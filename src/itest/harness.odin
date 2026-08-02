@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
+import "core:sys/posix"
 import "core:time"
 import "elodin:dns"
 
@@ -246,14 +247,42 @@ wait_ready :: proc(srv: ^Server, timeout: time.Duration) -> bool {
 }
 
 stop_server :: proc(srv: ^Server) {
-	if !srv.running {
-		return
+	if srv.running {
+		_ = os.process_kill(srv.process)
+		_, _ = os.process_wait(srv.process)
+		srv.running = false
 	}
-	_ = os.process_kill(srv.process)
-	_, _ = os.process_wait(srv.process)
-	srv.running = false
+	// Unconditional: a server that has already been stopped by other means
+	// still left its log path behind.
 	delete(srv.log_path)
 	srv.log_path = ""
+}
+
+/*
+Stop the server the way an init system would, and wait for it to go.
+
+`stop_server` uses SIGKILL, which says nothing about whether the process can
+shut itself down. This sends the signal systemd sends and reports what came of
+it — including the case where nothing does, since a graceful shutdown that
+never finishes is the failure worth catching. The log is left in place for the
+caller to read.
+*/
+signal_shutdown :: proc(srv: ^Server, within: time.Duration) -> (state: os.Process_State, ok: bool) {
+	if !srv.running {
+		return {}, false
+	}
+	if posix.kill(posix.pid_t(srv.process.pid), .SIGTERM) != .OK {
+		return {}, false
+	}
+	deadline := time.time_add(time.now(), within)
+	for time.diff(time.now(), deadline) > 0 {
+		s, err := os.process_wait(srv.process, 100 * time.Millisecond)
+		if err == nil && s.exited {
+			srv.running = false
+			return s, true
+		}
+	}
+	return {}, false
 }
 
 read_log :: proc(srv: ^Server) -> string {

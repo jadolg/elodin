@@ -33,12 +33,85 @@ Options :: struct {
 	no_fetch:    bool,
 }
 
+/*
+Set by the signal handler, read by the maintenance loop.
+
+A handler may not do much - it interrupts a thread wherever it happened to be,
+so anything taking a lock or allocating can deadlock the process it was meant
+to stop. Setting a flag is safe, and the loop is what turns that into an
+orderly shutdown.
+*/
+@(private)
+stop_requested: bool
+
+@(private)
+on_stop_signal :: proc "c" (sig: posix.Signal) {
+	if !sync.atomic_exchange(&stop_requested, true) {
+		return
+	}
+	/*
+	A second signal is an operator saying the first is taking too long. Put the
+	default disposition back and let this one through, so nobody is ever held
+	by a shutdown that has stopped making progress - a connection thread waiting
+	out a client timeout, most likely.
+
+	Both calls are on the short list of what a handler may do.
+	*/
+	act: posix.sigaction_t
+	act.sa_handler = nil // SIG_DFL
+	_ = posix.sigaction(sig, &act, nil)
+	_ = posix.kill(posix.getpid(), sig)
+}
+
+/*
+Ask for an orderly shutdown on the signals that mean one.
+
+SIGTERM is what an init system sends; SIGINT is Ctrl-C. Without these the
+default disposition applies and the process is simply terminated, which means
+nothing is put away: connections are cut mid-answer, and the teardown that
+drains the worker pools before releasing what their jobs are using never runs
+at all.
+*/
+install_stop_handlers :: proc() {
+	act: posix.sigaction_t
+	act.sa_handler = on_stop_signal
+	for sig in ([]posix.Signal{.SIGTERM, .SIGINT}) {
+		if posix.sigaction(sig, &act, nil) != .OK {
+			fmt.eprintfln("elodin: cannot install a handler for %v; it will terminate the process instead", sig)
+		}
+	}
+}
+
+/*
+Sleep until the next tick, or until a signal asks us to stop.
+
+Sliced rather than left as one long sleep: a handler can only set a flag, so
+the loop has to come back and look. Anything less often than this and an
+operator waits on a service that has already been told to go.
+*/
+@(private)
+wait_for_tick :: proc(tick: time.Duration) -> (carry_on: bool) {
+	SLICE :: 200 * time.Millisecond
+	deadline := time.time_add(time.now(), tick)
+	for {
+		if sync.atomic_load(&stop_requested) {
+			return false
+		}
+		remaining := time.diff(time.now(), deadline)
+		if remaining <= 0 {
+			return true
+		}
+		time.sleep(min(SLICE, remaining))
+	}
+}
+
 main :: proc() {
 	// Writing to a socket whose peer has gone away raises SIGPIPE, whose
 	// default disposition kills the process. A client hanging up mid-answer is
 	// completely routine, so the signal is ignored and the write reports EPIPE
 	// through the normal error path instead.
 	posix.sigignore(.SIGPIPE)
+	install_stop_handlers()
 
 	opts, ok := parse_args()
 	if !ok {
@@ -176,7 +249,11 @@ maintenance_loop :: proc(
 	last_report := time.now()
 
 	for sync.atomic_load(&s.running) {
-		time.sleep(TICK)
+		if !wait_for_tick(TICK) {
+			logx.infof("signal received, shutting down")
+			sync.atomic_store(&s.running, false)
+			break
+		}
 
 		if answers != nil {
 			if removed := cache.sweep(answers); removed > 0 {
