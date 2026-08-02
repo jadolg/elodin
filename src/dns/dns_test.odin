@@ -363,3 +363,47 @@ test_scan_ttl_offsets_releases_on_bad_name :: proc(t: ^testing.T) {
 		testing.expectf(t, false, "%d bytes leaked, allocated at %v", entry.size, entry.location)
 	}
 }
+
+@(test)
+test_peek_udp_size_reads_the_opt_record :: proc(t: ^testing.T) {
+	// No OPT: the 512 bytes a responder has to assume without being told.
+	bare := Message {
+		id       = 1,
+		question = []Question{{name = "example.com.", type = .A, class = .IN}},
+	}
+	bare_wire, _, bare_err := encode_message(bare, context.temp_allocator)
+	testing.expect_value(t, bare_err, Encode_Error.None)
+	testing.expect_value(t, peek_udp_size(bare_wire), u16(MAX_UDP_SIZE))
+
+	// With one, whatever it actually says — unclamped, since the point is to
+	// size a buffer for what the peer may send.
+	for advertised in ([]u16{512, 1232, 4096, 8192, 65535}) {
+		m := Message {
+			id         = 1,
+			question   = []Question{{name = "example.com.", type = .A, class = .IN}},
+			additional = []Record{make_opt(advertised, true)},
+		}
+		wire, _, err := encode_message(m, context.temp_allocator)
+		testing.expect_value(t, err, Encode_Error.None)
+		testing.expect_value(t, peek_udp_size(wire), advertised)
+	}
+
+	// An OPT sitting behind other records in the additional section is still
+	// found, and a message that will not walk falls back to the default.
+	behind := Message {
+		id         = 1,
+		question   = []Question{{name = "example.com.", type = .A, class = .IN}},
+		additional = []Record {
+			{name = "ns.example.com.", type = .A, class = .IN, ttl = 60, data = Rdata_A{addr = {192, 0, 2, 1}}},
+			make_opt(2048, false),
+		},
+	}
+	behind_wire, _, behind_err := encode_message(behind, context.temp_allocator)
+	testing.expect_value(t, behind_err, Encode_Error.None)
+	testing.expect_value(t, peek_udp_size(behind_wire), u16(2048))
+
+	testing.expect_value(t, peek_udp_size({}), u16(MAX_UDP_SIZE))
+	testing.expect_value(t, peek_udp_size(behind_wire[:HEADER_SIZE + 2]), u16(MAX_UDP_SIZE))
+
+	free_all(context.temp_allocator)
+}

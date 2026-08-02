@@ -183,6 +183,59 @@ scan_ttl_offsets :: proc(msg: []u8, allocator := context.allocator) -> (offsets:
 	return out[:], true
 }
 
+/*
+The EDNS0 payload size a message advertises, read off the wire.
+
+Answers the question a sender has to answer before it can size a receive buffer:
+how large may the reply to this be? Returns MAX_UDP_SIZE when there is no OPT
+record, or when the message cannot be walked — the 512 bytes RFC 1035 says a
+responder must assume without being told otherwise.
+
+Distinct from `edns_udp_size`, which clamps into the range this server is
+willing to *send*; this reports what the message actually said.
+*/
+peek_udp_size :: proc(msg: []u8) -> u16 {
+	if len(msg) < HEADER_SIZE {
+		return MAX_UDP_SIZE
+	}
+	qdcount := int(u16(msg[4]) << 8 | u16(msg[5]))
+	total := int(u16(msg[6]) << 8 | u16(msg[7]))
+	total += int(u16(msg[8]) << 8 | u16(msg[9]))
+	total += int(u16(msg[10]) << 8 | u16(msg[11]))
+
+	pos := HEADER_SIZE
+	for _ in 0 ..< qdcount {
+		next, ok := skip_name(msg, pos)
+		if !ok {
+			return MAX_UDP_SIZE
+		}
+		pos = next + 4
+		if pos > len(msg) {
+			return MAX_UDP_SIZE
+		}
+	}
+	for _ in 0 ..< total {
+		next, ok := skip_name(msg, pos)
+		if !ok {
+			return MAX_UDP_SIZE
+		}
+		pos = next
+		if pos + 10 > len(msg) {
+			return MAX_UDP_SIZE
+		}
+		// OPT carries the payload size where every other type carries its class.
+		if Type(u16(msg[pos]) << 8 | u16(msg[pos + 1])) == .OPT {
+			return u16(msg[pos + 2]) << 8 | u16(msg[pos + 3])
+		}
+		rdlength := int(u16(msg[pos + 8]) << 8 | u16(msg[pos + 9]))
+		pos += 10 + rdlength
+		if pos > len(msg) {
+			return MAX_UDP_SIZE
+		}
+	}
+	return MAX_UDP_SIZE
+}
+
 read_ttls :: proc(msg: []u8, offsets: []int, allocator := context.allocator) -> []u32 {
 	ttls := make([]u32, len(offsets), allocator)
 	for off, i in offsets {

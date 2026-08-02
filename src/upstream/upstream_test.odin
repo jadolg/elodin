@@ -465,3 +465,270 @@ test_reader_exact_refuses_a_negative_count :: proc(t: ^testing.T) {
 	testing.expect_value(t, r.pos, 4)
 	free_all(context.temp_allocator)
 }
+
+/*
+An answer as large as the query said it could be must arrive whole.
+
+`recv_udp` fills the buffer it is given and drops the rest of the datagram
+without saying so, so a buffer smaller than what the query advertised turns a
+perfectly good answer into a prefix of one — with the header and question still
+intact, so nothing downstream notices.
+*/
+
+@(private = "file")
+Big_Mock :: struct {
+	socket: net.UDP_Socket,
+	size:   int,
+	stop:   bool,
+}
+
+// Echoes the query with QR set, padded out to `size` bytes.
+//
+// The padding is not a well-formed record section, which does not matter here:
+// what is under test is how many of the bytes on the wire survive the receive,
+// and `response_matches` only reads the header and the question.
+@(private = "file")
+big_reply_loop :: proc(m: ^Big_Mock) {
+	buf: [4096]u8
+	out := make([]u8, m.size)
+	defer delete(out)
+	for !sync.atomic_load(&m.stop) {
+		n, client, err := net.recv_udp(m.socket, buf[:])
+		if err != nil {
+			continue
+		}
+		if n < dns.HEADER_SIZE || n > m.size {
+			continue
+		}
+		copy(out, buf[:n])
+		for i in n ..< m.size {
+			out[i] = 0xAA
+		}
+		out[2] |= 0x80
+		_, _ = net.send_udp(m.socket, out, client)
+	}
+}
+
+@(test)
+test_udp_answer_up_to_the_advertised_size_is_not_truncated :: proc(t: ^testing.T) {
+	ADVERTISED :: 8192
+	REPLY :: 6000
+
+	m := Big_Mock {
+		size = REPLY,
+	}
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if serr != nil {
+		testing.expectf(t, false, "cannot bind a loopback responder: %v", serr)
+		return
+	}
+	m.socket = socket
+	set_socket_timeouts(socket, 50 * time.Millisecond)
+
+	bound, berr := net.bound_endpoint(socket)
+	if berr != nil {
+		net.close(socket)
+		testing.expectf(t, false, "cannot read the responder's port: %v", berr)
+		return
+	}
+
+	responder := thread.create_and_start_with_poly_data(&m, big_reply_loop)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(responder)
+		thread.destroy(responder)
+		net.close(socket)
+	}
+
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port},
+		0,
+		2 * time.Second,
+		context.allocator,
+	)
+	testing.expectf(t, uerr == .None, "cannot build the upstream: %v", uerr)
+	if uerr != .None {
+		return
+	}
+	defer destroy(u)
+
+	// The OPT record is the whole point: it is what tells the upstream how much
+	// room there is, and therefore how much has to be read back.
+	query := dns.Message {
+		id         = 0x2A2A,
+		question   = []dns.Question{{name = "example.com.", type = .A, class = .IN}},
+		additional = []dns.Record{dns.make_opt(ADVERTISED, false)},
+	}
+	query.flags.rd = true
+	wire, _, enc_err := dns.encode_message(query, context.temp_allocator)
+	testing.expectf(t, enc_err == .None, "cannot encode the query: %v", enc_err)
+	if enc_err != .None {
+		return
+	}
+
+	resp, xerr := exchange(u, wire, 2 * time.Second, context.temp_allocator)
+	testing.expectf(t, xerr == .None, "the exchange failed: %v", xerr)
+	testing.expectf(
+		t,
+		len(resp) == REPLY,
+		"the answer came back %d bytes of %d; the rest of the datagram was dropped",
+		len(resp),
+		REPLY,
+	)
+	free_all(context.temp_allocator)
+}
+
+/*
+An upstream that ignores the advertised size is retried over TCP.
+
+Sizing the buffer correctly only settles what a well-behaved responder sends.
+One that overruns the room it was given leaves a prefix of an answer in the
+buffer with its header and question intact, which is the shape most likely to
+be mistaken for a whole one — so it has to be recognised and asked again on a
+transport with no such limit, the same way the TC bit is handled.
+*/
+
+@(private = "file")
+Overrun_Mock :: struct {
+	udp:      net.UDP_Socket,
+	listener: net.TCP_Socket,
+	size:     int,
+	stop:     bool,
+}
+
+@(private = "file")
+overrun_udp_loop :: proc(m: ^Overrun_Mock) {
+	buf: [4096]u8
+	out := make([]u8, m.size)
+	defer delete(out)
+	for !sync.atomic_load(&m.stop) {
+		n, client, err := net.recv_udp(m.udp, buf[:])
+		if err != nil {
+			continue
+		}
+		if n < dns.HEADER_SIZE || n > m.size {
+			continue
+		}
+		copy(out, buf[:n])
+		for i in n ..< m.size {
+			out[i] = 0xAA
+		}
+		out[2] |= 0x80
+		_, _ = net.send_udp(m.udp, out, client)
+	}
+}
+
+// Serves one framed answer and returns; one retry is all this needs.
+@(private = "file")
+overrun_tcp_once :: proc(m: ^Overrun_Mock) {
+	client, _, err := net.accept_tcp(m.listener)
+	if err != nil {
+		return
+	}
+	defer net.close(client)
+
+	length: [2]u8
+	if read_full_tcp(client, length[:]) != .None {
+		return
+	}
+	n := int(length[0]) << 8 | int(length[1])
+	if n < dns.HEADER_SIZE || n > m.size {
+		return
+	}
+	query := make([]u8, n, context.temp_allocator)
+	if read_full_tcp(client, query) != .None {
+		return
+	}
+
+	out := make([]u8, 2 + m.size, context.temp_allocator)
+	out[0] = u8(m.size >> 8)
+	out[1] = u8(m.size)
+	copy(out[2:], query)
+	for i in 2 + n ..< len(out) {
+		out[i] = 0xAA
+	}
+	out[4] |= 0x80
+	_ = write_all_tcp(client, out)
+}
+
+@(test)
+test_udp_answer_over_the_advertised_size_falls_back_to_tcp :: proc(t: ^testing.T) {
+	ADVERTISED :: 1232
+	REPLY :: 3000
+
+	// The TCP listener binds first so the UDP socket can take the same port
+	// number; the two live in separate namespaces.
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		net.close(listener)
+		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
+		return
+	}
+	// So the accept below gives up on its own if the retry never comes, rather
+	// than turning a regression into a hung test.
+	_ = net.set_option(listener, .Receive_Timeout, 3 * time.Second)
+	udp, uerr2 := net.make_bound_udp_socket(net.IP4_Loopback, bound.port)
+	if uerr2 != nil {
+		net.close(listener)
+		testing.expectf(t, false, "cannot bind udp/%d: %v", bound.port, uerr2)
+		return
+	}
+	set_socket_timeouts(udp, 50 * time.Millisecond)
+
+	m := Overrun_Mock {
+		udp      = udp,
+		listener = listener,
+		size     = REPLY,
+	}
+	udp_thread := thread.create_and_start_with_poly_data(&m, overrun_udp_loop)
+	tcp_thread := thread.create_and_start_with_poly_data(&m, overrun_tcp_once)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(udp_thread)
+		thread.destroy(udp_thread)
+		thread.join(tcp_thread)
+		thread.destroy(tcp_thread)
+		net.close(udp)
+		net.close(listener)
+	}
+
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port},
+		0,
+		2 * time.Second,
+		context.allocator,
+	)
+	testing.expectf(t, uerr == .None, "cannot build the upstream: %v", uerr)
+	if uerr != .None {
+		return
+	}
+	defer destroy(u)
+
+	query := dns.Message {
+		id         = 0x2A2A,
+		question   = []dns.Question{{name = "example.com.", type = .A, class = .IN}},
+		additional = []dns.Record{dns.make_opt(ADVERTISED, false)},
+	}
+	query.flags.rd = true
+	wire, _, enc_err := dns.encode_message(query, context.temp_allocator)
+	testing.expectf(t, enc_err == .None, "cannot encode the query: %v", enc_err)
+	if enc_err != .None {
+		return
+	}
+
+	resp, xerr := exchange(u, wire, 2 * time.Second, context.temp_allocator)
+	testing.expectf(t, xerr == .None, "the exchange failed: %v", xerr)
+	testing.expectf(
+		t,
+		len(resp) == REPLY,
+		"got %d bytes of %d; the overrun was not retried on a transport that could carry it",
+		len(resp),
+		REPLY,
+	)
+	free_all(context.temp_allocator)
+}

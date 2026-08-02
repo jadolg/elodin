@@ -36,12 +36,31 @@ exchange_udp :: proc(
 		return nil, .IO_Error
 	}
 
-	buf := make([]u8, 4096, context.temp_allocator)
+	/*
+	Sized from what the query itself advertised, not from a fixed number.
+
+	A responder may fill whatever room the OPT record offered it, and this query
+	is the client's own message forwarded verbatim — so the figure is the
+	client's, and it goes as high as 65535. A buffer smaller than that figure
+	turns a perfectly good answer into a failure: Linux reports the shortfall
+	rather than hiding it, which lands in the error path below, and three of
+	those in a row park a healthy upstream for the cooldown.
+
+	One byte over, so a datagram that ignores the advertised size is
+	recognisable rather than merely truncated.
+	*/
+	limit := clamp(int(dns.peek_udp_size(query)), dns.MAX_UDP_SIZE, dns.MAX_MESSAGE)
+	buf := make([]u8, limit + 1, context.temp_allocator)
 	deadline := time.time_add(time.now(), timeout)
 
 	for time.diff(deadline, time.now()) < 0 {
 		n, remote, recv_err := net.recv_udp(socket, buf)
 		if recv_err != nil {
+			// The datagram was larger than the room the query offered, so what
+			// arrived is a prefix of an answer. TCP is where the whole one is.
+			if recv_err == .Excess_Truncated {
+				return exchange_tcp(u, query, timeout, allocator)
+			}
 			return nil, .Timeout
 		}
 		if n < dns.HEADER_SIZE {
