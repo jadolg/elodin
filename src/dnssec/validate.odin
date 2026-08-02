@@ -99,6 +99,10 @@ MAX_LOOKUPS_PER_QUERY :: 32
 // more than this is a response trying to make us work rather than be believed.
 MAX_SIGNATURES_PER_RRSET :: 8
 
+// CNAME hops followed when checking that an answer addresses the question.
+// Real chains are one or two; anything past this is a loop or a stall.
+MAX_CNAME_CHAIN :: 16
+
 // Keys a zone may publish. Far past any real zone, and it bounds both the
 // canonical form built over the set and what the cache then holds on to.
 MAX_KEYS_PER_ZONE :: 64
@@ -295,6 +299,21 @@ validate_answer :: proc(
 	*/
 	if checked == 0 {
 		return {.Insecure, "nothing to authenticate"}
+	}
+
+	/*
+	Every RRset held up on its own. That is not yet an answer to the question:
+	each was judged against the zone that claims it, and nothing so far has
+	asked whether any of them concern the name that was asked about.
+
+	An attacker with a signed zone of their own has an endless supply of validly
+	signed RRsets, and offering one under someone else's question would pass
+	every check above. The verdict would be `Secure`, the AD bit would go out,
+	and a stub would read an authenticated answer holding nothing for the name
+	it asked about - a denial of existence that was never proven.
+	*/
+	if worst == .Secure && !answers_question(msg.answer, qname, qtype, class) {
+		return {.Bogus, "answer does not address the question"}
 	}
 
 	/*
@@ -1153,6 +1172,53 @@ fold_into :: proc(name: string, buf: []u8) -> (string, bool) {
 		buf[i] = c + 32 if c >= 'A' && c <= 'Z' else c
 	}
 	return string(buf[:len(name)]), true
+}
+
+/*
+Does this answer section address `qname`?
+
+Walks the CNAME chain from the name that was asked about. Reaching the type
+asked for settles it; so does running out of records after at least one hop,
+because a chain that stops before its target is a perfectly ordinary answer -
+the zone at the end may simply hold nothing of that type, and what proves that
+is the denial in the authority section, not anything here.
+
+What this refuses is an answer section with nothing at the queried name at all,
+which is not an answer to this question whatever else it is.
+
+Only the shape is checked. Every record here has already been through
+`validate_rrset`, so reaching a name by following this chain means the records
+that led there carried signatures from the zones that own them.
+*/
+@(private)
+answers_question :: proc(records: []dns.Record, qname: string, qtype: dns.Type, class: dns.Class) -> bool {
+	name := qname
+	hops := 0
+	for hops < MAX_CNAME_CHAIN {
+		target := ""
+		for r in records {
+			if r.class != class || !dns.name_equal_fold(r.name, name) {
+				continue
+			}
+			if r.type == qtype || qtype == .ANY {
+				return true
+			}
+			if r.type == .CNAME {
+				if v, is_name := r.data.(dns.Rdata_Name); is_name {
+					target = v.name
+				}
+			}
+		}
+		if target == "" {
+			// Nothing further to follow. Whether this answered the question
+			// comes down to having got here by a CNAME the queried name owns.
+			return hops > 0
+		}
+		name = target
+		hops += 1
+	}
+	// A chain this long is a loop or a stall, and either way proves nothing.
+	return false
 }
 
 @(private)

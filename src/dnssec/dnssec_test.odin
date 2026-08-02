@@ -793,3 +793,128 @@ broken_ds_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: me
 	}
 	return forged, true
 }
+
+@(test)
+test_answer_for_another_name_is_not_authentic :: proc(t: ^testing.T) {
+	/*
+	A response has to answer the question that was asked.
+
+	Every RRset here is genuine and signed, and every signature checks out
+	against a real chain from the root - it is simply an answer about a
+	different name, replayed under someone else's question. Judging the records
+	one by one and reporting the best of them says `Secure`, sets the AD bit,
+	and files the whole thing in the cache under the name that was asked about.
+
+	No forgery is needed for this. An attacker holding any signed zone of their
+	own has a supply of validly signed RRsets to offer, and a stub reading the
+	result sees an authenticated answer with nothing in it for the name it
+	asked about - a denial it never proved.
+	*/
+	v := test_validator()
+	defer destroy_validator(v)
+
+	// A real, signed answer for www.cloudflare.com.
+	wire := unhex(fixture("cloudflare_a").wire)
+	msg, derr := dns.decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+
+	// Re-asked as though it answered a name in another signed zone.
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question {
+		name  = "www.example.com.",
+		type  = .A,
+		class = .IN,
+	}
+	msg.question = question
+
+	tampered, _, enc := dns.encode_message(msg, context.temp_allocator)
+	testing.expect_value(t, enc, dns.Encode_Error.None)
+
+	result := validate(v, "www.example.com.", .A, tampered, fixture_now())
+	testing.expectf(
+		t,
+		result.status != .Secure,
+		"an answer about another name was called authentic (%v, %q)",
+		result.status,
+		result.reason,
+	)
+	free_all(context.temp_allocator)
+}
+
+@(private = "file")
+rec :: proc(name: string, type: dns.Type, target: string = "") -> dns.Record {
+	out := dns.Record {
+		name  = name,
+		type  = type,
+		class = .IN,
+		ttl   = 60,
+	}
+	if type == .CNAME {
+		out.data = dns.Rdata_Name{name = target}
+	}
+	return out
+}
+
+@(test)
+test_answers_question_follows_the_cname_chain :: proc(t: ^testing.T) {
+	/*
+	The shape of an answer that addresses its question, case by case. Chains
+	that stop short are ordinary - the zone at the end may hold nothing of the
+	type, which the authority section is what proves - so those count. An
+	answer section with nothing at the queried name does not.
+	*/
+	direct := []dns.Record{rec("www.example.com.", .A)}
+	testing.expect(t, answers_question(direct, "www.example.com.", .A, .IN), "the type at the name should count")
+
+	// Case folding, since a name is not the bytes it was written with.
+	testing.expect(t, answers_question(direct, "WWW.Example.COM.", .A, .IN), "names should match case-insensitively")
+
+	chain := []dns.Record {
+		rec("www.example.com.", .CNAME, "target.example.net."),
+		rec("target.example.net.", .A),
+	}
+	testing.expect(t, answers_question(chain, "www.example.com.", .A, .IN), "a completed chain should count")
+
+	// The chain stops at the CNAME: the target holds no A, which the authority
+	// section proves rather than this.
+	partial := []dns.Record{rec("www.example.com.", .CNAME, "target.example.net.")}
+	testing.expect(t, answers_question(partial, "www.example.com.", .A, .IN), "a chain that stops short should count")
+
+	// The CNAME itself, when that is what was asked for.
+	testing.expect(t, answers_question(partial, "www.example.com.", .CNAME, .IN), "a CNAME answers a CNAME question")
+
+	// Anything at the name answers ANY.
+	testing.expect(t, answers_question(direct, "www.example.com.", .ANY, .IN), "ANY takes whatever is there")
+
+	// The attack: signed records, wrong name.
+	elsewhere := []dns.Record{rec("evil.attacker.example.", .A)}
+	testing.expect(
+		t,
+		!answers_question(elsewhere, "www.example.com.", .A, .IN),
+		"records about another name do not answer this question",
+	)
+
+	// A chain that leads somewhere unrelated still has to start at the name
+	// that was asked about.
+	detached := []dns.Record {
+		rec("other.example.com.", .CNAME, "target.example.net."),
+		rec("target.example.net.", .A),
+	}
+	testing.expect(
+		t,
+		!answers_question(detached, "www.example.com.", .A, .IN),
+		"a chain that does not start at the queried name proves nothing",
+	)
+
+	// Class has to match too.
+	wrong_class := []dns.Record{rec("www.example.com.", .A)}
+	wrong_class[0].class = .CH
+	testing.expect(t, !answers_question(wrong_class, "www.example.com.", .A, .IN), "a different class is a different question")
+
+	// A loop must terminate rather than spin.
+	loop := []dns.Record {
+		rec("a.example.com.", .CNAME, "b.example.com."),
+		rec("b.example.com.", .CNAME, "a.example.com."),
+	}
+	testing.expect(t, !answers_question(loop, "a.example.com.", .A, .IN), "a CNAME loop should not be an answer")
+}
