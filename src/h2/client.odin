@@ -242,11 +242,15 @@ client_send_preface :: proc(c: ^Client) -> bool {
 	// protocol violation rather than something to handle.
 	// SETTINGS_INITIAL_WINDOW_SIZE raised to match the connection window
 	// below, so the peer is never throttled sending us a response.
-	write_frame_header(&out, 12, .Settings, 0, 0)
+	write_frame_header(&out, 18, .Settings, 0, 0)
 	append(&out, 0, u8(Setting.Enable_Push))
 	append_u32(&out, 0)
 	append(&out, 0, u8(Setting.Initial_Window_Size))
 	append_u32(&out, CLIENT_RECV_WINDOW)
+	// So an upstream is told the header bound rather than discovering it as a
+	// connection error.
+	append(&out, 0, u8(Setting.Max_Header_List_Size))
+	append_u32(&out, MAX_HEADER_LIST)
 
 	write_frame_header(&out, 4, .Window_Update, 0, 0)
 	append_u32(&out, CLIENT_RECV_WINDOW - DEFAULT_WINDOW)
@@ -400,6 +404,10 @@ client_handle_headers :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> boo
 		client_goaway(c, .Protocol_Error)
 		return false
 	}
+	if len(block) > MAX_HEADER_LIST {
+		client_goaway(c, .Compression_Error)
+		return false
+	}
 
 	clear(&c.header_scratch)
 	append(&c.header_scratch, ..block)
@@ -421,6 +429,16 @@ client_handle_headers :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> boo
 client_handle_continuation :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 	if c.continuation_on != h.stream_id {
 		client_goaway(c, .Protocol_Error)
+		return false
+	}
+	/*
+	Bounded as it accumulates, for the same reason as the server side: neither
+	HEADERS nor CONTINUATION is flow-controlled, and HPACK's own limit lives in
+	`decode`, which never runs for a block whose END_HEADERS never arrives. An
+	upstream that sent these without end would otherwise grow this without end.
+	*/
+	if len(c.header_scratch) + len(payload) > MAX_HEADER_LIST {
+		client_goaway(c, .Compression_Error)
 		return false
 	}
 	append(&c.header_scratch, ..payload)
