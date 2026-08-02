@@ -492,6 +492,145 @@ test_continuation_flood_is_refused :: proc(t: ^testing.T) {
 	expect_no_leaks(t, &track, "continuation flood")
 }
 
+/*
+A stream the peer resets before its body arrives.
+
+Nothing else will ever retire it. `respond` is what normally does, and it runs
+only for a stream a handler was given; one parked between its headers and a body
+that never came has no handler to answer it. Left in the table it holds its
+parked request - a header list apiece - and one of MAX_CONCURRENT slots for as
+long as the connection lasts.
+*/
+@(test)
+test_reset_stream_is_retired :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil, allocator)
+
+	// END_HEADERS without END_STREAM: the request is parked awaiting a body, so
+	// no handler owns it.
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	ok := handle_headers(
+		c,
+		Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1},
+		block,
+	)
+	testing.expect(t, ok, "handle_headers failed")
+
+	s, found := c.streams[1]
+	testing.expect(t, found, "stream 1 was not created")
+	testing.expect(t, s.pending != nil, "no request was parked on the stream")
+
+	rst := []u8{0, 0, 0, 8} // CANCEL
+	rok := handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst)
+	testing.expect(t, rok, "handle_frame(RST_STREAM) failed")
+
+	_, still_open := c.streams[1]
+	testing.expect(t, !still_open, "the reset stream is still in the table")
+
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "reset stream")
+}
+
+/*
+The consequence of not retiring them, which is what makes it worth more than a
+leak: two frames per stream and the connection stops accepting new ones.
+*/
+@(test)
+test_reset_streams_do_not_exhaust_concurrency :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil, allocator)
+
+	rst := []u8{0, 0, 0, 8} // CANCEL
+	for i in 0 ..< MAX_CONCURRENT {
+		block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+		id := u32(1 + 2 * i)
+		handle_headers(
+			c,
+			Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id},
+			block,
+		)
+		handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = id}, rst)
+	}
+
+	testing.expectf(t, len(c.streams) == 0, "%d reset streams are still held on the connection", len(c.streams))
+
+	// So the next one is still accepted rather than refused.
+	fresh, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	next := u32(1 + 2 * MAX_CONCURRENT)
+	handle_headers(
+		c,
+		Frame_Header{length = len(fresh), type = .Headers, flags = FLAG_END_HEADERS, stream_id = next},
+		fresh,
+	)
+	_, accepted := c.streams[next]
+	testing.expect(t, accepted, "a fresh stream was refused after MAX_CONCURRENT resets")
+
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "reset stream flood")
+}
+
+/*
+A stream that already has a handler is the other half of the same rule.
+
+`respond` is what retires that one, and it has to find the stream still there to
+see that the peer cancelled and skip the answer. Retiring it here instead would
+leave `respond` writing a response for a stream the peer has finished with, and
+the handler's own `close_stream` with nothing to close.
+*/
+@(test)
+test_reset_stream_with_a_handler_is_left_for_it :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, destroying_handler, nil, allocator)
+
+	// END_STREAM dispatches straight away, so a handler owns this one.
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	ok := handle_headers(
+		c,
+		Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1},
+		block,
+	)
+	testing.expect(t, ok, "handle_headers failed")
+
+	rst := []u8{0, 0, 0, 8} // CANCEL
+	handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst)
+
+	live, open := c.streams[1]
+	testing.expect(t, open, "a dispatched stream was retired out from under its handler")
+	if open {
+		testing.expect(t, live.cancelled, "the stream was not marked cancelled")
+	}
+
+	// The handler answers late, and must find the cancellation rather than write.
+	clear(&log.frames)
+	respond(c, 1, Response{status = 200, content_type = "application/dns-message", body = []u8{1, 2, 3, 4}})
+	testing.expectf(t, len(log.frames) == 0, "respond wrote %d frames for a cancelled stream", len(log.frames))
+
+	_, after := c.streams[1]
+	testing.expect(t, !after, "respond did not retire the cancelled stream")
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "reset with handler")
+}
+
 @(private = "file")
 Respond_Ctx :: struct {
 	conn: ^Conn,
