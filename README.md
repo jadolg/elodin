@@ -553,6 +553,15 @@ the reference resolver.
 
 Every one of these was invisible to the unit tests:
 
+- **A UDP upstream could not receive a large answer.** The receive buffer was a
+  fixed 4096 bytes, while the query forwarded to the upstream carries the
+  *client's* EDNS0 payload size — up to 65535. A responder filling the room it
+  was offered sent a datagram that would not fit, and Linux reports that rather
+  than hiding it, so the answer came back as a failure. Three in a row parked a
+  perfectly healthy upstream for the cooldown, which is how "one name does not
+  resolve" turns into "this upstream is skipped for ten seconds". The buffer is
+  sized from what the query actually advertised now, and a responder that
+  overruns even that is retried over TCP the same way the TC bit is.
 - **Shutdown released things that were still in use.** The read and accept loops
   freed their own context on the way out, but every job they had queued and
   every connection thread they had started holds that context and outlives them
