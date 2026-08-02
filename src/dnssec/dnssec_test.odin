@@ -260,7 +260,7 @@ test_zone_keys_are_cached :: proc(t: ^testing.T) {
 
 	// Nothing has run out of time yet, so a sweep should take nothing away and
 	// the walk after it should still be free.
-	testing.expect_value(t, sweep(v), 0)
+	testing.expect_value(t, sweep(v, fixture_now()), 0)
 	third, _, _ := trust(v, "example.com.")
 	testing.expect_value(t, third, Status.Secure)
 	testing.expect_value(t, counter.queries, cold)
