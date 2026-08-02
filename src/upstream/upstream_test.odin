@@ -958,3 +958,110 @@ test_dot_handshake_reset_by_the_peer_is_retried :: proc(t: ^testing.T) {
 	testing.expectf(t, len(resp) == len(wire), "got %d bytes back, expected %d", len(resp), len(wire))
 	free_all(context.temp_allocator)
 }
+
+@(private = "file")
+Tls_Reset_Mock :: struct {
+	listener: net.TCP_Socket,
+	ctx:      ^tlsx.Context,
+	resets:   int,
+	accepted: int,
+}
+
+// The same hard hang-up as `dot_reset_once`, but the second connection is only
+// handshaken: `open_stream` hands back a stream and leaves the protocol on it to
+// its caller, so there is nothing else to answer here.
+@(private = "file")
+tls_reset_once :: proc(m: ^Tls_Reset_Mock) {
+	first, _, ferr := net.accept_tcp(m.listener)
+	if ferr != nil {
+		return
+	}
+	lg := posix.linger {
+		l_onoff  = 1,
+		l_linger = 0,
+	}
+	posix.setsockopt(posix.FD(first), posix.SOL_SOCKET, .LINGER, &lg, posix.socklen_t(size_of(lg)))
+	net.close(first)
+	sync.atomic_add(&m.resets, 1)
+
+	second, _, serr := net.accept_tcp(m.listener)
+	if serr != nil {
+		return
+	}
+	_ = net.set_option(second, .Receive_Timeout, 3 * time.Second)
+	_ = net.set_option(second, .Send_Timeout, 3 * time.Second)
+	conn, terr := tlsx.server_accept(m.ctx, second)
+	if terr != .None {
+		net.close(second)
+		return
+	}
+	sync.atomic_add(&m.accepted, 1)
+	tlsx.close(conn)
+}
+
+/*
+The DoH side of the same reset.
+
+`open_stream` carries every HTTPS upstream - HTTP/1.1, HTTP/2 and the bootstrap
+resolver - and reaches the same resolvers over the same networks, so a handshake
+the peer killed is worth exactly the retry the DoT path gets.
+*/
+@(test)
+test_https_handshake_reset_by_the_peer_is_retried :: proc(t: ^testing.T) {
+	posix.sigignore(.SIGPIPE)
+
+	sync.once_do(&dot_cert_once, generate_dot_certs)
+	if !dot_cert_ok {
+		testing.expect(t, false, "no certificate available and openssl could not make one")
+		return
+	}
+
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
+		return
+	}
+	_ = net.set_option(listener, .Receive_Timeout, 3 * time.Second)
+
+	sctx, serr := tlsx.server_context(dot_cert_path, dot_key_path)
+	if serr != .None {
+		testing.expectf(t, false, "server_context: %v", serr)
+		return
+	}
+	defer tlsx.context_destroy(sctx)
+
+	cctx, cerr := tlsx.client_context(false)
+	if cerr != .None {
+		testing.expectf(t, false, "client_context: %v", cerr)
+		return
+	}
+	defer tlsx.context_destroy(cctx)
+
+	m := Tls_Reset_Mock {
+		listener = listener,
+		ctx      = sctx,
+	}
+	mock_thread := thread.create_and_start_with_poly_data(&m, tls_reset_once)
+	defer thread.destroy(mock_thread)
+
+	stream, oerr := open_stream(bound, cctx, "", 2 * time.Second)
+	testing.expectf(t, oerr == .None, "open_stream failed: %v", oerr)
+	if oerr == .None {
+		testing.expect(t, stream.tls != nil, "the stream came back without a TLS session")
+		stream_close(&stream)
+	}
+
+	// Under TLS 1.3 the client is done once it has sent its Finished, so the
+	// mock may still be inside `server_accept` at this point. What it counted is
+	// only worth reading once it has stopped counting.
+	thread.join(mock_thread)
+	testing.expect_value(t, sync.atomic_load(&m.resets), 1)
+	testing.expect_value(t, sync.atomic_load(&m.accepted), 1)
+	free_all(context.temp_allocator)
+}

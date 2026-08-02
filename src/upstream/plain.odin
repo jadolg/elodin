@@ -4,7 +4,6 @@ import "core:mem"
 import "core:net"
 import "core:time"
 import "elodin:dns"
-import "elodin:logx"
 import "elodin:tlsx"
 
 /*
@@ -209,48 +208,12 @@ read_full_tcp :: proc(socket: net.TCP_Socket, buf: []u8) -> Error {
 	return .None
 }
 
-/*
-Open a fresh DoT connection, retrying a handshake the transport killed.
-
-Some resolvers reset a share of connections partway through the handshake while
-the very next attempt goes through - Quad9 does it to roughly half of them from
-some networks. Counting one of those as an upstream failure parks a server that
-answers perfectly well as soon as three land in a row, so it is worth one more
-try on a new socket.
-
-Only that case. A certificate that did not check out will not check out on a
-second look, and a handshake that ran out of time has already spent the caller's
-budget - retrying it would spend it twice. A reset, by contrast, comes back
-immediately, so the retry costs a round trip rather than a timeout.
-*/
+// Open a fresh DoT connection. Dialling, the handshake and the retry that
+// handshake gets are the HTTPS path's exactly, so they are shared with it.
 @(private)
 dial_dot :: proc(u: ^Upstream, timeout: time.Duration) -> (conn: Idle_Conn, err: Error) {
-	for attempt in 0 ..< 2 {
-		socket, derr := dial_tcp_timeout(u.endpoint, timeout)
-		if derr != .None {
-			return {}, derr
-		}
-		set_socket_timeouts(socket, timeout)
-		_ = net.set_option(socket, .TCP_Nodelay, true)
-
-		tls_conn, terr := tlsx.client_connect(u.tls_ctx, socket, u.spec.hostname)
-		if terr == .None {
-			return Idle_Conn{socket = socket, tls = tls_conn}, .None
-		}
-		// OpenSSL keeps its reason on a per-thread queue, so it has to be read
-		// here rather than at the point the error surfaces.
-		logx.debugf(
-			"upstream %s: TLS handshake with %q failed: %s",
-			u.spec.name,
-			u.spec.hostname,
-			tlsx.describe_error(terr, context.temp_allocator),
-		)
-		net.close(socket)
-		if terr != .Closed || attempt == 1 {
-			return {}, handshake_failure(terr)
-		}
-	}
-	return {}, .TLS_Failed
+	stream := open_stream(u.endpoint, u.tls_ctx, u.spec.hostname, timeout, u.spec.name) or_return
+	return Idle_Conn{socket = stream.socket, tls = stream.tls}, .None
 }
 
 // DNS over TLS: the TCP framing above, carried inside a TLS session (RFC 7858).
