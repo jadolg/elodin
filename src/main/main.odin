@@ -72,8 +72,6 @@ main :: proc() {
 run :: proc(cfg: ^config.Config, opts: Options) {
 	handler_pool := pool.make_pool(cfg.server.workers)
 	race_pool := pool.make_pool(cfg.server.upstream_workers)
-	defer pool.destroy(handler_pool)
-	defer pool.destroy(race_pool)
 
 	group, gerr := upstream.make_group(cfg.upstream, race_pool)
 	if gerr != .None {
@@ -124,7 +122,28 @@ run :: proc(cfg: ^config.Config, opts: Options) {
 		logx.errorf("could not start every listener, shutting down")
 		os.exit(1)
 	}
-	defer server.stop_listeners(&listeners)
+	/*
+	Shutdown, in the one order that works, which is why it is a block rather
+	than four separate defers.
+
+	Deferred last so it runs first. Stopping the listeners closes the sockets
+	and joins every connection thread, but it does not empty the pools: a query
+	accepted a moment earlier is still queued, and `pool.destroy` runs what is
+	queued before it joins its workers. Those jobs reach for the validator, the
+	filters, the cache and the upstream group, so the pools have to be drained
+	before any of that is torn down - the defers below this one - and the
+	listener contexts released only once nothing is left that could hold one.
+
+	The pools are handled here rather than at the point they are created, where
+	a `defer` of their own would put them last in the unwind and hand every
+	draining job a set of freed dependencies.
+	*/
+	defer {
+		server.stop_listeners(&listeners)
+		pool.destroy(handler_pool)
+		pool.destroy(race_pool)
+		server.destroy_listeners(&listeners)
+	}
 
 	logx.infof(
 		"ready: strategy=%v upstreams=%d cache=%v blocking=%v dnssec=%v",

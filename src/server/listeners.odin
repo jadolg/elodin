@@ -24,7 +24,34 @@ Listeners :: struct {
 	doh_ctx:    ^tlsx.Context,
 	conns:      Conn_Manager,
 	stop:       bool,
+	/*
+	What the read and accept loops were given, held here rather than by the
+	loops themselves.
+
+	A loop hands its context to every job it queues and every connection thread
+	it starts, and those outlive it: a queued query still runs while the pool
+	drains, and a connection thread sits in a client read for as long as its
+	timeout allows. A loop that released its own context on the way out would
+	pull the ground from under both. `destroy_listeners` releases them instead,
+	once there is nothing left that could be holding one.
+	*/
+	udp_loop_ctx:    ^Udp_Context,
+	stream_loop_ctx: [dynamic]^Stream_Context,
 }
+
+/*
+How long a loop may sit in a blocking call before it gets a chance to notice
+that it has been told to stop.
+
+Closing a socket does not reliably wake a thread already blocked reading or
+accepting on it - the same reason `upstream/h2client.odin` polls rather than
+trusting close to cut a read short - so the loops carry a timeout and come up
+for air instead. Without it `conn_manager_shutdown` joins a thread that is
+never going to return. One wakeup a second per listener costs nothing next to
+the queries going through them.
+*/
+@(private)
+LISTENER_POLL :: time.Second
 
 @(private)
 parse_bind :: proc(address: string, port: int) -> (endpoint: net.Endpoint, ok: bool) {
@@ -106,6 +133,26 @@ stop_listeners :: proc(l: ^Listeners) {
 	tlsx.context_destroy(l.doh_ctx)
 }
 
+/*
+Release what the loops were given.
+
+Separate from `stop_listeners` because stopping is not the same as being
+finished with: a query queued before the sockets closed still runs while the
+worker pool drains, and it reads the context of the loop that queued it. The
+caller drains the pools between the two.
+*/
+destroy_listeners :: proc(l: ^Listeners) {
+	if l.udp_loop_ctx != nil {
+		free(l.udp_loop_ctx)
+		l.udp_loop_ctx = nil
+	}
+	for ctx in l.stream_loop_ctx {
+		free(ctx)
+	}
+	delete(l.stream_loop_ctx)
+	l.stream_loop_ctx = nil
+}
+
 // --- UDP ------------------------------------------------------------------
 
 @(private)
@@ -137,6 +184,8 @@ start_udp :: proc(s: ^Server, l: ^Listeners) -> bool {
 	// A large receive buffer absorbs query bursts that arrive while every
 	// worker is busy.
 	_ = net.set_option(socket, .Receive_Buffer_Size, 1 << 20)
+	// So the read loop below wakes up now and then and can see `stop`.
+	_ = net.set_option(socket, .Receive_Timeout, LISTENER_POLL)
 
 	l.udp_socket = socket
 	l.udp_open = true
@@ -146,10 +195,11 @@ start_udp :: proc(s: ^Server, l: ^Listeners) -> bool {
 	ctx.listeners = l
 	if !conn_spawn(&l.conns, ctx, udp_loop, counted = false) {
 		logx.errorf("listeners.udp: cannot start the read loop")
-		// No loop to hand it to, so it is ours to release.
+		// Nothing was ever handed it, so it is ours to release.
 		free(ctx)
 		return false
 	}
+	l.udp_loop_ctx = ctx
 	logx.infof("listening for DNS on %s:%d/udp", cfg.address, cfg.port)
 	return true
 }
@@ -196,7 +246,8 @@ udp_loop :: proc(data: rawptr) {
 			break
 		}
 	}
-	free(ctx)
+	// `ctx` is not released here: jobs queued above still hold it, and they run
+	// on while the pool drains. `destroy_listeners` has it.
 }
 
 @(private)
@@ -253,6 +304,8 @@ start_stream_listener :: proc(
 		report_bind_failure(name, cfg.address, cfg.port, err)
 		return false
 	}
+	// So the accept loop below wakes up now and then and can see `stop`.
+	_ = net.set_option(sock, .Receive_Timeout, LISTENER_POLL)
 	socket^ = sock
 	open^ = true
 
@@ -262,10 +315,11 @@ start_stream_listener :: proc(
 	ctx.proto = proto
 	if !conn_spawn(&l.conns, ctx, accept_loop, counted = false) {
 		logx.errorf("listeners.%s: cannot start the accept loop", name)
-		// No loop to hand it to, so it is ours to release.
+		// Nothing was ever handed it, so it is ours to release.
 		free(ctx)
 		return false
 	}
+	append(&l.stream_loop_ctx, ctx)
 	return true
 }
 
@@ -354,7 +408,9 @@ accept_loop :: proc(data: rawptr) {
 			free(job)
 		}
 	}
-	free(ctx)
+	// `ctx` is not released here: every connection thread started above holds
+	// it for as long as its client keeps the connection open, and this loop
+	// exits first. `destroy_listeners` has it.
 }
 
 @(private)
