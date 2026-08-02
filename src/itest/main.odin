@@ -139,6 +139,13 @@ main :: proc() {
 	run_upstream_transport_cases(&r)
 	run_stale_connection_cases(&r)
 
+	if cert_ok {
+		section(&r, "upstream: doh over h2")
+		run_upstream_doh2_cases(&r)
+	} else {
+		skip_case(&r, "upstream: doh over h2", "no certificate")
+	}
+
 	section(&r, "dnssec validation")
 	run_dnssec_cases(&r)
 

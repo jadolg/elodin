@@ -3,9 +3,11 @@ package upstream
 import "core:mem"
 import "core:net"
 import "core:sync"
+import "core:thread"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:h2"
 import "elodin:logx"
 import "elodin:tlsx"
 
@@ -33,6 +35,33 @@ Idle_Conn :: struct {
 	since:  time.Time,
 }
 
+// Which protocol an HTTPS upstream turned out to speak, discovered from ALPN
+// on the first connection and then treated as sticky.
+@(private)
+Protocol :: enum u8 {
+	Unknown,
+	H1,
+	H2,
+}
+
+/*
+A shared HTTP/2 connection plus what owns it.
+
+`stopping` exists because closing a socket does not reliably wake a thread
+already blocked in a read on it (the same reason itest/mock.odin polls rather
+than relying on close to interrupt a loop): the reader thread's socket carries
+a short receive timeout so it wakes on its own and can notice this flag,
+bounding teardown instead of depending on the close below to cut its read
+short.
+*/
+@(private)
+H2_Conn :: struct {
+	stream:   Stream,
+	client:   ^h2.Client,
+	thread:   ^thread.Thread,
+	stopping: bool,
+}
+
 Upstream :: struct {
 	spec:         config.Upstream_Spec,
 	endpoint:     net.Endpoint,
@@ -43,6 +72,14 @@ Upstream :: struct {
 	idle:         [dynamic]Idle_Conn,
 	max_idle:     int,
 	idle_timeout: time.Duration,
+
+	// HTTPS only. `proto` is set once ALPN has settled it and never changes
+	// back; `h2_cond` and `connecting` make concurrent first callers share one
+	// handshake instead of each racing to open their own.
+	proto:      Protocol,
+	h2_cond:    sync.Cond,
+	connecting: bool,
+	h2:         ^H2_Conn,
 
 	// Consecutive failures; a run of them parks the upstream for a cooldown so
 	// a dead server stops costing every query a full timeout.
@@ -88,9 +125,10 @@ make_upstream :: proc(
 		}
 		u.tls_ctx = ctx
 	case .HTTPS:
-		// RFC 8484 clients negotiate HTTP/2 where available; this client speaks
-		// HTTP/1.1, which every public DoH resolver still accepts.
-		ctx, terr := tlsx.client_context(spec.verify, "", []string{"http/1.1"}, allocator)
+		// h2 first: preferring it is what lets a resolver that only accepts
+		// HTTP/2 be used at all, and ALPN falls back to http/1.1 for the ones
+		// that do not offer h2.
+		ctx, terr := tlsx.client_context(spec.verify, "", []string{"h2", "http/1.1"}, allocator)
 		if terr != .None {
 			logx.errorf("upstream %s: cannot create TLS context: %s", spec.name, tlsx.describe_error(terr, context.temp_allocator))
 			return nil, .TLS_Failed
@@ -108,6 +146,7 @@ destroy :: proc(u: ^Upstream) {
 	}
 	close_idle(u, all = true)
 	delete(u.idle)
+	teardown_h2(u)
 	tlsx.context_destroy(u.tls_ctx)
 	free(u, u.allocator)
 }

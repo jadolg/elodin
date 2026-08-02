@@ -11,10 +11,9 @@ import "elodin:tlsx"
 /*
 A small HTTP/1.1 client.
 
-It exists to serve two callers: DoH upstream queries (RFC 8484) and blocklist
-downloads. HTTP/2 is not implemented; every public DoH resolver still answers
-HTTP/1.1, and the alternative is an HPACK and framing implementation that this
-server does not otherwise need.
+It exists to serve two callers: blocklist downloads, which have no HTTP/2
+server to talk to, and DoH upstream queries (RFC 8484) against a resolver that
+ALPN showed does not speak h2 — see h2client.odin for the one that does.
 */
 
 // Either half of a connection: plain TCP or TLS-wrapped.

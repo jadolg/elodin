@@ -4,6 +4,7 @@ import "core:mem"
 import "core:net"
 import "core:time"
 import "elodin:dns"
+import "elodin:h2"
 import "elodin:tlsx"
 
 /*
@@ -12,6 +13,10 @@ DNS over HTTPS (RFC 8484).
 The query is POSTed as application/dns-message. The transaction ID is zeroed on
 the way out, as the RFC recommends, so that intermediaries can cache by body;
 the caller restores the client's ID from the response afterwards.
+
+Which transport carries it — HTTP/2, multiplexed onto one shared connection, or
+pooled HTTP/1.1 connections — is decided by get_h2_conn from what ALPN showed
+on this upstream's first connection; see h2client.odin.
 */
 @(private)
 exchange_doh :: proc(
@@ -30,6 +35,87 @@ exchange_doh :: proc(
 	copy(body, query)
 	dns.set_id_in_place(body, 0)
 
+	return exchange_doh_h2(u, query, body, timeout, allocator)
+}
+
+@(private)
+exchange_doh_h2 :: proc(
+	u: ^Upstream,
+	query: []u8,
+	body: []u8,
+	timeout: time.Duration,
+	allocator: mem.Allocator,
+) -> (
+	response: []u8,
+	err: Error,
+) {
+	// A stale shared connection dying between get_h2_conn handing it out and
+	// this call reaching the server is retried once, on a fresh one; see
+	// exchange_tcp for why that must not count as an upstream failure.
+	for attempt in 0 ..< 2 {
+		conn, is_h2, cerr := get_h2_conn(u, timeout)
+		if cerr != .None {
+			return nil, cerr
+		}
+		if !is_h2 {
+			return exchange_doh_h1(u, query, body, timeout, allocator)
+		}
+
+		resp, herr := h2.client_request(
+			conn,
+			h2.Client_Request {
+				method = "POST",
+				scheme = "https",
+				authority = u.spec.hostname,
+				path = u.spec.path,
+				content_type = "application/dns-message",
+				accept = "application/dns-message",
+				body = body,
+			},
+			timeout,
+			allocator,
+		)
+		h2.client_unref(conn)
+
+		switch herr {
+		case .None:
+			if resp.status != 200 || len(resp.body) < dns.HEADER_SIZE {
+				if len(resp.body) > 0 {
+					delete(resp.body, allocator)
+				}
+				return nil, .HTTP_Error
+			}
+			dns.set_id_in_place(resp.body, u16(query[0]) << 8 | u16(query[1]))
+			if !response_matches(query, resp.body) {
+				delete(resp.body, allocator)
+				return nil, .Bad_Response
+			}
+			return resp.body, .None
+		case .Closed:
+			if attempt == 0 {
+				continue
+			}
+			return nil, .IO_Error
+		case .Reset:
+			return nil, .HTTP_Error
+		case .Timeout:
+			return nil, .Timeout
+		}
+	}
+	return nil, .IO_Error
+}
+
+@(private)
+exchange_doh_h1 :: proc(
+	u: ^Upstream,
+	query: []u8,
+	body: []u8,
+	timeout: time.Duration,
+	allocator: mem.Allocator,
+) -> (
+	response: []u8,
+	err: Error,
+) {
 	// Pooled connection first, then a fresh one; see exchange_tcp for why a
 	// dead pooled connection must not count as an upstream failure.
 	for attempt in 0 ..< 2 {

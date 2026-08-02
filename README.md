@@ -103,6 +103,15 @@ through the system resolver, since on a machine where elodin *is* the system
 resolver the latter would come straight back to a server that has not started
 listening yet.
 
+A `https` upstream picks between HTTP/2 and HTTP/1.1 with ALPN, preferring h2,
+the same way the [DoH listener](#dns-over-https) does — some public resolvers
+answer HTTP/1.1 only, and elodin does not assume either is always available.
+Every concurrent query against an h2 upstream multiplexes onto one shared
+connection instead of opening one per request; an upstream that turns out to
+speak HTTP/1.1 falls back to the same pooled-connection model TCP and DoT use.
+Which protocol a given upstream speaks is discovered once, from its first
+connection, and not re-checked after.
+
 Strategies:
 
 | `strategy`    | behaviour                                                        |
