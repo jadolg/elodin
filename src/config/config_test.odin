@@ -178,3 +178,48 @@ test_tls_listener_requires_cert :: proc(t: ^testing.T) {
 	testing.expect(t, len(e.messages) > 0, "expected a message")
 	free_all(context.temp_allocator)
 }
+
+/*
+A verifying DoT upstream needs a name to verify against.
+
+Certificate checking is chain plus name; with no name it is chain alone, which
+accepts anything a trusted CA ever signed and leaves the connection open to
+anyone who can get one. An address given as an IP literal has no name to fall
+back on, so the configuration has to carry one — or say plainly that it does
+not want checking.
+*/
+@(test)
+test_verifying_dot_upstream_requires_a_hostname :: proc(t: ^testing.T) {
+	SHORTHAND :: "upstream:\n  servers: [tls://1.1.1.1:853]\n"
+	_, sh_err := load_string(SHORTHAND, context.temp_allocator)
+	e1, has1 := sh_err.?
+	testing.expect(t, has1, "tls:// by IP with no #hostname should be refused")
+	testing.expect(t, len(e1.messages) > 0, "expected a message")
+
+	MAPPING :: "upstream:\n  servers:\n    - type: tls\n      address: 1.1.1.1\n"
+	_, map_err := load_string(MAPPING, context.temp_allocator)
+	e2, has2 := map_err.?
+	testing.expect(t, has2, "type: tls by IP with no hostname should be refused")
+	testing.expect(t, len(e2.messages) > 0, "expected a message")
+
+	free_all(context.temp_allocator)
+}
+
+// The two ways to make that configuration well-formed: name the certificate, or
+// say that it is not to be checked.
+@(test)
+test_dot_upstream_hostname_alternatives_are_accepted :: proc(t: ^testing.T) {
+	PINNED :: "upstream:\n  servers: [tls://1.1.1.1:853#cloudflare-dns.com]\n"
+	cfg, perr := load_string(PINNED, context.temp_allocator)
+	testing.expect(t, perr == nil, "a pinned certificate name should load cleanly")
+	testing.expect_value(t, len(cfg.upstream.servers), 1)
+	testing.expect_value(t, cfg.upstream.servers[0].hostname, "cloudflare-dns.com")
+
+	UNVERIFIED :: "upstream:\n  servers:\n    - type: tls\n      address: 1.1.1.1\n      verify: false\n"
+	cfg2, uerr := load_string(UNVERIFIED, context.temp_allocator)
+	testing.expect(t, uerr == nil, "verify: false is a deliberate opt-out and should load")
+	testing.expect_value(t, len(cfg2.upstream.servers), 1)
+	testing.expect(t, !cfg2.upstream.servers[0].verify, "verify should stay off")
+
+	free_all(context.temp_allocator)
+}

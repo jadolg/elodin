@@ -349,10 +349,39 @@ load_upstream_spec :: proc(
 		}
 	}
 
+	if !check_verify_has_a_name(l, spec, path) {
+		return {}, false
+	}
 	if spec.name == "" {
 		spec.name = describe_upstream(spec, l.allocator)
 	}
 	return spec, true
+}
+
+/*
+An upstream that verifies certificates has to say which name to verify.
+
+Checking a certificate is checking the chain *and* the name; with no name it is
+the chain alone, which accepts anything a trusted CA has ever signed for anyone.
+An address written as an IP literal leaves nothing to fall back on, so this is
+refused at load rather than at the first query — an operator who meant to pin a
+name gets told, and one who meant not to check says so with `verify: false`.
+*/
+@(private)
+check_verify_has_a_name :: proc(l: ^Loader, spec: Upstream_Spec, path: string) -> bool {
+	if spec.kind != .TLS && spec.kind != .HTTPS {
+		return true
+	}
+	if !spec.verify || spec.hostname != "" {
+		return true
+	}
+	errorf(
+		l,
+		"%s: verify is on but there is no hostname to check the certificate against; " +
+		"add '#name' after the address, set 'hostname:', or set 'verify: false'",
+		path,
+	)
+	return false
 }
 
 // "1.1.1.1", "8.8.8.8:53", "tcp://9.9.9.9", "tls://1.1.1.1:853#cloudflare-dns.com",
@@ -417,6 +446,9 @@ parse_upstream_shorthand :: proc(
 	spec.port = port if port != 0 else (853 if spec.kind == .TLS else 53)
 	if spec.hostname == "" && net.parse_address(host) == nil {
 		spec.hostname = host
+	}
+	if !check_verify_has_a_name(l, spec, path) {
+		return {}, false
 	}
 	spec.name = describe_upstream(spec, l.allocator)
 	return spec, true

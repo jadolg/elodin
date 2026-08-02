@@ -553,6 +553,24 @@ the reference resolver.
 
 Every one of these was invisible to the unit tests:
 
+- **A verifying TLS client checked the chain but not the name.** `SSL_set1_host`
+  is what ties a certificate to the peer you meant to reach, and it was only
+  called when a hostname was supplied. A `tls://` upstream written as an IP
+  literal has none — config only fills the hostname in when the address is *not*
+  an address — while `verify` defaults on, so `tls://1.1.1.1:853` accepted any
+  certificate any trusted CA had ever issued, for any name. The whole point of
+  DoT, undone by a configuration the README showed one line further up. Now
+  refused at load with a message naming the three ways out, and refused again in
+  `tlsx` so no caller can ask for it by accident.
+- **A chunk size was narrowed before it was bounded.** `strconv.parse_u64_of_base`
+  has no overflow check: it wraps and still reports success. A chunked HTTP
+  response whose size read `FFFFFFFFFFFFFFFF` therefore parsed cleanly, turned
+  negative on the way into `int`, passed a body-size guard written as
+  `len(out) + int(size) > MAX`, and asked the reader for a slice ending before it
+  started — with the cursor left negative for everything after it. The release
+  build compiles bounds checks out, so this was an out-of-bounds access at an
+  offset the peer chose, reachable from any DoH upstream speaking HTTP/1.1 and
+  from any blocklist served over plain HTTP.
 - **A key tag was treated as a key's identity.** Verifying a zone's DNSKEY set
   against its parent's DS, the code found the key the DS attested and then
   handed the whole key set to the signature check — which picks a key by tag and

@@ -418,3 +418,50 @@ test_bootstrap_refresh_does_not_orphan_its_key :: proc(t: ^testing.T) {
 
 	free_all(context.temp_allocator)
 }
+
+/*
+A chunk size too large to be an int must be refused, not narrowed.
+
+`strconv.parse_u64_of_base` has no overflow check: it wraps and still reports
+success, so a header of sixteen `F`s parses cleanly and turns negative on the
+way into `int`. A negative count slips past the body-size guard, walks the
+reader's position backwards and asks for a slice whose end precedes its start —
+which a release build, compiled with bounds checks off, hands out.
+*/
+@(test)
+test_chunk_size_too_large_is_refused :: proc(t: ^testing.T) {
+	CASES :: []string {
+		"FFFFFFFFFFFFFFFF\r\nxxxx\r\n0\r\n\r\n",
+		"8000000000000000\r\nxxxx\r\n0\r\n\r\n",
+		// Longer than 16 digits: the parser wraps round to a small value that
+		// would otherwise be read as a plausible size.
+		"10000000000000001\r\nxxxx\r\n0\r\n\r\n",
+	}
+	for body in CASES {
+		r := Buf_Reader {
+			buf = make([dynamic]u8, 0, 128, context.temp_allocator),
+		}
+		append(&r.buf, ..transmute([]u8)body)
+
+		_, err := read_chunked(&r, context.temp_allocator)
+		testing.expectf(t, err != .None, "%q was accepted as a chunk size", body)
+		testing.expectf(t, r.pos >= 0, "%q left the reader at position %d", body, r.pos)
+	}
+	free_all(context.temp_allocator)
+}
+
+// A count that cannot be read cannot be satisfied, and must not be answered
+// with a slice running backwards from the cursor.
+@(test)
+test_reader_exact_refuses_a_negative_count :: proc(t: ^testing.T) {
+	r := Buf_Reader {
+		buf = make([dynamic]u8, 0, 32, context.temp_allocator),
+	}
+	append(&r.buf, "abcdefgh")
+	r.pos = 4
+
+	_, err := reader_exact(&r, -1)
+	testing.expect(t, err != .None, "a negative count was accepted")
+	testing.expect_value(t, r.pos, 4)
+	free_all(context.temp_allocator)
+}

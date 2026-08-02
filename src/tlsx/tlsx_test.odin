@@ -3,6 +3,7 @@ package tlsx
 import "core:net"
 import "core:os"
 import "core:sync"
+import "core:sys/posix"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -413,4 +414,109 @@ idle_worker :: proc(i: ^Idle_Ctx) {
 	defer sync.atomic_store(&i.done, true)
 	buf: [64]u8
 	read(i.conn, buf[:])
+}
+
+/*
+Dial the loopback server once and hand back what the handshake made of it.
+
+The client context verifies against the server's own certificate, so the chain
+always checks out and the only thing left to decide the outcome is whether the
+name was checked.
+*/
+@(private = "file")
+verified_handshake :: proc(t: ^testing.T, hostname: string) -> (err: Error, ran: bool) {
+	cert, key, have := ensure_certs()
+	if !have {
+		testing.expect(t, false, "no certificate available and openssl could not make one")
+		return .None, false
+	}
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return .None, false
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the bound port: %v", berr)
+		return .None, false
+	}
+
+	sctx, serr := server_context(cert, key)
+	if serr != .None {
+		testing.expectf(t, false, "server_context: %v", serr)
+		return .None, false
+	}
+	defer context_destroy(sctx)
+	// The server's own certificate as the trust store: the chain is beyond
+	// question, which leaves the name as the only thing under test.
+	cctx, cerr := client_context(true, cert)
+	if cerr != .None {
+		testing.expectf(t, false, "client_context: %v", cerr)
+		return .None, false
+	}
+	defer context_destroy(cctx)
+
+	actx := new(Accept_Ctx)
+	defer free(actx)
+	actx.listener = listener
+	actx.ctx = sctx
+	accept := thread.create_and_start_with_poly_data(actx, accept_worker)
+	defer {
+		thread.join(accept)
+		thread.destroy(accept)
+		if actx.conn != nil {
+			close(actx.conn)
+		}
+	}
+
+	sock, derr := net.dial_tcp_from_endpoint(bound)
+	if derr != nil {
+		testing.expectf(t, false, "cannot dial: %v", derr)
+		return .None, false
+	}
+	_ = net.set_option(sock, .Receive_Timeout, 10 * time.Second)
+	_ = net.set_option(sock, .Send_Timeout, 10 * time.Second)
+
+	conn, clerr := client_connect(cctx, sock, hostname)
+	if clerr != .None {
+		net.close(sock)
+		return clerr, true
+	}
+	close(conn)
+	return .None, true
+}
+
+/*
+A verifying context must not accept a peer whose name it never checked.
+
+`SSL_set1_host` is the only thing that ties a certificate to the name we meant
+to reach; `SSL_VERIFY_PEER` on its own only asks that the chain end somewhere
+trusted. Skipping the call for an empty hostname therefore accepts any
+certificate from any trusted CA, which is the whole of a DoT upstream's
+protection. The configuration reaches this: a `tls://` upstream given as an IP
+literal leaves the hostname empty while `verify` defaults on.
+*/
+@(test)
+test_verifying_context_refuses_a_nameless_peer :: proc(t: ^testing.T) {
+	// Both ends of the session are shut down here, so the second close_notify
+	// goes to a socket whose peer has already gone. The server ignores SIGPIPE
+	// for the same reason (see main.odin); the test runner does not.
+	posix.sigignore(.SIGPIPE)
+
+	// A name the certificate does not carry is refused, which is what shows the
+	// checking is on at all. OpenSSL fails the handshake itself over it, so the
+	// error names that rather than the verification behind it.
+	wrong, ran := verified_handshake(t, "wrong.example")
+	if !ran {
+		return
+	}
+	testing.expectf(t, wrong != .None, "a certificate for another name was accepted")
+
+	// No name at all must not be the way around it.
+	nameless, ran2 := verified_handshake(t, "")
+	if !ran2 {
+		return
+	}
+	testing.expect_value(t, nameless, Error.Verify_Failed)
 }
