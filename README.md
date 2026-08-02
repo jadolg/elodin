@@ -9,7 +9,7 @@ Pi-hole and AdGuard Home, minus the web interface. One binary, one YAML file.
 - Sink lists in hosts, plain-domain and adblock syntax, with allowlists
 - Answer cache with negative caching and optional stale serving
 - Local rewrites (A, AAAA, CNAME, or "answer as if blocked")
-- DNSSEC validation against the root trust anchors, off by default
+- DNSSEC validation against the root trust anchors, on by default
 
 ## Requirements
 
@@ -205,8 +205,12 @@ taking the upstream's word for them. An answer that does not check out becomes
 SERVFAIL and never reaches the client; one that does gets the AD bit; a name in
 an unsigned zone is served normally, because unsigned is not the same as forged.
 
-It is off by default. Turning it on changes what a failure looks like, and that
-is a decision for whoever runs the resolver.
+It is on by default: a resolver that forwards signatures without checking them
+gives the answers an authority they have not earned. Turning it off is for an
+upstream that cannot be trusted to return DNSSEC records — an ISP or
+captive-portal resolver, say — since against one of those every signed zone
+would stop resolving rather than merely going unverified. That is a decision
+for whoever runs the resolver.
 
 Being a forwarder rather than a recursor, elodin has to ask for the material it
 validates against: every DS and DNSKEY on the way down from the root is fetched
@@ -249,7 +253,7 @@ records stripped back out of its answer, which is both what RFC 4035 asks for
 and what keeps ordinary answers from growing past the point of needing a retry
 over TCP.
 
-Two things worth knowing before turning it on:
+Two things worth knowing about running with it on:
 
 - **Distribution crypto policy can take algorithms away.** Fedora and RHEL ship
   an OpenSSL that refuses SHA-1 signatures outright (`rh-allow-sha1-signatures =
@@ -409,9 +413,9 @@ Memory, for a full configuration under load:
 It holds there. Over a 60-second run serving 8.65 million queries, resident
 memory stayed at 154 MB to the megabyte and the thread count never moved.
 
-Disk is negligible: a 2.2 MB binary, and a blocklist cache the size of the lists
-themselves (6.5 MB for two large ones). Nothing is written in steady state —
-with one exception below.
+Disk is negligible: an 800 KB binary, and a blocklist cache the size of the
+lists themselves (6.5 MB for two large ones). Nothing is written in steady
+state — with one exception below.
 
 Two settings cost real throughput: `log.queries` takes about 18% and writes
 ~12 MB/s at 150k qps — the one thing that touches the disk in steady state, so
@@ -423,7 +427,7 @@ number of servers.
 - The DoH **upstream client** speaks HTTP/1.1, not HTTP/2. Every public DoH
   resolver still accepts it, so this costs nothing today; the h2 code is
   server-side only.
-- DNSSEC validation is **off by default**, and where a distribution's crypto
+- DNSSEC validation is **on by default**, and where a distribution's crypto
   policy forbids SHA-1 signatures the two RSA/SHA-1 algorithms degrade to
   insecure rather than validating. See the DNSSEC section above.
 - **Encrypted transports get a thread per connection**, capped by
@@ -491,7 +495,7 @@ denial is checked against, and a response built to make one question cost as man
 upstream lookups as possible. Each was checked against the code as it stood
 before the fix, so they are known to fail when the property they guard does.
 
-**Integration tests** (`mise run itest`, 127 cases, ~20s) start the built binary
+**Integration tests** (`mise run itest`, 128 cases, ~20s) start the built binary
 as a separate process against scripted mock upstreams, so what is exercised is
 the artefact that ships rather than the library it was compiled from. The suite
 is hermetic: no public resolver is contacted, ports are allocated from a private
