@@ -15,16 +15,24 @@ lazily on the next spawn, which keeps the accept loop free of a reaper thread.
 */
 Conn_Manager :: struct {
 	mu:        sync.Mutex,
-	threads:   [dynamic]^thread.Thread,
+	threads:   [dynamic]Conn_Thread,
 	limit:     int,
 	// Accept and read loops live here too, but must not eat into the limit the
-	// operator set for client connections.
+	// operator set for client connections. Adjusted as threads are reaped as
+	// well as as they are added: the limit is `len(threads) - permanent`, so a
+	// figure that only ever grows stops describing anything once a loop ends.
 	permanent: int,
+}
+
+@(private)
+Conn_Thread :: struct {
+	handle:    ^thread.Thread,
+	permanent: bool,
 }
 
 conn_manager_init :: proc(cm: ^Conn_Manager, limit: int) {
 	cm.limit = max(limit, 1)
-	cm.threads = make([dynamic]^thread.Thread, 0, 16)
+	cm.threads = make([dynamic]Conn_Thread, 0, 16)
 }
 
 /*
@@ -46,7 +54,7 @@ conn_spawn :: proc(cm: ^Conn_Manager, data: rawptr, fn: proc(data: rawptr), coun
 	if t == nil {
 		return false
 	}
-	append(&cm.threads, t)
+	append(&cm.threads, Conn_Thread{handle = t, permanent = !counted})
 	if !counted {
 		cm.permanent += 1
 	}
@@ -57,10 +65,13 @@ conn_spawn :: proc(cm: ^Conn_Manager, data: rawptr, fn: proc(data: rawptr), coun
 reap_locked :: proc(cm: ^Conn_Manager) {
 	i := 0
 	for i < len(cm.threads) {
-		t := cm.threads[i]
-		if thread.is_done(t) {
-			thread.join(t)
-			thread.destroy(t)
+		entry := cm.threads[i]
+		if thread.is_done(entry.handle) {
+			thread.join(entry.handle)
+			thread.destroy(entry.handle)
+			if entry.permanent {
+				cm.permanent -= 1
+			}
 			unordered_remove(&cm.threads, i)
 			continue
 		}
@@ -83,9 +94,9 @@ conn_manager_shutdown :: proc(cm: ^Conn_Manager) {
 	cm.threads = nil
 	sync.mutex_unlock(&cm.mu)
 
-	for t in threads {
-		thread.join(t)
-		thread.destroy(t)
+	for entry in threads {
+		thread.join(entry.handle)
+		thread.destroy(entry.handle)
 	}
 	delete(threads)
 }

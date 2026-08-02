@@ -553,6 +553,25 @@ the reference resolver.
 
 Every one of these was invisible to the unit tests:
 
+- **A malformed query was answered with someone else's transaction ID.**
+  `error_response` picked its fallback on whether the encoder objected, and it
+  never does: a query that failed to decode arrives as an empty message, and an
+  empty message encodes perfectly well — into twelve bytes carrying ID zero. The
+  header-patching path its own doc comment described was therefore unreachable,
+  and every malformed datagram got a reply the client could not match to its
+  question, so it waited out the full timeout instead of failing fast.
+- **A parsed DoH request pointed into a buffer that could move.** The reader
+  hands back views into the buffer it goes on appending to, and the method,
+  path, query string and content type were kept as views while the headers and
+  then the body were read. That they still read correctly was a property of the
+  arena behind the scratch allocator, which carries the old contents forward —
+  not of anything the reader did. A test that swaps in an allocator which
+  scribbles over a released block reads `0xDD` out of every field.
+- **The connection limit drifted once a listener loop was reaped.** The limit is
+  `len(threads) - permanent`, and `permanent` only ever grew; reaping a finished
+  loop took it off the list without touching the count, so the total goes
+  negative and the limit stops holding for as many connections as there were
+  loops.
 - **An answer nobody checked still claimed to have been checked.** The AD bit
   was only ever touched on the path where validation had run, so with DNSSEC
   switched off — or for a client that set CD, which asks us to leave the

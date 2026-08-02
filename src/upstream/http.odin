@@ -88,7 +88,15 @@ reader_fill :: proc(r: ^Buf_Reader) -> Error {
 	return .None
 }
 
-// Read up to and including the next CRLF, returning the line without it.
+/*
+Read up to and including the next CRLF, returning the line without it.
+
+The result is a view into `r.buf`, which every later read may grow — and past
+its capacity that means a different block. So a line is good until the next read
+and no longer: `http_exchange` finishes with each one inside the iteration that
+produced it, and clones the one thing it keeps. Anything added here that holds a
+line across a read has to copy it first.
+*/
 @(private)
 reader_line :: proc(r: ^Buf_Reader) -> (line: string, err: Error) {
 	for {
