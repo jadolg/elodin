@@ -67,8 +67,8 @@ make_response :: proc(query: Message, rcode: Rcode, allocator := context.allocat
 /*
 Encode a bare error response for a query we could not or would not answer.
 
-Falls back to patching the request's own header in place when the query cannot
-be parsed, which is the only way to answer a malformed datagram at all.
+Falls back to patching the request's own header when there is no decoded query
+to build from, which is the only way to answer a malformed datagram at all.
 */
 error_response :: proc(
 	query_bytes: []u8,
@@ -80,10 +80,24 @@ error_response :: proc(
 	out: []u8,
 	ok: bool,
 ) {
-	resp := make_response(query, rcode, allocator)
-	bytes, _, err := encode_message(resp, allocator, max_size)
-	if err == .None {
-		return bytes, true
+	/*
+	A query that did not decode arrives here as an empty message, and an empty
+	message encodes perfectly well - into twelve bytes carrying id zero and no
+	question. Taking that as success is what left the fallback below unreachable
+	and sent malformed queries a reply their client had no way to recognise: a
+	stub matches on the transaction ID, so what came back was dropped as
+	unsolicited and the query waited out its full timeout.
+
+	So the decision is made on whether there is anything to build from, not on
+	whether the encoder objected.
+	*/
+	usable := len(query.question) > 0 || query.id != 0
+	if usable {
+		resp := make_response(query, rcode, allocator)
+		bytes, _, err := encode_message(resp, allocator, max_size)
+		if err == .None {
+			return bytes, true
+		}
 	}
 
 	if len(query_bytes) < HEADER_SIZE {

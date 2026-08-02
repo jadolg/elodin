@@ -323,3 +323,48 @@ test_ad_bit_is_not_forwarded_when_we_did_not_validate :: proc(t: ^testing.T) {
 		free_all(context.temp_allocator)
 	}
 }
+
+/*
+A reply to a query we could not parse still has to be recognisable as a reply.
+
+`make_response` builds from the decoded message, and a query that did not decode
+leaves that empty — id zero, no question. Encoding an empty message succeeds, so
+`error_response` returned those twelve bytes and never reached the fallback that
+was written to patch the request's own header. The client is waiting on its own
+transaction ID, so what came back was dropped as unsolicited and the query
+waited out its full timeout instead.
+*/
+@(test)
+test_formerr_for_an_unparseable_query_carries_its_id :: proc(t: ^testing.T) {
+	// A header claiming a question that is not there: enough to fail the decode
+	// while still being a header we can answer from.
+	query := make([]u8, dns.HEADER_SIZE, context.temp_allocator)
+	query[0], query[1] = 0xab, 0xcd
+	query[2] = 0x01 // RD
+	query[5] = 1 // qdcount, with no question following it
+
+	_, derr := dns.decode_message(query, context.temp_allocator)
+	testing.expect(t, derr != .None, "the fixture parsed, so it is not testing the unparseable path")
+
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.cache.enabled = false
+	s := Server {
+		cfg = &cfg,
+	}
+
+	out, outcome, ok := handle_query(&s, query, .UDP, "test", context.temp_allocator)
+	testing.expect(t, ok, "no response was produced for a malformed query")
+	testing.expect_value(t, outcome, Outcome.Failed)
+	if !ok || len(out) < dns.HEADER_SIZE {
+		return
+	}
+
+	id, id_ok := dns.peek_id(out)
+	testing.expect(t, id_ok, "the response is too short to carry an id")
+	testing.expectf(t, id == 0xabcd, "the reply carries id %04x, not the query's abcd", id)
+	testing.expect(t, out[2] & 0x80 != 0, "the reply is not marked as a response")
+	testing.expect_value(t, out[3] & 0xf, u8(dns.Rcode.Form_Err))
+
+	free_all(context.temp_allocator)
+}
