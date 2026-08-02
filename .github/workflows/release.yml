@@ -1,0 +1,35 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+      - run: mise run release
+
+      - name: Package
+        run: |
+          stage=elodin-${{ github.event.release.tag_name }}-linux-amd64
+          mkdir "$stage"
+          cp bin/elodin "$stage"/
+          cp packaging/elodin.service "$stage"/
+          cp examples/elodin.yaml "$stage"/
+          cp README.md "$stage"/
+          tar -czf "$stage.tar.gz" "$stage"
+
+      - name: Upload release asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload ${{ github.event.release.tag_name }} elodin-${{ github.event.release.tag_name }}-linux-amd64.tar.gz --clobber
