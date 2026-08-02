@@ -80,6 +80,15 @@ Stream :: struct {
 	send_window:  int,
 	// Request parked between its headers and the end of its body.
 	pending:      ^Request,
+	/*
+	Whether a handler has been given this stream, which decides who retires it.
+
+	A dispatched stream is `respond`'s to close, and it has to still be in the
+	table when that runs so the cancellation above is seen and the answer
+	skipped. One that was never dispatched has nobody to do that, so a reset
+	has to close it there and then or nothing ever will.
+	*/
+	dispatched:   bool,
 }
 
 Conn :: struct {
@@ -324,11 +333,17 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 
 	case .Rst_Stream:
 		sync.mutex_lock(&c.mu)
+		orphaned := false
 		if s, found := c.streams[h.stream_id]; found {
 			s.cancelled = true
 			s.state = .Closed
+			// Nobody is coming for this one. See `Stream.dispatched`.
+			orphaned = !s.dispatched
 		}
 		sync.mutex_unlock(&c.mu)
+		if orphaned {
+			close_stream(c, h.stream_id)
+		}
 		return true
 
 	case .Priority:
@@ -661,6 +676,12 @@ dispatch :: proc(c: ^Conn, s: ^Stream, req: ^Request) -> bool {
 		copy(body, s.body[:])
 		req.body = body
 	}
+	// Marked before the handler runs, not after: it may answer inline and retire
+	// the stream, and a reset arriving for an answered stream must not be read
+	// as one nobody was ever given.
+	sync.mutex_lock(&c.mu)
+	s.dispatched = true
+	sync.mutex_unlock(&c.mu)
 	c.handler(c, req)
 	return true
 }
