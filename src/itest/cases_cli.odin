@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
+import "core:time"
 
 /*
 Command-line behaviour: the checks an operator relies on before a deploy.
@@ -164,4 +165,76 @@ run_cli_cases :: proc(r: ^Runner) {
 @(private = "file")
 new_check :: proc(r: ^Runner, path: string, tag: string) -> Run_Result {
 	return run_binary(r, []string{"--config", path, "--check"}, tag)
+}
+
+/*
+Graceful shutdown.
+
+An init system stops a service with SIGTERM and expects it to put itself away.
+Without a handler the default disposition applies and the process is simply
+terminated, which means none of the teardown ever runs: connections are cut
+mid-answer, and the ordering that makes the teardown safe is never exercised at
+all.
+*/
+@(private = "file")
+config_for_shutdown :: proc(port, upstream_port: int) -> string {
+	return fmt.tprintf(
+		`log: {{ level: info }}
+listeners:
+  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
+  tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
+upstream:
+  timeout: 2s
+  servers: ["127.0.0.1:%d"]
+cache: {{ enabled: true }}
+blocking: {{ enabled: false }}
+`,
+		port,
+		port,
+		upstream_port,
+	)
+}
+
+run_shutdown_cases :: proc(r: ^Runner) {
+	f := fixture("a")
+	upstream_port := next_port(r)
+	mock := mock_make("shutdown", upstream_port)
+	mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
+	if !mock_start(mock) {
+		skip_case(r, "shutdown", "cannot start the mock upstream")
+		return
+	}
+	defer mock_stop(mock)
+
+	port := next_port(r)
+	srv, ok := start_server(
+		r,
+		Server_Options{config = config_for_shutdown(port, upstream_port), port = port},
+	)
+	if !ok {
+		skip_case(r, "shutdown", "server did not start")
+		return
+	}
+	defer stop_server(&srv)
+
+	start_case(r, "shutdown: SIGTERM is answered by an orderly exit")
+	{
+		// Answer something first, so the shutdown has a warmed-up server with
+		// its worker pools and caches populated to take down.
+		res := query_udp(port, from_hex(f.query))
+		check(r, res.ok, "the server did not answer before being asked to stop")
+
+		state, exited := signal_shutdown(&srv, 15 * time.Second)
+		if check(r, exited, "the server did not exit within 15s of SIGTERM") {
+			check(
+				r,
+				state.success && state.exit_code == 0,
+				"exited with code %d (success=%v); a signal default disposition looks like this",
+				state.exit_code,
+				state.success,
+			)
+			check(r, log_contains(&srv, "shutting down"), "no shutdown was logged, so the teardown never ran")
+		}
+	}
+	end_case(r)
 }

@@ -64,6 +64,19 @@ A cache directory it cannot write is a warning, not an error: the lists are
 still downloaded and applied, they just have to be fetched again on the next
 start.
 
+### Stopping
+
+`SIGTERM` and `SIGINT` ask for an orderly shutdown: the listeners stop, the
+worker pools drain what they had queued, and everything those jobs use is
+released afterwards rather than out from under them. An idle server is gone in
+well under a tenth of a second.
+
+Open client connections are waited on, and a connection sitting idle is only
+noticed when its read times out — so with clients connected, stopping can take
+up to `server.client_timeout` (ten seconds by default). That is comfortably
+inside systemd's `TimeoutStopSec`. A second signal skips the wait and terminates
+immediately, for when that is not what you want.
+
 `examples/elodin.yaml` documents every setting. A minimal config is:
 
 ```yaml
