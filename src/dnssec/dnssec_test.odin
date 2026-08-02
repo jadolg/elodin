@@ -918,3 +918,102 @@ test_answers_question_follows_the_cname_chain :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, !answers_question(loop, "a.example.com.", .A, .IN), "a CNAME loop should not be an answer")
 }
+
+@(test)
+test_cached_key_set_holds_no_gaps :: proc(t: ^testing.T) {
+	/*
+	`cache_put` copies each key, re-parses the copy, and skips any that fail -
+	but writes by index, so a skip leaves a zero-valued `Dnskey` behind rather
+	than a shorter set.
+
+	Nothing reaches that today: every key handed here has already been parsed
+	from the same bytes once. It is worth closing anyway, because of the
+	direction it fails in. A zero key carries algorithm 0, which no signature
+	matches, and an RRset with nothing to check it against is reported
+	unsupported - which `validate_rrset` turns into insecure. A cache quietly
+	holding entries that mean "treat this zone as unsigned" is the wrong way
+	round for a validator.
+	*/
+	v := make_validator(fixture_query, nil, Options{})
+	defer destroy_validator(v)
+
+	// One key that parses, one that cannot: too short to hold a public key.
+	good := fixture_dnskey(t)
+	bad := Dnskey {
+		rdata = []u8{1, 1},
+	}
+	cache_put(v, "example.com.", .Secure, []Dnskey{good, bad}, 300, fixture_now())
+
+	entry, found := v.zones["example.com."]
+	testing.expect(t, found, "the zone should have been cached")
+	if !found {
+		return
+	}
+	for key, i in entry.keys {
+		testing.expectf(t, len(key.rdata) > 0, "cached key %d is a gap left by a parse failure", i)
+		testing.expectf(t, key.algorithm != 0, "cached key %d has no algorithm", i)
+	}
+	free_all(context.temp_allocator)
+}
+
+@(private = "file")
+fixture_dnskey :: proc(t: ^testing.T) -> Dnskey {
+	msg, _ := dns.decode_message(unhex(fixture("example_dnskey").wire), context.temp_allocator)
+	for rec in msg.answer {
+		if rec.type != .DNSKEY {
+			continue
+		}
+		rdata, ok := raw_rdata(rec)
+		if !ok {
+			continue
+		}
+		key, perr := parse_dnskey(rdata)
+		if perr == .None {
+			return key
+		}
+	}
+	testing.expect(t, false, "no usable DNSKEY in the fixture")
+	return {}
+}
+
+@(test)
+test_literal_wildcard_name_is_not_an_expansion :: proc(t: ^testing.T) {
+	/*
+	A name that is itself a wildcard - a query for `*.example.com.`, which is a
+	perfectly ordinary name to hold records - is not a wildcard expansion.
+
+	RFC 4034 section 3.1.3 counts the Labels field without the leading `*`, so a
+	correct signature over `*.example.com.` says 2 where the name has 3
+	separators. Reading that as "fewer labels than the owner, so the zone
+	answered from a wildcard" demands a proof that the name does not exist, for
+	a name that plainly does, and the answer is refused.
+	*/
+	records := make([]dns.Record, 1, context.temp_allocator)
+	records[0] = dns.Record {
+		name  = "*.example.com.",
+		type  = .A,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_A{addr = {192, 0, 2, 1}},
+	}
+	sig := Rrsig {
+		type_covered = .A,
+		algorithm    = ALG_ED25519,
+		// The zone's own count: three labels, less the `*`.
+		labels       = 2,
+		original_ttl = 60,
+		// A real window around FIXTURE_TIME. Timestamps compare as RFC 1982
+		// serials, so max(u32) is not "far future" - it reads as long past.
+		inception    = u32(FIXTURE_TIME) - 86400,
+		expiration   = u32(FIXTURE_TIME) + 86400 * 365,
+		key_tag      = 1,
+		signer       = "example.com.",
+		signature    = []u8{0},
+	}
+
+	// No keys, so this cannot verify - the verdict is not what is under test.
+	// What matters is whether it was read as a wildcard expansion.
+	_, wildcard := check_signature(sig, "*.example.com.", .IN, records, nil, u32(FIXTURE_TIME), context.temp_allocator)
+	testing.expect(t, !wildcard, "a literal wildcard name was taken for a wildcard expansion")
+	free_all(context.temp_allocator)
+}

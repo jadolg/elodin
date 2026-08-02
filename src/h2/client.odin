@@ -516,9 +516,17 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 	sync.mutex_unlock(&c.mu)
 
 	if oversized {
-		// The stream is over as far as we are concerned; no point reading
-		// more of a body we have already discarded.
-		return client_rst_stream(c, h.stream_id, .Enhance_Your_Calm)
+		/*
+		The stream is over as far as we are concerned; no point reading more of
+		a body we have already discarded. The connection is a different matter -
+		these bytes came off it and count against a receive window shared by
+		every stream on it, so the credit goes back even though the stream-level
+		update does not.
+		*/
+		if !client_rst_stream(c, h.stream_id, .Enhance_Your_Calm) {
+			return false
+		}
+		return client_give_connection_credit(c, len(payload))
 	}
 
 	// Give the credit straight back; we buffer whole responses anyway.
@@ -557,6 +565,19 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 	sync.cond_broadcast(&c.cond)
 	sync.mutex_unlock(&c.mu)
 	return true
+}
+
+// Hand back connection-level receive window for bytes already read, whatever
+// became of the stream they belonged to.
+@(private)
+client_give_connection_credit :: proc(c: ^Client, n: int) -> bool {
+	if n <= 0 {
+		return true
+	}
+	out := make([dynamic]u8, 0, 13, context.temp_allocator)
+	write_frame_header(&out, 4, .Window_Update, 0, 0)
+	append_u32(&out, u32(n))
+	return client_write_all(c, out[:])
 }
 
 @(private)

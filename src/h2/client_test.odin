@@ -657,3 +657,77 @@ test_data_frame_cannot_touch_an_abandoned_stream :: proc(t: ^testing.T) {
 		testing.expectf(t, false, "data after abandon: %d bytes leaked, allocated at %v", entry.size, entry.location)
 	}
 }
+
+@(private = "file")
+Client_Frame_Log :: struct {
+	frames: [dynamic]Frame_Header,
+}
+
+@(private = "file")
+client_log_write :: proc(user: rawptr, buf: []u8) -> bool {
+	log := cast(^Client_Frame_Log)user
+	if log == nil {
+		return true
+	}
+	pos := 0
+	// The preface is not a frame; skip it when it leads the buffer.
+	if len(buf) >= len(PREFACE) && string(buf[:len(PREFACE)]) == PREFACE {
+		pos = len(PREFACE)
+	}
+	for pos + FRAME_HEADER_SIZE <= len(buf) {
+		h, ok := parse_frame_header(buf[pos:])
+		if !ok {
+			break
+		}
+		append(&log.frames, h)
+		pos += FRAME_HEADER_SIZE + h.length
+	}
+	return true
+}
+
+@(test)
+test_oversized_response_returns_connection_credit :: proc(t: ^testing.T) {
+	/*
+	The client side of the same accounting. An upstream response past the body
+	limit has its stream reset, but the bytes still came off the connection and
+	still count against a receive window every stream on it shares - and this
+	connection is shared by design, so leaking that room stalls every query
+	using it, not just the one that overran.
+	*/
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Client_Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+
+	s := new(Client_Stream, allocator)
+	s.id = 1
+	s.send_window = c.peer_initial_window
+	s.body = make([dynamic]u8, 0, 8, allocator)
+	c.streams[1] = s
+
+	clear(&log.frames)
+	payload := make([]u8, CLIENT_MAX_BODY + 1, context.temp_allocator)
+	client_handle_data(c, Frame_Header{length = len(payload), type = .Data, stream_id = 1}, payload)
+
+	credited := false
+	for f in log.frames {
+		if f.type == .Window_Update && f.stream_id == 0 {
+			credited = true
+		}
+	}
+	testing.expect(t, credited, "the connection window was not replenished for a response that was refused")
+
+	delete(log.frames)
+	client_stream_destroy(c, s)
+	delete_key(&c.streams, u32(1))
+	client_unref(c)
+	free_all(context.temp_allocator)
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "oversized response credit: %d bytes leaked at %v", entry.size, entry.location)
+	}
+}

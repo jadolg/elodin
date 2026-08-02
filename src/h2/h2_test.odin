@@ -559,3 +559,79 @@ test_response_gives_up_when_no_window_is_granted :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 	expect_no_leaks(t, &track, "no window granted")
 }
+
+// ---------------------------------------------------------------------------
+// Flow-control credit for bytes we refused
+// ---------------------------------------------------------------------------
+
+@(private = "file")
+Frame_Log :: struct {
+	frames: [dynamic]Frame_Header,
+}
+
+@(private = "file")
+log_write :: proc(user: rawptr, buf: []u8) -> bool {
+	log := cast(^Frame_Log)user
+	if log == nil {
+		return true
+	}
+	pos := 0
+	for pos + FRAME_HEADER_SIZE <= len(buf) {
+		h, ok := parse_frame_header(buf[pos:])
+		if !ok {
+			break
+		}
+		append(&log.frames, h)
+		pos += FRAME_HEADER_SIZE + h.length
+	}
+	return true
+}
+
+@(private = "file")
+saw_connection_window_update :: proc(log: ^Frame_Log) -> bool {
+	for f in log.frames {
+		if f.type == .Window_Update && f.stream_id == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+@(test)
+test_oversized_body_returns_connection_credit :: proc(t: ^testing.T) {
+	/*
+	A body past the limit is refused and its stream dropped, but the bytes were
+	still read off the connection and still count against the connection's
+	receive window. That window is shared by every stream, and nothing ever
+	replenishes it on its own, so skipping the WINDOW_UPDATE here costs the
+	connection that much room permanently. Enough of them and the peer is no
+	longer allowed to send anything at all.
+	*/
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+
+	clear(&log.frames)
+	body := make([]u8, MAX_BODY + 1, context.temp_allocator)
+	handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+
+	testing.expect(
+		t,
+		saw_connection_window_update(&log),
+		"the connection window was not replenished for a body that was refused",
+	)
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "oversized body credit")
+}

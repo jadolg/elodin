@@ -594,7 +594,14 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 			// The stream is over. Without this it would hold its body, its parked
 			// request and one of MAX_CONCURRENT slots until the connection went.
 			close_stream(c, h.stream_id)
-			return sent
+			/*
+			The stream is finished with, but the connection is not. These bytes
+			came off it and count against a receive window every stream shares,
+			and nothing replenishes that on its own - so refusing the body
+			without returning the credit costs the connection that much room for
+			good. The stream-level update is rightly skipped; that stream is gone.
+			*/
+			return sent && give_connection_credit(c, len(payload))
 		}
 		append(&s.body, ..data)
 	}
@@ -676,6 +683,19 @@ request_destroy :: proc(c: ^Conn, req: ^Request) {
 }
 
 MAX_BODY :: 64 * 1024
+
+// Hand back connection-level receive window for bytes that have been read off
+// the wire, whatever became of the stream they belonged to.
+@(private)
+give_connection_credit :: proc(c: ^Conn, n: int) -> bool {
+	if n <= 0 {
+		return true
+	}
+	out := make([dynamic]u8, 0, 13, context.temp_allocator)
+	write_frame_header(&out, 4, .Window_Update, 0, 0)
+	append_u32(&out, u32(n))
+	return write_all(c, out[:])
+}
 
 @(private)
 rst_stream :: proc(c: ^Conn, stream_id: u32, code: Error_Code) -> bool {
