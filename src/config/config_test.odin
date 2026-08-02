@@ -1,0 +1,180 @@
+package config
+
+import "core:testing"
+import "core:time"
+
+@(private = "file")
+GOOD :: `
+log:
+  level: warn
+  queries: true
+
+listeners:
+  udp: { enabled: true, address: "127.0.0.1", port: 5353 }
+  tcp: { enabled: true, address: "127.0.0.1", port: 5353 }
+
+upstream:
+  strategy: race
+  timeout: 3s
+  bootstrap: [1.1.1.1, 9.9.9.9]
+  servers:
+    - name: cloudflare-dot
+      type: tls
+      address: 1.1.1.1
+      port: 853
+      hostname: cloudflare-dns.com
+    - https://dns.google/dns-query
+    - tcp://9.9.9.9
+    - 192.168.1.1
+
+cache:
+  max_entries: 5000
+  max_ttl: 1h
+
+blocking:
+  response: custom
+  custom_ipv4: 10.0.0.1
+  custom_ipv6: "fd00::1"
+  block_ttl: 30
+  lists:
+    - name: steven-black
+      url: https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
+      format: hosts
+    - /etc/elodin/local.txt
+  rules:
+    - "||tracker.example^"
+  allow:
+    - "@@||needed.example^"
+
+rewrites:
+  - domain: nas.home
+    answer: 192.168.1.50
+  - domain: "*.lan"
+    answers: [192.168.1.10, "fd00::10"]
+  - domain: legacy.example
+    answer: new.example.com
+`
+
+@(test)
+test_load_good_config :: proc(t: ^testing.T) {
+	cfg, err := load_string(GOOD, context.temp_allocator)
+	if e, has := err.?; has {
+		testing.expectf(t, false, "config errors: %v", e.messages)
+		return
+	}
+
+	testing.expect_value(t, cfg.log.level, Log_Level.Warn)
+	testing.expect(t, cfg.log.queries, "queries should be enabled")
+	testing.expect_value(t, cfg.listeners.udp.port, 5353)
+	testing.expect_value(t, cfg.listeners.udp.address, "127.0.0.1")
+	testing.expect(t, !cfg.listeners.dot.enabled, "dot should default to disabled")
+
+	testing.expect_value(t, cfg.upstream.strategy, Strategy.Race)
+	testing.expect_value(t, cfg.upstream.timeout, 3 * time.Second)
+	testing.expect_value(t, len(cfg.upstream.servers), 4)
+
+	s0 := cfg.upstream.servers[0]
+	testing.expect_value(t, s0.kind, Upstream_Kind.TLS)
+	testing.expect_value(t, s0.hostname, "cloudflare-dns.com")
+	testing.expect_value(t, s0.port, 853)
+
+	s1 := cfg.upstream.servers[1]
+	testing.expect_value(t, s1.kind, Upstream_Kind.HTTPS)
+	testing.expect_value(t, s1.hostname, "dns.google")
+	testing.expect_value(t, s1.port, 443)
+	testing.expect_value(t, s1.path, "/dns-query")
+	// Bootstrap falls through from the upstream block.
+	testing.expect_value(t, len(s1.bootstrap), 2)
+
+	s2 := cfg.upstream.servers[2]
+	testing.expect_value(t, s2.kind, Upstream_Kind.TCP)
+	testing.expect_value(t, s2.address, "9.9.9.9")
+	testing.expect_value(t, s2.port, 53)
+
+	s3 := cfg.upstream.servers[3]
+	testing.expect_value(t, s3.kind, Upstream_Kind.UDP)
+	testing.expect_value(t, s3.port, 53)
+
+	testing.expect_value(t, cfg.cache.max_entries, 5000)
+	testing.expect_value(t, cfg.cache.max_ttl, u32(3600))
+
+	testing.expect_value(t, cfg.blocking.response, Block_Response.Custom_IP)
+	testing.expect_value(t, cfg.blocking.custom_ipv4, [4]u8{10, 0, 0, 1})
+	testing.expect_value(t, cfg.blocking.custom_ipv6[0], u8(0xfd))
+	testing.expect_value(t, cfg.blocking.custom_ipv6[15], u8(0x01))
+	testing.expect_value(t, cfg.blocking.block_ttl, u32(30))
+	testing.expect_value(t, len(cfg.blocking.lists), 2)
+	testing.expect_value(t, cfg.blocking.lists[0].format, List_Format.Hosts)
+	testing.expect_value(t, cfg.blocking.lists[1].file, "/etc/elodin/local.txt")
+	testing.expect_value(t, len(cfg.blocking.rules), 1)
+	testing.expect_value(t, len(cfg.blocking.allow_rules), 1)
+
+	testing.expect_value(t, len(cfg.rewrites), 3)
+	testing.expect_value(t, cfg.rewrites[0].domain, "nas.home.")
+	testing.expect(t, !cfg.rewrites[0].wildcard, "first rewrite is not a wildcard")
+	testing.expect_value(t, cfg.rewrites[0].answers[0].kind, Rewrite_Kind.A)
+	testing.expect(t, cfg.rewrites[1].wildcard, "second rewrite should be a wildcard")
+	testing.expect_value(t, cfg.rewrites[1].domain, "lan.")
+	testing.expect_value(t, len(cfg.rewrites[1].answers), 2)
+	testing.expect_value(t, cfg.rewrites[1].answers[1].kind, Rewrite_Kind.AAAA)
+	testing.expect_value(t, cfg.rewrites[2].answers[0].kind, Rewrite_Kind.CNAME)
+	testing.expect_value(t, cfg.rewrites[2].answers[0].name, "new.example.com.")
+
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_defaults_applied :: proc(t: ^testing.T) {
+	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	testing.expect(t, err == nil, "expected a clean load")
+	testing.expect_value(t, cfg.listeners.udp.port, 53)
+	testing.expect_value(t, cfg.upstream.strategy, Strategy.Failover)
+	testing.expect_value(t, cfg.cache.negative_ttl, u32(300))
+	testing.expect_value(t, cfg.blocking.response, Block_Response.NX_Domain)
+	// A configuration that says nothing about DNSSEC still validates.
+	testing.expect(t, cfg.dnssec.enabled, "DNSSEC validation should be on by default")
+	testing.expect_value(t, cfg.dnssec.max_nsec3_iterations, 100)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_dnssec_can_be_turned_off :: proc(t: ^testing.T) {
+	// The escape hatch for an upstream that cannot return DNSSEC records, where
+	// validating would mean answering nothing rather than answering unverified.
+	cfg, err := load_string(
+		"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  enabled: false\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, err == nil, "expected a clean load")
+	testing.expect(t, !cfg.dnssec.enabled, "dnssec.enabled: false should be honoured")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_missing_upstream_is_an_error :: proc(t: ^testing.T) {
+	_, err := load_string("log:\n  level: info\n", context.temp_allocator)
+	e, has := err.?
+	testing.expect(t, has, "expected an error for a config with no upstreams")
+	testing.expect(t, len(e.messages) > 0, "expected a message")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_unknown_enum_values_reported :: proc(t: ^testing.T) {
+	src := "upstream:\n  strategy: teleport\n  servers: [1.1.1.1]\nblocking:\n  response: explode\n"
+	_, err := load_string(src, context.temp_allocator)
+	e, has := err.?
+	testing.expect(t, has, "expected errors")
+	testing.expect_value(t, len(e.messages), 2)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_tls_listener_requires_cert :: proc(t: ^testing.T) {
+	src := "upstream:\n  servers: [1.1.1.1]\nlisteners:\n  dot:\n    enabled: true\n"
+	_, err := load_string(src, context.temp_allocator)
+	e, has := err.?
+	testing.expect(t, has, "expected an error when DoT has no certificate")
+	testing.expect(t, len(e.messages) > 0, "expected a message")
+	free_all(context.temp_allocator)
+}

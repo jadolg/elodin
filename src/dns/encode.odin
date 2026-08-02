@@ -1,0 +1,286 @@
+package dns
+
+import "core:mem"
+import "core:strings"
+
+/*
+Message writer with RFC 1035 name compression.
+
+Note on Rdata_Raw: the decoder only produces it for types that either cannot
+contain a compressed name or failed to parse. Forwarded upstream answers are
+passed through verbatim (see `patch_ttls`) rather than re-encoded, so a raw
+RDATA blob carrying pointers into a foreign message never reaches this writer.
+*/
+Writer :: struct {
+	buf:       [dynamic]u8,
+	comp:      map[string]u16,
+	compress:  bool,
+	allocator: mem.Allocator,
+	// Scratch reused across names so encoding a message stays allocation-light.
+	name_buf:  [MAX_NAME_WIRE]u8,
+	fold_buf:  [MAX_NAME_WIRE]u8,
+	offsets:   [dynamic]int,
+}
+
+writer_init :: proc(w: ^Writer, allocator := context.allocator, compress := true) {
+	w.allocator = allocator
+	w.compress = compress
+	w.buf = make([dynamic]u8, 0, 512, allocator)
+	w.offsets = make([dynamic]int, 0, 16, allocator)
+	if compress {
+		w.comp = make(map[string]u16, 32, allocator)
+	}
+}
+
+writer_destroy :: proc(w: ^Writer) {
+	delete(w.buf)
+	delete(w.offsets)
+	delete(w.comp)
+}
+
+@(private)
+w_u8 :: proc(w: ^Writer, v: u8) {
+	append(&w.buf, v)
+}
+
+@(private)
+w_u16 :: proc(w: ^Writer, v: u16) {
+	append(&w.buf, u8(v >> 8), u8(v))
+}
+
+@(private)
+w_u32 :: proc(w: ^Writer, v: u32) {
+	append(&w.buf, u8(v >> 24), u8(v >> 16), u8(v >> 8), u8(v))
+}
+
+@(private)
+w_bytes :: proc(w: ^Writer, v: []u8) {
+	append(&w.buf, ..v)
+}
+
+@(private)
+w_char_string :: proc(w: ^Writer, s: string) -> Encode_Error {
+	if len(s) > 255 {
+		return .Too_Large
+	}
+	w_u8(w, u8(len(s)))
+	w_bytes(w, transmute([]u8)s)
+	return .None
+}
+
+@(private)
+w_name :: proc(w: ^Writer, name: string, compress := true) -> Encode_Error {
+	n := encode_name(name, w.name_buf[:], &w.offsets) or_return
+	tmp := w.name_buf[:n]
+
+	if !w.compress || !compress {
+		w_bytes(w, tmp)
+		return .None
+	}
+
+	base := len(w.buf)
+	// The last entry is the root label; a 1-byte root beats a 2-byte pointer.
+	for i in 0 ..< max(0, len(w.offsets) - 1) {
+		off := w.offsets[i]
+		suffix := tmp[off:n]
+		for k in 0 ..< len(suffix) {
+			c := suffix[k]
+			w.fold_buf[k] = c + 32 if c >= 'A' && c <= 'Z' else c
+		}
+		key := string(w.fold_buf[:len(suffix)])
+
+		if target, found := w.comp[key]; found {
+			w_bytes(w, tmp[:off])
+			w_u16(w, 0xc000 | target)
+			return .None
+		}
+		if base + off < 0x4000 {
+			w.comp[strings.clone(key, w.allocator)] = u16(base + off)
+		}
+	}
+
+	w_bytes(w, tmp)
+	return .None
+}
+
+// Types whose RDATA name may be compressed. Anything newer must not be
+// (RFC 3597), so the writer emits those names in full.
+@(private)
+rdata_name_compressible :: proc "contextless" (t: Type) -> bool {
+	#partial switch t {
+	case .NS, .CNAME, .SOA, .PTR, .MX, .MINFO, .MB, .MG, .MR, .MD, .MF:
+		return true
+	}
+	return false
+}
+
+@(private)
+w_question :: proc(w: ^Writer, q: Question) -> Encode_Error {
+	w_name(w, q.name) or_return
+	w_u16(w, u16(q.type))
+	w_u16(w, u16(q.class))
+	return .None
+}
+
+@(private)
+w_record :: proc(w: ^Writer, rec: Record) -> Encode_Error {
+	w_name(w, rec.name, compress = rec.type != .OPT) or_return
+	w_u16(w, u16(rec.type))
+	w_u16(w, u16(rec.class))
+	w_u32(w, rec.ttl)
+
+	len_pos := len(w.buf)
+	w_u16(w, 0)
+	rdata_start := len(w.buf)
+
+	compressible := rdata_name_compressible(rec.type)
+
+	switch d in rec.data {
+	case Rdata_A:
+		addr := d.addr
+		w_bytes(w, addr[:])
+	case Rdata_AAAA:
+		addr := d.addr
+		w_bytes(w, addr[:])
+	case Rdata_Name:
+		w_name(w, d.name, compress = compressible) or_return
+	case Rdata_SOA:
+		w_name(w, d.ns, compress = compressible) or_return
+		w_name(w, d.mbox, compress = compressible) or_return
+		w_u32(w, d.serial)
+		w_u32(w, d.refresh)
+		w_u32(w, d.retry)
+		w_u32(w, d.expire)
+		w_u32(w, d.minimum)
+	case Rdata_MX:
+		w_u16(w, d.preference)
+		w_name(w, d.exchange, compress = compressible) or_return
+	case Rdata_TXT:
+		if len(d.strings) == 0 {
+			w_u8(w, 0)
+		}
+		for s in d.strings {
+			w_char_string(w, s) or_return
+		}
+	case Rdata_SRV:
+		w_u16(w, d.priority)
+		w_u16(w, d.weight)
+		w_u16(w, d.port)
+		w_name(w, d.target, compress = false) or_return
+	case Rdata_CAA:
+		w_u8(w, d.flags)
+		w_char_string(w, d.tag) or_return
+		w_bytes(w, transmute([]u8)d.value)
+	case Rdata_SVCB:
+		w_u16(w, d.priority)
+		w_name(w, d.target, compress = false) or_return
+		w_bytes(w, d.params)
+	case Rdata_OPT:
+		for opt in d.options {
+			w_u16(w, opt.code)
+			w_u16(w, u16(len(opt.data)))
+			w_bytes(w, opt.data)
+		}
+	case Rdata_Raw:
+		w_bytes(w, d.data)
+	case:
+		// nil rdata encodes as an empty RDATA section
+	}
+
+	rdlen := len(w.buf) - rdata_start
+	if rdlen > 0xffff {
+		return .Too_Large
+	}
+	w.buf[len_pos] = u8(rdlen >> 8)
+	w.buf[len_pos + 1] = u8(rdlen)
+	return .None
+}
+
+/*
+Serialise a message, truncating at `max_size` if necessary.
+
+When records have to be dropped the TC bit is set and, if the additional section
+carried an OPT record, that record is re-appended so the client still sees our
+EDNS parameters.
+*/
+encode_message :: proc(
+	m: Message,
+	allocator := context.allocator,
+	max_size := MAX_MESSAGE,
+	compress := true,
+) -> (
+	out: []u8,
+	truncated: bool,
+	err: Encode_Error,
+) {
+	w: Writer
+	writer_init(&w, allocator, compress)
+
+	append(&w.buf, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+	for q in m.question {
+		w_question(&w, q) or_return
+	}
+	if len(w.buf) > max_size {
+		return nil, true, .Buffer_Too_Small
+	}
+	qdcount := u16(len(m.question))
+
+	counts: [3]u16
+	sections := [3][]Record{m.answer, m.authority, m.additional}
+
+	outer: for section, si in sections {
+		for rec in section {
+			mark := len(w.buf)
+			w_record(&w, rec) or_return
+			if len(w.buf) > max_size {
+				resize(&w.buf, mark)
+				truncated = true
+				break outer
+			}
+			counts[si] += 1
+		}
+	}
+
+	if truncated {
+		// Compression targets recorded for the dropped bytes are now stale, so
+		// nothing more may be written that could reference them. OPT uses a
+		// root name and no compressible RDATA, which keeps this safe.
+		clear(&w.comp)
+		for rec in m.additional {
+			if rec.type != .OPT {
+				continue
+			}
+			mark := len(w.buf)
+			w.compress = false
+			w_record(&w, rec) or_return
+			if len(w.buf) > max_size {
+				resize(&w.buf, mark)
+			} else {
+				counts[2] += 1
+			}
+			break
+		}
+	}
+
+	flags := m.flags
+	if truncated {
+		flags.tc = true
+	}
+	fv := transmute(u16)flags
+
+	w.buf[0] = u8(m.id >> 8)
+	w.buf[1] = u8(m.id)
+	w.buf[2] = u8(fv >> 8)
+	w.buf[3] = u8(fv)
+	w.buf[4] = u8(qdcount >> 8)
+	w.buf[5] = u8(qdcount)
+	w.buf[6] = u8(counts[0] >> 8)
+	w.buf[7] = u8(counts[0])
+	w.buf[8] = u8(counts[1] >> 8)
+	w.buf[9] = u8(counts[1])
+	w.buf[10] = u8(counts[2] >> 8)
+	w.buf[11] = u8(counts[2])
+
+	return w.buf[:], truncated, .None
+}

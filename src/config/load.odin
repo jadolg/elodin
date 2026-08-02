@@ -1,0 +1,763 @@
+package config
+
+import "core:fmt"
+import "core:mem"
+import "core:net"
+import "core:os"
+import "core:strings"
+import "core:time"
+import "elodin:dnssec"
+import "elodin:yaml"
+
+Load_Error :: struct {
+	messages: []string,
+}
+
+@(private)
+Loader :: struct {
+	root:      ^yaml.Node,
+	errors:    [dynamic]string,
+	allocator: mem.Allocator,
+}
+
+@(private)
+errorf :: proc(l: ^Loader, format: string, args: ..any) {
+	append(&l.errors, fmt.aprintf(format, ..args, allocator = l.allocator))
+}
+
+load_file :: proc(path: string, allocator := context.allocator) -> (cfg: Config, err: Maybe(Load_Error)) {
+	data, read_err := os.read_entire_file(path, allocator)
+	if read_err != nil {
+		msgs := make([]string, 1, allocator)
+		msgs[0] = fmt.aprintf("cannot read config file %q: %v", path, read_err, allocator = allocator)
+		return {}, Load_Error{msgs}
+	}
+	return load_string(string(data), allocator)
+}
+
+load_string :: proc(src: string, allocator := context.allocator) -> (cfg: Config, err: Maybe(Load_Error)) {
+	root, perr := yaml.parse(src, allocator)
+	if e, has := perr.?; has {
+		msgs := make([]string, 1, allocator)
+		msgs[0] = fmt.aprintf("line %d: %s", e.line, e.msg, allocator = allocator)
+		return {}, Load_Error{msgs}
+	}
+
+	l := Loader {
+		root      = root,
+		errors    = make([dynamic]string, 0, 4, allocator),
+		allocator = allocator,
+	}
+	cfg = default_config()
+
+	load_log(&l, &cfg)
+	load_server(&l, &cfg)
+	load_listeners(&l, &cfg)
+	load_upstream(&l, &cfg)
+	load_cache(&l, &cfg)
+	load_blocking(&l, &cfg)
+	load_dnssec(&l, &cfg)
+	load_rewrites(&l, &cfg)
+	validate(&l, &cfg)
+
+	if len(l.errors) > 0 {
+		return cfg, Load_Error{l.errors[:]}
+	}
+	delete(l.errors)
+	return cfg, nil
+}
+
+@(private)
+opt_string :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^string, path: string) {
+	child := yaml.get(n, key)
+	if yaml.is_null(child) {
+		return
+	}
+	if v, ok := yaml.as_string(child); ok {
+		dst^ = v
+	} else {
+		errorf(l, "%s.%s: expected a string", path, key)
+	}
+}
+
+@(private)
+opt_bool :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^bool, path: string) {
+	child := yaml.get(n, key)
+	if yaml.is_null(child) {
+		return
+	}
+	if v, ok := yaml.as_bool(child); ok {
+		dst^ = v
+	} else {
+		errorf(l, "%s.%s: expected true or false", path, key)
+	}
+}
+
+@(private)
+opt_int :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^int, path: string) {
+	child := yaml.get(n, key)
+	if yaml.is_null(child) {
+		return
+	}
+	if v, ok := yaml.as_int(child); ok {
+		dst^ = int(v)
+	} else {
+		errorf(l, "%s.%s: expected an integer", path, key)
+	}
+}
+
+@(private)
+opt_u32 :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^u32, path: string) {
+	child := yaml.get(n, key)
+	if yaml.is_null(child) {
+		return
+	}
+	// Accept both a bare number of seconds and a duration such as "5m".
+	if d, ok := yaml.as_duration(child); ok {
+		secs := i64(d / time.Second)
+		if secs < 0 || secs > i64(max(u32)) {
+			errorf(l, "%s.%s: value out of range", path, key)
+			return
+		}
+		dst^ = u32(secs)
+		return
+	}
+	errorf(l, "%s.%s: expected a duration or a number of seconds", path, key)
+}
+
+@(private)
+opt_duration :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^time.Duration, path: string) {
+	child := yaml.get(n, key)
+	if yaml.is_null(child) {
+		return
+	}
+	if v, ok := yaml.as_duration(child); ok {
+		dst^ = v
+	} else {
+		errorf(l, "%s.%s: expected a duration such as 30s, 5m or 24h", path, key)
+	}
+}
+
+@(private)
+load_log :: proc(l: ^Loader, cfg: ^Config) {
+	n := yaml.get(l.root, "log")
+	if n == nil {
+		return
+	}
+	if s, ok := yaml.as_string(yaml.get(n, "level")); ok {
+		switch strings.to_lower(s, l.allocator) {
+		case "debug":
+			cfg.log.level = .Debug
+		case "info":
+			cfg.log.level = .Info
+		case "warn", "warning":
+			cfg.log.level = .Warn
+		case "error":
+			cfg.log.level = .Error
+		case:
+			errorf(l, "log.level: unknown level %q (want debug, info, warn or error)", s)
+		}
+	}
+	opt_bool(l, n, "queries", &cfg.log.queries, "log")
+	opt_string(l, n, "file", &cfg.log.file, "log")
+}
+
+@(private)
+load_server :: proc(l: ^Loader, cfg: ^Config) {
+	n := yaml.get(l.root, "server")
+	if n == nil {
+		return
+	}
+	opt_int(l, n, "workers", &cfg.server.workers, "server")
+	opt_int(l, n, "upstream_workers", &cfg.server.upstream_workers, "server")
+	opt_int(l, n, "max_connections", &cfg.server.max_connections, "server")
+	opt_int(l, n, "max_pending", &cfg.server.max_pending, "server")
+	opt_duration(l, n, "client_timeout", &cfg.server.client_timeout, "server")
+}
+
+@(private)
+load_listener :: proc(l: ^Loader, parent: ^yaml.Node, key: string, dst: ^Listener, needs_tls: bool) {
+	n := yaml.get(parent, key)
+	if n == nil {
+		return
+	}
+	path := fmt.tprintf("listeners.%s", key)
+	opt_bool(l, n, "enabled", &dst.enabled, path)
+	opt_string(l, n, "address", &dst.address, path)
+	opt_int(l, n, "port", &dst.port, path)
+	if needs_tls {
+		opt_string(l, n, "cert_file", &dst.cert_file, path)
+		opt_string(l, n, "key_file", &dst.key_file, path)
+	}
+	if key == "doh" {
+		opt_string(l, n, "path", &dst.path, path)
+	}
+}
+
+@(private)
+load_listeners :: proc(l: ^Loader, cfg: ^Config) {
+	n := yaml.get(l.root, "listeners")
+	if n == nil {
+		return
+	}
+	load_listener(l, n, "udp", &cfg.listeners.udp, false)
+	load_listener(l, n, "tcp", &cfg.listeners.tcp, false)
+	load_listener(l, n, "dot", &cfg.listeners.dot, true)
+	load_listener(l, n, "doh", &cfg.listeners.doh, true)
+}
+
+@(private)
+load_upstream :: proc(l: ^Loader, cfg: ^Config) {
+	n := yaml.get(l.root, "upstream")
+	if n == nil {
+		return
+	}
+	if s, ok := yaml.as_string(yaml.get(n, "strategy")); ok {
+		switch strings.to_lower(s, l.allocator) {
+		case "failover", "first":
+			cfg.upstream.strategy = .Failover
+		case "round_robin", "round-robin", "rr":
+			cfg.upstream.strategy = .Round_Robin
+		case "race", "fastest", "prefer_first_answer":
+			cfg.upstream.strategy = .Race
+		case:
+			errorf(l, "upstream.strategy: unknown strategy %q (want failover, round_robin or race)", s)
+		}
+	}
+	opt_duration(l, n, "timeout", &cfg.upstream.timeout, "upstream")
+	opt_int(l, n, "attempts", &cfg.upstream.attempts, "upstream")
+	opt_int(l, n, "max_idle", &cfg.upstream.max_idle, "upstream")
+	opt_duration(l, n, "idle_timeout", &cfg.upstream.idle_timeout, "upstream")
+
+	if b := yaml.get(n, "bootstrap"); !yaml.is_null(b) {
+		if list, ok := yaml.as_string_list(b, l.allocator); ok {
+			cfg.upstream.bootstrap = list
+		} else {
+			errorf(l, "upstream.bootstrap: expected a list of addresses")
+		}
+	}
+
+	servers := yaml.items(yaml.get(n, "servers"))
+	if len(servers) == 0 {
+		return
+	}
+	out := make([dynamic]Upstream_Spec, 0, len(servers), l.allocator)
+	for sn, i in servers {
+		spec, ok := load_upstream_spec(l, sn, i, cfg.upstream.bootstrap)
+		if ok {
+			append(&out, spec)
+		}
+	}
+	cfg.upstream.servers = out[:]
+}
+
+@(private)
+load_upstream_spec :: proc(
+	l: ^Loader,
+	n: ^yaml.Node,
+	index: int,
+	default_bootstrap: []string,
+) -> (
+	spec: Upstream_Spec,
+	ok: bool,
+) {
+	path := fmt.tprintf("upstream.servers[%d]", index)
+	spec.verify = true
+	spec.bootstrap = default_bootstrap
+
+	// A bare string entry is shorthand: "1.1.1.1", "tls://1.1.1.1:853#name",
+	// "https://dns.google/dns-query".
+	if n != nil && n.kind == .Scalar {
+		s, sok := yaml.as_string(n)
+		if !sok {
+			errorf(l, "%s: expected a server definition", path)
+			return {}, false
+		}
+		return parse_upstream_shorthand(l, s, path, default_bootstrap)
+	}
+
+	opt_string(l, n, "name", &spec.name, path)
+	opt_string(l, n, "address", &spec.address, path)
+	opt_string(l, n, "hostname", &spec.hostname, path)
+	opt_string(l, n, "url", &spec.url, path)
+	opt_int(l, n, "port", &spec.port, path)
+	opt_bool(l, n, "verify", &spec.verify, path)
+	if b := yaml.get(n, "bootstrap"); !yaml.is_null(b) {
+		if list, lok := yaml.as_string_list(b, l.allocator); lok {
+			spec.bootstrap = list
+		} else {
+			errorf(l, "%s.bootstrap: expected a list of addresses", path)
+		}
+	}
+
+	kind_str, has_kind := yaml.as_string(yaml.get(n, "type"))
+	if has_kind {
+		switch strings.to_lower(kind_str, l.allocator) {
+		case "udp", "plain", "dns":
+			spec.kind = .UDP
+		case "tcp":
+			spec.kind = .TCP
+		case "tls", "dot", "dns-over-tls":
+			spec.kind = .TLS
+		case "https", "doh", "dns-over-https":
+			spec.kind = .HTTPS
+		case:
+			errorf(l, "%s.type: unknown type %q (want udp, tcp, tls or https)", path, kind_str)
+			return {}, false
+		}
+	} else if spec.url != "" {
+		spec.kind = .HTTPS
+	} else {
+		spec.kind = .UDP
+	}
+
+	if spec.kind == .HTTPS {
+		if spec.url == "" {
+			errorf(l, "%s: an https upstream needs a url", path)
+			return {}, false
+		}
+		scheme, host, url_path, _, _ := net.split_url(spec.url, l.allocator)
+		if scheme != "https" {
+			errorf(l, "%s.url: expected an https:// url", path)
+			return {}, false
+		}
+		host_only, url_port, split_ok := net.split_port(host)
+		if !split_ok {
+			errorf(l, "%s.url: cannot parse host %q", path, host)
+			return {}, false
+		}
+		if spec.hostname == "" {
+			spec.hostname = host_only
+		}
+		if spec.address == "" {
+			spec.address = host_only
+		}
+		if spec.port == 0 {
+			spec.port = url_port if url_port != 0 else 443
+		}
+		spec.path = url_path if url_path != "" else "/dns-query"
+	} else {
+		if spec.address == "" {
+			errorf(l, "%s: missing address", path)
+			return {}, false
+		}
+		if spec.port == 0 {
+			spec.port = 853 if spec.kind == .TLS else 53
+		}
+		if spec.hostname == "" && net.parse_address(spec.address) == nil {
+			spec.hostname = spec.address
+		}
+	}
+
+	if spec.name == "" {
+		spec.name = describe_upstream(spec, l.allocator)
+	}
+	return spec, true
+}
+
+// "1.1.1.1", "8.8.8.8:53", "tcp://9.9.9.9", "tls://1.1.1.1:853#cloudflare-dns.com",
+// "https://dns.google/dns-query".
+@(private)
+parse_upstream_shorthand :: proc(
+	l: ^Loader,
+	raw: string,
+	path: string,
+	default_bootstrap: []string,
+) -> (
+	spec: Upstream_Spec,
+	ok: bool,
+) {
+	spec.verify = true
+	spec.bootstrap = default_bootstrap
+	s := strings.trim_space(raw)
+
+	if strings.has_prefix(s, "https://") {
+		spec.kind = .HTTPS
+		spec.url = s
+		scheme, host, url_path, _, _ := net.split_url(s, l.allocator)
+		_ = scheme
+		host_only, url_port, split_ok := net.split_port(host)
+		if !split_ok {
+			errorf(l, "%s: cannot parse %q", path, raw)
+			return {}, false
+		}
+		spec.address = host_only
+		spec.hostname = host_only
+		spec.port = url_port if url_port != 0 else 443
+		spec.path = url_path if url_path != "" else "/dns-query"
+		spec.name = s
+		return spec, true
+	}
+
+	spec.kind = .UDP
+	Scheme :: struct {
+		prefix: string,
+		kind:   Upstream_Kind,
+	}
+	for sch in ([]Scheme{{"udp://", .UDP}, {"tcp://", .TCP}, {"tls://", .TLS}}) {
+		if strings.has_prefix(s, sch.prefix) {
+			spec.kind = sch.kind
+			s = s[len(sch.prefix):]
+			break
+		}
+	}
+
+	// A trailing #hostname pins the certificate name for DoT.
+	if idx := strings.index_byte(s, '#'); idx >= 0 {
+		spec.hostname = s[idx + 1:]
+		s = s[:idx]
+	}
+
+	host, port, split_ok := net.split_port(s)
+	if !split_ok {
+		errorf(l, "%s: cannot parse %q", path, raw)
+		return {}, false
+	}
+	spec.address = host
+	spec.port = port if port != 0 else (853 if spec.kind == .TLS else 53)
+	if spec.hostname == "" && net.parse_address(host) == nil {
+		spec.hostname = host
+	}
+	spec.name = describe_upstream(spec, l.allocator)
+	return spec, true
+}
+
+describe_upstream :: proc(spec: Upstream_Spec, allocator := context.allocator) -> string {
+	if spec.kind == .HTTPS {
+		return strings.clone(spec.url, allocator)
+	}
+	scheme := "udp"
+	switch spec.kind {
+	case .UDP:
+		scheme = "udp"
+	case .TCP:
+		scheme = "tcp"
+	case .TLS:
+		scheme = "tls"
+	case .HTTPS:
+		scheme = "https"
+	}
+	return fmt.aprintf("%s://%s:%d", scheme, spec.address, spec.port, allocator = allocator)
+}
+
+@(private)
+load_cache :: proc(l: ^Loader, cfg: ^Config) {
+	n := yaml.get(l.root, "cache")
+	if n == nil {
+		return
+	}
+	opt_bool(l, n, "enabled", &cfg.cache.enabled, "cache")
+	opt_int(l, n, "max_entries", &cfg.cache.max_entries, "cache")
+	opt_u32(l, n, "min_ttl", &cfg.cache.min_ttl, "cache")
+	opt_u32(l, n, "max_ttl", &cfg.cache.max_ttl, "cache")
+	opt_u32(l, n, "negative_ttl", &cfg.cache.negative_ttl, "cache")
+	opt_bool(l, n, "serve_stale", &cfg.cache.serve_stale, "cache")
+}
+
+@(private)
+parse_v4 :: proc(l: ^Loader, s: string, path: string, dst: ^[4]u8) {
+	addr := net.parse_address(s)
+	if v4, is_v4 := addr.(net.IP4_Address); is_v4 {
+		dst^ = cast([4]u8)v4
+		return
+	}
+	errorf(l, "%s: %q is not an IPv4 address", path, s)
+}
+
+@(private)
+parse_v6 :: proc(l: ^Loader, s: string, path: string, dst: ^[16]u8) {
+	addr := net.parse_address(s)
+	if v6, is_v6 := addr.(net.IP6_Address); is_v6 {
+		for group, i in v6 {
+			v := u16(group)
+			dst[i * 2] = u8(v >> 8)
+			dst[i * 2 + 1] = u8(v)
+		}
+		return
+	}
+	errorf(l, "%s: %q is not an IPv6 address", path, s)
+}
+
+@(private)
+load_block_lists :: proc(l: ^Loader, n: ^yaml.Node, path: string) -> []Block_List {
+	entries := yaml.items(n)
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([dynamic]Block_List, 0, len(entries), l.allocator)
+	for e, i in entries {
+		bl := Block_List {
+			enabled = true,
+		}
+		if e != nil && e.kind == .Scalar {
+			s, _ := yaml.as_string(e)
+			if strings.has_prefix(s, "http://") || strings.has_prefix(s, "https://") {
+				bl.url = s
+			} else {
+				bl.file = s
+			}
+			bl.name = s
+			append(&out, bl)
+			continue
+		}
+		item_path := fmt.tprintf("%s[%d]", path, i)
+		opt_string(l, e, "name", &bl.name, item_path)
+		opt_string(l, e, "url", &bl.url, item_path)
+		opt_string(l, e, "file", &bl.file, item_path)
+		opt_bool(l, e, "enabled", &bl.enabled, item_path)
+		if f, ok := yaml.as_string(yaml.get(e, "format")); ok {
+			switch strings.to_lower(f, l.allocator) {
+			case "auto":
+				bl.format = .Auto
+			case "hosts":
+				bl.format = .Hosts
+			case "domains", "domain", "plain":
+				bl.format = .Domains
+			case "adblock", "abp":
+				bl.format = .Adblock
+			case:
+				errorf(l, "%s.format: unknown format %q (want auto, hosts, domains or adblock)", item_path, f)
+			}
+		}
+		if bl.url == "" && bl.file == "" {
+			errorf(l, "%s: needs either a url or a file", item_path)
+			continue
+		}
+		if bl.name == "" {
+			bl.name = bl.url if bl.url != "" else bl.file
+		}
+		append(&out, bl)
+	}
+	return out[:]
+}
+
+@(private)
+load_blocking :: proc(l: ^Loader, cfg: ^Config) {
+	n := yaml.get(l.root, "blocking")
+	if n == nil {
+		return
+	}
+	opt_bool(l, n, "enabled", &cfg.blocking.enabled, "blocking")
+	opt_u32(l, n, "block_ttl", &cfg.blocking.block_ttl, "blocking")
+	opt_duration(l, n, "refresh", &cfg.blocking.refresh, "blocking")
+	opt_string(l, n, "cache_dir", &cfg.blocking.cache_dir, "blocking")
+
+	if s, ok := yaml.as_string(yaml.get(n, "response")); ok {
+		switch strings.to_lower(s, l.allocator) {
+		case "nxdomain", "nx_domain":
+			cfg.blocking.response = .NX_Domain
+		case "nodata", "no_data", "empty":
+			cfg.blocking.response = .No_Data
+		case "zeroip", "zero_ip", "null":
+			cfg.blocking.response = .Zero_IP
+		case "custom", "custom_ip":
+			cfg.blocking.response = .Custom_IP
+		case "refused":
+			cfg.blocking.response = .Refused
+		case:
+			errorf(l, "blocking.response: unknown mode %q (want nxdomain, nodata, zeroip, custom or refused)", s)
+		}
+	}
+	if s, ok := yaml.as_string(yaml.get(n, "custom_ipv4")); ok {
+		parse_v4(l, s, "blocking.custom_ipv4", &cfg.blocking.custom_ipv4)
+	}
+	if s, ok := yaml.as_string(yaml.get(n, "custom_ipv6")); ok {
+		parse_v6(l, s, "blocking.custom_ipv6", &cfg.blocking.custom_ipv6)
+	}
+
+	cfg.blocking.lists = load_block_lists(l, yaml.get(n, "lists"), "blocking.lists")
+	cfg.blocking.allow_lists = load_block_lists(l, yaml.get(n, "allowlists"), "blocking.allowlists")
+
+	if r := yaml.get(n, "rules"); !yaml.is_null(r) {
+		if list, ok := yaml.as_string_list(r, l.allocator); ok {
+			cfg.blocking.rules = list
+		} else {
+			errorf(l, "blocking.rules: expected a list of rules")
+		}
+	}
+	if r := yaml.get(n, "allow"); !yaml.is_null(r) {
+		if list, ok := yaml.as_string_list(r, l.allocator); ok {
+			cfg.blocking.allow_rules = list
+		} else {
+			errorf(l, "blocking.allow: expected a list of rules")
+		}
+	}
+}
+
+@(private)
+load_dnssec :: proc(l: ^Loader, cfg: ^Config) {
+	n := yaml.get(l.root, "dnssec")
+	if n == nil {
+		return
+	}
+	opt_bool(l, n, "enabled", &cfg.dnssec.enabled, "dnssec")
+	opt_int(l, n, "max_nsec3_iterations", &cfg.dnssec.max_nsec3_iterations, "dnssec")
+
+	if a := yaml.get(n, "trust_anchors"); !yaml.is_null(a) {
+		if list, ok := yaml.as_string_list(a, l.allocator); ok {
+			cfg.dnssec.trust_anchors = list
+		} else {
+			errorf(l, "dnssec.trust_anchors: expected a list of DS records")
+		}
+	}
+}
+
+@(private)
+load_rewrites :: proc(l: ^Loader, cfg: ^Config) {
+	entries := yaml.items(yaml.get(l.root, "rewrites"))
+	if len(entries) == 0 {
+		return
+	}
+	out := make([dynamic]Rewrite, 0, len(entries), l.allocator)
+
+	for e, i in entries {
+		path := fmt.tprintf("rewrites[%d]", i)
+		rw := Rewrite {
+			ttl = 300,
+		}
+		domain := ""
+		opt_string(l, e, "domain", &domain, path)
+		if domain == "" {
+			errorf(l, "%s: missing domain", path)
+			continue
+		}
+		ttl_i := int(rw.ttl)
+		opt_int(l, e, "ttl", &ttl_i, path)
+		rw.ttl = u32(ttl_i)
+
+		if strings.has_prefix(domain, "*.") {
+			rw.wildcard = true
+			domain = domain[2:]
+		}
+		rw.domain = canonical_domain(domain, l.allocator)
+
+		answers_node := yaml.get(e, "answer")
+		if answers_node == nil {
+			answers_node = yaml.get(e, "answers")
+		}
+		raw, ok := yaml.as_string_list(answers_node, l.allocator)
+		if !ok || len(raw) == 0 {
+			errorf(l, "%s: missing answer", path)
+			continue
+		}
+
+		answers := make([dynamic]Rewrite_Answer, 0, len(raw), l.allocator)
+		for a in raw {
+			switch {
+			case a == "block", a == "deny":
+				append(&answers, Rewrite_Answer{kind = .Block})
+			case:
+				addr := net.parse_address(a)
+				switch v in addr {
+				case net.IP4_Address:
+					append(&answers, Rewrite_Answer{kind = .A, v4 = cast([4]u8)v})
+				case net.IP6_Address:
+					ans := Rewrite_Answer {
+						kind = .AAAA,
+					}
+					for group, gi in v {
+						x := u16(group)
+						ans.v6[gi * 2] = u8(x >> 8)
+						ans.v6[gi * 2 + 1] = u8(x)
+					}
+					append(&answers, ans)
+				case:
+					append(&answers, Rewrite_Answer{kind = .CNAME, name = canonical_domain(a, l.allocator)})
+				}
+			}
+		}
+		rw.answers = answers[:]
+		append(&out, rw)
+	}
+	cfg.rewrites = out[:]
+}
+
+// Lowercase with a trailing dot, matching the form the resolver compares against.
+canonical_domain :: proc(s: string, allocator := context.allocator) -> string {
+	trimmed := strings.trim_space(s)
+	trimmed = strings.trim_suffix(trimmed, ".")
+	lowered := strings.to_lower(trimmed, allocator)
+	if lowered == "" {
+		return strings.clone(".", allocator)
+	}
+	return strings.concatenate({lowered, "."}, allocator)
+}
+
+@(private)
+validate :: proc(l: ^Loader, cfg: ^Config) {
+	if len(cfg.upstream.servers) == 0 {
+		errorf(l, "upstream.servers: at least one upstream server is required")
+	}
+	any_listener :=
+		cfg.listeners.udp.enabled ||
+		cfg.listeners.tcp.enabled ||
+		cfg.listeners.dot.enabled ||
+		cfg.listeners.doh.enabled
+	if !any_listener {
+		errorf(l, "listeners: every listener is disabled, so nothing would be served")
+	}
+
+	check_tls :: proc(l: ^Loader, ln: Listener, name: string) {
+		if !ln.enabled {
+			return
+		}
+		if ln.cert_file == "" || ln.key_file == "" {
+			errorf(l, "listeners.%s: cert_file and key_file are required", name)
+			return
+		}
+		if !os.exists(ln.cert_file) {
+			errorf(l, "listeners.%s.cert_file: %q does not exist", name, ln.cert_file)
+		}
+		if !os.exists(ln.key_file) {
+			errorf(l, "listeners.%s.key_file: %q does not exist", name, ln.key_file)
+		}
+	}
+	check_tls(l, cfg.listeners.dot, "dot")
+	check_tls(l, cfg.listeners.doh, "doh")
+
+	if cfg.listeners.doh.enabled && !strings.has_prefix(cfg.listeners.doh.path, "/") {
+		errorf(l, "listeners.doh.path: must start with '/'")
+	}
+
+	for spec in cfg.upstream.servers {
+		needs_resolution := spec.hostname != "" && net.parse_address(spec.address) == nil
+		if needs_resolution && len(spec.bootstrap) == 0 {
+			errorf(
+				l,
+				"upstream server %q uses hostname %q but no bootstrap resolver is configured",
+				spec.name,
+				spec.hostname,
+			)
+		}
+	}
+
+	if cfg.cache.max_ttl < cfg.cache.min_ttl {
+		errorf(l, "cache.max_ttl must not be smaller than cache.min_ttl")
+	}
+	if cfg.server.workers < 1 {
+		errorf(l, "server.workers must be at least 1")
+	}
+	if cfg.server.upstream_workers < 1 {
+		errorf(l, "server.upstream_workers must be at least 1")
+	}
+	if cfg.server.max_pending < 0 {
+		errorf(l, "server.max_pending must not be negative")
+	}
+	if cfg.server.max_pending == 0 {
+		cfg.server.max_pending = cfg.server.workers * 8
+	}
+	if cfg.upstream.attempts < 1 {
+		errorf(l, "upstream.attempts must be at least 1")
+	}
+
+	if cfg.dnssec.max_nsec3_iterations < 0 {
+		errorf(l, "dnssec.max_nsec3_iterations must not be negative")
+	}
+	// Parsed here rather than at startup so `--check` reports a bad anchor
+	// instead of a resolver that comes up refusing every name.
+	for anchor, i in cfg.dnssec.trust_anchors {
+		if _, ok := dnssec.parse_trust_anchor(anchor, l.allocator); !ok {
+			errorf(l, "dnssec.trust_anchors[%d]: %q is not a DS record", i, anchor)
+		}
+	}
+}

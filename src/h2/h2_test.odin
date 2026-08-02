@@ -1,0 +1,331 @@
+package h2
+
+import "core:encoding/hex"
+import "core:mem"
+import "core:testing"
+
+/*
+HPACK tests built on the worked examples in RFC 7541 appendix C, so the codec is
+checked against the specification's own vectors rather than against itself.
+*/
+
+@(private = "file")
+from_hex :: proc(s: string) -> []u8 {
+	out, ok := hex.decode(transmute([]u8)s, context.temp_allocator)
+	if !ok {
+		return nil
+	}
+	return out
+}
+
+@(test)
+test_huffman_rfc_examples :: proc(t: ^testing.T) {
+	// C.4.1, C.4.2, C.4.3: Huffman-coded strings from the request examples.
+	Case :: struct {
+		encoded: string,
+		want:    string,
+	}
+	cases := []Case {
+		{"f1e3c2e5f23a6ba0ab90f4ff", "www.example.com"},
+		{"a8eb10649cbf", "no-cache"},
+		{"25a849e95ba97d7f", "custom-key"},
+		{"25a849e95bb8e8b4bf", "custom-value"},
+		// C.6.1: a Huffman-coded date header value.
+		{"d07abe941054d444a8200595040b8166e082a62d1bff", "Mon, 21 Oct 2013 20:13:21 GMT"},
+	}
+	for c in cases {
+		got, err := huffman_decode(from_hex(c.encoded), context.temp_allocator)
+		testing.expectf(t, err == .None, "%q failed to decode: %v", c.want, err)
+		testing.expect_value(t, got, c.want)
+	}
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_huffman_rejects_bad_padding :: proc(t: ^testing.T) {
+	// Padding must be the EOS prefix, all ones. A zero bit tail is invalid.
+	_, err := huffman_decode([]u8{0xf1, 0x00}, context.temp_allocator)
+	testing.expect(t, err != .None, "zero padding was accepted")
+
+	// Padding longer than seven bits is invalid too.
+	_, err2 := huffman_decode([]u8{0xff, 0xff, 0xff, 0xff}, context.temp_allocator)
+	testing.expect(t, err2 != .None, "over-long padding was accepted")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_decode_rfc_c31_literal_with_indexing :: proc(t: ^testing.T) {
+	// C.3.1: a full request header set, literals plus indexed fields.
+	table: Dynamic_Table
+	dynamic_table_init(&table, 4096, context.temp_allocator)
+
+	block := from_hex("828684410f7777772e6578616d706c652e636f6d")
+	headers, err := decode(&table, block, context.temp_allocator)
+	testing.expectf(t, err == .None, "decode failed: %v", err)
+	testing.expect_value(t, len(headers), 4)
+	testing.expect_value(t, headers[0].name, ":method")
+	testing.expect_value(t, headers[0].value, "GET")
+	testing.expect_value(t, headers[1].name, ":scheme")
+	testing.expect_value(t, headers[1].value, "http")
+	testing.expect_value(t, headers[2].name, ":path")
+	testing.expect_value(t, headers[2].value, "/")
+	testing.expect_value(t, headers[3].name, ":authority")
+	testing.expect_value(t, headers[3].value, "www.example.com")
+
+	// The literal was added to the dynamic table, at a cost of 57 bytes.
+	testing.expect_value(t, table.size, 57)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_decode_rfc_c4_huffman_request_sequence :: proc(t: ^testing.T) {
+	// C.4: the same three requests as C.3 but Huffman coded, decoded on one
+	// connection so the dynamic table carries across them.
+	table: Dynamic_Table
+	dynamic_table_init(&table, 4096, context.temp_allocator)
+
+	first, e1 := decode(&table, from_hex("828684418cf1e3c2e5f23a6ba0ab90f4ff"), context.temp_allocator)
+	testing.expectf(t, e1 == .None, "first request failed: %v", e1)
+	testing.expect_value(t, len(first), 4)
+	testing.expect_value(t, first[3].value, "www.example.com")
+
+	second, e2 := decode(&table, from_hex("828684be5886a8eb10649cbf"), context.temp_allocator)
+	testing.expectf(t, e2 == .None, "second request failed: %v", e2)
+	testing.expect_value(t, len(second), 5)
+	// Index 62 refers back to the authority stored by the first request.
+	testing.expect_value(t, second[3].name, ":authority")
+	testing.expect_value(t, second[3].value, "www.example.com")
+	testing.expect_value(t, second[4].name, "cache-control")
+	testing.expect_value(t, second[4].value, "no-cache")
+
+	third, e3 := decode(
+		&table,
+		from_hex("828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf"),
+		context.temp_allocator,
+	)
+	testing.expectf(t, e3 == .None, "third request failed: %v", e3)
+	testing.expect_value(t, len(third), 5)
+	testing.expect_value(t, third[4].name, "custom-key")
+	testing.expect_value(t, third[4].value, "custom-value")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_dynamic_table_eviction :: proc(t: ^testing.T) {
+	// A table only big enough for one of these entries evicts as it fills.
+	table: Dynamic_Table
+	dynamic_table_init(&table, 64, context.temp_allocator)
+
+	dynamic_table_add(&table, "aaaa", "bbbb")
+	testing.expect_value(t, len(table.entries), 1)
+	dynamic_table_add(&table, "cccc", "dddd")
+	testing.expect_value(t, len(table.entries), 1)
+	// Newest first.
+	testing.expect_value(t, table.entries[0].name, "cccc")
+
+	// An entry larger than the table clears it and is not stored.
+	big: [128]u8
+	for i in 0 ..< len(big) {
+		big[i] = 'x'
+	}
+	dynamic_table_add(&table, string(big[:]), "v")
+	testing.expect_value(t, len(table.entries), 0)
+	testing.expect_value(t, table.size, 0)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_integer_continuation :: proc(t: ^testing.T) {
+	// RFC 7541 C.1.2: 1337 with a 5-bit prefix is 31, 154, 10.
+	r := Bit_Reader {
+		buf = []u8{31, 154, 10},
+	}
+	v, err := read_integer(&r, 5)
+	testing.expectf(t, err == .None, "decode failed: %v", err)
+	testing.expect_value(t, v, 1337)
+
+	// And the same value round-trips through the encoder.
+	out := make([dynamic]u8, 0, 8, context.temp_allocator)
+	write_integer(&out, 5, 1337, 0x00)
+	testing.expect_value(t, len(out), 3)
+	testing.expect_value(t, out[0], u8(31))
+	testing.expect_value(t, out[1], u8(154))
+	testing.expect_value(t, out[2], u8(10))
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_encoder_round_trips_through_decoder :: proc(t: ^testing.T) {
+	out := make([dynamic]u8, 0, 128, context.temp_allocator)
+	encode_header(&out, ":status", "200")
+	encode_header(&out, "content-type", "application/dns-message")
+	encode_header(&out, "cache-control", "max-age=42")
+	encode_header(&out, "server", "elodin")
+
+	table: Dynamic_Table
+	dynamic_table_init(&table, 4096, context.temp_allocator)
+	headers, err := decode(&table, out[:], context.temp_allocator)
+	testing.expectf(t, err == .None, "decode failed: %v", err)
+	testing.expect_value(t, len(headers), 4)
+	testing.expect_value(t, headers[0].name, ":status")
+	testing.expect_value(t, headers[0].value, "200")
+	testing.expect_value(t, headers[1].value, "application/dns-message")
+	testing.expect_value(t, headers[2].value, "max-age=42")
+	testing.expect_value(t, headers[3].value, "elodin")
+
+	// ":status: 200" is static entry 8, so it costs a single byte.
+	testing.expect_value(t, out[0], u8(0x88))
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_decode_rejects_bad_index :: proc(t: ^testing.T) {
+	table: Dynamic_Table
+	dynamic_table_init(&table, 4096, context.temp_allocator)
+	// Index 62 with an empty dynamic table refers to nothing.
+	_, err := decode(&table, []u8{0xbe}, context.temp_allocator)
+	testing.expect(t, err != .None, "an out-of-range index was accepted")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_frame_header_round_trip :: proc(t: ^testing.T) {
+	out := make([dynamic]u8, 0, 16, context.temp_allocator)
+	write_frame_header(&out, 1234, .Headers, FLAG_END_HEADERS | FLAG_END_STREAM, 0x7fffffff)
+
+	h, ok := parse_frame_header(out[:])
+	testing.expect(t, ok, "parse failed")
+	testing.expect_value(t, h.length, 1234)
+	testing.expect_value(t, h.type, Frame_Type.Headers)
+	testing.expect_value(t, h.flags, u8(FLAG_END_HEADERS | FLAG_END_STREAM))
+	testing.expect_value(t, h.stream_id, u32(0x7fffffff))
+
+	// The reserved top bit must be masked off on receipt.
+	out[5] |= 0x80
+	h2, _ := parse_frame_header(out[:])
+	testing.expect_value(t, h2.stream_id, u32(0x7fffffff))
+	free_all(context.temp_allocator)
+}
+
+/*
+The three tests below run against a tracking allocator rather than the temp
+allocator the rest of the file uses, because what they check is that a failed or
+abandoned request releases what it allocated. A leak here is reachable by any
+peer that can open a connection, so it is worth asserting on directly.
+*/
+
+@(private = "file")
+expect_no_leaks :: proc(t: ^testing.T, track: ^mem.Tracking_Allocator, what: string) {
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%s: %d bytes leaked, allocated at %v", what, entry.size, entry.location)
+	}
+	testing.expectf(t, len(track.bad_free_array) == 0, "%s: %d bad frees", what, len(track.bad_free_array))
+}
+
+@(test)
+test_decode_error_releases_partial_list :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	table: Dynamic_Table
+	dynamic_table_init(&table, 4096, allocator)
+
+	// Two valid indexed fields (:method GET, :scheme http) and then index 62,
+	// which refers to a dynamic table that is still empty. The two fields are
+	// already decoded and cloned by the time the third is rejected.
+	_, err := decode(&table, []u8{0x82, 0x86, 0xbe}, allocator)
+	testing.expect(t, err != .None, "an out-of-range index was accepted")
+
+	dynamic_table_destroy(&table)
+	expect_no_leaks(t, &track, "decode error")
+}
+
+@(private = "file")
+discard_write :: proc(user: rawptr, buf: []u8) -> bool {
+	return true
+}
+
+@(private = "file")
+no_read :: proc(user: rawptr, buf: []u8) -> (n: int, ok: bool) {
+	return 0, false
+}
+
+@(private = "file")
+ignore_request :: proc(conn: ^Conn, req: ^Request) {
+}
+
+// RFC 7541 C.3.1: GET http / www.example.com, four fields.
+@(private = "file")
+REQUEST_BLOCK :: "828684410f7777772e6578616d706c652e636f6d"
+
+@(test)
+test_teardown_releases_parked_request :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil, allocator)
+
+	// HEADERS without END_STREAM: the request is complete but its body is not,
+	// so it is parked on the stream and no handler ever takes ownership of it.
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+	testing.expect(t, ok, "handle_headers failed")
+
+	s, found := c.streams[1]
+	testing.expect(t, found, "stream 1 was not created")
+	testing.expect(t, s.pending != nil, "no request was parked on the stream")
+
+	// The peer goes away here, which is all it takes.
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "parked request")
+}
+
+@(test)
+test_oversized_body_drops_the_stream :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil, allocator)
+
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+
+	body := make([]u8, MAX_BODY + 1, context.temp_allocator)
+	ok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect(t, ok, "handle_data failed")
+
+	// Refused, and gone: a stream left in the map would hold its body and one of
+	// MAX_CONCURRENT slots for as long as the connection lasted.
+	_, still_open := c.streams[1]
+	testing.expect(t, !still_open, "the reset stream is still in the table")
+
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "oversized body")
+}
+
+@(test)
+test_padding_and_priority_stripping :: proc(t: ^testing.T) {
+	// PADDED: first byte is the pad length, that many bytes come off the end.
+	padded := []u8{2, 'h', 'i', 0, 0}
+	body, ok := strip_padding(padded, FLAG_PADDED)
+	testing.expect(t, ok, "strip_padding failed")
+	testing.expect_value(t, string(body), "hi")
+
+	// A pad length that overruns the payload is rejected.
+	_, bad := strip_padding([]u8{9, 'h'}, FLAG_PADDED)
+	testing.expect(t, !bad, "over-long padding was accepted")
+
+	// PRIORITY prepends five bytes.
+	prio := []u8{0, 0, 0, 1, 16, 'o', 'k'}
+	rest, pok := strip_priority(prio, FLAG_PRIORITY)
+	testing.expect(t, pok, "strip_priority failed")
+	testing.expect_value(t, string(rest), "ok")
+}

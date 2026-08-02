@@ -1,0 +1,156 @@
+# elodin - a filtering DNS forwarder
+#
+# Every setting below is optional; the values shown are the defaults unless
+# noted otherwise. Durations accept "500ms", "30s", "5m", "12h", "7d" or a bare
+# number of seconds.
+
+log:
+  level: info          # debug | info | warn | error
+  queries: false       # log one line per query
+  file: ""             # empty means stderr
+
+server:
+  # A worker is busy for the whole of an upstream round trip, so throughput on
+  # cache misses is about `workers / upstream_rtt` — roughly 50 qps per worker
+  # against a 20 ms upstream. Every query shares this pool, so too few workers
+  # also delays answers that would have come from the cache. Size it as
+  # `target_qps * upstream_rtt` with headroom, and budget ~0.3 MB of resident
+  # memory per worker under load.
+  workers: 128
+  upstream_workers: 64 # threads used by the "race" strategy
+  max_connections: 512 # concurrent TCP / DoT / DoH connections
+  client_timeout: 10s
+  # Queries queued or in flight before new ones are dropped. 0 derives it as
+  # `workers * 8`, which keeps the backlog to about eight upstream round trips
+  # whatever the worker count.
+  max_pending: 0
+
+listeners:
+  udp:
+    enabled: true
+    address: "0.0.0.0"
+    port: 53
+  tcp:
+    enabled: true
+    address: "0.0.0.0"
+    port: 53
+  # DNS-over-TLS. Needs a certificate; `mise run certs` makes a self-signed one.
+  dot:
+    enabled: false
+    address: "0.0.0.0"
+    port: 853
+    cert_file: certs/cert.pem
+    key_file: certs/key.pem
+  # DNS-over-HTTPS. Served over HTTP/1.1.
+  doh:
+    enabled: false
+    address: "0.0.0.0"
+    port: 443
+    path: /dns-query
+    cert_file: certs/cert.pem
+    key_file: certs/key.pem
+
+upstream:
+  # failover     try servers in order, move on when one fails
+  # round_robin  the same, but the starting point rotates per query
+  # race         ask every server at once, take the first answer
+  strategy: failover
+  timeout: 5s
+  attempts: 2
+  max_idle: 8          # pooled connections per upstream (TCP/DoT/DoH)
+  idle_timeout: 30s
+
+  # Used to resolve upstream hostnames without going through the system
+  # resolver, which on this machine may well be elodin itself.
+  bootstrap: [1.1.1.1, 9.9.9.9]
+
+  servers:
+    - name: cloudflare-dot
+      type: tls                     # udp | tcp | tls | https
+      address: 1.1.1.1
+      port: 853
+      hostname: cloudflare-dns.com  # SNI and certificate name
+
+    - name: quad9-dot
+      type: tls
+      address: 9.9.9.9
+      port: 853
+      hostname: dns.quad9.net
+
+    # Shorthand forms are accepted too:
+    #   - 192.168.1.1
+    #   - tcp://9.9.9.9
+    #   - tls://1.1.1.1:853#cloudflare-dns.com
+    #   - https://dns.google/dns-query
+
+cache:
+  enabled: true
+  max_entries: 10000
+  min_ttl: 0           # raise to hold short-lived answers longer
+  max_ttl: 24h
+  negative_ttl: 300    # cap for NXDOMAIN / NODATA
+  serve_stale: false   # answer from an expired entry if the upstream is down
+
+blocking:
+  enabled: true
+
+  # nxdomain | nodata | zeroip | custom | refused
+  response: nxdomain
+  custom_ipv4: 0.0.0.0
+  custom_ipv6: "::"
+  block_ttl: 60
+
+  refresh: 24h
+  cache_dir: /var/cache/elodin
+
+  lists:
+    - name: steven-black
+      url: https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
+      format: hosts    # auto | hosts | domains | adblock
+
+    - name: adguard-dns
+      url: https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt
+      format: adblock
+
+    # A local file works the same way:
+    # - name: personal
+    #   file: /etc/elodin/blocklist.txt
+
+  # Names that must never be blocked, whatever the lists say.
+  allowlists: []
+
+  # Inline rules, in adblock syntax.
+  rules:
+    - "||doubleclick.net^"
+  allow:
+    - "||googleadservices.com^"   # the @@ prefix is implied here
+
+dnssec:
+  # Answers whose signatures do not check out become SERVFAIL rather than
+  # answers. This needs an upstream that returns DNSSEC records — every public
+  # resolver does, but an ISP or captive-portal resolver may not, and against
+  # one of those every signed zone would stop resolving. That is the case to
+  # turn this off for.
+  enabled: true
+
+  # Where the chain of trust starts. Empty uses the root keys IANA publishes,
+  # which are compiled in — both the 2017 and 2024 key-signing keys, so a
+  # rollover does not need a new build. Set this only to pin your own.
+  # trust_anchors:
+  #   - ". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"
+
+  # NSEC3 records asking for more hashing than this are treated as unusable,
+  # which makes the zone insecure rather than letting it hand the resolver an
+  # arbitrary amount of work. RFC 9276 asks zones for zero.
+  max_nsec3_iterations: 100
+
+# Local answers. Wildcards match subdomains only.
+rewrites:
+  - domain: nas.home
+    answer: 192.168.1.50
+  - domain: "*.home"
+    answers: [192.168.1.1]
+  - domain: old.example.com
+    answer: new.example.com       # a name becomes a CNAME
+  - domain: telemetry.example.com
+    answer: block                 # answered as if it were on a blocklist

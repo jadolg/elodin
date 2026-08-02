@@ -1,0 +1,6 @@
+/bin/
+/certs/
+/.cache/
+*.o
+/.claude
+/.idea
