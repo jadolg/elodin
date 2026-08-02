@@ -525,7 +525,18 @@ check_signature :: proc(
 	if !name_in_zone(owner, sig.signer) {
 		return .Bad, false
 	}
+	/*
+	RFC 4034 section 3.1.3 counts the Labels field without a leading `*`, so a
+	name that is itself a wildcard - and `*.example.com.` is an ordinary name a
+	zone may hold records for - has to be counted the same way here. Counting
+	the `*` would make a correct signature look one label short, which is the
+	mark of a wildcard expansion, and the answer would be sent off for a proof
+	that the name does not exist. It plainly does.
+	*/
 	owner_labels := label_count(owner)
+	if strings.has_prefix(owner, "*.") {
+		owner_labels -= 1
+	}
 	signer_labels := label_count(sig.signer)
 	if int(sig.labels) > owner_labels || int(sig.labels) < signer_labels {
 		return .Bad, false
@@ -1109,8 +1120,14 @@ cache_put :: proc(v: ^Validator, zone: string, status: Status, keys: []Dnskey, t
 	entry.status = status
 	entry.expires = time.time_add(now, time.Duration(lifetime) * time.Second)
 	if len(keys) > 0 {
-		owned := make([]Dnskey, len(keys), v.allocator)
-		for k, i in keys {
+		// Appended rather than written by index: skipping a key that will not
+		// parse must shorten the set, not leave a zero-valued one sitting in it.
+		// A gap carries algorithm 0, which no signature matches, and an RRset
+		// with nothing to check it against is reported unsupported - which
+		// `validate_rrset` reads as insecure. A cache holding entries that
+		// quietly mean "treat this zone as unsigned" fails the wrong way.
+		owned := make([dynamic]Dnskey, 0, len(keys), v.allocator)
+		for k in keys {
 			rdata := make([]u8, len(k.rdata), v.allocator)
 			copy(rdata, k.rdata)
 			parsed, perr := parse_dnskey(rdata)
@@ -1118,9 +1135,9 @@ cache_put :: proc(v: ^Validator, zone: string, status: Status, keys: []Dnskey, t
 				delete(rdata, v.allocator)
 				continue
 			}
-			owned[i] = parsed
+			append(&owned, parsed)
 		}
-		entry.keys = owned
+		entry.keys = owned[:]
 	}
 
 	sync.mutex_lock(&v.mu)
