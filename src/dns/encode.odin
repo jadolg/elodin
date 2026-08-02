@@ -34,7 +34,23 @@ writer_init :: proc(w: ^Writer, allocator := context.allocator, compress := true
 
 writer_destroy :: proc(w: ^Writer) {
 	delete(w.buf)
+	writer_release_scratch(w)
+}
+
+/*
+Release everything the writer allocated except its output buffer.
+
+Split out because `encode_message` hands that buffer to its caller and has to let
+go of the rest. The compression map's keys are cloned (see `w_name`), and the
+map's own storage does not own them, so dropping the map alone would leave a
+string per distinct name suffix behind.
+*/
+@(private)
+writer_release_scratch :: proc(w: ^Writer) {
 	delete(w.offsets)
+	for key in w.comp {
+		delete(key, w.allocator)
+	}
 	delete(w.comp)
 }
 
@@ -215,6 +231,19 @@ encode_message :: proc(
 ) {
 	w: Writer
 	writer_init(&w, allocator, compress)
+	/*
+	The scratch goes back whatever happens; the buffer only when it is not being
+	returned. Every `or_return` below abandons a partly written message, and the
+	allocator here defaults to `context.allocator` rather than to the per-request
+	arena the server happens to pass, so neither can be left to a `free_all` that
+	may never come.
+	*/
+	defer {
+		if err != .None {
+			delete(w.buf)
+		}
+		writer_release_scratch(&w)
+	}
 
 	append(&w.buf, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 

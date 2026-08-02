@@ -364,6 +364,84 @@ test_scan_ttl_offsets_releases_on_bad_name :: proc(t: ^testing.T) {
 	}
 }
 
+/*
+`encode_message` hands the caller its output buffer and abandons everything else
+the writer allocated: the label-offset list, the compression map, and a cloned
+string per distinct name suffix recorded in it.
+
+Nothing leaks in the server, where every caller threads a per-request arena
+through and `free_all` reclaims the lot. But the allocator parameter defaults to
+`context.allocator`, so a caller that takes the signature at its word - a test, a
+tool, anything that does not know the arena convention - leaks per message
+encoded, and there is nothing in the signature to warn it off.
+*/
+@(test)
+test_encode_message_releases_its_writer :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	// Names sharing suffixes, so the compression map is populated and its keys
+	// are actually cloned rather than the map staying empty.
+	m := Message {
+		id = 0x1234,
+		question = []Question{{name = "www.example.com.", type = .A, class = .IN}},
+		answer = []Record {
+			{
+				name = "www.example.com.",
+				type = .CNAME,
+				class = .IN,
+				ttl = 300,
+				data = Rdata_Name{name = "host.example.com."},
+			},
+			{name = "host.example.com.", type = .A, class = .IN, ttl = 300, data = Rdata_A{addr = {192, 0, 2, 1}}},
+			{name = "mail.example.com.", type = .A, class = .IN, ttl = 300, data = Rdata_A{addr = {192, 0, 2, 2}}},
+		},
+	}
+	m.flags.qr = true
+
+	wire, _, err := encode_message(m, allocator)
+	testing.expect_value(t, err, Encode_Error.None)
+	testing.expect(t, len(wire) > 0, "nothing was encoded")
+
+	// The buffer is the caller's, and is meant to be the only thing that is.
+	delete(wire, allocator)
+
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%d bytes left held, allocated at %v", entry.size, entry.location)
+	}
+	testing.expectf(t, len(track.bad_free_array) == 0, "%d bad frees", len(track.bad_free_array))
+}
+
+/*
+An encode that gives up owes the same debt, and one more besides: the output
+buffer it was part way through filling is abandoned rather than returned, so
+nothing outside is left holding a reference to free.
+*/
+@(test)
+test_encode_message_releases_its_writer_on_error :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	m := Message {
+		id       = 0x1234,
+		question = []Question{{name = "www.example.com.", type = .A, class = .IN}},
+	}
+
+	// Smaller than the header, so the question is written and then refused.
+	wire, _, err := encode_message(m, allocator, 4)
+	testing.expect(t, err != .None, "a message past max_size was accepted")
+	testing.expect(t, wire == nil, "a refused encode still returned a buffer")
+
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%d bytes left held, allocated at %v", entry.size, entry.location)
+	}
+	testing.expectf(t, len(track.bad_free_array) == 0, "%d bad frees", len(track.bad_free_array))
+}
+
 @(test)
 test_peek_udp_size_reads_the_opt_record :: proc(t: ^testing.T) {
 	// No OPT: the 512 bytes a responder has to assume without being told.
