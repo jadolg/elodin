@@ -284,6 +284,23 @@ validate_answer :: proc(
 		sigs := sigs_covering(msg.answer, rec.name, rec.type, class, allocator)
 
 		status, wildcard, why := validate_rrset(v, budget, rec.name, rec.type, class, records, sigs, unix, now, allocator)
+		/*
+		A CNAME carrying no signature at all may be one a DNAME produced rather
+		than one a zone forgot to sign. RFC 6672 section 3.4.1 has the server
+		synthesize it and send it unsigned, the DNAME being what carries the
+		authority, so demanding a signature here refuses every name that
+		resolves through one.
+
+		Only an unsigned CNAME is reconsidered. A CNAME that came with a
+		signature was meant to have one, and a signature that did not hold up
+		is not something a DNAME excuses.
+		*/
+		if status != .Secure && rec.type == .CNAME && len(sigs) == 0 {
+			if dname_covered(v, budget, msg, rec, class, unix, now, allocator) {
+				status = .Secure
+				why = ""
+			}
+		}
 		wildcard_seen ||= wildcard
 		checked += 1
 		if status != .Secure {
@@ -1172,6 +1189,112 @@ fold_into :: proc(name: string, buf: []u8) -> (string, bool) {
 		buf[i] = c + 32 if c >= 'A' && c <= 'Z' else c
 	}
 	return string(buf[:len(name)]), true
+}
+
+/*
+Is this CNAME one that a DNAME in the same answer produced?
+
+A DNAME redirects everything below its owner, and the server sends the CNAME it
+worked out along with it, unsigned (RFC 6672 section 3.4.1). The signature is on
+the DNAME, so that is what gets checked; the CNAME is accepted only once the
+substitution has been recomputed and found to match.
+
+Recomputing it is the entire safeguard. Accepting any unsigned CNAME that
+happened to sit below a validated DNAME would hand out a redirect to anywhere,
+for every name under every DNAME there is - a good deal worse than refusing
+them, which is what this replaces.
+*/
+@(private)
+dname_covered :: proc(
+	v: ^Validator,
+	budget: ^Budget,
+	msg: dns.Message,
+	cname: dns.Record,
+	class: dns.Class,
+	unix: u32,
+	now: time.Time,
+	allocator: mem.Allocator,
+) -> bool {
+	target, is_name := cname.data.(dns.Rdata_Name)
+	if !is_name {
+		return false
+	}
+
+	seen := make([dynamic]dns.Question, 0, 2, allocator)
+	for rec in msg.answer {
+		if rec.type != .DNAME || rec.class != class {
+			continue
+		}
+		if already_seen(seen[:], rec.name, rec.type) {
+			continue
+		}
+		append(&seen, dns.Question{name = rec.name, type = rec.type})
+
+		dname, dname_is_name := rec.data.(dns.Rdata_Name)
+		if !dname_is_name {
+			continue
+		}
+		if !dname_synthesizes(rec.name, dname.name, cname.name, target.name, allocator) {
+			continue
+		}
+		// Only now is it worth checking the DNAME itself, which costs a walk.
+		records := records_of(msg.answer, rec.name, .DNAME, class, allocator)
+		sigs := sigs_covering(msg.answer, rec.name, .DNAME, class, allocator)
+		status, _, _ := validate_rrset(v, budget, rec.name, .DNAME, class, records, sigs, unix, now, allocator)
+		if status == .Secure {
+			return true
+		}
+	}
+	return false
+}
+
+/*
+Would a DNAME at `owner` pointing to `target` produce exactly this CNAME?
+
+The substitution swaps the DNAME's owner, which is a suffix of the redirected
+name, for the DNAME's target, and carries the labels in front of it over
+untouched (RFC 6672 section 3.4.1).
+*/
+@(private)
+dname_synthesizes :: proc(owner, target, cname_owner, cname_target: string, allocator: mem.Allocator) -> bool {
+	// A DNAME redirects what is below it, never its own name.
+	if dns.name_equal_fold(cname_owner, owner) || !name_in_zone(cname_owner, owner) {
+		return false
+	}
+	prefix_labels := label_count(cname_owner) - label_count(owner)
+	if prefix_labels <= 0 {
+		return false
+	}
+	cut, ok := label_offset(cname_owner, prefix_labels)
+	if !ok {
+		return false
+	}
+	// The same prefix, over the target this time.
+	want := strings.concatenate({cname_owner[:cut], target}, allocator)
+	return dns.name_equal_fold(cname_target, want)
+}
+
+// Byte offset just past the `count`th label separator, so `name[:offset]` is
+// the first `count` labels with their trailing dot. Escapes are stepped over
+// whole, since the character after a backslash is never a separator.
+@(private)
+label_offset :: proc(name: string, count: int) -> (offset: int, ok: bool) {
+	seen := 0
+	i := 0
+	for i < len(name) {
+		if name[i] == '\\' {
+			i += 2
+			continue
+		}
+		if name[i] == '.' {
+			seen += 1
+			if seen == count {
+				return i + 1, true
+			}
+		}
+		i += 1
+	}
+	return 0, false
 }
 
 /*
