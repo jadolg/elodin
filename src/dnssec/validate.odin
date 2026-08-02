@@ -216,8 +216,35 @@ validate :: proc(
 		return {.Insecure, "no data to authenticate"}
 	}
 
-	if len(msg.answer) > 0 {
+	/*
+	Which path a response takes is decided by the records that can actually be
+	authenticated, not by the answer section being non-empty.
+
+	An RRSIG is never covered by a signature of its own, so it is skipped by
+	`validate_answer` and can never be the thing that makes an answer genuine.
+	Counting it as one would hand an attacker the denial path: a forged NXDOMAIN
+	with a single junk RRSIG dropped into its answer section would be sent to
+	`validate_answer`, which finds nothing it can check and says so - and the
+	proof of non-existence that `validate_denial` would have demanded is never
+	asked for. The denial is then served as merely unsigned.
+	*/
+	answerable := 0
+	for rec in msg.answer {
+		if rec.type != .RRSIG && rec.type != .OPT {
+			answerable += 1
+		}
+	}
+	if answerable > 0 {
 		return validate_answer(v, &budget, msg, qname, qtype, class, unix, now, allocator)
+	}
+	/*
+	A question about RRSIG records themselves is the one case where an answer
+	made only of them is honest: an RRSIG RRset carries no signature of its own
+	(RFC 4035 section 2.2), so there is nothing here to authenticate and no
+	denial to demand either.
+	*/
+	if qtype == .RRSIG && len(msg.answer) > 0 {
+		return {.Insecure, "nothing to authenticate"}
 	}
 	return validate_denial(v, &budget, msg, qname, qtype, class, unix, now, allocator)
 }
@@ -262,10 +289,9 @@ validate_answer :: proc(
 	}
 
 	/*
-	Everything in the answer was skipped, which happens when the question was
-	for RRSIG records themselves: an RRSIG RRset is never signed (RFC 4035
-	section 2.2), so there is nothing here that could be authenticated. Saying
-	so beats reporting an empty check as a pass.
+	A backstop. `validate` only sends a response here once it has counted a
+	record this loop will check, so reaching this means the two disagree about
+	what is authenticatable. Whatever the cause, an empty check is not a pass.
 	*/
 	if checked == 0 {
 		return {.Insecure, "nothing to authenticate"}

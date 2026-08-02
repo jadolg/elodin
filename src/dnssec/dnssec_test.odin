@@ -372,6 +372,93 @@ test_injected_signer_cannot_downgrade_a_denial :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_injected_answer_record_cannot_skip_a_denial :: proc(t: ^testing.T) {
+	/*
+	The same attack as above, aimed at the dispatch instead of at the zone.
+
+	A denial is only checked when the answer section is empty of anything that
+	could be authenticated. An RRSIG carries no signature of its own and is
+	skipped by the positive path, so one dropped into the answer section is
+	enough to make a response look like an answer while containing none - and a
+	validator that dispatched on the section being non-empty would report having
+	nothing to authenticate and never ask for the proof of non-existence.
+
+	Here the genuine NSEC records are removed outright, so nothing whatsoever
+	proves the name is absent. A forged NXDOMAIN for a name in the signed root
+	has to be refused.
+	*/
+	v := test_validator()
+	defer destroy_validator(v)
+
+	wire := unhex(fixture("nxdomain_root").wire)
+	msg, derr := dns.decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+
+	msg.authority = nil
+
+	answer := make([dynamic]dns.Record, 0, 1, context.temp_allocator)
+	append(
+		&answer,
+		dns.Record {
+			name = "zzzz-does-not-exist-xq7.",
+			type = .RRSIG,
+			class = .IN,
+			ttl = 60,
+			data = dns.Rdata_Raw{data = rrsig_rdata("reddit.com.", .NSEC, 1)},
+		},
+	)
+	msg.answer = answer[:]
+
+	tampered, _, enc := dns.encode_message(msg, context.temp_allocator)
+	testing.expect_value(t, enc, dns.Encode_Error.None)
+
+	result := validate(v, "zzzz-does-not-exist-xq7.", .A, tampered, fixture_now())
+	testing.expect(
+		t,
+		result.status == .Bogus || result.status == .Indeterminate,
+		"a denial with no proof behind it must be refused, not served",
+	)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_rrsig_question_has_nothing_to_authenticate :: proc(t: ^testing.T) {
+	/*
+	The one case where an answer made only of RRSIG records is honest. An RRSIG
+	RRset is never signed (RFC 4035 section 2.2), so a question about one is
+	answered by records that carry no signature - insecure rather than bogus,
+	and no denial of existence to demand.
+	*/
+	v := test_validator()
+	defer destroy_validator(v)
+
+	wire := unhex(fixture("nxdomain_root").wire)
+	msg, derr := dns.decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+
+	msg.authority = nil
+	answer := make([dynamic]dns.Record, 0, 1, context.temp_allocator)
+	append(
+		&answer,
+		dns.Record {
+			name = "example.com.",
+			type = .RRSIG,
+			class = .IN,
+			ttl = 60,
+			data = dns.Rdata_Raw{data = rrsig_rdata("example.com.", .A, 2)},
+		},
+	)
+	msg.answer = answer[:]
+
+	tampered, _, enc := dns.encode_message(msg, context.temp_allocator)
+	testing.expect_value(t, enc, dns.Encode_Error.None)
+
+	result := validate(v, "example.com.", .RRSIG, tampered, fixture_now())
+	testing.expect_value(t, result.status, Status.Insecure)
+	free_all(context.temp_allocator)
+}
+
+@(test)
 test_unsigned_delegation_is_insecure :: proc(t: ^testing.T) {
 	// reddit.com has no DS record in com, so its data is unsigned - which is a
 	// different thing from forged, and must not be refused.
