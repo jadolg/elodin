@@ -138,15 +138,28 @@ reader_exact :: proc(r: ^Buf_Reader, n: int) -> (data: []u8, err: Error) {
 	return r.buf[start:start + n], .None
 }
 
-// Read until the peer closes, for responses with no length information.
+/*
+Read until the peer closes, for responses with no length information.
+
+Bounded by `limit`, like every other framing path: the header scan stops at 64
+KB, and both the chunked and the Content-Length readers check MAX_HTTP_BODY.
+This one had nothing to check against, so a peer that never sent a length - by
+omitting both headers, or by sending a Content-Length that is not a length -
+decided on its own how much of our memory to take.
+*/
 @(private)
-reader_to_end :: proc(r: ^Buf_Reader) -> []u8 {
+reader_to_end :: proc(r: ^Buf_Reader, limit: int) -> (data: []u8, err: Error) {
 	for {
-		if err := reader_fill(r); err != .None {
+		// Checked before the next read rather than after, so the buffer is never
+		// grown past the limit it is about to be refused for.
+		if len(r.buf) - r.pos > limit {
+			return nil, .Too_Large
+		}
+		if ferr := reader_fill(r); ferr != .None {
 			break
 		}
 	}
-	return r.buf[r.pos:]
+	return r.buf[r.pos:], .None
 }
 
 Http_Response :: struct {
@@ -240,6 +253,12 @@ http_exchange :: proc(
 		switch {
 		case strings.equal_fold(name, "content-length"):
 			v, vok := strconv.parse_int(strings.trim_space(value))
+			// A value that parses but cannot be a length is refused here rather
+			// than left to fall past the `== 0` and `> 0` cases below onto the
+			// read-to-end path, which is not what the peer asked for.
+			if vok && (v < 0 || v > MAX_HTTP_BODY) {
+				return resp, .Too_Large
+			}
 			if vok {
 				content_length = v
 			}
@@ -265,16 +284,14 @@ http_exchange :: proc(
 	case content_length == 0:
 		resp.body = nil
 	case content_length > 0:
-		if content_length > MAX_HTTP_BODY {
-			return resp, .Too_Large
-		}
+		// Already bounded where the header was read.
 		data := reader_exact(&r, content_length) or_return
 		out := make([]u8, len(data), allocator)
 		copy(out, data)
 		resp.body = out
 	case:
 		// No framing information: the body ends when the connection does.
-		data := reader_to_end(&r)
+		data := reader_to_end(&r, MAX_HTTP_BODY) or_return
 		out := make([]u8, len(data), allocator)
 		copy(out, data)
 		resp.body = out

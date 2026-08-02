@@ -470,6 +470,117 @@ test_reader_exact_refuses_a_negative_count :: proc(t: ^testing.T) {
 }
 
 /*
+A response with no framing information ends when the connection does, and that
+reader was the one path of four with no size limit on it: the header scan stops
+at 64 KB, and chunked and Content-Length both check MAX_HTTP_BODY. This one read
+until the peer stopped sending, so a list host that never sent a length decided
+for itself how much memory to take.
+
+Driven with a small limit rather than through `http_exchange`, so the bound is
+exercised without moving 64 MB across the loopback on every run.
+*/
+@(test)
+test_unframed_body_stops_at_the_limit :: proc(t: ^testing.T) {
+	LIMIT :: 4096
+
+	Case :: struct {
+		body_len: int,
+		refused:  bool,
+		what:     string,
+	}
+	CASES := []Case{{LIMIT / 2, false, "under the limit"}, {LIMIT * 8, true, "over the limit"}}
+
+	for c in CASES {
+		listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+		if lerr != nil {
+			testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+			return
+		}
+		bound, berr := net.bound_endpoint(listener)
+		if berr != nil {
+			net.close(listener)
+			testing.expectf(t, false, "cannot read the mock's port: %v", berr)
+			return
+		}
+
+		payload := make([]u8, c.body_len, context.temp_allocator)
+		for i in 0 ..< len(payload) {
+			payload[i] = 'x'
+		}
+		m := Http_Mock {
+			listener = listener,
+			reply    = string(payload),
+		}
+		server := thread.create_and_start_with_poly_data(&m, http_mock_once)
+		defer {
+			thread.join(server)
+			thread.destroy(server)
+			net.close(listener)
+		}
+
+		socket, derr := dial_tcp_timeout(bound, 2 * time.Second)
+		if derr != .None {
+			testing.expectf(t, false, "cannot dial the mock: %v", derr)
+			return
+		}
+		set_socket_timeouts(socket, 2 * time.Second)
+		stream := Stream {
+			socket = socket,
+		}
+		defer stream_close(&stream)
+		// The mock reads a request before it answers.
+		stream_write(&stream, []u8{'\n'})
+
+		r := Buf_Reader {
+			stream = &stream,
+			buf    = make([dynamic]u8, 0, 256, context.temp_allocator),
+		}
+		data, err := reader_to_end(&r, LIMIT)
+		if c.refused {
+			testing.expectf(t, err != .None, "a body %s was read to the end anyway", c.what)
+			testing.expectf(t, len(data) == 0, "a refused body still handed back %d bytes", len(data))
+		} else {
+			testing.expectf(t, err == .None, "a body %s failed: %v", c.what, err)
+			testing.expectf(t, len(data) == c.body_len, "a body %s came back as %d bytes", c.what, len(data))
+		}
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+A Content-Length that is not a length must not fall through to the one reader
+with no length to work with.
+
+`-1` parses, so it slipped past both the `== 0` and the `> 0` case and landed on
+the read-to-end path - the single framing path where a body was never bounded.
+The `> MAX_HTTP_BODY` check that guards the ordinary case sits inside the branch
+it never reached.
+*/
+@(test)
+test_content_length_out_of_range_is_refused :: proc(t: ^testing.T) {
+	CASES :: []string {
+		"HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\nhello",
+		"HTTP/1.1 200 OK\r\nContent-Length: -9999999\r\n\r\nhello",
+	}
+	for reply in CASES {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		defer mem.tracking_allocator_destroy(&track)
+
+		resp, err, ok := exchange_against(t, reply, &track)
+		if !ok {
+			return
+		}
+		testing.expectf(t, err != .None, "%q was accepted, with a %d byte body", reply, len(resp.body))
+		if resp.body != nil {
+			delete(resp.body, mem.tracking_allocator(&track))
+		}
+		expect_caller_holds_nothing(t, &track, "negative content-length")
+		free_all(context.temp_allocator)
+	}
+}
+
+/*
 An answer as large as the query said it could be must arrive whole.
 
 `recv_udp` fills the buffer it is given and drops the rest of the datagram
