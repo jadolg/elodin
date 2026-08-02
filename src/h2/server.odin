@@ -583,10 +583,23 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		return true
 	}
 
+	/*
+	Looked up again rather than reusing the pointer from the top of this
+	procedure. The lock was released in between, and a handler answering this
+	stream retires it through `close_stream`, which frees it - so the earlier
+	pointer may by now refer to memory that is gone. A peer is free to send
+	DATA on a stream it has already ended, which is all it takes to be here at
+	the same moment as the handler.
+	*/
 	sync.mutex_lock(&c.mu)
-	s.state = .Half_Closed_Remote
-	req := s.pending
-	s.pending = nil
+	live, still_open := c.streams[h.stream_id]
+	if !still_open {
+		sync.mutex_unlock(&c.mu)
+		return true
+	}
+	live.state = .Half_Closed_Remote
+	req := live.pending
+	live.pending = nil
 	sync.mutex_unlock(&c.mu)
 
 	if req == nil {
@@ -594,7 +607,9 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		goaway(c, .Protocol_Error)
 		return false
 	}
-	return dispatch(c, s, req)
+	// Safe to use outside the lock: a parked request means no handler has been
+	// given this stream yet, so nothing else is in a position to retire it.
+	return dispatch(c, live, req)
 }
 
 @(private)
@@ -746,17 +761,25 @@ write_body :: proc(c: ^Conn, stream_id: u32, body: []u8) -> bool {
 	return true
 }
 
+/*
+Retire a stream and release it.
+
+The free happens under the lock, not after it. The reader thread looks streams
+up while holding `c.mu` and acts on what it finds; releasing one outside the
+lock would let this run between that lookup and the use, leaving the reader
+writing into memory that has already gone back to the allocator. Nothing here
+does I/O or takes another lock, so holding `c.mu` across it costs nothing.
+*/
 @(private)
 close_stream :: proc(c: ^Conn, stream_id: u32) {
 	sync.mutex_lock(&c.mu)
+	defer sync.mutex_unlock(&c.mu)
 	s, found := c.streams[stream_id]
-	if found {
-		delete_key(&c.streams, stream_id)
+	if !found {
+		return
 	}
-	sync.mutex_unlock(&c.mu)
-	if found {
-		stream_destroy(c, s)
-	}
+	delete_key(&c.streams, stream_id)
+	stream_destroy(c, s)
 }
 
 @(private)
