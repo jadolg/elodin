@@ -82,8 +82,22 @@ http_exact :: proc(r: ^Http_Reader, n: int) -> (data: []u8, ok: bool) {
 	return r.buf[start:start + n], true
 }
 
+/*
+Read one request off `r`.
+
+Everything kept in the result is copied out of the reader's buffer rather than
+pointed into it. `http_line` and `http_exact` return views, and every read after
+one of them may grow that buffer - which, past its capacity, means a different
+block. The arena behind `context.temp_allocator` happens to carry the old
+contents forward and hold onto the block until `free_all`, so views into it kept
+reading correctly, but nothing here should depend on which allocator it was
+handed. The copies live in the same scratch space and go the same way.
+*/
 @(private)
 read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, ok: bool) {
+	hold :: proc(s: string) -> string {
+		return strings.clone(s, context.temp_allocator)
+	}
 	line := http_line(r) or_return
 
 	// "METHOD path HTTP/1.1"
@@ -96,16 +110,16 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, ok: bool) {
 	if second <= 0 {
 		return {}, false
 	}
-	req.method = line[:first]
+	req.method = hold(line[:first])
 	target := rest[:second]
 	version := rest[second + 1:]
 	req.keep_alive = version != "HTTP/1.0"
 
 	if q := strings.index_byte(target, '?'); q >= 0 {
-		req.path = target[:q]
-		req.query = target[q + 1:]
+		req.path = hold(target[:q])
+		req.query = hold(target[q + 1:])
 	} else {
-		req.path = target
+		req.path = hold(target)
 	}
 
 	content_length := 0
@@ -132,7 +146,7 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, ok: bool) {
 				req.keep_alive = false
 			}
 		case strings.equal_fold(name, "content-type"):
-			req.content_type = value
+			req.content_type = hold(value)
 		case strings.equal_fold(name, "transfer-encoding"):
 			// Chunked request bodies are not accepted; DoH clients send a
 			// Content-Length.
@@ -142,7 +156,9 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, ok: bool) {
 
 	if content_length > 0 {
 		body := http_exact(r, content_length) or_return
-		req.body = body
+		owned := make([]u8, len(body), context.temp_allocator)
+		copy(owned, body)
+		req.body = owned
 	}
 	return req, true
 }
