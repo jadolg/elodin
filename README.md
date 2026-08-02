@@ -553,6 +553,20 @@ the reference resolver.
 
 Every one of these was invisible to the unit tests:
 
+- **Shutdown released things that were still in use.** The read and accept loops
+  freed their own context on the way out, but every job they had queued and
+  every connection thread they had started holds that context and outlives them
+  — and `pool.destroy` runs what is queued before it joins its workers, so those
+  jobs ran against freed memory. The teardown order compounded it: the worker
+  pools were deferred first, so they unwound last, and a draining query reached
+  for a validator, filter set, cache and upstream group that had all already
+  gone. The listeners now hand their contexts to `Listeners` and `main` drains
+  the pools between stopping the listeners and releasing them. The loops also
+  carry a poll timeout now, since closing a socket does not reliably wake a
+  thread already blocked reading or accepting on it, and joining one that never
+  returns would have hung the shutdown it was meant to complete. Latent rather
+  than live: nothing clears `Server.running` and there is no signal handler, so
+  the process has always been stopped by a signal and this path never ran.
 - **A verifying TLS client checked the chain but not the name.** `SSL_set1_host`
   is what ties a certificate to the peer you meant to reach, and it was only
   called when a hostname was supplied. A `tls://` upstream written as an IP
