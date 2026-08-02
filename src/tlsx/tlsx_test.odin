@@ -2,6 +2,7 @@ package tlsx
 
 import "core:net"
 import "core:os"
+import "core:strings"
 import "core:sync"
 import "core:sys/posix"
 import "core:testing"
@@ -485,6 +486,103 @@ verified_handshake :: proc(t: ^testing.T, hostname: string) -> (err: Error, ran:
 	}
 	close(conn)
 	return .None, true
+}
+
+@(private = "file")
+Reset_Ctx :: struct {
+	listener: net.TCP_Socket,
+	done:     bool,
+}
+
+// Accept, then hang up hard: SO_LINGER with a zero timeout makes close() send a
+// RST rather than a FIN, which is what a peer that drops handshakes mid-flight
+// looks like on the wire.
+@(private = "file")
+reset_worker :: proc(r: ^Reset_Ctx) {
+	defer sync.atomic_store(&r.done, true)
+	sock, _, err := net.accept_tcp(r.listener)
+	if err != nil {
+		return
+	}
+	lg := posix.linger {
+		l_onoff  = 1,
+		l_linger = 0,
+	}
+	posix.setsockopt(posix.FD(sock), posix.SOL_SOCKET, .LINGER, &lg, posix.socklen_t(size_of(lg)))
+	net.close(sock)
+}
+
+/*
+A handshake killed by the transport must say so.
+
+An upstream that resets the connection mid-handshake - Quad9 does it to a
+noticeable share of connections from some networks - leaves OpenSSL's error
+queue empty, because nothing about the protocol went wrong: the failure was the
+socket's. Reporting that as `Handshake_Failed` with "no OpenSSL error recorded"
+tells the operator nothing, and in particular does not tell them the problem is
+not theirs. The errno is the whole of the diagnosis, so it has to be picked up
+at the point of failure and carried out.
+*/
+@(test)
+test_handshake_reset_by_peer_reports_the_transport_error :: proc(t: ^testing.T) {
+	// The RST arrives while OpenSSL still has bytes to push, so the write that
+	// follows it raises SIGPIPE. The server ignores it (see main.odin); the test
+	// runner does not.
+	posix.sigignore(.SIGPIPE)
+
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the bound port: %v", berr)
+		return
+	}
+
+	cctx, cerr := client_context(false)
+	if cerr != .None {
+		testing.expectf(t, false, "client_context: %v", cerr)
+		return
+	}
+	defer context_destroy(cctx)
+
+	rctx := new(Reset_Ctx)
+	defer free(rctx)
+	rctx.listener = listener
+	reset := thread.create_and_start_with_poly_data(rctx, reset_worker)
+	defer {
+		thread.join(reset)
+		thread.destroy(reset)
+	}
+
+	sock, derr := net.dial_tcp_from_endpoint(bound)
+	if derr != nil {
+		testing.expectf(t, false, "cannot dial: %v", derr)
+		return
+	}
+	_ = net.set_option(sock, .Receive_Timeout, 10 * time.Second)
+	_ = net.set_option(sock, .Send_Timeout, 10 * time.Second)
+
+	conn, herr := client_connect(cctx, sock, "elodin.local")
+	if herr == .None {
+		close(conn)
+		testing.expect(t, false, "the handshake succeeded against a peer that reset it")
+		return
+	}
+	net.close(sock)
+
+	testing.expect_value(t, herr, Error.Closed)
+
+	detail := describe_error(herr, context.temp_allocator)
+	testing.expectf(
+		t,
+		strings.contains(detail, "reset"),
+		"the reported cause was %q, which does not name the transport error behind it",
+		detail,
+	)
 }
 
 /*

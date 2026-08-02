@@ -394,7 +394,7 @@ open_stream :: proc(
 			tlsx.describe_error(terr, context.temp_allocator),
 		)
 		net.close(socket)
-		return {}, .Verify_Failed if terr == .Verify_Failed else .TLS_Failed
+		return {}, handshake_failure(terr)
 	}
 	return Stream{socket = socket, tls = conn}, .None
 }
