@@ -1,7 +1,10 @@
 package server
 
 import "core:testing"
+import "elodin:cache"
+import "elodin:config"
 import "elodin:dns"
+import "elodin:dnssec"
 
 /*
 The parts of the DNSSEC path that shape what the client sees.
@@ -222,4 +225,101 @@ test_query_ids_do_not_repeat_in_sequence :: proc(t: ^testing.T) {
 	// raw would collide never, and be guessable, which is the failure this is
 	// looking for.
 	testing.expect(t, len(seen) > 200, "too few distinct transaction ids")
+}
+
+/*
+An answer we did not check ourselves must not claim to have been checked.
+
+The AD bit says "this resolver authenticated this data". When validation is off,
+or the client asked us to leave it alone with CD, we authenticated nothing — so
+whatever the upstream put in that bit is its claim, not ours, and passing it on
+lends it our name. RFC 6840 section 5.8 and RFC 4035 section 3.2.2.
+
+Driven through `handle_query` on the cache path rather than against
+`apply_ad_policy` directly, because the defect was not in that procedure: it
+was in only calling it when we had validated.
+*/
+
+@(private = "file")
+Ad_Case :: struct {
+	name:      string,
+	validator: bool,
+	cd:        bool,
+}
+
+@(private = "file")
+serve_cached_with_ad :: proc(t: ^testing.T, c: Ad_Case) -> (response: []u8, ok: bool) {
+	// The answer as an upstream sent it, AD set. Nothing here established that.
+	stored := signed_response()
+	stored.flags.ad = true
+	wire, _, enc := dns.encode_message(stored, context.temp_allocator)
+	testing.expect_value(t, enc, dns.Encode_Error.None)
+
+	cfg := config.default_config()
+	cfg.log.queries = false
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
+	defer cache.destroy(answers)
+
+	s := Server {
+		cfg     = &cfg,
+		answers = answers,
+	}
+	if c.validator {
+		// A validator that is never asked anything: with CD set, nothing
+		// reaches it.
+		s.validator = dnssec.make_validator(nil, nil, dnssec.Options{})
+	}
+	defer if s.validator != nil {
+		dnssec.destroy_validator(s.validator)
+	}
+
+	query := client_query(false, with_edns = false)
+	query.flags.cd = c.cd
+	query_wire, _, qenc := dns.encode_message(query, context.temp_allocator)
+	testing.expect_value(t, qenc, dns.Encode_Error.None)
+
+	key_buf: [cache.KEY_MAX]u8
+	key := cache.make_key(
+		key_buf[:],
+		query.question[0].name,
+		query.question[0].type,
+		query.question[0].class,
+		dns.edns_do(query),
+		query.flags.cd,
+	)
+	decoded, derr := dns.decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !cache.put(answers, key, wire, decoded) {
+		testing.expectf(t, false, "%s: the answer was not cached, so the served path was never taken", c.name)
+		return nil, false
+	}
+
+	out, outcome, served := handle_query(&s, query_wire, .UDP, "test", context.temp_allocator)
+	testing.expectf(t, served, "%s: no response was produced", c.name)
+	testing.expectf(t, outcome == .Cached, "%s: expected the cached path, got %v", c.name, outcome)
+	return out, served && outcome == .Cached
+}
+
+@(test)
+test_ad_bit_is_not_forwarded_when_we_did_not_validate :: proc(t: ^testing.T) {
+	cases := []Ad_Case {
+		// DNSSEC off entirely: there is no verdict to report.
+		{name = "no validator", validator = false, cd = false},
+		// DNSSEC on, but the client set CD, which is a request to leave the
+		// checking alone. We do, so we have nothing to attest either.
+		{name = "checking disabled by the client", validator = true, cd = true},
+	}
+	for c in cases {
+		out, ok := serve_cached_with_ad(t, c)
+		if !ok {
+			continue
+		}
+		testing.expectf(
+			t,
+			len(out) >= dns.HEADER_SIZE && out[3] & 0x20 == 0,
+			"%s: the upstream's AD bit reached the client as ours",
+			c.name,
+		)
+		free_all(context.temp_allocator)
+	}
 }

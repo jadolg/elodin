@@ -74,12 +74,27 @@ run_wire_cases :: proc(r: ^Runner) {
 				check_eq_int(r, h.ancount, f.ancount, "answer count")
 				check_eq_int(r, h.rcode, f.rcode, "rcode")
 
-				// Byte-for-byte, ignoring the ID we deliberately changed.
+				/*
+				Byte-for-byte, ignoring the ID we deliberately changed and the
+				AD bit we deliberately do not pass on.
+
+				This server is configured without DNSSEC, so it authenticated
+				nothing and has no business repeating an upstream's claim that
+				it did. The bit is checked on its own below; everything else
+				still has to arrive exactly as the upstream sent it.
+				*/
+				want := expected
+				want[3] &~= 0x20
 				if check(r, len(res.wire) == len(expected), "length: got %d, want %d", len(res.wire), len(expected)) {
 					check(
 						r,
-						bytes_equal(res.wire[2:], expected[2:]),
+						bytes_equal(res.wire[2:], want[2:]),
 						"payload differs from what the upstream sent",
+					)
+					check(
+						r,
+						res.wire[3] & 0x20 == 0,
+						"the upstream's AD bit was forwarded by a server that validates nothing",
 					)
 				}
 
