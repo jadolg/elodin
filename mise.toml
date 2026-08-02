@@ -54,6 +54,7 @@ run = [
   "odin test src/filter   -collection:elodin=src -out:bin/test_filter -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES",
   "odin test src/cache    -collection:elodin=src -out:bin/test_cache -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES",
   "odin test src/dnssec   -collection:elodin=src -out:bin/test_dnssec -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES",
+  "odin test src/tlsx     -collection:elodin=src -out:bin/test_tlsx -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES",
   "odin test src/upstream -collection:elodin=src -out:bin/test_upstream -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES",
   "odin test src/h2       -collection:elodin=src -out:bin/test_h2 -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES",
   "odin test src/server   -collection:elodin=src -out:bin/test_server -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES",

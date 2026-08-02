@@ -145,6 +145,13 @@ get_h2_conn :: proc(u: ^Upstream, timeout: time.Duration) -> (conn: ^h2.Client, 
 	// reader thread now lives for as long as the connection does, and normal
 	// idle time between queries must not look like a read failure.
 	_ = net.set_option(stream.socket, .Receive_Timeout, H2_POLL_INTERVAL)
+	if stream.tls != nil {
+		// A TLS connection stops taking its deadlines from the socket once the
+		// handshake is done - it waits in `poll` rather than in the kernel, so
+		// that a reader between queries does not hold the lock a writer needs -
+		// and has to be told separately.
+		tlsx.set_timeouts(stream.tls, H2_POLL_INTERVAL, timeout)
+	}
 
 	hc := new(H2_Conn, u.allocator)
 	hc.stream = stream
