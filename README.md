@@ -571,6 +571,18 @@ Every one of these was invisible to the unit tests:
   build compiles bounds checks out, so this was an out-of-bounds access at an
   offset the peer chose, reachable from any DoH upstream speaking HTTP/1.1 and
   from any blocklist served over plain HTTP.
+- **An algorithm we could not check made a signed RRset unsigned.** Once a zone
+  is established as secure, an RRset in it carrying only signatures we cannot
+  verify was reported insecure rather than bogus — the verdict was returned
+  before the code that asks whether the zone is signed at all. A zone using two
+  algorithms publishes an RRSIG for each, so stripping the one we can verify and
+  altering the records left an answer that reached the client as merely
+  unvalidated. That is the correction in RFC 6840 section 5.11: an unknown
+  algorithm makes a *delegation* insecure, at the DS, and nothing below it. An
+  algorithm the linked OpenSSL declines to run — SHA-1 under the Fedora and RHEL
+  crypto policy — is now a separate verdict, since that is a fact about the
+  machine rather than the zone, and refusing it would make zones unresolvable on
+  one host that resolve on another.
 - **A key tag was treated as a key's identity.** Verifying a zone's DNSKEY set
   against its parent's DS, the code found the key the DS attested and then
   handed the whole key set to the signature check — which picks a key by tag and
