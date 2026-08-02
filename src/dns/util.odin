@@ -95,6 +95,11 @@ error_response :: proc(
 	flags.qr = true
 	flags.ra = true
 	flags.tc = false
+	// Built out of the query's own header, so every bit in it started as the
+	// client's. AD is the one that must not survive the round trip: coming back
+	// set, it would read as this server vouching for a message it could not
+	// even parse.
+	flags.ad = false
 	flags.rcode = u8(rcode) & 0xf
 	fv := transmute(u16)flags
 	buf[2] = u8(fv >> 8)

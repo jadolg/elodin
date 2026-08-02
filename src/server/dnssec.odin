@@ -233,6 +233,27 @@ neither DO nor AD did not ask it. Applied to cache hits as much as to fresh
 answers, so which client happened to warm an entry cannot change what a later
 one is told.
 */
+/*
+Decide what the AD bit on the way out is allowed to say.
+
+Every answer goes through here, whether it came from the cache or from an
+upstream a moment ago. Where we validated, `apply_ad_policy` narrows the stored
+verdict to what this client asked about. Where we did not - DNSSEC switched off,
+the client set CD, a class we do not validate - there is no verdict at all, and
+whatever the upstream put in that bit is its claim rather than ours. Forwarding
+it would lend our name to an assertion nothing here checked, which RFC 4035
+section 3.2.2 asks a resolver never to do; on a plain UDP upstream, or one
+reached over a connection nobody authenticated, that claim is anyone's to make.
+*/
+@(private)
+settle_ad_bit :: proc(wire: []u8, query: dns.Message, validated: bool) {
+	if validated {
+		apply_ad_policy(wire, query)
+		return
+	}
+	set_ad_bit(wire, false)
+}
+
 @(private)
 apply_ad_policy :: proc(wire: []u8, query: dns.Message) {
 	if dns.edns_do(query) || query.flags.ad {

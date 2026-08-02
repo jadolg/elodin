@@ -156,9 +156,7 @@ handle_query :: proc(
 			dns.copy_question_case(hit, query)
 			// The stored answer carries the verdict; whether this client gets to
 			// hear it is a separate question.
-			if validating {
-				apply_ad_policy(hit, msg)
-			}
+			settle_ad_bit(hit, msg, validating)
 			sync.atomic_add(&s.stats.cached, 1)
 			out := fit_response(hit, limit, msg, allocator)
 			log_query(s, client, proto, q, .Cached, "stale" if stale else "cache", started)
@@ -221,9 +219,7 @@ handle_query :: proc(
 
 	sync.atomic_add(&s.stats.forwarded, 1)
 	out := fit_response(resp, limit, msg, allocator)
-	if validating {
-		apply_ad_policy(out, msg)
-	}
+	settle_ad_bit(out, msg, validating)
 	name := winner.spec.name if winner != nil else "?"
 	log_query(s, client, proto, q, .Forwarded, name, started)
 	return out, .Forwarded, true

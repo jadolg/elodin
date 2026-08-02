@@ -553,6 +553,15 @@ the reference resolver.
 
 Every one of these was invisible to the unit tests:
 
+- **An answer nobody checked still claimed to have been checked.** The AD bit
+  was only ever touched on the path where validation had run, so with DNSSEC
+  switched off — or for a client that set CD, which asks us to leave the
+  checking alone — whatever the upstream put in that bit reached the client
+  unaltered. It reads as *this resolver* authenticated the data, and on a plain
+  UDP upstream that assertion is anyone's to make. It was cached with the answer
+  too, so one client's forged AD was replayed to the next. Now settled on every
+  path: narrowed to what the client asked about where we validated, cleared
+  where we did not.
 - **A UDP upstream could not receive a large answer.** The receive buffer was a
   fixed 4096 bytes, while the query forwarded to the upstream carries the
   *client's* EDNS0 payload size — up to 65535. A responder filling the room it
