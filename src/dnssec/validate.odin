@@ -1086,20 +1086,22 @@ cache_put :: proc(v: ^Validator, zone: string, status: Status, keys: []Dnskey, t
 	v.zones[entry.zone] = entry
 }
 
-// Drop entries whose lifetime has run out.
-sweep :: proc(v: ^Validator) -> (removed: int) {
+// Drop entries whose lifetime has run out. A zero `now` reads the wall clock;
+// tests pass the same fixed clock the walk itself was made to trust, so an
+// entry timed against fixture signatures is not judged against real time.
+sweep :: proc(v: ^Validator, now: time.Time = {}) -> (removed: int) {
 	if v == nil {
 		return 0
 	}
 	sync.mutex_lock(&v.mu)
 	defer sync.mutex_unlock(&v.mu)
 
-	now := time.now()
+	clock := now if now != {} else time.now()
 	// Collected first: deleting from a map while walking it is not something to
 	// rely on.
 	expired := make([dynamic]^Zone_Entry, 0, 16, context.temp_allocator)
 	for _, entry in v.zones {
-		if time.diff(entry.expires, now) > 0 {
+		if time.diff(entry.expires, clock) > 0 {
 			append(&expired, entry)
 		}
 	}
