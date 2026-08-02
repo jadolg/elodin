@@ -368,33 +368,55 @@ read_chunked :: proc(r: ^Buf_Reader, allocator: mem.Allocator) -> (body: []u8, e
 Open a stream to `endpoint`, optionally wrapping it in TLS.
 
 `tls_ctx` is nil for plain HTTP. `hostname` is used for SNI and certificate
-verification.
+verification. `name` names the upstream in the log when there is one to name;
+the bootstrap resolver has none.
+
+A handshake the transport killed - a peer that reset the connection partway
+through - is retried once on a new socket. Some resolvers do this to a share of
+connections while the very next attempt goes through: Quad9 reset roughly a
+fifth of the handshakes offered to it from one network, and a single retry
+recovered two thirds of those. Left alone they accumulate into the consecutive
+failure count and park an upstream that answers perfectly well.
+
+Only that case is retried. A certificate that did not check out will not check
+out on a second look, and a handshake that ran out of time has already spent the
+caller's budget - retrying it would spend it twice. A reset comes back
+immediately, so the retry costs a round trip.
 */
 open_stream :: proc(
 	endpoint: net.Endpoint,
 	tls_ctx: ^tlsx.Context,
 	hostname: string,
 	timeout: time.Duration,
+	name: string = "",
 ) -> (
 	stream: Stream,
 	err: Error,
 ) {
-	socket := dial_tcp_timeout(endpoint, timeout) or_return
-	set_socket_timeouts(socket, timeout)
-	_ = net.set_option(socket, .TCP_Nodelay, true)
+	for attempt in 0 ..< 2 {
+		socket := dial_tcp_timeout(endpoint, timeout) or_return
+		set_socket_timeouts(socket, timeout)
+		_ = net.set_option(socket, .TCP_Nodelay, true)
 
-	if tls_ctx == nil {
-		return Stream{socket = socket}, .None
-	}
-	conn, terr := tlsx.client_connect(tls_ctx, socket, hostname)
-	if terr != .None {
-		logx.debugf(
-			"TLS handshake with %q failed: %s",
-			hostname,
-			tlsx.describe_error(terr, context.temp_allocator),
-		)
+		if tls_ctx == nil {
+			return Stream{socket = socket}, .None
+		}
+		conn, terr := tlsx.client_connect(tls_ctx, socket, hostname)
+		if terr == .None {
+			return Stream{socket = socket, tls = conn}, .None
+		}
+		// OpenSSL keeps its reason on a per-thread queue, so it has to be read
+		// here rather than at the point the error surfaces.
+		detail := tlsx.describe_error(terr, context.temp_allocator)
+		if name == "" {
+			logx.debugf("TLS handshake with %q failed: %s", hostname, detail)
+		} else {
+			logx.debugf("upstream %s: TLS handshake with %q failed: %s", name, hostname, detail)
+		}
 		net.close(socket)
-		return {}, .Verify_Failed if terr == .Verify_Failed else .TLS_Failed
+		if terr != .Closed || attempt == 1 {
+			return {}, handshake_failure(terr)
+		}
 	}
-	return Stream{socket = socket, tls = conn}, .None
+	return {}, .TLS_Failed
 }

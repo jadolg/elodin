@@ -4,7 +4,6 @@ import "core:mem"
 import "core:net"
 import "core:time"
 import "elodin:dns"
-import "elodin:logx"
 import "elodin:tlsx"
 
 /*
@@ -209,6 +208,14 @@ read_full_tcp :: proc(socket: net.TCP_Socket, buf: []u8) -> Error {
 	return .None
 }
 
+// Open a fresh DoT connection. Dialling, the handshake and the retry that
+// handshake gets are the HTTPS path's exactly, so they are shared with it.
+@(private)
+dial_dot :: proc(u: ^Upstream, timeout: time.Duration) -> (conn: Idle_Conn, err: Error) {
+	stream := open_stream(u.endpoint, u.tls_ctx, u.spec.hostname, timeout, u.spec.name) or_return
+	return Idle_Conn{socket = stream.socket, tls = stream.tls}, .None
+}
+
 // DNS over TLS: the TCP framing above, carried inside a TLS session (RFC 7858).
 @(private)
 exchange_dot :: proc(
@@ -229,29 +236,9 @@ exchange_dot :: proc(
 			conn, reused = take_idle(u)
 		}
 		if !reused {
-			socket, derr := dial_tcp_timeout(u.endpoint, timeout)
-			if derr != .None {
-				return nil, derr
-			}
-			set_socket_timeouts(socket, timeout)
-			_ = net.set_option(socket, .TCP_Nodelay, true)
-
-			tls_conn, terr := tlsx.client_connect(u.tls_ctx, socket, u.spec.hostname)
-			if terr != .None {
-				// OpenSSL keeps its reason on a per-thread queue, so it has to
-				// be read here rather than at the point the error surfaces.
-				logx.debugf(
-					"upstream %s: TLS handshake with %q failed: %s",
-					u.spec.name,
-					u.spec.hostname,
-					tlsx.describe_error(terr, context.temp_allocator),
-				)
-				net.close(socket)
-				return nil, .Verify_Failed if terr == .Verify_Failed else .TLS_Failed
-			}
-			conn = Idle_Conn {
-				socket = socket,
-				tls    = tls_conn,
+			conn, err = dial_dot(u, timeout)
+			if err != .None {
+				return nil, err
 			}
 		}
 

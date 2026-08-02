@@ -4,6 +4,7 @@ import "core:c"
 import "core:net"
 import "core:sys/posix"
 import "core:time"
+import "elodin:tlsx"
 
 /*
 Connect with a deadline.
@@ -109,6 +110,26 @@ fill_sockaddr :: proc(endpoint: net.Endpoint, storage: ^posix.sockaddr_in6, out_
 		storage.sin6_addr = transmute(posix.in6_addr)bytes
 		out_len^ = posix.socklen_t(size_of(posix.sockaddr_in6))
 	}
+}
+
+/*
+What a failed TLS handshake means to the group above.
+
+A certificate that did not check out is a trust problem and stays distinct. A
+handshake that ran out of time is a slow server, not a broken one, and reporting
+it as `Timeout` keeps it alongside every other kind of upstream that was too
+slow. Everything else - including a peer that reset the connection partway
+through - is a TLS failure.
+*/
+@(private)
+handshake_failure :: proc(terr: tlsx.Error) -> Error {
+	#partial switch terr {
+	case .Verify_Failed:
+		return .Verify_Failed
+	case .Timeout:
+		return .Timeout
+	}
+	return .TLS_Failed
 }
 
 // Apply read and write deadlines to a connected socket.

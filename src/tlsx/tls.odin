@@ -139,6 +139,60 @@ last_error :: proc(allocator := context.allocator) -> string {
 }
 
 /*
+The errno behind the last handshake this thread gave up on, or `.NONE` when the
+failure was OpenSSL's own.
+
+A peer that resets or hangs up mid-handshake leaves the OpenSSL error queue
+empty - nothing about the protocol went wrong - so `last_error` has nothing to
+report and the operator is told only that the handshake failed. The errno is
+the whole of the diagnosis in that case, and it is gone by the time the caller
+logs, so it is recorded here as the handshake fails. Per thread, for the same
+reason OpenSSL keeps its queue that way.
+*/
+@(private)
+@(thread_local)
+last_handshake_errno: posix.Errno
+
+/*
+Classify a handshake that did not complete.
+
+`SSL_get_error` has to be read before anything else touches the session, and
+errno before anything else makes a system call, so both are taken here, right
+where the failure happened.
+
+A blocking socket only ever asks to be retried because SO_RCVTIMEO or
+SO_SNDTIMEO cut a wait short, which is a timeout rather than a protocol
+failure, and a syscall-level error is the transport giving up rather than the
+peer refusing us. Telling those apart is what lets a caller log the difference
+between "the upstream is slow", "the upstream hung up on us", and "the
+certificate did not check out".
+*/
+@(private)
+handshake_error :: proc(ssl: ^SSL, ret: c.int) -> Error {
+	saved := posix.errno()
+	code := SSL_get_error(ssl, ret)
+	last_handshake_errno = .NONE
+
+	switch code {
+	case SSL_ERROR_WANT_READ, SSL_ERROR_WANT_WRITE:
+		return .Timeout
+	case SSL_ERROR_ZERO_RETURN:
+		return .Closed
+	case SSL_ERROR_SYSCALL:
+		// OpenSSL reports a blocking socket's expired timeout this way too on
+		// some paths; it is still a timeout, not a broken connection.
+		if saved == .EAGAIN || saved == .EWOULDBLOCK {
+			return .Timeout
+		}
+		// errno zero here means the peer went away without a word: an EOF where
+		// a handshake message was due.
+		last_handshake_errno = saved
+		return .Closed
+	}
+	return .Handshake_Failed
+}
+
+/*
 Encode ALPN protocol names into OpenSSL's wire format: each name prefixed by its
 one-byte length, all concatenated.
 */
@@ -395,9 +449,10 @@ client_connect :: proc(ctx: ^Context, socket: net.TCP_Socket, hostname: string, 
 	}
 
 	ERR_clear_error()
-	if SSL_connect(ssl) != 1 {
+	if ret := SSL_connect(ssl); ret != 1 {
+		err = handshake_error(ssl, ret)
 		SSL_free(ssl)
-		return nil, .Handshake_Failed
+		return nil, err
 	}
 	if ctx.verify && SSL_get_verify_result(ssl) != X509_V_OK {
 		SSL_free(ssl)
@@ -422,9 +477,10 @@ server_accept :: proc(ctx: ^Context, socket: net.TCP_Socket, allocator := contex
 		return nil, .Handshake_Failed
 	}
 	ERR_clear_error()
-	if SSL_accept(ssl) != 1 {
+	if ret := SSL_accept(ssl); ret != 1 {
+		err = handshake_error(ssl, ret)
 		SSL_free(ssl)
-		return nil, .Handshake_Failed
+		return nil, err
 	}
 	conn = new(Conn, allocator)
 	conn.ssl = ssl
@@ -641,6 +697,12 @@ describe_error :: proc(err: Error, allocator := context.allocator) -> string {
 	case .Handshake_Failed, .Certificate_Failed, .Context_Failed:
 		detail := last_error(context.temp_allocator)
 		return fmt.aprintf("%v: %s", err, detail, allocator = allocator)
+	case .Closed:
+		// Set only by a handshake that the transport killed; a connection closed
+		// anywhere else leaves it clear and falls through to the bare name.
+		if last_handshake_errno != .NONE {
+			return fmt.aprintf("%v: %s", err, posix.strerror(last_handshake_errno), allocator = allocator)
+		}
 	}
 	return fmt.aprintf("%v", err, allocator = allocator)
 }
