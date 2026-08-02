@@ -366,6 +366,19 @@ Wrap a connected socket in a TLS client session.
 name checking. Pass "" only for an unverified context.
 */
 client_connect :: proc(ctx: ^Context, socket: net.TCP_Socket, hostname: string, allocator := context.allocator) -> (conn: ^Conn, err: Error) {
+	/*
+	Verification without a name to verify against is not verification.
+
+	`SSL_VERIFY_PEER` only asks that the chain end somewhere trusted; what ties
+	the certificate to the peer we meant to reach is `SSL_set1_host` below, and
+	that needs a name. Going ahead without one would accept any certificate any
+	trusted CA ever issued, for any name at all - so this refuses instead,
+	rather than quietly handing back a session the caller believes is checked.
+	*/
+	if ctx.verify && hostname == "" {
+		return nil, .Verify_Failed
+	}
+
 	ssl := SSL_new(ctx.ptr)
 	if ssl == nil {
 		return nil, .Handshake_Failed

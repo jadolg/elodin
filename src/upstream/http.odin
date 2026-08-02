@@ -116,6 +116,12 @@ index_crlf :: proc(b: []u8) -> int {
 
 @(private)
 reader_exact :: proc(r: ^Buf_Reader, n: int) -> (data: []u8, err: Error) {
+	// A count no read can satisfy. Falling through would step the cursor
+	// backwards and return a slice ending before it starts, which a release
+	// build compiles without the bounds check that catches it here.
+	if n < 0 {
+		return nil, .HTTP_Error
+	}
 	for len(r.buf) - r.pos < n {
 		reader_fill(r) or_return
 	}
@@ -309,7 +315,21 @@ read_chunked :: proc(r: ^Buf_Reader, allocator: mem.Allocator) -> (body: []u8, e
 		if idx := strings.index_byte(line, ';'); idx >= 0 {
 			size_text = line[:idx]
 		}
-		size, ok := strconv.parse_u64_of_base(strings.trim_space(size_text), 16)
+		/*
+		`strconv.parse_u64_of_base` has no overflow check: it wraps and still
+		reports success. A header longer than a u64 therefore parses as some
+		unrelated number — zero among them, which would be read as the end of
+		the body — so the length is settled here, where sixteen significant hex
+		digits is exactly what fits.
+		*/
+		digits := strings.trim_space(size_text)
+		for len(digits) > 1 && digits[0] == '0' {
+			digits = digits[1:]
+		}
+		if len(digits) == 0 || len(digits) > 16 {
+			return nil, .HTTP_Error
+		}
+		size, ok := strconv.parse_u64_of_base(digits, 16)
 		if !ok {
 			return nil, .HTTP_Error
 		}
@@ -323,7 +343,10 @@ read_chunked :: proc(r: ^Buf_Reader, allocator: mem.Allocator) -> (body: []u8, e
 			}
 			break
 		}
-		if len(out) + int(size) > MAX_HTTP_BODY {
+		// Bounded before it is narrowed. A size past the body limit is refused
+		// whatever it is, so the `int` below is always a number this build can
+		// hold and the sum below it cannot overflow.
+		if size > u64(MAX_HTTP_BODY) || len(out) + int(size) > MAX_HTTP_BODY {
 			return nil, .Too_Large
 		}
 		data := reader_exact(r, int(size)) or_return
