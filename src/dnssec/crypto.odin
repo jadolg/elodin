@@ -49,15 +49,28 @@ Verify_Result :: enum u8 {
 	// The signature does not match, or the key is malformed.
 	Bad,
 	/*
-	The algorithm is one we cannot check at all.
+	The algorithm is one this build does not implement.
 
 	Distinct from `Bad` on purpose: RFC 4035 has a validator treat data it
 	cannot check as unsigned rather than as forged, so a zone that has moved to
-	an algorithm we do not know becomes insecure instead of bogus. Distribution
-	crypto policy lands here too — Fedora and RHEL ship an OpenSSL that refuses
-	SHA-1 signatures outright, which takes algorithms 5 and 7 with it.
+	an algorithm we do not know becomes insecure at its delegation instead of
+	bogus. That decision belongs at the DS (RFC 6840 section 5.2); reaching it
+	for an RRset inside a zone already established as secure means something
+	took the supported signature away, which is a forgery rather than a zone we
+	cannot follow.
 	*/
 	Unsupported,
+	/*
+	The algorithm is one we implement and the library would not run.
+
+	Distribution crypto policy lands here: Fedora and RHEL ship an OpenSSL that
+	refuses SHA-1 signatures outright, which takes algorithms 5 and 7 with it.
+	Kept apart from `Unsupported` because the two want different answers — this
+	one is a local policy about a zone that has done nothing wrong, so the data
+	is treated as unsigned rather than refused, and a zone that is unresolvable
+	here would resolve on the same build elsewhere.
+	*/
+	Refused,
 }
 
 // A modulus larger than this is not a key anyone is using, and refusing it early
@@ -192,14 +205,14 @@ verify_signature :: proc(
 
 	ctx := EVP_MD_CTX_new()
 	if ctx == nil {
-		return .Unsupported
+		return .Refused
 	}
 	defer EVP_MD_CTX_free(ctx)
 
 	// A refusal here is a policy decision about the algorithm rather than a
 	// verdict on this signature, so it must not be reported as a forgery.
 	if EVP_DigestVerifyInit(ctx, nil, md, nil, pkey) != 1 {
-		return .Unsupported
+		return .Refused
 	}
 	if EVP_DigestVerify(ctx, raw_data(sig), c.size_t(len(sig)), raw_data(data), c.size_t(len(data))) != 1 {
 		return .Bad

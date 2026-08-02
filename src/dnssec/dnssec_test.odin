@@ -1017,3 +1017,144 @@ test_literal_wildcard_name_is_not_an_expansion :: proc(t: ^testing.T) {
 	testing.expect(t, !wildcard, "a literal wildcard name was taken for a wildcard expansion")
 	free_all(context.temp_allocator)
 }
+
+// ---------------------------------------------------------------------------
+// Algorithm downgrade
+// ---------------------------------------------------------------------------
+
+// Never answers. The zone cache is primed directly below, so a lookup reaching
+// here means the walk went somewhere the test did not intend.
+@(private = "file")
+no_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> ([]u8, bool) {
+	return nil, false
+}
+
+/*
+A zone-signing DNSKEY for an algorithm this build cannot verify.
+
+Algorithm 12 (GOST R 34.10-2001) is deprecated and absent from
+`algorithm_supported`, which is exactly the property under test: a key the
+validator will hold, match against a signature, and then find it has no way to
+check.
+*/
+@(private = "file")
+ALG_UNSUPPORTED :: 12
+
+@(private = "file")
+unsupported_key :: proc() -> Dnskey {
+	rdata := make([]u8, 4 + 32, context.temp_allocator)
+	flags := u16(DNSKEY_FLAG_ZONE)
+	rdata[0] = u8(flags >> 8)
+	rdata[1] = u8(flags)
+	rdata[2] = 3 // protocol, fixed
+	rdata[3] = ALG_UNSUPPORTED
+	for i in 0 ..< 32 {
+		rdata[4 + i] = u8(i)
+	}
+	key, err := parse_dnskey(rdata)
+	assert(err == .None)
+	return key
+}
+
+/*
+Establish `zone` as signed, holding one key nothing here can verify.
+
+Primed rather than walked: the defect is in what `validate_rrset` concludes
+once a zone is Secure, and building a whole crafted chain to reach that state
+would put the fixture, not the verdict, under test.
+*/
+@(private = "file")
+validator_with_zone :: proc(zone: string, status: Status) -> (^Validator, []Dnskey) {
+	v := make_validator(no_query, nil, Options{})
+	keys := make([]Dnskey, 1, context.temp_allocator)
+	keys[0] = unsupported_key()
+
+	cache_put(v, ".", .Secure, nil, MAX_ZONE_TTL, fixture_now())
+	cache_put(v, zone, status, keys if status == .Secure else nil, MAX_ZONE_TTL, fixture_now())
+	return v, keys
+}
+
+// An RRset and a signature over it that names the unsupported key.
+@(private = "file")
+unsupported_rrset :: proc(owner: string, key: Dnskey) -> (records: []dns.Record, sigs: []Rrsig) {
+	records = make([]dns.Record, 1, context.temp_allocator)
+	records[0] = dns.Record {
+		name  = owner,
+		type  = .A,
+		class = .IN,
+		ttl   = 3600,
+		data  = dns.Rdata_A{addr = {192, 0, 2, 1}},
+	}
+
+	sigs = make([]Rrsig, 1, context.temp_allocator)
+	sigs[0] = Rrsig {
+		type_covered = .A,
+		algorithm    = ALG_UNSUPPORTED,
+		labels       = u8(label_count(owner)),
+		original_ttl = 3600,
+		inception    = u32(FIXTURE_TIME) - 3600,
+		expiration   = u32(FIXTURE_TIME) + 3600,
+		key_tag      = key.tag,
+		signer       = owner,
+		// Never examined: the algorithm is refused before any bytes are read.
+		signature    = make([]u8, 64, context.temp_allocator),
+	}
+	return
+}
+
+@(private = "file")
+downgrade_status :: proc(zone_status: Status) -> Status {
+	ZONE :: "test."
+	v, keys := validator_with_zone(ZONE, zone_status)
+	defer destroy_validator(v)
+
+	records, sigs := unsupported_rrset(ZONE, keys[0])
+	budget := Budget{}
+	status, _, _ := validate_rrset(
+		v,
+		&budget,
+		ZONE,
+		.A,
+		.IN,
+		records,
+		sigs,
+		u32(FIXTURE_TIME),
+		fixture_now(),
+		context.temp_allocator,
+	)
+	return status
+}
+
+/*
+An RRset in a signed zone, carrying only a signature we cannot check, is forged
+until proven otherwise.
+
+RFC 6840 section 5.11: a validator that supports an algorithm in the zone's
+DNSKEY set must see a valid signature from one of those algorithms. Reporting
+the RRset unsigned instead hands an attacker the downgrade — a zone signed with
+two algorithms publishes an RRSIG for each, so stripping the one we can verify
+and altering the records leaves a response that reaches the client as merely
+unvalidated rather than refused.
+
+`validate_answer` folds this straight into its verdict and `validate` returns
+it, so an `Insecure` here is an answer served.
+*/
+@(test)
+test_unverifiable_algorithm_in_a_signed_zone_is_bogus :: proc(t: ^testing.T) {
+	testing.expect_value(t, downgrade_status(.Secure), Status.Bogus)
+	free_all(context.temp_allocator)
+}
+
+/*
+The case the early return was written for, which has to keep working.
+
+A zone whose delegation names no algorithm we support is insecure, not broken —
+RFC 6840 section 5.2 — and the same unverifiable signature there means the data
+is merely unsigned. `zone_step` settles that at the DS, so the verdict must
+follow the zone rather than the signature.
+*/
+@(test)
+test_unverifiable_algorithm_in_an_unsigned_zone_is_insecure :: proc(t: ^testing.T) {
+	testing.expect_value(t, downgrade_status(.Insecure), Status.Insecure)
+	free_all(context.temp_allocator)
+}

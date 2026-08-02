@@ -448,6 +448,7 @@ validate_rrset :: proc(
 	have to hold a signature it was never in a position to make.
 	*/
 	unsupported := false
+	refused := false
 	attempts := 0
 	for sig in sigs {
 		if attempts >= MAX_SIGNATURES_PER_RRSET {
@@ -468,13 +469,9 @@ validate_rrset :: proc(
 			return .Secure, expanded, ""
 		case .Unsupported:
 			unsupported = true
+		case .Refused:
+			refused = true
 		}
-	}
-
-	if unsupported {
-		// Nothing was checkable, so the data is unsigned as far as we are
-		// concerned rather than forged.
-		return .Insecure, false, "unsupported algorithm"
 	}
 
 	/*
@@ -492,6 +489,40 @@ validate_rrset :: proc(
 	case .Bogus:
 		return .Bogus, false, "broken chain of trust"
 	case .Secure:
+	}
+
+	/*
+	Nothing here was checkable, and the zone it belongs to is signed with
+	something that was.
+
+	An algorithm we do not implement makes a *delegation* insecure - `zone_step`
+	settles that at the DS, per RFC 6840 section 5.2 - but it cannot make an
+	RRset inside an established zone insecure, which is the correction in
+	section 5.11 of the same document. A zone signed with two algorithms
+	publishes an RRSIG for each, so treating this as unsigned would let an
+	attacker strip the signature we can verify, alter the records, and have what
+	is left reach the client as merely unvalidated instead of refused. The whole
+	point of the second algorithm, inverted.
+	*/
+	if unsupported {
+		return .Bogus, false, "no signature this build can verify"
+	}
+
+	/*
+	The library would not run an algorithm we do implement, which is a statement
+	about this machine rather than about the zone.
+
+	Refusing here would make a zone unresolvable on a host whose crypto policy
+	rules SHA-1 out - Fedora and RHEL, for algorithms 5 and 7 - while the same
+	build resolved it everywhere else, so the data is treated as unsigned as it
+	always has been. That leaves the section 5.11 downgrade open on those hosts
+	for zones that publish a refused algorithm alongside a supported one; the
+	place to close it is `algorithm_supported`, which should answer for what the
+	linked library will actually run so that the delegation goes insecure at the
+	DS instead.
+	*/
+	if refused {
+		return .Insecure, false, "algorithm refused by local policy"
 	}
 	return .Bogus, false, missing
 }
@@ -556,6 +587,7 @@ check_signature :: proc(
 	}
 
 	unsupported := false
+	refused := false
 	for key in keys {
 		if key.algorithm != sig.algorithm || key.tag != sig.key_tag || !key_usable(key) {
 			continue
@@ -565,10 +597,20 @@ check_signature :: proc(
 			return .Ok, wildcard
 		case .Unsupported:
 			unsupported = true
+		case .Refused:
+			refused = true
 		case .Bad:
 		}
 	}
-	return .Unsupported if unsupported else .Bad, wildcard
+	// `Unsupported` first when both turned up: it is the stricter verdict, and a
+	// key we cannot read at all says more than one the library declined to run.
+	switch {
+	case unsupported:
+		return .Unsupported, wildcard
+	case refused:
+		return .Refused, wildcard
+	}
+	return .Bad, wildcard
 }
 
 /*
@@ -970,7 +1012,11 @@ fetch_keys :: proc(
 				switch result {
 				case .Ok:
 					return parsed[:], .Secure
-				case .Unsupported:
+				case .Unsupported, .Refused:
+					// Both mean the same thing here. This is the delegation, and
+					// a delegation we cannot follow is insecure whether the
+					// algorithm is one we never implemented or one the library
+					// declined to run (RFC 6840 section 5.2).
 					unsupported = true
 				case .Bad:
 				}
