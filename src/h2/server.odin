@@ -3,6 +3,7 @@ package h2
 import "core:mem"
 import "core:strings"
 import "core:sync"
+import "core:time"
 
 /*
 A server-side HTTP/2 connection, scoped to what a DoH endpoint needs.
@@ -49,6 +50,15 @@ Response :: struct {
 Handler :: #type proc(conn: ^Conn, req: ^Request)
 
 MAX_CONCURRENT :: 128
+/*
+How long a response may wait for the peer to open its flow-control window.
+
+A client that advertises a zero window and then goes quiet is otherwise
+indistinguishable from a slow one, and waiting on it forever hands over a
+handler thread per stream. Long enough that a genuinely slow reader is not cut
+off, short enough that a deliberate one cannot accumulate workers.
+*/
+DEFAULT_WRITE_TIMEOUT :: 10 * time.Second
 // Advertised receive window. Generous, so a client streaming request bodies is
 // never throttled by us; DoH bodies are tiny anyway.
 RECV_WINDOW :: 1 << 20
@@ -95,6 +105,9 @@ Conn :: struct {
 	allocator:       mem.Allocator,
 	// Scratch for a header block spanning CONTINUATION frames.
 	continuation_on: u32,
+	// How long a response may wait for the peer to grant flow-control credit
+	// before the stream is given up on.
+	write_timeout:   time.Duration,
 }
 
 make_conn :: proc(io: IO, handler: Handler, user: rawptr, allocator := context.allocator) -> ^Conn {
@@ -108,6 +121,7 @@ make_conn :: proc(io: IO, handler: Handler, user: rawptr, allocator := context.a
 	c.peer_initial_window = DEFAULT_WINDOW
 	c.send_window = DEFAULT_WINDOW
 	c.streams = make(map[u32]^Stream, 16, allocator)
+	c.write_timeout = DEFAULT_WRITE_TIMEOUT
 	dynamic_table_init(&c.decoder, 4096, allocator)
 	return c
 }
@@ -155,8 +169,9 @@ Block until every handler has finished, leaving only the caller's reference.
 Serving code calls this after `serve` returns and before dropping its own
 reference, so a handler still running on another thread cannot reach for a
 transport its owner has already torn down. Handlers waiting on flow control are
-released by the close that `serve` performs on its way out, so this cannot wait
-indefinitely on a dead peer.
+released by the close that `serve` performs on its way out, and give up on their
+own deadline in any case, so this cannot wait indefinitely on a peer that has
+stopped reading.
 */
 conn_wait_idle :: proc(c: ^Conn) {
 	sync.mutex_lock(&c.mu)
@@ -257,14 +272,18 @@ write_all :: proc(c: ^Conn, buf: []u8) -> bool {
 @(private)
 send_initial_settings :: proc(c: ^Conn) -> bool {
 	out := make([dynamic]u8, 0, 64, context.temp_allocator)
-	// SETTINGS_ENABLE_PUSH=0, MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE.
-	write_frame_header(&out, 18, .Settings, 0, 0)
+	// SETTINGS_ENABLE_PUSH=0, MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE, and
+	// MAX_HEADER_LIST_SIZE - the last so a peer is told the bound rather than
+	// discovering it as a connection error.
+	write_frame_header(&out, 24, .Settings, 0, 0)
 	append(&out, 0, u8(Setting.Enable_Push))
 	append_u32(&out, 0)
 	append(&out, 0, u8(Setting.Max_Concurrent_Streams))
 	append_u32(&out, MAX_CONCURRENT)
 	append(&out, 0, u8(Setting.Initial_Window_Size))
 	append_u32(&out, RECV_WINDOW)
+	append(&out, 0, u8(Setting.Max_Header_List_Size))
+	append_u32(&out, MAX_HEADER_LIST)
 
 	// Raise the connection-level receive window to match.
 	write_frame_header(&out, 4, .Window_Update, 0, 0)
@@ -421,6 +440,10 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		goaway(c, .Protocol_Error)
 		return false
 	}
+	if len(block) > MAX_HEADER_LIST {
+		goaway(c, .Compression_Error)
+		return false
+	}
 
 	sync.mutex_lock(&c.mu)
 	if h.stream_id <= c.last_stream_id {
@@ -460,10 +483,22 @@ handle_continuation :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	}
 	sync.mutex_lock(&c.mu)
 	s, found := c.streams[h.stream_id]
-	if found {
+	/*
+	Bounded as it accumulates, not once it is whole. Neither HEADERS nor
+	CONTINUATION is flow-controlled, so nothing slows a peer sending these, and
+	HPACK's own limit lives in `decode` - which never runs for a block whose
+	END_HEADERS never arrives. Without a cap here one connection can make us
+	hold as much as it cares to send.
+	*/
+	oversized := found && len(s.header_block) + len(payload) > MAX_HEADER_LIST
+	if found && !oversized {
 		append(&s.header_block, ..payload)
 	}
 	sync.mutex_unlock(&c.mu)
+	if oversized {
+		goaway(c, .Compression_Error)
+		return false
+	}
 	if !found {
 		goaway(c, .Protocol_Error)
 		return false
@@ -719,6 +754,7 @@ Write a response body, honouring flow control and the peer's frame size limit.
 */
 @(private)
 write_body :: proc(c: ^Conn, stream_id: u32, body: []u8) -> bool {
+	deadline := time.time_add(time.now(), c.write_timeout)
 	sent := 0
 	for sent < len(body) {
 		remaining := len(body) - sent
@@ -744,8 +780,20 @@ write_body :: proc(c: ^Conn, stream_id: u32, body: []u8) -> bool {
 				s.send_window -= chunk
 				break
 			}
-			// No credit; a WINDOW_UPDATE or a close will wake us.
-			sync.cond_wait(&c.cond, &c.mu)
+			/*
+			No credit. A WINDOW_UPDATE or a close will wake us; the deadline is
+			what handles the peer that sends neither. Its reader stays perfectly
+			healthy, so nothing else would ever mark this connection dead, and
+			the wait would keep a handler thread for as long as the peer felt
+			like holding it.
+			*/
+			left := time.diff(time.now(), deadline)
+			if left <= 0 {
+				sync.mutex_unlock(&c.mu)
+				rst_stream(c, stream_id, .Cancel)
+				return false
+			}
+			sync.cond_wait_with_timeout(&c.cond, &c.mu, left)
 		}
 		sync.mutex_unlock(&c.mu)
 

@@ -65,6 +65,10 @@ serve_doh2 :: proc(s: ^Server, conn: ^tlsx.Conn, client: string) {
 		write = h2_write,
 	}
 	hc := h2.make_conn(io, h2_handler, &ctx)
+	// A response waits no longer for flow-control credit than the connection
+	// waits for anything else, so a client that stops reading cannot hold a
+	// query worker past its welcome.
+	hc.write_timeout = s.cfg.server.client_timeout
 
 	h2.serve(hc)
 	// `ctx` and the TLS connection live in this frame, so every handler must be

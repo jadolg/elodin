@@ -2,7 +2,10 @@ package h2
 
 import "core:encoding/hex"
 import "core:mem"
+import "core:sync"
 import "core:testing"
+import "core:thread"
+import "core:time"
 
 /*
 HPACK tests built on the worked examples in RFC 7541 appendix C, so the codec is
@@ -432,4 +435,127 @@ test_data_frame_cannot_touch_a_closed_stream :: proc(t: ^testing.T) {
 	conn_unref(c)
 	free_all(context.temp_allocator)
 	expect_no_leaks(t, &track, "data after close")
+}
+
+// ---------------------------------------------------------------------------
+// Bounds on what one peer can make a connection hold or wait for
+// ---------------------------------------------------------------------------
+
+@(test)
+test_continuation_flood_is_refused :: proc(t: ^testing.T) {
+	/*
+	A header block arrives across as many CONTINUATION frames as the peer cares
+	to send, and neither HEADERS nor CONTINUATION is flow-controlled, so nothing
+	slows one down. HPACK's own limit is no help: `decode` does not run until
+	END_HEADERS arrives, and a peer bent on this never sends it.
+
+	So the block has to be bounded as it accumulates.
+	*/
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil, allocator)
+
+	// END_HEADERS clear, so the block stays open.
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = 0, stream_id = 1}, block)
+	testing.expect(t, ok, "handle_headers failed")
+
+	chunk := make([]u8, DEFAULT_MAX_FRAME, context.temp_allocator)
+	refused := false
+	for _ in 0 ..< 64 {
+		if !handle_continuation(
+			c,
+			Frame_Header{length = len(chunk), type = .Continuation, flags = 0, stream_id = 1},
+			chunk,
+		) {
+			refused = true
+			break
+		}
+	}
+	testing.expect(t, refused, "a header block was allowed to grow without limit")
+
+	if s, found := c.streams[1]; found {
+		testing.expectf(
+			t,
+			len(s.header_block) <= MAX_HEADER_LIST,
+			"the block reached %d bytes, past the %d limit",
+			len(s.header_block),
+			MAX_HEADER_LIST,
+		)
+	}
+
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "continuation flood")
+}
+
+@(private = "file")
+Respond_Ctx :: struct {
+	conn: ^Conn,
+	done: bool,
+}
+
+@(private = "file")
+respond_worker :: proc(r: ^Respond_Ctx) {
+	body := []u8{1, 2, 3, 4}
+	respond(r.conn, 1, Response{status = 200, content_type = "application/dns-message", body = body})
+	sync.atomic_store(&r.done, true)
+}
+
+@(test)
+test_response_gives_up_when_no_window_is_granted :: proc(t: ^testing.T) {
+	/*
+	A client that advertises a zero window and then says nothing leaves the
+	handler answering it parked on flow control. Nothing else marks the
+	connection dead - its reader is perfectly healthy - so the wait had no end
+	to it, and one connection could pin a worker per stream, up to
+	MAX_CONCURRENT of them.
+	*/
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	c := make_conn(IO{read = no_read, write = discard_write}, destroying_handler, nil, allocator)
+	// The peer grants nothing, so no stream ever has room for a DATA frame.
+	c.peer_initial_window = 0
+	c.write_timeout = 200 * time.Millisecond
+
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	ok := handle_headers(
+		c,
+		Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1},
+		block,
+	)
+	testing.expect(t, ok, "handle_headers failed")
+
+	r := Respond_Ctx {
+		conn = c,
+	}
+	worker := thread.create_and_start_with_poly_data(&r, respond_worker)
+
+	// Generously past the timeout above, and still far short of forever.
+	deadline := time.time_add(time.now(), 5 * time.Second)
+	for !sync.atomic_load(&r.done) && time.diff(time.now(), deadline) > 0 {
+		time.sleep(10 * time.Millisecond)
+	}
+	finished := sync.atomic_load(&r.done)
+	testing.expect(t, finished, "respond never gave up waiting for a window that was never granted")
+
+	if !finished {
+		// Release it so the suite can finish rather than hang on the join.
+		sync.mutex_lock(&c.mu)
+		c.closed = true
+		sync.cond_broadcast(&c.cond)
+		sync.mutex_unlock(&c.mu)
+	}
+	thread.join(worker)
+	thread.destroy(worker)
+
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "no window granted")
 }
