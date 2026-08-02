@@ -521,8 +521,21 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 		return true
 	}
 
+	/*
+	Looked up again rather than reusing the pointer from the top of this
+	procedure. The lock was released in between, and a caller that gives up on
+	its stream - a timeout, or a reset - frees it in the deferred cleanup of
+	`client_request`, so the earlier pointer may refer to memory that is gone
+	by now. A response landing at the same moment the caller stops waiting for
+	it is all this needs.
+	*/
 	sync.mutex_lock(&c.mu)
-	s.done = true
+	live, still_open := c.streams[h.stream_id]
+	if !still_open {
+		sync.mutex_unlock(&c.mu)
+		return true
+	}
+	live.done = true
 	sync.cond_broadcast(&c.cond)
 	sync.mutex_unlock(&c.mu)
 	return true
@@ -608,11 +621,18 @@ client_request :: proc(
 	sent := c.io.write(c.io.user, out[:])
 	sync.mutex_unlock(&c.mu)
 
+	/*
+	The stream is released under the lock, not after it. The reader thread
+	looks streams up while holding `c.mu` and acts on what it finds; freeing
+	one outside the lock would let this cleanup run between that lookup and
+	the use, leaving the reader writing into memory already handed back.
+	`client_unref` takes the lock itself, so it stays outside.
+	*/
 	defer {
 		sync.mutex_lock(&c.mu)
 		delete_key(&c.streams, stream_id)
-		sync.mutex_unlock(&c.mu)
 		client_stream_destroy(c, s)
+		sync.mutex_unlock(&c.mu)
 		client_unref(c)
 	}
 

@@ -563,3 +563,97 @@ test_client_reuses_connection_across_requests :: proc(t: ^testing.T) {
 	testing.expect_value(t, srv.accepts, 1)
 	free_all(context.temp_allocator)
 }
+
+// ---------------------------------------------------------------------------
+// A stream freed while the reader thread is between locks
+// ---------------------------------------------------------------------------
+
+@(private = "file")
+Client_Close_Hook :: struct {
+	client:    ^Client,
+	stream_id: u32,
+	armed:     bool,
+	fired:     bool,
+	retired:   ^Client_Stream,
+}
+
+/*
+Stands in for `client_request` giving up on a stream - a timeout, or the peer
+resetting it - inside the window `client_handle_data` leaves open between
+releasing `c.mu` after appending the body and re-acquiring it to mark the
+response complete.
+
+`client_handle_data` reaches here through the WINDOW_UPDATE it writes for the
+bytes it just consumed. `client_write_all` holds `c.mu` for the length of this
+call, so a request thread running its deferred cleanup would be parked on that
+mutex right here and would take it the moment this returns.
+
+The deferred cleanup in `client_request` frees the stream, so a write through
+the reader thread's stale pointer is a use-after-free. The stream is only
+unhooked from the map rather than released, so the write has somewhere defined
+to land and the test can assert on it.
+*/
+@(private = "file")
+retire_on_write :: proc(user: rawptr, buf: []u8) -> bool {
+	h := cast(^Client_Close_Hook)user
+	if h == nil || !h.armed || h.fired {
+		return true
+	}
+	h.fired = true
+
+	s, found := h.client.streams[h.stream_id]
+	if !found {
+		return true
+	}
+	delete_key(&h.client.streams, h.stream_id)
+	h.retired = s
+	return true
+}
+
+@(private = "file")
+hook_read_nothing :: proc(user: rawptr, buf: []u8) -> (n: int, ok: bool) {
+	return 0, false
+}
+
+@(test)
+test_data_frame_cannot_touch_an_abandoned_stream :: proc(t: ^testing.T) {
+	/*
+	A response arriving for a stream whose caller has just given up on it must
+	not write through a pointer the reader thread picked up before it released
+	the lock.
+	*/
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	hook := Client_Close_Hook{}
+	c := client_make(IO{user = &hook, read = hook_read_nothing, write = retire_on_write}, allocator)
+	hook.client = c
+	hook.stream_id = 1
+
+	// The stream `client_request` would have opened, without the blocking wait.
+	s := new(Client_Stream, allocator)
+	s.id = 1
+	s.send_window = c.peer_initial_window
+	s.body = make([dynamic]u8, 0, 8, allocator)
+	c.streams[1] = s
+
+	hook.armed = true
+	payload := []u8{'o', 'k'}
+	client_handle_data(c, Frame_Header{length = len(payload), type = .Data, flags = FLAG_END_STREAM, stream_id = 1}, payload)
+
+	testing.expect(t, hook.fired, "the retire hook never ran, so nothing was reproduced")
+	testing.expect(t, hook.retired != nil, "the stream was not retired")
+	testing.expect(t, !hook.retired.done, "a retired stream was marked done after it was abandoned")
+
+	_, back_in_map := c.streams[1]
+	testing.expect(t, !back_in_map, "the retired stream was put back in the table")
+
+	client_stream_destroy(c, hook.retired)
+	client_unref(c)
+	free_all(context.temp_allocator)
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "data after abandon: %d bytes leaked, allocated at %v", entry.size, entry.location)
+	}
+}

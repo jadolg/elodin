@@ -329,3 +329,107 @@ test_padding_and_priority_stripping :: proc(t: ^testing.T) {
 	testing.expect(t, pok, "strip_priority failed")
 	testing.expect_value(t, string(rest), "ok")
 }
+
+// ---------------------------------------------------------------------------
+// A stream freed while the reader thread is between locks
+// ---------------------------------------------------------------------------
+
+@(private = "file")
+Close_Hook :: struct {
+	conn:      ^Conn,
+	stream_id: u32,
+	armed:     bool,
+	fired:     bool,
+	closed:    ^Stream,
+}
+
+/*
+Stands in for a handler thread completing `respond` inside the window
+`handle_data` leaves open between releasing `c.mu` after appending the body and
+re-acquiring it to record the stream's final state.
+
+`handle_data` reaches here through the WINDOW_UPDATE it writes for the bytes it
+just consumed, which is where the real race lands: `write_all` holds `c.mu` for
+the length of this call, so a `respond` running on a handler-pool worker would
+be parked on that mutex right here and would take it the moment this returns.
+Retiring the stream inline reproduces that ordering without asking the scheduler
+to produce it.
+
+`close_stream` would free the stream here, and a write through the reader
+thread's stale pointer is then a use-after-free. The stream is only unhooked
+from the map rather than released, so that the write has somewhere defined to
+land and the test can assert on it instead of depending on the allocator to
+reuse the block or on a sanitiser to be watching.
+*/
+@(private = "file")
+close_on_write :: proc(user: rawptr, buf: []u8) -> bool {
+	h := cast(^Close_Hook)user
+	if h == nil || !h.armed || h.fired {
+		return true
+	}
+	h.fired = true
+
+	s, found := h.conn.streams[h.stream_id]
+	if !found {
+		return true
+	}
+	delete_key(&h.conn.streams, h.stream_id)
+	s.state = .Closed
+	h.closed = s
+	return true
+}
+
+@(private = "file")
+destroying_handler :: proc(conn: ^Conn, req: ^Request) {
+	request_destroy(conn, req)
+}
+
+@(test)
+test_data_frame_cannot_touch_a_closed_stream :: proc(t: ^testing.T) {
+	/*
+	A DATA frame arriving for a stream whose handler is answering it at the same
+	moment must not write through a pointer the reader thread picked up before
+	it released the lock.
+	*/
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	hook := Close_Hook{}
+	c := make_conn(IO{user = &hook, read = no_read, write = close_on_write}, destroying_handler, nil, allocator)
+	hook.conn = c
+	hook.stream_id = 1
+
+	// END_STREAM on the HEADERS dispatches the request straight away, so the
+	// stream is live with a handler owning it - the state in which `respond`
+	// runs concurrently with whatever the peer sends next.
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	ok := handle_headers(
+		c,
+		Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1},
+		block,
+	)
+	testing.expect(t, ok, "handle_headers failed")
+
+	hook.armed = true
+	body := []u8{'x'}
+	handle_data(c, Frame_Header{length = len(body), type = .Data, flags = FLAG_END_STREAM, stream_id = 1}, body)
+
+	testing.expect(t, hook.fired, "the close hook never ran, so nothing was reproduced")
+	testing.expect(t, hook.closed != nil, "the stream was not retired")
+
+	/*
+	The stream was retired while `handle_data` was between locks. In the real
+	sequence it has also been freed by now, so any write here is a write to
+	released memory.
+	*/
+	testing.expect_value(t, hook.closed.state, Stream_State.Closed)
+	_, back_in_map := c.streams[1]
+	testing.expect(t, !back_in_map, "the retired stream was put back in the table")
+
+	stream_destroy(c, hook.closed)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "data after close")
+}
