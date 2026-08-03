@@ -6,7 +6,20 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: Build (linux-${{ matrix.arch }})
+    # Each architecture builds natively on a runner of that architecture. The
+    # alternative, cross-compiling from x86, would need an aarch64 sysroot
+    # carrying glibc and OpenSSL, because src/tlsx and src/dnssec bind the
+    # system libssl and libcrypto rather than vendoring them.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: write
     steps:
@@ -23,9 +36,23 @@ jobs:
           # version to the tag the release is being published under.
           ELODIN_VERSION: ${{ github.event.release.tag_name }}
 
+      # A tarball named for one architecture holding a binary for another is a
+      # failure nobody notices until a user runs it, so check the ELF header
+      # agrees with the matrix entry before packaging.
+      - name: Verify binary architecture
+        run: |
+          case ${{ matrix.arch }} in
+            amd64) expected=x86-64 ;;
+            arm64) expected=aarch64 ;;
+          esac
+          file -b bin/elodin | grep -q "$expected" || {
+            echo "expected $expected, got: $(file -b bin/elodin)" >&2
+            exit 1
+          }
+
       - name: Package
         run: |
-          stage=elodin-${{ github.event.release.tag_name }}-linux-amd64
+          stage=elodin-${{ github.event.release.tag_name }}-linux-${{ matrix.arch }}
           mkdir "$stage"
           cp bin/elodin "$stage"/
           cp packaging/elodin.service "$stage"/
@@ -36,4 +63,4 @@ jobs:
       - name: Upload release asset
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload ${{ github.event.release.tag_name }} elodin-${{ github.event.release.tag_name }}-linux-amd64.tar.gz --clobber
+        run: gh release upload ${{ github.event.release.tag_name }} elodin-${{ github.event.release.tag_name }}-linux-${{ matrix.arch }}.tar.gz --clobber

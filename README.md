@@ -99,10 +99,13 @@ provides the state, cache and configuration directories and nothing else on the
 filesystem is writable. `RestrictAddressFamilies=AF_INET AF_INET6` leaves it the
 two families it actually uses.
 
-A published GitHub release carries a `linux-amd64` tarball built by
-`.github/workflows/release.yml`, holding the optimised binary, the unit file and
-the example configuration. CI runs `mise run check`, `mise run test` and
-`mise run itest` on every push and pull request.
+A published GitHub release carries a `linux-amd64` and a `linux-arm64` tarball
+built by `.github/workflows/release.yml`, each holding the optimised binary, the
+unit file and the example configuration. Both are built natively, on a runner of
+the architecture they target, because elodin binds the system libssl and
+libcrypto and cross-compiling would mean carrying a sysroot for each. CI runs
+`mise run check` once and `mise run test` and `mise run itest` on both
+architectures, on every push and pull request.
 
 ### Privileges
 
