@@ -169,14 +169,19 @@ cookies:
   # name is looked up at all. That stops an attacker forging queries from
   # someone else's address, at the price of one extra round trip for every new
   # client. Meant for use while an attack is actually under way. Queries with no
-  # cookie, and queries over TCP, DoT or DoH, are unaffected.
+  # cookie, and queries over TCP, DoT or DoH, are unaffected. Needs `enabled`:
+  # what it demands is a cookie this server issued, so the two together are
+  # refused at startup rather than left looking like a protection that is on.
   require: false
 
   # The same mechanism pointed the other way: elodin presents a cookie of its
   # own to plain UDP and TCP upstreams, and ignores a reply that does not carry
   # it back — so forging an answer to one of our queries means guessing 64 bits
   # that were never on a visible path, on top of the transaction ID and the
-  # source port. Independent of `enabled` above.
+  # source port. A server that has issued a cookie owes one on every reply after
+  # it, or leaving the option off would be an attacker's way round the check.
+  # Independent of `enabled` above; the client's own cookie is taken off the
+  # query either way.
   #
   # Only queries that already carry an OPT record get one, since adding one
   # would negotiate EDNS for a client that never asked; with DNSSEC validation

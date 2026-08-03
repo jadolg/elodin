@@ -237,8 +237,15 @@ resolve_query :: proc(
 	its own secret, decide it is a forgery and answer BADCOOKIE instead of
 	answering the question. Cookies towards the upstream, if they are ever
 	wanted, are ours to negotiate separately.
+
+	Asked as "the query carried one" rather than as anything about this server's
+	own cookie settings. With `cookies.enabled` off there is no verdict to reach
+	and every query looks cookie-less, and with `cookies.upstream` off nothing
+	replaces the option on the way out - so reading the verdict here let the
+	client's cookie travel whenever both were turned off, and to DoT and DoH
+	upstreams, which never carry a cookie of ours, whenever the first one was.
 	*/
-	if cookie.verdict != .Absent {
+	if cookie.sent {
 		stripped, done := dns.remove_edns_option(forwarded, .Cookie, allocator)
 		if !done {
 			/*

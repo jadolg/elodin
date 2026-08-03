@@ -161,6 +161,11 @@ Cookie_Config :: struct {
 	it while a spoofing attempt is actually under way, which is the case RFC
 	7873 section 5.2.3 has it for. Queries with no cookie at all, and queries
 	over TCP, DoT or DoH, are unaffected either way.
+
+	Needs `enabled`: what it demands is a cookie this server issued, and with
+	that off there are none. The pair is refused rather than quietly ignored,
+	since it is turned on while an attack is under way and that is the wrong
+	moment to find out it was never in force.
 	*/
 	require:  bool,
 	/*
@@ -171,7 +176,13 @@ Cookie_Config :: struct {
 	direction — an off-path attacker forging an answer to one of our queries has
 	to guess 64 bits it has never seen, on top of the transaction ID and the
 	source port. A forged datagram that fails the check is ignored rather than
-	answered, so the genuine reply is still waited for.
+	answered, so the genuine reply is still waited for. Once a server has issued
+	a cookie it owes one on every reply after it; a server that has never sent
+	one does not implement them, and the exchange carries on without.
+
+	Independent of `enabled` in the other respect too: the client's own cookie is
+	taken off the query before it is forwarded whichever of the two is set, since
+	it is the client's secret rather than something to spend on an upstream.
 
 	Only queries that already carry an OPT record get a cookie, because adding
 	one would mean an EDNS negotiation the client never asked for. With DNSSEC
@@ -190,6 +201,44 @@ Cookie_Config :: struct {
 	are drawn at random per upstream and are not derived from this.
 	*/
 	secret:   string,
+}
+
+COOKIE_SECRET_LEN :: 16
+
+/*
+Read `cookies.secret` into the bytes it stands for.
+
+Lives here rather than beside the server that uses it so that `--check` and
+startup agree by construction. Two parsers written to the same rule are two
+parsers that can drift, and the shape of that bug is a configuration `--check`
+passes and the resolver then refuses to start on.
+*/
+parse_cookie_secret :: proc(text: string, out: ^[COOKIE_SECRET_LEN]u8) -> bool {
+	if len(text) != COOKIE_SECRET_LEN * 2 {
+		return false
+	}
+	for i in 0 ..< COOKIE_SECRET_LEN {
+		hi, hi_ok := cookie_hex_value(text[i * 2])
+		lo, lo_ok := cookie_hex_value(text[i * 2 + 1])
+		if !hi_ok || !lo_ok {
+			return false
+		}
+		out[i] = hi << 4 | lo
+	}
+	return true
+}
+
+@(private)
+cookie_hex_value :: proc(c: u8) -> (v: u8, ok: bool) {
+	switch c {
+	case '0' ..= '9':
+		return c - '0', true
+	case 'a' ..= 'f':
+		return c - 'a' + 10, true
+	case 'A' ..= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
 }
 
 Rewrite_Kind :: enum u8 {

@@ -218,11 +218,16 @@ record_failure :: proc(u: ^Upstream) {
 	u.failures += 1
 	u.stats.queries += 1
 	u.stats.failures += 1
+	if u.failures >= FAILURE_THRESHOLD {
+		u.down_until = time.time_add(time.now(), COOLDOWN)
+		// A server that stopped sending cookies is a server whose every reply is
+		// now discarded for the want of one, and that arrives here looking like
+		// any other outage. Let the cooldown decide what it does rather than
+		// hold it to what it used to do.
+		forget_cookie(u)
+	}
 	if u.failures == FAILURE_THRESHOLD {
-		u.down_until = time.time_add(time.now(), COOLDOWN)
 		logx.warnf("upstream %s: %d consecutive failures, pausing it for %v", u.spec.name, u.failures, COOLDOWN)
-	} else if u.failures > FAILURE_THRESHOLD {
-		u.down_until = time.time_add(time.now(), COOLDOWN)
 	}
 }
 

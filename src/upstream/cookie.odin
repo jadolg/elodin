@@ -79,10 +79,16 @@ attach_cookie :: proc(u: ^Upstream, query: []u8, allocator: mem.Allocator) -> (o
 /*
 Whether a reply may be ours.
 
-A reply with no COOKIE option comes from a server that does not implement them,
-which is not a reason to throw it away — RFC 7873 has the client carry on. What
-must not pass is a cookie that is not the one we sent, because only something
-that saw our query could echo it back.
+Three ways a reply fails (RFC 7873 section 5.3): it echoes a client cookie that
+is not the one we sent, its COOKIE option is not a legal length, or it carries no
+cookie at all when this server has already shown it does cookies.
+
+That last one is the whole mechanism. A server we have never had a cookie from is
+one that does not implement them, and RFC 7873 has the exchange carry on without
+— but once it has issued one, accepting a reply with the option left off would
+make the check something an attacker opts out of at no cost: it would be back to
+guessing only the transaction ID and the source port, which is what the cookie
+was added to put out of reach.
 */
 @(private)
 cookie_matches :: proc(u: ^Upstream, response: []u8) -> bool {
@@ -95,14 +101,20 @@ cookie_matches :: proc(u: ^Upstream, response: []u8) -> bool {
 		// the header, and the caller decodes it properly further along.
 		return true
 	}
+	sync.mutex_lock(&u.mu)
+	echoed := u.cookie.client
+	// Having issued a cookie is what makes one owed on every reply after it.
+	expected := u.cookie.server_len > 0
+	sync.mutex_unlock(&u.mu)
+
 	raw, found := dns.find_edns_option(msg, .Cookie)
 	if !found {
-		return true
+		return !expected
 	}
-	if len(raw) < COOKIE_CLIENT_LEN {
+	if len(raw) != COOKIE_CLIENT_LEN &&
+	   (len(raw) < COOKIE_CLIENT_LEN + COOKIE_SERVER_MIN || len(raw) > COOKIE_CLIENT_LEN + COOKIE_SERVER_MAX) {
 		return false
 	}
-	echoed := u.cookie.client
 	for i in 0 ..< COOKIE_CLIENT_LEN {
 		if raw[i] != echoed[i] {
 			return false
@@ -111,14 +123,36 @@ cookie_matches :: proc(u: ^Upstream, response: []u8) -> bool {
 	return true
 }
 
+/*
+Forget the server cookie held for this upstream.
+
+Called when it is parked for a cooldown, which is where a server that has stopped
+answering ends up - including one that stopped because it no longer sends cookies
+and every reply is now being discarded for the want of one. Dropping what we hold
+puts it back to being a server we have never had a cookie from, so the next round
+of queries is judged on what it does now rather than on what it did before.
+
+The caller holds `u.mu`.
+*/
+@(private)
+forget_cookie :: proc(u: ^Upstream) {
+	u.cookie.server_len = 0
+}
+
+// The COOKIE option a reply carries, if it carries one.
+@(private)
+reply_cookie :: proc(response: []u8) -> (raw: []u8, found: bool) {
+	msg, err := dns.decode_message(response, context.temp_allocator)
+	if err != .None {
+		return nil, false
+	}
+	return dns.find_edns_option(msg, .Cookie)
+}
+
 // Keep the server cookie a reply carried, for the next query to this upstream.
 @(private)
 learn_cookie :: proc(u: ^Upstream, response: []u8) {
-	msg, err := dns.decode_message(response, context.temp_allocator)
-	if err != .None {
-		return
-	}
-	raw, found := dns.find_edns_option(msg, .Cookie)
+	raw, found := reply_cookie(response)
 	if !found {
 		return
 	}
@@ -160,6 +194,10 @@ exchange_with_cookie :: proc(
 	learn_cookie(u, response)
 
 	if dns.peek_rcode(response) == .Bad_Cookie {
+		// Unreachable in practice: the same `query` carried a cookie a moment ago
+		// at the top of this proc, and nothing about it has changed since. Kept as
+		// a refusal rather than an assertion because the alternative is sending
+		// the query on without the cookie the server has just insisted on.
 		retry, retried := attach_cookie(u, query, context.temp_allocator)
 		if !retried {
 			return nil, .Bad_Response
@@ -179,11 +217,25 @@ exchange_with_cookie :: proc(
 	in, it would reach a client that never asked for one and, worse, be stored
 	in the cache and handed to every client that asks the same question later.
 	*/
-	stripped, ok := dns.remove_edns_option(response, .Cookie, allocator)
-	if ok {
-		return stripped, .None
+	if _, carried := reply_cookie(response); !carried {
+		/*
+		Nothing to take out, which is where a server that does not do cookies
+		leaves every reply. Asked before the removal rather than inferred from it
+		failing: `remove_edns_option` needs an OPT record to walk, and a reply
+		without one cannot be told apart from a removal that went wrong.
+		*/
+		return response, .None
 	}
-	return response, .None
+	stripped, ok := dns.remove_edns_option(response, .Cookie, allocator)
+	if !ok {
+		// Failing closed, the way the client-facing side does when it cannot take
+		// the client's cookie back out. Handing the answer over as it stands is
+		// the one outcome the paragraph above exists to prevent, and losing it is
+		// the cheaper mistake: the group still has other servers to ask.
+		logx.warnf("upstream %s: could not strip the server cookie from a reply", u.spec.name)
+		return nil, .Bad_Response
+	}
+	return stripped, .None
 }
 
 @(private)

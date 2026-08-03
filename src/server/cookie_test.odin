@@ -480,15 +480,15 @@ test_cookie_is_not_shared_through_the_cache :: proc(t: ^testing.T) {
 @(test)
 test_cookie_secret_parsing :: proc(t: ^testing.T) {
 	secret: [COOKIE_SECRET_LEN]u8
-	testing.expect(t, parse_cookie_secret("e5e973e5a6b2a43f48e7dc849e37bfcf", &secret), "a valid secret was refused")
+	testing.expect(t, config.parse_cookie_secret("e5e973e5a6b2a43f48e7dc849e37bfcf", &secret), "a valid secret was refused")
 	testing.expect(
 		t,
 		mem.compare(secret[:], unhex("e5e973e5a6b2a43f48e7dc849e37bfcf")) == 0,
 		"the secret was decoded wrongly",
 	)
 
-	testing.expect(t, !parse_cookie_secret("e5e973", &secret), "a short secret was accepted")
-	testing.expect(t, !parse_cookie_secret("e5e973e5a6b2a43f48e7dc849e37bfcg", &secret), "a non-hex secret was accepted")
+	testing.expect(t, !config.parse_cookie_secret("e5e973", &secret), "a short secret was accepted")
+	testing.expect(t, !config.parse_cookie_secret("e5e973e5a6b2a43f48e7dc849e37bfcg", &secret), "a non-hex secret was accepted")
 	free_all(context.temp_allocator)
 }
 

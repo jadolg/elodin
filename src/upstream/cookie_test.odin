@@ -26,6 +26,16 @@ Cookie_Mock :: struct {
 	forge:      bool,
 	// Answer BADCOOKIE until a query turns up carrying the server cookie.
 	demand:     bool,
+	/*
+	Stop putting a COOKIE option in replies once this many have carried one.
+
+	Leaving the option off is the cheaper thing for an off-path forgery to do
+	than reproduce a cookie it has never seen. `nil` keeps sending them, and 0
+	plays a server that does not implement cookies at all.
+	*/
+	drop_after: Maybe(int),
+	// Reply with a server cookie shorter than the eight bytes RFC 7873 allows.
+	short:      bool,
 
 	mu:         sync.Mutex,
 	queries:    int,
@@ -44,10 +54,11 @@ cookie_mock_loop :: proc(m: ^Cookie_Mock) {
 
 		sync.mutex_lock(&m.mu)
 		m.queries += 1
+		count := m.queries
 		m.last_len = copy(m.last_query[:], buf[:n])
 		sync.mutex_unlock(&m.mu)
 
-		reply, ok := cookie_mock_reply(m, buf[:n])
+		reply, ok := cookie_mock_reply(m, buf[:n], count)
 		if ok {
 			_, _ = net.send_udp(m.socket, reply, client)
 		}
@@ -56,7 +67,7 @@ cookie_mock_loop :: proc(m: ^Cookie_Mock) {
 }
 
 @(private = "file")
-cookie_mock_reply :: proc(m: ^Cookie_Mock, query: []u8) -> (reply: []u8, ok: bool) {
+cookie_mock_reply :: proc(m: ^Cookie_Mock, query: []u8, count: int) -> (reply: []u8, ok: bool) {
 	msg, derr := dns.decode_message(query, context.temp_allocator)
 	if derr != .None {
 		return nil, false
@@ -75,6 +86,9 @@ cookie_mock_reply :: proc(m: ^Cookie_Mock, query: []u8) -> (reply: []u8, ok: boo
 	if !has_cookie {
 		return wire, true
 	}
+	if limit, capped := m.drop_after.?; capped && count > limit {
+		return wire, true
+	}
 
 	option: [16]u8
 	copy(option[:8], sent[:min(8, len(sent))])
@@ -82,7 +96,8 @@ cookie_mock_reply :: proc(m: ^Cookie_Mock, query: []u8) -> (reply: []u8, ok: boo
 		option[0] ~= 0xff
 	}
 	copy(option[8:], m.server[:])
-	out, set_ok := dns.set_edns_option(wire, .Cookie, option[:], context.temp_allocator)
+	written := option[:12] if m.short else option[:]
+	out, set_ok := dns.set_edns_option(wire, .Cookie, written, context.temp_allocator)
 	if !set_ok {
 		return wire, true
 	}
@@ -230,6 +245,82 @@ test_upstream_cookie_forged_reply_is_ignored :: proc(t: ^testing.T) {
 	seen := m.queries
 	sync.mutex_unlock(&m.mu)
 	testing.expect(t, seen > 0, "the responder never saw the query")
+	free_all(context.temp_allocator)
+}
+
+/*
+Once a server has issued a cookie, a reply from it without one is a forgery.
+
+Otherwise the check is one an attacker opts out of: leaving the COOKIE option off
+costs it nothing and puts the reply back to being accepted on the transaction ID
+and the source port alone. RFC 7873 section 5.3 - "If the client is expecting the
+response to contain a COOKIE option and it is missing, the response MUST be
+discarded."
+*/
+@(test)
+test_upstream_cookie_missing_from_reply_is_ignored :: proc(t: ^testing.T) {
+	m := Cookie_Mock {
+		server     = {1, 2, 3, 4, 5, 6, 7, 8},
+		drop_after = 1,
+	}
+	u, worker, ok := start_cookie_mock(t, &m)
+	if !ok {
+		return
+	}
+	defer stop_cookie_mock(&m, u, worker)
+
+	// The first reply carries one, so from here on this server is known to do
+	// cookies and a reply without one has to be turned away.
+	_, err := exchange(u, edns_query("example.com."), time.Second, context.temp_allocator)
+	testing.expectf(t, err == .None, "the first exchange failed: %v", err)
+
+	_, err2 := exchange(u, edns_query("example.org."), 300 * time.Millisecond, context.temp_allocator)
+	testing.expectf(t, err2 == .Timeout, "a reply with the cookie left off was accepted (%v)", err2)
+
+	sync.mutex_lock(&m.mu)
+	seen := m.queries
+	sync.mutex_unlock(&m.mu)
+	testing.expect(t, seen > 1, "the responder never saw the second query")
+	free_all(context.temp_allocator)
+}
+
+// A server cookie shorter than eight bytes is not a legal COOKIE option, and
+// RFC 7873 section 5.3 has the client discard the reply rather than read past it.
+@(test)
+test_upstream_cookie_illegal_length_is_ignored :: proc(t: ^testing.T) {
+	m := Cookie_Mock {
+		server = {1, 2, 3, 4, 5, 6, 7, 8},
+		short  = true,
+	}
+	u, worker, ok := start_cookie_mock(t, &m)
+	if !ok {
+		return
+	}
+	defer stop_cookie_mock(&m, u, worker)
+
+	_, err := exchange(u, edns_query("example.com."), 300 * time.Millisecond, context.temp_allocator)
+	testing.expectf(t, err == .Timeout, "a reply with an illegal cookie length was accepted (%v)", err)
+	free_all(context.temp_allocator)
+}
+
+// A server that never sent one is a server that does not do cookies, and RFC
+// 7873 has the exchange carry on without.
+@(test)
+test_upstream_cookie_absent_server_is_tolerated :: proc(t: ^testing.T) {
+	m := Cookie_Mock {
+		server     = {1, 2, 3, 4, 5, 6, 7, 8},
+		drop_after = 0,
+	}
+	u, worker, ok := start_cookie_mock(t, &m)
+	if !ok {
+		return
+	}
+	defer stop_cookie_mock(&m, u, worker)
+
+	for name in ([]string{"example.com.", "example.org."}) {
+		_, err := exchange(u, edns_query(name), time.Second, context.temp_allocator)
+		testing.expectf(t, err == .None, "%s: a cookie-less server was refused: %v", name, err)
+	}
 	free_all(context.temp_allocator)
 }
 

@@ -104,7 +104,16 @@ ensure_edns_option :: proc(
 	return encoded, true
 }
 
-// Take `code` back out. A message that never carried it is returned unchanged.
+/*
+Take `code` back out. A message that has an OPT record but no such option is
+returned unchanged.
+
+Still needs the OPT record: without one there is no RDATA to walk and no way to
+tell "the option is not there" from "this message cannot be read", so a message
+with no EDNS at all fails rather than reporting a removal it never checked.
+Callers that mean "make sure this is gone" should ask whether the option is there
+first.
+*/
 remove_edns_option :: proc(
 	msg: []u8,
 	code: EDNS_Option_Code,

@@ -414,17 +414,19 @@ looked up at all — so an attacker forging queries from someone else's address
 never gets an answer sent there. The cost falls on honest clients too, one extra
 round trip the first time each one asks, which is why RFC 7873 has it for use
 while an attack is actually under way. Queries carrying no cookie, and queries
-over TCP, DoT or DoH, are unaffected either way.
+over TCP, DoT or DoH, are unaffected either way. It needs `enabled`, since what
+it demands is a cookie this server issued; the two together are rejected at
+startup rather than left looking like a protection that is on.
 
 `secret` matters when more than one elodin answers on the same address: without
 it each draws its own at startup and rejects the cookies the others handed out.
 A single instance can leave it empty.
 
-The client's cookie stops at elodin and is never forwarded upstream. It is a
-secret between that client and this server — a stable identifier an upstream has
-no business seeing — and its server half was minted here, so an upstream that
-implements cookies would read it as a forgery and answer BADCOOKIE instead of
-the question.
+The client's cookie stops at elodin and is never forwarded upstream, whatever
+either setting is on or off. It is a secret between that client and this server —
+a stable identifier an upstream has no business seeing — and its server half was
+minted here, so an upstream that implements cookies would read it as a forgery
+and answer BADCOOKIE instead of the question.
 
 `upstream` turns the same mechanism the other way round, and is also on by
 default. elodin presents a cookie of its own to plain UDP and TCP upstreams:
@@ -432,7 +434,11 @@ a random client cookie per server, and the server cookie that server last issued
 A reply carrying a cookie that is not ours cannot have come from the server we
 asked, so it is passed over and the socket keeps waiting for the genuine one —
 which is the point, since answering a spoofing attempt with SERVFAIL would hand
-the attacker most of what it was after. The cookie the upstream sends back is
+the attacker most of what it was after. Once a server has issued a cookie, a
+reply from it with the option left off is passed over the same way: a check an
+attacker can decline to take is not a check at all, and RFC 7873 §5.3 has the
+response discarded. A server that has never sent one is a server that does not
+implement them, and the exchange carries on without. The cookie the upstream sends back is
 removed before the answer goes anywhere near a client or the cache: it belongs
 to that conversation and to no other. A BADCOOKIE reply carries a fresh server
 cookie, so the query is asked once more with it.
@@ -451,6 +457,7 @@ already establishes more than a cookie can.
 | server cookie | recomputed per query, nothing stored | learned and held per upstream |
 | transports | UDP, TCP, DoT, DoH | UDP and TCP only |
 | a cookie that does not check out | answered anyway, or BADCOOKIE with `require` | ignored, and the wait continues |
+| a message with no cookie | answered, and given none back | accepted, unless that server has issued one before |
 
 ### Rewrites
 

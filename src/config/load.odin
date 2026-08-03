@@ -814,23 +814,22 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	}
 
 	// Same reasoning: a secret that will not parse should fail `--check`, not
-	// leave a machine handing out cookies its neighbours reject.
-	if cfg.cookies.secret != "" && !valid_cookie_secret(cfg.cookies.secret) {
-		errorf(l, "cookies.secret must be 32 hexadecimal characters")
-	}
-}
-
-@(private)
-valid_cookie_secret :: proc(text: string) -> bool {
-	if len(text) != 32 {
-		return false
-	}
-	for i in 0 ..< len(text) {
-		switch text[i] {
-		case '0' ..= '9', 'a' ..= 'f', 'A' ..= 'F':
-		case:
-			return false
+	// leave a machine handing out cookies its neighbours reject. Read with the
+	// parser the server itself uses, so the two cannot disagree.
+	if cfg.cookies.secret != "" {
+		scratch: [COOKIE_SECRET_LEN]u8
+		if !parse_cookie_secret(cfg.cookies.secret, &scratch) {
+			errorf(l, "cookies.secret must be %d hexadecimal characters", COOKIE_SECRET_LEN * 2)
 		}
 	}
-	return true
+	/*
+	`require` is enforced against cookies this server issues, and it issues none
+	with `enabled` off - so the pair is a setting that quietly does nothing.
+
+	Worth an error rather than a warning: it is turned on while an attack is
+	under way, and finding out then that it was never in force is the wrong time.
+	*/
+	if cfg.cookies.require && !cfg.cookies.enabled {
+		errorf(l, "cookies.require needs cookies.enabled: there are no cookies to demand with it off")
+	}
 }

@@ -5,6 +5,7 @@ import "core:crypto/siphash"
 import "core:mem"
 import "core:net"
 import "core:time"
+import "elodin:config"
 import "elodin:dns"
 import "elodin:logx"
 
@@ -27,7 +28,9 @@ client's cookie is stripped before its query is forwarded, since it belongs to
 the client and this server, and would fail against anyone else's secret.
 */
 
-COOKIE_SECRET_LEN :: 16
+// Defined with the setting it is read from, so `--check` and startup cannot
+// disagree about what a usable secret looks like.
+COOKIE_SECRET_LEN :: config.COOKIE_SECRET_LEN
 COOKIE_CLIENT_LEN :: 8
 // Version, three reserved bytes, a four-byte timestamp and an eight-byte hash.
 COOKIE_SERVER_LEN :: 16
@@ -77,6 +80,17 @@ Cookie_Verdict :: enum u8 {
 
 Cookie_Request :: struct {
 	verdict: Cookie_Verdict,
+	/*
+	Whether the query carried a COOKIE option at all.
+
+	Separate from `verdict`, because it is answered even with the client-facing
+	side turned off, where there is no secret to judge one against and every
+	verdict is `.Absent`. What it decides is not whether to give the client a
+	cookie but whether to take one off the query before forwarding it, and that
+	has to happen either way: the client's cookie is no more the upstream's
+	business when this server is not issuing cookies than when it is.
+	*/
+	sent:    bool,
 	client:  [COOKIE_CLIENT_LEN]u8,
 	// The client address, in the 4 or 16 bytes the hash is taken over.
 	ip:      [16]u8,
@@ -98,7 +112,7 @@ start_cookies :: proc(s: ^Server) -> bool {
 	k.require = s.cfg.cookies.require
 
 	if s.cfg.cookies.secret != "" {
-		if !parse_cookie_secret(s.cfg.cookies.secret, &k.secret) {
+		if !config.parse_cookie_secret(s.cfg.cookies.secret, &k.secret) {
 			logx.errorf("cookies.secret must be %d hex characters", COOKIE_SECRET_LEN * 2)
 			free(k)
 			return false
@@ -121,34 +135,6 @@ stop_cookies :: proc(s: ^Server) {
 	s.cookies = nil
 }
 
-parse_cookie_secret :: proc(text: string, out: ^[COOKIE_SECRET_LEN]u8) -> bool {
-	if len(text) != COOKIE_SECRET_LEN * 2 {
-		return false
-	}
-	for i in 0 ..< COOKIE_SECRET_LEN {
-		hi, hi_ok := cookie_hex_value(text[i * 2])
-		lo, lo_ok := cookie_hex_value(text[i * 2 + 1])
-		if !hi_ok || !lo_ok {
-			return false
-		}
-		out[i] = hi << 4 | lo
-	}
-	return true
-}
-
-@(private)
-cookie_hex_value :: proc(c: u8) -> (v: u8, ok: bool) {
-	switch c {
-	case '0' ..= '9':
-		return c - '0', true
-	case 'a' ..= 'f':
-		return c - 'a' + 10, true
-	case 'A' ..= 'F':
-		return c - 'A' + 10, true
-	}
-	return 0, false
-}
-
 /*
 Read the client's COOKIE option and decide what it is worth.
 
@@ -156,15 +142,19 @@ Read the client's COOKIE option and decide what it is worth.
 changes from one query to the next, so only the host goes into the hash.
 */
 inspect_cookie :: proc(k: ^Cookie_Keeper, m: dns.Message, client: string) -> (req: Cookie_Request) {
-	if k == nil {
-		return {}
-	}
 	raw, found := dns.find_edns_option(m, .Cookie)
 	if !found {
 		return {}
 	}
+	// Recorded before anything else, since the forwarding path needs it whatever
+	// the verdict turns out to be - including with the keeper off, where there is
+	// no verdict to reach.
+	req.sent = true
+	if k == nil {
+		return req
+	}
 	if len(raw) != COOKIE_CLIENT_LEN && (len(raw) < COOKIE_MIN_LEN || len(raw) > COOKIE_MAX_LEN) {
-		return Cookie_Request{verdict = .Malformed}
+		return Cookie_Request{verdict = .Malformed, sent = true}
 	}
 
 	n, parsed := cookie_client_ip(client, req.ip[:])
@@ -173,7 +163,7 @@ inspect_cookie :: proc(k: ^Cookie_Keeper, m: dns.Message, client: string) -> (re
 		// client did send one, and `require` has to turn that away rather than
 		// wave it through for want of an address to check it against.
 		logx.debugf("cookies: %q is not an address a cookie can be bound to", client)
-		return Cookie_Request{verdict = .Unbindable}
+		return Cookie_Request{verdict = .Unbindable, sent = true}
 	}
 	req.ip_len = n
 	copy(req.client[:], raw[:COOKIE_CLIENT_LEN])
@@ -240,6 +230,8 @@ attach_cookie :: proc(
 
 @(private)
 make_cookie :: proc(k: ^Cookie_Keeper, req: Cookie_Request, now: u32) -> (out: [COOKIE_REPLY_LEN]u8) {
+	// A local copy because a parameter's array fields cannot be sliced: they are
+	// not addressable. Not a defensive copy, and not one to tidy away.
 	binding := req
 	copy(out[:COOKIE_CLIENT_LEN], binding.client[:])
 	out[8] = COOKIE_VERSION
@@ -277,7 +269,7 @@ verify_cookie :: proc(k: ^Cookie_Keeper, raw: []u8, req: Cookie_Request, now: u3
 	}
 	// The reserved bytes go in as they arrived; another server in the set may
 	// have set them, and this one is not the judge of that.
-	binding := req
+	binding := req // As in `make_cookie`: the parameter's arrays are not sliceable.
 	hash := cookie_hash(k.secret, raw[:16], binding.ip[:binding.ip_len])
 	return crypto.compare_constant_time(hash[:], raw[16:]) == 1
 }

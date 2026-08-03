@@ -362,6 +362,50 @@ run_upstream_cookie_cases :: proc(r: ^Runner) {
 		}
 		end_case(r)
 	}
+
+	{
+		// Both sides off, which is the combination where nothing replaces the
+		// client's cookie on its way out. It still must not travel: it is a
+		// stable identifier for that client, and its server half was minted here,
+		// so an upstream that implements cookies reads it as a forgery.
+		upstream_port := next_port(r)
+		mock := mock_make("cookies-all-off", upstream_port)
+		mock.cookies = .Echo
+		mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
+		if !mock_start(mock) {
+			skip_case(r, "cookies: both off", "cannot start the mock upstream")
+			return
+		}
+		defer mock_stop(mock)
+
+		port := next_port(r)
+		srv, ok := start_server(
+			r,
+			Server_Options{config = config_upstream_cookies(port, upstream_port, false, client_cookies = false), port = port},
+		)
+		if !ok {
+			skip_case(r, "cookies: both off", "server did not start")
+			return
+		}
+		defer stop_server(&srv)
+
+		start_case(r, "cookies: a client's cookie is dropped even with both sides off")
+		{
+			res := query_udp(port, build_query(f.qname, f.qtype, edns_size = 1232, cookie = CLIENT_COOKIE))
+			if check(r, res.ok, "no response") {
+				forwarded, found := find_cookie(mock_last_query(mock))
+				check(r, !found, "the client's cookie reached the upstream with both sides off")
+				if found {
+					check(
+						r,
+						!bytes_equal(forwarded[:min(8, len(forwarded))], CLIENT_COOKIE),
+						"the client's own cookie was the one forwarded",
+					)
+				}
+			}
+		}
+		end_case(r)
+	}
 }
 
 @(private = "file")
