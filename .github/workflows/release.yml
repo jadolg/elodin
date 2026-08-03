@@ -18,6 +18,10 @@ jobs:
           install: true
           cache: true
       - run: mise run release
+        env:
+          # The checkout is shallow and carries no tags, so leave the binary's
+          # version to the tag the release is being published under.
+          ELODIN_VERSION: ${{ github.event.release.tag_name }}
 
       - name: Package
         run: |

@@ -20,12 +20,20 @@ ELODIN_OUT = "{{config_root}}/bin/elodin"
 # a library directory, so it holds across distributions.
 ELODIN_LDFLAGS = "--sysroot=/ -B/usr/bin"
 
+# The version the binary reports comes from git rather than a constant in the
+# source, so a build cannot claim a release that was never tagged. A commit that
+# carries a tag reports the tag; anything else reports dev-<short sha>, which is
+# still enough to identify the build. ELODIN_VERSION in the environment wins, so
+# release CI can name the tag it is publishing even from a checkout whose tags
+# were never fetched, and a tree with no .git at all still builds.
+ELODIN_VERSION = "{{ exec(command='echo ${ELODIN_VERSION:-$(git describe --tags --exact-match 2>/dev/null || echo dev-$(git rev-parse --short HEAD 2>/dev/null || echo unknown))}') }}"
+
 # Each worker thread keeps its own scratch arena, and Odin sizes those at 4 MB
 # by default. A query needs a few kilobytes at most, so that costs ~4 MB per
 # worker — half a gigabyte at the default worker count — for nothing. 256 KB
 # measures identically on throughput and cuts resident memory by an order of
 # magnitude; the arena still grows if a request ever needs more.
-ELODIN_DEFINES = "-define:DEFAULT_TEMP_ALLOCATOR_BACKING_SIZE=262144"
+ELODIN_DEFINES = "-define:DEFAULT_TEMP_ALLOCATOR_BACKING_SIZE=262144 -define:ELODIN_VERSION={{ env.ELODIN_VERSION }}"
 
 # bin/ is not in version control, so a fresh clone has to create it before the
 # linker is asked to write there.
