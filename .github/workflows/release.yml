@@ -72,6 +72,10 @@ jobs:
       # user does, and it costs a few seconds.
       - name: Install the .deb
         run: |
+          # Declining the takeover. Saying yes here would disable the runner's
+          # resolver and put elodin on port 53 for the rest of the job, which
+          # is not what the following steps are testing.
+          echo 'elodin elodin/takeover-dns boolean false' | sudo debconf-set-selections
           sudo apt-get install -y ./dist/elodin_*_${{ matrix.arch }}.deb
           /usr/bin/elodin --version
           systemd-analyze verify /usr/lib/systemd/system/elodin.service

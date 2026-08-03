@@ -113,17 +113,43 @@ push and pull request.
 
 ```sh
 sudo apt install ./elodin_0.2.0-1_amd64.deb
-sudo systemctl enable --now elodin
 ```
 
 The binary lands at `/usr/bin/elodin`, the unit at
 `/usr/lib/systemd/system/elodin.service`, and `examples/elodin.yaml` at
 `/etc/elodin/elodin.yaml` as a conffile — dpkg keeps your edits across upgrades
-and asks before replacing them. The install enables nothing and starts nothing:
-elodin wants port 53, and on a machine that installs Debian packages that port
-is usually systemd-resolved's, so starting it there would fail the installation
-over a conflict only you can settle. `apt purge` removes the configuration, the
+and asks before replacing them. `apt purge` removes the configuration, the
 blocklist cache and the state directory.
+
+The install asks one question, and it defaults to yes:
+
+> **Make elodin the system resolver?**
+
+Answering yes stops, disables and **masks** systemd-resolved, replaces
+`/etc/resolv.conf` with a real file naming `127.0.0.1` (carrying over any
+`search` domains from the old one), and enables and starts elodin. Masking as
+well as disabling matters: a later systemd upgrade would otherwise switch
+resolved back on and take port 53 at the next boot. elodin reaches its
+blocklists and upstreams through the `upstream.bootstrap` addresses rather than
+through the system resolver, so it does not depend on the resolver it is in the
+middle of replacing.
+
+Answering no installs elodin and leaves everything alone. `sudo dpkg-reconfigure
+elodin` asks again, so the decision is not one-way. For unattended installs,
+preseed it:
+
+```sh
+echo 'elodin elodin/takeover-dns boolean true' | sudo debconf-set-selections
+```
+
+Nothing is disabled until `elodin --check` has passed on the configuration the
+service will use, and if elodin then fails to stay up — a certificate it cannot
+read, a port it cannot have — the package puts systemd-resolved and the old
+`/etc/resolv.conf` back and fails the install rather than leaving a machine
+pointed at a resolver that is not answering. Removing the package restores them
+the same way, whichever answer was given, and `apt remove` is enough: it does
+not wait for `apt purge`, because a machine that has just lost its resolver
+needs the old one back immediately.
 
 `mise run deb` builds one from a checkout into `dist/`, for the architecture of
 the machine that runs it. The script behind it, `packaging/build-deb.sh`,
