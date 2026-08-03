@@ -116,6 +116,28 @@ remove_edns_option :: proc(
 	return rewrite_edns_option(msg, u16(code), nil, true, allocator)
 }
 
+/*
+The full response code of an encoded message, extended bits included.
+
+`Message.flags` carries only the low four; the other eight live in the OPT
+record's TTL field, so a BADCOOKIE (23) reads as YXRRSET (7) to anything that
+looks at the header alone. Returns the header's own value when there is no OPT
+record or the message cannot be walked, which is what those eight bits mean when
+nothing supplies them.
+*/
+peek_rcode :: proc(msg: []u8) -> Rcode {
+	if len(msg) < HEADER_SIZE {
+		return .No_Error
+	}
+	base := u16(msg[3] & 0xf)
+	span, ok := find_opt_span(msg)
+	if !ok {
+		return Rcode(base)
+	}
+	// TTL sits between the class and RDLENGTH, so it ends four bytes back.
+	return Rcode(base | u16(msg[span.rdlen_pos - 4]) << 4)
+}
+
 @(private)
 Opt_Span :: struct {
 	// Offset of the OPT record's RDLENGTH field, which has to be corrected

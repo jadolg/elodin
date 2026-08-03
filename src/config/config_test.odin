@@ -156,12 +156,14 @@ test_cookies_defaults_and_overrides :: proc(t: ^testing.T) {
 	testing.expect(t, err == nil, "expected a clean load")
 	testing.expect(t, cfg.cookies.enabled, "cookies should be answered by default")
 	testing.expect(t, !cfg.cookies.require, "cookies should not be demanded by default")
+	testing.expect(t, cfg.cookies.upstream, "cookies should be sent upstream by default")
 
-	src := "upstream:\n  servers: [1.1.1.1]\ncookies:\n  enabled: false\n  require: true\n  secret: e5e973e5a6b2a43f48e7dc849e37bfcf\n"
+	src := "upstream:\n  servers: [1.1.1.1]\ncookies:\n  enabled: false\n  require: true\n  upstream: false\n  secret: e5e973e5a6b2a43f48e7dc849e37bfcf\n"
 	tuned, terr := load_string(src, context.temp_allocator)
 	testing.expect(t, terr == nil, "expected a clean load")
 	testing.expect(t, !tuned.cookies.enabled, "cookies.enabled: false should be honoured")
 	testing.expect(t, tuned.cookies.require, "cookies.require: true should be honoured")
+	testing.expect(t, !tuned.cookies.upstream, "cookies.upstream: false should be honoured")
 	testing.expect_value(t, tuned.cookies.secret, "e5e973e5a6b2a43f48e7dc849e37bfcf")
 	free_all(context.temp_allocator)
 }

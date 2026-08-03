@@ -96,14 +96,22 @@ run_cookie_cases :: proc(r: ^Runner) {
 	{
 		// It is a secret between the client and this server. An upstream that
 		// implements cookies would hash it against its own key, call it a
-		// forgery and answer BADCOOKIE instead of the question.
+		// forgery and answer BADCOOKIE instead of the question. What the
+		// upstream sees is elodin's own cookie for it, which is a different
+		// value entirely.
 		query := build_query(f.qname, f.qtype, edns_size = 1232, cookie = CLIENT_COOKIE)
 		res := query_udp(port, query)
 		if check(r, res.ok, "no response") {
 			seen := mock_last_query(mock)
 			if check(r, seen != nil, "the upstream saw no query") {
-				_, leaked := find_cookie(seen)
-				check(r, !leaked, "the client's cookie was forwarded upstream")
+				forwarded, has_cookie := find_cookie(seen)
+				if check(r, has_cookie, "elodin's own cookie did not go upstream") {
+					check(
+						r,
+						!bytes_equal(forwarded[:min(8, len(forwarded))], CLIENT_COOKIE),
+						"the client's cookie was forwarded upstream",
+					)
+				}
 				msg, err := dns.decode_message(seen, context.temp_allocator)
 				if check(r, err == .None, "the forwarded query does not decode") {
 					// Only the cookie goes; the rest of EDNS is still negotiated
@@ -141,6 +149,219 @@ run_cookie_cases :: proc(r: ^Runner) {
 	end_case(r)
 
 	run_cookie_require_cases(r, mock, upstream_port)
+}
+
+@(private = "file")
+config_upstream_cookies :: proc(port, upstream_port: int, upstream_cookies: bool, client_cookies := true) -> string {
+	return fmt.tprintf(
+		`log: {{ level: warn }}
+listeners:
+  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
+  tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
+upstream:
+  timeout: 3s
+  servers: ["127.0.0.1:%d"]
+cache: {{ enabled: false }}
+blocking: {{ enabled: false }}
+cookies:
+  enabled: %v
+  upstream: %v
+`,
+		port,
+		port,
+		upstream_port,
+		client_cookies,
+		upstream_cookies,
+	)
+}
+
+/*
+The other direction: what elodin sends to the servers it asks.
+
+The mock plays a cookie-aware resolver, so the conversation is observable from
+the far side — which cookie went out, whether the server cookie came back on the
+next query, and what a BADCOOKIE does.
+*/
+run_upstream_cookie_cases :: proc(r: ^Runner) {
+	f := fixture("a")
+
+	{
+		upstream_port := next_port(r)
+		mock := mock_make("upstream-cookie", upstream_port)
+		mock.cookies = .Echo
+		mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
+		if !mock_start(mock) {
+			skip_case(r, "cookies: upstream", "cannot start the mock upstream")
+			return
+		}
+		defer mock_stop(mock)
+
+		port := next_port(r)
+		srv, ok := start_server(r, Server_Options{config = config_upstream_cookies(port, upstream_port, true), port = port})
+		if !ok {
+			skip_case(r, "cookies: upstream", "server did not start")
+			return
+		}
+		defer stop_server(&srv)
+
+		start_case(r, "cookies: the upstream is asked with a cookie, and the answer teaches us one")
+		{
+			res := query_udp(port, build_query(f.qname, f.qtype, edns_size = 1232))
+			if check(r, res.ok, "no response") {
+				sent, found := find_cookie(mock_last_query(mock))
+				if check(r, found, "the upstream saw no cookie") {
+					// Nothing learned yet, so this is a client cookie alone.
+					check_eq_int(r, len(sent), 8, "cookie length on the first query")
+				}
+
+				// The second query should carry what the first one learned.
+				second := query_udp(port, build_query("second.example.", u16(dns.Type.A), id = 0x4245, edns_size = 1232))
+				if check(r, second.ok, "no response to the second query") {
+					again, had := find_cookie(mock_last_query(mock))
+					if check(r, had, "the second query carried no cookie") {
+						check_eq_int(r, len(again), 16, "cookie length on the second query")
+						check(r, bytes_equal(again[:8], sent), "the client cookie changed between queries")
+					}
+				}
+			}
+		}
+		end_case(r)
+
+		start_case(r, "cookies: the upstream's cookie is not passed on to the client")
+		{
+			// The client asked for no cookie, so it must get none - least of all
+			// one belonging to the conversation between us and the upstream.
+			res := query_udp(port, build_query(f.qname, f.qtype, id = 0x4246, edns_size = 1232))
+			if check(r, res.ok, "no response") {
+				_, leaked := find_cookie(res.wire)
+				check(r, !leaked, "the upstream's cookie reached the client")
+			}
+		}
+		end_case(r)
+
+		start_case(r, "cookies: a query with no EDNS goes upstream without one")
+		{
+			// Adding an OPT record would negotiate EDNS for a client that never
+			// asked, and change what may come back.
+			res := query_udp(port, build_query("plain.example.", u16(dns.Type.A), id = 0x4247))
+			if check(r, res.ok, "no response") {
+				_, found := find_cookie(mock_last_query(mock))
+				check(r, !found, "a cookie was added to a query with no OPT record")
+			}
+		}
+		end_case(r)
+	}
+
+	{
+		// A server that will not answer until it sees its own cookie.
+		upstream_port := next_port(r)
+		mock := mock_make("upstream-badcookie", upstream_port)
+		mock.cookies = .Require
+		mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
+		if !mock_start(mock) {
+			skip_case(r, "cookies: upstream badcookie", "cannot start the mock upstream")
+			return
+		}
+		defer mock_stop(mock)
+
+		port := next_port(r)
+		srv, ok := start_server(r, Server_Options{config = config_upstream_cookies(port, upstream_port, true), port = port})
+		if !ok {
+			skip_case(r, "cookies: upstream badcookie", "server did not start")
+			return
+		}
+		defer stop_server(&srv)
+
+		start_case(r, "cookies: BADCOOKIE from the upstream is retried, and the client never sees it")
+		{
+			res := query_udp(port, build_query(f.qname, f.qtype, edns_size = 1232))
+			if check(r, res.ok, "no response") {
+				h, _ := parse_header(res.wire)
+				check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode")
+				check(r, h.ancount > 0, "the answer never arrived")
+				check_eq_int(r, mock_total(mock), 2, "queries the upstream saw")
+			}
+		}
+		end_case(r)
+	}
+
+	{
+		// The two settings are independent. This is the combination where the
+		// client's cookie is not taken out on the way in, so what keeps it off
+		// the wire is our own cookie for this upstream replacing it.
+		upstream_port := next_port(r)
+		mock := mock_make("upstream-only", upstream_port)
+		mock.cookies = .Echo
+		mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
+		if !mock_start(mock) {
+			skip_case(r, "cookies: upstream only", "cannot start the mock upstream")
+			return
+		}
+		defer mock_stop(mock)
+
+		port := next_port(r)
+		srv, ok := start_server(
+			r,
+			Server_Options {
+				config = config_upstream_cookies(port, upstream_port, true, client_cookies = false),
+				port = port,
+			},
+		)
+		if !ok {
+			skip_case(r, "cookies: upstream only", "server did not start")
+			return
+		}
+		defer stop_server(&srv)
+
+		start_case(r, "cookies: a client's cookie is replaced even with the client-facing side off")
+		{
+			res := query_udp(port, build_query(f.qname, f.qtype, edns_size = 1232, cookie = CLIENT_COOKIE))
+			if check(r, res.ok, "no response") {
+				forwarded, has_cookie := find_cookie(mock_last_query(mock))
+				if check(r, has_cookie, "elodin's own cookie did not go upstream") {
+					check(
+						r,
+						!bytes_equal(forwarded[:min(8, len(forwarded))], CLIENT_COOKIE),
+						"the client's cookie reached the upstream",
+					)
+				}
+				// And with the client-facing side off, the client gets nothing back.
+				_, given := find_cookie(res.wire)
+				check(r, !given, "a cookie was issued with the client-facing side off")
+			}
+		}
+		end_case(r)
+	}
+
+	{
+		upstream_port := next_port(r)
+		mock := mock_make("upstream-nocookie", upstream_port)
+		mock.cookies = .Echo
+		mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
+		if !mock_start(mock) {
+			skip_case(r, "cookies: upstream off", "cannot start the mock upstream")
+			return
+		}
+		defer mock_stop(mock)
+
+		port := next_port(r)
+		srv, ok := start_server(r, Server_Options{config = config_upstream_cookies(port, upstream_port, false), port = port})
+		if !ok {
+			skip_case(r, "cookies: upstream off", "server did not start")
+			return
+		}
+		defer stop_server(&srv)
+
+		start_case(r, "cookies: upstream cookies can be turned off")
+		{
+			res := query_udp(port, build_query(f.qname, f.qtype, edns_size = 1232))
+			if check(r, res.ok, "no response") {
+				_, found := find_cookie(mock_last_query(mock))
+				check(r, !found, "a cookie went upstream with the setting off")
+			}
+		}
+		end_case(r)
+	}
 }
 
 @(private = "file")

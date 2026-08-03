@@ -172,6 +172,18 @@ cookies:
   # cookie, and queries over TCP, DoT or DoH, are unaffected.
   require: false
 
+  # The same mechanism pointed the other way: elodin presents a cookie of its
+  # own to plain UDP and TCP upstreams, and ignores a reply that does not carry
+  # it back — so forging an answer to one of our queries means guessing 64 bits
+  # that were never on a visible path, on top of the transaction ID and the
+  # source port. Independent of `enabled` above.
+  #
+  # Only queries that already carry an OPT record get one, since adding one
+  # would negotiate EDNS for a client that never asked; with DNSSEC validation
+  # on, every forwarded query carries one. DoT and DoH upstreams are left out,
+  # their certificate settling more than a cookie could.
+  upstream: true
+
   # The key cookies are derived from, as 32 hex characters. Empty draws a random
   # one at each startup, which is right for a single instance. Set it when
   # several elodins answer on one address, or they will reject each other's

@@ -168,7 +168,7 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	handler_pool := pool.make_pool(cfg.server.workers)
 	race_pool := pool.make_pool(cfg.server.upstream_workers)
 
-	group, gerr := upstream.make_group(cfg.upstream, race_pool)
+	group, gerr := upstream.make_group(cfg.upstream, race_pool, cookies = cfg.cookies.upstream)
 	if gerr != .None {
 		logx.errorf("no usable upstream servers, giving up")
 		os.exit(1)

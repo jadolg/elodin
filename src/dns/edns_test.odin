@@ -355,3 +355,42 @@ test_ensure_edns_option_refuses_a_message_it_cannot_read :: proc(t: ^testing.T) 
 
 	free_all(context.temp_allocator)
 }
+
+/*
+The extended rcode lives in the OPT record, not in the header, so a message
+carrying BADCOOKIE (23) reads as YXRRSET (7) to anything that stops at the
+header's four bits.
+*/
+@(test)
+test_peek_rcode_reads_the_extended_bits :: proc(t: ^testing.T) {
+	questions := make([]Question, 1, context.temp_allocator)
+	questions[0] = Question {
+		name  = "example.com.",
+		type  = .A,
+		class = .IN,
+	}
+	query := Message {
+		id       = 1,
+		question = questions,
+	}
+
+	resp := make_response(query, .Bad_Cookie, context.temp_allocator)
+	// make_response only echoes an OPT when the query had one, and this query
+	// has none, so the record is put there by hand.
+	additional := make([]Record, 1, context.temp_allocator)
+	additional[0] = make_opt(1232, false, u8(u16(Rcode.Bad_Cookie) >> 4))
+	resp.additional = additional
+
+	wire, _, err := encode_message(resp, context.temp_allocator)
+	testing.expect_value(t, err, Encode_Error.None)
+	testing.expect_value(t, wire[3] & 0xf, u8(7))
+	testing.expect_value(t, peek_rcode(wire), Rcode.Bad_Cookie)
+
+	// Without an OPT record the header is all there is.
+	plain, _, perr := encode_message(make_response(query, .NX_Domain, context.temp_allocator), context.temp_allocator)
+	testing.expect_value(t, perr, Encode_Error.None)
+	testing.expect_value(t, peek_rcode(plain), Rcode.NX_Domain)
+
+	testing.expect_value(t, peek_rcode([]u8{1, 2}), Rcode.No_Error)
+	free_all(context.temp_allocator)
+}

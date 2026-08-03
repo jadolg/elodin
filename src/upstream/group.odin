@@ -28,6 +28,8 @@ make_group :: proc(
 	cfg: config.Upstream_Config,
 	race_pool: ^pool.Pool,
 	allocator := context.allocator,
+	// Whether plain upstreams are asked with a DNS cookie; see upstream/cookie.odin.
+	cookies := false,
 ) -> (
 	g: ^Group,
 	err: Error,
@@ -41,7 +43,7 @@ make_group :: proc(
 
 	servers := make([dynamic]^Upstream, 0, len(cfg.servers), allocator)
 	for spec in cfg.servers {
-		u, uerr := make_upstream(spec, cfg.max_idle, cfg.idle_timeout, allocator)
+		u, uerr := make_upstream(spec, cfg.max_idle, cfg.idle_timeout, allocator, cookies)
 		if uerr != .None {
 			logx.errorf("upstream %s: not usable (%v)", spec.name, uerr)
 			continue

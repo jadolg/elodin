@@ -162,13 +162,34 @@ Cookie_Config :: struct {
 	7873 section 5.2.3 has it for. Queries with no cookie at all, and queries
 	over TCP, DoT or DoH, are unaffected either way.
 	*/
-	require: bool,
+	require:  bool,
+	/*
+	Whether elodin presents a cookie of its own to plain UDP and TCP upstreams.
+
+	On, and independent of `enabled`: one setting is about the clients asking us,
+	this one is about the servers we ask. It is the same protection in the other
+	direction — an off-path attacker forging an answer to one of our queries has
+	to guess 64 bits it has never seen, on top of the transaction ID and the
+	source port. A forged datagram that fails the check is ignored rather than
+	answered, so the genuine reply is still waited for.
+
+	Only queries that already carry an OPT record get a cookie, because adding
+	one would mean an EDNS negotiation the client never asked for. With DNSSEC
+	validation on — the default — every query this server forwards carries one.
+
+	DoT and DoH upstreams are left out: the transport already authenticates the
+	server, which is more than a cookie establishes.
+	*/
+	upstream: bool,
 	/*
 	The secret cookies are keyed by, as 32 hex characters. Empty draws a random
 	one at startup, which is right for a single instance and wrong for several
 	behind one address: each would reject the cookies the others handed out.
+
+	Applies to the cookies handed to clients. The client cookies sent upstream
+	are drawn at random per upstream and are not derived from this.
 	*/
-	secret:  string,
+	secret:   string,
 }
 
 Rewrite_Kind :: enum u8 {
@@ -319,8 +340,9 @@ default_config :: proc() -> Config {
 		max_nsec3_iterations = 100,
 	}
 	c.cookies = Cookie_Config {
-		enabled = true,
-		require = false,
+		enabled  = true,
+		require  = false,
+		upstream = true,
 	}
 	return c
 }

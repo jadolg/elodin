@@ -645,6 +645,7 @@ load_cookies :: proc(l: ^Loader, cfg: ^Config) {
 	}
 	opt_bool(l, n, "enabled", &cfg.cookies.enabled, "cookies")
 	opt_bool(l, n, "require", &cfg.cookies.require, "cookies")
+	opt_bool(l, n, "upstream", &cfg.cookies.upstream, "cookies")
 	opt_string(l, n, "secret", &cfg.cookies.secret, "cookies")
 }
 
