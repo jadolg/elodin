@@ -13,8 +13,8 @@ Pi-hole and AdGuard Home, minus the web interface. One binary, one YAML file.
 
 ## Requirements
 
-- [mise](https://mise.jdx.dev) — pins the toolchain (Odin and clang) and runs
-  the tasks; `mise install` fetches both
+- [mise](https://mise.jdx.dev) — pins the toolchain (Odin, clang, and Go for the
+  benchmark) and runs the tasks; `mise install` fetches them
 - OpenSSL 3.x with headers (`openssl-devel` / `libssl-dev`) for DoT, DoH and the
   DNSSEC signature checks
 
@@ -36,6 +36,7 @@ mise run itest      # integration tests against the built binary
 mise run verify     # check + test + itest
 mise run check      # type-check with -vet -strict-style
 mise run certs      # self-signed certificate for local DoT/DoH testing
+mise run bench      # throughput, latency, CPU and memory (see bench/README.md)
 ```
 
 ## Running
@@ -64,6 +65,41 @@ A cache directory it cannot write is a warning, not an error: the lists are
 still downloaded and applied, they just have to be fetched again on the next
 start.
 
+`examples/elodin.yaml` documents every setting. A minimal config is:
+
+```yaml
+upstream:
+  servers:
+    - tls://1.1.1.1:853#cloudflare-dns.com
+blocking:
+  lists:
+    - https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
+```
+
+### As a service
+
+`packaging/elodin.service` is a systemd unit for the usual arrangement: the
+binary at `/usr/local/bin/elodin`, the configuration at
+`/etc/elodin/elodin.yaml`.
+
+```sh
+sudo install -m755 bin/elodin /usr/local/bin/elodin
+sudo install -Dm644 examples/elodin.yaml /etc/elodin/elodin.yaml
+sudo install -m644 packaging/elodin.service /etc/systemd/system/
+sudo systemctl enable --now elodin
+```
+
+It binds :53 through `AmbientCapabilities=CAP_NET_BIND_SERVICE` rather than as
+root, and runs under `DynamicUser=yes` with `ProtectSystem=strict`, so systemd
+provides the state, cache and configuration directories and nothing else on the
+filesystem is writable. `RestrictAddressFamilies=AF_INET AF_INET6` leaves it the
+two families it actually uses.
+
+A published GitHub release carries a `linux-amd64` tarball built by
+`.github/workflows/release.yml`, holding the optimised binary, the unit file and
+the example configuration. CI runs `mise run check`, `mise run test` and
+`mise run itest` on every push and pull request.
+
 ### Stopping
 
 `SIGTERM` and `SIGINT` ask for an orderly shutdown: the listeners stop, the
@@ -77,16 +113,12 @@ up to `server.client_timeout` (ten seconds by default). That is comfortably
 inside systemd's `TimeoutStopSec`. A second signal skips the wait and terminates
 immediately, for when that is not what you want.
 
-`examples/elodin.yaml` documents every setting. A minimal config is:
+### Observing it
 
-```yaml
-upstream:
-  servers:
-    - tls://1.1.1.1:853#cloudflare-dns.com
-blocking:
-  lists:
-    - https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
-```
+There is no metrics endpoint. Statistics go to the log every five minutes —
+queries, blocked, cached, forwarded, failed, dropped, secure and bogus counts,
+plus cache entries, hits, misses and evictions — and `log.queries` adds one line
+per query, at the cost noted under [Resource use](#resource-use).
 
 ## Configuration
 
@@ -136,6 +168,14 @@ Strategies:
 An upstream that fails three times in a row is skipped for ten seconds, so a
 dead server stops costing every query a full timeout. If every upstream is in
 that state they are all tried anyway.
+
+A TLS handshake the peer resets partway through is retried once before it counts
+as one of those failures — some public resolvers do this to a fair share of
+fresh connections while the very next attempt goes through, and without the
+retry a run of them parks a server that is working. Only a reset is retried: it
+comes back in a round trip, where a timeout has already spent the query's budget
+and a rejected certificate will not improve on a second look. This covers DoT
+and every HTTPS upstream alike.
 
 ### Sink lists
 
@@ -325,30 +365,43 @@ hot path.
 
 ## Capacity
 
-Measured on this machine (16 cores) with an independent Go load generator, a
-mock upstream held at a realistic 20 ms, and the shipped defaults:
+Everything below comes out of `mise run bench`, against a mock upstream held at
+a realistic 20 ms and with the shipped defaults. The harness lives in `bench/`
+and is documented there; the run these figures are from is
+`bench/results/2026-08-03-ryzen7-6850u.md`. Re-taking them is the point — a
+number here that the harness does not produce is a number to delete.
 
-| workload | throughput | p50 | p99 | RSS |
+The machine is a Ryzen 7 PRO 6850U laptop, 16 logical cores. It is a 15 W part
+that cannot hold its boost clock through a long run, so read these as the shape
+of the thing rather than as a specification: the same table taken from a cold
+machine and from a hot one differs by 20–30%, and figures in one table should
+not be compared with figures in another.
+
+| workload | throughput | p50 | p99 | peak RSS |
 |---|---|---|---|---|
-| cache hits | 195,000 qps | 1.2 ms | 4.0 ms | 53 MB |
-| blocked / rewritten (no upstream) | 275,000 qps | 0.9 ms | 2.7 ms | — |
-| light mixed load (20 in flight) | — | 0.11 ms | 0.39 ms | — |
-| sustained cache misses | 6,400 qps | 20 ms | 28 ms | 38 MB |
+| cache hits | 164,000 qps | 1.1 ms | 3.2 ms | 43 MB |
+| blocked | 157,000 qps | 1.2 ms | 2.9 ms | 43 MB |
+| rewritten | 158,000 qps | 1.2 ms | 2.8 ms | 43 MB |
+| light mixed load (20 in flight) | 136,000 qps | 0.13 ms | 0.42 ms | 43 MB |
+| sustained cache misses | 6,100 qps | 21 ms | 24 ms | 47 MB |
 
 Every transport serves many clients at once. With 100 concurrent clients, each
 holding its own connection for the run:
 
 | transport | throughput | p50 | p99 | answered per client (min–max) |
 |---|---|---|---|---|
-| UDP | 130,000 qps | 0.56 ms | 4.6 ms | 6354 – 6749 |
-| TCP | 180,000 qps | 0.14 ms | 5.3 ms | 8619 – 9499 |
-| DoT | 140,000 qps | 0.23 ms | 5.9 ms | 6640 – 7583 |
-| DoH over HTTP/1.1 | 60,000 qps | 0.68 ms | 12 ms | 2856 – 3270 |
-| DoH over HTTP/2 | 34,000 qps | 0.64 ms | 18 ms | 1584 – 1859 |
+| UDP | 158,000 qps | 0.59 ms | 1.7 ms | 15659 – 15923 |
+| TCP | 177,000 qps | 0.21 ms | 4.4 ms | 17206 – 18486 |
+| DoT | 133,000 qps | 0.36 ms | 5.4 ms | 12935 – 13743 |
+| DoH over HTTP/1.1 | 65,000 qps | 0.81 ms | 11 ms | 6256 – 6787 |
+| DoH over HTTP/2 | 30,000 qps | 0.59 ms | 21 ms | 2777 – 3233 |
 
-No errors on any of them, and the per-client spread stays inside about 10%, so
-no client is starved by the others. TCP was also run at 500 concurrent
-connections: 152,000 qps, still with an even spread.
+No errors on any of them. The per-client spread stays inside 9% on UDP, TCP, DoT
+and HTTP/1.1, so no client is starved by the others; on HTTP/2 it is 16%, which
+is what multiplexing costs in fairness — streams from one connection compete for
+the same worker pool rather than taking turns. TCP was also run at 500
+concurrent connections: 149,000 qps, with the spread widening to 28% as the
+per-connection threads start contending.
 
 How each transport reaches that:
 
@@ -360,16 +413,17 @@ How each transport reaches that:
   reused, so the cap bounds concurrent *clients*, not queries per second — the
   100-connection runs above carry well over 100,000 qps.
 
-HTTP/2 costs about 40% more per query than HTTP/1.1 on answers that come
-straight from the cache, because of framing, HPACK and the hand-off to the
-worker pool. It earns that back the moment queries are slow, which is when a
-browser is actually waiting. Ten clients issuing eight concurrent requests each,
-all of them cache misses against a 20 ms upstream:
+HTTP/2 costs about two and a half times as much CPU per query as HTTP/1.1 on
+answers that come straight from the cache — 220 µs against 87 µs — because of
+framing, HPACK and the hand-off to the worker pool, and it serves under half the
+throughput on that workload. It earns all of that back the moment queries are
+slow, which is when a browser is actually waiting. Ten clients issuing eight
+concurrent requests each, all of them cache misses against a 20 ms upstream:
 
 | | throughput | p50 |
 |---|---|---|
-| HTTP/1.1 | 474 qps | 168 ms |
-| HTTP/2 | 3,759 qps | 21 ms |
+| HTTP/1.1 | 460 qps | 171 ms |
+| HTTP/2 | 3,702 qps | 21 ms |
 
 Eight times the throughput at an eighth of the latency — the eight requests
 overlap instead of queueing, and p50 settles at one upstream round trip.
@@ -397,10 +451,15 @@ knowing:
 - **Memory scales with workers**, at roughly 0.3 MB of scratch arena each.
 
 Past capacity the server drops queries rather than queueing them
-(`server.max_pending`, derived as `workers * 8`). Under a 10× overload that is
-5,200 qps served at a bounded 166 ms; without shedding the same load produced
-65 qps at 1 second and climbing, because the queue filled with queries whose
-clients had already given up.
+(`server.max_pending`, derived as `workers * 8`). With 6,000 clients all asking
+for cache misses at once — a thousandfold more demand than a 128-worker pool can
+carry against a 20 ms upstream — that is 4,900 qps served at a bounded 166 ms,
+and about 25,000 queries dropped over twenty seconds. Given an effectively
+unbounded queue the same load serves a comparable 5,900 qps but at 978 ms,
+because the backlog rather than the work becomes the latency, and every client
+waits behind queries whose own clients have already given up. A dropped query
+gets no answer at all, so a client sees it as a timeout and retries, which is
+the failure DNS is built for.
 
 ### Resource use
 
@@ -408,59 +467,66 @@ CPU, measured on the server process alone while it was saturated:
 
 | transport | CPU per query | at 5,000 qps |
 |---|---|---|
-| TCP | 30 µs | 0.15 core |
-| UDP | 36 µs | 0.18 core |
-| DoT | 38 µs | 0.19 core |
-| DoH over HTTP/1.1 | 78 µs | 0.39 core |
-| DoH over HTTP/2 | 178 µs | 0.89 core |
+| TCP | 37 µs | 0.19 core |
+| UDP | 37 µs | 0.19 core |
+| DoT | 61 µs | 0.31 core |
+| DoH over HTTP/1.1 | 87 µs | 0.44 core |
+| DoH over HTTP/2 | 220 µs | 1.10 core |
 
-Answering queries is cheap. **TLS handshakes are not**: about 1 ms of CPU each
-with an ECDSA P-256 certificate and 2 ms with RSA-2048 — fifty times the cost of
-answering a query on an established connection. A client that reuses its
-connection costs 38 µs per query; one that reconnects each time costs a
-thousand. Sustained fresh handshakes top out around 3,900/s (ECDSA) or 2,700/s
-(RSA) and consume most of the machine doing it. `mise run certs` generates
-ECDSA for that reason; use ECDSA for real deployments too.
+Answering queries is cheap. **TLS handshakes are not**: 1.1 ms of CPU each with
+an ECDSA P-256 certificate and 2.3 ms with RSA-2048 — some thirty times the cost
+of answering a query on an established connection. A client that reuses its
+connection costs 61 µs per query over DoT; one that reconnects for every query
+costs more than a thousand. Sustained fresh handshakes top out around 3,300/s
+(ECDSA) or 2,400/s (RSA) and consume most of the machine doing it. `mise run
+certs` generates ECDSA for that reason; use ECDSA for real deployments too.
 
 Memory, for a full configuration under load:
 
 | | |
 |---|---|
-| idle, no lists | 5–12 MB |
-| worker scratch arenas | ~0.26 MB per worker (33 MB at 128) |
-| blocklists | ~166 B per rule (42 MB for 253,000 rules) |
-| answer cache | ~400 B per entry (4 MB at the default 10,000) |
-| **realistic total under load** | **~155 MB** with two large lists and 200,000 cached answers |
+| idle, no lists | 11 MB |
+| worker scratch arenas | ~0.26 MB per worker (34 MB at 128) |
+| blocklists | ~129 B per rule (31 MB for 250,000 rules) |
+| answer cache | ~463 B per entry (4 MB at the default 10,000) |
+| **realistic total under load** | **154 MB** with 250,000 rules and 180,000 cached answers |
 
-It holds there. Over a 60-second run serving 8.65 million queries, resident
-memory stayed at 154 MB to the megabyte and the thread count never moved.
+Each row but the first is a difference between two runs that vary in one thing,
+so the cache is not charged for the worker arenas that the same load brings up.
 
-Disk is negligible: an 800 KB binary, and a blocklist cache the size of the
+Disk is negligible: an 840 KB binary, and a blocklist cache the size of the
 lists themselves (6.5 MB for two large ones). Nothing is written in steady
-state — with one exception below.
+state — with one exception.
 
-Two settings cost real throughput: `log.queries` takes about 18% and writes
-~12 MB/s at 150k qps — the one thing that touches the disk in steady state, so
-it wants rotation; and the `race` strategy multiplies upstream traffic by the
-number of servers.
+That exception is `log.queries`, which writes 22 MB/s at 220k qps, about 104
+bytes per query. It wants rotation. What it does *not* cost is throughput: on
+this machine the server was consistently around 20% **faster** with it on
+(191,000 qps against 230,000), reproducibly and with a run-to-run spread of a
+few percent — while the same configuration measured against itself differs by
+under 1%, so it is not an artefact of the ordering. The likeliest explanation is
+that the per-query write staggers 128 workers that otherwise contend on the same
+hot path. Do not read it as a reason to turn logging on; read it as a reason not
+to expect it to cost anything.
+
+The `race` strategy is the other setting with a real price: it multiplies
+upstream traffic by the number of servers.
 
 ## Known limitations
 
-- The DoH **upstream client** speaks HTTP/1.1, not HTTP/2. Every public DoH
-  resolver still accepts it, so this costs nothing today; the h2 code is
-  server-side only.
 - DNSSEC validation is **on by default**, and where a distribution's crypto
   policy forbids SHA-1 signatures the two RSA/SHA-1 algorithms degrade to
   insecure rather than validating. See the DNSSEC section above.
-- **Encrypted transports get a thread per connection**, capped by
-  `server.max_connections` (512). That is fine for thousands of queries per
-  second over UDP, and fine for DoT/DoH clients that hold a connection open and
-  pipeline over it, but it does not suit tens of thousands of concurrent
-  encrypted connections. UDP and TCP have no such limit.
+- **Connection-oriented transports get a thread per connection**, capped for
+  TCP, DoT and DoH together by `server.max_connections` (512). That is fine for
+  clients that hold a connection open and pipeline over it, but it does not suit
+  tens of thousands of concurrent connections. UDP is the exception: one reader
+  thread, no per-client state, no limit.
 - Upstream I/O is synchronous, so concurrency is bounded by thread count rather
-  than by in-flight queries. Async upstream I/O, or several UDP reader threads
-  behind `SO_REUSEPORT`, would lift both this and the item above; neither is
-  needed at the scale measured in the previous section.
+  than by in-flight queries. The h2 upstream client is the exception — its
+  queries multiplex onto one connection — but a worker is still held for the
+  round trip. Async upstream I/O, or several UDP reader threads behind
+  `SO_REUSEPORT`, would lift both this and the item above; neither is needed at
+  the scale measured in the previous section.
 - No per-client rules, no query log database, no web or API surface. Statistics
   go to the log every five minutes; there is no metrics endpoint to scrape.
 - Configuration is read once at startup; there is no reload signal yet.
@@ -468,19 +534,21 @@ number of servers.
 ## Layout
 
 ```
+src/main/      entry point: arguments, startup order, signals, maintenance loop
 src/dns/       message codec: names, compression, records, EDNS, TTL patching
 src/yaml/      YAML subset parser and typed accessors
 src/config/    configuration schema, loading and validation
 src/filter/    sink-list matching and list-format parsers
 src/cache/     LRU answer cache
 src/dnssec/    validation: canonical form, signatures, NSEC/NSEC3, chain of trust
-src/upstream/  transports (UDP/TCP/DoT/DoH), pooling, strategies, HTTP client
+src/upstream/  transports (UDP/TCP/DoT/DoH), pooling, strategies, HTTP/1.1 and h2 clients
 src/server/    resolver, listeners, DoH endpoint, list refresh
 src/h2/        HTTP/2 framing, HPACK, and the server connection state machine
 src/tlsx/      OpenSSL bindings and a small TLS wrapper
 src/pool/      worker pool
 src/logx/      logging
-src/itest/     integration suite: harness, mock upstream, clients, fixtures
+src/itest/     integration suite: harness, mock upstreams (DNS, HTTP, DoH/h2), clients, fixtures
+bench/         benchmark harness and DNSSEC survey, in Go, with committed results
 ```
 
 Two worker pools run underneath: one answering queries, one dedicated to racing
@@ -491,14 +559,23 @@ get a thread each instead, capped by `server.max_connections`.
 
 ## Testing
 
-Two layers, both run by `mise run verify`.
+Two layers, both run by `mise run verify`. A third, `mise run bench`, measures
+rather than asserts: it is where every number in [Capacity](#capacity) comes
+from, and it is documented in [`bench/README.md`](bench/README.md).
 
-**Unit tests** (`mise run test`, 96 cases) cover the message codec — round trips
+**Unit tests** (`mise run test`, 138 cases) cover the message codec — round trips
 for every modelled RDATA type, compression, truncation, EDNS, pointer loops,
 hostile record counts — plus the YAML parser, configuration loading, list
 parsing and matching, the cache, and the HTTP/2 codec — the HPACK cases run the
 worked examples from RFC 7541 appendix C, so the codec is checked against the
 specification's own vectors rather than against itself.
+
+They run per package, so a failure names one: `dns` 14, `yaml` 9, `config` 8,
+`filter` 8, `cache` 10, `dnssec` 32, `tlsx` 4, `upstream` 12, `h2` 28,
+`server` 13. Much of `tlsx`, `upstream`, `h2` and `server` is what the suite
+grew for the bugs recorded below — the HTTP reader's framing and body limits,
+the TLS handshake retry, the HTTP/2 stream table under RST_STREAM, and the DoH
+request parser read against an allocator that scribbles over what it releases.
 
 The DNSSEC cases work the same way. `src/dnssec/fixtures_test.odin` holds real
 signed traffic captured from a public resolver: the root and `com` signed with
@@ -517,7 +594,7 @@ denial is checked against, and a response built to make one question cost as man
 upstream lookups as possible. Each was checked against the code as it stood
 before the fix, so they are known to fail when the property they guard does.
 
-**Integration tests** (`mise run itest`, 128 cases, ~20s) start the built binary
+**Integration tests** (`mise run itest`, 132 cases, ~25s) start the built binary
 as a separate process against scripted mock upstreams, so what is exercised is
 the artefact that ships rather than the library it was compiled from. The suite
 is hermetic: no public resolver is contacted, ports are allocated from a private
@@ -534,10 +611,12 @@ What it covers:
 
 | area | cases |
 |---|---|
-| command line | `--version`, `--help`, `--check` accepting and rejecting configs, error text and line numbers, the shipped example config |
+| command line | `--version`, `--help`, `--check` accepting and rejecting configs, error text and line numbers, a DoT listener with no certificate, the shipped example config |
+| shutdown | `SIGTERM` produces an orderly exit rather than a killed process |
 | wire format | all 23 captured fixtures replayed and compared byte for byte, EDNS forwarding, 0x20 case preservation, truncation and the TC bit, FORMERR / NOTIMP / silent-drop handling |
 | listeners | UDP, TCP (single and pipelined), DoT, DoH POST and GET, keep-alive, 404 / 405 / 415 / 400 |
 | DoH over HTTP/2 | ALPN selection, POST and GET, Huffman-coded headers, CONTINUATION, concurrent streams proved parallel by timing, flow control with a tiny window, DATA splitting for a 27 KiB answer, PING, RST_STREAM, error statuses, HTTP/1.1 fallback |
+| DoH upstreams | a query resolved over an h2 upstream, one connection multiplexed across queries rather than reopened, fallback to HTTP/1.1 when the upstream does not offer h2 |
 | blocking | all five response modes, hosts vs domains vs adblock semantics, allow precedence, wildcards, modifiers, dnsmasq syntax, unusable rules, case folding |
 | rewrites | A, AAAA, CNAME, wildcard scope, `block`, NODATA for unmatched types |
 | cache | hits avoid the upstream, TTL countdown, cross-transport reuse, question re-casing, negative caching, key separation by type |
@@ -552,20 +631,63 @@ the client receives against the bytes the upstream sent. Generating the fixtures
 with elodin's own encoder instead would let a codec bug agree with itself and
 still pass.
 
-**Against live DNS**, by hand, because neither layer can prove the absence of
-false failures: 122 real domains asked through elodin with validation on and
-asked again of a validating resolver, comparing both the rcode and the AD bit.
-No false failure, and the same authenticated/unauthenticated verdict on 120 of
-the 122 — the two that differ are `pir.org` and `comcast.net`, both signed with
-RSA/SHA-1, which this machine's OpenSSL refuses to check at all. The four
-deliberately broken zones (`dnssec-failed.org`, `brokendnssec.net`,
-`sigfail.verteiltesysteme.net` and one bad-signature name) are refused, matching
-the reference resolver.
+**Against live DNS**, because neither layer can prove the absence of false
+failures — both work from fixtures, so both can show that a forged answer is
+refused and neither can show that validation leaves working names working. A
+validator that refused everything would pass the entire suite.
+
+`go run ./cmd/bench -survey 9.9.9.9:53` from `bench/` asks every name in
+`bench/domains.txt` through elodin with validation on, asks a reference
+validating resolver the same thing, and compares the rcode and the AD bit. The
+run in `bench/results/2026-08-03-dnssec-survey.md` covers 129 names: no false
+failure, all four deliberately broken zones (`dnssec-failed.org`,
+`brokendnssec.net`, `sigfail.verteiltesysteme.net`, `rhybar.cz`) refused, and
+the same verdict as the reference on 120 of the 125 that are meant to resolve.
+
+The five that differ — `cmu.edu`, `comcast.net`, `pir.org`, `afilias.info` and
+`kisa.or.kr` — come back served but without the AD bit, and every one of them is
+signed with DNSSEC algorithm 5 or 7, RSA/SHA-1, which this machine's OpenSSL
+refuses to compute under the Fedora crypto policy. That is the downgrade the
+DNSSEC section describes, measured: a fact about the host rather than the zone,
+and the safe direction to fail in.
 
 ### Bugs worth recording
 
 Every one of these was invisible to the unit tests:
 
+- **A response with no framing at all could take as much memory as the peer
+  liked.** Four paths read a body — no content, chunked, `Content-Length`, and
+  read-to-end — and the last was the one with no size limit on it, while the
+  header scan stops at 64 KB and the other two check `MAX_HTTP_BODY`. Omitting
+  both headers was the obvious way in; the other was a `Content-Length` that
+  parses but cannot be a length, since `-1` slipped past the `== 0` and `> 0`
+  cases and landed on the same unbounded reader, so the limit guarding the
+  ordinary case sat inside a branch it never reached. The final copy doubles the
+  peak. Reachable from blocklist downloads, which run at startup and on every
+  refresh, and from a DoH upstream that ALPN resolved to HTTP/1.1.
+- **A reset HTTP/2 stream nobody owned was never retired.** `RST_STREAM` marked
+  a stream cancelled and left it in the table. Only `respond` retires a stream
+  and it runs for dispatched streams alone, so one reset between its headers and
+  a body that never came was held for the life of the connection — with its
+  parked request and one of the `MAX_CONCURRENT` slots. Two frames per stream
+  and a peer wedges the connection. Retiring unconditionally would break the
+  other half, since `respond` reads `cancelled` off the stream to skip its
+  answer; `Stream.dispatched` splits the two, so a reset closes what nobody was
+  given and leaves the rest to `respond`.
+- **A handshake the peer reset counted as a dead upstream.** Quad9 resets a
+  share of TLS handshakes partway through while the very next attempt goes
+  through — measured from one network at about 22% of fresh connections, of
+  which a single retry rescued two thirds. Three in a row park the upstream for
+  the cooldown, sending every query to the fallback for ten seconds. OpenSSL
+  leaves its error queue empty for these, because nothing about the protocol
+  went wrong — the socket died — so the log said only `Handshake_Failed: no
+  OpenSSL error recorded`. `SSL_get_error` and `errno` are read at the point of
+  failure now, which both names the cause and tells a reset apart from a timeout
+  or a rejected certificate. Only the reset is retried: it comes back in a round
+  trip, where a timeout has already spent the caller's budget and a bad
+  certificate will not improve on a second look. A pause before the retry was
+  measured and did not help, so there is none. DoT and every HTTPS upstream —
+  HTTP/1.1, h2 and the bootstrap resolver — share the one path.
 - **A malformed query was answered with someone else's transaction ID.**
   `error_response` picked its fallback on whether the encoder objected, and it
   never does: a query that failed to decode arrives as an empty message, and an

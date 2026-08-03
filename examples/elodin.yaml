@@ -41,7 +41,7 @@ listeners:
     port: 853
     cert_file: certs/cert.pem
     key_file: certs/key.pem
-  # DNS-over-HTTPS. Served over HTTP/1.1.
+  # DNS-over-HTTPS. Served over HTTP/2 or HTTP/1.1, chosen by ALPN.
   doh:
     enabled: false
     address: "0.0.0.0"
