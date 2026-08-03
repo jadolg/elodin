@@ -58,6 +58,11 @@ depends = ["prepare"]
 # transport and 38 KB of binary, measured with `mise run bench -only cpu`.
 run = "odin build src/main -out:bin/elodin -collection:elodin=src -o:speed -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES"
 
+[tasks.deb]
+description = "Build a .deb from the optimised binary (dist/)"
+depends = ["release"]
+run = "packaging/build-deb.sh"
+
 [tasks.check]
 description = "Type-check every package without emitting a binary"
 run = "odin check src/main -collection:elodin=src -vet -strict-style"

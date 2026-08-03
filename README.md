@@ -102,11 +102,37 @@ two families it actually uses.
 
 A published GitHub release carries a `linux-amd64` and a `linux-arm64` tarball
 built by `.github/workflows/release.yml`, each holding the optimised binary, the
-unit file and the example configuration. Both are built natively, on a runner of
-the architecture they target, because elodin binds the system libssl and
-libcrypto and cross-compiling would mean carrying a sysroot for each. CI runs
-`mise run check` once and `mise run test` and `mise run itest` on both
-architectures, on every push and pull request.
+unit file and the example configuration, and a `.deb` of the same binary for
+each architecture. Both are built natively, on a runner of the architecture they
+target, because elodin binds the system libssl and libcrypto and
+cross-compiling would mean carrying a sysroot for each. CI runs `mise run check`
+once and `mise run test` and `mise run itest` on both architectures, on every
+push and pull request.
+
+### From a .deb
+
+```sh
+sudo apt install ./elodin_0.2.0-1_amd64.deb
+sudo systemctl enable --now elodin
+```
+
+The binary lands at `/usr/bin/elodin`, the unit at
+`/usr/lib/systemd/system/elodin.service`, and `examples/elodin.yaml` at
+`/etc/elodin/elodin.yaml` as a conffile — dpkg keeps your edits across upgrades
+and asks before replacing them. The install enables nothing and starts nothing:
+elodin wants port 53, and on a machine that installs Debian packages that port
+is usually systemd-resolved's, so starting it there would fail the installation
+over a conflict only you can settle. `apt purge` removes the configuration, the
+blocklist cache and the state directory.
+
+`mise run deb` builds one from a checkout into `dist/`, for the architecture of
+the machine that runs it. The script behind it, `packaging/build-deb.sh`,
+assembles the archive with `dpkg-deb` instead of debhelper and a `debian/`
+directory: the package is a binary, a unit file and a configuration file, and it
+is published to a personal apt repository rather than to Debian, so nothing
+downstream reads what that machinery produces. The one unit file serves both
+routes — the script rewrites `ExecStart` to `/usr/bin`, since a package may not
+write to `/usr/local`.
 
 ### Privileges
 
@@ -690,6 +716,7 @@ src/logx/      logging
 src/privdrop/  giving up root once the listeners hold their ports
 src/itest/     integration suite: harness, mock upstreams (DNS, HTTP, DoH/h2), clients, fixtures
 bench/         benchmark harness and DNSSEC survey, in Go, with committed results
+packaging/     systemd unit and the .deb build script
 ```
 
 Two worker pools run underneath: one answering queries, one dedicated to racing

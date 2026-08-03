@@ -60,7 +60,27 @@ jobs:
           cp README.md "$stage"/
           tar -czf "$stage.tar.gz" "$stage"
 
-      - name: Upload release asset
+      # The same binary, packaged for the distributions that can install one.
+      # Built after the tarball so both name the identical file.
+      - name: Package .deb
+        run: packaging/build-deb.sh ${{ github.event.release.tag_name }} ${{ matrix.arch }}
+
+      # A package that installs on the runner is a weak test — it is the
+      # distribution the binary was built on — but it is the one that catches
+      # a broken maintainer script or an unsatisfiable dependency before a
+      # user does, and it costs a few seconds.
+      - name: Install the .deb
+        run: |
+          sudo apt-get install -y ./dist/elodin_*_${{ matrix.arch }}.deb
+          /usr/bin/elodin --version
+          systemd-analyze verify /usr/lib/systemd/system/elodin.service
+          sudo apt-get purge -y elodin
+
+      - name: Upload release assets
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload ${{ github.event.release.tag_name }} elodin-${{ github.event.release.tag_name }}-linux-${{ matrix.arch }}.tar.gz --clobber
+        run: |
+          gh release upload ${{ github.event.release.tag_name }} \
+            elodin-${{ github.event.release.tag_name }}-linux-${{ matrix.arch }}.tar.gz \
+            dist/elodin_*_${{ matrix.arch }}.deb \
+            --clobber
