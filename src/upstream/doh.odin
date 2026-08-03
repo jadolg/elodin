@@ -196,6 +196,13 @@ fetch_url :: proc(
 	err: Error,
 ) {
 	current := url
+	// What the operator configured, which is what every later hop is judged
+	// against - rather than the hop before it, so a chain cannot walk itself
+	// down one step at a time.
+	origin_scheme: string
+	origin_public: bool
+	have_origin := false
+
 	for _ in 0 ..< 5 {
 		scheme, host, path, port, host_only, purl_ok := split_http_url(current)
 		if !purl_ok {
@@ -205,6 +212,14 @@ fetch_url :: proc(
 		addr, resolved := resolve_address(host_only, bootstrap)
 		if !resolved {
 			return nil, .Not_Resolved
+		}
+
+		if !have_origin {
+			origin_scheme = scheme
+			origin_public = address_is_public(addr)
+			have_origin = true
+		} else if !redirect_allowed(origin_scheme, origin_public, scheme, addr) {
+			return nil, .HTTP_Error
 		}
 		endpoint := net.Endpoint {
 			address = addr,
@@ -255,4 +270,90 @@ fetch_url :: proc(
 		}
 	}
 	return nil, .HTTP_Error
+}
+
+/*
+Whether a redirect may be followed.
+
+Judged against the URL the operator configured rather than against the previous
+hop, so a chain cannot walk itself down one step at a time.
+*/
+@(private)
+redirect_allowed :: proc(origin_scheme: string, origin_public: bool, scheme: string, addr: net.Address) -> bool {
+	// TLS the operator asked for is not a redirect's to drop. The certificate
+	// checking below is sound, but it only applies to a hop that still uses it.
+	if origin_scheme == "https" && scheme != "https" {
+		return false
+	}
+	/*
+	A list host on the public internet has no business moving the fetch onto an
+	address only this machine can reach: that is the shape of an SSRF, and a
+	resolver sits somewhere with a view of a network the list author does not
+	have. An operator who configured such an address to begin with plainly meant
+	it - a local mirror is an ordinary thing to run - and is left alone.
+	*/
+	if origin_public && !address_is_public(addr) {
+		return false
+	}
+	return true
+}
+
+/*
+Whether an address is one a fetch that started on the public internet may be
+redirected to.
+
+Loopback, link-local, the private ranges and the rest of the reserved space are
+not places a public list host has any business naming.
+*/
+@(private)
+address_is_public :: proc(addr: net.Address) -> bool {
+	switch a in addr {
+	case net.IP4_Address:
+		switch {
+		case a[0] == 0:
+			return false // 0.0.0.0/8
+		case a[0] == 10:
+			return false // 10.0.0.0/8
+		case a[0] == 127:
+			return false // loopback
+		case a[0] == 100 && a[1] >= 64 && a[1] <= 127:
+			return false // carrier-grade NAT, 100.64.0.0/10
+		case a[0] == 169 && a[1] == 254:
+			return false // link-local
+		case a[0] == 172 && a[1] >= 16 && a[1] <= 31:
+			return false // 172.16.0.0/12
+		case a[0] == 192 && a[1] == 168:
+			return false // 192.168.0.0/16
+		case a[0] >= 224:
+			return false // multicast and the reserved space above it
+		}
+		return true
+
+	case net.IP6_Address:
+		w: [8]u16
+		for v, i in a {
+			w[i] = u16(v)
+		}
+		/*
+		An IPv4-mapped or IPv4-compatible address is judged as the IPv4 address
+		it carries, so the ranges above cannot be reached by spelling them this
+		way instead. `::` and `::1` fall out of the same branch, both carrying a
+		v4 part inside 0.0.0.0/8.
+		*/
+		if w[0] == 0 && w[1] == 0 && w[2] == 0 && w[3] == 0 && w[4] == 0 && (w[5] == 0xffff || w[5] == 0) {
+			mapped: net.Address = net.IP4_Address{u8(w[6] >> 8), u8(w[6]), u8(w[7] >> 8), u8(w[7])}
+			return address_is_public(mapped)
+		}
+		switch {
+		case w[0] & 0xfe00 == 0xfc00:
+			return false // unique local, fc00::/7
+		case w[0] & 0xffc0 == 0xfe80:
+			return false // link-local, fe80::/10
+		case w[0] & 0xff00 == 0xff00:
+			return false // multicast
+		}
+		return true
+	}
+	// No address at all is not an address a redirect may name.
+	return false
 }

@@ -1,6 +1,7 @@
 package upstream
 
 import "base:runtime"
+import "core:fmt"
 import "core:mem"
 import "core:net"
 import "core:os"
@@ -1174,5 +1175,147 @@ test_https_handshake_reset_by_the_peer_is_retried :: proc(t: ^testing.T) {
 	thread.join(mock_thread)
 	testing.expect_value(t, sync.atomic_load(&m.resets), 1)
 	testing.expect_value(t, sync.atomic_load(&m.accepted), 1)
+	free_all(context.temp_allocator)
+}
+
+/*
+A redirect may not drop the TLS the operator asked for, nor move a fetch that
+started on the public internet onto an address only this machine can reach.
+
+`split_http_url` restricting the scheme to http or https was the only filter on
+a redirect target, so `Location: http://…` silently undid the transport the
+operator configured - and blocklists decide what gets *blocked*, so the
+interesting tampering is removal, which produces no visible failure.
+*/
+@(test)
+test_address_is_public_classifies_reserved_ranges :: proc(t: ^testing.T) {
+	Case :: struct {
+		text:   string,
+		public: bool,
+	}
+	CASES := []Case {
+		{"8.8.8.8", true},
+		{"1.1.1.1", true},
+		{"0.0.0.0", false},
+		{"10.1.2.3", false},
+		{"127.0.0.1", false},
+		{"100.64.0.1", false},
+		// The address a cloud metadata service answers on.
+		{"169.254.169.254", false},
+		{"172.16.0.1", false},
+		{"172.31.255.255", false},
+		// Just outside the private range, and ordinary public space.
+		{"172.32.0.1", true},
+		{"192.168.1.1", false},
+		{"224.0.0.1", false},
+		{"2606:4700:4700::1111", true},
+		{"::1", false},
+		{"fe80::1", false},
+		{"fd00::1", false},
+		{"ff02::1", false},
+		// Reserved ranges spelled as IPv4-mapped IPv6 are still reserved.
+		{"::ffff:127.0.0.1", false},
+		{"::ffff:8.8.8.8", true},
+	}
+	for c in CASES {
+		addr := net.parse_address(c.text)
+		if addr == nil {
+			testing.expectf(t, false, "%q did not parse as an address", c.text)
+			continue
+		}
+		testing.expectf(t, address_is_public(addr) == c.public, "%q: expected public=%v", c.text, c.public)
+	}
+	// Nothing at all is not somewhere a redirect may name.
+	testing.expect(t, !address_is_public(nil), "a nil address was treated as public")
+}
+
+@(test)
+test_redirect_allowed_refuses_downgrade_and_retarget :: proc(t: ^testing.T) {
+	Case :: struct {
+		origin_scheme: string,
+		origin_public: bool,
+		scheme:        string,
+		addr:          string,
+		allowed:       bool,
+		what:          string,
+	}
+	CASES := []Case {
+		{"https", true, "https", "8.8.8.8", true, "https staying https"},
+		{"https", true, "http", "8.8.8.8", false, "https downgraded to http"},
+		{"http", true, "https", "8.8.8.8", true, "http upgraded to https"},
+		{"http", true, "http", "8.8.8.8", true, "http staying http"},
+		{"https", true, "https", "127.0.0.1", false, "a public origin retargeted at loopback"},
+		{"https", true, "https", "169.254.169.254", false, "a public origin retargeted at link-local"},
+		// An operator who configured a local mirror meant it.
+		{"http", false, "http", "127.0.0.1", true, "a local mirror redirecting locally"},
+		{"https", false, "https", "10.0.0.1", true, "a private origin staying private"},
+	}
+	for c in CASES {
+		addr := net.parse_address(c.addr)
+		if addr == nil {
+			testing.expectf(t, false, "%q did not parse as an address", c.addr)
+			continue
+		}
+		got := redirect_allowed(c.origin_scheme, c.origin_public, c.scheme, addr)
+		testing.expectf(t, got == c.allowed, "%s: expected allowed=%v, got %v", c.what, c.allowed, got)
+	}
+}
+
+// And the ordinary case still works: a redirect that keeps the operator's
+// scheme and stays where it was pointed is followed to the end.
+@(test)
+test_redirect_within_the_configured_scheme_is_followed :: proc(t: ^testing.T) {
+	dest, derr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if derr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", derr)
+		return
+	}
+	dest_bound, dberr := net.bound_endpoint(dest)
+	if dberr != nil {
+		net.close(dest)
+		testing.expectf(t, false, "cannot read the destination's port: %v", dberr)
+		return
+	}
+	origin, oerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if oerr != nil {
+		net.close(dest)
+		testing.expectf(t, false, "cannot listen on loopback: %v", oerr)
+		return
+	}
+	origin_bound, oberr := net.bound_endpoint(origin)
+	if oberr != nil {
+		net.close(dest)
+		net.close(origin)
+		testing.expectf(t, false, "cannot read the origin's port: %v", oberr)
+		return
+	}
+
+	dest_mock := Http_Mock {
+		listener = dest,
+		reply    = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nrules",
+	}
+	origin_mock := Http_Mock {
+		listener = origin,
+		reply    = fmt.tprintf(
+			"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:%d/list.txt\r\nContent-Length: 0\r\n\r\n",
+			dest_bound.port,
+		),
+	}
+	dest_server := thread.create_and_start_with_poly_data(&dest_mock, http_mock_once)
+	origin_server := thread.create_and_start_with_poly_data(&origin_mock, http_mock_once)
+
+	url := fmt.tprintf("http://127.0.0.1:%d/list.txt", origin_bound.port)
+	body, ferr := fetch_url(url, nil, 5 * time.Second, context.temp_allocator)
+
+	// Joined before the arena the replies live in is reset.
+	thread.join(origin_server)
+	thread.destroy(origin_server)
+	thread.join(dest_server)
+	thread.destroy(dest_server)
+	net.close(origin)
+	net.close(dest)
+
+	testing.expectf(t, ferr == .None, "an in-scheme redirect was refused: %v", ferr)
+	testing.expect_value(t, string(body), "rules")
 	free_all(context.temp_allocator)
 }
