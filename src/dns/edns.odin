@@ -134,9 +134,17 @@ find_opt_span :: proc(msg: []u8) -> (span: Opt_Span, ok: bool) {
 		return {}, false
 	}
 	qdcount := int(u16(msg[4]) << 8 | u16(msg[5]))
-	total := int(u16(msg[6]) << 8 | u16(msg[7]))
-	total += int(u16(msg[8]) << 8 | u16(msg[9]))
-	total += int(u16(msg[10]) << 8 | u16(msg[11]))
+	/*
+	Only the additional section is looked in, because that is the only section
+	`find_opt` looks in. A record of type OPT anywhere else is not the message's
+	EDNS record and editing it would leave the reader and the writer working on
+	different bytes - the option the reader sees left standing, and a record it
+	never consults quietly rewritten. A client can put one in its answer section
+	for the asking.
+	*/
+	before := int(u16(msg[6]) << 8 | u16(msg[7]))
+	before += int(u16(msg[8]) << 8 | u16(msg[9]))
+	arcount := int(u16(msg[10]) << 8 | u16(msg[11]))
 
 	pos := HEADER_SIZE
 	for _ in 0 ..< qdcount {
@@ -146,7 +154,7 @@ find_opt_span :: proc(msg: []u8) -> (span: Opt_Span, ok: bool) {
 			return {}, false
 		}
 	}
-	for _ in 0 ..< total {
+	for i in 0 ..< before + arcount {
 		pos = skip_name(msg, pos) or_return
 		if pos + 10 > len(msg) {
 			return {}, false
@@ -158,7 +166,7 @@ find_opt_span :: proc(msg: []u8) -> (span: Opt_Span, ok: bool) {
 		if rd_end > len(msg) {
 			return {}, false
 		}
-		if rtype == .OPT {
+		if rtype == .OPT && i >= before {
 			return Opt_Span {
 					rdlen_pos = pos + 8,
 					rd_start = rd_start,

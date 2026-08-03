@@ -240,9 +240,27 @@ resolve_query :: proc(
 	wanted, are ours to negotiate separately.
 	*/
 	if cookie.verdict != .Absent {
-		if stripped, done := dns.remove_edns_option(forwarded, .Cookie, allocator); done {
-			forwarded = stripped
+		stripped, done := dns.remove_edns_option(forwarded, .Cookie, allocator)
+		if !done {
+			/*
+			Failing closed. A query this server cannot take the cookie back out
+			of is not one to send on: forwarding it anyway would hand the
+			client's secret to the upstream, which is the one outcome this whole
+			block exists to prevent. Losing the answer is the cheaper mistake,
+			and the client is told so rather than left waiting.
+			*/
+			sync.atomic_add(&s.stats.failed, 1)
+			out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
+			logx.warnf(
+				"could not strip the client cookie from %s %s from %s; not forwarding",
+				dns.type_name(q.type),
+				dns.name_trim_root(q.name),
+				client,
+			)
+			log_query(s, client, proto, q, .Failed, "cookie", started)
+			return out, .Failed, built
 		}
+		forwarded = stripped
 	}
 
 	resp, winner, uerr := upstream.resolve(s.group, forwarded, allocator)
