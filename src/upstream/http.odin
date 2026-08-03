@@ -125,8 +125,8 @@ index_crlf :: proc(b: []u8) -> int {
 @(private)
 reader_exact :: proc(r: ^Buf_Reader, n: int) -> (data: []u8, err: Error) {
 	// A count no read can satisfy. Falling through would step the cursor
-	// backwards and return a slice ending before it starts, which a release
-	// build compiles without the bounds check that catches it here.
+	// backwards and return a slice ending before it starts; the bounds check
+	// behind that is a crash a peer can reach, so refuse it as an error here.
 	if n < 0 {
 		return nil, .HTTP_Error
 	}

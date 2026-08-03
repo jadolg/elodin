@@ -111,7 +111,10 @@ over within a second of starting. Everything after that — DNS wire data, HTTP/
 frames, TLS records — is parsing input that came off the network, and it runs
 for the life of the process. A resolver that is still root while doing that
 turns any single bug in that code into a root compromise rather than the loss of
-one service account, and `mise run release` builds with `-no-bounds-check`.
+one service account. The release build keeps bounds checks on, so a missed guard
+in a parser is a crash rather than a write at an offset the peer chose — but a
+bounds check is the last line, not the only one, and it does nothing for the
+classes of bug it cannot see.
 
 There are two ways not to be root, and either is enough:
 
@@ -804,9 +807,10 @@ Every one of these was invisible to the unit tests:
   negative on the way into `int`, passed a body-size guard written as
   `len(out) + int(size) > MAX`, and asked the reader for a slice ending before it
   started — with the cursor left negative for everything after it. The release
-  build compiles bounds checks out, so this was an out-of-bounds access at an
-  offset the peer chose, reachable from any DoH upstream speaking HTTP/1.1 and
-  from any blocklist served over plain HTTP.
+  build compiled bounds checks out at the time, so this was an out-of-bounds
+  access at an offset the peer chose, reachable from any DoH upstream speaking
+  HTTP/1.1 and from any blocklist served over plain HTTP. It is what decided the
+  release build should keep its bounds checks.
 - **An algorithm we could not check made a signed RRset unsigned.** Once a zone
   is established as secure, an RRset in it carrying only signatures we cannot
   verify was reported insecure rather than bogus — the verdict was returned

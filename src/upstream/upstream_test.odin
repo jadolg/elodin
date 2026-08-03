@@ -429,8 +429,9 @@ A chunk size too large to be an int must be refused, not narrowed.
 `strconv.parse_u64_of_base` has no overflow check: it wraps and still reports
 success, so a header of sixteen `F`s parses cleanly and turns negative on the
 way into `int`. A negative count slips past the body-size guard, walks the
-reader's position backwards and asks for a slice whose end precedes its start —
-which a release build, compiled with bounds checks off, hands out.
+reader's position backwards and asks for a slice whose end precedes its start.
+The release build's bounds checks would now stop that, by killing the process a
+peer can reach; refusing the size is how it stays an error instead.
 */
 @(test)
 test_chunk_size_too_large_is_refused :: proc(t: ^testing.T) {

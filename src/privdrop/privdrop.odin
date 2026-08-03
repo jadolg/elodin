@@ -6,8 +6,8 @@ startup. Everything after that — parsing DNS wire data, HTTP/2 frames and TLS
 records straight off the network — is exactly the code an attacker gets to
 reach, and it runs for the life of the process. Staying root through all of it
 means any single memory bug in that surface is a root compromise rather than a
-compromise of one service account, and the release build is compiled with
-`-no-bounds-check`.
+compromise of one service account. The release build keeps bounds checks on,
+which catches one class of that surface's bugs and no others.
 
 `packaging/elodin.service` already avoids the problem by never being root:
 systemd binds the port through `AmbientCapabilities` and runs the process under
