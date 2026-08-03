@@ -24,6 +24,19 @@ server:
   # `workers * 8`, which keeps the backlog to about eight upstream round trips
   # whatever the worker count.
   max_pending: 0
+  # Account to switch to once the listeners have bound. Binding port 53 is the
+  # only privileged thing elodin does; everything after it parses data that came
+  # off the network, so if you start it as root, name an account here and it
+  # will not still be root by the time the first query arrives. A user name or a
+  # numeric uid; group defaults to the user's primary group. Empty leaves the
+  # process as it started, which is what you want under the systemd unit — that
+  # never runs as root in the first place.
+  #
+  #   sudo useradd --system --no-create-home --shell /usr/sbin/nologin elodin
+  #   sudo chown -R elodin:elodin /var/cache/elodin
+  #
+  user: ""
+  group: ""
 
 listeners:
   udp:

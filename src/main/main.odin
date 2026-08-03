@@ -11,6 +11,7 @@ import "elodin:config"
 import "elodin:filter"
 import "elodin:logx"
 import "elodin:pool"
+import "elodin:privdrop"
 import "elodin:server"
 import "elodin:upstream"
 
@@ -132,6 +133,27 @@ main :: proc() {
 	}
 	defer logx.shutdown()
 
+	/*
+	Resolved here rather than where it is used, so a name nobody has an account
+	for is a startup error instead of a process that comes up, takes port 53 and
+	only then finds it has nowhere to go. It also puts the account under
+	`--check`, which is where an operator looks before restarting a resolver.
+	*/
+	service: privdrop.Identity
+	if cfg.server.user != "" {
+		err: privdrop.Error
+		service, err = privdrop.resolve(cfg.server.user, cfg.server.group)
+		if err != .None {
+			fmt.eprintfln(
+				"elodin: server.user %q / server.group %q is not usable: %s",
+				cfg.server.user,
+				cfg.server.group,
+				privdrop.explain(err),
+			)
+			os.exit(1)
+		}
+	}
+
 	if opts.check_only {
 		fmt.printfln("%s is valid: %d upstreams, %d blocklists, %d rewrites",
 			opts.config_path, len(cfg.upstream.servers), len(cfg.blocking.lists), len(cfg.rewrites))
@@ -139,10 +161,10 @@ main :: proc() {
 	}
 
 	logx.infof("elodin %s starting", server.VERSION)
-	run(&cfg, opts)
+	run(&cfg, opts, service)
 }
 
-run :: proc(cfg: ^config.Config, opts: Options) {
+run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	handler_pool := pool.make_pool(cfg.server.workers)
 	race_pool := pool.make_pool(cfg.server.upstream_workers)
 
@@ -218,6 +240,8 @@ run :: proc(cfg: ^config.Config, opts: Options) {
 		server.destroy_listeners(&listeners)
 	}
 
+	drop_privileges(cfg, service)
+
 	logx.infof(
 		"ready: strategy=%v upstreams=%d cache=%v blocking=%v dnssec=%v",
 		cfg.upstream.strategy,
@@ -228,6 +252,55 @@ run :: proc(cfg: ^config.Config, opts: Options) {
 	)
 
 	maintenance_loop(&s, group, answers, cfg, opts)
+}
+
+/*
+Put root down now that the listeners hold their ports.
+
+This is the last moment a privilege is needed and the first moment it can go:
+binding below 1024 is the only thing on the way up that root was for, and
+everything from here on is parsing whatever arrives on those sockets. The
+sockets themselves are already open, so the process keeps serving on them
+whoever it becomes.
+
+The blocklist cache goes over first. It is the one path still opened by name
+afterwards - the lists were downloaded above, as root, and a refresh some hours
+later reopens them - so without this the cache would silently stop being
+written the moment its owner changed.
+
+A drop that was asked for and did not happen ends the process. Carrying on
+would leave it as root while the log said otherwise, which is worse than not
+starting.
+*/
+@(private)
+drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity) {
+	if cfg.server.user == "" {
+		if privdrop.is_root() {
+			logx.warnf(
+				"running as root and server.user is not set, so every query is parsed with full privileges;",
+			)
+			logx.warnf(
+				"  set server.user, or bind the port with 'setcap cap_net_bind_service=+ep' and start unprivileged",
+			)
+		}
+		return
+	}
+
+	if cfg.blocking.enabled && cfg.blocking.cache_dir != "" {
+		if !privdrop.hand_over(cfg.blocking.cache_dir, service) {
+			logx.warnf(
+				"could not give %q to %s; the lists are in effect but will be re-downloaded on each start",
+				cfg.blocking.cache_dir,
+				cfg.server.user,
+			)
+		}
+	}
+
+	if err := privdrop.apply(service); err != .None {
+		logx.errorf("cannot drop privileges to %s: %s", cfg.server.user, privdrop.explain(err))
+		os.exit(1)
+	}
+	logx.infof("running as %s (uid=%d gid=%d)", cfg.server.user, service.uid, service.gid)
 }
 
 /*

@@ -173,6 +173,8 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 	opt_int(l, n, "max_connections", &cfg.server.max_connections, "server")
 	opt_int(l, n, "max_pending", &cfg.server.max_pending, "server")
 	opt_duration(l, n, "client_timeout", &cfg.server.client_timeout, "server")
+	opt_string(l, n, "user", &cfg.server.user, "server")
+	opt_string(l, n, "group", &cfg.server.group, "server")
 }
 
 @(private)
@@ -777,6 +779,11 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	}
 	if cfg.server.max_pending == 0 {
 		cfg.server.max_pending = cfg.server.workers * 8
+	}
+	// A group on its own would read as a privilege drop that was configured,
+	// and nothing at all is what it would do.
+	if cfg.server.group != "" && cfg.server.user == "" {
+		errorf(l, "server.group is set without server.user, so no privileges would be dropped")
 	}
 	if cfg.upstream.attempts < 1 {
 		errorf(l, "upstream.attempts must be at least 1")

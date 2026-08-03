@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
+import "core:sys/posix"
 import "core:time"
 
 /*
@@ -153,6 +154,76 @@ run_cli_cases :: proc(r: ^Runner) {
 		check(r, strings.contains(res.output, "cert_file"), "the missing certificate was not reported")
 	}
 	end_case(r)
+
+	start_case(r, "cli: --check rejects a service account nobody has")
+	{
+		path := filepath.join({r.work_dir, "baduser.yaml"}, context.temp_allocator) or_else ""
+		_ = os.write_entire_file(
+			path,
+			transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\nserver:\n  user: elodin-no-such-user\n"),
+		)
+		res := new_check(r, path, "check-baduser")
+		check(r, res.exit_code != 0, "an unknown server.user exited 0")
+		check(r, strings.contains(res.output, "no such user"), "the unknown account was not reported: %q", res.output)
+	}
+	end_case(r)
+
+	start_case(r, "cli: --check rejects a group with no user")
+	{
+		path := filepath.join({r.work_dir, "groupalone.yaml"}, context.temp_allocator) or_else ""
+		_ = os.write_entire_file(
+			path,
+			transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\nserver:\n  group: elodin\n"),
+		)
+		res := new_check(r, path, "check-groupalone")
+		check(r, res.exit_code != 0, "server.group without server.user exited 0")
+		check(r, strings.contains(res.output, "server.group"), "the lone group was not reported: %q", res.output)
+	}
+	end_case(r)
+
+	/*
+	A drop that cannot happen has to stop the process.
+
+	The failure mode this guards is the quiet one: listeners up, log line saying
+	the server is ready, and the whole of the query path still running with
+	whatever privilege it started with. Asking an unprivileged process to become
+	root is the one way to provoke it without needing root to run the suite.
+	*/
+	if posix.geteuid() == 0 {
+		skip_case(r, "cli: a failed privilege drop stops the server", "running as root, so no drop can fail")
+	} else {
+		start_case(r, "cli: a privilege drop that cannot happen stops the server")
+		{
+			cfg := fmt.tprintf(
+				`log: {{ level: info }}
+listeners:
+  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
+  tcp: {{ enabled: false }}
+upstream:
+  servers: ["127.0.0.1:%d"]
+blocking: {{ enabled: false }}
+dnssec: {{ enabled: false }}
+server: {{ user: root }}
+`,
+				next_port(r),
+				next_port(r),
+			)
+			path := filepath.join({r.work_dir, "cannotdrop.yaml"}, context.temp_allocator) or_else ""
+			_ = os.write_entire_file(path, transmute([]u8)cfg)
+
+			res := run_binary(r, []string{"--config", path}, "cannot-drop")
+			if check(r, res.ok, "could not run the binary") {
+				check(r, res.exit_code != 0, "the server kept running after a failed drop")
+				check(
+					r,
+					strings.contains(res.output, "cannot drop privileges"),
+					"the failed drop was not reported: %q",
+					res.output,
+				)
+			}
+		}
+		end_case(r)
+	}
 
 	start_case(r, "cli: the shipped example config is valid")
 	{
