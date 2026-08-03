@@ -213,6 +213,20 @@ handle_query :: proc(
 
 	if s.cfg.cache.enabled {
 		if decoded, dec_err := dns.decode_message(resp, allocator); dec_err == .None {
+			/*
+			Settled before the entry goes in, rather than only on the way out to
+			this client.
+
+			`validating` is recomputed for every request and can be turned off
+			after the key is built - the upstream query failing to rebuild does
+			exactly that - so nothing otherwise ties the AD bit an entry carries
+			to whether that entry was ever validated. A later request that does
+			validate reads the stored bit as a verdict of ours and hands the
+			upstream's claim to a client under our name.
+			*/
+			if !validating {
+				set_ad_bit(resp, false)
+			}
 			cache.put(s.answers, key, resp, decoded)
 		}
 	}
