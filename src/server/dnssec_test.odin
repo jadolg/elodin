@@ -1,10 +1,13 @@
 package server
 
+import "core:net"
 import "core:testing"
+import "core:thread"
 import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:dnssec"
+import "elodin:upstream"
 
 /*
 The parts of the DNSSEC path that shape what the client sees.
@@ -366,5 +369,142 @@ test_formerr_for_an_unparseable_query_carries_its_id :: proc(t: ^testing.T) {
 	testing.expect(t, out[2] & 0x80 != 0, "the reply is not marked as a response")
 	testing.expect_value(t, out[3] & 0xf, u8(dns.Rcode.Form_Err))
 
+	free_all(context.temp_allocator)
+}
+
+/*
+An answer we did not check must not be stored carrying a claim that we did.
+
+`validating` is recomputed for every request, so nothing ties the AD bit an
+entry carries to whether that entry was ever validated. The two agree today only
+because the cache key carries CD and the class, which keeps the entries a
+non-validating request writes away from the requests that would trust them -
+an accident of the key rather than a property of the cache, and one that stops
+holding the moment `validating` is turned off after the key is built, as it is
+when the upstream query cannot be rebuilt.
+
+So the bit is settled before the entry goes in, and this drives the real store
+path to check it: a miss, forwarded to an upstream that sets AD, with CD on the
+client's query so no verdict of ours is ever reached.
+*/
+
+@(private = "file")
+Udp_Mock :: struct {
+	socket: net.UDP_Socket,
+	reply:  []u8,
+}
+
+@(private = "file")
+udp_mock_once :: proc(m: ^Udp_Mock) {
+	buf: [4096]u8
+	n, remote, err := net.recv_udp(m.socket, buf[:])
+	if err != nil || n < dns.HEADER_SIZE || len(m.reply) > len(buf) {
+		return
+	}
+	out: [4096]u8
+	copy(out[:], m.reply)
+	// Echo the query's transaction id, so the reply is matched to it.
+	out[0], out[1] = buf[0], buf[1]
+	_, _ = net.send_udp(m.socket, out[:len(m.reply)], remote)
+}
+
+@(test)
+test_unvalidated_answer_is_not_cached_with_ad :: proc(t: ^testing.T) {
+	// The answer as an upstream sent it, AD set. Nothing here established that.
+	from_upstream := signed_response()
+	from_upstream.flags.ad = true
+	reply, _, enc := dns.encode_message(from_upstream, context.temp_allocator)
+	testing.expect_value(t, enc, dns.Encode_Error.None)
+
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if serr != nil {
+		testing.expectf(t, false, "cannot bind the mock upstream: %v", serr)
+		return
+	}
+	defer net.close(socket)
+	bound, berr := net.bound_endpoint(socket)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the mock's port: %v", berr)
+		return
+	}
+
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.cache.enabled = true
+	cfg.dnssec.enabled = true
+	cfg.upstream.strategy = .Failover
+	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
+	servers[0] = config.Upstream_Spec {
+		name    = "mock",
+		kind    = .UDP,
+		address = "127.0.0.1",
+		port    = bound.port,
+	}
+	cfg.upstream.servers = servers
+
+	g, gerr := upstream.make_group(cfg.upstream, nil)
+	if gerr != .None {
+		testing.expectf(t, false, "cannot build the upstream group: %v", gerr)
+		return
+	}
+	defer upstream.destroy_group(g)
+
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
+	defer cache.destroy(answers)
+
+	s := Server {
+		cfg     = &cfg,
+		group   = g,
+		answers = answers,
+	}
+	// A validator that is never asked anything: CD below keeps it out of the way.
+	s.validator = dnssec.make_validator(nil, nil, dnssec.Options{})
+	defer dnssec.destroy_validator(s.validator)
+
+	// CD set, so `validating` is false and we reach no verdict of our own.
+	query := client_query(false, with_edns = false)
+	query.flags.cd = true
+	query_wire, _, qenc := dns.encode_message(query, context.temp_allocator)
+	testing.expect_value(t, qenc, dns.Encode_Error.None)
+
+	m := Udp_Mock {
+		socket = socket,
+		reply  = reply,
+	}
+	server := thread.create_and_start_with_poly_data(&m, udp_mock_once)
+	out, outcome, served := handle_query(&s, query_wire, .UDP, "test", context.temp_allocator)
+	// Joined here rather than deferred: the mock reads `reply` out of the scratch
+	// arena this test resets on its way out.
+	thread.join(server)
+	thread.destroy(server)
+
+	testing.expect(t, served, "no response was produced")
+	testing.expectf(t, outcome == .Forwarded, "expected the forwarded path, got %v", outcome)
+	// Already right, and the reason this went unnoticed: the client is told nothing.
+	testing.expect(
+		t,
+		len(out) >= dns.HEADER_SIZE && out[3] & 0x20 == 0,
+		"the upstream's AD bit reached the client as ours",
+	)
+
+	// What the entry carries is the point.
+	key_buf: [cache.KEY_MAX]u8
+	key := cache.make_key(
+		key_buf[:],
+		query.question[0].name,
+		query.question[0].type,
+		query.question[0].class,
+		dns.edns_do(query),
+		query.flags.cd,
+	)
+	stored, _, found := cache.get(answers, key, context.temp_allocator)
+	testing.expect(t, found, "the answer was not cached, so nothing was stored to check")
+	if found {
+		testing.expect(
+			t,
+			len(stored) >= dns.HEADER_SIZE && stored[3] & 0x20 == 0,
+			"an answer we never validated was cached carrying AD",
+		)
+	}
 	free_all(context.temp_allocator)
 }
