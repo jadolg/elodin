@@ -184,6 +184,17 @@ Http_Request :: struct {
 MAX_HTTP_BODY :: 64 * 1024 * 1024
 
 /*
+How many header fields — or trailer fields, which are read by the same loop —
+one response may carry.
+
+`reader_line` bounds a line at 64 KB but says nothing about how many lines
+follow, so a peer sending short fields forever was answered for as long as it
+kept the socket open. A hundred is well past what any list host or DoH resolver
+sends; the largest seen in practice is around twenty.
+*/
+MAX_HTTP_HEADERS :: 100
+
+/*
 Perform one request/response exchange on `stream`.
 
 The returned body is allocated from `allocator`; everything else borrows from
@@ -241,10 +252,15 @@ http_exchange :: proc(
 
 	content_length := -1
 	chunked := false
+	headers := 0
 	for {
 		line := reader_line(&r) or_return
 		if line == "" {
 			break
+		}
+		headers += 1
+		if headers > MAX_HTTP_HEADERS {
+			return resp, .HTTP_Error
 		}
 		name, value, ok := split_header(line)
 		if !ok {
@@ -359,11 +375,16 @@ read_chunked :: proc(r: ^Buf_Reader, allocator: mem.Allocator) -> (body: []u8, e
 			return nil, .HTTP_Error
 		}
 		if size == 0 {
-			// Trailers, then the final CRLF.
+			// Trailers, then the final CRLF. Counted like the headers they are.
+			trailers := 0
 			for {
 				trailer := reader_line(r) or_return
 				if trailer == "" {
 					break
+				}
+				trailers += 1
+				if trailers > MAX_HTTP_HEADERS {
+					return nil, .HTTP_Error
 				}
 			}
 			break
