@@ -64,3 +64,87 @@ jobs:
           install: true
           cache: true
       - run: mise run build
+
+  package:
+    name: Package (${{ matrix.arch }})
+    # Builds the .deb, installs it, and asks the installed service to resolve
+    # something. The takeover is accepted rather than declined: port 53 on the
+    # runner belongs to systemd-resolved, which is the machine the package is
+    # written for, so this is the install path a real one takes rather than a
+    # detour around the only interesting part of it.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install OpenSSL headers and a DNS client
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev dnsutils
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+
+      # The upstreams in the shipped configuration are DoT, so a runner that
+      # cannot reach 853 would fail the queries below for a reason that has
+      # nothing to do with the package. Finding that out here says which it is.
+      - name: Check egress to a DoT upstream
+        run: timeout 10 bash -c 'cat < /dev/null > /dev/tcp/1.1.1.1/853' && echo "853 reachable"
+
+      - run: mise run deb
+
+      # What the runner's resolver looked like before the package touched it,
+      # so the check after removal compares against what was actually there
+      # rather than against an assumption about how the image sets it up.
+      - name: Record the runner's resolver
+        run: |
+          {
+            stat -c '%F' /etc/resolv.conf
+            readlink /etc/resolv.conf || echo "(not a symlink)"
+            md5sum < /etc/resolv.conf
+          } | tee /tmp/resolv-before
+
+      - name: Install it
+        run: |
+          echo 'elodin elodin/takeover-dns boolean true' | sudo debconf-set-selections
+          sudo apt-get install -y ./dist/elodin_*_${{ matrix.arch }}.deb
+
+      - name: The takeover happened
+        run: |
+          test "$(systemctl is-active elodin)" = active
+          test "$(systemctl is-enabled elodin)" = enabled
+          test "$(systemctl is-enabled systemd-resolved)" = masked
+          grep -q '^nameserver 127\.0\.0\.1$' /etc/resolv.conf
+          # Started once and stayed up, rather than looping behind a postinst
+          # that only ever saw the exec succeed.
+          test "$(systemctl show elodin -p NRestarts --value)" = 0
+
+      - name: Resolve through the installed service
+        run: |
+          dig +short @127.0.0.1 example.com A | grep -qE '^[0-9]+\.'
+          dig +short +tcp @127.0.0.1 example.org A | grep -qE '^[0-9]+\.'
+          dig @127.0.0.1 cloudflare.com A +dnssec | grep -q 'flags:.* ad;'
+          dig @127.0.0.1 doubleclick.net A | grep -q 'status: NXDOMAIN'
+          # Not @127.0.0.1: this one goes through /etc/resolv.conf, so it only
+          # answers if the takeover pointed the machine at elodin properly.
+          getent hosts example.com
+
+      # Runs even when something above failed, so the runner is never left
+      # pointed at a resolver that is not answering.
+      - name: Remove it, and check the runner got its resolver back
+        if: always()
+        run: |
+          sudo apt-get remove -y elodin
+          test "$(systemctl is-active systemd-resolved)" = active
+          {
+            stat -c '%F' /etc/resolv.conf
+            readlink /etc/resolv.conf || echo "(not a symlink)"
+            md5sum < /etc/resolv.conf
+          } > /tmp/resolv-after
+          diff /tmp/resolv-before /tmp/resolv-after
+          getent hosts example.com

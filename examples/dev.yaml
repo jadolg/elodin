@@ -61,6 +61,9 @@ blocking:
     - name: steven-black
       url: https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
       format: hosts
+    - name: android-tracking
+      url: https://raw.githubusercontent.com/Perflyst/PiHoleBlocklist/master/android-tracking.txt
+      format: domains
   rules:
     - "||doubleclick.net^"
 

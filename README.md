@@ -100,13 +100,73 @@ provides the state, cache and configuration directories and nothing else on the
 filesystem is writable. `RestrictAddressFamilies=AF_INET AF_INET6` leaves it the
 two families it actually uses.
 
+`Restart=on-failure` covers a start that fails for a reason that passes, but
+`StartLimitBurst=5` over five minutes stops it retrying one that does not — a
+port it cannot have, a certificate it cannot read. The unit gives up in
+`failed`, where `systemctl status` and anything watching it will say so, rather
+than reporting `activating` forever and reloading the blocklists once every few
+seconds against a machine that has no resolver. `systemctl reset-failed elodin`
+clears that once the cause is dealt with.
+
 A published GitHub release carries a `linux-amd64` and a `linux-arm64` tarball
 built by `.github/workflows/release.yml`, each holding the optimised binary, the
-unit file and the example configuration. Both are built natively, on a runner of
-the architecture they target, because elodin binds the system libssl and
-libcrypto and cross-compiling would mean carrying a sysroot for each. CI runs
-`mise run check` once and `mise run test` and `mise run itest` on both
-architectures, on every push and pull request.
+unit file and the example configuration, and a `.deb` of the same binary for
+each architecture. Both are built natively, on a runner of the architecture they
+target, because elodin binds the system libssl and libcrypto and
+cross-compiling would mean carrying a sysroot for each. CI runs `mise run check`
+once and `mise run test` and `mise run itest` on both architectures, on every
+push and pull request.
+
+### From a .deb
+
+```sh
+sudo apt install ./elodin_0.2.0-1_amd64.deb
+```
+
+The binary lands at `/usr/bin/elodin`, the unit at
+`/usr/lib/systemd/system/elodin.service`, and `examples/elodin.yaml` at
+`/etc/elodin/elodin.yaml` as a conffile — dpkg keeps your edits across upgrades
+and asks before replacing them. `apt purge` removes the configuration, the
+blocklist cache and the state directory.
+
+The install asks one question, and it defaults to yes:
+
+> **Make elodin the system resolver?**
+
+Answering yes stops, disables and **masks** systemd-resolved, replaces
+`/etc/resolv.conf` with a real file naming `127.0.0.1` (carrying over any
+`search` domains from the old one), and enables and starts elodin. Masking as
+well as disabling matters: a later systemd upgrade would otherwise switch
+resolved back on and take port 53 at the next boot. elodin reaches its
+blocklists and upstreams through the `upstream.bootstrap` addresses rather than
+through the system resolver, so it does not depend on the resolver it is in the
+middle of replacing.
+
+Answering no installs elodin and leaves everything alone. `sudo dpkg-reconfigure
+elodin` asks again, so the decision is not one-way. For unattended installs,
+preseed it:
+
+```sh
+echo 'elodin elodin/takeover-dns boolean true' | sudo debconf-set-selections
+```
+
+Nothing is disabled until `elodin --check` has passed on the configuration the
+service will use, and if elodin then fails to stay up — a certificate it cannot
+read, a port it cannot have — the package puts systemd-resolved and the old
+`/etc/resolv.conf` back and fails the install rather than leaving a machine
+pointed at a resolver that is not answering. Removing the package restores them
+the same way, whichever answer was given, and `apt remove` is enough: it does
+not wait for `apt purge`, because a machine that has just lost its resolver
+needs the old one back immediately.
+
+`mise run deb` builds one from a checkout into `dist/`, for the architecture of
+the machine that runs it. The script behind it, `packaging/build-deb.sh`,
+assembles the archive with `dpkg-deb` instead of debhelper and a `debian/`
+directory: the package is a binary, a unit file and a configuration file, and it
+is published to a personal apt repository rather than to Debian, so nothing
+downstream reads what that machinery produces. The one unit file serves both
+routes — the script rewrites `ExecStart` to `/usr/bin`, since a package may not
+write to `/usr/local`.
 
 ### Privileges
 
@@ -690,6 +750,7 @@ src/logx/      logging
 src/privdrop/  giving up root once the listeners hold their ports
 src/itest/     integration suite: harness, mock upstreams (DNS, HTTP, DoH/h2), clients, fixtures
 bench/         benchmark harness and DNSSEC survey, in Go, with committed results
+packaging/     systemd unit and the .deb build script
 ```
 
 Two worker pools run underneath: one answering queries, one dedicated to racing
@@ -971,3 +1032,8 @@ Every one of these was invisible to the unit tests:
 Interoperability with a foreign HTTP/2 implementation is checked by hand with
 curl (which uses nghttp2): `curl --http2 -k -H 'content-type:
 application/dns-message' --data-binary @query.bin https://127.0.0.1:443/dns-query`.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Release tarballs and the .deb carry it too, the
+latter at `/usr/share/doc/elodin/copyright`.
