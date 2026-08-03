@@ -223,3 +223,31 @@ test_dot_upstream_hostname_alternatives_are_accepted :: proc(t: ^testing.T) {
 
 	free_all(context.temp_allocator)
 }
+
+@(test)
+test_service_account_is_read :: proc(t: ^testing.T) {
+	src := "upstream:\n  servers: [1.1.1.1]\nserver:\n  user: elodin\n  group: elodin\n"
+	cfg, err := load_string(src, context.temp_allocator)
+	testing.expect(t, err == nil, "a service account should load cleanly")
+	testing.expect_value(t, cfg.server.user, "elodin")
+	testing.expect_value(t, cfg.server.group, "elodin")
+
+	// Nothing configured is the historical behaviour: stay as started.
+	bare, berr := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	testing.expect(t, berr == nil, "a config without a service account should load")
+	testing.expect_value(t, bare.server.user, "")
+	testing.expect_value(t, bare.server.group, "")
+
+	free_all(context.temp_allocator)
+}
+
+// A group with no user drops nothing, and looks from the file as though it does.
+@(test)
+test_group_without_user_is_an_error :: proc(t: ^testing.T) {
+	src := "upstream:\n  servers: [1.1.1.1]\nserver:\n  group: elodin\n"
+	_, err := load_string(src, context.temp_allocator)
+	e, has := err.?
+	testing.expect(t, has, "server.group alone should be refused")
+	testing.expect(t, len(e.messages) > 0, "expected a message")
+	free_all(context.temp_allocator)
+}

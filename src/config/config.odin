@@ -199,6 +199,18 @@ Server_Config :: struct {
 	rather than a growing one.
 	*/
 	max_pending:      int,
+	/*
+	Account the process switches to once the listeners have bound.
+
+	Binding a port below 1024 is the only privileged thing elodin does, and it
+	is over within a second of starting. Everything after it parses data that
+	came off the network, so an operator who started the process as root has
+	every reason to want it to be somebody else by the time that begins. A name
+	or a numeric uid; empty leaves the process as it started.
+	*/
+	user:             string,
+	// Group to go with `user`. Empty takes the user's primary group.
+	group:            string,
 }
 
 Config :: struct {

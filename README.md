@@ -52,11 +52,15 @@ mise run run                                            # local, unprivileged
 ```
 
 `examples/elodin.yaml` binds port 53 and caches under `/var/cache/elodin`, so it
-needs privileges. Ports below 1024 need either root or `CAP_NET_BIND_SERVICE`:
+needs privileges. The way to give it exactly the one it needs is
+`CAP_NET_BIND_SERVICE`, which lets it bind below 1024 and start unprivileged:
 
 ```sh
 sudo setcap 'cap_net_bind_service=+ep' ./bin/elodin
 ```
+
+Starting as root works too, but then set `server.user` so it does not stay
+root — see [Privileges](#privileges).
 
 If the port is already taken it is usually the system resolver:
 `sudo systemctl stop systemd-resolved`. elodin says as much when a bind fails.
@@ -99,6 +103,51 @@ A published GitHub release carries a `linux-amd64` tarball built by
 `.github/workflows/release.yml`, holding the optimised binary, the unit file and
 the example configuration. CI runs `mise run check`, `mise run test` and
 `mise run itest` on every push and pull request.
+
+### Privileges
+
+Binding a port below 1024 is the only privileged thing elodin does, and it is
+over within a second of starting. Everything after that — DNS wire data, HTTP/2
+frames, TLS records — is parsing input that came off the network, and it runs
+for the life of the process. A resolver that is still root while doing that
+turns any single bug in that code into a root compromise rather than the loss of
+one service account, and `mise run release` builds with `-no-bounds-check`.
+
+There are two ways not to be root, and either is enough:
+
+**Never become root.** Grant the capability instead, which is what the systemd
+unit does with `AmbientCapabilities=CAP_NET_BIND_SERVICE` and `DynamicUser=yes`.
+By hand, `sudo setcap 'cap_net_bind_service=+ep' ./bin/elodin` and start it as
+an ordinary user. Leave `server.user` empty here — there is nothing to drop.
+
+**Start as root and put it down.** Name an account in `server.user`, and elodin
+switches to it the moment the listeners have their ports:
+
+```yaml
+server:
+  user: elodin        # a name or a numeric uid
+  group: elodin       # optional; defaults to the user's primary group
+```
+
+```sh
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin elodin
+```
+
+The supplementary groups are cleared first, then the gid, then the uid, all
+three of real, effective and saved — so there is no saved uid to step back
+into — and the result is read back from the kernel before it is reported. A drop
+that was configured and did not happen ends the process rather than leaving it
+running as root.
+
+`blocking.cache_dir` changes owner along with the process, because the lists are
+downloaded before the listeners bind and a refresh hours later has to reopen
+them. `log.file` needs nothing: it is opened once at startup and the process
+keeps writing through that descriptor.
+
+A misspelt account name is caught by `--check`, so a bad `server.user` is a
+configuration error before a restart rather than a resolver that comes up, takes
+port 53 and then exits. Running as root with no `server.user` set logs a warning
+at startup.
 
 ### Stopping
 
@@ -547,6 +596,7 @@ src/h2/        HTTP/2 framing, HPACK, and the server connection state machine
 src/tlsx/      OpenSSL bindings and a small TLS wrapper
 src/pool/      worker pool
 src/logx/      logging
+src/privdrop/  giving up root once the listeners hold their ports
 src/itest/     integration suite: harness, mock upstreams (DNS, HTTP, DoH/h2), clients, fixtures
 bench/         benchmark harness and DNSSEC survey, in Go, with committed results
 ```
@@ -563,17 +613,17 @@ Two layers, both run by `mise run verify`. A third, `mise run bench`, measures
 rather than asserts: it is where every number in [Capacity](#capacity) comes
 from, and it is documented in [`bench/README.md`](bench/README.md).
 
-**Unit tests** (`mise run test`, 138 cases) cover the message codec — round trips
+**Unit tests** (`mise run test`, 162 cases) cover the message codec — round trips
 for every modelled RDATA type, compression, truncation, EDNS, pointer loops,
 hostile record counts — plus the YAML parser, configuration loading, list
 parsing and matching, the cache, and the HTTP/2 codec — the HPACK cases run the
 worked examples from RFC 7541 appendix C, so the codec is checked against the
 specification's own vectors rather than against itself.
 
-They run per package, so a failure names one: `dns` 14, `yaml` 9, `config` 8,
-`filter` 8, `cache` 10, `dnssec` 32, `tlsx` 4, `upstream` 12, `h2` 28,
-`server` 13. Much of `tlsx`, `upstream`, `h2` and `server` is what the suite
-grew for the bugs recorded below — the HTTP reader's framing and body limits,
+They run per package, so a failure names one: `dns` 16, `yaml` 9, `config` 10,
+`filter` 8, `privdrop` 9, `cache` 10, `dnssec` 37, `tlsx` 4, `upstream` 15,
+`h2` 30, `server` 14. Much of `tlsx`, `upstream`, `h2` and `server` is what the
+suite grew for the bugs recorded below — the HTTP reader's framing and body limits,
 the TLS handshake retry, the HTTP/2 stream table under RST_STREAM, and the DoH
 request parser read against an allocator that scribbles over what it releases.
 
@@ -594,7 +644,7 @@ denial is checked against, and a response built to make one question cost as man
 upstream lookups as possible. Each was checked against the code as it stood
 before the fix, so they are known to fail when the property they guard does.
 
-**Integration tests** (`mise run itest`, 132 cases, ~25s) start the built binary
+**Integration tests** (`mise run itest`, 135 cases, ~25s) start the built binary
 as a separate process against scripted mock upstreams, so what is exercised is
 the artefact that ships rather than the library it was compiled from. The suite
 is hermetic: no public resolver is contacted, ports are allocated from a private
@@ -611,7 +661,7 @@ What it covers:
 
 | area | cases |
 |---|---|
-| command line | `--version`, `--help`, `--check` accepting and rejecting configs, error text and line numbers, a DoT listener with no certificate, the shipped example config |
+| command line | `--version`, `--help`, `--check` accepting and rejecting configs, error text and line numbers, a DoT listener with no certificate, an unknown `server.user`, a privilege drop that cannot happen stopping the server, the shipped example config |
 | shutdown | `SIGTERM` produces an orderly exit rather than a killed process |
 | wire format | all 23 captured fixtures replayed and compared byte for byte, EDNS forwarding, 0x20 case preservation, truncation and the TC bit, FORMERR / NOTIMP / silent-drop handling |
 | listeners | UDP, TCP (single and pipelined), DoT, DoH POST and GET, keep-alive, 404 / 405 / 415 / 400 |
