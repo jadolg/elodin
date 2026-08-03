@@ -4,6 +4,9 @@ odin = "dev-2026-07"
 # toolchain reproducible and avoids depending on whether the distribution
 # happens to ship an unversioned `clang` on PATH (Fedora, for one, does not).
 clang = "22.1.8"
+# Only the benchmark needs this. The load generator is deliberately not written
+# in Odin: a generator sharing the codec under test could agree with a bug in it.
+go = "1.26.4"
 
 [env]
 ELODIN_SRC = "{{config_root}}/src"
@@ -87,6 +90,11 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
   -days 825 -subj "/CN=elodin.local" \
   -addext "subjectAltName=DNS:elodin.local,DNS:localhost,IP:127.0.0.1"
 """
+
+[tasks.bench]
+description = "Measure throughput, latency, CPU and memory (see bench/README.md)"
+depends = ["release"]
+run = "cd bench && go run ./cmd/bench"
 
 [tasks.clean]
 description = "Remove build artefacts"
