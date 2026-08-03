@@ -731,3 +731,65 @@ test_oversized_response_returns_connection_credit :: proc(t: ^testing.T) {
 		testing.expectf(t, false, "oversized response credit: %d bytes leaked at %v", entry.size, entry.location)
 	}
 }
+
+/*
+The client half of the same rule.
+
+`client_handle_window_update` refuses a window pushed past 2^31-1;
+`client_handle_settings` applied its retroactive delta to every open stream and
+checked nothing, so an upstream could take the shared multiplexed connection's
+streams past the maximum a byte at a time.
+*/
+@(test)
+test_client_settings_window_change_is_bounded :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Client_Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+
+	s := new(Client_Stream, allocator)
+	s.id = 1
+	s.send_window = c.peer_initial_window
+	s.body = make([dynamic]u8, 0, 8, allocator)
+	c.streams[1] = s
+
+	grant := []u8{0x7f, 0xff, 0x00, 0x00} // MAX_WINDOW - DEFAULT_WINDOW
+	granted := client_handle_window_update(
+		c,
+		Frame_Header{length = len(grant), type = .Window_Update, stream_id = 1},
+		grant,
+	)
+	testing.expect(t, granted, "a window update to exactly the maximum was refused")
+	testing.expect_value(t, s.send_window, MAX_WINDOW)
+
+	clear(&log.frames)
+	settings := []u8{0, u8(Setting.Initial_Window_Size), 0, 1, 0, 0} // 65536
+	accepted := client_handle_settings(
+		c,
+		Frame_Header{length = len(settings), type = .Settings, stream_id = 0},
+		settings,
+	)
+	testing.expect(t, !accepted, "a settings change past the maximum window was accepted")
+
+	saw_goaway := false
+	for f in log.frames {
+		if f.type == .Goaway {
+			saw_goaway = true
+		}
+	}
+	testing.expect(t, saw_goaway, "no GOAWAY was sent for a flow-control violation")
+
+	delete(log.frames)
+	client_stream_destroy(c, s)
+	delete_key(&c.streams, u32(1))
+	client_unref(c)
+	free_all(context.temp_allocator)
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "settings window overflow: %d bytes leaked at %v", entry.size, entry.location)
+	}
+}

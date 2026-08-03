@@ -774,3 +774,58 @@ test_oversized_body_returns_connection_credit :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 	expect_no_leaks(t, &track, "oversized body credit")
 }
+
+/*
+A SETTINGS_INITIAL_WINDOW_SIZE change adjusts every open stream's send window,
+and the result of that adjustment has to be checked as well as the value itself.
+
+RFC 9113 section 6.9.2 makes a flow-control window pushed past 2^31-1 a
+connection error of type FLOW_CONTROL_ERROR. `handle_window_update` checks for
+exactly that, and this path applied its delta and looked at nothing, so the two
+routes to the same window disagreed about the same limit. The guard that is
+there only refuses a settings *value* over the maximum, which does not stop the
+accumulated window from getting there a byte at a time.
+*/
+@(test)
+test_settings_window_change_is_bounded :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+
+	// Exactly the maximum is allowed, and is where a peer parks a stream before
+	// nudging it over with a settings change.
+	grant := []u8{0x7f, 0xff, 0x00, 0x00} // MAX_WINDOW - DEFAULT_WINDOW
+	granted := handle_window_update(c, Frame_Header{length = len(grant), type = .Window_Update, stream_id = 1}, grant)
+	testing.expect(t, granted, "a window update to exactly the maximum was refused")
+	if s, found := c.streams[1]; found {
+		testing.expect_value(t, s.send_window, MAX_WINDOW)
+	}
+
+	clear(&log.frames)
+	// One byte more of initial window is one byte too many.
+	settings := []u8{0, u8(Setting.Initial_Window_Size), 0, 1, 0, 0} // 65536
+	accepted := handle_settings(c, Frame_Header{length = len(settings), type = .Settings, stream_id = 0}, settings)
+	testing.expect(t, !accepted, "a settings change past the maximum window was accepted")
+
+	saw_goaway := false
+	for f in log.frames {
+		if f.type == .Goaway {
+			saw_goaway = true
+		}
+	}
+	testing.expect(t, saw_goaway, "no GOAWAY was sent for a flow-control violation")
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "settings window overflow")
+}
