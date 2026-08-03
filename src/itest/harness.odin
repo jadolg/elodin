@@ -325,6 +325,8 @@ build_query :: proc(
 	edns_size: u16 = 0,
 	dnssec_ok := false,
 	checking_disabled := false,
+	// A COOKIE option to carry in the OPT record, which needs `edns_size` set.
+	cookie: []u8 = nil,
 	allocator := context.temp_allocator,
 ) -> []u8 {
 	buf := make([dynamic]u8, 0, 64, allocator)
@@ -361,9 +363,24 @@ build_query :: proc(
 		append(&buf, 0, 41) // OPT
 		append(&buf, u8(edns_size >> 8), u8(edns_size))
 		append(&buf, u8(ttl >> 24), u8(ttl >> 16), u8(ttl >> 8), u8(ttl))
-		append(&buf, 0, 0) // rdlength
+		rdlength := len(cookie) + 4 if cookie != nil else 0
+		append(&buf, u8(rdlength >> 8), u8(rdlength))
+		if cookie != nil {
+			append(&buf, 0, 10) // COOKIE
+			append(&buf, u8(len(cookie) >> 8), u8(len(cookie)))
+			append(&buf, ..cookie)
+		}
 	}
 	return buf[:]
+}
+
+// The COOKIE option carried in a message, if it has one.
+find_cookie :: proc(wire: []u8) -> (cookie: []u8, found: bool) {
+	msg, err := dns.decode_message(wire, context.temp_allocator)
+	if err != .None {
+		return nil, false
+	}
+	return dns.find_edns_option(msg, .Cookie)
 }
 
 Header :: struct {

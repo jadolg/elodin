@@ -142,6 +142,105 @@ Dnssec_Config :: struct {
 	max_nsec3_iterations: int,
 }
 
+Cookie_Config :: struct {
+	/*
+	Whether clients that send a DNS cookie get one back (RFC 7873).
+
+	On, because it costs one hash per query and takes the client-facing path
+	from "guess the transaction ID and the source port" to "guess a 64-bit
+	value you were never shown". Clients that do not use cookies are unaffected;
+	nothing is added to an answer whose query did not ask for it.
+	*/
+	enabled: bool,
+	/*
+	Whether a UDP query carrying a cookie must show a valid server cookie
+	before it is answered.
+
+	Off, because turning it on costs every new client an extra round trip: the
+	first query is answered with BADCOOKIE and a cookie to come back with. Worth
+	it while a spoofing attempt is actually under way, which is the case RFC
+	7873 section 5.2.3 has it for. Queries with no cookie at all, and queries
+	over TCP, DoT or DoH, are unaffected either way.
+
+	Needs `enabled`: what it demands is a cookie this server issued, and with
+	that off there are none. The pair is refused rather than quietly ignored,
+	since it is turned on while an attack is under way and that is the wrong
+	moment to find out it was never in force.
+	*/
+	require:  bool,
+	/*
+	Whether elodin presents a cookie of its own to plain UDP and TCP upstreams.
+
+	On, and independent of `enabled`: one setting is about the clients asking us,
+	this one is about the servers we ask. It is the same protection in the other
+	direction — an off-path attacker forging an answer to one of our queries has
+	to guess 64 bits it has never seen, on top of the transaction ID and the
+	source port. A forged datagram that fails the check is ignored rather than
+	answered, so the genuine reply is still waited for. Once a server has issued
+	a cookie it owes one on every reply after it; a server that has never sent
+	one does not implement them, and the exchange carries on without.
+
+	Independent of `enabled` in the other respect too: the client's own cookie is
+	taken off the query before it is forwarded whichever of the two is set, since
+	it is the client's secret rather than something to spend on an upstream.
+
+	Only queries that already carry an OPT record get a cookie, because adding
+	one would mean an EDNS negotiation the client never asked for. With DNSSEC
+	validation on — the default — every query this server forwards carries one.
+
+	DoT and DoH upstreams are left out: the transport already authenticates the
+	server, which is more than a cookie establishes.
+	*/
+	upstream: bool,
+	/*
+	The secret cookies are keyed by, as 32 hex characters. Empty draws a random
+	one at startup, which is right for a single instance and wrong for several
+	behind one address: each would reject the cookies the others handed out.
+
+	Applies to the cookies handed to clients. The client cookies sent upstream
+	are drawn at random per upstream and are not derived from this.
+	*/
+	secret:   string,
+}
+
+COOKIE_SECRET_LEN :: 16
+
+/*
+Read `cookies.secret` into the bytes it stands for.
+
+Lives here rather than beside the server that uses it so that `--check` and
+startup agree by construction. Two parsers written to the same rule are two
+parsers that can drift, and the shape of that bug is a configuration `--check`
+passes and the resolver then refuses to start on.
+*/
+parse_cookie_secret :: proc(text: string, out: ^[COOKIE_SECRET_LEN]u8) -> bool {
+	if len(text) != COOKIE_SECRET_LEN * 2 {
+		return false
+	}
+	for i in 0 ..< COOKIE_SECRET_LEN {
+		hi, hi_ok := cookie_hex_value(text[i * 2])
+		lo, lo_ok := cookie_hex_value(text[i * 2 + 1])
+		if !hi_ok || !lo_ok {
+			return false
+		}
+		out[i] = hi << 4 | lo
+	}
+	return true
+}
+
+@(private)
+cookie_hex_value :: proc(c: u8) -> (v: u8, ok: bool) {
+	switch c {
+	case '0' ..= '9':
+		return c - '0', true
+	case 'a' ..= 'f':
+		return c - 'a' + 10, true
+	case 'A' ..= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
+}
+
 Rewrite_Kind :: enum u8 {
 	A,
 	AAAA,
@@ -221,6 +320,7 @@ Config :: struct {
 	cache:     Cache_Config,
 	blocking:  Blocking_Config,
 	dnssec:    Dnssec_Config,
+	cookies:   Cookie_Config,
 	rewrites:  []Rewrite,
 }
 
@@ -287,6 +387,11 @@ default_config :: proc() -> Config {
 	c.dnssec = Dnssec_Config {
 		enabled              = true,
 		max_nsec3_iterations = 100,
+	}
+	c.cookies = Cookie_Config {
+		enabled  = true,
+		require  = false,
+		upstream = true,
 	}
 	return c
 }

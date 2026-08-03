@@ -36,6 +36,17 @@ Mock_Behaviour :: enum u8 {
 	Synth_A,
 }
 
+Mock_Cookies :: enum u8 {
+	// Ignore COOKIE options entirely, the way a server that predates RFC 7873
+	// would.
+	Off,
+	// Echo the client cookie with a server cookie behind it.
+	Echo,
+	// The same, but refuse to answer anything until the query shows the server
+	// cookie this mock issued.
+	Require,
+}
+
 Mock_Rule :: struct {
 	// Empty matches any name; otherwise compared case-insensitively with the
 	// trailing dot included.
@@ -66,6 +77,12 @@ Mock :: struct {
 	// When set, a connection is closed after this much idle time, the way a
 	// public DoT resolver drops connections a client has stopped using.
 	idle_close:  time.Duration,
+
+	// How this mock treats DNS cookies (RFC 7873).
+	cookies:     Mock_Cookies,
+	// Echo back a client cookie that is not the one the query carried, which is
+	// what an off-path forgery would have to do.
+	forge_cookie: bool,
 
 	mu:          sync.Mutex,
 	udp_queries: int,
@@ -291,6 +308,75 @@ answer for a Truncate_UDP rule.
 */
 @(private = "file")
 build_reply :: proc(
+	m: ^Mock,
+	query: []u8,
+	rule: Mock_Rule,
+	over_tcp: bool,
+	allocator := context.allocator,
+) -> (
+	reply: []u8,
+	ok: bool,
+) {
+	if m.cookies == .Off {
+		return build_answer(m, query, rule, over_tcp, allocator)
+	}
+	sent, has_cookie := query_cookie(query)
+	if !has_cookie {
+		// A client that sends no cookie gets none back (RFC 7873 section 5.2.1).
+		return build_answer(m, query, rule, over_tcp, allocator)
+	}
+	// Nothing but the cookie is looked at until the cookie is right.
+	if m.cookies == .Require && !cookie_is_ours(m, sent) {
+		return with_cookie(m, sent, build_rcode_reply(query, .Bad_Cookie, allocator), allocator), true
+	}
+	answer := build_answer(m, query, rule, over_tcp, allocator) or_return
+	return with_cookie(m, sent, answer, allocator), true
+}
+
+// The server cookie this mock hands out; fixed, so a test can recognise it.
+@(private = "file")
+MOCK_SERVER_COOKIE := []u8{0xc0, 0x0c, 0x1e, 0x5e, 0x5e, 0x1e, 0x0c, 0xc0}
+
+@(private = "file")
+query_cookie :: proc(query: []u8) -> (cookie: []u8, found: bool) {
+	msg, err := dns.decode_message(query, context.temp_allocator)
+	if err != .None {
+		return nil, false
+	}
+	return dns.find_edns_option(msg, .Cookie)
+}
+
+@(private = "file")
+cookie_is_ours :: proc(m: ^Mock, sent: []u8) -> bool {
+	if len(sent) != 8 + len(MOCK_SERVER_COOKIE) {
+		return false
+	}
+	for b, i in MOCK_SERVER_COOKIE {
+		if sent[8 + i] != b {
+			return false
+		}
+	}
+	return true
+}
+
+// Echo the client half back with this mock's server cookie behind it.
+@(private = "file")
+with_cookie :: proc(m: ^Mock, sent: []u8, reply: []u8, allocator := context.allocator) -> []u8 {
+	option := make([]u8, 8 + len(MOCK_SERVER_COOKIE), context.temp_allocator)
+	copy(option[:8], sent[:min(8, len(sent))])
+	copy(option[8:], MOCK_SERVER_COOKIE)
+	if m.forge_cookie {
+		option[0] ~= 0xff
+	}
+	out, ok := dns.ensure_edns_option(reply, .Cookie, option, 1232, allocator)
+	if !ok {
+		return reply
+	}
+	return out
+}
+
+@(private = "file")
+build_answer :: proc(
 	m: ^Mock,
 	query: []u8,
 	rule: Mock_Rule,

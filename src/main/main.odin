@@ -168,7 +168,7 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	handler_pool := pool.make_pool(cfg.server.workers)
 	race_pool := pool.make_pool(cfg.server.upstream_workers)
 
-	group, gerr := upstream.make_group(cfg.upstream, race_pool)
+	group, gerr := upstream.make_group(cfg.upstream, race_pool, cookies = cfg.cookies.upstream)
 	if gerr != .None {
 		logx.errorf("no usable upstream servers, giving up")
 		os.exit(1)
@@ -207,6 +207,12 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 		os.exit(1)
 	}
 	defer server.stop_validator(&s)
+
+	if !server.start_cookies(&s) {
+		logx.errorf("the configured cookie secret is not usable, shutting down")
+		os.exit(1)
+	}
+	defer server.stop_cookies(&s)
 
 	if cfg.blocking.enabled {
 		server.reload_filters(&s, !opts.no_fetch)

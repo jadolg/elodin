@@ -10,6 +10,7 @@ Pi-hole and AdGuard Home, minus the web interface. One binary, one YAML file.
 - Answer cache with negative caching and optional stale serving
 - Local rewrites (A, AAAA, CNAME, or "answer as if blocked")
 - DNSSEC validation against the root trust anchors, on by default
+- DNS cookies in both directions (RFC 7873/9018), on by default
 
 ## Requirements
 
@@ -383,6 +384,81 @@ Two things worth knowing about running with it on:
   which is unsigned by definition, from the child's, which is not. The answer
   section is validated in full; this affects only what rides alongside it.
 
+### DNS cookies
+
+```yaml
+cookies:
+  enabled: true          # answer clients that send a cookie
+  require: false         # demand a valid one from UDP clients that send any
+  upstream: true         # present a cookie of our own to plain upstreams
+  secret: ""             # 32 hex characters; empty draws a random one at startup
+```
+
+A client talking to elodin over UDP has two things standing between it and a
+forged answer from somewhere on the local network: a 16-bit transaction ID and a
+randomised source port. That is about 32 bits, and both are visible to anyone on
+the path. Cookies (RFC 7873, RFC 9018) add 64 bits that are not: a client that
+has asked once holds a token only this server could have produced, and an answer
+that comes back without it did not come from here.
+
+Nothing is remembered per client. The token is recomputed on each query from the
+client's own cookie, its address and a timestamp, keyed by a secret this process
+holds — so there is no table for a flood of clients to fill, and a cookie that
+does leak stops working within the hour. Clients that do not use cookies are
+untouched: an answer only carries one when the query did.
+
+`require` is the other half of the mechanism, and is off by default. With it on,
+a UDP query that carries a cookie but cannot show a valid server cookie is
+answered with BADCOOKIE and a cookie to come back with, before the name is
+looked up at all — so an attacker forging queries from someone else's address
+never gets an answer sent there. The cost falls on honest clients too, one extra
+round trip the first time each one asks, which is why RFC 7873 has it for use
+while an attack is actually under way. Queries carrying no cookie, and queries
+over TCP, DoT or DoH, are unaffected either way. It needs `enabled`, since what
+it demands is a cookie this server issued; the two together are rejected at
+startup rather than left looking like a protection that is on.
+
+`secret` matters when more than one elodin answers on the same address: without
+it each draws its own at startup and rejects the cookies the others handed out.
+A single instance can leave it empty.
+
+The client's cookie stops at elodin and is never forwarded upstream, whatever
+either setting is on or off. It is a secret between that client and this server —
+a stable identifier an upstream has no business seeing — and its server half was
+minted here, so an upstream that implements cookies would read it as a forgery
+and answer BADCOOKIE instead of the question.
+
+`upstream` turns the same mechanism the other way round, and is also on by
+default. elodin presents a cookie of its own to plain UDP and TCP upstreams:
+a random client cookie per server, and the server cookie that server last issued.
+A reply carrying a cookie that is not ours cannot have come from the server we
+asked, so it is passed over and the socket keeps waiting for the genuine one —
+which is the point, since answering a spoofing attempt with SERVFAIL would hand
+the attacker most of what it was after. Once a server has issued a cookie, a
+reply from it with the option left off is passed over the same way: a check an
+attacker can decline to take is not a check at all, and RFC 7873 §5.3 has the
+response discarded. A server that has never sent one is a server that does not
+implement them, and the exchange carries on without. The cookie the upstream sends back is
+removed before the answer goes anywhere near a client or the cache: it belongs
+to that conversation and to no other. A BADCOOKIE reply carries a fresh server
+cookie, so the query is asked once more with it.
+
+Two things bound what that covers. Only queries that already carry an OPT record
+get a cookie, since adding one would negotiate EDNS on behalf of a client that
+never asked — with DNSSEC validation on, which is the default, every forwarded
+query carries one. And DoT and DoH upstreams are left out, because a certificate
+already establishes more than a cookie can.
+
+| | client-facing | upstream |
+|---|---|---|
+| setting | `cookies.enabled` | `cookies.upstream` |
+| default | on | on |
+| secret | `cookies.secret`, or random at startup | random per upstream |
+| server cookie | recomputed per query, nothing stored | learned and held per upstream |
+| transports | UDP, TCP, DoT, DoH | UDP and TCP only |
+| a cookie that does not check out | answered anyway, or BADCOOKIE with `require` | ignored, and the wait continues |
+| a message with no cookie | answered, and given none back | accepted, unless that server has issued one before |
+
 ### Rewrites
 
 ```yaml
@@ -409,9 +485,11 @@ With validation on, an answer for a client that did not ask for DNSSEC records
 is rebuilt without them; every other answer still goes back verbatim.
 
 Also handled: EDNS0 (the client's OPT record is forwarded upstream so payload
-sizes are negotiated end to end), truncation with the TC bit and the UDP→TCP
-retry, `version.bind`/`hostname.bind` in the CHAOS class, and refusal of
-zone-transfer requests.
+sizes are negotiated end to end, minus its cookie, which stops here), DNS
+cookies in both directions (RFC 7873, RFC 9018) — answered for clients, and
+presented to plain upstreams with the reply checked against what we sent —
+truncation with the TC bit and the UDP→TCP retry, `version.bind`/`hostname.bind`
+in the CHAOS class, and refusal of zone-transfer requests.
 
 The cache stores upstream answers as untouched wire bytes plus the offsets of
 their TTL fields, and rewrites those TTLs in place on each hit. That keeps the
@@ -582,6 +660,13 @@ upstream traffic by the number of servers.
   round trip. Async upstream I/O, or several UDP reader threads behind
   `SO_REUSEPORT`, would lift both this and the item above; neither is needed at
   the scale measured in the previous section.
+- **DNS cookies do not cover every query.** Only queries that already carry an
+  OPT record are given one on the way upstream, so a non-EDNS client behind
+  elodin gets no cookie protection unless DNSSEC validation is on — which it is
+  by default, and which puts an OPT record on every forwarded query. Cookie
+  secrets, both the client-facing one and the client cookies held per upstream,
+  are drawn once at startup and never rotated: restarting costs each client and
+  each upstream one extra round trip.
 - No per-client rules, no query log database, no web or API surface. Statistics
   go to the log every five minutes; there is no metrics endpoint to scrape.
 - Configuration is read once at startup; there is no reload signal yet.
@@ -596,8 +681,8 @@ src/config/    configuration schema, loading and validation
 src/filter/    sink-list matching and list-format parsers
 src/cache/     LRU answer cache
 src/dnssec/    validation: canonical form, signatures, NSEC/NSEC3, chain of trust
-src/upstream/  transports (UDP/TCP/DoT/DoH), pooling, strategies, HTTP/1.1 and h2 clients
-src/server/    resolver, listeners, DoH endpoint, list refresh
+src/upstream/  transports (UDP/TCP/DoT/DoH), pooling, strategies, cookies, HTTP/1.1 and h2 clients
+src/server/    resolver, listeners, DoH endpoint, cookies, list refresh
 src/h2/        HTTP/2 framing, HPACK, and the server connection state machine
 src/tlsx/      OpenSSL bindings and a small TLS wrapper
 src/pool/      worker pool

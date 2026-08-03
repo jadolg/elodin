@@ -155,8 +155,9 @@ next_query_id :: proc() -> u16 {
 /*
 Re-ask the client's question with DO and CD set.
 
-The client's own EDNS options ride along - a cookie or a subnet hint still
-belongs to it - but the payload size and the DO bit are ours.
+The client's own EDNS options ride along - a subnet hint still belongs to it -
+but the payload size and the DO bit are ours. Its cookie is taken back out
+further down, once this and the plain forwarding path have converged.
 */
 @(private)
 dnssec_upstream_query :: proc(query: dns.Message, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {

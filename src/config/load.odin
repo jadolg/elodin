@@ -57,6 +57,7 @@ load_string :: proc(src: string, allocator := context.allocator) -> (cfg: Config
 	load_cache(&l, &cfg)
 	load_blocking(&l, &cfg)
 	load_dnssec(&l, &cfg)
+	load_cookies(&l, &cfg)
 	load_rewrites(&l, &cfg)
 	validate(&l, &cfg)
 
@@ -637,6 +638,18 @@ load_dnssec :: proc(l: ^Loader, cfg: ^Config) {
 }
 
 @(private)
+load_cookies :: proc(l: ^Loader, cfg: ^Config) {
+	n := yaml.get(l.root, "cookies")
+	if n == nil {
+		return
+	}
+	opt_bool(l, n, "enabled", &cfg.cookies.enabled, "cookies")
+	opt_bool(l, n, "require", &cfg.cookies.require, "cookies")
+	opt_bool(l, n, "upstream", &cfg.cookies.upstream, "cookies")
+	opt_string(l, n, "secret", &cfg.cookies.secret, "cookies")
+}
+
+@(private)
 load_rewrites :: proc(l: ^Loader, cfg: ^Config) {
 	entries := yaml.items(yaml.get(l.root, "rewrites"))
 	if len(entries) == 0 {
@@ -798,5 +811,25 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 		if _, ok := dnssec.parse_trust_anchor(anchor, l.allocator); !ok {
 			errorf(l, "dnssec.trust_anchors[%d]: %q is not a DS record", i, anchor)
 		}
+	}
+
+	// Same reasoning: a secret that will not parse should fail `--check`, not
+	// leave a machine handing out cookies its neighbours reject. Read with the
+	// parser the server itself uses, so the two cannot disagree.
+	if cfg.cookies.secret != "" {
+		scratch: [COOKIE_SECRET_LEN]u8
+		if !parse_cookie_secret(cfg.cookies.secret, &scratch) {
+			errorf(l, "cookies.secret must be %d hexadecimal characters", COOKIE_SECRET_LEN * 2)
+		}
+	}
+	/*
+	`require` is enforced against cookies this server issues, and it issues none
+	with `enabled` off - so the pair is a setting that quietly does nothing.
+
+	Worth an error rather than a warning: it is turned on while an attack is
+	under way, and finding out then that it was never in force is the wrong time.
+	*/
+	if cfg.cookies.require && !cfg.cookies.enabled {
+		errorf(l, "cookies.require needs cookies.enabled: there are no cookies to demand with it off")
 	}
 }

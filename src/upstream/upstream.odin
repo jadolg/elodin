@@ -81,6 +81,11 @@ Upstream :: struct {
 	connecting: bool,
 	h2:         ^H2_Conn,
 
+	// Whether queries to this server carry a DNS cookie. The client half is
+	// fixed at construction; the server half is learned and lives under `mu`.
+	cookies:      bool,
+	cookie:       Cookie,
+
 	// Consecutive failures; a run of them parks the upstream for a cooldown so
 	// a dead server stops costing every query a full timeout.
 	failures:     u32,
@@ -105,6 +110,7 @@ make_upstream :: proc(
 	max_idle: int,
 	idle_timeout: time.Duration,
 	allocator := context.allocator,
+	cookies := false,
 ) -> (
 	u: ^Upstream,
 	err: Error,
@@ -115,6 +121,8 @@ make_upstream :: proc(
 	u.max_idle = max(max_idle, 0)
 	u.idle_timeout = idle_timeout
 	u.idle = make([dynamic]Idle_Conn, 0, max(max_idle, 1), allocator)
+	u.cookies = cookies
+	init_cookie(u)
 
 	#partial switch spec.kind {
 	case .TLS:
@@ -210,11 +218,16 @@ record_failure :: proc(u: ^Upstream) {
 	u.failures += 1
 	u.stats.queries += 1
 	u.stats.failures += 1
+	if u.failures >= FAILURE_THRESHOLD {
+		u.down_until = time.time_add(time.now(), COOLDOWN)
+		// A server that stopped sending cookies is a server whose every reply is
+		// now discarded for the want of one, and that arrives here looking like
+		// any other outage. Let the cooldown decide what it does rather than
+		// hold it to what it used to do.
+		forget_cookie(u)
+	}
 	if u.failures == FAILURE_THRESHOLD {
-		u.down_until = time.time_add(time.now(), COOLDOWN)
 		logx.warnf("upstream %s: %d consecutive failures, pausing it for %v", u.spec.name, u.failures, COOLDOWN)
-	} else if u.failures > FAILURE_THRESHOLD {
-		u.down_until = time.time_add(time.now(), COOLDOWN)
 	}
 }
 
@@ -245,15 +258,10 @@ exchange :: proc(
 	}
 
 	start := time.now()
-	switch u.spec.kind {
-	case .UDP:
-		response, err = exchange_udp(u, query, timeout, allocator)
-	case .TCP:
-		response, err = exchange_tcp(u, query, timeout, allocator)
-	case .TLS:
-		response, err = exchange_dot(u, query, timeout, allocator)
-	case .HTTPS:
-		response, err = exchange_doh(u, query, timeout, allocator)
+	if cookies_wanted(u) {
+		response, err = exchange_with_cookie(u, query, timeout, allocator)
+	} else {
+		response, err = send(u, query, timeout, allocator)
 	}
 
 	if err != .None {
@@ -262,6 +270,45 @@ exchange :: proc(
 	}
 	record_success(u, time.diff(start, time.now()))
 	return response, .None
+}
+
+// One round trip over whichever transport this upstream speaks.
+@(private)
+send :: proc(
+	u: ^Upstream,
+	query: []u8,
+	timeout: time.Duration,
+	allocator: mem.Allocator,
+) -> (
+	response: []u8,
+	err: Error,
+) {
+	switch u.spec.kind {
+	case .UDP:
+		return exchange_udp(u, query, timeout, allocator)
+	case .TCP:
+		return exchange_tcp(u, query, timeout, allocator)
+	case .TLS:
+		return exchange_dot(u, query, timeout, allocator)
+	case .HTTPS:
+		return exchange_doh(u, query, timeout, allocator)
+	}
+	return nil, .Bad_Response
+}
+
+/*
+Whether a reply is one to act on: it answers the query we sent, and it carries
+our cookie if it carries one at all.
+
+Split from `response_matches` because the cookie needs the upstream's state and
+the bootstrap resolver has no upstream to hand.
+*/
+@(private)
+response_accepted :: proc(u: ^Upstream, query, response: []u8) -> bool {
+	if !response_matches(query, response) {
+		return false
+	}
+	return cookie_matches(u, response)
 }
 
 // Confirm a reply belongs to the query we sent: matching ID, the QR bit set, and

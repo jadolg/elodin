@@ -69,7 +69,9 @@ exchange_udp :: proc(
 		if remote.port != u.endpoint.port || !addresses_equal(remote.address, u.endpoint.address) {
 			continue
 		}
-		if !response_matches(query, buf[:n]) {
+		// A forged datagram is passed over rather than reported: the genuine
+		// reply may still be on its way, and the loop has until the deadline.
+		if !response_accepted(u, query, buf[:n]) {
 			continue
 		}
 
@@ -134,7 +136,7 @@ exchange_tcp :: proc(
 			}
 		}
 
-		response, err = tcp_roundtrip(conn.socket, query, allocator)
+		response, err = tcp_roundtrip(u, conn.socket, query, allocator)
 		if err == .None {
 			put_idle(u, conn)
 			return response, .None
@@ -148,7 +150,15 @@ exchange_tcp :: proc(
 }
 
 @(private)
-tcp_roundtrip :: proc(socket: net.TCP_Socket, query: []u8, allocator: mem.Allocator) -> (response: []u8, err: Error) {
+tcp_roundtrip :: proc(
+	u: ^Upstream,
+	socket: net.TCP_Socket,
+	query: []u8,
+	allocator: mem.Allocator,
+) -> (
+	response: []u8,
+	err: Error,
+) {
 	if len(query) > 0xffff {
 		return nil, .Too_Large
 	}
@@ -175,7 +185,7 @@ tcp_roundtrip :: proc(socket: net.TCP_Socket, query: []u8, allocator: mem.Alloca
 		delete(out, allocator)
 		return nil, .IO_Error
 	}
-	if !response_matches(query, out) {
+	if !response_accepted(u, query, out) {
 		delete(out, allocator)
 		return nil, .Bad_Response
 	}

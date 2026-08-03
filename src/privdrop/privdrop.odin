@@ -108,17 +108,17 @@ resolve :: proc(user: string, group: string) -> (id: Identity, err: Error) {
 		// A numeric uid is allowed to have no account behind it — containers do
 		// this — but then there is no primary group to read, and picking one
 		// would be a silent decision about what the process can reach.
-		if pw := posix.getpwuid(id.uid); pw != nil {
-			id.gid = pw.pw_gid
+		if gid, found := group_of_uid(id.uid); found {
+			id.gid = gid
 			have_gid = true
 		}
 	} else {
-		pw := posix.getpwnam(strings.clone_to_cstring(user, context.temp_allocator))
-		if pw == nil {
+		uid, gid, found := account_of_name(user)
+		if !found {
 			return {}, .Unknown_User
 		}
-		id.uid = pw.pw_uid
-		id.gid = pw.pw_gid
+		id.uid = uid
+		id.gid = gid
 		have_gid = true
 	}
 
@@ -126,11 +126,11 @@ resolve :: proc(user: string, group: string) -> (id: Identity, err: Error) {
 		if gid, ok := strconv.parse_uint(group, 10); ok {
 			id.gid = posix.gid_t(gid)
 		} else {
-			gr := posix.getgrnam(strings.clone_to_cstring(group, context.temp_allocator))
-			if gr == nil {
+			gid, found := gid_of_name(group)
+			if !found {
 				return {}, .Unknown_Group
 			}
-			id.gid = gr.gr_gid
+			id.gid = gid
 		}
 		have_gid = true
 	}
@@ -139,6 +139,65 @@ resolve :: proc(user: string, group: string) -> (id: Identity, err: Error) {
 		return {}, .Unknown_Group
 	}
 	return id, .None
+}
+
+/*
+The passwd and group lookups, done reentrantly.
+
+`getpwuid`, `getpwnam` and `getgrnam` each answer out of one static buffer per
+process, so two threads looking something up at the same time read each other's
+entries. What that looks like is a uid parsed correctly from the configuration
+and a gid belonging to whoever the other thread happened to ask about — a drop
+into the wrong group, which is the one mistake this package exists to avoid, and
+one that leaves no trace of having happened. It has already shown up as a test
+failing on a parallel runner and passing everywhere else.
+
+elodin resolves once at startup, before any worker exists, so nothing in the
+running server races here today. The `_r` forms cost a stack buffer and remove
+the possibility, rather than leaving it resting on the order the startup path
+happens to run in.
+
+A buffer too small for the entry is reported as not found: the caller turns that
+into `Unknown_User` or `Unknown_Group` and refuses to start, which is the right
+end for a lookup whose answer could not be read in full. Guessing a gid instead
+is what the whole file is written to avoid.
+*/
+@(private)
+LOOKUP_BUF :: 4096
+
+@(private)
+group_of_uid :: proc(uid: posix.uid_t) -> (gid: posix.gid_t, found: bool) {
+	buf: [LOOKUP_BUF]byte
+	pw: posix.passwd
+	result: ^posix.passwd
+	if posix.getpwuid_r(uid, &pw, raw_data(buf[:]), len(buf), &result) != .NONE || result == nil {
+		return 0, false
+	}
+	return pw.pw_gid, true
+}
+
+@(private)
+account_of_name :: proc(name: string) -> (uid: posix.uid_t, gid: posix.gid_t, found: bool) {
+	buf: [LOOKUP_BUF]byte
+	pw: posix.passwd
+	result: ^posix.passwd
+	cname := strings.clone_to_cstring(name, context.temp_allocator)
+	if posix.getpwnam_r(cname, &pw, raw_data(buf[:]), len(buf), &result) != .NONE || result == nil {
+		return 0, 0, false
+	}
+	return pw.pw_uid, pw.pw_gid, true
+}
+
+@(private)
+gid_of_name :: proc(name: string) -> (gid: posix.gid_t, found: bool) {
+	buf: [LOOKUP_BUF]byte
+	gr: posix.group
+	result: ^posix.group
+	cname := strings.clone_to_cstring(name, context.temp_allocator)
+	if posix.getgrnam_r(cname, &gr, raw_data(buf[:]), len(buf), &result) != .NONE || result == nil {
+		return 0, false
+	}
+	return gr.gr_gid, true
 }
 
 /*

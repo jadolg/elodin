@@ -151,6 +151,54 @@ test_dnssec_can_be_turned_off :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_cookies_defaults_and_overrides :: proc(t: ^testing.T) {
+	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	testing.expect(t, err == nil, "expected a clean load")
+	testing.expect(t, cfg.cookies.enabled, "cookies should be answered by default")
+	testing.expect(t, !cfg.cookies.require, "cookies should not be demanded by default")
+	testing.expect(t, cfg.cookies.upstream, "cookies should be sent upstream by default")
+
+	// `require` is set with `enabled` left on, since the two disagree by
+	// definition; that pairing has its own case below.
+	src := "upstream:\n  servers: [1.1.1.1]\ncookies:\n  require: true\n  upstream: false\n  secret: e5e973e5a6b2a43f48e7dc849e37bfcf\n"
+	tuned, terr := load_string(src, context.temp_allocator)
+	testing.expect(t, terr == nil, "expected a clean load")
+	testing.expect(t, tuned.cookies.require, "cookies.require: true should be honoured")
+	testing.expect(t, !tuned.cookies.upstream, "cookies.upstream: false should be honoured")
+	testing.expect_value(t, tuned.cookies.secret, "e5e973e5a6b2a43f48e7dc849e37bfcf")
+
+	off, oerr := load_string("upstream:\n  servers: [1.1.1.1]\ncookies:\n  enabled: false\n", context.temp_allocator)
+	testing.expect(t, oerr == nil, "expected a clean load")
+	testing.expect(t, !off.cookies.enabled, "cookies.enabled: false should be honoured")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_cookie_secret_must_be_hex :: proc(t: ^testing.T) {
+	// Caught here rather than at startup, so `--check` says so instead of a
+	// resolver that comes up and refuses to start.
+	src := "upstream:\n  servers: [1.1.1.1]\ncookies:\n  secret: not-a-secret\n"
+	_, err := load_string(src, context.temp_allocator)
+	e, has := err.?
+	testing.expect(t, has, "expected an error for a secret that is not hex")
+	testing.expect_value(t, len(e.messages), 1)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_cookie_require_needs_the_client_facing_side :: proc(t: ^testing.T) {
+	// `require` is enforced by the keeper `enabled` builds, so the two together
+	// are a setting that does nothing. Said at `--check` rather than left to be
+	// discovered when the attack it was turned on for arrives.
+	src := "upstream:\n  servers: [1.1.1.1]\ncookies:\n  enabled: false\n  require: true\n"
+	_, err := load_string(src, context.temp_allocator)
+	e, has := err.?
+	testing.expect(t, has, "expected an error for require without enabled")
+	testing.expect_value(t, len(e.messages), 1)
+	free_all(context.temp_allocator)
+}
+
+@(test)
 test_missing_upstream_is_an_error :: proc(t: ^testing.T) {
 	_, err := load_string("log:\n  level: info\n", context.temp_allocator)
 	e, has := err.?

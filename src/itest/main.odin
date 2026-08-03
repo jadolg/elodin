@@ -150,6 +150,10 @@ main :: proc() {
 	section(&r, "dnssec validation")
 	run_dnssec_cases(&r)
 
+	section(&r, "dns cookies")
+	run_cookie_cases(&r)
+	run_upstream_cookie_cases(&r)
+
 	elapsed := time.diff(started, time.now())
 	report(&r, elapsed)
 

@@ -51,6 +51,7 @@ Server :: struct {
 	answers:      ^cache.Cache,
 	filters:      ^filter.Engine,
 	validator:    ^dnssec.Validator,
+	cookies:      ^Cookie_Keeper,
 	handler_pool: ^pool.Pool,
 	race_pool:    ^pool.Pool,
 	stats:        Stats,
@@ -95,17 +96,68 @@ handle_query :: proc(
 		return nil, .Failed, false
 	}
 
+	cookie := inspect_cookie(s.cookies, msg, client)
+	limit := response_limit(msg, proto)
+
+	// A cookie of an impossible length is the one case RFC 7873 section 5.2.2
+	// answers with FORMERR, and the one response that carries no cookie back:
+	// there is no telling which eight of those bytes were the client's.
+	if cookie.verdict == .Malformed {
+		out, built := dns.error_response(query, msg, .Form_Err, allocator, limit)
+		return out, .Failed, built
+	}
+
+	response, outcome, ok = resolve_query(s, query, msg, proto, client, limit, cookie, started, allocator)
+	if ok {
+		response = attach_cookie(s.cookies, response, cookie, msg, limit, allocator)
+	}
+	return response, outcome, ok
+}
+
+@(private)
+resolve_query :: proc(
+	s: ^Server,
+	query: []u8,
+	msg: dns.Message,
+	proto: Protocol,
+	client: string,
+	limit: int,
+	cookie: Cookie_Request,
+	started: time.Time,
+	allocator: mem.Allocator,
+) -> (
+	response: []u8,
+	outcome: Outcome,
+	ok: bool,
+) {
 	if msg.flags.opcode != .Query {
-		out, built := dns.error_response(query, msg, .Not_Impl, allocator, response_limit(msg, proto))
+		out, built := dns.error_response(query, msg, .Not_Impl, allocator, limit)
 		return out, .Refused, built
 	}
 	if len(msg.question) != 1 {
-		out, built := dns.error_response(query, msg, .Form_Err, allocator, response_limit(msg, proto))
+		out, built := dns.error_response(query, msg, .Form_Err, allocator, limit)
 		return out, .Failed, built
 	}
 
 	q := msg.question[0]
-	limit := response_limit(msg, proto)
+
+	/*
+	A client that cannot show a cookie we issued is turned away before any work
+	is done, when that is what the configuration asks for.
+
+	This is the whole point of the mechanism: an off-path attacker forging a
+	query from someone else's address has never seen a cookie for that address,
+	so it cannot get past here, and the answer it was trying to have sent
+	somewhere is never looked up. The cost falls on the honest client too - one
+	extra round trip the first time it asks - which is why it is off by default
+	and meant for use while an attack is actually happening (RFC 7873 section
+	5.2.3).
+	*/
+	if cookie_must_be_refused(s.cookies, cookie, proto) {
+		out, built := dns.error_response(query, msg, .Bad_Cookie, allocator, limit)
+		log_query(s, client, proto, q, .Refused, "cookie", started)
+		return out, .Refused, built
+	}
 
 	if q.class == .CH {
 		if out, handled := answer_chaos(s, msg, q, allocator, limit); handled {
@@ -173,6 +225,48 @@ handle_query :: proc(
 		} else {
 			validating = false
 		}
+	}
+
+	/*
+	The client's cookie stops here.
+
+	It is a shared secret between that client and this server, so an upstream
+	has no business seeing it - a stable identifier for the client, handed to
+	somebody who cannot check it and did not need it. And the server half of it
+	is one we minted: an upstream that implements cookies would hash it against
+	its own secret, decide it is a forgery and answer BADCOOKIE instead of
+	answering the question. Cookies towards the upstream, if they are ever
+	wanted, are ours to negotiate separately.
+
+	Asked as "the query carried one" rather than as anything about this server's
+	own cookie settings. With `cookies.enabled` off there is no verdict to reach
+	and every query looks cookie-less, and with `cookies.upstream` off nothing
+	replaces the option on the way out - so reading the verdict here let the
+	client's cookie travel whenever both were turned off, and to DoT and DoH
+	upstreams, which never carry a cookie of ours, whenever the first one was.
+	*/
+	if cookie.sent {
+		stripped, done := dns.remove_edns_option(forwarded, .Cookie, allocator)
+		if !done {
+			/*
+			Failing closed. A query this server cannot take the cookie back out
+			of is not one to send on: forwarding it anyway would hand the
+			client's secret to the upstream, which is the one outcome this whole
+			block exists to prevent. Losing the answer is the cheaper mistake,
+			and the client is told so rather than left waiting.
+			*/
+			sync.atomic_add(&s.stats.failed, 1)
+			out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
+			logx.warnf(
+				"could not strip the client cookie from %s %s from %s; not forwarding",
+				dns.type_name(q.type),
+				dns.name_trim_root(q.name),
+				client,
+			)
+			log_query(s, client, proto, q, .Failed, "cookie", started)
+			return out, .Failed, built
+		}
+		forwarded = stripped
 	}
 
 	resp, winner, uerr := upstream.resolve(s.group, forwarded, allocator)
