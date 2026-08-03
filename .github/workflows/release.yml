@@ -58,6 +58,7 @@ jobs:
           cp packaging/elodin.service "$stage"/
           cp examples/elodin.yaml "$stage"/
           cp README.md "$stage"/
+          cp LICENSE "$stage"/
           tar -czf "$stage.tar.gz" "$stage"
 
       # The same binary, packaged for the distributions that can install one.

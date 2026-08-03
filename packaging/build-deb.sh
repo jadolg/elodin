@@ -103,6 +103,12 @@ grep -q '^ExecStart=/usr/bin/elodin ' "$unit" || {
 install -Dm644 "$repo_root/examples/elodin.yaml" "$stage/etc/elodin/elodin.yaml"
 install -Dm644 "$repo_root/README.md" "$stage/usr/share/doc/elodin/README.md"
 
+# `copyright` is the name dpkg, apt and every archive tool expect for the
+# licence, and the file Debian will not ship a package without. It is the
+# repository's LICENSE verbatim rather than a rewrite of it, so there is one
+# copy to keep current.
+install -Dm644 "$repo_root/LICENSE" "$stage/usr/share/doc/elodin/copyright"
+
 # Reported by apt before it downloads anything, so it is worth being right
 # rather than absent. Every payload file is in place by now.
 installed_size=$(du -k -s "$stage" | cut -f1)

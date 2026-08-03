@@ -998,3 +998,8 @@ Every one of these was invisible to the unit tests:
 Interoperability with a foreign HTTP/2 implementation is checked by hand with
 curl (which uses nghttp2): `curl --http2 -k -H 'content-type:
 application/dns-message' --data-binary @query.bin https://127.0.0.1:443/dns-query`.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Release tarballs and the .deb carry it too, the
+latter at `/usr/share/doc/elodin/copyright`.
