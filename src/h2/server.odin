@@ -391,13 +391,27 @@ handle_settings :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 				goaway(c, .Flow_Control_Error)
 				return false
 			}
-			// A change retroactively adjusts every open stream's window.
+			/*
+			A change retroactively adjusts every open stream's window, and a
+			stream carried past the maximum by that adjustment is the same
+			connection error as one carried there by a WINDOW_UPDATE (RFC 9113
+			section 6.9.2). The check above only refuses a settings *value* over
+			the maximum, which does not stop an already-raised window from being
+			nudged over it.
+			*/
 			delta := int(value) - c.peer_initial_window
 			c.peer_initial_window = int(value)
+			overflow := false
 			for _, s in c.streams {
 				s.send_window += delta
+				overflow ||= s.send_window > MAX_WINDOW
 			}
 			sync.cond_broadcast(&c.cond)
+			if overflow {
+				sync.mutex_unlock(&c.mu)
+				goaway(c, .Flow_Control_Error)
+				return false
+			}
 		}
 	}
 	sync.mutex_unlock(&c.mu)

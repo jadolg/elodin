@@ -345,13 +345,21 @@ client_handle_settings :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bo
 				client_goaway(c, .Flow_Control_Error)
 				return false
 			}
-			// A change retroactively adjusts every open stream's window.
+			// A change retroactively adjusts every open stream's window; see the
+			// server's handle_settings for why the result needs checking too.
 			delta := int(value) - c.peer_initial_window
 			c.peer_initial_window = int(value)
+			overflow := false
 			for _, s in c.streams {
 				s.send_window += delta
+				overflow ||= s.send_window > MAX_WINDOW
 			}
 			sync.cond_broadcast(&c.cond)
+			if overflow {
+				sync.mutex_unlock(&c.mu)
+				client_goaway(c, .Flow_Control_Error)
+				return false
+			}
 		}
 	}
 	sync.mutex_unlock(&c.mu)
