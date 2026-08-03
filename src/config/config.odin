@@ -142,6 +142,35 @@ Dnssec_Config :: struct {
 	max_nsec3_iterations: int,
 }
 
+Cookie_Config :: struct {
+	/*
+	Whether clients that send a DNS cookie get one back (RFC 7873).
+
+	On, because it costs one hash per query and takes the client-facing path
+	from "guess the transaction ID and the source port" to "guess a 64-bit
+	value you were never shown". Clients that do not use cookies are unaffected;
+	nothing is added to an answer whose query did not ask for it.
+	*/
+	enabled: bool,
+	/*
+	Whether a UDP query carrying a cookie must show a valid server cookie
+	before it is answered.
+
+	Off, because turning it on costs every new client an extra round trip: the
+	first query is answered with BADCOOKIE and a cookie to come back with. Worth
+	it while a spoofing attempt is actually under way, which is the case RFC
+	7873 section 5.2.3 has it for. Queries with no cookie at all, and queries
+	over TCP, DoT or DoH, are unaffected either way.
+	*/
+	require: bool,
+	/*
+	The secret cookies are keyed by, as 32 hex characters. Empty draws a random
+	one at startup, which is right for a single instance and wrong for several
+	behind one address: each would reject the cookies the others handed out.
+	*/
+	secret:  string,
+}
+
 Rewrite_Kind :: enum u8 {
 	A,
 	AAAA,
@@ -221,6 +250,7 @@ Config :: struct {
 	cache:     Cache_Config,
 	blocking:  Blocking_Config,
 	dnssec:    Dnssec_Config,
+	cookies:   Cookie_Config,
 	rewrites:  []Rewrite,
 }
 
@@ -287,6 +317,10 @@ default_config :: proc() -> Config {
 	c.dnssec = Dnssec_Config {
 		enabled              = true,
 		max_nsec3_iterations = 100,
+	}
+	c.cookies = Cookie_Config {
+		enabled = true,
+		require = false,
 	}
 	return c
 }

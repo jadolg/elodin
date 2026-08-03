@@ -57,6 +57,7 @@ load_string :: proc(src: string, allocator := context.allocator) -> (cfg: Config
 	load_cache(&l, &cfg)
 	load_blocking(&l, &cfg)
 	load_dnssec(&l, &cfg)
+	load_cookies(&l, &cfg)
 	load_rewrites(&l, &cfg)
 	validate(&l, &cfg)
 
@@ -637,6 +638,17 @@ load_dnssec :: proc(l: ^Loader, cfg: ^Config) {
 }
 
 @(private)
+load_cookies :: proc(l: ^Loader, cfg: ^Config) {
+	n := yaml.get(l.root, "cookies")
+	if n == nil {
+		return
+	}
+	opt_bool(l, n, "enabled", &cfg.cookies.enabled, "cookies")
+	opt_bool(l, n, "require", &cfg.cookies.require, "cookies")
+	opt_string(l, n, "secret", &cfg.cookies.secret, "cookies")
+}
+
+@(private)
 load_rewrites :: proc(l: ^Loader, cfg: ^Config) {
 	entries := yaml.items(yaml.get(l.root, "rewrites"))
 	if len(entries) == 0 {
@@ -799,4 +811,25 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 			errorf(l, "dnssec.trust_anchors[%d]: %q is not a DS record", i, anchor)
 		}
 	}
+
+	// Same reasoning: a secret that will not parse should fail `--check`, not
+	// leave a machine handing out cookies its neighbours reject.
+	if cfg.cookies.secret != "" && !valid_cookie_secret(cfg.cookies.secret) {
+		errorf(l, "cookies.secret must be 32 hexadecimal characters")
+	}
+}
+
+@(private)
+valid_cookie_secret :: proc(text: string) -> bool {
+	if len(text) != 32 {
+		return false
+	}
+	for i in 0 ..< len(text) {
+		switch text[i] {
+		case '0' ..= '9', 'a' ..= 'f', 'A' ..= 'F':
+		case:
+			return false
+		}
+	}
+	return true
 }

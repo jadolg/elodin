@@ -10,6 +10,7 @@ Pi-hole and AdGuard Home, minus the web interface. One binary, one YAML file.
 - Answer cache with negative caching and optional stale serving
 - Local rewrites (A, AAAA, CNAME, or "answer as if blocked")
 - DNSSEC validation against the root trust anchors, on by default
+- DNS cookies towards clients (RFC 7873/9018), on by default
 
 ## Requirements
 
@@ -383,6 +384,49 @@ Two things worth knowing about running with it on:
   which is unsigned by definition, from the child's, which is not. The answer
   section is validated in full; this affects only what rides alongside it.
 
+### DNS cookies
+
+```yaml
+cookies:
+  enabled: true
+  require: false
+  secret: ""             # 32 hex characters; empty draws a random one at startup
+```
+
+A client talking to elodin over UDP has two things standing between it and a
+forged answer from somewhere on the local network: a 16-bit transaction ID and a
+randomised source port. That is about 32 bits, and both are visible to anyone on
+the path. Cookies (RFC 7873, RFC 9018) add 64 bits that are not: a client that
+has asked once holds a token only this server could have produced, and an answer
+that comes back without it did not come from here.
+
+Nothing is remembered per client. The token is recomputed on each query from the
+client's own cookie, its address and a timestamp, keyed by a secret this process
+holds — so there is no table for a flood of clients to fill, and a cookie that
+does leak stops working within the hour. Clients that do not use cookies are
+untouched: an answer only carries one when the query did.
+
+`require` is the other half of the mechanism, and is off by default. With it on,
+a UDP query that carries a cookie but cannot show a valid server cookie is
+answered with BADCOOKIE and a cookie to come back with, before the name is
+looked up at all — so an attacker forging queries from someone else's address
+never gets an answer sent there. The cost falls on honest clients too, one extra
+round trip the first time each one asks, which is why RFC 7873 has it for use
+while an attack is actually under way. Queries carrying no cookie, and queries
+over TCP, DoT or DoH, are unaffected either way.
+
+`secret` matters when more than one elodin answers on the same address: without
+it each draws its own at startup and rejects the cookies the others handed out.
+A single instance can leave it empty.
+
+The client's cookie stops at elodin and is never forwarded upstream. It is a
+secret between that client and this server — a stable identifier an upstream has
+no business seeing — and its server half was minted here, so an upstream that
+implements cookies would read it as a forgery and answer BADCOOKIE instead of
+the question. elodin does not yet present cookies of its own to its upstreams;
+correlation there rests on the transaction ID, a randomised source port, the
+echoed question and 0x20 case randomisation.
+
 ### Rewrites
 
 ```yaml
@@ -409,8 +453,9 @@ With validation on, an answer for a client that did not ask for DNSSEC records
 is rebuilt without them; every other answer still goes back verbatim.
 
 Also handled: EDNS0 (the client's OPT record is forwarded upstream so payload
-sizes are negotiated end to end), truncation with the TC bit and the UDP→TCP
-retry, `version.bind`/`hostname.bind` in the CHAOS class, and refusal of
+sizes are negotiated end to end, minus its cookie, which stops here), DNS
+cookies towards clients (RFC 7873, RFC 9018), truncation with the TC bit and the
+UDP→TCP retry, `version.bind`/`hostname.bind` in the CHAOS class, and refusal of
 zone-transfer requests.
 
 The cache stores upstream answers as untouched wire bytes plus the offsets of
@@ -582,6 +627,11 @@ upstream traffic by the number of servers.
   round trip. Async upstream I/O, or several UDP reader threads behind
   `SO_REUSEPORT`, would lift both this and the item above; neither is needed at
   the scale measured in the previous section.
+- **DNS cookies are answered but not asked.** Clients get one; upstreams are
+  never sent one, so correlation on that side still rests on the transaction ID,
+  a randomised source port, the echoed question and 0x20 case randomisation. The
+  cookie secret is drawn once at startup and never rotated, so restarting costs
+  every client one extra round trip.
 - No per-client rules, no query log database, no web or API surface. Statistics
   go to the log every five minutes; there is no metrics endpoint to scrape.
 - Configuration is read once at startup; there is no reload signal yet.
@@ -597,7 +647,7 @@ src/filter/    sink-list matching and list-format parsers
 src/cache/     LRU answer cache
 src/dnssec/    validation: canonical form, signatures, NSEC/NSEC3, chain of trust
 src/upstream/  transports (UDP/TCP/DoT/DoH), pooling, strategies, HTTP/1.1 and h2 clients
-src/server/    resolver, listeners, DoH endpoint, list refresh
+src/server/    resolver, listeners, DoH endpoint, cookies, list refresh
 src/h2/        HTTP/2 framing, HPACK, and the server connection state machine
 src/tlsx/      OpenSSL bindings and a small TLS wrapper
 src/pool/      worker pool

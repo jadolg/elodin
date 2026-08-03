@@ -51,6 +51,7 @@ Server :: struct {
 	answers:      ^cache.Cache,
 	filters:      ^filter.Engine,
 	validator:    ^dnssec.Validator,
+	cookies:      ^Cookie_Keeper,
 	handler_pool: ^pool.Pool,
 	race_pool:    ^pool.Pool,
 	stats:        Stats,
@@ -95,17 +96,69 @@ handle_query :: proc(
 		return nil, .Failed, false
 	}
 
+	cookie := inspect_cookie(s.cookies, msg, client)
+	limit := response_limit(msg, proto)
+
+	// A cookie of an impossible length is the one case RFC 7873 section 5.2.2
+	// answers with FORMERR, and the one response that carries no cookie back:
+	// there is no telling which eight of those bytes were the client's.
+	if cookie.verdict == .Malformed {
+		out, built := dns.error_response(query, msg, .Form_Err, allocator, limit)
+		return out, .Failed, built
+	}
+
+	response, outcome, ok = resolve_query(s, query, msg, proto, client, limit, cookie, started, allocator)
+	if ok {
+		response = attach_cookie(s.cookies, response, cookie, msg, limit, allocator)
+	}
+	return response, outcome, ok
+}
+
+@(private)
+resolve_query :: proc(
+	s: ^Server,
+	query: []u8,
+	msg: dns.Message,
+	proto: Protocol,
+	client: string,
+	limit: int,
+	cookie: Cookie_Request,
+	started: time.Time,
+	allocator: mem.Allocator,
+) -> (
+	response: []u8,
+	outcome: Outcome,
+	ok: bool,
+) {
 	if msg.flags.opcode != .Query {
-		out, built := dns.error_response(query, msg, .Not_Impl, allocator, response_limit(msg, proto))
+		out, built := dns.error_response(query, msg, .Not_Impl, allocator, limit)
 		return out, .Refused, built
 	}
 	if len(msg.question) != 1 {
-		out, built := dns.error_response(query, msg, .Form_Err, allocator, response_limit(msg, proto))
+		out, built := dns.error_response(query, msg, .Form_Err, allocator, limit)
 		return out, .Failed, built
 	}
 
 	q := msg.question[0]
-	limit := response_limit(msg, proto)
+
+	/*
+	A client that cannot show a cookie we issued is turned away before any work
+	is done, when that is what the configuration asks for.
+
+	This is the whole point of the mechanism: an off-path attacker forging a
+	query from someone else's address has never seen a cookie for that address,
+	so it cannot get past here, and the answer it was trying to have sent
+	somewhere is never looked up. The cost falls on the honest client too - one
+	extra round trip the first time it asks - which is why it is off by default
+	and meant for use while an attack is actually happening (RFC 7873 section
+	5.2.3). Only UDP is checked; the stream transports already made the client
+	prove it can receive at the address it claims.
+	*/
+	if proto == .UDP && s.cookies != nil && s.cookies.require && cookie.verdict == .Unproven {
+		out, built := dns.error_response(query, msg, .Bad_Cookie, allocator, limit)
+		log_query(s, client, proto, q, .Refused, "cookie", started)
+		return out, .Refused, built
+	}
 
 	if q.class == .CH {
 		if out, handled := answer_chaos(s, msg, q, allocator, limit); handled {
@@ -172,6 +225,23 @@ handle_query :: proc(
 			forwarded = rewritten
 		} else {
 			validating = false
+		}
+	}
+
+	/*
+	The client's cookie stops here.
+
+	It is a shared secret between that client and this server, so an upstream
+	has no business seeing it - a stable identifier for the client, handed to
+	somebody who cannot check it and did not need it. And the server half of it
+	is one we minted: an upstream that implements cookies would hash it against
+	its own secret, decide it is a forgery and answer BADCOOKIE instead of
+	answering the question. Cookies towards the upstream, if they are ever
+	wanted, are ours to negotiate separately.
+	*/
+	if cookie.verdict != .Absent {
+		if stripped, done := dns.remove_edns_option(forwarded, .Cookie, allocator); done {
+			forwarded = stripped
 		}
 	}
 

@@ -157,6 +157,27 @@ dnssec:
   # arbitrary amount of work. RFC 9276 asks zones for zero.
   max_nsec3_iterations: 100
 
+cookies:
+  # Clients that send a DNS cookie get one back (RFC 7873). It costs one hash
+  # per query and it takes forging an answer to a client on this network from
+  # "guess the transaction ID and the source port" to "guess 64 bits you were
+  # never shown". Clients that do not use cookies are unaffected.
+  enabled: true
+
+  # Refuse to answer a UDP query that carries a cookie but cannot show a valid
+  # server cookie: it gets BADCOOKIE and a cookie to come back with, before the
+  # name is looked up at all. That stops an attacker forging queries from
+  # someone else's address, at the price of one extra round trip for every new
+  # client. Meant for use while an attack is actually under way. Queries with no
+  # cookie, and queries over TCP, DoT or DoH, are unaffected.
+  require: false
+
+  # The key cookies are derived from, as 32 hex characters. Empty draws a random
+  # one at each startup, which is right for a single instance. Set it when
+  # several elodins answer on one address, or they will reject each other's
+  # cookies.
+  # secret: e5e973e5a6b2a43f48e7dc849e37bfcf
+
 # Local answers. Wildcards match subdomains only.
 rewrites:
   - domain: nas.home
