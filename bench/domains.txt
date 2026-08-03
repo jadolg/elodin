@@ -1,0 +1,146 @@
+# Domains the DNSSEC survey asks about, one per line.
+#
+# The point of the survey is false failures: neither the unit tests nor the
+# integration suite can show that validation leaves working names working,
+# because both answer from fixtures. So this asks real names through elodin and
+# asks a reference validating resolver the same thing, and compares both the
+# rcode and the AD bit.
+#
+# A name marked `bogus` is deliberately broken and must be refused. Everything
+# else must resolve, and should agree with the reference on whether it was
+# authenticated.
+
+# Signed zones, a spread of algorithms and TLD operators.
+cloudflare.com
+www.cloudflare.com
+ietf.org
+iana.org
+icann.org
+nlnetlabs.nl
+ed25519.nl
+verisign.com
+internetsociety.org
+isc.org
+ripe.net
+nic.cz
+dnssec-tools.org
+kernel.org
+debian.org
+fedoraproject.org
+archlinux.org
+mozilla.org
+wikipedia.org
+wikimedia.org
+gov.uk
+nasa.gov
+nist.gov
+senate.gov
+house.gov
+usa.gov
+cisa.gov
+fbi.gov
+irs.gov
+weather.gov
+noaa.gov
+energy.gov
+va.gov
+si.edu
+berkeley.edu
+mit.edu
+stanford.edu
+harvard.edu
+cmu.edu
+ucla.edu
+umich.edu
+cornell.edu
+princeton.edu
+yale.edu
+columbia.edu
+nyu.edu
+bbc.co.uk
+ox.ac.uk
+cam.ac.uk
+ic.ac.uk
+ed.ac.uk
+tudelft.nl
+uva.nl
+surf.nl
+sidn.nl
+dnsimple.com
+comcast.net
+pir.org
+afilias.info
+switch.ch
+denic.de
+afnic.fr
+nic.fr
+registro.br
+jprs.jp
+twnic.tw
+kisa.or.kr
+cira.ca
+auda.org.au
+norid.no
+iis.se
+ficora.fi
+dk-hostmaster.dk
+nic.at
+nic.it
+nic.es
+dns.pt
+nic.pl
+nic.gr
+nic.ie
+nic.lv
+nic.lt
+nic.ee
+sk-nic.sk
+nic.si
+nic.hr
+nic.bg
+nic.ro
+nic.md
+nic.ua
+nic.by
+nic.kz
+nic.ge
+nic.am
+nic.az
+
+# Unsigned zones: these must resolve, and must not claim to be authenticated.
+example.com
+google.com
+amazon.com
+microsoft.com
+apple.com
+github.com
+stackoverflow.com
+reddit.com
+youtube.com
+facebook.com
+instagram.com
+linkedin.com
+netflix.com
+spotify.com
+twitch.tv
+ebay.com
+paypal.com
+adobe.com
+oracle.com
+salesforce.com
+dropbox.com
+slack.com
+zoom.us
+atlassian.com
+gitlab.com
+docker.com
+npmjs.com
+pypi.org
+rust-lang.org
+golang.org
+
+# Deliberately broken: every one of these must be refused.
+dnssec-failed.org bogus
+brokendnssec.net bogus
+sigfail.verteiltesysteme.net bogus
+rhybar.cz bogus
