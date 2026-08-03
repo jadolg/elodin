@@ -19,6 +19,9 @@ instead, and results are cached for BOOTSTRAP_TTL.
 BOOTSTRAP_TTL :: 1 * time.Hour
 
 @(private)
+BOOTSTRAP_TIMEOUT :: 3 * time.Second
+
+@(private)
 Bootstrap_Entry :: struct {
 	address: net.Address,
 	expires: time.Time,
@@ -106,7 +109,15 @@ resolve_address :: proc(host: string, bootstrap: []string) -> (addr: net.Address
 }
 
 @(private)
-bootstrap_query :: proc(server: string, hostname: string, qtype: dns.Type) -> (addr: net.Address, ok: bool) {
+bootstrap_query :: proc(
+	server: string,
+	hostname: string,
+	qtype: dns.Type,
+	timeout := BOOTSTRAP_TIMEOUT,
+) -> (
+	addr: net.Address,
+	ok: bool,
+) {
 	host, port, split_ok := net.split_port(server)
 	if !split_ok {
 		return nil, false
@@ -138,33 +149,57 @@ bootstrap_query :: proc(server: string, hostname: string, qtype: dns.Type) -> (a
 		return nil, false
 	}
 	defer net.close(socket)
-	set_socket_timeouts(socket, 3 * time.Second)
+	set_socket_timeouts(socket, timeout)
 
 	if _, send_err := net.send_udp(socket, wire, endpoint); send_err != nil {
 		return nil, false
 	}
 
-	buf := make([]u8, 4096, context.temp_allocator)
-	n, _, recv_err := net.recv_udp(socket, buf)
-	if recv_err != nil || n < dns.HEADER_SIZE {
-		return nil, false
-	}
+	/*
+	Same checks the main exchange path applies in `exchange_udp`: the datagram
+	has to come from the server that was asked and answer the question that was
+	sent. The ID on its own is 16 bits an off-path attacker can guess inside the
+	receive window, and what it would land in is cached for BOOTSTRAP_TTL and
+	consulted for blocklist hosts as well as upstream addresses.
 
-	msg, dec_err := dns.decode_message(buf[:n], context.temp_allocator)
-	if dec_err != .None || msg.id != query.id {
-		return nil, false
-	}
-	for rec in msg.answer {
-		#partial switch d in rec.data {
-		case dns.Rdata_A:
-			return net.IP4_Address(d.addr), true
-		case dns.Rdata_AAAA:
-			v6: net.IP6_Address
-			for i in 0 ..< 8 {
-				v6[i] = u16be(u16(d.addr[i * 2]) << 8 | u16(d.addr[i * 2 + 1]))
-			}
-			return v6, true
+	A datagram that fails them is dropped and the wait resumes, so a forgery
+	arriving first does not deny the real answer the rest of the window.
+	*/
+	buf := make([]u8, 4096, context.temp_allocator)
+	deadline := time.time_add(time.now(), timeout)
+
+	for time.diff(deadline, time.now()) < 0 {
+		n, remote, recv_err := net.recv_udp(socket, buf)
+		if recv_err != nil {
+			return nil, false
 		}
+		if n < dns.HEADER_SIZE {
+			continue
+		}
+		if remote.port != endpoint.port || !addresses_equal(remote.address, endpoint.address) {
+			continue
+		}
+		if !response_matches(wire, buf[:n]) {
+			continue
+		}
+
+		msg, dec_err := dns.decode_message(buf[:n], context.temp_allocator)
+		if dec_err != .None {
+			return nil, false
+		}
+		for rec in msg.answer {
+			#partial switch d in rec.data {
+			case dns.Rdata_A:
+				return net.IP4_Address(d.addr), true
+			case dns.Rdata_AAAA:
+				v6: net.IP6_Address
+				for i in 0 ..< 8 {
+					v6[i] = u16be(u16(d.addr[i * 2]) << 8 | u16(d.addr[i * 2 + 1]))
+				}
+				return v6, true
+			}
+		}
+		return nil, false
 	}
 	return nil, false
 }

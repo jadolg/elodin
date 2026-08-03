@@ -315,6 +315,23 @@ test_truncated_chunked_body_is_released :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+// The query echoed back with the QR bit set and one A record from TEST-NET-3.
+@(private = "file")
+a_record_reply :: proc(query: []u8) -> []u8 {
+	out := make([dynamic]u8, 0, len(query) + 16, context.temp_allocator)
+	append(&out, ..query)
+	out[2] |= 0x80
+	out[6], out[7] = 0, 1 // one answer
+	// Owner name as a pointer back to the question at offset 12, then A/IN,
+	// a TTL, and a four-byte address from TEST-NET-3.
+	append(&out, 0xc0, 0x0c)
+	append(&out, 0, 1, 0, 1)
+	append(&out, 0, 0, 0, 60)
+	append(&out, 0, 4)
+	append(&out, 203, 0, 113, 7)
+	return out[:]
+}
+
 /*
 A responder that answers every query with one A record, so a bootstrap lookup
 gets far enough to be cached.
@@ -327,20 +344,169 @@ a_record_loop :: proc(m: ^Mock) {
 		if err != nil || n < dns.HEADER_SIZE {
 			continue
 		}
-		out := make([dynamic]u8, 0, n + 16, context.temp_allocator)
-		append(&out, ..buf[:n])
-		out[2] |= 0x80
-		out[6], out[7] = 0, 1 // one answer
-		// Owner name as a pointer back to the question at offset 12, then A/IN,
-		// a TTL, and a four-byte address from TEST-NET-3.
-		append(&out, 0xc0, 0x0c)
-		append(&out, 0, 1, 0, 1)
-		append(&out, 0, 0, 0, 60)
-		append(&out, 0, 4)
-		append(&out, 203, 0, 113, 7)
-		_, _ = net.send_udp(m.socket, out[:], client)
+		_, _ = net.send_udp(m.socket, a_record_reply(buf[:n]), client)
 		free_all(context.temp_allocator)
 	}
+}
+
+@(private = "file")
+Spoof_Mock :: struct {
+	socket:  net.UDP_Socket, // the address the query is sent to
+	spoofer: net.UDP_Socket, // an unrelated port the answer arrives from
+	stop:    bool,
+}
+
+// Answer from a port the resolver never asked, as an off-path forgery would.
+@(private = "file")
+spoof_loop :: proc(m: ^Spoof_Mock) {
+	buf: [512]u8
+	for !sync.atomic_load(&m.stop) {
+		n, client, err := net.recv_udp(m.socket, buf[:])
+		if err != nil || n < dns.HEADER_SIZE {
+			continue
+		}
+		_, _ = net.send_udp(m.spoofer, a_record_reply(buf[:n]), client)
+		free_all(context.temp_allocator)
+	}
+}
+
+// Answer with the right ID over a question that was never asked.
+@(private = "file")
+wrong_question_loop :: proc(m: ^Mock) {
+	buf: [512]u8
+	for !sync.atomic_load(&m.stop) {
+		n, client, err := net.recv_udp(m.socket, buf[:])
+		if err != nil || n <= dns.HEADER_SIZE + 1 {
+			continue
+		}
+		reply := a_record_reply(buf[:n])
+		// First byte of the first label of the question, so the name differs
+		// while the ID and the QR bit stay agreeable.
+		reply[dns.HEADER_SIZE + 1] = 'x'
+		_, _ = net.send_udp(m.socket, reply, client)
+		free_all(context.temp_allocator)
+	}
+}
+
+/*
+Bind a loopback UDP socket and report the endpoint it landed on.
+*/
+@(private = "file")
+bind_loopback_udp :: proc(t: ^testing.T) -> (socket: net.UDP_Socket, endpoint: net.Endpoint, ok: bool) {
+	sock, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if serr != nil {
+		testing.expectf(t, false, "cannot bind a loopback responder: %v", serr)
+		return {}, {}, false
+	}
+	bound, berr := net.bound_endpoint(sock)
+	if berr != nil {
+		net.close(sock)
+		testing.expectf(t, false, "cannot read the responder's port: %v", berr)
+		return {}, {}, false
+	}
+	return sock, bound, true
+}
+
+/*
+A bootstrap answer has to come from the server that was asked.
+
+The 16-bit ID is all an off-path attacker has to guess, and the entry it lands in
+is cached for an hour and used to resolve blocklist hosts as well as upstreams.
+*/
+@(test)
+test_bootstrap_ignores_a_reply_from_another_port :: proc(t: ^testing.T) {
+	m := Spoof_Mock{}
+	server, bound, ok := bind_loopback_udp(t)
+	if !ok {
+		return
+	}
+	spoofer, _, spoof_ok := bind_loopback_udp(t)
+	if !spoof_ok {
+		net.close(server)
+		return
+	}
+	m.socket, m.spoofer = server, spoofer
+	set_socket_timeouts(server, 50 * time.Millisecond)
+
+	responder := thread.create_and_start_with_poly_data(&m, spoof_loop)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(responder)
+		thread.destroy(responder)
+		net.close(server)
+		net.close(spoofer)
+	}
+
+	addr, found := bootstrap_query(
+		net.endpoint_to_string(bound, context.temp_allocator),
+		"mock.invalid",
+		.A,
+		200 * time.Millisecond,
+	)
+	testing.expect(t, !found, "an answer from a port we never asked was accepted")
+	testing.expect(t, addr == nil, "a rejected answer still produced an address")
+	free_all(context.temp_allocator)
+}
+
+// The question has to be echoed back too, as it is on the main exchange path.
+@(test)
+test_bootstrap_ignores_a_reply_to_another_question :: proc(t: ^testing.T) {
+	m := Mock{}
+	server, bound, ok := bind_loopback_udp(t)
+	if !ok {
+		return
+	}
+	m.socket = server
+	set_socket_timeouts(server, 50 * time.Millisecond)
+
+	responder := thread.create_and_start_with_poly_data(&m, wrong_question_loop)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(responder)
+		thread.destroy(responder)
+		net.close(server)
+	}
+
+	addr, found := bootstrap_query(
+		net.endpoint_to_string(bound, context.temp_allocator),
+		"mock.invalid",
+		.A,
+		200 * time.Millisecond,
+	)
+	testing.expect(t, !found, "an answer to a question we never asked was accepted")
+	testing.expect(t, addr == nil, "a rejected answer still produced an address")
+	free_all(context.temp_allocator)
+}
+
+// The honest responder is still accepted, so the checks above are not simply
+// refusing everything.
+@(test)
+test_bootstrap_accepts_the_server_it_asked :: proc(t: ^testing.T) {
+	m := Mock{}
+	server, bound, ok := bind_loopback_udp(t)
+	if !ok {
+		return
+	}
+	m.socket = server
+	set_socket_timeouts(server, 50 * time.Millisecond)
+
+	responder := thread.create_and_start_with_poly_data(&m, a_record_loop)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(responder)
+		thread.destroy(responder)
+		net.close(server)
+	}
+
+	addr, found := bootstrap_query(
+		net.endpoint_to_string(bound, context.temp_allocator),
+		"mock.invalid",
+		.A,
+		200 * time.Millisecond,
+	)
+	testing.expect(t, found, "the honest responder's answer was refused")
+	testing.expect_value(t, addr, net.Address(net.IP4_Address{203, 0, 113, 7}))
+	free_all(context.temp_allocator)
 }
 
 /*
