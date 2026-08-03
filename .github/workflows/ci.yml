@@ -20,8 +20,19 @@ jobs:
       - run: mise run check
 
   test:
-    name: Tests
-    runs-on: ubuntu-latest
+    name: Tests (${{ matrix.arch }})
+    # Releases ship an arm64 tarball, so the tests have to run on arm64 too.
+    # A release build is the wrong place to discover that the OpenSSL bindings
+    # or the wire parsers only hold on x86.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - name: Install OpenSSL headers
@@ -34,8 +45,16 @@ jobs:
       - run: mise run itest
 
   build:
-    name: Build
-    runs-on: ubuntu-latest
+    name: Build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - name: Install OpenSSL headers
