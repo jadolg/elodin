@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:mem"
 import "core:net"
 import "core:os"
+import "core:strings"
 import "core:sync"
 import "core:sys/posix"
 import "core:testing"
@@ -330,6 +331,81 @@ a_record_reply :: proc(query: []u8) -> []u8 {
 	append(&out, 0, 4)
 	append(&out, 203, 0, 113, 7)
 	return out[:]
+}
+
+/*
+A header field costs a line, and a line is all the header scan used to count.
+The 64 KB cap in `reader_line` bounds one line, not how many of them arrive, so
+a list host answering with field after short field kept the parser reading for
+as long as it cared to send. Nothing here is the caller's memory, but the work
+is ours, and a response that needs more than a hundred fields to be understood
+is not one worth waiting for.
+
+Trailers are the same loop by another name, so the chunked reader is held to the
+same count.
+*/
+@(private = "file")
+many_field_reply :: proc(count: int, trailers: bool) -> string {
+	b := strings.builder_make(context.temp_allocator)
+	strings.write_string(&b, "HTTP/1.1 200 OK\r\n")
+	if trailers {
+		strings.write_string(&b, "Transfer-Encoding: chunked\r\n")
+	} else {
+		strings.write_string(&b, "Content-Length: 0\r\n")
+	}
+	if !trailers {
+		for i in 0 ..< count {
+			fmt.sbprintf(&b, "X-Pad-%d: v\r\n", i)
+		}
+	}
+	strings.write_string(&b, "\r\n")
+	if trailers {
+		strings.write_string(&b, "0\r\n")
+		for i in 0 ..< count {
+			fmt.sbprintf(&b, "X-Trailer-%d: v\r\n", i)
+		}
+		strings.write_string(&b, "\r\n")
+	}
+	return strings.to_string(b)
+}
+
+@(test)
+test_header_count_is_capped :: proc(t: ^testing.T) {
+	Case :: struct {
+		count:    int,
+		trailers: bool,
+		refused:  bool,
+		what:     string,
+	}
+	CASES := []Case {
+		{MAX_HTTP_HEADERS - 1, false, false, "headers under the cap"},
+		{MAX_HTTP_HEADERS + 1, false, true, "headers over the cap"},
+		{MAX_HTTP_HEADERS - 1, true, false, "trailers under the cap"},
+		{MAX_HTTP_HEADERS + 1, true, true, "trailers over the cap"},
+	}
+
+	for c in CASES {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		defer mem.tracking_allocator_destroy(&track)
+
+		resp, err, ok := exchange_against(t, many_field_reply(c.count, c.trailers), &track)
+		if !ok {
+			return
+		}
+		if c.refused {
+			testing.expectf(t, err == .HTTP_Error, "%s: accepted with %v", c.what, err)
+			testing.expectf(t, resp.body == nil, "%s: a refused exchange returned a body", c.what)
+		} else {
+			testing.expectf(t, err == .None, "%s: refused with %v", c.what, err)
+		}
+
+		if resp.body != nil {
+			delete(resp.body, mem.tracking_allocator(&track))
+		}
+		expect_caller_holds_nothing(t, &track, c.what)
+		free_all(context.temp_allocator)
+	}
 }
 
 /*
