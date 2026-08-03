@@ -3,7 +3,9 @@ package server
 import "core:sync"
 import "core:thread"
 
-VERSION :: "0.1.0"
+// Stamped at build time from the git tag; see ELODIN_VERSION in mise.toml. A
+// build that bypasses mise reports "dev" rather than claiming a release number.
+VERSION :: #config(ELODIN_VERSION, "dev")
 
 /*
 Bookkeeping for connection-handling threads.
