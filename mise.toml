@@ -34,14 +34,21 @@ hide = true
 run = "mkdir -p bin"
 
 [tasks.build]
-description = "Build elodin (debug symbols, bounds checks on)"
+description = "Build elodin (debug symbols, unoptimised)"
 depends = ["prepare"]
 run = "odin build src/main -out:bin/elodin -collection:elodin=src -debug -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES"
 
 [tasks.release]
 description = "Build elodin optimised for speed"
 depends = ["prepare"]
-run = "odin build src/main -out:bin/elodin -collection:elodin=src -o:speed -disable-assert -no-bounds-check -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES"
+# Bounds checks stay on. Every parser this binary runs — DNS wire, HPACK, YAML,
+# HTTP/1.1 — reads bytes an attacker chose, and compiling the checks out is what
+# turns a missed guard there into a write at an offset the peer picked rather
+# than a crash. It has happened once already: a chunked size of sixteen `F`s
+# wrapped to a negative int and asked the reader for a slice ending before it
+# started. The cost of keeping them is 1-3% of CPU per query across every
+# transport and 38 KB of binary, measured with `mise run bench -only cpu`.
+run = "odin build src/main -out:bin/elodin -collection:elodin=src -o:speed -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES"
 
 [tasks.check]
 description = "Type-check every package without emitting a binary"
