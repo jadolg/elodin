@@ -100,6 +100,14 @@ provides the state, cache and configuration directories and nothing else on the
 filesystem is writable. `RestrictAddressFamilies=AF_INET AF_INET6` leaves it the
 two families it actually uses.
 
+`Restart=on-failure` covers a start that fails for a reason that passes, but
+`StartLimitBurst=5` over five minutes stops it retrying one that does not — a
+port it cannot have, a certificate it cannot read. The unit gives up in
+`failed`, where `systemctl status` and anything watching it will say so, rather
+than reporting `activating` forever and reloading the blocklists once every few
+seconds against a machine that has no resolver. `systemctl reset-failed elodin`
+clears that once the cause is dealt with.
+
 A published GitHub release carries a `linux-amd64` and a `linux-arm64` tarball
 built by `.github/workflows/release.yml`, each holding the optimised binary, the
 unit file and the example configuration, and a `.deb` of the same binary for

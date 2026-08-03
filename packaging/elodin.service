@@ -3,6 +3,18 @@ Description=elodin filtering DNS forwarder
 After=network-online.target
 Wants=network-online.target
 
+# Whatever keeps elodin from starting — something else on :53, a certificate it
+# cannot read — usually fails the same way on the next attempt too, and the
+# defaults never stop it trying: five starts in ten seconds, against a start
+# that spends about a second loading lists before it fails plus the two of
+# RestartSec, fits three attempts in the window and so retries forever, burning
+# a second of CPU each time and reporting "activating" while the machine has no
+# resolver. Five attempts spread over five minutes leaves a transient failure
+# room to clear and lets a permanent one stop, in `failed`, where `systemctl
+# status` and anything watching it will say so.
+StartLimitIntervalSec=5min
+StartLimitBurst=5
+
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/elodin --config /etc/elodin/elodin.yaml

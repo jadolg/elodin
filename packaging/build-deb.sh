@@ -287,6 +287,10 @@ fi
 db_stop
 
 if [ "$takeover" = true ]; then
+    # A unit that hit StartLimitBurst stays failed and refuses to start again
+    # until it is reset, so a reinstall or a dpkg-reconfigure after a failure
+    # would otherwise never get as far as trying.
+    systemctl reset-failed elodin.service >/dev/null 2>&1 || true
     systemctl restart elodin.service || true
 
     # The unit is Type=simple, so the restart above returned the moment exec
