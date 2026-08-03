@@ -125,6 +125,14 @@ blocking:
       url: https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt
       format: adblock
 
+    - name: android-tracking
+      url: https://raw.githubusercontent.com/Perflyst/PiHoleBlocklist/master/android-tracking.txt
+      format: domains
+
+    - name: cyberhost-malware
+      url: https://lists.cyberhost.uk/malware.txt
+      format: domains
+
     # A local file works the same way:
     # - name: personal
     #   file: /etc/elodin/blocklist.txt
