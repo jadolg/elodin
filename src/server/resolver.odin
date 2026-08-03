@@ -151,10 +151,9 @@ resolve_query :: proc(
 	somewhere is never looked up. The cost falls on the honest client too - one
 	extra round trip the first time it asks - which is why it is off by default
 	and meant for use while an attack is actually happening (RFC 7873 section
-	5.2.3). Only UDP is checked; the stream transports already made the client
-	prove it can receive at the address it claims.
+	5.2.3).
 	*/
-	if proto == .UDP && s.cookies != nil && s.cookies.require && cookie.verdict == .Unproven {
+	if cookie_must_be_refused(s.cookies, cookie, proto) {
 		out, built := dns.error_response(query, msg, .Bad_Cookie, allocator, limit)
 		log_query(s, client, proto, q, .Refused, "cookie", started)
 		return out, .Refused, built

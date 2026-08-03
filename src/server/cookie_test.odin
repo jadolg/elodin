@@ -491,3 +491,106 @@ test_cookie_secret_parsing :: proc(t: ^testing.T) {
 	testing.expect(t, !parse_cookie_secret("e5e973e5a6b2a43f48e7dc849e37bfcg", &secret), "a non-hex secret was accepted")
 	free_all(context.temp_allocator)
 }
+
+/*
+An address the hash cannot be taken over is not the same as no cookie at all.
+
+Both mean no cookie goes back - there is nothing to bind one to - but the client
+did send one, and `require` is a promise not to answer a UDP query this server
+cannot vouch for. Folding the two together made that promise fail open on the
+one input that cannot be checked.
+*/
+@(test)
+test_cookie_unbindable_address_is_kept_apart :: proc(t: ^testing.T) {
+	k := keeper("e5e973e5a6b2a43f48e7dc849e37bfcf")
+	sent := unhex("2464c4abcf10c957")
+
+	// A bracketed IPv6 address with no port is in here because `parse_endpoint`
+	// takes bare `::1` and refuses `[::1]`, so this is not only reachable
+	// through a listener that has lost its mind.
+	unbindable := []string{"", "not-an-address", "[::1]", "999.1.1.1", "/run/elodin.sock"}
+	for client in unbindable {
+		req := inspect_cookie(&k, query_with_cookie(sent), client)
+		testing.expectf(t, req.verdict == .Unbindable, "%q gave verdict %v", client, req.verdict)
+	}
+
+	// A missing port is not a missing address, and only the host is hashed.
+	bindable := []string{"198.51.100.100", "::1", "198.51.100.100:9999", "[::1]:53"}
+	for client in bindable {
+		req := inspect_cookie(&k, query_with_cookie(sent), client)
+		testing.expectf(t, req.verdict == .Unproven, "%q gave verdict %v", client, req.verdict)
+	}
+
+	// No COOKIE option is still Absent, whatever the address.
+	testing.expect_value(t, inspect_cookie(&k, query_with_cookie(nil), "").verdict, Cookie_Verdict.Absent)
+
+	free_all(context.temp_allocator)
+}
+
+// The gate is asked as "not proven", so a verdict it cannot vouch for is refused
+// rather than having to be listed.
+@(test)
+test_cookie_require_refuses_everything_unproven :: proc(t: ^testing.T) {
+	k := Cookie_Keeper {
+		require = true,
+	}
+	testing.expect(t, cookie_must_be_refused(&k, Cookie_Request{verdict = .Unproven}, .UDP), "Unproven was let through")
+	testing.expect(
+		t,
+		cookie_must_be_refused(&k, Cookie_Request{verdict = .Unbindable}, .UDP),
+		"an address no cookie can be bound to was let through",
+	)
+	testing.expect(t, !cookie_must_be_refused(&k, Cookie_Request{verdict = .Valid}, .UDP), "a valid cookie was refused")
+	testing.expect(
+		t,
+		!cookie_must_be_refused(&k, Cookie_Request{verdict = .Absent}, .UDP),
+		"a client that sent no cookie was refused",
+	)
+
+	// Only UDP, and only when asked for.
+	testing.expect(t, !cookie_must_be_refused(&k, Cookie_Request{verdict = .Unproven}, .TCP), "TCP was gated")
+	off := Cookie_Keeper{}
+	testing.expect(t, !cookie_must_be_refused(&off, Cookie_Request{verdict = .Unproven}, .UDP), "require is off")
+	testing.expect(t, !cookie_must_be_refused(nil, Cookie_Request{verdict = .Unproven}, .UDP), "cookies are off")
+}
+
+// End to end: the whole client-facing path, with an address the listener could
+// not have written but the gate must survive anyway.
+@(test)
+test_cookie_require_turns_away_an_unbindable_address :: proc(t: ^testing.T) {
+	out, ok := roundtrip(
+		t,
+		Roundtrip{cookie = unhex("2464c4abcf10c957"), client = "not-an-address", proto = .UDP, require = true},
+	)
+	if !testing.expect(t, ok, "no response") {
+		return
+	}
+	testing.expect_value(t, response_rcode(out), dns.Rcode.Bad_Cookie)
+
+	m, derr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+	testing.expect_value(t, len(m.answer), 0)
+
+	// And no cookie with it: there is no address to bind one to, so there is
+	// nothing honest to hand back.
+	_, found := response_cookie(out)
+	testing.expect(t, !found, "a cookie was minted for an address it cannot be bound to")
+
+	free_all(context.temp_allocator)
+}
+
+// With `require` off the query is still answered, just without a cookie.
+@(test)
+test_cookie_unbindable_address_is_answered_when_not_required :: proc(t: ^testing.T) {
+	out, ok := roundtrip(
+		t,
+		Roundtrip{cookie = unhex("2464c4abcf10c957"), client = "not-an-address", proto = .UDP},
+	)
+	if !testing.expect(t, ok, "no response") {
+		return
+	}
+	testing.expect_value(t, response_rcode(out), dns.Rcode.No_Error)
+	_, found := response_cookie(out)
+	testing.expect(t, !found, "a cookie was minted for an address it cannot be bound to")
+	free_all(context.temp_allocator)
+}

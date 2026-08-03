@@ -59,6 +59,16 @@ Cookie_Verdict :: enum u8 {
 	Absent,
 	// A COOKIE option of a length no client should have sent.
 	Malformed,
+	/*
+	A COOKIE option from an address the hash cannot be taken over, so there is
+	nothing to bind a cookie to and nothing to check one against.
+
+	Kept apart from `Absent` because the client did send one. Both mean no
+	cookie goes back, but only one of them means `require` has nothing to
+	enforce, and folding them together made that setting fail open on the single
+	input it cannot verify.
+	*/
+	Unbindable,
 	// A client cookie with nothing behind it, or one we cannot vouch for.
 	Unproven,
 	// Ours, for this address, and not yet stale.
@@ -159,9 +169,11 @@ inspect_cookie :: proc(k: ^Cookie_Keeper, m: dns.Message, client: string) -> (re
 
 	n, parsed := cookie_client_ip(client, req.ip[:])
 	if !parsed {
-		// Nothing to bind a cookie to, so there is no cookie to give.
+		// Nothing to bind a cookie to, so there is no cookie to give - but the
+		// client did send one, and `require` has to turn that away rather than
+		// wave it through for want of an address to check it against.
 		logx.debugf("cookies: %q is not an address a cookie can be bound to", client)
-		return {}
+		return Cookie_Request{verdict = .Unbindable}
 	}
 	req.ip_len = n
 	copy(req.client[:], raw[:COOKIE_CLIENT_LEN])
@@ -171,6 +183,25 @@ inspect_cookie :: proc(k: ^Cookie_Keeper, m: dns.Message, client: string) -> (re
 		req.verdict = .Valid
 	}
 	return req
+}
+
+/*
+Whether a query has to be turned away with BADCOOKIE before the name is looked
+up at all.
+
+Asked as "the client sent a cookie and it is not one of ours", rather than as a
+list of the verdicts that fail. A verdict this server cannot vouch for is one it
+should refuse, and enumerating them the other way round is what let an address
+the hash cannot be taken over walk straight past `require`.
+
+Only UDP is checked; the stream transports already made the client prove it can
+receive at the address it claims.
+*/
+cookie_must_be_refused :: proc(k: ^Cookie_Keeper, req: Cookie_Request, proto: Protocol) -> bool {
+	if k == nil || !k.require || proto != .UDP {
+		return false
+	}
+	return req.verdict != .Absent && req.verdict != .Valid
 }
 
 /*
@@ -189,7 +220,9 @@ attach_cookie :: proc(
 	limit: int,
 	allocator: mem.Allocator,
 ) -> []u8 {
-	if k == nil || req.verdict == .Absent || req.verdict == .Malformed {
+	// Named as the two verdicts that earn a cookie rather than the ones that do
+	// not, so a verdict added later gets none until someone says otherwise.
+	if k == nil || (req.verdict != .Unproven && req.verdict != .Valid) {
 		return wire
 	}
 	cookie := make_cookie(k, req, cookie_now())
