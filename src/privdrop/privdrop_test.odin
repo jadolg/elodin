@@ -72,7 +72,9 @@ reach, so it is refused instead.
 @(test)
 test_resolve_bare_numeric_uid_needs_a_group :: proc(t: ^testing.T) {
 	UID :: 60999
-	if posix.getpwuid(posix.uid_t(UID)) != nil {
+	// Through the same reentrant lookup `resolve` uses; `posix.getpwuid` answers
+	// out of a buffer the other tests in this package are reading at the time.
+	if _, taken := group_of_uid(posix.uid_t(UID)); taken {
 		log.info("uid 60999 has a passwd entry here; skipping")
 		return
 	}
