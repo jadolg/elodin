@@ -36,12 +36,14 @@ Client :: struct {
 	peer_initial_window: int,
 	send_window:         int,
 
-	decoder:         Dynamic_Table,
-	streams:         map[u32]^Client_Stream,
+	decoder:             Dynamic_Table,
+	streams:             map[u32]^Client_Stream,
 	// Scratch for a response header block spanning CONTINUATION frames. Only
 	// the reader goroutine touches this, so it needs no lock.
-	header_scratch:  [dynamic]u8,
-	continuation_on: u32,
+	header_scratch:      [dynamic]u8,
+	continuation_on:     u32,
+	// How many CONTINUATION frames have arrived for the block currently open.
+	continuation_frames: int,
 
 	allocator: mem.Allocator,
 }
@@ -103,7 +105,7 @@ client_make :: proc(io: IO, allocator := context.allocator) -> ^Client {
 	c.send_window = DEFAULT_WINDOW
 	c.streams = make(map[u32]^Client_Stream, 16, allocator)
 	c.header_scratch = make([dynamic]u8, 0, 256, allocator)
-	dynamic_table_init(&c.decoder, 4096, allocator)
+	dynamic_table_init(&c.decoder, DEFAULT_HEADER_TABLE_SIZE, allocator)
 
 	// Sent here rather than from client_serve so it happens before this
 	// procedure returns: client_serve only starts once the caller has spawned
@@ -241,7 +243,12 @@ client_send_preface :: proc(c: ^Client) -> bool {
 	// protocol violation rather than something to handle.
 	// SETTINGS_INITIAL_WINDOW_SIZE raised to match the connection window
 	// below, so the peer is never throttled sending us a response.
-	write_frame_header(&out, 18, .Settings, 0, 0)
+	// SETTINGS_HEADER_TABLE_SIZE states the size this end's decoder was built
+	// with, which is the ceiling `decode` holds an upstream's table size
+	// updates to.
+	write_frame_header(&out, 24, .Settings, 0, 0)
+	append(&out, 0, u8(Setting.Header_Table_Size))
+	append_u32(&out, DEFAULT_HEADER_TABLE_SIZE)
 	append(&out, 0, u8(Setting.Enable_Push))
 	append_u32(&out, 0)
 	append(&out, 0, u8(Setting.Initial_Window_Size))
@@ -427,6 +434,7 @@ client_handle_headers :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> boo
 
 	if h.flags & FLAG_END_HEADERS == 0 {
 		c.continuation_on = h.stream_id
+		c.continuation_frames = 0
 		return true
 	}
 	return client_finish_headers(c, h.stream_id)
@@ -443,7 +451,16 @@ client_handle_continuation :: proc(c: ^Client, h: Frame_Header, payload: []u8) -
 	HEADERS nor CONTINUATION is flow-controlled, and HPACK's own limit lives in
 	`decode`, which never runs for a block whose END_HEADERS never arrives. An
 	upstream that sent these without end would otherwise grow this without end.
+
+	Counted as well, because a size cap is no cap against frames that carry
+	nothing: an empty CONTINUATION advances neither the block nor this check,
+	and holds the reader on a block that never ends.
 	*/
+	c.continuation_frames += 1
+	if c.continuation_frames > MAX_CONTINUATION_FRAMES {
+		client_goaway(c, .Enhance_Your_Calm)
+		return false
+	}
 	if len(c.header_scratch) + len(payload) > MAX_HEADER_LIST {
 		client_goaway(c, .Compression_Error)
 		return false

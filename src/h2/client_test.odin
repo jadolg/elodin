@@ -865,3 +865,41 @@ test_h2_status_is_three_digits :: proc(t: ^testing.T) {
 		}
 	}
 }
+
+/*
+The client side of the empty-CONTINUATION flood.
+
+The byte cap in `client_handle_continuation` measures what arrives, and an empty
+CONTINUATION brings nothing - so the header block it is waiting on stays open
+and the frames keep coming. The peer here is an upstream DoH server rather than
+anyone who can reach a listener, which is why this is smaller than the server
+side, but a reader thread that never gets to the end of a block is a reader
+thread that never serves the responses behind it.
+*/
+@(test)
+test_client_empty_continuation_flood_is_refused :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	c := client_make(IO{user = nil, read = hook_read_nothing, write = write_nothing}, allocator)
+	c.continuation_on = 1
+
+	sent := 0
+	refused := false
+	for _ in 0 ..< 10000 {
+		sent += 1
+		if !client_handle_continuation(c, Frame_Header{length = 0, type = .Continuation, stream_id = 1}, nil) {
+			refused = true
+			break
+		}
+	}
+	testing.expectf(t, refused, "%d empty CONTINUATION frames were all accepted", sent)
+
+	client_unref(c)
+	free_all(context.temp_allocator)
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%d bytes leaked at %v", entry.size, entry.location)
+	}
+}

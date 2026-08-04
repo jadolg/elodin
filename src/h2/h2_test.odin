@@ -441,6 +441,77 @@ test_data_frame_cannot_touch_a_closed_stream :: proc(t: ^testing.T) {
 // Bounds on what one peer can make a connection hold or wait for
 // ---------------------------------------------------------------------------
 
+/*
+A dynamic table size update may not exceed the size this end advertised.
+
+RFC 7541 6.3: "The new maximum size MUST be lower than or equal to the limit
+determined by the protocol using HPACK", and 4.2 makes a larger value a
+decoding error. The limit here is 4096 - what `dynamic_table_init` is given on
+both the server and the client connection, and what SETTINGS_HEADER_TABLE_SIZE
+states.
+
+What the decoder enforced instead was 65536, a constant of its own with no
+relation to the number the table was built with. The two are supposed to be the
+same number.
+
+Not all of that 65536 was reachable: `read_integer` refuses any value past
+MAX_HEADER_LIST, so an update above 32 KiB was already a decoding error by
+another route, and what a peer could actually take was eight times the size
+this end agreed to rather than sixteen. Both boundaries are here, each with the
+error that turns it away, so which one does the work is on the record.
+*/
+@(test)
+test_dynamic_table_update_is_bounded_by_the_advertised_limit :: proc(t: ^testing.T) {
+	LIMIT :: 4096
+
+	Case :: struct {
+		size:     int,
+		accepted: bool,
+		err:      Hpack_Error,
+		what:     string,
+	}
+
+	CASES := []Case {
+		{0, true, .None, "down to nothing"},
+		{512, true, .None, "under the limit"},
+		{LIMIT, true, .None, "exactly the limit"},
+		{LIMIT + 1, false, .Bad_Update, "one byte past the limit"},
+		{8192, false, .Bad_Update, "twice the limit"},
+		{MAX_HEADER_LIST, false, .Bad_Update, "the largest update that gets this far"},
+		// Past what `read_integer` will read at all, whatever it is for.
+		{MAX_HEADER_LIST + 1, false, .Too_Large, "past the integer cap"},
+		{65536, false, .Too_Large, "the old local cap"},
+	}
+
+	for c in CASES {
+		table: Dynamic_Table
+		dynamic_table_init(&table, LIMIT, context.temp_allocator)
+
+		block := make([dynamic]u8, 0, 16, context.temp_allocator)
+		write_integer(&block, 5, c.size, 0x20)
+		// A real field behind the update, so what is measured is a block a peer
+		// would actually send rather than a lone update.
+		append(&block, 0x82) // indexed: :method GET
+
+		headers, err := decode(&table, block[:], context.temp_allocator)
+		if c.accepted {
+			testing.expectf(t, err == .None, "an update %s was refused: %v", c.what, err)
+			testing.expectf(t, table.max_size == c.size, "%s: the table is %d, expected %d", c.what, table.max_size, c.size)
+			testing.expectf(t, len(headers) == 1, "%s: %d headers decoded", c.what, len(headers))
+		} else {
+			testing.expectf(t, err == c.err, "an update %s gave %v, expected %v", c.what, err, c.err)
+			testing.expectf(
+				t,
+				table.max_size == LIMIT,
+				"%s: the table was resized to %d anyway",
+				c.what,
+				table.max_size,
+			)
+		}
+		free_all(context.temp_allocator)
+	}
+}
+
 @(test)
 test_continuation_flood_is_refused :: proc(t: ^testing.T) {
 	/*
@@ -490,6 +561,48 @@ test_continuation_flood_is_refused :: proc(t: ^testing.T) {
 	conn_unref(c)
 	free_all(context.temp_allocator)
 	expect_no_leaks(t, &track, "continuation flood")
+}
+
+/*
+The same flood with nothing in the frames.
+
+A byte cap is no cap at all against a peer that sends no bytes: an empty
+CONTINUATION never advances `len(s.header_block)`, so the block stays open and
+the frames keep coming. Nothing accrues, which is why this is small, but the
+reader thread reads and dispatches nine-byte frames for as long as the peer
+cares to send them and the block it is waiting on never ends.
+
+So the frames are counted as well as measured.
+*/
+@(test)
+test_empty_continuation_flood_is_refused :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil, allocator)
+
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = 0, stream_id = 1}, block)
+	testing.expect(t, ok, "handle_headers failed")
+
+	// Far more than the cap, and far fewer than a peer would need to send to
+	// make this worth doing.
+	sent := 0
+	refused := false
+	for _ in 0 ..< 10000 {
+		sent += 1
+		if !handle_continuation(c, Frame_Header{length = 0, type = .Continuation, stream_id = 1}, nil) {
+			refused = true
+			break
+		}
+	}
+	testing.expectf(t, refused, "%d empty CONTINUATION frames were all accepted", sent)
+
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "empty continuation flood")
 }
 
 /*
