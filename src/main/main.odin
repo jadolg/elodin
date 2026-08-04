@@ -45,6 +45,21 @@ orderly shutdown.
 @(private)
 stop_requested: bool
 
+/*
+Set by the SIGHUP handler, consumed by the maintenance loop.
+
+Unlike `stop_requested` this never needs to be reset by the handler: the loop
+clears it the moment it acts on it, so a second SIGHUP arriving before that
+just asks for the same thing again rather than escalating to anything.
+*/
+@(private)
+reload_requested: bool
+
+@(private)
+on_reload_signal :: proc "c" (sig: posix.Signal) {
+	sync.atomic_store(&reload_requested, true)
+}
+
 @(private)
 on_stop_signal :: proc "c" (sig: posix.Signal) {
 	if !sync.atomic_exchange(&stop_requested, true) {
@@ -84,23 +99,53 @@ install_stop_handlers :: proc() {
 }
 
 /*
-Sleep until the next tick, or until a signal asks us to stop.
+SIGHUP asks the maintenance loop to reload the DoT/DoH certificates from the
+paths already in the configuration, without restarting the process.
+
+Nothing else about the configuration is reloaded - listener addresses, the
+upstream set, blocking, all of that still needs a restart - but a certificate
+renewed in place by certbot or its equivalent is the one thing that otherwise
+forces a resolver to bounce on a schedule it does not control.
+*/
+install_reload_handler :: proc() {
+	act: posix.sigaction_t
+	act.sa_handler = on_reload_signal
+	if posix.sigaction(.SIGHUP, &act, nil) != .OK {
+		fmt.eprintfln("elodin: cannot install a handler for SIGHUP; it will terminate the process instead")
+	}
+}
+
+@(private)
+Wait_Outcome :: enum u8 {
+	Tick,
+	Stop,
+	Reload,
+}
+
+/*
+Sleep until the next tick, or until a signal asks for something sooner.
 
 Sliced rather than left as one long sleep: a handler can only set a flag, so
 the loop has to come back and look. Anything less often than this and an
-operator waits on a service that has already been told to go.
+operator waits on a service that has already been told to go - or, for
+`Reload`, on a certificate that is already sitting on disk waiting to be
+picked up. `Reload` cuts the wait short rather than sitting out the rest of
+the tick, which otherwise could be the better part of `TICK`.
 */
 @(private)
-wait_for_tick :: proc(tick: time.Duration) -> (carry_on: bool) {
+wait_for_tick :: proc(tick: time.Duration) -> Wait_Outcome {
 	SLICE :: 200 * time.Millisecond
 	deadline := time.time_add(time.now(), tick)
 	for {
 		if sync.atomic_load(&stop_requested) {
-			return false
+			return .Stop
+		}
+		if sync.atomic_exchange(&reload_requested, false) {
+			return .Reload
 		}
 		remaining := time.diff(time.now(), deadline)
 		if remaining <= 0 {
-			return true
+			return .Tick
 		}
 		time.sleep(min(SLICE, remaining))
 	}
@@ -113,6 +158,7 @@ main :: proc() {
 	// through the normal error path instead.
 	posix.sigignore(.SIGPIPE)
 	install_stop_handlers()
+	install_reload_handler()
 
 	opts, ok := parse_args()
 	if !ok {
@@ -257,7 +303,7 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 		cfg.dnssec.enabled,
 	)
 
-	maintenance_loop(&s, group, answers, cfg, opts)
+	maintenance_loop(&s, &listeners, group, answers, cfg, opts)
 }
 
 /*
@@ -313,11 +359,13 @@ drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity) {
 Periodic housekeeping.
 
 Runs on the main thread, which otherwise has nothing to do once the listeners
-are up: expire cache entries, close idle upstream connections, and refresh the
-blocklists when their interval comes round.
+are up: expire cache entries, close idle upstream connections, refresh the
+blocklists when their interval comes round, and reload the TLS certificates
+when SIGHUP asks for it.
 */
 maintenance_loop :: proc(
 	s: ^server.Server,
+	listeners: ^server.Listeners,
 	group: ^upstream.Group,
 	answers: ^cache.Cache,
 	cfg: ^config.Config,
@@ -328,10 +376,17 @@ maintenance_loop :: proc(
 	last_report := time.now()
 
 	for sync.atomic_load(&s.running) {
-		if !wait_for_tick(TICK) {
+		switch wait_for_tick(TICK) {
+		case .Stop:
 			logx.infof("signal received, shutting down")
 			sync.atomic_store(&s.running, false)
-			break
+			continue
+		case .Reload:
+			logx.infof("SIGHUP received, reloading TLS certificates")
+			server.reload_tls(s, listeners)
+			free_all(context.temp_allocator)
+			continue
+		case .Tick:
 		}
 
 		if answers != nil {

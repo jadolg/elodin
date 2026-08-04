@@ -18,6 +18,9 @@ StartLimitBurst=5
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/elodin --config /etc/elodin/elodin.yaml
+# SIGHUP reloads the DoT/DoH certificates in place; see "Reloading" in the
+# README for what that does and does not cover.
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s
 

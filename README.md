@@ -229,6 +229,19 @@ up to `server.client_timeout` (ten seconds by default). That is comfortably
 inside systemd's `TimeoutStopSec`. A second signal skips the wait and terminates
 immediately, for when that is not what you want.
 
+### Reloading
+
+`SIGHUP` re-reads the DoT/DoH certificate and key files from the paths already
+in the configuration and switches the listeners over to what they now contain
+— `systemctl reload elodin`, or `kill -HUP` directly, with no restart and no
+dropped connections: a session already in progress keeps using the
+certificate it handshook with until it closes. A certificate that fails to
+load, the wrong key or a renewal caught mid-write, is logged and left alone;
+the listener keeps serving whatever it already had.
+
+Nothing else about the configuration is reloaded this way — listener
+addresses, the upstream set, blocking — those still need a restart.
+
 ### Observing it
 
 There is no metrics endpoint. Statistics go to the log every five minutes —
@@ -729,7 +742,10 @@ upstream traffic by the number of servers.
   each upstream one extra round trip.
 - No per-client rules, no query log database, no web or API surface. Statistics
   go to the log every five minutes; there is no metrics endpoint to scrape.
-- Configuration is read once at startup; there is no reload signal yet.
+- Configuration is read once at startup, with one exception: `SIGHUP` reloads
+  the DoT/DoH certificates (see [Reloading](#reloading)). Nothing else -
+  listener addresses, the upstream set, blocking - can be changed without a
+  restart yet.
 
 ## Layout
 

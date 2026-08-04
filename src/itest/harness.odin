@@ -285,6 +285,21 @@ signal_shutdown :: proc(srv: ^Server, within: time.Duration) -> (state: os.Proce
 	return {}, false
 }
 
+/*
+Ask for a certificate reload the way an operator would.
+
+`systemctl reload` on the shipped unit sends this, or an operator's own
+`kill -HUP` does. Unlike `signal_shutdown` there is nothing here to wait for -
+the process keeps running - so this only reports whether the signal was
+delivered; the caller checks the effect through the log or a fresh connection.
+*/
+signal_reload :: proc(srv: ^Server) -> bool {
+	if !srv.running {
+		return false
+	}
+	return posix.kill(posix.pid_t(srv.process.pid), .SIGHUP) == .OK
+}
+
 read_log :: proc(srv: ^Server) -> string {
 	data, err := os.read_entire_file(srv.log_path, context.temp_allocator)
 	if err != nil {
