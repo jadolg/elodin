@@ -797,3 +797,71 @@ test_client_settings_window_change_is_bounded :: proc(t: ^testing.T) {
 		testing.expectf(t, false, "settings window overflow: %d bytes leaked at %v", entry.size, entry.location)
 	}
 }
+
+@(private = "file")
+write_nothing :: proc(user: rawptr, buf: []u8) -> bool {
+	return true
+}
+
+/*
+`:status` is exactly three digits (RFC 9113 8.3.2), and this is where an
+upstream's word for how its answer went is taken.
+
+`strconv.parse_int` with its default base reads more than that: `0x1` is a 1,
+`1_0` is a 10, a sign is allowed, and a fourth digit is quietly dropped because
+the field is not measured. A response that says `0x2c8` where a conforming peer
+would say nothing intelligible then reads as 712 here - and further along, as
+whatever the number happens to fall on either side of a `== 200`.
+
+Anything that is not three digits is no status at all, and 0 is how that is
+already reported for a `:status` the peer left out.
+*/
+@(test)
+test_h2_status_is_three_digits :: proc(t: ^testing.T) {
+	Case :: struct {
+		value:  string,
+		status: int,
+		what:   string,
+	}
+
+	CASES := []Case {
+		{"200", 200, "three digits"},
+		{"404", 404, "three digits again, not from the static table"},
+		{"0x1", 0, "hexadecimal"},
+		{"0b11001000", 0, "binary"},
+		{"1_0", 0, "a digit separator"},
+		{"+200", 0, "a sign"},
+		{"20", 0, "two digits"},
+		{"2000", 0, "four digits"},
+		{"", 0, "nothing at all"},
+	}
+
+	for c in CASES {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		defer mem.tracking_allocator_destroy(&track)
+		allocator := mem.tracking_allocator(&track)
+
+		client := client_make(IO{user = nil, read = hook_read_nothing, write = write_nothing}, allocator)
+
+		s := new(Client_Stream, allocator)
+		s.id = 1
+		s.send_window = client.peer_initial_window
+		s.body = make([dynamic]u8, 0, 8, allocator)
+		client.streams[1] = s
+
+		block := make([dynamic]u8, 0, 64, context.temp_allocator)
+		encode_header(&block, ":status", c.value)
+		clear(&client.header_scratch)
+		append(&client.header_scratch, ..block[:])
+
+		testing.expectf(t, client_finish_headers(client, 1), "%s: the header block did not decode", c.what)
+		testing.expectf(t, s.status == c.status, "%s: %q came back as status %d, expected %d", c.what, c.value, s.status, c.status)
+
+		client_unref(client)
+		free_all(context.temp_allocator)
+		for _, entry in track.allocation_map {
+			testing.expectf(t, false, "%s: %d bytes leaked at %v", c.what, entry.size, entry.location)
+		}
+	}
+}

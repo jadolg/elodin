@@ -971,6 +971,68 @@ test_content_length_out_of_range_is_refused :: proc(t: ^testing.T) {
 }
 
 /*
+The response side of the same field, held to the same grammar.
+
+`Content-Length` is `1*DIGIT` (RFC 9110 8.6) and the status code is exactly
+three of them (RFC 9112 4). `strconv.parse_int` with its default base reads a
+good deal more: a prefix picks the base, so `0x10` is 16; `_` between digits is
+skipped; a sign is allowed; and the accumulator wraps in silence, so a value
+past 64 bits comes back as something small enough to pass the range check that
+follows it.
+
+What reaches this parser is a blocklist server's reply or a DoH upstream's, over
+a connection this client keeps alive and reuses. A length it reads differently
+from the peer that sent it leaves the reader standing in the middle of a body,
+and the next response read off that connection starts from wherever that landed.
+The server-side half of this is in `server/doh.odin`, where it is a smuggling
+primitive rather than a desync with oneself.
+*/
+@(test)
+test_response_framing_fields_are_strict_decimal :: proc(t: ^testing.T) {
+	Case :: struct {
+		reply:    string,
+		accepted: bool,
+		what:     string,
+	}
+
+	CASES := []Case {
+		{"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", true, "a plain decimal length"},
+		{"HTTP/1.1 200 OK\r\nContent-Length: 0x5\r\n\r\nhello", false, "a hexadecimal length"},
+		{"HTTP/1.1 200 OK\r\nContent-Length: 0b101\r\n\r\nhello", false, "a binary length"},
+		{"HTTP/1.1 200 OK\r\nContent-Length: 1_0\r\n\r\nhelloworld", false, "a digit separator in the length"},
+		{"HTTP/1.1 200 OK\r\nContent-Length: +5\r\n\r\nhello", false, "a signed length"},
+		// 2^64 + 5: the accumulator wraps to 5, and 5 is a fine length.
+		{"HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551621\r\n\r\nhello", false, "a length past 64 bits"},
+		{"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 0\r\n\r\nhello", false, "conflicting lengths"},
+		{"HTTP/1.1 0x1 OK\r\nContent-Length: 0\r\n\r\n", false, "a hexadecimal status"},
+		{"HTTP/1.1 1_0 OK\r\nContent-Length: 0\r\n\r\n", false, "a digit separator in the status"},
+		{"HTTP/1.1 2000 OK\r\nContent-Length: 0\r\n\r\n", false, "a four-digit status"},
+	}
+
+	for c in CASES {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		defer mem.tracking_allocator_destroy(&track)
+
+		resp, err, ok := exchange_against(t, c.reply, &track)
+		if !ok {
+			return
+		}
+		if c.accepted {
+			testing.expectf(t, err == .None, "%s was refused: %v", c.what, err)
+			testing.expectf(t, string(resp.body) == "hello", "%s: body came back as %q", c.what, string(resp.body))
+		} else {
+			testing.expectf(t, err != .None, "%s was accepted, with a %d byte body", c.what, len(resp.body))
+		}
+		if resp.body != nil {
+			delete(resp.body, mem.tracking_allocator(&track))
+		}
+		expect_caller_holds_nothing(t, &track, c.what)
+		free_all(context.temp_allocator)
+	}
+}
+
+/*
 An answer as large as the query said it could be must arrive whole.
 
 `recv_udp` fills the buffer it is given and drops the rest of the datagram

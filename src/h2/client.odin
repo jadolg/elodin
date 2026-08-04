@@ -1,7 +1,6 @@
 package h2
 
 import "core:mem"
-import "core:strconv"
 import "core:sync"
 import "core:time"
 
@@ -459,6 +458,31 @@ client_handle_continuation :: proc(c: ^Client, h: Frame_Header, payload: []u8) -
 }
 
 /*
+The `:status` value, which RFC 9113 8.3.2 says is exactly three digits.
+
+`strconv.parse_int` with its default base read more than that: `0x1` came back
+as 1, `0b11001000` as 200, `1_0` as 10, and a fourth digit was accepted rather
+than noticed. A peer's word for how its answer went then differs here from what
+it says anywhere else, which is a poor thing to hang a `== 200` on. Anything
+that is not three digits is not a status, and 0 is how a missing one is already
+reported.
+*/
+@(private)
+parse_status :: proc(value: string) -> int {
+	if len(value) != 3 {
+		return 0
+	}
+	v := 0
+	for c in transmute([]u8)value {
+		if c < '0' || c > '9' {
+			return 0
+		}
+		v = v * 10 + int(c - '0')
+	}
+	return v
+}
+
+/*
 Decode a completed response header block and, if the stream is still tracked,
 record its status and completion.
 
@@ -481,7 +505,7 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 	if found {
 		for f in headers {
 			if f.name == ":status" {
-				s.status = strconv.parse_int(f.value) or_else 0
+				s.status = parse_status(f.value)
 			}
 		}
 		if s.end_stream {

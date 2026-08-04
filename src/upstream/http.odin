@@ -268,16 +268,19 @@ http_exchange :: proc(
 		}
 		switch {
 		case strings.equal_fold(name, "content-length"):
-			v, vok := strconv.parse_int(strings.trim_space(value))
-			// A value that parses but cannot be a length is refused here rather
-			// than left to fall past the `== 0` and `> 0` cases below onto the
-			// read-to-end path, which is not what the peer asked for.
-			if vok && (v < 0 || v > MAX_HTTP_BODY) {
-				return resp, .Too_Large
+			// RFC 9112 6.3: more than one of these and the message is invalid,
+			// agreeing or not.
+			if content_length >= 0 {
+				return resp, .HTTP_Error
 			}
-			if vok {
-				content_length = v
+			v, cl_err := parse_content_length(value)
+			// A value that is not a length is refused here rather than left to
+			// fall past the `== 0` and `> 0` cases below onto the read-to-end
+			// path, which is not what the peer asked for.
+			if cl_err != .None {
+				return resp, cl_err
 			}
+			content_length = v
 		case strings.equal_fold(name, "transfer-encoding"):
 			chunked = strings.contains(strings.to_lower(value, context.temp_allocator), "chunked")
 		case strings.equal_fold(name, "connection"):
@@ -316,6 +319,53 @@ http_exchange :: proc(
 	return resp, .None
 }
 
+/*
+Parse a `Content-Length` value, which is `1*DIGIT` (RFC 9110 8.6) and nothing
+else.
+
+`strconv.parse_int` with its default base reads a good deal more than that: the
+base comes from a prefix, so `0x10` is 16 and `0b1010` is 10; `_` between digits
+is skipped; a leading sign is allowed; and the accumulator wraps in silence, so
+a value past 64 bits arrives as something small enough for any range check that
+follows. What is on the other end of this parser is a blocklist host or a DoH
+upstream, over a connection this client keeps alive and reuses, so a length read
+differently from the way it was sent leaves the reader standing in the middle of
+a body with the next response starting from wherever that landed.
+
+The server side of the field is in `server/doh.odin`, where the same laxity is a
+request-smuggling primitive rather than a desync with oneself.
+
+The limit is applied digit by digit, so nothing can wrap on the way to it. What
+may surround the digits is `OWS` - spaces and tabs, RFC 9110 5.6.3 - and that is
+all this takes off, `split_header` having already trimmed the field value.
+*/
+@(private)
+parse_content_length :: proc(value: string) -> (length: int, err: Error) {
+	digits := strings.trim_right(strings.trim_left(value, " \t"), " \t")
+	if len(digits) == 0 {
+		return 0, .HTTP_Error
+	}
+	v := 0
+	for i in 0 ..< len(digits) {
+		c := digits[i]
+		if c < '0' || c > '9' {
+			return 0, .HTTP_Error
+		}
+		v = v * 10 + int(c - '0')
+		if v > MAX_HTTP_BODY {
+			return 0, .Too_Large
+		}
+	}
+	return v, .None
+}
+
+/*
+The status line, whose code is exactly three digits (RFC 9112 4).
+
+Parsed with a detected base it was rather more: `HTTP/1.1 0x1 OK` came back as
+1, `1_0` as 10. The three characters were also taken without asking what
+followed them, so `HTTP/1.1 2000 OK` - not a status line at all - read as 200.
+*/
 @(private)
 parse_status :: proc(line: string) -> (status: int, err: Error) {
 	if !strings.has_prefix(line, "HTTP/") {
@@ -325,9 +375,17 @@ parse_status :: proc(line: string) -> (status: int, err: Error) {
 	if space < 0 || space + 4 > len(line) {
 		return 0, .HTTP_Error
 	}
-	v, ok := strconv.parse_int(line[space + 1:space + 4])
-	if !ok {
+	// A reason phrase is optional, but if anything follows the code it is the
+	// space in front of one.
+	if len(line) > space + 4 && line[space + 4] != ' ' {
 		return 0, .HTTP_Error
+	}
+	v := 0
+	for c in transmute([]u8)line[space + 1:space + 4] {
+		if c < '0' || c > '9' {
+			return 0, .HTTP_Error
+		}
+		v = v * 10 + int(c - '0')
 	}
 	return v, .None
 }
