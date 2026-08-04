@@ -67,6 +67,33 @@ run = "packaging/build-deb.sh"
 description = "Type-check every package without emitting a binary"
 run = "odin check src/main -collection:elodin=src -vet -strict-style"
 
+# Odin has no -fsanitize=fuzzer of its own, so coverage instrumentation has to
+# be added on the IR rather than by the Odin driver: `odin build` emits LLVM IR
+# for the target package, and clang then instruments and links it into a
+# libFuzzer binary. Build only — running is open-ended, so it is not part of
+# `verify` and has no fixed exit condition to script here.
+[tasks.fuzz]
+description = "Build the dns, h2 and yaml fuzz targets (bin/fuzz_*)"
+depends = ["prepare"]
+run = [
+  "rm -rf bin/fuzz-ir/dns  && mkdir -p bin/fuzz-ir/dns  && odin build src/fuzz/dns  -collection:elodin=src -build-mode:llvm-ir -no-entry-point -out:bin/fuzz-ir/dns/  $ELODIN_DEFINES && clang -fsanitize=fuzzer,address -Wno-override-module -o bin/fuzz_dns  bin/fuzz-ir/dns/*.ll  $ELODIN_LDFLAGS -lm",
+  "rm -rf bin/fuzz-ir/h2   && mkdir -p bin/fuzz-ir/h2   && odin build src/fuzz/h2   -collection:elodin=src -build-mode:llvm-ir -no-entry-point -out:bin/fuzz-ir/h2/   $ELODIN_DEFINES && clang -fsanitize=fuzzer,address -Wno-override-module -o bin/fuzz_h2   bin/fuzz-ir/h2/*.ll   $ELODIN_LDFLAGS -lm",
+  "rm -rf bin/fuzz-ir/yaml && mkdir -p bin/fuzz-ir/yaml && odin build src/fuzz/yaml -collection:elodin=src -build-mode:llvm-ir -no-entry-point -out:bin/fuzz-ir/yaml/ $ELODIN_DEFINES && clang -fsanitize=fuzzer,address -Wno-override-module -o bin/fuzz_yaml bin/fuzz-ir/yaml/*.ll $ELODIN_LDFLAGS -lm",
+]
+
+# The fast, bounded shape of fuzzing that belongs in a PR: no new inputs are
+# generated, each target just replays testdata/fuzz-corpus/ once. A crash that
+# fuzzing found stays found instead of only living in whoever's corpus turned
+# it up.
+[tasks.fuzz-regression]
+description = "Replay the committed fuzz corpus through each target once"
+depends = ["fuzz"]
+run = [
+  "ASAN_OPTIONS=detect_leaks=0 ./bin/fuzz_dns  -runs=0 testdata/fuzz-corpus/dns",
+  "ASAN_OPTIONS=detect_leaks=0 ./bin/fuzz_h2   -runs=0 testdata/fuzz-corpus/h2",
+  "ASAN_OPTIONS=detect_leaks=0 ./bin/fuzz_yaml -runs=0 testdata/fuzz-corpus/yaml",
+]
+
 [tasks.test]
 description = "Run all unit tests"
 depends = ["prepare"]
