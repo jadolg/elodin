@@ -618,3 +618,61 @@ test_verifying_context_refuses_a_nameless_peer :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, nameless, Error.Verify_Failed)
 }
+
+/*
+A name that cannot be bound as written must not be bound as something else.
+
+`SSL_set1_host` is reached through `strings.clone_to_cstring`, which ends the
+string at the first NUL byte. A configured name with one in it therefore
+verifies against a prefix of itself: "localhost\0wrong.example" is checked as
+"localhost", matches a certificate that carries that name, and the session comes
+back looking verified against a name nobody asked for. OpenSSL refuses embedded
+NULs itself - `X509_VERIFY_PARAM_set1_host` will not take one - but it only ever
+sees what survived the conversion, so the refusal has to happen on this side of
+it.
+
+The other end of the same problem is `SSL_set1_host` failing outright, which is
+not reproducible here: past the NUL case its only remaining failure is
+allocation. The check on its return value is in the code regardless, because
+what a missed failure produces is a chain-only handshake that
+`SSL_get_verify_result` still calls X509_V_OK - a session the caller believes is
+tied to a name and is not.
+*/
+@(test)
+test_verifying_context_refuses_a_name_it_cannot_bind :: proc(t: ^testing.T) {
+	posix.sigignore(.SIGPIPE)
+
+	long := strings.repeat("a", 300, context.temp_allocator)
+	defer free_all(context.temp_allocator)
+
+	Case :: struct {
+		hostname: string,
+		accepted: bool,
+		what:     string,
+	}
+
+	CASES := []Case {
+		// The certificate carries DNS:localhost, so this is the control: the
+		// refusals below are about the names, not about refusing everything.
+		{"localhost", true, "a name the certificate carries"},
+		// Truncates to a name the certificate does carry, which is what makes
+		// this the dangerous one: the handshake succeeds and the name that was
+		// checked is not the name that was configured.
+		{"localhost\x00wrong.example", false, "a NUL with a matching prefix"},
+		{"wrong.example\x00localhost", false, "a NUL with a matching suffix"},
+		// Past what SNI can carry (255 bytes), so the extension cannot be set.
+		{long, false, "a name too long to send"},
+	}
+
+	for c in CASES {
+		err, ran := verified_handshake(t, c.hostname)
+		if !ran {
+			return
+		}
+		if c.accepted {
+			testing.expectf(t, err == .None, "%s was refused: %v", c.what, err)
+		} else {
+			testing.expectf(t, err != .None, "%s was accepted", c.what)
+		}
+	}
+}

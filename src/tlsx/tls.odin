@@ -442,10 +442,46 @@ client_connect :: proc(ctx: ^Context, socket: net.TCP_Socket, hostname: string, 
 		return nil, .Handshake_Failed
 	}
 	if hostname != "" {
+		/*
+		A name with a NUL in it is not the name it looks like.
+
+		`clone_to_cstring` ends the string at the first NUL, so what would be
+		bound is a prefix of what was configured: "good.example\x00evil.test" is
+		checked as "good.example" and the session comes back looking verified
+		against a name nobody asked for. OpenSSL refuses embedded NULs itself -
+		`X509_VERIFY_PARAM_set1_host` will not take one - but it only ever sees
+		what survived the conversion, so the refusal belongs on this side of it.
+		*/
+		if strings.index_byte(hostname, 0) >= 0 {
+			SSL_free(ssl)
+			return nil, .Verify_Failed
+		}
 		chost := strings.clone_to_cstring(hostname, context.temp_allocator)
-		ssl_set_tlsext_host_name(ssl, chost)
-		// Ties certificate verification to the name we asked for.
-		SSL_set1_host(ssl, chost)
+
+		// Fatal rather than best-effort: a server that picks its certificate by
+		// SNI sends the wrong one when the extension is missing, and the name
+		// check below then fails in a way that reads as the peer's fault.
+		if !ssl_set_tlsext_host_name(ssl, chost) {
+			SSL_free(ssl)
+			return nil, .Handshake_Failed
+		}
+
+		/*
+		Ties certificate verification to the name we asked for, and the result
+		is checked because nothing downstream would notice if it had not taken.
+
+		`SSL_VERIFY_PEER` on its own asks only that the chain end somewhere
+		trusted, and `SSL_get_verify_result` returns X509_V_OK for a session with
+		no name bound to it - so a discarded failure here is a handshake that
+		accepts any certificate any trusted CA ever issued, for any name, while
+		reporting itself as verified. That is the hole the empty-hostname refusal
+		above exists to prevent, reached by another route.
+		*/
+		bound := SSL_set1_host(ssl, chost) == 1
+		if ctx.verify && !bound {
+			SSL_free(ssl)
+			return nil, .Verify_Failed
+		}
 	}
 
 	ERR_clear_error()
