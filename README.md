@@ -329,7 +329,7 @@ blocking:
 
   allowlists: []
   rules: ["||doubleclick.net^"]
-  allow: ["||googleadservices.com^"]
+  # allow: ["||googleadservices.com^"]   # an exception outranks every list
 ```
 
 What each list format matches:
