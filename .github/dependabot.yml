@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # GitHub Actions used in workflows (.github/workflows/*.yml)
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # Go modules used by the benchmarking tool (bench/go.mod)
+  - package-ecosystem: "gomod"
+    directory: "/bench"
+    schedule:
+      interval: "weekly"
