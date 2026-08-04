@@ -34,7 +34,7 @@ jobs:
       # up the newest previous one. This is what makes the corpus grow
       # instead of resetting every night.
       - name: Restore corpus
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
