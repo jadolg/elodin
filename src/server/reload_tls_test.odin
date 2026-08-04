@@ -1,6 +1,7 @@
 package server
 
 import "core:os"
+import "core:sync"
 import "core:testing"
 import "elodin:config"
 import "elodin:tlsx"
@@ -16,23 +17,26 @@ in place rather than tearing it down.
 @(private = "file")
 CERT_DIR :: "/tmp/elodin-server-reload-test"
 
-// A certificate this test can point `reload_tls` at, reusing the one a
-// developer already has in `certs/` and otherwise generating one - the same
-// fallback `tlsx`'s own tests use, kept local because that helper is private
-// to its package.
 @(private = "file")
-ensure_cert :: proc() -> (cert, key: string, ok: bool) {
+cert_once: sync.Once
+@(private = "file")
+cert_path: string
+@(private = "file")
+key_path: string
+@(private = "file")
+cert_ok: bool
+
+@(private = "file")
+generate_cert :: proc() {
 	if os.exists("certs/cert.pem") && os.exists("certs/key.pem") {
-		return "certs/cert.pem", "certs/key.pem", true
+		cert_path, key_path, cert_ok = "certs/cert.pem", "certs/key.pem", true
+		return
 	}
-	cert = CERT_DIR + "/cert.pem"
-	key = CERT_DIR + "/key.pem"
-	if os.exists(cert) && os.exists(key) {
-		return cert, key, true
-	}
+	cert_path = CERT_DIR + "/cert.pem"
+	key_path = CERT_DIR + "/key.pem"
 	if !os.exists(CERT_DIR) {
 		if err := os.make_directory(CERT_DIR); err != nil {
-			return "", "", false
+			return
 		}
 	}
 	process, perr := os.process_start(
@@ -47,9 +51,9 @@ ensure_cert :: proc() -> (cert, key: string, ok: bool) {
 				"ec_paramgen_curve:prime256v1",
 				"-nodes",
 				"-keyout",
-				key,
+				key_path,
 				"-out",
-				cert,
+				cert_path,
 				"-days",
 				"2",
 				"-subj",
@@ -58,13 +62,27 @@ ensure_cert :: proc() -> (cert, key: string, ok: bool) {
 		},
 	)
 	if perr != nil {
-		return "", "", false
+		return
 	}
 	state, werr := os.process_wait(process)
 	if werr != nil || state.exit_code != 0 {
-		return "", "", false
+		return
 	}
-	return cert, key, true
+	cert_ok = true
+}
+
+// A certificate this test can point `reload_tls` at, reusing the one a
+// developer already has in `certs/` and otherwise generating one - the same
+// fallback `tlsx`'s own tests use, kept local because that helper is private
+// to its package.
+//
+// Generated once and shared: the test runner runs these concurrently, and two
+// threads racing `openssl` over the same output files corrupted them often
+// enough in CI to fail a test that never touches the generation path itself.
+@(private = "file")
+ensure_cert :: proc() -> (cert, key: string, ok: bool) {
+	sync.once_do(&cert_once, generate_cert)
+	return cert_path, key_path, cert_ok
 }
 
 @(test)
