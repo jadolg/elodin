@@ -48,7 +48,13 @@ h2_io_read :: proc(user: rawptr, buf: []u8) -> (n: int, ok: bool) {
 		if nerr == nil {
 			return got, true
 		}
-		if nerr == .Timeout {
+		// SO_RCVTIMEO expiring on a blocking recv() surfaces as EAGAIN on
+		// Linux, which core:net maps to .Would_Block rather than .Timeout -
+		// ETIMEDOUT (and thus .Timeout) is never actually produced by a
+		// receive-timeout poll there. Treating only .Timeout as "no data yet"
+		// misread every idle poll tick as the peer closing, tearing down a
+		// perfectly healthy connection roughly once per H2_POLL_INTERVAL.
+		if nerr == .Timeout || nerr == .Would_Block {
 			continue
 		}
 		return 0, false
