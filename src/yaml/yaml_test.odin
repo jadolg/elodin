@@ -1,5 +1,6 @@
 package yaml
 
+import "core:fmt"
 import "core:testing"
 import "core:time"
 
@@ -156,6 +157,50 @@ test_duration_forms :: proc(t: ^testing.T) {
 	d, _ := as_duration(get(root, "d"))
 	testing.expect_value(t, d, 7 * 24 * time.Hour)
 	free_all(context.temp_allocator)
+}
+
+@(test)
+test_byte_size_forms :: proc(t: ^testing.T) {
+	Case :: struct {
+		text:  string,
+		value: i64,
+		ok:    bool,
+	}
+
+	CASES := []Case {
+		{"1024", 1024, true},
+		{"64MiB", 64 * 1024 * 1024, true},
+		{"64 MiB", 64 * 1024 * 1024, true},
+		{"512KiB", 512 * 1024, true},
+		{"512KB", 512_000, true},
+		{"2GiB", 2 * 1024 * 1024 * 1024, true},
+		{"1B", 1, true},
+		{"0", 0, true},
+		// A size is one number and one unit. Everything else is a typo, and a
+		// typo that parses is a bound nobody chose.
+		{"1MiB512KiB", 0, false},
+		{"64 MiBs", 0, false},
+		{"MiB", 0, false},
+		{"-1", 0, false},
+		{"64.5MiB", 0, false},
+		{"0x40", 0, false},
+		{"", 0, false},
+		// Would wrap to something small and plausible if it were let through.
+		{"9223372036854775808", 0, false},
+		{"16777216TiB", 0, false},
+		{"99999999999GiB", 0, false},
+	}
+
+	for c in CASES {
+		root, err := parse(fmt.tprintf("size: %q\n", c.text), context.temp_allocator)
+		testing.expectf(t, err == nil, "parse failed for %q: %v", c.text, err)
+		v, ok := as_bytes(get(root, "size"))
+		testing.expectf(t, ok == c.ok, "%q: parsed=%v, expected %v", c.text, ok, c.ok)
+		if c.ok {
+			testing.expectf(t, v == c.value, "%q came to %d, expected %d", c.text, v, c.value)
+		}
+		free_all(context.temp_allocator)
+	}
 }
 
 @(test)

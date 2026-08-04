@@ -1,5 +1,7 @@
 package cache
 
+import "core:fmt"
+import "core:mem"
 import "core:testing"
 import "core:time"
 import "elodin:dns"
@@ -246,6 +248,217 @@ test_key_distinguishes_type_and_do :: proc(t: ^testing.T) {
 
 	d := make_key(kb2[:], "EXAMPLE.com.", .A, .IN, false)
 	testing.expect_value(t, a, d)
+}
+
+/*
+An answer as large as the ones this bound exists for.
+
+`count` A records under one owner name, which the encoder writes as a pointer
+apiece, so each record is sixteen bytes of wire and carries an offset and a TTL
+of its own alongside it.
+*/
+@(private = "file")
+build_bulky_answer :: proc(
+	name: string,
+	count: int,
+	ttl: u32,
+	allocator := context.allocator,
+) -> (
+	[]u8,
+	dns.Message,
+) {
+	answers := make([]dns.Record, count, allocator)
+	for i in 0 ..< count {
+		answers[i] = dns.Record {
+			name = name,
+			type = .A,
+			class = .IN,
+			ttl = ttl,
+			data = dns.Rdata_A{addr = {10, u8(i >> 16), u8(i >> 8), u8(i)}},
+		}
+	}
+	m := dns.Message {
+		id       = 0x3333,
+		question = []dns.Question{{name = name, type = .A, class = .IN}},
+		answer   = answers,
+	}
+	m.flags.qr = true
+	m.flags.ra = true
+	wire, _, err := dns.encode_message(m, allocator)
+	if err != .None {
+		panic("failed to encode a bulky test answer")
+	}
+	decoded, derr := dns.decode_message(wire, allocator)
+	if derr != .None {
+		panic("failed to decode a bulky test answer")
+	}
+	return wire, decoded
+}
+
+/*
+The entry count was the only bound, and a count is not a bound on memory.
+
+An entry holds the response as it arrived - up to 64 KiB, since a query over
+TCP, DoT or DoH is answered with a whole message rather than a 512-byte UDP one
+- plus an offset and a TTL for each of its records, which for a response packed
+with minimal records is about twice the wire size again. So the default ten
+thousand entries stood for something in the region of 640 MB, and an attacker
+serving maximal answers from a zone it controls needs only distinct names to
+walk elodin there. What ends it is the resolver being killed for the memory it
+took.
+
+Both halves are checked, because one without the other proves little: the byte
+total the eviction loop reads, and what the allocator was actually asked for.
+A total that says the right thing while the memory is still held is the failure
+this is here to catch.
+*/
+@(test)
+test_cache_holds_to_its_byte_budget :: proc(t: ^testing.T) {
+	RECORDS :: 2000 // ~32 KB of wire, ~56 KB accounted, per entry
+	INSERTS :: 40
+	BUDGET :: 512 * 1024
+
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+
+	// Told it may hold far more entries than the budget has room for, so the
+	// count bound is never what stops it.
+	c := make_cache(
+		Options{max_entries = INSERTS * 2, max_bytes = BUDGET, max_ttl = 3600},
+		mem.tracking_allocator(&track),
+	)
+	defer destroy(c)
+
+	kb: [KEY_MAX]u8
+	names := make([]string, INSERTS, context.temp_allocator)
+	for i in 0 ..< INSERTS {
+		names[i] = fmt.tprintf("host%d.example.", i)
+		wire, msg := build_bulky_answer(names[i], RECORDS, 300, context.temp_allocator)
+		testing.expectf(t, put(c, key_for(kb[:], names[i]), wire, msg), "put %d failed", i)
+	}
+
+	entry_size := bytes_used(c) / max(1, len_entries(c))
+	testing.expectf(
+		t,
+		bytes_used(c) <= BUDGET,
+		"the cache accounts for %d bytes against a %d byte budget",
+		bytes_used(c),
+		BUDGET,
+	)
+	// The insertions came to several times the budget, so something had to go.
+	testing.expectf(
+		t,
+		len_entries(c) < INSERTS,
+		"all %d entries survived a budget that fits about %d of them",
+		INSERTS,
+		BUDGET / max(1, entry_size),
+	)
+
+	/*
+	And the memory itself. The allowance over the budget is what the cache holds
+	that entries do not: the Cache, the map's table, and the slack in the
+	allocations behind each entry.
+	*/
+	held := track.current_memory_allocated
+	testing.expectf(
+		t,
+		held <= BUDGET + BUDGET / 2,
+		"the cache is holding %d bytes of allocations against a %d byte budget",
+		held,
+		BUDGET,
+	)
+
+	// Evicted from the tail, so the oldest is gone and the newest is not.
+	_, _, first_ok := get(c, key_for(kb[:], names[0]), context.temp_allocator)
+	testing.expect(t, !first_ok, "the least recently used entry survived")
+	_, _, last_ok := get(c, key_for(kb[:], names[INSERTS - 1]), context.temp_allocator)
+	testing.expect(t, last_ok, "the most recently used entry was evicted")
+
+	free_all(context.temp_allocator)
+}
+
+// Nothing an operator can set makes this reachable with a real answer, but a
+// budget smaller than one entry must refuse it rather than empty the cache for
+// something it then drops as well.
+@(test)
+test_an_entry_larger_than_the_budget_is_refused :: proc(t: ^testing.T) {
+	c := make_cache(Options{max_entries = 8, max_bytes = 1024, max_ttl = 3600})
+	defer destroy(c)
+	kb: [KEY_MAX]u8
+
+	small, small_msg := build_answer("small.example.", 300, context.temp_allocator)
+	testing.expect(t, put(c, key_for(kb[:], "small.example."), small, small_msg), "the small answer was refused")
+
+	wire, msg := build_bulky_answer("huge.example.", 500, 300, context.temp_allocator)
+	testing.expect(t, !put(c, key_for(kb[:], "huge.example."), wire, msg), "an entry past the whole budget was stored")
+
+	testing.expect_value(t, len_entries(c), 1)
+	_, _, ok := get(c, key_for(kb[:], "small.example."), context.temp_allocator)
+	testing.expect(t, ok, "the entry that did fit was evicted for one that did not")
+	free_all(context.temp_allocator)
+}
+
+/*
+The byte total has to come back to zero by every route out of the cache.
+
+A total that only ever goes up is a cache that stops accepting entries once it
+has seen enough of them, and a total that goes down too far is a bound that
+stops binding. Each path removes an entry somewhere different - `get` on an
+expired one, `put` over a key already held, `sweep`, `clear_all` - and each is
+its own opportunity to forget.
+*/
+@(test)
+test_byte_accounting_comes_back_to_zero :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+
+	c := make_cache(Options{max_entries = 8, max_ttl = 3600}, mem.tracking_allocator(&track))
+	kb: [KEY_MAX]u8
+
+	put_one :: proc(c: ^Cache, kb: []u8, name: string) {
+		wire, msg := build_answer(name, 300, context.temp_allocator)
+		put(c, key_for(kb, name), wire, msg)
+	}
+
+	// Replaced in place: the total must count the new entry, not both.
+	put_one(c, kb[:], "a.example.")
+	one := bytes_used(c)
+	put_one(c, kb[:], "a.example.")
+	testing.expect_value(t, bytes_used(c), one)
+	testing.expect_value(t, len_entries(c), 1)
+
+	// Dropped by `get`, which is what an expired entry meets first.
+	sync_expire(c, key_for(kb[:], "a.example."))
+	_, _, _ = get(c, key_for(kb[:], "a.example."), context.temp_allocator)
+	testing.expect_value(t, bytes_used(c), 0)
+
+	// Dropped by `sweep`.
+	put_one(c, kb[:], "b.example.")
+	sync_expire(c, key_for(kb[:], "b.example."))
+	testing.expect_value(t, sweep(c), 1)
+	testing.expect_value(t, bytes_used(c), 0)
+
+	// Dropped by eviction, with the count as the bound this time.
+	small := make_cache(Options{max_entries = 1, max_ttl = 3600}, mem.tracking_allocator(&track))
+	put_one(small, kb[:], "c.example.")
+	after_one := bytes_used(small)
+	put_one(small, kb[:], "d.example.")
+	testing.expect_value(t, len_entries(small), 1)
+	testing.expect_value(t, bytes_used(small), after_one)
+	destroy(small)
+
+	// Dropped by `clear_all`, as a reload does it.
+	put_one(c, kb[:], "e.example.")
+	clear_all(c)
+	testing.expect_value(t, bytes_used(c), 0)
+
+	destroy(c)
+	free_all(context.temp_allocator)
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%d bytes still held, allocated at %v", entry.size, entry.location)
+	}
 }
 
 // Test helper: age an entry out without sleeping.

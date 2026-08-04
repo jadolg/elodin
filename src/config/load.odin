@@ -127,6 +127,25 @@ opt_u32 :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^u32, path: string)
 }
 
 @(private)
+opt_bytes :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^int, path: string) {
+	child := yaml.get(n, key)
+	if yaml.is_null(child) {
+		return
+	}
+	// Accept both a plain count of bytes and a suffixed size such as "64MiB".
+	v, ok := yaml.as_bytes(child)
+	if !ok {
+		errorf(l, "%s.%s: expected a size such as 64MiB, or a number of bytes", path, key)
+		return
+	}
+	if v > i64(max(int)) {
+		errorf(l, "%s.%s: size out of range", path, key)
+		return
+	}
+	dst^ = int(v)
+}
+
+@(private)
 opt_duration :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^time.Duration, path: string) {
 	child := yaml.get(n, key)
 	if yaml.is_null(child) {
@@ -483,6 +502,7 @@ load_cache :: proc(l: ^Loader, cfg: ^Config) {
 	}
 	opt_bool(l, n, "enabled", &cfg.cache.enabled, "cache")
 	opt_int(l, n, "max_entries", &cfg.cache.max_entries, "cache")
+	opt_bytes(l, n, "max_bytes", &cfg.cache.max_bytes, "cache")
 	opt_u32(l, n, "min_ttl", &cfg.cache.min_ttl, "cache")
 	opt_u32(l, n, "max_ttl", &cfg.cache.max_ttl, "cache")
 	opt_u32(l, n, "negative_ttl", &cfg.cache.negative_ttl, "cache")
@@ -778,6 +798,19 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 		}
 	}
 
+	// Only when there is a cache to size. A setting left over in a file that
+	// switched caching off should not be what stops the server starting.
+	if cfg.cache.enabled {
+		if cfg.cache.max_entries < 1 {
+			errorf(l, "cache.max_entries must be at least 1")
+		}
+		// A cache too small to hold one maximal answer would refuse every large
+		// one while still answering, which is a cache that has quietly stopped
+		// working on the records that most want caching.
+		if cfg.cache.max_bytes < MIN_CACHE_BYTES {
+			errorf(l, "cache.max_bytes must be at least %d bytes", MIN_CACHE_BYTES)
+		}
+	}
 	if cfg.cache.max_ttl < cfg.cache.min_ttl {
 		errorf(l, "cache.max_ttl must not be smaller than cache.min_ttl")
 	}

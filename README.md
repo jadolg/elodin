@@ -246,8 +246,8 @@ addresses, the upstream set, blocking — those still need a restart.
 
 There is no metrics endpoint. Statistics go to the log every five minutes —
 queries, blocked, cached, forwarded, failed, dropped, secure and bogus counts,
-plus cache entries, hits, misses and evictions — and `log.queries` adds one line
-per query, at the cost noted under [Resource use](#resource-use).
+plus cache entries, bytes, hits, misses and evictions — and `log.queries` adds
+one line per query, at the cost noted under [Resource use](#resource-use).
 
 ## Configuration
 
@@ -567,7 +567,9 @@ in the CHAOS class, and refusal of zone-transfer requests.
 The cache stores upstream answers as untouched wire bytes plus the offsets of
 their TTL fields, and rewrites those TTLs in place on each hit. That keeps the
 original name compression intact and avoids a decode/encode round trip on the
-hot path.
+hot path. It is bounded by `cache.max_bytes` as well as `cache.max_entries`,
+because an entry's size is decided by whoever answered the query: see
+[Resource use](#resource-use).
 
 ## Capacity
 
@@ -699,6 +701,17 @@ Memory, for a full configuration under load:
 
 Each row but the first is a difference between two runs that vary in one thing,
 so the cache is not charged for the worker arenas that the same load brings up.
+
+The cache row is a *typical* entry, not a bound. An entry holds the response as
+it arrived — up to 64 KiB, since a query over TCP, DoT or DoH is answered with
+the whole message rather than a 512-byte UDP one — plus an offset and a TTL for
+each of its records, which for a response packed with minimal records is about
+twice the wire size again. So `cache.max_entries` alone would stand for
+something near 640 MB at its default, reachable by anyone who can serve maximal
+answers from a zone they control and walk elodin through enough distinct names.
+`cache.max_bytes` is the bound that holds: 64 MiB by default, evicting from the
+least recently used end whenever either bound is passed. `cache bytes=` in the
+five-minute stats line reports what is held against it.
 
 Disk is negligible: an 840 KB binary, and a blocklist cache the size of the
 lists themselves (6.5 MB for two large ones). Nothing is written in steady

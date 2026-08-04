@@ -124,6 +124,7 @@ main :: proc() {
 
 	section(&r, "cache")
 	run_cache_cases(&r)
+	run_cache_bytes_cases(&r)
 
 	section(&r, "blocklist downloads")
 	run_list_download_cases(&r)

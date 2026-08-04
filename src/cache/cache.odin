@@ -38,6 +38,9 @@ Cache :: struct {
 	entries:      map[string]^Entry,
 	head, tail:   ^Entry,
 	max_entries:  int,
+	max_bytes:    int,
+	// What the entries currently hold, by `entry_bytes`.
+	bytes:        int,
 	min_ttl:      u32,
 	max_ttl:      u32,
 	negative_ttl: u32,
@@ -49,8 +52,28 @@ Cache :: struct {
 // TTL handed out with a stale answer so the client comes back soon.
 STALE_TTL :: 30
 
+/*
+What the cache may hold when the operator has not said.
+
+A count on its own is not a bound on memory. An entry holds the response as it
+arrived - up to 64 KiB, since a query over TCP, DoT or DoH is answered with the
+whole message rather than a 512-byte UDP one - plus an offset and a TTL for
+every record in it, which for a response packed with minimal records comes to
+about twice the wire size again. Ten thousand of those is on the order of 640 MB
+for a setting that reads like a modest cache, and an attacker serving maximal
+answers from a zone it controls needs only distinct names to walk elodin there.
+The end of that is the resolver being killed for the memory it took, which on a
+box where elodin is the system resolver takes name resolution with it.
+
+64 MiB is far above what a working set of ordinary answers needs - the default
+ten thousand entries measure about 4.6 MB in practice - and far below what the
+count alone would allow.
+*/
+DEFAULT_MAX_BYTES :: 64 * 1024 * 1024
+
 Options :: struct {
 	max_entries:  int,
+	max_bytes:    int,
 	min_ttl:      u32,
 	max_ttl:      u32,
 	negative_ttl: u32,
@@ -61,6 +84,7 @@ make_cache :: proc(opts: Options, allocator := context.allocator) -> ^Cache {
 	c := new(Cache, allocator)
 	c.allocator = allocator
 	c.max_entries = max(opts.max_entries, 1)
+	c.max_bytes = opts.max_bytes if opts.max_bytes > 0 else DEFAULT_MAX_BYTES
 	c.min_ttl = opts.min_ttl
 	c.max_ttl = opts.max_ttl if opts.max_ttl > 0 else 86400
 	c.negative_ttl = opts.negative_ttl
@@ -151,9 +175,7 @@ get :: proc(
 	now := time.now()
 	expired := time.diff(e.expires, now) > 0
 	if expired && !c.serve_stale {
-		unlink(c, e)
-		delete_key(&c.entries, key)
-		free_entry(c, e)
+		remove_entry(c, e)
 		c.stats.misses += 1
 		return nil, false, false
 	}
@@ -226,6 +248,22 @@ put :: proc(c: ^Cache, key: string, wire: []u8, msg: dns.Message) -> bool {
 		return false
 	}
 
+	/*
+	An entry that could not fit on its own is not cached at all.
+
+	Storing it would mean evicting everything else to make room it still does not
+	have, so the cache would empty itself for one answer and then drop that too.
+	Nothing an operator can set makes this reachable with real answers: the
+	smallest budget worth configuring is orders of magnitude past the 64 KiB a
+	response can be.
+	*/
+	size := sizeof_entry(key, wire, offsets, ttls)
+	if size > c.max_bytes {
+		delete(offsets, c.allocator)
+		delete(ttls, c.allocator)
+		return false
+	}
+
 	now := time.now()
 	e := new(Entry, c.allocator)
 	e.key = strings.clone(key, c.allocator)
@@ -240,19 +278,18 @@ put :: proc(c: ^Cache, key: string, wire: []u8, msg: dns.Message) -> bool {
 	defer sync.mutex_unlock(&c.mu)
 
 	if old, exists := c.entries[key]; exists {
-		unlink(c, old)
-		delete_key(&c.entries, key)
-		free_entry(c, old)
+		remove_entry(c, old)
 	}
 	c.entries[e.key] = e
 	push_front(c, e)
+	c.bytes += size
 	c.stats.inserts += 1
 
-	for len(c.entries) > c.max_entries && c.tail != nil {
-		victim := c.tail
-		unlink(c, victim)
-		delete_key(&c.entries, victim.key)
-		free_entry(c, victim)
+	// Both bounds, because the count alone is not one: see DEFAULT_MAX_BYTES. The
+	// entry just inserted is at the head and was refused above if it could not
+	// fit by itself, so this cannot come round to evicting it.
+	for (len(c.entries) > c.max_entries || c.bytes > c.max_bytes) && c.tail != nil {
+		remove_entry(c, c.tail)
 		c.stats.evictions += 1
 	}
 	return true
@@ -270,6 +307,7 @@ clear_all :: proc(c: ^Cache) {
 	}
 	clear(&c.entries)
 	c.head, c.tail = nil, nil
+	c.bytes = 0
 }
 
 // Remove every entry whose TTL has run out. Called periodically so a cache that
@@ -286,9 +324,7 @@ sweep :: proc(c: ^Cache) -> (removed: int) {
 	for e != nil {
 		prev := e.prev
 		if time.diff(e.expires, now) > 0 {
-			unlink(c, e)
-			delete_key(&c.entries, e.key)
-			free_entry(c, e)
+			remove_entry(c, e)
 			removed += 1
 		}
 		e = prev
@@ -305,6 +341,16 @@ len_entries :: proc(c: ^Cache) -> int {
 	return len(c.entries)
 }
 
+// What the entries hold, counted the way the bound counts it.
+bytes_used :: proc(c: ^Cache) -> int {
+	if c == nil {
+		return 0
+	}
+	sync.mutex_lock(&c.mu)
+	defer sync.mutex_unlock(&c.mu)
+	return c.bytes
+}
+
 stats :: proc(c: ^Cache) -> Stats {
 	if c == nil {
 		return {}
@@ -312,6 +358,44 @@ stats :: proc(c: ^Cache) -> Stats {
 	sync.mutex_lock(&c.mu)
 	defer sync.mutex_unlock(&c.mu)
 	return c.stats
+}
+
+/*
+What one entry costs the process, near enough to bound it by.
+
+The response as it arrived, an offset and a TTL for every record in it, the key,
+and the entry itself. What is left out is the map's own slot, which is a pointer
+and a hash in a table that grows in steps rather than per entry - a few tens of
+bytes against a mean entry of several hundred, and not something an attacker can
+inflate on its own.
+*/
+@(private)
+sizeof_entry :: proc(key: string, wire: []u8, offsets: []int, ttls: []u32) -> int {
+	return size_of(Entry) + len(key) + len(wire) + len(offsets) * size_of(int) + len(ttls) * size_of(u32)
+}
+
+@(private)
+entry_bytes :: proc(e: ^Entry) -> int {
+	return sizeof_entry(e.key, e.wire, e.ttl_offsets, e.ttls)
+}
+
+/*
+Take an entry out of the cache entirely: the list, the map, the byte total, the
+memory.
+
+Every removal goes through here. Doing it by hand at each of the four call sites
+is how a byte total drifts from what is actually held, and a bound computed from
+a drifting total is not a bound.
+
+The caller holds the lock.
+*/
+@(private)
+remove_entry :: proc(c: ^Cache, e: ^Entry) {
+	unlink(c, e)
+	// Before `free_entry`, which frees the string the map is keyed on.
+	delete_key(&c.entries, e.key)
+	c.bytes -= entry_bytes(e)
+	free_entry(c, e)
 }
 
 @(private)
