@@ -259,6 +259,39 @@ doh_raw :: proc(port: int, request: string, allocator := context.allocator) -> H
 	return http_roundtrip(port, transmute([]u8)request, allocator)
 }
 
+/*
+One raw request, then everything the server says until it hangs up.
+
+For the framing cases, where the question is not what any one reply says but how
+many of them there are: a body framed differently from the way it was written
+leaves bytes in the connection, and those bytes being read as a request and
+answered is the thing to catch. Read reply by reply this is invisible - two
+answers usually arrive in one record, and a reader that takes them one at a time
+throws away whatever it over-read.
+*/
+doh_raw_until_close :: proc(port: int, request: string, allocator := context.allocator) -> (data: string, ok: bool) {
+	conn, dialled := dial_tls(port, []string{"http/1.1"})
+	if !dialled {
+		return "", false
+	}
+	defer close_tls(&conn)
+
+	if !conn_write(&conn, transmute([]u8)request) {
+		return "", false
+	}
+
+	buf := make([dynamic]u8, 0, 8192, allocator)
+	for len(buf) < 64 * 1024 {
+		chunk: [4096]u8
+		n, read_ok := conn_read(&conn, chunk[:])
+		if !read_ok {
+			break
+		}
+		append(&buf, ..chunk[:n])
+	}
+	return string(buf[:]), true
+}
+
 // Two POSTs down one connection, to prove keep-alive works.
 doh_post_twice :: proc(port: int, path: string, query: []u8, allocator := context.allocator) -> (a, b: Http_Result) {
 	conn, ok := dial_tls(port, []string{"http/1.1"})

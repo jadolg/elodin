@@ -1,7 +1,6 @@
 package server
 
 import "core:encoding/base64"
-import "core:strconv"
 import "core:strings"
 import "elodin:dns"
 import "elodin:logx"
@@ -83,6 +82,52 @@ http_exact :: proc(r: ^Http_Reader, n: int) -> (data: []u8, ok: bool) {
 }
 
 /*
+Parse a `Content-Length` value, which is `1*DIGIT` and nothing else.
+
+RFC 9110 8.6 writes the field that way, and `strconv.parse_int` with its default
+base does not read it that way. It takes the base from a prefix, so `0x10` is
+16, `0b1010` is 10 and `0o20` is 16; it skips `_` between digits, so `1_0` is
+10; it allows a leading sign; and it wraps without reporting it, so
+`18446744073709551620` comes back as 4 and a range check downstream sees nothing
+wrong with the answer.
+
+None of that is academic here. Sharing :443 with a web server, or terminating
+TLS at nginx, haproxy or Envoy, is an ordinary way to run DoH, and a front end
+parses this field as the RFC writes it: it rejects the message, or reads a
+different length out of it. Two hops that disagree about where a request ends is
+the whole of CL.CL request smuggling - what this server takes for the tail of a
+body, the front end takes for the start of the next request, and attributes to
+whoever's connection it is pipelining onto. `transfer-encoding` is refused
+outright where the headers are read, which closes the TE.CL half of the same
+problem.
+
+The limit is applied digit by digit rather than to the total, so there is
+nothing for an overlong value to wrap in on the way to being checked.
+
+`value` is the field value as it arrived. What may surround the digits is `OWS`
+- spaces and tabs, RFC 9110 5.6.3 - and that is all this takes off.
+*/
+@(private)
+parse_content_length :: proc(value: string) -> (length: int, ok: bool) {
+	digits := strings.trim_right(strings.trim_left(value, " \t"), " \t")
+	if len(digits) == 0 {
+		return 0, false
+	}
+	v := 0
+	for i in 0 ..< len(digits) {
+		c := digits[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		v = v * 10 + int(c - '0')
+		if v > MAX_DOH_BODY {
+			return 0, false
+		}
+	}
+	return v, true
+}
+
+/*
 Read one request off `r`.
 
 Everything kept in the result is copied out of the reader's buffer rather than
@@ -122,22 +167,51 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, ok: bool) {
 		req.path = hold(target)
 	}
 
-	content_length := 0
+	// -1 rather than 0, so a second Content-Length can be told from the first.
+	content_length := -1
 	for {
 		header := http_line(r) or_return
 		if header == "" {
 			break
 		}
+		/*
+		A field line this server cannot read is a field line it must not skip.
+
+		Both of these are ways to write a Content-Length that elodin does not see
+		and a hop in front might: a line beginning with whitespace is an obs-fold
+		continuation of the one before it (RFC 9112 5.2), and whitespace before
+		the colon is not a field name (RFC 9112 5.1). Read here as "no header of
+		that name", either one leaves the body unread while the front end that
+		unfolded or trimmed it forwards a body length elodin never applied - the
+		remainder becomes the next request on the connection. Both RFCs ask a
+		server to reject rather than guess, and nothing that speaks DoH sends
+		either.
+		*/
+		if header[0] == ' ' || header[0] == '\t' {
+			return {}, false
+		}
 		colon := strings.index_byte(header, ':')
 		if colon <= 0 {
-			continue
+			return {}, false
+		}
+		if header[colon - 1] == ' ' || header[colon - 1] == '\t' {
+			return {}, false
 		}
 		name := header[:colon]
 		value := strings.trim_space(header[colon + 1:])
 		switch {
 		case strings.equal_fold(name, "content-length"):
-			v, vok := strconv.parse_int(value)
-			if !vok || v < 0 || v > MAX_DOH_BODY {
+			// RFC 9112 6.3: a message with more than one of these is invalid,
+			// whether or not they agree, because the hop in front is entitled to
+			// resolve the pair differently from the way this one would.
+			if content_length >= 0 {
+				return {}, false
+			}
+			// The field value as it arrived, not `value`: `strings.trim_space`
+			// takes a non-breaking space off the end, which is not OWS and not
+			// something a front end would overlook.
+			v, vok := parse_content_length(header[colon + 1:])
+			if !vok {
 				return {}, false
 			}
 			content_length = v

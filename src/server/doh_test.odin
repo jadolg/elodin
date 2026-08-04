@@ -193,3 +193,159 @@ test_doh_request_survives_a_buffer_that_grows :: proc(t: ^testing.T) {
 	testing.expect_value(t, req.content_type, "application/dns-message")
 	testing.expect_value(t, string(req.body), "abcd")
 }
+
+/*
+Hand `raw` to `read_http_request` over a loopback socket.
+
+The sender closes as soon as its bytes are away. A reader that asks for more
+than what was sent therefore reaches the end of the connection instead of
+blocking, which is what a body shorter than its declared length has to look
+like here.
+*/
+@(private = "file")
+read_request_over_loopback :: proc(t: ^testing.T, raw: string, what: string) -> (req: Http_Request_In, parsed, ok: bool) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "%s: cannot listen on loopback: %v", what, lerr)
+		return {}, false, false
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "%s: cannot read the bound port: %v", what, berr)
+		return {}, false, false
+	}
+
+	// A few hundred bytes, so the whole request fits in the socket buffer and
+	// this side never has to interleave sending with the reading below.
+	client, derr := net.dial_tcp_from_endpoint(bound)
+	if derr != nil {
+		testing.expectf(t, false, "%s: cannot dial the listener: %v", what, derr)
+		return {}, false, false
+	}
+	sent := 0
+	bytes := transmute([]u8)raw
+	for sent < len(bytes) {
+		n, serr := net.send_tcp(client, bytes[sent:])
+		if serr != nil || n <= 0 {
+			net.close(client)
+			testing.expectf(t, false, "%s: cannot send the request: %v", what, serr)
+			return {}, false, false
+		}
+		sent += n
+	}
+	net.close(client)
+
+	accepted, _, aerr := net.accept_tcp(listener)
+	if aerr != nil {
+		testing.expectf(t, false, "%s: nothing connected: %v", what, aerr)
+		return {}, false, false
+	}
+	defer net.close(accepted)
+	_ = net.set_option(accepted, .Receive_Timeout, 3 * time.Second)
+
+	r := Http_Reader {
+		conn = Conn{socket = accepted},
+		buf  = make([dynamic]u8, 0, 4096, context.temp_allocator),
+	}
+	req, parsed = read_http_request(&r)
+	return req, parsed, true
+}
+
+/*
+`Content-Length` is `1*DIGIT` (RFC 9110 8.6) and nothing else.
+
+Read with `strconv.parse_int` and its default base, it is a good deal more than
+that: the base is taken from a prefix, so `0x10` is 16 and `0b1010` is 10; `_`
+between digits is skipped, so `1_0` is 10; a leading sign is allowed; and the
+accumulator wraps without reporting it, so `18446744073709551620` is 4 and the
+range check that follows sees nothing wrong with it.
+
+Every one of those is a length elodin would act on and a front end would not.
+Sharing :443 with a web server, or terminating TLS at nginx, haproxy or Envoy,
+is an ordinary way to run DoH, and those parse the field as the RFC writes it -
+so they reject the message or take a different length from it. Two hops that
+disagree about where one request ends is the whole of CL.CL request smuggling:
+what elodin reads as the tail of a body, the front end reads as the start of
+the next request, and attributes to whoever's connection it is pipelining onto.
+
+Repeats are refused for the same reason (RFC 9112 6.3). The loop kept the last
+one it saw, and nothing says a proxy in front resolves the same way.
+*/
+@(test)
+test_content_length_is_strict_decimal :: proc(t: ^testing.T) {
+	Case :: struct {
+		headers:  string, // between the request line and the blank line
+		body:     string,
+		accepted: bool,
+		what:     string,
+	}
+
+	CASES := []Case {
+		{"Content-Length: 4\r\n", "abcd", true, "a plain decimal length"},
+		{"Content-Length: 004\r\n", "abcd", true, "leading zeroes, still 1*DIGIT"},
+		{"Content-Length: 0x4\r\n", "abcd", false, "hexadecimal"},
+		{"Content-Length: 0b100\r\n", "abcd", false, "binary"},
+		{"Content-Length: 0o4\r\n", "abcd", false, "octal"},
+		{"Content-Length: 0z4\r\n", "abcd", false, "base twelve, which the prefix table also has"},
+		{"Content-Length: 1_0\r\n", "abcdefghij", false, "a digit separator"},
+		{"Content-Length: +4\r\n", "abcd", false, "a signed length"},
+		{"Content-Length: -4\r\n", "abcd", false, "a negative length"},
+		{"Content-Length: \r\n", "", false, "an empty length"},
+		{"Content-Length: 4 5\r\n", "abcd", false, "two lengths in one field"},
+		// 2^64 + 4: the accumulator wraps to 4 and the range check is happy.
+		{"Content-Length: 18446744073709551620\r\n", "abcd", false, "a length past 64 bits"},
+		{"Content-Length: 4\r\nContent-Length: 0\r\n", "abcd", false, "conflicting repeats"},
+		{"Content-Length: 4\r\nContent-Length: 4\r\n", "abcd", false, "identical repeats"},
+		{"Content-Length:\t4\t\r\n", "abcd", true, "tabs around the digits, which is OWS"},
+		/*
+		Three ways to write a length this reader does not recognise as one while
+		a hop in front may: a non-breaking space is not OWS but is whitespace to
+		`strings.trim_space`; a folded line is a continuation of the one above it
+		(RFC 9112 5.2); and space before the colon is not a field name (RFC 9112
+		5.1). Skipped rather than refused, each leaves the body unread and the
+		next request starting in the middle of it.
+		*/
+		{"Content-Length: 4 \r\n", "abcd", false, "a non-breaking space after the digits"},
+		{"X-Fold: one\r\n Content-Length: 4\r\n", "abcd", false, "a folded continuation line"},
+		{"Content-Length : 4\r\n", "abcd", false, "space before the colon"},
+		{"Content-Length\t: 4\r\n", "abcd", false, "a tab before the colon"},
+		{"just-some-garbage\r\n", "", false, "a field line with no colon at all"},
+	}
+
+	for c in CASES {
+		b := strings.builder_make(context.temp_allocator)
+		strings.write_string(&b, "POST /dns-query HTTP/1.1\r\nHost: dns.example\r\n")
+		strings.write_string(&b, "Content-Type: application/dns-message\r\n")
+		strings.write_string(&b, c.headers)
+		strings.write_string(&b, "\r\n")
+		strings.write_string(&b, c.body)
+
+		req, parsed, ok := read_request_over_loopback(t, strings.to_string(b), c.what)
+		if !ok {
+			return
+		}
+		if c.accepted {
+			testing.expectf(t, parsed, "%s was rejected", c.what)
+			if parsed {
+				testing.expectf(
+					t,
+					string(req.body) == c.body,
+					"%s: body came back as %q, expected %q",
+					c.what,
+					string(req.body),
+					c.body,
+				)
+			}
+		} else {
+			testing.expectf(
+				t,
+				!parsed,
+				"%s was accepted, with a %d byte body; a front end would frame this request differently",
+				c.what,
+				len(req.body),
+			)
+		}
+		free_all(context.temp_allocator)
+	}
+}

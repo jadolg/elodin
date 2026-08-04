@@ -1,5 +1,6 @@
 package itest
 
+import "core:encoding/base64"
 import "core:fmt"
 import "core:strings"
 import "elodin:dns"
@@ -211,6 +212,66 @@ run_transport_cases :: proc(r: ^Runner) {
 		)
 		check(r, res.ok, "no HTTP response")
 		check_eq_int(r, res.status, 400, "status")
+	}
+	end_case(r)
+
+	/*
+	Content-Length is 1*DIGIT (RFC 9110 8.6) and repeats are invalid (RFC 9112
+	6.3). Both of these are requests a front end sharing :443 with elodin - nginx,
+	haproxy, Envoy - refuses or frames differently, and answering them is how a
+	back end ends up disagreeing with the hop in front about where this request
+	stops and the next one starts.
+
+	The body below is the real query, correctly sized. Only the way the size is
+	written is out of grammar, so an answer coming back means the length was
+	acted on.
+	*/
+	start_case(r, "doh: a hexadecimal Content-Length is not a length")
+	{
+		req := fmt.tprintf(
+			"POST /dns-query HTTP/1.1\r\nHost: elodin.local\r\nContent-Type: application/dns-message\r\nContent-Length: 0x%x\r\nConnection: close\r\n\r\n%s",
+			len(query),
+			string(query),
+		)
+		res := doh_raw(doh_port, req)
+		check(r, !res.ok || res.status != 200, "a hexadecimal Content-Length was answered (status %d)", res.status)
+	}
+	end_case(r)
+
+	/*
+	Two Content-Lengths, the second of them zero, and a body that is itself a
+	request.
+
+	Taking the last of the pair, elodin frames this as a request with no body,
+	answers it, and leaves the octets that follow unclaimed. Taking the first, it
+	is one request with a body. Both readings are answers, and RFC 9112 6.3 asks
+	for neither: the message is to be refused, because whichever way this hop
+	resolves the pair, the hop in front may resolve it the other way and forward
+	the remainder as a request of its own - on a connection it is pipelining for
+	somebody else.
+
+	So what is checked is that nothing at all comes back. A reply means a framing
+	was chosen.
+	*/
+	start_case(r, "doh: a repeated Content-Length is refused rather than framed")
+	{
+		encoded, eerr := base64.encode(query, base64.ENC_URL_TABLE, context.temp_allocator)
+		if eerr != nil {
+			fail(r, "cannot encode the smuggled query")
+		} else {
+			smuggled := fmt.tprintf(
+				"GET /dns-query?dns=%s HTTP/1.1\r\nHost: elodin.local\r\nConnection: close\r\n\r\n",
+				strings.trim_right(encoded, "="),
+			)
+			req := fmt.tprintf(
+				"POST /dns-query HTTP/1.1\r\nHost: elodin.local\r\nContent-Type: application/dns-message\r\nContent-Length: %d\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n%s",
+				len(smuggled),
+				smuggled,
+			)
+			data, read := doh_raw_until_close(doh_port, req)
+			replies := strings.count(data, "HTTP/1.1 ") if read else 0
+			check(r, replies == 0, "%d reply(s) came back, so one of the two lengths was acted on", replies)
+		}
 	}
 	end_case(r)
 
