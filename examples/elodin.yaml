@@ -158,8 +158,13 @@ blocking:
   # Inline rules, in adblock syntax.
   rules:
     - "||doubleclick.net^"
-  allow:
-    - "||googleadservices.com^"   # the @@ prefix is implied here
+
+  # Exceptions to the rules and to the lists above. Left commented out on
+  # purpose: an entry here outranks every blocklist, and the obvious things to
+  # put in it are the ad and tracking networks the lists exist to catch. Nothing
+  # should be unblocked by default just because the syntax needed an example.
+  # allow:
+  #   - "||googleadservices.com^"   # the @@ prefix is implied here
 
 dnssec:
   # Answers whose signatures do not check out become SERVFAIL rather than
