@@ -585,6 +585,152 @@ test_bootstrap_accepts_the_server_it_asked :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+@(private = "file")
+ID_TRIALS :: 32
+
+@(private = "file")
+Id_Mock :: struct {
+	socket: net.UDP_Socket,
+	// Written by the responder thread, read by the test once every query it
+	// makes has been answered.
+	ids:    [ID_TRIALS]u16,
+	count:  int,
+	stop:   bool,
+}
+
+// Record the transaction ID of every query, then answer it as an honest server
+// would so the caller moves on to the next one.
+@(private = "file")
+id_recording_loop :: proc(m: ^Id_Mock) {
+	buf: [512]u8
+	for !sync.atomic_load(&m.stop) {
+		n, client, err := net.recv_udp(m.socket, buf[:])
+		if err != nil || n < dns.HEADER_SIZE {
+			continue
+		}
+		if seen := sync.atomic_load(&m.count); seen < len(m.ids) {
+			m.ids[seen] = u16(buf[0]) << 8 | u16(buf[1])
+			sync.atomic_store(&m.count, seen + 1)
+		}
+		_, _ = net.send_udp(m.socket, a_record_reply(buf[:n]), client)
+		free_all(context.temp_allocator)
+	}
+}
+
+/*
+The transaction ID on a bootstrap query has to be drawn, not read off the clock.
+
+The two tests above are the rest of what guards this path: the reply has to come
+from the server that was asked and answer the question that was sent. That
+leaves elodin's ephemeral source port and these sixteen bits as the whole of
+what an off-path attacker has to guess, and a forged reply that gets past them
+sets the address of the upstream itself — cached for BOOTSTRAP_TTL, consulted
+for blocklist hosts as well, so one landed guess redirects every later query
+rather than poisoning a single name.
+
+An ID taken from the low bits of a nanosecond timestamp is not sixteen bits of
+anything. It is a function of when the query went out, and bootstrap queries go
+out at moments an attacker can watch for or cause: process start, a reload, an
+upstream that just stopped answering.
+
+So the check is against the clock rather than against randomness in the
+abstract, which a test cannot establish anyway. Note the time immediately before
+each query and see where the ID the responder receives sits relative to it.
+Derived from the clock it lands a microsecond or two past that reading every
+time; drawn, it lands in a window that size only as often as chance puts it
+there.
+*/
+@(test)
+test_bootstrap_query_id_does_not_follow_the_clock :: proc(t: ^testing.T) {
+	TRIALS :: ID_TRIALS
+	/*
+	Nanoseconds between the reading below and the point the ID is chosen inside
+	`bootstrap_query` — a port split, an address parse and a name
+	canonicalisation, on the order of a microsecond. Wide enough that a thread
+	descheduled in the middle still counts, narrow enough that a drawn ID misses
+	it most of the time.
+	*/
+	WINDOW :: 20_000
+	/*
+	Chance puts a drawn ID inside that window WINDOW/65536 of the time, so about
+	ten of the thirty-two land there with a spread under three; twenty-four is
+	five deviations out. A clock-derived one lands there in every trial it is
+	not descheduled out of.
+	*/
+	MAX_IN_WINDOW :: 24
+
+	m := Id_Mock{}
+	server, bound, ok := bind_loopback_udp(t)
+	if !ok {
+		return
+	}
+	m.socket = server
+	set_socket_timeouts(server, 50 * time.Millisecond)
+
+	responder := thread.create_and_start_with_poly_data(&m, id_recording_loop)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(responder)
+		thread.destroy(responder)
+		net.close(server)
+	}
+
+	// Not from the temp allocator, which the loop below resets between trials so
+	// that 32 receive buffers are not held at once.
+	address := net.endpoint_to_string(bound, context.allocator)
+	defer delete(address)
+
+	sent_at: [TRIALS]i64
+	for i in 0 ..< TRIALS {
+		sent_at[i] = time.now()._nsec
+		addr, found := bootstrap_query(address, "mock.invalid", .A, 200 * time.Millisecond)
+		free_all(context.temp_allocator)
+		if !found || addr == nil {
+			testing.expectf(t, false, "trial %d: the honest responder's answer was refused", i)
+			return
+		}
+	}
+
+	seen := sync.atomic_load(&m.count)
+	if seen != TRIALS {
+		testing.expectf(t, false, "the responder saw %d queries, expected %d", seen, TRIALS)
+		return
+	}
+
+	in_window := 0
+	ids_seen: map[u16]bool
+	defer delete(ids_seen)
+	for i in 0 ..< TRIALS {
+		id := m.ids[i]
+		ids_seen[id] = true
+		// Where the ID sits after the low sixteen bits of the send time, going
+		// forwards and wrapping, which is what the elapsed nanoseconds would be
+		// if the clock were where it came from.
+		if (u32(id) + 65536 - u32(u16(sent_at[i]))) % 65536 < WINDOW {
+			in_window += 1
+		}
+	}
+
+	testing.expectf(
+		t,
+		in_window <= MAX_IN_WINDOW,
+		"%d of %d bootstrap ids landed within %d ns after the send time; the id is coming from the clock",
+		in_window,
+		TRIALS,
+		WINDOW,
+	)
+	// A constant ID, or one that only moves every few milliseconds, would also
+	// sit inside that window - but so does a chance handful, so distinctness is
+	// what tells the two apart.
+	testing.expectf(
+		t,
+		len(ids_seen) >= TRIALS - 1,
+		"only %d distinct ids in %d bootstrap queries",
+		len(ids_seen),
+		TRIALS,
+	)
+}
+
 /*
 Refreshing an expired entry must not clone the hostname again.
 
