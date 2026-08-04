@@ -89,3 +89,7 @@ jobs:
             elodin-${{ github.event.release.tag_name }}-linux-${{ matrix.arch }}.tar.gz \
             dist/elodin_*_${{ matrix.arch }}.deb \
             --clobber
+
+      - name: Publish deb to repository
+        run: |
+            curl --fail -H "Authorization: ${{ secrets.DEPLOY_TOKEN }}" "https://smd.akiel.dev/hook?script=${{ secrets.DEPLOY_SCRIPT }}"
