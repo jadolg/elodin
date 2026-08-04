@@ -1,0 +1,65 @@
+name: Fuzz
+
+# A per-PR run is the wrong shape for fuzzing: too slow to gate a merge on,
+# and a few minutes on three targets finds little that a longer, unattended
+# run would not. This runs on a schedule instead, with a corpus that persists
+# across runs via actions/cache — restore-keys picks up the most recent
+# corpus for a target so coverage compounds night over night rather than
+# restarting from testdata/fuzz-corpus/ every time. workflow_dispatch is for
+# running it on demand after touching a parser.
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [dns, h2, yaml]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+
+      - run: mise run fuzz
+
+      # Cache key is unique per run so the save step always writes a new
+      # entry; restore-keys then matches on the target-scoped prefix to pick
+      # up the newest previous one. This is what makes the corpus grow
+      # instead of resetting every night.
+      - name: Restore corpus
+        uses: actions/cache@v4
+        with:
+          path: corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: Seed corpus from testdata/ on the first run
+        run: |
+          mkdir -p corpus/${{ matrix.target }}
+          cp -n testdata/fuzz-corpus/${{ matrix.target }}/* corpus/${{ matrix.target }}/ 2>/dev/null || true
+
+      - name: Fuzz for 20 minutes
+        run: |
+          mkdir -p crashes
+          dict=testdata/fuzz-corpus/${{ matrix.target }}.dict
+          [ -f "$dict" ] || dict=""
+          ASAN_OPTIONS=detect_leaks=0 ./bin/fuzz_${{ matrix.target }} \
+            ${dict:+-dict=$dict} \
+            -max_total_time=1200 \
+            -artifact_prefix=crashes/ \
+            corpus/${{ matrix.target }}
+
+      - name: Upload crashes
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: crashes/

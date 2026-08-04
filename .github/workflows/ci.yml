@@ -44,6 +44,20 @@ jobs:
       - run: mise run test
       - run: mise run itest
 
+  fuzz-regression:
+    name: Fuzz corpus regression
+    # No new inputs, just every file in testdata/fuzz-corpus/ run once through
+    # its target. Actual fuzzing runs on a schedule (fuzz.yml) — this job's
+    # only job is making sure a crash that fuzzing already found stays found.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+      - run: mise run fuzz-regression
+
   build:
     name: Build (${{ matrix.arch }})
     strategy:

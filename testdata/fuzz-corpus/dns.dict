@@ -1,0 +1,38 @@
+# libFuzzer dictionary for bin/fuzz_dns.
+#
+# decode_message reads big-endian u16s for QTYPE/TYPE and QCLASS/CLASS, so a
+# mutator finding these by chance is unlikely; handing them over directly gets
+# coverage into every rdata branch in decode.odin instead of just the header.
+# The compression-pointer prefix does the same for name decompression, which a
+# byte-flipping mutator is otherwise unlikely to land on 0xC0 for.
+
+# --- record types decode.odin gives dedicated rdata parsing (types.odin) ---
+type_a="\x00\x01"
+type_ns="\x00\x02"
+type_cname="\x00\x05"
+type_soa="\x00\x06"
+type_ptr="\x00\x0c"
+type_mx="\x00\x0f"
+type_txt="\x00\x10"
+type_srv="\x00\x21"
+type_dname="\x00\x27"
+type_opt="\x00\x29"
+type_ds="\x00\x2b"
+type_svcb="\x00\x40"
+type_https="\x00\x41"
+type_spf="\x00\x63"
+type_any="\x00\xff"
+type_caa="\x01\x01"
+
+# --- classes (types.odin) ---
+class_in="\x00\x01"
+class_cs="\x00\x02"
+class_ch="\x00\x03"
+class_hs="\x00\x04"
+class_none="\x00\xfe"
+class_any="\x00\xff"
+
+# --- name compression (RFC 1035 4.1.4): top two bits of a length byte mark a
+# pointer into the message, so a decoder walking labels has to recognize this
+# rather than treat 0xC0 as a 192-byte label length. ---
+compression_pointer="\xc0"
