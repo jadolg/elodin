@@ -195,6 +195,12 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 	opt_duration(l, n, "client_timeout", &cfg.server.client_timeout, "server")
 	opt_string(l, n, "user", &cfg.server.user, "server")
 	opt_string(l, n, "group", &cfg.server.group, "server")
+
+	if rl := yaml.get(n, "rate_limit"); rl != nil {
+		opt_bool(l, rl, "enabled", &cfg.server.rate_limit.enabled, "server.rate_limit")
+		opt_int(l, rl, "responses_per_second", &cfg.server.rate_limit.responses_per_second, "server.rate_limit")
+		opt_int(l, rl, "slip", &cfg.server.rate_limit.slip, "server.rate_limit")
+	}
 }
 
 @(private)
@@ -819,6 +825,14 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	}
 	if cfg.server.upstream_workers < 1 {
 		errorf(l, "server.upstream_workers must be at least 1")
+	}
+	if cfg.server.rate_limit.enabled {
+		if cfg.server.rate_limit.responses_per_second < 1 {
+			errorf(l, "server.rate_limit.responses_per_second must be at least 1")
+		}
+		if cfg.server.rate_limit.slip < 0 {
+			errorf(l, "server.rate_limit.slip must not be negative")
+		}
 	}
 	if cfg.server.max_pending < 0 {
 		errorf(l, "server.max_pending must not be negative")

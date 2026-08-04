@@ -255,6 +255,12 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	}
 	defer server.stop_validator(&s)
 
+	if !server.start_rate_limiter(&s) {
+		logx.errorf("the rate limiter could not be created, shutting down")
+		os.exit(1)
+	}
+	defer server.stop_rate_limiter(&s)
+
 	if !server.start_cookies(&s) {
 		logx.errorf("the configured cookie secret is not usable, shutting down")
 		os.exit(1)
@@ -421,14 +427,17 @@ maintenance_loop :: proc(
 report :: proc(s: ^server.Server, answers: ^cache.Cache) {
 	st := server.stats_of(s)
 	cs := cache.stats(answers)
+	limited, slipped := server.rate_limit_stats(s.limiter)
 	logx.infof(
-		"stats: queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d secure=%d bogus=%d | cache entries=%d bytes=%d hits=%d misses=%d evictions=%d",
+		"stats: queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d limited=%d truncated=%d secure=%d bogus=%d | cache entries=%d bytes=%d hits=%d misses=%d evictions=%d",
 		st.queries,
 		st.blocked,
 		st.cached,
 		st.forwarded,
 		st.failed,
 		st.dropped,
+		limited,
+		slipped,
 		st.secure,
 		st.bogus,
 		cache.len_entries(answers),

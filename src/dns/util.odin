@@ -65,6 +65,68 @@ make_response :: proc(query: Message, rcode: Rcode, allocator := context.allocat
 }
 
 /*
+The smallest complete answer there is: the question back, with TC set.
+
+Thirty-odd bytes for a query of the same size, so it is no use to anyone
+reflecting traffic off this server, and it says the one thing a rate-limited
+client needs to hear - ask again over TCP, where a handshake proves the address
+the answer would go to. A datagram source cannot do that, which is the point.
+
+Built from the query's own bytes rather than from a decoded message: this runs
+on the read loop while a flood is in progress, and decoding is work the flood
+would be paying us to do. The question is copied only if it is there and
+uncompressed - a pointer in a question is not legal and not worth echoing - and
+otherwise the answer is the header alone, which a client still reads as TC.
+*/
+truncated_response :: proc(query_bytes: []u8, allocator := context.allocator) -> (out: []u8, ok: bool) {
+	if len(query_bytes) < HEADER_SIZE {
+		return nil, false
+	}
+
+	end := HEADER_SIZE
+	questions: u16 = 0
+	if query_bytes[4] == 0 && query_bytes[5] == 1 {
+		p := HEADER_SIZE
+		for p < len(query_bytes) {
+			n := int(query_bytes[p])
+			if n & 0xc0 != 0 {
+				// A pointer, or a reserved label type. Neither belongs here.
+				p = -1
+				break
+			}
+			p += 1 + n
+			if n == 0 {
+				break
+			}
+		}
+		if p >= 0 && p + 4 <= len(query_bytes) {
+			end = p + 4
+			questions = 1
+		}
+	}
+
+	buf := make([]u8, end, allocator)
+	copy(buf, query_bytes[:end])
+	flags := transmute(Flags)(u16(buf[2]) << 8 | u16(buf[3]))
+	flags.qr = true
+	flags.ra = true
+	flags.tc = true
+	// As in `error_response`: every bit here started as the client's, and AD
+	// coming back set would read as this server vouching for something.
+	flags.ad = false
+	flags.rcode = 0
+	fv := transmute(u16)flags
+	buf[2] = u8(fv >> 8)
+	buf[3] = u8(fv)
+	buf[4], buf[5] = u8(questions >> 8), u8(questions)
+	// No answer, authority or additional sections, so nothing counts them.
+	for i in 6 ..< HEADER_SIZE {
+		buf[i] = 0
+	}
+	return buf, true
+}
+
+/*
 Encode a bare error response for a query we could not or would not answer.
 
 Falls back to patching the request's own header when there is no decoded query

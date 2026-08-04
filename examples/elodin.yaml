@@ -38,6 +38,20 @@ server:
   user: ""
   group: ""
 
+  # Response rate limiting, per client prefix (/24 for IPv4, /64 for IPv6).
+  #
+  # A UDP answer goes wherever the source address said, so a resolver that
+  # answers everything is an amplifier: a small spoofed query buys the sender a
+  # large response aimed at somebody else. The budget bounds what any one
+  # address can be made to receive. Every `slip`th query over it is answered
+  # with a truncated response rather than dropped, which tells a real client to
+  # come back over TCP, where the handshake proves the address; 0 drops them
+  # all. TCP, DoT and DoH are not limited - the connection already proves it.
+  rate_limit:
+    enabled: true
+    responses_per_second: 500
+    slip: 2
+
 listeners:
   udp:
     enabled: true

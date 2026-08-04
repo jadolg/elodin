@@ -485,3 +485,93 @@ test_peek_udp_size_reads_the_opt_record :: proc(t: ^testing.T) {
 
 	free_all(context.temp_allocator)
 }
+
+/*
+The truncated answer a rate-limited client gets.
+
+It is built from the query's own bytes on the read loop, without decoding them,
+so it is a parser of hostile input in its own right: what it must never do is
+read past what arrived, and what it must always produce is something a client
+recognises as an answer to its question with TC set.
+*/
+@(test)
+test_truncated_response :: proc(t: ^testing.T) {
+	query := Message {
+		id       = 0xbeef,
+		question = []Question{{name = "example.com.", type = .A, class = .IN}},
+	}
+	query.flags.rd = true
+	wire, _, err := encode_message(query, context.temp_allocator)
+	testing.expect_value(t, err, Encode_Error.None)
+
+	out, ok := truncated_response(wire, context.temp_allocator)
+	testing.expect(t, ok, "a well-formed query got no truncated answer")
+	testing.expect(t, len(out) < 64, "the answer is meant to be too small to reflect")
+
+	decoded, derr := decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	testing.expect_value(t, decoded.id, u16(0xbeef))
+	testing.expect(t, decoded.flags.qr, "QR not set")
+	testing.expect(t, decoded.flags.tc, "TC not set, which is the whole message")
+	testing.expect(t, decoded.flags.ra, "RA not set")
+	// RD comes back as the client sent it; AD never does.
+	testing.expect(t, decoded.flags.rd, "RD not echoed")
+	testing.expect(t, !decoded.flags.ad, "AD set on an answer that vouches for nothing")
+	testing.expect_value(t, rcode_of(decoded), Rcode.No_Error)
+	testing.expect_value(t, len(decoded.question), 1)
+	testing.expect_value(t, decoded.question[0].name, "example.com.")
+	testing.expect_value(t, len(decoded.answer), 0)
+	testing.expect_value(t, len(decoded.additional), 0)
+
+	/*
+	Everything else is a header, which is still an answer: a client reads TC and
+	comes back over TCP. What matters is that none of these walks off the end.
+	*/
+	Case :: struct {
+		wire: []u8,
+		ok:   bool,
+		what: string,
+	}
+
+	short := wire[:HEADER_SIZE - 1]
+	header_only := wire[:HEADER_SIZE]
+	// qdcount says one, and the name never ends.
+	unterminated := make([]u8, HEADER_SIZE + 3, context.temp_allocator)
+	copy(unterminated, wire[:HEADER_SIZE])
+	unterminated[HEADER_SIZE] = 8
+	// qdcount says one, and the question is a compression pointer, which is
+	// not legal in a question and not worth echoing.
+	compressed := make([]u8, HEADER_SIZE + 6, context.temp_allocator)
+	copy(compressed, wire[:HEADER_SIZE])
+	compressed[HEADER_SIZE] = 0xc0
+	compressed[HEADER_SIZE + 1] = 0x0c
+	// A name that ends exactly at the end, with no type and class behind it.
+	truncated_question := wire[:HEADER_SIZE + 13]
+
+	CASES := []Case {
+		{short, false, "shorter than a header"},
+		{header_only, true, "a header and nothing else"},
+		{unterminated, true, "a question whose name never ends"},
+		{compressed, true, "a compressed question"},
+		{truncated_question, true, "a question cut off before its type"},
+		{{}, false, "nothing at all"},
+	}
+
+	for c in CASES {
+		got, built := truncated_response(c.wire, context.temp_allocator)
+		testing.expectf(t, built == c.ok, "%s: built=%v", c.what, built)
+		if !built {
+			continue
+		}
+		testing.expectf(t, len(got) >= HEADER_SIZE, "%s: %d bytes came back", c.what, len(got))
+		testing.expectf(t, got[2] & 0x80 != 0, "%s: QR not set", c.what)
+		testing.expectf(t, got[2] & 0x02 != 0, "%s: TC not set", c.what)
+		// Nothing is claimed that is not there.
+		questions := int(got[4]) << 8 | int(got[5])
+		testing.expectf(t, questions == 0 || len(got) > HEADER_SIZE, "%s: a question claimed but not carried", c.what)
+		for i in 6 ..< HEADER_SIZE {
+			testing.expectf(t, got[i] == 0, "%s: section count at byte %d is not zero", c.what, i)
+		}
+	}
+	free_all(context.temp_allocator)
+}

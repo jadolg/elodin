@@ -228,6 +228,67 @@ stream_query :: proc(c: ^Test_Conn, query: []u8, allocator: mem.Allocator) -> Qu
 	return Query_Result{wire = out, ok = true}
 }
 
+/*
+Send `count` queries from one socket as fast as they go out, then read whatever
+comes back until the wire goes quiet.
+
+One socket and one draining pass, because the point is what the server sends in
+answer to a burst: asking query by query and waiting for each would let the
+budget refill between them, and waiting out a timeout for the ones that are
+never answered would take the rest of the afternoon.
+*/
+Flood_Result :: struct {
+	answered:  int,
+	truncated: int,
+	bytes:     int,
+}
+
+udp_flood :: proc(port: int, query: []u8, count: int, drain := 700 * time.Millisecond) -> Flood_Result {
+	socket, err := net.make_unbound_udp_socket(.IP4)
+	if err != nil {
+		return {}
+	}
+	defer net.close(socket)
+	_ = net.set_option(socket, .Receive_Timeout, 50 * time.Millisecond)
+	_ = net.set_option(socket, .Send_Timeout, time.Second)
+	_ = net.set_option(socket, .Receive_Buffer_Size, 4 << 20)
+
+	endpoint := net.Endpoint {
+		address = net.IP4_Loopback,
+		port    = port,
+	}
+
+	out := make([]u8, len(query), context.temp_allocator)
+	copy(out, query)
+	for i in 0 ..< count {
+		// A transaction ID of its own per query, as a real client would.
+		out[0], out[1] = u8(i >> 8), u8(i)
+		if _, serr := net.send_udp(socket, out, endpoint); serr != nil {
+			break
+		}
+	}
+
+	res: Flood_Result
+	buf := make([]u8, 65535, context.temp_allocator)
+	deadline := time.time_add(time.now(), drain)
+	for time.diff(deadline, time.now()) < 0 {
+		n, _, rerr := net.recv_udp(socket, buf)
+		if rerr != nil {
+			// The receive timeout expiring is how this notices the quiet.
+			continue
+		}
+		if n < dns.HEADER_SIZE {
+			continue
+		}
+		res.answered += 1
+		res.bytes += n
+		if buf[2] & 0x02 != 0 {
+			res.truncated += 1
+		}
+	}
+	return res
+}
+
 // --- DoH ------------------------------------------------------------------
 
 Http_Result :: struct {

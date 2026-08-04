@@ -122,6 +122,9 @@ main :: proc() {
 	section(&r, "rewrites")
 	run_rewrite_cases(&r)
 
+	section(&r, "rate limiting")
+	run_rate_limit_cases(&r)
+
 	section(&r, "cache")
 	run_cache_cases(&r)
 	run_cache_bytes_cases(&r)

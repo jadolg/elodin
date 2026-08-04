@@ -136,6 +136,11 @@ server:
   max_connections: %d
   max_pending: %d
   client_timeout: 10s
+  # The load generator is one address sending as fast as it can, which is
+  # exactly the shape response rate limiting exists to stop. Measuring the
+  # server's ceiling means taking that limit off; a real deployment keeps it.
+  rate_limit:
+    enabled: false
 
 listeners:
   udp:

@@ -37,7 +37,11 @@ Stats :: struct {
 	forwarded: u64,
 	failed:    u64,
 	rewritten: u64,
-	// Queries refused before any work was done, because the backlog was full.
+	/*
+	Queries refused before any work was done: the backlog was full, or the
+	source was one no answer could reach - see `plausible_source`. Queries the
+	rate limiter withheld are counted by the limiter itself.
+	*/
 	dropped:   u64,
 	// Answers that carried a valid chain of signatures, and answers refused
 	// because they did not.
@@ -52,6 +56,8 @@ Server :: struct {
 	filters:      ^filter.Engine,
 	validator:    ^dnssec.Validator,
 	cookies:      ^Cookie_Keeper,
+	// Nil when rate limiting is off; `rate_check` takes that as "allow".
+	limiter:      ^Rate_Limiter,
 	handler_pool: ^pool.Pool,
 	race_pool:    ^pool.Pool,
 	stats:        Stats,

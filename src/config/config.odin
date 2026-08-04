@@ -323,6 +323,23 @@ Server_Config :: struct {
 	user:             string,
 	// Group to go with `user`. Empty takes the user's primary group.
 	group:            string,
+	rate_limit:       Rate_Limit_Config,
+}
+
+/*
+Response rate limiting for the UDP listener.
+
+`responses_per_second` is per client prefix - /24 for IPv4, /64 for IPv6 -
+because an attacker spoofing a victim's address picks freely within their range,
+so a per-address budget would only be spread across it. `slip` answers every Nth
+query over the budget with a truncated response rather than dropping it, which
+tells a real client to come back over TCP where the handshake proves the address
+an answer would go to; 0 drops them all.
+*/
+Rate_Limit_Config :: struct {
+	enabled:              bool,
+	responses_per_second: int,
+	slip:                 int,
 }
 
 Config :: struct {
@@ -352,6 +369,18 @@ default_config :: proc() -> Config {
 		client_timeout   = 10 * time.Second,
 		max_connections  = 512,
 		max_pending      = 0,
+		/*
+		On by default, and generous.
+
+		A resolver that answers anything from anywhere is an amplifier, and the
+		default has to be a bound rather than an invitation to configure one.
+		Five hundred responses a second to one /24 is far past what a household
+		or an office behind one NAT asks for - the busiest of those is a few
+		dozen - and far under what makes reflection worth an attacker's
+		bandwidth. Every second query past it comes back truncated rather than
+		dropped, so a client that really is that busy keeps resolving, over TCP.
+		*/
+		rate_limit       = Rate_Limit_Config{enabled = true, responses_per_second = 500, slip = 2},
 	}
 	c.listeners.udp = Listener {
 		enabled = true,

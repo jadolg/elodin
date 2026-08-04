@@ -12,5 +12,9 @@ fuzz_one :: proc "c" (data: [^]u8, size: uint) -> i32 {
 	defer harness.teardown(&f)
 
 	_, _ = dns.decode_message(data[:size])
+	// Reached from the UDP read loop for a rate-limited query, on the bytes as
+	// they arrived and without decoding them first, so it is its own parser of
+	// hostile input and gets its own turn here.
+	_, _ = dns.truncated_response(data[:size])
 	return 0
 }

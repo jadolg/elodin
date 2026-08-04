@@ -13,6 +13,10 @@ import "elodin:tlsx"
 
 Listeners :: struct {
 	udp_socket: net.UDP_Socket,
+	// What the UDP socket actually bound, read once: `plausible_source` needs
+	// it for every datagram, and asking the kernel each time is a syscall per
+	// query for an answer that cannot change.
+	udp_bound:  net.Endpoint,
 	tcp_socket: net.TCP_Socket,
 	dot_socket: net.TCP_Socket,
 	doh_socket: net.TCP_Socket,
@@ -189,6 +193,9 @@ start_udp :: proc(s: ^Server, l: ^Listeners) -> bool {
 
 	l.udp_socket = socket
 	l.udp_open = true
+	if bound, berr := net.bound_endpoint(socket); berr == nil {
+		l.udp_bound = bound
+	}
 
 	ctx := new(Udp_Context)
 	ctx.server = s
@@ -223,6 +230,32 @@ udp_loop :: proc(data: rawptr) {
 			continue
 		}
 
+		if !plausible_source(l, client) {
+			sync.atomic_add(&ctx.server.stats.dropped, 1)
+			continue
+		}
+
+		/*
+		Charged before the work rather than after the answer.
+
+		A response this server will not send is a query it need not resolve, and
+		under a flood the upstream round trips and the cache churn are as much of
+		the damage as the traffic. It costs a strictly conservative limiter: the
+		reply that never gets built is charged for anyway, and a query that turns
+		out to be answerable from cache costs the same as one that is not.
+		*/
+		switch rate_check(ctx.server.limiter, client, time.tick_now()) {
+		case .Allow:
+		case .Truncate:
+			if tc, built := dns.truncated_response(buf[:n], context.temp_allocator); built {
+				_, _ = net.send_udp(l.udp_socket, tc, client)
+			}
+			free_all(context.temp_allocator)
+			continue
+		case .Drop:
+			continue
+		}
+
 		// Shed rather than queue once the backlog is past what the workers can
 		// work through. A query added here would be answered long after its
 		// client stopped waiting, and the effort spent on it is taken from
@@ -248,6 +281,72 @@ udp_loop :: proc(data: rawptr) {
 	}
 	// `ctx` is not released here: jobs queued above still hold it, and they run
 	// on while the pool drains. `destroy_listeners` has it.
+}
+
+/*
+Whether a datagram's source could be a client waiting for an answer.
+
+Two things it cannot be, both free to check and both well established:
+
+Port 0 is not a port anything receives on. A query that says it came from one is
+either a probe or a packet built by hand, and answering it sends a datagram to a
+port the kernel will not deliver.
+
+Our own listening endpoint is the other. A datagram spoofed as coming from the
+address and port this server is answering on makes it talk to itself - every
+answer arriving as a new query, forever, at whatever rate the loop sustains. A
+source port equal to ours from a loopback address is the same thing under a
+wildcard bind, where our own datagrams come from whichever local address the
+route picked rather than the 0.0.0.0 we asked for.
+
+The same shape aimed at *another* resolver is what a loop between two servers
+would be, and this is not what stops that: a client's source port is essentially
+never 53, but "essentially never" has counted some real forwarders, so refusing
+every datagram from port 53 would refuse them too. What stops it is that neither
+end answers an answer - `handle_query` drops anything with QR set before it
+looks at the question - so the exchange is one datagram each way rather than a
+loop, and the rate limiter bounds even that.
+*/
+@(private)
+plausible_source :: proc(l: ^Listeners, client: net.Endpoint) -> bool {
+	if client.port == 0 {
+		return false
+	}
+	bound := l.udp_bound
+	if bound.port == 0 || client.port != bound.port {
+		return true
+	}
+	// Bound to a concrete address, and the source claims to be it.
+	if addresses_equal(client.address, bound.address) {
+		return false
+	}
+	// Bound to the wildcard, where the source of our own datagrams is whichever
+	// local address the route picked rather than the address we bound.
+	return !is_loopback(client.address)
+}
+
+@(private)
+addresses_equal :: proc(a, b: net.Address) -> bool {
+	switch x in a {
+	case net.IP4_Address:
+		y, ok := b.(net.IP4_Address)
+		return ok && x == y
+	case net.IP6_Address:
+		y, ok := b.(net.IP6_Address)
+		return ok && x == y
+	}
+	return false
+}
+
+@(private)
+is_loopback :: proc(a: net.Address) -> bool {
+	switch x in a {
+	case net.IP4_Address:
+		return x[0] == 127
+	case net.IP6_Address:
+		return x == net.IP6_Loopback
+	}
+	return false
 }
 
 @(private)
