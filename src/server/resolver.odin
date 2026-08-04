@@ -269,6 +269,34 @@ resolve_query :: proc(
 		forwarded = stripped
 	}
 
+	/*
+	The transaction ID on the way out is ours.
+
+	The client chose the one on the query coming in, and forwarding it means an
+	attacker that can reach this listener picks the ID this server will then
+	accept from the upstream - half of what RFC 5452 section 9.2 asks an
+	off-path attacker to guess, handed over for the asking. What is left is the
+	ephemeral source port, and a search space of 2^16 is minutes of packets on a
+	fast link rather than the 2^31 it should be. A win is cached and served to
+	every client behind this resolver for the whole TTL.
+
+	Placed here rather than in the procedures above because all three ways the
+	outgoing buffer comes about pass through this point: the client's message
+	forwarded as it stands, the DNSSEC rewrite, and the one with the client's
+	cookie taken back out. The reply's ID is put back to the client's below,
+	which the DoH path already relied on.
+
+	Cloned first when the buffer is still the caller's. `query` is needed intact
+	afterwards - `error_response` answers from it, and on the UDP listener it is
+	a receive buffer this thread does not own - and `remove_edns_option` hands
+	back the message unchanged when there was no option to remove, so a buffer
+	arriving here can be the client's own either way.
+	*/
+	if raw_data(forwarded) == raw_data(query) {
+		forwarded = dns.clone_message_bytes(forwarded, allocator)
+	}
+	dns.set_id_in_place(forwarded, dns.random_id())
+
 	resp, winner, uerr := upstream.resolve(s.group, forwarded, allocator)
 	if uerr != .None {
 		sync.atomic_add(&s.stats.failed, 1)
@@ -278,8 +306,8 @@ resolve_query :: proc(
 		return out, .Failed, built
 	}
 
-	// Upstream answers carry our forwarded ID already, but a DoH upstream is
-	// asked with a zeroed ID, so set it unconditionally.
+	// The answer carries the ID we forwarded with, which is not the client's and
+	// on a DoH upstream is zero. The client is waiting on its own.
 	dns.set_id_in_place(resp, msg.id)
 
 	if validating {

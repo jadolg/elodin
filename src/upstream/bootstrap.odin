@@ -134,7 +134,12 @@ bootstrap_query :: proc(
 
 	name := dns.name_canonical(hostname, context.temp_allocator)
 	query := dns.Message {
-		id       = u16(time.now()._nsec & 0xffff),
+		// From the entropy source rather than from the clock: the low bits of a
+		// timestamp carry only as much unpredictability as the platform's clock
+		// resolution puts there, and what this query's answer decides - the
+		// address every later query to this upstream is sent to, cached for
+		// BOOTSTRAP_TTL - is worth more than that.
+		id       = dns.random_id(),
 		question = []dns.Question{{name = name, type = qtype, class = .IN}},
 	}
 	query.flags.rd = true
