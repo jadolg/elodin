@@ -208,26 +208,16 @@ test_upstream_query_asks_for_signatures :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(msg.question), 1)
 	testing.expect_value(t, msg.question[0].name, "www.example.com.")
 	testing.expect_value(t, msg.question[0].type, dns.Type.A)
-	testing.expect_value(t, msg.id, u16(0x2b2b))
-	free_all(context.temp_allocator)
-}
 
-@(test)
-test_query_ids_do_not_repeat_in_sequence :: proc(t: ^testing.T) {
-	seen: map[u16]bool
-	defer delete(seen)
-	collisions := 0
-	for _ in 0 ..< 256 {
-		id := next_query_id()
-		if seen[id] {
-			collisions += 1
-		}
-		seen[id] = true
-	}
-	// 256 draws from 16 bits will collide now and again; a counter handed out
-	// raw would collide never, and be guessable, which is the failure this is
-	// looking for.
-	testing.expect(t, len(seen) > 200, "too few distinct transaction ids")
+	/*
+	Nothing is asserted about the transaction ID here on purpose. This procedure
+	leaves it as the client wrote it, and `resolve_query` replaces it with a
+	fresh one once this path and the plain forwarding path have converged - so
+	the ID a client chose surviving this far is expected, and the ID reaching an
+	upstream is what has to be checked. `query_id_test.odin` checks it, through
+	the whole server.
+	*/
+	free_all(context.temp_allocator)
 }
 
 /*

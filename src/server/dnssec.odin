@@ -1,8 +1,6 @@
 package server
 
 import "core:mem"
-import "core:sync"
-import "core:time"
 import "elodin:dns"
 import "elodin:dnssec"
 import "elodin:logx"
@@ -106,7 +104,7 @@ validator_query :: proc(
 	additional[0] = dns.make_opt(UPSTREAM_UDP_SIZE, true)
 
 	q := dns.Message {
-		id         = next_query_id(),
+		id         = dns.random_id(),
 		question   = question,
 		additional = additional,
 	}
@@ -126,38 +124,12 @@ validator_query :: proc(
 }
 
 /*
-Transaction IDs for the validator's own queries.
-
-The client picks the ID on the path a query is forwarded on; here there is no
-client, so the number has to come from somewhere. A counter run through a
-mixing function keeps consecutive IDs from marching in a straight line, which
-is all that is being asked of it - a UDP upstream is the only transport where
-an off-path guess buys anything, and the response is still checked against the
-question either way.
-*/
-@(private)
-query_id_state: u64
-
-@(private)
-next_query_id :: proc() -> u16 {
-	if sync.atomic_load(&query_id_state) == 0 {
-		sync.atomic_store(&query_id_state, u64(time.now()._nsec) | 1)
-	}
-	x := sync.atomic_add(&query_id_state, 0x9e37_79b9_7f4a_7c15)
-	x ~= x >> 30
-	x *= 0xbf58_476d_1ce4_e5b9
-	x ~= x >> 27
-	x *= 0x94d0_49bb_1331_11eb
-	x ~= x >> 31
-	return u16(x)
-}
-
-/*
 Re-ask the client's question with DO and CD set.
 
 The client's own EDNS options ride along - a subnet hint still belongs to it -
 but the payload size and the DO bit are ours. Its cookie is taken back out
-further down, once this and the plain forwarding path have converged.
+further down, and its transaction ID replaced, once this and the plain
+forwarding path have converged.
 */
 @(private)
 dnssec_upstream_query :: proc(query: dns.Message, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
