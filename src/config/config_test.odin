@@ -27,6 +27,11 @@ upstream:
     - tcp://9.9.9.9
     - 192.168.1.1
 
+server:
+  rate_limit:
+    responses_per_second: 100
+    slip: 0
+
 cache:
   max_entries: 5000
   max_bytes: 32MiB
@@ -95,6 +100,11 @@ test_load_good_config :: proc(t: ^testing.T) {
 	s3 := cfg.upstream.servers[3]
 	testing.expect_value(t, s3.kind, Upstream_Kind.UDP)
 	testing.expect_value(t, s3.port, 53)
+
+	// On unless it is switched off, and the numbers are the file's.
+	testing.expect(t, cfg.server.rate_limit.enabled, "rate limiting should default to on")
+	testing.expect_value(t, cfg.server.rate_limit.responses_per_second, 100)
+	testing.expect_value(t, cfg.server.rate_limit.slip, 0)
 
 	testing.expect_value(t, cfg.cache.max_entries, 5000)
 	testing.expect_value(t, cfg.cache.max_bytes, 32 * 1024 * 1024)
@@ -243,6 +253,33 @@ test_cache_byte_budget_is_checked :: proc(t: ^testing.T) {
 	_, bad_err := load_string(nonsense, context.temp_allocator)
 	_, bad_has := bad_err.?
 	testing.expect(t, bad_has, "a size that is not a size was accepted")
+
+	free_all(context.temp_allocator)
+}
+
+/*
+A rate limit that cannot limit is a misconfiguration rather than a small one,
+and a limiter that is switched off is not sized at all.
+*/
+@(test)
+test_rate_limit_settings_are_checked :: proc(t: ^testing.T) {
+	zero := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    responses_per_second: 0\n"
+	_, err := load_string(zero, context.temp_allocator)
+	e, has := err.?
+	testing.expect(t, has, "a budget of zero responses a second was accepted")
+	if has {
+		testing.expect_value(t, len(e.messages), 1)
+	}
+
+	negative := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    slip: -1\n"
+	_, nerr := load_string(negative, context.temp_allocator)
+	_, nhas := nerr.?
+	testing.expect(t, nhas, "a negative slip was accepted")
+
+	off := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    enabled: false\n    responses_per_second: 0\n"
+	_, oerr := load_string(off, context.temp_allocator)
+	_, ohas := oerr.?
+	testing.expect(t, !ohas, "a limiter that is switched off was sized anyway")
 
 	free_all(context.temp_allocator)
 }

@@ -8,6 +8,7 @@ Pi-hole and AdGuard Home, minus the web interface. One binary, one YAML file.
 - Three upstream strategies: failover, round-robin and race
 - Sink lists in hosts, plain-domain and adblock syntax, with allowlists
 - Answer cache with negative caching and optional stale serving
+- Response rate limiting per client prefix, on by default
 - Local rewrites (A, AAAA, CNAME, or "answer as if blocked")
 - DNSSEC validation against the root trust anchors, on by default
 - DNS cookies in both directions (RFC 7873/9018), on by default
@@ -245,9 +246,10 @@ addresses, the upstream set, blocking — those still need a restart.
 ### Observing it
 
 There is no metrics endpoint. Statistics go to the log every five minutes —
-queries, blocked, cached, forwarded, failed, dropped, secure and bogus counts,
-plus cache entries, bytes, hits, misses and evictions — and `log.queries` adds
-one line per query, at the cost noted under [Resource use](#resource-use).
+queries, blocked, cached, forwarded, failed, dropped, rate-limited and
+truncated, secure and bogus counts, plus cache entries, bytes, hits, misses and
+evictions — and `log.queries` adds one line per query, at the cost noted under
+[Resource use](#resource-use).
 
 ## Configuration
 
@@ -463,6 +465,55 @@ Two things worth knowing about running with it on:
   to be signed.** A forwarder cannot tell the parent's copy of a delegation,
   which is unsigned by definition, from the child's, which is not. The answer
   section is validated in full; this affects only what rides alongside it.
+
+### Rate limiting
+
+```yaml
+server:
+  rate_limit:
+    enabled: true                 # on by default
+    responses_per_second: 500     # per client prefix: /24 for IPv4, /64 for IPv6
+    slip: 2                       # answer every 2nd query over the budget truncated; 0 drops them all
+```
+
+A UDP query carries no proof of where it came from, so the answer goes wherever
+the source address said. That is what makes any resolver an amplifier: a 40-byte
+query with an OPT record advertising 4096 buys the sender two orders of magnitude
+of traffic aimed at whoever they named, and DNSSEC and `ANY` answers are the
+usual way to get the most of it. A spoofed source port of 53 pointed at another
+resolver is the same trick made into a loop between the two.
+
+What bounds it is a budget on how much this server will send *to one place*. The
+sender's own rate is not worth measuring — they are not the ones receiving it,
+and with a spoofed address there is nothing of theirs to measure — so the budget
+is kept per destination prefix, /24 and /64, which is the granularity an attacker
+picks addresses within.
+
+Over-budget queries are not simply dropped. Every `slip`th one comes back as a
+header and a question with the TC bit set: thirty-odd bytes, too small to be
+worth reflecting, and the standard way of telling a client to ask again over TCP
+where the handshake proves the address. A client behind a genuinely busy NAT
+therefore keeps resolving, one round trip slower; a spoofed source cannot follow
+it up. Set `slip: 0` to drop them instead and answer nothing.
+
+500 responses a second to one /24 is far past what a household or an office
+behind one NAT asks for and far below what makes reflection worth an attacker's
+bandwidth, which is why it is on by default. The accounting is a fixed table of
+16,384 buckets — half a megabyte, allocated once — so the limiter is not itself
+somewhere to put pressure, and which prefixes share a bucket is decided by a key
+drawn at startup rather than by anything an attacker can work out.
+
+Two source addresses are refused outright before any of this: port 0, which
+nothing receives on, and this server's own listening endpoint, which is a query
+that would make it answer itself forever.
+
+TCP, DoT and DoH are not rate limited. A connection is established before a
+query arrives on one, so the address is already proven and there is nothing to
+reflect off.
+
+`cookies.require` is the sharper instrument for an attack actually under way:
+it makes a UDP client prove it can receive at the address it claims before any
+answer is sent at all. See [DNS cookies](#dns-cookies).
 
 ### DNS cookies
 
@@ -746,7 +797,8 @@ upstream traffic by the number of servers.
   TCP, DoT and DoH together by `server.max_connections` (512). That is fine for
   clients that hold a connection open and pipeline over it, but it does not suit
   tens of thousands of concurrent connections. UDP is the exception: one reader
-  thread, no per-client state, no limit.
+  thread and no per-client state, bounded instead by the per-prefix response
+  budget described under [Rate limiting](#rate-limiting).
 - Upstream I/O is synchronous, so concurrency is bounded by thread count rather
   than by in-flight queries. The h2 upstream client is the exception — its
   queries multiplex onto one connection — but a worker is still held for the
@@ -857,6 +909,7 @@ What it covers:
 | DoH upstreams | a query resolved over an h2 upstream, one connection multiplexed across queries rather than reopened, fallback to HTTP/1.1 when the upstream does not offer h2 |
 | blocking | all five response modes, hosts vs domains vs adblock semantics, allow precedence, wildcards, modifiers, dnsmasq syntax, unusable rules, case folding |
 | rewrites | A, AAAA, CNAME, wildcard scope, `block`, NODATA for unmatched types |
+| rate limiting | a flood from one source answered in full with the limiter off and cut to the budget with it on, truncated answers over the budget, and the bytes one address can be made to receive compared between the two |
 | cache | hits avoid the upstream, TTL countdown, cross-transport reuse, question re-casing, negative caching, key separation by type |
 | upstreams | failover, round-robin, race, health cooldown, TCP and DoT clients, connection pooling, UDP→TCP retry, total outage → SERVFAIL |
 | blocklist downloads | two lists fetched over HTTP and both applied, written to the cache directory, reused on restart without re-fetching, unwritable cache directory degrades to a warning |
