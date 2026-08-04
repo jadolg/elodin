@@ -130,6 +130,46 @@ run_h2_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	/*
+	RFC 7541 6.3: a dynamic table size update may not exceed the limit the
+	protocol set, which here is the 4096 of SETTINGS_HEADER_TABLE_SIZE. A larger
+	one is a decoding error (4.2), and a decoding error on a connection whose
+	HPACK state is now in doubt is a GOAWAY rather than a refused stream.
+
+	An update *at* the limit is sent first, so what the case below shows is a
+	size being refused rather than size updates being unwelcome.
+	*/
+	start_case(r, "h2: a dynamic table size update at the advertised limit is accepted")
+	{
+		c, cok := h2_connect(doh_port)
+		if check(r, cok, "cannot open an h2 connection") {
+			defer h2_close(c)
+			check(r, h2_send_request(c, 1, "POST", "/dns-query", query, table_update = 4096), "cannot send")
+			if check(r, h2_collect(c, []u32{1}), "stream 1 never completed") {
+				res, _ := h2_stream(c, 1)
+				check_eq_int(r, res.status, 200, "status")
+			}
+		}
+	}
+	end_case(r)
+
+	start_case(r, "h2: a dynamic table size update past the advertised limit is refused")
+	{
+		c, cok := h2_connect(doh_port)
+		if check(r, cok, "cannot open an h2 connection") {
+			defer h2_close(c)
+			check(r, h2_send_request(c, 1, "POST", "/dns-query", query, table_update = 8192), "cannot send")
+			// The connection ends, so this returns as soon as the read fails
+			// rather than waiting out the timeout.
+			_ = h2_collect(c, []u32{1}, 3 * time.Second)
+			res, found := h2_stream(c, 1)
+			answered := found && res.done && res.status == 200
+			check(r, !answered, "a table twice the advertised size was accepted and the request served")
+			check(r, c.goaway, "no GOAWAY for a header block that could not be decoded")
+		}
+	}
+	end_case(r)
+
 	start_case(r, "h2: concurrent streams are answered in parallel, not in turn")
 	{
 		// The mock delays every answer, so serial handling would cost the sum of

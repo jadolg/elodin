@@ -166,8 +166,14 @@ h2_send_request :: proc(
 	content_type := "application/dns-message",
 	huffman := false,
 	split_headers := false,
+	// A dynamic table size update at the head of the block, where HPACK
+	// requires one to be. Negative sends none.
+	table_update := -1,
 ) -> bool {
 	block := make([dynamic]u8, 0, 128, context.temp_allocator)
+	if table_update >= 0 {
+		h2_write_integer(&block, 5, table_update, 0x20)
+	}
 	h2_literal(&block, ":method", method, huffman)
 	h2_literal(&block, ":scheme", "https", huffman)
 	h2_literal(&block, ":authority", "elodin.local", huffman)

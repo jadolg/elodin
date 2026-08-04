@@ -92,31 +92,33 @@ Stream :: struct {
 }
 
 Conn :: struct {
-	io:              IO,
-	handler:         Handler,
-	user:            rawptr,
+	io:                  IO,
+	handler:             Handler,
+	user:                rawptr,
 
-	mu:              sync.Mutex,
-	cond:            sync.Cond,
-	refs:            int,
-	closed:          bool,
+	mu:                  sync.Mutex,
+	cond:                sync.Cond,
+	refs:                int,
+	closed:              bool,
 
 	// Peer settings that govern what we may send.
-	peer_max_frame:  int,
+	peer_max_frame:      int,
 	peer_initial_window: int,
-	send_window:     int,
+	send_window:         int,
 
-	decoder:         Dynamic_Table,
-	streams:         map[u32]^Stream,
-	last_stream_id:  u32,
-	goaway_sent:     bool,
+	decoder:             Dynamic_Table,
+	streams:             map[u32]^Stream,
+	last_stream_id:      u32,
+	goaway_sent:         bool,
 
-	allocator:       mem.Allocator,
+	allocator:           mem.Allocator,
 	// Scratch for a header block spanning CONTINUATION frames.
-	continuation_on: u32,
+	continuation_on:     u32,
+	// How many of them have arrived for the block currently open.
+	continuation_frames: int,
 	// How long a response may wait for the peer to grant flow-control credit
 	// before the stream is given up on.
-	write_timeout:   time.Duration,
+	write_timeout:       time.Duration,
 }
 
 make_conn :: proc(io: IO, handler: Handler, user: rawptr, allocator := context.allocator) -> ^Conn {
@@ -131,7 +133,7 @@ make_conn :: proc(io: IO, handler: Handler, user: rawptr, allocator := context.a
 	c.send_window = DEFAULT_WINDOW
 	c.streams = make(map[u32]^Stream, 16, allocator)
 	c.write_timeout = DEFAULT_WRITE_TIMEOUT
-	dynamic_table_init(&c.decoder, 4096, allocator)
+	dynamic_table_init(&c.decoder, DEFAULT_HEADER_TABLE_SIZE, allocator)
 	return c
 }
 
@@ -281,10 +283,14 @@ write_all :: proc(c: ^Conn, buf: []u8) -> bool {
 @(private)
 send_initial_settings :: proc(c: ^Conn) -> bool {
 	out := make([dynamic]u8, 0, 64, context.temp_allocator)
-	// SETTINGS_ENABLE_PUSH=0, MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE, and
-	// MAX_HEADER_LIST_SIZE - the last so a peer is told the bound rather than
-	// discovering it as a connection error.
-	write_frame_header(&out, 24, .Settings, 0, 0)
+	// SETTINGS_HEADER_TABLE_SIZE, ENABLE_PUSH=0, MAX_CONCURRENT_STREAMS,
+	// INITIAL_WINDOW_SIZE and MAX_HEADER_LIST_SIZE - the bounds stated rather
+	// than left for a peer to discover as a connection error. The table size is
+	// the RFC 9113 6.5.2 default, which would apply anyway; sending it puts the
+	// number `decode` holds a peer to on the wire where the peer can read it.
+	write_frame_header(&out, 30, .Settings, 0, 0)
+	append(&out, 0, u8(Setting.Header_Table_Size))
+	append_u32(&out, DEFAULT_HEADER_TABLE_SIZE)
 	append(&out, 0, u8(Setting.Enable_Push))
 	append_u32(&out, 0)
 	append(&out, 0, u8(Setting.Max_Concurrent_Streams))
@@ -499,6 +505,7 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 
 	if h.flags & FLAG_END_HEADERS == 0 {
 		c.continuation_on = h.stream_id
+		c.continuation_frames = 0
 		return true
 	}
 	return finish_headers(c, s)
@@ -508,6 +515,21 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 handle_continuation :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	if c.continuation_on != h.stream_id {
 		goaway(c, .Protocol_Error)
+		return false
+	}
+	/*
+	Counted as well as measured.
+
+	The size cap below is no cap against frames that carry nothing: an empty
+	CONTINUATION never advances `len(s.header_block)`, so a peer sending them
+	holds the block open and this thread reading nine-byte frames for as long as
+	it likes. Nothing accrues, which is why the cap is generous - a legitimate
+	block is MAX_HEADER_LIST at the outside and arrives in a handful of frames,
+	so anything near this many is a peer with something else in mind.
+	*/
+	c.continuation_frames += 1
+	if c.continuation_frames > MAX_CONTINUATION_FRAMES {
+		goaway(c, .Enhance_Your_Calm)
 		return false
 	}
 	sync.mutex_lock(&c.mu)

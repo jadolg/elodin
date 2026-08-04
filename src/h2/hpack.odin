@@ -23,6 +23,17 @@ saved would not pay for the risk.
 MAX_HEADER_LIST :: 32 * 1024
 MAX_HEADER_COUNT :: 128
 
+/*
+How many CONTINUATION frames one header block may arrive in.
+
+MAX_HEADER_LIST is what a block may weigh, and against a peer sending empty
+frames that is no bound at all - nothing accrues, so nothing trips, and the
+block stays open for as long as the peer keeps sending. A block at the size
+limit arrives in three frames at the default 16 KiB maximum frame size, so this
+is fifty times what a legitimate sender needs and still a number.
+*/
+MAX_CONTINUATION_FRAMES :: 128
+
 Hpack_Error :: enum u8 {
 	None,
 	Truncated,
@@ -32,11 +43,26 @@ Hpack_Error :: enum u8 {
 	Bad_Update,
 }
 
+/*
+The size a decoder's dynamic table is built with, and the most a peer may raise
+it to.
+
+RFC 9113 6.5.2 makes 4096 the default for SETTINGS_HEADER_TABLE_SIZE, which is
+what both connection types announce. It is stated in the SETTINGS frame rather
+than left to be inherited, so the number the table is built with and the number
+a peer is held to are visibly the same one.
+*/
+DEFAULT_HEADER_TABLE_SIZE :: 4096
+
 Dynamic_Table :: struct {
 	// Newest first, which is the order HPACK indexes them in.
 	entries:   [dynamic]Header_Field,
 	size:      int,
 	max_size:  int,
+	// The size this end advertised: the ceiling on `max_size`, enforced in
+	// `decode` where an update past it is the decoding error RFC 7541 4.2 asks
+	// for. Set once, at init.
+	limit:     int,
 	allocator: mem.Allocator,
 }
 
@@ -49,6 +75,7 @@ entry_size :: proc(f: Header_Field) -> int {
 dynamic_table_init :: proc(t: ^Dynamic_Table, max_size: int, allocator := context.allocator) {
 	t.allocator = allocator
 	t.max_size = max_size
+	t.limit = max_size
 	t.entries = make([dynamic]Header_Field, 0, 16, allocator)
 }
 
@@ -233,9 +260,23 @@ decode :: proc(
 			append(&out, f)
 
 		case b & 0xe0 == 0x20:
-			// Dynamic table size update.
+			/*
+			Dynamic table size update.
+
+			RFC 7541 6.3: "The new maximum size MUST be lower than or equal to
+			the limit determined by the protocol using HPACK", and 4.2 makes a
+			larger one a decoding error - which `finish_headers` turns into a
+			COMPRESSION_ERROR GOAWAY, since HPACK state a peer and this end
+			disagree about cannot be recovered from on a live connection.
+
+			The limit is the size this end advertised, not a constant of the
+			decoder's own. It used to be 65536 here against a table built with
+			4096, so a peer could hold what it liked up to whatever
+			`read_integer` would still read - a decoder's worth of state per
+			connection that this end never agreed to.
+			*/
 			size := read_integer(&r, 5) or_return
-			if size > 65536 {
+			if size > table.limit {
 				return nil, .Bad_Update
 			}
 			dynamic_table_set_max(table, size)

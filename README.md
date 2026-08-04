@@ -382,6 +382,13 @@ table, HEADERS with CONTINUATION, DATA, connection- and stream-level flow
 control, WINDOW_UPDATE, PING, RST_STREAM and GOAWAY. Server push is refused in
 SETTINGS and stream priority is parsed and ignored, which RFC 9113 permits.
 
+What one connection may make this end hold is stated in that SETTINGS frame
+rather than left to be discovered: 128 concurrent streams, a 32 KiB header list,
+and a 4096-byte HPACK table, which is also the ceiling on the dynamic table size
+updates a peer may send (RFC 7541 6.3). A header block may arrive in at most 128
+CONTINUATION frames, since a block bounded only by its size never ends if the
+frames carrying it are empty.
+
 ### DNSSEC
 
 ```yaml
@@ -846,7 +853,7 @@ What it covers:
 | shutdown | `SIGTERM` produces an orderly exit rather than a killed process |
 | wire format | all 23 captured fixtures replayed and compared byte for byte, EDNS forwarding, 0x20 case preservation, truncation and the TC bit, FORMERR / NOTIMP / silent-drop handling |
 | listeners | UDP, TCP (single and pipelined), DoT, DoH POST and GET, keep-alive, 404 / 405 / 415 / 400 |
-| DoH over HTTP/2 | ALPN selection, POST and GET, Huffman-coded headers, CONTINUATION, concurrent streams proved parallel by timing, flow control with a tiny window, DATA splitting for a 27 KiB answer, PING, RST_STREAM, error statuses, HTTP/1.1 fallback |
+| DoH over HTTP/2 | ALPN selection, POST and GET, Huffman-coded headers, CONTINUATION, a dynamic table size update at and past the advertised limit, concurrent streams proved parallel by timing, flow control with a tiny window, DATA splitting for a 27 KiB answer, PING, RST_STREAM, error statuses, HTTP/1.1 fallback |
 | DoH upstreams | a query resolved over an h2 upstream, one connection multiplexed across queries rather than reopened, fallback to HTTP/1.1 when the upstream does not offer h2 |
 | blocking | all five response modes, hosts vs domains vs adblock semantics, allow precedence, wildcards, modifiers, dnsmasq syntax, unusable rules, case folding |
 | rewrites | A, AAAA, CNAME, wildcard scope, `block`, NODATA for unmatched types |
