@@ -536,3 +536,129 @@ blocking: {{ enabled: false }}
 	}
 	end_case(r)
 }
+
+// An answer with `records` A records under one owner name: the shape of a
+// response whose size the party answering the query chose.
+@(private = "file")
+bulk_answer :: proc(name: string, records: int, allocator := context.allocator) -> []u8 {
+	answers := make([]dns.Record, records, context.temp_allocator)
+	for i in 0 ..< records {
+		answers[i] = dns.Record {
+			name  = name,
+			type  = .A,
+			class = .IN,
+			ttl   = 3600,
+			data  = dns.Rdata_A{addr = {10, u8(i >> 8), u8(i), 1}},
+		}
+	}
+	m := dns.Message {
+		id       = 0x4242,
+		question = []dns.Question{{name = name, type = .A, class = .IN}},
+		answer   = answers,
+	}
+	m.flags.qr = true
+	m.flags.ra = true
+	wire, _, err := dns.encode_message(m, allocator)
+	if err != .None {
+		return nil
+	}
+	return wire
+}
+
+/*
+The cache has to be bounded by what it holds, not only by how many things it
+holds.
+
+An entry is the response as it arrived plus an offset and a TTL for each of its
+records, and the size of a response is decided by whoever answered the query -
+up to 64 KiB of it. So an entry count is not a bound on memory: ten thousand
+entries at the default stood for something near 640 MB, and an attacker serving
+maximal answers from a zone it controls needs only distinct names to walk elodin
+there.
+
+The server below is told it may hold a hundred thousand entries and one mebibyte.
+Four hundred names are walked through it, each answered with about 3 KB, which is
+nowhere near the entry count and several times the budget. Whether the first of
+them is still cached afterwards is the whole question.
+*/
+run_cache_bytes_cases :: proc(r: ^Runner) {
+	NAMES :: 400
+	RECORDS :: 200
+
+	upstream_port := next_port(r)
+	mock := mock_make("cache-bytes", upstream_port)
+
+	names := make([]string, NAMES, context.allocator)
+	defer delete(names)
+	for i in 0 ..< NAMES {
+		names[i] = fmt.aprintf("bulk%d.example.com.", i)
+		mock_reply(mock, names[i], u16(dns.Type.A), bulk_answer(names[i], RECORDS, context.allocator))
+	}
+	if !mock_start(mock) {
+		skip_case(r, "cache bytes", "cannot start the mock upstream")
+		return
+	}
+	defer mock_stop(mock)
+
+	port := next_port(r)
+	config := fmt.tprintf(
+		`log: {{ level: warn }}
+listeners:
+  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
+  tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
+upstream:
+  timeout: 3s
+  servers: ["127.0.0.1:%d"]
+cache:
+  enabled: true
+  max_entries: 100000
+  max_bytes: 1MiB
+blocking: {{ enabled: false }}
+`,
+		port,
+		port,
+		upstream_port,
+	)
+
+	srv, ok := start_server(r, Server_Options{config = config, port = port})
+	if !ok {
+		skip_case(r, "cache bytes", "server did not start")
+		return
+	}
+	defer stop_server(&srv)
+
+	start_case(r, "cache: a byte budget evicts long before the entry count does")
+	{
+		// 4096 advertised, so a 3 KB answer comes back over UDP as it is rather
+		// than driving a retry over TCP.
+		answered := 0
+		for i in 0 ..< NAMES {
+			res := query_udp(port, build_query(names[i], u16(dns.Type.A), id = u16(i), edns_size = 4096))
+			if res.ok {
+				answered += 1
+			}
+		}
+		if !check(r, answered == NAMES, "only %d of %d names were answered", answered, NAMES) {
+			end_case(r)
+			return
+		}
+
+		// The most recent is still held, so the cache is working and the check
+		// below is about the bound rather than about caching being off.
+		mock_reset_counts(mock)
+		_ = query_udp(port, build_query(names[NAMES - 1], u16(dns.Type.A), id = 1000, edns_size = 4096))
+		check_eq_int(r, mock_total(mock), 0, "upstream queries for the most recently cached name")
+
+		// The oldest is not, and only the byte bound can have taken it: four
+		// hundred entries is a fraction of the hundred thousand allowed.
+		mock_reset_counts(mock)
+		_ = query_udp(port, build_query(names[0], u16(dns.Type.A), id = 1001, edns_size = 4096))
+		check(
+			r,
+			mock_total(mock) >= 1,
+			"%d names at ~3 KB each all fit in a 1 MiB cache, so the byte bound did nothing",
+			NAMES,
+		)
+	}
+	end_case(r)
+}

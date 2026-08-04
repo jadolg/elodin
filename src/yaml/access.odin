@@ -119,6 +119,68 @@ as_f64 :: proc(n: ^Node) -> (f64, bool) {
 }
 
 /*
+Byte sizes accept a plain count or a suffixed form: "64MiB", "512KB", "2GiB".
+
+The binary suffixes are the powers of 1024 and the decimal ones the powers of
+1000, as they are written. A bare number is bytes, and "MB" and "MiB" are far
+enough apart by the time they matter that guessing which was meant is not this
+parser's business.
+
+Unlike `as_duration` there is no compound form: "1MiB512KiB" is a typo, not a
+size. Overflow is refused rather than wrapped - what a wrapped size configures
+is a bound nobody chose.
+*/
+as_bytes :: proc(n: ^Node) -> (i64, bool) {
+	s, ok := as_string(n)
+	if !ok {
+		return 0, false
+	}
+	s = strings.trim_space(s)
+
+	digits := 0
+	for digits < len(s) && s[digits] >= '0' && s[digits] <= '9' {
+		digits += 1
+	}
+	if digits == 0 {
+		return 0, false
+	}
+
+	unit := i64(1)
+	switch strings.trim_space(s[digits:]) {
+	case "", "B", "b":
+	case "K", "KB", "kb":
+		unit = 1000
+	case "KiB", "kib", "Ki":
+		unit = 1024
+	case "M", "MB", "mb":
+		unit = 1000 * 1000
+	case "MiB", "mib", "Mi":
+		unit = 1024 * 1024
+	case "G", "GB", "gb":
+		unit = 1000 * 1000 * 1000
+	case "GiB", "gib", "Gi":
+		unit = 1024 * 1024 * 1024
+	case:
+		return 0, false
+	}
+
+	// Guarded before each step rather than after: a sum that has already wrapped
+	// is no longer a number anything can be compared against.
+	total := i64(0)
+	for i in 0 ..< digits {
+		d := i64(s[i] - '0')
+		if total > (max(i64) - d) / 10 {
+			return 0, false
+		}
+		total = total * 10 + d
+		if total > max(i64) / unit {
+			return 0, false
+		}
+	}
+	return total * unit, true
+}
+
+/*
 Durations accept a plain number of seconds or a suffixed form: "500ms", "30s",
 "5m", "12h", "7d". Compound values like "1h30m" are also accepted.
 */

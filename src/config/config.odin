@@ -74,9 +74,22 @@ Upstream_Config :: struct {
 	idle_timeout: time.Duration,
 }
 
+/*
+The smallest byte budget worth starting with.
+
+A cache that cannot hold one maximal answer - 64 KiB of wire and about twice
+that again in the offsets and TTLs beside it - would refuse every large response
+while still answering, which is a cache that has quietly stopped working on the
+records that most want caching. Anything under this is a misconfiguration rather
+than a small cache, so it is refused at load rather than discovered in
+production.
+*/
+MIN_CACHE_BYTES :: 1024 * 1024
+
 Cache_Config :: struct {
 	enabled:      bool,
 	max_entries:  int,
+	max_bytes:    int,
 	min_ttl:      u32,
 	max_ttl:      u32,
 	negative_ttl: u32,
@@ -371,6 +384,7 @@ default_config :: proc() -> Config {
 	c.cache = Cache_Config {
 		enabled      = true,
 		max_entries  = 10000,
+		max_bytes    = 64 * 1024 * 1024,
 		min_ttl      = 0,
 		max_ttl      = 86400,
 		negative_ttl = 300,

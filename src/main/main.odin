@@ -226,6 +226,7 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 		answers = cache.make_cache(
 			cache.Options {
 				max_entries = cfg.cache.max_entries,
+				max_bytes = cfg.cache.max_bytes,
 				min_ttl = cfg.cache.min_ttl,
 				max_ttl = cfg.cache.max_ttl,
 				negative_ttl = cfg.cache.negative_ttl,
@@ -421,7 +422,7 @@ report :: proc(s: ^server.Server, answers: ^cache.Cache) {
 	st := server.stats_of(s)
 	cs := cache.stats(answers)
 	logx.infof(
-		"stats: queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d secure=%d bogus=%d | cache entries=%d hits=%d misses=%d evictions=%d",
+		"stats: queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d secure=%d bogus=%d | cache entries=%d bytes=%d hits=%d misses=%d evictions=%d",
 		st.queries,
 		st.blocked,
 		st.cached,
@@ -431,6 +432,7 @@ report :: proc(s: ^server.Server, answers: ^cache.Cache) {
 		st.secure,
 		st.bogus,
 		cache.len_entries(answers),
+		cache.bytes_used(answers),
 		cs.hits,
 		cs.misses,
 		cs.evictions,

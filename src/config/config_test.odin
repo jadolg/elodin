@@ -29,6 +29,7 @@ upstream:
 
 cache:
   max_entries: 5000
+  max_bytes: 32MiB
   max_ttl: 1h
 
 blocking:
@@ -96,6 +97,7 @@ test_load_good_config :: proc(t: ^testing.T) {
 	testing.expect_value(t, s3.port, 53)
 
 	testing.expect_value(t, cfg.cache.max_entries, 5000)
+	testing.expect_value(t, cfg.cache.max_bytes, 32 * 1024 * 1024)
 	testing.expect_value(t, cfg.cache.max_ttl, u32(3600))
 
 	testing.expect_value(t, cfg.blocking.response, Block_Response.Custom_IP)
@@ -214,6 +216,34 @@ test_unknown_enum_values_reported :: proc(t: ^testing.T) {
 	e, has := err.?
 	testing.expect(t, has, "expected errors")
 	testing.expect_value(t, len(e.messages), 2)
+	free_all(context.temp_allocator)
+}
+
+/*
+A byte budget too small to hold one answer is a misconfiguration, not a small
+cache: every large response would be refused while the cache went on answering.
+Left to a caching server that has switched caching off, it is nothing at all.
+*/
+@(test)
+test_cache_byte_budget_is_checked :: proc(t: ^testing.T) {
+	too_small := "upstream:\n  servers: [1.1.1.1]\ncache:\n  max_bytes: 64KiB\n"
+	_, err := load_string(too_small, context.temp_allocator)
+	e, has := err.?
+	testing.expect(t, has, "a budget below one maximal answer was accepted")
+	if has {
+		testing.expect_value(t, len(e.messages), 1)
+	}
+
+	disabled := "upstream:\n  servers: [1.1.1.1]\ncache:\n  enabled: false\n  max_bytes: 64KiB\n"
+	_, off_err := load_string(disabled, context.temp_allocator)
+	_, off_has := off_err.?
+	testing.expect(t, !off_has, "a cache that is switched off was sized anyway")
+
+	nonsense := "upstream:\n  servers: [1.1.1.1]\ncache:\n  max_bytes: plenty\n"
+	_, bad_err := load_string(nonsense, context.temp_allocator)
+	_, bad_has := bad_err.?
+	testing.expect(t, bad_has, "a size that is not a size was accepted")
+
 	free_all(context.temp_allocator)
 }
 
