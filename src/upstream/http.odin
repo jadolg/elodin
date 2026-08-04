@@ -420,6 +420,10 @@ Only that case is retried. A certificate that did not check out will not check
 out on a second look, and a handshake that ran out of time has already spent the
 caller's budget - retrying it would spend it twice. A reset comes back
 immediately, so the retry costs a round trip.
+
+The same reset can also surface before the handshake starts: `dial_tcp_timeout`
+reports `Dial_Reset` when the peer closed before this side finished connecting,
+which is retried on the same terms.
 */
 open_stream :: proc(
 	endpoint: net.Endpoint,
@@ -432,7 +436,13 @@ open_stream :: proc(
 	err: Error,
 ) {
 	for attempt in 0 ..< 2 {
-		socket := dial_tcp_timeout(endpoint, timeout) or_return
+		socket, derr := dial_tcp_timeout(endpoint, timeout)
+		if derr != .None {
+			if derr != .Dial_Reset || attempt == 1 {
+				return {}, derr
+			}
+			continue
+		}
 		set_socket_timeouts(socket, timeout)
 		_ = net.set_option(socket, .TCP_Nodelay, true)
 

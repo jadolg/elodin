@@ -15,6 +15,11 @@ Error :: enum u8 {
 	None,
 	Not_Resolved,
 	Dial_Failed,
+	// The peer reset the connection before the handshake even began - a dial
+	// that never really failed so much as landed on a socket the other side
+	// had already decided to drop. Kept distinct from `Dial_Failed` so it can
+	// be retried the same way a reset mid-handshake is.
+	Dial_Reset,
 	Timeout,
 	IO_Error,
 	Bad_Response,

@@ -73,6 +73,13 @@ dial_tcp_timeout :: proc(endpoint: net.Endpoint, timeout: time.Duration) -> (soc
 			return 0, .Dial_Failed
 		}
 		if so_err != 0 {
+			// A RST can land here instead of during the handshake purely on
+			// scheduling luck - the peer had already reset by the time this
+			// side got around to reading SO_ERROR. Reported the same as a
+			// mid-handshake reset so the caller retries it the same way.
+			if posix.Errno(so_err) == .ECONNRESET {
+				return 0, .Dial_Reset
+			}
 			return 0, .Dial_Failed
 		}
 	}
