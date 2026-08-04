@@ -10,7 +10,7 @@ jobs:
     name: Style check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
       - uses: jdx/mise-action@v4
@@ -34,7 +34,7 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
       - uses: jdx/mise-action@v4
@@ -51,7 +51,7 @@ jobs:
     # only job is making sure a crash that fuzzing already found stays found.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
         with:
           install: true
@@ -70,7 +70,7 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
       - uses: jdx/mise-action@v4
@@ -96,7 +96,7 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install OpenSSL headers and a DNS client
         run: sudo apt-get update && sudo apt-get install -y libssl-dev dnsutils
       - uses: jdx/mise-action@v4
