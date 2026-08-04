@@ -334,9 +334,18 @@ start_tcp :: proc(s: ^Server, l: ^Listeners) -> bool {
 }
 
 @(private)
+DOT_ALPN := []string{"dot"}
+
+// h2 first: browsers will only use a DoH resolver over HTTP/2, and ALPN picks
+// by server preference. A client that offers neither gets a clean handshake
+// failure rather than a connection that then talks past us.
+@(private)
+DOH_ALPN := []string{"h2", "http/1.1"}
+
+@(private)
 start_dot :: proc(s: ^Server, l: ^Listeners) -> bool {
 	cfg := s.cfg.listeners.dot
-	ctx, err := tlsx.server_context(cfg.cert_file, cfg.key_file, []string{"dot"})
+	ctx, err := tlsx.server_context(cfg.cert_file, cfg.key_file, DOT_ALPN)
 	if err != .None {
 		logx.errorf("listeners.dot: %s", tlsx.describe_error(err, context.temp_allocator))
 		return false
@@ -352,10 +361,7 @@ start_dot :: proc(s: ^Server, l: ^Listeners) -> bool {
 @(private)
 start_doh :: proc(s: ^Server, l: ^Listeners) -> bool {
 	cfg := s.cfg.listeners.doh
-	// h2 first: browsers will only use a DoH resolver over HTTP/2, and ALPN
-	// picks by server preference. A client that offers neither gets a clean
-	// handshake failure rather than a connection that then talks past us.
-	ctx, err := tlsx.server_context(cfg.cert_file, cfg.key_file, []string{"h2", "http/1.1"})
+	ctx, err := tlsx.server_context(cfg.cert_file, cfg.key_file, DOH_ALPN)
 	if err != .None {
 		logx.errorf("listeners.doh: %s", tlsx.describe_error(err, context.temp_allocator))
 		return false
@@ -365,6 +371,56 @@ start_doh :: proc(s: ^Server, l: ^Listeners) -> bool {
 		return false
 	}
 	logx.infof("listening for DNS-over-HTTPS on %s:%d%s", cfg.address, cfg.port, cfg.path)
+	return true
+}
+
+/*
+Re-read the certificate and key files and switch the DoT/DoH listeners over to
+what they now contain, without touching the sockets or any connection already
+accepted.
+
+A new `SSL_CTX` is built first and swapped in only once it is known good, so a
+certificate that fails to load - the wrong key, a typo'd path - leaves the
+listener serving what it already had rather than falling over. The context an
+open connection's `SSL` holds stays valid after the swap: OpenSSL reference
+counts an `SSL_CTX` from `SSL_new` on, so freeing the displaced one here only
+releases it once the last connection still using it closes.
+
+Called from the maintenance loop on SIGHUP, one listener at a time; nothing
+else running concurrently writes `dot_ctx` or `doh_ctx`, but `accept_loop`'s
+connection threads read them for every new connection, hence the atomic swap.
+*/
+reload_tls :: proc(s: ^Server, l: ^Listeners) -> bool {
+	ok := true
+	if l.dot_open {
+		if !reload_tls_ctx(&l.dot_ctx, s.cfg.listeners.dot, DOT_ALPN, "dot") {
+			ok = false
+		}
+	}
+	if l.doh_open {
+		if !reload_tls_ctx(&l.doh_ctx, s.cfg.listeners.doh, DOH_ALPN, "doh") {
+			ok = false
+		}
+	}
+	return ok
+}
+
+@(private)
+reload_tls_ctx :: proc(slot: ^^tlsx.Context, cfg: config.Listener, alpn: []string, name: string) -> bool {
+	fresh, err := tlsx.server_context(cfg.cert_file, cfg.key_file, alpn)
+	if err != .None {
+		logx.errorf(
+			"listeners.%s: keeping the certificate already in use, %s and %s did not load: %s",
+			name,
+			cfg.cert_file,
+			cfg.key_file,
+			tlsx.describe_error(err, context.temp_allocator),
+		)
+		return false
+	}
+	old := sync.atomic_exchange(slot, fresh)
+	tlsx.context_destroy(old)
+	logx.infof("listeners.%s: reloaded the certificate from %s", name, cfg.cert_file)
 	return true
 }
 
@@ -439,7 +495,10 @@ stream_job :: proc(data: rawptr) {
 		defer net.close(job.socket)
 		serve_dns_stream(s, {socket = job.socket}, .TCP, client)
 	case .DoT:
-		conn, err := tlsx.server_accept(job.ctx.listeners.dot_ctx, job.socket)
+		// Read once, under the atomic that `reload_tls` swaps: a reload landing
+		// mid-accept must not hand this connection a half-updated context.
+		ctx := sync.atomic_load(&job.ctx.listeners.dot_ctx)
+		conn, err := tlsx.server_accept(ctx, job.socket)
 		if err != .None {
 			logx.debugf("dot: handshake with %s failed: %v", client, err)
 			net.close(job.socket)
@@ -448,7 +507,8 @@ stream_job :: proc(data: rawptr) {
 		defer tlsx.close(conn)
 		serve_dns_stream(s, {socket = job.socket, tls = conn}, .DoT, client)
 	case .DoH:
-		conn, err := tlsx.server_accept(job.ctx.listeners.doh_ctx, job.socket)
+		ctx := sync.atomic_load(&job.ctx.listeners.doh_ctx)
+		conn, err := tlsx.server_accept(ctx, job.socket)
 		if err != .None {
 			logx.debugf("doh: handshake with %s failed: %v", client, err)
 			net.close(job.socket)
