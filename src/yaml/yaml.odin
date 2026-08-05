@@ -402,6 +402,13 @@ parse_flow :: proc(p: ^Parser, text: string, line_num: int) -> (node: ^Node, con
 		if text[i] == closing {
 			return node, i + 1, true
 		}
+		// Any other bracket here closes a collection this one never opened, as
+		// in `[1, 2}`. It has to be rejected on the spot: the item scanner
+		// below stops on a closer without consuming it, so leaving it would
+		// park the loop on that byte and append an empty item forever.
+		if text[i] == ']' || text[i] == '}' {
+			return nil, 0, false
+		}
 
 		if text[i] == '[' || text[i] == '{' {
 			child, used := parse_flow(p, text[i:], line_num) or_return
