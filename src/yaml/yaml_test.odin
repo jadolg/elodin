@@ -263,6 +263,20 @@ test_tab_indentation_rejected :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_mismatched_flow_close_rejected :: proc(t: ^testing.T) {
+	// A flow collection closed by the wrong bracket left the item scanner
+	// parked on the stray closer: it consumed nothing, so every turn of the
+	// loop appended one more empty scalar and the parser ate memory until the
+	// process died.
+	cases := []string{"a: [x}", "a: [1, 2}", "a: [}", "a: {k: [v}}", "a: [[1]}"}
+	for src in cases {
+		_, err := parse(src, context.temp_allocator)
+		testing.expectf(t, err != nil, "%q should be rejected", src)
+		free_all(context.temp_allocator)
+	}
+}
+
+@(test)
 test_bad_mapping_line_reports_line_number :: proc(t: ^testing.T) {
 	_, err := parse("a: 1\nb: 2\nthis is not a mapping\n", context.temp_allocator)
 	e, has := err.?
