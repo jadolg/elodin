@@ -250,6 +250,7 @@ udp_loop :: proc(data: rawptr) {
 		*/
 		if !config.source_allowed(ctx.server.cfg.server.allow_from, client.address) {
 			sync.atomic_add(&ctx.server.stats.refused, 1)
+			report_refusal(client, "udp")
 			continue
 		}
 
@@ -304,6 +305,53 @@ udp_loop :: proc(data: rawptr) {
 	}
 	// `ctx` is not released here: jobs queued above still hold it, and they run
 	// on while the pool drains. `destroy_listeners` has it.
+}
+
+/*
+Say which client `server.allow_from` turned away, once, and then quietly.
+
+A refused source is told nothing: over UDP because a REFUSED is a reflection of
+its own, and over the stream transports because the connection is closed before
+anything can be written on it. That is the right behaviour toward the client and
+it leaves the operator with a resolver that has silently stopped serving
+somebody - a default that denies has to be able to say who it denied, or the
+first symptom of a network nobody added is a client that "just stopped working"
+with nothing to grep for.
+
+So the first refusal since start is a `warn` naming the source and the setting,
+and every one after it is `debug`. The counter in the stats line carries the
+rest: this is here to point at the setting once, not to log a flood.
+
+Costs one atomic load per refused datagram while debug is off, which is the case
+that matters - the caller is an attacker's send loop, and formatting an address
+for every packet it sends is a thing to be made to do only on purpose.
+*/
+@(private)
+refusal_reported: bool
+
+@(private)
+report_refusal :: proc(client: net.Endpoint, transport: string) {
+	if sync.atomic_load(&refusal_reported) && !logx.enabled(.Debug) {
+		return
+	}
+	// The stack, not the temp allocator: this runs on the read loop, whose arena
+	// is reset per query elsewhere, and on the accept loop, which has none.
+	buf: [64]u8
+	builder := strings.builder_from_bytes(buf[:])
+	who := net.endpoint_to_string(client, &builder)
+
+	if sync.atomic_exchange(&refusal_reported, true) {
+		logx.debugf("%s: refused a query from %s, which is not in server.allow_from", transport, who)
+		return
+	}
+	logx.warnf(
+		"%s: refused a query from %s: it is not in server.allow_from, so nothing was sent back",
+		transport,
+		who,
+	)
+	logx.warnf(
+		"  add its network to server.allow_from if that client should be served; refusals are counted as refused= in the stats line, and further ones are logged at debug level",
+	)
 }
 
 /*
@@ -585,11 +633,12 @@ accept_loop :: proc(data: rawptr) {
 		connection limit rather than a defence: a source we have already decided
 		not to serve would cost more than one we do. Closing on accept costs a
 		prefix compare and a close, and a client whose network is not in the
-		list sees the connection go rather than a reason, which is a thing to
-		find in the log instead.
+		list sees the connection go rather than a reason, which is why the log
+		has to carry one - see `report_refusal`.
 		*/
 		if !config.source_allowed(ctx.server.cfg.server.allow_from, client.address) {
 			sync.atomic_add(&ctx.server.stats.refused, 1)
+			report_refusal(client, proto_name(ctx.proto))
 			net.close(client_socket)
 			continue
 		}

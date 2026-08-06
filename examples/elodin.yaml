@@ -62,7 +62,13 @@ server:
   #
   # An empty list — `allow_from: []` — means no restriction, for a resolver
   # that is meant to be public. Say it on purpose; it is warned about at
-  # startup.
+  # startup. Note the brackets: `allow_from:` with nothing after it is refused
+  # rather than read as either the default or its opposite.
+  #
+  # A refused client is told nothing — nothing is sent over UDP, and the
+  # connection is closed over TCP, DoT and DoH — so the first refusal since
+  # start is logged at warn naming the source and this setting, and every one
+  # after it at debug.
   allow_from:
     - 127.0.0.0/8
     - 10.0.0.0/8

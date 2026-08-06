@@ -220,7 +220,23 @@ as one.
 @(private)
 load_allow_from :: proc(l: ^Loader, n: ^yaml.Node, cfg: ^Config) {
 	child := yaml.get(n, "allow_from")
+	if child == nil {
+		return
+	}
+	/*
+	Present with nothing after it is refused rather than guessed at.
+
+	`allow_from:` on its own reads as null, and the two things it could have
+	meant - "serve everybody" and "I started writing this and stopped" - are the
+	shipped default and its exact opposite. `[]` says the first unambiguously
+	and is two characters away, so there is nothing to be gained by picking one
+	on the operator's behalf and an open resolver to be lost by picking wrong.
+	*/
 	if yaml.is_null(child) {
+		errorf(
+			l,
+			"server.allow_from: expected a list of networks such as [192.168.0.0/16], or [] for no restriction at all; it has no value",
+		)
 		return
 	}
 	list, ok := yaml.as_string_list(child, l.allocator)

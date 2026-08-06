@@ -393,7 +393,19 @@ reason to make a client ask twice for an answer that fits.
 @(private)
 response_limit :: proc(s: ^Server, msg: dns.Message, proto: Protocol) -> int {
 	if proto == .UDP {
-		return min(int(dns.edns_udp_size(msg)), s.cfg.server.max_udp_response)
+		/*
+		Floored at the smallest response there is, rather than trusted to be in
+		range.
+
+		Every `Config` in a running server comes from `default_config` and is
+		then validated, so the field is never below 512 there. But a zero one -
+		a `Config` built literally, which is a thing a caller can do - would
+		truncate every answer to nothing, and a resolver that answers nothing at
+		all is too quiet a failure to leave resting on a convention held one
+		package away.
+		*/
+		ceiling := max(s.cfg.server.max_udp_response, config.MIN_UDP_RESPONSE)
+		return min(int(dns.edns_udp_size(msg)), ceiling)
 	}
 	return dns.MAX_MESSAGE
 }

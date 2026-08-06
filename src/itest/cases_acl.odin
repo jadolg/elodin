@@ -152,8 +152,80 @@ run_acl_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
-	// The same server with loopback in the list, so the two cases above are
-	// about the list and not about anything else being broken.
+	/*
+	A refused client is told nothing, so the log has to say something.
+
+	This is the other half of a default that denies: over UDP nothing is sent
+	back and over TCP the connection just goes, so an operator whose network is
+	not on the list sees clients stop working and has nowhere to read why. One
+	line, at `warn` so it shows at the default level, naming the source and the
+	setting.
+
+	Once, though. The caller is whatever is sending the refused datagrams, and a
+	line per datagram would be a way for it to write to the disk this server
+	logs to.
+	*/
+	start_case(r, "allow_from: a refusal names the source and the setting, once")
+	{
+		srv, _, ok := start_denying_server(r, upstream_port)
+		if check(r, ok, "server did not start") {
+			defer stop_server(&srv)
+			check(r, expect_no_udp_reply(srv.port, query), "the server answered a source outside allow_from")
+			// A second refusal, which must not produce a second line.
+			check(r, expect_no_udp_reply(srv.port, query), "the server answered a source outside allow_from")
+			// The line is written on the read loop, so give it the moment
+			// between the datagram being refused and the file being flushed.
+			time.sleep(200 * time.Millisecond)
+
+			check(
+				r,
+				log_contains(&srv, "udp: refused a query from"),
+				"the log does not say a query was refused over udp; log:\n%s",
+				read_log(&srv),
+			)
+			// The address, not just the fact: "127.0.0.1" alone would also match
+			// the line the listener printed when it bound.
+			check(
+				r,
+				log_contains(&srv, "refused a query from 127.0.0.1:"),
+				"the log does not name the refused source; log:\n%s",
+				read_log(&srv),
+			)
+			check(
+				r,
+				log_contains(&srv, "server.allow_from"),
+				"the log does not name the setting to change; log:\n%s",
+				read_log(&srv),
+			)
+			check_eq_int(r, log_count(&srv, "refused a query from"), 1, "refusal lines after two refusals")
+		}
+	}
+	end_case(r)
+
+	// The stream listeners refuse on accept, where there is even less for the
+	// client to go on - so the same line, naming the transport it happened on.
+	// A fresh server, because the line above is printed once per process.
+	start_case(r, "allow_from: a refused tcp connection is logged too")
+	{
+		srv, tcp_port, ok := start_denying_server(r, upstream_port)
+		if check(r, ok, "server did not start") {
+			defer stop_server(&srv)
+			connected, answered := tcp_closed_without_answer(tcp_port)
+			check(r, connected, "the tcp listener is not accepting at all, so the case proves nothing")
+			check(r, !answered, "the server answered a tcp source outside allow_from")
+			time.sleep(200 * time.Millisecond)
+			check(
+				r,
+				log_contains(&srv, "tcp: refused a query from"),
+				"a refused tcp connection left nothing in the log; log:\n%s",
+				read_log(&srv),
+			)
+		}
+	}
+	end_case(r)
+
+	// The same server with loopback in the list, so the cases above are about
+	// the list and not about anything else being broken.
 	start_case(r, "allow_from: a source inside the list is answered")
 	{
 		udp_port, tcp_port := next_port(r), next_port(r)

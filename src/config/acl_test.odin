@@ -1,5 +1,6 @@
 package config
 
+import "core:mem"
 import "core:net"
 import "core:testing"
 
@@ -207,6 +208,45 @@ test_default_allow_from_is_local_networks_only :: proc(t: ^testing.T) {
 	}
 }
 
+/*
+An entry written in the v4-mapped form is the IPv4 network it names.
+
+`source_allowed` compares a mapped source as IPv4, so an entry left as IPv6
+could never match one - a rule `--check` accepts, startup prints, and the
+matcher is guaranteed to ignore. The mapping is undone on both sides or on
+neither.
+*/
+@(test)
+test_v4_mapped_entries_become_v4_networks :: proc(t: ^testing.T) {
+	host := prefix(t, "::ffff:192.168.1.5")
+	testing.expect(t, !host.v6, "a mapped host stayed an IPv6 network")
+	testing.expect_value(t, host.bits, 32)
+	testing.expect(t, source_allowed({host}, v4(192, 168, 1, 5)), "the host it names is not allowed")
+	testing.expect(
+		t,
+		source_allowed({host}, v6(0, 0, 0, 0, 0, 0xffff, 0xc0a8, 0x0105)),
+		"the same host arriving mapped is not allowed",
+	)
+
+	// /112 of the mapped range is /16 of the IPv4 one.
+	net16 := prefix(t, "::ffff:192.168.0.0/112")
+	testing.expect(t, !net16.v6, "a mapped network stayed an IPv6 network")
+	testing.expect_value(t, net16.bits, 16)
+	testing.expect(t, source_allowed({net16}, v4(192, 168, 77, 3)), "192.168.77.3 is outside ::ffff:192.168.0.0/112")
+	testing.expect(t, !source_allowed({net16}, v4(192, 169, 0, 1)), "192.169.0.1 is inside ::ffff:192.168.0.0/112")
+
+	// The whole mapped range is every IPv4 address, and still no IPv6 one.
+	all := prefix(t, "::ffff:0:0/96")
+	testing.expect_value(t, all.bits, 0)
+	testing.expect(t, source_allowed({all}, v4(8, 8, 8, 8)), "::ffff:0:0/96 does not cover an IPv4 address")
+	testing.expect(t, !source_allowed({all}, v6(0x2001, 0xdb8)), "::ffff:0:0/96 covered a real IPv6 address")
+
+	// Shorter than /96 reaches outside the mapped range, so it is an IPv6
+	// network in its own right and stays one.
+	wide := prefix(t, "::/64")
+	testing.expect(t, wide.v6, "a network reaching past the mapped range was rewritten as IPv4")
+}
+
 // The line an operator reads at startup has to say the network they wrote.
 @(test)
 test_format_prefix_round_trips :: proc(t: ^testing.T) {
@@ -217,6 +257,39 @@ test_format_prefix_round_trips :: proc(t: ^testing.T) {
 	// The v6 text is whatever the standard shortening makes of it, so only the
 	// length is asserted literally.
 	testing.expect_value(t, format_prefix(prefix(t, "fe80::/10"), context.temp_allocator), "fe80::/10")
+}
+
+/*
+`format_prefix` returns one string and keeps nothing.
+
+The IPv6 path builds the address text before the text with the length on it, and
+`aprintf` copies the first into the second. Both callers happen to pass an
+allocator that is thrown away wholesale, which is exactly the condition under
+which a leak in a procedure taking an arbitrary allocator goes unnoticed - so it
+is measured here rather than left to them.
+*/
+@(test)
+test_format_prefix_keeps_nothing :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	cases := []string{"fe80::/10", "2001:db8::/32", "::1/128", "10.0.0.0/8"}
+	for text in cases {
+		p, ok := parse_prefix(text)
+		testing.expectf(t, ok, "%q did not parse", text)
+		out := format_prefix(p, allocator)
+		testing.expect_value(t, out, text)
+		delete(out, allocator)
+		testing.expectf(
+			t,
+			len(track.allocation_map) == 0,
+			"%q left %d allocation(s) behind",
+			text,
+			len(track.allocation_map),
+		)
+	}
 }
 
 // An address of neither family is not somebody this server knows how to answer,

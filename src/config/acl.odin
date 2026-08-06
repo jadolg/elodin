@@ -16,11 +16,16 @@ taking part in one. `server.allow_from` is the other half - a list of networks a
 query is accepted from at all, checked before the message is parsed and before
 it is queued, so a source outside it costs a prefix compare and nothing else.
 
-Defaulting to the local networks is what BIND (`allow-query`) and Unbound
-(`access-control`) both ship, and for the same reason: an installation that has
-not been configured yet should serve the machine and the network it is on, not
-the internet. An empty list is how an operator asks for a public resolver, which
-is a thing to write down on purpose rather than to inherit.
+Defaulting to the local networks is where BIND lands with `allow-recursion`,
+which is `localnets` plus `localhost` when nothing says otherwise. Unbound is
+stricter still: `access-control` starts at `0.0.0.0/0 refuse` with only
+`127.0.0.0/8` allowed, so a LAN client has to be named before it is served.
+(BIND's `allow-query` is a different setting and does default to `any`; it is
+recursion, not the query itself, that it holds back.) This list sits between the
+two, and for the reason both of them have one: an installation that has not been
+configured yet should serve the machine and the network it is on, not the
+internet. An empty list is how an operator asks for a public resolver, which is
+a thing to write down on purpose rather than to inherit.
 
 The parsing lives here rather than beside the listeners that enforce it so that
 `--check` and startup agree by construction - the same reasoning as
@@ -130,8 +135,43 @@ parse_prefix :: proc(text: string) -> (p: Prefix, ok: bool) {
 		p.bits = u8(n)
 	}
 
+	unmap_prefix(&p)
 	mask_prefix(&p)
 	return p, true
+}
+
+/*
+Rewrite a v4-mapped entry as the IPv4 network it names.
+
+`address_bytes` undoes the `::ffff:a.b.c.d` mapping on the way in, so a source
+that arrives mapped is compared as IPv4. An entry written in the mapped form and
+left as IPv6 would therefore be one the matcher can never match - accepted by
+`--check`, printed at startup, and dead. Undoing the mapping on both sides is
+what keeps that from being a way to write a rule that silently does nothing.
+
+Only from `/96` down, where the mapped prefix is wholly inside the length: a
+shorter one covers addresses outside `::ffff:0:0/96` as well and is a network in
+its own right, not a way of writing an IPv4 one.
+*/
+@(private)
+unmap_prefix :: proc(p: ^Prefix) {
+	if !p.v6 || p.bits < 96 {
+		return
+	}
+	for i in 0 ..< 10 {
+		if p.addr[i] != 0 {
+			return
+		}
+	}
+	if p.addr[10] != 0xff || p.addr[11] != 0xff {
+		return
+	}
+	p.addr[0], p.addr[1], p.addr[2], p.addr[3] = p.addr[12], p.addr[13], p.addr[14], p.addr[15]
+	for i in 4 ..< 16 {
+		p.addr[i] = 0
+	}
+	p.bits -= 96
+	p.v6 = false
 }
 
 // Clear everything below the prefix length, so a match never has to look at
@@ -246,6 +286,10 @@ format_prefix :: proc(p: Prefix, allocator := context.allocator) -> string {
 			a[i] = u16be(u16(p.addr[i * 2]) << 8 | u16(p.addr[i * 2 + 1]))
 		}
 		text := net.address_to_string(net.Address(a), allocator)
+		// `aprintf` copies it, so the intermediate goes back here rather than
+		// resting on every caller happening to pass an allocator that is reset
+		// wholesale.
+		defer delete(text, allocator)
 		return fmt.aprintf("%s/%d", text, p.bits, allocator = allocator)
 	}
 	return fmt.aprintf("%d.%d.%d.%d/%d", p.addr[0], p.addr[1], p.addr[2], p.addr[3], p.bits, allocator = allocator)

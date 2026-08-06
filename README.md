@@ -490,8 +490,12 @@ The listeners bind `0.0.0.0` by default, so on a machine with a public address
 elodin is reachable from the internet. What keeps it from being an *open*
 resolver is this list: queries are accepted from the local networks — loopback,
 the RFC 1918 ranges, IPv6 loopback, unique local and link-local — and from
-nowhere else. It is the same default BIND ships as `allow-query` and Unbound as
-`access-control`, and for the same reason: an installation nobody has configured
+nowhere else. It sits between what the two obvious comparisons ship: BIND's
+`allow-recursion` defaults to `localnets` plus `localhost`, and Unbound's
+`access-control` is stricter still, starting at `0.0.0.0/0 refuse` with only
+`127.0.0.0/8` allowed. (BIND's `allow-query` is a different setting and does
+default to `any` — it is recursion, not the query, that it holds back.) The
+reason all three have one is the same: an installation nobody has configured
 should serve the machine and the network it is on.
 
 This is a different bound from [rate limiting](#rate-limiting), not a weaker
@@ -508,11 +512,28 @@ handshake — answering REFUSED there would mean a source we have already decide
 not to serve costing more than one we do, and would make the allow list a way to
 exhaust `max_connections`. Refusals are counted as `refused=` in the stats line.
 
+Neither refusal tells the client anything, so the log does. The first refusal
+since start is a `warn` naming the source, the transport and the setting; every
+one after it is `debug`, and the `refused=` counter carries the rest. Without
+that line the first symptom of a network nobody added is a client that stopped
+working with nothing to grep for; with a line per datagram, whoever is sending
+them decides how much this server writes to disk.
+
+```
+WARN  udp: refused a query from 198.51.100.7:41234: it is not in
+      server.allow_from, so nothing was sent back
+WARN    add its network to server.allow_from if that client should be served;
+        refusals are counted as refused= in the stats line, and further ones are
+        logged at debug level
+```
+
 A list in the file replaces the default rather than adding to it, so include
 loopback if you want it. Entries are CIDR networks in either family; a bare
 address is the single host it names, and host bits below the length are masked
-off, so `127.0.0.1/8` and `127.0.0.0/8` are the same network. An entry that will
-not parse fails `--check` rather than starting a resolver that refuses everyone.
+off, so `127.0.0.1/8` and `127.0.0.0/8` are the same network. A v4-mapped entry
+(`::ffff:192.168.0.0/112`) is the IPv4 network it names, since that is how a
+mapped client arriving on an IPv6 socket is compared. An entry that will not
+parse fails `--check` rather than starting a resolver that refuses everyone.
 
 Carrier-grade NAT (`100.64.0.0/10`, which Tailscale also uses) is deliberately
 not in the default: a resolver behind one would be serving an ISP's other
@@ -528,6 +549,10 @@ server:
 That is how you ask for a public resolver, and it is a thing to write down on
 purpose. elodin warns about it at every start. Before running one, read
 [rate limiting](#rate-limiting) below and consider `cookies.require`.
+
+Note the `[]`. Writing `allow_from:` with nothing after it is a configuration
+error rather than either reading of it: YAML makes that a null, and the two
+things it could have meant here are the shipped default and its exact opposite.
 
 ### How large a UDP answer may be
 

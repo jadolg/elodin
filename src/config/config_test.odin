@@ -448,6 +448,40 @@ test_allow_from_reports_every_bad_entry :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+/*
+`allow_from:` with nothing after it is neither of the two settings it looks like.
+
+Null is what YAML makes of an empty value, and the two readings available for it
+here are the shipped default and its exact opposite. Guessing either way is a
+resolver that is not the one in the file, so it is an error - and the message has
+to name `[]`, since an operator who meant "serve everybody" is two characters
+from saying so.
+*/
+@(test)
+test_allow_from_with_no_value_is_an_error :: proc(t: ^testing.T) {
+	sources := []string {
+		// Last key in the mapping, and with another key after it: the same node
+		// either way, but both are what people actually write.
+		"upstream:\n  servers: [1.1.1.1]\nserver:\n  allow_from:\n",
+		"upstream:\n  servers: [1.1.1.1]\nserver:\n  allow_from:\n  workers: 4\n",
+	}
+	for src in sources {
+		cfg, err := load_string(src, context.temp_allocator)
+		e, has := err.?
+		if !testing.expectf(t, has, "an empty allow_from value loaded as %v", cfg.server.allow_from) {
+			continue
+		}
+		named := false
+		for m in e.messages {
+			if strings.contains(m, "allow_from") && strings.contains(m, "[]") {
+				named = true
+			}
+		}
+		testing.expectf(t, named, "the message does not offer [] as the way to say it: %v", e.messages)
+	}
+	free_all(context.temp_allocator)
+}
+
 // A scalar where a list belongs is a mistake worth a message rather than a
 // silently ignored setting.
 @(test)
