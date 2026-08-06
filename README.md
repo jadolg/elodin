@@ -513,7 +513,9 @@ a reflection of its own, small but free to whoever asked for it. Over TCP, DoT
 and DoH the connection is closed on accept, without a thread and without a TLS
 handshake — answering REFUSED there would mean a source we have already decided
 not to serve costing more than one we do, and would make the allow list a way to
-exhaust `max_connections`. Refusals are counted as `refused=` in the stats line.
+exhaust `max_connections`. Refusals are counted as `refused=` in the stats line
+— a datagram each on UDP and a connection each on the stream transports, so the
+number is a sum of the two units rather than a count of queries.
 
 Neither refusal tells the client anything, so the log does. The first refusal
 since start is a `warn` naming the source, the transport and the setting; every
@@ -529,6 +531,11 @@ WARN    add its network to server.allow_from if that client should be served;
         refusals are counted as refused= in the stats line, and further ones are
         logged at debug level
 ```
+
+The line says what was refused. Over UDP that is a query — the datagram is in
+hand when the check runs. Over TCP, DoT and DoH the check runs on accept, before
+a byte has been read, so it reads `refused a connection from`: there was never a
+query to refuse.
 
 A list in the file replaces the default rather than adding to it, so include
 loopback if you want it. Entries are CIDR networks in either family; a bare
@@ -599,9 +606,23 @@ zone does not fill the log. A client that asked for *less* than the ceiling and
 got a truncated answer got what it asked for, and nothing is said — the setting
 had no part in it.
 
+The ceiling is also the number the answer's own OPT record reports. RFC 6891
+section 6.2.4 makes that field the *responder's* maximum, not a copy of the
+requestor's — the counterpart to `max-udp-size` in BIND and Unbound — so a client
+that advertises 4096 against the 1232 default is told **1232**, and against
+`max_udp_response: 4096` is told 4096. A client that asked for less than the
+ceiling is told its own figure, since that is the size its answers will actually
+go out at. A stub mostly ignores this; a forwarder chaining through elodin does
+not, and one told a number this server will never send sizes its buffers for an
+answer that cannot arrive and then pays for a TC bit and a TCP round trip it was
+told it would not need. It holds on every path — locally built answers, forwarded
+ones, cache hits, and answers re-encoded to carry a DNS cookie.
+
 The ceiling is UDP only. TCP, DoT and DoH establish a connection before a query
 arrives, so the address is proven, there is nothing to reflect, and an answer
-that fits is sent whole.
+that fits is sent whole. The OPT record on those goes back carrying the client's
+own figure: the field bounds a datagram, and nothing on a stream is bounded by
+it.
 
 That does mean a truncated answer needs somewhere to go: if you have turned
 `listeners.tcp` off, a client told to retry has nowhere to retry to, and the
@@ -772,7 +793,10 @@ With validation on, an answer for a client that did not ask for DNSSEC records
 is rebuilt without them; every other answer still goes back verbatim.
 
 Also handled: EDNS0 (the client's OPT record is forwarded upstream so payload
-sizes are negotiated end to end, minus its cookie, which stops here), DNS
+sizes are negotiated end to end, minus its cookie, which stops here; the OPT
+that comes back to the client carries *this* server's payload size, per RFC 6891
+section 6.2.4 — see [How large a UDP answer may
+be](#how-large-a-udp-answer-may-be)), DNS
 cookies in both directions (RFC 7873, RFC 9018) — answered for clients, and
 presented to plain upstreams with the reply checked against what we sent —
 truncation with the TC bit and the UDP→TCP retry, `version.bind`/`hostname.bind`
@@ -853,7 +877,16 @@ overlap instead of queueing, and p50 settles at one upstream round trip.
 Past `max_connections`, DoT and DoH refuse cleanly during the handshake. Plain
 TCP cannot: the kernel completes the handshake from the listen backlog before
 the server sees it, so a refused client gets a connection reset on first use and
-has to reconnect.
+has to reconnect. Either way the first refusal since start is a `warn` naming
+the setting and every one after it is `debug` — the same shape as an
+`allow_from` refusal, and for the same reason: how many of them there are is
+decided by whoever is opening the connections.
+
+```
+WARN  tcp: refusing a connection, server.max_connections (512) is reached
+WARN    raise server.max_connections if this server should hold more clients at
+        once; further refusals are logged at debug level
+```
 
 The number that governs sizing is the sustained cache-miss row. A worker thread is occupied for
 the whole of an upstream round trip, so

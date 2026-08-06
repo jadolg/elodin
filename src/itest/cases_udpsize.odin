@@ -191,6 +191,54 @@ run_udp_size_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	/*
+	The number in the answer's own OPT record, which is what a downstream
+	forwarder sizes its buffers on.
+
+	RFC 6891 section 6.2.4 makes that field the responder's, not a copy of the
+	requestor's. Echoing the client's 4096 back while sending 1232 tells a
+	forwarder chaining through here to expect an answer that cannot arrive, and
+	it then pays for the TC bit and the TCP round trip it was told it would not
+	need. Both directions are pinned: against the default ceiling the answer
+	reads 1232, and against a raised one it reads 4096.
+	*/
+	start_case(r, "max_udp_response: the answer's OPT reports the ceiling, not the client's figure")
+	{
+		udp_port, tcp_port := next_port(r), next_port(r)
+		srv, ok := start_server(
+			r,
+			Server_Options{config = config_udp_size(udp_port, tcp_port, upstream_port, ""), port = udp_port},
+		)
+		if check(r, ok, "server did not start") {
+			defer stop_server(&srv)
+			res := query_udp(udp_port, query, context.temp_allocator)
+			if check(r, res.ok, "no answer came back") {
+				check_eq_int(r, int(dns.peek_udp_size(res.wire)), 1232, "the payload size the answer advertises")
+			}
+		}
+	}
+	end_case(r)
+
+	start_case(r, "max_udp_response: a raised ceiling is the number the answer reports")
+	{
+		udp_port, tcp_port := next_port(r), next_port(r)
+		srv, ok := start_server(
+			r,
+			Server_Options {
+				config = config_udp_size(udp_port, tcp_port, upstream_port, "max_udp_response: 4096"),
+				port = udp_port,
+			},
+		)
+		if check(r, ok, "server did not start") {
+			defer stop_server(&srv)
+			res := query_udp(udp_port, query, context.temp_allocator)
+			if check(r, res.ok, "no answer came back") {
+				check_eq_int(r, int(dns.peek_udp_size(res.wire)), 4096, "the payload size the answer advertises")
+			}
+		}
+	}
+	end_case(r)
+
 	// A client that asked for less than the ceiling gets what it asked for, and
 	// nothing is said about a setting that had no part in it.
 	start_case(r, "max_udp_response: a client's own small buffer is not blamed on the setting")
@@ -212,6 +260,9 @@ run_udp_size_cases :: proc(r: ^Runner) {
 			res := query_udp(udp_port, small, context.temp_allocator)
 			if check(r, res.ok, "no answer came back") {
 				check(r, len(res.wire) <= 512, "the answer is %d bytes, past what the client asked for", len(res.wire))
+				// The client's own figure binds here, so that is the number the
+				// answer reports: it is still the size this answer went out at.
+				check_eq_int(r, int(dns.peek_udp_size(res.wire)), 512, "the payload size the answer advertises")
 			}
 			// Give the line a moment to reach the file before concluding it is
 			// not there.

@@ -126,6 +126,30 @@ remove_edns_option :: proc(
 }
 
 /*
+Set the UDP payload size an encoded message's OPT record advertises.
+
+RFC 6891 section 6.2.4 makes that field the sender's own number, so on a response
+it is what the responder can deliver rather than a copy of what the requestor
+asked for. The responder's number is not known until the transport and the
+configured ceiling have been resolved, by which point the answer is already
+encoded - and may be an upstream's bytes or a cache entry, which have to keep the
+name compression they came with. So the two bytes are set where they are, as the
+rest of this file does.
+
+Reports false when the message carries no OPT record, or cannot be walked to it.
+Neither is a failure to pass on: a client that asked without EDNS gets no OPT
+back, and there is no field to write a number into.
+*/
+set_edns_udp_size :: proc(msg: []u8, size: u16) -> bool {
+	span := find_opt_span(msg) or_return
+	// TYPE, CLASS, TTL, RDLENGTH: the class ends six bytes before the length.
+	class_pos := span.rdlen_pos - 6
+	msg[class_pos] = u8(size >> 8)
+	msg[class_pos + 1] = u8(size)
+	return true
+}
+
+/*
 The full response code of an encoded message, extended bits included.
 
 `Message.flags` carries only the low four; the other eight live in the OPT

@@ -44,7 +44,10 @@ Stats :: struct {
 	*/
 	dropped:   u64,
 	/*
-	Queries turned away because of `server.allow_from`.
+	Traffic turned away because of `server.allow_from`: a datagram on UDP, and a
+	connection on the stream transports, where the check runs on accept before a
+	byte has been read. The number is the sum of the two units rather than a
+	count of queries, which is what the log line's wording says of each one.
 
 	Counted apart from `dropped` because the two ask different questions of an
 	operator. A rising `dropped` is a server that cannot keep up; a rising
@@ -102,9 +105,10 @@ handle_query :: proc(
 	}
 
 	msg, derr := dns.decode_message(query, allocator)
+	limit := response_limit(s, msg, proto)
 	if derr != .None {
-		out, built := dns.error_response(query, {}, .Form_Err, allocator, response_limit(s, msg, proto))
-		return out, .Failed, built
+		out, built := dns.error_response(query, {}, .Form_Err, allocator, limit)
+		return advertise_response_limit(out, msg, limit, proto), .Failed, built
 	}
 	// A response arriving on a listener port is not something to answer.
 	if msg.flags.qr {
@@ -112,21 +116,77 @@ handle_query :: proc(
 	}
 
 	cookie := inspect_cookie(s.cookies, msg, client)
-	limit := response_limit(s, msg, proto)
 
 	// A cookie of an impossible length is the one case RFC 7873 section 5.2.2
 	// answers with FORMERR, and the one response that carries no cookie back:
 	// there is no telling which eight of those bytes were the client's.
 	if cookie.verdict == .Malformed {
 		out, built := dns.error_response(query, msg, .Form_Err, allocator, limit)
-		return out, .Failed, built
+		return advertise_response_limit(out, msg, limit, proto), .Failed, built
 	}
 
 	response, outcome, ok = resolve_query(s, query, msg, proto, client, limit, cookie, started, allocator)
 	if ok {
-		response = attach_cookie(s.cookies, response, cookie, msg, limit, allocator)
+		response = attach_cookie(s.cookies, response, cookie, msg, limit, proto, allocator)
+		/*
+		Last, so that nothing after it can put another number back.
+
+		The four ways an answer reaches this point disagree about what its OPT
+		record says: a locally built one echoes the client's figure, a forwarded
+		or cached one carries the upstream's, and `attach_cookie` re-encodes over
+		the top of either. Writing it here rather than in each of them is what
+		makes the guarantee hold for a path added later, and the cached case
+		needs it here anyway - the ceiling is per-request and the stored wire is
+		shared between them.
+		*/
+		response = advertise_response_limit(response, msg, limit, proto)
 	}
 	return response, outcome, ok
+}
+
+/*
+The UDP payload size this server puts in an answer's OPT record.
+
+RFC 6891 section 6.2.4 makes that field the responder's own number rather than a
+copy of the requestor's - the counterpart to `max-udp-size` in BIND and Unbound,
+both of which set it from the configured ceiling. What is true of this server for
+this request is `response_limit`: the largest answer it will send here, whether
+that is bounded by `server.max_udp_response` or by what the client asked for. A
+client told 4096 by a server that will never send more than 1232 sizes its
+buffers for an answer that cannot arrive, and then pays for a TC bit and a TCP
+round trip it was told it would not need.
+
+On the stream transports the limit is the DNS framing rather than a datagram, so
+there is no payload size of ours to report and writing `response_limit` there
+would advertise 65535 - not a UDP payload size at all. The client's own figure
+goes back untouched, which is what it means on a transport the field does not
+bound.
+*/
+@(private)
+advertised_udp_size :: proc(query: dns.Message, limit: int, proto: Protocol) -> u16 {
+	if proto != .UDP {
+		return dns.edns_udp_size(query)
+	}
+	// `response_limit` already lands in [512, 4096] for every `Config` this
+	// server runs on. Clamped anyway, because what is being written is two bytes
+	// of a field with its own range, and a number from outside it would be
+	// truncated into something arbitrary rather than refused.
+	return u16(clamp(limit, int(dns.MAX_UDP_SIZE), int(config.MAX_UDP_RESPONSE)))
+}
+
+/*
+Write that size onto an answer that is already encoded.
+
+A no-op for a client that asked without EDNS: there is no OPT record to carry a
+number and none is invented for one.
+*/
+@(private)
+advertise_response_limit :: proc(wire: []u8, query: dns.Message, limit: int, proto: Protocol) -> []u8 {
+	if proto != .UDP || len(wire) < dns.HEADER_SIZE {
+		return wire
+	}
+	_ = dns.set_edns_udp_size(wire, advertised_udp_size(query, limit, proto))
+	return wire
 }
 
 @(private)

@@ -250,7 +250,7 @@ udp_loop :: proc(data: rawptr) {
 		*/
 		if !config.source_allowed(ctx.server.cfg.server.allow_from, client.address) {
 			sync.atomic_add(&ctx.server.stats.refused, 1)
-			report_refusal(client, "udp")
+			report_refusal(client, .UDP)
 			continue
 		}
 
@@ -308,6 +308,46 @@ udp_loop :: proc(data: rawptr) {
 }
 
 /*
+Whether a refusal is worth the line it would cost, and whether it is the first.
+
+Every refusal in this file is reached by a peer that chose to be refused, so how
+many of them there are is the peer's to decide and the log has to be bounded by
+something else. The first one since start is a `warn` naming the setting, so an
+operator has one line to grep for; every one after it is `debug`, where somebody
+who has gone looking will find it and nobody else pays for it. Without that, a
+peer sending refused traffic decides how much this server writes to disk.
+
+Costs one atomic load per refusal while debug is off, which is the case that
+matters - the callers are an attacker's send loop and an accept loop, and
+formatting an address for every packet is a thing to be made to do only on
+purpose.
+
+`say` is false when nothing should be logged at all; `first` is true exactly
+once per flag, on the call that turned it.
+*/
+@(private)
+report_once :: proc(reported: ^bool) -> (say: bool, first: bool) {
+	if sync.atomic_load(reported) && !logx.enabled(.Debug) {
+		return false, false
+	}
+	return true, !sync.atomic_exchange(reported, true)
+}
+
+/*
+What a refusal on this transport turned away.
+
+UDP refuses a datagram, which is a query. The stream transports refuse on
+accept, before a byte has been read, so a connection is all there ever was, and
+calling that a query names something that did not happen. The `refused=` counter
+is the sum of the two units, and this is what tells an operator which of them a
+line is about.
+*/
+@(private)
+refused_unit :: proc(proto: Protocol) -> string {
+	return "query" if proto == .UDP else "connection"
+}
+
+/*
 Say which client `server.allow_from` turned away, once, and then quietly.
 
 A refused source is told nothing: over UDP because a REFUSED is a reflection of
@@ -321,17 +361,14 @@ with nothing to grep for.
 So the first refusal since start is a `warn` naming the source and the setting,
 and every one after it is `debug`. The counter in the stats line carries the
 rest: this is here to point at the setting once, not to log a flood.
-
-Costs one atomic load per refused datagram while debug is off, which is the case
-that matters - the caller is an attacker's send loop, and formatting an address
-for every packet it sends is a thing to be made to do only on purpose.
 */
 @(private)
 refusal_reported: bool
 
 @(private)
-report_refusal :: proc(client: net.Endpoint, transport: string) {
-	if sync.atomic_load(&refusal_reported) && !logx.enabled(.Debug) {
+report_refusal :: proc(client: net.Endpoint, proto: Protocol) {
+	say, first := report_once(&refusal_reported)
+	if !say {
 		return
 	}
 	/*
@@ -360,17 +397,54 @@ report_refusal :: proc(client: net.Endpoint, transport: string) {
 	builder := strings.builder_from_bytes(buf[:])
 	who := net.endpoint_to_string(client, &builder)
 
-	if sync.atomic_exchange(&refusal_reported, true) {
-		logx.debugf("%s: refused a query from %s, which is not in server.allow_from", transport, who)
+	transport := proto_name(proto)
+	unit := refused_unit(proto)
+	if !first {
+		logx.debugf("%s: refused a %s from %s, which is not in server.allow_from", transport, unit, who)
 		return
 	}
 	logx.warnf(
-		"%s: refused a query from %s: it is not in server.allow_from, so nothing was sent back",
+		"%s: refused a %s from %s: it is not in server.allow_from, so nothing was sent back",
 		transport,
+		unit,
 		who,
 	)
 	logx.warnf(
 		"  add its network to server.allow_from if that client should be served; refusals are counted as refused= in the stats line, and further ones are logged at debug level",
+	)
+}
+
+/*
+Say that `server.max_connections` is full, once, and then quietly.
+
+The same reasoning as `report_refusal`, and reached the same way: a peer opening
+connections past the limit wrote one line per attempt otherwise, at `warn`, so it
+was on at the default level. The setting is named because it is the one thing
+that would change the outcome, and because a connection refused for want of a
+slot and one refused for want of an allow-list entry look identical from the
+client's side.
+*/
+@(private)
+conn_limit_reported: bool
+
+@(private)
+report_conn_limit :: proc(proto: Protocol, limit: int) {
+	say, first := report_once(&conn_limit_reported)
+	if !say {
+		return
+	}
+	// As in `report_refusal`: the accept loop is the one place that never resets
+	// its own temp arena, and the line was formatted out of it.
+	defer free_all(context.temp_allocator)
+
+	transport := proto_name(proto)
+	if !first {
+		logx.debugf("%s: refusing a connection, the limit of %d is reached", transport, limit)
+		return
+	}
+	logx.warnf("%s: refusing a connection, server.max_connections (%d) is reached", transport, limit)
+	logx.warnf(
+		"  raise server.max_connections if this server should hold more clients at once; further refusals are logged at debug level",
 	)
 }
 
@@ -658,7 +732,7 @@ accept_loop :: proc(data: rawptr) {
 		*/
 		if !config.source_allowed(ctx.server.cfg.server.allow_from, client.address) {
 			sync.atomic_add(&ctx.server.stats.refused, 1)
-			report_refusal(client, proto_name(ctx.proto))
+			report_refusal(client, ctx.proto)
 			net.close(client_socket)
 			continue
 		}
@@ -669,14 +743,14 @@ accept_loop :: proc(data: rawptr) {
 		job.client = client
 
 		if !conn_spawn(&l.conns, job, stream_job) {
-			logx.warnf("%s: refusing a connection, the limit of %d is reached", proto_name(ctx.proto), l.conns.limit)
+			// Bounded the same way `report_refusal` is: this is a refusal a peer
+			// reaches by opening connections, so a line per attempt is a line
+			// rate whoever is opening them decides. `report_conn_limit` releases
+			// the temp arena the line was formatted out of - this loop is the one
+			// place that never resets it, and nothing here outlives the iteration.
+			report_conn_limit(ctx.proto, l.conns.limit)
 			net.close(client_socket)
 			free(job)
-			// The line above was formatted out of this thread's temp arena, and
-			// this loop is the one place that never resets it - a peer opening
-			// connections past the limit would otherwise grow it for as long as
-			// it kept trying. Nothing here outlives the iteration.
-			free_all(context.temp_allocator)
 		}
 	}
 	// `ctx` is not released here: every connection thread started above holds
