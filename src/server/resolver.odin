@@ -43,6 +43,15 @@ Stats :: struct {
 	rate limiter withheld are counted by the limiter itself.
 	*/
 	dropped:   u64,
+	/*
+	Queries turned away because of `server.allow_from`.
+
+	Counted apart from `dropped` because the two ask different questions of an
+	operator. A rising `dropped` is a server that cannot keep up; a rising
+	`refused` is a client that is not on the list - which is either the internet
+	finding an open port, or somebody's own subnet that nobody added.
+	*/
+	refused:   u64,
 	// Answers that carried a valid chain of signatures, and answers refused
 	// because they did not.
 	secure:    u64,
@@ -94,7 +103,7 @@ handle_query :: proc(
 
 	msg, derr := dns.decode_message(query, allocator)
 	if derr != .None {
-		out, built := dns.error_response(query, {}, .Form_Err, allocator, response_limit(msg, proto))
+		out, built := dns.error_response(query, {}, .Form_Err, allocator, response_limit(s, msg, proto))
 		return out, .Failed, built
 	}
 	// A response arriving on a listener port is not something to answer.
@@ -103,7 +112,7 @@ handle_query :: proc(
 	}
 
 	cookie := inspect_cookie(s.cookies, msg, client)
-	limit := response_limit(msg, proto)
+	limit := response_limit(s, msg, proto)
 
 	// A cookie of an impossible length is the one case RFC 7873 section 5.2.2
 	// answers with FORMERR, and the one response that carries no cookie back:
@@ -367,12 +376,24 @@ resolve_query :: proc(
 	return out, .Forwarded, true
 }
 
-// Largest response the transport will carry. UDP is bound by what the client
-// advertised via EDNS0; the stream transports are bound only by the DNS framing.
+/*
+Largest response the transport will carry.
+
+UDP is bound by what the client advertised via EDNS0 and by
+`server.max_udp_response`, whichever is smaller. The client's number is a
+request, not a promise: it arrives on a datagram whose source is unverified, so
+an attacker aiming answers at somebody else advertises the largest buffer it can
+and that number is its amplification factor. The configured ceiling is what
+bounds it.
+
+The stream transports are bound only by the DNS framing. A connection was
+established before the query arrived, so there is nothing to reflect and no
+reason to make a client ask twice for an answer that fits.
+*/
 @(private)
-response_limit :: proc(msg: dns.Message, proto: Protocol) -> int {
+response_limit :: proc(s: ^Server, msg: dns.Message, proto: Protocol) -> int {
 	if proto == .UDP {
-		return int(dns.edns_udp_size(msg))
+		return min(int(dns.edns_udp_size(msg)), s.cfg.server.max_udp_response)
 	}
 	return dns.MAX_MESSAGE
 }
@@ -390,6 +411,7 @@ fit_response :: proc(wire: []u8, limit: int, query: dns.Message, allocator: mem.
 	if len(wire) <= limit {
 		return wire
 	}
+	report_udp_ceiling(wire, limit, query)
 	decoded, err := dns.decode_message(wire, allocator)
 	if err != .None {
 		// Cannot re-encode it; a truncated header at least tells the client to
@@ -408,6 +430,57 @@ fit_response :: proc(wire: []u8, limit: int, query: dns.Message, allocator: mem.
 		return wire
 	}
 	return out
+}
+
+/*
+Say so, once, when `server.max_udp_response` is what cut an answer short.
+
+A client that advertised a small buffer and got a truncated answer got what it
+asked for, and nothing here is worth telling anybody. A client that asked for
+more than the ceiling and was held to the ceiling is a different thing: the
+answer is on its way back over TCP, one round trip slower, because of a number
+in the configuration - and that number is only findable if something says which
+one it is. So the message names the setting, the two sizes, and what the trade
+is in both directions.
+
+Once, at warn, and every time after at debug. The condition is per-answer, so a
+resolver serving one large signed zone would otherwise print this for every
+query about it, and a line repeated ten thousand times is one an operator
+filters out rather than reads.
+*/
+@(private)
+udp_ceiling_reported: bool
+
+@(private)
+report_udp_ceiling :: proc(wire: []u8, limit: int, query: dns.Message) {
+	// Not our ceiling: the client asked for no more than this, so the
+	// truncation is the client's own arithmetic and not something to change.
+	if limit >= int(dns.edns_udp_size(query)) {
+		return
+	}
+	name := query.question[0].name if len(query.question) > 0 else "?"
+	if sync.atomic_exchange(&udp_ceiling_reported, true) {
+		logx.debugf(
+			"server.max_udp_response truncated a %d-byte answer for %s to %d bytes",
+			len(wire),
+			name,
+			limit,
+		)
+		return
+	}
+	logx.warnf(
+		"a %d-byte answer for %s was truncated to %d bytes and the client told to retry over TCP: it asked for %d, and server.max_udp_response is %d",
+		len(wire),
+		name,
+		limit,
+		int(dns.edns_udp_size(query)),
+		limit,
+	)
+	logx.warnf(
+		"  to send it over UDP instead, raise server.max_udp_response in the configuration (up to %d); the cost is that a spoofed query can make this server send that much to an address it did not verify",
+		config.MAX_UDP_RESPONSE,
+	)
+	logx.warnf("  further truncations at this ceiling are logged at debug level")
 }
 
 @(private)

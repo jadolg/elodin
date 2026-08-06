@@ -230,6 +230,29 @@ udp_loop :: proc(data: rawptr) {
 			continue
 		}
 
+		/*
+		Before the message is parsed, before the limiter and before the queue:
+		a source this server does not answer should cost a prefix compare and
+		nothing else.
+
+		Dropped rather than refused. A REFUSED is a datagram sent to whatever
+		address the query claimed, which is a reflection of its own - small, but
+		free to whoever asked for it - and the source on a datagram is not
+		evidence of anything. The stream listeners, where a handshake has
+		established who is there, close the connection instead.
+
+		Not charged to the rate limiter, though the limiter is the next thing
+		here. That budget is kept per /24, so a denied source in the same /24 as
+		an allowed one would be spending its neighbour's: charging refusals
+		would turn a narrowed allow list into a way to have the clients beside
+		it dropped. Nothing is sent, so there is nothing a response budget is
+		bounding.
+		*/
+		if !config.source_allowed(ctx.server.cfg.server.allow_from, client.address) {
+			sync.atomic_add(&ctx.server.stats.refused, 1)
+			continue
+		}
+
 		if !plausible_source(l, client) {
 			sync.atomic_add(&ctx.server.stats.dropped, 1)
 			continue
@@ -549,6 +572,25 @@ accept_loop :: proc(data: rawptr) {
 			if sync.atomic_load(&l.stop) {
 				break
 			}
+			continue
+		}
+
+		/*
+		Closed here rather than handed a thread that would answer REFUSED.
+
+		A refusal a client can read is the friendlier of the two, and it is what
+		BIND and Unbound send - but it has to be written on a connection, and a
+		connection is a thread out of `max_connections` plus, for DoT and DoH, a
+		TLS handshake. That would make the allow list a way to exhaust the
+		connection limit rather than a defence: a source we have already decided
+		not to serve would cost more than one we do. Closing on accept costs a
+		prefix compare and a close, and a client whose network is not in the
+		list sees the connection go rather than a reason, which is a thing to
+		find in the log instead.
+		*/
+		if !config.source_allowed(ctx.server.cfg.server.allow_from, client.address) {
+			sync.atomic_add(&ctx.server.stats.refused, 1)
+			net.close(client_socket)
 			continue
 		}
 

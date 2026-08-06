@@ -11,43 +11,6 @@ import "core:time"
 Command-line behaviour: the checks an operator relies on before a deploy.
 */
 
-@(private = "file")
-Run_Result :: struct {
-	exit_code: int,
-	output:    string,
-	ok:        bool,
-}
-
-@(private = "file")
-run_binary :: proc(r: ^Runner, args: []string, tag: string) -> Run_Result {
-	out_path := filepath.join({r.work_dir, fmt.tprintf("cli-%s.txt", tag)}, context.temp_allocator) or_else ""
-	out_file, oerr := os.open(out_path, {.Write, .Create, .Trunc}, os.Permissions_Read_All + {.Write_User})
-	if oerr != nil {
-		return {}
-	}
-
-	command := make([dynamic]string, 0, len(args) + 1, context.temp_allocator)
-	append(&command, r.binary)
-	append(&command, ..args)
-
-	process, perr := os.process_start(
-		os.Process_Desc{command = command[:], stdout = out_file, stderr = out_file},
-	)
-	if perr != nil {
-		os.close(out_file)
-		return {}
-	}
-	state, werr := os.process_wait(process)
-	os.close(out_file)
-	if werr != nil {
-		return {}
-	}
-
-	data, rerr := os.read_entire_file(out_path, context.temp_allocator)
-	text := rerr == nil ? string(data) : ""
-	return Run_Result{exit_code = state.exit_code, output = text, ok = true}
-}
-
 run_cli_cases :: proc(r: ^Runner) {
 	start_case(r, "cli: --version prints the build")
 	{
