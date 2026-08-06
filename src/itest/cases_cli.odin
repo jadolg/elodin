@@ -229,6 +229,18 @@ server: {{ user: root }}
 	{
 		res := new_check(r, "examples/elodin.yaml", "check-example")
 		check_eq_int(r, res.exit_code, 0, "exit code for examples/elodin.yaml")
+		/*
+		The shipped file leaves both worker counts unset, so the numbers only
+		exist once a machine has been measured. `--check` is where an operator
+		looks before restarting a resolver, and a pool size that appears in no
+		file and no output is one nobody can argue with.
+		*/
+		check(
+			r,
+			strings.contains(res.output, "workers=") && strings.contains(res.output, "derived from"),
+			"the derived worker counts were not reported: %q",
+			res.output,
+		)
 	}
 	end_case(r)
 }

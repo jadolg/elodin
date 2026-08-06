@@ -21,6 +21,12 @@ listeners:
   udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
   tcp: {{ enabled: false }}
 server:
+  # Pinned rather than derived from whatever machine the suite is running on:
+  # the flood below has to fit inside max_pending, which is workers * 8, for
+  # the unlimited run to be the baseline it claims to be. Otherwise the case
+  # measures this machine's shed threshold instead of the limiter.
+  workers: 32
+  upstream_workers: 8
   rate_limit: {{ %s }}
 upstream:
   timeout: 3s

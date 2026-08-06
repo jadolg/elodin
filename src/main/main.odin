@@ -151,6 +151,57 @@ wait_for_tick :: proc(tick: time.Duration) -> Wait_Outcome {
 	}
 }
 
+/*
+One line saying how large this instance is and why.
+
+Worth printing on every start, not only when something was derived: a worker
+count that came from the machine is one an operator has never seen in a file, so
+leaving it out of the log would make the first question about memory or
+throughput unanswerable from anything but the source. `--check` prints the same
+line, and derives it the same way, so it answers the question on the machine the
+config is bound for rather than in the abstract.
+*/
+// "1 usable CPU" rather than "1 usable CPUs", which is a machine small enough
+// that this line is exactly the one an operator reads twice.
+@(private)
+usable_cpus :: proc(cpus: int) -> string {
+	if cpus == 1 {
+		return "1 usable CPU"
+	}
+	return fmt.tprintf("%d usable CPUs", cpus)
+}
+
+@(private)
+sizing_line :: proc(s: config.Server_Config) -> string {
+	origin := "from the configuration"
+	switch {
+	case s.sizing.derived_workers:
+		m := s.sizing.machine
+		switch {
+		case m.cpus > 0 && m.memory > 0:
+			origin = fmt.tprintf("derived from %s and %#.1M", usable_cpus(m.cpus), m.memory)
+		case m.cpus > 0:
+			origin = fmt.tprintf("derived from %s", usable_cpus(m.cpus))
+		case m.memory > 0:
+			origin = fmt.tprintf("derived from %#.1M of memory", m.memory)
+		case:
+			origin = "derived from defaults; this machine could not be measured"
+		}
+	// Nothing was measured: half of a number the file named is still that
+	// number's doing, and naming the machine here would credit it with a
+	// choice an operator made.
+	case s.sizing.derived_upstream_workers:
+		origin = "upstream_workers derived from the configured workers"
+	}
+	return fmt.tprintf(
+		"workers=%d upstream_workers=%d max_pending=%d (%s)",
+		s.workers,
+		s.upstream_workers,
+		s.max_pending,
+		origin,
+	)
+}
+
 main :: proc() {
 	// Writing to a socket whose peer has gone away raises SIGPIPE, whose
 	// default disposition kills the process. A client hanging up mid-answer is
@@ -203,10 +254,12 @@ main :: proc() {
 	if opts.check_only {
 		fmt.printfln("%s is valid: %d upstreams, %d blocklists, %d rewrites",
 			opts.config_path, len(cfg.upstream.servers), len(cfg.blocking.lists), len(cfg.rewrites))
+		fmt.printfln("  %s", sizing_line(cfg.server))
 		return
 	}
 
 	logx.infof("elodin %s starting", server.VERSION)
+	logx.infof("%s", sizing_line(cfg.server))
 	run(&cfg, opts, service)
 }
 

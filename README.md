@@ -706,15 +706,43 @@ the whole of an upstream round trip, so
 sustained cache-miss throughput  ≈  server.workers / upstream_rtt
 ```
 
-which is about 50 qps per worker against a 20 ms upstream. The default of 128
-therefore carries roughly 6,000 misses per second. Two consequences worth
-knowing:
+which is about 50 qps per worker against a 20 ms upstream, so a 128-worker pool
+carries roughly 6,000 misses per second. Two consequences worth knowing:
 
 - **Every query shares that pool**, so running short on workers delays cache
-  hits as much as misses. At the old default of 8 workers, answers that take
-  60 µs to produce from cache were coming back after 413 ms because the workers
-  were all parked on upstream I/O.
-- **Memory scales with workers**, at roughly 0.3 MB of scratch arena each.
+  hits as much as misses. At a pool of 8 workers, answers that take 60 µs to
+  produce from cache were coming back after 413 ms because the workers were all
+  parked on upstream I/O.
+- **Memory scales with workers**, at roughly 0.3 MB of scratch arena each — and
+  it is a floor rather than a peak. A worker holds its arena from its first
+  query onward, because `free_all` on Odin's temp allocator keeps and zeroes the
+  first block instead of returning it.
+
+That second point is why `server.workers` and `server.upstream_workers` are not
+fixed numbers any more. Left unset — which is what `0` means, and what the
+shipped configuration says — they are worked out at startup from the machine:
+
+```
+workers           = clamp(usable_cpus * 4, 16, 128), lowered if the threads
+                    that implies would take more than 1/32 of usable memory
+upstream_workers  = workers / 2
+```
+
+"Usable" is what this process can have rather than what the box holds: the CPU
+affinity mask, and a cgroup CPU or memory limit where there is one, so a
+container or a systemd unit with `CPUQuota=`/`MemoryMax=` sizes itself for what
+it was given. A two-core home box lands on 16 workers and 8 racers rather than
+the 128 and 64 every installation used to get, and a 32-core resolver still gets
+those 128. Whatever the machine says, a number in the configuration wins — and
+the two can be set independently, since an unset `upstream_workers` follows a
+configured `workers`.
+
+The numbers it settled on, and what it read them from, are logged on the first
+line after startup and printed by `--check`:
+
+```
+workers=16 upstream_workers=8 max_pending=128 (derived from 4 usable CPUs and 7.7 GiB)
+```
 
 Past capacity the server drops queries rather than queueing them
 (`server.max_pending`, derived as `workers * 8`). With 6,000 clients all asking
@@ -752,13 +780,16 @@ Memory, for a full configuration under load:
 | | |
 |---|---|
 | idle, no lists | 11 MB |
-| worker scratch arenas | ~0.26 MB per worker (34 MB at 128) |
+| worker scratch arenas | ~0.26 MB per worker (34 MB at a 128-worker pool) |
 | blocklists | ~129 B per rule (31 MB for 250,000 rules) |
 | answer cache | ~463 B per entry (4 MB at the default 10,000) |
 | **realistic total under load** | **154 MB** with 250,000 rules and 180,000 cached answers |
 
 Each row but the first is a difference between two runs that vary in one thing,
 so the cache is not charged for the worker arenas that the same load brings up.
+The worker row is measured against a pinned 128-worker pool, which the
+benchmarks name explicitly rather than derive; a machine that derives 16 pays
+4 MB there instead of 34, and the total below moves with it.
 
 The cache row is a *typical* entry, not a bound. An entry holds the response as
 it arrived — up to 64 KiB, since a query over TCP, DoT or DoH is answered with

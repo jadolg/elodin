@@ -290,10 +290,19 @@ Server_Config :: struct {
 
 	Size it as `target_qps * upstream_rtt`, with headroom: 5000 qps against a
 	20 ms upstream wants at least 100.
+
+	Zero derives it from the machine at startup - see `sizing.odin` - because
+	every worker costs memory permanently and a number that suits a rack-mounted
+	resolver is one a home router pays for and never uses.
 	*/
 	workers:          int,
-	// Worker threads dedicated to racing upstreams, kept separate so a burst of
-	// races cannot starve the handlers that submitted them.
+	/*
+	Worker threads dedicated to racing upstreams, kept separate so a burst of
+	races cannot starve the handlers that submitted them.
+
+	Zero derives it as half of `workers`, whether that came from the file or
+	from the machine.
+	*/
 	upstream_workers: int,
 	// Per-connection read timeout for TCP, DoT and DoH clients.
 	client_timeout:   time.Duration,
@@ -324,6 +333,9 @@ Server_Config :: struct {
 	// Group to go with `user`. Empty takes the user's primary group.
 	group:            string,
 	rate_limit:       Rate_Limit_Config,
+	// What the two worker counts were derived from, when they were. Not a
+	// setting: filled in at load so startup and `--check` can report it.
+	sizing:           Sizing,
 }
 
 /*
@@ -361,11 +373,12 @@ default_config :: proc() -> Config {
 		queries = false,
 	}
 	c.server = Server_Config {
-		// 128 workers carries roughly 5000 cache misses per second against a
-		// 20 ms upstream. Idle threads cost almost nothing, so this is a far
-		// better default than a number that only suits a household.
-		workers          = 128,
-		upstream_workers = 64,
+		// Both zero: worked out at load from the CPUs and memory this machine
+		// actually has. A fixed 128 and 64 sized every installation for five
+		// thousand cache misses a second, and the threads that pays for keep
+		// their scratch arenas resident whether or not the load ever arrives.
+		workers          = 0,
+		upstream_workers = 0,
 		client_timeout   = 10 * time.Second,
 		max_connections  = 512,
 		max_pending      = 0,

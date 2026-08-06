@@ -32,6 +32,13 @@ StateDirectory=elodin
 CacheDirectory=elodin
 ConfigurationDirectory=elodin
 
+# With server.workers and server.upstream_workers left unset, elodin sizes its
+# thread pools from what this unit may use rather than from what the machine
+# has, so a limit named here is also a limit on the threads it raises. Neither
+# is set by default; both are worth having on a machine elodin shares.
+# CPUQuota=50%
+# MemoryMax=256M
+
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
