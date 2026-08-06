@@ -334,8 +334,28 @@ report_refusal :: proc(client: net.Endpoint, transport: string) {
 	if sync.atomic_load(&refusal_reported) && !logx.enabled(.Debug) {
 		return
 	}
-	// The stack, not the temp allocator: this runs on the read loop, whose arena
-	// is reset per query elsewhere, and on the accept loop, which has none.
+	/*
+	The line itself is what has to be paid for, and it is paid for here.
+
+	`logx` formats through `fmt.tprintf`, so a line costs a few hundred bytes of
+	the calling thread's temp arena - and the two callers are the UDP read loop
+	and the accept loops, neither of which resets one. The read loop's arena is
+	not the one a query is answered from; that belongs to the worker the job is
+	handed to. The accept loop's is untouched from start to shutdown. At `debug`,
+	where every refusal is logged, that would be an arena a refused source grows
+	for as long as it keeps sending - which is the level an operator turns on to
+	find out why their clients are being refused, so it is the level this must
+	not misbehave at.
+
+	Released where the garbage is made rather than at the call sites, and safe
+	because both of them hold nothing in the temp allocator across this: the
+	check runs before a datagram is parsed and before a connection is queued.
+	*/
+	defer free_all(context.temp_allocator)
+
+	// The stack rather than that arena: an address is a fixed few dozen bytes,
+	// and the less of a refused packet's cost goes through an allocator the
+	// better.
 	buf: [64]u8
 	builder := strings.builder_from_bytes(buf[:])
 	who := net.endpoint_to_string(client, &builder)
@@ -652,6 +672,11 @@ accept_loop :: proc(data: rawptr) {
 			logx.warnf("%s: refusing a connection, the limit of %d is reached", proto_name(ctx.proto), l.conns.limit)
 			net.close(client_socket)
 			free(job)
+			// The line above was formatted out of this thread's temp arena, and
+			// this loop is the one place that never resets it - a peer opening
+			// connections past the limit would otherwise grow it for as long as
+			// it kept trying. Nothing here outlives the iteration.
+			free_all(context.temp_allocator)
 		}
 	}
 	// `ctx` is not released here: every connection thread started above holds
