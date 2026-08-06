@@ -1,5 +1,7 @@
 package config
 
+import "core:net"
+import "core:strings"
 import "core:testing"
 import "core:time"
 
@@ -364,5 +366,188 @@ test_group_without_user_is_an_error :: proc(t: ^testing.T) {
 	e, has := err.?
 	testing.expect(t, has, "server.group alone should be refused")
 	testing.expect(t, len(e.messages) > 0, "expected a message")
+	free_all(context.temp_allocator)
+}
+
+/*
+`server.allow_from` as it comes out of a file.
+
+The three states are different settings rather than three ways of writing one:
+absent is the shipped default, a list is that list, and an empty list is a
+public resolver. Getting the last two the wrong way round would turn a default
+into an outage or an outage into an open resolver.
+*/
+@(test)
+test_allow_from_absent_keeps_the_local_default :: proc(t: ^testing.T) {
+	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	testing.expect(t, err == nil, "expected a clean load")
+	testing.expect(t, len(cfg.server.allow_from) > 0, "a file that says nothing should not open the resolver")
+	testing.expect(
+		t,
+		source_allowed(cfg.server.allow_from, net.IP4_Address{127, 0, 0, 1}),
+		"the default refuses loopback",
+	)
+	testing.expect(
+		t,
+		!source_allowed(cfg.server.allow_from, net.IP4_Address{8, 8, 8, 8}),
+		"the default answers the internet",
+	)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_allow_from_replaces_the_default :: proc(t: ^testing.T) {
+	src := "upstream:\n  servers: [1.1.1.1]\nserver:\n  allow_from: [\"203.0.113.0/24\", \"2001:db8::/32\"]\n"
+	cfg, err := load_string(src, context.temp_allocator)
+	testing.expect(t, err == nil, "expected a clean load")
+	testing.expect_value(t, len(cfg.server.allow_from), 2)
+	testing.expect(
+		t,
+		source_allowed(cfg.server.allow_from, net.IP4_Address{203, 0, 113, 9}),
+		"a network that was named is refused",
+	)
+	// The default is replaced, not added to: an operator who lists their own
+	// networks has said which ones, and inheriting 10/8 on top would serve a
+	// network they did not name.
+	testing.expect(
+		t,
+		!source_allowed(cfg.server.allow_from, net.IP4_Address{127, 0, 0, 1}),
+		"loopback survived a list that does not mention it",
+	)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_allow_from_empty_is_a_public_resolver :: proc(t: ^testing.T) {
+	cfg, err := load_string(
+		"upstream:\n  servers: [1.1.1.1]\nserver:\n  allow_from: []\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, err == nil, "an empty allow_from should load")
+	testing.expect_value(t, len(cfg.server.allow_from), 0)
+	testing.expect(
+		t,
+		source_allowed(cfg.server.allow_from, net.IP4_Address{8, 8, 8, 8}),
+		"an empty list refused a source instead of allowing everything",
+	)
+	free_all(context.temp_allocator)
+}
+
+// A network that will not parse has to stop `--check`, and the message has to
+// name the entry: a list of eight is not one an operator wants to bisect.
+@(test)
+test_allow_from_reports_every_bad_entry :: proc(t: ^testing.T) {
+	src := "upstream:\n  servers: [1.1.1.1]\nserver:\n  allow_from: [\"10.0.0.0/8\", \"nonsense\", \"::1/999\"]\n"
+	_, err := load_string(src, context.temp_allocator)
+	e, has := err.?
+	testing.expect(t, has, "an unparseable network should be refused")
+	testing.expect_value(t, len(e.messages), 2)
+	for m in e.messages {
+		testing.expect(t, strings.contains(m, "allow_from"), "the message does not name the setting")
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+`allow_from:` with nothing after it is neither of the two settings it looks like.
+
+Null is what YAML makes of an empty value, and the two readings available for it
+here are the shipped default and its exact opposite. Guessing either way is a
+resolver that is not the one in the file, so it is an error - and the message has
+to name `[]`, since an operator who meant "serve everybody" is two characters
+from saying so.
+*/
+@(test)
+test_allow_from_with_no_value_is_an_error :: proc(t: ^testing.T) {
+	sources := []string {
+		// Last key in the mapping, and with another key after it: the same node
+		// either way, but both are what people actually write.
+		"upstream:\n  servers: [1.1.1.1]\nserver:\n  allow_from:\n",
+		"upstream:\n  servers: [1.1.1.1]\nserver:\n  allow_from:\n  workers: 4\n",
+	}
+	for src in sources {
+		cfg, err := load_string(src, context.temp_allocator)
+		e, has := err.?
+		if !testing.expectf(t, has, "an empty allow_from value loaded as %v", cfg.server.allow_from) {
+			continue
+		}
+		named := false
+		for m in e.messages {
+			if strings.contains(m, "allow_from") && strings.contains(m, "[]") {
+				named = true
+			}
+		}
+		testing.expectf(t, named, "the message does not offer [] as the way to say it: %v", e.messages)
+	}
+	free_all(context.temp_allocator)
+}
+
+// A scalar where a list belongs is a mistake worth a message rather than a
+// silently ignored setting.
+@(test)
+test_allow_from_of_the_wrong_shape_is_an_error :: proc(t: ^testing.T) {
+	src := "upstream:\n  servers: [1.1.1.1]\nserver:\n  allow_from: { a: 1 }\n"
+	_, err := load_string(src, context.temp_allocator)
+	_, has := err.?
+	testing.expect(t, has, "a mapping should not be accepted as a list of networks")
+	free_all(context.temp_allocator)
+}
+
+/*
+`server.max_udp_response` is an amplification factor written as a number.
+
+1232 by default, refused outside [512, 4096] rather than clamped: a resolver
+that quietly served 4096 to somebody who asked for 8192 would be one whose
+ceiling is not the one in its file.
+*/
+@(test)
+test_max_udp_response_defaults_to_flag_day :: proc(t: ^testing.T) {
+	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	testing.expect(t, err == nil, "expected a clean load")
+	testing.expect_value(t, cfg.server.max_udp_response, DEFAULT_MAX_UDP_RESPONSE)
+	testing.expect_value(t, cfg.server.max_udp_response, 1232)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_max_udp_response_can_be_raised :: proc(t: ^testing.T) {
+	cfg, err := load_string(
+		"upstream:\n  servers: [1.1.1.1]\nserver:\n  max_udp_response: 4096\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, err == nil, "expected a clean load")
+	testing.expect_value(t, cfg.server.max_udp_response, 4096)
+
+	// Read as a size, so the suffixed forms the cache settings take work here.
+	sized, serr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\nserver:\n  max_udp_response: 1KiB\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, serr == nil, "a suffixed size should load")
+	testing.expect_value(t, sized.server.max_udp_response, 1024)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_max_udp_response_outside_the_range_is_an_error :: proc(t: ^testing.T) {
+	out_of_range := []string{"8192", "511", "0", "-1"}
+	for value in out_of_range {
+		src := strings.concatenate(
+			{"upstream:\n  servers: [1.1.1.1]\nserver:\n  max_udp_response: ", value, "\n"},
+			context.temp_allocator,
+		)
+		_, err := load_string(src, context.temp_allocator)
+		e, has := err.?
+		testing.expectf(t, has, "max_udp_response: %s was accepted", value)
+		if has {
+			named := false
+			for m in e.messages {
+				if strings.contains(m, "max_udp_response") {
+					named = true
+				}
+			}
+			testing.expectf(t, named, "the error for %s does not name the setting", value)
+		}
+	}
 	free_all(context.temp_allocator)
 }

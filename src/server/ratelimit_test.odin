@@ -2,6 +2,7 @@ package server
 
 import "core:net"
 import "core:testing"
+import "core:thread"
 import "core:time"
 
 /*
@@ -290,4 +291,67 @@ test_implausible_sources_are_refused :: proc(t: ^testing.T) {
 		got := plausible_source(&l, c.client)
 		testing.expectf(t, got == c.plausible, "%s: plausible_source said %v", c.what, got)
 	}
+}
+
+/*
+The bucket table has no lock, and this is what says so out loud.
+
+`rate_check` is written for one caller, and the cost of a second is not a crash
+but a limiter that quietly under-counts: torn `tokens`, lost `over`. A second
+reader is the obvious thing to add the day the read loop becomes the bottleneck,
+so the assumption is held as state and claimed by whoever calls first.
+
+`claim_reader` rather than `rate_check` itself, because what `rate_check` does
+with the answer is assert, and a test cannot observe an abort.
+*/
+@(test)
+test_limiter_is_claimed_by_one_thread :: proc(t: ^testing.T) {
+	r := make_rate_limiter(100, 2)
+	defer destroy_rate_limiter(r)
+
+	testing.expect(t, claim_reader(r), "the first caller was not given the limiter")
+	testing.expect(t, claim_reader(r), "the owner was refused its own limiter on the second call")
+
+	Probe :: struct {
+		limiter: ^Rate_Limiter,
+		claimed: bool,
+	}
+	probe := Probe {
+		limiter = r,
+	}
+	other := thread.create_and_start_with_poly_data(&probe, proc(p: ^Probe) {
+		p.claimed = claim_reader(p.limiter)
+	})
+	testing.expect(t, other != nil, "could not start a second thread")
+	thread.join(other)
+	thread.destroy(other)
+
+	testing.expect(t, !probe.claimed, "a second thread was allowed into an unlocked bucket table")
+	// And the owner still owns it: a refused claim must not have taken it away.
+	testing.expect(t, claim_reader(r), "the owner lost the limiter to a thread that was refused")
+}
+
+// A limiter nobody has called yet belongs to nobody, so the first thread to
+// arrive gets it whichever thread that is - the read loop is not this one.
+@(test)
+test_limiter_owner_is_the_first_caller_not_the_maker :: proc(t: ^testing.T) {
+	r := make_rate_limiter(100, 2)
+	defer destroy_rate_limiter(r)
+
+	Probe :: struct {
+		limiter: ^Rate_Limiter,
+		claimed: bool,
+	}
+	probe := Probe {
+		limiter = r,
+	}
+	owner := thread.create_and_start_with_poly_data(&probe, proc(p: ^Probe) {
+		p.claimed = claim_reader(p.limiter)
+	})
+	testing.expect(t, owner != nil, "could not start the owning thread")
+	thread.join(owner)
+	thread.destroy(owner)
+
+	testing.expect(t, probe.claimed, "a thread that made the first call was refused")
+	testing.expect(t, !claim_reader(r), "the thread that made the limiter was let in after another claimed it")
 }

@@ -192,15 +192,76 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 	opt_int(l, n, "upstream_workers", &cfg.server.upstream_workers, "server")
 	opt_int(l, n, "max_connections", &cfg.server.max_connections, "server")
 	opt_int(l, n, "max_pending", &cfg.server.max_pending, "server")
+	// A size, so "1232" and "1232B" and "4KiB" all read, the same as the cache
+	// sizes do.
+	opt_bytes(l, n, "max_udp_response", &cfg.server.max_udp_response, "server")
 	opt_duration(l, n, "client_timeout", &cfg.server.client_timeout, "server")
 	opt_string(l, n, "user", &cfg.server.user, "server")
 	opt_string(l, n, "group", &cfg.server.group, "server")
+	load_allow_from(l, n, cfg)
 
 	if rl := yaml.get(n, "rate_limit"); rl != nil {
 		opt_bool(l, rl, "enabled", &cfg.server.rate_limit.enabled, "server.rate_limit")
 		opt_int(l, rl, "responses_per_second", &cfg.server.rate_limit.responses_per_second, "server.rate_limit")
 		opt_int(l, rl, "slip", &cfg.server.rate_limit.slip, "server.rate_limit")
 	}
+}
+
+/*
+Read `server.allow_from` into the prefixes it names.
+
+Parsed at load rather than at startup, and with the parser the listeners
+themselves use, so a network that will not parse fails `--check` instead of
+coming up as a resolver that refuses every client. An entry that is absent
+leaves the default list alone; an entry that is present and empty is an
+operator asking for a public resolver, which is a different thing and is taken
+as one.
+*/
+@(private)
+load_allow_from :: proc(l: ^Loader, n: ^yaml.Node, cfg: ^Config) {
+	child := yaml.get(n, "allow_from")
+	if child == nil {
+		return
+	}
+	/*
+	Present with nothing after it is refused rather than guessed at.
+
+	`allow_from:` on its own reads as null, and the two things it could have
+	meant - "serve everybody" and "I started writing this and stopped" - are the
+	shipped default and its exact opposite. `[]` says the first unambiguously
+	and is two characters away, so there is nothing to be gained by picking one
+	on the operator's behalf and an open resolver to be lost by picking wrong.
+	*/
+	if yaml.is_null(child) {
+		errorf(
+			l,
+			"server.allow_from: expected a list of networks such as [192.168.0.0/16], or [] for no restriction at all; it has no value",
+		)
+		return
+	}
+	list, ok := yaml.as_string_list(child, l.allocator)
+	if !ok {
+		errorf(l, "server.allow_from: expected a list of networks in CIDR form, such as [192.168.0.0/16]")
+		return
+	}
+
+	out := make([]Prefix, len(list), l.allocator)
+	kept := 0
+	for entry, i in list {
+		p, pok := parse_prefix(entry)
+		if !pok {
+			errorf(
+				l,
+				"server.allow_from[%d]: %q is not a network in CIDR form such as 192.168.0.0/16 or ::1/128",
+				i,
+				entry,
+			)
+			continue
+		}
+		out[kept] = p
+		kept += 1
+	}
+	cfg.server.allow_from = out[:kept]
 }
 
 @(private)
@@ -858,6 +919,19 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	}
 	if cfg.server.max_pending < 0 {
 		errorf(l, "server.max_pending must not be negative")
+	}
+	// Refused rather than clamped: this number is an amplification factor, and
+	// a resolver that quietly served 4096 to somebody who wrote 8192 would be
+	// one whose ceiling is not what its file says.
+	if cfg.server.max_udp_response < MIN_UDP_RESPONSE || cfg.server.max_udp_response > MAX_UDP_RESPONSE {
+		errorf(
+			l,
+			"server.max_udp_response must be between %d and %d bytes (it is %d); %d is the default",
+			MIN_UDP_RESPONSE,
+			MAX_UDP_RESPONSE,
+			cfg.server.max_udp_response,
+			DEFAULT_MAX_UDP_RESPONSE,
+		)
 	}
 	if cfg.server.max_pending == 0 {
 		cfg.server.max_pending = cfg.server.workers * 8

@@ -71,6 +71,11 @@ A cache directory it cannot write is a warning, not an error: the lists are
 still downloaded and applied, they just have to be fetched again on the next
 start.
 
+The listeners bind `0.0.0.0`, but by default only the local networks are served
+— loopback, RFC 1918, IPv6 loopback, unique local and link-local. Clients on
+another network need adding to `server.allow_from`; see
+[Who may ask](#who-may-ask).
+
 `examples/elodin.yaml` documents every setting. A minimal config is:
 
 ```yaml
@@ -246,7 +251,7 @@ addresses, the upstream set, blocking — those still need a restart.
 ### Observing it
 
 There is no metrics endpoint. Statistics go to the log every five minutes —
-queries, blocked, cached, forwarded, failed, dropped, rate-limited and
+queries, blocked, cached, forwarded, failed, dropped, refused, rate-limited and
 truncated, secure and bogus counts, plus cache entries, bytes, hits, misses and
 evictions — and `log.queries` adds one line per query, at the cost noted under
 [Resource use](#resource-use).
@@ -466,6 +471,141 @@ Two things worth knowing about running with it on:
   which is unsigned by definition, from the child's, which is not. The answer
   section is validated in full; this affects only what rides alongside it.
 
+### Who may ask
+
+```yaml
+server:
+  allow_from:                     # the default, shown in full
+    - 127.0.0.0/8
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 169.254.0.0/16
+    - ::1/128
+    - fc00::/7
+    - fe80::/10
+```
+
+The listeners bind `0.0.0.0` by default, so on a machine with a public address
+elodin is reachable from the internet. What keeps it from being an *open*
+resolver is this list: queries are accepted from the local networks — loopback,
+the RFC 1918 ranges, IPv6 loopback, unique local and link-local — and from
+nowhere else. It sits between what the two obvious comparisons ship: BIND's
+`allow-recursion` defaults to `localnets` plus `localhost`, and Unbound's
+`access-control` is stricter still, starting at `0.0.0.0/0 refuse` with only
+`127.0.0.0/8` allowed. (BIND's `allow-query` is a different setting and does
+default to `any` — it is recursion, not the query, that it holds back.) The
+reason all three have one is the same: an installation nobody has configured
+should serve the machine and the network it is on.
+
+This is a different bound from [rate limiting](#rate-limiting), not a weaker
+version of it. The rate limiter caps what one victim can be made to receive; it
+does not stop this server from taking part in the attack that aims it there. The
+allow list is the half that does.
+
+The check runs before the message is parsed, before the rate limiter and before
+the query is queued, so a source that is not on the list costs a prefix compare
+and nothing else. Over UDP it is dropped: a REFUSED sent to a datagram source is
+a reflection of its own, small but free to whoever asked for it. Over TCP, DoT
+and DoH the connection is closed on accept, without a thread and without a TLS
+handshake — answering REFUSED there would mean a source we have already decided
+not to serve costing more than one we do, and would make the allow list a way to
+exhaust `max_connections`. Refusals are counted as `refused=` in the stats line.
+
+Neither refusal tells the client anything, so the log does. The first refusal
+since start is a `warn` naming the source, the transport and the setting; every
+one after it is `debug`, and the `refused=` counter carries the rest. Without
+that line the first symptom of a network nobody added is a client that stopped
+working with nothing to grep for; with a line per datagram, whoever is sending
+them decides how much this server writes to disk.
+
+```
+WARN  udp: refused a query from 198.51.100.7:41234: it is not in
+      server.allow_from, so nothing was sent back
+WARN    add its network to server.allow_from if that client should be served;
+        refusals are counted as refused= in the stats line, and further ones are
+        logged at debug level
+```
+
+A list in the file replaces the default rather than adding to it, so include
+loopback if you want it. Entries are CIDR networks in either family; a bare
+address is the single host it names, and host bits below the length are masked
+off, so `127.0.0.1/8` and `127.0.0.0/8` are the same network. A v4-mapped entry
+(`::ffff:192.168.0.0/112`) is the IPv4 network it names, since that is how a
+mapped client arriving on an IPv6 socket is compared. An entry that will not
+parse fails `--check` rather than starting a resolver that refuses everyone.
+
+Carrier-grade NAT (`100.64.0.0/10`, which Tailscale also uses) is deliberately
+not in the default: a resolver behind one would be serving an ISP's other
+customers. Add it explicitly if that is your network.
+
+An empty list is no restriction:
+
+```yaml
+server:
+  allow_from: []
+```
+
+That is how you ask for a public resolver, and it is a thing to write down on
+purpose. elodin warns about it at every start. Before running one, read
+[rate limiting](#rate-limiting) below and consider `cookies.require`.
+
+Note the `[]`. Writing `allow_from:` with nothing after it is a configuration
+error rather than either reading of it: YAML makes that a null, and the two
+things it could have meant here are the shipped default and its exact opposite.
+
+### How large a UDP answer may be
+
+```yaml
+server:
+  max_udp_response: 1232          # 512–4096; the DNS Flag Day 2020 figure
+```
+
+A client says in its OPT record how large a response it can take, and a
+resolver that simply believes it has handed the caller its own amplification
+factor: the query arrives on a datagram nobody verified, so an attacker aiming
+answers at a victim advertises the largest buffer it can and gets a hundredfold
+out of forty bytes. `max_udp_response` is the ceiling on that number, applied on
+top of whatever the client asked for. It is also what the per-prefix budget
+under [Rate limiting](#rate-limiting) is denominated in — 500 responses a second
+is about 600 KB/s at 1232 and about 2 MB/s at 4096.
+
+The cost is a TC bit, and a retry over TCP, on any answer between the ceiling
+and what the client asked for. Measured across the 129 names of the DNSSEC
+survey asked with `DO=1`, that is **no A or AAAA answer at all** — the largest
+is 743 bytes — and five DNSKEY answers, the largest 1793. Nothing in the survey
+reaches 4096; that ceiling is only reached by a zone built to fill it, which is
+what reflection uses. The measurement is in
+[`bench/results/2026-08-06-edns-response-sizes.md`](bench/results/2026-08-06-edns-response-sizes.md).
+
+Raise it, up to 4096, on a network whose path MTU is known to carry large
+datagrams and where the resolver is not reachable by anyone who would abuse it.
+When the ceiling does truncate an answer, elodin says so and names the setting:
+
+```
+WARN  a 2720-byte answer for big.example. was truncated to 1232 bytes and the
+      client told to retry over TCP: it asked for 4096, and
+      server.max_udp_response is 1232
+WARN    to send it over UDP instead, raise server.max_udp_response in the
+        configuration (up to 4096); the cost is that a spoofed query can make
+        this server send that much to an address it did not verify
+```
+
+Once, at `warn`; every truncation after that at `debug`, so one large signed
+zone does not fill the log. A client that asked for *less* than the ceiling and
+got a truncated answer got what it asked for, and nothing is said — the setting
+had no part in it.
+
+The ceiling is UDP only. TCP, DoT and DoH establish a connection before a query
+arrives, so the address is proven, there is nothing to reflect, and an answer
+that fits is sent whole.
+
+That does mean a truncated answer needs somewhere to go: if you have turned
+`listeners.tcp` off, a client told to retry has nowhere to retry to, and the
+answer is unreachable rather than slow. Either leave TCP on — it is on by
+default — or raise the ceiling to cover the largest answer your clients ask
+for.
+
 ### Rate limiting
 
 ```yaml
@@ -481,7 +621,10 @@ the source address said. That is what makes any resolver an amplifier: a 40-byte
 query with an OPT record advertising 4096 buys the sender two orders of magnitude
 of traffic aimed at whoever they named, and DNSSEC and `ANY` answers are the
 usual way to get the most of it. A spoofed source port of 53 pointed at another
-resolver is the same trick made into a loop between the two.
+resolver is the same trick made into a loop between the two. How much one
+datagram can be is capped separately, by
+[`server.max_udp_response`](#how-large-a-udp-answer-may-be); this is the cap on
+how many of them.
 
 What bounds it is a budget on how much this server will send *to one place*. The
 sender's own rate is not worth measuring — they are not the ones receiving it,
@@ -496,16 +639,26 @@ where the handshake proves the address. A client behind a genuinely busy NAT
 therefore keeps resolving, one round trip slower; a spoofed source cannot follow
 it up. Set `slip: 0` to drop them instead and answer nothing.
 
-500 responses a second to one /24 is far past what a household or an office
-behind one NAT asks for and far below what makes reflection worth an attacker's
-bandwidth, which is why it is on by default. The accounting is a fixed table of
+500 responses a second to one /24 — about 600 KB/s at the 1232-byte response
+ceiling — is far past what a household or an office behind one NAT asks for and
+far below what makes reflection worth an attacker's bandwidth, which is why it
+is on by default. The accounting is a fixed table of
 16,384 buckets — half a megabyte, allocated once — so the limiter is not itself
 somewhere to put pressure, and which prefixes share a bucket is decided by a key
 drawn at startup rather than by anything an attacker can work out.
 
 Two source addresses are refused outright before any of this: port 0, which
 nothing receives on, and this server's own listening endpoint, which is a query
-that would make it answer itself forever.
+that would make it answer itself forever. A source outside `server.allow_from`
+is refused earlier still — see [Who may ask](#who-may-ask), which is the bound
+on *whether* this server takes part in a reflection attack rather than on how
+much one gets out of it.
+
+Refusals are not charged to the budget, though the check sits right beside it.
+The budget is kept per /24, so a denied source in the same /24 as an allowed one
+would be spending its neighbour's: charging them would turn a narrowed allow
+list into a way to have the clients beside it dropped. Nothing is sent to a
+refused source, so there is nothing for a response budget to bound.
 
 TCP, DoT and DoH are not rate limited. A connection is established before a
 query arrives on one, so the address is already proven and there is nothing to
@@ -835,7 +988,10 @@ upstream traffic by the number of servers.
   queries multiplex onto one connection — but a worker is still held for the
   round trip. Async upstream I/O, or several UDP reader threads behind
   `SO_REUSEPORT`, would lift both this and the item above; neither is needed at
-  the scale measured in the previous section.
+  the scale measured in the previous section. A second UDP reader would have to
+  lock or shard the rate limiter's bucket table first — it is unlocked because
+  there is one reader, and a debug build asserts that rather than leaving it as
+  a comment for the change to quietly break.
 - **DNS cookies do not cover every query.** Only queries that already carry an
   OPT record are given one on the way upstream, so a non-EDNS client behind
   elodin gets no cookie protection unless DNSSEC validation is on — which it is

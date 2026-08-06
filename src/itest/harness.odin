@@ -114,6 +114,45 @@ check_eq_str :: proc(r: ^Runner, got, want: string, what: string) -> bool {
 	return check(r, got == want, "%s: got %q, want %q", what, got, want)
 }
 
+// --- running the binary directly -------------------------------------------
+
+Run_Result :: struct {
+	exit_code: int,
+	output:    string,
+	ok:        bool,
+}
+
+// Run the binary to completion with `args` and collect what it printed. For the
+// one-shot modes - `--version`, `--check` - that never bind a socket.
+run_binary :: proc(r: ^Runner, args: []string, tag: string) -> Run_Result {
+	out_path := filepath.join({r.work_dir, fmt.tprintf("cli-%s.txt", tag)}, context.temp_allocator) or_else ""
+	out_file, oerr := os.open(out_path, {.Write, .Create, .Trunc}, os.Permissions_Read_All + {.Write_User})
+	if oerr != nil {
+		return {}
+	}
+
+	command := make([dynamic]string, 0, len(args) + 1, context.temp_allocator)
+	append(&command, r.binary)
+	append(&command, ..args)
+
+	process, perr := os.process_start(
+		os.Process_Desc{command = command[:], stdout = out_file, stderr = out_file},
+	)
+	if perr != nil {
+		os.close(out_file)
+		return {}
+	}
+	state, werr := os.process_wait(process)
+	os.close(out_file)
+	if werr != nil {
+		return {}
+	}
+
+	data, rerr := os.read_entire_file(out_path, context.temp_allocator)
+	text := rerr == nil ? string(data) : ""
+	return Run_Result{exit_code = state.exit_code, output = text, ok = true}
+}
+
 // --- server lifecycle ------------------------------------------------------
 
 Server_Options :: struct {
@@ -242,6 +281,26 @@ wait_ready :: proc(srv: ^Server, timeout: time.Duration) -> bool {
 		if res.ok {
 			return true
 		}
+	}
+	return false
+}
+
+/*
+Probe by reading the log instead of by asking a question.
+
+For a server that is configured not to answer this suite - the `allow_from`
+cases, which have to ask from a source outside the list - the UDP probe above
+can never succeed, and waiting for it would only measure the timeout. The line
+the listeners print once they are bound says the same thing without needing an
+answer.
+*/
+wait_listening :: proc(srv: ^Server, needle: string, timeout: time.Duration) -> bool {
+	deadline := time.time_add(time.now(), timeout)
+	for time.diff(deadline, time.now()) < 0 {
+		if log_contains(srv, needle) {
+			return true
+		}
+		time.sleep(20 * time.Millisecond)
 	}
 	return false
 }

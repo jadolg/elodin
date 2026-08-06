@@ -87,6 +87,19 @@ Rate_Limiter :: struct {
 	the table's layout is unknown outside this process.
 	*/
 	hash_key:  [16]u8,
+	/*
+	The thread that has called `rate_check`, claimed on the first call.
+
+	The bucket table has no lock because one thread reads the UDP socket, and
+	that is an assumption in a doc comment rather than anything the code
+	enforces. A second reader - the obvious next step if the read loop ever
+	becomes the bottleneck - would not fail loudly: `tokens` would tear, `over`
+	increments would be lost, and the limiter would under-count at exactly the
+	moment it is counting something. So the assumption is written down as state
+	and checked, which turns a silent loss of correctness into a failure the
+	first run finds.
+	*/
+	owner:     int,
 	allocator: mem.Allocator,
 	// Counted here rather than in Stats because these are properties of the
 	// limiter, and read by tests.
@@ -131,7 +144,9 @@ Charge one response to `client`'s prefix and say what to do with it.
 
 Called from the UDP read loop and from nowhere else. That loop is one thread,
 which is why nothing here is locked; a second reader would need this table to be
-locked or split per thread.
+locked or split per thread. Under `-debug` the first caller claims the limiter
+and a second one asserts, so that requirement is enforced rather than merely
+recorded here - see `claim_reader`.
 
 `now` is passed in rather than read here so a test can run a bucket through an
 hour in a few microseconds.
@@ -139,6 +154,9 @@ hour in a few microseconds.
 rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) -> Rate_Verdict {
 	if r == nil {
 		return .Allow
+	}
+	when ODIN_DEBUG {
+		assert(claim_reader(r), "rate_check called from a second thread; the bucket table is not locked")
 	}
 
 	key := prefix_key(r, client.address)
@@ -182,6 +200,30 @@ rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) -> Ra
 		return .Truncate
 	}
 	return .Drop
+}
+
+/*
+Take ownership of the limiter for this thread, or report that somebody else has
+it.
+
+Compiled into every build and called only from the debug one, so the check costs
+nothing where it would be paid for and is still a procedure a test can call
+directly - which matters, because the failure it guards against is one that
+needs two threads to produce and `assert` is the wrong instrument for a test to
+observe.
+
+The exchange is what makes the first caller the owner without a lock: two
+threads racing to claim an unowned limiter both see zero, both write, and the
+one whose write landed second reads back an id that is not its own.
+*/
+@(private)
+claim_reader :: proc(r: ^Rate_Limiter) -> bool {
+	me := sync.current_thread_id()
+	if owner := sync.atomic_load(&r.owner); owner != 0 {
+		return owner == me
+	}
+	previous, _ := sync.atomic_compare_exchange_strong(&r.owner, 0, me)
+	return previous == 0 || previous == me
 }
 
 @(private)

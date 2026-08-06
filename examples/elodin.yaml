@@ -45,6 +45,57 @@ server:
   user: ""
   group: ""
 
+  # Networks a query is accepted from. Anything else is dropped over UDP and
+  # has its connection closed over TCP, DoT and DoH — before the message is
+  # parsed, so a source that is not on the list costs a prefix compare.
+  #
+  # The default below is the shipped one: loopback, the RFC 1918 ranges, and
+  # IPv6 loopback, unique local and link-local. It is what stops a resolver
+  # bound to 0.0.0.0 on a public address from being an open resolver, which is
+  # the condition every open-resolver scanner is looking for. Rate limiting
+  # bounds how much one victim can be made to receive; it does not stop this
+  # server from taking part.
+  #
+  # Add your own networks rather than editing these out — a list here replaces
+  # the default rather than adding to it. Note that carrier-grade NAT
+  # (100.64.0.0/10, which Tailscale also uses) is deliberately not included.
+  #
+  # An empty list — `allow_from: []` — means no restriction, for a resolver
+  # that is meant to be public. Say it on purpose; it is warned about at
+  # startup. Note the brackets: `allow_from:` with nothing after it is refused
+  # rather than read as either the default or its opposite.
+  #
+  # A refused client is told nothing — nothing is sent over UDP, and the
+  # connection is closed over TCP, DoT and DoH — so the first refusal since
+  # start is logged at warn naming the source and this setting, and every one
+  # after it at debug.
+  allow_from:
+    - 127.0.0.0/8
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 169.254.0.0/16
+    - ::1/128
+    - fc00::/7
+    - fe80::/10
+
+  # Largest UDP response this server will send, whatever the client's OPT
+  # record asked for. 512–4096; 1232 is the DNS Flag Day 2020 figure and the
+  # default.
+  #
+  # A client's advertised buffer arrives on a datagram nobody verified, so an
+  # attacker aiming answers at somebody else advertises the largest one it can
+  # — that number is the amplification factor, and this is the ceiling on it.
+  # It also sets what `rate_limit` below is denominated in: 500 responses a
+  # second is about 600 KB/s at 1232 and about 2 MB/s at 4096.
+  #
+  # The cost is a TC bit, and a retry over TCP, on any answer between this and
+  # what the client asked for. Measured against the 129 names of the DNSSEC
+  # survey, that is no A or AAAA answer at all and five DNSKEY answers — see
+  # bench/results/2026-08-06-edns-response-sizes.md. If a truncation does
+  # happen, the log says so and names this setting.
+  max_udp_response: 1232
+
   # Response rate limiting, per client prefix (/24 for IPv4, /64 for IPv6).
   #
   # A UDP answer goes wherever the source address said, so a resolver that

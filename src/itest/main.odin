@@ -125,6 +125,12 @@ main :: proc() {
 	section(&r, "rate limiting")
 	run_rate_limit_cases(&r)
 
+	section(&r, "client access control")
+	run_acl_cases(&r)
+
+	section(&r, "udp response ceiling")
+	run_udp_size_cases(&r)
+
 	section(&r, "cache")
 	run_cache_cases(&r)
 	run_cache_bytes_cases(&r)

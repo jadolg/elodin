@@ -202,6 +202,31 @@ sizing_line :: proc(s: config.Server_Config) -> string {
 	)
 }
 
+/*
+One line saying who may ask.
+
+Printed on every start and under `--check`, for the same reason as the sizing
+line: the default was never written in anybody's file, so an operator debugging
+a client that gets no answer has nowhere else to read it. The empty list gets a
+warning rather than a line, because a resolver reachable from the internet that
+answers all of it is the condition every open-resolver scanner is looking for,
+and an operator who meant it should still see it said out loud once a start.
+*/
+@(private)
+allow_from_line :: proc(s: config.Server_Config) -> string {
+	if len(s.allow_from) == 0 {
+		return "server.allow_from is empty: queries are answered from any source, including the internet"
+	}
+	texts := make([]string, len(s.allow_from), context.temp_allocator)
+	for p, i in s.allow_from {
+		texts[i] = config.format_prefix(p, context.temp_allocator)
+	}
+	return fmt.tprintf(
+		"answering queries from %s; every other source is refused",
+		strings.join(texts, ", ", context.temp_allocator),
+	)
+}
+
 main :: proc() {
 	// Writing to a socket whose peer has gone away raises SIGPIPE, whose
 	// default disposition kills the process. A client hanging up mid-answer is
@@ -255,11 +280,17 @@ main :: proc() {
 		fmt.printfln("%s is valid: %d upstreams, %d blocklists, %d rewrites",
 			opts.config_path, len(cfg.upstream.servers), len(cfg.blocking.lists), len(cfg.rewrites))
 		fmt.printfln("  %s", sizing_line(cfg.server))
+		fmt.printfln("  %s", allow_from_line(cfg.server))
 		return
 	}
 
 	logx.infof("elodin %s starting", server.VERSION)
 	logx.infof("%s", sizing_line(cfg.server))
+	if len(cfg.server.allow_from) == 0 {
+		logx.warnf("%s", allow_from_line(cfg.server))
+	} else {
+		logx.infof("%s", allow_from_line(cfg.server))
+	}
 	run(&cfg, opts, service)
 }
 
@@ -482,13 +513,14 @@ report :: proc(s: ^server.Server, answers: ^cache.Cache) {
 	cs := cache.stats(answers)
 	limited, slipped := server.rate_limit_stats(s.limiter)
 	logx.infof(
-		"stats: queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d limited=%d truncated=%d secure=%d bogus=%d | cache entries=%d bytes=%d hits=%d misses=%d evictions=%d",
+		"stats: queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d refused=%d limited=%d truncated=%d secure=%d bogus=%d | cache entries=%d bytes=%d hits=%d misses=%d evictions=%d",
 		st.queries,
 		st.blocked,
 		st.cached,
 		st.forwarded,
 		st.failed,
 		st.dropped,
+		st.refused,
 		limited,
 		slipped,
 		st.secure,

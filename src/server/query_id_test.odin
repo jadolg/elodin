@@ -291,20 +291,20 @@ test_forwarded_query_id_is_not_the_client_id :: proc(t: ^testing.T) {
 	seen: map[u16]bool
 	defer delete(seen)
 
-	for i in 0 ..< DRAWS {
+	// See the assertion below: counted across the draws rather than asserted on
+	// each one, because a fresh draw is allowed to land here by chance.
+	coincidences := 0
+
+	for _ in 0 ..< DRAWS {
 		query := id_client_query()
 		forwarded_id, out, outcome, ok := forward_once(t, &h, query)
 		if !ok {
 			return
 		}
 		testing.expectf(t, outcome == .Forwarded, "expected the forwarded path, got %v", outcome)
-		testing.expectf(
-			t,
-			forwarded_id != CLIENT_ID,
-			"draw %d: the upstream was asked with the client's own transaction id %04x",
-			i,
-			forwarded_id,
-		)
+		if forwarded_id == CLIENT_ID {
+			coincidences += 1
+		}
 		seen[forwarded_id] = true
 
 		// The client is waiting on the ID it wrote, so that is what comes back.
@@ -312,6 +312,26 @@ test_forwarded_query_id_is_not_the_client_id :: proc(t: ^testing.T) {
 		testing.expect(t, id_ok, "the response is too short to carry an id")
 		testing.expectf(t, id == CLIENT_ID, "the client got id %04x back, not its own %04x", id, CLIENT_ID)
 	}
+
+	/*
+	Coincidence is not a copy.
+
+	A fresh 16-bit draw lands on whatever the client happened to ask with about
+	once in 65536, so across 32 draws it happens about once in 2000 runs: rare
+	enough to be a surprise in CI and certain enough to turn up eventually. It
+	is not what this test is for. An ID carried across from the client is
+	carried across every time, so the failure being watched for is DRAWS of
+	these rather than one - and two by chance is about one run in ten million.
+	Counting them separates the two; asserting on each draw cannot.
+	*/
+	testing.expectf(
+		t,
+		coincidences <= 1,
+		"%d of %d queries went upstream with the client's own transaction id %04x",
+		coincidences,
+		DRAWS,
+		CLIENT_ID,
+	)
 
 	/*
 	Distinctness is what makes the ID worth anything: a single fresh value

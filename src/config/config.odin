@@ -86,6 +86,18 @@ production.
 */
 MIN_CACHE_BYTES :: 1024 * 1024
 
+/*
+The bounds on `server.max_udp_response`, and where it sits by default.
+
+512 is what a client that sent no OPT record gets and the smallest response any
+resolver has to be able to send, so there is nothing below it to choose. 4096 is
+the largest buffer this server will believe a client's OPT record about, and so
+the largest ceiling there is any point setting.
+*/
+MIN_UDP_RESPONSE :: 512
+MAX_UDP_RESPONSE :: 4096
+DEFAULT_MAX_UDP_RESPONSE :: 1232
+
 Cache_Config :: struct {
 	enabled:      bool,
 	max_entries:  int,
@@ -332,6 +344,37 @@ Server_Config :: struct {
 	user:             string,
 	// Group to go with `user`. Empty takes the user's primary group.
 	group:            string,
+	/*
+	Networks a query is accepted from, in CIDR form. See `acl.odin`.
+
+	Defaults to the local networks, so an installation nobody has configured
+	serves the machine and the network it is on rather than the internet. An
+	empty list is no restriction, for a resolver that is meant to be public.
+	*/
+	allow_from:       []Prefix,
+	/*
+	The largest UDP response this server will send, whatever the client asked
+	for.
+
+	A client advertises a buffer size in its OPT record, and an attacker
+	spoofing a victim's address advertises the largest one it can get away with:
+	that number is the amplification factor. A 40-byte query claiming 4096 buys
+	roughly a hundredfold, and the rate limiter's per-/24 budget is denominated
+	in it - 500 responses a second at 4096 is about 2 MB/s aimed at one network,
+	and at 1232 about 600 KB/s.
+
+	1232 is the DNS Flag Day 2020 figure and what most resolvers advertise now.
+	It costs a TC bit, and a retry over TCP, on any answer between it and what
+	the client asked for. Measured against the survey in `bench/results/`, that
+	is no A or AAAA answer at all and five DNSKEY answers out of 129, so the
+	cost against real traffic is close to nothing and the ceiling it removes is
+	one only a zone built to fill it ever reached.
+
+	Raise it, up to 4096, on a network whose path MTU is known to carry large
+	datagrams and where the resolver is not reachable by anyone who would abuse
+	it. Below 512 there is nothing sensible to send, so that is the floor.
+	*/
+	max_udp_response: int,
 	rate_limit:       Rate_Limit_Config,
 	// What the two worker counts were derived from, when they were. Not a
 	// setting: filled in at load so startup and `--check` can report it.
@@ -382,6 +425,12 @@ default_config :: proc() -> Config {
 		client_timeout   = 10 * time.Second,
 		max_connections  = 512,
 		max_pending      = 0,
+		// The local networks, and nothing else: a resolver that has not been
+		// configured must not be an open one. See `DEFAULT_ALLOW_FROM`.
+		allow_from       = DEFAULT_ALLOW_FROM,
+		// The DNS Flag Day 2020 figure. See the field, and the measurement in
+		// bench/results/2026-08-06-edns-response-sizes.md.
+		max_udp_response = DEFAULT_MAX_UDP_RESPONSE,
 		/*
 		On by default, and generous.
 
