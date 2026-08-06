@@ -1,6 +1,7 @@
 package config
 
 import "core:fmt"
+import "core:io"
 import "core:os"
 import "core:strconv"
 import "core:strings"
@@ -132,20 +133,47 @@ derive_upstream_workers :: proc(workers: int) -> int {
 
 // What this process can see of the machine, at the moment it asks.
 probe_machine :: proc() -> (m: Machine) {
+	/*
+	Read once and pass it down: both limits live in the hierarchies this file
+	names, and a process that moved cgroups between the two reads would be
+	sized against two different machines.
+
+	4 KiB because procfs hands out a page at a time and a hybrid host lists one
+	line per v1 controller plus the unified one - which procfs prints last, so a
+	buffer that cuts the file short is a buffer that loses the line cgroup v2
+	detection depends on.
+	*/
+	cgroup_buf: [4096]u8
+	cgroups, has_cgroups := read_small_file("/proc/self/cgroup", cgroup_buf[:])
+
 	// Affinity rather than the CPU count: a process pinned to two cores of a
 	// sixty-four core box is running on a two-core machine.
 	m.cpus = os.get_processor_core_count()
-	if quota, ok := cgroup_cpus(); ok && (m.cpus == 0 || quota < m.cpus) {
-		m.cpus = quota
+	if has_cgroups {
+		if quota, ok := cgroup_cpus(cgroups); ok && (m.cpus == 0 || quota < m.cpus) {
+			m.cpus = quota
+		}
 	}
 	if total, _, _, _, ok := si.ram_stats(); ok {
 		m.memory = total
 	}
-	if limit, ok := cgroup_memory(); ok && (m.memory == 0 || limit < m.memory) {
-		m.memory = limit
+	if has_cgroups {
+		if limit, ok := cgroup_memory(cgroups); ok && (m.memory == 0 || limit < m.memory) {
+			m.memory = limit
+		}
 	}
 	return
 }
+
+// Where the cgroup hierarchies are mounted, which is the same everywhere a
+// distribution has not gone out of its way. Under v1 each controller has a
+// hierarchy of its own; under v2 there is one for all of them.
+@(private)
+V2_MOUNT :: "/sys/fs/cgroup"
+@(private)
+V1_CPU_MOUNT :: "/sys/fs/cgroup/cpu"
+@(private)
+V1_MEMORY_MOUNT :: "/sys/fs/cgroup/memory"
 
 /*
 The CPU allowance of the cgroup this process is in, in whole CPUs.
@@ -154,63 +182,119 @@ Worth reading because affinity does not see it: `docker run --cpus 0.5` and
 systemd's `CPUQuota=` both leave every CPU in the mask and throttle instead, so
 without this a container limited to half a core would size itself for the host.
 Rounded up - half a CPU is still a machine that can run one worker's worth of
-work - and read from the process's own cgroup path, which is what a container
-gets in its own cgroup namespace.
+work - and read from the process's own cgroup path rather than the hierarchy
+root, for the reason `cgroup_file` gives.
 */
 @(private)
-cgroup_cpus :: proc() -> (cpus: int, ok: bool) {
-	buf: [256]u8
+cgroup_cpus :: proc(cgroups: string) -> (cpus: int, ok: bool) {
+	value_buf: [256]u8
 	path_buf: [512]u8
 	// cgroup v2: "$MAX $PERIOD", where $MAX is "max" when there is no limit.
-	if path, found := cgroup_v2_file(path_buf[:], "cpu.max"); found {
-		if text, read_ok := read_small_file(path, buf[:]); read_ok {
+	if path, found := cgroup_file(path_buf[:], cgroups, V2_MOUNT, "", "cpu.max"); found {
+		if text, read_ok := read_small_file(path, value_buf[:]); read_ok {
 			return parse_cpu_max(text)
 		}
 	}
-	// cgroup v1 keeps the two halves in separate files, and a quota of -1 is
-	// the unlimited case.
+	// cgroup v1 keeps the two halves in separate files, under the hierarchy
+	// mounted for the `cpu` controller, and a quota of -1 is the unlimited case.
+	quota_path_buf: [512]u8
+	period_path_buf: [512]u8
+	quota_path := cgroup_file(quota_path_buf[:], cgroups, V1_CPU_MOUNT, "cpu", "cpu.cfs_quota_us") or_return
+	period_path := cgroup_file(period_path_buf[:], cgroups, V1_CPU_MOUNT, "cpu", "cpu.cfs_period_us") or_return
 	quota_buf: [64]u8
 	period_buf: [64]u8
-	quota_text := read_small_file("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", quota_buf[:]) or_return
-	period_text := read_small_file("/sys/fs/cgroup/cpu/cpu.cfs_period_us", period_buf[:]) or_return
+	quota_text := read_small_file(quota_path, quota_buf[:]) or_return
+	period_text := read_small_file(period_path, period_buf[:]) or_return
 	quota := strconv.parse_i64(strings.trim_space(quota_text)) or_return
 	period := strconv.parse_i64(strings.trim_space(period_text)) or_return
 	return cpus_from_quota(quota, period)
 }
 
 /*
-Where a cgroup v2 interface file for *this* process lives.
+Where a cgroup interface file for *this* process lives.
 
 The controller files are not on the root cgroup, so `/sys/fs/cgroup/memory.max`
 exists only when something has put this process somewhere - which is exactly
-when it has a limit. `/proc/self/cgroup` names that somewhere: "0::/" inside a
-container with its own cgroup namespace, "0::/system.slice/elodin.service"
-under the systemd unit. One path covers both, which is why `MemoryMax=` in the
-unit and `docker run -m` end up meaning the same thing here.
+when it has a limit. `/proc/self/cgroup` names that somewhere, so one path
+covers a container, a systemd unit and a hand-made cgroup alike, and it is why
+`MemoryMax=` in the unit and `docker run -m` end up meaning the same thing here.
+Reading the mounted hierarchy directly would not: under cgroup v1 a container
+gets its own cgroup remapped to the mount root, but a plain systemd host does
+not, so `/sys/fs/cgroup/memory/memory.limit_in_bytes` there is the root group's
+- unlimited, whatever the unit says.
 
-Only this process's own cgroup, not the ancestors it inherits limits from. Both
-of the cases above put the limit on the leaf, and reading the whole chain to
-catch a hand-built hierarchy is more machinery than a default is worth: what it
-would miss is a limit an operator can still name a worker count under.
+Only this process's own cgroup, not the ancestors it inherits limits from. Every
+case above puts the limit on the leaf, and reading the whole chain to catch a
+hand-built hierarchy is more machinery than a default is worth: what it would
+miss is a limit an operator can still name a worker count under.
 */
 @(private)
-cgroup_v2_file :: proc(buf: []u8, leaf: string) -> (path: string, ok: bool) {
-	line_buf: [1024]u8
-	text := read_small_file("/proc/self/cgroup", line_buf[:]) or_return
+cgroup_file :: proc(buf: []u8, cgroups, mount, controller, leaf: string) -> (path: string, ok: bool) {
+	rel := cgroup_rel_path(cgroups, controller) or_return
+	// The root cgroup is "/", and joining that would ask for
+	// "/sys/fs/cgroup//memory.max".
+	if rel == "/" {
+		rel = ""
+	}
+	return fmt.bprintf(buf, "%s%s/%s", mount, rel, leaf), true
+}
+
+/*
+This process's path within one cgroup hierarchy, from the text of
+`/proc/self/cgroup`.
+
+Every line is "$ID:$CONTROLLERS:$PATH". The unified hierarchy that cgroup v2
+uses is the line with no controllers at all - "0::/" inside a container with its
+own cgroup namespace, "0::/system.slice/elodin.service" under the systemd unit -
+so an empty `controller` asks for that one. A v1 hierarchy is named by any of the
+controllers mounted together on it, which is why "cpu" has to match one field of
+"cpu,cpuacct" rather than the whole of it.
+
+The path may itself contain a colon, since a systemd unit name may, so only the
+first two are separators.
+*/
+@(private)
+cgroup_rel_path :: proc(cgroups: string, controller: string) -> (rel: string, ok: bool) {
+	text := cgroups
 	for line in strings.split_lines_iterator(&text) {
-		rel := strings.trim_space(line)
-		if !strings.has_prefix(rel, "0::/") {
+		entry := strings.trim_space(line)
+		id_end := strings.index_byte(entry, ':')
+		if id_end < 0 {
 			continue
 		}
-		rel = rel[3:]
-		// The root cgroup is "/", and joining that would ask for
-		// "/sys/fs/cgroup//memory.max".
-		if rel == "/" {
-			rel = ""
+		rest := entry[id_end + 1:]
+		names_end := strings.index_byte(rest, ':')
+		if names_end < 0 {
+			continue
 		}
-		return fmt.bprintf(buf, "/sys/fs/cgroup%s/%s", rel, leaf), true
+		if !cgroup_hierarchy_has(rest[:names_end], controller) {
+			continue
+		}
+		path := rest[names_end + 1:]
+		// Anything that is not an absolute path is not a cgroup this can join
+		// to a mount point.
+		if !strings.has_prefix(path, "/") {
+			continue
+		}
+		return path, true
 	}
 	return "", false
+}
+
+// Whether a hierarchy's comma-separated controller list is the one asked for.
+// An empty `controller` means the v2 unified hierarchy, which carries no names.
+@(private)
+cgroup_hierarchy_has :: proc(names: string, controller: string) -> bool {
+	if controller == "" {
+		return names == ""
+	}
+	rest := names
+	for name in strings.split_iterator(&rest, ",") {
+		if name == controller {
+			return true
+		}
+	}
+	return false
 }
 
 // "max 100000" leaves the CPU count to affinity; "50000 100000" is half a CPU.
@@ -247,15 +331,16 @@ unit lands here too, which makes it a way to say how large elodin should
 consider itself without naming a worker count.
 */
 @(private)
-cgroup_memory :: proc() -> (bytes: i64, ok: bool) {
+cgroup_memory :: proc(cgroups: string) -> (bytes: i64, ok: bool) {
 	buf: [64]u8
 	path_buf: [512]u8
-	if path, found := cgroup_v2_file(path_buf[:], "memory.max"); found {
+	if path, found := cgroup_file(path_buf[:], cgroups, V2_MOUNT, "", "memory.max"); found {
 		if text, read_ok := read_small_file(path, buf[:]); read_ok {
 			return parse_memory_max(text)
 		}
 	}
-	text := read_small_file("/sys/fs/cgroup/memory/memory.limit_in_bytes", buf[:]) or_return
+	v1_path := cgroup_file(path_buf[:], cgroups, V1_MEMORY_MOUNT, "memory", "memory.limit_in_bytes") or_return
+	text := read_small_file(v1_path, buf[:]) or_return
 	return parse_memory_max(text)
 }
 
@@ -286,6 +371,12 @@ Read a small pseudo-file into a caller-supplied buffer.
 path allocates nothing and reads nothing. Everything read here is a line or two,
 so a stack buffer covers it and the config loader stays free of allocations it
 would have to own.
+
+Read to the end rather than trusting one `read`, and refuse a buffer that filled
+completely: half of "10737418240" is "1073", which parses as cleanly as the whole
+of it and would be a limit off by seven orders of magnitude. Nothing read here is
+long enough for that to bind, so a truncation means something is not the file
+this expected, and no limit is a better answer than a wrong one.
 */
 @(private)
 read_small_file :: proc(path: string, buf: []u8) -> (text: string, ok: bool) {
@@ -294,8 +385,25 @@ read_small_file :: proc(path: string, buf: []u8) -> (text: string, ok: bool) {
 		return "", false
 	}
 	defer os.close(f)
-	n, read_err := os.read(f, buf)
-	if read_err != nil || n <= 0 {
+	n := 0
+	for n < len(buf) {
+		got, read_err := os.read(f, buf[n:])
+		n += got
+		// The end of the file arrives as `io.EOF` rather than a zero-length
+		// read, so it has to be named: treating every error as a failure would
+		// throw away the bytes that were read, and treating every error as the
+		// end would accept a file that stopped halfway through a number.
+		if read_err == io.Error.EOF {
+			break
+		}
+		if read_err != nil {
+			return "", false
+		}
+		if got == 0 {
+			break
+		}
+	}
+	if n <= 0 || n == len(buf) {
 		return "", false
 	}
 	return string(buf[:n]), true

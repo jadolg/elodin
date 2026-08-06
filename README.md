@@ -780,13 +780,16 @@ Memory, for a full configuration under load:
 | | |
 |---|---|
 | idle, no lists | 11 MB |
-| worker scratch arenas | ~0.26 MB per worker (34 MB at 128) |
+| worker scratch arenas | ~0.26 MB per worker (34 MB at a 128-worker pool) |
 | blocklists | ~129 B per rule (31 MB for 250,000 rules) |
 | answer cache | ~463 B per entry (4 MB at the default 10,000) |
 | **realistic total under load** | **154 MB** with 250,000 rules and 180,000 cached answers |
 
 Each row but the first is a difference between two runs that vary in one thing,
 so the cache is not charged for the worker arenas that the same load brings up.
+The worker row is measured against a pinned 128-worker pool, which the
+benchmarks name explicitly rather than derive; a machine that derives 16 pays
+4 MB there instead of 34, and the total below moves with it.
 
 The cache row is a *typical* entry, not a bound. An entry holds the response as
 it arrived — up to 64 KiB, since a query over TCP, DoT or DoH is answered with

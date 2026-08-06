@@ -833,17 +833,20 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	Done here rather than at startup so that `--check` and the run that follows
 	it agree by construction, and so an operator can see on the machine itself
 	what the file leaves unsaid.
+
+	The machine is measured only when `workers` is the number that needs it. A
+	racer count derived from a configured `workers` owes nothing to the CPUs or
+	the RAM, and reporting a machine it never consulted would tell an operator
+	their own number came from the hardware.
 	*/
-	if cfg.server.workers == 0 || cfg.server.upstream_workers == 0 {
+	if cfg.server.workers == 0 {
 		cfg.server.sizing.machine = probe_machine()
-		if cfg.server.workers == 0 {
-			cfg.server.workers = derive_workers(cfg.server.sizing.machine)
-			cfg.server.sizing.derived_workers = true
-		}
-		if cfg.server.upstream_workers == 0 {
-			cfg.server.upstream_workers = derive_upstream_workers(cfg.server.workers)
-			cfg.server.sizing.derived_upstream_workers = true
-		}
+		cfg.server.workers = derive_workers(cfg.server.sizing.machine)
+		cfg.server.sizing.derived_workers = true
+	}
+	if cfg.server.upstream_workers == 0 {
+		cfg.server.upstream_workers = derive_upstream_workers(cfg.server.workers)
+		cfg.server.sizing.derived_upstream_workers = true
 	}
 	if cfg.server.rate_limit.enabled {
 		if cfg.server.rate_limit.responses_per_second < 1 {

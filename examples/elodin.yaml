@@ -24,7 +24,7 @@ server:
   # or systemd CPU/memory limit counts for more than what the host has. The
   # numbers it settled on are in the first lines of the log and in `--check`.
   workers: 0
-  upstream_workers: 0  # threads used by the "race" strategy; 0 is half of `workers`
+  upstream_workers: 0 # threads used by the "race" strategy; 0 is half of `workers`
   max_connections: 512 # concurrent TCP / DoT / DoH connections
   client_timeout: 10s
   # Queries queued or in flight before new ones are dropped. 0 derives it as

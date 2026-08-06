@@ -119,6 +119,102 @@ test_parse_memory_max :: proc(t: ^testing.T) {
 }
 
 /*
+The path a limit is read from, which is the one thing here that cannot be
+checked by running it: the file that exists is the file this process's own
+cgroup owns, and a test cannot put itself in one.
+
+The v2 lines are the two shapes that matter - a container with its own cgroup
+namespace, and a systemd unit - and the v1 lines are why the mounted hierarchy
+cannot be read directly.
+*/
+@(test)
+test_cgroup_file_finds_this_processes_own_cgroup :: proc(t: ^testing.T) {
+	buf: [512]u8
+
+	// A container with its own cgroup namespace: the leaf is the root it sees,
+	// and joining "/" would ask for "/sys/fs/cgroup//memory.max".
+	path, ok := cgroup_file(buf[:], "0::/\n", V2_MOUNT, "", "memory.max")
+	testing.expect(t, ok, "the unified hierarchy should be found")
+	testing.expect_value(t, path, "/sys/fs/cgroup/memory.max")
+
+	// Under the systemd unit, where the limit `MemoryMax=` sets lives.
+	path, ok = cgroup_file(buf[:], "0::/system.slice/elodin.service\n", V2_MOUNT, "", "memory.max")
+	testing.expect(t, ok, "a unit's cgroup should be found")
+	testing.expect_value(t, path, "/sys/fs/cgroup/system.slice/elodin.service/memory.max")
+
+	// A hybrid host lists a line per v1 controller and prints the unified one
+	// last, so the unified line has to be picked out rather than assumed first.
+	hybrid := "8:memory:/user.slice\n4:cpu,cpuacct:/user.slice\n0::/user.slice/app.scope\n"
+	path, ok = cgroup_file(buf[:], hybrid, V2_MOUNT, "", "cpu.max")
+	testing.expect(t, ok, "the unified line should be found among v1 ones")
+	testing.expect_value(t, path, "/sys/fs/cgroup/user.slice/app.scope/cpu.max")
+
+	// v1, where the controller names the hierarchy - and "cpu" is one field of
+	// a list rather than the whole of it.
+	path, ok = cgroup_file(buf[:], hybrid, V1_CPU_MOUNT, "cpu", "cpu.cfs_quota_us")
+	testing.expect(t, ok, "a v1 hierarchy should be found by one of its controllers")
+	testing.expect_value(t, path, "/sys/fs/cgroup/cpu/user.slice/cpu.cfs_quota_us")
+
+	path, ok = cgroup_file(buf[:], hybrid, V1_MEMORY_MOUNT, "memory", "memory.limit_in_bytes")
+	testing.expect(t, ok, "the v1 memory hierarchy should be found")
+	testing.expect_value(t, path, "/sys/fs/cgroup/memory/user.slice/memory.limit_in_bytes")
+
+	// A unit name may contain a colon, and the path is what follows the second
+	// one rather than what precedes the last.
+	path, ok = cgroup_file(buf[:], "0::/system.slice/dev-disk-by\\x2duuid:0.device\n", V2_MOUNT, "", "cpu.max")
+	testing.expect(t, ok, "a colon in the path should not be read as a separator")
+	testing.expect_value(t, path, "/sys/fs/cgroup/system.slice/dev-disk-by\\x2duuid:0.device/cpu.max")
+}
+
+// Nothing to join a mount point to is no limit, not a path near one.
+@(test)
+test_cgroup_file_refuses_what_it_cannot_place :: proc(t: ^testing.T) {
+	buf: [512]u8
+
+	// A pure v1 host has no unified line at all.
+	_, ok := cgroup_file(buf[:], "8:memory:/user.slice\n4:cpu:/user.slice\n", V2_MOUNT, "", "cpu.max")
+	testing.expect(t, !ok, "a host with no unified hierarchy should report none")
+
+	// And a v2 host has no v1 controllers, so the fallback must not invent one.
+	_, ok = cgroup_file(buf[:], "0::/user.slice\n", V1_CPU_MOUNT, "cpu", "cpu.cfs_quota_us")
+	testing.expect(t, !ok, "the unified line should not answer for a v1 controller")
+
+	// "cpuset" is not "cpu", however much of the name it shares.
+	_, ok = cgroup_file(buf[:], "4:cpuset,cpuacct:/user.slice\n", V1_CPU_MOUNT, "cpu", "cpu.cfs_quota_us")
+	testing.expect(t, !ok, "a controller should match a whole field")
+
+	_, ok = cgroup_file(buf[:], "", V2_MOUNT, "", "cpu.max")
+	testing.expect(t, !ok, "an empty /proc/self/cgroup should report nothing")
+	_, ok = cgroup_file(buf[:], "0::relative\n", V2_MOUNT, "", "cpu.max")
+	testing.expect(t, !ok, "a path that is not absolute cannot be joined to a mount")
+	_, ok = cgroup_file(buf[:], "garbage\n", V2_MOUNT, "", "cpu.max")
+	testing.expect(t, !ok, "a line that is not an entry should be skipped")
+}
+
+/*
+A truncated pseudo-file is refused rather than parsed.
+
+"1073" of "10737418240" is a limit off by seven orders of magnitude and parses
+as cleanly as the whole of it, so a buffer that filled has to be read as a file
+this did not understand.
+*/
+@(test)
+test_read_small_file_refuses_a_truncated_read :: proc(t: ^testing.T) {
+	// /proc/self/cmdline is longer than one byte and, unlike /sys, is here on
+	// every machine the tests run on.
+	tiny: [1]u8
+	_, ok := read_small_file("/proc/self/cmdline", tiny[:])
+	testing.expect(t, !ok, "a value that did not fit should be refused")
+
+	roomy: [4096]u8
+	_, ok = read_small_file("/proc/self/cmdline", roomy[:])
+	testing.expect(t, ok, "a value that fits should be read")
+
+	_, ok = read_small_file("/proc/elodin-does-not-exist", roomy[:])
+	testing.expect(t, !ok, "a missing file is not a limit")
+}
+
+/*
 The machine this test is running on, whatever it is, has to produce a usable
 pair. The exact numbers are not the assertion - they are the machine's - but
 the bounds are.
@@ -166,6 +262,9 @@ test_configured_workers_win :: proc(t: ^testing.T) {
 	testing.expect(t, !cfg.server.sizing.derived_workers, "a configured count is not a derived one")
 	testing.expect_value(t, cfg.server.upstream_workers, 20)
 	testing.expect(t, cfg.server.sizing.derived_upstream_workers, "the unset half should be derived from the set one")
+	// The machine was not measured, and must not be reported as though it had
+	// been: half of 40 is the file's doing, not the hardware's.
+	testing.expect_value(t, cfg.server.sizing.machine, Machine{})
 
 	both := "upstream:\n  servers: [1.1.1.1]\nserver:\n  workers: 40\n  upstream_workers: 40\n"
 	pair, perr := load_string(both, context.temp_allocator)
