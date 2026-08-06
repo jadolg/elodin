@@ -89,3 +89,38 @@ test_response_limit_floors_an_unset_ceiling :: proc(t: ^testing.T) {
 	testing.expect_value(t, response_limit(&s, dns.Message{}, .UDP), config.MIN_UDP_RESPONSE)
 	free_all(context.temp_allocator)
 }
+
+/*
+The snapshot carries every counter, and this is what makes that true.
+
+`stats_of` reads the live counters one at a time, so a counter added to `Stats`
+and not added here reports zero forever - which is worse than not reporting it,
+because the stats line still prints the name and an operator reads the zero as
+the answer. `refused` was exactly that: incremented on every refused datagram
+and connection, and absent from the snapshot the report is built from.
+
+Whole-struct equality rather than a field-by-field walk, because the failure
+being guarded against is a field nobody thought to check.
+*/
+@(test)
+test_stats_of_carries_every_counter :: proc(t: ^testing.T) {
+	// Distinct values, so a snapshot that reads the wrong field is a failure
+	// rather than a coincidence.
+	want := Stats {
+		queries   = 1,
+		blocked   = 2,
+		cached    = 3,
+		forwarded = 4,
+		failed    = 5,
+		rewritten = 6,
+		dropped   = 7,
+		refused   = 8,
+		secure    = 9,
+		bogus     = 10,
+	}
+	s := Server {
+		stats = want,
+	}
+	got := stats_of(&s)
+	testing.expectf(t, got == want, "stats_of did not carry every counter: got %v, want %v", got, want)
+}

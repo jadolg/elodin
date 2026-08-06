@@ -781,6 +781,7 @@ stats_of :: proc(s: ^Server) -> Stats {
 		failed = sync.atomic_load(&s.stats.failed),
 		rewritten = sync.atomic_load(&s.stats.rewritten),
 		dropped = sync.atomic_load(&s.stats.dropped),
+		refused = sync.atomic_load(&s.stats.refused),
 		secure = sync.atomic_load(&s.stats.secure),
 		bogus = sync.atomic_load(&s.stats.bogus),
 	}
