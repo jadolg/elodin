@@ -513,7 +513,7 @@ report :: proc(s: ^server.Server, answers: ^cache.Cache) {
 	cs := cache.stats(answers)
 	limited, slipped := server.rate_limit_stats(s.limiter)
 	logx.infof(
-		"stats: queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d refused=%d limited=%d truncated=%d secure=%d bogus=%d | cache entries=%d bytes=%d hits=%d misses=%d evictions=%d",
+		"stats: queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d refused=%d conn_refused=%d limited=%d truncated=%d secure=%d bogus=%d | cache entries=%d bytes=%d hits=%d misses=%d evictions=%d",
 		st.queries,
 		st.blocked,
 		st.cached,
@@ -521,6 +521,7 @@ report :: proc(s: ^server.Server, answers: ^cache.Cache) {
 		st.failed,
 		st.dropped,
 		st.refused,
+		st.conn_refused,
 		limited,
 		slipped,
 		st.secure,

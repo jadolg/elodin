@@ -608,21 +608,24 @@ had no part in it.
 
 The ceiling is also the number the answer's own OPT record reports. RFC 6891
 section 6.2.4 makes that field the *responder's* maximum, not a copy of the
-requestor's — the counterpart to `max-udp-size` in BIND and Unbound — so a client
-that advertises 4096 against the 1232 default is told **1232**, and against
-`max_udp_response: 4096` is told 4096. A client that asked for less than the
-ceiling is told its own figure, since that is the size its answers will actually
-go out at. A stub mostly ignores this; a forwarder chaining through elodin does
-not, and one told a number this server will never send sizes its buffers for an
-answer that cannot arrive and then pays for a TC bit and a TCP round trip it was
-told it would not need. It holds on every path — locally built answers, forwarded
-ones, cache hits, and answers re-encoded to carry a DNS cookie.
+requestor's — the counterpart to `max-udp-size` in BIND and Unbound, both of
+which report their own figure regardless of what was asked for. So a client that
+advertises 4096 against the 1232 default is told **1232**, and against
+`max_udp_response: 4096` is told 4096; a client that advertised only 512 is told
+1232 as well, because that is what this server can deliver, and the 512 it asked
+for still bounds the reply it gets. A stub mostly ignores the field; a forwarder
+chaining through elodin does not, and one told a number this server will never
+send sizes its buffers for an answer that cannot arrive and then pays for a TC
+bit and a TCP round trip it was told it would not need. It holds on every path —
+locally built answers, forwarded ones, cache hits, and answers re-encoded to
+carry a DNS cookie.
 
 The ceiling is UDP only. TCP, DoT and DoH establish a connection before a query
 arrives, so the address is proven, there is nothing to reflect, and an answer
-that fits is sent whole. The OPT record on those goes back carrying the client's
-own figure: the field bounds a datagram, and nothing on a stream is bounded by
-it.
+that fits is sent whole. The OPT record on those goes back exactly as the answer
+carried it — the client's own figure on a locally built answer, the upstream's on
+a forwarded or cached one — because the field bounds a datagram and nothing on a
+stream is bounded by it.
 
 That does mean a truncated answer needs somewhere to go: if you have turned
 `listeners.tcp` off, a client told to retry has nowhere to retry to, and the
@@ -887,6 +890,13 @@ WARN  tcp: refusing a connection, server.max_connections (512) is reached
 WARN    raise server.max_connections if this server should hold more clients at
         once; further refusals are logged at debug level
 ```
+
+The counting does not stop with the logging: every one of them is a
+`conn_refused=` in the stats line, so a server that has been sitting at its limit
+since long after that `warn` scrolled away still says so. It is kept apart from
+`refused=`, which is the allow list turning a source away — this is a client
+elodin would serve and has no room for, and the setting to reach for is a
+different one.
 
 The number that governs sizing is the sustained cache-miss row. A worker thread is occupied for
 the whole of an upstream round trip, so

@@ -323,11 +323,14 @@ formatting an address for every packet is a thing to be made to do only on
 purpose.
 
 `say` is false when nothing should be logged at all; `first` is true exactly
-once per flag, on the call that turned it.
+once per flag, on the call that turned it. `every` is whether the levels below
+`warn` are being written - the callers pass `logx.enabled(.Debug)`, and it is a
+parameter rather than a call in here so that what this decides can be asked both
+ways without moving a level the whole process shares.
 */
 @(private)
-report_once :: proc(reported: ^bool) -> (say: bool, first: bool) {
-	if sync.atomic_load(reported) && !logx.enabled(.Debug) {
+report_once :: proc(reported: ^bool, every: bool) -> (say: bool, first: bool) {
+	if sync.atomic_load(reported) && !every {
 		return false, false
 	}
 	return true, !sync.atomic_exchange(reported, true)
@@ -367,7 +370,7 @@ refusal_reported: bool
 
 @(private)
 report_refusal :: proc(client: net.Endpoint, proto: Protocol) {
-	say, first := report_once(&refusal_reported)
+	say, first := report_once(&refusal_reported, logx.enabled(.Debug))
 	if !say {
 		return
 	}
@@ -429,7 +432,7 @@ conn_limit_reported: bool
 
 @(private)
 report_conn_limit :: proc(proto: Protocol, limit: int) {
-	say, first := report_once(&conn_limit_reported)
+	say, first := report_once(&conn_limit_reported, logx.enabled(.Debug))
 	if !say {
 		return
 	}
@@ -743,11 +746,21 @@ accept_loop :: proc(data: rawptr) {
 		job.client = client
 
 		if !conn_spawn(&l.conns, job, stream_job) {
-			// Bounded the same way `report_refusal` is: this is a refusal a peer
-			// reaches by opening connections, so a line per attempt is a line
-			// rate whoever is opening them decides. `report_conn_limit` releases
-			// the temp arena the line was formatted out of - this loop is the one
-			// place that never resets it, and nothing here outlives the iteration.
+			/*
+			Counted first, and logged only once.
+
+			Bounded the same way `report_refusal` is: this is a refusal a peer
+			reaches by opening connections, so a line per attempt is a line rate
+			whoever is opening them decides. The counter is what makes that
+			demotion safe - a server sitting at its limit still shows a rising
+			`conn_refused=` in the stats line long after the one `warn` scrolled
+			away.
+
+			`report_conn_limit` releases the temp arena the line was formatted out
+			of: this loop is the one place that never resets it, and nothing here
+			outlives the iteration.
+			*/
+			sync.atomic_add(&ctx.server.stats.conn_refused, 1)
 			report_conn_limit(ctx.proto, l.conns.limit)
 			net.close(client_socket)
 			free(job)

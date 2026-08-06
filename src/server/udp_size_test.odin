@@ -273,10 +273,19 @@ test_a_local_answer_advertises_the_ceiling :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
-// A client that asked for less than the ceiling is told what it asked for: that
-// is the size an answer to it will actually go out at.
+/*
+A client that asked for less than the ceiling is still told the ceiling.
+
+The field is what this server can deliver, not the size of the reply in hand -
+that is bounded separately, by `response_limit`, and the two only agree when the
+client asked for at least the ceiling. Reporting the smaller number here would be
+the same defect the ticket is about, inverted: a downstream forwarder that
+advertised a conservative 512 would read 512 back, conclude this server cannot
+deliver more, and go on paying for TC bits and TCP retries the 1232 ceiling would
+have spared it.
+*/
 @(test)
-test_a_client_below_the_ceiling_is_told_its_own_figure :: proc(t: ^testing.T) {
+test_a_client_below_the_ceiling_is_still_told_the_ceiling :: proc(t: ^testing.T) {
 	cfg := config.default_config()
 	cfg.log.queries = false
 	cfg.cache.enabled = false
@@ -288,7 +297,9 @@ test_a_client_below_the_ceiling_is_told_its_own_figure :: proc(t: ^testing.T) {
 	query := client_query(512, "version.bind.", .TXT, .CH)
 	out, _, ok := handle_query(&s, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
 	testing.expect(t, ok, "the chaos query went unanswered")
-	testing.expect_value(t, int(dns.peek_udp_size(out)), 512)
+	testing.expect_value(t, int(dns.peek_udp_size(out)), config.DEFAULT_MAX_UDP_RESPONSE)
+	// And the answer itself is still held to what the client asked for.
+	testing.expectf(t, len(out) <= 512, "the answer is %d bytes, past the client's own buffer", len(out))
 
 	free_all(context.temp_allocator)
 }
@@ -363,12 +374,12 @@ test_a_cached_answer_advertises_the_ceiling_of_the_request :: proc(t: ^testing.T
 	testing.expect_value(t, outcome, Outcome.Cached)
 	testing.expect_value(t, int(dns.peek_udp_size(hit)), config.DEFAULT_MAX_UDP_RESPONSE)
 
-	// Same entry, a client that asked for less: the answer reports the smaller
-	// figure, because that is the size it will go out at.
+	// The same entry served to a client that asked for less reports the same
+	// number: the field is this server's, and it did not change between the two.
 	small, small_outcome, small_ok := handle_query(&h.srv, client_query(512), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	testing.expect(t, small_ok, "the second cached query went unanswered")
 	testing.expect_value(t, small_outcome, Outcome.Cached)
-	testing.expect_value(t, int(dns.peek_udp_size(small)), 512)
+	testing.expect_value(t, int(dns.peek_udp_size(small)), config.DEFAULT_MAX_UDP_RESPONSE)
 
 	free_all(context.temp_allocator)
 }
@@ -401,13 +412,16 @@ test_an_answer_carrying_a_cookie_advertises_the_ceiling :: proc(t: ^testing.T) {
 }
 
 /*
-The stream transports are not bounded by the ceiling, so there is no smaller
-number to report and the client's own figure is what the answer carries. Writing
-`response_limit` there would advertise 65535, which is not a UDP payload size at
-all.
+The stream transports carry an answer's OPT record out as it stands.
+
+A UDP payload size bounds a datagram, and nothing on a stream is bounded by it -
+so there is no number of ours to report there. Writing the ceiling would claim a
+bound that does not apply, and writing `response_limit` would advertise 65535,
+which is not a payload size at all. A locally built answer therefore goes out
+echoing the client's figure, which is what `make_response` put there.
 */
 @(test)
-test_a_stream_answer_leaves_the_advertised_size_alone :: proc(t: ^testing.T) {
+test_a_stream_answer_leaves_a_local_opt_alone :: proc(t: ^testing.T) {
 	cfg := config.default_config()
 	cfg.log.queries = false
 	cfg.cache.enabled = false
@@ -429,6 +443,32 @@ test_a_stream_answer_leaves_the_advertised_size_alone :: proc(t: ^testing.T) {
 			int(CLIENT_ADVERTISED),
 		)
 	}
+
+	free_all(context.temp_allocator)
+}
+
+/*
+And "as it stands" means the upstream's figure on a forwarded answer, not the
+client's.
+
+Worth its own case because the two are the same number on the chaos query above
+and would stay the same if the stream path started rewriting the field. The mock
+answers with 4096 against a client that asked for 1232, so only one of the two
+can be there.
+*/
+@(test)
+test_a_forwarded_stream_answer_keeps_the_upstream_opt :: proc(t: ^testing.T) {
+	h: Harness
+	if !harness_start(t, &h) {
+		return
+	}
+	defer harness_stop(&h)
+
+	out, ok := forward_once(t, &h, client_query(1232), .TCP)
+	if !testing.expect(t, ok, "the query went unanswered") {
+		return
+	}
+	testing.expect_value(t, int(dns.peek_udp_size(out)), 4096)
 
 	free_all(context.temp_allocator)
 }

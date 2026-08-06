@@ -1,7 +1,6 @@
 package server
 
 import "core:testing"
-import "elodin:logx"
 
 /*
 What a refusal costs this server to say.
@@ -20,21 +19,17 @@ is a reporter that logs a flood.
 */
 
 /*
-The level is process-wide and this needs both answers out of `logx.enabled`, so
-the two halves are one case rather than two that could run at the same time.
-
-The flag is owned by the case rather than being either of the package's globals,
-so a reporter that has already fired elsewhere in the suite cannot decide the
-answer.
+Both the flag and the level are the case's own: the flag rather than either of
+the package's globals, so a reporter that has already fired elsewhere in the
+suite cannot decide the answer, and the level as a parameter rather than
+`logx.set_level`, which is process-wide and would race the fifteen other threads
+this suite runs on.
 */
 @(test)
 test_report_once_says_it_once :: proc(t: ^testing.T) {
-	restore := logx_level_for_test(.Info)
-	defer logx.set_level(restore)
-
 	reported: bool
 
-	say, first := report_once(&reported)
+	say, first := report_once(&reported, false)
 	testing.expect(t, say, "the first refusal said nothing")
 	testing.expect(t, first, "the first refusal was not reported as the first")
 
@@ -42,16 +37,15 @@ test_report_once_says_it_once :: proc(t: ^testing.T) {
 	// an attacker's send loop, and formatting an address for each packet is work
 	// to be done only on purpose.
 	for i in 0 ..< 3 {
-		again, again_first := report_once(&reported)
+		again, again_first := report_once(&reported, false)
 		testing.expectf(t, !again, "refusal %d was logged at warn as well", i + 2)
 		testing.expect(t, !again_first, "a later refusal claimed to be the first")
 	}
 
 	// With debug on every refusal is reported - and none of them is the first, so
 	// none of them is a `warn`.
-	logx.set_level(.Debug)
 	for i in 0 ..< 3 {
-		again, again_first := report_once(&reported)
+		again, again_first := report_once(&reported, true)
 		testing.expectf(t, again, "refusal %d was dropped at debug level", i + 5)
 		testing.expect(t, !again_first, "a later refusal claimed to be the first")
 	}
@@ -77,18 +71,4 @@ test_a_refusal_is_named_for_what_was_refused :: proc(t: ^testing.T) {
 			refused_unit(proto),
 		)
 	}
-}
-
-// The lowest level `logx.enabled` still says yes to is the level it is set to.
-@(private = "file")
-logx_level_for_test :: proc(want: logx.Level) -> (previous: logx.Level) {
-	previous = .Error
-	for level in ([]logx.Level{.Debug, .Info, .Warn, .Error}) {
-		if logx.enabled(level) {
-			previous = level
-			break
-		}
-	}
-	logx.set_level(want)
-	return previous
 }

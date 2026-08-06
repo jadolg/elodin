@@ -208,7 +208,7 @@ attach_cookie :: proc(
 	req: Cookie_Request,
 	query: dns.Message,
 	limit: int,
-	proto: Protocol,
+	advertise: u16,
 	allocator: mem.Allocator,
 ) -> []u8 {
 	// Named as the two verdicts that earn a cookie rather than the ones that do
@@ -217,24 +217,12 @@ attach_cookie :: proc(
 		return wire
 	}
 	cookie := make_cookie(k, req, cookie_now())
-	/*
-	Sized by what this server will send rather than by what the client asked
-	for.
-
-	The two were the same number until `server.max_udp_response` arrived, and
-	the OPT record minted here - for an answer from an upstream that dropped
-	EDNS - would otherwise advertise the client's figure on a server that will
-	not honour it. `advertised_udp_size` is the same number the answer goes out
-	carrying, so the record is right the first time instead of being corrected
-	behind it.
-	*/
-	out, ok := dns.ensure_edns_option(
-		wire,
-		.Cookie,
-		cookie[:],
-		advertised_udp_size(query, limit, proto),
-		allocator,
-	)
+	// `advertise` rather than the client's own figure: an answer from an upstream
+	// that dropped EDNS gets a whole OPT record minted here, and it is this
+	// server's payload size that belongs in it. `handle_query` writes the same
+	// number over the top on the UDP path, so this is what keeps a record minted
+	// on a stream transport from claiming the client's.
+	out, ok := dns.ensure_edns_option(wire, .Cookie, cookie[:], advertise, allocator)
 	if !ok {
 		// Nothing to do but send the answer as it is; a client that gets no
 		// cookie back reads it as a server that does not do them.

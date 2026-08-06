@@ -143,16 +143,17 @@ test_stats_of_carries_every_counter :: proc(t: ^testing.T) {
 	// Distinct values, so a snapshot that reads the wrong field is a failure
 	// rather than a coincidence.
 	want := Stats {
-		queries   = 1,
-		blocked   = 2,
-		cached    = 3,
-		forwarded = 4,
-		failed    = 5,
-		rewritten = 6,
-		dropped   = 7,
-		refused   = 8,
-		secure    = 9,
-		bogus     = 10,
+		queries      = 1,
+		blocked      = 2,
+		cached       = 3,
+		forwarded    = 4,
+		failed       = 5,
+		rewritten    = 6,
+		dropped      = 7,
+		refused      = 8,
+		conn_refused = 9,
+		secure       = 10,
+		bogus        = 11,
 	}
 	s := Server {
 		stats = want,

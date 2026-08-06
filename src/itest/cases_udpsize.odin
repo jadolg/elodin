@@ -260,9 +260,10 @@ run_udp_size_cases :: proc(r: ^Runner) {
 			res := query_udp(udp_port, small, context.temp_allocator)
 			if check(r, res.ok, "no answer came back") {
 				check(r, len(res.wire) <= 512, "the answer is %d bytes, past what the client asked for", len(res.wire))
-				// The client's own figure binds here, so that is the number the
-				// answer reports: it is still the size this answer went out at.
-				check_eq_int(r, int(dns.peek_udp_size(res.wire)), 512, "the payload size the answer advertises")
+				// The reply is held to the client's 512, but the OPT record still
+				// reports the ceiling: the field is what this server can deliver,
+				// not the size of the datagram it happens to be riding on.
+				check_eq_int(r, int(dns.peek_udp_size(res.wire)), 1232, "the payload size the answer advertises")
 			}
 			// Give the line a moment to reach the file before concluding it is
 			// not there.
