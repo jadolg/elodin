@@ -820,11 +820,30 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	if cfg.cache.max_ttl < cfg.cache.min_ttl {
 		errorf(l, "cache.max_ttl must not be smaller than cache.min_ttl")
 	}
-	if cfg.server.workers < 1 {
-		errorf(l, "server.workers must be at least 1")
+	if cfg.server.workers < 0 {
+		errorf(l, "server.workers must not be negative")
 	}
-	if cfg.server.upstream_workers < 1 {
-		errorf(l, "server.upstream_workers must be at least 1")
+	if cfg.server.upstream_workers < 0 {
+		errorf(l, "server.upstream_workers must not be negative")
+	}
+	/*
+	Sized before `max_pending` is derived, since that is a multiple of the
+	worker count and would otherwise be derived from a zero.
+
+	Done here rather than at startup so that `--check` and the run that follows
+	it agree by construction, and so an operator can see on the machine itself
+	what the file leaves unsaid.
+	*/
+	if cfg.server.workers == 0 || cfg.server.upstream_workers == 0 {
+		cfg.server.sizing.machine = probe_machine()
+		if cfg.server.workers == 0 {
+			cfg.server.workers = derive_workers(cfg.server.sizing.machine)
+			cfg.server.sizing.derived_workers = true
+		}
+		if cfg.server.upstream_workers == 0 {
+			cfg.server.upstream_workers = derive_upstream_workers(cfg.server.workers)
+			cfg.server.sizing.derived_upstream_workers = true
+		}
 	}
 	if cfg.server.rate_limit.enabled {
 		if cfg.server.rate_limit.responses_per_second < 1 {

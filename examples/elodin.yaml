@@ -15,9 +15,16 @@ server:
   # against a 20 ms upstream. Every query shares this pool, so too few workers
   # also delays answers that would have come from the cache. Size it as
   # `target_qps * upstream_rtt` with headroom, and budget ~0.3 MB of resident
-  # memory per worker under load.
-  workers: 128
-  upstream_workers: 64 # threads used by the "race" strategy
+  # memory per worker — which is paid from the worker's first query onward,
+  # not only under load.
+  #
+  # 0 works it out at startup from the CPUs and memory this machine has:
+  # `4 per CPU`, no fewer than 16 and no more than 128, and lower still if that
+  # many threads would be a real share of a small machine's memory. A container
+  # or systemd CPU/memory limit counts for more than what the host has. The
+  # numbers it settled on are in the first lines of the log and in `--check`.
+  workers: 0
+  upstream_workers: 0  # threads used by the "race" strategy; 0 is half of `workers`
   max_connections: 512 # concurrent TCP / DoT / DoH connections
   client_timeout: 10s
   # Queries queued or in flight before new ones are dropped. 0 derives it as

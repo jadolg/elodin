@@ -151,6 +151,41 @@ wait_for_tick :: proc(tick: time.Duration) -> Wait_Outcome {
 	}
 }
 
+/*
+One line saying how large this instance is and why.
+
+Worth printing on every start, not only when something was derived: a worker
+count that came from the machine is one an operator has never seen in a file, so
+leaving it out of the log would make the first question about memory or
+throughput unanswerable from anything but the source. `--check` prints the same
+line, and derives it the same way, so it answers the question on the machine the
+config is bound for rather than in the abstract.
+*/
+@(private)
+sizing_line :: proc(s: config.Server_Config) -> string {
+	origin := "from the configuration"
+	if s.sizing.derived_workers || s.sizing.derived_upstream_workers {
+		m := s.sizing.machine
+		switch {
+		case m.cpus > 0 && m.memory > 0:
+			origin = fmt.tprintf("derived from %d usable CPUs and %#.1M", m.cpus, m.memory)
+		case m.cpus > 0:
+			origin = fmt.tprintf("derived from %d usable CPUs", m.cpus)
+		case m.memory > 0:
+			origin = fmt.tprintf("derived from %#.1M of memory", m.memory)
+		case:
+			origin = "derived from defaults; this machine could not be measured"
+		}
+	}
+	return fmt.tprintf(
+		"workers=%d upstream_workers=%d max_pending=%d (%s)",
+		s.workers,
+		s.upstream_workers,
+		s.max_pending,
+		origin,
+	)
+}
+
 main :: proc() {
 	// Writing to a socket whose peer has gone away raises SIGPIPE, whose
 	// default disposition kills the process. A client hanging up mid-answer is
@@ -203,10 +238,12 @@ main :: proc() {
 	if opts.check_only {
 		fmt.printfln("%s is valid: %d upstreams, %d blocklists, %d rewrites",
 			opts.config_path, len(cfg.upstream.servers), len(cfg.blocking.lists), len(cfg.rewrites))
+		fmt.printfln("  %s", sizing_line(cfg.server))
 		return
 	}
 
 	logx.infof("elodin %s starting", server.VERSION)
+	logx.infof("%s", sizing_line(cfg.server))
 	run(&cfg, opts, service)
 }
 
