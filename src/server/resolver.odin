@@ -415,8 +415,14 @@ Shrink an already-encoded response to fit `limit`.
 
 Forwarded answers are normally sized correctly because the client's own EDNS0
 options are passed through to the upstream. A cached answer, though, may have
-been stored for a client that advertised a larger buffer, so it is re-encoded
-with the truncation rules and the TC bit set.
+been stored for a client that advertised a larger buffer, and `limit` on UDP is
+`server.max_udp_response` where that is the smaller of the two - a number no
+upstream was ever told about. Both are re-encoded here with the truncation rules
+and the TC bit set.
+
+Whatever comes back is no larger than `limit`, on every path including the ones
+that fail. That is what the callers rely on: this is the last thing between an
+answer and the wire.
 */
 @(private)
 fit_response :: proc(wire: []u8, limit: int, query: dns.Message, allocator: mem.Allocator) -> []u8 {
