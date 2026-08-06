@@ -91,6 +91,42 @@ test_response_limit_floors_an_unset_ceiling :: proc(t: ^testing.T) {
 }
 
 /*
+The ceiling holds on the paths that go wrong too.
+
+`fit_response` is the only thing between an answer and the wire, so whatever it
+returns is what a UDP client receives. An answer it cannot re-encode used to be
+returned unchanged, which meant the one case where the size was not under this
+server's control was the case where the size was not bounded either - and the
+number it is bounded by is an amplification factor.
+*/
+@(test)
+test_fit_response_never_exceeds_the_limit :: proc(t: ^testing.T) {
+	query := dns.Message {
+		id       = 0x1234,
+		question = []dns.Question{{name = "big.example.", type = .TXT, class = .IN}},
+	}
+	// Bytes no decoder will accept, past the ceiling: the path where there is
+	// nothing to re-encode and what is in hand is too large to send.
+	junk := make([]u8, 2048, context.temp_allocator)
+	for i in 0 ..< len(junk) {
+		junk[i] = 0xff
+	}
+
+	out := fit_response(junk, config.DEFAULT_MAX_UDP_RESPONSE, query, context.temp_allocator)
+	testing.expectf(
+		t,
+		len(out) <= config.DEFAULT_MAX_UDP_RESPONSE,
+		"fit_response returned %d bytes against a %d-byte ceiling",
+		len(out),
+		config.DEFAULT_MAX_UDP_RESPONSE,
+	)
+	if testing.expect(t, len(out) >= dns.HEADER_SIZE, "nothing came back that a client could read") {
+		testing.expect(t, out[2] & 0x02 != 0, "the client was not told to retry over TCP")
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
 The snapshot carries every counter, and this is what makes that true.
 
 `stats_of` reads the live counters one at a time, so a counter added to `Stats`

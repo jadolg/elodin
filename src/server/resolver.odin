@@ -424,23 +424,35 @@ fit_response :: proc(wire: []u8, limit: int, query: dns.Message, allocator: mem.
 		return wire
 	}
 	report_udp_ceiling(wire, limit, query)
-	decoded, err := dns.decode_message(wire, allocator)
-	if err != .None {
-		// Cannot re-encode it; a truncated header at least tells the client to
-		// retry over TCP.
-		out, ok := dns.error_response(wire, query, .No_Error, allocator, limit)
-		if !ok {
-			return wire
+	if decoded, err := dns.decode_message(wire, allocator); err == .None {
+		if out, _, enc_err := dns.encode_message(decoded, allocator, limit); enc_err == .None {
+			return out
 		}
-		if len(out) >= 4 {
-			out[2] |= 0x02
-		}
-		return out
 	}
-	out, _, enc_err := dns.encode_message(decoded, allocator, limit)
-	if enc_err != .None {
-		return wire
+	/*
+	Nothing could be re-encoded, and what is in hand is over the limit.
+
+	Sending it as it stands is the tempting answer - the bytes are a valid
+	message, just a larger one than was asked for - and it is what this did when
+	either step failed. On UDP that is the one outcome the limit exists to
+	prevent: `limit` there is `server.max_udp_response`, which is an
+	amplification factor, and an answer that reaches it by failing to re-encode
+	is exactly as large as one that was allowed to. The ceiling has to hold on
+	the paths that go wrong or it is not a ceiling.
+
+	Neither step is reachable from a well-formed answer - a message that decoded
+	re-encodes, and one that did not is answered from the query instead - which
+	is the reason to settle it here rather than to reason about how an upstream
+	might arrive at one. The client is told to ask again over TCP, where the
+	address is proven and the whole answer fits. If even that cannot be built,
+	nothing is sent: a client that waits out its timeout is a better failure than
+	a datagram this server promised not to send.
+	*/
+	out, ok := dns.error_response(wire, query, .No_Error, allocator, limit)
+	if !ok || len(out) < dns.HEADER_SIZE || len(out) > limit {
+		return nil
 	}
+	out[2] |= 0x02
 	return out
 }
 
