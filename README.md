@@ -587,6 +587,28 @@ Note the `[]`. Writing `allow_from:` with nothing after it is a configuration
 error rather than either reading of it: YAML makes that a null, and the two
 things it could have meant here are the shipped default and its exact opposite.
 
+### Recursion only when asked
+
+`allow_from` decides who may ask; the RD bit in the query decides what they are
+asking for. RFC 1035 section 4.1.1 makes RD the client's request for a
+recursive lookup, and elodin only forwards to an upstream when it is set. A
+query with RD=0 gets whatever this server already has cached, and nothing more
+- REFUSED, not a silent drop, so a client that meant to ask recursively finds
+out rather than timing out:
+
+```
+ts=… level=info msg="query client=198.51.100.7:41234 proto=udp qtype=A qname=\"example.com\" outcome=refused detail=\"rd\" ms=0.1"
+```
+
+There is no setting for this; it is not a policy an operator tunes, only a bit
+a client sends. The RA bit follows RD back on every answer this server builds
+itself - a refusal, a CHAOS reply, a blocked or rewritten one - so RA says
+whether *this* answer had recursion behind it, not whether elodin offers the
+service in general. A cached or forwarded answer is the one exception: its OPT
+and flags are the upstream's own, RA included, passed through rather than
+rebuilt - see [UDP payload size](#how-large-a-udp-answer-may-be) for the same
+rule applied to the OPT record.
+
 ### How large a UDP answer may be
 
 ```yaml
