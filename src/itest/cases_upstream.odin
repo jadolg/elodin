@@ -520,16 +520,11 @@ start_server_tcp_only :: proc(r: ^Runner, config: string, port: int) -> (srv: Se
 	if !ok {
 		return srv, false
 	}
-	deadline := time.time_add(time.now(), 5 * time.Second)
-	for time.diff(deadline, time.now()) < 0 {
-		res := query_tcp(port, build_query("version.bind.", u16(dns.Type.TXT), class = u16(dns.Class.CH)))
-		if res.ok {
-			return srv, true
-		}
-		time.sleep(100 * time.Millisecond)
+	if !wait_tcp(port, 5 * time.Second) {
+		stop_server(&srv)
+		return srv, false
 	}
-	stop_server(&srv)
-	return srv, false
+	return srv, true
 }
 
 /*

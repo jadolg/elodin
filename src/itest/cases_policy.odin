@@ -452,7 +452,7 @@ blocking: {{ enabled: false }}
 		upstream_port,
 	)
 
-	srv, ok := start_server(r, Server_Options{config = config, port = port})
+	srv, ok := start_server(r, Server_Options{config = config, port = port, tcp_port = port})
 	if !ok {
 		skip_case(r, "cache", "server did not start")
 		return

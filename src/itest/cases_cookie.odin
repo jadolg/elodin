@@ -411,7 +411,7 @@ run_upstream_cookie_cases :: proc(r: ^Runner) {
 @(private = "file")
 run_cookie_require_cases :: proc(r: ^Runner, mock: ^Mock, upstream_port: int) {
 	port := next_port(r)
-	srv, ok := start_server(r, Server_Options{config = config_cookies(port, upstream_port, true), port = port})
+	srv, ok := start_server(r, Server_Options{config = config_cookies(port, upstream_port, true), port = port, tcp_port = port})
 	if !ok {
 		skip_case(r, "cookies: require", "server did not start")
 		return

@@ -158,6 +158,7 @@ run_binary :: proc(r: ^Runner, args: []string, tag: string) -> Run_Result {
 Server_Options :: struct {
 	config:    string,
 	port:      int,
+	tcp_port:  int,
 	dot_port:  int,
 	doh_port:  int,
 	// Extra time to allow before the readiness probe gives up.
@@ -183,6 +184,11 @@ start_server :: proc(r: ^Runner, opts: Server_Options) -> (srv: Server, ok: bool
 
 	if !wait_ready(&srv, 5 * time.Second + opts.warmup) {
 		fail(r, "server on port %d never became ready; log:\n%s", opts.port, read_log(&srv))
+		stop_server(&srv)
+		return srv, false
+	}
+	if opts.tcp_port > 0 && !wait_tcp(opts.tcp_port, 5 * time.Second + opts.warmup) {
+		fail(r, "server on port %d never answered over tcp; log:\n%s", opts.port, read_log(&srv))
 		stop_server(&srv)
 		return srv, false
 	}
@@ -278,6 +284,29 @@ wait_ready :: proc(srv: ^Server, timeout: time.Duration) -> bool {
 
 	for time.diff(deadline, time.now()) < 0 {
 		res := query_udp(srv.port, probe, context.temp_allocator, PROBE_TIMEOUT)
+		if res.ok {
+			return true
+		}
+	}
+	return false
+}
+
+/*
+Probe until the server answers over TCP.
+
+The listeners bind in order, udp before tcp, so the UDP probe above succeeding
+says nothing yet about the stream listener: a TCP dial in the gap between the
+two binds is refused, and on a loaded runner the gap is more than microseconds.
+A case that queries over TCP passes the port in `Server_Options` and this probes
+it the same way as the datagram path - a CHAOS version.bind query, answered
+locally, retried until the deadline.
+*/
+@(private)
+wait_tcp :: proc(port: int, timeout: time.Duration) -> bool {
+	probe := build_query("version.bind.", u16(dns.Type.TXT), class = u16(dns.Class.CH))
+	deadline := time.time_add(time.now(), timeout)
+	for time.diff(deadline, time.now()) < 0 {
+		res := query_tcp(port, probe, context.temp_allocator, PROBE_TIMEOUT)
 		if res.ok {
 			return true
 		}

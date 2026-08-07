@@ -57,6 +57,7 @@ run_transport_cases :: proc(r: ^Runner) {
 		Server_Options {
 			config = config_all_transports(r, port, dot_port, doh_port, upstream_port),
 			port = port,
+			tcp_port = port,
 			dot_port = dot_port,
 			doh_port = doh_port,
 		},

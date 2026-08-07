@@ -77,14 +77,14 @@ expect_no_udp_reply :: proc(port: int, query: []u8, wait := 400 * time.Milliseco
 	return rerr != nil
 }
 
-query_tcp :: proc(port: int, query: []u8, allocator := context.allocator) -> Query_Result {
+query_tcp :: proc(port: int, query: []u8, allocator := context.allocator, timeout := CLIENT_TIMEOUT) -> Query_Result {
 	socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = port})
 	if err != nil {
 		return {}
 	}
 	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, CLIENT_TIMEOUT)
-	_ = net.set_option(socket, .Send_Timeout, CLIENT_TIMEOUT)
+	_ = net.set_option(socket, .Receive_Timeout, timeout)
+	_ = net.set_option(socket, .Send_Timeout, timeout)
 
 	conn := Test_Conn {
 		socket = socket,

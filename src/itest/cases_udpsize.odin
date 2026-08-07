@@ -101,7 +101,7 @@ run_udp_size_cases :: proc(r: ^Runner) {
 		udp_port, tcp_port := next_port(r), next_port(r)
 		srv, ok := start_server(
 			r,
-			Server_Options{config = config_udp_size(udp_port, tcp_port, upstream_port, ""), port = udp_port},
+			Server_Options{config = config_udp_size(udp_port, tcp_port, upstream_port, ""), port = udp_port, tcp_port = tcp_port},
 		)
 		if check(r, ok, "server did not start") {
 			defer stop_server(&srv)
@@ -147,6 +147,7 @@ run_udp_size_cases :: proc(r: ^Runner) {
 			Server_Options {
 				config = config_udp_size(udp_port, tcp_port, upstream_port, "max_udp_response: 4096"),
 				port = udp_port,
+				tcp_port = tcp_port,
 			},
 		)
 		if check(r, ok, "server did not start") {
@@ -176,7 +177,7 @@ run_udp_size_cases :: proc(r: ^Runner) {
 		udp_port, tcp_port := next_port(r), next_port(r)
 		srv, ok := start_server(
 			r,
-			Server_Options{config = config_udp_size(udp_port, tcp_port, upstream_port, ""), port = udp_port},
+			Server_Options{config = config_udp_size(udp_port, tcp_port, upstream_port, ""), port = udp_port, tcp_port = tcp_port},
 		)
 		if check(r, ok, "server did not start") {
 			defer stop_server(&srv)
@@ -207,7 +208,7 @@ run_udp_size_cases :: proc(r: ^Runner) {
 		udp_port, tcp_port := next_port(r), next_port(r)
 		srv, ok := start_server(
 			r,
-			Server_Options{config = config_udp_size(udp_port, tcp_port, upstream_port, ""), port = udp_port},
+			Server_Options{config = config_udp_size(udp_port, tcp_port, upstream_port, ""), port = udp_port, tcp_port = tcp_port},
 		)
 		if check(r, ok, "server did not start") {
 			defer stop_server(&srv)
@@ -227,6 +228,7 @@ run_udp_size_cases :: proc(r: ^Runner) {
 			Server_Options {
 				config = config_udp_size(udp_port, tcp_port, upstream_port, "max_udp_response: 4096"),
 				port = udp_port,
+				tcp_port = tcp_port,
 			},
 		)
 		if check(r, ok, "server did not start") {
@@ -246,7 +248,7 @@ run_udp_size_cases :: proc(r: ^Runner) {
 		udp_port, tcp_port := next_port(r), next_port(r)
 		srv, ok := start_server(
 			r,
-			Server_Options{config = config_udp_size(udp_port, tcp_port, upstream_port, ""), port = udp_port},
+			Server_Options{config = config_udp_size(udp_port, tcp_port, upstream_port, ""), port = udp_port, tcp_port = tcp_port},
 		)
 		if check(r, ok, "server did not start") {
 			defer stop_server(&srv)

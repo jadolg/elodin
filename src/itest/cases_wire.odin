@@ -47,7 +47,7 @@ run_wire_cases :: proc(r: ^Runner) {
 	defer mock_stop(mock)
 
 	port := next_port(r)
-	srv, ok := start_server(r, Server_Options{config = config_passthrough(port, upstream_port), port = port})
+	srv, ok := start_server(r, Server_Options{config = config_passthrough(port, upstream_port), port = port, tcp_port = port})
 	if !ok {
 		skip_case(r, "wire", "server did not start")
 		return

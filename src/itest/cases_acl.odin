@@ -251,6 +251,7 @@ run_acl_cases :: proc(r: ^Runner) {
 					`allow_from: ["10.0.0.0/8", "127.0.0.1/32"]`,
 				),
 				port = udp_port,
+				tcp_port = tcp_port,
 			},
 		)
 		if check(r, ok, "server did not start") {
