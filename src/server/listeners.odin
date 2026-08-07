@@ -438,10 +438,51 @@ conn_limit_reported: bool
 @(private)
 conn_failed_reported: bool
 
+/*
+Everything that differs between the two causes, chosen in one place.
+
+Split out of the reporter because the choosing is the part that can be wrong and
+the printing is not: a branch inverted here says "raising max_connections will
+not help" to the operator whose only problem is `max_connections`, and tells the
+host that ran out of pids to raise it. Both lines still appear in the log, and
+both still count something, so nothing downstream of the mistake looks wrong.
+Returned as data so a test can hold the two side by side - the same reason
+`refused_unit` is its own procedure.
+
+`brief` and `line` take the transport and the limit, in that order.
+*/
+@(private)
+Spawn_Failure_Words :: struct {
+	reported: ^bool,
+	// The `debug` line, for every occurrence after the first.
+	brief:    string,
+	// The `warn`, said once, and the line under it saying what to do.
+	line:     string,
+	hint:     string,
+}
+
+@(private)
+spawn_failure_words :: proc(why: Spawn_Result) -> Spawn_Failure_Words {
+	if why == .Limit_Reached {
+		return Spawn_Failure_Words {
+			reported = &conn_limit_reported,
+			brief = "%s: refusing a connection, the limit of %d is reached",
+			line = "%s: refusing a connection, server.max_connections (%d) is reached",
+			hint = "  raise server.max_connections if this server should hold more clients at once; these are counted as conn_refused= in the stats line, and further ones are logged at debug level",
+		}
+	}
+	return Spawn_Failure_Words {
+		reported = &conn_failed_reported,
+		brief = "%s: refusing a connection, the OS would not start a thread for it, below the limit of %d",
+		line = "%s: refusing a connection, the OS would not start a thread for it - this is below server.max_connections (%d), so raising that will not help",
+		hint = "  check the process thread and memory limits (RLIMIT_NPROC, cgroup pids.max); these are counted as conn_failed= in the stats line, and further ones are logged at debug level",
+	}
+}
+
 @(private)
 report_spawn_failure :: proc(proto: Protocol, why: Spawn_Result, limit: int) {
-	flag := &conn_limit_reported if why == .Limit_Reached else &conn_failed_reported
-	say, first := report_once(flag, logx.enabled(.Debug))
+	words := spawn_failure_words(why)
+	say, first := report_once(words.reported, logx.enabled(.Debug))
 	if !say {
 		return
 	}
@@ -450,29 +491,12 @@ report_spawn_failure :: proc(proto: Protocol, why: Spawn_Result, limit: int) {
 	defer free_all(context.temp_allocator)
 
 	transport := proto_name(proto)
-	if why != .Limit_Reached {
-		if !first {
-			logx.debugf("%s: refusing a connection, the OS would not start a thread for it", transport)
-			return
-		}
-		logx.warnf(
-			"%s: refusing a connection, the OS would not start a thread for it - this is below server.max_connections (%d), so raising that will not help",
-			transport,
-			limit,
-		)
-		logx.warnf(
-			"  check the process thread and memory limits (RLIMIT_NPROC, cgroup pids.max); these are counted as conn_failed= in the stats line, and further ones are logged at debug level",
-		)
-		return
-	}
 	if !first {
-		logx.debugf("%s: refusing a connection, the limit of %d is reached", transport, limit)
+		logx.debugf(words.brief, transport, limit)
 		return
 	}
-	logx.warnf("%s: refusing a connection, server.max_connections (%d) is reached", transport, limit)
-	logx.warnf(
-		"  raise server.max_connections if this server should hold more clients at once; these are counted as conn_refused= in the stats line, and further ones are logged at debug level",
-	)
+	logx.warnf(words.line, transport, limit)
+	logx.warnf(words.hint)
 }
 
 /*

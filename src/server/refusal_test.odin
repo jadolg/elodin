@@ -1,5 +1,6 @@
 package server
 
+import "core:strings"
 import "core:testing"
 
 /*
@@ -71,4 +72,54 @@ test_a_refusal_is_named_for_what_was_refused :: proc(t: ^testing.T) {
 			refused_unit(proto),
 		)
 	}
+}
+
+/*
+A connection refused for want of a slot and one refused for want of a thread are
+told which is which.
+
+The whole reason the two are kept apart is that they send an operator in opposite
+directions: raise `server.max_connections`, or go and find what stopped the OS
+giving this process a thread - and a host under `RLIMIT_NPROC` refuses well below
+the limit, where raising it makes things worse. So the words are chosen from the
+cause, and the two sets have to be the right way round. Swapped, nothing else in
+the suite would notice: both lines still appear, and both still count something.
+
+Pinned on the distinguishing phrases rather than on whole sentences, so the
+wording stays free to change.
+*/
+@(test)
+test_a_spawn_failure_names_its_own_cause :: proc(t: ^testing.T) {
+	limit := spawn_failure_words(.Limit_Reached)
+	failed := spawn_failure_words(.Thread_Failed)
+
+	testing.expect(
+		t,
+		strings.contains(limit.line, "server.max_connections") && strings.contains(limit.hint, "raise"),
+		"a full connection limit does not tell the operator to raise it",
+	)
+	testing.expect(
+		t,
+		strings.contains(failed.line, "will not help"),
+		"a refused thread was blamed on the connection limit",
+	)
+	testing.expect(
+		t,
+		strings.contains(failed.hint, "RLIMIT_NPROC"),
+		"a refused thread does not say where the actual limit is",
+	)
+	// Each counts into the field it names, and the stats line spells them this way.
+	testing.expect(t, strings.contains(limit.hint, "conn_refused="), "the limit's line names the wrong counter")
+	testing.expect(t, strings.contains(failed.hint, "conn_failed="), "the thread failure's line names the wrong counter")
+
+	/*
+	And a separate flag each.
+
+	Shared, whichever cause happened first would suppress the other for the
+	lifetime of the process - so a server that filled its connection limit in the
+	first minute would never say a word about the pids ceiling it hit an hour
+	later.
+	*/
+	testing.expect(t, limit.reported != failed.reported, "both spawn failures share one once-only flag")
+	testing.expect(t, limit.reported != nil && failed.reported != nil, "a spawn failure has no flag to report against")
 }

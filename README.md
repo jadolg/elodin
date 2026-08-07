@@ -894,7 +894,8 @@ decided by whoever is opening the connections.
 ```
 WARN  tcp: refusing a connection, server.max_connections (512) is reached
 WARN    raise server.max_connections if this server should hold more clients at
-        once; further refusals are logged at debug level
+        once; these are counted as conn_refused= in the stats line, and further
+        ones are logged at debug level
 ```
 
 The counting does not stop with the logging: every one of them is a
@@ -906,8 +907,16 @@ different one.
 
 A connection can also be refused *below* the limit, when the OS will not give
 the process another thread — `RLIMIT_NPROC`, a cgroup `pids.max`, or memory.
-That is `conn_failed=`, with its own once-at-warn line, because raising
-`max_connections` there cannot help and would make it worse.
+Raising `max_connections` there cannot help and would make it worse, so it is
+counted and named separately:
+
+```
+WARN  tcp: refusing a connection, the OS would not start a thread for it - this
+      is below server.max_connections (512), so raising that will not help
+WARN    check the process thread and memory limits (RLIMIT_NPROC, cgroup
+        pids.max); these are counted as conn_failed= in the stats line, and
+        further ones are logged at debug level
+```
 
 The number that governs sizing is the sustained cache-miss row. A worker thread is occupied for
 the whole of an upstream round trip, so
