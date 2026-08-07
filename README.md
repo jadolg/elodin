@@ -8,7 +8,7 @@ Pi-hole and AdGuard Home, minus the web interface. One binary, one YAML file.
 - Three upstream strategies: failover, round-robin and race
 - Sink lists in hosts, plain-domain and adblock syntax, with allowlists
 - Answer cache with negative caching and optional stale serving
-- Response rate limiting per client prefix, on by default
+- Response rate limiting per client prefix on UDP, on by default (see `server.rate_limit`)
 - Client allow list restricting who may query, defaulting to local networks only
 - A ceiling on UDP answer size to bound reflection amplification, on by default
 - Local rewrites (A, AAAA, CNAME, or "answer as if blocked")
@@ -712,7 +712,10 @@ refused source, so there is nothing for a response budget to bound.
 
 TCP, DoT and DoH are not rate limited. A connection is established before a
 query arrives on one, so the address is already proven and there is nothing to
-reflect off.
+reflect off. What bounds them is `server.allow_from` (see [Who may
+ask](#who-may-ask)), which refuses the connection at accept time, and
+`server.max_connections`, which caps how many connections at once — there is no
+per-client query budget for the stream transports to tune.
 
 `cookies.require` is the sharper instrument for an attack actually under way:
 it makes a UDP client prove it can receive at the address it claims before any
