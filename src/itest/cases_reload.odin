@@ -17,7 +17,7 @@ than reading the log would.
 */
 
 @(private = "file")
-config_for_reload :: proc(port, dot_port: int, cert_file, key_file: string) -> string {
+config_for_reload :: proc(udp_port, dot_port: int, cert_file, key_file: string) -> string {
 	return fmt.tprintf(
 		`log: {{ level: debug }}
 listeners:
@@ -30,8 +30,8 @@ upstream:
 cache: {{ enabled: false }}
 blocking: {{ enabled: false }}
 `,
-		port,
-		port,
+		udp_port,
+		udp_port,
 		dot_port,
 		cert_file,
 		key_file,
@@ -90,8 +90,8 @@ install_cert :: proc(dst, src: string) -> bool {
 // suite only ever needs to tell "the expected certificate is live" from
 // "it is not".
 @(private = "file")
-dot_handshake_verifies :: proc(port: int, ca_file, hostname: string) -> bool {
-	socket, derr := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = port})
+dot_handshake_verifies :: proc(dot_port: int, ca_file, hostname: string) -> bool {
+	socket, derr := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = dot_port})
 	if derr != nil {
 		return false
 	}
@@ -117,10 +117,10 @@ dot_handshake_verifies :: proc(port: int, ca_file, hostname: string) -> bool {
 // noticed on the maintenance loop's 200ms poll, which is fast but not
 // instant, and a fixed sleep would either race it or pad every run.
 @(private = "file")
-wait_for_handshake :: proc(port: int, ca_file, hostname: string, within: time.Duration) -> bool {
+wait_for_handshake :: proc(dot_port: int, ca_file, hostname: string, within: time.Duration) -> bool {
 	deadline := time.time_add(time.now(), within)
 	for time.diff(time.now(), deadline) > 0 {
-		if dot_handshake_verifies(port, ca_file, hostname) {
+		if dot_handshake_verifies(dot_port, ca_file, hostname) {
 			return true
 		}
 		time.sleep(50 * time.Millisecond)
@@ -150,13 +150,13 @@ run_reload_cases :: proc(r: ^Runner) {
 		return
 	}
 
-	port := next_port(r)
+	udp_port := next_port(r)
 	dot_port := next_port(r)
 	srv, ok := start_server(
 		r,
 		Server_Options {
-			config = config_for_reload(port, dot_port, active_cert, active_key),
-			port = port,
+			config = config_for_reload(udp_port, dot_port, active_cert, active_key),
+			udp_port = udp_port,
 		},
 	)
 	if !ok {

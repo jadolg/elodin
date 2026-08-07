@@ -95,7 +95,7 @@ run_strategy_cases :: proc(r: ^Runner) {
 		mock_stop(m)
 	}
 
-	base_config :: proc(port: int, strategy: string, servers: string, extra := "") -> string {
+	base_config :: proc(udp_port: int, strategy: string, servers: string, extra := "") -> string {
 		return fmt.tprintf(
 			`log: {{ level: debug, queries: true }}
 listeners:
@@ -110,7 +110,7 @@ upstream:
 cache: {{ enabled: false }}
 blocking: {{ enabled: false }}
 `,
-			port,
+			udp_port,
 			strategy,
 			extra,
 			servers,
@@ -127,16 +127,16 @@ blocking: {{ enabled: false }}
 
 	// --- failover ---
 	{
-		port := next_port(r)
+		udp_port := next_port(r)
 		srv, ok := start_server(
 			r,
-			Server_Options{config = base_config(port, "failover", server_list(ports[:])), port = port},
+			Server_Options{config = base_config(udp_port, "failover", server_list(ports[:])), udp_port = udp_port},
 		)
 		if ok {
 			start_case(r, "strategy: failover always prefers the first upstream")
 			{
 				for i in 0 ..< 4 {
-					res := query_udp(port, build_query(QNAME, u16(dns.Type.A), id = u16(i)))
+					res := query_udp(udp_port, build_query(QNAME, u16(dns.Type.A), id = u16(i)))
 					if check(r, res.ok, "no response on attempt %d", i) {
 						check_eq_str(r, first_address(res.wire), "10.0.0.1", "answering upstream")
 					}
@@ -151,10 +151,10 @@ blocking: {{ enabled: false }}
 
 	// --- round robin ---
 	{
-		port := next_port(r)
+		udp_port := next_port(r)
 		srv, ok := start_server(
 			r,
-			Server_Options{config = base_config(port, "round_robin", server_list(ports[:])), port = port},
+			Server_Options{config = base_config(udp_port, "round_robin", server_list(ports[:])), udp_port = udp_port},
 		)
 		if ok {
 			start_case(r, "strategy: round_robin visits every upstream in turn")
@@ -162,7 +162,7 @@ blocking: {{ enabled: false }}
 				seen := map[string]int{}
 				defer delete(seen)
 				for i in 0 ..< 6 {
-					res := query_udp(port, build_query(QNAME, u16(dns.Type.A), id = u16(i)))
+					res := query_udp(udp_port, build_query(QNAME, u16(dns.Type.A), id = u16(i)))
 					if check(r, res.ok, "no response on attempt %d", i) {
 						seen[first_address(res.wire)] += 1
 					}
@@ -196,19 +196,19 @@ blocking: {{ enabled: false }}
 			defer mock_stop(slow)
 			defer mock_stop(fast)
 
-			port := next_port(r)
+			udp_port := next_port(r)
 			srv, ok := start_server(
 				r,
 				Server_Options {
-					config = base_config(port, "race", server_list([]int{slow_port, fast_port})),
-					port = port,
+					config = base_config(udp_port, "race", server_list([]int{slow_port, fast_port})),
+					udp_port = udp_port,
 				},
 			)
 			if ok {
 				start_case(r, "strategy: race returns the first answer to arrive")
 				{
 					started := time.now()
-					res := query_udp(port, build_query(QNAME, u16(dns.Type.A)))
+					res := query_udp(udp_port, build_query(QNAME, u16(dns.Type.A)))
 					elapsed := time.diff(started, time.now())
 					if check(r, res.ok, "no response") {
 						check_eq_str(r, first_address(res.wire), "10.8.8.8", "winning upstream")
@@ -226,7 +226,7 @@ blocking: {{ enabled: false }}
 				{
 					// Both were queried; the losing answer must not leak out or
 					// corrupt the next query.
-					res := query_udp(port, build_query(QNAME, u16(dns.Type.A), id = 99))
+					res := query_udp(udp_port, build_query(QNAME, u16(dns.Type.A), id = 99))
 					if check(r, res.ok, "no response") {
 						h, _ := parse_header(res.wire)
 						check(r, h.id == 99, "wrong ID after a race: %04x", h.id)
@@ -255,18 +255,18 @@ blocking: {{ enabled: false }}
 			defer mock_stop(dead)
 			defer mock_stop(live)
 
-			port := next_port(r)
+			udp_port := next_port(r)
 			srv, ok := start_server(
 				r,
 				Server_Options {
-					config = base_config(port, "failover", server_list([]int{dead_port, live_port})),
-					port = port,
+					config = base_config(udp_port, "failover", server_list([]int{dead_port, live_port})),
+					udp_port = udp_port,
 				},
 			)
 			if ok {
 				start_case(r, "upstream: a silent server is skipped and the next one answers")
 				{
-					res := query_udp(port, build_query(QNAME, u16(dns.Type.A)))
+					res := query_udp(udp_port, build_query(QNAME, u16(dns.Type.A)))
 					if check(r, res.ok, "no response") {
 						check_eq_str(r, first_address(res.wire), "10.7.7.7", "answering upstream")
 					}
@@ -278,10 +278,10 @@ blocking: {{ enabled: false }}
 					// Three failures trip the cooldown; after that the dead
 					// upstream is skipped without waiting for its timeout.
 					for i in 0 ..< 3 {
-						_ = query_udp(port, build_query(QNAME, u16(dns.Type.A), id = u16(100 + i)))
+						_ = query_udp(udp_port, build_query(QNAME, u16(dns.Type.A), id = u16(100 + i)))
 					}
 					started := time.now()
-					res := query_udp(port, build_query(QNAME, u16(dns.Type.A), id = 200))
+					res := query_udp(udp_port, build_query(QNAME, u16(dns.Type.A), id = 200))
 					elapsed := time.diff(started, time.now())
 
 					if check(r, res.ok, "no response after the cooldown started") {
@@ -316,7 +316,7 @@ run_upstream_transport_cases :: proc(r: ^Runner) {
 			skip_case(r, "upstream: tcp", "cannot start the mock")
 		} else {
 			defer mock_stop(mock)
-			port := next_port(r)
+			udp_port := next_port(r)
 			config := fmt.tprintf(
 				`log: {{ level: warn }}
 listeners:
@@ -328,14 +328,14 @@ upstream:
 cache: {{ enabled: false }}
 blocking: {{ enabled: false }}
 `,
-				port,
+				udp_port,
 				upstream_port,
 			)
-			srv, ok := start_server(r, Server_Options{config = config, port = port})
+			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 			if ok {
 				start_case(r, "upstream: forwards over TCP")
 				{
-					res := query_udp(port, build_query(fix.qname, fix.qtype))
+					res := query_udp(udp_port, build_query(fix.qname, fix.qtype))
 					if check(r, res.ok, "no response") {
 						h, _ := parse_header(res.wire)
 						check_eq_int(r, h.ancount, fix.ancount, "answer count")
@@ -349,7 +349,7 @@ blocking: {{ enabled: false }}
 				{
 					mock_reset_counts(mock)
 					for i in 0 ..< 3 {
-						_ = query_udp(port, build_query(fix.qname, fix.qtype, id = u16(300 + i)))
+						_ = query_udp(udp_port, build_query(fix.qname, fix.qtype, id = u16(300 + i)))
 					}
 					_, tcp_count, _ := mock_counts(mock)
 					check_eq_int(r, tcp_count, 3, "queries seen by the upstream")
@@ -371,7 +371,7 @@ blocking: {{ enabled: false }}
 			skip_case(r, "upstream: dot", "cannot start the TLS mock")
 		} else {
 			defer mock_stop(mock)
-			port := next_port(r)
+			udp_port := next_port(r)
 			// verify: false, because the mock uses the suite's self-signed cert.
 			config := fmt.tprintf(
 				`log: {{ level: warn }}
@@ -385,14 +385,14 @@ upstream:
 cache: {{ enabled: false }}
 blocking: {{ enabled: false }}
 `,
-				port,
+				udp_port,
 				upstream_port,
 			)
-			srv, ok := start_server(r, Server_Options{config = config, port = port})
+			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 			if ok {
 				start_case(r, "upstream: forwards over DNS-over-TLS")
 				{
-					res := query_udp(port, build_query(fix.qname, fix.qtype))
+					res := query_udp(udp_port, build_query(fix.qname, fix.qtype))
 					if check(r, res.ok, "no response") {
 						h, _ := parse_header(res.wire)
 						check_eq_int(r, h.ancount, fix.ancount, "answer count")
@@ -406,7 +406,7 @@ blocking: {{ enabled: false }}
 				{
 					mock_reset_counts(mock)
 					for i in 0 ..< 3 {
-						_ = query_udp(port, build_query(fix.qname, fix.qtype, id = u16(400 + i)))
+						_ = query_udp(udp_port, build_query(fix.qname, fix.qtype, id = u16(400 + i)))
 					}
 					_, _, tls_count := mock_counts(mock)
 					check_eq_int(r, tls_count, 3, "queries seen over the TLS session")
@@ -429,7 +429,7 @@ blocking: {{ enabled: false }}
 			skip_case(r, "upstream: udp to tcp retry", "cannot start the mock")
 		} else {
 			defer mock_stop(mock)
-			port := next_port(r)
+			tcp_port := next_port(r)
 			config := fmt.tprintf(
 				`log: {{ level: warn }}
 listeners:
@@ -441,15 +441,15 @@ upstream:
 cache: {{ enabled: false }}
 blocking: {{ enabled: false }}
 `,
-				port,
+				tcp_port,
 				upstream_port,
 			)
 			// The readiness probe uses UDP, so this server is checked directly.
-			srv, ok := start_server_tcp_only(r, config, port)
+			srv, ok := start_server_tcp_only(r, config, tcp_port)
 			if ok {
 				start_case(r, "upstream: a truncated UDP answer is retried over TCP")
 				{
-					res := query_tcp(port, build_query("google.com.", u16(dns.Type.TXT)))
+					res := query_tcp(tcp_port, build_query("google.com.", u16(dns.Type.TXT)))
 					if check(r, res.ok, "no response") {
 						h, _ := parse_header(res.wire)
 						check(r, !h.tc, "the client was handed a truncated answer")
@@ -476,7 +476,7 @@ blocking: {{ enabled: false }}
 			skip_case(r, "upstream: total outage", "cannot start the mock")
 		} else {
 			defer mock_stop(dead)
-			port := next_port(r)
+			udp_port := next_port(r)
 			config := fmt.tprintf(
 				`log: {{ level: warn }}
 listeners:
@@ -489,14 +489,14 @@ upstream:
 cache: {{ enabled: false }}
 blocking: {{ enabled: false }}
 `,
-				port,
+				udp_port,
 				dead_port,
 			)
-			srv, ok := start_server(r, Server_Options{config = config, port = port})
+			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 			if ok {
 				start_case(r, "upstream: a total outage yields SERVFAIL, not silence")
 				{
-					res := query_udp(port, build_query("anything.test.", u16(dns.Type.A)))
+					res := query_udp(udp_port, build_query("anything.test.", u16(dns.Type.A)))
 					if check(r, res.ok, "the server went quiet instead of answering") {
 						h, _ := parse_header(res.wire)
 						check(r, h.rcode == int(dns.Rcode.Serv_Fail), "rcode %d, want SERVFAIL", h.rcode)
@@ -515,12 +515,12 @@ blocking: {{ enabled: false }}
 // A TCP-only server cannot be probed over UDP, so readiness is established by
 // connecting instead.
 @(private = "file")
-start_server_tcp_only :: proc(r: ^Runner, config: string, port: int) -> (srv: Server, ok: bool) {
-	srv, ok = start_server_raw(r, config, port)
+start_server_tcp_only :: proc(r: ^Runner, config: string, tcp_port: int) -> (srv: Server, ok: bool) {
+	srv, ok = start_server_raw(r, config, tcp_port)
 	if !ok {
 		return srv, false
 	}
-	if !wait_tcp(port, 5 * time.Second) {
+	if !wait_tcp(tcp_port, 5 * time.Second) {
 		stop_server(&srv)
 		return srv, false
 	}
@@ -565,7 +565,7 @@ run_stale_connection_cases :: proc(r: ^Runner) {
 		}
 		defer mock_stop(mock)
 
-		port := next_port(r)
+		udp_port := next_port(r)
 		server_entry :=
 			c.tls \
 			? fmt.tprintf(
@@ -587,11 +587,11 @@ upstream:
 cache: {{ enabled: false }}
 blocking: {{ enabled: false }}
 `,
-			port,
+			udp_port,
 			server_entry,
 		)
 
-		srv, ok := start_server(r, Server_Options{config = config, port = port})
+		srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 		if !ok {
 			skip_case(r, fmt.tprintf("stale connection over %s", c.name), "server did not start")
 			continue
@@ -599,7 +599,7 @@ blocking: {{ enabled: false }}
 
 		start_case(r, fmt.tprintf("upstream: a dropped %s connection is retried, not reported as failure", c.name))
 		{
-			first := query_udp(port, build_query(fix.qname, fix.qtype, id = 1))
+			first := query_udp(udp_port, build_query(fix.qname, fix.qtype, id = 1))
 			if check(r, first.ok, "the first query failed") {
 				h, _ := parse_header(first.wire)
 				check_eq_int(r, h.ancount, fix.ancount, "answer count on the first query")
@@ -608,7 +608,7 @@ blocking: {{ enabled: false }}
 			// Let the mock drop the pooled connection.
 			time.sleep(600 * time.Millisecond)
 
-			second := query_udp(port, build_query(fix.qname, fix.qtype, id = 2))
+			second := query_udp(udp_port, build_query(fix.qname, fix.qtype, id = 2))
 			if check(r, second.ok, "no response after the pooled connection went stale") {
 				h, _ := parse_header(second.wire)
 				check(

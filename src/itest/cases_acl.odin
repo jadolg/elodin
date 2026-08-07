@@ -57,8 +57,8 @@ pass a test written only on the absence of an answer. So the connection is made
 and the write attempted first, and only the read is expected to come back empty.
 */
 @(private = "file")
-tcp_closed_without_answer :: proc(port: int) -> (connected: bool, answered: bool) {
-	socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = port})
+tcp_closed_without_answer :: proc(tcp_port: int) -> (connected: bool, answered: bool) {
+	socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = tcp_port})
 	if err != nil {
 		return false, false
 	}
@@ -133,7 +133,7 @@ run_acl_cases :: proc(r: ^Runner) {
 		srv, _, ok := start_denying_server(r, upstream_port)
 		if check(r, ok, "server did not start") {
 			defer stop_server(&srv)
-			check(r, expect_no_udp_reply(srv.port, query), "the server answered a source outside allow_from")
+			check(r, expect_no_udp_reply(srv.udp_port, query), "the server answered a source outside allow_from")
 		}
 	}
 	end_case(r)
@@ -170,9 +170,9 @@ run_acl_cases :: proc(r: ^Runner) {
 		srv, _, ok := start_denying_server(r, upstream_port)
 		if check(r, ok, "server did not start") {
 			defer stop_server(&srv)
-			check(r, expect_no_udp_reply(srv.port, query), "the server answered a source outside allow_from")
+			check(r, expect_no_udp_reply(srv.udp_port, query), "the server answered a source outside allow_from")
 			// A second refusal, which must not produce a second line.
-			check(r, expect_no_udp_reply(srv.port, query), "the server answered a source outside allow_from")
+			check(r, expect_no_udp_reply(srv.udp_port, query), "the server answered a source outside allow_from")
 			// The line is written on the read loop, so give it the moment
 			// between the datagram being refused and the file being flushed.
 			time.sleep(200 * time.Millisecond)
@@ -250,7 +250,7 @@ run_acl_cases :: proc(r: ^Runner) {
 					upstream_port,
 					`allow_from: ["10.0.0.0/8", "127.0.0.1/32"]`,
 				),
-				port = udp_port,
+				udp_port = udp_port,
 				tcp_port = tcp_port,
 			},
 		)
@@ -271,7 +271,7 @@ run_acl_cases :: proc(r: ^Runner) {
 		udp_port, tcp_port := next_port(r), next_port(r)
 		srv, ok := start_server(
 			r,
-			Server_Options{config = config_acl(udp_port, tcp_port, upstream_port, `allow_from: []`), port = udp_port},
+			Server_Options{config = config_acl(udp_port, tcp_port, upstream_port, `allow_from: []`), udp_port = udp_port},
 		)
 		if check(r, ok, "server did not start") {
 			defer stop_server(&srv)
@@ -288,7 +288,7 @@ run_acl_cases :: proc(r: ^Runner) {
 		udp_port, tcp_port := next_port(r), next_port(r)
 		srv, ok := start_server(
 			r,
-			Server_Options{config = config_acl(udp_port, tcp_port, upstream_port, ""), port = udp_port},
+			Server_Options{config = config_acl(udp_port, tcp_port, upstream_port, ""), udp_port = udp_port},
 		)
 		if check(r, ok, "server did not start") {
 			defer stop_server(&srv)

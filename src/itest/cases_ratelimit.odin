@@ -14,7 +14,7 @@ same flood against a server with that budget and against one without.
 */
 
 @(private = "file")
-config_rate_limit :: proc(port, upstream_port: int, limit: string) -> string {
+config_rate_limit :: proc(udp_port, upstream_port: int, limit: string) -> string {
 	return fmt.tprintf(
 		`log: {{ level: warn }}
 listeners:
@@ -34,7 +34,7 @@ upstream:
 cache: {{ enabled: true, max_entries: 100 }}
 blocking: {{ enabled: false }}
 `,
-		port,
+		udp_port,
 		limit,
 		upstream_port,
 	)
@@ -69,14 +69,14 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 	*/
 	start_case(r, "rate limit: disabled, a flood from one source is answered in full")
 	{
-		port := next_port(r)
+		udp_port := next_port(r)
 		srv, ok := start_server(
 			r,
-			Server_Options{config = config_rate_limit(port, upstream_port, "enabled: false"), port = port},
+			Server_Options{config = config_rate_limit(udp_port, upstream_port, "enabled: false"), udp_port = udp_port},
 		)
 		if check(r, ok, "server did not start") {
 			defer stop_server(&srv)
-			res := udp_flood(port, query, QUERIES)
+			res := udp_flood(udp_port, query, QUERIES)
 			check(
 				r,
 				res.answered >= QUERIES - 5,
@@ -91,21 +91,21 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 
 	start_case(r, "rate limit: a flood from one prefix is cut to the budget")
 	{
-		port := next_port(r)
+		udp_port := next_port(r)
 		srv, ok := start_server(
 			r,
 			Server_Options {
 				config = config_rate_limit(
-					port,
+					udp_port,
 					upstream_port,
 					fmt.tprintf("enabled: true, responses_per_second: %d, slip: 2", RATE),
 				),
-				port = port,
+				udp_port = udp_port,
 			},
 		)
 		if check(r, ok, "server did not start") {
 			defer stop_server(&srv)
-			res := udp_flood(port, query, QUERIES)
+			res := udp_flood(udp_port, query, QUERIES)
 
 			full := res.answered - res.truncated
 			// The burst, plus whatever the second or so of draining refilled.
@@ -139,28 +139,28 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 	*/
 	start_case(r, "rate limit: the bytes a flood can aim at one address are bounded")
 	{
-		port := next_port(r)
+		udp_port := next_port(r)
 		srv, ok := start_server(
 			r,
 			Server_Options {
 				config = config_rate_limit(
-					port,
+					udp_port,
 					upstream_port,
 					fmt.tprintf("enabled: true, responses_per_second: %d, slip: 2", RATE),
 				),
-				port = port,
+				udp_port = udp_port,
 			},
 		)
 		if check(r, ok, "server did not start") {
 			defer stop_server(&srv)
-			limited := udp_flood(port, query, QUERIES)
+			limited := udp_flood(udp_port, query, QUERIES)
 
 			port2 := next_port(r)
 			srv2, ok2 := start_server(
 				r,
 				Server_Options {
 					config = config_rate_limit(port2, upstream_port, "enabled: false"),
-					port = port2,
+					udp_port = port2,
 				},
 			)
 			if check(r, ok2, "the unlimited server did not start") {

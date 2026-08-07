@@ -19,7 +19,7 @@ run_upstream_doh2_cases :: proc(r: ^Runner) {
 			skip_case(r, "upstream: doh over h2", "cannot start the mock")
 		} else {
 			defer doh2_mock_stop(mock)
-			port := next_port(r)
+			udp_port := next_port(r)
 			config := fmt.tprintf(
 				`log: {{ level: warn }}
 listeners:
@@ -32,14 +32,14 @@ upstream:
 cache: {{ enabled: false }}
 blocking: {{ enabled: false }}
 `,
-				port,
+				udp_port,
 				upstream_port,
 			)
-			srv, ok := start_server(r, Server_Options{config = config, port = port})
+			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 			if ok {
 				start_case(r, "upstream: resolves a query over a DoH/h2 upstream")
 				{
-					res := query_udp(port, build_query(fix.qname, fix.qtype))
+					res := query_udp(udp_port, build_query(fix.qname, fix.qtype))
 					if check(r, res.ok, "no response") {
 						h, _ := parse_header(res.wire)
 						check_eq_int(r, h.ancount, fix.ancount, "answer count")
@@ -54,7 +54,7 @@ blocking: {{ enabled: false }}
 				{
 					before_h2, _ := doh2_mock_counts(mock)
 					for i in 0 ..< 5 {
-						res := query_udp(port, build_query(fix.qname, fix.qtype, id = u16(500 + i)))
+						res := query_udp(udp_port, build_query(fix.qname, fix.qtype, id = u16(500 + i)))
 						check(r, res.ok, "no response on query %d", i)
 					}
 					after_h2, _ := doh2_mock_counts(mock)
@@ -78,7 +78,7 @@ blocking: {{ enabled: false }}
 			skip_case(r, "upstream: doh h2 alpn fallback", "cannot start the mock")
 		} else {
 			defer doh2_mock_stop(mock)
-			port := next_port(r)
+			udp_port := next_port(r)
 			config := fmt.tprintf(
 				`log: {{ level: warn }}
 listeners:
@@ -91,14 +91,14 @@ upstream:
 cache: {{ enabled: false }}
 blocking: {{ enabled: false }}
 `,
-				port,
+				udp_port,
 				upstream_port,
 			)
-			srv, ok := start_server(r, Server_Options{config = config, port = port})
+			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 			if ok {
 				start_case(r, "upstream: falls back to http/1.1 when the upstream does not offer h2")
 				{
-					res := query_udp(port, build_query(fix.qname, fix.qtype))
+					res := query_udp(udp_port, build_query(fix.qname, fix.qtype))
 					if check(r, res.ok, "no response") {
 						h, _ := parse_header(res.wire)
 						check_eq_int(r, h.ancount, fix.ancount, "answer count")

@@ -11,7 +11,7 @@ endpoint's HTTP behaviour.
 */
 
 @(private = "file")
-config_all_transports :: proc(r: ^Runner, port, dot_port, doh_port, upstream_port: int) -> string {
+config_all_transports :: proc(r: ^Runner, udp_port, dot_port, doh_port, upstream_port: int) -> string {
 	return fmt.tprintf(
 		`log: {{ level: debug, queries: true }}
 listeners:
@@ -25,8 +25,8 @@ upstream:
 cache: {{ enabled: false }}
 blocking: {{ enabled: false }}
 `,
-		port,
-		port,
+		udp_port,
+		udp_port,
 		dot_port,
 		r.cert_file,
 		r.key_file,
@@ -49,15 +49,15 @@ run_transport_cases :: proc(r: ^Runner) {
 	}
 	defer mock_stop(mock)
 
-	port := next_port(r)
+	udp_port := next_port(r)
 	dot_port := next_port(r)
 	doh_port := next_port(r)
 	srv, ok := start_server(
 		r,
 		Server_Options {
-			config = config_all_transports(r, port, dot_port, doh_port, upstream_port),
-			port = port,
-			tcp_port = port,
+			config = config_all_transports(r, udp_port, dot_port, doh_port, upstream_port),
+			udp_port = udp_port,
+			tcp_port = udp_port,
 			dot_port = dot_port,
 			doh_port = doh_port,
 		},
@@ -76,7 +76,7 @@ run_transport_cases :: proc(r: ^Runner) {
 	// --- UDP ---
 	start_case(r, "udp: forwards and returns the answer")
 	{
-		res := query_udp(port, query)
+		res := query_udp(udp_port, query)
 		if check(r, res.ok, "no response over UDP") {
 			h, _ := parse_header(res.wire)
 			check(r, h.id == 0x1111, "transaction ID not echoed: got %04x", h.id)
@@ -92,7 +92,7 @@ run_transport_cases :: proc(r: ^Runner) {
 	// --- TCP ---
 	start_case(r, "tcp: length-prefixed framing")
 	{
-		res := query_tcp(port, query)
+		res := query_tcp(udp_port, query)
 		if check(r, res.ok, "no response over TCP") {
 			h, _ := parse_header(res.wire)
 			check_eq_int(r, h.ancount, fix.ancount, "answer count")
@@ -106,7 +106,7 @@ run_transport_cases :: proc(r: ^Runner) {
 		q1 := build_query(fix.qname, fix.qtype, id = 1)
 		q2 := build_query(fix.qname, fix.qtype, id = 2)
 		q3 := build_query(fix.qname, fix.qtype, id = 3)
-		results := query_tcp_multi(port, [][]u8{q1, q2, q3})
+		results := query_tcp_multi(udp_port, [][]u8{q1, q2, q3})
 		for res, i in results {
 			if !check(r, res.ok, "query %d on the shared connection failed", i + 1) {
 				break
@@ -280,7 +280,7 @@ run_transport_cases :: proc(r: ^Runner) {
 	start_case(r, "chaos: version.bind reports the build")
 	{
 		q := build_query("version.bind.", u16(dns.Type.TXT), class = u16(dns.Class.CH))
-		res := query_udp(port, q)
+		res := query_udp(udp_port, q)
 		if check(r, res.ok, "no response") {
 			msg, err := dns.decode_message(res.wire, context.temp_allocator)
 			if check(r, err == .None, "cannot decode the response") &&
@@ -298,7 +298,7 @@ run_transport_cases :: proc(r: ^Runner) {
 	{
 		for qtype in ([]u16{252, 251}) { 	// AXFR, IXFR
 			q := build_query("example.com.", qtype)
-			res := query_udp(port, q)
+			res := query_udp(udp_port, q)
 			if check(r, res.ok, "no response for type %d", qtype) {
 				h, _ := parse_header(res.wire)
 				check(r, h.rcode == int(dns.Rcode.Refused), "type %d: rcode %d, want REFUSED", qtype, h.rcode)
@@ -310,7 +310,7 @@ run_transport_cases :: proc(r: ^Runner) {
 	start_case(r, "refuses classes other than IN and CH")
 	{
 		q := build_query("example.com.", u16(dns.Type.A), class = 4) // HS
-		res := query_udp(port, q)
+		res := query_udp(udp_port, q)
 		if check(r, res.ok, "no response") {
 			h, _ := parse_header(res.wire)
 			check(r, h.rcode == int(dns.Rcode.Refused), "rcode %d, want REFUSED", h.rcode)
