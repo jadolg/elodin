@@ -600,6 +600,13 @@ finds out rather than timing out:
 ts=… level=info msg="query client=198.51.100.7:41234 proto=udp qtype=A qname=\"example.com\" outcome=refused detail=\"rd\" ms=0.1"
 ```
 
+It does not add to `refused=` in the stats line — that counter is `allow_from`
+turning away a source before a query exists at all, and this is a source
+already on the list asking a question this server answered, just not by
+recursing. An operator graphing `refused=` as an unexpected-traffic signal
+will not see RD=0 probes there; the query log, with `log.queries` on, is where
+they show up.
+
 There is no setting for this; it is not a policy an operator tunes, only a bit
 a client sends. The refusal still comes back with RA=1: RFC 1035 section 4.1.1
 makes RA a statement that the server supports recursive service, not that this
