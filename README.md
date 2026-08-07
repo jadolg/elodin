@@ -601,13 +601,11 @@ ts=… level=info msg="query client=198.51.100.7:41234 proto=udp qtype=A qname=\
 ```
 
 There is no setting for this; it is not a policy an operator tunes, only a bit
-a client sends. The RA bit follows RD back on every answer this server builds
-itself — a refusal, a CHAOS reply, a blocked or rewritten one — so RA says
-whether *this* answer had recursion behind it, not whether elodin offers the
-service in general. A cached or forwarded answer is the one exception: its OPT
-and flags are the upstream's own, RA included, passed through rather than
-rebuilt — see [UDP payload size](#how-large-a-udp-answer-may-be) for the same
-rule applied to the OPT record.
+a client sends. The refusal still comes back with RA=1: RFC 1035 section 4.1.1
+makes RA a statement that the server supports recursive service, not that this
+particular query used it, and that is also what BIND and Unbound do with a
+query their own ACL declines to recurse for. The capability is on offer; this
+one request just did not draw on it.
 
 ### How large a UDP answer may be
 

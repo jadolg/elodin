@@ -43,14 +43,13 @@ make_opt :: proc(udp_size: u16, do_bit: bool, ext_rcode: u8 = 0) -> Record {
 
 /*
 Build a response skeleton mirroring `query`: same ID and question, QR set, RD
-copied, RA tied to it, and an OPT record echoed back when the query carried
-one.
+copied, RA set, and an OPT record echoed back when the query carried one.
 
-RA is not a blanket "this server can recurse" - it answers whether recursion
-was available for *this* query, and a query that came in with RD=0 never got
-any: `resolve_query` refuses rather than forwards on its behalf. Copying RD
-into RA keeps the two honest with each other instead of promising a service
-that was never on offer.
+RA is answered per RFC 1035 section 4.1.1: whether this server supports
+recursive service at all, not whether this particular query got any. A query
+refused for arriving with RD=0 still gets RA=1 back - the same way BIND and
+Unbound keep answering RA=1 to a query an ACL declines to recurse for. The
+capability is on offer; this request just did not use it.
 */
 make_response :: proc(query: Message, rcode: Rcode, allocator := context.allocator) -> Message {
 	resp: Message
@@ -58,7 +57,7 @@ make_response :: proc(query: Message, rcode: Rcode, allocator := context.allocat
 	resp.flags.qr = true
 	resp.flags.opcode = query.flags.opcode
 	resp.flags.rd = query.flags.rd
-	resp.flags.ra = query.flags.rd
+	resp.flags.ra = true
 	resp.flags.cd = query.flags.cd
 	resp.flags.rcode = u8(rcode) & 0xf
 	resp.question = query.question
@@ -116,7 +115,7 @@ truncated_response :: proc(query_bytes: []u8, allocator := context.allocator) ->
 	copy(buf, query_bytes[:end])
 	flags := transmute(Flags)(u16(buf[2]) << 8 | u16(buf[3]))
 	flags.qr = true
-	flags.ra = flags.rd
+	flags.ra = true
 	flags.tc = true
 	// As in `error_response`: every bit here started as the client's, and AD
 	// coming back set would read as this server vouching for something.
@@ -176,7 +175,7 @@ error_response :: proc(
 	copy(buf, query_bytes[:HEADER_SIZE])
 	flags := transmute(Flags)(u16(buf[2]) << 8 | u16(buf[3]))
 	flags.qr = true
-	flags.ra = flags.rd
+	flags.ra = true
 	flags.tc = false
 	// Built out of the query's own header, so every bit in it started as the
 	// client's. AD is the one that must not survive the round trip: coming back

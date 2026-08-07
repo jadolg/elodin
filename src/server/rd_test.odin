@@ -55,7 +55,10 @@ test_rd_zero_is_refused_without_forwarding :: proc(t: ^testing.T) {
 	decoded, derr := dns.decode_message(out, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
 	testing.expect_value(t, dns.rcode_of(decoded), dns.Rcode.Refused)
-	testing.expect(t, !decoded.flags.ra, "RA set on an answer to a query that never asked for recursion")
+	// RA says the server offers recursion, not that this query used it - RFC
+	// 1035 section 4.1.1. Declining to recurse for this one does not mean the
+	// service is off.
+	testing.expect(t, decoded.flags.ra, "RA not set on a refusal, though the server still offers recursion")
 
 	free_all(context.temp_allocator)
 }
@@ -63,7 +66,11 @@ test_rd_zero_is_refused_without_forwarding :: proc(t: ^testing.T) {
 /*
 A cache hit answers what this server already knows without going anywhere, so
 RD=0 does not stand in its way - the gate sits after the cache lookup, not
-before it.
+before it. The stored answer's own RA - the upstream's, from whenever it was
+first fetched - rides along untouched: it is not rebuilt through
+`make_response`, and nothing here re-derives it from this client's RD, which
+this client set to false specifically to catch that mistake if it is ever
+made.
 */
 @(test)
 test_rd_zero_is_still_served_from_cache :: proc(t: ^testing.T) {
@@ -110,7 +117,14 @@ test_rd_zero_is_still_served_from_cache :: proc(t: ^testing.T) {
 		return
 	}
 	testing.expect_value(t, outcome, Outcome.Cached)
-	_ = out
+
+	served, serr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, serr, dns.Decode_Error.None)
+	testing.expect(
+		t,
+		served.flags.ra,
+		"RA on a cached answer was recomputed from this query's RD instead of carrying the stored bit through",
+	)
 
 	free_all(context.temp_allocator)
 }
