@@ -46,6 +46,8 @@ list:
     body: >
       folded inside a sequence # entry
     tail: 7
+  - |
+    a bare block entry # with content
 
 quoted_key_block:
   "a\": b": |

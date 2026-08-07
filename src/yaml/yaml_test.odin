@@ -449,6 +449,96 @@ test_block_scalar_ends_below_its_own_indent :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_block_scalar_stops_at_its_own_indent :: proc(t: ^testing.T) {
+	// The scanner ends a block at the block's own indentation, but the read
+	// back used the key's indentation, so a content line that cleared the key
+	// while falling short of the block was swallowed into the scalar instead
+	// of ending it.
+	_, err := parse("a: |\n    x\n  y\nb: 2\n", context.temp_allocator)
+	testing.expectf(t, err != nil, "a line short of the block's indent should end the block")
+	if err == nil {
+		free_all(context.temp_allocator)
+		return
+	}
+	testing.expect_value(t, err.?.line, 3)
+
+	_, ferr := parse("a: >\n    deep\n  y\nb: 2\n", context.temp_allocator)
+	testing.expectf(t, ferr != nil, "folded: a line short of the block's indent should end the block")
+
+	// A line at exactly the block's indentation is still part of the block.
+	root, ok := parse("a: |\n    x\n    y\n", context.temp_allocator)
+	testing.expectf(t, ok == nil, "parse failed: %v", ok)
+	a, aok := as_string(get(root, "a"))
+	testing.expect(t, aok, "a missing")
+	testing.expect_value(t, a, "x\ny\n")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_block_scalar_as_sequence_entry :: proc(t: ^testing.T) {
+	// A block scalar as a bare sequence entry, `- |`, used to fall through to
+	// the plain-scalar path: its body was read as YAML and the parse failed.
+	root, err := parse("- |\n  text # kept\n- x\n", context.temp_allocator)
+	testing.expectf(t, err == nil, "parse failed: %v", err)
+	seq := items(root)
+	if !testing.expect_value(t, len(seq), 2) {
+		free_all(context.temp_allocator)
+		return
+	}
+	t0, ok0 := as_string(seq[0])
+	testing.expect(t, ok0, "first item missing")
+	testing.expect_value(t, t0, "text # kept\n")
+	t1, ok1 := as_string(seq[1])
+	testing.expect(t, ok1, "second item missing")
+	testing.expect_value(t, t1, "x")
+
+	// A folded scalar works the same way, and deeper indentation is fine.
+	froot, ferr := parse("- >\n  one\n  two\n- 2\n", context.temp_allocator)
+	testing.expectf(t, ferr == nil, "folded parse failed: %v", ferr)
+	fseq := items(froot)
+	if !testing.expect_value(t, len(fseq), 2) {
+		free_all(context.temp_allocator)
+		return
+	}
+	f0, fok := as_string(fseq[0])
+	testing.expect(t, fok, "folded item missing")
+	testing.expect_value(t, f0, "one two")
+	f1, f1ok := as_int(fseq[1])
+	testing.expect(t, f1ok, "folded int missing")
+	testing.expect_value(t, f1, i64(2))
+
+	// A nested sequence resolves the parent column through two dashes.
+	nroot, nerr := parse("- - |\n    t\n", context.temp_allocator)
+	testing.expectf(t, nerr == nil, "nested parse failed: %v", nerr)
+	nseq := items(nroot)
+	if !testing.expect_value(t, len(nseq), 1) {
+		free_all(context.temp_allocator)
+		return
+	}
+	inner := items(nseq[0])
+	if !testing.expect_value(t, len(inner), 1) {
+		free_all(context.temp_allocator)
+		return
+	}
+	iv, iok := as_string(inner[0])
+	testing.expect(t, iok, "nested item missing")
+	testing.expect_value(t, iv, "t\n")
+
+	// An entry with no body at all is an empty scalar, not the string "|".
+	eroot, eerr := parse("- |\n- x\n", context.temp_allocator)
+	testing.expectf(t, eerr == nil, "empty parse failed: %v", eerr)
+	eseq := items(eroot)
+	if !testing.expect_value(t, len(eseq), 2) {
+		free_all(context.temp_allocator)
+		return
+	}
+	ev, eok := as_string(eseq[0])
+	testing.expect(t, eok, "empty item missing")
+	testing.expect_value(t, ev, "")
+	free_all(context.temp_allocator)
+}
+
+@(test)
 test_folded_scalar_blank_line_is_a_break :: proc(t: ^testing.T) {
 	// Folding joins lines with a space, but a blank line between them is a
 	// paragraph break. Blank lines only reach the folder now that the scanner

@@ -137,18 +137,34 @@ scan_lines :: proc(p: ^Parser, src: string) -> Maybe(Error) {
 	return nil
 }
 
+// Whether `s` is a block scalar header: `|` or `>` with at most one chomping
+// indicator, the same shapes parse_block_scalar accepts.
+@(private)
+is_block_header :: proc(s: string) -> bool {
+	if len(s) == 0 || (s[0] != '|' && s[0] != '>') {
+		return false
+	}
+	return len(s) == 1 || (len(s) == 2 && (s[1] == '-' || s[1] == '+'))
+}
+
 // Reports the indentation a block scalar's body must exceed, when `body` is a
-// `key:` line whose value opens one. `- key: |` nests the block under the
-// entry's content column, which is the same rewrite parse_sequence performs.
+// line whose value opens one. `- key: |` nests the block under the entry's
+// content column, which is the same rewrite parse_sequence performs, while
+// `- |` nests it under the dash itself: the block is the entry's own value.
 @(private)
 opens_block_scalar :: proc(body: string, indent: int) -> (parent: int, opens: bool) {
 	text, col := body, indent
+	dash_col := -1
 	for is_sequence_entry(text) {
+		dash_col = col
 		text, col = strings.trim_space(text[1:]), entry_content_col(text, col)
+	}
+	if is_block_header(text) {
+		return dash_col if dash_col >= 0 else 0, dash_col >= 0
 	}
 	colon := find_key_colon(text) or_return
 	value := strings.trim_space(text[colon + 1:])
-	if len(value) == 0 || (value[0] != '|' && value[0] != '>') {
+	if !is_block_header(value) {
 		return 0, false
 	}
 	return col, true
@@ -377,6 +393,17 @@ parse_sequence :: proc(p: ^Parser, indent: int) -> ^Node {
 			continue
 		}
 
+		// `- |` and `- >`: the entry's value is a block scalar, read back at
+		// the sequence's indentation like the value of any other key.
+		if len(rest) > 0 && (rest[0] == '|' || rest[0] == '>') {
+			p.pos += 1
+			append(&node.seq, parse_block_scalar(p, rest, indent, line.num))
+			if _, has := p.err.?; has {
+				return node
+			}
+			continue
+		}
+
 		// `- key: value` starts a mapping whose body may continue on following
 		// lines aligned with `key`. Rewrite the entry as a plain line at that
 		// column and let the block parser take it from there.
@@ -435,8 +462,16 @@ parse_block_scalar :: proc(p: ^Parser, header: string, indent: int, line_num: in
 	// them is a paragraph break and stays a newline. Blank lines only reach
 	// here now that the scanner keeps them, so folding has to account for them.
 	blanks, wrote := 0, false
-	for p.pos < len(p.lines) && p.lines[p.pos].indent > indent {
+	for p.pos < len(p.lines) {
 		l := p.lines[p.pos]
+		if l.indent <= indent {
+			break
+		}
+		// A line short of the block's own indentation ends it, the same rule
+		// the scanner applies: it clears the key yet sits outside the block.
+		if block_indent >= 0 && l.indent < block_indent {
+			break
+		}
 		if block_indent < 0 {
 			block_indent = l.indent
 		}
