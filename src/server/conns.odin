@@ -38,29 +38,49 @@ conn_manager_init :: proc(cm: ^Conn_Manager, limit: int) {
 }
 
 /*
+Why a spawn did not happen.
+
+Two things stop one, and they ask for opposite responses from an operator.
+`Limit_Reached` is `server.max_connections` doing its job, and raising it is the
+fix. `Thread_Failed` is the OS refusing a thread - `RLIMIT_NPROC`, or memory -
+and it can happen far below the limit, where raising the limit cannot help and
+the number in the log would send somebody the wrong way.
+*/
+Spawn_Result :: enum u8 {
+	Started,
+	Limit_Reached,
+	Thread_Failed,
+}
+
+/*
 Start `fn` on its own thread, unless the connection limit has been reached.
 
-Returns false when the caller should refuse the connection instead. Pass
+Anything but `.Started` means the caller should refuse the connection. Pass
 `counted = false` for the server's own listener loops, which run for the
 process's lifetime and are not client connections.
 */
-conn_spawn :: proc(cm: ^Conn_Manager, data: rawptr, fn: proc(data: rawptr), counted := true) -> bool {
+conn_spawn :: proc(
+	cm: ^Conn_Manager,
+	data: rawptr,
+	fn: proc(data: rawptr),
+	counted := true,
+) -> Spawn_Result {
 	sync.mutex_lock(&cm.mu)
 	defer sync.mutex_unlock(&cm.mu)
 
 	reap_locked(cm)
 	if counted && len(cm.threads) - cm.permanent >= cm.limit {
-		return false
+		return .Limit_Reached
 	}
 	t := thread.create_and_start_with_poly_data(data, fn)
 	if t == nil {
-		return false
+		return .Thread_Failed
 	}
 	append(&cm.threads, Conn_Thread{handle = t, permanent = !counted})
 	if !counted {
 		cm.permanent += 1
 	}
-	return true
+	return .Started
 }
 
 @(private)

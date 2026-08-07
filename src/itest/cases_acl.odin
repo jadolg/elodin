@@ -202,10 +202,16 @@ run_acl_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
-	// The stream listeners refuse on accept, where there is even less for the
-	// client to go on - so the same line, naming the transport it happened on.
-	// A fresh server, because the line above is printed once per process.
-	start_case(r, "allow_from: a refused tcp connection is logged too")
+	/*
+	The stream listeners refuse on accept, where there is even less for the
+	client to go on - so the same line, naming the transport it happened on.
+	A fresh server, because the line above is printed once per process.
+
+	And naming a connection rather than a query: the check runs before a byte
+	has been read, so there never was a query to refuse. The `refused=` counter
+	is a sum of the two units, and the wording is what says which one a line is.
+	*/
+	start_case(r, "allow_from: a refused tcp connection is logged as a connection")
 	{
 		srv, tcp_port, ok := start_denying_server(r, upstream_port)
 		if check(r, ok, "server did not start") {
@@ -216,8 +222,14 @@ run_acl_cases :: proc(r: ^Runner) {
 			time.sleep(200 * time.Millisecond)
 			check(
 				r,
-				log_contains(&srv, "tcp: refused a query from"),
+				log_contains(&srv, "tcp: refused a connection from"),
 				"a refused tcp connection left nothing in the log; log:\n%s",
+				read_log(&srv),
+			)
+			check(
+				r,
+				!log_contains(&srv, "tcp: refused a query from"),
+				"a tcp connection refused on accept was logged as a refused query; log:\n%s",
 				read_log(&srv),
 			)
 		}

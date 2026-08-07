@@ -208,6 +208,7 @@ attach_cookie :: proc(
 	req: Cookie_Request,
 	query: dns.Message,
 	limit: int,
+	advertise: u16,
 	allocator: mem.Allocator,
 ) -> []u8 {
 	// Named as the two verdicts that earn a cookie rather than the ones that do
@@ -216,12 +217,36 @@ attach_cookie :: proc(
 		return wire
 	}
 	cookie := make_cookie(k, req, cookie_now())
-	out, ok := dns.ensure_edns_option(wire, .Cookie, cookie[:], dns.edns_udp_size(query), allocator)
+	/*
+	`advertise` is whatever the answer is going out reporting, worked out once by
+	the caller.
+
+	Only a record minted here can be affected: `ensure_edns_option` passes this
+	to `make_opt` for an answer from an upstream that dropped EDNS, and leaves an
+	existing OPT record's class alone. On UDP that is the ceiling, and
+	`handle_query` writes it again over the top a moment later, so the value is
+	belt and braces there. On the stream transports nothing writes it again, and
+	it is the client's own figure - the same number this passed before, and the
+	only one available on a transport where this server has no payload size to
+	report.
+	*/
+	out, ok := dns.ensure_edns_option(wire, .Cookie, cookie[:], advertise, allocator)
 	if !ok {
 		// Nothing to do but send the answer as it is; a client that gets no
 		// cookie back reads it as a server that does not do them.
 		return wire
 	}
+	/*
+	An answer the cookie pushes past the ceiling is truncated rather than sent
+	without one.
+
+	The other way round is available - drop the cookie, send the whole answer -
+	and it is the wrong trade here. `encode_message` re-adds the OPT record
+	after truncating, so the cookie survives this and the client is told to ask
+	again over TCP; dropping it instead would cost the client its cookie on
+	exactly the answers `cookies.require` is meant to protect, and a client that
+	gets no cookie back reads it as a server that does not do them.
+	*/
 	if len(out) > limit {
 		return fit_response(out, limit, query, allocator)
 	}

@@ -394,3 +394,75 @@ test_peek_rcode_reads_the_extended_bits :: proc(t: ^testing.T) {
 	testing.expect_value(t, peek_rcode([]u8{1, 2}), Rcode.No_Error)
 	free_all(context.temp_allocator)
 }
+
+/*
+The payload size an answer advertises is written back onto the bytes it will go
+out as.
+
+RFC 6891 section 6.2.4 makes the OPT record's CLASS field in a response the
+responder's own number rather than a copy of the requestor's, and the number
+this server can honour is only known once the transport and the configured
+ceiling have been resolved - by which point the answer is already encoded, and
+may be an upstream's bytes or a cache entry that must keep the name compression
+it came with. So the two bytes are set in place.
+*/
+@(test)
+test_set_edns_udp_size_rewrites_the_opt_class :: proc(t: ^testing.T) {
+	wire := opt_query(nil)
+	testing.expect(t, wire != nil, "could not build the query")
+	testing.expect_value(t, int(peek_udp_size(wire)), 1232)
+
+	testing.expect(t, set_edns_udp_size(wire, 512), "set_edns_udp_size failed")
+	testing.expect_value(t, int(peek_udp_size(wire)), 512)
+
+	// Nothing else moved: the message still decodes and still carries one OPT.
+	m, derr := decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	testing.expect_value(t, len(m.additional), 1)
+	testing.expect_value(t, int(edns_udp_size(m)), 512)
+
+	// And it is a plain assignment, not a ceiling: raising it works too.
+	testing.expect(t, set_edns_udp_size(wire, 4096), "set_edns_udp_size failed on the way up")
+	testing.expect_value(t, int(peek_udp_size(wire)), 4096)
+
+	free_all(context.temp_allocator)
+}
+
+// The options behind the record are untouched: only the class field moves.
+@(test)
+test_set_edns_udp_size_keeps_the_options :: proc(t: ^testing.T) {
+	existing := []EDNS_Option{{code = u16(EDNS_Option_Code.NSID), data = []u8{'x', 'y'}}}
+	wire := opt_query(existing)
+	testing.expect(t, wire != nil, "could not build the query")
+
+	testing.expect(t, set_edns_udp_size(wire, 1232), "set_edns_udp_size failed")
+	testing.expect_value(t, int(peek_udp_size(wire)), 1232)
+
+	nsid, found := option_data(wire, .NSID)
+	testing.expect(t, found, "the NSID option was lost")
+	testing.expect(t, mem.compare(nsid, []u8{'x', 'y'}) == 0, "the NSID option was corrupted")
+
+	free_all(context.temp_allocator)
+}
+
+/*
+A message with no OPT record is left alone and says so.
+
+A client that asked without EDNS gets no OPT back, and there is no field to
+write a number into. Reporting that is what lets the caller tell it apart from a
+message it could not walk, and neither is a reason to refuse the answer.
+*/
+@(test)
+test_set_edns_udp_size_reports_a_message_with_no_opt :: proc(t: ^testing.T) {
+	plain := plain_answer()
+	testing.expect(t, plain != nil, "could not build the answer")
+	before := make([]u8, len(plain), context.temp_allocator)
+	copy(before, plain)
+
+	testing.expect(t, !set_edns_udp_size(plain, 1232), "set_edns_udp_size invented an OPT record")
+	testing.expect(t, mem.compare(plain, before) == 0, "the message was changed anyway")
+
+	testing.expect(t, !set_edns_udp_size([]u8{1, 2, 3}, 1232), "a message too short to hold a header was accepted")
+
+	free_all(context.temp_allocator)
+}

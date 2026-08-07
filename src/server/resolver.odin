@@ -31,31 +31,60 @@ Outcome :: enum u8 {
 }
 
 Stats :: struct {
-	queries:   u64,
-	blocked:   u64,
-	cached:    u64,
-	forwarded: u64,
-	failed:    u64,
-	rewritten: u64,
+	queries:      u64,
+	blocked:      u64,
+	cached:       u64,
+	forwarded:    u64,
+	failed:       u64,
+	rewritten:    u64,
 	/*
 	Queries refused before any work was done: the backlog was full, or the
 	source was one no answer could reach - see `plausible_source`. Queries the
 	rate limiter withheld are counted by the limiter itself.
 	*/
-	dropped:   u64,
+	dropped:      u64,
 	/*
-	Queries turned away because of `server.allow_from`.
+	Traffic turned away because of `server.allow_from`: a datagram on UDP, and a
+	connection on the stream transports, where the check runs on accept before a
+	byte has been read. The number is the sum of the two units rather than a
+	count of queries, which is what the log line's wording says of each one.
 
 	Counted apart from `dropped` because the two ask different questions of an
 	operator. A rising `dropped` is a server that cannot keep up; a rising
 	`refused` is a client that is not on the list - which is either the internet
 	finding an open port, or somebody's own subnet that nobody added.
 	*/
-	refused:   u64,
+	refused:      u64,
+	/*
+	Connections turned away because `server.max_connections` was already full.
+
+	Counted rather than only logged, because the log says it once. The line for
+	this is demoted to `debug` after the first, on the reasoning that a peer
+	opening connections past the limit would otherwise decide how much this
+	server writes to disk - and that reasoning only holds if something else goes
+	on counting. Without this, a server sitting at its limit for a week shows one
+	`warn` from the first minute and nothing since.
+
+	Apart from `refused`, which is the allow list turning a source away: this is
+	a client this server would serve and has no room for, and the setting to
+	reach for is a different one.
+	*/
+	conn_refused: u64,
+	/*
+	Connections turned away because the OS would not start a thread for one.
+
+	Counted apart from `conn_refused` because it happens *below* the limit -
+	`RLIMIT_NPROC`, a cgroup `pids.max`, or memory - and the two point an
+	operator in opposite directions. Folded together, a host that ran out of
+	threads at a tenth of `max_connections` would read as a server that had
+	filled it, and the obvious response would be to raise a number that was never
+	the bound.
+	*/
+	conn_failed:  u64,
 	// Answers that carried a valid chain of signatures, and answers refused
 	// because they did not.
-	secure:    u64,
-	bogus:     u64,
+	secure:       u64,
+	bogus:        u64,
 }
 
 Server :: struct {
@@ -102,9 +131,11 @@ handle_query :: proc(
 	}
 
 	msg, derr := dns.decode_message(query, allocator)
+	limit := response_limit(s, msg, proto)
+	advertise := advertised_udp_size(s, msg, proto)
 	if derr != .None {
-		out, built := dns.error_response(query, {}, .Form_Err, allocator, response_limit(s, msg, proto))
-		return out, .Failed, built
+		out, built := dns.error_response(query, {}, .Form_Err, allocator, limit)
+		return advertise_udp_size(out, advertise, proto), .Failed, built
 	}
 	// A response arriving on a listener port is not something to answer.
 	if msg.flags.qr {
@@ -112,21 +143,97 @@ handle_query :: proc(
 	}
 
 	cookie := inspect_cookie(s.cookies, msg, client)
-	limit := response_limit(s, msg, proto)
 
 	// A cookie of an impossible length is the one case RFC 7873 section 5.2.2
 	// answers with FORMERR, and the one response that carries no cookie back:
 	// there is no telling which eight of those bytes were the client's.
 	if cookie.verdict == .Malformed {
 		out, built := dns.error_response(query, msg, .Form_Err, allocator, limit)
-		return out, .Failed, built
+		return advertise_udp_size(out, advertise, proto), .Failed, built
 	}
 
 	response, outcome, ok = resolve_query(s, query, msg, proto, client, limit, cookie, started, allocator)
 	if ok {
-		response = attach_cookie(s.cookies, response, cookie, msg, limit, allocator)
+		response = attach_cookie(s.cookies, response, cookie, msg, limit, advertise, allocator)
+		/*
+		Last, so that nothing after it can put another number back.
+
+		The four ways an answer reaches this point disagree about what its OPT
+		record says: a locally built one echoes the client's figure, a forwarded
+		or cached one carries the upstream's, and `attach_cookie` re-encodes over
+		the top of either. Writing it here rather than in each of them is what
+		makes the guarantee hold for a path added later, and the cached case
+		needs it here anyway - the stored wire is shared between clients and is
+		not this server's number to begin with.
+		*/
+		response = advertise_udp_size(response, advertise, proto)
 	}
 	return response, outcome, ok
+}
+
+/*
+The ceiling on a UDP response, floored at the smallest response there is.
+
+Every `Config` in a running server comes from `default_config` and is then
+validated, so the field is never below 512 there. But a zero one - a `Config`
+built literally, which is a thing a caller can do - would truncate every answer
+to nothing, and a resolver that answers nothing at all is too quiet a failure to
+leave resting on a convention held one package away.
+*/
+@(private)
+udp_ceiling :: proc(s: ^Server) -> int {
+	return max(s.cfg.server.max_udp_response, config.MIN_UDP_RESPONSE)
+}
+
+/*
+The UDP payload size this server puts in an answer's OPT record.
+
+RFC 6891 section 6.2.4 makes that field the responder's own maximum rather than
+a copy of the requestor's - the counterpart to `max-udp-size` in BIND and
+Unbound, both of which report their own figure independently of what was asked
+for. So it is the ceiling, not `response_limit`: the two differ for a client that
+advertised less than the ceiling, and reporting the smaller number there is the
+same defect as reporting the larger one, inverted. A downstream forwarder that
+advertised a conservative 512 would read 512 back, conclude this server cannot
+deliver more, and keep paying for TC bits and TCP retries the 1232 ceiling would
+have spared it.
+
+What bounds the answer itself is still `response_limit`, which is the smaller of
+the two. The field says what this server can deliver; it was never a statement
+about one reply.
+
+On the stream transports the limit is the DNS framing rather than a datagram, so
+there is no payload size of ours to report - writing the ceiling there would
+claim a UDP bound on a transport it does not apply to, and writing
+`response_limit` would advertise 65535, which is not a payload size at all. The
+answer's OPT goes back as it stands, whatever it says.
+*/
+@(private)
+advertised_udp_size :: proc(s: ^Server, query: dns.Message, proto: Protocol) -> u16 {
+	if proto != .UDP {
+		return dns.edns_udp_size(query)
+	}
+	// `udp_ceiling` already lands in [512, 4096] for every `Config` this server
+	// runs on. Clamped anyway, because what is being written is two bytes of a
+	// field with its own range, and a number from outside it would be truncated
+	// into something arbitrary rather than refused.
+	return u16(clamp(udp_ceiling(s), config.MIN_UDP_RESPONSE, config.MAX_UDP_RESPONSE))
+}
+
+/*
+Write that size onto an answer that is already encoded.
+
+A no-op for a client that asked without EDNS: there is no OPT record to carry a
+number and none is invented for one. A no-op on the stream transports too, where
+the field bounds nothing and the answer's own OPT is left as it is.
+*/
+@(private)
+advertise_udp_size :: proc(wire: []u8, size: u16, proto: Protocol) -> []u8 {
+	if proto != .UDP || len(wire) < dns.HEADER_SIZE {
+		return wire
+	}
+	_ = dns.set_edns_udp_size(wire, size)
+	return wire
 }
 
 @(private)
@@ -393,19 +500,9 @@ reason to make a client ask twice for an answer that fits.
 @(private)
 response_limit :: proc(s: ^Server, msg: dns.Message, proto: Protocol) -> int {
 	if proto == .UDP {
-		/*
-		Floored at the smallest response there is, rather than trusted to be in
-		range.
-
-		Every `Config` in a running server comes from `default_config` and is
-		then validated, so the field is never below 512 there. But a zero one -
-		a `Config` built literally, which is a thing a caller can do - would
-		truncate every answer to nothing, and a resolver that answers nothing at
-		all is too quiet a failure to leave resting on a convention held one
-		package away.
-		*/
-		ceiling := max(s.cfg.server.max_udp_response, config.MIN_UDP_RESPONSE)
-		return min(int(dns.edns_udp_size(msg)), ceiling)
+		// Floored by `udp_ceiling` rather than trusted to be in range: a zero
+		// ceiling read straight through would truncate every answer to nothing.
+		return min(int(dns.edns_udp_size(msg)), udp_ceiling(s))
 	}
 	return dns.MAX_MESSAGE
 }
@@ -800,6 +897,8 @@ stats_of :: proc(s: ^Server) -> Stats {
 		rewritten = sync.atomic_load(&s.stats.rewritten),
 		dropped = sync.atomic_load(&s.stats.dropped),
 		refused = sync.atomic_load(&s.stats.refused),
+		conn_refused = sync.atomic_load(&s.stats.conn_refused),
+		conn_failed = sync.atomic_load(&s.stats.conn_failed),
 		secure = sync.atomic_load(&s.stats.secure),
 		bogus = sync.atomic_load(&s.stats.bogus),
 	}
