@@ -587,6 +587,33 @@ Note the `[]`. Writing `allow_from:` with nothing after it is a configuration
 error rather than either reading of it: YAML makes that a null, and the two
 things it could have meant here are the shipped default and its exact opposite.
 
+### Recursion only when asked
+
+`allow_from` decides who may ask; the RD bit in the query decides what they are
+asking for. RFC 1035 section 4.1.1 makes RD the client's request for a
+recursive lookup, and elodin only forwards to an upstream when it is set. A
+query with RD=0 gets whatever this server already has cached, and nothing
+more — REFUSED, not a silent drop, so a client that meant to ask recursively
+finds out rather than timing out:
+
+```
+ts=… level=info msg="query client=198.51.100.7:41234 proto=udp qtype=A qname=\"example.com\" outcome=refused detail=\"rd\" ms=0.1"
+```
+
+It does not add to `refused=` in the stats line — that counter is `allow_from`
+turning away a source before a query exists at all, and this is a source
+already on the list asking a question this server answered, just not by
+recursing. An operator graphing `refused=` as an unexpected-traffic signal
+will not see RD=0 probes there; the query log, with `log.queries` on, is where
+they show up.
+
+There is no setting for this; it is not a policy an operator tunes, only a bit
+a client sends. The refusal still comes back with RA=1: RFC 1035 section 4.1.1
+makes RA a statement that the server supports recursive service, not that this
+particular query used it, and that is also what BIND and Unbound do with a
+query their own ACL declines to recurse for. The capability is on offer; this
+one request just did not draw on it.
+
 ### How large a UDP answer may be
 
 ```yaml

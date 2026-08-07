@@ -338,6 +338,28 @@ resolve_query :: proc(
 		}
 	}
 
+	/*
+	RD=0 asks for whatever this server already knows, not for a fresh lookup -
+	RFC 1035 section 4.1.1. A cache hit above already answered that without
+	going anywhere; reaching this point means answering it would mean forwarding
+	to an upstream, which is the recursion the client did not ask for. Refused
+	rather than silently dropped, matching the other policy refusals above -
+	the allow-list is what keeps this from being a free reflection.
+
+	No counter of its own, again matching the class, XFR and cookie refusals
+	beside it: `Stats.refused` is `server.allow_from` turning away a datagram or
+	connection before a query exists at all, and stretching it to cover this too
+	would blur two different questions an operator asks of it - "is a network I
+	never added reaching this port" against "are RD=0 probes arriving". The
+	query log is where this one shows, as `outcome=refused detail="rd"`, when
+	`log.queries` is on.
+	*/
+	if !msg.flags.rd {
+		out, built := dns.error_response(query, msg, .Refused, allocator, limit)
+		log_query(s, client, proto, q, .Refused, "rd", started)
+		return out, .Refused, built
+	}
+
 	// Validation needs the signatures, so the question goes out again with DO
 	// and CD set rather than as the client wrote it.
 	forwarded := query

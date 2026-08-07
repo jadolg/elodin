@@ -44,6 +44,12 @@ make_opt :: proc(udp_size: u16, do_bit: bool, ext_rcode: u8 = 0) -> Record {
 /*
 Build a response skeleton mirroring `query`: same ID and question, QR set, RD
 copied, RA set, and an OPT record echoed back when the query carried one.
+
+RA is answered per RFC 1035 section 4.1.1: whether this server supports
+recursive service at all, not whether this particular query got any. A query
+refused for arriving with RD=0 still gets RA=1 back - the same way BIND and
+Unbound keep answering RA=1 to a query an ACL declines to recurse for. The
+capability is on offer; this request just did not use it.
 */
 make_response :: proc(query: Message, rcode: Rcode, allocator := context.allocator) -> Message {
 	resp: Message

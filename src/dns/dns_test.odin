@@ -575,3 +575,66 @@ test_truncated_response :: proc(t: ^testing.T) {
 	}
 	free_all(context.temp_allocator)
 }
+
+/*
+RA answers whether this server supports recursive service at all - RFC 1035
+section 4.1.1 - not whether the query in hand asked for or got any. A query
+that arrived with RD=0 still gets RA=1 back, the same way BIND and Unbound
+keep answering RA=1 to a query an ACL declines to recurse for: the capability
+is on offer regardless of what this one request did with it.
+
+Covers all three paths that build a locally-made answer: `make_response` (the
+decoded path), and the two that patch a header without decoding one,
+`error_response`'s malformed-query fallback and `truncated_response`. Pinned
+here because it is easy to reach for the opposite rule - tying RA to RD looks
+tempting next to the RD=0 refusal in `resolve_query`, and was in fact tried
+and reverted; this guards against trying it again.
+*/
+@(test)
+test_ra_is_a_capability_flag_not_tied_to_rd :: proc(t: ^testing.T) {
+	question := []Question{{name = "example.com.", type = .A, class = .IN}}
+
+	recursive := Message {
+		id       = 1,
+		question = question,
+	}
+	recursive.flags.rd = true
+	resp := make_response(recursive, .No_Error, context.temp_allocator)
+	testing.expect(t, resp.flags.ra, "RA not set for a query that asked for recursion")
+
+	non_recursive := Message {
+		id       = 2,
+		question = question,
+	}
+	non_recursive.flags.rd = false
+	refused := make_response(non_recursive, .Refused, context.temp_allocator)
+	testing.expect(t, refused.flags.ra, "RA not set for a query that did not ask for recursion")
+
+	// The header-patching paths: built from a query's own bytes rather than a
+	// decoded Message.
+	rd_wire, _, rd_err := encode_message(recursive, context.temp_allocator)
+	testing.expect_value(t, rd_err, Encode_Error.None)
+	no_rd_wire, _, no_rd_err := encode_message(non_recursive, context.temp_allocator)
+	testing.expect_value(t, no_rd_err, Encode_Error.None)
+
+	// An unusable Message ({}) forces the fallback that patches the query's own
+	// header rather than building from a decoded one - the path a malformed
+	// datagram takes, which is the only way it ever reaches `error_response`.
+	err_rd, err_rd_ok := error_response(rd_wire, Message{}, .Serv_Fail, context.temp_allocator)
+	testing.expect(t, err_rd_ok, "error_response built nothing for an RD=1 query")
+	testing.expect(t, err_rd[3] & 0x80 != 0, "RA not set in error_response for an RD=1 query")
+
+	err_no_rd, err_no_rd_ok := error_response(no_rd_wire, Message{}, .Serv_Fail, context.temp_allocator)
+	testing.expect(t, err_no_rd_ok, "error_response built nothing for an RD=0 query")
+	testing.expect(t, err_no_rd[3] & 0x80 != 0, "RA not set in error_response for an RD=0 query")
+
+	trunc_rd, trunc_rd_ok := truncated_response(rd_wire, context.temp_allocator)
+	testing.expect(t, trunc_rd_ok, "truncated_response built nothing for an RD=1 query")
+	testing.expect(t, trunc_rd[3] & 0x80 != 0, "RA not set in truncated_response for an RD=1 query")
+
+	trunc_no_rd, trunc_no_rd_ok := truncated_response(no_rd_wire, context.temp_allocator)
+	testing.expect(t, trunc_no_rd_ok, "truncated_response built nothing for an RD=0 query")
+	testing.expect(t, trunc_no_rd[3] & 0x80 != 0, "RA not set in truncated_response for an RD=0 query")
+
+	free_all(context.temp_allocator)
+}
