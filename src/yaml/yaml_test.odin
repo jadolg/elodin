@@ -539,6 +539,29 @@ test_block_scalar_as_sequence_entry :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_bad_block_scalar_headers_error :: proc(t: ^testing.T) {
+	// A block header is `|` or `>` alone or with one chomping indicator, and a
+	// plain scalar may not start with `|` or `>`. main misread `- |x` as the
+	// scalar "|x" and parse_block_scalar took `|+x` for `|+`, dropping the
+	// trailing byte. All of these are invalid YAML and error now, as PyYAML
+	// does.
+	srcs := []string{
+		"- |x\n",
+		"- |+x\n",
+		"- >file\n",
+		"- | x\n",
+		"a: |x\n",
+		"a: |+x\n",
+		"a: >y\n",
+	}
+	for src in srcs {
+		_, err := parse(src, context.temp_allocator)
+		testing.expectf(t, err != nil, "%q: a `|`/`>` with trailing content is not a block header", src)
+	}
+	free_all(context.temp_allocator)
+}
+
+@(test)
 test_folded_scalar_blank_line_is_a_break :: proc(t: ^testing.T) {
 	// Folding joins lines with a space, but a blank line between them is a
 	// paragraph break. Blank lines only reach the folder now that the scanner

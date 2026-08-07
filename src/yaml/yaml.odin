@@ -394,7 +394,10 @@ parse_sequence :: proc(p: ^Parser, indent: int) -> ^Node {
 		}
 
 		// `- |` and `- >`: the entry's value is a block scalar, read back at
-		// the sequence's indentation like the value of any other key.
+		// the sequence's indentation like the value of any other key. A line
+		// that merely starts with `|` or `>` — `- |x` — is not a valid block
+		// header, and parse_block_scalar rejects it: main silently misread it
+		// as the plain scalar "|x".
 		if len(rest) > 0 && (rest[0] == '|' || rest[0] == '>') {
 			p.pos += 1
 			append(&node.seq, parse_block_scalar(p, rest, indent, line.num))
@@ -445,15 +448,17 @@ parse_value :: proc(p: ^Parser, rest: string, indent: int, line_num: int) -> ^No
 
 @(private)
 parse_block_scalar :: proc(p: ^Parser, header: string, indent: int, line_num: int) -> ^Node {
+	// The header is `|` or `>` with at most one chomping indicator, the same
+	// shapes the scanner recognizes. Anything else — `|x`, `|+x`, `| x` — is
+	// invalid YAML and is rejected here rather than misread: `|+x` used to be
+	// taken for `|+` with the trailing byte dropped.
+	if !is_block_header(header) {
+		return fail(p, line_num, "unsupported block scalar indicator")
+	}
 	folded := header[0] == '>'
 	chomp := byte(0)
 	if len(header) > 1 {
-		switch header[1] {
-		case '-', '+':
-			chomp = header[1]
-		case:
-			return fail(p, line_num, "unsupported block scalar indicator")
-		}
+		chomp = header[1]
 	}
 
 	b := strings.builder_make(p.allocator)
