@@ -306,6 +306,7 @@ test_escaped_quote_in_sequence_entry :: proc(t: ^testing.T) {
 	testing.expectf(t, err == nil, "parse failed: %v", err)
 	l := items(get(root, "list"))
 	if !testing.expect_value(t, len(l), 1) {
+		free_all(context.temp_allocator)
 		return
 	}
 	v, ok := as_string(l[0])
@@ -321,6 +322,7 @@ test_escaped_quote_in_flow_collection :: proc(t: ^testing.T) {
 	l, ok := as_string_list(get(root, "a"), context.temp_allocator)
 	testing.expect(t, ok, "flow list missing")
 	if !testing.expect_value(t, len(l), 2) {
+		free_all(context.temp_allocator)
 		return
 	}
 	testing.expect_value(t, l[0], "x\" # y")
