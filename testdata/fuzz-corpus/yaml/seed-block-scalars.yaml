@@ -1,0 +1,48 @@
+# Block scalar bodies, whose content is deliberately the things the line
+# scanner strips everywhere else: comments, blank lines and document markers.
+# The interesting part for the fuzzer is the boundary - where verbatim ends
+# and YAML resumes - so every block here is followed by a sibling.
+
+literal: |
+  # a whole-line comment, which is content here
+  text with a trailing # comment, also content
+
+  a blank line above, also content
+  ---
+  ...
+after_literal: 1
+
+folded: >
+  folded # keeps its hash
+  and joins the next line
+after_folded: 2
+
+strip: |-
+  no trailing newline # kept
+keep: |+
+  trailing newline kept # kept
+
+indented: |
+    deeper than the key
+      deeper still
+    back again
+after_indented: 3
+
+empty: |
+after_empty: 4
+
+nested:
+  inner:
+    body: |
+      # inside two levels
+    sibling: 5
+
+list:
+  - name: first
+    body: |
+      # inside a sequence entry
+    tail: 6
+  - name: second
+    body: >
+      folded inside a sequence # entry
+    tail: 7

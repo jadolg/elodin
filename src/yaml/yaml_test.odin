@@ -366,6 +366,94 @@ test_escaped_backslash_still_closes_scalar :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_block_scalar_keeps_comment_characters :: proc(t: ^testing.T) {
+	// Inside a block scalar a `#` is content, not a comment. The line scanner
+	// ran comment handling over every line before block scalars were assembled,
+	// so a whole-line comment vanished and an inline one truncated the line.
+	root, err := parse("a: |\n  # not a comment\nb: |\n  text # not a comment\n", context.temp_allocator)
+	testing.expectf(t, err == nil, "parse failed: %v", err)
+	a, aok := as_string(get(root, "a"))
+	testing.expect(t, aok, "a missing")
+	testing.expect_value(t, a, "# not a comment\n")
+	b, bok := as_string(get(root, "b"))
+	testing.expect(t, bok, "b missing")
+	testing.expect_value(t, b, "text # not a comment\n")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_block_scalar_keeps_blank_lines :: proc(t: ^testing.T) {
+	// Blank lines inside a block scalar are content too: they were dropped with
+	// the document's own blank lines, silently closing up the paragraphs.
+	root, err := parse("a: |\n  one\n\n  two\n", context.temp_allocator)
+	testing.expectf(t, err == nil, "parse failed: %v", err)
+	a, ok := as_string(get(root, "a"))
+	testing.expect(t, ok, "a missing")
+	testing.expect_value(t, a, "one\n\ntwo\n")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_block_scalar_keeps_document_markers :: proc(t: ^testing.T) {
+	root, err := parse("a: |\n  ---\n  x\n  ...\n", context.temp_allocator)
+	testing.expectf(t, err == nil, "parse failed: %v", err)
+	a, ok := as_string(get(root, "a"))
+	testing.expect(t, ok, "a missing")
+	testing.expect_value(t, a, "---\nx\n...\n")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_block_scalar_ends_at_dedent :: proc(t: ^testing.T) {
+	// Taking the body verbatim must stop at the block's indentation. Past it a
+	// comment is a comment again and a blank line is just a separator, or the
+	// rest of the document would be swallowed into the scalar.
+	src := `
+a: |
+  x # kept
+
+# dropped
+b: 2
+`
+	root, err := parse(src, context.temp_allocator)
+	testing.expectf(t, err == nil, "parse failed: %v", err)
+	a, aok := as_string(get(root, "a"))
+	testing.expect(t, aok, "a missing")
+	testing.expect_value(t, a, "x # kept\n")
+	b, bok := as_int(get(root, "b"))
+	testing.expect(t, bok, "b missing")
+	testing.expect_value(t, b, i64(2))
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_block_scalar_under_sequence_entry :: proc(t: ^testing.T) {
+	// The block's parent is the entry's content column, not the dash's own, so
+	// a key aligned with `banner` has to close the scalar rather than join it.
+	src := `
+list:
+  - name: one
+    banner: |
+      # inside
+    other: two
+`
+	root, err := parse(src, context.temp_allocator)
+	testing.expectf(t, err == nil, "parse failed: %v", err)
+	l := items(get(root, "list"))
+	if !testing.expect_value(t, len(l), 1) {
+		free_all(context.temp_allocator)
+		return
+	}
+	banner, bok := as_string(get(l[0], "banner"))
+	testing.expect(t, bok, "banner missing")
+	testing.expect_value(t, banner, "# inside\n")
+	other, ook := as_string(get(l[0], "other"))
+	testing.expect(t, ook, "other missing")
+	testing.expect_value(t, other, "two")
+	free_all(context.temp_allocator)
+}
+
+@(test)
 test_bad_mapping_line_reports_line_number :: proc(t: ^testing.T) {
 	_, err := parse("a: 1\nb: 2\nthis is not a mapping\n", context.temp_allocator)
 	e, has := err.?

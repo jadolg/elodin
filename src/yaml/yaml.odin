@@ -79,25 +79,33 @@ parse :: proc(src: string, allocator := context.allocator) -> (root: ^Node, err:
 }
 
 @(private)
+take_line :: proc(s: string) -> (line: string, rest: string) {
+	if idx := strings.index_byte(s, '\n'); idx >= 0 {
+		return s[:idx], s[idx + 1:]
+	}
+	return s, ""
+}
+
+@(private)
+leading_spaces :: proc(s: string) -> int {
+	n := 0
+	for n < len(s) && s[n] == ' ' {
+		n += 1
+	}
+	return n
+}
+
+@(private)
 scan_lines :: proc(p: ^Parser, src: string) -> Maybe(Error) {
 	num := 0
 	rest := src
 	for len(rest) > 0 || num == 0 {
 		num += 1
 		line: string
-		if idx := strings.index_byte(rest, '\n'); idx >= 0 {
-			line = rest[:idx]
-			rest = rest[idx + 1:]
-		} else {
-			line = rest
-			rest = ""
-		}
+		line, rest = take_line(rest)
 		line = strings.trim_right(line, "\r \t")
 
-		indent := 0
-		for indent < len(line) && line[indent] == ' ' {
-			indent += 1
-		}
+		indent := leading_spaces(line)
 		if indent < len(line) && line[indent] == '\t' {
 			return Error{num, "tabs may not be used for indentation"}
 		}
@@ -116,11 +124,83 @@ scan_lines :: proc(p: ^Parser, src: string) -> Maybe(Error) {
 			continue
 		}
 		append(&p.lines, Line{indent = indent, text = body, num = num})
+
+		// Everything above treats the line as YAML. A block scalar's body is
+		// not YAML but content, so it is taken verbatim instead.
+		if parent, opens := opens_block_scalar(body, indent); opens {
+			scan_block_scalar(p, &rest, &num, parent)
+		}
 		if len(rest) == 0 {
 			break
 		}
 	}
 	return nil
+}
+
+// Reports the indentation a block scalar's body must exceed, when `body` is a
+// `key:` line whose value opens one. `- key: |` nests the block under the
+// entry's content column, which is the same rewrite parse_sequence performs.
+@(private)
+opens_block_scalar :: proc(body: string, indent: int) -> (parent: int, opens: bool) {
+	text, col := body, indent
+	for is_sequence_entry(text) {
+		content_col := col + 1
+		for content_col < col + len(text) && text[content_col - col] == ' ' {
+			content_col += 1
+		}
+		text, col = strings.trim_space(text[1:]), content_col
+	}
+	colon := find_key_colon(text) or_return
+	value := strings.trim_space(text[colon + 1:])
+	if len(value) == 0 || (value[0] != '|' && value[0] != '>') {
+		return 0, false
+	}
+	return col, true
+}
+
+/*
+Takes a block scalar's body verbatim: a `#` in it is text rather than a
+comment, and a blank line is a blank line rather than a separator to drop.
+
+The body runs until a line indented no further than the key that opened it,
+which is what parse_block_scalar goes on to read it back at. Blank lines are
+held until content proves they sit inside the block, so the ones that merely
+trail it stay with the document.
+*/
+@(private)
+scan_block_scalar :: proc(p: ^Parser, rest: ^string, num: ^int, parent: int) {
+	block_indent := -1
+	pending, pending_num := 0, 0
+
+	for len(rest^) > 0 {
+		line, after := take_line(rest^)
+		line_num := num^ + 1
+		body := strings.trim_right(line, "\r")
+		indent := leading_spaces(body)
+
+		if indent == len(body) {
+			if pending == 0 {
+				pending_num = line_num
+			}
+			pending += 1
+			rest^, num^ = after, line_num
+			continue
+		}
+		if indent <= parent {
+			break
+		}
+
+		if block_indent < 0 {
+			block_indent = indent
+		}
+		for _ in 0 ..< pending {
+			append(&p.lines, Line{indent = block_indent, text = "", num = pending_num})
+			pending_num += 1
+		}
+		pending = 0
+		append(&p.lines, Line{indent = indent, text = body[indent:], num = line_num})
+		rest^, num^ = after, line_num
+	}
 }
 
 // A `#` only opens a comment when it follows whitespace and sits outside quotes.
