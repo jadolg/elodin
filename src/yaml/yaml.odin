@@ -174,7 +174,11 @@ scan_block_scalar :: proc(p: ^Parser, rest: ^string, num: ^int, parent: int) {
 		body := strings.trim_right(line, "\r")
 		indent := leading_spaces(body)
 
-		if indent == len(body) {
+		// A line carrying no content is blank whatever it is made of. Counting
+		// only spaces would let a lone tab fall through to the boundary test,
+		// end the block on the spot, and hand the rest of the body back to the
+		// comment stripper this whole procedure exists to keep it away from.
+		if len(strings.trim_space(body)) == 0 {
 			if pending == 0 {
 				pending_num = line_num
 			}

@@ -497,6 +497,22 @@ test_block_scalar_body_allows_tabs :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_block_scalar_blank_line_of_any_whitespace :: proc(t: ^testing.T) {
+	// A line holding only a tab is blank, not a boundary. Reading it as one
+	// ended the block early and handed the lines after it back to the comment
+	// stripper, so a `#` further down the body went missing again.
+	root, err := parse("a: |\n  x\n\t\n  y # tail\nb: 2\n", context.temp_allocator)
+	testing.expectf(t, err == nil, "parse failed: %v", err)
+	a, ok := as_string(get(root, "a"))
+	testing.expect(t, ok, "a missing")
+	testing.expect_value(t, a, "x\n\ny # tail\n")
+	n, nok := as_int(get(root, "b"))
+	testing.expect(t, nok, "b missing")
+	testing.expect_value(t, n, i64(2))
+	free_all(context.temp_allocator)
+}
+
+@(test)
 test_block_scalar_keeps_interior_trailing_spaces :: proc(t: ^testing.T) {
 	// Trailing spaces on a body line are content. Only the last line loses
 	// them, to chomping, which trims spaces along with the newlines.
