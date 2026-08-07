@@ -1,6 +1,7 @@
 package server
 
 import "core:net"
+import "core:strings"
 import "core:sync"
 import "core:testing"
 import "core:time"
@@ -275,4 +276,29 @@ test_a_connection_past_the_limit_is_counted :: proc(t: ^testing.T) {
 	)
 	// And it is the limit that was blamed, not the OS refusing a thread.
 	testing.expect_value(t, sync.atomic_load(&s.stats.conn_failed), u64(0))
+}
+
+/*
+The Date header's day-name has to agree with the date next to it, or a strict
+cache rejects the whole header - and with it the `max-age` that told it when
+to expire the answer.
+*/
+@(test)
+test_now_http_date_weekday_matches_the_date :: proc(t: ^testing.T) {
+	names := []string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
+	expected := names[int(time.weekday(time.now()))]
+
+	got := now_http_date()
+	defer delete(got)
+
+	comma := strings.index_byte(got, ',')
+	testing.expectf(t, comma == 3, "Date header is not in the expected form: %q", got)
+
+	testing.expectf(
+		t,
+		got[:3] == expected,
+		"Date header weekday does not match its date: got %q, expected %q",
+		got[:comma if comma >= 0 else 0],
+		expected,
+	)
 }

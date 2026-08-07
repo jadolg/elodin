@@ -977,7 +977,7 @@ now_http_date :: proc(allocator := context.allocator) -> string {
 	h, mi, sec := time.clock_from_time(now)
 	return fmt.aprintf(
 		"%s, %02d %s %04d %02d:%02d:%02d GMT",
-		"Mon",
+		weekday_name(time.weekday(now)),
 		d,
 		month_name(int(m)),
 		y,
@@ -995,4 +995,10 @@ month_name :: proc(m: int) -> string {
 		return names[m - 1]
 	}
 	return "Jan"
+}
+
+@(private)
+weekday_name :: proc(wd: time.Weekday) -> string {
+	names := []string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
+	return names[int(wd)]
 }
