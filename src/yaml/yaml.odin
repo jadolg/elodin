@@ -186,7 +186,10 @@ scan_block_scalar :: proc(p: ^Parser, rest: ^string, num: ^int, parent: int) {
 			rest^, num^ = after, line_num
 			continue
 		}
-		if indent <= parent {
+		// Once the first body line has set the block's own indentation, that is
+		// the boundary rather than the key's: a line short of it is outside the
+		// block even though it clears the key that opened it.
+		if indent <= parent || (block_indent >= 0 && indent < block_indent) {
 			break
 		}
 
@@ -419,20 +422,44 @@ parse_block_scalar :: proc(p: ^Parser, header: string, indent: int, line_num: in
 
 	b := strings.builder_make(p.allocator)
 	block_indent := -1
+	// Folding joins consecutive lines with a space, but a blank line between
+	// them is a paragraph break and stays a newline. Blank lines only reach
+	// here now that the scanner keeps them, so folding has to account for them.
+	blanks, wrote := 0, false
 	for p.pos < len(p.lines) && p.lines[p.pos].indent > indent {
 		l := p.lines[p.pos]
 		if block_indent < 0 {
 			block_indent = l.indent
 		}
-		text := l.text
+		p.pos += 1
+
+		if folded && len(l.text) == 0 {
+			blanks += 1
+			continue
+		}
+		if folded && wrote {
+			if blanks == 0 {
+				strings.write_byte(&b, ' ')
+			}
+			for _ in 0 ..< blanks {
+				strings.write_byte(&b, '\n')
+			}
+		}
+		blanks = 0
+
 		if l.indent > block_indent {
 			for _ in 0 ..< l.indent - block_indent {
 				strings.write_byte(&b, ' ')
 			}
 		}
-		strings.write_string(&b, text)
-		strings.write_byte(&b, '\n' if !folded else ' ')
-		p.pos += 1
+		strings.write_string(&b, l.text)
+		if !folded {
+			strings.write_byte(&b, '\n')
+		}
+		wrote = true
+	}
+	for _ in 0 ..< blanks {
+		strings.write_byte(&b, '\n')
 	}
 
 	s := strings.to_string(b)
