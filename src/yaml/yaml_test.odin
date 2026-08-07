@@ -330,8 +330,11 @@ test_escaped_quote_in_flow_collection :: proc(t: ^testing.T) {
 
 @(test)
 test_escaped_backslash_still_closes_scalar :: proc(t: ^testing.T) {
-	// The escape skip covers exactly one byte: a trailing `\\` must leave the
-	// following quote free to close the scalar and the comment free to be cut.
+	// The escape skip covers exactly one byte, so a trailing `\\` has to leave
+	// the quote after it free to close the scalar. Three scanners track quotes
+	// independently - comment stripping, key splitting and flow items - and each
+	// one is pinned here, because a skip one byte too wide reads as correct
+	// until a value ends in a backslash.
 	root, err := parse("a: \"ends \\\\\" # comment\nb: 2\n", context.temp_allocator)
 	testing.expectf(t, err == nil, "parse failed: %v", err)
 	v, ok := as_string(get(root, "a"))
@@ -340,6 +343,23 @@ test_escaped_backslash_still_closes_scalar :: proc(t: ^testing.T) {
 	n, nok := as_int(get(root, "b"))
 	testing.expect(t, nok, "b missing")
 	testing.expect_value(t, n, i64(2))
+
+	kroot, kerr := parse("\"a\\\\\": 1\n", context.temp_allocator)
+	testing.expectf(t, kerr == nil, "parse failed: %v", kerr)
+	kv, kok := as_int(get(kroot, "a\\"))
+	testing.expect(t, kok, "key missing")
+	testing.expect_value(t, kv, i64(1))
+
+	froot, ferr := parse("a: [\"x\\\\\", plain]\n", context.temp_allocator)
+	testing.expectf(t, ferr == nil, "parse failed: %v", ferr)
+	l, lok := as_string_list(get(froot, "a"), context.temp_allocator)
+	testing.expect(t, lok, "flow list missing")
+	if !testing.expect_value(t, len(l), 2) {
+		free_all(context.temp_allocator)
+		return
+	}
+	testing.expect_value(t, l[0], "x\\")
+	testing.expect_value(t, l[1], "plain")
 	free_all(context.temp_allocator)
 }
 
