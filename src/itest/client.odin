@@ -24,7 +24,7 @@ Query_Result :: struct {
 }
 
 query_udp :: proc(
-	port: int,
+	udp_port: int,
 	query: []u8,
 	allocator := context.allocator,
 	timeout := CLIENT_TIMEOUT,
@@ -39,7 +39,7 @@ query_udp :: proc(
 
 	endpoint := net.Endpoint {
 		address = net.IP4_Loopback,
-		port    = port,
+		port    = udp_port,
 	}
 	if _, serr := net.send_udp(socket, query, endpoint); serr != nil {
 		return {}
@@ -57,7 +57,7 @@ query_udp :: proc(
 
 // Confirms the server sends nothing at all, which is the correct answer to some
 // malformed input. Returns true when the wait times out.
-expect_no_udp_reply :: proc(port: int, query: []u8, wait := 400 * time.Millisecond) -> bool {
+expect_no_udp_reply :: proc(udp_port: int, query: []u8, wait := 400 * time.Millisecond) -> bool {
 	socket, err := net.make_unbound_udp_socket(.IP4)
 	if err != nil {
 		return false
@@ -67,7 +67,7 @@ expect_no_udp_reply :: proc(port: int, query: []u8, wait := 400 * time.Milliseco
 
 	endpoint := net.Endpoint {
 		address = net.IP4_Loopback,
-		port    = port,
+		port    = udp_port,
 	}
 	if _, serr := net.send_udp(socket, query, endpoint); serr != nil {
 		return false
@@ -77,14 +77,14 @@ expect_no_udp_reply :: proc(port: int, query: []u8, wait := 400 * time.Milliseco
 	return rerr != nil
 }
 
-query_tcp :: proc(port: int, query: []u8, allocator := context.allocator) -> Query_Result {
-	socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = port})
+query_tcp :: proc(tcp_port: int, query: []u8, allocator := context.allocator, timeout := CLIENT_TIMEOUT) -> Query_Result {
+	socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = tcp_port})
 	if err != nil {
 		return {}
 	}
 	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, CLIENT_TIMEOUT)
-	_ = net.set_option(socket, .Send_Timeout, CLIENT_TIMEOUT)
+	_ = net.set_option(socket, .Receive_Timeout, timeout)
+	_ = net.set_option(socket, .Send_Timeout, timeout)
 
 	conn := Test_Conn {
 		socket = socket,
@@ -94,9 +94,9 @@ query_tcp :: proc(port: int, query: []u8, allocator := context.allocator) -> Que
 
 // Sends several queries on one connection, which is what a real TCP or DoT
 // client does and what the server's per-connection loop has to handle.
-query_tcp_multi :: proc(port: int, queries: [][]u8, allocator := context.allocator) -> []Query_Result {
+query_tcp_multi :: proc(tcp_port: int, queries: [][]u8, allocator := context.allocator) -> []Query_Result {
 	results := make([]Query_Result, len(queries), allocator)
-	socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = port})
+	socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = tcp_port})
 	if err != nil {
 		return results
 	}
@@ -115,8 +115,8 @@ query_tcp_multi :: proc(port: int, queries: [][]u8, allocator := context.allocat
 	return results
 }
 
-query_dot :: proc(port: int, query: []u8, allocator := context.allocator) -> Query_Result {
-	conn, ok := dial_tls(port)
+query_dot :: proc(dot_port: int, query: []u8, allocator := context.allocator) -> Query_Result {
+	conn, ok := dial_tls(dot_port)
 	if !ok {
 		return {}
 	}
@@ -243,7 +243,7 @@ Flood_Result :: struct {
 	bytes:     int,
 }
 
-udp_flood :: proc(port: int, query: []u8, count: int, drain := 700 * time.Millisecond) -> Flood_Result {
+udp_flood :: proc(udp_port: int, query: []u8, count: int, drain := 700 * time.Millisecond) -> Flood_Result {
 	socket, err := net.make_unbound_udp_socket(.IP4)
 	if err != nil {
 		return {}
@@ -255,7 +255,7 @@ udp_flood :: proc(port: int, query: []u8, count: int, drain := 700 * time.Millis
 
 	endpoint := net.Endpoint {
 		address = net.IP4_Loopback,
-		port    = port,
+		port    = udp_port,
 	}
 
 	out := make([]u8, len(query), context.temp_allocator)
@@ -298,12 +298,12 @@ Http_Result :: struct {
 	ok:      bool,
 }
 
-doh_post :: proc(port: int, path: string, query: []u8, allocator := context.allocator) -> Http_Result {
+doh_post :: proc(doh_port: int, path: string, query: []u8, allocator := context.allocator) -> Http_Result {
 	req := build_http_request("POST", path, "application/dns-message", query)
-	return http_roundtrip(port, req, allocator)
+	return http_roundtrip(doh_port, req, allocator)
 }
 
-doh_get :: proc(port: int, path: string, query: []u8, allocator := context.allocator) -> Http_Result {
+doh_get :: proc(doh_port: int, path: string, query: []u8, allocator := context.allocator) -> Http_Result {
 	// RFC 8484 wants base64url with the padding stripped.
 	encoded, err := base64.encode(query, base64.ENC_URL_TABLE, context.temp_allocator)
 	if err != nil {
@@ -312,12 +312,12 @@ doh_get :: proc(port: int, path: string, query: []u8, allocator := context.alloc
 	trimmed := strings.trim_right(encoded, "=")
 	target := strings.concatenate({path, "?dns=", trimmed}, context.temp_allocator)
 	req := build_http_request("GET", target, "", nil)
-	return http_roundtrip(port, req, allocator)
+	return http_roundtrip(doh_port, req, allocator)
 }
 
 // Sends a request built by the caller, for the malformed and unsupported cases.
-doh_raw :: proc(port: int, request: string, allocator := context.allocator) -> Http_Result {
-	return http_roundtrip(port, transmute([]u8)request, allocator)
+doh_raw :: proc(doh_port: int, request: string, allocator := context.allocator) -> Http_Result {
+	return http_roundtrip(doh_port, transmute([]u8)request, allocator)
 }
 
 /*
@@ -330,8 +330,8 @@ answered is the thing to catch. Read reply by reply this is invisible - two
 answers usually arrive in one record, and a reader that takes them one at a time
 throws away whatever it over-read.
 */
-doh_raw_until_close :: proc(port: int, request: string, allocator := context.allocator) -> (data: string, ok: bool) {
-	conn, dialled := dial_tls(port, []string{"http/1.1"})
+doh_raw_until_close :: proc(doh_port: int, request: string, allocator := context.allocator) -> (data: string, ok: bool) {
+	conn, dialled := dial_tls(doh_port, []string{"http/1.1"})
 	if !dialled {
 		return "", false
 	}
@@ -354,8 +354,8 @@ doh_raw_until_close :: proc(port: int, request: string, allocator := context.all
 }
 
 // Two POSTs down one connection, to prove keep-alive works.
-doh_post_twice :: proc(port: int, path: string, query: []u8, allocator := context.allocator) -> (a, b: Http_Result) {
-	conn, ok := dial_tls(port, []string{"http/1.1"})
+doh_post_twice :: proc(doh_port: int, path: string, query: []u8, allocator := context.allocator) -> (a, b: Http_Result) {
+	conn, ok := dial_tls(doh_port, []string{"http/1.1"})
 	if !ok {
 		return {}, {}
 	}
@@ -404,8 +404,8 @@ build_http_request :: proc(method, target, content_type: string, body: []u8) -> 
 }
 
 @(private)
-http_roundtrip :: proc(port: int, request: []u8, allocator: mem.Allocator) -> Http_Result {
-	conn, ok := dial_tls(port, []string{"http/1.1"})
+http_roundtrip :: proc(doh_port: int, request: []u8, allocator: mem.Allocator) -> Http_Result {
+	conn, ok := dial_tls(doh_port, []string{"http/1.1"})
 	if !ok {
 		return {}
 	}

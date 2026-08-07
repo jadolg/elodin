@@ -19,7 +19,7 @@ resolver that quietly serves whatever it is handed.
 */
 
 @(private = "file")
-dnssec_config :: proc(r: ^Runner, port: int, upstream_port: int, extra := "") -> string {
+dnssec_config :: proc(r: ^Runner, udp_port: int, upstream_port: int, extra := "") -> string {
 	return fmt.tprintf(
 		`log:
   level: info
@@ -36,7 +36,7 @@ blocking:
 dnssec:
   enabled: true
 %s`,
-		port,
+		udp_port,
 		upstream_port,
 		extra,
 	)
@@ -52,8 +52,8 @@ run_dnssec_cases :: proc(r: ^Runner) {
 	}
 	defer mock_stop(mock)
 
-	port := next_port(r)
-	srv, ok := start_server(r, Server_Options{config = dnssec_config(r, port, upstream_port), port = port})
+	udp_port := next_port(r)
+	srv, ok := start_server(r, Server_Options{config = dnssec_config(r, udp_port, upstream_port), udp_port = udp_port})
 	if !ok {
 		return
 	}
@@ -64,7 +64,7 @@ run_dnssec_cases :: proc(r: ^Runner) {
 		// The mock has no root DNSKEY to offer, so the chain cannot be built and
 		// the answer must not be served. Failing open here would make the whole
 		// feature decorative.
-		res := query_udp(port, build_query("unsigned.test.", u16(dns.Type.A)))
+		res := query_udp(udp_port, build_query("unsigned.test.", u16(dns.Type.A)))
 		if check(r, res.ok, "no response") {
 			h, _ := parse_header(res.wire)
 			check_eq_int(r, h.rcode, int(dns.Rcode.Serv_Fail), "rcode")
@@ -84,7 +84,7 @@ run_dnssec_cases :: proc(r: ^Runner) {
 		// DO to get the signatures, CD so the upstream's own opinion of them
 		// does not decide the matter for us.
 		mock_reset_counts(mock)
-		_ = query_udp(port, build_query("signatures.test.", u16(dns.Type.A)))
+		_ = query_udp(udp_port, build_query("signatures.test.", u16(dns.Type.A)))
 
 		forwarded := mock_last_query(mock)
 		if check(r, len(forwarded) > 12, "the mock saw no query") {
@@ -104,7 +104,7 @@ run_dnssec_cases :: proc(r: ^Runner) {
 		// CD is the client saying it will do its own checking, or that it wants
 		// the data whatever the verdict. Refusing it anyway would break the
 		// resolvers that chain behind us.
-		res := query_udp(port, build_query("cd.test.", u16(dns.Type.A), checking_disabled = true))
+		res := query_udp(udp_port, build_query("cd.test.", u16(dns.Type.A), checking_disabled = true))
 		if check(r, res.ok, "no response") {
 			h, _ := parse_header(res.wire)
 			check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode for a CD query")
@@ -120,7 +120,7 @@ run_dnssec_cases :: proc(r: ^Runner) {
 
 	start_case(r, "dnssec: a refused answer carries an extended DNS error")
 	{
-		res := query_udp(port, build_query("ede.test.", u16(dns.Type.A), edns_size = 1232))
+		res := query_udp(udp_port, build_query("ede.test.", u16(dns.Type.A), edns_size = 1232))
 		if check(r, res.ok, "no response") {
 			msg, derr := dns.decode_message(res.wire, context.temp_allocator)
 			if check(r, derr == .None, "response does not decode: %v", derr) {
@@ -154,7 +154,7 @@ dnssec: {{enabled: false}}
 			plain_port,
 			upstream_port,
 		)
-		plain, started := start_server(r, Server_Options{config = config, port = plain_port})
+		plain, started := start_server(r, Server_Options{config = config, udp_port = plain_port})
 		if started {
 			defer stop_server(&plain)
 			res := query_udp(plain_port, build_query("unsigned.test.", u16(dns.Type.A)))

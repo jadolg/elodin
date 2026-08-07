@@ -15,7 +15,7 @@ insists all of them parse, rather than checking the ones it went looking for.
 */
 
 @(private = "file")
-config_logfmt :: proc(port, upstream_port: int) -> string {
+config_logfmt :: proc(udp_port, upstream_port: int) -> string {
 	return fmt.tprintf(
 		`log: {{ level: info, queries: true }}
 listeners:
@@ -27,7 +27,7 @@ upstream:
 cache: {{ enabled: false }}
 blocking: {{ enabled: false }}
 `,
-		port,
+		udp_port,
 		upstream_port,
 	)
 }
@@ -42,8 +42,8 @@ run_logfmt_cases :: proc(r: ^Runner) {
 	}
 	defer mock_stop(mock)
 
-	port := next_port(r)
-	srv, ok := start_server(r, Server_Options{config = config_logfmt(port, upstream_port), port = port})
+	udp_port := next_port(r)
+	srv, ok := start_server(r, Server_Options{config = config_logfmt(udp_port, upstream_port), udp_port = udp_port})
 	if !ok {
 		skip_case(r, "logfmt", "server did not start")
 		return
@@ -58,8 +58,8 @@ run_logfmt_cases :: proc(r: ^Runner) {
 	unquoted it would close `qname=` early and everything after it would parse as
 	fields this server never wrote.
 	*/
-	_ = query_udp(port, build_query(`we"ird.example.`, u16(dns.Type.A)))
-	_ = query_udp(port, build_query("plain.example.", u16(dns.Type.A)))
+	_ = query_udp(udp_port, build_query(`we"ird.example.`, u16(dns.Type.A)))
+	_ = query_udp(udp_port, build_query("plain.example.", u16(dns.Type.A)))
 
 	start_case(r, "logfmt: every line is key=value, with a timestamp and a level")
 	{

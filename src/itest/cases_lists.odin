@@ -42,7 +42,7 @@ run_list_download_cases :: proc(r: ^Runner) {
 	cache_dir := filepath.join({r.work_dir, "listcache"}, context.allocator) or_else ""
 	defer delete(cache_dir)
 
-	port := next_port(r)
+	udp_port := next_port(r)
 	config := fmt.tprintf(
 		`log: {{ level: debug }}
 listeners:
@@ -61,14 +61,14 @@ blocking:
     - {{ name: hosts-list, url: "http://127.0.0.1:%d/hosts.txt", format: hosts }}
     - {{ name: abp-list, url: "http://127.0.0.1:%d/abp.txt", format: adblock }}
 `,
-		port,
+		udp_port,
 		upstream_port,
 		cache_dir,
 		http_port,
 		http_port,
 	)
 
-	srv, ok := start_server(r, Server_Options{config = config, port = port, allow_fetch = true})
+	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port, allow_fetch = true})
 	if !ok {
 		skip_case(r, "lists: download", "server did not start")
 		return
@@ -81,17 +81,17 @@ blocking:
 		check_eq_int(r, http_mock_hits(http, "/hosts.txt"), 1, "fetches of the hosts list")
 		check_eq_int(r, http_mock_hits(http, "/abp.txt"), 1, "fetches of the adblock list")
 
-		res := query_udp(port, build_query("downloaded.test.", u16(dns.Type.A)))
+		res := query_udp(udp_port, build_query("downloaded.test.", u16(dns.Type.A)))
 		if check(r, res.ok, "no response for a name from the first list") {
 			h, _ := parse_header(res.wire)
 			check(r, h.rcode == int(dns.Rcode.NX_Domain), "the first list was not applied")
 		}
-		res2 := query_udp(port, build_query("sub.fetched.test.", u16(dns.Type.A)))
+		res2 := query_udp(udp_port, build_query("sub.fetched.test.", u16(dns.Type.A)))
 		if check(r, res2.ok, "no response for a name from the second list") {
 			h, _ := parse_header(res2.wire)
 			check(r, h.rcode == int(dns.Rcode.NX_Domain), "the second list was not applied")
 		}
-		allowed := query_udp(port, build_query("ok.fetched.test.", u16(dns.Type.A)))
+		allowed := query_udp(udp_port, build_query("ok.fetched.test.", u16(dns.Type.A)))
 		if check(r, allowed.ok, "no response for an allowed name") {
 			h, _ := parse_header(allowed.wire)
 			check(r, h.rcode == int(dns.Rcode.No_Error), "the allow rule from the download was lost")
@@ -137,7 +137,7 @@ blocking:
 			http_port,
 			http_port,
 		)
-		srv2, ok2 := start_server(r, Server_Options{config = config2, port = port2, allow_fetch = true})
+		srv2, ok2 := start_server(r, Server_Options{config = config2, udp_port = port2, allow_fetch = true})
 		if check(r, ok2, "the second server did not start") {
 			defer stop_server(&srv2)
 			check_eq_int(r, http_mock_hits(http, "/hosts.txt"), 1, "fetches after a restart")
@@ -176,7 +176,7 @@ blocking:
 			http_port,
 			http_port,
 		)
-		srv3, ok3 := start_server(r, Server_Options{config = config3, port = port3, allow_fetch = true})
+		srv3, ok3 := start_server(r, Server_Options{config = config3, udp_port = port3, allow_fetch = true})
 		if check(r, ok3, "the server did not start with an unwritable cache directory") {
 			defer stop_server(&srv3)
 			res := query_udp(port3, build_query("downloaded.test.", u16(dns.Type.A)))

@@ -14,7 +14,7 @@ DNSSEC records and types the codec has no case for.
 */
 
 @(private = "file")
-config_passthrough :: proc(port, upstream_port: int) -> string {
+config_passthrough :: proc(udp_port, upstream_port: int) -> string {
 	return fmt.tprintf(
 		`log: {{ level: warn }}
 listeners:
@@ -26,8 +26,8 @@ upstream:
 cache: {{ enabled: false }}
 blocking: {{ enabled: false }}
 `,
-		port,
-		port,
+		udp_port,
+		udp_port,
 		upstream_port,
 	)
 }
@@ -46,8 +46,8 @@ run_wire_cases :: proc(r: ^Runner) {
 	}
 	defer mock_stop(mock)
 
-	port := next_port(r)
-	srv, ok := start_server(r, Server_Options{config = config_passthrough(port, upstream_port), port = port})
+	udp_port := next_port(r)
+	srv, ok := start_server(r, Server_Options{config = config_passthrough(udp_port, upstream_port), udp_port = udp_port, tcp_port = udp_port})
 	if !ok {
 		skip_case(r, "wire", "server did not start")
 		return
@@ -67,7 +67,7 @@ run_wire_cases :: proc(r: ^Runner) {
 			// Use a distinct ID so ID rewriting is exercised.
 			query[0], query[1] = 0x7a, 0x5c
 
-			res := use_tcp ? query_tcp(port, query) : query_udp(port, query)
+			res := use_tcp ? query_tcp(udp_port, query) : query_udp(udp_port, query)
 			if check(r, res.ok, "no response") {
 				h, _ := parse_header(res.wire)
 				check(r, h.id == 0x7a5c, "transaction ID: got %04x, want 7a5c", h.id)
@@ -110,7 +110,7 @@ run_wire_cases :: proc(r: ^Runner) {
 	{
 		f := fixture("dnssec_a")
 		query := from_hex(f.query)
-		res := query_udp(port, query)
+		res := query_udp(udp_port, query)
 		if check(r, res.ok, "no response") {
 			msg, err := dns.decode_message(res.wire, context.temp_allocator)
 			if check(r, err == .None, "cannot decode") {
@@ -134,7 +134,7 @@ run_wire_cases :: proc(r: ^Runner) {
 		// matters is therefore what the upstream received.
 		f := fixture("a")
 		query := build_query(f.qname, f.qtype, edns_size = 1232, dnssec_ok = true)
-		res := query_udp(port, query)
+		res := query_udp(udp_port, query)
 		if check(r, res.ok, "no response") {
 			seen := mock_last_query(mock)
 			if check(r, seen != nil, "the upstream saw no query") {
@@ -152,7 +152,7 @@ run_wire_cases :: proc(r: ^Runner) {
 	start_case(r, "the query reaches the upstream with its case intact (0x20 clients)")
 	{
 		query := build_query("ExAmPle.CoM.", u16(dns.Type.A))
-		res := query_udp(port, query)
+		res := query_udp(udp_port, query)
 		if check(r, res.ok, "no response") {
 			seen := mock_last_query(mock)
 			if check(r, seen != nil, "the upstream saw no query") {
@@ -170,7 +170,7 @@ run_wire_cases :: proc(r: ^Runner) {
 
 	start_case(r, "malformed: a datagram shorter than a header gets no reply")
 	{
-		check(r, expect_no_udp_reply(port, []u8{0x00, 0x01, 0x02}), "the server answered a runt datagram")
+		check(r, expect_no_udp_reply(udp_port, []u8{0x00, 0x01, 0x02}), "the server answered a runt datagram")
 	}
 	end_case(r)
 
@@ -178,7 +178,7 @@ run_wire_cases :: proc(r: ^Runner) {
 	{
 		// QR set: this is an answer, not a question, and must not be processed.
 		reply := from_hex(fixture("a").response)
-		check(r, expect_no_udp_reply(port, reply), "the server answered a message with QR set")
+		check(r, expect_no_udp_reply(udp_port, reply), "the server answered a message with QR set")
 	}
 	end_case(r)
 
@@ -186,7 +186,7 @@ run_wire_cases :: proc(r: ^Runner) {
 	{
 		// A header claiming one question, with the name cut off mid-label.
 		bad := []u8{0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 7, 'e', 'x'}
-		res := query_udp(port, bad)
+		res := query_udp(udp_port, bad)
 		if check(r, res.ok, "no response to a truncated question") {
 			h, _ := parse_header(res.wire)
 			check(r, h.rcode == int(dns.Rcode.Form_Err), "rcode %d, want FORMERR", h.rcode)
@@ -198,7 +198,7 @@ run_wire_cases :: proc(r: ^Runner) {
 	{
 		q := build_query("example.com.", u16(dns.Type.A))
 		q[2] = (q[2] & 0x87) | (2 << 3) // opcode STATUS
-		res := query_udp(port, q)
+		res := query_udp(udp_port, q)
 		if check(r, res.ok, "no response") {
 			h, _ := parse_header(res.wire)
 			check(r, h.rcode == int(dns.Rcode.Not_Impl), "rcode %d, want NOTIMP", h.rcode)
@@ -211,7 +211,7 @@ run_wire_cases :: proc(r: ^Runner) {
 		f := fixture("txt_big")
 		// No EDNS, so the client is limited to 512 bytes.
 		query := build_query(f.qname, f.qtype)
-		res := query_udp(port, query)
+		res := query_udp(udp_port, query)
 		if check(r, res.ok, "no response") {
 			h, _ := parse_header(res.wire)
 			check(r, h.tc, "the TC bit was not set")
@@ -225,7 +225,7 @@ run_wire_cases :: proc(r: ^Runner) {
 	{
 		f := fixture("txt_big")
 		query := build_query(f.qname, f.qtype)
-		res := query_tcp(port, query)
+		res := query_tcp(udp_port, query)
 		if check(r, res.ok, "no response") {
 			h, _ := parse_header(res.wire)
 			check(r, !h.tc, "TC set on a TCP reply")

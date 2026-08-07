@@ -223,7 +223,7 @@ mid-answer, and the ordering that makes the teardown safe is never exercised at
 all.
 */
 @(private = "file")
-config_for_shutdown :: proc(port, upstream_port: int) -> string {
+config_for_shutdown :: proc(udp_port, upstream_port: int) -> string {
 	return fmt.tprintf(
 		`log: {{ level: info }}
 listeners:
@@ -235,8 +235,8 @@ upstream:
 cache: {{ enabled: true }}
 blocking: {{ enabled: false }}
 `,
-		port,
-		port,
+		udp_port,
+		udp_port,
 		upstream_port,
 	)
 }
@@ -252,10 +252,10 @@ run_shutdown_cases :: proc(r: ^Runner) {
 	}
 	defer mock_stop(mock)
 
-	port := next_port(r)
+	udp_port := next_port(r)
 	srv, ok := start_server(
 		r,
-		Server_Options{config = config_for_shutdown(port, upstream_port), port = port},
+		Server_Options{config = config_for_shutdown(udp_port, upstream_port), udp_port = udp_port},
 	)
 	if !ok {
 		skip_case(r, "shutdown", "server did not start")
@@ -267,7 +267,7 @@ run_shutdown_cases :: proc(r: ^Runner) {
 	{
 		// Answer something first, so the shutdown has a warmed-up server with
 		// its worker pools and caches populated to take down.
-		res := query_udp(port, from_hex(f.query))
+		res := query_udp(udp_port, from_hex(f.query))
 		check(r, res.ok, "the server did not answer before being asked to stop")
 
 		state, exited := signal_shutdown(&srv, 15 * time.Second)

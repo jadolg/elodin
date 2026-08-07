@@ -39,7 +39,7 @@ BASE_PORT :: 24000
 
 Server :: struct {
 	process:   os.Process,
-	port:      int,
+	udp_port:  int,
 	dot_port:  int,
 	doh_port:  int,
 	log_path:  string,
@@ -157,7 +157,8 @@ run_binary :: proc(r: ^Runner, args: []string, tag: string) -> Run_Result {
 
 Server_Options :: struct {
 	config:    string,
-	port:      int,
+	udp_port:  int,
+	tcp_port:  int,
 	dot_port:  int,
 	doh_port:  int,
 	// Extra time to allow before the readiness probe gives up.
@@ -174,7 +175,7 @@ Readiness is established by querying the server rather than by sleeping, so the
 suite neither races the process nor pays for a fixed delay.
 */
 start_server :: proc(r: ^Runner, opts: Server_Options) -> (srv: Server, ok: bool) {
-	srv, ok = start_server_raw(r, opts.config, opts.port, opts.allow_fetch)
+	srv, ok = start_server_raw(r, opts.config, opts.udp_port, opts.allow_fetch)
 	if !ok {
 		return srv, false
 	}
@@ -182,7 +183,12 @@ start_server :: proc(r: ^Runner, opts: Server_Options) -> (srv: Server, ok: bool
 	srv.doh_port = opts.doh_port
 
 	if !wait_ready(&srv, 5 * time.Second + opts.warmup) {
-		fail(r, "server on port %d never became ready; log:\n%s", opts.port, read_log(&srv))
+		fail(r, "server on port %d never became ready; log:\n%s", opts.udp_port, read_log(&srv))
+		stop_server(&srv)
+		return srv, false
+	}
+	if opts.tcp_port > 0 && !wait_tcp(opts.tcp_port, 5 * time.Second + opts.warmup) {
+		fail(r, "server on port %d never answered over tcp; log:\n%s", opts.udp_port, read_log(&srv))
 		stop_server(&srv)
 		return srv, false
 	}
@@ -210,7 +216,7 @@ without_dnssec :: proc(config: string, allocator := context.temp_allocator) -> s
 start_server_raw :: proc(
 	r: ^Runner,
 	config: string,
-	port: int,
+	udp_port: int,
 	allow_fetch := false,
 	// Write the configuration exactly as given, so a case can observe what the
 	// shipped defaults do rather than what the suite prefers.
@@ -219,8 +225,8 @@ start_server_raw :: proc(
 	srv: Server,
 	ok: bool,
 ) {
-	cfg_path := filepath.join({r.work_dir, fmt.tprintf("elodin-%d.yaml", port)}, context.temp_allocator) or_else ""
-	log_path := filepath.join({r.work_dir, fmt.tprintf("elodin-%d.log", port)}, context.temp_allocator) or_else ""
+	cfg_path := filepath.join({r.work_dir, fmt.tprintf("elodin-%d.yaml", udp_port)}, context.temp_allocator) or_else ""
+	log_path := filepath.join({r.work_dir, fmt.tprintf("elodin-%d.log", udp_port)}, context.temp_allocator) or_else ""
 
 	written := config if verbatim else without_dnssec(config)
 	if werr := os.write_entire_file(cfg_path, transmute([]u8)written); werr != nil {
@@ -251,7 +257,7 @@ start_server_raw :: proc(
 
 	srv = Server {
 		process  = process,
-		port     = port,
+		udp_port = udp_port,
 		// Heap: a Server outlives many cases, and end_case resets the temp
 		// allocator between them.
 		log_path = strings.clone(log_path, context.allocator),
@@ -277,7 +283,30 @@ wait_ready :: proc(srv: ^Server, timeout: time.Duration) -> bool {
 	deadline := time.time_add(time.now(), timeout)
 
 	for time.diff(deadline, time.now()) < 0 {
-		res := query_udp(srv.port, probe, context.temp_allocator, PROBE_TIMEOUT)
+		res := query_udp(srv.udp_port, probe, context.temp_allocator, PROBE_TIMEOUT)
+		if res.ok {
+			return true
+		}
+	}
+	return false
+}
+
+/*
+Probe until the server answers over TCP.
+
+The listeners bind in order, udp before tcp, so the UDP probe above succeeding
+says nothing yet about the stream listener: a TCP dial in the gap between the
+two binds is refused, and on a loaded runner the gap is more than microseconds.
+A case that queries over TCP passes the udp_port in `Server_Options` and this probes
+it the same way as the datagram path - a CHAOS version.bind query, answered
+locally, retried until the deadline.
+*/
+@(private)
+wait_tcp :: proc(tcp_port: int, timeout: time.Duration) -> bool {
+	probe := build_query("version.bind.", u16(dns.Type.TXT), class = u16(dns.Class.CH))
+	deadline := time.time_add(time.now(), timeout)
+	for time.diff(deadline, time.now()) < 0 {
+		res := query_tcp(tcp_port, probe, context.temp_allocator, PROBE_TIMEOUT)
 		if res.ok {
 			return true
 		}

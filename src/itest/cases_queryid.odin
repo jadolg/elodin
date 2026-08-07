@@ -37,7 +37,7 @@ run_query_id_cases :: proc(r: ^Runner) {
 	}
 	defer mock_stop(mock)
 
-	port := next_port(r)
+	udp_port := next_port(r)
 	// The cache is off so every query reaches the upstream, and cookies too:
 	// they close this same hole by another route, and what is under test is the
 	// ID on its own.
@@ -53,10 +53,10 @@ cache: {{ enabled: false }}
 blocking: {{ enabled: false }}
 cookies: {{ enabled: false, upstream: false }}
 `,
-		port,
+		udp_port,
 		upstream_port,
 	)
-	srv, ok := start_server(r, Server_Options{config = config, port = port})
+	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 	if !ok {
 		skip_case(r, "upstream: transaction ids", "server did not start")
 		return
@@ -73,7 +73,7 @@ cookies: {{ enabled: false, upstream: false }}
 			// A different name each time, so nothing can be served from
 			// anywhere but the upstream.
 			qname := fmt.tprintf("id-%d.probe.test.", i)
-			res := query_udp(port, build_query(qname, u16(dns.Type.A), id = CLIENT_ID))
+			res := query_udp(udp_port, build_query(qname, u16(dns.Type.A), id = CLIENT_ID))
 			if !check(r, res.ok, "no response to query %d", i) {
 				break
 			}
