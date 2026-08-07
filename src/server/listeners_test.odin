@@ -330,8 +330,11 @@ test_now_http_date_weekday_matches_the_date :: proc(t: ^testing.T) {
 		return
 	}
 
-	names := []string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
-	expected := names[int(time.weekday(parsed))]
+	// Shared with production rather than a second copy of the table: a table
+	// reordered the same way in both places would otherwise still agree with
+	// itself. test_now_http_date_epoch_is_a_known_thursday below is what
+	// actually catches that.
+	expected := WEEKDAY_NAMES[int(time.weekday(parsed))]
 
 	testing.expectf(
 		t,
@@ -340,4 +343,24 @@ test_now_http_date_weekday_matches_the_date :: proc(t: ^testing.T) {
 		got[:3],
 		expected,
 	)
+}
+
+/*
+An oracle independent of `weekday_name`'s own table: the Unix epoch is a well
+known Thursday, so the expected string here is a literal, not anything
+derived from the table under test. A table that agrees with itself while
+being wrong - every name shifted one place, say - would pass the test above
+but not this one.
+*/
+@(test)
+test_now_http_date_epoch_is_a_known_thursday :: proc(t: ^testing.T) {
+	epoch, ok := time.components_to_time(1970, 1, 1, 0, 0, 0)
+	if !testing.expect(t, ok, "could not construct the Unix epoch as a time.Time") {
+		return
+	}
+
+	got := http_date(epoch)
+	defer delete(got)
+
+	testing.expect_value(t, got, "Thu, 01 Jan 1970 00:00:00 GMT")
 }

@@ -238,9 +238,16 @@ run_h2_cases :: proc(r: ^Runner) {
 			anything and the whole body goes out in one frame once credit
 			exists - failing the case below for a timing reason that has nothing
 			to do with flow control.
+
+			The deadline below is not what actually bounds a stuck wait: each
+			`h2_pump` call blocks inside `conn_read` for up to CLIENT_TIMEOUT
+			before it can return and let the deadline be rechecked, so a server
+			that never sends anything is caught after one CLIENT_TIMEOUT, not
+			after this deadline. It has to sit above CLIENT_TIMEOUT or it would
+			never be the thing that fires.
 			*/
 			stalled := false
-			deadline := time.time_add(time.now(), 5 * time.Second)
+			deadline := time.time_add(time.now(), CLIENT_TIMEOUT + 2 * time.Second)
 			for time.diff(deadline, time.now()) < 0 {
 				if res, found := h2_stream(c, 1); found && res.data_frames >= 1 {
 					stalled = true
