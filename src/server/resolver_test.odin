@@ -152,8 +152,9 @@ test_stats_of_carries_every_counter :: proc(t: ^testing.T) {
 		dropped      = 7,
 		refused      = 8,
 		conn_refused = 9,
-		secure       = 10,
-		bogus        = 11,
+		conn_failed  = 10,
+		secure       = 11,
+		bogus        = 12,
 	}
 	s := Server {
 		stats = want,

@@ -620,6 +620,10 @@ bit and a TCP round trip it was told it would not need. It holds on every path �
 locally built answers, forwarded ones, cache hits, and answers re-encoded to
 carry a DNS cookie.
 
+Coming from Unbound, note that this is one knob where Unbound has two:
+`edns-buffer-size`, which is the figure it advertises, and `max-udp-size`, which
+is the bound it truncates at. `max_udp_response` is both.
+
 The ceiling is UDP only. TCP, DoT and DoH establish a connection before a query
 arrives, so the address is proven, there is nothing to reflect, and an answer
 that fits is sent whole. The OPT record on those goes back exactly as the answer
@@ -791,14 +795,16 @@ Wildcards match subdomains only, so `*.lan` covers `host.lan` but not `lan`.
 Queries of any type are answered: A, AAAA, CNAME, MX, TXT, SRV, SOA, NS, PTR,
 CAA, SVCB/HTTPS, DS, DNSKEY, RRSIG and everything else. Types the codec does not
 model natively are carried through as opaque RDATA per RFC 3597, and forwarded
-answers are passed back byte for byte, so DNSSEC records survive untouched.
-With validation on, an answer for a client that did not ask for DNSSEC records
-is rebuilt without them; every other answer still goes back verbatim.
+answers are passed back byte for byte, so DNSSEC records survive untouched. With
+validation on, an answer for a client that did not ask for DNSSEC records is
+rebuilt without them; every other answer still goes back verbatim, bar the two
+bytes of payload size described below.
 
 Also handled: EDNS0 (the client's OPT record is forwarded upstream so payload
-sizes are negotiated end to end, minus its cookie, which stops here; the OPT
-that comes back to the client carries *this* server's payload size, per RFC 6891
-section 6.2.4 — see [How large a UDP answer may
+sizes are negotiated end to end, minus its cookie, which stops here; over UDP the
+OPT that comes back to the client carries *this* server's payload size, per RFC
+6891 section 6.2.4, while on the stream transports it is passed through as it
+stands — see [How large a UDP answer may
 be](#how-large-a-udp-answer-may-be)), DNS
 cookies in both directions (RFC 7873, RFC 9018) — answered for clients, and
 presented to plain upstreams with the reply checked against what we sent —
@@ -897,6 +903,11 @@ since long after that `warn` scrolled away still says so. It is kept apart from
 `refused=`, which is the allow list turning a source away — this is a client
 elodin would serve and has no room for, and the setting to reach for is a
 different one.
+
+A connection can also be refused *below* the limit, when the OS will not give
+the process another thread — `RLIMIT_NPROC`, a cgroup `pids.max`, or memory.
+That is `conn_failed=`, with its own once-at-warn line, because raising
+`max_connections` there cannot help and would make it worse.
 
 The number that governs sizing is the sustained cache-miss row. A worker thread is occupied for
 the whole of an upstream round trip, so

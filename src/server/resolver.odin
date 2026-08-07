@@ -70,6 +70,17 @@ Stats :: struct {
 	reach for is a different one.
 	*/
 	conn_refused: u64,
+	/*
+	Connections turned away because the OS would not start a thread for one.
+
+	Counted apart from `conn_refused` because it happens *below* the limit -
+	`RLIMIT_NPROC`, a cgroup `pids.max`, or memory - and the two point an
+	operator in opposite directions. Folded together, a host that ran out of
+	threads at a tenth of `max_connections` would read as a server that had
+	filled it, and the obvious response would be to raise a number that was never
+	the bound.
+	*/
+	conn_failed:  u64,
 	// Answers that carried a valid chain of signatures, and answers refused
 	// because they did not.
 	secure:    u64,
@@ -206,7 +217,7 @@ advertised_udp_size :: proc(s: ^Server, query: dns.Message, proto: Protocol) -> 
 	// runs on. Clamped anyway, because what is being written is two bytes of a
 	// field with its own range, and a number from outside it would be truncated
 	// into something arbitrary rather than refused.
-	return u16(clamp(udp_ceiling(s), int(dns.MAX_UDP_SIZE), int(config.MAX_UDP_RESPONSE)))
+	return u16(clamp(udp_ceiling(s), config.MIN_UDP_RESPONSE, config.MAX_UDP_RESPONSE))
 }
 
 /*
@@ -887,6 +898,7 @@ stats_of :: proc(s: ^Server) -> Stats {
 		dropped = sync.atomic_load(&s.stats.dropped),
 		refused = sync.atomic_load(&s.stats.refused),
 		conn_refused = sync.atomic_load(&s.stats.conn_refused),
+		conn_failed = sync.atomic_load(&s.stats.conn_failed),
 		secure = sync.atomic_load(&s.stats.secure),
 		bogus = sync.atomic_load(&s.stats.bogus),
 	}

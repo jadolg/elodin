@@ -53,21 +53,21 @@ test_reaping_a_permanent_thread_keeps_the_count_honest :: proc(t: ^testing.T) {
 
 	// A listener loop, as `start_udp` and `start_stream_listener` register one,
 	// that then finishes - which is what shutdown does to all of them.
-	testing.expect(
-		t,
-		conn_spawn(&cm, nil, returns_immediately, counted = false),
-		"could not start the permanent thread",
-	)
+	testing.expect_value(t, conn_spawn(&cm, nil, returns_immediately, counted = false), Spawn_Result.Started)
 	testing.expect_value(t, wait_for_reap(&cm, 0), 0)
 
 	// With the tally corrected, the one slot the limit allows is still one slot.
 	held := Held{}
 	defer sync.atomic_store(&held.go, true)
-	testing.expect(t, conn_spawn(&cm, &held, holds_until_released), "the first connection was refused")
+	testing.expect_value(t, conn_spawn(&cm, &held, holds_until_released), Spawn_Result.Started)
 	testing.expect_value(t, active_connections(&cm), 1)
-	testing.expect(
-		t,
-		!conn_spawn(&cm, &held, holds_until_released),
-		"a second connection was accepted past a limit of one",
-	)
+	/*
+	And the refusal says which of the two it was.
+
+	`Limit_Reached` and `Thread_Failed` ask an operator for opposite things -
+	raise the limit, or find out what stopped the OS giving this process a
+	thread - so the accept loop counts and reports them apart. A boolean could
+	not tell them apart, and named `max_connections` for both.
+	*/
+	testing.expect_value(t, conn_spawn(&cm, &held, holds_until_released), Spawn_Result.Limit_Reached)
 }

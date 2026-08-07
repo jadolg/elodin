@@ -19,10 +19,13 @@ the configured ceiling. Echoing the client's own figure back tells a forwarder
 chaining through here to size its buffers for an answer that will never arrive,
 and it then pays for a TC bit and a TCP round trip it was told it would not need.
 
-`server.max_udp_response` bounds what goes out, so the number that is true of
-this server is `response_limit` - and every path an answer can reach the wire by
-has to carry it: locally built, forwarded, served from cache, and re-encoded
-afterwards to carry a cookie.
+The number that is true of this server is `server.max_udp_response` itself, not
+`response_limit`: the field says what can be delivered, and a client that asked
+for less than the ceiling has not lowered that. What bounds the reply in hand is
+`response_limit`, which is the smaller of the two, and it is a separate question.
+
+Every path an answer can reach the wire by has to carry it: locally built,
+forwarded, served from cache, and re-encoded afterwards to carry a cookie.
 */
 
 @(private = "file")

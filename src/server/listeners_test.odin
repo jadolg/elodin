@@ -166,3 +166,113 @@ test_read_loop_does_not_release_a_context_its_jobs_hold :: proc(t: ^testing.T) {
 	destroy_listeners(&l)
 	testing.expect(t, l.udp_loop_ctx == nil, "destroy_listeners left the context behind")
 }
+
+/*
+A connection refused for want of a slot is counted, not only logged.
+
+The line for it is a `warn` once and `debug` after that, on the reasoning that a
+peer opening connections decides how many lines this server writes. That trade is
+only sound because something else goes on counting: without `conn_refused`, a
+server sitting at `max_connections` for a week shows one `warn` from its first
+minute and nothing since - which is the silence the demotion was supposed to
+avoid, not cause.
+
+Driven through the accept loop against a real listener rather than through
+`conn_spawn`, because the increment is in the loop and `conn_spawn` knows nothing
+about the counter. `max_connections` of 1, one connection to occupy it and a
+second to be refused.
+*/
+@(private = "file")
+Refused_Probe :: struct {
+	server: ^Server,
+	want:   u64,
+}
+
+@(private = "file")
+conn_refused_reached :: proc(data: rawptr) -> bool {
+	p := cast(^Refused_Probe)data
+	return sync.atomic_load(&p.server.stats.conn_refused) >= p.want
+}
+
+@(private = "file")
+slot_taken :: proc(data: rawptr) -> bool {
+	return active_connections(&(cast(^Listeners)data).conns) >= 1
+}
+
+@(test)
+test_a_connection_past_the_limit_is_counted :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	cfg.listeners.udp.enabled = false
+	cfg.listeners.tcp = config.Listener {
+		enabled = true,
+		address = "127.0.0.1",
+		port    = 0,
+	}
+	cfg.listeners.dot.enabled = false
+	cfg.listeners.doh.enabled = false
+	cfg.cache.enabled = false
+	cfg.blocking.enabled = false
+	cfg.log.queries = false
+	cfg.server.max_connections = 1
+	// Long enough that the first connection is still holding its slot when the
+	// second arrives, without leaving a stuck thread behind if it is not.
+	cfg.server.client_timeout = 5 * time.Second
+
+	handler_pool := pool.make_pool(1)
+	s := Server {
+		cfg          = &cfg,
+		handler_pool = handler_pool,
+	}
+
+	l: Listeners
+	if !start_listeners(&s, &l) {
+		pool.destroy(handler_pool)
+		testing.expect(t, false, "could not start the TCP listener")
+		return
+	}
+	defer {
+		stop_listeners(&l)
+		pool.destroy(handler_pool)
+		destroy_listeners(&l)
+	}
+
+	bound, berr := net.bound_endpoint(l.tcp_socket)
+	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
+		return
+	}
+
+	// Opened and left open with nothing written on it, so the connection thread
+	// sits in its read and the slot stays taken.
+	first, ferr := net.dial_tcp(bound)
+	if !testing.expectf(t, ferr == nil, "cannot open the first connection: %v", ferr) {
+		return
+	}
+	defer net.close(first)
+
+	// The accept loop has to have taken the first one before the second arrives,
+	// or the limit is not what refuses it.
+	taken := wait_until(slot_taken, &l, 2 * time.Second)
+	if !testing.expect(t, taken, "the first connection never occupied the only slot") {
+		return
+	}
+
+	second, serr := net.dial_tcp(bound)
+	if !testing.expectf(t, serr == nil, "cannot open the second connection: %v", serr) {
+		return
+	}
+	defer net.close(second)
+
+	probe := Refused_Probe {
+		server = &s,
+		want   = 1,
+	}
+	counted := wait_until(conn_refused_reached, &probe, 2 * time.Second)
+	testing.expectf(
+		t,
+		counted,
+		"a connection refused past max_connections was not counted: conn_refused=%d",
+		sync.atomic_load(&s.stats.conn_refused),
+	)
+	// And it is the limit that was blamed, not the OS refusing a thread.
+	testing.expect_value(t, sync.atomic_load(&s.stats.conn_failed), u64(0))
+}

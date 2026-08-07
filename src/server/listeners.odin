@@ -200,7 +200,7 @@ start_udp :: proc(s: ^Server, l: ^Listeners) -> bool {
 	ctx := new(Udp_Context)
 	ctx.server = s
 	ctx.listeners = l
-	if !conn_spawn(&l.conns, ctx, udp_loop, counted = false) {
+	if conn_spawn(&l.conns, ctx, udp_loop, counted = false) != .Started {
 		logx.errorf("listeners.udp: cannot start the read loop")
 		// Nothing was ever handed it, so it is ours to release.
 		free(ctx)
@@ -418,7 +418,7 @@ report_refusal :: proc(client: net.Endpoint, proto: Protocol) {
 }
 
 /*
-Say that `server.max_connections` is full, once, and then quietly.
+Say why a connection could not be given a thread, once, and then quietly.
 
 The same reasoning as `report_refusal`, and reached the same way: a peer opening
 connections past the limit wrote one line per attempt otherwise, at `warn`, so it
@@ -426,13 +426,22 @@ was on at the default level. The setting is named because it is the one thing
 that would change the outcome, and because a connection refused for want of a
 slot and one refused for want of an allow-list entry look identical from the
 client's side.
+
+The two causes are told apart because they ask for opposite things. Naming
+`max_connections` at a host that ran out of threads sends an operator to raise a
+limit that was never the bound, and the raise makes it worse. Each keeps its own
+flag, so one of them going quiet does not silence the other.
 */
 @(private)
 conn_limit_reported: bool
 
 @(private)
-report_conn_limit :: proc(proto: Protocol, limit: int) {
-	say, first := report_once(&conn_limit_reported, logx.enabled(.Debug))
+conn_failed_reported: bool
+
+@(private)
+report_spawn_failure :: proc(proto: Protocol, why: Spawn_Result, limit: int) {
+	flag := &conn_limit_reported if why == .Limit_Reached else &conn_failed_reported
+	say, first := report_once(flag, logx.enabled(.Debug))
 	if !say {
 		return
 	}
@@ -441,13 +450,28 @@ report_conn_limit :: proc(proto: Protocol, limit: int) {
 	defer free_all(context.temp_allocator)
 
 	transport := proto_name(proto)
+	if why != .Limit_Reached {
+		if !first {
+			logx.debugf("%s: refusing a connection, the OS would not start a thread for it", transport)
+			return
+		}
+		logx.warnf(
+			"%s: refusing a connection, the OS would not start a thread for it - this is below server.max_connections (%d), so raising that will not help",
+			transport,
+			limit,
+		)
+		logx.warnf(
+			"  check the process thread and memory limits (RLIMIT_NPROC, cgroup pids.max); these are counted as conn_failed= in the stats line, and further ones are logged at debug level",
+		)
+		return
+	}
 	if !first {
 		logx.debugf("%s: refusing a connection, the limit of %d is reached", transport, limit)
 		return
 	}
 	logx.warnf("%s: refusing a connection, server.max_connections (%d) is reached", transport, limit)
 	logx.warnf(
-		"  raise server.max_connections if this server should hold more clients at once; further refusals are logged at debug level",
+		"  raise server.max_connections if this server should hold more clients at once; these are counted as conn_refused= in the stats line, and further ones are logged at debug level",
 	)
 }
 
@@ -580,7 +604,7 @@ start_stream_listener :: proc(
 	ctx.server = s
 	ctx.listeners = l
 	ctx.proto = proto
-	if !conn_spawn(&l.conns, ctx, accept_loop, counted = false) {
+	if conn_spawn(&l.conns, ctx, accept_loop, counted = false) != .Started {
 		logx.errorf("listeners.%s: cannot start the accept loop", name)
 		// Nothing was ever handed it, so it is ours to release.
 		free(ctx)
@@ -745,7 +769,7 @@ accept_loop :: proc(data: rawptr) {
 		job.socket = client_socket
 		job.client = client
 
-		if !conn_spawn(&l.conns, job, stream_job) {
+		if spawned := conn_spawn(&l.conns, job, stream_job); spawned != .Started {
 			/*
 			Counted first, and logged only once.
 
@@ -756,12 +780,21 @@ accept_loop :: proc(data: rawptr) {
 			`conn_refused=` in the stats line long after the one `warn` scrolled
 			away.
 
-			`report_conn_limit` releases the temp arena the line was formatted out
-			of: this loop is the one place that never resets it, and nothing here
-			outlives the iteration.
+			Which of the two refusals it was decides both the counter and the
+			line. A host that cannot give this process another thread refuses
+			connections well below `max_connections`, and telling that operator to
+			raise `max_connections` sends them somewhere the fix is not.
+
+			`report_spawn_failure` releases the temp arena the line was formatted
+			out of: this loop is the one place that never resets it, and nothing
+			here outlives the iteration.
 			*/
-			sync.atomic_add(&ctx.server.stats.conn_refused, 1)
-			report_conn_limit(ctx.proto, l.conns.limit)
+			if spawned == .Limit_Reached {
+				sync.atomic_add(&ctx.server.stats.conn_refused, 1)
+			} else {
+				sync.atomic_add(&ctx.server.stats.conn_failed, 1)
+			}
+			report_spawn_failure(ctx.proto, spawned, l.conns.limit)
 			net.close(client_socket)
 			free(job)
 		}

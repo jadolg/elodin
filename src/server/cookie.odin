@@ -217,11 +217,19 @@ attach_cookie :: proc(
 		return wire
 	}
 	cookie := make_cookie(k, req, cookie_now())
-	// `advertise` rather than the client's own figure: an answer from an upstream
-	// that dropped EDNS gets a whole OPT record minted here, and it is this
-	// server's payload size that belongs in it. `handle_query` writes the same
-	// number over the top on the UDP path, so this is what keeps a record minted
-	// on a stream transport from claiming the client's.
+	/*
+	`advertise` is whatever the answer is going out reporting, worked out once by
+	the caller.
+
+	Only a record minted here can be affected: `ensure_edns_option` passes this
+	to `make_opt` for an answer from an upstream that dropped EDNS, and leaves an
+	existing OPT record's class alone. On UDP that is the ceiling, and
+	`handle_query` writes it again over the top a moment later, so the value is
+	belt and braces there. On the stream transports nothing writes it again, and
+	it is the client's own figure - the same number this passed before, and the
+	only one available on a transport where this server has no payload size to
+	report.
+	*/
 	out, ok := dns.ensure_edns_option(wire, .Cookie, cookie[:], advertise, allocator)
 	if !ok {
 		// Nothing to do but send the answer as it is; a client that gets no
