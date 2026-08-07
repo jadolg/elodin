@@ -604,10 +604,10 @@ report_udp_ceiling :: proc(wire: []u8, limit: int, query: dns.Message) {
 		limit,
 	)
 	logx.warnf(
-		"  to send it over UDP instead, raise server.max_udp_response in the configuration (up to %d); the cost is that a spoofed query can make this server send that much to an address it did not verify",
+		"to send it over UDP instead, raise server.max_udp_response in the configuration (up to %d); the cost is that a spoofed query can make this server send that much to an address it did not verify",
 		config.MAX_UDP_RESPONSE,
 	)
-	logx.warnf("  further truncations at this ceiling are logged at debug level")
+	logx.warnf("further truncations at this ceiling are logged at debug level")
 }
 
 @(private)
@@ -860,16 +860,51 @@ log_query :: proc(
 		return
 	}
 	elapsed := time.diff(started, time.now())
-	logx.infof(
-		"%s %s %s %s -> %v (%s) %.1fms",
+	/*
+	Two of these are not this server's text, so both go through `quote`: a
+	query name is bytes a client chose, and `detail` carries an upstream's name
+	out of the configuration when one answered.
+
+	Presentation form is not enough on its own. It escapes the control range,
+	the space and the backslash, but `"` and `=` are printable and go through as
+	they are - which are exactly the two bytes that would otherwise end the
+	value early and let a name invent a field of its own.
+
+	The rest are addresses, enum names and numbers.
+	*/
+	logx.eventf(
+		.Info,
+		"query",
+		"client=%s proto=%s qtype=%s qname=%s outcome=%s detail=%s ms=%.1f",
 		client,
 		proto_name(proto),
 		dns.type_name(q.type),
-		dns.name_trim_root(q.name),
-		outcome,
-		detail,
+		logx.quote(dns.name_trim_root(q.name)),
+		outcome_name(outcome),
+		logx.quote(detail),
 		time.duration_milliseconds(elapsed),
 	)
+}
+
+@(private)
+outcome_name :: proc(o: Outcome) -> string {
+	switch o {
+	case .Forwarded:
+		return "forwarded"
+	case .Cached:
+		return "cached"
+	case .Blocked:
+		return "blocked"
+	case .Rewritten:
+		return "rewritten"
+	case .Local:
+		return "local"
+	case .Failed:
+		return "failed"
+	case .Refused:
+		return "refused"
+	}
+	return "unknown"
 }
 
 @(private)

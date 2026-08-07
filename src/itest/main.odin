@@ -103,6 +103,9 @@ main :: proc() {
 	run_cli_cases(&r)
 	run_shutdown_cases(&r)
 
+	section(&r, "log format")
+	run_logfmt_cases(&r)
+
 	section(&r, "wire format and message handling")
 	run_wire_cases(&r)
 
