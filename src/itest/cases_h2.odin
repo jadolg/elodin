@@ -230,8 +230,28 @@ run_h2_cases :: proc(r: ^Runner) {
 			defer h2_close(c)
 			check(r, h2_send_request(c, 1, "POST", "/dns-query", query), "cannot send")
 
-			// Let the server stall, then hand out credit.
-			time.sleep(150 * time.Millisecond)
+			/*
+			Wait for the server to actually stall on the 8-byte window before
+			handing out more credit, rather than sleeping a fixed duration: on a
+			slow or busy runner the response may still be in flight when a fixed
+			sleep elapses, so the window updates land before the server has sent
+			anything and the whole body goes out in one frame once credit
+			exists - failing the case below for a timing reason that has nothing
+			to do with flow control.
+			*/
+			stalled := false
+			deadline := time.time_add(time.now(), 5 * time.Second)
+			for time.diff(deadline, time.now()) < 0 {
+				if res, found := h2_stream(c, 1); found && res.data_frames >= 1 {
+					stalled = true
+					break
+				}
+				if !h2_pump(c) {
+					break
+				}
+			}
+			check(r, stalled, "the server never sent a frame constrained by the 8-byte window")
+
 			check(r, h2_send_window_update(c, 1, 65535), "cannot send a stream window update")
 			check(r, h2_send_window_update(c, 0, 65535), "cannot send a connection window update")
 
