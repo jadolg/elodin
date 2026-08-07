@@ -46,3 +46,8 @@ list:
     body: >
       folded inside a sequence # entry
     tail: 7
+
+quoted_key_block:
+  "a\": b": |
+    # a block under a key whose name holds an escaped quote
+  after: 8

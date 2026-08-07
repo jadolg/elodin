@@ -462,6 +462,22 @@ test_folded_scalar_blank_line_is_a_break :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_block_scalar_under_escaped_quote_key :: proc(t: ^testing.T) {
+	// Deciding whether a line opens a block scalar runs the key through
+	// find_key_colon, so a key holding an escaped quote exercises both that
+	// and the verbatim body at once.
+	root, err := parse("\"a\\\": b\": |\n  # content\n  x # tail\nc: 2\n", context.temp_allocator)
+	testing.expectf(t, err == nil, "parse failed: %v", err)
+	v, ok := as_string(get(root, "a\": b"))
+	testing.expect(t, ok, "key missing")
+	testing.expect_value(t, v, "# content\nx # tail\n")
+	c, cok := as_int(get(root, "c"))
+	testing.expect(t, cok, "c missing")
+	testing.expect_value(t, c, i64(2))
+	free_all(context.temp_allocator)
+}
+
+@(test)
 test_block_scalar_body_allows_tabs :: proc(t: ^testing.T) {
 	// Indentation is spaces, but past it a tab is content like any other byte.
 	// The document-wide tab check does not apply inside the body.
