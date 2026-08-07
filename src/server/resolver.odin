@@ -345,6 +345,14 @@ resolve_query :: proc(
 	to an upstream, which is the recursion the client did not ask for. Refused
 	rather than silently dropped, matching the other policy refusals above -
 	the allow-list is what keeps this from being a free reflection.
+
+	No counter of its own, again matching the class, XFR and cookie refusals
+	beside it: `Stats.refused` is `server.allow_from` turning away a datagram or
+	connection before a query exists at all, and stretching it to cover this too
+	would blur two different questions an operator asks of it - "is a network I
+	never added reaching this port" against "are RD=0 probes arriving". The
+	query log is where this one shows, as `outcome=refused detail="rd"`, when
+	`log.queries` is on.
 	*/
 	if !msg.flags.rd {
 		out, built := dns.error_response(query, msg, .Refused, allocator, limit)
