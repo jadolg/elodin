@@ -80,14 +80,12 @@ report_bind_failure :: proc(name: string, address: string, port: int, err: net.N
 	case net.Bind_Error:
 		#partial switch e {
 		case .Insufficient_Permissions_For_Address:
-			logx.errorf(
-				"  ports below 1024 need privileges: either grant them once with",
-			)
-			logx.errorf("    sudo setcap 'cap_net_bind_service=+ep' ./bin/elodin")
-			logx.errorf("  or use a high port, as examples/dev.yaml does")
+			logx.errorf("ports below 1024 need privileges: either grant them once with")
+			logx.errorf("sudo setcap 'cap_net_bind_service=+ep' ./bin/elodin")
+			logx.errorf("or use a high port, as examples/dev.yaml does")
 		case .Address_In_Use:
-			logx.errorf("  something is already listening there; on most systems that is systemd-resolved:")
-			logx.errorf("    sudo systemctl stop systemd-resolved")
+			logx.errorf("something is already listening there; on most systems that is systemd-resolved:")
+			logx.errorf("sudo systemctl stop systemd-resolved")
 		}
 	}
 }
@@ -413,7 +411,7 @@ report_refusal :: proc(client: net.Endpoint, proto: Protocol) {
 		who,
 	)
 	logx.warnf(
-		"  add its network to server.allow_from if that client should be served; refusals are counted as refused= in the stats line, and further ones are logged at debug level",
+		"add its network to server.allow_from if that client should be served; refusals are counted as refused= in the stats line, and further ones are logged at debug level",
 	)
 }
 
@@ -468,14 +466,14 @@ spawn_failure_words :: proc(why: Spawn_Result) -> Spawn_Failure_Words {
 			reported = &conn_limit_reported,
 			brief = "%s: refusing a connection, the limit of %d is reached",
 			line = "%s: refusing a connection, server.max_connections (%d) is reached",
-			hint = "  raise server.max_connections if this server should hold more clients at once; these are counted as conn_refused= in the stats line, and further ones are logged at debug level",
+			hint = "raise server.max_connections if this server should hold more clients at once; these are counted as conn_refused= in the stats line, and further ones are logged at debug level",
 		}
 	}
 	return Spawn_Failure_Words {
 		reported = &conn_failed_reported,
 		brief = "%s: refusing a connection, the OS would not start a thread for it, below the limit of %d",
 		line = "%s: refusing a connection, the OS would not start a thread for it - this is below server.max_connections (%d), so raising that will not help",
-		hint = "  check the process thread and memory limits (RLIMIT_NPROC, cgroup pids.max); these are counted as conn_failed= in the stats line, and further ones are logged at debug level",
+		hint = "check the process thread and memory limits (RLIMIT_NPROC, cgroup pids.max); these are counted as conn_failed= in the stats line, and further ones are logged at debug level",
 	}
 }
 

@@ -253,11 +253,37 @@ addresses, the upstream set, blocking — those still need a restart.
 
 ### Observing it
 
-There is no metrics endpoint. Statistics go to the log every five minutes —
-queries, blocked, cached, forwarded, failed, dropped, refused, rate-limited and
-truncated, secure and bogus counts, plus cache entries, bytes, hits, misses and
-evictions — and `log.queries` adds one line per query, at the cost noted under
-[Resource use](#resource-use).
+Every line is [logfmt](https://brandur.org/logfmt): `key=value` pairs, quoted
+only where a value needs it, with the time and the severity as fields rather
+than as a prefix a collector has to be taught to recognise.
+
+```
+ts=2026-08-07T09:12:33Z level=info msg=ready strategy=Round_Robin upstreams=2 cache=true blocking=true dnssec=true
+ts=2026-08-07T09:12:41Z level=info msg=query client=192.0.2.10:44188 proto=udp qtype=A qname=example.com outcome=forwarded detail=cloudflare-dot ms=11.7
+ts=2026-08-07T09:12:44Z level=warn msg="list steven-black: unavailable, skipping it"
+```
+
+`ts` is RFC 3339 in UTC, and `msg` names the event: the lines something is
+expected to watch — `starting`, `sizing`, `ready`, `stats`, `query` — keep the
+same `msg` from one line to the next and carry what differs in fields beside
+it. Everything else is one human sentence in `msg`, quoted because it has
+spaces in it. In Loki that is `| logfmt` and nothing else:
+
+```logql
+{job="elodin"} | logfmt | msg="query" | outcome="blocked"
+{job="elodin"} | logfmt | msg="stats" | unwrap cache_hits
+```
+
+There is no metrics endpoint. Statistics go to the log every five minutes, as
+`msg=stats` — `queries`, `blocked`, `cached`, `forwarded`, `failed`, `dropped`,
+`refused`, `conn_refused`, `conn_failed`, `limited`, `truncated`, `secure` and
+`bogus`, plus `cache_entries`, `cache_bytes`, `cache_hits`, `cache_misses` and
+`cache_evictions` — and `log.queries` adds one `msg=query` line per query, at
+the cost noted under [Resource use](#resource-use).
+
+A query name is the one field in that line whose bytes a client chooses. It is
+escaped like any other value, so a label holding a quote or a newline stays
+inside its own value and cannot forge a field of its own.
 
 ## Configuration
 
@@ -525,11 +551,8 @@ working with nothing to grep for; with a line per datagram, whoever is sending
 them decides how much this server writes to disk.
 
 ```
-WARN  udp: refused a query from 198.51.100.7:41234: it is not in
-      server.allow_from, so nothing was sent back
-WARN    add its network to server.allow_from if that client should be served;
-        refusals are counted as refused= in the stats line, and further ones are
-        logged at debug level
+ts=… level=warn msg="udp: refused a query from 198.51.100.7:41234: it is not in server.allow_from, so nothing was sent back"
+ts=… level=warn msg="add its network to server.allow_from if that client should be served; refusals are counted as refused= in the stats line, and further ones are logged at debug level"
 ```
 
 The line says what was refused. Over UDP that is a query — the datagram is in
@@ -593,12 +616,8 @@ datagrams and where the resolver is not reachable by anyone who would abuse it.
 When the ceiling does truncate an answer, elodin says so and names the setting:
 
 ```
-WARN  a 2720-byte answer for big.example. was truncated to 1232 bytes and the
-      client told to retry over TCP: it asked for 4096, and
-      server.max_udp_response is 1232
-WARN    to send it over UDP instead, raise server.max_udp_response in the
-        configuration (up to 4096); the cost is that a spoofed query can make
-        this server send that much to an address it did not verify
+ts=… level=warn msg="a 2720-byte answer for big.example. was truncated to 1232 bytes and the client told to retry over TCP: it asked for 4096, and server.max_udp_response is 1232"
+ts=… level=warn msg="to send it over UDP instead, raise server.max_udp_response in the configuration (up to 4096); the cost is that a spoofed query can make this server send that much to an address it did not verify"
 ```
 
 Once, at `warn`; every truncation after that at `debug`, so one large signed
@@ -892,10 +911,8 @@ the setting and every one after it is `debug` — the same shape as an
 decided by whoever is opening the connections.
 
 ```
-WARN  tcp: refusing a connection, server.max_connections (512) is reached
-WARN    raise server.max_connections if this server should hold more clients at
-        once; these are counted as conn_refused= in the stats line, and further
-        ones are logged at debug level
+ts=… level=warn msg="tcp: refusing a connection, server.max_connections (512) is reached"
+ts=… level=warn msg="raise server.max_connections if this server should hold more clients at once; these are counted as conn_refused= in the stats line, and further ones are logged at debug level"
 ```
 
 The counting does not stop with the logging: every one of them is a
@@ -911,11 +928,8 @@ Raising `max_connections` there cannot help and would make it worse, so it is
 counted and named separately:
 
 ```
-WARN  tcp: refusing a connection, the OS would not start a thread for it - this
-      is below server.max_connections (512), so raising that will not help
-WARN    check the process thread and memory limits (RLIMIT_NPROC, cgroup
-        pids.max); these are counted as conn_failed= in the stats line, and
-        further ones are logged at debug level
+ts=… level=warn msg="tcp: refusing a connection, the OS would not start a thread for it - this is below server.max_connections (512), so raising that will not help"
+ts=… level=warn msg="check the process thread and memory limits (RLIMIT_NPROC, cgroup pids.max); these are counted as conn_failed= in the stats line, and further ones are logged at debug level"
 ```
 
 The number that governs sizing is the sustained cache-miss row. A worker thread is occupied for
@@ -956,11 +970,18 @@ those 128. Whatever the machine says, a number in the configuration wins — and
 the two can be set independently, since an unset `upstream_workers` follows a
 configured `workers`.
 
-The numbers it settled on, and what it read them from, are logged on the first
+The numbers it settled on, and what it read them from, are logged on the second
 line after startup and printed by `--check`:
 
 ```
-workers=16 upstream_workers=8 max_pending=128 (derived from 4 usable CPUs and 7.7 GiB)
+ts=… level=info msg=sizing workers=16 upstream_workers=8 max_pending=128 origin="derived from 4 usable CPUs and 7.7 GiB"
+```
+
+```console
+$ elodin --check
+/etc/elodin/elodin.yaml is valid: 2 upstreams, 1 blocklists, 0 rewrites
+  workers=16 upstream_workers=8 max_pending=128 (derived from 4 usable CPUs and 7.7 GiB)
+  answering queries from 127.0.0.0/8, ::1/128; every other source is refused
 ```
 
 Past capacity the server drops queries rather than queueing them
@@ -1018,22 +1039,16 @@ twice the wire size again. So `cache.max_entries` alone would stand for
 something near 640 MB at its default, reachable by anyone who can serve maximal
 answers from a zone they control and walk elodin through enough distinct names.
 `cache.max_bytes` is the bound that holds: 64 MiB by default, evicting from the
-least recently used end whenever either bound is passed. `cache bytes=` in the
+least recently used end whenever either bound is passed. `cache_bytes=` in the
 five-minute stats line reports what is held against it.
 
 Disk is negligible: an 840 KB binary, and a blocklist cache the size of the
 lists themselves (6.5 MB for two large ones). Nothing is written in steady
 state — with one exception.
 
-That exception is `log.queries`, which writes 22 MB/s at 220k qps, about 104
-bytes per query. It wants rotation. What it does *not* cost is throughput: on
-this machine the server was consistently around 20% **faster** with it on
-(191,000 qps against 230,000), reproducibly and with a run-to-run spread of a
-few percent — while the same configuration measured against itself differs by
-under 1%, so it is not an artefact of the ordering. The likeliest explanation is
-that the per-query write staggers 128 workers that otherwise contend on the same
-hot path. Do not read it as a reason to turn logging on; read it as a reason not
-to expect it to cost anything.
+That exception is `log.queries`, which writes 32 MB/s at 185k qps, about 183
+bytes per query. It wants rotation. The line was 104 bytes before it became
+logfmt; the keys are most of the difference, and they are disk rather than work.
 
 The `race` strategy is the other setting with a real price: it multiplies
 upstream traffic by the number of servers.
@@ -1087,7 +1102,7 @@ src/server/    resolver, listeners, DoH endpoint, cookies, list refresh
 src/h2/        HTTP/2 framing, HPACK, and the server connection state machine
 src/tlsx/      OpenSSL bindings and a small TLS wrapper
 src/pool/      worker pool
-src/logx/      logging
+src/logx/      logging, in logfmt
 src/privdrop/  giving up root once the listeners hold their ports
 src/itest/     integration suite: harness, mock upstreams (DNS, HTTP, DoH/h2), clients, fixtures
 bench/         benchmark harness and DNSSEC survey, in Go, with committed results

@@ -172,33 +172,37 @@ usable_cpus :: proc(cpus: int) -> string {
 }
 
 @(private)
-sizing_line :: proc(s: config.Server_Config) -> string {
-	origin := "from the configuration"
+sizing_origin :: proc(s: config.Server_Config) -> string {
 	switch {
 	case s.sizing.derived_workers:
 		m := s.sizing.machine
 		switch {
 		case m.cpus > 0 && m.memory > 0:
-			origin = fmt.tprintf("derived from %s and %#.1M", usable_cpus(m.cpus), m.memory)
+			return fmt.tprintf("derived from %s and %#.1M", usable_cpus(m.cpus), m.memory)
 		case m.cpus > 0:
-			origin = fmt.tprintf("derived from %s", usable_cpus(m.cpus))
+			return fmt.tprintf("derived from %s", usable_cpus(m.cpus))
 		case m.memory > 0:
-			origin = fmt.tprintf("derived from %#.1M of memory", m.memory)
+			return fmt.tprintf("derived from %#.1M of memory", m.memory)
 		case:
-			origin = "derived from defaults; this machine could not be measured"
+			return "derived from defaults; this machine could not be measured"
 		}
 	// Nothing was measured: half of a number the file named is still that
 	// number's doing, and naming the machine here would credit it with a
 	// choice an operator made.
 	case s.sizing.derived_upstream_workers:
-		origin = "upstream_workers derived from the configured workers"
+		return "upstream_workers derived from the configured workers"
 	}
+	return "from the configuration"
+}
+
+@(private)
+sizing_line :: proc(s: config.Server_Config) -> string {
 	return fmt.tprintf(
 		"workers=%d upstream_workers=%d max_pending=%d (%s)",
 		s.workers,
 		s.upstream_workers,
 		s.max_pending,
-		origin,
+		sizing_origin(s),
 	)
 }
 
@@ -284,8 +288,16 @@ main :: proc() {
 		return
 	}
 
-	logx.infof("elodin %s starting", server.VERSION)
-	logx.infof("%s", sizing_line(cfg.server))
+	logx.eventf(.Info, "starting", "version=%s", logx.quote(server.VERSION))
+	logx.eventf(
+		.Info,
+		"sizing",
+		"workers=%d upstream_workers=%d max_pending=%d origin=%s",
+		cfg.server.workers,
+		cfg.server.upstream_workers,
+		cfg.server.max_pending,
+		logx.quote(sizing_origin(cfg.server)),
+	)
 	if len(cfg.server.allow_from) == 0 {
 		logx.warnf("%s", allow_from_line(cfg.server))
 	} else {
@@ -385,8 +397,10 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 
 	drop_privileges(cfg, service)
 
-	logx.infof(
-		"ready: strategy=%v upstreams=%d cache=%v blocking=%v dnssec=%v",
+	logx.eventf(
+		.Info,
+		"ready",
+		"strategy=%v upstreams=%d cache=%v blocking=%v dnssec=%v",
 		cfg.upstream.strategy,
 		len(cfg.upstream.servers),
 		cfg.cache.enabled,
@@ -423,7 +437,7 @@ drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity) {
 				"running as root and server.user is not set, so every query is parsed with full privileges;",
 			)
 			logx.warnf(
-				"  set server.user, or bind the port with 'setcap cap_net_bind_service=+ep' and start unprivileged",
+				"set server.user, or bind the port with 'setcap cap_net_bind_service=+ep' and start unprivileged",
 			)
 		}
 		return
@@ -512,8 +526,10 @@ report :: proc(s: ^server.Server, answers: ^cache.Cache) {
 	st := server.stats_of(s)
 	cs := cache.stats(answers)
 	limited, slipped := server.rate_limit_stats(s.limiter)
-	logx.infof(
-		"stats: queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d refused=%d conn_refused=%d conn_failed=%d limited=%d truncated=%d secure=%d bogus=%d | cache entries=%d bytes=%d hits=%d misses=%d evictions=%d",
+	logx.eventf(
+		.Info,
+		"stats",
+		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d refused=%d conn_refused=%d conn_failed=%d limited=%d truncated=%d secure=%d bogus=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_misses=%d cache_evictions=%d",
 		st.queries,
 		st.blocked,
 		st.cached,
