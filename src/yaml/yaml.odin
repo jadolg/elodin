@@ -144,11 +144,7 @@ scan_lines :: proc(p: ^Parser, src: string) -> Maybe(Error) {
 opens_block_scalar :: proc(body: string, indent: int) -> (parent: int, opens: bool) {
 	text, col := body, indent
 	for is_sequence_entry(text) {
-		content_col := col + 1
-		for content_col < col + len(text) && text[content_col - col] == ' ' {
-			content_col += 1
-		}
-		text, col = strings.trim_space(text[1:]), content_col
+		text, col = strings.trim_space(text[1:]), entry_content_col(text, col)
 	}
 	colon := find_key_colon(text) or_return
 	value := strings.trim_space(text[colon + 1:])
@@ -287,6 +283,18 @@ is_sequence_entry :: proc(text: string) -> bool {
 	return text == "-" || (len(text) >= 2 && text[0] == '-' && (text[1] == ' ' || text[1] == '\t'))
 }
 
+// The column a `- ` entry's content starts at. parse_sequence rewrites the
+// entry to this column and opens_block_scalar nests a block body under it, so
+// the two have to derive it the same way or they disagree about the block.
+@(private)
+entry_content_col :: proc(text: string, indent: int) -> int {
+	col := indent + 1
+	for col < indent + len(text) && text[col - indent] == ' ' {
+		col += 1
+	}
+	return col
+}
+
 @(private)
 parse_block :: proc(p: ^Parser, indent: int) -> ^Node {
 	if p.pos >= len(p.lines) {
@@ -370,10 +378,7 @@ parse_sequence :: proc(p: ^Parser, indent: int) -> ^Node {
 		// column and let the block parser take it from there.
 		_, is_map := find_key_colon(rest)
 		if is_map || is_sequence_entry(rest) {
-			content_col := line.indent + 1
-			for content_col < line.indent + len(line.text) && line.text[content_col - line.indent] == ' ' {
-				content_col += 1
-			}
+			content_col := entry_content_col(line.text, line.indent)
 			p.lines[p.pos] = Line{indent = content_col, text = rest, num = line.num}
 			append(&node.seq, parse_block(p, content_col))
 			if _, has := p.err.?; has {
@@ -437,8 +442,11 @@ parse_block_scalar :: proc(p: ^Parser, header: string, indent: int, line_num: in
 			blanks += 1
 			continue
 		}
-		if folded && wrote {
-			if blanks == 0 {
+		if folded {
+			// Only the space that joins two lines needs a line before it; the
+			// breaks a blank line stands for are written either way, so a block
+			// that opens on a blank keeps it as the literal form does.
+			if wrote && blanks == 0 {
 				strings.write_byte(&b, ' ')
 			}
 			for _ in 0 ..< blanks {
@@ -458,9 +466,9 @@ parse_block_scalar :: proc(p: ^Parser, header: string, indent: int, line_num: in
 		}
 		wrote = true
 	}
-	for _ in 0 ..< blanks {
-		strings.write_byte(&b, '\n')
-	}
+	// No flush of a trailing `blanks` run: the scanner drops the blank lines
+	// that merely trail a block, so the last line it hands over is always
+	// content. Keep-chomping them is a separate change to both halves.
 
 	s := strings.to_string(b)
 	switch chomp {

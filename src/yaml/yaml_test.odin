@@ -480,12 +480,49 @@ test_block_scalar_under_escaped_quote_key :: proc(t: ^testing.T) {
 @(test)
 test_block_scalar_body_allows_tabs :: proc(t: ^testing.T) {
 	// Indentation is spaces, but past it a tab is content like any other byte.
-	// The document-wide tab check does not apply inside the body.
-	root, err := parse("a: |\n  x\ty\nb: 2\n", context.temp_allocator)
+	// A tab straight after the indentation is the case that moved: the
+	// document-wide tab check used to reject it before the body was content.
+	root, err := parse("a: |\n  \ty\nb: 2\n", context.temp_allocator)
 	testing.expectf(t, err == nil, "parse failed: %v", err)
 	a, ok := as_string(get(root, "a"))
 	testing.expect(t, ok, "a missing")
-	testing.expect_value(t, a, "x\ty\n")
+	testing.expect_value(t, a, "\ty\n")
+
+	mid, merr := parse("a: |\n  x\ty\n", context.temp_allocator)
+	testing.expectf(t, merr == nil, "parse failed: %v", merr)
+	m, mok := as_string(get(mid, "a"))
+	testing.expect(t, mok, "a missing")
+	testing.expect_value(t, m, "x\ty\n")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_block_scalar_keeps_interior_trailing_spaces :: proc(t: ^testing.T) {
+	// Trailing spaces on a body line are content. Only the last line loses
+	// them, to chomping, which trims spaces along with the newlines.
+	root, err := parse("a: |\n  one  \n  two\n", context.temp_allocator)
+	testing.expectf(t, err == nil, "parse failed: %v", err)
+	a, ok := as_string(get(root, "a"))
+	testing.expect(t, ok, "a missing")
+	testing.expect_value(t, a, "one  \ntwo\n")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_folded_scalar_keeps_a_leading_blank :: proc(t: ^testing.T) {
+	// A folded block that opens on a blank line keeps it, as the literal form
+	// does. Only the space joining two lines needs a line before it.
+	root, err := parse("a: >-\n\n  one\n  two\n", context.temp_allocator)
+	testing.expectf(t, err == nil, "parse failed: %v", err)
+	a, ok := as_string(get(root, "a"))
+	testing.expect(t, ok, "a missing")
+	testing.expect_value(t, a, "\none two")
+
+	lit, lerr := parse("a: |\n\n  one\n", context.temp_allocator)
+	testing.expectf(t, lerr == nil, "parse failed: %v", lerr)
+	l, lok := as_string(get(lit, "a"))
+	testing.expect(t, lok, "literal a missing")
+	testing.expect_value(t, l, "\none\n")
 	free_all(context.temp_allocator)
 }
 
