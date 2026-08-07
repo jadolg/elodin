@@ -5,3 +5,24 @@
 /.claude
 /.idea
 /dist/
+
+# `odin test src/yaml` without -out: builds a bare executable named after the
+# package in the working directory. It is cleaned up when the run passes and
+# left behind when it fails, so it appears exactly when a `git add -A` is most
+# likely to sweep it up. One entry per package under src/.
+/cache
+/config
+/dns
+/dnssec
+/filter
+/fuzz
+/h2
+/itest
+/logx
+/main
+/pool
+/privdrop
+/server
+/tlsx
+/upstream
+/yaml
