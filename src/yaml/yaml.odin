@@ -127,7 +127,7 @@ scan_lines :: proc(p: ^Parser, src: string) -> Maybe(Error) {
 @(private)
 strip_comment :: proc(s: string) -> string {
 	in_single, in_double := false, false
-	for i in 0 ..< len(s) {
+	for i := 0; i < len(s); i += 1 {
 		c := s[i]
 		switch {
 		case in_single:
@@ -135,7 +135,12 @@ strip_comment :: proc(s: string) -> string {
 				in_single = false
 			}
 		case in_double:
+			// A backslash escapes the byte after it, `\"` included, so that byte
+			// has to be stepped over: leaving it to the next turn of the loop lets
+			// an escaped quote close the scalar early, and the rest of the line is
+			// then read unquoted.
 			if c == '\\' {
+				i += 1
 				continue
 			}
 			if c == '"' {
@@ -493,13 +498,17 @@ parse_flow :: proc(p: ^Parser, text: string, line_num: int) -> (node: ^Node, con
 find_key_colon :: proc(s: string) -> (idx: int, ok: bool) {
 	depth := 0
 	in_single, in_double := false, false
-	for i in 0 ..< len(s) {
+	for i := 0; i < len(s); i += 1 {
 		c := s[i]
 		switch {
 		case in_single:
 			if c == '\'' {in_single = false}
 		case in_double:
-			if c == '\\' {continue}
+			// Step over the escaped byte; see strip_comment.
+			if c == '\\' {
+				i += 1
+				continue
+			}
 			if c == '"' {in_double = false}
 		case c == '\'':
 			in_single = true

@@ -277,6 +277,95 @@ test_mismatched_flow_close_rejected :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_escaped_quote_does_not_close_scalar :: proc(t: ^testing.T) {
+	// `\"` closed double-quote mode one byte early, so everything after it was
+	// read as if unquoted: a `#` became a comment and a `: ` a key separator.
+	root, err := parse("key: \"val\\\" # not comment\"\n", context.temp_allocator)
+	testing.expectf(t, err == nil, "parse failed: %v", err)
+	v, ok := as_string(get(root, "key"))
+	testing.expect(t, ok, "key missing")
+	testing.expect_value(t, v, "val\" # not comment")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_escaped_quote_in_quoted_key :: proc(t: ^testing.T) {
+	root, err := parse("\"a\\\": b\": 1\n", context.temp_allocator)
+	testing.expectf(t, err == nil, "parse failed: %v", err)
+	v, ok := as_int(get(root, "a\": b"))
+	testing.expect(t, ok, "key missing")
+	testing.expect_value(t, v, i64(1))
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_escaped_quote_in_sequence_entry :: proc(t: ^testing.T) {
+	// The `: ` inside the quoted entry made it look like `- key: value`, and the
+	// entry was parsed as a mapping instead of a scalar.
+	root, err := parse("list:\n  - \"a\\\": b\"\n", context.temp_allocator)
+	testing.expectf(t, err == nil, "parse failed: %v", err)
+	l := items(get(root, "list"))
+	if !testing.expect_value(t, len(l), 1) {
+		free_all(context.temp_allocator)
+		return
+	}
+	v, ok := as_string(l[0])
+	testing.expect(t, ok, "entry is not a scalar")
+	testing.expect_value(t, v, "a\": b")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_escaped_quote_in_flow_collection :: proc(t: ^testing.T) {
+	root, err := parse("a: [\"x\\\" # y\", plain]\n", context.temp_allocator)
+	testing.expectf(t, err == nil, "parse failed: %v", err)
+	l, ok := as_string_list(get(root, "a"), context.temp_allocator)
+	testing.expect(t, ok, "flow list missing")
+	if !testing.expect_value(t, len(l), 2) {
+		free_all(context.temp_allocator)
+		return
+	}
+	testing.expect_value(t, l[0], "x\" # y")
+	testing.expect_value(t, l[1], "plain")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_escaped_backslash_still_closes_scalar :: proc(t: ^testing.T) {
+	// The escape skip covers exactly one byte, so a trailing `\\` has to leave
+	// the quote after it free to close the scalar. Three scanners track quotes
+	// independently - comment stripping, key splitting and flow items - and each
+	// one is pinned here, because a skip one byte too wide reads as correct
+	// until a value ends in a backslash.
+	root, err := parse("a: \"ends \\\\\" # comment\nb: 2\n", context.temp_allocator)
+	testing.expectf(t, err == nil, "parse failed: %v", err)
+	v, ok := as_string(get(root, "a"))
+	testing.expect(t, ok, "a missing")
+	testing.expect_value(t, v, "ends \\")
+	n, nok := as_int(get(root, "b"))
+	testing.expect(t, nok, "b missing")
+	testing.expect_value(t, n, i64(2))
+
+	kroot, kerr := parse("\"a\\\\\": 1\n", context.temp_allocator)
+	testing.expectf(t, kerr == nil, "parse failed: %v", kerr)
+	kv, kok := as_int(get(kroot, "a\\"))
+	testing.expect(t, kok, "key missing")
+	testing.expect_value(t, kv, i64(1))
+
+	froot, ferr := parse("a: [\"x\\\\\", plain]\n", context.temp_allocator)
+	testing.expectf(t, ferr == nil, "parse failed: %v", ferr)
+	l, lok := as_string_list(get(froot, "a"), context.temp_allocator)
+	testing.expect(t, lok, "flow list missing")
+	if !testing.expect_value(t, len(l), 2) {
+		free_all(context.temp_allocator)
+		return
+	}
+	testing.expect_value(t, l[0], "x\\")
+	testing.expect_value(t, l[1], "plain")
+	free_all(context.temp_allocator)
+}
+
+@(test)
 test_bad_mapping_line_reports_line_number :: proc(t: ^testing.T) {
 	_, err := parse("a: 1\nb: 2\nthis is not a mapping\n", context.temp_allocator)
 	e, has := err.?

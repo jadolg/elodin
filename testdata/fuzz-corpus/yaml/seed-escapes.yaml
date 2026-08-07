@@ -1,0 +1,32 @@
+# Escape-heavy shapes, so the fuzzer starts inside the quote-state scanners
+# rather than having to invent a `\"` from scratch. The bug this seeds against
+# had `\"` close double-quote mode a byte early, which turned a later `#` into
+# a comment and a later `: ` into a key separator.
+
+quoted:
+  escaped_quote: "val\" # not comment"
+  escaped_colon: "a\": b"
+  trailing_backslash: "ends \\"
+  mixed: "tab\there, nl\nhere, hex\x41, unié"
+  slash: "http:\/\/example.com"
+  empty: ""
+  just_escape: "\\"
+  single: 'it''s fine'
+
+"a\": b": escaped quote in the key
+"k\\": trailing backslash in the key
+
+flow:
+  seq: ["x\" # y", "p\": q", plain, "z\\"]
+  map: {"k\": v": 1, plain: "w\" # x"}
+  nested: {outer: ["i\": j", {inner: "m\" # n"}]}
+
+sequence:
+  - "a\": b"
+  - "c\" # d"
+  - key: "e\": f"
+    other: "g\\"
+
+block: |
+  a line with "an escaped \" quote"
+  and a # sign
