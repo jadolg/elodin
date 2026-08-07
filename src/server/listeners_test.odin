@@ -1,6 +1,7 @@
 package server
 
 import "core:net"
+import "core:strconv"
 import "core:sync"
 import "core:testing"
 import "core:time"
@@ -275,4 +276,91 @@ test_a_connection_past_the_limit_is_counted :: proc(t: ^testing.T) {
 	)
 	// And it is the limit that was blamed, not the OS refusing a thread.
 	testing.expect_value(t, sync.atomic_load(&s.stats.conn_failed), u64(0))
+}
+
+@(private = "file")
+month_number :: proc(name: string) -> int {
+	names := []string{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
+	for n, i in names {
+		if n == name {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+/*
+The Date header's day-name has to agree with the date next to it, or a strict
+cache rejects the whole header - and with it the `max-age` that told it when
+to expire the answer.
+
+The expected weekday is derived from the date `now_http_date` itself printed,
+not from a separate `time.now()` call in the test: the two calls straddling
+midnight would make the test flake on a day-name mismatch that was never a
+bug.
+*/
+@(test)
+test_now_http_date_weekday_matches_the_date :: proc(t: ^testing.T) {
+	got := now_http_date()
+	defer delete(got)
+
+	// "Fri, 07 Aug 2026 18:56:41 GMT" - fixed width throughout, since the
+	// format string uses %02d/%04d for every numeric field.
+	if !testing.expectf(t, len(got) == 29, "Date header is not in the expected form: %q", got) {
+		return
+	}
+
+	day, day_ok := strconv.parse_int(got[5:7])
+	month := month_number(got[8:11])
+	year, year_ok := strconv.parse_int(got[12:16])
+	hour, hour_ok := strconv.parse_int(got[17:19])
+	minute, minute_ok := strconv.parse_int(got[20:22])
+	second, second_ok := strconv.parse_int(got[23:25])
+	if !testing.expectf(
+		t,
+		day_ok && month != 0 && year_ok && hour_ok && minute_ok && second_ok,
+		"could not parse the Date header: %q",
+		got,
+	) {
+		return
+	}
+
+	parsed, ok := time.components_to_time(year, month, day, hour, minute, second)
+	if !testing.expectf(t, ok, "the Date header's own date does not parse as a valid time: %q", got) {
+		return
+	}
+
+	// Shared with production rather than a second copy of the table: a table
+	// reordered the same way in both places would otherwise still agree with
+	// itself. test_now_http_date_epoch_is_a_known_thursday below is what
+	// actually catches that.
+	expected := WEEKDAY_NAMES[int(time.weekday(parsed))]
+
+	testing.expectf(
+		t,
+		got[:3] == expected,
+		"Date header weekday does not match its date: got %q, expected %q",
+		got[:3],
+		expected,
+	)
+}
+
+/*
+An oracle independent of `weekday_name`'s own table: the Unix epoch is a well
+known Thursday, so the expected string here is a literal, not anything
+derived from the table under test. A table that agrees with itself while
+being wrong - every name shifted one place, say - would pass the test above
+but not this one.
+*/
+@(test)
+test_now_http_date_epoch_is_a_known_thursday :: proc(t: ^testing.T) {
+	epoch, ok := time.components_to_time(1970, 1, 1, 0, 0, 0)
+	if !testing.expect(t, ok, "could not construct the Unix epoch as a time.Time") {
+		return
+	}
+
+	got := http_date(epoch)
+	defer delete(got)
+
+	testing.expect_value(t, got, "Thu, 01 Jan 1970 00:00:00 GMT")
 }

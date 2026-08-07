@@ -971,13 +971,27 @@ conn_write_all :: proc(c: Conn, buf: []u8) -> bool {
 
 @(private)
 now_http_date :: proc(allocator := context.allocator) -> string {
+	return http_date(time.now(), allocator)
+}
+
+/*
+Split from `now_http_date` so a test can hand it a known instant - such as the
+Unix epoch - and check the result against a known-correct literal, rather than
+every caller trusting the same clock and weekday table this function itself
+uses.
+
+A `now: time.Time = {}` default on `now_http_date` itself would not work for
+that: `time.Time{}` and the Unix epoch are the same value, so passing the
+epoch explicitly would be indistinguishable from passing nothing.
+*/
+@(private)
+http_date :: proc(clock: time.Time, allocator := context.allocator) -> string {
 	// RFC 1123 date for the Date header. Callers only need something valid.
-	now := time.now()
-	y, m, d := time.date(now)
-	h, mi, sec := time.clock_from_time(now)
+	y, m, d := time.date(clock)
+	h, mi, sec := time.clock_from_time(clock)
 	return fmt.aprintf(
 		"%s, %02d %s %04d %02d:%02d:%02d GMT",
-		"Mon",
+		weekday_name(time.weekday(clock)),
 		d,
 		month_name(int(m)),
 		y,
@@ -995,4 +1009,14 @@ month_name :: proc(m: int) -> string {
 		return names[m - 1]
 	}
 	return "Jan"
+}
+
+// Shared with listeners_test.odin so the two cannot drift apart and still
+// agree with each other by accident.
+@(private)
+WEEKDAY_NAMES := []string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
+
+@(private)
+weekday_name :: proc(wd: time.Weekday) -> string {
+	return WEEKDAY_NAMES[int(wd)]
 }
