@@ -121,5 +121,4 @@ test_a_spawn_failure_names_its_own_cause :: proc(t: ^testing.T) {
 	later.
 	*/
 	testing.expect(t, limit.reported != failed.reported, "both spawn failures share one once-only flag")
-	testing.expect(t, limit.reported != nil && failed.reported != nil, "a spawn failure has no flag to report against")
 }

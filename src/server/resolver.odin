@@ -31,18 +31,18 @@ Outcome :: enum u8 {
 }
 
 Stats :: struct {
-	queries:   u64,
-	blocked:   u64,
-	cached:    u64,
-	forwarded: u64,
-	failed:    u64,
-	rewritten: u64,
+	queries:      u64,
+	blocked:      u64,
+	cached:       u64,
+	forwarded:    u64,
+	failed:       u64,
+	rewritten:    u64,
 	/*
 	Queries refused before any work was done: the backlog was full, or the
 	source was one no answer could reach - see `plausible_source`. Queries the
 	rate limiter withheld are counted by the limiter itself.
 	*/
-	dropped:   u64,
+	dropped:      u64,
 	/*
 	Traffic turned away because of `server.allow_from`: a datagram on UDP, and a
 	connection on the stream transports, where the check runs on accept before a
@@ -54,7 +54,7 @@ Stats :: struct {
 	`refused` is a client that is not on the list - which is either the internet
 	finding an open port, or somebody's own subnet that nobody added.
 	*/
-	refused:   u64,
+	refused:      u64,
 	/*
 	Connections turned away because `server.max_connections` was already full.
 
@@ -83,8 +83,8 @@ Stats :: struct {
 	conn_failed:  u64,
 	// Answers that carried a valid chain of signatures, and answers refused
 	// because they did not.
-	secure:    u64,
-	bogus:     u64,
+	secure:       u64,
+	bogus:        u64,
 }
 
 Server :: struct {
