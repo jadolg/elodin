@@ -79,25 +79,33 @@ parse :: proc(src: string, allocator := context.allocator) -> (root: ^Node, err:
 }
 
 @(private)
+take_line :: proc(s: string) -> (line: string, rest: string) {
+	if idx := strings.index_byte(s, '\n'); idx >= 0 {
+		return s[:idx], s[idx + 1:]
+	}
+	return s, ""
+}
+
+@(private)
+leading_spaces :: proc(s: string) -> int {
+	n := 0
+	for n < len(s) && s[n] == ' ' {
+		n += 1
+	}
+	return n
+}
+
+@(private)
 scan_lines :: proc(p: ^Parser, src: string) -> Maybe(Error) {
 	num := 0
 	rest := src
 	for len(rest) > 0 || num == 0 {
 		num += 1
 		line: string
-		if idx := strings.index_byte(rest, '\n'); idx >= 0 {
-			line = rest[:idx]
-			rest = rest[idx + 1:]
-		} else {
-			line = rest
-			rest = ""
-		}
+		line, rest = take_line(rest)
 		line = strings.trim_right(line, "\r \t")
 
-		indent := 0
-		for indent < len(line) && line[indent] == ' ' {
-			indent += 1
-		}
+		indent := leading_spaces(line)
 		if indent < len(line) && line[indent] == '\t' {
 			return Error{num, "tabs may not be used for indentation"}
 		}
@@ -116,11 +124,102 @@ scan_lines :: proc(p: ^Parser, src: string) -> Maybe(Error) {
 			continue
 		}
 		append(&p.lines, Line{indent = indent, text = body, num = num})
+
+		// Everything above treats the line as YAML. A block scalar's body is
+		// not YAML but content, so it is taken verbatim instead.
+		if parent, opens := opens_block_scalar(body, indent); opens {
+			scan_block_scalar(p, &rest, &num, parent)
+		}
 		if len(rest) == 0 {
 			break
 		}
 	}
 	return nil
+}
+
+// Whether `s` is a block scalar header: `|` or `>` with at most one chomping
+// indicator, the same shapes parse_block_scalar accepts.
+@(private)
+is_block_header :: proc(s: string) -> bool {
+	if len(s) == 0 || (s[0] != '|' && s[0] != '>') {
+		return false
+	}
+	return len(s) == 1 || (len(s) == 2 && (s[1] == '-' || s[1] == '+'))
+}
+
+// Reports the indentation a block scalar's body must exceed, when `body` is a
+// line whose value opens one. `- key: |` nests the block under the entry's
+// content column, which is the same rewrite parse_sequence performs, while
+// `- |` nests it under the dash itself: the block is the entry's own value.
+@(private)
+opens_block_scalar :: proc(body: string, indent: int) -> (parent: int, opens: bool) {
+	text, col := body, indent
+	dash_col := -1
+	for is_sequence_entry(text) {
+		dash_col = col
+		text, col = strings.trim_space(text[1:]), entry_content_col(text, col)
+	}
+	if is_block_header(text) {
+		return dash_col if dash_col >= 0 else 0, dash_col >= 0
+	}
+	colon := find_key_colon(text) or_return
+	value := strings.trim_space(text[colon + 1:])
+	if !is_block_header(value) {
+		return 0, false
+	}
+	return col, true
+}
+
+/*
+Takes a block scalar's body verbatim: a `#` in it is text rather than a
+comment, and a blank line is a blank line rather than a separator to drop.
+
+The body runs until a line indented no further than the key that opened it,
+which is what parse_block_scalar goes on to read it back at. Blank lines are
+held until content proves they sit inside the block, so the ones that merely
+trail it stay with the document.
+*/
+@(private)
+scan_block_scalar :: proc(p: ^Parser, rest: ^string, num: ^int, parent: int) {
+	block_indent := -1
+	pending, pending_num := 0, 0
+
+	for len(rest^) > 0 {
+		line, after := take_line(rest^)
+		line_num := num^ + 1
+		body := strings.trim_right(line, "\r")
+		indent := leading_spaces(body)
+
+		// A line carrying no content is blank whatever it is made of. Counting
+		// only spaces would let a lone tab fall through to the boundary test,
+		// end the block on the spot, and hand the rest of the body back to the
+		// comment stripper this whole procedure exists to keep it away from.
+		if len(strings.trim_space(body)) == 0 {
+			if pending == 0 {
+				pending_num = line_num
+			}
+			pending += 1
+			rest^, num^ = after, line_num
+			continue
+		}
+		// Once the first body line has set the block's own indentation, that is
+		// the boundary rather than the key's: a line short of it is outside the
+		// block even though it clears the key that opened it.
+		if indent <= parent || (block_indent >= 0 && indent < block_indent) {
+			break
+		}
+
+		if block_indent < 0 {
+			block_indent = indent
+		}
+		for _ in 0 ..< pending {
+			append(&p.lines, Line{indent = block_indent, text = "", num = pending_num})
+			pending_num += 1
+		}
+		pending = 0
+		append(&p.lines, Line{indent = indent, text = body[indent:], num = line_num})
+		rest^, num^ = after, line_num
+	}
 }
 
 // A `#` only opens a comment when it follows whitespace and sits outside quotes.
@@ -204,6 +303,18 @@ is_sequence_entry :: proc(text: string) -> bool {
 	return text == "-" || (len(text) >= 2 && text[0] == '-' && (text[1] == ' ' || text[1] == '\t'))
 }
 
+// The column a `- ` entry's content starts at. parse_sequence rewrites the
+// entry to this column and opens_block_scalar nests a block body under it, so
+// the two have to derive it the same way or they disagree about the block.
+@(private)
+entry_content_col :: proc(text: string, indent: int) -> int {
+	col := indent + 1
+	for col < indent + len(text) && text[col - indent] == ' ' {
+		col += 1
+	}
+	return col
+}
+
 @(private)
 parse_block :: proc(p: ^Parser, indent: int) -> ^Node {
 	if p.pos >= len(p.lines) {
@@ -282,15 +393,26 @@ parse_sequence :: proc(p: ^Parser, indent: int) -> ^Node {
 			continue
 		}
 
+		// `- |` and `- >`: the entry's value is a block scalar, read back at
+		// the sequence's indentation like the value of any other key. A line
+		// that merely starts with `|` or `>` — `- |x` — is not a valid block
+		// header, and parse_block_scalar rejects it: main silently misread it
+		// as the plain scalar "|x".
+		if len(rest) > 0 && (rest[0] == '|' || rest[0] == '>') {
+			p.pos += 1
+			append(&node.seq, parse_block_scalar(p, rest, indent, line.num))
+			if _, has := p.err.?; has {
+				return node
+			}
+			continue
+		}
+
 		// `- key: value` starts a mapping whose body may continue on following
 		// lines aligned with `key`. Rewrite the entry as a plain line at that
 		// column and let the block parser take it from there.
 		_, is_map := find_key_colon(rest)
 		if is_map || is_sequence_entry(rest) {
-			content_col := line.indent + 1
-			for content_col < line.indent + len(line.text) && line.text[content_col - line.indent] == ' ' {
-				content_col += 1
-			}
+			content_col := entry_content_col(line.text, line.indent)
 			p.lines[p.pos] = Line{indent = content_col, text = rest, num = line.num}
 			append(&node.seq, parse_block(p, content_col))
 			if _, has := p.err.?; has {
@@ -326,34 +448,71 @@ parse_value :: proc(p: ^Parser, rest: string, indent: int, line_num: int) -> ^No
 
 @(private)
 parse_block_scalar :: proc(p: ^Parser, header: string, indent: int, line_num: int) -> ^Node {
+	// The header is `|` or `>` with at most one chomping indicator, the same
+	// shapes the scanner recognizes. Anything else — `|x`, `|+x`, `| x` — is
+	// invalid YAML and is rejected here rather than misread: `|+x` used to be
+	// taken for `|+` with the trailing byte dropped.
+	if !is_block_header(header) {
+		return fail(p, line_num, "unsupported block scalar indicator")
+	}
 	folded := header[0] == '>'
 	chomp := byte(0)
 	if len(header) > 1 {
-		switch header[1] {
-		case '-', '+':
-			chomp = header[1]
-		case:
-			return fail(p, line_num, "unsupported block scalar indicator")
-		}
+		chomp = header[1]
 	}
 
 	b := strings.builder_make(p.allocator)
 	block_indent := -1
-	for p.pos < len(p.lines) && p.lines[p.pos].indent > indent {
+	// Folding joins consecutive lines with a space, but a blank line between
+	// them is a paragraph break and stays a newline. Blank lines only reach
+	// here now that the scanner keeps them, so folding has to account for them.
+	blanks, wrote := 0, false
+	for p.pos < len(p.lines) {
 		l := p.lines[p.pos]
+		if l.indent <= indent {
+			break
+		}
+		// A line short of the block's own indentation ends it, the same rule
+		// the scanner applies: it clears the key yet sits outside the block.
+		if block_indent >= 0 && l.indent < block_indent {
+			break
+		}
 		if block_indent < 0 {
 			block_indent = l.indent
 		}
-		text := l.text
+		p.pos += 1
+
+		if folded && len(l.text) == 0 {
+			blanks += 1
+			continue
+		}
+		if folded {
+			// Only the space that joins two lines needs a line before it; the
+			// breaks a blank line stands for are written either way, so a block
+			// that opens on a blank keeps it as the literal form does.
+			if wrote && blanks == 0 {
+				strings.write_byte(&b, ' ')
+			}
+			for _ in 0 ..< blanks {
+				strings.write_byte(&b, '\n')
+			}
+		}
+		blanks = 0
+
 		if l.indent > block_indent {
 			for _ in 0 ..< l.indent - block_indent {
 				strings.write_byte(&b, ' ')
 			}
 		}
-		strings.write_string(&b, text)
-		strings.write_byte(&b, '\n' if !folded else ' ')
-		p.pos += 1
+		strings.write_string(&b, l.text)
+		if !folded {
+			strings.write_byte(&b, '\n')
+		}
+		wrote = true
 	}
+	// No flush of a trailing `blanks` run: the scanner drops the blank lines
+	// that merely trail a block, so the last line it hands over is always
+	// content. Keep-chomping them is a separate change to both halves.
 
 	s := strings.to_string(b)
 	switch chomp {
