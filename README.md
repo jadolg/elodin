@@ -1049,14 +1049,6 @@ state — with one exception.
 That exception is `log.queries`, which writes 32 MB/s at 185k qps, about 183
 bytes per query. It wants rotation. The line was 104 bytes before it became
 logfmt; the keys are most of the difference, and they are disk rather than work.
-What it does *not* cost is throughput: on this machine the server was
-consistently around 20% **faster** with it on
-(191,000 qps against 230,000), reproducibly and with a run-to-run spread of a
-few percent — while the same configuration measured against itself differs by
-under 1%, so it is not an artefact of the ordering. The likeliest explanation is
-that the per-query write staggers 128 workers that otherwise contend on the same
-hot path. Do not read it as a reason to turn logging on; read it as a reason not
-to expect it to cost anything.
 
 The `race` strategy is the other setting with a real price: it multiplies
 upstream traffic by the number of servers.
