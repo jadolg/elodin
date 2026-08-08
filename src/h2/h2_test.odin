@@ -942,3 +942,81 @@ test_settings_window_change_is_bounded :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 	expect_no_leaks(t, &track, "settings window overflow")
 }
+
+// ---------------------------------------------------------------------------
+// Frame size bound
+// ---------------------------------------------------------------------------
+
+// Feeds `serve` a scripted byte stream and records the code of any GOAWAY the
+// connection writes back, so the frame loop can be driven end to end.
+@(private = "file")
+Serve_Harness :: struct {
+	in_data:    []u8,
+	in_pos:     int,
+	saw_goaway: bool,
+	code:       Error_Code,
+}
+
+@(private = "file")
+serve_harness_read :: proc(user: rawptr, buf: []u8) -> (n: int, ok: bool) {
+	h := cast(^Serve_Harness)user
+	if h.in_pos >= len(h.in_data) {
+		return 0, false
+	}
+	n = copy(buf, h.in_data[h.in_pos:])
+	h.in_pos += n
+	return n, true
+}
+
+@(private = "file")
+serve_harness_write :: proc(user: rawptr, buf: []u8) -> bool {
+	h := cast(^Serve_Harness)user
+	pos := 0
+	for pos + FRAME_HEADER_SIZE <= len(buf) {
+		fh, ok := parse_frame_header(buf[pos:])
+		if !ok {
+			break
+		}
+		body := buf[pos + FRAME_HEADER_SIZE:]
+		if fh.type == .Goaway && len(body) >= 8 {
+			h.saw_goaway = true
+			h.code = Error_Code(read_u32(body[4:]))
+		}
+		pos += FRAME_HEADER_SIZE + fh.length
+	}
+	return true
+}
+
+@(test)
+test_frame_larger_than_advertised_max_is_refused :: proc(t: ^testing.T) {
+	/*
+	The frame loop advertises the RFC 9113 6.5.2 default MAX_FRAME_SIZE (16384)
+	by never sending one, yet the bound it enforced was the receive window, 64x
+	that. A peer told one size and allowed another was refused only above 1 MB,
+	so any frame in between was accepted while the peer had been promised it
+	would not be.
+	*/
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	// Preface, then a frame header claiming a payload one byte over the
+	// advertised maximum - well under the old receive-window bound.
+	input := make([dynamic]u8, 0, len(PREFACE) + FRAME_HEADER_SIZE, context.temp_allocator)
+	append(&input, ..transmute([]u8)string(PREFACE))
+	write_frame_header(&input, DEFAULT_MAX_FRAME + 1, .Data, 0, 1)
+
+	h := Serve_Harness {
+		in_data = input[:],
+	}
+	c := make_conn(IO{user = &h, read = serve_harness_read, write = serve_harness_write}, ignore_request, nil, allocator)
+	serve(c)
+
+	testing.expect(t, h.saw_goaway, "an oversized frame was accepted without a GOAWAY")
+	testing.expect_value(t, h.code, Error_Code.Frame_Size_Error)
+
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "oversized frame")
+}

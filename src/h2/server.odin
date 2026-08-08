@@ -222,7 +222,12 @@ serve :: proc(c: ^Conn) {
 		if !ok {
 			return
 		}
-		if h.length > RECV_WINDOW {
+		// Bounded at the frame size we advertise, not at the receive window. We
+		// never send SETTINGS_MAX_FRAME_SIZE, so the peer is held to the RFC 9113
+		// 6.5.2 default (16384); accepting 64x that (RECV_WINDOW) would allow a
+		// frame the peer was told to keep smaller. The window still caps the body
+		// a stream may buffer; this caps a single frame off the wire.
+		if h.length > DEFAULT_MAX_FRAME {
 			goaway(c, .Frame_Size_Error)
 			return
 		}
