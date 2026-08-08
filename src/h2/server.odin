@@ -502,11 +502,10 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	per connection and order-dependent, so the block must still be decoded to
 	keep the decoder in step with the peer's encoder - RFC 9113 4.3 makes a
 	block left undecoded a COMPRESSION_ERROR, whatever the stream's fate. The
-	stream is carried like any other
-	through the block (and its CONTINUATION frames), then reset in
-	`finish_headers` instead of served. Advancing `last_stream_id` above and
-	setting `continuation_on` below both happen on this path exactly as on the
-	accepted one.
+	stream is carried like any other through the block (and its CONTINUATION
+	frames), then reset in `finish_headers` instead of served. Advancing
+	`last_stream_id` above and setting `continuation_on` below both happen on
+	this path exactly as on the accepted one.
 	*/
 	refused := len(c.streams) >= MAX_CONCURRENT
 

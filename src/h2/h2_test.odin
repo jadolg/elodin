@@ -1041,13 +1041,16 @@ test_frame_larger_than_advertised_max_is_refused :: proc(t: ^testing.T) {
 // ---------------------------------------------------------------------------
 
 // Fills every concurrency slot with a bare stream, so the next HEADERS the
-// connection sees is over MAX_CONCURRENT and refused.
+// connection sees is over MAX_CONCURRENT and refused. `last_stream_id` is left
+// at the highest id used, as opening those streams for real would have, so a
+// refused stream after it still has to advance the id on its own.
 @(private = "file")
 fill_concurrency :: proc(c: ^Conn, allocator: mem.Allocator) {
 	for i in 0 ..< MAX_CONCURRENT {
 		s := new(Stream, allocator)
 		s.id = u32(1 + 2 * i)
 		c.streams[s.id] = s
+		c.last_stream_id = s.id
 	}
 }
 
@@ -1160,16 +1163,20 @@ test_refused_stream_accepts_its_continuation :: proc(t: ^testing.T) {
 /*
 DATA the peer had already put on the wire for a stream we refused arrives after
 it is gone from the table. It is not tracked, so nothing buffers it; the bytes
-still counted against a shared receive window, so their credit is returned.
+still counted against the shared receive window, so their credit is returned
+with a connection-level WINDOW_UPDATE rather than silently dropped.
 */
 @(test)
-test_data_on_a_refused_stream_is_ignored :: proc(t: ^testing.T) {
+test_data_on_a_refused_stream_returns_connection_credit :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
 	mem.tracking_allocator_init(&track, context.allocator)
 	defer mem.tracking_allocator_destroy(&track)
 	allocator := mem.tracking_allocator(&track)
 
-	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil, allocator)
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
 	fill_concurrency(c, allocator)
 
 	refused_id := u32(1 + 2 * MAX_CONCURRENT)
@@ -1182,10 +1189,17 @@ test_data_on_a_refused_stream_is_ignored :: proc(t: ^testing.T) {
 	_, held := c.streams[refused_id]
 	testing.expect(t, !held, "a refused stream was left in the table")
 
+	clear(&log.frames)
 	body := []u8{1, 2, 3, 4}
 	ok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = refused_id}, body)
 	testing.expect(t, ok, "DATA on a refused stream was not handled gracefully")
+	testing.expect(
+		t,
+		saw_connection_window_update(&log),
+		"the connection window was not replenished for DATA on a refused stream",
+	)
 
+	delete(log.frames)
 	conn_unref(c)
 	free_all(context.temp_allocator)
 	expect_no_leaks(t, &track, "data on a refused stream")
