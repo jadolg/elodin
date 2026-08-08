@@ -1,6 +1,7 @@
 package yaml
 
 import "core:fmt"
+import "core:strings"
 import "core:testing"
 import "core:time"
 
@@ -710,5 +711,51 @@ test_bad_mapping_line_reports_line_number :: proc(t: ^testing.T) {
 	e, has := err.?
 	testing.expect(t, has, "expected an error")
 	testing.expect_value(t, e.line, 3)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_deep_flow_nesting_rejected :: proc(t: ^testing.T) {
+	// Deeply nested flow collections must produce an error, not a stack
+	// overflow. MAX_DEPTH + 1 open brackets is enough to trigger it.
+	b := strings.builder_make(context.temp_allocator)
+	strings.write_string(&b, "a: ")
+	for _ in 0 ..< MAX_DEPTH + 1 {
+		strings.write_byte(&b, '[')
+	}
+	for _ in 0 ..< MAX_DEPTH + 1 {
+		strings.write_byte(&b, ']')
+	}
+	strings.write_byte(&b, '\n')
+	_, err := parse(strings.to_string(b), context.temp_allocator)
+	testing.expect(t, err != nil, "deeply nested flow should be rejected")
+	if e, has := err.?; has {
+		testing.expectf(t, e.msg == "too deeply nested" || e.msg == "malformed flow collection",
+			"unexpected error: %v", e.msg)
+	}
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_deep_block_nesting_rejected :: proc(t: ^testing.T) {
+	// Deeply nested block structures must produce an error, not a stack
+	// overflow. Each line indented one more than the last gives O(N) depth.
+	b := strings.builder_make(context.temp_allocator)
+	for i in 0 ..< MAX_DEPTH + 1 {
+		for _ in 0 ..< i * 2 {
+			strings.write_byte(&b, ' ')
+		}
+		strings.write_string(&b, fmt.tprintf("k%d:\n", i))
+	}
+	// Write a final scalar value at the deepest level.
+	for _ in 0 ..< (MAX_DEPTH + 1) * 2 {
+		strings.write_byte(&b, ' ')
+	}
+	strings.write_string(&b, "val\n")
+	_, err := parse(strings.to_string(b), context.temp_allocator)
+	testing.expect(t, err != nil, "deeply nested block should be rejected")
+	if e, has := err.?; has {
+		testing.expect_value(t, e.msg, "too deeply nested")
+	}
 	free_all(context.temp_allocator)
 }
