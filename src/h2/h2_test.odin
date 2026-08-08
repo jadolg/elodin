@@ -1035,3 +1035,172 @@ test_frame_larger_than_advertised_max_is_refused :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 	expect_no_leaks(t, &track, "oversized frame")
 }
+
+// ---------------------------------------------------------------------------
+// A stream refused for being over the concurrency limit
+// ---------------------------------------------------------------------------
+
+// Fills every concurrency slot with a bare stream, so the next HEADERS the
+// connection sees is over MAX_CONCURRENT and refused. `last_stream_id` is left
+// at the highest id used, as opening those streams for real would have, so a
+// refused stream after it still has to advance the id on its own.
+@(private = "file")
+fill_concurrency :: proc(c: ^Conn, allocator: mem.Allocator) {
+	for i in 0 ..< MAX_CONCURRENT {
+		s := new(Stream, allocator)
+		s.id = u32(1 + 2 * i)
+		c.streams[s.id] = s
+		c.last_stream_id = s.id
+	}
+}
+
+/*
+RFC 9113 5.1.1: a refused stream's field block must still be decoded, or the
+per-connection HPACK decoder desynchronises from the peer's encoder for good.
+
+A literal with incremental indexing on the refused stream adds an entry to the
+peer's dynamic table; skipping the decode leaves ours without it, so every later
+block that references it decodes against the wrong table.
+*/
+@(test)
+test_refused_stream_still_decodes_its_header_block :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil, allocator)
+	fill_concurrency(c, allocator)
+
+	// Literal with incremental indexing, new name "x" with value "y": added to
+	// the dynamic table at index 62.
+	refused_block := []u8{0x40, 0x01, 'x', 0x01, 'y'}
+	refused_id := u32(1 + 2 * MAX_CONCURRENT)
+	ok := handle_headers(
+		c,
+		Frame_Header{length = len(refused_block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = refused_id},
+		refused_block,
+	)
+	testing.expect(t, ok, "handle_headers on a refused stream failed")
+
+	// Refused: it holds no slot.
+	_, held := c.streams[refused_id]
+	testing.expect(t, !held, "a refused stream was left in the table")
+
+	// last_stream_id advanced, so the peer cannot reuse the id.
+	testing.expect_value(t, c.last_stream_id, refused_id)
+
+	// The block's dynamic-table side effect was applied.
+	testing.expectf(t, len(c.decoder.entries) == 1, "the refused block was not decoded: %d entries", len(c.decoder.entries))
+	if len(c.decoder.entries) == 1 {
+		testing.expect_value(t, c.decoder.entries[0].name, "x")
+		testing.expect_value(t, c.decoder.entries[0].value, "y")
+	}
+
+	// Free a slot and send a stream that references index 62. With the decoder in
+	// step it decodes; desynchronised it is Bad_Index and a COMPRESSION_ERROR.
+	close_stream(c, 1)
+	next_block := []u8{0xbe}
+	next_id := refused_id + 2
+	nok := handle_headers(
+		c,
+		Frame_Header{length = len(next_block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = next_id},
+		next_block,
+	)
+	testing.expect(t, nok, "a later block referencing the refused entry failed to decode")
+	_, accepted := c.streams[next_id]
+	testing.expect(t, accepted, "the following stream was not accepted")
+
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "refused stream decode")
+}
+
+/*
+A refused HEADERS whose END_HEADERS is clear opens a CONTINUATION sequence like
+any other. Without `continuation_on` set on the refused path, the CONTINUATION
+that follows fails the `continuation_on != stream_id` guard and GOAWAYs the whole
+connection - so a client merely at its stream limit loses every in-flight stream.
+*/
+@(test)
+test_refused_stream_accepts_its_continuation :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil, allocator)
+	fill_concurrency(c, allocator)
+
+	// The literal split across HEADERS (END_HEADERS clear) and a CONTINUATION.
+	refused_id := u32(1 + 2 * MAX_CONCURRENT)
+	head := []u8{0x40, 0x01, 'x'}
+	ok := handle_headers(
+		c,
+		Frame_Header{length = len(head), type = .Headers, flags = 0, stream_id = refused_id},
+		head,
+	)
+	testing.expect(t, ok, "handle_headers on a refused stream failed")
+	testing.expect_value(t, c.continuation_on, refused_id)
+
+	tail := []u8{0x01, 'y'}
+	cok := handle_continuation(
+		c,
+		Frame_Header{length = len(tail), type = .Continuation, flags = FLAG_END_HEADERS, stream_id = refused_id},
+		tail,
+	)
+	testing.expect(t, cok, "the CONTINUATION of a refused stream was rejected")
+	testing.expect_value(t, c.continuation_on, u32(0))
+
+	// The whole block was decoded, so the decoder stayed in step.
+	testing.expectf(t, len(c.decoder.entries) == 1, "the refused block was not decoded: %d entries", len(c.decoder.entries))
+
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "refused stream continuation")
+}
+
+/*
+DATA the peer had already put on the wire for a stream we refused arrives after
+it is gone from the table. It is not tracked, so nothing buffers it; the bytes
+still counted against the shared receive window, so their credit is returned
+with a connection-level WINDOW_UPDATE rather than silently dropped.
+*/
+@(test)
+test_data_on_a_refused_stream_returns_connection_credit :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+	fill_concurrency(c, allocator)
+
+	refused_id := u32(1 + 2 * MAX_CONCURRENT)
+	block := []u8{0x40, 0x01, 'x', 0x01, 'y'}
+	handle_headers(
+		c,
+		Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = refused_id},
+		block,
+	)
+	_, held := c.streams[refused_id]
+	testing.expect(t, !held, "a refused stream was left in the table")
+
+	clear(&log.frames)
+	body := []u8{1, 2, 3, 4}
+	ok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = refused_id}, body)
+	testing.expect(t, ok, "DATA on a refused stream was not handled gracefully")
+	testing.expect(
+		t,
+		saw_connection_window_update(&log),
+		"the connection window was not replenished for DATA on a refused stream",
+	)
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "data on a refused stream")
+}

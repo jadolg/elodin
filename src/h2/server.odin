@@ -77,6 +77,10 @@ Stream :: struct {
 	end_stream:   bool,
 	// Set when the peer resets the stream, so a response in flight is dropped.
 	cancelled:    bool,
+	// Set when the stream is over the concurrency limit: its block is still
+	// decoded to keep HPACK in step, then the stream is reset without being
+	// served. See `handle_headers`.
+	refused:      bool,
 	send_window:  int,
 	// Request parked between its headers and the end of its body.
 	pending:      ^Request,
@@ -491,18 +495,29 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		goaway(c, .Protocol_Error)
 		return false
 	}
-	if len(c.streams) >= MAX_CONCURRENT {
-		sync.mutex_unlock(&c.mu)
-		return rst_stream(c, h.stream_id, .Refused_Stream)
-	}
 	c.last_stream_id = h.stream_id
+
+	/*
+	A stream over the concurrency limit is refused, but not here. HPACK state is
+	per connection and order-dependent, so the block must still be decoded to
+	keep the decoder in step with the peer's encoder - RFC 9113 4.3 makes a
+	block left undecoded a COMPRESSION_ERROR, whatever the stream's fate. The
+	stream is carried like any other through the block (and its CONTINUATION
+	frames), then reset in `finish_headers` instead of served. Advancing
+	`last_stream_id` above and setting `continuation_on` below both happen on
+	this path exactly as on the accepted one.
+	*/
+	refused := len(c.streams) >= MAX_CONCURRENT
 
 	s := new(Stream, c.allocator)
 	s.id = h.stream_id
 	s.state = .Open
+	s.refused = refused
 	s.send_window = c.peer_initial_window
 	s.header_block = make([dynamic]u8, 0, len(block), c.allocator)
-	s.body = make([dynamic]u8, 0, 512, c.allocator)
+	if !refused {
+		s.body = make([dynamic]u8, 0, 512, c.allocator)
+	}
 	append(&s.header_block, ..block)
 	s.end_stream = h.flags & FLAG_END_STREAM != 0
 	c.streams[h.stream_id] = s
@@ -583,6 +598,16 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 	}
 	// The block is decoded; keep only the fields.
 	clear(&s.header_block)
+
+	// A refused stream has had its HPACK side effects applied by the decode
+	// above, which is the whole reason it was carried this far. Reset it and let
+	// it go without ever handing it to a handler.
+	if s.refused {
+		free_headers(headers, c.allocator)
+		sent := rst_stream(c, s.id, .Refused_Stream)
+		close_stream(c, s.id)
+		return sent
+	}
 
 	req := new(Request, c.allocator)
 	req.stream_id = s.id
