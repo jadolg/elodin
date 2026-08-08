@@ -536,11 +536,7 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 	}
 	sync.mutex_unlock(&c.mu)
 
-	for f in headers {
-		delete(f.name, c.allocator)
-		delete(f.value, c.allocator)
-	}
-	delete(headers, c.allocator)
+	free_headers(headers, c.allocator)
 	return true
 }
 

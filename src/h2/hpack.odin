@@ -301,6 +301,17 @@ decode :: proc(
 	return out[:], .None
 }
 
+// Release a decoded header list: every field's name and value, then the slice
+// itself. The companion to a successful `decode`, for a caller that keeps none
+// of the fields.
+free_headers :: proc(headers: []Header_Field, allocator: mem.Allocator) {
+	for f in headers {
+		delete(f.name, allocator)
+		delete(f.value, allocator)
+	}
+	delete(headers, allocator)
+}
+
 @(private)
 read_literal :: proc(
 	r: ^Bit_Reader,

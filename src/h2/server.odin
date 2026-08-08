@@ -603,11 +603,7 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 	// above, which is the whole reason it was carried this far. Reset it and let
 	// it go without ever handing it to a handler.
 	if s.refused {
-		for f in headers {
-			delete(f.name, c.allocator)
-			delete(f.value, c.allocator)
-		}
-		delete(headers, c.allocator)
+		free_headers(headers, c.allocator)
 		sent := rst_stream(c, s.id, .Refused_Stream)
 		close_stream(c, s.id)
 		return sent
