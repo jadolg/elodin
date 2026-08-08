@@ -183,7 +183,11 @@ client_serve :: proc(c: ^Client) {
 		if !ok {
 			return
 		}
-		if h.length > CLIENT_RECV_WINDOW {
+		// Bounded at the frame size we advertise, not at the receive window: we
+		// send no SETTINGS_MAX_FRAME_SIZE, so an upstream is held to the RFC 9113
+		// 6.5.2 default (16384). The window still caps how much of a response we
+		// buffer; this caps a single frame off the wire.
+		if h.length > DEFAULT_MAX_FRAME {
 			client_goaway(c, .Frame_Size_Error)
 			return
 		}

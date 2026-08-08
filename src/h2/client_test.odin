@@ -444,6 +444,100 @@ test_client_goaway_closes_the_connection :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_client_refuses_frame_larger_than_advertised_max :: proc(t: ^testing.T) {
+	/*
+	The client advertises the RFC 9113 6.5.2 default MAX_FRAME_SIZE (16384) by
+	sending none, yet the reader loop bounded an incoming frame at the receive
+	window, 64x that. An upstream told one size and allowed another could send a
+	frame in between; the client should refuse it as a FRAME_SIZE_ERROR.
+	*/
+	listener, bound, lok := test_listen(t)
+	if !lok {
+		return
+	}
+
+	Script :: struct {
+		listener: net.TCP_Socket,
+		done:     sync.Wait_Group,
+		saw:      bool,
+		code:     Error_Code,
+	}
+	run_script :: proc(s: ^Script) {
+		defer sync.wait_group_done(&s.done)
+		client, _, err := net.accept_tcp(s.listener)
+		if err != nil {
+			return
+		}
+		defer net.close(client)
+		preface: [len(PREFACE)]u8
+		if !test_recv_full(client, preface[:]) {
+			return
+		}
+		if _, ok := test_wait_for_frame_type(client, .Headers); !ok {
+			return
+		}
+		// A DATA frame one byte past the advertised maximum frame size.
+		out := make([dynamic]u8, 0, FRAME_HEADER_SIZE, context.temp_allocator)
+		write_frame_header(&out, DEFAULT_MAX_FRAME + 1, .Data, 0, 1)
+		if !test_send(client, out[:]) {
+			return
+		}
+		// The client should answer with a GOAWAY of FRAME_SIZE_ERROR and close.
+		for {
+			hdr: [FRAME_HEADER_SIZE]u8
+			if !test_recv_full(client, hdr[:]) {
+				return
+			}
+			fh, fok := parse_frame_header(hdr[:])
+			if !fok {
+				return
+			}
+			body: []u8
+			if fh.length > 0 {
+				body = make([]u8, fh.length, context.temp_allocator)
+				if !test_recv_full(client, body) {
+					return
+				}
+			}
+			if fh.type == .Goaway && len(body) >= 8 {
+				s.saw = true
+				s.code = Error_Code(read_u32(body[4:]))
+				return
+			}
+		}
+	}
+	srv := Script{listener = listener}
+	sync.wait_group_add(&srv.done, 1)
+	server_thread := thread.create_and_start_with_poly_data(&srv, run_script)
+	defer {
+		thread.join(server_thread)
+		thread.destroy(server_thread)
+		net.close(listener)
+	}
+
+	c, ct, tc, cok := test_dial_client(t, bound)
+	if !cok {
+		return
+	}
+	defer {
+		test_close_client(ct, tc)
+		client_unref(c)
+	}
+
+	_, err := client_request(
+		c,
+		Client_Request{method = "GET", scheme = "https", authority = "mock.invalid", path = "/dns-query"},
+		2 * time.Second,
+	)
+	testing.expect_value(t, err, Client_Error.Closed)
+
+	sync.wait_group_wait(&srv.done)
+	testing.expect(t, srv.saw, "the client did not GOAWAY an oversized frame")
+	testing.expect_value(t, srv.code, Error_Code.Frame_Size_Error)
+	free_all(context.temp_allocator)
+}
+
+@(test)
 test_client_request_times_out_on_silence :: proc(t: ^testing.T) {
 	listener, bound, lok := test_listen(t)
 	if !lok {
