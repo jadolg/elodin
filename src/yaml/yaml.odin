@@ -41,6 +41,8 @@ Error :: struct {
 	msg:  string,
 }
 
+MAX_DEPTH :: 200
+
 @(private)
 Line :: struct {
 	indent: int,
@@ -52,6 +54,7 @@ Line :: struct {
 Parser :: struct {
 	lines:     [dynamic]Line,
 	pos:       int,
+	depth:     int,
 	allocator: mem.Allocator,
 	err:       Maybe(Error),
 }
@@ -317,6 +320,12 @@ entry_content_col :: proc(text: string, indent: int) -> int {
 
 @(private)
 parse_block :: proc(p: ^Parser, indent: int) -> ^Node {
+	p.depth += 1
+	defer p.depth -= 1
+	if p.depth > MAX_DEPTH {
+		line := p.lines[p.pos].num if p.pos < len(p.lines) else 0
+		return fail(p, line, "too deeply nested")
+	}
 	if p.pos >= len(p.lines) {
 		return new_scalar(p, "", false, 0)
 	}
@@ -551,6 +560,12 @@ parse_flow_or_scalar :: proc(p: ^Parser, text: string, line_num: int) -> ^Node {
 
 @(private)
 parse_flow :: proc(p: ^Parser, text: string, line_num: int) -> (node: ^Node, consumed: int, ok: bool) {
+	p.depth += 1
+	defer p.depth -= 1
+	if p.depth > MAX_DEPTH {
+		fail(p, line_num, "too deeply nested")
+		return nil, 0, false
+	}
 	closing := byte(']') if text[0] == '[' else byte('}')
 	is_seq := text[0] == '['
 	node = new_sequence(p, line_num) if is_seq else new_mapping(p, line_num)
