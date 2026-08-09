@@ -118,6 +118,35 @@ run_dnssec_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	start_case(r, "dnssec: a private reverse name is served without validation")
+	{
+		// 20.2.168.192.in-addr.arpa is the reverse name for 192.168.2.20, an RFC
+		// 1918 address. Nothing on the public Internet signs the RFC 6303
+		// locally-served zones, so holding this mock's unsigned answer to the
+		// chain of trust would SERVFAIL a LAN PTR lookup. It must come back
+		// NoError instead - the same escape hatch the code gives these zones by
+		// default, proven end to end while validation is on everywhere else.
+		res := query_udp(udp_port, build_query("20.2.168.192.in-addr.arpa.", u16(dns.Type.PTR)))
+		if check(r, res.ok, "no response") {
+			h, _ := parse_header(res.wire)
+			check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode for a private reverse name")
+		}
+	}
+	end_case(r)
+
+	start_case(r, "dnssec: a public reverse name is still validated")
+	{
+		// The counterpart: a public reverse name has a real chain, so this mock's
+		// unsigned answer for it must fail closed exactly as any other public name
+		// does. The gate is narrow, not a hole for every in-addr.arpa name.
+		res := query_udp(udp_port, build_query("8.8.8.8.in-addr.arpa.", u16(dns.Type.PTR)))
+		if check(r, res.ok, "no response") {
+			h, _ := parse_header(res.wire)
+			check_eq_int(r, h.rcode, int(dns.Rcode.Serv_Fail), "rcode for a public reverse name")
+		}
+	}
+	end_case(r)
+
 	start_case(r, "dnssec: a refused answer carries an extended DNS error")
 	{
 		res := query_udp(udp_port, build_query("ede.test.", u16(dns.Type.A), edns_size = 1232))
