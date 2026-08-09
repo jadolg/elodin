@@ -542,6 +542,10 @@ test_client_wakes_a_pending_request_when_stream_ids_are_exhausted :: proc(t: ^te
 	srv := Script{listener = listener}
 	server_thread := thread.create_and_start_with_poly_data(&srv, run_script)
 	defer {
+		// Set before joining, not just at the end of the happy path: an early
+		// return between here and there would otherwise leave run_script
+		// spinning on `stop` forever and this join hanging with it.
+		sync.atomic_store(&srv.stop, true)
 		thread.join(server_thread)
 		thread.destroy(server_thread)
 		net.close(listener)
@@ -603,7 +607,6 @@ test_client_wakes_a_pending_request_when_stream_ids_are_exhausted :: proc(t: ^te
 		w.elapsed < 2 * time.Second,
 		"the pending request was not woken by the close and instead rode out its own deadline",
 	)
-	sync.atomic_store(&srv.stop, true)
 	free_all(context.temp_allocator)
 }
 

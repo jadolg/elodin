@@ -505,6 +505,10 @@ reset_worker :: proc(r: ^Reset_Ctx) {
 	if err != nil {
 		return
 	}
+	// Bounded so a client that never sends anything (a future change to this
+	// test, say) fails this worker fast instead of hanging it - and the test's
+	// own thread.join with it - forever.
+	_ = net.set_option(sock, .Receive_Timeout, 10 * time.Second)
 	// Block for at least one byte of ClientHello before resetting. Without
 	// this, close() races the client's own connect(): under CI load the RST
 	// can land while dial_tcp_from_endpoint is still reading connect()'s
