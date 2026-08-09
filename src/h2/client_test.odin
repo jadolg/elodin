@@ -1150,6 +1150,19 @@ test_client_data_after_end_stream_is_refused :: proc(t: ^testing.T) {
 	testing.expect(t, saw_rst, "no RST_STREAM was sent for DATA after END_STREAM")
 	testing.expect(t, saw_credit, "the connection window was not replenished for a frame that was refused")
 
+	/*
+	A peer that keeps sending after the first violation must not draw a fresh
+	RST_STREAM every time. `rst_sent`, set on the first violation above, is
+	what keeps the second one quiet - kept separate from `s.done`/`s.reset` so
+	it cannot itself turn a finished response into a reported failure.
+	*/
+	clear(&log.frames)
+	ok2 := client_handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect(t, ok2, "a repeat violation should still be a stream error, not a connection error")
+	for f in log.frames {
+		testing.expectf(t, f.type != .Rst_Stream, "a second RST_STREAM was sent for a stream already answered once")
+	}
+
 	delete(log.frames)
 	client_stream_destroy(c, s)
 	delete_key(&c.streams, u32(1))
@@ -1157,6 +1170,55 @@ test_client_data_after_end_stream_is_refused :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 	for _, entry in track.allocation_map {
 		testing.expectf(t, false, "client data after end stream: %d bytes leaked at %v", entry.size, entry.location)
+	}
+}
+
+/*
+The client half of the same peer-reset case: RFC 9113 5.4.2 forbids answering
+an RST_STREAM with one of ours - that loops - so a stream the peer has
+already reset must draw no RST_STREAM back, only its connection credit.
+*/
+@(test)
+test_client_data_on_a_peer_reset_stream_is_refused :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Client_Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+
+	s := new(Client_Stream, allocator)
+	s.id = 1
+	s.send_window = c.peer_initial_window
+	s.body = make([dynamic]u8, 0, 8, allocator)
+	s.reset = true
+	c.streams[1] = s
+
+	clear(&log.frames)
+	body := []u8{'x'}
+	ok := client_handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect(t, ok, "DATA on a peer-reset stream should be a stream error, not a connection error")
+	testing.expect_value(t, len(s.body), 0)
+
+	saw_credit := false
+	for f in log.frames {
+		testing.expectf(t, f.type != .Rst_Stream, "an RST_STREAM was sent answering a stream the peer had already reset")
+		if f.type == .Window_Update && f.stream_id == 0 {
+			saw_credit = true
+		}
+	}
+	testing.expect(t, saw_credit, "the connection window was not replenished for a frame that was refused")
+
+	delete(log.frames)
+	client_stream_destroy(c, s)
+	delete_key(&c.streams, u32(1))
+	client_unref(c)
+	free_all(context.temp_allocator)
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "client data on a peer-reset stream: %d bytes leaked at %v", entry.size, entry.location)
 	}
 }
 

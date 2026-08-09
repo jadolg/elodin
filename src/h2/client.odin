@@ -59,6 +59,16 @@ Client_Stream :: struct {
 	// Set when the peer resets the stream.
 	reset:       bool,
 	send_window: int,
+	/*
+	Set once a stream-error RST_STREAM has answered a frame that arrived after
+	the stream was already done or reset, so a peer that keeps sending draws
+	its connection credit back without a fresh RST_STREAM every time.
+
+	Deliberately not folded into `reset`: that field also tells the waiter in
+	`client_request` to report the request as failed, and a stray frame after
+	an otherwise-successful response finishing must not turn into one.
+	*/
+	rst_sent:    bool,
 }
 
 Client_Request :: struct {
@@ -555,11 +565,22 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 
 	sync.mutex_lock(&c.mu)
 	s, found := c.streams[h.stream_id]
-	// RFC 9113 5.1: once a stream has said END_STREAM, only WINDOW_UPDATE,
-	// PRIORITY, and RST_STREAM are still allowed from it. The caller may
-	// already be reading `s.body` as a finished response, so this is refused
-	// rather than appended to it.
-	already_ended := found && s.done
+	/*
+	RFC 9113 5.1: once a stream is done or the peer has reset it, only
+	WINDOW_UPDATE, PRIORITY, and RST_STREAM are still allowed from it. The
+	caller may already be reading `s.body` as a finished response, so this is
+	refused rather than appended to it.
+
+	`need_rst` stays false once the peer has reset the stream itself -
+	answering their RST_STREAM with one of ours would loop (RFC 9113 5.4.2) -
+	and once `rst_sent` is set, so a peer that keeps sending after a `done`
+	violation draws its credit back without a fresh RST_STREAM each time.
+	*/
+	already_ended := found && (s.done || s.reset)
+	need_rst := already_ended && !s.reset && !s.rst_sent
+	if already_ended {
+		s.rst_sent = true
+	}
 	oversized := false
 	if found && !already_ended {
 		if len(s.body) + len(data) > CLIENT_MAX_BODY {
@@ -589,10 +610,11 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 	}
 
 	if already_ended {
-		if !client_rst_stream(c, h.stream_id, .Stream_Closed) {
-			return false
+		sent := true
+		if need_rst {
+			sent = client_rst_stream(c, h.stream_id, .Stream_Closed)
 		}
-		return client_give_connection_credit(c, len(payload))
+		return sent && client_give_connection_credit(c, len(payload))
 	}
 
 	// Give the credit straight back; we buffer whole responses anyway.

@@ -403,10 +403,87 @@ test_data_after_end_stream_is_refused :: proc(t: ^testing.T) {
 	testing.expect(t, saw_rst, "no RST_STREAM was sent for DATA after END_STREAM")
 	testing.expect(t, saw_credit, "the connection window was not replenished for a frame that was refused")
 
+	/*
+	A peer that keeps sending after the first violation must not draw a fresh
+	RST_STREAM every time - that is a cheap way to make this end write two
+	frames under `c.mu` per frame it sends. `cancelled`, set on the first
+	violation above, is what keeps the second one quiet.
+	*/
+	clear(&log.frames)
+	dok2 := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect(t, dok2, "a repeat violation should still be a stream error, not a connection error")
+	for f in log.frames {
+		testing.expectf(t, f.type != .Rst_Stream, "a second RST_STREAM was sent for a stream already marked cancelled")
+	}
+
 	delete(log.frames)
 	conn_unref(c)
 	free_all(context.temp_allocator)
 	expect_no_leaks(t, &track, "data after end stream")
+}
+
+/*
+RFC 9113 5.1 puts closed in the same bucket as half-closed (remote): once the
+peer has reset a stream, only WINDOW_UPDATE, PRIORITY, and RST_STREAM are
+still allowed from it. A dispatched stream stays in `c.streams` after an
+inbound RST_STREAM - `respond` is what retires it - so `handle_data` could
+still find it and, before this fix, would append to its body and hand back a
+stream-level WINDOW_UPDATE for a stream the peer had already walked away
+from. Answering with an RST_STREAM of our own would loop (RFC 9113 5.4.2),
+so this checks its absence rather than its presence.
+*/
+@(test)
+test_data_on_a_peer_reset_stream_is_refused :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, destroying_handler, nil, allocator)
+
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	ok := handle_headers(
+		c,
+		Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1},
+		block,
+	)
+	testing.expect(t, ok, "handle_headers failed")
+
+	rst := []u8{0, 0, 0, 8} // CANCEL
+	rok := handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst)
+	testing.expect(t, rok, "handle_frame failed")
+
+	live, open := c.streams[1]
+	testing.expect(t, open, "a dispatched stream was retired out from under its handler")
+	if open {
+		testing.expect_value(t, live.state, Stream_State.Closed)
+	}
+
+	clear(&log.frames)
+	body := []u8{'x'}
+	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect(t, dok, "DATA on a peer-reset stream should be a stream error, not a connection error")
+
+	if s, still_open := c.streams[1]; still_open {
+		testing.expect_value(t, len(s.body), 0)
+	}
+
+	saw_credit := false
+	for f in log.frames {
+		testing.expectf(t, f.type != .Rst_Stream, "an RST_STREAM was sent answering a stream the peer had already reset")
+		if f.type == .Window_Update && f.stream_id == 0 {
+			saw_credit = true
+		}
+	}
+	testing.expect(t, saw_credit, "the connection window was not replenished for a frame that was refused")
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "data on a peer-reset stream")
 }
 
 @(test)
@@ -499,15 +576,17 @@ test_data_frame_cannot_touch_a_closed_stream :: proc(t: ^testing.T) {
 	hook.conn = c
 	hook.stream_id = 1
 
-	// END_STREAM on the HEADERS dispatches the request straight away, so the
-	// stream is live with a handler owning it - the state in which `respond`
-	// runs concurrently with whatever the peer sends next.
+	/*
+	No END_STREAM on the HEADERS: the request parks on the stream rather than
+	dispatching, so the DATA below is the first frame to see this stream and
+	`already_ended` (server.odin) is false for it - it still takes the append
+	path all the way to the WINDOW_UPDATE write the hook rides in on. HEADERS
+	with END_STREAM would dispatch immediately and leave nothing for this DATA
+	to reach but the now-`already_ended` short-circuit, which returns before
+	ever writing a WINDOW_UPDATE.
+	*/
 	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
-	ok := handle_headers(
-		c,
-		Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1},
-		block,
-	)
+	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 	testing.expect(t, ok, "handle_headers failed")
 
 	hook.armed = true

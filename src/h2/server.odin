@@ -671,11 +671,28 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 
 	sync.mutex_lock(&c.mu)
 	s, found := c.streams[h.stream_id]
-	// RFC 9113 5.1: half-closed (remote) allows WINDOW_UPDATE, PRIORITY, and
-	// RST_STREAM from the peer and nothing else. A stream in this state already
-	// has, or is getting, a handler's full attention - so this is refused
-	// rather than retired: retiring it here would race whoever answers it.
-	already_ended := found && s.state == .Half_Closed_Remote
+	/*
+	RFC 9113 5.1: half-closed (remote) and closed both allow WINDOW_UPDATE,
+	PRIORITY, and RST_STREAM from the peer and nothing else. A stream in
+	either state already has, or is getting, a handler's full attention - so
+	this is refused rather than retired: retiring it here would race whoever
+	answers it.
+
+	`cancelled` already gates `respond` and `write_body` (set there by an
+	inbound RST_STREAM), so setting it here too - under the same lock that
+	makes the check, not after - is what closes that race without a second
+	flag: a handler mid-`respond` finds it through the same door. It also
+	means a stream the peer already reset draws no RST_STREAM of ours in
+	answer, since `cancelled` is already true by the time DATA gets here -
+	avoiding the loop RFC 9113 5.4.2 warns against - and a peer that repeats
+	the violation on a stream we reset first just draws its credit back
+	without a second one.
+	*/
+	already_ended := found && (s.state == .Half_Closed_Remote || s.state == .Closed)
+	need_rst := already_ended && !s.cancelled
+	if already_ended {
+		s.cancelled = true
+	}
 	if found && !already_ended {
 		// Checked before appending, so an oversized body is refused rather than
 		// buffered first.
@@ -699,7 +716,10 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	sync.mutex_unlock(&c.mu)
 
 	if already_ended {
-		sent := rst_stream(c, h.stream_id, .Stream_Closed)
+		sent := true
+		if need_rst {
+			sent = rst_stream(c, h.stream_id, .Stream_Closed)
+		}
 		return sent && give_connection_credit(c, len(payload))
 	}
 
