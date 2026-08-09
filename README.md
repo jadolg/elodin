@@ -487,6 +487,17 @@ records stripped back out of its answer, which is both what RFC 4035 asks for
 and what keeps ordinary answers from growing past the point of needing a retry
 over TCP.
 
+Reverse lookups for private space are served, not refused. The reverse trees for
+the RFC 1918 ranges, IPv4 link-local and loopback, and IPv6 unique-local and
+link-local — `10.in-addr.arpa`, `168.192.in-addr.arpa`, the sixteen `172.16/12`
+zones, `169.254`, `d.f.ip6.arpa`, and the rest — are the RFC 6303 locally-served
+zones. Nothing on the public Internet signs them, so a local answer for one has
+no chain to check; validating it would turn every LAN PTR lookup into SERVFAIL,
+so those names are served insecure, without the AD bit — the same default Unbound
+and BIND ship. Configuring a `trust_anchors` entry that covers one of these zones
+turns that off for it: an operator who signs their own reverse space and anchors
+it is asking for it to be validated, and elodin then does.
+
 Two things worth knowing about running with it on:
 
 - **Distribution crypto policy can take algorithms away.** Fedora and RHEL ship

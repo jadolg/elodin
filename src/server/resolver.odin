@@ -93,6 +93,10 @@ Server :: struct {
 	answers:      ^cache.Cache,
 	filters:      ^filter.Engine,
 	validator:    ^dnssec.Validator,
+	// The zones of the operator's own trust anchors, root excluded, in canonical
+	// form. An anchor here is a deliberate request to validate the zone it names,
+	// which the locally-served bypass has to defer to; see `covered_by_local_anchor`.
+	anchor_zones: []string,
 	cookies:      ^Cookie_Keeper,
 	// Nil when rate limiting is off; `rate_check` takes that as "allow".
 	limiter:      ^Rate_Limiter,
@@ -325,8 +329,13 @@ resolve_query :: proc(
 	// Internet signs them, so their unsigned local answers have no chain to
 	// check and validating one only turns a LAN PTR lookup into SERVFAIL. They
 	// are served as insecure, which is what `settle_ad_bit` records once
-	// `validating` is off.
-	validating := s.validator != nil && !msg.flags.cd && q.class == .IN && !is_locally_served(q.name)
+	// `validating` is off - unless the operator anchored the zone themselves, in
+	// which case that request to validate it wins and the bypass stands down.
+	validating :=
+		s.validator != nil &&
+		!msg.flags.cd &&
+		q.class == .IN &&
+		!(is_locally_served(q.name) && !covered_by_local_anchor(s, q.name))
 
 	key_buf: [cache.KEY_MAX]u8
 	key := cache.make_key(key_buf[:], q.name, q.type, q.class, dns.edns_do(msg), msg.flags.cd)

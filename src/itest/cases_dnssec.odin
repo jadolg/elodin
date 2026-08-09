@@ -147,6 +147,52 @@ run_dnssec_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	start_case(r, "dnssec: an operator anchor over a private zone re-enables validation")
+	{
+		// A site that signs its own reverse space and anchors it is asking for
+		// those names to be validated - the bypass must defer. With the root and
+		// a 168.192.in-addr.arpa anchor both configured, a name inside that zone
+		// is validated again (this mock cannot satisfy a validator, so it
+		// SERVFAILs), while 10.in-addr.arpa - anchored by no one - still bypasses
+		// and is served. That is the override working, and staying scoped to the
+		// zone the operator actually anchored.
+		anchored_port := next_port(r)
+		config := fmt.tprintf(
+			`listeners:
+  udp: {{enabled: true, address: 127.0.0.1, port: %d}}
+  tcp: {{enabled: false}}
+upstream:
+  servers: [udp://127.0.0.1:%d]
+cache: {{enabled: false}}
+blocking: {{enabled: false}}
+dnssec:
+  enabled: true
+  trust_anchors:
+    - ". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"
+    - "168.192.in-addr.arpa. IN DS 12345 8 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
+`,
+			anchored_port,
+			upstream_port,
+		)
+		anchored, started := start_server(r, Server_Options{config = config, udp_port = anchored_port})
+		if started {
+			defer stop_server(&anchored)
+
+			covered := query_udp(anchored_port, build_query("1.1.168.192.in-addr.arpa.", u16(dns.Type.PTR)))
+			if check(r, covered.ok, "no response for the anchored name") {
+				h, _ := parse_header(covered.wire)
+				check_eq_int(r, h.rcode, int(dns.Rcode.Serv_Fail), "rcode for an anchored private name")
+			}
+
+			uncovered := query_udp(anchored_port, build_query("1.1.10.in-addr.arpa.", u16(dns.Type.PTR)))
+			if check(r, uncovered.ok, "no response for the unanchored name") {
+				h, _ := parse_header(uncovered.wire)
+				check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode for an unanchored private name")
+			}
+		}
+	}
+	end_case(r)
+
 	start_case(r, "dnssec: a refused answer carries an extended DNS error")
 	{
 		res := query_udp(udp_port, build_query("ede.test.", u16(dns.Type.A), edns_size = 1232))

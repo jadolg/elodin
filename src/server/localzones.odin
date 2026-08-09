@@ -34,6 +34,11 @@ purpose: the TEST-NET reverse zones and the IPv6 loopback/unspecified zones are
 not names a running network resolves, and CGNAT space (100.64/10, RFC 6598,
 added after RFC 6303) is delegated in the public tree rather than served
 locally. None of them are the failure this addresses.
+
+The bypass is off, though, for a name an operator has anchored themselves. A
+site that signs its own reverse space and configures a trust anchor over it is
+asking for those names to be validated; `covered_by_local_anchor` sees that and
+leaves validation on, so the deliberate configuration wins over the default.
 */
 @(private)
 LOCALLY_SERVED_ZONES := [?]string {
@@ -82,6 +87,24 @@ a zone is a suffix of the name only when what precedes it is a label break, so
 @(private)
 is_locally_served :: proc(name: string) -> bool {
 	for zone in LOCALLY_SERVED_ZONES {
+		if name_at_or_below(name, zone) {
+			return true
+		}
+	}
+	return false
+}
+
+/*
+Whether the operator anchored a zone at or above `name`.
+
+`s.anchor_zones` holds their configured anchors with the root left out, so a
+match means a deliberate request to validate this name - the one case where the
+locally-served bypass has to stand down. Same label-boundary rule as everything
+else here: the anchor has to sit on a label break, not merely be a string suffix.
+*/
+@(private)
+covered_by_local_anchor :: proc(s: ^Server, name: string) -> bool {
+	for zone in s.anchor_zones {
 		if name_at_or_below(name, zone) {
 			return true
 		}

@@ -58,6 +58,44 @@ test_public_names_stay_validated :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_local_anchor_defers_the_bypass :: proc(t: ^testing.T) {
+	// An operator who anchors 10.in-addr.arpa is asking for it to be validated,
+	// so a name inside it is "covered" and the bypass stands down; a name in a
+	// different locally-served zone is not covered and still bypasses.
+	s := Server {
+		anchor_zones = []string{"10.in-addr.arpa."},
+	}
+	testing.expect(
+		t,
+		covered_by_local_anchor(&s, "5.10.in-addr.arpa."),
+		"a name under an anchored zone must be covered",
+	)
+	testing.expect(
+		t,
+		!covered_by_local_anchor(&s, "20.2.168.192.in-addr.arpa."),
+		"a name outside every anchored zone must not be covered",
+	)
+	// The label-break rule holds here too.
+	testing.expect(
+		t,
+		!covered_by_local_anchor(&s, "evil10.in-addr.arpa."),
+		"a string suffix of an anchored zone is not covered",
+	)
+}
+
+@(test)
+test_no_anchors_means_no_coverage :: proc(t: ^testing.T) {
+	// The default: root-only anchors leave anchor_zones empty, so nothing is
+	// covered and every locally-served name takes the bypass.
+	s := Server{}
+	testing.expect(
+		t,
+		!covered_by_local_anchor(&s, "5.10.in-addr.arpa."),
+		"with no configured anchors nothing is covered",
+	)
+}
+
+@(test)
 test_label_boundary_is_respected :: proc(t: ^testing.T) {
 	// A bare string suffix that does not fall on a label break is a different
 	// name, not a subtree, and must not be swept in.

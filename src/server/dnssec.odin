@@ -50,6 +50,19 @@ start_validator :: proc(s: ^Server) -> bool {
 			append(&parsed, anchor)
 		}
 		anchors = parsed[:]
+
+		// An operator who anchors a zone below the root is asking for that zone
+		// to be validated, so the locally-served bypass must step aside for a
+		// name it covers. The root anchor is not one of these: it covers every
+		// name yet cannot validate the AS112 zones the bypass exists for, which
+		// is the whole reason the bypass is there.
+		zones := make([dynamic]string, 0, len(parsed))
+		for anchor in parsed {
+			if anchor.zone != "." {
+				append(&zones, anchor.zone)
+			}
+		}
+		s.anchor_zones = zones[:]
 	}
 
 	s.validator = dnssec.make_validator(
