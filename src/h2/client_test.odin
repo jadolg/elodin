@@ -444,6 +444,61 @@ test_client_goaway_closes_the_connection :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_client_closes_connection_once_stream_ids_are_exhausted :: proc(t: ^testing.T) {
+	// RFC 9113 5.1.1: an endpoint that has used up the 31-bit stream id space
+	// must not open another stream on the connection. Rather than run 2^30
+	// real requests, this drives the counter to the boundary directly and
+	// checks client_request refuses to allocate past it instead of wrapping
+	// the id and reusing one still live in c.streams.
+	listener, bound, lok := test_listen(t)
+	if !lok {
+		return
+	}
+
+	Script :: struct {
+		listener: net.TCP_Socket,
+	}
+	run_script :: proc(s: ^Script) {
+		client, _, err := net.accept_tcp(s.listener)
+		if err != nil {
+			return
+		}
+		defer net.close(client)
+		preface: [len(PREFACE)]u8
+		_ = test_recv_full(client, preface[:])
+	}
+	srv := Script{listener = listener}
+	server_thread := thread.create_and_start_with_poly_data(&srv, run_script)
+	defer {
+		thread.join(server_thread)
+		thread.destroy(server_thread)
+		net.close(listener)
+	}
+
+	c, ct, tc, cok := test_dial_client(t, bound)
+	if !cok {
+		return
+	}
+	defer {
+		test_close_client(ct, tc)
+		client_unref(c)
+	}
+
+	sync.mutex_lock(&c.mu)
+	c.next_stream_id = 0x8000_0001
+	sync.mutex_unlock(&c.mu)
+
+	_, err := client_request(
+		c,
+		Client_Request{method = "GET", scheme = "https", authority = "mock.invalid", path = "/dns-query"},
+		2 * time.Second,
+	)
+	testing.expect_value(t, err, Client_Error.Closed)
+	testing.expect(t, client_closed(c), "the connection was not marked closed once stream ids were exhausted")
+	free_all(context.temp_allocator)
+}
+
+@(test)
 test_client_refuses_frame_larger_than_advertised_max :: proc(t: ^testing.T) {
 	/*
 	The client advertises the RFC 9113 6.5.2 default MAX_FRAME_SIZE (16384) by
