@@ -444,6 +444,181 @@ test_client_goaway_closes_the_connection :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_client_closes_connection_once_stream_ids_are_exhausted :: proc(t: ^testing.T) {
+	// RFC 9113 5.1.1: an endpoint that has used up the 31-bit stream id space
+	// must not open another stream on the connection. Rather than run 2^30
+	// real requests, this drives the counter to the boundary directly and
+	// checks client_request refuses to allocate past it instead of wrapping
+	// the id and reusing one still live in c.streams.
+	listener, bound, lok := test_listen(t)
+	if !lok {
+		return
+	}
+
+	Script :: struct {
+		listener: net.TCP_Socket,
+	}
+	run_script :: proc(s: ^Script) {
+		client, _, err := net.accept_tcp(s.listener)
+		if err != nil {
+			return
+		}
+		defer net.close(client)
+		preface: [len(PREFACE)]u8
+		_ = test_recv_full(client, preface[:])
+	}
+	srv := Script{listener = listener}
+	server_thread := thread.create_and_start_with_poly_data(&srv, run_script)
+	defer {
+		thread.join(server_thread)
+		thread.destroy(server_thread)
+		net.close(listener)
+	}
+
+	c, ct, tc, cok := test_dial_client(t, bound)
+	if !cok {
+		return
+	}
+	defer {
+		test_close_client(ct, tc)
+		client_unref(c)
+	}
+
+	sync.mutex_lock(&c.mu)
+	c.next_stream_id = 0x8000_0001
+	sync.mutex_unlock(&c.mu)
+
+	_, err := client_request(
+		c,
+		Client_Request{method = "GET", scheme = "https", authority = "mock.invalid", path = "/dns-query"},
+		2 * time.Second,
+	)
+	testing.expect_value(t, err, Client_Error.Closed)
+	testing.expect(t, client_closed(c), "the connection was not marked closed once stream ids were exhausted")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_client_wakes_a_pending_request_when_stream_ids_are_exhausted :: proc(t: ^testing.T) {
+	// A request already blocked waiting for its response is exactly the state
+	// a connection busy enough to exhaust its stream ids will be in: another
+	// caller trips the RFC 9113 5.1.1 close while this one sits in
+	// client_request's wait loop. That waiter must be woken by the close, not
+	// left to fall through on its own deadline and come back as a
+	// misclassified Timeout.
+	listener, bound, lok := test_listen(t)
+	if !lok {
+		return
+	}
+
+	// The mock holds the accepted socket open until the test explicitly
+	// releases it, rather than closing it after a fixed sleep: closing it
+	// early would let client_serve's own read-error path close and broadcast
+	// the connection, waking stream A for a reason unrelated to the one this
+	// test checks and masking a missing broadcast in the exhaustion branch.
+	Script :: struct {
+		listener:     net.TCP_Socket,
+		headers_seen: bool,
+		stop:         bool,
+	}
+	run_script :: proc(s: ^Script) {
+		client, _, err := net.accept_tcp(s.listener)
+		if err != nil {
+			return
+		}
+		defer net.close(client)
+		preface: [len(PREFACE)]u8
+		if !test_recv_full(client, preface[:]) {
+			return
+		}
+		// This is stream A's HEADERS; never respond to it.
+		if _, ok := test_wait_for_frame_type(client, .Headers); ok {
+			sync.atomic_store(&s.headers_seen, true)
+		}
+		for !sync.atomic_load(&s.stop) {
+			time.sleep(10 * time.Millisecond)
+		}
+	}
+	srv := Script{listener = listener}
+	server_thread := thread.create_and_start_with_poly_data(&srv, run_script)
+	defer {
+		// Set before joining, not just at the end of the happy path: an early
+		// return between here and there would otherwise leave run_script
+		// spinning on `stop` forever and this join hanging with it.
+		sync.atomic_store(&srv.stop, true)
+		thread.join(server_thread)
+		thread.destroy(server_thread)
+		net.close(listener)
+	}
+
+	c, ct, tc, cok := test_dial_client(t, bound)
+	if !cok {
+		return
+	}
+	defer {
+		test_close_client(ct, tc)
+		client_unref(c)
+	}
+
+	// One id short of exhaustion: stream A's request takes the last valid id,
+	// so a second request right behind it is the one that trips the close.
+	sync.mutex_lock(&c.mu)
+	c.next_stream_id = 0x7fff_ffff
+	sync.mutex_unlock(&c.mu)
+
+	Waiter :: struct {
+		c:       ^Client,
+		err:     Client_Error,
+		elapsed: time.Duration,
+	}
+	wait_for_a :: proc(w: ^Waiter) {
+		started := time.now()
+		_, w.err = client_request(
+			w.c,
+			Client_Request{method = "GET", scheme = "https", authority = "mock.invalid", path = "/dns-query"},
+			4 * time.Second,
+		)
+		w.elapsed = time.diff(started, time.now())
+	}
+	w := Waiter{c = c}
+	a := thread.create_and_start_with_poly_data(&w, wait_for_a)
+	defer {
+		// join is idempotent (checked below too, to read w's fields at a known
+		// point); destroy is not, so it only happens here. Deferred rather
+		// than left to the explicit call below so an early return before that
+		// point can't let the test_close_client/client_unref defer above free
+		// `c` while `a` is still inside client_request using it.
+		thread.join(a)
+		thread.destroy(a)
+	}
+
+	// Wait for stream A's HEADERS to land, then give it a little longer to
+	// re-acquire the lock and settle into its cond_wait - both comfortably
+	// short next to the 4s timeout that would mask a missing broadcast.
+	for i := 0; i < 200 && !sync.atomic_load(&srv.headers_seen); i += 1 {
+		time.sleep(5 * time.Millisecond)
+	}
+	testing.expect(t, sync.atomic_load(&srv.headers_seen), "stream A's HEADERS frame was never observed")
+	time.sleep(100 * time.Millisecond)
+
+	_, berr := client_request(
+		c,
+		Client_Request{method = "GET", scheme = "https", authority = "mock.invalid", path = "/dns-query"},
+		time.Second,
+	)
+	testing.expect_value(t, berr, Client_Error.Closed)
+
+	thread.join(a)
+	testing.expect_value(t, w.err, Client_Error.Closed)
+	testing.expect(
+		t,
+		w.elapsed < 2 * time.Second,
+		"the pending request was not woken by the close and instead rode out its own deadline",
+	)
+	free_all(context.temp_allocator)
+}
+
+@(test)
 test_client_refuses_frame_larger_than_advertised_max :: proc(t: ^testing.T) {
 	/*
 	The client advertises the RFC 9113 6.5.2 default MAX_FRAME_SIZE (16384) by

@@ -684,6 +684,21 @@ client_request :: proc(
 		sync.mutex_unlock(&c.mu)
 		return {}, .Closed
 	}
+	// RFC 9113 §5.1.1: an endpoint that has exhausted the stream id space must
+	// not open further streams on this connection. Close it so get_h2_conn
+	// dials a fresh one instead of wrapping the id and colliding with a
+	// stream still keyed on the unmasked value in c.streams. The RFC only
+	// requires refusing *new* streams, not tearing down ones already open; a
+	// draining state that let in-flight streams finish would be more
+	// faithful. Closing is a simplification that also cuts short whatever is
+	// still in flight - acceptable because doh.odin retries and this is
+	// 2^30 requests away, not because there is nothing to cut short.
+	if c.next_stream_id > 0x7fff_ffff {
+		c.closed = true
+		sync.cond_broadcast(&c.cond)
+		sync.mutex_unlock(&c.mu)
+		return {}, .Closed
+	}
 	c.refs += 1
 	stream_id := c.next_stream_id
 	c.next_stream_id += 2

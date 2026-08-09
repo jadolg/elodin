@@ -494,9 +494,10 @@ Reset_Ctx :: struct {
 	done:     bool,
 }
 
-// Accept, then hang up hard: SO_LINGER with a zero timeout makes close() send a
-// RST rather than a FIN, which is what a peer that drops handshakes mid-flight
-// looks like on the wire.
+// Accept, wait for the handshake to actually start, then hang up hard:
+// SO_LINGER with a zero timeout makes close() send a RST rather than a FIN,
+// which is what a peer that drops handshakes mid-flight looks like on the
+// wire.
 @(private = "file")
 reset_worker :: proc(r: ^Reset_Ctx) {
 	defer sync.atomic_store(&r.done, true)
@@ -504,6 +505,19 @@ reset_worker :: proc(r: ^Reset_Ctx) {
 	if err != nil {
 		return
 	}
+	// Bounded so a client that never sends anything (a future change to this
+	// test, say) fails this worker fast instead of hanging it - and the test's
+	// own thread.join with it - forever.
+	_ = net.set_option(sock, .Receive_Timeout, 10 * time.Second)
+	// Block for at least one byte of ClientHello before resetting. Without
+	// this, close() races the client's own connect(): under CI load the RST
+	// can land while dial_tcp_from_endpoint is still reading connect()'s
+	// SO_ERROR, so the client sees a reset dial rather than a reset
+	// handshake (see fix(upstream) 795492b for the same race elsewhere).
+	// Reading first guarantees the client's dial already succeeded and the
+	// handshake is underway by the time the RST goes out.
+	buf: [1]u8
+	_, _ = net.recv_tcp(sock, buf[:])
 	lg := posix.linger {
 		l_onoff  = 1,
 		l_linger = 0,
