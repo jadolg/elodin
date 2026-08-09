@@ -582,6 +582,15 @@ test_client_wakes_a_pending_request_when_stream_ids_are_exhausted :: proc(t: ^te
 	}
 	w := Waiter{c = c}
 	a := thread.create_and_start_with_poly_data(&w, wait_for_a)
+	defer {
+		// join is idempotent (checked below too, to read w's fields at a known
+		// point); destroy is not, so it only happens here. Deferred rather
+		// than left to the explicit call below so an early return before that
+		// point can't let the test_close_client/client_unref defer above free
+		// `c` while `a` is still inside client_request using it.
+		thread.join(a)
+		thread.destroy(a)
+	}
 
 	// Wait for stream A's HEADERS to land, then give it a little longer to
 	// re-acquire the lock and settle into its cond_wait - both comfortably
@@ -600,7 +609,6 @@ test_client_wakes_a_pending_request_when_stream_ids_are_exhausted :: proc(t: ^te
 	testing.expect_value(t, berr, Client_Error.Closed)
 
 	thread.join(a)
-	thread.destroy(a)
 	testing.expect_value(t, w.err, Client_Error.Closed)
 	testing.expect(
 		t,
