@@ -24,8 +24,16 @@ client is handed SERVFAIL for a PTR that should simply have come back unvalidate
 Unbound ships these as built-in `local-zone`s and BIND enables them through
 `empty-zones-enable`, both for the same reason. Here they turn validation off
 for names inside them, which lets the unsigned local answer through as insecure
-rather than refusing it. The 172.16/12 block is sixteen `/24`-aligned reverse
-zones (16 through 31), listed out so the set is plainly what it claims to be.
+rather than refusing it. The 172.16/12 block is sixteen /16 reverse zones - one
+per second octet, 16 through 31 - listed out so the set is plainly what it
+claims to be.
+
+This is the private/link-local/loopback subset of RFC 6303, which is what
+breaks a LAN reverse lookup. The rest of that document's list is left out on
+purpose: the TEST-NET reverse zones and the IPv6 loopback/unspecified zones are
+not names a running network resolves, and CGNAT space (100.64/10, RFC 6598,
+added after RFC 6303) is delegated in the public tree rather than served
+locally. None of them are the failure this addresses.
 */
 @(private)
 LOCALLY_SERVED_ZONES := [?]string {
