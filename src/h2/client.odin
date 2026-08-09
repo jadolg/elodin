@@ -690,6 +690,7 @@ client_request :: proc(
 	// stream still keyed on the unmasked value in c.streams.
 	if c.next_stream_id > 0x7fff_ffff {
 		c.closed = true
+		sync.cond_broadcast(&c.cond)
 		sync.mutex_unlock(&c.mu)
 		return {}, .Closed
 	}
