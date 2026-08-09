@@ -542,6 +542,11 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 
 @(private)
 client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
+	if h.stream_id == 0 {
+		client_goaway(c, .Protocol_Error)
+		return false
+	}
+
 	data, ok := strip_padding(payload, h.flags)
 	if !ok {
 		client_goaway(c, .Protocol_Error)
@@ -550,8 +555,13 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 
 	sync.mutex_lock(&c.mu)
 	s, found := c.streams[h.stream_id]
+	// RFC 9113 5.1: once a stream has said END_STREAM, only WINDOW_UPDATE,
+	// PRIORITY, and RST_STREAM are still allowed from it. The caller may
+	// already be reading `s.body` as a finished response, so this is refused
+	// rather than appended to it.
+	already_ended := found && s.done
 	oversized := false
-	if found {
+	if found && !already_ended {
 		if len(s.body) + len(data) > CLIENT_MAX_BODY {
 			oversized = true
 			s.reset = true
@@ -573,6 +583,13 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 		update does not.
 		*/
 		if !client_rst_stream(c, h.stream_id, .Enhance_Your_Calm) {
+			return false
+		}
+		return client_give_connection_credit(c, len(payload))
+	}
+
+	if already_ended {
+		if !client_rst_stream(c, h.stream_id, .Stream_Closed) {
 			return false
 		}
 		return client_give_connection_credit(c, len(payload))

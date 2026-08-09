@@ -658,6 +658,11 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 
 @(private)
 handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
+	if h.stream_id == 0 {
+		goaway(c, .Protocol_Error)
+		return false
+	}
+
 	data, ok := strip_padding(payload, h.flags)
 	if !ok {
 		goaway(c, .Protocol_Error)
@@ -666,7 +671,12 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 
 	sync.mutex_lock(&c.mu)
 	s, found := c.streams[h.stream_id]
-	if found {
+	// RFC 9113 5.1: half-closed (remote) allows WINDOW_UPDATE, PRIORITY, and
+	// RST_STREAM from the peer and nothing else. A stream in this state already
+	// has, or is getting, a handler's full attention - so this is refused
+	// rather than retired: retiring it here would race whoever answers it.
+	already_ended := found && s.state == .Half_Closed_Remote
+	if found && !already_ended {
 		// Checked before appending, so an oversized body is refused rather than
 		// buffered first.
 		if len(s.body) + len(data) > MAX_BODY {
@@ -687,6 +697,11 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		append(&s.body, ..data)
 	}
 	sync.mutex_unlock(&c.mu)
+
+	if already_ended {
+		sent := rst_stream(c, h.stream_id, .Stream_Closed)
+		return sent && give_connection_credit(c, len(payload))
+	}
 
 	// Give the credit straight back; we buffer whole requests anyway.
 	if len(payload) > 0 {

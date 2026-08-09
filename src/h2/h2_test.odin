@@ -314,6 +314,101 @@ test_oversized_body_drops_the_stream :: proc(t: ^testing.T) {
 	expect_no_leaks(t, &track, "oversized body")
 }
 
+/*
+RFC 9113 6.1: DATA is only ever sent on a stream, never on the connection
+control stream, so one arriving with stream_id 0 is a connection error of
+type PROTOCOL_ERROR. `handle_headers` already checks this; `handle_data` did
+not, and fell through to look up a stream that can never be in the map.
+*/
+@(test)
+test_data_on_stream_zero_is_rejected :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+
+	body := []u8{'x'}
+	ok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 0}, body)
+	testing.expect(t, !ok, "DATA on stream 0 was accepted")
+
+	saw_goaway := false
+	for f in log.frames {
+		if f.type == .Goaway {
+			saw_goaway = true
+		}
+	}
+	testing.expect(t, saw_goaway, "no GOAWAY was sent for DATA on stream 0")
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "data on stream zero")
+}
+
+/*
+RFC 9113 5.1: once a stream is half-closed (remote), the peer has said it is
+done sending, and anything but WINDOW_UPDATE, PRIORITY, or RST_STREAM from it
+is a stream error of type STREAM_CLOSED. `handle_data` instead appended
+straight to `s.body`, silently accepting a body that was already complete.
+*/
+@(test)
+test_data_after_end_stream_is_refused :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, destroying_handler, nil, allocator)
+
+	// END_STREAM on the HEADERS dispatches straight away and marks the stream
+	// half-closed (remote); the handler frees the request but leaves the
+	// stream itself for whoever answers it.
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	ok := handle_headers(
+		c,
+		Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1},
+		block,
+	)
+	testing.expect(t, ok, "handle_headers failed")
+
+	clear(&log.frames)
+	body := []u8{'x'}
+	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect(t, dok, "DATA after END_STREAM should be a stream error, not a connection error")
+
+	s, still_open := c.streams[1]
+	testing.expect(t, still_open, "a stream still owned by its handler was retired out from under it")
+	if still_open {
+		testing.expect_value(t, len(s.body), 0)
+	}
+
+	saw_rst := false
+	saw_credit := false
+	for f in log.frames {
+		if f.type == .Rst_Stream && f.stream_id == 1 {
+			saw_rst = true
+		}
+		if f.type == .Window_Update && f.stream_id == 0 {
+			saw_credit = true
+		}
+	}
+	testing.expect(t, saw_rst, "no RST_STREAM was sent for DATA after END_STREAM")
+	testing.expect(t, saw_credit, "the connection window was not replenished for a frame that was refused")
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "data after end stream")
+}
+
 @(test)
 test_padding_and_priority_stripping :: proc(t: ^testing.T) {
 	// PADDED: first byte is the pad length, that many bytes come off the end.

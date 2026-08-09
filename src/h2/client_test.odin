@@ -1067,6 +1067,99 @@ test_client_settings_window_change_is_bounded :: proc(t: ^testing.T) {
 	}
 }
 
+/*
+The client half of the same rule: RFC 9113 6.1 makes DATA on stream 0 a
+connection error of type PROTOCOL_ERROR. `client_handle_data` looked it up in
+the stream table and fell through same as any other miss, instead of
+recognizing the connection control stream can never hold one.
+*/
+@(test)
+test_client_data_on_stream_zero_is_rejected :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Client_Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+
+	body := []u8{'x'}
+	ok := client_handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 0}, body)
+	testing.expect(t, !ok, "DATA on stream 0 was accepted")
+
+	saw_goaway := false
+	for f in log.frames {
+		if f.type == .Goaway {
+			saw_goaway = true
+		}
+	}
+	testing.expect(t, saw_goaway, "no GOAWAY was sent for DATA on stream 0")
+
+	delete(log.frames)
+	client_unref(c)
+	free_all(context.temp_allocator)
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "client data on stream zero: %d bytes leaked at %v", entry.size, entry.location)
+	}
+}
+
+/*
+The client half of the same half-closed rule: RFC 9113 5.1 allows a stream
+that already said END_STREAM only WINDOW_UPDATE, PRIORITY, or RST_STREAM
+after that. `client_handle_data` did not check `s.done` and appended straight
+to `s.body`, silently accepting more of a response the caller may already be
+reading as complete.
+*/
+@(test)
+test_client_data_after_end_stream_is_refused :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Client_Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+
+	s := new(Client_Stream, allocator)
+	s.id = 1
+	s.send_window = c.peer_initial_window
+	s.body = make([dynamic]u8, 0, 8, allocator)
+	s.done = true
+	c.streams[1] = s
+
+	clear(&log.frames)
+	body := []u8{'x'}
+	ok := client_handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect(t, ok, "DATA after END_STREAM should be a stream error, not a connection error")
+	testing.expect_value(t, len(s.body), 0)
+
+	saw_rst := false
+	saw_credit := false
+	for f in log.frames {
+		if f.type == .Rst_Stream && f.stream_id == 1 {
+			saw_rst = true
+		}
+		if f.type == .Window_Update && f.stream_id == 0 {
+			saw_credit = true
+		}
+	}
+	testing.expect(t, saw_rst, "no RST_STREAM was sent for DATA after END_STREAM")
+	testing.expect(t, saw_credit, "the connection window was not replenished for a frame that was refused")
+
+	delete(log.frames)
+	client_stream_destroy(c, s)
+	delete_key(&c.streams, u32(1))
+	client_unref(c)
+	free_all(context.temp_allocator)
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "client data after end stream: %d bytes leaked at %v", entry.size, entry.location)
+	}
+}
+
 @(private = "file")
 write_nothing :: proc(user: rawptr, buf: []u8) -> bool {
 	return true
