@@ -209,14 +209,12 @@ validate :: proc(
 	unix := u32(time.to_unix_seconds(now))
 	budget := Budget{}
 
-	#partial switch dns.rcode_of(msg) {
-	case .No_Error, .NX_Domain:
-	case:
-		/*
-		REFUSED, SERVFAIL and the rest carry nothing to authenticate. Demanding a
-		denial of existence from them would turn every upstream error into a
-		DNSSEC failure, and report it as a forgery in the bargain.
-		*/
+	/*
+	REFUSED, SERVFAIL and the rest carry nothing to authenticate. Demanding a
+	denial of existence from them would turn every upstream error into a DNSSEC
+	failure, and report it as a forgery in the bargain.
+	*/
+	if !answerable_rcode(msg) {
 		return {.Insecure, "no data to authenticate"}
 	}
 
@@ -838,6 +836,19 @@ zone_step :: proc(
 	if derr != .None {
 		return .Bogus, nil
 	}
+	/*
+	An error carries no records, so a DS lookup that returns one finds neither a
+	delegation nor a denial of it - which is indistinguishable from a delegation
+	whose proof was stripped, and is what the checks below would call it.
+
+	The upstream failing to answer is a statement about the upstream, not about
+	the zone, and reporting it as a forgery would have every hiccup below a
+	signed parent come back as a DNSSEC failure. `validate` reaches the same
+	conclusion for the same rcodes on the response being validated.
+	*/
+	if !answerable_rcode(msg) {
+		return .Indeterminate, nil
+	}
 	unix := u32(time.to_unix_seconds(now))
 	// We asked in class IN, and the transport already checked the reply's
 	// question against ours; taking the class from the reply would only let it
@@ -955,6 +966,11 @@ fetch_keys :: proc(
 	msg, derr := dns.decode_message(wire, allocator)
 	if derr != .None {
 		return nil, .Bogus
+	}
+	// As in `zone_step`: an upstream error leaves the zone's keys unknown, which
+	// is not the same as the zone failing to produce them.
+	if !answerable_rcode(msg) {
+		return nil, .Indeterminate
 	}
 	class := dns.Class.IN
 
@@ -1358,6 +1374,21 @@ label_offset :: proc(name: string, count: int) -> (offset: int, ok: bool) {
 		i += 1
 	}
 	return 0, false
+}
+
+/*
+Does this response carry anything to reason about?
+
+Only NOERROR and NXDOMAIN do. Under every other rcode the responder is saying it
+did not answer, and its empty sections are not an absence anybody proved.
+*/
+@(private)
+answerable_rcode :: proc(msg: dns.Message) -> bool {
+	#partial switch dns.rcode_of(msg) {
+	case .No_Error, .NX_Domain:
+		return true
+	}
+	return false
 }
 
 /*
