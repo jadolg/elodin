@@ -167,6 +167,38 @@ run_transport_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	/*
+	The second request in the segment is a request, not spare bytes.
+
+	Nothing asks a client to wait for the answer before sending the next question
+	(RFC 9112 9.3), and keep-alive is what this endpoint advertises. Both arrive
+	in the same read, so the second one is in the reader's buffer when the first
+	is answered: dropped along with it, the client waits out `client_timeout` for
+	an answer that was never going to come.
+
+	Counted rather than read one reply at a time, for the reason
+	`doh_raw_until_close` gives - two answers usually arrive in one record.
+	*/
+	start_case(r, "doh: two pipelined requests are both answered")
+	{
+		encoded, eerr := base64.encode(query, base64.ENC_URL_TABLE, context.temp_allocator)
+		if eerr != nil {
+			fail(r, "cannot encode the pipelined query")
+		} else {
+			req := fmt.tprintf(
+				"POST /dns-query HTTP/1.1\r\nHost: elodin.local\r\nContent-Type: application/dns-message\r\nContent-Length: %d\r\nConnection: keep-alive\r\n\r\n%s" +
+				"GET /dns-query?dns=%s HTTP/1.1\r\nHost: elodin.local\r\nConnection: close\r\n\r\n",
+				len(query),
+				string(query),
+				strings.trim_right(encoded, "="),
+			)
+			data, read := doh_raw_until_close(doh_port, req)
+			replies := strings.count(data, "HTTP/1.1 200") if read else 0
+			check(r, replies == 2, "%d of the two pipelined requests were answered", replies)
+		}
+	}
+	end_case(r)
+
 	start_case(r, "doh: unknown path is 404")
 	{
 		res := doh_raw(doh_port, "GET /nope HTTP/1.1\r\nHost: elodin.local\r\nConnection: close\r\n\r\n")

@@ -69,6 +69,24 @@ http_line :: proc(r: ^Http_Reader) -> (line: string, ok: bool) {
 	}
 }
 
+/*
+Drop what has been read and move what has not to the front.
+
+`r.pos` is where the request just read ended, and anything past it is the start
+of the next one - so it has to survive into the next round, and the header limit
+`http_line` applies has to be measured from where that request begins rather
+than from whatever came before it. `remove_range` moves the tail down; the move
+is a `memmove`, so a tail longer than the gap it moves into is fine.
+*/
+@(private)
+http_compact :: proc(r: ^Http_Reader) {
+	if r.pos == 0 {
+		return
+	}
+	remove_range(&r.buf, 0, r.pos)
+	r.pos = 0
+}
+
 @(private)
 http_exact :: proc(r: ^Http_Reader, n: int) -> (data: []u8, ok: bool) {
 	for len(r.buf) - r.pos < n {
@@ -241,16 +259,36 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, ok: bool) {
 serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 	path := s.cfg.listeners.doh.path
 
+	/*
+	One reader for the connection rather than one per request.
+
+	A client may send the next request without waiting for the answer to this
+	one (RFC 9112 9.3), and `Connection: keep-alive` is what this endpoint
+	advertises, so a conforming client can do it. Those bytes come off the socket
+	along with the request being parsed and sit in `r.buf` past its end: a reader
+	built inside the loop throws them away with itself, and the next request is
+	either lost whole - the client waits for an answer until `client_timeout`
+	closes the connection - or, when only part of it had arrived, resumed from its
+	middle, which parses as a garbage request line and ends the connection.
+
+	The buffer is therefore not from `context.temp_allocator`: that arena is reset
+	after every request, and what is left over belongs to the next one.
+	*/
+	r := Http_Reader {
+		conn = conn,
+		buf  = make([dynamic]u8, 0, 4096),
+	}
+	defer delete(r.buf)
+
 	for {
-		r := Http_Reader {
-			conn = conn,
-			buf  = make([dynamic]u8, 0, 4096, context.temp_allocator),
-		}
 		req, ok := read_http_request(&r)
 		if !ok {
 			free_all(context.temp_allocator)
 			return
 		}
+		// Before the answer, so that what the reader carries into the next round
+		// is the next request and nothing before it.
+		http_compact(&r)
 
 		keep_alive := req.keep_alive
 		handled := serve_doh_request(s, conn, req, path, client)
