@@ -105,7 +105,7 @@ reader_line :: proc(r: ^Buf_Reader) -> (line: string, err: Error) {
 			r.pos += idx + 2
 			return string(r.buf[start:start + idx]), .None
 		}
-		if len(r.buf) > 64 * 1024 {
+		if len(r.buf) - r.pos > 64 * 1024 {
 			return "", .HTTP_Error
 		}
 		reader_fill(r) or_return
