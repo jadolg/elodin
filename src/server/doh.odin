@@ -21,6 +21,21 @@ DOH_CONTENT_TYPE :: "application/dns-message"
 MAX_HEADER_BYTES :: 16 * 1024
 MAX_DOH_BODY :: 64 * 1024
 
+/*
+What the connection's read buffer starts at, and what it is put back to between
+requests.
+
+It grows to hold whatever the largest request on the connection needed - a body
+at `MAX_DOH_BODY` takes it to 128 KiB, since a dynamic array doubles - and since
+the buffer now lives as long as the connection rather than as long as one
+request, that is capacity a client can raise once and leave raised for as long as
+it keeps the connection open, whatever it sends afterwards. At
+`server.max_connections`, connections that each did that hold tens of megabytes
+between them for nothing. One oversized request is not a reason to keep an
+oversized buffer, so `http_compact` hands the excess back.
+*/
+HTTP_BUF_SIZE :: 4096
+
 @(private)
 Http_Request_In :: struct {
 	method:       string,
@@ -80,11 +95,18 @@ is a `memmove`, so a tail longer than the gap it moves into is fine.
 */
 @(private)
 http_compact :: proc(r: ^Http_Reader) {
-	if r.pos == 0 {
-		return
+	if r.pos > 0 {
+		remove_range(&r.buf, 0, r.pos)
+		r.pos = 0
 	}
-	remove_range(&r.buf, 0, r.pos)
-	r.pos = 0
+	// The tail is what the next request has sent so far, so anything past
+	// `HTTP_BUF_SIZE` is capacity this connection has no use for. Left alone
+	// while the tail is larger than that: the next round compacts again, and
+	// giving it up here would only mean growing back for the request it belongs
+	// to.
+	if cap(r.buf) > HTTP_BUF_SIZE && len(r.buf) <= HTTP_BUF_SIZE {
+		_, _ = shrink(&r.buf, HTTP_BUF_SIZE)
+	}
 }
 
 @(private)
@@ -272,11 +294,12 @@ serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 	middle, which parses as a garbage request line and ends the connection.
 
 	The buffer is therefore not from `context.temp_allocator`: that arena is reset
-	after every request, and what is left over belongs to the next one.
+	after every request, and what is left over belongs to the next one. It does
+	not accumulate either - see `HTTP_BUF_SIZE`.
 	*/
 	r := Http_Reader {
 		conn = conn,
-		buf  = make([dynamic]u8, 0, 4096),
+		buf  = make([dynamic]u8, 0, HTTP_BUF_SIZE),
 	}
 	defer delete(r.buf)
 

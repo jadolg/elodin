@@ -280,6 +280,82 @@ test_doh_answers_a_pipelined_pair :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+/*
+One large request does not leave the connection holding a large buffer.
+
+The reader outlives the request now, so its buffer is no longer handed back by
+the `free_all` between requests: it holds whatever the largest request on the
+connection made it grow to. A body at `MAX_DOH_BODY` doubles it to 128 KiB, and
+a client that sends one and then goes back to 200-byte queries would keep that
+for as long as it holds the connection open - no malformed input needed, and
+multiplied by `server.max_connections`.
+
+Checked either side of `http_compact`, so this fails if the growth stops
+happening as well as if the buffer stops being given back.
+*/
+@(test)
+test_doh_reader_gives_back_an_oversized_buffer :: proc(t: ^testing.T) {
+	b := strings.builder_make(context.allocator)
+	defer strings.builder_destroy(&b)
+	strings.write_string(&b, "POST /dns-query HTTP/1.1\r\nHost: dns.example\r\n")
+	strings.write_string(&b, "Content-Type: application/dns-message\r\nContent-Length: ")
+	strings.write_int(&b, MAX_DOH_BODY)
+	strings.write_string(&b, "\r\n\r\n")
+	for _ in 0 ..< MAX_DOH_BODY {
+		strings.write_byte(&b, 'q')
+	}
+
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the bound port: %v", berr)
+		return
+	}
+
+	// On its own thread: 64 KiB is more than the socket buffers hold, so the
+	// send only finishes as the read below drains it.
+	sender := Sender {
+		endpoint = bound,
+		request  = strings.to_string(b),
+	}
+	client := thread.create_and_start_with_poly_data(&sender, send_request)
+	defer {
+		thread.join(client)
+		thread.destroy(client)
+	}
+
+	accepted, _, aerr := net.accept_tcp(listener)
+	if aerr != nil {
+		testing.expectf(t, false, "nothing connected: %v", aerr)
+		return
+	}
+	defer net.close(accepted)
+	_ = net.set_option(accepted, .Receive_Timeout, 3 * time.Second)
+
+	r := Http_Reader {
+		conn = Conn{socket = accepted},
+		buf  = make([dynamic]u8, 0, HTTP_BUF_SIZE),
+	}
+	defer delete(r.buf)
+
+	req, ok := read_http_request(&r)
+	testing.expect(t, ok, "the request did not parse")
+	if !ok {
+		return
+	}
+	testing.expect_value(t, len(req.body), MAX_DOH_BODY)
+	testing.expect(t, cap(r.buf) > HTTP_BUF_SIZE, "the body did not grow the buffer, so there is nothing to give back")
+
+	http_compact(&r)
+	testing.expect_value(t, len(r.buf), 0)
+	testing.expect_value(t, cap(r.buf), HTTP_BUF_SIZE)
+}
+
 @(private = "file")
 Doh_Session :: struct {
 	server: ^Server,
