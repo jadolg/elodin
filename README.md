@@ -941,6 +941,15 @@ rate(elodin_upstream_latency_seconds_total[5m]) / rate(elodin_upstream_queries_t
 min by (upstream) (elodin_upstream_up) == 0
 ```
 
+A Grafana dashboard covering all of the above is in
+[`examples/grafana-dashboard.json`](examples/grafana-dashboard.json) — import it
+under **Dashboards → New → Import**. It asks for a Prometheus data source and
+picks up `job` and `instance` from `elodin_build_info`, so it works against one
+instance or a fleet without editing. Five rows: an overview of headline rates,
+queries by outcome and by what turned them away, the cache, per-upstream traffic
+and health, and the process against its limits. Restarts are annotated from
+`process_start_time_seconds`.
+
 ## What is implemented
 
 Queries of any type are answered: A, AAAA, CNAME, MX, TXT, SRV, SOA, NS, PTR,
