@@ -50,6 +50,8 @@ Response :: struct {
 Handler :: #type proc(conn: ^Conn, req: ^Request)
 
 MAX_CONCURRENT :: 128
+// See Conn.closed_stream_rst_budget.
+MAX_CLOSED_STREAM_RST :: 16
 /*
 How long a response may wait for the peer to open its flow-control window.
 
@@ -110,10 +112,19 @@ Conn :: struct {
 	peer_initial_window: int,
 	send_window:         int,
 
-	decoder:             Dynamic_Table,
-	streams:             map[u32]^Stream,
-	last_stream_id:      u32,
-	goaway_sent:         bool,
+	decoder:        Dynamic_Table,
+	streams:        map[u32]^Stream,
+	last_stream_id: u32,
+	goaway_sent:    bool,
+	/*
+	How many more DATA frames for a stream that was opened and has since
+	closed still draw a courteous RST_STREAM(STREAM_CLOSED), rather than just
+	their connection credit back in silence. Bounded so a peer that keeps a
+	stream id alive purely to make this end answer it forever cannot turn a
+	handful of genuinely in-flight frames - the case RFC 9113 5.1 asks for
+	tolerance on - into an unbounded run of extra writes; see `handle_data`.
+	*/
+	closed_stream_rst_budget: int,
 
 	allocator:           mem.Allocator,
 	// Scratch for a header block spanning CONTINUATION frames.
@@ -136,6 +147,7 @@ make_conn :: proc(io: IO, handler: Handler, user: rawptr, allocator := context.a
 	c.peer_initial_window = DEFAULT_WINDOW
 	c.send_window = DEFAULT_WINDOW
 	c.streams = make(map[u32]^Stream, 16, allocator)
+	c.closed_stream_rst_budget = MAX_CLOSED_STREAM_RST
 	c.write_timeout = DEFAULT_WRITE_TIMEOUT
 	dynamic_table_init(&c.decoder, DEFAULT_HEADER_TABLE_SIZE, allocator)
 	return c
@@ -347,6 +359,10 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		return handle_data(c, h, payload)
 
 	case .Rst_Stream:
+		if h.stream_id == 0 || len(payload) != 4 {
+			goaway(c, .Protocol_Error if h.stream_id == 0 else .Frame_Size_Error)
+			return false
+		}
 		sync.mutex_lock(&c.mu)
 		orphaned := false
 		if s, found := c.streams[h.stream_id]; found {
@@ -354,6 +370,13 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 			s.state = .Closed
 			// Nobody is coming for this one. See `Stream.dispatched`.
 			orphaned = !s.dispatched
+			// Wakes a handler parked in write_body's no-credit wait; without this
+			// it sleeps out the full write_timeout on a stream already known
+			// dead. Inside `found`, unlike the already_ended path in handle_data:
+			// there is no stream here for an unmatched id to have parked anyone
+			// on, so broadcasting for one would only wake every other handler on
+			// the connection to recheck a state that has not changed for them.
+			sync.cond_broadcast(&c.cond)
 		}
 		sync.mutex_unlock(&c.mu)
 		if orphaned {
@@ -658,6 +681,11 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 
 @(private)
 handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
+	if h.stream_id == 0 {
+		goaway(c, .Protocol_Error)
+		return false
+	}
+
 	data, ok := strip_padding(payload, h.flags)
 	if !ok {
 		goaway(c, .Protocol_Error)
@@ -665,8 +693,74 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	}
 
 	sync.mutex_lock(&c.mu)
+	/*
+	RFC 9113 5.1: a stream id past the highest one this connection has ever
+	opened is idle, and idle only accepts HEADERS or PRIORITY - DATA on one
+	is a connection error of type PROTOCOL_ERROR, the same as stream 0. Left
+	unchecked, a peer can drive an unbounded run of connection WINDOW_UPDATE
+	writes with DATA on stream ids that were never opened.
+
+	An even id is idle too, whatever `last_stream_id` is: `handle_headers`
+	rejects one outright, so this server can never have opened one, and
+	without this half a DATA frame on one below `last_stream_id` fell through
+	to the closed-stream path instead - a connection error misanswered as a
+	stream error, and one that spent the closed-stream budget doing it.
+	*/
+	if h.stream_id > c.last_stream_id || h.stream_id % 2 == 0 {
+		sync.mutex_unlock(&c.mu)
+		goaway(c, .Protocol_Error)
+		return false
+	}
 	s, found := c.streams[h.stream_id]
-	if found {
+	/*
+	The idle check above already ruled out a stream id past `last_stream_id`,
+	so `!found` here can only mean one that was opened and has since closed -
+	RFC 9113 5.1 answers that with a stream error of type STREAM_CLOSED.
+	Budgeted rather than answered every time, unlike the two cases below that
+	cap their own RST_STREAM through `cancelled`: this stream is already gone,
+	so there is nothing here to hold a one-shot flag on. RFC 9113 5.1 also
+	asks endpoints to tolerate frames that were genuinely in flight when a
+	stream closed, and a peer that just keeps a dead id around otherwise draws
+	an unbounded run of RST_STREAM writes out of this end. Once the budget is
+	spent, this falls back to the pre-existing behaviour: credit returned, no
+	RST, silently ignored.
+	*/
+	send_closed_rst := !found && c.closed_stream_rst_budget > 0
+	if send_closed_rst {
+		c.closed_stream_rst_budget -= 1
+	}
+	/*
+	RFC 9113 5.1: half-closed (remote) and closed both allow WINDOW_UPDATE,
+	PRIORITY, and RST_STREAM from the peer and nothing else. A stream in
+	either state already has, or is getting, a handler's full attention - so
+	this is refused rather than retired: retiring it here would race whoever
+	answers it.
+
+	`cancelled` already gates `respond` and `write_body` (set there by an
+	inbound RST_STREAM), so setting it here too - under the same lock that
+	makes the check, not after - narrows the race between this and a handler
+	mid-`respond` without a second flag, though it does not close it: `respond`
+	and `write_body` both read `cancelled`, drop the lock, and only then write,
+	so a handler that reads it as false just before this runs can still write
+	one HEADERS frame after the RST_STREAM this sends. `cancelled` is already
+	true by the time that RST_STREAM goes out, so `write_body`'s first
+	per-chunk check catches it before any DATA follows - only the HEADERS frame
+	can escape. Closing that outright would mean holding `c.mu` across a
+	blocking write, which is the worse trade. Setting `cancelled` here also
+	means a stream the peer already reset draws no RST_STREAM of ours in
+	answer, since it is already true by the time DATA gets here - avoiding the
+	loop RFC 9113 5.4.2 warns against - and a peer that repeats the violation
+	on a stream we reset first just draws its credit back without a second one.
+	*/
+	already_ended := found && (s.state == .Half_Closed_Remote || s.state == .Closed)
+	need_rst := already_ended && !s.cancelled
+	if already_ended {
+		s.cancelled = true
+		// Wakes a handler parked in write_body's no-credit wait; without this it
+		// sleeps out the full write_timeout on a stream already known dead.
+		sync.cond_broadcast(&c.cond)
+	}
+	if found && !already_ended {
 		// Checked before appending, so an oversized body is refused rather than
 		// buffered first.
 		if len(s.body) + len(data) > MAX_BODY {
@@ -687,6 +781,19 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		append(&s.body, ..data)
 	}
 	sync.mutex_unlock(&c.mu)
+
+	if already_ended {
+		sent := true
+		if need_rst {
+			sent = rst_stream(c, h.stream_id, .Stream_Closed)
+		}
+		return sent && give_connection_credit(c, len(payload))
+	}
+
+	if send_closed_rst {
+		sent := rst_stream(c, h.stream_id, .Stream_Closed)
+		return sent && give_connection_credit(c, len(payload))
+	}
 
 	// Give the credit straight back; we buffer whole requests anyway.
 	if len(payload) > 0 {
@@ -896,6 +1003,13 @@ write_body :: proc(c: ^Conn, stream_id: u32, body: []u8) -> bool {
 			*/
 			left := time.diff(time.now(), deadline)
 			if left <= 0 {
+				// Marked here, under the same lock, for the same reason
+				// handle_data's already_ended path marks it before sending its
+				// own RST_STREAM: a DATA frame landing in the gap between this
+				// and respond's close_stream must find a stream already known
+				// dead, not send a second RST_STREAM onto one this end just reset.
+				s.cancelled = true
+				sync.cond_broadcast(&c.cond)
 				sync.mutex_unlock(&c.mu)
 				rst_stream(c, stream_id, .Cancel)
 				return false

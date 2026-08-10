@@ -314,6 +314,372 @@ test_oversized_body_drops_the_stream :: proc(t: ^testing.T) {
 	expect_no_leaks(t, &track, "oversized body")
 }
 
+/*
+RFC 9113 6.1: DATA is only ever sent on a stream, never on the connection
+control stream, so one arriving with stream_id 0 is a connection error of
+type PROTOCOL_ERROR. `handle_headers` already checks this; `handle_data` did
+not, and fell through to look up a stream that can never be in the map.
+*/
+@(test)
+test_data_on_stream_zero_is_rejected :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+
+	body := []u8{'x'}
+	ok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 0}, body)
+	testing.expect(t, !ok, "DATA on stream 0 was accepted")
+
+	saw_goaway := false
+	for f in log.frames {
+		if f.type == .Goaway {
+			saw_goaway = true
+		}
+	}
+	testing.expect(t, saw_goaway, "no GOAWAY was sent for DATA on stream 0")
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "data on stream zero")
+}
+
+/*
+RFC 9113 5.1: a stream id past the highest one this connection has ever opened
+is idle, and DATA is not among the frames idle accepts - a connection error of
+type PROTOCOL_ERROR, the same as stream 0. `handle_data` instead found nothing
+in the stream table and fell through the ordinary not-found path, handing back
+a connection WINDOW_UPDATE for a stream id that was never opened.
+*/
+@(test)
+test_data_on_an_idle_stream_is_rejected :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+
+	body := []u8{'x'}
+	ok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 3}, body)
+	testing.expect(t, !ok, "DATA on an idle stream was accepted")
+
+	saw_goaway := false
+	for f in log.frames {
+		if f.type == .Goaway {
+			saw_goaway = true
+		}
+	}
+	testing.expect(t, saw_goaway, "no GOAWAY was sent for DATA on an idle stream")
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "data on an idle stream")
+}
+
+/*
+`handle_headers` rejects an even stream id outright (server.odin:495 area) -
+this server can never have opened one - so an even id is idle regardless of
+where `last_stream_id` sits, the same reasoning `client_handle_data`'s
+parity check already applies. The `> last_stream_id` test alone missed it:
+DATA on stream 2 after the peer opened stream 3 fell through to the
+closed-stream path instead, spending a slot of `closed_stream_rst_budget` to
+answer a connection error as a stream error.
+*/
+@(test)
+test_data_on_an_even_stream_is_rejected :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 3}, block)
+	testing.expect(t, ok, "handle_headers failed")
+
+	clear(&log.frames)
+	body := []u8{'x'}
+	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 2}, body)
+	testing.expect(t, !dok, "DATA on an even (never-opened) stream was accepted")
+	testing.expect_value(t, c.closed_stream_rst_budget, MAX_CLOSED_STREAM_RST)
+
+	saw_goaway := false
+	for f in log.frames {
+		if f.type == .Goaway {
+			saw_goaway = true
+		}
+	}
+	testing.expect(t, saw_goaway, "no GOAWAY was sent for DATA on an even stream")
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "data on an even stream")
+}
+
+/*
+RFC 9113 5.1: a stream id at or below `last_stream_id` that is not in the
+table was opened and has since closed - a stream error of type STREAM_CLOSED,
+distinct from the idle case above. `handle_data` fell through the ordinary
+not-found path for this too, handing back a connection WINDOW_UPDATE and no
+RST_STREAM for a stream the peer had already been told, or could easily work
+out, was gone.
+*/
+@(test)
+test_data_on_a_closed_stream_is_answered_with_stream_closed :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+
+	// HEADERS without END_STREAM opens the stream (advancing last_stream_id)
+	// without dispatching it, so the inbound RST_STREAM below finds it an
+	// orphan and retires it via close_stream - opened, then gone, same as a
+	// stream a handler finished answering.
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+	testing.expect(t, ok, "handle_headers failed")
+
+	rst := []u8{0, 0, 0, 8} // CANCEL
+	rok := handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst)
+	testing.expect(t, rok, "handle_frame failed")
+	_, still_open := c.streams[1]
+	testing.expect(t, !still_open, "an orphaned reset stream was not retired")
+
+	clear(&log.frames)
+	body := []u8{'x'}
+	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect(t, dok, "DATA on a closed stream should be a stream error, not a connection error")
+
+	saw_rst := false
+	saw_credit := false
+	for f in log.frames {
+		if f.type == .Rst_Stream && f.stream_id == 1 {
+			saw_rst = true
+		}
+		if f.type == .Window_Update && f.stream_id == 0 {
+			saw_credit = true
+		}
+	}
+	testing.expect(t, saw_rst, "no RST_STREAM was sent for DATA on a closed stream")
+	testing.expect(t, saw_credit, "the connection window was not replenished for a frame that was refused")
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "data on a closed stream")
+}
+
+/*
+Answering every one of these forever is its own amplification vector: a peer
+that keeps a closed stream id around and just keeps sending draws an
+RST_STREAM out of this end for each frame, for free. `closed_stream_rst_budget`
+bounds that to `MAX_CLOSED_STREAM_RST` per connection; past it, this falls
+back to the credit-only behaviour the case had before this fix existed.
+*/
+@(test)
+test_data_on_a_closed_stream_stops_drawing_rst_once_the_budget_is_spent :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+	testing.expect(t, ok, "handle_headers failed")
+	rst := []u8{0, 0, 0, 8} // CANCEL
+	handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst)
+
+	body := []u8{'x'}
+	for _ in 0 ..< MAX_CLOSED_STREAM_RST {
+		handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	}
+	testing.expect_value(t, c.closed_stream_rst_budget, 0)
+
+	clear(&log.frames)
+	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect(t, dok, "DATA on a closed stream should still be tolerated once the budget is spent")
+
+	saw_rst := false
+	saw_credit := false
+	for f in log.frames {
+		if f.type == .Rst_Stream {
+			saw_rst = true
+		}
+		if f.type == .Window_Update && f.stream_id == 0 {
+			saw_credit = true
+		}
+	}
+	testing.expectf(t, !saw_rst, "an RST_STREAM was sent after the closed-stream budget was spent")
+	testing.expect(t, saw_credit, "the connection window was not replenished for a frame that was refused")
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "closed stream rst budget")
+}
+
+/*
+RFC 9113 5.1: once a stream is half-closed (remote), the peer has said it is
+done sending, and anything but WINDOW_UPDATE, PRIORITY, or RST_STREAM from it
+is a stream error of type STREAM_CLOSED. `handle_data` instead appended
+straight to `s.body`, silently accepting a body that was already complete.
+*/
+@(test)
+test_data_after_end_stream_is_refused :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, destroying_handler, nil, allocator)
+
+	// END_STREAM on the HEADERS dispatches straight away and marks the stream
+	// half-closed (remote); the handler frees the request but leaves the
+	// stream itself for whoever answers it.
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	ok := handle_headers(
+		c,
+		Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1},
+		block,
+	)
+	testing.expect(t, ok, "handle_headers failed")
+
+	clear(&log.frames)
+	body := []u8{'x'}
+	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect(t, dok, "DATA after END_STREAM should be a stream error, not a connection error")
+
+	s, still_open := c.streams[1]
+	testing.expect(t, still_open, "a stream still owned by its handler was retired out from under it")
+	if still_open {
+		testing.expect_value(t, len(s.body), 0)
+	}
+
+	saw_rst := false
+	saw_credit := false
+	for f in log.frames {
+		if f.type == .Rst_Stream && f.stream_id == 1 {
+			saw_rst = true
+		}
+		if f.type == .Window_Update && f.stream_id == 0 {
+			saw_credit = true
+		}
+	}
+	testing.expect(t, saw_rst, "no RST_STREAM was sent for DATA after END_STREAM")
+	testing.expect(t, saw_credit, "the connection window was not replenished for a frame that was refused")
+
+	/*
+	A peer that keeps sending after the first violation must not draw a fresh
+	RST_STREAM every time - that is a cheap way to make this end write two
+	frames under `c.mu` per frame it sends. `cancelled`, set on the first
+	violation above, is what keeps the second one quiet.
+	*/
+	clear(&log.frames)
+	dok2 := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect(t, dok2, "a repeat violation should still be a stream error, not a connection error")
+	for f in log.frames {
+		testing.expectf(t, f.type != .Rst_Stream, "a second RST_STREAM was sent for a stream already marked cancelled")
+	}
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "data after end stream")
+}
+
+/*
+RFC 9113 5.1 puts closed in the same bucket as half-closed (remote): once the
+peer has reset a stream, only WINDOW_UPDATE, PRIORITY, and RST_STREAM are
+still allowed from it. A dispatched stream stays in `c.streams` after an
+inbound RST_STREAM - `respond` is what retires it - so `handle_data` could
+still find it and, before this fix, would append to its body and hand back a
+stream-level WINDOW_UPDATE for a stream the peer had already walked away
+from. Answering with an RST_STREAM of our own would loop (RFC 9113 5.4.2),
+so this checks its absence rather than its presence.
+*/
+@(test)
+test_data_on_a_peer_reset_stream_is_refused :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, destroying_handler, nil, allocator)
+
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	ok := handle_headers(
+		c,
+		Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1},
+		block,
+	)
+	testing.expect(t, ok, "handle_headers failed")
+
+	rst := []u8{0, 0, 0, 8} // CANCEL
+	rok := handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst)
+	testing.expect(t, rok, "handle_frame failed")
+
+	live, open := c.streams[1]
+	testing.expect(t, open, "a dispatched stream was retired out from under its handler")
+	if open {
+		testing.expect_value(t, live.state, Stream_State.Closed)
+	}
+
+	clear(&log.frames)
+	body := []u8{'x'}
+	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect(t, dok, "DATA on a peer-reset stream should be a stream error, not a connection error")
+
+	if s, still_open := c.streams[1]; still_open {
+		testing.expect_value(t, len(s.body), 0)
+	}
+
+	saw_credit := false
+	for f in log.frames {
+		testing.expectf(t, f.type != .Rst_Stream, "an RST_STREAM was sent answering a stream the peer had already reset")
+		if f.type == .Window_Update && f.stream_id == 0 {
+			saw_credit = true
+		}
+	}
+	testing.expect(t, saw_credit, "the connection window was not replenished for a frame that was refused")
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "data on a peer-reset stream")
+}
+
 @(test)
 test_padding_and_priority_stripping :: proc(t: ^testing.T) {
 	// PADDED: first byte is the pad length, that many bytes come off the end.
@@ -390,9 +756,11 @@ destroying_handler :: proc(conn: ^Conn, req: ^Request) {
 @(test)
 test_data_frame_cannot_touch_a_closed_stream :: proc(t: ^testing.T) {
 	/*
-	A DATA frame arriving for a stream whose handler is answering it at the same
-	moment must not write through a pointer the reader thread picked up before
-	it released the lock.
+	A DATA frame arriving for a stream must not write through a pointer the
+	reader thread picked up before it released the lock, whoever retired the
+	stream in between - here, nothing so far has dispatched a handler for it,
+	so the request is still parked; `test_data_after_end_stream_is_refused`
+	covers the same race for a stream a handler already owns.
 	*/
 	track: mem.Tracking_Allocator
 	mem.tracking_allocator_init(&track, context.allocator)
@@ -404,15 +772,17 @@ test_data_frame_cannot_touch_a_closed_stream :: proc(t: ^testing.T) {
 	hook.conn = c
 	hook.stream_id = 1
 
-	// END_STREAM on the HEADERS dispatches the request straight away, so the
-	// stream is live with a handler owning it - the state in which `respond`
-	// runs concurrently with whatever the peer sends next.
+	/*
+	No END_STREAM on the HEADERS: the request parks on the stream rather than
+	dispatching, so the DATA below is the first frame to see this stream and
+	`already_ended` (server.odin) is false for it - it still takes the append
+	path all the way to the WINDOW_UPDATE write the hook rides in on. HEADERS
+	with END_STREAM would dispatch immediately and leave nothing for this DATA
+	to reach but the now-`already_ended` short-circuit, which returns before
+	ever writing a WINDOW_UPDATE.
+	*/
 	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
-	ok := handle_headers(
-		c,
-		Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1},
-		block,
-	)
+	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 	testing.expect(t, ok, "handle_headers failed")
 
 	hook.armed = true
@@ -650,6 +1020,78 @@ test_reset_stream_is_retired :: proc(t: ^testing.T) {
 }
 
 /*
+RFC 9113 6.4: RST_STREAM's payload is exactly one 4-byte error code. The
+client's handle_frame checks this (client.odin:312-315); the server's did
+not, and read `c.streams[h.stream_id]` regardless of what the "payload" it
+never measured actually held.
+*/
+@(test)
+test_rst_stream_with_a_bad_frame_size_is_a_connection_error :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+
+	bad := []u8{0, 0, 8} // one byte short of an error code
+	ok := handle_frame(c, Frame_Header{length = len(bad), type = .Rst_Stream, stream_id = 1}, bad)
+	testing.expect(t, !ok, "a malformed RST_STREAM was accepted")
+
+	saw_goaway := false
+	for f in log.frames {
+		if f.type == .Goaway {
+			saw_goaway = true
+		}
+	}
+	testing.expect(t, saw_goaway, "no GOAWAY was sent for a malformed RST_STREAM")
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "rst_stream bad frame size")
+}
+
+/*
+RFC 9113 6.4: RST_STREAM always names a stream; stream 0 is a connection
+error of type PROTOCOL_ERROR, the same as every other frame this package
+checks for it. Unguarded, this looked up `c.streams[0]` - always a miss -
+and returned true as if a peer sending it meant nothing in particular.
+*/
+@(test)
+test_rst_stream_on_stream_zero_is_a_connection_error :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+
+	rst := []u8{0, 0, 0, 8} // CANCEL
+	ok := handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 0}, rst)
+	testing.expect(t, !ok, "RST_STREAM on stream 0 was accepted")
+
+	saw_goaway := false
+	for f in log.frames {
+		if f.type == .Goaway {
+			saw_goaway = true
+		}
+	}
+	testing.expect(t, saw_goaway, "no GOAWAY was sent for RST_STREAM on stream 0")
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "rst_stream on stream zero")
+}
+
+/*
 The consequence of not retiring them, which is what makes it worth more than a
 leak: two frames per stream and the connection stops accepting new ones.
 */
@@ -810,6 +1252,137 @@ test_response_gives_up_when_no_window_is_granted :: proc(t: ^testing.T) {
 	conn_unref(c)
 	free_all(context.temp_allocator)
 	expect_no_leaks(t, &track, "no window granted")
+}
+
+/*
+Setting `cancelled` without waking anyone parked on it just relocates the
+problem the test above covers: a handler stuck in `write_body`'s no-credit
+wait only re-reads `cancelled` when it wakes, and nothing woke it, so it slept
+out the full `write_timeout` on a stream already known dead instead of giving
+up the moment the violation was seen.
+*/
+@(test)
+test_data_after_end_stream_wakes_a_parked_responder :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	c := make_conn(IO{read = no_read, write = discard_write}, destroying_handler, nil, allocator)
+	// No room for the body, ever - so `respond` parks in `write_body` waiting
+	// on credit that this test, not the peer, is what ends the wait for.
+	c.peer_initial_window = 0
+	c.write_timeout = 2 * time.Second
+
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	ok := handle_headers(
+		c,
+		Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1},
+		block,
+	)
+	testing.expect(t, ok, "handle_headers failed")
+
+	r := Respond_Ctx {
+		conn = c,
+	}
+	worker := thread.create_and_start_with_poly_data(&r, respond_worker)
+
+	// Give the worker a moment to reach the wait - the HEADERS write ahead of
+	// it is unwindowed, so it gets there in well under this.
+	time.sleep(50 * time.Millisecond)
+
+	body := []u8{'x'}
+	handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+
+	// Well short of write_timeout: a broadcast wakes it in microseconds, so
+	// anything past a few hundred milliseconds means nothing woke it at all.
+	deadline := time.time_add(time.now(), 1 * time.Second)
+	for !sync.atomic_load(&r.done) && time.diff(time.now(), deadline) > 0 {
+		time.sleep(10 * time.Millisecond)
+	}
+	finished := sync.atomic_load(&r.done)
+	testing.expect(t, finished, "the parked responder was not woken by the violation that cancelled its stream")
+
+	if !finished {
+		sync.mutex_lock(&c.mu)
+		c.closed = true
+		sync.cond_broadcast(&c.cond)
+		sync.mutex_unlock(&c.mu)
+	}
+	thread.join(worker)
+	thread.destroy(worker)
+
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "parked responder woken")
+}
+
+/*
+`write_body`'s own flow-control deadline sends RST_STREAM(.Cancel) - the same
+kind of one-shot RST_STREAM `handle_data`'s already_ended path sends, gated
+on `cancelled` there specifically so a peer cannot draw two. `write_body`
+sent its RST without setting `cancelled`, so a DATA frame landing in the
+window between that RST and `respond`'s `close_stream` would still find
+`cancelled == false` and send a second RST_STREAM on a stream this end had
+just reset.
+*/
+@(test)
+test_write_body_deadline_marks_the_stream_cancelled :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, destroying_handler, nil, allocator)
+	// No room for the body, ever, and a short timeout so the test does not wait long.
+	c.peer_initial_window = 0
+	c.write_timeout = 50 * time.Millisecond
+
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	ok := handle_headers(
+		c,
+		Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1},
+		block,
+	)
+	testing.expect(t, ok, "handle_headers failed")
+
+	clear(&log.frames)
+	// write_body blocks here for c.write_timeout, then gives up - synchronous,
+	// so no worker thread is needed to observe it.
+	sent := write_body(c, 1, []u8{1, 2, 3, 4})
+	testing.expect(t, !sent, "write_body should have given up once its deadline passed")
+
+	saw_rst := false
+	for f in log.frames {
+		if f.type == .Rst_Stream && f.stream_id == 1 {
+			saw_rst = true
+		}
+	}
+	testing.expect(t, saw_rst, "no RST_STREAM was sent for the flow-control deadline")
+
+	s, still_open := c.streams[1]
+	testing.expect(t, still_open, "the stream should still be here for respond to retire")
+	if still_open {
+		testing.expect(t, s.cancelled, "write_body's own RST_STREAM did not mark the stream cancelled")
+	}
+
+	// A stray DATA frame landing in the gap before respond retires the stream
+	// must not draw a second RST_STREAM.
+	clear(&log.frames)
+	body := []u8{'x'}
+	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect(t, dok, "DATA after the deadline RST should still be a stream error, not a connection error")
+	for f in log.frames {
+		testing.expectf(t, f.type != .Rst_Stream, "a second RST_STREAM was sent on a stream write_body had already reset")
+	}
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "write_body deadline cancelled")
 }
 
 // ---------------------------------------------------------------------------
