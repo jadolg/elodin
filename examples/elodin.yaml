@@ -282,15 +282,15 @@ cookies:
   # secret: e5e973e5a6b2a43f48e7dc849e37bfcf
 
 # Local answers. Wildcards match subdomains only.
-rewrites:
-  - domain: nas.home
-    answer: 192.168.1.50
-  - domain: "*.home"
-    answers: [192.168.1.1]
-  - domain: old.example.com
-    answer: new.example.com       # a name becomes a CNAME
-  - domain: telemetry.example.com
-    answer: block                 # answered as if it were on a blocklist
+# rewrites:
+#   - domain: nas.home
+#     answer: 192.168.1.50
+#   - domain: "*.home"
+#     answers: [192.168.1.1]
+#   - domain: old.example.com
+#     answer: new.example.com       # a name becomes a CNAME
+#   - domain: telemetry.example.com
+#     answer: block                 # answered as if it were on a blocklist
 
 # Prometheus. Off by default: a resolver that opens a port nobody asked for has
 # widened your exposure on your behalf.
