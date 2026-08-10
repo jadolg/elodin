@@ -670,6 +670,16 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	}
 
 	sync.mutex_lock(&c.mu)
+	// RFC 9113 5.1: a stream id past the highest one this connection has ever
+	// opened is idle, and idle only accepts HEADERS or PRIORITY - DATA on one
+	// is a connection error of type PROTOCOL_ERROR, the same as stream 0. Left
+	// unchecked, a peer can drive an unbounded run of connection WINDOW_UPDATE
+	// writes with DATA on stream ids that were never opened.
+	if h.stream_id > c.last_stream_id {
+		sync.mutex_unlock(&c.mu)
+		goaway(c, .Protocol_Error)
+		return false
+	}
 	s, found := c.streams[h.stream_id]
 	/*
 	RFC 9113 5.1: half-closed (remote) and closed both allow WINDOW_UPDATE,
@@ -680,13 +690,19 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 
 	`cancelled` already gates `respond` and `write_body` (set there by an
 	inbound RST_STREAM), so setting it here too - under the same lock that
-	makes the check, not after - is what closes that race without a second
-	flag: a handler mid-`respond` finds it through the same door. It also
+	makes the check, not after - narrows the race between this and a handler
+	mid-`respond` without a second flag, though it does not close it: `respond`
+	and `write_body` both read `cancelled`, drop the lock, and only then write,
+	so a handler that reads it as false just before this runs can still write
+	HEADERS - and, absent a further DATA frame to catch it, a full body - after
+	the RST_STREAM this sends. `write_body` re-checks `cancelled` under the
+	lock before each chunk, so a response already streaming does stop partway.
+	Closing the HEADERS gap outright would mean holding `c.mu` across a
+	blocking write, which is the worse trade. Setting `cancelled` here also
 	means a stream the peer already reset draws no RST_STREAM of ours in
-	answer, since `cancelled` is already true by the time DATA gets here -
-	avoiding the loop RFC 9113 5.4.2 warns against - and a peer that repeats
-	the violation on a stream we reset first just draws its credit back
-	without a second one.
+	answer, since it is already true by the time DATA gets here - avoiding the
+	loop RFC 9113 5.4.2 warns against - and a peer that repeats the violation
+	on a stream we reset first just draws its credit back without a second one.
 	*/
 	already_ended := found && (s.state == .Half_Closed_Remote || s.state == .Closed)
 	need_rst := already_ended && !s.cancelled

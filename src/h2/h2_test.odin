@@ -351,6 +351,43 @@ test_data_on_stream_zero_is_rejected :: proc(t: ^testing.T) {
 }
 
 /*
+RFC 9113 5.1: a stream id past the highest one this connection has ever opened
+is idle, and DATA is not among the frames idle accepts - a connection error of
+type PROTOCOL_ERROR, the same as stream 0. `handle_data` instead found nothing
+in the stream table and fell through the ordinary not-found path, handing back
+a connection WINDOW_UPDATE for a stream id that was never opened.
+*/
+@(test)
+test_data_on_an_idle_stream_is_rejected :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+
+	body := []u8{'x'}
+	ok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 3}, body)
+	testing.expect(t, !ok, "DATA on an idle stream was accepted")
+
+	saw_goaway := false
+	for f in log.frames {
+		if f.type == .Goaway {
+			saw_goaway = true
+		}
+	}
+	testing.expect(t, saw_goaway, "no GOAWAY was sent for DATA on an idle stream")
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "data on an idle stream")
+}
+
+/*
 RFC 9113 5.1: once a stream is half-closed (remote), the peer has said it is
 done sending, and anything but WINDOW_UPDATE, PRIORITY, or RST_STREAM from it
 is a stream error of type STREAM_CLOSED. `handle_data` instead appended
@@ -562,9 +599,11 @@ destroying_handler :: proc(conn: ^Conn, req: ^Request) {
 @(test)
 test_data_frame_cannot_touch_a_closed_stream :: proc(t: ^testing.T) {
 	/*
-	A DATA frame arriving for a stream whose handler is answering it at the same
-	moment must not write through a pointer the reader thread picked up before
-	it released the lock.
+	A DATA frame arriving for a stream must not write through a pointer the
+	reader thread picked up before it released the lock, whoever retired the
+	stream in between - here, nothing so far has dispatched a handler for it,
+	so the request is still parked; `test_data_after_end_stream_is_refused`
+	covers the same race for a stream a handler already owns.
 	*/
 	track: mem.Tracking_Allocator
 	mem.tracking_allocator_init(&track, context.allocator)

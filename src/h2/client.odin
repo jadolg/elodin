@@ -422,6 +422,11 @@ client_handle_window_update :: proc(c: ^Client, h: Frame_Header, payload: []u8) 
 
 @(private)
 client_handle_headers :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
+	if h.stream_id == 0 {
+		client_goaway(c, .Protocol_Error)
+		return false
+	}
+
 	body, ok := strip_padding(payload, h.flags)
 	if !ok {
 		client_goaway(c, .Protocol_Error)
@@ -441,7 +446,11 @@ client_handle_headers :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> boo
 	append(&c.header_scratch, ..block)
 
 	sync.mutex_lock(&c.mu)
-	if s, found := c.streams[h.stream_id]; found {
+	// A stream already done or reset only takes the already_ended path in
+	// `client_finish_headers` below; `end_stream` recorded here is what that
+	// path would otherwise read to decide whether to (re-)mark it done, so
+	// leaving it untouched keeps this frame from resurrecting one.
+	if s, found := c.streams[h.stream_id]; found && !s.done && !s.reset {
 		s.end_stream = h.flags & FLAG_END_STREAM != 0
 	}
 	sync.mutex_unlock(&c.mu)
@@ -533,7 +542,20 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 
 	sync.mutex_lock(&c.mu)
 	s, found := c.streams[stream_id]
-	if found {
+	/*
+	RFC 9113 5.1: once a stream is done or the peer has reset it, only
+	WINDOW_UPDATE, PRIORITY, and RST_STREAM are still allowed from it - a
+	second HEADERS block must not overwrite `s.status` out from under a
+	waiter that may already be reading it. Same one-shot RST_STREAM rule as
+	`client_handle_data`: skipped if the peer reset the stream itself (would
+	loop, RFC 9113 5.4.2), one-shot via `rst_sent` otherwise.
+	*/
+	already_ended := found && (s.done || s.reset)
+	need_rst := already_ended && !s.reset && !s.rst_sent
+	if already_ended {
+		s.rst_sent = true
+	}
+	if found && !already_ended {
 		for f in headers {
 			if f.name == ":status" {
 				s.status = parse_status(f.value)
@@ -547,6 +569,10 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 	sync.mutex_unlock(&c.mu)
 
 	free_headers(headers, c.allocator)
+
+	if need_rst {
+		return client_rst_stream(c, stream_id, .Stream_Closed)
+	}
 	return true
 }
 
@@ -827,7 +853,12 @@ client_send_body :: proc(c: ^Client, s: ^Client_Stream, body: []u8, deadline: ti
 		sync.mutex_lock(&c.mu)
 		chunk := 0
 		for {
-			if c.closed || s.reset {
+			// `done`: the response already arrived complete, so there is no one
+			// left to read the rest of this body. `rst_sent`: this connection has
+			// already answered a stream violation on this id with an RST_STREAM
+			// of its own - writing DATA after that is a frame on a stream we just
+			// reset.
+			if c.closed || s.reset || s.done || s.rst_sent {
 				sync.mutex_unlock(&c.mu)
 				return false
 			}
