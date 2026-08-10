@@ -551,3 +551,76 @@ test_max_udp_response_outside_the_range_is_an_error :: proc(t: ^testing.T) {
 	}
 	free_all(context.temp_allocator)
 }
+
+/*
+Off unless it is asked for.
+
+The default matters more than the rest of this section: an operator upgrading
+into a release with a metrics endpoint should not find a port open that their
+old configuration file never mentioned.
+*/
+@(test)
+test_metrics_is_off_by_default :: proc(t: ^testing.T) {
+	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	testing.expect(t, err == nil, "expected a clean load")
+	testing.expect(t, !cfg.metrics.enabled, "the metrics endpoint should be off by default")
+	testing.expect_value(t, cfg.metrics.address, "127.0.0.1")
+	testing.expect_value(t, cfg.metrics.port, 9153)
+	testing.expect_value(t, cfg.metrics.path, "/metrics")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_metrics_settings_are_honoured :: proc(t: ^testing.T) {
+	src := "upstream:\n  servers: [1.1.1.1]\nmetrics:\n  enabled: true\n  address: \"0.0.0.0\"\n  port: 9999\n  path: /stats\n"
+	cfg, err := load_string(src, context.temp_allocator)
+	testing.expect(t, err == nil, "expected a clean load")
+	testing.expect(t, cfg.metrics.enabled, "metrics.enabled: true should be honoured")
+	testing.expect_value(t, cfg.metrics.address, "0.0.0.0")
+	testing.expect_value(t, cfg.metrics.port, 9999)
+	testing.expect_value(t, cfg.metrics.path, "/stats")
+	free_all(context.temp_allocator)
+}
+
+/*
+Caught by `--check` rather than at startup.
+
+Each of these comes up as a listener that binds and is never scraped: a path a
+scrape config does not use, a port the kernel chose, an address that is not one.
+The endpoint would be up and the dashboard empty, which is the failure that
+takes longest to attribute.
+*/
+@(test)
+test_unusable_metrics_settings_are_errors :: proc(t: ^testing.T) {
+	cases := []string{"  path: metrics\n", "  port: 0\n", "  port: 70000\n", "  address: \"localhost\"\n"}
+	for tail in cases {
+		src := strings.concatenate(
+			{"upstream:\n  servers: [1.1.1.1]\nmetrics:\n  enabled: true\n", tail},
+			context.temp_allocator,
+		)
+		_, err := load_string(src, context.temp_allocator)
+		e, has := err.?
+		testing.expectf(t, has, "metrics:\n%s was accepted", tail)
+		if has {
+			named := false
+			for m in e.messages {
+				if strings.has_prefix(m, "metrics.") {
+					named = true
+				}
+			}
+			testing.expectf(t, named, "the error for %q does not name the setting", tail)
+		}
+	}
+	free_all(context.temp_allocator)
+}
+
+// The same settings with the endpoint off are settings that describe nothing,
+// and a file left over from an instance that once had it on should not be what
+// stops a resolver starting.
+@(test)
+test_metrics_settings_are_not_checked_while_it_is_off :: proc(t: ^testing.T) {
+	src := "upstream:\n  servers: [1.1.1.1]\nmetrics:\n  enabled: false\n  port: 0\n  path: nowhere\n"
+	_, err := load_string(src, context.temp_allocator)
+	testing.expect(t, err == nil, "a disabled metrics endpoint should not be validated")
+	free_all(context.temp_allocator)
+}

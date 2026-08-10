@@ -12,22 +12,27 @@ import "elodin:pool"
 import "elodin:tlsx"
 
 Listeners :: struct {
-	udp_socket: net.UDP_Socket,
+	udp_socket:     net.UDP_Socket,
 	// What the UDP socket actually bound, read once: `plausible_source` needs
 	// it for every datagram, and asking the kernel each time is a syscall per
 	// query for an answer that cannot change.
-	udp_bound:  net.Endpoint,
-	tcp_socket: net.TCP_Socket,
-	dot_socket: net.TCP_Socket,
-	doh_socket: net.TCP_Socket,
-	udp_open:   bool,
-	tcp_open:   bool,
-	dot_open:   bool,
-	doh_open:   bool,
-	dot_ctx:    ^tlsx.Context,
-	doh_ctx:    ^tlsx.Context,
-	conns:      Conn_Manager,
-	stop:       bool,
+	udp_bound:      net.Endpoint,
+	tcp_socket:     net.TCP_Socket,
+	dot_socket:     net.TCP_Socket,
+	doh_socket:     net.TCP_Socket,
+	// The Prometheus endpoint, which is not a DNS listener but is a socket with
+	// the same lifetime: opened by `start_listeners`, closed by
+	// `stop_listeners`, and its loop joined with the rest.
+	metrics_socket: net.TCP_Socket,
+	udp_open:       bool,
+	tcp_open:       bool,
+	dot_open:       bool,
+	doh_open:       bool,
+	metrics_open:   bool,
+	dot_ctx:        ^tlsx.Context,
+	doh_ctx:        ^tlsx.Context,
+	conns:          Conn_Manager,
+	stop:           bool,
 	/*
 	What the read and accept loops were given, held here rather than by the
 	loops themselves.
@@ -39,8 +44,9 @@ Listeners :: struct {
 	pull the ground from under both. `destroy_listeners` releases them instead,
 	once there is nothing left that could be holding one.
 	*/
-	udp_loop_ctx:    ^Udp_Context,
-	stream_loop_ctx: [dynamic]^Stream_Context,
+	udp_loop_ctx:     ^Udp_Context,
+	stream_loop_ctx:  [dynamic]^Stream_Context,
+	metrics_loop_ctx: ^Metrics_Context,
 }
 
 /*
@@ -73,8 +79,8 @@ The two that actually happen are a privileged port without the capability to
 use it, and something already listening — usually the system resolver.
 */
 @(private)
-report_bind_failure :: proc(name: string, address: string, port: int, err: net.Network_Error) {
-	logx.errorf("listeners.%s: cannot bind %s:%d (%v)", name, address, port, err)
+report_bind_failure :: proc(setting: string, address: string, port: int, err: net.Network_Error) {
+	logx.errorf("%s: cannot bind %s:%d (%v)", setting, address, port, err)
 
 	#partial switch e in err {
 	case net.Bind_Error:
@@ -113,6 +119,14 @@ start_listeners :: proc(s: ^Server, l: ^Listeners) -> bool {
 			return false
 		}
 	}
+	// Last, so that a port clash on an endpoint nobody queries cannot stop the
+	// ones they do from coming up first — and still fatal, because an operator
+	// who turned it on is about to be told the resolver is unmonitored.
+	if s.cfg.metrics.enabled {
+		if !start_metrics(s, l) {
+			return false
+		}
+	}
 	return true
 }
 
@@ -129,6 +143,9 @@ stop_listeners :: proc(l: ^Listeners) {
 	}
 	if l.doh_open {
 		net.close(l.doh_socket)
+	}
+	if l.metrics_open {
+		net.close(l.metrics_socket)
 	}
 	conn_manager_shutdown(&l.conns)
 	tlsx.context_destroy(l.dot_ctx)
@@ -153,6 +170,10 @@ destroy_listeners :: proc(l: ^Listeners) {
 	}
 	delete(l.stream_loop_ctx)
 	l.stream_loop_ctx = nil
+	if l.metrics_loop_ctx != nil {
+		free(l.metrics_loop_ctx)
+		l.metrics_loop_ctx = nil
+	}
 }
 
 // --- UDP ------------------------------------------------------------------
@@ -180,7 +201,7 @@ start_udp :: proc(s: ^Server, l: ^Listeners) -> bool {
 	}
 	socket, err := net.make_bound_udp_socket(endpoint.address, endpoint.port)
 	if err != nil {
-		report_bind_failure("udp", cfg.address, cfg.port, err)
+		report_bind_failure("listeners.udp", cfg.address, cfg.port, err)
 		return false
 	}
 	// A large receive buffer absorbs query bursts that arrive while every
@@ -614,7 +635,7 @@ start_stream_listener :: proc(
 	}
 	sock, err := net.listen_tcp(endpoint)
 	if err != nil {
-		report_bind_failure(name, cfg.address, cfg.port, err)
+		report_bind_failure(fmt.tprintf("listeners.%s", name), cfg.address, cfg.port, err)
 		return false
 	}
 	// So the accept loop below wakes up now and then and can see `stop`.

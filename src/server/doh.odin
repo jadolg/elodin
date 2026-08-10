@@ -264,37 +264,37 @@ serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 @(private)
 serve_doh_request :: proc(s: ^Server, conn: Conn, req: Http_Request_In, path: string, client: string) -> bool {
 	if req.path != path {
-		return send_http_error(conn, 404, "not found", req.keep_alive)
+		return send_http_error(conn, "doh", 404, "not found", req.keep_alive)
 	}
 
 	query: []u8
 	switch {
 	case req.method == "POST":
 		if req.content_type != "" && !strings.has_prefix(req.content_type, DOH_CONTENT_TYPE) {
-			return send_http_error(conn, 415, "unsupported media type", req.keep_alive)
+			return send_http_error(conn, "doh", 415, "unsupported media type", req.keep_alive)
 		}
 		query = req.body
 	case req.method == "GET":
 		encoded, found := query_param(req.query, "dns")
 		if !found {
-			return send_http_error(conn, 400, "missing dns parameter", req.keep_alive)
+			return send_http_error(conn, "doh", 400, "missing dns parameter", req.keep_alive)
 		}
 		decoded, dok := decode_dns_param(encoded)
 		if !dok || len(decoded) == 0 {
-			return send_http_error(conn, 400, "malformed dns parameter", req.keep_alive)
+			return send_http_error(conn, "doh", 400, "malformed dns parameter", req.keep_alive)
 		}
 		query = decoded
 	case:
-		return send_http_error(conn, 405, "method not allowed", req.keep_alive)
+		return send_http_error(conn, "doh", 405, "method not allowed", req.keep_alive)
 	}
 
 	if len(query) < dns.HEADER_SIZE {
-		return send_http_error(conn, 400, "message too short", req.keep_alive)
+		return send_http_error(conn, "doh", 400, "message too short", req.keep_alive)
 	}
 
 	response, _, ok := handle_query(s, query, .DoH, client, context.temp_allocator)
 	if !ok || len(response) == 0 {
-		return send_http_error(conn, 500, "no response", req.keep_alive)
+		return send_http_error(conn, "doh", 500, "no response", req.keep_alive)
 	}
 
 	// Cache-Control mirrors the smallest TTL so intermediaries expire the
@@ -380,8 +380,11 @@ query_param :: proc(query: string, name: string) -> (value: string, found: bool)
 	return "", false
 }
 
+// `who` names the endpoint in the debug line. Both HTTP endpoints this server
+// has - DoH and the metrics one - refuse requests the same way, and a log line
+// that named only one of them would send an operator to the wrong port.
 @(private)
-send_http_error :: proc(conn: Conn, status: int, message: string, keep_alive: bool) -> bool {
+send_http_error :: proc(conn: Conn, who: string, status: int, message: string, keep_alive: bool) -> bool {
 	b := strings.builder_make(context.temp_allocator)
 	strings.write_string(&b, "HTTP/1.1 ")
 	strings.write_int(&b, status)
@@ -395,6 +398,6 @@ send_http_error :: proc(conn: Conn, status: int, message: string, keep_alive: bo
 	strings.write_string(&b, message)
 	strings.write_byte(&b, '\n')
 
-	logx.debugf("doh: replying %d %s", status, message)
+	logx.debugf("%s: replying %d %s", who, status, message)
 	return conn_write_all(conn, transmute([]u8)strings.to_string(b)) && keep_alive
 }

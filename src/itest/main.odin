@@ -171,6 +171,9 @@ main :: proc() {
 	run_cookie_cases(&r)
 	run_upstream_cookie_cases(&r)
 
+	section(&r, "metrics")
+	run_metrics_cases(&r)
+
 	elapsed := time.diff(started, time.now())
 	report(&r, elapsed)
 

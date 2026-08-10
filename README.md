@@ -274,12 +274,17 @@ spaces in it. In Loki that is `| logfmt` and nothing else:
 {job="elodin"} | logfmt | msg="stats" | unwrap cache_hits
 ```
 
-There is no metrics endpoint. Statistics go to the log every five minutes, as
-`msg=stats` — `queries`, `blocked`, `cached`, `forwarded`, `failed`, `dropped`,
-`refused`, `conn_refused`, `conn_failed`, `limited`, `truncated`, `secure` and
-`bogus`, plus `cache_entries`, `cache_bytes`, `cache_hits`, `cache_misses` and
+Statistics go to the log every five minutes, as `msg=stats` — `queries`,
+`blocked`, `cached`, `forwarded`, `failed`, `dropped`, `refused`,
+`conn_refused`, `conn_failed`, `limited`, `truncated`, `secure` and `bogus`,
+plus `cache_entries`, `cache_bytes`, `cache_hits`, `cache_misses` and
 `cache_evictions` — and `log.queries` adds one `msg=query` line per query, at
 the cost noted under [Resource use](#resource-use).
+
+The same numbers, and what the kernel knows about the process besides, are
+available to a scraper once [`metrics.enabled`](#metrics) is set. It is off by
+default, and it is the same counters either way: the endpoint adds nothing to
+the path a query takes.
 
 A query name is the one field in that line whose bytes a client chooses. It is
 escaped like any other value, so a label holding a quote or a newline stays
@@ -850,6 +855,92 @@ rewrites:
 
 Wildcards match subdomains only, so `*.lan` covers `host.lan` but not `lan`.
 
+### Metrics
+
+```yaml
+metrics:
+  enabled: true
+  address: "127.0.0.1"   # loopback by default
+  port: 9153             # the port CoreDNS uses for the same thing
+  path: /metrics
+```
+
+Off by default, and nothing is bound until it is turned on: a resolver that
+opens a port nobody wrote in a file has widened an operator's exposure on their
+behalf. The endpoint speaks plain HTTP and serves the Prometheus text exposition
+format, version 0.0.4.
+
+```
+scrape_configs:
+  - job_name: elodin
+    static_configs:
+      - targets: ["127.0.0.1:9153"]
+```
+
+**It is not on the path a query takes.** Every number it publishes is a counter
+the resolver already maintains for the `msg=stats` line, read at scrape time
+from the atomic it already lives in, so turning the endpoint on adds no work per
+query and turning it off removes none. There is no latency histogram and no
+per-name label, because both would mean measuring on the path being measured.
+The isolation is structural rather than a promise: the endpoint has one thread
+of its own, never queues work on either worker pool, never spawns a thread per
+connection — so nothing reaching this port can spend the budget
+`server.max_connections` keeps for clients — and answers one request per
+connection before closing, so a scraper holding a socket open cannot keep the
+next scrape out. Two scrapers at once are served one after the other.
+
+It binds loopback by default rather than the `0.0.0.0` the DNS listeners use.
+Nothing here is a secret in the way an answer is, but together these numbers
+describe a network — how much it queries, how much of that is blocked, which
+upstreams are reachable — and there is no authentication in front of them. A
+bind beyond loopback is logged as a warning at startup, once.
+
+| metric | type | what it is |
+|---|---|---|
+| `elodin_build_info{version}` | gauge | a constant 1, carrying the version as a label |
+| `elodin_uptime_seconds` | gauge | seconds since this process finished starting |
+| `elodin_queries_total` | counter | queries accepted, whatever became of them |
+| `elodin_answers_total{outcome}` | counter | `forwarded`, `cached`, `blocked`, `rewritten`, `failed` — the same words the `msg=query` line uses |
+| `elodin_queries_dropped_total` | counter | turned away before any work: the backlog was full, or the source could not be answered |
+| `elodin_queries_refused_total` | counter | turned away by `server.allow_from` |
+| `elodin_connections_refused_total` | counter | refused because `server.max_connections` was full |
+| `elodin_connections_failed_total` | counter | refused because the OS would not start a thread |
+| `elodin_connections_active` / `_max` | gauge | connection threads in use, and what the limit allows |
+| `elodin_rate_limited_total` | counter | queries the rate limiter withheld an answer from |
+| `elodin_rate_limit_slipped_total` | counter | those answered truncated instead, to send a real client to TCP |
+| `elodin_dnssec_answers_total{result}` | counter | `secure` and `bogus` |
+| `elodin_cache_entries` / `_bytes` | gauge | what the cache holds, against `max_entries` and `max_bytes` |
+| `elodin_cache_hits_total` / `_misses_total` / `_evictions_total` | counter | how it is doing |
+| `elodin_filter_rules{list}` | gauge | rules loaded, `block` and `allow` |
+| `elodin_upstream_queries_total{upstream}` | counter | queries sent to each upstream, by its configured name |
+| `elodin_upstream_failures_total{upstream}` | counter | exchanges that produced no usable answer |
+| `elodin_upstream_latency_seconds_total{upstream}` | counter | cumulative round-trip time; divide by the query counter under `rate()` for the mean over a window |
+| `elodin_upstream_up{upstream}` | gauge | 0 while an upstream is in its failure cooldown |
+| `elodin_pool_workers{pool}` / `elodin_pool_pending{pool}` | gauge | the `query` and `upstream` pools; `pending` that does not return to zero is `server.workers` set too low |
+| `process_cpu_seconds_total` | counter | user plus system CPU |
+| `process_resident_memory_bytes` / `_virtual_memory_bytes` | gauge | from `/proc/self/stat` |
+| `process_threads`, `process_open_fds`, `process_max_fds` | gauge | thread and descriptor counts |
+| `process_start_time_seconds` | gauge | when this process began serving |
+
+The `process_` family carries the names every Prometheus client library uses for
+these, deliberately: a dashboard or an alert written against a Go or a Python
+service works here without being told it is looking at something else.
+
+`elodin_answers_total` does not sum to `elodin_queries_total`. A query the
+backlog or the allow list turned away never reached an outcome — that is
+`dropped` and `refused` — and one answered from a local zone is not counted
+apart from the rest.
+
+Useful starting points:
+
+```promql
+sum(rate(elodin_queries_total[5m]))
+sum by (outcome) (rate(elodin_answers_total[5m]))
+rate(elodin_cache_hits_total[5m]) / rate(elodin_queries_total[5m])
+rate(elodin_upstream_latency_seconds_total[5m]) / rate(elodin_upstream_queries_total[5m])
+min by (upstream) (elodin_upstream_up) == 0
+```
+
 ## What is implemented
 
 Queries of any type are answered: A, AAAA, CNAME, MX, TXT, SRV, SOA, NS, PTR,
@@ -1144,6 +1235,7 @@ src/h2/        HTTP/2 framing, HPACK, and the server connection state machine
 src/tlsx/      OpenSSL bindings and a small TLS wrapper
 src/pool/      worker pool
 src/logx/      logging, in logfmt
+src/metrics/   Prometheus exposition format, and process figures out of /proc
 src/privdrop/  giving up root once the listeners hold their ports
 src/itest/     integration suite: harness, mock upstreams (DNS, HTTP, DoH/h2), clients, fixtures
 bench/         benchmark harness and DNSSEC survey, in Go, with committed results
@@ -1162,16 +1254,16 @@ Two layers, both run by `mise run verify`. A third, `mise run bench`, measures
 rather than asserts: it is where every number in [Capacity](#capacity) comes
 from, and it is documented in [`bench/README.md`](bench/README.md).
 
-**Unit tests** (`mise run test`, 162 cases) cover the message codec — round trips
+**Unit tests** (`mise run test`, 384 cases) cover the message codec — round trips
 for every modelled RDATA type, compression, truncation, EDNS, pointer loops,
 hostile record counts — plus the YAML parser, configuration loading, list
 parsing and matching, the cache, and the HTTP/2 codec — the HPACK cases run the
 worked examples from RFC 7541 appendix C, so the codec is checked against the
 specification's own vectors rather than against itself.
 
-They run per package, so a failure names one: `dns` 16, `yaml` 9, `config` 10,
-`filter` 8, `privdrop` 9, `cache` 10, `dnssec` 37, `tlsx` 4, `upstream` 15,
-`h2` 30, `server` 14. Much of `tlsx`, `upstream`, `h2` and `server` is what the
+They run per package, so a failure names one: `dns` 34, `yaml` 34, `config` 54,
+`filter` 8, `logx` 1, `metrics` 9, `privdrop` 9, `cache` 13, `dnssec` 37,
+`tlsx` 5, `upstream` 30, `h2` 67, `server` 83. Much of `tlsx`, `upstream`, `h2` and `server` is what the
 suite grew for the bugs recorded below — the HTTP reader's framing and body limits,
 the TLS handshake retry, the HTTP/2 stream table under RST_STREAM, and the DoH
 request parser read against an allocator that scribbles over what it releases.
@@ -1193,7 +1285,7 @@ denial is checked against, and a response built to make one question cost as man
 upstream lookups as possible. Each was checked against the code as it stood
 before the fix, so they are known to fail when the property they guard does.
 
-**Integration tests** (`mise run itest`, 135 cases, ~25s) start the built binary
+**Integration tests** (`mise run itest`, 185 cases, ~50s) start the built binary
 as a separate process against scripted mock upstreams, so what is exercised is
 the artefact that ships rather than the library it was compiled from. The suite
 is hermetic: no public resolver is contacted, ports are allocated from a private
@@ -1223,6 +1315,7 @@ What it covers:
 | upstreams | failover, round-robin, race, health cooldown, TCP and DoT clients, connection pooling, UDP→TCP retry, total outage → SERVFAIL |
 | blocklist downloads | two lists fetched over HTTP and both applied, written to the cache directory, reused on restart without re-fetching, unwritable cache directory degrades to a warning |
 | DNSSEC | an answer with no chain of trust is refused rather than served, the forwarded query carries DO and CD, a CD client is served unvalidated, the refusal carries an extended DNS error, and none of it happens unless it is configured |
+| metrics | no port is open unless the configuration asks for one, a scrape reports the queries that actually went through and the process figures out of `/proc`, the configured path is the only one served, and anything else is a 404 or a 405 |
 
 `src/itest/fixtures.odin` holds real DNS responses captured from a public
 resolver, including compression pointers, DNSSEC records and types the codec

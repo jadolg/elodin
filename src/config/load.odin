@@ -58,6 +58,7 @@ load_string :: proc(src: string, allocator := context.allocator) -> (cfg: Config
 	load_blocking(&l, &cfg)
 	load_dnssec(&l, &cfg)
 	load_cookies(&l, &cfg)
+	load_metrics(&l, &cfg)
 	load_rewrites(&l, &cfg)
 	validate(&l, &cfg)
 
@@ -737,6 +738,18 @@ load_cookies :: proc(l: ^Loader, cfg: ^Config) {
 }
 
 @(private)
+load_metrics :: proc(l: ^Loader, cfg: ^Config) {
+	n := yaml.get(l.root, "metrics")
+	if n == nil {
+		return
+	}
+	opt_bool(l, n, "enabled", &cfg.metrics.enabled, "metrics")
+	opt_string(l, n, "address", &cfg.metrics.address, "metrics")
+	opt_int(l, n, "port", &cfg.metrics.port, "metrics")
+	opt_string(l, n, "path", &cfg.metrics.path, "metrics")
+}
+
+@(private)
 load_rewrites :: proc(l: ^Loader, cfg: ^Config) {
 	entries := yaml.items(yaml.get(l.root, "rewrites"))
 	if len(entries) == 0 {
@@ -851,6 +864,21 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 
 	if cfg.listeners.doh.enabled && !strings.has_prefix(cfg.listeners.doh.path, "/") {
 		errorf(l, "listeners.doh.path: must start with '/'")
+	}
+
+	if cfg.metrics.enabled {
+		if !strings.has_prefix(cfg.metrics.path, "/") {
+			errorf(l, "metrics.path: must start with '/'")
+		}
+		// Port 0 binds and works, on whichever port the kernel picked - which
+		// nothing can be told to scrape. Refused here rather than left as an
+		// endpoint that comes up and is never reached.
+		if cfg.metrics.port < 1 || cfg.metrics.port > 65535 {
+			errorf(l, "metrics.port: must be between 1 and 65535")
+		}
+		if net.parse_address(cfg.metrics.address) == nil {
+			errorf(l, "metrics.address: %q is not an IP address", cfg.metrics.address)
+		}
 	}
 
 	for spec in cfg.upstream.servers {

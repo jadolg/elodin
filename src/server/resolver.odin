@@ -103,6 +103,11 @@ Server :: struct {
 	handler_pool: ^pool.Pool,
 	race_pool:    ^pool.Pool,
 	stats:        Stats,
+	// When this process began serving. Not a setting and not a counter: the
+	// metrics endpoint reports uptime from it, and Prometheus's
+	// `process_start_time_seconds` is what every client library calls the same
+	// thing.
+	started:      time.Time,
 	running:      bool,
 }
 

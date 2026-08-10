@@ -506,3 +506,42 @@ header_int :: proc(head: string, name: string) -> int {
 header_contains :: proc(head: string, needle: string) -> bool {
 	return strings.contains(strings.to_lower(head, context.temp_allocator), strings.to_lower(needle, context.temp_allocator))
 }
+
+// --- plain HTTP -----------------------------------------------------------
+
+/*
+One HTTP/1.1 request over plain TCP.
+
+The metrics endpoint is the only thing this server speaks HTTP to without TLS in
+front of it, so this is `http_roundtrip` without the handshake. It answers one
+request per connection and closes, which is why nothing here tries to reuse the
+socket.
+*/
+http_request :: proc(port: int, method: string, target: string, allocator := context.allocator) -> Http_Result {
+	socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = port})
+	if err != nil {
+		return {}
+	}
+	defer net.close(socket)
+	_ = net.set_option(socket, .Receive_Timeout, CLIENT_TIMEOUT)
+	_ = net.set_option(socket, .Send_Timeout, CLIENT_TIMEOUT)
+
+	conn := Test_Conn {
+		socket = socket,
+	}
+	if !conn_write(&conn, build_http_request(method, target, "", nil)) {
+		return {}
+	}
+	return read_http_response(&conn, allocator)
+}
+
+// Whether anything is listening at all, which is what the "off by default" case
+// is asking.
+tcp_port_open :: proc(port: int) -> bool {
+	socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = port})
+	if err != nil {
+		return false
+	}
+	net.close(socket)
+	return true
+}
