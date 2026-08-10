@@ -342,6 +342,7 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 		filters      = filters,
 		handler_pool = handler_pool,
 		race_pool    = race_pool,
+		started      = time.now(),
 		running      = true,
 	}
 

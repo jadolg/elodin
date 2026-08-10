@@ -397,6 +397,32 @@ Rate_Limit_Config :: struct {
 	slip:                 int,
 }
 
+/*
+The Prometheus endpoint.
+
+Off, because a resolver that opens a second port nobody asked for is a resolver
+that has widened its own attack surface on an operator's behalf. Everything it
+would serve is already in the `msg=stats` log line, so nothing is lost by
+leaving it off, and turning it on costs the process one thread and whatever a
+scrape reads.
+
+`address` defaults to loopback rather than to the `0.0.0.0` the DNS listeners
+use. These numbers are not secret in the way an answer is, but they do describe
+a network - query rates, block rates, which upstreams are up - and there is no
+authentication in front of them, so the default is the interface a local scraper
+or a sidecar reaches and nothing else. Binding it wider is a deliberate act and
+is said so in the log.
+
+9153 is the port CoreDNS uses for the same thing, which is what a scrape config
+in an existing cluster already expects.
+*/
+Metrics_Config :: struct {
+	enabled: bool,
+	address: string,
+	port:    int,
+	path:    string,
+}
+
 Config :: struct {
 	log:       Log_Config,
 	server:    Server_Config,
@@ -406,6 +432,7 @@ Config :: struct {
 	blocking:  Blocking_Config,
 	dnssec:    Dnssec_Config,
 	cookies:   Cookie_Config,
+	metrics:   Metrics_Config,
 	rewrites:  []Rewrite,
 }
 
@@ -497,6 +524,12 @@ default_config :: proc() -> Config {
 		enabled  = true,
 		require  = false,
 		upstream = true,
+	}
+	c.metrics = Metrics_Config {
+		enabled = false,
+		address = "127.0.0.1",
+		port    = 9153,
+		path    = "/metrics",
 	}
 	return c
 }

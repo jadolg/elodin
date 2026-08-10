@@ -77,3 +77,11 @@ dnssec:
 rewrites:
   - domain: nas.home
     answer: 192.168.1.50
+
+# Off by default; on here so `curl localhost:9153/metrics` works while
+# developing.
+metrics:
+  enabled: true
+  address: "127.0.0.1"
+  port: 9153
+  path: /metrics

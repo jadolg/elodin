@@ -291,3 +291,23 @@ rewrites:
     answer: new.example.com       # a name becomes a CNAME
   - domain: telemetry.example.com
     answer: block                 # answered as if it were on a blocklist
+
+# Prometheus. Off by default: a resolver that opens a port nobody asked for has
+# widened your exposure on your behalf.
+#
+# Everything it publishes is a counter the resolver keeps anyway for the
+# `msg=stats` log line, read at scrape time, so this costs nothing per query
+# either way. See the README for what is on the page.
+metrics:
+  enabled: false
+
+  # Loopback rather than the 0.0.0.0 the listeners above use. These numbers are
+  # not secret the way an answer is, but together they describe a network, and
+  # there is nothing authenticating the scraper. Binding wider is logged as a
+  # warning at startup.
+  address: "127.0.0.1"
+
+  # 9153 is the port CoreDNS uses for the same thing, so an existing scrape
+  # config already expects it.
+  port: 9153
+  path: /metrics
