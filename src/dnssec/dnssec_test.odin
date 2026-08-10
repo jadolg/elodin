@@ -1158,3 +1158,91 @@ test_unverifiable_algorithm_in_an_unsigned_zone_is_insecure :: proc(t: ^testing.
 	testing.expect_value(t, downgrade_status(.Insecure), Status.Insecure)
 	free_all(context.temp_allocator)
 }
+
+// ---------------------------------------------------------------------------
+// Upstream failures during the walk
+// ---------------------------------------------------------------------------
+
+@(private = "file")
+Failing_Lookup :: struct {
+	name:  string,
+	type:  dns.Type,
+	rcode: dns.Rcode,
+}
+
+// A response carrying nothing but the question and an rcode, the way an
+// upstream that cannot answer replies.
+@(private = "file")
+failure_wire :: proc(name: string, type: dns.Type, rcode: dns.Rcode, allocator: mem.Allocator) -> []u8 {
+	question := make([]dns.Question, 1, allocator)
+	question[0] = dns.Question {
+		name  = name,
+		type  = type,
+		class = .IN,
+	}
+	msg := dns.Message {
+		question = question,
+	}
+	msg.flags.qr = true
+	msg.flags.rd = true
+	msg.flags.ra = true
+	msg.flags.rcode = u8(rcode) & 0xf
+
+	wire, _, err := dns.encode_message(msg, allocator)
+	if err != .None {
+		return nil
+	}
+	return wire
+}
+
+@(private = "file")
+failing_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> ([]u8, bool) {
+	fail := cast(^Failing_Lookup)ctx
+	if type == fail.type && dns.name_equal_fold(name, fail.name) {
+		return failure_wire(name, type, fail.rcode, allocator), true
+	}
+	return fixture_query(nil, name, type, allocator)
+}
+
+@(private = "file")
+walk_with_failure :: proc(name: string, type: dns.Type, rcode: dns.Rcode) -> Status {
+	fail := Failing_Lookup {
+		name  = name,
+		type  = type,
+		rcode = rcode,
+	}
+	v := make_validator(failing_query, &fail, Options{})
+	defer destroy_validator(v)
+
+	status, _, _ := trust(v, "www.example.com.")
+	return status
+}
+
+/*
+An upstream that answers a DS lookup with an error has said nothing about the
+delegation.
+
+SERVFAIL and REFUSED carry no records, so the walk finds no DS and no denial of
+existence - which reads exactly like a delegation whose proof was stripped.
+Calling that bogus turns every upstream hiccup into a forgery report and a
+SERVFAIL the client is told was a DNSSEC failure; the chain is merely
+unavailable, which is what `validate` itself concludes for the same rcodes on
+the response being validated.
+*/
+@(test)
+test_ds_lookup_failure_is_indeterminate :: proc(t: ^testing.T) {
+	testing.expect_value(t, walk_with_failure("com.", .DS, .Serv_Fail), Status.Indeterminate)
+	free_all(context.temp_allocator)
+	testing.expect_value(t, walk_with_failure("com.", .DS, .Refused), Status.Indeterminate)
+	free_all(context.temp_allocator)
+}
+
+// The same for the DNSKEY half of a step: an error there leaves the zone's keys
+// unknown rather than proving the zone lied about them.
+@(test)
+test_dnskey_lookup_failure_is_indeterminate :: proc(t: ^testing.T) {
+	testing.expect_value(t, walk_with_failure("example.com.", .DNSKEY, .Serv_Fail), Status.Indeterminate)
+	free_all(context.temp_allocator)
+	testing.expect_value(t, walk_with_failure(".", .DNSKEY, .Refused), Status.Indeterminate)
+	free_all(context.temp_allocator)
+}
