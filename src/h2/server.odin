@@ -693,12 +693,20 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	}
 
 	sync.mutex_lock(&c.mu)
-	// RFC 9113 5.1: a stream id past the highest one this connection has ever
-	// opened is idle, and idle only accepts HEADERS or PRIORITY - DATA on one
-	// is a connection error of type PROTOCOL_ERROR, the same as stream 0. Left
-	// unchecked, a peer can drive an unbounded run of connection WINDOW_UPDATE
-	// writes with DATA on stream ids that were never opened.
-	if h.stream_id > c.last_stream_id {
+	/*
+	RFC 9113 5.1: a stream id past the highest one this connection has ever
+	opened is idle, and idle only accepts HEADERS or PRIORITY - DATA on one
+	is a connection error of type PROTOCOL_ERROR, the same as stream 0. Left
+	unchecked, a peer can drive an unbounded run of connection WINDOW_UPDATE
+	writes with DATA on stream ids that were never opened.
+
+	An even id is idle too, whatever `last_stream_id` is: `handle_headers`
+	rejects one outright, so this server can never have opened one, and
+	without this half a DATA frame on one below `last_stream_id` fell through
+	to the closed-stream path instead - a connection error misanswered as a
+	stream error, and one that spent the closed-stream budget doing it.
+	*/
+	if h.stream_id > c.last_stream_id || h.stream_id % 2 == 0 {
 		sync.mutex_unlock(&c.mu)
 		goaway(c, .Protocol_Error)
 		return false

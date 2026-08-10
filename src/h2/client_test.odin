@@ -1699,6 +1699,115 @@ test_client_rst_stream_on_stream_zero_is_a_connection_error :: proc(t: ^testing.
 	}
 }
 
+/*
+`client_send_body`'s `s.done` branch read `rst_sent` to decide whether to
+send RST(NO_ERROR), but never set it - so the RST it just sent did not
+suppress the next one. `client_handle_data`'s `already_ended` is still true
+here via `s.done` alone, and its own `need_rst` needed `rst_sent` to stay
+false to fire again: a DATA frame the peer already had in flight then drew a
+second RST_STREAM(STREAM_CLOSED) on a stream this end had just closed with
+RST_STREAM(NO_ERROR) - which RFC 9113 5.1 forbids.
+*/
+@(test)
+test_client_send_body_early_response_rst_suppresses_a_later_one :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Client_Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+
+	s := new(Client_Stream, allocator)
+	s.id = 1
+	s.send_window = c.peer_initial_window
+	s.body = make([dynamic]u8, 0, 8, allocator)
+	s.status = 413
+	s.done = true
+	c.streams[1] = s
+
+	clear(&log.frames)
+	body := []u8{1, 2, 3, 4}
+	sent := client_send_body(c, s, body, time.time_add(time.now(), time.Second))
+	testing.expect(t, sent, "an early response should stop the upload successfully")
+	testing.expect(t, s.rst_sent, "client_send_body's own RST(NO_ERROR) did not mark the stream rst_sent")
+
+	// The DATA frame the peer already had in flight when it answered early.
+	clear(&log.frames)
+	extra := []u8{'x'}
+	dok := client_handle_data(c, Frame_Header{length = len(extra), type = .Data, stream_id = 1}, extra)
+	testing.expect(t, dok, "DATA in flight when the response arrived should still be a stream error, not a connection error")
+	for f in log.frames {
+		testing.expectf(t, f.type != .Rst_Stream, "a second RST_STREAM was sent on a stream already closed with RST(NO_ERROR)")
+	}
+
+	delete(log.frames)
+	client_stream_destroy(c, s)
+	delete_key(&c.streams, u32(1))
+	client_unref(c)
+	free_all(context.temp_allocator)
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "client send body early response rst: %d bytes leaked at %v", entry.size, entry.location)
+	}
+}
+
+/*
+The flow-control deadline path (client.odin:946) sends RST(.Cancel) but left
+`s.done`, `s.reset`, and `s.rst_sent` all false - so a DATA frame the peer
+already had in flight took the ordinary append path in `client_handle_data`
+instead of `already_ended`: bytes appended to `s.body`, and a stream-level
+WINDOW_UPDATE written, both on a stream this end had already reset. RFC 9113
+5.1 forbids sending or, implicitly, accepting anything but PRIORITY on a
+stream closed with RST_STREAM.
+*/
+@(test)
+test_client_send_body_flow_control_timeout_rst_is_not_forgotten :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Client_Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+
+	s := new(Client_Stream, allocator)
+	s.id = 1
+	s.send_window = 0
+	c.send_window = 0
+	s.body = make([dynamic]u8, 0, 8, allocator)
+	c.streams[1] = s
+
+	clear(&log.frames)
+	body := []u8{1, 2, 3, 4}
+	sent := client_send_body(c, s, body, time.time_add(time.now(), -time.Second))
+	testing.expect(t, !sent, "client_send_body should give up once the deadline has passed")
+	testing.expect(t, s.rst_sent, "the flow-control timeout's own RST(.Cancel) did not mark the stream rst_sent")
+
+	// The DATA frame the peer already had in flight when the timeout fired.
+	clear(&log.frames)
+	extra := []u8{'x'}
+	dok := client_handle_data(c, Frame_Header{length = len(extra), type = .Data, stream_id = 1}, extra)
+	testing.expect(t, dok, "DATA in flight when the timeout fired should still be a stream error, not a connection error")
+	testing.expect_value(t, len(s.body), 0)
+	for f in log.frames {
+		testing.expectf(t, f.type != .Rst_Stream, "a second RST_STREAM was sent on a stream already reset by the flow-control timeout")
+		testing.expectf(t, !(f.type == .Window_Update && f.stream_id == 1), "a stream-level WINDOW_UPDATE was written on a stream this end had reset")
+	}
+
+	delete(log.frames)
+	client_stream_destroy(c, s)
+	delete_key(&c.streams, u32(1))
+	client_unref(c)
+	free_all(context.temp_allocator)
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "client send body flow control timeout rst: %d bytes leaked at %v", entry.size, entry.location)
+	}
+}
+
 @(private = "file")
 write_nothing :: proc(user: rawptr, buf: []u8) -> bool {
 	return true

@@ -388,6 +388,51 @@ test_data_on_an_idle_stream_is_rejected :: proc(t: ^testing.T) {
 }
 
 /*
+`handle_headers` rejects an even stream id outright (server.odin:495 area) -
+this server can never have opened one - so an even id is idle regardless of
+where `last_stream_id` sits, the same reasoning `client_handle_data`'s
+parity check already applies. The `> last_stream_id` test alone missed it:
+DATA on stream 2 after the peer opened stream 3 fell through to the
+closed-stream path instead, spending a slot of `closed_stream_rst_budget` to
+answer a connection error as a stream error.
+*/
+@(test)
+test_data_on_an_even_stream_is_rejected :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 3}, block)
+	testing.expect(t, ok, "handle_headers failed")
+
+	clear(&log.frames)
+	body := []u8{'x'}
+	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 2}, body)
+	testing.expect(t, !dok, "DATA on an even (never-opened) stream was accepted")
+	testing.expect_value(t, c.closed_stream_rst_budget, MAX_CLOSED_STREAM_RST)
+
+	saw_goaway := false
+	for f in log.frames {
+		if f.type == .Goaway {
+			saw_goaway = true
+		}
+	}
+	testing.expect(t, saw_goaway, "no GOAWAY was sent for DATA on an even stream")
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "data on an even stream")
+}
+
+/*
 RFC 9113 5.1: a stream id at or below `last_stream_id` that is not in the
 table was opened and has since closed - a stream error of type STREAM_CLOSED,
 distinct from the idle case above. `handle_data` fell through the ordinary

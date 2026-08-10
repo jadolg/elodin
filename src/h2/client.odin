@@ -558,14 +558,16 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 	sync.mutex_lock(&c.mu)
 	s, found := c.streams[stream_id]
 	/*
-	RFC 9113 5.1: once a stream is done or the peer has reset it, only
+	RFC 9113 5.1: once a stream is done, the peer has reset it, or this end
+	has itself reset it (`rst_sent` - see client_send_body), only
 	WINDOW_UPDATE, PRIORITY, and RST_STREAM are still allowed from it - a
 	second HEADERS block must not overwrite `s.status` out from under a
 	waiter that may already be reading it. Same one-shot RST_STREAM rule as
 	`client_handle_data`: skipped if the peer reset the stream itself (would
-	loop, RFC 9113 5.4.2), one-shot via `rst_sent` otherwise.
+	loop, RFC 9113 5.4.2), one-shot via `rst_sent` otherwise - already true
+	when `rst_sent` is what got this to `already_ended` in the first place.
 	*/
-	already_ended := found && (s.done || s.reset)
+	already_ended := found && (s.done || s.reset || s.rst_sent)
 	need_rst := already_ended && !s.reset && !s.rst_sent
 	if already_ended {
 		s.rst_sent = true
@@ -627,7 +629,8 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 		return false
 	}
 	/*
-	RFC 9113 5.1: once a stream is done or the peer has reset it, only
+	RFC 9113 5.1: once a stream is done, the peer has reset it, or this end
+	has itself reset it (`rst_sent` - see client_send_body), only
 	WINDOW_UPDATE, PRIORITY, and RST_STREAM are still allowed from it. The
 	caller may already be reading `s.body` as a finished response, so this is
 	refused rather than appended to it.
@@ -635,9 +638,10 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 	`need_rst` stays false once the peer has reset the stream itself -
 	answering their RST_STREAM with one of ours would loop (RFC 9113 5.4.2) -
 	and once `rst_sent` is set, so a peer that keeps sending after a `done`
-	violation draws its credit back without a fresh RST_STREAM each time.
+	violation, or after this end reset the stream itself, draws its credit
+	back without a fresh RST_STREAM each time.
 	*/
-	already_ended := found && (s.done || s.reset)
+	already_ended := found && (s.done || s.reset || s.rst_sent)
 	need_rst := already_ended && !s.reset && !s.rst_sent
 	if already_ended {
 		s.rst_sent = true
@@ -912,8 +916,14 @@ client_send_body :: proc(c: ^Client, s: ^Client_Stream, body: []u8, deadline: ti
 				// RFC 9113 5.1 forbids sending anything but PRIORITY on a stream
 				// already closed with RST_STREAM - so if `rst_sent` is already
 				// true, the RST_STREAM(STREAM_CLOSED) that set it stands in for
-				// this one and a second RST_STREAM must not follow it.
+				// this one and a second RST_STREAM must not follow it. Set here
+				// regardless, not just when `rst_needed`: this is the point this
+				// stream becomes reset from our side either way, and DATA still
+				// in flight from the peer must route through `already_ended` in
+				// client_handle_data/client_finish_headers instead of the
+				// ordinary append path, on a stream this end just closed.
 				rst_needed := !s.rst_sent
+				s.rst_sent = true
 				sync.mutex_unlock(&c.mu)
 				if rst_needed {
 					client_rst_stream(c, s.id, .No_Error)
@@ -938,6 +948,10 @@ client_send_body :: proc(c: ^Client, s: ^Client_Stream, body: []u8, deadline: ti
 			}
 			left := time.diff(time.now(), deadline)
 			if left <= 0 {
+				// Marked before the write, same as the s.done branch above: DATA
+				// the peer already had in flight must find this stream already
+				// reset from our side, not take the ordinary append path.
+				s.rst_sent = true
 				sync.mutex_unlock(&c.mu)
 				// Matches the response-wait timeout below: a peer that stops
 				// granting window and says nothing else is given up on the same
