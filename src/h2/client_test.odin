@@ -1378,6 +1378,54 @@ test_client_send_body_stops_once_the_stream_is_reset_by_us :: proc(t: ^testing.T
 	}
 }
 
+/*
+RFC 9113 8.1 explicitly allows a server to answer before it has read the
+whole request, if the answer does not depend on the rest - a 413 on an
+upload too large, a 401, a redirect. `client_send_body` treated `s.done` as a
+failure exactly like `s.reset`, so `client_request` (client.odin:809) read
+that as `.Timeout` and threw away a complete, valid response sitting right
+there in `s.status`/`s.body`. Stopping the upload once the answer is in is
+correct; reporting that as a failure is not.
+*/
+@(test)
+test_client_send_body_stops_successfully_on_an_early_response :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Client_Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+
+	s := new(Client_Stream, allocator)
+	s.id = 1
+	s.send_window = c.peer_initial_window
+	s.body = make([dynamic]u8, 0, 8, allocator)
+	s.status = 413
+	s.done = true
+	c.streams[1] = s
+
+	clear(&log.frames)
+	body := []u8{1, 2, 3, 4}
+	sent := client_send_body(c, s, body, time.time_add(time.now(), time.Second))
+	testing.expect(t, sent, "an early response should stop the upload successfully, not report it as a failure")
+	for f in log.frames {
+		testing.expectf(t, f.type != .Data, "a DATA frame was written after the response had already arrived complete")
+	}
+	testing.expect_value(t, s.status, 413)
+
+	delete(log.frames)
+	client_stream_destroy(c, s)
+	delete_key(&c.streams, u32(1))
+	client_unref(c)
+	free_all(context.temp_allocator)
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "client send body on early response: %d bytes leaked at %v", entry.size, entry.location)
+	}
+}
+
 @(private = "file")
 write_nothing :: proc(user: rawptr, buf: []u8) -> bool {
 	return true

@@ -853,12 +853,22 @@ client_send_body :: proc(c: ^Client, s: ^Client_Stream, body: []u8, deadline: ti
 		sync.mutex_lock(&c.mu)
 		chunk := 0
 		for {
-			// `done`: the response already arrived complete, so there is no one
-			// left to read the rest of this body. `rst_sent`: this connection has
-			// already answered a stream violation on this id with an RST_STREAM
-			// of its own - writing DATA after that is a frame on a stream we just
-			// reset.
-			if c.closed || s.reset || s.done || s.rst_sent {
+			/*
+			RFC 9113 8.1 lets a server answer before the request finishes
+			uploading, if the answer does not depend on the rest of it - a 413
+			on a body too large, a 401, a redirect. That response is already
+			sitting in `s.status`/`s.body`, so stopping here is success, not
+			failure: the caller in `client_request` goes straight to the wait
+			loop and returns it.
+			*/
+			if s.done {
+				sync.mutex_unlock(&c.mu)
+				return true
+			}
+			// `rst_sent`: this connection has already answered a stream
+			// violation on this id with an RST_STREAM of its own - writing DATA
+			// after that is a frame on a stream we just reset.
+			if c.closed || s.reset || s.rst_sent {
 				sync.mutex_unlock(&c.mu)
 				return false
 			}
