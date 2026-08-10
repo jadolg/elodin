@@ -330,6 +330,12 @@ Server_Config :: struct {
 	Zero derives it as `workers * 8`, which is about eight upstream round trips
 	of backlog whatever the worker count, so the queue stays a bounded delay
 	rather than a growing one.
+
+	It bounds the two transports that queue: UDP, whose read loop drops the
+	datagram, and DoH over HTTP/2, whose stream is answered 503 rather than
+	dropped - there is a client on an open connection there to tell. TCP, DoT
+	and HTTP/1.1 DoH answer on their own connection thread and are bounded by
+	`max_connections` instead.
 	*/
 	max_pending:      int,
 	/*

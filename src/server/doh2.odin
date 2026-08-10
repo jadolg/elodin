@@ -1,6 +1,7 @@
 package server
 
 import "core:strings"
+import "core:sync"
 import "elodin:dns"
 import "elodin:h2"
 import "elodin:logx"
@@ -19,6 +20,10 @@ Each request is handed to the query worker pool rather than answered on the
 connection's reader thread, so the two lookups a browser issues for one name run
 at the same time instead of one behind the other. Responses are written back
 under the connection's write lock and may complete in any order.
+
+Being the only transport that queues its work, it is also the only one that has
+to shed: past `server.max_pending` a request is answered 503 here instead of
+joining a backlog it would sit out. See `h2_handler`.
 */
 
 @(private)
@@ -80,6 +85,31 @@ serve_doh2 :: proc(s: ^Server, conn: ^tlsx.Conn, client: string) {
 @(private)
 h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	ctx := cast(^H2_Context)hc.user
+
+	/*
+	Shed rather than queue once the backlog is past what the workers can work
+	through, the same bound the UDP read loop applies before it queues.
+
+	This is the only transport that hands its work to the pool - the others
+	answer on their own connection thread, so `max_connections` is what bounds
+	them. Without this check the operator's backlog limit sheds UDP at a few
+	hundred while HTTP/2 queues up to `max_connections` x `MAX_CONCURRENT`
+	streams, each holding its buffered body, in front of it.
+
+	Answered rather than dropped: unlike a datagram, the stream is a client
+	sitting on an open connection, and 503 tells it to come back later instead
+	of leaving it to time out. The answer is built on the reader thread and must
+	not reset its arena - `h2.serve` is still working through the frame that
+	brought us here - which is why this does not go through `h2_job`.
+	*/
+	if limit := ctx.server.cfg.server.max_pending; limit > 0 {
+		if pool.pending(ctx.server.handler_pool) >= limit {
+			sync.atomic_add(&ctx.server.stats.dropped, 1)
+			h2.respond(hc, req.stream_id, h2_error(503, "server too busy"))
+			h2.request_destroy(hc, req)
+			return
+		}
+	}
 
 	job := new(H2_Job)
 	job.ctx = ctx
