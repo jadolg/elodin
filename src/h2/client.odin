@@ -427,6 +427,21 @@ client_handle_headers :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> boo
 		return false
 	}
 
+	/*
+	Same idle-stream rule as client_handle_data, and safe to answer before
+	HPACK decode for the same reason a connection error always is: a rejection
+	here ends the connection, so there is no later frame left that would need
+	the decoder still in step with the peer's encoder.
+	*/
+	sync.mutex_lock(&c.mu)
+	_, tracked := c.streams[h.stream_id]
+	idle := !tracked && (h.stream_id >= c.next_stream_id || h.stream_id % 2 == 0)
+	sync.mutex_unlock(&c.mu)
+	if idle {
+		client_goaway(c, .Protocol_Error)
+		return false
+	}
+
 	body, ok := strip_padding(payload, h.flags)
 	if !ok {
 		client_goaway(c, .Protocol_Error)
@@ -600,8 +615,13 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 	checked outright: a tracked stream is proof this end knows about it
 	regardless of where `next_stream_id` currently sits, and `found` is
 	needed below in any case.
+
+	This client allocates odd ids exclusively, and push is refused, so an
+	even id can never be legitimate here whatever `next_stream_id` is - the
+	`>= next_stream_id` half alone would miss stream 2 once a single request
+	has moved that bound past it.
 	*/
-	if !found && h.stream_id >= c.next_stream_id {
+	if !found && (h.stream_id >= c.next_stream_id || h.stream_id % 2 == 0) {
 		sync.mutex_unlock(&c.mu)
 		client_goaway(c, .Protocol_Error)
 		return false
@@ -889,8 +909,15 @@ client_send_body :: proc(c: ^Client, s: ^Client_Stream, body: []u8, deadline: ti
 			this end has already decided not to send.
 			*/
 			if s.done {
+				// RFC 9113 5.1 forbids sending anything but PRIORITY on a stream
+				// already closed with RST_STREAM - so if `rst_sent` is already
+				// true, the RST_STREAM(STREAM_CLOSED) that set it stands in for
+				// this one and a second RST_STREAM must not follow it.
+				rst_needed := !s.rst_sent
 				sync.mutex_unlock(&c.mu)
-				client_rst_stream(c, s.id, .No_Error)
+				if rst_needed {
+					client_rst_stream(c, s.id, .No_Error)
+				}
 				return true
 			}
 			// `rst_sent`: this connection has already answered a stream
@@ -912,6 +939,11 @@ client_send_body :: proc(c: ^Client, s: ^Client_Stream, body: []u8, deadline: ti
 			left := time.diff(time.now(), deadline)
 			if left <= 0 {
 				sync.mutex_unlock(&c.mu)
+				// Matches the response-wait timeout below: a peer that stops
+				// granting window and says nothing else is given up on the same
+				// way, and left the same courtesy RST_STREAM rather than holding
+				// the stream open at the peer for the rest of the connection.
+				client_rst_stream(c, s.id, .Cancel)
 				return false
 			}
 			sync.cond_wait_with_timeout(&c.cond, &c.mu, left)

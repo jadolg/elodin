@@ -975,6 +975,78 @@ test_reset_stream_is_retired :: proc(t: ^testing.T) {
 }
 
 /*
+RFC 9113 6.4: RST_STREAM's payload is exactly one 4-byte error code. The
+client's handle_frame checks this (client.odin:312-315); the server's did
+not, and read `c.streams[h.stream_id]` regardless of what the "payload" it
+never measured actually held.
+*/
+@(test)
+test_rst_stream_with_a_bad_frame_size_is_a_connection_error :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+
+	bad := []u8{0, 0, 8} // one byte short of an error code
+	ok := handle_frame(c, Frame_Header{length = len(bad), type = .Rst_Stream, stream_id = 1}, bad)
+	testing.expect(t, !ok, "a malformed RST_STREAM was accepted")
+
+	saw_goaway := false
+	for f in log.frames {
+		if f.type == .Goaway {
+			saw_goaway = true
+		}
+	}
+	testing.expect(t, saw_goaway, "no GOAWAY was sent for a malformed RST_STREAM")
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "rst_stream bad frame size")
+}
+
+/*
+RFC 9113 6.4: RST_STREAM always names a stream; stream 0 is a connection
+error of type PROTOCOL_ERROR, the same as every other frame this package
+checks for it. Unguarded, this looked up `c.streams[0]` - always a miss -
+and returned true as if a peer sending it meant nothing in particular.
+*/
+@(test)
+test_rst_stream_on_stream_zero_is_a_connection_error :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+
+	rst := []u8{0, 0, 0, 8} // CANCEL
+	ok := handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 0}, rst)
+	testing.expect(t, !ok, "RST_STREAM on stream 0 was accepted")
+
+	saw_goaway := false
+	for f in log.frames {
+		if f.type == .Goaway {
+			saw_goaway = true
+		}
+	}
+	testing.expect(t, saw_goaway, "no GOAWAY was sent for RST_STREAM on stream 0")
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "rst_stream on stream zero")
+}
+
+/*
 The consequence of not retiring them, which is what makes it worth more than a
 leak: two frames per stream and the connection stops accepting new ones.
 */

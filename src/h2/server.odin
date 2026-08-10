@@ -359,6 +359,10 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		return handle_data(c, h, payload)
 
 	case .Rst_Stream:
+		if h.stream_id == 0 || len(payload) != 4 {
+			goaway(c, .Protocol_Error if h.stream_id == 0 else .Frame_Size_Error)
+			return false
+		}
 		sync.mutex_lock(&c.mu)
 		orphaned := false
 		if s, found := c.streams[h.stream_id]; found {
@@ -366,10 +370,14 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 			s.state = .Closed
 			// Nobody is coming for this one. See `Stream.dispatched`.
 			orphaned = !s.dispatched
+			// Wakes a handler parked in write_body's no-credit wait; without this
+			// it sleeps out the full write_timeout on a stream already known
+			// dead. Inside `found`, unlike the already_ended path in handle_data:
+			// there is no stream here for an unmatched id to have parked anyone
+			// on, so broadcasting for one would only wake every other handler on
+			// the connection to recheck a state that has not changed for them.
+			sync.cond_broadcast(&c.cond)
 		}
-		// Wakes a handler parked in write_body's no-credit wait; without this it
-		// sleeps out the full write_timeout on a stream already known dead.
-		sync.cond_broadcast(&c.cond)
 		sync.mutex_unlock(&c.mu)
 		if orphaned {
 			close_stream(c, h.stream_id)
