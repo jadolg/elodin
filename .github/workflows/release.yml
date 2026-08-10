@@ -90,6 +90,14 @@ jobs:
             dist/elodin_*_${{ matrix.arch }}.deb \
             --clobber
 
+  publish-deb:
+    name: Publish deb to repository
+    # Runs once, after every arch's .deb has landed in the release. Triggering
+    # this per-matrix-job (as before) let a fast amd64 run kick off the deploy
+    # before arm64 had uploaded its .deb, publishing a repo missing a package.
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
       - name: Publish deb to repository
         run: |
             curl --fail -H "Authorization: ${{ secrets.DEPLOY_TOKEN }}" "https://smd.akiel.dev/hook?script=${{ secrets.DEPLOY_SCRIPT }}"
