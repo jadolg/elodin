@@ -1068,6 +1068,8 @@ status_text :: proc(status: int) -> string {
 		return "415"
 	case 500:
 		return "500"
+	case 503:
+		return "503"
 	}
 	return "500"
 }

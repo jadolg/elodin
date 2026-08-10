@@ -1,6 +1,7 @@
 package server
 
 import "core:strings"
+import "core:sync"
 import "elodin:dns"
 import "elodin:h2"
 import "elodin:logx"
@@ -19,6 +20,10 @@ Each request is handed to the query worker pool rather than answered on the
 connection's reader thread, so the two lookups a browser issues for one name run
 at the same time instead of one behind the other. Responses are written back
 under the connection's write lock and may complete in any order.
+
+Being the only transport that queues its work, it is also the only one that has
+to shed: past `server.max_pending` a request is answered 503 here instead of
+joining a backlog it would sit out. See `h2_handler`.
 */
 
 @(private)
@@ -89,10 +94,80 @@ h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	// The job outlives this call, so it needs its own reference; the pool may
 	// still be running it after the reader thread has gone.
 	h2.conn_ref(hc)
-	if !pool.submit(ctx.server.handler_pool, h2_job, job) {
+	/*
+	Shed rather than queue once the backlog is past what the workers can work
+	through, the same bound the UDP read loop applies before it queues.
+
+	This is the only transport that hands its work to the pool - the others
+	answer on their own connection thread, so `max_connections` is what bounds
+	them. Without this the operator's backlog limit sheds UDP at a few hundred
+	while HTTP/2 queues up to `max_connections` x `MAX_CONCURRENT` streams, each
+	holding its buffered body, in front of it.
+
+	`try_submit` rather than `pending` and then `submit`: there is a reader
+	thread per connection here, and a gap between the two is one all of them can
+	pass through at once.
+	*/
+	switch pool.try_submit(
+		ctx.server.handler_pool,
+		h2_job,
+		job,
+		ctx.server.cfg.server.max_pending,
+	) {
+	case .Accepted:
+	case .Full:
+		h2.conn_unref(hc)
+		free(job)
+		h2_shed(ctx, hc, req)
+	case .Stopped:
 		// Shutting down: answer inline rather than dropping the stream.
 		h2_answer(job)
 	}
+}
+
+/*
+Turn one request away, on the connection's reader thread.
+
+Answered rather than dropped: unlike a datagram, the stream is a client sitting
+on an open connection, and a status tells it to come back later instead of
+leaving it to time out.
+
+Answered with no body, which is the part that matters. A body goes out through
+`h2.write_body`, which parks on flow-control credit until the write timeout when
+the client is not reading - and this is the thread that would have read the
+WINDOW_UPDATE releasing it. Parking here stops the connection reading anything,
+including the WINDOW_UPDATEs that release pool workers already writing to it, so
+a shed that can stall the reader deepens the overload it exists to relieve.
+HEADERS are not flow-controlled, so a status on its own cannot park.
+
+Nothing is freed here beyond the request: this runs on the arena `h2.serve` is
+still working through, which is also why it is not reached through `h2_job`.
+*/
+@(private)
+h2_shed :: proc(ctx: ^H2_Context, hc: ^h2.Conn, req: ^h2.Request) {
+	// Counted as a query the server dropped only when it was going to be one. A
+	// request for some other path was never going to reach the resolver, and
+	// `dropped` counts refused queries rather than turned-away streams.
+	endpoint, _ := h2_split_path(req.path)
+	if endpoint == ctx.path {
+		sync.atomic_add(&ctx.server.stats.dropped, 1)
+	}
+	/*
+	Logged whatever the path, which the counter above is not: dropped= is a
+	figure about queries, and this is the line that says a 503 came from the
+	backlog rather than from a broken endpoint. Without it a shed off the DoH
+	path leaves no trace anywhere at all.
+
+	Nothing is released after it: `h2.serve` resets this arena between frames,
+	which is the same reason `h2_error` can format on this thread.
+	*/
+	logx.debugf(
+		"doh/h2: shedding a request from %s, server.max_pending (%d) is reached",
+		ctx.client,
+		ctx.server.cfg.server.max_pending,
+	)
+	h2.respond(hc, req.stream_id, h2.Response{status = 503})
+	h2.request_destroy(hc, req)
 }
 
 @(private)
@@ -130,14 +205,7 @@ h2_answer :: proc(data: rawptr) {
 
 @(private)
 build_h2_response :: proc(ctx: ^H2_Context, req: ^h2.Request) -> (resp: h2.Response, ok: bool) {
-	// The :path pseudo-header carries the query string too.
-	path := req.path
-	query := ""
-	if idx := strings.index_byte(path, '?'); idx >= 0 {
-		query = path[idx + 1:]
-		path = path[:idx]
-	}
-
+	path, query := h2_split_path(req.path)
 	if path != ctx.path {
 		return h2_error(404, "not found"), true
 	}
@@ -179,6 +247,15 @@ build_h2_response :: proc(ctx: ^H2_Context, req: ^h2.Request) -> (resp: h2.Respo
 			body = answer,
 		},
 		true
+}
+
+// The :path pseudo-header carries the query string too.
+@(private)
+h2_split_path :: proc(path: string) -> (endpoint: string, query: string) {
+	if idx := strings.index_byte(path, '?'); idx >= 0 {
+		return path[:idx], path[idx + 1:]
+	}
+	return path, ""
 }
 
 @(private)

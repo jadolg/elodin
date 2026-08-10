@@ -73,15 +73,42 @@ worker_loop :: proc(p: ^Pool) {
 }
 
 submit :: proc(p: ^Pool, fn: proc(data: rawptr), data: rawptr) -> bool {
+	return try_submit(p, fn, data, 0) == .Accepted
+}
+
+Submit_Result :: enum {
+	Accepted,
+	// The backlog was already at `limit`.
+	Full,
+	// The pool is shutting down and takes no more work.
+	Stopped,
+}
+
+/*
+Submit unless the backlog is already at `limit`, deciding and appending under
+one hold of the lock. A limit of zero or less is no limit.
+
+Asking `pending` and then calling `submit` is not the same thing: the gap
+between them is one every caller can pass through at once, and the callers are
+not one thread. DoH over HTTP/2 runs a reader thread per connection, so a
+synchronised burst can have `max_connections` of them each read a backlog one
+short of the limit and each add to it - a queue past the limit by as many
+threads as happened to be looking, which is the shape of load the limit is
+there for.
+*/
+try_submit :: proc(p: ^Pool, fn: proc(data: rawptr), data: rawptr, limit: int) -> Submit_Result {
 	sync.mutex_lock(&p.mu)
 	defer sync.mutex_unlock(&p.mu)
 	if !p.running {
-		return false
+		return .Stopped
+	}
+	if limit > 0 && p.pending >= limit {
+		return .Full
 	}
 	append(&p.queue, Job{fn = fn, data = data})
 	p.pending += 1
 	sync.cond_signal(&p.cond)
-	return true
+	return .Accepted
 }
 
 // Jobs queued or in flight. Used to shed load before the queue grows unbounded.

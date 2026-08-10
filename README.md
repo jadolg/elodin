@@ -1134,7 +1134,9 @@ unbounded queue the same load serves a comparable 5,900 qps but at 978 ms,
 because the backlog rather than the work becomes the latency, and every client
 waits behind queries whose own clients have already given up. A dropped query
 gets no answer at all, so a client sees it as a timeout and retries, which is
-the failure DNS is built for.
+the failure DNS is built for. A DoH client over HTTP/2 is told instead: its
+stream is the other path that queues, and past the limit it is answered 503
+rather than left to wait on a connection that is already open.
 
 ### Resource use
 
