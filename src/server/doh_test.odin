@@ -7,6 +7,7 @@ import "core:strings"
 import "core:testing"
 import "core:thread"
 import "core:time"
+import "elodin:config"
 
 /*
 The DoH reader hands back views into a buffer it goes on appending to.
@@ -192,6 +193,279 @@ test_doh_request_survives_a_buffer_that_grows :: proc(t: ^testing.T) {
 	testing.expect_value(t, req.path, "/dns-query")
 	testing.expect_value(t, req.content_type, "application/dns-message")
 	testing.expect_value(t, string(req.body), "abcd")
+}
+
+/*
+Two requests in one segment are two requests.
+
+A client may send the next request without waiting for the answer to this one
+(RFC 9112 9.3), and `Connection: keep-alive` is what this endpoint advertises.
+Those bytes are read off the socket along with the request being parsed and sit
+in the reader's buffer past its end, so a reader that does not outlive the
+request takes them with it: the second request is dropped whole - the client
+waits for an answer until `client_timeout` closes the connection - or, when only
+part of it had arrived, the next `http_line` resumes in the middle of it and
+reads a garbage request line.
+
+Both go to a path this server does not serve, so both answers come from
+`send_http_error` and no resolver, cache or upstream has to exist for it. The
+first carries a body, which puts the leftover past what `http_exact` consumed
+rather than only past a header line.
+*/
+@(test)
+test_doh_answers_a_pipelined_pair :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the bound port: %v", berr)
+		return
+	}
+
+	client, derr := net.dial_tcp_from_endpoint(bound)
+	if derr != nil {
+		testing.expectf(t, false, "cannot dial the listener: %v", derr)
+		return
+	}
+	defer net.close(client)
+
+	// A few hundred bytes, so both requests are in flight before the server
+	// reads anything and the second arrives in the same read as the first.
+	pipelined :=
+		"POST /not-served HTTP/1.1\r\nHost: dns.example\r\nContent-Length: 4\r\n\r\nabcd" +
+		"GET /not-served HTTP/1.1\r\nHost: dns.example\r\n\r\n"
+	sent := 0
+	raw := transmute([]u8)pipelined
+	for sent < len(raw) {
+		n, serr := net.send_tcp(client, raw[sent:])
+		if serr != nil || n <= 0 {
+			testing.expectf(t, false, "cannot send the requests: %v", serr)
+			return
+		}
+		sent += n
+	}
+
+	accepted, _, aerr := net.accept_tcp(listener)
+	if aerr != nil {
+		testing.expectf(t, false, "nothing connected: %v", aerr)
+		return
+	}
+	defer net.close(accepted)
+	// Nothing follows the pair, so the handler ends on this rather than on a
+	// close: it stands in for `client_timeout` on a connection kept open.
+	_ = net.set_option(accepted, .Receive_Timeout, 500 * time.Millisecond)
+
+	cfg := config.default_config()
+	s := Server {
+		cfg = &cfg,
+	}
+	serve_doh(&s, Conn{socket = accepted}, "test")
+
+	_ = net.set_option(client, .Receive_Timeout, 500 * time.Millisecond)
+	answers := strings.builder_make(context.temp_allocator)
+	for {
+		chunk: [4096]u8
+		n, rerr := net.recv_tcp(client, chunk[:])
+		if rerr != nil || n <= 0 {
+			break
+		}
+		strings.write_bytes(&answers, chunk[:n])
+	}
+
+	testing.expect_value(t, strings.count(strings.to_string(answers), "HTTP/1.1 404"), 2)
+	free_all(context.temp_allocator)
+}
+
+/*
+One large request does not leave the connection holding a large buffer.
+
+The reader outlives the request now, so its buffer is no longer handed back by
+the `free_all` between requests: it holds whatever the largest request on the
+connection made it grow to. A body at `MAX_DOH_BODY` doubles it to 128 KiB, and
+a client that sends one and then goes back to 200-byte queries would keep that
+for as long as it holds the connection open - no malformed input needed, and
+multiplied by `server.max_connections`.
+
+Checked either side of `http_compact`, so this fails if the growth stops
+happening as well as if the buffer stops being given back.
+*/
+@(test)
+test_doh_reader_gives_back_an_oversized_buffer :: proc(t: ^testing.T) {
+	b := strings.builder_make(context.allocator)
+	defer strings.builder_destroy(&b)
+	strings.write_string(&b, "POST /dns-query HTTP/1.1\r\nHost: dns.example\r\n")
+	strings.write_string(&b, "Content-Type: application/dns-message\r\nContent-Length: ")
+	strings.write_int(&b, MAX_DOH_BODY)
+	strings.write_string(&b, "\r\n\r\n")
+	for _ in 0 ..< MAX_DOH_BODY {
+		strings.write_byte(&b, 'q')
+	}
+
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the bound port: %v", berr)
+		return
+	}
+
+	// On its own thread: 64 KiB is more than the socket buffers hold, so the
+	// send only finishes as the read below drains it.
+	sender := Sender {
+		endpoint = bound,
+		request  = strings.to_string(b),
+	}
+	client := thread.create_and_start_with_poly_data(&sender, send_request)
+	defer {
+		thread.join(client)
+		thread.destroy(client)
+	}
+
+	accepted, _, aerr := net.accept_tcp(listener)
+	if aerr != nil {
+		testing.expectf(t, false, "nothing connected: %v", aerr)
+		return
+	}
+	defer net.close(accepted)
+	_ = net.set_option(accepted, .Receive_Timeout, 3 * time.Second)
+
+	r := Http_Reader {
+		conn = Conn{socket = accepted},
+		buf  = make([dynamic]u8, 0, HTTP_BUF_SIZE),
+	}
+	defer delete(r.buf)
+
+	req, ok := read_http_request(&r)
+	testing.expect(t, ok, "the request did not parse")
+	if !ok {
+		return
+	}
+	testing.expect_value(t, len(req.body), MAX_DOH_BODY)
+	testing.expect(t, cap(r.buf) > HTTP_BUF_SIZE, "the body did not grow the buffer, so there is nothing to give back")
+
+	http_compact(&r)
+	testing.expect_value(t, len(r.buf), 0)
+	testing.expect_value(t, cap(r.buf), HTTP_BUF_SIZE)
+}
+
+@(private = "file")
+Doh_Session :: struct {
+	server: ^Server,
+	conn:   Conn,
+}
+
+@(private = "file")
+run_serve_doh :: proc(d: ^Doh_Session) {
+	serve_doh(d.server, d.conn, "test")
+}
+
+/*
+The half of the next request that has already arrived is still the front of it.
+
+This is the worse of the two ways the per-request reader lost pipelined bytes.
+The dropped-whole case costs an answer; here the leftover is a fragment, and the
+next `http_line` starts wherever the socket resumes - the middle of the request
+line - so what the server reads is not the request the client sent. It parses as
+garbage and the connection is closed under a client that did nothing wrong.
+
+The pause between the two writes is what puts the split there: the first read
+takes the whole of one request and the beginning of the next.
+*/
+@(test)
+test_doh_answers_a_request_that_arrives_split :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the bound port: %v", berr)
+		return
+	}
+
+	client, derr := net.dial_tcp_from_endpoint(bound)
+	if derr != nil {
+		testing.expectf(t, false, "cannot dial the listener: %v", derr)
+		return
+	}
+	defer net.close(client)
+
+	accepted, _, aerr := net.accept_tcp(listener)
+	if aerr != nil {
+		testing.expectf(t, false, "nothing connected: %v", aerr)
+		return
+	}
+	defer net.close(accepted)
+	// Longer than the pause below, so the handler waits for the rest of the
+	// second request rather than timing out on it.
+	_ = net.set_option(accepted, .Receive_Timeout, 3 * time.Second)
+
+	cfg := config.default_config()
+	s := Server {
+		cfg = &cfg,
+	}
+	session := Doh_Session {
+		server = &s,
+		conn   = Conn{socket = accepted},
+	}
+	handler := thread.create_and_start_with_poly_data(&session, run_serve_doh)
+	defer {
+		thread.join(handler)
+		thread.destroy(handler)
+	}
+
+	// The first request and the request line of the second, cut mid-target.
+	if !send_all(t, client, "GET /not-served HTTP/1.1\r\nHost: dns.example\r\n\r\nGET /not-se") {
+		net.shutdown(client, .Send)
+		return
+	}
+	time.sleep(200 * time.Millisecond)
+	if !send_all(t, client, "rved HTTP/1.1\r\nHost: dns.example\r\n\r\n") {
+		net.shutdown(client, .Send)
+		return
+	}
+
+	_ = net.set_option(client, .Receive_Timeout, 2 * time.Second)
+	answers := strings.builder_make(context.temp_allocator)
+	for strings.count(strings.to_string(answers), "HTTP/1.1 404") < 2 {
+		chunk: [4096]u8
+		n, rerr := net.recv_tcp(client, chunk[:])
+		if rerr != nil || n <= 0 {
+			break
+		}
+		strings.write_bytes(&answers, chunk[:n])
+	}
+
+	testing.expect_value(t, strings.count(strings.to_string(answers), "HTTP/1.1 404"), 2)
+	// Ends the handler: with nothing more to read it returns instead of sitting
+	// out its receive timeout.
+	net.shutdown(client, .Send)
+	free_all(context.temp_allocator)
+}
+
+@(private = "file")
+send_all :: proc(t: ^testing.T, socket: net.TCP_Socket, raw: string) -> bool {
+	sent := 0
+	bytes := transmute([]u8)raw
+	for sent < len(bytes) {
+		n, err := net.send_tcp(socket, bytes[sent:])
+		if err != nil || n <= 0 {
+			testing.expectf(t, false, "cannot send: %v", err)
+			return false
+		}
+		sent += n
+	}
+	return true
 }
 
 /*
