@@ -1272,6 +1272,74 @@ test_data_after_end_stream_wakes_a_parked_responder :: proc(t: ^testing.T) {
 	expect_no_leaks(t, &track, "parked responder woken")
 }
 
+/*
+`write_body`'s own flow-control deadline sends RST_STREAM(.Cancel) - the same
+kind of one-shot RST_STREAM `handle_data`'s already_ended path sends, gated
+on `cancelled` there specifically so a peer cannot draw two. `write_body`
+sent its RST without setting `cancelled`, so a DATA frame landing in the
+window between that RST and `respond`'s `close_stream` would still find
+`cancelled == false` and send a second RST_STREAM on a stream this end had
+just reset.
+*/
+@(test)
+test_write_body_deadline_marks_the_stream_cancelled :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, destroying_handler, nil, allocator)
+	// No room for the body, ever, and a short timeout so the test does not wait long.
+	c.peer_initial_window = 0
+	c.write_timeout = 50 * time.Millisecond
+
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	ok := handle_headers(
+		c,
+		Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1},
+		block,
+	)
+	testing.expect(t, ok, "handle_headers failed")
+
+	clear(&log.frames)
+	// write_body blocks here for c.write_timeout, then gives up - synchronous,
+	// so no worker thread is needed to observe it.
+	sent := write_body(c, 1, []u8{1, 2, 3, 4})
+	testing.expect(t, !sent, "write_body should have given up once its deadline passed")
+
+	saw_rst := false
+	for f in log.frames {
+		if f.type == .Rst_Stream && f.stream_id == 1 {
+			saw_rst = true
+		}
+	}
+	testing.expect(t, saw_rst, "no RST_STREAM was sent for the flow-control deadline")
+
+	s, still_open := c.streams[1]
+	testing.expect(t, still_open, "the stream should still be here for respond to retire")
+	if still_open {
+		testing.expect(t, s.cancelled, "write_body's own RST_STREAM did not mark the stream cancelled")
+	}
+
+	// A stray DATA frame landing in the gap before respond retires the stream
+	// must not draw a second RST_STREAM.
+	clear(&log.frames)
+	body := []u8{'x'}
+	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect(t, dok, "DATA after the deadline RST should still be a stream error, not a connection error")
+	for f in log.frames {
+		testing.expectf(t, f.type != .Rst_Stream, "a second RST_STREAM was sent on a stream write_body had already reset")
+	}
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "write_body deadline cancelled")
+}
+
 // ---------------------------------------------------------------------------
 // Flow-control credit for bytes we refused
 // ---------------------------------------------------------------------------

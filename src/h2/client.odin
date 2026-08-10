@@ -309,8 +309,8 @@ client_handle_frame :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool 
 		return client_handle_data(c, h, payload)
 
 	case .Rst_Stream:
-		if len(payload) != 4 {
-			client_goaway(c, .Frame_Size_Error)
+		if h.stream_id == 0 || len(payload) != 4 {
+			client_goaway(c, .Protocol_Error if h.stream_id == 0 else .Frame_Size_Error)
 			return false
 		}
 		sync.mutex_lock(&c.mu)

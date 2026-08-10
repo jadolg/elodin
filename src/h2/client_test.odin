@@ -1661,6 +1661,44 @@ test_client_send_body_resets_the_stream_on_a_flow_control_timeout :: proc(t: ^te
 	}
 }
 
+/*
+RFC 9113 6.4: RST_STREAM always names a stream; stream 0 is a connection
+error of type PROTOCOL_ERROR, the same check the server's Rst_Stream arm
+just gained. The client's checked frame size but not this, so RST_STREAM on
+stream 0 looked up c.streams[0] - always a miss - and returned true.
+*/
+@(test)
+test_client_rst_stream_on_stream_zero_is_a_connection_error :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Client_Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+
+	rst := []u8{0, 0, 0, 8} // CANCEL
+	ok := client_handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 0}, rst)
+	testing.expect(t, !ok, "RST_STREAM on stream 0 was accepted")
+
+	saw_goaway := false
+	for f in log.frames {
+		if f.type == .Goaway {
+			saw_goaway = true
+		}
+	}
+	testing.expect(t, saw_goaway, "no GOAWAY was sent for RST_STREAM on stream 0")
+
+	delete(log.frames)
+	client_unref(c)
+	free_all(context.temp_allocator)
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "client rst_stream on stream zero: %d bytes leaked at %v", entry.size, entry.location)
+	}
+}
+
 @(private = "file")
 write_nothing :: proc(user: rawptr, buf: []u8) -> bool {
 	return true

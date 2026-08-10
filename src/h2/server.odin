@@ -995,6 +995,13 @@ write_body :: proc(c: ^Conn, stream_id: u32, body: []u8) -> bool {
 			*/
 			left := time.diff(time.now(), deadline)
 			if left <= 0 {
+				// Marked here, under the same lock, for the same reason
+				// handle_data's already_ended path marks it before sending its
+				// own RST_STREAM: a DATA frame landing in the gap between this
+				// and respond's close_stream must find a stream already known
+				// dead, not send a second RST_STREAM onto one this end just reset.
+				s.cancelled = true
+				sync.cond_broadcast(&c.cond)
 				sync.mutex_unlock(&c.mu)
 				rst_stream(c, stream_id, .Cancel)
 				return false
