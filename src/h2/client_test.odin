@@ -1106,6 +1106,46 @@ test_client_data_on_stream_zero_is_rejected :: proc(t: ^testing.T) {
 }
 
 /*
+The client's bound is `next_stream_id`, not a server's `last_stream_id`, but
+the rule is the same: RFC 9113 5.1 makes any frame on a stream id past what
+this end has ever allocated a connection error of type PROTOCOL_ERROR. Left
+unchecked, an upstream drives one connection WINDOW_UPDATE write per DATA
+frame on ids this client never opened - the same amplification the server's
+`h.stream_id > c.last_stream_id` guard exists to stop.
+*/
+@(test)
+test_client_data_on_an_idle_stream_is_rejected :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Client_Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+
+	body := []u8{'x'}
+	ok := client_handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 3}, body)
+	testing.expect(t, !ok, "DATA on an idle stream was accepted")
+
+	saw_goaway := false
+	for f in log.frames {
+		if f.type == .Goaway {
+			saw_goaway = true
+		}
+	}
+	testing.expect(t, saw_goaway, "no GOAWAY was sent for DATA on an idle stream")
+
+	delete(log.frames)
+	client_unref(c)
+	free_all(context.temp_allocator)
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "client data on an idle stream: %d bytes leaked at %v", entry.size, entry.location)
+	}
+}
+
+/*
 The client half of the same half-closed rule: RFC 9113 5.1 allows a stream
 that already said END_STREAM only WINDOW_UPDATE, PRIORITY, or RST_STREAM
 after that. `client_handle_data` did not check `s.done` and appended straight
@@ -1411,9 +1451,18 @@ test_client_send_body_stops_successfully_on_an_early_response :: proc(t: ^testin
 	body := []u8{1, 2, 3, 4}
 	sent := client_send_body(c, s, body, time.time_add(time.now(), time.Second))
 	testing.expect(t, sent, "an early response should stop the upload successfully, not report it as a failure")
+	saw_rst := false
 	for f in log.frames {
 		testing.expectf(t, f.type != .Data, "a DATA frame was written after the response had already arrived complete")
+		if f.type == .Rst_Stream && f.stream_id == 1 {
+			saw_rst = true
+		}
 	}
+	testing.expect(
+		t,
+		saw_rst,
+		"no RST_STREAM(NO_ERROR) was sent for the abandoned upload - RFC 9113 8.1 asks for one so the peer does not hold the stream open forever",
+	)
 	testing.expect_value(t, s.status, 413)
 
 	delete(log.frames)

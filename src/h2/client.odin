@@ -592,6 +592,21 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 	sync.mutex_lock(&c.mu)
 	s, found := c.streams[h.stream_id]
 	/*
+	RFC 9113 5.1: a stream id this end never allocated is idle, and idle only
+	accepts HEADERS or PRIORITY - DATA on one is a connection error of type
+	PROTOCOL_ERROR, the same as stream 0. Left unchecked, an upstream can
+	drive an unbounded run of connection WINDOW_UPDATE writes with DATA on
+	stream ids this client never opened. Gated on `!found` rather than
+	checked outright: a tracked stream is proof this end knows about it
+	regardless of where `next_stream_id` currently sits, and `found` is
+	needed below in any case.
+	*/
+	if !found && h.stream_id >= c.next_stream_id {
+		sync.mutex_unlock(&c.mu)
+		client_goaway(c, .Protocol_Error)
+		return false
+	}
+	/*
 	RFC 9113 5.1: once a stream is done or the peer has reset it, only
 	WINDOW_UPDATE, PRIORITY, and RST_STREAM are still allowed from it. The
 	caller may already be reading `s.body` as a finished response, so this is
@@ -809,8 +824,16 @@ client_request :: proc(
 	if !sent || (len(req.body) > 0 && !client_send_body(c, s, req.body, deadline)) {
 		sync.mutex_lock(&c.mu)
 		dead := c.closed
+		reset := s.reset
 		sync.mutex_unlock(&c.mu)
-		return {}, .Closed if dead else .Timeout
+		switch {
+		case dead:
+			return {}, .Closed
+		case reset:
+			return {}, .Reset
+		case:
+			return {}, .Timeout
+		}
 	}
 
 	sync.mutex_lock(&c.mu)
@@ -859,10 +882,15 @@ client_send_body :: proc(c: ^Client, s: ^Client_Stream, body: []u8, deadline: ti
 			on a body too large, a 401, a redirect. That response is already
 			sitting in `s.status`/`s.body`, so stopping here is success, not
 			failure: the caller in `client_request` goes straight to the wait
-			loop and returns it.
+			loop and returns it. RFC 9113 8.1 also asks the client to send
+			RST_STREAM(NO_ERROR) when it does this, so the peer is not left
+			holding the stream half-open - and one of its MAX_CONCURRENT_STREAMS
+			slots - for the rest of the connection's life waiting for a body
+			this end has already decided not to send.
 			*/
 			if s.done {
 				sync.mutex_unlock(&c.mu)
+				client_rst_stream(c, s.id, .No_Error)
 				return true
 			}
 			// `rst_sent`: this connection has already answered a stream
