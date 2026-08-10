@@ -314,6 +314,7 @@ udp_loop :: proc(data: rawptr) {
 		limit := ctx.server.cfg.server.max_pending
 		if limit > 0 && pool.pending(ctx.server.handler_pool) >= limit {
 			sync.atomic_add(&ctx.server.stats.dropped, 1)
+			report_shed(client, limit)
 			continue
 		}
 
@@ -329,6 +330,7 @@ udp_loop :: proc(data: rawptr) {
 			// The backlog filled up between the check above and here, from this
 			// loop's own last datagram or from a DoH connection's reader.
 			sync.atomic_add(&ctx.server.stats.dropped, 1)
+			report_shed(client, limit)
 			delete(job.data)
 			free(job)
 		case .Stopped:
@@ -449,6 +451,38 @@ report_refusal :: proc(client: net.Endpoint, proto: Protocol) {
 	logx.warnf(
 		"add its network to server.allow_from if that client should be served; refusals are counted as refused= in the stats line, and further ones are logged at debug level",
 	)
+}
+
+/*
+Say which client a full backlog turned away.
+
+Debug only, and not through `report_once`: unlike a refusal, a shed is already
+counted as dropped= in the stats line, so an operator watching for it has a
+figure that a flood cannot make them miss. This is for the question that figure
+raises next - which clients are being turned away - and it is asked by turning
+debug on.
+
+The line is formatted out of the read loop's temp arena, which that loop resets
+only where it has something to reset, so it is released here as `report_refusal`
+does. Safe for the same reason: both call sites are about to `continue`, and
+neither holds anything in the temp allocator across this.
+*/
+@(private)
+report_shed :: proc(client: net.Endpoint, limit: int) {
+	// Before the address is formatted, not after: this is reached once per
+	// datagram of exactly the flood that fills the backlog, so with debug off it
+	// has to cost the load and nothing else.
+	if !logx.enabled(.Debug) {
+		return
+	}
+	defer free_all(context.temp_allocator)
+
+	// The stack rather than that arena, as in `report_refusal`.
+	buf: [64]u8
+	builder := strings.builder_from_bytes(buf[:])
+	who := net.endpoint_to_string(client, &builder)
+
+	logx.debugf("udp: shedding a query from %s, server.max_pending (%d) is reached", who, limit)
 }
 
 /*

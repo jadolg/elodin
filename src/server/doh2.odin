@@ -152,6 +152,20 @@ h2_shed :: proc(ctx: ^H2_Context, hc: ^h2.Conn, req: ^h2.Request) {
 	if endpoint == ctx.path {
 		sync.atomic_add(&ctx.server.stats.dropped, 1)
 	}
+	/*
+	Logged whatever the path, which the counter above is not: dropped= is a
+	figure about queries, and this is the line that says a 503 came from the
+	backlog rather than from a broken endpoint. Without it a shed off the DoH
+	path leaves no trace anywhere at all.
+
+	Nothing is released after it: `h2.serve` resets this arena between frames,
+	which is the same reason `h2_error` can format on this thread.
+	*/
+	logx.debugf(
+		"doh/h2: shedding a request from %s, server.max_pending (%d) is reached",
+		ctx.client,
+		ctx.server.cfg.server.max_pending,
+	)
 	h2.respond(hc, req.stream_id, h2.Response{status = 503})
 	h2.request_destroy(hc, req)
 }
