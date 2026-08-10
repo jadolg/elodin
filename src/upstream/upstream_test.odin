@@ -860,6 +860,73 @@ test_reader_exact_refuses_a_negative_count :: proc(t: ^testing.T) {
 }
 
 /*
+`reader_line`'s 64 KB guard must measure the unconsumed remainder, not the
+whole buffer. `Buf_Reader` never compacts, so once a body has pushed `r.buf`
+past 64 KB, every consumed byte stays counted against the guard forever - the
+next line that needs a fresh socket read would be refused even with nothing
+outstanding to read.
+
+`r.buf` is primed here to simulate exactly that: a chunk body already consumed
+past 64 KB, with the cursor at the end of it, as `read_chunked` leaves things
+right after a chunk's trailing CRLF. The terminal "0\r\n\r\n" line is still on
+the wire, so answering it requires `reader_fill` to run - which the old guard
+never gave a chance to.
+*/
+@(test)
+test_reader_line_guard_measures_the_remainder :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		net.close(listener)
+		testing.expectf(t, false, "cannot read the mock's port: %v", berr)
+		return
+	}
+
+	m := Http_Mock {
+		listener = listener,
+		reply    = "0\r\n\r\n",
+	}
+	server := thread.create_and_start_with_poly_data(&m, http_mock_once)
+	defer {
+		thread.join(server)
+		thread.destroy(server)
+		net.close(listener)
+	}
+
+	socket, derr := dial_tcp_timeout(bound, 2 * time.Second)
+	if derr != .None {
+		testing.expectf(t, false, "cannot dial the mock: %v", derr)
+		return
+	}
+	set_socket_timeouts(socket, 2 * time.Second)
+	stream := Stream {
+		socket = socket,
+	}
+	defer stream_close(&stream)
+	// The mock reads a request before it answers.
+	stream_write(&stream, []u8{'\n'})
+
+	r := Buf_Reader {
+		stream = &stream,
+		buf    = make([dynamic]u8, 0, 70_000, context.temp_allocator),
+	}
+	// Stand in for a chunk body already consumed past the 64 KB mark, cursor
+	// at the end of it - nothing unconsumed, everything still counted by a
+	// guard that looks at len(r.buf) alone.
+	append(&r.buf, ..make([]u8, 70_000, context.temp_allocator))
+	r.pos = len(r.buf)
+
+	line, err := reader_line(&r)
+	testing.expectf(t, err == .None, "the terminal chunk line was refused: %v", err)
+	testing.expect_value(t, line, "0")
+	free_all(context.temp_allocator)
+}
+
+/*
 A response with no framing information ends when the connection does, and that
 reader was the one path of four with no size limit on it: the header scan stops
 at 64 KB, and chunked and Content-Length both check MAX_HTTP_BODY. This one read
