@@ -237,7 +237,9 @@ udp_loop :: proc(data: rawptr) {
 	buf := make([]u8, 65535)
 	defer delete(buf)
 
-	for !sync.atomic_load(&l.stop) {
+	// Labelled for the submit below, whose `break` would otherwise leave only
+	// the switch it sits in.
+	loop: for !sync.atomic_load(&l.stop) {
 		n, client, err := net.recv_udp(l.udp_socket, buf)
 		if err != nil {
 			if sync.atomic_load(&l.stop) {
@@ -299,15 +301,20 @@ udp_loop :: proc(data: rawptr) {
 			continue
 		}
 
-		// Shed rather than queue once the backlog is past what the workers can
-		// work through. A query added here would be answered long after its
-		// client stopped waiting, and the effort spent on it is taken from
-		// queries that could still have been answered in time.
-		if limit := ctx.server.cfg.server.max_pending; limit > 0 {
-			if pool.pending(ctx.server.handler_pool) >= limit {
-				sync.atomic_add(&ctx.server.stats.dropped, 1)
-				continue
-			}
+		/*
+		Shed rather than queue once the backlog is past what the workers can
+		work through. A query added here would be answered long after its client
+		stopped waiting, and the effort spent on it is taken from queries that
+		could still have been answered in time.
+
+		Asked here as well as at the submit below, which is where it is decided:
+		this loop is what a flood arrives at, and the copy of the datagram the
+		job needs is worth not making for a query about to be shed.
+		*/
+		limit := ctx.server.cfg.server.max_pending
+		if limit > 0 && pool.pending(ctx.server.handler_pool) >= limit {
+			sync.atomic_add(&ctx.server.stats.dropped, 1)
+			continue
 		}
 
 		job := new(Udp_Job)
@@ -316,10 +323,18 @@ udp_loop :: proc(data: rawptr) {
 		job.data = make([]u8, n)
 		copy(job.data, buf[:n])
 
-		if !pool.submit(ctx.server.handler_pool, udp_job, job) {
+		switch pool.try_submit(ctx.server.handler_pool, udp_job, job, limit) {
+		case .Accepted:
+		case .Full:
+			// The backlog filled up between the check above and here, from this
+			// loop's own last datagram or from a DoH connection's reader.
+			sync.atomic_add(&ctx.server.stats.dropped, 1)
 			delete(job.data)
 			free(job)
-			break
+		case .Stopped:
+			delete(job.data)
+			free(job)
+			break loop
 		}
 	}
 	// `ctx` is not released here: jobs queued above still hold it, and they run

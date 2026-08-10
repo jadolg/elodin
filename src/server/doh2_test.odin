@@ -106,6 +106,22 @@ one_get_request :: proc(path: string) -> [dynamic]u8 {
 	return out
 }
 
+// Whether any DATA frame went out, which is what says a response carried a
+// body: a body is the flow-controlled part, and the only part that can park the
+// thread writing it.
+@(private = "file")
+wrote_a_body :: proc(out: []u8) -> bool {
+	pos := 0
+	for pos + 9 <= len(out) {
+		length := int(out[pos]) << 16 | int(out[pos + 1]) << 8 | int(out[pos + 2])
+		if out[pos + 3] == 0x0 && length > 0 {
+			return true
+		}
+		pos += 9 + length
+	}
+	return false
+}
+
 @(private = "file")
 Gate :: struct {
 	open: bool,
@@ -119,51 +135,44 @@ gate_job :: proc(data: rawptr) {
 	}
 }
 
+@(private = "file")
+Result :: struct {
+	// Everything the connection wrote. The caller owns it.
+	output:  [dynamic]u8,
+	dropped: u64,
+	// Requests that reached the pool, the job occupying it not counted.
+	queued:  int,
+}
+
 /*
-DoH over HTTP/2 must shed against `max_pending` like every other queued query.
+Serve one GET for `path` over a whole HTTP/2 connection and report what came of
+it.
 
-It is the only transport that hands its work to the shared worker pool instead
-of answering on its own connection thread, so it is the one that can fill that
-pool - up to `max_connections` x `MAX_CONCURRENT` streams - while the operator's
-backlog limit sheds UDP at a few hundred.
-
-The request here names a path the endpoint does not serve, so that the
-unshed path answers 404 from `build_h2_response` without reaching for a
-resolver this test has not wired up.
+`occupy` fills the worker with a job that will not finish, which is what puts
+the backlog at the limit. The pool is one worker throughout, so `max_pending` of
+1 and an occupied worker is a full backlog.
 */
-@(test)
-test_doh2_sheds_when_the_pool_backlog_is_full :: proc(t: ^testing.T) {
-	/*
-	A queued job is allocated on the connection thread and released on a pool
-	worker, and in the server both run under the default heap allocator. The
-	test runner hands this proc a per-test tracking allocator instead, which
-	would make that pairing a free through an allocator that never made the
-	block.
-	*/
-	context.allocator = runtime.heap_allocator()
-
-	cfg := config.default_config()
-	cfg.listeners.doh.path = "/dns-query"
-	cfg.server.max_pending = 1
-
-	// One worker, and one job is enough to fill the backlog.
+@(private = "file")
+serve_one :: proc(cfg: ^config.Config, path: string, await: string, occupy: bool) -> Result {
 	handler_pool := pool.make_pool(1)
 	s := Server {
-		cfg          = &cfg,
+		cfg          = cfg,
 		handler_pool = handler_pool,
 	}
 
 	gate := Gate{}
-	testing.expect(t, pool.submit(handler_pool, gate_job, &gate), "could not occupy the pool")
+	if occupy {
+		pool.submit(handler_pool, gate_job, &gate)
+	}
 
-	input := one_get_request("/not-the-endpoint")
+	input := one_get_request(path)
 	defer delete(input)
 
 	script := Script {
 		input  = input[:],
+		await  = await,
 		output = make([dynamic]u8, 0, 256, context.allocator),
 	}
-	defer delete(script.output)
 
 	ctx := H2_Context {
 		server = &s,
@@ -180,26 +189,72 @@ test_doh2_sheds_when_the_pool_backlog_is_full :: proc(t: ^testing.T) {
 
 	// Read before the gate opens: once the worker is free the pool drains, and
 	// a job that was queued would no longer be pending to find.
-	queued := pool.pending(handler_pool) - 1
+	queued := pool.pending(handler_pool)
+	if occupy {
+		queued -= 1
+	}
 
 	sync.atomic_store(&gate.open, true)
 	h2.conn_wait_idle(hc)
 	h2.conn_unref(hc)
 	pool.destroy(handler_pool)
 
-	testing.expectf(t, queued == 0, "%d requests were queued past max_pending", queued)
-
-	answer := string(script.output[:])
-	testing.expect(
-		t,
-		strings.contains(answer, "503") && strings.contains(answer, "server too busy"),
-		"the shed request was not answered 503 (nothing was shed)",
-	)
-	testing.expect_value(t, sync.atomic_load(&s.stats.dropped), u64(1))
+	return Result{output = script.output, dropped = sync.atomic_load(&s.stats.dropped), queued = queued}
 }
 
-// The shed is a limit, not a policy: with the pool idle the same request goes
-// to a worker and is answered there.
+/*
+DoH over HTTP/2 must shed against `max_pending` like every other queued query.
+
+It is the only transport that hands its work to the shared worker pool instead
+of answering on its own connection thread, so it is the one that can fill that
+pool - up to `max_connections` x `MAX_CONCURRENT` streams - while the operator's
+backlog limit sheds UDP at a few hundred.
+
+The query is a bare DNS header with no question, which the endpoint answers
+FORMERR without reaching the cache, the filters or an upstream group - none of
+which are wired up here. A shed request never gets that far, but a regression
+that queues it again should fail this test rather than crash it.
+*/
+@(test)
+test_doh2_sheds_when_the_pool_backlog_is_full :: proc(t: ^testing.T) {
+	/*
+	A queued job is allocated on the connection thread and released on a pool
+	worker, and in the server both run under the default heap allocator. The
+	test runner hands this proc a per-test tracking allocator instead, which
+	would make that pairing a free through an allocator that never made the
+	block.
+	*/
+	context.allocator = runtime.heap_allocator()
+
+	cfg := config.default_config()
+	cfg.listeners.doh.path = "/dns-query"
+	cfg.server.max_pending = 1
+	cfg.cache.enabled = false
+	cfg.blocking.enabled = false
+
+	// A bare 12-byte DNS header, base64url with no padding.
+	got := serve_one(&cfg, "/dns-query?dns=AAAAAAAAAAAAAAAA", "", occupy = true)
+	defer delete(got.output)
+
+	testing.expectf(t, got.queued == 0, "%d requests were queued past max_pending", got.queued)
+
+	// The status is the whole answer: a shed carries no body, so that it cannot
+	// park this thread on flow control. See `h2_shed`.
+	testing.expect(
+		t,
+		strings.contains(string(got.output[:]), "503"),
+		"the shed request was not answered 503 (nothing was shed)",
+	)
+	testing.expect(
+		t,
+		!wrote_a_body(got.output[:]),
+		"the shed answer carried a body, which can park the reader on flow control",
+	)
+	testing.expect_value(t, got.dropped, u64(1))
+}
+
+// The shed is a limit, not a policy: with the pool idle the same request goes to
+// a worker and is answered there.
 @(test)
 test_doh2_queues_while_the_pool_has_room :: proc(t: ^testing.T) {
 	// See the note in the test above.
@@ -209,39 +264,10 @@ test_doh2_queues_while_the_pool_has_room :: proc(t: ^testing.T) {
 	cfg.listeners.doh.path = "/dns-query"
 	cfg.server.max_pending = 8
 
-	handler_pool := pool.make_pool(1)
-	s := Server {
-		cfg          = &cfg,
-		handler_pool = handler_pool,
-	}
+	got := serve_one(&cfg, "/not-the-endpoint", "not found", occupy = false)
+	defer delete(got.output)
 
-	input := one_get_request("/not-the-endpoint")
-	defer delete(input)
-
-	script := Script {
-		input  = input[:],
-		await  = "not found",
-		output = make([dynamic]u8, 0, 256, context.allocator),
-	}
-	defer delete(script.output)
-
-	ctx := H2_Context {
-		server = &s,
-		client = "127.0.0.1",
-		path   = cfg.listeners.doh.path,
-	}
-	io := h2.IO {
-		user  = &script,
-		read  = script_read,
-		write = script_write,
-	}
-	hc := h2.make_conn(io, h2_handler, &ctx)
-	h2.serve(hc)
-	h2.conn_wait_idle(hc)
-	h2.conn_unref(hc)
-	pool.destroy(handler_pool)
-
-	answer := string(script.output[:])
+	answer := string(got.output[:])
 	// The 404 status is a static-table index rather than three digits on the
 	// wire; its body is what shows plainly.
 	testing.expect(
@@ -250,5 +276,36 @@ test_doh2_queues_while_the_pool_has_room :: proc(t: ^testing.T) {
 		"the request was not answered by a worker",
 	)
 	testing.expect(t, !strings.contains(answer, "503"), "an idle pool shed a request")
-	testing.expect_value(t, sync.atomic_load(&s.stats.dropped), u64(0))
+	// Also what says `wrote_a_body` can tell: this answer has one.
+	testing.expect(t, wrote_a_body(got.output[:]), "the 404 went out without its body")
+	testing.expect_value(t, got.dropped, u64(0))
+}
+
+/*
+`dropped` counts queries the server refused, not streams it turned away.
+
+A request for some other path is shed like any other once the backlog is full -
+it would have taken a worker to answer - but it was never going to reach the
+resolver, so counting it would have a scanner on the DoH port inflating the
+figure an operator reads as "this server cannot keep up".
+*/
+@(test)
+test_doh2_shed_counts_only_queries :: proc(t: ^testing.T) {
+	// See the note in the first test.
+	context.allocator = runtime.heap_allocator()
+
+	cfg := config.default_config()
+	cfg.listeners.doh.path = "/dns-query"
+	cfg.server.max_pending = 1
+
+	got := serve_one(&cfg, "/not-the-endpoint", "", occupy = true)
+	defer delete(got.output)
+
+	testing.expectf(t, got.queued == 0, "%d requests were queued past max_pending", got.queued)
+	testing.expect(
+		t,
+		strings.contains(string(got.output[:]), "503"),
+		"the request was not shed",
+	)
+	testing.expect_value(t, got.dropped, u64(0))
 }
