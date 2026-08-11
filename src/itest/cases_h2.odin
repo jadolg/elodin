@@ -1,6 +1,7 @@
 package itest
 
 import "core:fmt"
+import "core:strings"
 import "core:time"
 import "elodin:dns"
 
@@ -97,6 +98,37 @@ run_h2_cases :: proc(r: ^Runner) {
 				check_eq_int(r, res.status, 200, "status")
 				h, _ := parse_header(res.body)
 				check_eq_int(r, h.ancount, fix.ancount, "answer count")
+			}
+		}
+	}
+	end_case(r)
+
+	/*
+	The Apple .mobileconfig profile is served over HTTP/2 too, since that is the
+	protocol a device negotiates. The URL inside it is built from the `:authority`
+	pseudo-header - the client sends `elodin.local` - and the response carries the
+	Apple content type rather than the DNS-message one.
+	*/
+	start_case(r, "h2: the Apple profile downloads")
+	{
+		c, cok := h2_connect(doh_port)
+		if check(r, cok, "cannot open an h2 connection") {
+			defer h2_close(c)
+			check(r, h2_send_request(c, 1, "GET", "/apple-doh.mobileconfig", nil), "cannot send the request")
+			if check(r, h2_collect(c, []u32{1}), "stream 1 never completed") {
+				res, _ := h2_stream(c, 1)
+				check_eq_int(r, res.status, 200, "status")
+				check_eq_str(
+					r,
+					h2_header_value(res, "content-type"),
+					"application/x-apple-aspen-config",
+					"content type",
+				)
+				check(
+					r,
+					strings.contains(string(res.body), "<string>https://elodin.local/dns-query</string>"),
+					"the profile does not carry the DoH URL built from :authority",
+				)
 			}
 		}
 	}

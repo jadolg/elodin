@@ -1336,7 +1336,7 @@ What it covers:
 | shutdown | `SIGTERM` produces an orderly exit rather than a killed process |
 | wire format | all 23 captured fixtures replayed and compared byte for byte, EDNS forwarding, 0x20 case preservation, truncation and the TC bit, FORMERR / NOTIMP / silent-drop handling |
 | listeners | UDP, TCP (single and pipelined), DoT, DoH POST and GET, keep-alive, two pipelined requests in one segment, 404 / 405 / 415 / 400 |
-| Apple profile | the `.mobileconfig` built from the request host end to end over HTTP/1.1, its `ServerURL` and managed-DNS payload, a non-standard port kept, stable and distinct UUIDs, XML escaping, host validation, GET-only |
+| Apple profile | the `.mobileconfig` downloaded end to end over HTTP/1.1 and HTTP/2, its `ServerURL` built from the request host / `:authority`, the managed-DNS payload and Apple content type, GET-only |
 | DoH over HTTP/2 | ALPN selection, POST and GET, Huffman-coded headers, CONTINUATION, a dynamic table size update at and past the advertised limit, concurrent streams proved parallel by timing, flow control with a tiny window, DATA splitting for a 27 KiB answer, PING, RST_STREAM, error statuses, HTTP/1.1 fallback |
 | DoH upstreams | a query resolved over an h2 upstream, one connection multiplexed across queries rather than reopened, fallback to HTTP/1.1 when the upstream does not offer h2 |
 | blocking | all five response modes, hosts vs domains vs adblock semantics, allow precedence, wildcards, modifiers, dnsmasq syntax, unusable rules, case folding |
