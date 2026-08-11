@@ -166,7 +166,9 @@ mobileconfig_uuid :: proc(seed: string, tag: string) -> string {
 	tagged := strings.concatenate({seed, "/", tag}, context.temp_allocator)
 	siphash.sum_bytes_to_buffer_2_4(transmute([]u8)tagged, key[:], bytes[8:])
 
-	HEX :: "0123456789ABCDEF"
+	// A variable rather than a constant: a constant string cannot be indexed with
+	// a variable index, which is what the hex lookup below does.
+	HEX := "0123456789ABCDEF"
 	out: [36]u8
 	j := 0
 	for i in 0 ..< 16 {
