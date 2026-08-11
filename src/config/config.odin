@@ -16,13 +16,17 @@ Log_Config :: struct {
 }
 
 Listener :: struct {
-	enabled:   bool,
-	address:   string,
-	port:      int,
-	cert_file: string,
-	key_file:  string,
+	enabled:           bool,
+	address:           string,
+	port:              int,
+	cert_file:         string,
+	key_file:          string,
 	// DoH only.
-	path:      string,
+	path:              string,
+	// DoH only: the path an iPhone, iPad or Mac downloads its encrypted-DNS
+	// configuration profile (.mobileconfig) from. Empty turns it off; when it is
+	// set, the profile is served on the DoH listener alongside `path`.
+	mobileconfig_path: string,
 }
 
 Listeners :: struct {
@@ -493,10 +497,14 @@ default_config :: proc() -> Config {
 		port    = 853,
 	}
 	c.listeners.doh = Listener {
-		enabled = false,
-		address = "0.0.0.0",
-		port    = 443,
-		path    = "/dns-query",
+		enabled           = false,
+		address           = "0.0.0.0",
+		port              = 443,
+		path              = "/dns-query",
+		// On by default once DoH itself is: an iOS or macOS device points at this
+		// resolver by installing the profile served here, and the file gives away
+		// nothing the DoH URL does not already. Set it to "" to withhold it.
+		mobileconfig_path = "/apple-doh.mobileconfig",
 	}
 	c.upstream = Upstream_Config {
 		strategy     = .Failover,

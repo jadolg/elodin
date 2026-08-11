@@ -215,6 +215,55 @@ run_transport_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	/*
+	The Apple .mobileconfig profile downloads, and carries the DoH URL built from
+	the request's own Host.
+
+	The whole point of the endpoint is that an iPhone reaches it over exactly this
+	transport and gets back a file whose ServerURL names the host it used, so this
+	asks for it as a device would - a GET, over the real DoH TLS connection - and
+	checks the profile that comes back is the Apple content type and points at
+	`https://<that host>/dns-query`, the managed-DNS payload iOS installs.
+	*/
+	start_case(r, "doh: the Apple profile downloads and names the request host")
+	{
+		res := doh_raw(
+			doh_port,
+			"GET /apple-doh.mobileconfig HTTP/1.1\r\nHost: dns.test.local\r\nConnection: close\r\n\r\n",
+		)
+		if check(r, res.ok, "no HTTP response") {
+			check_eq_int(r, res.status, 200, "status")
+			check(
+				r,
+				header_contains(res.headers, "content-type: application/x-apple-aspen-config"),
+				"not served as an Apple configuration profile",
+			)
+			body := string(res.body)
+			check(
+				r,
+				strings.contains(body, "<string>https://dns.test.local/dns-query</string>"),
+				"the profile does not carry the DoH URL built from the request Host",
+			)
+			check(
+				r,
+				strings.contains(body, "com.apple.dnsSettings.managed"),
+				"the profile is missing the managed DNS payload",
+			)
+		}
+	}
+	end_case(r)
+
+	start_case(r, "doh: the Apple profile path is GET-only")
+	{
+		res := doh_raw(
+			doh_port,
+			"POST /apple-doh.mobileconfig HTTP/1.1\r\nHost: dns.test.local\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+		)
+		check(r, res.ok, "no HTTP response")
+		check_eq_int(r, res.status, 405, "status")
+	}
+	end_case(r)
+
 	start_case(r, "doh: wrong content type is 415")
 	{
 		body := "not a dns message"

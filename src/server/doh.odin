@@ -44,6 +44,9 @@ Http_Request_In :: struct {
 	body:         []u8,
 	keep_alive:   bool,
 	content_type: string,
+	// The Host header, used only to build the DoH URL the .mobileconfig endpoint
+	// hands back. Empty when the client sent none.
+	host:         string,
 }
 
 @(private)
@@ -261,6 +264,8 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, ok: bool) {
 			}
 		case strings.equal_fold(name, "content-type"):
 			req.content_type = hold(value)
+		case strings.equal_fold(name, "host"):
+			req.host = hold(value)
 		case strings.equal_fold(name, "transfer-encoding"):
 			// Chunked request bodies are not accepted; DoH clients send a
 			// Content-Length.
@@ -324,6 +329,10 @@ serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 
 @(private)
 serve_doh_request :: proc(s: ^Server, conn: Conn, req: Http_Request_In, path: string, client: string) -> bool {
+	mc_path := s.cfg.listeners.doh.mobileconfig_path
+	if mc_path != "" && req.path == mc_path {
+		return serve_doh_mobileconfig(conn, req, path)
+	}
 	if req.path != path {
 		return send_http_error(conn, "doh", 404, "not found", req.keep_alive)
 	}
@@ -382,6 +391,47 @@ serve_doh_request :: proc(s: ^Server, conn: Conn, req: Http_Request_In, path: st
 		return false
 	}
 	return conn_write_all(conn, response)
+}
+
+/*
+Serve the Apple .mobileconfig profile that points a device at this DoH endpoint.
+
+A GET, since a device downloads it by navigating to the URL; anything else is a
+405. The URL inside it is built from the request's own `Host` header, so a
+client that sends none - or one this server could not have a certificate for -
+gets a 400 rather than a profile naming a host that does not resolve. `doh_path`
+is `listeners.doh.path`, which is what the profile has the device query.
+*/
+@(private)
+serve_doh_mobileconfig :: proc(conn: Conn, req: Http_Request_In, doh_path: string) -> bool {
+	if req.method != "GET" {
+		return send_http_error(conn, "doh", 405, "method not allowed", req.keep_alive)
+	}
+	if !valid_mobileconfig_host(req.host) {
+		return send_http_error(conn, "doh", 400, "missing or invalid Host header", req.keep_alive)
+	}
+
+	profile := build_doh_mobileconfig(req.host, doh_path, context.temp_allocator)
+
+	b := strings.builder_make(context.temp_allocator)
+	strings.write_string(&b, "HTTP/1.1 200 OK\r\nContent-Type: ")
+	strings.write_string(&b, DOH_MOBILECONFIG_CONTENT_TYPE)
+	strings.write_string(&b, "\r\nContent-Length: ")
+	strings.write_int(&b, len(profile))
+	strings.write_string(&b, "\r\nContent-Disposition: attachment; filename=\"elodin-doh.mobileconfig\"")
+	strings.write_string(&b, "\r\nDate: ")
+	strings.write_string(&b, now_http_date(context.temp_allocator))
+	strings.write_string(&b, "\r\nServer: elodin/")
+	strings.write_string(&b, VERSION)
+	strings.write_string(&b, "\r\nConnection: ")
+	strings.write_string(&b, "keep-alive" if req.keep_alive else "close")
+	strings.write_string(&b, "\r\n\r\n")
+
+	head := strings.to_string(b)
+	if !conn_write_all(conn, transmute([]u8)head) {
+		return false
+	}
+	return conn_write_all(conn, transmute([]u8)profile)
 }
 
 /*
