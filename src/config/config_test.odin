@@ -152,6 +152,32 @@ test_defaults_applied :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_doh_mobileconfig_path :: proc(t: ^testing.T) {
+	// The default is a served path, so a device can be pointed at the resolver
+	// the moment DoH is turned on, without another setting.
+	base, berr := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	testing.expect(t, berr == nil, "expected a clean load")
+	testing.expect_value(t, base.listeners.doh.mobileconfig_path, "/apple-doh.mobileconfig")
+
+	// A value is read as given.
+	set, serr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\nlisteners:\n  doh:\n    mobileconfig_path: /profile.mobileconfig\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, serr == nil, "expected a clean load")
+	testing.expect_value(t, set.listeners.doh.mobileconfig_path, "/profile.mobileconfig")
+
+	// Empty is how it is withheld.
+	off, oerr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\nlisteners:\n  doh:\n    mobileconfig_path: \"\"\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, oerr == nil, "expected a clean load")
+	testing.expect_value(t, off.listeners.doh.mobileconfig_path, "")
+	free_all(context.temp_allocator)
+}
+
+@(test)
 test_dnssec_can_be_turned_off :: proc(t: ^testing.T) {
 	// The escape hatch for an upstream that cannot return DNSSEC records, where
 	// validating would mean answering nothing rather than answering unverified.

@@ -206,6 +206,11 @@ h2_answer :: proc(data: rawptr) {
 @(private)
 build_h2_response :: proc(ctx: ^H2_Context, req: ^h2.Request) -> (resp: h2.Response, ok: bool) {
 	path, query := h2_split_path(req.path)
+
+	mc_path := ctx.server.cfg.listeners.doh.mobileconfig_path
+	if mc_path != "" && path == mc_path {
+		return build_h2_mobileconfig(ctx, req)
+	}
 	if path != ctx.path {
 		return h2_error(404, "not found"), true
 	}
@@ -245,6 +250,31 @@ build_h2_response :: proc(ctx: ^H2_Context, req: ^h2.Request) -> (resp: h2.Respo
 			content_type = DOH_CONTENT_TYPE,
 			cache_control = h2_cache_control(answer),
 			body = answer,
+		},
+		true
+}
+
+/*
+Answer the .mobileconfig endpoint over HTTP/2.
+
+The HTTP/1.1 endpoint's twin: a GET returns the Apple profile, the URL inside it
+built from the request's `:authority` - the HTTP/2 spelling of `Host` - so a
+stream carrying none, or one for a host this server has no certificate for, is
+turned away rather than handed a profile that names an unreachable host.
+*/
+@(private)
+build_h2_mobileconfig :: proc(ctx: ^H2_Context, req: ^h2.Request) -> (resp: h2.Response, ok: bool) {
+	if req.method != "GET" {
+		return h2_error(405, "method not allowed"), true
+	}
+	if !valid_mobileconfig_host(req.authority) {
+		return h2_error(400, "missing or invalid :authority"), true
+	}
+	profile := build_doh_mobileconfig(req.authority, ctx.path, context.temp_allocator)
+	return h2.Response {
+			status = 200,
+			content_type = DOH_MOBILECONFIG_CONTENT_TYPE,
+			body = transmute([]u8)profile,
 		},
 		true
 }

@@ -754,6 +754,14 @@ start_doh :: proc(s: ^Server, l: ^Listeners) -> bool {
 		return false
 	}
 	logx.infof("listening for DNS-over-HTTPS on %s:%d%s", cfg.address, cfg.port, cfg.path)
+	if cfg.mobileconfig_path != "" {
+		logx.infof(
+			"serving the Apple .mobileconfig profile on %s:%d%s",
+			cfg.address,
+			cfg.port,
+			cfg.mobileconfig_path,
+		)
+	}
 	return true
 }
 

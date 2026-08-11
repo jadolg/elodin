@@ -281,6 +281,7 @@ load_listener :: proc(l: ^Loader, parent: ^yaml.Node, key: string, dst: ^Listene
 	}
 	if key == "doh" {
 		opt_string(l, n, "path", &dst.path, path)
+		opt_string(l, n, "mobileconfig_path", &dst.mobileconfig_path, path)
 	}
 }
 
@@ -864,6 +865,17 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 
 	if cfg.listeners.doh.enabled && !strings.has_prefix(cfg.listeners.doh.path, "/") {
 		errorf(l, "listeners.doh.path: must start with '/'")
+	}
+	// The profile endpoint shares the DoH listener, so it has to be a path of its
+	// own: absolute, and not the one that answers queries — a request cannot be
+	// both a DNS message and a download of the profile that points at it.
+	if cfg.listeners.doh.enabled && cfg.listeners.doh.mobileconfig_path != "" {
+		if !strings.has_prefix(cfg.listeners.doh.mobileconfig_path, "/") {
+			errorf(l, "listeners.doh.mobileconfig_path: must start with '/'")
+		}
+		if cfg.listeners.doh.mobileconfig_path == cfg.listeners.doh.path {
+			errorf(l, "listeners.doh.mobileconfig_path: must not be the same as listeners.doh.path")
+		}
 	}
 
 	if cfg.metrics.enabled {

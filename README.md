@@ -4,6 +4,7 @@ A filtering DNS forwarder in [Odin](https://odin-lang.org), in the spirit of
 Pi-hole and AdGuard Home, minus the web interface. One binary, one YAML file.
 
 - Serves plain DNS (UDP + TCP), DNS-over-TLS and DNS-over-HTTPS (HTTP/2 and HTTP/1.1)
+- Hands Apple devices a `.mobileconfig` profile to point themselves at the DoH endpoint
 - Forwards to plain, TCP, DoT and DoH upstreams
 - Three upstream strategies: failover, round-robin and race
 - Sink lists in hosts, plain-domain and adblock syntax, with allowlists
@@ -407,10 +408,28 @@ listeners:
     path: /dns-query
     cert_file: /etc/elodin/cert.pem
     key_file: /etc/elodin/key.pem
+    mobileconfig_path: /apple-doh.mobileconfig
 ```
 
 Both request forms of RFC 8484 are accepted on either version: `POST` with an
 `application/dns-message` body, and `GET` with a base64url `dns` parameter.
+
+#### Apple devices (iOS, iPadOS, macOS)
+
+Encrypted DNS on iOS 14 / macOS 11 and later is configured with a profile rather
+than an app. The DoH listener serves one: browse to `mobileconfig_path` on the
+device — `https://dns.example.com/apple-doh.mobileconfig` — and it downloads a
+`.mobileconfig` that, once installed under **Settings → General → VPN & Device
+Management**, sends the device's DNS to this resolver over HTTPS system-wide.
+
+The `ServerURL` inside the profile is built from the host the request arrived on,
+so it always matches the name the certificate is for and the port the listener
+is on; a listener answering on several names hands each device a profile for the
+one it used. The profile is unsigned, so the device shows it as *Unverified* on
+install, which is expected for a self-hosted resolver. Reinstalling replaces the
+profile rather than stacking a duplicate — its identifiers are derived from the
+URL, so the same endpoint always yields the same profile. Set
+`mobileconfig_path: ""` to withhold it; it is served only while DoH is enabled.
 
 Requests arriving on one HTTP/2 connection are answered on the query worker pool
 rather than one after another on the connection's reader thread, so the A and
@@ -1317,6 +1336,7 @@ What it covers:
 | shutdown | `SIGTERM` produces an orderly exit rather than a killed process |
 | wire format | all 23 captured fixtures replayed and compared byte for byte, EDNS forwarding, 0x20 case preservation, truncation and the TC bit, FORMERR / NOTIMP / silent-drop handling |
 | listeners | UDP, TCP (single and pipelined), DoT, DoH POST and GET, keep-alive, two pipelined requests in one segment, 404 / 405 / 415 / 400 |
+| Apple profile | the `.mobileconfig` built from the request host end to end over HTTP/1.1, its `ServerURL` and managed-DNS payload, a non-standard port kept, stable and distinct UUIDs, XML escaping, host validation, GET-only |
 | DoH over HTTP/2 | ALPN selection, POST and GET, Huffman-coded headers, CONTINUATION, a dynamic table size update at and past the advertised limit, concurrent streams proved parallel by timing, flow control with a tiny window, DATA splitting for a 27 KiB answer, PING, RST_STREAM, error statuses, HTTP/1.1 fallback |
 | DoH upstreams | a query resolved over an h2 upstream, one connection multiplexed across queries rather than reopened, fallback to HTTP/1.1 when the upstream does not offer h2 |
 | blocking | all five response modes, hosts vs domains vs adblock semantics, allow precedence, wildcards, modifiers, dnsmasq syntax, unusable rules, case folding |

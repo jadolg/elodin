@@ -134,6 +134,13 @@ listeners:
     path: /dns-query
     cert_file: certs/cert.pem
     key_file: certs/key.pem
+    # An iPhone, iPad or Mac points itself at this resolver by installing an
+    # encrypted-DNS configuration profile. Browse to this path on the device and
+    # it downloads a .mobileconfig that, once installed, sends all of the
+    # device's DNS here over HTTPS — no app needed. The URL inside the profile is
+    # built from the address you reached it on, so it matches the certificate
+    # above. Set it to "" to withhold the profile.
+    mobileconfig_path: /apple-doh.mobileconfig
 
 upstream:
   # failover     try servers in order, move on when one fails
