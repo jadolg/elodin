@@ -2048,6 +2048,21 @@ test_malformed_requests_are_reset :: proc(t: ^testing.T) {
 			"empty :path",
 			{{":method", "GET"}, {":scheme", "https"}, {":authority", "dns.example"}, {":path", ""}},
 		},
+		// 8.3.1 asks for one valid value, and an empty one is not a value. An
+		// empty :scheme is the one that bites: it is what selects the :path
+		// checks, so without this it carries any :path at all past them.
+		{
+			"empty :method",
+			{{":method", ""}, {":scheme", "https"}, {":authority", "dns.example"}, {":path", "/dns-query"}},
+		},
+		{
+			"empty :scheme",
+			{{":method", "GET"}, {":scheme", ""}, {":authority", "dns.example"}, {":path", "/dns-query"}},
+		},
+		{
+			"empty :scheme carrying a path that is not origin-form",
+			{{":method", "GET"}, {":scheme", ""}, {":authority", "dns.example"}, {":path", "dns-query"}},
+		},
 		{
 			"absolute-form :path",
 			{
@@ -2155,6 +2170,17 @@ test_conformant_requests_are_served :: proc(t: ^testing.T) {
 		{"no :authority", {{":method", "GET"}, {":scheme", "https"}, {":path", "/dns-query"}}},
 		// Asterisk-form, which is only OPTIONS' to use.
 		{"OPTIONS *", {{":method", "OPTIONS"}, {":scheme", "https"}, {":authority", "dns.example"}, {":path", "*"}}},
+		/*
+		8.5: a CONNECT with an authority and neither :scheme nor :path is
+		conformant, and has to be recognised as conformant even though this end
+		does not implement the method - the three checks above it are the ones a
+		request that is not CONNECT must pass, and applying them here would
+		refuse a well-formed request under the name of malformed.
+
+		What becomes of it is the handler's to decide: no :path means the empty
+		one, which matches no endpoint, so it draws a 404.
+		*/
+		{"CONNECT with only :authority", {{":method", "CONNECT"}, {":authority", "dns.example"}}},
 	}
 
 	for c in cases {

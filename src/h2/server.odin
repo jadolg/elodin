@@ -696,8 +696,9 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 	/*
 	8.5: CONNECT carries `:authority` and neither `:scheme` nor `:path`. Not
 	implemented here, but a conformant one still has to be recognised as
-	conformant - turning it away is the handler's job, with a 405, and not this
-	procedure's under the name of malformed.
+	conformant - turning it away is the handler's job, and not this procedure's
+	under the name of malformed. It carries no `:path`, so what the handler
+	matches it against is the empty one and what it answers is a 404.
 	*/
 	if method == "CONNECT" {
 		return !have_authority || have_scheme || have_path
@@ -705,6 +706,16 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 
 	// 8.3.1: the three every other request must carry.
 	if !have_method || !have_scheme || !have_path {
+		return true
+	}
+	/*
+	One valid value each, which 8.3.1 asks for and which an empty string is not:
+	`:method` is a token and `:scheme` is a scheme, and neither grammar admits
+	nothing at all. `:scheme` is worth more than tidiness here - it is what
+	selects the `:path` checks below, so an empty one carried any `:path` at all
+	straight past them.
+	*/
+	if len(method) == 0 || len(scheme) == 0 {
 		return true
 	}
 	/*

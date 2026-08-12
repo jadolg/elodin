@@ -446,8 +446,9 @@ A decoded header list is checked against RFC 9113 sections 8.2 and 8.3 before it
 becomes a request: connection-specific fields (`connection`,
 `transfer-encoding`, `keep-alive`, `proxy-connection`, `upgrade`, and any `te`
 other than `trailers`), uppercase or non-token field names, values carrying NUL,
-CR, LF or edge whitespace, repeated, unknown or late pseudo-headers, and a
-missing or non-origin-form `:path` each make the request malformed, which is a
+CR, LF or edge whitespace, repeated, unknown or late pseudo-headers, an empty
+`:method` or `:scheme`, and a missing or non-origin-form `:path` each make the
+request malformed, which is a
 stream error of type PROTOCOL_ERROR. Nothing here is proxied onward, so none of
 it is a request-smuggling primitive on its own; it becomes one as soon as
 another hop sits in front of or behind this endpoint, and the HTTP/1.1 side
