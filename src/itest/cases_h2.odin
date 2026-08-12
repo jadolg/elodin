@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:strings"
 import "core:time"
 import "elodin:dns"
+import "elodin:h2"
 
 /*
 DoH over HTTP/2.
@@ -334,6 +335,63 @@ run_h2_cases :: proc(r: ^Runner) {
 			if check(r, h2_collect(c, []u32{3}), "stream 3 never completed after a reset") {
 				res, _ := h2_stream(c, 3)
 				check_eq_int(r, res.status, 200, "status on the stream after a reset")
+			}
+		}
+	}
+	end_case(r)
+
+	/*
+	RFC 9113 8.2 and 8.3: a request carrying a connection-specific field, or an
+	uppercase field name, is malformed - a stream error of type PROTOCOL_ERROR,
+	not something to answer. Driven over the real transport rather than only
+	against `finish_headers` because the answer has to be an RST_STREAM that
+	leaves the connection usable, and it is the connection that the streams
+	after it depend on.
+	*/
+	start_case(r, "h2: a malformed request is reset and the connection carries on")
+	{
+		Case :: struct {
+			what:  string,
+			field: H2_Field,
+		}
+		cases := []Case {
+			{"transfer-encoding", {"transfer-encoding", "chunked"}},
+			{"connection", {"connection", "keep-alive"}},
+			{"te other than trailers", {"te", "gzip"}},
+			{"an uppercase field name", {"X-Smuggled", "1"}},
+		}
+		for tc in cases {
+			c, cok := h2_connect(doh_port)
+			if !check(r, cok, "cannot open an h2 connection for %s", tc.what) {
+				continue
+			}
+			defer h2_close(c)
+
+			check(
+				r,
+				h2_send_request(c, 1, "POST", "/dns-query", query, extra = []H2_Field{tc.field}),
+				"cannot send the malformed request with %s",
+				tc.what,
+			)
+			if check(r, h2_collect(c, []u32{1}), "stream 1 never ended for %s", tc.what) {
+				res, _ := h2_stream(c, 1)
+				check(r, res.reset, "%s was answered instead of reset", tc.what)
+				check_eq_int(
+					r,
+					int(res.reset_code),
+					int(h2.Error_Code.Protocol_Error),
+					fmt.tprintf("reset code for a request with %s", tc.what),
+				)
+				check_eq_int(r, res.status, 0, fmt.tprintf("status for a request with %s", tc.what))
+			}
+
+			// The connection is the peer's, not the request's: a later stream on
+			// it must still be served.
+			check(r, !c.goaway, "a malformed request took the whole connection down for %s", tc.what)
+			check(r, h2_send_request(c, 3, "POST", "/dns-query", query), "cannot send stream 3 after %s", tc.what)
+			if check(r, h2_collect(c, []u32{3}), "stream 3 never completed after %s", tc.what) {
+				res, _ := h2_stream(c, 3)
+				check_eq_int(r, res.status, 200, fmt.tprintf("status on the stream after %s", tc.what))
 			}
 		}
 	}
