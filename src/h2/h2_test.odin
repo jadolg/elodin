@@ -1672,8 +1672,11 @@ test_refused_stream_still_decodes_its_header_block :: proc(t: ^testing.T) {
 
 	// Free a slot and send a stream that references index 62. With the decoder in
 	// step it decodes; desynchronised it is Bad_Index and a COMPRESSION_ERROR.
+	// The three static entries ahead of it (:method GET, :scheme http, :path /)
+	// are what make it a request rather than a bare field, so it is accepted for
+	// the reason under test and not turned away as malformed.
 	close_stream(c, 1)
-	next_block := []u8{0xbe}
+	next_block := []u8{0x82, 0x86, 0x84, 0xbe}
 	next_id := refused_id + 2
 	nok := handle_headers(
 		c,
@@ -1776,4 +1779,440 @@ test_data_on_a_refused_stream_returns_connection_credit :: proc(t: ^testing.T) {
 	conn_unref(c)
 	free_all(context.temp_allocator)
 	expect_no_leaks(t, &track, "data on a refused stream")
+}
+
+// ---------------------------------------------------------------------------
+// Malformed requests (RFC 9113 sections 8.2 and 8.3)
+// ---------------------------------------------------------------------------
+
+/*
+Records what a connection wrote back and how many requests reached the handler,
+which together say whether a header list was served or turned away.
+*/
+@(private = "file")
+Request_Log :: struct {
+	rsts:       int,
+	rst_code:   Error_Code,
+	goaway:     bool,
+	dispatched: int,
+}
+
+@(private = "file")
+request_log_write :: proc(user: rawptr, buf: []u8) -> bool {
+	log := cast(^Request_Log)user
+	if log == nil {
+		return true
+	}
+	pos := 0
+	for pos + FRAME_HEADER_SIZE <= len(buf) {
+		h, ok := parse_frame_header(buf[pos:])
+		if !ok {
+			break
+		}
+		body := buf[pos + FRAME_HEADER_SIZE:]
+		#partial switch h.type {
+		case .Rst_Stream:
+			if len(body) >= 4 {
+				log.rsts += 1
+				log.rst_code = Error_Code(read_u32(body))
+			}
+		case .Goaway:
+			log.goaway = true
+		}
+		pos += FRAME_HEADER_SIZE + h.length
+	}
+	return true
+}
+
+@(private = "file")
+counting_handler :: proc(conn: ^Conn, req: ^Request) {
+	log := cast(^Request_Log)conn.user
+	if log != nil {
+		log.dispatched += 1
+	}
+	request_destroy(conn, req)
+}
+
+@(private = "file")
+Field :: struct {
+	name:  string,
+	value: string,
+}
+
+// HPACK literal without indexing, new name: no table state, so a block with any
+// field name at all can be built here without going through the encoder - which
+// only ever emits names the static table knows.
+@(private = "file")
+put_field :: proc(out: ^[dynamic]u8, name, value: string) {
+	append(out, 0x00)
+	write_string(out, name)
+	write_string(out, value)
+}
+
+@(private = "file")
+build_block :: proc(fields: []Field) -> []u8 {
+	out := make([dynamic]u8, 0, 128, context.temp_allocator)
+	for f in fields {
+		put_field(&out, f.name, f.value)
+	}
+	return out[:]
+}
+
+/*
+Every field list below is malformed under RFC 9113 8.2 or 8.3, and each is a
+stream error of type PROTOCOL_ERROR: the request must be reset rather than
+answered, and the connection must survive so the streams around it are not
+punished for it.
+
+Nothing here is proxied onward today, so none of it is a smuggling primitive on
+its own. It becomes one the moment another hop sits in front of or behind this
+endpoint - an h2-to-h1 front end that downgrades a request carrying
+`transfer-encoding` is the classic h2.TE desync - and the HTTP/1.1 side of this
+codebase already refuses the same shapes.
+*/
+@(test)
+test_malformed_requests_are_reset :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	Case :: struct {
+		what:   string,
+		fields: []Field,
+	}
+	cases := []Case {
+		// 8.2.2: connection-specific fields have no place in HTTP/2.
+		{
+			"connection",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+				{"connection", "keep-alive"},
+			},
+		},
+		{
+			"transfer-encoding",
+			{
+				{":method", "POST"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+				{"transfer-encoding", "chunked"},
+			},
+		},
+		{
+			"keep-alive",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+				{"keep-alive", "timeout=5"},
+			},
+		},
+		{
+			"proxy-connection",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+				{"proxy-connection", "keep-alive"},
+			},
+		},
+		{
+			"upgrade",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+				{"upgrade", "websocket"},
+			},
+		},
+		// 8.2.2 allows exactly one te value.
+		{
+			"te other than trailers",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+				{"te", "gzip"},
+			},
+		},
+		// 8.2.1: field names are lowercase, and are tokens.
+		{
+			"uppercase field name",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+				{"X-Forwarded-For", "203.0.113.1"},
+			},
+		},
+		{
+			"field name that is not a token",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+				{"bad name", "x"},
+			},
+		},
+		{
+			"empty field name",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+				{"", "x"},
+			},
+		},
+		// 8.2.1: NUL, CR and LF are never part of a field value, and neither is
+		// leading or trailing whitespace.
+		{
+			"newline in a field value",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+				{"accept", "text/plain\r\nx-injected: 1"},
+			},
+		},
+		{
+			"nul in a field value",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+				{"accept", "text/plain\x00"},
+			},
+		},
+		{
+			"padded field value",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+				{"accept", " text/plain"},
+			},
+		},
+		// 8.3: pseudo-headers come first, appear once, and are only the four
+		// this specification defines for a request.
+		{
+			"duplicate pseudo-header",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+				{":path", "/somewhere-else"},
+			},
+		},
+		{
+			"unknown pseudo-header",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+				{":protocol", "websocket"},
+			},
+		},
+		{
+			"pseudo-header after a regular field",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":path", "/dns-query"},
+				{"accept", "application/dns-message"},
+				{":authority", "dns.example"},
+			},
+		},
+		// 8.3.1: the three mandatory pseudo-headers, and what :path may hold.
+		{"no pseudo-headers at all", {{"accept", "application/dns-message"}}},
+		{"missing :method", {{":scheme", "https"}, {":authority", "dns.example"}, {":path", "/dns-query"}}},
+		{"missing :scheme", {{":method", "GET"}, {":authority", "dns.example"}, {":path", "/dns-query"}}},
+		{"missing :path", {{":method", "GET"}, {":scheme", "https"}, {":authority", "dns.example"}}},
+		{
+			"empty :path",
+			{{":method", "GET"}, {":scheme", "https"}, {":authority", "dns.example"}, {":path", ""}},
+		},
+		// 8.3.1 asks for one valid value, and an empty one is not a value. An
+		// empty :scheme is the one that bites: it is what selects the :path
+		// checks, so without this it carries any :path at all past them.
+		{
+			"empty :method",
+			{{":method", ""}, {":scheme", "https"}, {":authority", "dns.example"}, {":path", "/dns-query"}},
+		},
+		{
+			"empty :scheme",
+			{{":method", "GET"}, {":scheme", ""}, {":authority", "dns.example"}, {":path", "/dns-query"}},
+		},
+		{
+			"empty :scheme carrying a path that is not origin-form",
+			{{":method", "GET"}, {":scheme", ""}, {":authority", "dns.example"}, {":path", "dns-query"}},
+		},
+		{
+			"absolute-form :path",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "https://elsewhere.example/dns-query"},
+			},
+		},
+		{
+			"asterisk :path outside OPTIONS",
+			{{":method", "GET"}, {":scheme", "https"}, {":authority", "dns.example"}, {":path", "*"}},
+		},
+		// 8.5: CONNECT carries an authority and nothing else.
+		{
+			"CONNECT with :scheme and :path",
+			{
+				{":method", "CONNECT"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+			},
+		},
+		{"CONNECT without :authority", {{":method", "CONNECT"}}},
+	}
+
+	for c in cases {
+		log: Request_Log
+		conn := make_conn(
+			IO{user = &log, read = no_read, write = request_log_write},
+			counting_handler,
+			&log,
+			allocator,
+		)
+
+		block := build_block(c.fields)
+		ok := handle_headers(
+			conn,
+			Frame_Header {
+				length = len(block),
+				type = .Headers,
+				flags = FLAG_END_HEADERS | FLAG_END_STREAM,
+				stream_id = 1,
+			},
+			block,
+		)
+
+		testing.expectf(t, ok, "%s: the connection was torn down for a stream error", c.what)
+		testing.expectf(t, !log.goaway, "%s: a malformed request was answered with GOAWAY", c.what)
+		testing.expectf(t, log.dispatched == 0, "%s: a malformed request reached the handler", c.what)
+		testing.expectf(t, log.rsts == 1, "%s: %d RST_STREAM frames, want 1", c.what, log.rsts)
+		testing.expectf(
+			t,
+			log.rst_code == .Protocol_Error,
+			"%s: RST_STREAM carried %v, want Protocol_Error",
+			c.what,
+			log.rst_code,
+		)
+		_, still_open := conn.streams[1]
+		testing.expectf(t, !still_open, "%s: the reset stream was left in the table", c.what)
+
+		conn_unref(conn)
+		free_all(context.temp_allocator)
+	}
+
+	expect_no_leaks(t, &track, "malformed requests")
+}
+
+// The other half of the check above: a conformant request still gets through,
+// including the field values 8.2.2 does allow.
+@(test)
+test_conformant_requests_are_served :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	Case :: struct {
+		what:   string,
+		fields: []Field,
+	}
+	cases := []Case {
+		{
+			"a DoH GET",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query?dns=AAABAAABAAAAAAAA"},
+				{"accept", "application/dns-message"},
+			},
+		},
+		{
+			"te: trailers",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+				{"te", "trailers"},
+			},
+		},
+		// No :authority: legal, and what a client with no authority to convey
+		// sends. Only :method, :scheme and :path are mandatory.
+		{"no :authority", {{":method", "GET"}, {":scheme", "https"}, {":path", "/dns-query"}}},
+		// Asterisk-form, which is only OPTIONS' to use.
+		{"OPTIONS *", {{":method", "OPTIONS"}, {":scheme", "https"}, {":authority", "dns.example"}, {":path", "*"}}},
+		/*
+		8.5: a CONNECT with an authority and neither :scheme nor :path is
+		conformant, and has to be recognised as conformant even though this end
+		does not implement the method - the three checks above it are the ones a
+		request that is not CONNECT must pass, and applying them here would
+		refuse a well-formed request under the name of malformed.
+
+		What becomes of it is the handler's to decide: no :path means the empty
+		one, which matches no endpoint, so it draws a 404.
+		*/
+		{"CONNECT with only :authority", {{":method", "CONNECT"}, {":authority", "dns.example"}}},
+	}
+
+	for c in cases {
+		log: Request_Log
+		conn := make_conn(
+			IO{user = &log, read = no_read, write = request_log_write},
+			counting_handler,
+			&log,
+			allocator,
+		)
+
+		block := build_block(c.fields)
+		ok := handle_headers(
+			conn,
+			Frame_Header {
+				length = len(block),
+				type = .Headers,
+				flags = FLAG_END_HEADERS | FLAG_END_STREAM,
+				stream_id = 1,
+			},
+			block,
+		)
+
+		testing.expectf(t, ok, "%s: the connection was torn down", c.what)
+		testing.expectf(t, log.rsts == 0, "%s: a conformant request drew an RST_STREAM", c.what)
+		testing.expectf(t, !log.goaway, "%s: a conformant request drew a GOAWAY", c.what)
+		testing.expectf(t, log.dispatched == 1, "%s: %d requests reached the handler, want 1", c.what, log.dispatched)
+
+		close_stream(conn, 1)
+		conn_unref(conn)
+		free_all(context.temp_allocator)
+	}
+
+	expect_no_leaks(t, &track, "conformant requests")
 }

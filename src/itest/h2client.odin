@@ -25,6 +25,15 @@ H2_Stream_Result :: struct {
 	data_frames: int,
 	done:        bool,
 	reset:       bool,
+	// The code the server put in the RST_STREAM, which is what says why the
+	// stream was refused rather than merely that it was.
+	reset_code:  h2.Error_Code,
+}
+
+// A request field beyond the four pseudo-headers every request carries.
+H2_Field :: struct {
+	name:  string,
+	value: string,
 }
 
 H2_Client :: struct {
@@ -169,6 +178,9 @@ h2_send_request :: proc(
 	// A dynamic table size update at the head of the block, where HPACK
 	// requires one to be. Negative sends none.
 	table_update := -1,
+	// Sent after the fields above, so a check can put a field of its own on a
+	// request that is otherwise ordinary.
+	extra: []H2_Field = nil,
 ) -> bool {
 	block := make([dynamic]u8, 0, 128, context.temp_allocator)
 	if table_update >= 0 {
@@ -182,6 +194,9 @@ h2_send_request :: proc(
 		h2_literal(&block, "content-type", content_type, huffman)
 	}
 	h2_literal(&block, "accept", "application/dns-message", huffman)
+	for f in extra {
+		h2_literal(&block, f.name, f.value, huffman)
+	}
 
 	end_stream: u8 = h2.FLAG_END_STREAM if len(body) == 0 else 0
 	out := make([dynamic]u8, 0, len(block) + 32, context.temp_allocator)
@@ -327,6 +342,9 @@ h2_handle :: proc(c: ^H2_Client, header: h2.Frame_Header, payload: []u8) -> bool
 	case .Rst_Stream:
 		r := h2_result(c, header.stream_id)
 		r.reset = true
+		if len(payload) >= 4 {
+			r.reset_code = h2.Error_Code(h2.read_u32(payload))
+		}
 
 	case .Headers:
 		block, ok := h2.strip_padding(payload, header.flags)

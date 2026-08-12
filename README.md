@@ -442,6 +442,18 @@ table, HEADERS with CONTINUATION, DATA, connection- and stream-level flow
 control, WINDOW_UPDATE, PING, RST_STREAM and GOAWAY. Server push is refused in
 SETTINGS and stream priority is parsed and ignored, which RFC 9113 permits.
 
+A decoded header list is checked against RFC 9113 sections 8.2 and 8.3 before it
+becomes a request: connection-specific fields (`connection`,
+`transfer-encoding`, `keep-alive`, `proxy-connection`, `upgrade`, and any `te`
+other than `trailers`), uppercase or non-token field names, values carrying NUL,
+CR, LF or edge whitespace, repeated, unknown or late pseudo-headers, an empty
+`:method` or `:scheme`, and a missing or non-origin-form `:path` each make the
+request malformed, which is a
+stream error of type PROTOCOL_ERROR. Nothing here is proxied onward, so none of
+it is a request-smuggling primitive on its own; it becomes one as soon as
+another hop sits in front of or behind this endpoint, and the HTTP/1.1 side
+already refuses the same shapes.
+
 What one connection may make this end hold is stated in that SETTINGS frame
 rather than left to be discovered: 128 concurrent streams, a 32 KiB header list,
 and a 4096-byte HPACK table, which is also the ceiling on the dynamic table size
@@ -1284,16 +1296,16 @@ Two layers, both run by `mise run verify`. A third, `mise run bench`, measures
 rather than asserts: it is where every number in [Capacity](#capacity) comes
 from, and it is documented in [`bench/README.md`](bench/README.md).
 
-**Unit tests** (`mise run test`, 384 cases) cover the message codec — round trips
+**Unit tests** (`mise run test`, 403 cases) cover the message codec — round trips
 for every modelled RDATA type, compression, truncation, EDNS, pointer loops,
 hostile record counts — plus the YAML parser, configuration loading, list
 parsing and matching, the cache, and the HTTP/2 codec — the HPACK cases run the
 worked examples from RFC 7541 appendix C, so the codec is checked against the
 specification's own vectors rather than against itself.
 
-They run per package, so a failure names one: `dns` 34, `yaml` 34, `config` 54,
-`filter` 8, `logx` 1, `metrics` 9, `privdrop` 9, `cache` 13, `dnssec` 37,
-`tlsx` 5, `upstream` 30, `h2` 67, `server` 83. Much of `tlsx`, `upstream`, `h2` and `server` is what the
+They run per package, so a failure names one: `dns` 34, `yaml` 34, `config` 55,
+`filter` 8, `logx` 1, `metrics` 9, `privdrop` 9, `cache` 13, `dnssec` 39,
+`tlsx` 5, `upstream` 31, `h2` 69, `server` 96. Much of `tlsx`, `upstream`, `h2` and `server` is what the
 suite grew for the bugs recorded below — the HTTP reader's framing and body limits,
 the TLS handshake retry, the HTTP/2 stream table under RST_STREAM, and the DoH
 request parser read against an allocator that scribbles over what it releases.
@@ -1315,7 +1327,7 @@ denial is checked against, and a response built to make one question cost as man
 upstream lookups as possible. Each was checked against the code as it stood
 before the fix, so they are known to fail when the property they guard does.
 
-**Integration tests** (`mise run itest`, 185 cases, ~50s) start the built binary
+**Integration tests** (`mise run itest`, 190 cases, ~50s) start the built binary
 as a separate process against scripted mock upstreams, so what is exercised is
 the artefact that ships rather than the library it was compiled from. The suite
 is hermetic: no public resolver is contacted, ports are allocated from a private
@@ -1337,7 +1349,7 @@ What it covers:
 | wire format | all 23 captured fixtures replayed and compared byte for byte, EDNS forwarding, 0x20 case preservation, truncation and the TC bit, FORMERR / NOTIMP / silent-drop handling |
 | listeners | UDP, TCP (single and pipelined), DoT, DoH POST and GET, keep-alive, two pipelined requests in one segment, 404 / 405 / 415 / 400 |
 | Apple profile | the `.mobileconfig` downloaded end to end over HTTP/1.1 and HTTP/2, its `ServerURL` built from the request host / `:authority`, the managed-DNS payload and Apple content type, GET-only |
-| DoH over HTTP/2 | ALPN selection, POST and GET, Huffman-coded headers, CONTINUATION, a dynamic table size update at and past the advertised limit, concurrent streams proved parallel by timing, flow control with a tiny window, DATA splitting for a 27 KiB answer, PING, RST_STREAM, error statuses, HTTP/1.1 fallback |
+| DoH over HTTP/2 | ALPN selection, POST and GET, Huffman-coded headers, CONTINUATION, a dynamic table size update at and past the advertised limit, concurrent streams proved parallel by timing, flow control with a tiny window, DATA splitting for a 27 KiB answer, PING, RST_STREAM, malformed requests reset with PROTOCOL_ERROR while the connection carries on, error statuses, HTTP/1.1 fallback |
 | DoH upstreams | a query resolved over an h2 upstream, one connection multiplexed across queries rather than reopened, fallback to HTTP/1.1 when the upstream does not offer h2 |
 | blocking | all five response modes, hosts vs domains vs adblock semantics, allow precedence, wildcards, modifiers, dnsmasq syntax, unusable rules, case folding |
 | rewrites | A, AAAA, CNAME, wildcard scope, `block`, NODATA for unmatched types |

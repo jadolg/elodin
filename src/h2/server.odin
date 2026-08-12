@@ -606,6 +606,182 @@ handle_continuation :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 }
 
 /*
+Whether a decoded request header list is malformed under RFC 9113 8.2 and 8.3.
+
+One pass over the list, no allocation. `finish_headers` keeps six fields and
+drops the rest, so without this the checks the specification asks for would be
+made against the six that survived - and a `transfer-encoding` this end never
+looks at would be dropped in silence rather than refused.
+
+Silence is safe only for as long as elodin is the last hop. It terminates every
+request it accepts and reflects no field onward, so none of this is a smuggling
+primitive here today; it becomes one the moment another hop sits in front of or
+behind this endpoint, an h2-to-h1 front end that downgrades a request carrying
+`transfer-encoding` being the classic h2.TE desync. The HTTP/1.1 side of this
+codebase already refuses the same shapes, and the two should not disagree about
+what a request is.
+*/
+@(private)
+request_is_malformed :: proc(headers: []Header_Field) -> bool {
+	method, scheme, path: string
+	have_method, have_scheme, have_path, have_authority: bool
+	// Set by the first ordinary field, which is where the pseudo-headers end.
+	seen_regular: bool
+
+	for f in headers {
+		if len(f.name) == 0 || !field_value_is_valid(f.value) {
+			return true
+		}
+
+		if f.name[0] == ':' {
+			// 8.3: every pseudo-header comes before the ordinary fields.
+			if seen_regular {
+				return true
+			}
+			/*
+			A repeat is malformed, and it is worth being explicit about why the
+			check is here rather than left to `take`. That procedure keeps the
+			first value and frees the rest, which is right for memory and wrong
+			for the protocol: two `:path` fields would be answered from the
+			first, and a hop that resolved the same request the other way round
+			would answer from the second.
+			*/
+			switch f.name {
+			case ":method":
+				if have_method {
+					return true
+				}
+				have_method, method = true, f.value
+			case ":scheme":
+				if have_scheme {
+					return true
+				}
+				have_scheme, scheme = true, f.value
+			case ":path":
+				if have_path {
+					return true
+				}
+				have_path, path = true, f.value
+			case ":authority":
+				if have_authority {
+					return true
+				}
+				have_authority = true
+			case:
+				// 8.3 again: a request has those four and no others. `:protocol`
+				// lands here too, which is the answer this end wants - extended
+				// CONNECT is not implemented.
+				return true
+			}
+			continue
+		}
+
+		seen_regular = true
+		if !field_name_is_valid(f.name) {
+			return true
+		}
+		switch f.name {
+		case "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade":
+			// 8.2.2: connection-specific fields have no meaning in HTTP/2, where
+			// the connection is shared by every stream on it.
+			return true
+		case "te":
+			// The one exception 8.2.2 makes, and only for this value.
+			if f.value != "trailers" {
+				return true
+			}
+		}
+	}
+
+	/*
+	8.5: CONNECT carries `:authority` and neither `:scheme` nor `:path`. Not
+	implemented here, but a conformant one still has to be recognised as
+	conformant - turning it away is the handler's job, and not this procedure's
+	under the name of malformed. It carries no `:path`, so what the handler
+	matches it against is the empty one and what it answers is a 404.
+	*/
+	if method == "CONNECT" {
+		return !have_authority || have_scheme || have_path
+	}
+
+	// 8.3.1: the three every other request must carry.
+	if !have_method || !have_scheme || !have_path {
+		return true
+	}
+	/*
+	One valid value each, which 8.3.1 asks for and which an empty string is not:
+	`:method` is a token and `:scheme` is a scheme, and neither grammar admits
+	nothing at all. `:scheme` is worth more than tidiness here - it is what
+	selects the `:path` checks below, so an empty one carried any `:path` at all
+	straight past them.
+	*/
+	if len(method) == 0 || len(scheme) == 0 {
+		return true
+	}
+	/*
+	And what `:path` may hold: for http and https it is origin-form, non-empty
+	and rooted, with asterisk-form reserved to OPTIONS. Any other scheme's path
+	is not this specification's to constrain, and is nothing this endpoint would
+	match in any case.
+
+	An absent `:path` used to arrive as "", which fails the comparison in
+	`build_h2_response` and 404s - safe by accident rather than by check, and
+	only for as long as that comparison is what the path is used for.
+	*/
+	if scheme == "http" || scheme == "https" {
+		if path == "*" {
+			return method != "OPTIONS"
+		}
+		if len(path) == 0 || path[0] != '/' {
+			return true
+		}
+	}
+	return false
+}
+
+/*
+RFC 9113 8.2.1: a field name is an RFC 9110 token, and lowercase. Uppercase is
+not folded on receipt but malformed, so that two hops cannot disagree about
+which of `Transfer-Encoding` and `transfer-encoding` they were sent.
+*/
+@(private)
+field_name_is_valid :: proc(name: string) -> bool {
+	for i in 0 ..< len(name) {
+		switch name[i] {
+		case 'a' ..= 'z', '0' ..= '9':
+			continue
+		case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+/*
+RFC 9113 8.2.1 again: a field value holds no NUL, CR or LF, and neither begins
+nor ends with whitespace. The three characters are what an HTTP/1.1 hop would
+read as the end of the field, or of the message, so a value carrying one is how
+a request smuggled through this end would be written.
+*/
+@(private)
+field_value_is_valid :: proc(value: string) -> bool {
+	if len(value) > 0 {
+		first, last := value[0], value[len(value) - 1]
+		if first == ' ' || first == '\t' || last == ' ' || last == '\t' {
+			return false
+		}
+	}
+	for i in 0 ..< len(value) {
+		switch value[i] {
+		case 0, '\n', '\r':
+			return false
+		}
+	}
+	return true
+}
+
+/*
 Decode a completed header block and, if the request is already complete,
 dispatch it.
 
@@ -628,6 +804,22 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 	if s.refused {
 		free_headers(headers, c.allocator)
 		sent := rst_stream(c, s.id, .Refused_Stream)
+		close_stream(c, s.id)
+		return sent
+	}
+
+	/*
+	RFC 9113 8.1.1 makes a malformed request a stream error of type
+	PROTOCOL_ERROR: the stream is reset and the connection carries on, so the
+	streams around it are not punished for one peer's bad request. Checked here
+	rather than in the DoH handler because none of it is about DNS - it is what
+	the HTTP/2 layer promises the layers above it about the request it hands
+	over, and the field that would break the promise is dropped by the loop
+	below before anyone above could see it.
+	*/
+	if request_is_malformed(headers) {
+		free_headers(headers, c.allocator)
+		sent := rst_stream(c, s.id, .Protocol_Error)
 		close_stream(c, s.id)
 		return sent
 	}
