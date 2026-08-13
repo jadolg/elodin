@@ -206,16 +206,29 @@ w_record :: proc(w: ^Writer, rec: Record) -> Encode_Error {
 		/*
 		The decoder expands these, so this only fires if something got past it:
 		a compressible type with no entry in `raw_rdata_layout` to walk, a layout
-		that stopped matching what senders write, or a blob built somewhere other
-		than a decode. None of that should happen, which is why it is worth
-		catching - a stale pointer is not visible in the answer, and the client
-		has no way to know the name it was handed is the wrong one.
+		that stopped matching what senders write, a name the walk could not
+		rebuild - a pointer aiming forwards, an expansion that will not fit a
+		name - or a blob built somewhere other than a decode. Little of that
+		should happen, which is why it is worth catching: a stale pointer is not
+		visible in the answer, and the client has no way to know the name it was
+		handed is the wrong one.
 
-		What the callers do with the failure is the reason this is safe to add:
+		Most callers degrade into something the client recovers from on its own:
 		`fit_response` falls back to an empty answer with TC set and the client
 		asks again over TCP, `ensure_edns_option` returns the answer without a
 		cookie, and `strip_dnssec_records` forwards the bytes it started from.
-		Each is a degradation the client recovers from on its own.
+
+		Two do not, and it is worth being plain about them. `remove_edns_option`
+		is how a cookie is taken back out of a message, on the way to an upstream
+		in src/server/resolver.odin and on the way back from one in
+		src/upstream/cookie.odin, and both fail closed rather than let a cookie
+		travel: the query is answered SERVFAIL and the reply is dropped for the
+		group to re-ask. So a single record whose RDATA holds a pointer nothing
+		could expand costs a cookie-using client that answer entirely. That is
+		the trade taken here anyway - such a record is malformed in its own right
+		by the time it reaches this, and a name pointing at bytes nobody chose is
+		the worse thing to hand out - but it is a whole answer, not a degraded
+		one.
 		*/
 		if raw_rdata_holds_pointer(rec.type, d.data) {
 			return .Bad_Rdata
