@@ -33,6 +33,30 @@ edns_do :: proc(m: Message) -> bool {
 	return opt.ttl & 0x0000_8000 != 0
 }
 
+/*
+The EDNS version the requestor asked in, from the second byte of the OPT
+record's TTL.
+
+RFC 6891 section 6.1.3 divides that 32-bit field into an extended rcode, this
+version number, and sixteen flag bits of which DO is the top one. The three are
+windows onto one number, and until this one was cut only the two at either end
+of it were ever looked through - so a request asking in a version this server
+does not implement was indistinguishable from one asking in version 0, and got
+an answer in a version nobody had agreed on.
+
+A message with no OPT record asked in no version at all, and zero is the right
+answer for it: a requestor that never mentioned EDNS is asking for something
+this server can answer, which is what a caller comparing against the version it
+implements needs to hear.
+*/
+edns_version :: proc(m: Message) -> u8 {
+	opt, found := find_opt(m)
+	if !found {
+		return 0
+	}
+	return u8(opt.ttl >> 16)
+}
+
 make_opt :: proc(udp_size: u16, do_bit: bool, ext_rcode: u8 = 0) -> Record {
 	ttl := u32(ext_rcode) << 24
 	if do_bit {

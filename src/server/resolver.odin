@@ -160,7 +160,42 @@ handle_query :: proc(
 		return advertise_udp_size(out, advertise, proto), .Failed, built
 	}
 
-	response, outcome, ok = resolve_query(s, query, msg, proto, client, limit, cookie, started, allocator)
+	/*
+	A requestor asking in an EDNS version this server does not implement is told
+	so, and nothing is looked up on its behalf.
+
+	RFC 6891 section 6.1.3 requires BADVERS for a VERSION the responder does not
+	implement, and 0 is the only version implemented here. Refused ahead of
+	`resolve_query` rather than somewhere inside it because the version is a
+	property of the request and not of the name: a rewrite, a blocklist hit, a
+	CHAOS answer and a cache hit would each otherwise reply in a version the two
+	ends never agreed on, and the forwarding path would put the question to an
+	upstream in the version this server chose rather than the one asked for.
+
+	The response `error_response` builds carries the extended half of rcode 16 in
+	its own OPT record, and states version 0 in the same field, which is the rest
+	of what section 6.1.3 asks for.
+
+	Not counted, matching the class, XFR and RD refusals it belongs with: none of
+	those has a counter, and `Stats.refused` is `server.allow_from` turning a
+	source away before there is a query at all. Logged for the same reason those
+	are - BADVERS answers leaving a server with nothing in the query log to
+	account for them are answers an operator has no way to trace back to here.
+	*/
+	if dns.edns_version(msg) > 0 {
+		out, built := dns.error_response(query, msg, .Bad_Vers, allocator, limit)
+		// This gate runs before the question count is checked, so there may be no
+		// question to name; one that arrives without any is refused for its
+		// version all the same.
+		q: dns.Question
+		if len(msg.question) > 0 {
+			q = msg.question[0]
+		}
+		log_query(s, client, proto, q, .Refused, "edns", started)
+		response, outcome, ok = out, .Refused, built
+	} else {
+		response, outcome, ok = resolve_query(s, query, msg, proto, client, limit, cookie, started, allocator)
+	}
 	if ok {
 		response = attach_cookie(s.cookies, response, cookie, msg, limit, advertise, allocator)
 		/*

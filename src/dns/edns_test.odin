@@ -538,3 +538,89 @@ test_raw_rdata_pointer_survives_cookie_attach :: proc(t: ^testing.T) {
 
 	free_all(context.temp_allocator)
 }
+
+/*
+The VERSION field, and the two fields it is wedged between.
+
+RFC 6891 section 6.1.3 lays the OPT record's TTL out as an extended rcode in the
+top eight bits, VERSION in the next eight, and sixteen flag bits below that, of
+which DO is the highest. The three readers over that one number are pinned
+together here because the mistake this guards against is arithmetic rather than
+logic: a shift one byte too far reports the extended rcode as the version, and
+one byte short reports the flags, and either would be read as a version this
+server implements or refuses purely by accident.
+*/
+@(test)
+test_edns_version_reads_the_middle_of_the_ttl :: proc(t: ^testing.T) {
+	asked_in :: proc(version: u8, do_bit: bool, ext_rcode: u8) -> Message {
+		opt := make_opt(1232, do_bit, ext_rcode)
+		opt.ttl |= u32(version) << 16
+		additional := make([]Record, 1, context.temp_allocator)
+		additional[0] = opt
+		return Message{additional = additional}
+	}
+
+	testing.expect_value(t, edns_version(asked_in(0, false, 0)), u8(0))
+	testing.expect_value(t, edns_version(asked_in(1, false, 0)), u8(1))
+	testing.expect_value(t, edns_version(asked_in(255, false, 0)), u8(255))
+
+	// Neither neighbour bleeds into the version, and the version bleeds into
+	// neither of them.
+	crowded := asked_in(1, true, u8(u16(Rcode.Bad_Vers) >> 4))
+	testing.expect_value(t, edns_version(crowded), u8(1))
+	testing.expect(t, edns_do(crowded), "the DO bit was lost to the version beside it")
+	testing.expect_value(t, rcode_of(crowded), Rcode.Bad_Vers)
+
+	// A message with no OPT record asked in no version at all, which is not a
+	// version to refuse.
+	testing.expect_value(t, edns_version(Message{}), u8(0))
+	free_all(context.temp_allocator)
+}
+
+/*
+BADVERS is unreadable without the OPT record it travels in.
+
+Rcode 16 is four zero bits in the header and a one in the extended byte, so a
+response that lost the extended half does not read as a weaker refusal - it
+reads as NOERROR, which is agreement, and the client that asked in a version
+this server cannot answer in would take it for an answer. The whole path is
+pinned rather than the pieces: `make_response` through `make_opt`, onto the
+wire, and back out of both readers, since a client uses one or the other and
+they must not disagree.
+*/
+@(test)
+test_badvers_needs_its_opt_record_to_read_as_a_refusal :: proc(t: ^testing.T) {
+	questions := make([]Question, 1, context.temp_allocator)
+	questions[0] = Question {
+		name  = "example.com.",
+		type  = .A,
+		class = .IN,
+	}
+	opt := make_opt(1232, false)
+	// Asked in version 1, which is what makes the version on the way back a
+	// statement rather than an echo.
+	opt.ttl |= u32(1) << 16
+	additional := make([]Record, 1, context.temp_allocator)
+	additional[0] = opt
+	query := Message {
+		id         = 0x4321,
+		question   = questions,
+		additional = additional,
+	}
+
+	resp := make_response(query, .Bad_Vers, context.temp_allocator)
+	wire, _, err := encode_message(resp, context.temp_allocator)
+	testing.expect_value(t, err, Encode_Error.None)
+
+	testing.expect_value(t, wire[3] & 0xf, u8(0))
+	testing.expect_value(t, peek_rcode(wire), Rcode.Bad_Vers)
+
+	decoded, derr := decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	testing.expect_value(t, rcode_of(decoded), Rcode.Bad_Vers)
+
+	// RFC 6891 section 6.1.3 has the response state the highest version the
+	// responder implements, which is 0 - not the version that was asked for.
+	testing.expect_value(t, edns_version(decoded), u8(0))
+	free_all(context.temp_allocator)
+}
