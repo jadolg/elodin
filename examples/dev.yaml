@@ -1,8 +1,13 @@
-# Development configuration: runs as an ordinary user.
+# Development configuration: runs as an ordinary user. Use `mise run run`.
 #
-# Differs from examples/elodin.yaml only in the two things that need root: it
-# listens on 5354 instead of 53, and caches blocklists under the project
-# directory instead of /var/cache. Use `mise run run` to start it.
+# Two of the differences from examples/elodin.yaml are what makes it
+# unprivileged: it listens on 5354 (and 8853 / 8443) instead of 53, 853 and 443,
+# and it caches blocklists under the project directory instead of /var/cache.
+# The rest are for developing against: it binds loopback rather than 0.0.0.0,
+# logs at debug with a line per query, carries fewer blocklists so a start is
+# quick, rotates upstreams so both get exercised, keeps one rewrite to look at,
+# and turns the metrics endpoint on. Anything absent below is the shipped
+# default; examples/elodin.yaml is where those are written out.
 
 log:
   level: debug
