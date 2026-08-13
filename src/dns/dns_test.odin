@@ -638,3 +638,58 @@ test_ra_is_a_capability_flag_not_tied_to_rd :: proc(t: ^testing.T) {
 
 	free_all(context.temp_allocator)
 }
+
+@(test)
+test_name_length_counts_the_root_octet :: proc(t: ^testing.T) {
+	/*
+	RFC 1035 2.3.4 caps a domain name at 255 octets, and that figure counts
+	the length octet in front of every label as well as the zero octet that
+	terminates the name; RFC 2181 11 restates it. The decoder and the encoder
+	have to draw the line in the same place. A name only the decoder accepts
+	is one this server will read off the wire and can never write back out,
+	because every path that would re-encode it refuses - so the boundary is
+	pinned here from both sides, and the largest name that fits is made to
+	survive a round trip through both halves.
+	*/
+	// Four 50-octet labels and one 49-octet label come to 4 * 51 + 50 = 254
+	// octets of labels, which the root brings to exactly 255.
+	longest := make([dynamic]u8, 0, 256, context.temp_allocator)
+	for _ in 0 ..< 4 {
+		append(&longest, 50)
+		for _ in 0 ..< 50 {
+			append(&longest, 'a')
+		}
+	}
+	append(&longest, 49)
+	for _ in 0 ..< 49 {
+		append(&longest, 'a')
+	}
+	append(&longest, 0)
+	testing.expect_value(t, len(longest), MAX_NAME_WIRE)
+
+	name, next, err := decode_name(longest[:], 0, context.temp_allocator)
+	testing.expect_value(t, err, Decode_Error.None)
+	testing.expect_value(t, next, MAX_NAME_WIRE)
+
+	buf: [MAX_NAME_WIRE]u8
+	n, eerr := encode_name(name, buf[:])
+	testing.expect_value(t, eerr, Encode_Error.None)
+	testing.expect_value(t, n, MAX_NAME_WIRE)
+	testing.expect(t, mem.compare(buf[:n], longest[:]) == 0, "the longest legal name did not re-encode to its own wire bytes")
+
+	// One octet more: five 50-octet labels are 255 octets of labels on their
+	// own, 256 once the root is counted.
+	too_long := make([dynamic]u8, 0, 256, context.temp_allocator)
+	for _ in 0 ..< 5 {
+		append(&too_long, 50)
+		for _ in 0 ..< 50 {
+			append(&too_long, 'a')
+		}
+	}
+	append(&too_long, 0)
+	testing.expect_value(t, len(too_long), MAX_NAME_WIRE + 1)
+
+	_, _, terr := decode_name(too_long[:], 0, context.temp_allocator)
+	testing.expect_value(t, terr, Decode_Error.Name_Too_Long)
+	free_all(context.temp_allocator)
+}
