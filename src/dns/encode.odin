@@ -205,11 +205,11 @@ w_record :: proc(w: ^Writer, rec: Record) -> Encode_Error {
 	case Rdata_Raw:
 		/*
 		The decoder expands these, so this only fires if something got past it:
-		a type added to `rdata_has_compressible_name` with no layout to walk, a
-		layout that stopped matching what senders write, or a blob built
-		somewhere other than a decode. None of that should happen, which is why
-		it is worth catching - a stale pointer is not visible in the answer, and
-		the client has no way to know the name it was handed is the wrong one.
+		a compressible type with no entry in `raw_rdata_layout` to walk, a layout
+		that stopped matching what senders write, or a blob built somewhere other
+		than a decode. None of that should happen, which is why it is worth
+		catching - a stale pointer is not visible in the answer, and the client
+		has no way to know the name it was handed is the wrong one.
 
 		What the callers do with the failure is the reason this is safe to add:
 		`fit_response` falls back to an empty answer with TC set and the client

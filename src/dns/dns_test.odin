@@ -849,6 +849,69 @@ test_raw_rdata_pointer_survives_reencode :: proc(t: ^testing.T) {
 }
 
 /*
+A type this decoder does model is expanded too when its RDATA falls back to raw.
+
+`decode_rdata` rejects an MX whose RDLENGTH counts a byte more than its two
+fields, and `decode_record` then keeps the record as `Rdata_Raw` rather than
+losing it. The exchanger inside is a perfectly good compressed name, so it has to
+be expanded on the way through exactly as an AFSDB's would be: nothing downstream
+can tell a raw MX from a raw AFSDB, and a stale pointer re-encoded into an answer
+names whichever byte now sits at that offset.
+*/
+@(test)
+test_raw_rdata_expands_a_modelled_type_that_failed_to_parse :: proc(t: ^testing.T) {
+	m, ns_target := message_prefix(3)
+	// preference, a compressed exchanger, and one byte more than the fields need.
+	append_answer(&m, .MX, []u8{0x00, 0x0a, 0xc0 | u8(ns_target >> 8), u8(ns_target), 0x00})
+
+	raw, ok := raw_rdata_of(m[:], .MX)
+	testing.expect(t, ok, "the malformed MX did not come back as raw rdata")
+	expected := []u8 {
+		0x00, 0x0a,
+		3, 'n', 's', '1', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0,
+		0x00,
+	}
+	testing.expect(t, mem.compare(raw, expected) == 0, "MX rdata was not expanded")
+
+	// And it still names the same host once written into a message of our own.
+	msg, derr := decode_message(m[:], context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	out, _, eerr := encode_message(msg, context.temp_allocator)
+	testing.expect_value(t, eerr, Encode_Error.None)
+
+	after, after_ok := raw_rdata_of(out, .MX)
+	testing.expect(t, after_ok, "the MX record did not survive the re-encode")
+	testing.expect(t, mem.compare(after, expected) == 0, "MX rdata changed meaning on re-encode")
+	free_all(context.temp_allocator)
+}
+
+/*
+A modelled type whose name cannot be expanded is refused by the writer.
+
+A CNAME carrying a forward pointer does not decode, so the record falls back to
+raw with the pointer still in it. Forwarding those two bytes is the dangerous
+outcome: the pointer aims past the end of the message it arrived in, but a
+message of our own may well be long enough for it to land on a real name, and the
+client would be sent somewhere nobody named. Failing the encode leaves every
+caller with an honest degradation instead.
+*/
+@(test)
+test_encode_refuses_a_modelled_type_holding_a_pointer :: proc(t: ^testing.T) {
+	m, _ := message_prefix(3)
+	append_answer(&m, .CNAME, []u8{0xc0, 0xf0})
+
+	raw, ok := raw_rdata_of(m[:], .CNAME)
+	testing.expect(t, ok, "the undecodable CNAME did not come back as raw rdata")
+	testing.expect(t, mem.compare(raw, []u8{0xc0, 0xf0}) == 0, "unwalkable CNAME rdata was altered")
+
+	msg, derr := decode_message(m[:], context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	_, _, eerr := encode_message(msg, context.temp_allocator)
+	testing.expect_value(t, eerr, Encode_Error.Bad_Rdata)
+	free_all(context.temp_allocator)
+}
+
+/*
 RDATA with nothing to expand comes back exactly as it arrived.
 
 Expansion is only ever a rewrite of compression pointers, so a blob holding none

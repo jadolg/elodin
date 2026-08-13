@@ -47,6 +47,14 @@ out: where its name starts depends on a prefix length in its own RDATA, and it
 has been formally obsolete since RFC 6563. An A6 record therefore still forwards
 with its pointer intact, which is what it did before any of this existed.
 
+The types this decoder models natively - NS, CNAME, PTR, DNAME, MB, MG, MR, SOA,
+MX, SRV - are on the list too, because a record of one of them still lands here
+when its RDATA fails to parse for some other reason. An MX whose RDLENGTH counts
+one byte more than its two fields, a SOA whose serial is short, a CNAME whose
+name will not decode: `decode_record` catches the failure and keeps the bytes as
+`Rdata_Raw`, and the compressed name inside is then exactly as stale as any other
+once the message it pointed into is gone.
+
 The same table exists as `raw_layout` in src/dnssec/canonical.odin, which walks
 these layouts to lowercase the names for canonical form. It cannot reach a
 private helper in this package and this package must not depend on that one, so
@@ -55,16 +63,18 @@ the two are kept in step by hand: a type added to either belongs in both.
 @(private)
 raw_rdata_layout :: proc "contextless" (t: Type) -> (layout: Raw_Layout, ok: bool) {
 	#partial switch t {
-	case .MD, .MF, .NXT:
+	case .NS, .CNAME, .PTR, .DNAME, .MB, .MG, .MR, .MD, .MF, .NXT:
 		return {0, 0, 1}, true
-	case .MINFO, .RP:
+	case .SOA, .MINFO, .RP:
 		return {0, 0, 2}, true
-	case .AFSDB, .RT, .KX:
+	case .MX, .AFSDB, .RT, .KX:
 		return {2, 0, 1}, true
 	case .PX:
 		return {2, 0, 2}, true
 	case .NAPTR:
 		return {4, 3, 1}, true
+	case .SRV:
+		return {6, 0, 1}, true
 	case .SIG:
 		return {18, 0, 1}, true
 	}
@@ -151,11 +161,14 @@ expand_rdata_names :: proc(
 		// it. `next` is the first byte after the name in the record being
 		// walked, so a name that overran the RDATA shows up as an end past it.
 		name, next, derr := decode_name(msg, pos, allocator)
-		if derr != .None || next > end {
+		if derr != .None {
+			return nil, false
+		}
+		defer delete(name, allocator)
+		if next > end {
 			return nil, false
 		}
 		n, eerr := encode_name(name, name_buf[:])
-		delete(name, allocator)
 		if eerr != .None {
 			return nil, false
 		}

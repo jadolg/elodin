@@ -166,7 +166,10 @@ Everything after the last name is copied through untouched.
 
 Only types on the lowercasing list above need an entry, and only those whose
 layout is fixed enough to walk. A6 is left out: its layout depends on a prefix
-length, and it has been formally obsolete since 2012.
+length, and it has been formally obsolete since 2012. The types the codec models
+natively are listed anyway: one of them still arrives as raw bytes when its RDATA
+failed to parse, and a validation attempt on such a record should compare against
+the same canonical form as any other.
 
 The same table exists as `raw_rdata_layout` in src/dns/rdata_raw.odin, where the
 decoder walks it to expand compressed names. That one is private to its package
@@ -183,16 +186,18 @@ Raw_Layout :: struct {
 @(private)
 raw_layout :: proc "contextless" (t: dns.Type) -> (layout: Raw_Layout, ok: bool) {
 	#partial switch t {
-	case .MD, .MF, .NXT:
+	case .NS, .CNAME, .PTR, .DNAME, .MB, .MG, .MR, .MD, .MF, .NXT:
 		return {0, 0, 1}, true
-	case .MINFO, .RP:
+	case .SOA, .MINFO, .RP:
 		return {0, 0, 2}, true
-	case .AFSDB, .RT, .KX:
+	case .MX, .AFSDB, .RT, .KX:
 		return {2, 0, 1}, true
 	case .PX:
 		return {2, 0, 2}, true
 	case .NAPTR:
 		return {4, 3, 1}, true
+	case .SRV:
+		return {6, 0, 1}, true
 	case .SIG:
 		return {18, 0, 1}, true
 	}
