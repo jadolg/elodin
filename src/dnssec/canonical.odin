@@ -167,6 +167,11 @@ Everything after the last name is copied through untouched.
 Only types on the lowercasing list above need an entry, and only those whose
 layout is fixed enough to walk. A6 is left out: its layout depends on a prefix
 length, and it has been formally obsolete since 2012.
+
+The same table exists as `raw_rdata_layout` in src/dns/rdata_raw.odin, where the
+decoder walks it to expand compressed names. That one is private to its package
+and this one is private to this, so the two are kept in step by hand: a type
+added to either belongs in both.
 */
 @(private)
 Raw_Layout :: struct {
@@ -202,6 +207,12 @@ name turns out to be compressed, which cannot be expanded here because the
 surrounding message is long gone. Such a record simply fails to validate, which
 is the right outcome for RDATA that RFC 4034 forbade compressing in the first
 place.
+
+A compressed name should no longer reach that fallback: the decoder expands the
+ones it can while the message is still in hand (see src/dns/rdata_raw.odin), so
+what arrives here is the uncompressed form RFC 4034 section 6.2 asks for rather
+than a canonical form no signer ever signed. What is left is RDATA nothing could
+walk, and a validation failure is the honest answer for it.
 */
 @(private)
 write_downcased_raw :: proc(out: ^[dynamic]u8, type: dns.Type, rdata: []u8) {

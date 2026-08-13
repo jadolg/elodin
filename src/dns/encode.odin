@@ -6,10 +6,15 @@ import "core:strings"
 /*
 Message writer with RFC 1035 name compression.
 
-Note on Rdata_Raw: the decoder only produces it for types that either cannot
-contain a compressed name or failed to parse. Forwarded upstream answers are
-passed through verbatim (see `patch_ttls`) rather than re-encoded, so a raw
-RDATA blob carrying pointers into a foreign message never reaches this writer.
+Note on Rdata_Raw: a raw blob is copied out at whatever offset the record lands
+at, so a compression pointer inside one would name a byte of this message rather
+than the one it was written against. Answers do reach this writer - a cookie
+attached to a reply that carried no OPT record, an answer stripped of its DNSSEC
+records for a client that did not ask for them, and one shrunk to a UDP limit are
+all re-encoded - so what keeps that from corrupting them is the decoder, which
+expands the compressed names inside raw RDATA as it reads them (see
+src/dns/rdata_raw.odin). `w_record` refuses a blob that still holds one, on the
+grounds that failing to answer is recoverable and answering wrongly is not.
 */
 Writer :: struct {
 	buf:       [dynamic]u8,
@@ -198,6 +203,23 @@ w_record :: proc(w: ^Writer, rec: Record) -> Encode_Error {
 			w_bytes(w, opt.data)
 		}
 	case Rdata_Raw:
+		/*
+		The decoder expands these, so this only fires if something got past it:
+		a type added to `rdata_has_compressible_name` with no layout to walk, a
+		layout that stopped matching what senders write, or a blob built
+		somewhere other than a decode. None of that should happen, which is why
+		it is worth catching - a stale pointer is not visible in the answer, and
+		the client has no way to know the name it was handed is the wrong one.
+
+		What the callers do with the failure is the reason this is safe to add:
+		`fit_response` falls back to an empty answer with TC set and the client
+		asks again over TCP, `ensure_edns_option` returns the answer without a
+		cookie, and `strip_dnssec_records` forwards the bytes it started from.
+		Each is a degradation the client recovers from on its own.
+		*/
+		if raw_rdata_holds_pointer(rec.type, d.data) {
+			return .Bad_Rdata
+		}
 		w_bytes(w, d.data)
 	case:
 		// nil rdata encodes as an empty RDATA section

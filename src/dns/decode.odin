@@ -21,6 +21,7 @@ Encode_Error :: enum u8 {
 	Label_Too_Long,
 	Name_Too_Long,
 	Too_Large,
+	Bad_Rdata,
 }
 
 @(private)
@@ -164,11 +165,12 @@ decode_record :: proc(r: ^Reader, allocator: mem.Allocator) -> (rec: Record, err
 
 	rec.data, err = decode_rdata(r, rec.type, rdata_start, rdata_end, allocator)
 	if err != .None {
-		// Malformed or unrecognised RDATA is preserved verbatim rather than
-		// rejected, so odd records still survive a forward.
-		raw := make([]u8, rdlength, allocator)
-		copy(raw, r.msg[rdata_start:rdata_end])
-		rec.data = Rdata_Raw{data = raw}
+		// Malformed or unrecognised RDATA is preserved rather than rejected, so
+		// odd records still survive a forward. Compressed names in it are still
+		// expanded where they can be: a type this decoder does model can fail on
+		// something else entirely - a trailing byte, a length that disagrees -
+		// and come through here with a perfectly good pointer inside it.
+		rec.data = decode_raw_rdata(r.msg, rec.type, rdata_start, rdata_end, allocator)
 		err = .None
 	}
 	r.pos = rdata_end
@@ -294,8 +296,7 @@ decode_rdata :: proc(
 		return Rdata_OPT{options = opts[:]}, .None
 	}
 
-	raw := r_bytes(r, n, allocator) or_return
-	return Rdata_Raw{data = raw}, .None
+	return decode_raw_rdata(r.msg, type, start, end, allocator), .None
 }
 
 // Cheap header peek for paths that only need the ID or the QR bit and do not
