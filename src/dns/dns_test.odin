@@ -691,5 +691,19 @@ test_name_length_counts_the_root_octet :: proc(t: ^testing.T) {
 
 	_, _, terr := decode_name(too_long[:], 0, context.temp_allocator)
 	testing.expect_value(t, terr, Decode_Error.Name_Too_Long)
+
+	// The encoder is the other side of that same line, and it is the side the
+	// decoder was just made to agree with, so pin it too: the presentation form
+	// of those same five labels has to come back Name_Too_Long rather than a
+	// 256th octet.
+	presentation := make([dynamic]u8, 0, 256, context.temp_allocator)
+	for _ in 0 ..< 5 {
+		for _ in 0 ..< 50 {
+			append(&presentation, 'a')
+		}
+		append(&presentation, '.')
+	}
+	_, perr := encode_name(string(presentation[:]), buf[:])
+	testing.expect_value(t, perr, Encode_Error.Name_Too_Long)
 	free_all(context.temp_allocator)
 }
