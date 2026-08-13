@@ -367,12 +367,20 @@ run_transport_cases :: proc(r: ^Runner) {
 	authority as the grammar writes them - it refuses these, or reads a target or
 	a host out of them that this hop did not - so what is checked is that the
 	refusal happens here too, and that it says which half was wrong: 505 for a
-	version this endpoint does not speak, 400 for a line that is not three tokens
-	and for the Host cases.
+	major version this endpoint does not speak, 400 for a line that is not three
+	tokens - a third token that is not an HTTP-version at all included - and for
+	the Host cases.
 
 	`HTTP/1.0` is in the list because it is the one version below 1.1 that stays
 	valid, Host and all: the field postdates it, so a 1.0 request without one is
 	answered rather than refused.
+
+	The last case carries a body the reader never gets to - the request line is
+	refused before the headers that frame it - and checks that a status still comes
+	back over the real listener. Whether the answer survives the close that follows
+	it is timing, so it is `test_a_refusal_outlives_the_close_that_follows_it` that
+	pins it: a client that reads as promptly as this one does has the answer before
+	the close, and the case here would not notice its loss.
 	*/
 	start_case(r, "doh: the request line and Host are checked")
 	{
@@ -382,7 +390,7 @@ run_transport_cases :: proc(r: ^Runner) {
 			what:    string,
 		}
 		CASES := []Case {
-			{"GET /nope JUNK\r\nHost: elodin.local\r\nConnection: close\r\n\r\n", 505, "a version that is not one"},
+			{"GET /nope JUNK\r\nHost: elodin.local\r\nConnection: close\r\n\r\n", 400, "a version that is not one"},
 			{"GET /nope HTTP/2.0\r\nHost: elodin.local\r\nConnection: close\r\n\r\n", 505, "HTTP/2 without ALPN"},
 			{"GET /nope HTTP/1.1 x\r\nHost: elodin.local\r\nConnection: close\r\n\r\n", 400, "a fourth token"},
 			{"GET /nope\r\nHost: elodin.local\r\nConnection: close\r\n\r\n", 400, "two tokens"},
@@ -399,6 +407,19 @@ run_transport_cases :: proc(r: ^Runner) {
 			if check(r, res.ok, "%s: no HTTP response", c.what) {
 				check(r, res.status == c.status, "%s: status %d, want %d", c.what, res.status, c.status)
 			}
+		}
+
+		// The refusal with a body behind it. 16 KiB is past the reader's first
+		// read, so bytes of it are still unread when the connection closes.
+		UNREAD :: 16 * 1024
+		with_body := fmt.tprintf(
+			"POST /nope JUNK\r\nHost: elodin.local\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+			UNREAD,
+			strings.repeat("x", UNREAD, context.temp_allocator),
+		)
+		res := doh_raw(doh_port, with_body)
+		if check(r, res.ok, "a refusal with a body behind it: no HTTP response") {
+			check(r, res.status == 400, "a refusal with a body behind it: status %d, want 400", res.status)
 		}
 	}
 	end_case(r)

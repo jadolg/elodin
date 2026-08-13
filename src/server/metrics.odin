@@ -154,6 +154,9 @@ serve_metrics :: proc(s: ^Server, l: ^Listeners, socket: net.TCP_Socket, client:
 		// answered at all - see `read_http_request`.
 		if status != 0 {
 			_ = send_http_error(conn, "metrics", status, http_refusal_message(status), false)
+			// The refused request may have declared a body that was never read, and
+			// the close in the accept loop would take the answer with it.
+			http_linger(conn)
 		}
 		return
 	}

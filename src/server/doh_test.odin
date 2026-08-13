@@ -556,6 +556,12 @@ request this hop was willing to answer. `Host` is the same argument again: RFC
 9112 3.2 makes it mandatory on HTTP/1.1 and a repeat invalid, for the reason a
 repeated `Content-Length` is.
 
+Which refusal each one gets is checked too, because the two are not
+interchangeable: 505 says the *major version* is unsupported (RFC 9110 15.6.6),
+which a client acts on by asking again in another version, and every other failure
+here is a malformed request line, which RFC 9112 3 answers with a 400. A `JUNK`
+answered 505 sends a client off to change something that was never wrong.
+
 `status` is what the caller answers with, and 0 is "answer nothing, close" - the
 framing cases keep that, an answer on a connection whose next byte this server
 cannot place being worse than a close.
@@ -579,11 +585,17 @@ test_request_line_is_three_tokens_with_a_known_version :: proc(t: ^testing.T) {
 		// RFC 9112 3.2 asks for Host on HTTP/1.1; 1.0 predates the field.
 		{"GET /dns-query HTTP/1.0", "", 0, false, "1.0 without a Host, which is allowed"},
 		{"GET /dns-query HTTP/1.9", HOST, 0, true, "a minor version this major version allows"},
-		{"GET /dns-query JUNK", HOST, 505, false, "a version that is not one"},
+		// 505 is for a major version this server does not speak; a token that is
+		// not a version at all is a malformed request line, which is a 400.
 		{"GET /dns-query HTTP/2.0", HOST, 505, false, "a major version this endpoint does not speak"},
 		{"GET /dns-query HTTP/0.9", HOST, 505, false, "a major version below this one"},
-		{"GET /dns-query HTTP/1.10", HOST, 505, false, "a two-digit minor version, which is not the grammar"},
-		{"GET /dns-query http/1.1", HOST, 505, false, "a lowercase version name"},
+		{"GET /dns-query JUNK", HOST, 400, false, "a version that is not one"},
+		{"GET /dns-query HTTP/1.10", HOST, 400, false, "a two-digit minor version, which is not the grammar"},
+		{"GET /dns-query http/1.1", HOST, 400, false, "a lowercase version name"},
+		{"GET /dns-query HTTP/1.1\t", HOST, 400, false, "a tab on the end of an otherwise good version"},
+		{"GET /dns-query HTTP/11", HOST, 400, false, "a version with no dot in it"},
+		{"GET /dns-query HTTP/1.x", HOST, 400, false, "a minor version that is not a digit"},
+		{"GET /dns-query HTTP/x.1", HOST, 400, false, "a major version that is not a digit"},
 		{"GET /dns-query HTTP/1.1 x", HOST, 400, false, "a fourth token"},
 		{"GET /dns-query HTTP/1.1 ", HOST, 400, false, "a trailing space"},
 		{"GET /dns-query ", HOST, 400, false, "no version at all"},
@@ -723,4 +735,113 @@ test_content_length_is_strict_decimal :: proc(t: ^testing.T) {
 		}
 		free_all(context.temp_allocator)
 	}
+}
+
+/*
+A refusal reaches the client even when the request that earned it went on past
+what the reader read.
+
+`read_http_request` turns down a bad request line before it looks at the headers
+that would say how long the body is, so the bytes of that body are still sitting
+in this server's receive queue when the answer is written - and closing a socket
+in that state does not send a FIN but an RST (RFC 1122 4.2.2.13). The RST reaches
+a client that has not read yet, its kernel drops what is already in its receive
+buffer, and the 400 written a moment earlier is gone: the client is left with a
+connection reset, which is exactly the bare closed connection the status was
+added to replace.
+
+So the drain has to happen before the close. The body here is larger than one
+`http_fill` chunk, which is what leaves bytes behind for the close to trip over -
+a request that fits in the first read is drained by having been read. The client
+shuts down its sending half rather than closing outright, so the drain ends on the
+end of the data instead of on its timeout, and can still read afterwards.
+*/
+@(test)
+test_a_refusal_outlives_the_close_that_follows_it :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the bound port: %v", berr)
+		return
+	}
+
+	client, derr := net.dial_tcp_from_endpoint(bound)
+	if derr != nil {
+		testing.expectf(t, false, "cannot dial the listener: %v", derr)
+		return
+	}
+	defer net.close(client)
+	_ = net.set_option(client, .Receive_Timeout, 3 * time.Second)
+
+	UNREAD :: 16 * 1024
+	b := strings.builder_make(context.temp_allocator)
+	strings.write_string(&b, "POST /dns-query JUNK\r\nHost: dns.example\r\nContent-Length: ")
+	strings.write_int(&b, UNREAD)
+	strings.write_string(&b, "\r\n\r\n")
+	for _ in 0 ..< UNREAD {
+		strings.write_byte(&b, 'x')
+	}
+	request := transmute([]u8)strings.to_string(b)
+
+	sent := 0
+	for sent < len(request) {
+		n, serr := net.send_tcp(client, request[sent:])
+		if serr != nil || n <= 0 {
+			testing.expectf(t, false, "cannot send the request: %v", serr)
+			return
+		}
+		sent += n
+	}
+	_ = net.shutdown(client, .Send)
+
+	accepted, _, aerr := net.accept_tcp(listener)
+	if aerr != nil {
+		testing.expectf(t, false, "nothing connected: %v", aerr)
+		return
+	}
+	_ = net.set_option(accepted, .Receive_Timeout, 3 * time.Second)
+	conn := Conn {
+		socket = accepted,
+	}
+
+	r := Http_Reader {
+		conn = conn,
+		buf  = make([dynamic]u8, 0, 4096, context.temp_allocator),
+	}
+	_, status, parsed := read_http_request(&r)
+	testing.expect(t, !parsed, "a JUNK version was accepted")
+	testing.expectf(t, status == 400, "answered %d, expected 400", status)
+	testing.expect(t, len(r.buf) - r.pos < UNREAD, "the whole body was read, so nothing is left for the close")
+
+	// What `serve_doh` does with a refused request, in the order it does it: the
+	// answer, the drain, the close. Its return value is `keep_alive`, which is
+	// false here; whether the write landed is what the read below is about.
+	_ = send_http_error(conn, "doh", status, http_refusal_message(status), false)
+	http_linger(conn)
+	net.close(accepted)
+
+	reply := make([dynamic]u8, 0, 4096, context.temp_allocator)
+	for len(reply) < 4096 {
+		chunk: [512]u8
+		n, rerr := net.recv_tcp(client, chunk[:])
+		if rerr != nil {
+			testing.expectf(t, false, "the answer did not survive the close: %v", rerr)
+			return
+		}
+		if n == 0 {
+			break
+		}
+		append(&reply, ..chunk[:n])
+	}
+	testing.expectf(
+		t,
+		strings.has_prefix(string(reply[:]), "HTTP/1.1 400 "),
+		"the client read %q, expected the 400 that was written",
+		string(reply[:min(len(reply), 40)]),
+	)
 }

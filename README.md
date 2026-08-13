@@ -1347,7 +1347,7 @@ What it covers:
 | command line | `--version`, `--help`, `--check` accepting and rejecting configs, error text and line numbers, a DoT listener with no certificate, an unknown `server.user`, a privilege drop that cannot happen stopping the server, the shipped example config |
 | shutdown | `SIGTERM` produces an orderly exit rather than a killed process |
 | wire format | all 23 captured fixtures replayed and compared byte for byte, EDNS forwarding, 0x20 case preservation, truncation and the TC bit, FORMERR / NOTIMP / silent-drop handling |
-| listeners | UDP, TCP (single and pipelined), DoT, DoH POST and GET, keep-alive, two pipelined requests in one segment, 404 / 405 / 415 / 400 |
+| listeners | UDP, TCP (single and pipelined), DoT, DoH POST and GET, keep-alive, two pipelined requests in one segment, 404 / 405 / 415 / 400 / 505, a request line that is not three tokens and a mandatory single `Host`, a refusal read back over a body the server never read |
 | Apple profile | the `.mobileconfig` downloaded end to end over HTTP/1.1 and HTTP/2, its `ServerURL` built from the request host / `:authority`, the managed-DNS payload and Apple content type, GET-only |
 | DoH over HTTP/2 | ALPN selection, POST and GET, Huffman-coded headers, CONTINUATION, a dynamic table size update at and past the advertised limit, concurrent streams proved parallel by timing, flow control with a tiny window, DATA splitting for a 27 KiB answer, PING, RST_STREAM, malformed requests reset with PROTOCOL_ERROR while the connection carries on, error statuses, HTTP/1.1 fallback |
 | DoH upstreams | a query resolved over an h2 upstream, one connection multiplexed across queries rather than reopened, fallback to HTTP/1.1 when the upstream does not offer h2 |
