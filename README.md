@@ -964,7 +964,7 @@ bind beyond loopback is logged as a warning at startup, once.
 | `elodin_dnssec_answers_total{result}` | counter | `secure` and `bogus` |
 | `elodin_cache_entries` / `_bytes` | gauge | what the cache holds, against `max_entries` and `max_bytes` |
 | `elodin_cache_hits_total` / `_misses_total` / `_evictions_total` | counter | how it is doing |
-| `elodin_cache_stale_total` | counter | expired answers served because the upstream failed, with `cache.serve_stale` on |
+| `elodin_cache_stale_total` | counter | expired answers served because no fresh one could be got, with `cache.serve_stale` on |
 | `elodin_filter_rules{list}` | gauge | rules loaded, `block` and `allow` |
 | `elodin_upstream_queries_total{upstream}` | counter | queries sent to each upstream, by its configured name |
 | `elodin_upstream_failures_total{upstream}` | counter | exchanges that produced no usable answer |

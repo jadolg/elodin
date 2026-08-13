@@ -345,16 +345,21 @@ render_cache_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 	A stale lookup is counted a miss - the cache did not answer it, the query went
 	to an upstream - and the answer that comes back when that upstream fails is
 	counted a cached query one package away, in `elodin_answers_total`. Neither
-	says the data was expired, and the upstream failure behind it raises no
-	counter at all, since the client was answered. Without this an operator
-	watching an outage covered by expired data sees only the absence of the
-	traffic that stopped.
+	says the data was expired, and the only other trace the failure behind it
+	leaves is `elodin_upstream_failures_total`, which every exchange that fails
+	raises, including the ones a second upstream or a retry went on to cover.
+	Without this an operator watching an outage covered by expired data sees only
+	the absence of the traffic that stopped.
+
+	Counted where the answer reaches a client rather than where an upstream
+	fails, so an expired entry served to an RD=0 query - which is answered from
+	what this server already knows, without asking anybody - is in here too.
 	*/
 	metrics.scalar(
 		b,
 		"elodin_cache_stale_total",
 		.Counter,
-		"Expired answers served because the upstream failed.",
+		"Expired answers served because no fresh one could be got.",
 		cs.stale,
 	)
 	metrics.scalar(
