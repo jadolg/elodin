@@ -169,6 +169,21 @@ upstream:
       port: 853
       hostname: dns.quad9.net
 
+    # A DoH upstream is given a url instead of an address; the host in it is
+    # resolved through `bootstrap`, and the path defaults to /dns-query. HTTP/2
+    # or HTTP/1.1 is chosen by ALPN, preferring h2.
+    # - name: google-doh
+    #   type: https
+    #   url: https://dns.google/dns-query
+    #   # Overrides the bootstrap above for this server only.
+    #   bootstrap: [8.8.8.8]
+    #   # Whether the upstream's certificate is checked. On, for tls and https
+    #   # alike. Checking the chain without a name to check it against accepts
+    #   # anything a trusted CA ever signed for anyone, so a tls or https server
+    #   # with this on and no hostname is refused at load: give it a `hostname:`
+    #   # (or `#name` in the shorthand), or say `verify: false` on purpose.
+    #   verify: true
+
     # Shorthand forms are accepted too:
     #   - 192.168.1.1
     #   - tcp://9.9.9.9
@@ -213,9 +228,17 @@ blocking:
       url: https://lists.cyberhost.uk/malware.txt
       format: domains
 
-    # A local file works the same way:
+    # A local file works the same way. `enabled` defaults to true; setting it
+    # false keeps a list written down but out of the filter, which is easier to
+    # undo than commenting the entry out.
     # - name: personal
     #   file: /etc/elodin/blocklist.txt
+    #   enabled: true
+    #
+    # A bare string is shorthand for either: anything starting http:// or
+    # https:// is a url, anything else is a file, and the string is its name.
+    # - https://lists.cyberhost.uk/malware.txt
+    # - /etc/elodin/blocklist.txt
 
   # Names that must never be blocked, whatever the lists say.
   allowlists: []
@@ -288,10 +311,12 @@ cookies:
   # cookies.
   # secret: e5e973e5a6b2a43f48e7dc849e37bfcf
 
-# Local answers. Wildcards match subdomains only.
+# Local answers. Wildcards match subdomains only, so "*.home" covers host.home
+# but not home itself. `ttl` is what the answer carries, 300 seconds by default.
 # rewrites:
 #   - domain: nas.home
 #     answer: 192.168.1.50
+#     ttl: 300
 #   - domain: "*.home"
 #     answers: [192.168.1.1]
 #   - domain: old.example.com

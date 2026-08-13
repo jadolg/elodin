@@ -35,14 +35,18 @@ if you would rather use your own toolchain.
 
 ```sh
 mise trust
-mise run build      # bin/elodin, with debug info
-mise run release    # bin/elodin, optimised
-mise run test       # unit tests
-mise run itest      # integration tests against the built binary
-mise run verify     # check + test + itest
-mise run check      # type-check with -vet -strict-style
-mise run certs      # self-signed certificate for local DoT/DoH testing
-mise run bench      # throughput, latency, CPU and memory (see bench/README.md)
+mise run build            # bin/elodin, with debug info
+mise run release          # bin/elodin, optimised
+mise run test             # unit tests
+mise run itest            # integration tests against the built binary
+mise run verify           # check + test + itest
+mise run check            # type-check with -vet -strict-style
+mise run fuzz             # build the dns, h2 and yaml libFuzzer targets
+mise run fuzz-regression  # replay the committed corpus through each of them
+mise run certs            # self-signed certificate for local DoT/DoH testing
+mise run bench            # throughput, latency, CPU and memory (see bench/README.md)
+mise run deb              # a .deb from this checkout, into dist/
+mise run clean            # remove bin/
 ```
 
 ## Running
@@ -120,24 +124,30 @@ clears that once the cause is dealt with.
 
 A published GitHub release carries a `linux-amd64` and a `linux-arm64` tarball
 built by `.github/workflows/release.yml`, each holding the optimised binary, the
-unit file and the example configuration, and a `.deb` of the same binary for
-each architecture. Both are built natively, on a runner of the architecture they
-target, because elodin binds the system libssl and libcrypto and
-cross-compiling would mean carrying a sysroot for each. CI runs `mise run check`
-once and `mise run test` and `mise run itest` on both architectures, on every
-push and pull request.
+unit file, the example configuration, this README and the licence, and a `.deb`
+of the same binary for each architecture. Both are built natively, on a runner
+of the architecture they target, because elodin binds the system libssl and
+libcrypto and cross-compiling would mean carrying a sysroot for each.
+
+CI (`.github/workflows/ci.yml`) runs on every pull request and on every push to
+`main`: `mise run check` once, `mise run test` and `mise run itest` on both
+architectures, `mise run fuzz-regression` once, `mise run build` on both, and —
+also on both — a `mise run deb` that is then installed on the runner, asked to
+resolve a handful of names through the takeover it just performed, and removed
+again with a check that the runner got its own resolver back.
 
 ### From a .deb
 
 ```sh
-sudo apt install ./elodin_0.2.0-1_amd64.deb
+sudo apt install ./elodin_0.8.0-1_amd64.deb
 ```
 
 The binary lands at `/usr/bin/elodin`, the unit at
 `/usr/lib/systemd/system/elodin.service`, and `examples/elodin.yaml` at
 `/etc/elodin/elodin.yaml` as a conffile — dpkg keeps your edits across upgrades
-and asks before replacing them. `apt purge` removes the configuration, the
-blocklist cache and the state directory.
+and asks before replacing them. This README and the licence go to
+`/usr/share/doc/elodin/`, the latter as `copyright`. `apt purge` removes the
+configuration, the blocklist cache and the state directory.
 
 The install asks one question, and it defaults to yes:
 
@@ -374,17 +384,25 @@ blocking:
 
 What each list format matches:
 
-| syntax                | matches                          |
-|-----------------------|----------------------------------|
-| `0.0.0.0 ads.foo.com` | `ads.foo.com` exactly            |
-| `ads.foo.com`         | `ads.foo.com` and its subdomains |
-| `\|\|ads.foo.com^`    | `ads.foo.com` and its subdomains |
-| `*.foo.com`           | subdomains of `foo.com` only     |
-| `@@\|\|safe.foo.com^` | never blocked                    |
+| syntax                     | matches                          |
+|----------------------------|----------------------------------|
+| `0.0.0.0 ads.foo.com`      | `ads.foo.com` exactly            |
+| `ads.foo.com`              | `ads.foo.com` and its subdomains |
+| `\|\|ads.foo.com^`         | `ads.foo.com` and its subdomains |
+| `\|ads.foo.com`            | `ads.foo.com` exactly            |
+| `*.foo.com`                | subdomains of `foo.com` only     |
+| `address=/foo.com/0.0.0.0` | `foo.com` and its subdomains     |
+| `@@\|\|safe.foo.com^`      | never blocked                    |
 
 Hosts entries are exact because hosts-format lists spell out every subdomain
 they mean; bare domains and `||` rules cover subtrees. This matches how AdGuard
 Home reads the same files. Allow rules always win over block rules.
+
+The `address=/…/` and `server=/…/` forms are dnsmasq's, accepted because they
+turn up in lists that are otherwise adblock syntax. A `$` modifier
+(`$third-party`, `$important`) is dropped and the rest of the rule kept: none of
+the modifiers change which *name* a rule matches, and the ones that would need
+something a DNS answer cannot express.
 
 Downloaded lists are cached under `cache_dir`. A refresh that fails falls back
 to the cached copy, so a network outage cannot silently turn blocking off.
@@ -448,11 +466,15 @@ becomes a request: connection-specific fields (`connection`,
 other than `trailers`), uppercase or non-token field names, values carrying NUL,
 CR, LF or edge whitespace, repeated, unknown or late pseudo-headers, an empty
 `:method` or `:scheme`, and a missing or non-origin-form `:path` each make the
-request malformed, which is a
-stream error of type PROTOCOL_ERROR. Nothing here is proxied onward, so none of
-it is a request-smuggling primitive on its own; it becomes one as soon as
-another hop sits in front of or behind this endpoint, and the HTTP/1.1 side
-already refuses the same shapes.
+request malformed, which is a stream error of type PROTOCOL_ERROR. The one
+shape that looks malformed by that list and is not is a conformant `CONNECT`
+(RFC 9113 8.5): `:authority` and neither `:scheme` nor `:path`. This endpoint
+does not implement it, but turning it away is the handler's job — it draws a
+404, not a stream error, because a request that keeps to the specification
+should not be told it broke it. Nothing here is proxied onward, so none of this
+is a request-smuggling primitive on its own; it becomes one as soon as another
+hop sits in front of or behind this endpoint, and the HTTP/1.1 side already
+refuses the same shapes.
 
 What one connection may make this end hold is stated in that SETTINGS frame
 rather than left to be discovered: 128 concurrent streams, a 32 KiB header list,
@@ -972,7 +994,7 @@ rate(elodin_upstream_latency_seconds_total[5m]) / rate(elodin_upstream_queries_t
 min by (upstream) (elodin_upstream_up) == 0
 ```
 
-A Grafana dashboard covering all of the above is in
+A Grafana dashboard over those metrics is in
 [`examples/grafana-dashboard.json`](examples/grafana-dashboard.json) — import it
 under **Dashboards → New → Import**. It asks for a Prometheus data source and
 picks up `job` and `instance` from `elodin_build_info`, so it works against one
@@ -989,7 +1011,8 @@ model natively are carried through as opaque RDATA per RFC 3597, and forwarded
 answers are passed back byte for byte, so DNSSEC records survive untouched. With
 validation on, an answer for a client that did not ask for DNSSEC records is
 rebuilt without them; every other answer still goes back verbatim, bar the two
-bytes of payload size described below.
+bytes of payload size in the OPT record — see [How large a UDP answer may
+be](#how-large-a-udp-answer-may-be).
 
 Also handled: EDNS0 (the client's OPT record is forwarded upstream so payload
 sizes are negotiated end to end, minus its cookie, which stops here; over UDP the
@@ -1216,13 +1239,16 @@ answers from a zone they control and walk elodin through enough distinct names.
 least recently used end whenever either bound is passed. `cache_bytes=` in the
 five-minute stats line reports what is held against it.
 
-Disk is negligible: an 840 KB binary, and a blocklist cache the size of the
-lists themselves (6.5 MB for two large ones). Nothing is written in steady
+Disk is negligible: a binary under a megabyte, and a blocklist cache the size of
+the lists themselves (6.5 MB for two large ones). Nothing is written in steady
 state — with one exception.
 
 That exception is `log.queries`, which writes 32 MB/s at 185k qps, about 183
 bytes per query. It wants rotation. The line was 104 bytes before it became
 logfmt; the keys are most of the difference, and they are disk rather than work.
+The committed run predates logfmt, so its own logging section still reports the
+104-byte line rather than this one — re-take it with `mise run bench -only
+logging` before quoting either figure against a change.
 
 The `race` strategy is the other setting with a real price: it multiplies
 upstream traffic by the number of servers.
@@ -1255,7 +1281,9 @@ upstream traffic by the number of servers.
   are drawn once at startup and never rotated: restarting costs each client and
   each upstream one extra round trip.
 - No per-client rules, no query log database, no web or API surface. Statistics
-  go to the log every five minutes; there is no metrics endpoint to scrape.
+  go to the log every five minutes, and to a Prometheus endpoint when
+  [`metrics.enabled`](#metrics) is set — but that endpoint is counters only,
+  with no latency histogram and no per-name label, for the reason given there.
 - Configuration is read once at startup, with one exception: `SIGHUP` reloads
   the DoT/DoH certificates (see [Reloading](#reloading)). Nothing else -
   listener addresses, the upstream set, blocking - can be changed without a
@@ -1280,7 +1308,10 @@ src/logx/      logging, in logfmt
 src/metrics/   Prometheus exposition format, and process figures out of /proc
 src/privdrop/  giving up root once the listeners hold their ports
 src/itest/     integration suite: harness, mock upstreams (DNS, HTTP, DoH/h2), clients, fixtures
+src/fuzz/      libFuzzer targets for the DNS, HPACK and YAML parsers, and their shared arena
+testdata/      fuzz corpus and dictionary, committed so a found crash stays found
 bench/         benchmark harness and DNSSEC survey, in Go, with committed results
+examples/      the shipped configuration, a development one, and a Grafana dashboard
 packaging/     systemd unit and the .deb build script
 ```
 
@@ -1292,9 +1323,10 @@ get a thread each instead, capped by `server.max_connections`.
 
 ## Testing
 
-Two layers, both run by `mise run verify`. A third, `mise run bench`, measures
-rather than asserts: it is where every number in [Capacity](#capacity) comes
-from, and it is documented in [`bench/README.md`](bench/README.md).
+Two layers, both run by `mise run verify`, and a third — fuzzing — that runs on
+its own schedule. A fourth, `mise run bench`, measures rather than asserts: it
+is where every number in [Capacity](#capacity) comes from, and it is documented
+in [`bench/README.md`](bench/README.md).
 
 **Unit tests** (`mise run test`, 403 cases) cover the message codec — round trips
 for every modelled RDATA type, compression, truncation, EDNS, pointer loops,
@@ -1305,10 +1337,11 @@ specification's own vectors rather than against itself.
 
 They run per package, so a failure names one: `dns` 34, `yaml` 34, `config` 55,
 `filter` 8, `logx` 1, `metrics` 9, `privdrop` 9, `cache` 13, `dnssec` 39,
-`tlsx` 5, `upstream` 31, `h2` 69, `server` 96. Much of `tlsx`, `upstream`, `h2` and `server` is what the
-suite grew for the bugs recorded below — the HTTP reader's framing and body limits,
-the TLS handshake retry, the HTTP/2 stream table under RST_STREAM, and the DoH
-request parser read against an allocator that scribbles over what it releases.
+`tlsx` 5, `upstream` 31, `h2` 69, `server` 96. Much of `tlsx`, `upstream`, `h2`
+and `server` is what the suite grew around bugs that were found some other way
+and had to stay found — the HTTP reader's framing and body limits, the TLS
+handshake retry, the HTTP/2 stream table under RST_STREAM, and the DoH request
+parser read against an allocator that scribbles over what it releases.
 
 The DNSSEC cases work the same way. `src/dnssec/fixtures_test.odin` holds real
 signed traffic captured from a public resolver: the root and `com` signed with
@@ -1346,7 +1379,11 @@ What it covers:
 |---|---|
 | command line | `--version`, `--help`, `--check` accepting and rejecting configs, error text and line numbers, a DoT listener with no certificate, an unknown `server.user`, a privilege drop that cannot happen stopping the server, the shipped example config |
 | shutdown | `SIGTERM` produces an orderly exit rather than a killed process |
+| logging | every line a real start-to-shutdown wrote parses as logfmt, a query is fields rather than a sentence, and a name a client chose cannot forge a field of its own |
 | wire format | all 23 captured fixtures replayed and compared byte for byte, EDNS forwarding, 0x20 case preservation, truncation and the TC bit, FORMERR / NOTIMP / silent-drop handling |
+| transaction ids | a forwarded query does not carry the client's id, over enough forwards that a fixed or counting one could not pass by chance (RFC 5452) |
+| who may ask | a source outside `allow_from` gets nothing over UDP and no connection over TCP, one inside is answered, an empty list serves everybody, the shipped default answers loopback, the first refusal is logged once and names the setting, an unparseable entry fails `--check` |
+| UDP answer size | the default holds a client asking for 4096 to 1232, a raised ceiling sends the whole answer, the ceiling does not apply over TCP, the answer's own OPT reports the ceiling rather than the client's figure, and a client's own small buffer is not blamed on the setting |
 | listeners | UDP, TCP (single and pipelined), DoT, DoH POST and GET, keep-alive, two pipelined requests in one segment, 404 / 405 / 415 / 400 / 505, a request line that is not three tokens and a mandatory single `Host`, a refusal read back over a body the server never read |
 | Apple profile | the `.mobileconfig` downloaded end to end over HTTP/1.1 and HTTP/2, its `ServerURL` built from the request host / `:authority`, the managed-DNS payload and Apple content type, GET-only |
 | DoH over HTTP/2 | ALPN selection, POST and GET, Huffman-coded headers, CONTINUATION, a dynamic table size update at and past the advertised limit, concurrent streams proved parallel by timing, flow control with a tiny window, DATA splitting for a 27 KiB answer, PING, RST_STREAM, malformed requests reset with PROTOCOL_ERROR while the connection carries on, error statuses, HTTP/1.1 fallback |
@@ -1358,6 +1395,8 @@ What it covers:
 | upstreams | failover, round-robin, race, health cooldown, TCP and DoT clients, connection pooling, UDP→TCP retry, total outage → SERVFAIL |
 | blocklist downloads | two lists fetched over HTTP and both applied, written to the cache directory, reused on restart without re-fetching, unwritable cache directory degrades to a warning |
 | DNSSEC | an answer with no chain of trust is refused rather than served, the forwarded query carries DO and CD, a CD client is served unvalidated, the refusal carries an extended DNS error, and none of it happens unless it is configured |
+| DNS cookies | a client cookie comes back with a server cookie behind it and works again, the client's own cookie never reaches the upstream and the upstream's never reaches the client, an impossible length is FORMERR, a query with no EDNS goes upstream without one, upstream BADCOOKIE is retried invisibly, each side turns off independently, and `require` turns an unproven UDP client away while leaving cookieless and TCP clients alone |
+| certificate reload | the listener serves what it started with, `SIGHUP` swaps in a certificate renewed on disk, and a bad one on disk leaves the working one in place |
 | metrics | no port is open unless the configuration asks for one, a scrape reports the queries that actually went through and the process figures out of `/proc`, the configured path is the only one served, and anything else is a 404 or a 405 |
 
 `src/itest/fixtures.odin` holds real DNS responses captured from a public
@@ -1367,10 +1406,29 @@ the client receives against the bytes the upstream sent. Generating the fixtures
 with elodin's own encoder instead would let a codec bug agree with itself and
 still pass.
 
-**Against live DNS**, because neither layer can prove the absence of false
-failures — both work from fixtures, so both can show that a forged answer is
-refused and neither can show that validation leaves working names working. A
-validator that refused everything would pass the entire suite.
+**Fuzzing** covers the three parsers that read bytes somebody else chose: the
+DNS wire codec (`dns.decode_message`, plus `dns.truncated_response`, which the
+UDP read loop reaches for a rate-limited query without decoding it first), the
+HPACK decoder, and the YAML parser — the last of which reads not only the
+configuration but every blocklist downloaded at runtime. Odin has no
+`-fsanitize=fuzzer` of its own, so `mise run fuzz` emits LLVM IR for each target
+and has clang instrument and link it into a libFuzzer binary at `bin/fuzz_*`,
+with ASan on and bounds checks still in.
+
+Running one is open-ended, so it is not part of `mise run verify`.
+`.github/workflows/fuzz.yml` does it nightly instead, twenty minutes per target
+against a corpus cached between runs so coverage compounds rather than
+restarting each night, and `workflow_dispatch` runs it on demand after a parser
+is touched. What CI runs on every change is the bounded half:
+`mise run fuzz-regression` replays `testdata/fuzz-corpus/` — eighteen seeds and
+one committed crash — through each target once, generating nothing new, so a
+crash fuzzing has already found stays found instead of only living in whoever's
+corpus turned it up.
+
+**Against live DNS**, because none of the layers above can prove the absence of
+false failures — they work from fixtures and generated input, so they can show
+that a forged answer is refused and cannot show that validation leaves working
+names working. A validator that refused everything would pass the entire suite.
 
 `go run ./cmd/bench -survey 9.9.9.9:53` from `bench/` asks every name in
 `bench/domains.txt` through elodin with validation on, asks a reference
