@@ -379,27 +379,44 @@ resolve_query :: proc(
 	key_buf: [cache.KEY_MAX]u8
 	key := cache.make_key(key_buf[:], q.name, q.type, q.class, dns.edns_do(msg), msg.flags.cd)
 
+	/*
+	An expired entry that `serve_stale` kept, held back rather than served.
+
+	RFC 8767 section 5 has a resolver try the refresh first and use expired data
+	only once that attempt has failed, which is what the setting says it does:
+	answer from an expired entry *if the upstream is down*. So a stale hit falls
+	through to the forwarding path exactly as a miss would, and these bytes come
+	out below only if that path cannot produce an answer at all.
+
+	They stay valid for as long as they are needed: `cache.get` copies the entry
+	into the per-request arena, which outlives the upstream call and is released
+	only once the response has gone out.
+	*/
+	stale_hit: []u8
+
 	if s.cfg.cache.enabled {
 		if hit, stale, found := cache.get(s.answers, key, allocator); found {
-			dns.set_id_in_place(hit, msg.id)
-			dns.copy_question_case(hit, query)
-			// The stored answer carries the verdict; whether this client gets to
-			// hear it is a separate question.
-			settle_ad_bit(hit, msg, validating)
-			sync.atomic_add(&s.stats.cached, 1)
-			out := fit_response(hit, limit, msg, allocator)
-			log_query(s, client, proto, q, .Cached, "stale" if stale else "cache", started)
-			return out, .Cached, true
+			if !stale {
+				return serve_from_cache(s, hit, query, msg, q, proto, client, limit, validating, false, started, allocator)
+			}
+			stale_hit = hit
 		}
 	}
 
 	/*
 	RD=0 asks for whatever this server already knows, not for a fresh lookup -
-	RFC 1035 section 4.1.1. A cache hit above already answered that without
+	RFC 1035 section 4.1.1. A fresh cache hit above already answered that without
 	going anywhere; reaching this point means answering it would mean forwarding
 	to an upstream, which is the recursion the client did not ask for. Refused
 	rather than silently dropped, matching the other policy refusals above -
 	the allow-list is what keeps this from being a free reflection.
+
+	An expired entry held back for the upstream is served here rather than
+	refused. It is something this server already knows and no recursion is needed
+	to produce it, so the reason for the refusal does not reach it - and the
+	forwarding path that would have refreshed it is closed to this query anyway.
+	Refusing would withhold the fallback from exactly the clients that asked for
+	local knowledge and nothing else.
 
 	No counter of its own, again matching the class, XFR and cookie refusals
 	beside it: `Stats.refused` is `server.allow_from` turning away a datagram or
@@ -410,6 +427,9 @@ resolve_query :: proc(
 	`log.queries` is on.
 	*/
 	if !msg.flags.rd {
+		if stale_hit != nil {
+			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, true, started, allocator)
+		}
 		out, built := dns.error_response(query, msg, .Refused, allocator, limit)
 		log_query(s, client, proto, q, .Refused, "rd", started)
 		return out, .Refused, built
@@ -498,9 +518,23 @@ resolve_query :: proc(
 
 	resp, winner, uerr := upstream.resolve(s.group, forwarded, allocator)
 	if uerr != .None {
+		logx.debugf("query %s %s from %s failed: %v", dns.type_name(q.type), q.name, client, uerr)
+		/*
+		The condition `cache.serve_stale` was always documented by: the refresh
+		was attempted, and there is nothing to answer with but what expired.
+
+		Only a failure to get an answer at all counts. An upstream that answered
+		SERVFAIL answered, and a response this server refused to hand on -
+		because it did not validate - was refused deliberately; serving expired
+		data instead of either would be reaching past a verdict rather than
+		covering an outage. RFC 8767 section 5 leaves both open; neither is
+		decided here.
+		*/
+		if stale_hit != nil {
+			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, true, started, allocator)
+		}
 		sync.atomic_add(&s.stats.failed, 1)
 		out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
-		logx.debugf("query %s %s from %s failed: %v", dns.type_name(q.type), q.name, client, uerr)
 		log_query(s, client, proto, q, .Failed, "upstream", started)
 		return out, .Failed, built
 	}
@@ -558,6 +592,55 @@ resolve_query :: proc(
 	name := winner.spec.name if winner != nil else "?"
 	log_query(s, client, proto, q, .Forwarded, name, started)
 	return out, .Forwarded, true
+}
+
+/*
+Hand a stored answer to the client that asked for it.
+
+The fresh hit and the stale fallback are the same answer as far as everything
+downstream is concerned - the same transaction ID to put back, the same question
+case to restore, the same verdict to settle, the same limit to fit - and they go
+through one procedure so that a step added for one of them cannot be missed for
+the other. The two differ in what an operator is told: `stale` is what the query
+log reports as the detail, and what tells the cache that the copy it lent out
+was used.
+
+Counted as a cached query either way, because that is what happened: the client
+was answered from this server's cache without an upstream producing the answer.
+The upstream failure behind a stale answer is a debug line of its own and not a
+failed query - the client got an answer.
+*/
+@(private)
+serve_from_cache :: proc(
+	s: ^Server,
+	hit: []u8,
+	query: []u8,
+	msg: dns.Message,
+	q: dns.Question,
+	proto: Protocol,
+	client: string,
+	limit: int,
+	validating: bool,
+	stale: bool,
+	started: time.Time,
+	allocator: mem.Allocator,
+) -> (
+	response: []u8,
+	outcome: Outcome,
+	ok: bool,
+) {
+	dns.set_id_in_place(hit, msg.id)
+	dns.copy_question_case(hit, query)
+	// The stored answer carries the verdict; whether this client gets to hear it
+	// is a separate question.
+	settle_ad_bit(hit, msg, validating)
+	if stale {
+		cache.note_stale_served(s.answers)
+	}
+	sync.atomic_add(&s.stats.cached, 1)
+	out := fit_response(hit, limit, msg, allocator)
+	log_query(s, client, proto, q, .Cached, "stale" if stale else "cache", started)
+	return out, .Cached, true
 }
 
 /*
