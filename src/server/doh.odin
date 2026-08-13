@@ -13,8 +13,10 @@ Both defined request forms are accepted:
   POST <path>            body is the raw DNS message
   GET  <path>?dns=<b64>  base64url-encoded DNS message, no padding
 
-HTTP/2 is not implemented. The TLS layer advertises only "http/1.1" via ALPN, so
-an HTTP/2-only client fails during the handshake instead of after it.
+HTTP/2 is served elsewhere. The listener advertises "h2" and "http/1.1" via ALPN
+and hands an "h2" connection to `serve_doh2`, so this reader only ever sees a
+client that selected HTTP/1.1 - which is why an `HTTP/2.0` request line here is
+refused rather than upgraded.
 */
 
 DOH_CONTENT_TYPE :: "application/dns-message"
@@ -45,7 +47,8 @@ Http_Request_In :: struct {
 	keep_alive:   bool,
 	content_type: string,
 	// The Host header, used only to build the DoH URL the .mobileconfig endpoint
-	// hands back. Empty when the client sent none.
+	// hands back. Empty only on an HTTP/1.0 request, which predates the field; an
+	// HTTP/1.1 request without one is refused before it gets here.
 	host:         string,
 }
 
@@ -171,7 +174,32 @@ parse_content_length :: proc(value: string) -> (length: int, ok: bool) {
 }
 
 /*
+Whether `version` is an HTTP-version this endpoint speaks.
+
+RFC 9112 2.3 writes it as `HTTP/` `DIGIT` `.` `DIGIT`, and for this major version
+that is `HTTP/1.` and one digit - the whole token, case-sensitively, with no room
+for anything on either side of it. A minor version above 1 is not refused: 2.3
+has a recipient treat one as the highest minor version it speaks, and nothing in
+HTTP/1.x changes framing between minor versions. Another major version is, ALPN
+having already routed HTTP/2 elsewhere - see the note at the top of this file.
+*/
+@(private)
+http_version_ok :: proc(version: string) -> bool {
+	return len(version) == 8 && strings.has_prefix(version, "HTTP/1.") && version[7] >= '0' && version[7] <= '9'
+}
+
+/*
 Read one request off `r`.
+
+`status` says what the caller is to answer a request this refuses with, and 0
+says to answer nothing and close. Nothing is answered where the framing is what
+was wrong - an unreadable `Content-Length`, a folded field line, a chunked body:
+those are requests this hop and the hop in front may cut in different places, and
+a reply on a connection whose next byte this server cannot place would be a reply
+the front end may attribute to the next request on it. A request line, on the
+other hand, is either read whole or not read at all, so the refusals RFC 9112
+asks for there are safe to send - and are sent with the connection closed after
+them.
 
 Everything kept in the result is copied out of the reader's buffer rather than
 pointed into it. `http_line` and `http_exact` return views, and every read after
@@ -182,26 +210,50 @@ reading correctly, but nothing here should depend on which allocator it was
 handed. The copies live in the same scratch space and go the same way.
 */
 @(private)
-read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, ok: bool) {
+read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int, ok: bool) {
 	hold :: proc(s: string) -> string {
 		return strings.clone(s, context.temp_allocator)
 	}
 	line := http_line(r) or_return
 
-	// "METHOD path HTTP/1.1"
+	// "METHOD SP request-target SP HTTP-version", three tokens and nothing else
+	// (RFC 9112 3).
 	first := strings.index_byte(line, ' ')
 	if first <= 0 {
-		return {}, false
+		return {}, 400, false
 	}
 	rest := line[first + 1:]
 	second := strings.index_byte(rest, ' ')
 	if second <= 0 {
-		return {}, false
+		return {}, 400, false
 	}
-	req.method = hold(line[:first])
 	target := rest[:second]
 	version := rest[second + 1:]
-	req.keep_alive = version != "HTTP/1.0"
+	/*
+	`second` is the first space in `rest`, so what follows the target - any
+	further space included - is all in `version`. Checked rather than taken for
+	one: read as "not HTTP/1.0, so 1.1 with keep-alive", `GET / JUNK` was a
+	request, and so was `GET / HTTP/1.1 trailing-garbage`.
+
+	Both are the disagreement `parse_content_length` above is written against, on
+	the other half of the request line. A front end sharing :443 with elodin, or
+	terminating TLS in front of it, reads the request line as the grammar writes
+	it: it refuses the message, or - given a fourth token - takes the target to be
+	something other than what this hop took it for.
+
+	A fourth token, or a missing third one, is a line that is not three tokens,
+	which RFC 9112 3 answers with a 400; a third token that is not a version this
+	server speaks is the 505 of 2.3.
+	*/
+	if len(version) == 0 || strings.index_byte(version, ' ') >= 0 {
+		return {}, 400, false
+	}
+	if !http_version_ok(version) {
+		return {}, 505, false
+	}
+	req.method = hold(line[:first])
+	http_1_0 := version == "HTTP/1.0"
+	req.keep_alive = !http_1_0
 
 	if q := strings.index_byte(target, '?'); q >= 0 {
 		req.path = hold(target[:q])
@@ -212,6 +264,9 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, ok: bool) {
 
 	// -1 rather than 0, so a second Content-Length can be told from the first.
 	content_length := -1
+	// Counted rather than flagged off `req.host`: an empty Host is a field the
+	// client sent, and a second one has to be told from it.
+	hosts := 0
 	for {
 		header := http_line(r) or_return
 		if header == "" {
@@ -231,14 +286,14 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, ok: bool) {
 		either.
 		*/
 		if header[0] == ' ' || header[0] == '\t' {
-			return {}, false
+			return {}, 0, false
 		}
 		colon := strings.index_byte(header, ':')
 		if colon <= 0 {
-			return {}, false
+			return {}, 0, false
 		}
 		if header[colon - 1] == ' ' || header[colon - 1] == '\t' {
-			return {}, false
+			return {}, 0, false
 		}
 		name := header[:colon]
 		value := strings.trim_space(header[colon + 1:])
@@ -248,14 +303,14 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, ok: bool) {
 			// whether or not they agree, because the hop in front is entitled to
 			// resolve the pair differently from the way this one would.
 			if content_length >= 0 {
-				return {}, false
+				return {}, 0, false
 			}
 			// The field value as it arrived, not `value`: `strings.trim_space`
 			// takes a non-breaking space off the end, which is not OWS and not
 			// something a front end would overlook.
 			v, vok := parse_content_length(header[colon + 1:])
 			if !vok {
-				return {}, false
+				return {}, 0, false
 			}
 			content_length = v
 		case strings.equal_fold(name, "connection"):
@@ -265,12 +320,31 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, ok: bool) {
 		case strings.equal_fold(name, "content-type"):
 			req.content_type = hold(value)
 		case strings.equal_fold(name, "host"):
+			/*
+			RFC 9112 3.2: a request carrying more than one Host is a 400, whether
+			or not the two agree - the same argument a repeated Content-Length
+			gets. The loop kept the last one it saw, and the .mobileconfig
+			endpoint builds a URL out of it: given two, the profile a device
+			installs names whichever of them this hop happened to keep, which is
+			not necessarily the one the front end routed the request by.
+			*/
+			hosts += 1
+			if hosts > 1 {
+				return {}, 400, false
+			}
 			req.host = hold(value)
 		case strings.equal_fold(name, "transfer-encoding"):
 			// Chunked request bodies are not accepted; DoH clients send a
 			// Content-Length.
-			return {}, false
+			return {}, 0, false
 		}
+	}
+
+	// RFC 9112 3.2 again: Host carries the authority for an origin-form target,
+	// so an HTTP/1.1 request without one is a 400. HTTP/1.0 predates the field
+	// and is allowed to leave it out.
+	if hosts == 0 && !http_1_0 {
+		return {}, 400, false
 	}
 
 	if content_length > 0 {
@@ -279,7 +353,7 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, ok: bool) {
 		copy(owned, body)
 		req.body = owned
 	}
-	return req, true
+	return req, 0, true
 }
 
 @(private)
@@ -309,8 +383,15 @@ serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 	defer delete(r.buf)
 
 	for {
-		req, ok := read_http_request(&r)
+		req, status, ok := read_http_request(&r)
 		if !ok {
+			// The connection ends either way: `keep_alive` is false, so nothing
+			// further is read off a connection whose next byte this server cannot
+			// place. A `status` of 0 is a request that is not answered at all -
+			// see `read_http_request`.
+			if status != 0 {
+				_ = send_http_error(conn, "doh", status, http_refusal_message(status), false)
+			}
 			free_all(context.temp_allocator)
 			return
 		}
@@ -489,6 +570,22 @@ query_param :: proc(query: string, name: string) -> (value: string, found: bool)
 		}
 	}
 	return "", false
+}
+
+/*
+The reason phrase for a status `read_http_request` refused a request with.
+
+`send_http_error` writes the message it is given as both the reason phrase and
+the body, and the reader hands back a status rather than a phrase - which
+endpoint is being refused for, and in what words, is not its business. Both
+callers of the reader map it here so the two answer alike.
+*/
+@(private)
+http_refusal_message :: proc(status: int) -> string {
+	if status == 505 {
+		return "http version not supported"
+	}
+	return "bad request"
 }
 
 // `who` names the endpoint in the debug line. Both HTTP endpoints this server

@@ -184,7 +184,7 @@ test_doh_request_survives_a_buffer_that_grows :: proc(t: ^testing.T) {
 	}
 	defer delete(r.buf)
 
-	req, ok := read_http_request(&r)
+	req, _, ok := read_http_request(&r)
 	testing.expect(t, ok, "the request did not parse")
 	if !ok {
 		return
@@ -343,7 +343,7 @@ test_doh_reader_gives_back_an_oversized_buffer :: proc(t: ^testing.T) {
 	}
 	defer delete(r.buf)
 
-	req, ok := read_http_request(&r)
+	req, _, ok := read_http_request(&r)
 	testing.expect(t, ok, "the request did not parse")
 	if !ok {
 		return
@@ -475,19 +475,31 @@ The sender closes as soon as its bytes are away. A reader that asks for more
 than what was sent therefore reaches the end of the connection instead of
 blocking, which is what a body shorter than its declared length has to look
 like here.
+
+`status` is what the reader asks the caller to answer a refused request with,
+and `ok` is whether the loopback pair itself came up - not whether the request
+parsed, which is `parsed`.
 */
 @(private = "file")
-read_request_over_loopback :: proc(t: ^testing.T, raw: string, what: string) -> (req: Http_Request_In, parsed, ok: bool) {
+read_request_over_loopback :: proc(
+	t: ^testing.T,
+	raw: string,
+	what: string,
+) -> (
+	req: Http_Request_In,
+	status: int,
+	parsed, ok: bool,
+) {
 	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
 	if lerr != nil {
 		testing.expectf(t, false, "%s: cannot listen on loopback: %v", what, lerr)
-		return {}, false, false
+		return {}, 0, false, false
 	}
 	defer net.close(listener)
 	bound, berr := net.bound_endpoint(listener)
 	if berr != nil {
 		testing.expectf(t, false, "%s: cannot read the bound port: %v", what, berr)
-		return {}, false, false
+		return {}, 0, false, false
 	}
 
 	// A few hundred bytes, so the whole request fits in the socket buffer and
@@ -495,7 +507,7 @@ read_request_over_loopback :: proc(t: ^testing.T, raw: string, what: string) -> 
 	client, derr := net.dial_tcp_from_endpoint(bound)
 	if derr != nil {
 		testing.expectf(t, false, "%s: cannot dial the listener: %v", what, derr)
-		return {}, false, false
+		return {}, 0, false, false
 	}
 	sent := 0
 	bytes := transmute([]u8)raw
@@ -504,7 +516,7 @@ read_request_over_loopback :: proc(t: ^testing.T, raw: string, what: string) -> 
 		if serr != nil || n <= 0 {
 			net.close(client)
 			testing.expectf(t, false, "%s: cannot send the request: %v", what, serr)
-			return {}, false, false
+			return {}, 0, false, false
 		}
 		sent += n
 	}
@@ -513,7 +525,7 @@ read_request_over_loopback :: proc(t: ^testing.T, raw: string, what: string) -> 
 	accepted, _, aerr := net.accept_tcp(listener)
 	if aerr != nil {
 		testing.expectf(t, false, "%s: nothing connected: %v", what, aerr)
-		return {}, false, false
+		return {}, 0, false, false
 	}
 	defer net.close(accepted)
 	_ = net.set_option(accepted, .Receive_Timeout, 3 * time.Second)
@@ -522,8 +534,97 @@ read_request_over_loopback :: proc(t: ^testing.T, raw: string, what: string) -> 
 		conn = Conn{socket = accepted},
 		buf  = make([dynamic]u8, 0, 4096, context.temp_allocator),
 	}
-	req, parsed = read_http_request(&r)
-	return req, parsed, true
+	req, status, parsed = read_http_request(&r)
+	return req, status, parsed, true
+}
+
+/*
+A request line is three tokens, and the third of them is a version this server
+speaks.
+
+RFC 9112 3 writes it as `method SP request-target SP HTTP-version` with nothing
+around it, and 2.3 writes the version as `HTTP/1.<DIGIT>` here. Split on its
+first two spaces and never looked at, the third token took anything: `JUNK` was
+read as a version, and so was `HTTP/1.1 trailing-garbage`, because everything
+after the target - further spaces included - landed in it.
+
+Both are the disagreement the `Content-Length` cases below are about, on the
+other half of the request line. A front end sharing :443 with elodin, or
+terminating TLS in front of it, reads the version as the grammar writes it: it
+refuses the message, or - for `HTTP/1.1 x` - takes the target to be `/` on a
+request this hop was willing to answer. `Host` is the same argument again: RFC
+9112 3.2 makes it mandatory on HTTP/1.1 and a repeat invalid, for the reason a
+repeated `Content-Length` is.
+
+`status` is what the caller answers with, and 0 is "answer nothing, close" - the
+framing cases keep that, an answer on a connection whose next byte this server
+cannot place being worse than a close.
+*/
+@(test)
+test_request_line_is_three_tokens_with_a_known_version :: proc(t: ^testing.T) {
+	Case :: struct {
+		line:       string, // the request line, without its CRLF
+		host:       string, // the Host field lines, if any, each with its CRLF
+		status:     int, // 0 for a request that parses
+		keep_alive: bool, // what the version asks for, when it parses
+		what:       string,
+	}
+
+	HOST :: "Host: dns.example\r\n"
+	TWO_HOSTS :: "Host: a.example\r\nHost: b.example\r\n"
+
+	CASES := []Case {
+		{"GET /dns-query HTTP/1.1", HOST, 0, true, "an ordinary 1.1 request line"},
+		{"GET /dns-query HTTP/1.0", HOST, 0, false, "1.0, which keep-alive is not assumed for"},
+		// RFC 9112 3.2 asks for Host on HTTP/1.1; 1.0 predates the field.
+		{"GET /dns-query HTTP/1.0", "", 0, false, "1.0 without a Host, which is allowed"},
+		{"GET /dns-query HTTP/1.9", HOST, 0, true, "a minor version this major version allows"},
+		{"GET /dns-query JUNK", HOST, 505, false, "a version that is not one"},
+		{"GET /dns-query HTTP/2.0", HOST, 505, false, "a major version this endpoint does not speak"},
+		{"GET /dns-query HTTP/0.9", HOST, 505, false, "a major version below this one"},
+		{"GET /dns-query HTTP/1.10", HOST, 505, false, "a two-digit minor version, which is not the grammar"},
+		{"GET /dns-query http/1.1", HOST, 505, false, "a lowercase version name"},
+		{"GET /dns-query HTTP/1.1 x", HOST, 400, false, "a fourth token"},
+		{"GET /dns-query HTTP/1.1 ", HOST, 400, false, "a trailing space"},
+		{"GET /dns-query ", HOST, 400, false, "no version at all"},
+		{"GET  HTTP/1.1", HOST, 400, false, "an empty target"},
+		{" /dns-query HTTP/1.1", HOST, 400, false, "an empty method"},
+		{"GET /dns-query", HOST, 400, false, "two tokens"},
+		{"GET /dns-query HTTP/1.1", "", 400, false, "1.1 with no Host"},
+		{"GET /dns-query HTTP/1.1", HOST + HOST, 400, false, "identical repeats of Host"},
+		{"GET /dns-query HTTP/1.1", TWO_HOSTS, 400, false, "conflicting repeats of Host"},
+		{"GET /dns-query HTTP/1.0", TWO_HOSTS, 400, false, "repeats of Host on 1.0 as well"},
+	}
+
+	for c in CASES {
+		b := strings.builder_make(context.temp_allocator)
+		strings.write_string(&b, c.line)
+		strings.write_string(&b, "\r\n")
+		strings.write_string(&b, c.host)
+		strings.write_string(&b, "\r\n")
+
+		req, status, parsed, ok := read_request_over_loopback(t, strings.to_string(b), c.what)
+		if !ok {
+			return
+		}
+		if c.status == 0 {
+			testing.expectf(t, parsed, "%s was refused with a %d", c.what, status)
+			if parsed {
+				testing.expectf(
+					t,
+					req.keep_alive == c.keep_alive,
+					"%s: keep_alive came back as %v, expected %v",
+					c.what,
+					req.keep_alive,
+					c.keep_alive,
+				)
+			}
+		} else {
+			testing.expectf(t, !parsed, "%s was accepted, as %q", c.what, req.path)
+			testing.expectf(t, status == c.status, "%s: answered %d, expected %d", c.what, status, c.status)
+		}
+		free_all(context.temp_allocator)
+	}
 }
 
 /*
@@ -595,7 +696,7 @@ test_content_length_is_strict_decimal :: proc(t: ^testing.T) {
 		strings.write_string(&b, "\r\n")
 		strings.write_string(&b, c.body)
 
-		req, parsed, ok := read_request_over_loopback(t, strings.to_string(b), c.what)
+		req, _, parsed, ok := read_request_over_loopback(t, strings.to_string(b), c.what)
 		if !ok {
 			return
 		}

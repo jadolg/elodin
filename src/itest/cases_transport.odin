@@ -357,6 +357,52 @@ run_transport_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	/*
+	The request line is three tokens and the third of them is a version this
+	server speaks (RFC 9112 3 and 2.3), and an HTTP/1.1 request carries exactly
+	one Host (RFC 9112 3.2).
+
+	Same argument as the Content-Length cases above, on the other half of the
+	request line. A front end sharing :443 with elodin reads the version and the
+	authority as the grammar writes them - it refuses these, or reads a target or
+	a host out of them that this hop did not - so what is checked is that the
+	refusal happens here too, and that it says which half was wrong: 505 for a
+	version this endpoint does not speak, 400 for a line that is not three tokens
+	and for the Host cases.
+
+	`HTTP/1.0` is in the list because it is the one version below 1.1 that stays
+	valid, Host and all: the field postdates it, so a 1.0 request without one is
+	answered rather than refused.
+	*/
+	start_case(r, "doh: the request line and Host are checked")
+	{
+		Case :: struct {
+			request: string,
+			status:  int,
+			what:    string,
+		}
+		CASES := []Case {
+			{"GET /nope JUNK\r\nHost: elodin.local\r\nConnection: close\r\n\r\n", 505, "a version that is not one"},
+			{"GET /nope HTTP/2.0\r\nHost: elodin.local\r\nConnection: close\r\n\r\n", 505, "HTTP/2 without ALPN"},
+			{"GET /nope HTTP/1.1 x\r\nHost: elodin.local\r\nConnection: close\r\n\r\n", 400, "a fourth token"},
+			{"GET /nope\r\nHost: elodin.local\r\nConnection: close\r\n\r\n", 400, "two tokens"},
+			{"GET /nope HTTP/1.1\r\nConnection: close\r\n\r\n", 400, "1.1 with no Host"},
+			{
+				"GET /nope HTTP/1.1\r\nHost: a.example\r\nHost: b.example\r\nConnection: close\r\n\r\n",
+				400,
+				"two Hosts",
+			},
+			{"GET /nope HTTP/1.0\r\nConnection: close\r\n\r\n", 404, "1.0 without a Host, still served"},
+		}
+		for c in CASES {
+			res := doh_raw(doh_port, c.request)
+			if check(r, res.ok, "%s: no HTTP response", c.what) {
+				check(r, res.status == c.status, "%s: status %d, want %d", c.what, res.status, c.status)
+			}
+		}
+	}
+	end_case(r)
+
 	// --- local answers, no upstream involved ---
 	start_case(r, "chaos: version.bind reports the build")
 	{
