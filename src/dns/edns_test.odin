@@ -622,5 +622,25 @@ test_badvers_needs_its_opt_record_to_read_as_a_refusal :: proc(t: ^testing.T) {
 	// RFC 6891 section 6.1.3 has the response state the highest version the
 	// responder implements, which is 0 - not the version that was asked for.
 	testing.expect_value(t, edns_version(decoded), u8(0))
+
+	/*
+	And the same through `error_response`, which is what the version gate
+	actually calls, for the one query that has nothing else to build from: id
+	zero and no question at all. That is the shape which sends `error_response`
+	down its header-patching fallback, and a twelve-byte header has no OPT
+	record to carry the top four bits of rcode 16 - so the refusal would go back
+	as NOERROR, which is this server agreeing to a version it cannot speak. The
+	gate runs before the question count is checked, so the shape is reachable.
+	*/
+	bare := Message {
+		additional = additional,
+	}
+	bare_wire, bare_ok := error_response(make([]u8, HEADER_SIZE, context.temp_allocator), bare, .Bad_Vers, context.temp_allocator)
+	testing.expect(t, bare_ok, "no answer was built for a version refusal with no question")
+	testing.expect_value(t, peek_rcode(bare_wire), Rcode.Bad_Vers)
+	bare_decoded, bare_derr := decode_message(bare_wire, context.temp_allocator)
+	testing.expect_value(t, bare_derr, Decode_Error.None)
+	testing.expect_value(t, rcode_of(bare_decoded), Rcode.Bad_Vers)
+
 	free_all(context.temp_allocator)
 }

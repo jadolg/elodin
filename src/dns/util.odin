@@ -182,8 +182,17 @@ error_response :: proc(
 
 	So the decision is made on whether there is anything to build from, not on
 	whether the encoder objected.
+
+	An extended rcode is the third thing there is to build from. Its top bits
+	live in an OPT record and nowhere else, so the fallback below - twelve bytes
+	and no additional section - cannot carry one: BADVERS would go back as
+	NOERROR and BADCOOKIE as YXRRSET, which is a weaker answer than the refusal
+	meant, and in BADVERS' case is this server agreeing to a version it cannot
+	speak. A query that carries an OPT record is enough to answer from, whatever
+	else it left out - `make_response` echoes that record and puts the top bits
+	in it.
 	*/
-	usable := len(query.question) > 0 || query.id != 0
+	usable := len(query.question) > 0 || query.id != 0 || (u16(rcode) > 0xf && edns_present(query))
 	if usable {
 		resp := make_response(query, rcode, allocator)
 		bytes, _, err := encode_message(resp, allocator, max_size)
