@@ -912,6 +912,32 @@ test_encode_refuses_a_modelled_type_holding_a_pointer :: proc(t: ^testing.T) {
 }
 
 /*
+NSAP-PTR is held to the same rule as the CNAME above.
+
+It is the odd one out among the types whose RDATA is a name and nothing else -
+the one RFC 4034 never listed for downcasing - and being odd is how a type comes
+to be left off a table. Left off this one it takes the whole of the corruption
+these tests are about: its name will not decode, so the record falls back to raw,
+and the two bytes of a stale pointer go out in a message of ours naming whatever
+now sits at that offset.
+*/
+@(test)
+test_encode_refuses_an_nsap_ptr_holding_a_pointer :: proc(t: ^testing.T) {
+	m, _ := message_prefix(3)
+	append_answer(&m, .NSAP_PTR, []u8{0xc0, 0xf0})
+
+	raw, ok := raw_rdata_of(m[:], .NSAP_PTR)
+	testing.expect(t, ok, "the undecodable NSAP-PTR did not come back as raw rdata")
+	testing.expect(t, mem.compare(raw, []u8{0xc0, 0xf0}) == 0, "unwalkable NSAP-PTR rdata was altered")
+
+	msg, derr := decode_message(m[:], context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	_, _, eerr := encode_message(msg, context.temp_allocator)
+	testing.expect_value(t, eerr, Encode_Error.Bad_Rdata)
+	free_all(context.temp_allocator)
+}
+
+/*
 RDATA with nothing to expand comes back exactly as it arrived.
 
 Expansion is only ever a rewrite of compression pointers, so a blob holding none

@@ -41,29 +41,34 @@ Where the domain names sit inside the RDATA of a type kept as raw bytes: some
 fixed-width bytes, then some character-strings, then the names. Everything past
 the last name is carried through untouched.
 
-Only types on `rdata_has_compressible_name` need an entry, and only those whose
-layout is fixed enough to walk without knowing more than the type. A6 is left
-out: where its name starts depends on a prefix length in its own RDATA, and it
-has been formally obsolete since RFC 6563. An A6 record therefore still forwards
-with its pointer intact, which is what it did before any of this existed.
+Only types whose RDATA may carry a domain name need an entry, and only those
+whose layout is fixed enough to walk without knowing more than the type. A6 is
+left out: where its name starts depends on a prefix length in its own RDATA, and
+it has been formally obsolete since RFC 6563. An A6 record therefore still
+forwards with its pointer intact, which is what it did before any of this
+existed.
 
-The types this decoder models natively - NS, CNAME, PTR, DNAME, MB, MG, MR, SOA,
-MX, SRV - are on the list too, because a record of one of them still lands here
-when its RDATA fails to parse for some other reason. An MX whose RDLENGTH counts
-one byte more than its two fields, a SOA whose serial is short, a CNAME whose
-name will not decode: `decode_record` catches the failure and keeps the bytes as
-`Rdata_Raw`, and the compressed name inside is then exactly as stale as any other
-once the message it pointed into is gone.
+The types this decoder models natively - NS, CNAME, PTR, DNAME, MB, MG, MR,
+NSAP-PTR, SOA, MX, SRV - are on the list too, because a record of one of them
+still lands here when its RDATA fails to parse for some other reason. An MX whose
+RDLENGTH counts one byte more than its two fields, a SOA whose serial is short, a
+CNAME whose name will not decode: `decode_record` catches the failure and keeps
+the bytes as `Rdata_Raw`, and the compressed name inside is then exactly as stale
+as any other once the message it pointed into is gone.
 
-The same table exists as `raw_layout` in src/dnssec/canonical.odin, which walks
-these layouts to lowercase the names for canonical form. It cannot reach a
+Nearly the same table exists as `raw_layout` in src/dnssec/canonical.odin, which
+walks these layouts to lowercase the names for canonical form. It cannot reach a
 private helper in this package and this package must not depend on that one, so
-the two are kept in step by hand: a type added to either belongs in both.
+the two are kept in step by hand. The lists are not quite the same list, though,
+and a type added here only belongs there if RFC 4034 section 6.2 names it: this
+one is "a name may be compressed in here", that one is "a name in here is
+lowercased for a signature". NSAP-PTR is the difference today - a name this
+decoder walks, and one no signer ever downcased.
 */
 @(private)
 raw_rdata_layout :: proc "contextless" (t: Type) -> (layout: Raw_Layout, ok: bool) {
 	#partial switch t {
-	case .NS, .CNAME, .PTR, .DNAME, .MB, .MG, .MR, .MD, .MF, .NXT:
+	case .NS, .CNAME, .PTR, .DNAME, .MB, .MG, .MR, .MD, .MF, .NXT, .NSAP_PTR:
 		return {0, 0, 1}, true
 	case .SOA, .MINFO, .RP:
 		return {0, 0, 2}, true

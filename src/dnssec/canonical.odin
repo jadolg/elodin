@@ -171,10 +171,14 @@ natively are listed anyway: one of them still arrives as raw bytes when its RDAT
 failed to parse, and a validation attempt on such a record should compare against
 the same canonical form as any other.
 
-The same table exists as `raw_rdata_layout` in src/dns/rdata_raw.odin, where the
-decoder walks it to expand compressed names. That one is private to its package
-and this one is private to this, so the two are kept in step by hand: a type
-added to either belongs in both.
+Nearly the same table exists as `raw_rdata_layout` in src/dns/rdata_raw.odin,
+where the decoder walks it to expand compressed names. That one is private to its
+package and this one is private to this, so the two are kept in step by hand -
+but they are not quite the same list. That one asks whether a name in the RDATA
+may have been compressed; this one asks whether a name in the RDATA is lowercased
+for a signature, which only the types in RFC 4034 section 6.2 are. NSAP-PTR is
+walked there and deliberately absent here: downcasing it would build a canonical
+form no signer ever computed.
 */
 @(private)
 Raw_Layout :: struct {
