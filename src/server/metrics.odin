@@ -144,9 +144,20 @@ serve_metrics :: proc(s: ^Server, l: ^Listeners, socket: net.TCP_Socket, client:
 		conn = conn,
 		buf  = make([dynamic]u8, 0, METRICS_REQUEST_BUF, context.temp_allocator),
 	}
-	req, ok := read_http_request(&r)
+	req, status, ok := read_http_request(&r)
 	if !ok {
 		logx.debugf("metrics: unreadable request from %v", client)
+		// A scraper is a program, and one whose request line this endpoint will
+		// not read is one whose author has something to fix: the status says
+		// which half of it was wrong instead of leaving a bare closed connection
+		// to be read as the endpoint being down. 0 is a request that is not
+		// answered at all - see `read_http_request`.
+		if status != 0 {
+			_ = send_http_error(conn, "metrics", status, http_refusal_message(status), false)
+			// The refused request may have declared a body that was never read, and
+			// the close in the accept loop would take the answer with it.
+			http_linger(conn)
+		}
 		return
 	}
 
