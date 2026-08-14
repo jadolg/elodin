@@ -69,7 +69,13 @@ decode_name :: proc(msg: []u8, offset: int, allocator := context.allocator) -> (
 				return "", 0, .Short_Buffer
 			}
 			wire_len += 1 + label_len
-			if wire_len > MAX_NAME_WIRE {
+			// The 255 of RFC 1035 2.3.4 counts the whole encoding, and every
+			// name ends with the zero octet that terminates it, so the root is
+			// one of the 255 whether or not it has been read yet. Leaving it
+			// out let a name whose labels came to 255 octets through, which is
+			// 256 on the wire and one byte more than `encode_name` - which does
+			// count it - will ever agree to write.
+			if wire_len + 1 > MAX_NAME_WIRE {
 				return "", 0, .Name_Too_Long
 			}
 			for c in msg[pos + 1:pos + 1 + label_len] {
