@@ -33,6 +33,30 @@ edns_do :: proc(m: Message) -> bool {
 	return opt.ttl & 0x0000_8000 != 0
 }
 
+/*
+The EDNS version the requestor asked in, from the second byte of the OPT
+record's TTL.
+
+RFC 6891 section 6.1.3 divides that 32-bit field into an extended rcode, this
+version number, and sixteen flag bits of which DO is the top one. The three are
+windows onto one number, and until this one was cut only the two at either end
+of it were ever looked through - so a request asking in a version this server
+does not implement was indistinguishable from one asking in version 0, and got
+an answer in a version nobody had agreed on.
+
+A message with no OPT record asked in no version at all, and zero is the right
+answer for it: a requestor that never mentioned EDNS is asking for something
+this server can answer, which is what a caller comparing against the version it
+implements needs to hear.
+*/
+edns_version :: proc(m: Message) -> u8 {
+	opt, found := find_opt(m)
+	if !found {
+		return 0
+	}
+	return u8(opt.ttl >> 16)
+}
+
 make_opt :: proc(udp_size: u16, do_bit: bool, ext_rcode: u8 = 0) -> Record {
 	ttl := u32(ext_rcode) << 24
 	if do_bit {
@@ -158,8 +182,17 @@ error_response :: proc(
 
 	So the decision is made on whether there is anything to build from, not on
 	whether the encoder objected.
+
+	An extended rcode is the third thing there is to build from. Its top bits
+	live in an OPT record and nowhere else, so the fallback below - twelve bytes
+	and no additional section - cannot carry one: BADVERS would go back as
+	NOERROR and BADCOOKIE as YXRRSET, which is a weaker answer than the refusal
+	meant, and in BADVERS' case is this server agreeing to a version it cannot
+	speak. A query that carries an OPT record is enough to answer from, whatever
+	else it left out - `make_response` echoes that record and puts the top bits
+	in it.
 	*/
-	usable := len(query.question) > 0 || query.id != 0
+	usable := len(query.question) > 0 || query.id != 0 || (u16(rcode) > 0xf && edns_present(query))
 	if usable {
 		resp := make_response(query, rcode, allocator)
 		bytes, _, err := encode_message(resp, allocator, max_size)
