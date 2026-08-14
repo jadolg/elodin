@@ -28,6 +28,14 @@ Entry :: struct {
 Stats :: struct {
 	hits:      u64,
 	misses:    u64,
+	/*
+	Stale answers that reached a client, which only the caller knows about.
+
+	`get` lends an expired entry out without knowing whether it will be used -
+	the resolver asks an upstream first and serves what it was lent only if that
+	fails - so the count is made there, through `note_stale_served`, once there
+	is something to count.
+	*/
 	stale:     u64,
 	inserts:   u64,
 	evictions: u64,
@@ -51,6 +59,24 @@ Cache :: struct {
 
 // TTL handed out with a stale answer so the client comes back soon.
 STALE_TTL :: 30
+
+/*
+How long past its expiry an entry is kept when `serve_stale` is on.
+
+Expired data is worth keeping for the outage it is there to cover and not much
+longer. An address that changed months ago is not a better answer than SERVFAIL,
+and without a bound the last copy of every name ever looked up would sit here
+for the life of the process waiting for an upstream to have a bad minute. RFC
+8767 section 5 asks for such a cap and puts it in the region of one to three
+days; a day is the short end of that, which suits a forwarder whose entries are
+somebody else's to begin with.
+
+Deliberately not a configuration key. What an operator turns on is
+`cache.serve_stale`, and the useful answer to "how long" is a property of what
+stale data is for rather than of a deployment - so the setting stays one
+question rather than two, and this is the answer to the second.
+*/
+MAX_STALE :: 24 * time.Hour
 
 /*
 What the cache may hold when the operator has not said.
@@ -150,6 +176,13 @@ Look a response up.
 On a hit the returned bytes are a fresh copy owned by `allocator`, with TTLs
 already counted down and the transaction ID left at whatever the cached message
 had; callers set the ID and re-case the question themselves.
+
+`stale` says the entry had expired and `serve_stale` kept it. Those bytes are
+not an answer to send on sight: RFC 8767 section 5 has the refresh attempted
+first and expired data used only once that attempt has failed, which is also
+what the setting promises the operator - an answer from an expired entry if the
+upstream is down. The caller carries on as it would for a miss and falls back on
+what it was lent, calling `note_stale_served` if it does.
 */
 get :: proc(
 	c: ^Cache,
@@ -173,8 +206,7 @@ get :: proc(
 	}
 
 	now := time.now()
-	expired := time.diff(e.expires, now) > 0
-	if expired && !c.serve_stale {
+	if time.diff(deadline(c, e), now) > 0 {
 		remove_entry(c, e)
 		c.stats.misses += 1
 		return nil, false, false
@@ -184,7 +216,7 @@ get :: proc(
 	out := make([]u8, len(e.wire), allocator)
 	copy(out, e.wire)
 
-	if expired {
+	if time.diff(e.expires, now) > 0 {
 		// A stale answer goes out with a short fixed TTL rather than a
 		// counted-down one, which would already have reached zero.
 		for off in e.ttl_offsets {
@@ -193,15 +225,37 @@ get :: proc(
 			out[off + 2] = u8(STALE_TTL >> 8)
 			out[off + 3] = u8(STALE_TTL)
 		}
-		c.stats.stale += 1
+		/*
+		A miss, because that is what it is to the caller: the lookup was not
+		answered here, and the query goes on to an upstream exactly as an
+		unknown name would. Counting it a hit would put it in
+		`elodin_cache_hits_total`, whose help text says the lookups it counts
+		were answered from the cache, while the same query is counted forwarded
+		one package away.
+		*/
+		c.stats.misses += 1
 		stale = true
 	} else {
 		dns.patch_ttls(out, e.ttl_offsets, e.ttls, elapsed, c.min_ttl)
+		c.stats.hits += 1
 	}
 
+	// An expired entry moves to the front along with the fresh ones. Something
+	// is asking for this name, so it is the last thing to drop when the cache
+	// has to make room - and if the upstream for it is down, it is also the only
+	// answer for that name there is.
 	move_to_front(c, e)
-	c.stats.hits += 1
 	return out, stale, true
+}
+
+// Count a stale answer that a caller went on to serve; see `Stats.stale`.
+note_stale_served :: proc(c: ^Cache) {
+	if c == nil {
+		return
+	}
+	sync.mutex_lock(&c.mu)
+	defer sync.mutex_unlock(&c.mu)
+	c.stats.stale += 1
 }
 
 /*
@@ -310,8 +364,17 @@ clear_all :: proc(c: ^Cache) {
 	c.bytes = 0
 }
 
-// Remove every entry whose TTL has run out. Called periodically so a cache that
-// stops being queried does not hold memory indefinitely.
+/*
+Remove every entry that has run out of use. Called periodically so a cache that
+stops being queried does not hold memory indefinitely.
+
+Expiry is not that point when `serve_stale` is on: `main.maintenance_loop` runs
+this every thirty seconds, so sweeping at expiry left an expired entry alive for
+half a minute at most - and an upstream that has been down for half a minute is
+one nothing has noticed yet. The setting could only ever have worked in the
+window before the next tick, which is the window in which it is needed least.
+See `deadline`.
+*/
 sweep :: proc(c: ^Cache) -> (removed: int) {
 	if c == nil {
 		return 0
@@ -323,7 +386,7 @@ sweep :: proc(c: ^Cache) -> (removed: int) {
 	e := c.tail
 	for e != nil {
 		prev := e.prev
-		if time.diff(e.expires, now) > 0 {
+		if time.diff(deadline(c, e), now) > 0 {
 			remove_entry(c, e)
 			removed += 1
 		}
@@ -358,6 +421,22 @@ stats :: proc(c: ^Cache) -> Stats {
 	sync.mutex_lock(&c.mu)
 	defer sync.mutex_unlock(&c.mu)
 	return c.stats
+}
+
+/*
+When an entry stops being of any use.
+
+Its expiry, or `MAX_STALE` past it while stale serving is on - the point past
+which the entry is neither a valid answer nor a fallback worth keeping. `get`
+and `sweep` both read it from here, because an entry one of them keeps and the
+other refuses is either memory held for a day for nothing or an answer served
+from data too old to serve, depending on which of the two runs first.
+
+The caller holds the lock.
+*/
+@(private)
+deadline :: proc(c: ^Cache, e: ^Entry) -> time.Time {
+	return time.time_add(e.expires, MAX_STALE) if c.serve_stale else e.expires
 }
 
 /*

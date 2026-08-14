@@ -197,6 +197,10 @@ cache:
   min_ttl: 0           # raise to hold short-lived answers longer
   max_ttl: 24h
   negative_ttl: 300    # cap for NXDOMAIN / NODATA
+  # An entry is kept for a day past its expiry, reached for only once the
+  # upstream has failed to answer - or straight away for an RD=0 query, which
+  # forbids the forwarding that would have refreshed it - and handed out with a
+  # 30-second TTL so the client comes back for a fresh one.
   serve_stale: false   # answer from an expired entry if the upstream is down
 
 blocking:

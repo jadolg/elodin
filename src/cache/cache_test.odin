@@ -235,6 +235,126 @@ test_serve_stale :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+/*
+The sweep leaves alone the entries stale serving exists to keep.
+
+`main.maintenance_loop` sweeps every thirty seconds, so an entry the sweep drops
+the moment it expires is gone long before an outage has been noticed - and an
+outage is the only thing `serve_stale` is for. That left the setting a window of
+0 to 30 seconds after expiry to work in, which is precisely the window in which
+an upstream that has just stopped answering still looks fine, and an upstream
+down for two minutes found the cache already emptied of everything it would have
+served.
+
+With the setting off nothing changes: the entry goes at expiry, as it always
+has, because keeping expired answers nobody will serve is only memory held for
+no reason.
+*/
+@(test)
+test_sweep_keeps_stale_entries :: proc(t: ^testing.T) {
+	kb: [KEY_MAX]u8
+	key := key_for(kb[:], "stale.example.")
+	wire, msg := build_answer("stale.example.", 60, context.temp_allocator)
+
+	c := make_cache(Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
+	defer destroy(c)
+	testing.expect(t, put(c, key, wire, msg), "the entry was not stored")
+	sync_expire(c, key)
+
+	testing.expect_value(t, sweep(c), 0)
+	_, stale, ok := get(c, key, context.temp_allocator)
+	testing.expect(t, ok, "the entry did not survive a sweep with serve_stale on")
+	testing.expect(t, stale, "the surviving entry was not flagged stale")
+
+	off := make_cache(Options{max_entries = 8, max_ttl = 3600})
+	defer destroy(off)
+	testing.expect(t, put(off, key, wire, msg), "the entry was not stored")
+	sync_expire(off, key)
+	testing.expect_value(t, sweep(off), 1)
+	free_all(context.temp_allocator)
+}
+
+/*
+Stale serving is bounded; it is not a licence to answer from last week.
+
+RFC 8767 section 5 asks for a cap on how long expired data may be used and puts
+it in the region of a day. Without one, an entry that nothing refreshes would
+sit here for as long as the process runs and be handed out during whatever bad
+minute an upstream has next - an address that changed months ago, served with
+every appearance of being current.
+
+Both the sweep and `get` are held to the same deadline. Either one alone leaves
+the other free to contradict it: a sweep that kept the entry would have `get`
+serving it, and a `get` that refused it would leave the memory held for a day by
+an entry that can no longer be used for anything.
+*/
+@(test)
+test_stale_entries_do_not_outlive_max_stale :: proc(t: ^testing.T) {
+	c := make_cache(Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
+	defer destroy(c)
+	kb: [KEY_MAX]u8
+	key := key_for(kb[:], "ancient.example.")
+	wire, msg := build_answer("ancient.example.", 60, context.temp_allocator)
+
+	testing.expect(t, put(c, key, wire, msg), "the entry was not stored")
+	sync_expire(c, key, MAX_STALE + time.Minute)
+	_, _, ok := get(c, key, context.temp_allocator)
+	testing.expect(t, !ok, "an entry a day past its expiry was still served")
+	testing.expect_value(t, len_entries(c), 0)
+
+	testing.expect(t, put(c, key, wire, msg), "the entry was not stored")
+	sync_expire(c, key, MAX_STALE + time.Minute)
+	testing.expect_value(t, sweep(c), 1)
+
+	// Still inside the window, so both leave it where it is.
+	testing.expect(t, put(c, key, wire, msg), "the entry was not stored")
+	sync_expire(c, key, MAX_STALE - time.Minute)
+	testing.expect_value(t, sweep(c), 0)
+	_, _, fresh_enough := get(c, key, context.temp_allocator)
+	testing.expect(t, fresh_enough, "an entry inside the stale window was refused")
+	free_all(context.temp_allocator)
+}
+
+/*
+An expired entry is not a lookup the cache answered.
+
+`get` lends the caller an expired copy to fall back on; whether the client ever
+sees it depends on an upstream the cache knows nothing about. Counting that as a
+hit would put every stale lookup into `elodin_cache_hits_total`, whose help text
+says the lookups it counts were answered from the cache, while the resolver
+counts the same query as forwarded - a hit rate above what the cache actually
+served, and highest exactly when the data is oldest. The stale answers that do
+reach a client are counted by `note_stale_served`, once the resolver knows there
+was one.
+*/
+@(test)
+test_a_stale_lookup_is_counted_as_a_miss :: proc(t: ^testing.T) {
+	c := make_cache(Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
+	defer destroy(c)
+	kb: [KEY_MAX]u8
+	key := key_for(kb[:], "counted.example.")
+
+	wire, msg := build_answer("counted.example.", 60, context.temp_allocator)
+	testing.expect(t, put(c, key, wire, msg), "the entry was not stored")
+
+	_, _, fresh := get(c, key, context.temp_allocator)
+	testing.expect(t, fresh, "expected a hit while the entry was fresh")
+	testing.expect_value(t, stats(c).hits, u64(1))
+
+	sync_expire(c, key)
+	_, stale, ok := get(c, key, context.temp_allocator)
+	testing.expect(t, ok && stale, "expected a stale hit")
+
+	s := stats(c)
+	testing.expect_value(t, s.hits, u64(1))
+	testing.expect_value(t, s.misses, u64(1))
+	testing.expect_value(t, s.stale, u64(0))
+
+	note_stale_served(c)
+	testing.expect_value(t, stats(c).stale, u64(1))
+	free_all(context.temp_allocator)
+}
+
 @(test)
 test_key_distinguishes_type_and_do :: proc(t: ^testing.T) {
 	kb1: [KEY_MAX]u8
@@ -461,11 +581,13 @@ test_byte_accounting_comes_back_to_zero :: proc(t: ^testing.T) {
 	}
 }
 
-// Test helper: age an entry out without sleeping.
+// Test helper: age an entry out without sleeping. `ago` is how far past its
+// expiry the entry should land, which the stale-lifetime tests need to push
+// beyond a day.
 @(private = "file")
-sync_expire :: proc(c: ^Cache, key: string) {
+sync_expire :: proc(c: ^Cache, key: string, ago := 1 * time.Second) {
 	if e, ok := c.entries[key]; ok {
-		e.expires = time.time_add(time.now(), -1 * time.Second)
-		e.inserted = time.time_add(time.now(), -3600 * time.Second)
+		e.expires = time.time_add(time.now(), -ago)
+		e.inserted = time.time_add(time.now(), -ago - 3600 * time.Second)
 	}
 }

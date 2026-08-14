@@ -339,6 +339,29 @@ render_cache_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 	metrics.scalar(b, "elodin_cache_bytes", .Gauge, "Bytes the cached answers occupy.", i64(cache.bytes_used(s.answers)))
 	metrics.scalar(b, "elodin_cache_hits_total", .Counter, "Lookups answered from the cache.", cs.hits)
 	metrics.scalar(b, "elodin_cache_misses_total", .Counter, "Lookups the cache could not answer.", cs.misses)
+	/*
+	The one series that shows `cache.serve_stale` working.
+
+	A stale lookup is counted a miss - the cache did not answer it, the query went
+	to an upstream - and the answer that comes back when that upstream fails is
+	counted a cached query one package away, in `elodin_answers_total`. Neither
+	says the data was expired, and the only other trace the failure behind it
+	leaves is `elodin_upstream_failures_total`, which every exchange that fails
+	raises, including the ones a second upstream or a retry went on to cover.
+	Without this an operator watching an outage covered by expired data sees only
+	the absence of the traffic that stopped.
+
+	Counted where the answer reaches a client rather than where an upstream
+	fails, so an expired entry served to an RD=0 query - which is answered from
+	what this server already knows, without asking anybody - is in here too.
+	*/
+	metrics.scalar(
+		b,
+		"elodin_cache_stale_total",
+		.Counter,
+		"Expired answers served because no fresh one could be got.",
+		cs.stale,
+	)
 	metrics.scalar(
 		b,
 		"elodin_cache_evictions_total",
