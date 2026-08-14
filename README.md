@@ -1329,16 +1329,16 @@ its own schedule. A fourth, `mise run bench`, measures rather than asserts: it
 is where every number in [Capacity](#capacity) comes from, and it is documented
 in [`bench/README.md`](bench/README.md).
 
-**Unit tests** (`mise run test`, 403 cases) cover the message codec — round trips
+**Unit tests** (`mise run test`, 433 cases) cover the message codec — round trips
 for every modelled RDATA type, compression, truncation, EDNS, pointer loops,
 hostile record counts — plus the YAML parser, configuration loading, list
 parsing and matching, the cache, and the HTTP/2 codec — the HPACK cases run the
 worked examples from RFC 7541 appendix C, so the codec is checked against the
 specification's own vectors rather than against itself.
 
-They run per package, so a failure names one: `dns` 34, `yaml` 34, `config` 55,
-`filter` 8, `logx` 1, `metrics` 9, `privdrop` 9, `cache` 13, `dnssec` 39,
-`tlsx` 5, `upstream` 31, `h2` 69, `server` 96. Much of `tlsx`, `upstream`, `h2`
+They run per package, so a failure names one: `dns` 47, `yaml` 34, `config` 55,
+`filter` 8, `logx` 1, `metrics` 9, `privdrop` 9, `cache` 16, `dnssec` 39,
+`tlsx` 5, `upstream` 31, `h2` 69, `server` 110. Much of `tlsx`, `upstream`, `h2`
 and `server` is what the suite grew around bugs that were found some other way
 and had to stay found — the HTTP reader's framing and body limits, the TLS
 handshake retry, the HTTP/2 stream table under RST_STREAM, and the DoH request
@@ -1361,7 +1361,7 @@ denial is checked against, and a response built to make one question cost as man
 upstream lookups as possible. Each was checked against the code as it stood
 before the fix, so they are known to fail when the property they guard does.
 
-**Integration tests** (`mise run itest`, 190 cases, ~50s) start the built binary
+**Integration tests** (`mise run itest`, 191 cases, ~50s) start the built binary
 as a separate process against scripted mock upstreams, so what is exercised is
 the artefact that ships rather than the library it was compiled from. The suite
 is hermetic: no public resolver is contacted, ports are allocated from a private
