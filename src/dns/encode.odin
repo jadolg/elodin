@@ -6,10 +6,15 @@ import "core:strings"
 /*
 Message writer with RFC 1035 name compression.
 
-Note on Rdata_Raw: the decoder only produces it for types that either cannot
-contain a compressed name or failed to parse. Forwarded upstream answers are
-passed through verbatim (see `patch_ttls`) rather than re-encoded, so a raw
-RDATA blob carrying pointers into a foreign message never reaches this writer.
+Note on Rdata_Raw: a raw blob is copied out at whatever offset the record lands
+at, so a compression pointer inside one would name a byte of this message rather
+than the one it was written against. Answers do reach this writer - a cookie
+attached to a reply that carried no OPT record, an answer stripped of its DNSSEC
+records for a client that did not ask for them, and one shrunk to a UDP limit are
+all re-encoded - so what keeps that from corrupting them is the decoder, which
+expands the compressed names inside raw RDATA as it reads them (see
+src/dns/rdata_raw.odin). `w_record` refuses a blob that still holds one, on the
+grounds that failing to answer is recoverable and answering wrongly is not.
 */
 Writer :: struct {
 	buf:       [dynamic]u8,
@@ -198,6 +203,36 @@ w_record :: proc(w: ^Writer, rec: Record) -> Encode_Error {
 			w_bytes(w, opt.data)
 		}
 	case Rdata_Raw:
+		/*
+		The decoder expands these, so this only fires if something got past it:
+		a compressible type with no entry in `raw_rdata_layout` to walk, a layout
+		that stopped matching what senders write, a name the walk could not
+		rebuild - a pointer aiming forwards, an expansion that will not fit a
+		name - or a blob built somewhere other than a decode. Little of that
+		should happen, which is why it is worth catching: a stale pointer is not
+		visible in the answer, and the client has no way to know the name it was
+		handed is the wrong one.
+
+		Most callers degrade into something the client recovers from on its own:
+		`fit_response` falls back to an empty answer with TC set and the client
+		asks again over TCP, `ensure_edns_option` returns the answer without a
+		cookie, and `strip_dnssec_records` forwards the bytes it started from.
+
+		Two do not, and it is worth being plain about them. `remove_edns_option`
+		is how a cookie is taken back out of a message, on the way to an upstream
+		in src/server/resolver.odin and on the way back from one in
+		src/upstream/cookie.odin, and both fail closed rather than let a cookie
+		travel: the query is answered SERVFAIL and the reply is dropped for the
+		group to re-ask. So a single record whose RDATA holds a pointer nothing
+		could expand costs a cookie-using client that answer entirely. That is
+		the trade taken here anyway - such a record is malformed in its own right
+		by the time it reaches this, and a name pointing at bytes nobody chose is
+		the worse thing to hand out - but it is a whole answer, not a degraded
+		one.
+		*/
+		if raw_rdata_holds_pointer(rec.type, d.data) {
+			return .Bad_Rdata
+		}
 		w_bytes(w, d.data)
 	case:
 		// nil rdata encodes as an empty RDATA section

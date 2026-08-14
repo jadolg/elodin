@@ -166,7 +166,19 @@ Everything after the last name is copied through untouched.
 
 Only types on the lowercasing list above need an entry, and only those whose
 layout is fixed enough to walk. A6 is left out: its layout depends on a prefix
-length, and it has been formally obsolete since 2012.
+length, and it has been formally obsolete since 2012. The types the codec models
+natively are listed anyway: one of them still arrives as raw bytes when its RDATA
+failed to parse, and a validation attempt on such a record should compare against
+the same canonical form as any other.
+
+Nearly the same table exists as `raw_rdata_layout` in src/dns/rdata_raw.odin,
+where the decoder walks it to expand compressed names. That one is private to its
+package and this one is private to this, so the two are kept in step by hand -
+but they are not quite the same list. That one asks whether a name in the RDATA
+may have been compressed; this one asks whether a name in the RDATA is lowercased
+for a signature, which only the types in RFC 4034 section 6.2 are. NSAP-PTR is
+walked there and deliberately absent here: downcasing it would build a canonical
+form no signer ever computed.
 */
 @(private)
 Raw_Layout :: struct {
@@ -178,16 +190,18 @@ Raw_Layout :: struct {
 @(private)
 raw_layout :: proc "contextless" (t: dns.Type) -> (layout: Raw_Layout, ok: bool) {
 	#partial switch t {
-	case .MD, .MF, .NXT:
+	case .NS, .CNAME, .PTR, .DNAME, .MB, .MG, .MR, .MD, .MF, .NXT:
 		return {0, 0, 1}, true
-	case .MINFO, .RP:
+	case .SOA, .MINFO, .RP:
 		return {0, 0, 2}, true
-	case .AFSDB, .RT, .KX:
+	case .MX, .AFSDB, .RT, .KX:
 		return {2, 0, 1}, true
 	case .PX:
 		return {2, 0, 2}, true
 	case .NAPTR:
 		return {4, 3, 1}, true
+	case .SRV:
+		return {6, 0, 1}, true
 	case .SIG:
 		return {18, 0, 1}, true
 	}
@@ -202,6 +216,12 @@ name turns out to be compressed, which cannot be expanded here because the
 surrounding message is long gone. Such a record simply fails to validate, which
 is the right outcome for RDATA that RFC 4034 forbade compressing in the first
 place.
+
+A compressed name should no longer reach that fallback: the decoder expands the
+ones it can while the message is still in hand (see src/dns/rdata_raw.odin), so
+what arrives here is the uncompressed form RFC 4034 section 6.2 asks for rather
+than a canonical form no signer ever signed. What is left is RDATA nothing could
+walk, and a validation failure is the honest answer for it.
 */
 @(private)
 write_downcased_raw :: proc(out: ^[dynamic]u8, type: dns.Type, rdata: []u8) {

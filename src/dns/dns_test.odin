@@ -707,3 +707,360 @@ test_name_length_counts_the_root_octet :: proc(t: ^testing.T) {
 	testing.expect_value(t, perr, Encode_Error.Name_Too_Long)
 	free_all(context.temp_allocator)
 }
+
+/*
+A message whose answers can carry a compression pointer inside their RDATA.
+
+The question sits at offset 12 and the second answer is an NS record whose
+target name starts at the returned offset, so a later record's RDATA has a real
+name to point at - which is what an authoritative server does when it compresses
+the hostname of an AFSDB or the mailbox of an RP against a name it has already
+written.
+*/
+@(private = "file")
+message_prefix :: proc(answers: int) -> (m: [dynamic]u8, ns_target: int) {
+	m = make([dynamic]u8, 0, 128, context.temp_allocator)
+	append(&m, 0x12, 0x34, 0x80, 0x00, 0x00, 0x01, u8(answers >> 8), u8(answers), 0x00, 0x00, 0x00, 0x00)
+	// Question: example.com. A IN, at offset 12.
+	append(&m, 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0)
+	append(&m, 0x00, 0x01, 0x00, 0x01)
+	// Answer 1: a.example.com. TXT "abc", owner written out in full so the
+	// re-encode has something of its own to compress.
+	append(&m, 1, 'a', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0)
+	append(&m, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04)
+	append(&m, 3, 'a', 'b', 'c')
+	// Answer 2: example.com. NS ns1.example.com.
+	append(&m, 0xc0, 0x0c)
+	append(&m, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x06)
+	ns_target = len(m)
+	append(&m, 3, 'n', 's', '1', 0xc0, 0x0c)
+	return
+}
+
+// An answer owned by example.com. carrying `rdata` verbatim.
+@(private = "file")
+append_answer :: proc(m: ^[dynamic]u8, type: Type, rdata: []u8) {
+	append(m, 0xc0, 0x0c)
+	append(m, u8(u16(type) >> 8), u8(u16(type)))
+	append(m, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c)
+	append(m, u8(len(rdata) >> 8), u8(len(rdata)))
+	append(m, ..rdata)
+}
+
+@(private = "file")
+raw_rdata_of :: proc(wire: []u8, type: Type) -> (data: []u8, ok: bool) {
+	msg, err := decode_message(wire, context.temp_allocator)
+	if err != .None {
+		return nil, false
+	}
+	for rec in msg.answer {
+		if rec.type != type {
+			continue
+		}
+		raw, is_raw := rec.data.(Rdata_Raw)
+		if !is_raw {
+			return nil, false
+		}
+		return raw.data, true
+	}
+	return nil, false
+}
+
+/*
+The hostname an AFSDB record names, read the way a client would: out of the
+RDATA when it stands on its own, and by following the pointer into the message
+it arrived in when it does not.
+
+Reading it this way rather than comparing bytes lets the test state the property
+a client cares about - the record still names the same host - so it holds
+whichever representation the codec settles on.
+*/
+@(private = "file")
+afsdb_host :: proc(wire: []u8) -> (name: string, ok: bool) {
+	raw := raw_rdata_of(wire, .AFSDB) or_return
+	if len(raw) < 3 {
+		return "", false
+	}
+	if raw[2] & 0xc0 == 0xc0 {
+		if len(raw) < 4 {
+			return "", false
+		}
+		target := (int(raw[2]) & 0x3f) << 8 | int(raw[3])
+		n, _, err := decode_name(wire, target, context.temp_allocator)
+		return n, err == .None
+	}
+	n, _, err := decode_name(raw, 2, context.temp_allocator)
+	return n, err == .None
+}
+
+/*
+A compression pointer inside the RDATA of a type the codec keeps as raw bytes is
+expanded when the message is decoded.
+
+AFSDB is one of the types RFC 1035 name compression may legally reach into and
+one this codec does not model, so its hostname arrives as a pointer into the
+message that carried it. Such a pointer only means anything against the exact
+bytes it came with; the moment the record is written into a message of our own it
+names whatever now sits at that offset. Expanding at decode, which RFC 3597
+section 4 allows a receiver to do, makes the blob mean the same thing wherever it
+is later put down.
+*/
+@(test)
+test_raw_rdata_pointer_expanded_at_decode :: proc(t: ^testing.T) {
+	m, ns_target := message_prefix(3)
+	append_answer(&m, .AFSDB, []u8{0x00, 0x01, 0xc0 | u8(ns_target >> 8), u8(ns_target)})
+
+	raw, ok := raw_rdata_of(m[:], .AFSDB)
+	testing.expect(t, ok, "no raw AFSDB record came back")
+	expected := []u8{0x00, 0x01, 3, 'n', 's', '1', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0}
+	testing.expect(t, mem.compare(raw, expected) == 0, "AFSDB rdata was not expanded")
+	free_all(context.temp_allocator)
+}
+
+/*
+Re-encoding an answer keeps the hostname its AFSDB record named.
+
+An answer that has a cookie attached with no OPT record to rewrite, that is
+stripped of DNSSEC records for a client which did not ask for them, or that is
+shrunk to fit a UDP limit, goes out through the message writer rather than
+straight from the upstream's bytes. Before the RDATA was expanded, the pointer
+inside it survived into the new message and resolved against a byte that had
+nothing to do with the name it was written for, so the client was handed a
+plausible-looking answer naming the wrong host.
+*/
+@(test)
+test_raw_rdata_pointer_survives_reencode :: proc(t: ^testing.T) {
+	m, ns_target := message_prefix(3)
+	append_answer(&m, .AFSDB, []u8{0x00, 0x01, 0xc0 | u8(ns_target >> 8), u8(ns_target)})
+
+	before, before_ok := afsdb_host(m[:])
+	testing.expect(t, before_ok, "the AFSDB hostname could not be read from the original")
+	testing.expect_value(t, before, "ns1.example.com.")
+
+	msg, derr := decode_message(m[:], context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	out, _, eerr := encode_message(msg, context.temp_allocator)
+	testing.expect_value(t, eerr, Encode_Error.None)
+
+	after, after_ok := afsdb_host(out)
+	testing.expect(t, after_ok, "the AFSDB hostname could not be read after re-encoding")
+	testing.expect_value(t, after, "ns1.example.com.")
+	free_all(context.temp_allocator)
+}
+
+/*
+A type this decoder does model is expanded too when its RDATA falls back to raw.
+
+`decode_rdata` rejects an MX whose RDLENGTH counts a byte more than its two
+fields, and `decode_record` then keeps the record as `Rdata_Raw` rather than
+losing it. The exchanger inside is a perfectly good compressed name, so it has to
+be expanded on the way through exactly as an AFSDB's would be: nothing downstream
+can tell a raw MX from a raw AFSDB, and a stale pointer re-encoded into an answer
+names whichever byte now sits at that offset.
+*/
+@(test)
+test_raw_rdata_expands_a_modelled_type_that_failed_to_parse :: proc(t: ^testing.T) {
+	m, ns_target := message_prefix(3)
+	// preference, a compressed exchanger, and one byte more than the fields need.
+	append_answer(&m, .MX, []u8{0x00, 0x0a, 0xc0 | u8(ns_target >> 8), u8(ns_target), 0x00})
+
+	raw, ok := raw_rdata_of(m[:], .MX)
+	testing.expect(t, ok, "the malformed MX did not come back as raw rdata")
+	expected := []u8 {
+		0x00, 0x0a,
+		3, 'n', 's', '1', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0,
+		0x00,
+	}
+	testing.expect(t, mem.compare(raw, expected) == 0, "MX rdata was not expanded")
+
+	// And it still names the same host once written into a message of our own.
+	msg, derr := decode_message(m[:], context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	out, _, eerr := encode_message(msg, context.temp_allocator)
+	testing.expect_value(t, eerr, Encode_Error.None)
+
+	after, after_ok := raw_rdata_of(out, .MX)
+	testing.expect(t, after_ok, "the MX record did not survive the re-encode")
+	testing.expect(t, mem.compare(after, expected) == 0, "MX rdata changed meaning on re-encode")
+	free_all(context.temp_allocator)
+}
+
+/*
+A modelled type whose name cannot be expanded is refused by the writer.
+
+A CNAME carrying a forward pointer does not decode, so the record falls back to
+raw with the pointer still in it. Forwarding those two bytes is the dangerous
+outcome: the pointer aims past the end of the message it arrived in, but a
+message of our own may well be long enough for it to land on a real name, and the
+client would be sent somewhere nobody named. Failing the encode leaves every
+caller with an honest degradation instead.
+*/
+@(test)
+test_encode_refuses_a_modelled_type_holding_a_pointer :: proc(t: ^testing.T) {
+	m, _ := message_prefix(3)
+	append_answer(&m, .CNAME, []u8{0xc0, 0xf0})
+
+	raw, ok := raw_rdata_of(m[:], .CNAME)
+	testing.expect(t, ok, "the undecodable CNAME did not come back as raw rdata")
+	testing.expect(t, mem.compare(raw, []u8{0xc0, 0xf0}) == 0, "unwalkable CNAME rdata was altered")
+
+	msg, derr := decode_message(m[:], context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	_, _, eerr := encode_message(msg, context.temp_allocator)
+	testing.expect_value(t, eerr, Encode_Error.Bad_Rdata)
+	free_all(context.temp_allocator)
+}
+
+/*
+NSAP-PTR is held to the same rule as the CNAME above.
+
+It is the odd one out among the types whose RDATA is a name and nothing else -
+the one RFC 4034 never listed for downcasing - and being odd is how a type comes
+to be left off a table. Left off this one it takes the whole of the corruption
+these tests are about: its name will not decode, so the record falls back to raw,
+and the two bytes of a stale pointer go out in a message of ours naming whatever
+now sits at that offset.
+*/
+@(test)
+test_encode_refuses_an_nsap_ptr_holding_a_pointer :: proc(t: ^testing.T) {
+	m, _ := message_prefix(3)
+	append_answer(&m, .NSAP_PTR, []u8{0xc0, 0xf0})
+
+	raw, ok := raw_rdata_of(m[:], .NSAP_PTR)
+	testing.expect(t, ok, "the undecodable NSAP-PTR did not come back as raw rdata")
+	testing.expect(t, mem.compare(raw, []u8{0xc0, 0xf0}) == 0, "unwalkable NSAP-PTR rdata was altered")
+
+	msg, derr := decode_message(m[:], context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	_, _, eerr := encode_message(msg, context.temp_allocator)
+	testing.expect_value(t, eerr, Encode_Error.Bad_Rdata)
+	free_all(context.temp_allocator)
+}
+
+/*
+RDATA with nothing to expand comes back exactly as it arrived.
+
+Expansion is only ever a rewrite of compression pointers, so a blob holding none
+- the ordinary case, and the only case for the types RFC 3597 forbids
+compressing at all - has to be handed on byte for byte. A type off the
+compressible list is left alone whatever its bytes look like: a DNSKEY's key
+material may well contain a 0xc0 byte, and reading that as a pointer would
+corrupt the very records DNSSEC validation rests on.
+*/
+@(test)
+test_raw_rdata_without_pointer_is_untouched :: proc(t: ^testing.T) {
+	plain := []u8{0x00, 0x01, 3, 'n', 's', '1', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0}
+	// Not on the compressible list, and these bytes would walk as a pointer if
+	// anything were tempted to look.
+	keyish := []u8{0x01, 0x00, 0x03, 0x08, 0xc0, 0x0c, 0xc0, 0x1a, 0xff, 0xff}
+
+	m, _ := message_prefix(4)
+	append_answer(&m, .AFSDB, plain)
+	append_answer(&m, .DNSKEY, keyish)
+
+	raw, ok := raw_rdata_of(m[:], .AFSDB)
+	testing.expect(t, ok, "no raw AFSDB record came back")
+	testing.expect(t, mem.compare(raw, plain) == 0, "uncompressed AFSDB rdata was altered")
+
+	key, key_ok := raw_rdata_of(m[:], .DNSKEY)
+	testing.expect(t, key_ok, "no raw DNSKEY record came back")
+	testing.expect(t, mem.compare(key, keyish) == 0, "DNSKEY rdata was altered")
+	free_all(context.temp_allocator)
+}
+
+/*
+RDATA that cannot be walked is forwarded exactly as it arrived.
+
+The decoder's standing posture is to keep odd RDATA rather than reject the
+message around it, so a record whose layout does not add up has to come through
+unchanged: it may still be the answer somebody wanted, and it is not this
+server's place to decide otherwise. Both shapes here are ones a broken or
+hostile sender can produce - a pointer cut short by the RDATA's own length, and a
+pointer aiming forwards, which `decode_name` refuses because only a backward
+pointer is guaranteed to terminate.
+*/
+@(test)
+test_raw_rdata_that_cannot_be_walked_is_kept :: proc(t: ^testing.T) {
+	cases := [][]u8{{0x00, 0x01, 0xc0}, {0x00, 0x01, 0xff, 0xff}}
+	for rdata in cases {
+		m, _ := message_prefix(3)
+		append_answer(&m, .AFSDB, rdata)
+
+		_, derr := decode_message(m[:], context.temp_allocator)
+		testing.expect_value(t, derr, Decode_Error.None)
+
+		raw, ok := raw_rdata_of(m[:], .AFSDB)
+		testing.expect(t, ok, "no raw AFSDB record came back")
+		testing.expect(t, mem.compare(raw, rdata) == 0, "unwalkable rdata was altered")
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+Both names of a two-name RDATA are expanded.
+
+RP carries a mailbox and the name of a TXT record, one after the other, and
+MINFO and PX have the same shape. Expanding only the first would leave the second
+pointing at a byte of the old message, which is the same corruption in a place
+that is easier to miss, so the walk has to run to the end of the layout.
+*/
+@(test)
+test_raw_rdata_expands_every_name :: proc(t: ^testing.T) {
+	m, ns_target := message_prefix(3)
+	append_answer(&m, .RP, []u8{0xc0, 0x0c, 0xc0 | u8(ns_target >> 8), u8(ns_target)})
+
+	raw, ok := raw_rdata_of(m[:], .RP)
+	testing.expect(t, ok, "no raw RP record came back")
+	expected := []u8 {
+		7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0,
+		3, 'n', 's', '1', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0,
+	}
+	testing.expect(t, mem.compare(raw, expected) == 0, "RP rdata was not fully expanded")
+	free_all(context.temp_allocator)
+}
+
+/*
+The writer refuses raw RDATA that still holds a compression pointer.
+
+Nothing the decoder produces should reach this point any more, which is the
+reason to check: a type added to the compressible list without a layout to walk,
+or a layout that stops matching what senders write, would otherwise surface as a
+wrong answer served to a client rather than as a failure here. Every caller
+degrades into something honest - an answer without a cookie, an answer truncated
+so the client retries over TCP - which is worth having in place of a name
+pointing at the wrong bytes. Types off the compressible list are not checked at
+all, so a blob that merely happens to contain a 0xc0 byte still goes out.
+*/
+@(test)
+test_encode_refuses_raw_rdata_holding_a_pointer :: proc(t: ^testing.T) {
+	compressed := Message {
+		id     = 1,
+		answer = []Record {
+			{
+				name = "example.com.",
+				type = .AFSDB,
+				class = .IN,
+				ttl = 60,
+				data = Rdata_Raw{data = []u8{0x00, 0x01, 0xc0, 0x0c}},
+			},
+		},
+	}
+	_, _, err := encode_message(compressed, context.temp_allocator)
+	testing.expect_value(t, err, Encode_Error.Bad_Rdata)
+
+	opaque := Message {
+		id     = 2,
+		answer = []Record {
+			{
+				name = "example.com.",
+				type = .DNSKEY,
+				class = .IN,
+				ttl = 60,
+				data = Rdata_Raw{data = []u8{0x01, 0x00, 0x03, 0x08, 0xc0, 0x0c}},
+			},
+		},
+	}
+	_, _, opaque_err := encode_message(opaque, context.temp_allocator)
+	testing.expect_value(t, opaque_err, Encode_Error.None)
+	free_all(context.temp_allocator)
+}

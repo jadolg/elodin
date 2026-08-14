@@ -466,3 +466,75 @@ test_set_edns_udp_size_reports_a_message_with_no_opt :: proc(t: ^testing.T) {
 
 	free_all(context.temp_allocator)
 }
+
+/*
+An answer whose AFSDB hostname is compressed into the message, with the pointer
+aimed at the NS target written before it.
+
+The twin of `message_prefix` in dns_test.odin, kept separate because both are
+file-private; either one on its own says too little about what the other tests
+build, and sharing them would put wire-format scaffolding in the package proper.
+*/
+@(private = "file")
+answer_with_compressed_afsdb :: proc() -> []u8 {
+	m := make([dynamic]u8, 0, 128, context.temp_allocator)
+	append(&m, 0x12, 0x34, 0x80, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00)
+	// Question: example.com. A IN, at offset 12.
+	append(&m, 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0)
+	append(&m, 0x00, 0x01, 0x00, 0x01)
+	// Answer 1: example.com. NS ns1.example.com.
+	append(&m, 0xc0, 0x0c)
+	append(&m, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x06)
+	ns_target := len(m)
+	append(&m, 3, 'n', 's', '1', 0xc0, 0x0c)
+	// Answer 2: example.com. AFSDB 1 <pointer at the NS target above>
+	append(&m, 0xc0, 0x0c)
+	append(&m, 0x00, 0x12, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04)
+	append(&m, 0x00, 0x01, 0xc0 | u8(ns_target >> 8), u8(ns_target))
+	return m[:]
+}
+
+/*
+Attaching a cookie to an answer that has no OPT record leaves its AFSDB record
+naming the same host.
+
+This is the path a real answer takes rather than a codec round-trip made up for
+a test: an upstream that does not do EDNS replies without an OPT record, so
+`ensure_edns_option` has nothing to rewrite in place and rebuilds the message
+through the writer instead. Whatever the RDATA of a record the codec keeps as
+raw bytes meant on the way in, it has to mean on the way out, because the client
+cannot tell that its answer went through a second encoder at all.
+*/
+@(test)
+test_raw_rdata_pointer_survives_cookie_attach :: proc(t: ^testing.T) {
+	original := answer_with_compressed_afsdb()
+	cookie: [24]u8
+
+	out, ok := ensure_edns_option(original, .Cookie, cookie[:], 1232, context.temp_allocator)
+	testing.expect(t, ok, "the cookie could not be attached")
+
+	m, derr := decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+
+	found := false
+	for rec in m.answer {
+		if rec.type != .AFSDB {
+			continue
+		}
+		raw, is_raw := rec.data.(Rdata_Raw)
+		testing.expect(t, is_raw, "the AFSDB record stopped being raw")
+		if !is_raw {
+			break
+		}
+		found = true
+		host, _, herr := decode_name(raw.data, 2, context.temp_allocator)
+		testing.expect_value(t, herr, Decode_Error.None)
+		testing.expect_value(t, host, "ns1.example.com.")
+	}
+	testing.expect(t, found, "the AFSDB record did not survive the cookie attach")
+
+	_, has_cookie := option_data(out, .Cookie)
+	testing.expect(t, has_cookie, "the cookie was not attached")
+
+	free_all(context.temp_allocator)
+}
