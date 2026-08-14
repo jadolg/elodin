@@ -2076,6 +2076,19 @@ test_malformed_requests_are_reset :: proc(t: ^testing.T) {
 			"asterisk :path outside OPTIONS",
 			{{":method", "GET"}, {":scheme", "https"}, {":authority", "dns.example"}, {":path", "*"}},
 		},
+		// RFC 3986 3.1: scheme names are case-insensitive, and 8.3.1 puts no
+		// case restriction on :scheme. An uppercase one names the same scheme
+		// and has to draw the same :path checks, which comparing it
+		// case-sensitively let a peer skip by capitalising a letter.
+		{
+			"an uppercase :scheme carrying an absolute-form :path",
+			{
+				{":method", "GET"},
+				{":scheme", "HTTPS"},
+				{":authority", "dns.example"},
+				{":path", "https://elsewhere.example/dns-query"},
+			},
+		},
 		// 8.5: CONNECT carries an authority and nothing else.
 		{
 			"CONNECT with :scheme and :path",
@@ -2168,6 +2181,18 @@ test_conformant_requests_are_served :: proc(t: ^testing.T) {
 		// No :authority: legal, and what a client with no authority to convey
 		// sends. Only :method, :scheme and :path are mandatory.
 		{"no :authority", {{":method", "GET"}, {":scheme", "https"}, {":path", "/dns-query"}}},
+		// The other side of the case-insensitivity above: an uppercase scheme
+		// names https rather than some scheme this specification says nothing
+		// about, so the origin-form :path it carries is served as it stands.
+		{
+			"an uppercase :scheme",
+			{
+				{":method", "GET"},
+				{":scheme", "HTTPS"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+			},
+		},
 		// Asterisk-form, which is only OPTIONS' to use.
 		{"OPTIONS *", {{":method", "OPTIONS"}, {":scheme", "https"}, {":authority", "dns.example"}, {":path", "*"}}},
 		/*

@@ -727,8 +727,15 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 	An absent `:path` used to arrive as "", which fails the comparison in
 	`build_h2_response` and 404s - safe by accident rather than by check, and
 	only for as long as that comparison is what the path is used for.
+
+	Folded, because RFC 3986 section 3.1 makes scheme names case-insensitive and
+	8.3.1 puts no case restriction on `:scheme` - it is an ordinary field value,
+	not a token a receiver may fold on the sender's behalf. Compared as it
+	arrives, `HTTPS` names a scheme this specification is silent about and so
+	carried any `:path` past these checks, which is the empty-`:scheme` hole
+	again with a capital letter in place of nothing at all.
 	*/
-	if scheme == "http" || scheme == "https" {
+	if strings.equal_fold(scheme, "http") || strings.equal_fold(scheme, "https") {
 		if path == "*" {
 			return method != "OPTIONS"
 		}

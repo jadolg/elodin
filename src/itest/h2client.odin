@@ -25,8 +25,8 @@ H2_Stream_Result :: struct {
 	data_frames: int,
 	done:        bool,
 	reset:       bool,
-	// The code the server put in the RST_STREAM, which is what says why the
-	// stream was refused rather than merely that it was.
+	// The code the server put in the first RST_STREAM, which is what says why
+	// the stream was refused rather than merely that it was.
 	reset_code:  h2.Error_Code,
 }
 
@@ -341,10 +341,19 @@ h2_handle :: proc(c: ^H2_Client, header: h2.Frame_Header, payload: []u8) -> bool
 
 	case .Rst_Stream:
 		r := h2_result(c, header.stream_id)
-		r.reset = true
-		if len(payload) >= 4 {
+		// The first code and not the last, because a stream can be reset twice
+		// over and only the first reset says why it died. A malformed POST
+		// draws PROTOCOL_ERROR from `finish_headers`, and the DATA frame that
+		// was already on the wire behind it - the HEADERS carried no
+		// END_STREAM - then finds the stream retired and draws a second
+		// RST_STREAM carrying STREAM_CLOSED. Both are the server behaving
+		// correctly, and which of them a check would have read depended on
+		// whether the two arrived in the same `h2_pump` read. `r.reset` is
+		// what tells one from the other, so it is read here and set after.
+		if !r.reset && len(payload) >= 4 {
 			r.reset_code = h2.Error_Code(h2.read_u32(payload))
 		}
+		r.reset = true
 
 	case .Headers:
 		block, ok := h2.strip_padding(payload, header.flags)
