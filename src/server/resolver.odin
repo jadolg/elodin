@@ -1,7 +1,6 @@
 package server
 
 import "core:mem"
-import "core:strings"
 import "core:sync"
 import "core:time"
 import "elodin:cache"
@@ -827,13 +826,12 @@ apply_rewrite :: proc(
 find_rewrite :: proc(rules: []config.Rewrite, name: string) -> (rule: config.Rewrite, found: bool) {
 	for r in rules {
 		if r.wildcard {
-			// "*.lan." matches any strictly deeper name.
-			if len(name) > len(r.domain) && strings.has_suffix(name, r.domain) {
-				// Guard against "notlan." matching "lan.".
-				boundary := name[len(name) - len(r.domain) - 1]
-				if boundary == '.' && dns.name_equal_fold(name[len(name) - len(r.domain):], r.domain) {
-					return r, true
-				}
+			// "*.lan." matches any strictly deeper name, which is `name_below`
+			// exactly: the label-break guard that keeps "notlan." out of a rule
+			// written for "lan.", and the case-insensitive comparison that DNS
+			// requires, are both its business rather than this loop's.
+			if name_below(name, r.domain) {
+				return r, true
 			}
 			continue
 		}

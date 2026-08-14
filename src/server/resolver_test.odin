@@ -162,3 +162,122 @@ test_stats_of_carries_every_counter :: proc(t: ^testing.T) {
 	got := stats_of(&s)
 	testing.expectf(t, got == want, "stats_of did not carry every counter: got %v, want %v", got, want)
 }
+
+/*
+Which names a rewrite rule claims, and in particular that the claim does not
+depend on how the client happened to spell them.
+
+DNS names compare without regard to case (RFC 1035 section 2.3.3, restated for
+every label by RFC 4343), and nothing folds the question name on its way in:
+`resolve_query` reads it straight off the wire so that the response can echo
+back the exact bytes the client sent, which is what a resolver doing DNS-0x20
+(RFC 5452 section 9.2) is checking. The whole of the case-insensitivity has
+therefore to live in the matcher. A wildcard that only recognised lowercase
+would leave "answer: block" bypassable by shifting a single letter, and would
+send a split-horizon name upstream instead of answering it locally.
+*/
+@(test)
+test_wildcard_rewrite_matches_regardless_of_case :: proc(t: ^testing.T) {
+	rules := []config.Rewrite{{domain = "lan.", wildcard = true, ttl = 60}}
+
+	names := [?]string{"host.lan.", "host.LAN.", "HOST.Lan.", "deep.HOST.lAn."}
+	for name in names {
+		_, found := find_rewrite(rules, name)
+		testing.expectf(t, found, "%s should match the wildcard rule *.lan.", name)
+	}
+}
+
+/*
+The two edges a wildcard has to keep, which the case-insensitive comparison
+must not quietly widen.
+
+"*.lan." stands for at least one label below "lan.", so the zone apex is
+outside the rule however it is spelled; and the suffix has to begin on a label
+break, or "notlan." would be swallowed by a rule written for "lan.".
+*/
+@(test)
+test_wildcard_rewrite_excludes_the_apex_and_bare_suffixes :: proc(t: ^testing.T) {
+	rules := []config.Rewrite{{domain = "lan.", wildcard = true, ttl = 60}}
+
+	outside := [?]string{"lan.", "LAN.", "notlan.", "NOTLAN.", "an.", "example.com."}
+	for name in outside {
+		_, found := find_rewrite(rules, name)
+		testing.expectf(t, !found, "%s must not match the wildcard rule *.lan.", name)
+	}
+}
+
+/*
+An exact rewrite is unaffected by any of this and has always folded case; it is
+pinned here beside the wildcard so that a change to one matcher that forgets the
+other shows up.
+*/
+@(test)
+test_exact_rewrite_matches_regardless_of_case :: proc(t: ^testing.T) {
+	rules := []config.Rewrite{{domain = "host.lan.", ttl = 60}}
+
+	_, exact := find_rewrite(rules, "HOST.LAN.")
+	testing.expect(t, exact, "an exact rewrite must match a differently-cased name")
+
+	_, deeper := find_rewrite(rules, "sub.HOST.LAN.")
+	testing.expect(t, !deeper, "an exact rewrite must not claim names below it")
+}
+
+/*
+The same property end to end, which is what says the bypass is actually closed
+rather than only that the helper agrees with itself.
+
+The query carries RD=0 so that a rewrite which failed to match cannot reach the
+forwarding path - there is no upstream configured - and comes back as Refused
+instead, naming the failure exactly. A wildcard rule with `answer: block` is
+the same code path with a different verdict, so a mixed-case query answered
+from configuration here is a mixed-case query blocked in that deployment.
+*/
+@(test)
+test_mixed_case_query_is_answered_by_a_wildcard_rewrite :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.cache.enabled = false
+	cfg.blocking.enabled = false
+
+	cfg.rewrites = make([]config.Rewrite, 1, context.temp_allocator)
+	cfg.rewrites[0] = config.Rewrite {
+		domain   = "lan.",
+		wildcard = true,
+		answers  = []config.Rewrite_Answer{{kind = .A, v4 = {192, 0, 2, 1}}},
+		ttl      = 300,
+	}
+
+	s := Server {
+		cfg = &cfg,
+	}
+
+	questions := make([]dns.Question, 1, context.temp_allocator)
+	questions[0] = dns.Question {
+		name  = "HOST.LaN.",
+		type  = .A,
+		class = .IN,
+	}
+	query := dns.Message {
+		id       = 0x4d21,
+		question = questions,
+	}
+	wire, _, enc := dns.encode_message(query, context.temp_allocator)
+	testing.expect_value(t, enc, dns.Encode_Error.None)
+
+	out, outcome, ok := handle_query(&s, wire, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	if !testing.expect(t, ok, "a mixed-case query under a wildcard rewrite went unanswered") {
+		return
+	}
+	testing.expect_value(t, outcome, Outcome.Rewritten)
+
+	resp, derr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !testing.expect(t, len(resp.answer) == 1, "the rewrite produced no answer record") {
+		return
+	}
+	a, is_a := resp.answer[0].data.(dns.Rdata_A)
+	testing.expect(t, is_a, "the rewritten answer is not an A record")
+	testing.expect_value(t, a.addr, [4]u8{192, 0, 2, 1})
+
+	free_all(context.temp_allocator)
+}

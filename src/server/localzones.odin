@@ -112,18 +112,39 @@ covered_by_local_anchor :: proc(s: ^Server, name: string) -> bool {
 	return false
 }
 
+/*
+Whether `name` sits strictly below `zone`, the zone's own name excluded.
+
+This is what a wildcard means: "*.lan." stands for at least one label under
+"lan.", so `find_rewrite` in the resolver asks this question while the callers
+above ask the inclusive one. Both go through the same test so that neither can
+be tightened or loosened without the other following, which is how the two came
+to disagree about case in the first place.
+
+The comparison folds case throughout, since DNS names compare without regard to
+it (RFC 1035 section 2.3.3, restated for every label by RFC 4343) and the names
+reaching here are whatever the client spelled - nothing upstream of this lowers
+them, deliberately, so that a response can echo the question back byte for
+byte. That rules out any byte-wise shortcut on the suffix, however tempting one
+looks in front of the fold.
+*/
 @(private)
-name_at_or_below :: proc(name, zone: string) -> bool {
-	if len(name) < len(zone) {
+name_below :: proc(name, zone: string) -> bool {
+	if len(name) <= len(zone) {
 		return false
 	}
-	if len(name) == len(zone) {
-		return dns.name_equal_fold(name, zone)
-	}
-	// Longer than the zone: the zone has to begin right after a label break, or
-	// it is a bare string suffix of some other name rather than a subtree of it.
+	// The zone has to begin right after a label break, or it is a bare string
+	// suffix of some other name rather than a subtree of it.
 	if name[len(name) - len(zone) - 1] != '.' {
 		return false
 	}
 	return dns.name_equal_fold(name[len(name) - len(zone):], zone)
+}
+
+@(private)
+name_at_or_below :: proc(name, zone: string) -> bool {
+	if len(name) == len(zone) {
+		return dns.name_equal_fold(name, zone)
+	}
+	return name_below(name, zone)
 }
