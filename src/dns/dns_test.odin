@@ -1,5 +1,6 @@
 package dns
 
+import "core:fmt"
 import "core:mem"
 import "core:testing"
 
@@ -435,6 +436,49 @@ test_encode_message_releases_its_writer_on_error :: proc(t: ^testing.T) {
 	wire, _, err := encode_message(m, allocator, 4)
 	testing.expect(t, err != .None, "a message past max_size was accepted")
 	testing.expect(t, wire == nil, "a refused encode still returned a buffer")
+
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%d bytes left held, allocated at %v", entry.size, entry.location)
+	}
+	testing.expectf(t, len(track.bad_free_array) == 0, "%d bad frees", len(track.bad_free_array))
+}
+
+/*
+Truncation is the third path, and the one that used to leak: it `clear`s the
+compression map to invalidate the targets recorded for the dropped bytes, then
+leans on the deferred `writer_release_scratch` to free the cloned keys - but an
+already-cleared map has nothing to iterate, so every key clone made before the
+cut escaped. The answer here is large enough to force a cut with the map already
+populated by distinct name suffixes.
+*/
+@(test)
+test_encode_message_releases_its_writer_on_truncation :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	// Distinct suffixes so the compression map holds real cloned keys, and
+	// enough of them that `max_size` cuts the answer partway through.
+	answer: [dynamic]Record
+	for i in 0 ..< 64 {
+		name := fmt.aprintf("host%d.example.com.", i, allocator = context.temp_allocator)
+		append(&answer, Record{name = name, type = .A, class = .IN, ttl = 300, data = Rdata_A{addr = {192, 0, 2, u8(i)}}})
+	}
+	m := Message {
+		id       = 0x1234,
+		question = []Question{{name = "example.com.", type = .A, class = .IN}},
+		answer   = answer[:],
+	}
+	m.flags.qr = true
+
+	wire, truncated, err := encode_message(m, allocator, 200)
+	testing.expect_value(t, err, Encode_Error.None)
+	testing.expect(t, truncated, "answer past max_size was not truncated")
+	testing.expect(t, len(wire) > 0, "nothing was encoded")
+
+	delete(wire, allocator)
+	delete(answer)
 
 	for _, entry in track.allocation_map {
 		testing.expectf(t, false, "%d bytes left held, allocated at %v", entry.size, entry.location)
