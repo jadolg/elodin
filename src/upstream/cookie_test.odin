@@ -222,6 +222,50 @@ test_upstream_cookie_is_sent_and_learned :: proc(t: ^testing.T) {
 }
 
 /*
+Stripping the server cookie must not orphan the reply it was stripped from.
+
+`exchange_with_cookie` allocates the reply as it arrived in the caller's
+allocator, then hands back a *different* buffer with the cookie taken out. On
+the arena paths the discarded first buffer is reclaimed for free, but on the
+Race strategy the allocator is the process heap and nothing else ever frees
+it — so every forwarded query whose upstream echoes a cookie would leak one
+buffer for the life of the process. Freeing the one buffer the caller is given
+back must leave the heap empty.
+*/
+@(test)
+test_upstream_cookie_strip_leaves_no_orphan_on_heap :: proc(t: ^testing.T) {
+	m := Cookie_Mock {
+		server = {1, 2, 3, 4, 5, 6, 7, 8},
+	}
+	u, worker, ok := start_cookie_mock(t, &m)
+	if !ok {
+		return
+	}
+	defer stop_cookie_mock(&m, u, worker)
+
+	// Stand in for the heap the race workers hand down, so a buffer left behind
+	// shows up as a live allocation rather than being swallowed by an arena.
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	heap := mem.tracking_allocator(&track)
+
+	// The reply carries a cookie, so the exchange takes the strip path: it
+	// allocates the reply as sent and again the copy with the cookie removed.
+	response, err := exchange(u, edns_query("example.com."), time.Second, heap)
+	testing.expectf(t, err == .None, "the exchange failed: %v", err)
+	testing.expect(t, response != nil, "the exchange returned nothing")
+
+	// The stripped reply is the caller's to free. Once it is gone, nothing the
+	// exchange put on the heap may remain.
+	delete(response, heap)
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%d bytes orphaned on the heap, allocated at %v", entry.size, entry.location)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
 A reply echoing someone else's client cookie is what a forgery looks like, and
 it is passed over rather than answered - the genuine reply may still arrive.
 */

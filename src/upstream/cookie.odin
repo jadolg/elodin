@@ -200,12 +200,19 @@ exchange_with_cookie :: proc(
 		// the query on without the cookie the server has just insisted on.
 		retry, retried := attach_cookie(u, query, context.temp_allocator)
 		if !retried {
+			// `response` came out of `allocator`, which on the race path is the
+			// process heap: dropping it here would leak it for the life of the
+			// process, so free it before turning the reply away.
+			delete(response, allocator)
 			return nil, .Bad_Response
 		}
+		// The retry supersedes this reply; free it before it is overwritten.
+		delete(response, allocator)
 		response = send(u, retry, timeout, allocator) or_return
 		learn_cookie(u, response)
 		if dns.peek_rcode(response) == .Bad_Cookie {
 			logx.debugf("upstream %s: still BADCOOKIE after a fresh cookie", u.spec.name)
+			delete(response, allocator)
 			return nil, .Bad_Response
 		}
 	}
@@ -226,6 +233,17 @@ exchange_with_cookie :: proc(
 		*/
 		return response, .None
 	}
+	/*
+	`stripped` is a fresh buffer with the cookie taken out, so `response` is
+	now superseded. It has to be freed either way we leave here.
+
+	On the arena paths this is a no-op — the per-request scratch arena reclaims
+	it on `free_all` regardless. But on the race path `allocator` is the process
+	heap (a race worker can outlive the caller's arena), and there nothing else
+	ever frees it: left behind, it leaks one buffer per forwarded query for the
+	life of the process.
+	*/
+	defer delete(response, allocator)
 	stripped, ok := dns.remove_edns_option(response, .Cookie, allocator)
 	if !ok {
 		// Failing closed, the way the client-facing side does when it cannot take
