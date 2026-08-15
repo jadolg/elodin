@@ -53,10 +53,23 @@ string per distinct name suffix behind.
 @(private)
 writer_release_scratch :: proc(w: ^Writer) {
 	delete(w.offsets)
+	writer_free_comp_keys(w)
+	delete(w.comp)
+}
+
+/*
+Free the cloned key strings the compression map holds (see `w_name`).
+
+The map's own storage does not own its keys, so both dropping the map
+(`writer_release_scratch`) and clearing it to invalidate stale targets
+(`encode_message`'s truncation path) have to free them first, or a string
+per distinct name suffix leaks.
+*/
+@(private)
+writer_free_comp_keys :: proc(w: ^Writer) {
 	for key in w.comp {
 		delete(key, w.allocator)
 	}
-	delete(w.comp)
 }
 
 @(private)
@@ -309,7 +322,11 @@ encode_message :: proc(
 	if truncated {
 		// Compression targets recorded for the dropped bytes are now stale, so
 		// nothing more may be written that could reference them. OPT uses a
-		// root name and no compressible RDATA, which keeps this safe.
+		// root name and no compressible RDATA, which keeps this safe. The keys
+		// are cloned, so free them before `clear` drops the entries — otherwise
+		// the later `writer_release_scratch` finds an empty map and one string
+		// per distinct suffix leaks.
+		writer_free_comp_keys(&w)
 		clear(&w.comp)
 		for rec in m.additional {
 			if rec.type != .OPT {
