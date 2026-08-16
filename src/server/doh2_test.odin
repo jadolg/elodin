@@ -327,12 +327,17 @@ test_doh2_refuses_a_request_over_the_rate_limit :: proc(t: ^testing.T) {
 	cfg.cache.enabled = false
 	cfg.blocking.enabled = false
 
-	// One response a second, so the bucket holds two; the slip is on, which a
-	// connection must not use - see `stream_rate_check`.
+	// One response a second, so the pool holds two; spent through
+	// `stream_rate_check`, which is the pool an h2 request is charged to - see
+	// `Rate_Class`. The slip is on, which a connection must not use.
 	limiter := make_rate_limiter(1, 2)
 	defer destroy_rate_limiter(limiter)
 	for _ in 0 ..< RRL_BURST_SECONDS {
-		testing.expect_value(t, rate_check(limiter, H2_PEER, time.tick_now()), Rate_Verdict.Allow)
+		testing.expect(
+			t,
+			stream_rate_check(limiter, H2_PEER, time.tick_now()),
+			"the stream budget refused a query it had room for",
+		)
 	}
 
 	got := serve_one(&cfg, "/dns-query?dns=AAAAAAAAAAAAAAAA", "", occupy = true, limiter = limiter)
@@ -379,9 +384,10 @@ test_doh2_rate_limit_charges_only_queries :: proc(t: ^testing.T) {
 
 	limiter := make_rate_limiter(1, 0)
 	defer destroy_rate_limiter(limiter)
-	// Nothing left for a query, let alone for anything that is not one.
+	// Nothing left for a query, let alone for anything that is not one. The stream
+	// pool, which is the one an h2 request is charged to - see `Rate_Class`.
 	for _ in 0 ..< RRL_BURST_SECONDS {
-		rate_check(limiter, H2_PEER, time.tick_now())
+		stream_rate_check(limiter, H2_PEER, time.tick_now())
 	}
 
 	got := serve_one(&cfg, "/not-the-endpoint", "not found", occupy = false, limiter = limiter)
@@ -448,9 +454,10 @@ test_doh2_rate_limit_charges_only_well_formed_queries :: proc(t: ^testing.T) {
 
 	limiter := make_rate_limiter(1, 0)
 	defer destroy_rate_limiter(limiter)
-	// Nothing left for a query, let alone for something that is not one.
+	// Nothing left for a query, let alone for something that is not one. The stream
+	// pool, which is the one an h2 request is charged to - see `Rate_Class`.
 	for _ in 0 ..< RRL_BURST_SECONDS {
-		rate_check(limiter, H2_PEER, time.tick_now())
+		stream_rate_check(limiter, H2_PEER, time.tick_now())
 	}
 
 	// The endpoint, and a parameter with no base64 in it at all.

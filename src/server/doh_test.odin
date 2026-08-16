@@ -522,8 +522,10 @@ test_doh_refuses_a_query_over_the_rate_limit :: proc(t: ^testing.T) {
 	s := Server {
 		cfg = &cfg,
 	}
-	// One response a second, so the bucket holds two and both are spent below.
-	// The slip is on, which a connection must not use - see `stream_rate_check`.
+	// One response a second, so the pool holds two and both are spent below.
+	// Spent through `stream_rate_check`, because the stream pool is the one a DoH
+	// request is charged to and datagrams cannot empty it - see `Rate_Class`. The
+	// slip is on, which a connection must not use either way.
 	s.limiter = make_rate_limiter(1, 2)
 	defer destroy_rate_limiter(s.limiter)
 
@@ -532,7 +534,11 @@ test_doh_refuses_a_query_over_the_rate_limit :: proc(t: ^testing.T) {
 		port    = 40000,
 	}
 	for _ in 0 ..< RRL_BURST_SECONDS {
-		testing.expect_value(t, rate_check(s.limiter, peer, time.tick_now()), Rate_Verdict.Allow)
+		testing.expect(
+			t,
+			stream_rate_check(s.limiter, peer, time.tick_now()),
+			"the stream budget refused a query it had room for",
+		)
 	}
 
 	serve_doh(&s, Conn{socket = accepted, peer = peer}, "test")

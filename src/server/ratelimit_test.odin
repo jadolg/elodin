@@ -306,7 +306,7 @@ responses this server sent.
 
 The limiter here has a slip configured, which is what makes that observable at
 all, and the last part of the test is the same limiter still slipping for UDP -
-this is the caller's choice per query, not a mode the bucket is put into.
+the slip belongs to the datagram pool, not to a mode the bucket is put into.
 */
 @(test)
 test_stream_queries_are_refused_rather_than_truncated :: proc(t: ^testing.T) {
@@ -346,11 +346,16 @@ A refusal on a connection does not move the slip along.
 
 `over` is the counter the slip is taken off, and the queries it counts have to be
 the ones the slip can be spent on: a stream refusal that advanced it would decide
-which *datagram* comes back truncated. Alternating traffic over one budget is
-where that shows - with the connection counted, one interleaving truncates every
-over-limit datagram, well past the 1-in-`slip` an operator asked for, and the
-other truncates none of them and leaves a client behind a busy NAT with nothing
-to act on.
+which *datagram* comes back truncated. Alternating traffic is where that shows -
+with the connection counted, one interleaving truncates every over-limit datagram,
+well past the 1-in-`slip` an operator asked for, and the other truncates none of
+them and leaves a client behind a busy NAT with nothing to act on.
+
+Charging the two classes to separate pools is what keeps a connection away from
+this counter, so the test reads as one about the pools now. It is kept as one about
+the slip because that is the behaviour a reader can check: both budgets are spent
+dry first, since a refusal is the only way a stream query gets far enough to be
+capable of touching `over` at all.
 
 One refusal, then two over-limit datagrams: the first is the slip's first, so it
 is dropped, and the second is its second.
@@ -362,6 +367,9 @@ test_a_stream_refusal_does_not_advance_the_slip :: proc(t: ^testing.T) {
 	defer destroy_rate_limiter(r)
 
 	client := v4(198, 51, 102, 7)
+	for _ in 0 ..< RRL_BURST_SECONDS {
+		testing.expect(t, stream_rate_check(r, client, at(0)), "the stream budget refused a query it had room for")
+	}
 	for _ in 0 ..< RRL_BURST_SECONDS {
 		testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Allow)
 	}
@@ -378,37 +386,114 @@ test_a_stream_refusal_does_not_advance_the_slip :: proc(t: ^testing.T) {
 }
 
 /*
-One budget per prefix, not one per transport.
+Nor does a query a connection was *given* put the slip back to the start.
 
-What the limit bounds is what this server does for one prefix, so a prefix that
-has spent its budget answering datagrams has spent it - otherwise the same flood
-delivered two ways gets twice as much, and the way to have more of it is to ask
-over more transports.
+The counter's rule is one rule, not two: `over` counts over-limit datagrams since
+the last one a slip could have been spent on, so a query on a connection - which a
+slip can never be spent on - has to leave it exactly where it was, answered or
+refused. Clearing it would be the same interference as advancing it, from the other
+end: one connection in the prefix asking while its neighbours are over the budget
+would zero the count between every pair of over-limit datagrams, and at any `slip`
+above 2 no datagram would come back truncated at all - the client behind the busy
+NAT the slip exists for would be left with nothing to act on.
+
+Three over-limit datagrams, then a query answered on a connection out of the pool
+the flood has not touched, and then the fourth datagram - which is the SLIPth and
+must be the one that is truncated.
 */
 @(test)
-test_the_budget_is_shared_across_transports :: proc(t: ^testing.T) {
+test_a_stream_answer_does_not_reset_the_slip :: proc(t: ^testing.T) {
+	SLIP :: 4
+	r := make_rate_limiter(1, SLIP)
+	defer destroy_rate_limiter(r)
+
+	client := v4(198, 51, 103, 9)
+	for _ in 0 ..< RRL_BURST_SECONDS {
+		testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Allow)
+	}
+	for _ in 0 ..< SLIP - 1 {
+		testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Drop)
+	}
+
+	testing.expect(t, stream_rate_check(r, client, at(0)), "the stream budget refused a query it had room for")
+
+	testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Truncate)
+
+	limited, slipped := rate_limit_stats(r)
+	testing.expect_value(t, limited, u64(SLIP))
+	testing.expect_value(t, slipped, u64(1))
+}
+
+/*
+Two budgets per prefix, and a datagram flood cannot reach the one connections are
+answered out of.
+
+Stated as the attack rather than as a property, because the attack is the reason
+the separation is there. The bucket is keyed on the query's source address, and over
+UDP the sender writes that field: somebody spoofing sources inside prefix P, at
+more than the configured rate, keeps P's datagram pool empty for as long as they
+care to run it. When one pool served both, every genuine TCP, DoT or DoH connection
+from P then had its first query refused and its connection closed - so a party who
+could not receive a byte at P, and who was asking none of P's questions, decided
+what this server did for the clients who live there, on a default configuration. It
+also emptied the budget the slip's own advice sends a client to, which is the whole
+of what a truncated answer is for.
+
+Both directions, since a pool that can be drained from the other side is not a
+separate pool: the flood must not reach the connections, and a client pipelining
+over a connection must not empty what its neighbours' datagrams are answered out
+of.
+
+The cost of the split is asserted here too rather than left implicit. The prefix
+draws RATE*BURST out of each pool, so a client willing to ask both ways gets twice
+what an operator configured - a constant, and the trade is argued at the top of
+`ratelimit.odin`. What must not come back is one pool lending to the other.
+*/
+@(test)
+test_the_stream_budget_is_not_the_datagram_one :: proc(t: ^testing.T) {
 	RATE :: 10
 	r := make_rate_limiter(RATE, 0)
 	defer destroy_rate_limiter(r)
 
-	// One address of the prefix spends it all over UDP.
-	client := v4(203, 0, 113, 20)
+	// The flood: one prefix's datagram pool spent dry and held there.
+	victim := v4(203, 0, 113, 20)
 	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Allow)
+		testing.expect_value(t, rate_check(r, victim, at(0)), Rate_Verdict.Allow)
 	}
-	// Another address in the same /24, over a connection, finds nothing left.
+	for _ in 0 ..< 50 {
+		testing.expect_value(t, rate_check(r, victim, at(0)), Rate_Verdict.Drop)
+	}
+
+	// A real client in the same /24, over a connection: a budget of its own, and
+	// the whole of it.
+	answered := 0
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		if stream_rate_check(r, v4(203, 0, 113, 21), at(0)) {
+			answered += 1
+		}
+	}
+	testing.expectf(
+		t,
+		answered == RATE * RRL_BURST_SECONDS,
+		"a datagram flood took %d of the %d answers the prefix's connections were owed",
+		answered,
+		RATE * RRL_BURST_SECONDS,
+	)
+	// A budget of its own, not an exemption.
 	testing.expect(
 		t,
-		!stream_rate_check(r, v4(203, 0, 113, 21), at(0)),
-		"a connection was served out of a budget UDP had already spent",
+		!stream_rate_check(r, v4(203, 0, 113, 22), at(0)),
+		"the stream budget answered past what it holds",
 	)
 
-	// And the other way about, on a prefix of its own.
+	// The other way about, on a prefix of its own: a pipelining client spends the
+	// stream pool dry and its neighbours' datagrams are answered anyway.
 	stream_first := v6(0xcccc, 1)
 	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		testing.expect(t, stream_rate_check(r, stream_first, at(0)), "the budget refused a query it had room for")
+		testing.expect(t, stream_rate_check(r, stream_first, at(0)), "the stream budget refused a query it had room for")
 	}
-	testing.expect_value(t, rate_check(r, v6(0xcccc, 2), at(0)), Rate_Verdict.Drop)
+	testing.expect(t, !stream_rate_check(r, stream_first, at(0)), "the stream budget answered past what it holds")
+	testing.expect_value(t, rate_check(r, v6(0xcccc, 2), at(0)), Rate_Verdict.Allow)
 }
 
 // One charging thread's share of the work below, and what it saw.
@@ -416,6 +501,9 @@ test_the_budget_is_shared_across_transports :: proc(t: ^testing.T) {
 Hammer :: struct {
 	limiter:   ^Rate_Limiter,
 	client:    net.Endpoint,
+	// Which of the prefix's two pools this thread spends from. Both are hammered,
+	// because both entry points decrement under the one lock.
+	stream:    bool,
 	rounds:    int,
 	allowed:   int,
 	truncated: int,
@@ -424,6 +512,12 @@ Hammer :: struct {
 @(private = "file")
 hammer :: proc(h: ^Hammer) {
 	for _ in 0 ..< h.rounds {
+		if h.stream {
+			if stream_rate_check(h.limiter, h.client, at(0)) {
+				h.allowed += 1
+			}
+			continue
+		}
 		switch rate_check(h.limiter, h.client, at(0)) {
 		case .Allow:
 			h.allowed += 1
@@ -446,11 +540,15 @@ once loses one of the two decrements, and `over` loses slips the same way. Both
 are counted here rather than only the first, because the numbers an operator reads
 are as much of the limiter as the verdicts are.
 
+Half the threads charge datagrams and half charge connections, so both pools are
+spent concurrently and each is asserted to the token: they live in one bucket
+behind one lock, and a pool that came out over its capacity would be one the other
+half's decrements had raced with.
+
 Every thread charges the same prefix at the same instant, so nothing refills
-during the run and the arithmetic is exact: a full bucket and no more, whoever
-spent it. Unlocked, the total comes out above the capacity - by how much depends
-on the interleaving, which is why the assertion is an equality rather than a
-threshold.
+during the run and the arithmetic is exact: a full pool and no more, whoever spent
+it. Unlocked, the totals come out above the capacity - by how much depends on the
+interleaving, which is why the assertions are equalities rather than thresholds.
 */
 @(test)
 test_rate_limit_accounts_exactly_under_concurrent_callers :: proc(t: ^testing.T) {
@@ -458,6 +556,7 @@ test_rate_limit_accounts_exactly_under_concurrent_callers :: proc(t: ^testing.T)
 	SLIP :: 2
 	THREADS :: 8
 	ROUNDS :: 500
+	CAPACITY :: RATE * RRL_BURST_SECONDS
 
 	r := make_rate_limiter(RATE, SLIP)
 	defer destroy_rate_limiter(r)
@@ -469,6 +568,7 @@ test_rate_limit_accounts_exactly_under_concurrent_callers :: proc(t: ^testing.T)
 		hammers[i] = Hammer {
 			limiter = r,
 			client  = client,
+			stream  = i % 2 == 1,
 			rounds  = ROUNDS,
 		}
 		threads[i] = thread.create_and_start_with_poly_data(&hammers[i], hammer)
@@ -477,28 +577,43 @@ test_rate_limit_accounts_exactly_under_concurrent_callers :: proc(t: ^testing.T)
 			return
 		}
 	}
-	allowed, truncated := 0, 0
+	datagrams, streams, truncated := 0, 0, 0
 	for i in 0 ..< THREADS {
 		thread.join(threads[i])
 		thread.destroy(threads[i])
-		allowed += hammers[i].allowed
+		if hammers[i].stream {
+			streams += hammers[i].allowed
+		} else {
+			datagrams += hammers[i].allowed
+		}
 		truncated += hammers[i].truncated
 	}
 
 	testing.expectf(
 		t,
-		allowed == RATE * RRL_BURST_SECONDS,
-		"%d threads spent %d responses out of a bucket holding %d",
-		THREADS,
-		allowed,
-		RATE * RRL_BURST_SECONDS,
+		datagrams == CAPACITY,
+		"%d threads spent %d datagrams out of a pool holding %d",
+		THREADS / 2,
+		datagrams,
+		CAPACITY,
+	)
+	testing.expectf(
+		t,
+		streams == CAPACITY,
+		"%d threads spent %d queries on connections out of a pool holding %d",
+		THREADS / 2,
+		streams,
+		CAPACITY,
 	)
 
 	limited, slipped := rate_limit_stats(r)
-	over := u64(THREADS * ROUNDS - RATE * RRL_BURST_SECONDS)
-	testing.expect_value(t, limited, over)
-	// `over` counted once per over-limit query and never lost, so every SLIPth one
-	// of them slipped - exactly, not approximately.
-	testing.expect_value(t, slipped, over / SLIP)
-	testing.expect_value(t, u64(truncated), over / SLIP)
+	// Each half spent its own pool, so each half went over by its own rounds less
+	// that pool's capacity.
+	over_datagram := u64(THREADS / 2 * ROUNDS - CAPACITY)
+	testing.expect_value(t, limited, over_datagram * 2)
+	// `over` counted once per over-limit datagram and never lost, so every SLIPth
+	// one of them slipped - exactly, not approximately. The connections' refusals
+	// are not among them: they do not reach the counter.
+	testing.expect_value(t, slipped, over_datagram / SLIP)
+	testing.expect_value(t, u64(truncated), over_datagram / SLIP)
 }

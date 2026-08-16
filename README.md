@@ -9,7 +9,7 @@ Pi-hole and AdGuard Home, minus the web interface. One binary, one YAML file.
 - Three upstream strategies: failover, round-robin and race
 - Sink lists in hosts, plain-domain and adblock syntax, with allowlists
 - Answer cache with negative caching and optional stale serving
-- Response rate limiting per client prefix, across every transport, on by default (see `server.rate_limit`)
+- Response rate limiting per client prefix, on every transport and with a separate budget for datagrams and for connections, on by default (see `server.rate_limit`)
 - Client allow list restricting who may query, defaulting to local networks only
 - A ceiling on UDP answer size to bound reflection amplification, on by default
 - Local rewrites (A, AAAA, CNAME, or "answer as if blocked")
@@ -695,8 +695,8 @@ resolver that simply believes it has handed the caller its own amplification
 factor: the query arrives on a datagram nobody verified, so an attacker aiming
 answers at a victim advertises the largest buffer it can and gets a hundredfold
 out of forty bytes. `max_udp_response` is the ceiling on that number, applied on
-top of whatever the client asked for. It is also what the per-prefix budget
-under [Rate limiting](#rate-limiting) is denominated in — 500 responses a second
+top of whatever the client asked for. It is also what the per-prefix datagram
+budget under [Rate limiting](#rate-limiting) is denominated in — 500 responses a second
 is about 600 KB/s at 1232 and about 2 MB/s at 4096.
 
 The cost is a TC bit, and a retry over TCP, on any answer between the ceiling
@@ -758,7 +758,7 @@ for.
 server:
   rate_limit:
     enabled: true                 # on by default
-    responses_per_second: 500     # per client prefix: /24 for IPv4, /64 for IPv6
+    responses_per_second: 500     # per client prefix (/24 for IPv4, /64 for IPv6), and per transport class
     slip: 2                       # answer every 2nd query over the budget truncated; 0 drops them all
 ```
 
@@ -789,9 +789,9 @@ it up. Set `slip: 0` to drop them instead and answer nothing.
 ceiling — is far past what a household or an office behind one NAT asks for and
 far below what makes reflection worth an attacker's bandwidth, which is why it
 is on by default. The accounting is a fixed table of
-16,384 buckets — half a megabyte, allocated once — so the limiter is not itself
-somewhere to put pressure, and which prefixes share a bucket is decided by a key
-drawn at startup rather than by anything an attacker can work out.
+16,384 buckets — 640 KB, allocated once — so the limiter is not itself somewhere to
+put pressure, and which prefixes share a bucket is decided by a key drawn at
+startup rather than by anything an attacker can work out.
 
 Two source addresses are refused outright before any of this: port 0, which
 nothing receives on, and this server's own listening endpoint, which is a query
@@ -806,7 +806,7 @@ would be spending its neighbour's: charging them would turn a narrowed allow
 list into a way to have the clients beside it dropped. Nothing is sent to a
 refused source, so there is nothing for a response budget to bound.
 
-TCP, DoT and DoH are charged against the same budget, for the other half of what
+TCP, DoT and DoH are charged too, for the other half of what
 a flood costs. Amplification is not their problem — a connection is established
 before a query arrives on one, so the address is proven and nothing is reflected
 — but the work behind an answer is the same wherever the query came from, and
@@ -816,16 +816,32 @@ connection carries as many queries as the socket will take, and
 fast one of them asks. Without the budget, a flood delivered over a handful of
 long-lived connections is one the limiter never sees.
 
-One budget across the four transports, not one each: what it bounds is what this
-server does for one prefix, so a prefix that has spent its budget answering
-datagrams has spent it. What differs is the answer an over-budget query gets.
-`slip` is a UDP mechanism — the TC bit tells a client to ask again over TCP, and
-a client that is already there can do nothing with it — so on a connection
-everything over the budget is refused: TCP and DoT are closed, and DoH is
-answered `429 Too Many Requests` and then closed, HTTP having a way to say it.
-Over HTTP/2 the stream is refused with a 429 and the connection stays, since one
-over-budget request is no reason to take the requests in flight beside it down as
-well.
+Two budgets per prefix, though, not one: datagrams are charged to one and
+connections to the other, each getting `responses_per_second`, and neither can be
+spent from the other side. The reason is that the budget is keyed on the query's
+source address, and on a datagram that field is written by whoever sent it. Under
+one shared budget, anybody able to send UDP could empty the budget of any prefix
+they liked — a spoofed flood naming sources in a /24, above the configured rate,
+keeps that /24's bucket empty for as long as it runs — and every genuine TCP, DoT
+or DoH connection from that /24 would then have its first query refused and its
+connection closed. Somebody who cannot receive a byte at the address, and who is
+asking none of that network's questions, would be deciding what this server does
+for the clients who actually live there, on a default configuration. It would also
+empty the budget a slip's own advice sends a client to.
+
+The cost of the separation is that a client willing to ask both ways can draw
+twice `responses_per_second` — a factor of two on the work behind an answer, on a
+figure you chose, and half of it only reachable over a completed handshake from an
+address that is therefore real. That is the trade, taken deliberately; the
+alternative was letting anyone with a raw socket switch off a stranger's TCP.
+
+What differs besides the budget is the answer an over-budget query gets. `slip` is
+a UDP mechanism — the TC bit tells a client to ask again over TCP, and a client
+that is already there can do nothing with it — so on a connection everything over
+the budget is refused: TCP and DoT are closed, and DoH is answered `429 Too Many
+Requests` and then closed, HTTP having a way to say it. Over HTTP/2 the stream is
+refused with a 429 and the connection stays, since one over-budget request is no
+reason to take the requests in flight beside it down as well.
 
 What the budget is spent on is a question, on every transport. Over HTTP that
 means a request has to be one before it is charged: a scanner's 404, a
@@ -841,11 +857,11 @@ the client's kernel throw away the answers that went out before the budget was
 gone. So what is left unread is read and discarded first, briefly and up to a
 bound, and then the connection ends.
 
-That is also the limit of what a slip promises. The TCP retry it invites is
-charged to the same bucket, so it is answered once a token has refilled — two
-milliseconds at the default 500 — and refused like anything else for as long as a
-flood is taking them as fast as they arrive. A slip says the address is worth
-proving; it does not reserve the budget the proof is spent on.
+The TCP retry a slip invites is charged to the stream budget, which is the one the
+datagram flood cannot reach — so a client sent to TCP by a flood in its prefix
+arrives at a budget that flood has not spent. It is still a budget: a client that
+has emptied the stream side itself is refused there like anything else, and a slip
+says the address is worth proving rather than reserving anything for the proof.
 
 Both counters cover every transport. `elodin_rate_limited_total` counts what was
 withheld wherever it came from; `elodin_rate_limit_slipped_total` counts truncated
@@ -1301,7 +1317,7 @@ upstream traffic by the number of servers.
   TCP, DoT and DoH together by `server.max_connections` (512). That is fine for
   clients that hold a connection open and pipeline over it, but it does not suit
   tens of thousands of concurrent connections. UDP is the exception: one reader
-  thread and no per-client state, bounded instead by the per-prefix response
+  thread and no per-client state, bounded instead by the per-prefix datagram
   budget described under [Rate limiting](#rate-limiting).
 - Upstream I/O is synchronous, so concurrency is bounded by thread count rather
   than by in-flight queries. The h2 upstream client is the exception — its
@@ -1428,7 +1444,7 @@ What it covers:
 | DoH upstreams | a query resolved over an h2 upstream, one connection multiplexed across queries rather than reopened, fallback to HTTP/1.1 when the upstream does not offer h2 |
 | blocking | all five response modes, hosts vs domains vs adblock semantics, allow precedence, wildcards, modifiers, dnsmasq syntax, unusable rules, case folding |
 | rewrites | A, AAAA, CNAME, wildcard scope, `block`, NODATA for unmatched types |
-| rate limiting | a flood from one source answered in full with the limiter off and cut to the budget with it on, truncated answers over the budget, the bytes one address can be made to receive compared between the two, and the same flood pipelined down one TCP connection cut to the same budget with nothing truncated |
+| rate limiting | a flood from one source answered in full with the limiter off and cut to the budget with it on, truncated answers over the budget, the bytes one address can be made to receive compared between the two, the same flood pipelined down one TCP connection cut to its budget with nothing truncated, and a TCP client still answered after a datagram flood has spent the prefix's UDP budget |
 | cache | hits avoid the upstream, TTL countdown, cross-transport reuse, question re-casing, negative caching, key separation by type |
 | upstreams | failover, round-robin, race, health cooldown, TCP and DoT clients, connection pooling, UDP→TCP retry, total outage → SERVFAIL |
 | blocklist downloads | two lists fetched over HTTP and both applied, written to the cache directory, reused on restart without re-fetching, unwritable cache directory degrades to a warning |

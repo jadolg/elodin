@@ -1011,8 +1011,10 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 
 		/*
 		Charged before the answer is built, as the UDP loop charges before it
-		queues, and against the same budget - see the head of `ratelimit.odin` for
-		why a connection is metered at all when nothing on it can be reflected.
+		queues, and against the prefix's stream budget rather than the one its
+		datagrams spend - see the head of `ratelimit.odin` for why a connection is
+		metered at all when nothing on it can be reflected, and why it is not
+		metered out of the same pool.
 
 		The connection ends rather than this query being skipped. Skipping it
 		leaves a client that framed a correct query waiting for an answer that is
