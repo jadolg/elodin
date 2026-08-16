@@ -55,6 +55,12 @@ twice as many ways.
 What differs is what an over-limit query is answered with: `slip` sends a
 truncated answer over UDP and does not apply to a connection, for the reason in
 `stream_rate_check`.
+
+Which is also the limit of what a slip promises, and worth being plain about: the
+retry it invites is charged to the same bucket, so it is answered once a token has
+refilled - two milliseconds at the default - and refused like anything else while a
+flood is taking them as fast as they arrive. A slip says the address is worth
+proving; it does not reserve the budget the proof is spent on.
 */
 
 /*
@@ -86,7 +92,12 @@ Rate_Bucket :: struct {
 	key:     u64,
 	tokens:  f64,
 	last_ns: i64,
-	// Over-limit queries since the last one that was answered, for `slip`.
+	/*
+	Over-limit queries since the last one that was answered, for `slip`, and only
+	the ones the slip could have applied to: a connection's refusal is not counted,
+	because it would move which datagram the next truncated answer lands on without
+	ever being one. See `rate_check`.
+	*/
 	over:    u32,
 }
 
@@ -224,8 +235,22 @@ rate_check :: proc(
 	}
 
 	sync.atomic_add(&r.limited, 1)
+	/*
+	`over` is the slip counter and nothing besides, so only a query the slip could
+	be spent on advances it. A connection's refusal counted here would move which
+	datagram the next truncated answer lands on, and in the two interleavings that
+	matter it moves it off the end: alternating stream and UDP queries over one
+	budget either put every even count on a datagram - every over-limit datagram
+	answered truncated, which is more truncated traffic than `slip` was set to
+	allow - or every even count on a connection, where nothing is sent, and no
+	datagram is ever truncated at all. Either way the figure an operator
+	configured is not the figure they get.
+	*/
+	if !slip {
+		return .Drop
+	}
 	b.over += 1
-	if slip && r.slip > 0 && int(b.over) % r.slip == 0 {
+	if r.slip > 0 && int(b.over) % r.slip == 0 {
 		sync.atomic_add(&r.slipped, 1)
 		return .Truncate
 	}
@@ -246,7 +271,9 @@ standing in for a large one aimed at somebody else.
 
 `rate_check` is told not to slip rather than having its `Truncate` reinterpreted
 here, because `slipped=` in the stats line counts truncated answers that went out,
-and a verdict nobody acts on must not be counted among them.
+and a verdict nobody acts on must not be counted among them. Saying so up front is
+also what leaves the slip counter alone: a refusal on a connection that advanced it
+would decide which *datagram* comes back truncated - see `Rate_Bucket.over`.
 
 What the caller does with a `false` is stop serving: see `serve_dns_stream` for
 why the connection ends rather than the query being quietly skipped.

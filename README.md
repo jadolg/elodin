@@ -827,6 +827,12 @@ Over HTTP/2 the stream is refused with a 429 and the connection stays, since one
 over-budget request is no reason to take the requests in flight beside it down as
 well.
 
+That is also the limit of what a slip promises. The TCP retry it invites is
+charged to the same bucket, so it is answered once a token has refilled — two
+milliseconds at the default 500 — and refused like anything else for as long as a
+flood is taking them as fast as they arrive. A slip says the address is worth
+proving; it does not reserve the budget the proof is spent on.
+
 Both counters cover every transport. `elodin_rate_limited_total` counts what was
 withheld wherever it came from; `elodin_rate_limit_slipped_total` counts truncated
 answers, so it only ever moves for UDP.

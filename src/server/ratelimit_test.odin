@@ -342,6 +342,42 @@ test_stream_queries_are_refused_rather_than_truncated :: proc(t: ^testing.T) {
 }
 
 /*
+A refusal on a connection does not move the slip along.
+
+`over` is the counter the slip is taken off, and the queries it counts have to be
+the ones the slip can be spent on: a stream refusal that advanced it would decide
+which *datagram* comes back truncated. Alternating traffic over one budget is
+where that shows - with the connection counted, one interleaving truncates every
+over-limit datagram, well past the 1-in-`slip` an operator asked for, and the
+other truncates none of them and leaves a client behind a busy NAT with nothing
+to act on.
+
+One refusal, then two over-limit datagrams: the first is the slip's first, so it
+is dropped, and the second is its second.
+*/
+@(test)
+test_a_stream_refusal_does_not_advance_the_slip :: proc(t: ^testing.T) {
+	SLIP :: 2
+	r := make_rate_limiter(1, SLIP)
+	defer destroy_rate_limiter(r)
+
+	client := v4(198, 51, 102, 7)
+	for _ in 0 ..< RRL_BURST_SECONDS {
+		testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Allow)
+	}
+
+	testing.expect(t, !stream_rate_check(r, client, at(0)), "an over-budget query was answered on a connection")
+
+	testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Drop)
+	testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Truncate)
+
+	limited, slipped := rate_limit_stats(r)
+	// Three over the budget: the connection's and the two datagrams.
+	testing.expect_value(t, limited, u64(3))
+	testing.expect_value(t, slipped, u64(1))
+}
+
+/*
 One budget per prefix, not one per transport.
 
 What the limit bounds is what this server does for one prefix, so a prefix that
@@ -375,24 +411,7 @@ test_the_budget_is_shared_across_transports :: proc(t: ^testing.T) {
 	testing.expect_value(t, rate_check(r, v6(0xcccc, 2), at(0)), Rate_Verdict.Drop)
 }
 
-/*
-The bucket table is reached from as many threads as there are connections, and
-this is what says the accounting survives it.
-
-Every stream connection charges the queries it reads on its own thread, so the
-single-reader assumption the table was first written under is gone. What its
-absence costs is not a crash but a limiter that under-counts at the moment it is
-counting something: `tokens` read, decremented and written back by two threads at
-once loses one of the two decrements, and `over` loses slips the same way. Both
-are counted here rather than only the first, because the numbers an operator reads
-are as much of the limiter as the verdicts are.
-
-Every thread charges the same prefix at the same instant, so nothing refills
-during the run and the arithmetic is exact: a full bucket and no more, whoever
-spent it. Unlocked, the total comes out above the capacity - by how much depends
-on the interleaving, which is why the assertion is an equality rather than a
-threshold.
-*/
+// One charging thread's share of the work below, and what it saw.
 @(private = "file")
 Hammer :: struct {
 	limiter:   ^Rate_Limiter,
@@ -415,6 +434,24 @@ hammer :: proc(h: ^Hammer) {
 	}
 }
 
+/*
+The bucket table is reached from as many threads as there are connections, and
+this is what says the accounting survives it.
+
+Every stream connection charges the queries it reads on its own thread, so the
+single-reader assumption the table was first written under is gone. What its
+absence costs is not a crash but a limiter that under-counts at the moment it is
+counting something: `tokens` read, decremented and written back by two threads at
+once loses one of the two decrements, and `over` loses slips the same way. Both
+are counted here rather than only the first, because the numbers an operator reads
+are as much of the limiter as the verdicts are.
+
+Every thread charges the same prefix at the same instant, so nothing refills
+during the run and the arithmetic is exact: a full bucket and no more, whoever
+spent it. Unlocked, the total comes out above the capacity - by how much depends
+on the interleaving, which is why the assertion is an equality rather than a
+threshold.
+*/
 @(test)
 test_rate_limit_accounts_exactly_under_concurrent_callers :: proc(t: ^testing.T) {
 	RATE :: 100
