@@ -200,12 +200,23 @@ exchange_with_cookie :: proc(
 		// the query on without the cookie the server has just insisted on.
 		retry, retried := attach_cookie(u, query, context.temp_allocator)
 		if !retried {
+			// `response` came out of `allocator`, which on the race path is the
+			// process heap: dropping it here would leak it for the life of the
+			// process, so free it before turning the reply away.
+			delete(response, allocator)
 			return nil, .Bad_Response
 		}
+		// The retry supersedes this reply; free it before it is overwritten. Null
+		// the named result in between: `send` can bail through `or_return`, and a
+		// result still pointing at the freed buffer would be one the caller could
+		// read back rather than one it is guaranteed to discard on the error.
+		delete(response, allocator)
+		response = nil
 		response = send(u, retry, timeout, allocator) or_return
 		learn_cookie(u, response)
 		if dns.peek_rcode(response) == .Bad_Cookie {
 			logx.debugf("upstream %s: still BADCOOKIE after a fresh cookie", u.spec.name)
+			delete(response, allocator)
 			return nil, .Bad_Response
 		}
 	}
@@ -226,6 +237,18 @@ exchange_with_cookie :: proc(
 		*/
 		return response, .None
 	}
+	/*
+	`stripped` is a fresh buffer with the cookie taken out, so the reply `send`
+	returned is now superseded and has to be freed before we leave.
+
+	On the arena paths freeing it is a no-op — the per-request scratch arena
+	reclaims it on `free_all` regardless. But on the race path `allocator` is the
+	process heap (a race worker can outlive the caller's arena), and there
+	nothing else ever frees it: left behind, it leaks one buffer per forwarded
+	query for the life of the process. Deleted before `return`, not on a defer:
+	`response` is a named result, so `return stripped` would rebind it and a
+	deferred delete would free the buffer we just handed back.
+	*/
 	stripped, ok := dns.remove_edns_option(response, .Cookie, allocator)
 	if !ok {
 		// Failing closed, the way the client-facing side does when it cannot take
@@ -233,7 +256,21 @@ exchange_with_cookie :: proc(
 		// the one outcome the paragraph above exists to prevent, and losing it is
 		// the cheaper mistake: the group still has other servers to ask.
 		logx.warnf("upstream %s: could not strip the server cookie from a reply", u.spec.name)
+		delete(response, allocator)
 		return nil, .Bad_Response
+	}
+	/*
+	Free the superseded reply only once it is a different buffer. The cookie is
+	present here (the `reply_cookie` guard returned otherwise), so the strip
+	makes a fresh one and this is always the case — but `remove_edns_option`
+	hands the input straight back when it finds no option to take out, and that
+	full-decode guard and this raw option walk are two implementations of "is
+	the cookie present." Comparing the backing pointers rather than trusting
+	them to agree keeps a divergence from turning the free into one that drops
+	the very buffer we return.
+	*/
+	if raw_data(stripped) != raw_data(response) {
+		delete(response, allocator)
 	}
 	return stripped, .None
 }
