@@ -1044,7 +1044,7 @@ test_a_refusal_outlives_the_close_that_follows_it :: proc(t: ^testing.T) {
 	// answer, the drain, the close. Its return value is `keep_alive`, which is
 	// false here; whether the write landed is what the read below is about.
 	_ = send_http_error(conn, "doh", status, http_refusal_message(status), false)
-	http_linger(conn)
+	http_linger(conn, HTTP_LINGER_BODY_IDLE)
 	net.close(accepted)
 
 	reply := make([dynamic]u8, 0, 4096, context.temp_allocator)
@@ -1066,4 +1066,187 @@ test_a_refusal_outlives_the_close_that_follows_it :: proc(t: ^testing.T) {
 		"the client read %q, expected the 400 that was written",
 		string(reply[:min(len(reply), 40)]),
 	)
+}
+
+@(private = "file")
+Late_Body :: struct {
+	socket: net.TCP_Socket,
+	body:   string,
+	delay:  time.Duration,
+}
+
+// Writes the body its request already declared, after a wait, on a connection it
+// leaves open - which is what a client on a link with any latency looks like from
+// this end, and what `test_a_refusal_outlives_the_close_that_follows_it` cannot
+// show, its body being on the wire before the reader is.
+@(private = "file")
+send_late_body :: proc(lb: ^Late_Body) {
+	time.sleep(lb.delay)
+	sent := 0
+	raw := transmute([]u8)lb.body
+	for sent < len(raw) {
+		n, err := net.send_tcp(lb.socket, raw[sent:])
+		if err != nil || n <= 0 {
+			return
+		}
+		sent += n
+	}
+}
+
+/*
+A refusal reaches the client when the body that earned it had not finished
+arriving.
+
+The other direction of `test_a_refusal_outlives_the_close_that_follows_it`. There
+the body was on the wire before the reader ran, so a drain of any length at all
+found it in the receive queue and read it. Here the request line is refused while
+the declared body is still a round trip away, which is what every DoH client on a
+real link looks like: `read_http_request` turns a request down on its version
+before it has read a header, and the body the client is still sending arrives
+after the answer has been written.
+
+A drain that stops waiting while that body is still on its way is the same loss as
+not draining at all, reached the other way round. What decides which close happens
+is whether the receive queue is empty when it does: empty sends a FIN, and unread
+bytes send an RST (RFC 1122 4.2.2.13), whose arrival has the client's kernel
+discard the status already sitting in its receive buffer and hand its next read a
+connection reset instead - so waiting 50 ms for a body that is 100 ms away costs
+the client its 400 exactly as closing straight over it would.
+
+Both halves of that are checked, in the order they happen: what the drain left
+behind for the close to trip over, and then whether the status survived the close.
+The first is the mechanism and the second is the consequence, and shortening the
+wait fails on both. The 100 ms delay stands in for a round trip,
+`HTTP_LINGER_BODY_IDLE` is the wait that covers one, and the margin between them
+is what keeps this from turning on how the two threads were scheduled.
+
+The client never shuts its sending half down, so nothing but that wait ends the
+drain.
+*/
+@(test)
+test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the bound port: %v", berr)
+		return
+	}
+
+	client, derr := net.dial_tcp_from_endpoint(bound)
+	if derr != nil {
+		testing.expectf(t, false, "cannot dial the listener: %v", derr)
+		return
+	}
+	defer net.close(client)
+	_ = net.set_option(client, .Receive_Timeout, 3 * time.Second)
+
+	// The head alone. A `JUNK` version is refused on the request line, which is
+	// before `read_http_request` has looked at the Content-Length that says the
+	// rest is coming.
+	LATE :: 16 * 1024
+	head := strings.builder_make(context.temp_allocator)
+	strings.write_string(&head, "POST /dns-query JUNK\r\nHost: dns.example\r\nContent-Length: ")
+	strings.write_int(&head, LATE)
+	strings.write_string(&head, "\r\n\r\n")
+	if !send_all(t, client, strings.to_string(head)) {
+		return
+	}
+
+	accepted, _, aerr := net.accept_tcp(listener)
+	if aerr != nil {
+		testing.expectf(t, false, "nothing connected: %v", aerr)
+		return
+	}
+	_ = net.set_option(accepted, .Receive_Timeout, 3 * time.Second)
+	conn := Conn {
+		socket = accepted,
+	}
+
+	body := strings.builder_make(context.temp_allocator)
+	for _ in 0 ..< LATE {
+		strings.write_byte(&body, 'x')
+	}
+	late := Late_Body {
+		socket = client,
+		body   = strings.to_string(body),
+		delay  = 100 * time.Millisecond,
+	}
+	sender := thread.create_and_start_with_poly_data(&late, send_late_body)
+	defer thread.destroy(sender)
+
+	r := Http_Reader {
+		conn = conn,
+		buf  = make([dynamic]u8, 0, 4096, context.temp_allocator),
+	}
+	_, status, parsed := read_http_request(&r)
+	testing.expect(t, !parsed, "a JUNK version was accepted")
+	testing.expectf(t, status == 400, "answered %d, expected 400", status)
+	/*
+	The point of the arrangement: the reader is done before the body exists on the
+	wire, so the drain is the only thing that can take it off. What is left in the
+	buffer here is the rest of the head - the two headers the refused request line
+	was followed by, which the first fill read along with it - and nothing of the
+	body still to come.
+	*/
+	testing.expectf(
+		t,
+		len(r.buf) - r.pos < len(strings.to_string(head)),
+		"%d bytes were left over, which is more than the head: the body arrived before the refusal, and this is the other test",
+		len(r.buf) - r.pos,
+	)
+
+	// `serve_doh`'s refusal path, in its order: the answer, then the drain.
+	_ = send_http_error(conn, "doh", status, http_refusal_message(status), false)
+	http_linger(conn, HTTP_LINGER_BODY_IDLE)
+
+	/*
+	The assertion, taken before the close it is about: one more read, and nothing
+	there to read. A drain that covered the body leaves the queue empty and the
+	client with nothing left to send, so this times out; a drain that gave up before
+	the body arrived left it to turn up afterwards, and this is what finds it -
+	which is the close finding it there and sending an RST instead of a FIN.
+
+	The wait is written out rather than taken from `HTTP_LINGER_BODY_IDLE`, and is
+	longer than the delay above by a margin: read for as long as the drain waits and
+	a shortened drain would be measured with the same short ruler that shortened it,
+	which is a check that agrees with whatever the constant says.
+	*/
+	_ = net.set_option(accepted, .Receive_Timeout, 500 * time.Millisecond)
+	leftover: [4096]u8
+	behind, more := conn_read(conn, leftover[:])
+	testing.expectf(
+		t,
+		!more,
+		"%d bytes were still on their way when the drain gave up, and the close will send an RST over them",
+		behind,
+	)
+
+	net.close(accepted)
+	thread.join(sender)
+
+	reply := make([dynamic]u8, 0, 4096, context.temp_allocator)
+	for len(reply) < 4096 {
+		chunk: [512]u8
+		n, rerr := net.recv_tcp(client, chunk[:])
+		if rerr != nil {
+			testing.expectf(t, false, "the answer did not survive the close: %v", rerr)
+			return
+		}
+		if n == 0 {
+			break
+		}
+		append(&reply, ..chunk[:n])
+	}
+	testing.expectf(
+		t,
+		strings.has_prefix(string(reply[:]), "HTTP/1.1 400 "),
+		"the client read %q, expected the 400 that was written",
+		string(reply[:min(len(reply), 40)]),
+	)
+	free_all(context.temp_allocator)
 }
