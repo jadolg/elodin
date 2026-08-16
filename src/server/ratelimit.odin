@@ -244,6 +244,10 @@ rate_bucket :: proc(r: ^Rate_Limiter, client: net.Endpoint, now_ns: i64) -> ^Rat
 	key := prefix_key(r, client.address)
 	b := &r.buckets[key % RRL_BUCKETS]
 
+	// What both pools have accrued since either was last charged, read once: the
+	// collision check below weighs it and the refill afterwards spends it.
+	gained := elapsed_tokens(r, b.last_ns, now_ns)
+
 	if b.key != key {
 		/*
 		Somebody else's bucket, or one never used.
@@ -260,7 +264,6 @@ rate_bucket :: proc(r: ^Rate_Limiter, client: net.Endpoint, now_ns: i64) -> ^Rat
 		is the flood-clears-the-accounting hole again, reached through whichever
 		transport the owner was not using.
 		*/
-		gained := elapsed_tokens(r, b.last_ns, now_ns)
 		refilled :=
 			b.key == 0 ||
 			(b.tokens[.Datagram] + gained >= r.capacity && b.tokens[.Stream] + gained >= r.capacity)
@@ -269,12 +272,13 @@ rate_bucket :: proc(r: ^Rate_Limiter, client: net.Endpoint, now_ns: i64) -> ^Rat
 			for &tokens in b.tokens {
 				tokens = r.capacity
 			}
-			b.last_ns = now_ns
 			b.over = 0
+			// Full as of now, so there is nothing left of the elapsed time to
+			// bring forward below.
+			gained = 0
 		}
 	}
 
-	gained := elapsed_tokens(r, b.last_ns, now_ns)
 	for &tokens in b.tokens {
 		tokens = min(r.capacity, tokens + gained)
 	}
