@@ -137,8 +137,13 @@ serve_metrics :: proc(s: ^Server, l: ^Listeners, socket: net.TCP_Socket, client:
 	_ = net.set_option(socket, .Receive_Timeout, METRICS_TIMEOUT)
 	_ = net.set_option(socket, .Send_Timeout, METRICS_TIMEOUT)
 
+	// `peer` is filled in although nothing here charges the rate limiter, so that
+	// it is not a zero endpoint waiting for something that does: `prefix_key` maps
+	// an address it cannot read to one bucket, which would put every scrape in the
+	// prefix of nobody.
 	conn := Conn {
 		socket = socket,
+		peer   = client,
 	}
 	r := Http_Reader {
 		conn = conn,

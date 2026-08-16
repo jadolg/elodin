@@ -991,6 +991,9 @@ complexity here.
 */
 @(private)
 serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string) {
+	// Whether this connection has anything the close could take back, which is
+	// what decides whether the refusal below drains first - see `stream_linger`.
+	answered := false
 	for {
 		length_buf: [2]u8
 		if !conn_read_full(conn, length_buf[:]) {
@@ -1026,10 +1029,18 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 		this server never read are still in the receive queue, and closing a socket
 		in that state takes the answers already written down with it. See
 		`stream_linger`.
+
+		Only when there is something to take, though: a connection whose very first
+		query is over the budget - which under a flood of short connections is all
+		of them - has written nothing for the reset to discard, so the drain would
+		buy nothing and cost up to `STREAM_LINGER_TIMEOUT` of one of
+		`max_connections`, which is the slot this close exists to hand back.
 		*/
 		if !stream_rate_check(s.limiter, conn.peer, time.tick_now()) {
 			report_rate_limited(client, proto)
-			stream_linger(conn)
+			if answered {
+				stream_linger(conn)
+			}
 			return
 		}
 
@@ -1046,6 +1057,7 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 		if !conn_write_all(conn, framed) {
 			return
 		}
+		answered = true
 		free_all(context.temp_allocator)
 	}
 }
@@ -1091,6 +1103,11 @@ would be lost is a 429.
 Discarded rather than framed and answered: the budget is spent, and what these
 bytes ask is the thing being refused. Past either bound the close goes ahead and
 takes the RST with it, which is no worse than not draining at all.
+
+Reached only from a connection that has answered something, for the same reason:
+with nothing written there is nothing for the RST to take back, and the drain
+would be a quarter of a second of one of `max_connections` spent protecting
+nothing.
 */
 @(private)
 stream_linger :: proc(conn: Conn) {

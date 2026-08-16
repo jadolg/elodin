@@ -35,6 +35,14 @@ serving one would have. The wait is short and applies per read, because these ar
 bytes a client that has already sent its request line has already written: what
 must not happen is a whole `client_timeout` spent on a client that announced a
 body and then went quiet.
+
+The same value bounds the drain as a whole, which the per-read wait alone does
+not. A client trickling a byte at a time stays inside a per-read timeout for as
+long as it likes, so a drain counted only in bytes would be somewhere to sit and
+hold one of `max_connections` for hours - and a refusal that costs more than an
+answer is one worth provoking, which the 429 in `serve_doh_request` makes any
+client able to reach the endpoint able to do at will. See `stream_linger`, which
+is bounded the same way.
 */
 HTTP_LINGER_BYTES :: MAX_HEADER_BYTES + MAX_DOH_BODY
 HTTP_LINGER_TIMEOUT :: 1 * time.Second
@@ -707,16 +715,17 @@ which is the bare closed connection the status was there to replace.
 
 Discarded rather than parsed: `keep_alive` is false on every path that gets here,
 so nothing further on this connection is answered and what these bytes say does
-not matter. A client that stops short of what it declared, or that keeps sending
-past `HTTP_LINGER_BYTES`, ends the drain on the timeout or the limit rather than
-holding the thread.
+not matter. A client that stops short of what it declared, that keeps sending past
+`HTTP_LINGER_BYTES`, or that trickles for longer than `HTTP_LINGER_TIMEOUT`, ends
+the drain on the timeout, the limit or the deadline rather than holding the thread.
 */
 @(private)
 http_linger :: proc(conn: Conn) {
 	_ = net.set_option(conn.socket, .Receive_Timeout, HTTP_LINGER_TIMEOUT)
+	start := time.tick_now()
 	chunk: [4096]u8
 	discarded := 0
-	for discarded < HTTP_LINGER_BYTES {
+	for discarded < HTTP_LINGER_BYTES && time.tick_since(start) < HTTP_LINGER_TIMEOUT {
 		n, ok := conn_read(conn, chunk[:])
 		if !ok {
 			return
