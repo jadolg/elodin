@@ -565,6 +565,116 @@ test_doh_refuses_a_query_over_the_rate_limit :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+/*
+The drain after a 429 does not sit out its deadline on a client that has gone
+quiet.
+
+`http_linger` reads what the client had already sent before the connection closes,
+so that closing on unread bytes does not send an RST and have the client's kernel
+throw the 429 away along with them - see `http_linger`. A client that sent one
+query and nothing else has nothing there to read, and every client that can
+address this endpoint can be that client: a 429 asks for no more than a question
+the budget has no room for. Waiting a whole `HTTP_LINGER_TIMEOUT` for bytes that
+are not coming makes the refusal a cheaper way to hold one of `max_connections`
+than a question that gets answered is.
+
+The client here never shuts its send side down, so the drain's first read has
+nothing to return and no end of stream to end it early either; what ends it is
+`HTTP_LINGER_IDLE`. The 429 still has to arrive - what is bounded is how long the
+drain waits, not whether it runs.
+*/
+@(test)
+test_doh_refusal_does_not_wait_out_a_silent_client :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the bound port: %v", berr)
+		return
+	}
+
+	client, derr := net.dial_tcp_from_endpoint(bound)
+	if derr != nil {
+		testing.expectf(t, false, "cannot dial the listener: %v", derr)
+		return
+	}
+	defer net.close(client)
+
+	body := strings.builder_make(context.temp_allocator)
+	strings.write_string(&body, "POST /dns-query HTTP/1.1\r\nHost: dns.example\r\n")
+	strings.write_string(&body, "Content-Type: application/dns-message\r\nContent-Length: ")
+	strings.write_int(&body, dns.HEADER_SIZE)
+	strings.write_string(&body, "\r\n\r\n")
+	for _ in 0 ..< dns.HEADER_SIZE {
+		strings.write_byte(&body, 0)
+	}
+	if !send_all(t, client, strings.to_string(body)) {
+		return
+	}
+
+	accepted, _, aerr := net.accept_tcp(listener)
+	if aerr != nil {
+		testing.expectf(t, false, "nothing connected: %v", aerr)
+		return
+	}
+	defer net.close(accepted)
+	// Longer than the drain is allowed to take, so that a regression shows up as a
+	// slow `serve_doh` rather than as a read that gave up on the request.
+	_ = net.set_option(accepted, .Receive_Timeout, 2 * time.Second)
+
+	cfg := config.default_config()
+	cfg.listeners.doh.path = "/dns-query"
+	s := Server {
+		cfg = &cfg,
+	}
+	s.limiter = make_rate_limiter(1, 2)
+	defer destroy_rate_limiter(s.limiter)
+
+	peer := net.Endpoint {
+		address = net.IP4_Loopback,
+		port    = 40001,
+	}
+	for _ in 0 ..< RRL_BURST_SECONDS {
+		testing.expect(
+			t,
+			stream_rate_check(s.limiter, peer, time.tick_now()),
+			"the stream budget refused a query it had room for",
+		)
+	}
+
+	start := time.tick_now()
+	serve_doh(&s, Conn{socket = accepted, peer = peer}, "test")
+	spent := time.tick_since(start)
+
+	testing.expectf(
+		t,
+		spent < HTTP_LINGER_TIMEOUT / 2,
+		"the refusal took %v, which is the drain waiting out a client that had stopped sending",
+		spent,
+	)
+
+	_ = net.set_option(client, .Receive_Timeout, 500 * time.Millisecond)
+	answer := strings.builder_make(context.temp_allocator)
+	for {
+		chunk: [4096]u8
+		n, rerr := net.recv_tcp(client, chunk[:])
+		if rerr != nil || n <= 0 {
+			break
+		}
+		strings.write_bytes(&answer, chunk[:n])
+	}
+	testing.expect(
+		t,
+		strings.contains(strings.to_string(answer), "HTTP/1.1 429"),
+		"the bounded drain cost the client its 429",
+	)
+	free_all(context.temp_allocator)
+}
+
 @(private = "file")
 send_all :: proc(t: ^testing.T, socket: net.TCP_Socket, raw: string) -> bool {
 	sent := 0

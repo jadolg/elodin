@@ -27,25 +27,34 @@ MAX_DOH_BODY :: 64 * 1024
 
 /*
 How much of a refused request `http_linger` reads and throws away before the
-connection closes on it, and how long it waits for each read.
+connection closes on it, how long it waits for any one read, and how long the
+whole of it may take.
 
 The size is a request this endpoint would have read in full anyway - the header
 limit plus the largest body it accepts - so draining one costs no more than
-serving one would have. The wait is short and applies per read, because these are
-bytes a client that has already sent its request line has already written: what
-must not happen is a whole `client_timeout` spent on a client that announced a
-body and then went quiet.
+serving one would have.
 
-The same value bounds the drain as a whole, which the per-read wait alone does
-not. A client trickling a byte at a time stays inside a per-read timeout for as
-long as it likes, so a drain counted only in bytes would be somewhere to sit and
-hold one of `max_connections` for hours - and a refusal that costs more than an
-answer is one worth provoking, which the 429 in `serve_doh_request` makes any
-client able to reach the endpoint able to do at will. See `stream_linger`, which
-is bounded the same way.
+The idle wait applies per read and is short because of what these bytes are: a
+client that has already sent its request line wrote them before it could have
+read the refusal, so what the close would otherwise take back from it is in this
+server's receive queue already, and a read of a queue with something in it
+returns without waiting at all. Time spent waiting past that is time spent on a
+client that has stopped sending, holding one of `max_connections` while it does -
+and a refusal that costs more than an answer is one worth provoking, which the
+429 in `serve_doh_request` makes any client able to reach the endpoint able to do
+at will. A second of it, per connection, for nothing, is the shape of that: one
+over-budget query and then silence is a cheaper way to spend a slot than asking a
+question is.
+
+The deadline bounds the drain as a whole, which the idle wait alone does not. A
+client sending a byte inside every wait stays inside all of them for as long as it
+likes, so a drain counted only in bytes and idle time would be somewhere to sit
+and hold a slot for hours; past the deadline the close goes ahead. See
+`stream_linger`, which is bounded the same way.
 */
 HTTP_LINGER_BYTES :: MAX_HEADER_BYTES + MAX_DOH_BODY
 HTTP_LINGER_TIMEOUT :: 1 * time.Second
+HTTP_LINGER_IDLE :: 50 * time.Millisecond
 
 /*
 What the connection's read buffer starts at, and what it is put back to between
@@ -717,11 +726,12 @@ Discarded rather than parsed: `keep_alive` is false on every path that gets here
 so nothing further on this connection is answered and what these bytes say does
 not matter. A client that stops short of what it declared, that keeps sending past
 `HTTP_LINGER_BYTES`, or that trickles for longer than `HTTP_LINGER_TIMEOUT`, ends
-the drain on the timeout, the limit or the deadline rather than holding the thread.
+the drain on the idle wait, the limit or the deadline rather than holding the
+thread.
 */
 @(private)
 http_linger :: proc(conn: Conn) {
-	_ = net.set_option(conn.socket, .Receive_Timeout, HTTP_LINGER_TIMEOUT)
+	_ = net.set_option(conn.socket, .Receive_Timeout, HTTP_LINGER_IDLE)
 	start := time.tick_now()
 	chunk: [4096]u8
 	discarded := 0
