@@ -234,16 +234,19 @@ exchange_with_cookie :: proc(
 		return response, .None
 	}
 	/*
-	`stripped` is a fresh buffer with the cookie taken out, so `response` is
-	now superseded. It has to be freed either way we leave here.
+	`stripped` is a fresh buffer with the cookie taken out, so the reply `send`
+	returned is now superseded and has to be freed before we leave — the option
+	is present on this path (the guard above returned otherwise), so the strip
+	always produces a distinct buffer rather than handing back the input.
 
-	On the arena paths this is a no-op — the per-request scratch arena reclaims
-	it on `free_all` regardless. But on the race path `allocator` is the process
-	heap (a race worker can outlive the caller's arena), and there nothing else
-	ever frees it: left behind, it leaks one buffer per forwarded query for the
-	life of the process.
+	On the arena paths freeing it is a no-op — the per-request scratch arena
+	reclaims it on `free_all` regardless. But on the race path `allocator` is the
+	process heap (a race worker can outlive the caller's arena), and there
+	nothing else ever frees it: left behind, it leaks one buffer per forwarded
+	query for the life of the process. Deleted before `return`, not on a defer:
+	`response` is a named result, so `return stripped` would rebind it and a
+	deferred delete would free the buffer we just handed back.
 	*/
-	defer delete(response, allocator)
 	stripped, ok := dns.remove_edns_option(response, .Cookie, allocator)
 	if !ok {
 		// Failing closed, the way the client-facing side does when it cannot take
@@ -251,8 +254,10 @@ exchange_with_cookie :: proc(
 		// the one outcome the paragraph above exists to prevent, and losing it is
 		// the cheaper mistake: the group still has other servers to ask.
 		logx.warnf("upstream %s: could not strip the server cookie from a reply", u.spec.name)
+		delete(response, allocator)
 		return nil, .Bad_Response
 	}
+	delete(response, allocator)
 	return stripped, .None
 }
 
