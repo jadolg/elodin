@@ -211,9 +211,9 @@ WINDOW_UPDATE for - and this path is reached by precisely the client that is
 sending faster than it is being answered, so a refusal that can stall the reader
 would deepen what it exists to relieve.
 
-Not counted here. `rate_check` has already counted it as limited=, which is the
-figure that says the budget is what turned the request away; dropped= is about
-queries this server could not keep up with, and `h2_shed` is where that is
+Not counted here. `stream_rate_check` has already counted it as limited=, which
+is the figure that says the budget is what turned the request away; dropped= is
+about queries this server could not keep up with, and `h2_shed` is where that is
 counted.
 
 The stream is refused rather than the connection closed, which is where this
@@ -288,7 +288,7 @@ h2_charged :: proc(ctx: ^H2_Context, req: ^h2.Request) -> bool {
 	if endpoint != ctx.path {
 		return false
 	}
-	_, _, _, is_query := h2_query_message(ctx, req)
+	_, _, _, is_query := h2_query_message(req)
 	return is_query
 }
 
@@ -312,7 +312,6 @@ decode on the ones a browser sends by GET.
 */
 @(private)
 h2_query_message :: proc(
-	ctx: ^H2_Context,
 	req: ^h2.Request,
 ) -> (
 	message: []u8,
@@ -362,7 +361,7 @@ build_h2_response :: proc(ctx: ^H2_Context, req: ^h2.Request) -> (resp: h2.Respo
 	// The status is built here rather than by the check, so that the refusal is
 	// logged and formatted once - on the worker, by the call that wants the message
 	// - and not again by `h2_charged` on the reader thread.
-	message, status, why, is_query := h2_query_message(ctx, req)
+	message, status, why, is_query := h2_query_message(req)
 	if !is_query {
 		return h2_error(status, why), true
 	}
