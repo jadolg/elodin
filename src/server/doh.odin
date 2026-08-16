@@ -1,7 +1,6 @@
 package server
 
 import "core:encoding/base64"
-import "core:net"
 import "core:strings"
 import "core:time"
 import "elodin:dns"
@@ -759,7 +758,9 @@ answer.
 */
 @(private)
 http_linger :: proc(conn: Conn, idle: time.Duration) {
-	_ = net.set_option(conn.socket, .Receive_Timeout, idle)
+	// Not `net.set_option`: over DoH the connection is a TLS one, where the socket
+	// option stopped applying at the handshake - see `conn_set_read_timeout`.
+	conn_set_read_timeout(conn, idle)
 	start := time.tick_now()
 	chunk: [4096]u8
 	discarded := 0

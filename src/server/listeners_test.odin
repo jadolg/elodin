@@ -8,6 +8,7 @@ import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:pool"
+import "elodin:tlsx"
 
 /*
 Shutdown has to release the loops' contexts after the work that holds them, not
@@ -480,4 +481,32 @@ test_a_refused_pipeline_keeps_the_answers_already_written :: proc(t: ^testing.T)
 	*/
 	n, rerr := net.recv_tcp(client, reply[:])
 	testing.expectf(t, n == 0 && rerr == nil, "the close was not graceful: %d bytes, %v", n, rerr)
+}
+
+/*
+The drains' short read wait reaches a TLS connection, which the socket option it
+used to be written as did not.
+
+`tlsx` reads SO_RCVTIMEO once, at the handshake, and then puts the socket into
+non-blocking mode and waits on the deadline the connection carries instead. So a
+`net.set_option` afterwards changes nothing a TLS read looks at, and the drains -
+which are reached over DoT and DoH as often as over TCP - were left waiting out
+`client_timeout` on a client that had stopped sending, holding one of
+`max_connections` for the whole of it. That is what the short wait exists to
+avoid, so it has to be the wait that a TLS read actually uses.
+
+Nothing is handshaked here: what is under test is which field the wait lands in,
+and a bare `tlsx.Conn` carries both of them. The write deadline is asserted too -
+a drain shortens its reads and has no business saying what a write should wait
+for.
+*/
+@(test)
+test_a_drain_shortens_a_tls_read_as_well :: proc(t: ^testing.T) {
+	tls := tlsx.Conn{}
+	tlsx.set_timeouts(&tls, 10 * time.Second, 10 * time.Second)
+
+	conn_set_read_timeout(Conn{tls = &tls}, STREAM_LINGER_IDLE)
+
+	testing.expect_value(t, time.Duration(tls.read_timeout_ns), STREAM_LINGER_IDLE)
+	testing.expect_value(t, time.Duration(tls.write_timeout_ns), 10 * time.Second)
 }

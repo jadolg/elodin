@@ -567,6 +567,20 @@ set_timeouts :: proc(conn: ^Conn, read, write: time.Duration) {
 	sync.atomic_store(&conn.write_timeout_ns, i64(write))
 }
 
+/*
+Change how long a read waits and leave the write deadline where it is.
+
+For a caller that shortens its reads for a moment without a view on what the
+connection's writes should be waiting for - draining what a client had already
+sent before closing on it, where the read wait is a bound on the drain and the
+write wait is still the connection's. `set_timeouts` would need the writer's
+figure passed back in to leave it alone, which is a value that caller has no
+business knowing.
+*/
+set_read_timeout :: proc(conn: ^Conn, read: time.Duration) {
+	sync.atomic_store(&conn.read_timeout_ns, i64(read))
+}
+
 @(private)
 Op :: enum u8 {
 	Read,

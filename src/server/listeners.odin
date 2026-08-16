@@ -1144,7 +1144,7 @@ would be time out of one of `max_connections` spent protecting nothing.
 */
 @(private)
 stream_linger :: proc(conn: Conn) {
-	_ = net.set_option(conn.socket, .Receive_Timeout, STREAM_LINGER_IDLE)
+	conn_set_read_timeout(conn, STREAM_LINGER_IDLE)
 	start := time.tick_now()
 	chunk: [4096]u8
 	discarded := 0
@@ -1171,6 +1171,30 @@ Conn :: struct {
 	cannot change.
 	*/
 	peer:   net.Endpoint,
+}
+
+/*
+Bound how long one read on this connection waits.
+
+`net.set_option` is not enough on its own, which is the whole reason this exists.
+`tlsx` picks SO_RCVTIMEO up at the handshake and then puts the socket into
+non-blocking mode, so a TLS read waits on the deadline the connection carries
+rather than on the socket option - and a `set_option` afterwards reaches nothing.
+Both drains that shorten their reads - `stream_linger` and `http_linger` - are
+reached over DoT and DoH as often as over TCP, where the option alone would have
+left them waiting out the whole of `client_timeout` for bytes that are not coming,
+holding one of `max_connections` while it did. That is the cost the short wait was
+written to avoid.
+
+Read only: the write deadline is the connection's, not this moment's.
+*/
+@(private)
+conn_set_read_timeout :: proc(c: Conn, wait: time.Duration) {
+	if c.tls != nil {
+		tlsx.set_read_timeout(c.tls, wait)
+		return
+	}
+	_ = net.set_option(c.socket, .Receive_Timeout, wait)
 }
 
 @(private)
