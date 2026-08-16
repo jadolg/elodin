@@ -98,16 +98,15 @@ h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	in and for the same reason: a request that is not going to be answered is work
 	not worth doing, and queueing is work.
 
-	Only requests for the DNS endpoint, as `h2_shed`'s counter is: the budget is
-	denominated in answers to questions, and a .mobileconfig download or a
-	scanner's 404 is neither - see the note in `serve_doh_request`, which charges at
-	the same point for the same reason.
+	Only requests that are questions, as `h2_shed`'s counter is: the budget is
+	denominated in answers to questions, and a .mobileconfig download, a scanner's
+	404 and a POST that names the wrong content type are none of them one - see the
+	note in `serve_doh_request`, which charges at the same point for the same
+	reason. `h2_charged` is what says which is which.
 	*/
-	if endpoint, _ := h2_split_path(req.path); endpoint == ctx.path {
-		if !stream_rate_check(ctx.server.limiter, ctx.peer, time.tick_now()) {
-			h2_rate_limited(ctx, hc, req)
-			return
-		}
+	if h2_charged(ctx, req) && !stream_rate_check(ctx.server.limiter, ctx.peer, time.tick_now()) {
+		h2_rate_limited(ctx, hc, req)
+		return
 	}
 
 	job := new(H2_Job)
@@ -262,9 +261,87 @@ h2_answer :: proc(data: rawptr) {
 	h2.respond(hc, req.stream_id, resp)
 }
 
+/*
+Whether this request is one the response budget is denominated in.
+
+Answered on the connection's reader thread, because that is where the charge is,
+and answerable there because none of it is a lookup: the endpoint is a string
+compare and the rest is the request as it arrived. Without it the budget was spent
+by anything at all addressed to the DNS path - a POST with the wrong content type,
+a `dns` parameter that is not base64, twelve bytes short of a header - none of
+which reach the resolver, the cache or an upstream, and all of which could
+therefore starve the clients sharing their prefix while costing this server
+nothing it needed a budget for. The HTTP/1.1 endpoint has always charged after
+these same checks; this is that, one thread earlier.
+*/
+@(private)
+h2_charged :: proc(ctx: ^H2_Context, req: ^h2.Request) -> bool {
+	endpoint, _ := h2_split_path(req.path)
+	if endpoint != ctx.path {
+		return false
+	}
+	_, _, _, is_query := h2_query_message(ctx, req)
+	return is_query
+}
+
+/*
+The DNS message a request to the DoH endpoint is asking about, or the status that
+says it was not asking about one.
+
+Split out of `build_h2_response` because `h2_charged` needs the question it
+answers - is this a query? - a thread before the message itself is wanted, and
+the two must agree: a request charged here and refused there would spend a budget
+on a 400, and one refused here and charged there would let the same 400 through
+for free.
+
+Called twice per query as a result, once for the verdict and once for the
+message. What the second call costs is a base64 decode of a `:path` that HPACK's
+`MAX_HEADER_LIST` already bounds at 32 KiB, which is cheaper than the alternative:
+the decode lands in `context.temp_allocator`, and on the reader thread that is the
+arena `h2.serve` resets between frames, so carrying it across to the worker would
+mean copying every message out to the heap - a cost on every query, to save a
+decode on the ones a browser sends by GET.
+*/
+@(private)
+h2_query_message :: proc(
+	ctx: ^H2_Context,
+	req: ^h2.Request,
+) -> (
+	message: []u8,
+	status: int,
+	why: string,
+	ok: bool,
+) {
+	_, query := h2_split_path(req.path)
+	switch req.method {
+	case "POST":
+		if req.content_type != "" && !strings.has_prefix(req.content_type, DOH_CONTENT_TYPE) {
+			return nil, 415, "unsupported media type", false
+		}
+		message = req.body
+	case "GET":
+		encoded, found := query_param(query, "dns")
+		if !found {
+			return nil, 400, "missing dns parameter", false
+		}
+		decoded, dok := decode_dns_param(encoded)
+		if !dok || len(decoded) == 0 {
+			return nil, 400, "malformed dns parameter", false
+		}
+		message = decoded
+	case:
+		return nil, 405, "method not allowed", false
+	}
+
+	if len(message) < dns.HEADER_SIZE {
+		return nil, 400, "message too short", false
+	}
+	return message, 0, "", true
+}
+
 @(private)
 build_h2_response :: proc(ctx: ^H2_Context, req: ^h2.Request) -> (resp: h2.Response, ok: bool) {
-	path, query := h2_split_path(req.path)
+	path, _ := h2_split_path(req.path)
 
 	mc_path := ctx.server.cfg.listeners.doh.mobileconfig_path
 	if mc_path != "" && path == mc_path {
@@ -274,29 +351,12 @@ build_h2_response :: proc(ctx: ^H2_Context, req: ^h2.Request) -> (resp: h2.Respo
 		return h2_error(404, "not found"), true
 	}
 
-	message: []u8
-	switch req.method {
-	case "POST":
-		if req.content_type != "" && !strings.has_prefix(req.content_type, DOH_CONTENT_TYPE) {
-			return h2_error(415, "unsupported media type"), true
-		}
-		message = req.body
-	case "GET":
-		encoded, found := query_param(query, "dns")
-		if !found {
-			return h2_error(400, "missing dns parameter"), true
-		}
-		decoded, dok := decode_dns_param(encoded)
-		if !dok || len(decoded) == 0 {
-			return h2_error(400, "malformed dns parameter"), true
-		}
-		message = decoded
-	case:
-		return h2_error(405, "method not allowed"), true
-	}
-
-	if len(message) < dns.HEADER_SIZE {
-		return h2_error(400, "message too short"), true
+	// The status is built here rather than by the check, so that the refusal is
+	// logged and formatted once - on the worker, by the call that wants the message
+	// - and not again by `h2_charged` on the reader thread.
+	message, status, why, is_query := h2_query_message(ctx, req)
+	if !is_query {
+		return h2_error(status, why), true
 	}
 
 	answer, _, handled := handle_query(ctx.server, message, .DoH, ctx.client, context.temp_allocator)

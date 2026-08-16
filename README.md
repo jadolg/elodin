@@ -827,6 +827,20 @@ Over HTTP/2 the stream is refused with a 429 and the connection stays, since one
 over-budget request is no reason to take the requests in flight beside it down as
 well.
 
+What the budget is spent on is a question, on every transport. Over HTTP that
+means a request has to be one before it is charged: a scanner's 404, a
+`.mobileconfig` download, a POST naming the wrong content type and a `dns=`
+parameter that is not a DNS message reach no resolver, no cache and no upstream,
+and charging them would let anything that can address the endpoint spend the
+budget of the clients sharing its prefix.
+
+A connection cut off this way is drained before it closes. A client that
+pipelines has queries in flight that were never read when the budget ran out, and
+closing a socket in that state resets it rather than ending it — which would have
+the client's kernel throw away the answers that went out before the budget was
+gone. So what is left unread is read and discarded first, briefly and up to a
+bound, and then the connection ends.
+
 That is also the limit of what a slip promises. The TCP retry it invites is
 charged to the same bucket, so it is answered once a token has refilled — two
 milliseconds at the default 500 — and refused like anything else for as long as a

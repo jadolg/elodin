@@ -241,6 +241,10 @@ Flood_Result :: struct {
 	answered:  int,
 	truncated: int,
 	bytes:     int,
+	// Set when the server's close arrived as a reset rather than as the end of the
+	// stream, which is what a close over unread bytes sends. Only
+	// `tcp_pipeline_flood` fills it in; a datagram has nothing to reset.
+	reset:     bool,
 }
 
 udp_flood :: proc(udp_port: int, query: []u8, count: int, drain := 700 * time.Millisecond) -> Flood_Result {
@@ -333,21 +337,22 @@ tcp_pipeline_flood :: proc(tcp_port: int, query: []u8, count: int, drain := 700 
 		sent += n
 	}
 
-	conn := Test_Conn {
-		socket = socket,
-	}
 	res: Flood_Result
 	buf := make([]u8, dns.MAX_MESSAGE, context.temp_allocator)
 	for {
 		length_buf: [2]u8
-		if !conn_read_full(&conn, length_buf[:]) {
+		ok, reset := flood_read_full(socket, length_buf[:])
+		if !ok {
+			res.reset = reset
 			break
 		}
 		length := int(length_buf[0]) << 8 | int(length_buf[1])
 		if length < dns.HEADER_SIZE || length > dns.MAX_MESSAGE {
 			break
 		}
-		if !conn_read_full(&conn, buf[:length]) {
+		ok, reset = flood_read_full(socket, buf[:length])
+		if !ok {
+			res.reset = reset
 			break
 		}
 		res.answered += 1
@@ -357,6 +362,34 @@ tcp_pipeline_flood :: proc(tcp_port: int, query: []u8, count: int, drain := 700 
 		}
 	}
 	return res
+}
+
+/*
+`conn_read_full` for a plain socket, and also how the read ended.
+
+The end of the stream and a reset are the same "no more answers" to the loop
+above, and a world apart to the client: a server that closes with queries still
+unread in its receive queue sends an RST rather than a FIN (RFC 1122 4.2.2.13),
+and the RST has this kernel throw away answers it had already been handed. That
+difference is the whole of what the server's drain before the close is for, so it
+is worth carrying back rather than flattening into `break`. `core:net` spells a
+graceful end as no bytes and no error, and names the other thing
+`Connection_Closed`.
+*/
+@(private)
+flood_read_full :: proc(socket: net.TCP_Socket, buf: []u8) -> (ok: bool, reset: bool) {
+	got := 0
+	for got < len(buf) {
+		n, err := net.recv_tcp(socket, buf[got:])
+		if err != nil {
+			return false, err == net.TCP_Recv_Error.Connection_Closed
+		}
+		if n == 0 {
+			return false, false
+		}
+		got += n
+	}
+	return true, false
 }
 
 // --- DoH ------------------------------------------------------------------

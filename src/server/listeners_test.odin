@@ -364,3 +364,120 @@ test_now_http_date_epoch_is_a_known_thursday :: proc(t: ^testing.T) {
 
 	testing.expect_value(t, got, "Thu, 01 Jan 1970 00:00:00 GMT")
 }
+
+/*
+The answers a refused connection has already written survive the close that
+refuses the rest of it.
+
+A client that pipelines - which RFC 7766 6.2.1.1 allows - has queries in this
+server's receive queue that were never read, because the budget ran out before
+they were reached. Closing a socket in that state sends an RST rather than a FIN
+(RFC 1122 4.2.2.13), and the RST has the client's kernel discard its receive
+buffer: without a drain first, the answers the client was already sent go with the
+queries it was refused, and its `recv` fails where it should have handed over
+those answers and then the end of the stream.
+
+Served by hand rather than through `serve_dns_stream`, which wants a whole server
+behind it. What is under test is the three things the refusal path does and the
+order it does them in - the answer, the drain, the close - and the drain is the
+only one of the three that is new. The client shuts down its sending half so the
+drain ends on the end of the data rather than on `STREAM_LINGER_TIMEOUT`, and can
+still read afterwards.
+*/
+@(test)
+test_a_refused_pipeline_keeps_the_answers_already_written :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the bound port: %v", berr)
+		return
+	}
+
+	client, derr := net.dial_tcp_from_endpoint(bound)
+	if derr != nil {
+		testing.expectf(t, false, "cannot dial the listener: %v", derr)
+		return
+	}
+	defer net.close(client)
+	_ = net.set_option(client, .Receive_Timeout, 3 * time.Second)
+
+	// Bare DNS headers behind the two-byte length prefix, all of them sent before
+	// any is answered, each with a transaction ID of its own as a real client's
+	// would have.
+	STRIDE :: 2 + dns.HEADER_SIZE
+	PIPELINE :: 64
+	pipeline: [PIPELINE * STRIDE]u8
+	for i in 0 ..< PIPELINE {
+		message := pipeline[i * STRIDE:][:STRIDE]
+		message[1] = u8(dns.HEADER_SIZE)
+		message[2], message[3] = u8(i >> 8), u8(i)
+	}
+	sent := 0
+	for sent < len(pipeline) {
+		n, serr := net.send_tcp(client, pipeline[sent:])
+		if serr != nil || n <= 0 {
+			testing.expectf(t, false, "cannot send the pipeline: %v", serr)
+			return
+		}
+		sent += n
+	}
+	_ = net.shutdown(client, .Send)
+
+	accepted, _, aerr := net.accept_tcp(listener)
+	if aerr != nil {
+		testing.expectf(t, false, "nothing connected: %v", aerr)
+		return
+	}
+	_ = net.set_option(accepted, .Receive_Timeout, 3 * time.Second)
+	conn := Conn {
+		socket = accepted,
+	}
+
+	// One query read and answered, which is the connection doing its job, and then
+	// a budget with nothing left in it: what `serve_dns_stream` does from there,
+	// in the order it does it.
+	first: [STRIDE]u8
+	if !conn_read_full(conn, first[:]) {
+		testing.expect(t, false, "the first query never arrived")
+		return
+	}
+	answer := first
+	// QR, so what goes back is an answer and not the question echoed.
+	answer[4] = 0x80
+	if !conn_write_all(conn, answer[:]) {
+		testing.expect(t, false, "the answer was not written")
+		return
+	}
+	stream_linger(conn)
+	net.close(accepted)
+
+	reply: [STRIDE]u8
+	got := 0
+	for got < len(reply) {
+		n, rerr := net.recv_tcp(client, reply[got:])
+		if rerr != nil {
+			testing.expectf(t, false, "the answer did not survive the close: %v", rerr)
+			return
+		}
+		if n == 0 {
+			testing.expect(t, false, "the connection ended before the answer arrived")
+			return
+		}
+		got += n
+	}
+	testing.expectf(t, reply == answer, "the client read % x, expected the answer that was written", reply)
+
+	/*
+	And the connection ended rather than resetting. `core:net` spells a graceful
+	close as no bytes and no error, where it documents `Connection_Closed` as the
+	other thing - so this is the assertion that fails on an RST even if the answer
+	above happened to be read before one arrived.
+	*/
+	n, rerr := net.recv_tcp(client, reply[:])
+	testing.expectf(t, n == 0 && rerr == nil, "the close was not graceful: %d bytes, %v", n, rerr)
+}

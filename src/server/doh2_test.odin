@@ -423,3 +423,54 @@ test_doh2_shed_counts_only_queries :: proc(t: ^testing.T) {
 	)
 	testing.expect_value(t, got.dropped, u64(0))
 }
+
+/*
+Nor is a request the endpoint turns down on its framing, addressed to the DNS path
+though it is.
+
+A `dns` parameter that is not base64 - or a missing one, or a POST naming the
+wrong content type, or a message short of a DNS header - is answered out of the
+request and nothing else: no resolver, no cache, no upstream, none of the costs
+this bound exists to hold down. Charged, they would let anything able to address
+`/dns-query` spend the budget of the clients sharing its prefix, without even the
+expense of asking a question - a cheaper flood than the one the limiter was added
+for. `h2_charged` is what draws the line, and it draws it with the same checks the
+worker answers by, so the two cannot come apart.
+*/
+@(test)
+test_doh2_rate_limit_charges_only_well_formed_queries :: proc(t: ^testing.T) {
+	// See the note in the first test.
+	context.allocator = runtime.heap_allocator()
+
+	cfg := config.default_config()
+	cfg.listeners.doh.path = "/dns-query"
+	cfg.server.max_pending = 8
+
+	limiter := make_rate_limiter(1, 0)
+	defer destroy_rate_limiter(limiter)
+	// Nothing left for a query, let alone for something that is not one.
+	for _ in 0 ..< RRL_BURST_SECONDS {
+		rate_check(limiter, H2_PEER, time.tick_now())
+	}
+
+	// The endpoint, and a parameter with no base64 in it at all.
+	got := serve_one(
+		&cfg,
+		"/dns-query?dns=%%%%",
+		"malformed dns parameter",
+		occupy = false,
+		limiter = limiter,
+	)
+	defer delete(got.output)
+
+	answer := string(got.output[:])
+	testing.expect(
+		t,
+		strings.contains(answer, "malformed dns parameter"),
+		"the request was not answered 400",
+	)
+	testing.expect(t, !strings.contains(answer, "429"), "a request that is not a query was charged to the budget")
+
+	limited, _ := rate_limit_stats(limiter)
+	testing.expect_value(t, limited, u64(0))
+}

@@ -1020,9 +1020,16 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 		under heavy load or attack, which is the case this is, and a client that
 		wants another answer is free to open one - which costs it a handshake, and
 		over DoT and DoH that is the expensive end of the exchange.
+
+		What the client has already sent is drained before the close, because the
+		client this is reached by is the one that pipelined: the queries it sent and
+		this server never read are still in the receive queue, and closing a socket
+		in that state takes the answers already written down with it. See
+		`stream_linger`.
 		*/
 		if !stream_rate_check(s.limiter, conn.peer, time.tick_now()) {
 			report_rate_limited(client, proto)
+			stream_linger(conn)
 			return
 		}
 
@@ -1040,6 +1047,63 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 			return
 		}
 		free_all(context.temp_allocator)
+	}
+}
+
+/*
+How much of a refused connection `stream_linger` reads and throws away, and how
+long it may spend doing it.
+
+The size is one message at its largest, which is what this connection would have
+read next anyway, and it covers the case that gets here with room to spare: a
+client pipelining hundreds of questions has sent hundreds of question-sized
+messages, which is a few kilobytes between them and not a few megabytes.
+
+The deadline is what a receive timeout alone does not give. That timeout bounds
+one read, and a client trickling a byte at a time stays inside it for as long as
+it likes - so a drain counted only in bytes would be somewhere for the client
+that has just proved it sends faster than it is answered to sit, holding one of
+`max_connections` while it does. Bounded by the clock as well, the whole of it is
+over in a quarter of a second and the close goes ahead.
+*/
+@(private)
+STREAM_LINGER_BYTES :: 2 + dns.MAX_MESSAGE
+@(private)
+STREAM_LINGER_TIMEOUT :: 250 * time.Millisecond
+
+/*
+Read and throw away what the client had already sent, so that the answers already
+written to it are not lost to the close that follows.
+
+`serve_dns_stream` closes on a client that is over its budget, and a client that
+pipelines - which RFC 7766 6.2.1.1 allows - has queries in this server's receive
+queue that were never read, because the budget ran out before they were reached.
+Closing a socket in that state does not send a FIN but an RST (RFC 1122
+4.2.2.13), and an RST arriving at a client that has not read yet has its kernel
+discard what is already in its receive buffer: the answers this connection did
+write, before the budget ran out, are thrown away along with the queries it
+declined to read, and the client's `recv` fails where it would have returned
+those answers and then the end of the stream. Cutting a flood short is the point
+of the close; taking back what was already answered is not. The DoH endpoint
+drains before its own refusal for the same reason - see `http_linger`, where what
+would be lost is a 429.
+
+Discarded rather than framed and answered: the budget is spent, and what these
+bytes ask is the thing being refused. Past either bound the close goes ahead and
+takes the RST with it, which is no worse than not draining at all.
+*/
+@(private)
+stream_linger :: proc(conn: Conn) {
+	_ = net.set_option(conn.socket, .Receive_Timeout, STREAM_LINGER_TIMEOUT)
+	start := time.tick_now()
+	chunk: [4096]u8
+	discarded := 0
+	for discarded < STREAM_LINGER_BYTES && time.tick_since(start) < STREAM_LINGER_TIMEOUT {
+		n, ok := conn_read(conn, chunk[:])
+		if !ok {
+			return
+		}
+		discarded += n
 	}
 }
 

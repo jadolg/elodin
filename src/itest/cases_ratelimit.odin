@@ -265,6 +265,15 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 			)
 			check(r, limited.answered > 0, "the budget answered nothing at all")
 			check_eq_int(r, limited.truncated, 0, "truncated answers on a connection")
+			/*
+			And the answers that did come back were not taken away again. The
+			connection is cut off with the rest of the pipeline still unread, and
+			closing a socket in that state sends an RST, which has this client's
+			kernel discard whatever of those answers it had not read yet - so the
+			server drains before it closes. See `stream_linger`; `reset` is what
+			says which kind of ending arrived.
+			*/
+			check(r, !limited.reset, "the connection was reset, so answers already sent were lost")
 		}
 	}
 	end_case(r)
