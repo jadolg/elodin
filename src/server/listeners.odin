@@ -1016,6 +1016,27 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 		metered at all when nothing on it can be reflected, and why it is not
 		metered out of the same pool.
 
+		Charged on a message of a plausible length rather than on one that parses,
+		which is where the DoH endpoints charge too, and worth writing down because
+		it reads like the place they do not. What `serve_doh_request` and
+		`h2_charged` keep out of the budget is a request that was never a question
+		put to this service - a scanner's 404, a .mobileconfig download, a POST
+		naming the wrong content type, a `dns` parameter that is not base64 - and
+		none of that has a spelling here, where a length prefix and a socket are the
+		whole envelope. Neither of them looks inside the message either: the floor
+		all three share is `dns.HEADER_SIZE`, and the length check above turns
+		anything under it away without charging, so the three are already charging
+		for the same thing.
+
+		Not moved behind the parse, then. A message this long that does not decode
+		is answered - `handle_query` builds it a FORMERR out of its own header - so
+		it spends the budget on a response, like everything else the budget counts.
+		The one length-legal message that goes unanswered is a response arriving
+		where queries are read, and the DoH paths charge for that one too before
+		turning it into a 500. Which leaves the parse buying nothing but a rule that
+		differed from the UDP loop's, and that loop charges a datagram before it has
+		looked at it at all.
+
 		The connection ends rather than this query being skipped. Skipping it
 		leaves a client that framed a correct query waiting for an answer that is
 		never coming, until `client_timeout` closes the connection anyway, and
