@@ -1065,25 +1065,36 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 }
 
 /*
-How much of a refused connection `stream_linger` reads and throws away, and how
-long it may spend doing it.
+How much of a refused connection `stream_linger` reads and throws away, how long
+it waits for any one read, and how long the whole of it may take.
 
 The size is one message at its largest, which is what this connection would have
 read next anyway, and it covers the case that gets here with room to spare: a
 client pipelining hundreds of questions has sent hundreds of question-sized
 messages, which is a few kilobytes between them and not a few megabytes.
 
-The deadline is what a receive timeout alone does not give. That timeout bounds
-one read, and a client trickling a byte at a time stays inside it for as long as
-it likes - so a drain counted only in bytes would be somewhere for the client
-that has just proved it sends faster than it is answered to sit, holding one of
-`max_connections` while it does. Bounded by the clock as well, the whole of it is
-over in a quarter of a second and the close goes ahead.
+The idle wait is short because of what these bytes are: a client that pipelined
+wrote them before it could have known the budget had run out, so they are in this
+server's receive queue already and a read of a queue with something in it returns
+without waiting at all. Once it is empty there is nothing more coming that this
+drain is for, and a client is not obliged to shut its sending half down to say so
+- so a per-read wait as long as the whole deadline would have every refused
+connection hold one of `max_connections` for the full deadline whether or not it
+had anything left to give. `http_linger` is bounded the same way, for the same
+reason.
+
+The deadline bounds the drain as a whole, which the idle wait alone does not: a
+client sending a byte inside every wait stays inside all of them for as long as it
+likes, so a drain counted only in bytes and idle time would be somewhere for the
+client that has just proved it sends faster than it is answered to sit. Past
+either bound the close goes ahead.
 */
 @(private)
 STREAM_LINGER_BYTES :: 2 + dns.MAX_MESSAGE
 @(private)
 STREAM_LINGER_TIMEOUT :: 250 * time.Millisecond
+@(private)
+STREAM_LINGER_IDLE :: 50 * time.Millisecond
 
 /*
 Read and throw away what the client had already sent, so that the answers already
@@ -1108,12 +1119,11 @@ takes the RST with it, which is no worse than not draining at all.
 
 Reached only from a connection that has answered something, for the same reason:
 with nothing written there is nothing for the RST to take back, and the drain
-would be a quarter of a second of one of `max_connections` spent protecting
-nothing.
+would be time out of one of `max_connections` spent protecting nothing.
 */
 @(private)
 stream_linger :: proc(conn: Conn) {
-	_ = net.set_option(conn.socket, .Receive_Timeout, STREAM_LINGER_TIMEOUT)
+	_ = net.set_option(conn.socket, .Receive_Timeout, STREAM_LINGER_IDLE)
 	start := time.tick_now()
 	chunk: [4096]u8
 	discarded := 0
