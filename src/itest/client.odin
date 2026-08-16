@@ -289,6 +289,76 @@ udp_flood :: proc(udp_port: int, query: []u8, count: int, drain := 700 * time.Mi
 	return res
 }
 
+/*
+Send `count` queries down one TCP connection back to back, then read the answers
+until the server has no more to give.
+
+The flood a datagram limiter never sees. Nothing here waits for an answer before
+sending the next query - which RFC 7766 6.2.1.1 explicitly allows a client to do -
+so one connection out of `max_connections` carries as fast a query rate as the
+socket does. All of it goes out before anything is read: a few dozen bytes per
+query is far short of what a send buffer holds, so the server needs not have read a
+byte for the write to finish.
+
+The reading ends on the server closing the connection, which is what being over
+the budget looks like on a stream: there is nothing to truncate, so an answer that
+does not arrive arrives as the end of the connection. A run that is never cut off
+ends on the receive timeout instead.
+*/
+tcp_pipeline_flood :: proc(tcp_port: int, query: []u8, count: int, drain := 700 * time.Millisecond) -> Flood_Result {
+	socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = tcp_port})
+	if err != nil {
+		return {}
+	}
+	defer net.close(socket)
+	_ = net.set_option(socket, .Receive_Timeout, drain)
+	_ = net.set_option(socket, .Send_Timeout, CLIENT_TIMEOUT)
+
+	stride := 2 + len(query)
+	framed := make([]u8, count * stride, context.temp_allocator)
+	for i in 0 ..< count {
+		message := framed[i * stride:][:stride]
+		message[0] = u8(len(query) >> 8)
+		message[1] = u8(len(query))
+		copy(message[2:], query)
+		// A transaction ID of its own per query, as a real client would.
+		message[2], message[3] = u8(i >> 8), u8(i)
+	}
+	sent := 0
+	for sent < len(framed) {
+		n, serr := net.send_tcp(socket, framed[sent:])
+		if serr != nil || n <= 0 {
+			break
+		}
+		sent += n
+	}
+
+	conn := Test_Conn {
+		socket = socket,
+	}
+	res: Flood_Result
+	buf := make([]u8, dns.MAX_MESSAGE, context.temp_allocator)
+	for {
+		length_buf: [2]u8
+		if !conn_read_full(&conn, length_buf[:]) {
+			break
+		}
+		length := int(length_buf[0]) << 8 | int(length_buf[1])
+		if length < dns.HEADER_SIZE || length > dns.MAX_MESSAGE {
+			break
+		}
+		if !conn_read_full(&conn, buf[:length]) {
+			break
+		}
+		res.answered += 1
+		res.bytes += 2 + length
+		if buf[2] & 0x02 != 0 {
+			res.truncated += 1
+		}
+	}
+	return res
+}
+
 // --- DoH ------------------------------------------------------------------
 
 Http_Result :: struct {

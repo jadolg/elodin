@@ -519,6 +519,33 @@ serve_doh_request :: proc(s: ^Server, conn: Conn, req: Http_Request_In, path: st
 		return send_http_error(conn, "doh", 400, "message too short", req.keep_alive)
 	}
 
+	/*
+	Charged here rather than where the request is read, so that what is charged is
+	a query: a 404 from a scanner, a .mobileconfig download and a request this
+	endpoint refuses on its framing are none of them responses to a question, and
+	none of them reach the resolver, the cache or an upstream. The budget is
+	denominated in the ones that do.
+
+	429 rather than the bare close the length-prefixed transports get, RFC 6585 4
+	being written for exactly this: over HTTP a status is something a client can
+	read and act on. No `Retry-After` with it, though the RFC allows one: the field
+	counts whole seconds, and at the default 500 a second the budget has a token
+	back in two milliseconds, so the smallest value it can carry would send a client
+	away for hundreds of times the wait there actually is.
+
+	`false` for `keep_alive`, so the connection ends with the refusal for the
+	reason `serve_dns_stream` closes - and the drain before it closes is what keeps
+	the 429 from being lost, this being reached by a client that pipelines: closing
+	a socket with bytes still in its receive queue sends an RST, and an RST has the
+	client's kernel discard what it has not read yet. See `http_linger`.
+	*/
+	if !stream_rate_check(s.limiter, conn.peer, time.tick_now()) {
+		report_rate_limited(client, .DoH)
+		_ = send_http_error(conn, "doh", 429, "too many requests", false)
+		http_linger(conn)
+		return false
+	}
+
 	response, _, ok := handle_query(s, query, .DoH, client, context.temp_allocator)
 	if !ok || len(response) == 0 {
 		return send_http_error(conn, "doh", 500, "no response", req.keep_alive)

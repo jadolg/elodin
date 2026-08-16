@@ -8,6 +8,7 @@ import "core:testing"
 import "core:thread"
 import "core:time"
 import "elodin:config"
+import "elodin:dns"
 
 /*
 The DoH reader hands back views into a buffer it goes on appending to.
@@ -450,6 +451,111 @@ test_doh_answers_a_request_that_arrives_split :: proc(t: ^testing.T) {
 	// Ends the handler: with nothing more to read it returns instead of sitting
 	// out its receive timeout.
 	net.shutdown(client, .Send)
+	free_all(context.temp_allocator)
+}
+
+/*
+A query over the budget is answered 429 and the connection ends.
+
+DoH pipelines - `Connection: keep-alive` is what this endpoint advertises - so a
+client sitting on one connection can put queries through it as fast as the socket
+carries them, and until the limiter was charged here that rate was bounded by
+nothing at all: `max_connections` counts connections, and this is one.
+
+429 rather than the bare close TCP and DoT get, because over HTTP there is a
+status to say it with, and `Connection: close` because the refusal ends the
+connection either way.
+
+Nothing behind `handle_query` is wired up in this server - no cache, no filters,
+no upstream group - which is the other half of what this checks: the charge lands
+before the work, so a refused query reaches none of it. A regression that charged
+afterwards would not answer 429 here at all.
+*/
+@(test)
+test_doh_refuses_a_query_over_the_rate_limit :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the bound port: %v", berr)
+		return
+	}
+
+	client, derr := net.dial_tcp_from_endpoint(bound)
+	if derr != nil {
+		testing.expectf(t, false, "cannot dial the listener: %v", derr)
+		return
+	}
+	defer net.close(client)
+
+	// A bare 12-byte DNS header, which is the shortest thing the endpoint takes
+	// for a query and enough to get past the length check ahead of the charge.
+	body := strings.builder_make(context.temp_allocator)
+	strings.write_string(&body, "POST /dns-query HTTP/1.1\r\nHost: dns.example\r\n")
+	strings.write_string(&body, "Content-Type: application/dns-message\r\nContent-Length: ")
+	strings.write_int(&body, dns.HEADER_SIZE)
+	strings.write_string(&body, "\r\n\r\n")
+	for _ in 0 ..< dns.HEADER_SIZE {
+		strings.write_byte(&body, 0)
+	}
+	if !send_all(t, client, strings.to_string(body)) {
+		return
+	}
+	// So `http_linger` after the refusal reaches the end of the connection rather
+	// than sitting out its timeout.
+	net.shutdown(client, .Send)
+
+	accepted, _, aerr := net.accept_tcp(listener)
+	if aerr != nil {
+		testing.expectf(t, false, "nothing connected: %v", aerr)
+		return
+	}
+	defer net.close(accepted)
+	_ = net.set_option(accepted, .Receive_Timeout, 500 * time.Millisecond)
+
+	cfg := config.default_config()
+	cfg.listeners.doh.path = "/dns-query"
+	s := Server {
+		cfg = &cfg,
+	}
+	// One response a second, so the bucket holds two and both are spent below.
+	// The slip is on, which a connection must not use - see `stream_rate_check`.
+	s.limiter = make_rate_limiter(1, 2)
+	defer destroy_rate_limiter(s.limiter)
+
+	peer := net.Endpoint {
+		address = net.IP4_Loopback,
+		port    = 40000,
+	}
+	for _ in 0 ..< RRL_BURST_SECONDS {
+		testing.expect_value(t, rate_check(s.limiter, peer, time.tick_now()), Rate_Verdict.Allow)
+	}
+
+	serve_doh(&s, Conn{socket = accepted, peer = peer}, "test")
+
+	_ = net.set_option(client, .Receive_Timeout, 500 * time.Millisecond)
+	answer := strings.builder_make(context.temp_allocator)
+	for {
+		chunk: [4096]u8
+		n, rerr := net.recv_tcp(client, chunk[:])
+		if rerr != nil || n <= 0 {
+			break
+		}
+		strings.write_bytes(&answer, chunk[:n])
+	}
+
+	head := strings.to_string(answer)
+	testing.expect(t, strings.contains(head, "HTTP/1.1 429"), "an over-budget query was not answered 429")
+	testing.expect(t, strings.contains(head, "Connection: close"), "the refusal left the connection open")
+
+	limited, slipped := rate_limit_stats(s.limiter)
+	testing.expect_value(t, limited, u64(1))
+	// A truncated DNS answer is a UDP answer; nothing here may be counted as one.
+	testing.expect_value(t, slipped, u64(0))
 	free_all(context.temp_allocator)
 }
 

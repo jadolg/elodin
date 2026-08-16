@@ -9,7 +9,7 @@ import "core:time"
 import "elodin:logx"
 
 /*
-Response rate limiting for the UDP listener.
+Response rate limiting.
 
 A datagram carries no proof of where it came from, so an answer sent over UDP
 goes wherever the source address said - which is how a resolver becomes an
@@ -36,6 +36,25 @@ busy NAT therefore still resolves, at the cost of a round trip, while a spoofed
 source gets a truncated answer it cannot follow up.
 
 This is what BIND's `rate-limit` and Knot's RRL do, and the shape is theirs.
+
+The stream transports - TCP, DoT, DoH - are charged against the same budget, for
+the other half of what a flood costs. Amplification is not their problem: a
+handshake settled that whoever is asking is where they said they were, and no
+answer goes anywhere else. What they share with UDP is the work behind an answer,
+which is the upstream round trips and the cache churn, and a client pipelining
+queries down one connection reaches that as fast as the socket allows.
+`server.max_connections` bounds how many clients are here at once, not how fast
+one of them asks, so without this a flood delivered over a handful of connections
+is one the limiter never sees.
+
+One budget across the four rather than one each, because what is being bounded is
+what this server does for one prefix, and a prefix that has spent its budget over
+UDP has spent it. Two budgets would be a way to have twice as much by asking
+twice as many ways.
+
+What differs is what an over-limit query is answered with: `slip` sends a
+truncated answer over UDP and does not apply to a connection, for the reason in
+`stream_rate_check`.
 */
 
 /*
@@ -88,18 +107,22 @@ Rate_Limiter :: struct {
 	*/
 	hash_key:  [16]u8,
 	/*
-	The thread that has called `rate_check`, claimed on the first call.
+	The bucket table, which has as many callers as there are connections.
 
-	The bucket table has no lock because one thread reads the UDP socket, and
-	that is an assumption in a doc comment rather than anything the code
-	enforces. A second reader - the obvious next step if the read loop ever
-	becomes the bottleneck - would not fail loudly: `tokens` would tear, `over`
-	increments would be lost, and the limiter would under-count at exactly the
-	moment it is counting something. So the assumption is written down as state
-	and checked, which turns a silent loss of correctness into a failure the
-	first run finds.
+	One thread reads the UDP socket, but every TCP, DoT and DoH connection is
+	served on a thread of its own and charges the queries it reads from there, so
+	the single-reader assumption this table was written under no longer holds.
+	Unlocked, what that costs is not a crash but a limiter that under-counts at
+	exactly the moment it is counting something: `tokens` read, decremented and
+	written back by two threads at once loses one of the two decrements, and
+	`over` loses slips the same way.
+
+	One mutex for the table rather than one per bucket, or an atomic bucket. The
+	critical section is a hash, a compare and a few flops - shorter than the
+	syscall that delivered the query and orders of magnitude shorter than
+	answering it - so a finer lock would buy contention on a lock nobody holds.
 	*/
-	owner:     int,
+	lock:      sync.Mutex,
 	allocator: mem.Allocator,
 	// Counted here rather than in Stats because these are properties of the
 	// limiter, and read by tests.
@@ -142,22 +165,29 @@ Rate_Verdict :: enum u8 {
 /*
 Charge one response to `client`'s prefix and say what to do with it.
 
-Called from the UDP read loop and from nowhere else. That loop is one thread,
-which is why nothing here is locked; a second reader would need this table to be
-locked or split per thread. Under `-debug` the first caller claims the limiter
-and a second one asserts, so that requirement is enforced rather than merely
-recorded here - see `claim_reader`.
+Called from the UDP read loop, from every stream connection's thread and from
+each HTTP/2 reader, which is why the table is locked - see `lock`.
 
 `now` is passed in rather than read here so a test can run a bucket through an
 hour in a few microseconds.
+
+`slip` is whether the every-Nth-one-truncated escape is available for this query,
+and it is the caller's to decide because it depends on the transport: over UDP it
+is what keeps a real client behind a busy NAT resolving, and on a connection there
+is nothing for it to do. `stream_rate_check` is the caller that says no, and says
+why.
 */
-rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) -> Rate_Verdict {
+rate_check :: proc(
+	r: ^Rate_Limiter,
+	client: net.Endpoint,
+	now: time.Tick,
+	slip := true,
+) -> Rate_Verdict {
 	if r == nil {
 		return .Allow
 	}
-	when ODIN_DEBUG {
-		assert(claim_reader(r), "rate_check called from a second thread; the bucket table is not locked")
-	}
+	sync.mutex_lock(&r.lock)
+	defer sync.mutex_unlock(&r.lock)
 
 	key := prefix_key(r, client.address)
 	b := &r.buckets[key % RRL_BUCKETS]
@@ -195,7 +225,7 @@ rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) -> Ra
 
 	sync.atomic_add(&r.limited, 1)
 	b.over += 1
-	if r.slip > 0 && int(b.over) % r.slip == 0 {
+	if slip && r.slip > 0 && int(b.over) % r.slip == 0 {
 		sync.atomic_add(&r.slipped, 1)
 		return .Truncate
 	}
@@ -203,27 +233,26 @@ rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) -> Ra
 }
 
 /*
-Take ownership of the limiter for this thread, or report that somebody else has
-it.
+Charge one query read off a connection and say whether to answer it.
 
-Compiled into every build and called only from the debug one, so the check costs
-nothing where it would be paid for and is still a procedure a test can call
-directly - which matters, because the failure it guards against is one that
-needs two threads to produce and `assert` is the wrong instrument for a test to
-observe.
+Everything over the budget is refused, `slip` included, so the caller has one
+thing to do with a refusal rather than two. Both of the things that make a
+truncated answer worth sending are missing on a connection: the TC bit is an
+instruction to ask again over TCP, and the client is already there, so a client
+that acted on it would ask again on the connection it is holding - the same query,
+charged again - and one that did not would give up. Nor is there an address to
+protect: the handshake established where the client is, so the small answer is not
+standing in for a large one aimed at somebody else.
 
-The exchange is what makes the first caller the owner without a lock: two
-threads racing to claim an unowned limiter both see zero, both write, and the
-one whose write landed second reads back an id that is not its own.
+`rate_check` is told not to slip rather than having its `Truncate` reinterpreted
+here, because `slipped=` in the stats line counts truncated answers that went out,
+and a verdict nobody acts on must not be counted among them.
+
+What the caller does with a `false` is stop serving: see `serve_dns_stream` for
+why the connection ends rather than the query being quietly skipped.
 */
-@(private)
-claim_reader :: proc(r: ^Rate_Limiter) -> bool {
-	me := sync.current_thread_id()
-	if owner := sync.atomic_load(&r.owner); owner != 0 {
-		return owner == me
-	}
-	previous, _ := sync.atomic_compare_exchange_strong(&r.owner, 0, me)
-	return previous == 0 || previous == me
+stream_rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) -> bool {
+	return rate_check(r, client, now, slip = false) == .Allow
 }
 
 @(private)
@@ -271,7 +300,7 @@ start_rate_limiter :: proc(s: ^Server) -> bool {
 	s.limiter = make_rate_limiter(cfg.responses_per_second, cfg.slip)
 	if cfg.slip > 0 {
 		logx.infof(
-			"rate limit: %d responses/s per client prefix (/24, /64); 1 in %d over that answered truncated",
+			"rate limit: %d responses/s per client prefix (/24, /64); 1 in %d over that answered truncated over UDP, and over a connection nothing is",
 			cfg.responses_per_second,
 			cfg.slip,
 		)

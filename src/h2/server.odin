@@ -1250,6 +1250,14 @@ close_stream :: proc(c: ^Conn, stream_id: u32) {
 	stream_destroy(c, s)
 }
 
+/*
+The `:status` value as HPACK wants it, which is a string.
+
+A table rather than a conversion so that the digits are static storage and no
+response has to allocate for three bytes. Every status this server sends is
+listed; a status that is not falls back to 500, so a caller adding one has to add
+it here as well - which is a thing to know, and the reason it is written down.
+*/
 @(private)
 status_text :: proc(status: int) -> string {
 	switch status {
@@ -1265,6 +1273,8 @@ status_text :: proc(status: int) -> string {
 		return "413"
 	case 415:
 		return "415"
+	case 429:
+		return "429"
 	case 500:
 		return "500"
 	case 503:

@@ -11,15 +11,27 @@ the source address said. That is what makes an open resolver an amplifier: a
 small spoofed query buys the sender a large response aimed at somebody else. The
 bound on it is a budget per destination prefix, and the two runs below are the
 same flood against a server with that budget and against one without.
+
+The last case is the same budget over TCP, where amplification is not what is
+being bounded - a handshake settled where the client is - but the work behind an
+answer is, and a client pipelining down one connection reaches it as fast as the
+socket allows.
 */
 
+// `tcp_port` of 0 leaves the stream listener off, which is what every case that
+// is about datagrams wants: a listener nothing connects to would only be a port
+// for the suite to collide on.
 @(private = "file")
-config_rate_limit :: proc(udp_port, upstream_port: int, limit: string) -> string {
+config_rate_limit :: proc(udp_port, upstream_port: int, limit: string, tcp_port := 0) -> string {
+	tcp := "{ enabled: false }"
+	if tcp_port > 0 {
+		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port)
+	}
 	return fmt.tprintf(
 		`log: {{ level: warn }}
 listeners:
   udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
+  tcp: %s
 server:
   # Pinned rather than derived from whatever machine the suite is running on:
   # the flood below has to fit inside max_pending, which is workers * 8, for
@@ -35,6 +47,7 @@ cache: {{ enabled: true, max_entries: 100 }}
 blocking: {{ enabled: false }}
 `,
 		udp_port,
+		tcp,
 		limit,
 		upstream_port,
 	)
@@ -174,6 +187,84 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 					unlimited.bytes,
 				)
 			}
+		}
+	}
+	end_case(r)
+
+	/*
+	The same flood down one TCP connection, which the limiter used not to see at
+	all.
+
+	`server.max_connections` bounds how many clients are here, not how fast one of
+	them asks, so a client that pipelines - which RFC 7766 6.2.1.1 allows - had the
+	upstream round trips and the cache churn of an unmetered flood for the price of
+	one connection.
+
+	Both runs are here rather than only the limited one, because the ceiling below is
+	a bound only if the flood arrives: a run that answered forty queries because forty
+	was all that got through the socket would pass it having tested nothing. The
+	unlimited server answers all two hundred on the one connection.
+
+	Nothing comes back truncated. There is nothing to truncate on a stream - the TC
+	bit tells a client to ask again over TCP and it is already there - so the budget
+	running out shows up as the connection ending, which is what stops the read.
+	*/
+	start_case(r, "rate limit: a flood pipelined over TCP is cut to the budget")
+	{
+		udp_port := next_port(r)
+		tcp_port := next_port(r)
+		srv, ok := start_server(
+			r,
+			Server_Options {
+				config = config_rate_limit(udp_port, upstream_port, "enabled: false", tcp_port),
+				udp_port = udp_port,
+				tcp_port = tcp_port,
+			},
+		)
+		if check(r, ok, "the unlimited server did not start") {
+			defer stop_server(&srv)
+			unlimited := tcp_pipeline_flood(tcp_port, query, QUERIES)
+			check(
+				r,
+				unlimited.answered >= QUERIES - 5,
+				"only %d of %d answered with the limiter off, so the pipeline did not arrive",
+				unlimited.answered,
+				QUERIES,
+			)
+		}
+
+		limited_udp_port := next_port(r)
+		limited_tcp_port := next_port(r)
+		srv2, ok2 := start_server(
+			r,
+			Server_Options {
+				config = config_rate_limit(
+					limited_udp_port,
+					upstream_port,
+					fmt.tprintf("enabled: true, responses_per_second: %d, slip: 2", RATE),
+					limited_tcp_port,
+				),
+				udp_port = limited_udp_port,
+				tcp_port = limited_tcp_port,
+			},
+		)
+		if check(r, ok2, "the limited server did not start") {
+			defer stop_server(&srv2)
+			limited := tcp_pipeline_flood(limited_tcp_port, query, QUERIES)
+
+			// The burst, plus whatever the second or so of draining refilled. The
+			// readiness probes spend a little of it first, which only tightens this.
+			ceiling := BURST + RATE * 2
+			check(
+				r,
+				limited.answered <= ceiling,
+				"%d answers to %d pipelined queries, past the %d the budget allows",
+				limited.answered,
+				QUERIES,
+				ceiling,
+			)
+			check(r, limited.answered > 0, "the budget answered nothing at all")
+			check_eq_int(r, limited.truncated, 0, "truncated answers on a connection")
 		}
 	}
 	end_case(r)

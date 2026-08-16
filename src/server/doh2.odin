@@ -1,7 +1,9 @@
 package server
 
+import "core:net"
 import "core:strings"
 import "core:sync"
+import "core:time"
 import "elodin:dns"
 import "elodin:h2"
 import "elodin:logx"
@@ -31,6 +33,10 @@ H2_Context :: struct {
 	server: ^Server,
 	conn:   ^tlsx.Conn,
 	client: string,
+	// The endpoint `client` was formatted from, which is what the rate limiter
+	// needs: a prefix cannot be hashed back out of the printed form. See `Conn`,
+	// where the other stream transports carry the same thing.
+	peer:   net.Endpoint,
 	path:   string,
 }
 
@@ -56,11 +62,12 @@ h2_write :: proc(user: rawptr, buf: []u8) -> bool {
 }
 
 @(private)
-serve_doh2 :: proc(s: ^Server, conn: ^tlsx.Conn, client: string) {
+serve_doh2 :: proc(s: ^Server, conn: ^tlsx.Conn, client: string, peer: net.Endpoint) {
 	ctx := H2_Context {
 		server = s,
 		conn   = conn,
 		client = client,
+		peer   = peer,
 		path   = s.cfg.listeners.doh.path,
 	}
 
@@ -85,6 +92,23 @@ serve_doh2 :: proc(s: ^Server, conn: ^tlsx.Conn, client: string) {
 @(private)
 h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	ctx := cast(^H2_Context)hc.user
+
+	/*
+	Charged before the request is queued, which is the order the UDP loop charges
+	in and for the same reason: a request that is not going to be answered is work
+	not worth doing, and queueing is work.
+
+	Only requests for the DNS endpoint, as `h2_shed`'s counter is: the budget is
+	denominated in answers to questions, and a .mobileconfig download or a
+	scanner's 404 is neither - see the note in `serve_doh_request`, which charges at
+	the same point for the same reason.
+	*/
+	if endpoint, _ := h2_split_path(req.path); endpoint == ctx.path {
+		if !stream_rate_check(ctx.server.limiter, ctx.peer, time.tick_now()) {
+			h2_rate_limited(ctx, hc, req)
+			return
+		}
+	}
 
 	job := new(H2_Job)
 	job.ctx = ctx
@@ -167,6 +191,41 @@ h2_shed :: proc(ctx: ^H2_Context, hc: ^h2.Conn, req: ^h2.Request) {
 		ctx.server.cfg.server.max_pending,
 	)
 	h2.respond(hc, req.stream_id, h2.Response{status = 503})
+	h2.request_destroy(hc, req)
+}
+
+/*
+Turn one request away for being over the response budget.
+
+The shape is `h2_shed`'s and for the same reasons: on the connection's reader
+thread, a status and no body. A body goes out through `h2.write_body`, which parks
+on flow-control credit that this thread is the one that would read the
+WINDOW_UPDATE for - and this path is reached by precisely the client that is
+sending faster than it is being answered, so a refusal that can stall the reader
+would deepen what it exists to relieve.
+
+Not counted here. `rate_check` has already counted it as limited=, which is the
+figure that says the budget is what turned the request away; dropped= is about
+queries this server could not keep up with, and `h2_shed` is where that is
+counted.
+
+The stream is refused rather than the connection closed, which is where this
+parts company with the other three transports. There is no way to say "this
+connection is over its budget" in HTTP/2 short of GOAWAY, and one over-limit
+stream is not a reason to take the requests in flight beside it down as well: a
+browser has a handful open on one connection, and they were not all sent by
+whatever is flooding. A client that keeps asking keeps being answered 429, which
+costs it a stream and this server a HEADERS frame.
+*/
+@(private)
+h2_rate_limited :: proc(ctx: ^H2_Context, hc: ^h2.Conn, req: ^h2.Request) {
+	// Nothing is released after the line, as in `h2_shed`: `h2.serve` resets this
+	// arena between frames.
+	logx.debugf(
+		"doh/h2: refusing a request from %s, its prefix is over server.rate_limit.responses_per_second",
+		ctx.client,
+	)
+	h2.respond(hc, req.stream_id, h2.Response{status = 429})
 	h2.request_destroy(hc, req)
 }
 

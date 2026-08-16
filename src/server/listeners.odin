@@ -486,6 +486,28 @@ report_shed :: proc(client: net.Endpoint, limit: int) {
 }
 
 /*
+Say which client the response budget turned away, and on which transport.
+
+Debug only and not through `report_once`, for the reason `report_shed` is not:
+these are already counted as limited= in the stats line, so an operator watching
+for them has a figure a flood cannot make them miss, and this is for the question
+that figure raises next - which clients, and where.
+
+Unlike the two above, `client` arrives formatted: the stream handlers build it
+once per connection and hold it for the connection's life, so there is no address
+to render here and nothing to release afterwards. `logx.debugf` returns without
+formatting anything when debug is off.
+*/
+@(private)
+report_rate_limited :: proc(client: string, proto: Protocol) {
+	logx.debugf(
+		"%s: closing the connection from %s, its prefix is over server.rate_limit.responses_per_second",
+		proto_name(proto),
+		client,
+	)
+}
+
+/*
 Say why a connection could not be given a thread, once, and then quietly.
 
 The same reasoning as `report_refusal`, and reached the same way: a peer opening
@@ -928,7 +950,7 @@ stream_job :: proc(data: rawptr) {
 	switch job.ctx.proto {
 	case .TCP:
 		defer net.close(job.socket)
-		serve_dns_stream(s, {socket = job.socket}, .TCP, client)
+		serve_dns_stream(s, {socket = job.socket, peer = job.client}, .TCP, client)
 	case .DoT:
 		// Read once, under the atomic that `reload_tls` swaps: a reload landing
 		// mid-accept must not hand this connection a half-updated context.
@@ -940,7 +962,7 @@ stream_job :: proc(data: rawptr) {
 			return
 		}
 		defer tlsx.close(conn)
-		serve_dns_stream(s, {socket = job.socket, tls = conn}, .DoT, client)
+		serve_dns_stream(s, {socket = job.socket, tls = conn, peer = job.client}, .DoT, client)
 	case .DoH:
 		ctx := sync.atomic_load(&job.ctx.listeners.doh_ctx)
 		conn, err := tlsx.server_accept(ctx, job.socket)
@@ -951,9 +973,9 @@ stream_job :: proc(data: rawptr) {
 		}
 		defer tlsx.close(conn)
 		if tlsx.alpn_protocol(conn) == "h2" {
-			serve_doh2(s, conn, client)
+			serve_doh2(s, conn, client, job.client)
 		} else {
-			serve_doh(s, {socket = job.socket, tls = conn}, client)
+			serve_doh(s, {socket = job.socket, tls = conn, peer = job.client}, client)
 		}
 	case .UDP:
 	// not reachable: UDP has no accept loop
@@ -984,6 +1006,26 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 			return
 		}
 
+		/*
+		Charged before the answer is built, as the UDP loop charges before it
+		queues, and against the same budget - see the head of `ratelimit.odin` for
+		why a connection is metered at all when nothing on it can be reflected.
+
+		The connection ends rather than this query being skipped. Skipping it
+		leaves a client that framed a correct query waiting for an answer that is
+		never coming, until `client_timeout` closes the connection anyway, and
+		leaves this thread reading the rest of the flood in the meantime; closing
+		says so now and hands the slot back to `max_connections`. RFC 7766 6.2.3
+		has a server free to hold connections open for no time at all when it is
+		under heavy load or attack, which is the case this is, and a client that
+		wants another answer is free to open one - which costs it a handshake, and
+		over DoT and DoH that is the expensive end of the exchange.
+		*/
+		if !stream_rate_check(s.limiter, conn.peer, time.tick_now()) {
+			report_rate_limited(client, proto)
+			return
+		}
+
 		response, _, ok := handle_query(s, query, proto, client, context.temp_allocator)
 		if !ok || len(response) == 0 {
 			free_all(context.temp_allocator)
@@ -1005,6 +1047,16 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 Conn :: struct {
 	socket: net.TCP_Socket,
 	tls:    ^tlsx.Conn,
+	/*
+	Who is on the other end, for the rate limiter.
+
+	Carried on the connection because that is what it is a property of, and
+	because the `client` the handlers already have is the endpoint formatted for
+	a log line - which is not something `prefix_key` can hash a prefix back out
+	of. Asking the kernel again per query would be a syscall for an answer that
+	cannot change.
+	*/
+	peer:   net.Endpoint,
 }
 
 @(private)

@@ -294,64 +294,174 @@ test_implausible_sources_are_refused :: proc(t: ^testing.T) {
 }
 
 /*
-The bucket table has no lock, and this is what says so out loud.
+A query read off a connection is refused whenever it is over the budget, `slip`
+and all.
 
-`rate_check` is written for one caller, and the cost of a second is not a crash
-but a limiter that quietly under-counts: torn `tokens`, lost `over`. A second
-reader is the obvious thing to add the day the read loop becomes the bottleneck,
-so the assumption is held as state and claimed by whoever calls first.
+The TC bit is an instruction to ask again over TCP, and a client that is already
+there can do nothing with it but ask again on the connection it is holding - the
+same query, charged again. So the slip is a UDP answer, and what must not happen
+is a stream caller reinterpreting a `Truncate` into a refusal after `rate_check`
+has counted it as an answer that went out: `slipped=` is a figure about truncated
+responses this server sent.
 
-`claim_reader` rather than `rate_check` itself, because what `rate_check` does
-with the answer is assert, and a test cannot observe an abort.
+The limiter here has a slip configured, which is what makes that observable at
+all, and the last part of the test is the same limiter still slipping for UDP -
+this is the caller's choice per query, not a mode the bucket is put into.
 */
 @(test)
-test_limiter_is_claimed_by_one_thread :: proc(t: ^testing.T) {
-	r := make_rate_limiter(100, 2)
+test_stream_queries_are_refused_rather_than_truncated :: proc(t: ^testing.T) {
+	RATE :: 5
+	SLIP :: 2
+	r := make_rate_limiter(RATE, SLIP)
 	defer destroy_rate_limiter(r)
 
-	testing.expect(t, claim_reader(r), "the first caller was not given the limiter")
-	testing.expect(t, claim_reader(r), "the owner was refused its own limiter on the second call")
-
-	Probe :: struct {
-		limiter: ^Rate_Limiter,
-		claimed: bool,
+	client := v4(198, 51, 100, 4)
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		testing.expect(t, stream_rate_check(r, client, at(0)), "a connection was refused a query the budget had room for")
 	}
-	probe := Probe {
-		limiter = r,
+	for _ in 0 ..< 20 {
+		testing.expect(t, !stream_rate_check(r, client, at(0)), "an over-budget query was answered on a connection")
 	}
-	other := thread.create_and_start_with_poly_data(&probe, proc(p: ^Probe) {
-		p.claimed = claim_reader(p.limiter)
-	})
-	testing.expect(t, other != nil, "could not start a second thread")
-	thread.join(other)
-	thread.destroy(other)
 
-	testing.expect(t, !probe.claimed, "a second thread was allowed into an unlocked bucket table")
-	// And the owner still owns it: a refused claim must not have taken it away.
-	testing.expect(t, claim_reader(r), "the owner lost the limiter to a thread that was refused")
+	limited, slipped := rate_limit_stats(r)
+	testing.expect_value(t, limited, u64(20))
+	testing.expect_value(t, slipped, u64(0))
+
+	// The same limiter, a prefix of its own, over UDP: still every SLIPth one.
+	over_udp := v4(198, 51, 101, 4)
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		rate_check(r, over_udp, at(0))
+	}
+	truncated := 0
+	for _ in 0 ..< 10 {
+		if rate_check(r, over_udp, at(0)) == .Truncate {
+			truncated += 1
+		}
+	}
+	testing.expectf(t, truncated == 10 / SLIP, "%d of 10 over-limit datagrams were truncated, expected %d", truncated, 10 / SLIP)
 }
 
-// A limiter nobody has called yet belongs to nobody, so the first thread to
-// arrive gets it whichever thread that is - the read loop is not this one.
+/*
+One budget per prefix, not one per transport.
+
+What the limit bounds is what this server does for one prefix, so a prefix that
+has spent its budget answering datagrams has spent it - otherwise the same flood
+delivered two ways gets twice as much, and the way to have more of it is to ask
+over more transports.
+*/
 @(test)
-test_limiter_owner_is_the_first_caller_not_the_maker :: proc(t: ^testing.T) {
-	r := make_rate_limiter(100, 2)
+test_the_budget_is_shared_across_transports :: proc(t: ^testing.T) {
+	RATE :: 10
+	r := make_rate_limiter(RATE, 0)
 	defer destroy_rate_limiter(r)
 
-	Probe :: struct {
-		limiter: ^Rate_Limiter,
-		claimed: bool,
+	// One address of the prefix spends it all over UDP.
+	client := v4(203, 0, 113, 20)
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Allow)
 	}
-	probe := Probe {
-		limiter = r,
-	}
-	owner := thread.create_and_start_with_poly_data(&probe, proc(p: ^Probe) {
-		p.claimed = claim_reader(p.limiter)
-	})
-	testing.expect(t, owner != nil, "could not start the owning thread")
-	thread.join(owner)
-	thread.destroy(owner)
+	// Another address in the same /24, over a connection, finds nothing left.
+	testing.expect(
+		t,
+		!stream_rate_check(r, v4(203, 0, 113, 21), at(0)),
+		"a connection was served out of a budget UDP had already spent",
+	)
 
-	testing.expect(t, probe.claimed, "a thread that made the first call was refused")
-	testing.expect(t, !claim_reader(r), "the thread that made the limiter was let in after another claimed it")
+	// And the other way about, on a prefix of its own.
+	stream_first := v6(0xcccc, 1)
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		testing.expect(t, stream_rate_check(r, stream_first, at(0)), "the budget refused a query it had room for")
+	}
+	testing.expect_value(t, rate_check(r, v6(0xcccc, 2), at(0)), Rate_Verdict.Drop)
+}
+
+/*
+The bucket table is reached from as many threads as there are connections, and
+this is what says the accounting survives it.
+
+Every stream connection charges the queries it reads on its own thread, so the
+single-reader assumption the table was first written under is gone. What its
+absence costs is not a crash but a limiter that under-counts at the moment it is
+counting something: `tokens` read, decremented and written back by two threads at
+once loses one of the two decrements, and `over` loses slips the same way. Both
+are counted here rather than only the first, because the numbers an operator reads
+are as much of the limiter as the verdicts are.
+
+Every thread charges the same prefix at the same instant, so nothing refills
+during the run and the arithmetic is exact: a full bucket and no more, whoever
+spent it. Unlocked, the total comes out above the capacity - by how much depends
+on the interleaving, which is why the assertion is an equality rather than a
+threshold.
+*/
+@(private = "file")
+Hammer :: struct {
+	limiter:   ^Rate_Limiter,
+	client:    net.Endpoint,
+	rounds:    int,
+	allowed:   int,
+	truncated: int,
+}
+
+@(private = "file")
+hammer :: proc(h: ^Hammer) {
+	for _ in 0 ..< h.rounds {
+		switch rate_check(h.limiter, h.client, at(0)) {
+		case .Allow:
+			h.allowed += 1
+		case .Truncate:
+			h.truncated += 1
+		case .Drop:
+		}
+	}
+}
+
+@(test)
+test_rate_limit_accounts_exactly_under_concurrent_callers :: proc(t: ^testing.T) {
+	RATE :: 100
+	SLIP :: 2
+	THREADS :: 8
+	ROUNDS :: 500
+
+	r := make_rate_limiter(RATE, SLIP)
+	defer destroy_rate_limiter(r)
+
+	client := v4(192, 0, 2, 40)
+	hammers: [THREADS]Hammer
+	threads: [THREADS]^thread.Thread
+	for i in 0 ..< THREADS {
+		hammers[i] = Hammer {
+			limiter = r,
+			client  = client,
+			rounds  = ROUNDS,
+		}
+		threads[i] = thread.create_and_start_with_poly_data(&hammers[i], hammer)
+		if threads[i] == nil {
+			testing.expect(t, false, "could not start a charging thread")
+			return
+		}
+	}
+	allowed, truncated := 0, 0
+	for i in 0 ..< THREADS {
+		thread.join(threads[i])
+		thread.destroy(threads[i])
+		allowed += hammers[i].allowed
+		truncated += hammers[i].truncated
+	}
+
+	testing.expectf(
+		t,
+		allowed == RATE * RRL_BURST_SECONDS,
+		"%d threads spent %d responses out of a bucket holding %d",
+		THREADS,
+		allowed,
+		RATE * RRL_BURST_SECONDS,
+	)
+
+	limited, slipped := rate_limit_stats(r)
+	over := u64(THREADS * ROUNDS - RATE * RRL_BURST_SECONDS)
+	testing.expect_value(t, limited, over)
+	// `over` counted once per over-limit query and never lost, so every SLIPth one
+	// of them slipped - exactly, not approximately.
+	testing.expect_value(t, slipped, over / SLIP)
+	testing.expect_value(t, u64(truncated), over / SLIP)
 }

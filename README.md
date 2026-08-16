@@ -9,7 +9,7 @@ Pi-hole and AdGuard Home, minus the web interface. One binary, one YAML file.
 - Three upstream strategies: failover, round-robin and race
 - Sink lists in hosts, plain-domain and adblock syntax, with allowlists
 - Answer cache with negative caching and optional stale serving
-- Response rate limiting per client prefix on UDP, on by default (see `server.rate_limit`)
+- Response rate limiting per client prefix, across every transport, on by default (see `server.rate_limit`)
 - Client allow list restricting who may query, defaulting to local networks only
 - A ceiling on UDP answer size to bound reflection amplification, on by default
 - Local rewrites (A, AAAA, CNAME, or "answer as if blocked")
@@ -806,12 +806,30 @@ would be spending its neighbour's: charging them would turn a narrowed allow
 list into a way to have the clients beside it dropped. Nothing is sent to a
 refused source, so there is nothing for a response budget to bound.
 
-TCP, DoT and DoH are not rate limited. A connection is established before a
-query arrives on one, so the address is already proven and there is nothing to
-reflect off. What bounds them is `server.allow_from` (see [Who may
-ask](#who-may-ask)), which refuses the connection at accept time, and
-`server.max_connections`, which caps how many connections at once — there is no
-per-client query budget for the stream transports to tune.
+TCP, DoT and DoH are charged against the same budget, for the other half of what
+a flood costs. Amplification is not their problem — a connection is established
+before a query arrives on one, so the address is proven and nothing is reflected
+— but the work behind an answer is the same wherever the query came from, and
+that is the upstream round trips and the cache churn. All three pipeline: one
+connection carries as many queries as the socket will take, and
+`server.max_connections` bounds how many clients are here at once rather than how
+fast one of them asks. Without the budget, a flood delivered over a handful of
+long-lived connections is one the limiter never sees.
+
+One budget across the four transports, not one each: what it bounds is what this
+server does for one prefix, so a prefix that has spent its budget answering
+datagrams has spent it. What differs is the answer an over-budget query gets.
+`slip` is a UDP mechanism — the TC bit tells a client to ask again over TCP, and
+a client that is already there can do nothing with it — so on a connection
+everything over the budget is refused: TCP and DoT are closed, and DoH is
+answered `429 Too Many Requests` and then closed, HTTP having a way to say it.
+Over HTTP/2 the stream is refused with a 429 and the connection stays, since one
+over-budget request is no reason to take the requests in flight beside it down as
+well.
+
+Both counters cover every transport. `elodin_rate_limited_total` counts what was
+withheld wherever it came from; `elodin_rate_limit_slipped_total` counts truncated
+answers, so it only ever moves for UDP.
 
 `cookies.require` is the sharper instrument for an attack actually under way:
 it makes a UDP client prove it can receive at the address it claims before any
@@ -1270,10 +1288,9 @@ upstream traffic by the number of servers.
   queries multiplex onto one connection — but a worker is still held for the
   round trip. Async upstream I/O, or several UDP reader threads behind
   `SO_REUSEPORT`, would lift both this and the item above; neither is needed at
-  the scale measured in the previous section. A second UDP reader would have to
-  lock or shard the rate limiter's bucket table first — it is unlocked because
-  there is one reader, and a debug build asserts that rather than leaving it as
-  a comment for the change to quietly break.
+  the scale measured in the previous section. A second UDP reader is no longer
+  blocked on the rate limiter: its bucket table is behind a mutex, which every
+  stream connection's thread already takes for the queries it reads.
 - **DNS cookies do not cover every query.** Only queries that already carry an
   OPT record are given one on the way upstream, so a non-EDNS client behind
   elodin gets no cookie protection unless DNSSEC validation is on — which it is
@@ -1391,7 +1408,7 @@ What it covers:
 | DoH upstreams | a query resolved over an h2 upstream, one connection multiplexed across queries rather than reopened, fallback to HTTP/1.1 when the upstream does not offer h2 |
 | blocking | all five response modes, hosts vs domains vs adblock semantics, allow precedence, wildcards, modifiers, dnsmasq syntax, unusable rules, case folding |
 | rewrites | A, AAAA, CNAME, wildcard scope, `block`, NODATA for unmatched types |
-| rate limiting | a flood from one source answered in full with the limiter off and cut to the budget with it on, truncated answers over the budget, and the bytes one address can be made to receive compared between the two |
+| rate limiting | a flood from one source answered in full with the limiter off and cut to the budget with it on, truncated answers over the budget, the bytes one address can be made to receive compared between the two, and the same flood pipelined down one TCP connection cut to the same budget with nothing truncated |
 | cache | hits avoid the upstream, TTL countdown, cross-transport reuse, question re-casing, negative caching, key separation by type |
 | upstreams | failover, round-robin, race, health cooldown, TCP and DoT clients, connection pooling, UDP→TCP retry, total outage → SERVFAIL |
 | blocklist downloads | two lists fetched over HTTP and both applied, written to the cache directory, reused on restart without re-fetching, unwritable cache directory degrades to a warning |
