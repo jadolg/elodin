@@ -206,8 +206,12 @@ exchange_with_cookie :: proc(
 			delete(response, allocator)
 			return nil, .Bad_Response
 		}
-		// The retry supersedes this reply; free it before it is overwritten.
+		// The retry supersedes this reply; free it before it is overwritten. Null
+		// the named result in between: `send` can bail through `or_return`, and a
+		// result still pointing at the freed buffer would be one the caller could
+		// read back rather than one it is guaranteed to discard on the error.
 		delete(response, allocator)
+		response = nil
 		response = send(u, retry, timeout, allocator) or_return
 		learn_cookie(u, response)
 		if dns.peek_rcode(response) == .Bad_Cookie {
@@ -235,9 +239,7 @@ exchange_with_cookie :: proc(
 	}
 	/*
 	`stripped` is a fresh buffer with the cookie taken out, so the reply `send`
-	returned is now superseded and has to be freed before we leave — the option
-	is present on this path (the guard above returned otherwise), so the strip
-	always produces a distinct buffer rather than handing back the input.
+	returned is now superseded and has to be freed before we leave.
 
 	On the arena paths freeing it is a no-op — the per-request scratch arena
 	reclaims it on `free_all` regardless. But on the race path `allocator` is the
@@ -257,7 +259,19 @@ exchange_with_cookie :: proc(
 		delete(response, allocator)
 		return nil, .Bad_Response
 	}
-	delete(response, allocator)
+	/*
+	Free the superseded reply only once it is a different buffer. The cookie is
+	present here (the `reply_cookie` guard returned otherwise), so the strip
+	makes a fresh one and this is always the case — but `remove_edns_option`
+	hands the input straight back when it finds no option to take out, and that
+	full-decode guard and this raw option walk are two implementations of "is
+	the cookie present." Comparing the backing pointers rather than trusting
+	them to agree keeps a divergence from turning the free into one that drops
+	the very buffer we return.
+	*/
+	if raw_data(stripped) != raw_data(response) {
+		delete(response, allocator)
+	}
 	return stripped, .None
 }
 
