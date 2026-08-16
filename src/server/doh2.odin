@@ -103,8 +103,16 @@ h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	404 and a POST that names the wrong content type are none of them one - see the
 	note in `serve_doh_request`, which charges at the same point for the same
 	reason. `h2_charged` is what says which is which.
+
+	The limiter is looked at before `h2_charged` is asked, rather than left to
+	`stream_rate_check` to shrug off: deciding whether a request is a query means
+	decoding a GET's `dns` parameter, and with the budget switched off that is a
+	base64 decode per request, on the connection's reader thread, for an answer
+	nothing then reads.
 	*/
-	if h2_charged(ctx, req) && !stream_rate_check(ctx.server.limiter, ctx.peer, time.tick_now()) {
+	if ctx.server.limiter != nil &&
+	   h2_charged(ctx, req) &&
+	   !stream_rate_check(ctx.server.limiter, ctx.peer, time.tick_now()) {
 		h2_rate_limited(ctx, hc, req)
 		return
 	}
