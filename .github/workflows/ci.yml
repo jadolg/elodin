@@ -179,7 +179,9 @@ jobs:
           cache: true
       - run: mise run coverage
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        # Pinned to a full commit SHA (a third-party action, unlike the
+        # first-party actions/* and the toolchain's own jdx/mise-action above).
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
         with:
           files: ./bin/coverage.info
           token: ${{ secrets.CODECOV_TOKEN }}
