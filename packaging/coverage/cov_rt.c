@@ -34,17 +34,20 @@ expects, with no load-bias arithmetic.
 #include <fcntl.h>
 #include <sys/mman.h>
 
+// Where this build drops its per-process coverage files. This is a developer's
+// own coverage run, not a privileged service, so a chosen directory is trusted.
 static const char *cov_dir(void) {
-	const char *d = getenv("ELODIN_COV_DIR");
+	const char *d = getenv("ELODIN_COV_DIR"); // Flawfinder: ignore
 	return (d && *d) ? d : ".";
 }
 
-// A file mmap'd for the lifetime of the process. `base` stays mapped so writes
-// keep landing in the file even after the fd is closed.
+// Create $ELODIN_COV_DIR/cov.<pid>.<suffix>, sized to `bytes`, and mmap it for
+// the lifetime of the process: `base` stays mapped so writes keep landing in the
+// file even after the fd is closed, which is what makes them survive a SIGKILL.
 static void *map_file(const char *suffix, size_t bytes) {
-	char path[4096];
-	snprintf(path, sizeof path, "%s/cov.%d.%s", cov_dir(), (int)getpid(), suffix);
-	int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+	char path[4096]; // Flawfinder: ignore
+	snprintf(path, sizeof path, "%s/cov.%d.%s", cov_dir(), (int)getpid(), suffix); // Flawfinder: ignore
+	int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644); // Flawfinder: ignore
 	if (fd < 0) return 0;
 	void *base = 0;
 	if (ftruncate(fd, (off_t)bytes) == 0) {

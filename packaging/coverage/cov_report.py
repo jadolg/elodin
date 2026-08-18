@@ -13,7 +13,7 @@ and lcov is emitted: a line is DA:<line>,1 if any point on it ran, else 0.
 import glob
 import os
 import struct
-import subprocess
+import subprocess  # nosec B404 - fixed argv (addr2line), no shell, no external input
 import sys
 
 
@@ -39,7 +39,7 @@ def merge_hits(paths, count):
 def symbolize(binary, pcs, addr2line):
     """Run addr2line once over all PCs, returning its line-oriented output."""
     addrs = "\n".join(f"0x{pc:x}" for pc in pcs)
-    proc = subprocess.run(
+    proc = subprocess.run(  # nosec B603 - fixed argv, no shell, tool path from env only
         [addr2line, "-e", binary, "-a", "-f", "-i"],
         input=addrs, capture_output=True, text=True, check=False,
     )
