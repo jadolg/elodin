@@ -1,0 +1,10 @@
+---
+# packaging/coverage/ is build tooling for `mise run coverage`, not part of the
+# shipped server: a ~90-line C shim that provides the SanitizerCoverage callbacks
+# and a Python script that turns the raw counters into lcov. Codacy's hosted
+# analyzers flag safe patterns there — a subprocess call whose program path comes
+# from an env var, getenv/open in the C shim — that are false positives for a
+# developer's own coverage run and are already annotated in-code for the tools
+# that honour inline suppressions. Keep the quality gate focused on src/.
+exclude_paths:
+  - 'packaging/coverage/**'
