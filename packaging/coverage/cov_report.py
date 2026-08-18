@@ -1,109 +1,128 @@
 #!/usr/bin/env python3
-"""
-Turn the raw coverage files that cov_rt.c leaves in $ELODIN_COV_DIR into an
-lcov report for the elodin sources.
+"""Turn the raw files cov_rt.c leaves in $ELODIN_COV_DIR into lcov.
 
 Inputs (per server process, PID in the name):
   cov.<pid>.pcs    uint64 count, then that many instrumented PCs (identical
                    across processes, since they share one binary).
   cov.<pid>.hits   one byte per point, non-zero where that point ran.
 
-The point at index i in .hits corresponds to the PC at index i in .pcs. We
-OR-merge every .hits file, symbolize each PC with addr2line, keep the ones under
-src/, and emit lcov: a line is DA:<line>,1 if any point on it ran, else
-DA:<line>,0.
+The point at index i in .hits is the PC at index i in .pcs. Every .hits file is
+OR-merged, each PC is symbolized with addr2line, the points under src/ are kept,
+and lcov is emitted: a line is DA:<line>,1 if any point on it ran, else 0.
 """
-import glob, os, struct, subprocess, sys
+import glob
+import os
+import struct
+import subprocess
+import sys
+
+
+def read_pcs(path):
+    """Read the PC table written by cov_rt.c: a count then that many uint64 PCs."""
+    with open(path, "rb") as f:
+        (count,) = struct.unpack("<Q", f.read(8))
+        return list(struct.unpack(f"<{count}Q", f.read(8 * count)))
+
+
+def merge_hits(paths, count):
+    """OR-merge every per-process hit bitmap into one list of `count` flags."""
+    merged = bytearray(count)
+    for path in paths:
+        with open(path, "rb") as f:
+            data = f.read()
+        for i in range(min(count, len(data))):
+            if data[i]:
+                merged[i] = 1
+    return merged
+
+
+def symbolize(binary, pcs, addr2line):
+    """Run addr2line once over all PCs, returning its line-oriented output."""
+    addrs = "\n".join(f"0x{pc:x}" for pc in pcs)
+    proc = subprocess.run(
+        [addr2line, "-e", binary, "-a", "-f", "-i"],
+        input=addrs, capture_output=True, text=True, check=False,
+    )
+    if proc.returncode != 0:
+        sys.exit(f"coverage: addr2line failed: {proc.stderr}")
+    return proc.stdout.splitlines()
+
+
+def collect(lines, merged, repo, src_prefix):
+    """Fold addr2line output into {relative_path: {lineno: covered}} for src/.
+
+    addr2line emits, per address, a line "0x..", then function/file:line pairs
+    (several when a PC is inlined). A point is attributed to every src/ frame it
+    names, covered if that point's merged hit bit is set.
+    """
+    cov = {}
+
+    def add(path, lineno, covered):
+        real = os.path.realpath(path)
+        if not real.startswith(src_prefix):
+            return
+        rel = real[len(repo):]
+        per_line = cov.setdefault(rel, {})
+        per_line[lineno] = per_line.get(lineno, False) or covered
+
+    idx = -1
+    i = 0
+    while i < len(lines):
+        if lines[i].startswith("0x"):
+            idx += 1
+            i += 1
+            continue
+        # A function name line, then its file:line line.
+        if i + 1 < len(lines):
+            path, _, lno = lines[i + 1].rpartition(":")
+            lno = lno.split(" ")[0]
+            if lno.isdigit() and path not in ("??", ""):
+                add(path, int(lno), bool(merged[idx]) if 0 <= idx < len(merged) else False)
+            i += 2
+            continue
+        i += 1
+    return cov
+
+
+def write_lcov(cov, out):
+    """Write the coverage map as lcov and return (hit_lines, total_lines)."""
+    total = hits = 0
+    with open(out, "w", encoding="utf-8") as w:
+        for rel in sorted(cov):
+            per_line = cov[rel]
+            w.write(f"SF:{rel}\n")
+            for lno in sorted(per_line):
+                covered = 1 if per_line[lno] else 0
+                w.write(f"DA:{lno},{covered}\n")
+                total += 1
+                hits += covered
+            w.write(f"LF:{len(per_line)}\n")
+            w.write(f"LH:{sum(1 for v in per_line.values() if v)}\n")
+            w.write("end_of_record\n")
+    return hits, total
+
 
 def main():
-    cov_dir = sys.argv[1]
-    binary = sys.argv[2]
-    out = sys.argv[3]
+    """Merge the raw coverage files named on argv into an lcov report."""
+    cov_dir, binary, out = sys.argv[1], sys.argv[2], sys.argv[3]
     addr2line = os.environ.get("ADDR2LINE", "addr2line")
-    repo = os.path.realpath(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))) + "/"
+    here = os.path.abspath(__file__)
+    repo = os.path.realpath(os.path.dirname(os.path.dirname(os.path.dirname(here)))) + "/"
     src_prefix = repo + "src/"
 
     pcs_files = sorted(glob.glob(os.path.join(cov_dir, "cov.*.pcs")))
     hits_files = sorted(glob.glob(os.path.join(cov_dir, "cov.*.hits")))
     if not pcs_files or not hits_files:
-        sys.exit("coverage: no cov.*.pcs / cov.*.hits files in %s" % cov_dir)
+        sys.exit(f"coverage: no cov.*.pcs / cov.*.hits files in {cov_dir}")
 
-    with open(pcs_files[0], "rb") as f:
-        (n,) = struct.unpack("<Q", f.read(8))
-        pcs = list(struct.unpack("<%dQ" % n, f.read(8 * n)))
+    pcs = read_pcs(pcs_files[0])
+    merged = merge_hits(hits_files, len(pcs))
+    cov = collect(symbolize(binary, pcs, addr2line), merged, repo, src_prefix)
+    hits, total = write_lcov(cov, out)
 
-    merged = bytearray(n)
-    for hf in hits_files:
-        with open(hf, "rb") as f:
-            data = f.read()
-        for i in range(min(n, len(data))):
-            if data[i]:
-                merged[i] = 1
+    pct = (100.0 * hits / total) if total else 0.0
+    print(f"coverage: {hits}/{total} lines, {pct:.1f}% across {len(cov)} files -> {out}")
 
-    # Symbolize every PC once. addr2line reads a list of addresses on stdin.
-    addrs = "\n".join("0x%x" % pc for pc in pcs)
-    proc = subprocess.run([addr2line, "-e", binary, "-a", "-f", "-i"],
-                          input=addrs, capture_output=True, text=True)
-    if proc.returncode != 0:
-        sys.exit("coverage: addr2line failed: %s" % proc.stderr)
-
-    # Output groups per address: a line "0x..", then function/file:line pairs
-    # (several when a PC is inlined). We attribute the point to its innermost
-    # frame that falls under src/.
-    idx = -1
-    lines = proc.stdout.splitlines()
-    # file -> {lineno -> covered(bool)}
-    cov = {}
-    i = 0
-    cur_locs = []
-    def flush(point_idx, locs):
-        hit = merged[point_idx] if 0 <= point_idx < n else 0
-        for path, ln in locs:
-            rp = os.path.realpath(path)
-            if not rp.startswith(src_prefix):
-                continue
-            rel = rp[len(repo):]
-            d = cov.setdefault(rel, {})
-            d[ln] = d.get(ln, False) or bool(hit)
-    while i < len(lines):
-        ln = lines[i]
-        if ln.startswith("0x"):
-            if idx >= 0:
-                flush(idx, cur_locs)
-            idx += 1
-            cur_locs = []
-            i += 1
-            continue
-        # function name line, then file:line line
-        if i + 1 < len(lines):
-            floc = lines[i + 1]
-            if ":" in floc:
-                path, _, lno = floc.rpartition(":")
-                lno = lno.split(" ")[0]
-                if lno.isdigit() and path not in ("??", ""):
-                    cur_locs.append((path, int(lno)))
-            i += 2
-            continue
-        i += 1
-    if idx >= 0:
-        flush(idx, cur_locs)
-
-    total = hitc = 0
-    with open(out, "w") as w:
-        for rel in sorted(cov):
-            w.write("SF:%s\n" % rel)
-            d = cov[rel]
-            for lno in sorted(d):
-                c = 1 if d[lno] else 0
-                w.write("DA:%d,%d\n" % (lno, c))
-                total += 1
-                hitc += c
-            w.write("LF:%d\n" % len(d))
-            w.write("LH:%d\n" % sum(1 for v in d.values() if v))
-            w.write("end_of_record\n")
-    pct = (100.0 * hitc / total) if total else 0.0
-    print("coverage: %d/%d lines, %.1f%% across %d files -> %s" %
-          (hitc, total, pct, len(cov), out))
 
 if __name__ == "__main__":
     main()

@@ -55,12 +55,13 @@ static void *map_file(const char *suffix, size_t bytes) {
 	return base;
 }
 
-static uint8_t *g_hits;       // one byte per instrumented point
-static uint32_t *g_guards;    // start of the guard array; index = guard - start
+static uint8_t *g_hits;             // one byte per instrumented point
+static const uint32_t *g_guards;    // start of the guard array; index = guard - start
 
 // pc-table: the full set of instrumented PCs, known at startup. Persist it so
 // the reporter can name every point, hit or not. Every process writes an
 // identical copy; the reporter uses whichever it finds first.
+// cppcheck-suppress unusedFunction // called by the coverage instrumentation
 void __sanitizer_cov_pcs_init(const uintptr_t *beg, const uintptr_t *end) {
 	// Entries are pairs: (PC, flags). We only need the PCs.
 	size_t npairs = (size_t)(end - beg) / 2;
@@ -71,14 +72,16 @@ void __sanitizer_cov_pcs_init(const uintptr_t *beg, const uintptr_t *end) {
 	for (size_t i = 0; i < npairs; i++) out[i + 1] = (uint64_t)beg[i * 2];
 }
 
-void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
+// cppcheck-suppress unusedFunction // called by the coverage instrumentation
+void __sanitizer_cov_trace_pc_guard_init(const uint32_t *start, const uint32_t *stop) {
 	size_t n = (size_t)(stop - start);
 	if (!n) return;
 	g_guards = start;
 	g_hits = map_file("hits", n);
 }
 
-void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
+// cppcheck-suppress unusedFunction // called at every instrumented edge
+void __sanitizer_cov_trace_pc_guard(const uint32_t *guard) {
 	if (!g_hits) return;
 	size_t idx = (size_t)(guard - g_guards);
 	g_hits[idx] = 1;
