@@ -9,7 +9,7 @@ import "core:time"
 import "elodin:logx"
 
 /*
-Response rate limiting for the UDP listener.
+Response rate limiting.
 
 A datagram carries no proof of where it came from, so an answer sent over UDP
 goes wherever the source address said - which is how a resolver becomes an
@@ -36,6 +36,61 @@ busy NAT therefore still resolves, at the cost of a round trip, while a spoofed
 source gets a truncated answer it cannot follow up.
 
 This is what BIND's `rate-limit` and Knot's RRL do, and the shape is theirs.
+
+The stream transports - TCP, DoT, DoH - are charged too, for the other half of
+what a flood costs. Amplification is not their problem: a handshake settled that
+whoever is asking is where they said they were, and no answer goes anywhere else.
+What they share with UDP is the work behind an answer, which is the upstream round
+trips and the cache churn, and a client pipelining queries down one connection
+reaches that as fast as the socket allows. `server.max_connections` bounds how
+many clients are here at once, not how fast one of them asks, so without this a
+flood delivered over a handful of connections is one the limiter never sees.
+
+Charged to a budget of their own, though. Each prefix has two: datagrams are spent
+out of one and connections out of the other, at the same rate, and neither is a
+way to spend the other. See `Rate_Class`.
+
+One shared budget is what this began as, and it was wrong - which is worth writing
+down, because the argument for sharing is the one that reads better. It goes: what
+is bounded is what this server does for one prefix, so a prefix that has spent its
+budget on datagrams has spent it, and two budgets are just a way to have twice as
+much by asking twice as many ways. What it misses is that the two transports have
+different claims on the address the budget is keyed to. The key comes off the
+query's source, and over UDP the sender writes that field, so anyone able to send
+a datagram can spend any prefix's budget: a spoofed flood naming sources inside
+prefix P, at more than `responses_per_second`, keeps P's bucket empty for as long
+as it runs. Under one budget every genuine TCP, DoT and DoH connection from P then
+has its first query refused and its connection closed - so an attacker who cannot
+receive anything at P, and who is asking none of P's questions, decides what this
+server does for the clients who actually live there, on a default configuration.
+It also shuts the one door the slip exists to open: a truncated answer says come
+back over TCP, and coming back over TCP arrived at the budget the flood had
+already emptied.
+
+So the two are separated, and the doubling is accepted deliberately. A prefix
+willing to ask both ways can draw `responses_per_second` out of each, which is a
+factor of two on the work behind an answer - a constant, applied to a figure an
+operator chose, and half of it reachable only over a completed handshake from an
+address that is therefore real. What the shared budget bought instead was letting
+anyone with a raw socket switch off a stranger's TCP.
+
+The property to keep is that neither pool can be spent from the other side: a
+change that charges one class against the other's pool, or lends a token across
+when the first runs dry, hands the flood back its authority over the connections.
+`test_the_stream_budget_is_not_the_datagram_one` is the test that says so, and the
+reason it is worth more than it looks.
+
+What differs besides the pool is what an over-limit query is answered with: `slip`
+sends a truncated answer over UDP and does not apply to a connection, for the
+reason in `stream_rate_check`. So the slip counter belongs to the datagram pool
+alone - see `Rate_Bucket.over`.
+
+Which is also what makes the slip's invitation worth accepting. The TCP retry it
+asks for is charged to the other pool, so a client sent to TCP by a flood in its
+prefix arrives at a budget that flood has not touched. Still a budget: a client
+that has emptied the stream pool itself is refused there like anything else, and a
+slip says the address is worth proving rather than reserving anything for the
+proof. But the retry is no longer answerable only in the gaps a flood leaves.
 */
 
 /*
@@ -43,9 +98,10 @@ The table is fixed at construction and never grows.
 
 A cache of buckets that allocated per source would be a memory bound written in
 terms of how many distinct addresses an attacker cares to name, which is not a
-bound. Sixteen thousand buckets is 512 KB and more prefixes than a resolver
-serves; what collides shares a budget, which is a limit that is too strict on
-rare occasions rather than a limit that fails.
+bound. Sixteen thousand buckets is 640 KB - a bucket carries a budget per transport
+class - and more prefixes than a resolver serves; what collides shares a budget,
+which is a limit that is too strict on rare occasions rather than a limit that
+fails.
 */
 @(private)
 RRL_BUCKETS :: 16384
@@ -61,19 +117,51 @@ produces and still bounds what one moment of an attack delivers.
 @(private)
 RRL_BURST_SECONDS :: 2
 
+/*
+Which of a prefix's two budgets a query is charged to.
+
+The separation is the point, and the note at the top of this file is where the
+reasoning for it lives: under one budget a spoofed datagram flood could empty the
+bucket of a prefix it was only naming, and close the connections of the clients who
+live there.
+
+`Datagram` is UDP, where the source address is whatever the sender wrote and what
+the budget bounds is amplification - how much traffic one address can be made to
+receive. `Stream` is TCP, DoT and DoH, where a handshake settled where the client
+is and what the budget bounds is work - the upstream round trips and the cache
+churn behind an answer.
+*/
+@(private)
+Rate_Class :: enum u8 {
+	Datagram,
+	Stream,
+}
+
 @(private)
 Rate_Bucket :: struct {
 	// The hashed prefix this bucket is accounting for; 0 when unused.
 	key:     u64,
-	tokens:  f64,
+	// One budget per class, refilled together and spent apart - see `Rate_Class`.
+	tokens:  [Rate_Class]f64,
+	// When both were last brought forward, which is whenever either was charged.
 	last_ns: i64,
-	// Over-limit queries since the last one that was answered, for `slip`.
+	/*
+	Over-limit datagrams since the last one that was answered, for `slip`.
+
+	Datagrams and nothing else, because a datagram is all a slip can be spent on: a
+	truncated answer is an instruction to ask again over TCP, so a query that is
+	already on a connection can neither be answered with one nor be allowed to
+	decide which datagram the next one lands on. Charging the two classes to
+	separate pools is what keeps that true without a guard - a connection's query
+	does not reach this counter at all, answered or refused. See `rate_check`.
+	*/
 	over:    u32,
 }
 
 Rate_Limiter :: struct {
 	buckets:   []Rate_Bucket,
-	// Tokens per second, and the most that may be banked.
+	// Tokens per second, and the most that may be banked. Per pool: each of a
+	// bucket's two gets this, which is the doubling the file's note accepts.
 	rate:      f64,
 	capacity:  f64,
 	slip:      int,
@@ -88,18 +176,22 @@ Rate_Limiter :: struct {
 	*/
 	hash_key:  [16]u8,
 	/*
-	The thread that has called `rate_check`, claimed on the first call.
+	The bucket table, which has as many callers as there are connections.
 
-	The bucket table has no lock because one thread reads the UDP socket, and
-	that is an assumption in a doc comment rather than anything the code
-	enforces. A second reader - the obvious next step if the read loop ever
-	becomes the bottleneck - would not fail loudly: `tokens` would tear, `over`
-	increments would be lost, and the limiter would under-count at exactly the
-	moment it is counting something. So the assumption is written down as state
-	and checked, which turns a silent loss of correctness into a failure the
-	first run finds.
+	One thread reads the UDP socket, but every TCP, DoT and DoH connection is
+	served on a thread of its own and charges the queries it reads from there, so
+	the single-reader assumption this table was written under no longer holds.
+	Unlocked, what that costs is not a crash but a limiter that under-counts at
+	exactly the moment it is counting something: `tokens` read, decremented and
+	written back by two threads at once loses one of the two decrements, and
+	`over` loses slips the same way.
+
+	One mutex for the table rather than one per bucket, or an atomic bucket. The
+	critical section is a hash, a compare and a few flops - shorter than the
+	syscall that delivered the query and orders of magnitude shorter than
+	answering it - so a finer lock would buy contention on a lock nobody holds.
 	*/
-	owner:     int,
+	lock:      sync.Mutex,
 	allocator: mem.Allocator,
 	// Counted here rather than in Stats because these are properties of the
 	// limiter, and read by tests.
@@ -140,31 +232,22 @@ Rate_Verdict :: enum u8 {
 }
 
 /*
-Charge one response to `client`'s prefix and say what to do with it.
+The bucket accounting for `client`'s prefix, with both of its budgets brought
+forward to `now_ns`. The caller holds the lock.
 
-Called from the UDP read loop and from nowhere else. That loop is one thread,
-which is why nothing here is locked; a second reader would need this table to be
-locked or split per thread. Under `-debug` the first caller claims the limiter
-and a second one asserts, so that requirement is enforced rather than merely
-recorded here - see `claim_reader`.
-
-`now` is passed in rather than read here so a test can run a bucket through an
-hour in a few microseconds.
+Both are refilled on every charge, whichever one is about to be spent: they accrue
+at the same rate from the same instant, so bringing the idle one along costs a
+flop and lets a single `last_ns` stand for the pair.
 */
-rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) -> Rate_Verdict {
-	if r == nil {
-		return .Allow
-	}
-	when ODIN_DEBUG {
-		assert(claim_reader(r), "rate_check called from a second thread; the bucket table is not locked")
-	}
-
+@(private)
+rate_bucket :: proc(r: ^Rate_Limiter, client: net.Endpoint, now_ns: i64) -> ^Rate_Bucket {
 	key := prefix_key(r, client.address)
 	b := &r.buckets[key % RRL_BUCKETS]
 
-	// Monotonic: a wall clock stepped backwards by an NTP correction would hand
-	// out a bucket's worth of budget, and stepped forwards, none.
-	now_ns := now._nsec
+	// What both pools have accrued since either was last charged, read once: the
+	// collision check below weighs it and the refill afterwards spends it.
+	gained := elapsed_tokens(r, b.last_ns, now_ns)
+
 	if b.key != key {
 		/*
 		Somebody else's bucket, or one never used.
@@ -174,21 +257,58 @@ rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) -> Ra
 		let a flood from one prefix clear the accounting of another. Otherwise
 		the two share what is left, which is the conservative reading of a
 		collision.
+
+		Both pools have to have refilled, not either: a prefix whose connections
+		are still spending is as live as one whose datagrams are, and taking the
+		bucket on the strength of the quiet pool would clear the busy one - which
+		is the flood-clears-the-accounting hole again, reached through whichever
+		transport the owner was not using.
 		*/
-		refilled := b.key == 0 || b.tokens + elapsed_tokens(r, b.last_ns, now_ns) >= r.capacity
+		refilled :=
+			b.key == 0 ||
+			(b.tokens[.Datagram] + gained >= r.capacity && b.tokens[.Stream] + gained >= r.capacity)
 		if refilled {
 			b.key = key
-			b.tokens = r.capacity
-			b.last_ns = now_ns
+			for &tokens in b.tokens {
+				tokens = r.capacity
+			}
 			b.over = 0
+			// Full as of now, so there is nothing left of the elapsed time to
+			// bring forward below.
+			gained = 0
 		}
 	}
 
-	b.tokens = min(r.capacity, b.tokens + elapsed_tokens(r, b.last_ns, now_ns))
+	for &tokens in b.tokens {
+		tokens = min(r.capacity, tokens + gained)
+	}
 	b.last_ns = now_ns
+	return b
+}
 
-	if b.tokens >= 1 {
-		b.tokens -= 1
+/*
+Charge one datagram to `client`'s prefix and say what to do with it.
+
+Called from the UDP read loop. `stream_rate_check` is the other half, charging the
+other pool, and the two run from as many threads as there are connections, which is
+why the table is locked - see `lock`.
+
+`now` is passed in rather than read here so a test can run a bucket through an
+hour in a few microseconds. Monotonic, because a wall clock stepped backwards by
+an NTP correction would hand out a bucket's worth of budget, and stepped forwards,
+none.
+*/
+rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) -> Rate_Verdict {
+	if r == nil {
+		return .Allow
+	}
+	sync.mutex_lock(&r.lock)
+	defer sync.mutex_unlock(&r.lock)
+
+	b := rate_bucket(r, client, now._nsec)
+
+	if b.tokens[.Datagram] >= 1 {
+		b.tokens[.Datagram] -= 1
 		b.over = 0
 		return .Allow
 	}
@@ -203,27 +323,42 @@ rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) -> Ra
 }
 
 /*
-Take ownership of the limiter for this thread, or report that somebody else has
-it.
+Charge one query read off a connection and say whether to answer it.
 
-Compiled into every build and called only from the debug one, so the check costs
-nothing where it would be paid for and is still a procedure a test can call
-directly - which matters, because the failure it guards against is one that
-needs two threads to produce and `assert` is the wrong instrument for a test to
-observe.
+The stream pool, not the datagram one, which is the separation the top of this
+file argues for: a spoofed flood aimed at this prefix cannot reach what a
+connection spends, so a client that got here over a handshake is not refused on
+the strength of datagrams it never sent.
 
-The exchange is what makes the first caller the owner without a lock: two
-threads racing to claim an unowned limiter both see zero, both write, and the
-one whose write landed second reads back an id that is not its own.
+Everything over the budget is refused, with no slip, so the caller has one thing
+to do with a refusal rather than two. Both of the things that make a truncated
+answer worth sending are missing on a connection: the TC bit is an instruction to
+ask again over TCP, and the client is already there, so a client that acted on it
+would ask again on the connection it is holding - the same query, charged again -
+and one that did not would give up. Nor is there an address to protect: the
+handshake established where the client is, so the small answer would not be
+standing in for a large one aimed at somebody else. `slipped=` in the stats line
+counts truncated answers that went out, and there are none from here.
+
+What the caller does with a `false` is stop serving: see `serve_dns_stream` for
+why the connection ends rather than the query being quietly skipped.
 */
-@(private)
-claim_reader :: proc(r: ^Rate_Limiter) -> bool {
-	me := sync.current_thread_id()
-	if owner := sync.atomic_load(&r.owner); owner != 0 {
-		return owner == me
+stream_rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) -> bool {
+	if r == nil {
+		return true
 	}
-	previous, _ := sync.atomic_compare_exchange_strong(&r.owner, 0, me)
-	return previous == 0 || previous == me
+	sync.mutex_lock(&r.lock)
+	defer sync.mutex_unlock(&r.lock)
+
+	b := rate_bucket(r, client, now._nsec)
+
+	if b.tokens[.Stream] >= 1 {
+		b.tokens[.Stream] -= 1
+		return true
+	}
+
+	sync.atomic_add(&r.limited, 1)
+	return false
 }
 
 @(private)
@@ -269,15 +404,18 @@ start_rate_limiter :: proc(s: ^Server) -> bool {
 		return true
 	}
 	s.limiter = make_rate_limiter(cfg.responses_per_second, cfg.slip)
+	// The two budgets are named in the line rather than left to the documentation:
+	// an operator reading `500` needs to know it is 500 datagrams and 500 queries
+	// on connections, not 500 between them.
 	if cfg.slip > 0 {
 		logx.infof(
-			"rate limit: %d responses/s per client prefix (/24, /64); 1 in %d over that answered truncated",
+			"rate limit: %d responses/s per client prefix (/24, /64), counted separately for datagrams and for connections; 1 in %d over the datagram budget answered truncated, and over a connection nothing is",
 			cfg.responses_per_second,
 			cfg.slip,
 		)
 	} else {
 		logx.infof(
-			"rate limit: %d responses/s per client prefix (/24, /64); anything over that dropped",
+			"rate limit: %d responses/s per client prefix (/24, /64), counted separately for datagrams and for connections; anything over that dropped",
 			cfg.responses_per_second,
 		)
 	}

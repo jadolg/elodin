@@ -46,7 +46,9 @@ server:
   # address can be made to receive. Every `slip`th query over it is answered
   # with a truncated response rather than dropped, which tells a real client to
   # come back over TCP, where the handshake proves the address; 0 drops them
-  # all. TCP, DoT and DoH are not limited - the connection already proves it.
+  # all. TCP, DoT and DoH are charged too, against a budget of their own: a UDP
+  # source address is written by the sender, so one shared budget let a spoofed
+  # flood close a prefix's connections.
   rate_limit:
     enabled: true
     responses_per_second: 500

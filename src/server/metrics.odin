@@ -137,8 +137,13 @@ serve_metrics :: proc(s: ^Server, l: ^Listeners, socket: net.TCP_Socket, client:
 	_ = net.set_option(socket, .Receive_Timeout, METRICS_TIMEOUT)
 	_ = net.set_option(socket, .Send_Timeout, METRICS_TIMEOUT)
 
+	// `peer` is filled in although nothing here charges the rate limiter, so that
+	// it is not a zero endpoint waiting for something that does: `prefix_key` maps
+	// an address it cannot read to one bucket, which would put every scrape in the
+	// prefix of nobody.
 	conn := Conn {
 		socket = socket,
+		peer   = client,
 	}
 	r := Http_Reader {
 		conn = conn,
@@ -155,8 +160,10 @@ serve_metrics :: proc(s: ^Server, l: ^Listeners, socket: net.TCP_Socket, client:
 		if status != 0 {
 			_ = send_http_error(conn, "metrics", status, http_refusal_message(status), false)
 			// The refused request may have declared a body that was never read, and
-			// the close in the accept loop would take the answer with it.
-			http_linger(conn)
+			// the close in the accept loop would take the answer with it. The body
+			// may not have finished arriving either, which is the longer of the two
+			// idle waits - see `HTTP_LINGER_BODY_IDLE`.
+			http_linger(conn, HTTP_LINGER_BODY_IDLE)
 		}
 		return
 	}

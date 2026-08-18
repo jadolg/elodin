@@ -1,7 +1,6 @@
 package server
 
 import "core:encoding/base64"
-import "core:net"
 import "core:strings"
 import "core:time"
 import "elodin:dns"
@@ -27,17 +26,53 @@ MAX_DOH_BODY :: 64 * 1024
 
 /*
 How much of a refused request `http_linger` reads and throws away before the
-connection closes on it, and how long it waits for each read.
+connection closes on it, how long it waits for any one read, and how long the
+whole of it may take.
 
 The size is a request this endpoint would have read in full anyway - the header
 limit plus the largest body it accepts - so draining one costs no more than
-serving one would have. The wait is short and applies per read, because these are
-bytes a client that has already sent its request line has already written: what
-must not happen is a whole `client_timeout` spent on a client that announced a
-body and then went quiet.
+serving one would have.
+
+The idle wait applies per read, and there are two of them, because the callers
+disagree about where the bytes still to come are. Each passes the one that
+matches what it refused.
+
+`HTTP_LINGER_IDLE` is for a refusal written after the whole request was read: the
+429 in `serve_doh_request`, which charges the budget once it has a message in
+hand. It is short because of what is left over there - a client that pipelined
+wrote those bytes before it could have read the refusal, so what the close would
+otherwise take back from it is in this server's receive queue already, and a read
+of a queue with something in it returns without waiting at all. Time spent
+waiting past that is time spent on a client that has stopped sending, holding one
+of `max_connections` while it does - and a refusal that costs more than an answer
+is one worth provoking, which the 429 makes any client able to reach the endpoint
+able to do at will. A second of it, per connection, for nothing, is the shape of
+that: one over-budget query and then silence is a cheaper way to spend a slot
+than asking a question is.
+
+`HTTP_LINGER_BODY_IDLE` is for the refusals `read_http_request` hands back, which
+are decided on the request line or on a repeated `Host` - before the body those
+headers declared has been read. What is unread there is not something the client
+has already put on the wire but a body still on its way, and over any distance
+the next segment of it is a round trip away rather than in the queue: a wait of
+the length above drains the first congestion window, gives up on a body that is
+still coming, and closes over the remainder, which is the RST this drain exists
+to avoid and leaves the client reading ECONNRESET instead of the 400. So this one
+is a round trip's worth. It is provokable in the same way - a request line this
+reader will not read costs a client no more than an over-budget query does -
+which is why it is a quarter of a second rather than a second, that being the
+bound `stream_linger` accepts against the same abuse.
+
+The deadline bounds the drain as a whole, which the idle wait alone does not. A
+client sending a byte inside every wait stays inside all of them for as long as it
+likes, so a drain counted only in bytes and idle time would be somewhere to sit
+and hold a slot for hours; past the deadline the close goes ahead. See
+`stream_linger`, which is bounded the same way.
 */
 HTTP_LINGER_BYTES :: MAX_HEADER_BYTES + MAX_DOH_BODY
 HTTP_LINGER_TIMEOUT :: 1 * time.Second
+HTTP_LINGER_IDLE :: 50 * time.Millisecond
+HTTP_LINGER_BODY_IDLE :: 250 * time.Millisecond
 
 /*
 What the connection's read buffer starts at, and what it is put back to between
@@ -465,8 +500,10 @@ serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 			if status != 0 {
 				_ = send_http_error(conn, "doh", status, http_refusal_message(status), false)
 				// The refused request may have declared a body that was never read,
-				// and the close below would take the answer with it.
-				http_linger(conn)
+				// and the close below would take the answer with it. That body may
+				// also still be arriving, which is what picks the longer of the two
+				// idle waits - see `HTTP_LINGER_BODY_IDLE`.
+				http_linger(conn, HTTP_LINGER_BODY_IDLE)
 			}
 			free_all(context.temp_allocator)
 			return
@@ -517,6 +554,33 @@ serve_doh_request :: proc(s: ^Server, conn: Conn, req: Http_Request_In, path: st
 
 	if len(query) < dns.HEADER_SIZE {
 		return send_http_error(conn, "doh", 400, "message too short", req.keep_alive)
+	}
+
+	/*
+	Charged here rather than where the request is read, so that what is charged is
+	a query: a 404 from a scanner, a .mobileconfig download and a request this
+	endpoint refuses on its framing are none of them responses to a question, and
+	none of them reach the resolver, the cache or an upstream. The budget is
+	denominated in the ones that do.
+
+	429 rather than the bare close the length-prefixed transports get, RFC 6585 4
+	being written for exactly this: over HTTP a status is something a client can
+	read and act on. No `Retry-After` with it, though the RFC allows one: the field
+	counts whole seconds, and at the default 500 a second the budget has a token
+	back in two milliseconds, so the smallest value it can carry would send a client
+	away for hundreds of times the wait there actually is.
+
+	`false` for `keep_alive`, so the connection ends with the refusal for the
+	reason `serve_dns_stream` closes - and the drain before it closes is what keeps
+	the 429 from being lost, this being reached by a client that pipelines: closing
+	a socket with bytes still in its receive queue sends an RST, and an RST has the
+	client's kernel discard what it has not read yet. See `http_linger`.
+	*/
+	if !stream_rate_check(s.limiter, conn.peer, time.tick_now()) {
+		report_rate_limited(client, .DoH)
+		_ = send_http_error(conn, "doh", 429, "too many requests", false)
+		http_linger(conn, HTTP_LINGER_IDLE)
+		return false
 	}
 
 	response, _, ok := handle_query(s, query, .DoH, client, context.temp_allocator)
@@ -680,16 +744,27 @@ which is the bare closed connection the status was there to replace.
 
 Discarded rather than parsed: `keep_alive` is false on every path that gets here,
 so nothing further on this connection is answered and what these bytes say does
-not matter. A client that stops short of what it declared, or that keeps sending
-past `HTTP_LINGER_BYTES`, ends the drain on the timeout or the limit rather than
-holding the thread.
+not matter. A client that stops short of what it declared, that keeps sending past
+`HTTP_LINGER_BYTES`, or that trickles for longer than `HTTP_LINGER_TIMEOUT`, ends
+the drain on the idle wait, the limit or the deadline rather than holding the
+thread.
+
+`idle` is the per-read wait, and the caller chooses it because the caller is what
+knows whether the bytes that are left are already here or still arriving:
+`HTTP_LINGER_IDLE` after a request that was read in full, `HTTP_LINGER_BODY_IDLE`
+after one refused with a declared body outstanding. Passed rather than defaulted
+so that a path added later has to answer the question rather than inherit an
+answer.
 */
 @(private)
-http_linger :: proc(conn: Conn) {
-	_ = net.set_option(conn.socket, .Receive_Timeout, HTTP_LINGER_TIMEOUT)
+http_linger :: proc(conn: Conn, idle: time.Duration) {
+	// Not `net.set_option`: over DoH the connection is a TLS one, where the socket
+	// option stopped applying at the handshake - see `conn_set_read_timeout`.
+	conn_set_read_timeout(conn, idle)
+	start := time.tick_now()
 	chunk: [4096]u8
 	discarded := 0
-	for discarded < HTTP_LINGER_BYTES {
+	for discarded < HTTP_LINGER_BYTES && time.tick_since(start) < HTTP_LINGER_TIMEOUT {
 		n, ok := conn_read(conn, chunk[:])
 		if !ok {
 			return

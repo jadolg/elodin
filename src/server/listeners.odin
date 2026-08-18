@@ -486,6 +486,28 @@ report_shed :: proc(client: net.Endpoint, limit: int) {
 }
 
 /*
+Say which client the response budget turned away, and on which transport.
+
+Debug only and not through `report_once`, for the reason `report_shed` is not:
+these are already counted as limited= in the stats line, so an operator watching
+for them has a figure a flood cannot make them miss, and this is for the question
+that figure raises next - which clients, and where.
+
+Unlike the two above, `client` arrives formatted: the stream handlers build it
+once per connection and hold it for the connection's life, so there is no address
+to render here and nothing to release afterwards. `logx.debugf` returns without
+formatting anything when debug is off.
+*/
+@(private)
+report_rate_limited :: proc(client: string, proto: Protocol) {
+	logx.debugf(
+		"%s: closing the connection from %s, its prefix is over server.rate_limit.responses_per_second",
+		proto_name(proto),
+		client,
+	)
+}
+
+/*
 Say why a connection could not be given a thread, once, and then quietly.
 
 The same reasoning as `report_refusal`, and reached the same way: a peer opening
@@ -928,7 +950,7 @@ stream_job :: proc(data: rawptr) {
 	switch job.ctx.proto {
 	case .TCP:
 		defer net.close(job.socket)
-		serve_dns_stream(s, {socket = job.socket}, .TCP, client)
+		serve_dns_stream(s, {socket = job.socket, peer = job.client}, .TCP, client)
 	case .DoT:
 		// Read once, under the atomic that `reload_tls` swaps: a reload landing
 		// mid-accept must not hand this connection a half-updated context.
@@ -940,7 +962,7 @@ stream_job :: proc(data: rawptr) {
 			return
 		}
 		defer tlsx.close(conn)
-		serve_dns_stream(s, {socket = job.socket, tls = conn}, .DoT, client)
+		serve_dns_stream(s, {socket = job.socket, tls = conn, peer = job.client}, .DoT, client)
 	case .DoH:
 		ctx := sync.atomic_load(&job.ctx.listeners.doh_ctx)
 		conn, err := tlsx.server_accept(ctx, job.socket)
@@ -951,9 +973,9 @@ stream_job :: proc(data: rawptr) {
 		}
 		defer tlsx.close(conn)
 		if tlsx.alpn_protocol(conn) == "h2" {
-			serve_doh2(s, conn, client)
+			serve_doh2(s, conn, client, job.client)
 		} else {
-			serve_doh(s, {socket = job.socket, tls = conn}, client)
+			serve_doh(s, {socket = job.socket, tls = conn, peer = job.client}, client)
 		}
 	case .UDP:
 	// not reachable: UDP has no accept loop
@@ -969,6 +991,9 @@ complexity here.
 */
 @(private)
 serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string) {
+	// Whether this connection has anything the close could take back, which is
+	// what decides whether the refusal below drains first - see `stream_linger`.
+	answered := false
 	for {
 		length_buf: [2]u8
 		if !conn_read_full(conn, length_buf[:]) {
@@ -981,6 +1006,64 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 
 		query := make([]u8, length, context.temp_allocator)
 		if !conn_read_full(conn, query) {
+			return
+		}
+
+		/*
+		Charged before the answer is built, as the UDP loop charges before it
+		queues, and against the prefix's stream budget rather than the one its
+		datagrams spend - see the head of `ratelimit.odin` for why a connection is
+		metered at all when nothing on it can be reflected, and why it is not
+		metered out of the same pool.
+
+		Charged on a message of a plausible length rather than on one that parses,
+		which is where the DoH endpoints charge too, and worth writing down because
+		it reads like the place they do not. What `serve_doh_request` and
+		`h2_charged` keep out of the budget is a request that was never a question
+		put to this service - a scanner's 404, a .mobileconfig download, a POST
+		naming the wrong content type, a `dns` parameter that is not base64 - and
+		none of that has a spelling here, where a length prefix and a socket are the
+		whole envelope. Neither of them looks inside the message either: the floor
+		all three share is `dns.HEADER_SIZE`, and the length check above turns
+		anything under it away without charging, so the three are already charging
+		for the same thing.
+
+		Not moved behind the parse, then. A message this long that does not decode
+		is answered - `handle_query` builds it a FORMERR out of its own header - so
+		it spends the budget on a response, like everything else the budget counts.
+		The one length-legal message that goes unanswered is a response arriving
+		where queries are read, and the DoH paths charge for that one too before
+		turning it into a 500. Which leaves the parse buying nothing but a rule that
+		differed from the UDP loop's, and that loop charges a datagram before it has
+		looked at it at all.
+
+		The connection ends rather than this query being skipped. Skipping it
+		leaves a client that framed a correct query waiting for an answer that is
+		never coming, until `client_timeout` closes the connection anyway, and
+		leaves this thread reading the rest of the flood in the meantime; closing
+		says so now and hands the slot back to `max_connections`. RFC 7766 6.2.3
+		has a server free to hold connections open for no time at all when it is
+		under heavy load or attack, which is the case this is, and a client that
+		wants another answer is free to open one - which costs it a handshake, and
+		over DoT and DoH that is the expensive end of the exchange.
+
+		What the client has already sent is drained before the close, because the
+		client this is reached by is the one that pipelined: the queries it sent and
+		this server never read are still in the receive queue, and closing a socket
+		in that state takes the answers already written down with it. See
+		`stream_linger`.
+
+		Only when there is something to take, though: a connection whose very first
+		query is over the budget - which under a flood of short connections is all
+		of them - has written nothing for the reset to discard, so the drain would
+		buy nothing and cost up to `STREAM_LINGER_TIMEOUT` of one of
+		`max_connections`, which is the slot this close exists to hand back.
+		*/
+		if !stream_rate_check(s.limiter, conn.peer, time.tick_now()) {
+			report_rate_limited(client, proto)
+			if answered {
+				stream_linger(conn)
+			}
 			return
 		}
 
@@ -997,7 +1080,80 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 		if !conn_write_all(conn, framed) {
 			return
 		}
+		answered = true
 		free_all(context.temp_allocator)
+	}
+}
+
+/*
+How much of a refused connection `stream_linger` reads and throws away, how long
+it waits for any one read, and how long the whole of it may take.
+
+The size is one message at its largest, which is what this connection would have
+read next anyway, and it covers the case that gets here with room to spare: a
+client pipelining hundreds of questions has sent hundreds of question-sized
+messages, which is a few kilobytes between them and not a few megabytes.
+
+The idle wait is short because of what these bytes are: a client that pipelined
+wrote them before it could have known the budget had run out, so they are in this
+server's receive queue already and a read of a queue with something in it returns
+without waiting at all. Once it is empty there is nothing more coming that this
+drain is for, and a client is not obliged to shut its sending half down to say so
+- so a per-read wait as long as the whole deadline would have every refused
+connection hold one of `max_connections` for the full deadline whether or not it
+had anything left to give. `http_linger` is bounded the same way, for the same
+reason.
+
+The deadline bounds the drain as a whole, which the idle wait alone does not: a
+client sending a byte inside every wait stays inside all of them for as long as it
+likes, so a drain counted only in bytes and idle time would be somewhere for the
+client that has just proved it sends faster than it is answered to sit. Past
+either bound the close goes ahead.
+*/
+@(private)
+STREAM_LINGER_BYTES :: 2 + dns.MAX_MESSAGE
+@(private)
+STREAM_LINGER_TIMEOUT :: 250 * time.Millisecond
+@(private)
+STREAM_LINGER_IDLE :: 50 * time.Millisecond
+
+/*
+Read and throw away what the client had already sent, so that the answers already
+written to it are not lost to the close that follows.
+
+`serve_dns_stream` closes on a client that is over its budget, and a client that
+pipelines - which RFC 7766 6.2.1.1 allows - has queries in this server's receive
+queue that were never read, because the budget ran out before they were reached.
+Closing a socket in that state does not send a FIN but an RST (RFC 1122
+4.2.2.13), and an RST arriving at a client that has not read yet has its kernel
+discard what is already in its receive buffer: the answers this connection did
+write, before the budget ran out, are thrown away along with the queries it
+declined to read, and the client's `recv` fails where it would have returned
+those answers and then the end of the stream. Cutting a flood short is the point
+of the close; taking back what was already answered is not. The DoH endpoint
+drains before its own refusal for the same reason - see `http_linger`, where what
+would be lost is a 429.
+
+Discarded rather than framed and answered: the budget is spent, and what these
+bytes ask is the thing being refused. Past either bound the close goes ahead and
+takes the RST with it, which is no worse than not draining at all.
+
+Reached only from a connection that has answered something, for the same reason:
+with nothing written there is nothing for the RST to take back, and the drain
+would be time out of one of `max_connections` spent protecting nothing.
+*/
+@(private)
+stream_linger :: proc(conn: Conn) {
+	conn_set_read_timeout(conn, STREAM_LINGER_IDLE)
+	start := time.tick_now()
+	chunk: [4096]u8
+	discarded := 0
+	for discarded < STREAM_LINGER_BYTES && time.tick_since(start) < STREAM_LINGER_TIMEOUT {
+		n, ok := conn_read(conn, chunk[:])
+		if !ok {
+			return
+		}
+		discarded += n
 	}
 }
 
@@ -1005,6 +1161,40 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 Conn :: struct {
 	socket: net.TCP_Socket,
 	tls:    ^tlsx.Conn,
+	/*
+	Who is on the other end, for the rate limiter.
+
+	Carried on the connection because that is what it is a property of, and
+	because the `client` the handlers already have is the endpoint formatted for
+	a log line - which is not something `prefix_key` can hash a prefix back out
+	of. Asking the kernel again per query would be a syscall for an answer that
+	cannot change.
+	*/
+	peer:   net.Endpoint,
+}
+
+/*
+Bound how long one read on this connection waits.
+
+`net.set_option` is not enough on its own, which is the whole reason this exists.
+`tlsx` picks SO_RCVTIMEO up at the handshake and then puts the socket into
+non-blocking mode, so a TLS read waits on the deadline the connection carries
+rather than on the socket option - and a `set_option` afterwards reaches nothing.
+Both drains that shorten their reads - `stream_linger` and `http_linger` - are
+reached over DoT and DoH as often as over TCP, where the option alone would have
+left them waiting out the whole of `client_timeout` for bytes that are not coming,
+holding one of `max_connections` while it did. That is the cost the short wait was
+written to avoid.
+
+Read only: the write deadline is the connection's, not this moment's.
+*/
+@(private)
+conn_set_read_timeout :: proc(c: Conn, wait: time.Duration) {
+	if c.tls != nil {
+		tlsx.set_read_timeout(c.tls, wait)
+		return
+	}
+	_ = net.set_option(c.socket, .Receive_Timeout, wait)
 }
 
 @(private)

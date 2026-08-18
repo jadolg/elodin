@@ -392,7 +392,7 @@ Server_Config :: struct {
 }
 
 /*
-Response rate limiting for the UDP listener.
+Response rate limiting.
 
 `responses_per_second` is per client prefix - /24 for IPv4, /64 for IPv6 -
 because an attacker spoofing a victim's address picks freely within their range,
@@ -400,6 +400,19 @@ so a per-address budget would only be spread across it. `slip` answers every Nth
 query over the budget with a truncated response rather than dropping it, which
 tells a real client to come back over TCP where the handshake proves the address
 an answer would go to; 0 drops them all.
+
+The figure is charged twice over, not once: each prefix gets it for datagrams and
+again for queries read off a connection, and neither budget can be spent from the
+other's side. Deliberately, and not to be quietly consolidated - a UDP source
+address is written by whoever sent the datagram, so one shared budget let a spoofed
+flood naming a prefix close the TCP, DoT and DoH connections of the clients who
+live in it. `ratelimit.odin` is where that is argued out. The cost is that a client
+asking both ways can draw twice the figure.
+
+`slip` applies to UDP alone: a truncated answer is an instruction to ask again over
+TCP, so it has nothing to say to a client that is already on a connection.
+Over-budget queries there end the connection instead, DoH saying so with a 429
+first.
 */
 Rate_Limit_Config :: struct {
 	enabled:              bool,

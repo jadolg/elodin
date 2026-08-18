@@ -1,6 +1,7 @@
 package server
 
 import "base:runtime"
+import "core:net"
 import "core:strings"
 import "core:sync"
 import "core:testing"
@@ -144,6 +145,15 @@ Result :: struct {
 	queued:  int,
 }
 
+// Who the scripted peer is, for the rate limiter: a test that has to spend the
+// budget before the request arrives charges the same endpoint the connection
+// will.
+@(private = "file")
+H2_PEER := net.Endpoint {
+	address = net.IP4_Loopback,
+	port    = 40000,
+}
+
 /*
 Serve one GET for `path` over a whole HTTP/2 connection and report what came of
 it.
@@ -151,13 +161,23 @@ it.
 `occupy` fills the worker with a job that will not finish, which is what puts
 the backlog at the limit. The pool is one worker throughout, so `max_pending` of
 1 and an occupied worker is a full backlog.
+
+`limiter` is nil unless the case is about the response budget, which is what every
+other transport's absent one means too.
 */
 @(private = "file")
-serve_one :: proc(cfg: ^config.Config, path: string, await: string, occupy: bool) -> Result {
+serve_one :: proc(
+	cfg: ^config.Config,
+	path: string,
+	await: string,
+	occupy: bool,
+	limiter: ^Rate_Limiter = nil,
+) -> Result {
 	handler_pool := pool.make_pool(1)
 	s := Server {
 		cfg          = cfg,
 		handler_pool = handler_pool,
+		limiter      = limiter,
 	}
 
 	gate := Gate{}
@@ -177,6 +197,7 @@ serve_one :: proc(cfg: ^config.Config, path: string, await: string, occupy: bool
 	ctx := H2_Context {
 		server = &s,
 		client = "127.0.0.1",
+		peer   = H2_PEER,
 		path   = cfg.listeners.doh.path,
 	}
 	io := h2.IO {
@@ -282,6 +303,105 @@ test_doh2_queues_while_the_pool_has_room :: proc(t: ^testing.T) {
 }
 
 /*
+A request over the response budget is answered 429 and never queued.
+
+HTTP/2 multiplexes, so one connection carries as many requests as the client cares
+to open streams for - up to `MAX_CONCURRENT` at a time, each of them replaced the
+moment it completes - and `max_connections` bounds none of that. The charge is on
+the reader thread ahead of `try_submit` so an over-budget request costs a HEADERS
+frame rather than a place in the backlog and a worker.
+
+The bucket is spent before the connection opens, which is what a client that has
+already been asking looks like. The pool is deliberately occupied and
+`max_pending` left wide: had the request been queued instead, it would still be
+pending for `queued` to find, and the answer would be 503 rather than 429.
+*/
+@(test)
+test_doh2_refuses_a_request_over_the_rate_limit :: proc(t: ^testing.T) {
+	// See the note in the first test.
+	context.allocator = runtime.heap_allocator()
+
+	cfg := config.default_config()
+	cfg.listeners.doh.path = "/dns-query"
+	cfg.server.max_pending = 8
+	cfg.cache.enabled = false
+	cfg.blocking.enabled = false
+
+	// One response a second, so the pool holds two; spent through
+	// `stream_rate_check`, which is the pool an h2 request is charged to - see
+	// `Rate_Class`. The slip is on, which a connection must not use.
+	limiter := make_rate_limiter(1, 2)
+	defer destroy_rate_limiter(limiter)
+	for _ in 0 ..< RRL_BURST_SECONDS {
+		testing.expect(
+			t,
+			stream_rate_check(limiter, H2_PEER, time.tick_now()),
+			"the stream budget refused a query it had room for",
+		)
+	}
+
+	got := serve_one(&cfg, "/dns-query?dns=AAAAAAAAAAAAAAAA", "", occupy = true, limiter = limiter)
+	defer delete(got.output)
+
+	answer := string(got.output[:])
+	testing.expectf(t, got.queued == 0, "%d over-budget requests were queued", got.queued)
+	testing.expect(t, strings.contains(answer, "429"), "the over-budget request was not answered 429")
+	testing.expect(t, !strings.contains(answer, "503"), "the request was shed rather than rate limited")
+	// The status is the whole answer, for the reason `h2_shed` sends none either:
+	// a body can park this thread on flow control.
+	testing.expect(
+		t,
+		!wrote_a_body(got.output[:]),
+		"the refusal carried a body, which can park the reader on flow control",
+	)
+
+	limited, slipped := rate_limit_stats(limiter)
+	testing.expect_value(t, limited, u64(1))
+	// A truncated DNS answer is a UDP answer; nothing here may be counted as one.
+	testing.expect_value(t, slipped, u64(0))
+	// The limiter's own figure says what happened, so `dropped` - which is about a
+	// backlog this server could not work through - must not also move.
+	testing.expect_value(t, got.dropped, u64(0))
+}
+
+/*
+The response budget is denominated in answers to questions, so a request that was
+never going to be one is not charged against it.
+
+A scanner on the DoH port, or a device fetching the .mobileconfig, reaches no
+resolver, no cache and no upstream - the costs this bound exists to hold down -
+and charging them would let either of them spend a budget that belongs to the
+clients being served. The same argument `h2_shed` counts by, one step earlier.
+*/
+@(test)
+test_doh2_rate_limit_charges_only_queries :: proc(t: ^testing.T) {
+	// See the note in the first test.
+	context.allocator = runtime.heap_allocator()
+
+	cfg := config.default_config()
+	cfg.listeners.doh.path = "/dns-query"
+	cfg.server.max_pending = 8
+
+	limiter := make_rate_limiter(1, 0)
+	defer destroy_rate_limiter(limiter)
+	// Nothing left for a query, let alone for anything that is not one. The stream
+	// pool, which is the one an h2 request is charged to - see `Rate_Class`.
+	for _ in 0 ..< RRL_BURST_SECONDS {
+		stream_rate_check(limiter, H2_PEER, time.tick_now())
+	}
+
+	got := serve_one(&cfg, "/not-the-endpoint", "not found", occupy = false, limiter = limiter)
+	defer delete(got.output)
+
+	answer := string(got.output[:])
+	testing.expect(t, strings.contains(answer, "not found"), "the request was refused rather than answered 404")
+	testing.expect(t, !strings.contains(answer, "429"), "a request that is not a query was charged to the budget")
+
+	limited, _ := rate_limit_stats(limiter)
+	testing.expect_value(t, limited, u64(0))
+}
+
+/*
 `dropped` counts queries the server refused, not streams it turned away.
 
 A request for some other path is shed like any other once the backlog is full -
@@ -308,4 +428,56 @@ test_doh2_shed_counts_only_queries :: proc(t: ^testing.T) {
 		"the request was not shed",
 	)
 	testing.expect_value(t, got.dropped, u64(0))
+}
+
+/*
+Nor is a request the endpoint turns down on its framing, addressed to the DNS path
+though it is.
+
+A `dns` parameter that is not base64 - or a missing one, or a POST naming the
+wrong content type, or a message short of a DNS header - is answered out of the
+request and nothing else: no resolver, no cache, no upstream, none of the costs
+this bound exists to hold down. Charged, they would let anything able to address
+`/dns-query` spend the budget of the clients sharing its prefix, without even the
+expense of asking a question - a cheaper flood than the one the limiter was added
+for. `h2_charged` is what draws the line, and it draws it with the same checks the
+worker answers by, so the two cannot come apart.
+*/
+@(test)
+test_doh2_rate_limit_charges_only_well_formed_queries :: proc(t: ^testing.T) {
+	// See the note in the first test.
+	context.allocator = runtime.heap_allocator()
+
+	cfg := config.default_config()
+	cfg.listeners.doh.path = "/dns-query"
+	cfg.server.max_pending = 8
+
+	limiter := make_rate_limiter(1, 0)
+	defer destroy_rate_limiter(limiter)
+	// Nothing left for a query, let alone for something that is not one. The stream
+	// pool, which is the one an h2 request is charged to - see `Rate_Class`.
+	for _ in 0 ..< RRL_BURST_SECONDS {
+		stream_rate_check(limiter, H2_PEER, time.tick_now())
+	}
+
+	// The endpoint, and a parameter with no base64 in it at all.
+	got := serve_one(
+		&cfg,
+		"/dns-query?dns=%%%%",
+		"malformed dns parameter",
+		occupy = false,
+		limiter = limiter,
+	)
+	defer delete(got.output)
+
+	answer := string(got.output[:])
+	testing.expect(
+		t,
+		strings.contains(answer, "malformed dns parameter"),
+		"the request was not answered 400",
+	)
+	testing.expect(t, !strings.contains(answer, "429"), "a request that is not a query was charged to the budget")
+
+	limited, _ := rate_limit_stats(limiter)
+	testing.expect_value(t, limited, u64(0))
 }
