@@ -1,0 +1,19 @@
+# Coverage here is the share of the server's own code (src/) that the
+# integration suite exercises. It deliberately excludes the unit tests: those
+# run in-process under `odin test`, which cannot be instrumented through the
+# LLVM-IR route the coverage build uses. So the number is a trend to watch, not
+# a bar to clear — both statuses are informational and never fail a PR.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+# Post (and keep updating) a single coverage comment on every pull request.
+comment:
+  layout: "reach, diff, files"
+  behavior: default
+  require_changes: false

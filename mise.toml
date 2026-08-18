@@ -123,6 +123,36 @@ description = "Everything: type-check, unit tests, integration tests"
 depends = ["check", "test", "itest"]
 run = "echo 'all checks passed'"
 
+# Line coverage of the server code the integration suite exercises, written as
+# lcov to bin/coverage.info (what CI hands to Codecov).
+#
+# Odin has no coverage of its own, so this reuses the fuzz targets' route: emit
+# the server as LLVM IR and let clang instrument it. SanitizerCoverage's
+# trace-pc-guard and pc-table give a hit bit and a source location per
+# instrumented point; packaging/coverage/cov_rt.c records the hits (mmap'd, so
+# they survive the SIGKILL the harness stops most servers with) and cov_report.py
+# turns them into lcov. This measures the shipped binary under the integration
+# tests, not the unit tests, which run in-process and cannot be instrumented
+# this way.
+[tasks.coverage]
+description = "Line coverage from the integration suite, as lcov (bin/coverage.info)"
+depends = ["prepare"]
+run = [
+  "rm -rf bin/cov-ir bin/covdata && mkdir -p bin/cov-ir bin/covdata",
+  # -debug is load-bearing: it carries the .odin file and line into the IR, which
+  # is what addr2line reads back out of the instrumented binary.
+  "odin build src/main -collection:elodin=src -build-mode:llvm-ir -debug -out:bin/cov-ir/ $ELODIN_DEFINES",
+  "clang -c -O1 packaging/coverage/cov_rt.c -o bin/cov-ir/cov_rt.o",
+  # Non-PIE so a recorded PC is the static address addr2line expects, with no
+  # load-bias to undo. No sanitizer runtime is linked; cov_rt.c is the runtime.
+  "clang -fsanitize-coverage=trace-pc-guard,pc-table -no-pie -fno-pie -g -Wno-override-module bin/cov-ir/*.ll bin/cov-ir/cov_rt.o -o bin/elodin-cov $ELODIN_LDFLAGS -lssl -lcrypto -lm -lpthread",
+  # The harness spawns the binary as a child, so ELODIN_COV_DIR is inherited by
+  # every server process; each writes its own cov.<pid>.* files there.
+  "odin build src/itest -collection:elodin=src -out:bin/itest -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES",
+  "ELODIN_COV_DIR=$PWD/bin/covdata ./bin/itest --binary bin/elodin-cov",
+  "python3 packaging/coverage/cov_report.py bin/covdata bin/elodin-cov bin/coverage.info",
+]
+
 [tasks.run]
 description = "Run elodin locally on port 5354 (no root needed)"
 depends = ["build", "prepare"]

@@ -162,3 +162,26 @@ jobs:
           } > /tmp/resolv-after
           diff /tmp/resolv-before /tmp/resolv-after
           getent hosts example.com
+
+  coverage:
+    name: Coverage
+    # Instruments the server's LLVM IR, runs the integration suite against it,
+    # and uploads the lcov to Codecov, which posts the PR comment and serves the
+    # README badge. See `mise run coverage` and packaging/coverage/.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - uses: jdx/mise-action@v4
+        with:
+          install: true
+          cache: true
+      - run: mise run coverage
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./bin/coverage.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          # A Codecov hiccup shouldn't fail the build; the number is advisory.
+          fail_ci_if_error: false

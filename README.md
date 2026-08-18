@@ -1,5 +1,7 @@
 # elodin
 
+[![codecov](https://codecov.io/gh/jadolg/elodin/branch/main/graph/badge.svg)](https://codecov.io/gh/jadolg/elodin)
+
 A filtering DNS forwarder in [Odin](https://odin-lang.org), in the spirit of
 Pi-hole and AdGuard Home, minus the web interface. One binary, one YAML file.
 
