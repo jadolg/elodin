@@ -227,7 +227,7 @@ validate :: proc(
 ) -> Result {
 	msg, derr := dns.decode_message(wire, allocator)
 	if derr != .None {
-		return {.Bogus, "unparseable response", nil, nil}
+		return {status = .Bogus, reason = "unparseable response"}
 	}
 	class := msg.question[0].class if len(msg.question) > 0 else dns.Class.IN
 	unix := u32(time.to_unix_seconds(now))
@@ -239,7 +239,7 @@ validate :: proc(
 	failure, and report it as a forgery in the bargain.
 	*/
 	if !answerable_rcode(msg) {
-		return {.Insecure, "no data to authenticate", nil, nil}
+		return {status = .Insecure, reason = "no data to authenticate"}
 	}
 
 	/*
@@ -270,7 +270,7 @@ validate :: proc(
 	denial to demand either.
 	*/
 	if qtype == .RRSIG && len(msg.answer) > 0 {
-		return {.Insecure, "nothing to authenticate", nil, nil}
+		return {status = .Insecure, reason = "nothing to authenticate"}
 	}
 	return validate_denial(v, &budget, msg, qname, qtype, class, unix, now, allocator)
 }
@@ -308,6 +308,17 @@ stays is what was proven and what a client has a use for: the answer, the NSEC
 and NSEC3 records a denial rests on, and the SOA that denial is cached
 negatively against.
 
+Not everything in the additional section is glue, and the argument above does
+not stretch to cover the rest of it. The address records a server sends beside
+an HTTPS, SVCB, SRV or MX answer are ordinary signed zone data (RFC 9460 section
+5 asks for them by name), and a client that has them is spared a round trip
+before it can connect. They are dropped all the same, because they are signed by
+the target's zone rather than by the one this query established, so keeping them
+authenticated means the same second chain walk the denial case needs - and
+keeping them unauthenticated under our AD bit is the whole thing this procedure
+exists to stop. The cost is a round trip on a shape that is getting commoner, so
+it is filed rather than shrugged at.
+
 The one real loss is a CNAME chain that ends in a denial - a dual-stack client
 asking AAAA for an IPv4-only name is the everyday version of it, and a CNAME
 pointing at a name that does not exist is the same shape with NXDOMAIN on it.
@@ -325,6 +336,13 @@ section holds, finds no SOA to read, and is held for `cache.negative_ttl`
 instead - longer than a zone asking for less would like, and not at all where an
 operator has set that to zero. Both are the same missing chain walk, and are
 fixed by the same one.
+
+The rcode is the part of this no prune can reach. AD covers the records in those
+two sections, and this makes it honest about them; it says nothing about the
+header. An on-path attacker who flips a signed CNAME answer to NXDOMAIN still
+gets `Secure` out of `validate_answer`, on the strength of a CNAME that really
+is signed, and the client reads an authenticated denial nobody proved. That is
+the same missing chain walk again, from the other end, and the same issue.
 
 Two ways not to lose it, and neither belongs here. Keeping the records and
 clearing AD instead is the one that looks free: it is not, because AD is a
@@ -381,6 +399,13 @@ strip_unauthenticated :: proc(
 
 @(private)
 authenticated_only :: proc(section: []dns.Record, kept: []dns.Question, allocator: mem.Allocator) -> []dns.Record {
+	// Nothing in this section was authenticated, so nothing in it survives. Worth
+	// saying up front: a denial names no RRsets in the answer section, and the
+	// loop below would otherwise parse and allocate a signer name for every RRSIG
+	// sitting there before dropping the lot.
+	if len(kept) == 0 {
+		return nil
+	}
 	out := make([dynamic]dns.Record, 0, len(section), allocator)
 	for rec in section {
 		covered := rec.type
@@ -514,7 +539,7 @@ validate_answer :: proc(
 	what is authenticatable. Whatever the cause, an empty check is not a pass.
 	*/
 	if checked == 0 {
-		return {.Insecure, "nothing to authenticate", nil, nil}
+		return {status = .Insecure, reason = "nothing to authenticate"}
 	}
 
 	/*
@@ -529,7 +554,7 @@ validate_answer :: proc(
 	it asked about - a denial of existence that was never proven.
 	*/
 	if worst == .Secure && !answers_question(msg.answer, qname, qtype, class) {
-		return {.Bogus, "answer does not address the question", nil, nil}
+		return {status = .Bogus, reason = "answer does not address the question"}
 	}
 
 	/*
@@ -558,10 +583,20 @@ validate_answer :: proc(
 			append(&proved, ..records)
 		}
 		if worst != .Secure {
-			return {worst, "wildcard expansion not proven", nil, nil}
+			return {status = worst, reason = "wildcard expansion not proven"}
 		}
 	}
-	return {worst, reason, authenticated[:], proved[:]}
+	/*
+	The RRsets are named only when the verdict is `Secure`, which is what
+	`Result` promises and the only case a caller may prune against. A partial
+	verdict has a partial list behind it - the RRsets that happened to hold up
+	while another did not - and pruning a message down to that would drop
+	records from an answer nobody is vouching for anyway.
+	*/
+	if worst != .Secure {
+		return {status = worst, reason = reason}
+	}
+	return {status = worst, reason = reason, answer = authenticated[:], authority = proved[:]}
 }
 
 @(private)
@@ -592,16 +627,16 @@ validate_denial :: proc(
 	status, keys, established := zone_trust(v, budget, qname, now, allocator)
 	#partial switch status {
 	case .Insecure:
-		return {.Insecure, "unsigned zone", nil, nil}
+		return {status = .Insecure, reason = "unsigned zone"}
 	case .Bogus:
-		return {.Bogus, "broken chain of trust", nil, nil}
+		return {status = .Bogus, reason = "broken chain of trust"}
 	case .Indeterminate:
-		return {.Indeterminate, "chain of trust unavailable", nil, nil}
+		return {status = .Indeterminate, reason = "chain of trust unavailable"}
 	}
 
 	nsecs, nsec3s, proved := validated_denial_records(v, msg.authority, established, class, keys, unix, now, allocator)
 	if len(nsecs) == 0 && len(nsec3s) == 0 {
-		return {.Bogus, "no denial of existence", nil, nil}
+		return {status = .Bogus, reason = "no denial of existence"}
 	}
 
 	rcode := dns.rcode_of(msg)
@@ -620,13 +655,13 @@ validate_denial :: proc(
 
 	switch proof {
 	case .Proven:
-		return {.Secure, "", nil, proved_denial(msg, proved, established, class, keys, unix, allocator)}
+		return {status = .Secure, authority = proved_denial(msg, proved, established, class, keys, unix, allocator)}
 	case .Opt_Out:
-		return {.Insecure, "opt-out span", nil, nil}
+		return {status = .Insecure, reason = "opt-out span"}
 	case .Failed:
-		return {.Bogus, "denial of existence not proven", nil, nil}
+		return {status = .Bogus, reason = "denial of existence not proven"}
 	}
-	return {.Bogus, "denial of existence not proven", nil, nil}
+	return {status = .Bogus, reason = "denial of existence not proven"}
 }
 
 /*
@@ -642,9 +677,11 @@ AD bit, which is a small forgery but a free one, and a `minimum` of a week on a
 denial nobody signed is worth having.
 
 Checking it costs nothing. The zone the denial was proven against is established
-and its keys are already in hand, so this is one signature verification against
+and its keys are already in hand, so this is a signature verification against
 records that are already here - no walk, no lookup, no chance of turning a
-question about a TTL into an upstream query.
+question about a TTL into an upstream query. A sender padding the SOA with
+signatures buys at most `MAX_SIGNATURES_PER_RRSET` attempts, the same cap every
+other RRset is checked under.
 
 One owner name is looked at, and it is the apex of that zone: RFC 2308 puts the
 SOA of the zone the denial came from in the authority section, and that zone is

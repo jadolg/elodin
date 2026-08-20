@@ -178,10 +178,10 @@ a delegation, or an address, that nothing here examined (RFC 4035 section
 3.2.3). `dnssec.strip_unauthenticated` has the whole argument for taking them
 out rather than trying to check them.
 
-A client that set DO asked for the whole thing and gets it byte for byte. One
-that did not has the DNSSEC records taken back out, because RFC 4035 says not to
-send them unasked and because they would otherwise push ordinary answers past
-the point where they need a retry over TCP.
+A client that set DO asked for the signatures and keeps every record that
+survived the prune above. One that did not has the DNSSEC records taken back
+out, because RFC 4035 says not to send them unasked and because they would
+otherwise push ordinary answers past the point where they need a retry over TCP.
 */
 @(private)
 present_response :: proc(
