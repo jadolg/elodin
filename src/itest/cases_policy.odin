@@ -548,7 +548,9 @@ bulk_answer :: proc(name: string, records: int, allocator := context.allocator) 
 			type  = .A,
 			class = .IN,
 			ttl   = 3600,
-			data  = dns.Rdata_A{addr = {10, u8(i >> 8), u8(i), 1}},
+			// Not RFC 1918, though these are only filler: the rebinding guard
+			// would refuse the whole answer and the cache would never see it.
+			data  = dns.Rdata_A{addr = {198, 51, u8(i >> 8), u8(i)}},
 		}
 	}
 	m := dns.Message {

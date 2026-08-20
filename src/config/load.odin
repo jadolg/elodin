@@ -58,6 +58,7 @@ load_string :: proc(src: string, allocator := context.allocator) -> (cfg: Config
 	load_blocking(&l, &cfg)
 	load_dnssec(&l, &cfg)
 	load_cookies(&l, &cfg)
+	load_rebind(&l, &cfg)
 	load_metrics(&l, &cfg)
 	load_rewrites(&l, &cfg)
 	validate(&l, &cfg)
@@ -736,6 +737,56 @@ load_cookies :: proc(l: ^Loader, cfg: ^Config) {
 	opt_bool(l, n, "require", &cfg.cookies.require, "cookies")
 	opt_bool(l, n, "upstream", &cfg.cookies.upstream, "cookies")
 	opt_string(l, n, "secret", &cfg.cookies.secret, "cookies")
+}
+
+/*
+Read the `rebind` section.
+
+`allow_domains` is canonicalised here, with the same procedure `rewrites` uses,
+so the resolver compares two names that were written the same way. An operator
+who put a trailing dot on one and not the other gets the same behaviour from
+both, which is the sort of difference that is otherwise only found by the name
+that would not resolve.
+*/
+@(private)
+load_rebind :: proc(l: ^Loader, cfg: ^Config) {
+	n := yaml.get(l.root, "rebind")
+	if n == nil {
+		return
+	}
+	opt_bool(l, n, "enabled", &cfg.rebind.enabled, "rebind")
+	opt_bool(l, n, "allow_loopback", &cfg.rebind.allow_loopback, "rebind")
+
+	if d := yaml.get(n, "allow_domains"); !yaml.is_null(d) {
+		list, ok := yaml.as_string_list(d, l.allocator)
+		if !ok {
+			errorf(l, "rebind.allow_domains: expected a list of domains, such as [home.example]")
+			return
+		}
+		out := make([]string, len(list), l.allocator)
+		kept := 0
+		for entry, i in list {
+			/*
+			The root would exempt every name there is, which is `rebind.enabled:
+			false` written in a way nothing about the file makes obvious. Refused
+			rather than obeyed, on the same reasoning that `allow_from:` with no
+			value is refused: the two readings are a setting and its opposite.
+			*/
+			domain := canonical_domain(entry, l.allocator)
+			if domain == "." {
+				errorf(
+					l,
+					"rebind.allow_domains[%d]: %q exempts every name; set rebind.enabled to false if that is what you mean",
+					i,
+					entry,
+				)
+				continue
+			}
+			out[kept] = domain
+			kept += 1
+		}
+		cfg.rebind.allow_domains = out[:kept]
+	}
 }
 
 @(private)

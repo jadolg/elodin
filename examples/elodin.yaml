@@ -329,6 +329,35 @@ cookies:
   # cookies.
   # secret: e5e973e5a6b2a43f48e7dc849e37bfcf
 
+rebind:
+  # Refuse an upstream answer that points a public name into private address
+  # space — loopback, RFC 1918, link-local (169.254.169.254 is the cloud
+  # metadata endpoint), IPv6 unique-local, 0.0.0.0 and ::. That is the DNS half
+  # of a rebinding attack: a page served from a name the attacker owns is
+  # same-origin with whatever that name resolves to, so re-answering it with
+  # 192.168.1.1 lets the page read the router's admin interface using the
+  # browser as the proxy. The whole answer becomes NODATA rather than having the
+  # record filtered out of it. dnsmasq calls this --stop-dns-rebind.
+  #
+  # On, which is not where dnsmasq and AdGuard Home put it. The case for turning
+  # it off is split horizon: if your upstream is your own internal server and it
+  # resolves internal names to RFC 1918 addresses, name those zones in
+  # allow_domains below rather than switching this off. Names you answer with
+  # `rewrites` need nothing — they are answered here and never reach an upstream.
+  enabled: true
+
+  # Zones whose answers may carry private addresses, each covering itself and
+  # everything under it — dnsmasq's --rebind-domain-ok. Matched against the name
+  # that was asked for, so a CNAME into one of these exempts nothing.
+  # allow_domains:
+  #   - corp.example
+  #   - home.arpa
+
+  # Let 127.0.0.0/8 and ::1 through — dnsmasq's --rebind-localhost-ok. Off,
+  # because a service bound to loopback is the one its author most believed only
+  # local processes could reach, and so the one least likely to authenticate.
+  allow_loopback: false
+
 # Local answers. Wildcards match subdomains only, so "*.home" covers host.home
 # but not home itself. `ttl` is what the answer carries, 300 seconds by default.
 # rewrites:

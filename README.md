@@ -14,6 +14,7 @@ Pi-hole and AdGuard Home, minus the web interface. One binary, one YAML file.
 - A ceiling on UDP answer size to bound reflection amplification, on by default
 - Local rewrites (A, AAAA, CNAME, or "answer as if blocked")
 - DNSSEC validation against the root trust anchors, on by default
+- DNS rebinding protection: an upstream answer pointing a public name at loopback, RFC 1918 or link-local space is refused, on by default (see `rebind`)
 - DNS cookies in both directions (RFC 7873/9018), on by default
 - Ships as a systemd service or a `.deb`, with optional automatic system-resolver takeover
 
@@ -269,7 +270,7 @@ only where a value needs it, with the time and the severity as fields rather
 than as a prefix a collector has to be taught to recognise.
 
 ```
-ts=2026-08-07T09:12:33Z level=info msg=ready strategy=Round_Robin upstreams=2 cache=true blocking=true dnssec=true
+ts=2026-08-07T09:12:33Z level=info msg=ready strategy=Round_Robin upstreams=2 cache=true blocking=true dnssec=true rebind=true
 ts=2026-08-07T09:12:41Z level=info msg=query client=192.0.2.10:44188 proto=udp qtype=A qname=example.com outcome=forwarded detail=cloudflare-dot ms=11.7
 ts=2026-08-07T09:12:44Z level=warn msg="list steven-black: unavailable, skipping it"
 ```
@@ -287,8 +288,8 @@ spaces in it. In Loki that is `| logfmt` and nothing else:
 
 Statistics go to the log every five minutes, as `msg=stats` — `queries`,
 `blocked`, `cached`, `forwarded`, `failed`, `dropped`, `refused`,
-`conn_refused`, `conn_failed`, `limited`, `truncated`, `secure` and `bogus`,
-plus `cache_entries`, `cache_bytes`, `cache_hits`, `cache_misses`, `cache_stale`
+`conn_refused`, `conn_failed`, `limited`, `truncated`, `secure`, `bogus` and
+`rebind`, plus `cache_entries`, `cache_bytes`, `cache_hits`, `cache_misses`, `cache_stale`
 and `cache_evictions` — and `log.queries` adds one `msg=query` line per query, at
 the cost noted under [Resource use](#resource-use).
 
@@ -1018,6 +1019,142 @@ already establishes more than a cookie can.
 | a cookie that does not check out | answered anyway, or BADCOOKIE with `require` | ignored, and the wait continues |
 | a message with no cookie | answered, and given none back | accepted, unless that server has issued one before |
 
+### DNS rebinding protection
+
+```yaml
+rebind:
+  enabled: true                   # the default
+  allow_domains: []               # zones that may answer with private addresses
+  allow_loopback: false           # let 127.0.0.0/8 and ::1 through
+```
+
+A page loaded from `rebind.attacker.example` is same-origin with whatever that
+name resolves to, for as long as it resolves to it. So the attacker publishes the
+name with a one-second TTL, lets the browser fetch the page, and answers the next
+lookup with `192.168.1.1` — and the page is now allowed, by the browser's own
+rules, to read the router's admin interface. Nothing was broken into: the
+same-origin policy is keyed on a name, the attacker owns the name, and the
+attacker also decides what it means. The victim's browser is the proxy and the
+victim's LAN is the vantage point.
+
+The browser cannot see this happening; it asked a resolver and believed the
+answer. The resolver can, which is why this is a resolver's job and why every
+comparable product does it — dnsmasq's `--stop-dns-rebind`, Unbound's
+`private-address`, AdGuard Home's rebinding protection.
+
+elodin checks the answer section of an upstream reply for addresses in loopback
+(`127.0.0.0/8`, `::1`), the RFC 1918 ranges, link-local (`169.254.0.0/16`,
+`fe80::/10`), IPv6 unique-local (`fc00::/7`), `0.0.0.0/8` and `::`. It reads A
+and AAAA records and the `ipv4hint`/`ipv6hint` parameters of SVCB and HTTPS
+records, which are addresses a browser connects to without ever asking for the A
+record. `169.254.169.254` is worth naming on its own: it is the cloud instance
+metadata endpoint, it answers unauthenticated to anything that can reach it, and
+what it hands back is credentials.
+
+One offending record refuses the whole answer rather than being filtered out of
+it, so a mixed answer cannot be used to sneak one through and the guard does not
+have to be exhaustive over every way an address can be written into a message.
+The client gets NODATA — NOERROR with an empty answer section, an SOA so it knows
+how long to remember, and RFC 8914 extended error 15 saying why:
+
+```
+ts=… level=warn msg="refused an answer for rebind.attacker.example carrying the private address 192.168.1.1: a public name resolving into private space is how a DNS rebinding attack reaches a service on this network, so the client was told NODATA"
+ts=… level=info msg="query client=192.168.1.20:41234 proto=udp qtype=A qname=\"rebind.attacker.example\" outcome=blocked detail=\"rebind\" ms=12.4"
+```
+
+NODATA rather than SERVFAIL, deliberately. A stub resolver configured with two
+servers treats SERVFAIL as *this* server having failed and asks the other one,
+which on a home network is the router — and the router answers `192.168.1.1`
+quite happily. The refusal would route the attack around itself. NODATA is an
+answer, so the stub stops. It is the same reasoning that has blocklist hits
+answer NXDOMAIN rather than REFUSED.
+
+The check runs before the answer is cached, which is the ordering the whole thing
+rests on: cached first, the first client's private answer is stored and every
+later client is served it without the check ever running again. The refusal is
+not cached either — what elodin saw was one answer, not a property of the name.
+
+Refusals are counted as `rebind=` in the stats line and as
+`elodin_rebind_refused_total` on the metrics endpoint. The first since start is a
+`warn` naming the address and both settings that would allow it; every one after
+is `debug`, so that whoever is triggering it does not decide how much this server
+writes to disk.
+
+#### Why it is on by default
+
+dnsmasq, AdGuard Home and Unbound all ship their version of this **off**. elodin
+ships it **on**, and the reason is worth reading before you decide whether to
+keep it that way.
+
+The first half of the argument is that this tree already made it, one section up.
+[DNSSEC validation](#dnssec) is on by default, and the cost is written down in
+the same shape: an upstream that cannot return DNSSEC records makes every signed
+zone *unresolvable* rather than merely unverified, and anything talking to such
+an upstream has to turn it off deliberately. Blocking, cookies, rate limiting and
+the client allow list all default the same way. A security feature that shipped
+off here would be the one exception, and an operator reasoning from the others
+would guess wrong about this one.
+
+The second half is who runs this. elodin is a forwarder for a box on a LAN that
+every device points at — which is precisely the deployment a rebinding attack
+targets, sharing an address space with the router, the printer and the NAS. That
+population is also the least likely to work through a list of optional hardening
+switches. A default nobody turns on protects nobody.
+
+Against that: the failure mode of this feature is breaking legitimate resolution,
+and it is a real cost rather than a hypothetical one. What it breaks is named
+below, and what makes the default defensible is that the failure is loud — a
+`warn` at the first refusal naming the setting, a counter, a query-log line — and
+the attack it prevents is silent.
+
+#### What this makes unresolvable
+
+- **Split horizon through an internal upstream.** A site whose upstream is its
+  own DNS server, resolving `nas.corp.example` to an RFC 1918 address through the
+  public name space, gets NODATA for every such name after an upgrade. This is
+  the case `allow_domains` exists for; name the zones and they work again:
+
+  ```yaml
+  rebind:
+    allow_domains: [corp.example, home.arpa]
+  ```
+
+  Each entry covers itself and everything below it, the way
+  `--rebind-domain-ok=/corp.example/` does in dnsmasq. Matching is against the
+  name that was asked for, not the owner name of the offending record, so a CNAME
+  from an attacker's name into an exempt zone exempts nothing.
+
+- **Names that legitimately resolve to loopback**, such as a development host
+  pointed at `127.0.0.1` by a public zone. `allow_loopback: true` covers all of
+  them at once; `allow_domains` covers the one you meant. Prefer the second:
+  loopback is the address a rebinding attack most wants, because a service bound
+  to `127.0.0.1` is the one its author most believed only local processes could
+  reach, and so the one least likely to authenticate.
+
+- **A chained sinkhole.** If elodin forwards to another filtering resolver that
+  answers blocked names with `0.0.0.0` or `127.0.0.1` — a Pi-hole, or dnsmasq
+  with `--address=/ads.example/0.0.0.0` — those answers become NODATA here. The
+  name is blocked either way, so nothing an operator wanted stops resolving, but
+  `rebind=` will climb steadily and stop being a useful signal that something is
+  attacking you. `allow_loopback`, or moving the filtering into elodin's own
+  [sink lists](#sink-lists), settles it.
+
+Three things that look like they would break and do not. `rewrites` need no
+exemption: a rewritten name is answered out of the configuration long before
+anything is forwarded, so `nas.home` pointing at `192.168.1.50` never reaches an
+upstream and never reaches this check. Reverse lookups are unaffected — a PTR
+answer is a name, not an address, and the RFC 6303 reverse zones are handled
+separately (see [DNSSEC](#dnssec)). And elodin's own blocking, whatever
+`blocking.response` is set to, builds its answer locally rather than forwarding
+for one.
+
+To restore the previous behaviour in one line:
+
+```yaml
+rebind:
+  enabled: false
+```
+
 ### Rewrites
 
 ```yaml
@@ -1079,7 +1216,7 @@ bind beyond loopback is logged as a warning at startup, once.
 | `elodin_build_info{version}` | gauge | a constant 1, carrying the version as a label |
 | `elodin_uptime_seconds` | gauge | seconds since this process finished starting |
 | `elodin_queries_total` | counter | queries accepted, whatever became of them |
-| `elodin_answers_total{outcome}` | counter | `forwarded`, `cached`, `blocked`, `rewritten`, `failed` — the same words the `msg=query` line uses |
+| `elodin_answers_total{outcome}` | counter | `forwarded`, `cached`, `blocked`, `rewritten`, `failed` — the same words the `msg=query` line uses, except that an answer the rebinding guard withheld is logged as `blocked` and counted in `elodin_rebind_refused_total` instead of here |
 | `elodin_queries_dropped_total` | counter | turned away before any work: the backlog was full, or the source could not be answered |
 | `elodin_queries_refused_total` | counter | turned away by `server.allow_from` |
 | `elodin_connections_refused_total` | counter | refused because `server.max_connections` was full |
@@ -1088,6 +1225,7 @@ bind beyond loopback is logged as a warning at startup, once.
 | `elodin_rate_limited_total` | counter | queries the rate limiter withheld an answer from |
 | `elodin_rate_limit_slipped_total` | counter | those answered truncated instead, to send a real client to TCP |
 | `elodin_dnssec_answers_total{result}` | counter | `secure` and `bogus` |
+| `elodin_rebind_refused_total` | counter | answers withheld because a public name was pointed into private address space |
 | `elodin_cache_entries` / `_bytes` | gauge | what the cache holds, against `max_entries` and `max_bytes` |
 | `elodin_cache_hits_total` / `_misses_total` / `_evictions_total` | counter | how it is doing |
 | `elodin_cache_stale_total` | counter | expired answers served because no fresh one could be got, with `cache.serve_stale` on |
@@ -1387,6 +1525,16 @@ upstream traffic by the number of servers.
 - DNSSEC validation is **on by default**, and where a distribution's crypto
   policy forbids SHA-1 signatures the two RSA/SHA-1 algorithms degrade to
   insecure rather than validating. See the DNSSEC section above.
+- [Rebinding protection](#dns-rebinding-protection) reads the answer section
+  only, and only for A, AAAA, ANY, SVCB and HTTPS questions — the ones a browser
+  can be made to ask. Addresses in the additional section are left alone: they
+  are glue for names other than the one asked about, a stub does not resolve a
+  hostname out of them, and elodin stores and serves a response as a whole under
+  the question's key, so there is no way to retrieve one on its own. An answer
+  the codec cannot decode is forwarded unchecked, which is the decoder's gap
+  rather than the check's — the same message is one the validator cannot
+  validate and the cache declines to store, and the fuzz corpus is what keeps
+  the set of them empty.
 - **Connection-oriented transports get a thread per connection**, capped for
   TCP, DoT and DoH together by `server.max_connections` (512). That is fine for
   clients that hold a connection open and pipeline over it, but it does not suit
