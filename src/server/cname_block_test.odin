@@ -394,6 +394,52 @@ test_a_decoy_branch_does_not_end_the_walk_before_the_other_one :: proc(t: ^testi
 	free_all(context.temp_allocator)
 }
 
+/*
+The budget is spent on names, so repeating one does not spend it.
+
+The answer comes from whoever runs the cloaked zone, and the same CNAME written
+out sixteen times is sixteen records to scan but one name to look up. Counting
+the records instead would let a padded answer use the whole budget up before the
+walk reached the record that mattered, which is the cheapest evasion there is:
+no chain to build, no second zone to run, just the same line repeated.
+*/
+@(test)
+test_a_repeated_cname_does_not_spend_the_budget_for_the_listed_one :: proc(t: ^testing.T) {
+	answer := make([]dns.Record, MAX_CHAIN_NAMES + 2, context.temp_allocator)
+	for i in 0 ..< MAX_CHAIN_NAMES {
+		answer[i] = dns.Record {
+			name  = "www.brand.example.",
+			type  = .CNAME,
+			class = .IN,
+			ttl   = 60,
+			data  = dns.Rdata_Name{name = "decoy.brand.example."},
+		}
+	}
+	answer[MAX_CHAIN_NAMES] = dns.Record {
+		name  = "www.brand.example.",
+		type  = .CNAME,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_Name{name = "tracker.evil.example."},
+	}
+	answer[MAX_CHAIN_NAMES + 1] = dns.Record {
+		name  = "tracker.evil.example.",
+		type  = .A,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_A{addr = {203, 0, 113, 7}},
+	}
+	outcome := serve_cached_answer(
+		t,
+		"www.brand.example.",
+		chain_wire("www.brand.example.", answer),
+		[]string{"tracker.evil.example"},
+		nil,
+	)
+	testing.expect_value(t, outcome, Outcome.Blocked)
+	free_all(context.temp_allocator)
+}
+
 // The hop cap from the other side: a chain that never ends is answered rather
 // than walked forever.
 @(test)

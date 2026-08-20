@@ -117,23 +117,29 @@ cloaked_chain_target :: proc(s: ^Server, answer: []dns.Record, qname: string) ->
 	decoy one hop deep - an innocent target listed first, the tracker reached
 	through the second - would carry the whole chain below it past this.
 
-	At most one entry is added per name looked up, so `MAX_CHAIN_NAMES` bounds
-	the list at that many plus the question it starts with. A name already on it
-	is not added twice, which is what stops a chain that loops from spending the
-	budget going round it.
+	The budget is spent when a name joins this list, not when a record naming it
+	is found, and the two are only the same number for an answer nobody built to
+	be awkward. A name already on the list is passed over entirely - not matched
+	again, not counted again - which is what stops a chain that loops from
+	spending the budget going round it, and what stops the cheapest evasion there
+	is: the same CNAME written out sixteen times is sixteen records to scan but
+	one name to look up, and charging for each copy would let a padded answer use
+	the budget up before the walk reached the record that mattered. No chain to
+	build, no second zone to run, just the one line repeated.
+
+	So `tail` is the count, and there is no separate one to keep in step with it.
+	The list holds the question plus at most `MAX_CHAIN_NAMES` targets, which is
+	the bound on lookups; the scan below runs once per name on it, which is the
+	bound on passes over the answer.
 	*/
 	pending: [MAX_CHAIN_NAMES + 1]string
 	pending[0] = qname
 	head, tail := 0, 1
 
-	looked_up := 0
-	for head < tail && looked_up < MAX_CHAIN_NAMES {
+	for head < tail {
 		name := pending[head]
 		head += 1
 		for r in answer {
-			if looked_up >= MAX_CHAIN_NAMES {
-				break
-			}
 			if r.type != .CNAME || !dns.name_equal_fold(r.name, name) {
 				continue
 			}
@@ -142,13 +148,28 @@ cloaked_chain_target :: proc(s: ^Server, answer: []dns.Record, qname: string) ->
 				continue
 			}
 			/*
-			Every CNAME at this owner counts, not just the first. A name may own
-			one CNAME and nothing else (RFC 1034 section 3.6.2), so a second is a
-			broken answer - but it is one somebody wrote on purpose, and which of
-			them a client picks is the client's business rather than something to
-			guess at here.
+			Every CNAME at this owner is walked, not just the first. A name may
+			own one CNAME and nothing else (RFC 1034 section 3.6.2), so a second
+			is a broken answer - but it is one somebody wrote on purpose, and
+			which of them a client picks is the client's business rather than
+			something to guess at here.
 			*/
-			looked_up += 1
+			seen := false
+			for i in 0 ..< tail {
+				if dns.name_equal_fold(pending[i], v.name) {
+					seen = true
+					break
+				}
+			}
+			if seen {
+				continue
+			}
+			if tail >= len(pending) {
+				break
+			}
+			pending[tail] = v.name
+			tail += 1
+
 			switch filter.engine_match(s.filters, v.name) {
 			case .Allowed:
 				return "", false
@@ -157,17 +178,6 @@ cloaked_chain_target :: proc(s: ^Server, answer: []dns.Record, qname: string) ->
 					target = v.name
 				}
 			case .None:
-			}
-			seen := false
-			for i in 0 ..< tail {
-				if dns.name_equal_fold(pending[i], v.name) {
-					seen = true
-					break
-				}
-			}
-			if !seen && tail < len(pending) {
-				pending[tail] = v.name
-				tail += 1
 			}
 		}
 	}
