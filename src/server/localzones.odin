@@ -123,12 +123,18 @@ root delegates none of them, so no answer a public resolver gives for one of
 these can be the right answer - and the query that fetched the wrong answer has
 already told somebody what was being looked for.
 
-For `.onion` that disclosure is the whole harm, which is why RFC 7686 section 2
-makes forwarding a MUST NOT rather than a SHOULD NOT. The query names, to the
-upstream operator and to anyone on the path to a plain-UDP upstream, one
-specific hidden service that somebody on this network is reaching for: exactly
-what Tor was being used not to publish, leaving through a resolver nobody
-thought was on the path.
+For `.onion` that disclosure is the whole harm. The query names, to the upstream
+operator and to anyone on the path to a plain-UDP upstream, one specific hidden
+service that somebody on this network is reaching for: exactly what Tor was
+being used not to publish, leaving through a resolver nobody thought was on the
+path. RFC 7686 section 2 tells a caching server "where not explicitly adapted to
+interoperate with Tor" not to look these up and to answer NXDOMAIN, which is
+both halves of the behaviour here - and the escape clause is why `onion.` has a
+key rather than only the whole table having one. An operator whose upstream is a
+local tor with `DNSPort` and `AutomapHostsOnResolve` is the adapted case the RFC
+is describing, and `special_use.onion: false` is how they say so. Making them
+reach for `special_use.enabled: false` instead would have cost them `localhost.`
+and `invalid.` to get one zone back.
 
 `localhost.` is the correctness half rather than the privacy half. The only
 answer that name is allowed to have is the loopback address (RFC 6761 section
@@ -137,12 +143,28 @@ rebinding primitive handed over for free. `invalid.` is guaranteed never to
 exist (RFC 6761 section 6.4), so NXDOMAIN from here is the answer the root
 would have given anyway, minus the round trip and minus the leak.
 
+Those two have no key of their own, and the asymmetry with `onion.`, `local.`
+and `test.` below is the point. Each of those three names a deployment somebody
+runs - a Tor-aware upstream, an Active Directory domain, an internal `.test`
+zone - and the key exists because that deployment does. There is no such
+deployment for `localhost.` or `invalid.`: no upstream is authoritative for
+either, and RFC 6761 sections 6.3 and 6.4 leave a resolver nothing to defer to
+about them. A key nobody can describe a legitimate use for is one that only ever
+gets set while somebody is working around a symptom, so neither gets one; the
+whole table still has `special_use.enabled` for the operator who wants none of
+this.
+
 `example.` is deliberately absent, though RFC 6761 reserves it too. Section 6.5
 is the one entry in that document that asks for the opposite of the rest:
 caching servers SHOULD NOT recognise example names as special, because
 `example.com`, `example.net` and `example.org` are delegated and do resolve.
 Answering them from here would break names that work today to honour a
 reservation that exists to stop registries selling them.
+
+The three keys are not symmetric with each other either: `onion` is on and
+turning it off is a statement about the upstream, while `local` and `test` are
+off and turning them on is a statement about this network. Each default is the
+one that leaves a working installation working.
 
 `local.` and `test.` are in the table only when `special_use.local` and
 `special_use.test` ask for them. RFC 6762 section 22 and RFC 6761 section 6.2
@@ -162,9 +184,6 @@ cannot do is send the query somewhere else, there being no per-domain upstream
 here, so a network whose router answers `.local` dynamically needs the
 configuration key rather than a rule. That is what the key is for.
 */
-@(private)
-SPECIAL_USE_NXDOMAIN := [?]string{"onion.", "invalid."}
-
 @(private)
 Special_Use :: enum u8 {
 	None,
@@ -203,13 +222,17 @@ special_use_zone :: proc(s: ^Server, name: string) -> (zone: string, kind: Speci
 	if !s.cfg.special_use.enabled {
 		return "", .None
 	}
+	// The two with no key of their own.
 	if name_at_or_below(name, "localhost.") {
 		return "localhost.", .Loopback
 	}
-	for z in SPECIAL_USE_NXDOMAIN {
-		if name_at_or_below(name, z) {
-			return z, .Nonexistent
-		}
+	if name_at_or_below(name, "invalid.") {
+		return "invalid.", .Nonexistent
+	}
+	// The three an operator can hand back to the upstream, each for a
+	// deployment that really is served there.
+	if s.cfg.special_use.onion && name_at_or_below(name, "onion.") {
+		return "onion.", .Nonexistent
 	}
 	if s.cfg.special_use.local && name_at_or_below(name, "local.") {
 		return "local.", .Nonexistent

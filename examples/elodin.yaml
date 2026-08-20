@@ -385,13 +385,21 @@ rebind:
 
 # Names the RFCs reserved, answered here instead of being sent upstream.
 #
-# `enabled` covers localhost. (127.0.0.1 and ::1, RFC 6761 6.3), onion.
+# `enabled` is the table: localhost. (127.0.0.1 and ::1, RFC 6761 6.3), onion.
 # (NXDOMAIN, RFC 7686 2) and invalid. (NXDOMAIN, RFC 6761 6.4), each including
 # everything below it. The .onion case is the one this is for: forwarding such a
 # query tells the upstream operator, and anyone on the path to a plain-UDP
 # upstream, that somebody here is looking for one specific hidden service.
 # localhost. is the other kind of problem — forwarded, the one name that is only
 # ever allowed to be the loopback address resolves to whatever the upstream says.
+#
+# `onion` turns that one zone back over to the upstream, for the deployment
+# where the upstream can actually answer it: a local tor with DNSPort and
+# AutomapHostsOnResolve. RFC 7686 2 speaks of a caching server "where not
+# explicitly adapted to interoperate with Tor", and this is how you say yours
+# is. It is warned about at startup, because the setting is a claim about your
+# upstream rather than about this resolver. localhost. and invalid. have no such
+# key: no upstream is authoritative for either, so there is nothing to defer to.
 #
 # local. and test. are reserved as well, and both are off. They are the two that
 # networks genuinely serve — an Active Directory domain under .local, an internal
@@ -406,6 +414,7 @@ rebind:
 # resolve.
 special_use:
   enabled: true
+  onion: true
   local: false
   test: false
 
