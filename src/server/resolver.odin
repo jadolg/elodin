@@ -783,7 +783,29 @@ resolve_query :: proc(
 			asks the upstream again, which is what happened before any of this
 			was memoised.
 			*/
-			if s.cfg.cache.enabled && have_decoded {
+			/*
+			`Unreadable` is not stored. The other two verdicts are stable
+			properties of an answer somebody built - a name is on a list, a chain
+			is seventeen long - and they are worth remembering, which is the
+			whole argument for storing a refusal at all: without it the cheapest
+			name to refuse becomes the most expensive one to serve.
+
+			A record this decoder could not parse is not that. It is as likely to
+			be an upstream or a middlebox having a bad day as an attack, which is
+			the same reasoning that gives it SERVFAIL rather than the operator's
+			block response - and memoising it takes that reasoning back. Stored,
+			one malformed CNAME pins the name to SERVFAIL for up to
+			`cache.max_ttl`, a day by default, with the upstream never asked
+			again; a list reload does not release it either, because the re-walk
+			reads the same stored bytes and reaches the same verdict. The name
+			stays broken until the entry expires, for a record the upstream may
+			have stopped sending within the minute.
+
+			So it goes unstored and the next query asks again, which is what the
+			whole-message version of this - `answer-unreadable` above - already
+			does.
+			*/
+			if s.cfg.cache.enabled && have_decoded && verdict != .Unreadable {
 				cache.put(s.answers, key, resp, decoded, generation, u8(verdict))
 			}
 			return out, cloak_outcome(verdict), true
