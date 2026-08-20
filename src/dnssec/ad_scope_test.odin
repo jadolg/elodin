@@ -76,6 +76,26 @@ holds :: proc(records: []dns.Record, name: string, type: dns.Type) -> bool {
 	return false
 }
 
+// Asked for by what it covers, because an apex carries signatures over several
+// types at once and "an RRSIG survived" would be answered by any of them.
+@(private = "file")
+holds_signature_over :: proc(records: []dns.Record, name: string, covered: dns.Type) -> bool {
+	for rec in records {
+		if rec.type != .RRSIG || !dns.name_equal_fold(rec.name, name) {
+			continue
+		}
+		rdata, is_raw := raw_rdata(rec)
+		if !is_raw {
+			continue
+		}
+		sig, err := parse_rrsig(rdata, context.temp_allocator)
+		if err == .None && sig.type_covered == covered {
+			return true
+		}
+	}
+	return false
+}
+
 @(test)
 test_unsigned_authority_records_do_not_reach_the_client :: proc(t: ^testing.T) {
 	v := make_validator(ad_query, nil, Options{})
@@ -180,7 +200,11 @@ test_a_proven_denial_keeps_its_proof_and_its_soa :: proc(t: ^testing.T) {
 
 	testing.expect(t, !holds(pruned.authority, ".", .NS), "an unsigned NS RRset went out under the AD bit")
 	testing.expect(t, holds(pruned.authority, ".", .SOA), "the SOA a client caches the denial by was dropped")
-	testing.expect(t, holds(pruned.authority, ".", .RRSIG), "the SOA's own signature was dropped")
+	testing.expect(
+		t,
+		holds_signature_over(pruned.authority, ".", .SOA),
+		"the SOA survived without the signature that is the only reason it was allowed to",
+	)
 
 	proof := false
 	for rec in pruned.authority {
