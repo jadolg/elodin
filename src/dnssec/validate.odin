@@ -1,10 +1,12 @@
 package dnssec
 
 import "core:mem"
+import "core:slice"
 import "core:strings"
 import "core:sync"
 import "core:time"
 import "elodin:dns"
+import "elodin:logx"
 
 /*
 The chain of trust.
@@ -95,8 +97,16 @@ answered with SERVFAIL rather than chased.
 */
 MAX_LOOKUPS_PER_QUERY :: 32
 
-// Signatures tried on one RRset. A set carries one per algorithm in practice;
-// more than this is a response trying to make us work rather than be believed.
+/*
+Signatures kept beside one RRset when the response is pruned.
+
+Not an attempt limit any more: `validate_rrset` and `verified_rrset` both spend
+`MAX_VERIFICATIONS_PER_QUERY` instead, having each had a per-RRset cap that an
+attacker could fill. What is left is what `strip_unauthenticated` will hand on
+besides the signature that actually verified, which is exempt - a set carries
+one signature per algorithm in practice, and more than this is padding aimed at
+whatever validates downstream.
+*/
 MAX_SIGNATURES_PER_RRSET :: 8
 
 // CNAME hops followed when checking that an answer addresses the question.
@@ -115,7 +125,89 @@ is per client question: two queries arriving at once each get their own.
 */
 @(private)
 Budget :: struct {
-	lookups: int,
+	lookups:       int,
+	verifications: int,
+}
+
+/*
+Signature checks one client question may provoke, in total.
+
+A per-RRset cap cannot do this job, and having one was a way to break a zone: a
+signature is only tried when its signer names a zone in the owner's ancestry,
+but the signer is a name in the RDATA and anyone able to add records can write
+it. Eight forgeries at the head of an RRset therefore spent the whole per-RRset
+allowance before the genuine signature was reached, the set was dropped, and the
+answer came back Bogus - a denial's RRset taking every NXDOMAIN in the zone with
+it. The cap could only ever be filled by signatures an attacker chose; the
+genuine one is what it kept out. Both paths that verify a set - `validate_rrset`
+for the answer section and `verified_rrset` for a denial - are counted here, so
+neither keeps a private allowance that can be emptied on its own.
+
+Counted across the question instead, and spent only on signatures that could
+actually verify - see `signature_worth_trying`, which refuses the rest for
+nothing. Generous next to any real answer: a set carries one signature per
+algorithm, and a chain a handful of sets.
+
+Spent by `validate_rrset` and `verified_rrset`, which is every signature over an
+answer's own RRsets and over a denial's proof. It is *not* spent by the two
+loops that check a DS set in `zone_step` or a DNSKEY set in `fetch_keys`; those
+have never had a bound of any kind, before this change or after it, and giving
+them one is #193 rather than something to bolt on here. So this is a bound on
+the signatures a response's own records provoke, not on every verification a
+question can reach.
+
+It is also a bound on work and not a guarantee that the genuine signature is
+reached, and the difference is worth being plain about. A forgery that copies the real
+signature's key tag, algorithm and validity window - all of them public - buys a
+verification apiece, and enough of them in front of the real one will exhaust
+this and turn the answer Bogus. No number fixes that: the count and the order
+are the sender's, so any budget spent in section order can be spent before the
+record that matters. What stops it being worth doing is that whoever can rewrite
+a response that far can deny the answer by corrupting it instead, which DNSSEC
+never promised to prevent. Leaving the budget out is the option that is actually
+unsafe - that is unbounded verification on a message an attacker wrote.
+*/
+MAX_VERIFICATIONS_PER_QUERY :: 64
+
+/*
+Whether a signature could verify at all, decided without doing any crypto.
+
+Every signature reaching a verification is one an attacker may have written, so
+the useful question before spending anything on one is whether it stands a
+chance. Two things answer it for free: a signature outside its validity window
+cannot verify, and neither can one whose key tag and algorithm name no key the
+zone published.
+
+That is what keeps the budgets below from being an attacker's to spend. A
+forgery now has to name a key tag the zone actually has - and the tag is public,
+so this is a cost rather than a wall - where before any sixteen bytes of noise
+with the right owner name were enough to consume an attempt.
+
+Deliberately the same test `check_signature` makes internally, hoisted out. It
+stays there too: this one decides whether to spend, that one decides the result,
+and a caller reaching the second without the first is answered correctly, just
+more expensively.
+*/
+@(private)
+signature_worth_trying :: proc(sig: Rrsig, keys: []Dnskey, unix: u32) -> bool {
+	if !signature_current(sig, unix) {
+		return false
+	}
+	for key in keys {
+		if key.algorithm == sig.algorithm && key.tag == sig.key_tag && key_usable(key) {
+			return true
+		}
+	}
+	return false
+}
+
+@(private)
+spend_verification :: proc(budget: ^Budget) -> bool {
+	if budget.verifications >= MAX_VERIFICATIONS_PER_QUERY {
+		return false
+	}
+	budget.verifications += 1
+	return true
 }
 
 @(private)
@@ -181,9 +273,89 @@ free_entry :: proc(v: ^Validator, entry: ^Zone_Entry) {
 // ---------------------------------------------------------------------------
 
 Result :: struct {
-	status: Status,
+	status:    Status,
 	// A short phrase for the log line and the extended DNS error.
-	reason: string,
+	reason:    string,
+	/*
+	The RRsets the verdict actually rests on, as owner/type/class triples, in
+	the section each was read from.
+
+	A `Secure` status is reached by checking particular record sets, not by
+	reading the whole message: `validate_answer` looks at the answer section,
+	`validate_denial` at the NSEC and NSEC3 records that carry the proof. What
+	arrived alongside them - a delegation in the authority section, glue in the
+	additional section - is never examined and is nobody's word but the
+	sender's. RFC 4035 section 3.2.3 lets the AD bit be set only over data the
+	resolver authenticated, so the caller needs to know which records those
+	were; `strip_unauthenticated` is what does something about it.
+
+	The two sections are kept apart because the section is part of an RRset's
+	identity here. A signature is checked over the records of one section, so
+	`www.example.com. A` holding up in the answer says nothing about a set of
+	that name and type in the authority section - which is free to hold a
+	different address, and would otherwise be waved through on its neighbour's
+	credentials.
+
+	Filled in only on the `Secure` path, since nothing else can set AD.
+	*/
+	answer:    []Authenticated_Set,
+	authority: []Authenticated_Set,
+}
+
+/*
+An RRset the verdict rests on, and the signer whose signature carried it.
+
+The signer is here because `strip_unauthenticated` has to decide which of the
+signatures in the message may travel with the set, and the only honest answer is
+"the ones naming the signer this server actually verified against". Anything
+looser is a guess: the name in an RRSIG's signer field is chosen by whoever
+wrote the record, so a test that merely asks whether it lies in the owner's
+ancestry admits signatures the validator itself skipped without a glance.
+*/
+Authenticated_Set :: struct {
+	name:      string,
+	type:      dns.Type,
+	class:     dns.Class,
+	signer:    string,
+	/*
+	The whole RRSIG that carried it, so the prune can keep that record whatever
+	else it drops.
+
+	All of it, and this took three goes to get right. Keyed on the key tag and
+	algorithm, a forgery copied both out of the zone's public DNSKEY set and
+	took the exemption. Keyed on the signature bytes, an attacker did not even
+	have to forge: it appended verbatim copies, and then - once those were
+	counted - a near-copy, the genuine record with one bit of its ORIGINAL TTL
+	flipped and the signature left alone. That mutant satisfied a
+	signature-bytes test, took the exemption, and the forgeries behind it filled
+	the cap so that the *genuine* record was the one dropped. The answer then
+	went out under AD and into the cache no longer validating for anybody.
+
+	Every field is compared because every field an attacker can vary is a way to
+	be mistaken for the record that verified while not being it. A copy that
+	matches on all of them is the same record, which is what `verified_kept`
+	is for.
+
+	The slices inside point into the message the verdict was reached over, which
+	the caller's arena keeps alive for as long as the prune needs it.
+	*/
+	rrsig: Rrsig,
+}
+
+// Whether two RRSIGs are the same record, field for field.
+@(private)
+rrsig_equal :: proc(a, b: Rrsig) -> bool {
+	return(
+		a.type_covered == b.type_covered &&
+		a.algorithm == b.algorithm &&
+		a.labels == b.labels &&
+		a.original_ttl == b.original_ttl &&
+		a.expiration == b.expiration &&
+		a.inception == b.inception &&
+		a.key_tag == b.key_tag &&
+		dns.name_equal_fold(a.signer, b.signer) &&
+		slice.equal(a.signature, b.signature) \
+	)
 }
 
 /*
@@ -203,7 +375,7 @@ validate :: proc(
 ) -> Result {
 	msg, derr := dns.decode_message(wire, allocator)
 	if derr != .None {
-		return {.Bogus, "unparseable response"}
+		return {status = .Bogus, reason = "unparseable response"}
 	}
 	class := msg.question[0].class if len(msg.question) > 0 else dns.Class.IN
 	unix := u32(time.to_unix_seconds(now))
@@ -215,7 +387,7 @@ validate :: proc(
 	failure, and report it as a forgery in the bargain.
 	*/
 	if !answerable_rcode(msg) {
-		return {.Insecure, "no data to authenticate"}
+		return {status = .Insecure, reason = "no data to authenticate"}
 	}
 
 	/*
@@ -246,9 +418,371 @@ validate :: proc(
 	denial to demand either.
 	*/
 	if qtype == .RRSIG && len(msg.answer) > 0 {
-		return {.Insecure, "nothing to authenticate"}
+		return {status = .Insecure, reason = "nothing to authenticate"}
 	}
 	return validate_denial(v, &budget, msg, qname, qtype, class, unix, now, allocator)
+}
+
+/*
+Cut a validated response down to the records the verdict covers.
+
+`validate` authenticates particular RRsets, and a response carries more than
+those. The authority section of a positive answer holds a delegation nobody
+here looked at, the additional section holds the addresses to go with it, and
+handing the whole thing on with AD set says this server checked them. RFC 4035
+section 3.2.3 asks it not to say that, and anyone able to add a record to a
+response would be glad to hear it said: a nameserver of their choosing, or an
+address for one, arriving under our authentication. A signed zone the attacker
+owns can bolt those on and still answer the question perfectly; so can anyone on
+the path to a plain UDP or TCP upstream, who need not touch the signed answer at
+all.
+
+Dropped rather than checked, and the reason is not the cost. Validating those
+sections the way the answer section is validated is the obvious repair, and it
+cannot work on the records it would need to work on: the NS RRset at a zone cut
+and the glue below it are unsigned by design (RFC 4035 section 2.2). Exactly
+what an attacker would forge is what no signature can ever settle, so a resolver
+demanding one would refuse every delegation it was ever handed - and would then
+have to special-case its way back to accepting them, which is where it started.
+
+The cost is the second reason and still a real one: each owner name in a
+response is free to name a signer of its own, and a chain walk apiece is what
+MAX_LOOKUPS_PER_QUERY exists to stop one response provoking. Dropping cannot
+cost a lookup.
+
+A forwarder gives up little by dropping them. The client asked this server to
+resolve the name; it is not going to chase a delegation or dial the glue. What
+stays is what was proven and what a client has a use for: the answer, the NSEC
+and NSEC3 records a denial rests on, and the SOA that denial is cached
+negatively against.
+
+Not everything in the additional section is glue, and the argument above does
+not stretch to cover the rest of it. The address records a server sends beside
+an HTTPS, SVCB, SRV or MX answer are ordinary signed zone data (RFC 9460 section
+5 asks for them by name), and a client that has them is spared a round trip
+before it can connect. They are dropped all the same, because they are signed by
+the target's zone rather than by the one this query established, so keeping them
+authenticated means the same second chain walk the denial case needs - and
+keeping them unauthenticated under our AD bit is the whole thing this procedure
+exists to stop. The cost is a round trip on a shape that is getting commoner, so
+it is filed rather than shrugged at.
+
+The one real loss is a CNAME chain that ends in a denial - a dual-stack client
+asking AAAA for an IPv4-only name is the everyday version of it, and a CNAME
+pointing at a name that does not exist is the same shape with NXDOMAIN on it.
+Either reaches `Secure` through `validate_answer` on the strength of the CNAME
+alone, and the proof sitting in its authority section belongs to the target's
+zone, which nothing here ever established. So out it goes with the rest, SOA
+included, and a downstream resolver falls back to its own idea of how long to
+remember the absence.
+
+Our own cache falls back with it, and only on the NXDOMAIN half. `cache.put`
+picks its lifetime on `rcode == .NX_Domain || len(msg.answer) == 0`, so the
+NODATA one keeps its CNAME in the answer section and is held for the shortest
+TTL still there; the NXDOMAIN one takes the negative branch whatever its answer
+section holds, finds no SOA to read, and is held for `cache.negative_ttl`
+instead - longer than a zone asking for less would like, and not at all where an
+operator has set that to zero. Both are the same missing chain walk, and are
+fixed by the same one.
+
+The rcode is the part of this no prune can reach. AD covers the records in those
+two sections, and this makes it honest about them; it says nothing about the
+header. An on-path attacker who flips a signed CNAME answer to NXDOMAIN still
+gets `Secure` out of `validate_answer`, on the strength of a CNAME that really
+is signed, and the client reads an authenticated denial nobody proved. That is
+the same missing chain walk again, from the other end, and the same issue.
+
+Two ways not to lose it, and neither belongs here. Keeping the records and
+clearing AD instead is the one that looks free: it is not, because AD is a
+property of the message and not of a section, so the commonest answer shape
+there is would go out unauthenticated - and the copy that lands in the cache
+would be AD-less for every later client too. A negative-caching hint is not
+worth the bit on the common path. The other way is the correct one, which is to
+establish the target's zone and validate the denial there; that is a second
+chain walk on a hot path, it widens what gets checked rather than narrowing what
+gets claimed, and it is filed as its own issue rather than smuggled in here.
+
+The OPT record survives on its own account. It is transport rather than data -
+no owner name to authenticate - and taking it out would drop the upper bits of
+the rcode and any extended error with them.
+
+Only a `Secure` verdict is pruned. Nothing else sets AD, so nothing else has a
+boundary to keep, and the other paths name no RRsets at all - pruning against
+that would throw the response away.
+*/
+strip_unauthenticated :: proc(
+	wire: []u8,
+	result: Result,
+	allocator := context.temp_allocator,
+	limit := dns.MAX_MESSAGE,
+) -> (
+	out: []u8,
+	ok: bool,
+) {
+	if result.status != .Secure {
+		return wire, true
+	}
+	msg, derr := dns.decode_message(wire, allocator)
+	if derr != .None {
+		return nil, false
+	}
+	msg.answer = authenticated_only(msg.answer, result.answer, allocator)
+	msg.authority = authenticated_only(msg.authority, result.authority, allocator)
+	msg.additional = opt_only(msg.additional, allocator)
+
+	/*
+	A truncated rebuild is a failure, not a result. `encode_message` drops
+	whatever no longer fits and says so in `truncated`; taking that as the
+	pruned message would hand the caller a response with records missing and
+	nothing to distinguish it from a complete one - and the caller's next act is
+	to set the AD bit over it. Failing instead leaves the original standing
+	without the bit, which is the same fallback an encode error already gets.
+	*/
+	encoded, truncated, enc := dns.encode_message(msg, allocator, limit)
+	if enc != .None || truncated {
+		return nil, false
+	}
+	return encoded, true
+}
+
+/*
+Whether the response asserts that there is nothing more to be had.
+
+NXDOMAIN says the name is not there; NOERROR with an SOA in the authority
+section is what RFC 2308 section 2.2 makes a NODATA. Anything else - a bare
+chain, a referral - asserts nothing, and a sender asserting nothing has made no
+claim for this server to put its name to.
+
+This is the one place on this path that reads fields the sender writes, and it
+is the right place for it: what is guarded against is a false denial reaching a
+client under our AD bit, so deleting the claim removes the harm rather than
+hiding it. The client then sees a redirection and goes and asks the target
+itself.
+*/
+@(private)
+denial_claimed :: proc(msg: dns.Message) -> bool {
+	if dns.rcode_of(msg) == .NX_Domain {
+		return true
+	}
+	for rec in msg.authority {
+		if rec.type == .SOA {
+			return true
+		}
+	}
+	return false
+}
+
+/*
+What the answer section does with the question, as the chain sees it.
+
+`answers_question` folded two different outcomes into one `true`: a record of
+the type asked for, and a CNAME chain that stopped short of it. The second is
+not an answer - it is a redirection, and whatever explains the missing type
+lives in the authority section at a zone this path never walked to. Keeping them
+apart is what lets the caller stamp AD on the first and decline to on the
+second.
+*/
+@(private)
+Answer_Shape :: enum u8 {
+	// Nothing here concerns the question.
+	None,
+	// A record of the type asked for was reached.
+	Direct,
+	// A CNAME chain that ran out before the type was reached.
+	Chain_Only,
+}
+
+/*
+Follow the chain from `qname` and report where it ended up.
+
+The walk is the only thing consulted, and that is the point. Scanning the whole
+section for any record of the type is not the same test and was a way to get
+this wrong: an attacker with a signed zone of its own appends
+`x.evil.example. A`, which has nothing to do with the question, and a scan sees
+the type and stops asking.
+*/
+@(private)
+chain_shape :: proc(
+	records: []dns.Record,
+	qname: string,
+	qtype: dns.Type,
+	class: dns.Class,
+) -> Answer_Shape {
+	name := qname
+	hops := 0
+	for hops < MAX_CNAME_CHAIN {
+		target := ""
+		for r in records {
+			if r.class != class || !dns.name_equal_fold(r.name, name) {
+				continue
+			}
+			if r.type == qtype || qtype == .ANY {
+				return .Direct
+			}
+			if r.type == .CNAME {
+				if v, is_name := r.data.(dns.Rdata_Name); is_name {
+					target = v.name
+				}
+			}
+		}
+		if target == "" {
+			// Nothing further to follow. Whether this concerns the question at
+			// all comes down to having got here by a CNAME the queried name owns.
+			return .Chain_Only if hops > 0 else .None
+		}
+		name = target
+		hops += 1
+	}
+	// A chain this long is a loop or a stall, and either way proves nothing.
+	return .None
+}
+
+@(private)
+authenticated_only :: proc(
+	section: []dns.Record,
+	kept: []Authenticated_Set,
+	allocator: mem.Allocator,
+) -> []dns.Record {
+	// Nothing in this section was authenticated, so nothing in it survives. Worth
+	// saying up front: a denial names no RRsets in the answer section, and the
+	// loop below would otherwise parse and allocate a signer name for every RRSIG
+	// sitting there before dropping the lot.
+	if len(kept) == 0 {
+		return nil
+	}
+	// Signatures kept for each authenticated RRset beyond the one that verified,
+	// and whether that one has been kept already.
+	sigs_kept := make([]int, len(kept), allocator)
+	verified_kept := make([]bool, len(kept), allocator)
+	out := make([dynamic]dns.Record, 0, len(section), allocator)
+	for rec in section {
+		covered := rec.type
+		signer: string
+		parsed: Rrsig
+		if rec.type == .RRSIG {
+			/*
+			An RRSIG rides on the RRset it covers. Nothing signs an RRSIG (RFC
+			4035 section 2.2), so one whose RRset did not survive is a record
+			the sender chose and nobody checked - and an answer section holding
+			an RRSIG and nothing else is how a forged denial gets itself sent to
+			`validate_denial` in the first place.
+
+			Kept by what it covers rather than by having been the signature that
+			verified. Deliberate: a set part-way through an algorithm rollover
+			carries an RRSIG per algorithm, and a downstream validator may
+			implement only the other one, so keeping just the signature this
+			build happened to verify would fail exactly the client the records
+			are being kept for.
+
+			What is checked is the signer: it has to be the one whose signature
+			actually carried this set, which `Authenticated_Set` records. That
+			admits the whole rollover case, since the other algorithms' RRSIGs
+			name the same signer, and refuses everything the validator itself
+			never looked at.
+
+			The signature that actually verified is kept whatever else happens
+			to it, which is what makes a cap safe again. A plain count cap was
+			tried here first and was worse than the problem: the section order
+			belongs to whoever wrote the answer, so eight forgeries in front of
+			the real signature filled the allowance and the real one was what
+			got evicted - and the message then went out under AD with nothing in
+			it that verifies, cached that way for every downstream validator
+			behind this resolver. A cap that cannot be made to drop the one
+			record the answer rests on does not have that failure.
+
+			The rest are held to `MAX_SIGNATURES_PER_RRSET`, which is what stops
+			an answer padded with hundreds of same-signer forgeries being stamped
+			with AD, cached, and then handed to every downstream validator to
+			work through on every hit.
+			*/
+			rdata, is_raw := raw_rdata(rec)
+			if !is_raw {
+				continue
+			}
+			sig, err := parse_rrsig(rdata, allocator)
+			if err != .None {
+				continue
+			}
+			covered = sig.type_covered
+			signer = sig.signer
+			parsed = sig
+		}
+		idx, ok := authenticated_rrset(kept, rec.name, covered, rec.class)
+		if !ok {
+			continue
+		}
+		if rec.type == .RRSIG {
+			if !dns.name_equal_fold(signer, kept[idx].signer) {
+				continue
+			}
+			/*
+			The record that verified is exempt from the cap, and exempt once.
+
+			The test is on the signature bytes, which is a comparison of content
+			rather than of identity - and the genuine signature is public, so an
+			attacker appends verbatim copies of it and every copy matched. The
+			exemption was then unlimited and the cap never fired, which is the
+			padding it exists to stop, arrived at by copying instead of forging.
+			*/
+			exempt := !verified_kept[idx] && rrsig_equal(parsed, kept[idx].rrsig)
+			if exempt {
+				verified_kept[idx] = true
+			} else {
+				if sigs_kept[idx] >= MAX_SIGNATURES_PER_RRSET {
+					continue
+				}
+				sigs_kept[idx] += 1
+			}
+		}
+		append(&out, rec)
+	}
+	return out[:]
+}
+
+/*
+The additional section keeps its OPT record and nothing else.
+
+Nothing else in it was authenticated, and there is no second copy of the answer
+to serve the clients that would rather have the unauthenticated version: the
+cache key tells DO and CD apart and nothing else, so one message is what every
+client behind this resolver gets.
+
+What that costs is the address records a responder sends beside an HTTPS, SVCB,
+SRV, MX or NS answer (RFC 9460 section 5) - a client loses them and pays a round
+trip to look them up. Filed as #189, which is where a way to keep the signed ones
+belongs; it needs the answer's own RRsets checked in the additional section
+rather than a change here.
+*/
+@(private)
+opt_only :: proc(section: []dns.Record, allocator: mem.Allocator) -> []dns.Record {
+	out := make([dynamic]dns.Record, 0, 1, allocator)
+	for rec in section {
+		if rec.type == .OPT {
+			append(&out, rec)
+		}
+	}
+	return out[:]
+}
+
+// Like `already_seen`, but the class is part of the question here: a record of
+// some other class carries neither the name nor the type it appears to, and an
+// RRset is only ever checked in the class it was checked in.
+@(private)
+authenticated_rrset :: proc(
+	kept: []Authenticated_Set,
+	name: string,
+	type: dns.Type,
+	class: dns.Class,
+) -> (
+	index: int,
+	found: bool,
+) {
+	for q, i in kept {
+		if q.type == type && q.class == class && dns.name_equal_fold(q.name, name) {
+			return i, true
+		}
+	}
+	return 0, false
 }
 
 @(private)
@@ -268,6 +802,10 @@ validate_answer :: proc(
 	wildcard_seen := false
 	checked := 0
 
+	// What the verdict will be allowed to cover. Built from the RRsets that
+	// came back `Secure` rather than from `seen`, which also holds the ones
+	// that did not - the two only coincide while the whole answer holds up.
+	authenticated := make([dynamic]Authenticated_Set, 0, len(msg.answer), allocator)
 	seen := make([dynamic]dns.Question, 0, len(msg.answer), allocator)
 	for rec in msg.answer {
 		if rec.type == .RRSIG || rec.type == .OPT {
@@ -281,7 +819,18 @@ validate_answer :: proc(
 		records := records_of(msg.answer, rec.name, rec.type, class, allocator)
 		sigs := sigs_covering(msg.answer, rec.name, rec.type, class, allocator)
 
-		status, wildcard, why := validate_rrset(v, budget, rec.name, rec.type, class, records, sigs, unix, now, allocator)
+		status, wildcard, why, signer, carried := validate_rrset(
+			v,
+			budget,
+			rec.name,
+			rec.type,
+			class,
+			records,
+			sigs,
+			unix,
+			now,
+			allocator,
+		)
 		/*
 		A CNAME carrying no signature at all may be one a DNAME produced rather
 		than one a zone forgot to sign. RFC 6672 section 3.4.1 has the server
@@ -292,9 +841,25 @@ validate_answer :: proc(
 		Only an unsigned CNAME is reconsidered. A CNAME that came with a
 		signature was meant to have one, and a signature that did not hold up
 		is not something a DNAME excuses.
+
+		Every record of the set has to be covered, not just the first one found
+		at that owner. The verdict recorded below names an RRset, and the prune
+		keeps everything matching it - so asking about one record and vouching
+		for the set let a second, unsigned CNAME at the same owner ride out
+		under the AD bit, pointing wherever the sender liked. A zone may not
+		publish two CNAMEs at one name (RFC 1034 section 3.6.2) and a DNAME
+		synthesizes exactly one, so a set with a second is not a set a DNAME
+		produced; the loop stops at the first record no DNAME accounts for.
 		*/
 		if status != .Secure && rec.type == .CNAME && len(sigs) == 0 {
-			if dname_covered(v, budget, msg, rec, class, unix, now, allocator) {
+			covered := len(records) > 0
+			for r in records {
+				if !dname_covered(v, budget, msg, r, class, unix, now, allocator) {
+					covered = false
+					break
+				}
+			}
+			if covered {
 				status = .Secure
 				why = ""
 			}
@@ -304,7 +869,18 @@ validate_answer :: proc(
 		if status != .Secure {
 			worst = worse(worst, status)
 			reason = why
+			continue
 		}
+		append(
+			&authenticated,
+			Authenticated_Set {
+				name = rec.name,
+				type = rec.type,
+				class = class,
+				signer = signer,
+				rrsig = carried,
+			},
+		)
 	}
 
 	/*
@@ -313,7 +889,7 @@ validate_answer :: proc(
 	what is authenticatable. Whatever the cause, an empty check is not a pass.
 	*/
 	if checked == 0 {
-		return {.Insecure, "nothing to authenticate"}
+		return {status = .Insecure, reason = "nothing to authenticate"}
 	}
 
 	/*
@@ -327,22 +903,74 @@ validate_answer :: proc(
 	and a stub would read an authenticated answer holding nothing for the name
 	it asked about - a denial of existence that was never proven.
 	*/
-	if worst == .Secure && !answers_question(msg.answer, qname, qtype, class) {
-		return {.Bogus, "answer does not address the question"}
+	shape := chain_shape(msg.answer, qname, qtype, class)
+	if worst == .Secure && shape == .None {
+		return {status = .Bogus, reason = "answer does not address the question"}
 	}
 
 	/*
 	A wildcard answer is only good if the name really had nothing of its own.
 	Without this an attacker holding one wildcard signature could serve it for
 	names the zone answers for directly.
+
+	That proof is also the only thing this path authenticates outside the answer
+	section. It was checked against the zone's keys, so it is as authentic as
+	the answer it stands behind, and a client that validates for itself needs it
+	to reach the same conclusion.
 	*/
+	proved: []Authenticated_Set
 	if worst == .Secure && wildcard_seen {
-		proof := validate_wildcard_proof(v, budget, msg, qname, class, unix, now, allocator)
+		proof, records := validate_wildcard_proof(v, budget, msg, qname, class, unix, now, allocator)
 		if proof != .Secure {
-			return {proof, "wildcard expansion not proven"}
+			return {status = proof, reason = "wildcard expansion not proven"}
 		}
+		proved = records
 	}
-	return {worst, reason}
+
+	/*
+	A chain that ends without the type asked for, where the sender is claiming
+	there is nothing more, is a denial this path did not check.
+
+	The everyday shape is an AAAA lookup for a name whose CNAME leads somewhere
+	with only an A record: the CNAME verifies, the chain concerns the question,
+	and the verdict is `Secure` - reached entirely from the answer section. What
+	says the target really has no AAAA lives in the *authority* section, at the
+	target's zone, which nothing here walked to. The prune keeps only what the
+	verdict names, so that proof was stripped, and the AD bit went out over what
+	was left: a downstream resolver validating for itself gets an authenticated
+	denial with nothing behind it and refuses it.
+
+	Both halves are needed, and finding that out cost a regression. A chain
+	stopping short is not enough on its own - a DNAME redirection is exactly
+	that shape and is not a denial, so refusing on the shape alone took the AD
+	bit off every one of them. `denial_claimed` is the other half.
+
+	*After* the wildcard proof, and that ordering is load-bearing. Put before it,
+	this became a way to skip that proof: an attacker replays a genuine wildcard
+	record as the answer for a name that has its own records, adds one SOA, and
+	what used to be `Bogus` - refused, SERVFAIL - came back `Insecure`, which
+	`resolve_query` forwards to the client. A guard meant to withhold an answer
+	must not be reachable before the check that would have withheld it outright.
+
+	`Insecure` is the honest verdict: this server has no opinion on the denial.
+	Nothing is pruned, so the proof reaches the client intact and it can check
+	it, and no AD bit claims otherwise. Checking it here means walking to the
+	target's zone, which is #186.
+	*/
+	if worst == .Secure && shape == .Chain_Only && denial_claimed(msg) {
+		return {status = .Insecure, reason = "denial after a cname was not checked"}
+	}
+	/*
+	The RRsets are named only when the verdict is `Secure`, which is what
+	`Result` promises and the only case a caller may prune against. A partial
+	verdict has a partial list behind it - the RRsets that happened to hold up
+	while another did not - and pruning a message down to that would drop
+	records from an answer nobody is vouching for anyway.
+	*/
+	if worst != .Secure {
+		return {status = worst, reason = reason}
+	}
+	return {status = worst, reason = reason, answer = authenticated[:], authority = proved}
 }
 
 @(private)
@@ -373,16 +1001,36 @@ validate_denial :: proc(
 	status, keys, established := zone_trust(v, budget, qname, now, allocator)
 	#partial switch status {
 	case .Insecure:
-		return {.Insecure, "unsigned zone"}
+		return {status = .Insecure, reason = "unsigned zone"}
 	case .Bogus:
-		return {.Bogus, "broken chain of trust"}
+		return {status = .Bogus, reason = "broken chain of trust"}
 	case .Indeterminate:
-		return {.Indeterminate, "chain of trust unavailable"}
+		return {status = .Indeterminate, reason = "chain of trust unavailable"}
 	}
 
-	nsecs, nsec3s := validated_denial_records(v, msg.authority, established, class, keys, unix, now, allocator)
+	nsecs, nsec3s, proved, denial_spent := validated_denial_records(
+		v,
+		budget,
+		msg.authority,
+		established,
+		class,
+		keys,
+		unix,
+		now,
+		allocator,
+	)
+	/*
+	Our own allowance again, and the same answer as everywhere else: a proof this
+	server stopped short of reading is not a proof it found wanting. Reported as
+	`Indeterminate` rather than left to fall through to "no denial of existence",
+	which counts a forgery, warns with the client's address beside the word, and
+	hands the client extended error 6.
+	*/
+	if denial_spent {
+		return {.Indeterminate, "verification budget spent", nil, nil}
+	}
 	if len(nsecs) == 0 && len(nsec3s) == 0 {
-		return {.Bogus, "no denial of existence"}
+		return {status = .Bogus, reason = "no denial of existence"}
 	}
 
 	rcode := dns.rcode_of(msg)
@@ -401,13 +1049,70 @@ validate_denial :: proc(
 
 	switch proof {
 	case .Proven:
-		return {.Secure, ""}
+		return {status = .Secure, authority = proved_denial(budget, msg, proved, established, class, keys, unix, allocator)}
 	case .Opt_Out:
-		return {.Insecure, "opt-out span"}
+		return {status = .Insecure, reason = "opt-out span"}
 	case .Failed:
-		return {.Bogus, "denial of existence not proven"}
+		return {status = .Bogus, reason = "denial of existence not proven"}
 	}
-	return {.Bogus, "denial of existence not proven"}
+	return {status = .Bogus, reason = "denial of existence not proven"}
+}
+
+/*
+What a proven denial is allowed to carry, on top of the proof itself.
+
+The SOA, and only if it holds up. It is the one other record in the authority
+section of a NODATA or an NXDOMAIN that a client has a use for - RFC 2308 has it
+decide how long the absence may be remembered, and that number reaches this
+server's own cache through `dns.negative_ttl` - and the denial path never looks
+at it: `validated_denial_records` reads NSEC and NSEC3 records and walks past
+everything else. Left unchecked it is a TTL of the sender's choosing under our
+AD bit, which is a small forgery but a free one, and a `minimum` of a week on a
+denial nobody signed is worth having.
+
+Checking it costs nothing. The zone the denial was proven against is established
+and its keys are already in hand, so this is a signature verification against
+records that are already here - no walk, no lookup, no chance of turning a
+question about a TTL into an upstream query. A sender padding the SOA with
+signatures does not buy a fixed allowance of its own, though: it draws on the
+query-wide `MAX_VERIFICATIONS_PER_QUERY`, which the denial's own proof has just
+been spending. Running it out here drops the SOA - the denial stays proven and
+loses only its negative TTL - and says so at debug rather than passing for a
+signature that failed.
+
+One owner name is looked at, and it is the apex of that zone: RFC 2308 puts the
+SOA of the zone the denial came from in the authority section, and that zone is
+the one this denial was established against. Taking the owner from the response
+instead would let a sender name as many owners as fits in a message and buy a
+signature verification apiece off the back of one question.
+*/
+@(private)
+proved_denial :: proc(
+	budget: ^Budget,
+	msg: dns.Message,
+	proved: []Authenticated_Set,
+	zone: string,
+	class: dns.Class,
+	keys: []Dnskey,
+	unix: u32,
+	allocator: mem.Allocator,
+) -> []Authenticated_Set {
+	out := make([dynamic]Authenticated_Set, 0, len(proved) + 1, allocator)
+	append(&out, ..proved)
+	_, signer, carried, ok, _ := verified_rrset(budget, msg.authority, zone, .SOA, class, zone, keys, unix, allocator)
+	if ok {
+		append(
+			&out,
+			Authenticated_Set {
+				name = zone,
+				type = .SOA,
+				class = class,
+				signer = signer,
+				rrsig = carried,
+			},
+		)
+	}
+	return out[:]
 }
 
 /*
@@ -432,6 +1137,9 @@ validate_rrset :: proc(
 	status: Status,
 	wildcard: bool,
 	reason: string,
+	// Which signature carried the set, for `Authenticated_Set`.
+	signer: string,
+	rrsig: Rrsig,
 ) {
 	/*
 	Each signature names the zone that claims the data, and each is judged
@@ -447,24 +1155,92 @@ validate_rrset :: proc(
 	*/
 	unsupported := false
 	refused := false
-	attempts := 0
+	exhausted := false
+	/*
+	One chain walk per distinct signer, not one per signature.
+
+	`zone_trust` is the expensive thing in this loop - a walk down the
+	hierarchy, taking the validator's lock and cloning a DNSKEY set out of its
+	cache at every step - and it used to be bounded only by the per-RRset
+	attempt cap that sat above it. With that cap gone the walk became the thing
+	an attacker could multiply: a padded answer carrying two thousand RRSIGs
+	whose signer merely names an ancestor of the owner bought two thousand
+	walks, thousands of acquisitions of a lock every validating worker shares,
+	and megabytes of arena, for one question.
+
+	Memoised by signer, which bounds it by the number of ancestors a name has
+	rather than by the number of records somebody wrote. Distinct signers are
+	the only ones that cost anything, and a name has at most as many ancestors
+	as it has labels.
+	*/
+	Walked :: struct {
+		signer:      string,
+		status:      Status,
+		keys:        []Dnskey,
+		established: string,
+	}
+	walked := make([dynamic]Walked, 0, 4, allocator)
+
 	for sig in sigs {
-		if attempts >= MAX_SIGNATURES_PER_RRSET {
-			break
-		}
 		if !name_in_zone(owner, sig.signer) {
 			continue
 		}
-		attempts += 1
+		/*
+		Free, and needs no keys, so it goes above the walk. An expired or
+		not-yet-valid signature cannot verify whatever the chain says, and
+		refusing it here is what stops a heap of stale forgeries paying for
+		chain walks.
+		*/
+		if !signature_current(sig, unix) {
+			continue
+		}
 
-		zone_status, keys, established := zone_trust(v, budget, sig.signer, now, allocator)
+		zone_status: Status
+		keys: []Dnskey
+		established: string
+		seen_walk := false
+		for w in walked {
+			if dns.name_equal_fold(w.signer, sig.signer) {
+				zone_status, keys, established = w.status, w.keys, w.established
+				seen_walk = true
+				break
+			}
+		}
+		if !seen_walk {
+			zone_status, keys, established = zone_trust(v, budget, sig.signer, now, allocator)
+			append(
+				&walked,
+				Walked {
+					signer = sig.signer,
+					status = zone_status,
+					keys = keys,
+					established = established,
+				},
+			)
+		}
 		if zone_status != .Secure || !dns.name_equal_fold(sig.signer, established) {
 			continue
+		}
+		/*
+		Same two guards as the denial path, and for the same reason: this loop
+		used to stop after eight signatures whose signer merely named a zone in
+		the owner's ancestry, and the signer is a field an attacker writes. Eight
+		forgeries in front of the genuine signature therefore spent the whole
+		allowance and the answer came back Bogus - the very shape
+		`MAX_VERIFICATIONS_PER_QUERY` was introduced to remove, left standing on
+		the path every answer-section RRset takes.
+		*/
+		if !signature_worth_trying(sig, keys, unix) {
+			continue
+		}
+		if !spend_verification(budget) {
+			exhausted = true
+			break
 		}
 		result, expanded := check_signature(sig, owner, class, records, keys, unix, allocator)
 		#partial switch result {
 		case .Ok:
-			return .Secure, expanded, ""
+			return .Secure, expanded, "", sig.signer, sig
 		case .Unsupported:
 			unsupported = true
 		case .Refused:
@@ -477,15 +1253,34 @@ validate_rrset :: proc(
 	about the zone the name lives in, not about the signatures that arrived with
 	it, so it is settled by walking down to the name itself.
 	*/
+	/*
+	Our own allowance running out is not evidence about the zone.
+
+	`spend_lookup` already settles this the same way: a chain this server could
+	not afford to walk comes back `Indeterminate`, "chain of trust unavailable",
+	because the answer might be perfectly good and we simply stopped looking.
+
+	What that changes today is the extended error the client is sent - 22,
+	"No Reachable Authority", instead of 6, "DNSSEC Bogus" - and the `reason`
+	that reaches the log. It does not change the counters: `resolve_query`
+	handles `Bogus` and `Indeterminate` in one branch, so `Stats.bogus` moves for
+	both, which is worth knowing before reading that gauge as a forgery count.
+	Splitting them is a change to what the metric means and belongs with the
+	metric rather than here.
+	*/
+	if exhausted {
+		return .Indeterminate, false, "verification budget spent", "", {}
+	}
+
 	missing := "signature missing" if len(sigs) == 0 else "no valid signature"
 	owner_status, _, _ := zone_trust(v, budget, owner, now, allocator)
 	switch owner_status {
 	case .Insecure:
-		return .Insecure, false, "unsigned zone"
+		return .Insecure, false, "unsigned zone", "", {}
 	case .Indeterminate:
-		return .Indeterminate, false, "chain of trust unavailable"
+		return .Indeterminate, false, "chain of trust unavailable", "", {}
 	case .Bogus:
-		return .Bogus, false, "broken chain of trust"
+		return .Bogus, false, "broken chain of trust", "", {}
 	case .Secure:
 	}
 
@@ -503,7 +1298,7 @@ validate_rrset :: proc(
 	point of the second algorithm, inverted.
 	*/
 	if unsupported {
-		return .Bogus, false, "no signature this build can verify"
+		return .Bogus, false, "no signature this build can verify", "", {}
 	}
 
 	/*
@@ -520,9 +1315,9 @@ validate_rrset :: proc(
 	DS instead.
 	*/
 	if refused {
-		return .Insecure, false, "algorithm refused by local policy"
+		return .Insecure, false, "algorithm refused by local policy", "", {}
 	}
-	return .Bogus, false, missing
+	return .Bogus, false, missing, "", {}
 }
 
 /*
@@ -628,34 +1423,62 @@ validate_wildcard_proof :: proc(
 	unix: u32,
 	now: time.Time,
 	allocator: mem.Allocator,
-) -> Status {
+) -> (
+	status: Status,
+	proved: []Authenticated_Set,
+) {
 	// Established from the queried name, for the same reason as the denial path.
-	status, keys, established := zone_trust(v, budget, qname, now, allocator)
-	if status != .Secure {
-		return status
+	trust, keys, established := zone_trust(v, budget, qname, now, allocator)
+	if trust != .Secure {
+		return trust, nil
 	}
-	nsecs, nsec3s := validated_denial_records(v, msg.authority, established, class, keys, unix, now, allocator)
+	nsecs, nsec3s, verified, wildcard_spent := validated_denial_records(
+		v,
+		budget,
+		msg.authority,
+		established,
+		class,
+		keys,
+		unix,
+		now,
+		allocator,
+	)
+	/*
+	The same allowance, and the same answer. Falling through here reports a
+	budget of ours as "wildcard expansion not proven", which reaches the client
+	as a forged answer - the one thing every other exhaustion path in this file
+	now takes care not to say.
+	*/
+	if wildcard_spent {
+		return .Indeterminate, nil
+	}
 	if len(nsecs) > 0 {
 		if _, covered := nsec_covering(nsecs, qname); covered {
-			return .Secure
+			return .Secure, verified
 		}
 	}
 	if len(nsec3s) > 0 {
 		if _, _, ce_ok := nsec3_closest_encloser(nsec3s, qname, established, v.max_nsec3_iterations); ce_ok {
-			return .Secure
+			return .Secure, verified
 		}
 	}
-	return .Bogus
+	return .Bogus, nil
 }
 
 /*
 Verify the NSEC and NSEC3 records of an authority section and hand back the ones
 that held up. An unverified denial record is worse than none, so a single
 failure discards the lot.
+
+`verified` names the RRsets whose signatures were checked here, for a caller
+that has to decide which of them may go out under an AD bit. It is not the same
+as the proof: a record can verify and prove nothing, and it is still a record
+this server authenticated.
 */
 @(private)
 validated_denial_records :: proc(
 	v: ^Validator,
+	budget: ^Budget,
 	authority: []dns.Record,
 	zone: string,
 	class: dns.Class,
@@ -666,9 +1489,14 @@ validated_denial_records :: proc(
 ) -> (
 	nsecs: []Nsec_Rr,
 	nsec3s: []Nsec3_Rr,
+	verified: []Authenticated_Set,
+	// True when the query's verification allowance ran out partway through, so
+	// that a caller can tell "nothing proved this" from "we stopped looking".
+	exhausted: bool,
 ) {
 	out_nsec := make([dynamic]Nsec_Rr, 0, 4, allocator)
 	out_nsec3 := make([dynamic]Nsec3_Rr, 0, 4, allocator)
+	out_verified := make([dynamic]Authenticated_Set, 0, 4, allocator)
 	seen := make([dynamic]dns.Question, 0, 4, allocator)
 
 	for rec in authority {
@@ -680,27 +1508,40 @@ validated_denial_records :: proc(
 		}
 		append(&seen, dns.Question{name = rec.name, type = rec.type})
 
-		records := records_of(authority, rec.name, rec.type, class, allocator)
-		sigs := sigs_covering(authority, rec.name, rec.type, class, allocator)
-
-		verified := false
-		for sig in sigs {
-			if !dns.name_equal_fold(sig.signer, zone) {
-				continue
-			}
-			result, _ := check_signature(sig, rec.name, class, records, keys, unix, allocator)
-			if result == .Ok {
-				verified = true
-				break
-			}
+		records, signer, carried, ok, spent := verified_rrset(
+			budget,
+			authority,
+			rec.name,
+			rec.type,
+			class,
+			zone,
+			keys,
+			unix,
+			allocator,
+		)
+		if spent {
+			// The allowance, not the records. Stop and say so rather than
+			// carrying on to report an empty proof as a forged one.
+			exhausted = true
+			break
 		}
-		if !verified {
+		if !ok {
 			// Dropped rather than fatal. A proof assembled only from records
 			// that verified is sound whatever else came along, and refusing the
 			// lot would let one junk record added to a response deny every name
 			// the real records were about to prove.
 			continue
 		}
+		append(
+			&out_verified,
+			Authenticated_Set {
+				name = rec.name,
+				type = rec.type,
+				class = class,
+				signer = signer,
+				rrsig = carried,
+			},
+		)
 
 		for r in records {
 			rdata, is_raw := raw_rdata(r)
@@ -727,7 +1568,81 @@ validated_denial_records :: proc(
 			}
 		}
 	}
-	return out_nsec[:], out_nsec3[:]
+	return out_nsec[:], out_nsec3[:], out_verified[:], exhausted
+}
+
+/*
+Check one RRset against keys that are already in hand.
+
+The zone is named by the caller rather than taken from the signature, so this
+answers "did this zone sign this" and not "did somebody sign this". Every use is
+in an authority section that has already been placed in a zone, where a signer
+of the response's own choosing is precisely what must not be believed.
+
+The attempts are bounded the way `validate_rrset` bounds them, which is no
+longer a per-RRset cap: both spend the query-wide
+`MAX_VERIFICATIONS_PER_QUERY`, and both throw out for nothing - through
+`signature_worth_trying` - every signature whose key tag and algorithm name no
+key the zone published. Running the budget out here is reported back as
+`exhausted`, not as a set that failed to verify, because the two are different
+things to say about a zone.
+*/
+@(private)
+verified_rrset :: proc(
+	budget: ^Budget,
+	section: []dns.Record,
+	owner: string,
+	type: dns.Type,
+	class: dns.Class,
+	zone: string,
+	keys: []Dnskey,
+	unix: u32,
+	allocator: mem.Allocator,
+) -> (
+	records: []dns.Record,
+	signer: string,
+	rrsig: Rrsig,
+	ok: bool,
+	// True when the query's verification allowance ran out before a signature
+	// held, which is a statement about this server and not about the records.
+	exhausted: bool,
+) {
+	records = records_of(section, owner, type, class, allocator)
+	if len(records) == 0 {
+		return nil, "", {}, false, false
+	}
+	for sig in sigs_covering(section, owner, type, class, allocator) {
+		if !dns.name_equal_fold(sig.signer, zone) {
+			continue
+		}
+		// Free rejects first, so the budget is spent on signatures that could
+		// actually verify rather than on whatever was written in front of them.
+		if !signature_worth_trying(sig, keys, unix) {
+			continue
+		}
+		// Bounded across the question rather than per RRset; see
+		// `MAX_VERIFICATIONS_PER_QUERY` for why the difference matters.
+		if !spend_verification(budget) {
+			/*
+			Said out loud. Running out here drops the RRset, and a dropped SOA
+			takes the denial's negative TTL with it silently - `cache.put` falls
+			back to `cache.negative_ttl`, and with that at zero the answer is not
+			cached at all, so the same question goes upstream every time with
+			nothing anywhere saying why.
+			*/
+			logx.debugf(
+				"dnssec: %s %s ran out of verifications before a signature held; the set is dropped",
+				dns.type_name(type),
+				dns.name_trim_root(owner),
+			)
+			return nil, "", {}, false, true
+		}
+		result, _ := check_signature(sig, owner, class, records, keys, unix, allocator)
+		if result == .Ok {
+			return records, sig.signer, sig, true, false
+		}
+	}
+	return nil, "", {}, false, false
 }
 
 // ---------------------------------------------------------------------------
@@ -911,7 +1826,14 @@ zone_step :: proc(
 
 	// No DS in the answer. The authority section has to say why, and say it in
 	// a form the parent signed.
-	nsecs, nsec3s := validated_denial_records(v, msg.authority, parent, class, parent_keys, unix, now, allocator)
+	// Nothing here reaches a client - this is our own DS lookup - so which
+	// RRsets verified is of no interest beyond the proof they carry.
+	nsecs, nsec3s, _, ds_spent := validated_denial_records(v, budget, msg.authority, parent, class, parent_keys, unix, now, allocator)
+	// A chain step this server ran out of allowance on is one it did not read,
+	// which is `Indeterminate` territory rather than a broken delegation.
+	if ds_spent {
+		return .Indeterminate, nil
+	}
 	if len(nsecs) == 0 && len(nsec3s) == 0 {
 		return .Bogus, nil
 	}
@@ -1319,7 +2241,7 @@ dname_covered :: proc(
 		// Only now is it worth checking the DNAME itself, which costs a walk.
 		records := records_of(msg.answer, rec.name, .DNAME, class, allocator)
 		sigs := sigs_covering(msg.answer, rec.name, .DNAME, class, allocator)
-		status, _, _ := validate_rrset(v, budget, rec.name, .DNAME, class, records, sigs, unix, now, allocator)
+		status, _, _, _, _ := validate_rrset(v, budget, rec.name, .DNAME, class, records, sigs, unix, now, allocator)
 		if status == .Secure {
 			return true
 		}
@@ -1409,33 +2331,7 @@ that led there carried signatures from the zones that own them.
 */
 @(private)
 answers_question :: proc(records: []dns.Record, qname: string, qtype: dns.Type, class: dns.Class) -> bool {
-	name := qname
-	hops := 0
-	for hops < MAX_CNAME_CHAIN {
-		target := ""
-		for r in records {
-			if r.class != class || !dns.name_equal_fold(r.name, name) {
-				continue
-			}
-			if r.type == qtype || qtype == .ANY {
-				return true
-			}
-			if r.type == .CNAME {
-				if v, is_name := r.data.(dns.Rdata_Name); is_name {
-					target = v.name
-				}
-			}
-		}
-		if target == "" {
-			// Nothing further to follow. Whether this answered the question
-			// comes down to having got here by a CNAME the queried name owns.
-			return hops > 0
-		}
-		name = target
-		hops += 1
-	}
-	// A chain this long is a loop or a stall, and either way proves nothing.
-	return false
+	return chain_shape(records, qname, qtype, class) != .None
 }
 
 @(private)

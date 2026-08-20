@@ -1,6 +1,7 @@
 package server
 
 import "core:mem"
+import "core:sync"
 import "elodin:dns"
 import "elodin:dnssec"
 import "elodin:logx"
@@ -170,20 +171,84 @@ dnssec_upstream_query :: proc(query: dns.Message, allocator: mem.Allocator) -> (
 /*
 Turn a validated upstream answer into the one the client gets.
 
-A client that set DO asked for the whole thing and gets it byte for byte. One
-that did not has the DNSSEC records taken back out, because RFC 4035 says not to
-send them unasked and because they would otherwise push ordinary answers past
-the point where they need a retry over TCP.
+An answer this server is about to vouch for is first cut down to the records it
+actually checked. The verdict covers the RRsets the validator looked at, and a
+response carries whatever else its sender chose to put in the authority and
+additional sections - so passing those on under an AD bit would lend our name to
+a delegation, or an address, that nothing here examined (RFC 4035 section
+3.2.3). `dnssec.strip_unauthenticated` has the whole argument for taking them
+out rather than trying to check them.
+
+A client that set DO asked for the signatures and keeps every record that
+survived the prune above. One that did not has the DNSSEC records taken back
+out, because RFC 4035 says not to send them unasked and because they would
+otherwise push ordinary answers past the point where they need a retry over TCP.
 */
+// Set once the first answer has lost its AD bit to a failed rebuild; see below.
+@(private)
+prune_failure_reported: bool
+
 @(private)
 present_response :: proc(
 	wire: []u8,
 	query: dns.Message,
 	qtype: dns.Type,
-	secure: bool,
+	result: dnssec.Result,
 	allocator: mem.Allocator,
 ) -> []u8 {
 	out := wire
+	secure := result.status == .Secure
+	if secure {
+		/*
+		Rebuilt at full size, as below: this is what goes into the cache.
+
+		A response that cannot be rebuilt keeps its records and loses the bit
+		instead. The alternative - serving the message as it stands with AD set
+		- is the thing this call exists to prevent, and refusing the answer
+		outright would let a message we merely failed to re-encode take down a
+		name that validated perfectly well.
+		*/
+		if pruned, ok := dnssec.strip_unauthenticated(out, result, allocator, dns.MAX_MESSAGE); ok {
+			out = pruned
+		} else {
+			/*
+			Said out loud, because everything else about this is silent. The
+			answer validated - `Stats.secure` has already counted it - and the
+			client is about to get it without the bit that says so, which from
+			the outside is indistinguishable from a zone that is not signed. The
+			copy stored in the cache is the AD-less one too, so every later
+			client for that name loses it as well, for the life of the entry.
+
+			Reachable rather than theoretical: `encode_message` refuses raw RDATA
+			of a compressible type that still holds a compression pointer, which
+			is what `decode_raw_rdata` leaves behind when it could not expand
+			one, so an MX or an NS this decoder could not fully read takes the
+			bit down with it.
+			*/
+			/*
+			Once at warn, then at debug, like `report_udp_ceiling`. The condition
+			is per-answer and remotely reachable, so a name that trips it every
+			time would otherwise let whoever queries it decide how much this
+			server writes to disk.
+			*/
+			name := dns.name_trim_root(query.question[0].name if len(query.question) > 0 else "?")
+			if sync.atomic_exchange(&prune_failure_reported, true) {
+				logx.debugf(
+					"dnssec: %s %s validated but could not be rebuilt without its unauthenticated records; answering without the AD bit",
+					dns.type_name(qtype),
+					name,
+				)
+			} else {
+				logx.warnf(
+					"dnssec: %s %s validated but could not be rebuilt without its unauthenticated records; answering without the AD bit",
+					dns.type_name(qtype),
+					name,
+				)
+				logx.warnf("further answers losing the AD bit this way are logged at debug level")
+			}
+			secure = false
+		}
+	}
 	if !dns.edns_do(query) {
 		/*
 		Rebuilt at full size rather than at this client's limit. What comes back
@@ -191,7 +256,7 @@ present_response :: proc(
 		buffer would then be all any later client could be given. Shrinking to
 		fit is `fit_response`'s job, once per client.
 		*/
-		out = strip_dnssec_records(wire, query, qtype, allocator, dns.MAX_MESSAGE)
+		out = strip_dnssec_records(out, query, qtype, allocator, dns.MAX_MESSAGE)
 	}
 	/*
 	AD records the verdict, not the audience. This message may end up in the

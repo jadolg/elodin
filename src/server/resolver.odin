@@ -578,7 +578,7 @@ resolve_query :: proc(
 		case .Secure:
 			sync.atomic_add(&s.stats.secure, 1)
 		}
-		resp = present_response(resp, msg, q.type, result.status == .Secure, allocator)
+		resp = present_response(resp, msg, q.type, result, allocator)
 	}
 
 	if s.cfg.cache.enabled {
