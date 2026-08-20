@@ -140,10 +140,10 @@ validator_query :: proc(
 /*
 Re-ask the client's question with DO and CD set.
 
-The client's own EDNS options ride along - a subnet hint still belongs to it -
-but the payload size and the DO bit are ours. Its cookie is taken back out
-further down, and its transaction ID replaced, once this and the plain
-forwarding path have converged.
+The client's own EDNS options ride along, but the payload size and the DO bit
+are ours. Its cookie and its client-subnet option are taken back out further
+down, and its transaction ID replaced, once this and the plain forwarding path
+have converged.
 */
 @(private)
 dnssec_upstream_query :: proc(query: dns.Message, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
