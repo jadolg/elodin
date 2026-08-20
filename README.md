@@ -1366,8 +1366,9 @@ upstream traffic by the number of servers.
   the upstream scopes on elodin's own address, as it does for a query that never
   carried the option. There is no setting to turn forwarding back on, because
   there is nowhere honest to file the answers yet. A query hiding the option
-  where it cannot be taken back out — in a second OPT record, which RFC 6891
-  forbids anyway — is answered FORMERR rather than forwarded.
+  where it cannot be taken back out — in a second OPT record, or behind option
+  bytes that do not parse as an option list, neither of which RFC 6891 permits
+  anyway — is answered FORMERR rather than forwarded.
 - No per-client rules, no query log database, no web or API surface. Statistics
   go to the log every five minutes, and to a Prometheus endpoint when
   [`metrics.enabled`](#metrics) is set — but that endpoint is counters only,

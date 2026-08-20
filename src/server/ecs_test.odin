@@ -332,6 +332,63 @@ test_an_unstrippable_client_subnet_is_not_forwarded :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+/*
+The same, for a subnet the decoder cannot see rather than one it can see in the
+wrong place.
+
+`decode_record` keeps RDATA it cannot parse as raw bytes rather than rejecting
+the message, so an option list ending in a partial option header decodes to an
+OPT record with no options at all - and the ECS option in front of that stump
+reads as absent to anything asking the decoded message. It is not absent to the
+upstream, which walks the same bytes and stops at the option it understands. So
+the query is stopped here rather than forwarded with the subnet still on it.
+*/
+@(test)
+test_a_client_subnet_behind_unreadable_opt_bytes_is_not_forwarded :: proc(t: ^testing.T) {
+	f: Fixture
+	if !fixture_start(t, &f) {
+		return
+	}
+	defer fixture_stop(&f)
+	_ = net.set_option(f.socket, .Receive_Timeout, 200 * time.Millisecond)
+
+	x := Ecs_Mock{socket = f.socket, name = "cdn.example."}
+	mock := thread.create_and_start_with_poly_data(&x, serve_ecs)
+
+	// One well-formed ECS option, then three bytes of a fourth option header:
+	// enough for `decode_rdata` to give up on the list, not enough to hide the
+	// option from a resolver reading it the same way this one would have.
+	raw := make([]u8, 4 + 8 + 3, context.temp_allocator)
+	raw[0], raw[1] = 0, 8 // OPTION-CODE: Client Subnet
+	raw[2], raw[3] = 0, 8 // OPTION-LENGTH
+	raw[4], raw[5] = 0, 1 // FAMILY: IPv4
+	raw[6] = 24 // SOURCE PREFIX-LENGTH
+	raw[7] = 0 // SCOPE PREFIX-LENGTH
+	raw[8], raw[9], raw[10], raw[11] = 198, 51, 100, 0
+	raw[12], raw[13], raw[14] = 0, 3, 0 // an option header cut short
+
+	opt := dns.make_opt(1232, false)
+	opt.data = dns.Rdata_Raw{data = raw}
+	additional := make([]dns.Record, 1, context.temp_allocator)
+	additional[0] = opt
+
+	out, outcome, ok := handle_query(
+		&f.srv,
+		a_query("cdn.example.", additional),
+		.UDP,
+		"127.0.0.1:5555",
+		context.temp_allocator,
+	)
+	thread.join(mock)
+	thread.destroy(mock)
+
+	testing.expect(t, !x.served, "the query reached the upstream with a subnet still on it")
+	testing.expect(t, ok, "the client was left with nothing at all")
+	testing.expect_value(t, outcome, Outcome.Failed)
+	testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.Form_Err)
+	free_all(context.temp_allocator)
+}
+
 @(test)
 test_a_client_subnet_does_not_survive_the_dnssec_rewrite :: proc(t: ^testing.T) {
 	f: Fixture
