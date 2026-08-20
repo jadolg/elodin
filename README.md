@@ -572,6 +572,16 @@ _dns.resolver.arpa ... did not validate: Bogus`. A `rewrites` rule for the name
 still wins, for an operator who does want to advertise this server's own DoT or
 DoH endpoints.
 
+`special_use.onion: false` stands validation down the same way, on the forward
+side. That key says the upstream is a Tor-aware resolver, and what such an
+upstream answers for a `.onion` name cannot be signed — the root publishes a
+signed proof that there is no `onion.` to delegate — so validating it would
+turn every `.onion` lookup into SERVFAIL. Those names are served insecure,
+without the AD bit, exactly as the reverse zones above are. It is the only other
+place validation is skipped, it applies to nothing but `onion.`, and it is off
+until an operator writes the key down; see [Names that are never
+forwarded](#names-that-are-never-forwarded).
+
 Two things worth knowing about running with it on:
 
 - **Distribution crypto policy can take algorithms away.** Fedora and RHEL ship
@@ -978,6 +988,90 @@ rewrites:
 
 Wildcards match subdomains only, so `*.lan` covers `host.lan` but not `lan`.
 
+### Names that are never forwarded
+
+```yaml
+special_use:
+  enabled: true    # the table below
+  onion: true      # onion.  (RFC 7686 section 2)
+  local: false     # local.  (RFC 6762 section 22)
+  test: false      # test.   (RFC 6761 section 6.2)
+```
+
+Three names are answered here rather than asked about, whatever `upstream.servers`
+says:
+
+| name | answer | why |
+|---|---|---|
+| `localhost.` and below | 127.0.0.1 for A, `::1` for AAAA, NODATA otherwise | RFC 6761 6.3. The only answer it is allowed to have |
+| `onion.` and below | NXDOMAIN | RFC 7686 2, unless the upstream is Tor-aware |
+| `invalid.` and below | NXDOMAIN | RFC 6761 6.4. It cannot exist |
+
+`.onion` is the one this exists for. The query is the disclosure: forwarding it
+tells the upstream operator — and anyone on the path to a plain-UDP upstream —
+that somebody on this network is reaching for one specific hidden service, which
+is what Tor was being used not to publish. `localhost.` is a correctness problem
+rather than a privacy one: forwarded, the name resolves to whatever the upstream
+says, which is a rebinding primitive given away for free.
+
+**`local.` and `test.` are off by default**, though RFC 6762 and RFC 6761 ask for
+the same handling. They are the two reserved names that networks really do serve
+— an Active Directory domain under `.local` older than the reservation, an
+internal `.test` zone that RFC 6761 explicitly permits — and answering them with
+NXDOMAIN on an upgrade would take those hostnames away from a network that had
+them. Turn them on if nothing here serves them; against a public upstream the
+only thing that changes is that the NXDOMAIN arrives without the round trip and
+without the hostname having left the building.
+
+Note that such a site may not have working `.local` names in the first place.
+With `dnssec.enabled` on — the default — the unsigned answer its upstream gives
+is checked against a root that publishes a signed proof there is no `local.` to
+delegate, and SERVFAIL is the likely verdict; the sites this default protects
+are the ones running with validation off. If `.local` is SERVFAILing for you,
+`local: true` at least turns that into a clean NXDOMAIN, and a `rewrites` rule
+turns it into an answer.
+
+A rewrite outranks all of this, since `rewrites` are matched first: a site that
+knows what its own `.local` names resolve to can say so and keep that answer.
+What a rewrite cannot do is send the query somewhere — there is no per-domain
+upstream here — so a network whose router answers `.local` dynamically wants
+`local: false`, which is the default.
+
+There is one upstream for which `.onion` really is the right question to ask: a
+local `tor` with `DNSPort` and `AutomapHostsOnResolve`, which answers those names
+with mapped addresses. That setup wants `onion: false`, and keeps everything else
+in the table. RFC 7686 2 addresses a caching server "where not explicitly adapted
+to interoperate with Tor", so this is the adapted case the RFC leaves room for
+rather than a departure from it. It is warned about at startup, since the setting
+is a claim about the upstream and not about this resolver.
+
+What that upstream answers is unsigned, and cannot be anything else: the root
+publishes a signed proof that there is no `onion.` to delegate, so a validator
+reads a mapped address under it as unsigned data inside the root zone and calls
+it forgery. `onion: false` therefore also takes those names out of DNSSEC
+validation, exactly as the RFC 6303 reverse zones are — they come back as
+insecure, without the AD bit, rather than as SERVFAIL. Nothing else moves:
+validation is untouched for every other name, and for `.onion` too unless the
+key is written down.
+
+`localhost.` and `invalid.` have no key of their own, and are not going to grow
+one. Neither has a deployment that wants them forwarded — no upstream is
+authoritative for either, and RFC 6761 6.3 and 6.4 leave a resolver nothing to
+defer to about them — so a key would only ever be set by somebody working around
+a symptom. `enabled: false` is still there for an operator who wants none of
+this, and says so in the log.
+
+`example.` is deliberately not in the table. It is reserved, but RFC 6761 6.5 is
+the one entry in that document that asks for the opposite: caching servers should
+*not* treat example names as special, `example.com` and its siblings being
+delegated names that resolve.
+
+These answers carry a 10-minute TTL and a synthesised SOA so a resolver
+downstream can cache the negative, and they are not put in elodin's own cache —
+they are built from a table already in memory, and an entry would only outlive
+the reload meant to change it. They show in the query log as `outcome=local
+detail="special-use"`.
+
 ### Metrics
 
 ```yaml
@@ -1095,7 +1189,9 @@ cookies in both directions (RFC 7873, RFC 9018) — answered for clients, and
 presented to plain upstreams with the reply checked against what we sent —
 truncation with the TC bit and the UDP→TCP retry, `version.bind`/`hostname.bind`
 in the CHAOS class, local NODATA answers for `resolver.arpa` (RFC 9462 section
-6.1), and refusal of zone-transfer requests.
+6.1), refusal of zone-transfer requests, and the reserved names of RFC 6761 and
+RFC 7686 answered here instead of being forwarded — see [Names that are never
+forwarded](#names-that-are-never-forwarded).
 
 The cache stores upstream answers as untouched wire bytes plus the offsets of
 their TTL fields, and rewrites those TTLs in place on each hit. That keeps the
