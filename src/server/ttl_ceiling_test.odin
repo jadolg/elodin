@@ -101,23 +101,31 @@ upstream_reply :: proc(ttl: u32) -> []u8 {
 }
 
 /*
-Forward one query to a mock upstream that answers with `ttl`, and report the TTL
-the client is handed.
+Put one query through `handle_query` against a mock upstream that answers with
+`reply`, and report what came back.
 
 `ok` false means the exchange itself did not happen, which the caller reports
-rather than reading a TTL out of nothing.
+rather than reading an answer out of nothing.
 */
 @(private = "file")
-forwarded_ttl :: proc(t: ^testing.T, ttl: u32, max_ttl: u32) -> (served: u32, ok: bool) {
+exchange_once :: proc(
+	t: ^testing.T,
+	reply: []u8,
+	max_ttl: u32,
+) -> (
+	out: []u8,
+	outcome: Outcome,
+	ok: bool,
+) {
 	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
 	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
-		return 0, false
+		return nil, .Failed, false
 	}
 	defer net.close(socket)
 	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
 	bound, berr := net.bound_endpoint(socket)
 	if !testing.expectf(t, berr == nil, "cannot read the mock's port: %v", berr) {
-		return 0, false
+		return nil, .Failed, false
 	}
 
 	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = max_ttl})
@@ -142,7 +150,7 @@ forwarded_ttl :: proc(t: ^testing.T, ttl: u32, max_ttl: u32) -> (served: u32, ok
 
 	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return 0, false
+		return nil, .Failed, false
 	}
 	defer upstream.destroy_group(group)
 
@@ -154,17 +162,36 @@ forwarded_ttl :: proc(t: ^testing.T, ttl: u32, max_ttl: u32) -> (served: u32, ok
 
 	x := Ttl_Exchange {
 		socket = socket,
-		reply  = upstream_reply(ttl),
+		reply  = reply,
 	}
 	mock := thread.create_and_start_with_poly_data(&x, serve_one_ttl)
-	out, outcome, done := handle_query(&s, hostile_query(), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	response, got_outcome, done := handle_query(
+		&s,
+		hostile_query(),
+		.UDP,
+		"127.0.0.1:5555",
+		context.temp_allocator,
+	)
 	thread.join(mock)
 	thread.destroy(mock)
 
 	if !testing.expect(t, x.got, "the upstream was never asked") {
-		return 0, false
+		return nil, .Failed, false
 	}
 	if !testing.expect(t, done, "nothing came back at all") {
+		return nil, .Failed, false
+	}
+	return response, got_outcome, true
+}
+
+/*
+Forward one query to a mock upstream that answers with `ttl`, and report the TTL
+the client is handed.
+*/
+@(private = "file")
+forwarded_ttl :: proc(t: ^testing.T, ttl: u32, max_ttl: u32) -> (served: u32, ok: bool) {
+	out, outcome, done := exchange_once(t, upstream_reply(ttl), max_ttl)
+	if !done {
 		return 0, false
 	}
 	testing.expect_value(t, outcome, Outcome.Forwarded)
@@ -217,5 +244,42 @@ test_max_ttl_bounds_a_forwarded_answer :: proc(t: ^testing.T) {
 		return
 	}
 	testing.expect_value(t, ttl, u32(60))
+	free_all(context.temp_allocator)
+}
+
+/*
+An answer whose TTLs could not be bounded is not passed on.
+
+`dns.cap_ttls` reports false for a message `scan_ttl_offsets` cannot walk, and
+nothing in it was rewritten - so forwarding it hands the client the upstream's
+own figures, which is the one outcome the bounding exists to prevent. The reply
+here answers the question that was asked, so `response_matches` takes it, but
+its ARCOUNT claims a record that is not there: the walk stops, and a client
+parsing the answer section more leniently than this does would read a TTL of
+2^32-1 straight off the wire. SERVFAIL costs nothing, `cache.put` refusing the
+same message means it was never going to be kept either way.
+*/
+@(test)
+test_an_unbounded_answer_is_refused_rather_than_forwarded :: proc(t: ^testing.T) {
+	reply := upstream_reply(max(u32))
+	if !testing.expect(t, len(reply) >= dns.HEADER_SIZE, "the mock reply was not built") {
+		return
+	}
+	// One more additional record than the message carries, so the walk runs off
+	// the end. The question is untouched, so the reply is still accepted.
+	reply[10], reply[11] = 0, 1
+
+	out, outcome, ok := exchange_once(t, reply, 86400)
+	if !ok {
+		return
+	}
+	testing.expect_value(t, outcome, Outcome.Failed)
+
+	refused, derr := dns.decode_message(out, context.temp_allocator)
+	if !testing.expect(t, derr == .None, "the refusal did not decode") {
+		return
+	}
+	testing.expect_value(t, dns.rcode_of(refused), dns.Rcode.Serv_Fail)
+	testing.expect_value(t, len(refused.answer), 0)
 	free_all(context.temp_allocator)
 }
