@@ -181,9 +181,33 @@ free_entry :: proc(v: ^Validator, entry: ^Zone_Entry) {
 // ---------------------------------------------------------------------------
 
 Result :: struct {
-	status: Status,
+	status:    Status,
 	// A short phrase for the log line and the extended DNS error.
-	reason: string,
+	reason:    string,
+	/*
+	The RRsets the verdict actually rests on, as owner/type/class triples, in
+	the section each was read from.
+
+	A `Secure` status is reached by checking particular record sets, not by
+	reading the whole message: `validate_answer` looks at the answer section,
+	`validate_denial` at the NSEC and NSEC3 records that carry the proof. What
+	arrived alongside them - a delegation in the authority section, glue in the
+	additional section - is never examined and is nobody's word but the
+	sender's. RFC 4035 section 3.2.3 lets the AD bit be set only over data the
+	resolver authenticated, so the caller needs to know which records those
+	were; `strip_unauthenticated` is what does something about it.
+
+	The two sections are kept apart because the section is part of an RRset's
+	identity here. A signature is checked over the records of one section, so
+	`www.example.com. A` holding up in the answer says nothing about a set of
+	that name and type in the authority section - which is free to hold a
+	different address, and would otherwise be waved through on its neighbour's
+	credentials.
+
+	Filled in only on the `Secure` path, since nothing else can set AD.
+	*/
+	answer:    []dns.Question,
+	authority: []dns.Question,
 }
 
 /*
@@ -203,7 +227,7 @@ validate :: proc(
 ) -> Result {
 	msg, derr := dns.decode_message(wire, allocator)
 	if derr != .None {
-		return {.Bogus, "unparseable response"}
+		return {.Bogus, "unparseable response", nil, nil}
 	}
 	class := msg.question[0].class if len(msg.question) > 0 else dns.Class.IN
 	unix := u32(time.to_unix_seconds(now))
@@ -215,7 +239,7 @@ validate :: proc(
 	failure, and report it as a forgery in the bargain.
 	*/
 	if !answerable_rcode(msg) {
-		return {.Insecure, "no data to authenticate"}
+		return {.Insecure, "no data to authenticate", nil, nil}
 	}
 
 	/*
@@ -246,9 +270,138 @@ validate :: proc(
 	denial to demand either.
 	*/
 	if qtype == .RRSIG && len(msg.answer) > 0 {
-		return {.Insecure, "nothing to authenticate"}
+		return {.Insecure, "nothing to authenticate", nil, nil}
 	}
 	return validate_denial(v, &budget, msg, qname, qtype, class, unix, now, allocator)
+}
+
+/*
+Cut a validated response down to the records the verdict covers.
+
+`validate` authenticates particular RRsets, and a response carries more than
+those. The authority section of a positive answer holds a delegation nobody
+here looked at, the additional section holds the addresses to go with it, and
+handing the whole thing on with AD set says this server checked them. RFC 4035
+section 3.2.3 asks it not to say that, and anyone able to add a record to a
+response would be glad to hear it said: a nameserver of their choosing, or an
+address for one, arriving under our authentication. A signed zone the attacker
+owns can bolt those on and still answer the question perfectly; so can anyone on
+the path to a plain UDP or TCP upstream, who need not touch the signed answer at
+all.
+
+Dropped rather than checked. Validating those sections the way the answer
+section is validated is the obvious repair and it does not work: the NS RRset at
+a zone cut and the glue below it are unsigned by design (RFC 4035 section 2.2),
+so exactly the records an attacker would forge are the ones no signature can
+settle, and a resolver that demanded one would refuse every delegation it was
+handed. It would cost as well - each owner name in a response is free to name a
+signer of its own, and a chain walk apiece is what MAX_LOOKUPS_PER_QUERY exists
+to stop one response provoking. Dropping cannot cost a lookup.
+
+A forwarder gives up little by dropping them. The client asked this server to
+resolve the name; it is not going to chase a delegation or dial the glue. What
+stays is what was proven and what a client has a use for: the answer, the NSEC
+and NSEC3 records a denial rests on, and the SOA that denial is cached
+negatively against.
+
+The one real loss is a CNAME chain that ends in NODATA. That reaches `Secure`
+through `validate_answer`, on the strength of the CNAME alone, and the proof
+sitting in its authority section is one nothing here ever examined - so out it
+goes with the rest, and the client falls back to its own idea of how long to
+remember a negative answer. Keeping it would mean establishing the target zone,
+which is a chain walk for a zone this query has not otherwise touched, and that
+is the lookup this whole approach was chosen to avoid. It was unauthenticated
+before this change too; the difference is that it is no longer unauthenticated
+and stamped as authenticated.
+
+The OPT record survives on its own account. It is transport rather than data -
+no owner name to authenticate - and taking it out would drop the upper bits of
+the rcode and any extended error with them.
+
+Only a `Secure` verdict is pruned. Nothing else sets AD, so nothing else has a
+boundary to keep, and the other paths name no RRsets at all - pruning against
+that would throw the response away.
+*/
+strip_unauthenticated :: proc(
+	wire: []u8,
+	result: Result,
+	allocator := context.temp_allocator,
+	limit := dns.MAX_MESSAGE,
+) -> (
+	out: []u8,
+	ok: bool,
+) {
+	if result.status != .Secure {
+		return wire, true
+	}
+	msg, derr := dns.decode_message(wire, allocator)
+	if derr != .None {
+		return nil, false
+	}
+	msg.answer = authenticated_only(msg.answer, result.answer, allocator)
+	msg.authority = authenticated_only(msg.authority, result.authority, allocator)
+	msg.additional = opt_only(msg.additional, allocator)
+
+	encoded, _, enc := dns.encode_message(msg, allocator, limit)
+	if enc != .None {
+		return nil, false
+	}
+	return encoded, true
+}
+
+@(private)
+authenticated_only :: proc(section: []dns.Record, kept: []dns.Question, allocator: mem.Allocator) -> []dns.Record {
+	out := make([dynamic]dns.Record, 0, len(section), allocator)
+	for rec in section {
+		covered := rec.type
+		if rec.type == .RRSIG {
+			/*
+			An RRSIG rides on the RRset it covers. Nothing signs an RRSIG (RFC
+			4035 section 2.2), so one whose RRset did not survive is a record
+			the sender chose and nobody checked - and an answer section holding
+			an RRSIG and nothing else is how a forged denial gets itself sent to
+			`validate_denial` in the first place.
+			*/
+			rdata, is_raw := raw_rdata(rec)
+			if !is_raw {
+				continue
+			}
+			sig, err := parse_rrsig(rdata, allocator)
+			if err != .None {
+				continue
+			}
+			covered = sig.type_covered
+		}
+		if !authenticated_rrset(kept, rec.name, covered, rec.class) {
+			continue
+		}
+		append(&out, rec)
+	}
+	return out[:]
+}
+
+@(private)
+opt_only :: proc(section: []dns.Record, allocator: mem.Allocator) -> []dns.Record {
+	out := make([dynamic]dns.Record, 0, 1, allocator)
+	for rec in section {
+		if rec.type == .OPT {
+			append(&out, rec)
+		}
+	}
+	return out[:]
+}
+
+// Like `already_seen`, but the class is part of the question here: a record of
+// some other class carries neither the name nor the type it appears to, and an
+// RRset is only ever checked in the class it was checked in.
+@(private)
+authenticated_rrset :: proc(kept: []dns.Question, name: string, type: dns.Type, class: dns.Class) -> bool {
+	for q in kept {
+		if q.type == type && q.class == class && dns.name_equal_fold(q.name, name) {
+			return true
+		}
+	}
+	return false
 }
 
 @(private)
@@ -268,6 +421,10 @@ validate_answer :: proc(
 	wildcard_seen := false
 	checked := 0
 
+	// What the verdict will be allowed to cover. Built from the RRsets that
+	// came back `Secure` rather than from `seen`, which also holds the ones
+	// that did not - the two only coincide while the whole answer holds up.
+	authenticated := make([dynamic]dns.Question, 0, len(msg.answer), allocator)
 	seen := make([dynamic]dns.Question, 0, len(msg.answer), allocator)
 	for rec in msg.answer {
 		if rec.type == .RRSIG || rec.type == .OPT {
@@ -304,7 +461,9 @@ validate_answer :: proc(
 		if status != .Secure {
 			worst = worse(worst, status)
 			reason = why
+			continue
 		}
+		append(&authenticated, dns.Question{name = rec.name, type = rec.type, class = class})
 	}
 
 	/*
@@ -313,7 +472,7 @@ validate_answer :: proc(
 	what is authenticatable. Whatever the cause, an empty check is not a pass.
 	*/
 	if checked == 0 {
-		return {.Insecure, "nothing to authenticate"}
+		return {.Insecure, "nothing to authenticate", nil, nil}
 	}
 
 	/*
@@ -328,21 +487,28 @@ validate_answer :: proc(
 	it asked about - a denial of existence that was never proven.
 	*/
 	if worst == .Secure && !answers_question(msg.answer, qname, qtype, class) {
-		return {.Bogus, "answer does not address the question"}
+		return {.Bogus, "answer does not address the question", nil, nil}
 	}
 
 	/*
 	A wildcard answer is only good if the name really had nothing of its own.
 	Without this an attacker holding one wildcard signature could serve it for
 	names the zone answers for directly.
+
+	That proof is also the only thing this path authenticates outside the answer
+	section. It was checked against the zone's keys, so it is as authentic as
+	the answer it stands behind, and a client that validates for itself needs it
+	to reach the same conclusion.
 	*/
+	proved: []dns.Question
 	if worst == .Secure && wildcard_seen {
-		proof := validate_wildcard_proof(v, budget, msg, qname, class, unix, now, allocator)
+		proof, records := validate_wildcard_proof(v, budget, msg, qname, class, unix, now, allocator)
 		if proof != .Secure {
-			return {proof, "wildcard expansion not proven"}
+			return {proof, "wildcard expansion not proven", nil, nil}
 		}
+		proved = records
 	}
-	return {worst, reason}
+	return {worst, reason, authenticated[:], proved}
 }
 
 @(private)
@@ -373,16 +539,16 @@ validate_denial :: proc(
 	status, keys, established := zone_trust(v, budget, qname, now, allocator)
 	#partial switch status {
 	case .Insecure:
-		return {.Insecure, "unsigned zone"}
+		return {.Insecure, "unsigned zone", nil, nil}
 	case .Bogus:
-		return {.Bogus, "broken chain of trust"}
+		return {.Bogus, "broken chain of trust", nil, nil}
 	case .Indeterminate:
-		return {.Indeterminate, "chain of trust unavailable"}
+		return {.Indeterminate, "chain of trust unavailable", nil, nil}
 	}
 
-	nsecs, nsec3s := validated_denial_records(v, msg.authority, established, class, keys, unix, now, allocator)
+	nsecs, nsec3s, proved := validated_denial_records(v, msg.authority, established, class, keys, unix, now, allocator)
 	if len(nsecs) == 0 && len(nsec3s) == 0 {
-		return {.Bogus, "no denial of existence"}
+		return {.Bogus, "no denial of existence", nil, nil}
 	}
 
 	rcode := dns.rcode_of(msg)
@@ -401,13 +567,54 @@ validate_denial :: proc(
 
 	switch proof {
 	case .Proven:
-		return {.Secure, ""}
+		return {.Secure, "", nil, proved_denial(msg, proved, established, class, keys, unix, allocator)}
 	case .Opt_Out:
-		return {.Insecure, "opt-out span"}
+		return {.Insecure, "opt-out span", nil, nil}
 	case .Failed:
-		return {.Bogus, "denial of existence not proven"}
+		return {.Bogus, "denial of existence not proven", nil, nil}
 	}
-	return {.Bogus, "denial of existence not proven"}
+	return {.Bogus, "denial of existence not proven", nil, nil}
+}
+
+/*
+What a proven denial is allowed to carry, on top of the proof itself.
+
+The SOA, and only if it holds up. It is the one other record in the authority
+section of a NODATA or an NXDOMAIN that a client has a use for - RFC 2308 has it
+decide how long the absence may be remembered, and that number reaches this
+server's own cache through `dns.negative_ttl` - and the denial path never looks
+at it: `validated_denial_records` reads NSEC and NSEC3 records and walks past
+everything else. Left unchecked it is a TTL of the sender's choosing under our
+AD bit, which is a small forgery but a free one, and a `minimum` of a week on a
+denial nobody signed is worth having.
+
+Checking it costs nothing. The zone the denial was proven against is established
+and its keys are already in hand, so this is one signature verification against
+records that are already here - no walk, no lookup, no chance of turning a
+question about a TTL into an upstream query.
+
+One owner name is looked at, and it is the apex of that zone: RFC 2308 puts the
+SOA of the zone the denial came from in the authority section, and that zone is
+the one this denial was established against. Taking the owner from the response
+instead would let a sender name as many owners as fits in a message and buy a
+signature verification apiece off the back of one question.
+*/
+@(private)
+proved_denial :: proc(
+	msg: dns.Message,
+	proved: []dns.Question,
+	zone: string,
+	class: dns.Class,
+	keys: []Dnskey,
+	unix: u32,
+	allocator: mem.Allocator,
+) -> []dns.Question {
+	out := make([dynamic]dns.Question, 0, len(proved) + 1, allocator)
+	append(&out, ..proved)
+	if _, ok := verified_rrset(msg.authority, zone, .SOA, class, zone, keys, unix, allocator); ok {
+		append(&out, dns.Question{name = zone, type = .SOA, class = class})
+	}
+	return out[:]
 }
 
 /*
@@ -628,30 +835,47 @@ validate_wildcard_proof :: proc(
 	unix: u32,
 	now: time.Time,
 	allocator: mem.Allocator,
-) -> Status {
+) -> (
+	status: Status,
+	proved: []dns.Question,
+) {
 	// Established from the queried name, for the same reason as the denial path.
-	status, keys, established := zone_trust(v, budget, qname, now, allocator)
-	if status != .Secure {
-		return status
+	trust, keys, established := zone_trust(v, budget, qname, now, allocator)
+	if trust != .Secure {
+		return trust, nil
 	}
-	nsecs, nsec3s := validated_denial_records(v, msg.authority, established, class, keys, unix, now, allocator)
+	nsecs, nsec3s, verified := validated_denial_records(
+		v,
+		msg.authority,
+		established,
+		class,
+		keys,
+		unix,
+		now,
+		allocator,
+	)
 	if len(nsecs) > 0 {
 		if _, covered := nsec_covering(nsecs, qname); covered {
-			return .Secure
+			return .Secure, verified
 		}
 	}
 	if len(nsec3s) > 0 {
 		if _, _, ce_ok := nsec3_closest_encloser(nsec3s, qname, established, v.max_nsec3_iterations); ce_ok {
-			return .Secure
+			return .Secure, verified
 		}
 	}
-	return .Bogus
+	return .Bogus, nil
 }
 
 /*
 Verify the NSEC and NSEC3 records of an authority section and hand back the ones
 that held up. An unverified denial record is worse than none, so a single
 failure discards the lot.
+
+`verified` names the RRsets whose signatures were checked here, for a caller
+that has to decide which of them may go out under an AD bit. It is not the same
+as the proof: a record can verify and prove nothing, and it is still a record
+this server authenticated.
 */
 @(private)
 validated_denial_records :: proc(
@@ -666,9 +890,11 @@ validated_denial_records :: proc(
 ) -> (
 	nsecs: []Nsec_Rr,
 	nsec3s: []Nsec3_Rr,
+	verified: []dns.Question,
 ) {
 	out_nsec := make([dynamic]Nsec_Rr, 0, 4, allocator)
 	out_nsec3 := make([dynamic]Nsec3_Rr, 0, 4, allocator)
+	out_verified := make([dynamic]dns.Question, 0, 4, allocator)
 	seen := make([dynamic]dns.Question, 0, 4, allocator)
 
 	for rec in authority {
@@ -680,27 +906,15 @@ validated_denial_records :: proc(
 		}
 		append(&seen, dns.Question{name = rec.name, type = rec.type})
 
-		records := records_of(authority, rec.name, rec.type, class, allocator)
-		sigs := sigs_covering(authority, rec.name, rec.type, class, allocator)
-
-		verified := false
-		for sig in sigs {
-			if !dns.name_equal_fold(sig.signer, zone) {
-				continue
-			}
-			result, _ := check_signature(sig, rec.name, class, records, keys, unix, allocator)
-			if result == .Ok {
-				verified = true
-				break
-			}
-		}
-		if !verified {
+		records, ok := verified_rrset(authority, rec.name, rec.type, class, zone, keys, unix, allocator)
+		if !ok {
 			// Dropped rather than fatal. A proof assembled only from records
 			// that verified is sound whatever else came along, and refusing the
 			// lot would let one junk record added to a response deny every name
 			// the real records were about to prove.
 			continue
 		}
+		append(&out_verified, dns.Question{name = rec.name, type = rec.type, class = class})
 
 		for r in records {
 			rdata, is_raw := raw_rdata(r)
@@ -727,7 +941,54 @@ validated_denial_records :: proc(
 			}
 		}
 	}
-	return out_nsec[:], out_nsec3[:]
+	return out_nsec[:], out_nsec3[:], out_verified[:]
+}
+
+/*
+Check one RRset against keys that are already in hand.
+
+The zone is named by the caller rather than taken from the signature, so this
+answers "did this zone sign this" and not "did somebody sign this". Every use is
+in an authority section that has already been placed in a zone, where a signer
+of the response's own choosing is precisely what must not be believed.
+
+The attempts are capped the way `validate_rrset` caps them: an RRset carries one
+signature per algorithm, and a response offering more than that is trying to buy
+verifications rather than be believed.
+*/
+@(private)
+verified_rrset :: proc(
+	section: []dns.Record,
+	owner: string,
+	type: dns.Type,
+	class: dns.Class,
+	zone: string,
+	keys: []Dnskey,
+	unix: u32,
+	allocator: mem.Allocator,
+) -> (
+	records: []dns.Record,
+	ok: bool,
+) {
+	records = records_of(section, owner, type, class, allocator)
+	if len(records) == 0 {
+		return nil, false
+	}
+	attempts := 0
+	for sig in sigs_covering(section, owner, type, class, allocator) {
+		if attempts >= MAX_SIGNATURES_PER_RRSET {
+			break
+		}
+		if !dns.name_equal_fold(sig.signer, zone) {
+			continue
+		}
+		attempts += 1
+		result, _ := check_signature(sig, owner, class, records, keys, unix, allocator)
+		if result == .Ok {
+			return records, true
+		}
+	}
+	return nil, false
 }
 
 // ---------------------------------------------------------------------------
@@ -911,7 +1172,9 @@ zone_step :: proc(
 
 	// No DS in the answer. The authority section has to say why, and say it in
 	// a form the parent signed.
-	nsecs, nsec3s := validated_denial_records(v, msg.authority, parent, class, parent_keys, unix, now, allocator)
+	// Nothing here reaches a client - this is our own DS lookup - so which
+	// RRsets verified is of no interest beyond the proof they carry.
+	nsecs, nsec3s, _ := validated_denial_records(v, msg.authority, parent, class, parent_keys, unix, now, allocator)
 	if len(nsecs) == 0 && len(nsec3s) == 0 {
 		return .Bogus, nil
 	}
