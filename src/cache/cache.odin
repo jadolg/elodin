@@ -248,6 +248,23 @@ get :: proc(
 	return out, stale, true
 }
 
+/*
+The ceiling this cache puts on a TTL, for an answer that is not coming out of it.
+
+`put` bounds what it stores, so everything served from an entry is bounded
+already; a forwarded answer is bounded by the caller, and this is the figure to
+bound it by. Reported rather than read off the configuration because the two are
+not the same number: `make_cache` reads an unset `max_ttl` as a day, and a
+caller that went to the configuration would apply zero. No cache means no
+ceiling - `cache.enabled: false` leaves nothing of this setting in play.
+*/
+ttl_ceiling :: proc(c: ^Cache) -> u32 {
+	if c == nil {
+		return dns.TTL_MAX
+	}
+	return c.max_ttl
+}
+
 // Count a stale answer that a caller went on to serve; see `Stats.stale`.
 note_stale_served :: proc(c: ^Cache) {
 	if c == nil {
@@ -284,6 +301,28 @@ put :: proc(c: ^Cache, key: string, wire: []u8, msg: dns.Message) -> bool {
 		return false
 	}
 	ttls := dns.read_ttls(wire, offsets, c.allocator)
+
+	/*
+	`max_ttl` applied to the stored figures, not only to the entry's lifetime.
+
+	Every copy this cache serves is `e.wire` with `e.ttls` counted down into it
+	by `patch_ttls`, so bounding the array here bounds what every client is told
+	for as long as the entry lives, and the hot path stays the copy plus a
+	handful of u32 writes it was. Capping in `get` instead would put a second
+	comparison in that loop for a figure that cannot change after the insert.
+
+	Without this the setting bounds only how long the answer is held *here*: the
+	client is handed the upstream's own number and goes on holding the record
+	long after this cache has dropped it, which is the half of a poisoned answer
+	that outlives the poisoning. It is why dnsmasq's `--max-ttl`, Unbound's
+	`cache-max-ttl` and BIND's `max-cache-ttl` all rewrite the TTL in the answer
+	they hand out. The mirror of `min_ttl`, which has always reached the client -
+	`patch_ttls` takes it as a floor - and the pair now says the same kind of
+	thing in both directions.
+	*/
+	for &t in ttls {
+		t = min(t, c.max_ttl)
+	}
 
 	effective: u32
 	if rcode == .NX_Domain || len(msg.answer) == 0 {

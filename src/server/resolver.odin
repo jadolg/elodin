@@ -581,6 +581,35 @@ resolve_query :: proc(
 		resp = present_response(resp, msg, q.type, result.status == .Secure, allocator)
 	}
 
+	/*
+	The TTLs bounded once, here, so the client's copy and the entry's are the
+	same bytes.
+
+	RFC 2181 section 8 is not a setting and runs whatever the cache is doing: a
+	TTL with the top bit set becomes zero, which makes the answer uncacheable
+	below - `effective` works out at zero - and tells the client to come back
+	rather than to hold the record for sixty-eight years. Doing it in
+	`cache.put` alone would leave the forwarded copy carrying the hostile figure
+	to the client that caused the fetch, and with `cache.enabled: false` would
+	leave every answer carrying it.
+
+	The ceiling is the cache's `max_ttl`, and `ttl_ceiling` reports no ceiling
+	when there is no cache, since the setting is then not in play at all. An
+	answer forwarded on a miss is the same answer the next client is handed out
+	of the entry it just filled, so bounding one and not the other would make
+	the client that caused the fetch the one client the setting never reaches.
+	This is the reading dnsmasq's `--max-ttl` has always had: the maximum TTL
+	handed out to clients.
+
+	`min_ttl` deliberately stays where it is, on the copies `cache.get` serves.
+	A ceiling can only shorten what a client is told, which is safe wherever it
+	is applied; the floor lengthens it, and it is honest on the way out of the
+	cache because the entry really is being held that long. Applied here it
+	would stretch the TTL of an answer that may not be kept at all - the cache
+	can be off, and `put` refuses plenty of what it is handed.
+	*/
+	_ = dns.cap_ttls(resp, cache.ttl_ceiling(s.answers), allocator)
+
 	if s.cfg.cache.enabled {
 		if decoded, dec_err := dns.decode_message(resp, allocator); dec_err == .None {
 			/*
