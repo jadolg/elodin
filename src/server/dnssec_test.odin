@@ -31,6 +31,26 @@ question :: proc() -> []dns.Question {
 	return out
 }
 
+/*
+An RRSIG's RDATA, far enough along to be read as one.
+
+Only the covered type is ever looked at here - `dnssec.strip_unauthenticated`
+keeps a signature for the RRset it covers, so a record whose first two bytes say
+nothing is a signature over nothing and is dropped. The rest is filler: no
+signature is verified anywhere in this file, which is `src/dnssec`'s work
+against captured chains.
+*/
+@(private = "file")
+rrsig_over :: proc(covered: dns.Type) -> dns.Rdata_Raw {
+	// 18 bytes of fixed fields, the root as the signer name, then a signature.
+	rdata := make([]u8, 27, context.temp_allocator)
+	rdata[0] = u8(u16(covered) >> 8)
+	rdata[1] = u8(u16(covered))
+	rdata[2] = 13 // ECDSA P-256, so the algorithm at least names something real
+	rdata[3] = 3 // labels
+	return dns.Rdata_Raw{data = rdata}
+}
+
 @(private = "file")
 signed_response :: proc() -> dns.Message {
 	answer := make([]dns.Record, 2, context.temp_allocator)
@@ -46,7 +66,7 @@ signed_response :: proc() -> dns.Message {
 		type = .RRSIG,
 		class = .IN,
 		ttl = 300,
-		data = dns.Rdata_Raw{data = make([]u8, 40, context.temp_allocator)},
+		data = rrsig_over(.A),
 	}
 	authority := make([]dns.Record, 1, context.temp_allocator)
 	authority[0] = dns.Record {
@@ -300,8 +320,266 @@ test_ad_never_goes_out_over_records_the_verdict_missed :: proc(t: ^testing.T) {
 	// signs - stays.
 	testing.expect_value(t, len(decoded.additional), 1)
 	testing.expect(t, dns.edns_present(decoded), "the OPT record should survive")
+
+	// The answer and the signature over it both stay: an RRSIG rides on the
+	// RRset it covers, and this one covers an RRset that held up.
+	testing.expect_value(t, len(decoded.answer), 2)
+	testing.expect_value(t, decoded.answer[0].type, dns.Type.A)
+	testing.expect_value(t, decoded.answer[1].type, dns.Type.RRSIG)
+	free_all(context.temp_allocator)
+}
+
+/*
+What the prune leaves behind still has to survive the two paths after it.
+
+`strip_dnssec_records` runs next for a client that never set DO, and this is the
+order they run in: the prune first, at full size, and the client's own trimming
+after. Getting that backwards would have taken the forgery out for the non-DO
+client by accident and left it in for the DO client, which is the one whose
+message is otherwise passed through byte for byte.
+*/
+@(test)
+test_a_pruned_answer_survives_the_strip_for_a_client_without_do :: proc(t: ^testing.T) {
+	msg := signed_response()
+	authority := make([dynamic]dns.Record, 0, len(msg.authority) + 1, context.temp_allocator)
+	append(&authority, ..msg.authority)
+	append(
+		&authority,
+		dns.Record {
+			name = "example.com.",
+			type = .NS,
+			class = .IN,
+			ttl = 86400,
+			data = dns.Rdata_Name{name = "ns.attacker.example."},
+		},
+	)
+	msg.authority = authority[:]
+
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	testing.expect_value(t, err, dns.Encode_Error.None)
+
+	out := present_response(wire, client_query(false), .A, secure_verdict(), context.temp_allocator)
+	testing.expect(t, out[3] & 0x20 != 0, "AD should record the secure verdict")
+
+	decoded, derr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+
+	// The answer the client asked for, with the DNSSEC records it did not ask
+	// for taken back out - and the forgery gone whichever procedure got to it.
 	testing.expect_value(t, len(decoded.answer), 1)
 	testing.expect_value(t, decoded.answer[0].type, dns.Type.A)
+	testing.expect_value(t, len(decoded.authority), 0)
+
+	// The OPT is the client's again, rebuilt by the strip: its buffer size, and
+	// DO clear because it never asked.
+	testing.expect(t, dns.edns_present(decoded), "the OPT record should survive")
+	testing.expect(t, !dns.edns_do(decoded), "DO should be clear for a client that did not set it")
+	testing.expect_value(t, dns.edns_udp_size(decoded), u16(1232))
+	free_all(context.temp_allocator)
+}
+
+@(private = "file")
+aaaa_question :: proc() -> []dns.Question {
+	out := make([]dns.Question, 1, context.temp_allocator)
+	out[0] = dns.Question {
+		name  = "www.example.com.",
+		type  = .AAAA,
+		class = .IN,
+	}
+	return out
+}
+
+@(private = "file")
+aaaa_query :: proc() -> dns.Message {
+	msg := dns.Message {
+		id       = 0x2b2b,
+		question = aaaa_question(),
+	}
+	msg.flags.rd = true
+	additional := make([]dns.Record, 1, context.temp_allocator)
+	additional[0] = dns.make_opt(1232, true)
+	msg.additional = additional
+	return msg
+}
+
+/*
+The everyday shape this prune costs something: AAAA for a name that is CNAME'd
+to an IPv4-only host. The CNAME is signed and checks out; the NODATA at the end
+of it is proven in the target's zone, which the validator never establishes - so
+that proof and the SOA beside it go out with the rest of what nobody checked.
+*/
+@(private = "file")
+cname_nodata_response :: proc() -> dns.Message {
+	answer := make([]dns.Record, 2, context.temp_allocator)
+	answer[0] = dns.Record {
+		name = "www.example.com.",
+		type = .CNAME,
+		class = .IN,
+		ttl = 600,
+		data = dns.Rdata_Name{name = "cdn.example.net."},
+	}
+	answer[1] = dns.Record {
+		name = "www.example.com.",
+		type = .RRSIG,
+		class = .IN,
+		ttl = 600,
+		data = rrsig_over(.CNAME),
+	}
+	authority := make([]dns.Record, 3, context.temp_allocator)
+	authority[0] = dns.Record {
+		name = "example.net.",
+		type = .SOA,
+		class = .IN,
+		ttl = 900,
+		data = dns.Rdata_SOA {
+			ns = "ns.example.net.",
+			mbox = "hostmaster.example.net.",
+			serial = 1,
+			refresh = 7200,
+			retry = 3600,
+			expire = 1209600,
+			minimum = 900,
+		},
+	}
+	authority[1] = dns.Record {
+		name = "cdn.example.net.",
+		type = .NSEC,
+		class = .IN,
+		ttl = 900,
+		data = dns.Rdata_Raw{data = make([]u8, 12, context.temp_allocator)},
+	}
+	authority[2] = dns.Record {
+		name = "example.net.",
+		type = .RRSIG,
+		class = .IN,
+		ttl = 900,
+		data = rrsig_over(.SOA),
+	}
+	additional := make([]dns.Record, 1, context.temp_allocator)
+	additional[0] = dns.make_opt(4096, true)
+
+	msg := dns.Message {
+		id         = 0x2b2b,
+		question   = aaaa_question(),
+		answer     = answer,
+		authority  = authority,
+		additional = additional,
+	}
+	msg.flags.qr = true
+	msg.flags.ra = true
+	return msg
+}
+
+/*
+A pruned answer must still be an answer the cache will keep.
+
+`cache.put` reads a lifetime out of one of two branches, and which one it lands
+in is decided by `rcode == .NX_Domain || len(msg.answer) == 0`. NODATA after a
+CNAME keeps the CNAME in its answer section, so it takes the ordinary branch and
+is held for the shortest TTL among the records that are left. The other branch
+reads the SOA, which is exactly what the prune took away.
+
+Worth pinning because it comes out right by which branch the message falls into
+rather than by anything the prune does on purpose. The cache here is built with
+`negative_ttl` 0 to make that visible: had this entry taken the negative branch
+there would be no SOA left to read and no fallback to stand in for it, and
+`cache.put` would have refused it. An answer shape that quietly stopped being
+cacheable would send every AAAA lookup for a CNAME'd name upstream, every time,
+with nothing to connect it to this change.
+
+The stored bytes are then served back through `handle_query`, because the copy
+in the cache is the pruned one and `serve_from_cache` is what hands it to every
+later client.
+*/
+@(test)
+test_a_pruned_answer_is_still_cached_and_served :: proc(t: ^testing.T) {
+	wire, _, err := dns.encode_message(cname_nodata_response(), context.temp_allocator)
+	testing.expect_value(t, err, dns.Encode_Error.None)
+
+	// The verdict `validate_answer` reaches on this shape: the CNAME held up,
+	// and nothing in the authority section was ever looked at.
+	covered := make([]dns.Question, 1, context.temp_allocator)
+	covered[0] = dns.Question {
+		name  = "www.example.com.",
+		type  = .CNAME,
+		class = .IN,
+	}
+	verdict := dnssec.Result {
+		status = .Secure,
+		answer = covered,
+	}
+
+	out := present_response(wire, aaaa_query(), .AAAA, verdict, context.temp_allocator)
+	decoded, derr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+
+	if !testing.expect_value(t, len(decoded.answer), 2) {
+		return
+	}
+	testing.expect_value(t, decoded.answer[0].type, dns.Type.CNAME)
+	testing.expect_value(t, len(decoded.authority), 0)
+	// The condition `cache.put` reads, stated where a change to it would show.
+	testing.expect_value(t, dns.rcode_of(decoded), dns.Rcode.No_Error)
+	testing.expect(t, len(decoded.answer) > 0, "an empty answer section would take the negative branch")
+
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, negative_ttl = 0})
+	defer cache.destroy(answers)
+
+	key_buf: [cache.KEY_MAX]u8
+	key := cache.make_key(key_buf[:], "www.example.com.", .AAAA, .IN, true, false)
+	if !testing.expect(t, cache.put(answers, key, out, decoded), "a pruned answer was not cacheable") {
+		return
+	}
+
+	/*
+	The other side of that, so the reason it worked is on the record rather than
+	inferred. Take the CNAME out as well and the same message falls into the
+	negative branch, where there is now no SOA to read a lifetime from and no
+	`negative_ttl` behind it - and the cache turns the entry away.
+	*/
+	{
+		answerless := decoded
+		answerless.answer = nil
+		empty, _, eerr := dns.encode_message(answerless, context.temp_allocator)
+		testing.expect_value(t, eerr, dns.Encode_Error.None)
+		other := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, negative_ttl = 0})
+		defer cache.destroy(other)
+		testing.expect(
+			t,
+			!cache.put(other, key, empty, answerless),
+			"an answer section pruned to nothing was cached anyway, so this test proves less than it claims",
+		)
+	}
+
+	cfg := config.default_config()
+	cfg.log.queries = false
+	s := Server {
+		cfg     = &cfg,
+		answers = answers,
+	}
+	// Present so the request counts as one this server would validate, which is
+	// what lets the stored AD bit reach a client that asked for it.
+	s.validator = dnssec.make_validator(nil, nil, dnssec.Options{})
+	defer dnssec.destroy_validator(s.validator)
+
+	query_wire, _, qenc := dns.encode_message(aaaa_query(), context.temp_allocator)
+	testing.expect_value(t, qenc, dns.Encode_Error.None)
+
+	served, outcome, ok := handle_query(&s, query_wire, .UDP, "test", context.temp_allocator)
+	testing.expect(t, ok, "no response was produced")
+	testing.expect_value(t, outcome, Outcome.Cached)
+	if !ok {
+		return
+	}
+	testing.expect(t, served[3] & 0x20 != 0, "the stored verdict should reach a client that set DO")
+
+	hit, hderr := dns.decode_message(served, context.temp_allocator)
+	testing.expect_value(t, hderr, dns.Decode_Error.None)
+	if !testing.expect_value(t, len(hit.answer), 2) {
+		return
+	}
+	testing.expect_value(t, hit.answer[0].type, dns.Type.CNAME)
+	testing.expect_value(t, len(hit.authority), 0)
 	free_all(context.temp_allocator)
 }
 
