@@ -318,21 +318,44 @@ Authenticated_Set :: struct {
 	class:     dns.Class,
 	signer:    string,
 	/*
-	The signature bytes of the RRSIG that carried it, so the prune can keep that
-	record whatever else it drops.
+	The whole RRSIG that carried it, so the prune can keep that record whatever
+	else it drops.
 
-	The bytes rather than the key tag and algorithm, which is what this was
-	first: both of those are published in the zone's DNSKEY set, so an attacker
-	copies them off the genuine signature and every forgery it writes takes the
-	exemption too - the cap then never fires and the padding it was meant to
-	stop rides out under AD. The signature itself is the one field of an RRSIG
-	that cannot be copied from public data and still be the record that
-	verified.
+	All of it, and this took three goes to get right. Keyed on the key tag and
+	algorithm, a forgery copied both out of the zone's public DNSKEY set and
+	took the exemption. Keyed on the signature bytes, an attacker did not even
+	have to forge: it appended verbatim copies, and then - once those were
+	counted - a near-copy, the genuine record with one bit of its ORIGINAL TTL
+	flipped and the signature left alone. That mutant satisfied a
+	signature-bytes test, took the exemption, and the forgeries behind it filled
+	the cap so that the *genuine* record was the one dropped. The answer then
+	went out under AD and into the cache no longer validating for anybody.
 
-	A slice into the message the verdict was reached over, which the caller's
-	arena keeps alive for as long as the prune needs it.
+	Every field is compared because every field an attacker can vary is a way to
+	be mistaken for the record that verified while not being it. A copy that
+	matches on all of them is the same record, which is what `verified_kept`
+	is for.
+
+	The slices inside point into the message the verdict was reached over, which
+	the caller's arena keeps alive for as long as the prune needs it.
 	*/
-	signature: []u8,
+	rrsig: Rrsig,
+}
+
+// Whether two RRSIGs are the same record, field for field.
+@(private)
+rrsig_equal :: proc(a, b: Rrsig) -> bool {
+	return(
+		a.type_covered == b.type_covered &&
+		a.algorithm == b.algorithm &&
+		a.labels == b.labels &&
+		a.original_ttl == b.original_ttl &&
+		a.expiration == b.expiration &&
+		a.inception == b.inception &&
+		a.key_tag == b.key_tag &&
+		dns.name_equal_fold(a.signer, b.signer) &&
+		slice.equal(a.signature, b.signature) \
+	)
 }
 
 /*
@@ -543,7 +566,7 @@ authenticated_only :: proc(
 	for rec in section {
 		covered := rec.type
 		signer: string
-		signature: []u8
+		parsed: Rrsig
 		if rec.type == .RRSIG {
 			/*
 			An RRSIG rides on the RRset it covers. Nothing signs an RRSIG (RFC
@@ -590,7 +613,7 @@ authenticated_only :: proc(
 			}
 			covered = sig.type_covered
 			signer = sig.signer
-			signature = sig.signature
+			parsed = sig
 		}
 		idx, ok := authenticated_rrset(kept, rec.name, covered, rec.class)
 		if !ok {
@@ -609,7 +632,7 @@ authenticated_only :: proc(
 			exemption was then unlimited and the cap never fired, which is the
 			padding it exists to stop, arrived at by copying instead of forging.
 			*/
-			exempt := !verified_kept[idx] && slice.equal(signature, kept[idx].signature)
+			exempt := !verified_kept[idx] && rrsig_equal(parsed, kept[idx].rrsig)
 			if exempt {
 				verified_kept[idx] = true
 			} else {
@@ -704,7 +727,7 @@ validate_answer :: proc(
 		records := records_of(msg.answer, rec.name, rec.type, class, allocator)
 		sigs := sigs_covering(msg.answer, rec.name, rec.type, class, allocator)
 
-		status, wildcard, why, signer, signature := validate_rrset(
+		status, wildcard, why, signer, carried := validate_rrset(
 			v,
 			budget,
 			rec.name,
@@ -763,7 +786,7 @@ validate_answer :: proc(
 				type = rec.type,
 				class = class,
 				signer = signer,
-				signature = signature,
+				rrsig = carried,
 			},
 		)
 	}
@@ -926,7 +949,7 @@ proved_denial :: proc(
 ) -> []Authenticated_Set {
 	out := make([dynamic]Authenticated_Set, 0, len(proved) + 1, allocator)
 	append(&out, ..proved)
-	_, signer, signature, ok := verified_rrset(budget, msg.authority, zone, .SOA, class, zone, keys, unix, allocator)
+	_, signer, carried, ok, _ := verified_rrset(budget, msg.authority, zone, .SOA, class, zone, keys, unix, allocator)
 	if ok {
 		append(
 			&out,
@@ -935,7 +958,7 @@ proved_denial :: proc(
 				type = .SOA,
 				class = class,
 				signer = signer,
-				signature = signature,
+				rrsig = carried,
 			},
 		)
 	}
@@ -966,7 +989,7 @@ validate_rrset :: proc(
 	reason: string,
 	// Which signature carried the set, for `Authenticated_Set`.
 	signer: string,
-	signature: []u8,
+	rrsig: Rrsig,
 ) {
 	/*
 	Each signature names the zone that claims the data, and each is judged
@@ -982,6 +1005,7 @@ validate_rrset :: proc(
 	*/
 	unsupported := false
 	refused := false
+	exhausted := false
 	/*
 	One chain walk per distinct signer, not one per signature.
 
@@ -1060,12 +1084,13 @@ validate_rrset :: proc(
 			continue
 		}
 		if !spend_verification(budget) {
+			exhausted = true
 			break
 		}
 		result, expanded := check_signature(sig, owner, class, records, keys, unix, allocator)
 		#partial switch result {
 		case .Ok:
-			return .Secure, expanded, "", sig.signer, sig.signature
+			return .Secure, expanded, "", sig.signer, sig
 		case .Unsupported:
 			unsupported = true
 		case .Refused:
@@ -1078,15 +1103,30 @@ validate_rrset :: proc(
 	about the zone the name lives in, not about the signatures that arrived with
 	it, so it is settled by walking down to the name itself.
 	*/
+	/*
+	Our own allowance running out is not evidence about the zone.
+
+	`spend_lookup` already settles this the same way: a chain this server could
+	not afford to walk comes back `Indeterminate`, "chain of trust unavailable",
+	because the answer might be perfectly good and we simply stopped looking.
+	Reporting a budget of ours as `Bogus` publishes a resource limit to the
+	operator as a forgery - `Stats.bogus` counts it, the log names the client
+	beside the word forgery, and the client is handed extended error 6, "DNSSEC
+	Bogus", for an answer nobody found anything wrong with.
+	*/
+	if exhausted {
+		return .Indeterminate, false, "verification budget spent", "", {}
+	}
+
 	missing := "signature missing" if len(sigs) == 0 else "no valid signature"
 	owner_status, _, _ := zone_trust(v, budget, owner, now, allocator)
 	switch owner_status {
 	case .Insecure:
-		return .Insecure, false, "unsigned zone", "", nil
+		return .Insecure, false, "unsigned zone", "", {}
 	case .Indeterminate:
-		return .Indeterminate, false, "chain of trust unavailable", "", nil
+		return .Indeterminate, false, "chain of trust unavailable", "", {}
 	case .Bogus:
-		return .Bogus, false, "broken chain of trust", "", nil
+		return .Bogus, false, "broken chain of trust", "", {}
 	case .Secure:
 	}
 
@@ -1104,7 +1144,7 @@ validate_rrset :: proc(
 	point of the second algorithm, inverted.
 	*/
 	if unsupported {
-		return .Bogus, false, "no signature this build can verify", "", nil
+		return .Bogus, false, "no signature this build can verify", "", {}
 	}
 
 	/*
@@ -1121,9 +1161,9 @@ validate_rrset :: proc(
 	DS instead.
 	*/
 	if refused {
-		return .Insecure, false, "algorithm refused by local policy", "", nil
+		return .Insecure, false, "algorithm refused by local policy", "", {}
 	}
-	return .Bogus, false, missing, "", nil
+	return .Bogus, false, missing, "", {}
 }
 
 /*
@@ -1302,7 +1342,7 @@ validated_denial_records :: proc(
 		}
 		append(&seen, dns.Question{name = rec.name, type = rec.type})
 
-		records, signer, signature, ok := verified_rrset(
+		records, signer, carried, ok, _ := verified_rrset(
 			budget,
 			authority,
 			rec.name,
@@ -1327,7 +1367,7 @@ validated_denial_records :: proc(
 				type = rec.type,
 				class = class,
 				signer = signer,
-				signature = signature,
+				rrsig = carried,
 			},
 		)
 
@@ -1385,12 +1425,15 @@ verified_rrset :: proc(
 ) -> (
 	records: []dns.Record,
 	signer: string,
-	signature: []u8,
+	rrsig: Rrsig,
 	ok: bool,
+	// True when the query's verification allowance ran out before a signature
+	// held, which is a statement about this server and not about the records.
+	exhausted: bool,
 ) {
 	records = records_of(section, owner, type, class, allocator)
 	if len(records) == 0 {
-		return nil, "", nil, false
+		return nil, "", {}, false, false
 	}
 	for sig in sigs_covering(section, owner, type, class, allocator) {
 		if !dns.name_equal_fold(sig.signer, zone) {
@@ -1416,14 +1459,14 @@ verified_rrset :: proc(
 				dns.type_name(type),
 				dns.name_trim_root(owner),
 			)
-			break
+			return nil, "", {}, false, true
 		}
 		result, _ := check_signature(sig, owner, class, records, keys, unix, allocator)
 		if result == .Ok {
-			return records, sig.signer, sig.signature, true
+			return records, sig.signer, sig, true, false
 		}
 	}
-	return nil, "", nil, false
+	return nil, "", {}, false, false
 }
 
 // ---------------------------------------------------------------------------
