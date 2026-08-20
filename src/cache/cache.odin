@@ -410,6 +410,52 @@ note_checked :: proc(c: ^Cache, key: string, serial: u64, checked: u64, refused:
 	e.refused = refused
 }
 
+/*
+Drop an entry a caller has decided is of no use to it.
+
+Guarded by `serial` for the same reason `note_checked` is: between the caller
+reading the bytes and reaching this, another worker's answer may have taken the
+key, and dropping that one would throw away a good entry on the strength of a
+verdict about bytes it has nothing to do with.
+
+Not counted an eviction. That number is what the bound pushed out to make room,
+and an operator reading a rising eviction count is asking whether the cache is
+too small; this is an entry that turned out to be unusable, which is a different
+question and a rarer one.
+*/
+forget :: proc(c: ^Cache, key: string, serial: u64) {
+	if c == nil {
+		return
+	}
+	sync.mutex_lock(&c.mu)
+	defer sync.mutex_unlock(&c.mu)
+	if e, found := c.entries[key]; found && e.serial == serial {
+		remove_entry(c, e)
+	}
+}
+
+/*
+Take back a hit the caller did not end up serving.
+
+`get` counts a hit when it hands the bytes over, because that is the only point
+it knows anything at all - and a caller that then withholds the answer has left
+`elodin_cache_hits_total` counting a lookup that was not answered from the
+cache, which is what its help text says it counts. The stale path settles the
+same question inside `get` by counting itself a miss; this is that, for the
+answers only the caller can rule on.
+*/
+note_hit_withheld :: proc(c: ^Cache) {
+	if c == nil {
+		return
+	}
+	sync.mutex_lock(&c.mu)
+	defer sync.mutex_unlock(&c.mu)
+	if c.stats.hits > 0 {
+		c.stats.hits -= 1
+	}
+	c.stats.misses += 1
+}
+
 // Count a stale answer that a caller went on to serve; see `Stats.stale`.
 note_stale_served :: proc(c: ^Cache) {
 	if c == nil {

@@ -286,15 +286,86 @@ test_an_allowed_question_exempts_the_chain_it_leads_to :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
-// Allow beats block for one name; it beats it across a chain the same way, and
-// the hop it wins on may come after the hop that would have lost.
+/*
+An allow rule speaks for its own name and does not excuse the one beside it.
+
+This asserted the opposite until an allowlisted name anywhere in the answer was
+recognised for what it is: a key the responder can use to turn the check off.
+The chain here reaches a listed name and then an allowed one, and the answer is
+refused for the listed name regardless of what follows it.
+*/
 @(test)
-test_an_allow_rule_later_in_the_chain_beats_a_block_earlier_in_it :: proc(t: ^testing.T) {
+test_an_allow_rule_later_in_the_chain_does_not_excuse_a_block_earlier_in_it :: proc(t: ^testing.T) {
 	outcome := serve_cached_chain(
 		t,
 		[]string{"www.brand.example.", "tracker.evil.example.", "safe.example."},
 		[]string{"evil.example"},
 		[]string{"safe.example"},
+	)
+	testing.expect_value(t, outcome, Outcome.Blocked)
+	free_all(context.temp_allocator)
+}
+
+/*
+The same thing in the shape an attacker would actually write it.
+
+Not a chain at all: two CNAMEs at the question's owner, one pointing at whatever
+host the operator has allowlisted and one at the tracker. Both are reachable, so
+both are matched, and an allow that cleared the answer would clear this one -
+for the cost of a single extra record that the responder writes itself. Every
+allowlist entry would be a master key, and an allowlist is a thing operators add
+to precisely because they had to unbreak a site.
+*/
+@(test)
+test_an_allowed_sibling_does_not_clear_the_listed_target :: proc(t: ^testing.T) {
+	answer := make([]dns.Record, 3, context.temp_allocator)
+	answer[0] = dns.Record {
+		name  = "www.brand.example.",
+		type  = .CNAME,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_Name{name = "cdn.allowed.example."},
+	}
+	answer[1] = dns.Record {
+		name  = "www.brand.example.",
+		type  = .CNAME,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_Name{name = "tracker.evil.example."},
+	}
+	answer[2] = dns.Record {
+		name  = "tracker.evil.example.",
+		type  = .A,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_A{addr = {203, 0, 113, 7}},
+	}
+	outcome := serve_cached_answer(
+		t,
+		"www.brand.example.",
+		chain_wire("www.brand.example.", answer),
+		[]string{"tracker.evil.example"},
+		[]string{"cdn.allowed.example"},
+	)
+	testing.expect_value(t, outcome, Outcome.Blocked)
+	free_all(context.temp_allocator)
+}
+
+/*
+The escape hatch that remains: allow the question.
+
+Nobody but the client chooses what gets asked, so an allow rule on the question
+is an operator statement about a lookup rather than something a responder can
+manufacture. This is what an operator reaches for when a first-party name
+resolves through a CDN somebody has listed.
+*/
+@(test)
+test_allowing_the_question_still_exempts_a_listed_chain :: proc(t: ^testing.T) {
+	outcome := serve_cached_chain(
+		t,
+		[]string{"www.brand.example.", "tracker.evil.example."},
+		[]string{"evil.example"},
+		[]string{"www.brand.example"},
 	)
 	testing.expect_value(t, outcome, Outcome.Cached)
 	free_all(context.temp_allocator)

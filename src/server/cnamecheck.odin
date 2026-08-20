@@ -63,17 +63,28 @@ lookups to learn what the walk below would have told it for nothing: with no
 CNAME anywhere in the section there is no target to return, whatever the lists
 say about the question.
 
-Allow beats block anywhere the walk reaches, which is how `engine_match` already
-resolves the two for a single name, and is the only escape hatch there is for a
-first-party name whose CDN or analytics host is on somebody's list. So a block
-found early does not end the walk: it is held while the rest of the names are
-tried, and an allow found later stands the answer back up.
+An allow rule speaks for the name it names and for nothing else. `engine_match`
+resolves allow over block for a single name, and that is the whole of what it
+settles: an allowed name is not a block, and the walk goes on. It does not
+excuse a *different* name found beside it.
 
-"Anywhere the walk reaches" and "anywhere in the chain" part company at the
-budget below, where a block at the third name is returned although an allow rule
-would have matched the seventeenth. That is the price of bounding the work, and
-the answer it can happen to is one with sixteen names in its chain - which no
-zone publishes and an exception nobody could have known to write.
+Hoisting it to the answer - any allowed name anywhere clears the lot - was the
+first shape of this and it handed the whole check away. The party that writes
+the answer section is the party this feature is aimed at, so it may write
+whatever names it likes into it: one extra CNAME at the question's owner
+pointing at any host the operator has ever allowlisted, the tracker's CNAME
+beside it, and the answer went out intact. Every allowlist entry was a master
+key, and an allowlist is a thing operators add to precisely because they had to
+unbreak something.
+
+So the only whole-answer exemption is an allow rule on the *question*, matched
+above before any of this runs. That one is safe because the question is the
+client's, not the responder's: nobody but the client chooses what gets asked.
+It is also the escape hatch to reach for when a first-party name resolves
+through a CDN somebody has listed - name the first-party lookup, not the CDN.
+
+A block found early still does not end the walk, because the walk is also
+looking for the budget's end.
 
 A DNAME is not followed, and for an answer built to RFC 6672 section 3.1 it does
 not need to be: the responder synthesizes the CNAME that the redirection amounts
@@ -233,13 +244,14 @@ cloaked_chain_target :: proc(
 			tail += 1
 
 			switch filter.engine_match(s.filters, v.name) {
-			case .Allowed:
-				return "", .Clear
 			case .Blocked:
 				if target == "" {
 					target = v.name
 				}
-			case .None:
+			case .Allowed, .None:
+				// Allowed says this name is not a block. It says nothing about
+				// the next one; see the note above on why that distinction is
+				// the whole of the check.
 			}
 		}
 	}
@@ -322,6 +334,20 @@ refuse_cloaked :: proc(
 			dns.name_trim_root(q.name),
 			client,
 			MAX_CHAIN_NAMES,
+		)
+	} else if target == "" {
+		/*
+		A refusal the cache remembered, which records that the answer redirects
+		onto a listed name without keeping which one - see `serve_from_cache`.
+		Worded for what is actually known rather than printed with an empty name
+		in the sentence, which is what naming a target this path has not got
+		amounts to.
+		*/
+		logx.debugf(
+			"%s %s from %s redirects onto a name on the block list, found when the answer was first checked",
+			dns.type_name(q.type),
+			dns.name_trim_root(q.name),
+			client,
 		)
 	} else {
 		logx.debugf(

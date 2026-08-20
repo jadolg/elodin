@@ -406,9 +406,13 @@ the question is a first-party name no list can usefully carry and the address th
 browser connects to is the tracker's, with the site's own cookies attached.
 Pi-hole calls this deep CNAME inspection and AdGuard Home does the same thing to
 CNAME targets. Every hop is matched rather than only the last, up to sixteen of
-them, and an allow rule matching any hop — or the question — exempts the whole
-answer, which is the escape hatch when a first-party name resolves through a CDN
-somebody has listed. These show in the query log as `outcome=blocked
+them. An allow rule exempts the whole answer only when it matches the
+*question* — that is the escape hatch when a first-party name resolves through a
+CDN somebody has listed, so name the first-party lookup rather than the CDN. An
+allow rule matching a hop clears that hop and no other: the party writing the
+answer is the party this feature is aimed at, and if any allowlisted name
+appearing anywhere in an answer excused the rest of it, every allowlist entry
+would be a key for turning the check off. These show in the query log as `outcome=blocked
 detail=cname`, against `detail=list` for a question that was on a list itself,
 and the name that matched is logged at debug level.
 

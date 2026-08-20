@@ -798,6 +798,7 @@ serve_from_cache :: proc(
 			of the two refusals it was, so the query log says the same thing for
 			this hit as it said for the walk that decided it.
 			*/
+			cache.note_hit_withheld(s.answers)
 			out := refuse_cloaked(s, "", verdict, msg, q, proto, client, limit, started, allocator)
 			return out, .Blocked, true
 		}
@@ -819,6 +820,7 @@ serve_from_cache :: proc(
 				allocator,
 			); verdict != .Clear {
 				cache.note_checked(s.answers, hit.key, hit.serial, hit.checked, u8(verdict))
+				cache.note_hit_withheld(s.answers)
 				return out, .Blocked, true
 			}
 			// Inside the decode, not after it. An entry nothing could read has
@@ -827,6 +829,28 @@ serve_from_cache :: proc(
 			// Unreachable as things stand, since `cache.put` stores nothing it
 			// could not decode, and not a thing to leave resting on that.
 			cache.note_checked(s.answers, hit.key, hit.serial, hit.checked, u8(Cloak_Verdict.Clear))
+		} else {
+			/*
+			The stored bytes would not decode, so the walk it is owed cannot be
+			run at all - and an answer this server could not check is one it
+			withholds, exactly as it withholds a chain that outran the budget.
+
+			Serving it was the other way this could have gone and it is the same
+			mistake `Unwalkable` exists to refuse: the check is not a thing to
+			skip on the inputs that defeat it. Nothing reaches here as things
+			stand - `cache.put` stores no message it could not read - which is
+			the reason refusing costs nothing, not a reason to fall through.
+
+			The entry is dropped rather than stamped. It cannot be walked on any
+			later hit either, so leaving it would refuse this name for as long
+			as it lived; dropping it sends the next query upstream for an answer
+			that can be read.
+			*/
+			cache.forget(s.answers, hit.key, hit.serial)
+			cache.note_hit_withheld(s.answers)
+			out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
+			log_query(s, client, proto, q, .Failed, "cache-unreadable", started)
+			return out, .Failed, built
 		}
 	}
 
