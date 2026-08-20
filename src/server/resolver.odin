@@ -714,12 +714,14 @@ resolve_query :: proc(
 	same bytes.
 
 	RFC 2181 section 8 is not a setting and runs whatever the cache is doing: a
-	TTL with the top bit set becomes zero, which makes the answer uncacheable
-	below - `effective` works out at zero - and tells the client to come back
-	rather than to hold the record for sixty-eight years. Doing it in
-	`cache.put` alone would leave the forwarded copy carrying the hostile figure
-	to the client that caused the fetch, and with `cache.enabled: false` would
-	leave every answer carrying it.
+	TTL with the top bit set becomes zero, which tells the client to come back
+	rather than to hold the record for sixty-eight years, and leaves `put` below
+	with an `effective` of zero - so the answer is not kept either, unless
+	`cache.min_ttl` raises it, which is the operator saying how long the shortest
+	answer this cache keeps is good for and reaches a zeroed TTL like any other.
+	Doing it in `cache.put` alone would leave the forwarded copy carrying the
+	hostile figure to the client that caused the fetch, and with
+	`cache.enabled: false` would leave every answer carrying it.
 
 	The ceiling is the cache's `max_ttl`, and `ttl_ceiling` reports no ceiling
 	when there is no cache, since the setting is then not in play at all. An

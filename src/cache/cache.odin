@@ -312,12 +312,16 @@ get :: proc(
 
 	if time.diff(e.expires, now) > 0 {
 		// A stale answer goes out with a short fixed TTL rather than a
-		// counted-down one, which would already have reached zero.
+		// counted-down one, which would already have reached zero. Bounded by
+		// `max_ttl` like everything else this cache hands out: an operator who
+		// set a ceiling below thirty seconds meant it, and the fixed figure is
+		// there to bring the client back soon rather than to be a floor.
+		stale_ttl := min(u32(STALE_TTL), c.max_ttl)
 		for off in e.ttl_offsets {
-			out[off] = 0
-			out[off + 1] = 0
-			out[off + 2] = u8(STALE_TTL >> 8)
-			out[off + 3] = u8(STALE_TTL)
+			out[off] = u8(stale_ttl >> 24)
+			out[off + 1] = u8(stale_ttl >> 16)
+			out[off + 2] = u8(stale_ttl >> 8)
+			out[off + 3] = u8(stale_ttl)
 		}
 		/*
 		A miss, because that is what it is to the caller: the lookup was not
