@@ -385,12 +385,14 @@ resolve_query :: proc(
 	operator who put a name on a blocklist still seeing it counted as blocked.
 	This table is the default for the names nobody configured.
 
-	Ahead of the cache, and of the RD gate below. Ahead of the cache because an
-	entry stored before the setting was turned on would otherwise still be
-	served, and there is nothing to look up in any case. Ahead of the RD gate
-	because RD=0 asks for what this server already knows without recursion, and
-	this is precisely that: an answer from a table, with nowhere to forward to
-	even if the client had asked for it.
+	Ahead of the cache, and of the RD gate below. Ahead of the cache because
+	there is nothing there to find: these answers are never stored, and one a
+	previous configuration forwarded and stored cannot outlive the restart it
+	takes to change the setting. The order is what keeps that true rather than
+	something to re-check if either of those facts ever stops holding. Ahead of
+	the RD gate because RD=0 asks for what this server already knows without
+	recursion, and this is precisely that: an answer from a table, with nowhere
+	to forward to even if the client had asked for it.
 
 	No counter of its own, matching `answer_chaos` - the other thing this server
 	answers out of itself. It shows in the query log as `outcome=local
@@ -413,11 +415,18 @@ resolve_query :: proc(
 	// are served as insecure, which is what `settle_ad_bit` records once
 	// `validating` is off - unless the operator anchored the zone themselves, in
 	// which case that request to validate it wins and the bypass stands down.
+	//
+	// `special_use_deferred` is the forward-side case of the same thing: a
+	// `.onion` name an operator handed to a Tor-aware upstream with
+	// `special_use.onion: false` comes back unsigned under a root that signs a
+	// proof there is no `onion.` at all, which is Bogus to a validator and
+	// SERVFAIL to the client. See `localzones.odin`.
 	validating :=
 		s.validator != nil &&
 		!msg.flags.cd &&
 		q.class == .IN &&
-		!(is_locally_served(q.name) && !covered_by_local_anchor(s, q.name))
+		!(is_locally_served(q.name) && !covered_by_local_anchor(s, q.name)) &&
+		!special_use_deferred(s, q.name)
 
 	key_buf: [cache.KEY_MAX]u8
 	key := cache.make_key(key_buf[:], q.name, q.type, q.class, dns.edns_do(msg), msg.flags.cd)

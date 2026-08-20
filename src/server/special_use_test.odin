@@ -1,5 +1,6 @@
 package server
 
+import "core:mem"
 import "core:net"
 import "core:testing"
 import "core:thread"
@@ -7,6 +8,7 @@ import "core:time"
 import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:dnssec"
 import "elodin:upstream"
 
 /*
@@ -102,7 +104,13 @@ leak_server :: proc(t: ^testing.T, cfg: ^config.Config, name: string) -> (s: Ser
 	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
 		return {}, nil, false
 	}
-	_ = net.set_option(socket, .Receive_Timeout, time.Second)
+	// Most cases here expect nothing to arrive, and the mock thread is joined
+	// after `handle_query` has already returned - so this is dead time on every
+	// one of them rather than a bound on a real exchange. A query that did leak
+	// was sent before `handle_query` could return, so it is waiting in the
+	// socket by the time the mock looks: half a second is not a race, it is the
+	// pause before giving up on a datagram that was never sent.
+	_ = net.set_option(socket, .Receive_Timeout, 500 * time.Millisecond)
 	bound, _ := net.bound_endpoint(socket)
 
 	cfg.log.queries = false
@@ -149,8 +157,11 @@ Leak_Case :: struct {
 	// The zone the synthesised SOA is expected to be owned by, for the cases
 	// that carry one.
 	soa:   string,
-	// Whether the case needs `special_use.local`, which is off by default.
+	// Which of the two off-by-default keys the case needs. One field each rather
+	// than one for the pair: a table that answered `test.` from
+	// `special_use.local` would be a live bug, and a shared flag would hide it.
 	local: bool,
+	test:  bool,
 }
 
 @(test)
@@ -173,13 +184,13 @@ test_special_use_names_are_not_sent_to_the_upstream :: proc(t: ^testing.T) {
 		// RFC 6762 section 22, behind `special_use.local`: see the table in
 		// localzones.odin for why that one is asked for rather than assumed.
 		{name = "printer.local.", type = .A, want = .Nx_Domain, soa = "local.", local = true},
-		{name = "internal.test.", type = .A, want = .Nx_Domain, soa = "test.", local = true},
+		{name = "internal.test.", type = .A, want = .Nx_Domain, soa = "test.", test = true},
 	}
 
 	for c in cases {
 		cfg := config.default_config()
 		cfg.special_use.local = c.local
-		cfg.special_use.test = c.local
+		cfg.special_use.test = c.test
 
 		s, x, built := leak_server(t, &cfg, c.name)
 		if !built {
@@ -322,6 +333,81 @@ test_a_tor_aware_upstream_can_be_given_onion_back :: proc(t: ^testing.T) {
 		"localhost. came back as %v; special_use.onion took the rest of the table with it",
 		local_outcome,
 	)
+
+	free_all(context.temp_allocator)
+}
+
+/*
+A validator that can fetch nothing, which is what a Tor-aware upstream is.
+
+`tor`'s `DNSPort` answers A and AAAA and knows nothing of DS or DNSKEY, so a
+chain walk over it produces no records whatever the name. The verdict that
+follows - Indeterminate rather than Bogus - is not the point; either one is
+SERVFAIL to the client, and the point is that the validator is never consulted
+about a name the operator handed over on purpose.
+*/
+@(private = "file")
+tor_has_no_chain :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> ([]u8, bool) {
+	return nil, false
+}
+
+/*
+The `.onion` answer that comes back from that upstream is not validated.
+
+`special_use.onion: false` and `dnssec.enabled` are both reachable at once, and
+the second is on by default - so if the forwarded answer were held to the public
+chain of trust the key would hand every `.onion` name to the upstream and then
+turn what came back into SERVFAIL. Nothing signs a `.onion` answer, and nothing
+can: the root publishes a signed proof that there is no `onion.` to delegate, so
+a validator reads any answer under it as unsigned data inside the root zone.
+
+The mock answers with an address the way a local tor would, and the assertion is
+that the client sees it.
+*/
+@(test)
+test_a_deferred_onion_answer_is_not_held_to_the_public_chain :: proc(t: ^testing.T) {
+	name := "duskgytldkxiuqc6otgh4.onion."
+	cfg := config.default_config()
+	cfg.special_use.onion = false
+
+	s, x, built := leak_server(t, &cfg, name)
+	if !built {
+		return
+	}
+	defer net.close(x.socket)
+	defer upstream.destroy_group(s.group)
+
+	s.validator = dnssec.make_validator(tor_has_no_chain, nil, dnssec.Options{})
+	defer dnssec.destroy_validator(s.validator)
+
+	mock := thread.create_and_start_with_poly_data(x, serve_leak)
+	out, _, ok := handle_query(&s, leak_query(name), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	thread.join(mock)
+	thread.destroy(mock)
+
+	testing.expect(t, x.asked, "the .onion query never reached the Tor-aware upstream")
+	if !testing.expect(t, ok, "the .onion query went unanswered") {
+		return
+	}
+
+	resp, derr := dns.decode_message(out, context.temp_allocator)
+	if !testing.expectf(t, derr == .None, "the response will not decode: %v", derr) {
+		return
+	}
+	if !testing.expectf(
+		t,
+		dns.rcode_of(resp) == .No_Error,
+		"the mapped .onion address came back as %v: the validator was asked about a name handed to the upstream",
+		dns.rcode_of(resp),
+	) {
+		return
+	}
+	if !testing.expect(t, len(resp.answer) == 1, "the mapped .onion address did not survive") {
+		return
+	}
+	a, is_a := resp.answer[0].data.(dns.Rdata_A)
+	testing.expect(t, is_a, "the .onion answer is not an A record")
+	testing.expect_value(t, a.addr, [4]u8{203, 0, 113, 1})
 
 	free_all(context.temp_allocator)
 }
