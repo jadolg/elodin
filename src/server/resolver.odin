@@ -398,7 +398,7 @@ resolve_query :: proc(
 	Which rule sets an answer is matched against here, read once and used for
 	both the cache lookup and the store below.
 
-	Taken before any matching happens rather than after. A reload landing partway
+	Taken before the chain walk rather than after. A reload landing partway
 	through leaves the answer stamped with the older number, which costs one more
 	walk on the next hit; taking it afterwards would stamp an answer with the
 	number of a rule set that arrived after it had been matched, and that entry
@@ -798,7 +798,7 @@ serve_from_cache :: proc(
 			of the two refusals it was, so the query log says the same thing for
 			this hit as it said for the walk that decided it.
 			*/
-			cache.note_hit_withheld(s.answers)
+			cache.note_withheld(s.answers)
 			out := refuse_cloaked(s, "", verdict, msg, q, proto, client, limit, started, allocator)
 			return out, .Blocked, true
 		}
@@ -820,7 +820,7 @@ serve_from_cache :: proc(
 				allocator,
 			); verdict != .Clear {
 				cache.note_checked(s.answers, hit.key, hit.serial, hit.checked, u8(verdict))
-				cache.note_hit_withheld(s.answers)
+				cache.note_withheld(s.answers)
 				return out, .Blocked, true
 			}
 			// Inside the decode, not after it. An entry nothing could read has
@@ -847,7 +847,8 @@ serve_from_cache :: proc(
 			that can be read.
 			*/
 			cache.forget(s.answers, hit.key, hit.serial)
-			cache.note_hit_withheld(s.answers)
+			cache.note_withheld(s.answers)
+			sync.atomic_add(&s.stats.failed, 1)
 			out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
 			log_query(s, client, proto, q, .Failed, "cache-unreadable", started)
 			return out, .Failed, built

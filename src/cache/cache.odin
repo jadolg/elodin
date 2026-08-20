@@ -115,6 +115,8 @@ Stats :: struct {
 	stale:     u64,
 	inserts:   u64,
 	evictions: u64,
+	// Answers `get` handed over that the caller then refused; see `note_withheld`.
+	withheld:  u64,
 }
 
 Cache :: struct {
@@ -435,25 +437,32 @@ forget :: proc(c: ^Cache, key: string, serial: u64) {
 }
 
 /*
-Take back a hit the caller did not end up serving.
+Count bytes the cache produced that the caller decided not to serve.
 
-`get` counts a hit when it hands the bytes over, because that is the only point
-it knows anything at all - and a caller that then withholds the answer has left
-`elodin_cache_hits_total` counting a lookup that was not answered from the
-cache, which is what its help text says it counts. The stale path settles the
-same question inside `get` by counting itself a miss; this is that, for the
-answers only the caller can rule on.
+`get` cannot know: it hands over an answer and the caller may then refuse it -
+for a chain that leads somewhere listed, or one it could not finish checking.
+Left unrecorded, `elodin_cache_hits_total` and the resolver's `cached` drift
+apart with nothing to account for the gap.
+
+A counter of its own rather than a hit taken back off `hits`, which is what this
+was first: a counter that goes down is read by Prometheus as a reset, and the
+window is real - `get` increments under the lock and releases it, and the
+caller's decode and walk happen before the correction lands, so a scrape falling
+between the two sees the higher figure and the next sees the lower. It would
+discard the accumulated rate for the series every time an answer was withheld.
+Both numbers now only ever rise, and `hits - withheld` is what was served.
+
+Counted for a stale lend as well as a fresh hit, and those were counted a miss
+by `get` rather than a hit - which is right either way, because what this counts
+is not hits but answers the caller was given and did not use.
 */
-note_hit_withheld :: proc(c: ^Cache) {
+note_withheld :: proc(c: ^Cache) {
 	if c == nil {
 		return
 	}
 	sync.mutex_lock(&c.mu)
 	defer sync.mutex_unlock(&c.mu)
-	if c.stats.hits > 0 {
-		c.stats.hits -= 1
-	}
-	c.stats.misses += 1
+	c.stats.withheld += 1
 }
 
 // Count a stale answer that a caller went on to serve; see `Stats.stale`.
