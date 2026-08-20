@@ -318,10 +318,7 @@ get :: proc(
 		// there to bring the client back soon rather than to be a floor.
 		stale_ttl := min(u32(STALE_TTL), c.max_ttl)
 		for off in e.ttl_offsets {
-			out[off] = u8(stale_ttl >> 24)
-			out[off + 1] = u8(stale_ttl >> 16)
-			out[off + 2] = u8(stale_ttl >> 8)
-			out[off + 3] = u8(stale_ttl)
+			dns.write_ttl_at(out, off, stale_ttl)
 		}
 		/*
 		A miss, because that is what it is to the caller: the lookup was not
