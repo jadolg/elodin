@@ -45,11 +45,27 @@ Set :: struct {
 }
 
 Engine :: struct {
-	mu:    sync.RW_Mutex,
-	block: ^Set,
-	allow: ^Set,
+	mu:         sync.RW_Mutex,
+	block:      ^Set,
+	allow:      ^Set,
+	/*
+	Which rule sets these are, counted up on every swap.
+
+	A number rather than a timestamp: what a caller needs of it is only whether
+	it is the same one it saw last, and two swaps inside one clock tick are a
+	thing a reload loop can do. Zero is "no list has ever been loaded", which is
+	what a caller that has never asked can stamp its own work with and be sure of
+	being told to ask again.
+
+	It exists for answers held somewhere else. A decision this engine makes about
+	a name is made afresh every time it is asked, so nothing here needs it; a
+	decision *cached* elsewhere - the resolver keeps whole answers, matched
+	against the lists when they were stored - has no other way to notice that the
+	lists it was matched against are gone.
+	*/
+	generation: u64,
 	// Names the engine answers for directly regardless of lists.
-	stats: Stats,
+	stats:      Stats,
 }
 
 Stats :: struct {
@@ -143,9 +159,27 @@ engine_swap :: proc(e: ^Engine, block, allow: ^Set) -> (old_block, old_allow: ^S
 	defer sync.rw_mutex_unlock(&e.mu)
 	old_block, old_allow = e.block, e.allow
 	e.block, e.allow = block, allow
+	e.generation += 1
 	e.stats.block_rules = block.count if block != nil else 0
 	e.stats.allow_rules = allow.count if allow != nil else 0
 	return
+}
+
+/*
+Which rule sets `engine_match` is answering from at the moment.
+
+Read under the same lock the sets themselves are read under, so a caller that
+takes this number before matching and stamps it onto what it stores cannot
+credit its result to a set that arrived after the match began - it stamps the
+older number and is told to match again, which is the harmless direction.
+*/
+engine_generation :: proc(e: ^Engine) -> u64 {
+	if e == nil {
+		return 0
+	}
+	sync.rw_mutex_shared_lock(&e.mu)
+	defer sync.rw_mutex_shared_unlock(&e.mu)
+	return e.generation
 }
 
 /*

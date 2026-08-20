@@ -395,6 +395,18 @@ resolve_query :: proc(
 	key := cache.make_key(key_buf[:], q.name, q.type, q.class, dns.edns_do(msg), msg.flags.cd)
 
 	/*
+	Which rule sets an answer is matched against here, read once and used for
+	both the cache lookup and the store below.
+
+	Taken before any matching happens rather than after. A reload landing partway
+	through leaves the answer stamped with the older number, which costs one more
+	walk on the next hit; taking it afterwards would stamp an answer with the
+	number of a rule set that arrived after it had been matched, and that entry
+	would then never be looked at again.
+	*/
+	generation := filter.engine_generation(s.filters)
+
+	/*
 	An expired entry that `serve_stale` kept, held back rather than served.
 
 	RFC 8767 section 5 has a resolver try the refresh first and use expired data
@@ -407,14 +419,22 @@ resolve_query :: proc(
 	into the per-request arena, which outlives the upstream call and is released
 	only once the response has gone out.
 	*/
-	stale_hit: []u8
+	stale_hit: Cached_Answer
 
 	if s.cfg.cache.enabled {
-		if hit, stale, found := cache.get(s.answers, key, allocator); found {
-			if !stale {
-				return serve_from_cache(s, hit, query, msg, q, proto, client, limit, validating, false, started, allocator)
+		if wire, hit, found := cache.get(s.answers, key, allocator, checked_against = generation); found {
+			stored := Cached_Answer {
+				wire    = wire,
+				key     = key,
+				stale   = hit.stale,
+				recheck = hit.recheck,
+				serial  = hit.serial,
+				checked = generation,
 			}
-			stale_hit = hit
+			if !hit.stale {
+				return serve_from_cache(s, stored, query, msg, q, proto, client, limit, validating, started, allocator)
+			}
+			stale_hit = stored
 		}
 	}
 
@@ -442,8 +462,8 @@ resolve_query :: proc(
 	`log.queries` is on.
 	*/
 	if !msg.flags.rd {
-		if stale_hit != nil {
-			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, true, started, allocator)
+		if stale_hit.wire != nil {
+			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, allocator)
 		}
 		out, built := dns.error_response(query, msg, .Refused, allocator, limit)
 		log_query(s, client, proto, q, .Refused, "rd", started)
@@ -545,8 +565,8 @@ resolve_query :: proc(
 		covering an outage. RFC 8767 section 5 leaves both open; neither is
 		decided here.
 		*/
-		if stale_hit != nil {
-			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, true, started, allocator)
+		if stale_hit.wire != nil {
+			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, allocator)
 		}
 		sync.atomic_add(&s.stats.failed, 1)
 		out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
@@ -615,7 +635,7 @@ resolve_query :: proc(
 			if !validating {
 				set_ad_bit(resp, false)
 			}
-			cache.put(s.answers, key, resp, decoded)
+			cache.put(s.answers, key, resp, decoded, generation)
 		}
 	}
 
@@ -628,15 +648,39 @@ resolve_query :: proc(
 }
 
 /*
+A hit as `resolve_query` found it.
+
+Carried as one value because these five travel together from `cache.get` to
+whichever of the three places ends up serving them, and because what has to be
+done with them - re-match the chain, then put the stamp back on the entry the
+bytes came out of - needs all five at once.
+*/
+@(private)
+Cached_Answer :: struct {
+	// The stored response, already copied into this request's arena.
+	wire:    []u8,
+	// What the entry is stored under, and which entry it was, so the stamp goes
+	// back on the answer that was looked at rather than on whatever has replaced
+	// it since.
+	key:     string,
+	serial:  u64,
+	stale:   bool,
+	recheck: bool,
+	// The rule sets the re-match is made against, and the number stamped on the
+	// entry when it comes back clean.
+	checked: u64,
+}
+
+/*
 Hand a stored answer to the client that asked for it.
 
 The fresh hit and the stale fallback are the same answer as far as everything
 downstream is concerned - the same transaction ID to put back, the same question
 case to restore, the same verdict to settle, the same limit to fit - and they go
 through one procedure so that a step added for one of them cannot be missed for
-the other. The two differ in what an operator is told: `stale` is what the query
-log reports as the detail, and what tells the cache that the copy it lent out
-was used.
+the other. The two differ in what an operator is told: `hit.stale` is what the
+query log reports as the detail, and what tells the cache that the copy it lent
+out was used.
 
 Counted as a cached query either way, because that is what happened: the client
 was answered from this server's cache without an upstream producing the answer.
@@ -648,7 +692,7 @@ it is.
 @(private)
 serve_from_cache :: proc(
 	s: ^Server,
-	hit: []u8,
+	hit: Cached_Answer,
 	query: []u8,
 	msg: dns.Message,
 	q: dns.Question,
@@ -656,7 +700,6 @@ serve_from_cache :: proc(
 	client: string,
 	limit: int,
 	validating: bool,
-	stale: bool,
 	started: time.Time,
 	allocator: mem.Allocator,
 ) -> (
@@ -665,39 +708,54 @@ serve_from_cache :: proc(
 	ok: bool,
 ) {
 	/*
-	The stored answer is put through the list check again rather than trusted to
-	have passed it when it went in.
+	An answer the lists have not been over since they last changed is matched
+	again before it is served, and only then.
 
-	Lists are reloaded under a running server, and the entry may predate the
-	reload that named something in its chain. The question side of the same rule
-	set is matched on every query - it runs before the cache is consulted at all -
-	so an entry left unchecked here would make one half of a rule take effect on
-	the next query and the other half take effect when the TTL ran out, which is
-	up to `cache.max_ttl` later and is not a difference an operator can be
-	expected to hold in their head.
+	Lists are reloaded under a running server and the answer cache is not touched
+	by the swap, so an entry can outlive the reload that named something in its
+	chain. The question side of the same rule set is matched on every query - it
+	runs before the cache is consulted at all - so an entry left alone here would
+	make one half of a rule take effect on the next query and the other half when
+	the TTL ran out, up to `cache.max_ttl` later.
 
-	It costs a decode on the path that exists to avoid work. That is the price of
-	the check meaning the same thing on both paths, and it is the same decode the
-	miss path pays to store the entry in the first place. The entry itself is left
-	where it is: nothing here can tell whether the next list reload will put it
-	back in service, and re-checking a hit is cheaper than the miss that dropping
-	it would cause.
+	What it must not cost is a decode per hit. `cache.get` answers that: an entry
+	whose answer section goes nowhere never asks for this at all, and one that
+	does asks only while the number it was stored under is behind the rule sets in
+	force. `note_checked` then puts the number forward, so a chain is walked once
+	per reload rather than once per hit - which is the whole of what this costs in
+	the steady state, against the copy and the handful of TTL writes that serving
+	a hit is meant to be.
+
+	Clearing the cache in `reload_filters` instead is one line and was not taken:
+	it throws away every unrelated entry on every refresh interval, and buys a
+	burst of upstream traffic each time to re-learn answers nothing was wrong
+	with.
+
+	An entry that is refused stays where it is. Nothing here can tell whether the
+	next reload will put it back in service, and walking it again on each hit is
+	cheaper than the upstream query that dropping it would cost - it keeps its old
+	stamp, which is what asks for that walk.
 	*/
-	if out, cloaked := block_cloaked_answer(s, hit, msg, q, proto, client, limit, started, allocator); cloaked {
-		return out, .Blocked, true
+	if hit.recheck {
+		if out, cloaked := block_cloaked_answer(s, hit.wire, msg, q, proto, client, limit, started, allocator);
+		   cloaked {
+			return out, .Blocked, true
+		}
+		cache.note_checked(s.answers, hit.key, hit.serial, hit.checked)
 	}
 
-	dns.set_id_in_place(hit, msg.id)
-	dns.copy_question_case(hit, query)
+	wire := hit.wire
+	dns.set_id_in_place(wire, msg.id)
+	dns.copy_question_case(wire, query)
 	// The stored answer carries the verdict; whether this client gets to hear it
 	// is a separate question.
-	settle_ad_bit(hit, msg, validating)
-	if stale {
+	settle_ad_bit(wire, msg, validating)
+	if hit.stale {
 		cache.note_stale_served(s.answers)
 	}
 	sync.atomic_add(&s.stats.cached, 1)
-	out := fit_response(hit, limit, msg, allocator)
-	log_query(s, client, proto, q, .Cached, "stale" if stale else "cache", started)
+	out := fit_response(wire, limit, msg, allocator)
+	log_query(s, client, proto, q, .Cached, "stale" if hit.stale else "cache", started)
 	return out, .Cached, true
 }
 

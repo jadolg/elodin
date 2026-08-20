@@ -22,7 +22,57 @@ Entry :: struct {
 	ttls:        []u32,
 	inserted:    time.Time,
 	expires:     time.Time,
+	/*
+	Whether the answer section redirects anywhere: a CNAME, or the DNAME that
+	comes with one.
+
+	Noted at insert, where the message is decoded anyway, so that a caller whose
+	interest is in where an answer leads can be told on the way out that there is
+	nowhere for this one to lead. Nearly every entry is an address and answers
+	that question with no work at all; the ones that do redirect are the only ones
+	worth decoding again. The cache makes nothing of it itself.
+	*/
+	redirects:   bool,
+	/*
+	What the caller had decided about this answer when it stored it, in whatever
+	numbering the caller keeps - see `put` and `get`. Zero for a caller that does
+	not keep one, which reads as "decided under nothing you would recognise" and
+	so is never mistaken for current.
+	*/
+	checked:     u64,
+	/*
+	Which entry this is, counted up once per insert and never reused.
+
+	`note_checked` writes to an entry a caller read some microseconds earlier, and
+	between the two the key may have been replaced by another worker's answer.
+	Without something to tell the two apart, that write would put one answer's
+	verdict on another answer's bytes - and if the replacement was stored under
+	older rules than the writer's, the entry would then be trusted under rules
+	nothing had matched it against.
+	*/
+	serial:      u64,
 	prev, next:  ^Entry,
+}
+
+/*
+What `get` found, beside the bytes themselves.
+
+Returned as one value rather than three so that the shape of a hit can grow
+without every caller having to spell out the parts it does not use.
+*/
+Hit :: struct {
+	// The entry had expired and `serve_stale` kept it. See `get`.
+	stale:   bool,
+	/*
+	The answer redirects somewhere, and the number it was stored with is not the
+	one the caller looked it up with - so whatever the caller decided about where
+	it leads, it decided under rules it now says have changed. An answer with
+	nowhere to lead never sets this, whatever the numbers say: there is nothing
+	for the caller to look at again.
+	*/
+	recheck: bool,
+	// Which entry the bytes came out of, for `note_checked`.
+	serial:  u64,
 }
 
 Stats :: struct {
@@ -53,6 +103,9 @@ Cache :: struct {
 	max_ttl:      u32,
 	negative_ttl: u32,
 	serve_stale:  bool,
+	// Last number handed to an entry; see `Entry.serial`. Never reset, so an
+	// entry's identity is not reused within the life of the process.
+	serials:      u64,
 	allocator:    mem.Allocator,
 	stats:        Stats,
 }
@@ -177,24 +230,33 @@ On a hit the returned bytes are a fresh copy owned by `allocator`, with TTLs
 already counted down and the transaction ID left at whatever the cached message
 had; callers set the ID and re-case the question themselves.
 
-`stale` says the entry had expired and `serve_stale` kept it. Those bytes are
+`hit.stale` says the entry had expired and `serve_stale` kept it. Those bytes are
 not an answer to send on sight: RFC 8767 section 5 has the refresh attempted
 first and expired data used only once that attempt has failed, which is also
 what the setting promises the operator - an answer from an expired entry if the
 upstream is down. The caller carries on as it would for a miss and falls back on
 what it was lent, calling `note_stale_served` if it does.
+
+`checked_against` is the caller's number for whatever it decides about answers
+before storing them - see `put`. An entry stored under a different one, and with
+somewhere to redirect to, comes back as `hit.recheck`: the cache is not saying
+the answer is wrong, only that nothing has looked at it under the rules the
+caller says are current. A caller with no such notion leaves this at zero, gets
+`recheck` on nothing it stored at zero as well, and pays nothing for the
+mechanism.
 */
 get :: proc(
 	c: ^Cache,
 	key: string,
 	allocator := context.allocator,
+	checked_against: u64 = 0,
 ) -> (
 	wire: []u8,
-	stale: bool,
+	hit: Hit,
 	ok: bool,
 ) {
 	if c == nil {
-		return nil, false, false
+		return nil, {}, false
 	}
 	sync.mutex_lock(&c.mu)
 	defer sync.mutex_unlock(&c.mu)
@@ -202,15 +264,18 @@ get :: proc(
 	e, found := c.entries[key]
 	if !found {
 		c.stats.misses += 1
-		return nil, false, false
+		return nil, {}, false
 	}
 
 	now := time.now()
 	if time.diff(deadline(c, e), now) > 0 {
 		remove_entry(c, e)
 		c.stats.misses += 1
-		return nil, false, false
+		return nil, {}, false
 	}
+
+	hit.serial = e.serial
+	hit.recheck = e.redirects && e.checked != checked_against
 
 	elapsed := u32(max(0, time.duration_seconds(time.diff(e.inserted, now))))
 	out := make([]u8, len(e.wire), allocator)
@@ -234,7 +299,7 @@ get :: proc(
 		one package away.
 		*/
 		c.stats.misses += 1
-		stale = true
+		hit.stale = true
 	} else {
 		dns.patch_ttls(out, e.ttl_offsets, e.ttls, elapsed, c.min_ttl)
 		c.stats.hits += 1
@@ -245,7 +310,47 @@ get :: proc(
 	// has to make room - and if the upstream for it is down, it is also the only
 	// answer for that name there is.
 	move_to_front(c, e)
-	return out, stale, true
+	return out, hit, true
+}
+
+// Does the answer section send the client somewhere else? See `Entry.redirects`.
+@(private)
+redirects :: proc(msg: dns.Message) -> bool {
+	for r in msg.answer {
+		#partial switch r.type {
+		case .CNAME, .DNAME:
+			return true
+		}
+	}
+	return false
+}
+
+/*
+Say that the entry under `key` has been looked at again, and found to stand.
+
+Without this a caller whose numbering has moved on is told `recheck` on every hit
+for the rest of the entry's life, which is the per-hit cost the flag exists to
+avoid - it would only have moved it from every hit to every hit after a change.
+
+`checked` is the caller's number *at the time it did the work*, not the newest
+one it knows of, so an entry that was looked at under one set of rules is never
+credited to the set that replaced it while the caller was busy.
+
+`serial` is the one `get` handed back with the bytes, and nothing is written
+unless the entry under this key is still that one. The key alone would not do:
+another worker may have replaced the answer in between, and stamping its bytes
+with a verdict reached on the bytes they displaced is how an answer nobody
+matched comes to look as though somebody had.
+*/
+note_checked :: proc(c: ^Cache, key: string, serial: u64, checked: u64) {
+	if c == nil {
+		return
+	}
+	sync.mutex_lock(&c.mu)
+	defer sync.mutex_unlock(&c.mu)
+	if e, found := c.entries[key]; found && e.serial == serial {
+		e.checked = checked
+	}
 }
 
 // Count a stale answer that a caller went on to serve; see `Stats.stale`.
@@ -263,8 +368,14 @@ Store a response.
 
 Returns false when the message should not be cached at all: truncated answers,
 transient failures, and anything whose effective TTL works out as zero.
+
+`checked` is the caller's own note of what it had decided about this answer, kept
+with the entry and handed back by `get` as `recheck` once the caller says its
+numbering has moved on. The cache does not read it: what it counts is a number
+the caller recognises, and a caller with nothing to say leaves it at zero, which
+`get` will always report as out of date rather than silently current.
 */
-put :: proc(c: ^Cache, key: string, wire: []u8, msg: dns.Message) -> bool {
+put :: proc(c: ^Cache, key: string, wire: []u8, msg: dns.Message, checked: u64 = 0) -> bool {
 	if c == nil || len(wire) < dns.HEADER_SIZE {
 		return false
 	}
@@ -325,6 +436,8 @@ put :: proc(c: ^Cache, key: string, wire: []u8, msg: dns.Message) -> bool {
 	copy(e.wire, wire)
 	e.ttl_offsets = offsets
 	e.ttls = ttls
+	e.redirects = redirects(msg)
+	e.checked = checked
 	e.inserted = now
 	e.expires = time.time_add(now, time.Duration(effective) * time.Second)
 
@@ -334,6 +447,8 @@ put :: proc(c: ^Cache, key: string, wire: []u8, msg: dns.Message) -> bool {
 	if old, exists := c.entries[key]; exists {
 		remove_entry(c, old)
 	}
+	c.serials += 1
+	e.serial = c.serials
 	c.entries[e.key] = e
 	push_front(c, e)
 	c.bytes += size

@@ -202,8 +202,19 @@ serve_cached_chain :: proc(t: ^testing.T, hops, block, allow: []string) -> Outco
 	return serve_cached_answer(t, hops[0], chain_reply(hops), block, allow)
 }
 
+/*
+`stamped` stores the entry as the miss path would have stored it a moment ago:
+matched against the rule sets that are in force now. Left off, the entry carries
+no stamp at all, which is every entry that predates a reload.
+*/
 @(private = "file")
-serve_cached_answer :: proc(t: ^testing.T, qname: string, wire: []u8, block, allow: []string) -> Outcome {
+serve_cached_answer :: proc(
+	t: ^testing.T,
+	qname: string,
+	wire: []u8,
+	block, allow: []string,
+	stamped := false,
+) -> Outcome {
 	cfg := config.default_config()
 	cfg.log.queries = false
 	cfg.cache.enabled = true
@@ -233,7 +244,8 @@ serve_cached_answer :: proc(t: ^testing.T, qname: string, wire: []u8, block, all
 	}
 	key_buf: [cache.KEY_MAX]u8
 	key := cache.make_key(key_buf[:], qname, .A, .IN, false, false)
-	if !testing.expect(t, cache.put(answers, key, wire, decoded), "the answer was not cached") {
+	checked := filter.engine_generation(engine) if stamped else 0
+	if !testing.expect(t, cache.put(answers, key, wire, decoded, checked), "the answer was not cached") {
 		return .Failed
 	}
 
@@ -339,5 +351,78 @@ test_a_cname_chain_that_loops_is_still_answered :: proc(t: ^testing.T) {
 		nil,
 	)
 	testing.expect_value(t, outcome, Outcome.Cached)
+	free_all(context.temp_allocator)
+}
+
+/*
+An entry stored under the rule sets in force is served without the chain being
+walked again.
+
+This is the whole of what keeps the re-match off the hot path, so it is worth a
+test that fails if the stamp stops being honoured: what is stored here is an
+answer that leads to a listed name, and it goes out, because the entry says it
+was matched against these very rules. Nothing in a running server can reach that
+state - an answer that matched is refused before `cache.put` sees it - which is
+the reason the stamp can be believed at all.
+*/
+@(test)
+test_an_entry_matched_against_the_rules_in_force_is_not_walked_again :: proc(t: ^testing.T) {
+	outcome := serve_cached_answer(
+		t,
+		"www.brand.example.",
+		chain_reply([]string{"www.brand.example.", "tracker.evil.example."}),
+		[]string{"tracker.evil.example"},
+		nil,
+		stamped = true,
+	)
+	testing.expect_value(t, outcome, Outcome.Cached)
+	free_all(context.temp_allocator)
+}
+
+/*
+And the stamp goes forward once the answer has been looked at, so a reload costs
+one walk per entry rather than one per hit.
+
+Observed through the cache rather than by counting walks: after the first hit
+the entry is stamped with the generation it was matched against, which is what
+`cache.get` reads to decide there is nothing to do.
+*/
+@(test)
+test_a_clean_answer_is_walked_once_per_reload_and_not_once_per_hit :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.cache.enabled = true
+	cfg.dnssec.enabled = false
+	cfg.blocking.enabled = true
+
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
+	defer cache.destroy(answers)
+
+	engine := filter.engine_make()
+	defer filter.engine_destroy(engine)
+	block_set := filter.set_make()
+	filter.set_add(block_set, "tracker.evil.example", {.Apex, .Subdomains})
+	filter.engine_swap(engine, block_set, filter.set_make())
+
+	s := Server{cfg = &cfg, answers = answers, filters = engine}
+
+	hops := []string{"www.brand.example.", "cdn.brand.example."}
+	wire := chain_reply(hops)
+	decoded, derr := dns.decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+	key_buf: [cache.KEY_MAX]u8
+	key := cache.make_key(key_buf[:], hops[0], .A, .IN, false, false)
+	// Stored before the lists this server is running: the first hit has to walk it.
+	testing.expect(t, cache.put(answers, key, wire, decoded), "the answer was not cached")
+
+	_, first, _ := cache.get(answers, key, context.temp_allocator, checked_against = filter.engine_generation(engine))
+	testing.expect(t, first.recheck, "an entry from before the reload was not flagged for a second look")
+
+	_, outcome, ok := handle_query(&s, cloak_query(hops[0]), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	testing.expect(t, ok, "nothing came back at all")
+	testing.expect_value(t, outcome, Outcome.Cached)
+
+	_, second, _ := cache.get(answers, key, context.temp_allocator, checked_against = filter.engine_generation(engine))
+	testing.expect(t, !second.recheck, "the walk was not recorded, so every later hit pays for it again")
 	free_all(context.temp_allocator)
 }

@@ -79,9 +79,9 @@ test_put_and_get :: proc(t: ^testing.T) {
 	testing.expect(t, put(c, key, wire, msg), "put should succeed")
 	testing.expect_value(t, len_entries(c), 1)
 
-	got, stale, ok := get(c, key, context.temp_allocator)
+	got, hit, ok := get(c, key, context.temp_allocator)
 	testing.expect(t, ok, "expected a hit")
-	testing.expect(t, !stale, "entry should be fresh")
+	testing.expect(t, !hit.stale, "entry should be fresh")
 
 	decoded, derr := dns.decode_message(got, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
@@ -227,9 +227,9 @@ test_serve_stale :: proc(t: ^testing.T) {
 	put(c, key, wire, msg)
 	sync_expire(c, key)
 
-	got, stale, ok := get(c, key, context.temp_allocator)
+	got, hit, ok := get(c, key, context.temp_allocator)
 	testing.expect(t, ok, "stale serving should still hit")
-	testing.expect(t, stale, "hit should be flagged stale")
+	testing.expect(t, hit.stale, "hit should be flagged stale")
 	decoded, _ := dns.decode_message(got, context.temp_allocator)
 	testing.expect_value(t, decoded.answer[0].ttl, u32(STALE_TTL))
 	free_all(context.temp_allocator)
@@ -262,9 +262,9 @@ test_sweep_keeps_stale_entries :: proc(t: ^testing.T) {
 	sync_expire(c, key)
 
 	testing.expect_value(t, sweep(c), 0)
-	_, stale, ok := get(c, key, context.temp_allocator)
+	_, hit, ok := get(c, key, context.temp_allocator)
 	testing.expect(t, ok, "the entry did not survive a sweep with serve_stale on")
-	testing.expect(t, stale, "the surviving entry was not flagged stale")
+	testing.expect(t, hit.stale, "the surviving entry was not flagged stale")
 
 	off := make_cache(Options{max_entries = 8, max_ttl = 3600})
 	defer destroy(off)
@@ -342,8 +342,8 @@ test_a_stale_lookup_is_counted_as_a_miss :: proc(t: ^testing.T) {
 	testing.expect_value(t, stats(c).hits, u64(1))
 
 	sync_expire(c, key)
-	_, stale, ok := get(c, key, context.temp_allocator)
-	testing.expect(t, ok && stale, "expected a stale hit")
+	_, hit, ok := get(c, key, context.temp_allocator)
+	testing.expect(t, ok && hit.stale, "expected a stale hit")
 
 	s := stats(c)
 	testing.expect_value(t, s.hits, u64(1))
@@ -590,4 +590,142 @@ sync_expire :: proc(c: ^Cache, key: string, ago := 1 * time.Second) {
 		e.expires = time.time_add(time.now(), -ago)
 		e.inserted = time.time_add(time.now(), -ago - 3600 * time.Second)
 	}
+}
+
+/*
+The stamp a caller leaves on an entry, and what `get` makes of it.
+
+The cache decides nothing about an answer. What it does is remember what its
+caller decided and under which of the caller's own numberings, so that a
+decision made against rules that have since been replaced is not mistaken for
+one made against the rules in force. See `Entry.checked`.
+*/
+
+@(private = "file")
+build_cname_answer :: proc(name, target: string, ttl: u32, allocator := context.allocator) -> ([]u8, dns.Message) {
+	m := dns.Message {
+		id       = 0x3333,
+		question = []dns.Question{{name = name, type = .A, class = .IN}},
+		answer   = []dns.Record {
+			{name = name, type = .CNAME, class = .IN, ttl = ttl, data = dns.Rdata_Name{name = target}},
+			{name = target, type = .A, class = .IN, ttl = ttl, data = dns.Rdata_A{addr = {5, 6, 7, 8}}},
+		},
+	}
+	m.flags.qr = true
+	m.flags.ra = true
+	wire, _, err := dns.encode_message(m, allocator)
+	if err != .None {
+		panic("failed to encode test cname answer")
+	}
+	decoded, derr := dns.decode_message(wire, allocator)
+	if derr != .None {
+		panic("failed to decode test cname answer")
+	}
+	return wire, decoded
+}
+
+@(test)
+test_an_entry_stored_under_the_current_number_is_not_flagged :: proc(t: ^testing.T) {
+	c := make_cache(Options{max_entries = 8, max_ttl = 3600})
+	defer destroy(c)
+
+	wire, msg := build_cname_answer("www.example.com.", "cdn.example.net.", 300, context.temp_allocator)
+	kb: [KEY_MAX]u8
+	key := key_for(kb[:], "www.example.com.")
+	testing.expect(t, put(c, key, wire, msg, 7), "the entry was not stored")
+
+	_, hit, ok := get(c, key, context.temp_allocator, checked_against = 7)
+	testing.expect(t, ok, "the entry was not found")
+	testing.expect(t, !hit.recheck, "an entry stored under the number it was looked up with asked to be looked at again")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_an_entry_that_leads_nowhere_is_never_flagged :: proc(t: ^testing.T) {
+	c := make_cache(Options{max_entries = 8, max_ttl = 3600})
+	defer destroy(c)
+
+	// An address, and an NXDOMAIN with nothing in the answer section at all:
+	// neither has anywhere to send a client, so no change of rules can make
+	// where they lead worth looking at again.
+	wire, msg := build_answer("plain.example.com.", 300, context.temp_allocator)
+	kb: [KEY_MAX]u8
+	key := key_for(kb[:], "plain.example.com.")
+	testing.expect(t, put(c, key, wire, msg, 1), "the entry was not stored")
+
+	nx_wire, nx_msg := build_nxdomain("gone.example.com.", 300, context.temp_allocator)
+	nb: [KEY_MAX]u8
+	nx_key := key_for(nb[:], "gone.example.com.")
+	testing.expect(t, put(c, nx_key, nx_wire, nx_msg, 1), "the nxdomain was not stored")
+
+	_, hit, ok := get(c, key, context.temp_allocator, checked_against = 99)
+	testing.expect(t, ok && !hit.recheck, "an address answer asked to be looked at again")
+	_, nx_hit, nx_ok := get(c, nx_key, context.temp_allocator, checked_against = 99)
+	testing.expect(t, nx_ok && !nx_hit.recheck, "an empty answer asked to be looked at again")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_a_redirecting_entry_is_flagged_until_it_is_looked_at_again :: proc(t: ^testing.T) {
+	c := make_cache(Options{max_entries = 8, max_ttl = 3600})
+	defer destroy(c)
+
+	wire, msg := build_cname_answer("www.example.com.", "cdn.example.net.", 300, context.temp_allocator)
+	kb: [KEY_MAX]u8
+	key := key_for(kb[:], "www.example.com.")
+	testing.expect(t, put(c, key, wire, msg, 1), "the entry was not stored")
+
+	_, hit, ok := get(c, key, context.temp_allocator, checked_against = 2)
+	testing.expect(t, ok, "the entry was not found")
+	if !testing.expect(t, hit.recheck, "the rules moved on and the entry was served without a word") {
+		return
+	}
+
+	// Every hit until somebody says otherwise: a flag that cleared itself would
+	// be one look, not one look per change.
+	_, again, _ := get(c, key, context.temp_allocator, checked_against = 2)
+	testing.expect(t, again.recheck, "the flag cleared itself without anything having looked")
+
+	note_checked(c, key, hit.serial, 2)
+	_, settled, _ := get(c, key, context.temp_allocator, checked_against = 2)
+	testing.expect(t, !settled.recheck, "the entry was looked at and still asks to be looked at again")
+
+	// And the next change puts it back.
+	_, moved_on, _ := get(c, key, context.temp_allocator, checked_against = 3)
+	testing.expect(t, moved_on.recheck, "the rules changed again and the entry did not notice")
+	free_all(context.temp_allocator)
+}
+
+/*
+The verdict follows the bytes it was reached on, not the key.
+
+Two workers can be in the same key at once: one holding a copy it has just
+looked at, the other storing a fresh answer over the top of it. Without the
+serial, the first one's verdict would land on the second one's answer - and if
+that answer was stored under older rules, the entry would be trusted under rules
+nothing had ever matched it against.
+*/
+@(test)
+test_a_verdict_does_not_land_on_an_answer_that_replaced_the_one_it_was_reached_on :: proc(t: ^testing.T) {
+	c := make_cache(Options{max_entries = 8, max_ttl = 3600})
+	defer destroy(c)
+
+	wire, msg := build_cname_answer("www.example.com.", "cdn.example.net.", 300, context.temp_allocator)
+	kb: [KEY_MAX]u8
+	key := key_for(kb[:], "www.example.com.")
+	testing.expect(t, put(c, key, wire, msg, 1), "the entry was not stored")
+
+	_, hit, ok := get(c, key, context.temp_allocator, checked_against = 3)
+	testing.expect(t, ok && hit.recheck, "the entry should have asked to be looked at")
+
+	// Another worker's answer takes the key, stored under an older number than
+	// the one the first worker was checking against.
+	other_wire, other_msg := build_cname_answer("www.example.com.", "tracker.example.org.", 300, context.temp_allocator)
+	testing.expect(t, put(c, key, other_wire, other_msg, 2), "the replacement was not stored")
+
+	note_checked(c, key, hit.serial, 3)
+
+	_, after, _ := get(c, key, context.temp_allocator, checked_against = 3)
+	testing.expect(t, after.recheck, "a verdict reached on bytes that are gone cleared the answer that replaced them")
+	free_all(context.temp_allocator)
 }
