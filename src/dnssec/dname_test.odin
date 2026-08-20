@@ -265,3 +265,83 @@ test_dname_synthesis_is_recomputed_exactly :: proc(t: ^testing.T) {
 	)
 	free_all(context.temp_allocator)
 }
+
+/*
+A second, unsigned CNAME beside the one the DNAME produced is not vouched for.
+
+The DNAME rescue exists because RFC 6672 section 3.4.1 has the responder
+synthesize its CNAME unsigned, the DNAME being what carries the authority. The
+verdict it produces names an RRset, though, and the prune keeps everything
+matching that name, type and class - so asking whether *one* record is covered
+and then vouching for the set let a second CNAME at the same owner go out under
+the AD bit, pointing wherever the sender chose. Nothing signed it and nothing
+looked at it.
+
+Reachable by whoever writes the answer: a malicious upstream, or anyone on the
+path to a plain UDP or TCP one. A zone may not publish two CNAMEs at one name
+(RFC 1034 section 3.6.2) and a DNAME synthesizes exactly one, so a set carrying
+a second is not one a DNAME produced.
+*/
+@(test)
+test_a_second_cname_beside_a_dname_synthesis_is_not_authenticated :: proc(t: ^testing.T) {
+	v := dname_validator()
+	if !testing.expect(t, v != nil, "cannot build the dname validator") {
+		return
+	}
+	defer destroy_validator(v)
+
+	msg, derr := dns.decode_message(dname_fixture("dname_answer"), context.temp_allocator)
+	if !testing.expect(t, derr == .None, "the fixture did not decode") {
+		return
+	}
+
+	// The synthesized CNAME, plus one the sender added at the same owner.
+	answer := make([dynamic]dns.Record, 0, len(msg.answer) + 1, context.temp_allocator)
+	planted := false
+	for rec in msg.answer {
+		append(&answer, rec)
+		if rec.type == .CNAME && !planted {
+			append(
+				&answer,
+				dns.Record {
+					name = rec.name,
+					type = .CNAME,
+					class = rec.class,
+					ttl = rec.ttl,
+					data = dns.Rdata_Name{name = "evil.example."},
+				},
+			)
+			planted = true
+		}
+	}
+	if !testing.expect(t, planted, "the fixture carried no CNAME to sit beside") {
+		return
+	}
+	msg.answer = answer[:]
+
+	tampered, _, enc := dns.encode_message(msg, context.temp_allocator, dns.MAX_MESSAGE)
+	testing.expect_value(t, enc, dns.Encode_Error.None)
+
+	result := validate(v, "a.dnametest.", .A, tampered, time.unix(FIXTURE_TIME, 0))
+	if result.status == .Secure {
+		// If the verdict stands, the planted record must not be in what it covers.
+		out, ok := strip_unauthenticated(tampered, result, context.temp_allocator, dns.MAX_MESSAGE)
+		if !testing.expect(t, ok, "the pruned response should rebuild") {
+			return
+		}
+		pruned, _ := dns.decode_message(out, context.temp_allocator)
+		for rec in pruned.answer {
+			name, is_name := rec.data.(dns.Rdata_Name)
+			if !is_name {
+				continue
+			}
+			testing.expectf(
+				t,
+				name.name != "evil.example.",
+				"an unsigned CNAME to %s went out under AD beside a DNAME synthesis",
+				name.name,
+			)
+		}
+	}
+	free_all(context.temp_allocator)
+}

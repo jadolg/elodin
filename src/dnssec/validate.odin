@@ -6,6 +6,7 @@ import "core:strings"
 import "core:sync"
 import "core:time"
 import "elodin:dns"
+import "elodin:logx"
 
 /*
 The chain of trust.
@@ -147,8 +148,16 @@ actually verify - see `signature_worth_trying`, which refuses the rest for
 nothing. Generous next to any real answer: a set carries one signature per
 algorithm, and a chain a handful of sets.
 
-It is a bound on work and not a guarantee that the genuine signature is reached,
-and the difference is worth being plain about. A forgery that copies the real
+Spent by `validate_rrset` and `verified_rrset`, which is every signature over an
+answer's own RRsets and over a denial's proof. It is *not* spent by the two
+loops that check a DS set in `zone_step` or a DNSKEY set in `fetch_keys`; those
+have never had a bound of any kind, before this change or after it, and giving
+them one is #193 rather than something to bolt on here. So this is a bound on
+the signatures a response's own records provoke, not on every verification a
+question can reach.
+
+It is also a bound on work and not a guarantee that the genuine signature is
+reached, and the difference is worth being plain about. A forgery that copies the real
 signature's key tag, algorithm and validity window - all of them public - buys a
 verification apiece, and enough of them in front of the real one will exhaust
 this and turn the answer Bogus. No number fixes that: the count and the order
@@ -717,9 +726,25 @@ validate_answer :: proc(
 		Only an unsigned CNAME is reconsidered. A CNAME that came with a
 		signature was meant to have one, and a signature that did not hold up
 		is not something a DNAME excuses.
+
+		Every record of the set has to be covered, not just the first one found
+		at that owner. The verdict recorded below names an RRset, and the prune
+		keeps everything matching it - so asking about one record and vouching
+		for the set let a second, unsigned CNAME at the same owner ride out
+		under the AD bit, pointing wherever the sender liked. A zone may not
+		publish two CNAMEs at one name (RFC 1034 section 3.6.2) and a DNAME
+		synthesizes exactly one, so a set with a second is not a set a DNAME
+		produced; the loop stops at the first record no DNAME accounts for.
 		*/
 		if status != .Secure && rec.type == .CNAME && len(sigs) == 0 {
-			if dname_covered(v, budget, msg, rec, class, unix, now, allocator) {
+			covered := len(records) > 0
+			for r in records {
+				if !dname_covered(v, budget, msg, r, class, unix, now, allocator) {
+					covered = false
+					break
+				}
+			}
+			if covered {
 				status = .Secure
 				why = ""
 			}
@@ -1432,6 +1457,18 @@ verified_rrset :: proc(
 		// Bounded across the question rather than per RRset; see
 		// `MAX_VERIFICATIONS_PER_QUERY` for why the difference matters.
 		if !spend_verification(budget) {
+			/*
+			Said out loud. Running out here drops the RRset, and a dropped SOA
+			takes the denial's negative TTL with it silently - `cache.put` falls
+			back to `cache.negative_ttl`, and with that at zero the answer is not
+			cached at all, so the same question goes upstream every time with
+			nothing anywhere saying why.
+			*/
+			logx.debugf(
+				"dnssec: %s %s ran out of verifications before a signature held; the set is dropped",
+				dns.type_name(type),
+				dns.name_trim_root(owner),
+			)
 			break
 		}
 		result, _ := check_signature(sig, owner, class, records, keys, unix, allocator)
