@@ -84,6 +84,17 @@ Stats :: struct {
 	// because they did not.
 	secure:       u64,
 	bogus:        u64,
+	/*
+	Answers withheld because a public name was pointed into private address
+	space - see `rebind.odin`.
+
+	Counted apart from `blocked`, which is the filter engine, because the two
+	answer different questions. A rising `blocked` is the lists doing their job
+	on names clients asked for; a rising `rebind` is either an attack or a split
+	horizon that nobody exempted, and folding it into the first would hide both
+	inside a number that is meant to be large.
+	*/
+	rebind:       u64,
 }
 
 Server :: struct {
@@ -579,6 +590,13 @@ resolve_query :: proc(
 			sync.atomic_add(&s.stats.secure, 1)
 		}
 		resp = present_response(resp, msg, q.type, result.status == .Secure, allocator)
+	}
+
+	// Before the cache, not after it: an answer stored first is one every later
+	// client is served without this running again. See `rebind.odin`.
+	if out, blocked := rebind_refusal(s, msg, q, resp, limit, allocator); blocked {
+		log_query(s, client, proto, q, .Blocked, "rebind", started)
+		return out, .Blocked, true
 	}
 
 	if s.cfg.cache.enabled {
@@ -1116,5 +1134,6 @@ stats_of :: proc(s: ^Server) -> Stats {
 		conn_failed = sync.atomic_load(&s.stats.conn_failed),
 		secure = sync.atomic_load(&s.stats.secure),
 		bogus = sync.atomic_load(&s.stats.bogus),
+		rebind = sync.atomic_load(&s.stats.rebind),
 	}
 }

@@ -650,3 +650,51 @@ test_metrics_settings_are_not_checked_while_it_is_off :: proc(t: ^testing.T) {
 	testing.expect(t, err == nil, "a disabled metrics endpoint should not be validated")
 	free_all(context.temp_allocator)
 }
+
+/*
+The rebinding guard's defaults and its two exemptions.
+
+The default is the part worth pinning: it is on, and it is on in a tree whose
+`allow_from` restricts to local networks, so an operator upgrading into it can
+have internal names stop resolving. A change to `enabled` here is a change to
+whether that happens, and it should not be possible to make by accident.
+*/
+@(test)
+test_rebind_defaults_to_on_with_nothing_exempt :: proc(t: ^testing.T) {
+	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	testing.expect(t, err == nil)
+	testing.expect(t, cfg.rebind.enabled)
+	testing.expect(t, !cfg.rebind.allow_loopback)
+	testing.expect_value(t, len(cfg.rebind.allow_domains), 0)
+
+	src := "upstream:\n  servers: [1.1.1.1]\nrebind:\n  enabled: false\n  allow_loopback: true\n  allow_domains: [Corp.Example., other.example]\n"
+	set, serr := load_string(src, context.temp_allocator)
+	testing.expect(t, serr == nil)
+	testing.expect(t, !set.rebind.enabled)
+	testing.expect(t, set.rebind.allow_loopback)
+	if testing.expect_value(t, len(set.rebind.allow_domains), 2) {
+		// Canonicalised with the procedure `rewrites` uses, so that a trailing
+		// dot and a capital letter are not two ways of writing a zone the
+		// resolver then fails to match.
+		testing.expect_value(t, set.rebind.allow_domains[0], "corp.example.")
+		testing.expect_value(t, set.rebind.allow_domains[1], "other.example.")
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+The root exempts every name there is, which is the feature turned off written in
+a way nothing about the file admits to. Refused for the same reason `allow_from:`
+with no value is refused: the two readings are a setting and its opposite, and
+there is a two-character way to say the other one.
+*/
+@(test)
+test_rebind_allow_domains_will_not_take_the_root :: proc(t: ^testing.T) {
+	src := "upstream:\n  servers: [1.1.1.1]\nrebind:\n  allow_domains: [\".\"]\n"
+	_, err := load_string(src, context.temp_allocator)
+	e, has := err.?
+	if testing.expect(t, has, "the root was accepted as an exempt domain") {
+		testing.expect(t, strings.contains(e.messages[0], "rebind.allow_domains"))
+	}
+	free_all(context.temp_allocator)
+}
