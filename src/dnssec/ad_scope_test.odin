@@ -283,7 +283,7 @@ test_forged_signatures_do_not_survive_the_prune_in_bulk :: proc(t: ^testing.T) {
 	append(&answer, ..msg.answer)
 	// Thirty-two more, all claiming to cover the answer's A RRset. Half name a
 	// signer inside the owner's ancestry and half name one outside it.
-	for i in 0 ..< 16 {
+	for _ in 0 ..< 16 {
 		append(&answer, forged_rrsig("www.example.com.", "example.com."))
 		append(&answer, forged_rrsig("www.example.com.", "attacker.example."))
 	}
@@ -628,6 +628,76 @@ test_copies_of_the_real_signature_do_not_inherit_its_exemption :: proc(t: ^testi
 		sigs,
 	)
 	// And the one that matters is still there.
+	after := validate(v, "www.example.com.", .A, out, time.unix(FIXTURE_TIME, 0))
+	testing.expectf(t, after.status == .Secure, "the pruned answer no longer validates (%v)", after.status)
+	free_all(context.temp_allocator)
+}
+
+/*
+Verbatim copies of the genuine signature do not each take the exemption.
+
+The exemption is decided by comparing signature bytes, which is a test of
+content and not of identity - and the genuine signature is public. So an
+attacker does not need to forge anything at all: it appends copies of the real
+record, every copy matches, and an exemption that fired once per match let all
+of them through the cap. The padding then goes out under AD and into the cache,
+which is what the cap exists to stop, reached by copying rather than forging.
+
+Fires once now, and the copies are charged against the cap like anything else.
+*/
+@(test)
+test_verbatim_copies_of_the_real_signature_are_capped :: proc(t: ^testing.T) {
+	v := make_validator(ad_query, nil, Options{})
+	defer destroy_validator(v)
+
+	msg, derr := dns.decode_message(ad_unhex(ad_fixture("example_a").wire), context.temp_allocator)
+	if !testing.expect(t, derr == .None, "the fixture did not decode") {
+		return
+	}
+
+	answer := make([dynamic]dns.Record, 0, len(msg.answer) + 40, context.temp_allocator)
+	append(&answer, ..msg.answer)
+	copies := 0
+	for rec in msg.answer {
+		if rec.type != .RRSIG {
+			continue
+		}
+		for _ in 0 ..< 40 {
+			append(&answer, rec)
+			copies += 1
+		}
+		break
+	}
+	if !testing.expect(t, copies == 40, "the fixture carried no RRSIG to copy") {
+		return
+	}
+	msg.answer = answer[:]
+
+	tampered, _, enc := dns.encode_message(msg, context.temp_allocator, dns.MAX_MESSAGE)
+	testing.expect_value(t, enc, dns.Encode_Error.None)
+
+	result := validate(v, "www.example.com.", .A, tampered, time.unix(FIXTURE_TIME, 0))
+	if !testing.expectf(t, result.status == .Secure, "the verdict did not survive (%v)", result.status) {
+		return
+	}
+
+	out, ok := strip_unauthenticated(tampered, result, context.temp_allocator, dns.MAX_MESSAGE)
+	if !testing.expect(t, ok, "the pruned response should rebuild") {
+		return
+	}
+	pruned, _ := dns.decode_message(out, context.temp_allocator)
+	sigs := 0
+	for rec in pruned.answer {
+		if rec.type == .RRSIG {
+			sigs += 1
+		}
+	}
+	testing.expectf(
+		t,
+		sigs <= MAX_SIGNATURES_PER_RRSET + 1,
+		"%d signatures survived: copies of the real one each took the exemption",
+		sigs,
+	)
 	after := validate(v, "www.example.com.", .A, out, time.unix(FIXTURE_TIME, 0))
 	testing.expectf(t, after.status == .Secure, "the pruned answer no longer validates (%v)", after.status)
 	free_all(context.temp_allocator)

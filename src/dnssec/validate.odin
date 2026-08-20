@@ -526,8 +526,10 @@ authenticated_only :: proc(
 	if len(kept) == 0 {
 		return nil
 	}
-	// Signatures kept for each authenticated RRset beyond the one that verified.
+	// Signatures kept for each authenticated RRset beyond the one that verified,
+	// and whether that one has been kept already.
 	sigs_kept := make([]int, len(kept), allocator)
+	verified_kept := make([]bool, len(kept), allocator)
 	out := make([dynamic]dns.Record, 0, len(section), allocator)
 	for rec in section {
 		covered := rec.type
@@ -589,9 +591,19 @@ authenticated_only :: proc(
 			if !dns.name_equal_fold(signer, kept[idx].signer) {
 				continue
 			}
-			// The record that verified is never subject to the cap; everything
-			// else naming the same signer is.
-			if !slice.equal(signature, kept[idx].signature) {
+			/*
+			The record that verified is exempt from the cap, and exempt once.
+
+			The test is on the signature bytes, which is a comparison of content
+			rather than of identity - and the genuine signature is public, so an
+			attacker appends verbatim copies of it and every copy matched. The
+			exemption was then unlimited and the cap never fired, which is the
+			padding it exists to stop, arrived at by copying instead of forging.
+			*/
+			exempt := !verified_kept[idx] && slice.equal(signature, kept[idx].signature)
+			if exempt {
+				verified_kept[idx] = true
+			} else {
 				if sigs_kept[idx] >= MAX_SIGNATURES_PER_RRSET {
 					continue
 				}
@@ -961,12 +973,68 @@ validate_rrset :: proc(
 	*/
 	unsupported := false
 	refused := false
+	/*
+	One chain walk per distinct signer, not one per signature.
+
+	`zone_trust` is the expensive thing in this loop - a walk down the
+	hierarchy, taking the validator's lock and cloning a DNSKEY set out of its
+	cache at every step - and it used to be bounded only by the per-RRset
+	attempt cap that sat above it. With that cap gone the walk became the thing
+	an attacker could multiply: a padded answer carrying two thousand RRSIGs
+	whose signer merely names an ancestor of the owner bought two thousand
+	walks, thousands of acquisitions of a lock every validating worker shares,
+	and megabytes of arena, for one question.
+
+	Memoised by signer, which bounds it by the number of ancestors a name has
+	rather than by the number of records somebody wrote. Distinct signers are
+	the only ones that cost anything, and a name has at most as many ancestors
+	as it has labels.
+	*/
+	Walked :: struct {
+		signer:      string,
+		status:      Status,
+		keys:        []Dnskey,
+		established: string,
+	}
+	walked := make([dynamic]Walked, 0, 4, allocator)
+
 	for sig in sigs {
 		if !name_in_zone(owner, sig.signer) {
 			continue
 		}
+		/*
+		Free, and needs no keys, so it goes above the walk. An expired or
+		not-yet-valid signature cannot verify whatever the chain says, and
+		refusing it here is what stops a heap of stale forgeries paying for
+		chain walks.
+		*/
+		if !signature_current(sig, unix) {
+			continue
+		}
 
-		zone_status, keys, established := zone_trust(v, budget, sig.signer, now, allocator)
+		zone_status: Status
+		keys: []Dnskey
+		established: string
+		seen_walk := false
+		for w in walked {
+			if dns.name_equal_fold(w.signer, sig.signer) {
+				zone_status, keys, established = w.status, w.keys, w.established
+				seen_walk = true
+				break
+			}
+		}
+		if !seen_walk {
+			zone_status, keys, established = zone_trust(v, budget, sig.signer, now, allocator)
+			append(
+				&walked,
+				Walked {
+					signer = sig.signer,
+					status = zone_status,
+					keys = keys,
+					established = established,
+				},
+			)
+		}
 		if zone_status != .Secure || !dns.name_equal_fold(sig.signer, established) {
 			continue
 		}
