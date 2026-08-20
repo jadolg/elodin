@@ -44,6 +44,19 @@ seventeen-name chain that does not exist is worse than being told nothing.
 Stored in the cache as the byte behind them, so a remembered refusal still says
 which of the three it was.
 */
+/*
+What outcome a verdict is reported under.
+
+`Unreadable` is a failure rather than a refusal - see `refuse_cloaked` - so the
+counters and the query log have to agree with the rcode that goes out. Written
+once here rather than at each of the four places a verdict is turned into a
+return, which is how the two would drift.
+*/
+@(private)
+cloak_outcome :: proc(verdict: Cloak_Verdict) -> Outcome {
+	return .Failed if verdict == .Unreadable else .Blocked
+}
+
 @(private)
 Cloak_Verdict :: enum u8 {
 	Clear,
@@ -346,6 +359,41 @@ refuse_cloaked :: proc(
 	started: time.Time,
 	allocator: mem.Allocator,
 ) -> []u8 {
+	/*
+	A record this server could not read is a failure, not a policy answer.
+
+	The other two refusals are things somebody built: a name on a list, and a
+	chain of seventeen that no zone publishes. `blocking.response` is the right
+	shape for those - the operator asked for NXDOMAIN or an address, and that is
+	what a refused lookup gets.
+
+	An unreadable record is not that. One malformed CNAME is as likely to be an
+	upstream or a middlebox having a bad day as it is to be an attack, and
+	answering it through `blocking.response` tells the client something confident
+	and wrong: with the default it is NXDOMAIN, so a name that exists is reported
+	not to, with no rule behind it and nothing in the lists to explain it, and
+	the stub caches that for `blocking.block_ttl`. Under `zero_ip` or `custom_ip`
+	it is worse - NOERROR and an address, which the client will try to connect
+	to.
+
+	SERVFAIL says what actually happened and is the only one of the three a stub
+	will retry or fail over from. It is also what `answer-unreadable` returns for
+	the wider version of the same problem, so the narrow case no longer answers
+	more confidently than the broad one.
+	*/
+	if verdict == .Unreadable {
+		sync.atomic_add(&s.stats.failed, 1)
+		logx.debugf(
+			"%s %s from %s redirects onto a name this server could not read, so where it leads could not be checked; withheld",
+			dns.type_name(q.type),
+			dns.name_trim_root(q.name),
+			client,
+		)
+		out, _ := dns.error_response(nil, msg, .Serv_Fail, allocator, limit)
+		log_query(s, client, proto, q, .Failed, "cname-unreadable", started)
+		return out
+	}
+
 	sync.atomic_add(&s.stats.blocked, 1)
 	if verdict == .Unwalkable {
 		logx.debugf(
@@ -354,13 +402,6 @@ refuse_cloaked :: proc(
 			dns.name_trim_root(q.name),
 			client,
 			MAX_CHAIN_NAMES,
-		)
-	} else if verdict == .Unreadable {
-		logx.debugf(
-			"%s %s from %s redirects onto a name this server could not read, so where it leads could not be checked; withheld",
-			dns.type_name(q.type),
-			dns.name_trim_root(q.name),
-			client,
 		)
 	} else if target == "" {
 		/*
@@ -386,14 +427,7 @@ refuse_cloaked :: proc(
 		)
 	}
 	out := build_block_response(s, msg, q, allocator, limit)
-	detail := "cname"
-	switch verdict {
-	case .Unwalkable:
-		detail = "cname-deep"
-	case .Unreadable:
-		detail = "cname-unreadable"
-	case .Clear, .Listed:
-	}
+	detail := "cname-deep" if verdict == .Unwalkable else "cname"
 	log_query(s, client, proto, q, .Blocked, detail, started)
 	return out
 }
@@ -403,9 +437,15 @@ Whether a refusal the cache remembers is still this server's to act on.
 
 The verdict was recorded under a rule set, and the number that says whether that
 set is current is what `recheck` already answers. What it cannot answer is
-blocking having been switched off entirely since - a reload can do that without
-the lists themselves changing - and a remembered refusal acted on then would be
-this server declining a name under a feature the operator has turned off.
+blocking having been switched off entirely since, which would make a remembered
+refusal this server declining a name under a feature the operator has turned
+off.
+
+Nothing can switch it off today: SIGHUP re-reads the certificates and the lists
+and nothing else, so `blocking.enabled` is fixed for the life of the process and
+this half of the guard is a constant. It is kept as the cheap half of a
+condition that is about to be read wrongly the day configuration reload grows -
+not as a claim that reload exists.
 */
 @(private)
 cloak_refusal_stands :: proc(s: ^Server) -> bool {

@@ -159,7 +159,11 @@ engine_swap :: proc(e: ^Engine, block, allow: ^Set) -> (old_block, old_allow: ^S
 	defer sync.rw_mutex_unlock(&e.mu)
 	old_block, old_allow = e.block, e.allow
 	e.block, e.allow = block, allow
-	sync.atomic_store(&e.generation, e.generation + 1)
+	// An atomic read-modify-write, not a plain read and an atomic store: the
+	// exclusive lock keeps other *writers* out and says nothing about the
+	// lock-free readers in `engine_generation`, so a plain load here would be
+	// one half of a race with them.
+	sync.atomic_add(&e.generation, 1)
 	e.stats.block_rules = block.count if block != nil else 0
 	e.stats.allow_rules = allow.count if allow != nil else 0
 	return

@@ -434,9 +434,18 @@ lists accounts for it:
 | detail | rcode | what happened |
 | --- | --- | --- |
 | `cname-deep` | the `blocking.response` | the chain ran past the sixteenth name, so where it ends was never checked |
-| `cname-unreadable` | the `blocking.response` | a CNAME's target could not be parsed, so where it leads could not be checked |
+| `cname-unreadable` | SERVFAIL | a CNAME's target could not be parsed, so where it leads could not be checked |
 | `answer-unreadable` | SERVFAIL | the upstream's reply could not be parsed at all, so it could not be walked |
 | `cache-unreadable` | SERVFAIL | a stored answer could not be parsed on the way back out |
+
+The two `-unreadable` ones answer SERVFAIL rather than what `blocking.response`
+says, and the split is deliberate: a listed name and an over-long chain are
+answers somebody built, so the operator's chosen refusal fits them, while a
+record that will not parse is as likely to be an upstream or a middlebox having
+a bad day. Reporting that as NXDOMAIN would tell a client a name it asked for
+does not exist, with no rule behind it, and the stub would cache that for
+`blocking.block_ttl`; SERVFAIL is the only one of the answers a stub will retry
+or fail over from.
 
 `answer-unreadable` is the one worth knowing about, because it is a way for a
 name to stop resolving that appears only once blocking is on: with blocking off

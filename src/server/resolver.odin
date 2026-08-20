@@ -786,7 +786,7 @@ resolve_query :: proc(
 			if s.cfg.cache.enabled && have_decoded {
 				cache.put(s.answers, key, resp, decoded, generation, u8(verdict))
 			}
-			return out, .Blocked, true
+			return out, cloak_outcome(verdict), true
 		}
 	}
 
@@ -916,7 +916,7 @@ serve_from_cache :: proc(
 			*/
 			cache.note_withheld(s.answers)
 			out := refuse_cloaked(s, "", verdict, msg, q, proto, client, limit, started, allocator)
-			return out, .Blocked, true
+			return out, cloak_outcome(verdict), true
 		}
 	}
 	if hit.recheck {
@@ -937,7 +937,7 @@ serve_from_cache :: proc(
 			); verdict != .Clear {
 				cache.note_checked(s.answers, hit.key, hit.serial, hit.checked, u8(verdict))
 				cache.note_withheld(s.answers)
-				return out, .Blocked, true
+				return out, cloak_outcome(verdict), true
 			}
 			// Inside the decode, not after it. An entry nothing could read has
 			// not been looked at, and stamping it here would say it had - which

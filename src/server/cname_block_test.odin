@@ -1104,3 +1104,114 @@ test_a_refusal_on_a_partial_decode_is_released_by_a_reload :: proc(t: ^testing.T
 	)
 	free_all(context.temp_allocator)
 }
+
+/*
+An unreadable CNAME is SERVFAIL, not a policy answer.
+
+The three refusals are not the same kind of thing. A listed name and a
+seventeen-name chain are answers somebody built, and `blocking.response` is what
+the operator asked for those. One CNAME whose target will not parse is as likely
+to be an upstream or a middlebox as an attack, and rendering it through
+`blocking.response` says something confident and wrong: with the default that is
+NXDOMAIN, so a name that exists is reported not to, with no rule behind it and
+nothing in the lists to explain it - and the stub caches that for
+`blocking.block_ttl`. Under `zero_ip` the client gets an address to connect to
+instead.
+
+SERVFAIL is the only one of the three a stub retries or fails over from, and it
+is what the whole-message version of the same problem already returns.
+*/
+@(test)
+test_an_unreadable_cname_target_is_servfail_not_a_block_answer :: proc(t: ^testing.T) {
+	// A CNAME whose RDATA is a compression pointer aiming past the end of the
+	// message: the record decodes as Rdata_Raw, the message decodes fine.
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question{name = "www.brand.example.", type = .A, class = .IN}
+	msg := dns.Message{question = question}
+	msg.flags.qr = true
+	msg.flags.rd = true
+	msg.flags.ra = true
+	base, _, enc := dns.encode_message(msg, context.temp_allocator)
+	if !testing.expect(t, enc == .None, "could not build the fixture") {
+		return
+	}
+
+	wire := make([dynamic]u8, 0, len(base) + 32, context.temp_allocator)
+	append(&wire, ..base)
+	wire[7] = 1 // ANCOUNT = 1
+	// Owner: www.brand.example., written out rather than compressed.
+	for label in ([]string{"www", "brand", "example"}) {
+		append(&wire, u8(len(label)))
+		append(&wire, ..transmute([]u8)label)
+	}
+	append(&wire, 0)
+	append(&wire, 0, 5) // TYPE = CNAME
+	append(&wire, 0, 1) // CLASS = IN
+	append(&wire, 0, 0, 0, 60) // TTL
+	append(&wire, 0, 2) // RDLENGTH = 2
+	append(&wire, 0xc0, 0xfe) // a pointer past the end of the message
+
+	decoded, derr := dns.decode_message(wire[:], context.temp_allocator)
+	if !testing.expect(t, derr == .None, "the fixture was meant to decode as a whole") {
+		return
+	}
+	if !testing.expect(t, len(decoded.answer) == 1, "the fixture was meant to carry one record") {
+		return
+	}
+	if _, is_name := decoded.answer[0].data.(dns.Rdata_Name); is_name {
+		testing.fail_now(t, "the CNAME parsed after all, so this does not reach the Unreadable path")
+	}
+
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+		return
+	}
+	defer net.close(socket)
+	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+	bound, _ := net.bound_endpoint(socket)
+
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.cache.enabled = false
+	cfg.dnssec.enabled = false
+	cfg.blocking.enabled = true
+	cfg.upstream.strategy = .Failover
+	cfg.upstream.attempts = 1
+	cfg.upstream.timeout = 3 * time.Second
+	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
+	servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port}
+	cfg.upstream.servers = servers
+
+	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+		return
+	}
+	defer upstream.destroy_group(group)
+
+	engine := filter.engine_make()
+	defer filter.engine_destroy(engine)
+	// Nothing on any list: the refusal is about the record, not about a rule.
+	filter.engine_swap(engine, filter.set_make(), filter.set_make())
+
+	srv := Server{cfg = &cfg, group = group, filters = engine}
+
+	x := Cloak_Mock{socket = socket, reply = wire[:]}
+	mock := thread.create_and_start_with_poly_data(&x, serve_cloak)
+	out, outcome, ok := handle_query(&srv, cloak_query("www.brand.example."), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	thread.join(mock)
+	thread.destroy(mock)
+
+	if !testing.expect(t, ok, "nothing came back at all") {
+		return
+	}
+	testing.expect_value(t, outcome, Outcome.Failed)
+	served, serr2 := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, serr2, dns.Decode_Error.None)
+	testing.expectf(
+		t,
+		dns.rcode_of(served) == .Serv_Fail,
+		"a record that would not parse was answered %v rather than SERVFAIL",
+		dns.rcode_of(served),
+	)
+	free_all(context.temp_allocator)
+}
