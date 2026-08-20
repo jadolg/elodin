@@ -58,6 +58,7 @@ load_string :: proc(src: string, allocator := context.allocator) -> (cfg: Config
 	load_blocking(&l, &cfg)
 	load_dnssec(&l, &cfg)
 	load_cookies(&l, &cfg)
+	load_rebind(&l, &cfg)
 	load_metrics(&l, &cfg)
 	load_rewrites(&l, &cfg)
 	validate(&l, &cfg)
@@ -736,6 +737,114 @@ load_cookies :: proc(l: ^Loader, cfg: ^Config) {
 	opt_bool(l, n, "require", &cfg.cookies.require, "cookies")
 	opt_bool(l, n, "upstream", &cfg.cookies.upstream, "cookies")
 	opt_string(l, n, "secret", &cfg.cookies.secret, "cookies")
+}
+
+/*
+Read the `rebind` section.
+
+`allow_domains` is canonicalised here, with the same procedure `rewrites` uses,
+so the resolver compares two names that were written the same way. An operator
+who put a trailing dot on one and not the other gets the same behaviour from
+both, which is the sort of difference that is otherwise only found by the name
+that would not resolve.
+*/
+@(private)
+load_rebind :: proc(l: ^Loader, cfg: ^Config) {
+	n := yaml.get(l.root, "rebind")
+	if n == nil {
+		return
+	}
+	opt_bool(l, n, "enabled", &cfg.rebind.enabled, "rebind")
+	opt_bool(l, n, "allow_loopback", &cfg.rebind.allow_loopback, "rebind")
+
+	if d := yaml.get(n, "allow_domains"); !yaml.is_null(d) {
+		list, ok := yaml.as_string_list(d, l.allocator)
+		if !ok {
+			errorf(l, "rebind.allow_domains: expected a list of domains, such as [home.example]")
+			return
+		}
+		out := make([]string, len(list), l.allocator)
+		kept := 0
+		for entry, i in list {
+			domain := canonical_domain(entry, l.allocator)
+
+			/*
+			`rewrites` further down does take a `*.` prefix, so an operator who
+			has written one there writes one here too, and `canonical_domain`
+			keeps the star. This list has no use for one - an entry already
+			covers everything below itself - so `*.corp.example.` would sit in
+			it matching nothing any client can ask for, and the symptom of that
+			is every internal name still answering NODATA after the fix was
+			applied, with no line anywhere saying why. That is the one failure
+			this setting exists to prevent, so the star is named here instead of
+			at three in the morning.
+
+			`zone` is what the entry meant; a bare `*` leaves nothing of it and
+			is the root, which the next check refuses for what it is.
+			*/
+			wildcard := strings.has_prefix(domain, "*.")
+			zone := domain
+			if wildcard {
+				zone = domain[2:]
+				if zone == "" {
+					zone = "."
+				}
+			}
+
+			/*
+			The root would exempt every name there is, which is `rebind.enabled:
+			false` written in a way nothing about the file makes obvious. Refused
+			rather than obeyed, on the same reasoning that `allow_from:` with no
+			value is refused: the two readings are a setting and its opposite.
+			*/
+			if zone == "." {
+				errorf(
+					l,
+					"rebind.allow_domains[%d]: %q exempts every name; set rebind.enabled to false if that is what you mean",
+					i,
+					entry,
+				)
+				continue
+			}
+			/*
+			Named rather than quietly stripped: `*.corp.example` means "below"
+			in the section that does take it and this list means "at or below",
+			so obeying it would widen an exemption past what was written.
+			*/
+			if wildcard {
+				errorf(
+					l,
+					"rebind.allow_domains[%d]: %q takes no wildcard; write %q, which already covers everything below it",
+					i,
+					entry,
+					strings.trim_suffix(zone, "."),
+				)
+				continue
+			}
+			/*
+			An empty label - a leading dot, or two of them in a row - is the
+			other way to write an entry that matches nothing, and
+			`.corp.example` is a form operators arrive with because `no_proxy`
+			takes it and means by it what this list writes plain. Kept as
+			written it would sit in the configuration looking like the fix while
+			every internal name went on answering NODATA, which is the failure
+			the wildcard check above exists to prevent; refused for the same
+			reason.
+			*/
+			if strings.has_prefix(zone, ".") || strings.contains(zone, "..") {
+				errorf(
+					l,
+					"rebind.allow_domains[%d]: %q has an empty label; write the zone as a plain name, such as corp.example",
+					i,
+					entry,
+				)
+				continue
+			}
+			out[kept] = domain
+			kept += 1
+		}
+		cfg.rebind.allow_domains = out[:kept]
+	}
 }
 
 @(private)

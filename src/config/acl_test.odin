@@ -302,3 +302,90 @@ test_no_address_is_not_allowed :: proc(t: ^testing.T) {
 	// source but the absence of one.
 	testing.expect(t, source_allowed(nil, nil), "an empty list should still mean no restriction")
 }
+
+/*
+The other question the prefix machinery answers: not "may this source ask" but
+"is this an address a public name should have resolved to".
+
+`PRIVATE_NETWORKS` is a table of its own rather than a second reader of
+`DEFAULT_ALLOW_FROM`, because that one is a default an operator replaces and this
+one is a property of the address space. What the two share is the matching, which
+is what this pins - a table read by a compare that is wrong in the last bit is a
+table that says nothing.
+*/
+@(private = "file")
+private_v4 :: proc(a, b, c, d: u8) -> bool {
+	bytes: [16]u8
+	bytes[0], bytes[1], bytes[2], bytes[3] = a, b, c, d
+	return address_in(PRIVATE_NETWORKS, bytes, false)
+}
+
+@(test)
+test_the_private_table_covers_the_ranges_it_names :: proc(t: ^testing.T) {
+	testing.expect(t, private_v4(127, 0, 0, 1))
+	testing.expect(t, private_v4(10, 0, 0, 5))
+	testing.expect(t, private_v4(172, 16, 0, 1))
+	testing.expect(t, private_v4(172, 31, 255, 254))
+	testing.expect(t, private_v4(192, 168, 1, 1))
+	// The cloud instance metadata endpoint, which is the single most valuable
+	// target in the set: unauthenticated, and what it returns is credentials.
+	testing.expect(t, private_v4(169, 254, 169, 254))
+	testing.expect(t, private_v4(0, 0, 0, 0))
+
+	// Just outside each edge, so a /12 written as a /16 or an off-by-one mask
+	// would be caught rather than passing every test above.
+	testing.expect(t, !private_v4(172, 15, 255, 255))
+	testing.expect(t, !private_v4(172, 32, 0, 1))
+	testing.expect(t, !private_v4(192, 167, 1, 1))
+	testing.expect(t, !private_v4(169, 253, 0, 1))
+	testing.expect(t, !private_v4(93, 184, 216, 34))
+	testing.expect(t, !private_v4(1, 1, 1, 1))
+	// Carrier-grade NAT is deliberately not in it: it is a shared address space
+	// rather than a private one, and a resolver behind an ISP using it would be
+	// refusing answers about hosts it can legitimately reach.
+	testing.expect(t, !private_v4(100, 64, 0, 1))
+}
+
+@(test)
+test_the_private_table_covers_v6_and_the_mapped_form :: proc(t: ^testing.T) {
+	loopback := [16]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+	link_local := [16]u8{0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+	unique_local := [16]u8{0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+	unspecified := [16]u8{}
+	public := [16]u8{0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88}
+
+	testing.expect(t, address_in(PRIVATE_NETWORKS, loopback, true))
+	testing.expect(t, address_in(PRIVATE_NETWORKS, link_local, true))
+	testing.expect(t, address_in(PRIVATE_NETWORKS, unique_local, true))
+	testing.expect(t, address_in(PRIVATE_NETWORKS, unspecified, true))
+	testing.expect(t, !address_in(PRIVATE_NETWORKS, public, true))
+
+	/*
+	`::ffff:192.168.1.1` is 192.168.1.1 to every stack that connects to it, so an
+	AAAA record holding one has to be read as the IPv4 address it names. Reading
+	it as an IPv6 address outside fc00::/7 would be a way of writing a private
+	address that the check does not see - the answer-side twin of the mapping
+	`address_bytes` already undoes on the way in.
+	*/
+	mapped := [16]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 1, 1}
+	testing.expect(t, address_in(PRIVATE_NETWORKS, mapped, true))
+	mapped_public := [16]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 93, 184, 216, 34}
+	testing.expect(t, !address_in(PRIVATE_NETWORKS, mapped_public, true))
+}
+
+// The loopback subset is a subset, and is where dnsmasq's
+// `--rebind-localhost-ok` draws its line. A switch that also opened RFC 1918
+// would be one an operator reaches for and thereby turns the feature off.
+@(test)
+test_the_loopback_table_is_loopback_alone :: proc(t: ^testing.T) {
+	v4_loopback: [16]u8
+	v4_loopback[0], v4_loopback[3] = 127, 1
+	v6_loopback := [16]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+	rfc1918: [16]u8
+	rfc1918[0], rfc1918[1], rfc1918[2], rfc1918[3] = 192, 168, 1, 1
+
+	testing.expect(t, address_in(LOOPBACK_NETWORKS, v4_loopback, false))
+	testing.expect(t, address_in(LOOPBACK_NETWORKS, v6_loopback, true))
+	testing.expect(t, !address_in(LOOPBACK_NETWORKS, rfc1918, false))
+	testing.expect(t, !address_in(LOOPBACK_NETWORKS, [16]u8{}, false))
+}

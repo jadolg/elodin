@@ -650,3 +650,113 @@ test_metrics_settings_are_not_checked_while_it_is_off :: proc(t: ^testing.T) {
 	testing.expect(t, err == nil, "a disabled metrics endpoint should not be validated")
 	free_all(context.temp_allocator)
 }
+
+/*
+The rebinding guard's defaults and its two exemptions.
+
+The default is the part worth pinning: it is on, and it is on in a tree whose
+`allow_from` restricts to local networks, so an operator upgrading into it can
+have internal names stop resolving. A change to `enabled` here is a change to
+whether that happens, and it should not be possible to make by accident.
+*/
+@(test)
+test_rebind_defaults_to_on_with_nothing_exempt :: proc(t: ^testing.T) {
+	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	testing.expect(t, err == nil)
+	testing.expect(t, cfg.rebind.enabled)
+	testing.expect(t, !cfg.rebind.allow_loopback)
+	testing.expect_value(t, len(cfg.rebind.allow_domains), 0)
+
+	src := "upstream:\n  servers: [1.1.1.1]\nrebind:\n  enabled: false\n  allow_loopback: true\n  allow_domains: [Corp.Example., other.example]\n"
+	set, serr := load_string(src, context.temp_allocator)
+	testing.expect(t, serr == nil)
+	testing.expect(t, !set.rebind.enabled)
+	testing.expect(t, set.rebind.allow_loopback)
+	if testing.expect_value(t, len(set.rebind.allow_domains), 2) {
+		// Canonicalised with the procedure `rewrites` uses, so that a trailing
+		// dot and a capital letter are not two ways of writing a zone the
+		// resolver then fails to match.
+		testing.expect_value(t, set.rebind.allow_domains[0], "corp.example.")
+		testing.expect_value(t, set.rebind.allow_domains[1], "other.example.")
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+The root exempts every name there is, which is the feature turned off written in
+a way nothing about the file admits to. Refused for the same reason `allow_from:`
+with no value is refused: the two readings are a setting and its opposite, and
+there is a two-character way to say the other one.
+*/
+@(test)
+test_rebind_allow_domains_will_not_take_the_root :: proc(t: ^testing.T) {
+	src := "upstream:\n  servers: [1.1.1.1]\nrebind:\n  allow_domains: [\".\"]\n"
+	_, err := load_string(src, context.temp_allocator)
+	e, has := err.?
+	if testing.expect(t, has, "the root was accepted as an exempt domain") {
+		testing.expect(t, strings.contains(e.messages[0], "rebind.allow_domains"))
+	}
+
+	// A bare star is the root written the other way, and means the same thing.
+	star := "upstream:\n  servers: [1.1.1.1]\nrebind:\n  allow_domains: [\"*\"]\n"
+	_, serr := load_string(star, context.temp_allocator)
+	_, star_has := serr.?
+	testing.expect(t, star_has, "a bare * was accepted as an exempt domain")
+	free_all(context.temp_allocator)
+}
+
+/*
+A wildcard is refused rather than kept, because keeping it matches nothing.
+
+`rewrites` in the same file does take `*.lab`, so an operator who has written one
+there writes one here - and `canonical_domain` would hold it as `*.corp.example.`,
+which no name a client asks for is ever at or below. The entry would sit in the
+configuration looking like the fix while every internal name went on answering
+NODATA, which is precisely the failure `allow_domains` exists to end. The error
+names the zone to write instead.
+*/
+@(test)
+test_rebind_allow_domains_will_not_take_a_wildcard :: proc(t: ^testing.T) {
+	src := "upstream:\n  servers: [1.1.1.1]\nrebind:\n  allow_domains: [\"*.corp.example\"]\n"
+	_, err := load_string(src, context.temp_allocator)
+	e, has := err.?
+	if testing.expect(t, has, "a wildcard was accepted as an exempt domain, and would match nothing") {
+		testing.expect(t, strings.contains(e.messages[0], "rebind.allow_domains"))
+		testing.expect(t, strings.contains(e.messages[0], "corp.example"))
+	}
+
+	// And the plain zone, which is what it should have said, still loads and
+	// still covers everything below itself.
+	ok_src := "upstream:\n  servers: [1.1.1.1]\nrebind:\n  allow_domains: [corp.example]\n"
+	cfg, oerr := load_string(ok_src, context.temp_allocator)
+	testing.expect(t, oerr == nil)
+	if testing.expect_value(t, len(cfg.rebind.allow_domains), 1) {
+		testing.expect_value(t, cfg.rebind.allow_domains[0], "corp.example.")
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+The leading dot, which is the third way to write an entry that matches nothing.
+
+`no_proxy` takes `.corp.example` and means by it what this list writes plain, so
+it is a form an operator arrives with rather than one they invent. Held as
+written it would be an entry no name a client asks for is ever at or below - the
+same silent no-op the wildcard is refused for, and the same symptom: every
+internal name still answering NODATA after the fix was applied.
+*/
+@(test)
+test_rebind_allow_domains_will_not_take_an_empty_label :: proc(t: ^testing.T) {
+	sources := []string {
+		"upstream:\n  servers: [1.1.1.1]\nrebind:\n  allow_domains: [\".corp.example\"]\n",
+		"upstream:\n  servers: [1.1.1.1]\nrebind:\n  allow_domains: [\"corp..example\"]\n",
+	}
+	for src in sources {
+		_, err := load_string(src, context.temp_allocator)
+		e, has := err.?
+		if testing.expect(t, has, "an empty label was accepted, and would match nothing") {
+			testing.expect(t, strings.contains(e.messages[0], "rebind.allow_domains"))
+		}
+	}
+	free_all(context.temp_allocator)
+}

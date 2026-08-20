@@ -401,12 +401,16 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	logx.eventf(
 		.Info,
 		"ready",
-		"strategy=%v upstreams=%d cache=%v blocking=%v dnssec=%v",
+		"strategy=%v upstreams=%d cache=%v blocking=%v dnssec=%v rebind=%v",
 		cfg.upstream.strategy,
 		len(cfg.upstream.servers),
 		cfg.cache.enabled,
 		cfg.blocking.enabled,
 		cfg.dnssec.enabled,
+		// Named here because it is on by default and can make a name stop
+		// resolving. An operator working out why an internal host went missing
+		// should find the feature in the first line the server wrote.
+		cfg.rebind.enabled,
 	)
 
 	maintenance_loop(&s, &listeners, group, answers, cfg, opts)
@@ -530,7 +534,7 @@ report :: proc(s: ^server.Server, answers: ^cache.Cache) {
 	logx.eventf(
 		.Info,
 		"stats",
-		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d refused=%d conn_refused=%d conn_failed=%d limited=%d truncated=%d secure=%d bogus=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_misses=%d cache_stale=%d cache_evictions=%d",
+		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d refused=%d conn_refused=%d conn_failed=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_misses=%d cache_stale=%d cache_evictions=%d",
 		st.queries,
 		st.blocked,
 		st.cached,
@@ -544,6 +548,7 @@ report :: proc(s: ^server.Server, answers: ^cache.Cache) {
 		slipped,
 		st.secure,
 		st.bogus,
+		st.rebind,
 		cache.len_entries(answers),
 		cache.bytes_used(answers),
 		cs.hits,

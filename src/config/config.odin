@@ -421,6 +421,74 @@ Rate_Limit_Config :: struct {
 }
 
 /*
+Refusing an upstream answer that points a public name into private address space.
+
+The reasoning for the whole feature is in `src/server/rebind.odin`; what is
+decided here is the default, and it is the part of this that can go wrong for
+somebody who never read either file.
+
+On, which is not where dnsmasq, AdGuard Home or Unbound put their version of it.
+Three reasons it goes the other way here.
+
+The first is that this tree already made the argument, for the setting directly
+above `dnssec.enabled`: validation is on, and the cost is written down as "an
+upstream which cannot return DNSSEC records makes every signed zone unresolvable
+rather than merely unverified, so anything talking to such an upstream has to
+turn this off deliberately". That is the same trade in the same shape - a check
+on what an upstream returned, on by default, unresolvable rather than unchecked
+when the upstream disagrees with it. `blocking`, `cookies`, `rate_limit` and
+`allow_from` all default the same way. A security feature that shipped off in
+this tree would be the exception, and an operator reasoning from the others
+would get this one wrong.
+
+The second is who runs it. This is a forwarder for a box on a LAN that every
+device points at, so its population is the exact target of the attack and is
+also the population least likely to read a list of optional hardening switches.
+A default nobody turns on protects nobody.
+
+The third is that the failure is loud and the attack is silent. A name this
+refuses says so once at `warn`, names the address, names this setting and names
+`rebind.allow_domains`, and is counted as `rebind=` in the stats line and in the
+query log; an operator whose internal name stopped resolving has the fix in the
+first line they grep. Forwarding a private address is a page silently reaching a
+router's admin interface, which produces no line anywhere.
+
+What it costs is real and is not waved away: a split-horizon site whose upstream
+is its own internal server resolves internal names to RFC 1918 addresses, and
+every one of those becomes NODATA on upgrade until the zone is named in
+`allow_domains`. That is the case `allow_domains` exists for, it is one line, and
+`--check` reads it. `rewrites` need no such line - a rewritten name is answered
+here and never reaches an upstream, so it never reaches this check.
+*/
+Rebind_Config :: struct {
+	enabled:        bool,
+	/*
+	Names whose answers may carry private addresses, each covering itself and
+	everything below it - dnsmasq's `--rebind-domain-ok`.
+
+	Matched against the question, not against the owner name of the offending
+	record. A CNAME into an exempt zone therefore exempts nothing: the browser's
+	origin is the name it asked for, and that is the name whose answer is being
+	trusted. The other way round is what an operator means - `home.example`
+	listed here covers `nas.home.example` however many CNAMEs the answer takes
+	to reach an address.
+	*/
+	allow_domains:  []string,
+	/*
+	Whether 127.0.0.0/8 and ::1 are allowed through - dnsmasq's
+	`--rebind-localhost-ok`.
+
+	Off, because loopback is the address a rebinding attack most wants: a
+	service bound to 127.0.0.1 is one its author believed only local processes
+	could reach, and is therefore the one least likely to authenticate. The
+	names that legitimately resolve there are few and usually the operator's
+	own, which `allow_domains` covers by name rather than by opening the range
+	for everything.
+	*/
+	allow_loopback: bool,
+}
+
+/*
 The Prometheus endpoint.
 
 Off, because a resolver that opens a second port nobody asked for is a resolver
@@ -455,6 +523,7 @@ Config :: struct {
 	blocking:  Blocking_Config,
 	dnssec:    Dnssec_Config,
 	cookies:   Cookie_Config,
+	rebind:    Rebind_Config,
 	metrics:   Metrics_Config,
 	rewrites:  []Rewrite,
 }
@@ -551,6 +620,14 @@ default_config :: proc() -> Config {
 		enabled  = true,
 		require  = false,
 		upstream = true,
+	}
+	c.rebind = Rebind_Config {
+		// On, and with nothing exempt. See the type: the argument is that this
+		// tree already defaults `dnssec.enabled` the same way against the same
+		// trade, and that the operators this is for are the ones the attack is
+		// aimed at.
+		enabled        = true,
+		allow_loopback = false,
 	}
 	c.metrics = Metrics_Config {
 		enabled = false,

@@ -250,6 +250,15 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 	allow list turned away never reached an outcome, and one answered from a
 	local zone is not counted apart from the rest; the difference is the
 	`dropped` and `refused` counters below.
+
+	An answer withheld by the rebinding guard is in none of these either, though
+	the query log calls it `outcome=blocked`. `blocked` here is what the sink
+	lists did to names clients asked for, which is a number meant to be large and
+	is what a dashboard graphs as such; a rebind refusal is either an attack or a
+	split horizon nobody exempted, and adding a handful of those into a figure in
+	the tens of thousands would hide both. `elodin_rebind_refused_total` below is
+	where it is counted. Same reasoning, and the same shape, as `outcome=refused
+	detail="rd"` not adding to `elodin_queries_refused_total`.
 	*/
 	metrics.family(&b, "elodin_answers_total", .Counter, "Queries by how they were answered.")
 	metrics.sample(&b, "elodin_answers_total", st.forwarded, metrics.Label{"outcome", "forwarded"})
@@ -316,6 +325,14 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 		.Counter,
 		"Rate-limited queries answered truncated instead of dropped, to send a real client to TCP.",
 		slipped,
+	)
+
+	metrics.scalar(
+		&b,
+		"elodin_rebind_refused_total",
+		.Counter,
+		"Answers withheld because a public name was pointed into private address space.",
+		st.rebind,
 	)
 
 	metrics.family(&b, "elodin_dnssec_answers_total", .Counter, "Answers by what validation made of them.")
