@@ -594,8 +594,8 @@ resolve_query :: proc(
 
 	// Before the cache, not after it: an answer stored first is one every later
 	// client is served without this running again. See `rebind.odin`.
-	if out, blocked := rebind_refusal(s, msg, q, resp, limit, allocator); blocked {
-		log_query(s, client, proto, q, .Blocked, "rebind", started)
+	if out, detail, blocked := rebind_refusal(s, msg, q, resp, limit, allocator); blocked {
+		log_query(s, client, proto, q, .Blocked, detail, started)
 		return out, .Blocked, true
 	}
 

@@ -735,3 +735,28 @@ test_rebind_allow_domains_will_not_take_a_wildcard :: proc(t: ^testing.T) {
 	}
 	free_all(context.temp_allocator)
 }
+
+/*
+The leading dot, which is the third way to write an entry that matches nothing.
+
+`no_proxy` takes `.corp.example` and means by it what this list writes plain, so
+it is a form an operator arrives with rather than one they invent. Held as
+written it would be an entry no name a client asks for is ever at or below - the
+same silent no-op the wildcard is refused for, and the same symptom: every
+internal name still answering NODATA after the fix was applied.
+*/
+@(test)
+test_rebind_allow_domains_will_not_take_an_empty_label :: proc(t: ^testing.T) {
+	sources := []string {
+		"upstream:\n  servers: [1.1.1.1]\nrebind:\n  allow_domains: [\".corp.example\"]\n",
+		"upstream:\n  servers: [1.1.1.1]\nrebind:\n  allow_domains: [\"corp..example\"]\n",
+	}
+	for src in sources {
+		_, err := load_string(src, context.temp_allocator)
+		e, has := err.?
+		if testing.expect(t, has, "an empty label was accepted, and would match nothing") {
+			testing.expect(t, strings.contains(e.messages[0], "rebind.allow_domains"))
+		}
+	}
+	free_all(context.temp_allocator)
+}

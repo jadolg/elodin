@@ -821,6 +821,25 @@ load_rebind :: proc(l: ^Loader, cfg: ^Config) {
 				)
 				continue
 			}
+			/*
+			An empty label - a leading dot, or two of them in a row - is the
+			other way to write an entry that matches nothing, and
+			`.corp.example` is a form operators arrive with because `no_proxy`
+			takes it and means by it what this list writes plain. Kept as
+			written it would sit in the configuration looking like the fix while
+			every internal name went on answering NODATA, which is the failure
+			the wildcard check above exists to prevent; refused for the same
+			reason.
+			*/
+			if strings.has_prefix(zone, ".") || strings.contains(zone, "..") {
+				errorf(
+					l,
+					"rebind.allow_domains[%d]: %q has an empty label; write the zone as a plain name, such as corp.example",
+					i,
+					entry,
+				)
+				continue
+			}
 			out[kept] = domain
 			kept += 1
 		}

@@ -220,9 +220,35 @@ ask_with_reply :: proc(
 	decoded: dns.Message,
 	ok: bool,
 ) {
+	out, _, sent := ask_raw(t, cfg, name, type, reply, answers)
+	if !sent {
+		return {}, false
+	}
+	msg, derr := dns.decode_message(out, context.temp_allocator)
+	if !testing.expectf(t, derr == .None, "the response did not decode: %v", derr) {
+		return {}, false
+	}
+	return msg, true
+}
+
+// The same, stopping at the bytes. What a test wants when the response is not
+// meant to decode - which is the whole subject of the undecodable-answer case.
+@(private = "file")
+ask_raw :: proc(
+	t: ^testing.T,
+	cfg: ^config.Config,
+	name: string,
+	type: dns.Type,
+	reply: []u8,
+	answers: ^cache.Cache = nil,
+) -> (
+	wire: []u8,
+	outcome: Outcome,
+	ok: bool,
+) {
 	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
 	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
-		return {}, false
+		return nil, .Failed, false
 	}
 	defer net.close(socket)
 	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
@@ -237,7 +263,7 @@ ask_with_reply :: proc(
 
 	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return {}, false
+		return nil, .Failed, false
 	}
 	defer upstream.destroy_group(group)
 	s := Server {
@@ -248,18 +274,14 @@ ask_with_reply :: proc(
 
 	x := Rebind_Mock{socket = socket, reply = reply}
 	mock := thread.create_and_start_with_poly_data(&x, serve_rebind)
-	out, _, sent := handle_query(&s, rebind_query_type(name, type), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, got, sent := handle_query(&s, rebind_query_type(name, type), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	thread.join(mock)
 	thread.destroy(mock)
 
 	if !testing.expect(t, sent, "nothing came back at all") {
-		return {}, false
+		return nil, got, false
 	}
-	msg, derr := dns.decode_message(out, context.temp_allocator)
-	if !testing.expectf(t, derr == .None, "the response did not decode: %v", derr) {
-		return {}, false
-	}
-	return msg, true
+	return out, got, true
 }
 
 // A configuration with nothing in the way of the check but the check itself.
@@ -749,6 +771,175 @@ test_a_zero_ip_block_response_still_reaches_the_client :: proc(t: ^testing.T) {
 			"the %v sink answer was refused: blocking with zeroip has been taken down by the rebinding guard",
 			type,
 		)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+An answer this server cannot decode is refused rather than forwarded.
+
+This was the way round the guard, and it cost the attacker nothing: they own the
+authoritative server, so they emit a truthful answer section carrying
+192.168.1.1 and an ARCOUNT of 100 with no additional records behind it. The
+count check in `decode_message` rejects the message, `rebind_refusal` had
+nothing to inspect and said so, and the bytes went to the client verbatim -
+where glibc's `getanswer`, which only ever walks the answer section, hands the
+browser the address. Deterministic, one flag in the header, no timing and no
+race.
+
+What the file used to offer against that was that such a message is also one the
+validator cannot validate. It is not much: `validating` is false whenever
+`dnssec.enabled` is off - a supported configuration, and the one recommended for
+an upstream that cannot return DNSSEC records - or the client sets CD, and an
+attacker's own zone is unsigned in any case, so validation reaches Insecure and
+serves it. A mitigation that an attacker turns off by not signing their zone is
+not one.
+
+The reply here is built by encoding a well-formed message and then writing 100
+into ARCOUNT, which is exactly the attacker's edit and nothing else.
+*/
+@(test)
+test_an_undecodable_answer_is_refused_not_forwarded :: proc(t: ^testing.T) {
+	records := make([]dns.Record, 1, context.temp_allocator)
+	records[0] = a_record("undecodable.attacker.example.", {192, 168, 1, 1})
+	reply := rebind_reply_of("undecodable.attacker.example.", .A, records)
+	if !testing.expect(t, len(reply) > dns.HEADER_SIZE, "the reply did not encode") {
+		return
+	}
+	// ARCOUNT is the fourth count in the header, bytes 10 and 11. A hundred
+	// additional records that are not there is more than the remaining bytes
+	// can hold, which is what the decoder refuses.
+	patched := make([]u8, len(reply), context.temp_allocator)
+	copy(patched, reply)
+	patched[10], patched[11] = 0, 100
+
+	_, derr := dns.decode_message(patched, context.temp_allocator)
+	if !testing.expect(t, derr != .None, "the premise is gone: this message now decodes") {
+		return
+	}
+
+	cfg := rebind_config()
+	msg, ok := ask_with_reply(t, &cfg, "undecodable.attacker.example.", .A, patched)
+	if !ok {
+		return
+	}
+	testing.expect_value(t, len(msg.answer), 0)
+	testing.expect_value(t, msg.flags.rcode, u8(dns.Rcode.No_Error))
+
+	/*
+	And only where the guard covers the question. A TXT answer the decoder
+	rejects is forwarded as it always was: this is the rebinding guard declining
+	to pass on what it cannot read, not a new rule about malformed messages, and
+	widening it to every type would be a much larger change than the one that
+	closes the bypass.
+	*/
+	txt := make([]dns.Record, 1, context.temp_allocator)
+	txt[0] = dns.Record {
+		name  = "undecodable.attacker.example.",
+		type  = .TXT,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_TXT{strings = []string{"hello"}},
+	}
+	txt_reply := rebind_reply_of("undecodable.attacker.example.", .TXT, txt)
+	txt_patched := make([]u8, len(txt_reply), context.temp_allocator)
+	copy(txt_patched, txt_reply)
+	txt_patched[10], txt_patched[11] = 0, 100
+
+	out, _, sent := ask_raw(t, &cfg, "undecodable.attacker.example.", .TXT, txt_patched)
+	if testing.expect(t, sent, "the TXT answer was not sent at all") {
+		testing.expectf(
+			t,
+			len(out) == len(txt_patched),
+			"an undecodable TXT answer was not forwarded as it stood: %d bytes out of %d",
+			len(out),
+			len(txt_patched),
+		)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+An SVCB or HTTPS answer's additional section is checked too.
+
+The additional section is left alone everywhere else, and the reason given for
+that is that a stub does not resolve a hostname out of it. True for MX and NS
+glue; not true here. RFC 9460 section 5 has the resolver put A and AAAA for the
+ServiceMode TargetName in the additional section precisely so the client does not
+have to ask, and a client following it connects to what it finds there. So an
+answer of `HTTPS 1 .` with no `ipv4hint` at all, and `A 192.168.1.1` in the
+additional section, was the same "address a browser reaches without ever asking
+for the A record" that the hints are covered for - arriving by the other door.
+
+Scoped to answers that actually carry an SVCB or HTTPS record rather than to the
+question type, since that is the only shape in which an additional-section
+address is something a client acts on.
+*/
+@(test)
+test_an_https_answer_cannot_smuggle_an_address_in_the_additional_section :: proc(t: ^testing.T) {
+	answers := make([]dns.Record, 1, context.temp_allocator)
+	answers[0] = dns.Record {
+		name  = "svc.attacker.example.",
+		type  = .HTTPS,
+		class = .IN,
+		ttl   = 60,
+		// No parameters at all, so there is no hint to catch it by.
+		data  = dns.Rdata_SVCB{priority = 1, target = "target.attacker.example."},
+	}
+	additional := make([]dns.Record, 1, context.temp_allocator)
+	additional[0] = a_record("target.attacker.example.", {192, 168, 1, 1})
+
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question{name = "svc.attacker.example.", type = .HTTPS, class = .IN}
+	reply_msg := dns.Message {
+		question   = question,
+		answer     = answers,
+		additional = additional,
+	}
+	reply_msg.flags.qr = true
+	reply_msg.flags.rd = true
+	reply_msg.flags.ra = true
+	reply, _, err := dns.encode_message(reply_msg, context.temp_allocator)
+	if !testing.expectf(t, err == .None, "the reply did not encode: %v", err) {
+		return
+	}
+
+	cfg := rebind_config()
+	msg, ok := ask_with_reply(t, &cfg, "svc.attacker.example.", .HTTPS, reply)
+	if !ok {
+		return
+	}
+	testing.expect_value(t, len(msg.answer), 0)
+
+	/*
+	And an A answer's additional section is still left alone. Glue for a name
+	other than the one asked about is not something a stub connects to, elodin
+	stores and serves a response whole under the question's key so there is no
+	way to retrieve it on its own, and refusing on it would mean an answer
+	turned away for a record its client will never read.
+	*/
+	plain := make([]dns.Record, 1, context.temp_allocator)
+	plain[0] = a_record("ok.example.", {93, 184, 216, 34})
+	glue := make([]dns.Record, 1, context.temp_allocator)
+	glue[0] = a_record("ns.somewhere.example.", {192, 168, 1, 1})
+	q2 := make([]dns.Question, 1, context.temp_allocator)
+	q2[0] = dns.Question{name = "ok.example.", type = .A, class = .IN}
+	m2 := dns.Message {
+		question   = q2,
+		answer     = plain,
+		additional = glue,
+	}
+	m2.flags.qr = true
+	m2.flags.rd = true
+	m2.flags.ra = true
+	wire, _, werr := dns.encode_message(m2, context.temp_allocator)
+	if !testing.expectf(t, werr == .None, "the second reply did not encode: %v", werr) {
+		return
+	}
+	cfg2 := rebind_config()
+	msg2, ok2 := ask_with_reply(t, &cfg2, "ok.example.", .A, wire)
+	if ok2 {
+		testing.expect_value(t, len(msg2.answer), 1)
 	}
 	free_all(context.temp_allocator)
 }
