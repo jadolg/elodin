@@ -170,6 +170,14 @@ dnssec_upstream_query :: proc(query: dns.Message, allocator: mem.Allocator) -> (
 /*
 Turn a validated upstream answer into the one the client gets.
 
+An answer this server is about to vouch for is first cut down to the records it
+actually checked. The verdict covers the RRsets the validator looked at, and a
+response carries whatever else its sender chose to put in the authority and
+additional sections - so passing those on under an AD bit would lend our name to
+a delegation, or an address, that nothing here examined (RFC 4035 section
+3.2.3). `dnssec.strip_unauthenticated` has the whole argument for taking them
+out rather than trying to check them.
+
 A client that set DO asked for the whole thing and gets it byte for byte. One
 that did not has the DNSSEC records taken back out, because RFC 4035 says not to
 send them unasked and because they would otherwise push ordinary answers past
@@ -180,10 +188,27 @@ present_response :: proc(
 	wire: []u8,
 	query: dns.Message,
 	qtype: dns.Type,
-	secure: bool,
+	result: dnssec.Result,
 	allocator: mem.Allocator,
 ) -> []u8 {
 	out := wire
+	secure := result.status == .Secure
+	if secure {
+		/*
+		Rebuilt at full size, as below: this is what goes into the cache.
+
+		A response that cannot be rebuilt keeps its records and loses the bit
+		instead. The alternative - serving the message as it stands with AD set
+		- is the thing this call exists to prevent, and refusing the answer
+		outright would let a message we merely failed to re-encode take down a
+		name that validated perfectly well.
+		*/
+		if pruned, ok := dnssec.strip_unauthenticated(out, result, allocator, dns.MAX_MESSAGE); ok {
+			out = pruned
+		} else {
+			secure = false
+		}
+	}
 	if !dns.edns_do(query) {
 		/*
 		Rebuilt at full size rather than at this client's limit. What comes back
@@ -191,7 +216,7 @@ present_response :: proc(
 		buffer would then be all any later client could be given. Shrinking to
 		fit is `fit_response`'s job, once per client.
 		*/
-		out = strip_dnssec_records(wire, query, qtype, allocator, dns.MAX_MESSAGE)
+		out = strip_dnssec_records(out, query, qtype, allocator, dns.MAX_MESSAGE)
 	}
 	/*
 	AD records the verdict, not the audience. This message may end up in the

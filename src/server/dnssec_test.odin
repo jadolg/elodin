@@ -71,6 +71,30 @@ signed_response :: proc() -> dns.Message {
 	return msg
 }
 
+/*
+The verdict a validator would have reached over `signed_response`.
+
+Spelled out rather than reduced to "secure", because that is what a verdict is
+now: `present_response` cuts a secure answer down to the RRsets the validator
+names, so a `Result` that names nothing strips the message to its OPT record.
+*/
+@(private = "file")
+secure_verdict :: proc() -> dnssec.Result {
+	answer := make([]dns.Question, 1, context.temp_allocator)
+	answer[0] = dns.Question {
+		name  = "www.example.com.",
+		type  = .A,
+		class = .IN,
+	}
+	authority := make([]dns.Question, 1, context.temp_allocator)
+	authority[0] = dns.Question {
+		name  = "example.com.",
+		type  = .NSEC,
+		class = .IN,
+	}
+	return dnssec.Result{status = .Secure, answer = answer, authority = authority}
+}
+
 @(private = "file")
 client_query :: proc(dnssec_ok: bool, with_edns := true) -> dns.Message {
 	msg := dns.Message {
@@ -140,13 +164,19 @@ test_strip_omits_opt_for_a_client_without_edns :: proc(t: ^testing.T) {
 test_ad_bit_records_the_verdict :: proc(t: ^testing.T) {
 	// What goes into the cache says what was established, whoever asked.
 	wire, _, _ := dns.encode_message(signed_response(), context.temp_allocator)
-	secure := present_response(wire, client_query(false), .A, true, context.temp_allocator)
+	secure := present_response(wire, client_query(false), .A, secure_verdict(), context.temp_allocator)
 	testing.expect(t, secure[3] & 0x20 != 0, "AD should record a secure verdict")
 
 	// Not secure: the bit must come off even though the upstream may have set it.
 	insecure_wire, _, _ := dns.encode_message(signed_response(), context.temp_allocator)
 	insecure_wire[3] |= 0x20
-	insecure := present_response(insecure_wire, client_query(true), .A, false, context.temp_allocator)
+	insecure := present_response(
+		insecure_wire,
+		client_query(true),
+		.A,
+		dnssec.Result{status = .Insecure},
+		context.temp_allocator,
+	)
 	testing.expect(t, insecure[3] & 0x20 == 0, "AD must not survive an unauthenticated answer")
 	free_all(context.temp_allocator)
 }
@@ -183,13 +213,95 @@ test_cd_bit_is_not_echoed_back :: proc(t: ^testing.T) {
 	wire, _, _ := dns.encode_message(signed_response(), context.temp_allocator)
 	wire[3] |= 0x10
 
-	out := present_response(wire, client_query(true), .A, true, context.temp_allocator)
+	out := present_response(wire, client_query(true), .A, secure_verdict(), context.temp_allocator)
 	testing.expect(t, out[3] & 0x10 == 0, "CD should be clear for a client that did not set it")
 
 	stripped_wire, _, _ := dns.encode_message(signed_response(), context.temp_allocator)
 	stripped_wire[3] |= 0x10
-	stripped := present_response(stripped_wire, client_query(false), .A, true, context.temp_allocator)
+	stripped := present_response(stripped_wire, client_query(false), .A, secure_verdict(), context.temp_allocator)
 	testing.expect(t, stripped[3] & 0x10 == 0, "CD should be clear on a stripped answer too")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_ad_never_goes_out_over_records_the_verdict_missed :: proc(t: ^testing.T) {
+	/*
+	RFC 4035 section 3.2.3. The verdict names the RRsets that were checked, and
+	this is the last place the rest can be taken out - after it, the AD bit goes
+	on and the message goes into the cache for every later client to be given.
+
+	The DO client is the one to check, because it is the one whose message is
+	otherwise passed through byte for byte: `strip_dnssec_records` would have
+	taken the forgery below out of a non-DO client's copy by accident, being
+	interested in a different question entirely.
+	*/
+	msg := signed_response()
+	authority := make([dynamic]dns.Record, 0, len(msg.authority) + 1, context.temp_allocator)
+	append(&authority, ..msg.authority)
+	append(
+		&authority,
+		dns.Record {
+			name = "example.com.",
+			type = .NS,
+			class = .IN,
+			ttl = 86400,
+			data = dns.Rdata_Name{name = "ns.attacker.example."},
+		},
+	)
+	/*
+	And the same question asked sideways: an address for the name that *was*
+	authenticated, in the section that was not. The verdict names an RRset in a
+	section, so this one has no credentials of its own to be waved through on -
+	the signature that held up was checked over the answer section's records and
+	says nothing about these.
+	*/
+	append(
+		&authority,
+		dns.Record {
+			name = "www.example.com.",
+			type = .A,
+			class = .IN,
+			ttl = 300,
+			data = dns.Rdata_A{addr = {203, 0, 113, 67}},
+		},
+	)
+	msg.authority = authority[:]
+
+	additional := make([dynamic]dns.Record, 0, len(msg.additional) + 1, context.temp_allocator)
+	append(&additional, ..msg.additional)
+	append(
+		&additional,
+		dns.Record {
+			name = "ns.attacker.example.",
+			type = .A,
+			class = .IN,
+			ttl = 86400,
+			data = dns.Rdata_A{addr = {203, 0, 113, 66}},
+		},
+	)
+	msg.additional = additional[:]
+
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	testing.expect_value(t, err, dns.Encode_Error.None)
+
+	out := present_response(wire, client_query(true), .A, secure_verdict(), context.temp_allocator)
+	testing.expect(t, out[3] & 0x20 != 0, "AD should record the secure verdict")
+
+	decoded, derr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+
+	for rec in decoded.authority {
+		testing.expectf(t, rec.type != .NS, "an unsigned NS RRset went out under AD as %v", rec.name)
+	}
+	testing.expect_value(t, len(decoded.authority), 1)
+	testing.expect_value(t, decoded.authority[0].type, dns.Type.NSEC)
+
+	// The glue goes with it, and the OPT record - which is not data anybody
+	// signs - stays.
+	testing.expect_value(t, len(decoded.additional), 1)
+	testing.expect(t, dns.edns_present(decoded), "the OPT record should survive")
+	testing.expect_value(t, len(decoded.answer), 1)
+	testing.expect_value(t, decoded.answer[0].type, dns.Type.A)
 	free_all(context.temp_allocator)
 }
 
