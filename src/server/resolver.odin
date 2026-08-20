@@ -761,7 +761,29 @@ resolve_query :: proc(
 			started,
 			allocator,
 		); verdict != .Clear {
-			if s.cfg.cache.enabled {
+			/*
+			`have_decoded`, not `walkable`. The two part company for an answer
+			whose section beyond the answer would not parse: the walk runs on the
+			partial decode, and `decoded` is still the zero message it was
+			declared as.
+
+			Storing from that puts an entry in built from nothing to do with
+			these bytes. `scan_ttl_offsets` is far more forgiving than the
+			decoder - it follows no compression pointers and bounds no name - so
+			it succeeds on the real wire and the entry goes in with
+			`redirects = false` and a lifetime derived as if the answer were a
+			denial. `redirects = false` is the trap: `get` computes `recheck`
+			from it, so the entry can never be re-walked, and the refusal it
+			carries is replayed on every hit until it expires. An operator who
+			then writes the documented allow rule and reloads gets nothing - the
+			name stays blocked against the very rule meant to release it, which
+			is the opposite of the invariant the comment above states.
+
+			So it is not cached at all in that case. The next query for the name
+			asks the upstream again, which is what happened before any of this
+			was memoised.
+			*/
+			if s.cfg.cache.enabled && have_decoded {
 				cache.put(s.answers, key, resp, decoded, generation, u8(verdict))
 			}
 			return out, .Blocked, true

@@ -949,3 +949,158 @@ test_junk_outside_the_answer_section_does_not_withhold_the_answer :: proc(t: ^te
 	)
 	free_all(context.temp_allocator)
 }
+
+/*
+A refusal reached on a partial decode is not frozen into the cache.
+
+The walk can run on an answer section alone, and the cache wants the whole
+message. When only the first succeeds, `decoded` is still the zero message it
+was declared as, and storing the refusal from it built an entry out of nothing
+to do with these bytes: `redirects` came out false, and `get` derives `recheck`
+from `redirects`, so the entry could never be walked again. The refusal it
+carried was then replayed on every hit until it expired - including after the
+operator wrote the allow rule the documentation points them at, which is the one
+thing that was supposed to release it.
+
+So nothing is stored for that answer, and the name goes upstream again. This
+asserts the release: the same cloaked answer, refused, and then allowed once the
+question is on the allow list and the lists have been reloaded.
+*/
+@(test)
+test_a_refusal_on_a_partial_decode_is_released_by_a_reload :: proc(t: ^testing.T) {
+	answer := make([]dns.Record, 2, context.temp_allocator)
+	answer[0] = dns.Record {
+		name  = "www.brand.example.",
+		type  = .CNAME,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_Name{name = "tracker.evil.example."},
+	}
+	answer[1] = dns.Record {
+		name  = "tracker.evil.example.",
+		type  = .A,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_A{addr = {203, 0, 113, 7}},
+	}
+	base := chain_wire("www.brand.example.", answer)
+
+	/*
+	One additional record whose owner name is a compression pointer aiming past
+	the end of the message.
+
+	The pointer rather than a short RDLENGTH, because the two are rejected by
+	different things. `decode_message` refuses both. `scan_ttl_offsets`, which is
+	what decides whether `cache.put` stores anything, bounds an RDLENGTH but
+	follows no pointer at all - `skip_name` takes any 0xc0 byte as two bytes and
+	moves on. So a truncated RDLENGTH never reaches the cache and this does,
+	which is the whole of what makes the entry below possible.
+	*/
+	junk := make([dynamic]u8, 0, len(base) + 12, context.temp_allocator)
+	append(&junk, ..base)
+	junk[11] = 1 // ARCOUNT = 1
+	append(&junk, 0xc0, 0xff) // owner: a pointer to offset 255, which is forward
+	append(&junk, 0, 16) // TYPE = TXT
+	append(&junk, 0, 1) // CLASS = IN
+	append(&junk, 0, 0, 0, 0) // TTL
+	append(&junk, 0, 0) // RDLENGTH = 0
+	wire := junk[:]
+
+	if _, whole := dns.decode_message(wire, context.temp_allocator); !testing.expect(
+		t,
+		whole != .None,
+		"the fixture was meant to be undecodable as a whole",
+	) {
+		return
+	}
+	if _, partial := dns.decode_through_answer(wire, context.temp_allocator); !testing.expect(
+		t,
+		partial == .None,
+		"the fixture's answer section was meant to still parse",
+	) {
+		return
+	}
+
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+		return
+	}
+	defer net.close(socket)
+	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+	bound, _ := net.bound_endpoint(socket)
+
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.cache.enabled = true
+	cfg.dnssec.enabled = false
+	cfg.blocking.enabled = true
+	cfg.upstream.strategy = .Failover
+	cfg.upstream.attempts = 1
+	cfg.upstream.timeout = 3 * time.Second
+	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
+	servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port}
+	cfg.upstream.servers = servers
+
+	/*
+	Built from the configuration rather than with a literal, and `negative_ttl`
+	is the reason. A cache made without one rejects the bogus entry this is
+	about for having a zero lifetime, so the test passed against the bug -
+	`put` derives the lifetime from a zero message, which reads as a denial, and
+	a denial with no negative TTL configured is not stored at all. The running
+	server has 300 there.
+	*/
+	answers := cache.make_cache(
+		cache.Options {
+			max_entries = 8,
+			max_ttl = cfg.cache.max_ttl,
+			min_ttl = cfg.cache.min_ttl,
+			negative_ttl = cfg.cache.negative_ttl,
+		},
+	)
+	defer cache.destroy(answers)
+
+	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+		return
+	}
+	defer upstream.destroy_group(group)
+
+	engine := filter.engine_make()
+	defer filter.engine_destroy(engine)
+	block := filter.set_make()
+	allow := filter.set_make()
+	filter.set_add(block, "tracker.evil.example", {.Apex, .Subdomains})
+	filter.engine_swap(engine, block, allow)
+
+	srv := Server{cfg = &cfg, group = group, filters = engine, answers = answers}
+
+	x := Cloak_Mock{socket = socket, reply = wire}
+	mock := thread.create_and_start_with_poly_data(&x, serve_cloak)
+	_, first, _ := handle_query(&srv, cloak_query("www.brand.example."), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	thread.join(mock)
+	thread.destroy(mock)
+	testing.expect_value(t, first, Outcome.Blocked)
+
+	// The operator writes the documented escape hatch and reloads.
+	block2 := filter.set_make()
+	allow2 := filter.set_make()
+	filter.set_add(block2, "tracker.evil.example", {.Apex, .Subdomains})
+	filter.set_add(allow2, "www.brand.example", {.Apex, .Subdomains})
+	ob, oa := filter.engine_swap(engine, block2, allow2)
+	filter.set_destroy(ob)
+	filter.set_destroy(oa)
+
+	y := Cloak_Mock{socket = socket, reply = wire}
+	mock2 := thread.create_and_start_with_poly_data(&y, serve_cloak)
+	_, second, _ := handle_query(&srv, cloak_query("www.brand.example."), .UDP, "127.0.0.2:5555", context.temp_allocator)
+	thread.join(mock2)
+	thread.destroy(mock2)
+
+	testing.expectf(
+		t,
+		second != .Blocked,
+		"the allow rule did not release the name: a refusal reached on a partial decode outlived the reload (outcome=%v)",
+		second,
+	)
+	free_all(context.temp_allocator)
+}

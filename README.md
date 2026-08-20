@@ -427,7 +427,7 @@ rule on the *question* skips the walk entirely and is the way out. Note that an
 allow rule on a hop past the sixteenth cannot help, because the walk stops
 before reaching it.
 
-Three other details name a withheld or failed answer that no list explains, and
+Four details name a withheld or failed answer that no list explains, and
 they are what to search the query log for when a site breaks and nothing in the
 lists accounts for it:
 

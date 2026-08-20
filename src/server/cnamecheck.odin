@@ -33,6 +33,26 @@ size the decoder has already bounded.
 MAX_CHAIN_NAMES :: 16
 
 /*
+What the walk concluded about an answer.
+
+The three are kept apart because they are three different things to an operator:
+one names a rule they wrote, one says the answer was too long to check, and one
+says a record in it could not be read. All three withhold the answer, and an
+operator whose site broke needs to know which - being sent to look for a
+seventeen-name chain that does not exist is worse than being told nothing.
+
+Stored in the cache as the byte behind them, so a remembered refusal still says
+which of the three it was.
+*/
+@(private)
+Cloak_Verdict :: enum u8 {
+	Clear,
+	Listed,
+	Unwalkable,
+	Unreadable,
+}
+
+/*
 The name on the lists that this answer redirects to, if it redirects to one.
 
 Blocking the question and nothing else is a rule a list author cannot write
@@ -115,26 +135,6 @@ name inside it ran outside the message, pointed forward, or came to more than
 255 octets, and the whole message decoded around it - so this is a target the
 client cannot read either, in an answer that otherwise parsed.
 */
-/*
-What the walk concluded about an answer.
-
-The three are kept apart because they are three different things to an operator:
-one names a rule they wrote, one says the answer was too long to check, and one
-says a record in it could not be read. All three withhold the answer, and an
-operator whose site broke needs to know which - being sent to look for a
-seventeen-name chain that does not exist is worse than being told nothing.
-
-Stored in the cache as the byte behind them, so a remembered refusal still says
-which of the three it was.
-*/
-@(private)
-Cloak_Verdict :: enum u8 {
-	Clear,
-	Listed,
-	Unwalkable,
-	Unreadable,
-}
-
 @(private)
 cloaked_chain_target :: proc(
 	s: ^Server,
