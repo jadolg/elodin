@@ -619,8 +619,14 @@ never established - so the lifetime falls back to `cache.negative_ttl`, and to
 nothing at all where an operator has set that to zero.
 
 Pinned as the cost it is, not as a property worth having. It is what this prune
-leaves behind until the denial at a CNAME target is validated properly, and the
-test is here so that changing it is a decision rather than an accident.
+leaves behind until the denial at a CNAME target is validated properly.
+
+The verdict here is built by hand, and since `denial_after_chain` was added it
+is one the validator will not reach on its own: a chain ending without the type
+asked for now comes back `Insecure`, so nothing is pruned and the proof reaches
+the client. What this still pins is the prune's own behaviour when it *is*
+handed such a verdict - worth keeping, because the shape becomes reachable again
+the moment #186 lands and the denial at the target's zone is genuinely checked.
 */
 @(test)
 test_a_pruned_nxdomain_after_a_cname_falls_back_to_the_configured_negative_ttl :: proc(t: ^testing.T) {

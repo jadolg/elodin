@@ -545,6 +545,35 @@ strip_unauthenticated :: proc(
 	return encoded, true
 }
 
+/*
+Whether the response is really a denial that the answer section only leads up to.
+
+True when the chain ends without a record of the type asked for and the sender
+put a denial in the authority section to say why. `CNAME` and `ANY` questions
+are answered by the chain itself, so neither is this shape.
+
+Read off the message rather than from the rcode alone, because NODATA carries
+NOERROR: what marks it is the absence of the type, not the code.
+*/
+@(private)
+denial_after_chain :: proc(msg: dns.Message, qtype: dns.Type, class: dns.Class) -> bool {
+	if qtype == .CNAME || qtype == .ANY {
+		return false
+	}
+	for rec in msg.answer {
+		if rec.type == qtype && rec.class == class {
+			return false
+		}
+	}
+	for rec in msg.authority {
+		#partial switch rec.type {
+		case .SOA, .NSEC, .NSEC3:
+			return true
+		}
+	}
+	return false
+}
+
 @(private)
 authenticated_only :: proc(
 	section: []dns.Record,
@@ -831,6 +860,32 @@ validate_answer :: proc(
 	authentic as the answer it stands behind, and a client that validates for
 	itself needs it to reach the same conclusion.
 	*/
+	/*
+	A chain that ends without the type asked for is a denial, and this path did
+	not check it.
+
+	The everyday shape is an AAAA lookup for a name whose CNAME leads somewhere
+	with only an A record: the CNAME verifies, `answers_question` is satisfied by
+	the chain, and the verdict is `Secure` - reached entirely from the answer
+	section. What says the target really has no AAAA is the SOA and the NSEC or
+	NSEC3 in the *authority* section, at the target's zone, which nothing here
+	walked to.
+
+	Serving that as `Secure` was wrong twice over. The prune keeps only what the
+	verdict names, so the proof was stripped; and the AD bit went out over what
+	was left. A downstream resolver that validates for itself then has an
+	authenticated denial with nothing behind it, which it refuses - so a common
+	lookup on any dual-stack network turns into SERVFAIL one hop down.
+
+	Answered `Insecure` instead, which is the honest description: this server has
+	no opinion on the denial. Nothing is pruned, so the proof reaches the client
+	intact and it can check it, and no AD bit claims otherwise. Checking it here
+	means walking to the target's zone, which is #186.
+	*/
+	if worst == .Secure && denial_after_chain(msg, qtype, class) {
+		return {status = .Insecure, reason = "denial after a cname was not checked"}
+	}
+
 	proved := make([dynamic]Authenticated_Set, 0, 1, allocator)
 	if worst == .Secure {
 		// Every one of them, and the worst verdict wins. Stopping at the first
@@ -894,7 +949,27 @@ validate_denial :: proc(
 		return {status = .Indeterminate, reason = "chain of trust unavailable"}
 	}
 
-	nsecs, nsec3s, proved := validated_denial_records(v, budget, msg.authority, established, class, keys, unix, now, allocator)
+	nsecs, nsec3s, proved, denial_spent := validated_denial_records(
+		v,
+		budget,
+		msg.authority,
+		established,
+		class,
+		keys,
+		unix,
+		now,
+		allocator,
+	)
+	/*
+	Our own allowance again, and the same answer as everywhere else: a proof this
+	server stopped short of reading is not a proof it found wanting. Reported as
+	`Indeterminate` rather than left to fall through to "no denial of existence",
+	which counts a forgery, warns with the client's address beside the word, and
+	hands the client extended error 6.
+	*/
+	if denial_spent {
+		return {.Indeterminate, "verification budget spent", nil, nil}
+	}
 	if len(nsecs) == 0 && len(nsec3s) == 0 {
 		return {status = .Bogus, reason = "no denial of existence"}
 	}
@@ -940,8 +1015,11 @@ Checking it costs nothing. The zone the denial was proven against is established
 and its keys are already in hand, so this is a signature verification against
 records that are already here - no walk, no lookup, no chance of turning a
 question about a TTL into an upstream query. A sender padding the SOA with
-signatures buys at most `MAX_SIGNATURES_PER_RRSET` attempts, the same cap every
-other RRset is checked under.
+signatures does not buy a fixed allowance of its own, though: it draws on the
+query-wide `MAX_VERIFICATIONS_PER_QUERY`, which the denial's own proof has just
+been spending. Running it out here drops the SOA - the denial stays proven and
+loses only its negative TTL - and says so at debug rather than passing for a
+signature that failed.
 
 One owner name is looked at, and it is the apex of that zone: RFC 2308 puts the
 SOA of the zone the denial came from in the authority section, and that zone is
@@ -1325,7 +1403,7 @@ validate_wildcard_proof :: proc(
 	if !name_in_zone(next_closer, established) {
 		return .Bogus, nil
 	}
-	nsecs, nsec3s, verified := validated_denial_records(
+	nsecs, nsec3s, verified, _ := validated_denial_records(
 		v,
 		budget,
 		msg.authority,
@@ -1380,6 +1458,9 @@ validated_denial_records :: proc(
 	nsecs: []Nsec_Rr,
 	nsec3s: []Nsec3_Rr,
 	verified: []Authenticated_Set,
+	// True when the query's verification allowance ran out partway through, so
+	// that a caller can tell "nothing proved this" from "we stopped looking".
+	exhausted: bool,
 ) {
 	out_nsec := make([dynamic]Nsec_Rr, 0, 4, allocator)
 	out_nsec3 := make([dynamic]Nsec3_Rr, 0, 4, allocator)
@@ -1395,7 +1476,7 @@ validated_denial_records :: proc(
 		}
 		append(&seen, dns.Question{name = rec.name, type = rec.type})
 
-		records, signer, carried, ok, _ := verified_rrset(
+		records, signer, carried, ok, spent := verified_rrset(
 			budget,
 			authority,
 			rec.name,
@@ -1406,6 +1487,12 @@ validated_denial_records :: proc(
 			unix,
 			allocator,
 		)
+		if spent {
+			// The allowance, not the records. Stop and say so rather than
+			// carrying on to report an empty proof as a forged one.
+			exhausted = true
+			break
+		}
 		if !ok {
 			// Dropped rather than fatal. A proof assembled only from records
 			// that verified is sound whatever else came along, and refusing the
@@ -1449,7 +1536,7 @@ validated_denial_records :: proc(
 			}
 		}
 	}
-	return out_nsec[:], out_nsec3[:], out_verified[:]
+	return out_nsec[:], out_nsec3[:], out_verified[:], exhausted
 }
 
 /*
@@ -1460,9 +1547,13 @@ answers "did this zone sign this" and not "did somebody sign this". Every use is
 in an authority section that has already been placed in a zone, where a signer
 of the response's own choosing is precisely what must not be believed.
 
-The attempts are capped the way `validate_rrset` caps them: an RRset carries one
-signature per algorithm, and a response offering more than that is trying to buy
-verifications rather than be believed.
+The attempts are bounded the way `validate_rrset` bounds them, which is no
+longer a per-RRset cap: both spend the query-wide
+`MAX_VERIFICATIONS_PER_QUERY`, and both throw out for nothing - through
+`signature_worth_trying` - every signature whose key tag and algorithm name no
+key the zone published. Running the budget out here is reported back as
+`exhausted`, not as a set that failed to verify, because the two are different
+things to say about a zone.
 */
 @(private)
 verified_rrset :: proc(
@@ -1705,7 +1796,12 @@ zone_step :: proc(
 	// a form the parent signed.
 	// Nothing here reaches a client - this is our own DS lookup - so which
 	// RRsets verified is of no interest beyond the proof they carry.
-	nsecs, nsec3s, _ := validated_denial_records(v, budget, msg.authority, parent, class, parent_keys, unix, now, allocator)
+	nsecs, nsec3s, _, ds_spent := validated_denial_records(v, budget, msg.authority, parent, class, parent_keys, unix, now, allocator)
+	// A chain step this server ran out of allowance on is one it did not read,
+	// which is `Indeterminate` territory rather than a broken delegation.
+	if ds_spent {
+		return .Indeterminate, nil
+	}
 	if len(nsecs) == 0 && len(nsec3s) == 0 {
 		return .Bogus, nil
 	}
