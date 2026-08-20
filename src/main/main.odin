@@ -530,7 +530,7 @@ report :: proc(s: ^server.Server, answers: ^cache.Cache) {
 	logx.eventf(
 		.Info,
 		"stats",
-		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d refused=%d conn_refused=%d conn_failed=%d limited=%d truncated=%d secure=%d bogus=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_misses=%d cache_stale=%d cache_evictions=%d",
+		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d refused=%d conn_refused=%d conn_failed=%d limited=%d truncated=%d secure=%d bogus=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d",
 		st.queries,
 		st.blocked,
 		st.cached,
@@ -547,6 +547,12 @@ report :: proc(s: ^server.Server, answers: ^cache.Cache) {
 		cache.len_entries(answers),
 		cache.bytes_used(answers),
 		cs.hits,
+		// Beside `cache_hits` because it qualifies it: `get` counts a hit when it
+		// hands the bytes over, and the resolver may then refuse them. Without
+		// this the line shows `cache_hits` and `cached=` drifting apart with
+		// nothing to account for the gap, which is the drift the counter exists
+		// to close - the metrics endpoint got it and this line did not.
+		cs.withheld,
 		cs.misses,
 		cs.stale,
 		cs.evictions,

@@ -658,9 +658,11 @@ and an answer this server could not finish checking is not one to hand over.
 */
 @(test)
 test_a_chain_longer_than_the_budget_is_refused :: proc(t: ^testing.T) {
+	// The question plus seventeen targets: one more than the walk admits, so it
+	// is the first length that is refused rather than merely a long one.
 	hops := make([dynamic]string, 0, MAX_CHAIN_NAMES + 3, context.temp_allocator)
 	append(&hops, "www.brand.example.")
-	for i in 0 ..< MAX_CHAIN_NAMES + 1 {
+	for i in 0 ..< MAX_CHAIN_NAMES {
 		append(&hops, fmt.tprintf("h%d.brand.example.", i))
 	}
 	append(&hops, "tracker.evil.example.")
@@ -680,14 +682,18 @@ test_a_chain_longer_than_the_budget_is_refused :: proc(t: ^testing.T) {
 /*
 A chain of exactly the budget is walked to the end and served.
 
-The boundary in the other direction, so that failing closed past the budget
-cannot quietly become failing closed at ordinary lengths.
+The boundary in the other direction, and it has to be the *exact* one. This
+tested fifteen targets against a walk that admits sixteen, and its partner
+tested eighteen against a refusal that starts at seventeen - so the pair passed
+whether the budget was 15, 16 or 17, on a number that decides whether ordinary
+answers are withheld. Sixteen here and seventeen there is what pins it.
 */
 @(test)
 test_a_chain_that_fits_the_budget_is_answered :: proc(t: ^testing.T) {
-	hops := make([dynamic]string, 0, MAX_CHAIN_NAMES + 1, context.temp_allocator)
+	// The question plus sixteen targets, which is the most the walk will follow.
+	hops := make([dynamic]string, 0, MAX_CHAIN_NAMES + 2, context.temp_allocator)
 	append(&hops, "www.brand.example.")
-	for i in 0 ..< MAX_CHAIN_NAMES - 1 {
+	for i in 0 ..< MAX_CHAIN_NAMES {
 		append(&hops, fmt.tprintf("h%d.brand.example.", i))
 	}
 	testing.expect_value(t, serve_cached_chain(t, hops[:], nil, nil), Outcome.Cached)

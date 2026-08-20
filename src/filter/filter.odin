@@ -168,10 +168,14 @@ engine_swap :: proc(e: ^Engine, block, allow: ^Set) -> (old_block, old_allow: ^S
 /*
 Which rule sets `engine_match` is answering from at the moment.
 
-Read under the same lock the sets themselves are read under, so a caller that
-takes this number before matching and stamps it onto what it stores cannot
-credit its result to a set that arrived after the match began - it stamps the
-older number and is told to match again, which is the harmless direction.
+A caller that takes this number before matching, and stamps it onto what it
+stores, cannot credit its result to a set that arrived after the match began: it
+stamps the older number and is told to match again, which is the harmless
+direction. `engine_swap` publishes the sets before it moves the number, both
+under the exclusive lock, so a reader that has seen the new number is matching
+against the new sets.
+
+Read without taking the lock; see below for why the write side makes that safe.
 */
 engine_generation :: proc(e: ^Engine) -> u64 {
 	if e == nil {

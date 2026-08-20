@@ -422,11 +422,28 @@ bound at all — it would be a length to exceed, and exceeding it is free for
 whoever writes the answer, so a listed name one hop past the end would go
 straight through. Real chains are one or two names and no zone publishes
 seventeen, so what this turns away is answers built to be turned away. They are
-counted as blocked and logged as `outcome=blocked detail=cname-deep`, which is
-the one to look for if a site breaks with nothing on any list to explain it; an
-allow rule on the *question* skips the walk entirely and is the way out. Note
-that an allow rule on a hop past the sixteenth cannot help, because the walk
-stops before reaching it.
+counted as blocked and logged as `outcome=blocked detail=cname-deep`; an allow
+rule on the *question* skips the walk entirely and is the way out. Note that an
+allow rule on a hop past the sixteenth cannot help, because the walk stops
+before reaching it.
+
+Three other details name a withheld or failed answer that no list explains, and
+they are what to search the query log for when a site breaks and nothing in the
+lists accounts for it:
+
+| detail | rcode | what happened |
+| --- | --- | --- |
+| `cname-deep` | the `blocking.response` | the chain ran past the sixteenth name, so where it ends was never checked |
+| `cname-unreadable` | the `blocking.response` | a CNAME's target could not be parsed, so where it leads could not be checked |
+| `answer-unreadable` | SERVFAIL | the upstream's reply could not be parsed at all, so it could not be walked |
+| `cache-unreadable` | SERVFAIL | a stored answer could not be parsed on the way back out |
+
+`answer-unreadable` is the one worth knowing about, because it is a way for a
+name to stop resolving that appears only once blocking is on: with blocking off
+nothing walks the answer, so nothing needs to parse it, and the same reply is
+forwarded. Every case of it is a name or a length that ran outside the message,
+which a client would have to reject too — but if an upstream produces them
+routinely, that is the line that says so.
 
 The `address=/…/` and `server=/…/` forms are dnsmasq's, accepted because they
 turn up in lists that are otherwise adblock syntax. A `$` modifier
@@ -1065,6 +1082,7 @@ bind beyond loopback is logged as a warning at startup, once.
 | `elodin_cache_entries` / `_bytes` | gauge | what the cache holds, against `max_entries` and `max_bytes` |
 | `elodin_cache_hits_total` / `_misses_total` / `_evictions_total` | counter | how it is doing |
 | `elodin_cache_stale_total` | counter | expired answers served because no fresh one could be got, with `cache.serve_stale` on |
+| `elodin_cache_withheld_total` | counter | answers the cache handed over that were then refused rather than served, so `_hits_total` counts them and the query log does not |
 | `elodin_filter_rules{list}` | gauge | rules loaded, `block` and `allow` |
 | `elodin_upstream_queries_total{upstream}` | counter | queries sent to each upstream, by its configured name |
 | `elodin_upstream_failures_total{upstream}` | counter | exchanges that produced no usable answer |
