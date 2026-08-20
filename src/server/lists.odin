@@ -222,6 +222,18 @@ reload_filters :: proc(s: ^Server, allow_network: bool) {
 	block, allow := build_filter_sets(s.cfg, allow_network)
 	old_block, old_allow := filter.engine_swap(s.filters, block, allow)
 
+	/*
+	The answer cache is left as it is.
+
+	Its entries were matched against the sets just displaced, and some of them -
+	the ones whose answer leads somewhere else - have to be matched again before
+	they are served. They carry the generation `engine_swap` has just moved past,
+	which is what asks for that; see `serve_from_cache`. Emptying the cache here
+	would do the same job in one line and take every unrelated entry with it,
+	buying a burst of upstream traffic on every refresh interval to re-learn
+	answers nothing was wrong with.
+	*/
+
 	// In-flight queries hold a shared lock across their match, which the swap
 	// waited on, so nothing can still be reading the displaced sets.
 	filter.set_destroy(old_block)

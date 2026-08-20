@@ -101,6 +101,35 @@ Every string and slice in the result is allocated from `allocator`; callers that
 serve a single query are expected to hand in an arena and drop it wholesale.
 */
 decode_message :: proc(msg: []u8, allocator := context.allocator) -> (m: Message, err: Decode_Error) {
+	return decode_sections(msg, false, allocator)
+}
+
+/*
+Decode as far as the answer section and stop there.
+
+For a caller whose question is what the answer says: it gets that answer, or the
+error that stopped it reading one, and is not told about a malformed record
+sitting in a section it was never going to look at. `decode_message` refuses the
+whole message for any of them, which is right when the whole message is what the
+caller wanted and wrong when it makes a clean, walkable answer unreadable on the
+strength of somebody's additional section.
+
+The section counts are still sanity-checked against the message's length before
+anything is allocated, so a caller that stops early is not a way around that.
+*/
+decode_through_answer :: proc(msg: []u8, allocator := context.allocator) -> (m: Message, err: Decode_Error) {
+	return decode_sections(msg, true, allocator)
+}
+
+@(private)
+decode_sections :: proc(
+	msg: []u8,
+	answer_only: bool,
+	allocator := context.allocator,
+) -> (
+	m: Message,
+	err: Decode_Error,
+) {
 	if len(msg) < HEADER_SIZE {
 		return {}, .Truncated_Header
 	}
@@ -132,6 +161,9 @@ decode_message :: proc(msg: []u8, allocator := context.allocator) -> (m: Message
 	}
 
 	m.answer = decode_records(&r, int(ancount), allocator) or_return
+	if answer_only {
+		return
+	}
 	m.authority = decode_records(&r, int(nscount), allocator) or_return
 	m.additional = decode_records(&r, int(arcount), allocator) or_return
 	return
