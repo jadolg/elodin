@@ -11,12 +11,14 @@ import "elodin:filter"
 import "elodin:upstream"
 
 /*
-Blocking is decided on the question and nothing else.
+Blocking is decided on the answer as well as the question.
 
 An answer may point somewhere else entirely: the question is a first-party name
 the site owns, the CNAME in the answer lands on the tracker, and the address the
 browser ends up talking to is the tracker's. Pi-hole calls this CNAME cloaking
-and inspects the chain for it; nothing here looks past `q.name`.
+and inspects the chain for it; so does `cloaked_chain_target`, and what follows
+holds it to that - through a mock upstream for the forwarding path, and through
+an answer put straight into the cache for the hit path.
 */
 
 @(private = "file")
@@ -136,7 +138,8 @@ test_a_blocked_name_reached_through_a_cname_is_still_blocked :: proc(t: ^testing
 	decoded, derr := dns.decode_message(out, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
 
-	// The client is handed the tracker's address and the chain that leads to it.
+	// Whatever `blocking.response` is, what goes out is built from the question:
+	// nothing of the upstream's chain reaches the client.
 	for rec in decoded.answer {
 		if cname, is_cname := rec.data.(dns.Rdata_Name); is_cname {
 			testing.expectf(

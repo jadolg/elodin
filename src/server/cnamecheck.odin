@@ -56,11 +56,24 @@ matched it. It cannot come back `Blocked`, because that answer was already given
 above; it can come back `Allowed`, and an operator who wrote an exception for
 the name they asked about meant the lookup, not the label.
 
-Allow beats block anywhere in the chain, which is how `engine_match` already
+That second match is behind a look for a CNAME in the answer at all, which
+nearly every answer there is does not have. Every forwarded response reaches
+this, so an address answer would otherwise pay a normalise, a lock and two hash
+lookups to learn what the walk below would have told it for nothing: with no
+CNAME anywhere in the section there is no target to return, whatever the lists
+say about the question.
+
+Allow beats block anywhere the walk reaches, which is how `engine_match` already
 resolves the two for a single name, and is the only escape hatch there is for a
-first-party name whose CDN or analytics host is on somebody's list. So the walk
-runs to the end of the chain before returning a block rather than stopping at
-the first one.
+first-party name whose CDN or analytics host is on somebody's list. So a block
+found early does not end the walk: it is held while the rest of the names are
+tried, and an allow found later stands the answer back up.
+
+"Anywhere the walk reaches" and "anywhere in the chain" part company at the
+budget below, where a block at the third name is returned although an allow rule
+would have matched the seventeenth. That is the price of bounding the work, and
+the answer it can happen to is one with sixteen names in its chain - which no
+zone publishes and an exception nobody could have known to write.
 
 A DNAME is not followed, and does not need to be: RFC 6672 section 3.1 has the
 responder synthesize the CNAME that the redirection amounts to and put it in the
@@ -77,6 +90,17 @@ cannot read is one the client is being handed in the same unreadable state.
 @(private)
 cloaked_chain_target :: proc(s: ^Server, answer: []dns.Record, qname: string) -> (target: string, found: bool) {
 	if !s.cfg.blocking.enabled || s.filters == nil || len(answer) == 0 {
+		return "", false
+	}
+
+	redirects := false
+	for r in answer {
+		if r.type == .CNAME {
+			redirects = true
+			break
+		}
+	}
+	if !redirects {
 		return "", false
 	}
 

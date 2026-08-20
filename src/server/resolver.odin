@@ -403,8 +403,15 @@ resolve_query :: proc(
 	walk on the next hit; taking it afterwards would stamp an answer with the
 	number of a rule set that arrived after it had been matched, and that entry
 	would then never be looked at again.
+
+	Not read at all with the cache off. The number exists to date a stored answer,
+	and with nothing stored it is a second trip through the engine's lock on every
+	query for a value nothing reads.
 	*/
-	generation := filter.engine_generation(s.filters)
+	generation: u64
+	if s.cfg.cache.enabled {
+		generation = filter.engine_generation(s.filters)
+	}
 
 	/*
 	An expired entry that `serve_stale` kept, held back rather than served.
@@ -679,10 +686,10 @@ resolve_query :: proc(
 /*
 A hit as `resolve_query` found it.
 
-Carried as one value because these five travel together from `cache.get` to
+Carried as one value because these six travel together from `cache.get` to
 whichever of the three places ends up serving them, and because what has to be
 done with them - re-match the chain, then put the stamp back on the entry the
-bytes came out of - needs all five at once.
+bytes came out of - needs all six at once.
 */
 @(private)
 Cached_Answer :: struct {
