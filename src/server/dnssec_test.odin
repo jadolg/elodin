@@ -40,14 +40,32 @@ nothing is a signature over nothing and is dropped. The rest is filler: no
 signature is verified anywhere in this file, which is `src/dnssec`'s work
 against captured chains.
 */
+/*
+The signer these synthetic signatures name.
+
+Written out rather than left as the root, because the prune keeps a signature
+only when its signer is the one the verdict was reached against - so the name in
+here and the `signer` on the `Authenticated_Set` below have to be the same name,
+and a test whose fixture quietly disagreed with its verdict would drop the
+signature and look like a prune bug.
+*/
+@(private = "file")
+TEST_SIGNER :: "example.com."
+
 @(private = "file")
 rrsig_over :: proc(covered: dns.Type) -> dns.Rdata_Raw {
-	// 18 bytes of fixed fields, the root as the signer name, then a signature.
-	rdata := make([]u8, 27, context.temp_allocator)
+	// 18 bytes of fixed fields, the signer name, then a signature.
+	name_buf: [dns.MAX_NAME_WIRE]u8
+	n, err := dns.encode_name(TEST_SIGNER, name_buf[:])
+	if err != .None {
+		panic("cannot encode the test signer")
+	}
+	rdata := make([]u8, 18 + n + 8, context.temp_allocator)
 	rdata[0] = u8(u16(covered) >> 8)
 	rdata[1] = u8(u16(covered))
 	rdata[2] = 13 // ECDSA P-256, so the algorithm at least names something real
 	rdata[3] = 3 // labels
+	copy(rdata[18:], name_buf[:n])
 	return dns.Rdata_Raw{data = rdata}
 }
 
@@ -100,17 +118,19 @@ names, so a `Result` that names nothing strips the message to its OPT record.
 */
 @(private = "file")
 secure_verdict :: proc() -> dnssec.Result {
-	answer := make([]dns.Question, 1, context.temp_allocator)
-	answer[0] = dns.Question {
-		name  = "www.example.com.",
-		type  = .A,
-		class = .IN,
+	answer := make([]dnssec.Authenticated_Set, 1, context.temp_allocator)
+	answer[0] = dnssec.Authenticated_Set {
+		name   = "www.example.com.",
+		type   = .A,
+		class  = .IN,
+		signer = TEST_SIGNER,
 	}
-	authority := make([]dns.Question, 1, context.temp_allocator)
-	authority[0] = dns.Question {
-		name  = "example.com.",
-		type  = .NSEC,
-		class = .IN,
+	authority := make([]dnssec.Authenticated_Set, 1, context.temp_allocator)
+	authority[0] = dnssec.Authenticated_Set {
+		name   = "example.com.",
+		type   = .NSEC,
+		class  = .IN,
+		signer = TEST_SIGNER,
 	}
 	return dnssec.Result{status = .Secure, answer = answer, authority = authority}
 }
@@ -502,11 +522,12 @@ test_a_pruned_answer_is_still_cached_and_served :: proc(t: ^testing.T) {
 
 	// The verdict `validate_answer` reaches on this shape: the CNAME held up,
 	// and nothing in the authority section was ever looked at.
-	covered := make([]dns.Question, 1, context.temp_allocator)
-	covered[0] = dns.Question {
-		name  = "www.example.com.",
-		type  = .CNAME,
-		class = .IN,
+	covered := make([]dnssec.Authenticated_Set, 1, context.temp_allocator)
+	covered[0] = dnssec.Authenticated_Set {
+		name   = "www.example.com.",
+		type   = .CNAME,
+		class  = .IN,
+		signer = TEST_SIGNER,
 	}
 	verdict := dnssec.Result {
 		status = .Secure,
@@ -608,11 +629,12 @@ test_a_pruned_nxdomain_after_a_cname_falls_back_to_the_configured_negative_ttl :
 	wire, _, err := dns.encode_message(msg, context.temp_allocator)
 	testing.expect_value(t, err, dns.Encode_Error.None)
 
-	covered := make([]dns.Question, 1, context.temp_allocator)
-	covered[0] = dns.Question {
-		name  = "www.example.com.",
-		type  = .CNAME,
-		class = .IN,
+	covered := make([]dnssec.Authenticated_Set, 1, context.temp_allocator)
+	covered[0] = dnssec.Authenticated_Set {
+		name   = "www.example.com.",
+		type   = .CNAME,
+		class  = .IN,
+		signer = TEST_SIGNER,
 	}
 	verdict := dnssec.Result {
 		status = .Secure,
