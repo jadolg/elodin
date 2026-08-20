@@ -303,6 +303,13 @@ main :: proc() {
 	} else {
 		logx.infof("%s", allow_from_line(cfg.server))
 	}
+	// Said out loud for the same reason an empty allow list is: with the table
+	// off, a .onion query is forwarded, which tells the upstream operator that
+	// somebody here is reaching for one specific hidden service (RFC 7686
+	// section 2). Nothing is logged when it is on - that is the default.
+	if !cfg.special_use.enabled {
+		logx.warnf("special_use.enabled is off: localhost., onion. and invalid. are forwarded to the upstream")
+	}
 	run(&cfg, opts, service)
 }
 

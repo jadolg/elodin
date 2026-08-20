@@ -374,6 +374,34 @@ resolve_query :: proc(
 		}
 	}
 
+	/*
+	The names that are never forwarded, whatever `upstream.servers` says. See
+	`localzones.odin` for which they are and why.
+
+	Placed after the rewrites and the block lists on purpose. Both of those are
+	the operator having said something explicit about this name, both answer it
+	locally, and neither can leak it - so letting them run first costs nothing
+	and leaves a site that legitimately serves `.local` able to say so, and an
+	operator who put a name on a blocklist still seeing it counted as blocked.
+	This table is the default for the names nobody configured.
+
+	Ahead of the cache, and of the RD gate below. Ahead of the cache because an
+	entry stored before the setting was turned on would otherwise still be
+	served, and there is nothing to look up in any case. Ahead of the RD gate
+	because RD=0 asks for what this server already knows without recursion, and
+	this is precisely that: an answer from a table, with nowhere to forward to
+	even if the client had asked for it.
+
+	No counter of its own, matching `answer_chaos` - the other thing this server
+	answers out of itself. It shows in the query log as `outcome=local
+	detail="special-use"`.
+	*/
+	if zone, kind := special_use_zone(s, q.name); kind != .None {
+		out := answer_special_use(msg, q, zone, kind, allocator, limit)
+		log_query(s, client, proto, q, .Local, "special-use", started)
+		return out, .Local, true
+	}
+
 	// A client that sets CD is asking for the upstream's answer whatever we
 	// think of it, so validation is skipped - and the answer is kept apart in
 	// the cache so it cannot be served to a client that did want it checked.
@@ -855,12 +883,23 @@ build_block_response :: proc(
 	return out
 }
 
-// A minimal SOA for a name we are answering for locally.
+/*
+A minimal SOA for a name we are answering for locally.
+
+`apex` names the zone the record is to be owned by, for a caller that knows one:
+the special-use table does, and the parent of `a.b.onion.` is `b.onion.`, which
+nobody has ever been authoritative for. Empty falls back to the queried name's
+parent, which is the best guess available to the blocking and rewrite paths -
+they answer for names scattered through zones this server knows nothing about.
+*/
 @(private)
-synth_soa :: proc(name: string, ttl: u32, allocator: mem.Allocator) -> []dns.Record {
-	zone := dns.name_parent(name)
-	if zone == "." {
-		zone = name
+synth_soa :: proc(name: string, ttl: u32, allocator: mem.Allocator, apex := "") -> []dns.Record {
+	zone := apex
+	if zone == "" {
+		zone = dns.name_parent(name)
+		if zone == "." {
+			zone = name
+		}
 	}
 	return synth_soa_for_zone(zone, ttl, allocator)
 }
