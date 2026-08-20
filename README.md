@@ -1115,8 +1115,9 @@ that a client drops a record when this cache does: an entry lives for the
 smallest TTL in the message it holds, and a negative one for the SOA's own
 figure capped by `cache.negative_ttl` (RFC 2308), while every record in it still
 goes out carrying its own TTL up to the ceiling. A TTL arriving with its top
-bit set is taken as zero, per RFC 2181 section 8, which also makes the answer
-uncacheable; that one applies to forwarded answers too, cache or no cache.
+bit set is taken as zero, per RFC 2181 section 8, which also leaves the answer
+uncacheable unless `cache.min_ttl` raises it — a zeroed TTL meets that floor
+like any other. Section 8 applies to forwarded answers too, cache or no cache.
 
 ## Capacity
 

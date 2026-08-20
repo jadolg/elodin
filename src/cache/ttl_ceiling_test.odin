@@ -1,6 +1,7 @@
 package cache
 
 import "core:testing"
+import "core:time"
 import "elodin:dns"
 
 /*
@@ -79,11 +80,12 @@ test_max_ttl_bounds_the_ttl_the_client_is_given :: proc(t: ^testing.T) {
 /*
 RFC 2181 section 8: a TTL arriving with the top bit set is taken as zero.
 
-Zero is not a TTL an answer can be cached under, so the answer is refused
-outright rather than stored with the top bit masked off - which is the whole of
-what the RFC asks for, since a record nobody keeps is a record nobody has
-pinned. Before this it was stored, and then served verbatim: 2^31 seconds,
-sixty-eight years.
+Zero is not a TTL an answer can be cached under at the default `min_ttl` of
+zero, so the answer is refused outright rather than stored with the top bit
+masked off - which is the whole of what the RFC asks for, since a record nobody
+keeps is a record nobody has pinned. Before this it was stored, and then served
+verbatim: 2^31 seconds, sixty-eight years. An operator who set a floor gets the
+answer kept for that floor instead, which is the test below.
 
 What the client is told on the way past is not this package's to decide - the
 answer was never cached, so nothing here serves it - and is checked over in
@@ -123,5 +125,52 @@ test_a_zeroed_ttl_is_still_raised_by_min_ttl :: proc(t: ^testing.T) {
 		return
 	}
 	testing.expect_value(t, ttl, u32(300))
+	free_all(context.temp_allocator)
+}
+
+// Age an entry past its expiry without spending the time. The stale path is
+// what is under test, not the clock that gets there.
+@(private = "file")
+expire_entry :: proc(c: ^Cache, key: string) {
+	if e, found := c.entries[key]; found {
+		e.expires = time.time_add(time.now(), -1 * time.Second)
+		e.inserted = time.time_add(time.now(), -3601 * time.Second)
+	}
+}
+
+/*
+The ceiling reaches the stale answer too.
+
+`STALE_TTL` is a fixed thirty seconds, there to bring a client back soon rather
+than to stand as a floor - so an operator whose ceiling is shorter than that has
+asked for sooner still, and a figure that ignored them would leave one answer
+this cache hands out above `max_ttl`. The counted-down TTL cannot cover this:
+the stale branch does not use it, because by then it has reached zero.
+*/
+@(test)
+test_a_stale_answer_is_bounded_by_max_ttl :: proc(t: ^testing.T) {
+	c := make_cache(Options{max_entries = 8, max_ttl = 10, serve_stale = true})
+	defer destroy(c)
+
+	wire, msg := answer_with_ttl("stale.example.", 300, context.temp_allocator)
+	kb: [KEY_MAX]u8
+	key := make_key(kb[:], "stale.example.", .A, .IN, false)
+	if !testing.expect(t, put(c, key, wire, msg), "the answer was not stored") {
+		return
+	}
+	expire_entry(c, key)
+
+	got, stale, ok := get(c, key, context.temp_allocator)
+	if !testing.expect(t, ok && stale, "the expired entry was not lent out") {
+		return
+	}
+	decoded, derr := dns.decode_message(got, context.temp_allocator)
+	if !testing.expect(t, derr == .None, "the stale copy did not decode") {
+		return
+	}
+	if !testing.expect(t, len(decoded.answer) == 1, "the stale copy carried no record") {
+		return
+	}
+	testing.expect_value(t, decoded.answer[0].ttl, u32(10))
 	free_all(context.temp_allocator)
 }
