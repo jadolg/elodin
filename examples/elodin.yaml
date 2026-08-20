@@ -383,6 +383,32 @@ rebind:
 #   - domain: telemetry.example.com
 #     answer: block                 # answered as if it were on a blocklist
 
+# Names the RFCs reserved, answered here instead of being sent upstream.
+#
+# `enabled` covers localhost. (127.0.0.1 and ::1, RFC 6761 6.3), onion.
+# (NXDOMAIN, RFC 7686 2) and invalid. (NXDOMAIN, RFC 6761 6.4), each including
+# everything below it. The .onion case is the one this is for: forwarding such a
+# query tells the upstream operator, and anyone on the path to a plain-UDP
+# upstream, that somebody here is looking for one specific hidden service.
+# localhost. is the other kind of problem — forwarded, the one name that is only
+# ever allowed to be the loopback address resolves to whatever the upstream says.
+#
+# local. and test. are reserved as well, and both are off. They are the two that
+# networks genuinely serve — an Active Directory domain under .local, an internal
+# .test zone RFC 6761 6.2 says users may run — and NXDOMAIN arriving with an
+# upgrade would take those hostnames away. Turn them on if nothing here serves
+# them. A `rewrites` rule is matched first either way, so a name you have written
+# down keeps its answer; what a rewrite cannot do is forward the query on to your
+# router, which is why these are settings rather than something to work around.
+#
+# example. is deliberately not in the set: RFC 6761 6.5 asks resolvers *not* to
+# treat it specially, example.com and its siblings being delegated names that do
+# resolve.
+special_use:
+  enabled: true
+  local: false
+  test: false
+
 # Prometheus. Off by default: a resolver that opens a port nobody asked for has
 # widened your exposure on your behalf.
 #

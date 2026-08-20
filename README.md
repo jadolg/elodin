@@ -1212,6 +1212,63 @@ rewrites:
 
 Wildcards match subdomains only, so `*.lan` covers `host.lan` but not `lan`.
 
+### Names that are never forwarded
+
+```yaml
+special_use:
+  enabled: true    # localhost., onion., invalid.
+  local: false     # also local.  (RFC 6762 section 22)
+  test: false      # also test.   (RFC 6761 section 6.2)
+```
+
+Three names are answered here rather than asked about, whatever `upstream.servers`
+says:
+
+| name | answer | why |
+|---|---|---|
+| `localhost.` and below | 127.0.0.1 for A, `::1` for AAAA, NODATA otherwise | RFC 6761 6.3. The only answer it is allowed to have |
+| `onion.` and below | NXDOMAIN | RFC 7686 2, a MUST NOT on forwarding |
+| `invalid.` and below | NXDOMAIN | RFC 6761 6.4. It cannot exist |
+
+`.onion` is the one this exists for. The query is the disclosure: forwarding it
+tells the upstream operator — and anyone on the path to a plain-UDP upstream —
+that somebody on this network is reaching for one specific hidden service, which
+is what Tor was being used not to publish. `localhost.` is a correctness problem
+rather than a privacy one: forwarded, the name resolves to whatever the upstream
+says, which is a rebinding primitive given away for free.
+
+**`local.` and `test.` are off by default**, though RFC 6762 and RFC 6761 ask for
+the same handling. They are the two reserved names that networks really do serve
+— an Active Directory domain under `.local` older than the reservation, an
+internal `.test` zone that RFC 6761 explicitly permits — and answering them with
+NXDOMAIN on an upgrade would take a working network's own hostnames away. Turn
+them on if nothing here serves them; against a public upstream the only thing
+that changes is that the NXDOMAIN arrives without the round trip and without the
+hostname having left the building.
+
+A rewrite outranks all of this, since `rewrites` are matched first: a site that
+knows what its own `.local` names resolve to can say so and keep that answer.
+What a rewrite cannot do is send the query somewhere — there is no per-domain
+upstream here — so a network whose router answers `.local` dynamically wants
+`local: false`, which is the default.
+
+There is one upstream for which `.onion` really is the right question to ask: a
+local `tor` with `DNSPort` and `AutomapHostsOnResolve`, which answers those names
+with mapped addresses. That setup wants `enabled: false`, and gives up the
+`localhost.` and `invalid.` handling with it — the switch is the whole table, not
+one name of it.
+
+`example.` is deliberately not in the table. It is reserved, but RFC 6761 6.5 is
+the one entry in that document that asks for the opposite: caching servers should
+*not* treat example names as special, `example.com` and its siblings being
+delegated names that resolve.
+
+These answers carry a 10-minute TTL and a synthesised SOA so a resolver
+downstream can cache the negative, and they are not put in elodin's own cache —
+they are built from a table already in memory, and an entry would only outlive
+the reload meant to change it. They show in the query log as `outcome=local
+detail="special-use"`.
+
 ### Metrics
 
 ```yaml
@@ -1331,7 +1388,9 @@ cookies in both directions (RFC 7873, RFC 9018) — answered for clients, and
 presented to plain upstreams with the reply checked against what we sent —
 truncation with the TC bit and the UDP→TCP retry, `version.bind`/`hostname.bind`
 in the CHAOS class, local NODATA answers for `resolver.arpa` (RFC 9462 section
-6.1), and refusal of zone-transfer requests.
+6.1), refusal of zone-transfer requests, and the reserved names of RFC 6761 and
+RFC 7686 answered here instead of being forwarded — see [Names that are never
+forwarded](#names-that-are-never-forwarded).
 
 The cache stores upstream answers as untouched wire bytes plus the offsets of
 their TTL fields, and rewrites those TTLs in place on each hit. That keeps the

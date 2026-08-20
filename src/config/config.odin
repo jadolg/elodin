@@ -510,18 +510,44 @@ Metrics_Config :: struct {
 	path:    string,
 }
 
+/*
+The names the RFCs reserve on the forward side, answered here instead of being
+forwarded. `localzones.odin` in the server package holds the table and argues
+which names are in it.
+
+`enabled` covers `localhost.`, `onion.` and `invalid.`: three names where the
+RFC's instruction and what a network actually needs agree, and where no
+upstream anywhere can be serving something an operator would miss. Off, every
+one of them is forwarded verbatim, which for a `.onion` name means telling the
+upstream operator that somebody here is looking for one specific hidden
+service.
+
+`local` and `test` are the two reserved names that sites genuinely do run - an
+Active Directory domain under `.local`, an internal `.test` - so they are off
+and asked for by name rather than arriving with an upgrade and taking a working
+network's own hostnames away. Both need `enabled`, which is where the table
+lives; setting one of them with `enabled` off is refused at load rather than
+left looking like a protection that is on.
+*/
+Special_Use_Config :: struct {
+	enabled: bool,
+	local:   bool,
+	test:    bool,
+}
+
 Config :: struct {
-	log:       Log_Config,
-	server:    Server_Config,
-	listeners: Listeners,
-	upstream:  Upstream_Config,
-	cache:     Cache_Config,
-	blocking:  Blocking_Config,
-	dnssec:    Dnssec_Config,
-	cookies:   Cookie_Config,
-	rebind:    Rebind_Config,
-	metrics:   Metrics_Config,
-	rewrites:  []Rewrite,
+	log:         Log_Config,
+	server:      Server_Config,
+	listeners:   Listeners,
+	upstream:    Upstream_Config,
+	cache:       Cache_Config,
+	blocking:    Blocking_Config,
+	dnssec:      Dnssec_Config,
+	cookies:     Cookie_Config,
+	rebind:      Rebind_Config,
+	metrics:     Metrics_Config,
+	rewrites:    []Rewrite,
+	special_use: Special_Use_Config,
 }
 
 default_config :: proc() -> Config {
@@ -625,6 +651,14 @@ default_config :: proc() -> Config {
 		// large share of its own operators on upgrade. It is one line to turn on.
 		enabled        = false,
 		allow_loopback = false,
+	}
+	c.special_use = Special_Use_Config {
+		enabled = true,
+		// Both off. See the field comments: these two are reserved names that
+		// working networks serve today, and answering them here would take a
+		// site's own hostnames away on an upgrade.
+		local   = false,
+		test    = false,
 	}
 	c.metrics = Metrics_Config {
 		enabled = false,

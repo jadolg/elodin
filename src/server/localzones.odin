@@ -1,5 +1,6 @@
 package server
 
+import "core:mem"
 import "elodin:dns"
 
 /*
@@ -110,6 +111,192 @@ covered_by_local_anchor :: proc(s: ^Server, name: string) -> bool {
 		}
 	}
 	return false
+}
+
+/*
+The forward-side sibling of the table above: names the RFCs reserved, which are
+answered here and never asked about.
+
+RFC 6761 set `localhost.`, `invalid.`, `test.` and `example.` aside, RFC 6762
+section 22 set `local.` aside for mDNS, and RFC 7686 set `onion.` aside. The
+root delegates none of them, so no answer a public resolver gives for one of
+these can be the right answer - and the query that fetched the wrong answer has
+already told somebody what was being looked for.
+
+For `.onion` that disclosure is the whole harm, which is why RFC 7686 section 2
+makes forwarding a MUST NOT rather than a SHOULD NOT. The query names, to the
+upstream operator and to anyone on the path to a plain-UDP upstream, one
+specific hidden service that somebody on this network is reaching for: exactly
+what Tor was being used not to publish, leaving through a resolver nobody
+thought was on the path.
+
+`localhost.` is the correctness half rather than the privacy half. The only
+answer that name is allowed to have is the loopback address (RFC 6761 section
+6.3); forwarded, it is whatever the upstream feels like returning, which is a
+rebinding primitive handed over for free. `invalid.` is guaranteed never to
+exist (RFC 6761 section 6.4), so NXDOMAIN from here is the answer the root
+would have given anyway, minus the round trip and minus the leak.
+
+`example.` is deliberately absent, though RFC 6761 reserves it too. Section 6.5
+is the one entry in that document that asks for the opposite of the rest:
+caching servers SHOULD NOT recognise example names as special, because
+`example.com`, `example.net` and `example.org` are delegated and do resolve.
+Answering them from here would break names that work today to honour a
+reservation that exists to stop registries selling them.
+
+`local.` and `test.` are in the table only when `special_use.local` and
+`special_use.test` ask for them. RFC 6762 section 22 and RFC 6761 section 6.2
+do want this handling by default, and this is a deliberate departure from both:
+those two are the reserved names that deployed networks really do serve - an
+Active Directory domain under `.local` older than the reservation, an internal
+`.test` zone that section 6.2 itself tells users they may run. NXDOMAIN by
+default would take a working network's own hostnames away on an upgrade, which
+is the forward-side version of the breakage `LOCALLY_SERVED_ZONES` above exists
+to avoid. It costs little to leave them behind a key: against a public upstream
+the only case where turning one on changes what a client sees is the case where
+the upstream was answering, the root having no `local.` or `test.` to delegate.
+
+A rewrite outranks all of this, because `apply_rewrite` runs first - a site that
+has written down what its own names resolve to keeps that answer. What a rewrite
+cannot do is send the query somewhere else, there being no per-domain upstream
+here, so a network whose router answers `.local` dynamically needs the
+configuration key rather than a rule. That is what the key is for.
+*/
+@(private)
+SPECIAL_USE_NXDOMAIN := [?]string{"onion.", "invalid."}
+
+@(private)
+Special_Use :: enum u8 {
+	None,
+	// Answered with the loopback address: `localhost.` and anything under it.
+	Loopback,
+	// Answered NXDOMAIN, the name being one that cannot exist.
+	Nonexistent,
+}
+
+/*
+Ten minutes on a synthesised answer.
+
+Nothing behind these can change while the setting stands, so the TTL is not
+about freshness - it is how long a client goes on believing this after an
+operator has changed their mind. A day would be the honest figure for `onion.`
+and be wrong the first time somebody turns `special_use.local` off to get their
+Active Directory domain back and finds their own clients still holding the
+NXDOMAIN. Ten minutes is short enough that a reload takes effect while the
+operator is still watching, and long enough that a chatty `.local` client is not
+asking every second.
+*/
+@(private)
+SPECIAL_USE_TTL :: 600
+
+/*
+Which special-use zone `name` falls in, and how it is to be answered.
+
+The zone comes back with the verdict because the SOA the caller synthesises
+belongs at the zone's apex - `onion.` for a name under it - rather than at the
+queried name's parent, which for `a.b.onion.` is `b.onion.`, a zone nobody has
+ever been authoritative for. Same label-boundary, case-folding test as
+everything else in this file, so `notlocalhost.` is not inside `localhost.`.
+*/
+@(private)
+special_use_zone :: proc(s: ^Server, name: string) -> (zone: string, kind: Special_Use) {
+	if !s.cfg.special_use.enabled {
+		return "", .None
+	}
+	if name_at_or_below(name, "localhost.") {
+		return "localhost.", .Loopback
+	}
+	for z in SPECIAL_USE_NXDOMAIN {
+		if name_at_or_below(name, z) {
+			return z, .Nonexistent
+		}
+	}
+	if s.cfg.special_use.local && name_at_or_below(name, "local.") {
+		return "local.", .Nonexistent
+	}
+	if s.cfg.special_use.test && name_at_or_below(name, "test.") {
+		return "test.", .Nonexistent
+	}
+	return "", .None
+}
+
+/*
+The answer for a name that is never forwarded.
+
+`localhost.` gets 127.0.0.1 for A and ::1 for AAAA (RFC 6761 section 6.3), and
+NODATA for every other type - not NXDOMAIN, because the name exists, and not a
+made-up record of some other type, because this server has no zone to invent
+one from. An MX or a TXT for `localhost.` is a question with a real answer of
+"there is none", and NODATA is how that is spelled.
+
+The rest get NXDOMAIN. Both shapes carry a synthesised SOA in the authority
+section for the same reason `build_block_response` does: without one there is
+nothing for a downstream resolver to cache the negative answer against (RFC
+2308 section 5), and a client that re-asks every second is a client whose
+`.onion` lookups this server is now generating rather than merely refusing to
+forward.
+
+The answers themselves do not go in the cache. `cache.put` is there so an
+upstream need not be asked twice; these are built from a table already in
+memory, they can never go stale, and an entry would only spend the cache's
+budget to outlive the reload that was meant to change it.
+*/
+@(private)
+answer_special_use :: proc(
+	query: dns.Message,
+	q: dns.Question,
+	zone: string,
+	kind: Special_Use,
+	allocator: mem.Allocator,
+	limit: int,
+) -> []u8 {
+	rcode := dns.Rcode.No_Error
+	answers := make([dynamic]dns.Record, 0, 2, allocator)
+
+	switch kind {
+	case .None:
+	// Not reached: the caller checks before it asks for an answer.
+	case .Loopback:
+		if q.type == .A || q.type == .ANY {
+			append(
+				&answers,
+				dns.Record {
+					name = q.name,
+					type = .A,
+					class = .IN,
+					ttl = SPECIAL_USE_TTL,
+					data = dns.Rdata_A{addr = {127, 0, 0, 1}},
+				},
+			)
+		}
+		if q.type == .AAAA || q.type == .ANY {
+			append(
+				&answers,
+				dns.Record {
+					name = q.name,
+					type = .AAAA,
+					class = .IN,
+					ttl = SPECIAL_USE_TTL,
+					data = dns.Rdata_AAAA{addr = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}},
+				},
+			)
+		}
+	case .Nonexistent:
+		rcode = .NX_Domain
+	}
+
+	resp := dns.make_response(query, rcode, allocator)
+	resp.answer = answers[:]
+	if len(answers) == 0 {
+		resp.authority = synth_soa(q.name, SPECIAL_USE_TTL, allocator, zone)
+	}
+
+	out, _, err := dns.encode_message(resp, allocator, limit)
+	if err != .None {
+		fallback, _ := dns.error_response(nil, query, rcode, allocator, limit)
+		return fallback
+	}
+	return out
 }
 
 /*

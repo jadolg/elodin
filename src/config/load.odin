@@ -59,6 +59,7 @@ load_string :: proc(src: string, allocator := context.allocator) -> (cfg: Config
 	load_dnssec(&l, &cfg)
 	load_cookies(&l, &cfg)
 	load_rebind(&l, &cfg)
+	load_special_use(&l, &cfg)
 	load_metrics(&l, &cfg)
 	load_rewrites(&l, &cfg)
 	validate(&l, &cfg)
@@ -848,6 +849,17 @@ load_rebind :: proc(l: ^Loader, cfg: ^Config) {
 }
 
 @(private)
+load_special_use :: proc(l: ^Loader, cfg: ^Config) {
+	n := yaml.get(l.root, "special_use")
+	if n == nil {
+		return
+	}
+	opt_bool(l, n, "enabled", &cfg.special_use.enabled, "special_use")
+	opt_bool(l, n, "local", &cfg.special_use.local, "special_use")
+	opt_bool(l, n, "test", &cfg.special_use.test, "special_use")
+}
+
+@(private)
 load_metrics :: proc(l: ^Loader, cfg: ^Config) {
 	n := yaml.get(l.root, "metrics")
 	if n == nil {
@@ -1123,5 +1135,17 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	*/
 	if cfg.cookies.require && !cfg.cookies.enabled {
 		errorf(l, "cookies.require needs cookies.enabled: there are no cookies to demand with it off")
+	}
+
+	// Same shape of mistake: `local` and `test` add two names to a table that
+	// is not consulted at all with `special_use.enabled` off, so the pair reads
+	// as a leak that was stopped and is not.
+	if !cfg.special_use.enabled {
+		if cfg.special_use.local {
+			errorf(l, "special_use.local needs special_use.enabled: nothing consults the table with it off")
+		}
+		if cfg.special_use.test {
+			errorf(l, "special_use.test needs special_use.enabled: nothing consults the table with it off")
+		}
 	}
 }
