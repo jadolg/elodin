@@ -338,10 +338,11 @@ wrong place.
 
 `decode_record` keeps RDATA it cannot parse as raw bytes rather than rejecting
 the message, so an option list ending in a partial option header decodes to an
-OPT record with no options at all - and the ECS option in front of that stump
-reads as absent to anything asking the decoded message. It is not absent to the
-upstream, which walks the same bytes and stops at the option it understands. So
-the query is stopped here rather than forwarded with the subnet still on it.
+OPT record holding `Rdata_Raw` rather than an option list - and the ECS option
+in front of that stump reads as absent to anything asking the decoded message,
+`find_edns_option` included. It is not absent to the upstream, which walks the
+same bytes and stops at the option it understands. So the query is stopped here
+rather than forwarded with the subnet still on it.
 */
 @(test)
 test_a_client_subnet_behind_unreadable_opt_bytes_is_not_forwarded :: proc(t: ^testing.T) {
