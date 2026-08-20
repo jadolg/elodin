@@ -487,7 +487,7 @@ numbering has moved on. The cache does not read it: what it counts is a number
 the caller recognises, and a caller with nothing to say leaves it at zero, which
 `get` will always report as out of date rather than silently current.
 */
-put :: proc(c: ^Cache, key: string, wire: []u8, msg: dns.Message, checked: u64 = 0) -> bool {
+put :: proc(c: ^Cache, key: string, wire: []u8, msg: dns.Message, checked: u64 = 0, refused: u8 = 0) -> bool {
 	if c == nil || len(wire) < dns.HEADER_SIZE {
 		return false
 	}
@@ -550,6 +550,7 @@ put :: proc(c: ^Cache, key: string, wire: []u8, msg: dns.Message, checked: u64 =
 	e.ttls = ttls
 	e.redirects = redirects(msg)
 	e.checked = checked
+	e.refused = refused
 	e.inserted = now
 	e.expires = time.time_add(now, time.Duration(effective) * time.Second)
 

@@ -619,26 +619,66 @@ resolve_query :: proc(
 	which is the one part of this that every query pays for.
 
 	Skipped when neither of them will run, which is the only arrangement that was
-	not already paying for a decode here. A response this server cannot decode is
-	still handed to the client - it is the upstream's answer, not ours to withhold
-	over our own reading of it - it is only not walked and not stored.
+	not already paying for a decode here.
 	*/
 	decoded: dns.Message
 	have_decoded := false
-	if s.cfg.cache.enabled || (s.cfg.blocking.enabled && s.filters != nil) {
+	walking := s.cfg.blocking.enabled && s.filters != nil
+	if s.cfg.cache.enabled || walking {
 		if d, dec_err := dns.decode_message(resp, allocator); dec_err == .None {
 			decoded, have_decoded = d, true
 		}
 	}
 
 	/*
-	Ahead of the cache, so that nothing this refuses is stored at all. The hit
-	path checks what it serves too, so storing it would not open the hole back
-	up - but an answer this server has decided not to hand out is not one to keep
-	a copy of, and leaving it out means the check being removed from one path
-	cannot quietly restore it from the other. What it costs is a question that
-	goes upstream again next time; the `blocking.block_ttl` in the answer is what
-	keeps a client from asking every second in between.
+	An answer the walk was going to look at and cannot read is refused.
+
+	This read the other way round - hand it to the client, it is the upstream's
+	answer and not ours to withhold over our own reading of it - which is a fair
+	argument about an answer nobody was going to inspect, and the wrong one about
+	an answer that was about to be checked. A response that does not decode is
+	not walked, and serving what could not be walked is the same fail-open the
+	`Unwalkable` verdict exists to refuse, reachable by appending one record with
+	a bad compression pointer or an RDLENGTH that runs off the end. The cloaked
+	chain rides out in the answer section, which a stub parses perfectly well.
+	`serve_from_cache` already refuses the stored equivalent; the two paths have
+	to agree or the check is only as strong as whichever one an attacker picks.
+
+	Gated on the walk actually being due. With blocking off there is nothing this
+	would have checked, and refusing then would be this server withholding an
+	answer over a parse it had no use for - which is what the old comment was
+	right about.
+
+	The cost is an upstream whose answers this decoder rejects becoming
+	unresolvable rather than merely unfiltered, for the names it does that on.
+	Every rejection is a name or a length that ran outside the message, which a
+	client has to reject too, so the answer was not going to be usable; and the
+	failure says so in the query log rather than passing something through
+	unchecked.
+	*/
+	if walking && !have_decoded {
+		sync.atomic_add(&s.stats.failed, 1)
+		out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
+		log_query(s, client, proto, q, .Failed, "answer-unreadable", started)
+		return out, .Failed, built
+	}
+
+	/*
+	The answer is stored anyway, with the refusal stamped on it.
+
+	Leaving it out was the first shape of this, on the reasoning that an answer
+	this server will not hand out is not one to keep a copy of. What that missed
+	is which case it applies to: a cloaked name that is *not* already cached -
+	the ordinary one, and the one an attacker arranges - then costs an upstream
+	round trip on every single query, forever, because nothing about the refusal
+	is remembered. A name blocked on the question costs none at all. So the
+	cheapest name to serve became one of the most expensive, and the memoisation
+	built for the hit path stopped short of the case that needed it most.
+
+	Storing it does not put the hole back: the entry carries the verdict, so the
+	hit path serves the refusal from it rather than the bytes, and it is walked
+	again as soon as a reload moves the generation past its stamp. The bytes are
+	kept only so that later walk has something to walk.
 
 	Behind validation, because an answer that will not be served at all is not one
 	to spend a list lookup on - and the order cannot change a verdict, since
@@ -657,6 +697,9 @@ resolve_query :: proc(
 			started,
 			allocator,
 		); verdict != .Clear {
+			if s.cfg.cache.enabled {
+				cache.put(s.answers, key, resp, decoded, generation, u8(verdict))
+			}
 			return out, .Blocked, true
 		}
 	}

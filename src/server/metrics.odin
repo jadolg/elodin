@@ -350,7 +350,7 @@ render_cache_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 		b,
 		"elodin_cache_withheld_total",
 		.Counter,
-		"Answers the cache produced that were then refused rather than served; subtract from hits for the number served.",
+		"Answers the cache handed over - a fresh hit or a stale lend - that the resolver then refused instead of serving.",
 		cs.withheld,
 	)
 	/*
