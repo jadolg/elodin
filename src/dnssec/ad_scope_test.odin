@@ -850,11 +850,57 @@ test_denial_after_chain_recognises_the_shape :: proc(t: ^testing.T) {
 		"a chain that reaches the type asked for is not a denial",
 	)
 
-	// No denial in the authority section: nothing to have failed to check.
+	// No denial claimed at all: a bare chain is one the client follows itself.
 	bare := dns.Message {
 		answer = []dns.Record{cname},
 	}
-	testing.expect(t, !denial_after_chain(bare, .AAAA, .IN), "no authority records, no denial")
+	testing.expect(t, !denial_after_chain(bare, .AAAA, .IN), "a bare chain claims no denial")
+
+	/*
+	NXDOMAIN with the authority section deleted.
+
+	The shape the first version of this missed: it asked whether the sender had
+	put denial records in the message, which the sender can simply not do. Flip
+	the rcode, drop the section, and an authenticated NXDOMAIN went out with
+	nothing behind it. The rcode is the half that cannot be deleted.
+	*/
+	stripped := dns.Message {
+		answer = []dns.Record{cname},
+	}
+	stripped.flags.rcode = u8(dns.Rcode.NX_Domain)
+	testing.expect(
+		t,
+		denial_after_chain(stripped, .AAAA, .IN),
+		"an NXDOMAIN with no authority records is still a denial claimed",
+	)
+
+	/*
+	A wildcard-expanded answer is not a denial, and its proof is not one either.
+
+	RFC 4035 section 3.1.3 has an NSEC or NSEC3 travel beside a wildcard-expanded
+	answer to show the expansion was allowed. That is a proof *for* the answer,
+	and `validate_wildcard_proof` is about to check it - so reading it as a
+	denial refused a legitimately signed answer its AD bit and returned before
+	the code that would have confirmed it ever ran. An SOA is what marks a
+	NODATA (RFC 2308 section 2.2), and there is none here.
+	*/
+	wildcard_proof := dns.Message {
+		answer    = []dns.Record{cname},
+		authority = []dns.Record {
+			{
+				name = "brand.example.",
+				type = .NSEC3,
+				class = .IN,
+				ttl = 60,
+				data = dns.Rdata_Raw{data = make([]u8, 4, context.temp_allocator)},
+			},
+		},
+	}
+	testing.expect(
+		t,
+		!denial_after_chain(wildcard_proof, .AAAA, .IN),
+		"an NSEC3 with no SOA beside it is a wildcard proof, not a denial",
+	)
 
 	// A CNAME or ANY question is answered by the chain itself.
 	testing.expect(t, !denial_after_chain(chain_only, .CNAME, .IN), "a CNAME question is answered by the chain")
