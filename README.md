@@ -556,6 +556,22 @@ and BIND ship. Configuring a `trust_anchors` entry that covers one of these zone
 turns that off for it: an operator who signs their own reverse space and anchors
 it is asking for it to be validated, and elodin then does.
 
+Queries for `resolver.arpa` are answered here rather than forwarded. That name
+is where a client looks for the encrypted endpoints of the resolver it is
+already using — RFC 9462's Discovery of Designated Resolvers, an SVCB lookup for
+`_dns.resolver.arpa`. Forwarded, the answer would be the *upstream's*
+designation, and a client that took it would move its traffic to Quad9 or
+Cloudflare directly, leaving the block lists, the rewrites and the query log
+behind; the TLS certificate would not name elodin's address either. RFC 9462
+section 6.1 says a forwarder should not forward these, so elodin answers NODATA
+and the client stays on the resolver it was already talking to. That also
+settles a DNSSEC warning worth recognising: `resolver.arpa` does not exist in
+the signed `arpa` zone, so an upstream's synthesised, unsigned answer for it is
+indistinguishable from a forgery and used to be logged as `dnssec: SVCB
+_dns.resolver.arpa ... did not validate: Bogus`. A `rewrites` rule for the name
+still wins, for an operator who does want to advertise this server's own DoT or
+DoH endpoints.
+
 Two things worth knowing about running with it on:
 
 - **Distribution crypto policy can take algorithms away.** Fedora and RHEL ship
@@ -1078,7 +1094,8 @@ be](#how-large-a-udp-answer-may-be)), DNS
 cookies in both directions (RFC 7873, RFC 9018) — answered for clients, and
 presented to plain upstreams with the reply checked against what we sent —
 truncation with the TC bit and the UDP→TCP retry, `version.bind`/`hostname.bind`
-in the CHAOS class, and refusal of zone-transfer requests.
+in the CHAOS class, local NODATA answers for `resolver.arpa` (RFC 9462 section
+6.1), and refusal of zone-transfer requests.
 
 The cache stores upstream answers as untouched wire bytes plus the offsets of
 their TTL fields, and rewrites those TTLs in place on each hit. That keeps the
@@ -1334,6 +1351,12 @@ upstream traffic by the number of servers.
   secrets, both the client-facing one and the client cookies held per upstream,
   are drawn once at startup and never rotated: restarting costs each client and
   each upstream one extra round trip.
+- **elodin does not advertise its own DoT or DoH endpoints over DDR.** Queries
+  for `resolver.arpa` are answered NODATA rather than forwarded, which keeps
+  clients on this server, but nothing designates its encrypted listeners
+  automatically: a client that should use them is pointed at them by
+  configuration, by the [Apple mobileconfig
+  profile](#apple-devices-ios-ipados-macos), or by a `rewrites` rule.
 - No per-client rules, no query log database, no web or API surface. Statistics
   go to the log every five minutes, and to a Prometheus endpoint when
   [`metrics.enabled`](#metrics) is set — but that endpoint is counters only,

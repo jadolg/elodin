@@ -350,6 +350,21 @@ resolve_query :: proc(
 		return out, .Rewritten, true
 	}
 
+	/*
+	A DDR probe is answered from here and never forwarded - the upstream's
+	designated resolvers are not ours to hand a client, and its unsigned answer
+	under the signed `arpa` zone does not validate. See `ddr.odin`.
+
+	Below the rewrites, so an operator who wants to designate this server's own
+	DoT or DoH endpoints can say so and be obeyed; above the block lists and the
+	cache, which have nothing to add to a name this server answers for itself.
+	*/
+	if is_resolver_arpa(q.name) {
+		out := build_resolver_arpa_response(msg, q, allocator, limit)
+		log_query(s, client, proto, q, .Local, "ddr", started)
+		return out, .Local, true
+	}
+
 	if s.cfg.blocking.enabled && s.filters != nil {
 		if filter.engine_match(s.filters, q.name) == .Blocked {
 			sync.atomic_add(&s.stats.blocked, 1)
@@ -847,6 +862,12 @@ synth_soa :: proc(name: string, ttl: u32, allocator: mem.Allocator) -> []dns.Rec
 	if zone == "." {
 		zone = name
 	}
+	return synth_soa_for_zone(zone, ttl, allocator)
+}
+
+// The same, for a caller that knows the zone rather than a name inside it.
+@(private)
+synth_soa_for_zone :: proc(zone: string, ttl: u32, allocator: mem.Allocator) -> []dns.Record {
 	recs := make([]dns.Record, 1, allocator)
 	recs[0] = dns.Record {
 		name = zone,
