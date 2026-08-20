@@ -1054,9 +1054,27 @@ rather than as tidiness: browsers on Linux and macOS reach services bound to
 `127.0.0.1` by connecting to `0.0.0.0`, which is what the "0.0.0.0 Day"
 disclosure was about, so it is a working bypass and not merely an odd answer.
 
+Beside an SVCB or HTTPS answer it reads the additional section too, since RFC
+9460 section 5 has the client take the target's address from there without
+issuing a second query. Everywhere else the additional section is left alone: it
+is glue for names other than the one asked about, which a stub does not connect
+to.
+
 One offending record refuses the whole answer rather than being filtered out of
 it, so a mixed answer cannot be used to sneak one through and the guard does not
 have to be exhaustive over every way an address can be written into a message.
+
+An answer elodin cannot decode is refused too, for those same five question
+types. That was the way round the whole guard and it was free: the attacker owns
+the authoritative server, so a truthful answer section carrying `192.168.1.1`
+with an `ARCOUNT` of 100 and nothing behind it is rejected by the decoder, was
+forwarded verbatim, and glibc's resolver — which only ever walks the answer
+section — handed it to the browser. The cost of closing it is that a name whose
+upstream emits something elodin's decoder rejects now returns NODATA for A and
+AAAA where it used to be forwarded; such an answer was already not cacheable and
+not re-encodable. Every other question type is forwarded exactly as before. In
+the query log this one reads `outcome=blocked detail="unreadable"`, against
+`detail="rebind"` for an answer that named a private address.
 The client gets NODATA — NOERROR with an empty answer section, an SOA so it knows
 how long to remember, and RFC 8914 extended error 15 saying why:
 
@@ -1549,16 +1567,16 @@ upstream traffic by the number of servers.
 - DNSSEC validation is **on by default**, and where a distribution's crypto
   policy forbids SHA-1 signatures the two RSA/SHA-1 algorithms degrade to
   insecure rather than validating. See the DNSSEC section above.
-- [Rebinding protection](#dns-rebinding-protection) reads the answer section
-  only, and only for A, AAAA, ANY, SVCB and HTTPS questions — the ones a browser
-  can be made to ask. Addresses in the additional section are left alone: they
-  are glue for names other than the one asked about, a stub does not resolve a
-  hostname out of them, and elodin stores and serves a response as a whole under
-  the question's key, so there is no way to retrieve one on its own. An answer
-  the codec cannot decode is forwarded unchecked, which is the decoder's gap
-  rather than the check's — the same message is one the validator cannot
-  validate and the cache declines to store, and the fuzz corpus is what keeps
-  the set of them empty.
+- [Rebinding protection](#dns-rebinding-protection) runs only for A, AAAA, ANY,
+  SVCB and HTTPS questions — the ones a browser can be made to ask. Addresses in
+  the additional section are left alone unless the answer carried an SVCB or
+  HTTPS record: ordinarily they are glue for names other than the one asked
+  about, a stub does not resolve a hostname out of them, and elodin stores and
+  serves a response as a whole under the question's key, so there is no way to
+  retrieve one on its own. SVCB is the exception because RFC 9460 section 5 has
+  the client use them directly. An answer the codec cannot decode is refused for
+  those five question types rather than forwarded unchecked — see the section
+  above — and forwarded as before for every other type.
 - **Connection-oriented transports get a thread per connection**, capped for
   TCP, DoT and DoH together by `server.max_connections` (512). That is fine for
   clients that hold a connection open and pipeline over it, but it does not suit

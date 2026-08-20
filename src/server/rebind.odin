@@ -79,18 +79,44 @@ every MX and TXT answer a second time to look for address records that a stub
 would discard is work on the forwarding path for nothing. A browser cannot be
 made to issue any other type.
 
-The additional section is left alone. Addresses there are glue for names other
-than the one asked about, a stub does not resolve a hostname out of them, and
-this server stores and serves the response as a whole under the question's key -
-so there is no way to retrieve one on its own. What SVCB puts in its own RDATA is
-different: that is an address for the name in the question.
+The additional section is left alone, except beside an SVCB or HTTPS answer.
+Addresses there are ordinarily glue for names other than the one asked about: a
+stub does not resolve a hostname out of them, and this server stores and serves
+the response as a whole under the question's key, so there is no way to retrieve
+one on its own. SVCB is the exception in the specification rather than here - RFC
+9460 section 5 has the resolver put A and AAAA for the ServiceMode TargetName in
+the additional section precisely so that the client does not have to ask for
+them, so a client following it connects to what it finds there. That is the same
+"address a browser reaches without ever asking for the A record" the hints are
+covered for, arriving by the other door, and an `HTTPS 1 target.` with no hints
+at all was the way through.
 
-An answer this server cannot decode is forwarded unchecked. That is a real gap
-and it is the decoder's rather than this file's: the same message is one the
-validator cannot validate and the cache declines to store, and the fuzz corpus in
-`testdata/fuzz-corpus/dns` is what keeps the set of such messages empty. Refusing
-every response that fails to decode would be a different change with a much
-larger blast radius than this one.
+An answer this server cannot decode is refused, not forwarded, for the five
+question types above. That was the way round the whole guard and it cost the
+attacker one byte: they own the authoritative server, so they emit a truthful
+answer section carrying 192.168.1.1 and an ARCOUNT of 100 with nothing behind it,
+the count check in `decode_message` rejects the message, and the bytes reach the
+client verbatim - where glibc's `getanswer`, which only ever walks the answer
+section, hands the browser the address.
+
+What used to be written here in place of refusing was that such a message is also
+one the validator cannot validate and the cache declines to store. The second
+half is true and useless: the client is served either way. The first was simply
+wrong. `validating` is false whenever `dnssec.enabled` is off - which is a
+supported configuration and the one recommended for an upstream that cannot
+return DNSSEC records - or the client sets CD; and an attacker's own zone is
+unsigned in any case, so validation reaches Insecure and serves it. A mitigation
+an attacker switches off by not signing their zone was never one.
+
+So it fails closed, and only exactly here: with the guard on, for the questions
+the guard covers, when the decode fails. An undecodable MX or TXT answer is
+forwarded as it always was. What that costs is a name whose upstream emits
+something this decoder rejects becoming NODATA for A and AAAA where it used to be
+forwarded - an answer that was already not cacheable, not re-encodable and not
+validatable, so the marginal loss is small and the fuzz corpus in
+`testdata/fuzz-corpus/dns` is what keeps the set small. Widening it to every
+question type would be a different change with a much larger blast radius, and is
+not this one.
 
 What is exempt
 
@@ -151,11 +177,19 @@ SVCB_IPV4HINT :: 4
 SVCB_IPV6HINT :: 6
 
 /*
-The answer to send instead, when the upstream's answer points into private space.
+The answer to send instead, when the upstream's answer cannot be passed on.
 
 `refused` false means there was nothing to object to and the caller carries on
 with the response it has. It is false for every query when `rebind.enabled` is
 off, which is the only cost this feature has on a server that does not want it.
+
+`detail` is what the query log records beside `outcome=blocked`, and separates
+the two reasons: `rebind` for an answer that named a private address, and
+`unreadable` for one that could not be decoded and therefore could not be
+checked. Both are this guard withholding an answer and both move the same
+counter - they should each be zero in production, and a second counter for a
+number that never moves is a number nobody reads - but they point an operator at
+completely different things, so the log has to be able to say which.
 */
 @(private)
 rebind_refusal :: proc(
@@ -167,18 +201,19 @@ rebind_refusal :: proc(
 	allocator: mem.Allocator,
 ) -> (
 	out: []u8,
+	detail: string,
 	refused: bool,
 ) {
 	if !s.cfg.rebind.enabled {
-		return nil, false
+		return nil, "", false
 	}
 	#partial switch q.type {
 	case .A, .AAAA, .ANY, .SVCB, .HTTPS:
 	case:
-		return nil, false
+		return nil, "", false
 	}
 	if rebind_exempt(s.cfg.rebind.allow_domains, q.name) {
-		return nil, false
+		return nil, "", false
 	}
 
 	/*
@@ -192,7 +227,9 @@ rebind_refusal :: proc(
 	*/
 	decoded, err := dns.decode_message(resp, allocator)
 	if err != .None {
-		return nil, false
+		sync.atomic_add(&s.stats.rebind, 1)
+		report_unreadable(q.name, err)
+		return rebind_nodata(s, query, q, limit, allocator), "unreadable", true
 	}
 
 	// Decided once, from the question, rather than read out of the configuration
@@ -203,15 +240,34 @@ rebind_refusal :: proc(
 
 	addr, v6, found := first_private_answer(decoded, loopback_ok)
 	if !found {
-		return nil, false
+		return nil, "", false
 	}
 
 	sync.atomic_add(&s.stats.rebind, 1)
 	report_rebind(q.name, addr, v6, allocator)
+	return rebind_nodata(s, query, q, limit, allocator), "rebind", true
+}
 
-	ttl := s.cfg.blocking.block_ttl
+/*
+NOERROR, no answer section, an SOA to say how long to remember it and an extended
+error to say why.
+
+One procedure for both reasons, so that a client cannot tell from the response
+which of them it was. Not that it is secret - the query log says, and the whole
+point of the extended error is that the reason travels - but the two differ only
+in what an operator is told, and building them separately is how they would come
+to differ in what a client is told as well.
+*/
+@(private)
+rebind_nodata :: proc(
+	s: ^Server,
+	query: dns.Message,
+	q: dns.Question,
+	limit: int,
+	allocator: mem.Allocator,
+) -> []u8 {
 	out_msg := dns.make_response(query, .No_Error, allocator)
-	out_msg.authority = synth_soa(q.name, ttl, allocator)
+	out_msg.authority = synth_soa(q.name, s.cfg.blocking.block_ttl, allocator)
 	attach_extended_error(&out_msg, EDE_BLOCKED, "rebind", allocator)
 
 	encoded, _, enc_err := dns.encode_message(out_msg, allocator, limit)
@@ -223,9 +279,9 @@ rebind_refusal :: proc(
 		procedure just decided to withhold has lost rather more than that.
 		*/
 		fallback, _ := dns.error_response(nil, query, .No_Error, allocator, limit)
-		return fallback, true
+		return fallback
 	}
-	return encoded, true
+	return encoded
 }
 
 /*
@@ -246,14 +302,22 @@ rebind_exempt :: proc(domains: []string, name: string) -> bool {
 }
 
 /*
-The first address in the answer section that is inside private space.
+The first address in the answer that is inside private space.
 
 First rather than all of them: one is enough to refuse the whole message, and
 what the caller does with it is name it in the log, so the rest would be a list
 nobody reads.
+
+The additional section joins the search only when the answer carried an SVCB or
+HTTPS record, which is the one shape in which an address there is something a
+client acts on - RFC 9460 section 5. Scoped to the answer's contents rather than
+to the question type, because that is the condition that actually holds: an ANY
+query returning an HTTPS record is in it, and an A query whose upstream attached
+unrelated NS glue is not.
 */
 @(private)
 first_private_answer :: proc(msg: dns.Message, loopback_ok: bool) -> (addr: [16]u8, v6: bool, found: bool) {
+	service_answer := false
 	for rec in msg.answer {
 		switch data in rec.data {
 		case dns.Rdata_A:
@@ -267,6 +331,7 @@ first_private_answer :: proc(msg: dns.Message, loopback_ok: bool) -> (addr: [16]
 				return data.addr, true, true
 			}
 		case dns.Rdata_SVCB:
+			service_answer = true
 			if a, is6, hit := private_svcb_hint(data.params, loopback_ok); hit {
 				return a, is6, true
 			}
@@ -278,6 +343,24 @@ first_private_answer :: proc(msg: dns.Message, loopback_ok: bool) -> (addr: [16]
 		case:
 		// No data at all, which is a record type the decoder produced nothing
 		// for. Nothing to read an address out of.
+		}
+	}
+
+	if !service_answer {
+		return {}, false, false
+	}
+	for rec in msg.additional {
+		#partial switch data in rec.data {
+		case dns.Rdata_A:
+			a: [16]u8
+			a[0], a[1], a[2], a[3] = data.addr[0], data.addr[1], data.addr[2], data.addr[3]
+			if rebind_private(a, false, loopback_ok) {
+				return a, false, true
+			}
+		case dns.Rdata_AAAA:
+			if rebind_private(data.addr, true, loopback_ok) {
+				return data.addr, true, true
+			}
 		}
 	}
 	return {}, false, false
@@ -400,6 +483,39 @@ report_rebind :: proc(name: string, addr: [16]u8, v6: bool, allocator: mem.Alloc
 	)
 	logx.warnf(
 		"if that name is served locally on purpose, add its zone to rebind.allow_domains (or set rebind.allow_loopback for 127.0.0.0/8 and ::1, or rebind.enabled to false); refusals are counted as rebind= in the stats line, and further ones are logged at debug level",
+	)
+}
+
+/*
+Say, once, that an answer was withheld because it could not be read.
+
+A different diagnosis from the one above and so a flag of its own: an operator
+who saw the private-address warning first would otherwise never be told that this
+is happening at all. What it points at is not a network to exempt but an upstream
+emitting something this decoder rejects - or somebody trying the one way there
+was around the guard - so the line names the decode error rather than a setting,
+and does not suggest `allow_domains`, which would not help.
+*/
+@(private)
+unreadable_reported: bool
+
+@(private)
+report_unreadable :: proc(name: string, err: dns.Decode_Error) {
+	say, first := report_once(&unreadable_reported, logx.enabled(.Debug))
+	if !say {
+		return
+	}
+	if !first {
+		logx.debugf("refused an unreadable answer for %s: %v", dns.name_trim_root(name), err)
+		return
+	}
+	logx.warnf(
+		"refused an answer for %s that could not be decoded (%v): with rebinding protection on, an answer this server cannot read is one it cannot check, so it is not passed on",
+		dns.name_trim_root(name),
+		err,
+	)
+	logx.warnf(
+		"this is an upstream sending something the decoder rejects, or an attempt to slip a private address past the check; it applies to A, AAAA, ANY, SVCB and HTTPS questions only, and rebind.enabled turns it off with the rest of the guard",
 	)
 }
 
