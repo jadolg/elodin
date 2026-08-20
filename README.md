@@ -398,6 +398,20 @@ Hosts entries are exact because hosts-format lists spell out every subdomain
 they mean; bare domains and `||` rules cover subtrees. This matches how AdGuard
 Home reads the same files. Allow rules always win over block rules.
 
+The rules are matched against the answer as well as the question. An answer
+whose CNAME chain lands on a listed name is blocked as though that name had been
+asked for: the arrangement to catch is a tracker given a subdomain inside the
+site's own zone — `metrics.brand.example` CNAME `tracker.evil.example` — where
+the question is a first-party name no list can usefully carry and the address the
+browser connects to is the tracker's, with the site's own cookies attached.
+Pi-hole calls this deep CNAME inspection and AdGuard Home does the same thing to
+CNAME targets. Every hop is matched rather than only the last, up to sixteen of
+them, and an allow rule matching any hop — or the question — exempts the whole
+answer, which is the escape hatch when a first-party name resolves through a CDN
+somebody has listed. These show in the query log as `outcome=blocked
+detail=cname`, against `detail=list` for a question that was on a list itself,
+and the name that matched is logged at debug level.
+
 The `address=/…/` and `server=/…/` forms are dnsmasq's, accepted because they
 turn up in lists that are otherwise adblock syntax. A `$` modifier
 (`$third-party`, `$important`) is dropped and the rest of the rule kept: none of

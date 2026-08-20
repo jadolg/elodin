@@ -581,6 +581,24 @@ resolve_query :: proc(
 		resp = present_response(resp, msg, q.type, result.status == .Secure, allocator)
 	}
 
+	/*
+	Ahead of the cache, so that nothing this refuses is stored at all. The hit
+	path checks what it serves too, so storing it would not open the hole back
+	up - but an answer this server has decided not to hand out is not one to keep
+	a copy of, and leaving it out means the check being removed from one path
+	cannot quietly restore it from the other. What it costs is a question that
+	goes upstream again next time; the `blocking.block_ttl` in the answer is what
+	keeps a client from asking every second in between.
+
+	Behind validation, because an answer that will not be served at all is not one
+	to spend a list lookup on - and the order cannot change a verdict, since
+	everything this can decide is to withhold an answer the validator was willing
+	to pass.
+	*/
+	if out, cloaked := block_cloaked_answer(s, resp, msg, q, proto, client, limit, started, allocator); cloaked {
+		return out, .Blocked, true
+	}
+
 	if s.cfg.cache.enabled {
 		if decoded, dec_err := dns.decode_message(resp, allocator); dec_err == .None {
 			/*
@@ -623,7 +641,9 @@ was used.
 Counted as a cached query either way, because that is what happened: the client
 was answered from this server's cache without an upstream producing the answer.
 The upstream failure behind a stale answer is a debug line of its own and not a
-failed query - the client got an answer.
+failed query - the client got an answer. The exception is an entry the lists now
+refuse, which never becomes a served answer at all and is counted as the block
+it is.
 */
 @(private)
 serve_from_cache :: proc(
@@ -644,6 +664,29 @@ serve_from_cache :: proc(
 	outcome: Outcome,
 	ok: bool,
 ) {
+	/*
+	The stored answer is put through the list check again rather than trusted to
+	have passed it when it went in.
+
+	Lists are reloaded under a running server, and the entry may predate the
+	reload that named something in its chain. The question side of the same rule
+	set is matched on every query - it runs before the cache is consulted at all -
+	so an entry left unchecked here would make one half of a rule take effect on
+	the next query and the other half take effect when the TTL ran out, which is
+	up to `cache.max_ttl` later and is not a difference an operator can be
+	expected to hold in their head.
+
+	It costs a decode on the path that exists to avoid work. That is the price of
+	the check meaning the same thing on both paths, and it is the same decode the
+	miss path pays to store the entry in the first place. The entry itself is left
+	where it is: nothing here can tell whether the next list reload will put it
+	back in service, and re-checking a hit is cheaper than the miss that dropping
+	it would cause.
+	*/
+	if out, cloaked := block_cloaked_answer(s, hit, msg, q, proto, client, limit, started, allocator); cloaked {
+		return out, .Blocked, true
+	}
+
 	dns.set_id_in_place(hit, msg.id)
 	dns.copy_question_case(hit, query)
 	// The stored answer carries the verdict; whether this client gets to hear it

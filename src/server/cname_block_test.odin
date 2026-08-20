@@ -1,0 +1,343 @@
+package server
+
+import "core:net"
+import "core:testing"
+import "core:thread"
+import "core:time"
+import "elodin:cache"
+import "elodin:config"
+import "elodin:dns"
+import "elodin:filter"
+import "elodin:upstream"
+
+/*
+Blocking is decided on the question and nothing else.
+
+An answer may point somewhere else entirely: the question is a first-party name
+the site owns, the CNAME in the answer lands on the tracker, and the address the
+browser ends up talking to is the tracker's. Pi-hole calls this CNAME cloaking
+and inspects the chain for it; nothing here looks past `q.name`.
+*/
+
+@(private = "file")
+Cloak_Mock :: struct {
+	socket: net.UDP_Socket,
+	reply:  []u8,
+	asked:  bool,
+}
+
+@(private = "file")
+serve_cloak :: proc(x: ^Cloak_Mock) {
+	buf: [4096]u8
+	n, remote, err := net.recv_udp(x.socket, buf[:])
+	if err != nil || n < dns.HEADER_SIZE || len(x.reply) > len(buf) {
+		return
+	}
+	x.asked = true
+	out: [4096]u8
+	copy(out[:], x.reply)
+	// The resolver draws a fresh transaction ID for every query it forwards.
+	out[0], out[1] = buf[0], buf[1]
+	_, _ = net.send_udp(x.socket, out[:len(x.reply)], remote)
+}
+
+@(private = "file")
+cloak_query :: proc(name: string) -> []u8 {
+	questions := make([]dns.Question, 1, context.temp_allocator)
+	questions[0] = dns.Question{name = name, type = .A, class = .IN}
+	msg := dns.Message{id = 0x4321, question = questions}
+	msg.flags.rd = true
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	if err != .None {
+		return nil
+	}
+	return wire
+}
+
+@(private = "file")
+cloak_reply :: proc(qname, target: string) -> []u8 {
+	answer := make([]dns.Record, 2, context.temp_allocator)
+	answer[0] = dns.Record {
+		name  = qname,
+		type  = .CNAME,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_Name{name = target},
+	}
+	answer[1] = dns.Record {
+		name  = target,
+		type  = .A,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_A{addr = {203, 0, 113, 7}},
+	}
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question{name = qname, type = .A, class = .IN}
+	msg := dns.Message{question = question, answer = answer}
+	msg.flags.qr = true
+	msg.flags.rd = true
+	msg.flags.ra = true
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	if err != .None {
+		return nil
+	}
+	return wire
+}
+
+@(test)
+test_a_blocked_name_reached_through_a_cname_is_still_blocked :: proc(t: ^testing.T) {
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+		return
+	}
+	defer net.close(socket)
+	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+	bound, _ := net.bound_endpoint(socket)
+
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.cache.enabled = false
+	cfg.dnssec.enabled = false
+	cfg.blocking.enabled = true
+	cfg.upstream.strategy = .Failover
+	cfg.upstream.attempts = 1
+	cfg.upstream.timeout = 3 * time.Second
+	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
+	servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port}
+	cfg.upstream.servers = servers
+
+	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+		return
+	}
+	defer upstream.destroy_group(group)
+
+	engine := filter.engine_make()
+	defer filter.engine_destroy(engine)
+	block := filter.set_make()
+	allow := filter.set_make()
+	filter.set_add(block, "tracker.evil.example", {.Apex, .Subdomains})
+	filter.engine_swap(engine, block, allow)
+
+	s := Server{cfg = &cfg, group = group, filters = engine}
+
+	// The tracker is on the list: asked for directly, it is blocked.
+	testing.expect_value(t, filter.engine_match(engine, "tracker.evil.example."), filter.Decision.Blocked)
+
+	x := Cloak_Mock{socket = socket, reply = cloak_reply("www.brand.example.", "tracker.evil.example.")}
+	mock := thread.create_and_start_with_poly_data(&x, serve_cloak)
+	out, outcome, ok := handle_query(&s, cloak_query("www.brand.example."), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	thread.join(mock)
+	thread.destroy(mock)
+
+	if !testing.expect(t, ok, "nothing came back at all") {
+		return
+	}
+	decoded, derr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+
+	// The client is handed the tracker's address and the chain that leads to it.
+	for rec in decoded.answer {
+		if cname, is_cname := rec.data.(dns.Rdata_Name); is_cname {
+			testing.expectf(
+				t,
+				filter.engine_match(engine, cname.name) != .Blocked,
+				"the answer carries a CNAME to %s, which is on the block list",
+				cname.name,
+			)
+		}
+	}
+	testing.expect_value(t, outcome, Outcome.Blocked)
+	free_all(context.temp_allocator)
+}
+
+/*
+The rest of the walk, exercised from the cache rather than through a mock
+upstream. An entry that predates the rule now covering its chain is the case the
+cache path exists to catch, and putting the answer in directly is the only way to
+have one.
+*/
+
+@(private = "file")
+chain_reply :: proc(hops: []string) -> []u8 {
+	// A CNAME per hop and an address at the end, which is the shape of a cloaked
+	// answer: the chain is what leads there and the address is the point of it.
+	answer := make([]dns.Record, len(hops), context.temp_allocator)
+	for i in 0 ..< len(hops) - 1 {
+		answer[i] = dns.Record {
+			name  = hops[i],
+			type  = .CNAME,
+			class = .IN,
+			ttl   = 60,
+			data  = dns.Rdata_Name{name = hops[i + 1]},
+		}
+	}
+	answer[len(hops) - 1] = dns.Record {
+		name  = hops[len(hops) - 1],
+		type  = .A,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_A{addr = {203, 0, 113, 7}},
+	}
+	return chain_wire(hops[0], answer)
+}
+
+@(private = "file")
+chain_wire :: proc(qname: string, answer: []dns.Record) -> []u8 {
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question{name = qname, type = .A, class = .IN}
+	msg := dns.Message{question = question, answer = answer}
+	msg.flags.qr = true
+	msg.flags.rd = true
+	msg.flags.ra = true
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	if err != .None {
+		return nil
+	}
+	return wire
+}
+
+@(private = "file")
+serve_cached_chain :: proc(t: ^testing.T, hops, block, allow: []string) -> Outcome {
+	return serve_cached_answer(t, hops[0], chain_reply(hops), block, allow)
+}
+
+@(private = "file")
+serve_cached_answer :: proc(t: ^testing.T, qname: string, wire: []u8, block, allow: []string) -> Outcome {
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.cache.enabled = true
+	cfg.dnssec.enabled = false
+	cfg.blocking.enabled = true
+
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
+	defer cache.destroy(answers)
+
+	engine := filter.engine_make()
+	defer filter.engine_destroy(engine)
+	block_set := filter.set_make()
+	allow_set := filter.set_make()
+	for d in block {
+		filter.set_add(block_set, d, {.Apex, .Subdomains})
+	}
+	for d in allow {
+		filter.set_add(allow_set, d, {.Apex, .Subdomains})
+	}
+	filter.engine_swap(engine, block_set, allow_set)
+
+	s := Server{cfg = &cfg, answers = answers, filters = engine}
+
+	decoded, derr := dns.decode_message(wire, context.temp_allocator)
+	if !testing.expectf(t, derr == .None, "the answer would not decode: %v", derr) {
+		return .Failed
+	}
+	key_buf: [cache.KEY_MAX]u8
+	key := cache.make_key(key_buf[:], qname, .A, .IN, false, false)
+	if !testing.expect(t, cache.put(answers, key, wire, decoded), "the answer was not cached") {
+		return .Failed
+	}
+
+	_, outcome, ok := handle_query(&s, cloak_query(qname), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	testing.expect(t, ok, "nothing came back at all")
+	return outcome
+}
+
+// Lists are reloaded under a running server, so an entry can outlive the moment
+// its chain became something to refuse. Matched on the way out, every time.
+@(test)
+test_a_cached_answer_is_matched_against_the_lists_as_they_stand_now :: proc(t: ^testing.T) {
+	outcome := serve_cached_chain(
+		t,
+		[]string{"www.brand.example.", "tracker.evil.example."},
+		[]string{"tracker.evil.example"},
+		nil,
+	)
+	testing.expect_value(t, outcome, Outcome.Blocked)
+	free_all(context.temp_allocator)
+}
+
+// An exception written for the name that was asked about covers the lookup and
+// not just the label: the chain below it is not searched for a reason to refuse.
+@(test)
+test_an_allowed_question_exempts_the_chain_it_leads_to :: proc(t: ^testing.T) {
+	outcome := serve_cached_chain(
+		t,
+		[]string{"www.brand.example.", "tracker.evil.example."},
+		[]string{"evil.example"},
+		[]string{"www.brand.example"},
+	)
+	testing.expect_value(t, outcome, Outcome.Cached)
+	free_all(context.temp_allocator)
+}
+
+// Allow beats block for one name; it beats it across a chain the same way, and
+// the hop it wins on may come after the hop that would have lost.
+@(test)
+test_an_allow_rule_later_in_the_chain_beats_a_block_earlier_in_it :: proc(t: ^testing.T) {
+	outcome := serve_cached_chain(
+		t,
+		[]string{"www.brand.example.", "tracker.evil.example.", "safe.example."},
+		[]string{"evil.example"},
+		[]string{"safe.example"},
+	)
+	testing.expect_value(t, outcome, Outcome.Cached)
+	free_all(context.temp_allocator)
+}
+
+/*
+Two CNAMEs at one owner name, the listed one second.
+
+A zone may not publish that (RFC 1034 section 3.6.2), which is the point: the
+answer comes from whoever runs the cloaked zone, and following only the first
+CNAME at each owner would let them put an innocent one in front of the tracker
+and have the walk end there while the tracker's address rides along in the same
+answer.
+*/
+@(test)
+test_a_decoy_cname_beside_the_listed_one_does_not_hide_it :: proc(t: ^testing.T) {
+	answer := make([]dns.Record, 3, context.temp_allocator)
+	answer[0] = dns.Record {
+		name  = "www.brand.example.",
+		type  = .CNAME,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_Name{name = "decoy.brand.example."},
+	}
+	answer[1] = dns.Record {
+		name  = "www.brand.example.",
+		type  = .CNAME,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_Name{name = "tracker.evil.example."},
+	}
+	answer[2] = dns.Record {
+		name  = "tracker.evil.example.",
+		type  = .A,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_A{addr = {203, 0, 113, 7}},
+	}
+	outcome := serve_cached_answer(
+		t,
+		"www.brand.example.",
+		chain_wire("www.brand.example.", answer),
+		[]string{"tracker.evil.example"},
+		nil,
+	)
+	testing.expect_value(t, outcome, Outcome.Blocked)
+	free_all(context.temp_allocator)
+}
+
+// The hop cap from the other side: a chain that never ends is answered rather
+// than walked forever.
+@(test)
+test_a_cname_chain_that_loops_is_still_answered :: proc(t: ^testing.T) {
+	outcome := serve_cached_chain(
+		t,
+		[]string{"a.example.", "b.example.", "a.example."},
+		[]string{"tracker.evil.example"},
+		nil,
+	)
+	testing.expect_value(t, outcome, Outcome.Cached)
+	free_all(context.temp_allocator)
+}
