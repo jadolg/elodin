@@ -201,9 +201,9 @@ about freshness - it is how long a client goes on believing this after an
 operator has changed their mind. A day would be the honest figure for `onion.`
 and be wrong the first time somebody turns `special_use.local` off to get their
 Active Directory domain back and finds their own clients still holding the
-NXDOMAIN. Ten minutes is short enough that a reload takes effect while the
-operator is still watching, and long enough that a chatty `.local` client is not
-asking every second.
+NXDOMAIN. Ten minutes is short enough that the restart which changes the setting
+takes effect while the operator is still watching, and long enough that a chatty
+`.local` client is not asking every second.
 */
 @(private)
 SPECIAL_USE_TTL :: 600
@@ -244,6 +244,44 @@ special_use_zone :: proc(s: ^Server, name: string) -> (zone: string, kind: Speci
 }
 
 /*
+Whether `name` is a reserved name this configuration has deliberately handed
+back to the upstream, and so must not be held to the public chain of trust.
+
+`special_use.onion: false` says the upstream is a Tor-aware resolver, and what
+such an upstream answers for a `.onion` name is unsigned - it can be nothing
+else, the root delegating no `onion.` for anybody to sign under. A validator
+walking down from the root asks for `onion. DS`, is shown an NSEC proving the
+name is not in the root zone at all, concludes from that that nothing is
+delegated there and the root's own keys still cover the subtree, and then meets
+an answer carrying no signature under them. That is Bogus, and the client gets
+SERVFAIL - so the one deployment this key exists for would get nothing out of
+it while `dnssec.enabled` stands, which it does by default.
+
+The same standing-down `is_locally_served` performs above, for the same reason
+and at the same price: the answer is served as insecure. Nothing reaches it
+unless an operator wrote the key down, and writing it down is the claim that
+makes it right.
+
+Which is also why there is no `covered_by_local_anchor` beside it. That test
+exists because the reverse-side bypass applies to every installation whether or
+not anybody asked for it, so a site that anchored its own reverse space needs a
+way to say it meant the opposite. This bypass is already the thing an operator
+asked for by name, and no anchor can be more deliberate than the key that turned
+it on - nor is there a plausible anchor to have configured, the root delegating
+no `onion.` for a DS to hang under.
+
+`local.` and `test.` get no such treatment, deliberately. They are forwarded by
+a default configuration rather than by a claim about the upstream, and a public
+upstream's NXDOMAIN for them really is signed by the root - bypassing the check
+would turn an answer this server can prove into one it merely repeats, for every
+installation rather than for one that asked.
+*/
+@(private)
+special_use_deferred :: proc(s: ^Server, name: string) -> bool {
+	return !s.cfg.special_use.onion && name_at_or_below(name, "onion.")
+}
+
+/*
 The answer for a name that is never forwarded.
 
 `localhost.` gets 127.0.0.1 for A and ::1 for AAAA (RFC 6761 section 6.3), and
@@ -262,7 +300,7 @@ forward.
 The answers themselves do not go in the cache. `cache.put` is there so an
 upstream need not be asked twice; these are built from a table already in
 memory, they can never go stale, and an entry would only spend the cache's
-budget to outlive the reload that was meant to change it.
+budget on the one kind of answer that cannot need it.
 */
 @(private)
 answer_special_use :: proc(

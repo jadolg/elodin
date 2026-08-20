@@ -1261,6 +1261,15 @@ to interoperate with Tor", so this is the adapted case the RFC leaves room for
 rather than a departure from it. It is warned about at startup, since the setting
 is a claim about the upstream and not about this resolver.
 
+What that upstream answers is unsigned, and cannot be anything else: the root
+publishes a signed proof that there is no `onion.` to delegate, so a validator
+reads a mapped address under it as unsigned data inside the root zone and calls
+it forgery. `onion: false` therefore also takes those names out of DNSSEC
+validation, exactly as the RFC 6303 reverse zones are — they come back as
+insecure, without the AD bit, rather than as SERVFAIL. Nothing else moves:
+validation is untouched for every other name, and for `.onion` too unless the
+key is written down.
+
 `localhost.` and `invalid.` have no key of their own, and are not going to grow
 one. Neither has a deployment that wants them forwarded — no upstream is
 authoritative for either, and RFC 6761 6.3 and 6.4 leave a resolver nothing to
