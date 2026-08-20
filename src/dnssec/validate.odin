@@ -308,12 +308,23 @@ stays is what was proven and what a client has a use for: the answer, the NSEC
 and NSEC3 records a denial rests on, and the SOA that denial is cached
 negatively against.
 
-The one real loss is a CNAME chain that ends in NODATA - a dual-stack client
-asking AAAA for an IPv4-only name is the everyday version of it. That reaches
-`Secure` through `validate_answer` on the strength of the CNAME alone, and the
-proof sitting in its authority section belongs to the target's zone, which
-nothing here ever established. So out it goes with the rest, and a downstream
-resolver falls back to its own idea of how long to remember the absence.
+The one real loss is a CNAME chain that ends in a denial - a dual-stack client
+asking AAAA for an IPv4-only name is the everyday version of it, and a CNAME
+pointing at a name that does not exist is the same shape with NXDOMAIN on it.
+Either reaches `Secure` through `validate_answer` on the strength of the CNAME
+alone, and the proof sitting in its authority section belongs to the target's
+zone, which nothing here ever established. So out it goes with the rest, SOA
+included, and a downstream resolver falls back to its own idea of how long to
+remember the absence.
+
+Our own cache falls back with it, and only on the NXDOMAIN half. `cache.put`
+picks its lifetime on `rcode == .NX_Domain || len(msg.answer) == 0`, so the
+NODATA one keeps its CNAME in the answer section and is held for the shortest
+TTL still there; the NXDOMAIN one takes the negative branch whatever its answer
+section holds, finds no SOA to read, and is held for `cache.negative_ttl`
+instead - longer than a zone asking for less would like, and not at all where an
+operator has set that to zero. Both are the same missing chain walk, and are
+fixed by the same one.
 
 Two ways not to lose it, and neither belongs here. Keeping the records and
 clearing AD instead is the one that looks free: it is not, because AD is a
@@ -353,8 +364,16 @@ strip_unauthenticated :: proc(
 	msg.authority = authenticated_only(msg.authority, result.authority, allocator)
 	msg.additional = opt_only(msg.additional, allocator)
 
-	encoded, _, enc := dns.encode_message(msg, allocator, limit)
-	if enc != .None {
+	/*
+	A truncated rebuild is a failure, not a result. `encode_message` drops
+	whatever no longer fits and says so in `truncated`; taking that as the
+	pruned message would hand the caller a response with records missing and
+	nothing to distinguish it from a complete one - and the caller's next act is
+	to set the AD bit over it. Failing instead leaves the original standing
+	without the bit, which is the same fallback an encode error already gets.
+	*/
+	encoded, truncated, enc := dns.encode_message(msg, allocator, limit)
+	if enc != .None || truncated {
 		return nil, false
 	}
 	return encoded, true
@@ -372,6 +391,16 @@ authenticated_only :: proc(section: []dns.Record, kept: []dns.Question, allocato
 			the sender chose and nobody checked - and an answer section holding
 			an RRSIG and nothing else is how a forged denial gets itself sent to
 			`validate_denial` in the first place.
+
+			Kept by what it covers rather than by having been the signature that
+			verified, which is the one thing here that goes out without having
+			been checked itself. Deliberate: a set part-way through an algorithm
+			rollover carries an RRSIG per algorithm, and a downstream validator
+			may implement only the other one, so keeping just the signature this
+			build happened to verify would fail exactly the client the records
+			are being kept for. A spurious signature asserts no data - the worst
+			it costs is a verification attempt a validator makes anyway, trying
+			each signature over the set in turn.
 			*/
 			rdata, is_raw := raw_rdata(rec)
 			if !is_raw {

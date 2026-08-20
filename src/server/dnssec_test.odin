@@ -251,9 +251,10 @@ test_ad_never_goes_out_over_records_the_verdict_missed :: proc(t: ^testing.T) {
 	on and the message goes into the cache for every later client to be given.
 
 	The DO client is the one to check, because it is the one whose message is
-	otherwise passed through byte for byte: `strip_dnssec_records` would have
-	taken the forgery below out of a non-DO client's copy by accident, being
-	interested in a different question entirely.
+	otherwise passed through byte for byte. Nothing else on this path would take
+	the forgery below out: `strip_dnssec_records` drops RRSIG, NSEC, NSEC3 and
+	NSEC3PARAM and hands on every other type it finds, so a forged NS and the
+	address to go with it walk straight through it.
 	*/
 	msg := signed_response()
 	authority := make([dynamic]dns.Record, 0, len(msg.authority) + 1, context.temp_allocator)
@@ -334,9 +335,12 @@ What the prune leaves behind still has to survive the two paths after it.
 
 `strip_dnssec_records` runs next for a client that never set DO, and this is the
 order they run in: the prune first, at full size, and the client's own trimming
-after. Getting that backwards would have taken the forgery out for the non-DO
-client by accident and left it in for the DO client, which is the one whose
-message is otherwise passed through byte for byte.
+after. It is the prune that takes the forgery out in both cases -
+`strip_dnssec_records` is interested in RRSIG, NSEC, NSEC3 and NSEC3PARAM and
+would pass a forged NS on untouched - so what this pins is that the second pass
+does not undo the first: it re-encodes the message from scratch, and a prune
+whose result it were handed the unpruned bytes for would put every dropped
+record back.
 */
 @(test)
 test_a_pruned_answer_survives_the_strip_for_a_client_without_do :: proc(t: ^testing.T) {
@@ -365,7 +369,7 @@ test_a_pruned_answer_survives_the_strip_for_a_client_without_do :: proc(t: ^test
 	testing.expect_value(t, derr, dns.Decode_Error.None)
 
 	// The answer the client asked for, with the DNSSEC records it did not ask
-	// for taken back out - and the forgery gone whichever procedure got to it.
+	// for taken back out - and the forged NS gone, which only the prune does.
 	testing.expect_value(t, len(decoded.answer), 1)
 	testing.expect_value(t, decoded.answer[0].type, dns.Type.A)
 	testing.expect_value(t, len(decoded.authority), 0)
@@ -580,6 +584,65 @@ test_a_pruned_answer_is_still_cached_and_served :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, hit.answer[0].type, dns.Type.CNAME)
 	testing.expect_value(t, len(hit.authority), 0)
+	free_all(context.temp_allocator)
+}
+
+/*
+The other half of that shape, where the answer section stops deciding.
+
+A CNAME pointing at a name that does not exist comes back NXDOMAIN with the
+CNAME still in the answer section, and `cache.put` reads the rcode first: the
+negative branch is taken whatever the answer holds. The prune has just removed
+the SOA that branch reads - it belongs to the target's zone, which the validator
+never established - so the lifetime falls back to `cache.negative_ttl`, and to
+nothing at all where an operator has set that to zero.
+
+Pinned as the cost it is, not as a property worth having. It is what this prune
+leaves behind until the denial at a CNAME target is validated properly, and the
+test is here so that changing it is a decision rather than an accident.
+*/
+@(test)
+test_a_pruned_nxdomain_after_a_cname_falls_back_to_the_configured_negative_ttl :: proc(t: ^testing.T) {
+	msg := cname_nodata_response()
+	msg.flags.rcode = u8(dns.Rcode.NX_Domain)
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	testing.expect_value(t, err, dns.Encode_Error.None)
+
+	covered := make([]dns.Question, 1, context.temp_allocator)
+	covered[0] = dns.Question {
+		name  = "www.example.com.",
+		type  = .CNAME,
+		class = .IN,
+	}
+	verdict := dnssec.Result {
+		status = .Secure,
+		answer = covered,
+	}
+
+	out := present_response(wire, aaaa_query(), .AAAA, verdict, context.temp_allocator)
+	decoded, derr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+	testing.expect_value(t, dns.rcode_of(decoded), dns.Rcode.NX_Domain)
+	testing.expect_value(t, len(decoded.authority), 0)
+
+	key_buf: [cache.KEY_MAX]u8
+	key := cache.make_key(key_buf[:], "www.example.com.", .AAAA, .IN, true, false)
+
+	// With a fallback configured the entry is kept - for that number, not for
+	// the one the zone's SOA asked for.
+	configured := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, negative_ttl = 300})
+	defer cache.destroy(configured)
+	testing.expect(t, cache.put(configured, key, out, decoded), "a pruned NXDOMAIN should still be cacheable")
+
+	// With none, there is nothing left to read a lifetime from and the entry is
+	// turned away. Every repeat of this question then goes upstream.
+	none := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, negative_ttl = 0})
+	defer cache.destroy(none)
+	testing.expect(
+		t,
+		!cache.put(none, key, out, decoded),
+		"cache.put found a lifetime for a pruned NXDOMAIN, so the comment above is out of date",
+	)
 	free_all(context.temp_allocator)
 }
 
