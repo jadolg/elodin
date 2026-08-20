@@ -309,8 +309,14 @@ advertise_udp_size :: proc(wire: []u8, size: u16, proto: Protocol) -> []u8 {
 }
 
 /*
-Whether the client asked with an EDNS Client Subnet option, and whether taking
-it back out is something this server can be sure it managed.
+Whether the client may have asked with an EDNS Client Subnet option, and whether
+taking it back out is something this server can be sure it managed.
+
+Read conservatively on purpose: "may have" is as much as the decoded message can
+say, and a caller that is going to refuse what it cannot strip wants the doubt
+rather than a clean-looking no. Every message this is asked about came out of
+`decode_message`, which gives an OPT record either an option list or the raw
+bytes it could not make one of - never nothing.
 
 The second answer exists because `remove_edns_option` works on the first OPT
 record and no more, while a message can arrive carrying two - one OPT record is
@@ -318,10 +324,21 @@ all RFC 6891 section 6.1.1 permits, but nothing here turns the rest away before
 this point. An ECS option hidden in a second OPT would survive a removal that
 reported success, so the caller has to be able to tell that case from a clean
 one, and the removal's own return value cannot see it.
+
+An OPT record whose RDATA the decoder could not walk is the other half of the
+same problem, and the more useful one to an attacker: `decode_record` keeps
+RDATA it cannot parse as raw bytes rather than rejecting the message, so an
+option list ending in three bytes of a fourth option header decodes to a record
+with no options at all. Read as "no subnet here" that forwards the client's ECS
+upstream untouched - the option is perfectly legible to the resolver on the
+other end, only not to this decoder. So an unreadable OPT reports a subnet that
+cannot be stripped, and the query stops, which is also what RFC 6891 section
+6.1.1 asks of RDATA that is not a well-formed option list.
 */
 @(private)
 client_subnet_sent :: proc(msg: dns.Message) -> (sent: bool, strippable: bool) {
 	opts := 0
+	readable := true
 	for rec in msg.additional {
 		if rec.type != .OPT {
 			continue
@@ -329,15 +346,18 @@ client_subnet_sent :: proc(msg: dns.Message) -> (sent: bool, strippable: bool) {
 		opts += 1
 		rdata, is_opt := rec.data.(dns.Rdata_OPT)
 		if !is_opt {
+			sent = true
+			readable = false
 			continue
 		}
 		for o in rdata.options {
 			if o.code == u16(dns.EDNS_Option_Code.Client_Subnet) {
 				sent = true
+				break
 			}
 		}
 	}
-	return sent, opts == 1
+	return sent, readable && opts == 1
 }
 
 @(private)
@@ -715,15 +735,16 @@ resolve_query :: proc(
 	*/
 	if ecs_sent, strippable := client_subnet_sent(msg); ecs_sent {
 		/*
-		A subnet in a second OPT record is answered rather than sent on, because
-		the strip below would report success and leave it standing. FORMERR
-		because that is what RFC 6891 section 6.1.1 already says about a query
-		with more than one OPT record, and this is where the first thing that
-		cares about it happens to look; not counted and not logged at warn, for
-		the reason the class and RD refusals above are not - a malformed query
-		is the client's own to fix, and a line an unauthenticated peer can print
-		once per datagram is not a line to write at that level. The query log
-		has it as `outcome=failed detail="ecs"`.
+		A subnet the strip cannot be trusted to reach - one in a second OPT
+		record, or one in an OPT whose RDATA this decoder could not walk - is
+		answered rather than sent on, because the strip below would report
+		success and leave it standing. FORMERR because that is what RFC 6891
+		section 6.1.1 already says about both of those messages, and this is
+		where the first thing that cares happens to look; not counted and not
+		logged at warn, for the reason the class and RD refusals above are not -
+		a malformed query is the client's own to fix, and a line an
+		unauthenticated peer can print once per datagram is not a line to write
+		at that level. The query log has it as `outcome=failed detail="ecs"`.
 		*/
 		if !strippable {
 			out, built := dns.error_response(query, msg, .Form_Err, allocator, limit)
