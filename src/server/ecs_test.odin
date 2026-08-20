@@ -439,3 +439,102 @@ test_a_client_subnet_does_not_survive_the_dnssec_rewrite :: proc(t: ^testing.T) 
 	testing.expect(t, !x.saw_ecs, "the DNSSEC rewrite carried the client's ECS option upstream")
 	free_all(context.temp_allocator)
 }
+
+// An OPT record carrying `n` ECS options at once, each naming a different /24.
+@(private = "file")
+ecs_opt_repeated :: proc(n: int) -> dns.Record {
+	options := make([]dns.EDNS_Option, n, context.temp_allocator)
+	for i in 0 ..< n {
+		payload := make([]u8, 8, context.temp_allocator)
+		payload[0], payload[1] = 0, 1 // FAMILY: IPv4
+		payload[2] = 24 // SOURCE PREFIX-LENGTH
+		payload[3] = 0 // SCOPE PREFIX-LENGTH
+		payload[4], payload[5], payload[6] = 198, 51, u8(100 + i)
+		options[i] = dns.EDNS_Option{code = u16(dns.EDNS_Option_Code.Client_Subnet), data = payload}
+	}
+	opt := dns.make_opt(1232, false)
+	opt.data = dns.Rdata_OPT{options = options}
+	return opt
+}
+
+/*
+The OPT record is not required to be the last thing in the additional section.
+
+RFC 6891 section 6.1.1 puts one OPT in the additional section and says nothing
+about where; a client is free to write it first and something else after it.
+`remove_edns_option` rewrites the record in place and has the rest of the
+section to carry past it, which is the part that would go wrong quietly - a
+strip that reported success while leaving the option, or one that truncated
+whatever followed.
+
+Pinned rather than left to the round trip because a query shaped like this is
+rare enough that no other test here builds one, and the failure it guards
+against is the client's subnet reaching the upstream after this server decided
+it had removed it.
+*/
+@(test)
+test_a_client_subnet_is_stripped_from_an_opt_that_is_not_last :: proc(t: ^testing.T) {
+	additional := make([]dns.Record, 2, context.temp_allocator)
+	additional[0] = ecs_opt({198, 51, 100, 0})
+	additional[1] = dns.Record {
+		name  = "extra.example.",
+		type  = .TXT,
+		class = .IN,
+		ttl   = 0,
+		data  = dns.Rdata_TXT{strings = nil},
+	}
+	wire := a_query("cdn.example.", additional)
+
+	decoded, derr := dns.decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+	sent, strippable := client_subnet_sent(decoded)
+	testing.expect(t, sent, "the subnet was not noticed at all")
+	testing.expect(t, strippable, "a single OPT record was reported unstrippable")
+
+	out, ok := dns.remove_edns_option(wire, .Client_Subnet, context.temp_allocator)
+	if !testing.expect(t, ok, "the strip failed on an OPT that is not last") {
+		return
+	}
+	after, aerr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, aerr, dns.Decode_Error.None)
+	_, survived := dns.find_edns_option(after, .Client_Subnet)
+	testing.expect(t, !survived, "the subnet survived the strip")
+	// The record that followed the OPT is still there and still readable.
+	testing.expect_value(t, len(after.additional), 2)
+	free_all(context.temp_allocator)
+}
+
+/*
+One OPT record may carry the option twice.
+
+Nothing in RFC 6891 section 6.1.2 stops a client repeating an option inside one
+OPT's RDATA, and `remove_edns_option` rebuilds that RDATA from the options it
+kept rather than cutting the first match out of it - so both copies go. The
+distinction worth pinning is against the neighbouring case: two ECS options in
+*one* OPT record are strippable and the query is forwarded, while two OPT
+*records* are not and the query is refused. A change that conflated the two
+would either leak a subnet or start refusing ordinary queries.
+*/
+@(test)
+test_a_repeated_client_subnet_in_one_opt_is_stripped_whole :: proc(t: ^testing.T) {
+	additional := make([]dns.Record, 1, context.temp_allocator)
+	additional[0] = ecs_opt_repeated(2)
+	wire := a_query("cdn.example.", additional)
+
+	decoded, derr := dns.decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+	sent, strippable := client_subnet_sent(decoded)
+	testing.expect(t, sent, "the repeated subnet was not noticed")
+	testing.expect(t, strippable, "one OPT record was reported unstrippable")
+
+	out, ok := dns.remove_edns_option(wire, .Client_Subnet, context.temp_allocator)
+	if !testing.expect(t, ok, "the strip failed on a repeated option") {
+		return
+	}
+	after, _ := dns.decode_message(out, context.temp_allocator)
+	_, survived := dns.find_edns_option(after, .Client_Subnet)
+	testing.expect(t, !survived, "a second copy of the subnet survived the strip")
+	still, _ := client_subnet_sent(after)
+	testing.expect(t, !still, "the stripped query still reports a subnet")
+	free_all(context.temp_allocator)
+}
