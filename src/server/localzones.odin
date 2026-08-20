@@ -163,8 +163,15 @@ reservation that exists to stop registries selling them.
 
 The three keys are not symmetric with each other either: `onion` is on and
 turning it off is a statement about the upstream, while `local` and `test` are
-off and turning them on is a statement about this network. Each default is the
-one that leaves a working installation working.
+off and turning them on is a statement about this network. Each default leaves
+an installation answering as it did before the table existed, which is the
+weaker claim it sounds like but is not: a site whose upstream really does serve
+`.local` is not necessarily *working* today, since with `dnssec.enabled` on -
+the default - that unsigned answer is checked against a root that publishes a
+signed proof there is no `local.` to delegate, and SERVFAIL is the likely
+verdict. Such a site has already turned validation off, or has not noticed. What
+the default guarantees is only that nothing here is what changed for them, and
+that turning `local` on is a decision rather than an upgrade.
 
 `local.` and `test.` are in the table only when `special_use.local` and
 `special_use.test` ask for them. RFC 6762 section 22 and RFC 6761 section 6.2

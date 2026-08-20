@@ -104,12 +104,10 @@ leak_server :: proc(t: ^testing.T, cfg: ^config.Config, name: string) -> (s: Ser
 	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
 		return {}, nil, false
 	}
-	// Most cases here expect nothing to arrive, and the mock thread is joined
-	// after `handle_query` has already returned - so this is dead time on every
-	// one of them rather than a bound on a real exchange. A query that did leak
-	// was sent before `handle_query` could return, so it is waiting in the
-	// socket by the time the mock looks: half a second is not a race, it is the
-	// pause before giving up on a datagram that was never sent.
+	// A bound on the exchange in the cases that expect one: the mock runs on its
+	// own thread there and has to see the query and answer it before the
+	// resolver's own `upstream.timeout` runs out. The cases that expect nothing
+	// do not wait this out - see `nothing_reached`.
 	_ = net.set_option(socket, .Receive_Timeout, 500 * time.Millisecond)
 	bound, _ := net.bound_endpoint(socket)
 
@@ -136,6 +134,26 @@ leak_server :: proc(t: ^testing.T, cfg: ^config.Config, name: string) -> (s: Ser
 		reply  = leak_reply(name),
 	}
 	return Server{cfg = cfg, group = group}, x, true
+}
+
+/*
+Whether the upstream was left alone, asked once `handle_query` has returned.
+
+No second thread and no waiting for one. A query this server forwards is written
+to the socket before the call can return - the send is what it then waits on an
+answer for - so if anything leaked it is already sitting in the receive buffer by
+the time this looks, and the case that leaks nothing pays a few milliseconds
+rather than a whole timeout. That is most of the cases here, and the concurrent
+mock is kept only where an answer has to come back.
+
+Not zero milliseconds: `SO_RCVTIMEO` reads zero as "no timeout", which on a
+socket nothing is going to send to is the one value that hangs.
+*/
+@(private = "file")
+nothing_reached :: proc(x: ^Leak_Mock) -> bool {
+	_ = net.set_option(x.socket, .Receive_Timeout, 20 * time.Millisecond)
+	serve_leak(x)
+	return !x.asked
 }
 
 @(private = "file")
@@ -199,12 +217,15 @@ test_special_use_names_are_not_sent_to_the_upstream :: proc(t: ^testing.T) {
 		defer net.close(x.socket)
 		defer upstream.destroy_group(s.group)
 
-		mock := thread.create_and_start_with_poly_data(x, serve_leak)
 		out, outcome, ok := handle_query(&s, leak_query(c.name, c.type), .UDP, "127.0.0.1:5555", context.temp_allocator)
-		thread.join(mock)
-		thread.destroy(mock)
 
-		testing.expectf(t, !x.asked, "%s was sent to the public upstream, which asked for %q", c.name, x.name)
+		testing.expectf(
+			t,
+			nothing_reached(x),
+			"%s was sent to the public upstream, which asked for %q",
+			c.name,
+			x.name,
+		)
 		if !testing.expectf(t, ok, "%s went unanswered", c.name) {
 			continue
 		}

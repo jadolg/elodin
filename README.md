@@ -572,6 +572,16 @@ _dns.resolver.arpa ... did not validate: Bogus`. A `rewrites` rule for the name
 still wins, for an operator who does want to advertise this server's own DoT or
 DoH endpoints.
 
+`special_use.onion: false` stands validation down the same way, on the forward
+side. That key says the upstream is a Tor-aware resolver, and what such an
+upstream answers for a `.onion` name cannot be signed — the root publishes a
+signed proof that there is no `onion.` to delegate — so validating it would
+turn every `.onion` lookup into SERVFAIL. Those names are served insecure,
+without the AD bit, exactly as the reverse zones above are. It is the only other
+place validation is skipped, it applies to nothing but `onion.`, and it is off
+until an operator writes the key down; see [Names that are never
+forwarded](#names-that-are-never-forwarded).
+
 Two things worth knowing about running with it on:
 
 - **Distribution crypto policy can take algorithms away.** Fedora and RHEL ship
@@ -1008,10 +1018,18 @@ says, which is a rebinding primitive given away for free.
 the same handling. They are the two reserved names that networks really do serve
 — an Active Directory domain under `.local` older than the reservation, an
 internal `.test` zone that RFC 6761 explicitly permits — and answering them with
-NXDOMAIN on an upgrade would take a working network's own hostnames away. Turn
-them on if nothing here serves them; against a public upstream the only thing
-that changes is that the NXDOMAIN arrives without the round trip and without the
-hostname having left the building.
+NXDOMAIN on an upgrade would take those hostnames away from a network that had
+them. Turn them on if nothing here serves them; against a public upstream the
+only thing that changes is that the NXDOMAIN arrives without the round trip and
+without the hostname having left the building.
+
+Note that such a site may not have working `.local` names in the first place.
+With `dnssec.enabled` on — the default — the unsigned answer its upstream gives
+is checked against a root that publishes a signed proof there is no `local.` to
+delegate, and SERVFAIL is the likely verdict; the sites this default protects
+are the ones running with validation off. If `.local` is SERVFAILing for you,
+`local: true` at least turns that into a clean NXDOMAIN, and a `rewrites` rule
+turns it into an answer.
 
 A rewrite outranks all of this, since `rewrites` are matched first: a site that
 knows what its own `.local` names resolve to can say so and keep that answer.
