@@ -268,6 +268,26 @@ scan_ttl_offsets :: proc(msg: []u8, allocator := context.allocator) -> (offsets:
 	total += int(u16(msg[8]) << 8 | u16(msg[9]))
 	total += int(u16(msg[10]) << 8 | u16(msg[11]))
 
+	/*
+	Counts that cannot possibly fit are refused before `total` is spent as a
+	capacity: a question needs at least 5 bytes on the wire and a record at
+	least 11 - a root name plus the fixed fields - which is the same arithmetic
+	`decode_message` makes, for the same reason.
+
+	It used to be enough that the decoder made it. The only caller that reached
+	here with somebody else's bytes was `cache.put`, and `resolve_query` decodes
+	a response before it offers it, so a datagram with impossible counts was
+	turned away one step earlier. `cap_ttls` walks a response before anything
+	has decoded it, so without this a 17-byte reply claiming three sections of
+	65535 records has this allocate 1.5 MB for a walk that then fails on the
+	first name - once per query, out of the per-request arena, which keeps the
+	block it grew to.
+	*/
+	remaining := len(msg) - HEADER_SIZE
+	if qdcount * 5 + total * 11 > remaining {
+		return nil, false
+	}
+
 	pos := HEADER_SIZE
 	for _ in 0 ..< qdcount {
 		pos = skip_name(msg, pos) or_return
