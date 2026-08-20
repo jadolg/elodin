@@ -406,9 +406,12 @@ authenticated_only :: proc(section: []dns.Record, kept: []dns.Question, allocato
 	if len(kept) == 0 {
 		return nil
 	}
+	// One count per authenticated RRset, for the cap below.
+	sigs_kept := make([]int, len(kept), allocator)
 	out := make([dynamic]dns.Record, 0, len(section), allocator)
 	for rec in section {
 		covered := rec.type
+		signer: string
 		if rec.type == .RRSIG {
 			/*
 			An RRSIG rides on the RRset it covers. Nothing signs an RRSIG (RFC
@@ -418,14 +421,28 @@ authenticated_only :: proc(section: []dns.Record, kept: []dns.Question, allocato
 			`validate_denial` in the first place.
 
 			Kept by what it covers rather than by having been the signature that
-			verified, which is the one thing here that goes out without having
-			been checked itself. Deliberate: a set part-way through an algorithm
-			rollover carries an RRSIG per algorithm, and a downstream validator
-			may implement only the other one, so keeping just the signature this
+			verified. Deliberate: a set part-way through an algorithm rollover
+			carries an RRSIG per algorithm, and a downstream validator may
+			implement only the other one, so keeping just the signature this
 			build happened to verify would fail exactly the client the records
-			are being kept for. A spurious signature asserts no data - the worst
-			it costs is a verification attempt a validator makes anyway, trying
-			each signature over the set in turn.
+			are being kept for.
+
+			That leaves the only records here that go out unchecked, so the two
+			things that can be said about a signature without verifying it are
+			said. Its signer must lie in the owner's ancestry - the same rule
+			`check_signature` applies, and a zone may only sign what is inside
+			it - and no more than `MAX_SIGNATURES_PER_RRSET` are kept for one
+			RRset, which is already the number the validator will try.
+
+			Without those, an attacker who can add records appends as many bogus
+			RRSIGs at an authenticated owner and type as it likes: every one
+			matched what it claimed to cover, survived the prune, went out under
+			the AD bit, and was stored for every later client. That is an
+			unauthenticated RRset in the answer section under AD, which is the
+			condition this whole procedure exists to remove. It also gives a
+			downstream validator running a per-fetch verification budget - BIND's
+			`max-validations-per-fetch`, say - a way to be pushed into SERVFAIL
+			on an answer this server stamped as authenticated.
 			*/
 			rdata, is_raw := raw_rdata(rec)
 			if !is_raw {
@@ -436,15 +453,40 @@ authenticated_only :: proc(section: []dns.Record, kept: []dns.Question, allocato
 				continue
 			}
 			covered = sig.type_covered
+			signer = sig.signer
 		}
-		if !authenticated_rrset(kept, rec.name, covered, rec.class) {
+		idx, ok := authenticated_rrset(kept, rec.name, covered, rec.class)
+		if !ok {
 			continue
+		}
+		if rec.type == .RRSIG {
+			if !name_in_zone(rec.name, signer) {
+				continue
+			}
+			if sigs_kept[idx] >= MAX_SIGNATURES_PER_RRSET {
+				continue
+			}
+			sigs_kept[idx] += 1
 		}
 		append(&out, rec)
 	}
 	return out[:]
 }
 
+/*
+The additional section keeps its OPT record and nothing else.
+
+Nothing else in it was authenticated, and there is no second copy of the answer
+to serve the clients that would rather have the unauthenticated version: the
+cache key tells DO and CD apart and nothing else, so one message is what every
+client behind this resolver gets.
+
+What that costs is the address records a responder sends beside an HTTPS, SVCB,
+SRV, MX or NS answer (RFC 9460 section 5) - a client loses them and pays a round
+trip to look them up. Filed as #189, which is where a way to keep the signed ones
+belongs; it needs the answer's own RRsets checked in the additional section
+rather than a change here.
+*/
 @(private)
 opt_only :: proc(section: []dns.Record, allocator: mem.Allocator) -> []dns.Record {
 	out := make([dynamic]dns.Record, 0, 1, allocator)
@@ -460,13 +502,21 @@ opt_only :: proc(section: []dns.Record, allocator: mem.Allocator) -> []dns.Recor
 // some other class carries neither the name nor the type it appears to, and an
 // RRset is only ever checked in the class it was checked in.
 @(private)
-authenticated_rrset :: proc(kept: []dns.Question, name: string, type: dns.Type, class: dns.Class) -> bool {
-	for q in kept {
+authenticated_rrset :: proc(
+	kept: []dns.Question,
+	name: string,
+	type: dns.Type,
+	class: dns.Class,
+) -> (
+	index: int,
+	found: bool,
+) {
+	for q, i in kept {
 		if q.type == type && q.class == class && dns.name_equal_fold(q.name, name) {
-			return true
+			return i, true
 		}
 	}
-	return false
+	return 0, false
 }
 
 @(private)
