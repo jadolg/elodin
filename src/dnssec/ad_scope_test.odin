@@ -432,6 +432,43 @@ test_forgeries_ahead_of_the_real_signature_do_not_evict_it :: proc(t: ^testing.T
 	free_all(context.temp_allocator)
 }
 
+/*
+A forgery built from the genuine signature beside it.
+
+Everything an RRSIG carries except the signature itself is public - the signer
+is a name, the key tag and algorithm come out of the zone's DNSKEY set, and the
+validity window is in the real record. So a forgery copies all of it and changes
+only the bytes it cannot produce, which is what a cheap pre-check cannot tell
+apart and what any cap therefore has to survive.
+
+Built from `real` for exactly that reason. An earlier version of this wrote a
+key tag of its own, which matched no key in the zone - so `signature_worth_trying`
+rejected every one of them for free, `spend_verification` was never called, and
+the test passed while touching none of the code it names.
+*/
+@(private = "file")
+forged_like :: proc(real: dns.Record) -> dns.Record {
+	rdata, is_raw := real.data.(dns.Rdata_Raw)
+	if !is_raw {
+		panic("the record to copy is not raw RDATA")
+	}
+	out := make([]u8, len(rdata.data), context.temp_allocator)
+	copy(out, rdata.data)
+	// Only the signature bytes differ, and only in the last few: the signature
+	// begins after the fixed fields and the signer name, and flipping the tail
+	// is enough to make it not verify.
+	for i in max(0, len(out) - 8) ..< len(out) {
+		out[i] ~= 0xff
+	}
+	return dns.Record {
+		name = real.name,
+		type = .RRSIG,
+		class = real.class,
+		ttl = real.ttl,
+		data = dns.Rdata_Raw{data = out},
+	}
+}
+
 @(private = "file")
 forged_denial_rrsig :: proc(owner: string, signer: string) -> dns.Record {
 	rdata := make([dynamic]u8, 0, 64, context.temp_allocator)
@@ -455,21 +492,31 @@ forged_denial_rrsig :: proc(owner: string, signer: string) -> dns.Record {
 }
 
 /*
-Forgeries ahead of the real signature do not starve the verdict either.
+Junk in front of a real signature costs nothing, so it cannot starve anything.
 
-The other half of the same shape, one layer down. A denial's signature is only
-tried when its signer names the zone, but the signer is a name in the RDATA and
-anyone able to add records can write it - so eight RRSIGs naming `cloudflare.com`
-placed ahead of the genuine one spent a per-RRset attempt allowance before it
-was reached. The RRset was dropped, `validate_denial` found no proof, and every
-NXDOMAIN and NODATA in the zone came back SERVFAIL.
+This is the half of the starvation problem that is actually solvable, and the
+one that used to break a zone: a signature was tried whenever its signer named
+the zone, and the signer is a name in the RDATA. Eight RRSIGs naming
+`cloudflare.com` in front of the genuine one therefore spent a per-RRset
+allowance before it was reached, the RRset was dropped, and every NXDOMAIN in
+the zone came back SERVFAIL.
 
-Bounded across the question instead, so junk in front of a real signature is
-paid for out of a budget the whole message shares rather than out of the one
-thing that had to be reached.
+They cost nothing now: their key tag names no key the zone published, so
+`signature_worth_trying` refuses them without touching the budget.
+
+What this does *not* claim is that no forgery can drain it. One that copies the
+genuine signature's key tag, algorithm and validity window - all public - buys a
+real verification apiece, and enough of them in front of the real signature will
+exhaust the budget and turn the answer Bogus. That is not fixable by tuning the
+number: the attacker chooses the order and the count, so any budget spent in
+section order can be spent before the record that matters. It is also not a
+capability worth much, since anyone able to rewrite a response that far can deny
+the answer outright by corrupting it or dropping it. What the budget buys is
+that the work stays bounded, which is what `test_copies_of_the_real_signature_do_not_inherit_its_exemption`
+holds on the other side of the same problem.
 */
 @(test)
-test_forged_signatures_do_not_starve_the_denial :: proc(t: ^testing.T) {
+test_free_rejectable_forgeries_do_not_touch_the_budget :: proc(t: ^testing.T) {
 	v := make_validator(ad_query, nil, Options{})
 	defer destroy_validator(v)
 
@@ -478,8 +525,8 @@ test_forged_signatures_do_not_starve_the_denial :: proc(t: ^testing.T) {
 		return
 	}
 
-	// Signed by the zone itself this time, so the validator cannot skip them
-	// without trying: exactly the signatures a per-RRset cap counted.
+	// Signed by the zone itself, so the signer test cannot skip them - but with a
+	// key tag the zone never published, so the free reject can.
 	authority := make([dynamic]dns.Record, 0, len(msg.authority) + 8, context.temp_allocator)
 	planted := false
 	for rec in msg.authority {
@@ -505,9 +552,83 @@ test_forged_signatures_do_not_starve_the_denial :: proc(t: ^testing.T) {
 	testing.expectf(
 		t,
 		result.status == .Secure,
-		"eight forged signatures in front of the real one turned a good denial into %v (%s)",
+		"eight free-rejectable forgeries in front of the real one turned a good denial into %v (%s)",
 		result.status,
 		result.reason,
 	)
+	free_all(context.temp_allocator)
+}
+
+/*
+Copies of the genuine signature do not take its exemption with them.
+
+The prune keeps the record that verified whatever else it drops, so that a cap
+can never evict the one thing the answer rests on. That exemption was first
+keyed on the key tag and algorithm - both of which are printed in the zone's
+DNSKEY set - so a forgery copied them and took the exemption too, the cap never
+fired, and an answer padded with hundreds of them went out under AD and into the
+cache for every downstream validator to work through on each hit.
+
+Keyed on the signature bytes now: the one field of an RRSIG that cannot be
+copied from public data and still be the record that verified.
+*/
+@(test)
+test_copies_of_the_real_signature_do_not_inherit_its_exemption :: proc(t: ^testing.T) {
+	v := make_validator(ad_query, nil, Options{})
+	defer destroy_validator(v)
+
+	msg, derr := dns.decode_message(ad_unhex(ad_fixture("example_a").wire), context.temp_allocator)
+	if !testing.expect(t, derr == .None, "the fixture did not decode") {
+		return
+	}
+
+	answer := make([dynamic]dns.Record, 0, len(msg.answer) + 40, context.temp_allocator)
+	append(&answer, ..msg.answer)
+	planted := 0
+	for rec in msg.answer {
+		if rec.type != .RRSIG {
+			continue
+		}
+		for _ in 0 ..< 40 {
+			append(&answer, forged_like(rec))
+			planted += 1
+		}
+		break
+	}
+	if !testing.expect(t, planted == 40, "the fixture carried no RRSIG to copy") {
+		return
+	}
+	msg.answer = answer[:]
+
+	tampered, _, enc := dns.encode_message(msg, context.temp_allocator, dns.MAX_MESSAGE)
+	testing.expect_value(t, enc, dns.Encode_Error.None)
+
+	result := validate(v, "www.example.com.", .A, tampered, time.unix(FIXTURE_TIME, 0))
+	if !testing.expectf(t, result.status == .Secure, "the verdict did not survive (%v)", result.status) {
+		return
+	}
+
+	out, ok := strip_unauthenticated(tampered, result, context.temp_allocator, dns.MAX_MESSAGE)
+	if !testing.expect(t, ok, "the pruned response should rebuild") {
+		return
+	}
+	pruned, perr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, perr, dns.Decode_Error.None)
+
+	sigs := 0
+	for rec in pruned.answer {
+		if rec.type == .RRSIG {
+			sigs += 1
+		}
+	}
+	testing.expectf(
+		t,
+		sigs <= MAX_SIGNATURES_PER_RRSET + 1,
+		"%d signatures survived: forgeries copying the real tag and algorithm took the exemption",
+		sigs,
+	)
+	// And the one that matters is still there.
+	after := validate(v, "www.example.com.", .A, out, time.unix(FIXTURE_TIME, 0))
+	testing.expectf(t, after.status == .Secure, "the pruned answer no longer validates (%v)", after.status)
 	free_all(context.temp_allocator)
 }

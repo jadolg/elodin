@@ -1110,7 +1110,7 @@ downgrade_status :: proc(zone_status: Status) -> Status {
 
 	records, sigs := unsupported_rrset(ZONE, keys[0])
 	budget := Budget{}
-	status, _, _, _, _, _ := validate_rrset(
+	status, _, _, _, _ := validate_rrset(
 		v,
 		&budget,
 		ZONE,
