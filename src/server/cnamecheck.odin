@@ -118,15 +118,21 @@ client cannot read either, in an answer that otherwise parsed.
 /*
 What the walk concluded about an answer.
 
-`Unwalkable` is kept apart from `Listed` because the two are different things to
-an operator: one names a rule they wrote, the other says the answer was too long
-to check and there is no rule to point at. Both withhold the answer.
+The three are kept apart because they are three different things to an operator:
+one names a rule they wrote, one says the answer was too long to check, and one
+says a record in it could not be read. All three withhold the answer, and an
+operator whose site broke needs to know which - being sent to look for a
+seventeen-name chain that does not exist is worse than being told nothing.
+
+Stored in the cache as the byte behind them, so a remembered refusal still says
+which of the three it was.
 */
 @(private)
 Cloak_Verdict :: enum u8 {
 	Clear,
 	Listed,
 	Unwalkable,
+	Unreadable,
 }
 
 @(private)
@@ -194,7 +200,14 @@ cloaked_chain_target :: proc(
 			}
 			v, is_name := r.data.(dns.Rdata_Name)
 			if !is_name {
-				return "", .Unwalkable
+				// A name already matched is the better thing to report: it is
+				// the same answer either way, and one of the two has a rule
+				// behind it that an operator can go and look at. Same
+				// preference as the budget's, below.
+				if target != "" {
+					return target, .Listed
+				}
+				return "", .Unreadable
 			}
 			/*
 			Every CNAME at this owner is walked, not just the first. A name may
@@ -342,6 +355,13 @@ refuse_cloaked :: proc(
 			client,
 			MAX_CHAIN_NAMES,
 		)
+	} else if verdict == .Unreadable {
+		logx.debugf(
+			"%s %s from %s redirects onto a name this server could not read, so where it leads could not be checked; withheld",
+			dns.type_name(q.type),
+			dns.name_trim_root(q.name),
+			client,
+		)
 	} else if target == "" {
 		/*
 		A refusal the cache remembered, which records that the answer redirects
@@ -366,7 +386,15 @@ refuse_cloaked :: proc(
 		)
 	}
 	out := build_block_response(s, msg, q, allocator, limit)
-	log_query(s, client, proto, q, .Blocked, "cname" if verdict == .Listed else "cname-deep", started)
+	detail := "cname"
+	switch verdict {
+	case .Unwalkable:
+		detail = "cname-deep"
+	case .Unreadable:
+		detail = "cname-unreadable"
+	case .Clear, .Listed:
+	}
+	log_query(s, client, proto, q, .Blocked, detail, started)
 	return out
 }
 

@@ -159,7 +159,7 @@ engine_swap :: proc(e: ^Engine, block, allow: ^Set) -> (old_block, old_allow: ^S
 	defer sync.rw_mutex_unlock(&e.mu)
 	old_block, old_allow = e.block, e.allow
 	e.block, e.allow = block, allow
-	e.generation += 1
+	sync.atomic_store(&e.generation, e.generation + 1)
 	e.stats.block_rules = block.count if block != nil else 0
 	e.stats.allow_rules = allow.count if allow != nil else 0
 	return
@@ -177,9 +177,20 @@ engine_generation :: proc(e: ^Engine) -> u64 {
 	if e == nil {
 		return 0
 	}
-	sync.rw_mutex_shared_lock(&e.mu)
-	defer sync.rw_mutex_shared_unlock(&e.mu)
-	return e.generation
+	/*
+	Read without the lock, which the write side makes safe: `generation` is only
+	ever moved inside `engine_swap`, under the exclusive lock, by one store. So
+	an atomic load sees either the number before that store or the number after
+	it, which is exactly what the shared lock guaranteed and is all a caller
+	needs - the stamp it then writes is compared for equality, never ordered
+	against another reader's.
+
+	Worth the paragraph because this is on the hot path: it runs once per query
+	on top of the shared lock `engine_match` takes for the question and one more
+	per name in the chain, and it was a second lock round trip for a number that
+	changes when a list is reloaded and at no other time.
+	*/
+	return sync.atomic_load(&e.generation)
 }
 
 /*

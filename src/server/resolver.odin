@@ -658,13 +658,18 @@ resolve_query :: proc(
 	*/
 	if walking && !have_decoded {
 		/*
-		A stale copy is a better answer than SERVFAIL here, exactly as it is when
-		the upstream did not answer at all: it is something this server already
-		knows, and it goes through the walk on the way out rather than round it.
+		No stale fallback, deliberately, and it had one for a round.
+
+		The rule for that is set out where the upstream fails, above: expired
+		data covers an outage, and only a failure to get an answer at all counts
+		as one. This is not an outage. The upstream answered, and this server
+		refused what it said - the same shape as the DNSSEC verdict below, which
+		returns without reaching for `stale_hit` for the same reason. Serving
+		expired data over a refusal reaches past a verdict rather than covering
+		anything, and it tells the operator the wrong story besides: `detail=stale`
+		and a climbing `elodin_cache_stale_total` say the upstream is down while
+		it is answering perfectly well.
 		*/
-		if stale_hit.wire != nil {
-			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, allocator)
-		}
 		sync.atomic_add(&s.stats.failed, 1)
 		out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
 		log_query(s, client, proto, q, .Failed, "answer-unreadable", started)
@@ -747,10 +752,10 @@ resolve_query :: proc(
 /*
 A hit as `resolve_query` found it.
 
-Carried as one value because these six travel together from `cache.get` to
+Carried as one value because these seven travel together from `cache.get` to
 whichever of the three places ends up serving them, and because what has to be
 done with them - re-match the chain, then put the stamp back on the entry the
-bytes came out of - needs all six at once.
+bytes came out of - needs all seven at once.
 */
 @(private)
 Cached_Answer :: struct {
@@ -764,7 +769,8 @@ Cached_Answer :: struct {
 	stale:   bool,
 	recheck: bool,
 	// What the last walk decided, as a `Cloak_Verdict`, when `recheck` says that
-	// decision is current.
+	// decision is current. Stored as the byte the cache keeps rather than the
+	// enum, which is the caller's type and not the cache's.
 	refused: u8,
 	// The rule sets the re-match is made against, and the number stamped on the
 	// entry when it comes back clean.
