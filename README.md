@@ -1478,6 +1478,14 @@ hot path. It is bounded by `cache.max_bytes` as well as `cache.max_entries`,
 because an entry's size is decided by whoever answered the query: see
 [Resource use](#resource-use).
 
+The TTLs it writes are bounded at both ends, and both ends reach the client:
+`cache.min_ttl` as a floor and `cache.max_ttl` as a ceiling, on the answer that
+goes out as well as on how long the entry is kept — so a record cannot be pinned
+in a downstream cache for longer than this one would hold it. A TTL arriving
+with its top bit set is taken as zero, per RFC 2181 section 8, which also makes
+the answer uncacheable; that one applies to forwarded answers too, cache or no
+cache.
+
 ## Capacity
 
 Everything below comes out of `mise run bench`, against a mock upstream held at

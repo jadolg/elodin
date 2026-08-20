@@ -710,6 +710,46 @@ resolve_query :: proc(
 	}
 
 	/*
+	The TTLs bounded once, here, so the client's copy and the entry's are the
+	same bytes.
+
+	RFC 2181 section 8 is not a setting and runs whatever the cache is doing: a
+	TTL with the top bit set becomes zero, which makes the answer uncacheable
+	below - `effective` works out at zero - and tells the client to come back
+	rather than to hold the record for sixty-eight years. Doing it in
+	`cache.put` alone would leave the forwarded copy carrying the hostile figure
+	to the client that caused the fetch, and with `cache.enabled: false` would
+	leave every answer carrying it.
+
+	The ceiling is the cache's `max_ttl`, and `ttl_ceiling` reports no ceiling
+	when there is no cache, since the setting is then not in play at all. An
+	answer forwarded on a miss is the same answer the next client is handed out
+	of the entry it just filled, so bounding one and not the other would make
+	the client that caused the fetch the one client the setting never reaches.
+	This is the reading dnsmasq's `--max-ttl` has always had: the maximum TTL
+	handed out to clients.
+
+	`min_ttl` deliberately stays where it is, on the copies `cache.get` serves.
+	A ceiling can only shorten what a client is told, which is safe wherever it
+	is applied; the floor lengthens it, and it is honest on the way out of the
+	cache because the entry really is being held that long. Applied here it
+	would stretch the TTL of an answer that may not be kept at all - the cache
+	can be off, and `put` refuses plenty of what it is handed.
+
+	Above the decode below, not below it, so that `decoded` is a reading of the
+	bytes as they now stand. The cache derives an entry's lifetime and its
+	`redirects` flag from that decode while storing `resp` itself; bounding the
+	wire afterwards would leave the two disagreeing about the same answer, with
+	the entry outliving what its own bytes tell a client.
+
+	After the rebinding refusal, not before it. An answer that refusal turns
+	back is replaced wholesale, so bounding its TTLs first is work done on bytes
+	nobody is handed - and `rebind.odin` reads the answer section, not the TTLs,
+	so nothing it decides changes by waiting.
+	*/
+	_ = dns.cap_ttls(resp, cache.ttl_ceiling(s.answers), allocator)
+
+	/*
 	Decoded once for the two things below that both need it: the chain walk reads
 	the answer section, and the cache reads the whole message. Decoding for each
 	of them separately meant a second full pass over every forwarded response,

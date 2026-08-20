@@ -356,16 +356,91 @@ peek_udp_size :: proc(msg: []u8) -> u16 {
 	return MAX_UDP_SIZE
 }
 
+/*
+The largest TTL a message may carry.
+
+The field is 32 bits wide on the wire, but RFC 2181 section 8 narrows the value
+to an unsigned 31-bit number: the top bit is not part of it. Doubles as the "no
+ceiling" argument to `cap_ttls`, since no TTL that has been through `sane_ttl`
+is above it.
+*/
+TTL_MAX :: u32(0x7fff_ffff)
+
+/*
+A TTL as this server is willing to read it, per RFC 2181 section 8:
+
+	Implementations should treat TTL values received with the most significant
+	bit set as if the entire value received was zero.
+
+Zero rather than the low 31 bits, which is what the RFC asks for and is the only
+reading that is safe to act on anyway. A sender that sets the top bit is either
+getting the field wrong or nailing the record into every cache below it for the
+life of the machine - 2^31 seconds is sixty-eight years - and nothing else in
+the message tells the two apart. Zero says "use this for the query in hand and
+come back", which is the right answer to both.
+
+Applied where a TTL is acted on rather than in `decode_message`, which goes on
+reporting the field as it stands: a decoded message is also what the DNSSEC
+validator and the query log read, and those want to see what arrived.
+*/
+sane_ttl :: proc(v: u32) -> u32 {
+	return 0 if v > TTL_MAX else v
+}
+
 read_ttls :: proc(msg: []u8, offsets: []int, allocator := context.allocator) -> []u32 {
 	ttls := make([]u32, len(offsets), allocator)
 	for off, i in offsets {
-		ttls[i] =
+		ttls[i] = sane_ttl(
 			u32(msg[off]) << 24 |
 			u32(msg[off + 1]) << 16 |
 			u32(msg[off + 2]) << 8 |
-			u32(msg[off + 3])
+			u32(msg[off + 3]),
+		)
 	}
 	return ttls
+}
+
+/*
+Bound every TTL a message carries, on the wire, in place.
+
+For the answers that never pass through the cache - a miss is forwarded to the
+client from the upstream's own bytes, and with `cache.enabled: false` no answer
+passes through it at all. The cache bounds the copies it serves by bounding what
+it stores (see `cache.put`), and that leaves the copy the client gets on the very
+miss that filled the entry, which is the one that carries the upstream's figure
+untouched.
+
+Walks the message itself rather than taking offsets from the caller: the one
+caller that has already scanned is the cache, and it has its own reason to hold
+the offsets. `false` when the message cannot be walked, in which case nothing
+was written - the same messages `scan_ttl_offsets` refuses, which are not ones
+this server goes on to send.
+*/
+cap_ttls :: proc(msg: []u8, ceiling: u32, allocator := context.allocator) -> bool {
+	offsets, ok := scan_ttl_offsets(msg, allocator)
+	if !ok {
+		return false
+	}
+	defer delete(offsets, allocator)
+	for off in offsets {
+		if off + 4 > len(msg) {
+			break
+		}
+		v := min(
+			sane_ttl(
+				u32(msg[off]) << 24 |
+				u32(msg[off + 1]) << 16 |
+				u32(msg[off + 2]) << 8 |
+				u32(msg[off + 3]),
+			),
+			ceiling,
+		)
+		msg[off] = u8(v >> 24)
+		msg[off + 1] = u8(v >> 16)
+		msg[off + 2] = u8(v >> 8)
+		msg[off + 3] = u8(v)
+	}
+	return true
 }
 
 // Rewrites each TTL to `original - elapsed`, floored at `floor_ttl`.
