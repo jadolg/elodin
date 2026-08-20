@@ -450,7 +450,9 @@ window is real - `get` increments under the lock and releases it, and the
 caller's decode and walk happen before the correction lands, so a scrape falling
 between the two sees the higher figure and the next sees the lower. It would
 discard the accumulated rate for the series every time an answer was withheld.
-Both numbers now only ever rise, and `hits - withheld` is what was served.
+Both numbers now only ever rise. Not that `hits - withheld` is what was served,
+though: a withheld stale lend is counted here and was counted a miss by `get`,
+so the subtraction is only exact where `serve_stale` is off.
 
 Counted for a stale lend as well as a fresh hit, and those were counted a miss
 by `get` rather than a hit - which is right either way, because what this counts

@@ -758,3 +758,80 @@ test_a_cloaked_answer_is_fetched_from_the_upstream_only_once :: proc(t: ^testing
 	testing.expect_value(t, second, Outcome.Blocked)
 	free_all(context.temp_allocator)
 }
+
+/*
+A refused answer does not take the upstream's AD bit into the cache with it.
+
+The bytes are stored so a later reload has something to walk, and a reload that
+clears the name serves them. If the upstream's AD bit went in with them, that
+later answer would carry this server's assurance that it validated something it
+never looked at - which is what clearing the bit before the store is for, and
+which the refused branch quietly did not do when it was added.
+
+Driven with DNSSEC off, so `validating` is false and the bit must be cleared on
+every stored answer, refused or not.
+*/
+@(test)
+test_a_refused_answer_is_not_cached_with_the_upstream_ad_bit :: proc(t: ^testing.T) {
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+		return
+	}
+	defer net.close(socket)
+	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+	bound, _ := net.bound_endpoint(socket)
+
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
+	defer cache.destroy(answers)
+
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.cache.enabled = true
+	cfg.dnssec.enabled = false
+	cfg.blocking.enabled = true
+	cfg.upstream.strategy = .Failover
+	cfg.upstream.attempts = 1
+	cfg.upstream.timeout = 3 * time.Second
+	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
+	servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port}
+	cfg.upstream.servers = servers
+
+	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+		return
+	}
+	defer upstream.destroy_group(group)
+
+	engine := filter.engine_make()
+	defer filter.engine_destroy(engine)
+	block := filter.set_make()
+	allow := filter.set_make()
+	filter.set_add(block, "tracker.evil.example", {.Apex, .Subdomains})
+	filter.engine_swap(engine, block, allow)
+
+	s := Server{cfg = &cfg, group = group, filters = engine, answers = answers}
+
+	// The upstream claims the answer is authenticated.
+	reply := cloak_reply("www.brand.example.", "tracker.evil.example.")
+	reply[3] |= 0x20
+
+	x := Cloak_Mock{socket = socket, reply = reply}
+	mock := thread.create_and_start_with_poly_data(&x, serve_cloak)
+	_, outcome, _ := handle_query(&s, cloak_query("www.brand.example."), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	thread.join(mock)
+	thread.destroy(mock)
+	testing.expect_value(t, outcome, Outcome.Blocked)
+
+	key_buf: [cache.KEY_MAX]u8
+	key := cache.make_key(key_buf[:], "www.brand.example.", .A, .IN, false, false)
+	entry, found := answers.entries[key]
+	if !testing.expect(t, found, "the refused answer was not stored, so nothing can re-walk it later") {
+		return
+	}
+	testing.expect(
+		t,
+		entry.wire[3] & 0x20 == 0,
+		"the stored answer kept the upstream's AD bit, which a later reload would serve under our name",
+	)
+	free_all(context.temp_allocator)
+}

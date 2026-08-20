@@ -657,6 +657,14 @@ resolve_query :: proc(
 	unchecked.
 	*/
 	if walking && !have_decoded {
+		/*
+		A stale copy is a better answer than SERVFAIL here, exactly as it is when
+		the upstream did not answer at all: it is something this server already
+		knows, and it goes through the walk on the way out rather than round it.
+		*/
+		if stale_hit.wire != nil {
+			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, allocator)
+		}
 		sync.atomic_add(&s.stats.failed, 1)
 		out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
 		log_query(s, client, proto, q, .Failed, "answer-unreadable", started)
@@ -685,6 +693,26 @@ resolve_query :: proc(
 	everything this can decide is to withhold an answer the validator was willing
 	to pass.
 	*/
+	/*
+	Settled here, above everything that might store these bytes, rather than
+	beside one of the stores.
+
+	`validating` is recomputed for every request and can be turned off after the
+	key is built - the upstream query failing to rebuild does exactly that - so
+	nothing otherwise ties the AD bit an entry carries to whether that entry was
+	ever validated. A later request that does validate reads the stored bit as a
+	verdict of ours and hands the upstream's claim to a client under our name.
+
+	It lived next to the ordinary store until a second store was added below it,
+	for an answer refused as cloaked, and quietly did not get it: that entry went
+	in carrying the upstream's bit, and a reload that cleared the name later
+	served it with the bit intact. One statement above both is what stops the
+	third one being written without it.
+	*/
+	if !validating {
+		set_ad_bit(resp, false)
+	}
+
 	if have_decoded {
 		if out, verdict := block_cloaked_answer(
 			s,
@@ -705,20 +733,6 @@ resolve_query :: proc(
 	}
 
 	if s.cfg.cache.enabled && have_decoded {
-		/*
-		Settled before the entry goes in, rather than only on the way out to this
-		client.
-
-		`validating` is recomputed for every request and can be turned off after
-		the key is built - the upstream query failing to rebuild does exactly
-		that - so nothing otherwise ties the AD bit an entry carries to whether
-		that entry was ever validated. A later request that does validate reads
-		the stored bit as a verdict of ours and hands the upstream's claim to a
-		client under our name.
-		*/
-		if !validating {
-			set_ad_bit(resp, false)
-		}
 		cache.put(s.answers, key, resp, decoded, generation)
 	}
 
