@@ -696,5 +696,42 @@ test_rebind_allow_domains_will_not_take_the_root :: proc(t: ^testing.T) {
 	if testing.expect(t, has, "the root was accepted as an exempt domain") {
 		testing.expect(t, strings.contains(e.messages[0], "rebind.allow_domains"))
 	}
+
+	// A bare star is the root written the other way, and means the same thing.
+	star := "upstream:\n  servers: [1.1.1.1]\nrebind:\n  allow_domains: [\"*\"]\n"
+	_, serr := load_string(star, context.temp_allocator)
+	_, star_has := serr.?
+	testing.expect(t, star_has, "a bare * was accepted as an exempt domain")
+	free_all(context.temp_allocator)
+}
+
+/*
+A wildcard is refused rather than kept, because keeping it matches nothing.
+
+`rewrites` in the same file does take `*.lab`, so an operator who has written one
+there writes one here - and `canonical_domain` would hold it as `*.corp.example.`,
+which no name a client asks for is ever at or below. The entry would sit in the
+configuration looking like the fix while every internal name went on answering
+NODATA, which is precisely the failure `allow_domains` exists to end. The error
+names the zone to write instead.
+*/
+@(test)
+test_rebind_allow_domains_will_not_take_a_wildcard :: proc(t: ^testing.T) {
+	src := "upstream:\n  servers: [1.1.1.1]\nrebind:\n  allow_domains: [\"*.corp.example\"]\n"
+	_, err := load_string(src, context.temp_allocator)
+	e, has := err.?
+	if testing.expect(t, has, "a wildcard was accepted as an exempt domain, and would match nothing") {
+		testing.expect(t, strings.contains(e.messages[0], "rebind.allow_domains"))
+		testing.expect(t, strings.contains(e.messages[0], "corp.example"))
+	}
+
+	// And the plain zone, which is what it should have said, still loads and
+	// still covers everything below itself.
+	ok_src := "upstream:\n  servers: [1.1.1.1]\nrebind:\n  allow_domains: [corp.example]\n"
+	cfg, oerr := load_string(ok_src, context.temp_allocator)
+	testing.expect(t, oerr == nil)
+	if testing.expect_value(t, len(cfg.rebind.allow_domains), 1) {
+		testing.expect_value(t, cfg.rebind.allow_domains[0], "corp.example.")
+	}
 	free_all(context.temp_allocator)
 }

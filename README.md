@@ -1129,9 +1129,11 @@ counter, a query-log line — and the attack it prevents is silent.
   ```
 
   Each entry covers itself and everything below it, the way
-  `--rebind-domain-ok=/corp.example/` does in dnsmasq. Matching is against the
-  name that was asked for, not the owner name of the offending record, so a CNAME
-  from an attacker's name into an exempt zone exempts nothing.
+  `--rebind-domain-ok=/corp.example/` does in dnsmasq — so write the zone rather
+  than a wildcard, and a `*.corp.example` copied from [`rewrites`](#rewrites) is
+  refused at load rather than kept as an entry that matches nothing. Matching is
+  against the name that was asked for, not the owner name of the offending
+  record, so a CNAME from an attacker's name into an exempt zone exempts nothing.
 
 - **Names that legitimately resolve to loopback**, such as a development host
   pointed at `127.0.0.1` by a public zone. `allow_loopback: true` covers all of
