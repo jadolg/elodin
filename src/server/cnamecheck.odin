@@ -44,6 +44,14 @@ seventeen-name chain that does not exist is worse than being told nothing.
 Stored in the cache as the byte behind them, so a remembered refusal still says
 which of the three it was.
 */
+@(private)
+Cloak_Verdict :: enum u8 {
+	Clear,
+	Listed,
+	Unwalkable,
+	Unreadable,
+}
+
 /*
 What outcome a verdict is reported under.
 
@@ -57,12 +65,35 @@ cloak_outcome :: proc(verdict: Cloak_Verdict) -> Outcome {
 	return .Failed if verdict == .Unreadable else .Blocked
 }
 
+/*
+Whether a verdict is one to remember against the stored answer.
+
+`Listed` and `Unwalkable` are stable facts about an answer somebody built - a
+name is on a list, a chain is seventeen long - and re-deriving them on every hit
+is the cost that made a cloaked name the most expensive kind to serve. Those are
+worth keeping.
+
+`Unreadable` is not a fact about anything stable. It is the case the SERVFAIL was
+chosen for, an upstream or a middlebox having a bad day, and keeping it turns
+that bad minute into a bad day: the entry answers SERVFAIL until it expires with
+the upstream never asked again, and a reload cannot release it because the
+re-walk reads the same bytes and reaches the same verdict.
+
+Asked here rather than written out at each site that persists a verdict, because
+writing it out is how the two sites came to disagree: the forwarding path was
+taught this and the cache's own recheck was not, so an answer that went in clean
+and turned unreadable on a later walk was pinned exactly as before. A third site
+should have to answer this question rather than remember to.
+*/
 @(private)
-Cloak_Verdict :: enum u8 {
-	Clear,
-	Listed,
-	Unwalkable,
-	Unreadable,
+cloak_verdict_worth_keeping :: proc(verdict: Cloak_Verdict) -> bool {
+	switch verdict {
+	case .Listed, .Unwalkable:
+		return true
+	case .Clear, .Unreadable:
+		return false
+	}
+	return false
 }
 
 /*

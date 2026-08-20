@@ -1315,3 +1315,117 @@ test_an_unreadable_refusal_does_not_outlive_the_answer_that_caused_it :: proc(t:
 	testing.expectf(t, second != .Failed, "the name stayed broken after a good answer was available (outcome=%v)", second)
 	free_all(context.temp_allocator)
 }
+
+/*
+An entry that turns unreadable on a *later* walk is dropped, not pinned.
+
+The sibling test covers the forwarding path: an answer that is unreadable the
+first time it is seen is never stored. This is the way in that the sibling
+misses, and it is the one that took a round to find - the entry goes in clean,
+and only a later walk reaches the verdict.
+
+It goes in clean because the question was allowlisted when it was stored, so the
+walk returned before looking at any record. The operator then removes that rule
+and reloads; the re-walk now reads the malformed CNAME and returns `Unreadable`.
+Stamping that verdict onto the entry would pin the name to SERVFAIL until it
+expired, with the upstream never asked again - the same outcome the forwarding
+path declines to create, reached from the other side.
+*/
+@(test)
+test_an_entry_that_turns_unreadable_on_a_later_walk_is_dropped :: proc(t: ^testing.T) {
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+		return
+	}
+	defer net.close(socket)
+	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+	bound, _ := net.bound_endpoint(socket)
+
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.cache.enabled = true
+	cfg.dnssec.enabled = false
+	cfg.blocking.enabled = true
+	cfg.upstream.strategy = .Failover
+	cfg.upstream.attempts = 1
+	cfg.upstream.timeout = 3 * time.Second
+	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
+	servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port}
+	cfg.upstream.servers = servers
+
+	answers := cache.make_cache(
+		cache.Options {
+			max_entries = 8,
+			max_ttl = cfg.cache.max_ttl,
+			min_ttl = cfg.cache.min_ttl,
+			negative_ttl = cfg.cache.negative_ttl,
+		},
+	)
+	defer cache.destroy(answers)
+
+	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+		return
+	}
+	defer upstream.destroy_group(group)
+
+	engine := filter.engine_make()
+	defer filter.engine_destroy(engine)
+	// The question is allowlisted, so the first walk returns before reading any
+	// record and the answer is stored clean.
+	block1 := filter.set_make()
+	allow1 := filter.set_make()
+	filter.set_add(allow1, "www.brand.example", {.Apex, .Subdomains})
+	filter.engine_swap(engine, block1, allow1)
+
+	srv := Server{cfg = &cfg, group = group, filters = engine, answers = answers}
+
+	// A CNAME whose RDATA is a pointer past the end of the message.
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question{name = "www.brand.example.", type = .A, class = .IN}
+	skeleton := dns.Message{question = question}
+	skeleton.flags.qr = true
+	skeleton.flags.rd = true
+	skeleton.flags.ra = true
+	base, _, enc := dns.encode_message(skeleton, context.temp_allocator)
+	if !testing.expect(t, enc == .None, "could not build the fixture") {
+		return
+	}
+	bad := make([dynamic]u8, 0, len(base) + 32, context.temp_allocator)
+	append(&bad, ..base)
+	bad[7] = 1
+	for label in ([]string{"www", "brand", "example"}) {
+		append(&bad, u8(len(label)))
+		append(&bad, ..transmute([]u8)label)
+	}
+	append(&bad, 0)
+	append(&bad, 0, 5, 0, 1, 0, 0, 0, 60, 0, 2, 0xc0, 0xfe)
+
+	x := Cloak_Mock{socket = socket, reply = bad[:]}
+	mock := thread.create_and_start_with_poly_data(&x, serve_cloak)
+	_, first, _ := handle_query(&srv, cloak_query("www.brand.example."), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	thread.join(mock)
+	thread.destroy(mock)
+	// Allowlisted, so it was served and stored rather than refused.
+	testing.expect_value(t, first, Outcome.Forwarded)
+
+	// The operator drops the allow rule and reloads.
+	ob, oa := filter.engine_swap(engine, filter.set_make(), filter.set_make())
+	filter.set_destroy(ob)
+	filter.set_destroy(oa)
+
+	// The re-walk now reaches the malformed record: refused, and the entry goes.
+	_, second, _ := handle_query(&srv, cloak_query("www.brand.example."), .UDP, "127.0.0.2:5555", context.temp_allocator)
+	testing.expect_value(t, second, Outcome.Failed)
+
+	// The upstream stops sending the malformed record. It must be asked again.
+	y := Cloak_Mock{socket = socket, reply = cloak_reply("www.brand.example.", "good.brand.example.")}
+	mock2 := thread.create_and_start_with_poly_data(&y, serve_cloak)
+	_, third, _ := handle_query(&srv, cloak_query("www.brand.example."), .UDP, "127.0.0.3:5555", context.temp_allocator)
+	thread.join(mock2)
+	thread.destroy(mock2)
+
+	testing.expect(t, y.asked, "the upstream was never re-asked: the parse failure was pinned onto the entry")
+	testing.expectf(t, third != .Failed, "the name stayed broken after a good answer was available (outcome=%v)", third)
+	free_all(context.temp_allocator)
+}

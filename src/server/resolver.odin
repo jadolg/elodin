@@ -805,7 +805,7 @@ resolve_query :: proc(
 			whole-message version of this - `answer-unreadable` above - already
 			does.
 			*/
-			if s.cfg.cache.enabled && have_decoded && verdict != .Unreadable {
+			if s.cfg.cache.enabled && have_decoded && cloak_verdict_worth_keeping(verdict) {
 				cache.put(s.answers, key, resp, decoded, generation, u8(verdict))
 			}
 			return out, cloak_outcome(verdict), true
@@ -957,7 +957,25 @@ serve_from_cache :: proc(
 				started,
 				allocator,
 			); verdict != .Clear {
-				cache.note_checked(s.answers, hit.key, hit.serial, hit.checked, u8(verdict))
+				/*
+				A verdict not worth keeping takes the entry with it. Stamping it
+				would pin the name until the entry expired - the forwarding path
+				declines to store one for that reason, and this path reaches the
+				same verdict from bytes that are already stored, so the only way
+				to decline it here is to drop them.
+
+				An entry can arrive at this branch having gone in clean: stored
+				while the question was allowlisted, or with a listed name at the
+				same owner scanned before the malformed one. The rule changes,
+				the re-walk reaches the record this decoder cannot read, and
+				without this the answer is pinned to SERVFAIL from then on with
+				the upstream never asked again.
+				*/
+				if cloak_verdict_worth_keeping(verdict) {
+					cache.note_checked(s.answers, hit.key, hit.serial, hit.checked, u8(verdict))
+				} else {
+					cache.forget(s.answers, hit.key, hit.serial)
+				}
 				cache.note_withheld(s.answers)
 				return out, cloak_outcome(verdict), true
 			}
