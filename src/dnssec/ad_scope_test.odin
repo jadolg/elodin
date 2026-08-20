@@ -161,6 +161,59 @@ test_unsigned_authority_records_do_not_reach_the_client :: proc(t: ^testing.T) {
 }
 
 /*
+A denial has to be claimed as well as implied by the chain.
+
+The pair with `chain_shape`: that one says the chain stopped short, this one says
+the sender is asserting there is nothing more. Both are needed, and finding out
+why cost a regression - a DNAME redirection is a chain that stops short and is
+not a denial at all, so refusing AD on the shape alone took the bit off every one
+of them.
+
+This is the one place on this path that reads fields the sender writes, and
+deliberately: what is guarded against is a false denial going out under our AD
+bit, so a sender that claims no denial has made nothing to guard against.
+Deleting the claim removes the harm rather than hiding it.
+*/
+@(test)
+test_denial_claimed_reads_the_assertion :: proc(t: ^testing.T) {
+	soa := dns.Record {
+		name  = "other.example.",
+		type  = .SOA,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_Raw{data = make([]u8, 4, context.temp_allocator)},
+	}
+	nsec3 := dns.Record {
+		name  = "brand.example.",
+		type  = .NSEC3,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_Raw{data = make([]u8, 4, context.temp_allocator)},
+	}
+
+	// NODATA: NOERROR with an SOA behind it.
+	testing.expect(t, denial_claimed(dns.Message{authority = []dns.Record{soa}}), "an SOA claims a NODATA")
+
+	// NXDOMAIN, with the authority section deleted. The rcode cannot be removed
+	// by sending less, only set - and setting it is the claim.
+	stripped := dns.Message{}
+	stripped.flags.rcode = u8(dns.Rcode.NX_Domain)
+	testing.expect(t, denial_claimed(stripped), "NXDOMAIN claims a denial whatever else was dropped")
+
+	// A bare redirection claims nothing: the client follows the chain.
+	testing.expect(t, !denial_claimed(dns.Message{}), "a bare chain claims no denial")
+
+	// A wildcard-expansion proof is not a claim of denial either - it stands
+	// beside an answer rather than against one, and carries no SOA.
+	testing.expect(
+		t,
+		!denial_claimed(dns.Message{authority = []dns.Record{nsec3}}),
+		"an NSEC3 with no SOA is a wildcard proof, not a denial",
+	)
+	free_all(context.temp_allocator)
+}
+
+/*
 The same forgery on a denial, where more has to be kept.
 
 An NXDOMAIN is proven by the NSEC or NSEC3 records in its authority section,
@@ -795,30 +848,25 @@ test_a_near_copy_does_not_evict_the_record_that_verified :: proc(t: ^testing.T) 
 }
 
 /*
-What counts as a denial the answer section only leads up to.
+What the chain does with the question, and what it must not be talked out of.
 
-The predicate behind the `Insecure` verdict for a chain that ends without the
-type asked for. Worth testing on its own: the shape it recognises is the
-commonest lookup on a dual-stack network - AAAA for a name whose CNAME leads
-somewhere with only an A record - and getting it wrong in either direction is
-costly. Too eager and ordinary signed answers stop carrying AD; too shy and an
-unchecked denial goes out under it.
+`chain_shape` decides whether the AD bit may go out over an answer whose chain
+stops short of the type asked for, so it is worth testing on its own. Five
+earlier attempts at this question consulted something the sender writes - an SOA
+in the authority section, an NSEC, the rcode - and each was defeated either by
+adding a record or by deleting one. This consults the chain and nothing else.
+
+The cases below are the ones those attempts got wrong, kept as the record of
+what the predicate has to survive.
 */
 @(test)
-test_denial_after_chain_recognises_the_shape :: proc(t: ^testing.T) {
+test_chain_shape_reads_only_the_chain :: proc(t: ^testing.T) {
 	cname := dns.Record {
 		name  = "www.brand.example.",
 		type  = .CNAME,
 		class = .IN,
 		ttl   = 60,
 		data  = dns.Rdata_Name{name = "target.other.example."},
-	}
-	soa := dns.Record {
-		name  = "other.example.",
-		type  = .SOA,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_Raw{data = make([]u8, 4, context.temp_allocator)},
 	}
 	aaaa := dns.Record {
 		name  = "target.other.example.",
@@ -828,96 +876,87 @@ test_denial_after_chain_recognises_the_shape :: proc(t: ^testing.T) {
 		data  = dns.Rdata_AAAA{addr = {}},
 	}
 
-	// A chain that stops short of the type, with a denial behind it.
-	chain_only := dns.Message {
-		answer    = []dns.Record{cname},
-		authority = []dns.Record{soa},
-	}
-	testing.expect(
+	// The chain reaches the type: an answer, and AD may cover it.
+	testing.expect_value(
 		t,
-		denial_after_chain(chain_only, .AAAA, .IN),
-		"a chain ending without the type, with an SOA behind it, is a denial",
+		chain_shape([]dns.Record{cname, aaaa}, "www.brand.example.", .AAAA, .IN),
+		Answer_Shape.Direct,
 	)
 
-	// The same chain that does reach the type is not.
-	answered := dns.Message {
-		answer    = []dns.Record{cname, aaaa},
-		authority = []dns.Record{soa},
-	}
-	testing.expect(
+	// The chain stops short: a redirection, and whatever explains the missing
+	// type was never checked.
+	testing.expect_value(
 		t,
-		!denial_after_chain(answered, .AAAA, .IN),
-		"a chain that reaches the type asked for is not a denial",
-	)
-
-	// No denial claimed at all: a bare chain is one the client follows itself.
-	bare := dns.Message {
-		answer = []dns.Record{cname},
-	}
-	testing.expect(t, !denial_after_chain(bare, .AAAA, .IN), "a bare chain claims no denial")
-
-	/*
-	NXDOMAIN with the authority section deleted.
-
-	The shape the first version of this missed: it asked whether the sender had
-	put denial records in the message, which the sender can simply not do. Flip
-	the rcode, drop the section, and an authenticated NXDOMAIN went out with
-	nothing behind it. The rcode is the half that cannot be deleted.
-	*/
-	stripped := dns.Message {
-		answer = []dns.Record{cname},
-	}
-	stripped.flags.rcode = u8(dns.Rcode.NX_Domain)
-	testing.expect(
-		t,
-		denial_after_chain(stripped, .AAAA, .IN),
-		"an NXDOMAIN with no authority records is still a denial claimed",
+		chain_shape([]dns.Record{cname}, "www.brand.example.", .AAAA, .IN),
+		Answer_Shape.Chain_Only,
 	)
 
 	/*
-	A wildcard-expanded answer is not a denial, and its proof is not one either.
+	An unrelated record of the right type does not answer the question.
 
-	RFC 4035 section 3.1.3 has an NSEC or NSEC3 travel beside a wildcard-expanded
-	answer to show the expansion was allowed. That is a proof *for* the answer,
-	and `validate_wildcard_proof` is about to check it - so reading it as a
-	denial refused a legitimately signed answer its AD bit and returned before
-	the code that would have confirmed it ever ran. An SOA is what marks a
-	NODATA (RFC 2308 section 2.2), and there is none here.
+	A predicate that scanned the whole section for the type stopped here: an
+	attacker with a signed zone appends `x.evil.example. A`, every RRset
+	verifies, and the guard was talked out of firing by a record with nothing to
+	do with the name asked about.
 	*/
-	wildcard_proof := dns.Message {
-		answer    = []dns.Record{cname},
-		authority = []dns.Record {
-			{
-				name = "brand.example.",
-				type = .NSEC3,
-				class = .IN,
-				ttl = 60,
-				data = dns.Rdata_Raw{data = make([]u8, 4, context.temp_allocator)},
-			},
-		},
+	unrelated := dns.Record {
+		name  = "x.evil.example.",
+		type  = .AAAA,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_AAAA{addr = {}},
 	}
-	testing.expect(
+	testing.expect_value(
 		t,
-		!denial_after_chain(wildcard_proof, .AAAA, .IN),
-		"an NSEC3 with no SOA beside it is a wildcard proof, not a denial",
+		chain_shape([]dns.Record{cname, unrelated}, "www.brand.example.", .AAAA, .IN),
+		Answer_Shape.Chain_Only,
+	)
+
+	/*
+	Deleting records does not make the answer look more complete.
+
+	The other direction, and the one an on-path attacker reaches for: strip the
+	AAAA and its signature, strip the authority section, and a predicate that
+	asked whether a denial had been *claimed* saw nothing to object to. The chain
+	still stops short, which is all this asks.
+	*/
+	testing.expect_value(
+		t,
+		chain_shape([]dns.Record{cname}, "www.brand.example.", .AAAA, .IN),
+		Answer_Shape.Chain_Only,
+	)
+
+	// Nothing addressing the question at all.
+	testing.expect_value(
+		t,
+		chain_shape([]dns.Record{unrelated}, "www.brand.example.", .AAAA, .IN),
+		Answer_Shape.None,
 	)
 
 	// A CNAME or ANY question is answered by the chain itself.
-	testing.expect(t, !denial_after_chain(chain_only, .CNAME, .IN), "a CNAME question is answered by the chain")
-	testing.expect(t, !denial_after_chain(chain_only, .ANY, .IN), "an ANY question is answered by the chain")
-
-	// The class is part of it: a record of another class answers nothing.
-	other_class := dns.Message {
-		answer    = []dns.Record {
-			cname,
-			{name = "target.other.example.", type = .AAAA, class = .CH, ttl = 60, data = dns.Rdata_AAAA{}},
-		},
-		authority = []dns.Record{soa},
-	}
-	testing.expect(
+	testing.expect_value(
 		t,
-		denial_after_chain(other_class, .AAAA, .IN),
-		"a record of another class does not answer the question",
+		chain_shape([]dns.Record{cname}, "www.brand.example.", .CNAME, .IN),
+		Answer_Shape.Direct,
+	)
+	testing.expect_value(
+		t,
+		chain_shape([]dns.Record{cname}, "www.brand.example.", .ANY, .IN),
+		Answer_Shape.Direct,
+	)
+
+	// Class is part of the question.
+	other_class := dns.Record {
+		name  = "target.other.example.",
+		type  = .AAAA,
+		class = .CH,
+		ttl   = 60,
+		data  = dns.Rdata_AAAA{addr = {}},
+	}
+	testing.expect_value(
+		t,
+		chain_shape([]dns.Record{cname, other_class}, "www.brand.example.", .AAAA, .IN),
+		Answer_Shape.Chain_Only,
 	)
 	free_all(context.temp_allocator)
 }

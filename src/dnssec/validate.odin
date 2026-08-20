@@ -546,43 +546,21 @@ strip_unauthenticated :: proc(
 }
 
 /*
-Whether the response is really a denial that the answer section only leads up to.
+Whether the response asserts that there is nothing more to be had.
 
-Two things have to hold. The chain has to stop short of the type asked for -
-`CNAME` and `ANY` are answered by the chain itself, so neither is this shape -
-and the sender has to be claiming a denial rather than simply handing over a
-chain for the client to follow.
+NXDOMAIN says the name is not there; NOERROR with an SOA in the authority
+section is what RFC 2308 section 2.2 makes a NODATA. Anything else - a bare
+chain, a referral - asserts nothing, and a sender asserting nothing has made no
+claim for this server to put its name to.
 
-That second half is where the first attempt at this went wrong. It asked whether
-the authority section held an SOA, an NSEC or an NSEC3, which is a question
-about records the sender writes: flip the rcode to NXDOMAIN, *delete* the
-authority section, and the guard did not fire - so the answer stayed `Secure`,
-the prune cut it down to the CNAME, and the client read an authenticated
-NXDOMAIN that nothing proved. A guard an attacker turns off by sending less is
-a guard against honest responders only.
-
-The rcode is the other way a denial is claimed and it cannot be dropped, only
-set - and setting it is what makes this fire. So the shapes are: NXDOMAIN,
-whatever the authority section holds or does not hold; or NOERROR with an SOA
-behind it, which is what RFC 2308 section 2.2 makes a NODATA.
-
-An SOA specifically, not any NSEC or NSEC3, and that is the other correction. A
-wildcard-expanded answer carries the NSEC or NSEC3 that RFC 4035 section 3.1.3
-requires beside it to show the expansion was allowed - a proof *for* the answer,
-not against it, and one `validate_wildcard_proof` is about to check. Treating
-that as a denial refused a legitimately signed answer its AD bit and never
-reached the code that would have confirmed it.
+This is the one place on this path that reads fields the sender writes, and it
+is the right place for it: what is guarded against is a false denial reaching a
+client under our AD bit, so deleting the claim removes the harm rather than
+hiding it. The client then sees a redirection and goes and asks the target
+itself.
 */
 @(private)
-denial_after_chain :: proc(msg: dns.Message, qtype: dns.Type, class: dns.Class) -> bool {
-	if qtype == .CNAME || qtype == .ANY {
-		return false
-	}
-	for rec in msg.answer {
-		if rec.type == qtype && rec.class == class {
-			return false
-		}
-	}
+denial_claimed :: proc(msg: dns.Message) -> bool {
 	if dns.rcode_of(msg) == .NX_Domain {
 		return true
 	}
@@ -592,6 +570,71 @@ denial_after_chain :: proc(msg: dns.Message, qtype: dns.Type, class: dns.Class) 
 		}
 	}
 	return false
+}
+
+/*
+What the answer section does with the question, as the chain sees it.
+
+`answers_question` folded two different outcomes into one `true`: a record of
+the type asked for, and a CNAME chain that stopped short of it. The second is
+not an answer - it is a redirection, and whatever explains the missing type
+lives in the authority section at a zone this path never walked to. Keeping them
+apart is what lets the caller stamp AD on the first and decline to on the
+second.
+*/
+@(private)
+Answer_Shape :: enum u8 {
+	// Nothing here concerns the question.
+	None,
+	// A record of the type asked for was reached.
+	Direct,
+	// A CNAME chain that ran out before the type was reached.
+	Chain_Only,
+}
+
+/*
+Follow the chain from `qname` and report where it ended up.
+
+The walk is the only thing consulted, and that is the point. Scanning the whole
+section for any record of the type is not the same test and was a way to get
+this wrong: an attacker with a signed zone of its own appends
+`x.evil.example. A`, which has nothing to do with the question, and a scan sees
+the type and stops asking.
+*/
+@(private)
+chain_shape :: proc(
+	records: []dns.Record,
+	qname: string,
+	qtype: dns.Type,
+	class: dns.Class,
+) -> Answer_Shape {
+	name := qname
+	hops := 0
+	for hops < MAX_CNAME_CHAIN {
+		target := ""
+		for r in records {
+			if r.class != class || !dns.name_equal_fold(r.name, name) {
+				continue
+			}
+			if r.type == qtype || qtype == .ANY {
+				return .Direct
+			}
+			if r.type == .CNAME {
+				if v, is_name := r.data.(dns.Rdata_Name); is_name {
+					target = v.name
+				}
+			}
+		}
+		if target == "" {
+			// Nothing further to follow. Whether this concerns the question at
+			// all comes down to having got here by a CNAME the queried name owns.
+			return .Chain_Only if hops > 0 else .None
+		}
+		name = target
+		hops += 1
+	}
+	// A chain this long is a loop or a stall, and either way proves nothing.
+	return .None
 }
 
 @(private)
@@ -860,7 +903,8 @@ validate_answer :: proc(
 	and a stub would read an authenticated answer holding nothing for the name
 	it asked about - a denial of existence that was never proven.
 	*/
-	if worst == .Secure && !answers_question(msg.answer, qname, qtype, class) {
+	shape := chain_shape(msg.answer, qname, qtype, class)
+	if worst == .Secure && shape == .None {
 		return {status = .Bogus, reason = "answer does not address the question"}
 	}
 
@@ -874,32 +918,6 @@ validate_answer :: proc(
 	the answer it stands behind, and a client that validates for itself needs it
 	to reach the same conclusion.
 	*/
-	/*
-	A chain that ends without the type asked for is a denial, and this path did
-	not check it.
-
-	The everyday shape is an AAAA lookup for a name whose CNAME leads somewhere
-	with only an A record: the CNAME verifies, `answers_question` is satisfied by
-	the chain, and the verdict is `Secure` - reached entirely from the answer
-	section. What says the target really has no AAAA is the SOA and the NSEC or
-	NSEC3 in the *authority* section, at the target's zone, which nothing here
-	walked to.
-
-	Serving that as `Secure` was wrong twice over. The prune keeps only what the
-	verdict names, so the proof was stripped; and the AD bit went out over what
-	was left. A downstream resolver that validates for itself then has an
-	authenticated denial with nothing behind it, which it refuses - so a common
-	lookup on any dual-stack network turns into SERVFAIL one hop down.
-
-	Answered `Insecure` instead, which is the honest description: this server has
-	no opinion on the denial. Nothing is pruned, so the proof reaches the client
-	intact and it can check it, and no AD bit claims otherwise. Checking it here
-	means walking to the target's zone, which is #186.
-	*/
-	if worst == .Secure && denial_after_chain(msg, qtype, class) {
-		return {status = .Insecure, reason = "denial after a cname was not checked"}
-	}
-
 	proved: []Authenticated_Set
 	if worst == .Secure && wildcard_seen {
 		proof, records := validate_wildcard_proof(v, budget, msg, qname, class, unix, now, allocator)
@@ -907,6 +925,40 @@ validate_answer :: proc(
 			return {status = proof, reason = "wildcard expansion not proven"}
 		}
 		proved = records
+	}
+
+	/*
+	A chain that ends without the type asked for, where the sender is claiming
+	there is nothing more, is a denial this path did not check.
+
+	The everyday shape is an AAAA lookup for a name whose CNAME leads somewhere
+	with only an A record: the CNAME verifies, the chain concerns the question,
+	and the verdict is `Secure` - reached entirely from the answer section. What
+	says the target really has no AAAA lives in the *authority* section, at the
+	target's zone, which nothing here walked to. The prune keeps only what the
+	verdict names, so that proof was stripped, and the AD bit went out over what
+	was left: a downstream resolver validating for itself gets an authenticated
+	denial with nothing behind it and refuses it.
+
+	Both halves are needed, and finding that out cost a regression. A chain
+	stopping short is not enough on its own - a DNAME redirection is exactly
+	that shape and is not a denial, so refusing on the shape alone took the AD
+	bit off every one of them. `denial_claimed` is the other half.
+
+	*After* the wildcard proof, and that ordering is load-bearing. Put before it,
+	this became a way to skip that proof: an attacker replays a genuine wildcard
+	record as the answer for a name that has its own records, adds one SOA, and
+	what used to be `Bogus` - refused, SERVFAIL - came back `Insecure`, which
+	`resolve_query` forwards to the client. A guard meant to withhold an answer
+	must not be reachable before the check that would have withheld it outright.
+
+	`Insecure` is the honest verdict: this server has no opinion on the denial.
+	Nothing is pruned, so the proof reaches the client intact and it can check
+	it, and no AD bit claims otherwise. Checking it here means walking to the
+	target's zone, which is #186.
+	*/
+	if worst == .Secure && shape == .Chain_Only && denial_claimed(msg) {
+		return {status = .Insecure, reason = "denial after a cname was not checked"}
 	}
 	/*
 	The RRsets are named only when the verdict is `Secure`, which is what
@@ -2279,33 +2331,7 @@ that led there carried signatures from the zones that own them.
 */
 @(private)
 answers_question :: proc(records: []dns.Record, qname: string, qtype: dns.Type, class: dns.Class) -> bool {
-	name := qname
-	hops := 0
-	for hops < MAX_CNAME_CHAIN {
-		target := ""
-		for r in records {
-			if r.class != class || !dns.name_equal_fold(r.name, name) {
-				continue
-			}
-			if r.type == qtype || qtype == .ANY {
-				return true
-			}
-			if r.type == .CNAME {
-				if v, is_name := r.data.(dns.Rdata_Name); is_name {
-					target = v.name
-				}
-			}
-		}
-		if target == "" {
-			// Nothing further to follow. Whether this answered the question
-			// comes down to having got here by a CNAME the queried name owns.
-			return hops > 0
-		}
-		name = target
-		hops += 1
-	}
-	// A chain this long is a loop or a stall, and either way proves nothing.
-	return false
+	return chain_shape(records, qname, qtype, class) != .None
 }
 
 @(private)
