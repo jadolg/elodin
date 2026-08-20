@@ -793,3 +793,85 @@ test_a_near_copy_does_not_evict_the_record_that_verified :: proc(t: ^testing.T) 
 	)
 	free_all(context.temp_allocator)
 }
+
+/*
+What counts as a denial the answer section only leads up to.
+
+The predicate behind the `Insecure` verdict for a chain that ends without the
+type asked for. Worth testing on its own: the shape it recognises is the
+commonest lookup on a dual-stack network - AAAA for a name whose CNAME leads
+somewhere with only an A record - and getting it wrong in either direction is
+costly. Too eager and ordinary signed answers stop carrying AD; too shy and an
+unchecked denial goes out under it.
+*/
+@(test)
+test_denial_after_chain_recognises_the_shape :: proc(t: ^testing.T) {
+	cname := dns.Record {
+		name  = "www.brand.example.",
+		type  = .CNAME,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_Name{name = "target.other.example."},
+	}
+	soa := dns.Record {
+		name  = "other.example.",
+		type  = .SOA,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_Raw{data = make([]u8, 4, context.temp_allocator)},
+	}
+	aaaa := dns.Record {
+		name  = "target.other.example.",
+		type  = .AAAA,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_AAAA{addr = {}},
+	}
+
+	// A chain that stops short of the type, with a denial behind it.
+	chain_only := dns.Message {
+		answer    = []dns.Record{cname},
+		authority = []dns.Record{soa},
+	}
+	testing.expect(
+		t,
+		denial_after_chain(chain_only, .AAAA, .IN),
+		"a chain ending without the type, with an SOA behind it, is a denial",
+	)
+
+	// The same chain that does reach the type is not.
+	answered := dns.Message {
+		answer    = []dns.Record{cname, aaaa},
+		authority = []dns.Record{soa},
+	}
+	testing.expect(
+		t,
+		!denial_after_chain(answered, .AAAA, .IN),
+		"a chain that reaches the type asked for is not a denial",
+	)
+
+	// No denial in the authority section: nothing to have failed to check.
+	bare := dns.Message {
+		answer = []dns.Record{cname},
+	}
+	testing.expect(t, !denial_after_chain(bare, .AAAA, .IN), "no authority records, no denial")
+
+	// A CNAME or ANY question is answered by the chain itself.
+	testing.expect(t, !denial_after_chain(chain_only, .CNAME, .IN), "a CNAME question is answered by the chain")
+	testing.expect(t, !denial_after_chain(chain_only, .ANY, .IN), "an ANY question is answered by the chain")
+
+	// The class is part of it: a record of another class answers nothing.
+	other_class := dns.Message {
+		answer    = []dns.Record {
+			cname,
+			{name = "target.other.example.", type = .AAAA, class = .CH, ttl = 60, data = dns.Rdata_AAAA{}},
+		},
+		authority = []dns.Record{soa},
+	}
+	testing.expect(
+		t,
+		denial_after_chain(other_class, .AAAA, .IN),
+		"a record of another class does not answer the question",
+	)
+	free_all(context.temp_allocator)
+}
