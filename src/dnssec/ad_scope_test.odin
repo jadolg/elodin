@@ -229,9 +229,13 @@ more than `MAX_SIGNATURES_PER_RRSET` are kept for one RRset.
 
 Without those an attacker who can add records - a zone it owns, or the path to a
 plain UDP upstream - appends as many as it likes at an authenticated owner and
-type. Every one matched, survived, went out under AD, and was cached for every
-later client: an unauthenticated RRset in the answer section under the AD bit,
-which is what this procedure exists to remove.
+type. Every one matched what it claimed to cover and rode out under the AD bit.
+
+The filter is signer equality against the signature that actually carried the
+set, which admits an algorithm rollover - those name the same signer - and
+refuses what the validator never looked at. Deliberately not a count cap: that
+was tried, and it evicted the genuine signature instead, because the forgeries
+come first in the section and the section order is the attacker's to choose.
 */
 @(private = "file")
 forged_rrsig :: proc(owner: string, signer: string) -> dns.Record {
@@ -319,12 +323,183 @@ test_forged_signatures_do_not_survive_the_prune_in_bulk :: proc(t: ^testing.T) {
 			rec.name,
 		)
 	}
+	testing.expect(t, sigs > 0, "every signature was dropped, including the genuine one")
+
+	/*
+	The assertion that matters, and the one a count cap failed.
+
+	Capping how many signatures survive sounds prudent and is the opposite: the
+	signer field is written by whoever wrote the record, so the cap fills with
+	forgeries placed ahead of the real signature and the genuine one is what
+	gets evicted - leaving a message that goes out under AD with nothing in it
+	that verifies. Re-validating the pruned bytes is what says that has not
+	happened, rather than counting what came through.
+	*/
+	after := validate(v, "www.example.com.", .A, out, time.unix(FIXTURE_TIME, 0))
 	testing.expectf(
 		t,
-		sigs <= MAX_SIGNATURES_PER_RRSET,
-		"%d signatures survived for one RRset, against a cap of %d",
-		sigs,
-		MAX_SIGNATURES_PER_RRSET,
+		after.status == .Secure,
+		"the pruned answer no longer validates (%v: %s) - the signature that carried it did not survive",
+		after.status,
+		after.reason,
+	)
+	free_all(context.temp_allocator)
+}
+
+/*
+Forgeries placed *ahead* of the genuine signature, in the authority section.
+
+This is the shape a count cap loses to, and the reason there is no longer one.
+The section order belongs to whoever wrote the answer, so eight RRSIGs at the
+head of a denial's NSEC RRset fill any per-RRset allowance before the real
+signature is reached - and what gets evicted is the only record in the message
+that verifies. The answer then goes out under AD with a denial nothing supports,
+and is cached that way for every downstream validator behind this resolver.
+
+The authority section rather than the answer, because that is where the two
+filters disagreed: the validator accepts a denial's signature only when its
+signer *is* the established zone, while the prune was asking the looser question
+of whether the signer lay somewhere in the owner's ancestry. `com.` passes the
+loose test over `cloudflare.com.` and fails the strict one.
+*/
+@(test)
+test_forgeries_ahead_of_the_real_signature_do_not_evict_it :: proc(t: ^testing.T) {
+	v := make_validator(ad_query, nil, Options{})
+	defer destroy_validator(v)
+
+	msg, derr := dns.decode_message(ad_unhex(ad_fixture("nodata_cloudflare").wire), context.temp_allocator)
+	if !testing.expect(t, derr == .None, "the fixture did not decode") {
+		return
+	}
+
+	// Eight signatures signed by `com.`, ahead of everything the zone sent.
+	authority := make([dynamic]dns.Record, 0, len(msg.authority) + 8, context.temp_allocator)
+	planted := false
+	for rec in msg.authority {
+		if rec.type != .NSEC {
+			continue
+		}
+		for _ in 0 ..< 8 {
+			append(&authority, forged_denial_rrsig(rec.name, "com."))
+		}
+		planted = true
+		break
+	}
+	if !testing.expect(t, planted, "the fixture carried no NSEC record, so nothing was planted") {
+		return
+	}
+	append(&authority, ..msg.authority)
+	msg.authority = authority[:]
+
+	tampered, _, enc := dns.encode_message(msg, context.temp_allocator, dns.MAX_MESSAGE)
+	testing.expect_value(t, enc, dns.Encode_Error.None)
+
+	// The verdict must survive the forgeries: the validator skips a signature
+	// whose signer is not the zone, so they cost it nothing.
+	result := validate(v, "nosuchname-xq7.cloudflare.com.", .A, tampered, time.unix(FIXTURE_TIME, 0))
+	if !testing.expectf(
+		t,
+		result.status == .Secure,
+		"forged signatures ahead of the real one broke the verdict itself (%v: %s)",
+		result.status,
+		result.reason,
+	) {
+		return
+	}
+
+	out, ok := strip_unauthenticated(tampered, result, context.temp_allocator, dns.MAX_MESSAGE)
+	if !testing.expect(t, ok, "the pruned response should rebuild") {
+		return
+	}
+
+	// And the pruned message must still stand on its own.
+	after := validate(v, "nosuchname-xq7.cloudflare.com.", .A, out, time.unix(FIXTURE_TIME, 0))
+	testing.expectf(
+		t,
+		after.status == .Secure,
+		"the pruned denial no longer validates (%v: %s) - the genuine signature was evicted by the forgeries in front of it",
+		after.status,
+		after.reason,
+	)
+	free_all(context.temp_allocator)
+}
+
+@(private = "file")
+forged_denial_rrsig :: proc(owner: string, signer: string) -> dns.Record {
+	rdata := make([dynamic]u8, 0, 64, context.temp_allocator)
+	append(&rdata, 0, 47) // TYPE COVERED = NSEC
+	append(&rdata, 13) // ALGORITHM
+	append(&rdata, 3) // LABELS
+	append(&rdata, 0, 0, 0, 60) // ORIGINAL TTL
+	append(&rdata, 0x6a, 0xff, 0xff, 0xff) // EXPIRATION
+	append(&rdata, 0x6a, 0x00, 0x00, 0x00) // INCEPTION
+	append(&rdata, 0xff, 0xfe) // KEY TAG
+	name_buf: [dns.MAX_NAME_WIRE]u8
+	n, err := dns.encode_name(signer, name_buf[:])
+	if err != .None {
+		panic("cannot encode the forged signer")
+	}
+	append(&rdata, ..name_buf[:n])
+	for _ in 0 ..< 16 {
+		append(&rdata, 0x42)
+	}
+	return dns.Record{name = owner, type = .RRSIG, class = .IN, ttl = 60, data = dns.Rdata_Raw{data = rdata[:]}}
+}
+
+/*
+Forgeries ahead of the real signature do not starve the verdict either.
+
+The other half of the same shape, one layer down. A denial's signature is only
+tried when its signer names the zone, but the signer is a name in the RDATA and
+anyone able to add records can write it - so eight RRSIGs naming `cloudflare.com`
+placed ahead of the genuine one spent a per-RRset attempt allowance before it
+was reached. The RRset was dropped, `validate_denial` found no proof, and every
+NXDOMAIN and NODATA in the zone came back SERVFAIL.
+
+Bounded across the question instead, so junk in front of a real signature is
+paid for out of a budget the whole message shares rather than out of the one
+thing that had to be reached.
+*/
+@(test)
+test_forged_signatures_do_not_starve_the_denial :: proc(t: ^testing.T) {
+	v := make_validator(ad_query, nil, Options{})
+	defer destroy_validator(v)
+
+	msg, derr := dns.decode_message(ad_unhex(ad_fixture("nodata_cloudflare").wire), context.temp_allocator)
+	if !testing.expect(t, derr == .None, "the fixture did not decode") {
+		return
+	}
+
+	// Signed by the zone itself this time, so the validator cannot skip them
+	// without trying: exactly the signatures a per-RRset cap counted.
+	authority := make([dynamic]dns.Record, 0, len(msg.authority) + 8, context.temp_allocator)
+	planted := false
+	for rec in msg.authority {
+		if rec.type != .NSEC {
+			continue
+		}
+		for _ in 0 ..< 8 {
+			append(&authority, forged_denial_rrsig(rec.name, "cloudflare.com."))
+		}
+		planted = true
+		break
+	}
+	if !testing.expect(t, planted, "the fixture carried no NSEC record, so nothing was planted") {
+		return
+	}
+	append(&authority, ..msg.authority)
+	msg.authority = authority[:]
+
+	tampered, _, enc := dns.encode_message(msg, context.temp_allocator, dns.MAX_MESSAGE)
+	testing.expect_value(t, enc, dns.Encode_Error.None)
+
+	result := validate(v, "nosuchname-xq7.cloudflare.com.", .A, tampered, time.unix(FIXTURE_TIME, 0))
+	testing.expectf(
+		t,
+		result.status == .Secure,
+		"eight forged signatures in front of the real one turned a good denial into %v (%s)",
+		result.status,
+		result.reason,
 	)
 	free_all(context.temp_allocator)
 }
