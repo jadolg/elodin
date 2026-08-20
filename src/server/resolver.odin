@@ -279,6 +279,60 @@ advertise_udp_size :: proc(wire: []u8, size: u16, proto: Protocol) -> []u8 {
 	return wire
 }
 
+/*
+Whether the client may have asked with an EDNS Client Subnet option, and whether
+taking it back out is something this server can be sure it managed.
+
+Read conservatively on purpose: "may have" is as much as the decoded message can
+say, and a caller that is going to refuse what it cannot strip wants the doubt
+rather than a clean-looking no. Every message this is asked about came out of
+`decode_message`, which gives an OPT record either an option list or the raw
+bytes it could not make one of - never nothing.
+
+The second answer exists because `remove_edns_option` works on the first OPT
+record and no more, while a message can arrive carrying two - one OPT record is
+all RFC 6891 section 6.1.1 permits, but nothing here turns the rest away before
+this point. An ECS option hidden in a second OPT would survive a removal that
+reported success, so the caller has to be able to tell that case from a clean
+one, and the removal's own return value cannot see it.
+
+An OPT record whose RDATA the decoder could not walk is the other half of the
+same problem, and the more useful one to an attacker: `decode_record` keeps
+RDATA it cannot parse as raw bytes rather than rejecting the message, so an
+option list ending in three bytes of a fourth option header reaches here as an
+OPT record holding `Rdata_Raw` and not an option list at all. That is why the
+check below asks which variant the RDATA is rather than how many options it
+holds: the list is not empty, it was never built. Read as "no subnet here" it
+would forward the client's ECS upstream untouched - the option is perfectly
+legible to the resolver on the other end, only not to this decoder. So an unreadable OPT
+reports a subnet that cannot be stripped, and the query stops, which is also
+what RFC 6891 section 6.1.1 asks of RDATA that is not a well-formed option list.
+*/
+@(private)
+client_subnet_sent :: proc(msg: dns.Message) -> (sent: bool, strippable: bool) {
+	opts := 0
+	readable := true
+	for rec in msg.additional {
+		if rec.type != .OPT {
+			continue
+		}
+		opts += 1
+		rdata, is_opt := rec.data.(dns.Rdata_OPT)
+		if !is_opt {
+			sent = true
+			readable = false
+			continue
+		}
+		for o in rdata.options {
+			if o.code == u16(dns.EDNS_Option_Code.Client_Subnet) {
+				sent = true
+				break
+			}
+		}
+	}
+	return sent, readable && opts == 1
+}
+
 @(private)
 resolve_query :: proc(
 	s: ^Server,
@@ -498,6 +552,97 @@ resolve_query :: proc(
 				client,
 			)
 			log_query(s, client, proto, q, .Failed, "cookie", started)
+			return out, .Failed, built
+		}
+		forwarded = stripped
+	}
+
+	/*
+	The client's subnet stops here as well.
+
+	RFC 7871 section 7.5 puts no condition on this: an intermediate nameserver
+	that forwards ECS options received from its clients "MUST fully implement
+	the caching behavior described in Section 7.3", and this server does not.
+	Its key is the question plus DO and CD and nothing else (`cache.make_key`),
+	so an answer tailored to whatever network a client named would be filed
+	under the bare question and handed to every other client behind this
+	resolver until it expired - section 7.3.1's requirement that a cached answer
+	be tied to the network it was scoped to, absent. One well-formed query from
+	anyone `server.allow_from` lets in, and the whole network gets the CDN edge
+	that client chose.
+
+	The leak is the other half, and it holds with the cache switched off:
+	`server.allow_from` decides who may ask here, not what they may claim about
+	themselves, so a client can have this server tell a public upstream that its
+	users are somewhere they are not (section 11.1).
+
+	Stripped rather than refused. Section 7.5 does offer REFUSED for an option
+	an intermediate does not want to use, but a stub that sends ECS is asking
+	for a nearer CDN edge and not committing an offence, and refusing it teaches
+	the client to route around this resolver. Dropping the option leaves the
+	upstream scoping on this server's own address, which is the answer everyone
+	behind it should be getting, and the reply then carries no ECS option back -
+	which section 7.3 reads as "suitable for all client addresses", true here
+	rather than the false tailoring claim that section warns about.
+
+	Nothing is put in its place. Section 7.1.2 gives SOURCE PREFIX-LENGTH 0 to a
+	stub that wants no scoping at all and section 7.1.3 says a forwarder looks
+	like a stub, but sending it would forbid the upstream from scoping on *our*
+	address too - every client behind this resolver losing the locality it has
+	today, to fix a leak that is already fixed by the option being gone. That is
+	an operator's decision and a larger one than this. An absent option says
+	this server does not do ECS, which is the truth.
+
+	No setting to turn it back on, either. Forwarding ECS is only correct
+	together with the section 7.3 caching, and until the cache can hold a scope
+	per network the key would either be a lie or be the client's own bytes -
+	which is the cache pollution section 11.3 is about, an attacker sitting on
+	one name and evicting the table with a fresh subnet each time. The option
+	belongs with that work, not ahead of it.
+
+	Placed after the DNSSEC rewrite for the reason the cookie is: that path
+	copies the client's OPT data across wholesale, so this is the point where
+	both ways of building the outgoing query have converged.
+	*/
+	if ecs_sent, strippable := client_subnet_sent(msg); ecs_sent {
+		/*
+		A subnet the strip cannot be trusted to reach - one in a second OPT
+		record, or one in an OPT whose RDATA this decoder could not walk - is
+		answered rather than sent on, because the strip below would report
+		success and leave it standing. FORMERR because that is what RFC 6891
+		section 6.1.1 already says about both of those messages, and this is
+		where the first thing that cares happens to look; not counted and not
+		logged at warn, for the reason the class and RD refusals above are not -
+		a malformed query is the client's own to fix, and a line an
+		unauthenticated peer can print once per datagram is not a line to write
+		at that level. The query log has it as `outcome=failed detail="ecs"`.
+		*/
+		if !strippable {
+			out, built := dns.error_response(query, msg, .Form_Err, allocator, limit)
+			log_query(s, client, proto, q, .Failed, "ecs", started)
+			return out, .Failed, built
+		}
+		stripped, done := dns.remove_edns_option(forwarded, .Client_Subnet, allocator)
+		if !done {
+			/*
+			Failing closed, as the cookie above does, and for a reason that
+			survives the objection that a cookie is a secret and a subnet is
+			only a hint. It is a hint that steers a shared cache: forwarding one
+			this server could not account for is what lets a single client pick
+			the answer the rest of them get, which no amount of "it is only a
+			hint" makes cheaper than one lost answer for the client that sent
+			it. Nobody else's queries are affected by the refusal, and the
+			client is told rather than left waiting.
+			*/
+			sync.atomic_add(&s.stats.failed, 1)
+			out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
+			logx.warnf(
+				"could not strip the client subnet from %s %s from %s; not forwarding",
+				dns.type_name(q.type),
+				dns.name_trim_root(q.name),
+				client,
+			)
+			log_query(s, client, proto, q, .Failed, "ecs", started)
 			return out, .Failed, built
 		}
 		forwarded = stripped
