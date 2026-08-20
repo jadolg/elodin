@@ -87,10 +87,31 @@ passed over: there is no target in hand to look up. Refusing the answer instead
 would turn a malformed record into a withheld name, and a target this server
 cannot read is one the client is being handed in the same unreadable state.
 */
+/*
+What the walk concluded about an answer.
+
+`Unwalkable` is kept apart from `Listed` because the two are different things to
+an operator: one names a rule they wrote, the other says the answer was too long
+to check and there is no rule to point at. Both withhold the answer.
+*/
 @(private)
-cloaked_chain_target :: proc(s: ^Server, answer: []dns.Record, qname: string) -> (target: string, found: bool) {
+Cloak_Verdict :: enum u8 {
+	Clear,
+	Listed,
+	Unwalkable,
+}
+
+@(private)
+cloaked_chain_target :: proc(
+	s: ^Server,
+	answer: []dns.Record,
+	qname: string,
+) -> (
+	target: string,
+	verdict: Cloak_Verdict,
+) {
 	if !s.cfg.blocking.enabled || s.filters == nil || len(answer) == 0 {
-		return "", false
+		return "", .Clear
 	}
 
 	redirects := false
@@ -101,11 +122,11 @@ cloaked_chain_target :: proc(s: ^Server, answer: []dns.Record, qname: string) ->
 		}
 	}
 	if !redirects {
-		return "", false
+		return "", .Clear
 	}
 
 	if filter.engine_match(s.filters, qname) == .Allowed {
-		return "", false
+		return "", .Clear
 	}
 
 	/*
@@ -164,15 +185,46 @@ cloaked_chain_target :: proc(s: ^Server, answer: []dns.Record, qname: string) ->
 			if seen {
 				continue
 			}
+			/*
+			The walk has outrun its budget, and the answer is refused rather
+			than served.
+
+			Serving it was the whole of the evasion this check exists to stop.
+			An attacker who can write the answer can write as many distinct
+			names into it as it likes, and while the budget bounded the work it
+			did nothing about what happened at the end of it: the walk stopped,
+			the listed name sat one hop past where it stopped, and the answer
+			went out. A plain eighteen-name chain did it - no repetition, no
+			malformed record, nothing a client would not follow to the end.
+
+			So the budget now bounds the work *and* the answer. An answer this
+			server could not finish checking is one it does not know about, and
+			the honest thing to do with a name it does not know about is decline
+			it, exactly as it declines a name it knows is listed.
+
+			Returning here rather than matching what is left is deliberate. The
+			verdict is settled - the answer is going to be withheld either way -
+			so going on would only be work an attacker chose the size of, and
+			`seen` cannot record a name there is no room to store, which is what
+			would make that work unbounded.
+
+			What this costs is an allowlist entry that would have matched past
+			the budget, on a chain of more than sixteen names. No zone publishes
+			one; the escape hatch for a name that somehow needs it is an allow
+			rule on the question, which is matched above before any of this runs.
+			*/
 			if tail >= len(pending) {
-				break
+				if target != "" {
+					return target, .Listed
+				}
+				return "", .Unwalkable
 			}
 			pending[tail] = v.name
 			tail += 1
 
 			switch filter.engine_match(s.filters, v.name) {
 			case .Allowed:
-				return "", false
+				return "", .Clear
 			case .Blocked:
 				if target == "" {
 					target = v.name
@@ -181,7 +233,7 @@ cloaked_chain_target :: proc(s: ^Server, answer: []dns.Record, qname: string) ->
 			}
 		}
 	}
-	return target, target != ""
+	return target, .Listed if target != "" else .Clear
 }
 
 /*
@@ -223,19 +275,68 @@ block_cloaked_answer :: proc(
 	response: []u8,
 	blocked: bool,
 ) {
-	target, cloaked := cloaked_chain_target(s, answer, q.name)
-	if !cloaked {
+	target, verdict := cloaked_chain_target(s, answer, q.name)
+	if verdict == .Clear {
 		return nil, false
 	}
+	return refuse_cloaked(s, target, verdict, msg, q, proto, client, limit, started, allocator), true
+}
+
+/*
+Serve a refusal the walk has already decided on.
+
+Split out so that the cache can hand back a verdict it recorded earlier without
+the walk being run again to re-reach it - see `serve_from_cache`. The counter,
+the log line and the response are all here rather than at the two call sites, so
+that an answer refused from the cache and one refused on the way in cannot come
+to differ in what an operator is shown or in what is counted.
+*/
+@(private)
+refuse_cloaked :: proc(
+	s: ^Server,
+	target: string,
+	verdict: Cloak_Verdict,
+	msg: dns.Message,
+	q: dns.Question,
+	proto: Protocol,
+	client: string,
+	limit: int,
+	started: time.Time,
+	allocator: mem.Allocator,
+) -> []u8 {
 	sync.atomic_add(&s.stats.blocked, 1)
-	logx.debugf(
-		"%s %s from %s is a cname to %s, which is on the block list",
-		dns.type_name(q.type),
-		dns.name_trim_root(q.name),
-		client,
-		dns.name_trim_root(target),
-	)
+	if verdict == .Unwalkable {
+		logx.debugf(
+			"%s %s from %s redirects through more than %d names, which is more than this server will follow; withheld",
+			dns.type_name(q.type),
+			dns.name_trim_root(q.name),
+			client,
+			MAX_CHAIN_NAMES,
+		)
+	} else {
+		logx.debugf(
+			"%s %s from %s is a cname to %s, which is on the block list",
+			dns.type_name(q.type),
+			dns.name_trim_root(q.name),
+			client,
+			dns.name_trim_root(target),
+		)
+	}
 	out := build_block_response(s, msg, q, allocator, limit)
-	log_query(s, client, proto, q, .Blocked, "cname", started)
-	return out, true
+	log_query(s, client, proto, q, .Blocked, "cname" if verdict == .Listed else "cname-deep", started)
+	return out
+}
+
+/*
+Whether a refusal the cache remembers is still this server's to act on.
+
+The verdict was recorded under a rule set, and the number that says whether that
+set is current is what `recheck` already answers. What it cannot answer is
+blocking having been switched off entirely since - a reload can do that without
+the lists themselves changing - and a remembered refusal acted on then would be
+this server declining a name under a feature the operator has turned off.
+*/
+@(private)
+cloak_refusal_stands :: proc(s: ^Server) -> bool {
+	return s.cfg.blocking.enabled && s.filters != nil
 }

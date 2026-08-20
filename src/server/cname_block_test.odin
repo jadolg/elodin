@@ -1,5 +1,6 @@
 package server
 
+import "core:fmt"
 import "core:net"
 import "core:testing"
 import "core:thread"
@@ -524,5 +525,100 @@ test_a_clean_answer_is_walked_once_per_reload_and_not_once_per_hit :: proc(t: ^t
 
 	_, second, _ := cache.get(answers, key, context.temp_allocator, checked_against = filter.engine_generation(engine))
 	testing.expect(t, !second.recheck, "the walk was not recorded, so every later hit pays for it again")
+	free_all(context.temp_allocator)
+}
+
+/*
+Sixteen distinct decoys, and then the tracker.
+
+The budget is spent on distinct names, so distinct decoys spend it - which the
+repeated-CNAME case above cannot show, its decoys all being one name. Sixteen of
+them use the walk up before it reaches the seventeenth record, and what the
+walk has not reached it has not cleared.
+*/
+@(test)
+test_distinct_decoys_do_not_bury_the_listed_name :: proc(t: ^testing.T) {
+	answer := make([]dns.Record, MAX_CHAIN_NAMES + 2, context.temp_allocator)
+	for i in 0 ..< MAX_CHAIN_NAMES {
+		answer[i] = dns.Record {
+			name  = "www.brand.example.",
+			type  = .CNAME,
+			class = .IN,
+			ttl   = 60,
+			data  = dns.Rdata_Name{name = fmt.tprintf("decoy%d.brand.example.", i)},
+		}
+	}
+	answer[MAX_CHAIN_NAMES] = dns.Record {
+		name  = "www.brand.example.",
+		type  = .CNAME,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_Name{name = "tracker.evil.example."},
+	}
+	answer[MAX_CHAIN_NAMES + 1] = dns.Record {
+		name  = "tracker.evil.example.",
+		type  = .A,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_A{addr = {203, 0, 113, 7}},
+	}
+	outcome := serve_cached_answer(
+		t,
+		"www.brand.example.",
+		chain_wire("www.brand.example.", answer),
+		[]string{"tracker.evil.example"},
+		nil,
+	)
+	testing.expect_value(t, outcome, Outcome.Blocked)
+	free_all(context.temp_allocator)
+}
+
+/*
+A plain chain longer than the budget is withheld, listed name or not.
+
+This is the shape that matters, because there is nothing wrong with it: one
+CNAME per owner, no repetition, no malformed record, every client follows it to
+the end and arrives at the tracker. Bounding the walk and then serving whatever
+the walk did not reach is not a bound on anything an attacker cares about - it
+is a length they have to exceed, and exceeding it was free.
+
+So the answer is refused. The chain is eighteen names where a real one is two,
+and an answer this server could not finish checking is not one to hand over.
+*/
+@(test)
+test_a_chain_longer_than_the_budget_is_refused :: proc(t: ^testing.T) {
+	hops := make([dynamic]string, 0, MAX_CHAIN_NAMES + 3, context.temp_allocator)
+	append(&hops, "www.brand.example.")
+	for i in 0 ..< MAX_CHAIN_NAMES + 1 {
+		append(&hops, fmt.tprintf("h%d.brand.example.", i))
+	}
+	append(&hops, "tracker.evil.example.")
+
+	// Listed at the far end: the walk must not clear what it never reached.
+	testing.expect_value(
+		t,
+		serve_cached_chain(t, hops[:], []string{"tracker.evil.example"}, nil),
+		Outcome.Blocked,
+	)
+	// And with nothing listed at all, the same chain is still withheld: the
+	// refusal is "not checkable", not "found something".
+	testing.expect_value(t, serve_cached_chain(t, hops[:], nil, nil), Outcome.Blocked)
+	free_all(context.temp_allocator)
+}
+
+/*
+A chain of exactly the budget is walked to the end and served.
+
+The boundary in the other direction, so that failing closed past the budget
+cannot quietly become failing closed at ordinary lengths.
+*/
+@(test)
+test_a_chain_that_fits_the_budget_is_answered :: proc(t: ^testing.T) {
+	hops := make([dynamic]string, 0, MAX_CHAIN_NAMES + 1, context.temp_allocator)
+	append(&hops, "www.brand.example.")
+	for i in 0 ..< MAX_CHAIN_NAMES - 1 {
+		append(&hops, fmt.tprintf("h%d.brand.example.", i))
+	}
+	testing.expect_value(t, serve_cached_chain(t, hops[:], nil, nil), Outcome.Cached)
 	free_all(context.temp_allocator)
 }

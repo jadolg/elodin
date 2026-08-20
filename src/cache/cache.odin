@@ -41,6 +41,21 @@ Entry :: struct {
 	*/
 	checked:     u64,
 	/*
+	What the caller decided when it last looked, under the number in `checked`.
+
+	An answer refused at the last walk is refused on the next hit too, until the
+	caller's number moves and the walk is owed again. Without this the refusal
+	would have to be re-derived every time - the entry cannot be stamped as
+	checked, because a stamp says "serve it", so the walk would come round on
+	every hit for as long as the entry lived. Dropping the entry instead trades
+	that for an upstream query per client query, which is the more expensive half
+	of the same choice.
+
+	Meaningless while `recheck` is set; the caller is being asked to decide again
+	and this is what it decided last time.
+	*/
+	refused:     bool,
+	/*
 	Which entry this is, counted up once per insert and never reused.
 
 	`note_checked` writes to an entry a caller read some microseconds earlier, and
@@ -71,6 +86,13 @@ Hit :: struct {
 	for the caller to look at again.
 	*/
 	recheck: bool,
+	/*
+	What the caller decided about these bytes last time, when `recheck` is clear.
+
+	Read it only then: with `recheck` set the verdict is out of date by
+	definition, which is what `recheck` says.
+	*/
+	refused: bool,
 	// Which entry the bytes came out of, for `note_checked`.
 	serial:  u64,
 }
@@ -276,6 +298,7 @@ get :: proc(
 
 	hit.serial = e.serial
 	hit.recheck = e.redirects && e.checked != checked_against
+	hit.refused = e.refused
 
 	elapsed := u32(max(0, time.duration_seconds(time.diff(e.inserted, now))))
 	out := make([]u8, len(e.wire), allocator)
@@ -342,15 +365,35 @@ another worker may have replaced the answer in between, and stamping its bytes
 with a verdict reached on the bytes they displaced is how an answer nobody
 matched comes to look as though somebody had.
 */
-note_checked :: proc(c: ^Cache, key: string, serial: u64, checked: u64) {
+note_checked :: proc(c: ^Cache, key: string, serial: u64, checked: u64, refused: bool) {
 	if c == nil {
 		return
 	}
 	sync.mutex_lock(&c.mu)
 	defer sync.mutex_unlock(&c.mu)
-	if e, found := c.entries[key]; found && e.serial == serial {
-		e.checked = checked
+	e, found := c.entries[key]
+	if !found || e.serial != serial {
+		return
 	}
+	/*
+	Never backwards.
+
+	A caller reads its number, spends some microseconds deciding, and writes it
+	back here. Two of them can interleave: the one that read the older number can
+	be the one that writes last, and it would then put the stamp back to a number
+	another worker has already moved past - re-arming `recheck` for every hit
+	until somebody walks the entry again and wins the race. It settles itself on
+	the next hit, so what this costs is work rather than correctness, but the
+	guard is a comparison.
+
+	Equality is not an update either: two workers stamping the same number agree
+	about the verdict by construction, having decided under the same rules.
+	*/
+	if checked <= e.checked {
+		return
+	}
+	e.checked = checked
+	e.refused = refused
 }
 
 // Count a stale answer that a caller went on to serve; see `Stats.stale`.

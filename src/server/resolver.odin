@@ -435,6 +435,7 @@ resolve_query :: proc(
 				key     = key,
 				stale   = hit.stale,
 				recheck = hit.recheck,
+				refused = hit.refused,
 				serial  = hit.serial,
 				checked = generation,
 			}
@@ -702,6 +703,8 @@ Cached_Answer :: struct {
 	serial:  u64,
 	stale:   bool,
 	recheck: bool,
+	// What the last walk decided, when `recheck` says that decision is current.
+	refused: bool,
 	// The rule sets the re-match is made against, and the number stamped on the
 	// entry when it comes back clean.
 	checked: u64,
@@ -767,11 +770,28 @@ serve_from_cache :: proc(
 	burst of upstream traffic each time to re-learn answers nothing was wrong
 	with.
 
-	An entry that is refused stays where it is. Nothing here can tell whether the
-	next reload will put it back in service, and walking it again on each hit is
-	cheaper than the upstream query that dropping it would cost - it keeps its old
-	stamp, which is what asks for that walk.
+	An entry that is refused stays where it is, and its refusal is stamped on it
+	along with the number. Nothing here can tell whether the next reload will put
+	it back in service, and dropping it would cost an upstream query per client
+	query until something did.
+
+	Keeping it and *not* recording the verdict was the first shape of this, and
+	it was wrong in a way worth naming: an entry cannot be stamped as merely
+	checked, because a stamp says "serve it", so the refusal had to be re-derived
+	from the bytes on every hit - a decode and a walk, on the hot path, at
+	whatever rate a client cares to ask, for as long as the entry lived. That is
+	the per-hit decode the stamp exists to avoid, reintroduced for exactly the
+	names an attacker is interested in. With the verdict recorded, a refused
+	entry costs one walk per reload like any other.
 	*/
+	if !hit.recheck && hit.refused && cloak_refusal_stands(s) {
+		// `Listed` rather than the verdict that was reached: what is remembered
+		// is that the answer was refused, not which of the two reasons it was,
+		// and inventing a distinction the entry does not carry would put a name
+		// in the log line that nothing here looked up.
+		out := refuse_cloaked(s, q.name, .Listed, msg, q, proto, client, limit, started, allocator)
+		return out, .Blocked, true
+	}
 	if hit.recheck {
 		// The entry decoded once already, on the way in - `cache.put` will not
 		// store a message it could not read - so this is the copy being decoded,
@@ -788,6 +808,7 @@ serve_from_cache :: proc(
 				started,
 				allocator,
 			); cloaked {
+				cache.note_checked(s.answers, hit.key, hit.serial, hit.checked, true)
 				return out, .Blocked, true
 			}
 			// Inside the decode, not after it. An entry nothing could read has
@@ -795,7 +816,7 @@ serve_from_cache :: proc(
 			// is the one way this mechanism could come to skip a walk it owed.
 			// Unreachable as things stand, since `cache.put` stores nothing it
 			// could not decode, and not a thing to leave resting on that.
-			cache.note_checked(s.answers, hit.key, hit.serial, hit.checked)
+			cache.note_checked(s.answers, hit.key, hit.serial, hit.checked, false)
 		}
 	}
 
