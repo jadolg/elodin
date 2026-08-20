@@ -289,14 +289,18 @@ owns can bolt those on and still answer the question perfectly; so can anyone on
 the path to a plain UDP or TCP upstream, who need not touch the signed answer at
 all.
 
-Dropped rather than checked. Validating those sections the way the answer
-section is validated is the obvious repair and it does not work: the NS RRset at
-a zone cut and the glue below it are unsigned by design (RFC 4035 section 2.2),
-so exactly the records an attacker would forge are the ones no signature can
-settle, and a resolver that demanded one would refuse every delegation it was
-handed. It would cost as well - each owner name in a response is free to name a
-signer of its own, and a chain walk apiece is what MAX_LOOKUPS_PER_QUERY exists
-to stop one response provoking. Dropping cannot cost a lookup.
+Dropped rather than checked, and the reason is not the cost. Validating those
+sections the way the answer section is validated is the obvious repair, and it
+cannot work on the records it would need to work on: the NS RRset at a zone cut
+and the glue below it are unsigned by design (RFC 4035 section 2.2). Exactly
+what an attacker would forge is what no signature can ever settle, so a resolver
+demanding one would refuse every delegation it was ever handed - and would then
+have to special-case its way back to accepting them, which is where it started.
+
+The cost is the second reason and still a real one: each owner name in a
+response is free to name a signer of its own, and a chain walk apiece is what
+MAX_LOOKUPS_PER_QUERY exists to stop one response provoking. Dropping cannot
+cost a lookup.
 
 A forwarder gives up little by dropping them. The client asked this server to
 resolve the name; it is not going to chase a delegation or dial the glue. What
@@ -304,15 +308,22 @@ stays is what was proven and what a client has a use for: the answer, the NSEC
 and NSEC3 records a denial rests on, and the SOA that denial is cached
 negatively against.
 
-The one real loss is a CNAME chain that ends in NODATA. That reaches `Secure`
-through `validate_answer`, on the strength of the CNAME alone, and the proof
-sitting in its authority section is one nothing here ever examined - so out it
-goes with the rest, and the client falls back to its own idea of how long to
-remember a negative answer. Keeping it would mean establishing the target zone,
-which is a chain walk for a zone this query has not otherwise touched, and that
-is the lookup this whole approach was chosen to avoid. It was unauthenticated
-before this change too; the difference is that it is no longer unauthenticated
-and stamped as authenticated.
+The one real loss is a CNAME chain that ends in NODATA - a dual-stack client
+asking AAAA for an IPv4-only name is the everyday version of it. That reaches
+`Secure` through `validate_answer` on the strength of the CNAME alone, and the
+proof sitting in its authority section belongs to the target's zone, which
+nothing here ever established. So out it goes with the rest, and a downstream
+resolver falls back to its own idea of how long to remember the absence.
+
+Two ways not to lose it, and neither belongs here. Keeping the records and
+clearing AD instead is the one that looks free: it is not, because AD is a
+property of the message and not of a section, so the commonest answer shape
+there is would go out unauthenticated - and the copy that lands in the cache
+would be AD-less for every later client too. A negative-caching hint is not
+worth the bit on the common path. The other way is the correct one, which is to
+establish the target's zone and validate the denial there; that is a second
+chain walk on a hot path, it widens what gets checked rather than narrowing what
+gets claimed, and it is filed as its own issue rather than smuggled in here.
 
 The OPT record survives on its own account. It is transport rather than data -
 no owner name to authenticate - and taking it out would drop the upper bits of
