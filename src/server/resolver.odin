@@ -942,9 +942,12 @@ serve_from_cache :: proc(
 		}
 	}
 	if hit.recheck {
-		// The entry decoded once already, on the way in - `cache.put` will not
-		// store a message it could not read - so this is the copy being decoded,
-		// not a question of whether it can be.
+		// The entry decoded once already, on the way in, so this is the copy being
+		// decoded rather than a question of whether it can be. That rests on the
+		// two `have_decoded` guards at the stores above and not on anything
+		// `cache.put` checks: `put` never decodes, it takes an already-decoded
+		// message and trusts it to describe the bytes beside it. A third store
+		// written without that guard would break this quietly.
 		if stored, derr := dns.decode_message(hit.wire, allocator); derr == .None {
 			if out, verdict := block_cloaked_answer(
 				s,
@@ -982,8 +985,8 @@ serve_from_cache :: proc(
 			// Inside the decode, not after it. An entry nothing could read has
 			// not been looked at, and stamping it here would say it had - which
 			// is the one way this mechanism could come to skip a walk it owed.
-			// Unreachable as things stand, since `cache.put` stores nothing it
-			// could not decode, and not a thing to leave resting on that.
+			// Unreachable as things stand, because both stores are guarded on
+			// `have_decoded`, and not a thing to leave resting on that.
 			cache.note_checked(s.answers, hit.key, hit.serial, hit.checked, u8(Cloak_Verdict.Clear))
 		} else {
 			/*

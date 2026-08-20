@@ -472,9 +472,10 @@ blocking having been switched off entirely since, which would make a remembered
 refusal this server declining a name under a feature the operator has turned
 off.
 
-Nothing can switch it off today: SIGHUP re-reads the certificates and the lists
-and nothing else, so `blocking.enabled` is fixed for the life of the process and
-this half of the guard is a constant. It is kept as the cheap half of a
+Nothing can switch it off today: SIGHUP re-reads the certificates and nothing
+else, and the only other thing that changes at runtime is the lists themselves,
+on `blocking.refresh`. `blocking.enabled` is read once from the configuration and
+is fixed for the life of the process, so this half of the guard is a constant. It is kept as the cheap half of a
 condition that is about to be read wrongly the day configuration reload grows -
 not as a claim that reload exists.
 */
