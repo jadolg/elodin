@@ -61,7 +61,27 @@ serve_ecs :: proc(x: ^Ecs_Mock) {
 	if derr != .None {
 		return
 	}
-	_, x.saw_ecs = dns.find_edns_option(m, .Client_Subnet)
+	/*
+	Every OPT record is walked, not just the first one `find_edns_option` stops
+	at. A resolver reading these bytes is under no obligation to stop where this
+	server's decoder stops, so a mock that looked only where the strip looks
+	could not tell a query the strip cleaned from one still carrying the option
+	somewhere the strip never reached.
+	*/
+	for rec in m.additional {
+		if rec.type != .OPT {
+			continue
+		}
+		rdata, is_opt := rec.data.(dns.Rdata_OPT)
+		if !is_opt {
+			continue
+		}
+		for o in rdata.options {
+			if o.code == u16(dns.EDNS_Option_Code.Client_Subnet) {
+				x.saw_ecs = true
+			}
+		}
+	}
 	x.saw_do = dns.edns_do(m)
 
 	reply := scoped_reply(x.name, TAILORED if x.saw_ecs else GLOBAL)
