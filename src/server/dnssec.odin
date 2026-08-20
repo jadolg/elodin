@@ -1,6 +1,7 @@
 package server
 
 import "core:mem"
+import "core:sync"
 import "elodin:dns"
 import "elodin:dnssec"
 import "elodin:logx"
@@ -183,6 +184,10 @@ survived the prune above. One that did not has the DNSSEC records taken back
 out, because RFC 4035 says not to send them unasked and because they would
 otherwise push ordinary answers past the point where they need a retry over TCP.
 */
+// Set once the first answer has lost its AD bit to a failed rebuild; see below.
+@(private)
+prune_failure_reported: bool
+
 @(private)
 present_response :: proc(
 	wire: []u8,
@@ -220,11 +225,27 @@ present_response :: proc(
 			one, so an MX or an NS this decoder could not fully read takes the
 			bit down with it.
 			*/
-			logx.warnf(
-				"dnssec: %s %s validated but could not be rebuilt without its unauthenticated records; answering without the AD bit",
-				dns.type_name(qtype),
-				dns.name_trim_root(query.question[0].name if len(query.question) > 0 else "?"),
-			)
+			/*
+			Once at warn, then at debug, like `report_udp_ceiling`. The condition
+			is per-answer and remotely reachable, so a name that trips it every
+			time would otherwise let whoever queries it decide how much this
+			server writes to disk.
+			*/
+			name := dns.name_trim_root(query.question[0].name if len(query.question) > 0 else "?")
+			if sync.atomic_exchange(&prune_failure_reported, true) {
+				logx.debugf(
+					"dnssec: %s %s validated but could not be rebuilt without its unauthenticated records; answering without the AD bit",
+					dns.type_name(qtype),
+					name,
+				)
+			} else {
+				logx.warnf(
+					"dnssec: %s %s validated but could not be rebuilt without its unauthenticated records; answering without the AD bit",
+					dns.type_name(qtype),
+					name,
+				)
+				logx.warnf("further answers losing the AD bit this way are logged at debug level")
+			}
 			secure = false
 		}
 	}
