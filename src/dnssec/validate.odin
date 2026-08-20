@@ -1,6 +1,7 @@
 package dnssec
 
 import "core:mem"
+import "core:slice"
 import "core:strings"
 import "core:sync"
 import "core:time"
@@ -95,8 +96,16 @@ answered with SERVFAIL rather than chased.
 */
 MAX_LOOKUPS_PER_QUERY :: 32
 
-// Signatures tried on one RRset. A set carries one per algorithm in practice;
-// more than this is a response trying to make us work rather than be believed.
+/*
+Signatures kept beside one RRset when the response is pruned.
+
+Not an attempt limit any more: `validate_rrset` and `verified_rrset` both spend
+`MAX_VERIFICATIONS_PER_QUERY` instead, having each had a per-RRset cap that an
+attacker could fill. What is left is what `strip_unauthenticated` will hand on
+besides the signature that actually verified, which is exempt - a set carries
+one signature per algorithm in practice, and more than this is padding aimed at
+whatever validates downstream.
+*/
 MAX_SIGNATURES_PER_RRSET :: 8
 
 // CNAME hops followed when checking that an answer addresses the question.
@@ -133,10 +142,21 @@ genuine one is what it kept out. Both paths that verify a set - `validate_rrset`
 for the answer section and `verified_rrset` for a denial - are counted here, so
 neither keeps a private allowance that can be emptied on its own.
 
-Counted across the question instead, so a set that carries junk in front of its
-real signature still reaches it, while what one question can be made to spend
-stays bounded. Generous next to any real answer: a set carries one signature per
+Counted across the question instead, and spent only on signatures that could
+actually verify - see `signature_worth_trying`, which refuses the rest for
+nothing. Generous next to any real answer: a set carries one signature per
 algorithm, and a chain a handful of sets.
+
+It is a bound on work and not a guarantee that the genuine signature is reached,
+and the difference is worth being plain about. A forgery that copies the real
+signature's key tag, algorithm and validity window - all of them public - buys a
+verification apiece, and enough of them in front of the real one will exhaust
+this and turn the answer Bogus. No number fixes that: the count and the order
+are the sender's, so any budget spent in section order can be spent before the
+record that matters. What stops it being worth doing is that whoever can rewrite
+a response that far can deny the answer by corrupting it instead, which DNSSEC
+never promised to prevent. Leaving the budget out is the option that is actually
+unsafe - that is unbounded verification on a message an attacker wrote.
 */
 MAX_VERIFICATIONS_PER_QUERY :: 64
 
@@ -288,12 +308,22 @@ Authenticated_Set :: struct {
 	type:      dns.Type,
 	class:     dns.Class,
 	signer:    string,
-	// Which signature carried it, so the prune can keep that one whatever else
-	// it drops. A tag is not unique, but a tag and an algorithm together pick
-	// out the signature that verified closely enough that nothing an attacker
-	// adds can push it out.
-	key_tag:   u16,
-	algorithm: u8,
+	/*
+	The signature bytes of the RRSIG that carried it, so the prune can keep that
+	record whatever else it drops.
+
+	The bytes rather than the key tag and algorithm, which is what this was
+	first: both of those are published in the zone's DNSKEY set, so an attacker
+	copies them off the genuine signature and every forgery it writes takes the
+	exemption too - the cap then never fires and the padding it was meant to
+	stop rides out under AD. The signature itself is the one field of an RRSIG
+	that cannot be copied from public data and still be the record that
+	verified.
+
+	A slice into the message the verdict was reached over, which the caller's
+	arena keeps alive for as long as the prune needs it.
+	*/
+	signature: []u8,
 }
 
 /*
@@ -502,8 +532,7 @@ authenticated_only :: proc(
 	for rec in section {
 		covered := rec.type
 		signer: string
-		key_tag: u16
-		algorithm: u8
+		signature: []u8
 		if rec.type == .RRSIG {
 			/*
 			An RRSIG rides on the RRset it covers. Nothing signs an RRSIG (RFC
@@ -550,8 +579,7 @@ authenticated_only :: proc(
 			}
 			covered = sig.type_covered
 			signer = sig.signer
-			key_tag = sig.key_tag
-			algorithm = sig.algorithm
+			signature = sig.signature
 		}
 		idx, ok := authenticated_rrset(kept, rec.name, covered, rec.class)
 		if !ok {
@@ -561,8 +589,9 @@ authenticated_only :: proc(
 			if !dns.name_equal_fold(signer, kept[idx].signer) {
 				continue
 			}
-			// The one that verified is never subject to the cap.
-			if key_tag != kept[idx].key_tag || algorithm != kept[idx].algorithm {
+			// The record that verified is never subject to the cap; everything
+			// else naming the same signer is.
+			if !slice.equal(signature, kept[idx].signature) {
 				if sigs_kept[idx] >= MAX_SIGNATURES_PER_RRSET {
 					continue
 				}
@@ -654,7 +683,7 @@ validate_answer :: proc(
 		records := records_of(msg.answer, rec.name, rec.type, class, allocator)
 		sigs := sigs_covering(msg.answer, rec.name, rec.type, class, allocator)
 
-		status, encloser, why, signer, tag, algo := validate_rrset(
+		status, encloser, why, signer, signature := validate_rrset(
 			v,
 			budget,
 			rec.name,
@@ -699,8 +728,7 @@ validate_answer :: proc(
 				type = rec.type,
 				class = class,
 				signer = signer,
-				key_tag = tag,
-				algorithm = algo,
+				signature = signature,
 			},
 		)
 	}
@@ -874,7 +902,7 @@ proved_denial :: proc(
 ) -> []Authenticated_Set {
 	out := make([dynamic]Authenticated_Set, 0, len(proved) + 1, allocator)
 	append(&out, ..proved)
-	_, signer, tag, algo, ok := verified_rrset(budget, msg.authority, zone, .SOA, class, zone, keys, unix, allocator)
+	_, signer, signature, ok := verified_rrset(budget, msg.authority, zone, .SOA, class, zone, keys, unix, allocator)
 	if ok {
 		append(
 			&out,
@@ -883,8 +911,7 @@ proved_denial :: proc(
 				type = .SOA,
 				class = class,
 				signer = signer,
-				key_tag = tag,
-				algorithm = algo,
+				signature = signature,
 			},
 		)
 	}
@@ -918,8 +945,7 @@ validate_rrset :: proc(
 	reason: string,
 	// Which signature carried the set, for `Authenticated_Set`.
 	signer: string,
-	key_tag: u16,
-	algorithm: u8,
+	signature: []u8,
 ) {
 	/*
 	Each signature names the zone that claims the data, and each is judged
@@ -962,7 +988,7 @@ validate_rrset :: proc(
 		result, expanded_from := check_signature(sig, owner, class, records, keys, unix, allocator)
 		#partial switch result {
 		case .Ok:
-			return .Secure, expanded_from, "", sig.signer, sig.key_tag, sig.algorithm
+			return .Secure, expanded_from, "", sig.signer, sig.signature
 		case .Unsupported:
 			unsupported = true
 		case .Refused:
@@ -979,11 +1005,11 @@ validate_rrset :: proc(
 	owner_status, _, _ := zone_trust(v, budget, owner, now, allocator)
 	switch owner_status {
 	case .Insecure:
-		return .Insecure, "", "unsigned zone", "", 0, 0
+		return .Insecure, "", "unsigned zone", "", nil
 	case .Indeterminate:
-		return .Indeterminate, "", "chain of trust unavailable", "", 0, 0
+		return .Indeterminate, "", "chain of trust unavailable", "", nil
 	case .Bogus:
-		return .Bogus, "", "broken chain of trust", "", 0, 0
+		return .Bogus, "", "broken chain of trust", "", nil
 	case .Secure:
 	}
 
@@ -1001,7 +1027,7 @@ validate_rrset :: proc(
 	point of the second algorithm, inverted.
 	*/
 	if unsupported {
-		return .Bogus, "", "no signature this build can verify", "", 0, 0
+		return .Bogus, "", "no signature this build can verify", "", nil
 	}
 
 	/*
@@ -1018,9 +1044,9 @@ validate_rrset :: proc(
 	DS instead.
 	*/
 	if refused {
-		return .Insecure, "", "algorithm refused by local policy", "", 0, 0
+		return .Insecure, "", "algorithm refused by local policy", "", nil
 	}
-	return .Bogus, "", missing, "", 0, 0
+	return .Bogus, "", missing, "", nil
 }
 
 /*
@@ -1236,7 +1262,7 @@ validated_denial_records :: proc(
 		}
 		append(&seen, dns.Question{name = rec.name, type = rec.type})
 
-		records, signer, tag, algo, ok := verified_rrset(
+		records, signer, signature, ok := verified_rrset(
 			budget,
 			authority,
 			rec.name,
@@ -1261,8 +1287,7 @@ validated_denial_records :: proc(
 				type = rec.type,
 				class = class,
 				signer = signer,
-				key_tag = tag,
-				algorithm = algo,
+				signature = signature,
 			},
 		)
 
@@ -1320,13 +1345,12 @@ verified_rrset :: proc(
 ) -> (
 	records: []dns.Record,
 	signer: string,
-	key_tag: u16,
-	algorithm: u8,
+	signature: []u8,
 	ok: bool,
 ) {
 	records = records_of(section, owner, type, class, allocator)
 	if len(records) == 0 {
-		return nil, "", 0, 0, false
+		return nil, "", nil, false
 	}
 	for sig in sigs_covering(section, owner, type, class, allocator) {
 		if !dns.name_equal_fold(sig.signer, zone) {
@@ -1344,10 +1368,10 @@ verified_rrset :: proc(
 		}
 		result, _ := check_signature(sig, owner, class, records, keys, unix, allocator)
 		if result == .Ok {
-			return records, sig.signer, sig.key_tag, sig.algorithm, true
+			return records, sig.signer, sig.signature, true
 		}
 	}
-	return nil, "", 0, 0, false
+	return nil, "", nil, false
 }
 
 // ---------------------------------------------------------------------------
@@ -1941,7 +1965,7 @@ dname_covered :: proc(
 		// Only now is it worth checking the DNAME itself, which costs a walk.
 		records := records_of(msg.answer, rec.name, .DNAME, class, allocator)
 		sigs := sigs_covering(msg.answer, rec.name, .DNAME, class, allocator)
-		status, _, _, _, _, _ := validate_rrset(v, budget, rec.name, .DNAME, class, records, sigs, unix, now, allocator)
+		status, _, _, _, _ := validate_rrset(v, budget, rec.name, .DNAME, class, records, sigs, unix, now, allocator)
 		if status == .Secure {
 			return true
 		}
