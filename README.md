@@ -1049,7 +1049,10 @@ and AAAA records and the `ipv4hint`/`ipv6hint` parameters of SVCB and HTTPS
 records, which are addresses a browser connects to without ever asking for the A
 record. `169.254.169.254` is worth naming on its own: it is the cloud instance
 metadata endpoint, it answers unauthenticated to anything that can reach it, and
-what it hands back is credentials.
+what it hands back is credentials. `0.0.0.0` is in the set for a similar reason
+rather than as tidiness: browsers on Linux and macOS reach services bound to
+`127.0.0.1` by connecting to `0.0.0.0`, which is what the "0.0.0.0 Day"
+disclosure was about, so it is a working bypass and not merely an odd answer.
 
 One offending record refuses the whole answer rather than being filtered out of
 it, so a mixed answer cannot be used to sneak one through and the guard does not
@@ -1101,11 +1104,17 @@ targets, sharing an address space with the router, the printer and the NAS. That
 population is also the least likely to work through a list of optional hardening
 switches. A default nobody turns on protects nobody.
 
-Against that: the failure mode of this feature is breaking legitimate resolution,
-and it is a real cost rather than a hypothetical one. What it breaks is named
-below, and what makes the default defensible is that the failure is loud — a
-`warn` at the first refusal naming the setting, a counter, a query-log line — and
-the attack it prevents is silent.
+Against that, plainly: **if your upstream is your own internal DNS server and it
+resolves internal names to RFC 1918 addresses, those names stop resolving the
+moment you upgrade to a version with this in it.** Not degrade — stop, with
+NODATA, which looks exactly like a name that does not exist. The fix is one line,
+`rebind.allow_domains`, naming the zones that are allowed to answer that way; it
+is described below and `--check` reads it. If you run split horizon, put that
+line in before you upgrade.
+
+The rest of the argument for the default is that the failure is loud — a `warn`
+at the first refusal naming the address and both settings that would allow it, a
+counter, a query-log line — and the attack it prevents is silent.
 
 #### What this makes unresolvable
 
@@ -1135,18 +1144,31 @@ the attack it prevents is silent.
   answers blocked names with `0.0.0.0` or `127.0.0.1` — a Pi-hole, or dnsmasq
   with `--address=/ads.example/0.0.0.0` — those answers become NODATA here. The
   name is blocked either way, so nothing an operator wanted stops resolving, but
-  `rebind=` will climb steadily and stop being a useful signal that something is
-  attacking you. `allow_loopback`, or moving the filtering into elodin's own
-  [sink lists](#sink-lists), settles it.
+  `rebind=` will climb in proportion to how much that upstream is filtering. **If
+  you see `rebind=` rising, check whether your upstream sinkholes before
+  concluding you are being attacked**: a counter that tracks your own ad blocking
+  says nothing about an attacker. Moving the filtering into elodin's own
+  [sink lists](#sink-lists) settles it, and `allow_loopback` settles the
+  `127.0.0.1` half.
 
-Three things that look like they would break and do not. `rewrites` need no
+  `0.0.0.0` is not dropped from the set to make that counter tidier. It is a
+  working bypass — see above — and leaving the most interesting target in the set
+  open in order to keep a number clean is the wrong trade.
+
+Four things that look like they would break and do not. `rewrites` need no
 exemption: a rewritten name is answered out of the configuration long before
 anything is forwarded, so `nas.home` pointing at `192.168.1.50` never reaches an
 upstream and never reaches this check. Reverse lookups are unaffected — a PTR
 answer is a name, not an address, and the RFC 6303 reverse zones are handled
-separately (see [DNSSEC](#dnssec)). And elodin's own blocking, whatever
+separately (see [DNSSEC](#dnssec)). elodin's own blocking, whatever
 `blocking.response` is set to, builds its answer locally rather than forwarding
-for one.
+for one — including `zeroip`, whose `0.0.0.0` and `::` are in the refused set but
+never travel the path this check sits on. And `localhost.`, with everything under
+it, may be answered with `127.0.0.1` or `::1` with nothing configured: RFC 6761
+section 6.3 makes those the only answers that name can have, so a loopback answer
+for it is legitimate by definition rather than by anybody's policy. Only as far
+as loopback, though — `evil.localhost` answered with `192.168.1.1` gets no
+latitude from that, since it is not an answer the RFC permits either.
 
 To restore the previous behaviour in one line:
 

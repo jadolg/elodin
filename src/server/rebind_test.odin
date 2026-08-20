@@ -7,6 +7,7 @@ import "core:time"
 import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:filter"
 import "elodin:upstream"
 
 /*
@@ -625,5 +626,129 @@ test_an_https_record_cannot_hint_at_a_private_address :: proc(t: ^testing.T) {
 		return
 	}
 	testing.expect_value(t, len(msg.answer), 0)
+	free_all(context.temp_allocator)
+}
+
+/*
+`localhost.` may be answered with loopback, without anybody configuring it.
+
+RFC 6761 section 6.3 makes 127.0.0.1 and ::1 the only answers that name can
+have, so this is not the operator granting latitude but the guard declining to
+refuse the one answer the standard permits. It is deliberately not a setting,
+and deliberately not deferred to the RFC 6761 handling that would answer the
+name locally and keep it off the forwarding path entirely: two guards whose
+correctness depends on which of them merged first is a live bug waiting for one
+to land while the other is still in review.
+
+The second half is the scope. The exemption is for the addresses section 6.3
+allows, not for the name - an upstream answering `evil.localhost` with
+192.168.1.1 is doing something the RFC does not permit either, and gets no
+latitude from this.
+*/
+@(test)
+test_localhost_may_be_answered_with_loopback :: proc(t: ^testing.T) {
+	loopback := [16]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+
+	names := []string{"localhost.", "app.localhost."}
+	for name in names {
+		cfg := rebind_config()
+		records := make([]dns.Record, 1, context.temp_allocator)
+		records[0] = a_record(name, {127, 0, 0, 1})
+		msg, ok := ask_with_reply(t, &cfg, name, .A, rebind_reply_of(name, .A, records))
+		if !ok {
+			return
+		}
+		testing.expectf(t, len(msg.answer) == 1, "%s was refused its own loopback address", name)
+
+		v6cfg := rebind_config()
+		v6recs := make([]dns.Record, 1, context.temp_allocator)
+		v6recs[0] = aaaa_record(name, loopback)
+		v6msg, v6ok := ask_with_reply(t, &v6cfg, name, .AAAA, rebind_reply_of(name, .AAAA, v6recs))
+		if v6ok {
+			testing.expectf(t, len(v6msg.answer) == 1, "%s was refused ::1", name)
+		}
+	}
+
+	// Loopback and no further: RFC 1918 out of a `.localhost` name is not an
+	// answer section 6.3 permits, so the exemption does not reach it.
+	cfg := rebind_config()
+	records := make([]dns.Record, 1, context.temp_allocator)
+	records[0] = a_record("evil.localhost.", {192, 168, 1, 1})
+	msg, ok := ask_with_reply(t, &cfg, "evil.localhost.", .A, rebind_reply_of("evil.localhost.", .A, records))
+	if ok {
+		testing.expect_value(t, len(msg.answer), 0)
+	}
+
+	// And the label break holds here as everywhere else: `notlocalhost.` is not
+	// inside `localhost.`.
+	plain := rebind_config()
+	precs := make([]dns.Record, 1, context.temp_allocator)
+	precs[0] = a_record("notlocalhost.", {127, 0, 0, 1})
+	pmsg, pok := ask_with_reply(t, &plain, "notlocalhost.", .A, rebind_reply_of("notlocalhost.", .A, precs))
+	if pok {
+		testing.expect_value(t, len(pmsg.answer), 0)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+`blocking.response: zeroip` answers a blocked name with 0.0.0.0, and 0.0.0.0 is
+in the set of addresses this guard refuses.
+
+Those two do not collide, because a block response is built locally by
+`build_block_response` and never travels the forwarding path the check sits on.
+But that is a fact about where the call site is, not about either feature: a
+check moved to cover locally-built answers would refuse every blocked name and
+take the whole blocking feature down with it, silently, for the one
+`blocking.response` mode that produces an address. This is what would fail
+instead.
+
+Both families, since `zeroip` answers AAAA with `::` and that is in the set too.
+*/
+@(test)
+test_a_zero_ip_block_response_still_reaches_the_client :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.cache.enabled = false
+	cfg.dnssec.enabled = false
+	cfg.blocking.enabled = true
+	cfg.blocking.response = .Zero_IP
+	// The guard is on, as it is by default. That is the point of the test.
+	testing.expect(t, cfg.rebind.enabled)
+
+	block, allow := filter.set_make(), filter.set_make()
+	filter.parse_list(block, allow, "0.0.0.0 ads.example.com\n", .Hosts)
+	engine := filter.engine_make()
+	defer filter.engine_destroy(engine)
+	filter.engine_swap(engine, block, allow)
+
+	s := Server {
+		cfg     = &cfg,
+		filters = engine,
+	}
+
+	types := []dns.Type{.A, .AAAA}
+	for type in types {
+		out, outcome, ok := handle_query(
+			&s,
+			rebind_query_type("ads.example.com.", type),
+			.UDP,
+			"127.0.0.1:5555",
+			context.temp_allocator,
+		)
+		if !testing.expectf(t, ok, "the %v block response was not sent at all", type) {
+			return
+		}
+		testing.expect_value(t, outcome, Outcome.Blocked)
+
+		msg, derr := dns.decode_message(out, context.temp_allocator)
+		testing.expect_value(t, derr, dns.Decode_Error.None)
+		testing.expectf(
+			t,
+			len(msg.answer) == 1,
+			"the %v sink answer was refused: blocking with zeroip has been taken down by the rebinding guard",
+			type,
+		)
+	}
 	free_all(context.temp_allocator)
 }
