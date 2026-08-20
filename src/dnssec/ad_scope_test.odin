@@ -233,9 +233,10 @@ type. Every one matched what it claimed to cover and rode out under the AD bit.
 
 The filter is signer equality against the signature that actually carried the
 set, which admits an algorithm rollover - those name the same signer - and
-refuses what the validator never looked at. Deliberately not a count cap: that
-was tried, and it evicted the genuine signature instead, because the forgeries
-come first in the section and the section order is the attacker's to choose.
+refuses what the validator never looked at. The rest are capped, and the
+signature that verified is exempt from the cap: a plain count cap was tried
+first and evicted the genuine signature instead, the forgeries coming first in
+a section whose order the attacker chooses.
 */
 @(private = "file")
 forged_rrsig :: proc(owner: string, signer: string) -> dns.Record {
@@ -324,6 +325,13 @@ test_forged_signatures_do_not_survive_the_prune_in_bulk :: proc(t: ^testing.T) {
 		)
 	}
 	testing.expect(t, sigs > 0, "every signature was dropped, including the genuine one")
+	testing.expectf(
+		t,
+		sigs <= MAX_SIGNATURES_PER_RRSET + 1,
+		"%d signatures survived for one RRset: the cap is %d beyond the one that verified",
+		sigs,
+		MAX_SIGNATURES_PER_RRSET,
+	)
 
 	/*
 	The assertion that matters, and the one a count cap failed.
