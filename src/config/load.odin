@@ -766,19 +766,58 @@ load_rebind :: proc(l: ^Loader, cfg: ^Config) {
 		out := make([]string, len(list), l.allocator)
 		kept := 0
 		for entry, i in list {
+			domain := canonical_domain(entry, l.allocator)
+
+			/*
+			`rewrites` further down does take a `*.` prefix, so an operator who
+			has written one there writes one here too, and `canonical_domain`
+			keeps the star. This list has no use for one - an entry already
+			covers everything below itself - so `*.corp.example.` would sit in
+			it matching nothing any client can ask for, and the symptom of that
+			is every internal name still answering NODATA after the fix was
+			applied, with no line anywhere saying why. That is the one failure
+			this setting exists to prevent, so the star is named here instead of
+			at three in the morning.
+
+			`zone` is what the entry meant; a bare `*` leaves nothing of it and
+			is the root, which the next check refuses for what it is.
+			*/
+			wildcard := strings.has_prefix(domain, "*.")
+			zone := domain
+			if wildcard {
+				zone = domain[2:]
+				if zone == "" {
+					zone = "."
+				}
+			}
+
 			/*
 			The root would exempt every name there is, which is `rebind.enabled:
 			false` written in a way nothing about the file makes obvious. Refused
 			rather than obeyed, on the same reasoning that `allow_from:` with no
 			value is refused: the two readings are a setting and its opposite.
 			*/
-			domain := canonical_domain(entry, l.allocator)
-			if domain == "." {
+			if zone == "." {
 				errorf(
 					l,
 					"rebind.allow_domains[%d]: %q exempts every name; set rebind.enabled to false if that is what you mean",
 					i,
 					entry,
+				)
+				continue
+			}
+			/*
+			Named rather than quietly stripped: `*.corp.example` means "below"
+			in the section that does take it and this list means "at or below",
+			so obeying it would widen an exemption past what was written.
+			*/
+			if wildcard {
+				errorf(
+					l,
+					"rebind.allow_domains[%d]: %q takes no wildcard; write %q, which already covers everything below it",
+					i,
+					entry,
+					strings.trim_suffix(zone, "."),
 				)
 				continue
 			}

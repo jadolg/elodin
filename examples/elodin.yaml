@@ -348,7 +348,9 @@ rebind:
 
   # Zones whose answers may carry private addresses, each covering itself and
   # everything under it — dnsmasq's --rebind-domain-ok. Matched against the name
-  # that was asked for, so a CNAME into one of these exempts nothing.
+  # that was asked for, so a CNAME into one of these exempts nothing. Write the
+  # zone, not a wildcard: `*.corp.example` is what `rewrites` below takes and is
+  # refused here, since the plain name already covers everything under it.
   #
   # If your upstream is your own internal DNS server and it resolves internal
   # names to RFC 1918 addresses, those names stop resolving until they are named

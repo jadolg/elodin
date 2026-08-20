@@ -309,10 +309,15 @@ two-byte length and that many bytes of value, in ascending key order (RFC 9460
 section 2.2). Walked rather than parsed into anything, because two of the keys
 matter and the rest are of no interest here.
 
-A length that runs past the end stops the walk instead of being clamped. The
-bytes came from an upstream, the record is already malformed if that happens, and
-guessing at where the next parameter starts would mean reading a key out of
-somebody else's value.
+A length that runs past the end stops the walk instead of being clamped, which
+fails open for whatever came after it. Named rather than left to be discovered:
+guessing at where the next parameter begins would mean reading a key out of the
+middle of somebody else's value, and refusing the answer outright would mean an
+SVCB record this walker disagrees with taking a name down - a young RR type where
+the disagreement is as likely to be ours. What makes it safe to fail open is that
+the attacker needs the *client* to act on the hint, and a client parsing the same
+RDATA by the same lengths reaches the same truncation and has nothing to act on.
+A client that reads past a declared length has a bug this could not have fixed.
 */
 @(private)
 private_svcb_hint :: proc(params: []u8, loopback_ok: bool) -> (addr: [16]u8, v6: bool, found: bool) {
@@ -365,14 +370,26 @@ Which is the same trade in both directions. An operator with a broken split
 horizon sees the warning once, at start, when every internal name is failing. An
 operator under an actual attack sees one warning and a counter that climbs, which
 is what a graph is for.
+
+Through `report_once` rather than the atomic on its own, so that the address is
+rendered only when a line is going to carry it. Both callers of this are floods -
+an attack, or a split horizon in which every query refuses - and `logx` throws a
+debug line away at a level check that `rebind_address_text` has already allocated
+and formatted for by then. That is the same reason `report_refusal` goes through
+it, and the same arithmetic: work per refused query, decided by whoever is
+sending them.
 */
 @(private)
 rebind_reported: bool
 
 @(private)
 report_rebind :: proc(name: string, addr: [16]u8, v6: bool, allocator: mem.Allocator) {
+	say, first := report_once(&rebind_reported, logx.enabled(.Debug))
+	if !say {
+		return
+	}
 	text := rebind_address_text(addr, v6, allocator)
-	if sync.atomic_exchange(&rebind_reported, true) {
+	if !first {
 		logx.debugf("refused an answer for %s carrying the private address %s", dns.name_trim_root(name), text)
 		return
 	}
