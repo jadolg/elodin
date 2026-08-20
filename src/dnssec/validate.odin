@@ -548,12 +548,30 @@ strip_unauthenticated :: proc(
 /*
 Whether the response is really a denial that the answer section only leads up to.
 
-True when the chain ends without a record of the type asked for and the sender
-put a denial in the authority section to say why. `CNAME` and `ANY` questions
-are answered by the chain itself, so neither is this shape.
+Two things have to hold. The chain has to stop short of the type asked for -
+`CNAME` and `ANY` are answered by the chain itself, so neither is this shape -
+and the sender has to be claiming a denial rather than simply handing over a
+chain for the client to follow.
 
-Read off the message rather than from the rcode alone, because NODATA carries
-NOERROR: what marks it is the absence of the type, not the code.
+That second half is where the first attempt at this went wrong. It asked whether
+the authority section held an SOA, an NSEC or an NSEC3, which is a question
+about records the sender writes: flip the rcode to NXDOMAIN, *delete* the
+authority section, and the guard did not fire - so the answer stayed `Secure`,
+the prune cut it down to the CNAME, and the client read an authenticated
+NXDOMAIN that nothing proved. A guard an attacker turns off by sending less is
+a guard against honest responders only.
+
+The rcode is the other way a denial is claimed and it cannot be dropped, only
+set - and setting it is what makes this fire. So the shapes are: NXDOMAIN,
+whatever the authority section holds or does not hold; or NOERROR with an SOA
+behind it, which is what RFC 2308 section 2.2 makes a NODATA.
+
+An SOA specifically, not any NSEC or NSEC3, and that is the other correction. A
+wildcard-expanded answer carries the NSEC or NSEC3 that RFC 4035 section 3.1.3
+requires beside it to show the expansion was allowed - a proof *for* the answer,
+not against it, and one `validate_wildcard_proof` is about to check. Treating
+that as a denial refused a legitimately signed answer its AD bit and never
+reached the code that would have confirmed it.
 */
 @(private)
 denial_after_chain :: proc(msg: dns.Message, qtype: dns.Type, class: dns.Class) -> bool {
@@ -565,9 +583,11 @@ denial_after_chain :: proc(msg: dns.Message, qtype: dns.Type, class: dns.Class) 
 			return false
 		}
 	}
+	if dns.rcode_of(msg) == .NX_Domain {
+		return true
+	}
 	for rec in msg.authority {
-		#partial switch rec.type {
-		case .SOA, .NSEC, .NSEC3:
+		if rec.type == .SOA {
 			return true
 		}
 	}
@@ -1203,10 +1223,14 @@ validate_rrset :: proc(
 	`spend_lookup` already settles this the same way: a chain this server could
 	not afford to walk comes back `Indeterminate`, "chain of trust unavailable",
 	because the answer might be perfectly good and we simply stopped looking.
-	Reporting a budget of ours as `Bogus` publishes a resource limit to the
-	operator as a forgery - `Stats.bogus` counts it, the log names the client
-	beside the word forgery, and the client is handed extended error 6, "DNSSEC
-	Bogus", for an answer nobody found anything wrong with.
+
+	What that changes today is the extended error the client is sent - 22,
+	"No Reachable Authority", instead of 6, "DNSSEC Bogus" - and the `reason`
+	that reaches the log. It does not change the counters: `resolve_query`
+	handles `Bogus` and `Indeterminate` in one branch, so `Stats.bogus` moves for
+	both, which is worth knowing before reading that gauge as a forgery count.
+	Splitting them is a change to what the metric means and belongs with the
+	metric rather than here.
 	*/
 	if exhausted {
 		return .Indeterminate, "", "verification budget spent", "", {}
@@ -1403,7 +1427,7 @@ validate_wildcard_proof :: proc(
 	if !name_in_zone(next_closer, established) {
 		return .Bogus, nil
 	}
-	nsecs, nsec3s, verified, _ := validated_denial_records(
+	nsecs, nsec3s, verified, wildcard_spent := validated_denial_records(
 		v,
 		budget,
 		msg.authority,
@@ -1414,6 +1438,15 @@ validate_wildcard_proof :: proc(
 		now,
 		allocator,
 	)
+	/*
+	The same allowance, and the same answer. Falling through here reports a
+	budget of ours as "wildcard expansion not proven", which reaches the client
+	as a forged answer - the one thing every other exhaustion path in this file
+	now takes care not to say.
+	*/
+	if wildcard_spent {
+		return .Indeterminate, nil
+	}
 	if len(nsecs) > 0 {
 		if _, covered := nsec_covering(nsecs, next_closer); covered {
 			return .Secure, verified
