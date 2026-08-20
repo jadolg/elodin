@@ -340,6 +340,57 @@ test_a_decoy_cname_beside_the_listed_one_does_not_hide_it :: proc(t: ^testing.T)
 	free_all(context.temp_allocator)
 }
 
+/*
+And the decoy one hop further down, where nothing on the branch is listed until
+the second name on it.
+
+Matching both CNAMEs at the owner and then following only the first is the same
+hole with one more hop in front of it: the innocent branch ends immediately, the
+walk ends with it, and the tracker sits two names along the branch the client is
+equally free to take.
+*/
+@(test)
+test_a_decoy_branch_does_not_end_the_walk_before_the_other_one :: proc(t: ^testing.T) {
+	answer := make([]dns.Record, 4, context.temp_allocator)
+	answer[0] = dns.Record {
+		name  = "www.brand.example.",
+		type  = .CNAME,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_Name{name = "decoy.brand.example."},
+	}
+	answer[1] = dns.Record {
+		name  = "www.brand.example.",
+		type  = .CNAME,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_Name{name = "hop.other.example."},
+	}
+	answer[2] = dns.Record {
+		name  = "hop.other.example.",
+		type  = .CNAME,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_Name{name = "tracker.evil.example."},
+	}
+	answer[3] = dns.Record {
+		name  = "tracker.evil.example.",
+		type  = .A,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_A{addr = {203, 0, 113, 7}},
+	}
+	outcome := serve_cached_answer(
+		t,
+		"www.brand.example.",
+		chain_wire("www.brand.example.", answer),
+		[]string{"tracker.evil.example"},
+		nil,
+	)
+	testing.expect_value(t, outcome, Outcome.Blocked)
+	free_all(context.temp_allocator)
+}
+
 // The hop cap from the other side: a chain that never ends is answered rather
 // than walked forever.
 @(test)

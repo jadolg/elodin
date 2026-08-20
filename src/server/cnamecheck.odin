@@ -22,10 +22,12 @@ one of those silently retune the other.
 Counted in names matched rather than in hops followed, which for any answer a
 zone would publish is the same number. It is not the same number for an answer
 built to be expensive: one owner name may carry a thousand CNAMEs, every one of
-them a name to look up, and a cap on the hops alone would let the width of the
-answer through while bounding only its length. What is left is the record scan
-per hop, which is a string compare that fails on the first byte for all but the
-few records that share the owner name being followed.
+them a name to look up and each a branch of its own to walk, and a cap on the
+hops alone would let the width of the answer through while bounding only its
+length. What is left is one scan of the answer section per name walked - a
+string compare that fails on the first byte for all but the records sharing that
+owner - so the whole walk is bounded at seventeen passes over an answer whose
+size the decoder has already bounded.
 */
 @(private)
 MAX_CHAIN_NAMES :: 16
@@ -73,20 +75,8 @@ would turn a malformed record into a withheld name, and a target this server
 cannot read is one the client is being handed in the same unreadable state.
 */
 @(private)
-cloaked_chain_target :: proc(
-	s: ^Server,
-	wire: []u8,
-	qname: string,
-	allocator: mem.Allocator,
-) -> (
-	target: string,
-	found: bool,
-) {
-	if !s.cfg.blocking.enabled || s.filters == nil {
-		return "", false
-	}
-	msg, err := dns.decode_message(wire, allocator)
-	if err != .None || len(msg.answer) == 0 {
+cloaked_chain_target :: proc(s: ^Server, answer: []dns.Record, qname: string) -> (target: string, found: bool) {
+	if !s.cfg.blocking.enabled || s.filters == nil || len(answer) == 0 {
 		return "", false
 	}
 
@@ -94,11 +84,29 @@ cloaked_chain_target :: proc(
 		return "", false
 	}
 
-	name := qname
+	/*
+	Names still to have their own CNAMEs looked for, the question first.
+
+	A work list rather than a single name carried forward, because an owner may
+	hold more than one CNAME and each of them is a name a client may end up at.
+	Following only the first would leave the rest matched but not walked, and a
+	decoy one hop deep - an innocent target listed first, the tracker reached
+	through the second - would carry the whole chain below it past this.
+
+	At most one entry is added per name looked up, so `MAX_CHAIN_NAMES` bounds
+	the list at that many plus the question it starts with. A name already on it
+	is not added twice, which is what stops a chain that loops from spending the
+	budget going round it.
+	*/
+	pending: [MAX_CHAIN_NAMES + 1]string
+	pending[0] = qname
+	head, tail := 0, 1
+
 	looked_up := 0
-	for looked_up < MAX_CHAIN_NAMES {
-		next := ""
-		for r in msg.answer {
+	for head < tail && looked_up < MAX_CHAIN_NAMES {
+		name := pending[head]
+		head += 1
+		for r in answer {
 			if looked_up >= MAX_CHAIN_NAMES {
 				break
 			}
@@ -110,12 +118,11 @@ cloaked_chain_target :: proc(
 				continue
 			}
 			/*
-			Every CNAME at this owner is matched, not only the one the walk goes
-			on to follow. A name may own one CNAME and nothing else (RFC 1034
-			section 3.6.2), so a second is a broken answer - but it is a broken
-			answer somebody wrote on purpose, and which of the two a client picks
-			is the client's business. Matching only the first would let a decoy
-			hop carry the listed one past this.
+			Every CNAME at this owner counts, not just the first. A name may own
+			one CNAME and nothing else (RFC 1034 section 3.6.2), so a second is a
+			broken answer - but it is one somebody wrote on purpose, and which of
+			them a client picks is the client's business rather than something to
+			guess at here.
 			*/
 			looked_up += 1
 			switch filter.engine_match(s.filters, v.name) {
@@ -127,14 +134,18 @@ cloaked_chain_target :: proc(
 				}
 			case .None:
 			}
-			if next == "" {
-				next = v.name
+			seen := false
+			for i in 0 ..< tail {
+				if dns.name_equal_fold(pending[i], v.name) {
+					seen = true
+					break
+				}
+			}
+			if !seen && tail < len(pending) {
+				pending[tail] = v.name
+				tail += 1
 			}
 		}
-		if next == "" {
-			break
-		}
-		name = next
 	}
 	return target, target != ""
 }
@@ -147,6 +158,11 @@ just produced, and the one the cache held - and get back the response to send
 instead. Written as one procedure with the counter and the log line inside it so
 that the two paths cannot drift into blocking on different grounds or counting
 it differently.
+
+The answer section arrives decoded rather than as wire. Each caller has the
+message in hand already - the forwarding path decodes it for the cache and the
+hit path to reach this at all - and taking the bytes here meant decoding every
+forwarded response a second time for nothing.
 
 The response is built from the question, exactly as a block on the question is:
 what the client asked for is `www.brand.example`, and `blocking.response` says
@@ -161,7 +177,7 @@ which is where somebody working out why a site broke will look for it.
 @(private)
 block_cloaked_answer :: proc(
 	s: ^Server,
-	wire: []u8,
+	answer: []dns.Record,
 	msg: dns.Message,
 	q: dns.Question,
 	proto: Protocol,
@@ -173,7 +189,7 @@ block_cloaked_answer :: proc(
 	response: []u8,
 	blocked: bool,
 ) {
-	target, cloaked := cloaked_chain_target(s, wire, q.name, allocator)
+	target, cloaked := cloaked_chain_target(s, answer, q.name)
 	if !cloaked {
 		return nil, false
 	}

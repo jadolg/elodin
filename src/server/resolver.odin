@@ -602,6 +602,25 @@ resolve_query :: proc(
 	}
 
 	/*
+	Decoded once for the two things below that both need it: the chain walk reads
+	the answer section, and the cache reads the whole message. Decoding for each
+	of them separately meant a second full pass over every forwarded response,
+	which is the one part of this that every query pays for.
+
+	Skipped when neither of them will run, which is the only arrangement that was
+	not already paying for a decode here. A response this server cannot decode is
+	still handed to the client - it is the upstream's answer, not ours to withhold
+	over our own reading of it - it is only not walked and not stored.
+	*/
+	decoded: dns.Message
+	have_decoded := false
+	if s.cfg.cache.enabled || (s.cfg.blocking.enabled && s.filters != nil) {
+		if d, dec_err := dns.decode_message(resp, allocator); dec_err == .None {
+			decoded, have_decoded = d, true
+		}
+	}
+
+	/*
 	Ahead of the cache, so that nothing this refuses is stored at all. The hit
 	path checks what it serves too, so storing it would not open the hole back
 	up - but an answer this server has decided not to hand out is not one to keep
@@ -615,28 +634,38 @@ resolve_query :: proc(
 	everything this can decide is to withhold an answer the validator was willing
 	to pass.
 	*/
-	if out, cloaked := block_cloaked_answer(s, resp, msg, q, proto, client, limit, started, allocator); cloaked {
-		return out, .Blocked, true
+	if have_decoded {
+		if out, cloaked := block_cloaked_answer(
+			s,
+			decoded.answer,
+			msg,
+			q,
+			proto,
+			client,
+			limit,
+			started,
+			allocator,
+		); cloaked {
+			return out, .Blocked, true
+		}
 	}
 
-	if s.cfg.cache.enabled {
-		if decoded, dec_err := dns.decode_message(resp, allocator); dec_err == .None {
-			/*
-			Settled before the entry goes in, rather than only on the way out to
-			this client.
+	if s.cfg.cache.enabled && have_decoded {
+		/*
+		Settled before the entry goes in, rather than only on the way out to this
+		client.
 
-			`validating` is recomputed for every request and can be turned off
-			after the key is built - the upstream query failing to rebuild does
-			exactly that - so nothing otherwise ties the AD bit an entry carries
-			to whether that entry was ever validated. A later request that does
-			validate reads the stored bit as a verdict of ours and hands the
-			upstream's claim to a client under our name.
-			*/
-			if !validating {
-				set_ad_bit(resp, false)
-			}
-			cache.put(s.answers, key, resp, decoded, generation)
+		`validating` is recomputed for every request and can be turned off after
+		the key is built - the upstream query failing to rebuild does exactly
+		that - so nothing otherwise ties the AD bit an entry carries to whether
+		that entry was ever validated. A later request that does validate reads
+		the stored bit as a verdict of ours and hands the upstream's claim to a
+		client under our name.
+		*/
+		if !validating {
+			set_ad_bit(resp, false)
 		}
+		cache.put(s.answers, key, resp, decoded, generation)
 	}
 
 	sync.atomic_add(&s.stats.forwarded, 1)
@@ -737,11 +766,30 @@ serve_from_cache :: proc(
 	stamp, which is what asks for that walk.
 	*/
 	if hit.recheck {
-		if out, cloaked := block_cloaked_answer(s, hit.wire, msg, q, proto, client, limit, started, allocator);
-		   cloaked {
-			return out, .Blocked, true
+		// The entry decoded once already, on the way in - `cache.put` will not
+		// store a message it could not read - so this is the copy being decoded,
+		// not a question of whether it can be.
+		if stored, derr := dns.decode_message(hit.wire, allocator); derr == .None {
+			if out, cloaked := block_cloaked_answer(
+				s,
+				stored.answer,
+				msg,
+				q,
+				proto,
+				client,
+				limit,
+				started,
+				allocator,
+			); cloaked {
+				return out, .Blocked, true
+			}
+			// Inside the decode, not after it. An entry nothing could read has
+			// not been looked at, and stamping it here would say it had - which
+			// is the one way this mechanism could come to skip a walk it owed.
+			// Unreachable as things stand, since `cache.put` stores nothing it
+			// could not decode, and not a thing to leave resting on that.
+			cache.note_checked(s.answers, hit.key, hit.serial, hit.checked)
 		}
-		cache.note_checked(s.answers, hit.key, hit.serial, hit.checked)
 	}
 
 	wire := hit.wire
