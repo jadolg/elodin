@@ -206,6 +206,25 @@ present_response :: proc(
 		if pruned, ok := dnssec.strip_unauthenticated(out, result, allocator, dns.MAX_MESSAGE); ok {
 			out = pruned
 		} else {
+			/*
+			Said out loud, because everything else about this is silent. The
+			answer validated - `Stats.secure` has already counted it - and the
+			client is about to get it without the bit that says so, which from
+			the outside is indistinguishable from a zone that is not signed. The
+			copy stored in the cache is the AD-less one too, so every later
+			client for that name loses it as well, for the life of the entry.
+
+			Reachable rather than theoretical: `encode_message` refuses raw RDATA
+			of a compressible type that still holds a compression pointer, which
+			is what `decode_raw_rdata` leaves behind when it could not expand
+			one, so an MX or an NS this decoder could not fully read takes the
+			bit down with it.
+			*/
+			logx.warnf(
+				"dnssec: %s %s validated but could not be rebuilt without its unauthenticated records; answering without the AD bit",
+				dns.type_name(qtype),
+				dns.name_trim_root(query.question[0].name if len(query.question) > 0 else "?"),
+			)
 			secure = false
 		}
 	}
