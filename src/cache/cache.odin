@@ -53,8 +53,12 @@ Entry :: struct {
 
 	Meaningless while `recheck` is set; the caller is being asked to decide again
 	and this is what it decided last time.
+
+	A byte in whatever numbering the caller keeps, as `checked` is a number in
+	whatever numbering the caller keeps. Zero is "nothing was decided", which is
+	what an entry nobody has walked reads as.
 	*/
-	refused:     bool,
+	refused:     u8,
 	/*
 	Which entry this is, counted up once per insert and never reused.
 
@@ -92,7 +96,7 @@ Hit :: struct {
 	Read it only then: with `recheck` set the verdict is out of date by
 	definition, which is what `recheck` says.
 	*/
-	refused: bool,
+	refused: u8,
 	// Which entry the bytes came out of, for `note_checked`.
 	serial:  u64,
 }
@@ -336,12 +340,22 @@ get :: proc(
 	return out, hit, true
 }
 
-// Does the answer section send the client somewhere else? See `Entry.redirects`.
+/*
+Does the answer section send the client somewhere else? See `Entry.redirects`.
+
+A CNAME and nothing else. A DNAME redirects too, in the sense that matters to a
+client, but the caller's walk follows the CNAME that RFC 6672 section 3.1 has
+the responder synthesize alongside it rather than deriving the target from the
+DNAME itself - so an entry flagged here for a DNAME with no CNAME beside it
+would be handed back for a walk that has nothing to look at, once per reload,
+forever. The two definitions have to be the same one or the flag stops meaning
+what it says.
+*/
 @(private)
 redirects :: proc(msg: dns.Message) -> bool {
 	for r in msg.answer {
 		#partial switch r.type {
-		case .CNAME, .DNAME:
+		case .CNAME:
 			return true
 		}
 	}
@@ -365,7 +379,7 @@ another worker may have replaced the answer in between, and stamping its bytes
 with a verdict reached on the bytes they displaced is how an answer nobody
 matched comes to look as though somebody had.
 */
-note_checked :: proc(c: ^Cache, key: string, serial: u64, checked: u64, refused: bool) {
+note_checked :: proc(c: ^Cache, key: string, serial: u64, checked: u64, refused: u8) {
 	if c == nil {
 		return
 	}

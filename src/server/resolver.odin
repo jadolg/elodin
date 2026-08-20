@@ -404,12 +404,15 @@ resolve_query :: proc(
 	number of a rule set that arrived after it had been matched, and that entry
 	would then never be looked at again.
 
-	Not read at all with the cache off. The number exists to date a stored answer,
-	and with nothing stored it is a second trip through the engine's lock on every
-	query for a value nothing reads.
+	Not read at all unless both halves are on. The number exists to date a stored
+	answer against the rule sets, so with nothing stored, or no rule sets to date
+	it against, it is a second trip through the engine's lock on every query for a
+	value nothing reads. With blocking off the engine is never swapped at all -
+	`reload_filters` runs only under that flag - so the number would sit at zero
+	and match every entry's stamp for the life of the process.
 	*/
 	generation: u64
-	if s.cfg.cache.enabled {
+	if s.cfg.cache.enabled && s.cfg.blocking.enabled && s.filters != nil {
 		generation = filter.engine_generation(s.filters)
 	}
 
@@ -643,7 +646,7 @@ resolve_query :: proc(
 	to pass.
 	*/
 	if have_decoded {
-		if out, cloaked := block_cloaked_answer(
+		if out, verdict := block_cloaked_answer(
 			s,
 			decoded.answer,
 			msg,
@@ -653,7 +656,7 @@ resolve_query :: proc(
 			limit,
 			started,
 			allocator,
-		); cloaked {
+		); verdict != .Clear {
 			return out, .Blocked, true
 		}
 	}
@@ -703,8 +706,9 @@ Cached_Answer :: struct {
 	serial:  u64,
 	stale:   bool,
 	recheck: bool,
-	// What the last walk decided, when `recheck` says that decision is current.
-	refused: bool,
+	// What the last walk decided, as a `Cloak_Verdict`, when `recheck` says that
+	// decision is current.
+	refused: u8,
 	// The rule sets the re-match is made against, and the number stamped on the
 	// entry when it comes back clean.
 	checked: u64,
@@ -784,20 +788,26 @@ serve_from_cache :: proc(
 	names an attacker is interested in. With the verdict recorded, a refused
 	entry costs one walk per reload like any other.
 	*/
-	if !hit.recheck && hit.refused && cloak_refusal_stands(s) {
-		// `Listed` rather than the verdict that was reached: what is remembered
-		// is that the answer was refused, not which of the two reasons it was,
-		// and inventing a distinction the entry does not carry would put a name
-		// in the log line that nothing here looked up.
-		out := refuse_cloaked(s, q.name, .Listed, msg, q, proto, client, limit, started, allocator)
-		return out, .Blocked, true
+	if !hit.recheck && cloak_refusal_stands(s) {
+		if verdict := Cloak_Verdict(hit.refused); verdict != .Clear {
+			/*
+			No target, because the entry does not carry one. The name that
+			matched was a name in the stored answer's chain, and keeping a copy
+			of it would mean the cache holding a string on the caller's behalf
+			for the sake of one debug line. What the entry does carry is which
+			of the two refusals it was, so the query log says the same thing for
+			this hit as it said for the walk that decided it.
+			*/
+			out := refuse_cloaked(s, "", verdict, msg, q, proto, client, limit, started, allocator)
+			return out, .Blocked, true
+		}
 	}
 	if hit.recheck {
 		// The entry decoded once already, on the way in - `cache.put` will not
 		// store a message it could not read - so this is the copy being decoded,
 		// not a question of whether it can be.
 		if stored, derr := dns.decode_message(hit.wire, allocator); derr == .None {
-			if out, cloaked := block_cloaked_answer(
+			if out, verdict := block_cloaked_answer(
 				s,
 				stored.answer,
 				msg,
@@ -807,8 +817,8 @@ serve_from_cache :: proc(
 				limit,
 				started,
 				allocator,
-			); cloaked {
-				cache.note_checked(s.answers, hit.key, hit.serial, hit.checked, true)
+			); verdict != .Clear {
+				cache.note_checked(s.answers, hit.key, hit.serial, hit.checked, u8(verdict))
 				return out, .Blocked, true
 			}
 			// Inside the decode, not after it. An entry nothing could read has
@@ -816,7 +826,7 @@ serve_from_cache :: proc(
 			// is the one way this mechanism could come to skip a walk it owed.
 			// Unreachable as things stand, since `cache.put` stores nothing it
 			// could not decode, and not a thing to leave resting on that.
-			cache.note_checked(s.answers, hit.key, hit.serial, hit.checked, false)
+			cache.note_checked(s.answers, hit.key, hit.serial, hit.checked, u8(Cloak_Verdict.Clear))
 		}
 	}
 

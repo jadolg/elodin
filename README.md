@@ -412,6 +412,18 @@ somebody has listed. These show in the query log as `outcome=blocked
 detail=cname`, against `detail=list` for a question that was on a list itself,
 and the name that matched is logged at debug level.
 
+An answer whose chain runs past that sixteenth name is **withheld**, not served.
+Bounding the walk and then handing over whatever it did not reach would not be a
+bound at all — it would be a length to exceed, and exceeding it is free for
+whoever writes the answer, so a listed name one hop past the end would go
+straight through. Real chains are one or two names and no zone publishes
+seventeen, so what this turns away is answers built to be turned away. They are
+counted as blocked and logged as `outcome=blocked detail=cname-deep`, which is
+the one to look for if a site breaks with nothing on any list to explain it; an
+allow rule on the *question* skips the walk entirely and is the way out. Note
+that an allow rule on a hop past the sixteenth cannot help, because the walk
+stops before reaching it.
+
 The `address=/…/` and `server=/…/` forms are dnsmasq's, accepted because they
 turn up in lists that are otherwise adblock syntax. A `$` modifier
 (`$third-party`, `$important`) is dropped and the rest of the rule kept: none of

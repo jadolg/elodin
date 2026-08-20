@@ -75,12 +75,22 @@ would have matched the seventeenth. That is the price of bounding the work, and
 the answer it can happen to is one with sixteen names in its chain - which no
 zone publishes and an exception nobody could have known to write.
 
-A DNAME is not followed, and does not need to be: RFC 6672 section 3.1 has the
-responder synthesize the CNAME that the redirection amounts to and put it in the
-same answer, so the name the client ends up at is already on this walk. Matching
-the DNAME's own target instead would be matching a suffix - a rule naming
-`bar.example` says nothing about whether `x.bar.example` is listed - and would
-withhold a whole subtree on the strength of a name nobody asked for.
+A DNAME is not followed, and for an answer built to RFC 6672 section 3.1 it does
+not need to be: the responder synthesizes the CNAME that the redirection amounts
+to and puts it in the same answer, so the name the client ends up at is already
+on this walk. Matching the DNAME's own target instead would be matching a suffix
+- a rule naming `bar.example` says nothing about whether `x.bar.example` is
+listed - and would withhold a whole subtree on the strength of a name nobody
+asked for.
+
+What that leaves open is a responder which omits the synthesized CNAME while a
+client derives the target from the DNAME itself, which is a decoder differential
+rather than an oversight: this walk sees no redirection and clears the answer,
+and a client that synthesizes follows one. Stub resolvers do not generally
+synthesize, and the responder has to be the party running the cloaked zone for
+it to matter - which is why it is written down here rather than closed. Closing
+it means doing the suffix substitution properly and matching what comes out,
+not matching the DNAME's target as a name.
 
 A CNAME whose RDATA this decoder would not parse arrives as `Rdata_Raw`, and is
 passed over: there is no target in hand to look up. Refusing the answer instead
@@ -273,13 +283,13 @@ block_cloaked_answer :: proc(
 	allocator: mem.Allocator,
 ) -> (
 	response: []u8,
-	blocked: bool,
+	verdict: Cloak_Verdict,
 ) {
-	target, verdict := cloaked_chain_target(s, answer, q.name)
-	if verdict == .Clear {
-		return nil, false
+	target, reached := cloaked_chain_target(s, answer, q.name)
+	if reached == .Clear {
+		return nil, .Clear
 	}
-	return refuse_cloaked(s, target, verdict, msg, q, proto, client, limit, started, allocator), true
+	return refuse_cloaked(s, target, reached, msg, q, proto, client, limit, started, allocator), reached
 }
 
 /*

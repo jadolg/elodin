@@ -686,7 +686,7 @@ test_a_redirecting_entry_is_flagged_until_it_is_looked_at_again :: proc(t: ^test
 	_, again, _ := get(c, key, context.temp_allocator, checked_against = 2)
 	testing.expect(t, again.recheck, "the flag cleared itself without anything having looked")
 
-	note_checked(c, key, hit.serial, 2, false)
+	note_checked(c, key, hit.serial, 2, 0)
 	_, settled, _ := get(c, key, context.temp_allocator, checked_against = 2)
 	testing.expect(t, !settled.recheck, "the entry was looked at and still asks to be looked at again")
 
@@ -723,7 +723,7 @@ test_a_verdict_does_not_land_on_an_answer_that_replaced_the_one_it_was_reached_o
 	other_wire, other_msg := build_cname_answer("www.example.com.", "tracker.example.org.", 300, context.temp_allocator)
 	testing.expect(t, put(c, key, other_wire, other_msg, 2), "the replacement was not stored")
 
-	note_checked(c, key, hit.serial, 3, false)
+	note_checked(c, key, hit.serial, 3, 0)
 
 	_, after, _ := get(c, key, context.temp_allocator, checked_against = 3)
 	testing.expect(t, after.recheck, "a verdict reached on bytes that are gone cleared the answer that replaced them")
