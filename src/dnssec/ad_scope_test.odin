@@ -702,3 +702,94 @@ test_verbatim_copies_of_the_real_signature_are_capped :: proc(t: ^testing.T) {
 	testing.expectf(t, after.status == .Secure, "the pruned answer no longer validates (%v)", after.status)
 	free_all(context.temp_allocator)
 }
+
+/*
+A near-copy of the genuine signature cannot steal its exemption.
+
+The sharpest form of this, and the one two earlier tests both walked past: one
+copies the whole record, the other changes the signature bytes, and neither
+varies a field *other* than the signature while holding the signature fixed.
+
+That is the gap. Take the genuine RRSIG, flip a bit of its ORIGINAL TTL, leave
+the signature alone. It keeps the real key tag, algorithm and validity window,
+so nothing rejects it early and `check_signature` simply fails on it - but an
+exemption keyed on the signature bytes matched it. The mutant took the
+exemption, the forgeries behind it filled the cap, and the record that actually
+verified was the one dropped. The answer went out under AD, was cached, and
+validated for nobody.
+
+Ordered the way an attacker would: mutant first, padding next, the genuine
+record last.
+*/
+@(test)
+test_a_near_copy_does_not_evict_the_record_that_verified :: proc(t: ^testing.T) {
+	v := make_validator(ad_query, nil, Options{})
+	defer destroy_validator(v)
+
+	msg, derr := dns.decode_message(ad_unhex(ad_fixture("example_a").wire), context.temp_allocator)
+	if !testing.expect(t, derr == .None, "the fixture did not decode") {
+		return
+	}
+
+	genuine: dns.Record
+	found := false
+	answer := make([dynamic]dns.Record, 0, len(msg.answer) + 16, context.temp_allocator)
+	for rec in msg.answer {
+		if rec.type == .RRSIG && !found {
+			genuine, found = rec, true
+			continue
+		}
+		append(&answer, rec)
+	}
+	if !testing.expect(t, found, "the fixture carried no RRSIG") {
+		return
+	}
+
+	// The mutant: every byte of the genuine record except one bit of the
+	// ORIGINAL TTL, which sits at offset 4 of the RDATA and is not the signature.
+	raw, is_raw := genuine.data.(dns.Rdata_Raw)
+	if !testing.expect(t, is_raw, "the RRSIG did not arrive as raw RDATA") {
+		return
+	}
+	mutated := make([]u8, len(raw.data), context.temp_allocator)
+	copy(mutated, raw.data)
+	mutated[4] ~= 0x01
+	append(
+		&answer,
+		dns.Record {
+			name = genuine.name,
+			type = .RRSIG,
+			class = genuine.class,
+			ttl = genuine.ttl,
+			data = dns.Rdata_Raw{data = mutated},
+		},
+	)
+	// Padding, then the record that actually verifies, last.
+	for _ in 0 ..< MAX_SIGNATURES_PER_RRSET {
+		append(&answer, forged_like(genuine))
+	}
+	append(&answer, genuine)
+	msg.answer = answer[:]
+
+	tampered, _, enc := dns.encode_message(msg, context.temp_allocator, dns.MAX_MESSAGE)
+	testing.expect_value(t, enc, dns.Encode_Error.None)
+
+	result := validate(v, "www.example.com.", .A, tampered, time.unix(FIXTURE_TIME, 0))
+	if !testing.expectf(t, result.status == .Secure, "the verdict did not survive (%v)", result.status) {
+		return
+	}
+
+	out, ok := strip_unauthenticated(tampered, result, context.temp_allocator, dns.MAX_MESSAGE)
+	if !testing.expect(t, ok, "the pruned response should rebuild") {
+		return
+	}
+	after := validate(v, "www.example.com.", .A, out, time.unix(FIXTURE_TIME, 0))
+	testing.expectf(
+		t,
+		after.status == .Secure,
+		"the pruned answer no longer validates (%v: %s) - a near-copy took the exemption and the genuine record was evicted",
+		after.status,
+		after.reason,
+	)
+	free_all(context.temp_allocator)
+}
