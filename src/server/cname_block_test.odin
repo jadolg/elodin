@@ -841,3 +841,111 @@ test_a_refused_answer_is_not_cached_with_the_upstream_ad_bit :: proc(t: ^testing
 	)
 	free_all(context.temp_allocator)
 }
+
+/*
+A malformed record in a section the walk never reads does not cost the answer.
+
+The walk reads the answer section. The cache reads the whole message, so a
+record it cannot parse anywhere means the answer is not stored - which is fine,
+and was always the behaviour. What is not fine is refusing to *serve* it: for a
+round this gate was `!have_decoded`, which is the whole message, so one bad
+RDLENGTH in an additional section turned a clean, walkable answer into SERVFAIL,
+and only once blocking was on.
+
+The reply here has a good CNAME chain and one additional record whose RDLENGTH
+runs past the end of the message.
+*/
+@(test)
+test_junk_outside_the_answer_section_does_not_withhold_the_answer :: proc(t: ^testing.T) {
+	// A well-formed reply for www.brand.example -> good.brand.example, built and
+	// then extended by hand with an additional record that cannot be parsed.
+	answer := make([]dns.Record, 2, context.temp_allocator)
+	answer[0] = dns.Record {
+		name  = "www.brand.example.",
+		type  = .CNAME,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_Name{name = "good.brand.example."},
+	}
+	answer[1] = dns.Record {
+		name  = "good.brand.example.",
+		type  = .A,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_A{addr = {203, 0, 113, 20}},
+	}
+	base := chain_wire("www.brand.example.", answer)
+
+	// One additional record: root name, type TXT, class IN, ttl 0, RDLENGTH 32
+	// with no bytes behind it. The answer section ahead of it is untouched.
+	junk := make([dynamic]u8, 0, len(base) + 11, context.temp_allocator)
+	append(&junk, ..base)
+	junk[11] = 1 // ARCOUNT = 1
+	append(&junk, 0) // root name
+	append(&junk, 0, 16) // TYPE = TXT
+	append(&junk, 0, 1) // CLASS = IN
+	append(&junk, 0, 0, 0, 0) // TTL
+	append(&junk, 0, 32) // RDLENGTH, with nothing following it
+
+	wire := junk[:]
+	_, whole_err := dns.decode_message(wire, context.temp_allocator)
+	if !testing.expect(t, whole_err != .None, "the fixture was meant to be undecodable as a whole") {
+		return
+	}
+	through, answer_err := dns.decode_through_answer(wire, context.temp_allocator)
+	if !testing.expect(t, answer_err == .None, "the answer section was meant to still parse") {
+		return
+	}
+	testing.expect_value(t, len(through.answer), 2)
+
+	// Driven through the forwarding path: the cache path cannot store a message
+	// it could not decode, so this is only reachable from an upstream reply.
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+		return
+	}
+	defer net.close(socket)
+	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+	bound, _ := net.bound_endpoint(socket)
+
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.cache.enabled = false
+	cfg.dnssec.enabled = false
+	cfg.blocking.enabled = true
+	cfg.upstream.strategy = .Failover
+	cfg.upstream.attempts = 1
+	cfg.upstream.timeout = 3 * time.Second
+	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
+	servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port}
+	cfg.upstream.servers = servers
+
+	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+		return
+	}
+	defer upstream.destroy_group(group)
+
+	engine := filter.engine_make()
+	defer filter.engine_destroy(engine)
+	block := filter.set_make()
+	allow := filter.set_make()
+	filter.set_add(block, "tracker.evil.example", {.Apex, .Subdomains})
+	filter.engine_swap(engine, block, allow)
+
+	srv := Server{cfg = &cfg, group = group, filters = engine}
+
+	x := Cloak_Mock{socket = socket, reply = wire}
+	mock := thread.create_and_start_with_poly_data(&x, serve_cloak)
+	_, outcome, _ := handle_query(&srv, cloak_query("www.brand.example."), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	thread.join(mock)
+	thread.destroy(mock)
+
+	testing.expectf(
+		t,
+		outcome != .Failed,
+		"a clean answer section was refused for junk in a section the walk never reads (outcome=%v)",
+		outcome,
+	)
+	free_all(context.temp_allocator)
+}

@@ -631,32 +631,63 @@ resolve_query :: proc(
 	}
 
 	/*
+	What the walk needs is the answer section, and only that.
+
+	Read separately from the decode above, which wants the whole message because
+	the cache stores the whole message. Holding the walk to that standard turned
+	one malformed record in an authority or additional section - sections the
+	walk never looks at - into SERVFAIL for a name whose answer section was
+	clean, and only once blocking was on. That is not the check failing closed,
+	it is the check refusing an answer it had no opinion about.
+
+	Only reached when the full decode already failed, so the common path pays
+	nothing for it.
+	*/
+	walk_answer: []dns.Record
+	walkable := have_decoded
+	if have_decoded {
+		walk_answer = decoded.answer
+	} else if walking {
+		if d, dec_err := dns.decode_through_answer(resp, allocator); dec_err == .None {
+			walk_answer, walkable = d.answer, true
+		}
+	}
+
+	/*
 	An answer the walk was going to look at and cannot read is refused.
 
 	This read the other way round - hand it to the client, it is the upstream's
 	answer and not ours to withhold over our own reading of it - which is a fair
 	argument about an answer nobody was going to inspect, and the wrong one about
-	an answer that was about to be checked. A response that does not decode is
-	not walked, and serving what could not be walked is the same fail-open the
-	`Unwalkable` verdict exists to refuse, reachable by appending one record with
-	a bad compression pointer or an RDLENGTH that runs off the end. The cloaked
-	chain rides out in the answer section, which a stub parses perfectly well.
-	`serve_from_cache` already refuses the stored equivalent; the two paths have
-	to agree or the check is only as strong as whichever one an attacker picks.
+	an answer that was about to be checked. An answer section that does not
+	decode is not walked, and serving what could not be walked is the same
+	fail-open the `Unwalkable` verdict exists to refuse, reachable by writing one
+	CNAME with a bad compression pointer or an RDLENGTH that runs off the end.
+	The cloaked chain rides out in that same section, which a lenient stub parses
+	perfectly well. `serve_from_cache` already refuses the stored equivalent; the
+	two paths have to agree or the check is only as strong as whichever one an
+	attacker picks.
+
+	An allow rule on the question is honoured here as it is inside the walk. This
+	gate sits above `block_cloaked_answer`, where that rule is otherwise read, so
+	without asking for it the one escape hatch the blocking section documents
+	would be the one hatch that did not open: an operator told to allowlist the
+	name would find it refused anyway, under a detail that says unreadable rather
+	than blocked.
 
 	Gated on the walk actually being due. With blocking off there is nothing this
 	would have checked, and refusing then would be this server withholding an
 	answer over a parse it had no use for - which is what the old comment was
 	right about.
 
-	The cost is an upstream whose answers this decoder rejects becoming
+	The cost is an upstream whose *answer sections* this decoder rejects becoming
 	unresolvable rather than merely unfiltered, for the names it does that on.
 	Every rejection is a name or a length that ran outside the message, which a
 	client has to reject too, so the answer was not going to be usable; and the
 	failure says so in the query log rather than passing something through
 	unchecked.
 	*/
-	if walking && !have_decoded {
+	if walking && !walkable && filter.engine_match(s.filters, q.name) != .Allowed {
 		/*
 		No stale fallback, deliberately, and it had one for a round.
 
@@ -718,10 +749,10 @@ resolve_query :: proc(
 		set_ad_bit(resp, false)
 	}
 
-	if have_decoded {
+	if walkable {
 		if out, verdict := block_cloaked_answer(
 			s,
-			decoded.answer,
+			walk_answer,
 			msg,
 			q,
 			proto,
