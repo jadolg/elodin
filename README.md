@@ -982,9 +982,10 @@ Wildcards match subdomains only, so `*.lan` covers `host.lan` but not `lan`.
 
 ```yaml
 special_use:
-  enabled: true    # localhost., onion., invalid.
-  local: false     # also local.  (RFC 6762 section 22)
-  test: false      # also test.   (RFC 6761 section 6.2)
+  enabled: true    # the table below
+  onion: true      # onion.  (RFC 7686 section 2)
+  local: false     # local.  (RFC 6762 section 22)
+  test: false      # test.   (RFC 6761 section 6.2)
 ```
 
 Three names are answered here rather than asked about, whatever `upstream.servers`
@@ -993,7 +994,7 @@ says:
 | name | answer | why |
 |---|---|---|
 | `localhost.` and below | 127.0.0.1 for A, `::1` for AAAA, NODATA otherwise | RFC 6761 6.3. The only answer it is allowed to have |
-| `onion.` and below | NXDOMAIN | RFC 7686 2, a MUST NOT on forwarding |
+| `onion.` and below | NXDOMAIN | RFC 7686 2, unless the upstream is Tor-aware |
 | `invalid.` and below | NXDOMAIN | RFC 6761 6.4. It cannot exist |
 
 `.onion` is the one this exists for. The query is the disclosure: forwarding it
@@ -1020,9 +1021,18 @@ upstream here — so a network whose router answers `.local` dynamically wants
 
 There is one upstream for which `.onion` really is the right question to ask: a
 local `tor` with `DNSPort` and `AutomapHostsOnResolve`, which answers those names
-with mapped addresses. That setup wants `enabled: false`, and gives up the
-`localhost.` and `invalid.` handling with it — the switch is the whole table, not
-one name of it.
+with mapped addresses. That setup wants `onion: false`, and keeps everything else
+in the table. RFC 7686 2 addresses a caching server "where not explicitly adapted
+to interoperate with Tor", so this is the adapted case the RFC leaves room for
+rather than a departure from it. It is warned about at startup, since the setting
+is a claim about the upstream and not about this resolver.
+
+`localhost.` and `invalid.` have no key of their own, and are not going to grow
+one. Neither has a deployment that wants them forwarded — no upstream is
+authoritative for either, and RFC 6761 6.3 and 6.4 leave a resolver nothing to
+defer to about them — so a key would only ever be set by somebody working around
+a symptom. `enabled: false` is still there for an operator who wants none of
+this, and says so in the log.
 
 `example.` is deliberately not in the table. It is reserved, but RFC 6761 6.5 is
 the one entry in that document that asks for the opposite: caching servers should

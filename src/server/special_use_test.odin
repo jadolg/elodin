@@ -278,6 +278,55 @@ test_a_default_configuration_still_forwards_local_test_and_example :: proc(t: ^t
 }
 
 /*
+The upstream that really can answer a `.onion` name.
+
+RFC 7686 section 2 puts its instruction to caching servers on those "not
+explicitly adapted to interoperate with Tor", and a local tor with `DNSPort` and
+`AutomapHostsOnResolve` as the upstream is the adapted case. `special_use.onion`
+hands that one zone back without costing the operator `localhost.` and
+`invalid.` as `special_use.enabled: false` would - which is what the second half
+of this checks, since a key that turned the whole table off would pass the first
+half on its own.
+*/
+@(test)
+test_a_tor_aware_upstream_can_be_given_onion_back :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	cfg.special_use.onion = false
+
+	s, x, built := leak_server(t, &cfg, "duskgytldkxiuqc6otgh4.onion.")
+	if !built {
+		return
+	}
+	defer net.close(x.socket)
+	defer upstream.destroy_group(s.group)
+
+	mock := thread.create_and_start_with_poly_data(x, serve_leak)
+	_, outcome, _ := handle_query(
+		&s,
+		leak_query("duskgytldkxiuqc6otgh4.onion."),
+		.UDP,
+		"127.0.0.1:5555",
+		context.temp_allocator,
+	)
+	thread.join(mock)
+	thread.destroy(mock)
+
+	testing.expect(t, x.asked, "special_use.onion: false did not hand the query to the upstream")
+	testing.expectf(t, outcome == .Forwarded, "the .onion query came back as %v rather than forwarded", outcome)
+
+	// The rest of the table is untouched by that key.
+	_, local_outcome, _ := handle_query(&s, leak_query("localhost."), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	testing.expectf(
+		t,
+		local_outcome == .Local,
+		"localhost. came back as %v; special_use.onion took the rest of the table with it",
+		local_outcome,
+	)
+
+	free_all(context.temp_allocator)
+}
+
+/*
 A rewrite outranks the table.
 
 This is the escape hatch for a site that serves a reserved name for real and

@@ -303,12 +303,22 @@ main :: proc() {
 	} else {
 		logx.infof("%s", allow_from_line(cfg.server))
 	}
-	// Said out loud for the same reason an empty allow list is: with the table
-	// off, a .onion query is forwarded, which tells the upstream operator that
-	// somebody here is reaching for one specific hidden service (RFC 7686
-	// section 2). Nothing is logged when it is on - that is the default.
-	if !cfg.special_use.enabled {
+	/*
+	Said out loud for the same reason an empty allow list is: with the table
+	off, a .onion query is forwarded, which tells the upstream operator that
+	somebody here is reaching for one specific hidden service (RFC 7686 section
+	2). Nothing is logged when it is on - that is the default.
+
+	`onion` alone gets its own line, since that setting is a claim about the
+	upstream rather than about this table: it says the upstream is a Tor-aware
+	resolver, which is the one deployment where forwarding is right, and it is
+	worth reading back to an operator who set it for some other reason.
+	*/
+	switch {
+	case !cfg.special_use.enabled:
 		logx.warnf("special_use.enabled is off: localhost., onion. and invalid. are forwarded to the upstream")
+	case !cfg.special_use.onion:
+		logx.warnf("special_use.onion is off: .onion queries are forwarded, which is only safe to a Tor-aware upstream")
 	}
 	run(&cfg, opts, service)
 }

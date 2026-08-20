@@ -451,22 +451,23 @@ The names the RFCs reserve on the forward side, answered here instead of being
 forwarded. `localzones.odin` in the server package holds the table and argues
 which names are in it.
 
-`enabled` covers `localhost.`, `onion.` and `invalid.`: three names where the
-RFC's instruction and what a network actually needs agree, and where no
-upstream anywhere can be serving something an operator would miss. Off, every
-one of them is forwarded verbatim, which for a `.onion` name means telling the
-upstream operator that somebody here is looking for one specific hidden
-service.
+`enabled` is the whole table. `localhost.` and `invalid.` have no key of their
+own under it and are not meant to grow one; the three that do - `onion.`,
+`local.` and `test.` - each name a deployment where the upstream really is the
+right place to ask.
 
-`local` and `test` are the two reserved names that sites genuinely do run - an
-Active Directory domain under `.local`, an internal `.test` - so they are off
-and asked for by name rather than arriving with an upgrade and taking a working
-network's own hostnames away. Both need `enabled`, which is where the table
-lives; setting one of them with `enabled` off is refused at load rather than
-left looking like a protection that is on.
+`onion` is on, and off means the upstream is a Tor-aware resolver. `local` and
+`test` are off, and on means nothing here serves them: they are the two reserved
+names that sites genuinely do run - an Active Directory domain under `.local`,
+an internal `.test`. Those two need `enabled`, and setting either with `enabled`
+off is refused at load rather than left looking like a protection that is on.
+`onion` needs it as well, but that pair cannot be written down: it is on by
+default, so `enabled: false` on its own already says everything the
+contradiction would have.
 */
 Special_Use_Config :: struct {
 	enabled: bool,
+	onion:   bool,
 	local:   bool,
 	test:    bool,
 }
@@ -580,9 +581,13 @@ default_config :: proc() -> Config {
 	}
 	c.special_use = Special_Use_Config {
 		enabled = true,
-		// Both off. See the field comments: these two are reserved names that
-		// working networks serve today, and answering them here would take a
-		// site's own hostnames away on an upgrade.
+		// On: an upstream that can answer a `.onion` name is a Tor-aware
+		// resolver somebody stood up deliberately, and turning this off is how
+		// they say so.
+		onion   = true,
+		// Off. See the field comments: these two are reserved names that working
+		// networks serve today, and answering them here would take a site's own
+		// hostnames away on an upgrade.
 		local   = false,
 		test    = false,
 	}
