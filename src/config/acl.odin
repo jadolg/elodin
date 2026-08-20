@@ -89,11 +89,13 @@ that can disagree.
 Two entries are here that are not in the allow list, for the same reason the
 allow list leaves them out: nothing queries from them.
 
-  - `0.0.0.0/8` is RFC 1122's "this network", unroutable in its entirety, and
-    what a sinkhole answers with. An upstream that returns it for a public name
-    either broke or is filtering on our behalf.
-  - `::/128` is the unspecified address, which is not somewhere a connection
-    goes.
+  - `0.0.0.0/8` is RFC 1122's "this network" and unroutable in its entirety.
+    Its first address is also a working bypass rather than merely an odd
+    answer: browsers on Linux and macOS reach services bound to 127.0.0.1 by
+    connecting to 0.0.0.0, which is what the "0.0.0.0 Day" disclosure was
+    about. Leaving it out would open the most interesting target in the set.
+  - `::/128` is the unspecified address, and is the same bypass in the other
+    family.
 
 Carrier-grade NAT (`100.64.0.0/10`, RFC 6598) is left out, matching the allow
 list, but for the opposite reason: it is a shared address space rather than a

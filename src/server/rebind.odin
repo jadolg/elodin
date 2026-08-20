@@ -109,9 +109,34 @@ matched on the question rather than on the record's owner name - see the field.
 `rebind.allow_loopback` is the other one, and is dnsmasq's
 `--rebind-localhost-ok`.
 
-Whether this can be on by default is decided by those two existing, and the
-argument for the default it has is in `Rebind_Config`.
+`localhost.` is exempt without being configured, and only as far as loopback.
+RFC 6761 section 6.3 makes 127.0.0.1 and ::1 the only answers that name may
+have, so a loopback answer for it is legitimate by definition rather than by
+anybody's policy - which is a different kind of exemption from the two above and
+is why it is not a setting. Scoped to loopback rather than waved through
+wholesale, because nothing forwards `.localhost` on purpose and an upstream that
+answered `evil.localhost` with 192.168.1.1 would be doing something RFC 6761 does
+not permit either; the exemption is for the addresses the RFC allows, not for the
+name.
+
+Answering the name here instead - which is what RFC 6761 asks a resolver to do,
+and would mean it never reached the forwarding path at all - is a separate change
+and a separate issue. This does not wait on it: two guards whose correctness
+depends on which of them merged first is the coupling that turns into a live bug
+when one lands and the other is still in review.
+
+Whether this can be on by default is decided by these exemptions existing, and
+the argument for the default it has is in `Rebind_Config`.
 */
+
+/*
+The name RFC 6761 section 6.3 reserves, with everything under it.
+
+`name_at_or_below` gives both halves of what section 6.3 describes - the name
+itself and any name ending in `.localhost.` - from one entry.
+*/
+@(private)
+LOCALHOST_ZONE :: "localhost."
 
 // RFC 8914 code 15, "Blocked": the answer was withheld for an internal security
 // policy of the resolver's, which is exactly what this is. 17 ("Filtered") is
@@ -156,12 +181,27 @@ rebind_refusal :: proc(
 		return nil, false
 	}
 
+	/*
+	Decoded here rather than sharing the decode the cache block does a few lines
+	below. Deliberate and temporary: four changes are in flight against
+	`resolve_query` at once, and one procedure call is what rebases cleanly
+	between them where a restructured cache block does not. Folding the two into
+	one decode is issue #188, to be done in the merge pass once there is a single
+	shape to fold into - it is not an oversight, and it costs only the cache-miss
+	path for the five question types above.
+	*/
 	decoded, err := dns.decode_message(resp, allocator)
 	if err != .None {
 		return nil, false
 	}
 
-	addr, v6, found := first_private_answer(s.cfg.rebind, decoded)
+	// Decided once, from the question, rather than read out of the configuration
+	// beside each address: `localhost.` earns the same latitude the setting
+	// grants, and one verdict per query is what keeps the two from drifting into
+	// meaning different things about the same address.
+	loopback_ok := s.cfg.rebind.allow_loopback || name_at_or_below(q.name, LOCALHOST_ZONE)
+
+	addr, v6, found := first_private_answer(decoded, loopback_ok)
 	if !found {
 		return nil, false
 	}
@@ -213,21 +253,21 @@ what the caller does with it is name it in the log, so the rest would be a list
 nobody reads.
 */
 @(private)
-first_private_answer :: proc(cfg: config.Rebind_Config, msg: dns.Message) -> (addr: [16]u8, v6: bool, found: bool) {
+first_private_answer :: proc(msg: dns.Message, loopback_ok: bool) -> (addr: [16]u8, v6: bool, found: bool) {
 	for rec in msg.answer {
 		switch data in rec.data {
 		case dns.Rdata_A:
 			a: [16]u8
 			a[0], a[1], a[2], a[3] = data.addr[0], data.addr[1], data.addr[2], data.addr[3]
-			if rebind_private(cfg, a, false) {
+			if rebind_private(a, false, loopback_ok) {
 				return a, false, true
 			}
 		case dns.Rdata_AAAA:
-			if rebind_private(cfg, data.addr, true) {
+			if rebind_private(data.addr, true, loopback_ok) {
 				return data.addr, true, true
 			}
 		case dns.Rdata_SVCB:
-			if a, is6, hit := private_svcb_hint(cfg, data.params); hit {
+			if a, is6, hit := private_svcb_hint(data.params, loopback_ok); hit {
 				return a, is6, true
 			}
 		case dns.Rdata_Name, dns.Rdata_SOA, dns.Rdata_MX, dns.Rdata_TXT, dns.Rdata_SRV, dns.Rdata_CAA, dns.Rdata_OPT, dns.Rdata_Raw:
@@ -244,18 +284,18 @@ first_private_answer :: proc(cfg: config.Rebind_Config, msg: dns.Message) -> (ad
 }
 
 /*
-Whether `addr` is somewhere no public name should point.
+Whether `addr` is somewhere this question's answer should not point.
 
-`rebind.allow_loopback` is applied here rather than by leaving loopback out of
-the table, so that the address is still recognised as private everywhere else
-and the switch means one thing: "and serve it anyway".
+`loopback_ok` is applied here rather than by leaving loopback out of the table,
+so that the address is still recognised as private everywhere else and the
+latitude means one thing: "and serve it anyway".
 */
 @(private)
-rebind_private :: proc(cfg: config.Rebind_Config, addr: [16]u8, v6: bool) -> bool {
+rebind_private :: proc(addr: [16]u8, v6: bool, loopback_ok: bool) -> bool {
 	if !config.address_in(config.PRIVATE_NETWORKS, addr, v6) {
 		return false
 	}
-	if cfg.allow_loopback && config.address_in(config.LOOPBACK_NETWORKS, addr, v6) {
+	if loopback_ok && config.address_in(config.LOOPBACK_NETWORKS, addr, v6) {
 		return false
 	}
 	return true
@@ -275,7 +315,7 @@ guessing at where the next parameter starts would mean reading a key out of
 somebody else's value.
 */
 @(private)
-private_svcb_hint :: proc(cfg: config.Rebind_Config, params: []u8) -> (addr: [16]u8, v6: bool, found: bool) {
+private_svcb_hint :: proc(params: []u8, loopback_ok: bool) -> (addr: [16]u8, v6: bool, found: bool) {
 	i := 0
 	for i + 4 <= len(params) {
 		key := int(params[i]) << 8 | int(params[i + 1])
@@ -292,7 +332,7 @@ private_svcb_hint :: proc(cfg: config.Rebind_Config, params: []u8) -> (addr: [16
 			for off := 0; off + 4 <= len(value); off += 4 {
 				a: [16]u8
 				copy(a[:], value[off:off + 4])
-				if rebind_private(cfg, a, false) {
+				if rebind_private(a, false, loopback_ok) {
 					return a, false, true
 				}
 			}
@@ -300,7 +340,7 @@ private_svcb_hint :: proc(cfg: config.Rebind_Config, params: []u8) -> (addr: [16
 			for off := 0; off + 16 <= len(value); off += 16 {
 				a: [16]u8
 				copy(a[:], value[off:off + 16])
-				if rebind_private(cfg, a, true) {
+				if rebind_private(a, true, loopback_ok) {
 					return a, true, true
 				}
 			}

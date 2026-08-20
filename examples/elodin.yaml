@@ -349,6 +349,10 @@ rebind:
   # Zones whose answers may carry private addresses, each covering itself and
   # everything under it — dnsmasq's --rebind-domain-ok. Matched against the name
   # that was asked for, so a CNAME into one of these exempts nothing.
+  #
+  # If your upstream is your own internal DNS server and it resolves internal
+  # names to RFC 1918 addresses, those names stop resolving until they are named
+  # here. That is the one upgrade break this feature has.
   # allow_domains:
   #   - corp.example
   #   - home.arpa
@@ -356,6 +360,9 @@ rebind:
   # Let 127.0.0.0/8 and ::1 through — dnsmasq's --rebind-localhost-ok. Off,
   # because a service bound to loopback is the one its author most believed only
   # local processes could reach, and so the one least likely to authenticate.
+  # `localhost.` and anything under it are already allowed their own loopback
+  # address without this: RFC 6761 section 6.3 makes that the only answer the
+  # name can have.
   allow_loopback: false
 
 # Local answers. Wildcards match subdomains only, so "*.home" covers host.home
