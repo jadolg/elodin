@@ -299,12 +299,14 @@ one, and the removal's own return value cannot see it.
 An OPT record whose RDATA the decoder could not walk is the other half of the
 same problem, and the more useful one to an attacker: `decode_record` keeps
 RDATA it cannot parse as raw bytes rather than rejecting the message, so an
-option list ending in three bytes of a fourth option header decodes to a record
-with no options at all. Read as "no subnet here" that forwards the client's ECS
-upstream untouched - the option is perfectly legible to the resolver on the
-other end, only not to this decoder. So an unreadable OPT reports a subnet that
-cannot be stripped, and the query stops, which is also what RFC 6891 section
-6.1.1 asks of RDATA that is not a well-formed option list.
+option list ending in three bytes of a fourth option header reaches here as an
+OPT record holding `Rdata_Raw` and not an option list at all. That is why the
+check below asks which variant the RDATA is rather than how many options it
+holds: the list is not empty, it was never built. Read as "no subnet here" it
+would forward the client's ECS upstream untouched - the option is perfectly
+legible to the resolver on the other end, only not to this decoder. So an unreadable OPT
+reports a subnet that cannot be stripped, and the query stops, which is also
+what RFC 6891 section 6.1.1 asks of RDATA that is not a well-formed option list.
 */
 @(private)
 client_subnet_sent :: proc(msg: dns.Message) -> (sent: bool, strippable: bool) {
