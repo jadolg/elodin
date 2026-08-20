@@ -413,8 +413,10 @@ untouched.
 Walks the message itself rather than taking offsets from the caller: the one
 caller that has already scanned is the cache, and it has its own reason to hold
 the offsets. `false` when the message cannot be walked, in which case nothing
-was written - the same messages `scan_ttl_offsets` refuses, which are not ones
-this server goes on to send.
+was written and no TTL in it is bounded - the same messages `scan_ttl_offsets`
+refuses, and `cache.put` with it. A caller that goes on to send such a message
+sends the sender's own figures, so the result is one to act on rather than to
+discard: `server.resolve_query` answers SERVFAIL instead of forwarding.
 */
 cap_ttls :: proc(msg: []u8, ceiling: u32, allocator := context.allocator) -> bool {
 	offsets, ok := scan_ttl_offsets(msg, allocator)
