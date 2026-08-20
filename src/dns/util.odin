@@ -407,15 +407,33 @@ sane_ttl :: proc(v: u32) -> u32 {
 	return 0 if v > TTL_MAX else v
 }
 
+/*
+The TTL field at `off`, read and written as the four big-endian bytes it is.
+
+One spelling of the pair, because four places move a TTL in and out of a message
+in place - `read_ttls`, `cap_ttls`, `patch_ttls` and the cache's stale branch -
+and arithmetic typed out four times is arithmetic that can be typed wrong once.
+
+Neither bounds-checks. Every offset in play comes from `scan_ttl_offsets`, which
+only reports one after establishing that the record's fixed fields are inside
+the message it walked, so a check here would be dead in every caller; Odin's own
+bounds checks stay on in release builds and catch a caller that invents one.
+*/
+read_ttl_at :: proc(msg: []u8, off: int) -> u32 {
+	return u32(msg[off]) << 24 | u32(msg[off + 1]) << 16 | u32(msg[off + 2]) << 8 | u32(msg[off + 3])
+}
+
+write_ttl_at :: proc(msg: []u8, off: int, v: u32) {
+	msg[off] = u8(v >> 24)
+	msg[off + 1] = u8(v >> 16)
+	msg[off + 2] = u8(v >> 8)
+	msg[off + 3] = u8(v)
+}
+
 read_ttls :: proc(msg: []u8, offsets: []int, allocator := context.allocator) -> []u32 {
 	ttls := make([]u32, len(offsets), allocator)
 	for off, i in offsets {
-		ttls[i] = sane_ttl(
-			u32(msg[off]) << 24 |
-			u32(msg[off + 1]) << 16 |
-			u32(msg[off + 2]) << 8 |
-			u32(msg[off + 3]),
-		)
+		ttls[i] = sane_ttl(read_ttl_at(msg, off))
 	}
 	return ttls
 }
@@ -445,22 +463,7 @@ cap_ttls :: proc(msg: []u8, ceiling: u32, allocator := context.allocator) -> boo
 	}
 	defer delete(offsets, allocator)
 	for off in offsets {
-		if off + 4 > len(msg) {
-			break
-		}
-		v := min(
-			sane_ttl(
-				u32(msg[off]) << 24 |
-				u32(msg[off + 1]) << 16 |
-				u32(msg[off + 2]) << 8 |
-				u32(msg[off + 3]),
-			),
-			ceiling,
-		)
-		msg[off] = u8(v >> 24)
-		msg[off + 1] = u8(v >> 16)
-		msg[off + 2] = u8(v >> 8)
-		msg[off + 3] = u8(v)
+		write_ttl_at(msg, off, min(sane_ttl(read_ttl_at(msg, off)), ceiling))
 	}
 	return true
 }
@@ -476,10 +479,7 @@ patch_ttls :: proc(msg: []u8, offsets: []int, originals: []u32, elapsed: u32, fl
 		if v < floor_ttl {
 			v = floor_ttl
 		}
-		msg[off] = u8(v >> 24)
-		msg[off + 1] = u8(v >> 16)
-		msg[off + 2] = u8(v >> 8)
-		msg[off + 3] = u8(v)
+		write_ttl_at(msg, off, v)
 	}
 }
 
