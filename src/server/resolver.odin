@@ -581,6 +581,66 @@ resolve_query :: proc(
 		resp = present_response(resp, msg, q.type, result.status == .Secure, allocator)
 	}
 
+	/*
+	The TTLs bounded once, here, so the client's copy and the entry's are the
+	same bytes.
+
+	RFC 2181 section 8 is not a setting and runs whatever the cache is doing: a
+	TTL with the top bit set becomes zero, which tells the client to come back
+	rather than to hold the record for sixty-eight years, and leaves `put` below
+	with an `effective` of zero - so the answer is not kept either, unless
+	`cache.min_ttl` raises it, which is the operator saying how long the shortest
+	answer this cache keeps is good for and reaches a zeroed TTL like any other.
+	Doing it in `cache.put` alone would leave the forwarded copy carrying the
+	hostile figure to the client that caused the fetch, and with
+	`cache.enabled: false` would leave every answer carrying it.
+
+	The ceiling is the cache's `max_ttl`, and `ttl_ceiling` reports no ceiling
+	when there is no cache, since the setting is then not in play at all. An
+	answer forwarded on a miss is the same answer the next client is handed out
+	of the entry it just filled, so bounding one and not the other would make
+	the client that caused the fetch the one client the setting never reaches.
+	This is the reading dnsmasq's `--max-ttl` has always had: the maximum TTL
+	handed out to clients.
+
+	`min_ttl` deliberately stays where it is, on the copies `cache.get` serves.
+	A ceiling can only shorten what a client is told, which is safe wherever it
+	is applied; the floor lengthens it, and it is honest on the way out of the
+	cache because the entry really is being held that long. Applied here it
+	would stretch the TTL of an answer that may not be kept at all - the cache
+	can be off, and `put` refuses plenty of what it is handed.
+
+	Failing closed when the bound cannot be applied, the way `fit_response` does
+	with the size ceiling: a message `scan_ttl_offsets` cannot walk is one whose
+	TTLs were not rewritten, and forwarding it anyway is the one outcome this
+	block exists to prevent - the upstream's own figure, 2^31 seconds of it,
+	reaching whatever parses the answer section more leniently than this does.
+	Nothing is lost by refusing: `cache.put` scans the same way and would refuse
+	it too, so such an answer was never going to be kept, and a client that reads
+	SERVFAIL asks again rather than pinning a record for sixty-eight years. Held
+	back rather than answered from a stale entry, for the reason the DNSSEC
+	refusal above is: an upstream that sent something this server will not pass
+	on has answered, and reaching for expired data instead would be reaching past
+	a verdict rather than covering an outage.
+
+	Debug rather than a warning, because an upstream decides how often it
+	happens and a warning per query is a log it can fill. What names it for an
+	operator is the query log line - `outcome=failed detail="ttl"`, this refusal
+	and no other - counted in `elodin_answers_total` as a failed answer.
+	*/
+	if !dns.cap_ttls(resp, cache.ttl_ceiling(s.answers), allocator) {
+		logx.debugf(
+			"query %s %s from %s: the answer's TTLs could not be bounded, not forwarding it",
+			dns.type_name(q.type),
+			dns.name_trim_root(q.name),
+			client,
+		)
+		sync.atomic_add(&s.stats.failed, 1)
+		out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
+		log_query(s, client, proto, q, .Failed, "ttl", started)
+		return out, .Failed, built
+	}
+
 	if s.cfg.cache.enabled {
 		if decoded, dec_err := dns.decode_message(resp, allocator); dec_err == .None {
 			/*

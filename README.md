@@ -1104,6 +1104,21 @@ hot path. It is bounded by `cache.max_bytes` as well as `cache.max_entries`,
 because an entry's size is decided by whoever answered the query: see
 [Resource use](#resource-use).
 
+The TTLs it writes are bounded at both ends, and both ends reach the client, on
+different answers. `cache.max_ttl` is a ceiling on every answer that goes out —
+forwarded or cached — as well as on how long the entry is kept, so no client is
+told to hold a record for longer than a day by default however large a figure
+the upstream sent. `cache.min_ttl` is a floor on the copies served from an
+entry; the copy forwarded on the miss that filled that entry carries the
+upstream's own figure, which a ceiling can only shorten. Neither is a promise
+that a client drops a record when this cache does: an entry lives for the
+smallest TTL in the message it holds, and a negative one for the SOA's own
+figure capped by `cache.negative_ttl` (RFC 2308), while every record in it still
+goes out carrying its own TTL up to the ceiling. A TTL arriving with its top
+bit set is taken as zero, per RFC 2181 section 8, which also leaves the answer
+uncacheable unless `cache.min_ttl` raises it — a zeroed TTL meets that floor
+like any other. Section 8 applies to forwarded answers too, cache or no cache.
+
 ## Capacity
 
 Everything below comes out of `mise run bench`, against a mock upstream held at

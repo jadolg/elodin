@@ -208,8 +208,12 @@ cache:
   enabled: true
   max_entries: 10000
   max_bytes: 64MiB     # a count of entries is not a bound on memory
+  # Both ends reach the client, on different answers: max_ttl is a ceiling on
+  # every answer that goes out, forwarded or cached, and min_ttl is a floor on
+  # the ones served from an entry - the copy forwarded on the miss that filled
+  # it carries the upstream's own figure, which the ceiling can only shorten.
   min_ttl: 0           # raise to hold short-lived answers longer
-  max_ttl: 24h
+  max_ttl: 24h         # and the longest any client is told to hold one
   negative_ttl: 300    # cap for NXDOMAIN / NODATA
   # An entry is kept for a day past its expiry, reached for only once the
   # upstream has failed to answer - or straight away for an RD=0 query, which

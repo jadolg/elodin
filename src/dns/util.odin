@@ -268,6 +268,26 @@ scan_ttl_offsets :: proc(msg: []u8, allocator := context.allocator) -> (offsets:
 	total += int(u16(msg[8]) << 8 | u16(msg[9]))
 	total += int(u16(msg[10]) << 8 | u16(msg[11]))
 
+	/*
+	Counts that cannot possibly fit are refused before `total` is spent as a
+	capacity: a question needs at least 5 bytes on the wire and a record at
+	least 11 - a root name plus the fixed fields - which is the same arithmetic
+	`decode_message` makes, for the same reason.
+
+	It used to be enough that the decoder made it. The only caller that reached
+	here with somebody else's bytes was `cache.put`, and `resolve_query` decodes
+	a response before it offers it, so a datagram with impossible counts was
+	turned away one step earlier. `cap_ttls` walks a response before anything
+	has decoded it, so without this a 17-byte reply claiming three sections of
+	65535 records has this allocate 1.5 MB for a walk that then fails on the
+	first name - once per query, out of the per-request arena, which keeps the
+	block it grew to.
+	*/
+	remaining := len(msg) - HEADER_SIZE
+	if qdcount * 5 + total * 11 > remaining {
+		return nil, false
+	}
+
 	pos := HEADER_SIZE
 	for _ in 0 ..< qdcount {
 		pos = skip_name(msg, pos) or_return
@@ -356,16 +376,96 @@ peek_udp_size :: proc(msg: []u8) -> u16 {
 	return MAX_UDP_SIZE
 }
 
+/*
+The largest TTL a message may carry.
+
+The field is 32 bits wide on the wire, but RFC 2181 section 8 narrows the value
+to an unsigned 31-bit number: the top bit is not part of it. Doubles as the "no
+ceiling" argument to `cap_ttls`, since no TTL that has been through `sane_ttl`
+is above it.
+*/
+TTL_MAX :: u32(0x7fff_ffff)
+
+/*
+A TTL as this server is willing to read it, per RFC 2181 section 8:
+
+	Implementations should treat TTL values received with the most significant
+	bit set as if the entire value received was zero.
+
+Zero rather than the low 31 bits, which is what the RFC asks for and is the only
+reading that is safe to act on anyway. A sender that sets the top bit is either
+getting the field wrong or nailing the record into every cache below it for the
+life of the machine - 2^31 seconds is sixty-eight years - and nothing else in
+the message tells the two apart. Zero says "use this for the query in hand and
+come back", which is the right answer to both.
+
+Applied where a TTL is acted on rather than in `decode_message`, which goes on
+reporting the field as it stands: a decoded message is also what the DNSSEC
+validator and the query log read, and those want to see what arrived.
+*/
+sane_ttl :: proc(v: u32) -> u32 {
+	return 0 if v > TTL_MAX else v
+}
+
+/*
+The TTL field at `off`, read and written as the four big-endian bytes it is.
+
+One spelling of the pair, because four places move a TTL in and out of a message
+in place - `read_ttls`, `cap_ttls`, `patch_ttls` and the cache's stale branch -
+and arithmetic typed out four times is arithmetic that can be typed wrong once.
+
+Neither bounds-checks. Every offset in play comes from `scan_ttl_offsets`, which
+only reports one after establishing that the record's fixed fields are inside
+the message it walked, so a check here would be dead in every caller; Odin's own
+bounds checks stay on in release builds and catch a caller that invents one.
+*/
+read_ttl_at :: proc(msg: []u8, off: int) -> u32 {
+	return u32(msg[off]) << 24 | u32(msg[off + 1]) << 16 | u32(msg[off + 2]) << 8 | u32(msg[off + 3])
+}
+
+write_ttl_at :: proc(msg: []u8, off: int, v: u32) {
+	msg[off] = u8(v >> 24)
+	msg[off + 1] = u8(v >> 16)
+	msg[off + 2] = u8(v >> 8)
+	msg[off + 3] = u8(v)
+}
+
 read_ttls :: proc(msg: []u8, offsets: []int, allocator := context.allocator) -> []u32 {
 	ttls := make([]u32, len(offsets), allocator)
 	for off, i in offsets {
-		ttls[i] =
-			u32(msg[off]) << 24 |
-			u32(msg[off + 1]) << 16 |
-			u32(msg[off + 2]) << 8 |
-			u32(msg[off + 3])
+		ttls[i] = sane_ttl(read_ttl_at(msg, off))
 	}
 	return ttls
+}
+
+/*
+Bound every TTL a message carries, on the wire, in place.
+
+For the answers that never pass through the cache - a miss is forwarded to the
+client from the upstream's own bytes, and with `cache.enabled: false` no answer
+passes through it at all. The cache bounds the copies it serves by bounding what
+it stores (see `cache.put`), and that leaves the copy the client gets on the very
+miss that filled the entry, which is the one that carries the upstream's figure
+untouched.
+
+Walks the message itself rather than taking offsets from the caller: the one
+caller that has already scanned is the cache, and it has its own reason to hold
+the offsets. `false` when the message cannot be walked, in which case nothing
+was written and no TTL in it is bounded - the same messages `scan_ttl_offsets`
+refuses, and `cache.put` with it. A caller that goes on to send such a message
+sends the sender's own figures, so the result is one to act on rather than to
+discard: `server.resolve_query` answers SERVFAIL instead of forwarding.
+*/
+cap_ttls :: proc(msg: []u8, ceiling: u32, allocator := context.allocator) -> bool {
+	offsets, ok := scan_ttl_offsets(msg, allocator)
+	if !ok {
+		return false
+	}
+	defer delete(offsets, allocator)
+	for off in offsets {
+		write_ttl_at(msg, off, min(sane_ttl(read_ttl_at(msg, off)), ceiling))
+	}
+	return true
 }
 
 // Rewrites each TTL to `original - elapsed`, floored at `floor_ttl`.
@@ -379,10 +479,7 @@ patch_ttls :: proc(msg: []u8, offsets: []int, originals: []u32, elapsed: u32, fl
 		if v < floor_ttl {
 			v = floor_ttl
 		}
-		msg[off] = u8(v >> 24)
-		msg[off + 1] = u8(v >> 16)
-		msg[off + 2] = u8(v >> 8)
-		msg[off + 3] = u8(v)
+		write_ttl_at(msg, off, v)
 	}
 }
 

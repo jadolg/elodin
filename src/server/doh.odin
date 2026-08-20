@@ -589,7 +589,8 @@ serve_doh_request :: proc(s: ^Server, conn: Conn, req: Http_Request_In, path: st
 	}
 
 	// Cache-Control mirrors the smallest TTL so intermediaries expire the
-	// answer at the same time the DNS data does.
+	// answer at the same time the DNS data does - the bounded TTL, see
+	// `doh_max_age`.
 	max_age := doh_max_age(response)
 
 	b := strings.builder_make(context.temp_allocator)
@@ -679,6 +680,19 @@ decode_dns_param :: proc(encoded: string) -> (data: []u8, ok: bool) {
 	return decoded, true
 }
 
+/*
+The `Cache-Control: max-age` for a response, read back off its own TTLs.
+
+Reads the answer as it is about to be sent, which is the answer after
+`handle_query` has bounded its TTLs: RFC 2181 section 8 applied and
+`cache.max_ttl` on top of it, whether the bytes came out of the cache or
+straight from an upstream. So the header cannot outlive the DNS data it is
+mirroring, and a hostile TTL cannot be laundered through it into every HTTP
+cache between here and the client - which recomputing the figure from what the
+upstream sent would do. `read_ttls` applies section 8 again on the way past,
+which costs nothing and means this holds for any caller that reaches it with
+bytes from somewhere else.
+*/
 @(private)
 doh_max_age :: proc(response: []u8) -> u32 {
 	offsets, ok := dns.scan_ttl_offsets(response, context.temp_allocator)
