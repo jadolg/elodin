@@ -346,6 +346,13 @@ render_cache_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 	metrics.scalar(b, "elodin_cache_bytes", .Gauge, "Bytes the cached answers occupy.", i64(cache.bytes_used(s.answers)))
 	metrics.scalar(b, "elodin_cache_hits_total", .Counter, "Lookups answered from the cache.", cs.hits)
 	metrics.scalar(b, "elodin_cache_misses_total", .Counter, "Lookups the cache could not answer.", cs.misses)
+	metrics.scalar(
+		b,
+		"elodin_cache_withheld_total",
+		.Counter,
+		"Answers the cache handed over - a fresh hit or a stale lend - that the resolver then refused instead of serving.",
+		cs.withheld,
+	)
 	/*
 	The one series that shows `cache.serve_stale` working.
 

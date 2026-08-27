@@ -395,6 +395,28 @@ resolve_query :: proc(
 	key := cache.make_key(key_buf[:], q.name, q.type, q.class, dns.edns_do(msg), msg.flags.cd)
 
 	/*
+	Which rule sets an answer is matched against here, read once and used for
+	both the cache lookup and the store below.
+
+	Taken before the chain walk rather than after. A reload landing partway
+	through leaves the answer stamped with the older number, which costs one more
+	walk on the next hit; taking it afterwards would stamp an answer with the
+	number of a rule set that arrived after it had been matched, and that entry
+	would then never be looked at again.
+
+	Not read at all unless both halves are on. The number exists to date a stored
+	answer against the rule sets, so with nothing stored, or no rule sets to date
+	it against, it is a second trip through the engine's lock on every query for a
+	value nothing reads. With blocking off the engine is never swapped at all -
+	`reload_filters` runs only under that flag - so the number would sit at zero
+	and match every entry's stamp for the life of the process.
+	*/
+	generation: u64
+	if s.cfg.cache.enabled && s.cfg.blocking.enabled && s.filters != nil {
+		generation = filter.engine_generation(s.filters)
+	}
+
+	/*
 	An expired entry that `serve_stale` kept, held back rather than served.
 
 	RFC 8767 section 5 has a resolver try the refresh first and use expired data
@@ -407,14 +429,23 @@ resolve_query :: proc(
 	into the per-request arena, which outlives the upstream call and is released
 	only once the response has gone out.
 	*/
-	stale_hit: []u8
+	stale_hit: Cached_Answer
 
 	if s.cfg.cache.enabled {
-		if hit, stale, found := cache.get(s.answers, key, allocator); found {
-			if !stale {
-				return serve_from_cache(s, hit, query, msg, q, proto, client, limit, validating, false, started, allocator)
+		if wire, hit, found := cache.get(s.answers, key, allocator, checked_against = generation); found {
+			stored := Cached_Answer {
+				wire    = wire,
+				key     = key,
+				stale   = hit.stale,
+				recheck = hit.recheck,
+				refused = hit.refused,
+				serial  = hit.serial,
+				checked = generation,
 			}
-			stale_hit = hit
+			if !hit.stale {
+				return serve_from_cache(s, stored, query, msg, q, proto, client, limit, validating, started, allocator)
+			}
+			stale_hit = stored
 		}
 	}
 
@@ -442,8 +473,8 @@ resolve_query :: proc(
 	`log.queries` is on.
 	*/
 	if !msg.flags.rd {
-		if stale_hit != nil {
-			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, true, started, allocator)
+		if stale_hit.wire != nil {
+			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, allocator)
 		}
 		out, built := dns.error_response(query, msg, .Refused, allocator, limit)
 		log_query(s, client, proto, q, .Refused, "rd", started)
@@ -545,8 +576,8 @@ resolve_query :: proc(
 		covering an outage. RFC 8767 section 5 leaves both open; neither is
 		decided here.
 		*/
-		if stale_hit != nil {
-			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, true, started, allocator)
+		if stale_hit.wire != nil {
+			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, allocator)
 		}
 		sync.atomic_add(&s.stats.failed, 1)
 		out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
@@ -581,24 +612,208 @@ resolve_query :: proc(
 		resp = present_response(resp, msg, q.type, result.status == .Secure, allocator)
 	}
 
-	if s.cfg.cache.enabled {
-		if decoded, dec_err := dns.decode_message(resp, allocator); dec_err == .None {
-			/*
-			Settled before the entry goes in, rather than only on the way out to
-			this client.
+	/*
+	Decoded once for the two things below that both need it: the chain walk reads
+	the answer section, and the cache reads the whole message. Decoding for each
+	of them separately meant a second full pass over every forwarded response,
+	which is the one part of this that every query pays for.
 
-			`validating` is recomputed for every request and can be turned off
-			after the key is built - the upstream query failing to rebuild does
-			exactly that - so nothing otherwise ties the AD bit an entry carries
-			to whether that entry was ever validated. A later request that does
-			validate reads the stored bit as a verdict of ours and hands the
-			upstream's claim to a client under our name.
-			*/
-			if !validating {
-				set_ad_bit(resp, false)
-			}
-			cache.put(s.answers, key, resp, decoded)
+	Skipped when neither of them will run, which is the only arrangement that was
+	not already paying for a decode here.
+	*/
+	decoded: dns.Message
+	have_decoded := false
+	walking := s.cfg.blocking.enabled && s.filters != nil
+	if s.cfg.cache.enabled || walking {
+		if d, dec_err := dns.decode_message(resp, allocator); dec_err == .None {
+			decoded, have_decoded = d, true
 		}
+	}
+
+	/*
+	What the walk needs is the answer section, and only that.
+
+	Read separately from the decode above, which wants the whole message because
+	the cache stores the whole message. Holding the walk to that standard turned
+	one malformed record in an authority or additional section - sections the
+	walk never looks at - into SERVFAIL for a name whose answer section was
+	clean, and only once blocking was on. That is not the check failing closed,
+	it is the check refusing an answer it had no opinion about.
+
+	Only reached when the full decode already failed, so the common path pays
+	nothing for it.
+	*/
+	walk_answer: []dns.Record
+	walkable := have_decoded
+	if have_decoded {
+		walk_answer = decoded.answer
+	} else if walking {
+		if d, dec_err := dns.decode_through_answer(resp, allocator); dec_err == .None {
+			walk_answer, walkable = d.answer, true
+		}
+	}
+
+	/*
+	An answer the walk was going to look at and cannot read is refused.
+
+	This read the other way round - hand it to the client, it is the upstream's
+	answer and not ours to withhold over our own reading of it - which is a fair
+	argument about an answer nobody was going to inspect, and the wrong one about
+	an answer that was about to be checked. An answer section that does not
+	decode is not walked, and serving what could not be walked is the same
+	fail-open the `Unwalkable` verdict exists to refuse, reachable by writing one
+	CNAME with a bad compression pointer or an RDLENGTH that runs off the end.
+	The cloaked chain rides out in that same section, which a lenient stub parses
+	perfectly well. `serve_from_cache` already refuses the stored equivalent; the
+	two paths have to agree or the check is only as strong as whichever one an
+	attacker picks.
+
+	An allow rule on the question is honoured here as it is inside the walk. This
+	gate sits above `block_cloaked_answer`, where that rule is otherwise read, so
+	without asking for it the one escape hatch the blocking section documents
+	would be the one hatch that did not open: an operator told to allowlist the
+	name would find it refused anyway, under a detail that says unreadable rather
+	than blocked.
+
+	Gated on the walk actually being due. With blocking off there is nothing this
+	would have checked, and refusing then would be this server withholding an
+	answer over a parse it had no use for - which is what the old comment was
+	right about.
+
+	The cost is an upstream whose *answer sections* this decoder rejects becoming
+	unresolvable rather than merely unfiltered, for the names it does that on.
+	Every rejection is a name or a length that ran outside the message, which a
+	client has to reject too, so the answer was not going to be usable; and the
+	failure says so in the query log rather than passing something through
+	unchecked.
+	*/
+	if walking && !walkable && filter.engine_match(s.filters, q.name) != .Allowed {
+		/*
+		No stale fallback, deliberately, and it had one for a round.
+
+		The rule for that is set out where the upstream fails, above: expired
+		data covers an outage, and only a failure to get an answer at all counts
+		as one. This is not an outage. The upstream answered, and this server
+		refused what it said - the same shape as the DNSSEC verdict below, which
+		returns without reaching for `stale_hit` for the same reason. Serving
+		expired data over a refusal reaches past a verdict rather than covering
+		anything, and it tells the operator the wrong story besides: `detail=stale`
+		and a climbing `elodin_cache_stale_total` say the upstream is down while
+		it is answering perfectly well.
+		*/
+		sync.atomic_add(&s.stats.failed, 1)
+		out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
+		log_query(s, client, proto, q, .Failed, "answer-unreadable", started)
+		return out, .Failed, built
+	}
+
+	/*
+	The answer is stored anyway, with the refusal stamped on it.
+
+	Leaving it out was the first shape of this, on the reasoning that an answer
+	this server will not hand out is not one to keep a copy of. What that missed
+	is which case it applies to: a cloaked name that is *not* already cached -
+	the ordinary one, and the one an attacker arranges - then costs an upstream
+	round trip on every single query, forever, because nothing about the refusal
+	is remembered. A name blocked on the question costs none at all. So the
+	cheapest name to serve became one of the most expensive, and the memoisation
+	built for the hit path stopped short of the case that needed it most.
+
+	Storing it does not put the hole back: the entry carries the verdict, so the
+	hit path serves the refusal from it rather than the bytes, and it is walked
+	again as soon as a reload moves the generation past its stamp. The bytes are
+	kept only so that later walk has something to walk.
+
+	Behind validation, because an answer that will not be served at all is not one
+	to spend a list lookup on - and the order cannot change a verdict, since
+	everything this can decide is to withhold an answer the validator was willing
+	to pass.
+	*/
+	/*
+	Settled here, above everything that might store these bytes, rather than
+	beside one of the stores.
+
+	`validating` is recomputed for every request and can be turned off after the
+	key is built - the upstream query failing to rebuild does exactly that - so
+	nothing otherwise ties the AD bit an entry carries to whether that entry was
+	ever validated. A later request that does validate reads the stored bit as a
+	verdict of ours and hands the upstream's claim to a client under our name.
+
+	It lived next to the ordinary store until a second store was added below it,
+	for an answer refused as cloaked, and quietly did not get it: that entry went
+	in carrying the upstream's bit, and a reload that cleared the name later
+	served it with the bit intact. One statement above both is what stops the
+	third one being written without it.
+	*/
+	if !validating {
+		set_ad_bit(resp, false)
+	}
+
+	if walkable {
+		if out, verdict := block_cloaked_answer(
+			s,
+			walk_answer,
+			msg,
+			q,
+			proto,
+			client,
+			limit,
+			started,
+			allocator,
+		); verdict != .Clear {
+			/*
+			`have_decoded`, not `walkable`. The two part company for an answer
+			whose section beyond the answer would not parse: the walk runs on the
+			partial decode, and `decoded` is still the zero message it was
+			declared as.
+
+			Storing from that puts an entry in built from nothing to do with
+			these bytes. `scan_ttl_offsets` is far more forgiving than the
+			decoder - it follows no compression pointers and bounds no name - so
+			it succeeds on the real wire and the entry goes in with
+			`redirects = false` and a lifetime derived as if the answer were a
+			denial. `redirects = false` is the trap: `get` computes `recheck`
+			from it, so the entry can never be re-walked, and the refusal it
+			carries is replayed on every hit until it expires. An operator who
+			then writes the documented allow rule and reloads gets nothing - the
+			name stays blocked against the very rule meant to release it, which
+			is the opposite of the invariant the comment above states.
+
+			So it is not cached at all in that case. The next query for the name
+			asks the upstream again, which is what happened before any of this
+			was memoised.
+			*/
+			/*
+			`Unreadable` is not stored. The other two verdicts are stable
+			properties of an answer somebody built - a name is on a list, a chain
+			is seventeen long - and they are worth remembering, which is the
+			whole argument for storing a refusal at all: without it the cheapest
+			name to refuse becomes the most expensive one to serve.
+
+			A record this decoder could not parse is not that. It is as likely to
+			be an upstream or a middlebox having a bad day as an attack, which is
+			the same reasoning that gives it SERVFAIL rather than the operator's
+			block response - and memoising it takes that reasoning back. Stored,
+			one malformed CNAME pins the name to SERVFAIL for up to
+			`cache.max_ttl`, a day by default, with the upstream never asked
+			again; a list reload does not release it either, because the re-walk
+			reads the same stored bytes and reaches the same verdict. The name
+			stays broken until the entry expires, for a record the upstream may
+			have stopped sending within the minute.
+
+			So it goes unstored and the next query asks again, which is what the
+			whole-message version of this - `answer-unreadable` above - already
+			does.
+			*/
+			if s.cfg.cache.enabled && have_decoded && cloak_verdict_worth_keeping(verdict) {
+				cache.put(s.answers, key, resp, decoded, generation, u8(verdict))
+			}
+			return out, cloak_outcome(verdict), true
+		}
+	}
+
+	if s.cfg.cache.enabled && have_decoded {
+		cache.put(s.answers, key, resp, decoded, generation)
 	}
 
 	sync.atomic_add(&s.stats.forwarded, 1)
@@ -610,25 +825,55 @@ resolve_query :: proc(
 }
 
 /*
+A hit as `resolve_query` found it.
+
+Carried as one value because these seven travel together from `cache.get` to
+whichever of the three places ends up serving them, and because what has to be
+done with them - re-match the chain, then put the stamp back on the entry the
+bytes came out of - needs all seven at once.
+*/
+@(private)
+Cached_Answer :: struct {
+	// The stored response, already copied into this request's arena.
+	wire:    []u8,
+	// What the entry is stored under, and which entry it was, so the stamp goes
+	// back on the answer that was looked at rather than on whatever has replaced
+	// it since.
+	key:     string,
+	serial:  u64,
+	stale:   bool,
+	recheck: bool,
+	// What the last walk decided, as a `Cloak_Verdict`, when `recheck` says that
+	// decision is current. Stored as the byte the cache keeps rather than the
+	// enum, which is the caller's type and not the cache's.
+	refused: u8,
+	// The rule sets the re-match is made against, and the number stamped on the
+	// entry when it comes back clean.
+	checked: u64,
+}
+
+/*
 Hand a stored answer to the client that asked for it.
 
 The fresh hit and the stale fallback are the same answer as far as everything
 downstream is concerned - the same transaction ID to put back, the same question
 case to restore, the same verdict to settle, the same limit to fit - and they go
 through one procedure so that a step added for one of them cannot be missed for
-the other. The two differ in what an operator is told: `stale` is what the query
-log reports as the detail, and what tells the cache that the copy it lent out
-was used.
+the other. The two differ in what an operator is told: `hit.stale` is what the
+query log reports as the detail, and what tells the cache that the copy it lent
+out was used.
 
 Counted as a cached query either way, because that is what happened: the client
 was answered from this server's cache without an upstream producing the answer.
 The upstream failure behind a stale answer is a debug line of its own and not a
-failed query - the client got an answer.
+failed query - the client got an answer. The exception is an entry the lists now
+refuse, which never becomes a served answer at all and is counted as the block
+it is.
 */
 @(private)
 serve_from_cache :: proc(
 	s: ^Server,
-	hit: []u8,
+	hit: Cached_Answer,
 	query: []u8,
 	msg: dns.Message,
 	q: dns.Question,
@@ -636,7 +881,6 @@ serve_from_cache :: proc(
 	client: string,
 	limit: int,
 	validating: bool,
-	stale: bool,
 	started: time.Time,
 	allocator: mem.Allocator,
 ) -> (
@@ -644,17 +888,144 @@ serve_from_cache :: proc(
 	outcome: Outcome,
 	ok: bool,
 ) {
-	dns.set_id_in_place(hit, msg.id)
-	dns.copy_question_case(hit, query)
+	/*
+	An answer the lists have not been over since they last changed is matched
+	again before it is served, and only then.
+
+	Lists are reloaded under a running server and the answer cache is not touched
+	by the swap, so an entry can outlive the reload that named something in its
+	chain. The question side of the same rule set is matched on every query - it
+	runs before the cache is consulted at all - so an entry left alone here would
+	make one half of a rule take effect on the next query and the other half when
+	the TTL ran out, up to `cache.max_ttl` later.
+
+	What it must not cost is a decode per hit. `cache.get` answers that: an entry
+	whose answer section goes nowhere never asks for this at all, and one that
+	does asks only while the number it was stored under is behind the rule sets in
+	force. `note_checked` then puts the number forward, so a chain is walked once
+	per reload rather than once per hit - which is the whole of what this costs in
+	the steady state, against the copy and the handful of TTL writes that serving
+	a hit is meant to be.
+
+	Clearing the cache in `reload_filters` instead is one line and was not taken:
+	it throws away every unrelated entry on every refresh interval, and buys a
+	burst of upstream traffic each time to re-learn answers nothing was wrong
+	with.
+
+	An entry that is refused stays where it is, and its refusal is stamped on it
+	along with the number. Nothing here can tell whether the next reload will put
+	it back in service, and dropping it would cost an upstream query per client
+	query until something did.
+
+	Keeping it and *not* recording the verdict was the first shape of this, and
+	it was wrong in a way worth naming: an entry cannot be stamped as merely
+	checked, because a stamp says "serve it", so the refusal had to be re-derived
+	from the bytes on every hit - a decode and a walk, on the hot path, at
+	whatever rate a client cares to ask, for as long as the entry lived. That is
+	the per-hit decode the stamp exists to avoid, reintroduced for exactly the
+	names an attacker is interested in. With the verdict recorded, a refused
+	entry costs one walk per reload like any other.
+	*/
+	if !hit.recheck && cloak_refusal_stands(s) {
+		if verdict := Cloak_Verdict(hit.refused); verdict != .Clear {
+			/*
+			No target, because the entry does not carry one. The name that
+			matched was a name in the stored answer's chain, and keeping a copy
+			of it would mean the cache holding a string on the caller's behalf
+			for the sake of one debug line. What the entry does carry is which
+			of the two refusals it was, so the query log says the same thing for
+			this hit as it said for the walk that decided it.
+			*/
+			cache.note_withheld(s.answers)
+			out := refuse_cloaked(s, "", verdict, msg, q, proto, client, limit, started, allocator)
+			return out, cloak_outcome(verdict), true
+		}
+	}
+	if hit.recheck {
+		// The entry decoded once already, on the way in, so this is the copy being
+		// decoded rather than a question of whether it can be. That rests on the
+		// two `have_decoded` guards at the stores above and not on anything
+		// `cache.put` checks: `put` never decodes, it takes an already-decoded
+		// message and trusts it to describe the bytes beside it. A third store
+		// written without that guard would break this quietly.
+		if stored, derr := dns.decode_message(hit.wire, allocator); derr == .None {
+			if out, verdict := block_cloaked_answer(
+				s,
+				stored.answer,
+				msg,
+				q,
+				proto,
+				client,
+				limit,
+				started,
+				allocator,
+			); verdict != .Clear {
+				/*
+				A verdict not worth keeping takes the entry with it. Stamping it
+				would pin the name until the entry expired - the forwarding path
+				declines to store one for that reason, and this path reaches the
+				same verdict from bytes that are already stored, so the only way
+				to decline it here is to drop them.
+
+				An entry can arrive at this branch having gone in clean: stored
+				while the question was allowlisted, or with a listed name at the
+				same owner scanned before the malformed one. The rule changes,
+				the re-walk reaches the record this decoder cannot read, and
+				without this the answer is pinned to SERVFAIL from then on with
+				the upstream never asked again.
+				*/
+				if cloak_verdict_worth_keeping(verdict) {
+					cache.note_checked(s.answers, hit.key, hit.serial, hit.checked, u8(verdict))
+				} else {
+					cache.forget(s.answers, hit.key, hit.serial)
+				}
+				cache.note_withheld(s.answers)
+				return out, cloak_outcome(verdict), true
+			}
+			// Inside the decode, not after it. An entry nothing could read has
+			// not been looked at, and stamping it here would say it had - which
+			// is the one way this mechanism could come to skip a walk it owed.
+			// Unreachable as things stand, because both stores are guarded on
+			// `have_decoded`, and not a thing to leave resting on that.
+			cache.note_checked(s.answers, hit.key, hit.serial, hit.checked, u8(Cloak_Verdict.Clear))
+		} else {
+			/*
+			The stored bytes would not decode, so the walk it is owed cannot be
+			run at all - and an answer this server could not check is one it
+			withholds, exactly as it withholds a chain that outran the budget.
+
+			Serving it was the other way this could have gone and it is the same
+			mistake `Unwalkable` exists to refuse: the check is not a thing to
+			skip on the inputs that defeat it. Nothing reaches here as things
+			stand - `cache.put` stores no message it could not read - which is
+			the reason refusing costs nothing, not a reason to fall through.
+
+			The entry is dropped rather than stamped. It cannot be walked on any
+			later hit either, so leaving it would refuse this name for as long
+			as it lived; dropping it sends the next query upstream for an answer
+			that can be read.
+			*/
+			cache.forget(s.answers, hit.key, hit.serial)
+			cache.note_withheld(s.answers)
+			sync.atomic_add(&s.stats.failed, 1)
+			out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
+			log_query(s, client, proto, q, .Failed, "cache-unreadable", started)
+			return out, .Failed, built
+		}
+	}
+
+	wire := hit.wire
+	dns.set_id_in_place(wire, msg.id)
+	dns.copy_question_case(wire, query)
 	// The stored answer carries the verdict; whether this client gets to hear it
 	// is a separate question.
-	settle_ad_bit(hit, msg, validating)
-	if stale {
+	settle_ad_bit(wire, msg, validating)
+	if hit.stale {
 		cache.note_stale_served(s.answers)
 	}
 	sync.atomic_add(&s.stats.cached, 1)
-	out := fit_response(hit, limit, msg, allocator)
-	log_query(s, client, proto, q, .Cached, "stale" if stale else "cache", started)
+	out := fit_response(wire, limit, msg, allocator)
+	log_query(s, client, proto, q, .Cached, "stale" if hit.stale else "cache", started)
 	return out, .Cached, true
 }
 

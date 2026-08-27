@@ -437,9 +437,9 @@ test_a_live_upstream_beats_a_stale_entry :: proc(t: ^testing.T) {
 	// outage falls back on the answer that was just fetched.
 	kb: [cache.KEY_MAX]u8
 	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
-	_, still_stale, found := cache.get(answers, key, context.temp_allocator)
+	_, refreshed, found := cache.get(answers, key, context.temp_allocator)
 	testing.expect(t, found, "the refreshed answer was not cached")
-	testing.expect(t, !still_stale, "the entry is still the expired one")
+	testing.expect(t, !refreshed.stale, "the entry is still the expired one")
 	free_all(context.temp_allocator)
 }
 

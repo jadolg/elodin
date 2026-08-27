@@ -398,6 +398,62 @@ Hosts entries are exact because hosts-format lists spell out every subdomain
 they mean; bare domains and `||` rules cover subtrees. This matches how AdGuard
 Home reads the same files. Allow rules always win over block rules.
 
+The rules are matched against the answer as well as the question. An answer
+whose CNAME chain lands on a listed name is blocked as though that name had been
+asked for: the arrangement to catch is a tracker given a subdomain inside the
+site's own zone — `metrics.brand.example` CNAME `tracker.evil.example` — where
+the question is a first-party name no list can usefully carry and the address the
+browser connects to is the tracker's, with the site's own cookies attached.
+Pi-hole calls this deep CNAME inspection and AdGuard Home does the same thing to
+CNAME targets. Every hop is matched rather than only the last, up to sixteen of
+them. An allow rule exempts the whole answer only when it matches the
+*question* — that is the escape hatch when a first-party name resolves through a
+CDN somebody has listed, so name the first-party lookup rather than the CDN. An
+allow rule matching a hop clears that hop and no other: the party writing the
+answer is the party this feature is aimed at, and if any allowlisted name
+appearing anywhere in an answer excused the rest of it, every allowlist entry
+would be a key for turning the check off. These show in the query log as `outcome=blocked
+detail=cname`, against `detail=list` for a question that was on a list itself,
+and the name that matched is logged at debug level.
+
+An answer whose chain runs past that sixteenth name is **withheld**, not served.
+Bounding the walk and then handing over whatever it did not reach would not be a
+bound at all — it would be a length to exceed, and exceeding it is free for
+whoever writes the answer, so a listed name one hop past the end would go
+straight through. Real chains are one or two names and no zone publishes
+seventeen, so what this turns away is answers built to be turned away. They are
+counted as blocked and logged as `outcome=blocked detail=cname-deep`; an allow
+rule on the *question* skips the walk entirely and is the way out. Note that an
+allow rule on a hop past the sixteenth cannot help, because the walk stops
+before reaching it.
+
+Four details name a withheld or failed answer that no list explains, and
+they are what to search the query log for when a site breaks and nothing in the
+lists accounts for it:
+
+| detail | rcode | what happened |
+| --- | --- | --- |
+| `cname-deep` | the `blocking.response` | the chain ran past the sixteenth name, so where it ends was never checked |
+| `cname-unreadable` | SERVFAIL | a CNAME's target could not be parsed, so where it leads could not be checked |
+| `answer-unreadable` | SERVFAIL | the upstream's reply could not be parsed at all, so it could not be walked |
+| `cache-unreadable` | SERVFAIL | a stored answer could not be parsed on the way back out |
+
+The two `-unreadable` ones answer SERVFAIL rather than what `blocking.response`
+says, and the split is deliberate: a listed name and an over-long chain are
+answers somebody built, so the operator's chosen refusal fits them, while a
+record that will not parse is as likely to be an upstream or a middlebox having
+a bad day. Reporting that as NXDOMAIN would tell a client a name it asked for
+does not exist, with no rule behind it, and the stub would cache that for
+`blocking.block_ttl`; SERVFAIL is the only one of the answers a stub will retry
+or fail over from.
+
+`answer-unreadable` is the one worth knowing about, because it is a way for a
+name to stop resolving that appears only once blocking is on: with blocking off
+nothing walks the answer, so nothing needs to parse it, and the same reply is
+forwarded. Every case of it is a name or a length that ran outside the message,
+which a client would have to reject too — but if an upstream produces them
+routinely, that is the line that says so.
+
 The `address=/…/` and `server=/…/` forms are dnsmasq's, accepted because they
 turn up in lists that are otherwise adblock syntax. A `$` modifier
 (`$third-party`, `$important`) is dropped and the rest of the rule kept: none of
@@ -1035,6 +1091,7 @@ bind beyond loopback is logged as a warning at startup, once.
 | `elodin_cache_entries` / `_bytes` | gauge | what the cache holds, against `max_entries` and `max_bytes` |
 | `elodin_cache_hits_total` / `_misses_total` / `_evictions_total` | counter | how it is doing |
 | `elodin_cache_stale_total` | counter | expired answers served because no fresh one could be got, with `cache.serve_stale` on |
+| `elodin_cache_withheld_total` | counter | answers the cache handed over that were then refused rather than served, so `_hits_total` counts them and the query log does not |
 | `elodin_filter_rules{list}` | gauge | rules loaded, `block` and `allow` |
 | `elodin_upstream_queries_total{upstream}` | counter | queries sent to each upstream, by its configured name |
 | `elodin_upstream_failures_total{upstream}` | counter | exchanges that produced no usable answer |
