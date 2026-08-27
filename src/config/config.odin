@@ -427,38 +427,34 @@ The reasoning for the whole feature is in `src/server/rebind.odin`; what is
 decided here is the default, and it is the part of this that can go wrong for
 somebody who never read either file.
 
-On, which is not where dnsmasq, AdGuard Home or Unbound put their version of it.
-Three reasons it goes the other way here.
+Off, which is where dnsmasq (`--stop-dns-rebind`), AdGuard Home and Unbound
+(`private-address`) all put their version of it too. The reason to follow them
+is not deference - it is that the deployment this program is written for is the
+one most likely to do the exact thing the guard refuses, and to do it on
+purpose. A box on a LAN that every device points at is commonly the same box
+running split horizon: a public zone whose names answer with a LAN address, an
+upstream that is the operator's own internal server, a homelab whose
+`nas.example.com` is `192.168.1.50` by design. On by default, every one of those
+names becomes NODATA the moment the operator upgrades - not degraded, gone, and
+looking exactly like a name that does not exist - for a configuration that was
+never wrong. A security default that breaks working resolution for a large share
+of the people it ships to is one they will turn off in a hurry and with a bad
+taste, rather than one they will leave on.
 
-The first is that this tree already made the argument, for the setting directly
-above `dnssec.enabled`: validation is on, and the cost is written down as "an
-upstream which cannot return DNSSEC records makes every signed zone unresolvable
-rather than merely unverified, so anything talking to such an upstream has to
-turn this off deliberately". That is the same trade in the same shape - a check
-on what an upstream returned, on by default, unresolvable rather than unchecked
-when the upstream disagrees with it. `blocking`, `cookies`, `rate_limit` and
-`allow_from` all default the same way. A security feature that shipped off in
-this tree would be the exception, and an operator reasoning from the others
-would get this one wrong.
+So the guard ships off and is turned on by the operator who wants it, which is
+the same shape dnsmasq and the others chose. `dnssec.enabled` defaults the other
+way in this tree, and the difference is real: an upstream that cannot return
+DNSSEC records is a misconfiguration to fix, whereas a public name answering with
+a private address is, for this program's audience, a supported and ordinary
+thing to be doing. The two are not the same trade.
 
-The second is who runs it. This is a forwarder for a box on a LAN that every
-device points at, so its population is the exact target of the attack and is
-also the population least likely to read a list of optional hardening switches.
-A default nobody turns on protects nobody.
-
-The third is that the failure is loud and the attack is silent. A name this
-refuses says so once at `warn`, names the address, names this setting and names
-`rebind.allow_domains`, and is counted as `rebind=` in the stats line and in the
-query log; an operator whose internal name stopped resolving has the fix in the
-first line they grep. Forwarding a private address is a page silently reaching a
-router's admin interface, which produces no line anywhere.
-
-What it costs is real and is not waved away: a split-horizon site whose upstream
-is its own internal server resolves internal names to RFC 1918 addresses, and
-every one of those becomes NODATA on upgrade until the zone is named in
-`allow_domains`. That is the case `allow_domains` exists for, it is one line, and
-`--check` reads it. `rewrites` need no such line - a rewritten name is answered
-here and never reaches an upstream, so it never reaches this check.
+None of that lowers what the guard is worth to the operator who is not running
+split horizon: it is one line to enable, the failure it prevents is silent and
+the refusal it produces is loud - a `warn` naming the address and both settings
+that would allow it, a `rebind=` counter, a query-log line - and `allow_domains`
+exists so that even an operator who does run split horizon can turn it on and
+name the zones that are allowed to answer privately. The README recommends
+enabling it, in exactly those terms.
 */
 Rebind_Config :: struct {
 	enabled:        bool,
@@ -622,11 +618,12 @@ default_config :: proc() -> Config {
 		upstream = true,
 	}
 	c.rebind = Rebind_Config {
-		// On, and with nothing exempt. See the type: the argument is that this
-		// tree already defaults `dnssec.enabled` the same way against the same
-		// trade, and that the operators this is for are the ones the attack is
-		// aimed at.
-		enabled        = true,
+		// Off, and with nothing exempt. See the type: the deployment this is
+		// written for routinely and legitimately points a public name at a
+		// private address - split horizon, a homelab whose public zone answers
+		// with a LAN address - so on by default would break resolution for a
+		// large share of its own operators on upgrade. It is one line to turn on.
+		enabled        = false,
 		allow_loopback = false,
 	}
 	c.metrics = Metrics_Config {

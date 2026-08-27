@@ -14,7 +14,7 @@ Pi-hole and AdGuard Home, minus the web interface. One binary, one YAML file.
 - A ceiling on UDP answer size to bound reflection amplification, on by default
 - Local rewrites (A, AAAA, CNAME, or "answer as if blocked")
 - DNSSEC validation against the root trust anchors, on by default
-- DNS rebinding protection: an upstream answer pointing a public name at loopback, RFC 1918 or link-local space is refused, on by default (see `rebind`)
+- DNS rebinding protection: an upstream answer pointing a public name at loopback, RFC 1918 or link-local space is refused, off by default so split horizon keeps working, one line to turn on (see `rebind`)
 - DNS cookies in both directions (RFC 7873/9018), on by default
 - Ships as a systemd service or a `.deb`, with optional automatic system-resolver takeover
 
@@ -270,7 +270,7 @@ only where a value needs it, with the time and the severity as fields rather
 than as a prefix a collector has to be taught to recognise.
 
 ```
-ts=2026-08-07T09:12:33Z level=info msg=ready strategy=Round_Robin upstreams=2 cache=true blocking=true dnssec=true rebind=true
+ts=2026-08-07T09:12:33Z level=info msg=ready strategy=Round_Robin upstreams=2 cache=true blocking=true dnssec=true rebind=false
 ts=2026-08-07T09:12:41Z level=info msg=query client=192.0.2.10:44188 proto=udp qtype=A qname=example.com outcome=forwarded detail=cloudflare-dot ms=11.7
 ts=2026-08-07T09:12:44Z level=warn msg="list steven-black: unavailable, skipping it"
 ```
@@ -1023,7 +1023,7 @@ already establishes more than a cookie can.
 
 ```yaml
 rebind:
-  enabled: true                   # the default
+  enabled: false                  # the default; set true to turn the guard on
   allow_domains: []               # zones that may answer with private addresses
   allow_loopback: false           # let 127.0.0.0/8 and ::1 through
 ```
@@ -1101,45 +1101,47 @@ Refusals are counted as `rebind=` in the stats line and as
 is `debug`, so that whoever is triggering it does not decide how much this server
 writes to disk.
 
-#### Why it is on by default
+#### Why it is off by default, and why to turn it on
 
-dnsmasq, AdGuard Home and Unbound all ship their version of this **off**. elodin
-ships it **on**, and the reason is worth reading before you decide whether to
-keep it that way.
+dnsmasq, AdGuard Home and Unbound all ship their version of this **off**, and
+elodin follows them. The reason is not deference — it is who runs this. elodin is
+a forwarder for a box on a LAN that every device points at, and that box is
+commonly the one running **split horizon**: a public zone whose names answer with
+a LAN address, an upstream that is the operator's own internal server, a homelab
+whose `nas.example.com` is `192.168.1.50` by design. On by default, every one of
+those names would become NODATA the moment the operator upgraded — not degraded,
+gone, and looking exactly like a name that does not exist — for a configuration
+that was never wrong. A security default that breaks working resolution for a
+large share of the people it ships to is one they turn off in a hurry; off by
+default, and turned on deliberately, is the honest arrangement.
 
-The first half of the argument is that this tree already made it, one section up.
-[DNSSEC validation](#dnssec) is on by default, and the cost is written down in
-the same shape: an upstream that cannot return DNSSEC records makes every signed
-zone *unresolvable* rather than merely unverified, and anything talking to such
-an upstream has to turn it off deliberately. Blocking, cookies, rate limiting and
-the client allow list all default the same way. A security feature that shipped
-off here would be the one exception, and an operator reasoning from the others
-would guess wrong about this one.
+This is a different trade from [DNSSEC validation](#dnssec), which *is* on by
+default here. An upstream that cannot return DNSSEC records is a misconfiguration
+to fix. A public name answering with a private address is, for this program's
+audience, an ordinary and supported thing to be doing — so the two do not default
+the same way.
 
-The second half is who runs this. elodin is a forwarder for a box on a LAN that
-every device points at — which is precisely the deployment a rebinding attack
-targets, sharing an address space with the router, the printer and the NAS. That
-population is also the least likely to work through a list of optional hardening
-switches. A default nobody turns on protects nobody.
+**Turn it on if you are not running split horizon.** The failure it prevents is
+silent — a page reaching your router's admin interface produces no line anywhere
+— while the guard itself is loud: a `warn` at the first refusal naming the
+address and both settings that would allow it, a `rebind=` counter, a query-log
+line. It is one line:
 
-Against that, plainly: **if your upstream is your own internal DNS server and it
-resolves internal names to RFC 1918 addresses, those names stop resolving the
-moment you upgrade to a version with this in it.** Not degrade — stop, with
-NODATA, which looks exactly like a name that does not exist. The fix is one line,
-`rebind.allow_domains`, naming the zones that are allowed to answer that way; it
-is described below and `--check` reads it. If you run split horizon, put that
-line in before you upgrade.
+```yaml
+rebind:
+  enabled: true
+```
 
-The rest of the argument for the default is that the failure is loud — a `warn`
-at the first refusal naming the address and both settings that would allow it, a
-counter, a query-log line — and the attack it prevents is silent.
+And if you *do* run split horizon, you can still turn it on: name the zones that
+are allowed to answer with private addresses in `rebind.allow_domains`, described
+below, which `--check` reads.
 
-#### What this makes unresolvable
+#### What turning it on makes unresolvable
 
 - **Split horizon through an internal upstream.** A site whose upstream is its
   own DNS server, resolving `nas.corp.example` to an RFC 1918 address through the
-  public name space, gets NODATA for every such name after an upgrade. This is
-  the case `allow_domains` exists for; name the zones and they work again:
+  public name space, gets NODATA for every such name once the guard is on. This
+  is the case `allow_domains` exists for; name the zones and they work again:
 
   ```yaml
   rebind:
@@ -1190,12 +1192,8 @@ for it is legitimate by definition rather than by anybody's policy. Only as far
 as loopback, though — `evil.localhost` answered with `192.168.1.1` gets no
 latitude from that, since it is not an answer the RFC permits either.
 
-To restore the previous behaviour in one line:
-
-```yaml
-rebind:
-  enabled: false
-```
+`enabled: false` is the default, so none of the above happens until you turn the
+guard on; the same line turns it back off if you do.
 
 ### Rewrites
 
