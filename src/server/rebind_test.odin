@@ -105,6 +105,8 @@ test_a_public_name_is_not_answered_with_a_private_address :: proc(t: ^testing.T)
 		cfg.cache.enabled = false
 		cfg.dnssec.enabled = false
 		cfg.blocking.enabled = false
+		// Off by default now, and this is the reproducer for the guard on.
+		cfg.rebind.enabled = true
 		cfg.upstream.strategy = .Failover
 		cfg.upstream.attempts = 1
 		cfg.upstream.timeout = 3 * time.Second
@@ -285,6 +287,8 @@ ask_raw :: proc(
 }
 
 // A configuration with nothing in the way of the check but the check itself.
+// The guard is off in the shipped default now, so it is turned on here: these
+// tests are all about what it does once on, and the off case has its own test.
 @(private = "file")
 rebind_config :: proc() -> config.Config {
 	cfg := config.default_config()
@@ -292,6 +296,7 @@ rebind_config :: proc() -> config.Config {
 	cfg.cache.enabled = false
 	cfg.dnssec.enabled = false
 	cfg.blocking.enabled = false
+	cfg.rebind.enabled = true
 	return cfg
 }
 
@@ -583,9 +588,12 @@ test_a_refused_answer_is_not_cached :: proc(t: ^testing.T) {
 /*
 Off is off.
 
-The setting has to restore the previous behaviour exactly, because the operator
-reaching for it is one whose network this broke and who needs the server
-resolving again in one line while they work out which zone to exempt.
+`enabled: false` is the shipped default, and it has to be inert exactly: a
+private address from an upstream is forwarded as any other answer would be, with
+none of the guard's machinery in the way. An operator who turned the guard on and
+then hit a split-horizon name reaches for this to get resolving again in one line
+while they work out which zone to exempt, and it has to land them back on the
+plain forwarding path.
 */
 @(test)
 test_the_guard_can_be_turned_off :: proc(t: ^testing.T) {
@@ -735,8 +743,10 @@ test_a_zero_ip_block_response_still_reaches_the_client :: proc(t: ^testing.T) {
 	cfg.dnssec.enabled = false
 	cfg.blocking.enabled = true
 	cfg.blocking.response = .Zero_IP
-	// The guard is on, as it is by default. That is the point of the test.
-	testing.expect(t, cfg.rebind.enabled)
+	// The guard is turned on here - it is off in the shipped default - because a
+	// guard that is off could not collide with blocking, and the collision is
+	// the point of the test.
+	cfg.rebind.enabled = true
 
 	block, allow := filter.set_make(), filter.set_make()
 	filter.parse_list(block, allow, "0.0.0.0 ads.example.com\n", .Hosts)

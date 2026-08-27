@@ -654,16 +654,17 @@ test_metrics_settings_are_not_checked_while_it_is_off :: proc(t: ^testing.T) {
 /*
 The rebinding guard's defaults and its two exemptions.
 
-The default is the part worth pinning: it is on, and it is on in a tree whose
-`allow_from` restricts to local networks, so an operator upgrading into it can
-have internal names stop resolving. A change to `enabled` here is a change to
+The default is the part worth pinning: it is off, so that an operator running
+split horizon - a public name answering with a LAN address, which the deployment
+this ships to commonly does on purpose - does not have every such name stop
+resolving the moment they upgrade. A change to `enabled` here is a change to
 whether that happens, and it should not be possible to make by accident.
 */
 @(test)
-test_rebind_defaults_to_on_with_nothing_exempt :: proc(t: ^testing.T) {
+test_rebind_defaults_to_off_with_nothing_exempt :: proc(t: ^testing.T) {
 	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
 	testing.expect(t, err == nil)
-	testing.expect(t, cfg.rebind.enabled)
+	testing.expect(t, !cfg.rebind.enabled)
 	testing.expect(t, !cfg.rebind.allow_loopback)
 	testing.expect_value(t, len(cfg.rebind.allow_domains), 0)
 

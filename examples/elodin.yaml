@@ -339,12 +339,15 @@ rebind:
   # browser as the proxy. The whole answer becomes NODATA rather than having the
   # record filtered out of it. dnsmasq calls this --stop-dns-rebind.
   #
-  # On, which is not where dnsmasq and AdGuard Home put it. The case for turning
-  # it off is split horizon: if your upstream is your own internal server and it
-  # resolves internal names to RFC 1918 addresses, name those zones in
-  # allow_domains below rather than switching this off. Names you answer with
-  # `rewrites` need nothing — they are answered here and never reach an upstream.
-  enabled: true
+  # Off by default, as in dnsmasq, AdGuard Home and Unbound, because the
+  # deployment this ships to commonly points a public name at a private address
+  # on purpose — split horizon, a homelab whose public zone answers with a LAN
+  # address — and on by default would break those names on upgrade. Turning it
+  # on is recommended if you do not do that. If you do, set enabled: true and
+  # name the zones that may answer privately in allow_domains below rather than
+  # leaving it off; names you answer with `rewrites` need nothing — they are
+  # answered here and never reach an upstream.
+  enabled: false
 
   # Zones whose answers may carry private addresses, each covering itself and
   # everything under it — dnsmasq's --rebind-domain-ok. Matched against the name

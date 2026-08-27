@@ -79,10 +79,10 @@ run_strategy_cases :: proc(r: ^Runner) {
 	Three upstreams, each answering with a distinguishable address.
 
 	TEST-NET-2 rather than 10.0.0.0/8, which is what these were: the rebinding
-	guard is on by default and refuses an answer that points a public name into
-	private space, so a mock handing back 10.0.0.1 for `example.test` is now
-	indistinguishable from the attack it is there to stop. Any documentation
-	range does; the addresses only have to differ from each other.
+	guard refuses an answer that points a public name into private space, and
+	though it is off by default now, keeping these on a documentation range means
+	the case does not quietly depend on that default. Any documentation range
+	does; the addresses only have to differ from each other.
 	*/
 	ports := [3]int{next_port(r), next_port(r), next_port(r)}
 	mocks: [3]^Mock
