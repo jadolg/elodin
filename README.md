@@ -289,7 +289,8 @@ spaces in it. In Loki that is `| logfmt` and nothing else:
 Statistics go to the log every five minutes, as `msg=stats` — `queries`,
 `blocked`, `cached`, `forwarded`, `failed`, `dropped`, `refused`,
 `conn_refused`, `conn_failed`, `limited`, `truncated`, `secure`, `bogus` and
-`rebind`, plus `cache_entries`, `cache_bytes`, `cache_hits`, `cache_misses`, `cache_stale`
+`rebind`, plus `cache_entries`, `cache_bytes`, `cache_hits`, `cache_withheld`,
+`cache_misses`, `cache_stale`
 and `cache_evictions` — and `log.queries` adds one `msg=query` line per query, at
 the cost noted under [Resource use](#resource-use).
 
