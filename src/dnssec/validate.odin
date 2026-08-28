@@ -149,12 +149,14 @@ nothing. Generous next to any real answer: a set carries one signature per
 algorithm, and a chain a handful of sets.
 
 Spent by `validate_rrset` and `verified_rrset`, which is every signature over an
-answer's own RRsets and over a denial's proof. It is *not* spent by the two
-loops that check a DS set in `zone_step` or a DNSKEY set in `fetch_keys`; those
-have never had a bound of any kind, before this change or after it, and giving
-them one is #193 rather than something to bolt on here. So this is a bound on
-the signatures a response's own records provoke, not on every verification a
-question can reach.
+answer's own RRsets and over a denial's proof - the proof `zone_step` reads when
+a delegation comes back with no DS included, since that goes through
+`verified_rrset` like every other denial. It is *not* spent by the two loops
+that check a DS set in `zone_step` or a DNSKEY set in `fetch_keys`; those have
+never had a bound of any kind, before this change or after it, and giving them
+one is #193 rather than something to bolt on here. So this is a bound on the
+signatures a response's own records provoke and on the denials its chain walks
+through, not on every verification a question can reach.
 
 It is also a bound on work and not a guarantee that the genuine signature is
 reached, and the difference is worth being plain about. A forgery that copies the real
@@ -930,13 +932,23 @@ validate_answer :: proc(
 		// failure would let an expansion that came out merely insecure - an
 		// opt-out cover does - hide a forged one behind it, and which comes
 		// first in the answer section is the sender's choice.
+		// Verified once for the message, not once per expansion: they are the
+		// same records, read against the same zone, and re-verifying them spends
+		// an allowance the answer needs for its own RRsets.
+		denials := make([dynamic]Verified_Denial, 0, 1, allocator)
+		proof_reason: string
 		for e in expansions {
-			proof, records := validate_wildcard_proof(v, budget, msg, e.owner, e.encloser, class, unix, now, allocator)
+			proof, records, why := validate_wildcard_proof(v, budget, msg, e.owner, e.encloser, class, &denials, unix, now, allocator)
+			// The reason belongs to the verdict that is being returned, so it
+			// moves only when the verdict does.
+			if worse(worst, proof) != worst {
+				proof_reason = why
+			}
 			worst = worse(worst, proof)
 			append(&proved, ..records)
 		}
 		if worst != .Secure {
-			return {status = worst, reason = "wildcard expansion not proven"}
+			return {status = worst, reason = proof_reason}
 		}
 	}
 
@@ -1435,6 +1447,74 @@ Wildcard_Expansion :: struct {
 }
 
 /*
+Denial records already verified for one message, held for the length of a single
+`validate_answer` call.
+
+An answer can expand from more than one wildcard, and every expansion needs the
+same authority section verified against the same zone. Verifying it per
+expansion was free when nothing counted it; it is not free now that
+`validated_denial_records` spends `MAX_VERIFICATIONS_PER_QUERY`, and the cost
+falls on answers that did nothing wrong. Eight expansions over an authority
+section carrying five NSEC3 RRsets is forty verifications for five sets' worth
+of information, which alone is most of the allowance - so a legitimate response
+came back `Indeterminate`, and reached the client as SERVFAIL, for being large
+rather than for being false.
+
+Keyed by the zone the records were established against. That, with the message
+and the class, is everything the verification depends on: the keys are the
+zone's, and one `validate_answer` call fixes the rest.
+*/
+@(private)
+Verified_Denial :: struct {
+	zone:      string,
+	nsecs:     []Nsec_Rr,
+	nsec3s:    []Nsec3_Rr,
+	verified:  []Authenticated_Set,
+	exhausted: bool,
+}
+
+// The records for `zone`, verifying them if this message has not needed them yet.
+@(private)
+denial_records_for :: proc(
+	v: ^Validator,
+	budget: ^Budget,
+	seen: ^[dynamic]Verified_Denial,
+	authority: []dns.Record,
+	zone: string,
+	class: dns.Class,
+	keys: []Dnskey,
+	unix: u32,
+	now: time.Time,
+	allocator: mem.Allocator,
+) -> Verified_Denial {
+	for entry in seen^ {
+		if dns.name_equal_fold(entry.zone, zone) {
+			return entry
+		}
+	}
+	nsecs, nsec3s, verified, exhausted := validated_denial_records(
+		v,
+		budget,
+		authority,
+		zone,
+		class,
+		keys,
+		unix,
+		now,
+		allocator,
+	)
+	entry := Verified_Denial {
+		zone      = zone,
+		nsecs     = nsecs,
+		nsec3s    = nsec3s,
+		verified  = verified,
+		exhausted = exhausted,
+	}
+	append(seen, entry)
+	return entry
+}
+
+/*
 Prove that a wildcard was allowed to answer.
 
 RFC 5155 section 8.8: the verified RRset is what hands the validator a closest
@@ -1460,62 +1540,59 @@ validate_wildcard_proof :: proc(
 	msg: dns.Message,
 	owner, encloser: string,
 	class: dns.Class,
+	seen: ^[dynamic]Verified_Denial,
 	unix: u32,
 	now: time.Time,
 	allocator: mem.Allocator,
 ) -> (
 	status: Status,
 	proved: []Authenticated_Set,
+	reason: string,
 ) {
 	// Established from the expanded name, for the same reason as the denial path.
 	trust, keys, established := zone_trust(v, budget, owner, now, allocator)
 	if trust != .Secure {
-		return trust, nil
+		// A chain this server could not walk is not a proof that failed, and the
+		// two must not reach the log or the client saying the same thing.
+		if trust == .Indeterminate {
+			return trust, nil, "chain of trust unavailable"
+		}
+		return trust, nil, "wildcard expansion not proven"
 	}
 	next_closer := name_drop_labels(owner, label_count(owner) - label_count(encloser) - 1)
 	// The denial records were verified against `established`, so a name outside
 	// it is not theirs to speak for - a hash of one landing in some span of the
 	// zone would say nothing at all.
 	if !name_in_zone(next_closer, established) {
-		return .Bogus, nil
+		return .Bogus, nil, "wildcard expansion not proven"
 	}
-	nsecs, nsec3s, verified, wildcard_spent := validated_denial_records(
-		v,
-		budget,
-		msg.authority,
-		established,
-		class,
-		keys,
-		unix,
-		now,
-		allocator,
-	)
+	denial := denial_records_for(v, budget, seen, msg.authority, established, class, keys, unix, now, allocator)
 	/*
 	The same allowance, and the same answer. Falling through here reports a
 	budget of ours as "wildcard expansion not proven", which reaches the client
 	as a forged answer - the one thing every other exhaustion path in this file
 	now takes care not to say.
 	*/
-	if wildcard_spent {
-		return .Indeterminate, nil
+	if denial.exhausted {
+		return .Indeterminate, nil, "verification budget spent"
 	}
-	if len(nsecs) > 0 {
-		if _, covered := nsec_covering(nsecs, next_closer); covered {
-			return .Secure, verified
+	if len(denial.nsecs) > 0 {
+		if _, covered := nsec_covering(denial.nsecs, next_closer); covered {
+			return .Secure, denial.verified, ""
 		}
 	}
-	if len(nsec3s) > 0 {
-		if cover, covered := nsec3_covering(nsec3s, next_closer, v.max_nsec3_iterations); covered {
+	if len(denial.nsec3s) > 0 {
+		if cover, covered := nsec3_covering(denial.nsec3s, next_closer, v.max_nsec3_iterations); covered {
 			// RFC 5155 section 9.2 forbids the AD bit over an opt-out cover:
 			// the span may be hiding an unsigned delegation, so the next closer
 			// name is not proven absent and the wildcard may not have applied.
 			if cover.rr.flags & NSEC3_FLAG_OPT_OUT != 0 {
-				return .Insecure, nil
+				return .Insecure, nil, "opt-out span"
 			}
-			return .Secure, verified
+			return .Secure, denial.verified, ""
 		}
 	}
-	return .Bogus, nil
+	return .Bogus, nil, "wildcard expansion not proven"
 }
 
 /*

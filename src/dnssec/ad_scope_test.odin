@@ -960,3 +960,86 @@ test_chain_shape_reads_only_the_chain :: proc(t: ^testing.T) {
 	)
 	free_all(context.temp_allocator)
 }
+
+/*
+The denial records behind a wildcard proof are verified once for the message.
+
+An answer may expand from several wildcards, and each expansion needs the same
+authority section verified against the same zone. Doing that per expansion was
+free while nothing counted it. It is not free now that the verification spends
+`MAX_VERIFICATIONS_PER_QUERY`, and what it spends it on is work already done:
+eight expansions over five NSEC3 RRsets is forty verifications carrying five
+sets' worth of information, most of the allowance gone before the answer's own
+RRsets are reached. The response that pays for it is a legitimate one - an
+attacker gains nothing by making a zone answer from its own wildcards - so the
+budget fires on size rather than on forgery, and a good answer reaches the
+client as SERVFAIL.
+
+Asserted on the budget rather than on a verdict because that is where the bug
+lived: both calls return the same records either way, and only the meter says
+whether the second one paid for them again.
+*/
+@(test)
+test_a_messages_denial_records_are_verified_once :: proc(t: ^testing.T) {
+	v := make_validator(ad_query, nil, Options{})
+	defer destroy_validator(v)
+
+	msg, derr := dns.decode_message(ad_unhex(ad_fixture("nodata_cloudflare").wire), context.temp_allocator)
+	if !testing.expect(t, derr == .None, "the fixture did not decode") {
+		return
+	}
+
+	now := time.unix(FIXTURE_TIME, 0)
+	budget := Budget{}
+	trust, keys, established := zone_trust(v, &budget, "cloudflare.com.", now, context.temp_allocator)
+	if !testing.expectf(t, trust == .Secure, "the fixture's zone did not establish, got %v", trust) {
+		return
+	}
+
+	seen := make([dynamic]Verified_Denial, 0, 1, context.temp_allocator)
+	first := denial_records_for(
+		v,
+		&budget,
+		&seen,
+		msg.authority,
+		established,
+		.IN,
+		keys,
+		u32(FIXTURE_TIME),
+		now,
+		context.temp_allocator,
+	)
+	spent := budget.verifications
+	// Otherwise the comparison below holds for the wrong reason: nothing was
+	// verified on the first pass either.
+	if !testing.expect(t, spent > 0, "the first pass verified nothing, so the second cannot be shown to be free") {
+		return
+	}
+	if !testing.expect(t, len(first.nsecs) > 0 || len(first.nsec3s) > 0, "the fixture carried no denial records") {
+		return
+	}
+
+	second := denial_records_for(
+		v,
+		&budget,
+		&seen,
+		msg.authority,
+		established,
+		.IN,
+		keys,
+		u32(FIXTURE_TIME),
+		now,
+		context.temp_allocator,
+	)
+	testing.expectf(
+		t,
+		budget.verifications == spent,
+		"a second expansion re-verified the same denial records: %d verifications became %d",
+		spent,
+		budget.verifications,
+	)
+	testing.expect_value(t, len(second.nsecs), len(first.nsecs))
+	testing.expect_value(t, len(second.nsec3s), len(first.nsec3s))
+	testing.expect_value(t, len(second.verified), len(first.verified))
+	free_all(context.temp_allocator)
+}
