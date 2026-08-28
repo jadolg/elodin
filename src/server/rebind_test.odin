@@ -1,0 +1,1232 @@
+package server
+
+import "core:net"
+import "core:testing"
+import "core:thread"
+import "core:time"
+import "elodin:cache"
+import "elodin:config"
+import "elodin:dns"
+import "elodin:filter"
+import "elodin:upstream"
+
+/*
+An answer that points a public name back into the network the client sits on.
+
+This is the DNS half of a rebinding attack: a page loaded from
+`rebind.attacker.example` is same-origin with whatever that name resolves to, so
+an answer of 127.0.0.1 or 192.168.1.1 lets the page reach the router's admin
+page or a service bound to loopback. dnsmasq calls the guard
+`--stop-dns-rebind`, AdGuard Home calls it rebinding protection, and both drop
+private addresses arriving from an upstream.
+*/
+
+@(private = "file")
+Rebind_Mock :: struct {
+	socket: net.UDP_Socket,
+	reply:  []u8,
+}
+
+@(private = "file")
+serve_rebind :: proc(x: ^Rebind_Mock) {
+	buf: [4096]u8
+	n, remote, err := net.recv_udp(x.socket, buf[:])
+	if err != nil || n < dns.HEADER_SIZE || len(x.reply) > len(buf) {
+		return
+	}
+	out: [4096]u8
+	copy(out[:], x.reply)
+	out[0], out[1] = buf[0], buf[1]
+	_, _ = net.send_udp(x.socket, out[:len(x.reply)], remote)
+}
+
+@(private = "file")
+rebind_query :: proc(name: string) -> []u8 {
+	questions := make([]dns.Question, 1, context.temp_allocator)
+	questions[0] = dns.Question{name = name, type = .A, class = .IN}
+	msg := dns.Message{id = 0x4321, question = questions}
+	msg.flags.rd = true
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	if err != .None {
+		return nil
+	}
+	return wire
+}
+
+@(private = "file")
+rebind_reply :: proc(name: string, addr: [4]u8) -> []u8 {
+	answer := make([]dns.Record, 1, context.temp_allocator)
+	answer[0] = dns.Record{name = name, type = .A, class = .IN, ttl = 60, data = dns.Rdata_A{addr = addr}}
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question{name = name, type = .A, class = .IN}
+	msg := dns.Message{question = question, answer = answer}
+	msg.flags.qr = true
+	msg.flags.rd = true
+	msg.flags.ra = true
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	if err != .None {
+		return nil
+	}
+	return wire
+}
+
+@(private = "file")
+is_private_v4 :: proc(a: [4]u8) -> bool {
+	switch {
+	case a[0] == 127:
+		return true
+	case a[0] == 10:
+		return true
+	case a[0] == 172 && a[1] >= 16 && a[1] <= 31:
+		return true
+	case a[0] == 192 && a[1] == 168:
+		return true
+	case a[0] == 169 && a[1] == 254:
+		return true
+	}
+	return false
+}
+
+@(test)
+test_a_public_name_is_not_answered_with_a_private_address :: proc(t: ^testing.T) {
+	addresses := [][4]u8{{127, 0, 0, 1}, {192, 168, 1, 1}, {10, 0, 0, 5}, {169, 254, 169, 254}}
+
+	for addr in addresses {
+		socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+		if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+			return
+		}
+		defer net.close(socket)
+		_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+		bound, _ := net.bound_endpoint(socket)
+
+		cfg := config.default_config()
+		cfg.log.queries = false
+		cfg.cache.enabled = false
+		cfg.dnssec.enabled = false
+		cfg.blocking.enabled = false
+		// Off by default now, and this is the reproducer for the guard on.
+		cfg.rebind.enabled = true
+		cfg.upstream.strategy = .Failover
+		cfg.upstream.attempts = 1
+		cfg.upstream.timeout = 3 * time.Second
+		servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
+		servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port}
+		cfg.upstream.servers = servers
+
+		group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+		if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+			return
+		}
+		defer upstream.destroy_group(group)
+		s := Server{cfg = &cfg, group = group}
+
+		x := Rebind_Mock{socket = socket, reply = rebind_reply("rebind.attacker.example.", addr)}
+		mock := thread.create_and_start_with_poly_data(&x, serve_rebind)
+		out, _, ok := handle_query(
+			&s,
+			rebind_query("rebind.attacker.example."),
+			.UDP,
+			"127.0.0.1:5555",
+			context.temp_allocator,
+		)
+		thread.join(mock)
+		thread.destroy(mock)
+
+		if !testing.expect(t, ok, "nothing came back at all") {
+			return
+		}
+		decoded, derr := dns.decode_message(out, context.temp_allocator)
+		testing.expect_value(t, derr, dns.Decode_Error.None)
+		for rec in decoded.answer {
+			a, is_a := rec.data.(dns.Rdata_A)
+			if !is_a {
+				continue
+			}
+			testing.expectf(
+				t,
+				!is_private_v4(a.addr),
+				"a public name was answered with %v, which is inside the client's own network",
+				a.addr,
+			)
+		}
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+Everything below asks the same question of the finished feature rather than of
+the bug: the guard has to refuse the attack without refusing the deployments it
+sits in front of, and that second half is where a check like this goes wrong.
+
+The helpers are the reproducer's, generalised: one mock upstream, one query, one
+answer that this file decides the contents of.
+*/
+
+@(private = "file")
+rebind_query_type :: proc(name: string, type: dns.Type) -> []u8 {
+	questions := make([]dns.Question, 1, context.temp_allocator)
+	questions[0] = dns.Question{name = name, type = type, class = .IN}
+	msg := dns.Message{id = 0x4321, question = questions}
+	msg.flags.rd = true
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	if err != .None {
+		return nil
+	}
+	return wire
+}
+
+@(private = "file")
+rebind_reply_of :: proc(name: string, type: dns.Type, answers: []dns.Record) -> []u8 {
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question{name = name, type = type, class = .IN}
+	msg := dns.Message{question = question, answer = answers}
+	msg.flags.qr = true
+	msg.flags.rd = true
+	msg.flags.ra = true
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	if err != .None {
+		return nil
+	}
+	return wire
+}
+
+@(private = "file")
+a_record :: proc(name: string, addr: [4]u8) -> dns.Record {
+	return dns.Record{name = name, type = .A, class = .IN, ttl = 60, data = dns.Rdata_A{addr = addr}}
+}
+
+@(private = "file")
+aaaa_record :: proc(name: string, addr: [16]u8) -> dns.Record {
+	return dns.Record{name = name, type = .AAAA, class = .IN, ttl = 60, data = dns.Rdata_AAAA{addr = addr}}
+}
+
+/*
+Put one question to a server whose only upstream answers with `reply`.
+
+`cfg` is the caller's, so each test says in its own body what configuration it is
+about; the upstream is filled in here because the mock's port is not known until
+it is bound. The cache is the caller's too, since the ordering against `cache.put`
+is one of the things being tested and a helper that switched caching off could not
+tell the difference between running before it and running instead of it.
+*/
+@(private = "file")
+ask_with_reply :: proc(
+	t: ^testing.T,
+	cfg: ^config.Config,
+	name: string,
+	type: dns.Type,
+	reply: []u8,
+	answers: ^cache.Cache = nil,
+) -> (
+	decoded: dns.Message,
+	ok: bool,
+) {
+	out, _, sent := ask_raw(t, cfg, name, type, reply, answers)
+	if !sent {
+		return {}, false
+	}
+	msg, derr := dns.decode_message(out, context.temp_allocator)
+	if !testing.expectf(t, derr == .None, "the response did not decode: %v", derr) {
+		return {}, false
+	}
+	return msg, true
+}
+
+// The same, stopping at the bytes. What a test wants when the response is not
+// meant to decode - which is the whole subject of the undecodable-answer case.
+@(private = "file")
+ask_raw :: proc(
+	t: ^testing.T,
+	cfg: ^config.Config,
+	name: string,
+	type: dns.Type,
+	reply: []u8,
+	answers: ^cache.Cache = nil,
+) -> (
+	wire: []u8,
+	outcome: Outcome,
+	ok: bool,
+) {
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+		return nil, .Failed, false
+	}
+	defer net.close(socket)
+	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+	bound, _ := net.bound_endpoint(socket)
+
+	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
+	servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port}
+	cfg.upstream.servers = servers
+	cfg.upstream.strategy = .Failover
+	cfg.upstream.attempts = 1
+	cfg.upstream.timeout = 3 * time.Second
+
+	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+		return nil, .Failed, false
+	}
+	defer upstream.destroy_group(group)
+	s := Server {
+		cfg     = cfg,
+		group   = group,
+		answers = answers,
+	}
+
+	x := Rebind_Mock{socket = socket, reply = reply}
+	mock := thread.create_and_start_with_poly_data(&x, serve_rebind)
+	out, got, sent := handle_query(&s, rebind_query_type(name, type), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	thread.join(mock)
+	thread.destroy(mock)
+
+	if !testing.expect(t, sent, "nothing came back at all") {
+		return nil, got, false
+	}
+	return out, got, true
+}
+
+// A configuration with nothing in the way of the check but the check itself.
+// The guard is off in the shipped default now, so it is turned on here: these
+// tests are all about what it does once on, and the off case has its own test.
+@(private = "file")
+rebind_config :: proc() -> config.Config {
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.cache.enabled = false
+	cfg.dnssec.enabled = false
+	cfg.blocking.enabled = false
+	cfg.rebind.enabled = true
+	return cfg
+}
+
+@(private = "file")
+addresses_in :: proc(msg: dns.Message) -> (out: [dynamic][16]u8) {
+	out = make([dynamic][16]u8, 0, 2, context.temp_allocator)
+	for rec in msg.answer {
+		#partial switch data in rec.data {
+		case dns.Rdata_A:
+			a: [16]u8
+			a[0], a[1], a[2], a[3] = data.addr[0], data.addr[1], data.addr[2], data.addr[3]
+			append(&out, a)
+		case dns.Rdata_AAAA:
+			append(&out, data.addr)
+		}
+	}
+	return out
+}
+
+@(private = "file")
+v4_bytes :: proc(a: [4]u8) -> (out: [16]u8) {
+	out[0], out[1], out[2], out[3] = a[0], a[1], a[2], a[3]
+	return out
+}
+
+/*
+The other half of the guard, and the half that decides whether it can be on by
+default: an answer that is not pointing anywhere private goes through untouched.
+
+Worth a test of its own rather than being taken as read from the refusals above.
+A check that refused everything would pass every one of them.
+*/
+@(test)
+test_a_public_address_is_forwarded_unchanged :: proc(t: ^testing.T) {
+	cfg := rebind_config()
+	records := make([]dns.Record, 1, context.temp_allocator)
+	records[0] = a_record("ok.example.", {93, 184, 216, 34})
+	reply := rebind_reply_of("ok.example.", .A, records)
+
+	msg, ok := ask_with_reply(t, &cfg, "ok.example.", .A, reply)
+	if !ok {
+		return
+	}
+	got := addresses_in(msg)
+	if testing.expect_value(t, len(got), 1) {
+		testing.expect_value(t, got[0], v4_bytes({93, 184, 216, 34}))
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+Split horizon, which is the deployment this feature has to not break.
+
+A site whose upstream is its own internal server resolves `nas.corp.example` to
+an RFC 1918 address through the public name space, and that is a normal thing to
+run rather than an attack. `rebind.allow_domains` names the zone, and the
+exemption covers everything below it - an operator writing a zone name is not
+also expected to enumerate the hosts in it.
+*/
+@(test)
+test_an_exempt_domain_may_resolve_to_a_private_address :: proc(t: ^testing.T) {
+	names := []string{"corp.example.", "nas.corp.example.", "a.b.corp.example."}
+	for name in names {
+		cfg := rebind_config()
+		exempt := make([]string, 1, context.temp_allocator)
+		exempt[0] = "corp.example."
+		cfg.rebind.allow_domains = exempt
+
+		records := make([]dns.Record, 1, context.temp_allocator)
+		records[0] = a_record(name, {192, 168, 1, 50})
+		msg, ok := ask_with_reply(t, &cfg, name, .A, rebind_reply_of(name, .A, records))
+		if !ok {
+			return
+		}
+		got := addresses_in(msg)
+		testing.expectf(t, len(got) == 1, "%s was refused despite rebind.allow_domains covering it", name)
+	}
+
+	/*
+	And the exemption stops at the label break. `notcorp.example` is not inside
+	`corp.example`, however much of a string suffix it is - the same rule the
+	rewrites and the locally-served zones are matched by, and the reason all
+	three go through `name_at_or_below`.
+	*/
+	cfg := rebind_config()
+	exempt := make([]string, 1, context.temp_allocator)
+	exempt[0] = "corp.example."
+	cfg.rebind.allow_domains = exempt
+
+	records := make([]dns.Record, 1, context.temp_allocator)
+	records[0] = a_record("notcorp.example.", {192, 168, 1, 50})
+	msg, ok := ask_with_reply(t, &cfg, "notcorp.example.", .A, rebind_reply_of("notcorp.example.", .A, records))
+	if ok {
+		testing.expect_value(t, len(msg.answer), 0)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+The v6 half of the address set, and the one entry of it that is not a v6 address
+at all.
+
+`::ffff:192.168.1.1` is 192.168.1.1 to every stack that connects to it, so an
+AAAA record holding one is a way to write a private address that a check reading
+sixteen bytes as an IPv6 address would not see. `address_in` undoes the mapping
+for the same reason `source_allowed` does on the way in.
+*/
+@(test)
+test_private_ipv6_answers_are_refused_too :: proc(t: ^testing.T) {
+	refused := [][16]u8 {
+		{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, // ::1
+		{0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, // fe80::1
+		{0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, // fd00::1
+		{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 1, 1}, // ::ffff:192.168.1.1
+		{}, // ::
+	}
+	for addr in refused {
+		cfg := rebind_config()
+		records := make([]dns.Record, 1, context.temp_allocator)
+		records[0] = aaaa_record("rebind.attacker.example.", addr)
+		msg, ok := ask_with_reply(
+			t,
+			&cfg,
+			"rebind.attacker.example.",
+			.AAAA,
+			rebind_reply_of("rebind.attacker.example.", .AAAA, records),
+		)
+		if !ok {
+			return
+		}
+		testing.expectf(t, len(msg.answer) == 0, "a public name was answered with %v", addr)
+		testing.expect_value(t, msg.flags.rcode, u8(dns.Rcode.No_Error))
+	}
+
+	// 2001:4860:4860::8888 is a public address and stays one.
+	cfg := rebind_config()
+	public := [16]u8{0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88}
+	records := make([]dns.Record, 1, context.temp_allocator)
+	records[0] = aaaa_record("ok.example.", public)
+	msg, ok := ask_with_reply(t, &cfg, "ok.example.", .AAAA, rebind_reply_of("ok.example.", .AAAA, records))
+	if ok {
+		testing.expect_value(t, len(msg.answer), 1)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+A rewrite is what an operator uses to point a name at their own NAS, so it is the
+first thing this must not break.
+
+It cannot: `apply_rewrite` answers out of the configuration before anything is
+forwarded, so the guard never sees the name. Pinned all the same, because that is
+a fact about where the two sit in `resolve_query` rather than about either of
+them - a rewrite moved below the forwarding path would acquire the problem
+silently, and this is what would say so.
+*/
+@(test)
+test_a_rewritten_name_keeps_its_private_address :: proc(t: ^testing.T) {
+	cfg := rebind_config()
+	answers := make([]config.Rewrite_Answer, 1, context.temp_allocator)
+	answers[0] = config.Rewrite_Answer{kind = .A, v4 = {192, 168, 1, 50}}
+	rules := make([]config.Rewrite, 1, context.temp_allocator)
+	rules[0] = config.Rewrite{domain = "nas.home.", answers = answers, ttl = 60}
+	cfg.rewrites = rules
+
+	// The upstream would answer with a public address, so anything but
+	// 192.168.1.50 coming back means the rewrite was not what answered.
+	records := make([]dns.Record, 1, context.temp_allocator)
+	records[0] = a_record("nas.home.", {93, 184, 216, 34})
+	msg, ok := ask_with_reply(t, &cfg, "nas.home.", .A, rebind_reply_of("nas.home.", .A, records))
+	if !ok {
+		return
+	}
+	got := addresses_in(msg)
+	if testing.expect_value(t, len(got), 1) {
+		testing.expect_value(t, got[0], v4_bytes({192, 168, 1, 50}))
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+One bad record refuses the whole answer.
+
+Filtering it out and serving the rest is what Unbound does and is the tempting
+shape, but it makes the guard's correctness depend on being exhaustive over every
+way an address can appear in a message. Refusing the message is one decision, and
+it is the one that holds for an RR type this code does not model yet.
+*/
+@(test)
+test_one_private_address_refuses_the_whole_answer :: proc(t: ^testing.T) {
+	cfg := rebind_config()
+	records := make([]dns.Record, 2, context.temp_allocator)
+	records[0] = a_record("mixed.attacker.example.", {93, 184, 216, 34})
+	records[1] = a_record("mixed.attacker.example.", {192, 168, 1, 1})
+
+	msg, ok := ask_with_reply(
+		t,
+		&cfg,
+		"mixed.attacker.example.",
+		.A,
+		rebind_reply_of("mixed.attacker.example.", .A, records),
+	)
+	if !ok {
+		return
+	}
+	testing.expect_value(t, len(msg.answer), 0)
+	/*
+	NODATA rather than SERVFAIL: a stub with a second resolver configured treats
+	SERVFAIL as this server having failed and asks the other one, which on a home
+	network is the router - and the router answers 192.168.1.1 quite happily. The
+	refusal would route the attack around itself.
+	*/
+	testing.expect_value(t, msg.flags.rcode, u8(dns.Rcode.No_Error))
+	// With an SOA to say how long to remember it, so the name is not re-asked
+	// every second while an attack runs.
+	testing.expect_value(t, len(msg.authority), 1)
+	free_all(context.temp_allocator)
+}
+
+/*
+`rebind.allow_loopback` opens 127.0.0.0/8 and ::1, and nothing else.
+
+dnsmasq draws `--rebind-localhost-ok` at exactly this line. The half of the test
+that matters is the second one: a switch that also let RFC 1918 through would be
+one an operator reaches for to fix a loopback name and thereby turns the feature
+off.
+*/
+@(test)
+test_allow_loopback_opens_loopback_alone :: proc(t: ^testing.T) {
+	cfg := rebind_config()
+	cfg.rebind.allow_loopback = true
+
+	records := make([]dns.Record, 1, context.temp_allocator)
+	records[0] = a_record("local.example.", {127, 0, 0, 1})
+	msg, ok := ask_with_reply(t, &cfg, "local.example.", .A, rebind_reply_of("local.example.", .A, records))
+	if !ok {
+		return
+	}
+	testing.expect_value(t, len(msg.answer), 1)
+
+	private := make([]dns.Record, 1, context.temp_allocator)
+	private[0] = a_record("router.example.", {192, 168, 1, 1})
+	msg2, ok2 := ask_with_reply(t, &cfg, "router.example.", .A, rebind_reply_of("router.example.", .A, private))
+	if ok2 {
+		testing.expect_value(t, len(msg2.answer), 0)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+The refusal happens before `cache.put`, and nothing about it is stored.
+
+Two things are being said. The first is the ordering the whole feature rests on:
+an answer cached before the check is one every later client is served without the
+check running again, so the second query here would come back with 192.168.1.1
+out of the cache and never reach an upstream. The second is that the synthesised
+NODATA is not cached either - what was seen was one answer rather than a property
+of the name, and an upstream that answers sensibly a moment later is believed.
+*/
+@(test)
+test_a_refused_answer_is_not_cached :: proc(t: ^testing.T) {
+	cfg := rebind_config()
+	cfg.cache.enabled = true
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
+	defer cache.destroy(answers)
+
+	bad := make([]dns.Record, 1, context.temp_allocator)
+	bad[0] = a_record("flip.example.", {192, 168, 1, 1})
+	first, ok := ask_with_reply(t, &cfg, "flip.example.", .A, rebind_reply_of("flip.example.", .A, bad), answers)
+	if !ok {
+		return
+	}
+	testing.expect_value(t, len(first.answer), 0)
+	testing.expect_value(t, cache.len_entries(answers), 0)
+
+	good := make([]dns.Record, 1, context.temp_allocator)
+	good[0] = a_record("flip.example.", {93, 184, 216, 34})
+	second, ok2 := ask_with_reply(t, &cfg, "flip.example.", .A, rebind_reply_of("flip.example.", .A, good), answers)
+	if !ok2 {
+		return
+	}
+	got := addresses_in(second)
+	if testing.expect_value(t, len(got), 1) {
+		testing.expect_value(t, got[0], v4_bytes({93, 184, 216, 34}))
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+Off is off.
+
+`enabled: false` is the shipped default, and it has to be inert exactly: a
+private address from an upstream is forwarded as any other answer would be, with
+none of the guard's machinery in the way. An operator who turned the guard on and
+then hit a split-horizon name reaches for this to get resolving again in one line
+while they work out which zone to exempt, and it has to land them back on the
+plain forwarding path.
+*/
+@(test)
+test_the_guard_can_be_turned_off :: proc(t: ^testing.T) {
+	cfg := rebind_config()
+	cfg.rebind.enabled = false
+
+	records := make([]dns.Record, 1, context.temp_allocator)
+	records[0] = a_record("rebind.attacker.example.", {192, 168, 1, 1})
+	msg, ok := ask_with_reply(
+		t,
+		&cfg,
+		"rebind.attacker.example.",
+		.A,
+		rebind_reply_of("rebind.attacker.example.", .A, records),
+	)
+	if !ok {
+		return
+	}
+	got := addresses_in(msg)
+	if testing.expect_value(t, len(got), 1) {
+		testing.expect_value(t, got[0], v4_bytes({192, 168, 1, 1}))
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+An HTTPS record's `ipv4hint` is an address a browser connects to without ever
+having asked for the A record, so a guard that only read A and AAAA would have a
+documented way round it (RFC 9460 section 7.3).
+
+The hints are inside the RDATA of the name in the question rather than glue for
+somebody else's name, which is what separates them from the additional section
+this deliberately does not read.
+*/
+@(test)
+test_an_https_record_cannot_hint_at_a_private_address :: proc(t: ^testing.T) {
+	// One SvcParam: key 4 (ipv4hint), four bytes of value, 192.168.1.1.
+	params := make([]u8, 8, context.temp_allocator)
+	params[0], params[1] = 0, 4
+	params[2], params[3] = 0, 4
+	params[4], params[5], params[6], params[7] = 192, 168, 1, 1
+
+	cfg := rebind_config()
+	records := make([]dns.Record, 1, context.temp_allocator)
+	records[0] = dns.Record {
+		name  = "svc.attacker.example.",
+		type  = .HTTPS,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_SVCB{priority = 1, target = ".", params = params},
+	}
+	msg, ok := ask_with_reply(
+		t,
+		&cfg,
+		"svc.attacker.example.",
+		.HTTPS,
+		rebind_reply_of("svc.attacker.example.", .HTTPS, records),
+	)
+	if !ok {
+		return
+	}
+	testing.expect_value(t, len(msg.answer), 0)
+	free_all(context.temp_allocator)
+}
+
+/*
+`localhost.` may be answered with loopback, without anybody configuring it.
+
+RFC 6761 section 6.3 makes 127.0.0.1 and ::1 the only answers that name can
+have, so this is not the operator granting latitude but the guard declining to
+refuse the one answer the standard permits. It is deliberately not a setting,
+and deliberately not deferred to the RFC 6761 handling that would answer the
+name locally and keep it off the forwarding path entirely: two guards whose
+correctness depends on which of them merged first is a live bug waiting for one
+to land while the other is still in review.
+
+The second half is the scope. The exemption is for the addresses section 6.3
+allows, not for the name - an upstream answering `evil.localhost` with
+192.168.1.1 is doing something the RFC does not permit either, and gets no
+latitude from this.
+*/
+@(test)
+test_localhost_may_be_answered_with_loopback :: proc(t: ^testing.T) {
+	loopback := [16]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+
+	names := []string{"localhost.", "app.localhost."}
+	for name in names {
+		cfg := rebind_config()
+		records := make([]dns.Record, 1, context.temp_allocator)
+		records[0] = a_record(name, {127, 0, 0, 1})
+		msg, ok := ask_with_reply(t, &cfg, name, .A, rebind_reply_of(name, .A, records))
+		if !ok {
+			return
+		}
+		testing.expectf(t, len(msg.answer) == 1, "%s was refused its own loopback address", name)
+
+		v6cfg := rebind_config()
+		v6recs := make([]dns.Record, 1, context.temp_allocator)
+		v6recs[0] = aaaa_record(name, loopback)
+		v6msg, v6ok := ask_with_reply(t, &v6cfg, name, .AAAA, rebind_reply_of(name, .AAAA, v6recs))
+		if v6ok {
+			testing.expectf(t, len(v6msg.answer) == 1, "%s was refused ::1", name)
+		}
+	}
+
+	// Loopback and no further: RFC 1918 out of a `.localhost` name is not an
+	// answer section 6.3 permits, so the exemption does not reach it.
+	cfg := rebind_config()
+	records := make([]dns.Record, 1, context.temp_allocator)
+	records[0] = a_record("evil.localhost.", {192, 168, 1, 1})
+	msg, ok := ask_with_reply(t, &cfg, "evil.localhost.", .A, rebind_reply_of("evil.localhost.", .A, records))
+	if ok {
+		testing.expect_value(t, len(msg.answer), 0)
+	}
+
+	// And the label break holds here as everywhere else: `notlocalhost.` is not
+	// inside `localhost.`.
+	plain := rebind_config()
+	precs := make([]dns.Record, 1, context.temp_allocator)
+	precs[0] = a_record("notlocalhost.", {127, 0, 0, 1})
+	pmsg, pok := ask_with_reply(t, &plain, "notlocalhost.", .A, rebind_reply_of("notlocalhost.", .A, precs))
+	if pok {
+		testing.expect_value(t, len(pmsg.answer), 0)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+`blocking.response: zeroip` answers a blocked name with 0.0.0.0, and 0.0.0.0 is
+in the set of addresses this guard refuses.
+
+Those two do not collide, because a block response is built locally by
+`build_block_response` and never travels the forwarding path the check sits on.
+But that is a fact about where the call site is, not about either feature: a
+check moved to cover locally-built answers would refuse every blocked name and
+take the whole blocking feature down with it, silently, for the one
+`blocking.response` mode that produces an address. This is what would fail
+instead.
+
+Both families, since `zeroip` answers AAAA with `::` and that is in the set too.
+*/
+@(test)
+test_a_zero_ip_block_response_still_reaches_the_client :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.cache.enabled = false
+	cfg.dnssec.enabled = false
+	cfg.blocking.enabled = true
+	cfg.blocking.response = .Zero_IP
+	// The guard is turned on here - it is off in the shipped default - because a
+	// guard that is off could not collide with blocking, and the collision is
+	// the point of the test.
+	cfg.rebind.enabled = true
+
+	block, allow := filter.set_make(), filter.set_make()
+	filter.parse_list(block, allow, "0.0.0.0 ads.example.com\n", .Hosts)
+	engine := filter.engine_make()
+	defer filter.engine_destroy(engine)
+	filter.engine_swap(engine, block, allow)
+
+	s := Server {
+		cfg     = &cfg,
+		filters = engine,
+	}
+
+	types := []dns.Type{.A, .AAAA}
+	for type in types {
+		out, outcome, ok := handle_query(
+			&s,
+			rebind_query_type("ads.example.com.", type),
+			.UDP,
+			"127.0.0.1:5555",
+			context.temp_allocator,
+		)
+		if !testing.expectf(t, ok, "the %v block response was not sent at all", type) {
+			return
+		}
+		testing.expect_value(t, outcome, Outcome.Blocked)
+
+		msg, derr := dns.decode_message(out, context.temp_allocator)
+		testing.expect_value(t, derr, dns.Decode_Error.None)
+		testing.expectf(
+			t,
+			len(msg.answer) == 1,
+			"the %v sink answer was refused: blocking with zeroip has been taken down by the rebinding guard",
+			type,
+		)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+An answer this server cannot decode is refused rather than forwarded.
+
+This was the way round the guard, and it cost the attacker nothing: they own the
+authoritative server, so they emit a truthful answer section carrying
+192.168.1.1 and an ARCOUNT of 100 with no additional records behind it. The
+count check in `decode_message` rejects the message, `rebind_refusal` had
+nothing to inspect and said so, and the bytes went to the client verbatim -
+where glibc's `getanswer`, which only ever walks the answer section, hands the
+browser the address. Deterministic, one flag in the header, no timing and no
+race.
+
+What the file used to offer against that was that such a message is also one the
+validator cannot validate. It is not much: `validating` is false whenever
+`dnssec.enabled` is off - a supported configuration, and the one recommended for
+an upstream that cannot return DNSSEC records - or the client sets CD, and an
+attacker's own zone is unsigned in any case, so validation reaches Insecure and
+serves it. A mitigation that an attacker turns off by not signing their zone is
+not one.
+
+The reply here is built by encoding a well-formed message and then writing 100
+into ARCOUNT, which is exactly the attacker's edit and nothing else.
+*/
+@(test)
+test_an_undecodable_answer_is_refused_not_forwarded :: proc(t: ^testing.T) {
+	records := make([]dns.Record, 1, context.temp_allocator)
+	records[0] = a_record("undecodable.attacker.example.", {192, 168, 1, 1})
+	reply := rebind_reply_of("undecodable.attacker.example.", .A, records)
+	if !testing.expect(t, len(reply) > dns.HEADER_SIZE, "the reply did not encode") {
+		return
+	}
+	// ARCOUNT is the fourth count in the header, bytes 10 and 11. A hundred
+	// additional records that are not there is more than the remaining bytes
+	// can hold, which is what the decoder refuses.
+	patched := make([]u8, len(reply), context.temp_allocator)
+	copy(patched, reply)
+	patched[10], patched[11] = 0, 100
+
+	_, derr := dns.decode_message(patched, context.temp_allocator)
+	if !testing.expect(t, derr != .None, "the premise is gone: this message now decodes") {
+		return
+	}
+
+	cfg := rebind_config()
+	msg, ok := ask_with_reply(t, &cfg, "undecodable.attacker.example.", .A, patched)
+	if !ok {
+		return
+	}
+	testing.expect_value(t, len(msg.answer), 0)
+	testing.expect_value(t, msg.flags.rcode, u8(dns.Rcode.No_Error))
+
+	/*
+	And only where the guard covers the question. A TXT answer the decoder
+	rejects is forwarded as it always was: this is the rebinding guard declining
+	to pass on what it cannot read, not a new rule about malformed messages, and
+	widening it to every type would be a much larger change than the one that
+	closes the bypass.
+	*/
+	txt := make([]dns.Record, 1, context.temp_allocator)
+	txt[0] = dns.Record {
+		name  = "undecodable.attacker.example.",
+		type  = .TXT,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_TXT{strings = []string{"hello"}},
+	}
+	txt_reply := rebind_reply_of("undecodable.attacker.example.", .TXT, txt)
+	txt_patched := make([]u8, len(txt_reply), context.temp_allocator)
+	copy(txt_patched, txt_reply)
+	txt_patched[10], txt_patched[11] = 0, 100
+
+	out, _, sent := ask_raw(t, &cfg, "undecodable.attacker.example.", .TXT, txt_patched)
+	if testing.expect(t, sent, "the TXT answer was not sent at all") {
+		testing.expectf(
+			t,
+			len(out) == len(txt_patched),
+			"an undecodable TXT answer was not forwarded as it stood: %d bytes out of %d",
+			len(out),
+			len(txt_patched),
+		)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+An SVCB or HTTPS answer's additional section is checked too.
+
+The additional section is left alone everywhere else, and the reason given for
+that is that a stub does not resolve a hostname out of it. True for MX and NS
+glue; not true here. RFC 9460 section 5 has the resolver put A and AAAA for the
+ServiceMode TargetName in the additional section precisely so the client does not
+have to ask, and a client following it connects to what it finds there. So an
+answer of `HTTPS 1 .` with no `ipv4hint` at all, and `A 192.168.1.1` in the
+additional section, was the same "address a browser reaches without ever asking
+for the A record" that the hints are covered for - arriving by the other door.
+
+Scoped to answers that actually carry an SVCB or HTTPS record rather than to the
+question type, since that is the only shape in which an additional-section
+address is something a client acts on.
+*/
+@(test)
+test_an_https_answer_cannot_smuggle_an_address_in_the_additional_section :: proc(t: ^testing.T) {
+	answers := make([]dns.Record, 1, context.temp_allocator)
+	answers[0] = dns.Record {
+		name  = "svc.attacker.example.",
+		type  = .HTTPS,
+		class = .IN,
+		ttl   = 60,
+		// No parameters at all, so there is no hint to catch it by.
+		data  = dns.Rdata_SVCB{priority = 1, target = "target.attacker.example."},
+	}
+	additional := make([]dns.Record, 1, context.temp_allocator)
+	additional[0] = a_record("target.attacker.example.", {192, 168, 1, 1})
+
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question{name = "svc.attacker.example.", type = .HTTPS, class = .IN}
+	reply_msg := dns.Message {
+		question   = question,
+		answer     = answers,
+		additional = additional,
+	}
+	reply_msg.flags.qr = true
+	reply_msg.flags.rd = true
+	reply_msg.flags.ra = true
+	reply, _, err := dns.encode_message(reply_msg, context.temp_allocator)
+	if !testing.expectf(t, err == .None, "the reply did not encode: %v", err) {
+		return
+	}
+
+	cfg := rebind_config()
+	msg, ok := ask_with_reply(t, &cfg, "svc.attacker.example.", .HTTPS, reply)
+	if !ok {
+		return
+	}
+	testing.expect_value(t, len(msg.answer), 0)
+
+	/*
+	And an A answer's additional section is still left alone. Glue for a name
+	other than the one asked about is not something a stub connects to, elodin
+	stores and serves a response whole under the question's key so there is no
+	way to retrieve it on its own, and refusing on it would mean an answer
+	turned away for a record its client will never read.
+	*/
+	plain := make([]dns.Record, 1, context.temp_allocator)
+	plain[0] = a_record("ok.example.", {93, 184, 216, 34})
+	glue := make([]dns.Record, 1, context.temp_allocator)
+	glue[0] = a_record("ns.somewhere.example.", {192, 168, 1, 1})
+	q2 := make([]dns.Question, 1, context.temp_allocator)
+	q2[0] = dns.Question{name = "ok.example.", type = .A, class = .IN}
+	m2 := dns.Message {
+		question   = q2,
+		answer     = plain,
+		additional = glue,
+	}
+	m2.flags.qr = true
+	m2.flags.rd = true
+	m2.flags.ra = true
+	wire, _, werr := dns.encode_message(m2, context.temp_allocator)
+	if !testing.expectf(t, werr == .None, "the second reply did not encode: %v", werr) {
+		return
+	}
+	cfg2 := rebind_config()
+	msg2, ok2 := ask_with_reply(t, &cfg2, "ok.example.", .A, wire)
+	if ok2 {
+		testing.expect_value(t, len(msg2.answer), 1)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+A clean answer section is not refused over a section nothing reads.
+
+The fail-closed rule exists for one bypass - a truthful answer carrying a private
+address behind a count of records that are not in the message - and the first cut
+of it enforced fail-closed with `decode_message`, which refuses a message for a
+malformed record anywhere in it. That is wider than the bypass by everything a
+stub never looks at: an authority or additional section that does not parse has
+no bearing on the address the client is about to connect to, and a name whose
+upstream emits one resolves today.
+
+Three cases, and the middle one is the point of the other two: the guard has to
+still be reading the answer section, not skipping the message.
+*/
+@(test)
+test_a_broken_additional_section_does_not_refuse_a_readable_answer :: proc(t: ^testing.T) {
+	// ARCOUNT one higher than the records behind it. Enough to fail the full
+	// decode, not enough to fail the count check in the prologue - which is the
+	// only reason there is a case to answer here. The hundred-record version
+	// from the test above is refused by both decoders and still is.
+	overrun :: proc(wire: []u8) -> []u8 {
+		patched := make([]u8, len(wire), context.temp_allocator)
+		copy(patched, wire)
+		patched[10], patched[11] = 0, 1
+		return patched
+	}
+
+	public := make([]dns.Record, 1, context.temp_allocator)
+	public[0] = a_record("tail.example.", {93, 184, 216, 34})
+	patched := overrun(rebind_reply_of("tail.example.", .A, public))
+
+	_, full := dns.decode_message(patched, context.temp_allocator)
+	if !testing.expect(t, full != .None, "the premise is gone: the whole message decodes") {
+		return
+	}
+	_, answer_only := dns.decode_through_answer(patched, context.temp_allocator)
+	if !testing.expectf(t, answer_only == .None, "the premise is gone: the answer section does not decode: %v", answer_only) {
+		return
+	}
+
+	cfg := rebind_config()
+	out, outcome, sent := ask_raw(t, &cfg, "tail.example.", .A, patched)
+	if testing.expect(t, sent, "the answer was not sent at all") {
+		testing.expectf(t, outcome != .Blocked, "a readable public answer was refused over its additional section")
+		testing.expectf(
+			t,
+			len(out) == len(patched),
+			"the answer was not forwarded as it stood: %d bytes out of %d",
+			len(out),
+			len(patched),
+		)
+	}
+
+	// The same message with a private address in it is still refused, which is
+	// what says the answer section was read rather than waved through.
+	private := make([]dns.Record, 1, context.temp_allocator)
+	private[0] = a_record("tail.attacker.example.", {192, 168, 1, 1})
+	msg, ok := ask_with_reply(
+		t,
+		&cfg,
+		"tail.attacker.example.",
+		.A,
+		overrun(rebind_reply_of("tail.attacker.example.", .A, private)),
+	)
+	if ok {
+		testing.expect_value(t, len(msg.answer), 0)
+		testing.expect_value(t, msg.flags.rcode, u8(dns.Rcode.No_Error))
+	}
+
+	/*
+	And an answer carrying HTTPS keeps the whole-message requirement, because
+	there the unread section is one the client acts on: RFC 9460 section 5 puts
+	the target's addresses in it. Refusing is the only safe reading of "the part
+	that did not decode is the part I would have had to check".
+	*/
+	service := make([]dns.Record, 1, context.temp_allocator)
+	service[0] = dns.Record {
+		name  = "svc.attacker.example.",
+		type  = .HTTPS,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_SVCB{priority = 1, target = "target.attacker.example.", params = nil},
+	}
+	svc, svc_ok := ask_with_reply(
+		t,
+		&cfg,
+		"svc.attacker.example.",
+		.HTTPS,
+		overrun(rebind_reply_of("svc.attacker.example.", .HTTPS, service)),
+	)
+	if svc_ok {
+		testing.expectf(
+			t,
+			len(svc.answer) == 0,
+			"an HTTPS answer whose additional section did not decode was passed on with %d records",
+			len(svc.answer),
+		)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+An address record the decoder could not parse is unreadable, not absent.
+
+`decode_record` does not fail on RDATA it cannot make sense of - it keeps the
+bytes and reports success, which is right for a forwarder that has to pass on
+types it does not model. The guard reads the union tag to find addresses, so such
+a record matched nothing and was forwarded unexamined. For HTTPS that is a way
+through with something behind it: the `ipv4hint` bytes are sitting in the RDATA,
+a client that parses the target name differently from this decoder reads them,
+and the guard never looked.
+
+Scoped to the four types the guard takes addresses from - a raw TXT is a raw TXT,
+and refusing on those would be a rule about malformed messages rather than about
+rebinding.
+*/
+@(test)
+test_an_unparsable_address_record_is_refused :: proc(t: ^testing.T) {
+	cfg := rebind_config()
+
+	// An A record whose RDLENGTH says five bytes. `decode_rdata` refuses it and
+	// `decode_record` keeps it as raw, so the message as a whole decodes.
+	bad_a := make([]dns.Record, 1, context.temp_allocator)
+	bad_a[0] = dns.Record {
+		name  = "raw.attacker.example.",
+		type  = .A,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_Raw{data = []u8{192, 168, 1, 1, 0}},
+	}
+	wire := rebind_reply_of("raw.attacker.example.", .A, bad_a)
+	decoded, derr := dns.decode_message(wire, context.temp_allocator)
+	if !testing.expectf(t, derr == .None, "the premise is gone: the message does not decode: %v", derr) {
+		return
+	}
+	if _, raw := decoded.answer[0].data.(dns.Rdata_Raw); !raw {
+		testing.fail_now(t, "the premise is gone: the decoder parsed the malformed A record")
+	}
+
+	msg, ok := ask_with_reply(t, &cfg, "raw.attacker.example.", .A, wire)
+	if ok {
+		testing.expectf(t, len(msg.answer) == 0, "an unparsable A record was forwarded unexamined")
+	}
+
+	// The same for HTTPS, where the hints the guard exists to read sit inside
+	// the RDATA it could not parse.
+	bad_svcb := make([]dns.Record, 1, context.temp_allocator)
+	bad_svcb[0] = dns.Record {
+		name  = "raw.svc.example.",
+		type  = .HTTPS,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_Raw{data = []u8{0x00}},
+	}
+	svc, svc_ok := ask_with_reply(t, &cfg, "raw.svc.example.", .HTTPS, rebind_reply_of("raw.svc.example.", .HTTPS, bad_svcb))
+	if svc_ok {
+		testing.expectf(t, len(svc.answer) == 0, "an unparsable HTTPS record was forwarded unexamined")
+	}
+
+	/*
+	And not a rule about every malformed record. A TXT the decoder kept raw,
+	beside a public address, is forwarded: nothing in a TXT is an address a
+	browser connects to, so it is not this guard's business.
+	*/
+	mixed := make([]dns.Record, 2, context.temp_allocator)
+	mixed[0] = a_record("raw-txt.example.", {93, 184, 216, 34})
+	mixed[1] = dns.Record {
+		name  = "raw-txt.example.",
+		type  = .TXT,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_Raw{data = []u8{5, 'a'}},
+	}
+	out, out_ok := ask_with_reply(t, &cfg, "raw-txt.example.", .A, rebind_reply_of("raw-txt.example.", .A, mixed))
+	if out_ok {
+		got := addresses_in(out)
+		if testing.expectf(t, len(got) == 1, "a public answer was refused over a malformed TXT record beside it") {
+			testing.expect_value(t, got[0], v4_bytes({93, 184, 216, 34}))
+		}
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+The IPv6 forms that carry an IPv4 address inside them.
+
+`::ffff:a.b.c.d` is undone by `address_in` and has its own case above. Two more
+reach a private IPv4 host and were not being undone: RFC 6052's well-known NAT64
+prefix, which on a NAT64 network is how a client is given an IPv4 destination at
+all, and the deprecated IPv4-compatible form. Both are one AAAA record, which is
+the record a client on such a network asks for first.
+
+The fourth case is the one that keeps the unwrap honest in the other direction: a
+NAT64 answer for a public IPv4 host is the ordinary output of every DNS64
+resolver and must go through.
+*/
+@(test)
+test_an_ipv4_embedded_in_ipv6_cannot_hide_a_private_address :: proc(t: ^testing.T) {
+	cfg := rebind_config()
+
+	refused :: proc(t: ^testing.T, cfg: ^config.Config, name: string, addr: [16]u8, what: string) {
+		records := make([]dns.Record, 1, context.temp_allocator)
+		records[0] = aaaa_record(name, addr)
+		msg, ok := ask_with_reply(t, cfg, name, .AAAA, rebind_reply_of(name, .AAAA, records))
+		if ok {
+			testing.expectf(t, len(msg.answer) == 0, "%s was forwarded", what)
+		}
+	}
+
+	// 64:ff9b::192.168.1.1
+	refused(
+		t,
+		&cfg,
+		"nat64.attacker.example.",
+		{1 = 0x64, 2 = 0xff, 3 = 0x9b, 12 = 192, 13 = 168, 14 = 1, 15 = 1},
+		"a private address behind the well-known NAT64 prefix",
+	)
+	// ::192.168.1.1
+	refused(
+		t,
+		&cfg,
+		"compat.attacker.example.",
+		{12 = 192, 13 = 168, 14 = 1, 15 = 1},
+		"a private address in the IPv4-compatible form",
+	)
+	// 64:ff9b::169.254.169.254, the metadata endpoint by the same door.
+	refused(
+		t,
+		&cfg,
+		"nat64-meta.attacker.example.",
+		{1 = 0x64, 2 = 0xff, 3 = 0x9b, 12 = 169, 13 = 254, 14 = 169, 15 = 254},
+		"the metadata address behind the well-known NAT64 prefix",
+	)
+
+	/*
+	`64:ff9b::` itself, which is RFC 6052's encoding of 0.0.0.0 rather than a
+	prefix with nothing behind it. A stack on a NAT64 network connects to
+	0.0.0.0, and that is the entry the table calls a working bypass rather than
+	an odd answer - the "0.0.0.0 Day" reach into a service bound to 127.0.0.1.
+	It is also the one address in the set whose first embedded octet is zero, so
+	the rule that keeps `::` and `::1` intact has to not reach it.
+	*/
+	refused(
+		t,
+		&cfg,
+		"nat64-zero.attacker.example.",
+		{1 = 0x64, 2 = 0xff, 3 = 0x9b},
+		"the NAT64 encoding of 0.0.0.0",
+	)
+
+	// 64:ff9b::198.51.100.1, which is what a DNS64 resolver answers all day.
+	public := make([]dns.Record, 1, context.temp_allocator)
+	public[0] = aaaa_record(
+		"nat64.example.",
+		{1 = 0x64, 2 = 0xff, 3 = 0x9b, 12 = 198, 13 = 51, 14 = 100, 15 = 1},
+	)
+	msg, ok := ask_with_reply(t, &cfg, "nat64.example.", .AAAA, rebind_reply_of("nat64.example.", .AAAA, public))
+	if ok {
+		testing.expectf(t, len(msg.answer) == 1, "a NAT64 answer for a public host was refused")
+	}
+
+	/*
+	And `::1` is still `::1`. Unwrapping it would read it as 0.0.0.1, which is
+	inside `0.0.0.0/8` and outside `LOOPBACK_NETWORKS` - so the address would
+	still be refused, but `allow_loopback` would no longer reach it, which is
+	taking the switch away from the one address it was written for.
+	*/
+	cfg.rebind.allow_loopback = true
+	loop := make([]dns.Record, 1, context.temp_allocator)
+	loop[0] = aaaa_record("loop.example.", {15 = 1})
+	lmsg, lok := ask_with_reply(t, &cfg, "loop.example.", .AAAA, rebind_reply_of("loop.example.", .AAAA, loop))
+	if lok {
+		testing.expectf(t, len(lmsg.answer) == 1, "allow_loopback no longer reaches ::1")
+	}
+	free_all(context.temp_allocator)
+}

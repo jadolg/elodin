@@ -421,6 +421,70 @@ Rate_Limit_Config :: struct {
 }
 
 /*
+Refusing an upstream answer that points a public name into private address space.
+
+The reasoning for the whole feature is in `src/server/rebind.odin`; what is
+decided here is the default, and it is the part of this that can go wrong for
+somebody who never read either file.
+
+Off, which is where dnsmasq (`--stop-dns-rebind`), AdGuard Home and Unbound
+(`private-address`) all put their version of it too. The reason to follow them
+is not deference - it is that the deployment this program is written for is the
+one most likely to do the exact thing the guard refuses, and to do it on
+purpose. A box on a LAN that every device points at is commonly the same box
+running split horizon: a public zone whose names answer with a LAN address, an
+upstream that is the operator's own internal server, a homelab whose
+`nas.example.com` is `192.168.1.50` by design. On by default, every one of those
+names becomes NODATA the moment the operator upgrades - not degraded, gone, and
+looking exactly like a name that does not exist - for a configuration that was
+never wrong. A security default that breaks working resolution for a large share
+of the people it ships to is one they will turn off in a hurry and with a bad
+taste, rather than one they will leave on.
+
+So the guard ships off and is turned on by the operator who wants it, which is
+the same shape dnsmasq and the others chose. `dnssec.enabled` defaults the other
+way in this tree, and the difference is real: an upstream that cannot return
+DNSSEC records is a misconfiguration to fix, whereas a public name answering with
+a private address is, for this program's audience, a supported and ordinary
+thing to be doing. The two are not the same trade.
+
+None of that lowers what the guard is worth to the operator who is not running
+split horizon: it is one line to enable, the failure it prevents is silent and
+the refusal it produces is loud - a `warn` naming the address and both settings
+that would allow it, a `rebind=` counter, a query-log line - and `allow_domains`
+exists so that even an operator who does run split horizon can turn it on and
+name the zones that are allowed to answer privately. The README recommends
+enabling it, in exactly those terms.
+*/
+Rebind_Config :: struct {
+	enabled:        bool,
+	/*
+	Names whose answers may carry private addresses, each covering itself and
+	everything below it - dnsmasq's `--rebind-domain-ok`.
+
+	Matched against the question, not against the owner name of the offending
+	record. A CNAME into an exempt zone therefore exempts nothing: the browser's
+	origin is the name it asked for, and that is the name whose answer is being
+	trusted. The other way round is what an operator means - `home.example`
+	listed here covers `nas.home.example` however many CNAMEs the answer takes
+	to reach an address.
+	*/
+	allow_domains:  []string,
+	/*
+	Whether 127.0.0.0/8 and ::1 are allowed through - dnsmasq's
+	`--rebind-localhost-ok`.
+
+	Off, because loopback is the address a rebinding attack most wants: a
+	service bound to 127.0.0.1 is one its author believed only local processes
+	could reach, and is therefore the one least likely to authenticate. The
+	names that legitimately resolve there are few and usually the operator's
+	own, which `allow_domains` covers by name rather than by opening the range
+	for everything.
+	*/
+	allow_loopback: bool,
+}
+
+/*
 The Prometheus endpoint.
 
 Off, because a resolver that opens a second port nobody asked for is a resolver
@@ -455,6 +519,7 @@ Config :: struct {
 	blocking:  Blocking_Config,
 	dnssec:    Dnssec_Config,
 	cookies:   Cookie_Config,
+	rebind:    Rebind_Config,
 	metrics:   Metrics_Config,
 	rewrites:  []Rewrite,
 }
@@ -551,6 +616,15 @@ default_config :: proc() -> Config {
 		enabled  = true,
 		require  = false,
 		upstream = true,
+	}
+	c.rebind = Rebind_Config {
+		// Off, and with nothing exempt. See the type: the deployment this is
+		// written for routinely and legitimately points a public name at a
+		// private address - split horizon, a homelab whose public zone answers
+		// with a LAN address - so on by default would break resolution for a
+		// large share of its own operators on upgrade. It is one line to turn on.
+		enabled        = false,
+		allow_loopback = false,
 	}
 	c.metrics = Metrics_Config {
 		enabled = false,

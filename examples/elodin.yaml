@@ -329,6 +329,47 @@ cookies:
   # cookies.
   # secret: e5e973e5a6b2a43f48e7dc849e37bfcf
 
+rebind:
+  # Refuse an upstream answer that points a public name into private address
+  # space — loopback, RFC 1918, link-local (169.254.169.254 is the cloud
+  # metadata endpoint), IPv6 unique-local, 0.0.0.0 and ::. That is the DNS half
+  # of a rebinding attack: a page served from a name the attacker owns is
+  # same-origin with whatever that name resolves to, so re-answering it with
+  # 192.168.1.1 lets the page read the router's admin interface using the
+  # browser as the proxy. The whole answer becomes NODATA rather than having the
+  # record filtered out of it. dnsmasq calls this --stop-dns-rebind.
+  #
+  # Off by default, as in dnsmasq, AdGuard Home and Unbound, because the
+  # deployment this ships to commonly points a public name at a private address
+  # on purpose — split horizon, a homelab whose public zone answers with a LAN
+  # address — and on by default would break those names on upgrade. Turning it
+  # on is recommended if you do not do that. If you do, set enabled: true and
+  # name the zones that may answer privately in allow_domains below rather than
+  # leaving it off; names you answer with `rewrites` need nothing — they are
+  # answered here and never reach an upstream.
+  enabled: false
+
+  # Zones whose answers may carry private addresses, each covering itself and
+  # everything under it — dnsmasq's --rebind-domain-ok. Matched against the name
+  # that was asked for, so a CNAME into one of these exempts nothing. Write the
+  # zone, not a wildcard: `*.corp.example` is what `rewrites` below takes and is
+  # refused here, since the plain name already covers everything under it.
+  #
+  # If your upstream is your own internal DNS server and it resolves internal
+  # names to RFC 1918 addresses, those names stop resolving until they are named
+  # here. That is the one upgrade break this feature has.
+  # allow_domains:
+  #   - corp.example
+  #   - home.arpa
+
+  # Let 127.0.0.0/8 and ::1 through — dnsmasq's --rebind-localhost-ok. Off,
+  # because a service bound to loopback is the one its author most believed only
+  # local processes could reach, and so the one least likely to authenticate.
+  # `localhost.` and anything under it are already allowed their own loopback
+  # address without this: RFC 6761 section 6.3 makes that the only answer the
+  # name can have.
+  allow_loopback: false
+
 # Local answers. Wildcards match subdomains only, so "*.home" covers host.home
 # but not home itself. `ttl` is what the answer carries, 300 seconds by default.
 # rewrites:

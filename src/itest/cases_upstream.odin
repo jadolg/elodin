@@ -75,10 +75,18 @@ first_address :: proc(wire: []u8) -> string {
 }
 
 run_strategy_cases :: proc(r: ^Runner) {
-	// Three upstreams, each answering with a distinguishable address.
+	/*
+	Three upstreams, each answering with a distinguishable address.
+
+	TEST-NET-2 rather than 10.0.0.0/8, which is what these were: the rebinding
+	guard refuses an answer that points a public name into private space, and
+	though it is off by default now, keeping these on a documentation range means
+	the case does not quietly depend on that default. Any documentation range
+	does; the addresses only have to differ from each other.
+	*/
 	ports := [3]int{next_port(r), next_port(r), next_port(r)}
 	mocks: [3]^Mock
-	addrs := [3][4]u8{{10, 0, 0, 1}, {10, 0, 0, 2}, {10, 0, 0, 3}}
+	addrs := [3][4]u8{{198, 51, 100, 1}, {198, 51, 100, 2}, {198, 51, 100, 3}}
 
 	for i in 0 ..< 3 {
 		mocks[i] = mock_make(fmt.tprintf("up%d", i + 1), ports[i])
@@ -138,7 +146,7 @@ blocking: {{ enabled: false }}
 				for i in 0 ..< 4 {
 					res := query_udp(udp_port, build_query(QNAME, u16(dns.Type.A), id = u16(i)))
 					if check(r, res.ok, "no response on attempt %d", i) {
-						check_eq_str(r, first_address(res.wire), "10.0.0.1", "answering upstream")
+						check_eq_str(r, first_address(res.wire), "198.51.100.1", "answering upstream")
 					}
 				}
 			}
@@ -168,7 +176,7 @@ blocking: {{ enabled: false }}
 					}
 				}
 				check_eq_int(r, len(seen), 3, "distinct upstreams used over six queries")
-				for addr in ([]string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}) {
+				for addr in ([]string{"198.51.100.1", "198.51.100.2", "198.51.100.3"}) {
 					check(r, seen[addr] == 2, "upstream %s answered %d times, want 2", addr, seen[addr])
 				}
 			}
@@ -186,9 +194,9 @@ blocking: {{ enabled: false }}
 		slow_port := next_port(r)
 		fast_port := next_port(r)
 		slow := mock_make("slow", slow_port)
-		mock_delay_all(slow, 700 * time.Millisecond, make_a_response(QNAME, {10, 9, 9, 9}, 60))
+		mock_delay_all(slow, 700 * time.Millisecond, make_a_response(QNAME, {198, 51, 100, 9}, 60))
 		fast := mock_make("fast", fast_port)
-		mock_reply_all(fast, make_a_response(QNAME, {10, 8, 8, 8}, 60))
+		mock_reply_all(fast, make_a_response(QNAME, {198, 51, 100, 8}, 60))
 
 		if !mock_start(slow) || !mock_start(fast) {
 			skip_case(r, "strategy: race", "cannot start the racing mocks")
@@ -211,7 +219,7 @@ blocking: {{ enabled: false }}
 					res := query_udp(udp_port, build_query(QNAME, u16(dns.Type.A)))
 					elapsed := time.diff(started, time.now())
 					if check(r, res.ok, "no response") {
-						check_eq_str(r, first_address(res.wire), "10.8.8.8", "winning upstream")
+						check_eq_str(r, first_address(res.wire), "198.51.100.8", "winning upstream")
 						check(
 							r,
 							elapsed < 500 * time.Millisecond,
@@ -247,7 +255,7 @@ blocking: {{ enabled: false }}
 		dead := mock_make("dead", dead_port)
 		mock_silent(dead)
 		live := mock_make("live", live_port)
-		mock_reply_all(live, make_a_response(QNAME, {10, 7, 7, 7}, 60))
+		mock_reply_all(live, make_a_response(QNAME, {198, 51, 100, 7}, 60))
 
 		if !mock_start(dead) || !mock_start(live) {
 			skip_case(r, "strategy: failover past a dead upstream", "cannot start the mocks")
@@ -268,7 +276,7 @@ blocking: {{ enabled: false }}
 				{
 					res := query_udp(udp_port, build_query(QNAME, u16(dns.Type.A)))
 					if check(r, res.ok, "no response") {
-						check_eq_str(r, first_address(res.wire), "10.7.7.7", "answering upstream")
+						check_eq_str(r, first_address(res.wire), "198.51.100.7", "answering upstream")
 					}
 				}
 				end_case(r)
@@ -285,7 +293,7 @@ blocking: {{ enabled: false }}
 					elapsed := time.diff(started, time.now())
 
 					if check(r, res.ok, "no response after the cooldown started") {
-						check_eq_str(r, first_address(res.wire), "10.7.7.7", "answering upstream")
+						check_eq_str(r, first_address(res.wire), "198.51.100.7", "answering upstream")
 						check(
 							r,
 							elapsed < 500 * time.Millisecond,

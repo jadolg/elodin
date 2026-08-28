@@ -125,6 +125,9 @@ main :: proc() {
 	section(&r, "rewrites")
 	run_rewrite_cases(&r)
 
+	section(&r, "dns rebinding protection")
+	run_rebind_cases(&r)
+
 	section(&r, "rate limiting")
 	run_rate_limit_cases(&r)
 

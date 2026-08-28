@@ -187,7 +187,10 @@ run_reload_cases :: proc(r: ^Runner) {
 				!dot_handshake_verifies(dot_port, cert_a, "reload-a.test"),
 				"the old certificate is still being served after reload",
 			)
-			check(r, log_contains(&srv, "reloaded the certificate"), "no reload was logged")
+			// Polled, not read once: the handshake above goes through the moment
+			// the context is swapped, and the log line the reload writes can reach
+			// the file a beat later, so a single read races it on a loaded runner.
+			check(r, wait_listening(&srv, "reloaded the certificate", 2 * time.Second), "no reload was logged")
 		}
 	}
 	end_case(r)
@@ -198,16 +201,22 @@ run_reload_cases :: proc(r: ^Runner) {
 		// caught mid-write or a bad file permission would also look like.
 		corrupted := os.write_entire_file(active_key, transmute([]u8)string("not a key")) == nil
 		if check(r, corrupted, "cannot corrupt the key file") && check(r, signal_reload(&srv), "could not deliver SIGHUP") {
-			// Nothing here is expected to change, so there is nothing to poll
-			// for - just enough of a pause for the maintenance loop to have
-			// noticed the signal and tried the bad certificate.
-			time.sleep(500 * time.Millisecond)
-			check(
+			// The maintenance loop notices the signal on its 200ms poll, tries
+			// the bad certificate and refuses to load it. That refusal is the log
+			// line, so poll for it rather than sleeping a fixed amount and reading
+			// once; its appearance is also what says the reload attempt is over,
+			// so the handshake check below is not racing an in-flight swap.
+			if check(
 				r,
-				dot_handshake_verifies(dot_port, cert_b, "reload-b.test"),
-				"a certificate that failed to load knocked out the one already serving",
-			)
-			check(r, log_contains(&srv, "keeping the certificate already in use"), "the bad reload was not logged")
+				wait_listening(&srv, "keeping the certificate already in use", 2 * time.Second),
+				"the bad reload was not logged",
+			) {
+				check(
+					r,
+					dot_handshake_verifies(dot_port, cert_b, "reload-b.test"),
+					"a certificate that failed to load knocked out the one already serving",
+				)
+			}
 		}
 	}
 	end_case(r)
