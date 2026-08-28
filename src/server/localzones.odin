@@ -280,13 +280,16 @@ and at the same price: the answer is served as insecure. Neither key is ever set
 by default, so nothing reaches this without an operator having written something
 down, and writing it down is the claim that makes it right.
 
-Which is also why there is no `covered_by_local_anchor` beside it. That test
-exists because the reverse-side bypass applies to every installation whether or
-not anybody asked for it, so a site that anchored its own reverse space needs a
-way to say it meant the opposite. This bypass is already the thing an operator
-asked for, and no anchor can be more deliberate than the key that turned it on -
-nor is there a plausible anchor to have configured, the root delegating no
-`onion.` for a DS to hang under.
+`covered_by_local_anchor` stands it down in turn, the same way it does the
+reverse-side bypass. The argument for leaving it out was that this bypass is
+already what an operator asked for, so no anchor could be more deliberate than
+the key that turned it on - but that is only true while the two cannot be written
+together, and they can. An operator who runs a privately signed tree under
+`onion.` behind their own resolver and configures a trust anchor over it has said
+something more specific than either key, and the reverse side already settles
+which of those wins: the anchor. Having the forward side answer the same question
+the other way would mean the narrower instruction losing to the broader one, in
+one of two places that read as a pair.
 
 `local.` and `test.` get no such treatment, deliberately, and the line between
 them and `onion.` is what an operator had to do to get here. Those two are
@@ -311,7 +314,12 @@ special_use_deferred :: proc(s: ^Server, name: string) -> bool {
 	if s.cfg.special_use.enabled && s.cfg.special_use.onion {
 		return false
 	}
-	return name_at_or_below(name, "onion.")
+	if !name_at_or_below(name, "onion.") {
+		return false
+	}
+	// An anchor over the zone is the operator asking for the opposite, and it is
+	// the more specific of the two things they have written down.
+	return !covered_by_local_anchor(s, name)
 }
 
 /*

@@ -682,3 +682,78 @@ test_a_blocklist_entry_for_a_reserved_name_wins :: proc(t: ^testing.T) {
 
 	free_all(context.temp_allocator)
 }
+
+/*
+An anchor over `onion.` wins against the key that forwards it.
+
+The forward-side bypass stands down for the same reason the reverse-side one
+does, and this is the case that separates the two policies: `onion: false` says
+the upstream can answer these names, an anchor over `onion.` says the operator
+wants what comes back checked, and the anchor is the more specific of the two.
+Without this, the narrower instruction would lose to the broader one - and it
+would lose silently, since an unvalidated answer looks like a working one.
+
+SERVFAIL is the pass condition, which reads oddly until you consider what the
+alternative means. The mock is a tor-like upstream with no chain at all, so a
+validator that is *consulted* can only fail; that it failed is the evidence it
+was asked. The test above is the same arrangement without the anchor, where
+NOERROR is the evidence it was not.
+*/
+@(test)
+test_an_anchor_over_onion_beats_the_key_that_forwards_it :: proc(t: ^testing.T) {
+	name := "duskgytldkxiuqc6otgh4.onion."
+	cfg := config.default_config()
+	cfg.special_use.onion = false
+
+	s, x, built := leak_server(t, &cfg, name)
+	if !built {
+		return
+	}
+	defer net.close(x.socket)
+	defer upstream.destroy_group(s.group)
+
+	s.validator = dnssec.make_validator(tor_has_no_chain, nil, dnssec.Options{})
+	defer dnssec.destroy_validator(s.validator)
+
+	anchors := make([]string, 1, context.temp_allocator)
+	anchors[0] = "onion."
+	s.anchor_zones = anchors
+
+	mock := thread.create_and_start_with_poly_data(x, serve_leak)
+	out, _, ok := handle_query(&s, leak_query(name), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	thread.join(mock)
+	thread.destroy(mock)
+
+	if !testing.expect(t, ok, "the anchored .onion query went unanswered") {
+		return
+	}
+	resp, derr := dns.decode_message(out, context.temp_allocator)
+	if !testing.expectf(t, derr == .None, "the response will not decode: %v", derr) {
+		return
+	}
+	testing.expectf(
+		t,
+		dns.rcode_of(resp) == .Serv_Fail,
+		"came back as %v: the anchor was ignored and the bypass stood",
+		dns.rcode_of(resp),
+	)
+
+	// And the label boundary holds here too: an anchor over `onion.` is not an
+	// anchor over somebody else's `notonion.`, so that name keeps the bypass.
+	other := "x.notonion."
+	ocfg := config.default_config()
+	ocfg.special_use.onion = false
+	os_, ox, obuilt := leak_server(t, &ocfg, other)
+	if !obuilt {
+		return
+	}
+	defer net.close(ox.socket)
+	defer upstream.destroy_group(os_.group)
+	testing.expect(
+		t,
+		!special_use_deferred(&os_, other),
+		"notonion. was treated as being inside onion.",
+	)
+
+	free_all(context.temp_allocator)
+}

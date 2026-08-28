@@ -635,17 +635,20 @@ names](#names-that-are-never-forwarded) alike. Reaching `resolver.arpa` from a
 list means a rule over `arpa` itself, which is already breaking every reverse
 lookup you have, so this is not a case worth a second ordering to protect.
 
-`special_use.onion: false` stands validation down the same way, on the forward
-side. That key says the upstream is a Tor-aware resolver, and what such an
-upstream answers for a `.onion` name cannot be signed — the root publishes a
-signed proof that there is no `onion.` to delegate — so validating it would
-turn every `.onion` lookup into SERVFAIL. Those names are served insecure,
-without the AD bit, exactly as the reverse zones above are. It is the only other
-place validation is skipped, it applies to nothing but `onion.`, and it is off
-until an operator writes the key down; see [Names that are never
-forwarded](#names-that-are-never-forwarded).
+Forwarding `.onion` stands validation down the same way, on the forward side.
+What a Tor-aware upstream answers for such a name cannot be signed — the root
+publishes a signed proof that there is no `onion.` to delegate — so validating it
+would turn every `.onion` lookup into SERVFAIL. Those names are served insecure,
+without the AD bit, exactly as the reverse zones above are.
 
-Two things worth knowing about running with it on:
+Either key that forwards them does this: `special_use.onion: false`, which says
+the upstream is Tor-aware, and `special_use.enabled: false`, which turns the
+whole table off. It is the only other place validation is skipped, it applies to
+nothing but `onion.`, and both keys are off until an operator writes one down;
+see [Names that are never forwarded](#names-that-are-never-forwarded), which has
+what that costs an operator who set `enabled: false` for some other reason.
+
+Two things worth knowing about running `dnssec.enabled` on:
 
 - **Distribution crypto policy can take algorithms away.** Fedora and RHEL ship
   an OpenSSL that refuses SHA-1 signatures outright (`rh-allow-sha1-signatures =

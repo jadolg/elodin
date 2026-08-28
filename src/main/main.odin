@@ -326,6 +326,16 @@ main :: proc() {
 	switch {
 	case !cfg.special_use.enabled:
 		logx.warnf("special_use.enabled is off: localhost., onion. and invalid. are forwarded to the upstream")
+		// The second half of what this key now does. `special_use_deferred` fires
+		// on this key as well as on `onion`, so an operator who set it for a
+		// reason having nothing to do with tor - wanting their own hosts file to
+		// own `localhost.`, say - is also giving up the root's signed
+		// nonexistence proof for `.onion`, and this line is the only place they
+		// will see that. The warning it replaced said the opposite, that they
+		// had to write `onion: false` to get here.
+		if cfg.dnssec.enabled {
+			logx.warnf("special_use.enabled is off: .onion answers are served insecure, as nothing under a zone the root proves is not delegated can be signed")
+		}
 	case !cfg.special_use.onion:
 		logx.warnf("special_use.onion is off: .onion queries are forwarded, which is only safe to a Tor-aware upstream")
 	}

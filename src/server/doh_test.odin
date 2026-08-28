@@ -1197,6 +1197,11 @@ test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
 	}
 	defer net.close(client)
 	_ = net.set_option(client, .Receive_Timeout, 3 * time.Second)
+	// So that the body's blocking write cannot outlive the test. `thread.join`
+	// below waits for that write, and without this a peer window that never opens
+	// - a drain that stopped reading on a host with small socket buffers - would
+	// hang the join rather than fail an assertion. See the note on the join.
+	_ = net.set_option(client, .Send_Timeout, 3 * time.Second)
 
 	// The head alone. A `JUNK` version is refused on the request line, which is
 	// before `read_http_request` has looked at the Content-Length that says the
@@ -1290,11 +1295,41 @@ test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
 	shape the old failure took: bytes arriving after both the drain and the check
 	had finished, and the close sending an RST over them.
 
-	It cannot block for want of a reader. 16 KiB against a loopback receive buffer
-	two orders of magnitude larger arrives whether or not anything is draining, and
-	a drain that gave up early leaves it all sitting there for the check to find.
+	A join can block, which is why the sender's socket carries a send timeout. In
+	the ordinary case it cannot: 16 KiB goes into a loopback receive buffer two
+	orders of magnitude larger whether or not anything is draining, and a drain
+	that gave up early leaves it all sitting there for the check to find. But that
+	is a fact about this machine's `net.core.rmem_default`, not about the test, and
+	on a host that sized its buffers smaller a half-written body with no reader
+	would hang here rather than fail - a suite that stops saying anything instead
+	of one that says what went wrong. The timeout keeps the bad case loud.
 	*/
 	thread.join(sender)
+
+	/*
+	And then the sending half goes down, which is what makes the check below an
+	answer rather than a guess.
+
+	`send_tcp` returning means the bytes reached the kernel's send buffer, not that
+	they reached the server - so a joined sender can still have a body in flight,
+	and the check reading nothing could mean either that the drain took it all or
+	that it has yet to land. That ambiguity is the last of this test's flakiness:
+	when the body landed after the check, the close met unread bytes and sent an
+	RST, the client lost its 400, and the failure named the close while saying
+	nothing about the body being late.
+
+	A FIN is queued behind everything already written, so once this is sent the
+	read below can only return the leftover the drain failed to take, or the clean
+	EOF that says there was none - `conn_read` reports both as `ok = false` only in
+	the second case, since it requires `got > 0`. Nothing can arrive afterwards
+	either, which is what leaves the close with one possible outcome.
+
+	It does not weaken what the drain was measured against. `http_linger` had
+	already returned before this line, ended by its own idle timeout with the
+	sending half still open, which is what the docstring above means by nothing
+	but that wait ending the drain.
+	*/
+	_ = net.shutdown(client, .Send)
 
 	/*
 	The assertion, taken before the close it is about: one more read, and nothing
@@ -1307,6 +1342,11 @@ test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
 	longer than the delay above by a margin: read for as long as the drain waits and
 	a shortened drain would be measured with the same short ruler that shortened it,
 	which is a check that agrees with whatever the constant says.
+
+	With the client's sending half down this no longer waits on a race - a read
+	here returns the leftover or the EOF, and cannot return nothing because the
+	body has yet to arrive. The generous timeout stays as a guard rather than as
+	the mechanism.
 	*/
 	_ = net.set_option(accepted, .Receive_Timeout, 500 * time.Millisecond)
 	leftover: [4096]u8

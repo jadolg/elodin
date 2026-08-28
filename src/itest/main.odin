@@ -177,6 +177,7 @@ main :: proc() {
 	section(&r, "metrics")
 	run_metrics_cases(&r)
 
+	section(&r, "special-use names")
 	run_special_use_cases(&r)
 
 	elapsed := time.diff(started, time.now())
