@@ -407,9 +407,10 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 		cfg.cache.enabled,
 		cfg.blocking.enabled,
 		cfg.dnssec.enabled,
-		// Named here because it is on by default and can make a name stop
-		// resolving. An operator working out why an internal host went missing
-		// should find the feature in the first line the server wrote.
+		// Named here because it is off by default and can make a name stop
+		// resolving once it is not. An operator working out why an internal host
+		// went missing should be able to see, in the first line the server
+		// wrote, whether the thing that refuses such answers is running.
 		cfg.rebind.enabled,
 	)
 
