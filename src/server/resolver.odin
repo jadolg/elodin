@@ -95,6 +95,24 @@ Stats :: struct {
 	inside a number that is meant to be large.
 	*/
 	rebind:       u64,
+	/*
+	Queries answered out of the RFC 6761/6762/7686 table rather than forwarded -
+	see `localzones.odin`.
+
+	Counted, where the other things this server answers from itself are not,
+	because this one is a privacy control and the count is the only aggregate
+	evidence it worked. `answer_chaos` serves a version string and DDR serves a
+	discovery probe, and nobody needs to know how many of either went by; a
+	rising `special_use` says something specific and worth seeing, that clients
+	on this network are asking for `.onion` or `localhost.` names and that those
+	questions stopped here. Without it an operator has to turn query logging on
+	to learn whether the table has ever done anything.
+
+	Apart from `blocked` for the reason `rebind` is: the lists are meant to
+	produce a large number, and a handful of stopped leaks folded into it would
+	be invisible in both directions.
+	*/
+	special_use:  u64,
 }
 
 Server :: struct {
@@ -369,6 +387,17 @@ resolve_query :: proc(
 	Below the rewrites, so an operator who wants to designate this server's own
 	DoT or DoH endpoints can say so and be obeyed; above the block lists and the
 	cache, which have nothing to add to a name this server answers for itself.
+
+	Note that the reserved-name table below sits on the *other* side of the block
+	lists, and the difference is deliberate rather than an accident of which
+	landed first. The two agree on what matters - both below the rewrites, both
+	above the cache - and differ only on blocking, because a blocklist can
+	plausibly name something under `onion.` or `test.` and cannot plausibly name
+	`resolver.arpa`. Where a hit is possible the operator's list should win and
+	the query should count as blocked; here a hit could only be a wildcard
+	misfiring, and honouring it would hand a client a block response where RFC
+	9462 wants NODATA, breaking discovery to enforce a rule nobody wrote. See the
+	ordering note on the table below.
 	*/
 	if is_resolver_arpa(q.name) {
 		out := build_resolver_arpa_response(msg, q, allocator, limit)
@@ -396,6 +425,16 @@ resolve_query :: proc(
 	operator who put a name on a blocklist still seeing it counted as blocked.
 	This table is the default for the names nobody configured.
 
+	The DDR zone above is answered before the block lists rather than after, and
+	the two are consistent despite that. What separates them is whether a
+	blocklist could ever name what they answer for: a list can plausibly carry a
+	specific `.onion` or a host under an internal `.test`, and where the operator
+	has said something the operator wins and the query is counted as blocked;
+	nothing legitimately lists `resolver.arpa`, and treating a wildcard that
+	happened to match it as a block would break the discovery RFC 9462 asks for.
+	Both sit below the rewrites and above the cache, which is the part that would
+	be a real inconsistency.
+
 	Ahead of the cache, and of the RD gate below. Ahead of the cache because
 	there is nothing there to find: these answers are never stored, and one a
 	previous configuration forwarded and stored cannot outlive the restart it
@@ -405,12 +444,16 @@ resolve_query :: proc(
 	recursion, and this is precisely that: an answer from a table, with nowhere
 	to forward to even if the client had asked for it.
 
-	No counter of its own, matching `answer_chaos` - the other thing this server
-	answers out of itself. It shows in the query log as `outcome=local
-	detail="special-use"`.
+	Counted in `stats.special_use`, and shown in the query log as `outcome=local
+	detail=special-use`. That is a departure from `answer_chaos` and the DDR
+	probe, which are answered from here too and counted nowhere: those two are a
+	version string and a discovery probe, while a stopped `.onion` query is the
+	one thing here an operator has a reason to watch, and the counter is the only
+	way to see it without running the query log.
 	*/
 	if zone, kind := special_use_zone(s, q.name); kind != .None {
 		out := answer_special_use(msg, q, zone, kind, allocator, limit)
+		sync.atomic_add(&s.stats.special_use, 1)
 		log_query(s, client, proto, q, .Local, "special-use", started)
 		return out, .Local, true
 	}
@@ -1554,5 +1597,6 @@ stats_of :: proc(s: ^Server) -> Stats {
 		secure = sync.atomic_load(&s.stats.secure),
 		bogus = sync.atomic_load(&s.stats.bogus),
 		rebind = sync.atomic_load(&s.stats.rebind),
+		special_use = sync.atomic_load(&s.stats.special_use),
 	}
 }

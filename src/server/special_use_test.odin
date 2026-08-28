@@ -9,6 +9,7 @@ import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:dnssec"
+import "elodin:filter"
 import "elodin:upstream"
 
 /*
@@ -547,6 +548,137 @@ test_special_use_answers_do_not_enter_the_cache :: proc(t: ^testing.T) {
 	}
 
 	testing.expect(t, cache.len_entries(answers) == 0, "a synthesised special-use answer was stored in the cache")
+
+	free_all(context.temp_allocator)
+}
+
+/*
+The counter, and what it does not count.
+
+`stats.special_use` is the only aggregate evidence the table ever did anything -
+an operator who has not turned the query log on has nothing else to look at - so
+it is worth a test that it moves, and worth one that it does not move for a name
+that was forwarded. The second half is the one that would catch a counter
+incremented on the way into `resolve_query` rather than on the branch that
+answers, which would report a leak stopped every time one was not.
+*/
+@(test)
+test_the_special_use_counter_counts_only_what_the_table_answered :: proc(t: ^testing.T) {
+	// Answered from the table: two names, one query each.
+	for name in ([]string{"localhost.", "nothing.invalid."}) {
+		cfg := config.default_config()
+		s, x, built := leak_server(t, &cfg, name)
+		if !built {
+			return
+		}
+		defer net.close(x.socket)
+		defer upstream.destroy_group(s.group)
+
+		_, _, _ = handle_query(&s, leak_query(name), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		testing.expectf(
+			t,
+			s.stats.special_use == 1,
+			"%s left the counter at %d, want 1",
+			name,
+			s.stats.special_use,
+		)
+	}
+
+	/*
+	Forwarded, so not counted. `.local` is outside the table by default, and the
+	mock has to be served for the query to complete - the point being that a
+	query which went to an upstream leaves this counter alone.
+	*/
+	{
+		name := "printer.local."
+		cfg := config.default_config()
+		s, x, built := leak_server(t, &cfg, name)
+		if !built {
+			return
+		}
+		defer net.close(x.socket)
+		defer upstream.destroy_group(s.group)
+
+		mock := thread.create_and_start_with_poly_data(x, serve_leak)
+		_, outcome, _ := handle_query(&s, leak_query(name), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		thread.join(mock)
+		thread.destroy(mock)
+
+		testing.expectf(t, outcome == .Forwarded, "%s came back as %v rather than forwarded", name, outcome)
+		testing.expectf(
+			t,
+			s.stats.special_use == 0,
+			"a forwarded name moved the counter to %d",
+			s.stats.special_use,
+		)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+A blocklist entry for a reserved name beats the table, and is counted as blocked.
+
+This is the ordering the table's docstring in `resolver.odin` argues for and
+which nothing else pins: the block lists run first, so an operator who put a
+specific hidden service on a list gets the block response they configured and
+sees it in `blocked` rather than having the table quietly answer first and leave
+the list looking like it did nothing.
+
+It is also the half of the comparison with the DDR zone that could actually
+regress. DDR is answered *above* the block lists, deliberately, because nothing
+legitimately lists `resolver.arpa`; if that placement were ever copied onto this
+table to make the two look alike, this test is what would fail.
+*/
+@(test)
+test_a_blocklist_entry_for_a_reserved_name_wins :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.cache.enabled = false
+	cfg.blocking.enabled = true
+
+	block, allow := filter.set_make(), filter.set_make()
+	filter.parse_list(block, allow, "0.0.0.0 duskgytldkxiuqc6otgh4.onion\n", .Hosts)
+	engine := filter.engine_make()
+	defer filter.engine_destroy(engine)
+	filter.engine_swap(engine, block, allow)
+
+	s := Server {
+		cfg     = &cfg,
+		filters = engine,
+	}
+
+	_, outcome, ok := handle_query(
+		&s,
+		leak_query("duskgytldkxiuqc6otgh4.onion."),
+		.UDP,
+		"127.0.0.1:5555",
+		context.temp_allocator,
+	)
+	testing.expect(t, ok, "the blocked .onion name went unanswered")
+	testing.expectf(
+		t,
+		outcome == .Blocked,
+		"came back as %v: the table answered a name the operator had blocked",
+		outcome,
+	)
+	testing.expectf(
+		t,
+		s.stats.special_use == 0,
+		"the table counted an answer it did not give (%d)",
+		s.stats.special_use,
+	)
+
+	// The control: an unlisted name in the same zone still reaches the table, so
+	// the above is the list winning rather than blocking swallowing the zone.
+	_, other, other_ok := handle_query(
+		&s,
+		leak_query("unlisted.onion."),
+		.UDP,
+		"127.0.0.1:5555",
+		context.temp_allocator,
+	)
+	testing.expect(t, other_ok, "an unlisted .onion name went unanswered")
+	testing.expectf(t, other == .Local, "unlisted.onion. came back as %v rather than from the table", other)
 
 	free_all(context.temp_allocator)
 }

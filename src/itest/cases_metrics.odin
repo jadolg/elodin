@@ -194,8 +194,10 @@ Wait for the endpoint rather than for the resolver.
 `start_server` establishes readiness by asking a DNS question, and the metrics
 listener binds after the ones that answer those - so a scrape sent the moment
 the probe succeeds can arrive before there is anything to accept it.
+
+Shared with `cases_special_use.odin`, which scrapes the endpoint for a counter of
+its own; the waiting is the same and the reason for it is the same.
 */
-@(private = "file")
 wait_http :: proc(port: int, path: string) -> bool {
 	deadline := time.time_add(time.now(), 5 * time.Second)
 	for time.diff(deadline, time.now()) < 0 {
@@ -214,8 +216,8 @@ check_metric :: proc(r: ^Runner, page: string, name: string, want: int) {
 	check(r, strings.contains(page, wanted), "%s is not %d in the scrape", name, want)
 }
 
-// -1 when the sample is not there, which no counter on the page can be.
-@(private = "file")
+// -1 when the sample is not there, which no counter on the page can be. Shared
+// with `cases_special_use.odin` for the same reason `wait_http` is.
 metric_value :: proc(page: string, name: string) -> int {
 	prefix := fmt.tprintf("\n%s ", name)
 	at := strings.index(page, prefix)

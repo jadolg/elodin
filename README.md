@@ -288,8 +288,8 @@ spaces in it. In Loki that is `| logfmt` and nothing else:
 
 Statistics go to the log every five minutes, as `msg=stats` — `queries`,
 `blocked`, `cached`, `forwarded`, `failed`, `dropped`, `refused`,
-`conn_refused`, `conn_failed`, `limited`, `truncated`, `secure`, `bogus` and
-`rebind`, plus `cache_entries`, `cache_bytes`, `cache_hits`, `cache_withheld`,
+`conn_refused`, `conn_failed`, `limited`, `truncated`, `secure`, `bogus`,
+`rebind` and `special_use`, plus `cache_entries`, `cache_bytes`, `cache_hits`, `cache_withheld`,
 `cache_misses`, `cache_stale`
 and `cache_evictions` — and `log.queries` adds one `msg=query` line per query, at
 the cost noted under [Resource use](#resource-use).
@@ -1257,6 +1257,14 @@ is what Tor was being used not to publish. `localhost.` is a correctness problem
 rather than a privacy one: forwarded, the name resolves to whatever the upstream
 says, which is a rebinding primitive given away for free.
 
+Answers from the table are counted as `special_use=` in the `msg=stats` line and
+as `elodin_special_use_total` on the metrics endpoint, and logged individually as
+`outcome=local detail=special-use` when `log.queries` is on. That counter is
+worth a panel: it is not a number that should climb on a network nobody is
+resolving `.onion` from, so it climbing tells you either that somebody is, or
+that `localhost.` lookups are reaching this resolver rather than being answered
+from a hosts file.
+
 **`local.` and `test.` are off by default**, though RFC 6762 and RFC 6761 ask for
 the same handling. They are the two reserved names that networks really do serve
 — an Active Directory domain under `.local` older than the reservation, an
@@ -1329,7 +1337,7 @@ These answers carry a 10-minute TTL and a synthesised SOA so a resolver
 downstream can cache the negative, and they are not put in elodin's own cache —
 they are built from a table already in memory, and an entry would only outlive
 the reload meant to change it. They show in the query log as `outcome=local
-detail="special-use"`.
+detail=special-use`.
 
 ### Metrics
 
@@ -1376,7 +1384,7 @@ bind beyond loopback is logged as a warning at startup, once.
 | `elodin_build_info{version}` | gauge | a constant 1, carrying the version as a label |
 | `elodin_uptime_seconds` | gauge | seconds since this process finished starting |
 | `elodin_queries_total` | counter | queries accepted, whatever became of them |
-| `elodin_answers_total{outcome}` | counter | `forwarded`, `cached`, `blocked`, `rewritten`, `failed` — the same words the `msg=query` line uses, except that an answer the rebinding guard withheld is logged as `blocked` and counted in `elodin_rebind_refused_total` instead of here |
+| `elodin_answers_total{outcome}` | counter | `forwarded`, `cached`, `blocked`, `rewritten`, `failed` — the same words the `msg=query` line uses, except that an answer the rebinding guard withheld is logged as `blocked` and counted in `elodin_rebind_refused_total` instead of here, and that `outcome=local` is not among them: of those, only the reserved-name table is counted, in `elodin_special_use_total` |
 | `elodin_queries_dropped_total` | counter | turned away before any work: the backlog was full, or the source could not be answered |
 | `elodin_queries_refused_total` | counter | turned away by `server.allow_from` |
 | `elodin_connections_refused_total` | counter | refused because `server.max_connections` was full |
@@ -1386,6 +1394,7 @@ bind beyond loopback is logged as a warning at startup, once.
 | `elodin_rate_limit_slipped_total` | counter | those answered truncated instead, to send a real client to TCP |
 | `elodin_dnssec_answers_total{result}` | counter | `secure` and `bogus` |
 | `elodin_rebind_refused_total` | counter | answers withheld because a public name was pointed into private address space |
+| `elodin_special_use_total` | counter | queries answered from the reserved-name table instead of being forwarded — a rising figure is `.onion` or `localhost.` lookups on your network that stopped here |
 | `elodin_cache_entries` / `_bytes` | gauge | what the cache holds, against `max_entries` and `max_bytes` |
 | `elodin_cache_hits_total` / `_misses_total` / `_evictions_total` | counter | how it is doing |
 | `elodin_cache_stale_total` | counter | expired answers served because no fresh one could be got, with `cache.serve_stale` on |

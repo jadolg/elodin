@@ -561,7 +561,7 @@ report :: proc(s: ^server.Server, answers: ^cache.Cache) {
 	logx.eventf(
 		.Info,
 		"stats",
-		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d refused=%d conn_refused=%d conn_failed=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d",
+		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d refused=%d conn_refused=%d conn_failed=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d special_use=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d",
 		st.queries,
 		st.blocked,
 		st.cached,
@@ -576,6 +576,7 @@ report :: proc(s: ^server.Server, answers: ^cache.Cache) {
 		st.secure,
 		st.bogus,
 		st.rebind,
+		st.special_use,
 		cache.len_entries(answers),
 		cache.bytes_used(answers),
 		cs.hits,
