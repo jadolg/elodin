@@ -160,8 +160,8 @@ test_a_stale_answer_is_bounded_by_max_ttl :: proc(t: ^testing.T) {
 	}
 	expire_entry(c, key)
 
-	got, stale, ok := get(c, key, context.temp_allocator)
-	if !testing.expect(t, ok && stale, "the expired entry was not lent out") {
+	got, hit, ok := get(c, key, context.temp_allocator)
+	if !testing.expect(t, ok && hit.stale, "the expired entry was not lent out") {
 		return
 	}
 	decoded, derr := dns.decode_message(got, context.temp_allocator)
