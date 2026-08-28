@@ -3,6 +3,7 @@ package server
 import "core:testing"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:filter"
 
 /*
 Discovery of Designated Resolvers, from the forwarder's side.
@@ -99,4 +100,66 @@ test_ddr_does_not_swallow_neighbouring_names :: proc(t: ^testing.T) {
 	testing.expect(t, !is_resolver_arpa("notresolver.arpa."), "a string suffix is not a subtree")
 	testing.expect(t, !is_resolver_arpa("resolver.arpa.example.com."), "the zone has to be at the end")
 	testing.expect(t, !is_resolver_arpa("arpa."), "the parent is not the zone")
+}
+
+/*
+A blocklist entry that reaches `resolver.arpa` wins, because the block lists run
+first.
+
+This is the placement, pinned. The DDR answer used to be built ahead of the block
+lists, on the argument that nothing legitimately lists this name; it is now
+behind them, so that everything this server answers for itself goes in one place
+and a reader learns the rule once. See the ordering note in `resolve_query`, and
+`test_a_blocklist_entry_for_a_reserved_name_wins` for the other half of it.
+
+The case given up is written out here rather than left implicit: a list broad
+enough to match `resolver.arpa` - a rule over `arpa` itself, as below - now
+blocks the probe instead of having it answered NODATA. A list like that is
+already breaking every reverse lookup on the machine, which is why this is an
+acceptable trade and not a regression anybody will meet.
+*/
+@(test)
+test_a_blocklist_entry_over_arpa_beats_the_ddr_answer :: proc(t: ^testing.T) {
+	cfg: config.Config
+	s := ddr_server(&cfg)
+	cfg.blocking.enabled = true
+
+	block, allow := filter.set_make(), filter.set_make()
+	// The whole subtree, which is what it takes to reach this name at all.
+	filter.parse_list(block, allow, "||arpa^\n", .Adblock)
+	engine := filter.engine_make()
+	defer filter.engine_destroy(engine)
+	filter.engine_swap(engine, block, allow)
+	s.filters = engine
+
+	_, outcome, ok := handle_query(
+		&s,
+		ddr_query("_dns.resolver.arpa."),
+		.UDP,
+		"127.0.0.1:5555",
+		context.temp_allocator,
+	)
+	testing.expect(t, ok, "the blocked DDR query went unanswered")
+	testing.expectf(
+		t,
+		outcome == .Blocked,
+		"came back as %v: the DDR answer was built ahead of the block lists",
+		outcome,
+	)
+
+	// The control: with nothing listed, the same query is answered from here, so
+	// the above is the list winning rather than DDR having stopped working.
+	clean: config.Config
+	c := ddr_server(&clean)
+	_, plain, plain_ok := handle_query(
+		&c,
+		ddr_query("_dns.resolver.arpa."),
+		.UDP,
+		"127.0.0.1:5555",
+		context.temp_allocator,
+	)
+	testing.expect(t, plain_ok, "an unlisted DDR query went unanswered")
+	testing.expectf(t, plain == .Local, "an unlisted DDR query came back as %v", plain)
+
+	free_all(context.temp_allocator)
 }

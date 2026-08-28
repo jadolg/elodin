@@ -379,32 +379,6 @@ resolve_query :: proc(
 		return out, .Rewritten, true
 	}
 
-	/*
-	A DDR probe is answered from here and never forwarded - the upstream's
-	designated resolvers are not ours to hand a client, and its unsigned answer
-	under the signed `arpa` zone does not validate. See `ddr.odin`.
-
-	Below the rewrites, so an operator who wants to designate this server's own
-	DoT or DoH endpoints can say so and be obeyed; above the block lists and the
-	cache, which have nothing to add to a name this server answers for itself.
-
-	Note that the reserved-name table below sits on the *other* side of the block
-	lists, and the difference is deliberate rather than an accident of which
-	landed first. The two agree on what matters - both below the rewrites, both
-	above the cache - and differ only on blocking, because a blocklist can
-	plausibly name something under `onion.` or `test.` and cannot plausibly name
-	`resolver.arpa`. Where a hit is possible the operator's list should win and
-	the query should count as blocked; here a hit could only be a wildcard
-	misfiring, and honouring it would hand a client a block response where RFC
-	9462 wants NODATA, breaking discovery to enforce a rule nobody wrote. See the
-	ordering note on the table below.
-	*/
-	if is_resolver_arpa(q.name) {
-		out := build_resolver_arpa_response(msg, q, allocator, limit)
-		log_query(s, client, proto, q, .Local, "ddr", started)
-		return out, .Local, true
-	}
-
 	if s.cfg.blocking.enabled && s.filters != nil {
 		if filter.engine_match(s.filters, q.name) == .Blocked {
 			sync.atomic_add(&s.stats.blocked, 1)
@@ -412,6 +386,34 @@ resolve_query :: proc(
 			log_query(s, client, proto, q, .Blocked, "list", started)
 			return out, .Blocked, true
 		}
+	}
+
+	/*
+	A DDR probe is answered from here and never forwarded - the upstream's
+	designated resolvers are not ours to hand a client, and its unsigned answer
+	under the signed `arpa` zone does not validate. See `ddr.odin`.
+
+	One rule for everything this server answers for itself, and this is it:
+	below the rewrites and the block lists, above the cache and the RD gate. The
+	rewrites so an operator who wants to designate this server's own DoT or DoH
+	endpoints can say so and be obeyed; the block lists so that an entry an
+	operator wrote down wins and is counted as blocked, rather than a table
+	answering first and leaving the list looking like it did nothing.
+
+	This used to sit above the block lists while the reserved-name table below sat
+	beneath them, each with its own reasoning and neither referring to the other.
+	The distinction was real but thin - a blocklist can plausibly name something
+	under `onion.` and cannot plausibly name `resolver.arpa` - and it is not worth
+	two orderings for. One place to reason about is worth more than the case it
+	gives up, which is this: a list broad enough to match `resolver.arpa`, which
+	means a rule over `arpa` itself, now blocks a DDR probe instead of having it
+	answered NODATA. Such a list is already breaking every reverse lookup on the
+	machine, so it is not a configuration this ordering has to protect.
+	*/
+	if is_resolver_arpa(q.name) {
+		out := build_resolver_arpa_response(msg, q, allocator, limit)
+		log_query(s, client, proto, q, .Local, "ddr", started)
+		return out, .Local, true
 	}
 
 	/*
@@ -425,15 +427,12 @@ resolve_query :: proc(
 	operator who put a name on a blocklist still seeing it counted as blocked.
 	This table is the default for the names nobody configured.
 
-	The DDR zone above is answered before the block lists rather than after, and
-	the two are consistent despite that. What separates them is whether a
-	blocklist could ever name what they answer for: a list can plausibly carry a
-	specific `.onion` or a host under an internal `.test`, and where the operator
-	has said something the operator wins and the query is counted as blocked;
-	nothing legitimately lists `resolver.arpa`, and treating a wildcard that
-	happened to match it as a block would break the discovery RFC 9462 asks for.
-	Both sit below the rewrites and above the cache, which is the part that would
-	be a real inconsistency.
+	The DDR zone above is in the same place for the same reasons, which it was not
+	always: it used to be answered ahead of the block lists, on the argument that
+	nothing legitimately lists `resolver.arpa`. True, but not worth two orderings
+	in one procedure - a reader should be able to learn where locally answered
+	names go once. Both now sit below the rewrites and the block lists and above
+	the cache and the RD gate.
 
 	Ahead of the cache, and of the RD gate below. Ahead of the cache because
 	there is nothing there to find: these answers are never stored, and one a

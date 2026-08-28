@@ -628,7 +628,12 @@ the signed `arpa` zone, so an upstream's synthesised, unsigned answer for it is
 indistinguishable from a forgery and used to be logged as `dnssec: SVCB
 _dns.resolver.arpa ... did not validate: Bogus`. A `rewrites` rule for the name
 still wins, for an operator who does want to advertise this server's own DoT or
-DoH endpoints.
+DoH endpoints, and so does a block list entry that reaches it — everything elodin
+answers out of itself is answered after the rewrites and the block lists and
+before the cache, this and the [reserved forward
+names](#names-that-are-never-forwarded) alike. Reaching `resolver.arpa` from a
+list means a rule over `arpa` itself, which is already breaking every reverse
+lookup you have, so this is not a case worth a second ordering to protect.
 
 `special_use.onion: false` stands validation down the same way, on the forward
 side. That key says the upstream is a Tor-aware resolver, and what such an
