@@ -953,3 +953,264 @@ test_an_https_answer_cannot_smuggle_an_address_in_the_additional_section :: proc
 	}
 	free_all(context.temp_allocator)
 }
+
+/*
+A clean answer section is not refused over a section nothing reads.
+
+The fail-closed rule exists for one bypass - a truthful answer carrying a private
+address behind a count of records that are not in the message - and the first cut
+of it enforced fail-closed with `decode_message`, which refuses a message for a
+malformed record anywhere in it. That is wider than the bypass by everything a
+stub never looks at: an authority or additional section that does not parse has
+no bearing on the address the client is about to connect to, and a name whose
+upstream emits one resolves today.
+
+Three cases, and the middle one is the point of the other two: the guard has to
+still be reading the answer section, not skipping the message.
+*/
+@(test)
+test_a_broken_additional_section_does_not_refuse_a_readable_answer :: proc(t: ^testing.T) {
+	// ARCOUNT one higher than the records behind it. Enough to fail the full
+	// decode, not enough to fail the count check in the prologue - which is the
+	// only reason there is a case to answer here. The hundred-record version
+	// from the test above is refused by both decoders and still is.
+	overrun :: proc(wire: []u8) -> []u8 {
+		patched := make([]u8, len(wire), context.temp_allocator)
+		copy(patched, wire)
+		patched[10], patched[11] = 0, 1
+		return patched
+	}
+
+	public := make([]dns.Record, 1, context.temp_allocator)
+	public[0] = a_record("tail.example.", {93, 184, 216, 34})
+	patched := overrun(rebind_reply_of("tail.example.", .A, public))
+
+	_, full := dns.decode_message(patched, context.temp_allocator)
+	if !testing.expect(t, full != .None, "the premise is gone: the whole message decodes") {
+		return
+	}
+	_, answer_only := dns.decode_through_answer(patched, context.temp_allocator)
+	if !testing.expectf(t, answer_only == .None, "the premise is gone: the answer section does not decode: %v", answer_only) {
+		return
+	}
+
+	cfg := rebind_config()
+	out, outcome, sent := ask_raw(t, &cfg, "tail.example.", .A, patched)
+	if testing.expect(t, sent, "the answer was not sent at all") {
+		testing.expectf(t, outcome != .Blocked, "a readable public answer was refused over its additional section")
+		testing.expectf(
+			t,
+			len(out) == len(patched),
+			"the answer was not forwarded as it stood: %d bytes out of %d",
+			len(out),
+			len(patched),
+		)
+	}
+
+	// The same message with a private address in it is still refused, which is
+	// what says the answer section was read rather than waved through.
+	private := make([]dns.Record, 1, context.temp_allocator)
+	private[0] = a_record("tail.attacker.example.", {192, 168, 1, 1})
+	msg, ok := ask_with_reply(
+		t,
+		&cfg,
+		"tail.attacker.example.",
+		.A,
+		overrun(rebind_reply_of("tail.attacker.example.", .A, private)),
+	)
+	if ok {
+		testing.expect_value(t, len(msg.answer), 0)
+		testing.expect_value(t, msg.flags.rcode, u8(dns.Rcode.No_Error))
+	}
+
+	/*
+	And an answer carrying HTTPS keeps the whole-message requirement, because
+	there the unread section is one the client acts on: RFC 9460 section 5 puts
+	the target's addresses in it. Refusing is the only safe reading of "the part
+	that did not decode is the part I would have had to check".
+	*/
+	service := make([]dns.Record, 1, context.temp_allocator)
+	service[0] = dns.Record {
+		name  = "svc.attacker.example.",
+		type  = .HTTPS,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_SVCB{priority = 1, target = "target.attacker.example.", params = nil},
+	}
+	svc, svc_ok := ask_with_reply(
+		t,
+		&cfg,
+		"svc.attacker.example.",
+		.HTTPS,
+		overrun(rebind_reply_of("svc.attacker.example.", .HTTPS, service)),
+	)
+	if svc_ok {
+		testing.expectf(
+			t,
+			len(svc.answer) == 0,
+			"an HTTPS answer whose additional section did not decode was passed on with %d records",
+			len(svc.answer),
+		)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+An address record the decoder could not parse is unreadable, not absent.
+
+`decode_record` does not fail on RDATA it cannot make sense of - it keeps the
+bytes and reports success, which is right for a forwarder that has to pass on
+types it does not model. The guard reads the union tag to find addresses, so such
+a record matched nothing and was forwarded unexamined. For HTTPS that is a way
+through with something behind it: the `ipv4hint` bytes are sitting in the RDATA,
+a client that parses the target name differently from this decoder reads them,
+and the guard never looked.
+
+Scoped to the four types the guard takes addresses from - a raw TXT is a raw TXT,
+and refusing on those would be a rule about malformed messages rather than about
+rebinding.
+*/
+@(test)
+test_an_unparsable_address_record_is_refused :: proc(t: ^testing.T) {
+	cfg := rebind_config()
+
+	// An A record whose RDLENGTH says five bytes. `decode_rdata` refuses it and
+	// `decode_record` keeps it as raw, so the message as a whole decodes.
+	bad_a := make([]dns.Record, 1, context.temp_allocator)
+	bad_a[0] = dns.Record {
+		name  = "raw.attacker.example.",
+		type  = .A,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_Raw{data = []u8{192, 168, 1, 1, 0}},
+	}
+	wire := rebind_reply_of("raw.attacker.example.", .A, bad_a)
+	decoded, derr := dns.decode_message(wire, context.temp_allocator)
+	if !testing.expectf(t, derr == .None, "the premise is gone: the message does not decode: %v", derr) {
+		return
+	}
+	if _, raw := decoded.answer[0].data.(dns.Rdata_Raw); !raw {
+		testing.fail_now(t, "the premise is gone: the decoder parsed the malformed A record")
+	}
+
+	msg, ok := ask_with_reply(t, &cfg, "raw.attacker.example.", .A, wire)
+	if ok {
+		testing.expectf(t, len(msg.answer) == 0, "an unparsable A record was forwarded unexamined")
+	}
+
+	// The same for HTTPS, where the hints the guard exists to read sit inside
+	// the RDATA it could not parse.
+	bad_svcb := make([]dns.Record, 1, context.temp_allocator)
+	bad_svcb[0] = dns.Record {
+		name  = "raw.svc.example.",
+		type  = .HTTPS,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_Raw{data = []u8{0x00}},
+	}
+	svc, svc_ok := ask_with_reply(t, &cfg, "raw.svc.example.", .HTTPS, rebind_reply_of("raw.svc.example.", .HTTPS, bad_svcb))
+	if svc_ok {
+		testing.expectf(t, len(svc.answer) == 0, "an unparsable HTTPS record was forwarded unexamined")
+	}
+
+	/*
+	And not a rule about every malformed record. A TXT the decoder kept raw,
+	beside a public address, is forwarded: nothing in a TXT is an address a
+	browser connects to, so it is not this guard's business.
+	*/
+	mixed := make([]dns.Record, 2, context.temp_allocator)
+	mixed[0] = a_record("raw-txt.example.", {93, 184, 216, 34})
+	mixed[1] = dns.Record {
+		name  = "raw-txt.example.",
+		type  = .TXT,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_Raw{data = []u8{5, 'a'}},
+	}
+	out, out_ok := ask_with_reply(t, &cfg, "raw-txt.example.", .A, rebind_reply_of("raw-txt.example.", .A, mixed))
+	if out_ok {
+		got := addresses_in(out)
+		if testing.expectf(t, len(got) == 1, "a public answer was refused over a malformed TXT record beside it") {
+			testing.expect_value(t, got[0], v4_bytes({93, 184, 216, 34}))
+		}
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+The IPv6 forms that carry an IPv4 address inside them.
+
+`::ffff:a.b.c.d` is undone by `address_in` and has its own case above. Two more
+reach a private IPv4 host and were not being undone: RFC 6052's well-known NAT64
+prefix, which on a NAT64 network is how a client is given an IPv4 destination at
+all, and the deprecated IPv4-compatible form. Both are one AAAA record, which is
+the record a client on such a network asks for first.
+
+The fourth case is the one that keeps the unwrap honest in the other direction: a
+NAT64 answer for a public IPv4 host is the ordinary output of every DNS64
+resolver and must go through.
+*/
+@(test)
+test_an_ipv4_embedded_in_ipv6_cannot_hide_a_private_address :: proc(t: ^testing.T) {
+	cfg := rebind_config()
+
+	refused :: proc(t: ^testing.T, cfg: ^config.Config, name: string, addr: [16]u8, what: string) {
+		records := make([]dns.Record, 1, context.temp_allocator)
+		records[0] = aaaa_record(name, addr)
+		msg, ok := ask_with_reply(t, cfg, name, .AAAA, rebind_reply_of(name, .AAAA, records))
+		if ok {
+			testing.expectf(t, len(msg.answer) == 0, "%s was forwarded", what)
+		}
+	}
+
+	// 64:ff9b::192.168.1.1
+	refused(
+		t,
+		&cfg,
+		"nat64.attacker.example.",
+		{1 = 0x64, 2 = 0xff, 3 = 0x9b, 12 = 192, 13 = 168, 14 = 1, 15 = 1},
+		"a private address behind the well-known NAT64 prefix",
+	)
+	// ::192.168.1.1
+	refused(
+		t,
+		&cfg,
+		"compat.attacker.example.",
+		{12 = 192, 13 = 168, 14 = 1, 15 = 1},
+		"a private address in the IPv4-compatible form",
+	)
+	// 64:ff9b::169.254.169.254, the metadata endpoint by the same door.
+	refused(
+		t,
+		&cfg,
+		"nat64-meta.attacker.example.",
+		{1 = 0x64, 2 = 0xff, 3 = 0x9b, 12 = 169, 13 = 254, 14 = 169, 15 = 254},
+		"the metadata address behind the well-known NAT64 prefix",
+	)
+
+	// 64:ff9b::198.51.100.1, which is what a DNS64 resolver answers all day.
+	public := make([]dns.Record, 1, context.temp_allocator)
+	public[0] = aaaa_record(
+		"nat64.example.",
+		{1 = 0x64, 2 = 0xff, 3 = 0x9b, 12 = 198, 13 = 51, 14 = 100, 15 = 1},
+	)
+	msg, ok := ask_with_reply(t, &cfg, "nat64.example.", .AAAA, rebind_reply_of("nat64.example.", .AAAA, public))
+	if ok {
+		testing.expectf(t, len(msg.answer) == 1, "a NAT64 answer for a public host was refused")
+	}
+
+	/*
+	And `::1` is still `::1`. Unwrapping it would read it as 0.0.0.1, which is
+	inside `0.0.0.0/8` and outside `LOOPBACK_NETWORKS` - so the address would
+	still be refused, but `allow_loopback` would no longer reach it, which is
+	taking the switch away from the one address it was written for.
+	*/
+	cfg.rebind.allow_loopback = true
+	loop := make([]dns.Record, 1, context.temp_allocator)
+	loop[0] = aaaa_record("loop.example.", {15 = 1})
+	lmsg, lok := ask_with_reply(t, &cfg, "loop.example.", .AAAA, rebind_reply_of("loop.example.", .AAAA, loop))
+	if lok {
+		testing.expectf(t, len(lmsg.answer) == 1, "allow_loopback no longer reaches ::1")
+	}
+	free_all(context.temp_allocator)
+}

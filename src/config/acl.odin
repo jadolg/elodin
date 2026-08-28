@@ -104,6 +104,17 @@ about hosts it can legitimately reach. Unbound lists the documentation ranges
 (192.0.2.0/24 and friends) here too; they are left out because an answer
 carrying one is a broken zone rather than a machine an attacker gains anything
 by reaching.
+
+The IPv6 forms that carry an IPv4 address inside them are not entries here, and
+only one of them is handled below. `address_in` undoes `::ffff:a.b.c.d`, because
+that one reaches this check from the client side as well. `64:ff9b::a.b.c.d`
+(RFC 6052) and `::a.b.c.d` (RFC 4291, deprecated) reach a private IPv4 host too,
+but only ever as something an answer said, so they are unwrapped by
+`rebind_unwrap` in `src/server/rebind.odin` rather than here - a client that
+arrives from one is a question about the ACL, and that question has not been
+asked. Nothing is silently missing from the table on their account; what a table
+of prefixes cannot express is an address that has to be rewritten before it is
+matched.
 */
 PRIVATE_NETWORKS := []Prefix {
 	{addr = {0 = 127}, bits = 8}, // 127.0.0.0/8      loopback

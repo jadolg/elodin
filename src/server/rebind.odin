@@ -109,14 +109,27 @@ unsigned in any case, so validation reaches Insecure and serves it. A mitigation
 an attacker switches off by not signing their zone was never one.
 
 So it fails closed, and only exactly here: with the guard on, for the questions
-the guard covers, when the decode fails. An undecodable MX or TXT answer is
-forwarded as it always was. What that costs is a name whose upstream emits
-something this decoder rejects becoming NODATA for A and AAAA where it used to be
-forwarded - an answer that was already not cacheable, not re-encodable and not
-validatable, so the marginal loss is small and the fuzz corpus in
-`testdata/fuzz-corpus/dns` is what keeps the set small. Widening it to every
-question type would be a different change with a much larger blast radius, and is
-not this one.
+the guard covers, when the part of the message a client acts on cannot be read.
+An undecodable MX or TXT answer is forwarded as it always was.
+
+That last clause is narrower than "when the decode fails", and the difference
+matters in both directions. `decode_message` refuses a message for a malformed
+record anywhere in it, authority and additional sections included, and a stub
+reads neither - so refusing on those two would take down a name that resolves
+today over bytes nothing acts on. `rebind_decode` therefore falls back to the
+answer section alone, which is what has to be readable, and keeps the whole-
+message requirement for the one case where the rest is acted on: an answer
+carrying SVCB or HTTPS, whose additional section a client following RFC 9460
+section 5 connects to. The ARCOUNT bypass above is refused by either decode -
+the count check is in the prologue both share - so nothing is given back to the
+attacker; see `rebind_decode`.
+
+What it still costs is a name whose upstream emits an answer section this decoder
+rejects becoming NODATA for A and AAAA where it used to be forwarded - an answer
+that was already not cacheable, not re-encodable and not validatable, so the
+marginal loss is small and the fuzz corpus in `testdata/fuzz-corpus/dns` is what
+keeps the set small. Widening it to every question type would be a different
+change with a much larger blast radius, and is not this one.
 
 What is exempt
 
@@ -225,8 +238,8 @@ rebind_refusal :: proc(
 	shape to fold into - it is not an oversight, and it costs only the cache-miss
 	path for the five question types above.
 	*/
-	decoded, err := dns.decode_message(resp, allocator)
-	if err != .None {
+	decoded, readable, err := rebind_decode(resp, allocator)
+	if !readable {
 		sync.atomic_add(&s.stats.rebind, 1)
 		report_unreadable(q.name, err)
 		return rebind_nodata(s, query, q, limit, allocator), "unreadable", true
@@ -246,6 +259,118 @@ rebind_refusal :: proc(
 	sync.atomic_add(&s.stats.rebind, 1)
 	report_rebind(q.name, addr, v6, allocator)
 	return rebind_nodata(s, query, q, limit, allocator), "rebind", true
+}
+
+/*
+The response, decoded as far as this guard has to read it.
+
+`readable` false is the fail-closed case: bytes that cannot be checked are not
+passed on, and `err` is what stopped the read. What is decided here is how much
+of a message has to be readable before the answer counts as checkable, and it is
+the answer section - plus the additional section when the answer carries an SVCB
+or HTTPS record.
+
+The full decode is tried first, because it is what the checks want. When it
+fails, the question is which part of the message failed. A stub reads the answer
+section and nothing else - glibc's `getanswer` never walks past it - so an answer
+section that reads cleanly beside an authority or additional section that does
+not is one this server can still check and still pass on. Refusing it would take
+a name down over a part of the message nothing acts on, and that name resolves
+today. `decode_through_answer` is the same decode stopped after the answer
+section, and is what `resolve_query` already falls back to for the CNAME walk,
+for the same reason.
+
+None of which reopens the bypass the fail-closed rule was written for. That one
+is an ARCOUNT claiming records that are not in the message, and the count check
+that rejects it - eleven bytes needed per record, five per question, against the
+bytes actually there - is in `decode_sections`' prologue, ahead of the branch
+that stops at the answer section. Both decoders refuse it. What gets past the
+prologue and fails later is a count that overruns by a record or two, and there
+the answer section is read and checked exactly as it always was: a private
+address in it is still found and the answer still refused. What the attacker
+buys with the malformed tail is a decode that stops early, not an address that
+goes unlooked-at.
+
+The exception is an answer carrying SVCB or HTTPS. RFC 9460 section 5 has the
+client take addresses for the target out of the additional section - see
+`first_private_answer` - so there the part that did not read is a part that is
+acted on, and the message is refused as it was before.
+
+A record the decoder kept as `Rdata_Raw` is the other way a message can be
+unreadable without saying so. `decode_record` does not fail on RDATA it cannot
+parse; it keeps the bytes verbatim and reports success, which is right for a
+forwarder and wrong for a check that reads the union tag to find addresses. An A
+whose RDLENGTH disagrees or an SVCB whose TargetName this decoder refuses would
+arrive as a blob, match none of the address cases, and be forwarded unexamined
+with whatever a more forgiving client parses out of it - `ipv4hint` bytes sitting
+untouched behind a target name only this decoder objects to. So a raw record
+whose *type* is one of the four this guard reads addresses out of is unreadable,
+by the same rule as the message: not checkable, not passed on. Every other type
+is raw all the time by design and is none of this guard's business.
+*/
+@(private)
+rebind_decode :: proc(
+	resp: []u8,
+	allocator: mem.Allocator,
+) -> (
+	msg: dns.Message,
+	readable: bool,
+	err: dns.Decode_Error,
+) {
+	decoded, full_err := dns.decode_message(resp, allocator)
+	if full_err != .None {
+		answer, answer_err := dns.decode_through_answer(resp, allocator)
+		if answer_err != .None {
+			return {}, false, answer_err
+		}
+		// The unread section is one the client acts on, so this is the refusal
+		// the whole-message decode was already making.
+		if answer_has_service(answer) {
+			return {}, false, full_err
+		}
+		decoded = answer
+	}
+	if answer_has_raw_address(decoded) {
+		return {}, false, .Bad_Rdata
+	}
+	return decoded, true, .None
+}
+
+/*
+Whether the answer section carries an SVCB or HTTPS record.
+
+On `rec.type` rather than on the union tag, because one caller is asking the
+question about a message whose records may not have decoded.
+*/
+@(private)
+answer_has_service :: proc(msg: dns.Message) -> bool {
+	for rec in msg.answer {
+		#partial switch rec.type {
+		case .SVCB, .HTTPS:
+			return true
+		}
+	}
+	return false
+}
+
+/*
+Whether the answer section carries an address record the decoder could not read.
+
+The four types are the ones `first_private_answer` takes addresses from. A record
+of one of those types that arrived as `Rdata_Raw` is one this guard would skip
+in silence.
+*/
+@(private)
+answer_has_raw_address :: proc(msg: dns.Message) -> bool {
+	for rec in msg.answer {
+		#partial switch rec.type {
+		case .A, .AAAA, .SVCB, .HTTPS:
+			if _, raw := rec.data.(dns.Rdata_Raw); raw {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 /*
@@ -371,17 +496,74 @@ Whether `addr` is somewhere this question's answer should not point.
 
 `loopback_ok` is applied here rather than by leaving loopback out of the table,
 so that the address is still recognised as private everywhere else and the
-latitude means one thing: "and serve it anyway".
+latitude means one thing: "and serve it anyway". Both tables are consulted
+through the same unwrapped bytes, so an exemption cannot miss an address the
+refusal caught.
 */
 @(private)
 rebind_private :: proc(addr: [16]u8, v6: bool, loopback_ok: bool) -> bool {
-	if !config.address_in(config.PRIVATE_NETWORKS, addr, v6) {
+	bytes, family := rebind_unwrap(addr, v6)
+	if !config.address_in(config.PRIVATE_NETWORKS, bytes, family) {
 		return false
 	}
-	if loopback_ok && config.address_in(config.LOOPBACK_NETWORKS, addr, v6) {
+	if loopback_ok && config.address_in(config.LOOPBACK_NETWORKS, bytes, family) {
 		return false
 	}
 	return true
+}
+
+/*
+The IPv4 address inside a v6 address that carries one, for the two forms
+`address_in` does not already undo.
+
+`address_in` unwraps `::ffff:a.b.c.d`, which is the form that matters to the ACL
+as well - a client can arrive from one. These two only matter to an answer:
+
+  - `64:ff9b::/96`, RFC 6052's well-known prefix. On a NAT64 network the stack
+    connects to the embedded IPv4 host, so `64:ff9b::c0a8:0101` reaches
+    192.168.1.1 as squarely as an A record for it would, and an AAAA is the
+    record such a network's clients ask for. RFC 6052 section 3.1 forbids using
+    the well-known prefix with a non-global address, which is the argument that
+    a legitimate answer never carries one and refusing costs nothing.
+  - `::a.b.c.d`, the IPv4-compatible form deprecated by RFC 4291 section
+    2.5.5.1. Deprecated is not the same as not parsed, and it is one byte of
+    difference from the mapped form that everything does parse.
+
+Left alone deliberately: an embedded address whose first byte is zero, so `::`
+and `::1` stay the addresses they are and keep matching the `::/128` and
+`::1/128` entries - unwrapping them would turn `::1` into 0.0.0.1 and quietly
+put it outside `LOOPBACK_NETWORKS`, taking `allow_loopback` away from the one
+address it exists for.
+
+Not covered, and named because the rest of this file names what it leaves out: a
+site-specific NAT64 prefix (RFC 6052 allows /32 through /64, RFC 8215 reserves
+`64:ff9b:1::/48` for local use). This server is not told what its network's
+prefix is, and the embedded octets sit at a different offset for each length,
+skipping the `u` byte. A site running one has `allow_domains`, and dnsmasq and
+Unbound do not recognise even the well-known prefix.
+*/
+@(private)
+rebind_unwrap :: proc(addr: [16]u8, v6: bool) -> (bytes: [16]u8, family: bool) {
+	// The zero first octet is the "left alone" rule above, and it is checked
+	// before anything else so that `::` and `::1` never reach the unwrap.
+	if !v6 || addr[12] == 0 {
+		return addr, v6
+	}
+	// Bytes 4 through 11 are zero in both forms. `::ffff:a.b.c.d` fails here on
+	// its own 0xff pair, which is what leaves it to `address_in`.
+	for i in 4 ..< 12 {
+		if addr[i] != 0 {
+			return addr, true
+		}
+	}
+	nat64 := addr[0] == 0x00 && addr[1] == 0x64 && addr[2] == 0xff && addr[3] == 0x9b
+	compat := addr[0] == 0 && addr[1] == 0 && addr[2] == 0 && addr[3] == 0
+	if !nat64 && !compat {
+		return addr, true
+	}
+	v4: [16]u8
+	v4[0], v4[1], v4[2], v4[3] = addr[12], addr[13], addr[14], addr[15]
+	return v4, false
 }
 
 /*
