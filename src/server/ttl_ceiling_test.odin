@@ -248,21 +248,33 @@ test_max_ttl_bounds_a_forwarded_answer :: proc(t: ^testing.T) {
 }
 
 /*
-An answer whose TTLs could not be bounded is not passed on.
+An answer the walk cannot finish is still bounded as far as the walk got.
 
-`dns.cap_ttls` reports false for a message `scan_ttl_offsets` cannot walk, and
-nothing in it was rewritten - so forwarding it hands the client the upstream's
-own figures, which is the one outcome the bounding exists to prevent. The reply
-here answers the question that was asked, so `response_matches` takes it, but
-its ARCOUNT claims a record that is not there: the walk stops, and a client
-parsing the answer section more leniently than this does would read a TTL of
-2^32-1 straight off the wire. SERVFAIL costs nothing, `cache.put` refusing the
-same message means it was never going to be kept either way.
+The reply here answers the question that was asked, so `response_matches` takes
+it, but its ARCOUNT claims a record that is not there: `scan_ttl_offsets` refuses
+it outright, and `cache.put` with it, so nothing about this answer is ever
+stored. What is left is the copy handed to the client, and the section that copy
+is read for - the answer - sits before the point the walk gives up at. So it is
+bounded, and section 8 turns `max(u32)` into a zero that tells the client to come
+back rather than to keep the record for as long as the machine lasts.
+
+Refused outright for a round, and three tests in this package say why it is not:
+an upstream or a middlebox mangling a section this server never reads is not
+grounds for making the name unresolvable. See `dns.cap_ttls`.
+
+The offset is taken from the intact reply, because once the header is mangled
+nothing will walk the message far enough to find it - which is exactly the
+condition under test. `handle_query` rewrites the ID in place and the reply is
+far too small to be trimmed, so the answer sits where it did.
 */
 @(test)
-test_an_unbounded_answer_is_refused_rather_than_forwarded :: proc(t: ^testing.T) {
+test_an_unbounded_answer_is_forwarded_with_what_could_be_bounded :: proc(t: ^testing.T) {
 	reply := upstream_reply(max(u32))
 	if !testing.expect(t, len(reply) >= dns.HEADER_SIZE, "the mock reply was not built") {
+		return
+	}
+	offsets, scanned := dns.scan_ttl_offsets(reply, context.temp_allocator)
+	if !testing.expect(t, scanned && len(offsets) == 1, "the intact reply did not scan") {
 		return
 	}
 	// One more additional record than the message carries, so the walk runs off
@@ -273,13 +285,10 @@ test_an_unbounded_answer_is_refused_rather_than_forwarded :: proc(t: ^testing.T)
 	if !ok {
 		return
 	}
-	testing.expect_value(t, outcome, Outcome.Failed)
-
-	refused, derr := dns.decode_message(out, context.temp_allocator)
-	if !testing.expect(t, derr == .None, "the refusal did not decode") {
+	testing.expect_value(t, outcome, Outcome.Forwarded)
+	if !testing.expect(t, len(out) == len(reply), "the answer was not forwarded as it stood") {
 		return
 	}
-	testing.expect_value(t, dns.rcode_of(refused), dns.Rcode.Serv_Fail)
-	testing.expect_value(t, len(refused.answer), 0)
+	testing.expect_value(t, dns.read_ttl_at(out, offsets[0]), u32(0))
 	free_all(context.temp_allocator)
 }

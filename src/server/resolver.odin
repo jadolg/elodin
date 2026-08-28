@@ -749,36 +749,22 @@ resolve_query :: proc(
 	nobody is handed - and `rebind.odin` reads the answer section, not the TTLs,
 	so nothing it decides changes by waiting.
 
-	Failing closed when the bound cannot be applied, the way `fit_response` does
-	with the size ceiling: a message `scan_ttl_offsets` cannot walk is one whose
-	TTLs were not rewritten, and forwarding it anyway is the one outcome this
-	block exists to prevent - the upstream's own figure, 2^31 seconds of it,
-	reaching whatever parses the answer section more leniently than this does.
-	Nothing is lost by refusing: `cache.put` scans the same way and would refuse
-	it too, so such an answer was never going to be kept, and a client that reads
-	SERVFAIL asks again rather than pinning a record for sixty-eight years. Held
-	back rather than answered from a stale entry, for the reason the DNSSEC
-	refusal above is: an upstream that sent something this server will not pass
-	on has answered, and reaching for expired data instead would be reaching past
-	a verdict rather than covering an outage.
+	Best-effort, and it does not refuse. `dns.cap_ttls` bounds every record it
+	can read and stops at the first it cannot, which for the malformed messages
+	that actually arrive means the answer section is bounded and the junk that
+	follows it is not. Refusing the whole message instead - SERVFAIL, the way
+	`fit_response` fails on the size ceiling - turned junk in an authority or
+	additional section into a dead name whose answer section was perfectly good,
+	which is the fail-closed-on-the-wrong-evidence the chain walk below spells
+	out at length and settles the same way.
 
-	Debug rather than a warning, because an upstream decides how often it
-	happens and a warning per query is a log it can fill. What names it for an
-	operator is the query log line - `outcome=failed detail="ttl"`, this refusal
-	and no other - counted in `elodin_answers_total` as a failed answer.
+	What the ceiling gives up by not refusing is one forwarded copy of a message
+	this server could not fully walk, with whatever TTLs sat past the point the
+	walk stopped. Nothing is stored: `cache.put` scans with `scan_ttl_offsets`,
+	which refuses what this walk stopped short on, so no entry pins the figure
+	and no later client is served it.
 	*/
-	if !dns.cap_ttls(resp, cache.ttl_ceiling(s.answers), allocator) {
-		logx.debugf(
-			"query %s %s from %s: the answer's TTLs could not be bounded, not forwarding it",
-			dns.type_name(q.type),
-			dns.name_trim_root(q.name),
-			client,
-		)
-		sync.atomic_add(&s.stats.failed, 1)
-		out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
-		log_query(s, client, proto, q, .Failed, "ttl", started)
-		return out, .Failed, built
-	}
+	dns.cap_ttls(resp, cache.ttl_ceiling(s.answers))
 
 	/*
 	Decoded once for the two things below that both need it: the chain walk reads

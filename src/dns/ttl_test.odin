@@ -85,9 +85,7 @@ two cannot drift apart.
 @(test)
 test_cap_ttls_bounds_the_wire_and_spares_the_opt :: proc(t: ^testing.T) {
 	wire := answer_with_ttls([]u32{86400, 0x8000_0000, 30}, ext_rcode = 0x80)
-	if !testing.expect(t, cap_ttls(wire, 3600, context.temp_allocator), "the message could not be walked") {
-		return
-	}
+	cap_ttls(wire, 3600)
 	m, err := decode_message(wire, context.temp_allocator)
 	if !testing.expect(t, err == .None, "the bounded message did not decode") {
 		return
@@ -108,13 +106,48 @@ test_cap_ttls_bounds_the_wire_and_spares_the_opt :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
-// A message that cannot be walked is left as it stands rather than half
-// rewritten - the same messages `scan_ttl_offsets` refuses, which are not ones
-// this server goes on to send.
+/*
+Junk past the answer section does not stop the answer section being bounded.
+
+This is the case that decided the shape of `cap_ttls`. Records are laid out
+answer first, so by the time a walk goes wrong in an authority or additional
+section the records a client actually acts on have already been bounded.
+Refusing the whole message instead - which this did for a round - turned a
+mangled additional section into SERVFAIL for a name whose answer was clean,
+and `server` has three tests of its own saying it must not.
+
+The offsets are taken before the header is mangled, because afterwards nothing
+in this package will walk the message far enough to find them again - which is
+the point: `scan_ttl_offsets` refuses these bytes, so `cache.put` refuses them
+too and the copy this bounds is never stored.
+*/
 @(test)
-test_cap_ttls_refuses_a_message_it_cannot_walk :: proc(t: ^testing.T) {
+test_cap_ttls_bounds_what_it_can_reach :: proc(t: ^testing.T) {
+	wire := answer_with_ttls([]u32{86400, 0x8000_0000})
+	offsets, ok := scan_ttl_offsets(wire, context.temp_allocator)
+	if !testing.expect(t, ok && len(offsets) == 2, "the intact message did not scan") {
+		return
+	}
+	// An additional count no message this size could satisfy: the walk gets
+	// through the answers and the OPT record, then runs out of bytes.
+	wire[10], wire[11] = 0x00, 0x64
+	if _, still := scan_ttl_offsets(wire, context.temp_allocator); still {
+		testing.fail_now(t, "the mangled message was meant to defeat the strict scan")
+	}
+
+	cap_ttls(wire, 3600)
+	testing.expect_value(t, read_ttl_at(wire, offsets[0]), u32(3600))
+	testing.expect_value(t, read_ttl_at(wire, offsets[1]), u32(0))
+	free_all(context.temp_allocator)
+}
+
+// A header too short to hold one is left exactly as it stands, and does not
+// take the walk off the end of it.
+@(test)
+test_cap_ttls_leaves_a_truncated_header_alone :: proc(t: ^testing.T) {
 	short := []u8{0x12, 0x34, 0x81, 0x80}
-	testing.expect(t, !cap_ttls(short, 60, context.temp_allocator), "a truncated header was walked")
+	cap_ttls(short, 60)
+	testing.expect_value(t, short[2], u8(0x81))
 	free_all(context.temp_allocator)
 }
 
@@ -122,11 +155,13 @@ test_cap_ttls_refuses_a_message_it_cannot_walk :: proc(t: ^testing.T) {
 A reply claiming more records than it could possibly hold is refused before the
 count is spent as a capacity.
 
-`cap_ttls` is the first thing to walk an upstream's bytes - it runs before
-anything has decoded them, so the counts it reads are the sender's own, checked
-by nothing. Three sections of 65535 records fit in a header that is seventeen
-bytes long in total, and the array they ask `scan_ttl_offsets` to reserve is
-1.5 MB, spent once per query on a walk that fails at the first name.
+Three sections of 65535 records fit in a header that is seventeen bytes long in
+total, and the array they ask `scan_ttl_offsets` to reserve is 1.5 MB, spent on
+a walk that fails at the first name.
+
+Written when `cap_ttls` walked undecoded bytes through this scan and every query
+paid for it. It does its own walk and allocates nothing now, so the guard stands
+for `cache.put`, whose counts come from a caller rather than from this package.
 
 Tracked rather than asserted on the outcome, because the outcome cannot tell the
 two apart: the message is refused either way, and what is under test is what was
@@ -150,7 +185,9 @@ test_scan_refuses_counts_that_cannot_fit :: proc(t: ^testing.T) {
 
 	_, ok := scan_ttl_offsets(msg, tracked)
 	testing.expect(t, !ok, "a message claiming 196605 records was walked")
-	testing.expect(t, !cap_ttls(msg, 60, tracked), "the same message was bounded")
+	// The same counts through `cap_ttls`, which reserves nothing for them and
+	// gives up at the first record that will not fit.
+	cap_ttls(msg, 60)
 	testing.expectf(
 		t,
 		track.peak_memory_allocated < 4096,
