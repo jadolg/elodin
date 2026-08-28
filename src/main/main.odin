@@ -314,22 +314,18 @@ main :: proc() {
 	resolver, which is the one deployment where forwarding is right, and it is
 	worth reading back to an operator who set it for some other reason.
 
-	Turning the whole table off is not that claim, and does not stand in for it.
-	`special_use.onion` is what takes a forwarded `.onion` name out of the chain
-	of trust; with the table off but that key left at its default, the answer a
-	local tor returns is still validated against a root that publishes a signed
-	proof there is no `onion.`, and the client gets SERVFAIL rather than the
-	mapped address. The two keys are written together for that deployment, which
-	is worth saying to an operator who reached for `enabled: false` alone.
+	There used to be a second line under `enabled: false`, telling an operator
+	with a local tor that they needed `onion: false` as well or their `.onion`
+	answers would be held to the public chain of trust and become SERVFAIL. That
+	was a warning standing in for a fix. `special_use_deferred` now takes a
+	forwarded `.onion` name out of the chain whichever key forwarded it, so there
+	is nothing left to warn about: the two keys no longer have to be written
+	together to work, and a line telling an operator to write both would now be
+	telling them to do something that changes nothing.
 	*/
 	switch {
 	case !cfg.special_use.enabled:
 		logx.warnf("special_use.enabled is off: localhost., onion. and invalid. are forwarded to the upstream")
-		if cfg.dnssec.enabled {
-			logx.warnf(
-				"a Tor-aware upstream needs special_use.onion: false as well, or its .onion answer is held to the public chain of trust and becomes SERVFAIL",
-			)
-		}
 	case !cfg.special_use.onion:
 		logx.warnf("special_use.onion is off: .onion queries are forwarded, which is only safe to a Tor-aware upstream")
 	}

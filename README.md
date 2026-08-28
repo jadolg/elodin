@@ -1291,18 +1291,34 @@ is a claim about the upstream and not about this resolver.
 What that upstream answers is unsigned, and cannot be anything else: the root
 publishes a signed proof that there is no `onion.` to delegate, so a validator
 reads a mapped address under it as unsigned data inside the root zone and calls
-it forgery. `onion: false` therefore also takes those names out of DNSSEC
+it forgery. Forwarding `.onion` therefore also takes those names out of DNSSEC
 validation, exactly as the RFC 6303 reverse zones are — they come back as
-insecure, without the AD bit, rather than as SERVFAIL. Nothing else moves:
-validation is untouched for every other name, and for `.onion` too unless the
-key is written down.
+insecure, without the AD bit, rather than as SERVFAIL.
+
+That follows from the forwarding, not from which key asked for it: `onion: false`
+and `enabled: false` both send these names to the upstream, so both stand
+validation down for them. The narrow reading, where only `onion: false` did, left
+`enabled: false` forwarding `.onion` and then SERVFAILing the answer — a trap for
+exactly the tor operator the escape hatch exists for, who has no reason to read
+the difference off the two key names.
+
+The cost, since it is a real one: if you set `enabled: false` for some reason
+other than tor and your upstream is an ordinary public resolver, its NXDOMAIN for
+a `.onion` name now arrives as insecure rather than as the root-signed
+nonexistence it could have proved, and a forged address for one is passed on
+rather than caught as Bogus. That is the exposure `onion: false` already accepts,
+and it is bounded by both keys being off by default. Nothing else moves:
+validation is untouched for every other name, and for `.onion` too while the
+table is answering it.
 
 `localhost.` and `invalid.` have no key of their own, and are not going to grow
 one. Neither has a deployment that wants them forwarded — no upstream is
 authoritative for either, and RFC 6761 6.3 and 6.4 leave a resolver nothing to
 defer to about them — so a key would only ever be set by somebody working around
 a symptom. `enabled: false` is still there for an operator who wants none of
-this, and says so in the log.
+this, and says so in the log — and it forwards `.onion` without validating it,
+so a Tor-aware upstream works behind it without `onion: false` having to be
+written down as well.
 
 `example.` is deliberately not in the table. It is reserved, but RFC 6761 6.5 is
 the one entry in that document that asks for the opposite: caching servers should

@@ -254,38 +254,64 @@ special_use_zone :: proc(s: ^Server, name: string) -> (zone: string, kind: Speci
 Whether `name` is a reserved name this configuration has deliberately handed
 back to the upstream, and so must not be held to the public chain of trust.
 
-`special_use.onion: false` says the upstream is a Tor-aware resolver, and what
-such an upstream answers for a `.onion` name is unsigned - it can be nothing
-else, the root delegating no `onion.` for anybody to sign under. A validator
-walking down from the root asks for `onion. DS`, is shown an NSEC proving the
-name is not in the root zone at all, concludes from that that nothing is
-delegated there and the root's own keys still cover the subtree, and then meets
-an answer carrying no signature under them. That is Bogus, and the client gets
-SERVFAIL - so the one deployment this key exists for would get nothing out of
-it while `dnssec.enabled` stands, which it does by default.
+What such an upstream answers for a `.onion` name is unsigned, and can be
+nothing else - the root delegates no `onion.` for anybody to sign under. A
+validator walking down from the root asks for `onion. DS`, is shown an NSEC
+proving the name is not in the root zone at all, concludes from that that
+nothing is delegated there and the root's own keys still cover the subtree, and
+then meets an answer carrying no signature under them. That is Bogus, and the
+client gets SERVFAIL - so a Tor-aware upstream would be worth nothing while
+`dnssec.enabled` stands, which it does by default.
+
+The condition is that the table is not answering `onion.` itself, by either of
+the two keys that can take it out: `special_use.onion: false`, which says the
+upstream is Tor-aware, or `special_use.enabled: false`, which says none of this
+handling is wanted. Keying it on `onion` alone was the narrower reading, and it
+left a trap: an operator with a local tor who reached for `enabled: false` -
+the blunter key, and the one whose name sounds like it covers everything - got
+the forwarding they asked for and a SERVFAIL for every `.onion` name, because
+the bypass was still waiting for a key they had no reason to think they needed.
+A startup warning used to point at it. Answering it in the code is better: the
+rule is now that a `.onion` name this server forwards is a `.onion` name it does
+not validate, which holds however the operator said to forward it.
 
 The same standing-down `is_locally_served` performs above, for the same reason
-and at the same price: the answer is served as insecure. Nothing reaches it
-unless an operator wrote the key down, and writing it down is the claim that
-makes it right.
+and at the same price: the answer is served as insecure. Neither key is ever set
+by default, so nothing reaches this without an operator having written something
+down, and writing it down is the claim that makes it right.
 
 Which is also why there is no `covered_by_local_anchor` beside it. That test
 exists because the reverse-side bypass applies to every installation whether or
 not anybody asked for it, so a site that anchored its own reverse space needs a
 way to say it meant the opposite. This bypass is already the thing an operator
-asked for by name, and no anchor can be more deliberate than the key that turned
-it on - nor is there a plausible anchor to have configured, the root delegating
-no `onion.` for a DS to hang under.
+asked for, and no anchor can be more deliberate than the key that turned it on -
+nor is there a plausible anchor to have configured, the root delegating no
+`onion.` for a DS to hang under.
 
-`local.` and `test.` get no such treatment, deliberately. They are forwarded by
-a default configuration rather than by a claim about the upstream, and a public
-upstream's NXDOMAIN for them really is signed by the root - bypassing the check
-would turn an answer this server can prove into one it merely repeats, for every
-installation rather than for one that asked.
+`local.` and `test.` get no such treatment, deliberately, and the line between
+them and `onion.` is what an operator had to do to get here. Those two are
+forwarded by a *default* configuration, and a public upstream's NXDOMAIN for
+them really is signed by the root - bypassing the check would turn an answer
+this server can prove into one it merely repeats, for every installation rather
+than for one that asked. `enabled: false` is on the other side of that line: it
+is not a default, and the installation that set it asked.
+
+What it costs, so the trade is written down rather than discovered. An operator
+who set `enabled: false` for some reason other than tor, and whose upstream is
+an ordinary public resolver, now gets that upstream's NXDOMAIN for a `.onion`
+name as insecure rather than as the root-signed nonexistence it could have
+proved - and a forged address for one, from a hostile upstream or somebody on
+the path, is passed on as insecure instead of being caught as Bogus. That is the
+same exposure `onion: false` already accepts, extended to the other key that
+also forwards these names. It is the price of the rule holding whichever key was
+used, and it is bounded by both keys being explicit.
 */
 @(private)
 special_use_deferred :: proc(s: ^Server, name: string) -> bool {
-	return !s.cfg.special_use.onion && name_at_or_below(name, "onion.")
+	if s.cfg.special_use.enabled && s.cfg.special_use.onion {
+		return false
+	}
+	return name_at_or_below(name, "onion.")
 }
 
 /*

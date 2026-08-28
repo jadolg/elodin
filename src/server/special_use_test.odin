@@ -373,23 +373,53 @@ tor_has_no_chain :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: m
 }
 
 /*
-The `.onion` answer that comes back from that upstream is not validated.
+The `.onion` answer that comes back from that upstream is not validated - by
+whichever key sent it there.
 
-`special_use.onion: false` and `dnssec.enabled` are both reachable at once, and
-the second is on by default - so if the forwarded answer were held to the public
-chain of trust the key would hand every `.onion` name to the upstream and then
-turn what came back into SERVFAIL. Nothing signs a `.onion` answer, and nothing
-can: the root publishes a signed proof that there is no `onion.` to delegate, so
-a validator reads any answer under it as unsigned data inside the root zone.
+`dnssec.enabled` is on by default and is reachable at once with either key that
+forwards `.onion`, so if the forwarded answer were held to the public chain of
+trust the key would hand every `.onion` name to the upstream and then turn what
+came back into SERVFAIL. Nothing signs a `.onion` answer, and nothing can: the
+root publishes a signed proof that there is no `onion.` to delegate, so a
+validator reads any answer under it as unsigned data inside the root zone.
+
+Both keys are checked because the rule is about forwarding, not about one
+setting. `onion: false` is the narrow claim about the upstream; `enabled: false`
+is the blunt key an operator with a local tor may well reach for instead, having
+no reason to read the difference off the names. When only the first stood the
+validator down, the second was a SERVFAIL for every `.onion` name and a startup
+warning was all that pointed at it. If `special_use_deferred` is ever narrowed
+back to `onion` alone, the second case here fails.
 
 The mock answers with an address the way a local tor would, and the assertion is
 that the client sees it.
 */
 @(test)
 test_a_deferred_onion_answer_is_not_held_to_the_public_chain :: proc(t: ^testing.T) {
+	Case :: struct {
+		label: string,
+		apply: proc(cfg: ^config.Config),
+	}
+	cases := []Case {
+		{
+			label = "special_use.onion: false",
+			apply = proc(cfg: ^config.Config) {cfg.special_use.onion = false},
+		},
+		{
+			label = "special_use.enabled: false",
+			apply = proc(cfg: ^config.Config) {cfg.special_use.enabled = false},
+		},
+	}
+	for c in cases {
+		check_onion_is_not_validated(t, c.label, c.apply)
+	}
+}
+
+@(private = "file")
+check_onion_is_not_validated :: proc(t: ^testing.T, label: string, apply: proc(cfg: ^config.Config)) {
 	name := "duskgytldkxiuqc6otgh4.onion."
 	cfg := config.default_config()
-	cfg.special_use.onion = false
+	apply(&cfg)
 
 	s, x, built := leak_server(t, &cfg, name)
 	if !built {
@@ -406,28 +436,29 @@ test_a_deferred_onion_answer_is_not_held_to_the_public_chain :: proc(t: ^testing
 	thread.join(mock)
 	thread.destroy(mock)
 
-	testing.expect(t, x.asked, "the .onion query never reached the Tor-aware upstream")
-	if !testing.expect(t, ok, "the .onion query went unanswered") {
+	testing.expectf(t, x.asked, "%s: the .onion query never reached the Tor-aware upstream", label)
+	if !testing.expectf(t, ok, "%s: the .onion query went unanswered", label) {
 		return
 	}
 
 	resp, derr := dns.decode_message(out, context.temp_allocator)
-	if !testing.expectf(t, derr == .None, "the response will not decode: %v", derr) {
+	if !testing.expectf(t, derr == .None, "%s: the response will not decode: %v", label, derr) {
 		return
 	}
 	if !testing.expectf(
 		t,
 		dns.rcode_of(resp) == .No_Error,
-		"the mapped .onion address came back as %v: the validator was asked about a name handed to the upstream",
+		"%s: the mapped .onion address came back as %v: the validator was asked about a name handed to the upstream",
+		label,
 		dns.rcode_of(resp),
 	) {
 		return
 	}
-	if !testing.expect(t, len(resp.answer) == 1, "the mapped .onion address did not survive") {
+	if !testing.expectf(t, len(resp.answer) == 1, "%s: the mapped .onion address did not survive", label) {
 		return
 	}
 	a, is_a := resp.answer[0].data.(dns.Rdata_A)
-	testing.expect(t, is_a, "the .onion answer is not an A record")
+	testing.expectf(t, is_a, "%s: the .onion answer is not an A record", label)
 	testing.expect_value(t, a.addr, [4]u8{203, 0, 113, 1})
 
 	free_all(context.temp_allocator)
