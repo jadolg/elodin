@@ -300,6 +300,25 @@ rebind_config :: proc() -> config.Config {
 	return cfg
 }
 
+/*
+The same, with the RFC 6761 table out of the way.
+
+`special_use.enabled` ships on and answers every name under `localhost.` out of
+this server, so with it left on those names never reach the forwarding path this
+guard sits on: the mock upstream is never asked, and the assertions below would
+hold whether or not the exemption existed - which is the test passing for a
+reason that has nothing to do with what it is checking. Turning the table off
+here is what keeps the two independent, as the docstring on the localhost test
+asks. How the pair composes in a shipped configuration is a separate question,
+asserted separately in `test_the_table_answers_localhost_before_the_guard`.
+*/
+@(private = "file")
+rebind_config_without_the_table :: proc() -> config.Config {
+	cfg := rebind_config()
+	cfg.special_use.enabled = false
+	return cfg
+}
+
 @(private = "file")
 addresses_in :: proc(msg: dns.Message) -> (out: [dynamic][16]u8) {
 	out = make([dynamic][16]u8, 0, 2, context.temp_allocator)
@@ -670,6 +689,13 @@ name locally and keep it off the forwarding path entirely: two guards whose
 correctness depends on which of them merged first is a live bug waiting for one
 to land while the other is still in review.
 
+That handling has since landed, and it does keep these names off the forwarding
+path - so this test builds its configuration with `special_use.enabled: false`
+to reach the guard at all. The exemption is still the guard's own, which is the
+point of holding it here rather than deleting it: it is what answers a
+`localhost.` query if an operator ever turns the table off, and it is why doing
+so does not cost them the one answer RFC 6761 permits.
+
 The second half is the scope. The exemption is for the addresses section 6.3
 allows, not for the name - an upstream answering `evil.localhost` with
 192.168.1.1 is doing something the RFC does not permit either, and gets no
@@ -681,7 +707,7 @@ test_localhost_may_be_answered_with_loopback :: proc(t: ^testing.T) {
 
 	names := []string{"localhost.", "app.localhost."}
 	for name in names {
-		cfg := rebind_config()
+		cfg := rebind_config_without_the_table()
 		records := make([]dns.Record, 1, context.temp_allocator)
 		records[0] = a_record(name, {127, 0, 0, 1})
 		msg, ok := ask_with_reply(t, &cfg, name, .A, rebind_reply_of(name, .A, records))
@@ -690,7 +716,7 @@ test_localhost_may_be_answered_with_loopback :: proc(t: ^testing.T) {
 		}
 		testing.expectf(t, len(msg.answer) == 1, "%s was refused its own loopback address", name)
 
-		v6cfg := rebind_config()
+		v6cfg := rebind_config_without_the_table()
 		v6recs := make([]dns.Record, 1, context.temp_allocator)
 		v6recs[0] = aaaa_record(name, loopback)
 		v6msg, v6ok := ask_with_reply(t, &v6cfg, name, .AAAA, rebind_reply_of(name, .AAAA, v6recs))
@@ -701,7 +727,7 @@ test_localhost_may_be_answered_with_loopback :: proc(t: ^testing.T) {
 
 	// Loopback and no further: RFC 1918 out of a `.localhost` name is not an
 	// answer section 6.3 permits, so the exemption does not reach it.
-	cfg := rebind_config()
+	cfg := rebind_config_without_the_table()
 	records := make([]dns.Record, 1, context.temp_allocator)
 	records[0] = a_record("evil.localhost.", {192, 168, 1, 1})
 	msg, ok := ask_with_reply(t, &cfg, "evil.localhost.", .A, rebind_reply_of("evil.localhost.", .A, records))
@@ -717,6 +743,43 @@ test_localhost_may_be_answered_with_loopback :: proc(t: ^testing.T) {
 	pmsg, pok := ask_with_reply(t, &plain, "notlocalhost.", .A, rebind_reply_of("notlocalhost.", .A, precs))
 	if pok {
 		testing.expect_value(t, len(pmsg.answer), 0)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+And what a shipped configuration actually does with those names, now that both
+features are in it.
+
+The RFC 6761 table runs before anything is forwarded, so with it at its default
+a hostile answer for a `.localhost` name is not refused by the guard - it is
+never asked for. `evil.localhost.` comes back as 127.0.0.1 from the table while
+the upstream offering 192.168.1.1 goes unconsulted, which is the same refusal
+reached one step earlier and without the round trip.
+
+This is asserted rather than left implied because the two orderings are not
+equally safe and nothing else pins which one is in force. Were the table ever
+moved after the forwarding path, this test would keep passing on the guard's
+refusal (NODATA, no answer records) only if the address check still held; it
+fails the moment neither of them is what stops 192.168.1.1, which is the
+property actually worth keeping.
+*/
+@(test)
+test_the_table_answers_localhost_before_the_guard :: proc(t: ^testing.T) {
+	cfg := rebind_config() // the table left at its default: on
+	records := make([]dns.Record, 1, context.temp_allocator)
+	records[0] = a_record("evil.localhost.", {192, 168, 1, 1})
+	msg, ok := ask_with_reply(t, &cfg, "evil.localhost.", .A, rebind_reply_of("evil.localhost.", .A, records))
+	if !ok {
+		return
+	}
+
+	testing.expect_value(t, dns.rcode_of(msg), dns.Rcode.No_Error)
+	if testing.expectf(t, len(msg.answer) == 1, "evil.localhost. has %d answers, want 1", len(msg.answer)) {
+		a, is_a := msg.answer[0].data.(dns.Rdata_A)
+		if testing.expect(t, is_a, "evil.localhost. did not come back as an A record") {
+			testing.expectf(t, a.addr == {127, 0, 0, 1}, "evil.localhost. resolved to %v, not loopback", a.addr)
+		}
 	}
 	free_all(context.temp_allocator)
 }

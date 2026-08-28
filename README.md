@@ -1203,6 +1203,15 @@ for it is legitimate by definition rather than by anybody's policy. Only as far
 as loopback, though — `evil.localhost` answered with `192.168.1.1` gets no
 latitude from that, since it is not an answer the RFC permits either.
 
+That exemption is not what you meet first, though. With `special_use.enabled` at
+its default, the table under [Names that are never
+forwarded](#names-that-are-never-forwarded) answers everything below `localhost.`
+before anything is forwarded, so the guard is never asked about those names at
+all — `evil.localhost` comes back as `127.0.0.1` rather than as a refusal. The
+exemption is what keeps `localhost.` resolvable in the one configuration where
+that table is off, and is deliberately the guard's own rather than deferred to
+it.
+
 `enabled: false` is the default, so none of the above happens until you turn the
 guard on; the same line turns it back off if you do.
 
