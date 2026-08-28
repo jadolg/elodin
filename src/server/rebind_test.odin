@@ -1188,6 +1188,22 @@ test_an_ipv4_embedded_in_ipv6_cannot_hide_a_private_address :: proc(t: ^testing.
 		"the metadata address behind the well-known NAT64 prefix",
 	)
 
+	/*
+	`64:ff9b::` itself, which is RFC 6052's encoding of 0.0.0.0 rather than a
+	prefix with nothing behind it. A stack on a NAT64 network connects to
+	0.0.0.0, and that is the entry the table calls a working bypass rather than
+	an odd answer - the "0.0.0.0 Day" reach into a service bound to 127.0.0.1.
+	It is also the one address in the set whose first embedded octet is zero, so
+	the rule that keeps `::` and `::1` intact has to not reach it.
+	*/
+	refused(
+		t,
+		&cfg,
+		"nat64-zero.attacker.example.",
+		{1 = 0x64, 2 = 0xff, 3 = 0x9b},
+		"the NAT64 encoding of 0.0.0.0",
+	)
+
 	// 64:ff9b::198.51.100.1, which is what a DNS64 resolver answers all day.
 	public := make([]dns.Record, 1, context.temp_allocator)
 	public[0] = aaaa_record(
