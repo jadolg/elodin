@@ -1332,28 +1332,47 @@ test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
 	_ = net.shutdown(client, .Send)
 
 	/*
-	The assertion, taken before the close it is about: one more read, and nothing
-	there to read. A drain that covered the body leaves the queue empty and the
-	client with nothing left to send, so this times out; a drain that gave up before
-	the body arrived left it to turn up afterwards, and this is what finds it -
-	which is the close finding it there and sending an RST instead of a FIN.
+	The assertion, taken before the close it is about: read to the end of what the
+	client sent, and require it to have been nothing. A drain that covered the body
+	leaves only the FIN queued behind it; a drain that gave up before the body
+	arrived left it to turn up here, which is the close finding it there and
+	sending an RST instead of a FIN.
 
-	The wait is written out rather than taken from `HTTP_LINGER_BODY_IDLE`, and is
-	longer than the delay above by a margin: read for as long as the drain waits and
-	a shortened drain would be measured with the same short ruler that shortened it,
-	which is a check that agrees with whatever the constant says.
+	Read to a clean EOF rather than to one read returning nothing, which is what
+	this used to do and is where its last flakiness lived. `conn_read` reports a
+	receive timeout and an orderly shutdown the same way - `ok = false`, because it
+	asks only for `got > 0` - so a body that had not yet landed within the wait was
+	read as a queue that was empty, and the close then met the bytes and took the
+	400 with it in an RST. The failure named the close and said nothing about the
+	body, because by its own reading there was no body to name. A `recv` returning
+	zero with no error cannot be faked by a slow sender: the FIN is queued behind
+	everything the client wrote, so reaching it means every byte before it has
+	already been read here.
 
-	With the client's sending half down this no longer waits on a race - a read
-	here returns the leftover or the EOF, and cannot return nothing because the
-	body has yet to arrive. The generous timeout stays as a guard rather than as
-	the mechanism.
+	The timeout is a guard against a hang rather than the mechanism, which is why
+	it is generous and why it is written out rather than derived from
+	`HTTP_LINGER_BODY_IDLE`: read for as long as the drain waits and a shortened
+	drain would be measured with the same short ruler that shortened it, which is a
+	check that agrees with whatever the constant says. Anything it does catch is a
+	body that never arrived at all, and it says so in those words.
 	*/
-	_ = net.set_option(accepted, .Receive_Timeout, 500 * time.Millisecond)
-	leftover: [4096]u8
-	behind, more := conn_read(conn, leftover[:])
+	_ = net.set_option(accepted, .Receive_Timeout, 3 * time.Second)
+	behind := 0
+	for {
+		leftover: [4096]u8
+		n, rerr := net.recv_tcp(accepted, leftover[:])
+		if rerr != nil {
+			testing.expectf(t, false, "the client's bytes never finished arriving: %v", rerr)
+			return
+		}
+		if n == 0 {
+			break
+		}
+		behind += n
+	}
 	testing.expectf(
 		t,
-		!more,
+		behind == 0,
 		"%d bytes were still on their way when the drain gave up, and the close will send an RST over them",
 		behind,
 	)
