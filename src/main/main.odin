@@ -303,6 +303,42 @@ main :: proc() {
 	} else {
 		logx.infof("%s", allow_from_line(cfg.server))
 	}
+	/*
+	Said out loud for the same reason an empty allow list is: with the table
+	off, a .onion query is forwarded, which tells the upstream operator that
+	somebody here is reaching for one specific hidden service (RFC 7686 section
+	2). Nothing is logged when it is on - that is the default.
+
+	`onion` alone gets its own line, since that setting is a claim about the
+	upstream rather than about this table: it says the upstream is a Tor-aware
+	resolver, which is the one deployment where forwarding is right, and it is
+	worth reading back to an operator who set it for some other reason.
+
+	There used to be a second line under `enabled: false`, telling an operator
+	with a local tor that they needed `onion: false` as well or their `.onion`
+	answers would be held to the public chain of trust and become SERVFAIL. That
+	was a warning standing in for a fix. `special_use_deferred` now takes a
+	forwarded `.onion` name out of the chain whichever key forwarded it, so there
+	is nothing left to warn about: the two keys no longer have to be written
+	together to work, and a line telling an operator to write both would now be
+	telling them to do something that changes nothing.
+	*/
+	switch {
+	case !cfg.special_use.enabled:
+		logx.warnf("special_use.enabled is off: localhost., onion. and invalid. are forwarded to the upstream")
+		// The second half of what this key now does. `special_use_deferred` fires
+		// on this key as well as on `onion`, so an operator who set it for a
+		// reason having nothing to do with tor - wanting their own hosts file to
+		// own `localhost.`, say - is also giving up the root's signed
+		// nonexistence proof for `.onion`, and this line is the only place they
+		// will see that. The warning it replaced said the opposite, that they
+		// had to write `onion: false` to get here.
+		if cfg.dnssec.enabled {
+			logx.warnf("special_use.enabled is off: .onion answers are served insecure, as nothing under a zone the root proves is not delegated can be signed")
+		}
+	case !cfg.special_use.onion:
+		logx.warnf("special_use.onion is off: .onion queries are forwarded, which is only safe to a Tor-aware upstream")
+	}
 	run(&cfg, opts, service)
 }
 
@@ -535,7 +571,7 @@ report :: proc(s: ^server.Server, answers: ^cache.Cache) {
 	logx.eventf(
 		.Info,
 		"stats",
-		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d refused=%d conn_refused=%d conn_failed=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d",
+		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d refused=%d conn_refused=%d conn_failed=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d special_use=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d",
 		st.queries,
 		st.blocked,
 		st.cached,
@@ -550,6 +586,7 @@ report :: proc(s: ^server.Server, answers: ^cache.Cache) {
 		st.secure,
 		st.bogus,
 		st.rebind,
+		st.special_use,
 		cache.len_entries(answers),
 		cache.bytes_used(answers),
 		cs.hits,

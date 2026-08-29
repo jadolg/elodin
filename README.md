@@ -288,8 +288,8 @@ spaces in it. In Loki that is `| logfmt` and nothing else:
 
 Statistics go to the log every five minutes, as `msg=stats` — `queries`,
 `blocked`, `cached`, `forwarded`, `failed`, `dropped`, `refused`,
-`conn_refused`, `conn_failed`, `limited`, `truncated`, `secure`, `bogus` and
-`rebind`, plus `cache_entries`, `cache_bytes`, `cache_hits`, `cache_withheld`,
+`conn_refused`, `conn_failed`, `limited`, `truncated`, `secure`, `bogus`,
+`rebind` and `special_use`, plus `cache_entries`, `cache_bytes`, `cache_hits`, `cache_withheld`,
 `cache_misses`, `cache_stale`
 and `cache_evictions` — and `log.queries` adds one `msg=query` line per query, at
 the cost noted under [Resource use](#resource-use).
@@ -628,9 +628,27 @@ the signed `arpa` zone, so an upstream's synthesised, unsigned answer for it is
 indistinguishable from a forgery and used to be logged as `dnssec: SVCB
 _dns.resolver.arpa ... did not validate: Bogus`. A `rewrites` rule for the name
 still wins, for an operator who does want to advertise this server's own DoT or
-DoH endpoints.
+DoH endpoints, and so does a block list entry that reaches it — everything elodin
+answers out of itself is answered after the rewrites and the block lists and
+before the cache, this and the [reserved forward
+names](#names-that-are-never-forwarded) alike. Reaching `resolver.arpa` from a
+list means a rule over `arpa` itself, which is already breaking every reverse
+lookup you have, so this is not a case worth a second ordering to protect.
 
-Two things worth knowing about running with it on:
+Forwarding `.onion` stands validation down the same way, on the forward side.
+What a Tor-aware upstream answers for such a name cannot be signed — the root
+publishes a signed proof that there is no `onion.` to delegate — so validating it
+would turn every `.onion` lookup into SERVFAIL. Those names are served insecure,
+without the AD bit, exactly as the reverse zones above are.
+
+Either key that forwards them does this: `special_use.onion: false`, which says
+the upstream is Tor-aware, and `special_use.enabled: false`, which turns the
+whole table off. It is the only other place validation is skipped, it applies to
+nothing but `onion.`, and both keys are off until an operator writes one down;
+see [Names that are never forwarded](#names-that-are-never-forwarded), which has
+what that costs an operator who set `enabled: false` for some other reason.
+
+Two things worth knowing about running `dnssec.enabled` on:
 
 - **Distribution crypto policy can take algorithms away.** Fedora and RHEL ship
   an OpenSSL that refuses SHA-1 signatures outright (`rh-allow-sha1-signatures =
@@ -1193,6 +1211,15 @@ for it is legitimate by definition rather than by anybody's policy. Only as far
 as loopback, though — `evil.localhost` answered with `192.168.1.1` gets no
 latitude from that, since it is not an answer the RFC permits either.
 
+That exemption is not what you meet first, though. With `special_use.enabled` at
+its default, the table under [Names that are never
+forwarded](#names-that-are-never-forwarded) answers everything below `localhost.`
+before anything is forwarded, so the guard is never asked about those names at
+all — `evil.localhost` comes back as `127.0.0.1` rather than as a refusal. The
+exemption is what keeps `localhost.` resolvable in the one configuration where
+that table is off, and is deliberately the guard's own rather than deferred to
+it.
+
 `enabled: false` is the default, so none of the above happens until you turn the
 guard on; the same line turns it back off if you do.
 
@@ -1211,6 +1238,114 @@ rewrites:
 ```
 
 Wildcards match subdomains only, so `*.lan` covers `host.lan` but not `lan`.
+
+### Names that are never forwarded
+
+```yaml
+special_use:
+  enabled: true    # the table below
+  onion: true      # onion.  (RFC 7686 section 2)
+  local: false     # local.  (RFC 6762 section 22)
+  test: false      # test.   (RFC 6761 section 6.2)
+```
+
+Three names are answered here rather than asked about, whatever `upstream.servers`
+says:
+
+| name | answer | why |
+|---|---|---|
+| `localhost.` and below | 127.0.0.1 for A, `::1` for AAAA, NODATA otherwise | RFC 6761 6.3. The only answer it is allowed to have |
+| `onion.` and below | NXDOMAIN | RFC 7686 2, unless the upstream is Tor-aware |
+| `invalid.` and below | NXDOMAIN | RFC 6761 6.4. It cannot exist |
+
+`.onion` is the one this exists for. The query is the disclosure: forwarding it
+tells the upstream operator — and anyone on the path to a plain-UDP upstream —
+that somebody on this network is reaching for one specific hidden service, which
+is what Tor was being used not to publish. `localhost.` is a correctness problem
+rather than a privacy one: forwarded, the name resolves to whatever the upstream
+says, which is a rebinding primitive given away for free.
+
+Answers from the table are counted as `special_use=` in the `msg=stats` line and
+as `elodin_special_use_total` on the metrics endpoint, and logged individually as
+`outcome=local detail=special-use` when `log.queries` is on. That counter is
+worth a panel: it is not a number that should climb on a network nobody is
+resolving `.onion` from, so it climbing tells you either that somebody is, or
+that `localhost.` lookups are reaching this resolver rather than being answered
+from a hosts file.
+
+**`local.` and `test.` are off by default**, though RFC 6762 and RFC 6761 ask for
+the same handling. They are the two reserved names that networks really do serve
+— an Active Directory domain under `.local` older than the reservation, an
+internal `.test` zone that RFC 6761 explicitly permits — and answering them with
+NXDOMAIN on an upgrade would take those hostnames away from a network that had
+them. Turn them on if nothing here serves them; against a public upstream the
+only thing that changes is that the NXDOMAIN arrives without the round trip and
+without the hostname having left the building.
+
+Note that such a site may not have working `.local` names in the first place.
+With `dnssec.enabled` on — the default — the unsigned answer its upstream gives
+is checked against a root that publishes a signed proof there is no `local.` to
+delegate, and SERVFAIL is the likely verdict; the sites this default protects
+are the ones running with validation off. If `.local` is SERVFAILing for you,
+`local: true` at least turns that into a clean NXDOMAIN, and a `rewrites` rule
+turns it into an answer.
+
+A rewrite outranks all of this, since `rewrites` are matched first: a site that
+knows what its own `.local` names resolve to can say so and keep that answer.
+What a rewrite cannot do is send the query somewhere — there is no per-domain
+upstream here — so a network whose router answers `.local` dynamically wants
+`local: false`, which is the default.
+
+There is one upstream for which `.onion` really is the right question to ask: a
+local `tor` with `DNSPort` and `AutomapHostsOnResolve`, which answers those names
+with mapped addresses. That setup wants `onion: false`, and keeps everything else
+in the table. RFC 7686 2 addresses a caching server "where not explicitly adapted
+to interoperate with Tor", so this is the adapted case the RFC leaves room for
+rather than a departure from it. It is warned about at startup, since the setting
+is a claim about the upstream and not about this resolver.
+
+What that upstream answers is unsigned, and cannot be anything else: the root
+publishes a signed proof that there is no `onion.` to delegate, so a validator
+reads a mapped address under it as unsigned data inside the root zone and calls
+it forgery. Forwarding `.onion` therefore also takes those names out of DNSSEC
+validation, exactly as the RFC 6303 reverse zones are — they come back as
+insecure, without the AD bit, rather than as SERVFAIL.
+
+That follows from the forwarding, not from which key asked for it: `onion: false`
+and `enabled: false` both send these names to the upstream, so both stand
+validation down for them. The narrow reading, where only `onion: false` did, left
+`enabled: false` forwarding `.onion` and then SERVFAILing the answer — a trap for
+exactly the tor operator the escape hatch exists for, who has no reason to read
+the difference off the two key names.
+
+The cost, since it is a real one: if you set `enabled: false` for some reason
+other than tor and your upstream is an ordinary public resolver, its NXDOMAIN for
+a `.onion` name now arrives as insecure rather than as the root-signed
+nonexistence it could have proved, and a forged address for one is passed on
+rather than caught as Bogus. That is the exposure `onion: false` already accepts,
+and it is bounded by both keys being off by default. Nothing else moves:
+validation is untouched for every other name, and for `.onion` too while the
+table is answering it.
+
+`localhost.` and `invalid.` have no key of their own, and are not going to grow
+one. Neither has a deployment that wants them forwarded — no upstream is
+authoritative for either, and RFC 6761 6.3 and 6.4 leave a resolver nothing to
+defer to about them — so a key would only ever be set by somebody working around
+a symptom. `enabled: false` is still there for an operator who wants none of
+this, and says so in the log — and it forwards `.onion` without validating it,
+so a Tor-aware upstream works behind it without `onion: false` having to be
+written down as well.
+
+`example.` is deliberately not in the table. It is reserved, but RFC 6761 6.5 is
+the one entry in that document that asks for the opposite: caching servers should
+*not* treat example names as special, `example.com` and its siblings being
+delegated names that resolve.
+
+These answers carry a 10-minute TTL and a synthesised SOA so a resolver
+downstream can cache the negative, and they are not put in elodin's own cache —
+they are built from a table already in memory, and an entry would only outlive
+the reload meant to change it. They show in the query log as `outcome=local
+detail=special-use`.
 
 ### Metrics
 
@@ -1257,7 +1392,7 @@ bind beyond loopback is logged as a warning at startup, once.
 | `elodin_build_info{version}` | gauge | a constant 1, carrying the version as a label |
 | `elodin_uptime_seconds` | gauge | seconds since this process finished starting |
 | `elodin_queries_total` | counter | queries accepted, whatever became of them |
-| `elodin_answers_total{outcome}` | counter | `forwarded`, `cached`, `blocked`, `rewritten`, `failed` — the same words the `msg=query` line uses, except that an answer the rebinding guard withheld is logged as `blocked` and counted in `elodin_rebind_refused_total` instead of here |
+| `elodin_answers_total{outcome}` | counter | `forwarded`, `cached`, `blocked`, `rewritten`, `failed` — the same words the `msg=query` line uses, except that an answer the rebinding guard withheld is logged as `blocked` and counted in `elodin_rebind_refused_total` instead of here, and that `outcome=local` is not among them: of those, only the reserved-name table is counted, in `elodin_special_use_total` |
 | `elodin_queries_dropped_total` | counter | turned away before any work: the backlog was full, or the source could not be answered |
 | `elodin_queries_refused_total` | counter | turned away by `server.allow_from` |
 | `elodin_connections_refused_total` | counter | refused because `server.max_connections` was full |
@@ -1267,6 +1402,7 @@ bind beyond loopback is logged as a warning at startup, once.
 | `elodin_rate_limit_slipped_total` | counter | those answered truncated instead, to send a real client to TCP |
 | `elodin_dnssec_answers_total{result}` | counter | `secure` and `bogus` |
 | `elodin_rebind_refused_total` | counter | answers withheld because a public name was pointed into private address space |
+| `elodin_special_use_total` | counter | queries answered from the reserved-name table instead of being forwarded — a rising figure is `.onion` or `localhost.` lookups on your network that stopped here |
 | `elodin_cache_entries` / `_bytes` | gauge | what the cache holds, against `max_entries` and `max_bytes` |
 | `elodin_cache_hits_total` / `_misses_total` / `_evictions_total` | counter | how it is doing |
 | `elodin_cache_stale_total` | counter | expired answers served because no fresh one could be got, with `cache.serve_stale` on |
@@ -1331,7 +1467,9 @@ cookies in both directions (RFC 7873, RFC 9018) — answered for clients, and
 presented to plain upstreams with the reply checked against what we sent —
 truncation with the TC bit and the UDP→TCP retry, `version.bind`/`hostname.bind`
 in the CHAOS class, local NODATA answers for `resolver.arpa` (RFC 9462 section
-6.1), and refusal of zone-transfer requests.
+6.1), refusal of zone-transfer requests, and the reserved names of RFC 6761 and
+RFC 7686 answered here instead of being forwarded — see [Names that are never
+forwarded](#names-that-are-never-forwarded).
 
 The cache stores upstream answers as untouched wire bytes plus the offsets of
 their TTL fields, and rewrites those TTLs in place on each hit. That keeps the

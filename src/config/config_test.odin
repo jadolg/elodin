@@ -239,6 +239,56 @@ test_cookie_require_needs_the_client_facing_side :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_special_use_defaults_and_overrides :: proc(t: ^testing.T) {
+	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	testing.expect(t, err == nil, "expected a clean load")
+	testing.expect(t, cfg.special_use.enabled, "localhost., onion. and invalid. should be answered locally by default")
+	testing.expect(t, cfg.special_use.onion, "onion. should be answered locally by default")
+	// The two that deployed networks serve for real. Off unless asked for; see
+	// the table in the server package for the argument.
+	testing.expect(t, !cfg.special_use.local, "local. should be forwarded by default")
+	testing.expect(t, !cfg.special_use.test, "test. should be forwarded by default")
+
+	src := "upstream:\n  servers: [1.1.1.1]\nspecial_use:\n  onion: false\n  local: true\n  test: true\n"
+	tuned, terr := load_string(src, context.temp_allocator)
+	testing.expect(t, terr == nil, "expected a clean load")
+	testing.expect(t, tuned.special_use.enabled, "special_use.enabled should survive the other three being set")
+	testing.expect(t, !tuned.special_use.onion, "special_use.onion: false should be honoured")
+	testing.expect(t, tuned.special_use.local, "special_use.local: true should be honoured")
+	testing.expect(t, tuned.special_use.test, "special_use.test: true should be honoured")
+
+	off, oerr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\nspecial_use:\n  enabled: false\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, oerr == nil, "expected a clean load")
+	testing.expect(t, !off.special_use.enabled, "special_use.enabled: false should be honoured")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_special_use_extras_need_the_table :: proc(t: ^testing.T) {
+	// Nothing looks at `local` or `test` with `enabled` off, so the pair reads
+	// as a leak that was stopped and was not. Said at `--check`.
+	src := "upstream:\n  servers: [1.1.1.1]\nspecial_use:\n  enabled: false\n  local: true\n"
+	_, err := load_string(src, context.temp_allocator)
+	e, has := err.?
+	testing.expect(t, has, "expected an error for local without enabled")
+	testing.expect_value(t, len(e.messages), 1)
+
+	// `onion` is not part of that check and must not be: it is on by default, so
+	// turning the table off without mentioning it is the ordinary way to do it
+	// rather than a contradiction anybody wrote down.
+	off, oerr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\nspecial_use:\n  enabled: false\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, oerr == nil, "special_use.enabled: false on its own should load")
+	testing.expect(t, !off.special_use.enabled, "special_use.enabled: false should be honoured")
+	free_all(context.temp_allocator)
+}
+
+@(test)
 test_missing_upstream_is_an_error :: proc(t: ^testing.T) {
 	_, err := load_string("log:\n  level: info\n", context.temp_allocator)
 	e, has := err.?

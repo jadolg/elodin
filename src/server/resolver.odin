@@ -95,6 +95,24 @@ Stats :: struct {
 	inside a number that is meant to be large.
 	*/
 	rebind:       u64,
+	/*
+	Queries answered out of the RFC 6761/6762/7686 table rather than forwarded -
+	see `localzones.odin`.
+
+	Counted, where the other things this server answers from itself are not,
+	because this one is a privacy control and the count is the only aggregate
+	evidence it worked. `answer_chaos` serves a version string and DDR serves a
+	discovery probe, and nobody needs to know how many of either went by; a
+	rising `special_use` says something specific and worth seeing, that clients
+	on this network are asking for `.onion` or `localhost.` names and that those
+	questions stopped here. Without it an operator has to turn query logging on
+	to learn whether the table has ever done anything.
+
+	Apart from `blocked` for the reason `rebind` is: the lists are meant to
+	produce a large number, and a handful of stopped leaks folded into it would
+	be invisible in both directions.
+	*/
+	special_use:  u64,
 }
 
 Server :: struct {
@@ -361,21 +379,6 @@ resolve_query :: proc(
 		return out, .Rewritten, true
 	}
 
-	/*
-	A DDR probe is answered from here and never forwarded - the upstream's
-	designated resolvers are not ours to hand a client, and its unsigned answer
-	under the signed `arpa` zone does not validate. See `ddr.odin`.
-
-	Below the rewrites, so an operator who wants to designate this server's own
-	DoT or DoH endpoints can say so and be obeyed; above the block lists and the
-	cache, which have nothing to add to a name this server answers for itself.
-	*/
-	if is_resolver_arpa(q.name) {
-		out := build_resolver_arpa_response(msg, q, allocator, limit)
-		log_query(s, client, proto, q, .Local, "ddr", started)
-		return out, .Local, true
-	}
-
 	if s.cfg.blocking.enabled && s.filters != nil {
 		if filter.engine_match(s.filters, q.name) == .Blocked {
 			sync.atomic_add(&s.stats.blocked, 1)
@@ -383,6 +386,75 @@ resolve_query :: proc(
 			log_query(s, client, proto, q, .Blocked, "list", started)
 			return out, .Blocked, true
 		}
+	}
+
+	/*
+	A DDR probe is answered from here and never forwarded - the upstream's
+	designated resolvers are not ours to hand a client, and its unsigned answer
+	under the signed `arpa` zone does not validate. See `ddr.odin`.
+
+	One rule for everything this server answers for itself, and this is it:
+	below the rewrites and the block lists, above the cache and the RD gate. The
+	rewrites so an operator who wants to designate this server's own DoT or DoH
+	endpoints can say so and be obeyed; the block lists so that an entry an
+	operator wrote down wins and is counted as blocked, rather than a table
+	answering first and leaving the list looking like it did nothing.
+
+	This used to sit above the block lists while the reserved-name table below sat
+	beneath them, each with its own reasoning and neither referring to the other.
+	The distinction was real but thin - a blocklist can plausibly name something
+	under `onion.` and cannot plausibly name `resolver.arpa` - and it is not worth
+	two orderings for. One place to reason about is worth more than the case it
+	gives up, which is this: a list broad enough to match `resolver.arpa`, which
+	means a rule over `arpa` itself, now blocks a DDR probe instead of having it
+	answered NODATA. Such a list is already breaking every reverse lookup on the
+	machine, so it is not a configuration this ordering has to protect.
+	*/
+	if is_resolver_arpa(q.name) {
+		out := build_resolver_arpa_response(msg, q, allocator, limit)
+		log_query(s, client, proto, q, .Local, "ddr", started)
+		return out, .Local, true
+	}
+
+	/*
+	The names that are never forwarded, whatever `upstream.servers` says. See
+	`localzones.odin` for which they are and why.
+
+	Placed after the rewrites and the block lists on purpose. Both of those are
+	the operator having said something explicit about this name, both answer it
+	locally, and neither can leak it - so letting them run first costs nothing
+	and leaves a site that legitimately serves `.local` able to say so, and an
+	operator who put a name on a blocklist still seeing it counted as blocked.
+	This table is the default for the names nobody configured.
+
+	The DDR zone above is in the same place for the same reasons, which it was not
+	always: it used to be answered ahead of the block lists, on the argument that
+	nothing legitimately lists `resolver.arpa`. True, but not worth two orderings
+	in one procedure - a reader should be able to learn where locally answered
+	names go once. Both now sit below the rewrites and the block lists and above
+	the cache and the RD gate.
+
+	Ahead of the cache, and of the RD gate below. Ahead of the cache because
+	there is nothing there to find: these answers are never stored, and one a
+	previous configuration forwarded and stored cannot outlive the restart it
+	takes to change the setting. The order is what keeps that true rather than
+	something to re-check if either of those facts ever stops holding. Ahead of
+	the RD gate because RD=0 asks for what this server already knows without
+	recursion, and this is precisely that: an answer from a table, with nowhere
+	to forward to even if the client had asked for it.
+
+	Counted in `stats.special_use`, and shown in the query log as `outcome=local
+	detail=special-use`. That is a departure from `answer_chaos` and the DDR
+	probe, which are answered from here too and counted nowhere: those two are a
+	version string and a discovery probe, while a stopped `.onion` query is the
+	one thing here an operator has a reason to watch, and the counter is the only
+	way to see it without running the query log.
+	*/
+	if zone, kind := special_use_zone(s, q.name); kind != .None {
+		out := answer_special_use(msg, q, zone, kind, allocator, limit)
+		sync.atomic_add(&s.stats.special_use, 1)
+		log_query(s, client, proto, q, .Local, "special-use", started)
+		return out, .Local, true
 	}
 
 	// A client that sets CD is asking for the upstream's answer whatever we
@@ -396,11 +468,18 @@ resolve_query :: proc(
 	// are served as insecure, which is what `settle_ad_bit` records once
 	// `validating` is off - unless the operator anchored the zone themselves, in
 	// which case that request to validate it wins and the bypass stands down.
+	//
+	// `special_use_deferred` is the forward-side case of the same thing: a
+	// `.onion` name an operator handed to a Tor-aware upstream with
+	// `special_use.onion: false` comes back unsigned under a root that signs a
+	// proof there is no `onion.` at all, which is Bogus to a validator and
+	// SERVFAIL to the client. See `localzones.odin`.
 	validating :=
 		s.validator != nil &&
 		!msg.flags.cd &&
 		q.class == .IN &&
-		!(is_locally_served(q.name) && !covered_by_local_anchor(s, q.name))
+		!(is_locally_served(q.name) && !covered_by_local_anchor(s, q.name)) &&
+		!special_use_deferred(s, q.name)
 
 	key_buf: [cache.KEY_MAX]u8
 	key := cache.make_key(key_buf[:], q.name, q.type, q.class, dns.edns_do(msg), msg.flags.cd)
@@ -1244,12 +1323,23 @@ build_block_response :: proc(
 	return out
 }
 
-// A minimal SOA for a name we are answering for locally.
+/*
+A minimal SOA for a name we are answering for locally.
+
+`apex` names the zone the record is to be owned by, for a caller that knows one:
+the special-use table does, and the parent of `a.b.onion.` is `b.onion.`, which
+nobody has ever been authoritative for. Empty falls back to the queried name's
+parent, which is the best guess available to the blocking and rewrite paths -
+they answer for names scattered through zones this server knows nothing about.
+*/
 @(private)
-synth_soa :: proc(name: string, ttl: u32, allocator: mem.Allocator) -> []dns.Record {
-	zone := dns.name_parent(name)
-	if zone == "." {
-		zone = name
+synth_soa :: proc(name: string, ttl: u32, allocator: mem.Allocator, apex := "") -> []dns.Record {
+	zone := apex
+	if zone == "" {
+		zone = dns.name_parent(name)
+		if zone == "." {
+			zone = name
+		}
 	}
 	return synth_soa_for_zone(zone, ttl, allocator)
 }
@@ -1506,5 +1596,6 @@ stats_of :: proc(s: ^Server) -> Stats {
 		secure = sync.atomic_load(&s.stats.secure),
 		bogus = sync.atomic_load(&s.stats.bogus),
 		rebind = sync.atomic_load(&s.stats.rebind),
+		special_use = sync.atomic_load(&s.stats.special_use),
 	}
 }

@@ -248,8 +248,11 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 
 	These do not add up to `elodin_queries_total`. A query the backlog or the
 	allow list turned away never reached an outcome, and one answered from a
-	local zone is not counted apart from the rest; the difference is the
-	`dropped` and `refused` counters below.
+	local zone is not among these either; the difference is the `dropped` and
+	`refused` counters below. Of the local answers only the reserved-name table
+	is counted at all, in `elodin_special_use_total` below - a stopped `.onion`
+	query being the one an operator watches for - while the CHAOS replies and the
+	DDR probe are answered here and counted nowhere.
 
 	An answer withheld by the rebinding guard is in none of these either, though
 	the query log calls it `outcome=blocked`. `blocked` here is what the sink
@@ -333,6 +336,14 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 		.Counter,
 		"Answers withheld because a public name was pointed into private address space.",
 		st.rebind,
+	)
+
+	metrics.scalar(
+		&b,
+		"elodin_special_use_total",
+		.Counter,
+		"Queries answered from the reserved-name table instead of being forwarded.",
+		st.special_use,
 	)
 
 	metrics.family(&b, "elodin_dnssec_answers_total", .Counter, "Answers by what validation made of them.")

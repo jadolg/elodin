@@ -4,6 +4,7 @@ import "core:mem"
 import "core:mem/virtual"
 import "core:net"
 import "core:strings"
+import "core:sync"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -1073,14 +1074,37 @@ Late_Body :: struct {
 	socket: net.TCP_Socket,
 	body:   string,
 	delay:  time.Duration,
+	ready:  sync.Sema,
+	go:     sync.Sema,
 }
 
-// Writes the body its request already declared, after a wait, on a connection it
-// leaves open - which is what a client on a link with any latency looks like from
-// this end, and what `test_a_refusal_outlives_the_close_that_follows_it` cannot
-// show, its body being on the wire before the reader is.
+/*
+Writes the body its request already declared, when told to, on a connection it
+leaves open - which is what a client on a link with any latency looks like from
+this end, and what `test_a_refusal_outlives_the_close_that_follows_it` cannot
+show, its body being on the wire before the reader is.
+
+Two semaphores and one sleep, and which is which is the point. The sleep used to
+be the whole of it, timed from whenever this thread happened to start, and it had
+to be long enough that the reader always won the race to it and short enough that
+the drain was always still waiting when it ended. On a loaded runner it was
+neither: thread start is unbounded, `time.sleep` may overshoot by as much as it
+was asked for, and between them the body could arrive after the drain and the
+check behind it had both finished - which is the flakiness this test had, on both
+architectures, with the suite at its normal speed.
+
+Both unbounded terms are taken out rather than one. `ready` is posted from inside
+the thread, and the caller waits for it before it starts reading, so thread start
+is absorbed where nothing is timing it; `go` is posted once the refusal has been
+written, so the body cannot reach the wire before then however this thread is
+scheduled. What is left to time is the sleep below - 50 ms against the 250 the
+drain waits out - and it now runs on a thread known to be alive and sitting on
+this line, rather than standing in for one that may not have started.
+*/
 @(private = "file")
 send_late_body :: proc(lb: ^Late_Body) {
+	sync.sema_post(&lb.ready)
+	sync.sema_wait(&lb.go)
 	time.sleep(lb.delay)
 	sent := 0
 	raw := transmute([]u8)lb.body
@@ -1116,9 +1140,38 @@ the client its 400 exactly as closing straight over it would.
 Both halves of that are checked, in the order they happen: what the drain left
 behind for the close to trip over, and then whether the status survived the close.
 The first is the mechanism and the second is the consequence, and shortening the
-wait fails on both. The 100 ms delay stands in for a round trip,
-`HTTP_LINGER_BODY_IDLE` is the wait that covers one, and the margin between them
-is what keeps this from turning on how the two threads were scheduled.
+wait fails on both.
+
+The sequence is waited for rather than timed, which it did not used to be. A
+100 ms sleep in the sender stood in for a round trip against the 250 ms of
+`HTTP_LINGER_BODY_IDLE`, and the margin between the two was supposed to keep the
+result off the scheduler. It did not: on a loaded CI runner the sender's thread
+start plus a sleep that may overshoot by its own length put the body on the wire
+after the drain and after the 500 ms check behind it, so the close met bytes
+nobody had drained and the RST took the 400 with it - the test reporting the real
+consequence of a body it had itself sent too late. It failed on both
+architectures with the suite at its normal speed.
+
+`Late_Body` is now handed its turn instead of guessing at it: it reports itself
+alive before the reader runs, waits to be told the refusal has been written, and
+only then sleeps the round trip - 50 ms against the drain's 250. Thread start and
+sleep overshoot were the two unbounded terms sitting inside that margin, and both
+are now outside it.
+
+The sender is reaped between the drain and the check rather than after both, so
+an empty queue at the check can only mean the drain emptied it. That is what a
+late body used to be able to counterfeit, and the exact shape of the old failure:
+16 KiB turning up after the drain and the check had finished, and the close
+sending an RST over it.
+
+What is deliberately *not* done is waiting for the body before the drain, which
+would be more deterministic still. `http_linger` has to be what meets a body on
+its way: with the whole 16 KiB already in the receive queue before the drain
+began, a drain of any length would read it, and shortening
+`HTTP_LINGER_BODY_IDLE` would stop failing this test - which is most of what it
+is for. Nothing about the property changed either way: the body still cannot
+exist on the wire until after the refusal was read and written, which is what
+makes this the opposite case to the test named above.
 
 The client never shuts its sending half down, so nothing but that wait ends the
 drain.
@@ -1144,6 +1197,11 @@ test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
 	}
 	defer net.close(client)
 	_ = net.set_option(client, .Receive_Timeout, 3 * time.Second)
+	// So that the body's blocking write cannot outlive the test. `thread.join`
+	// below waits for that write, and without this a peer window that never opens
+	// - a drain that stopped reading on a host with small socket buffers - would
+	// hang the join rather than fail an assertion. See the note on the join.
+	_ = net.set_option(client, .Send_Timeout, 3 * time.Second)
 
 	// The head alone. A `JUNK` version is refused on the request line, which is
 	// before `read_http_request` has looked at the Content-Length that says the
@@ -1171,13 +1229,25 @@ test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
 	for _ in 0 ..< LATE {
 		strings.write_byte(&body, 'x')
 	}
+	/*
+	A fifth of the drain's wait, so the margin is plainly a margin. It stands in
+	for the round trip the body is away, and it is deliberately an absolute figure
+	rather than a fraction of `HTTP_LINGER_BODY_IDLE`: derived from the constant it
+	would shrink with it, and shortening the drain is the thing this test exists to
+	fail on.
+	*/
 	late := Late_Body {
 		socket = client,
 		body   = strings.to_string(body),
-		delay  = 100 * time.Millisecond,
+		delay  = 50 * time.Millisecond,
 	}
 	sender := thread.create_and_start_with_poly_data(&late, send_late_body)
 	defer thread.destroy(sender)
+
+	// Wait for it to be alive and waiting before anything below is timed against
+	// it. Thread start is the other unbounded term this test used to have inside
+	// its margin; absorbed here, it is outside it.
+	sync.sema_wait(&late.ready)
 
 	r := Http_Reader {
 		conn = conn,
@@ -1202,7 +1272,64 @@ test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
 
 	// `serve_doh`'s refusal path, in its order: the answer, then the drain.
 	_ = send_http_error(conn, "doh", status, http_refusal_message(status), false)
+
+	/*
+	And now the body is allowed onto the wire - after the refusal was read and
+	written, which is the property separating this test from
+	`test_a_refusal_outlives_the_close_that_follows_it`, and which the post turns
+	from a race into an ordering.
+
+	It must not be waited for here. The drain has to be what meets a body still on
+	its way, so the sender runs against `http_linger` and is reaped after the check
+	below. Were the 16 KiB already in the receive queue when the drain started, any
+	wait at all would read it and a shortened `HTTP_LINGER_BODY_IDLE` would pass.
+	*/
+	sync.sema_post(&late.go)
 	http_linger(conn, HTTP_LINGER_BODY_IDLE)
+
+	/*
+	Reaped here, between the drain and the check, so that what the check sees can
+	only be the drain's doing. The body is fully written by the time this returns,
+	so an empty queue below means the drain read it rather than that it had yet to
+	be sent - which is the reading a late sender used to be able to fake, and the
+	shape the old failure took: bytes arriving after both the drain and the check
+	had finished, and the close sending an RST over them.
+
+	A join can block, which is why the sender's socket carries a send timeout. In
+	the ordinary case it cannot: 16 KiB goes into a loopback receive buffer two
+	orders of magnitude larger whether or not anything is draining, and a drain
+	that gave up early leaves it all sitting there for the check to find. But that
+	is a fact about this machine's `net.core.rmem_default`, not about the test, and
+	on a host that sized its buffers smaller a half-written body with no reader
+	would hang here rather than fail - a suite that stops saying anything instead
+	of one that says what went wrong. The timeout keeps the bad case loud.
+	*/
+	thread.join(sender)
+
+	/*
+	And then the sending half goes down, which is what makes the check below an
+	answer rather than a guess.
+
+	`send_tcp` returning means the bytes reached the kernel's send buffer, not that
+	they reached the server - so a joined sender can still have a body in flight,
+	and the check reading nothing could mean either that the drain took it all or
+	that it has yet to land. That ambiguity is the last of this test's flakiness:
+	when the body landed after the check, the close met unread bytes and sent an
+	RST, the client lost its 400, and the failure named the close while saying
+	nothing about the body being late.
+
+	A FIN is queued behind everything already written, so once this is sent the
+	read below can only return the leftover the drain failed to take, or the clean
+	EOF that says there was none - `conn_read` reports both as `ok = false` only in
+	the second case, since it requires `got > 0`. Nothing can arrive afterwards
+	either, which is what leaves the close with one possible outcome.
+
+	It does not weaken what the drain was measured against. `http_linger` had
+	already returned before this line, ended by its own idle timeout with the
+	sending half still open, which is what the docstring above means by nothing
+	but that wait ending the drain.
+	*/
+	_ = net.shutdown(client, .Send)
 
 	/*
 	The assertion, taken before the close it is about: one more read, and nothing
@@ -1215,6 +1342,11 @@ test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
 	longer than the delay above by a margin: read for as long as the drain waits and
 	a shortened drain would be measured with the same short ruler that shortened it,
 	which is a check that agrees with whatever the constant says.
+
+	With the client's sending half down this no longer waits on a race - a read
+	here returns the leftover or the EOF, and cannot return nothing because the
+	body has yet to arrive. The generous timeout stays as a guard rather than as
+	the mechanism.
 	*/
 	_ = net.set_option(accepted, .Receive_Timeout, 500 * time.Millisecond)
 	leftover: [4096]u8
@@ -1227,7 +1359,6 @@ test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
 	)
 
 	net.close(accepted)
-	thread.join(sender)
 
 	reply := make([dynamic]u8, 0, 4096, context.temp_allocator)
 	for len(reply) < 4096 {
