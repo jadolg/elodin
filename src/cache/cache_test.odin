@@ -112,8 +112,10 @@ test_ttl_clamping :: proc(t: ^testing.T) {
 	got, _, ok := get(c, key, context.temp_allocator)
 	testing.expect(t, ok, "expected a hit")
 	decoded, _ := dns.decode_message(got, context.temp_allocator)
-	// The stored TTL is untouched; only the entry's lifetime is clamped.
-	testing.expect_value(t, decoded.answer[0].ttl, u32(3600))
+	// And handed out no longer either: the stored figure is clamped with the
+	// lifetime, so what the client is told cannot outlast the entry it came
+	// from. See `ttl_ceiling_test.odin` for what that is worth.
+	testing.expect_value(t, decoded.answer[0].ttl, u32(120))
 	free_all(context.temp_allocator)
 }
 
