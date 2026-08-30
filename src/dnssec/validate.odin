@@ -343,11 +343,16 @@ validate_answer :: proc(
 	expanded is not always the one carrying the question's own name.
 	*/
 	if worst == .Secure {
+		// Every one of them, and the worst verdict wins. Stopping at the first
+		// failure would let an expansion that came out merely insecure - an
+		// opt-out cover does - hide a forged one behind it, and which comes
+		// first in the answer section is the sender's choice.
 		for e in expansions {
 			proof := validate_wildcard_proof(v, budget, msg, e.owner, e.encloser, class, unix, now, allocator)
-			if proof != .Secure {
-				return {proof, "wildcard expansion not proven"}
-			}
+			worst = worse(worst, proof)
+		}
+		if worst != .Secure {
+			return {worst, "wildcard expansion not proven"}
 		}
 	}
 	return {worst, reason}
