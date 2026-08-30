@@ -4,6 +4,7 @@ import "core:mem"
 import "core:sync"
 import "core:time"
 import "elodin:config"
+import "elodin:dns"
 import "elodin:logx"
 import "elodin:pool"
 
@@ -93,6 +94,88 @@ resolve :: proc(
 		return resolve_sequential(g, query, 0, allocator)
 	}
 	return nil, nil, .IO_Error
+}
+
+/*
+Resolve `query`, insisting on a reply that says something about the name.
+
+`resolve` hands back whatever the first upstream to reply said, and SERVFAIL is
+a reply: `exchange` reads the rcode only for BADCOOKIE, so a server answering
+"I could not" ends a search that a server which could would have finished. For
+a client's own question that is right - the rcode is the answer, and passing it
+on is honest. For a lookup this server makes on its own account, walking the
+DNSSEC chain, it is not. NOERROR and NXDOMAIN are the only rcodes that say
+anything about a delegation; anything else leaves the chain unestablished, and
+an unestablished chain is a SERVFAIL for a name that may be perfectly good.
+
+Transport failures are deliberately not retried here - `resolve` has already
+exhausted them, every server for `attempts` rounds. What it leaves unretried is
+the reply that did arrive and said nothing, so that is what this asks again.
+
+The ordinary path is untouched: an answerable reply returns from the call below
+and none of the rest runs.
+*/
+resolve_answerable :: proc(
+	g: ^Group,
+	query: []u8,
+	allocator := context.allocator,
+) -> (
+	response: []u8,
+	winner: ^Upstream,
+	err: Error,
+) {
+	response, winner, err = resolve(g, query, allocator)
+	if err != .None || answerable(response) {
+		return response, winner, err
+	}
+
+	/*
+	One pass, and the server that already spoke is skipped: it gave its answer
+	and asking it again gets the same one. That bounds the sweep by the server
+	count, and the chain walk calling this is itself bounded by
+	MAX_LOOKUPS_PER_QUERY, so no client can turn one question into an unbounded
+	fan-out.
+
+	Health is left alone on purpose. SERVFAIL is a legitimate answer to plenty
+	of questions, and a server that gives one has not failed in the sense
+	`record_failure` tracks - it answered, promptly, and for the client's own
+	queries this server goes on using it.
+	*/
+	for u in g.servers {
+		if u == winner {
+			continue
+		}
+		resp, xerr := exchange(u, query, g.timeout, allocator)
+		if xerr != .None {
+			logx.debugf("upstream %s failed: %v", u.spec.name, xerr)
+			continue
+		}
+		if answerable(resp) {
+			// The first reply is superseded. It came from the caller's
+			// allocator, which is an arena per request on the query path,
+			// where this is a no-op; it matters where one is not.
+			_ = delete(response, allocator)
+			return resp, u, .None
+		}
+		_ = delete(resp, allocator)
+	}
+
+	// Nobody could answer. The first reply stands, rcode and all: the caller
+	// reads it and decides, and turning one verdict into another is not this
+	// procedure's business.
+	return response, winner, .None
+}
+
+// The two rcodes that say something about the name that was asked for. The
+// same test `dnssec.answerable_rcode` makes, over the wire bytes this package
+// deals in rather than a decoded message.
+@(private)
+answerable :: proc(response: []u8) -> bool {
+	#partial switch dns.peek_rcode(response) {
+	case .No_Error, .NX_Domain:
+		return true
+	}
+	return false
 }
 
 @(private)
