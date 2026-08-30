@@ -118,6 +118,13 @@ Find the deepest ancestor of `qname` the zone is shown to hold.
 Returns that name along with the "next closer" name, one label longer, whose
 absence the caller then has to see covered. A match on `qname` itself means the
 name exists, which contradicts whatever the caller was trying to prove.
+
+Reaching `zone` itself without a match still counts: the zone apex's existence
+was already established by the chain of trust that got this deep (its DNSKEY
+set had to be fetched and verified to be here at all), so nothing in this
+particular response has to say it again with an in-band NSEC3 match. RFC 5155
+section 7.2.6 relies on exactly this for a wildcard answer whose closest
+encloser is the apex - the response only has to cover the next closer name.
 */
 @(private)
 nsec3_closest_encloser :: proc(
@@ -141,7 +148,10 @@ nsec3_closest_encloser :: proc(
 			return name, previous, true
 		}
 		if dns.name_equal_fold(name, zone) {
-			return "", "", false
+			if previous == "" {
+				return "", "", false
+			}
+			return name, previous, true
 		}
 		previous = name
 		name = dns.name_parent(name)

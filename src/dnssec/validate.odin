@@ -641,8 +641,18 @@ validate_wildcard_proof :: proc(
 		}
 	}
 	if len(nsec3s) > 0 {
-		if _, _, ce_ok := nsec3_closest_encloser(nsec3s, qname, established, v.max_nsec3_iterations); ce_ok {
-			return .Secure
+		/*
+		Identifying the closest encloser is not the proof - RFC 5155 section
+		7.2.6 also demands an NSEC3 that covers the next closer name, which is
+		what says the queried name itself has nothing of its own. Stopping at
+		`ce_ok` would accept any wildcard-signed RRset offered for the wrong
+		name as long as the response carried some unrelated NSEC3 that
+		happened to match an ancestor of it.
+		*/
+		if _, next_closer, ce_ok := nsec3_closest_encloser(nsec3s, qname, established, v.max_nsec3_iterations); ce_ok {
+			if _, covered := nsec3_covering(nsec3s, next_closer, v.max_nsec3_iterations); covered {
+				return .Secure
+			}
 		}
 	}
 	return .Bogus
