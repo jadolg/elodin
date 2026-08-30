@@ -129,7 +129,14 @@ validator_query :: proc(
 	if err != .None {
 		return nil, false
 	}
-	response, _, uerr := upstream.resolve(s.group, asked, allocator)
+	/*
+	`resolve_answerable` rather than `resolve`: this is a lookup the server
+	makes on its own account, and a SERVFAIL from the first upstream to reply
+	is not an answer about the delegation - it is one server declining to say.
+	Another in the group may know, and if none do the reply still comes back
+	for `zone_step` to read the rcode off and call the chain unavailable.
+	*/
+	response, _, uerr := upstream.resolve_answerable(s.group, asked, allocator)
 	if uerr != .None {
 		logx.debugf("dnssec: %s %s could not be fetched: %v", dns.type_name(type), name, uerr)
 		return nil, false

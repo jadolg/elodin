@@ -1837,3 +1837,229 @@ test_redirect_within_the_configured_scheme_is_followed :: proc(t: ^testing.T) {
 	testing.expect_value(t, string(body), "rules")
 	free_all(context.temp_allocator)
 }
+
+/*
+A lookup the server makes on its own account has to outlive one upstream
+declining to answer it.
+
+`exchange` reads the rcode only for BADCOOKIE, so a SERVFAIL is a successful
+exchange and `resolve_sequential` returns it from the first server to reply -
+the failover loop never runs, because nothing failed in the sense it measures.
+That is right for a client's question, whose answer is the rcode. It is wrong
+for a DS or DNSKEY lookup, where SERVFAIL says nothing about the delegation and
+leaves the chain unestablished, refusing a name that another upstream in the
+group could have settled.
+
+Two responders, in configured order: the first answers SERVFAIL to everything,
+the second answers NOERROR. `resolve` is expected to take the first at its word;
+`resolve_answerable` is expected to go on and find the second.
+*/
+@(private = "file")
+Rcode_Mock :: struct {
+	socket: net.UDP_Socket,
+	rcode:  u8,
+	stop:   bool,
+	hits:   int,
+}
+
+@(private = "file")
+rcode_mock_loop :: proc(m: ^Rcode_Mock) {
+	buf: [512]u8
+	for !sync.atomic_load(&m.stop) {
+		n, client, err := net.recv_udp(m.socket, buf[:])
+		if err != nil {
+			// The receive timeout firing is how this loop notices `stop`.
+			continue
+		}
+		if n < dns.HEADER_SIZE {
+			continue
+		}
+		sync.atomic_add(&m.hits, 1)
+		buf[2] |= 0x80
+		buf[3] = (buf[3] & 0xf0) | m.rcode
+		_, _ = net.send_udp(m.socket, buf[:n], client)
+	}
+}
+
+// Binds a responder that answers every query with `rcode`, and hands back the
+// upstream pointing at it.
+@(private = "file")
+start_rcode_mock :: proc(
+	t: ^testing.T,
+	m: ^Rcode_Mock,
+	name: string,
+	rcode: dns.Rcode,
+) -> (
+	u: ^Upstream,
+	responder: ^thread.Thread,
+	ok: bool,
+) {
+	m.rcode = u8(rcode) & 0xf
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if serr != nil {
+		testing.expectf(t, false, "cannot bind a loopback responder: %v", serr)
+		return nil, nil, false
+	}
+	m.socket = socket
+	set_socket_timeouts(socket, 50 * time.Millisecond)
+
+	bound, berr := net.bound_endpoint(socket)
+	if berr != nil {
+		net.close(socket)
+		testing.expectf(t, false, "cannot read the responder's port: %v", berr)
+		return nil, nil, false
+	}
+
+	built, uerr := make_upstream(
+		config.Upstream_Spec{name = name, kind = .UDP, address = "127.0.0.1", port = bound.port},
+		0,
+		time.Second,
+		context.allocator,
+	)
+	if uerr != .None {
+		net.close(socket)
+		testing.expectf(t, false, "cannot build the upstream: %v", uerr)
+		return nil, nil, false
+	}
+
+	return built, thread.create_and_start_with_poly_data(m, rcode_mock_loop), true
+}
+
+@(test)
+test_a_chain_lookup_is_asked_elsewhere_when_one_upstream_declines :: proc(t: ^testing.T) {
+	refuser := Rcode_Mock{}
+	answerer := Rcode_Mock{}
+
+	bad, bad_thread, bad_ok := start_rcode_mock(t, &refuser, "refuser", .Serv_Fail)
+	if !bad_ok {
+		return
+	}
+	defer {
+		sync.atomic_store(&refuser.stop, true)
+		thread.join(bad_thread)
+		thread.destroy(bad_thread)
+		net.close(refuser.socket)
+		destroy(bad)
+	}
+
+	good, good_thread, good_ok := start_rcode_mock(t, &answerer, "answerer", .No_Error)
+	if !good_ok {
+		return
+	}
+	defer {
+		sync.atomic_store(&answerer.stop, true)
+		thread.join(good_thread)
+		thread.destroy(good_thread)
+		net.close(answerer.socket)
+		destroy(good)
+	}
+
+	servers := make([]^Upstream, 2, context.allocator)
+	defer delete(servers, context.allocator)
+	servers[0] = bad
+	servers[1] = good
+
+	g := Group {
+		servers   = servers,
+		strategy  = .Failover,
+		timeout   = time.Second,
+		attempts  = 1,
+		allocator = context.allocator,
+	}
+
+	query := dns.Message {
+		id       = 0x2A2A,
+		question = []dns.Question{{name = "bahn.de.", type = .DS, class = .IN}},
+	}
+	query.flags.rd = true
+	wire, _, enc := dns.encode_message(query, context.temp_allocator)
+	testing.expectf(t, enc == dns.Encode_Error.None, "cannot encode the query: %v", enc)
+	if enc != .None {
+		return
+	}
+
+	// What a client's own question gets, and should go on getting: the rcode is
+	// the answer, and the first server to reply gave one.
+	plain, plain_winner, plain_err := resolve(&g, wire, context.allocator)
+	testing.expect_value(t, plain_err, Error.None)
+	testing.expect_value(t, dns.peek_rcode(plain), dns.Rcode.Serv_Fail)
+	testing.expect_value(t, plain_winner, bad)
+	delete(plain, context.allocator)
+
+	// What the chain walk gets: the declining server is skipped over rather
+	// than believed.
+	resp, winner, err := resolve_answerable(&g, wire, context.allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expect_value(t, dns.peek_rcode(resp), dns.Rcode.No_Error)
+	testing.expect_value(t, winner, good)
+	testing.expect(t, sync.atomic_load(&answerer.hits) > 0, "the second upstream was never asked")
+	delete(resp, context.allocator)
+
+	free_all(context.temp_allocator)
+}
+
+// The other half: when nobody can answer, the first reply still comes back with
+// its rcode intact, so `zone_step` reads it and calls the chain unavailable
+// rather than the caller getting a transport error it would report differently.
+@(test)
+test_a_chain_lookup_keeps_the_reply_when_no_upstream_can_answer :: proc(t: ^testing.T) {
+	first := Rcode_Mock{}
+	second := Rcode_Mock{}
+
+	a, a_thread, a_ok := start_rcode_mock(t, &first, "first", .Serv_Fail)
+	if !a_ok {
+		return
+	}
+	defer {
+		sync.atomic_store(&first.stop, true)
+		thread.join(a_thread)
+		thread.destroy(a_thread)
+		net.close(first.socket)
+		destroy(a)
+	}
+
+	b, b_thread, b_ok := start_rcode_mock(t, &second, "second", .Refused)
+	if !b_ok {
+		return
+	}
+	defer {
+		sync.atomic_store(&second.stop, true)
+		thread.join(b_thread)
+		thread.destroy(b_thread)
+		net.close(second.socket)
+		destroy(b)
+	}
+
+	servers := make([]^Upstream, 2, context.allocator)
+	defer delete(servers, context.allocator)
+	servers[0] = a
+	servers[1] = b
+
+	g := Group {
+		servers   = servers,
+		strategy  = .Failover,
+		timeout   = time.Second,
+		attempts  = 1,
+		allocator = context.allocator,
+	}
+
+	query := dns.Message {
+		id       = 0x2A2A,
+		question = []dns.Question{{name = "bahn.de.", type = .DS, class = .IN}},
+	}
+	query.flags.rd = true
+	wire, _, enc := dns.encode_message(query, context.temp_allocator)
+	testing.expectf(t, enc == dns.Encode_Error.None, "cannot encode the query: %v", enc)
+	if enc != .None {
+		return
+	}
+
+	resp, winner, err := resolve_answerable(&g, wire, context.allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expect_value(t, dns.peek_rcode(resp), dns.Rcode.Serv_Fail)
+	testing.expect_value(t, winner, a)
+	testing.expect(t, sync.atomic_load(&second.hits) > 0, "the second upstream was never asked")
+	delete(resp, context.allocator)
+
+	free_all(context.temp_allocator)
+}
