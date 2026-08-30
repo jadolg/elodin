@@ -1246,3 +1246,74 @@ test_dnskey_lookup_failure_is_indeterminate :: proc(t: ^testing.T) {
 	testing.expect_value(t, walk_with_failure(".", .DNSKEY, .Refused), Status.Indeterminate)
 	free_all(context.temp_allocator)
 }
+
+/*
+The reason has to belong to the verdict that is returned.
+
+`validate_answer` keeps the worst status across the answer's RRsets, and every
+RRset that fails hands back a reason of its own. Those two are reported
+together - to the log, and to the client as the text of the extended error - so
+a reason left over from an RRset whose verdict lost is a reason describing
+something other than why the answer was refused.
+
+The shape is an everyday one: a CNAME chain crossing zones, one of which this
+server could not reach the trust chain for while the rest are plainly unsigned.
+`Insecure` ranks below `Indeterminate`, so the status stays with the
+unreachable zone while the text follows the last RRset to fail - and the
+operator is told "unsigned zone", which reads as the benign, expected verdict,
+for a response actually refused because a lookup did not come back.
+
+The wildcard-proof loop below the same code already guards this, and for the
+same reason.
+*/
+@(test)
+test_reason_belongs_to_the_returned_verdict :: proc(t: ^testing.T) {
+	// example.com is signed, so a DNSKEY lookup that errors leaves its chain
+	// unavailable rather than broken; reddit.com has no DS in the captured set
+	// and is provably unsigned.
+	fail := Failing_Lookup {
+		name  = "example.com.",
+		type  = .DNSKEY,
+		rcode = .Serv_Fail,
+	}
+	v := make_validator(failing_query, &fail, Options{})
+	defer destroy_validator(v)
+
+	// Unsigned, and in that order: the RRset that decides the status first, the
+	// one that merely overwrote the reason second.
+	answer := make([]dns.Record, 2, context.temp_allocator)
+	answer[0] = dns.Record {
+		name  = "a.example.com.",
+		type  = .A,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_A{addr = {192, 0, 2, 1}},
+	}
+	answer[1] = dns.Record {
+		name  = "b.reddit.com.",
+		type  = .A,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_A{addr = {192, 0, 2, 2}},
+	}
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question {
+		name  = "a.example.com.",
+		type  = .A,
+		class = .IN,
+	}
+	msg := dns.Message {
+		question = question,
+		answer   = answer,
+	}
+	msg.flags.qr = true
+	msg.flags.ra = true
+
+	wire, _, enc := dns.encode_message(msg, context.temp_allocator)
+	testing.expect_value(t, enc, dns.Encode_Error.None)
+
+	result := validate(v, "a.example.com.", .A, wire, fixture_now())
+	testing.expect_value(t, result.status, Status.Indeterminate)
+	testing.expect_value(t, result.reason, "chain of trust unavailable")
+	free_all(context.temp_allocator)
+}

@@ -871,8 +871,17 @@ validate_answer :: proc(
 		}
 		checked += 1
 		if status != .Secure {
+			// The reason belongs to the verdict that is being returned, so it
+			// moves only when the verdict does - the same rule the wildcard
+			// proofs below follow. `Insecure` ranks under `Indeterminate`, so
+			// a later unsigned RRset used to leave "unsigned zone" standing
+			// beside a verdict reached because a chain could not be walked:
+			// the benign reason reported, in the log and in the client's
+			// extended error, for a refusal that was anything but.
+			if worse(worst, status) != worst {
+				reason = why
+			}
 			worst = worse(worst, status)
-			reason = why
 			continue
 		}
 		append(
