@@ -16,11 +16,19 @@ import "elodin:upstream"
 The names that are never meant to reach a public resolver.
 
 RFC 6761 reserves `localhost.`, `invalid.`, `test.` and `example.`; RFC 6762
-section 22 reserves `local.` for mDNS; RFC 7686 reserves `onion.`. Each of them
-says the same thing in slightly different words: a caching resolver should
-answer these itself and MUST NOT forward them to the public DNS. Forwarding a
-`.onion` name in particular publishes to the upstream operator that somebody on
-this network is looking for a specific hidden service.
+section 22 reserves `local.` for mDNS; RFC 7686 reserves `onion.`; RFC 8375
+section 3 reserves `home.arpa.` for a home network's own zone. Each of them says
+the same thing in slightly different words: a caching resolver should answer
+these itself and MUST NOT forward them to the public DNS. Forwarding a `.onion`
+name in particular publishes to the upstream operator that somebody on this
+network is looking for a specific hidden service, and forwarding a `home.arpa.`
+name names that network's own hardware to whoever is listening.
+
+`home.arpa.` has two shapes of its own that the others do not, both from RFC
+8375 section 4 item 4.B, and both pinned below: it is served as an empty zone
+rather than as a name that cannot exist, its parent being signed and saying it
+exists; and the `DS` at its apex is forwarded rather than answered, that proof
+living in `arpa.` and nowhere this server can reach.
 
 A mock upstream stands behind the resolver in these tests and records whether it
 was asked anything at all, which is the half of the requirement that is about
@@ -55,11 +63,16 @@ serve_leak :: proc(x: ^Leak_Mock) {
 }
 
 @(private = "file")
-leak_query :: proc(name: string, type := dns.Type.A) -> []u8 {
+leak_query :: proc(name: string, type := dns.Type.A, do_bit := false) -> []u8 {
 	questions := make([]dns.Question, 1, context.temp_allocator)
 	questions[0] = dns.Question{name = name, type = type, class = .IN}
 	msg := dns.Message{id = 0x4321, question = questions}
 	msg.flags.rd = true
+	if do_bit {
+		extra := make([]dns.Record, 1, context.temp_allocator)
+		extra[0] = dns.make_opt(1232, true)
+		msg.additional = extra
+	}
 	wire, _, err := dns.encode_message(msg, context.temp_allocator)
 	if err != .None {
 		return nil
@@ -68,17 +81,24 @@ leak_query :: proc(name: string, type := dns.Type.A) -> []u8 {
 }
 
 @(private = "file")
-leak_reply :: proc(name: string) -> []u8 {
-	answer := make([]dns.Record, 1, context.temp_allocator)
-	answer[0] = dns.Record {
-		name  = name,
-		type  = .A,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_A{addr = {203, 0, 113, 1}},
+leak_reply :: proc(name: string, type := dns.Type.A) -> []u8 {
+	// An address for an A question, and NODATA for anything else: the cases
+	// that reach this only care that the upstream answered at all, and a canned
+	// A record under a question of some other type is a reply no forwarder
+	// should accept in the first place.
+	answer := make([]dns.Record, 0, context.temp_allocator)
+	if type == .A {
+		answer = make([]dns.Record, 1, context.temp_allocator)
+		answer[0] = dns.Record {
+			name  = name,
+			type  = .A,
+			class = .IN,
+			ttl   = 60,
+			data  = dns.Rdata_A{addr = {203, 0, 113, 1}},
+		}
 	}
 	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = name, type = .A, class = .IN}
+	question[0] = dns.Question{name = name, type = type, class = .IN}
 	msg := dns.Message{question = question, answer = answer}
 	msg.flags.qr = true
 	msg.flags.rd = true
@@ -100,7 +120,16 @@ afterwards whether anything reached it. The reply it is armed with is a lie -
 back as a wrong answer as well as a leak.
 */
 @(private = "file")
-leak_server :: proc(t: ^testing.T, cfg: ^config.Config, name: string) -> (s: Server, mock: ^Leak_Mock, ok: bool) {
+leak_server :: proc(
+	t: ^testing.T,
+	cfg: ^config.Config,
+	name: string,
+	type := dns.Type.A,
+) -> (
+	s: Server,
+	mock: ^Leak_Mock,
+	ok: bool,
+) {
 	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
 	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
 		return {}, nil, false
@@ -132,7 +161,7 @@ leak_server :: proc(t: ^testing.T, cfg: ^config.Config, name: string) -> (s: Ser
 	x := new(Leak_Mock, context.temp_allocator)
 	x^ = Leak_Mock {
 		socket = socket,
-		reply  = leak_reply(name),
+		reply  = leak_reply(name, type),
 	}
 	return Server{cfg = cfg, group = group}, x, true
 }
@@ -166,6 +195,10 @@ Want :: enum {
 	// nothing of this type.
 	No_Data,
 	Nx_Domain,
+	// NOERROR carrying the empty zone's own SOA, or its own NS: the two types
+	// RFC 6303 section 3 has an apex answer rather than decline.
+	Zone_Soa,
+	Zone_Ns,
 }
 
 @(private = "file")
@@ -176,11 +209,12 @@ Leak_Case :: struct {
 	// The zone the synthesised SOA is expected to be owned by, for the cases
 	// that carry one.
 	soa:   string,
-	// Which of the two off-by-default keys the case needs. One field each rather
-	// than one for the pair: a table that answered `test.` from
+	// Which of the off-by-default keys the case needs. One field each rather
+	// than one for the set: a table that answered `test.` from
 	// `special_use.local` would be a live bug, and a shared flag would hide it.
-	local: bool,
-	test:  bool,
+	local:     bool,
+	test:      bool,
+	home_arpa: bool,
 }
 
 @(test)
@@ -204,12 +238,55 @@ test_special_use_names_are_not_sent_to_the_upstream :: proc(t: ^testing.T) {
 		// localzones.odin for why that one is asked for rather than assumed.
 		{name = "printer.local.", type = .A, want = .Nx_Domain, soa = "local.", local = true},
 		{name = "internal.test.", type = .A, want = .Nx_Domain, soa = "test.", test = true},
+		// RFC 8375 section 3, behind `special_use.home_arpa`. The SOA sits at
+		// the zone apex for the same reason `onion.`'s does, and the point of
+		// the case is the half above: the printer's name does not leave.
+		{
+			name = "printer.home.arpa.",
+			type = .A,
+			want = .Nx_Domain,
+			soa = "home.arpa.",
+			home_arpa = true,
+		},
+		// The apex is the empty zone RFC 6303 section 3 describes, which RFC
+		// 8375 section 4 item 4.B asks for here by name. NODATA rather than
+		// NXDOMAIN: `arpa.` is signed and publishes this delegation, so a
+		// client can prove the name exists, and answering that it does not
+		// would be this server contradicting a zone the client can check. It is
+		// also what the blackhole servers answer, which is what makes turning
+		// the key on a change of route rather than a change of answer.
+		{
+			name = "home.arpa.",
+			type = .A,
+			want = .No_Data,
+			soa = "home.arpa.",
+			home_arpa = true,
+		},
+		// "SOA, NS, and 'no data' responses ... as appropriate to the query
+		// type" - the two the empty zone answers rather than declines. The NS
+		// names the zone itself and has no address record anywhere, per RFC
+		// 6303 section 3, which is what aborts an UPDATE client trying to
+		// register a name into a zone nothing here serves.
+		{name = "home.arpa.", type = .SOA, want = .Zone_Soa, home_arpa = true},
+		{name = "home.arpa.", type = .NS, want = .Zone_Ns, home_arpa = true},
+		// Only the apex is the zone. A DS *below* it asks about a name that
+		// exists nowhere but this network, so that one is a name error like any
+		// other inside the zone - it is the apex DS, forwarded, that has a test
+		// of its own below.
+		{
+			name = "printer.home.arpa.",
+			type = .DS,
+			want = .Nx_Domain,
+			soa = "home.arpa.",
+			home_arpa = true,
+		},
 	}
 
 	for c in cases {
 		cfg := config.default_config()
 		cfg.special_use.local = c.local
 		cfg.special_use.test = c.test
+		cfg.special_use.home_arpa = c.home_arpa
 
 		s, x, built := leak_server(t, &cfg, c.name)
 		if !built {
@@ -255,6 +332,43 @@ test_special_use_names_are_not_sent_to_the_upstream :: proc(t: ^testing.T) {
 			testing.expectf(t, is_aaaa, "%s did not come back as an AAAA record", c.name)
 			loopback := [16]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
 			testing.expectf(t, aaaa.addr == loopback, "%s resolved to %v, not ::1", c.name, aaaa.addr)
+		case .Zone_Soa, .Zone_Ns:
+			want_type := dns.Type.SOA if c.want == .Zone_Soa else dns.Type.NS
+			testing.expectf(t, dns.rcode_of(resp) == .No_Error, "%s %v is not NOERROR", c.name, c.type)
+			if !testing.expectf(
+				t,
+				len(resp.answer) == 1,
+				"%s %v has %d answers, want 1",
+				c.name,
+				c.type,
+				len(resp.answer),
+			) {
+				continue
+			}
+			testing.expectf(
+				t,
+				resp.answer[0].type == want_type,
+				"%s %v came back as %v",
+				c.name,
+				c.type,
+				resp.answer[0].type,
+			)
+			testing.expectf(
+				t,
+				dns.name_equal_fold(resp.answer[0].name, c.name),
+				"%s %v is owned by %q",
+				c.name,
+				c.type,
+				resp.answer[0].name,
+			)
+			if ns, is_ns := resp.answer[0].data.(dns.Rdata_Name); is_ns {
+				testing.expectf(
+					t,
+					dns.name_equal_fold(ns.name, c.name),
+					"the empty zone's NS names %q rather than the zone",
+					ns.name,
+				)
+			}
 		case .No_Data, .Nx_Domain:
 			want_rcode := dns.Rcode.No_Error if c.want == .No_Data else dns.Rcode.NX_Domain
 			testing.expectf(t, dns.rcode_of(resp) == want_rcode, "%s is %v, want %v", c.name, dns.rcode_of(resp), want_rcode)
@@ -279,16 +393,22 @@ test_special_use_names_are_not_sent_to_the_upstream :: proc(t: ^testing.T) {
 /*
 The names that are still forwarded, and are meant to be.
 
-`local.` and `test.` are reserved but served for real by networks that have been
-running them for years, so they wait for `special_use.local` and
-`special_use.test`; `example.` is reserved and explicitly *not* to be treated as
-special (RFC 6761 section 6.5), its delegated subdomains being names that
-resolve. This is the case that catches a table that grew past what was argued
-for it.
+`local.`, `test.` and `home.arpa.` are reserved but served for real by networks
+that have been running them for years, so they wait for `special_use.local`,
+`special_use.test` and `special_use.home_arpa`; `example.` is reserved and
+explicitly *not* to be treated as special (RFC 6761 section 6.5), its delegated
+subdomains being names that resolve. This is the case that catches a table that
+grew past what was argued for it.
+
+`home.arpa.` matters most here. A home router authoritative for the zone is the
+deployment RFC 8375 wrote the name for, and answering it from the table by
+default would take that network's own hostnames away on an upgrade - so the
+default has to keep forwarding it, and `LOCALLY_SERVED_ZONES` is what keeps the
+router's unsigned answer from being called a forgery on the way back.
 */
 @(test)
 test_a_default_configuration_still_forwards_local_test_and_example :: proc(t: ^testing.T) {
-	names := []string{"printer.local.", "internal.test.", "www.example.com."}
+	names := []string{"printer.local.", "internal.test.", "www.example.com.", "printer.home.arpa."}
 
 	for name in names {
 		cfg := config.default_config()
@@ -308,6 +428,67 @@ test_a_default_configuration_still_forwards_local_test_and_example :: proc(t: ^t
 		testing.expectf(t, outcome == .Forwarded, "%s came back as %v rather than forwarded", name, outcome)
 	}
 	free_all(context.temp_allocator)
+}
+
+/*
+The one query `special_use.home_arpa` is not allowed to answer.
+
+RFC 8375 section 4 item 4.B carves the delegation's own `DS` out of the MUST NOT
+that keeps the rest of the zone at home: "a query for a DS record with the DO
+bit set MUST return the correct answer for that question, including correct
+information in the authority section that proves that the record is
+nonexistent", and that proof is signed and lives in `arpa.`.
+
+Answering it from the table would hand a validating client below this server a
+chain that is broken rather than one proved absent - an unsigned NXDOMAIN for a
+name whose parent publishes it - and a broken chain is Bogus, which is SERVFAIL
+for every name in the zone. That is the failure `LOCALLY_SERVED_ZONES` describes
+a home router causing, and it would be this server causing it, in the
+configuration whose whole purpose is to answer those names cleanly.
+
+Both DO settings, though the RFC only requires the one: a question whose rcode
+depended on a bit in the request would be answered wrongly in the cheaper path,
+and cached there by any downstream resolver that asked without it.
+*/
+@(test)
+test_the_home_arpa_apex_ds_is_still_forwarded :: proc(t: ^testing.T) {
+	for do_bit in ([]bool{true, false}) {
+		cfg := config.default_config()
+		cfg.special_use.home_arpa = true
+
+		s, x, built := leak_server(t, &cfg, "home.arpa.", .DS)
+		if !built {
+			return
+		}
+		defer net.close(x.socket)
+		defer upstream.destroy_group(s.group)
+
+		mock := thread.create_and_start_with_poly_data(x, serve_leak)
+		_, outcome, _ := handle_query(
+			&s,
+			leak_query("home.arpa.", .DS, do_bit),
+			.UDP,
+			"127.0.0.1:5555",
+			context.temp_allocator,
+		)
+		thread.join(mock)
+		thread.destroy(mock)
+
+		testing.expectf(
+			t,
+			x.asked,
+			"the home.arpa. DS (DO=%v) was answered from the table, leaving a validating client below with no proof",
+			do_bit,
+		)
+		testing.expectf(
+			t,
+			outcome == .Forwarded,
+			"the home.arpa. DS (DO=%v) came back as %v rather than forwarded",
+			do_bit,
+			outcome,
+		)
+		free_all(context.temp_allocator)
+	}
 }
 
 /*

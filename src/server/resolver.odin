@@ -443,6 +443,13 @@ resolve_query :: proc(
 	recursion, and this is precisely that: an answer from a table, with nowhere
 	to forward to even if the client had asked for it.
 
+	The query type reaches `special_use_zone` for one carve-out: the `DS` at the
+	apex of `home.arpa.` is forwarded even with `special_use.home_arpa` on, RFC
+	8375 section 4 item 4.B requiring the signed proof that the delegation has no
+	DS - which lives in `arpa.` - to be fetched rather than invented. It falls
+	through to the forwarding path below like any other name, where the
+	`home.arpa.` entry in `LOCALLY_SERVED_ZONES` keeps it off the chain walk.
+
 	Counted in `stats.special_use`, and shown in the query log as `outcome=local
 	detail=special-use`. That is a departure from `answer_chaos` and the DDR
 	probe, which are answered from here too and counted nowhere: those two are a
@@ -450,7 +457,7 @@ resolve_query :: proc(
 	one thing here an operator has a reason to watch, and the counter is the only
 	way to see it without running the query log.
 	*/
-	if zone, kind := special_use_zone(s, q.name); kind != .None {
+	if zone, kind := special_use_zone(s, q.name, q.type); kind != .None {
 		out := answer_special_use(msg, q, zone, kind, allocator, limit)
 		sync.atomic_add(&s.stats.special_use, 1)
 		log_query(s, client, proto, q, .Local, "special-use", started)
