@@ -1329,7 +1329,12 @@ test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
 	sending half still open, which is what the docstring above means by nothing
 	but that wait ending the drain.
 	*/
-	_ = net.shutdown(client, .Send)
+	// Kept rather than discarded. This is the first operation on `client` after
+	// whatever the teardown does to the connection, so on a failing run it is where
+	// a pending `ECONNRESET` is consumed - which is why the read below then saw the
+	// socket's *second* reading, `Not_Connected`, rather than the first. Naming it
+	// lets the final check report whether the reset had already arrived by here.
+	shutdown_err := net.shutdown(client, .Send)
 
 	/*
 	The assertion, taken before the close it is about: read to the end of what the
@@ -1339,28 +1344,43 @@ test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
 	sending an RST instead of a FIN.
 
 	Read to a clean EOF rather than to one read returning nothing, which is what
-	this used to do and is where its last flakiness lived. `conn_read` reports a
-	receive timeout and an orderly shutdown the same way - `ok = false`, because it
-	asks only for `got > 0` - so a body that had not yet landed within the wait was
-	read as a queue that was empty, and the close then met the bytes and took the
-	400 with it in an RST. The failure named the close and said nothing about the
-	body, because by its own reading there was no body to name. A `recv` returning
-	zero with no error cannot be faked by a slow sender: the FIN is queued behind
-	everything the client wrote, so reaching it means every byte before it has
-	already been read here.
+	this used to do and is where an earlier round of flakiness lived. `conn_read`
+	reports a receive timeout and an orderly shutdown the same way - `ok = false`,
+	because it asks only for `got > 0` - so a body that had not yet landed within
+	the wait was read as a queue that was empty, and the close then met the bytes
+	and took the 400 with it in an RST. A `recv` returning zero with no error
+	cannot be faked by a slow sender: the FIN is queued behind everything the
+	client wrote, so reaching it means every byte before it has already been read
+	here.
 
-	The timeout is a guard against a hang rather than the mechanism, which is why
+	`Not_Connected` and the `Connection_Closed` that precedes it name a socket the
+	peer reset, not bytes still on their way, and they are the end of the read, not
+	a failure of it. The verdict is `behind`, which counts bytes, and a client that
+	gave up mid-body reaches this loop as data followed by the FIN of its
+	`shutdown(.Send)` - counted and caught below - never as an RST, because this
+	test's client only ever shuts its sending half down. An RST here is the
+	teardown's own doing rather than the drain's, it flushes the receive queue as it
+	lands so there is nothing left to measure, and taking it as the errno-shaped
+	verdict is what let the suite stop on a socket state while saying nothing about
+	the body. See the note on `Not_Connected` in issue #197: it is `recv` on a
+	socket already torn down, distinct from the receive timeout, which surfaces as
+	`Would_Block` on Linux and is a body that never arrived at all - a real hang,
+	and still a failure that says so.
+
+	The timeout is that guard against a hang rather than the mechanism, which is why
 	it is generous and why it is written out rather than derived from
 	`HTTP_LINGER_BODY_IDLE`: read for as long as the drain waits and a shortened
 	drain would be measured with the same short ruler that shortened it, which is a
-	check that agrees with whatever the constant says. Anything it does catch is a
-	body that never arrived at all, and it says so in those words.
+	check that agrees with whatever the constant says.
 	*/
 	_ = net.set_option(accepted, .Receive_Timeout, 3 * time.Second)
 	behind := 0
 	for {
 		leftover: [4096]u8
 		n, rerr := net.recv_tcp(accepted, leftover[:])
+		if rerr == .Not_Connected || rerr == .Connection_Closed {
+			break
+		}
 		if rerr != nil {
 			testing.expectf(t, false, "the client's bytes never finished arriving: %v", rerr)
 			return
@@ -1379,10 +1399,23 @@ test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
 
 	net.close(accepted)
 
+	/*
+	And the consequence: the status the drain protected has to be the thing the
+	client reads back. The verdict is the bytes, not the socket's state - so a reset
+	ends this read the same way an EOF does and lets the prefix check below speak. A
+	400 the client had already taken off the wire before the connection went down
+	survives in `reply` and passes; a 400 an RST discarded before it was read leaves
+	`reply` empty and fails, naming what was read and whether `shutdown` had already
+	seen the reset. Only a receive timeout - `Would_Block`, a 400 that never came at
+	all - is the hard failure here.
+	*/
 	reply := make([dynamic]u8, 0, 4096, context.temp_allocator)
 	for len(reply) < 4096 {
 		chunk: [512]u8
 		n, rerr := net.recv_tcp(client, chunk[:])
+		if rerr == .Not_Connected || rerr == .Connection_Closed {
+			break
+		}
 		if rerr != nil {
 			testing.expectf(t, false, "the answer did not survive the close: %v", rerr)
 			return
@@ -1395,8 +1428,9 @@ test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
 	testing.expectf(
 		t,
 		strings.has_prefix(string(reply[:]), "HTTP/1.1 400 "),
-		"the client read %q, expected the 400 that was written",
+		"the client read %q (shutdown reported %v), expected the 400 that was written",
 		string(reply[:min(len(reply), 40)]),
+		shutdown_err,
 	)
 	free_all(context.temp_allocator)
 }
