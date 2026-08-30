@@ -614,6 +614,32 @@ and BIND ship. Configuring a `trust_anchors` entry that covers one of these zone
 turns that off for it: an operator who signs their own reverse space and anchors
 it is asking for it to be validated, and elodin then does.
 
+`home.arpa` is treated the same way, though what breaks there is not quite what
+breaks above it. RFC 8375 reserved it as the name a home network uses for its own
+zone, and `arpa` does delegate it — to the blackhole servers, with no DS, and the
+delegation itself is signed. A validator that asks `arpa` therefore learns the
+zone is insecure and serves the router's unsigned answer unvalidated, which is
+the right answer; against a public upstream that is what happens today.
+
+It breaks when the upstream *is* the router that answers the zone. Being
+authoritative for `home.arpa`, it answers the `home.arpa DS` query from its own
+zone rather than forwarding it to `arpa`, so the proof that the delegation is
+insecure never comes back. The chain is then broken rather than provably absent,
+which is Bogus — and `printer.home.arpa` is a SERVFAIL rather than the printer,
+in exactly the home network RFC 8375 wrote the name for. elodin stops asking:
+those names are served insecure, without the AD bit, and a `trust_anchors` entry
+over the zone turns that off exactly as it does for the reverse zones. Nothing
+under `home.arpa` can be secure in any case, the delegation having no DS by
+design, so there is no chain being given up.
+
+The query is still forwarded: elodin has no per-domain upstream to send it to a
+local authority instead, so a network with nothing answering for `home.arpa`
+still gets NXDOMAIN from wherever `upstream.servers` points. One thing to know if
+you run the zone: its answers carry private addresses, which
+[rebind protection](#dns-rebinding-protection) filters unless `home.arpa` is
+named in `rebind.allow_domains`. The reverse zones never trip that guard, a PTR
+not being an address.
+
 Queries for `resolver.arpa` are answered here rather than forwarded. That name
 is where a client looks for the encrypted endpoints of the resolver it is
 already using — RFC 9462's Discovery of Designated Resolvers, an SVCB lookup for

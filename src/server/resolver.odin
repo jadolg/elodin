@@ -461,13 +461,16 @@ resolve_query :: proc(
 	// think of it, so validation is skipped - and the answer is kept apart in
 	// the cache so it cannot be served to a client that did want it checked.
 	//
-	// The RFC 6303 locally-served zones - the reverse trees for private,
-	// link-local and loopback space - are skipped too. Nothing on the public
-	// Internet signs them, so their unsigned local answers have no chain to
-	// check and validating one only turns a LAN PTR lookup into SERVFAIL. They
-	// are served as insecure, which is what `settle_ad_bit` records once
-	// `validating` is off - unless the operator anchored the zone themselves, in
-	// which case that request to validate it wins and the bypass stands down.
+	// The locally-served zones are skipped too. Nothing on the public Internet
+	// signs the RFC 6303 reverse trees for private, link-local and loopback
+	// space, so their unsigned local answers have no chain to check and
+	// validating one only turns a LAN PTR lookup into SERVFAIL. RFC 8375's
+	// `home.arpa.` is delegated insecure and would validate on its own, but the
+	// router that answers the zone swallows the `DS` query that proves it,
+	// breaking the walk the same way. Both are served as insecure, which is what
+	// `settle_ad_bit` records once `validating` is off - unless the operator
+	// anchored the zone themselves, in which case that request to validate it
+	// wins and the bypass stands down.
 	//
 	// `special_use_deferred` is the forward-side case of the same thing: a
 	// `.onion` name an operator handed to a Tor-aware upstream with

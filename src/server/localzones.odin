@@ -4,13 +4,14 @@ import "core:mem"
 import "elodin:dns"
 
 /*
-The reverse-DNS zones that name private, link-local and loopback address space.
+The zones a network serves for itself, which nothing on the public Internet
+answers for or signs.
 
-These are the zones RFC 6303 ("Locally Served DNS Zones") lists: the reverse
-trees for the RFC 1918 private ranges, RFC 3927 IPv4 link-local, RFC 4193 IPv6
-unique-local, RFC 4291 IPv6 link-local, and loopback. They exist only inside a
-network, so no authoritative server on the public Internet answers for them and
-none ever signs them.
+Most of them are the zones RFC 6303 ("Locally Served DNS Zones") lists: the
+reverse trees for the RFC 1918 private ranges, RFC 3927 IPv4 link-local, RFC
+4193 IPv6 unique-local, RFC 4291 IPv6 link-local, and loopback. They exist only
+inside a network, so no authoritative server on the public Internet answers for
+them and none ever signs them.
 
 A validating forwarder must not hold them to the public chain of trust. The
 answer for such a name comes from whatever resolves the site's own reverse
@@ -35,6 +36,47 @@ purpose: the TEST-NET reverse zones and the IPv6 loopback/unspecified zones are
 not names a running network resolves, and CGNAT space (100.64/10, RFC 6598,
 added after RFC 6303) is delegated in the public tree rather than served
 locally. None of them are the failure this addresses.
+
+`home.arpa.` is the one forward name in the list, and what goes wrong there is
+not what goes wrong above it. `arpa.` does delegate it: RFC 8375 section 7 had
+IANA put it in the zone, NS to the blackhole servers and deliberately no DS. The
+delegation is signed, so the NSEC at `home.arpa.` proves the DS is missing and a
+validator that reads it concludes insecure, which is the right answer and the
+end of the matter. Ask a public resolver for `printer.home.arpa` and that is
+what happens today.
+
+It breaks when the upstream is the thing that answers the zone. A home router
+authoritative for `home.arpa.` treats every name inside it as its own, so the
+`home.arpa. DS` a validator sends to learn the delegation is insecure is
+answered from the router's own zone - NODATA, no NSEC, nothing signed - rather
+than forwarded to `arpa.` where the proof lives. The proof never arrives, so the
+chain is broken rather than provably absent, and a broken chain is Bogus:
+SERVFAIL for a client asking where its own printer is. That deployment is the
+one RFC 8375 wrote the name for, and the only one where the name fails.
+
+The upstream is what is wrong there, and what this can do about it is stop
+asking. Nothing under `home.arpa.` is ever secure - the delegation carries no DS
+by design, so there is no chain to be deprived of - and skipping the walk
+reaches the same insecure verdict the public path reaches, without needing the
+upstream to cooperate in proving it. RFC 8375 section 5 asks a resolver that
+supports the name for that outcome.
+
+Nothing about this is special to `home.arpa.`, which is worth knowing before the
+next one arrives: any upstream authoritative for a forward zone that answers DS
+queries inside it from its own data breaks a chain the same way, `corp.example`
+and a site's internal `.test` included. `home.arpa.` is the case that can be
+listed here rather than configured, being the one such zone an RFC names.
+
+What this does not do is keep the query at home. `home.arpa.` is still forwarded
+to whatever `upstream.servers` names, so a network with no local authority for
+it still sends those names out - and gets the blackhole servers' NXDOMAIN back,
+insecure and correct, exactly as it did before this entry existed. The two
+halves do not overlap: where this entry changes a verdict the router answered
+and nothing left the building, and where the names leak the chain already
+worked. Closing the leak needs somewhere else to send them - a per-domain
+upstream this server does not have - and answering the zone from the forward
+table instead would break the deployment RFC 8375 wrote it for, which is the
+same argument that keeps `local.` and `test.` forwarded by default.
 
 The bypass is off, though, for a name an operator has anchored themselves. A
 site that signs its own reverse space and configures a trust anchor over it is
@@ -74,6 +116,8 @@ LOCALLY_SERVED_ZONES := [?]string {
 	"9.e.f.ip6.arpa.",
 	"a.e.f.ip6.arpa.",
 	"b.e.f.ip6.arpa.",
+	// RFC 8375's forward zone for a home network's own names.
+	"home.arpa.",
 }
 
 /*

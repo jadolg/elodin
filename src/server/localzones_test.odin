@@ -3,7 +3,7 @@ package server
 import "core:testing"
 
 /*
-The gate that keeps RFC 6303 locally-served names off the public chain of trust.
+The gate that keeps locally-served names off the public chain of trust.
 
 `is_locally_served` is the whole of the decision - once it answers, `validating`
 follows - so the cases that matter are the boundaries: the reported name, the
@@ -103,5 +103,54 @@ test_label_boundary_is_respected :: proc(t: ^testing.T) {
 		t,
 		!is_locally_served("evil168.192.in-addr.arpa."),
 		"a name that only shares a string suffix is not inside the zone",
+	)
+}
+
+@(test)
+test_home_arpa_is_locally_served :: proc(t: ^testing.T) {
+	// RFC 8375's forward zone. `arpa` delegates it insecure, so a resolver that
+	// reaches `arpa` for the proof settles it there - but the router that
+	// answers the zone answers the `DS` query out of it too, so the proof never
+	// arrives and the broken chain is a SERVFAIL for the printer. Not walking
+	// it at all is the way past that.
+	testing.expect(
+		t,
+		is_locally_served("printer.home.arpa."),
+		"a name in the home network's own zone must skip validation",
+	)
+	testing.expect(t, is_locally_served("home.arpa."), "the zone's apex is inside it")
+	testing.expect(t, is_locally_served("HOME.ARPA."), "the match must be case-insensitive")
+	// The label-break rule, and the parent that is genuinely public.
+	testing.expect(
+		t,
+		!is_locally_served("nothome.arpa."),
+		"a name that only shares a string suffix is not inside the zone",
+	)
+	testing.expect(t, !is_locally_served("arpa."), "the signed parent stays validated")
+	testing.expect(
+		t,
+		!is_locally_served("2.0.192.in-addr.arpa."),
+		"a public reverse name under arpa stays validated",
+	)
+}
+
+@(test)
+test_home_arpa_anchor_defers_the_bypass :: proc(t: ^testing.T) {
+	// An operator who signs their own home zone and anchors it locally - what
+	// RFC 8375 section 5 leaves them - is asking for it to be validated, and
+	// the bypass has to stand down exactly as it does on the reverse side.
+	s := Server {
+		anchor_zones = []string{"home.arpa."},
+	}
+	testing.expect(
+		t,
+		covered_by_local_anchor(&s, "printer.home.arpa."),
+		"an anchor over the home zone puts a name inside it back under validation",
+	)
+	testing.expect(t, covered_by_local_anchor(&s, "home.arpa."), "the anchored apex is covered")
+	testing.expect(
+		t,
+		!covered_by_local_anchor(&s, "nothome.arpa."),
+		"a string suffix of the anchored zone is not covered",
 	)
 }
