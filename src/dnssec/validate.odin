@@ -265,7 +265,7 @@ validate_answer :: proc(
 ) -> Result {
 	worst := Status.Secure
 	reason: string
-	wildcard_seen := false
+	expansions := make([dynamic]Wildcard_Expansion, 0, 1, allocator)
 	checked := 0
 
 	seen := make([dynamic]dns.Question, 0, len(msg.answer), allocator)
@@ -281,7 +281,7 @@ validate_answer :: proc(
 		records := records_of(msg.answer, rec.name, rec.type, class, allocator)
 		sigs := sigs_covering(msg.answer, rec.name, rec.type, class, allocator)
 
-		status, wildcard, why := validate_rrset(v, budget, rec.name, rec.type, class, records, sigs, unix, now, allocator)
+		status, encloser, why := validate_rrset(v, budget, rec.name, rec.type, class, records, sigs, unix, now, allocator)
 		/*
 		A CNAME carrying no signature at all may be one a DNAME produced rather
 		than one a zone forgot to sign. RFC 6672 section 3.4.1 has the server
@@ -299,7 +299,9 @@ validate_answer :: proc(
 				why = ""
 			}
 		}
-		wildcard_seen ||= wildcard
+		if encloser != "" {
+			append(&expansions, Wildcard_Expansion{owner = rec.name, encloser = encloser})
+		}
 		checked += 1
 		if status != .Secure {
 			worst = worse(worst, status)
@@ -335,11 +337,17 @@ validate_answer :: proc(
 	A wildcard answer is only good if the name really had nothing of its own.
 	Without this an attacker holding one wildcard signature could serve it for
 	names the zone answers for directly.
+
+	Every expanded RRset is asked for separately. A CNAME chain can be answered
+	partly from real records and partly from a wildcard, and the one that was
+	expanded is not always the one carrying the question's own name.
 	*/
-	if worst == .Secure && wildcard_seen {
-		proof := validate_wildcard_proof(v, budget, msg, qname, class, unix, now, allocator)
-		if proof != .Secure {
-			return {proof, "wildcard expansion not proven"}
+	if worst == .Secure {
+		for e in expansions {
+			proof := validate_wildcard_proof(v, budget, msg, e.owner, e.encloser, class, unix, now, allocator)
+			if proof != .Secure {
+				return {proof, "wildcard expansion not proven"}
+			}
 		}
 	}
 	return {worst, reason}
@@ -413,8 +421,11 @@ validate_denial :: proc(
 /*
 Check one RRset.
 
-Returns the wildcard flag as well, because a wildcard-expanded answer needs a
-denial proof of its own that only the caller can assemble.
+Returns the closest encloser a wildcard expansion claimed, empty when the
+signature was made over the owner name itself. A wildcard-expanded answer needs
+a denial proof of its own that only the caller can assemble, and that proof is
+about the name the asterisk stood in for, so the caller has to be told which
+name that was rather than merely that there was one.
 */
 @(private)
 validate_rrset :: proc(
@@ -430,7 +441,7 @@ validate_rrset :: proc(
 	allocator: mem.Allocator,
 ) -> (
 	status: Status,
-	wildcard: bool,
+	encloser: string,
 	reason: string,
 ) {
 	/*
@@ -481,11 +492,11 @@ validate_rrset :: proc(
 	owner_status, _, _ := zone_trust(v, budget, owner, now, allocator)
 	switch owner_status {
 	case .Insecure:
-		return .Insecure, false, "unsigned zone"
+		return .Insecure, "", "unsigned zone"
 	case .Indeterminate:
-		return .Indeterminate, false, "chain of trust unavailable"
+		return .Indeterminate, "", "chain of trust unavailable"
 	case .Bogus:
-		return .Bogus, false, "broken chain of trust"
+		return .Bogus, "", "broken chain of trust"
 	case .Secure:
 	}
 
@@ -503,7 +514,7 @@ validate_rrset :: proc(
 	point of the second algorithm, inverted.
 	*/
 	if unsupported {
-		return .Bogus, false, "no signature this build can verify"
+		return .Bogus, "", "no signature this build can verify"
 	}
 
 	/*
@@ -520,9 +531,9 @@ validate_rrset :: proc(
 	DS instead.
 	*/
 	if refused {
-		return .Insecure, false, "algorithm refused by local policy"
+		return .Insecure, "", "algorithm refused by local policy"
 	}
-	return .Bogus, false, missing
+	return .Bogus, "", missing
 }
 
 /*
@@ -543,16 +554,16 @@ check_signature :: proc(
 	allocator: mem.Allocator,
 ) -> (
 	result: Verify_Result,
-	wildcard: bool,
+	encloser: string,
 ) {
 	if !signature_current(sig, unix) {
-		return .Bad, false
+		return .Bad, ""
 	}
 	// A zone may only sign what is inside it. Without this a zone could vouch
 	// for names it has no authority over, which is the whole point of the
 	// hierarchy.
 	if !name_in_zone(owner, sig.signer) {
-		return .Bad, false
+		return .Bad, ""
 	}
 	/*
 	RFC 4034 section 3.1.3 counts the Labels field without a leading `*`, so a
@@ -561,27 +572,31 @@ check_signature :: proc(
 	the `*` would make a correct signature look one label short, which is the
 	mark of a wildcard expansion, and the answer would be sent off for a proof
 	that the name does not exist. It plainly does.
+
+	Only the count the Labels field is compared against drops the asterisk. The
+	name still has that label, so reconstructing an encloser out of it has to
+	walk the labels the name actually carries.
 	*/
 	owner_labels := label_count(owner)
-	if strings.has_prefix(owner, "*.") {
-		owner_labels -= 1
-	}
+	signed_labels := owner_labels - 1 if strings.has_prefix(owner, "*.") else owner_labels
 	signer_labels := label_count(sig.signer)
-	if int(sig.labels) > owner_labels || int(sig.labels) < signer_labels {
-		return .Bad, false
+	if int(sig.labels) > signed_labels || int(sig.labels) < signer_labels {
+		return .Bad, ""
 	}
 
 	// Fewer labels than the owner name means the zone answered from a wildcard,
 	// and the signature was made over that wildcard rather than over the name.
+	// The name the asterisk stood in for is the closest encloser the answer
+	// claims, which is what the caller has to see a denial proof lined up with.
 	signing_owner := owner
-	if int(sig.labels) < owner_labels {
-		signing_owner = wildcard_of(name_drop_labels(owner, owner_labels - int(sig.labels)), allocator)
-		wildcard = true
+	if int(sig.labels) < signed_labels {
+		encloser = name_drop_labels(owner, owner_labels - int(sig.labels))
+		signing_owner = wildcard_of(encloser, allocator)
 	}
 
 	data, built := signing_input(sig, signing_owner, class, records, allocator)
 	if !built {
-		return .Bad, wildcard
+		return .Bad, encloser
 	}
 
 	unsupported := false
@@ -592,7 +607,7 @@ check_signature :: proc(
 		}
 		switch verify_signature(sig.algorithm, key.public_key, sig.signature, data, allocator) {
 		case .Ok:
-			return .Ok, wildcard
+			return .Ok, encloser
 		case .Unsupported:
 			unsupported = true
 		case .Refused:
@@ -604,55 +619,78 @@ check_signature :: proc(
 	// key we cannot read at all says more than one the library declined to run.
 	switch {
 	case unsupported:
-		return .Unsupported, wildcard
+		return .Unsupported, encloser
 	case refused:
-		return .Refused, wildcard
+		return .Refused, encloser
 	}
-	return .Bad, wildcard
+	return .Bad, encloser
+}
+
+// One RRset an answer expanded from a wildcard, and the closest encloser that
+// expansion claims - the immediate ancestor of the generating wildcard.
+@(private)
+Wildcard_Expansion :: struct {
+	owner:    string,
+	encloser: string,
 }
 
 /*
 Prove that a wildcard was allowed to answer.
 
-The zone has to show that the queried name has nothing of its own, which is the
-same denial of existence a NODATA answer would carry, in the authority section
-alongside the answer.
+RFC 5155 section 8.8: the verified RRset is what hands the validator a closest
+encloser, that encloser being the immediate ancestor of the wildcard that signed
+it, and what the zone then has to show is an NSEC or NSEC3 covering the "next
+closer" name - the ancestor of `owner` one label below the encloser. That is the
+half saying no closer name exists, so the wildcard really was what applied.
+
+Deriving the encloser from the denial records instead would let the sender pick
+it. Given a zone holding `*.example.com.` and a real `y.example.com.`, an
+attacker can pair a genuine wildcard-signed RRset with the genuine NSEC3s from
+an NXDOMAIN for `x.y.example.com.` - one matching `y.example.com.`, one covering
+`x.y.example.com.` - and a walk up from the name stops at that match and asks
+only for the cover it was handed. The signature reconstructs `*.example.com.`,
+so it verifies, and an NXDOMAIN becomes a `Secure` answer. Taking the encloser
+from the signature's own label count is what rules that out: the wildcard names
+`example.com.`, so the name to see covered is `y.example.com.`, which exists.
 */
 @(private)
 validate_wildcard_proof :: proc(
 	v: ^Validator,
 	budget: ^Budget,
 	msg: dns.Message,
-	qname: string,
+	owner, encloser: string,
 	class: dns.Class,
 	unix: u32,
 	now: time.Time,
 	allocator: mem.Allocator,
 ) -> Status {
-	// Established from the queried name, for the same reason as the denial path.
-	status, keys, established := zone_trust(v, budget, qname, now, allocator)
+	// Established from the expanded name, for the same reason as the denial path.
+	status, keys, established := zone_trust(v, budget, owner, now, allocator)
 	if status != .Secure {
 		return status
 	}
+	next_closer := name_drop_labels(owner, label_count(owner) - label_count(encloser) - 1)
+	// The denial records were verified against `established`, so a name outside
+	// it is not theirs to speak for - a hash of one landing in some span of the
+	// zone would say nothing at all.
+	if !name_in_zone(next_closer, established) {
+		return .Bogus
+	}
 	nsecs, nsec3s := validated_denial_records(v, msg.authority, established, class, keys, unix, now, allocator)
 	if len(nsecs) > 0 {
-		if _, covered := nsec_covering(nsecs, qname); covered {
+		if _, covered := nsec_covering(nsecs, next_closer); covered {
 			return .Secure
 		}
 	}
 	if len(nsec3s) > 0 {
-		/*
-		Identifying the closest encloser is not the proof - RFC 5155 section
-		7.2.6 also demands an NSEC3 that covers the next closer name, which is
-		what says the queried name itself has nothing of its own. Stopping at
-		`ce_ok` would accept any wildcard-signed RRset offered for the wrong
-		name as long as the response carried some unrelated NSEC3 that
-		happened to match an ancestor of it.
-		*/
-		if _, next_closer, ce_ok := nsec3_closest_encloser(nsec3s, qname, established, v.max_nsec3_iterations); ce_ok {
-			if _, covered := nsec3_covering(nsec3s, next_closer, v.max_nsec3_iterations); covered {
-				return .Secure
+		if cover, covered := nsec3_covering(nsec3s, next_closer, v.max_nsec3_iterations); covered {
+			// RFC 5155 section 9.2 forbids the AD bit over an opt-out cover:
+			// the span may be hiding an unsigned delegation, so the next closer
+			// name is not proven absent and the wildcard may not have applied.
+			if cover.rr.flags & NSEC3_FLAG_OPT_OUT != 0 {
+				return .Insecure
 			}
+			return .Secure
 		}
 	}
 	return .Bogus

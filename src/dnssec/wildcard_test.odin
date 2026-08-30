@@ -8,21 +8,21 @@ import "elodin:dns"
 /*
 A synthetic NSEC3 zone reproducing a shape real traffic actually sends:
 `oisd.nl` answers every name under it from an apex wildcard (`*.oisd.nl.`) and,
-per RFC 5155 section 7.2.6, proves the wildcard was allowed to answer with a
-single NSEC3 RR covering the "next closer" name - no separate NSEC3 matching
-the closest encloser, because the closest encloser here is the zone apex,
-already proven to exist by the chain of trust that got this far. Quad9
+per RFC 5155 sections 7.2.6 and 8.8, proves the wildcard was allowed to answer
+with a single NSEC3 RR covering the "next closer" name - no separate NSEC3
+matching the closest encloser, that encloser being named by the wildcard the
+signature was made over rather than searched for among the records. Quad9
 validates that exact response and sets the AD bit.
 
 Generated rather than captured, for the same reason as `dname_test.odin`:
 reproducibility, and a signature window that does not rot. Ed25519 throughout,
 root replaced by a trust anchor of its own. `wc_wildcard_answer` is the
 single-NSEC3 proof shape above, for `sub.wildcardtest.`; `wc_wildcard_answer_no_cover`
-is the attack the closest-encloser check exists to stop - a wildcard-signed
-RRset for `other.wildcardtest.` beside an NSEC3 that matches the zone apex
-(satisfying a closest-encloser check alone) but covers nothing near
-`other.wildcardtest.`, so the "next closer does not exist" half of the proof
-was never supplied.
+is the attack the proof exists to stop - a wildcard-signed RRset for
+`other.wildcardtest.` beside an NSEC3 that matches the zone apex but covers
+nothing near `other.wildcardtest.`, so the "next closer does not exist" half was
+never supplied. `closest_encloser_test.odin` covers the other half, where the
+records do carry a cover but for the next closer of a different wildcard.
 */
 
 @(private = "file")
@@ -174,12 +174,12 @@ test_wildcard_answer_with_apex_closest_encloser_validates :: proc(t: ^testing.T)
 	`sub.wildcardtest.` does not exist; `*.wildcardtest.` answers for it. The
 	zone proves that the way oisd.nl's nameserver does for names under it: one
 	NSEC3 RR covering `sub.wildcardtest.` (the next closer name), and nothing
-	matching `wildcardtest.` itself - the apex's existence already follows
-	from the chain of trust that reached it. A validator that insists on an
-	in-band NSEC3 match for the apex rejects this as bogus even though it is a
-	sound proof and every other validator accepts it (confirmed against
-	Quad9's live answer for big.oisd.nl, which sets the AD bit on exactly this
-	shape).
+	matching `wildcardtest.` itself - the closest encloser is the apex, which
+	the signature's own label count already names. A validator that goes
+	looking for an in-band NSEC3 match for it instead rejects this as bogus
+	even though it is a sound proof and every other validator accepts it
+	(confirmed against Quad9's live answer for big.oisd.nl, which sets the AD
+	bit on exactly this shape).
 	*/
 	v := wildcard_validator()
 	testing.expect(t, v != nil, "the anchor should parse")
@@ -199,13 +199,11 @@ test_wildcard_answer_with_apex_closest_encloser_validates :: proc(t: ^testing.T)
 @(test)
 test_wildcard_answer_without_next_closer_cover_is_bogus :: proc(t: ^testing.T) {
 	/*
-	The attack the wildcard proof exists to stop, and the other half of the
-	same bug: an NSEC3 RR that matches the zone apex exactly satisfies a
-	closest-encloser check on its own, but proves nothing about whether
-	`other.wildcardtest.` itself has a real record. Skipping the "next closer
-	is covered" check would let this wildcard-signed RRset - genuinely signed,
-	just for the wrong name - stand in for any name in the zone, including
-	ones with real records of their own.
+	The attack the wildcard proof exists to stop: an NSEC3 RR matching the zone
+	apex proves nothing about whether `other.wildcardtest.` itself has a real
+	record. Skipping the "next closer is covered" check would let this
+	wildcard-signed RRset - genuinely signed, just for the wrong name - stand
+	in for any name in the zone, including ones with real records of their own.
 	*/
 	v := wildcard_validator()
 	testing.expect(t, v != nil, "the anchor should parse")
@@ -220,8 +218,8 @@ test_wildcard_answer_without_next_closer_cover_is_bogus :: proc(t: ^testing.T) {
 	)
 	testing.expectf(
 		t,
-		result.status != .Secure,
-		"a wildcard answer whose next-closer name was never covered was accepted (%v, %q)",
+		result.status == .Bogus,
+		"a wildcard answer whose next-closer name was never covered should be bogus, got %v (%q)",
 		result.status,
 		result.reason,
 	)

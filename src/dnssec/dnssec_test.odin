@@ -1013,8 +1013,8 @@ test_literal_wildcard_name_is_not_an_expansion :: proc(t: ^testing.T) {
 
 	// No keys, so this cannot verify - the verdict is not what is under test.
 	// What matters is whether it was read as a wildcard expansion.
-	_, wildcard := check_signature(sig, "*.example.com.", .IN, records, nil, u32(FIXTURE_TIME), context.temp_allocator)
-	testing.expect(t, !wildcard, "a literal wildcard name was taken for a wildcard expansion")
+	_, encloser := check_signature(sig, "*.example.com.", .IN, records, nil, u32(FIXTURE_TIME), context.temp_allocator)
+	testing.expect(t, encloser == "", "a literal wildcard name was taken for a wildcard expansion")
 	free_all(context.temp_allocator)
 }
 
