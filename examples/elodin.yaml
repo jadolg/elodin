@@ -418,6 +418,18 @@ rebind:
 # down keeps its answer; what a rewrite cannot do is forward the query on to your
 # router, which is why these are settings rather than something to work around.
 #
+# home.arpa is the same shape as those two, and the one that is about privacy
+# rather than a wrong answer. RFC 8375 reserved it for a home network's own zone
+# and section 5 says not to send those queries to the public DNS, but a router
+# that is authoritative for it needs them forwarded to answer them — so this is
+# off, and turning it on says nothing here serves the zone. With it off the
+# names still leave, and get the blackhole servers' NXDOMAIN back; with it on
+# they are answered here and your printer's name stays on your network. Either
+# way elodin keeps home.arpa out of the public chain of trust, so a router's
+# unsigned answer is served insecure rather than as a SERVFAIL. Sending the
+# query to your router instead would need a per-domain upstream, which this
+# resolver does not have.
+#
 # example. is deliberately not in the set: RFC 6761 6.5 asks resolvers *not* to
 # treat it specially, example.com and its siblings being delegated names that do
 # resolve.
@@ -426,6 +438,7 @@ special_use:
   onion: true
   local: false
   test: false
+  home_arpa: false
 
 # Prometheus. Off by default: a resolver that opens a port nobody asked for has
 # widened your exposure on your behalf.

@@ -248,14 +248,19 @@ test_special_use_defaults_and_overrides :: proc(t: ^testing.T) {
 	// the table in the server package for the argument.
 	testing.expect(t, !cfg.special_use.local, "local. should be forwarded by default")
 	testing.expect(t, !cfg.special_use.test, "test. should be forwarded by default")
+	// Off for the same reason, and with the leak that costs written down in the
+	// type: a router authoritative for the zone needs the query forwarded.
+	testing.expect(t, !cfg.special_use.home_arpa, "home.arpa. should be forwarded by default")
 
-	src := "upstream:\n  servers: [1.1.1.1]\nspecial_use:\n  onion: false\n  local: true\n  test: true\n"
+	src :=
+		"upstream:\n  servers: [1.1.1.1]\nspecial_use:\n  onion: false\n  local: true\n  test: true\n  home_arpa: true\n"
 	tuned, terr := load_string(src, context.temp_allocator)
 	testing.expect(t, terr == nil, "expected a clean load")
-	testing.expect(t, tuned.special_use.enabled, "special_use.enabled should survive the other three being set")
+	testing.expect(t, tuned.special_use.enabled, "special_use.enabled should survive the other four being set")
 	testing.expect(t, !tuned.special_use.onion, "special_use.onion: false should be honoured")
 	testing.expect(t, tuned.special_use.local, "special_use.local: true should be honoured")
 	testing.expect(t, tuned.special_use.test, "special_use.test: true should be honoured")
+	testing.expect(t, tuned.special_use.home_arpa, "special_use.home_arpa: true should be honoured")
 
 	off, oerr := load_string(
 		"upstream:\n  servers: [1.1.1.1]\nspecial_use:\n  enabled: false\n",
@@ -275,6 +280,16 @@ test_special_use_extras_need_the_table :: proc(t: ^testing.T) {
 	e, has := err.?
 	testing.expect(t, has, "expected an error for local without enabled")
 	testing.expect_value(t, len(e.messages), 1)
+
+	// `home_arpa` is in the same check, and is the one where the misreading
+	// costs the most: it exists to stop a leak, so an operator who wrote it down
+	// under `enabled: false` believes their own hostnames are staying on the
+	// network while they are being forwarded.
+	hsrc := "upstream:\n  servers: [1.1.1.1]\nspecial_use:\n  enabled: false\n  home_arpa: true\n"
+	_, herr := load_string(hsrc, context.temp_allocator)
+	he, has_h := herr.?
+	testing.expect(t, has_h, "expected an error for home_arpa without enabled")
+	testing.expect_value(t, len(he.messages), 1)
 
 	// `onion` is not part of that check and must not be: it is on by default, so
 	// turning the table off without mentioning it is the ordinary way to do it

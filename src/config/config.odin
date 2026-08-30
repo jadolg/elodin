@@ -516,24 +516,36 @@ forwarded. `localzones.odin` in the server package holds the table and argues
 which names are in it.
 
 `enabled` is the whole table. `localhost.` and `invalid.` have no key of their
-own under it and are not meant to grow one; the three that do - `onion.`,
-`local.` and `test.` - each name a deployment where the upstream really is the
-right place to ask.
+own under it and are not meant to grow one; the four that do - `onion.`,
+`local.`, `test.` and `home.arpa.` - each name a deployment where the upstream
+really is the right place to ask.
 
-`onion` is on, and off means the upstream is a Tor-aware resolver. `local` and
-`test` are off, and on means nothing here serves them: they are the two reserved
-names that sites genuinely do run - an Active Directory domain under `.local`,
-an internal `.test`. Those two need `enabled`, and setting either with `enabled`
-off is refused at load rather than left looking like a protection that is on.
-`onion` needs it as well, but that pair cannot be written down: it is on by
-default, so `enabled: false` on its own already says everything the
-contradiction would have.
+`onion` is on, and off means the upstream is a Tor-aware resolver. `local`,
+`test` and `home_arpa` are off, and on means nothing here serves them: they are
+the reserved names that sites genuinely do run - an Active Directory domain
+under `.local`, an internal `.test`, a home network's own zone under
+`home.arpa.`. Those three need `enabled`, and setting one with `enabled` off is
+refused at load rather than left looking like a protection that is on. `onion`
+needs it as well, but that pair cannot be written down: it is on by default, so
+`enabled: false` on its own already says everything the contradiction would
+have.
+
+`home_arpa` stops a leak rather than a wrong answer, which makes it the odd one
+of the four. Off - the default - the zone is forwarded, which is what a network
+whose router answers it needs, and `is_locally_served` keeps the reply out of
+the public chain of trust so it arrives insecure instead of Bogus. On, the names
+are answered NXDOMAIN here and never leave the building, which is what RFC 8375
+section 5 asks of a resolver on a network with nothing serving the zone. Both
+deployments are real and only the operator knows which one they are running, so
+this is a key rather than a default. It closes the leak for the second of them
+and does nothing for the first, which is the whole of what it claims.
 */
 Special_Use_Config :: struct {
-	enabled: bool,
-	onion:   bool,
-	local:   bool,
-	test:    bool,
+	enabled:   bool,
+	onion:     bool,
+	local:     bool,
+	test:      bool,
+	home_arpa: bool,
 }
 
 Config :: struct {
@@ -654,16 +666,17 @@ default_config :: proc() -> Config {
 		allow_loopback = false,
 	}
 	c.special_use = Special_Use_Config {
-		enabled = true,
+		enabled   = true,
 		// On: an upstream that can answer a `.onion` name is a Tor-aware
 		// resolver somebody stood up deliberately, and turning this off is how
 		// they say so.
-		onion   = true,
-		// Off. See the field comments: these two are reserved names that working
+		onion     = true,
+		// Off. See the field comments: these are reserved names that working
 		// networks serve today, and answering them here would take a site's own
 		// hostnames away on an upgrade.
-		local   = false,
-		test    = false,
+		local     = false,
+		test      = false,
+		home_arpa = false,
 	}
 	c.metrics = Metrics_Config {
 		enabled = false,

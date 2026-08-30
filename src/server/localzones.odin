@@ -162,10 +162,12 @@ The forward-side sibling of the table above: names the RFCs reserved, which are
 answered here and never asked about.
 
 RFC 6761 set `localhost.`, `invalid.`, `test.` and `example.` aside, RFC 6762
-section 22 set `local.` aside for mDNS, and RFC 7686 set `onion.` aside. The
-root delegates none of them, so no answer a public resolver gives for one of
-these can be the right answer - and the query that fetched the wrong answer has
-already told somebody what was being looked for.
+section 22 set `local.` aside for mDNS, RFC 7686 set `onion.` aside, and RFC
+8375 set `home.arpa.` aside for a home network's own zone. The root delegates
+none of them to anybody who could answer for the network asking - `home.arpa.`
+being delegated only to the blackhole servers - so no answer a public resolver
+gives for one of these can be the right answer, and the query that fetched the
+wrong answer has already told somebody what was being looked for.
 
 For `.onion` that disclosure is the whole harm. The query names, to the upstream
 operator and to anyone on the path to a plain-UDP upstream, one specific hidden
@@ -217,17 +219,40 @@ verdict. Such a site has already turned validation off, or has not noticed. What
 the default guarantees is only that nothing here is what changed for them, and
 that turning `local` on is a decision rather than an upgrade.
 
-`local.` and `test.` are in the table only when `special_use.local` and
-`special_use.test` ask for them. RFC 6762 section 22 and RFC 6761 section 6.2
-do want this handling by default, and this is a deliberate departure from both:
-those two are the reserved names that deployed networks really do serve - an
-Active Directory domain under `.local` older than the reservation, an internal
-`.test` zone that section 6.2 itself tells users they may run. NXDOMAIN by
-default would take a working network's own hostnames away on an upgrade, which
-is the forward-side version of the breakage `LOCALLY_SERVED_ZONES` above exists
-to avoid. It costs little to leave them behind a key: against a public upstream
-the only case where turning one on changes what a client sees is the case where
-the upstream was answering, the root having no `local.` or `test.` to delegate.
+`local.`, `test.` and `home.arpa.` are in the table only when
+`special_use.local`, `special_use.test` and `special_use.home_arpa` ask for
+them. RFC 6762 section 22, RFC 6761 section 6.2 and RFC 8375 section 5 all want
+this handling by default, and this is a deliberate departure from all three:
+those are the reserved names that deployed networks really do serve - an Active
+Directory domain under `.local` older than the reservation, an internal `.test`
+zone that section 6.2 itself tells users they may run, a home router
+authoritative for `home.arpa.`. NXDOMAIN by default would take a working
+network's own hostnames away on an upgrade, which is the forward-side version of
+the breakage `LOCALLY_SERVED_ZONES` above exists to avoid. It costs little to
+leave them behind a key: against a public upstream the only case where turning
+one on changes what a client sees is the case where the upstream was answering,
+the root having no `local.` or `test.` to delegate and `home.arpa.` reaching
+only the blackhole servers.
+
+`home_arpa` is the one of the three that buys privacy rather than correctness,
+and it is the only place this server can do anything at all about the leak.
+`home.arpa.` names are a home network's own hostnames; forwarded to a public
+resolver they name that network's printer and its NAS to somebody who has no
+business knowing, and get an NXDOMAIN from the blackhole servers for it. RFC
+8375 section 5 says not to send them. What stops it properly is a per-domain
+upstream that could send them to the router instead, which this server does not
+have; what the key does is answer them here, for the network that has no router
+answering them either. That is the whole of its claim, and the reason it cannot
+be the default is the network on the other side of it, whose router does answer
+and whose hostnames would disappear.
+
+The pair it forms with the `home.arpa.` entry in `LOCALLY_SERVED_ZONES` above is
+worth reading in one go, since each covers exactly the deployment the other
+cannot. Off - the default - the name is forwarded and the table above keeps the
+router's unsigned answer out of the public chain of trust. On, the name is never
+forwarded, so validation never arises and the entry above is moot. They compose
+because `special_use_zone` is consulted first: a name the table answers is one
+`resolve_query` never gets as far as validating.
 
 A rewrite outranks all of this, because `apply_rewrite` runs first - a site that
 has written down what its own names resolve to keeps that answer. What a rewrite
@@ -290,6 +315,9 @@ special_use_zone :: proc(s: ^Server, name: string) -> (zone: string, kind: Speci
 	}
 	if s.cfg.special_use.test && name_at_or_below(name, "test.") {
 		return "test.", .Nonexistent
+	}
+	if s.cfg.special_use.home_arpa && name_at_or_below(name, "home.arpa.") {
+		return "home.arpa.", .Nonexistent
 	}
 	return "", .None
 }

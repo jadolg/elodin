@@ -858,6 +858,7 @@ load_special_use :: proc(l: ^Loader, cfg: ^Config) {
 	opt_bool(l, n, "onion", &cfg.special_use.onion, "special_use")
 	opt_bool(l, n, "local", &cfg.special_use.local, "special_use")
 	opt_bool(l, n, "test", &cfg.special_use.test, "special_use")
+	opt_bool(l, n, "home_arpa", &cfg.special_use.home_arpa, "special_use")
 }
 
 @(private)
@@ -1139,9 +1140,14 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	}
 
 	/*
-	Same shape of mistake: `local` and `test` add two names to a table that is
-	not consulted at all with `special_use.enabled` off, so the pair reads as a
-	leak that was stopped and is not.
+	Same shape of mistake: `local`, `test` and `home_arpa` add names to a table
+	that is not consulted at all with `special_use.enabled` off, so the pair
+	reads as a leak that was stopped and is not.
+
+	`home_arpa` is the one where that reading does the most damage, since
+	stopping a leak is the whole of what it is for: an operator who wrote it
+	down under `enabled: false` believes their home network's names are staying
+	on the network, and they are being forwarded.
 
 	`onion` is in the same position and cannot be caught here. It defaults on,
 	so `enabled: false` with it left alone is not a contradiction anybody wrote
@@ -1154,6 +1160,12 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 		}
 		if cfg.special_use.test {
 			errorf(l, "special_use.test needs special_use.enabled: nothing consults the table with it off")
+		}
+		if cfg.special_use.home_arpa {
+			errorf(
+				l,
+				"special_use.home_arpa needs special_use.enabled: nothing consults the table with it off, so home.arpa is still forwarded",
+			)
 		}
 	}
 }

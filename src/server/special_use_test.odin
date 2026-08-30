@@ -16,11 +16,13 @@ import "elodin:upstream"
 The names that are never meant to reach a public resolver.
 
 RFC 6761 reserves `localhost.`, `invalid.`, `test.` and `example.`; RFC 6762
-section 22 reserves `local.` for mDNS; RFC 7686 reserves `onion.`. Each of them
-says the same thing in slightly different words: a caching resolver should
-answer these itself and MUST NOT forward them to the public DNS. Forwarding a
-`.onion` name in particular publishes to the upstream operator that somebody on
-this network is looking for a specific hidden service.
+section 22 reserves `local.` for mDNS; RFC 7686 reserves `onion.`; RFC 8375
+reserves `home.arpa.` for a home network's own zone. Each of them says the same
+thing in slightly different words: a caching resolver should answer these itself
+and MUST NOT forward them to the public DNS. Forwarding a `.onion` name in
+particular publishes to the upstream operator that somebody on this network is
+looking for a specific hidden service, and forwarding a `home.arpa.` name names
+that network's own hardware to whoever is listening.
 
 A mock upstream stands behind the resolver in these tests and records whether it
 was asked anything at all, which is the half of the requirement that is about
@@ -176,11 +178,12 @@ Leak_Case :: struct {
 	// The zone the synthesised SOA is expected to be owned by, for the cases
 	// that carry one.
 	soa:   string,
-	// Which of the two off-by-default keys the case needs. One field each rather
-	// than one for the pair: a table that answered `test.` from
+	// Which of the off-by-default keys the case needs. One field each rather
+	// than one for the set: a table that answered `test.` from
 	// `special_use.local` would be a live bug, and a shared flag would hide it.
-	local: bool,
-	test:  bool,
+	local:     bool,
+	test:      bool,
+	home_arpa: bool,
 }
 
 @(test)
@@ -204,12 +207,30 @@ test_special_use_names_are_not_sent_to_the_upstream :: proc(t: ^testing.T) {
 		// localzones.odin for why that one is asked for rather than assumed.
 		{name = "printer.local.", type = .A, want = .Nx_Domain, soa = "local.", local = true},
 		{name = "internal.test.", type = .A, want = .Nx_Domain, soa = "test.", test = true},
+		// RFC 8375 section 5, behind `special_use.home_arpa`. The SOA sits at
+		// the zone apex for the same reason `onion.`'s does, and the point of
+		// the case is the half above: the printer's name does not leave.
+		{
+			name = "printer.home.arpa.",
+			type = .A,
+			want = .Nx_Domain,
+			soa = "home.arpa.",
+			home_arpa = true,
+		},
+		{
+			name = "home.arpa.",
+			type = .A,
+			want = .Nx_Domain,
+			soa = "home.arpa.",
+			home_arpa = true,
+		},
 	}
 
 	for c in cases {
 		cfg := config.default_config()
 		cfg.special_use.local = c.local
 		cfg.special_use.test = c.test
+		cfg.special_use.home_arpa = c.home_arpa
 
 		s, x, built := leak_server(t, &cfg, c.name)
 		if !built {
@@ -279,16 +300,22 @@ test_special_use_names_are_not_sent_to_the_upstream :: proc(t: ^testing.T) {
 /*
 The names that are still forwarded, and are meant to be.
 
-`local.` and `test.` are reserved but served for real by networks that have been
-running them for years, so they wait for `special_use.local` and
-`special_use.test`; `example.` is reserved and explicitly *not* to be treated as
-special (RFC 6761 section 6.5), its delegated subdomains being names that
-resolve. This is the case that catches a table that grew past what was argued
-for it.
+`local.`, `test.` and `home.arpa.` are reserved but served for real by networks
+that have been running them for years, so they wait for `special_use.local`,
+`special_use.test` and `special_use.home_arpa`; `example.` is reserved and
+explicitly *not* to be treated as special (RFC 6761 section 6.5), its delegated
+subdomains being names that resolve. This is the case that catches a table that
+grew past what was argued for it.
+
+`home.arpa.` matters most here. A home router authoritative for the zone is the
+deployment RFC 8375 wrote the name for, and answering it from the table by
+default would take that network's own hostnames away on an upgrade - so the
+default has to keep forwarding it, and `LOCALLY_SERVED_ZONES` is what keeps the
+router's unsigned answer from being called a forgery on the way back.
 */
 @(test)
 test_a_default_configuration_still_forwards_local_test_and_example :: proc(t: ^testing.T) {
-	names := []string{"printer.local.", "internal.test.", "www.example.com."}
+	names := []string{"printer.local.", "internal.test.", "www.example.com.", "printer.home.arpa."}
 
 	for name in names {
 		cfg := config.default_config()
