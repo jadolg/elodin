@@ -193,10 +193,10 @@ run_special_use_answered_cases :: proc(r: ^Runner) {
 /*
 The defaults, which are the argument for the shape of the feature.
 
-`.local` and `.test` are names deployed networks really do serve, and `example.`
-is reserved but delegated, so all three are forwarded by a shipped configuration.
-The mock answering 198.51.100.7 is what proves it: the address could not have
-come from the table.
+`.local`, `.test` and `home.arpa` are names deployed networks really do serve,
+and `example.` is reserved but delegated, so all four are forwarded by a shipped
+configuration. The mock answering 198.51.100.7 is what proves it: the address
+could not have come from the table.
 */
 @(private = "file")
 run_special_use_default_forwarding_cases :: proc(r: ^Runner) {
@@ -220,9 +220,9 @@ run_special_use_default_forwarding_cases :: proc(r: ^Runner) {
 	}
 	defer stop_server(&srv)
 
-	start_case(r, "special_use: .local, .test and example.com are forwarded by default")
+	start_case(r, "special_use: .local, .test, home.arpa and example.com are forwarded by default")
 	{
-		for name in ([]string{"printer.local.", "internal.test.", "www.example.com."}) {
+		for name in ([]string{"printer.local.", "internal.test.", "www.example.com.", "printer.home.arpa."}) {
 			res := query_udp(udp_port, build_query(name, u16(dns.Type.A)))
 			if check(r, res.ok, "no response for %s", name) {
 				h, _ := parse_header(res.wire)
@@ -286,6 +286,94 @@ run_special_use_key_cases :: proc(r: ^Runner) {
 				end_case(r)
 			} else {
 				skip_case(r, "special_use: local: true", "server did not start")
+			}
+		}
+	}
+
+	// --- home_arpa: true serves the empty zone, and still fetches the apex DS ---
+	{
+		upstream_port := next_port(r)
+		mock := mock_make("special-use-home-arpa", upstream_port)
+		mock_synth_all(mock, {198, 51, 100, 7})
+		if !mock_start(mock) {
+			skip_case(r, "special_use: home_arpa: true", "cannot start the mock")
+		} else {
+			defer mock_stop(mock)
+			udp_port := next_port(r)
+			srv, ok := start_server(
+				r,
+				Server_Options {
+					config = special_use_config(udp_port, upstream_port, "special_use: { home_arpa: true }\n"),
+					udp_port = udp_port,
+				},
+			)
+			if ok {
+				defer stop_server(&srv)
+				start_case(r, "special_use: home_arpa: true serves home.arpa as an empty zone")
+				{
+					// Inside the zone: a name error, cached against the apex.
+					res := query_udp(udp_port, build_query("printer.home.arpa.", u16(dns.Type.A)))
+					if check(r, res.ok, "no response for printer.home.arpa.") {
+						h, _ := parse_header(res.wire)
+						check(r, h.rcode == int(dns.Rcode.NX_Domain), "rcode %d, want NXDOMAIN", h.rcode)
+						check_eq_int(r, len(answer_addresses(res.wire)), 0, "addresses handed to the client")
+						check_eq_str(r, authority_soa_owner(res.wire), "home.arpa.", "SOA owner")
+					}
+					// The apex itself: NODATA, not a name error. `arpa` publishes
+					// a signed delegation for it, so a client can prove the name
+					// exists - RFC 8375 section 4 item 4.B, by way of RFC 6303
+					// section 3.
+					apex := query_udp(udp_port, build_query("home.arpa.", u16(dns.Type.A)))
+					if check(r, apex.ok, "no response for home.arpa.") {
+						h, _ := parse_header(apex.wire)
+						check(r, h.rcode == int(dns.Rcode.No_Error), "apex rcode %d, want NOERROR", h.rcode)
+						check_eq_int(r, len(answer_addresses(apex.wire)), 0, "addresses at the apex")
+						check_eq_str(r, authority_soa_owner(apex.wire), "home.arpa.", "apex SOA owner")
+					}
+					// The other key is untouched, so this one is not the whole table.
+					other := query_udp(udp_port, build_query("internal.test.", u16(dns.Type.A)))
+					if check(r, other.ok, "no response for internal.test.") {
+						addrs := answer_addresses(other.wire)
+						if check(r, len(addrs) == 1, "internal.test. returned %d addresses", len(addrs)) {
+							check_eq_str(r, addrs[0], "198.51.100.7", "forwarded address")
+						}
+					}
+				}
+				end_case(r)
+
+				start_case(r, "special_use: the home.arpa apex DS is fetched rather than invented")
+				{
+					// The one query the key does not answer. The proof that this
+					// delegation carries no DS is signed and lives in `arpa`, so
+					// answering it from the table would leave a validating client
+					// below with a broken chain - SERVFAIL for the whole zone -
+					// instead of a proved-insecure one. RFC 8375 section 4 item
+					// 4.B requires it to go out; DO set or not, since a rcode
+					// that turned on that bit would be wrong in one of the two.
+					for dnssec_ok in ([]bool{true, false}) {
+						before := mock_total(mock)
+						res := query_udp(
+							udp_port,
+							build_query(
+								"home.arpa.",
+								u16(dns.Type.DS),
+								edns_size = 1232,
+								dnssec_ok = dnssec_ok,
+							),
+						)
+						check(r, res.ok, "no response for home.arpa. DS (DO=%v)", dnssec_ok)
+						check(
+							r,
+							mock_total(mock) - before == 1,
+							"the home.arpa. DS (DO=%v) reached the upstream %d times, want 1",
+							dnssec_ok,
+							mock_total(mock) - before,
+						)
+					}
+				}
+				end_case(r)
+			} else {
+				skip_case(r, "special_use: home_arpa: true", "server did not start")
 			}
 		}
 	}

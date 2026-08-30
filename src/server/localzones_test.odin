@@ -137,7 +137,7 @@ test_home_arpa_is_locally_served :: proc(t: ^testing.T) {
 @(test)
 test_home_arpa_anchor_defers_the_bypass :: proc(t: ^testing.T) {
 	// An operator who signs their own home zone and anchors it locally - what
-	// RFC 8375 section 5 leaves them - is asking for it to be validated, and
+	// RFC 8375 section 6.1 leaves them - is asking for it to be validated, and
 	// the bypass has to stand down exactly as it does on the reverse side.
 	s := Server {
 		anchor_zones = []string{"home.arpa."},

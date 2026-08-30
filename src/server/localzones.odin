@@ -58,8 +58,9 @@ The upstream is what is wrong there, and what this can do about it is stop
 asking. Nothing under `home.arpa.` is ever secure - the delegation carries no DS
 by design, so there is no chain to be deprived of - and skipping the walk
 reaches the same insecure verdict the public path reaches, without needing the
-upstream to cooperate in proving it. RFC 8375 section 5 asks a resolver that
-supports the name for that outcome.
+upstream to cooperate in proving it. RFC 8375 section 4 asks a resolver that
+supports the name for that outcome, and section 6.2 is where the working group
+wrote down why the delegation is unsigned in the first place.
 
 Nothing about this is special to `home.arpa.`, which is worth knowing before the
 next one arrives: any upstream authoritative for a forward zone that answers DS
@@ -67,16 +68,23 @@ queries inside it from its own data breaks a chain the same way, `corp.example`
 and a site's internal `.test` included. `home.arpa.` is the case that can be
 listed here rather than configured, being the one such zone an RFC names.
 
-What this does not do is keep the query at home. `home.arpa.` is still forwarded
-to whatever `upstream.servers` names, so a network with no local authority for
-it still sends those names out - and gets the blackhole servers' NXDOMAIN back,
-insecure and correct, exactly as it did before this entry existed. The two
-halves do not overlap: where this entry changes a verdict the router answered
-and nothing left the building, and where the names leak the chain already
-worked. Closing the leak needs somewhere else to send them - a per-domain
-upstream this server does not have - and answering the zone from the forward
-table instead would break the deployment RFC 8375 wrote it for, which is the
-same argument that keeps `local.` and `test.` forwarded by default.
+What this entry does not do is keep the query at home. By itself it leaves
+`home.arpa.` forwarded to whatever `upstream.servers` names, so a network with
+no local authority for it sends those names out and gets the blackhole servers'
+empty zone back, insecure and correct, exactly as it did before the entry
+existed. The two halves do not overlap: where this entry changes a verdict the
+router answered and nothing left the building, and where the names leak the
+chain already worked.
+
+`special_use.home_arpa` is the other half, and the forward table below is where
+it lives - answering the zone here for the network that has nothing serving it.
+It cannot be the default, because answering the zone from a table is exactly
+what breaks the deployment RFC 8375 wrote the name for, which is the same
+argument that keeps `local.` and `test.` forwarded. What neither half can do is
+send the query to the router, which needs a per-domain upstream this server does
+not have. Note that the key does not retire this entry: the apex `DS` is
+forwarded whichever way it is set, and this is what keeps that answer off a
+chain walk that cannot finish.
 
 The bypass is off, though, for a name an operator has anchored themselves. A
 site that signs its own reverse space and configures a trust anchor over it is
@@ -221,7 +229,7 @@ that turning `local` on is a decision rather than an upgrade.
 
 `local.`, `test.` and `home.arpa.` are in the table only when
 `special_use.local`, `special_use.test` and `special_use.home_arpa` ask for
-them. RFC 6762 section 22, RFC 6761 section 6.2 and RFC 8375 section 5 all want
+them. RFC 6762 section 22, RFC 6761 section 6.2 and RFC 8375 section 3 all want
 this handling by default, and this is a deliberate departure from all three:
 those are the reserved names that deployed networks really do serve - an Active
 Directory domain under `.local` older than the reservation, an internal `.test`
@@ -238,21 +246,58 @@ only the blackhole servers.
 and it is the only place this server can do anything at all about the leak.
 `home.arpa.` names are a home network's own hostnames; forwarded to a public
 resolver they name that network's printer and its NAS to somebody who has no
-business knowing, and get an NXDOMAIN from the blackhole servers for it. RFC
-8375 section 5 says not to send them. What stops it properly is a per-domain
-upstream that could send them to the router instead, which this server does not
-have; what the key does is answer them here, for the network that has no router
-answering them either. That is the whole of its claim, and the reason it cannot
-be the default is the network on the other side of it, whose router does answer
-and whose hostnames would disappear.
+business knowing, and get the blackhole servers' empty zone back for it. RFC
+8375 section 3 says not to send them, in as many words: queries for these names
+"MUST NOT be recursively forwarded to servers outside the logical boundaries of
+the homenet". What stops it properly is a per-domain upstream that could send
+them to the router instead, which this server does not have; what the key does
+is answer them here, for the network that has no router answering them either.
+That is the whole of its claim, and the reason it cannot be the default is the
+network on the other side of it, whose router does answer and whose hostnames
+would disappear.
+
+`home.arpa.` is served as an empty zone rather than as a name that cannot
+exist, and that is where it parts company with the three above it. Those three
+are absent from their parent - the root delegates no `onion.`, no `local.`, no
+`test.` - so NXDOMAIN for the apex is simply true. `home.arpa.` is delegated,
+and the delegation is signed (RFC 8375 section 7), so a client can prove the
+name exists and an NXDOMAIN for it would be this server contradicting `arpa.`.
+RFC 8375 section 4 item 4.B asks instead for the behaviour in section 3 of RFC
+6303, which draws exactly that line: name errors for the names inside the zone,
+and for the zone name itself "SOA, NS, and 'no data' responses ... as
+appropriate to the query type". An empty zone, in other words, which is what the
+blackhole servers are serving today - so turning the key on stops the query
+leaving without changing the rcode any client sees.
+
+The delegation's own `DS` is the one query under `home.arpa.` this table does
+not answer. RFC 8375 section 4 item 4.B carves it out of the same MUST NOT
+that keeps everything else at home: a `DS` query "MUST result in forwarding
+whatever queries are necessary", because the signed proof that this delegation
+carries no DS lives in `arpa.` and nowhere else. Swallowing it is not a small
+discourtesy - it is precisely the failure `LOCALLY_SERVED_ZONES` above describes
+a home router causing, with this server in the router's place. A validating
+client below here walks down from `arpa.`, asks for the DS, and is handed an
+unsigned NXDOMAIN for a name whose parent proves it exists: a chain broken
+rather than proved absent, which is Bogus, which is SERVFAIL for every
+`home.arpa.` name the key was supposed to be answering cleanly. Forwarding it
+gives up nothing the key was protecting, either - the question names no host,
+and the answer is the same for every home network there has ever been.
+
+That carve-out holds whatever the DO bit says, though the RFC only requires it
+with DO set. A client that is not validating has no use for the proof, but
+answering one question NXDOMAIN or NODATA depending on a bit in the request
+would put the wrong answer in the cheaper of the two paths, where a downstream
+resolver that asked without DO would cache it and hold it against the name.
 
 The pair it forms with the `home.arpa.` entry in `LOCALLY_SERVED_ZONES` above is
 worth reading in one go, since each covers exactly the deployment the other
 cannot. Off - the default - the name is forwarded and the table above keeps the
-router's unsigned answer out of the public chain of trust. On, the name is never
-forwarded, so validation never arises and the entry above is moot. They compose
-because `special_use_zone` is consulted first: a name the table answers is one
-`resolve_query` never gets as far as validating.
+router's unsigned answer out of the public chain of trust. On, the `DS` query at
+the apex is the only one that still goes out, and the entry above governs it
+exactly as it does with the key off: unvalidated here, and passed to the client
+with the upstream's own signatures intact for the client to check for itself.
+They compose because `special_use_zone` is consulted first: a name the table
+answers is one `resolve_query` never gets as far as validating.
 
 A rewrite outranks all of this, because `apply_rewrite` runs first - a site that
 has written down what its own names resolve to keeps that answer. What a rewrite
@@ -267,6 +312,11 @@ Special_Use :: enum u8 {
 	Loopback,
 	// Answered NXDOMAIN, the name being one that cannot exist.
 	Nonexistent,
+	// Served as an empty zone: the name does exist, and its parent says so in
+	// public, so the apex answers SOA, NS and NODATA by type and only the names
+	// inside the zone are errors. `home.arpa.` is the only one, and the argument
+	// for why it is not simply `Nonexistent` is above.
+	Empty_Zone,
 }
 
 /*
@@ -292,9 +342,23 @@ belongs at the zone's apex - `onion.` for a name under it - rather than at the
 queried name's parent, which for `a.b.onion.` is `b.onion.`, a zone nobody has
 ever been authoritative for. Same label-boundary, case-folding test as
 everything else in this file, so `notlocalhost.` is not inside `localhost.`.
+
+`type` is here for one question only, and it is a question about `home.arpa.`:
+the `DS` at that apex has to be forwarded rather than answered, RFC 8375 section
+4 item 4.B being explicit that this one query escapes the table. Nothing else in
+here looks at the type, which is why the caller's `.None` means "forward it"
+rather than "no such zone" - for that one question the zone is in the table and
+the answer still is not.
 */
 @(private)
-special_use_zone :: proc(s: ^Server, name: string) -> (zone: string, kind: Special_Use) {
+special_use_zone :: proc(
+	s: ^Server,
+	name: string,
+	type: dns.Type,
+) -> (
+	zone: string,
+	kind: Special_Use,
+) {
 	if !s.cfg.special_use.enabled {
 		return "", .None
 	}
@@ -317,7 +381,13 @@ special_use_zone :: proc(s: ^Server, name: string) -> (zone: string, kind: Speci
 		return "test.", .Nonexistent
 	}
 	if s.cfg.special_use.home_arpa && name_at_or_below(name, "home.arpa.") {
-		return "home.arpa.", .Nonexistent
+		// The delegation's own DS, and only at the apex: a DS below it is a
+		// query about a name that exists nowhere but this network, and the
+		// answer to that one really is here.
+		if type == .DS && dns.name_equal_fold(name, "home.arpa.") {
+			return "", .None
+		}
+		return "home.arpa.", .Empty_Zone
 	}
 	return "", .None
 }
@@ -403,12 +473,17 @@ made-up record of some other type, because this server has no zone to invent
 one from. An MX or a TXT for `localhost.` is a question with a real answer of
 "there is none", and NODATA is how that is spelled.
 
-The rest get NXDOMAIN. Both shapes carry a synthesised SOA in the authority
-section for the same reason `build_block_response` does: without one there is
-nothing for a downstream resolver to cache the negative answer against (RFC
-2308 section 5), and a client that re-asks every second is a client whose
-`.onion` lookups this server is now generating rather than merely refusing to
-forward.
+`home.arpa.` gets the empty zone RFC 6303 section 3 describes, it being the one
+name here whose parent publishes a signed proof that it exists: NODATA at the
+apex, its SOA and its NS for the types that ask for those, and NXDOMAIN for the
+names inside the zone. The rest get NXDOMAIN throughout, apex included, having
+no parent that says otherwise.
+
+Every shape that carries no answer carries a synthesised SOA in the authority
+section, for the same reason `build_block_response` does: without one there is
+nothing for a downstream resolver to cache the negative answer against (RFC 2308
+section 5), and a client that re-asks every second is a client whose `.onion`
+lookups this server is now generating rather than merely refusing to forward.
 
 The answers themselves do not go in the cache. `cache.put` is there so an
 upstream need not be asked twice; these are built from a table already in
@@ -457,6 +532,32 @@ answer_special_use :: proc(
 		}
 	case .Nonexistent:
 		rcode = .NX_Domain
+	case .Empty_Zone:
+		// RFC 6303 section 3, which RFC 8375 section 4 item 4.B asks for by
+		// name: a name error for anything inside the zone, and at the zone name
+		// itself the SOA, the NS and NODATA as the query type calls for. The NS
+		// names the zone and has no address record anywhere, which is what RFC
+		// 6303 recommends and what stops an UPDATE client from trying to
+		// register a name into a zone nothing here serves.
+		if !dns.name_equal_fold(q.name, zone) {
+			rcode = .NX_Domain
+			break
+		}
+		if q.type == .SOA || q.type == .ANY {
+			append(&answers, ..synth_soa_for_zone(zone, SPECIAL_USE_TTL, allocator))
+		}
+		if q.type == .NS || q.type == .ANY {
+			append(
+				&answers,
+				dns.Record {
+					name = zone,
+					type = .NS,
+					class = .IN,
+					ttl = SPECIAL_USE_TTL,
+					data = dns.Rdata_Name{name = zone},
+				},
+			)
+		}
 	}
 
 	resp := dns.make_response(query, rcode, allocator)

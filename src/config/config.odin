@@ -534,11 +534,20 @@ have.
 of the four. Off - the default - the zone is forwarded, which is what a network
 whose router answers it needs, and `is_locally_served` keeps the reply out of
 the public chain of trust so it arrives insecure instead of Bogus. On, the names
-are answered NXDOMAIN here and never leave the building, which is what RFC 8375
-section 5 asks of a resolver on a network with nothing serving the zone. Both
-deployments are real and only the operator knows which one they are running, so
-this is a key rather than a default. It closes the leak for the second of them
-and does nothing for the first, which is the whole of what it claims.
+are answered here and never leave the building, which is what RFC 8375 section 3
+asks of a resolver on a network with nothing serving the zone. Both deployments
+are real and only the operator knows which one they are running, so this is a
+key rather than a default. It closes the leak for the second of them and does
+nothing for the first, which is the whole of what it claims.
+
+Two details of the shape, both from RFC 8375 section 4 item 4.B and both argued
+in `localzones.odin`. The zone is served empty rather than absent, so the apex
+answers NODATA, its SOA and its NS, and only the names inside it are NXDOMAIN -
+`arpa.` publishes a signed delegation for `home.arpa.`, and a client that can
+prove the name exists should not be told by this server that it does not. And
+the `DS` at that apex is forwarded even with the key on, since the proof that
+the delegation carries no DS lives in `arpa.` and a validating client below here
+needs it to conclude insecure rather than broken.
 */
 Special_Use_Config :: struct {
 	enabled:   bool,

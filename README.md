@@ -638,7 +638,10 @@ send it to a local authority instead, so a network with nothing answering for
 what was being looked for on the way. If nothing here serves the zone,
 [`special_use.home_arpa`](#names-that-are-never-forwarded) answers those names
 from the table instead and they stop leaving — it is off by default because the
-network whose router *does* answer them needs them forwarded. One thing to know
+network whose router *does* answer them needs them forwarded. Either way the
+`home.arpa DS` query goes upstream, RFC 8375 requiring that proof to be fetched
+rather than invented, and either way this bypass is what keeps the answer to it
+from being held to a chain that cannot be walked from here. One thing to know
 if you run the zone: its answers carry private addresses, which
 [rebind protection](#dns-rebinding-protection) filters unless `home.arpa` is
 named in `rebind.allow_domains`. The reverse zones never trip that guard, a PTR
@@ -1277,7 +1280,7 @@ special_use:
   onion: true      # onion.  (RFC 7686 section 2)
   local: false     # local.  (RFC 6762 section 22)
   test: false      # test.   (RFC 6761 section 6.2)
-  home_arpa: false # home.arpa. (RFC 8375 section 5)
+  home_arpa: false # home.arpa. (RFC 8375 sections 3 and 4)
 ```
 
 Three names are answered here rather than asked about, whatever `upstream.servers`
@@ -1318,11 +1321,25 @@ hostname having left the building.
 answer, and it is worth turning on if no router here answers `home.arpa`. Those
 names are your own network's — the printer, the NAS — and forwarded they name
 your hardware to a public resolver in exchange for the blackhole servers'
-NXDOMAIN. RFC 8375 section 5 says not to send them. What it does *not* do is
+NXDOMAIN. RFC 8375 section 3 says not to send them. What it does *not* do is
 send them to your router instead: that needs a per-domain upstream, which elodin
 does not have, and is why the key cannot simply default on for the networks
-whose router does answer the zone. See [DNSSEC](#dnssec) for the other half of
-how `home.arpa` is handled, which applies whichever way this key is set.
+whose router does answer the zone.
+
+`home.arpa` is answered as an empty zone rather than as a name that does not
+exist, which is what RFC 8375 section 4 asks for and what the blackhole servers
+serve today: `printer.home.arpa` is NXDOMAIN, and `home.arpa` itself is NODATA,
+with its own SOA and NS for the types that ask. Turning the key on changes the
+route those queries take, not the rcode your clients see.
+
+One query still goes out with the key on: `home.arpa DS`. The signed proof that
+this delegation carries no DS lives in `arpa`, RFC 8375 section 4 requires that
+it be fetched rather than invented, and a validating client below elodin needs
+it to conclude "insecure" instead of "broken" — answering that one from the
+table would turn every `home.arpa` name into SERVFAIL for such a client. The
+question names no host of yours, and the answer is the same for every home
+network. See [DNSSEC](#dnssec) for the other half of how `home.arpa` is handled,
+which is what keeps that forwarded `DS` off the chain walk.
 
 Note that such a site may not have working `.local` names in the first place.
 With `dnssec.enabled` on — the default — the unsigned answer its upstream gives

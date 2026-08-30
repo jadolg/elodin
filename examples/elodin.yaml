@@ -420,15 +420,22 @@ rebind:
 #
 # home.arpa is the same shape as those two, and the one that is about privacy
 # rather than a wrong answer. RFC 8375 reserved it for a home network's own zone
-# and section 5 says not to send those queries to the public DNS, but a router
+# and section 3 says not to send those queries to the public DNS, but a router
 # that is authoritative for it needs them forwarded to answer them — so this is
 # off, and turning it on says nothing here serves the zone. With it off the
 # names still leave, and get the blackhole servers' NXDOMAIN back; with it on
-# they are answered here and your printer's name stays on your network. Either
-# way elodin keeps home.arpa out of the public chain of trust, so a router's
-# unsigned answer is served insecure rather than as a SERVFAIL. Sending the
-# query to your router instead would need a per-domain upstream, which this
+# they are answered here and your printer's name stays on your network. Sending
+# the query to your router instead would need a per-domain upstream, which this
 # resolver does not have.
+#
+# On, the zone is served empty rather than absent, which is what RFC 8375
+# section 4 asks for: printer.home.arpa is NXDOMAIN, home.arpa itself is NODATA
+# with its own SOA and NS. The one query that still goes out is home.arpa DS —
+# the signed proof that the delegation has no DS is in arpa and nowhere else,
+# and a validating client below this resolver needs it to tell "insecure" from
+# "broken". Whichever way the key is set, elodin keeps the names in this zone
+# out of the public chain of trust, so a router's unsigned answer is served
+# insecure rather than as a SERVFAIL.
 #
 # example. is deliberately not in the set: RFC 6761 6.5 asks resolvers *not* to
 # treat it specially, example.com and its siblings being delegated names that do
