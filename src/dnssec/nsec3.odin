@@ -118,6 +118,14 @@ Find the deepest ancestor of `qname` the zone is shown to hold.
 Returns that name along with the "next closer" name, one label longer, whose
 absence the caller then has to see covered. A match on `qname` itself means the
 name exists, which contradicts whatever the caller was trying to prove.
+
+The match has to be in band, the apex included: the walk stops at the deepest
+ancestor some NSEC3 in the response matches, and reaching the apex without one
+at all is a failure, as RFC 5155 sections 8.4 through 8.9 ask for. A wildcard
+answer is the one shape that genuinely does arrive without an apex match, and it
+does not come through here: its closest encloser is named by the signature that
+expanded it, so `validate_wildcard_proof` reads it from there rather than
+searching for it.
 */
 @(private)
 nsec3_closest_encloser :: proc(
