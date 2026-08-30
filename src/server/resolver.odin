@@ -179,6 +179,40 @@ handle_query :: proc(
 		return nil, .Failed, false
 	}
 
+	/*
+	EDNS this server cannot account for is refused before anything is read out of
+	it.
+
+	FORMERR because RFC 6891 section 6.1.1 says exactly that of a query carrying
+	more than one OPT record, and because RDATA that is not a well-formed option
+	list is no more answerable: every option in it is one this server can neither
+	see nor take back out, while the upstream reading the same bytes can.
+
+	Ahead of `inspect_cookie` for the reason the version check below is ahead of
+	`resolve_query`: this is a property of the request and not of the name. A gate
+	any lower answers identical bytes differently depending on what else happened
+	to be true - FORMERR on a cache miss, the entry on a hit, a blocklist verdict
+	or a rewrite where a rule matches the name - and the client's cookie would by
+	then have been looked for in the first OPT record, found absent, and left
+	standing in the second one all the way to the upstream.
+
+	Not counted, matching the malformed-cookie FORMERR below and the class, XFR
+	and RD refusals: none of those has a counter either. It reaches the query log
+	as `outcome=failed detail="opt"` and goes no higher - a line an
+	unauthenticated peer can print once per datagram does not belong at warn.
+	*/
+	if !edns_opt_readable(msg) {
+		out, built := dns.error_response(query, msg, .Form_Err, allocator, limit)
+		// As the version gate below: this runs before the question count is
+		// checked, so there may be no question to name.
+		q: dns.Question
+		if len(msg.question) > 0 {
+			q = msg.question[0]
+		}
+		log_query(s, client, proto, q, .Failed, "opt", started)
+		return advertise_udp_size(out, advertise, proto), .Failed, built
+	}
+
 	cookie := inspect_cookie(s.cookies, msg, client)
 
 	// A cookie of an impossible length is the one case RFC 7873 section 5.2.2
@@ -306,6 +340,80 @@ advertise_udp_size :: proc(wire: []u8, size: u16, proto: Protocol) -> []u8 {
 	}
 	_ = dns.set_edns_udp_size(wire, size)
 	return wire
+}
+
+/*
+Whether this server can account for the EDNS on a message, which is what every
+later edit to one depends on.
+
+Two shapes cannot be accounted for, and they are the same defect read from
+either end. A second OPT record is one RFC 6891 section 6.1.1 forbids outright,
+and every reader here - `find_opt` on the decoded message, `find_opt_span` on
+the wire, and so both the cookie strip and the subnet strip - takes the first
+one and looks no further, so an option sitting in the second travels upstream
+untouched past a removal that reported success. An OPT whose RDATA is not a
+well-formed option list is the other: `decode_record` keeps RDATA it cannot
+parse as raw bytes rather than rejecting the message, so a list ending in three
+bytes of a fourth option header arrives as an OPT record holding `Rdata_Raw`,
+and every option in front of that stump reads as absent to anything asking the
+decoded message - `find_edns_option` included. Absent to this server, that is,
+and not to the upstream, which walks the same bytes and stops where this decoder
+stopped.
+
+Asked of the message rather than of one option, because the answer is the same
+for every option in it and asking per option is what went wrong before: the
+client's subnet had a gate of its own and the client's cookie, which is a secret
+and the more expensive of the two to hand to a stranger, had none.
+
+Only the additional section is counted, because that is the only section
+`find_opt` and `find_opt_span` look in. A record of type OPT in the answer
+section is not the message's EDNS record, and a client can put one there for the
+asking.
+*/
+@(private)
+edns_opt_readable :: proc(msg: dns.Message) -> bool {
+	seen := false
+	for rec in msg.additional {
+		if rec.type != .OPT {
+			continue
+		}
+		if seen {
+			return false
+		}
+		seen = true
+		if _, is_opt := rec.data.(dns.Rdata_OPT); !is_opt {
+			return false
+		}
+	}
+	return true
+}
+
+/*
+Whether the client asked with an EDNS Client Subnet option.
+
+Read off the decoded message, which is the whole of what it takes by the time
+this is asked: `handle_query` has already turned away the two shapes that could
+hide an option from this decoder - a second OPT record, and an OPT whose RDATA
+is not a well-formed option list - so an option that is not in the list here is
+not in the message either, and the one that is can be taken back out.
+*/
+@(private)
+client_subnet_sent :: proc(msg: dns.Message) -> bool {
+	for rec in msg.additional {
+		if rec.type != .OPT {
+			continue
+		}
+		rdata, is_opt := rec.data.(dns.Rdata_OPT)
+		if !is_opt {
+			continue
+		}
+		for o in rdata.options {
+			if o.code == u16(dns.EDNS_Option_Code.Client_Subnet) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 @(private)
@@ -629,6 +737,85 @@ resolve_query :: proc(
 				client,
 			)
 			log_query(s, client, proto, q, .Failed, "cookie", started)
+			return out, .Failed, built
+		}
+		forwarded = stripped
+	}
+
+	/*
+	The client's subnet stops here as well.
+
+	RFC 7871 section 7.5 puts no condition on this: an intermediate nameserver
+	that forwards ECS options received from its clients "MUST fully implement
+	the caching behavior described in Section 7.3", and this server does not.
+	Its key is the question plus DO and CD and nothing else (`cache.make_key`),
+	so an answer tailored to whatever network a client named would be filed
+	under the bare question and handed to every other client behind this
+	resolver until it expired - section 7.3.1's requirement that a cached answer
+	be tied to the network it was scoped to, absent. One well-formed query from
+	anyone `server.allow_from` lets in, and the whole network gets the CDN edge
+	that client chose.
+
+	The leak is the other half, and it holds with the cache switched off:
+	`server.allow_from` decides who may ask here, not what they may claim about
+	themselves, so a client can have this server tell a public upstream that its
+	users are somewhere they are not (section 11.1).
+
+	Stripped rather than refused. Section 7.5 does offer REFUSED for an option
+	an intermediate does not want to use, but a stub that sends ECS is asking
+	for a nearer CDN edge and not committing an offence, and refusing it teaches
+	the client to route around this resolver. Dropping the option leaves the
+	upstream scoping on this server's own address, which is the answer everyone
+	behind it should be getting, and the reply then carries no ECS option back -
+	which section 7.3 reads as "suitable for all client addresses", true here
+	rather than the false tailoring claim that section warns about.
+
+	Nothing is put in its place. Section 7.1.2 gives SOURCE PREFIX-LENGTH 0 to a
+	stub that wants no scoping at all and section 7.1.3 says a forwarder looks
+	like a stub, but sending it would forbid the upstream from scoping on *our*
+	address too - every client behind this resolver losing the locality it has
+	today, to fix a leak that is already fixed by the option being gone. That is
+	an operator's decision and a larger one than this. An absent option says
+	this server does not do ECS, which is the truth.
+
+	No setting to turn it back on, either. Forwarding ECS is only correct
+	together with the section 7.3 caching, and until the cache can hold a scope
+	per network the key would either be a lie or be the client's own bytes -
+	which is the cache pollution section 11.3 is about, an attacker sitting on
+	one name and evicting the table with a fresh subnet each time. The option
+	belongs with that work, not ahead of it.
+
+	Placed after the DNSSEC rewrite for the reason the cookie is: that path
+	copies the client's OPT data across wholesale, so this is the point where
+	both ways of building the outgoing query have converged.
+
+	The strip below is trusted to reach the option because `handle_query` has
+	already refused the two shapes it could not - a second OPT record, and an OPT
+	whose RDATA is not a well-formed option list. Both would have survived a
+	removal that reported success; see `edns_opt_readable`.
+	*/
+	if client_subnet_sent(msg) {
+		stripped, done := dns.remove_edns_option(forwarded, .Client_Subnet, allocator)
+		if !done {
+			/*
+			Failing closed, as the cookie above does, and for a reason that
+			survives the objection that a cookie is a secret and a subnet is
+			only a hint. It is a hint that steers a shared cache: forwarding one
+			this server could not account for is what lets a single client pick
+			the answer the rest of them get, which no amount of "it is only a
+			hint" makes cheaper than one lost answer for the client that sent
+			it. Nobody else's queries are affected by the refusal, and the
+			client is told rather than left waiting.
+			*/
+			sync.atomic_add(&s.stats.failed, 1)
+			out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
+			logx.warnf(
+				"could not strip the client subnet from %s %s from %s; not forwarding",
+				dns.type_name(q.type),
+				dns.name_trim_root(q.name),
+				client,
+			)
+			log_query(s, client, proto, q, .Failed, "ecs", started)
 			return out, .Failed, built
 		}
 		forwarded = stripped
