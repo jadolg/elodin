@@ -179,6 +179,40 @@ handle_query :: proc(
 		return nil, .Failed, false
 	}
 
+	/*
+	EDNS this server cannot account for is refused before anything is read out of
+	it.
+
+	FORMERR because RFC 6891 section 6.1.1 says exactly that of a query carrying
+	more than one OPT record, and because RDATA that is not a well-formed option
+	list is no more answerable: every option in it is one this server can neither
+	see nor take back out, while the upstream reading the same bytes can.
+
+	Ahead of `inspect_cookie` for the reason the version check below is ahead of
+	`resolve_query`: this is a property of the request and not of the name. A gate
+	any lower answers identical bytes differently depending on what else happened
+	to be true - FORMERR on a cache miss, the entry on a hit, a blocklist verdict
+	or a rewrite where a rule matches the name - and the client's cookie would by
+	then have been looked for in the first OPT record, found absent, and left
+	standing in the second one all the way to the upstream.
+
+	Not counted, matching the malformed-cookie FORMERR below and the class, XFR
+	and RD refusals: none of those has a counter either. It reaches the query log
+	as `outcome=failed detail="opt"` and goes no higher - a line an
+	unauthenticated peer can print once per datagram does not belong at warn.
+	*/
+	if !edns_opt_readable(msg) {
+		out, built := dns.error_response(query, msg, .Form_Err, allocator, limit)
+		// As the version gate below: this runs before the question count is
+		// checked, so there may be no question to name.
+		q: dns.Question
+		if len(msg.question) > 0 {
+			q = msg.question[0]
+		}
+		log_query(s, client, proto, q, .Failed, "opt", started)
+		return advertise_udp_size(out, advertise, proto), .Failed, built
+	}
+
 	cookie := inspect_cookie(s.cookies, msg, client)
 
 	// A cookie of an impossible length is the one case RFC 7873 section 5.2.2
@@ -309,57 +343,77 @@ advertise_udp_size :: proc(wire: []u8, size: u16, proto: Protocol) -> []u8 {
 }
 
 /*
-Whether the client may have asked with an EDNS Client Subnet option, and whether
-taking it back out is something this server can be sure it managed.
+Whether this server can account for the EDNS on a message, which is what every
+later edit to one depends on.
 
-Read conservatively on purpose: "may have" is as much as the decoded message can
-say, and a caller that is going to refuse what it cannot strip wants the doubt
-rather than a clean-looking no. Every message this is asked about came out of
-`decode_message`, which gives an OPT record either an option list or the raw
-bytes it could not make one of - never nothing.
+Two shapes cannot be accounted for, and they are the same defect read from
+either end. A second OPT record is one RFC 6891 section 6.1.1 forbids outright,
+and every reader here - `find_opt` on the decoded message, `find_opt_span` on
+the wire, and so both the cookie strip and the subnet strip - takes the first
+one and looks no further, so an option sitting in the second travels upstream
+untouched past a removal that reported success. An OPT whose RDATA is not a
+well-formed option list is the other: `decode_record` keeps RDATA it cannot
+parse as raw bytes rather than rejecting the message, so a list ending in three
+bytes of a fourth option header arrives as an OPT record holding `Rdata_Raw`,
+and every option in front of that stump reads as absent to anything asking the
+decoded message - `find_edns_option` included. Absent to this server, that is,
+and not to the upstream, which walks the same bytes and stops where this decoder
+stopped.
 
-The second answer exists because `remove_edns_option` works on the first OPT
-record and no more, while a message can arrive carrying two - one OPT record is
-all RFC 6891 section 6.1.1 permits, but nothing here turns the rest away before
-this point. An ECS option hidden in a second OPT would survive a removal that
-reported success, so the caller has to be able to tell that case from a clean
-one, and the removal's own return value cannot see it.
+Asked of the message rather than of one option, because the answer is the same
+for every option in it and asking per option is what went wrong before: the
+client's subnet had a gate of its own and the client's cookie, which is a secret
+and the more expensive of the two to hand to a stranger, had none.
 
-An OPT record whose RDATA the decoder could not walk is the other half of the
-same problem, and the more useful one to an attacker: `decode_record` keeps
-RDATA it cannot parse as raw bytes rather than rejecting the message, so an
-option list ending in three bytes of a fourth option header reaches here as an
-OPT record holding `Rdata_Raw` and not an option list at all. That is why the
-check below asks which variant the RDATA is rather than how many options it
-holds: the list is not empty, it was never built. Read as "no subnet here" it
-would forward the client's ECS upstream untouched - the option is perfectly
-legible to the resolver on the other end, only not to this decoder. So an unreadable OPT
-reports a subnet that cannot be stripped, and the query stops, which is also
-what RFC 6891 section 6.1.1 asks of RDATA that is not a well-formed option list.
+Only the additional section is counted, because that is the only section
+`find_opt` and `find_opt_span` look in. A record of type OPT in the answer
+section is not the message's EDNS record, and a client can put one there for the
+asking.
 */
 @(private)
-client_subnet_sent :: proc(msg: dns.Message) -> (sent: bool, strippable: bool) {
-	opts := 0
-	readable := true
+edns_opt_readable :: proc(msg: dns.Message) -> bool {
+	seen := false
 	for rec in msg.additional {
 		if rec.type != .OPT {
 			continue
 		}
-		opts += 1
+		if seen {
+			return false
+		}
+		seen = true
+		if _, is_opt := rec.data.(dns.Rdata_OPT); !is_opt {
+			return false
+		}
+	}
+	return true
+}
+
+/*
+Whether the client asked with an EDNS Client Subnet option.
+
+Read off the decoded message, which is the whole of what it takes by the time
+this is asked: `handle_query` has already turned away the two shapes that could
+hide an option from this decoder - a second OPT record, and an OPT whose RDATA
+is not a well-formed option list - so an option that is not in the list here is
+not in the message either, and the one that is can be taken back out.
+*/
+@(private)
+client_subnet_sent :: proc(msg: dns.Message) -> bool {
+	for rec in msg.additional {
+		if rec.type != .OPT {
+			continue
+		}
 		rdata, is_opt := rec.data.(dns.Rdata_OPT)
 		if !is_opt {
-			sent = true
-			readable = false
 			continue
 		}
 		for o in rdata.options {
 			if o.code == u16(dns.EDNS_Option_Code.Client_Subnet) {
-				sent = true
-				break
+				return true
 			}
 		}
 	}
-	return sent, readable && opts == 1
+	return false
 }
 
 @(private)
@@ -734,25 +788,13 @@ resolve_query :: proc(
 	Placed after the DNSSEC rewrite for the reason the cookie is: that path
 	copies the client's OPT data across wholesale, so this is the point where
 	both ways of building the outgoing query have converged.
+
+	The strip below is trusted to reach the option because `handle_query` has
+	already refused the two shapes it could not - a second OPT record, and an OPT
+	whose RDATA is not a well-formed option list. Both would have survived a
+	removal that reported success; see `edns_opt_readable`.
 	*/
-	if ecs_sent, strippable := client_subnet_sent(msg); ecs_sent {
-		/*
-		A subnet the strip cannot be trusted to reach - one in a second OPT
-		record, or one in an OPT whose RDATA this decoder could not walk - is
-		answered rather than sent on, because the strip below would report
-		success and leave it standing. FORMERR because that is what RFC 6891
-		section 6.1.1 already says about both of those messages, and this is
-		where the first thing that cares happens to look; not counted and not
-		logged at warn, for the reason the class and RD refusals above are not -
-		a malformed query is the client's own to fix, and a line an
-		unauthenticated peer can print once per datagram is not a line to write
-		at that level. The query log has it as `outcome=failed detail="ecs"`.
-		*/
-		if !strippable {
-			out, built := dns.error_response(query, msg, .Form_Err, allocator, limit)
-			log_query(s, client, proto, q, .Failed, "ecs", started)
-			return out, .Failed, built
-		}
+	if client_subnet_sent(msg) {
 		stripped, done := dns.remove_edns_option(forwarded, .Client_Subnet, allocator)
 		if !done {
 			/*

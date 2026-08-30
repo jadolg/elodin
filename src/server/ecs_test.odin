@@ -314,9 +314,10 @@ A subnet the strip cannot reach costs the client its answer, not everyone else
 theirs.
 
 `remove_edns_option` edits the first OPT record and no other, so an ECS option
-in a second one would survive a removal that reported success. Nothing else here
-turns a query with two OPT records away, so this is where it stops: FORMERR, as
-RFC 6891 section 6.1.1 says of that message, and nothing forwarded.
+in a second one would survive a removal that reported success. `handle_query`
+turns that message away before any of this - FORMERR, as RFC 6891 section 6.1.1
+says of it - so what this case pins is that the subnet never reaches the
+upstream, whichever gate is the one that stops it.
 */
 @(test)
 test_an_unstrippable_client_subnet_is_not_forwarded :: proc(t: ^testing.T) {
@@ -361,8 +362,10 @@ the message, so an option list ending in a partial option header decodes to an
 OPT record holding `Rdata_Raw` rather than an option list - and the ECS option
 in front of that stump reads as absent to anything asking the decoded message,
 `find_edns_option` included. It is not absent to the upstream, which walks the
-same bytes and stops at the option it understands. So the query is stopped here
-rather than forwarded with the subnet still on it.
+same bytes and stops at the option it understands. So the query is stopped by
+the `edns_opt_readable` gate rather than forwarded with the subnet still on it -
+which it is whether or not the stump has a subnet in front of it, the case
+`edns_opt_test.odin` pins from the other side.
 */
 @(test)
 test_a_client_subnet_behind_unreadable_opt_bytes_is_not_forwarded :: proc(t: ^testing.T) {
@@ -487,9 +490,7 @@ test_a_client_subnet_is_stripped_from_an_opt_that_is_not_last :: proc(t: ^testin
 
 	decoded, derr := dns.decode_message(wire, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
-	sent, strippable := client_subnet_sent(decoded)
-	testing.expect(t, sent, "the subnet was not noticed at all")
-	testing.expect(t, strippable, "a single OPT record was reported unstrippable")
+	testing.expect(t, client_subnet_sent(decoded), "the subnet was not noticed at all")
 
 	out, ok := dns.remove_edns_option(wire, .Client_Subnet, context.temp_allocator)
 	if !testing.expect(t, ok, "the strip failed on an OPT that is not last") {
@@ -523,9 +524,7 @@ test_a_repeated_client_subnet_in_one_opt_is_stripped_whole :: proc(t: ^testing.T
 
 	decoded, derr := dns.decode_message(wire, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
-	sent, strippable := client_subnet_sent(decoded)
-	testing.expect(t, sent, "the repeated subnet was not noticed")
-	testing.expect(t, strippable, "one OPT record was reported unstrippable")
+	testing.expect(t, client_subnet_sent(decoded), "the repeated subnet was not noticed")
 
 	out, ok := dns.remove_edns_option(wire, .Client_Subnet, context.temp_allocator)
 	if !testing.expect(t, ok, "the strip failed on a repeated option") {
@@ -534,7 +533,6 @@ test_a_repeated_client_subnet_in_one_opt_is_stripped_whole :: proc(t: ^testing.T
 	after, _ := dns.decode_message(out, context.temp_allocator)
 	_, survived := dns.find_edns_option(after, .Client_Subnet)
 	testing.expect(t, !survived, "a second copy of the subnet survived the strip")
-	still, _ := client_subnet_sent(after)
-	testing.expect(t, !still, "the stripped query still reports a subnet")
+	testing.expect(t, !client_subnet_sent(after), "the stripped query still reports a subnet")
 	free_all(context.temp_allocator)
 }

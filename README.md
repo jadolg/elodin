@@ -1518,8 +1518,11 @@ be](#how-large-a-udp-answer-may-be).
 
 Also handled: EDNS0 (the client's OPT record is forwarded upstream so payload
 sizes are negotiated end to end, minus its cookie and its client-subnet option,
-which both stop here; over UDP the OPT that comes back to the client carries
-*this* server's payload size, per RFC 6891 section 6.2.4, while on the stream
+which both stop here — and a query with two OPT records, or with one whose
+options cannot be read, is refused with FORMERR rather than forwarded, because
+neither is a message those two can be taken back out of; over UDP the OPT that
+comes back to the client carries *this* server's payload size, per RFC 6891
+section 6.2.4, while on the stream
 transports it is passed through as it stands — see [How large a UDP answer may
 be](#how-large-a-udp-answer-may-be)), DNS
 cookies in both directions (RFC 7873, RFC 9018) — answered for clients, and
@@ -1826,10 +1829,14 @@ upstream traffic by the number of servers.
   public upstream where that client claims to be. Nothing is sent in its place:
   the upstream scopes on elodin's own address, as it does for a query that never
   carried the option. There is no setting to turn forwarding back on, because
-  there is nowhere honest to file the answers yet. A query hiding the option
-  where it cannot be taken back out — in a second OPT record, or behind option
-  bytes that do not parse as an option list, neither of which RFC 6891 permits
-  anyway — is answered FORMERR rather than forwarded.
+  there is nowhere honest to file the answers yet. A query whose EDNS elodin
+  cannot account for — one carrying more than one OPT record, or an OPT whose
+  RDATA is not a well-formed option list, neither of which RFC 6891 section
+  6.1.1 permits — is answered FORMERR before anything is looked up, since an
+  option hidden in either shape survives a strip that reports success. That
+  refusal is not about the subnet: a malformed OPT record costs the client the
+  answer and not only the option it mangled, and it keeps the cookie strip
+  honest too.
 - No per-client rules, no query log database, no web or API surface. Statistics
   go to the log every five minutes, and to a Prometheus endpoint when
   [`metrics.enabled`](#metrics) is set — but that endpoint is counters only,
