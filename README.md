@@ -901,7 +901,10 @@ What bounds it is a budget on how much this server will send *to one place*. The
 sender's own rate is not worth measuring — they are not the ones receiving it,
 and with a spoofed address there is nothing of theirs to measure — so the budget
 is kept per destination prefix, /24 and /64, which is the granularity an attacker
-picks addresses within.
+picks addresses within. An IPv4 client that reached a listener bound to `::`
+arrives as `::ffff:a.b.c.d`, and is budgeted on its /24 rather than on the
+`::/64` those bytes fall in — the same reading of the mapping that
+[`server.allow_from`](#who-may-ask) applies.
 
 Over-budget queries are not simply dropped. Every `slip`th one comes back as a
 header and a question with the TC bit set: thirty-odd bytes, too small to be

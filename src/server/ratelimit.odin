@@ -375,12 +375,20 @@ The prefix an answer would be delivered to, hashed.
 /24 and /64 are the units an attacker picks addresses within, so they are the
 units the budget is kept in. The hash is keyed (see `hash_key`), and never
 returns 0, which marks a bucket as unused.
+
+The v4 mapping is undone first, so an IPv4 client is keyed on its /24 whichever
+kind of socket it arrived on. Left mapped it would be keyed as IPv6, and every
+`::ffff:a.b.c.d` address is zeroes in the four groups a /64 is taken from - so
+the whole IPv4 side of a listener bound to `::` would share one bucket, and any
+one client there could spend the budget of all the others. `unmap_v4` is the same
+normalisation `is_loopback` reads a source through, and the rule the ACL compared
+it against on the way in.
 */
 @(private)
 prefix_key :: proc(r: ^Rate_Limiter, address: net.Address) -> u64 {
 	buf: [16]u8
 	n := 0
-	switch a in address {
+	switch a in unmap_v4(address) {
 	case net.IP4_Address:
 		buf[0], buf[1], buf[2] = a[0], a[1], a[2]
 		n = 3

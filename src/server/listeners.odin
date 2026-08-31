@@ -631,22 +631,73 @@ plausible_source :: proc(l: ^Listeners, client: net.Endpoint) -> bool {
 	return !is_loopback(client.address)
 }
 
+/*
+The IPv4 address inside `::ffff:a.b.c.d`, when that is what an address holds.
+
+An IPv4 client reaching a socket bound to `::` arrives mapped, and so do our own
+datagrams to an IPv4 destination under such a bind. `core:net` reports the
+sixteen bytes as they arrived and nothing between the socket and here normalises
+them, so a judgement that needs the address a client actually has asks for it
+through this. A deployment `config.source_allowed` goes out of its way to support
+(see `config.address_bytes`, and the `allow_from` section of the README) is one
+every other judgement about a source has to be able to make too: whether it is
+loopback, and which prefix's budget it spends.
+
+Exactly the mapped prefix, which is `config.unmap_bytes`'s rule and has to stay
+the same rule: ten zero bytes, then `ff ff`. The deprecated compat form
+`::a.b.c.d` and the translated form `::ffff:0:a.b.c.d` are IPv6 addresses that
+happen to carry four familiar octets, no stack sources a datagram from them, and
+reading them as IPv4 here would judge a source by an address the ACL compares as
+IPv6 - which is the way round that gives a v6 sender the choice.
+*/
+@(private)
+unmap_v4 :: proc(a: net.Address) -> net.Address {
+	x, is6 := a.(net.IP6_Address)
+	if !is6 {
+		return a
+	}
+	for i in 0 ..< 5 {
+		if x[i] != 0 {
+			return a
+		}
+	}
+	if u16(x[5]) != 0xffff {
+		return a
+	}
+	hi, lo := u16(x[6]), u16(x[7])
+	return net.IP4_Address{u8(hi >> 8), u8(hi), u8(lo >> 8), u8(lo)}
+}
+
+// Mapped or not is not a difference between two addresses: `::ffff:10.0.0.1` is
+// 10.0.0.1, and a source claiming one of the two forms of an address we bound is
+// claiming that address.
 @(private)
 addresses_equal :: proc(a, b: net.Address) -> bool {
-	switch x in a {
+	switch x in unmap_v4(a) {
 	case net.IP4_Address:
-		y, ok := b.(net.IP4_Address)
+		y, ok := unmap_v4(b).(net.IP4_Address)
 		return ok && x == y
 	case net.IP6_Address:
-		y, ok := b.(net.IP6_Address)
+		y, ok := unmap_v4(b).(net.IP6_Address)
 		return ok && x == y
 	}
 	return false
 }
 
+/*
+Whether an address is one of this host's own.
+
+Read as a statement about who is at the other end: `plausible_source` refuses a
+datagram from one on our own listening port, since under a wildcard bind that is
+this server talking to itself, and `start_metrics` warns when the endpoint it
+bound is not one, since anything else serves the numbers to whatever can reach
+them. Both questions are asked of addresses that may arrive mapped, so the
+mapping is undone before 127/8 is looked for - `::ffff:127.0.0.1` is the address
+our own datagrams to a v4 destination carry under a `::` bind.
+*/
 @(private)
 is_loopback :: proc(a: net.Address) -> bool {
-	switch x in a {
+	switch x in unmap_v4(a) {
 	case net.IP4_Address:
 		return x[0] == 127
 	case net.IP6_Address:
