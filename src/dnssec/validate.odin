@@ -125,9 +125,13 @@ targets is the sender's to choose, so the walks need a bound that is not.
 
 Eight is past every answer of this shape that anyone serves: an HTTPS answer
 names one target, an SRV set a handful, and an eight-exchange MX set is a large
-one. Past the bound the hints are dropped exactly as the whole section used to
-be - a round trip for the client, not a wrong answer - so erring small costs
-little and erring large costs upstream queries somebody else picked.
+one. A target past the bound keeps no hints, exactly as the whole section used
+to keep none - a round trip for the client, not a wrong answer - so erring small
+costs little and erring large costs upstream queries somebody else picked. The
+eight that are inside it keep theirs, and which eight those are is the order the
+sender wrote its answer section in: a response naming more than eight decides
+which of its targets a client is spared a lookup for, and can decide it badly,
+but every one it picks is still authenticated before anything is kept.
 
 The query budget is the other bound and the one that holds when this is not
 enough: the walks spend `MAX_LOOKUPS_PER_QUERY` and
@@ -878,6 +882,15 @@ authenticated and carried out under the AD bit; that would still be authentic
 data, since each hint is checked against its own zone, but it would be a stranger
 choosing what this server spends its chain walks on.
 
+What it removes is the free version of that. An attacker who holds a signed zone
+of their own can still nominate a target, by appending a signed SVCB or MX RRset
+from it - `validate_answer` authenticates whatever it can and does not ask which
+RRsets concern the question, so that set reaches `answered` like any other. It
+buys the same thing appending an unsigned record used to: up to
+`MAX_HINT_TARGETS` names of the attacker's choosing walked to, inside the query
+budget every other walk shares, and authentic data or nothing at the end of it.
+Which is why the bound above is a bound and not a comfort.
+
 An HTTPS or SVCB record in ServiceMode may write its TargetName as ".", which RFC
 9460 section 2.5 makes the owner name itself rather than the root. AliasMode -
 priority zero - is a redirection to be followed rather than a service to connect
@@ -977,11 +990,19 @@ redirection nobody asked it to follow, on the strength of a section it does not
 otherwise read.
 
 The cost is upstream queries, and where it falls is worth being plain about: a
-target inside the zone the answer established costs nothing at all, because
-`zone_step` finds that zone in the validator's cache. A target in a second zone
-costs the walk down to it, shared with every later question through the same
-cache. `MAX_HINT_TARGETS` bounds how many of those one response can ask for, and
-the query budget bounds what they may spend between them.
+signed hint inside the zone the answer established costs nothing at all, because
+the walk goes to the RRSIG's signer and `zone_step` finds that zone in the
+validator's cache. A hint in a second zone costs the walk down to it, shared
+with every later question through the same cache. A hint nothing verified -
+unsigned, or forged - costs one step more than either: `validate_rrset` settles
+forged against unsigned by walking to the *owner*, and the owner of a hint is a
+name below its zone rather than the zone itself, so that step is a DS query for
+a name that is no cut and that `zone_step` does not cache as one. Appending an
+unsigned address at a target the answer really names is therefore worth a lookup
+to whoever appends it, on every miss. A hint padded past the allowance is the one
+that costs nothing extra: the exhausted return comes before that walk.
+`MAX_HINT_TARGETS` bounds how many of these one response can ask for, and the
+query budget bounds what they may spend between them.
 
 One more thing changes for the client, and it is not a security property: the
 records kept here carry TTLs of their own, and `cache.put` holds an entry for the
