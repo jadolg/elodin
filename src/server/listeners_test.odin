@@ -592,3 +592,47 @@ groups_address :: proc(groups: [8]u16) -> net.Address {
 	}
 	return addr
 }
+
+/*
+Loopback is 127/8 and `::1`, swept over every octet that decides it.
+
+The table above names the interesting addresses; this says there are no others.
+127/8 whole in both forms, nothing outside it in either, and the sweep is over
+the octet the check actually reads - a check that looked at the wrong byte, or
+compared a range rather than the octet, passes a hand-written table and fails
+here.
+*/
+@(test)
+test_loopback_is_127_over_8_in_both_forms :: proc(t: ^testing.T) {
+	for first in 0 ..< 256 {
+		want := first == 127
+		unmapped := net.IP4_Address{u8(first), 0, 0, 1}
+		testing.expectf(
+			t,
+			is_loopback(unmapped) == want,
+			"%d.0.0.1: is_loopback said %v",
+			first,
+			is_loopback(unmapped),
+		)
+		testing.expectf(
+			t,
+			is_loopback(mapped_address(u8(first), 0, 0, 1)) == want,
+			"`::ffff:%d.0.0.1`: is_loopback said %v",
+			first,
+			is_loopback(mapped_address(u8(first), 0, 0, 1)),
+		)
+	}
+	// Everything below the /8 is inside it, whichever form it arrived in.
+	for byte_value in 0 ..< 256 {
+		b := u8(byte_value)
+		testing.expectf(t, is_loopback(net.IP4_Address{127, b, b, b}), "127.%d.%d.%d is inside 127/8", b, b, b)
+		testing.expectf(t, is_loopback(mapped_address(127, b, b, b)), "`::ffff:127.%d.%d.%d` is inside 127/8", b, b, b)
+	}
+	// `::1` and nothing near it.
+	testing.expect(t, is_loopback(net.IP6_Loopback), "`::1` is loopback")
+	for group in 0 ..< 8 {
+		groups := [8]u16{0, 0, 0, 0, 0, 0, 0, 1}
+		groups[group] |= 0x0100
+		testing.expectf(t, !is_loopback(groups_address(groups)), "a bit set in group %d of `::1` is not `::1`", group)
+	}
+}

@@ -1,5 +1,6 @@
 package server
 
+import "core:log"
 import "core:net"
 import "core:testing"
 import "core:thread"
@@ -401,6 +402,175 @@ test_only_the_v4_mapped_prefix_is_unmapped :: proc(t: ^testing.T) {
 	// An address of neither family is not a prefix; it gets the one key that is
 	// not a hash of anything.
 	testing.expect_value(t, prefix_key(r, nil), u64(1))
+}
+
+/*
+The address a v4 client actually arrives as, from the kernel rather than a literal.
+
+Every other test here builds `::ffff:a.b.c.d` by hand, which proves the judgement
+and assumes the premise. This one binds `::`, sends a datagram to 127.0.0.1 from
+an IPv4 socket, and asks both questions of whatever address `recv_udp` reports -
+so the fix rests on what a client really arrives as rather than on a reading of
+`core:net`, and it stays honest if a platform or a future `core:net` ever reports
+the unmapped form instead.
+
+Skipped, out loud, where `::` cannot be bound or is not dual-stack: that is a
+property of the machine (`net.ipv6.bindv6only`, a container without IPv6) rather
+than of the code, and a hard failure there would be a false alarm. The line in
+the log is so that a runner where this never executes is visible rather than
+quietly green.
+*/
+@(test)
+test_a_real_v4_client_on_a_wildcard_bind_is_judged_by_its_v4_address :: proc(t: ^testing.T) {
+	server_socket, serr := net.make_bound_udp_socket(net.IP6_Any, 0)
+	if serr != nil {
+		log.infof("skipped: this machine cannot bind `::` (%v)", serr)
+		return
+	}
+	defer net.close(server_socket)
+	_ = net.set_option(server_socket, .Receive_Timeout, 2 * time.Second)
+
+	bound, berr := net.bound_endpoint(server_socket)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the bound port: %v", berr)
+		return
+	}
+
+	client_socket, cerr := net.make_unbound_udp_socket(.IP4)
+	if cerr != nil {
+		testing.expectf(t, false, "cannot open an IPv4 socket: %v", cerr)
+		return
+	}
+	defer net.close(client_socket)
+
+	payload := [1]u8{0}
+	to := net.Endpoint {
+		address = net.IP4_Loopback,
+		port    = bound.port,
+	}
+	if _, err := net.send_udp(client_socket, payload[:], to); err != nil {
+		log.infof("skipped: a `::` bind is not reachable over IPv4 here (%v)", err)
+		return
+	}
+	buf: [4]u8
+	_, from, rerr := net.recv_udp(server_socket, buf[:])
+	if rerr != nil {
+		log.infof("skipped: nothing arrived on the `::` socket from an IPv4 client (%v)", rerr)
+		return
+	}
+
+	// Whatever form it is in, these are the two judgements that have to come out
+	// the way they would for 127.0.0.1 itself.
+	testing.expectf(t, is_loopback(from.address), "a real IPv4 client (%v) did not read as loopback", from.address)
+
+	r := make_rate_limiter(10, 0)
+	defer destroy_rate_limiter(r)
+	testing.expectf(
+		t,
+		prefix_key(r, from.address) == prefix_key(r, net.IP4_Loopback),
+		"a real IPv4 client (%v) was keyed as a different prefix from 127.0.0.1",
+		from.address,
+	)
+	// And it must not be keyed as `::/64`, which is what every mapped address
+	// collapsed to and the reason one bucket held the whole IPv4 side.
+	testing.expectf(
+		t,
+		prefix_key(r, from.address) != prefix_key(r, net.IP6_Any),
+		"a real IPv4 client (%v) was keyed as `::/64`",
+		from.address,
+	)
+
+	// The premise itself, on the record: mapped is what a dual-stack `::` bind
+	// reports, and a platform that ever stops doing so should say so here.
+	if _, is6 := from.address.(net.IP6_Address); !is6 {
+		log.infof("note: this platform reports an IPv4 client on a `::` bind unmapped (%v)", from.address)
+	}
+}
+
+/*
+No single bit off the mapped prefix is read as IPv4.
+
+`unmap_v4`'s guard is ten zero bytes and then `ff ff`, and a guard is worth
+sweeping rather than sampling: a loop bound one short, a mask on the wrong byte,
+a comparison against the wrong half of the pair. Every bit that can be set in
+the ten zero bytes, and every bit that can be cleared in the pair, must leave the
+address IPv6 - because reading one of them as IPv4 is what would let a v6 sender
+choose which IPv4 prefix's budget to spend.
+*/
+@(test)
+test_no_single_bit_off_the_mapped_prefix_is_read_as_ipv4 :: proc(t: ^testing.T) {
+	r := make_rate_limiter(10, 0)
+	defer destroy_rate_limiter(r)
+
+	// `::ffff:198.51.100.1`, and the key it has to have.
+	MAPPED :: [8]u16{0, 0, 0, 0, 0, 0xffff, 0xc633, 0x6401}
+	v4_key := prefix_key(r, net.IP4_Address{198, 51, 100, 1})
+	testing.expect_value(t, prefix_key(r, v6_of(MAPPED)), v4_key)
+
+	// A bit set anywhere in the ten bytes that have to be zero.
+	for group in 0 ..< 5 {
+		for bit in 0 ..< 16 {
+			groups := MAPPED
+			groups[group] |= u16(1) << uint(bit)
+			testing.expectf(
+				t,
+				prefix_key(r, v6_of(groups)) != v4_key,
+				"bit %d of group %d set, and the address was still read as 198.51.100.0/24",
+				bit,
+				group,
+			)
+		}
+	}
+	// And a bit cleared anywhere in the `ff ff` pair.
+	for bit in 0 ..< 16 {
+		groups := MAPPED
+		groups[5] &~= u16(1) << uint(bit)
+		testing.expectf(
+			t,
+			prefix_key(r, v6_of(groups)) != v4_key,
+			"bit %d of the `ff ff` pair cleared, and the address was still read as 198.51.100.0/24",
+			bit,
+		)
+	}
+}
+
+/*
+An unmapped source is keyed on its /24 exactly: all of it, and no more of it.
+
+Swept over every value of every octet, because "keyed on the /24" is two claims
+and a mistake in either is a real one. Too few bytes - a /16, say - and two
+unrelated networks share a budget, which is the collapse this fix is about in
+miniature. Too many - the whole address - and the budget is per host, so an
+attacker aiming at one victim spreads a flood across the 256 addresses of its
+/24 and pays nothing for it, which is the reason the limit is kept per prefix at
+all.
+*/
+@(test)
+test_a_mapped_source_is_keyed_on_its_24_exactly :: proc(t: ^testing.T) {
+	r := make_rate_limiter(10, 0)
+	defer destroy_rate_limiter(r)
+
+	ORIGIN := [4]u8{198, 51, 100, 1}
+	v4_key := prefix_key(r, mapped(ORIGIN[0], ORIGIN[1], ORIGIN[2], ORIGIN[3]).address)
+
+	for pos in 0 ..< 4 {
+		for value in 0 ..< 256 {
+			octets := ORIGIN
+			octets[pos] = u8(value)
+			// The host octet is below the prefix, so only it may differ freely.
+			want := pos == 3 || u8(value) == ORIGIN[pos]
+			got := prefix_key(r, mapped(octets[0], octets[1], octets[2], octets[3]).address) == v4_key
+			testing.expectf(
+				t,
+				got == want,
+				"octet %d set to %d: keys %s, expected %s",
+				pos,
+				value,
+				"agree" if got else "differ",
+				"agreement" if want else "a difference",
+			)
+		}
+	}
 }
 
 /*

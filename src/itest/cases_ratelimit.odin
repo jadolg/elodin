@@ -28,7 +28,14 @@ one-shared-budget version it replaced is written down.
 // is about datagrams wants: a listener nothing connects to would only be a port
 // for the suite to collide on.
 @(private = "file")
-config_rate_limit :: proc(udp_port, upstream_port: int, limit: string, tcp_port := 0) -> string {
+config_rate_limit :: proc(
+	udp_port, upstream_port: int,
+	limit: string,
+	tcp_port := 0,
+	// `::` for the case that needs both families on one port; loopback otherwise,
+	// so the rest of the suite binds no more than it is asking about.
+	udp_address := "127.0.0.1",
+) -> string {
 	tcp := "{ enabled: false }"
 	if tcp_port > 0 {
 		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port)
@@ -36,7 +43,7 @@ config_rate_limit :: proc(udp_port, upstream_port: int, limit: string, tcp_port 
 	return fmt.tprintf(
 		`log: {{ level: warn }}
 listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
+  udp: {{ enabled: true, address: "%s", port: %d }}
   tcp: %s
 server:
   # Pinned rather than derived from whatever machine the suite is running on:
@@ -52,6 +59,7 @@ upstream:
 cache: {{ enabled: true, max_entries: 100 }}
 blocking: {{ enabled: false }}
 `,
+		udp_address,
 		udp_port,
 		tcp,
 		limit,
@@ -345,4 +353,63 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 		}
 	}
 	end_case(r)
+
+	/*
+	Both families of client on one wildcard listener, each with a budget of its own.
+
+	An IPv4 client reaching a listener bound to `::` arrives as `::ffff:a.b.c.d`,
+	which is zeroes in the four groups an IPv6 source is keyed on - so keyed as
+	IPv6 it landed in the `::/64` bucket, the same one `::1` lands in, and the
+	whole IPv4 side of the listener shared a budget with it. This is that from the
+	outside, and it is the case that needs no spoofing to show: two real clients,
+	two real families, one port, and the kernel filling in the source addresses.
+
+	One response a second, for the reason the case above gives: a shared bucket
+	stays empty for a whole second after the flood, so the IPv6 query landing
+	microseconds later cannot be answered out of a refill. `wildcard_flood` sends
+	it before draining anything, which is what puts it there.
+
+	The IPv4 result is checked first: two hundred datagrams answered a handful of
+	times is the flood having arrived and been cut to the budget, and without that
+	the IPv6 answer below would only be saying the limiter was never reached.
+	*/
+	if !ipv6_loopback_available() {
+		skip_case(r, "rate limit: a `::` listener tells the families apart", "no IPv6 loopback on this machine")
+	} else {
+		start_case(r, "rate limit: a `::` listener tells the families apart")
+		{
+			udp_port := next_port(r)
+			srv, ok := start_server(
+				r,
+				Server_Options {
+					config = config_rate_limit(
+						udp_port,
+						upstream_port,
+						"enabled: true, responses_per_second: 1, slip: 0",
+						udp_address = "::",
+					),
+					udp_port = udp_port,
+				},
+			)
+			if check(r, ok, "server did not start") {
+				defer stop_server(&srv)
+
+				res := wildcard_flood(udp_port, query, QUERIES)
+				check(r, res.v6_sent, "the IPv6 query did not go out, so nothing below was tested")
+				check(
+					r,
+					res.v4_answered <= 4,
+					"%d full answers to %d datagrams at one a second, so the budget was not spent",
+					res.v4_answered,
+					QUERIES,
+				)
+				check(
+					r,
+					res.v6_answered,
+					"an IPv4 flood on a `::` listener spent the IPv6 client's budget: it got no answer at all",
+				)
+			}
+		}
+		end_case(r)
+	}
 }

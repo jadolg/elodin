@@ -648,3 +648,105 @@ tcp_port_open :: proc(port: int) -> bool {
 	net.close(socket)
 	return true
 }
+
+/*
+Whether this machine can be an IPv6 client at all.
+
+Asked before a case that needs one, so a container without IPv6 skips it rather
+than failing it: that is a property of the machine, not of the server.
+*/
+ipv6_loopback_available :: proc() -> bool {
+	socket, err := net.make_bound_udp_socket(net.IP6_Loopback, 0)
+	if err != nil {
+		return false
+	}
+	net.close(socket)
+	return true
+}
+
+/*
+An IPv4 flood and then one IPv6 query, both to one port a `::` bind is serving.
+
+Interleaved in one procedure because the order is the whole point. A `::` bind is
+a single dual-stack socket, so both families' datagrams land in one queue and the
+server reads them in the order they were sent - the IPv6 query is therefore read
+after the flood has spent whatever budget it is charged to, with no time in
+between for tokens to accrue. Sent after a pause instead, it would be answered
+out of whatever refilled during the pause whether the two clients share a bucket
+or not, and the case would prove nothing.
+
+The IPv4 side is drained first and the IPv6 reply read afterwards: it has been
+waiting in its own socket since the server sent it, so reading it last costs
+nothing and keeps the drain loop from spending its time on two timeouts.
+*/
+Wildcard_Flood_Result :: struct {
+	v4_answered: int,
+	v6_answered: bool,
+	// False when this machine could not send the IPv6 query at all, which the
+	// caller has to tell apart from an answer that was withheld.
+	v6_sent:     bool,
+}
+
+wildcard_flood :: proc(udp_port: int, query: []u8, count: int, drain := 700 * time.Millisecond) -> Wildcard_Flood_Result {
+	res: Wildcard_Flood_Result
+
+	v4, v4_err := net.make_unbound_udp_socket(.IP4)
+	if v4_err != nil {
+		return res
+	}
+	defer net.close(v4)
+	v6, v6_err := net.make_unbound_udp_socket(.IP6)
+	if v6_err != nil {
+		return res
+	}
+	defer net.close(v6)
+	for socket in ([]net.UDP_Socket{v4, v6}) {
+		_ = net.set_option(socket, .Receive_Timeout, 50 * time.Millisecond)
+		_ = net.set_option(socket, .Send_Timeout, time.Second)
+		_ = net.set_option(socket, .Receive_Buffer_Size, 4 << 20)
+	}
+
+	out := make([]u8, len(query), context.temp_allocator)
+	copy(out, query)
+
+	to_v4 := net.Endpoint {
+		address = net.IP4_Loopback,
+		port    = udp_port,
+	}
+	for i in 0 ..< count {
+		// A transaction ID of its own per query, as a real client would.
+		out[0], out[1] = u8(i >> 8), u8(i)
+		if _, serr := net.send_udp(v4, out, to_v4); serr != nil {
+			break
+		}
+	}
+
+	// Straight after it, same port, other family.
+	out[0], out[1] = 0xff, 0xff
+	to_v6 := net.Endpoint {
+		address = net.IP6_Loopback,
+		port    = udp_port,
+	}
+	if _, serr := net.send_udp(v6, out, to_v6); serr != nil {
+		return res
+	}
+	res.v6_sent = true
+
+	buf := make([]u8, 65535, context.temp_allocator)
+	deadline := time.time_add(time.now(), drain)
+	for time.diff(deadline, time.now()) < 0 {
+		n, _, rerr := net.recv_udp(v4, buf)
+		if rerr != nil {
+			// The receive timeout expiring is how this notices the quiet.
+			continue
+		}
+		if n < dns.HEADER_SIZE {
+			continue
+		}
+		res.v4_answered += 1
+	}
+	if n, _, rerr := net.recv_udp(v6, buf); rerr == nil && n >= dns.HEADER_SIZE {
+		res.v6_answered = true
+	}
+	return res
+}

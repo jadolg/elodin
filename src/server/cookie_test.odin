@@ -594,3 +594,41 @@ test_cookie_unbindable_address_is_answered_when_not_required :: proc(t: ^testing
 	testing.expect(t, !found, "a cookie was minted for an address it cannot be bound to")
 	free_all(context.temp_allocator)
 }
+
+/*
+A cookie is bound to the client's address as the socket reported it.
+
+`cookie_client_ip` hashes `::ffff:a.b.c.d` as the sixteen bytes it arrived as,
+and is the one place in the server that does not undo the mapping - `unmap_v4`
+undoes it for the rate limiter and for loopback, and `config.address_bytes` for
+the ACL. What is decided here is only whether a cookie this server issued came
+back from the address it was issued to, and a client returns to the socket that
+issued it, which reports it the same way both times.
+
+So both halves are asserted: a mapped client's own cookie verifies, and the two
+spellings are not interchangeable. The second is the deliberate part. Unmapping
+would make them interchangeable, would be harmless, and would invalidate every
+cookie in flight at the upgrade - so if a later change unmaps here for
+consistency's sake, this is the test that should be read before it is deleted.
+*/
+@(test)
+test_a_cookie_is_bound_to_the_address_as_reported :: proc(t: ^testing.T) {
+	k := keeper("e5e973e5a6b2a43f48e7dc849e37bfcf")
+
+	client := request("2464c4abcf10c957", "[::ffff:198.51.100.100]:9999")
+	// Sixteen, so the mapping really did survive the parse: a four-byte input
+	// here would mean this test was about an IPv4 client and proved nothing.
+	testing.expect_value(t, client.ip_len, 16)
+
+	issued := make_cookie(&k, client, 1559731985)
+	testing.expect(t, verify_cookie(&k, issued[:], client, 1559731985), "a mapped client's own cookie was rejected")
+
+	unmapped := request("2464c4abcf10c957", "198.51.100.100:9999")
+	testing.expect_value(t, unmapped.ip_len, 4)
+	testing.expect(
+		t,
+		!verify_cookie(&k, issued[:], unmapped, 1559731985),
+		"the two forms hash alike, so something here is undoing the mapping after all",
+	)
+	free_all(context.temp_allocator)
+}
