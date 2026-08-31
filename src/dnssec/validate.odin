@@ -2105,6 +2105,8 @@ Step :: enum u8 {
 	Secure,
 	// No delegation here, so the parent still covers everything below.
 	No_Cut,
+	// The name is not there at all, so nothing below it is either.
+	Absent,
 	Insecure,
 	Bogus,
 	Indeterminate,
@@ -2148,6 +2150,41 @@ zone_trust :: proc(
 			zone = child
 			keys = child_keys
 		case .No_Cut:
+			/*
+			Not a cut, so the walk keeps its keys and keeps going.
+
+			Stopping here instead reads "nothing is delegated at this name" as
+			"nothing below this name is delegated either", which is not the same
+			statement and not true: an empty non-terminal has no NS and no DS of
+			its own and still has zone cuts under it. `seed.btc.petertodd.net.`
+			is one of those, under an empty `btc.petertodd.net.`, and stopping
+			at `petertodd.net.` leaves every signature that zone makes coming
+			from a zone this walk never established - which is refused, so a
+			zone the rest of the internet validates comes back SERVFAIL.
+
+			The cost is one DS lookup per label, and what keeps a client from
+			choosing how many is `.Absent` below: only a name the zone really
+			holds is walked past, and the first name it does not hold ends the
+			walk. So the depth here is the zone's own, not the question's.
+			Caching non-cuts the way `cache_put` caches zones would take even
+			that back if a deep chain of real empty non-terminals ever shows.
+			*/
+			continue
+		case .Absent:
+			/*
+			Nothing exists at this name, so nothing exists below it and no zone
+			cut can be hiding down there: the zone reached so far is the deepest
+			one, and the walk is done.
+
+			Asking anyway is what the label-by-label walk above would otherwise
+			do, and it is wrong twice over. It turns one client question into a
+			blocking DS lookup per remaining label, none of which will ever be
+			asked again for a name nobody has. And under NSEC3 it asks about a
+			name the denial does not speak for: a name error proves the closest
+			encloser and the next closer, so the step below the next closer
+			finds neither a match nor a cover, and a zone that validates
+			everywhere else comes back `Bogus`.
+			*/
 			return .Secure, keys, zone
 		case .Insecure:
 			return .Insecure, nil, child
@@ -2312,25 +2349,49 @@ zone_step :: proc(
 		return .Bogus, nil
 	}
 
+	step = denial_step(nsecs, nsec3s, child, parent, v.max_nsec3_iterations)
+	if step == .Insecure {
+		cache_put(v, child, .Insecure, nil, negative_ttl(msg), now)
+	}
+	return step, nil
+}
+
+/*
+Read a verified DS denial: is `child` an unsigned delegation, a name that is
+not a cut, or a name that is not there at all?
+
+Kept apart from the lookup around it because this is the whole of the decision
+and none of it needs a network: the records have already been checked against
+the parent's keys, and what is left is what they say.
+*/
+@(private)
+denial_step :: proc(
+	nsecs: []Nsec_Rr,
+	nsec3s: []Nsec3_Rr,
+	child, parent: string,
+	max_nsec3_iterations: int,
+) -> Step {
 	if len(nsecs) > 0 {
 		if nsec_proves_no_ds(nsecs, child) == .Proven {
-			cache_put(v, child, .Insecure, nil, negative_ttl(msg), now)
-			return .Insecure, nil
+			return .Insecure
 		}
 		if nsec_proves_no_delegation(nsecs, child) {
-			return .No_Cut, nil
+			return .No_Cut if nsec_shows_node(nsecs, child) else .Absent
 		}
 	}
 	if len(nsec3s) > 0 {
-		if nsec3_proves_no_ds(nsec3s, child, parent, v.max_nsec3_iterations) == .Proven {
-			cache_put(v, child, .Insecure, nil, negative_ttl(msg), now)
-			return .Insecure, nil
+		if nsec3_proves_no_ds(nsec3s, child, parent, max_nsec3_iterations) == .Proven {
+			return .Insecure
 		}
-		if nsec3_proves_no_delegation(nsec3s, child, parent, v.max_nsec3_iterations) {
-			return .No_Cut, nil
+		if nsec3_proves_no_delegation(nsec3s, child, parent, max_nsec3_iterations) {
+			// An NSEC3 zone publishes a record for every empty non-terminal
+			// (RFC 5155 section 7.1), so a name with none of its own is a name
+			// that is not there.
+			_, matched := nsec3_matching(nsec3s, child, max_nsec3_iterations)
+			return .No_Cut if matched else .Absent
 		}
 	}
-	return .Bogus, nil
+	return .Bogus
 }
 
 /*

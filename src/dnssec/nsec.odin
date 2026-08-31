@@ -221,6 +221,32 @@ nsec_proves_no_delegation :: proc(nsecs: []Nsec_Rr, name: string) -> bool {
 }
 
 /*
+Does an NSEC set show that `name` is a node in the zone at all?
+
+An NSEC on the name itself says so outright. An empty non-terminal has none of
+its own - RFC 4035 section 2.3 asks for a record only where there is data or a
+delegation - so the zone answers for it with the NSEC covering it, which is the
+same record it would send for a name that is not there at all (RFC 7129 section
+5.4 calls this out as the one place the two are indistinguishable by shape).
+
+Where that record points tells them apart. Names sort so that everything under a
+name follows it immediately, before any sibling, so the first name after an
+empty non-terminal is the descendant it exists for. A name that is really not
+there is followed by something outside it.
+
+The walk down to a zone's keys turns on this: a node that is not a cut still has
+cuts under it and has to be walked past, while a name that is not there has
+nothing under it to walk to.
+*/
+nsec_shows_node :: proc(nsecs: []Nsec_Rr, name: string) -> bool {
+	if _, found := nsec_matching(nsecs, name); found {
+		return true
+	}
+	cover, covered := nsec_covering(nsecs, name)
+	return covered && !dns.name_equal_fold(cover.rr.next, name) && name_in_zone(cover.rr.next, name)
+}
+
+/*
 Decode the "extended hex" base32 of RFC 4648 section 7.
 
 NSEC3 owner names use that alphabet rather than ordinary base32 because its
