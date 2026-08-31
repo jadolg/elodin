@@ -31,6 +31,32 @@ find_edns_option :: proc(m: Message, code: EDNS_Option_Code) -> (data: []u8, fou
 }
 
 /*
+The data carried under `code` in an encoded message's OPT record, read off the
+wire rather than off a decoded message.
+
+The same answer `find_edns_option` gives, for the messages a decode never gets
+to. A caller that has to judge a reply *before* deciding whether to accept it
+cannot ask for a decode first: a message that is well formed through the
+question and malformed after it is one the reply matcher accepts, so a check
+that only looks at messages which decode is one the sender opts out of by making
+the tail unreadable. Walking the OPT record answers the question for exactly the
+set of messages the matcher is willing to accept.
+
+`found` is false when the message has no OPT record, when the record has no such
+option, and when the message cannot be walked that far - three things a caller
+asking "is this option here" answers the same way.
+*/
+peek_edns_option :: proc(msg: []u8, code: EDNS_Option_Code) -> (data: []u8, found: bool) {
+	span := find_opt_span(msg) or_return
+	site := scan_edns_option(msg, span, u16(code)) or_return
+	if !site.found {
+		return nil, false
+	}
+	// The four bytes the walk counted are the option's own code and length.
+	return msg[site.start + 4:site.end], true
+}
+
+/*
 Put `data` into the message's OPT record under `code`, replacing any option
 already there.
 
