@@ -62,7 +62,6 @@ def canonical_name(name):
 
 class Key:
     """One Ed25519 zone key, used as both KSK and ZSK."""
-
     def __init__(self, zone, seed):
         """Derive the key deterministically, so a regenerated fixture matches."""
         self.zone = zone
@@ -111,7 +110,6 @@ class Key:
 
 class RR:
     """One resource record, carrying its RDATA already encoded."""
-
     def __init__(self, name, rtype, rdata, ttl=3600):
         """Hold one record; `rdata` is already in wire form."""
         self.name, self.type, self.rdata, self.ttl = name, rtype, rdata, ttl
@@ -133,7 +131,6 @@ def labels_of(name):
 
 def signed_label_count(owner):
     """The Labels field an honest signature over `owner` carries."""
-
     # RFC 4034 section 3.1.3 counts the owner name's labels without a leading
     # asterisk, so a zone's own `*.example.com.` counts two rather than three.
     return len([label for label in labels_of(owner) if label != "*"])
@@ -141,7 +138,6 @@ def signed_label_count(owner):
 
 def signing_owner(owner, labels):
     """The name a signature is computed under, which is `owner` unless it expands."""
-
     # A Labels field short of the owner's own count says a wildcard answered, and
     # RFC 4035 section 5.3.2 has the signature computed over that wildcard rather
     # than over the name it was expanded to.
@@ -153,7 +149,6 @@ def signing_owner(owner, labels):
 
 def sign(rrset, key, signer=None, labels=None):
     """Build an RRSIG over `rrset`, which is one owner name and one type."""
-
     # The validity window and the TTLs come from the module constants: no scenario
     # has needed to vary them, and a signature outside the window is a case the
     # Odin tests reach by moving the clock rather than by signing differently.
@@ -225,7 +220,6 @@ def scenario(fn):
 @scenario
 def algorithm_downgrade():
     """Cover a delegation naming two DS algorithms, one of them unknown here."""
-
     # RFC 6840 section 5.11: a validator needs one DS it can follow, and the
     # presence of a DS for an algorithm it does not implement neither breaks the
     # delegation nor excuses it from checking the one it does. Getting this wrong
@@ -258,7 +252,6 @@ def algorithm_downgrade():
 @scenario
 def unsupported_algorithm_only():
     """Cover the same delegation with only the unknown-algorithm DS left."""
-
     # Nothing in the chain can be followed past this point, and RFC 6840 section
     # 5.2 makes that an insecure delegation rather than a broken one: the answer
     # is served without the AD bit rather than refused.
@@ -285,7 +278,6 @@ def unsupported_algorithm_only():
 @scenario
 def unsupported_digest_only():
     """Cover a DS we can follow by algorithm but not by digest type."""
-
     # Same outcome as an unknown algorithm, by the same section, and worth its own
     # fixture because the two fields are checked separately and only one of them
     # being consulted is an easy mistake to make.
@@ -313,7 +305,6 @@ def unsupported_digest_only():
 @scenario
 def revoked_key():
     """Cover a zone whose apex key is published revoked (RFC 5011)."""
-
     # The key still hashes to the DS the parent published - revoking changes the
     # flags, which changes the key tag, but an attacker replaying an old DS would
     # not care. A validator that ignores the bit would keep trusting a key its
@@ -343,7 +334,6 @@ def revoked_key():
 @scenario
 def unfollowable_ds_beside_unsupported():
     """Cover a followable DS matching no key, beside one we cannot read."""
-
     # This is the case that tells the two layers of the check apart. `zone_step`
     # refuses a DS set with nothing usable in it before spending a DNSKEY lookup;
     # `fetch_keys` reaches the same verdict again after the lookup, for the set
