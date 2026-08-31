@@ -139,24 +139,28 @@ it. Eight forgeries at the head of an RRset therefore spent the whole per-RRset
 allowance before the genuine signature was reached, the set was dropped, and the
 answer came back Bogus - a denial's RRset taking every NXDOMAIN in the zone with
 it. The cap could only ever be filled by signatures an attacker chose; the
-genuine one is what it kept out. Both paths that verify a set - `validate_rrset`
-for the answer section and `verified_rrset` for a denial - are counted here, so
-neither keeps a private allowance that can be emptied on its own.
+genuine one is what it kept out.
 
 Counted across the question instead, and spent only on signatures that could
 actually verify - see `signature_worth_trying`, which refuses the rest for
-nothing. Generous next to any real answer: a set carries one signature per
-algorithm, and a chain a handful of sets.
+nothing. Every verification a question can reach comes from here, at four call
+sites: `validate_rrset` for an answer's own RRsets, `verified_rrset` for a
+denial's proof, the RRSIGs over a DS set in `zone_step`, and the RRSIGs over a
+DNSKEY set in `fetch_keys`. The last two were unbounded until #193 - their
+signature list comes out of a response, so its length was whoever answered the
+lookup, and `MAX_LOOKUPS_PER_QUERY` allows 32 such lookups per question.
 
-Spent by `validate_rrset` and `verified_rrset`, which is every signature over an
-answer's own RRsets and over a denial's proof - the proof `zone_step` reads when
-a delegation comes back with no DS included, since that goes through
-`verified_rrset` like every other denial. It is *not* spent by the two loops
-that check a DS set in `zone_step` or a DNSKEY set in `fetch_keys`; those have
-never had a bound of any kind, before this change or after it, and giving them
-one is #193 rather than something to bolt on here. So this is a bound on the
-signatures a response's own records provoke and on the denials its chain walks
-through, not on every verification a question can reach.
+One budget for all four, so no path keeps a private allowance that can be
+emptied on its own - and so the chain walk shares what it spends with the
+answer. That is deliberate, and it costs something: a padded DS set early in a
+walk can exhaust what a later step needs and leave a resolvable name
+Indeterminate. It is the trade the paragraph below describes, made once more -
+an attacker who can pad a response can already deny the answer by corrupting it
+- and the alternative, an allowance per step, is a bound that multiplies by the
+step count and so is not much of a bound. The room is there for real traffic: a
+set carries one signature per algorithm and the first one tried is the one that
+verifies, so a genuine chain spends about one verification per lookup and a
+whole question far less than this.
 
 It is also a bound on work and not a guarantee that the genuine signature is
 reached, and the difference is worth being plain about. A forgery that copies the real
@@ -1852,6 +1856,13 @@ zone_trust :: proc(
 /*
 Take one step down: is `child` a signed zone, an unsigned delegation, or not a
 zone cut at all?
+
+The signatures over the DS set are whatever the DS lookup came back with, so
+they are bounded like every other verification: refused for nothing when their
+key tag and algorithm name no key of the parent's, and charged to
+`MAX_VERIFICATIONS_PER_QUERY` when they are not. A step whose allowance ran out
+is one this server did not read, so it is `Indeterminate` rather than a
+delegation reported broken.
 */
 @(private)
 zone_step :: proc(
@@ -1913,9 +1924,23 @@ zone_step :: proc(
 	if len(ds_records) > 0 {
 		sigs := sigs_covering(msg.answer, child, .DS, class, allocator)
 		verified := false
+		exhausted := false
 		for sig in sigs {
 			if !dns.name_equal_fold(sig.signer, parent) {
 				continue
+			}
+			// Free rejects first, so a padded DS set spends the budget only on
+			// signatures that could actually verify.
+			if !signature_worth_trying(sig, parent_keys, unix) {
+				continue
+			}
+			if !spend_verification(budget) {
+				logx.debugf(
+					"dnssec: DS %s ran out of verifications before a signature held; the step is undecided",
+					dns.name_trim_root(child),
+				)
+				exhausted = true
+				break
 			}
 			result, _ := check_signature(sig, child, class, ds_records, parent_keys, unix, allocator)
 			if result == .Ok {
@@ -1924,7 +1949,10 @@ zone_step :: proc(
 			}
 		}
 		if !verified {
-			return .Bogus, nil
+			// A step this server ran out of allowance on is one it did not
+			// read, which is `Indeterminate` territory rather than a broken
+			// delegation - the same distinction the denial path below makes.
+			return .Indeterminate if exhausted else .Bogus, nil
 		}
 
 		set := make([dynamic]Ds, 0, len(ds_records), allocator)
@@ -2004,6 +2032,14 @@ published.
 
 At least one key has to hash to a DS and then sign the whole set, which is what
 binds the zone's own keys to its parent.
+
+Finding that key is three nested loops - the DS records, the keys they match,
+the signatures over the set - and both the DS records and the signatures are
+counts a response chooses, the DS set by padding it with duplicates that survive
+the parent's signature and the DNSKEY set by publishing whatever it likes. So
+the verification sits inside all three and spends
+`MAX_VERIFICATIONS_PER_QUERY`, and a zone whose allowance ran out is
+`Indeterminate`: see the note on that return for why it must not be `Insecure`.
 */
 @(private)
 fetch_keys :: proc(
@@ -2055,7 +2091,8 @@ fetch_keys :: proc(
 	sigs := sigs_covering(msg.answer, zone, .DNSKEY, class, allocator)
 	unsupported := false
 
-	for ds in ds_set {
+	exhausted := false
+	ds_loop: for ds in ds_set {
 		if !algorithm_supported(ds.algorithm) || !digest_supported(ds.digest_type) {
 			unsupported = true
 			continue
@@ -2067,6 +2104,15 @@ fetch_keys :: proc(
 			if !ds_matches(zone, key, ds) {
 				continue
 			}
+			/*
+			This one key, and no other. A key tag is a 16-bit fold of the RDATA,
+			not an identity: two keys can share one, and an attacker is free to
+			make that happen. Offering the whole set here would let a key of
+			their own satisfy the signature while the parent's DS went on
+			attesting a key that had signed nothing - which is the entire chain
+			of trust bypassed in one step.
+			*/
+			attested := [1]Dnskey{key}
 			// The key is vouched for by the parent; now it must vouch for the
 			// rest of the set.
 			for sig in sigs {
@@ -2076,15 +2122,26 @@ fetch_keys :: proc(
 				if !dns.name_equal_fold(sig.signer, zone) {
 					continue
 				}
+				// Free rejects first, as everywhere else: a lapsed signature
+				// cannot verify, and finding that out costs nothing where
+				// canonicalising the DNSKEY set for it does not.
+				if !signature_worth_trying(sig, attested[:], unix) {
+					continue
+				}
 				/*
-				This one key, and no other. A key tag is a 16-bit fold of the
-				RDATA, not an identity: two keys can share one, and an attacker
-				is free to make that happen. Offering the whole set here would
-				let a key of their own satisfy the signature while the parent's
-				DS went on attesting a key that had signed nothing - which is
-				the entire chain of trust bypassed in one step.
+				Charged against the query, and charged inside all three loops
+				rather than around them: the count here is the DS records that
+				match this key multiplied by the signatures the zone published,
+				and a response chooses both.
 				*/
-				attested := [1]Dnskey{key}
+				if !spend_verification(budget) {
+					logx.debugf(
+						"dnssec: DNSKEY %s ran out of verifications before a signature held; the zone is undecided",
+						dns.name_trim_root(zone),
+					)
+					exhausted = true
+					break ds_loop
+				}
 				result, _ := check_signature(sig, zone, class, records, attested[:], unix, allocator)
 				switch result {
 				case .Ok:
@@ -2099,6 +2156,17 @@ fetch_keys :: proc(
 				}
 			}
 		}
+	}
+	/*
+	Before the verdict below, and not through it. `unsupported` is set by any DS
+	naming an algorithm this build cannot check, which a parent is free to
+	publish beside a supported one - so leaving through that return when the
+	allowance ran out would let a padded DNSKEY set choose `Insecure`, and with
+	it every answer below the zone accepted unvalidated. Running out is a
+	statement about this server, so it says so.
+	*/
+	if exhausted {
+		return nil, .Indeterminate
 	}
 	return nil, .Insecure if unsupported else .Bogus
 }

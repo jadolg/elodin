@@ -6,14 +6,14 @@ import "elodin:dns"
 /*
 `check_signature` on its own, at the point where nothing else is guarding it.
 
-Three of the tests it makes are duplicated elsewhere on the ordinary path -
-`validate_rrset` and `verified_rrset` run `signature_worth_trying` first, which
-also refuses a lapsed signature - and that duplication is deliberate: one call
-decides whether to spend a verification, the other decides the answer. But the
-chain walk does not go through the cheap one. `zone_step` checks the signature
-over a DS set and `fetch_keys` checks the one over a DNSKEY set by calling
-straight in here, so on the two lookups that build the chain of trust these are
-the only checks there are.
+One of the tests it makes is duplicated on every path that reaches it -
+`signature_worth_trying` also refuses a lapsed signature, and since #193 the two
+chain-walk loops run it as well - and that duplication is deliberate: one call
+decides whether to spend a verification, the other decides the answer. The other
+two are made nowhere else. The cheap pre-check reads a key tag, an algorithm and
+a pair of dates; whether the signer may sign the owner name at all, and whether
+the Labels field agrees with that name, are asked here and only here, on every
+DS and DNSKEY the chain of trust is built out of.
 
 That makes them worth testing where they live rather than through a caller that
 has already refused the same signature for its own reasons. Each test below
