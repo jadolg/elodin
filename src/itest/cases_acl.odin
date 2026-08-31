@@ -100,7 +100,7 @@ start_denying_server :: proc(r: ^Runner, upstream_port: int) -> (srv: Server, tc
 	}
 	// Both listeners, so a TCP case cannot race the bind and read the closed
 	// connection it was hoping for out of a socket nothing is listening on yet.
-	if !wait_listening(&srv, fmt.tprintf("%d/tcp", tcp_port), 5 * time.Second) {
+	if !wait_for_log(&srv, fmt.tprintf("%d/tcp", tcp_port), 5 * time.Second) {
 		fail(r, "server never bound its listeners; log:\n%s", read_log(&srv))
 		stop_server(&srv)
 		return srv, tcp_port, false
@@ -173,13 +173,14 @@ run_acl_cases :: proc(r: ^Runner) {
 			check(r, expect_no_udp_reply(srv.udp_port, query), "the server answered a source outside allow_from")
 			// A second refusal, which must not produce a second line.
 			check(r, expect_no_udp_reply(srv.udp_port, query), "the server answered a source outside allow_from")
-			// The line is written on the read loop, so give it the moment
-			// between the datagram being refused and the file being flushed.
-			time.sleep(200 * time.Millisecond)
-
+			// Polled, not slept then read: nothing the client saw is ordered
+			// against this line. A refused datagram is answered with silence, so
+			// all the calls above established is that a receive timeout elapsed -
+			// the line is written on the server's read loop, on its own schedule,
+			// and a fixed pause only asserts that the write beat the read.
 			check(
 				r,
-				log_contains(&srv, "udp: refused a query from"),
+				wait_for_log(&srv, "udp: refused a query from", 5 * time.Second),
 				"the log does not say a query was refused over udp; log:\n%s",
 				read_log(&srv),
 			)
@@ -197,6 +198,9 @@ run_acl_cases :: proc(r: ^Runner) {
 				"the log does not name the setting to change; log:\n%s",
 				read_log(&srv),
 			)
+			// Read once, and safe to: `report_refusal` writes these in one call,
+			// so the poll above is what waited for all three, and the second
+			// refusal was sent and timed out before any of it.
 			check_eq_int(r, log_count(&srv, "refused a query from"), 1, "refusal lines after two refusals")
 		}
 	}
@@ -219,10 +223,9 @@ run_acl_cases :: proc(r: ^Runner) {
 			connected, answered := tcp_closed_without_answer(tcp_port)
 			check(r, connected, "the tcp listener is not accepting at all, so the case proves nothing")
 			check(r, !answered, "the server answered a tcp source outside allow_from")
-			time.sleep(200 * time.Millisecond)
 			check(
 				r,
-				log_contains(&srv, "tcp: refused a connection from"),
+				wait_for_log(&srv, "tcp: refused a connection from", 5 * time.Second),
 				"a refused tcp connection left nothing in the log; log:\n%s",
 				read_log(&srv),
 			)

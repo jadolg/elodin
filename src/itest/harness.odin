@@ -315,15 +315,26 @@ wait_tcp :: proc(tcp_port: int, timeout: time.Duration) -> bool {
 }
 
 /*
-Probe by reading the log instead of by asking a question.
+Poll the log until a line shows up, or give up.
 
-For a server that is configured not to answer this suite - the `allow_from`
-cases, which have to ask from a source outside the list - the UDP probe above
-can never succeed, and waiting for it would only measure the timeout. The line
-the listeners print once they are bound says the same thing without needing an
-answer.
+The read-once counterpart, `log_contains`, is only sound when something already
+establishes that the line is on the file: a query the server answered carries
+its own query-log line, because `handle_query` logs before the response is
+handed to the socket. Where the case learned what to expect from a *different*
+observable - a receive timeout on a datagram nothing was sent back for, a
+handshake that verifies against a renewed certificate - there is no such
+ordering, and the line reaches the file on the server's own schedule. Reading
+once then asserts that the write beat the read, which is a statement about the
+machine rather than about the server.
+
+So this re-reads until the needle appears, the same wait-until-or-give-up shape
+`wait_ready` uses for the readiness probe. It is also how a server that is
+configured not to answer this suite - the `allow_from` cases, which have to ask
+from a source outside the list - is waited for at all: the UDP probe can never
+succeed there, and the line the listeners print once they are bound says the
+same thing without needing an answer.
 */
-wait_listening :: proc(srv: ^Server, needle: string, timeout: time.Duration) -> bool {
+wait_for_log :: proc(srv: ^Server, needle: string, timeout: time.Duration) -> bool {
 	deadline := time.time_add(time.now(), timeout)
 	for time.diff(deadline, time.now()) < 0 {
 		if log_contains(srv, needle) {
@@ -396,6 +407,9 @@ read_log :: proc(srv: ^Server) -> string {
 	return string(data)
 }
 
+// One read of the log as it stands. Sound only where the case already holds an
+// ordering that puts the line on the file - see `wait_for_log`, which is what a
+// case that learned what to expect from some other observable wants instead.
 log_contains :: proc(srv: ^Server, needle: string) -> bool {
 	return strings.contains(read_log(srv), needle)
 }
