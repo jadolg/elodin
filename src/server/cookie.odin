@@ -321,6 +321,15 @@ The client's address as the bytes the hash covers.
 
 Four for IPv4, sixteen for IPv6, which is also what fixes the length of the
 hash input at 20 or 32 bytes.
+
+`::ffff:a.b.c.d` is hashed as the sixteen bytes it arrived as, deliberately, and
+this is the one place that answers the mapping question that way - `unmap_v4`
+undoes it for the rate limiter and for loopback, and `config.address_bytes` for
+the ACL. What is being decided here is only whether a cookie this server issued
+came back from the address it was issued to, and a client returns to the socket
+it was talking to, which reports its address the same way both times. Unmapping
+would be harmless and would invalidate every cookie in flight at the upgrade, so
+it is not worth doing for tidiness.
 */
 @(private)
 cookie_client_ip :: proc(client: string, out: []u8) -> (n: int, ok: bool) {
