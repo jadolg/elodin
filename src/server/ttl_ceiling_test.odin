@@ -122,7 +122,7 @@ exchange_once :: proc(
 		return nil, .Failed, false
 	}
 	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	bound, berr := net.bound_endpoint(socket)
 	if !testing.expectf(t, berr == nil, "cannot read the mock's port: %v", berr) {
 		return nil, .Failed, false

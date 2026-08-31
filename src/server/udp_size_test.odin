@@ -169,7 +169,7 @@ harness_start :: proc(t: ^testing.T, h: ^Harness, caching := false, cookies := f
 		return false
 	}
 	h.socket = socket
-	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 
 	bound, berr := net.bound_endpoint(socket)
 	if berr != nil {

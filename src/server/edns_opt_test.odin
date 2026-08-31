@@ -159,7 +159,7 @@ opt_fixture_start :: proc(t: ^testing.T, f: ^Opt_Fixture) -> bool {
 		return false
 	}
 	f.socket = socket
-	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	bound, berr := net.bound_endpoint(socket)
 	if berr != nil {
 		testing.expectf(t, false, "cannot read the mock's port: %v", berr)
@@ -250,11 +250,6 @@ test_a_cookie_in_a_second_opt_record_is_not_forwarded :: proc(t: ^testing.T) {
 
 	// Two OPT records, the cookie in the second: refused, and nothing sent.
 	{
-		x := Opt_Mock{socket = f.socket, name = "hidden.example."}
-		// The mock is here to report that nothing arrived, so it should not hold
-		// the run open for the two seconds a real exchange is allowed.
-		_ = net.set_option(f.socket, .Receive_Timeout, 200 * time.Millisecond)
-		mock := thread.create_and_start_with_poly_data(&x, serve_opt)
 		pair := make([]dns.Record, 2, context.temp_allocator)
 		pair[0] = dns.make_opt(1232, false)
 		pair[1] = cookie_opt()
@@ -265,11 +260,9 @@ test_a_cookie_in_a_second_opt_record_is_not_forwarded :: proc(t: ^testing.T) {
 			"127.0.0.1:5555",
 			context.temp_allocator,
 		)
-		thread.join(mock)
-		thread.destroy(mock)
 
-		testing.expect(t, !x.saw_cookie, "the client's cookie reached the upstream in a second OPT record")
-		testing.expect(t, !x.served, "the query was forwarded instead of being refused")
+		// Nothing arrived, so neither did the cookie in the second record.
+		testing.expect(t, mock_untouched(f.socket), "the query was forwarded instead of being refused")
 		testing.expect(t, ok, "the client was left with nothing at all")
 		testing.expect_value(t, outcome, Outcome.Failed)
 		testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.Form_Err)
@@ -295,10 +288,7 @@ test_an_unreadable_opt_is_refused_with_nothing_hidden_in_it :: proc(t: ^testing.
 		return
 	}
 	defer opt_fixture_stop(&f)
-	_ = net.set_option(f.socket, .Receive_Timeout, 200 * time.Millisecond)
 
-	x := Opt_Mock{socket = f.socket, name = "stump.example."}
-	mock := thread.create_and_start_with_poly_data(&x, serve_opt)
 	additional := make([]dns.Record, 1, context.temp_allocator)
 	additional[0] = truncated_opt()
 	out, outcome, ok := handle_query(
@@ -308,10 +298,8 @@ test_an_unreadable_opt_is_refused_with_nothing_hidden_in_it :: proc(t: ^testing.
 		"127.0.0.1:5555",
 		context.temp_allocator,
 	)
-	thread.join(mock)
-	thread.destroy(mock)
 
-	testing.expect(t, !x.served, "an OPT record this server cannot read was forwarded")
+	testing.expect(t, mock_untouched(f.socket), "an OPT record this server cannot read was forwarded")
 	testing.expect(t, ok, "the client was left with nothing at all")
 	testing.expect_value(t, outcome, Outcome.Failed)
 	testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.Form_Err)

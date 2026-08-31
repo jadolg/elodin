@@ -94,7 +94,7 @@ test_a_blocked_name_reached_through_a_cname_is_still_blocked :: proc(t: ^testing
 		return
 	}
 	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	bound, _ := net.bound_endpoint(socket)
 
 	cfg := config.default_config()
@@ -716,7 +716,7 @@ test_a_cloaked_answer_is_fetched_from_the_upstream_only_once :: proc(t: ^testing
 		return
 	}
 	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	bound, _ := net.bound_endpoint(socket)
 
 	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
@@ -784,7 +784,7 @@ test_a_refused_answer_is_not_cached_with_the_upstream_ad_bit :: proc(t: ^testing
 		return
 	}
 	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	bound, _ := net.bound_endpoint(socket)
 
 	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
@@ -905,7 +905,7 @@ test_junk_outside_the_answer_section_does_not_withhold_the_answer :: proc(t: ^te
 		return
 	}
 	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	bound, _ := net.bound_endpoint(socket)
 
 	cfg := config.default_config()
@@ -1026,7 +1026,7 @@ test_a_refusal_on_a_partial_decode_is_released_by_a_reload :: proc(t: ^testing.T
 		return
 	}
 	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	bound, _ := net.bound_endpoint(socket)
 
 	cfg := config.default_config()
@@ -1167,7 +1167,7 @@ test_an_unreadable_cname_target_is_servfail_not_a_block_answer :: proc(t: ^testi
 		return
 	}
 	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	bound, _ := net.bound_endpoint(socket)
 
 	cfg := config.default_config()
@@ -1238,7 +1238,7 @@ test_an_unreadable_refusal_does_not_outlive_the_answer_that_caused_it :: proc(t:
 		return
 	}
 	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	bound, _ := net.bound_endpoint(socket)
 
 	cfg := config.default_config()
@@ -1338,7 +1338,7 @@ test_an_entry_that_turns_unreadable_on_a_later_walk_is_dropped :: proc(t: ^testi
 		return
 	}
 	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	bound, _ := net.bound_endpoint(socket)
 
 	cfg := config.default_config()
