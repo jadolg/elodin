@@ -18,7 +18,7 @@ import "elodin:upstream"
 USAGE :: `elodin - a filtering DNS forwarder
 
 usage:
-  elodin [--config <path>] [--check] [--version]
+  elodin [--config <path>] [--check] [--no-fetch] [--version]
 
 options:
   -c, --config <path>  configuration file (default: /etc/elodin/elodin.yaml)

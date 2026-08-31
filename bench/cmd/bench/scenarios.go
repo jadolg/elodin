@@ -494,9 +494,9 @@ func (h *harness) cacheFilledRSS(o serverOpts) (cacheFill, error) {
 // shedding is what happens past capacity: the server drops rather than queues.
 func (h *harness) shedding() (section, error) {
 	// The offered load has to exceed what the workers can carry by enough that
-	// the queue, not the client count, is what bounds it: 6000 clients against
-	// 128 workers on a 20 ms upstream is about a thousandfold more demand than
-	// supply, so an unbounded queue has room to become the latency.
+	// the queue, not the client count, is what bounds it: 6000 queries
+	// outstanding against 128 workers is about fifty times the concurrency the
+	// pool has, so an unbounded queue has room to become the latency.
 	const clients = 6000
 
 	var sb strings.Builder

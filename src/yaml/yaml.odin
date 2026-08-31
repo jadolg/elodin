@@ -10,11 +10,32 @@ A pragmatic YAML subset, sized for configuration files.
 Supported: block mappings and sequences, nested structures by indentation,
 plain / single-quoted / double-quoted scalars, flow sequences and mappings
 ([a, b] and {k: v}), block scalars (| and >, with the - and + chomping
-indicators), comments, and document markers.
+indicators), and comments.
 
 Not supported: anchors and aliases, tags, multiple documents in one stream,
-complex (?) keys, and multi-line plain scalars. Any of these raise an error
-rather than being silently misread.
+complex (?) keys, and multi-line plain scalars.
+
+Two of those are refused, and the other three are not, which is worth knowing
+before trusting a file this parser accepted. A complex `?` key and a multi-line
+plain scalar are refused: neither fits the "one key, one value, indentation
+decides nesting" shape every line is read against, so both come back as a parse
+error naming their line.
+
+Anchors, aliases and tags are not recognised at all. There is no syntax for them
+here, so `&name`, `*name` and `!!tag` are read as part of the plain scalar they
+sit in - `file: &f /tmp/x.log` yields the literal value `&f /tmp/x.log`, spaces
+and all. That surfaces as an error only when the value goes on to fail a typed
+conversion in `config`, which is where `level: &lvl warn` is caught; on a
+string-typed key it is accepted as written.
+
+Document markers are skipped rather than acted on: `scan_lines` drops any line
+that is exactly `---` or `...`, so a file holding several documents is read as
+one, with later documents merged over the first rather than rejected. That is
+the one case where the reading differs from YAML's without saying so, and it is
+kept because a leading `---` is common and harmless in a single-document file.
+
+A parser this size is the right trade for one configuration file, but "it
+parsed" is not "it means what YAML says it means" for the three above.
 */
 
 Kind :: enum u8 {

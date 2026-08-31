@@ -140,7 +140,7 @@ again with a check that the runner got its own resolver back.
 ### From a .deb
 
 ```sh
-sudo apt install ./elodin_0.8.0-1_amd64.deb
+sudo apt install ./elodin_0.13.0-1_amd64.deb
 ```
 
 The binary lands at `/usr/bin/elodin`, the unit at
@@ -690,7 +690,8 @@ without the AD bit, exactly as the reverse zones above are.
 Either key that forwards them does this: `special_use.onion: false`, which says
 the upstream is Tor-aware, and `special_use.enabled: false`, which turns the
 whole table off. It is the only other place validation is skipped, it applies to
-nothing but `onion.`, and both keys are off until an operator writes one down;
+nothing but `onion.`, and neither key forwards anything until an operator writes
+one of those lines down — both default to `true`;
 see [Names that are never forwarded](#names-that-are-never-forwarded), which has
 what that costs an operator who set `enabled: false` for some other reason.
 
@@ -804,7 +805,7 @@ more — REFUSED, not a silent drop, so a client that meant to ask recursively
 finds out rather than timing out:
 
 ```
-ts=… level=info msg="query client=198.51.100.7:41234 proto=udp qtype=A qname=\"example.com\" outcome=refused detail=\"rd\" ms=0.1"
+ts=… level=info msg=query client=198.51.100.7:41234 proto=udp qtype=A qname=example.com outcome=refused detail=rd ms=0.1
 ```
 
 It does not add to `refused=` in the stats line — that counter is `allow_from`
@@ -1141,14 +1142,14 @@ section — handed it to the browser. The cost of closing it is that a name whos
 upstream emits something elodin's decoder rejects now returns NODATA for A and
 AAAA where it used to be forwarded; such an answer was already not cacheable and
 not re-encodable. Every other question type is forwarded exactly as before. In
-the query log this one reads `outcome=blocked detail="unreadable"`, against
-`detail="rebind"` for an answer that named a private address.
+the query log this one reads `outcome=blocked detail=unreadable`, against
+`detail=rebind` for an answer that named a private address.
 The client gets NODATA — NOERROR with an empty answer section, an SOA so it knows
 how long to remember, and RFC 8914 extended error 15 saying why:
 
 ```
 ts=… level=warn msg="refused an answer for rebind.attacker.example carrying the private address 192.168.1.1: a public name resolving into private space is how a DNS rebinding attack reaches a service on this network, so the client was told NODATA"
-ts=… level=info msg="query client=192.168.1.20:41234 proto=udp qtype=A qname=\"rebind.attacker.example\" outcome=blocked detail=\"rebind\" ms=12.4"
+ts=… level=info msg=query client=192.168.1.20:41234 proto=udp qtype=A qname=rebind.attacker.example outcome=blocked detail=rebind ms=12.4
 ```
 
 NODATA rather than SERVFAIL, deliberately. A stub resolver configured with two
@@ -1398,7 +1399,8 @@ other than tor and your upstream is an ordinary public resolver, its NXDOMAIN fo
 a `.onion` name now arrives as insecure rather than as the root-signed
 nonexistence it could have proved, and a forged address for one is passed on
 rather than caught as Bogus. That is the exposure `onion: false` already accepts,
-and it is bounded by both keys being off by default. Nothing else moves:
+and it is bounded by both keys defaulting to `true`, so neither forwards until
+somebody writes it down. Nothing else moves:
 validation is untouched for every other name, and for `.onion` too while the
 table is answering it.
 
@@ -1577,10 +1579,23 @@ like any other. Section 8 applies to forwarded answers too, cache or no cache.
 ## Capacity
 
 Everything below comes out of `mise run bench`, against a mock upstream held at
-a realistic 20 ms and with the shipped defaults. The harness lives in `bench/`
-and is documented there; the run these figures are from is
-`bench/results/2026-08-03-ryzen7-6850u.md`. Re-taking them is the point — a
-number here that the harness does not produce is a number to delete.
+a realistic 20 ms. The harness lives in `bench/` and is documented there; the run
+these figures are from is `bench/results/2026-08-03-ryzen7-6850u.md`. Re-taking
+them is the point — a number here that the harness does not produce is a number
+to delete.
+
+Four settings are not at their shipped values, and the numbers should be read
+knowing it. **DNSSEC validation is off**, because the mock serves an unsigned
+zone with no chain to the root and every answer would otherwise be SERVFAIL.
+**Rate limiting is off**, because the load generator is one address asking as
+fast as it can, which is exactly what the limiter exists to stop — at the shipped
+500 responses a second per prefix none of these figures is reachable.
+`server.workers` and `server.upstream_workers` are **pinned at 128 and 64**
+rather than derived from the machine, so a row means the same thing on any host.
+And `upstream.attempts` is **1** rather than 2, so a failure shows up as one
+instead of being retried into a slower success. What DNSSEC and rate limiting
+cost is a separate question from what the transports cost, which is the reason
+they are held out rather than an argument that they are free.
 
 The machine is a Ryzen 7 PRO 6850U laptop, 16 logical cores. It is a 15 W part
 that cannot hold its boost clock through a long run, so read these as the shape
@@ -1716,15 +1731,15 @@ ts=… level=info msg=sizing workers=16 upstream_workers=8 max_pending=128 origi
 
 ```console
 $ elodin --check
-/etc/elodin/elodin.yaml is valid: 2 upstreams, 1 blocklists, 0 rewrites
+/etc/elodin/elodin.yaml is valid: 2 upstreams, 4 blocklists, 0 rewrites
   workers=16 upstream_workers=8 max_pending=128 (derived from 4 usable CPUs and 7.7 GiB)
-  answering queries from 127.0.0.0/8, ::1/128; every other source is refused
+  answering queries from 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, ::1/128, fc00::/7, fe80::/10; every other source is refused
 ```
 
 Past capacity the server drops queries rather than queueing them
 (`server.max_pending`, derived as `workers * 8`). With 6,000 clients all asking
-for cache misses at once — a thousandfold more demand than a 128-worker pool can
-carry against a 20 ms upstream — that is 4,900 qps served at a bounded 166 ms,
+for cache misses at once — some fifty times the concurrency a 128-worker pool has
+against a 20 ms upstream — that is 4,900 qps served at a bounded 166 ms,
 and about 25,000 queries dropped over twenty seconds. Given an effectively
 unbounded queue the same load serves a comparable 5,900 qps but at 978 ms,
 because the backlog rather than the work becomes the latency, and every client
@@ -1882,7 +1897,8 @@ src/metrics/   Prometheus exposition format, and process figures out of /proc
 src/privdrop/  giving up root once the listeners hold their ports
 src/itest/     integration suite: harness, mock upstreams (DNS, HTTP, DoH/h2), clients, fixtures
 src/fuzz/      libFuzzer targets for the DNS, HPACK and YAML parsers, and their shared arena
-testdata/      fuzz corpus and dictionary, committed so a found crash stays found
+testdata/      fuzz corpus and dictionary, committed so a found crash stays
+               found, plus gen/ - the generator behind the DNSSEC fixtures
 bench/         benchmark harness and DNSSEC survey, in Go, with committed results
 examples/      the shipped configuration, a development one, and a Grafana dashboard
 packaging/     systemd unit and the .deb build script
@@ -1901,16 +1917,16 @@ its own schedule. A fourth, `mise run bench`, measures rather than asserts: it
 is where every number in [Capacity](#capacity) comes from, and it is documented
 in [`bench/README.md`](bench/README.md).
 
-**Unit tests** (`mise run test`, 433 cases) cover the message codec — round trips
+**Unit tests** (`mise run test`, 720 cases) cover the message codec — round trips
 for every modelled RDATA type, compression, truncation, EDNS, pointer loops,
 hostile record counts — plus the YAML parser, configuration loading, list
 parsing and matching, the cache, and the HTTP/2 codec — the HPACK cases run the
 worked examples from RFC 7541 appendix C, so the codec is checked against the
 specification's own vectors rather than against itself.
 
-They run per package, so a failure names one: `dns` 47, `yaml` 34, `config` 55,
-`filter` 8, `logx` 1, `metrics` 9, `privdrop` 9, `cache` 16, `dnssec` 39,
-`tlsx` 5, `upstream` 31, `h2` 69, `server` 110. Much of `tlsx`, `upstream`, `h2`
+They run per package, so a failure names one: `dns` 60, `yaml` 34, `config` 64,
+`filter` 25, `logx` 1, `metrics` 9, `privdrop` 9, `cache` 24, `dnssec` 173,
+`tlsx` 5, `upstream` 42, `h2` 69, `server` 205. Much of `tlsx`, `upstream`, `h2`
 and `server` is what the suite grew around bugs that were found some other way
 and had to stay found — the HTTP reader's framing and body limits, the TLS
 handshake retry, the HTTP/2 stream table under RST_STREAM, and the DoH request
@@ -1933,7 +1949,7 @@ denial is checked against, and a response built to make one question cost as man
 upstream lookups as possible. Each was checked against the code as it stood
 before the fix, so they are known to fail when the property they guard does.
 
-**Integration tests** (`mise run itest`, 191 cases, ~50s) start the built binary
+**Integration tests** (`mise run itest`, 211 cases, ~55s) start the built binary
 as a separate process against scripted mock upstreams, so what is exercised is
 the artefact that ships rather than the library it was compiled from. The suite
 is hermetic: no public resolver is contacted, ports are allocated from a private
@@ -1963,11 +1979,13 @@ What it covers:
 | DoH upstreams | a query resolved over an h2 upstream, one connection multiplexed across queries rather than reopened, fallback to HTTP/1.1 when the upstream does not offer h2 |
 | blocking | all five response modes, hosts vs domains vs adblock semantics, allow precedence, wildcards, modifiers, dnsmasq syntax, unusable rules, case folding |
 | rewrites | A, AAAA, CNAME, wildcard scope, `block`, NODATA for unmatched types |
+| rebinding | a private address is forwarded while the guard is off, refused as NODATA once it is on, a public address is untouched, an `allow_domains` zone may answer privately while a name just outside it may not, and `allow_loopback` opens loopback without opening RFC 1918 |
 | rate limiting | a flood from one source answered in full with the limiter off and cut to the budget with it on, truncated answers over the budget, the bytes one address can be made to receive compared between the two, the same flood pipelined down one TCP connection cut to its budget with nothing truncated, and a TCP client still answered after a datagram flood has spent the prefix's UDP budget |
 | cache | hits avoid the upstream, TTL countdown, cross-transport reuse, question re-casing, negative caching, key separation by type |
 | upstreams | failover, round-robin, race, health cooldown, TCP and DoT clients, connection pooling, UDP→TCP retry, total outage → SERVFAIL |
 | blocklist downloads | two lists fetched over HTTP and both applied, written to the cache directory, reused on restart without re-fetching, unwritable cache directory degrades to a warning |
 | DNSSEC | an answer with no chain of trust is refused rather than served, the forwarded query carries DO and CD, a CD client is served unvalidated, the refusal carries an extended DNS error, and none of it happens unless it is configured |
+| reserved names | `localhost.` resolves to loopback in both families and is NODATA for a type it has none of, `.onion` and `.invalid` are NXDOMAIN with an SOA at the reserved apex, none of it reaches the upstream, `.local` / `.test` / `home.arpa` are forwarded by default, `local: true` answers `.local` and nothing else, `home_arpa: true` serves the zone empty while the apex `DS` is still fetched, `onion: false` hands `.onion` upstream on its own, and the answers are counted on the metrics endpoint |
 | DNS cookies | a client cookie comes back with a server cookie behind it and works again, the client's own cookie never reaches the upstream and the upstream's never reaches the client, an impossible length is FORMERR, a query with no EDNS goes upstream without one, upstream BADCOOKIE is retried invisibly, each side turns off independently, and `require` turns an unproven UDP client away while leaving cookieless and TCP clients alone |
 | certificate reload | the listener serves what it started with, `SIGHUP` swaps in a certificate renewed on disk, and a bad one on disk leaves the working one in place |
 | metrics | no port is open unless the configuration asks for one, a scrape reports the queries that actually went through and the process figures out of `/proc`, the configured path is the only one served, and anything else is a 404 or a 405 |
@@ -1982,9 +2000,10 @@ still pass.
 **Fuzzing** covers the three parsers that read bytes somebody else chose: the
 DNS wire codec (`dns.decode_message`, plus `dns.truncated_response`, which the
 UDP read loop reaches for a rate-limited query without decoding it first), the
-HPACK decoder, and the YAML parser — the last of which reads not only the
-configuration but every blocklist downloaded at runtime. Odin has no
-`-fsanitize=fuzzer` of its own, so `mise run fuzz` emits LLVM IR for each target
+HPACK decoder, and the YAML parser, which reads the configuration file. The
+blocklist formats are not covered: a downloaded list goes to
+`filter.parse_list`, not through the YAML parser, and has no target of its own.
+Odin has no `-fsanitize=fuzzer`, so `mise run fuzz` emits LLVM IR for each target
 and has clang instrument and link it into a libFuzzer binary at `bin/fuzz_*`,
 with ASan on and bounds checks still in.
 
