@@ -187,10 +187,29 @@ def sign(rrset, key, signer=None, labels=None):
     return RR(owner, RRSIG, prefix + signature, TTL)
 
 
-def message(qname, qtype, answer, authority=(), additional=()):
-    """One authoritative NOERROR reply, as the fixture query callback returns it."""
+def type_bitmap(types):
+    """The NSEC type bit maps of RFC 4034 section 4.1.2."""
+    windows = {}
+    for rtype in types:
+        window, bit = rtype >> 8, rtype & 0xFF
+        windows.setdefault(window, bytearray(32))[bit // 8] |= 0x80 >> (bit % 8)
+    out = b""
+    for window in sorted(windows):
+        bitmap = windows[window]
+        length = max(i for i, byte in enumerate(bitmap) if byte) + 1
+        out += bytes([window, length]) + bytes(bitmap[:length])
+    return out
+
+
+def nsec_rdata(next_name, types):
+    """The next owner name and the types present at this one."""
+    return wire_name(next_name) + type_bitmap(types)
+
+
+def message(qname, qtype, answer, authority=(), additional=(), rcode=0):
+    """One authoritative reply, as the fixture query callback returns it."""
     header = struct.pack(
-        "!HHHHHH", QID, FLAGS, 1, len(answer), len(authority), len(additional)
+        "!HHHHHH", QID, FLAGS | rcode, 1, len(answer), len(authority), len(additional)
     )
     out = header + wire_name(qname) + struct.pack("!HH", qtype, CLASS_IN)
     for section in (answer, authority, additional):
@@ -527,6 +546,64 @@ def signed_address_hints():
     hint_chain(root, (zone, other))
     hints_that_hold_up(zone, other)
     hints_that_must_not(zone, other, nowhere)
+
+@scenario
+def zone_cut_under_empty_non_terminal():
+    """Cover a signed zone whose apex sits two labels below its signed parent."""
+    # `deep.mid.entest.` is a zone of its own, and `mid.entest.` between it and
+    # `entest.` is an empty non-terminal: no NS, no DS, nothing but the names
+    # under it. A chain walk that reads "no delegation here" as "nothing below
+    # here is delegated either" stops at `entest.` and never reaches the keys
+    # that signed the answer, which reaches the client as a forgery. The shape
+    # is not exotic - `seed.btc.petertodd.net.` and `seed.bitcoin.sprovoost.nl.`
+    # are both this, under an empty non-terminal their operators never named.
+    root = Key(".", "ent-root")
+    parent = Key("entest.", "ent-parent")
+    child = Key("deep.mid.entest.", "ent-child")
+
+    root_keys = [RR(".", DNSKEY, root.rdata)]
+    print("// anchor: %s" % root.ds_text())
+    emit("en_root_dnskey", ".", "DNSKEY", message(".", DNSKEY, root_keys + [sign(root_keys, root)]))
+
+    ds_set = [RR("entest.", DS, parent.ds())]
+    emit("en_ds", "entest.", "DS", message("entest.", DS, ds_set + [sign(ds_set, root)]))
+
+    parent_keys = [RR("entest.", DNSKEY, parent.rdata)]
+    emit("en_dnskey", "entest.", "DNSKEY",
+         message("entest.", DNSKEY, parent_keys + [sign(parent_keys, parent)]))
+
+    # The empty non-terminal: it exists because something below it does, and it
+    # holds nothing itself. NS absent is what makes it not a zone cut.
+    mid_nsec = [RR("mid.entest.", NSEC, nsec_rdata("deep.mid.entest.", [RRSIG, NSEC]))]
+    emit("en_mid_ds", "mid.entest.", "DS",
+         message("mid.entest.", DS, [], mid_nsec + [sign(mid_nsec, parent)]))
+
+    child_ds = [RR("deep.mid.entest.", DS, child.ds())]
+    emit("en_deep_ds", "deep.mid.entest.", "DS",
+         message("deep.mid.entest.", DS, child_ds + [sign(child_ds, parent)]))
+
+    child_keys = [RR("deep.mid.entest.", DNSKEY, child.rdata)]
+    emit("en_deep_dnskey", "deep.mid.entest.", "DNSKEY",
+         message("deep.mid.entest.", DNSKEY, child_keys + [sign(child_keys, child)]))
+
+    answer = [RR("deep.mid.entest.", A, bytes([192, 0, 2, 1]))]
+    emit("en_answer", "deep.mid.entest.", "A",
+         message("deep.mid.entest.", A, answer + [sign(answer, child)]))
+
+    # One NSEC does both halves of an NXDOMAIN proof here: the span from the
+    # apex to `zz.` swallows `nx.deep.mid.entest.` and the wildcard that would
+    # otherwise have answered for it.
+    apex_nsec = [
+        RR("deep.mid.entest.", NSEC,
+           nsec_rdata("zz.deep.mid.entest.", [A, NS, SOA, RRSIG, NSEC, DNSKEY])),
+    ]
+    denial = apex_nsec + [sign(apex_nsec, child)]
+    emit("en_nx", "nx.deep.mid.entest.", "A",
+         message("nx.deep.mid.entest.", A, [], denial, rcode=3), rcode=3)
+    # The walk asks about the queried name itself before it settles on a zone,
+    # so the denial has to answer a DS lookup too.
+    emit("en_nx_ds", "nx.deep.mid.entest.", "DS",
+         message("nx.deep.mid.entest.", DS, [], denial, rcode=3), rcode=3)
 
 
 if __name__ == "__main__":

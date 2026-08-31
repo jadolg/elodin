@@ -2148,7 +2148,25 @@ zone_trust :: proc(
 			zone = child
 			keys = child_keys
 		case .No_Cut:
-			return .Secure, keys, zone
+			/*
+			Not a cut, so the walk keeps its keys and keeps going.
+
+			Stopping here instead reads "nothing is delegated at this name" as
+			"nothing below this name is delegated either", which is not the same
+			statement and not true: an empty non-terminal has no NS and no DS of
+			its own and still has zone cuts under it. `seed.btc.petertodd.net.`
+			is one of those, under an empty `btc.petertodd.net.`, and stopping
+			at `petertodd.net.` leaves every signature that zone makes coming
+			from a zone this walk never established - which is refused, so a
+			zone the rest of the internet validates comes back SERVFAIL.
+
+			The cost is one DS lookup per label below the deepest cut, and only
+			on the paths that walk past a cut to begin with: a signer walk ends
+			at the zone that signed, and it is the denial and the
+			failure-classification walks that go deeper. Caching non-cuts the
+			way `cache_put` caches zones would take that back if it ever shows.
+			*/
+			continue
 		case .Insecure:
 			return .Insecure, nil, child
 		case .Bogus:
