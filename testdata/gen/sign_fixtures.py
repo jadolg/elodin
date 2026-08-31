@@ -30,6 +30,12 @@ FIXTURE_TIME = 1785664800  # must match FIXTURE_TIME in src/dnssec/dnssec_test.o
 INCEPTION = FIXTURE_TIME - 86400 * 30
 EXPIRATION = FIXTURE_TIME + 86400 * 3650
 
+TTL = 3600
+# A fixture reply is authoritative NOERROR with the query id the Odin harness
+# expects: QR, AA, RD and RA set.
+QID = 0x1234
+FLAGS = 0x8580
+
 ALG_ED25519 = 15
 DIGEST_SHA256 = 2
 CLASS_IN = 1
@@ -39,6 +45,7 @@ DS, RRSIG, NSEC, DNSKEY, NSEC3 = 43, 46, 47, 48, 50
 
 
 def wire_name(name):
+    """A presentation-form name as length-prefixed labels, case preserved."""
     if name in (".", ""):
         return b"\x00"
     out = b""
@@ -50,13 +57,14 @@ def wire_name(name):
 
 
 def canonical_name(name):
+    """The same, lowercased: the form RFC 4034 section 6.2 signs over."""
     return wire_name(name.lower())
 
 
 class Key:
     """One Ed25519 zone key, used as both KSK and ZSK."""
 
-    def __init__(self, zone, seed, flags=257, protocol=3, algorithm=ALG_ED25519):
+    def __init__(self, zone, seed):
         self.zone = zone
         self.priv = ed25519.Ed25519PrivateKey.from_private_bytes(
             hashlib.sha256(seed.encode()).digest()
@@ -64,16 +72,20 @@ class Key:
         self.pub = self.priv.public_key().public_bytes(
             serialization.Encoding.Raw, serialization.PublicFormat.Raw
         )
-        self.flags = flags
-        self.protocol = protocol
-        self.algorithm = algorithm
+        # A single key per zone, acting as both KSK and ZSK. A scenario that
+        # needs a different shape sets these after construction.
+        self.flags = 257
+        self.protocol = 3
+        self.algorithm = ALG_ED25519
 
     @property
     def rdata(self):
+        """The DNSKEY RDATA, which both the key tag and the DS digest run over."""
         return struct.pack("!HBB", self.flags, self.protocol, self.algorithm) + self.pub
 
     @property
     def tag(self):
+        """The key tag of RFC 4034 appendix B."""
         acc = 0
         for i, b in enumerate(self.rdata):
             acc += (b << 8) if i % 2 == 0 else b
@@ -81,11 +93,13 @@ class Key:
         return acc & 0xFFFF
 
     def ds(self, digest_type=DIGEST_SHA256):
+        """This key's DS RDATA, as its parent would publish it."""
         data = canonical_name(self.zone) + self.rdata
         digest = hashlib.sha256(data).digest()
         return struct.pack("!HBB", self.tag, self.algorithm, digest_type) + digest
 
     def ds_text(self):
+        """The same DS in presentation form, for a trust anchor in the tests."""
         return "%s IN DS %d %d %d %s" % (
             self.zone,
             self.tag,
@@ -96,10 +110,13 @@ class Key:
 
 
 class RR:
+    """One resource record, carrying its RDATA already encoded."""
+
     def __init__(self, name, rtype, rdata, ttl=3600):
         self.name, self.type, self.rdata, self.ttl = name, rtype, rdata, ttl
 
     def wire(self):
+        """The record as it goes in a message section."""
         return (
             wire_name(self.name)
             + struct.pack("!HHI", self.type, CLASS_IN, self.ttl)
@@ -108,22 +125,28 @@ class RR:
         )
 
 
-def sign(rrset, key, signer=None, labels=None, ttl=3600, original_ttl=3600,
-         inception=INCEPTION, expiration=EXPIRATION, key_tag=None, algorithm=None):
-    """An RRSIG over `rrset`, which must be one owner name and one type."""
+def sign(rrset, key, signer=None, labels=None):
+    """
+    An RRSIG over `rrset`, which must be one owner name and one type.
+
+    The validity window and the TTLs come from the module constants: no scenario
+    has needed to vary them, and a signature outside the window is a case the
+    Odin tests reach by moving the clock rather than by signing differently.
+
+    `signer` and `labels` default to the truthful values and are overridable
+    because two tests need a signature that is internally consistent with an
+    untruthful one - see `check_signature_test.odin`.
+    """
     signer = signer if signer is not None else key.zone
     owner = rrset[0].name
     rtype = rrset[0].type
     if labels is None:
         stripped = owner.rstrip(".")
         labels = len([l for l in stripped.split(".") if l and l != "*"])
-    algorithm = algorithm if algorithm is not None else key.algorithm
-    key_tag = key_tag if key_tag is not None else key.tag
-
     prefix = (
-        struct.pack("!HBBI", rtype, algorithm, labels, original_ttl)
-        + struct.pack("!II", expiration, inception)
-        + struct.pack("!H", key_tag)
+        struct.pack("!HBBI", rtype, key.algorithm, labels, TTL)
+        + struct.pack("!II", EXPIRATION, INCEPTION)
+        + struct.pack("!H", key.tag)
         + canonical_name(signer)
     )
 
@@ -138,86 +161,27 @@ def sign(rrset, key, signer=None, labels=None, ttl=3600, original_ttl=3600,
     for rdata in sorted({rr.rdata for rr in rrset}):
         body += (
             canonical_name(sign_owner)
-            + struct.pack("!HHI", rtype, CLASS_IN, original_ttl)
+            + struct.pack("!HHI", rtype, CLASS_IN, TTL)
             + struct.pack("!H", len(rdata))
             + rdata
         )
 
     signature = key.priv.sign(prefix + body)
-    return RR(owner, RRSIG, prefix + signature, ttl)
+    return RR(owner, RRSIG, prefix + signature, TTL)
 
 
-def nsec3_hash(name, salt, iterations):
-    h = hashlib.sha1(canonical_name(name) + salt).digest()
-    for _ in range(iterations):
-        h = hashlib.sha1(h + salt).digest()
-    return h
-
-
-B32HEX = "0123456789abcdefghijklmnopqrstuv"
-
-
-def b32hex(data):
-    out, acc, bits = "", 0, 0
-    for byte in data:
-        acc = (acc << 8) | byte
-        bits += 8
-        while bits >= 5:
-            bits -= 5
-            out += B32HEX[(acc >> bits) & 31]
-    if bits:
-        out += B32HEX[(acc << (5 - bits)) & 31]
-    return out
-
-
-def type_bitmap(types):
-    out = b""
-    for window in sorted({t >> 8 for t in types}):
-        bits = bytearray(32)
-        high = 0
-        for t in types:
-            if t >> 8 != window:
-                continue
-            bits[(t & 0xFF) // 8] |= 0x80 >> ((t & 0xFF) % 8)
-            high = max(high, (t & 0xFF) // 8 + 1)
-        out += bytes([window, high]) + bytes(bits[:high])
-    return out
-
-
-def nsec_rdata(next_name, types):
-    return wire_name(next_name) + type_bitmap(types)
-
-
-def nsec3_rdata(next_hash, types, salt=b"", iterations=0, flags=0):
-    return (
-        bytes([1, flags])
-        + struct.pack("!H", iterations)
-        + bytes([len(salt)])
-        + salt
-        + bytes([len(next_hash)])
-        + next_hash
-        + type_bitmap(types)
-    )
-
-
-def nsec3_rr(zone, owner, next_hash, types, salt=b"", iterations=0, flags=0, ttl=3600):
-    name = b32hex(nsec3_hash(owner, salt, iterations)) + "." + zone
-    return RR(name, NSEC3, nsec3_rdata(next_hash, types, salt, iterations, flags), ttl)
-
-
-def message(qname, qtype, answer=(), authority=(), additional=(), rcode=0, qid=0x1234):
-    flags = 0x8580 | rcode  # QR, AA, RD, RA
-    out = struct.pack(
-        "!HHHHHH", qid, flags, 1, len(answer), len(authority), len(additional)
-    )
-    out += wire_name(qname) + struct.pack("!HH", qtype, CLASS_IN)
-    for section in (answer, authority, additional):
+def message(qname, qtype, answer, authority=()):
+    """One authoritative NOERROR reply, as the fixture query callback returns it."""
+    header = struct.pack("!HHHHHH", QID, FLAGS, 1, len(answer), len(authority), 0)
+    out = header + wire_name(qname) + struct.pack("!HH", qtype, CLASS_IN)
+    for section in (answer, authority):
         for rr in section:
             out += rr.wire()
     return out
 
 
 def emit(key, name, rtype, wire, rcode=0):
+    """Print one `Fixture` literal, wrapped the way the Odin files are written."""
     text = wire.hex()
     lines = [text[i:i + 96] for i in range(0, len(text), 96)]
     body = '" +\n\t\t\t"'.join(lines)
@@ -234,6 +198,7 @@ SCENARIOS = {}
 
 
 def scenario(fn):
+    """Register a scenario so it can be generated by name."""
     SCENARIOS[fn.__name__] = fn
     return fn
 
@@ -386,7 +351,10 @@ def unfollowable_ds_beside_unsupported():
 
     # Right algorithm, right digest type, right key tag - and a digest that is
     # not this key's.
-    mismatched = struct.pack("!HBB", child.tag, ALG_ED25519, DIGEST_SHA256) + hashlib.sha256(b"not this key").digest()
+    mismatched = (
+        struct.pack("!HBB", child.tag, ALG_ED25519, DIGEST_SHA256)
+        + hashlib.sha256(b"not this key").digest()
+    )
     unknown = struct.pack("!HBB", child.tag, 253, DIGEST_SHA256) + hashlib.sha256(b"nope").digest()
 
     root_keys = [RR(".", DNSKEY, root.rdata)]
