@@ -26,3 +26,6 @@
 /tlsx
 /upstream
 /yaml
+
+# Python bytecode from testdata/gen/
+__pycache__/
