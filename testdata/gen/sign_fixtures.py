@@ -62,6 +62,7 @@ def canonical_name(name):
 
 class Key:
     """One Ed25519 zone key, used as both KSK and ZSK."""
+
     def __init__(self, zone, seed):
         """Derive the key deterministically, so a regenerated fixture matches."""
         self.zone = zone
@@ -110,6 +111,7 @@ class Key:
 
 class RR:
     """One resource record, carrying its RDATA already encoded."""
+
     def __init__(self, name, rtype, rdata, ttl=3600):
         """Hold one record; `rdata` is already in wire form."""
         self.name, self.type, self.rdata, self.ttl = name, rtype, rdata, ttl
