@@ -510,3 +510,85 @@ test_a_drain_shortens_a_tls_read_as_well :: proc(t: ^testing.T) {
 	testing.expect_value(t, time.Duration(tls.read_timeout_ns), STREAM_LINGER_IDLE)
 	testing.expect_value(t, time.Duration(tls.write_timeout_ns), 10 * time.Second)
 }
+
+/*
+Loopback, in every spelling one can arrive in.
+
+Two callers, and both of them read the answer as a statement about who is at the
+other end. `plausible_source` refuses a datagram from a loopback address on our
+own listening port, because under a wildcard bind that is this server talking to
+itself - and on a `::` bind our own datagrams to an IPv4 destination carry
+`::ffff:127.0.0.1`, not `::1`. `start_metrics` warns when the endpoint it just
+bound is not loopback, so an operator who bound `::ffff:127.0.0.1` was told the
+unauthenticated endpoint was reachable from the network when it was not.
+
+The mapping and nothing else is undone, which is `config.address_bytes`'s rule:
+`::7f00:1` and `::ffff:0:7f00:1` are IPv6 addresses that happen to carry the
+octets of 127.0.0.1, no stack sources a datagram from them, and reading them as
+IPv4 here would be reading an address the ACL compares as IPv6.
+
+127/8 whole, both mapped and not, because that is what loopback is for IPv4 -
+`::1/128` is the whole of it for IPv6, and the compat and translated forms of
+`::1` are not it.
+*/
+@(test)
+test_loopback_is_recognised_through_the_v4_mapping :: proc(t: ^testing.T) {
+	Case :: struct {
+		address:  net.Address,
+		loopback: bool,
+		what:     string,
+	}
+
+	CASES := []Case {
+		{net.IP4_Loopback, true, "127.0.0.1"},
+		{net.IP4_Address{127, 0, 0, 0}, true, "the bottom of 127/8"},
+		{net.IP4_Address{127, 255, 255, 255}, true, "the top of it"},
+		{net.IP6_Loopback, true, "`::1`"},
+		{mapped_address(127, 0, 0, 1), true, "`::ffff:127.0.0.1`, our own datagram under a `::` bind"},
+		{mapped_address(127, 1, 2, 3), true, "the rest of 127/8, mapped"},
+		{mapped_address(127, 255, 255, 255), true, "the top of it, mapped"},
+
+		{net.IP4_Address{126, 255, 255, 255}, false, "just below 127/8"},
+		{net.IP4_Address{128, 0, 0, 1}, false, "just above it"},
+		{mapped_address(126, 255, 255, 255), false, "just below 127/8, mapped"},
+		{mapped_address(128, 0, 0, 1), false, "just above it, mapped"},
+		{mapped_address(0, 0, 0, 0), false, "`::ffff:0.0.0.0`"},
+		{mapped_address(0, 0, 0, 1), false, "0.0.0.0/8 is not loopback"},
+		{mapped_address(192, 0, 2, 1), false, "an ordinary mapped address"},
+		{net.IP6_Any, false, "`::`"},
+		{net.IP6_Address{0x2001, 0x0db8, 0, 0, 0, 0, 0, 1}, false, "an ordinary IPv6 address"},
+		// Not the mapping, so not unmapped.
+		{groups_address({0, 0, 0, 0, 0, 0, 0x7f00, 0x0001}), false, "the compat form of 127.0.0.1"},
+		{groups_address({0, 0, 0, 0, 0xffff, 0, 0x7f00, 0x0001}), false, "the translated form of 127.0.0.1"},
+		{groups_address({0, 0, 0, 0, 0, 0xfffe, 0x7f00, 0x0001}), false, "one bit off the mapped prefix"},
+		{groups_address({0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001}), true, "and the mapped prefix itself, written out"},
+		// The mapped forms of `::1`, which are not addresses at all - the mapping
+		// carries an IPv4 address, and `::1` is not one.
+		{groups_address({0, 0, 0, 0, 0, 0xffff, 0, 1}), false, "`::ffff:0.0.0.1`, not `::1`"},
+
+		// Neither family: not an address, so not loopback.
+		{nil, false, "no address"},
+	}
+
+	for c in CASES {
+		got := is_loopback(c.address)
+		testing.expectf(t, got == c.loopback, "%s: is_loopback said %v", c.what, got)
+	}
+}
+
+// `::ffff:a.b.c.d`, the form an IPv4 peer arrives in on a socket bound to `::`.
+@(private = "file")
+mapped_address :: proc(a, b, c, d: u8) -> net.Address {
+	return groups_address({0, 0, 0, 0, 0, 0xffff, u16(a) << 8 | u16(b), u16(c) << 8 | u16(d)})
+}
+
+// An IPv6 address written as its eight groups, for the forms that only resemble
+// the mapped one.
+@(private = "file")
+groups_address :: proc(groups: [8]u16) -> net.Address {
+	addr: net.IP6_Address
+	for g, i in groups {
+		addr[i] = u16be(g)
+	}
+	return addr
+}
