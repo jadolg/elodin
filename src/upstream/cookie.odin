@@ -89,16 +89,22 @@ one that does not implement them, and RFC 7873 has the exchange carry on without
 make the check something an attacker opts out of at no cost: it would be back to
 guessing only the transaction ID and the source port, which is what the cookie
 was added to put out of reach.
+
+The option is read off the wire rather than off a decoded message, because a
+decode is a second, stricter test than the one the reply had to pass to get here.
+`response_matches` reads the header and the first question and stops, so a
+message that is well formed that far and rubbish after it is a reply this server
+accepts — and treating "it does not decode" as "not mine to judge" would hand the
+attacker the same opt-out by another route: truncate the body after the question
+and the cookie is never looked for. Walking to the OPT record judges exactly the
+set of messages `response_matches` is willing to accept, so the two cannot
+disagree about which replies get judged at all. A message that cannot even be
+walked that far carries no cookie as far as this is concerned, which is the
+answer that fails closed.
 */
 @(private)
 cookie_matches :: proc(u: ^Upstream, response: []u8) -> bool {
 	if u == nil || !cookies_wanted(u) {
-		return true
-	}
-	msg, err := dns.decode_message(response, context.temp_allocator)
-	if err != .None {
-		// Not something to judge here; `response_matches` has already accepted
-		// the header, and the caller decodes it properly further along.
 		return true
 	}
 	sync.mutex_lock(&u.mu)
@@ -107,7 +113,7 @@ cookie_matches :: proc(u: ^Upstream, response: []u8) -> bool {
 	expected := u.cookie.server_len > 0
 	sync.mutex_unlock(&u.mu)
 
-	raw, found := dns.find_edns_option(msg, .Cookie)
+	raw, found := dns.peek_edns_option(response, .Cookie)
 	if !found {
 		return !expected
 	}
@@ -139,14 +145,17 @@ forget_cookie :: proc(u: ^Upstream) {
 	u.cookie.server_len = 0
 }
 
-// The COOKIE option a reply carries, if it carries one.
+/*
+The COOKIE option a reply carries, if it carries one.
+
+The same wire walk `cookie_matches` judges the reply with, and for the same
+reason: a reply that got past the matcher without decoding is one this server is
+about to hand to a client, and the cookie in it has to be found to be taken back
+out.
+*/
 @(private)
 reply_cookie :: proc(response: []u8) -> (raw: []u8, found: bool) {
-	msg, err := dns.decode_message(response, context.temp_allocator)
-	if err != .None {
-		return nil, false
-	}
-	return dns.find_edns_option(msg, .Cookie)
+	return dns.peek_edns_option(response, .Cookie)
 }
 
 // Keep the server cookie a reply carried, for the next query to this upstream.
@@ -261,13 +270,13 @@ exchange_with_cookie :: proc(
 	}
 	/*
 	Free the superseded reply only once it is a different buffer. The cookie is
-	present here (the `reply_cookie` guard returned otherwise), so the strip
-	makes a fresh one and this is always the case — but `remove_edns_option`
-	hands the input straight back when it finds no option to take out, and that
-	full-decode guard and this raw option walk are two implementations of "is
-	the cookie present." Comparing the backing pointers rather than trusting
-	them to agree keeps a divergence from turning the free into one that drops
-	the very buffer we return.
+	present here (the `reply_cookie` guard returned otherwise) and the guard now
+	walks the same OPT record `remove_edns_option` does, so the strip always
+	makes a fresh buffer and this is always the case. The comparison stays
+	because `remove_edns_option` hands the input straight back when it finds no
+	option to take out: if the two ever stop agreeing on "is the cookie
+	present", that is a free of the very buffer we return rather than a missing
+	strip, and this is what keeps it from being one.
 	*/
 	if raw_data(stripped) != raw_data(response) {
 		delete(response, allocator)
