@@ -6,14 +6,14 @@ import "elodin:dns"
 /*
 `check_signature` on its own, at the point where nothing else is guarding it.
 
-Three of the tests it makes are duplicated elsewhere on the ordinary path -
-`validate_rrset` and `verified_rrset` run `signature_worth_trying` first, which
-also refuses a lapsed signature - and that duplication is deliberate: one call
-decides whether to spend a verification, the other decides the answer. But the
-chain walk does not go through the cheap one. `zone_step` checks the signature
-over a DS set and `fetch_keys` checks the one over a DNSKEY set by calling
-straight in here, so on the two lookups that build the chain of trust these are
-the only checks there are.
+One of the tests it makes is duplicated on every path that reaches it -
+`signature_worth_trying` also refuses a lapsed signature, and since #193 the two
+chain-walk loops run it as well - and that duplication is deliberate: one call
+decides whether to spend a verification, the other decides the answer. The other
+two are made nowhere else. The cheap pre-check reads a key tag, an algorithm and
+a pair of dates; whether the signer may sign the owner name at all, and whether
+the Labels field agrees with that name, are asked here and only here, on every
+DS and DNSKEY the chain of trust is built out of.
 
 That makes them worth testing where they live rather than through a caller that
 has already refused the same signature for its own reasons. Each test below
@@ -329,5 +329,86 @@ test_check_signature_refuses_a_consistent_wildcard_above_the_signing_zone :: pro
 	result, encloser := check_signature(sig, "www.example.com.", .IN, cs_records(), cs_key(), CS_NOW, context.temp_allocator)
 	testing.expect_value(t, result, Verify_Result.Bad)
 	testing.expectf(t, encloser == "", "no encloser should be claimed on a refusal, got %q", encloser)
+	free_all(context.temp_allocator)
+}
+
+@(private = "file")
+cs_colliding :: proc(decoys: int) -> []Dnskey {
+	real := cs_key()
+	if len(real) != 1 {
+		return nil
+	}
+	keys := make([dynamic]Dnskey, 0, decoys + 1, context.temp_allocator)
+	for i in 0 ..< decoys {
+		// The same tag, algorithm and flags as the key that signed - only the
+		// key bytes differ, which is what makes each one a verification that
+		// has to be run in order to be refused.
+		decoy := real[0]
+		bytes := make([]u8, len(real[0].public_key), context.temp_allocator)
+		copy(bytes, real[0].public_key)
+		bytes[0] ~= u8(i + 1)
+		decoy.public_key = bytes
+		append(&keys, decoy)
+	}
+	append(&keys, real[0])
+	return keys[:]
+}
+
+@(test)
+test_check_signature_bounds_the_keys_one_signature_is_tried_against :: proc(t: ^testing.T) {
+	/*
+	`MAX_VERIFICATIONS_PER_QUERY` counts calls into here, and that bounds the
+	crypto only if a call means a verification. It did not: a key tag is a
+	16-bit checksum over the RDATA rather than an identity, so a signature
+	naming one may name several keys, and the loop has to try each of them
+	because any could be the one that made it. Every further key sharing the tag
+	was another full verification charged to nobody, so the query's allowance
+	was bounding `MAX_KEYS_PER_ZONE` times what it counted - sixty-four
+	signature checks buying four thousand.
+
+	The multiplier is the zone's to choose and needs no cleverness: nothing
+	requires a DNSKEY RRset's records to be distinct, so sixty-four copies of
+	one key does it. That is the collision half of KeyTrap (CVE-2023-50387),
+	the half an attempt count does not reach.
+
+	Padding a key set has to survive the zone's own self-signature and the DS
+	above it, so only the zone's owner can put it there and only against their
+	own zone - which is why the bound may sit as low as it does.
+	*/
+
+	// A handful of collisions is a rollover's bad luck rather than an attack,
+	// so everything up to the bound still reaches the key that signed.
+	within := cs_colliding(MAX_KEYS_PER_SIGNATURE - 1)
+	result, _ := check_signature(
+		cs_sig(CS_PLAIN_SIG),
+		"www.example.com.",
+		.IN,
+		cs_records(),
+		within,
+		CS_NOW,
+		context.temp_allocator,
+	)
+	testing.expect_value(t, result, Verify_Result.Ok)
+
+	// Past it the attempts stop, and the genuine key sitting behind the padding
+	// is never reached - the same trade `MAX_VERIFICATIONS_PER_QUERY` makes for
+	// the signatures themselves.
+	padded := cs_colliding(MAX_KEYS_PER_ZONE)
+	bounded, _ := check_signature(
+		cs_sig(CS_PLAIN_SIG),
+		"www.example.com.",
+		.IN,
+		cs_records(),
+		padded,
+		CS_NOW,
+		context.temp_allocator,
+	)
+	testing.expectf(
+		t,
+		bounded == .Bad,
+		"%d keys sharing one tag were all verified against for a single signature (%v): one budget unit buys that many verifications",
+		MAX_KEYS_PER_ZONE,
+		bounded,
+	)
 	free_all(context.temp_allocator)
 }
