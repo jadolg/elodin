@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-Generate signed DNS fixtures for src/dnssec's end-to-end tests.
+"""Generate signed DNS fixtures for src/dnssec's end-to-end tests.
 
 The captured fixtures in `fixtures_test.odin` are real traffic, which is the
 right thing to validate the ordinary path against: a canonicalisation bug
@@ -65,6 +64,7 @@ class Key:
     """One Ed25519 zone key, used as both KSK and ZSK."""
 
     def __init__(self, zone, seed):
+        """Derive the key deterministically, so a regenerated fixture matches."""
         self.zone = zone
         self.priv = ed25519.Ed25519PrivateKey.from_private_bytes(
             hashlib.sha256(seed.encode()).digest()
@@ -93,7 +93,7 @@ class Key:
         return acc & 0xFFFF
 
     def ds(self, digest_type=DIGEST_SHA256):
-        """This key's DS RDATA, as its parent would publish it."""
+        """The DS RDATA for this key, as its parent would publish it."""
         data = canonical_name(self.zone) + self.rdata
         digest = hashlib.sha256(data).digest()
         return struct.pack("!HBB", self.tag, self.algorithm, digest_type) + digest
@@ -113,6 +113,7 @@ class RR:
     """One resource record, carrying its RDATA already encoded."""
 
     def __init__(self, name, rtype, rdata, ttl=3600):
+        """Hold one record; `rdata` is already in wire form."""
         self.name, self.type, self.rdata, self.ttl = name, rtype, rdata, ttl
 
     def wire(self):
@@ -125,9 +126,35 @@ class RR:
         )
 
 
-def sign(rrset, key, signer=None, labels=None):
+def labels_of(name):
+    """The labels of a presentation-form name, root and empties dropped."""
+    return [label for label in name.rstrip(".").split(".") if label]
+
+
+def signed_label_count(owner):
+    """The Labels field an honest signature over `owner` carries.
+
+    RFC 4034 section 3.1.3 counts the owner name's labels without a leading
+    asterisk, so a zone's own `*.example.com.` counts two rather than three.
     """
-    An RRSIG over `rrset`, which must be one owner name and one type.
+    return len([label for label in labels_of(owner) if label != "*"])
+
+
+def signing_owner(owner, labels):
+    """The name a signature is computed under, which is `owner` unless it expands.
+
+    A Labels field short of the owner's own count says a wildcard answered, and
+    RFC 4035 section 5.3.2 has the signature computed over that wildcard rather
+    than over the name it was expanded to.
+    """
+    parts = labels_of(owner)
+    if labels >= len(parts) or owner.startswith("*."):
+        return owner
+    return "*." + ".".join(parts[len(parts) - labels:]) + "."
+
+
+def sign(rrset, key, signer=None, labels=None):
+    """Build an RRSIG over `rrset`, which is one owner name and one type.
 
     The validity window and the TTLs come from the module constants: no scenario
     has needed to vary them, and a signature outside the window is a case the
@@ -141,8 +168,7 @@ def sign(rrset, key, signer=None, labels=None):
     owner = rrset[0].name
     rtype = rrset[0].type
     if labels is None:
-        stripped = owner.rstrip(".")
-        labels = len([l for l in stripped.split(".") if l and l != "*"])
+        labels = signed_label_count(owner)
     prefix = (
         struct.pack("!HBBI", rtype, key.algorithm, labels, TTL)
         + struct.pack("!II", EXPIRATION, INCEPTION)
@@ -151,11 +177,7 @@ def sign(rrset, key, signer=None, labels=None):
     )
 
     # RFC 4034 section 6.3: the RRset in canonical order, duplicates dropped.
-    # A wildcard expansion is signed under the wildcard the zone holds.
-    sign_owner = owner
-    owner_labels = len([l for l in owner.rstrip(".").split(".") if l])
-    if labels < owner_labels and not owner.startswith("*."):
-        sign_owner = "*." + ".".join(owner.rstrip(".").split(".")[owner_labels - labels:]) + "."
+    sign_owner = signing_owner(owner, labels)
 
     body = b""
     for rdata in sorted({rr.rdata for rr in rrset}):
@@ -205,8 +227,7 @@ def scenario(fn):
 
 @scenario
 def algorithm_downgrade():
-    """
-    A delegation whose DS set names two algorithms, one of them unknown here.
+    """Cover a delegation naming two DS algorithms, one of them unknown here.
 
     RFC 6840 section 5.11: a validator needs one DS it can follow, and the
     presence of a DS for an algorithm it does not implement neither breaks the
@@ -240,8 +261,7 @@ def algorithm_downgrade():
 
 @scenario
 def unsupported_algorithm_only():
-    """
-    The same delegation with only the unknown-algorithm DS left.
+    """Cover the same delegation with only the unknown-algorithm DS left.
 
     Nothing in the chain can be followed past this point, and RFC 6840 section
     5.2 makes that an insecure delegation rather than a broken one: the answer
@@ -269,8 +289,7 @@ def unsupported_algorithm_only():
 
 @scenario
 def unsupported_digest_only():
-    """
-    A DS whose algorithm we implement but whose digest type we do not.
+    """Cover a DS we can follow by algorithm but not by digest type.
 
     Same outcome as an unknown algorithm, by the same section, and worth its own
     fixture because the two fields are checked separately and only one of them
@@ -299,8 +318,7 @@ def unsupported_digest_only():
 
 @scenario
 def revoked_key():
-    """
-    A zone whose apex key is published with the revoke bit set (RFC 5011).
+    """Cover a zone whose apex key is published revoked (RFC 5011).
 
     The key still hashes to the DS the parent published - revoking changes the
     flags, which changes the key tag, but an attacker replaying an old DS would
@@ -331,9 +349,7 @@ def revoked_key():
 
 @scenario
 def unfollowable_ds_beside_unsupported():
-    """
-    A DS set holding one record we could follow and one we cannot understand,
-    where the followable one matches no published key.
+    """Cover a followable DS matching no key, beside one we cannot read.
 
     This is the case that tells the two layers of the check apart. `zone_step`
     refuses a DS set with nothing usable in it before spending a DNSKEY lookup;
