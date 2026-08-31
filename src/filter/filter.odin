@@ -64,7 +64,7 @@ Engine :: struct {
 	lists it was matched against are gone.
 	*/
 	generation: u64,
-	// Names the engine answers for directly regardless of lists.
+	// Rule counts, and the running query and block totals.
 	stats:      Stats,
 }
 

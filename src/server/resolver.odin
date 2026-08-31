@@ -198,7 +198,7 @@ handle_query :: proc(
 
 	Not counted, matching the malformed-cookie FORMERR below and the class, XFR
 	and RD refusals: none of those has a counter either. It reaches the query log
-	as `outcome=failed detail="opt"` and goes no higher - a line an
+	as `outcome=failed detail=opt` and goes no higher - a line an
 	unauthenticated peer can print once per datagram does not belong at warn.
 	*/
 	if !edns_opt_readable(msg) {
@@ -677,7 +677,7 @@ resolve_query :: proc(
 	connection before a query exists at all, and stretching it to cover this too
 	would blur two different questions an operator asks of it - "is a network I
 	never added reaching this port" against "are RD=0 probes arriving". The
-	query log is where this one shows, as `outcome=refused detail="rd"`, when
+	query log is where this one shows, as `outcome=refused detail=rd`, when
 	`log.queries` is on.
 	*/
 	if !msg.flags.rd {
@@ -708,8 +708,9 @@ resolve_query :: proc(
 	somebody who cannot check it and did not need it. And the server half of it
 	is one we minted: an upstream that implements cookies would hash it against
 	its own secret, decide it is a forgery and answer BADCOOKIE instead of
-	answering the question. Cookies towards the upstream, if they are ever
-	wanted, are ours to negotiate separately.
+	answering the question. Cookies towards the upstream are a separate exchange
+	of our own - `cookies.upstream`, in `src/upstream/cookie.odin` - which puts
+	its own client cookie on the query after this strip has run.
 
 	Asked as "the query carried one" rather than as anything about this server's
 	own cookie settings. With `cookies.enabled` off there is no verdict to reach

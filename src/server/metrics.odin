@@ -261,7 +261,7 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 	split horizon nobody exempted, and adding a handful of those into a figure in
 	the tens of thousands would hide both. `elodin_rebind_refused_total` below is
 	where it is counted. Same reasoning, and the same shape, as `outcome=refused
-	detail="rd"` not adding to `elodin_queries_refused_total`.
+	detail=rd` not adding to `elodin_queries_refused_total`.
 	*/
 	metrics.family(&b, "elodin_answers_total", .Counter, "Queries by how they were answered.")
 	metrics.sample(&b, "elodin_answers_total", st.forwarded, metrics.Label{"outcome", "forwarded"})

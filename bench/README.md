@@ -34,9 +34,14 @@ harness owns all of them rather than inheriting them from the machine:
   20 ms by default. That delay is the point: a worker is occupied for a whole
   upstream round trip, so it is what decides how many queries the pool can carry.
   An upstream answering instantly would measure a server nobody runs.
-- **Its own configuration.** Each scenario writes the config it needs, leaving
-  everything it is not varying at the shipped default, so the numbers describe
-  the defaults.
+- **Its own configuration.** Each scenario writes the config it needs. Most keys
+  are left at the shipped default, but four are not, for every scenario:
+  validation is off (see below), rate limiting is off (the generator is one
+  address asking as fast as it can, which is what the limiter exists to stop),
+  `server.workers` / `server.upstream_workers` are pinned at 128 / 64 rather than
+  derived from the machine, and `upstream.attempts` is 1 so a failure reads as
+  one rather than as a slower success. `cmd/bench/server.go` is where that
+  template lives.
 - **Its own certificates.** ECDSA P-256 and RSA-2048, generated per run, so the
   handshake comparison is not at the mercy of whatever is in `certs/`.
 - **The server process alone.** RSS and CPU come from `/proc/<pid>` for elodin
@@ -46,7 +51,8 @@ harness owns all of them rather than inheriting them from the machine:
 **DNSSEC is off throughout.** The mock serves an unsigned zone with no chain to
 the root, so with validation on every answer would be SERVFAIL and the tables
 would describe a failing resolver. What validation costs is a separate question
-from what the transports cost.
+from what the transports cost — as is what rate limiting costs, which is the
+other setting held away from its shipped value for the same kind of reason.
 
 ## Why the load generator is its own thing
 
