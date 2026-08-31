@@ -369,9 +369,9 @@ test_a_live_upstream_beats_a_stale_entry :: proc(t: ^testing.T) {
 		return
 	}
 	defer net.close(socket)
-	// A query that never comes must not stall the run; the upstream timeout below
-	// is longer, so a real exchange is never cut short by this.
-	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+	// Only a bound on a hang, and past the upstream timeout below rather than
+	// under it: see the note on `MOCK_RECV_TIMEOUT`.
+	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	bound, berr := net.bound_endpoint(socket)
 	if !testing.expectf(t, berr == nil, "cannot read the mock's port: %v", berr) {
 		return

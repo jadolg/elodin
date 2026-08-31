@@ -134,11 +134,11 @@ leak_server :: proc(
 	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
 		return {}, nil, false
 	}
-	// A bound on the exchange in the cases that expect one: the mock runs on its
-	// own thread there and has to see the query and answer it before the
-	// resolver's own `upstream.timeout` runs out. The cases that expect nothing
-	// do not wait this out - see `nothing_reached`.
-	_ = net.set_option(socket, .Receive_Timeout, 500 * time.Millisecond)
+	// A bound on a hang in the cases that expect an exchange: the mock runs on
+	// its own thread there, and the resolver's own `upstream.timeout` is what
+	// gives up first - see the note on `MOCK_RECV_TIMEOUT`. The cases that expect
+	// nothing do not wait this out at all - see `nothing_reached`.
+	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	bound, _ := net.bound_endpoint(socket)
 
 	cfg.log.queries = false

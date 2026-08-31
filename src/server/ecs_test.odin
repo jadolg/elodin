@@ -197,9 +197,9 @@ fixture_start :: proc(t: ^testing.T, f: ^Fixture, validating := false) -> bool {
 		return false
 	}
 	f.socket = socket
-	// A query that never arrives must not stall the run. Shorter than the
-	// upstream timeout below, so a real exchange is never cut short by it.
-	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+	// Only a bound on a hang, and past the upstream timeout below rather than
+	// under it: see the note on `MOCK_RECV_TIMEOUT`.
+	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	bound, berr := net.bound_endpoint(socket)
 	if berr != nil {
 		testing.expectf(t, false, "cannot read the mock's port: %v", berr)
@@ -326,12 +326,6 @@ test_an_unstrippable_client_subnet_is_not_forwarded :: proc(t: ^testing.T) {
 		return
 	}
 	defer fixture_stop(&f)
-	// The mock is here only to report that nothing arrived, so it should not
-	// hold the run open for the two seconds a real exchange is allowed.
-	_ = net.set_option(f.socket, .Receive_Timeout, 200 * time.Millisecond)
-
-	x := Ecs_Mock{socket = f.socket, name = "cdn.example."}
-	mock := thread.create_and_start_with_poly_data(&x, serve_ecs)
 
 	additional := make([]dns.Record, 2, context.temp_allocator)
 	additional[0] = dns.make_opt(1232, false)
@@ -343,10 +337,8 @@ test_an_unstrippable_client_subnet_is_not_forwarded :: proc(t: ^testing.T) {
 		"127.0.0.1:5555",
 		context.temp_allocator,
 	)
-	thread.join(mock)
-	thread.destroy(mock)
 
-	testing.expect(t, !x.served, "the query reached the upstream with a subnet still on it")
+	testing.expect(t, mock_untouched(f.socket), "the query reached the upstream with a subnet still on it")
 	testing.expect(t, ok, "the client was left with nothing at all")
 	testing.expect_value(t, outcome, Outcome.Failed)
 	testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.Form_Err)
@@ -374,10 +366,6 @@ test_a_client_subnet_behind_unreadable_opt_bytes_is_not_forwarded :: proc(t: ^te
 		return
 	}
 	defer fixture_stop(&f)
-	_ = net.set_option(f.socket, .Receive_Timeout, 200 * time.Millisecond)
-
-	x := Ecs_Mock{socket = f.socket, name = "cdn.example."}
-	mock := thread.create_and_start_with_poly_data(&x, serve_ecs)
 
 	// One well-formed ECS option, then three bytes of a fourth option header:
 	// enough for `decode_rdata` to give up on the list, not enough to hide the
@@ -403,10 +391,8 @@ test_a_client_subnet_behind_unreadable_opt_bytes_is_not_forwarded :: proc(t: ^te
 		"127.0.0.1:5555",
 		context.temp_allocator,
 	)
-	thread.join(mock)
-	thread.destroy(mock)
 
-	testing.expect(t, !x.served, "the query reached the upstream with a subnet still on it")
+	testing.expect(t, mock_untouched(f.socket), "the query reached the upstream with a subnet still on it")
 	testing.expect(t, ok, "the client was left with nothing at all")
 	testing.expect_value(t, outcome, Outcome.Failed)
 	testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.Form_Err)

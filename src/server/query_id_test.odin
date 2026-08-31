@@ -186,9 +186,9 @@ harness_start :: proc(t: ^testing.T, h: ^Harness, validating := false) -> bool {
 		return false
 	}
 	h.socket = socket
-	// A query that never comes must not stall the run; the upstream timeout
-	// below is longer, so a real exchange is never cut short by this.
-	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+	// Only a bound on a hang, and past the upstream timeout below rather than
+	// under it: see the note on `MOCK_RECV_TIMEOUT`.
+	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 
 	bound, berr := net.bound_endpoint(socket)
 	if berr != nil {

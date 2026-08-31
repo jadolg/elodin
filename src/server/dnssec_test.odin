@@ -893,6 +893,10 @@ test_unvalidated_answer_is_not_cached_with_ad :: proc(t: ^testing.T) {
 		return
 	}
 	defer net.close(socket)
+	// The mock has no timeout of its own and the join below waits for it, so
+	// without this a query that never arrives hangs the run instead of failing
+	// it. See the note on `MOCK_RECV_TIMEOUT`.
+	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	bound, berr := net.bound_endpoint(socket)
 	if berr != nil {
 		testing.expectf(t, false, "cannot read the mock's port: %v", berr)

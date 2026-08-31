@@ -25,6 +25,7 @@ private addresses arriving from an upstream.
 Rebind_Mock :: struct {
 	socket: net.UDP_Socket,
 	reply:  []u8,
+	asked:  bool,
 }
 
 @(private = "file")
@@ -34,6 +35,7 @@ serve_rebind :: proc(x: ^Rebind_Mock) {
 	if err != nil || n < dns.HEADER_SIZE || len(x.reply) > len(buf) {
 		return
 	}
+	x.asked = true
 	out: [4096]u8
 	copy(out[:], x.reply)
 	out[0], out[1] = buf[0], buf[1]
@@ -97,7 +99,7 @@ test_a_public_name_is_not_answered_with_a_private_address :: proc(t: ^testing.T)
 			return
 		}
 		defer net.close(socket)
-		_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+		_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 		bound, _ := net.bound_endpoint(socket)
 
 		cfg := config.default_config()
@@ -218,11 +220,12 @@ ask_with_reply :: proc(
 	type: dns.Type,
 	reply: []u8,
 	answers: ^cache.Cache = nil,
+	forwarded := true,
 ) -> (
 	decoded: dns.Message,
 	ok: bool,
 ) {
-	out, _, sent := ask_raw(t, cfg, name, type, reply, answers)
+	out, _, sent := ask_raw(t, cfg, name, type, reply, answers, forwarded)
 	if !sent {
 		return {}, false
 	}
@@ -233,8 +236,20 @@ ask_with_reply :: proc(
 	return msg, true
 }
 
-// The same, stopping at the bytes. What a test wants when the response is not
-// meant to decode - which is the whole subject of the undecodable-answer case.
+/*
+The same, stopping at the bytes. What a test wants when the response is not meant
+to decode - which is the whole subject of the undecodable-answer case.
+
+`forwarded` says whether the query is expected to reach the upstream at all. The
+cases where it is not - a rewrite, a name the local table answers - are asserted
+rather than waited on: no mock thread runs, and the socket is read once
+`handle_query` has returned, by which point anything that leaked is already
+sitting in the receive buffer. That is `nothing_reached` in special_use_test.odin,
+and it does two things a concurrent mock cannot. It cannot miss a leak that
+arrived after the mock had stopped waiting for one, and it costs milliseconds
+rather than a receive timeout that is deliberately long enough to be no deadline
+at all - see the note on `MOCK_RECV_TIMEOUT`.
+*/
 @(private = "file")
 ask_raw :: proc(
 	t: ^testing.T,
@@ -243,6 +258,7 @@ ask_raw :: proc(
 	type: dns.Type,
 	reply: []u8,
 	answers: ^cache.Cache = nil,
+	forwarded := true,
 ) -> (
 	wire: []u8,
 	outcome: Outcome,
@@ -253,7 +269,7 @@ ask_raw :: proc(
 		return nil, .Failed, false
 	}
 	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	bound, _ := net.bound_endpoint(socket)
 
 	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
@@ -275,10 +291,23 @@ ask_raw :: proc(
 	}
 
 	x := Rebind_Mock{socket = socket, reply = reply}
-	mock := thread.create_and_start_with_poly_data(&x, serve_rebind)
+	mock: ^thread.Thread
+	if forwarded {
+		mock = thread.create_and_start_with_poly_data(&x, serve_rebind)
+	} else {
+		// How long the read below waits to find out that nothing arrived. Not
+		// zero: `SO_RCVTIMEO` reads zero as "no timeout", which on a socket
+		// nothing is going to send to is the one value that hangs.
+		_ = net.set_option(socket, .Receive_Timeout, 20 * time.Millisecond)
+	}
 	out, got, sent := handle_query(&s, rebind_query_type(name, type), .UDP, "127.0.0.1:5555", context.temp_allocator)
-	thread.join(mock)
-	thread.destroy(mock)
+	if forwarded {
+		thread.join(mock)
+		thread.destroy(mock)
+	} else {
+		serve_rebind(&x)
+		testing.expect(t, !x.asked, "the query was forwarded, so the answer did not come from this server")
+	}
 
 	if !testing.expect(t, sent, "nothing came back at all") {
 		return nil, got, false
@@ -485,7 +514,14 @@ test_a_rewritten_name_keeps_its_private_address :: proc(t: ^testing.T) {
 	// 192.168.1.50 coming back means the rewrite was not what answered.
 	records := make([]dns.Record, 1, context.temp_allocator)
 	records[0] = a_record("nas.home.", {93, 184, 216, 34})
-	msg, ok := ask_with_reply(t, &cfg, "nas.home.", .A, rebind_reply_of("nas.home.", .A, records))
+	msg, ok := ask_with_reply(
+		t,
+		&cfg,
+		"nas.home.",
+		.A,
+		rebind_reply_of("nas.home.", .A, records),
+		forwarded = false,
+	)
 	if !ok {
 		return
 	}
@@ -769,7 +805,14 @@ test_the_table_answers_localhost_before_the_guard :: proc(t: ^testing.T) {
 	cfg := rebind_config() // the table left at its default: on
 	records := make([]dns.Record, 1, context.temp_allocator)
 	records[0] = a_record("evil.localhost.", {192, 168, 1, 1})
-	msg, ok := ask_with_reply(t, &cfg, "evil.localhost.", .A, rebind_reply_of("evil.localhost.", .A, records))
+	msg, ok := ask_with_reply(
+		t,
+		&cfg,
+		"evil.localhost.",
+		.A,
+		rebind_reply_of("evil.localhost.", .A, records),
+		forwarded = false,
+	)
 	if !ok {
 		return
 	}
