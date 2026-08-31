@@ -118,6 +118,32 @@ MAX_CNAME_CHAIN :: 16
 MAX_KEYS_PER_ZONE :: 64
 
 /*
+Keys one signature may be tried against.
+
+`MAX_VERIFICATIONS_PER_QUERY` counts calls into `check_signature`, and that is a
+bound on the crypto only if a call means a verification. Without this it does
+not: a key tag is a 16-bit checksum over the RDATA rather than an identity, so a
+signature naming one may name several keys, and `check_signature` has to try
+each of them because any could be the one that made it. Every further key
+sharing the tag is another full verification charged to nobody, so the query
+budget was bounding `MAX_KEYS_PER_ZONE` times what it counted.
+
+The multiplier is the zone's to choose, and it needs no cleverness: nothing
+requires a DNSKEY RRset's records to be distinct, so sixty-four copies of one
+key does it, and grinding a decoy key to a chosen tag is a few thousand hashes
+in any case. That is the collision half of KeyTrap (CVE-2023-50387), the half a
+bound on attempts does not reach.
+
+Four is far past what an accident produces - a tag collision falls out about
+once in sixty-five thousand key pairs, and a zone mid-rollover publishes a
+handful of keys in total - so the trade this makes is the one
+`MAX_VERIFICATIONS_PER_QUERY` already describes, and a safer one: padding the
+key set has to survive the zone's own self-signature and the DS above it, so
+only the zone's owner can put it there, and only against their own zone.
+*/
+MAX_KEYS_PER_SIGNATURE :: 4
+
+/*
 What one call to `validate` is allowed to spend.
 
 Carried down the whole walk rather than kept on the validator, because the limit
@@ -1426,10 +1452,22 @@ check_signature :: proc(
 
 	unsupported := false
 	refused := false
+	/*
+	One verification per key the tag names, and the tag names as many keys as
+	the zone cares to publish under it - so the attempts are counted. See
+	`MAX_KEYS_PER_SIGNATURE`: without this the query's verification budget
+	bounds the calls made here rather than the crypto they run, which is the
+	collision half of KeyTrap.
+	*/
+	tried := 0
 	for key in keys {
 		if key.algorithm != sig.algorithm || key.tag != sig.key_tag || !key_usable(key) {
 			continue
 		}
+		if tried >= MAX_KEYS_PER_SIGNATURE {
+			break
+		}
+		tried += 1
 		switch verify_signature(sig.algorithm, key.public_key, sig.signature, data, allocator) {
 		case .Ok:
 			return .Ok, encloser

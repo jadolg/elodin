@@ -331,3 +331,84 @@ test_check_signature_refuses_a_consistent_wildcard_above_the_signing_zone :: pro
 	testing.expectf(t, encloser == "", "no encloser should be claimed on a refusal, got %q", encloser)
 	free_all(context.temp_allocator)
 }
+
+@(private = "file")
+cs_colliding :: proc(decoys: int) -> []Dnskey {
+	real := cs_key()
+	if len(real) != 1 {
+		return nil
+	}
+	keys := make([dynamic]Dnskey, 0, decoys + 1, context.temp_allocator)
+	for i in 0 ..< decoys {
+		// The same tag, algorithm and flags as the key that signed - only the
+		// key bytes differ, which is what makes each one a verification that
+		// has to be run in order to be refused.
+		decoy := real[0]
+		bytes := make([]u8, len(real[0].public_key), context.temp_allocator)
+		copy(bytes, real[0].public_key)
+		bytes[0] ~= u8(i + 1)
+		decoy.public_key = bytes
+		append(&keys, decoy)
+	}
+	append(&keys, real[0])
+	return keys[:]
+}
+
+@(test)
+test_check_signature_bounds_the_keys_one_signature_is_tried_against :: proc(t: ^testing.T) {
+	/*
+	`MAX_VERIFICATIONS_PER_QUERY` counts calls into here, and that bounds the
+	crypto only if a call means a verification. It did not: a key tag is a
+	16-bit checksum over the RDATA rather than an identity, so a signature
+	naming one may name several keys, and the loop has to try each of them
+	because any could be the one that made it. Every further key sharing the tag
+	was another full verification charged to nobody, so the query's allowance
+	was bounding `MAX_KEYS_PER_ZONE` times what it counted - sixty-four
+	signature checks buying four thousand.
+
+	The multiplier is the zone's to choose and needs no cleverness: nothing
+	requires a DNSKEY RRset's records to be distinct, so sixty-four copies of
+	one key does it. That is the collision half of KeyTrap (CVE-2023-50387),
+	the half an attempt count does not reach.
+
+	Padding a key set has to survive the zone's own self-signature and the DS
+	above it, so only the zone's owner can put it there and only against their
+	own zone - which is why the bound may sit as low as it does.
+	*/
+
+	// A handful of collisions is a rollover's bad luck rather than an attack,
+	// so everything up to the bound still reaches the key that signed.
+	within := cs_colliding(MAX_KEYS_PER_SIGNATURE - 1)
+	result, _ := check_signature(
+		cs_sig(CS_PLAIN_SIG),
+		"www.example.com.",
+		.IN,
+		cs_records(),
+		within,
+		CS_NOW,
+		context.temp_allocator,
+	)
+	testing.expect_value(t, result, Verify_Result.Ok)
+
+	// Past it the attempts stop, and the genuine key sitting behind the padding
+	// is never reached - the same trade `MAX_VERIFICATIONS_PER_QUERY` makes for
+	// the signatures themselves.
+	padded := cs_colliding(MAX_KEYS_PER_ZONE)
+	bounded, _ := check_signature(
+		cs_sig(CS_PLAIN_SIG),
+		"www.example.com.",
+		.IN,
+		cs_records(),
+		padded,
+		CS_NOW,
+		context.temp_allocator,
+	)
+	testing.expectf(
+		t,
+		bounded == .Bad,
+		"%d keys sharing one tag were all verified against for a single signature (%v): one budget unit buys that many verifications",
+		MAX_KEYS_PER_ZONE,
+		bounded,
+	)
+	free_all(context.temp_allocator)
+}
