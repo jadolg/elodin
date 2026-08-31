@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""Generate signed DNS fixtures for src/dnssec's end-to-end tests.
+"""Generate signed DNS fixtures for src/dnssec's end-to-end tests."""
 
-The captured fixtures in `fixtures_test.odin` are real traffic, which is the
-right thing to validate the ordinary path against: a canonicalisation bug
-cannot agree with itself and still pass. What they cannot supply is a zone
-nobody operates on purpose - a delegation whose every DS names an algorithm we
-do not implement, a key published with the revoke bit set, an opt-out span
-standing in for a proof. Those are generated here.
-
-Ed25519 throughout (algorithm 15, RFC 8080): the signatures are short, the keys
-are 32 bytes, and there is no per-signature randomness, so a regenerated fixture
-is byte-identical. The root is replaced by a trust anchor of this file's own
-making, printed alongside each scenario.
-
-Usage: python3 sign_fixtures.py            # every scenario
-       python3 sign_fixtures.py <name>     # just one
-"""
+# The captured fixtures in `fixtures_test.odin` are real traffic, which is the
+# right thing to validate the ordinary path against: a canonicalisation bug
+# cannot agree with itself and still pass. What they cannot supply is a zone
+# nobody operates on purpose - a delegation whose every DS names an algorithm we
+# do not implement, a key published with the revoke bit set, an opt-out span
+# standing in for a proof. Those are generated here.
+#
+# Ed25519 throughout (algorithm 15, RFC 8080): the signatures are short, the keys
+# are 32 bytes, and there is no per-signature randomness, so a regenerated fixture
+# is byte-identical. The root is replaced by a trust anchor of this file's own
+# making, printed alongside each scenario.
+#
+# Usage:
+#     python3 sign_fixtures.py           # every scenario
+#     python3 sign_fixtures.py <name>    # just one
 
 import hashlib
 import struct
@@ -132,21 +132,19 @@ def labels_of(name):
 
 
 def signed_label_count(owner):
-    """The Labels field an honest signature over `owner` carries.
+    """The Labels field an honest signature over `owner` carries."""
 
-    RFC 4034 section 3.1.3 counts the owner name's labels without a leading
-    asterisk, so a zone's own `*.example.com.` counts two rather than three.
-    """
+    # RFC 4034 section 3.1.3 counts the owner name's labels without a leading
+    # asterisk, so a zone's own `*.example.com.` counts two rather than three.
     return len([label for label in labels_of(owner) if label != "*"])
 
 
 def signing_owner(owner, labels):
-    """The name a signature is computed under, which is `owner` unless it expands.
+    """The name a signature is computed under, which is `owner` unless it expands."""
 
-    A Labels field short of the owner's own count says a wildcard answered, and
-    RFC 4035 section 5.3.2 has the signature computed over that wildcard rather
-    than over the name it was expanded to.
-    """
+    # A Labels field short of the owner's own count says a wildcard answered, and
+    # RFC 4035 section 5.3.2 has the signature computed over that wildcard rather
+    # than over the name it was expanded to.
     parts = labels_of(owner)
     if labels >= len(parts) or owner.startswith("*."):
         return owner
@@ -154,16 +152,15 @@ def signing_owner(owner, labels):
 
 
 def sign(rrset, key, signer=None, labels=None):
-    """Build an RRSIG over `rrset`, which is one owner name and one type.
+    """Build an RRSIG over `rrset`, which is one owner name and one type."""
 
-    The validity window and the TTLs come from the module constants: no scenario
-    has needed to vary them, and a signature outside the window is a case the
-    Odin tests reach by moving the clock rather than by signing differently.
-
-    `signer` and `labels` default to the truthful values and are overridable
-    because two tests need a signature that is internally consistent with an
-    untruthful one - see `check_signature_test.odin`.
-    """
+    # The validity window and the TTLs come from the module constants: no scenario
+    # has needed to vary them, and a signature outside the window is a case the
+    # Odin tests reach by moving the clock rather than by signing differently.
+    #
+    # `signer` and `labels` default to the truthful values and are overridable
+    # because two tests need a signature that is internally consistent with an
+    # untruthful one - see `check_signature_test.odin`.
     signer = signer if signer is not None else key.zone
     owner = rrset[0].name
     rtype = rrset[0].type
@@ -227,15 +224,14 @@ def scenario(fn):
 
 @scenario
 def algorithm_downgrade():
-    """Cover a delegation naming two DS algorithms, one of them unknown here.
+    """Cover a delegation naming two DS algorithms, one of them unknown here."""
 
-    RFC 6840 section 5.11: a validator needs one DS it can follow, and the
-    presence of a DS for an algorithm it does not implement neither breaks the
-    delegation nor excuses it from checking the one it does. Getting this wrong
-    in either direction is a downgrade: refuse the whole set and a zone mid
-    rollover goes dark, accept the unknown one as sufficient and an attacker who
-    can strip the usable DS turns a signed zone insecure.
-    """
+    # RFC 6840 section 5.11: a validator needs one DS it can follow, and the
+    # presence of a DS for an algorithm it does not implement neither breaks the
+    # delegation nor excuses it from checking the one it does. Getting this wrong
+    # in either direction is a downgrade: refuse the whole set and a zone mid
+    # rollover goes dark, accept the unknown one as sufficient and an attacker who
+    # can strip the usable DS turns a signed zone insecure.
     root = Key(".", "downgrade-root")
     child = Key("dgtest.", "downgrade-child")
 
@@ -261,12 +257,11 @@ def algorithm_downgrade():
 
 @scenario
 def unsupported_algorithm_only():
-    """Cover the same delegation with only the unknown-algorithm DS left.
+    """Cover the same delegation with only the unknown-algorithm DS left."""
 
-    Nothing in the chain can be followed past this point, and RFC 6840 section
-    5.2 makes that an insecure delegation rather than a broken one: the answer
-    is served without the AD bit rather than refused.
-    """
+    # Nothing in the chain can be followed past this point, and RFC 6840 section
+    # 5.2 makes that an insecure delegation rather than a broken one: the answer
+    # is served without the AD bit rather than refused.
     root = Key(".", "unsupported-root")
     child = Key("uatest.", "unsupported-child")
     unknown = struct.pack("!HBB", child.tag, 253, DIGEST_SHA256) + hashlib.sha256(b"nope").digest()
@@ -289,12 +284,11 @@ def unsupported_algorithm_only():
 
 @scenario
 def unsupported_digest_only():
-    """Cover a DS we can follow by algorithm but not by digest type.
+    """Cover a DS we can follow by algorithm but not by digest type."""
 
-    Same outcome as an unknown algorithm, by the same section, and worth its own
-    fixture because the two fields are checked separately and only one of them
-    being consulted is an easy mistake to make.
-    """
+    # Same outcome as an unknown algorithm, by the same section, and worth its own
+    # fixture because the two fields are checked separately and only one of them
+    # being consulted is an easy mistake to make.
     root = Key(".", "digest-root")
     child = Key("udtest.", "digest-child")
     # Digest type 3 is GOST R 34.11-94, withdrawn by RFC 6986.
@@ -318,13 +312,12 @@ def unsupported_digest_only():
 
 @scenario
 def revoked_key():
-    """Cover a zone whose apex key is published revoked (RFC 5011).
+    """Cover a zone whose apex key is published revoked (RFC 5011)."""
 
-    The key still hashes to the DS the parent published - revoking changes the
-    flags, which changes the key tag, but an attacker replaying an old DS would
-    not care. A validator that ignores the bit would keep trusting a key its
-    owner has publicly withdrawn, which is the entire point of revoking one.
-    """
+    # The key still hashes to the DS the parent published - revoking changes the
+    # flags, which changes the key tag, but an attacker replaying an old DS would
+    # not care. A validator that ignores the bit would keep trusting a key its
+    # owner has publicly withdrawn, which is the entire point of revoking one.
     root = Key(".", "revoked-root")
     child = Key("rvtest.", "revoked-child")
 
@@ -349,19 +342,18 @@ def revoked_key():
 
 @scenario
 def unfollowable_ds_beside_unsupported():
-    """Cover a followable DS matching no key, beside one we cannot read.
+    """Cover a followable DS matching no key, beside one we cannot read."""
 
-    This is the case that tells the two layers of the check apart. `zone_step`
-    refuses a DS set with nothing usable in it before spending a DNSKEY lookup;
-    `fetch_keys` reaches the same verdict again after the lookup, for the set
-    that got past. Both must hold on their own, or a change to either goes
-    unnoticed because the other still produces the right answer.
-
-    Here the Ed25519 DS is usable enough to get past the first check and then
-    matches nothing, while the algorithm-253 DS remains unevaluatable. A DS we
-    cannot check may yet be the right one, so the delegation is insecure rather
-    than bogus - the same conclusion, reached in the second place.
-    """
+    # This is the case that tells the two layers of the check apart. `zone_step`
+    # refuses a DS set with nothing usable in it before spending a DNSKEY lookup;
+    # `fetch_keys` reaches the same verdict again after the lookup, for the set
+    # that got past. Both must hold on their own, or a change to either goes
+    # unnoticed because the other still produces the right answer.
+    #
+    # Here the Ed25519 DS is usable enough to get past the first check and then
+    # matches nothing, while the algorithm-253 DS remains unevaluatable. A DS we
+    # cannot check may yet be the right one, so the delegation is insecure rather
+    # than bogus - the same conclusion, reached in the second place.
     root = Key(".", "unfollowable-root")
     child = Key("uftest.", "unfollowable-child")
 
