@@ -213,3 +213,34 @@ test_a_denial_from_a_zone_below_an_empty_non_terminal_validates :: proc(t: ^test
 	)
 	free_all(context.temp_allocator)
 }
+
+@(test)
+test_the_walk_stops_at_a_name_the_zone_says_is_not_there :: proc(t: ^testing.T) {
+	/*
+	`nx.deep.mid.entest.` does not exist, so neither does anything under it and
+	no zone cut can be hiding there. The walk has to read the denial that way
+	and stop, rather than keep asking for a DS at every remaining label.
+
+	The fixtures answer for no name below `nx.`, which is what makes this
+	visible: a walk that kept going would come back `Indeterminate` on the first
+	lookup it could not make. On the real internet it comes back instead as one
+	blocking upstream query per label of a name a client chose, and - in an
+	NSEC3 zone, where the denial speaks for the next closer name and not for the
+	label below it - as `Bogus` on a zone that is perfectly well signed.
+	*/
+	v := ent_validator()
+	testing.expect(t, v != nil, "the anchor should parse")
+	defer destroy_validator(v)
+
+	budget := Budget{}
+	status, _, zone := zone_trust(
+		v,
+		&budget,
+		"a.b.nx.deep.mid.entest.",
+		time.unix(FIXTURE_TIME, 0),
+		context.temp_allocator,
+	)
+	testing.expect_value(t, status, Status.Secure)
+	testing.expect_value(t, zone, "deep.mid.entest.")
+	free_all(context.temp_allocator)
+}
