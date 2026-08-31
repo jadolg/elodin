@@ -644,3 +644,247 @@ test_badvers_needs_its_opt_record_to_read_as_a_refusal :: proc(t: ^testing.T) {
 
 	free_all(context.temp_allocator)
 }
+
+/*
+The wire walk and the decoded reader have to give the same answer.
+
+`peek_edns_option` exists because the decoded reader cannot be asked about a
+message that does not decode, and a caller judging a reply before accepting it
+has exactly those messages in front of it. That only helps if the two agree
+everywhere they can both be asked - a walk that read a different option, or read
+one from a record the decoded reader never consults, would be a second opinion
+rather than the same one arrived at earlier.
+*/
+@(private = "file")
+raw_reply :: proc(ancount, arcount: u16, tail: ..[]u8) -> []u8 {
+	b := make([dynamic]u8, 0, 128, context.temp_allocator)
+	append(&b, 0x12, 0x34) // id
+	append(&b, 0x81, 0x80) // QR RD RA
+	append(&b, 0x00, 0x01) // qdcount
+	append(&b, u8(ancount >> 8), u8(ancount))
+	append(&b, 0x00, 0x00) // nscount
+	append(&b, u8(arcount >> 8), u8(arcount))
+	append(&b, 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e')
+	append(&b, 3, 'c', 'o', 'm', 0)
+	append(&b, 0x00, 0x01, 0x00, 0x01) // A IN
+	for part in tail {
+		append(&b, ..part)
+	}
+	return b[:]
+}
+
+// An OPT record carrying `options` verbatim, so an option list that does not
+// tile can be written on purpose.
+@(private = "file")
+raw_opt :: proc(options: ..[]u8) -> []u8 {
+	b := make([dynamic]u8, 0, 32, context.temp_allocator)
+	append(&b, 0)                      // root owner name
+	append(&b, 0x00, 0x29)             // OPT
+	append(&b, 0x04, 0xd0)             // 1232
+	append(&b, 0x00, 0x00, 0x00, 0x00) // extended rcode, version, flags
+	n := 0
+	for part in options {
+		n += len(part)
+	}
+	append(&b, u8(n >> 8), u8(n))
+	for part in options {
+		append(&b, ..part)
+	}
+	return b[:]
+}
+
+@(private = "file")
+raw_option :: proc(code: u16, data: []u8) -> []u8 {
+	b := make([dynamic]u8, 0, 32, context.temp_allocator)
+	append(&b, u8(code >> 8), u8(code))
+	append(&b, u8(len(data) >> 8), u8(len(data)))
+	append(&b, ..data)
+	return b[:]
+}
+
+// An A record for the question, with whatever RDLENGTH the caller wants in
+// front of its four bytes of address.
+@(private = "file")
+raw_a :: proc(rdlength: u16) -> []u8 {
+	b := make([dynamic]u8, 0, 32, context.temp_allocator)
+	append(&b, 0xc0, 0x0c)             // owner: a pointer at the question
+	append(&b, 0x00, 0x01, 0x00, 0x01) // A IN
+	append(&b, 0x00, 0x00, 0x00, 0x3c) // ttl 60
+	append(&b, u8(rdlength >> 8), u8(rdlength))
+	append(&b, 192, 0, 2, 1)
+	return b[:]
+}
+
+@(test)
+test_peek_edns_option_agrees_with_the_decoded_reader :: proc(t: ^testing.T) {
+	cookie := []u8{1, 2, 3, 4, 5, 6, 7, 8}
+	nsid := []u8{'n', 's'}
+	wire := raw_reply(
+		1,
+		1,
+		raw_a(4),
+		raw_opt(raw_option(u16(EDNS_Option_Code.NSID), nsid), raw_option(u16(EDNS_Option_Code.Cookie), cookie)),
+	)
+
+	m, derr := decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+
+	for code in ([]EDNS_Option_Code{.Cookie, .NSID, .Padding}) {
+		want, want_found := find_edns_option(m, code)
+		got, got_found := peek_edns_option(wire, code)
+		testing.expectf(t, want_found == got_found, "%v: the walk and the decoded reader disagree on whether it is there", code)
+		testing.expectf(t, mem.compare(want, got) == 0, "%v: the walk read %v, the decoded reader read %v", code, got, want)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+A record the decoder refuses does not put the OPT record out of reach.
+
+The owner name below is a compression pointer aimed forwards, which `decode_name`
+rejects outright (RFC 1035 4.1.4 pointers go backwards) while the wire walk steps
+over the two bytes without following them. That is the whole gap this proc is
+for: the message is well formed as far as anything that matches a reply looks,
+and the cookie in it is there to be read.
+*/
+@(test)
+test_peek_edns_option_reads_past_a_record_the_decoder_refuses :: proc(t: ^testing.T) {
+	cookie := []u8{1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 9, 9, 9, 9, 9}
+	forward_pointer := []u8 {
+		0xc0,
+		0xff, // owner: a pointer past its own position
+		0x00,
+		0x01,
+		0x00,
+		0x01, // A IN
+		0x00,
+		0x00,
+		0x00,
+		0x3c, // ttl 60
+		0x00,
+		0x04,
+		192,
+		0,
+		2,
+		1,
+	}
+	wire := raw_reply(1, 1, forward_pointer, raw_opt(raw_option(u16(EDNS_Option_Code.Cookie), cookie)))
+
+	_, derr := decode_message(wire, context.temp_allocator)
+	testing.expect(t, derr != .None, "the fixture decoded after all, so it tests nothing")
+
+	got, found := peek_edns_option(wire, .Cookie)
+	testing.expect(t, found, "the cookie was not found in a message that does not decode")
+	testing.expect(t, mem.compare(got, cookie) == 0, "the walk read the wrong bytes")
+	free_all(context.temp_allocator)
+}
+
+/*
+What cannot be walked carries no option, which is the answer that fails closed.
+
+There is no third result to report, so a caller asking "is my option here" is
+told no rather than being handed a maybe it would have to invent a policy for.
+*/
+@(test)
+test_peek_edns_option_reports_nothing_when_the_walk_cannot_reach_the_opt :: proc(t: ^testing.T) {
+	cookie := raw_opt(raw_option(u16(EDNS_Option_Code.Cookie), []u8{1, 2, 3, 4, 5, 6, 7, 8}))
+
+	// An RDLENGTH that runs off the end of the message, with the OPT record it
+	// hides sitting right behind it.
+	lying := raw_reply(1, 1, raw_a(0xffff), cookie)
+	_, found := peek_edns_option(lying, .Cookie)
+	testing.expect(t, !found, "an option was read out of a message the walk cannot cross")
+
+	// A section count that promises a record the message does not contain.
+	missing := raw_reply(1, 0)
+	_, found_missing := peek_edns_option(missing, .Cookie)
+	testing.expect(t, !found_missing, "an option was read out of a truncated message")
+
+	// Not even a header.
+	_, found_stub := peek_edns_option([]u8{0x12, 0x34}, .Cookie)
+	testing.expect(t, !found_stub, "an option was read out of a stub")
+
+	_, found_empty := peek_edns_option(nil, .Cookie)
+	testing.expect(t, !found_empty, "an option was read out of nothing")
+	free_all(context.temp_allocator)
+}
+
+/*
+An option list whose lengths do not tile the RDATA is not one to read the first
+entry off and stop: the bytes after it are not options, and which of them a
+reader lands on is the sender's choice.
+
+The decoded reader arrives at the same place by another road. `decode_record`
+keeps RDATA it cannot parse as raw bytes rather than refusing the message, so
+this one decodes - but the OPT record's data is no longer an option list, and
+`find_edns_option` reports nothing. Both readers say the cookie is not there,
+which is what matters: the walk is not a way to read an option out of a record
+the decoded reader has already given up on.
+*/
+@(test)
+test_peek_edns_option_rejects_an_option_list_that_does_not_tile :: proc(t: ^testing.T) {
+	// A cookie, and then three bytes that are the start of an option header and
+	// not an option.
+	wire := raw_reply(
+		0,
+		1,
+		raw_opt(raw_option(u16(EDNS_Option_Code.Cookie), []u8{1, 2, 3, 4, 5, 6, 7, 8}), []u8{0x00, 0x0a, 0x00}),
+	)
+
+	_, found := peek_edns_option(wire, .Cookie)
+	testing.expect(t, !found, "an option was read out of a list that does not tile")
+
+	m, derr := decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	_, decoded_found := find_edns_option(m, .Cookie)
+	testing.expect(t, !decoded_found, "the decoded reader read an option out of a list that does not tile")
+	free_all(context.temp_allocator)
+}
+
+// The same rule the writer follows: an OPT record only counts in the additional
+// section, so the walk cannot be pointed at one a reader never consults.
+@(test)
+test_peek_edns_option_ignores_an_opt_outside_the_additional_section :: proc(t: ^testing.T) {
+	decoy := raw_opt(raw_option(u16(EDNS_Option_Code.Cookie), []u8{9, 9, 9, 9, 9, 9, 9, 9}))
+	real := raw_opt(raw_option(u16(EDNS_Option_Code.Cookie), []u8{1, 2, 3, 4, 5, 6, 7, 8}))
+
+	only_decoy := raw_reply(1, 0, decoy)
+	_, found := peek_edns_option(only_decoy, .Cookie)
+	testing.expect(t, !found, "an OPT record in the answer section was read as the message's EDNS record")
+
+	both := raw_reply(1, 1, decoy, real)
+	got, found_both := peek_edns_option(both, .Cookie)
+	testing.expect(t, found_both, "the additional section's OPT record was not found")
+	testing.expect(t, mem.compare(got, []u8{1, 2, 3, 4, 5, 6, 7, 8}) == 0, "the decoy's cookie was read instead")
+
+	m, derr := decode_message(both, context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	want, _ := find_edns_option(m, .Cookie)
+	testing.expect(t, mem.compare(want, got) == 0, "the walk and the decoded reader read different OPT records")
+	free_all(context.temp_allocator)
+}
+
+// Both readers take the first of a repeated option, so a second copy is not a
+// way to show one of them a cookie the other never sees.
+@(test)
+test_peek_edns_option_takes_the_first_of_duplicates :: proc(t: ^testing.T) {
+	first := []u8{1, 2, 3, 4, 5, 6, 7, 8}
+	second := []u8{9, 9, 9, 9, 9, 9, 9, 9}
+	wire := raw_reply(
+		0,
+		1,
+		raw_opt(raw_option(u16(EDNS_Option_Code.Cookie), first), raw_option(u16(EDNS_Option_Code.Cookie), second)),
+	)
+
+	got, found := peek_edns_option(wire, .Cookie)
+	testing.expect(t, found, "the repeated option was not found")
+	testing.expect(t, mem.compare(got, first) == 0, "the walk read the second copy")
+
+	m, derr := decode_message(wire, context.temp_allocator)
+	if derr == .None {
+		want, want_found := find_edns_option(m, .Cookie)
+		testing.expect(t, want_found, "the decoded reader lost the repeated option")
+		testing.expect(t, mem.compare(want, got) == 0, "the two readers picked different copies")
+	}
+	free_all(context.temp_allocator)
+}
