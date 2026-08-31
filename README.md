@@ -580,9 +580,22 @@ What is checked, and what happens when it does not hold:
 | denial of existence | NSEC and NSEC3, including closest-encloser proofs and opt-out |
 | wildcards | a wildcard answer must come with a proof that the name had nothing of its own |
 | unsigned zones | insecure: served, no AD bit |
-| bounds | 32 DS/DNSKEY lookups per question, 24 labels of chain, 8 signatures per RRset, 64 keys per zone, 100 NSEC3 iterations |
+| bounds | 32 DS/DNSKEY lookups per question, 64 signature checks per question, 24 labels of chain, 8 signatures per RRset, 64 keys per zone, 8 hint targets per answer, 100 NSEC3 iterations |
 | algorithm we cannot check | insecure, not bogus — RFC 4035 treats unverifiable data as unsigned |
 | bad signature, broken chain, missing proof | SERVFAIL, with an extended DNS error (RFC 8914) saying which |
+
+An answer that gets the AD bit is first cut down to the records that earned it.
+RFC 4035 section 3.2.3 allows the bit only over data the resolver authenticated,
+and a response carries whatever else its sender chose to put in it — a
+delegation, an address for a nameserver — which nothing here examined. Those go,
+so that the bit is not lent to them. The address records an authoritative server
+sends beside an HTTPS, SVCB, SRV or MX answer are the exception, and not by being
+waved through: RFC 9460 section 5 asks for them so a client can connect without a
+second query, so elodin establishes the target's own zone, checks the signature
+there, and keeps the ones that hold up. A hint that does not — unsigned, forged,
+in a zone with no chain, or expanded from a wildcard whose proof is not in the
+message — is dropped, and the client asks for the address itself. Nothing about
+a hint can change the verdict on the answer it arrived with.
 
 The trust anchors are the root key-signing keys IANA publishes, both KSK-2017
 and KSK-2024, compiled in — a rollover between the two needs no new build.

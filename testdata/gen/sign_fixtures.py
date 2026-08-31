@@ -40,6 +40,7 @@ DIGEST_SHA256 = 2
 CLASS_IN = 1
 
 A, NS, SOA, CNAME, MX, TXT = 1, 2, 6, 5, 15, 16
+AAAA, SRV, SVCB, HTTPS = 28, 33, 64, 65
 DS, RRSIG, NSEC, DNSKEY, NSEC3 = 43, 46, 47, 48, 50
 
 
@@ -186,11 +187,13 @@ def sign(rrset, key, signer=None, labels=None):
     return RR(owner, RRSIG, prefix + signature, TTL)
 
 
-def message(qname, qtype, answer, authority=()):
+def message(qname, qtype, answer, authority=(), additional=()):
     """One authoritative NOERROR reply, as the fixture query callback returns it."""
-    header = struct.pack("!HHHHHH", QID, FLAGS, 1, len(answer), len(authority), 0)
+    header = struct.pack(
+        "!HHHHHH", QID, FLAGS, 1, len(answer), len(authority), len(additional)
+    )
     out = header + wire_name(qname) + struct.pack("!HH", qtype, CLASS_IN)
-    for section in (answer, authority):
+    for section in (answer, authority, additional):
         for rr in section:
             out += rr.wire()
     return out
@@ -371,6 +374,140 @@ def unfollowable_ds_beside_unsupported():
     answer = [RR("www.uftest.", A, bytes([192, 0, 2, 1]))]
     emit("uf_answer", "www.uftest.", "A",
          message("www.uftest.", A, answer + [sign(answer, child)]))
+
+
+@scenario
+def signed_address_hints():
+    """Cover the address records that ride beside an HTTPS, SVCB, SRV or MX answer."""
+    # RFC 9460 section 5 has an authoritative server put A and AAAA for the
+    # target in the additional section so a client can connect without asking
+    # again. Those are not glue - they are ordinary signed zone data - so a
+    # resolver setting AD can keep the ones it authenticates, and must drop the
+    # rest. Every shape that decision has to tell apart is here: a target inside
+    # the zone the answer established, one in a second zone that needs a chain
+    # walk of its own, one in a zone that cannot be reached at all, an unsigned
+    # record, a forged one, a validly signed record for a name the answer never
+    # named, and a wildcard expansion whose proof is nowhere in the message.
+    root = Key(".", "hints-root")
+    zone = Key("hinttest.", "hints-zone")
+    other = Key("other.", "hints-other")
+    # A zone with no delegation anywhere in these fixtures, so a hint signed by
+    # it is a hint whose chain of trust cannot be built.
+    nowhere = Key("nosuch.", "hints-nowhere")
+
+    root_keys = [RR(".", DNSKEY, root.rdata)]
+    print("// anchor: %s" % root.ds_text())
+    emit("sh_root_dnskey", ".", "DNSKEY", message(".", DNSKEY, root_keys + [sign(root_keys, root)]))
+
+    for child in (zone, other):
+        ds_set = [RR(child.zone, DS, child.ds())]
+        emit("sh_%s_ds" % child.zone.rstrip("."), child.zone, "DS",
+             message(child.zone, DS, ds_set + [sign(ds_set, root)]))
+        keys = [RR(child.zone, DNSKEY, child.rdata)]
+        emit("sh_%s_dnskey" % child.zone.rstrip("."), child.zone, "DNSKEY",
+             message(child.zone, DNSKEY, keys + [sign(keys, child)]))
+
+    def a(name, addr):
+        """One A record, from a dotted-quad."""
+        return RR(name, A, bytes(int(part) for part in addr.split(".")))
+
+    def aaaa(name, addr):
+        """One AAAA record, from the 16 bytes written as hex."""
+        return RR(name, AAAA, bytes.fromhex(addr))
+
+    def srv(name, target):
+        """An SRV record at priority 0, weight 0, port 443."""
+        return RR(name, SRV, struct.pack("!HHH", 0, 0, 443) + wire_name(target))
+
+    def https(name, target):
+        """A ServiceMode HTTPS record with no parameters."""
+        return RR(name, HTTPS, struct.pack("!H", 1) + wire_name(target))
+
+    def mx(name, target, preference=10):
+        """One MX record."""
+        return RR(name, MX, struct.pack("!H", preference) + wire_name(target))
+
+    # A target inside the zone the answer already established: the common case,
+    # and the one that costs no lookup at all because the zone's keys are in hand.
+    answer = [srv("_svc._tcp.hinttest.", "svc.hinttest.")]
+    hints = [a("svc.hinttest.", "192.0.2.10"), aaaa("svc.hinttest.", "20010db8000000000000000000000010")]
+    emit("sh_srv_same_zone", "_svc._tcp.hinttest.", "SRV",
+         message("_svc._tcp.hinttest.", SRV, answer + [sign(answer, zone)],
+                 additional=hints + [sign(hints[:1], zone), sign(hints[1:], zone)]))
+
+    # A target in a second signed zone. Keeping this one means walking a chain
+    # the answer never needed.
+    answer = [https("alt.hinttest.", "edge.other.")]
+    hints = [a("edge.other.", "198.51.100.20"), aaaa("edge.other.", "20010db8000000000000000000000020")]
+    emit("sh_https_cross_zone", "alt.hinttest.", "HTTPS",
+         message("alt.hinttest.", HTTPS, answer + [sign(answer, zone)],
+                 additional=hints + [sign(hints[:1], other), sign(hints[1:], other)]))
+
+    # A ServiceMode TargetName of "." stands for the owner name (RFC 9460
+    # section 2.5), so the hints to keep are the ones at the answer's own name.
+    answer = [https("hinttest.", ".")]
+    hints = [a("hinttest.", "192.0.2.1")]
+    emit("sh_https_service_form", "hinttest.", "HTTPS",
+         message("hinttest.", HTTPS, answer + [sign(answer, zone)],
+                 additional=hints + [sign(hints, zone)]))
+
+    # One MX answer carrying every kind of record that must not survive it: the
+    # exchange's AAAA with no signature at all, a validly signed address for a
+    # name the answer never named, and an attacker's unsigned glue.
+    answer = [mx("hinttest.", "mail.hinttest.")]
+    signed = [a("mail.hinttest.", "192.0.2.30")]
+    bystander = [a("bystander.hinttest.", "192.0.2.31")]
+    additional = (
+        signed + [sign(signed, zone)]
+        + [aaaa("mail.hinttest.", "20010db8000000000000000000000030")]
+        + bystander + [sign(bystander, zone)]
+        + [a("ns.attacker.example.", "203.0.113.66")]
+    )
+    emit("sh_mx_mixed", "hinttest.", "MX",
+         message("hinttest.", MX, answer + [sign(answer, zone)], additional=additional))
+
+    # The signature is the zone's and covers this owner and type - over an
+    # address that is not the one in the record beside it.
+    answer = [srv("_svc._tcp.hinttest.", "svc.hinttest.")]
+    genuine = [a("svc.hinttest.", "192.0.2.10")]
+    emit("sh_forged_hint", "_svc._tcp.hinttest.", "SRV",
+         message("_svc._tcp.hinttest.", SRV, answer + [sign(answer, zone)],
+                 additional=[a("svc.hinttest.", "203.0.113.99"), sign(genuine, zone)]))
+
+    # AliasMode - priority zero - is a redirection the client follows by name
+    # (RFC 9460 section 2.4.2), so its target names no hint to keep even when a
+    # perfectly good signed address for it is sitting in the section.
+    answer = [RR("alias.hinttest.", HTTPS, struct.pack("!H", 0) + wire_name("edge.other."))]
+    hints = [a("edge.other.", "198.51.100.20")]
+    emit("sh_alias_mode", "alias.hinttest.", "HTTPS",
+         message("alias.hinttest.", HTTPS, answer + [sign(answer, zone)],
+                 additional=hints + [sign(hints, other)]))
+
+    # A hint that verifies against a wildcard. Nothing in the message proves the
+    # name had no records of its own, and that proof lives in a section this
+    # server never validated - so the signature holding up is not enough.
+    answer = [https("alt2.hinttest.", "wild.hinttest.")]
+    hints = [a("wild.hinttest.", "192.0.2.40")]
+    emit("sh_wildcard_hint", "alt2.hinttest.", "HTTPS",
+         message("alt2.hinttest.", HTTPS, answer + [sign(answer, zone)],
+                 additional=hints + [sign(hints, zone, labels=1)]))
+
+    # A target in a zone nothing delegates to. The signature is real and the
+    # chain cannot be built, which is the same as no signature at all here.
+    answer = [https("alt3.hinttest.", "edge.nosuch.")]
+    hints = [a("edge.nosuch.", "192.0.2.50")]
+    emit("sh_unreachable_zone", "alt3.hinttest.", "HTTPS",
+         message("alt3.hinttest.", HTTPS, answer + [sign(answer, zone)],
+                 additional=hints + [sign(hints, nowhere)]))
+
+    # Forty exchanges in forty zones, none of them reachable. What is being
+    # counted is how many of them provoke a chain walk: a response naming more
+    # targets than `MAX_HINT_TARGETS` must not buy a walk apiece, and must not
+    # cost the answer its own verdict.
+    answer = [mx("hinttest.", "mx%d.z%d." % (i, i), preference=i) for i in range(40)]
+    additional = [a("mx%d.z%d." % (i, i), "192.0.2.%d" % (100 + i)) for i in range(40)]
+    emit("sh_many_targets", "hinttest.", "MX",
+         message("hinttest.", MX, answer + [sign(answer, zone)], additional=additional))
 
 
 if __name__ == "__main__":

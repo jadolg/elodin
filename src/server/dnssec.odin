@@ -184,7 +184,8 @@ response carries whatever else its sender chose to put in the authority and
 additional sections - so passing those on under an AD bit would lend our name to
 a delegation, or an address, that nothing here examined (RFC 4035 section
 3.2.3). `dnssec.strip_unauthenticated` has the whole argument for taking them
-out rather than trying to check them.
+out rather than trying to check them - and for the one part of it that is
+checked instead, the address hints beside an HTTPS, SVCB, SRV or MX answer.
 
 A client that set DO asked for the signatures and keeps every record that
 survived the prune above. One that did not has the DNSSEC records taken back

@@ -113,6 +113,31 @@ MAX_SIGNATURES_PER_RRSET :: 8
 // Real chains are one or two; anything past this is a loop or a stall.
 MAX_CNAME_CHAIN :: 16
 
+/*
+Targets one answer may have its address hints authenticated for.
+
+RFC 9460 section 5 has an authoritative server send the A and AAAA records for
+an HTTPS, SVCB, SRV or MX target beside the answer, so that a client can connect
+without asking again. `validated_hints` keeps the ones that hold up, and holding
+one up means establishing the zone that signed it - which for a target outside
+the zone the answer established is a chain walk of its own. The number of
+targets is the sender's to choose, so the walks need a bound that is not.
+
+Eight is past every answer of this shape that anyone serves: an HTTPS answer
+names one target, an SRV set a handful, and an eight-exchange MX set is a large
+one. Past the bound the hints are dropped exactly as the whole section used to
+be - a round trip for the client, not a wrong answer - so erring small costs
+little and erring large costs upstream queries somebody else picked.
+
+The query budget is the other bound and the one that holds when this is not
+enough: the walks spend `MAX_LOOKUPS_PER_QUERY` and
+`MAX_VERIFICATIONS_PER_QUERY` like everything else. Hints are authenticated last
+for that reason - what they spend is what the answer and its wildcard proofs did
+not need, and a hint that runs the allowance out is dropped rather than allowed
+to change the verdict the answer already earned.
+*/
+MAX_HINT_TARGETS :: 8
+
 // Keys a zone may publish. Far past any real zone, and it bounds both the
 // canonical form built over the set and what the cache then holds on to.
 MAX_KEYS_PER_ZONE :: 64
@@ -330,8 +355,19 @@ Result :: struct {
 
 	Filled in only on the `Secure` path, since nothing else can set AD.
 	*/
-	answer:    []Authenticated_Set,
-	authority: []Authenticated_Set,
+	answer:     []Authenticated_Set,
+	authority:  []Authenticated_Set,
+	/*
+	The address hints beside the answer that were authenticated as well.
+
+	A third section, and the only one this validator goes looking in rather than
+	being handed. `validate_answer` reads the targets out of the RRsets it has
+	already authenticated and then checks the A and AAAA sets sitting at those
+	names, which is what RFC 9460 section 5 puts them there for. Everything else
+	in the additional section stays what it always was - nobody's word but the
+	sender's - so this list is what separates the two.
+	*/
+	additional: []Authenticated_Set,
 }
 
 /*
@@ -492,12 +528,11 @@ Not everything in the additional section is glue, and the argument above does
 not stretch to cover the rest of it. The address records a server sends beside
 an HTTPS, SVCB, SRV or MX answer are ordinary signed zone data (RFC 9460 section
 5 asks for them by name), and a client that has them is spared a round trip
-before it can connect. They are dropped all the same, because they are signed by
-the target's zone rather than by the one this query established, so keeping them
-authenticated means the same second chain walk the denial case needs - and
-keeping them unauthenticated under our AD bit is the whole thing this procedure
-exists to stop. The cost is a round trip on a shape that is getting commoner, so
-it is filed rather than shrugged at.
+before it can connect. Those are authenticated rather than dropped, and the ones
+that hold up travel with the answer - see `validated_hints`, which is where the
+narrow reading of "those" is written down. Not passed through unchecked: AD is a
+property of the message, and a client that reads AD=1 and then connects to an
+address nobody verified is the exact harm this procedure exists to prevent.
 
 The one real loss is a CNAME chain that ends in a denial - a dual-stack client
 asking AAAA for an IPv4-only name is the everyday version of it, and a CNAME
@@ -560,7 +595,7 @@ strip_unauthenticated :: proc(
 	}
 	msg.answer = authenticated_only(msg.answer, result.answer, allocator)
 	msg.authority = authenticated_only(msg.authority, result.authority, allocator)
-	msg.additional = opt_only(msg.additional, allocator)
+	msg.additional = authenticated_and_opt(msg.additional, result.additional, allocator)
 
 	/*
 	A truncated rebuild is a failure, not a result. `encode_message` drops
@@ -772,22 +807,35 @@ authenticated_only :: proc(
 }
 
 /*
-The additional section keeps its OPT record and nothing else.
+The additional section keeps its OPT record and the hints that were checked.
 
-Nothing else in it was authenticated, and there is no second copy of the answer
-to serve the clients that would rather have the unauthenticated version: the
-cache key tells DO and CD apart and nothing else, so one message is what every
-client behind this resolver gets.
+`kept` is `Result.additional`, which `validated_hints` fills with the address
+RRsets an authenticated answer pointed at and this server then authenticated in
+their own zones. Everything else goes, because nothing else in the section was
+looked at and there is no second copy of the answer to serve the clients that
+would rather have the unauthenticated version: the cache key tells DO and CD
+apart and nothing else, so one message is what every client behind this resolver
+gets.
 
-What that costs is the address records a responder sends beside an HTTPS, SVCB,
-SRV, MX or NS answer (RFC 9460 section 5) - a client loses them and pays a round
-trip to look them up. Filed as #189, which is where a way to keep the signed ones
-belongs; it needs the answer's own RRsets checked in the additional section
-rather than a change here.
+The OPT record survives on its own account and is written last, which is where
+every responder puts it. It is transport rather than data - no owner name to
+authenticate - and taking it out would drop the upper bits of the rcode and any
+extended error with them.
+
+An NS answer's addresses are not on the list, and the omission is deliberate.
+The NS RRset of a delegation arrives in the *authority* section and is never
+authenticated, so it names no target here and the addresses below it stay glue -
+which is the whole of #177 and must not be undone by a procedure about hints.
 */
 @(private)
-opt_only :: proc(section: []dns.Record, allocator: mem.Allocator) -> []dns.Record {
-	out := make([dynamic]dns.Record, 0, 1, allocator)
+authenticated_and_opt :: proc(
+	section: []dns.Record,
+	kept: []Authenticated_Set,
+	allocator: mem.Allocator,
+) -> []dns.Record {
+	hints := authenticated_only(section, kept, allocator)
+	out := make([dynamic]dns.Record, 0, len(hints) + 1, allocator)
+	append(&out, ..hints)
 	for rec in section {
 		if rec.type == .OPT {
 			append(&out, rec)
@@ -815,6 +863,192 @@ authenticated_rrset :: proc(
 		}
 	}
 	return 0, false
+}
+
+/*
+The names an authenticated answer points a client at.
+
+Read from the RRsets that came back `Secure` and from nowhere else, which is the
+load-bearing half of this. The additional section is written by whoever wrote the
+response, and so is the answer section - but an answer RRset had to survive its
+zone's signature to get into `answered`, so the targets named here are the ones
+the zone itself published. Reading them off the answer section directly would let
+anyone able to append a record nominate the names whose addresses get
+authenticated and carried out under the AD bit; that would still be authentic
+data, since each hint is checked against its own zone, but it would be a stranger
+choosing what this server spends its chain walks on.
+
+An HTTPS or SVCB record in ServiceMode may write its TargetName as ".", which RFC
+9460 section 2.5 makes the owner name itself rather than the root. AliasMode -
+priority zero - is a redirection to be followed rather than a service to connect
+to, and the client will ask about the target by name, so it names no hint.
+*/
+@(private)
+hint_targets :: proc(
+	msg: dns.Message,
+	answered: []Authenticated_Set,
+	class: dns.Class,
+	allocator: mem.Allocator,
+) -> []string {
+	out := make([dynamic]string, 0, 4, allocator)
+	for rec in msg.answer {
+		if len(out) >= MAX_HINT_TARGETS {
+			break
+		}
+		if rec.class != class {
+			continue
+		}
+		#partial switch rec.type {
+		case .HTTPS, .SVCB, .SRV, .MX:
+		case:
+			continue
+		}
+		if _, ok := authenticated_rrset(answered, rec.name, rec.type, class); !ok {
+			continue
+		}
+
+		target := ""
+		if svcb, is_svcb := rec.data.(dns.Rdata_SVCB); is_svcb {
+			if svcb.priority == 0 {
+				continue
+			}
+			target = rec.name if svcb.target == "." else svcb.target
+		} else if srv, is_srv := rec.data.(dns.Rdata_SRV); is_srv {
+			target = srv.target
+		} else if mx, is_mx := rec.data.(dns.Rdata_MX); is_mx {
+			target = mx.exchange
+		}
+		// The root holds no addresses, and a target that did not parse is not a
+		// name to go looking for one under.
+		if target == "" || target == "." {
+			continue
+		}
+		if name_listed(out[:], target) {
+			continue
+		}
+		append(&out, target)
+	}
+	return out[:]
+}
+
+@(private)
+name_listed :: proc(names: []string, name: string) -> bool {
+	for n in names {
+		if dns.name_equal_fold(n, name) {
+			return true
+		}
+	}
+	return false
+}
+
+/*
+Authenticate the address records sent beside the answer, and keep the ones that
+hold up.
+
+RFC 9460 section 5 asks a recursive resolver to pass those on so that a client
+does not have to resolve the target before it can connect, and #177 took them out
+along with the glue. They are not glue: an address for an HTTPS, SVCB, SRV or MX
+target is ordinary zone data, signed by the zone that holds it, and the only
+reason it cannot ride on the answer's verdict is that the zone which signed it is
+usually not the zone the answer established. So it gets established here.
+
+`validate_rrset` does the establishing, which means each hint is judged exactly
+as an answer-section RRset is: the signer has to lie in the owner's ancestry, the
+chain from a trust anchor down to that signer has to hold, and the signature has
+to be one this build can check. What is different is what a failure means. The
+answer has already been judged by the time this runs, and a hint is a
+convenience - so anything short of `Secure` drops the record and changes nothing
+else. A response cannot be made to fail by having a bad address bolted onto it.
+
+Two things are refused that an answer-section RRset would not be.
+
+A wildcard expansion, because the proof that goes with one is not here. RFC 4035
+section 5.3.4 has a validator demand a denial that the expanded name has nothing
+of its own, `validate_answer` assembles that proof for the answer, and for a hint
+it would live in the authority section of a zone this message is not even about.
+Without it, a wildcard signature lifted from any name under the encloser vouches
+for an address at any other - so the hint is dropped, and a client that wants the
+address asks for it, which is where it started.
+
+Anything outside the query's class, and A or AAAA and nothing else. A target's
+address is what section 5 is about and what a client connects to; a CNAME, a
+DNAME or a second SVCB record at the target would be this server following a
+redirection nobody asked it to follow, on the strength of a section it does not
+otherwise read.
+
+The cost is upstream queries, and where it falls is worth being plain about: a
+target inside the zone the answer established costs nothing at all, because
+`zone_step` finds that zone in the validator's cache. A target in a second zone
+costs the walk down to it, shared with every later question through the same
+cache. `MAX_HINT_TARGETS` bounds how many of those one response can ask for, and
+the query budget bounds what they may spend between them.
+
+One more thing changes for the client, and it is not a security property: the
+records kept here carry TTLs of their own, and `cache.put` holds an entry for the
+shortest TTL in the message. A hint with a shorter life than the answer therefore
+shortens the entry - which is what already happens to every unsigned answer that
+keeps its additional section, so this makes the two paths agree rather than
+introducing anything.
+*/
+@(private)
+validated_hints :: proc(
+	v: ^Validator,
+	budget: ^Budget,
+	msg: dns.Message,
+	answered: []Authenticated_Set,
+	class: dns.Class,
+	unix: u32,
+	now: time.Time,
+	allocator: mem.Allocator,
+) -> []Authenticated_Set {
+	targets := hint_targets(msg, answered, class, allocator)
+	if len(targets) == 0 {
+		return nil
+	}
+
+	out := make([dynamic]Authenticated_Set, 0, 2 * len(targets), allocator)
+	seen := make([dynamic]dns.Question, 0, 2 * len(targets), allocator)
+	for rec in msg.additional {
+		if rec.class != class || (rec.type != .A && rec.type != .AAAA) {
+			continue
+		}
+		if !name_listed(targets, rec.name) {
+			continue
+		}
+		if already_seen(seen[:], rec.name, rec.type) {
+			continue
+		}
+		append(&seen, dns.Question{name = rec.name, type = rec.type})
+
+		records := records_of(msg.additional, rec.name, rec.type, class, allocator)
+		sigs := sigs_covering(msg.additional, rec.name, rec.type, class, allocator)
+		status, encloser, _, signer, carried := validate_rrset(
+			v,
+			budget,
+			rec.name,
+			rec.type,
+			class,
+			records,
+			sigs,
+			unix,
+			now,
+			allocator,
+		)
+		if status != .Secure || encloser != "" {
+			continue
+		}
+		append(
+			&out,
+			Authenticated_Set {
+				name = rec.name,
+				type = rec.type,
+				class = class,
+				signer = signer,
+				rrsig = carried,
+			},
+		)
+	}
+	return out[:]
 }
 
 @(private)
@@ -1034,7 +1268,21 @@ validate_answer :: proc(
 	if worst != .Secure {
 		return {status = worst, reason = reason}
 	}
-	return {status = worst, reason = reason, answer = authenticated[:], authority = proved[:]}
+	/*
+	Last, and after the verdict is settled. The hints spend what the answer and
+	its proofs left of the budget, and nothing they find - or fail to find - can
+	move `worst`: a response is not made bogus by an address bolted onto it, and
+	an address this server could not afford to check is one the client asks for
+	itself.
+	*/
+	hints := validated_hints(v, budget, msg, authenticated[:], class, unix, now, allocator)
+	return {
+		status = worst,
+		reason = reason,
+		answer = authenticated[:],
+		authority = proved[:],
+		additional = hints,
+	}
 }
 
 @(private)
@@ -1091,7 +1339,7 @@ validate_denial :: proc(
 	hands the client extended error 6.
 	*/
 	if denial_spent {
-		return {.Indeterminate, "verification budget spent", nil, nil}
+		return {status = .Indeterminate, reason = "verification budget spent"}
 	}
 	if len(nsecs) == 0 && len(nsec3s) == 0 {
 		return {status = .Bogus, reason = "no denial of existence"}
