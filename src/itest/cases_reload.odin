@@ -190,7 +190,7 @@ run_reload_cases :: proc(r: ^Runner) {
 			// Polled, not read once: the handshake above goes through the moment
 			// the context is swapped, and the log line the reload writes can reach
 			// the file a beat later, so a single read races it on a loaded runner.
-			check(r, wait_listening(&srv, "reloaded the certificate", 2 * time.Second), "no reload was logged")
+			check(r, wait_for_log(&srv, "reloaded the certificate", 2 * time.Second), "no reload was logged")
 		}
 	}
 	end_case(r)
@@ -208,7 +208,7 @@ run_reload_cases :: proc(r: ^Runner) {
 			// so the handshake check below is not racing an in-flight swap.
 			if check(
 				r,
-				wait_listening(&srv, "keeping the certificate already in use", 2 * time.Second),
+				wait_for_log(&srv, "keeping the certificate already in use", 2 * time.Second),
 				"the bad reload was not logged",
 			) {
 				check(
