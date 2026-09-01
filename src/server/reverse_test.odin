@@ -356,6 +356,56 @@ test_a_rule_that_opts_out_supplies_no_reverse :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+/*
+`ptr: false` on the rule that answers the name is what settles it, even when the
+rule mentioning the address said nothing.
+
+A duplicated `domain:` where only the first copy carries the opt-out is the
+short way to write it: the second copy is never answered, so reading its silence
+as consent would synthesise exactly the PTR the first copy was written to
+prevent. A wildcard with `ptr: false` over a later rule for the same address is
+the same shape.
+*/
+@(test)
+test_the_opt_out_follows_the_rule_that_answers :: proc(t: ^testing.T) {
+	rules := make([]config.Rewrite, 2, context.temp_allocator)
+	rules[0] = config.Rewrite {
+		domain  = "ads.example.",
+		answers = answers_of({kind = .A, v4 = {192, 168, 1, 10}}),
+		ttl     = 300,
+		ptr     = false,
+	}
+	rules[1] = config.Rewrite {
+		domain  = "ads.example.",
+		answers = answers_of({kind = .A, v4 = {192, 168, 1, 10}}),
+		ttl     = 300,
+		ptr     = true,
+	}
+
+	_, _, duplicated := reverse_rewrite_target(rules, "10.1.168.192.in-addr.arpa.")
+	testing.expect(t, !duplicated, "the shadowed copy must not undo the opt-out")
+
+	wildcard := make([]config.Rewrite, 2, context.temp_allocator)
+	wildcard[0] = config.Rewrite {
+		domain   = "example.",
+		wildcard = true,
+		answers  = answers_of({kind = .A, v4 = {192, 168, 1, 10}}),
+		ttl      = 300,
+		ptr      = false,
+	}
+	wildcard[1] = config.Rewrite {
+		domain  = "ads.example.",
+		answers = answers_of({kind = .A, v4 = {192, 168, 1, 10}}),
+		ttl     = 300,
+		ptr     = true,
+	}
+
+	_, _, shadowed := reverse_rewrite_target(wildcard, "10.1.168.192.in-addr.arpa.")
+	testing.expect(t, !shadowed, "the wildcard that answers the name carries the opt-out")
+
+	free_all(context.temp_allocator)
+}
+
 // The same, for the other way a rule can be unreachable: a duplicated `domain:`
 // is two rules with one name between them, and only the first is ever answered.
 @(test)

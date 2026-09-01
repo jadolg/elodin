@@ -1366,10 +1366,13 @@ the address is one this network holds:
 - a rule written for the reverse name itself wins, the synthesis being what
   happens when nothing more specific was said;
 - a `dnssec.trust_anchors` entry over the reverse zone turns the synthesis off
-  for the names it covers. Anchoring a zone is a request to validate it, and an
-  answer invented here carries no signature — a validating client below you,
-  holding the same anchor, would get SERVFAIL for it. A site that signs its own
-  reverse space is publishing these PTRs already.
+  for the names it covers, while `dnssec.enabled` is on. Anchoring a zone is a
+  request to validate it, and an answer invented here carries no signature — a
+  validating client below you, holding the same anchor, would get SERVFAIL for
+  it. A site that signs its own reverse space is publishing these PTRs already.
+  With validation off the anchors are inert here as they are everywhere else in
+  this server, and every locally answered name — rewrites, blocked names, the
+  reserved-name table — is unsigned in the same way.
 
 Three things to know before turning this loose on an existing installation.
 

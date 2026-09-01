@@ -122,8 +122,20 @@ apply_reverse_rewrite :: proc(
 	if !served {
 		return nil, false
 	}
-	// An anchor over the zone is the operator asking for these names to be
-	// validated, which nothing invented here can be. See above.
+	/*
+	An anchor over the zone is the operator asking for these names to be
+	validated, which nothing invented here can be. See above.
+
+	It reaches only as far as `s.anchor_zones` does, which is to say only while
+	`dnssec.enabled` - `start_validator` is what fills that in, and with
+	validation off nothing in this server reads `dnssec.trust_anchors` at all.
+	The deference is the narrower claim it therefore sounds like, and the wider
+	one is not this procedure's to make: with validation off, an answer this
+	server produces for itself is unsigned whatever an anchor says, which is
+	already true of `apply_rewrite`, of the block response and of the
+	special-use table. Making the one invented answer honour an anchor list the
+	rest of the server ignores would be a surprise, not a fix.
+	*/
 	if covered_by_local_anchor(s, q.name) {
 		return nil, false
 	}
@@ -249,12 +261,27 @@ rewrite_naming_address :: proc(
 		if !rule_hands_out(r, want) {
 			continue
 		}
-		// What `r.domain` actually resolves to is whatever rule wins that name,
-		// which is `r` itself unless something above shadows it - and the TTL
-		// comes from there too, so that a client is told the two directions
-		// expire together because they do.
-		winner, _ := find_rewrite_index(rules, r.domain)
-		if winner != i && !rule_hands_out(rules[winner], want) {
+		/*
+		What `r.domain` actually resolves to is whatever rule wins that name,
+		which is `r` itself unless something above shadows it - and everything
+		about the answer comes from there: whether it is this address, whether
+		the rule that gives it out allows a reverse, and the TTL, so that a
+		client is told the two directions expire together because they do.
+
+		`ptr: false` on the winner settles it even though the shadowed rule said
+		nothing, and that is the only reading that holds: the PTR asserts what
+		this address is called, an assertion whose truth is in the answer the
+		winner gives, so it is the winner's opt-out that is about this address.
+		*/
+		winner, has_winner := find_rewrite_index(rules, r.domain)
+		if !has_winner {
+			// Unreachable: a non-wildcard rule matches its own domain, that
+			// being `name_equal_fold` of a string with itself. Guarded rather
+			// than indexed on the `0` sentinel, which would quietly read the
+			// first rule instead if the search ever grew a filter.
+			continue
+		}
+		if winner != i && (!rules[winner].ptr || !rule_hands_out(rules[winner], want)) {
 			continue
 		}
 		return r.domain, rules[winner].ttl, true
