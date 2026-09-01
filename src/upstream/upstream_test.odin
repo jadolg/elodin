@@ -1381,22 +1381,26 @@ The mock resets its first connection and serves the second, so the query only
 comes back if the retry happened.
 */
 
-@(private = "file")
+/*
+Package-private rather than file-private: `padding_test.odin` stands up a DoT
+mock of its own and there is one key generation to share between them.
+*/
+@(private)
 DOT_CERT_DIR :: "/tmp/elodin-upstream-test"
 
-@(private = "file")
+@(private)
 dot_cert_once: sync.Once
-@(private = "file")
+@(private)
 dot_cert_path: string
-@(private = "file")
+@(private)
 dot_key_path: string
-@(private = "file")
+@(private)
 dot_cert_ok: bool
 
 // Generated into the system temp directory and left there, so only the first
 // run of the suite pays for key generation. `certs/` is used when a developer
 // already has one; CI never does.
-@(private = "file")
+@(private)
 generate_dot_certs :: proc() {
 	if os.exists("certs/cert.pem") && os.exists("certs/key.pem") {
 		dot_cert_path, dot_key_path, dot_cert_ok = "certs/cert.pem", "certs/key.pem", true
