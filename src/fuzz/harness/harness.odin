@@ -32,6 +32,22 @@ setup :: proc(f: ^Fuzz_Arena) -> runtime.Context {
 	return ctx
 }
 
+/*
+Drop everything this input allocated: the arena above, and the temp arena with it.
+
+`setup` swaps `context.allocator` but leaves `context.temp_allocator` as the
+thread's default one, and code under test reaches for it on its own - the EDNS
+writers take their scratch from there whenever an option cannot be spliced in
+place and the message has to go back through the decoder. Nothing in a fuzz
+target ever returns to a caller that would reset it, and Odin's default temp
+allocator chains a fresh heap block rather than reusing the last one once its
+backing is full, so a target that touched it grew by a few hundred bytes per
+input for as long as the run lasted. Left out, `fuzz_dns` climbed from 70 MB to
+libFuzzer's 2 GB ceiling in around 600k inputs and reported an out-of-memory
+whose reproducer replays clean - which is the one finding a fuzz target must not
+invent, because it stops the run that would have found a real one.
+*/
 teardown :: proc(f: ^Fuzz_Arena) {
+	free_all(context.temp_allocator)
 	delete(f.buf, f.allocator)
 }
