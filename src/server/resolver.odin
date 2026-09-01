@@ -559,6 +559,27 @@ resolve_query :: proc(
 		return out, .Rewritten, true
 	}
 
+	/*
+	The reverse of a rewrite, from the same table and immediately below it.
+
+	`rewrites` is where an operator writes down what their own names resolve to,
+	and the address in such a rule has a reverse whether or not they wrote that
+	down too - see `reverse.odin`. It is one rule set, so it answers in one
+	place: below the explicit rules, since a rule naming a reverse name outright
+	is the more specific of the two and must win, and above everything else for
+	the same reasons the forward direction is - nothing here can leak, and an
+	operator's own configuration outranks a table.
+
+	Counted as a rewrite, because it is one, and separated in the query log:
+	`detail=rewrite-ptr` is what tells an operator debugging a reverse lookup
+	that this server answered it out of a forward rule rather than forwarding it.
+	*/
+	if out, matched := apply_reverse_rewrite(s, msg, q, allocator, limit); matched {
+		sync.atomic_add(&s.stats.rewritten, 1)
+		log_query(s, client, proto, q, .Rewritten, "rewrite-ptr", started)
+		return out, .Rewritten, true
+	}
+
 	if s.cfg.blocking.enabled && s.filters != nil {
 		if filter.engine_match(s.filters, q.name) == .Blocked {
 			sync.atomic_add(&s.stats.blocked, 1)

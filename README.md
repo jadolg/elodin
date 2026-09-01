@@ -12,7 +12,8 @@ Pi-hole and AdGuard Home, minus the web interface. One binary, one YAML file.
 - Response rate limiting per client prefix, on every transport and with a separate budget for datagrams and for connections, on by default (see `server.rate_limit`)
 - Client allow list restricting who may query, defaulting to local networks only
 - A ceiling on UDP answer size to bound reflection amplification, on by default
-- Local rewrites (A, AAAA, CNAME, or "answer as if blocked")
+- Local rewrites (A, AAAA, CNAME, or "answer as if blocked"), with the matching
+  PTR synthesised so a locally answered name has a reverse
 - DNSSEC validation against the root trust anchors, on by default
 - DNS rebinding protection: an upstream answer pointing a public name at loopback, RFC 1918 or link-local space is refused, off by default so split horizon keeps working, one line to turn on (see `rebind`)
 - DNS cookies in both directions (RFC 7873/9018), on by default
@@ -1327,6 +1328,37 @@ rewrites:
 
 Wildcards match subdomains only, so `*.lan` covers `host.lan` but not `lan`.
 
+#### Reverse lookups
+
+The PTR for an address a rule hands out comes for free: `nas.home` above also
+answers `50.1.168.192.in-addr.arpa`, with the rule's own TTL, so `nslookup
+192.168.1.50` gives back `nas.home` instead of the blackhole servers' NXDOMAIN.
+dnsmasq and AdGuard Home both do this, and without it every `ssh` banner, mail
+server check and log viewer on the LAN reports a name that does not exist for a
+name this server is answering. Nothing to configure — writing the forward rule is
+writing the reverse one.
+
+Four cases it stays out of:
+
+- a wildcard rule answers every name below its suffix with the same address, so
+  there is no one name to point back at and none is invented;
+- an address named by several rules gets the first rule's name, in file order,
+  which is the precedence the forward direction already uses;
+- an address outside RFC 1918, RFC 3927 link-local, RFC 4193 unique-local and
+  RFC 4291 IPv6 link-local gets nothing — a rule pointing a local name at a
+  public address says nothing about who owns that address, and its real PTR is
+  somebody else's to answer. Loopback and `0.0.0.0` are left out too: a rule
+  pointing a name at one of those is sinking it rather than addressing it;
+- a rule written for the reverse name itself wins, the synthesis being what
+  happens when nothing more specific was said.
+
+The one thing that changes for an existing installation: if your upstream serves
+your reverse zone, the addresses named in `rewrites` are now answered here
+instead. They are the ones you wrote down.
+
+Other types for a synthesised name are NODATA with an SOA rather than a
+forwarded query — the name exists, and there is nothing else at it.
+
 ### Names that are never forwarded
 
 ```yaml
@@ -2019,7 +2051,7 @@ What it covers:
 | DoH over HTTP/2 | ALPN selection, POST and GET, Huffman-coded headers, CONTINUATION, a dynamic table size update at and past the advertised limit, concurrent streams proved parallel by timing, flow control with a tiny window, DATA splitting for a 27 KiB answer, PING, RST_STREAM, malformed requests reset with PROTOCOL_ERROR while the connection carries on, error statuses, HTTP/1.1 fallback |
 | DoH upstreams | a query resolved over an h2 upstream, one connection multiplexed across queries rather than reopened, fallback to HTTP/1.1 when the upstream does not offer h2 |
 | blocking | all five response modes, hosts vs domains vs adblock semantics, allow precedence, wildcards, modifiers, dnsmasq syntax, unusable rules, case folding |
-| rewrites | A, AAAA, CNAME, wildcard scope, `block`, NODATA for unmatched types |
+| rewrites | A, AAAA, CNAME, wildcard scope, `block`, NODATA for unmatched types, the PTR synthesised for an address a rule hands out in both families, a wildcard and a public address getting none, and another type at a synthesised name answered rather than forwarded |
 | rebinding | a private address is forwarded while the guard is off, refused as NODATA once it is on, a public address is untouched, an `allow_domains` zone may answer privately while a name just outside it may not, and `allow_loopback` opens loopback without opening RFC 1918 |
 | rate limiting | a flood from one source answered in full with the limiter off and cut to the budget with it on, truncated answers over the budget, the bytes one address can be made to receive compared between the two, the same flood pipelined down one TCP connection cut to its budget with nothing truncated, and a TCP client still answered after a datagram flood has spent the prefix's UDP budget |
 | cache | hits avoid the upstream, TTL countdown, cross-transport reuse, question re-casing, negative caching, key separation by type |

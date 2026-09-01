@@ -325,9 +325,11 @@ cache: {{ enabled: false }}
 blocking: {{ enabled: true, response: nxdomain }}
 rewrites:
   - {{ domain: nas.home, answer: 192.168.1.50, ttl: 111 }}
+  - {{ domain: nas6.home, answer: "fd00::50" }}
   - {{ domain: "*.lab", answers: [10.0.0.1, "fd00::1"] }}
   - {{ domain: old.example.org, answer: new.example.org }}
   - {{ domain: telemetry.example.org, answer: block }}
+  - {{ domain: www.example.org, answer: 203.0.113.9 }}
 `,
 		udp_port,
 		upstream_port,
@@ -412,6 +414,85 @@ rewrites:
 			h, _ := parse_header(res.wire)
 			check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)
 			check_eq_int(r, h.ancount, 0, "answer count")
+		}
+	}
+	end_case(r)
+
+	start_case(r, "rewrite: an address a rule hands out answers its own PTR")
+	{
+		// The reverse of the first rule, which nobody wrote down: without the
+		// synthesis this leaves for the upstream, and for RFC 1918 space the
+		// real answer out there is the blackhole servers' NXDOMAIN. The TTL is
+		// the rule's own, so the two directions expire together.
+		mock_reset_counts(mock)
+		res := query_udp(udp_port, build_query("50.1.168.192.in-addr.arpa.", u16(dns.Type.PTR)))
+		if check(r, res.ok, "no response") {
+			h, _ := parse_header(res.wire)
+			check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)
+			check_eq_str(r, first_cname_or_name(res.wire), "nas.home.", "PTR target")
+			ttl, has := min_answer_ttl(res.wire)
+			check(r, has && ttl == 111, "TTL: got %d, want 111", ttl)
+			check_eq_int(r, mock_total(mock), 0, "upstream queries for a name answered here")
+		}
+	}
+	end_case(r)
+
+	start_case(r, "rewrite: a v6 address answers its nibble PTR")
+	{
+		res := query_udp(
+			udp_port,
+			build_query(
+				"0.5.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.d.f.ip6.arpa.",
+				u16(dns.Type.PTR),
+			),
+		)
+		if check(r, res.ok, "no response") {
+			check_eq_str(r, first_cname_or_name(res.wire), "nas6.home.", "PTR target")
+		}
+	}
+	end_case(r)
+
+	start_case(r, "rewrite: a wildcard address gets no PTR")
+	{
+		// "*.lab" answers every name below "lab" with 10.0.0.1, so there is no
+		// one name to point back at and this server must not invent one. The
+		// query goes upstream like any other, which the mock's query count is
+		// what proves - it answers a PTR with NOERROR and nothing in it, exactly
+		// as an empty answer synthesised here would look.
+		mock_reset_counts(mock)
+		res := query_udp(udp_port, build_query("1.0.0.10.in-addr.arpa.", u16(dns.Type.PTR)))
+		if check(r, res.ok, "no response") {
+			check_eq_str(r, first_cname_or_name(res.wire), "", "a wildcard must produce no PTR")
+			check(r, mock_total(mock) >= 1, "the query should have been forwarded")
+		}
+	}
+	end_case(r)
+
+	start_case(r, "rewrite: a public address keeps its own reverse")
+	{
+		// 203.0.113.9 is delegated to somebody, and their PTR is the right one.
+		// A rewrite pointing a local name at it says nothing about who owns the
+		// address, so the reverse still leaves.
+		mock_reset_counts(mock)
+		res := query_udp(udp_port, build_query("9.113.0.203.in-addr.arpa.", u16(dns.Type.PTR)))
+		if check(r, res.ok, "no response") {
+			check_eq_str(r, first_cname_or_name(res.wire), "", "a public address must produce no PTR")
+			check(r, mock_total(mock) >= 1, "the query should have been forwarded")
+		}
+	}
+	end_case(r)
+
+	start_case(r, "rewrite: a synthesised reverse name is NODATA for other types")
+	{
+		// The name exists - its PTR was just answered - so another type is
+		// "there is none" rather than a forwarded query. The upstream would have
+		// synthesised an A for it, so an empty answer is the proof it stayed.
+		res := query_udp(udp_port, build_query("50.1.168.192.in-addr.arpa.", u16(dns.Type.A)))
+		if check(r, res.ok, "no response") {
+			h, _ := parse_header(res.wire)
+			check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)
+			check_eq_int(r, h.ancount, 0, "answer count")
+			check_eq_int(r, h.nscount, 1, "authority count")
 		}
 	}
 	end_case(r)

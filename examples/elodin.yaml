@@ -376,6 +376,12 @@ rebind:
 
 # Local answers. Wildcards match subdomains only, so "*.home" covers host.home
 # but not home itself. `ttl` is what the answer carries, 300 seconds by default.
+#
+# The reverse comes with it: nas.home below also answers PTR for
+# 50.1.168.192.in-addr.arpa, so `nslookup 192.168.1.50` gives back the name you
+# wrote rather than NXDOMAIN. Nothing to configure, and nothing is invented — a
+# wildcard rule names no one host, and an address outside private space keeps
+# whatever PTR its real owner publishes.
 # rewrites:
 #   - domain: nas.home
 #     answer: 192.168.1.50
