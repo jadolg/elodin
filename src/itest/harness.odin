@@ -492,6 +492,8 @@ build_query :: proc(
 	checking_disabled := false,
 	// A COOKIE option to carry in the OPT record, which needs `edns_size` set.
 	cookie: []u8 = nil,
+	// A PADDING option, same again: the bytes a client pads its query with.
+	padding: []u8 = nil,
 	allocator := context.temp_allocator,
 ) -> []u8 {
 	buf := make([dynamic]u8, 0, 64, allocator)
@@ -528,12 +530,23 @@ build_query :: proc(
 		append(&buf, 0, 41) // OPT
 		append(&buf, u8(edns_size >> 8), u8(edns_size))
 		append(&buf, u8(ttl >> 24), u8(ttl >> 16), u8(ttl >> 8), u8(ttl))
-		rdlength := len(cookie) + 4 if cookie != nil else 0
+		rdlength := 0
+		if cookie != nil {
+			rdlength += 4 + len(cookie)
+		}
+		if padding != nil {
+			rdlength += 4 + len(padding)
+		}
 		append(&buf, u8(rdlength >> 8), u8(rdlength))
 		if cookie != nil {
 			append(&buf, 0, 10) // COOKIE
 			append(&buf, u8(len(cookie) >> 8), u8(len(cookie)))
 			append(&buf, ..cookie)
+		}
+		if padding != nil {
+			append(&buf, 0, 12) // PADDING
+			append(&buf, u8(len(padding) >> 8), u8(len(padding)))
+			append(&buf, ..padding)
 		}
 	}
 	return buf[:]
@@ -546,6 +559,15 @@ find_cookie :: proc(wire: []u8) -> (cookie: []u8, found: bool) {
 		return nil, false
 	}
 	return dns.find_edns_option(msg, .Cookie)
+}
+
+// The PADDING option carried in a message, if it has one.
+find_padding :: proc(wire: []u8) -> (padding: []u8, found: bool) {
+	msg, err := dns.decode_message(wire, context.temp_allocator)
+	if err != .None {
+		return nil, false
+	}
+	return dns.find_edns_option(msg, .Padding)
 }
 
 Header :: struct {

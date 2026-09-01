@@ -16,6 +16,7 @@ Pi-hole and AdGuard Home, minus the web interface. One binary, one YAML file.
 - DNSSEC validation against the root trust anchors, on by default
 - DNS rebinding protection: an upstream answer pointing a public name at loopback, RFC 1918 or link-local space is refused, off by default so split horizon keeps working, one line to turn on (see `rebind`)
 - DNS cookies in both directions (RFC 7873/9018), on by default
+- EDNS(0) padding on DoT and DoH in both directions (RFC 7830/8467), so encrypted messages stop naming themselves by length
 - Ships as a systemd service or a `.deb`, with optional automatic system-resolver takeover
 
 ## Requirements
@@ -1090,6 +1091,41 @@ already establishes more than a cookie can.
 | a cookie that does not check out | answered anyway, or BADCOOKIE with `require` | ignored, and the wait continues |
 | a message with no cookie | answered, and given none back | accepted, unless that server has issued one before |
 
+### EDNS padding
+
+Encryption hides what a DNS message says, not how long it is, and DNS messages
+are distinctive enough by length that an observer holding a list of candidate
+names can often tell which one was asked. RFC 7830 defines the mitigation — an
+EDNS option carrying nothing but zeroes — and RFC 8467 fixes the block sizes it
+is applied in. elodin does both halves, on DoT and DoH only:
+
+| | client-facing | upstream |
+|---|---|---|
+| block | 468 octets (RFC 8467 §4.2) | 128 octets (RFC 8467 §4.1) |
+| transports | DoT and DoH | DoT and DoH upstreams |
+| when | the client's query carried the option | every query that carries an OPT record |
+| the other side's padding | replaced with ours | stripped before the answer is cached |
+
+There is no setting. The RFC gives one pair of numbers rather than a knob, and a
+deployment padding to a block of its own choosing would be recognisable by it —
+which is the opposite of the point.
+
+UDP and plain TCP are left out deliberately (RFC 8467 §5): padding a message
+anyone on the path can read hides nothing from them, and on UDP the bytes would
+come out of `server.max_udp_response`, enlarging exactly the datagrams the
+[UDP answer ceiling](#how-large-a-udp-answer-may-be) exists to bound. A client that did not
+send the option gets no padding either (RFC 7830 §4) — it never budgeted for the
+bytes.
+
+Upstream, only queries that already carry an OPT record are padded, for the same
+reason cookies are: minting one would negotiate EDNS on behalf of a client that
+never asked. With DNSSEC validation on, which is the default, every forwarded
+query carries one. An upstream that pads its replies back — which is what a
+padding-aware server does with a padded query — has that padding taken off
+before the answer is stored, so the cache holds the answer rather than the
+answer plus a block of zeroes, and the copies it serves over UDP stay the size
+they were.
+
 ### DNS rebinding protection
 
 ```yaml
@@ -1547,6 +1583,8 @@ transports it is passed through as it stands — see [How large a UDP answer may
 be](#how-large-a-udp-answer-may-be)), DNS
 cookies in both directions (RFC 7873, RFC 9018) — answered for clients, and
 presented to plain upstreams with the reply checked against what we sent —
+EDNS(0) padding in both directions on DoT and DoH, and on neither of the clear
+transports (RFC 7830, RFC 8467) — see [EDNS padding](#edns-padding) —
 truncation with the TC bit and the UDP→TCP retry, `version.bind`/`hostname.bind`
 in the CHAOS class, local NODATA answers for `resolver.arpa` (RFC 9462 section
 6.1), refusal of zone-transfer requests, and the reserved names of RFC 6761 and

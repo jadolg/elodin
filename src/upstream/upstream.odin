@@ -263,9 +263,15 @@ exchange :: proc(
 	}
 
 	start := time.now()
-	if cookies_wanted(u) {
+	// Never both: a cookie is for the transports with nothing authenticating
+	// the peer, padding for the transports where a length is the only thing
+	// left showing. `cookies_wanted` and `padding_wanted` name disjoint kinds.
+	switch {
+	case cookies_wanted(u):
 		response, err = exchange_with_cookie(u, query, timeout, allocator)
-	} else {
+	case padding_wanted(u):
+		response, err = exchange_padded(u, query, timeout, allocator)
+	case:
 		response, err = send(u, query, timeout, allocator)
 	}
 

@@ -16,5 +16,13 @@ fuzz_one :: proc "c" (data: [^]u8, size: uint) -> i32 {
 	// they arrived and without decoding them first, so it is its own parser of
 	// hostile input and gets its own turn here.
 	_, _ = dns.truncated_response(data[:size])
+	/*
+	The padding writer walks the OPT record of a message this server did not
+	write - an upstream's reply on its way out to a DoT or DoH client - and
+	splices bytes into it, so the walk and the splice both read hostile input.
+	The response block, because that is the direction whose input is hostile:
+	the query it pads on the way upstream is one of ours.
+	*/
+	_, _ = dns.pad_response(data[:size], dns.PAD_RESPONSE_BLOCK, dns.MAX_MESSAGE, 1232)
 	return 0
 }

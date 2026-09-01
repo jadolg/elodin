@@ -199,6 +199,99 @@ run_transport_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	/*
+	EDNS(0) padding, RFC 7830 and RFC 8467.
+
+	A client that pads its queries gets its answers in whole 468-octet blocks on
+	the encrypted transports, and the same query over UDP gets none: padding a
+	message an observer can already read hides nothing, and on UDP it would grow
+	the datagrams an amplifier reflects (RFC 8467 section 5).
+
+	Asked through the listeners rather than of `handle_query`, because what is
+	being claimed is the length of what leaves this process - the DoT framing and
+	the DoH body included.
+	*/
+	{
+		// The query as a padding client sends it: rounded up to a multiple of
+		// 128 (section 4.1), where the four bytes are the option's own header.
+		bare := build_query(fix.qname, fix.qtype, id = 0x1313, edns_size = 1232)
+		need := (dns.PAD_QUERY_BLOCK - (len(bare) + 4) % dns.PAD_QUERY_BLOCK) % dns.PAD_QUERY_BLOCK
+		/*
+		A whole extra block rather than nothing, when the four bytes of the
+		option header land the query on a boundary by themselves.
+
+		`build_query` reads "carry a padding option" off `padding != nil`, and a
+		zero-length `make` in Odin hands back a slice with no backing pointer -
+		so a fixture whose bare query happens to measure 124 mod 128 would build
+		a query with no option in it at all, and these three cases would quietly
+		stop asking about padding. One block further along is still a multiple of
+		128 and is still a query only a padding client sends.
+		*/
+		if need == 0 {
+			need = dns.PAD_QUERY_BLOCK
+		}
+		pad := make([]u8, need, context.temp_allocator)
+		// Heap, as `query` above: `end_case` resets the scratch between cases.
+		padded := build_query(
+			fix.qname,
+			fix.qtype,
+			id = 0x1313,
+			edns_size = 1232,
+			padding = pad,
+			allocator = context.allocator,
+		)
+		defer delete(padded)
+
+		start_case(r, "dot: a padded query is answered in whole blocks")
+		{
+			res := query_dot(dot_port, padded)
+			if check(r, res.ok, "no response over DoT") {
+				check(
+					r,
+					len(res.wire) % dns.PAD_RESPONSE_BLOCK == 0,
+					"a %d-byte answer is %d past a 468-octet block",
+					len(res.wire),
+					len(res.wire) % dns.PAD_RESPONSE_BLOCK,
+				)
+				_, found := find_padding(res.wire)
+				check(r, found, "the answer carries no padding option")
+				h, _ := parse_header(res.wire)
+				check_eq_int(r, h.ancount, fix.ancount, "answer count")
+			}
+		}
+		end_case(r)
+
+		start_case(r, "doh: a padded query is answered in whole blocks")
+		{
+			res := doh_post(doh_port, "/dns-query", padded)
+			if check(r, res.ok, "no HTTP response") {
+				check_eq_int(r, res.status, 200, "status")
+				check(
+					r,
+					len(res.body) % dns.PAD_RESPONSE_BLOCK == 0,
+					"a %d-byte body is %d past a 468-octet block",
+					len(res.body),
+					len(res.body) % dns.PAD_RESPONSE_BLOCK,
+				)
+				_, found := find_padding(res.body)
+				check(r, found, "the answer carries no padding option")
+			}
+		}
+		end_case(r)
+
+		start_case(r, "udp: a padded query is answered without padding")
+		{
+			res := query_udp(udp_port, padded)
+			if check(r, res.ok, "no response over UDP") {
+				_, found := find_padding(res.wire)
+				check(r, !found, "a %d-byte UDP answer came back padded", len(res.wire))
+				h, _ := parse_header(res.wire)
+				check_eq_int(r, h.ancount, fix.ancount, "answer count")
+			}
+		}
+		end_case(r)
+	}
+
 	start_case(r, "doh: unknown path is 404")
 	{
 		res := doh_raw(doh_port, "GET /nope HTTP/1.1\r\nHost: elodin.local\r\nConnection: close\r\n\r\n")
