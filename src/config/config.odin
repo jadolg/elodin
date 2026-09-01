@@ -292,6 +292,19 @@ Rewrite :: struct {
 	wildcard: bool,
 	answers:  []Rewrite_Answer,
 	ttl:      u32,
+	/*
+	Whether this rule's addresses may be answered in the reverse direction too.
+
+	`load_rewrites` sets it, so it is true unless the rule says `ptr: false` -
+	and, as with `ttl`, a `Rewrite` built anywhere but the loader has to say so
+	itself. The reverse of a rewrite is the operator's own mapping read
+	backwards (see `server/reverse.odin`), which is what they meant for a rule
+	naming a host and not for one sinking a name at a machine that has a name
+	of its own: `ads.example.com -> 192.168.1.10`, a block page served off the
+	router, would otherwise take the router's reverse with it. This is how a
+	rule says it is the second kind.
+	*/
+	ptr:      bool,
 }
 
 Server_Config :: struct {

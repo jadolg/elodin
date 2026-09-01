@@ -332,6 +332,7 @@ rewrites:
   - {{ domain: www.example.org, answer: 203.0.113.9 }}
   - {{ domain: shadowed.lab, answer: 192.168.1.70 }}
   - {{ domain: sink.example.org, answers: [block, 192.168.1.60] }}
+  - {{ domain: blockpage.example.org, answer: 192.168.1.80, ptr: false }}
 `,
 		udp_port,
 		upstream_port,
@@ -514,6 +515,27 @@ rewrites:
 		res := query_udp(udp_port, build_query("60.1.168.192.in-addr.arpa.", u16(dns.Type.PTR)))
 		if check(r, res.ok, "no response") {
 			check_eq_str(r, first_cname_or_name(res.wire), "", "a sunk rule must produce no PTR")
+			check(r, mock_total(mock) >= 1, "the query should have been forwarded")
+		}
+	}
+	end_case(r)
+
+	start_case(r, "rewrite: ptr: false keeps the forward answer and drops the reverse")
+	{
+		// A block page on a host that has a name of its own: the rule answers
+		// its own name as any other rule would, and says nothing about the
+		// address in the other direction.
+		fwd := query_udp(udp_port, build_query("blockpage.example.org.", u16(dns.Type.A)))
+		if check(r, fwd.ok, "no response for the opted-out name") {
+			addrs := answer_addresses(fwd.wire)
+			if check(r, len(addrs) == 1, "expected one address, got %d", len(addrs)) {
+				check_eq_str(r, addrs[0], "192.168.1.80", "the forward answer is unaffected")
+			}
+		}
+		mock_reset_counts(mock)
+		res := query_udp(udp_port, build_query("80.1.168.192.in-addr.arpa.", u16(dns.Type.PTR)))
+		if check(r, res.ok, "no response") {
+			check_eq_str(r, first_cname_or_name(res.wire), "", "ptr: false must produce no PTR")
 			check(r, mock_total(mock) >= 1, "the query should have been forwarded")
 		}
 	}

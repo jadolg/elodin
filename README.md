@@ -1353,11 +1353,16 @@ the address is one this network holds:
   to it and still gets the PTR;
 - an address named by several rules gets the first rule's name, in file order,
   which is the precedence the forward direction already uses;
-- an address outside RFC 1918, RFC 3927 link-local, RFC 4193 unique-local and
+- a rule with `ptr: false` keeps its forward answer and stops claiming the
+  address — see below;
+- an address outside RFC 1918, RFC 3927 link-local, `fd00::/8` unique-local and
   RFC 4291 IPv6 link-local gets nothing — a rule pointing a local name at a
   public address says nothing about who owns that address, and its real PTR is
   somebody else's to answer. Loopback and `0.0.0.0` are left out too: a rule
-  pointing a name at one of those is sinking it rather than addressing it;
+  pointing a name at one of those is sinking it rather than addressing it.
+  (`fd00::/8` rather than all of RFC 4193's `fc00::/7`, matching the reverse zone
+  that is served locally: `fc00::/8` is the half of that block nobody defined an
+  assignment method for, and no `c.f.ip6.arpa` is served here to answer under.);
 - a rule written for the reverse name itself wins, the synthesis being what
   happens when nothing more specific was said;
 - a `dnssec.trust_anchors` entry over the reverse zone turns the synthesis off
@@ -1366,18 +1371,36 @@ the address is one this network holds:
   holding the same anchor, would get SERVFAIL for it. A site that signs its own
   reverse space is publishing these PTRs already.
 
-Two things to know before turning this loose on an existing installation.
+Three things to know before turning this loose on an existing installation.
 
 If you sink a name by pointing it at a host on your LAN — `ads.example.com:
-192.168.1.10`, a block page served off the router — that host's reverse becomes
-`ads.example.com`. Nothing here can tell that rule from a rule naming the host
-itself. The file order is the fix: a rule for the host, above the sinkhole rules,
-takes the address back. `answer: block` and the [sink lists](#sink-lists) are the
-other way to sink a name, and neither hands out an address to be reversed.
+192.168.1.10`, a block page served off the router — that host's reverse would
+become `ads.example.com`. Nothing here can tell that rule from a rule naming the
+host itself, so say so with `ptr: false`:
 
-And if your upstream serves your reverse zone, the addresses named in `rewrites`
-are now answered here instead. They are the ones you wrote down; signing that
-zone and anchoring it is how to say you meant the upstream's answer.
+```yaml
+rewrites:
+  - domain: ads.example.com
+    answer: 192.168.1.10
+    ptr: false               # keep .10's own reverse
+```
+
+The rule keeps its forward answer and stops claiming the address. File order
+settles it too — a rule for the host, above the sinkhole rules, takes the address
+back — and `answer: block` and the [sink lists](#sink-lists) sink a name without
+handing out an address to be reversed at all. The key is for when the block page
+really does have to be an address.
+
+If your upstream serves your reverse zone, the addresses named in `rewrites` are
+now answered here instead. They are the ones you wrote down; signing that zone
+and anchoring it is how to say you meant the upstream's answer.
+
+And the reverse direction makes your local name inventory sweepable: anyone your
+[client allow list](#who-may-ask) admits can walk RFC 1918 reverse space and
+collect the names, where before they had to guess forward names. dnsmasq and
+AdGuard Home give the same answers to the same sweep, and the allow list defaults
+to local networks only — but if that list is wide, this is one more thing behind
+it.
 
 Other types for a synthesised name are NODATA with an SOA rather than a
 forwarded query — the name exists, and there is nothing else at it.
@@ -2074,7 +2097,7 @@ What it covers:
 | DoH over HTTP/2 | ALPN selection, POST and GET, Huffman-coded headers, CONTINUATION, a dynamic table size update at and past the advertised limit, concurrent streams proved parallel by timing, flow control with a tiny window, DATA splitting for a 27 KiB answer, PING, RST_STREAM, malformed requests reset with PROTOCOL_ERROR while the connection carries on, error statuses, HTTP/1.1 fallback |
 | DoH upstreams | a query resolved over an h2 upstream, one connection multiplexed across queries rather than reopened, fallback to HTTP/1.1 when the upstream does not offer h2 |
 | blocking | all five response modes, hosts vs domains vs adblock semantics, allow precedence, wildcards, modifiers, dnsmasq syntax, unusable rules, case folding |
-| rewrites | A, AAAA, CNAME, wildcard scope, `block`, NODATA for unmatched types, the PTR synthesised for an address a rule hands out in both families, a wildcard, a public address, a rule shadowed by an earlier wildcard and a rule sunk by `block` each getting none, and another type at a synthesised name answered rather than forwarded |
+| rewrites | A, AAAA, CNAME, wildcard scope, `block`, NODATA for unmatched types, the PTR synthesised for an address a rule hands out in both families, a wildcard, a public address, a rule shadowed by an earlier wildcard, a rule sunk by `block` and a rule with `ptr: false` each getting none, and another type at a synthesised name answered rather than forwarded |
 | rebinding | a private address is forwarded while the guard is off, refused as NODATA once it is on, a public address is untouched, an `allow_domains` zone may answer privately while a name just outside it may not, and `allow_loopback` opens loopback without opening RFC 1918 |
 | rate limiting | a flood from one source answered in full with the limiter off and cut to the budget with it on, truncated answers over the budget, the bytes one address can be made to receive compared between the two, the same flood pipelined down one TCP connection cut to its budget with nothing truncated, and a TCP client still answered after a datagram flood has spent the prefix's UDP budget |
 | cache | hits avoid the upstream, TTL countdown, cross-transport reuse, question re-casing, negative caching, key separation by type |

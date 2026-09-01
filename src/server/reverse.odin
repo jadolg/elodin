@@ -82,13 +82,14 @@ to say the router's answer was meant, per the paragraph above.
 
 The other thing it changes is for the name pointed at a host rather than at a
 sinkhole. `ads.example.com -> 192.168.1.10`, a block page served off a machine
-on the LAN, is a rewrite like any other, so `192.168.1.10` now reverses to
+on the LAN, is a rewrite like any other, so `192.168.1.10` would reverse to
 `ads.example.com.` - a real host wearing the name of the thing it is blocking.
-Nothing here can tell those two rules apart; what an operator has is the file
-order, which is deliberate and documented: a rule naming the host itself, placed
-above the sinkhole rules, takes the address back. `answer: block` and the
-blocklists are the other way to sink a name, and they hand out no address to be
-reversed at all.
+Nothing here can tell those two rules apart, so `ptr: false` on the rule is how
+the operator does: the rule keeps its forward answer and stops claiming the
+address. File order settles it too, a rule naming the host itself above the
+sinkhole rules taking the address back, and `answer: block` and the blocklists
+sink a name without handing out an address to be reversed at all. The key is for
+the case where the block page really does have to be an address.
 */
 @(private)
 apply_reverse_rewrite :: proc(
@@ -242,19 +243,21 @@ rewrite_naming_address :: proc(
 	found: bool,
 ) {
 	for r, i in rules {
-		if r.wildcard {
+		if r.wildcard || !r.ptr {
 			continue
 		}
 		if !rule_hands_out(r, want) {
 			continue
 		}
 		// What `r.domain` actually resolves to is whatever rule wins that name,
-		// which is `r` itself unless something above shadows it.
+		// which is `r` itself unless something above shadows it - and the TTL
+		// comes from there too, so that a client is told the two directions
+		// expire together because they do.
 		winner, _ := find_rewrite_index(rules, r.domain)
 		if winner != i && !rule_hands_out(rules[winner], want) {
 			continue
 		}
-		return r.domain, r.ttl, true
+		return r.domain, rules[winner].ttl, true
 	}
 	return "", 0, false
 }

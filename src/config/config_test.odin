@@ -133,6 +133,39 @@ test_load_good_config :: proc(t: ^testing.T) {
 	testing.expect_value(t, cfg.rewrites[1].answers[1].kind, Rewrite_Kind.AAAA)
 	testing.expect_value(t, cfg.rewrites[2].answers[0].kind, Rewrite_Kind.CNAME)
 	testing.expect_value(t, cfg.rewrites[2].answers[0].name, "new.example.com.")
+	// The reverse of a rule's address is answered unless the rule says
+	// otherwise, so a file that has never heard of `ptr` gets it.
+	testing.expect(t, cfg.rewrites[0].ptr, "ptr defaults to on")
+
+	free_all(context.temp_allocator)
+}
+
+/*
+`ptr: false` on one rule, which is how an operator says this address is not
+theirs to name in the reverse direction - a sinkhole pointed at a host that has
+a name of its own. See `server/reverse.odin`.
+
+Pinned beside a rule that says nothing, because the default is the half that
+every existing configuration relies on: the key is opt-out, and a loader that
+forgot to set it would silence the whole feature rather than fail.
+*/
+@(test)
+test_rewrite_ptr_opt_out :: proc(t: ^testing.T) {
+	src :=
+		"upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - domain: ads.example\n    answer: 192.168.1.10\n    ptr: false\n  - domain: nas.home\n    answer: 192.168.1.50\n"
+	cfg, err := load_string(src, context.temp_allocator)
+	testing.expect(t, err == nil)
+	if testing.expect_value(t, len(cfg.rewrites), 2) {
+		testing.expect(t, !cfg.rewrites[0].ptr, "ptr: false should be read")
+		testing.expect(t, cfg.rewrites[1].ptr, "the key is per rule")
+	}
+
+	bad := "upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - domain: ads.example\n    answer: 192.168.1.10\n    ptr: maybe\n"
+	_, berr := load_string(bad, context.temp_allocator)
+	e, has := berr.?
+	if testing.expect(t, has, "a non-boolean ptr was accepted") {
+		testing.expect(t, strings.contains(e.messages[0], "rewrites[0].ptr"))
+	}
 
 	free_all(context.temp_allocator)
 }

@@ -134,27 +134,32 @@ sample_rules :: proc() -> []config.Rewrite {
 			{kind = .AAAA, v6 = {0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}},
 		),
 		ttl     = 111,
+		ptr     = true,
 	}
 	rules[1] = config.Rewrite {
 		domain   = "lan.",
 		wildcard = true,
 		answers  = answers_of({kind = .A, v4 = {10, 0, 0, 1}}),
 		ttl      = 300,
+		ptr      = true,
 	}
 	rules[2] = config.Rewrite {
 		domain  = "media.home.",
 		answers = answers_of({kind = .A, v4 = {192, 168, 1, 50}}),
 		ttl     = 300,
+		ptr     = true,
 	}
 	rules[3] = config.Rewrite {
 		domain  = "www.example.org.",
 		answers = answers_of({kind = .A, v4 = {203, 0, 113, 9}}),
 		ttl     = 300,
+		ptr     = true,
 	}
 	rules[4] = config.Rewrite {
 		domain  = "sink.example.org.",
 		answers = answers_of({kind = .A, v4 = {0, 0, 0, 0}}, {kind = .A, v4 = {127, 0, 0, 1}}),
 		ttl     = 300,
+		ptr     = true,
 	}
 	return rules
 }
@@ -252,11 +257,13 @@ test_a_shadowed_rule_supplies_no_reverse :: proc(t: ^testing.T) {
 		wildcard = true,
 		answers  = answers_of({kind = .A, v4 = {203, 0, 113, 9}}),
 		ttl      = 300,
+		ptr      = true,
 	}
 	rules[1] = config.Rewrite {
 		domain  = "nas.home.",
 		answers = answers_of({kind = .A, v4 = {192, 168, 1, 50}}),
 		ttl     = 300,
+		ptr     = true,
 	}
 
 	_, _, found := reverse_rewrite_target(rules, "50.1.168.192.in-addr.arpa.")
@@ -288,22 +295,63 @@ test_a_rule_shadowed_by_the_same_address_still_supplies_its_reverse :: proc(t: ^
 		domain   = "lab.",
 		wildcard = true,
 		answers  = answers_of({kind = .A, v4 = {10, 0, 0, 1}}),
-		ttl      = 300,
+		ttl      = 30,
+		ptr      = true,
 	}
 	rules[1] = config.Rewrite {
 		domain  = "gateway.lab.",
 		answers = answers_of({kind = .A, v4 = {10, 0, 0, 1}}),
-		ttl     = 300,
+		ttl     = 86400,
+		ptr     = true,
 	}
 
-	domain, _, found := reverse_rewrite_target(rules, "1.0.0.10.in-addr.arpa.")
+	domain, ttl, found := reverse_rewrite_target(rules, "1.0.0.10.in-addr.arpa.")
 	testing.expect(t, found, "a name that does resolve to the address should be its reverse")
 	testing.expect_value(t, domain, "gateway.lab.")
+	// The TTL is the one a client gets in the forward direction, which is the
+	// wildcard's here - the shadowed rule's own 86400 is a number nothing ever
+	// answers with, and handing it out would have the two directions expire
+	// days apart.
+	testing.expect_value(t, ttl, u32(30))
 
 	// And the wildcard alone still supplies nothing, so it is the exact rule
 	// below it that is being allowed through rather than the wildcard itself.
 	_, _, wildcard_only := reverse_rewrite_target(rules[:1], "1.0.0.10.in-addr.arpa.")
 	testing.expect(t, !wildcard_only, "a wildcard names no host")
+
+	free_all(context.temp_allocator)
+}
+
+/*
+`ptr: false` keeps a rule's forward answer and stops it claiming the address.
+
+The case it is for is a name sunk at a host that has a name of its own - a block
+page served off the router - where the rule is as real a rewrite as any other
+and the reverse it would imply is not the one anybody wants.
+*/
+@(test)
+test_a_rule_that_opts_out_supplies_no_reverse :: proc(t: ^testing.T) {
+	rules := make([]config.Rewrite, 2, context.temp_allocator)
+	rules[0] = config.Rewrite {
+		domain  = "ads.example.",
+		answers = answers_of({kind = .A, v4 = {192, 168, 1, 10}}),
+		ttl     = 300,
+		ptr     = false,
+	}
+	rules[1] = config.Rewrite {
+		domain  = "nas.home.",
+		answers = answers_of({kind = .A, v4 = {192, 168, 1, 50}}),
+		ttl     = 300,
+		ptr     = true,
+	}
+
+	_, _, opted_out := reverse_rewrite_target(rules, "10.1.168.192.in-addr.arpa.")
+	testing.expect(t, !opted_out, "a rule with ptr: false must not claim its address")
+
+	// The key is per rule, so the one beside it is unaffected.
+	domain, _, other := reverse_rewrite_target(rules, "50.1.168.192.in-addr.arpa.")
+	testing.expect(t, other, "ptr: false on one rule must not silence another")
+	testing.expect_value(t, domain, "nas.home.")
 
 	free_all(context.temp_allocator)
 }
@@ -317,11 +365,13 @@ test_a_duplicated_domain_supplies_one_reverse :: proc(t: ^testing.T) {
 		domain  = "nas.home.",
 		answers = answers_of({kind = .A, v4 = {192, 168, 1, 50}}),
 		ttl     = 300,
+		ptr     = true,
 	}
 	rules[1] = config.Rewrite {
 		domain  = "nas.home.",
 		answers = answers_of({kind = .A, v4 = {192, 168, 1, 51}}),
 		ttl     = 300,
+		ptr     = true,
 	}
 
 	domain, _, first := reverse_rewrite_target(rules, "50.1.168.192.in-addr.arpa.")
@@ -350,11 +400,13 @@ test_a_blocked_rule_supplies_no_reverse :: proc(t: ^testing.T) {
 		domain  = "ads.example.",
 		answers = answers_of({kind = .Block}, {kind = .A, v4 = {192, 168, 1, 77}}),
 		ttl     = 300,
+		ptr     = true,
 	}
 	rules[1] = config.Rewrite {
 		domain  = "trackers.example.",
 		answers = answers_of({kind = .A, v4 = {192, 168, 1, 78}}, {kind = .Block}),
 		ttl     = 300,
+		ptr     = true,
 	}
 
 	_, _, first := reverse_rewrite_target(rules, "77.1.168.192.in-addr.arpa.")
@@ -382,11 +434,13 @@ test_an_anchor_over_the_reverse_zone_stops_the_synthesis :: proc(t: ^testing.T) 
 		domain  = "nas.home.",
 		answers = answers_of({kind = .A, v4 = {192, 168, 1, 50}}),
 		ttl     = 111,
+		ptr     = true,
 	}
 	rules[1] = config.Rewrite {
 		domain  = "pi.home.",
 		answers = answers_of({kind = .A, v4 = {10, 0, 0, 5}}),
 		ttl     = 111,
+		ptr     = true,
 	}
 	cfg := reverse_test_server(rules)
 
@@ -608,11 +662,13 @@ test_an_explicit_rule_for_a_reverse_name_outranks_the_synthesis :: proc(t: ^test
 		domain  = "50.1.168.192.in-addr.arpa.",
 		answers = answers_of({kind = .CNAME, name = "elsewhere.example."}),
 		ttl     = 60,
+		ptr     = true,
 	}
 	rules[1] = config.Rewrite {
 		domain  = "nas.home.",
 		answers = answers_of({kind = .A, v4 = {192, 168, 1, 50}}),
 		ttl     = 111,
+		ptr     = true,
 	}
 	cfg := reverse_test_server(rules)
 

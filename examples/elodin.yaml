@@ -383,10 +383,9 @@ rebind:
 # wildcard rule names no one host, a `block` rule hands out no address, and an
 # address outside private space keeps whatever PTR its real owner publishes.
 #
-# One thing to watch: a name you sink by pointing it at a host on your LAN takes
-# that host's reverse with it. The first rule in the file wins, so a rule naming
-# the host itself, written above the sinkhole rules, keeps the address. See
-# "Reverse lookups" in the README.
+# One thing to watch: a name you sink by pointing it at a host on your LAN would
+# take that host's reverse with it. `ptr: false` on that rule keeps the forward
+# answer and leaves the address alone. See "Reverse lookups" in the README.
 # rewrites:
 #   - domain: nas.home
 #     answer: 192.168.1.50
@@ -397,6 +396,9 @@ rebind:
 #     answer: new.example.com       # a name becomes a CNAME
 #   - domain: telemetry.example.com
 #     answer: block                 # answered as if it were on a blocklist
+#   - domain: ads.example.com
+#     answer: 192.168.1.10          # a block page on a host that has its own name
+#     ptr: false                    # so leave 192.168.1.10's reverse alone
 
 # Names the RFCs reserved, answered here instead of being sent upstream.
 #
