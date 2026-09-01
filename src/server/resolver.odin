@@ -230,7 +230,12 @@ handle_query :: proc(
 	// there is no telling which eight of those bytes were the client's.
 	if cookie.verdict == .Malformed {
 		out, built := dns.error_response(query, msg, .Form_Err, allocator, limit)
-		return advertise_udp_size(out, advertise, proto), .Failed, built
+		out = advertise_udp_size(out, advertise, proto)
+		// Padded like any other answer to this client. The two refusals above
+		// are not, and cannot be: one has a query that did not decode and the
+		// other a query whose EDNS this server has just declined to read, so
+		// neither can say whether padding was asked for. This one can.
+		return pad_answer(out, msg, proto, limit, advertise, allocator), .Failed, built
 	}
 
 	/*
@@ -283,6 +288,10 @@ handle_query :: proc(
 		not this server's number to begin with.
 		*/
 		response = advertise_udp_size(response, advertise, proto)
+		// After that rather than before it: padding is a statement about the
+		// length of the bytes that leave, so nothing may change the length -
+		// or, as `set_edns_udp_size` would, rewrite the OPT record - behind it.
+		response = pad_answer(response, msg, proto, limit, advertise, allocator)
 	}
 	return response, outcome, ok
 }
@@ -350,6 +359,59 @@ advertise_udp_size :: proc(wire: []u8, size: u16, proto: Protocol) -> []u8 {
 	}
 	_ = dns.set_edns_udp_size(wire, size)
 	return wire
+}
+
+/*
+Round an answer up to a block boundary, on the transports where its length is
+worth hiding and for the clients that asked.
+
+Both halves of that are conditions rather than policy. RFC 8467 section 5 rules
+out padding on UDP and plain TCP - an observer reading the message does not need
+its length - and on UDP it would additionally spend `server.max_udp_response` on
+bytes that hide nothing while enlarging the amplification surface that setting
+exists to bound. RFC 7830 section 4 rules out padding a client that did not send
+the option: a requestor that never asked has not budgeted for the bytes, and on
+UDP would be the one paying for them.
+
+468 octets, from RFC 8467 section 4.2, which is what a responder pads to when
+the requestor padded to the 128 that section 4.1 names. Not configurable, for
+the reason the RFC gives one number rather than a knob: a deployment that picked
+its own block would be distinguishable by it, which is the opposite of what the
+padding is for.
+
+`limit` is the transport's own ceiling, 65535 on both of these, so a block that
+would not fit is a message that is already within 467 bytes of the largest one
+there is. It goes out unpadded rather than partway padded - see `dns.pad_response`.
+
+Every caller sits behind `edns_opt_readable`, so an option found here is an
+option this server can account for, and the padding written over it is one the
+upstream cannot see a second copy of.
+*/
+@(private)
+pad_answer :: proc(
+	wire: []u8,
+	query: dns.Message,
+	proto: Protocol,
+	limit: int,
+	advertise: u16,
+	allocator: mem.Allocator,
+) -> []u8 {
+	if proto != .DoT && proto != .DoH {
+		return wire
+	}
+	if len(wire) < dns.HEADER_SIZE {
+		return wire
+	}
+	if _, asked := dns.find_edns_option(query, .Padding); !asked {
+		return wire
+	}
+	out, ok := dns.pad_response(wire, dns.PAD_RESPONSE_BLOCK, limit, advertise, allocator)
+	if !ok {
+		// Nothing to do but send the answer as it stands: an answer withheld
+		// would tell the same observer rather more than its length does.
+		return wire
+	}
+	return out
 }
 
 /*
