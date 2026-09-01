@@ -57,21 +57,35 @@ is that table's private subset. A synthesised PTR under a signed `in-addr.arpa`
 with the validator still watching is exactly the shape `localzones.odin` exists
 to keep away from the chain of trust, and this cannot produce one.
 
-A trust anchor over the reverse zone does not stand this down, though it stands
-the bypass in `localzones.odin` down. The two questions look alike and are not:
-there the anchor is the operator asking for an upstream's answer to be checked,
-and there is an upstream answer to check. Here the answer is the operator's own
-configuration, and `apply_rewrite` above already hands such a rule its name
-whatever the anchor says - a rewrite for a name in an anchored zone is answered
-unsigned today. Deferring in one direction and not the other would leave the two
-halves of one rule behaving differently; a site that signs its own reverse space
-should be serving it, not rewriting into it.
+A trust anchor over the reverse zone stands the whole of it down, the same way
+it stands down the bypass in `localzones.odin`. A site that signs its own
+reverse space and anchors it here has said, specifically about these names, that
+they are to be validated - and an answer invented here carries no signature, so
+a downstream validator holding the same anchor would fetch the real signed
+DNSKEY through this server, conclude the zone is secure, meet an unsigned PTR
+and hand its client SERVFAIL where a signed answer used to arrive. The forward
+direction does not defer, and the asymmetry is the point: there the operator
+wrote the name down, while here the name is one this server made up, and a made-
+up answer is the weaker of the two claims an operator has written. It costs such
+a site nothing, either - they are serving a signed reverse zone, so the PTR this
+would have invented is one they already publish.
 
 What it does change for an existing installation is narrow and worth naming: a
-site whose upstream really does serve its own reverse zone now gets this
-server's answer for the addresses named in `rewrites`, rather than the router's.
-The two disagree only where the operator wrote one of them down, and the one
-they wrote down is this one.
+site whose upstream really does serve its own reverse zone, unsigned, now gets
+this server's answer for the addresses named in `rewrites` rather than the
+router's. The two disagree only where the operator wrote one of them down, and
+the one they wrote down is this one. Signing that zone and anchoring it is how
+to say the router's answer was meant, per the paragraph above.
+
+The other thing it changes is for the name pointed at a host rather than at a
+sinkhole. `ads.example.com -> 192.168.1.10`, a block page served off a machine
+on the LAN, is a rewrite like any other, so `192.168.1.10` now reverses to
+`ads.example.com.` - a real host wearing the name of the thing it is blocking.
+Nothing here can tell those two rules apart; what an operator has is the file
+order, which is deliberate and documented: a rule naming the host itself, placed
+above the sinkhole rules, takes the address back. `answer: block` and the
+blocklists are the other way to sink a name, and they hand out no address to be
+reversed at all.
 */
 @(private)
 apply_reverse_rewrite :: proc(
@@ -85,6 +99,11 @@ apply_reverse_rewrite :: proc(
 	matched: bool,
 ) {
 	if len(s.cfg.rewrites) == 0 {
+		return nil, false
+	}
+	// An anchor over the zone is the operator asking for these names to be
+	// validated, which nothing invented here can be. See above.
+	if covered_by_local_anchor(s, q.name) {
 		return nil, false
 	}
 	domain, ttl, found := reverse_rewrite_target(s.cfg.rewrites, q.name)
@@ -164,8 +183,30 @@ reverse_rewrite_target :: proc(
 	return "", 0, false
 }
 
-// The first rule that answers with `want`, wildcards skipped. See above for why
-// each of those is what it is.
+/*
+The first rule that really does hand out `want`, in file order.
+
+"Really does" is the whole of this procedure, and three things can make a rule
+that mentions an address not be a rule that gives it out.
+
+A wildcard names no one host, as above.
+
+A rule carrying `block` never reaches its addresses: `apply_rewrite` stops at
+the first `.Block` answer and sinks the name, so `answers: [block, 192.168.1.77]`
+hands out nothing at all - and a PTR pointing at a name whose own A is NXDOMAIN
+would be this server contradicting itself between two answers to one question.
+
+A rule shadowed in the forward direction never reaches them either. `rewrites`
+is matched first-wins by `find_rewrite`, so an earlier wildcard over the same
+name - `*.home` above `nas.home` - or an earlier rule with a duplicate `domain:`
+is what answers, and the shadowed rule's address is never given to anybody.
+Synthesising from it would point the reverse at a name whose forward answer is a
+different address, which is the forward-confirmed reverse check failing on this
+server's own two answers. Only the rule that would answer its own name may speak
+for its address, and `find_rewrite_index` is asked which one that is rather than
+this loop guessing - "same domain" would let the second of two duplicates
+through.
+*/
 @(private)
 rewrite_naming_address :: proc(
 	rules: []config.Rewrite,
@@ -175,19 +216,32 @@ rewrite_naming_address :: proc(
 	ttl: u32,
 	found: bool,
 ) {
-	for r in rules {
+	for r, i in rules {
 		if r.wildcard {
 			continue
 		}
+		sunk := false
+		named := false
 		for a in r.answers {
+			if a.kind == .Block {
+				sunk = true
+				break
+			}
 			if a.kind != want.kind {
 				continue
 			}
 			same := a.v4 == want.v4 if want.kind == .A else a.v6 == want.v6
 			if same {
-				return r.domain, r.ttl, true
+				named = true
 			}
 		}
+		if sunk || !named {
+			continue
+		}
+		if winner, _ := find_rewrite_index(rules, r.domain); winner != i {
+			continue
+		}
+		return r.domain, r.ttl, true
 	}
 	return "", 0, false
 }

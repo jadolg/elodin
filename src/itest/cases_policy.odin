@@ -330,6 +330,8 @@ rewrites:
   - {{ domain: old.example.org, answer: new.example.org }}
   - {{ domain: telemetry.example.org, answer: block }}
   - {{ domain: www.example.org, answer: 203.0.113.9 }}
+  - {{ domain: shadowed.lab, answer: 192.168.1.70 }}
+  - {{ domain: sink.example.org, answers: [block, 192.168.1.60] }}
 `,
 		udp_port,
 		upstream_port,
@@ -477,6 +479,41 @@ rewrites:
 		res := query_udp(udp_port, build_query("9.113.0.203.in-addr.arpa.", u16(dns.Type.PTR)))
 		if check(r, res.ok, "no response") {
 			check_eq_str(r, first_cname_or_name(res.wire), "", "a public address must produce no PTR")
+			check(r, mock_total(mock) >= 1, "the query should have been forwarded")
+		}
+	}
+	end_case(r)
+
+	start_case(r, "rewrite: a rule the forward direction never reaches gets no PTR")
+	{
+		// "*.lab" is written above "shadowed.lab", so the wildcard is what
+		// answers that name and 192.168.1.70 is never handed to anybody. A PTR
+		// for it would point at a name that resolves to 10.0.0.1 - this server
+		// disagreeing with itself across two answers.
+		v4 := query_udp(udp_port, build_query("shadowed.lab.", u16(dns.Type.A)))
+		if check(r, v4.ok, "no response for the shadowed name") {
+			addrs := answer_addresses(v4.wire)
+			if check(r, len(addrs) == 1, "expected one address, got %d", len(addrs)) {
+				check_eq_str(r, addrs[0], "10.0.0.1", "the wildcard is what answers")
+			}
+		}
+		mock_reset_counts(mock)
+		res := query_udp(udp_port, build_query("70.1.168.192.in-addr.arpa.", u16(dns.Type.PTR)))
+		if check(r, res.ok, "no response") {
+			check_eq_str(r, first_cname_or_name(res.wire), "", "a shadowed rule must produce no PTR")
+			check(r, mock_total(mock) >= 1, "the query should have been forwarded")
+		}
+	}
+	end_case(r)
+
+	start_case(r, "rewrite: a sunk rule's address gets no PTR")
+	{
+		// `answers: [block, 192.168.1.60]` sinks the name, so the address is
+		// never given out and has nothing to be the reverse of.
+		mock_reset_counts(mock)
+		res := query_udp(udp_port, build_query("60.1.168.192.in-addr.arpa.", u16(dns.Type.PTR)))
+		if check(r, res.ok, "no response") {
+			check_eq_str(r, first_cname_or_name(res.wire), "", "a sunk rule must produce no PTR")
 			check(r, mock_total(mock) >= 1, "the query should have been forwarded")
 		}
 	}

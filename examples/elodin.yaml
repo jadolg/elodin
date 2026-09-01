@@ -380,8 +380,13 @@ rebind:
 # The reverse comes with it: nas.home below also answers PTR for
 # 50.1.168.192.in-addr.arpa, so `nslookup 192.168.1.50` gives back the name you
 # wrote rather than NXDOMAIN. Nothing to configure, and nothing is invented — a
-# wildcard rule names no one host, and an address outside private space keeps
-# whatever PTR its real owner publishes.
+# wildcard rule names no one host, a `block` rule hands out no address, and an
+# address outside private space keeps whatever PTR its real owner publishes.
+#
+# One thing to watch: a name you sink by pointing it at a host on your LAN takes
+# that host's reverse with it. The first rule in the file wins, so a rule naming
+# the host itself, written above the sinkhole rules, keeps the address. See
+# "Reverse lookups" in the README.
 # rewrites:
 #   - domain: nas.home
 #     answer: 192.168.1.50

@@ -1338,10 +1338,17 @@ server check and log viewer on the LAN reports a name that does not exist for a
 name this server is answering. Nothing to configure — writing the forward rule is
 writing the reverse one.
 
-Four cases it stays out of:
+Only a rule that really does hand out the address gets to name it, and only if
+the address is one this network holds:
 
 - a wildcard rule answers every name below its suffix with the same address, so
   there is no one name to point back at and none is invented;
+- a rule with `answer: block` hands out no address at all, so there is nothing to
+  reverse;
+- a rule the forward direction never reaches — one shadowed by an earlier
+  wildcard over the same name, or by an earlier rule with the same `domain:` —
+  supplies nothing either, or `192.168.1.50` would reverse to a name that
+  resolves to some other address;
 - an address named by several rules gets the first rule's name, in file order,
   which is the precedence the forward direction already uses;
 - an address outside RFC 1918, RFC 3927 link-local, RFC 4193 unique-local and
@@ -1350,11 +1357,25 @@ Four cases it stays out of:
   somebody else's to answer. Loopback and `0.0.0.0` are left out too: a rule
   pointing a name at one of those is sinking it rather than addressing it;
 - a rule written for the reverse name itself wins, the synthesis being what
-  happens when nothing more specific was said.
+  happens when nothing more specific was said;
+- a `dnssec.trust_anchors` entry over the reverse zone turns the synthesis off
+  for the names it covers. Anchoring a zone is a request to validate it, and an
+  answer invented here carries no signature — a validating client below you,
+  holding the same anchor, would get SERVFAIL for it. A site that signs its own
+  reverse space is publishing these PTRs already.
 
-The one thing that changes for an existing installation: if your upstream serves
-your reverse zone, the addresses named in `rewrites` are now answered here
-instead. They are the ones you wrote down.
+Two things to know before turning this loose on an existing installation.
+
+If you sink a name by pointing it at a host on your LAN — `ads.example.com:
+192.168.1.10`, a block page served off the router — that host's reverse becomes
+`ads.example.com`. Nothing here can tell that rule from a rule naming the host
+itself. The file order is the fix: a rule for the host, above the sinkhole rules,
+takes the address back. `answer: block` and the [sink lists](#sink-lists) are the
+other way to sink a name, and neither hands out an address to be reversed.
+
+And if your upstream serves your reverse zone, the addresses named in `rewrites`
+are now answered here instead. They are the ones you wrote down; signing that
+zone and anchoring it is how to say you meant the upstream's answer.
 
 Other types for a synthesised name are NODATA with an SOA rather than a
 forwarded query — the name exists, and there is nothing else at it.
@@ -2051,7 +2072,7 @@ What it covers:
 | DoH over HTTP/2 | ALPN selection, POST and GET, Huffman-coded headers, CONTINUATION, a dynamic table size update at and past the advertised limit, concurrent streams proved parallel by timing, flow control with a tiny window, DATA splitting for a 27 KiB answer, PING, RST_STREAM, malformed requests reset with PROTOCOL_ERROR while the connection carries on, error statuses, HTTP/1.1 fallback |
 | DoH upstreams | a query resolved over an h2 upstream, one connection multiplexed across queries rather than reopened, fallback to HTTP/1.1 when the upstream does not offer h2 |
 | blocking | all five response modes, hosts vs domains vs adblock semantics, allow precedence, wildcards, modifiers, dnsmasq syntax, unusable rules, case folding |
-| rewrites | A, AAAA, CNAME, wildcard scope, `block`, NODATA for unmatched types, the PTR synthesised for an address a rule hands out in both families, a wildcard and a public address getting none, and another type at a synthesised name answered rather than forwarded |
+| rewrites | A, AAAA, CNAME, wildcard scope, `block`, NODATA for unmatched types, the PTR synthesised for an address a rule hands out in both families, a wildcard, a public address, a rule shadowed by an earlier wildcard and a rule sunk by `block` each getting none, and another type at a synthesised name answered rather than forwarded |
 | rebinding | a private address is forwarded while the guard is off, refused as NODATA once it is on, a public address is untouched, an `allow_domains` zone may answer privately while a name just outside it may not, and `allow_loopback` opens loopback without opening RFC 1918 |
 | rate limiting | a flood from one source answered in full with the limiter off and cut to the budget with it on, truncated answers over the budget, the bytes one address can be made to receive compared between the two, the same flood pipelined down one TCP connection cut to its budget with nothing truncated, and a TCP client still answered after a datagram flood has spent the prefix's UDP budget |
 | cache | hits avoid the upstream, TTL countdown, cross-transport reuse, question re-casing, negative caching, key separation by type |

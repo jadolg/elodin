@@ -1790,22 +1790,37 @@ apply_rewrite :: proc(
 
 @(private)
 find_rewrite :: proc(rules: []config.Rewrite, name: string) -> (rule: config.Rewrite, found: bool) {
-	for r in rules {
+	i := find_rewrite_index(rules, name) or_return
+	return rules[i], true
+}
+
+/*
+The same search, reporting which rule won rather than what it says.
+
+`reverse.odin` needs the identity: a rule only gets to supply the PTR for its
+address if it is the rule that would answer its own name, and "the same domain"
+is not enough to decide that - a duplicated `domain:` is two rules with one name
+between them, and only the first of them is ever reached. Both callers go
+through one loop so that the precedence cannot be described twice and drift.
+*/
+@(private)
+find_rewrite_index :: proc(rules: []config.Rewrite, name: string) -> (index: int, found: bool) {
+	for r, i in rules {
 		if r.wildcard {
 			// "*.lan." matches any strictly deeper name, which is `name_below`
 			// exactly: the label-break guard that keeps "notlan." out of a rule
 			// written for "lan.", and the case-insensitive comparison that DNS
 			// requires, are both its business rather than this loop's.
 			if name_below(name, r.domain) {
-				return r, true
+				return i, true
 			}
 			continue
 		}
 		if dns.name_equal_fold(name, r.domain) {
-			return r, true
+			return i, true
 		}
 	}
-	return {}, false
+	return 0, false
 }
 
 // CHAOS-class queries used by monitoring tools: version.bind and hostname.bind.

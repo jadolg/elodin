@@ -234,6 +234,139 @@ test_reverse_rewrite_leaves_addresses_it_cannot_speak_for :: proc(t: ^testing.T)
 }
 
 /*
+A rule that never answers its own name never supplies the PTR for its address
+either, or this server would disagree with itself between two answers to one
+question.
+
+`rewrites` is first-wins, so `*.home` written above `nas.home` is what answers
+`nas.home` - with a public address, in this rule set. Synthesising from the
+shadowed rule would have `192.168.1.50` reverse to `nas.home.` while `nas.home`
+resolves to `203.0.113.9`, which is the forward-confirmed reverse check every
+mail server runs failing on this server's own pair of answers.
+*/
+@(test)
+test_a_shadowed_rule_supplies_no_reverse :: proc(t: ^testing.T) {
+	rules := make([]config.Rewrite, 2, context.temp_allocator)
+	rules[0] = config.Rewrite {
+		domain   = "home.",
+		wildcard = true,
+		answers  = answers_of({kind = .A, v4 = {203, 0, 113, 9}}),
+		ttl      = 300,
+	}
+	rules[1] = config.Rewrite {
+		domain  = "nas.home.",
+		answers = answers_of({kind = .A, v4 = {192, 168, 1, 50}}),
+		ttl     = 300,
+	}
+
+	_, _, found := reverse_rewrite_target(rules, "50.1.168.192.in-addr.arpa.")
+	testing.expect(t, !found, "a rule the wildcard above it shadows must supply no PTR")
+
+	// The same rule with nothing shadowing it does supply one, so it is the
+	// shadowing that decided this rather than anything else about the rule.
+	unshadowed := rules[1:]
+	domain, _, unshadowed_found := reverse_rewrite_target(unshadowed, "50.1.168.192.in-addr.arpa.")
+	testing.expect(t, unshadowed_found, "the same rule alone should supply its PTR")
+	testing.expect_value(t, domain, "nas.home.")
+
+	free_all(context.temp_allocator)
+}
+
+// The same, for the other way a rule can be unreachable: a duplicated `domain:`
+// is two rules with one name between them, and only the first is ever answered.
+@(test)
+test_a_duplicated_domain_supplies_one_reverse :: proc(t: ^testing.T) {
+	rules := make([]config.Rewrite, 2, context.temp_allocator)
+	rules[0] = config.Rewrite {
+		domain  = "nas.home.",
+		answers = answers_of({kind = .A, v4 = {192, 168, 1, 50}}),
+		ttl     = 300,
+	}
+	rules[1] = config.Rewrite {
+		domain  = "nas.home.",
+		answers = answers_of({kind = .A, v4 = {192, 168, 1, 51}}),
+		ttl     = 300,
+	}
+
+	domain, _, first := reverse_rewrite_target(rules, "50.1.168.192.in-addr.arpa.")
+	testing.expect(t, first, "the rule that answers the name supplies its PTR")
+	testing.expect_value(t, domain, "nas.home.")
+
+	_, _, second := reverse_rewrite_target(rules, "51.1.168.192.in-addr.arpa.")
+	testing.expect(t, !second, "the shadowed duplicate hands out no address, so it has no reverse")
+
+	free_all(context.temp_allocator)
+}
+
+/*
+A rule that sinks its name hands out no address at all, `apply_rewrite` stopping
+at the first `.Block` answer, so there is nothing for it to be the reverse of.
+*/
+@(test)
+test_a_blocked_rule_supplies_no_reverse :: proc(t: ^testing.T) {
+	rules := make([]config.Rewrite, 1, context.temp_allocator)
+	rules[0] = config.Rewrite {
+		domain  = "ads.example.",
+		answers = answers_of({kind = .Block}, {kind = .A, v4 = {192, 168, 1, 77}}),
+		ttl     = 300,
+	}
+
+	_, _, found := reverse_rewrite_target(rules, "77.1.168.192.in-addr.arpa.")
+	testing.expect(t, !found, "a sunk rule gives out no address, so it has no reverse")
+
+	free_all(context.temp_allocator)
+}
+
+/*
+An operator's own trust anchor over the reverse zone stops the synthesis, the
+anchor being a request to validate exactly these names and an invented answer
+being the one thing that can never be validated.
+
+The same anchor scoping `localzones.odin` uses: `168.192.in-addr.arpa.` covers
+the name under it and says nothing about `10.in-addr.arpa.`, which still gets
+its PTR.
+*/
+@(test)
+test_an_anchor_over_the_reverse_zone_stops_the_synthesis :: proc(t: ^testing.T) {
+	rules := make([]config.Rewrite, 2, context.temp_allocator)
+	rules[0] = config.Rewrite {
+		domain  = "nas.home.",
+		answers = answers_of({kind = .A, v4 = {192, 168, 1, 50}}),
+		ttl     = 111,
+	}
+	rules[1] = config.Rewrite {
+		domain  = "pi.home.",
+		answers = answers_of({kind = .A, v4 = {10, 0, 0, 5}}),
+		ttl     = 111,
+	}
+	cfg := reverse_test_server(rules)
+
+	anchors := make([]string, 1, context.temp_allocator)
+	anchors[0] = "168.192.in-addr.arpa."
+
+	_, anchored, _ := ask_anchored(&cfg, anchors, "50.1.168.192.in-addr.arpa.", .PTR)
+	testing.expect_value(t, anchored, Outcome.Refused)
+
+	resp, elsewhere, ok := ask_anchored(&cfg, anchors, "5.0.0.10.in-addr.arpa.", .PTR)
+	if !testing.expect(t, ok, "an unanchored zone should still be synthesised") {
+		return
+	}
+	testing.expect_value(t, elsewhere, Outcome.Rewritten)
+	if !testing.expect(t, len(resp.answer) == 1, "the unanchored zone lost its PTR") {
+		return
+	}
+	ptr, is_name := resp.answer[0].data.(dns.Rdata_Name)
+	testing.expect(t, is_name, "the synthesised answer is not a name")
+	testing.expect_value(t, ptr.name, "pi.home.")
+
+	// And with no anchor configured at all, the first name is answered.
+	_, unanchored, _ := ask_anchored(&cfg, nil, "50.1.168.192.in-addr.arpa.", .PTR)
+	testing.expect_value(t, unanchored, Outcome.Rewritten)
+
+	free_all(context.temp_allocator)
+}
+
+/*
 The invariant the placement rests on: every name this can answer is inside a
 locally-served zone.
 
@@ -298,8 +431,23 @@ reverse_test_server :: proc(rules: []config.Rewrite) -> config.Config {
 
 @(private = "file")
 ask :: proc(cfg: ^config.Config, name: string, type: dns.Type) -> (dns.Message, Outcome, bool) {
+	return ask_anchored(cfg, nil, name, type)
+}
+
+@(private = "file")
+ask_anchored :: proc(
+	cfg: ^config.Config,
+	anchor_zones: []string,
+	name: string,
+	type: dns.Type,
+) -> (
+	dns.Message,
+	Outcome,
+	bool,
+) {
 	s := Server {
-		cfg = cfg,
+		cfg          = cfg,
+		anchor_zones = anchor_zones,
 	}
 	questions := make([]dns.Question, 1, context.temp_allocator)
 	questions[0] = dns.Question {
