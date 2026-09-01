@@ -31,6 +31,17 @@ Listeners :: struct {
 	metrics_open:   bool,
 	dot_ctx:        ^tlsx.Context,
 	doh_ctx:        ^tlsx.Context,
+	/*
+	Guards the two above against the reload that replaces them.
+
+	`reload_tls` frees the context it displaces, and a connection thread that
+	has read the pointer but not yet started its session is holding a pointer to
+	exactly that. The two are not otherwise ordered - the reload runs on the
+	maintenance loop and the read on a thread per connection - so an atomic on
+	the pointer settles which context a connection gets and says nothing about
+	whether the one it got is still there. See `accept_tls`.
+	*/
+	tls_mu:         sync.RW_Mutex,
 	conns:          Conn_Manager,
 	stop:           bool,
 	/*
@@ -852,17 +863,17 @@ releases it once the last connection still using it closes.
 
 Called from the maintenance loop on SIGHUP, one listener at a time; nothing
 else running concurrently writes `dot_ctx` or `doh_ctx`, but `accept_loop`'s
-connection threads read them for every new connection, hence the atomic swap.
+connection threads read them for every new connection, hence `l.tls_mu`.
 */
 reload_tls :: proc(s: ^Server, l: ^Listeners) -> bool {
 	ok := true
 	if l.dot_open {
-		if !reload_tls_ctx(&l.dot_ctx, s.cfg.listeners.dot, DOT_ALPN, "dot") {
+		if !reload_tls_ctx(l, &l.dot_ctx, s.cfg.listeners.dot, DOT_ALPN, "dot") {
 			ok = false
 		}
 	}
 	if l.doh_open {
-		if !reload_tls_ctx(&l.doh_ctx, s.cfg.listeners.doh, DOH_ALPN, "doh") {
+		if !reload_tls_ctx(l, &l.doh_ctx, s.cfg.listeners.doh, DOH_ALPN, "doh") {
 			ok = false
 		}
 	}
@@ -870,7 +881,13 @@ reload_tls :: proc(s: ^Server, l: ^Listeners) -> bool {
 }
 
 @(private)
-reload_tls_ctx :: proc(slot: ^^tlsx.Context, cfg: config.Listener, alpn: []string, name: string) -> bool {
+reload_tls_ctx :: proc(
+	l: ^Listeners,
+	slot: ^^tlsx.Context,
+	cfg: config.Listener,
+	alpn: []string,
+	name: string,
+) -> bool {
 	fresh, err := tlsx.server_context(cfg.cert_file, cfg.key_file, alpn)
 	if err != .None {
 		logx.errorf(
@@ -882,10 +899,57 @@ reload_tls_ctx :: proc(slot: ^^tlsx.Context, cfg: config.Listener, alpn: []strin
 		)
 		return false
 	}
-	old := sync.atomic_exchange(slot, fresh)
+	/*
+	Swapped and released inside the exclusive lock rather than around it.
+
+	Holding it is what says no connection thread is between reading the pointer
+	and taking its reference on the `SSL_CTX` - see `accept_tls` - so the
+	displaced context can be freed knowing nobody is about to dereference it.
+	Released here and not later because there is nothing to wait for: an open
+	connection holds the `SSL_CTX` through its own reference, and this only
+	drops ours.
+
+	Loading the replacement happens above, outside the lock, because it reads
+	two files.
+	*/
+	sync.rw_mutex_lock(&l.tls_mu)
+	old := slot^
+	slot^ = fresh
 	tlsx.context_destroy(old)
+	sync.rw_mutex_unlock(&l.tls_mu)
 	logx.infof("listeners.%s: reloaded the certificate from %s", name, cfg.cert_file)
 	return true
+}
+
+/*
+Accept a TLS connection on `proto`, taking the certificate context under the
+lock the reload replaces it under.
+
+The shared lock spans reading the pointer and `tlsx.server_session`, which is
+the whole of the window that matters: the session takes a reference on the
+`SSL_CTX`, so once it has one the reload may swap the context out and free it
+without this connection noticing. Everything before that - the pointer still in
+the slot, the `Context` behind it - is memory `reload_tls` is about to release,
+and reading it afterwards is a use-after-free that ends the process.
+
+The handshake is outside the lock on purpose. It waits on the peer, and a peer
+that dawdles over one would otherwise hold off a certificate reload for as long
+as it liked; with `server.max_connections` of them, indefinitely. Nothing it
+touches is shared with the reload.
+*/
+@(private)
+accept_tls :: proc(l: ^Listeners, proto: Protocol, socket: net.TCP_Socket) -> (^tlsx.Conn, tlsx.Error) {
+	session: tlsx.Server_Session
+	err: tlsx.Error
+	{
+		sync.rw_mutex_shared_lock(&l.tls_mu)
+		defer sync.rw_mutex_shared_unlock(&l.tls_mu)
+		session, err = tlsx.server_session(proto == .DoT ? l.dot_ctx : l.doh_ctx, socket)
+	}
+	if err != .None {
+		return nil, err
+	}
+	return tlsx.server_handshake(session)
 }
 
 @(private)
@@ -1003,10 +1067,7 @@ stream_job :: proc(data: rawptr) {
 		defer net.close(job.socket)
 		serve_dns_stream(s, {socket = job.socket, peer = job.client}, .TCP, client)
 	case .DoT:
-		// Read once, under the atomic that `reload_tls` swaps: a reload landing
-		// mid-accept must not hand this connection a half-updated context.
-		ctx := sync.atomic_load(&job.ctx.listeners.dot_ctx)
-		conn, err := tlsx.server_accept(ctx, job.socket)
+		conn, err := accept_tls(job.ctx.listeners, .DoT, job.socket)
 		if err != .None {
 			logx.debugf("dot: handshake with %s failed: %v", client, err)
 			net.close(job.socket)
@@ -1015,8 +1076,7 @@ stream_job :: proc(data: rawptr) {
 		defer tlsx.close(conn)
 		serve_dns_stream(s, {socket = job.socket, tls = conn, peer = job.client}, .DoT, client)
 	case .DoH:
-		ctx := sync.atomic_load(&job.ctx.listeners.doh_ctx)
-		conn, err := tlsx.server_accept(ctx, job.socket)
+		conn, err := accept_tls(job.ctx.listeners, .DoH, job.socket)
 		if err != .None {
 			logx.debugf("doh: handshake with %s failed: %v", client, err)
 			net.close(job.socket)

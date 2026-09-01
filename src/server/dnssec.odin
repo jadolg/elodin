@@ -45,12 +45,19 @@ start_validator :: proc(s: ^Server) -> bool {
 			anchor, ok := dnssec.parse_trust_anchor(line)
 			if !ok {
 				logx.errorf("dnssec: cannot read trust anchor %q", line)
+				// The ones before it parsed, and this is where they stop being
+				// anybody's: the server is refusing to start, so `stop_validator`
+				// never runs to release them.
+				for done in parsed {
+					dnssec.destroy_trust_anchor(done)
+				}
 				delete(parsed)
 				return false
 			}
 			append(&parsed, anchor)
 		}
 		anchors = parsed[:]
+		s.anchors = anchors
 
 		// An operator who anchors a zone below the root is asking for that zone
 		// to be validated, so the locally-served bypass must step aside for a
@@ -78,9 +85,28 @@ start_validator :: proc(s: ^Server) -> bool {
 	return true
 }
 
+/*
+Tear the validator down, and release the anchors it was validating against.
+
+The anchors are not the validator's to free - it borrows the slice, and an
+unconfigured one borrows `dnssec.root_anchors`, which is static - so
+`destroy_validator` leaves them alone and this is where the ones
+`start_validator` parsed go. Nothing here runs for the built-in anchors, which
+never filled `s.anchors` in the first place.
+*/
 stop_validator :: proc(s: ^Server) {
 	dnssec.destroy_validator(s.validator)
 	s.validator = nil
+
+	for anchor in s.anchors {
+		dnssec.destroy_trust_anchor(anchor)
+	}
+	delete(s.anchors)
+	s.anchors = nil
+	// Only the slice: the strings in it are the anchors' own `zone` fields,
+	// released just above.
+	delete(s.anchor_zones)
+	s.anchor_zones = nil
 }
 
 // Drop cached zone keys whose lifetime has run out.

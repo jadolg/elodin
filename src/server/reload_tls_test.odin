@@ -3,6 +3,8 @@ package server
 import "core:os"
 import "core:sync"
 import "core:testing"
+import "core:thread"
+import "core:time"
 import "elodin:config"
 import "elodin:tlsx"
 
@@ -161,4 +163,88 @@ test_reload_tls_does_nothing_for_a_listener_that_is_not_open :: proc(t: ^testing
 	testing.expect(t, reload_tls(&s, &l), "reload_tls tried to load a certificate for a listener that was never opened")
 	testing.expect(t, l.dot_ctx == nil, "a context appeared for a listener that was never opened")
 	testing.expect(t, l.doh_ctx == nil, "a context appeared for a listener that was never opened")
+}
+
+@(private = "file")
+Reload_Race :: struct {
+	server:    ^Server,
+	listeners: ^Listeners,
+	// Written once the reload has returned; read by the test while it waits.
+	finished:  bool,
+}
+
+/*
+A reload must not release the context while a connection is still taking a
+reference from it.
+
+This is the whole of the bug that was here. `reload_tls` freed the context it
+displaced the moment it had swapped a new one in, and `accept_tls` reads that
+pointer and dereferences it in `tlsx.server_session` a few instructions later —
+so a SIGHUP landing in between left a connection thread calling `SSL_new` on
+freed memory. Under ASan and with the window widened to a couple of
+milliseconds it is a `heap-use-after-free` that ends the process; in production
+it is a rare crash on the one operation an operator is told is safe to automate.
+
+What closes it is that `accept_tls` holds `tls_mu` shared across the pointer
+read and `SSL_new`, and the reload takes it exclusively to swap and free. So the
+property to hold onto is an ordering one, and it is what this asserts: while
+something holds the reader's side, the reload does not get as far as replacing
+the context, let alone freeing it.
+
+The wait is generous and only ever fails in the safe direction — a reload thread
+that has not reached the lock yet looks the same as one correctly blocked on it,
+so this cannot report a failure that is not there.
+*/
+@(test)
+test_reload_tls_waits_for_a_connection_holding_the_context :: proc(t: ^testing.T) {
+	cert, key, ok := ensure_cert()
+	if !ok {
+		testing.expect(t, false, "no certificate available and openssl could not make one")
+		return
+	}
+
+	cfg := config.default_config()
+	cfg.listeners.dot.cert_file = cert
+	cfg.listeners.dot.key_file = key
+
+	first, ferr := tlsx.server_context(cert, key, DOT_ALPN)
+	if ferr != .None {
+		testing.expectf(t, false, "server_context: %v", ferr)
+		return
+	}
+
+	l := Listeners{}
+	l.dot_ctx = first
+	l.dot_open = true
+	s := Server{cfg = &cfg}
+	defer tlsx.context_destroy(l.dot_ctx)
+
+	// Stand in for a connection thread that has read the context and not yet
+	// finished taking its reference — the state `accept_tls` is in while it
+	// holds the shared lock.
+	sync.rw_mutex_shared_lock(&l.tls_mu)
+
+	race := Reload_Race {
+		server    = &s,
+		listeners = &l,
+	}
+	worker := thread.create_and_start_with_poly_data(&race, proc(race: ^Reload_Race) {
+		reload_tls(race.server, race.listeners)
+		sync.atomic_store(&race.finished, true)
+	})
+
+	time.sleep(200 * time.Millisecond)
+	testing.expect(
+		t,
+		!sync.atomic_load(&race.finished),
+		"reload_tls ran to completion while a connection still held the context it frees",
+	)
+	testing.expect_value(t, l.dot_ctx, first)
+
+	sync.rw_mutex_shared_unlock(&l.tls_mu)
+	thread.join(worker)
+	thread.destroy(worker)
+
+	testing.expect(t, sync.atomic_load(&race.finished), "reload_tls never finished after the connection let go")
+	testing.expect(t, l.dot_ctx != first, "reload_tls did not swap the context in once it could")
 }

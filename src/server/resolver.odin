@@ -121,9 +121,19 @@ Server :: struct {
 	answers:      ^cache.Cache,
 	filters:      ^filter.Engine,
 	validator:    ^dnssec.Validator,
+	/*
+	The operator's own trust anchors, as parsed.
+
+	Held here rather than left to the validator because the validator borrows
+	them: with none configured it points at `dnssec.root_anchors`, which is
+	static, so `destroy_validator` cannot free what it has and these would have
+	nobody to release them. Empty when the built-in anchors are in use.
+	*/
+	anchors:      []dnssec.Trust_Anchor,
 	// The zones of the operator's own trust anchors, root excluded, in canonical
 	// form. An anchor here is a deliberate request to validate the zone it names,
 	// which the locally-served bypass has to defer to; see `covered_by_local_anchor`.
+	// The strings are the anchors' own; only the slice belongs to this field.
 	anchor_zones: []string,
 	cookies:      ^Cookie_Keeper,
 	// Nil when rate limiting is off; `rate_check` takes that as "allow".
