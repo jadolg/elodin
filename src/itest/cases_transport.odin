@@ -216,6 +216,20 @@ run_transport_cases :: proc(r: ^Runner) {
 		// 128 (section 4.1), where the four bytes are the option's own header.
 		bare := build_query(fix.qname, fix.qtype, id = 0x1313, edns_size = 1232)
 		need := (dns.PAD_QUERY_BLOCK - (len(bare) + 4) % dns.PAD_QUERY_BLOCK) % dns.PAD_QUERY_BLOCK
+		/*
+		A whole extra block rather than nothing, when the four bytes of the
+		option header land the query on a boundary by themselves.
+
+		`build_query` reads "carry a padding option" off `padding != nil`, and a
+		zero-length `make` in Odin hands back a slice with no backing pointer -
+		so a fixture whose bare query happens to measure 124 mod 128 would build
+		a query with no option in it at all, and these three cases would quietly
+		stop asking about padding. One block further along is still a multiple of
+		128 and is still a query only a padding client sends.
+		*/
+		if need == 0 {
+			need = dns.PAD_QUERY_BLOCK
+		}
 		pad := make([]u8, need, context.temp_allocator)
 		// Heap, as `query` above: `end_case` resets the scratch between cases.
 		padded := build_query(
