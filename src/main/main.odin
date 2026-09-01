@@ -1,6 +1,7 @@
 package main
 
 import "core:fmt"
+import "core:mem/virtual"
 import "core:os"
 import "core:strings"
 import "core:sync"
@@ -245,7 +246,34 @@ main :: proc() {
 		os.exit(2)
 	}
 
-	cfg, load_err := config.load_file(opts.config_path, context.allocator)
+	/*
+	The configuration gets an arena, and is released as one thing at the end.
+
+	`Config` is a tree of strings that are not the tree's to free one by one: a
+	YAML scalar is usually a view into the file text, and sometimes - a block
+	scalar, a quoted one carrying an escape - a buffer the parser built instead,
+	so a field's bytes may live in either and nothing records which. Freeing the
+	document would strand the fields pointing into it, and freeing the file text
+	would strand the rest; there is no order that works, which is why `yaml` has
+	no destroy at all.
+
+	An arena sidesteps the question by making the lifetime one decision instead
+	of hundreds, and it is what every other caller of the loader already does -
+	the tests all hand it a scratch arena. This was the one that handed it the
+	heap and never came back, so a `--check` run, and every run of the server,
+	ended holding the whole parse.
+
+	Registered before `logx.shutdown` so it is released after it: defers run in
+	reverse, and the log's own file name is one of these strings.
+	*/
+	config_arena: virtual.Arena
+	if arena_err := virtual.arena_init_growing(&config_arena); arena_err != nil {
+		fmt.eprintfln("elodin: cannot reserve memory for the configuration: %v", arena_err)
+		os.exit(1)
+	}
+	defer virtual.arena_destroy(&config_arena)
+
+	cfg, load_err := config.load_file(opts.config_path, virtual.arena_allocator(&config_arena))
 	if e, has := load_err.?; has {
 		fmt.eprintfln("elodin: %s is not usable:", opts.config_path)
 		for msg in e.messages {

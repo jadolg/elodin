@@ -98,7 +98,10 @@ ensure_edns_option :: proc(
 		return out, true
 	}
 
-	m, derr := decode_message(msg, allocator)
+	// Scratch, not the caller's allocator; see `rebuild_edns_option`.
+	scratch := context.temp_allocator
+
+	m, derr := decode_message(msg, scratch)
 	if derr != .None {
 		return nil, false
 	}
@@ -108,7 +111,7 @@ ensure_edns_option :: proc(
 		return nil, false
 	}
 
-	options := make([]EDNS_Option, 1, allocator)
+	options := make([]EDNS_Option, 1, scratch)
 	options[0] = EDNS_Option {
 		code = u16(code),
 		data = data,
@@ -118,16 +121,18 @@ ensure_edns_option :: proc(
 	opt := make_opt(udp_size, false)
 	opt.data = Rdata_OPT{options = options}
 
-	additional := make([dynamic]Record, 0, len(m.additional) + 1, allocator)
+	additional := make([dynamic]Record, 0, len(m.additional) + 1, scratch)
 	append(&additional, ..m.additional)
 	append(&additional, opt)
 	m.additional = additional[:]
 
-	encoded, _, eerr := encode_message(m, allocator, MAX_MESSAGE)
+	encoded, _, eerr := encode_message(m, scratch, MAX_MESSAGE)
 	if eerr != .None {
 		return nil, false
 	}
-	return encoded, true
+	out = make([]u8, len(encoded), allocator)
+	copy(out, encoded)
+	return out, true
 }
 
 /*
@@ -354,7 +359,26 @@ rewrite_edns_option :: proc(
 	return out, true
 }
 
-// The slow path: decode, fix the option list, encode again.
+/*
+The slow path: decode, fix the option list, encode again.
+
+The working set here - a whole decoded `Message`, which is a slice per section, a
+copy of every record's RDATA, a name per owner, and an option list for the OPT -
+is of no use once the message has been encoded again, so it comes out of the temp
+arena and only the answer is taken from `allocator`.
+
+Not a detail of taste. Every caller on the client-facing side hands in a
+per-request arena, where a scratch allocation left behind is reclaimed with
+everything else and costs nothing; that is why this read as correct for as long
+as it did. The race strategy is the exception: a race worker can outlive the
+caller's arena, so `upstream.exchange` and everything under it - including
+`exchange_with_cookie`, which strips the server cookie out of every reply through
+here - is given the process heap instead. Nothing ever reclaims that, so a reply
+reaching this path left one decoded message behind per query, for the life of the
+process. It takes an upstream whose OPT record is not the last one in the message,
+or one sending the same option twice, which is what `rewrite_edns_option` sends
+down here.
+*/
 @(private)
 rebuild_edns_option :: proc(
 	msg: []u8,
@@ -366,7 +390,9 @@ rebuild_edns_option :: proc(
 	out: []u8,
 	ok: bool,
 ) {
-	m, derr := decode_message(msg, allocator)
+	scratch := context.temp_allocator
+
+	m, derr := decode_message(msg, scratch)
 	if derr != .None {
 		return nil, false
 	}
@@ -375,7 +401,7 @@ rebuild_edns_option :: proc(
 			continue
 		}
 		rdata, _ := rec.data.(Rdata_OPT)
-		options := make([dynamic]EDNS_Option, 0, len(rdata.options) + 1, allocator)
+		options := make([dynamic]EDNS_Option, 0, len(rdata.options) + 1, scratch)
 		written := false
 		for o in rdata.options {
 			if o.code == code {
@@ -393,11 +419,13 @@ rebuild_edns_option :: proc(
 		}
 		rec.data = Rdata_OPT{options = options[:]}
 
-		encoded, _, eerr := encode_message(m, allocator, MAX_MESSAGE)
+		encoded, _, eerr := encode_message(m, scratch, MAX_MESSAGE)
 		if eerr != .None {
 			return nil, false
 		}
-		return encoded, true
+		out = make([]u8, len(encoded), allocator)
+		copy(out, encoded)
+		return out, true
 	}
 	return nil, false
 }

@@ -44,6 +44,32 @@ jobs:
       - run: mise run test
       - run: mise run itest
 
+  leakcheck:
+    name: Memory (AddressSanitizer)
+    # The integration suite again, this time against a binary built with
+    # -sanitize:address, so a leak or a use-after-free in the running server
+    # fails the build.
+    #
+    # `mise run test` covers what a test allocates: the runner tracks it and,
+    # since ODIN_TEST_FAIL_ON_BAD_MEMORY, fails on what is left over. What it
+    # cannot see is memory the server itself owns — the configuration, a
+    # listener's TLS context, the answer a race worker allocates on the heap
+    # because it may outlive the caller's arena. Every one of those has leaked
+    # at some point, and none of them is reachable from a unit test.
+    #
+    # One architecture is enough: nothing here is arch-specific, and the job
+    # costs about two and a half minutes against the plain suite's one.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - uses: jdx/mise-action@v4
+        with:
+          install: true
+          cache: true
+      - run: mise run leakcheck
+
   fuzz-regression:
     name: Fuzz corpus regression
     # No new inputs, just every file in testdata/fuzz-corpus/ run once through

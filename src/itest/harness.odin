@@ -31,11 +31,32 @@ Runner :: struct {
 	current:   string,
 	current_failed: bool,
 	verbose:   bool,
+	/*
+	End each case by asking the server to shut down rather than killing it.
+
+	Off by default because it costs the suite a shutdown per case - the
+	maintenance loop notices the signal on a 200ms slice, and there are two
+	hundred cases - and nothing in the ordinary run needs it. What needs it is a
+	binary built with `-sanitize:address`: LeakSanitizer reports at exit, and a
+	process that was killed never has one. See `mise run leakcheck`.
+	*/
+	graceful_stop: bool,
 }
 
 // Ports are handed out from a high range unlikely to collide with anything the
 // developer's machine is already running.
 BASE_PORT :: 24000
+
+/*
+How long `--graceful-stop` waits for a server to go before killing it.
+
+Generous, because the process it is waiting for is instrumented: an ASan build
+walks its whole heap at exit, and a runner under load is slower again. Waiting
+too long costs seconds on a job that already takes minutes; not waiting long
+enough turns the leak report the mode exists to collect into a killed process
+that never wrote one.
+*/
+GRACEFUL_STOP_TIMEOUT :: 15 * time.Second
 
 Server :: struct {
 	process:   os.Process,
@@ -44,6 +65,8 @@ Server :: struct {
 	doh_port:  int,
 	log_path:  string,
 	running:   bool,
+	// See `Runner.graceful_stop`.
+	graceful:  bool,
 }
 
 next_port :: proc(r: ^Runner) -> int {
@@ -262,6 +285,9 @@ start_server_raw :: proc(
 		// allocator between them.
 		log_path = strings.clone(log_path, context.allocator),
 		running  = true,
+		// Carried on the server rather than looked up at stop time, so a case
+		// that keeps one past the runner's frame still ends it the same way.
+		graceful = r.graceful_stop,
 	}
 	return srv, true
 }
@@ -345,7 +371,29 @@ wait_for_log :: proc(srv: ^Server, needle: string, timeout: time.Duration) -> bo
 	return false
 }
 
+/*
+End a case's server.
+
+SIGKILL by default, which is quick and says nothing about the process: whatever
+it was doing stops where it stood. Under `--graceful-stop` it is asked first,
+the way an init system would, because a binary built with a sanitizer only
+reports what it found on its way out - and a killed process never gets there.
+The kill stays as the fallback, so a server that will not go still cannot hang
+the suite.
+*/
 stop_server :: proc(srv: ^Server) {
+	if srv.running && srv.graceful {
+		if posix.kill(posix.pid_t(srv.process.pid), .SIGTERM) == .OK {
+			deadline := time.time_add(time.now(), GRACEFUL_STOP_TIMEOUT)
+			for time.diff(time.now(), deadline) > 0 {
+				state, werr := os.process_wait(srv.process, 100 * time.Millisecond)
+				if werr == nil && state.exited {
+					srv.running = false
+					break
+				}
+			}
+		}
+	}
 	if srv.running {
 		_ = os.process_kill(srv.process)
 		_, _ = os.process_wait(srv.process)

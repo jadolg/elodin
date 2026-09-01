@@ -35,6 +35,20 @@ ELODIN_VERSION = "{{ exec(command='echo ${ELODIN_VERSION:-$(git describe --tags 
 # magnitude; the arena still grows if a request ever needs more.
 ELODIN_DEFINES = "-define:DEFAULT_TEMP_ALLOCATOR_BACKING_SIZE=262144 -define:ELODIN_VERSION={{ env.ELODIN_VERSION }}"
 
+# `odin test` already wraps each test in a tracking allocator and prints what it
+# was still holding when it returned. It does not fail the run over it, though:
+# the default is a warning line among the passes, which is a leak reported to
+# nobody. This makes one an error, so a test that leaks fails like a test that
+# asserts wrongly.
+#
+# Only meaningful to `odin test` - passing it to a build draws an unused-define
+# warning - so it is kept apart from ELODIN_DEFINES rather than folded in.
+#
+# It covers what a test allocates and nothing else. Memory the running server
+# owns - the configuration, a listener's TLS context, a race worker's answer -
+# is reached by `mise run leakcheck` instead.
+ELODIN_TEST_DEFINES = "-define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true"
+
 # bin/ is not in version control, so a fresh clone has to create it before the
 # linker is asked to write there.
 [tasks.prepare]
@@ -98,25 +112,30 @@ run = [
 description = "Run all unit tests"
 depends = ["prepare"]
 run = [
-  "odin test src/dns      -collection:elodin=src -out:bin/test_dns -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES",
-  "odin test src/yaml     -collection:elodin=src -out:bin/test_yaml -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES",
-  "odin test src/config   -collection:elodin=src -out:bin/test_config -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES",
-  "odin test src/filter   -collection:elodin=src -out:bin/test_filter -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES",
-  "odin test src/logx     -collection:elodin=src -out:bin/test_logx -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES",
-  "odin test src/metrics  -collection:elodin=src -out:bin/test_metrics -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES",
-  "odin test src/privdrop -collection:elodin=src -out:bin/test_privdrop -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES",
-  "odin test src/cache    -collection:elodin=src -out:bin/test_cache -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES",
-  "odin test src/dnssec   -collection:elodin=src -out:bin/test_dnssec -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES",
-  "odin test src/tlsx     -collection:elodin=src -out:bin/test_tlsx -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES",
-  "odin test src/upstream -collection:elodin=src -out:bin/test_upstream -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES",
-  "odin test src/h2       -collection:elodin=src -out:bin/test_h2 -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES",
-  "odin test src/server   -collection:elodin=src -out:bin/test_server -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES",
+  "odin test src/dns      -collection:elodin=src -out:bin/test_dns -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
+  "odin test src/yaml     -collection:elodin=src -out:bin/test_yaml -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
+  "odin test src/config   -collection:elodin=src -out:bin/test_config -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
+  "odin test src/filter   -collection:elodin=src -out:bin/test_filter -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
+  "odin test src/logx     -collection:elodin=src -out:bin/test_logx -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
+  "odin test src/metrics  -collection:elodin=src -out:bin/test_metrics -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
+  "odin test src/privdrop -collection:elodin=src -out:bin/test_privdrop -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
+  "odin test src/cache    -collection:elodin=src -out:bin/test_cache -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
+  "odin test src/dnssec   -collection:elodin=src -out:bin/test_dnssec -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
+  "odin test src/tlsx     -collection:elodin=src -out:bin/test_tlsx -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
+  "odin test src/upstream -collection:elodin=src -out:bin/test_upstream -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
+  "odin test src/h2       -collection:elodin=src -out:bin/test_h2 -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
+  "odin test src/server   -collection:elodin=src -out:bin/test_server -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
 ]
 
 [tasks.itest]
 description = "Integration tests: run the built binary against mock upstreams"
 depends = ["build", "prepare"]
 run = "odin build src/itest -collection:elodin=src -out:bin/itest -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES && ./bin/itest"
+
+[tasks.leakcheck]
+description = "Run the integration suite against an AddressSanitizer build and fail on any finding"
+depends = ["prepare"]
+run = "scripts/leak-check.sh"
 
 [tasks.verify]
 description = "Everything: type-check, unit tests, integration tests"

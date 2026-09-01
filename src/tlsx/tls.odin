@@ -503,27 +503,72 @@ client_connect :: proc(ctx: ^Context, socket: net.TCP_Socket, hostname: string, 
 	return conn, .None
 }
 
-server_accept :: proc(ctx: ^Context, socket: net.TCP_Socket, allocator := context.allocator) -> (conn: ^Conn, err: Error) {
+/*
+A session that has taken its settings from a context but has not yet shaken
+hands.
+
+It exists so that the two halves of accepting a connection can be timed apart;
+see `server_session`. Carries the socket as well as the `SSL` so a caller
+holding one has everything `server_handshake` needs, and cannot pair a session
+with the wrong socket.
+*/
+Server_Session :: struct {
+	ssl:    ^SSL,
+	socket: net.TCP_Socket,
+}
+
+/*
+The half of accepting that reads `ctx`.
+
+Split out from `server_accept` so a caller whose context can be replaced under
+it - `server.reload_tls`, on SIGHUP - can hold whatever guards the replacement
+across exactly this much and no more. `SSL_new` takes the reference that keeps
+the `SSL_CTX` alive for the rest of the connection, so from the moment it
+returns the context may be swapped out and freed with this session none the
+wiser. Before it returns, both the `Context` and the `SSL_CTX` are still being
+read, and freeing either is a use-after-free.
+
+The handshake is deliberately not part of this: it blocks on the network for as
+long as the peer takes, and a caller that held its lock across it would let any
+client decide when a renewed certificate is picked up.
+*/
+server_session :: proc(ctx: ^Context, socket: net.TCP_Socket) -> (session: Server_Session, err: Error) {
 	ssl := SSL_new(ctx.ptr)
 	if ssl == nil {
-		return nil, .Handshake_Failed
+		return {}, .Handshake_Failed
 	}
 	if SSL_set_fd(ssl, socket_fd(socket)) != 1 {
 		SSL_free(ssl)
-		return nil, .Handshake_Failed
+		return {}, .Handshake_Failed
 	}
+	return Server_Session{ssl = ssl, socket = socket}, .None
+}
+
+/*
+Shake hands on a session `server_session` prepared, and wrap the result.
+
+The session is consumed either way: a handshake that fails releases the `SSL`
+before returning, so a caller has nothing left to clean up after an error.
+*/
+server_handshake :: proc(session: Server_Session, allocator := context.allocator) -> (conn: ^Conn, err: Error) {
 	ERR_clear_error()
-	if ret := SSL_accept(ssl); ret != 1 {
-		err = handshake_error(ssl, ret)
-		SSL_free(ssl)
+	if ret := SSL_accept(session.ssl); ret != 1 {
+		err = handshake_error(session.ssl, ret)
+		SSL_free(session.ssl)
 		return nil, err
 	}
 	conn = new(Conn, allocator)
-	conn.ssl = ssl
-	conn.socket = socket
+	conn.ssl = session.ssl
+	conn.socket = session.socket
 	conn.allocator = allocator
 	adopt_socket(conn)
 	return conn, .None
+}
+
+// Both halves, for a caller with no context lifetime to worry about.
+server_accept :: proc(ctx: ^Context, socket: net.TCP_Socket, allocator := context.allocator) -> (conn: ^Conn, err: Error) {
+	session := server_session(ctx, socket) or_return
+	return server_handshake(session, allocator)
 }
 
 /*

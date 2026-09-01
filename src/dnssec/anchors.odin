@@ -102,6 +102,20 @@ parse_trust_anchor :: proc(text: string, allocator := context.allocator) -> (anc
 		true
 }
 
+/*
+Release what `parse_trust_anchor` allocated: the canonical zone name and the
+digest.
+
+For parsed anchors only. `root_anchors` hands back static storage, and a
+`Validator` borrows whichever set it was given rather than owning it - see
+`destroy_validator`, which deliberately leaves `anchors` alone because it cannot
+tell the two apart. So whoever parsed them frees them.
+*/
+destroy_trust_anchor :: proc(anchor: Trust_Anchor, allocator := context.allocator) {
+	delete(anchor.ds.digest, allocator)
+	delete(anchor.zone, allocator)
+}
+
 @(private)
 decode_hex :: proc(text: string, allocator := context.allocator) -> (out: []u8, ok: bool) {
 	if len(text) % 2 != 0 {
