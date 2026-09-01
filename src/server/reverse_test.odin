@@ -272,6 +272,42 @@ test_a_shadowed_rule_supplies_no_reverse :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+/*
+Shadowed by a rule that hands out the same address is not shadowed for this
+purpose, and the test has to be the answer rather than which rule won.
+
+`*.lab -> 10.0.0.1` above `gateway.lab -> 10.0.0.1` means the wildcard is what
+answers `gateway.lab`, but it answers with 10.0.0.1, so the name really does
+resolve to the address being asked about and is a true reverse for it. Refusing
+it would lose a PTR to a rule that agrees.
+*/
+@(test)
+test_a_rule_shadowed_by_the_same_address_still_supplies_its_reverse :: proc(t: ^testing.T) {
+	rules := make([]config.Rewrite, 2, context.temp_allocator)
+	rules[0] = config.Rewrite {
+		domain   = "lab.",
+		wildcard = true,
+		answers  = answers_of({kind = .A, v4 = {10, 0, 0, 1}}),
+		ttl      = 300,
+	}
+	rules[1] = config.Rewrite {
+		domain  = "gateway.lab.",
+		answers = answers_of({kind = .A, v4 = {10, 0, 0, 1}}),
+		ttl     = 300,
+	}
+
+	domain, _, found := reverse_rewrite_target(rules, "1.0.0.10.in-addr.arpa.")
+	testing.expect(t, found, "a name that does resolve to the address should be its reverse")
+	testing.expect_value(t, domain, "gateway.lab.")
+
+	// And the wildcard alone still supplies nothing, so it is the exact rule
+	// below it that is being allowed through rather than the wildcard itself.
+	_, _, wildcard_only := reverse_rewrite_target(rules[:1], "1.0.0.10.in-addr.arpa.")
+	testing.expect(t, !wildcard_only, "a wildcard names no host")
+
+	free_all(context.temp_allocator)
+}
+
 // The same, for the other way a rule can be unreachable: a duplicated `domain:`
 // is two rules with one name between them, and only the first is ever answered.
 @(test)
@@ -299,20 +335,33 @@ test_a_duplicated_domain_supplies_one_reverse :: proc(t: ^testing.T) {
 }
 
 /*
-A rule that sinks its name hands out no address at all, `apply_rewrite` stopping
-at the first `.Block` answer, so there is nothing for it to be the reverse of.
+A rule that sinks its name hands out no address at all, so there is nothing for
+it to be the reverse of.
+
+Both orders, because `apply_rewrite` sinks the name on any `.Block` answer
+rather than on the first one: it walks the whole list and answers with the block
+response afterwards, so an address written before the `block` is given out no
+more than one written after it.
 */
 @(test)
 test_a_blocked_rule_supplies_no_reverse :: proc(t: ^testing.T) {
-	rules := make([]config.Rewrite, 1, context.temp_allocator)
+	rules := make([]config.Rewrite, 2, context.temp_allocator)
 	rules[0] = config.Rewrite {
 		domain  = "ads.example.",
 		answers = answers_of({kind = .Block}, {kind = .A, v4 = {192, 168, 1, 77}}),
 		ttl     = 300,
 	}
+	rules[1] = config.Rewrite {
+		domain  = "trackers.example.",
+		answers = answers_of({kind = .A, v4 = {192, 168, 1, 78}}, {kind = .Block}),
+		ttl     = 300,
+	}
 
-	_, _, found := reverse_rewrite_target(rules, "77.1.168.192.in-addr.arpa.")
-	testing.expect(t, !found, "a sunk rule gives out no address, so it has no reverse")
+	_, _, first := reverse_rewrite_target(rules, "77.1.168.192.in-addr.arpa.")
+	testing.expect(t, !first, "a sunk rule gives out no address, so it has no reverse")
+
+	_, _, second := reverse_rewrite_target(rules, "78.1.168.192.in-addr.arpa.")
+	testing.expect(t, !second, "the address written first is sunk just the same")
 
 	free_all(context.temp_allocator)
 }
@@ -380,14 +429,22 @@ claims.
 */
 @(test)
 test_every_synthesised_reverse_name_is_locally_served :: proc(t: ^testing.T) {
+	// Every edge of every range the predicate admits, and in particular all four
+	// of the zones `fe80::/10` spans - `8.e.f`, `9.e.f`, `a.e.f` and `b.e.f` -
+	// since an address in the last three is as admissible as one in the first.
 	names := [?]string {
 		"50.1.168.192.in-addr.arpa.",
 		"1.0.0.10.in-addr.arpa.",
+		"255.255.255.10.in-addr.arpa.",
 		"1.1.16.172.in-addr.arpa.",
-		"1.1.31.172.in-addr.arpa.",
+		"254.255.31.172.in-addr.arpa.",
 		"1.1.254.169.in-addr.arpa.",
 		FD00_1_REVERSE,
 		FE80_1_REVERSE,
+		"f.f.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.f.f.d.f.ip6.arpa.",
+		"1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.9.e.f.ip6.arpa.",
+		"1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.a.e.f.ip6.arpa.",
+		"1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.b.e.f.ip6.arpa.",
 	}
 	for name in names {
 		v4, v4_ok := parse_reverse_v4(name)

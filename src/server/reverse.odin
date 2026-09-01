@@ -48,14 +48,17 @@ And the shape has to be a host's, not a zone's. Four decimal labels under
 `1.168.192.in-addr.arpa.` names a zone cut rather than an address, and there is
 nothing for it to point at.
 
-Where this sits is the other half of the argument. It runs from `apply_rewrite`,
-which is above everything in `localzones.odin` - so a synthesised name is
-answered before the reverse tree can be considered, which is what it has to be,
-and it stays inside the same bypass those zones already have: `is_locally_served`
-covers every name this can answer, by construction, since the address test above
-is that table's private subset. A synthesised PTR under a signed `in-addr.arpa`
-with the validator still watching is exactly the shape `localzones.odin` exists
-to keep away from the chain of trust, and this cannot produce one.
+Where this sits is the other half of the argument. `resolve_query` calls it
+immediately below `apply_rewrite`, which is above everything in
+`localzones.odin` - so a synthesised name is answered before the reverse tree
+can be considered, which is what it has to be, and it stays inside the same
+bypass those zones already have. Two things hold that: the address test below
+admits only that table's private subset, and `apply_reverse_rewrite` will not
+answer a name `locally_served_zone` does not claim. Either would do on a good
+day; the second is there because the first is a predicate somebody will widen -
+`fc00::/7` to match `config.PRIVATE_NETWORKS` is the obvious edit - and a
+synthesised PTR under a signed `ip6.arpa` with the validator still watching is
+exactly the shape `localzones.odin` exists to keep away from the chain of trust.
 
 A trust anchor over the reverse zone stands the whole of it down, the same way
 it stands down the bypass in `localzones.odin`. A site that signs its own
@@ -101,6 +104,23 @@ apply_reverse_rewrite :: proc(
 	if len(s.cfg.rewrites) == 0 {
 		return nil, false
 	}
+	/*
+	The zone the name is in, which is both the gate and the apex of the SOA
+	below.
+
+	As a gate it is the invariant in the file comment made structural rather
+	than merely true: this cannot answer a name outside the zones that are
+	served locally, whatever the address test comes to believe. The two are not
+	the same check and neither can stand for the other - the address test also
+	has to exclude loopback and `0.0.0.0`, which are in this table - but they are
+	the same claim from two sides, and a widened address test with no gate here
+	would answer under a name the public tree proves does not exist, which is
+	Bogus to a validator and the one shape `localzones.odin` exists to prevent.
+	*/
+	zone, served := locally_served_zone(q.name)
+	if !served {
+		return nil, false
+	}
 	// An anchor over the zone is the operator asking for these names to be
 	// validated, which nothing invented here can be. See above.
 	if covered_by_local_anchor(s, q.name) {
@@ -135,13 +155,10 @@ apply_reverse_rewrite :: proc(
 		types it has no record of are questions whose true answer is "none",
 		not "no such name".
 
-		The SOA goes at the RFC 6303 zone rather than at the queried name's
-		parent, `1.168.192.in-addr.arpa.` being a zone nobody was ever
-		authoritative for. `locally_served_zone` always finds one for a name that
-		got this far, and an empty apex leaves `synth_soa` to fall back to the
-		parent rather than making the caller handle a case that cannot happen.
+		The SOA goes at the RFC 6303 zone found above rather than at the queried
+		name's parent, `1.168.192.in-addr.arpa.` being a zone nobody was ever
+		authoritative for.
 		*/
-		zone, _ := locally_served_zone(q.name)
 		resp.authority = synth_soa(q.name, ttl, allocator, zone)
 	}
 
@@ -191,21 +208,29 @@ that mentions an address not be a rule that gives it out.
 
 A wildcard names no one host, as above.
 
-A rule carrying `block` never reaches its addresses: `apply_rewrite` stops at
-the first `.Block` answer and sinks the name, so `answers: [block, 192.168.1.77]`
-hands out nothing at all - and a PTR pointing at a name whose own A is NXDOMAIN
-would be this server contradicting itself between two answers to one question.
+A rule carrying `block` never reaches its addresses. `apply_rewrite` sinks the
+name on any `.Block` answer, whatever else the rule lists and in whichever
+order, so `answers: [block, 192.168.1.77]` hands out nothing at all - and a PTR
+pointing at a name whose own A is NXDOMAIN would be this server contradicting
+itself between two answers to one question.
 
-A rule shadowed in the forward direction never reaches them either. `rewrites`
-is matched first-wins by `find_rewrite`, so an earlier wildcard over the same
-name - `*.home` above `nas.home` - or an earlier rule with a duplicate `domain:`
-is what answers, and the shadowed rule's address is never given to anybody.
-Synthesising from it would point the reverse at a name whose forward answer is a
-different address, which is the forward-confirmed reverse check failing on this
-server's own two answers. Only the rule that would answer its own name may speak
-for its address, and `find_rewrite_index` is asked which one that is rather than
-this loop guessing - "same domain" would let the second of two duplicates
-through.
+And a rule the forward direction never reaches does not hand out its address
+either. `rewrites` is matched first-wins by `find_rewrite`, so an earlier
+wildcard over the same name - `*.home` above `nas.home` - or an earlier rule
+with a duplicate `domain:` is what answers, and the shadowed rule's address is
+never given to anybody. Synthesising from it would point the reverse at a name
+whose forward answer is a different address, which is the forward-confirmed
+reverse check failing on this server's own two answers.
+
+That last test is on the answer rather than on which rule won, and the
+difference matters in one direction only. `*.lab -> 10.0.0.1` above
+`gateway.lab -> 10.0.0.1` shadows the second rule, but `gateway.lab` still
+resolves to 10.0.0.1, so the pair agrees and the name is a true reverse for the
+address; refusing it because some other rule answered would lose a PTR for no
+reason. What has to hold is that the name really does resolve to the address
+being asked about, which is what `find_rewrite_index` is asked - "same domain"
+could not answer it, the second of two duplicate `domain:` entries having the
+same domain as the first and none of its answers.
 */
 @(private)
 rewrite_naming_address :: proc(
@@ -220,30 +245,38 @@ rewrite_naming_address :: proc(
 		if r.wildcard {
 			continue
 		}
-		sunk := false
-		named := false
-		for a in r.answers {
-			if a.kind == .Block {
-				sunk = true
-				break
-			}
-			if a.kind != want.kind {
-				continue
-			}
-			same := a.v4 == want.v4 if want.kind == .A else a.v6 == want.v6
-			if same {
-				named = true
-			}
-		}
-		if sunk || !named {
+		if !rule_hands_out(r, want) {
 			continue
 		}
-		if winner, _ := find_rewrite_index(rules, r.domain); winner != i {
+		// What `r.domain` actually resolves to is whatever rule wins that name,
+		// which is `r` itself unless something above shadows it.
+		winner, _ := find_rewrite_index(rules, r.domain)
+		if winner != i && !rule_hands_out(rules[winner], want) {
 			continue
 		}
 		return r.domain, r.ttl, true
 	}
 	return "", 0, false
+}
+
+// Whether `r` gives out `want` to a client that asks for its name: it lists the
+// address, and nothing in it sinks the name first.
+@(private)
+rule_hands_out :: proc(r: config.Rewrite, want: config.Rewrite_Answer) -> bool {
+	named := false
+	for a in r.answers {
+		if a.kind == .Block {
+			return false
+		}
+		if a.kind != want.kind {
+			continue
+		}
+		same := a.v4 == want.v4 if want.kind == .A else a.v6 == want.v6
+		if same {
+			named = true
+		}
+	}
+	return named
 }
 
 /*

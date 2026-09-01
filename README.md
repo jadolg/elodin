@@ -1348,7 +1348,9 @@ the address is one this network holds:
 - a rule the forward direction never reaches — one shadowed by an earlier
   wildcard over the same name, or by an earlier rule with the same `domain:` —
   supplies nothing either, or `192.168.1.50` would reverse to a name that
-  resolves to some other address;
+  resolves to some other address. The test is on the answer, not on which rule
+  won: if the rule shadowing it hands out the same address, the name does resolve
+  to it and still gets the PTR;
 - an address named by several rules gets the first rule's name, in file order,
   which is the precedence the forward direction already uses;
 - an address outside RFC 1918, RFC 3927 link-local, RFC 4193 unique-local and
