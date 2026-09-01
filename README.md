@@ -40,6 +40,7 @@ mise run build            # bin/elodin, with debug info
 mise run release          # bin/elodin, optimised
 mise run test             # unit tests
 mise run itest            # integration tests against the built binary
+mise run leakcheck        # the same suite under AddressSanitizer
 mise run verify           # check + test + itest
 mise run check            # type-check with -vet -strict-style
 mise run fuzz             # build the dns, h2 and yaml libFuzzer targets
@@ -132,10 +133,11 @@ libcrypto and cross-compiling would mean carrying a sysroot for each.
 
 CI (`.github/workflows/ci.yml`) runs on every pull request and on every push to
 `main`: `mise run check` once, `mise run test` and `mise run itest` on both
-architectures, `mise run fuzz-regression` once, `mise run build` on both, and —
-also on both — a `mise run deb` that is then installed on the runner, asked to
-resolve a handful of names through the takeover it just performed, and removed
-again with a check that the runner got its own resolver back.
+architectures, `mise run fuzz-regression` once, `mise run leakcheck` once,
+`mise run build` on both, and — also on both — a `mise run deb` that is then
+installed on the runner, asked to resolve a handful of names through the
+takeover it just performed, and removed again with a check that the runner got
+its own resolver back.
 
 ### From a .deb
 
@@ -1912,10 +1914,11 @@ get a thread each instead, capped by `server.max_connections`.
 
 ## Testing
 
-Two layers, both run by `mise run verify`, and a third — fuzzing — that runs on
-its own schedule. A fourth, `mise run bench`, measures rather than asserts: it
-is where every number in [Capacity](#capacity) comes from, and it is documented
-in [`bench/README.md`](bench/README.md).
+Two layers, both run by `mise run verify`, a third that watches what those two
+do to memory, and a fourth — fuzzing — that runs on its own schedule. A fifth,
+`mise run bench`, measures rather than asserts: it is where every number in
+[Capacity](#capacity) comes from, and it is documented in
+[`bench/README.md`](bench/README.md).
 
 **Unit tests** (`mise run test`, 720 cases) cover the message codec — round trips
 for every modelled RDATA type, compression, truncation, EDNS, pointer loops,
@@ -1996,6 +1999,32 @@ does not model. The mock replays them verbatim and the suite compares the bytes
 the client receives against the bytes the upstream sent. Generating the fixtures
 with elodin's own encoder instead would let a codec bug agree with itself and
 still pass.
+
+**Memory** is checked in two places, because no one place can see all of it.
+
+`odin test` wraps every test in a tracking allocator, and
+`ODIN_TEST_FAIL_ON_BAD_MEMORY` — set for `mise run test` — turns what it finds
+into a failing test rather than a warning line among the passes. That catches a
+procedure which keeps what it was lent. It cannot catch anything else: nearly
+every allocation on the query path comes from a per-request arena that is reset
+whole, so a leak there is invisible by construction, and the memory that is
+*not* arena-backed belongs to the running server rather than to any procedure a
+test calls.
+
+So `mise run leakcheck` builds the binary with `-sanitize:address` and runs the
+integration suite against it, with `--graceful-stop` so each server is asked to
+exit rather than killed — a sanitizer reports on its way out, and a killed
+process never gets there. LeakSanitizer writes one report per process and the
+job fails if there are any. This is the layer that reaches the configuration,
+the listeners' TLS contexts, and the answers a race worker allocates on the heap
+because it may outlive the caller's arena; every one of those has leaked at some
+point, and none of them is reachable from a unit test. Being ASan rather than
+LSan alone, it also catches a use-after-free — which is how the certificate
+reload was found to be freeing a context a connection was still about to read.
+
+It runs on one architecture and takes about two and a half minutes, against the
+plain suite's one. Not part of `mise run verify`, which is the fast local gate;
+CI runs it on every change.
 
 **Fuzzing** covers the three parsers that read bytes somebody else chose: the
 DNS wire codec (`dns.decode_message`, plus `dns.truncated_response`, which the

@@ -24,12 +24,14 @@ generates for itself.
 USAGE :: `elodin integration tests
 
 usage:
-  itest [-v] [--binary <path>] [--keep]
+  itest [-v] [--binary <path>] [--keep] [--graceful-stop]
 
 options:
   -v, --verbose       print each case as it runs
       --binary <path> the elodin binary to test (default: bin/elodin)
       --keep          keep the temporary working directory
+      --graceful-stop end each case with SIGTERM rather than SIGKILL, so an
+                      instrumented binary gets to run its exit checks
   -h, --help          print this message
 `
 
@@ -41,6 +43,7 @@ main :: proc() {
 	binary := "bin/elodin"
 	verbose := false
 	keep := false
+	graceful_stop := false
 
 	args := os.args[1:]
 	i := 0
@@ -50,6 +53,8 @@ main :: proc() {
 			verbose = true
 		case "--keep":
 			keep = true
+		case "--graceful-stop":
+			graceful_stop = true
 		case "--binary":
 			if i + 1 >= len(args) {
 				fmt.eprintln("itest: --binary needs a path")
@@ -78,11 +83,12 @@ main :: proc() {
 	}
 
 	r := Runner {
-		binary    = absolute(binary),
-		work_dir  = work_dir,
-		next_port = BASE_PORT,
-		failures  = make([dynamic]string, 0, 16),
-		verbose   = verbose,
+		binary        = absolute(binary),
+		work_dir      = work_dir,
+		next_port     = BASE_PORT,
+		failures      = make([dynamic]string, 0, 16),
+		verbose       = verbose,
+		graceful_stop = graceful_stop,
 	}
 
 	cert, key, cert_ok := ensure_certificate(work_dir)
