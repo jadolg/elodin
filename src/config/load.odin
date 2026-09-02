@@ -708,6 +708,56 @@ check_route_reachable :: proc(l: ^Loader, cfg: ^Config, route: Zone_Route) {
 	}
 }
 
+/*
+Whether every name a route claims is already covered by a trust anchor.
+
+A route serves its zone insecure by default, and that is the first of the two
+things `--check` says a route gives up - but `covered_by_local_anchor` in the
+server stands the bypass down for a name an anchor covers, so a site that signed
+its own zone and anchored it gives up no validation at all by routing it. Saying
+otherwise would be the warning being wrong at exactly the configuration that was
+most careful, which is worse than not printing it.
+
+Every domain rather than any: the warning is one line about the whole route, and
+a route claiming an anchored zone alongside an unanchored one still serves the
+second insecure.
+
+The root anchor does not count, which is `start_validator` leaving it out of
+`anchor_zones`: it covers every name and can validate none of the zones the
+bypass exists for. Neither does an anchor that will not parse - `validate`
+refuses the file over one of those, so no operator ever sees what this answered
+for such a file.
+
+Read by `main` for the `--check` line and nothing else, so the parse is scratch:
+the anchors it builds are thrown at the temporary allocator rather than freed
+one by one, the caller's own line being built there too.
+*/
+route_is_anchored :: proc(cfg: ^Config, route: Zone_Route) -> bool {
+	if !cfg.dnssec.enabled || len(cfg.dnssec.trust_anchors) == 0 || len(route.domains) == 0 {
+		return false
+	}
+	for domain in route.domains {
+		covered := false
+		for line in cfg.dnssec.trust_anchors {
+			anchor, ok := dnssec.parse_trust_anchor(line, context.temp_allocator)
+			if !ok || anchor.zone == "." {
+				continue
+			}
+			// Both sides canonical: `canonical_domain` made the route's, and
+			// `parse_trust_anchor` runs the anchor's through
+			// `dns.name_canonical`.
+			if domain_at_or_below(domain, anchor.zone) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			return false
+		}
+	}
+	return true
+}
+
 @(private)
 load_upstream_spec :: proc(
 	l: ^Loader,

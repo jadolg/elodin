@@ -128,6 +128,50 @@ run_route_warning_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	start_case(r, "upstream.zones: an anchored route is not said to give up validation")
+	{
+		/*
+		The one file where the first half of that line would be untrue.
+
+		`covered_by_local_anchor` stands the route's bypass down for a name an
+		anchor covers, so a site that signed its own zone and anchored it gives
+		up no validation at all by routing it. Telling it otherwise would be the
+		warning misfiring at the most careful configuration there is. The second
+		half still holds and is asserted with it: an anchor says nothing about
+		what addresses the zone may answer with.
+
+		The root DS is listed alongside because `trust_anchors` replaces the
+		built-in keys rather than adding to them.
+		*/
+		body := fmt.tprintf(
+			"%sdnssec:\n  enabled: true\n  trust_anchors:\n    - %q\n    - %q\nrebind:\n  enabled: true\n",
+			ROUTE,
+			". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
+			"corp.example. IN DS 12345 8 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF",
+		)
+		res := run_binary(
+			r,
+			[]string{"--config", write(r, "route-warn-anchored.yaml", body), "--check"},
+			"route-warn-anchored",
+		)
+		if check(r, res.ok, "could not run the binary") {
+			check_eq_int(r, res.exit_code, 0, "exit code")
+			check(
+				r,
+				!strings.contains(res.output, "insecure"),
+				"an anchored route was said to be served insecure: %q",
+				res.output,
+			)
+			check(
+				r,
+				strings.contains(res.output, "rebind protection"),
+				"the rebinding guard was not named: %q",
+				res.output,
+			)
+		}
+	}
+	end_case(r)
+
 	start_case(r, "upstream.zones: nothing is claimed for a check the file already turned off")
 	{
 		// Both off: the route gives up neither, so a line naming either would be

@@ -266,25 +266,6 @@ route_shaped_rules :: proc(cfg: ^config.Config, allocator := context.allocator) 
 }
 
 /*
-One line per rule found, worded for both lists.
-
-`blocking.allow` (`cfg.blocking.allow_rules`) is scanned as well as
-`blocking.rules`, and the form does a different nothing in each. In
-`blocking.rules` it blackholes the zone, as above. In `blocking.allow` it does
-not exempt it either: `build_filter_sets` prefixes those entries with `@@`
-before parsing them, which puts the string past `parse_adblock_line`'s dnsmasq
-branch and into the generic one, where the `/` still in it is read as a
-path-scoped rule and the whole entry is discarded. So the rule adds nothing to
-either set and the zone goes on being resolved by `upstream.servers`, which
-looks exactly like the route not working.
-
-The warning therefore says what the rule is and what it is not, and leaves what
-it does to the list it is in - claiming either "blocks that domain" or "exempts
-that domain" would be untrue of one of the two files. Both lists are named by
-the key an operator writes rather than by the field they land in, so the line
-can be searched for in the file it is about.
-*/
-/*
 What each route gives up, said once per route rather than left to be noticed.
 
 A route does three things and only the first is what the operator wrote it for:
@@ -305,7 +286,13 @@ leaves the judgement where the knowledge is.
 Only what is actually given up. With `dnssec.enabled` off there is no validation
 to lose and with `rebind.enabled` off there is no guard to be exempt from, so a
 configuration with both off gets no line: a warning that names a protection the
-file already turned off is noise standing where a real one should be.
+file already turned off is noise standing where a real one should be. A trust
+anchor over the routed zone is the third way to have given nothing up, and the
+one that is easiest to get wrong here: the anchor stands the bypass down, so the
+zone is validated like any other and `config.route_is_anchored` takes the first
+half of the line back. Telling a site that anchored its own zone that routing it
+turned validation off would be the warning misfiring at the most careful file
+there is.
 */
 route_implication_warning :: proc(
 	cfg: ^config.Config,
@@ -318,15 +305,23 @@ route_implication_warning :: proc(
 	if len(route.domains) == 0 {
 		return "", false
 	}
+	// Validation is given up only where it was being done: with `dnssec.enabled`
+	// there is nothing to lose, and with an anchor over every name the route
+	// claims the bypass never applies to them in the first place.
+	insecure := cfg.dnssec.enabled && !config.route_is_anchored(cfg, route)
+	if !insecure && !cfg.rebind.enabled {
+		return "", false
+	}
+
 	zones := strings.join(route.domains, ", ", allocator)
 	switch {
-	case cfg.dnssec.enabled && cfg.rebind.enabled:
+	case insecure && cfg.rebind.enabled:
 		return fmt.aprintf(
 			"the route for %s serves that zone insecure (DNSSEC validation off for it) and exempt from rebind protection, which is what a route asserts about a zone a local authority answers; if it is a public signed zone, those are two checks you are giving up",
 			zones,
 			allocator = allocator,
 		), true
-	case cfg.dnssec.enabled:
+	case insecure:
 		return fmt.aprintf(
 			"the route for %s serves that zone insecure (DNSSEC validation off for it), which is what a route asserts about a zone a local authority answers; if it is a public signed zone, that is a check you are giving up",
 			zones,
@@ -339,9 +334,30 @@ route_implication_warning :: proc(
 			allocator = allocator,
 		), true
 	}
+	// Unreachable: the guard above has already left for the file that gives up
+	// neither, so one of the three arms holds. Odin wants the terminator.
 	return "", false
 }
 
+/*
+One line per rule found, worded for both lists.
+
+`blocking.allow` (`cfg.blocking.allow_rules`) is scanned as well as
+`blocking.rules`, and the form does a different nothing in each. In
+`blocking.rules` it blackholes the zone, as above. In `blocking.allow` it does
+not exempt it either: `build_filter_sets` prefixes those entries with `@@`
+before parsing them, which puts the string past `parse_adblock_line`'s dnsmasq
+branch and into the generic one, where the `/` still in it is read as a
+path-scoped rule and the whole entry is discarded. So the rule adds nothing to
+either set and the zone goes on being resolved by `upstream.servers`, which
+looks exactly like the route not working.
+
+The warning therefore says what the rule is and what it is not, and leaves what
+it does to the list it is in - claiming either "blocks that domain" or "exempts
+that domain" would be untrue of one of the two files. Both lists are named by
+the key an operator writes rather than by the field they land in, so the line
+can be searched for in the file it is about.
+*/
 route_rule_warning :: proc(rule: string, allocator := context.allocator) -> string {
 	return fmt.aprintf(
 		"blocking rule %q is a list rule, not a route: it does not send the zone anywhere - under blocking.rules that form blackholes the zone, and under blocking.allow it is discarded; to send a zone to its own server use upstream.zones",

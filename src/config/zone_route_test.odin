@@ -1,5 +1,6 @@
 package config
 
+import "core:fmt"
 import "core:strings"
 import "core:testing"
 import "core:time"
@@ -281,6 +282,68 @@ test_a_route_under_an_enabled_special_use_zone_is_refused :: proc(t: ^testing.T)
 	)
 	testing.expect(t, err == nil, "a route under a table nothing consults was refused")
 	testing.expect_value(t, len(cfg.upstream.zones), 1)
+	free_all(context.temp_allocator)
+}
+
+/*
+A route the operator anchored gives up no validation, and `--check` has to be
+able to tell.
+
+`covered_by_local_anchor` stands the route's DNSSEC bypass down for a name an
+anchor covers, so the line `main` prints about what a route costs would be
+untrue of exactly the file that signed its own zone and said so. The three ways
+not to be covered are each their own case: no anchor at all, the root anchor -
+which covers every name and validates none of the zones the bypass exists for,
+and is left out of `anchor_zones` for that reason - and an anchor sitting below
+the routed zone, which leaves the rest of the zone insecure.
+*/
+@(test)
+test_a_route_knows_whether_an_anchor_covers_it :: proc(t: ^testing.T) {
+	ROOT :: `". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"`
+	DS :: `IN DS 12345 8 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF`
+
+	load :: proc(t: ^testing.T, anchors: string, domains := "[corp.example]") -> (Config, bool) {
+		src := fmt.tprintf(
+			"upstream:\n  servers: [1.1.1.1]\n  zones:\n    - domains: %s\n      servers: [10.0.0.1]\ndnssec:\n  enabled: true\n%s",
+			domains,
+			anchors,
+		)
+		cfg, err := load_string(src, context.temp_allocator)
+		if e, has := err.?; has {
+			testing.expectf(t, false, "config errors: %v", e.messages)
+			return {}, false
+		}
+		return cfg, len(cfg.upstream.zones) == 1
+	}
+
+	// Nothing configured: the built-in root keys, and no zone of the operator's
+	// own to defer to.
+	if cfg, ok := load(t, ""); ok {
+		testing.expect(t, !route_is_anchored(&cfg, cfg.upstream.zones[0]), "a route with no anchors was called anchored")
+	}
+	// The root alone is not an anchor over anything, which is what
+	// `start_validator` decides by leaving it out of `anchor_zones`.
+	if cfg, ok := load(t, "  trust_anchors:\n    - " + ROOT + "\n"); ok {
+		testing.expect(t, !route_is_anchored(&cfg, cfg.upstream.zones[0]), "the root anchor was read as covering a zone")
+	}
+	// The zone itself, which is the case the warning has to keep quiet about.
+	if cfg, ok := load(t, "  trust_anchors:\n    - " + ROOT + "\n    - \"corp.example. " + DS + "\"\n"); ok {
+		testing.expect(t, route_is_anchored(&cfg, cfg.upstream.zones[0]), "an anchor over the routed zone was ignored")
+	}
+	// An anchor inside the zone covers its own names and leaves the rest of the
+	// zone exactly as insecure as it was.
+	if cfg, ok := load(t, "  trust_anchors:\n    - \"dev.corp.example. " + DS + "\"\n"); ok {
+		testing.expect(t, !route_is_anchored(&cfg, cfg.upstream.zones[0]), "an anchor below the zone was read as covering it")
+	}
+	// One domain of a route anchored and the other not is the whole route still
+	// giving validation up, the line being one sentence about all of them.
+	if cfg, ok := load(
+		t,
+		"  trust_anchors:\n    - \"corp.example. " + DS + "\"\n",
+		"[corp.example, lab.example]",
+	); ok {
+		testing.expect(t, !route_is_anchored(&cfg, cfg.upstream.zones[0]), "a half-anchored route was called anchored")
+	}
 	free_all(context.temp_allocator)
 }
 

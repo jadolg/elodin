@@ -459,7 +459,8 @@ configuration is not reloaded. Restart after changing a route.
 does the log at startup. Nothing at load can tell an internal zone from a public
 signed one — whether a zone is signed is a question only the DNS answers — so the
 line states the two implications and leaves the judgement to you. It is not
-printed for a check the file has already turned off.
+printed for a check the file has already turned off, nor for the half a
+`trust_anchors` entry over the routed zone takes back.
 
 A route into a zone [`special_use`](#names-that-are-never-forwarded) already
 answers is refused at load. Those names are answered from the table before
