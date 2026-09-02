@@ -204,6 +204,51 @@ upstream:
     #   - tls://1.1.1.1:853#cloudflare-dns.com
     #   - https://dns.google/dns-query
 
+  # Zones that go somewhere other than the servers above - dnsmasq's
+  # server=/corp.example/10.0.0.1, unbound's forward-zone, blocky's
+  # conditionalMapping. This is what a network that runs its own DNS for its own
+  # zone needs: without it the choice is a public resolver that has never heard
+  # of the zone, or an internal server asked to recurse the whole Internet.
+  #
+  # Each route is a whole upstream in its own right - it takes strategy,
+  # timeout, attempts, max_idle, idle_timeout, bootstrap and servers in every
+  # form and transport above - and inherits whatever it does not say from the
+  # settings at the top of this section.
+  #
+  # domains match on label boundaries: corp.example covers corp.example and
+  # everything under it, and does not cover notcorp.example. The longest
+  # matching route wins, so a sub-zone can be sent elsewhere without the broader
+  # entry being rewritten.
+  #
+  # Two things follow from a route, so that turning it on is one decision rather
+  # than three: names in the zone are served insecure, since a local zone's
+  # unsigned data sits under a public parent that delegates nothing to it and
+  # validating it would SERVFAIL every internal name; and the zone is exempt
+  # from the rebinding guard below, since answering with private addresses is
+  # what a local authority is for.
+  #
+  # A dnssec.trust_anchors entry covering a routed zone stands the first of
+  # those down, so the names are validated like any other. That is not the same
+  # as the zone validating: the walk starts at the root and descends by DS, so
+  # it reaches a signed zone only where the public tree delegates to it, and
+  # standing the bypass down over a purely internal zone turns a working
+  # insecure answer into SERVFAIL. trust_anchors also replaces the built-in root
+  # keys rather than adding to them, so list the root DS alongside your own.
+  #
+  # What does not follow a route is the DNSSEC chain walk - DS and DNSKEY for
+  # the zones above a name always go to the servers above, because a server
+  # authoritative for a zone answers DS queries inside it from its own data and
+  # that breaks the chain instead of completing it.
+  #
+  # Careful if you are coming from dnsmasq: server=/corp.example/10.0.0.1 under
+  # blocking.rules blocks that zone rather than routing it, the form being one
+  # that turns up in blocklists. Routing lives here and nowhere else.
+  # zones:
+  #   - domains: [corp.example]
+  #     servers: [10.0.0.1]
+  #   - domains: [home.arpa]
+  #     servers: [192.168.1.1]
+
 cache:
   enabled: true
   max_entries: 10000
@@ -361,7 +406,9 @@ rebind:
   #
   # If your upstream is your own internal DNS server and it resolves internal
   # names to RFC 1918 addresses, those names stop resolving until they are named
-  # here. That is the one upgrade break this feature has.
+  # here. That is the one upgrade break this feature has. A zone with a route
+  # under upstream.zones needs no entry: the route already says it is answered
+  # locally, and the exemption follows from that.
   # allow_domains:
   #   - corp.example
   #   - home.arpa
@@ -456,7 +503,8 @@ rebind:
 # upgrade would take those hostnames away. Turn them on if nothing here serves
 # them. A `rewrites` rule is matched first either way, so a name you have written
 # down keeps its answer; what a rewrite cannot do is forward the query on to your
-# router, which is why these are settings rather than something to work around.
+# router - that is upstream.zones above, and these settings are for the network
+# where nothing local answers the name at all.
 #
 # home.arpa is the same shape as those two, and the one that is about privacy
 # rather than a wrong answer. RFC 8375 reserved it for a home network's own zone
@@ -465,8 +513,8 @@ rebind:
 # off, and turning it on says nothing here serves the zone. With it off the
 # names still leave, and get the blackhole servers' NXDOMAIN back; with it on
 # they are answered here and your printer's name stays on your network. Sending
-# the query to your router instead would need a per-domain upstream, which this
-# resolver does not have.
+# the query to your router instead is upstream.zones above, which is what a
+# network whose router does answer the zone wants.
 #
 # On, the zone is served empty rather than absent, which is what RFC 8375
 # section 4 asks for: printer.home.arpa is NXDOMAIN, home.arpa itself is NODATA

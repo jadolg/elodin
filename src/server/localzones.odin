@@ -66,7 +66,12 @@ Nothing about this is special to `home.arpa.`, which is worth knowing before the
 next one arrives: any upstream authoritative for a forward zone that answers DS
 queries inside it from its own data breaks a chain the same way, `corp.example`
 and a site's internal `.test` included. `home.arpa.` is the case that can be
-listed here rather than configured, being the one such zone an RFC names.
+listed here rather than configured, being the one such zone an RFC names; the
+general case is `upstream.zones`, where an operator names their own zone and
+gets this same bypass over it. See `routes.odin`. This entry remains what covers
+the network that configured no route because its default upstream *is* the
+router - the one arrangement where a zone is served locally without anybody
+having had to say so.
 
 What this entry does not do is keep the query at home. By itself it leaves
 `home.arpa.` forwarded to whatever `upstream.servers` names, so a network with
@@ -80,11 +85,13 @@ chain already worked.
 it lives - answering the zone here for the network that has nothing serving it.
 It cannot be the default, because answering the zone from a table is exactly
 what breaks the deployment RFC 8375 wrote the name for, which is the same
-argument that keeps `local.` and `test.` forwarded. What neither half can do is
-send the query to the router, which needs a per-domain upstream this server does
-not have. Note that the key does not retire this entry: the apex `DS` is
-forwarded whichever way it is set, and this is what keeps that answer off a
-chain walk that cannot finish.
+argument that keeps `local.` and `test.` forwarded. Sending the query to the
+router is the third thing, and it is `upstream.zones` - a route for
+`home.arpa.` pointed at the router keeps the names resolving and keeps them off
+the public upstream at once, which is what neither half here can do alone. Note
+that the key does not retire this entry: the apex `DS` is forwarded whichever
+way it is set, and this is what keeps that answer off a chain walk that cannot
+finish.
 
 The bypass is off, though, for a name an operator has anchored themselves. A
 site that signs its own reverse space and configures a trust anchor over it is
@@ -265,10 +272,10 @@ resolver they name that network's printer and its NAS to somebody who has no
 business knowing, and get the blackhole servers' empty zone back for it. RFC
 8375 section 3 says not to send them, in as many words: queries for these names
 "MUST NOT be recursively forwarded to servers outside the logical boundaries of
-the homenet". What stops it properly is a per-domain upstream that could send
-them to the router instead, which this server does not have; what the key does
-is answer them here, for the network that has no router answering them either.
-That is the whole of its claim, and the reason it cannot be the default is the
+the homenet". What stops it for a network that has a router answering the zone
+is a route in `upstream.zones` pointed at that router; what this key does is
+answer them here, for the network that has no router answering them either. That
+is the whole of its claim, and the reason it cannot be the default is the
 network on the other side of it, whose router does answer and whose hostnames
 would disappear.
 
@@ -317,9 +324,9 @@ answers is one `resolve_query` never gets as far as validating.
 
 A rewrite outranks all of this, because `apply_rewrite` runs first - a site that
 has written down what its own names resolve to keeps that answer. What a rewrite
-cannot do is send the query somewhere else, there being no per-domain upstream
-here, so a network whose router answers `.local` dynamically needs the
-configuration key rather than a rule. That is what the key is for.
+cannot do is send the query somewhere else; a network whose router answers
+`.local` dynamically wants a route in `upstream.zones` rather than a rule, and
+these keys rather than either where nothing local answers the name at all.
 */
 @(private)
 Special_Use :: enum u8 {
@@ -378,6 +385,12 @@ special_use_zone :: proc(
 	if !s.cfg.special_use.enabled {
 		return "", .None
 	}
+	// The zones below are listed a second time in `config.check_route_reachable`,
+	// which refuses an `upstream.zones` route that one of them would answer
+	// before anything is forwarded. The config package cannot import this one, so
+	// a zone added here has to be added there too or a route under it will load
+	// cleanly and never fire.
+	//
 	// The two with no key of their own.
 	if name_at_or_below(name, "localhost.") {
 		return "localhost.", .Loopback

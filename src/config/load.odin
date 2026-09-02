@@ -300,24 +300,34 @@ load_listeners :: proc(l: ^Loader, cfg: ^Config) {
 	load_listener(l, n, "doh", &cfg.listeners.doh, true)
 }
 
+// `strategy`, wherever it appears: once for `upstream` itself and once for every
+// route under `upstream.zones`, which chooses between its own servers the same
+// way the default group chooses between its.
+@(private)
+load_strategy :: proc(l: ^Loader, n: ^yaml.Node, dst: ^Strategy, path: string) {
+	s, ok := yaml.as_string(yaml.get(n, "strategy"))
+	if !ok {
+		return
+	}
+	switch strings.to_lower(s, l.allocator) {
+	case "failover", "first":
+		dst^ = .Failover
+	case "round_robin", "round-robin", "rr":
+		dst^ = .Round_Robin
+	case "race", "fastest", "prefer_first_answer":
+		dst^ = .Race
+	case:
+		errorf(l, "%s.strategy: unknown strategy %q (want failover, round_robin or race)", path, s)
+	}
+}
+
 @(private)
 load_upstream :: proc(l: ^Loader, cfg: ^Config) {
 	n := yaml.get(l.root, "upstream")
 	if n == nil {
 		return
 	}
-	if s, ok := yaml.as_string(yaml.get(n, "strategy")); ok {
-		switch strings.to_lower(s, l.allocator) {
-		case "failover", "first":
-			cfg.upstream.strategy = .Failover
-		case "round_robin", "round-robin", "rr":
-			cfg.upstream.strategy = .Round_Robin
-		case "race", "fastest", "prefer_first_answer":
-			cfg.upstream.strategy = .Race
-		case:
-			errorf(l, "upstream.strategy: unknown strategy %q (want failover, round_robin or race)", s)
-		}
-	}
+	load_strategy(l, n, &cfg.upstream.strategy, "upstream")
 	opt_duration(l, n, "timeout", &cfg.upstream.timeout, "upstream")
 	opt_int(l, n, "attempts", &cfg.upstream.attempts, "upstream")
 	opt_int(l, n, "max_idle", &cfg.upstream.max_idle, "upstream")
@@ -331,31 +341,456 @@ load_upstream :: proc(l: ^Loader, cfg: ^Config) {
 		}
 	}
 
-	servers := yaml.items(yaml.get(n, "servers"))
-	if len(servers) == 0 {
+	if servers := yaml.items(yaml.get(n, "servers")); len(servers) > 0 {
+		out := make([dynamic]Upstream_Spec, 0, len(servers), l.allocator)
+		for sn, i in servers {
+			spec, ok := load_upstream_spec(l, sn, fmt.tprintf("upstream.servers[%d]", i), cfg.upstream.bootstrap)
+			if ok {
+				append(&out, spec)
+			}
+		}
+		cfg.upstream.servers = out[:]
+	}
+
+	load_upstream_zones(l, cfg, n)
+}
+
+/*
+Read `upstream.zones`: the per-domain routes.
+
+Each entry is a whole upstream configuration in its own right - its own
+servers, and its own strategy, timeout, attempts and connection reuse - so it
+begins as a copy of the defaults read above and overrides whatever it names.
+`bootstrap` is inherited along with the rest: a route that names a DoT server
+by hostname needs one exactly as the default group does, and an operator who
+wrote one at the top of the section meant it for the file.
+
+Two fields are dropped from that copy rather than inherited. `servers` is the
+one thing a route has to state for itself, and inheriting it would turn a route
+that forgot to name any into one silently pointing at the public upstream -
+which is the leak the route was written to stop. `zones` is dropped because
+routes do not nest; a `zones` key inside a route is refused below rather than
+read and ignored.
+
+Read after `servers` so the section can be written in either order and mean the
+same thing, and so a route inherits the timeout an operator set beside it
+rather than the built-in default.
+*/
+@(private)
+load_upstream_zones :: proc(l: ^Loader, cfg: ^Config, n: ^yaml.Node) {
+	zn := yaml.get(n, "zones")
+	if yaml.is_null(zn) {
 		return
 	}
-	out := make([dynamic]Upstream_Spec, 0, len(servers), l.allocator)
-	for sn, i in servers {
-		spec, ok := load_upstream_spec(l, sn, i, cfg.upstream.bootstrap)
-		if ok {
-			append(&out, spec)
+	// On the node's own kind rather than on whether `items` came back empty: an
+	// explicit `zones: []` is a list with nothing in it, which is a file saying
+	// there are no routes, and a mapping written where a list belongs is a
+	// mistake. The two must not produce the same answer.
+	if zn.kind != .Sequence {
+		errorf(l, "upstream.zones: expected a list of routes, each with domains and servers")
+		return
+	}
+	entries := yaml.items(zn)
+
+	routes := make([dynamic]Zone_Route, 0, len(entries), l.allocator)
+	/*
+	Which route claimed a domain first. Two routes naming the same zone is not
+	a longest-match question - they are the same length - so the answer would
+	be whichever the file happened to list first, and the other would sit there
+	looking configured while nothing ever reached it. Refused by name instead.
+	*/
+	claimed := make(map[string]int, l.allocator)
+	defer delete(claimed)
+
+	for entry, i in entries {
+		path := fmt.tprintf("upstream.zones[%d]", i)
+		if entry == nil || entry.kind != .Mapping {
+			errorf(l, "%s: expected a mapping with domains and servers", path)
+			continue
+		}
+		if !yaml.is_null(yaml.get(entry, "zones")) {
+			errorf(l, "%s.zones: routes do not nest; write another entry in upstream.zones instead", path)
+			continue
+		}
+
+		route: Zone_Route
+		route.upstream = cfg.upstream
+		route.upstream.servers = nil
+		route.upstream.zones = nil
+
+		load_strategy(l, entry, &route.upstream.strategy, path)
+		opt_duration(l, entry, "timeout", &route.upstream.timeout, path)
+		opt_int(l, entry, "attempts", &route.upstream.attempts, path)
+		opt_int(l, entry, "max_idle", &route.upstream.max_idle, path)
+		opt_duration(l, entry, "idle_timeout", &route.upstream.idle_timeout, path)
+		if b := yaml.get(entry, "bootstrap"); !yaml.is_null(b) {
+			if list, ok := yaml.as_string_list(b, l.allocator); ok {
+				route.upstream.bootstrap = list
+			} else {
+				errorf(l, "%s.bootstrap: expected a list of addresses", path)
+			}
+		}
+
+		route.domains = load_route_domains(l, entry, path, i, &claimed)
+
+		if servers := yaml.items(yaml.get(entry, "servers")); len(servers) > 0 {
+			out := make([dynamic]Upstream_Spec, 0, len(servers), l.allocator)
+			for sn, j in servers {
+				spec, ok := load_upstream_spec(
+					l,
+					sn,
+					fmt.tprintf("%s.servers[%d]", path, j),
+					route.upstream.bootstrap,
+				)
+				if ok {
+					append(&out, spec)
+				}
+			}
+			route.upstream.servers = out[:]
+		}
+
+		append(&routes, route)
+	}
+	cfg.upstream.zones = routes[:]
+}
+
+/*
+One entry of a zone list, canonicalised and held to the three refusals.
+
+`rebind.allow_domains` and every `upstream.zones[].domains` take a list of the
+same thing - a plain zone name, covering itself and everything below it - and
+refuse the same three ways of writing one that matches nothing a client can ask
+for. An operator arrives with `*.corp.example` from the `rewrites` section, or
+`.corp.example` from `no_proxy`, or with the root; kept as written, each would
+sit in the file looking like the fix while nothing about the deployment changed.
+
+The failures the two lists are guarding are different - there an exemption that
+never fires and every internal name still answering NODATA, here a zone that
+goes on being resolved by the public upstream - and the root is the one refusal
+whose wording has to say which, so it comes in as `root_reason`. The other two
+name only the entry and what to write instead, which is the same sentence
+either way. `path` is the list without its index: `rebind.allow_domains`, or
+`upstream.zones[0].domains`.
+*/
+@(private)
+canonical_zone_entry :: proc(
+	l: ^Loader,
+	written: string,
+	path: string,
+	index: int,
+	root_reason: string,
+) -> (
+	domain: string,
+	ok: bool,
+) {
+	domain = canonical_domain(written, l.allocator)
+
+	/*
+	`rewrites` further down does take a `*.` prefix, so an operator who has
+	written one there writes one here too, and `canonical_domain` keeps the
+	star. Neither of these lists has a use for one - an entry already covers
+	everything below itself - so `*.corp.example.` would sit in it matching
+	nothing any client can ask for, with no line anywhere saying why.
+
+	`zone` is what the entry meant; a bare `*` leaves nothing of it and is the
+	root, which the next check refuses for what it is.
+	*/
+	wildcard := strings.has_prefix(domain, "*.")
+	zone := domain
+	if wildcard {
+		zone = domain[2:]
+		if zone == "" {
+			zone = "."
 		}
 	}
-	cfg.upstream.servers = out[:]
+
+	// The root is always the whole setting written in a way nothing about the
+	// file admits to, and there is always a plainer way to say that; what it is
+	// differs per list, so the caller says.
+	if zone == "." {
+		errorf(l, "%s[%d]: %q %s", path, index, written, root_reason)
+		return "", false
+	}
+	/*
+	Named rather than quietly stripped: `*.corp.example` means "below" in the
+	section that does take it and these lists mean "at or below", so obeying it
+	would widen what was written past what it says.
+	*/
+	if wildcard {
+		errorf(
+			l,
+			"%s[%d]: %q takes no wildcard; write %q, which already covers everything below it",
+			path,
+			index,
+			written,
+			strings.trim_suffix(zone, "."),
+		)
+		return "", false
+	}
+	/*
+	An empty label - a leading dot, or two of them in a row - is the other way to
+	write an entry that matches nothing, and `.corp.example` is a form operators
+	arrive with because `no_proxy` takes it and means by it what these lists
+	write plain.
+	*/
+	if strings.has_prefix(zone, ".") || strings.contains(zone, "..") {
+		errorf(
+			l,
+			"%s[%d]: %q has an empty label; write the zone as a plain name, such as corp.example",
+			path,
+			index,
+			written,
+		)
+		return "", false
+	}
+	return domain, true
+}
+
+/*
+The `domains` of one route, canonicalised and checked.
+
+The three refusals are `canonical_zone_entry`'s, shared with
+`rebind.allow_domains`; the fourth is this list's own, since two routes claiming
+one zone is not a question the other list can be asked.
+*/
+@(private)
+load_route_domains :: proc(
+	l: ^Loader,
+	entry: ^yaml.Node,
+	path: string,
+	index: int,
+	claimed: ^map[string]int,
+) -> []string {
+	d := yaml.get(entry, "domains")
+	if yaml.is_null(d) {
+		errorf(l, "%s.domains: a route has to say which names it takes, such as [corp.example]", path)
+		return nil
+	}
+	list, ok := yaml.as_string_list(d, l.allocator)
+	if !ok {
+		errorf(l, "%s.domains: expected a list of domains, such as [corp.example]", path)
+		return nil
+	}
+	if len(list) == 0 {
+		errorf(l, "%s.domains: a route has to say which names it takes, such as [corp.example]", path)
+		return nil
+	}
+
+	// The root would route every name there is, which is `upstream.servers`
+	// written in a way nothing about the file makes obvious - and it would take
+	// the DNSSEC bypass and the rebinding exemption a route implies with it,
+	// across the whole name space.
+	ROOT :: "routes every name; put those servers in upstream.servers if that is what you mean"
+
+	domains_path := fmt.tprintf("%s.domains", path)
+	out := make([]string, len(list), l.allocator)
+	kept := 0
+	for written, j in list {
+		domain, good := canonical_zone_entry(l, written, domains_path, j, ROOT)
+		if !good {
+			continue
+		}
+		if first, seen := claimed[domain]; seen {
+			// Two spellings of one zone in one route - `corp.example` and
+			// `CORP.example.` - is the same refusal, but "already routed by
+			// upstream.zones[0]" read while looking at upstream.zones[0] names
+			// the entry as its own culprit, which sends an operator looking for
+			// a second route that is not there.
+			if first == index {
+				errorf(
+					l,
+					"%s[%d]: %q is already listed in this route; one zone goes in one place",
+					domains_path,
+					j,
+					written,
+				)
+			} else {
+				errorf(
+					l,
+					"%s[%d]: %q is already routed by upstream.zones[%d]; one zone goes to one place",
+					domains_path,
+					j,
+					written,
+					first,
+				)
+			}
+			continue
+		}
+		claimed[domain] = index
+
+		out[kept] = domain
+		kept += 1
+	}
+	return out[:kept]
+}
+
+/*
+Whether `name` is `zone` or sits under it, both already canonical.
+
+The resolver's own `name_at_or_below` folds case because the names reaching it
+are whatever the client spelled. Nothing here is: both sides have been through
+`canonical_domain` or are written lowercase in this file, so the comparison is
+bytes and the fold would only hide a name that failed to be canonicalised.
+*/
+@(private)
+domain_at_or_below :: proc(name, zone: string) -> bool {
+	if len(name) < len(zone) {
+		return false
+	}
+	if len(name) == len(zone) {
+		return name == zone
+	}
+	// The zone has to begin right after a label break, or it is a bare string
+	// suffix of some other name rather than a subtree of it.
+	if name[len(name) - len(zone) - 1] != '.' {
+		return false
+	}
+	return name[len(name) - len(zone):] == zone
+}
+
+/*
+A route into a zone the special-use table already answers never fires.
+
+`special_use_zone` runs in `resolve_query` before anything is forwarded, so a
+name inside an enabled entry is answered from the table and the route below it
+is never consulted. Written together they are the exact mistake the rest of this
+section is shaped against: a route sitting in the file looking like the fix
+while the names it claims go on being answered somewhere else - and the one that
+costs the most is `home.arpa`, since an operator who turned the key on to stop
+the leak and then added the route to send the names to their router keeps the
+key's NXDOMAIN and never sees the router.
+
+Refused by name, the way `special_use.local` without `special_use.enabled` is,
+rather than left to be discovered from the outside.
+
+`resolver.arpa.` is the same refusal with no key attached, and so is checked
+first and outside the guard below. See `server.is_resolver_arpa`.
+*/
+@(private)
+check_route_reachable :: proc(l: ^Loader, cfg: ^Config, route: Zone_Route) {
+	/*
+	The DDR zone, which no configuration can bring within reach of a route.
+
+	`is_resolver_arpa` runs in `resolve_query` ahead of the special-use table
+	and ahead of everything that forwards, and no key turns it off - RFC 9462
+	has the resolver answer for its own designation rather than fetch somebody
+	else's. So a route here is the same trap as one under an enabled key, minus
+	the key: there is nothing to turn off, and nothing to say about the route
+	but that it will never fire.
+	*/
+	for domain in route.domains {
+		if domain_at_or_below(domain, "resolver.arpa.") {
+			errorf(
+				l,
+				"upstream.zones: the route for %s would never be used: this server answers resolver.arpa. itself, for DDR (RFC 9462), before a query is forwarded",
+				domain,
+			)
+		}
+	}
+
+	if !cfg.special_use.enabled {
+		return
+	}
+	Shadow :: struct {
+		zone:   string,
+		on:     bool,
+		reason: string,
+	}
+	/*
+	A copy of `server.special_use_zone`'s own list, and it has to stay one.
+
+	This package cannot import `server` - `server` imports this one - so the
+	zones are written out again here rather than read from the single place that
+	decides them. A key added there and not here does not break anything loudly:
+	it leaves a route under the new zone loading cleanly and then never firing,
+	which is the exact failure this check exists to catch. Add the entry in both.
+
+	`localhost.` and `invalid.` have no key of their own: with the table on at
+	all they are answered there, which is what RFC 6761 asks for.
+	*/
+	table := [?]Shadow {
+		{"localhost.", true, "special_use.enabled answers localhost. here (RFC 6761)"},
+		{"invalid.", true, "special_use.enabled answers invalid. here (RFC 6761)"},
+		{"onion.", cfg.special_use.onion, "special_use.onion answers onion. here"},
+		{"local.", cfg.special_use.local, "special_use.local answers local. here"},
+		{"test.", cfg.special_use.test, "special_use.test answers test. here"},
+		{"home.arpa.", cfg.special_use.home_arpa, "special_use.home_arpa answers home.arpa. here"},
+	}
+	for domain in route.domains {
+		for entry in table {
+			if !entry.on || !domain_at_or_below(domain, entry.zone) {
+				continue
+			}
+			errorf(
+				l,
+				"upstream.zones: the route for %s would never be used: %s, before a query is forwarded; turn that key off to route the zone instead",
+				domain,
+				entry.reason,
+			)
+		}
+	}
+}
+
+/*
+Whether every name a route claims is already covered by a trust anchor.
+
+A route serves its zone insecure by default, and that is the first of the two
+things `--check` says a route gives up - but `covered_by_local_anchor` in the
+server stands the bypass down for a name an anchor covers, so a site that signed
+its own zone and anchored it gives up no validation at all by routing it. Saying
+otherwise would be the warning being wrong at exactly the configuration that was
+most careful, which is worse than not printing it.
+
+Every domain rather than any: the warning is one line about the whole route, and
+a route claiming an anchored zone alongside an unanchored one still serves the
+second insecure.
+
+The root anchor does not count, which is `start_validator` leaving it out of
+`anchor_zones`: it covers every name and can validate none of the zones the
+bypass exists for. Neither does an anchor that will not parse - `validate`
+refuses the file over one of those, so no operator ever sees what this answered
+for such a file.
+
+Read by `main` for the `--check` line and nothing else, so the parse is scratch:
+the anchors it builds are thrown at the temporary allocator rather than freed
+one by one, the caller's own line being built there too.
+*/
+route_is_anchored :: proc(cfg: ^Config, route: Zone_Route) -> bool {
+	if !cfg.dnssec.enabled || len(cfg.dnssec.trust_anchors) == 0 || len(route.domains) == 0 {
+		return false
+	}
+	for domain in route.domains {
+		covered := false
+		for line in cfg.dnssec.trust_anchors {
+			anchor, ok := dnssec.parse_trust_anchor(line, context.temp_allocator)
+			if !ok || anchor.zone == "." {
+				continue
+			}
+			// Both sides canonical: `canonical_domain` made the route's, and
+			// `parse_trust_anchor` runs the anchor's through
+			// `dns.name_canonical`.
+			if domain_at_or_below(domain, anchor.zone) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			return false
+		}
+	}
+	return true
 }
 
 @(private)
 load_upstream_spec :: proc(
 	l: ^Loader,
 	n: ^yaml.Node,
-	index: int,
+	path: string,
 	default_bootstrap: []string,
 ) -> (
 	spec: Upstream_Spec,
 	ok: bool,
 ) {
-	path := fmt.tprintf("upstream.servers[%d]", index)
 	spec.verify = true
 	spec.bootstrap = default_bootstrap
 
@@ -765,81 +1200,22 @@ load_rebind :: proc(l: ^Loader, cfg: ^Config) {
 			errorf(l, "rebind.allow_domains: expected a list of domains, such as [home.example]")
 			return
 		}
+		/*
+		The root would exempt every name there is, which is `rebind.enabled:
+		false` written in a way nothing about the file makes obvious. Refused
+		rather than obeyed, on the same reasoning that `allow_from:` with no
+		value is refused: the two readings are a setting and its opposite.
+		*/
+		ROOT :: "exempts every name; set rebind.enabled to false if that is what you mean"
+
 		out := make([]string, len(list), l.allocator)
 		kept := 0
 		for entry, i in list {
-			domain := canonical_domain(entry, l.allocator)
-
-			/*
-			`rewrites` further down does take a `*.` prefix, so an operator who
-			has written one there writes one here too, and `canonical_domain`
-			keeps the star. This list has no use for one - an entry already
-			covers everything below itself - so `*.corp.example.` would sit in
-			it matching nothing any client can ask for, and the symptom of that
-			is every internal name still answering NODATA after the fix was
-			applied, with no line anywhere saying why. That is the one failure
-			this setting exists to prevent, so the star is named here instead of
-			at three in the morning.
-
-			`zone` is what the entry meant; a bare `*` leaves nothing of it and
-			is the root, which the next check refuses for what it is.
-			*/
-			wildcard := strings.has_prefix(domain, "*.")
-			zone := domain
-			if wildcard {
-				zone = domain[2:]
-				if zone == "" {
-					zone = "."
-				}
-			}
-
-			/*
-			The root would exempt every name there is, which is `rebind.enabled:
-			false` written in a way nothing about the file makes obvious. Refused
-			rather than obeyed, on the same reasoning that `allow_from:` with no
-			value is refused: the two readings are a setting and its opposite.
-			*/
-			if zone == "." {
-				errorf(
-					l,
-					"rebind.allow_domains[%d]: %q exempts every name; set rebind.enabled to false if that is what you mean",
-					i,
-					entry,
-				)
-				continue
-			}
-			/*
-			Named rather than quietly stripped: `*.corp.example` means "below"
-			in the section that does take it and this list means "at or below",
-			so obeying it would widen an exemption past what was written.
-			*/
-			if wildcard {
-				errorf(
-					l,
-					"rebind.allow_domains[%d]: %q takes no wildcard; write %q, which already covers everything below it",
-					i,
-					entry,
-					strings.trim_suffix(zone, "."),
-				)
-				continue
-			}
-			/*
-			An empty label - a leading dot, or two of them in a row - is the
-			other way to write an entry that matches nothing, and
-			`.corp.example` is a form operators arrive with because `no_proxy`
-			takes it and means by it what this list writes plain. Kept as
-			written it would sit in the configuration looking like the fix while
-			every internal name went on answering NODATA, which is the failure
-			the wildcard check above exists to prevent; refused for the same
-			reason.
-			*/
-			if strings.has_prefix(zone, ".") || strings.contains(zone, "..") {
-				errorf(
-					l,
-					"rebind.allow_domains[%d]: %q has an empty label; write the zone as a plain name, such as corp.example",
-					i,
-					entry,
-				)
+			// The wildcard and empty-label refusals with it, shared with
+			// `upstream.zones[].domains`, which takes the same shape of list
+			// against the same mistakes. See `canonical_zone_entry`.
+			domain, good := canonical_zone_entry(l, entry, "rebind.allow_domains", i, ROOT)
+			if !good {
 				continue
 			}
 			out[kept] = domain
@@ -1602,16 +1978,57 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 		}
 	}
 
-	for spec in cfg.upstream.servers {
-		needs_resolution := spec.hostname != "" && net.parse_address(spec.address) == nil
-		if needs_resolution && len(spec.bootstrap) == 0 {
-			errorf(
-				l,
-				"upstream server %q uses hostname %q but no bootstrap resolver is configured",
-				spec.name,
-				spec.hostname,
-			)
+	check_bootstrap :: proc(l: ^Loader, specs: []Upstream_Spec) {
+		for spec in specs {
+			needs_resolution := spec.hostname != "" && net.parse_address(spec.address) == nil
+			if needs_resolution && len(spec.bootstrap) == 0 {
+				errorf(
+					l,
+					"upstream server %q uses hostname %q but no bootstrap resolver is configured",
+					spec.name,
+					spec.hostname,
+				)
+			}
 		}
+	}
+	check_bootstrap(l, cfg.upstream.servers)
+
+	/*
+	Each route held to what the default group is held to: servers it can
+	actually reach, and an attempt count that lets it try.
+
+	A route with no usable server is worse than no route at all. The name it
+	claims would fall through to nothing - `make_group` refuses an empty group -
+	so it has to be caught here, where the file can be pointed at, rather than
+	at startup where it reads as "no usable upstream servers" about a resolver
+	whose default upstream is fine.
+	*/
+	/*
+	Named by their zone rather than by their index. An entry the loader refused
+	outright - a route that is not a mapping, or one with a `zones` key of its
+	own - is never appended, so the position of a route in this slice is not its
+	position in the file once anything ahead of it has gone wrong, and an index
+	that points at the wrong route is worse than no index at all.
+	*/
+	for route in cfg.upstream.zones {
+		if len(route.domains) == 0 {
+			// Already reported by the loader, which refused every domain it was
+			// given; a second line saying the route is empty adds nothing.
+			continue
+		}
+		if len(route.upstream.servers) == 0 {
+			errorf(l, "upstream.zones: the route for %s needs at least one server", route.domains[0])
+		}
+		// Only where the route is the one that said so. `attempts` is inherited,
+		// so `upstream.attempts: 0` would otherwise name every route in the file
+		// for a number none of them wrote, beside the one line about the key
+		// that did - and an operator fixing the routes would find the error
+		// still there.
+		if route.upstream.attempts < 1 && cfg.upstream.attempts >= 1 {
+			errorf(l, "upstream.zones: the route for %s needs attempts of at least 1", route.domains[0])
+		}
+		check_bootstrap(l, route.upstream.servers)
+		check_route_reachable(l, cfg, route)
 	}
 
 	// Only when there is a cache to size. A setting left over in a file that

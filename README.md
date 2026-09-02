@@ -7,6 +7,7 @@ Pi-hole and AdGuard Home, minus the web interface. One binary, one YAML file.
 - Hands Apple devices a `.mobileconfig` profile to point themselves at the DoH endpoint
 - Forwards to plain, TCP, DoT and DoH upstreams
 - Three upstream strategies: failover, round-robin and race
+- Per-domain upstreams, so a zone your own network answers goes to the server that answers it and nowhere else (see `upstream.zones`)
 - Sink lists in hosts, plain-domain and adblock syntax, with allowlists
 - Answer cache with negative caching and optional stale serving
 - Response rate limiting per client prefix, on every transport and with a separate budget for datagrams and for connections, on by default (see `server.rate_limit`)
@@ -365,6 +366,117 @@ comes back in a round trip, where a timeout has already spent the query's budget
 and a rejected certificate will not improve on a second look. This covers DoT
 and every HTTPS upstream alike.
 
+#### Per-domain upstreams
+
+If something on your network answers for a zone of its own — a domain controller
+for `corp.example`, a router that answers `home.arpa`, a lab server with an
+internal `.test` — name that zone and where it goes:
+
+```yaml
+upstream:
+  servers: [1.1.1.1, 9.9.9.9]     # everything else
+  zones:
+    - domains: [corp.example]
+      servers: [10.0.0.1]         # the domain controller
+    - domains: [home.arpa]
+      servers: [192.168.1.1]      # the router
+```
+
+Without this the choice is between a public resolver that has never heard of
+your zone and an internal server asked to recurse the whole Internet. This is
+dnsmasq's `server=/corp.example/10.0.0.1`, unbound's `forward-zone`, blocky's
+`conditionalMapping` and AdGuard Home's `[/corp.example/]10.0.0.1`.
+
+A route is a whole upstream in its own right, so it takes anything `upstream`
+itself takes — `strategy`, `timeout`, `attempts`, `max_idle`, `idle_timeout`,
+`bootstrap`, and servers in every form and transport, DoT and DoH included. What
+it does not say, it inherits from the `upstream` block around it, so a timeout
+set once applies to routes as well:
+
+```yaml
+upstream:
+  timeout: 3s
+  servers: [1.1.1.1]
+  zones:
+    - domains: [corp.example, corp.internal]
+      strategy: race
+      servers:
+        - name: dc1
+          type: tls
+          address: 10.0.0.1
+          hostname: dc1.corp.example
+        - 10.0.0.2
+```
+
+`domains` matches on label boundaries: `corp.example` covers `corp.example`
+itself and everything under it, and does not cover `notcorp.example`. Case does
+not matter. The longest matching route wins, so a sub-zone can be sent elsewhere
+without the broader entry being rewritten:
+
+```yaml
+  zones:
+    - domains: [corp.example]
+      servers: [10.0.0.1]
+    - domains: [dev.corp.example]   # wins for names under dev
+      servers: [10.1.0.1]
+```
+
+Two more things follow from a route, both of which would otherwise have to be
+configured separately and both of which break the deployment when they are
+forgotten:
+
+- **The zone is not validated.** A local zone holds unsigned data under a public
+  parent that delegates nothing to it, so walking the public chain for a name
+  inside it finds a missing delegation and calls a perfectly good answer bogus —
+  SERVFAIL for a name that was never public. Routed names are served insecure,
+  without the AD bit, exactly as the RFC 6303 private reverse zones are. A
+  [`trust_anchors`](#dnssec) entry covering the zone stands that bypass down —
+  the names are then validated like any other. Read that as "the bypass is off",
+  not as "the zone now validates": the chain walk starts at the root and descends
+  by `DS`, so it reaches a signed internal zone only if the public tree delegates
+  to it. A zone signed purely internally has no such delegation, and standing the
+  bypass down there turns a working insecure answer into SERVFAIL. Note also that
+  `trust_anchors` *replaces* the built-in root keys rather than adding to them,
+  so a list naming only your own zone leaves the validator with no root anchor
+  and SERVFAILs everything — list the root DS alongside it.
+- **The zone may answer with private addresses.** A route says the zone is
+  answered by a local authority, and answering with local addresses is what a
+  local authority is for, so [rebind protection](#dns-rebinding-protection)
+  exempts a routed zone without it also having to appear in
+  `rebind.allow_domains`.
+
+What does *not* follow a route is the DNSSEC chain walk. The lookups elodin
+makes on its own account — `DS` and `DNSKEY` for the zones above a name — always
+go to `upstream.servers`, because a server authoritative for `corp.example`
+answers `corp.example DS` out of its own zone rather than fetching the signed
+proof from the parent, and that answer breaks a chain instead of completing it.
+
+The answer cache is keyed on the question and not on which upstream produced it,
+which is sound because the routing table is built once at startup and
+configuration is not reloaded. Restart after changing a route.
+
+`--check` says out loud what each route gives up, one line per route, and so
+does the log at startup. Nothing at load can tell an internal zone from a public
+signed one — whether a zone is signed is a question only the DNS answers — so the
+line states the two implications and leaves the judgement to you. It is not
+printed for a check the file has already turned off, nor for the half a
+`trust_anchors` entry over the routed zone takes back.
+
+A route into a zone [`special_use`](#names-that-are-never-forwarded) already
+answers is refused at load. Those names are answered from the table before
+anything is forwarded, so a route under `special_use.home_arpa: true` would sit
+in the file looking like the fix while every `home.arpa` name went on getting the
+table's NXDOMAIN — turn the key off in the same edit that adds the route, which
+is the whole point of the key being off by default.
+
+> **Coming from dnsmasq:** `server=/corp.example/10.0.0.1` in `blocking.rules`
+> does not route that zone — it *blocks* it. That form turns up in downloaded
+> blocklists, where it means a blackhole, so the list parser reads it as one. In
+> `blocking.allow` it does not even do that: the entry is discarded and neither
+> list changes, which looks exactly like the route not working. `--check` warns
+> about either one written by hand. Routing lives under `upstream.zones` and
+> nowhere else.
+
 ### Sink lists
 
 ```yaml
@@ -650,10 +762,11 @@ over the zone turns that off exactly as it does for the reverse zones. Nothing
 under `home.arpa` can be secure in any case, the delegation having no DS by
 design, so there is no chain being given up.
 
-The query is still forwarded by default: elodin has no per-domain upstream to
-send it to a local authority instead, so a network with nothing answering for
-`home.arpa` gets NXDOMAIN from wherever `upstream.servers` points, having told it
-what was being looked for on the way. If nothing here serves the zone,
+The query is still forwarded to `upstream.servers` by default, so a network with
+nothing answering for `home.arpa` gets NXDOMAIN from wherever that points, having
+told it what was being looked for on the way. If a router here does answer the
+zone, [`upstream.zones`](#per-domain-upstreams) sends those names to it instead
+and they stop leaving the building. If nothing here serves the zone,
 [`special_use.home_arpa`](#names-that-are-never-forwarded) answers those names
 from the table instead and they stop leaving — it is off by default because the
 network whose router *does* answer them needs them forwarded. Either way the
@@ -662,8 +775,8 @@ rather than invented, and either way this bypass is what keeps the answer to it
 from being held to a chain that cannot be walked from here. One thing to know
 if you run the zone: its answers carry private addresses, which
 [rebind protection](#dns-rebinding-protection) filters unless `home.arpa` is
-named in `rebind.allow_domains`. The reverse zones never trip that guard, a PTR
-not being an address.
+routed under `upstream.zones` or named in `rebind.allow_domains`. The reverse
+zones never trip that guard, a PTR not being an address.
 
 Queries for `resolver.arpa` are answered here rather than forwarded. That name
 is where a client looks for the encrypted endpoints of the resolver it is
@@ -1257,6 +1370,12 @@ below, which `--check` reads.
     allow_domains: [corp.example, home.arpa]
   ```
 
+  A zone with a route under [`upstream.zones`](#per-domain-upstreams) needs no
+  entry here: the route already says that zone is answered locally, and the
+  exemption follows from it. `allow_domains` is for the site whose *default*
+  upstream is the internal server, where there is no per-zone route to read that
+  fact off.
+
   Each entry covers itself and everything below it, the way
   `--rebind-domain-ok=/corp.example/` does in dnsmasq — so write the zone rather
   than a wildcard, and a `*.corp.example` copied from [`rewrites`](#rewrites) is
@@ -1536,9 +1655,9 @@ answer, and it is worth turning on if no router here answers `home.arpa`. Those
 names are your own network's — the printer, the NAS — and forwarded they name
 your hardware to a public resolver in exchange for the blackhole servers'
 NXDOMAIN. RFC 8375 section 3 says not to send them. What it does *not* do is
-send them to your router instead: that needs a per-domain upstream, which elodin
-does not have, and is why the key cannot simply default on for the networks
-whose router does answer the zone.
+send them to your router instead — that is
+[`upstream.zones`](#per-domain-upstreams), which is what a network whose router
+*does* answer the zone wants, and is why this key cannot simply default on.
 
 `home.arpa` is answered as an empty zone rather than as a name that does not
 exist, which is what RFC 8375 section 4 asks for and what the blackhole servers
@@ -1565,9 +1684,10 @@ turns it into an answer.
 
 A rewrite outranks all of this, since `rewrites` are matched first: a site that
 knows what its own `.local` names resolve to can say so and keep that answer.
-What a rewrite cannot do is send the query somewhere — there is no per-domain
-upstream here — so a network whose router answers `.local` dynamically wants
-`local: false`, which is the default.
+What a rewrite cannot do is send the query somewhere — a network whose router
+answers `.local` dynamically wants a route under
+[`upstream.zones`](#per-domain-upstreams) pointed at it, alongside the
+`local: false` that is already the default.
 
 There is one upstream for which `.onion` really is the right question to ask: a
 local `tor` with `DNSPort` and `AutomapHostsOnResolve`, which answers those names
@@ -1930,7 +2050,7 @@ ts=… level=info msg=sizing workers=16 upstream_workers=8 max_pending=128 origi
 
 ```console
 $ elodin --check
-/etc/elodin/elodin.yaml is valid: 2 upstreams, 4 blocklists, 0 rewrites
+/etc/elodin/elodin.yaml is valid: 2 upstreams, 0 zone routes, 4 blocklists, 0 rewrites
   workers=16 upstream_workers=8 max_pending=128 (derived from 4 usable CPUs and 7.7 GiB)
   answering queries from 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, ::1/128, fc00::/7, fe80::/10; every other source is refused
 ```
@@ -2183,6 +2303,7 @@ What it covers:
 | rate limiting | a flood from one source answered in full with the limiter off and cut to the budget with it on, truncated answers over the budget, the bytes one address can be made to receive compared between the two, the same flood pipelined down one TCP connection cut to its budget with nothing truncated, and a TCP client still answered after a datagram flood has spent the prefix's UDP budget |
 | cache | hits avoid the upstream, TTL countdown, cross-transport reuse, question re-casing, negative caching, key separation by type |
 | upstreams | failover, round-robin, race, health cooldown, TCP and DoT clients, connection pooling, UDP→TCP retry, total outage → SERVFAIL |
+| per-domain upstreams | a routed name is answered by its own upstream and never reaches the public one, the zone apex follows the route, everything else still goes to `upstream.servers`, a bare suffix match is not routed, an operator anchor over a routed zone puts validation back, and the longest of two nested routes wins |
 | blocklist downloads | two lists fetched over HTTP and both applied, written to the cache directory, reused on restart without re-fetching, unwritable cache directory degrades to a warning |
 | DNSSEC | an answer with no chain of trust is refused rather than served, the forwarded query carries DO and CD, a CD client is served unvalidated, the refusal carries an extended DNS error, and none of it happens unless it is configured |
 | reserved names | `localhost.` resolves to loopback in both families and is NODATA for a type it has none of, `.onion` and `.invalid` are NXDOMAIN with an SOA at the reserved apex, none of it reaches the upstream, `.local` / `.test` / `home.arpa` are forwarded by default, `local: true` answers `.local` and nothing else, `home_arpa: true` serves the zone empty while the apex `DS` is still fetched, `onion: false` hands `.onion` upstream on its own, and the answers are counted on the metrics endpoint |
