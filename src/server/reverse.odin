@@ -254,7 +254,7 @@ rewrite_naming_address :: proc(
 	ttl: u32,
 	found: bool,
 ) {
-	for r, i in rules {
+	for r in rules {
 		if r.wildcard || !r.ptr {
 			continue
 		}
@@ -262,31 +262,62 @@ rewrite_naming_address :: proc(
 			continue
 		}
 		/*
-		What `r.domain` actually resolves to is whatever rule wins that name,
-		which is `r` itself unless something above shadows it - and everything
-		about the answer comes from there: whether it is this address, whether
-		the rule that gives it out allows a reverse, and the TTL, so that a
-		client is told the two directions expire together because they do.
+		Whether `r.domain` really does resolve to this address, asked of the
+		rules the way `apply_rewrite` asks them - `answering_rule` below walks
+		the same search, so the reverse cannot claim a name whose forward answer
+		is something else.
 
-		`ptr: false` on the winner settles it even though the shadowed rule said
-		nothing, and that is the only reading that holds: the PTR asserts what
-		this address is called, an assertion whose truth is in the answer the
-		winner gives, so it is the winner's opt-out that is about this address.
+		Everything about the answer comes from the rule that gives it: whether
+		it allows a reverse at all, and the TTL, so a client is told the two
+		directions expire together because they do.
 		*/
-		winner, has_winner := find_rewrite_index(rules, r.domain)
-		if !has_winner {
-			// Unreachable: a non-wildcard rule matches its own domain, that
-			// being `name_equal_fold` of a string with itself. Guarded rather
-			// than indexed on the `0` sentinel, which would quietly read the
-			// first rule instead if the search ever grew a filter.
+		answering, has_answer := answering_rule(rules, r.domain, want)
+		if !has_answer || !rules[answering].ptr {
 			continue
 		}
-		if winner != i && (!rules[winner].ptr || !rule_hands_out(rules[winner], want)) {
-			continue
-		}
-		return r.domain, rules[winner].ttl, true
+		return r.domain, rules[answering].ttl, true
 	}
 	return "", 0, false
+}
+
+/*
+The rule that answers an address query for `name` with `want`, if one does.
+
+This is `apply_rewrite`'s search written for one question, and it has to stay
+that search: a PTR asserts what an address is called, and the assertion is only
+true if asking that name for its address really does come back with this
+address.
+
+Three ways a rule ends the walk. It hands out `want`, and the assertion holds.
+It claims the name without handing out `want` - an address of its own, an alias,
+`block` - and the name resolves to something else, or to nothing. Or there are
+no more matching rules, and the name is the upstream's business. A rule that
+claims nothing and holds no address of this family answers a different question
+entirely, so the walk goes past it exactly as the forward direction does.
+*/
+@(private)
+answering_rule :: proc(
+	rules: []config.Rewrite,
+	name: string,
+	want: config.Rewrite_Answer,
+) -> (
+	index: int,
+	found: bool,
+) {
+	from := 0
+	for {
+		i, matched := find_rewrite_index(rules, name, from)
+		if !matched {
+			return 0, false
+		}
+		if rule_hands_out(rules[i], want) {
+			return i, true
+		}
+		if rule_claims_name(rules[i]) {
+			return 0, false
+		}
+		from = i + 1
+	}
 }
 
 // Whether `r` gives out `want` to a client that asks for its name: it lists the
