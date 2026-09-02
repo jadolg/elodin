@@ -213,6 +213,103 @@ test_rewrite_records_answer_any :: proc(t: ^testing.T) {
 }
 
 /*
+A rule that only adds records to a name leaves the rest of the name alone.
+
+This is the difference between the kinds this commit adds and the ones that were
+here before. An address, an alias and the sink each answer "what is this name",
+so a rule holding one of them may say NODATA for the types it has no record of.
+An `MX` does not: the ordinary reason to write one is a domain whose address is
+somebody else's business, and `example.com` with two MX records is still a real
+website. NODATA for its `A` would take that website away from every client
+behind this server, with an SOA on the answer so they remembered it.
+
+`Refused` is what falling through looks like in a test with no upstream and
+RD=0, and it is the whole of the assertion: the rule declined to answer and the
+query went on down the pipeline.
+*/
+@(test)
+test_a_record_only_rule_leaves_other_types_alone :: proc(t: ^testing.T) {
+	rules := make([]config.Rewrite, 1, context.temp_allocator)
+	rules[0] = config.Rewrite {
+		domain  = "example.com.",
+		answers = answers_of(
+			{kind = .MX, preference = 10, name = "mail.example.com."},
+			{kind = .TXT, strings = strings_of("v=spf1 -all")},
+		),
+		ttl     = 300,
+		ptr     = true,
+	}
+
+	_, forwarded, _ := ask(rules, "example.com.", .A)
+	testing.expect_value(t, forwarded, Outcome.Refused)
+
+	// The types it does hold are still answered here.
+	resp, answered, ok := ask(rules, "example.com.", .MX)
+	if testing.expect(t, ok, "the MX query went unanswered") {
+		testing.expect_value(t, answered, Outcome.Rewritten)
+		testing.expect_value(t, len(resp.answer), 1)
+	}
+
+	free_all(context.temp_allocator)
+}
+
+/*
+The other side of it: one address in the rule and the old reading is back.
+
+That is the line, and it is deliberate - an operator who wants the name wholly
+answered here writes down where it points, which is what they were always
+writing before these kinds existed.
+*/
+@(test)
+test_an_address_in_the_rule_still_claims_the_whole_name :: proc(t: ^testing.T) {
+	rules := make([]config.Rewrite, 1, context.temp_allocator)
+	rules[0] = config.Rewrite {
+		domain  = "example.com.",
+		answers = answers_of(
+			{kind = .MX, preference = 10, name = "mail.example.com."},
+			{kind = .A, v4 = {192, 0, 2, 10}},
+		),
+		ttl     = 300,
+		ptr     = true,
+	}
+
+	resp, outcome, ok := ask(rules, "example.com.", .AAAA)
+	if !testing.expect(t, ok, "the AAAA query went unanswered") {
+		return
+	}
+	testing.expect_value(t, outcome, Outcome.Rewritten)
+	testing.expect_value(t, resp.flags.rcode, u8(dns.Rcode.No_Error))
+	testing.expect_value(t, len(resp.answer), 0)
+	testing.expect_value(t, len(resp.authority), 1)
+
+	// A CNAME or `block` says the same thing about the name, so each of them
+	// claims it too.
+	claiming_kinds := [?]config.Rewrite_Kind{.CNAME, .Block}
+	for kind in claiming_kinds {
+		claimed := make([]config.Rewrite, 1, context.temp_allocator)
+		claimed[0] = config.Rewrite {
+			domain  = "other.example.",
+			answers = answers_of(
+				{kind = .TXT, strings = strings_of("x")},
+				{kind = kind, name = "elsewhere.example."},
+			),
+			ttl     = 300,
+			ptr     = true,
+		}
+		_, claimed_outcome, _ := ask(claimed, "other.example.", .AAAA)
+		testing.expectf(
+			t,
+			claimed_outcome == .Rewritten,
+			"a rule with %v should answer for the whole name, got %v",
+			kind,
+			claimed_outcome,
+		)
+	}
+
+	free_all(context.temp_allocator)
+}
+
+/*
 A rule with an MX and nothing else claims no address, so it supplies no reverse
 either - the PTR synthesis reads addresses out of `answers`, and there is none
 here to read.

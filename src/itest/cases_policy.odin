@@ -482,12 +482,32 @@ rewrites:
 	}
 	end_case(r)
 
-	start_case(r, "rewrite: a record rule is NODATA for the types it has none of")
+	start_case(r, "rewrite: a record-only rule leaves the other types to the upstream")
 	{
-		// The upstream would have synthesised an A for this name, so an empty
-		// answer is the proof the rule answered rather than the query leaving.
+		// mail.example.org has MX and TXT records here and no address, which is
+		// the ordinary shape: a domain whose mail this operator directs and
+		// whose website is somebody else's. Answering its A out of the rule
+		// would take that website away from every client behind this server.
 		mock_reset_counts(mock)
 		res := query_udp(udp_port, build_query("mail.example.org.", u16(dns.Type.A)))
+		if check(r, res.ok, "no response") {
+			addrs := answer_addresses(res.wire)
+			if check(r, len(addrs) == 1, "expected the upstream answer, got %d records", len(addrs)) {
+				check_eq_str(r, addrs[0], "203.0.113.1", "answer source")
+			}
+			check(r, mock_total(mock) >= 1, "the query should have been forwarded")
+		}
+	}
+	end_case(r)
+
+	start_case(r, "rewrite: an address in the rule still claims the whole name")
+	{
+		// The other side of the line: nas.home has an address, so the rule
+		// speaks for the name and a type it has no record of is NODATA rather
+		// than a question for the upstream. Same assertion as the MX case
+		// further up, made here against the rule that has both kinds in play.
+		mock_reset_counts(mock)
+		res := query_udp(udp_port, build_query("nas.home.", u16(dns.Type.SRV)))
 		if check(r, res.ok, "no response") {
 			h, _ := parse_header(res.wire)
 			check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)

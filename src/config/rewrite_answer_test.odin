@@ -255,6 +255,122 @@ test_rewrite_typed_answers_are_checked :: proc(t: ^testing.T) {
 }
 
 /*
+A type this does not answer, and a type that does not exist, are both errors
+rather than a CNAME to a name with a space in it.
+
+`PTR nas.home` is the plausible one - the reverse synthesis is documented right
+beside this - and without the check it became an alias to the name
+`ptr nas.home`, which `encode_name` puts on the wire quite happily, so every
+client asking that name got it, whatever type they asked for. A typo has the
+same non-reading and so gets the same refusal.
+*/
+@(test)
+test_rewrite_unknown_type_token_is_refused :: proc(t: ^testing.T) {
+	answers := [?]string {
+		`["PTR nas.home"]`,
+		`["NS ns1.internal"]`,
+		`["CAA 0 issue letsencrypt.org"]`,
+		`["HTTPS 1 . alpn=h2"]`,
+		`["MXX 10 mail.example.com"]`,
+		// No type at all, several fields: the shape that has always become a
+		// nonsense CNAME.
+		`["some random text"]`,
+	}
+	for a in answers {
+		msg := error_from(a)
+		if testing.expectf(t, msg != "", "%s was accepted", a) {
+			testing.expectf(
+				t,
+				strings.contains(msg, "record type"),
+				"%s: message %q should say a type comes first",
+				a,
+				msg,
+			)
+		}
+	}
+
+	// And the six it does answer are still answered, so the refusal is about the
+	// token rather than about anything having a space in it.
+	rules := rules_from(t, `["MX 10 mail.example.com"]`)
+	testing.expect(t, len(rules) == 1 && len(rules[0].answers) == 1, "MX should still parse")
+
+	free_all(context.temp_allocator)
+}
+
+/*
+`block` and `deny` fold case like the type tokens beside them.
+
+`Block` read as a name is a CNAME to the host `block`, which is not merely
+different from what was asked for but the opposite of it: the name resolves
+instead of being sunk.
+*/
+@(test)
+test_rewrite_block_folds_case :: proc(t: ^testing.T) {
+	spellings := [?]string{"block", "Block", "BLOCK", "deny", "DENY"}
+	for s in spellings {
+		rules := rules_from(t, strings.concatenate({"[", s, "]"}, context.temp_allocator))
+		if testing.expectf(t, len(rules) == 1 && len(rules[0].answers) == 1, "%s: expected one answer", s) {
+			testing.expectf(
+				t,
+				rules[0].answers[0].kind == .Block,
+				"%s should sink the name, got %v",
+				s,
+				rules[0].answers[0].kind,
+			)
+		}
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+A name the wire cannot carry is a startup error, not a rule that quietly does
+nothing.
+
+What made this worth a check at load time is where the failure went: the record
+fails to encode at query time, `apply_rewrite` gives up, and the query carries
+on to the upstream - so the internal name the rule was written for leaves the
+building and the public answer comes back, with nothing logged. A 64-byte label
+and a name over 255 bytes are the two ways to write one.
+*/
+@(test)
+test_rewrite_names_must_fit_on_the_wire :: proc(t: ^testing.T) {
+	long_label := strings.concatenate(
+		{strings.repeat("a", 64, context.temp_allocator), ".example.com"},
+		context.temp_allocator,
+	)
+	deep := strings.repeat("abcdefghij.", 26, context.temp_allocator)
+
+	answers := [?]string {
+		strings.concatenate({`["MX 10 `, long_label, `"]`}, context.temp_allocator),
+		strings.concatenate({`["SRV 0 5 5060 `, long_label, `"]`}, context.temp_allocator),
+		strings.concatenate({`["CNAME `, long_label, `"]`}, context.temp_allocator),
+		strings.concatenate({`[`, long_label, `]`}, context.temp_allocator),
+		strings.concatenate({`["MX 10 `, deep, `"]`}, context.temp_allocator),
+	}
+	for a in answers {
+		msg := error_from(a)
+		if testing.expectf(t, msg != "", "an unencodable name was accepted: %s", a) {
+			testing.expectf(
+				t,
+				strings.contains(msg, "cannot be put on the wire"),
+				"message %q should say the name cannot be sent",
+				msg,
+			)
+		}
+	}
+
+	// 63 bytes is the label limit, so one of exactly that is fine.
+	ok_label := strings.concatenate(
+		{strings.repeat("a", 63, context.temp_allocator), ".example.com"},
+		context.temp_allocator,
+	)
+	rules := rules_from(t, strings.concatenate({`["MX 10 `, ok_label, `"]`}, context.temp_allocator))
+	testing.expect(t, len(rules) == 1 && len(rules[0].answers) == 1, "a 63-byte label should parse")
+
+	free_all(context.temp_allocator)
+}
+
+/*
 The 255-byte limit on one <character-string>, which is the length octet in front
 of it and not a policy of this file's.
 

@@ -411,10 +411,16 @@ rebind:
 #   - domain: _sip._tcp.example.com
 #     answer: "SRV 0 5 5060 sip.example.com"
 #
-# A, AAAA, CNAME, MX, TXT and SRV. Unlike the short forms above, a typed answer
-# that does not parse fails --check instead of quietly becoming a CNAME, and TXT
-# takes either one unquoted line or a sequence of quoted strings of 255 bytes
-# each.
+# A, AAAA, CNAME, MX, TXT and SRV. An answer that names a type and gets it wrong
+# fails --check instead of quietly becoming a CNAME, and so does a type that is
+# not in that list. TXT takes either one unquoted line or a sequence of quoted
+# strings of 255 bytes each.
+#
+# A rule holding only MX, TXT and SRV records adds them to the name and leaves
+# the rest of it alone, so example.com above still resolves its address
+# upstream: adding MX records does not take the website away. Give the rule an
+# address, a name or `block` and it answers for the whole name, with the types
+# it has no record of coming back NODATA.
 
 # Names the RFCs reserved, answered here instead of being sent upstream.
 #

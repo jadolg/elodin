@@ -1361,11 +1361,23 @@ TXT unquoted is one string to the end of the line. Quoted, it is a sequence —
 over 255 bytes has to be written as, that being the limit on each string. Inside
 the quotes, `\"` is a quote and `\\` a backslash.
 
-Unlike the short form, a typed answer that does not parse is a config error
-naming the rule, not a CNAME to whatever was written: `MX ten mail.example.com`
-fails `--check` rather than resolving.
+An answer that names a type and gets it wrong is a config error naming the rule,
+not a CNAME to whatever was written: `MX ten mail.example.com` fails `--check`,
+and so does a type this does not answer (`PTR nas.home`, `NS ns1.internal`) and
+anything else with a space in it that does not start with a type. A host name in
+an answer is checked against the wire's limits too — a 64-byte label or a name
+over 255 bytes fails `--check` rather than becoming a rule that silently
+forwards the query it was written to answer.
 
-A rule answers only the types it holds; the rest are NODATA, as they always were.
+**A rule holding only MX, TXT and SRV records is additive**: the types it lists
+are answered here, and every other type at that name is forwarded as though the
+rule were not there. That is what you want for `example.com` with two MX records
+and an SPF `TXT` — a real domain whose website must go on resolving — and it is
+what `--mx-host` and `--txt-record` do in dnsmasq. Add an address, a name or
+`block` to the same rule and it speaks for the whole name again: those are the
+answers that say where a name points, so the types the rule has no record of are
+NODATA, exactly as they were before these kinds existed.
+
 The MX exchange and the SRV target get no address in the additional section —
 this server would have to resolve them upstream to find one, and clients ask for
 it themselves.
@@ -2142,7 +2154,7 @@ What it covers:
 | DoH over HTTP/2 | ALPN selection, POST and GET, Huffman-coded headers, CONTINUATION, a dynamic table size update at and past the advertised limit, concurrent streams proved parallel by timing, flow control with a tiny window, DATA splitting for a 27 KiB answer, PING, RST_STREAM, malformed requests reset with PROTOCOL_ERROR while the connection carries on, error statuses, HTTP/1.1 fallback |
 | DoH upstreams | a query resolved over an h2 upstream, one connection multiplexed across queries rather than reopened, fallback to HTTP/1.1 when the upstream does not offer h2 |
 | blocking | all five response modes, hosts vs domains vs adblock semantics, allow precedence, wildcards, modifiers, dnsmasq syntax, unusable rules, case folding |
-| rewrites | A, AAAA, CNAME, wildcard scope, `block`, NODATA for unmatched types, MX with two preferences, TXT, and SRV with four distinct fields answered from the zone-file form, the PTR synthesised for an address a rule hands out in both families, a wildcard, a public address, a rule shadowed by an earlier wildcard, a rule sunk by `block` and a rule with `ptr: false` each getting none, and another type at a synthesised name answered rather than forwarded |
+| rewrites | A, AAAA, CNAME, wildcard scope, `block`, NODATA for unmatched types, MX with two preferences, TXT, and SRV with four distinct fields answered from the zone-file form, a record-only rule leaving the name's other types to the upstream while a rule with an address still claims them, an unsupported type token and an unencodable host name each failing `--check`, the PTR synthesised for an address a rule hands out in both families, a wildcard, a public address, a rule shadowed by an earlier wildcard, a rule sunk by `block` and a rule with `ptr: false` each getting none, and another type at a synthesised name answered rather than forwarded |
 | rebinding | a private address is forwarded while the guard is off, refused as NODATA once it is on, a public address is untouched, an `allow_domains` zone may answer privately while a name just outside it may not, and `allow_loopback` opens loopback without opening RFC 1918 |
 | rate limiting | a flood from one source answered in full with the limiter off and cut to the budget with it on, truncated answers over the budget, the bytes one address can be made to receive compared between the two, the same flood pipelined down one TCP connection cut to its budget with nothing truncated, and a TCP client still answered after a datagram flood has spent the prefix's UDP budget |
 | cache | hits avoid the upstream, TTL countdown, cross-transport reuse, question re-casing, negative caching, key separation by type |

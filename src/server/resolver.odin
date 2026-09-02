@@ -1831,6 +1831,38 @@ apply_rewrite :: proc(
 		return build_block_response(s, query, q, allocator, limit), true
 	}
 
+	/*
+	A rule that only adds records to a name does not get to answer for the rest
+	of it.
+
+	Every rule used to say where a name points - an address, an alias, or the
+	sink - so a rule matching at all meant the name was this configuration's,
+	and NODATA for a type it had no record of was the truthful answer: the name
+	exists, here is everything there is. `MX`, `TXT` and `SRV` break that
+	assumption, because the ordinary reason to write one is a name whose address
+	is somebody else's business. `example.com` with two MX records and an SPF
+	`TXT` is a real domain that resolves on the public Internet, and answering
+	its `A` query NODATA out of this rule would take the website away from every
+	client behind this server - with an SOA on it, so they would remember the
+	denial for the rule's TTL.
+
+	So a rule holding only these kinds is additive: the types it has are answered
+	here and the rest are forwarded, which is what `--mx-host` and
+	`--txt-record` do in dnsmasq, and what the operator meant by writing down one
+	record rather than a name's whole existence. Add an address, an alias or
+	`block` to the same rule and the old reading is back, deliberately: those are
+	the answers that say the name is ours.
+
+	`matched = false` is how the forwarding happens, so such a query is not
+	counted as rewritten and not logged as one either. That is the honest
+	accounting - nothing was rewritten - and it costs the operator the one signal
+	that the rule was consulted at all. The alternative was a third outcome for
+	the query log, which is a lot of machinery for a rule that did nothing.
+	*/
+	if len(answers) == 0 && !rule_claims_name(rule) {
+		return nil, false
+	}
+
 	resp := dns.make_response(query, .No_Error, allocator)
 	resp.answer = answers[:]
 	if len(answers) == 0 {
@@ -1841,6 +1873,28 @@ apply_rewrite :: proc(
 		return nil, false
 	}
 	return out, true
+}
+
+/*
+Whether `rule` says where its name points, rather than only adding a record to
+it.
+
+An address, an alias and the sink are each an answer to "what is this name",
+which is what earns a rule the right to say NODATA for the types it has no
+record of. `MX`, `TXT` and `SRV` answer a different question about a name whose
+own address is usually somebody else's to give, so a rule holding nothing but
+those leaves the rest of the name alone. See `apply_rewrite`.
+*/
+@(private)
+rule_claims_name :: proc(rule: config.Rewrite) -> bool {
+	for a in rule.answers {
+		switch a.kind {
+		case .A, .AAAA, .CNAME, .Block:
+			return true
+		case .MX, .TXT, .SRV:
+		}
+	}
+	return false
 }
 
 @(private)

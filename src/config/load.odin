@@ -6,6 +6,7 @@ import "core:net"
 import "core:os"
 import "core:strings"
 import "core:time"
+import "elodin:dns"
 import "elodin:dnssec"
 import "elodin:yaml"
 
@@ -978,7 +979,10 @@ parse_rewrite_answer :: proc(
 		errorf(l, "%s: empty answer", path)
 		return {}, false
 	}
-	if trimmed == "block" || trimmed == "deny" {
+	// Case-folded like the type tokens below, and for the same reason: `Block`
+	// read as a name is a CNAME to the host `block`, which is the opposite of
+	// what the word was written to ask for.
+	if strings.equal_fold(trimmed, "block") || strings.equal_fold(trimmed, "deny") {
 		return Rewrite_Answer{kind = .Block}, true
 	}
 
@@ -1015,6 +1019,33 @@ parse_rewrite_answer :: proc(
 			strs := parse_txt_strings(l, rest, path) or_return
 			return Rewrite_Answer{kind = .TXT, strings = strs}, true
 		}
+
+		/*
+		Several fields and no type this understands, which is a mistake with no
+		second reading.
+
+		The short form below would take it: `PTR nas.home` becomes a CNAME to
+		the name `ptr nas.home`, which `encode_name` will put on the wire
+		without complaint - it checks lengths, not characters - so every client
+		asking for that name is handed an alias to a label with a space in it,
+		whatever type it asked for. The type token was added on the promise that
+		an answer naming a type and getting it wrong is an error, and this was
+		the shape where the promise was still broken.
+
+		Every multi-field answer is caught, not only the RR types this does not
+		implement, because a typo is the same mistake as an unsupported type and
+		has the same non-reading. No legal short form has ever had a space in it:
+		an address does not, `block` does not, and a name that really contains
+		one would have to spell it `\032` to mean anything. TXT is the single
+		answer whose text may hold spaces, and it says so first.
+		*/
+		errorf(
+			l,
+			"%s: %q is not an answer this understands - name a record type first (A, AAAA, CNAME, MX, TXT, SRV), or write one address, one name, or `block`",
+			path,
+			trimmed,
+		)
+		return {}, false
 	}
 
 	// The short form, unchanged: an address is what it looks like, and anything
@@ -1025,7 +1056,8 @@ parse_rewrite_answer :: proc(
 	case net.IP6_Address:
 		return v6_rewrite_answer(v), true
 	}
-	return Rewrite_Answer{kind = .CNAME, name = canonical_domain(trimmed, l.allocator)}, true
+	name := rdata_name(l, trimmed, path, "an answer") or_return
+	return Rewrite_Answer{kind = .CNAME, name = name}, true
 }
 
 /*
@@ -1181,11 +1213,20 @@ v6_rewrite_answer :: proc(v: net.IP6_Address) -> (ans: Rewrite_Answer) {
 }
 
 /*
-A domain name out of an RDATA field.
+A domain name out of an RDATA field, checked for being one.
 
-`canonical_domain` takes anything at all, so the check is here: a field with a
-space in it is two fields that were meant to be one, and the message says which
-record was being written rather than leaving the operator to find it.
+`canonical_domain` takes anything at all, so both checks are here. A field with
+a space in it is two fields that were meant to be one, and the message says
+which record was being written rather than leaving the operator to find it.
+
+The second check is that the wire can carry it, and it is here because of what
+happens when it cannot: `encode_message` fails on the record, `apply_rewrite`
+gives up and returns no answer, and the query carries on down the pipeline to
+the upstream. So a label of 64 bytes, or a name over 255, turns a rule that
+`--check` passed into a rule that silently does nothing - and worse than
+nothing, since the internal name it was written for now leaves the building and
+the public answer comes back. `encode_name` is asked here, at load time, so the
+name that cannot be sent is a startup error instead.
 */
 @(private)
 rdata_name :: proc(l: ^Loader, text, path, type: string) -> (name: string, ok: bool) {
@@ -1194,7 +1235,15 @@ rdata_name :: proc(l: ^Loader, text, path, type: string) -> (name: string, ok: b
 		errorf(l, "%s: %s needs one host name, got %q", path, type, text)
 		return "", false
 	}
-	return canonical_domain(trimmed, l.allocator), true
+	canonical := canonical_domain(trimmed, l.allocator)
+	// A name is at most 255 bytes on the wire, so nothing longer can be encoded
+	// into this and nothing shorter needs more.
+	buf: [256]u8
+	if _, err := dns.encode_name(canonical, buf[:]); err != .None {
+		errorf(l, "%s: %s host %q cannot be put on the wire: %v", path, type, trimmed, err)
+		return "", false
+	}
+	return canonical, true
 }
 
 /*
