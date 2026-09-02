@@ -559,6 +559,27 @@ resolve_query :: proc(
 		return out, .Rewritten, true
 	}
 
+	/*
+	The reverse of a rewrite, from the same table and immediately below it.
+
+	`rewrites` is where an operator writes down what their own names resolve to,
+	and the address in such a rule has a reverse whether or not they wrote that
+	down too - see `reverse.odin`. It is one rule set, so it answers in one
+	place: below the explicit rules, since a rule naming a reverse name outright
+	is the more specific of the two and must win, and above everything else for
+	the same reasons the forward direction is - nothing here can leak, and an
+	operator's own configuration outranks a table.
+
+	Counted as a rewrite, because it is one, and separated in the query log:
+	`detail=rewrite-ptr` is what tells an operator debugging a reverse lookup
+	that this server answered it out of a forward rule rather than forwarding it.
+	*/
+	if out, matched := apply_reverse_rewrite(s, msg, q, allocator, limit); matched {
+		sync.atomic_add(&s.stats.rewritten, 1)
+		log_query(s, client, proto, q, .Rewritten, "rewrite-ptr", started)
+		return out, .Rewritten, true
+	}
+
 	if s.cfg.blocking.enabled && s.filters != nil {
 		if filter.engine_match(s.filters, q.name) == .Blocked {
 			sync.atomic_add(&s.stats.blocked, 1)
@@ -1769,22 +1790,37 @@ apply_rewrite :: proc(
 
 @(private)
 find_rewrite :: proc(rules: []config.Rewrite, name: string) -> (rule: config.Rewrite, found: bool) {
-	for r in rules {
+	i := find_rewrite_index(rules, name) or_return
+	return rules[i], true
+}
+
+/*
+The same search, reporting which rule won rather than what it says.
+
+`reverse.odin` needs the identity: a rule only gets to supply the PTR for its
+address if it is the rule that would answer its own name, and "the same domain"
+is not enough to decide that - a duplicated `domain:` is two rules with one name
+between them, and only the first of them is ever reached. Both callers go
+through one loop so that the precedence cannot be described twice and drift.
+*/
+@(private)
+find_rewrite_index :: proc(rules: []config.Rewrite, name: string) -> (index: int, found: bool) {
+	for r, i in rules {
 		if r.wildcard {
 			// "*.lan." matches any strictly deeper name, which is `name_below`
 			// exactly: the label-break guard that keeps "notlan." out of a rule
 			// written for "lan.", and the case-insensitive comparison that DNS
 			// requires, are both its business rather than this loop's.
 			if name_below(name, r.domain) {
-				return r, true
+				return i, true
 			}
 			continue
 		}
 		if dns.name_equal_fold(name, r.domain) {
-			return r, true
+			return i, true
 		}
 	}
-	return {}, false
+	return 0, false
 }
 
 // CHAOS-class queries used by monitoring tools: version.bind and hostname.bind.

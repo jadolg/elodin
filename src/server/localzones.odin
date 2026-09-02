@@ -139,12 +139,28 @@ a zone is a suffix of the name only when what precedes it is a label break, so
 */
 @(private)
 is_locally_served :: proc(name: string) -> bool {
-	for zone in LOCALLY_SERVED_ZONES {
-		if name_at_or_below(name, zone) {
-			return true
+	_, found := locally_served_zone(name)
+	return found
+}
+
+/*
+The same question, answered with the zone that claimed the name.
+
+`reverse.odin` wants the apex rather than the verdict: a synthesised PTR that
+carries no answer needs an SOA in the authority section, and the zone it belongs
+to is `168.192.in-addr.arpa.` rather than the queried name's parent, which for
+`50.1.168.192.in-addr.arpa.` is a zone nobody has ever been authoritative for.
+The two are one procedure so that a zone added to the table above is in both
+answers at once.
+*/
+@(private)
+locally_served_zone :: proc(name: string) -> (zone: string, found: bool) {
+	for z in LOCALLY_SERVED_ZONES {
+		if name_at_or_below(name, z) {
+			return z, true
 		}
 	}
-	return false
+	return "", false
 }
 
 /*

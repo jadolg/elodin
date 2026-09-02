@@ -885,6 +885,7 @@ load_rewrites :: proc(l: ^Loader, cfg: ^Config) {
 		path := fmt.tprintf("rewrites[%d]", i)
 		rw := Rewrite {
 			ttl = 300,
+			ptr = true,
 		}
 		domain := ""
 		opt_string(l, e, "domain", &domain, path)
@@ -895,6 +896,7 @@ load_rewrites :: proc(l: ^Loader, cfg: ^Config) {
 		ttl_i := int(rw.ttl)
 		opt_int(l, e, "ttl", &ttl_i, path)
 		rw.ttl = u32(ttl_i)
+		opt_bool(l, e, "ptr", &rw.ptr, path)
 
 		if strings.has_prefix(domain, "*.") {
 			rw.wildcard = true

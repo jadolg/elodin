@@ -12,7 +12,8 @@ Pi-hole and AdGuard Home, minus the web interface. One binary, one YAML file.
 - Response rate limiting per client prefix, on every transport and with a separate budget for datagrams and for connections, on by default (see `server.rate_limit`)
 - Client allow list restricting who may query, defaulting to local networks only
 - A ceiling on UDP answer size to bound reflection amplification, on by default
-- Local rewrites (A, AAAA, CNAME, or "answer as if blocked")
+- Local rewrites (A, AAAA, CNAME, or "answer as if blocked"), with the matching
+  PTR synthesised so a locally answered name has a reverse
 - DNSSEC validation against the root trust anchors, on by default
 - DNS rebinding protection: an upstream answer pointing a public name at loopback, RFC 1918 or link-local space is refused, off by default so split horizon keeps working, one line to turn on (see `rebind`)
 - DNS cookies in both directions (RFC 7873/9018), on by default
@@ -1327,6 +1328,86 @@ rewrites:
 
 Wildcards match subdomains only, so `*.lan` covers `host.lan` but not `lan`.
 
+#### Reverse lookups
+
+The PTR for an address a rule hands out comes for free: `nas.home` above also
+answers `50.1.168.192.in-addr.arpa`, with the rule's own TTL, so `nslookup
+192.168.1.50` gives back `nas.home` instead of the blackhole servers' NXDOMAIN.
+dnsmasq and AdGuard Home both do this, and without it every `ssh` banner, mail
+server check and log viewer on the LAN reports a name that does not exist for a
+name this server is answering. Nothing to configure — writing the forward rule is
+writing the reverse one.
+
+Only a rule that really does hand out the address gets to name it, and only if
+the address is one this network holds:
+
+- a wildcard rule answers every name below its suffix with the same address, so
+  there is no one name to point back at and none is invented;
+- a rule with `answer: block` hands out no address at all, so there is nothing to
+  reverse;
+- a rule the forward direction never reaches — one shadowed by an earlier
+  wildcard over the same name, or by an earlier rule with the same `domain:` —
+  supplies nothing either, or `192.168.1.50` would reverse to a name that
+  resolves to some other address. The test is on the answer, not on which rule
+  won: if the rule shadowing it hands out the same address, the name does resolve
+  to it and still gets the PTR;
+- an address named by several rules gets the first rule's name, in file order,
+  which is the precedence the forward direction already uses;
+- a rule with `ptr: false` keeps its forward answer and stops claiming the
+  address — see below;
+- an address outside RFC 1918, RFC 3927 link-local, `fd00::/8` unique-local and
+  RFC 4291 IPv6 link-local gets nothing — a rule pointing a local name at a
+  public address says nothing about who owns that address, and its real PTR is
+  somebody else's to answer. Loopback and `0.0.0.0` are left out too: a rule
+  pointing a name at one of those is sinking it rather than addressing it.
+  (`fd00::/8` rather than all of RFC 4193's `fc00::/7`, matching the reverse zone
+  that is served locally: `fc00::/8` is the half of that block nobody defined an
+  assignment method for, and no `c.f.ip6.arpa` is served here to answer under.);
+- a rule written for the reverse name itself wins, the synthesis being what
+  happens when nothing more specific was said;
+- a `dnssec.trust_anchors` entry over the reverse zone turns the synthesis off
+  for the names it covers, while `dnssec.enabled` is on. Anchoring a zone is a
+  request to validate it, and an answer invented here carries no signature — a
+  validating client below you, holding the same anchor, would get SERVFAIL for
+  it. A site that signs its own reverse space is publishing these PTRs already.
+  With validation off the anchors are inert here as they are everywhere else in
+  this server, and every locally answered name — rewrites, blocked names, the
+  reserved-name table — is unsigned in the same way.
+
+Three things to know before turning this loose on an existing installation.
+
+If you sink a name by pointing it at a host on your LAN — `ads.example.com:
+192.168.1.10`, a block page served off the router — that host's reverse would
+become `ads.example.com`. Nothing here can tell that rule from a rule naming the
+host itself, so say so with `ptr: false`:
+
+```yaml
+rewrites:
+  - domain: ads.example.com
+    answer: 192.168.1.10
+    ptr: false               # keep .10's own reverse
+```
+
+The rule keeps its forward answer and stops claiming the address. File order
+settles it too — a rule for the host, above the sinkhole rules, takes the address
+back — and `answer: block` and the [sink lists](#sink-lists) sink a name without
+handing out an address to be reversed at all. The key is for when the block page
+really does have to be an address.
+
+If your upstream serves your reverse zone, the addresses named in `rewrites` are
+now answered here instead. They are the ones you wrote down; signing that zone
+and anchoring it is how to say you meant the upstream's answer.
+
+And the reverse direction makes your local name inventory sweepable: anyone your
+[client allow list](#who-may-ask) admits can walk RFC 1918 reverse space and
+collect the names, where before they had to guess forward names. dnsmasq and
+AdGuard Home give the same answers to the same sweep, and the allow list defaults
+to local networks only — but if that list is wide, this is one more thing behind
+it.
+
+Other types for a synthesised name are NODATA with an SOA rather than a
+forwarded query — the name exists, and there is nothing else at it.
+
 ### Names that are never forwarded
 
 ```yaml
@@ -2019,7 +2100,7 @@ What it covers:
 | DoH over HTTP/2 | ALPN selection, POST and GET, Huffman-coded headers, CONTINUATION, a dynamic table size update at and past the advertised limit, concurrent streams proved parallel by timing, flow control with a tiny window, DATA splitting for a 27 KiB answer, PING, RST_STREAM, malformed requests reset with PROTOCOL_ERROR while the connection carries on, error statuses, HTTP/1.1 fallback |
 | DoH upstreams | a query resolved over an h2 upstream, one connection multiplexed across queries rather than reopened, fallback to HTTP/1.1 when the upstream does not offer h2 |
 | blocking | all five response modes, hosts vs domains vs adblock semantics, allow precedence, wildcards, modifiers, dnsmasq syntax, unusable rules, case folding |
-| rewrites | A, AAAA, CNAME, wildcard scope, `block`, NODATA for unmatched types |
+| rewrites | A, AAAA, CNAME, wildcard scope, `block`, NODATA for unmatched types, the PTR synthesised for an address a rule hands out in both families, a wildcard, a public address, a rule shadowed by an earlier wildcard, a rule sunk by `block` and a rule with `ptr: false` each getting none, and another type at a synthesised name answered rather than forwarded |
 | rebinding | a private address is forwarded while the guard is off, refused as NODATA once it is on, a public address is untouched, an `allow_domains` zone may answer privately while a name just outside it may not, and `allow_loopback` opens loopback without opening RFC 1918 |
 | rate limiting | a flood from one source answered in full with the limiter off and cut to the budget with it on, truncated answers over the budget, the bytes one address can be made to receive compared between the two, the same flood pipelined down one TCP connection cut to its budget with nothing truncated, and a TCP client still answered after a datagram flood has spent the prefix's UDP budget |
 | cache | hits avoid the upstream, TTL countdown, cross-transport reuse, question re-casing, negative caching, key separation by type |
