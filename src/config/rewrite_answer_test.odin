@@ -451,6 +451,71 @@ test_rewrite_names_must_fit_on_the_wire :: proc(t: ^testing.T) {
 }
 
 /*
+Both keys on one rule is refused rather than resolved in silence.
+
+`answer:` won and `answers:` was dropped, and with rules that can hold several
+records the obvious way to add an MX to a rule that has an address is to write
+the second key under the first - which threw the MX away and passed `--check`
+while doing it.
+*/
+@(test)
+test_a_rule_may_not_have_both_answer_keys :: proc(t: ^testing.T) {
+	src := "upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - domain: example.com\n    answer: 192.168.1.50\n    answers: [\"MX 10 mail.example.com\"]\n"
+	_, err := load_string(src, context.temp_allocator)
+	if e, has := err.?; testing.expect(t, has, "both keys were accepted") {
+		testing.expect(t, strings.contains(e.messages[0], "both"), "the message should say which mistake this is")
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+The rule's own `domain:` is held to the wire's limits too.
+
+A rule is matched against a name that came off the wire, so a domain the wire
+cannot carry is a rule no query can ever equal: it sits in a configuration
+`--check` passed, matching nothing, which is the outcome the answer-side check
+was added to prevent.
+*/
+@(test)
+test_rewrite_domain_must_fit_the_wire :: proc(t: ^testing.T) {
+	long_label := strings.concatenate(
+		{strings.repeat("a", 64, context.temp_allocator), ".home"},
+		context.temp_allocator,
+	)
+	src := strings.concatenate(
+		{
+			"upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - domain: ",
+			long_label,
+			"\n    answer: 192.168.1.50\n",
+		},
+		context.temp_allocator,
+	)
+	_, err := load_string(src, context.temp_allocator)
+	if e, has := err.?; testing.expect(t, has, "an unencodable domain was accepted") {
+		testing.expect(
+			t,
+			strings.contains(e.messages[0], "rewrites[0].domain"),
+			"the message should name the domain",
+		)
+	}
+
+	// A wildcard's suffix is a name as well, and is checked the same way.
+	wild := strings.concatenate(
+		{
+			"upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - domain: \"*.",
+			long_label,
+			"\"\n    answer: 192.168.1.50\n",
+		},
+		context.temp_allocator,
+	)
+	_, werr := load_string(wild, context.temp_allocator)
+	_, whas := werr.?
+	testing.expect(t, whas, "an unencodable wildcard suffix was accepted")
+
+	free_all(context.temp_allocator)
+}
+
+/*
 The 255-byte limit on one <character-string>, which is the length octet in front
 of it and not a policy of this file's.
 

@@ -326,6 +326,7 @@ blocking: {{ enabled: true, response: nxdomain }}
 rewrites:
   - {{ domain: nas.home, answer: 192.168.1.50, ttl: 111 }}
   - {{ domain: nas6.home, answer: "fd00::50" }}
+  - {{ domain: mail.lab, answers: ["MX 10 mx.lab"] }}
   - {{ domain: "*.lab", answers: [10.0.0.1, "fd00::1"] }}
   - {{ domain: old.example.org, answer: new.example.org }}
   - {{ domain: telemetry.example.org, answer: block }}
@@ -496,6 +497,39 @@ rewrites:
 				check_eq_str(r, addrs[0], "203.0.113.1", "answer source")
 			}
 			check(r, mock_total(mock) >= 1, "the query should have been forwarded")
+		}
+	}
+	end_case(r)
+
+	start_case(r, "rewrite: a record-only rule steps aside for the rules below it")
+	{
+		// "mail.lab" holds only an MX and is written above the "*.lab" wildcard,
+		// which answers every name under "lab" with 10.0.0.1 - the order anybody
+		// writes, specific before general. An A query for it has to reach that
+		// wildcard: stopping at the first matching rule would send an internal
+		// name to the public upstream while the rule that answers it sat one
+		// line below, unread.
+		mock_reset_counts(mock)
+		res := query_udp(udp_port, build_query("mail.lab.", u16(dns.Type.A)))
+		if check(r, res.ok, "no response") {
+			addrs := answer_addresses(res.wire)
+			if check(r, len(addrs) == 1, "expected one address, got %d", len(addrs)) {
+				check_eq_str(r, addrs[0], "10.0.0.1", "the wildcard should have answered")
+			}
+			check_eq_int(r, mock_total(mock), 0, "upstream queries for a name answered here")
+		}
+
+		// And its own type is still answered by the rule that holds it.
+		mx := query_udp(udp_port, build_query("mail.lab.", u16(dns.Type.MX)))
+		if check(r, mx.ok, "no response for the MX query") {
+			msg, derr := dns.decode_message(mx.wire, context.temp_allocator)
+			if check(r, derr == .None, "response did not decode: %v", derr) &&
+			   check(r, len(msg.answer) == 1, "expected one MX record, got %d", len(msg.answer)) {
+				rec, is_mx := msg.answer[0].data.(dns.Rdata_MX)
+				if check(r, is_mx, "the answer is not an MX record") {
+					check_eq_str(r, rec.exchange, "mx.lab.", "exchange")
+				}
+			}
 		}
 	}
 	end_case(r)

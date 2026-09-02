@@ -903,16 +903,45 @@ load_rewrites :: proc(l: ^Loader, cfg: ^Config) {
 			rw.wildcard = true
 			domain = domain[2:]
 		}
-		rw.domain = canonical_domain(domain, l.allocator)
+		/*
+		The name the rule is for, held to the same limits as the names in its
+		answers.
 
-		// Whichever of the two spellings the rule used is the one its errors are
-		// reported against: being pointed at `answers[0]` by a file that says
-		// `answer:` is being pointed at a key that is not there.
+		A rule is matched against the question name off the wire, which a
+		decoder has already held to those limits - so a domain with a 64-byte
+		label in it is a rule no query can ever equal, sitting in a
+		configuration that `--check` passed and quietly matching nothing. Same
+		outcome the answer-side check exists to prevent, and the same one line
+		to prevent it.
+		*/
+		rw.domain = canonical_domain(domain, l.allocator)
+		if !name_fits_the_wire(l, rw.domain, fmt.tprintf("%s.domain", path)) {
+			continue
+		}
+
+		/*
+		Whichever of the two spellings the rule used is the one its errors are
+		reported against: being pointed at `answers[0]` by a file that says
+		`answer:` is being pointed at a key that is not there.
+
+		Both at once is refused rather than resolved. `answer:` would win and
+		`answers:` would be dropped in silence, and with rules that can now hold
+		several records the obvious way to add an MX to a rule that already has
+		an address is to write the second key underneath the first - which would
+		have thrown the MX away and passed `--check` while doing it.
+		*/
 		answers_node := yaml.get(e, "answer")
 		key := "answer"
 		if answers_node == nil {
 			answers_node = yaml.get(e, "answers")
 			key = "answers"
+		} else if yaml.get(e, "answers") != nil {
+			errorf(
+				l,
+				"%s: has both `answer` and `answers`; put every record under one of them",
+				path,
+			)
+			continue
 		}
 		raw, ok := yaml.as_string_list(answers_node, l.allocator)
 		if !ok || len(raw) == 0 {
@@ -1259,24 +1288,44 @@ parse_txt_strings :: proc(l: ^Loader, rest, path: string) -> (out: []string, ok:
 	}
 
 	/*
-	And the whole record has to fit the 16-bit RDLENGTH in front of it.
+	And the record has to leave room for the message it will be sent in.
 
-	It takes 257 strings to get there, so nobody types this - but a record that
-	cannot be encoded is not a record that fails loudly at query time: the encode
-	fails, `apply_rewrite` returns no answer, and the query goes upstream as
-	though the rule had never matched. Everything else that could produce that
-	outcome is refused at load, and this is the last of them.
+	It takes 256 strings to reach even the 16-bit RDLENGTH, so nobody types
+	this - but the failure if they did is worse than the one every other check
+	here prevents. `encode_message` does not report a record that will not fit:
+	it sets the truncated flag and leaves the record out (see `encode.odin`), so
+	the client gets TC=1 and an empty answer, retries over TCP where the ceiling
+	is the same 65535, and gets the same empty answer for as long as the rule
+	stands.
+
+	MAX_RECORD_RDATA is what always fits: 65535 for the whole message, less the
+	12-byte header, less a question of the longest name there can be (255 + 4),
+	less this record's own header at the same worst-case name (255 + 10). Name
+	compression makes that pessimistic by up to a few hundred bytes, which is
+	the right direction to be wrong in for a limit nothing legitimate
+	approaches.
 	*/
 	total := 0
 	for s in strs {
 		total += 1 + len(s)
 	}
-	if total > 65535 {
-		errorf(l, "%s: TXT record is %d bytes, and one record may be at most 65535", path, total)
+	if total > MAX_RECORD_RDATA {
+		errorf(
+			l,
+			"%s: TXT record is %d bytes, and one record may be at most %d",
+			path,
+			total,
+			MAX_RECORD_RDATA,
+		)
 		return nil, false
 	}
 	return strs[:], true
 }
+
+// See `parse_txt_strings`: the largest RDATA that always leaves room for the
+// header, the question and the record's own header in a 65535-byte message.
+@(private)
+MAX_RECORD_RDATA :: dns.MAX_MESSAGE - 12 - (255 + 4) - (255 + 10)
 
 // The bytes of an IPv6 literal, in the order the wire wants them.
 @(private)
@@ -1314,14 +1363,25 @@ rdata_name :: proc(l: ^Loader, text, path, type: string) -> (name: string, ok: b
 		return "", false
 	}
 	canonical := canonical_domain(trimmed, l.allocator)
-	// A name is at most 255 bytes on the wire, so nothing longer can be encoded
-	// into this and nothing shorter needs more.
-	buf: [256]u8
-	if _, err := dns.encode_name(canonical, buf[:]); err != .None {
-		errorf(l, "%s: %s host %q cannot be put on the wire: %v", path, type, trimmed, err)
+	if !name_fits_the_wire(l, canonical, fmt.tprintf("%s: %s host %q", path, type, trimmed)) {
 		return "", false
 	}
 	return canonical, true
+}
+
+// Whether `name` is one the wire can carry: 63 bytes to a label, 255 to the
+// whole of it, no empty labels, and every escape a real escape. `dns` owns all
+// four rules, so it is asked rather than copied.
+@(private)
+name_fits_the_wire :: proc(l: ^Loader, name: string, what: string) -> bool {
+	// A name is at most 255 bytes encoded, so nothing longer fits in here and
+	// nothing shorter needs more.
+	buf: [256]u8
+	if _, err := dns.encode_name(name, buf[:]); err != .None {
+		errorf(l, "%s cannot be put on the wire: %v", what, err)
+		return false
+	}
+	return true
 }
 
 /*

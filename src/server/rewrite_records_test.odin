@@ -320,6 +320,116 @@ test_an_address_in_the_rule_still_claims_the_whole_name :: proc(t: ^testing.T) {
 }
 
 /*
+A record-only rule that has nothing for the type asked for steps aside for the
+rules below it, rather than ending the search.
+
+This is the shape anybody writes - specific rule first, wildcard last - and
+taking the first match would send `A mail.lan` upstream while the wildcard that
+answers it sat one line below, unread. That is the internal name leaving the
+network to fetch a public answer, which is the outcome the whole of this file's
+checking exists to prevent.
+*/
+@(test)
+test_a_record_only_rule_steps_aside_for_the_rules_below_it :: proc(t: ^testing.T) {
+	rules := make([]config.Rewrite, 2, context.temp_allocator)
+	rules[0] = config.Rewrite {
+		domain  = "mail.lan.",
+		answers = answers_of({kind = .MX, preference = 10, name = "mx.lan."}),
+		ttl     = 300,
+		ptr     = true,
+	}
+	rules[1] = config.Rewrite {
+		domain   = "lan.",
+		wildcard = true,
+		answers  = answers_of({kind = .A, v4 = {192, 168, 1, 10}}),
+		ttl      = 300,
+		ptr      = true,
+	}
+
+	resp, outcome, ok := ask(rules, "mail.lan.", .A)
+	if !testing.expect(t, ok, "the A query went unanswered") {
+		return
+	}
+	testing.expect_value(t, outcome, Outcome.Rewritten)
+	if !testing.expect(t, len(resp.answer) == 1, "the wildcard below should have answered") {
+		return
+	}
+	a, is_a := resp.answer[0].data.(dns.Rdata_A)
+	testing.expect(t, is_a, "the answer is not an A record")
+	testing.expect_value(t, a.addr, [4]u8{192, 168, 1, 10})
+
+	// The record-only rule still answers its own type, and first.
+	mx_resp, _, mx_ok := ask(rules, "mail.lan.", .MX)
+	if testing.expect(t, mx_ok, "the MX query went unanswered") {
+		testing.expect_value(t, len(mx_resp.answer), 1)
+		testing.expect_value(t, mx_resp.answer[0].type, dns.Type.MX)
+	}
+
+	// With nothing below it, the name is still the upstream's business.
+	alone, alone_outcome, _ := ask(rules[:1], "mail.lan.", .A)
+	testing.expect_value(t, alone_outcome, Outcome.Refused)
+	testing.expect_value(t, len(alone.answer), 0)
+
+	free_all(context.temp_allocator)
+}
+
+/*
+And the reverse direction follows the same walk, or it would name an address the
+forward direction does not give out.
+
+The wildcard hands out 192.168.1.10 for every name below `lan.`, including
+`mail.lan` - which the MX rule above it does not answer for - so the PTR for
+that address is the wildcard's business, and a wildcard names no one host. The
+answer is that there is none, and the point is that it is arrived at by asking
+the same question `apply_rewrite` asks.
+*/
+@(test)
+test_the_reverse_walk_follows_the_forward_one :: proc(t: ^testing.T) {
+	rules := make([]config.Rewrite, 3, context.temp_allocator)
+	rules[0] = config.Rewrite {
+		domain  = "mail.lan.",
+		answers = answers_of({kind = .MX, preference = 10, name = "mx.lan."}),
+		ttl     = 300,
+		ptr     = true,
+	}
+	rules[1] = config.Rewrite {
+		domain   = "lan.",
+		wildcard = true,
+		answers  = answers_of({kind = .A, v4 = {192, 168, 1, 10}}),
+		ttl      = 300,
+		ptr      = true,
+	}
+	rules[2] = config.Rewrite {
+		domain  = "nas.home.",
+		answers = answers_of({kind = .A, v4 = {192, 168, 1, 50}}),
+		ttl     = 111,
+		ptr     = true,
+	}
+
+	_, _, wildcard := reverse_rewrite_target(rules, "10.1.168.192.in-addr.arpa.")
+	testing.expect(t, !wildcard, "a wildcard names no host, whatever sits above it")
+
+	// A record-only rule above an address rule for the same name does not stop
+	// that address having its reverse: the A query walks past it, so the PTR
+	// does too.
+	shadowed := make([]config.Rewrite, 2, context.temp_allocator)
+	shadowed[0] = config.Rewrite {
+		domain  = "nas.home.",
+		answers = answers_of({kind = .TXT, strings = strings_of("hello")}),
+		ttl     = 300,
+		ptr     = true,
+	}
+	shadowed[1] = rules[2]
+
+	domain, ttl, found := reverse_rewrite_target(shadowed, "50.1.168.192.in-addr.arpa.")
+	testing.expect(t, found, "the rule that answers the address should name it")
+	testing.expect_value(t, domain, "nas.home.")
+	testing.expect_value(t, ttl, u32(111))
+
+	free_all(context.temp_allocator)
+}
+
+/*
 A rule with an MX and nothing else claims no address, so it supplies no reverse
 either - the PTR synthesis reads addresses out of `answers`, and there is none
 here to read.

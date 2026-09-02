@@ -418,10 +418,12 @@ rebind:
 # it already answers every type.
 #
 # A rule holding only MX, TXT and SRV records adds them to the name and leaves
-# the rest of it alone, so example.com above still resolves its address
-# upstream: adding MX records does not take the website away. Give the rule an
-# address, a name or `block` and it answers for the whole name, with the types
-# it has no record of coming back NODATA.
+# the rest of it alone - the rules below it are still tried, then the upstream -
+# so example.com above still resolves its address: adding MX records does not
+# take the website away. Give the rule an address, a name or `block` and it
+# answers for the whole name, with the types it has no record of coming back
+# NODATA. Do that for a name nothing else resolves, or its other types come back
+# NXDOMAIN and a client that caches one stops asking for the MX as well.
 
 # Names the RFCs reserved, answered here instead of being sent upstream.
 #
