@@ -63,6 +63,43 @@ test_rewrite_mx_answer :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+/*
+A padded number is that number.
+
+`MX 000010` is ten, and refusing it while saying it "is not a number from 0 to
+65535" was a message arguing with itself. The reverse-name parser refuses a
+padded octet on purpose - `050` there is a second spelling of a name - and the
+distinction is worth keeping straight: a preference is a number, and a number
+has one value however it is written.
+*/
+@(test)
+test_rewrite_numbers_may_be_padded :: proc(t: ^testing.T) {
+	rules := rules_from(t, `["MX 000010 mail.example.com", "MX 0020 backup.example.com"]`)
+	if !testing.expect(t, len(rules) == 1 && len(rules[0].answers) == 2, "expected two answers") {
+		return
+	}
+	testing.expect_value(t, rules[0].answers[0].preference, u16(10))
+	testing.expect_value(t, rules[0].answers[1].preference, u16(20))
+
+	srv := rules_from(t, `["SRV 00 05 05060 sip.example.com"]`)
+	if testing.expect(t, len(srv) == 1 && len(srv[0].answers) == 1, "expected one answer") {
+		testing.expect_value(t, srv[0].answers[0].weight, u16(5))
+		testing.expect_value(t, srv[0].answers[0].port, u16(5060))
+	}
+
+	// Out of range is still out of range, however it is spelled, and a run of
+	// digits long enough to overflow is refused rather than counted.
+	over := [?]string{`["MX 65536 mail.example.com"]`, `["MX 00065536 mail.example.com"]`}
+	for a in over {
+		msg := error_from(a)
+		if testing.expectf(t, msg != "", "%s was accepted", a) {
+			testing.expectf(t, strings.contains(msg, "preference"), "message %q", msg)
+		}
+	}
+
+	free_all(context.temp_allocator)
+}
+
 @(test)
 test_rewrite_srv_answer :: proc(t: ^testing.T) {
 	rules := rules_from(t, `["SRV 0 5 5060 sip.example.com"]`)

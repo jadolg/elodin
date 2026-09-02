@@ -1494,13 +1494,25 @@ rdata_fields :: proc(s: string, out: []string) -> int {
 /*
 A decimal number that fits in the 16 bits an MX preference or an SRV field has.
 
-Deliberately stricter than `strconv`: this is a configuration file, and
-`0x1f`, `+5`, `1_000` and a leading space are all shapes that would be accepted
+Deliberately stricter than `strconv`: this is a configuration file, and `0x1f`,
+`+5`, `1_000` and a leading space are all shapes that would be accepted
 somewhere and mean something else here. A number is digits.
+
+Leading zeros are digits too. `MX 000010` is ten however it is padded, and
+refusing it while saying it "is not a number from 0 to 65535" was a message
+arguing with itself - the value is in range and the reader is left looking for
+the part that is not. The bound is on what the digits come to rather than on how
+many there are, which also stops a thousand of them from being counted before
+being rejected.
+
+The reverse-name parser next door refuses a padded octet on purpose, and the
+two are not in disagreement: `050` there is a second spelling of a *name*, and
+one address answering to two names is a thing worth refusing. A preference is a
+number, and a number has one value.
 */
 @(private)
 parse_rdata_u16 :: proc(s: string) -> (v: u16, ok: bool) {
-	if len(s) == 0 || len(s) > 5 {
+	if len(s) == 0 {
 		return 0, false
 	}
 	n := 0
@@ -1510,9 +1522,9 @@ parse_rdata_u16 :: proc(s: string) -> (v: u16, ok: bool) {
 			return 0, false
 		}
 		n = n * 10 + int(c - '0')
-	}
-	if n > 65535 {
-		return 0, false
+		if n > 65535 {
+			return 0, false
+		}
 	}
 	return u16(n), true
 }
