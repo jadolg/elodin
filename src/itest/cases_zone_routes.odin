@@ -1,6 +1,9 @@
 package itest
 
 import "core:fmt"
+import "core:os"
+import "core:path/filepath"
+import "core:strings"
 import "elodin:dns"
 
 /*
@@ -75,7 +78,78 @@ blocking:
 	)
 }
 
+/*
+`--check` says what a route gives up, and says it only where there is something
+to give up.
+
+The coupling is deliberate and argued in `routes.odin`, but nothing at load can
+tell a network's own `corp.example` from a public signed zone routed down a VPN,
+and in the second case a route turns off two checks that were working. One line
+per route is what stands in for the per-route key this does not have, so the
+line has to actually appear - and has to stay absent for a file that turned both
+checks off itself, or it is noise where a real warning should be.
+*/
+@(private = "file")
+run_route_warning_cases :: proc(r: ^Runner) {
+	write :: proc(r: ^Runner, name, body: string) -> string {
+		path := filepath.join({r.work_dir, name}, context.temp_allocator) or_else ""
+		_ = os.write_entire_file(path, transmute([]u8)body)
+		return path
+	}
+
+	ROUTE :: "upstream:\n  servers: [1.1.1.1]\n  zones:\n    - domains: [corp.example]\n      servers: [10.0.0.1]\n"
+
+	start_case(r, "upstream.zones: --check says what a route gives up")
+	{
+		// dnssec on by default, rebind off by default: one of the two.
+		res := run_binary(r, []string{"--config", write(r, "route-warn.yaml", ROUTE), "--check"}, "route-warn")
+		if check(r, res.ok, "could not run the binary") {
+			check_eq_int(r, res.exit_code, 0, "exit code")
+			check(r, strings.contains(res.output, "corp.example."), "the warning does not name the routed zone: %q", res.output)
+			check(r, strings.contains(res.output, "insecure"), "the warning does not mention validation: %q", res.output)
+			check(
+				r,
+				!strings.contains(res.output, "rebind protection"),
+				"a guard the file leaves off was named anyway: %q",
+				res.output,
+			)
+		}
+	}
+	end_case(r)
+
+	start_case(r, "upstream.zones: with both guards on the warning names both")
+	{
+		body := fmt.tprintf("%srebind:\n  enabled: true\n", ROUTE)
+		res := run_binary(r, []string{"--config", write(r, "route-warn-both.yaml", body), "--check"}, "route-warn-both")
+		if check(r, res.ok, "could not run the binary") {
+			check(r, strings.contains(res.output, "insecure"), "validation was not named: %q", res.output)
+			check(r, strings.contains(res.output, "rebind protection"), "the rebinding guard was not named: %q", res.output)
+		}
+	}
+	end_case(r)
+
+	start_case(r, "upstream.zones: nothing is claimed for a check the file already turned off")
+	{
+		// Both off: the route gives up neither, so a line naming either would be
+		// telling the operator they lost something they had already declined.
+		body := fmt.tprintf("%sdnssec:\n  enabled: false\n", ROUTE)
+		res := run_binary(r, []string{"--config", write(r, "route-warn-none.yaml", body), "--check"}, "route-warn-none")
+		if check(r, res.ok, "could not run the binary") {
+			check_eq_int(r, res.exit_code, 0, "exit code")
+			check(
+				r,
+				!strings.contains(res.output, "giving up"),
+				"a route gave up nothing and said otherwise: %q",
+				res.output,
+			)
+		}
+	}
+	end_case(r)
+}
+
 run_zone_route_cases :: proc(r: ^Runner) {
+	run_route_warning_cases(r)
+
 	public_port := next_port(r)
 	public := mock_make("public", public_port)
 	mock_synth_all(public, PUBLIC)

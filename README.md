@@ -455,6 +455,12 @@ The answer cache is keyed on the question and not on which upstream produced it,
 which is sound because the routing table is built once at startup and
 configuration is not reloaded. Restart after changing a route.
 
+`--check` says out loud what each route gives up, one line per route, and so
+does the log at startup. Nothing at load can tell an internal zone from a public
+signed one — whether a zone is signed is a question only the DNS answers — so the
+line states the two implications and leaves the judgement to you. It is not
+printed for a check the file has already turned off.
+
 A route into a zone [`special_use`](#names-that-are-never-forwarded) already
 answers is refused at load. Those names are answered from the table before
 anything is forwarded, so a route under `special_use.home_arpa: true` would sit

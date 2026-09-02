@@ -284,6 +284,64 @@ that domain" would be untrue of one of the two files. Both lists are named by
 the key an operator writes rather than by the field they land in, so the line
 can be searched for in the file it is about.
 */
+/*
+What each route gives up, said once per route rather than left to be noticed.
+
+A route does three things and only the first is what the operator wrote it for:
+the zone goes to its own servers, its names stop being validated, and its
+answers stop being checked for private addresses. The last two follow from what
+a route asserts - that a local authority answers this zone - and for the zone
+`upstream.zones` was built for they are what makes it work at all. A network's
+own `corp.example` is unsigned under a parent that delegates nothing to it, and
+its addresses are RFC 1918 by definition.
+
+They are the wrong two for a zone that is public and signed, which a route can
+equally be pointed at: sending one domain to a filtering resolver or down a VPN
+is ordinary conditional forwarding, and there the route silently turns off a
+check that was working. Nothing at load can tell the two apart - whether a zone
+is signed is a question only the DNS can answer - so this says what happened and
+leaves the judgement where the knowledge is.
+
+Only what is actually given up. With `dnssec.enabled` off there is no validation
+to lose and with `rebind.enabled` off there is no guard to be exempt from, so a
+configuration with both off gets no line: a warning that names a protection the
+file already turned off is noise standing where a real one should be.
+*/
+route_implication_warning :: proc(
+	cfg: ^config.Config,
+	route: config.Zone_Route,
+	allocator := context.allocator,
+) -> (
+	text: string,
+	worth_saying: bool,
+) {
+	if len(route.domains) == 0 {
+		return "", false
+	}
+	zones := strings.join(route.domains, ", ", allocator)
+	switch {
+	case cfg.dnssec.enabled && cfg.rebind.enabled:
+		return fmt.aprintf(
+			"the route for %s serves that zone insecure (DNSSEC validation off for it) and exempt from rebind protection, which is what a route asserts about a zone a local authority answers; if it is a public signed zone, those are two checks you are giving up",
+			zones,
+			allocator = allocator,
+		), true
+	case cfg.dnssec.enabled:
+		return fmt.aprintf(
+			"the route for %s serves that zone insecure (DNSSEC validation off for it), which is what a route asserts about a zone a local authority answers; if it is a public signed zone, that is a check you are giving up",
+			zones,
+			allocator = allocator,
+		), true
+	case cfg.rebind.enabled:
+		return fmt.aprintf(
+			"the route for %s exempts that zone from rebind protection, which is what a route asserts about a zone a local authority answers; if it is a public zone, that is a check you are giving up",
+			zones,
+			allocator = allocator,
+		), true
+	}
+	return "", false
+}
+
 route_rule_warning :: proc(rule: string, allocator := context.allocator) -> string {
 	return fmt.aprintf(
 		"blocking rule %q is a list rule, not a route: it does not send the zone anywhere - under blocking.rules that form blackholes the zone, and under blocking.allow it is discarded; to send a zone to its own server use upstream.zones",
@@ -382,6 +440,11 @@ main :: proc() {
 		for rule in misrouted {
 			fmt.printfln("  warning: %s", route_rule_warning(rule, context.temp_allocator))
 		}
+		for route in cfg.upstream.zones {
+			if text, say := route_implication_warning(&cfg, route, context.temp_allocator); say {
+				fmt.printfln("  warning: %s", text)
+			}
+		}
 		return
 	}
 
@@ -405,6 +468,11 @@ main :: proc() {
 	// not drift apart.
 	for rule in misrouted {
 		logx.warnf("%s", route_rule_warning(rule, context.temp_allocator))
+	}
+	for route in cfg.upstream.zones {
+		if text, say := route_implication_warning(&cfg, route, context.temp_allocator); say {
+			logx.warnf("%s", text)
+		}
 	}
 	/*
 	Said out loud for the same reason an empty allow list is: with the table
