@@ -282,28 +282,38 @@ test_an_address_in_the_rule_still_claims_the_whole_name :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(resp.answer), 0)
 	testing.expect_value(t, len(resp.authority), 1)
 
-	// A CNAME or `block` says the same thing about the name, so each of them
-	// claims it too.
-	claiming_kinds := [?]config.Rewrite_Kind{.CNAME, .Block}
-	for kind in claiming_kinds {
-		claimed := make([]config.Rewrite, 1, context.temp_allocator)
-		claimed[0] = config.Rewrite {
-			domain  = "other.example.",
-			answers = answers_of(
-				{kind = .TXT, strings = strings_of("x")},
-				{kind = kind, name = "elsewhere.example."},
-			),
-			ttl     = 300,
-			ptr     = true,
-		}
-		_, claimed_outcome, _ := ask(claimed, "other.example.", .AAAA)
-		testing.expectf(
-			t,
-			claimed_outcome == .Rewritten,
-			"a rule with %v should answer for the whole name, got %v",
-			kind,
-			claimed_outcome,
-		)
+	/*
+	A CNAME and `block` say the same thing about a name, so each of them claims
+	it too.
+
+	A CNAME is alone in its rule because the loader will not let it share one
+	(RFC 2181 section 10.1), which is the shape it has in any configuration that
+	loads; `block` may sit beside a record, and does here.
+	*/
+	alias := make([]config.Rewrite, 1, context.temp_allocator)
+	alias[0] = config.Rewrite {
+		domain  = "other.example.",
+		answers = answers_of({kind = .CNAME, name = "elsewhere.example."}),
+		ttl     = 300,
+		ptr     = true,
+	}
+	_, alias_outcome, _ := ask(alias, "other.example.", .AAAA)
+	testing.expect_value(t, alias_outcome, Outcome.Rewritten)
+
+	sunk := make([]config.Rewrite, 1, context.temp_allocator)
+	sunk[0] = config.Rewrite {
+		domain  = "sunk.example.",
+		answers = answers_of({kind = .TXT, strings = strings_of("x")}, {kind = .Block}),
+		ttl     = 300,
+		ptr     = true,
+	}
+	// Counted as a rewrite rather than as a block, `apply_rewrite` being what
+	// answered; the rcode is what says the name was sunk and not merely found to
+	// have no AAAA.
+	sunk_resp, sunk_outcome, sunk_ok := ask(sunk, "sunk.example.", .AAAA)
+	testing.expect_value(t, sunk_outcome, Outcome.Rewritten)
+	if testing.expect(t, sunk_ok, "the sunk name went unanswered") {
+		testing.expect_value(t, sunk_resp.flags.rcode, u8(dns.Rcode.NX_Domain))
 	}
 
 	free_all(context.temp_allocator)

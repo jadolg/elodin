@@ -137,8 +137,8 @@ test_rewrite_txt_answer :: proc(t: ^testing.T) {
 // an operator who has learned the type token will reach for.
 @(test)
 test_rewrite_explicit_address_and_name_types :: proc(t: ^testing.T) {
-	rules := rules_from(t, `["A 192.168.1.50", "AAAA fd00::1", "CNAME new.example.com"]`)
-	if !testing.expect(t, len(rules) == 1 && len(rules[0].answers) == 3, "expected three answers") {
+	rules := rules_from(t, `["A 192.168.1.50", "AAAA fd00::1"]`)
+	if !testing.expect(t, len(rules) == 1 && len(rules[0].answers) == 2, "expected two answers") {
 		return
 	}
 	testing.expect_value(t, rules[0].answers[0].kind, Rewrite_Kind.A)
@@ -149,8 +149,52 @@ test_rewrite_explicit_address_and_name_types :: proc(t: ^testing.T) {
 		rules[0].answers[1].v6,
 		[16]u8{0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
 	)
-	testing.expect_value(t, rules[0].answers[2].kind, Rewrite_Kind.CNAME)
-	testing.expect_value(t, rules[0].answers[2].name, "new.example.com.")
+
+	// On its own, an alias being the one answer that cannot share a name.
+	alias := rules_from(t, `["CNAME new.example.com"]`)
+	if testing.expect(t, len(alias) == 1 && len(alias[0].answers) == 1, "expected one answer") {
+		testing.expect_value(t, alias[0].answers[0].kind, Rewrite_Kind.CNAME)
+		testing.expect_value(t, alias[0].answers[0].name, "new.example.com.")
+	}
+
+	free_all(context.temp_allocator)
+}
+
+/*
+A CNAME cannot sit beside other records at the same name (RFC 2181 section
+10.1), and there cannot be two of them.
+
+Barely writable before - a rule was an address, an alias or the sink - and the
+natural thing to write now that a rule can carry several types, which is why the
+check arrives with them. A resolver meeting a CNAME beside an MX has met a
+malformed answer, and what it does with one is its own business: some take the
+first record, some refuse the lot.
+*/
+@(test)
+test_a_cname_cannot_share_its_name :: proc(t: ^testing.T) {
+	answers := [?]string {
+		`["CNAME web.example.com", 'TXT "v=spf1 -all"']`,
+		`["CNAME web.example.com", "MX 10 mail.example.com"]`,
+		`[new.example.com, 192.168.1.50]`,
+		`["CNAME one.example.com", "CNAME two.example.com"]`,
+	}
+	for a in answers {
+		msg := error_from(a)
+		if testing.expectf(t, msg != "", "%s was accepted", a) {
+			testing.expectf(
+				t,
+				strings.contains(msg, "CNAME"),
+				"%s: message %q should say which record is the problem",
+				a,
+				msg,
+			)
+		}
+	}
+
+	// `block` is not a record and answers before the rest of the rule is looked
+	// at, so it may sit anywhere.
+	with_block := rules_from(t, `[block, new.example.com]`)
+	testing.expect(t, len(with_block) == 1, "block beside a CNAME should load")
 
 	free_all(context.temp_allocator)
 }
@@ -164,15 +208,48 @@ the name sunk.
 */
 @(test)
 test_rewrite_short_form_unchanged :: proc(t: ^testing.T) {
-	rules := rules_from(t, `[192.168.1.50, "fd00::10", new.example.com, block]`)
-	if !testing.expect(t, len(rules) == 1 && len(rules[0].answers) == 4, "expected four answers") {
+	rules := rules_from(t, `[192.168.1.50, "fd00::10", block]`)
+	if !testing.expect(t, len(rules) == 1 && len(rules[0].answers) == 3, "expected three answers") {
 		return
 	}
 	testing.expect_value(t, rules[0].answers[0].kind, Rewrite_Kind.A)
 	testing.expect_value(t, rules[0].answers[1].kind, Rewrite_Kind.AAAA)
-	testing.expect_value(t, rules[0].answers[2].kind, Rewrite_Kind.CNAME)
-	testing.expect_value(t, rules[0].answers[2].name, "new.example.com.")
-	testing.expect_value(t, rules[0].answers[3].kind, Rewrite_Kind.Block)
+	testing.expect_value(t, rules[0].answers[2].kind, Rewrite_Kind.Block)
+
+	alias := rules_from(t, `[new.example.com]`)
+	if testing.expect(t, len(alias) == 1 && len(alias[0].answers) == 1, "expected one answer") {
+		testing.expect_value(t, alias[0].answers[0].kind, Rewrite_Kind.CNAME)
+		testing.expect_value(t, alias[0].answers[0].name, "new.example.com.")
+	}
+
+	free_all(context.temp_allocator)
+}
+
+/*
+An error names the key the rule actually used.
+
+`answer:` and `answers:` are both accepted, so a file that says the first and is
+told about `answers[0]` is being pointed at a key it does not contain. A scalar
+has no index to name either.
+*/
+@(test)
+test_rewrite_errors_name_the_key_that_was_used :: proc(t: ^testing.T) {
+	singular := "upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - domain: example.com\n    answer: \"MX ten mail.example.com\"\n"
+	_, serr := load_string(singular, context.temp_allocator)
+	if e, has := serr.?; testing.expect(t, has, "a bad singular answer was accepted") {
+		testing.expectf(
+			t,
+			strings.contains(e.messages[0], "rewrites[0].answer:"),
+			"message %q should name the `answer` key with no index",
+			e.messages[0],
+		)
+	}
+
+	// A list keeps its index, however long it is.
+	msg := error_from(`["MX ten mail.example.com"]`)
+	if testing.expect(t, msg != "", "a bad listed answer was accepted") {
+		testing.expect(t, strings.contains(msg, "rewrites[0].answers[0]"), "a list names its index")
+	}
 
 	free_all(context.temp_allocator)
 }
@@ -342,6 +419,9 @@ test_rewrite_names_must_fit_on_the_wire :: proc(t: ^testing.T) {
 
 	answers := [?]string {
 		strings.concatenate({`["MX 10 `, long_label, `"]`}, context.temp_allocator),
+		// An empty label, which is the same class of unencodable name and the
+		// one an operator actually produces, by typing a dot twice.
+		`["MX 10 mail..example.org"]`,
 		strings.concatenate({`["SRV 0 5 5060 `, long_label, `"]`}, context.temp_allocator),
 		strings.concatenate({`["CNAME `, long_label, `"]`}, context.temp_allocator),
 		strings.concatenate({`[`, long_label, `]`}, context.temp_allocator),

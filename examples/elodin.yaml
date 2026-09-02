@@ -414,7 +414,8 @@ rebind:
 # A, AAAA, CNAME, MX, TXT and SRV. An answer that names a type and gets it wrong
 # fails --check instead of quietly becoming a CNAME, and so does a type that is
 # not in that list. TXT takes either one unquoted line or a sequence of quoted
-# strings of 255 bytes each.
+# strings of 255 bytes each. A CNAME has to be the only record in its rule -
+# it already answers every type.
 #
 # A rule holding only MX, TXT and SRV records adds them to the name and leaves
 # the rest of it alone, so example.com above still resolves its address

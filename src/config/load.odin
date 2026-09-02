@@ -905,28 +905,88 @@ load_rewrites :: proc(l: ^Loader, cfg: ^Config) {
 		}
 		rw.domain = canonical_domain(domain, l.allocator)
 
+		// Whichever of the two spellings the rule used is the one its errors are
+		// reported against: being pointed at `answers[0]` by a file that says
+		// `answer:` is being pointed at a key that is not there.
 		answers_node := yaml.get(e, "answer")
+		key := "answer"
 		if answers_node == nil {
 			answers_node = yaml.get(e, "answers")
+			key = "answers"
 		}
 		raw, ok := yaml.as_string_list(answers_node, l.allocator)
 		if !ok || len(raw) == 0 {
 			errorf(l, "%s: missing answer", path)
 			continue
 		}
+		// A single value written as a scalar has no index to name, while a list
+		// does however long it is.
+		listed := len(yaml.items(answers_node)) > 0
 
 		answers := make([dynamic]Rewrite_Answer, 0, len(raw), l.allocator)
 		for a, ai in raw {
-			ans, parsed := parse_rewrite_answer(l, a, fmt.tprintf("%s.answers[%d]", path, ai))
+			apath := fmt.tprintf("%s.%s", path, key)
+			if listed {
+				apath = fmt.tprintf("%s.%s[%d]", path, key, ai)
+			}
+			ans, parsed := parse_rewrite_answer(l, a, apath)
 			if !parsed {
 				continue
 			}
 			append(&answers, ans)
 		}
+		if !answers_agree(l, answers[:], fmt.tprintf("%s.%s", path, key)) {
+			continue
+		}
 		rw.answers = answers[:]
 		append(&out, rw)
 	}
 	cfg.rewrites = out[:]
+}
+
+/*
+Whether one rule's answers can all be true of the same name at once.
+
+A CNAME says that this name is another name, so nothing else may sit beside it:
+RFC 2181 section 10.1 states the rule and RFC 1034 section 3.6.2 is where it
+comes from, and a resolver that meets a CNAME with an MX or a TXT at the same
+owner has met a malformed answer - some stubs take the first record and some
+refuse the lot. One CNAME per name for the same reason: two aliases for one name
+is not a thing a name can be.
+
+This could not be written before, near enough - a rule was an address, an alias
+or the sink - and the list form that could was rare enough to go unnoticed. The
+new kinds make a mixed list the natural thing to write, so the check goes in
+beside them. `block` is exempt because it is not a record: it says to answer as
+though the name were on a list, which `apply_rewrite` does before it looks at
+anything else in the rule.
+*/
+@(private)
+answers_agree :: proc(l: ^Loader, answers: []Rewrite_Answer, path: string) -> bool {
+	aliases := 0
+	records := 0
+	for a in answers {
+		switch a.kind {
+		case .CNAME:
+			aliases += 1
+		case .A, .AAAA, .MX, .TXT, .SRV:
+			records += 1
+		case .Block:
+		}
+	}
+	if aliases > 1 {
+		errorf(l, "%s: a name can have only one CNAME", path)
+		return false
+	}
+	if aliases == 1 && records > 0 {
+		errorf(
+			l,
+			"%s: a CNAME cannot sit beside other records at the same name (RFC 2181 section 10.1) - it already answers every type, so put the other records on the name it points at",
+			path,
+		)
+		return false
+	}
+	return true
 }
 
 /*
@@ -1196,6 +1256,24 @@ parse_txt_strings :: proc(l: ^Loader, rest, path: string) -> (out: []string, ok:
 			return nil, false
 		}
 		append(&strs, s)
+	}
+
+	/*
+	And the whole record has to fit the 16-bit RDLENGTH in front of it.
+
+	It takes 257 strings to get there, so nobody types this - but a record that
+	cannot be encoded is not a record that fails loudly at query time: the encode
+	fails, `apply_rewrite` returns no answer, and the query goes upstream as
+	though the rule had never matched. Everything else that could produce that
+	outcome is refused at load, and this is the last of them.
+	*/
+	total := 0
+	for s in strs {
+		total += 1 + len(s)
+	}
+	if total > 65535 {
+		errorf(l, "%s: TXT record is %d bytes, and one record may be at most 65535", path, total)
+		return nil, false
 	}
 	return strs[:], true
 }
