@@ -4,39 +4,41 @@ A filtering DNS forwarder in [Odin](https://odin-lang.org), in the spirit of
 Pi-hole and AdGuard Home, minus the web interface. One binary, one YAML file.
 
 - Serves plain DNS (UDP + TCP), DNS-over-TLS and DNS-over-HTTPS (HTTP/2 and HTTP/1.1)
-- Hands Apple devices a `.mobileconfig` profile to point themselves at the DoH endpoint
-- Forwards to plain, TCP, DoT and DoH upstreams
-- Three upstream strategies: failover, round-robin and race
-- Per-domain upstreams, so a zone your own network answers goes to the server that answers it and nowhere else (see `upstream.zones`)
-- Sink lists in hosts, plain-domain and adblock syntax, with allowlists
+- Forwards to plain, TCP, DoT and DoH upstreams, by failover, round-robin or race
+- Per-domain upstreams, so a zone your own network answers goes to the server
+  that answers it and nowhere else
+- Sink lists in hosts, plain-domain and adblock syntax, with allowlists, matched
+  against an answer's CNAME chain as well as the question
 - Answer cache with negative caching and optional stale serving
-- Response rate limiting per client prefix, on every transport and with a separate budget for datagrams and for connections, on by default (see `server.rate_limit`)
-- Client allow list restricting who may query, defaulting to local networks only
-- A ceiling on UDP answer size to bound reflection amplification, on by default
-- Local rewrites (A, AAAA, CNAME, MX, TXT, SRV, or "answer as if blocked"),
-  written as a zone file writes them, with the matching PTR synthesised so a
-  locally answered name has a reverse
 - DNSSEC validation against the root trust anchors, on by default
-- DNS rebinding protection: an upstream answer pointing a public name at loopback, RFC 1918 or link-local space is refused, off by default so split horizon keeps working, one line to turn on (see `rebind`)
-- DNS cookies in both directions (RFC 7873/9018), on by default
-- EDNS(0) padding on DoT and DoH in both directions (RFC 7830/8467), so encrypted messages stop naming themselves by length
-- Ships as a systemd service or a `.deb`, with optional automatic system-resolver takeover
+- Local rewrites (A, AAAA, CNAME, MX, TXT, SRV, or "answer as if blocked"),
+  written as a zone file writes them, with the matching PTR synthesised
+- The reserved names of RFC 6761/7686 answered here rather than forwarded
+- Client allow list (local networks only by default), per-prefix response rate
+  limiting, a ceiling on UDP answer size, DNS cookies in both directions, and
+  EDNS(0) padding on DoT and DoH — all on by default
+- DNS rebinding protection, off by default so split horizon keeps working
+- A `.mobileconfig` profile that points Apple devices at the DoH endpoint
+- A Prometheus endpoint, off by default
+- Ships as a systemd service or a `.deb`, with optional system-resolver takeover
 
-## Requirements
+`examples/elodin.yaml` is the annotated configuration reference. The reasoning
+behind each default lives in the source beside the code it governs —
+`src/config/config.odin` for the settings, and the feature's own package for the
+rest — so this file keeps to what an operator needs to run it.
 
-- [mise](https://mise.jdx.dev) — pins the toolchain (Odin, clang, and Go for the
+## Build
+
+- [mise](https://mise.jdx.dev) pins the toolchain (Odin, clang, and Go for the
   benchmark) and runs the tasks; `mise install` fetches them
 - OpenSSL 3.x with headers (`openssl-devel` / `libssl-dev`) for DoT, DoH and the
   DNSSEC signature checks
 
-Odin shells out to `clang` as its linker driver, so mise pins that too rather
-than relying on the distribution shipping an unversioned `clang`. The pinned
-build is a conda-forge one that defaults to conda's own sysroot, so the tasks
-pass `--sysroot=/ -B/usr/bin` to send the linker back to the system — elodin
-links against the system OpenSSL, and that pair of flags names no library
-directory, so it holds across distributions. The flags live in `ELODIN_LDFLAGS`
-in `mise.toml`; drop the `clang` pin from `[tools]` and they become unnecessary
-if you would rather use your own toolchain.
+Odin shells out to `clang` as its linker driver, so mise pins that too. The
+pinned build defaults to conda's own sysroot, so the tasks pass `--sysroot=/
+-B/usr/bin` (`ELODIN_LDFLAGS` in `mise.toml`) to send the linker back to the
+system OpenSSL; drop the `clang` pin from `[tools]` and those flags become
+unnecessary.
 
 ```sh
 mise trust
@@ -57,40 +59,30 @@ mise run clean            # remove bin/
 
 ## Running
 
-`mise run run` starts elodin with `examples/dev.yaml`, which listens on 5354 and
-caches blocklists under `.cache/` so it runs as an ordinary user.
-
 ```sh
-mise run run                                            # local, unprivileged
+mise run run                                            # port 5354, unprivileged
 ./bin/elodin --config examples/elodin.yaml              # the real thing
 ./bin/elodin --config examples/elodin.yaml --check      # validate and exit
 ./bin/elodin --config examples/elodin.yaml --no-fetch   # skip list downloads
 ```
 
-`examples/elodin.yaml` binds port 53 and caches under `/var/cache/elodin`, so it
-needs privileges. The way to give it exactly the one it needs is
-`CAP_NET_BIND_SERVICE`, which lets it bind below 1024 and start unprivileged:
+`mise run run` uses `examples/dev.yaml`, which listens on 5354 and caches under
+`.cache/` so it runs as an ordinary user. `examples/elodin.yaml` binds port 53
+and caches under `/var/cache/elodin`. Give it the one privilege it needs rather
+than starting it as root:
 
 ```sh
 sudo setcap 'cap_net_bind_service=+ep' ./bin/elodin
 ```
 
-Starting as root works too, but then set `server.user` so it does not stay
-root — see [Privileges](#privileges).
+Starting as root works too, but then set `server.user` — see
+[Privileges](#privileges). If the port is already taken it is usually the system
+resolver (`sudo systemctl stop systemd-resolved`); elodin says as much when a
+bind fails. A cache directory it cannot write is a warning, not an error: the
+lists still apply, they just have to be fetched again next start.
 
-If the port is already taken it is usually the system resolver:
-`sudo systemctl stop systemd-resolved`. elodin says as much when a bind fails.
-
-A cache directory it cannot write is a warning, not an error: the lists are
-still downloaded and applied, they just have to be fetched again on the next
-start.
-
-The listeners bind `0.0.0.0`, but by default only the local networks are served
-— loopback, RFC 1918, IPv6 loopback, unique local and link-local. Clients on
-another network need adding to `server.allow_from`; see
-[Who may ask](#who-may-ask).
-
-`examples/elodin.yaml` documents every setting. A minimal config is:
+The listeners bind `0.0.0.0`, but only the local networks are served by default
+— see [Who may ask](#who-may-ask). A minimal configuration:
 
 ```yaml
 upstream:
@@ -103,9 +95,8 @@ blocking:
 
 ### As a service
 
-`packaging/elodin.service` is a systemd unit for the usual arrangement: the
-binary at `/usr/local/bin/elodin`, the configuration at
-`/etc/elodin/elodin.yaml`.
+`packaging/elodin.service` expects the binary at `/usr/local/bin/elodin` and the
+configuration at `/etc/elodin/elodin.yaml`:
 
 ```sh
 sudo install -m755 bin/elodin /usr/local/bin/elodin
@@ -115,107 +106,62 @@ sudo systemctl enable --now elodin
 ```
 
 It binds :53 through `AmbientCapabilities=CAP_NET_BIND_SERVICE` rather than as
-root, and runs under `DynamicUser=yes` with `ProtectSystem=strict`, so systemd
-provides the state, cache and configuration directories and nothing else on the
-filesystem is writable. `RestrictAddressFamilies=AF_INET AF_INET6` leaves it the
-two families it actually uses.
+root, and runs under `DynamicUser=yes` with `ProtectSystem=strict`.
+`Restart=on-failure` with `StartLimitBurst=5` retries a start that fails for a
+reason that passes, and gives up in `failed` on one that does not — a port it
+cannot have, a certificate it cannot read. `systemctl reset-failed elodin` clears
+that.
 
-`Restart=on-failure` covers a start that fails for a reason that passes, but
-`StartLimitBurst=5` over five minutes stops it retrying one that does not — a
-port it cannot have, a certificate it cannot read. The unit gives up in
-`failed`, where `systemctl status` and anything watching it will say so, rather
-than reporting `activating` forever and reloading the blocklists once every few
-seconds against a machine that has no resolver. `systemctl reset-failed elodin`
-clears that once the cause is dealt with.
-
-A published GitHub release carries a `linux-amd64` and a `linux-arm64` tarball
-built by `.github/workflows/release.yml`, each holding the optimised binary, the
-unit file, the example configuration, this README and the licence, and a `.deb`
-of the same binary for each architecture. Both are built natively, on a runner
-of the architecture they target, because elodin binds the system libssl and
-libcrypto and cross-compiling would mean carrying a sysroot for each.
-
-CI (`.github/workflows/ci.yml`) runs on every pull request and on every push to
-`main`: `mise run check` once, `mise run test` and `mise run itest` on both
-architectures, `mise run fuzz-regression` once, `mise run leakcheck` once,
-`mise run build` on both, and — also on both — a `mise run deb` that is then
-installed on the runner, asked to resolve a handful of names through the
-takeover it just performed, and removed again with a check that the runner got
-its own resolver back.
+A published GitHub release carries `linux-amd64` and `linux-arm64` tarballs and a
+`.deb` for each, both built natively: elodin binds the system libssl, so
+cross-compiling would mean carrying a sysroot per architecture.
 
 ### From a .deb
 
 ```sh
-sudo apt install ./elodin_0.13.0-1_amd64.deb
+sudo apt install ./elodin_*_amd64.deb
 ```
 
 The binary lands at `/usr/bin/elodin`, the unit at
-`/usr/lib/systemd/system/elodin.service`, and `examples/elodin.yaml` at
-`/etc/elodin/elodin.yaml` as a conffile — dpkg keeps your edits across upgrades
-and asks before replacing them. This README and the licence go to
-`/usr/share/doc/elodin/`, the latter as `copyright`. `apt purge` removes the
-configuration, the blocklist cache and the state directory.
+`/usr/lib/systemd/system/elodin.service`, and the example configuration at
+`/etc/elodin/elodin.yaml` as a conffile, so dpkg keeps your edits across
+upgrades. `apt purge` removes the configuration, the blocklist cache and the
+state directory.
 
-The install asks one question, and it defaults to yes:
+The install asks one question, defaulting to yes:
 
 > **Make elodin the system resolver?**
 
-Answering yes stops, disables and **masks** systemd-resolved, replaces
-`/etc/resolv.conf` with a real file naming `127.0.0.1` (carrying over any
-`search` domains from the old one), and enables and starts elodin. Masking as
-well as disabling matters: a later systemd upgrade would otherwise switch
-resolved back on and take port 53 at the next boot. elodin reaches its
-blocklists and upstreams through the `upstream.bootstrap` addresses rather than
-through the system resolver, so it does not depend on the resolver it is in the
-middle of replacing.
+Yes stops, disables and **masks** systemd-resolved — masking too, since a later
+systemd upgrade would otherwise switch it back on and take port 53 at the next
+boot — replaces `/etc/resolv.conf` with a real file naming `127.0.0.1`, carrying
+over any `search` domains, and starts elodin. elodin reaches its blocklists and
+upstreams through `upstream.bootstrap`, so it does not depend on the resolver it
+is replacing.
 
-Answering no installs elodin and leaves everything alone. `sudo dpkg-reconfigure
-elodin` asks again, so the decision is not one-way. For unattended installs,
-preseed it:
+Nothing is disabled until `elodin --check` has passed, and if elodin then fails
+to stay up the package puts systemd-resolved and the old `/etc/resolv.conf` back
+and fails the install. Removing the package restores them the same way, at `apt
+remove` rather than waiting for `apt purge`. `sudo dpkg-reconfigure elodin` asks
+again; for unattended installs, preseed it:
 
 ```sh
 echo 'elodin elodin/takeover-dns boolean true' | sudo debconf-set-selections
 ```
 
-Nothing is disabled until `elodin --check` has passed on the configuration the
-service will use, and if elodin then fails to stay up — a certificate it cannot
-read, a port it cannot have — the package puts systemd-resolved and the old
-`/etc/resolv.conf` back and fails the install rather than leaving a machine
-pointed at a resolver that is not answering. Removing the package restores them
-the same way, whichever answer was given, and `apt remove` is enough: it does
-not wait for `apt purge`, because a machine that has just lost its resolver
-needs the old one back immediately.
-
-`mise run deb` builds one from a checkout into `dist/`, for the architecture of
-the machine that runs it. The script behind it, `packaging/build-deb.sh`,
-assembles the archive with `dpkg-deb` instead of debhelper and a `debian/`
-directory: the package is a binary, a unit file and a configuration file, and it
-is published to a personal apt repository rather than to Debian, so nothing
-downstream reads what that machinery produces. The one unit file serves both
-routes — the script rewrites `ExecStart` to `/usr/bin`, since a package may not
-write to `/usr/local`.
-
 ### Privileges
 
 Binding a port below 1024 is the only privileged thing elodin does, and it is
-over within a second of starting. Everything after that — DNS wire data, HTTP/2
-frames, TLS records — is parsing input that came off the network, and it runs
-for the life of the process. A resolver that is still root while doing that
-turns any single bug in that code into a root compromise rather than the loss of
-one service account. The release build keeps bounds checks on, so a missed guard
-in a parser is a crash rather than a write at an offset the peer chose — but a
-bounds check is the last line, not the only one, and it does nothing for the
-classes of bug it cannot see.
+over within a second of starting; everything after that is parsing input that
+came off the network. Either of two arrangements keeps it from being root while
+it does that.
 
-There are two ways not to be root, and either is enough:
+**Never become root.** Grant the capability, as the systemd unit does, or
+`setcap` as above and start as an ordinary user. Leave `server.user` empty —
+there is nothing to drop.
 
-**Never become root.** Grant the capability instead, which is what the systemd
-unit does with `AmbientCapabilities=CAP_NET_BIND_SERVICE` and `DynamicUser=yes`.
-By hand, `sudo setcap 'cap_net_bind_service=+ep' ./bin/elodin` and start it as
-an ordinary user. Leave `server.user` empty here — there is nothing to drop.
-
-**Start as root and put it down.** Name an account in `server.user`, and elodin
-switches to it the moment the listeners have their ports:
+**Start as root and put it down.** Name an account and elodin switches to it the
+moment the listeners have their ports:
 
 ```yaml
 server:
@@ -223,57 +169,31 @@ server:
   group: elodin       # optional; defaults to the user's primary group
 ```
 
-```sh
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin elodin
-```
+Supplementary groups go first, then the gid, then the uid — all three of real,
+effective and saved — and the result is read back from the kernel before it is
+reported. A drop that was configured and did not happen ends the process. A
+misspelt account name fails `--check`; running as root with no `server.user`
+logs a warning. `blocking.cache_dir` changes owner along with the process, since
+a refresh hours later has to reopen it.
 
-The supplementary groups are cleared first, then the gid, then the uid, all
-three of real, effective and saved — so there is no saved uid to step back
-into — and the result is read back from the kernel before it is reported. A drop
-that was configured and did not happen ends the process rather than leaving it
-running as root.
+### Signals
 
-`blocking.cache_dir` changes owner along with the process, because the lists are
-downloaded before the listeners bind and a refresh hours later has to reopen
-them. `log.file` needs nothing: it is opened once at startup and the process
-keeps writing through that descriptor.
+`SIGTERM` and `SIGINT` stop the listeners and let the worker pools drain. Open
+client connections are waited on, and an idle one is only noticed when its read
+times out, so stopping can take up to `server.client_timeout` (ten seconds by
+default). A second signal terminates immediately.
 
-A misspelt account name is caught by `--check`, so a bad `server.user` is a
-configuration error before a restart rather than a resolver that comes up, takes
-port 53 and then exits. Running as root with no `server.user` set logs a warning
-at startup.
+`SIGHUP` re-reads the DoT/DoH certificate and key from the paths already in the
+configuration and switches the listeners over, with no restart and no dropped
+connections: a session in progress keeps the certificate it handshook with. One
+that fails to load is logged and left alone, and the listener keeps serving what
+it had. Nothing else is reloaded this way — listener addresses, the upstream set
+and blocking need a restart.
 
-### Stopping
+### Logs
 
-`SIGTERM` and `SIGINT` ask for an orderly shutdown: the listeners stop, the
-worker pools drain what they had queued, and everything those jobs use is
-released afterwards rather than out from under them. An idle server is gone in
-well under a tenth of a second.
-
-Open client connections are waited on, and a connection sitting idle is only
-noticed when its read times out — so with clients connected, stopping can take
-up to `server.client_timeout` (ten seconds by default). That is comfortably
-inside systemd's `TimeoutStopSec`. A second signal skips the wait and terminates
-immediately, for when that is not what you want.
-
-### Reloading
-
-`SIGHUP` re-reads the DoT/DoH certificate and key files from the paths already
-in the configuration and switches the listeners over to what they now contain
-— `systemctl reload elodin`, or `kill -HUP` directly, with no restart and no
-dropped connections: a session already in progress keeps using the
-certificate it handshook with until it closes. A certificate that fails to
-load, the wrong key or a renewal caught mid-write, is logged and left alone;
-the listener keeps serving whatever it already had.
-
-Nothing else about the configuration is reloaded this way — listener
-addresses, the upstream set, blocking — those still need a restart.
-
-### Observing it
-
-Every line is [logfmt](https://brandur.org/logfmt): `key=value` pairs, quoted
-only where a value needs it, with the time and the severity as fields rather
-than as a prefix a collector has to be taught to recognise.
+Every line is [logfmt](https://brandur.org/logfmt), with the time and severity as
+fields rather than a prefix a collector has to be taught to recognise:
 
 ```
 ts=2026-08-07T09:12:33Z level=info msg=ready strategy=Round_Robin upstreams=2 cache=true blocking=true dnssec=true rebind=false
@@ -281,46 +201,42 @@ ts=2026-08-07T09:12:41Z level=info msg=query client=192.0.2.10:44188 proto=udp q
 ts=2026-08-07T09:12:44Z level=warn msg="list steven-black: unavailable, skipping it"
 ```
 
-`ts` is RFC 3339 in UTC, and `msg` names the event: the lines something is
-expected to watch — `starting`, `sizing`, `ready`, `stats`, `query` — keep the
-same `msg` from one line to the next and carry what differs in fields beside
-it. Everything else is one human sentence in `msg`, quoted because it has
-spaces in it. In Loki that is `| logfmt` and nothing else:
+The lines something is expected to watch — `starting`, `sizing`, `ready`,
+`stats`, `query` — keep the same `msg` from one line to the next and carry what
+differs in fields beside it; everything else is one human sentence in `msg`. In
+Loki that is `| logfmt` and nothing else:
 
 ```logql
 {job="elodin"} | logfmt | msg="query" | outcome="blocked"
 {job="elodin"} | logfmt | msg="stats" | unwrap cache_hits
 ```
 
-Statistics go to the log every five minutes, as `msg=stats` — `queries`,
+Statistics go to the log every five minutes as `msg=stats`: `queries`,
 `blocked`, `cached`, `forwarded`, `failed`, `dropped`, `refused`,
 `conn_refused`, `conn_failed`, `limited`, `truncated`, `secure`, `bogus`,
-`rebind` and `special_use`, plus `cache_entries`, `cache_bytes`, `cache_hits`, `cache_withheld`,
-`cache_misses`, `cache_stale`
-and `cache_evictions` — and `log.queries` adds one `msg=query` line per query, at
-the cost noted under [Resource use](#resource-use).
+`rebind` and `special_use`, plus `cache_entries`, `cache_bytes`, `cache_hits`,
+`cache_withheld`, `cache_misses`, `cache_stale` and `cache_evictions`.
+`log.queries` adds one `msg=query` line per query. A query name is the one field
+whose bytes a client chooses; it is escaped like any other value, so a name
+holding a quote or a newline cannot forge a field of its own.
 
-The same numbers, and what the kernel knows about the process besides, are
-available to a scraper once [`metrics.enabled`](#metrics) is set. It is off by
-default, and it is the same counters either way: the endpoint adds nothing to
-the path a query takes.
-
-A query name is the one field in that line whose bytes a client chooses. It is
-escaped like any other value, so a label holding a quote or a newline stays
-inside its own value and cannot forge a field of its own.
+Repeated refusals — an unauthorised source, a truncation, a connection past the
+limit, a rebinding refusal — are logged once at `warn`, naming the setting, and
+at `debug` after that, so whoever is triggering them does not decide how much
+this server writes to disk. The stats counters carry the rest.
 
 ## Configuration
 
 ### Upstreams
 
-Each server is either a mapping or a shorthand string:
-
 ```yaml
 upstream:
-  strategy: failover
+  strategy: failover               # failover | round_robin | race
   timeout: 5s
   attempts: 2
-  bootstrap: [1.1.1.1, 9.9.9.9]   # resolves upstream hostnames
+  max_idle: 8                      # pooled connections per upstream
+  idle_timeout: 30s
+  bootstrap: [1.1.1.1, 9.9.9.9]    # resolves upstream hostnames
   servers:
     - name: cloudflare-dot
       type: tls                    # udp | tcp | tls | https
@@ -330,23 +246,8 @@ upstream:
     - https://dns.google/dns-query
     - tcp://9.9.9.9
     - 192.168.1.1
+  zones: []                        # per-domain routes; see below
 ```
-
-`bootstrap` matters: elodin resolves upstream hostnames itself rather than
-through the system resolver, since on a machine where elodin *is* the system
-resolver the latter would come straight back to a server that has not started
-listening yet.
-
-A `https` upstream picks between HTTP/2 and HTTP/1.1 with ALPN, preferring h2,
-the same way the [DoH listener](#dns-over-https) does — some public resolvers
-answer HTTP/1.1 only, and elodin does not assume either is always available.
-Every concurrent query against an h2 upstream multiplexes onto one shared
-connection instead of opening one per request; an upstream that turns out to
-speak HTTP/1.1 falls back to the same pooled-connection model TCP and DoT use.
-Which protocol a given upstream speaks is discovered once, from its first
-connection, and not re-checked after.
-
-Strategies:
 
 | `strategy`    | behaviour                                                        |
 |---------------|------------------------------------------------------------------|
@@ -354,23 +255,32 @@ Strategies:
 | `round_robin` | the same, but the starting position advances on every query      |
 | `race`        | query every healthy server at once, take the first usable answer |
 
-An upstream that fails three times in a row is skipped for ten seconds, so a
-dead server stops costing every query a full timeout. If every upstream is in
-that state they are all tried anyway.
+`race` multiplies upstream traffic by the number of servers.
 
-A TLS handshake the peer resets partway through is retried once before it counts
-as one of those failures — some public resolvers do this to a fair share of
-fresh connections while the very next attempt goes through, and without the
-retry a run of them parks a server that is working. Only a reset is retried: it
-comes back in a round trip, where a timeout has already spent the query's budget
-and a rejected certificate will not improve on a second look. This covers DoT
-and every HTTPS upstream alike.
+`bootstrap` matters: elodin resolves upstream hostnames itself rather than
+through the system resolver, since on a machine where elodin *is* the system
+resolver the latter would come straight back to a server that has not started
+listening yet.
+
+An upstream that fails three times in a row is skipped for ten seconds; if every
+upstream is in that state they are all tried anyway. A TLS handshake the peer
+resets partway through is retried once first, since some public resolvers do that
+to a fair share of fresh connections while the very next attempt goes through.
+Only a reset is retried.
+
+An `https` upstream picks between HTTP/2 and HTTP/1.1 with ALPN, preferring h2,
+since some public resolvers answer HTTP/1.1 only. Concurrent queries against an
+h2 upstream multiplex onto one connection; an HTTP/1.1 one uses the same pooled
+connections TCP and DoT do. Which it speaks is discovered from its first
+connection and not re-checked.
 
 #### Per-domain upstreams
 
 If something on your network answers for a zone of its own — a domain controller
 for `corp.example`, a router that answers `home.arpa`, a lab server with an
-internal `.test` — name that zone and where it goes:
+internal `.test` — name that zone and where it goes, rather than choosing between
+a public resolver that has never heard of it and an internal server asked to
+recurse the whole Internet:
 
 ```yaml
 upstream:
@@ -382,16 +292,13 @@ upstream:
       servers: [192.168.1.1]      # the router
 ```
 
-Without this the choice is between a public resolver that has never heard of
-your zone and an internal server asked to recurse the whole Internet. This is
-dnsmasq's `server=/corp.example/10.0.0.1`, unbound's `forward-zone`, blocky's
-`conditionalMapping` and AdGuard Home's `[/corp.example/]10.0.0.1`.
+This is dnsmasq's `server=/corp.example/10.0.0.1`, unbound's `forward-zone`,
+blocky's `conditionalMapping` and AdGuard Home's `[/corp.example/]10.0.0.1`.
 
 A route is a whole upstream in its own right, so it takes anything `upstream`
 itself takes — `strategy`, `timeout`, `attempts`, `max_idle`, `idle_timeout`,
-`bootstrap`, and servers in every form and transport, DoT and DoH included. What
-it does not say, it inherits from the `upstream` block around it, so a timeout
-set once applies to routes as well:
+`bootstrap`, and servers in every form and transport, DoT and DoH included — and
+inherits from the `upstream` block around it whatever it does not say:
 
 ```yaml
 upstream:
@@ -406,75 +313,55 @@ upstream:
           address: 10.0.0.1
           hostname: dc1.corp.example
         - 10.0.0.2
-```
-
-`domains` matches on label boundaries: `corp.example` covers `corp.example`
-itself and everything under it, and does not cover `notcorp.example`. Case does
-not matter. The longest matching route wins, so a sub-zone can be sent elsewhere
-without the broader entry being rewritten:
-
-```yaml
-  zones:
-    - domains: [corp.example]
-      servers: [10.0.0.1]
-    - domains: [dev.corp.example]   # wins for names under dev
+    - domains: [dev.corp.example]   # longest match wins for names under dev
       servers: [10.1.0.1]
 ```
 
-Two more things follow from a route, both of which would otherwise have to be
-configured separately and both of which break the deployment when they are
-forgotten:
+`domains` matches on label boundaries and ignores case, so `corp.example` covers
+itself and everything under it but not `notcorp.example`, and the longest
+matching route wins — a sub-zone can be sent elsewhere without rewriting the
+broader entry.
+
+Two things follow from a route, both of which would otherwise have to be
+configured separately and both of which break the deployment when forgotten:
 
 - **The zone is not validated.** A local zone holds unsigned data under a public
   parent that delegates nothing to it, so walking the public chain for a name
-  inside it finds a missing delegation and calls a perfectly good answer bogus —
-  SERVFAIL for a name that was never public. Routed names are served insecure,
-  without the AD bit, exactly as the RFC 6303 private reverse zones are. A
-  [`trust_anchors`](#dnssec) entry covering the zone stands that bypass down —
-  the names are then validated like any other. Read that as "the bypass is off",
-  not as "the zone now validates": the chain walk starts at the root and descends
-  by `DS`, so it reaches a signed internal zone only if the public tree delegates
-  to it. A zone signed purely internally has no such delegation, and standing the
-  bypass down there turns a working insecure answer into SERVFAIL. Note also that
-  `trust_anchors` *replaces* the built-in root keys rather than adding to them,
-  so a list naming only your own zone leaves the validator with no root anchor
-  and SERVFAILs everything — list the root DS alongside it.
+  inside it finds a missing delegation and calls a good answer bogus. Routed
+  names are served insecure, without the AD bit, exactly as the RFC 6303 private
+  reverse zones are. A [`trust_anchors`](#dnssec) entry covering the zone stands
+  that bypass down — read that as "the bypass is off" rather than "the zone now
+  validates", since the chain walk descends by `DS` from the root and reaches an
+  internal zone only if the public tree delegates to it. And `trust_anchors`
+  *replaces* the built-in root keys rather than adding to them, so list the root
+  DS alongside your own.
 - **The zone may answer with private addresses.** A route says the zone is
   answered by a local authority, and answering with local addresses is what a
   local authority is for, so [rebind protection](#dns-rebinding-protection)
-  exempts a routed zone without it also having to appear in
-  `rebind.allow_domains`.
+  exempts a routed zone without it also appearing in `rebind.allow_domains`.
 
-What does *not* follow a route is the DNSSEC chain walk. The lookups elodin
-makes on its own account — `DS` and `DNSKEY` for the zones above a name — always
-go to `upstream.servers`, because a server authoritative for `corp.example`
-answers `corp.example DS` out of its own zone rather than fetching the signed
-proof from the parent, and that answer breaks a chain instead of completing it.
+What does *not* follow a route is the DNSSEC chain walk: the `DS` and `DNSKEY`
+lookups elodin makes on its own account always go to `upstream.servers`, because
+a server authoritative for `corp.example` answers `corp.example DS` out of its
+own zone rather than fetching the signed proof from the parent, and that answer
+breaks a chain instead of completing it.
 
-The answer cache is keyed on the question and not on which upstream produced it,
-which is sound because the routing table is built once at startup and
-configuration is not reloaded. Restart after changing a route.
+The answer cache is keyed on the question rather than on which upstream produced
+it, which holds because the routing table is built once at startup — restart
+after changing a route. `--check` and the startup log say out loud what each
+route gives up, one line per route, since nothing at load can tell an internal
+zone from a public signed one.
 
-`--check` says out loud what each route gives up, one line per route, and so
-does the log at startup. Nothing at load can tell an internal zone from a public
-signed one — whether a zone is signed is a question only the DNS answers — so the
-line states the two implications and leaves the judgement to you. It is not
-printed for a check the file has already turned off, nor for the half a
-`trust_anchors` entry over the routed zone takes back.
-
-A route into a zone [`special_use`](#names-that-are-never-forwarded) already
-answers is refused at load. Those names are answered from the table before
-anything is forwarded, so a route under `special_use.home_arpa: true` would sit
-in the file looking like the fix while every `home.arpa` name went on getting the
-table's NXDOMAIN — turn the key off in the same edit that adds the route, which
-is the whole point of the key being off by default.
+A route into a zone [`special_use`](#reserved-names) already answers is refused
+at load: those names are answered from the table before anything is forwarded,
+so the route would sit in the file looking like the fix while every name went on
+getting the table's NXDOMAIN. Turn the key off in the same edit.
 
 > **Coming from dnsmasq:** `server=/corp.example/10.0.0.1` in `blocking.rules`
-> does not route that zone — it *blocks* it. That form turns up in downloaded
-> blocklists, where it means a blackhole, so the list parser reads it as one. In
-> `blocking.allow` it does not even do that: the entry is discarded and neither
-> list changes, which looks exactly like the route not working. `--check` warns
-> about either one written by hand. Routing lives under `upstream.zones` and
+> does not route that zone — it *blocks* it, that form meaning a blackhole in the
+> downloaded lists the parser was written for. In `blocking.allow` it is
+> discarded entirely, which looks exactly like the route not working. `--check`
+> warns about either written by hand. Routing lives under `upstream.zones` and
 > nowhere else.
 
 ### Sink lists
@@ -501,8 +388,6 @@ blocking:
   # allow: ["||googleadservices.com^"]   # an exception outranks every list
 ```
 
-What each list format matches:
-
 | syntax                     | matches                          |
 |----------------------------|----------------------------------|
 | `0.0.0.0 ads.foo.com`      | `ads.foo.com` exactly            |
@@ -513,84 +398,77 @@ What each list format matches:
 | `address=/foo.com/0.0.0.0` | `foo.com` and its subdomains     |
 | `@@\|\|safe.foo.com^`      | never blocked                    |
 
-Hosts entries are exact because hosts-format lists spell out every subdomain
-they mean; bare domains and `||` rules cover subtrees. This matches how AdGuard
-Home reads the same files. Allow rules always win over block rules.
+Hosts entries are exact because hosts-format lists spell out every subdomain they
+mean; bare domains and `||` rules cover subtrees, which is how AdGuard Home reads
+the same files. Allow rules always win. The `address=/…/` and `server=/…/` forms
+are dnsmasq's, accepted because they turn up in lists that are otherwise adblock
+syntax; a `$` modifier is dropped and the rest of the rule kept, and a rule that
+cannot be expressed as a domain is skipped rather than failing its list.
+Downloaded lists are cached under `cache_dir`, and a refresh that fails falls
+back to the cached copy, so a network outage cannot silently turn blocking off.
 
-The rules are matched against the answer as well as the question. An answer
-whose CNAME chain lands on a listed name is blocked as though that name had been
-asked for: the arrangement to catch is a tracker given a subdomain inside the
-site's own zone — `metrics.brand.example` CNAME `tracker.evil.example` — where
-the question is a first-party name no list can usefully carry and the address the
-browser connects to is the tracker's, with the site's own cookies attached.
-Pi-hole calls this deep CNAME inspection and AdGuard Home does the same thing to
-CNAME targets. Every hop is matched rather than only the last, up to sixteen of
-them. An allow rule exempts the whole answer only when it matches the
-*question* — that is the escape hatch when a first-party name resolves through a
-CDN somebody has listed, so name the first-party lookup rather than the CDN. An
-allow rule matching a hop clears that hop and no other: the party writing the
-answer is the party this feature is aimed at, and if any allowlisted name
-appearing anywhere in an answer excused the rest of it, every allowlist entry
-would be a key for turning the check off. These show in the query log as `outcome=blocked
-detail=cname`, against `detail=list` for a question that was on a list itself,
-and the name that matched is logged at debug level.
+**CNAME chains are matched too** — Pi-hole calls it deep CNAME inspection. The
+arrangement to catch is a tracker given a subdomain inside the site's own zone,
+`metrics.brand.example` CNAME `tracker.evil.example`, where the question is a
+first-party name no list can usefully carry. Every hop is matched, up to sixteen,
+logged as `outcome=blocked detail=cname` against `detail=list` for a question
+that was listed itself; an answer whose chain runs past the sixteenth name is
+withheld rather than served. An allow rule on the *question* exempts the whole
+answer — the escape hatch when a first-party name resolves through a listed CDN —
+while one matching a hop clears that hop and no other.
 
-An answer whose chain runs past that sixteenth name is **withheld**, not served.
-Bounding the walk and then handing over whatever it did not reach would not be a
-bound at all — it would be a length to exceed, and exceeding it is free for
-whoever writes the answer, so a listed name one hop past the end would go
-straight through. Real chains are one or two names and no zone publishes
-seventeen, so what this turns away is answers built to be turned away. They are
-counted as blocked and logged as `outcome=blocked detail=cname-deep`; an allow
-rule on the *question* skips the walk entirely and is the way out. Note that an
-allow rule on a hop past the sixteenth cannot help, because the walk stops
-before reaching it.
-
-Four details name a withheld or failed answer that no list explains, and
-they are what to search the query log for when a site breaks and nothing in the
-lists accounts for it:
+Four details name a withheld or failed answer that no list explains, and they are
+what to search the query log for when a site breaks and the lists do not account
+for it:
 
 | detail | rcode | what happened |
 | --- | --- | --- |
 | `cname-deep` | the `blocking.response` | the chain ran past the sixteenth name, so where it ends was never checked |
-| `cname-unreadable` | SERVFAIL | a CNAME's target could not be parsed, so where it leads could not be checked |
-| `answer-unreadable` | SERVFAIL | the upstream's reply could not be parsed at all, so it could not be walked |
+| `cname-unreadable` | SERVFAIL | a CNAME's target could not be parsed |
+| `answer-unreadable` | SERVFAIL | the upstream's reply could not be parsed at all |
 | `cache-unreadable` | SERVFAIL | a stored answer could not be parsed on the way back out |
 
-The two `-unreadable` ones answer SERVFAIL rather than what `blocking.response`
-says, and the split is deliberate: a listed name and an over-long chain are
-answers somebody built, so the operator's chosen refusal fits them, while a
-record that will not parse is as likely to be an upstream or a middlebox having
-a bad day. Reporting that as NXDOMAIN would tell a client a name it asked for
-does not exist, with no rule behind it, and the stub would cache that for
-`blocking.block_ttl`; SERVFAIL is the only one of the answers a stub will retry
-or fail over from.
+The `-unreadable` ones answer SERVFAIL rather than `blocking.response`, since a
+record that will not parse is as likely an upstream having a bad day as an
+attack, and SERVFAIL is the only answer a stub will retry or fail over from.
+`answer-unreadable` is the one worth watching: it is a way for a name to stop
+resolving that appears only once blocking is on, since with blocking off nothing
+walks the answer and nothing needs to parse it.
 
-`answer-unreadable` is the one worth knowing about, because it is a way for a
-name to stop resolving that appears only once blocking is on: with blocking off
-nothing walks the answer, so nothing needs to parse it, and the same reply is
-forwarded. Every case of it is a name or a length that ran outside the message,
-which a client would have to reject too — but if an upstream produces them
-routinely, that is the line that says so.
+### Cache
 
-The `address=/…/` and `server=/…/` forms are dnsmasq's, accepted because they
-turn up in lists that are otherwise adblock syntax. A `$` modifier
-(`$third-party`, `$important`) is dropped and the rest of the rule kept: none of
-the modifiers change which *name* a rule matches, and the ones that would need
-something a DNS answer cannot express.
+```yaml
+cache:
+  enabled: true
+  max_entries: 10000
+  max_bytes: 64MiB       # a count of entries is not a bound on memory
+  min_ttl: 0
+  max_ttl: 24h
+  negative_ttl: 300      # cap for NXDOMAIN / NODATA (RFC 2308)
+  serve_stale: false     # answer from an expired entry if the upstream is down
+```
 
-Downloaded lists are cached under `cache_dir`. A refresh that fails falls back
-to the cached copy, so a network outage cannot silently turn blocking off.
-Rules that cannot be expressed as a domain (regexes, path-scoped rules) are
-skipped rather than failing the whole list.
+Answers are stored as untouched wire bytes plus the offsets of their TTL fields,
+and those TTLs are rewritten in place on each hit, so name compression stays
+intact and there is no decode/encode round trip on the hot path.
+
+Both bounds are needed, because an entry's size is decided by whoever answered
+the query — the response as it arrived, up to 64 KiB over a stream transport,
+plus an offset and a TTL per record. Eviction is from the least recently used end
+whenever either bound is passed, and `cache_bytes=` in the stats line reports
+what is held.
+
+`max_ttl` caps every answer passed on from an upstream, forwarded or cached, as
+well as how long the entry is kept; it does not touch the answers elodin writes
+itself, which carry `blocking.block_ttl` or a rewrite's own `ttl`. `min_ttl` is a
+floor on the copies served from an entry. Neither is a promise that a client
+drops a record when this cache does: an entry lives for the smallest TTL in the
+message it holds, a negative one for the SOA's figure capped by `negative_ttl`,
+while every record still goes out carrying its own TTL up to the ceiling. A TTL
+with its top bit set is taken as zero per RFC 2181 section 8, forwarded answers
+included, which leaves it uncacheable unless `min_ttl` raises it.
 
 ### DNS-over-HTTPS
-
-The endpoint serves both HTTP/2 and HTTP/1.1 and picks between them with ALPN,
-preferring h2. That matters because Firefox and Chrome will only use a DoH
-resolver over HTTP/2; curl, `dnscrypt-proxy` and routers that speak HTTP/1.1
-keep working unchanged. A client offering neither gets a clean handshake
-failure rather than a connection that then talks past us.
 
 ```yaml
 listeners:
@@ -604,59 +482,46 @@ listeners:
     mobileconfig_path: /apple-doh.mobileconfig
 ```
 
+The endpoint serves HTTP/2 and HTTP/1.1 and picks between them with ALPN,
+preferring h2. That matters because Firefox and Chrome will only use a DoH
+resolver over HTTP/2, while curl, `dnscrypt-proxy` and HTTP/1.1 routers keep
+working unchanged; a client offering neither gets a clean handshake failure.
 Both request forms of RFC 8484 are accepted on either version: `POST` with an
 `application/dns-message` body, and `GET` with a base64url `dns` parameter.
+Requests on one HTTP/2 connection are answered on the query worker pool rather
+than one after another on the connection's reader thread, so the A and AAAA
+lookups a browser issues for the same name run at the same time.
+
+`src/h2/` covers the preface and SETTINGS exchange, HPACK with Huffman decoding
+and a full dynamic table, HEADERS with CONTINUATION, DATA, connection- and
+stream-level flow control, WINDOW_UPDATE, PING, RST_STREAM and GOAWAY. Server
+push is refused and stream priority parsed and ignored, which RFC 9113 permits.
+What one connection may make this end hold is stated in the SETTINGS frame rather
+than left to be discovered: 128 concurrent streams, a 32 KiB header list, a
+4096-byte HPACK table — also the ceiling on a peer's table size updates — and at
+most 128 CONTINUATION frames per header block, since a block bounded only by its
+size never ends if the frames carrying it are empty.
+
+A decoded header list is checked against RFC 9113 sections 8.2 and 8.3 before it
+becomes a request, and anything malformed there is a stream error of type
+PROTOCOL_ERROR. A conformant `CONNECT` is the one shape that looks malformed by
+those rules and is not, so it draws a 404 rather than a stream error. The
+HTTP/1.1 side refuses the same shapes.
 
 #### Apple devices (iOS, iPadOS, macOS)
 
 Encrypted DNS on iOS 14 / macOS 11 and later is configured with a profile rather
-than an app. The DoH listener serves one: browse to `mobileconfig_path` on the
-device — `https://dns.example.com/apple-doh.mobileconfig` — and it downloads a
-`.mobileconfig` that, once installed under **Settings → General → VPN & Device
-Management**, sends the device's DNS to this resolver over HTTPS system-wide.
+than an app, and the DoH listener serves one: browse to `mobileconfig_path` on
+the device and it downloads a `.mobileconfig` that, installed under **Settings →
+General → VPN & Device Management**, sends the device's DNS here over HTTPS
+system-wide.
 
-The `ServerURL` inside the profile is built from the host the request arrived on,
-so it always matches the name the certificate is for and the port the listener
-is on; a listener answering on several names hands each device a profile for the
-one it used. The profile is unsigned, so the device shows it as *Unverified* on
-install, which is expected for a self-hosted resolver. Reinstalling replaces the
-profile rather than stacking a duplicate — its identifiers are derived from the
-URL, so the same endpoint always yields the same profile. Set
+The `ServerURL` inside is built from the host the request arrived on, so it always
+matches the name the certificate is for, and a listener answering on several
+names hands each device a profile for the one it used. Its identifiers derive
+from the URL, so reinstalling replaces the profile rather than stacking a
+duplicate. The profile is unsigned, so the device shows it as *Unverified*. Set
 `mobileconfig_path: ""` to withhold it; it is served only while DoH is enabled.
-
-Requests arriving on one HTTP/2 connection are answered on the query worker pool
-rather than one after another on the connection's reader thread, so the A and
-AAAA lookups a browser issues for the same name run at the same time. Responses
-are written under the connection's write lock and may complete in any order.
-
-The implementation (`src/h2/`) covers what a DoH endpoint needs: the connection
-preface and SETTINGS exchange, HPACK with Huffman decoding and a full dynamic
-table, HEADERS with CONTINUATION, DATA, connection- and stream-level flow
-control, WINDOW_UPDATE, PING, RST_STREAM and GOAWAY. Server push is refused in
-SETTINGS and stream priority is parsed and ignored, which RFC 9113 permits.
-
-A decoded header list is checked against RFC 9113 sections 8.2 and 8.3 before it
-becomes a request: connection-specific fields (`connection`,
-`transfer-encoding`, `keep-alive`, `proxy-connection`, `upgrade`, and any `te`
-other than `trailers`), uppercase or non-token field names, values carrying NUL,
-CR, LF or edge whitespace, repeated, unknown or late pseudo-headers, an empty
-`:method` or `:scheme`, and a missing or non-origin-form `:path` each make the
-request malformed, which is a stream error of type PROTOCOL_ERROR. The one
-shape that looks malformed by that list and is not is a conformant `CONNECT`
-(RFC 9113 8.5): `:authority` and neither `:scheme` nor `:path`. This endpoint
-does not implement it, but turning it away is the handler's job — it draws a
-404, not a stream error, because a request that keeps to the specification
-should not be told it broke it. Nothing here is proxied onward, so none of this
-is a request-smuggling primitive on its own; it becomes one as soon as another
-hop sits in front of or behind this endpoint, and the HTTP/1.1 side already
-refuses the same shapes.
-
-What one connection may make this end hold is stated in that SETTINGS frame
-rather than left to be discovered: 128 concurrent streams, a 32 KiB header list,
-and a 4096-byte HPACK table, which is also the ceiling on the dynamic table size
-updates a peer may send (RFC 7541 6.3). A header block may arrive in at most 128
-CONTINUATION frames, since a block bounded only by its size never ends if the
-frames carrying it are empty.
 
 ### DNSSEC
 
@@ -667,27 +532,18 @@ dnssec:
   trust_anchors: []      # empty uses the built-in root keys
 ```
 
-With this on, elodin checks the signatures on the answers it forwards instead of
-taking the upstream's word for them. An answer that does not check out becomes
-SERVFAIL and never reaches the client; one that does gets the AD bit; a name in
-an unsigned zone is served normally, because unsigned is not the same as forged.
+elodin checks the signatures on the answers it forwards instead of taking the
+upstream's word for them. An answer that does not check out becomes SERVFAIL and
+never reaches the client; one that does gets the AD bit; a name in an unsigned
+zone is served normally, because unsigned is not the same as forged. Turning it
+off is for an upstream that cannot be trusted to return DNSSEC records — an ISP
+or captive-portal resolver — against which every signed zone would otherwise stop
+resolving rather than merely going unverified.
 
-It is on by default: a resolver that forwards signatures without checking them
-gives the answers an authority they have not earned. Turning it off is for an
-upstream that cannot be trusted to return DNSSEC records — an ISP or
-captive-portal resolver, say — since against one of those every signed zone
-would stop resolving rather than merely going unverified. That is a decision
-for whoever runs the resolver.
-
-Being a forwarder rather than a recursor, elodin has to ask for the material it
-validates against: every DS and DNSKEY on the way down from the root is fetched
-through the configured upstreams, with DO and CD set so the signatures arrive
-and the upstream's own verdict stays out of the way. Zone keys are cached, so
-the cost falls on the first query into a zone and not on the ones after it —
-measured here, a name under a cold TLD takes 20–70 ms to establish and nothing
-thereafter.
-
-What is checked, and what happens when it does not hold:
+Being a forwarder rather than a recursor, elodin fetches the material it
+validates against: every DS and DNSKEY down from the root, through the configured
+upstreams, with DO and CD set. Zone keys are cached, so the cost falls on the
+first query into a zone and not the ones after it.
 
 | | |
 |---|---|
@@ -697,25 +553,12 @@ What is checked, and what happens when it does not hold:
 | denial of existence | NSEC and NSEC3, including closest-encloser proofs and opt-out |
 | wildcards | a wildcard answer must come with a proof that the name had nothing of its own |
 | unsigned zones | insecure: served, no AD bit |
-| bounds | 32 DS/DNSKEY lookups per question, 64 signature checks per question, 24 labels of chain, 8 signatures per RRset, 64 keys per zone, 8 hint targets per answer, 100 NSEC3 iterations |
-| algorithm we cannot check | insecure, not bogus — RFC 4035 treats unverifiable data as unsigned |
+| bounds | 32 DS/DNSKEY lookups and 64 signature checks per question, 24 labels of chain, 8 signatures per RRset, 64 keys per zone, 8 hint targets per answer, 100 NSEC3 iterations |
+| an algorithm we cannot check | insecure, not bogus — RFC 4035 treats unverifiable data as unsigned |
 | bad signature, broken chain, missing proof | SERVFAIL, with an extended DNS error (RFC 8914) saying which |
 
-An answer that gets the AD bit is first cut down to the records that earned it.
-RFC 4035 section 3.2.3 allows the bit only over data the resolver authenticated,
-and a response carries whatever else its sender chose to put in it — a
-delegation, an address for a nameserver — which nothing here examined. Those go,
-so that the bit is not lent to them. The address records an authoritative server
-sends beside an HTTPS, SVCB, SRV or MX answer are the exception, and not by being
-waved through: RFC 9460 section 5 asks for them so a client can connect without a
-second query, so elodin establishes the target's own zone, checks the signature
-there, and keeps the ones that hold up. A hint that does not — unsigned, forged,
-in a zone with no chain, or expanded from a wildcard whose proof is not in the
-message — is dropped, and the client asks for the address itself. Nothing about
-a hint can change the verdict on the answer it arrived with.
-
-The trust anchors are the root key-signing keys IANA publishes, both KSK-2017
-and KSK-2024, compiled in — a rollover between the two needs no new build.
+The trust anchors are the root key-signing keys IANA publishes, both KSK-2017 and
+KSK-2024, compiled in, so a rollover between the two needs no new build.
 `trust_anchors` replaces them, taking either bare DS fields or a full
 presentation-form record:
 
@@ -725,106 +568,73 @@ dnssec:
     - ". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"
 ```
 
-A client that sets CD is asking for the data whatever the verdict, and gets it —
-that is what the bit is for, and resolvers chaining behind elodin rely on it.
-Those answers are cached under a separate key so they can never be handed to a
-client that did want the check. A client that did not set DO gets the DNSSEC
-records stripped back out of its answer, which is both what RFC 4035 asks for
-and what keeps ordinary answers from growing past the point of needing a retry
-over TCP.
+An answer that gets the AD bit is first cut down to the records that earned it,
+RFC 4035 section 3.2.3 allowing the bit only over data the resolver
+authenticated. Address records beside an HTTPS, SVCB, SRV or MX answer are the
+exception, and not by being waved through: RFC 9460 section 5 asks for them so a
+client can connect without a second query, so elodin establishes the target's own
+zone and keeps the hints whose signatures hold up there. Nothing about a hint can
+change the verdict on the answer it came with.
 
-Reverse lookups for private space are served, not refused. The reverse trees for
-the RFC 1918 ranges, IPv4 link-local and loopback, and IPv6 unique-local and
-link-local — `10.in-addr.arpa`, `168.192.in-addr.arpa`, the sixteen `172.16/12`
-zones, `169.254`, `d.f.ip6.arpa`, and the rest — are the RFC 6303 locally-served
-zones. Nothing on the public Internet signs them, so a local answer for one has
-no chain to check; validating it would turn every LAN PTR lookup into SERVFAIL,
-so those names are served insecure, without the AD bit — the same default Unbound
-and BIND ship. Configuring a `trust_anchors` entry that covers one of these zones
-turns that off for it: an operator who signs their own reverse space and anchors
-it is asking for it to be validated, and elodin then does.
+A client that sets CD gets the data whatever the verdict — resolvers chaining
+behind elodin rely on that — and those answers are cached under a separate key so
+they can never reach a client that did want the check. A client that did not set
+DO gets the DNSSEC records stripped back out.
 
-`home.arpa` is treated the same way, though what breaks there is not quite what
-breaks above it. RFC 8375 reserved it as the name a home network uses for its own
-zone, and `arpa` does delegate it — to the blackhole servers, with no DS, and the
-delegation itself is signed. A validator that asks `arpa` therefore learns the
-zone is insecure and serves the router's unsigned answer unvalidated, which is
-the right answer; against a public upstream that is what happens today.
+**Four groups of names are served insecure**, without the AD bit, because there
+is no chain to walk and refusing them would be worse than not validating them:
 
-It breaks when the upstream *is* the router that answers the zone. Being
-authoritative for `home.arpa`, it answers the `home.arpa DS` query from its own
-zone rather than forwarding it to `arpa`, so the proof that the delegation is
-insecure never comes back. The chain is then broken rather than provably absent,
-which is Bogus — and `printer.home.arpa` is a SERVFAIL rather than the printer,
-in exactly the home network RFC 8375 wrote the name for. elodin stops asking:
-those names are served insecure, without the AD bit, and a `trust_anchors` entry
-over the zone turns that off exactly as it does for the reverse zones. Nothing
-under `home.arpa` can be secure in any case, the delegation having no DS by
-design, so there is no chain being given up.
+- The RFC 6303 locally-served reverse zones — the RFC 1918 ranges, IPv4
+  link-local and loopback, IPv6 unique-local and link-local. Nobody signs them,
+  so validating would turn every LAN PTR lookup into SERVFAIL. Unbound and BIND
+  ship the same default. A `trust_anchors` entry covering one turns validation
+  back on for it.
+- Zones routed under [`upstream.zones`](#per-domain-upstreams), which hold
+  unsigned data under a public parent that delegates nothing to them, so the
+  chain walk would find a missing delegation and call a good answer bogus. A
+  `trust_anchors` entry stands that bypass down the same way.
+- `home.arpa`. `arpa` delegates it to the blackhole servers with no DS and signs
+  that delegation, so against a public upstream a validator learns the zone is
+  insecure and serves the router's unsigned answer. It breaks when the upstream
+  *is* the router: authoritative for the zone, it answers `home.arpa DS` from its
+  own zone rather than forwarding to `arpa`, so the proof the delegation is
+  insecure never arrives and the chain reads as broken rather than provably
+  absent. Nothing under `home.arpa` can be secure in any case, the delegation
+  having no DS by design. The names are still forwarded to `upstream.servers` by
+  default; a router here that does answer the zone wants
+  [`upstream.zones`](#per-domain-upstreams) pointed at it, and if nothing serves
+  the zone at all, [`special_use.home_arpa`](#reserved-names) answers those names
+  here. Either way the `home.arpa DS` query itself goes upstream, RFC 8375
+  requiring that proof be fetched rather than invented. If you do run the zone,
+  its private addresses trip [rebind
+  protection](#dns-rebinding-protection) unless it is routed or named in
+  `rebind.allow_domains`.
+- `.onion`, whenever it is forwarded at all, since the root publishes a signed
+  proof that there is no `onion.` to delegate and a Tor-aware upstream's answer
+  therefore reads as forgery. Both `special_use.onion: false` and
+  `special_use.enabled: false` forward those names and stand validation down for
+  them; see [Reserved names](#reserved-names).
 
-The query is still forwarded to `upstream.servers` by default, so a network with
-nothing answering for `home.arpa` gets NXDOMAIN from wherever that points, having
-told it what was being looked for on the way. If a router here does answer the
-zone, [`upstream.zones`](#per-domain-upstreams) sends those names to it instead
-and they stop leaving the building. If nothing here serves the zone,
-[`special_use.home_arpa`](#names-that-are-never-forwarded) answers those names
-from the table instead and they stop leaving — it is off by default because the
-network whose router *does* answer them needs them forwarded. Either way the
-`home.arpa DS` query goes upstream, RFC 8375 requiring that proof to be fetched
-rather than invented, and either way this bypass is what keeps the answer to it
-from being held to a chain that cannot be walked from here. One thing to know
-if you run the zone: its answers carry private addresses, which
-[rebind protection](#dns-rebinding-protection) filters unless `home.arpa` is
-routed under `upstream.zones` or named in `rebind.allow_domains`. The reverse
-zones never trip that guard, a PTR not being an address.
-
-Queries for `resolver.arpa` are answered here rather than forwarded. That name
-is where a client looks for the encrypted endpoints of the resolver it is
-already using — RFC 9462's Discovery of Designated Resolvers, an SVCB lookup for
-`_dns.resolver.arpa`. Forwarded, the answer would be the *upstream's*
-designation, and a client that took it would move its traffic to Quad9 or
+`resolver.arpa` is answered NODATA here rather than forwarded. That is where a
+client looks for the encrypted endpoints of the resolver it is already using (RFC
+9462's Discovery of Designated Resolvers), so forwarded it would hand back the
+*upstream's* designation and a client that took it would move to Quad9 or
 Cloudflare directly, leaving the block lists, the rewrites and the query log
-behind; the TLS certificate would not name elodin's address either. RFC 9462
-section 6.1 says a forwarder should not forward these, so elodin answers NODATA
-and the client stays on the resolver it was already talking to. That also
-settles a DNSSEC warning worth recognising: `resolver.arpa` does not exist in
-the signed `arpa` zone, so an upstream's synthesised, unsigned answer for it is
-indistinguishable from a forgery and used to be logged as `dnssec: SVCB
-_dns.resolver.arpa ... did not validate: Bogus`. A `rewrites` rule for the name
-still wins, for an operator who does want to advertise this server's own DoT or
-DoH endpoints, and so does a block list entry that reaches it — everything elodin
-answers out of itself is answered after the rewrites and the block lists and
-before the cache, this and the [reserved forward
-names](#names-that-are-never-forwarded) alike. Reaching `resolver.arpa` from a
-list means a rule over `arpa` itself, which is already breaking every reverse
-lookup you have, so this is not a case worth a second ordering to protect.
+behind; RFC 9462 section 6.1 says a forwarder should not forward these. A
+`rewrites` rule for the name still wins, for an operator who does want to
+advertise this server's own endpoints.
 
-Forwarding `.onion` stands validation down the same way, on the forward side.
-What a Tor-aware upstream answers for such a name cannot be signed — the root
-publishes a signed proof that there is no `onion.` to delegate — so validating it
-would turn every `.onion` lookup into SERVFAIL. Those names are served insecure,
-without the AD bit, exactly as the reverse zones above are.
+Two things worth knowing with validation on:
 
-Either key that forwards them does this: `special_use.onion: false`, which says
-the upstream is Tor-aware, and `special_use.enabled: false`, which turns the
-whole table off. It is the only other place validation is skipped, it applies to
-nothing but `onion.`, and neither key forwards anything until an operator writes
-one of those lines down — both default to `true`;
-see [Names that are never forwarded](#names-that-are-never-forwarded), which has
-what that costs an operator who set `enabled: false` for some other reason.
-
-Two things worth knowing about running `dnssec.enabled` on:
-
-- **Distribution crypto policy can take algorithms away.** Fedora and RHEL ship
-  an OpenSSL that refuses SHA-1 signatures outright (`rh-allow-sha1-signatures =
-  no`), which covers DNSSEC algorithms 5 and 7. elodin treats an algorithm it
-  cannot check as unsigned rather than as broken, so those zones — `pir.org` and
-  `comcast.net` among them — come back without the AD bit instead of failing.
-  That is the safe direction, but it is a downgrade, and it is silent.
-- **NS records in the authority section of a positive answer are not required
-  to be signed.** A forwarder cannot tell the parent's copy of a delegation,
-  which is unsigned by definition, from the child's, which is not. The answer
-  section is validated in full; this affects only what rides alongside it.
+- **Distribution crypto policy can take algorithms away.** Fedora and RHEL ship an
+  OpenSSL that refuses SHA-1 signatures outright, covering DNSSEC algorithms 5
+  and 7. elodin treats an algorithm it cannot check as unsigned rather than as
+  broken, so those zones come back without the AD bit instead of failing — the
+  safe direction, but a silent downgrade.
+- **NS records in the authority section of a positive answer are not required to
+  be signed**, a forwarder being unable to tell the parent's copy of a delegation
+  from the child's. The answer section is validated in full; this affects only
+  what rides alongside it.
 
 ### Who may ask
 
@@ -841,104 +651,54 @@ server:
     - fe80::/10
 ```
 
-The listeners bind `0.0.0.0` by default, so on a machine with a public address
-elodin is reachable from the internet. What keeps it from being an *open*
-resolver is this list: queries are accepted from the local networks — loopback,
-the RFC 1918 ranges, IPv6 loopback, unique local and link-local — and from
-nowhere else. It sits between what the two obvious comparisons ship: BIND's
-`allow-recursion` defaults to `localnets` plus `localhost`, and Unbound's
-`access-control` is stricter still, starting at `0.0.0.0/0 refuse` with only
-`127.0.0.0/8` allowed. (BIND's `allow-query` is a different setting and does
-default to `any` — it is recursion, not the query, that it holds back.) The
-reason all three have one is the same: an installation nobody has configured
-should serve the machine and the network it is on.
-
-This is a different bound from [rate limiting](#rate-limiting), not a weaker
-version of it. The rate limiter caps what one victim can be made to receive; it
-does not stop this server from taking part in the attack that aims it there. The
-allow list is the half that does.
+The listeners bind `0.0.0.0`, so on a machine with a public address elodin is
+reachable from the internet; what keeps it from being an *open* resolver is this
+list. BIND's `allow-recursion` and Unbound's `access-control` exist for the same
+reason. It is a different bound from [rate limiting](#rate-limiting), not a
+weaker version: the rate limiter caps what one victim can be made to receive, and
+this is the half that keeps this server out of the attack aimed there.
 
 The check runs before the message is parsed, before the rate limiter and before
-the query is queued, so a source that is not on the list costs a prefix compare
-and nothing else. Over UDP it is dropped: a REFUSED sent to a datagram source is
-a reflection of its own, small but free to whoever asked for it. Over TCP, DoT
-and DoH the connection is closed on accept, without a thread and without a TLS
-handshake — answering REFUSED there would mean a source we have already decided
-not to serve costing more than one we do, and would make the allow list a way to
-exhaust `max_connections`. Refusals are counted as `refused=` in the stats line
-— a datagram each on UDP and a connection each on the stream transports, so the
-number is a sum of the two units rather than a count of queries.
-
-Neither refusal tells the client anything, so the log does. The first refusal
-since start is a `warn` naming the source, the transport and the setting; every
-one after it is `debug`, and the `refused=` counter carries the rest. Without
-that line the first symptom of a network nobody added is a client that stopped
-working with nothing to grep for; with a line per datagram, whoever is sending
-them decides how much this server writes to disk.
-
-```
-ts=… level=warn msg="udp: refused a query from 198.51.100.7:41234: it is not in server.allow_from, so nothing was sent back"
-ts=… level=warn msg="add its network to server.allow_from if that client should be served; refusals are counted as refused= in the stats line, and further ones are logged at debug level"
-```
-
-The line says what was refused. Over UDP that is a query — the datagram is in
-hand when the check runs. Over TCP, DoT and DoH the check runs on accept, before
-a byte has been read, so it reads `refused a connection from`: there was never a
-query to refuse.
+the query is queued, so a source not on the list costs a prefix compare and
+nothing else. Over UDP the datagram is dropped, a REFUSED to a datagram source
+being a reflection of its own; over TCP, DoT and DoH the connection is closed on
+accept, without a thread and without a TLS handshake, so the allow list cannot
+become a way to exhaust `max_connections`. Refusals are counted as `refused=` — a
+datagram each on UDP, a connection each on the stream transports.
 
 A list in the file replaces the default rather than adding to it, so include
 loopback if you want it. Entries are CIDR networks in either family; a bare
-address is the single host it names, and host bits below the length are masked
-off, so `127.0.0.1/8` and `127.0.0.0/8` are the same network. A v4-mapped entry
-(`::ffff:192.168.0.0/112`) is the IPv4 network it names, since that is how a
-mapped client arriving on an IPv6 socket is compared. An entry that will not
-parse fails `--check` rather than starting a resolver that refuses everyone.
+address is the single host it names, host bits below the length are masked off,
+and a v4-mapped entry (`::ffff:192.168.0.0/112`) is the IPv4 network it names,
+since that is how a mapped client on an IPv6 socket is compared. An entry that
+will not parse fails `--check`. Carrier-grade NAT (`100.64.0.0/10`, which
+Tailscale also uses) is deliberately not in the default: a resolver behind one
+would be serving an ISP's other customers.
 
-Carrier-grade NAT (`100.64.0.0/10`, which Tailscale also uses) is deliberately
-not in the default: a resolver behind one would be serving an ISP's other
-customers. Add it explicitly if that is your network.
-
-An empty list is no restriction:
+An empty list is no restriction, which is how you ask for a public resolver.
+elodin warns about it at every start; before running one, read [rate
+limiting](#rate-limiting) and consider `cookies.require`.
 
 ```yaml
 server:
   allow_from: []
 ```
 
-That is how you ask for a public resolver, and it is a thing to write down on
-purpose. elodin warns about it at every start. Before running one, read
-[rate limiting](#rate-limiting) below and consider `cookies.require`.
+Note the `[]`. `allow_from:` with nothing after it is a YAML null and a
+configuration error, since the two things it could have meant are the shipped
+default and its exact opposite.
 
-Note the `[]`. Writing `allow_from:` with nothing after it is a configuration
-error rather than either reading of it: YAML makes that a null, and the two
-things it could have meant here are the shipped default and its exact opposite.
+#### Recursion only when asked
 
-### Recursion only when asked
-
-`allow_from` decides who may ask; the RD bit in the query decides what they are
-asking for. RFC 1035 section 4.1.1 makes RD the client's request for a
-recursive lookup, and elodin only forwards to an upstream when it is set. A
-query with RD=0 gets whatever this server already has cached, and nothing
-more — REFUSED, not a silent drop, so a client that meant to ask recursively
-finds out rather than timing out:
-
-```
-ts=… level=info msg=query client=198.51.100.7:41234 proto=udp qtype=A qname=example.com outcome=refused detail=rd ms=0.1
-```
-
-It does not add to `refused=` in the stats line — that counter is `allow_from`
-turning away a source before a query exists at all, and this is a source
-already on the list asking a question this server answered, just not by
-recursing. An operator graphing `refused=` as an unexpected-traffic signal
-will not see RD=0 probes there; the query log, with `log.queries` on, is where
-they show up.
-
-There is no setting for this; it is not a policy an operator tunes, only a bit
-a client sends. The refusal still comes back with RA=1: RFC 1035 section 4.1.1
-makes RA a statement that the server supports recursive service, not that this
-particular query used it, and that is also what BIND and Unbound do with a
-query their own ACL declines to recurse for. The capability is on offer; this
-one request just did not draw on it.
+`allow_from` decides who may ask; the RD bit decides what they are asking for.
+RFC 1035 section 4.1.1 makes RD the client's request for a recursive lookup, and
+elodin only forwards to an upstream when it is set. A query with RD=0 gets
+whatever is already cached and nothing more — REFUSED, not a silent drop, so a
+client that meant to ask recursively finds out rather than timing out. It shows
+as `outcome=refused detail=rd` in the query log and does not add to `refused=`,
+which counts sources turned away before a query exists at all. The refusal still
+carries RA=1, which RFC 1035 makes a statement that the server supports recursive
+service rather than that this query used it — the same thing BIND and Unbound do.
 
 ### How large a UDP answer may be
 
@@ -947,67 +707,32 @@ server:
   max_udp_response: 1232          # 512–4096; the DNS Flag Day 2020 figure
 ```
 
-A client says in its OPT record how large a response it can take, and a
-resolver that simply believes it has handed the caller its own amplification
-factor: the query arrives on a datagram nobody verified, so an attacker aiming
-answers at a victim advertises the largest buffer it can and gets a hundredfold
-out of forty bytes. `max_udp_response` is the ceiling on that number, applied on
-top of whatever the client asked for. It is also what the per-prefix datagram
-budget under [Rate limiting](#rate-limiting) is denominated in — 500 responses a second
-is about 600 KB/s at 1232 and about 2 MB/s at 4096.
+A client says in its OPT record how large a response it can take, and a resolver
+that simply believes it has handed the caller its own amplification factor: the
+query arrives on a datagram nobody verified, so an attacker aiming answers at a
+victim advertises the largest buffer it can. `max_udp_response` caps that number,
+and it is what the per-prefix datagram budget under [rate
+limiting](#rate-limiting) is denominated in.
 
-The cost is a TC bit, and a retry over TCP, on any answer between the ceiling
-and what the client asked for. Measured across the 129 names of the DNSSEC
-survey asked with `DO=1`, that is **no A or AAAA answer at all** — the largest
-is 743 bytes — and five DNSKEY answers, the largest 1793. Nothing in the survey
-reaches 4096; that ceiling is only reached by a zone built to fill it, which is
-what reflection uses. The measurement is in
-[`bench/results/2026-08-06-edns-response-sizes.md`](bench/results/2026-08-06-edns-response-sizes.md).
+The cost is a TC bit and a retry over TCP on any answer between the ceiling and
+what the client asked for; against real traffic that is close to nothing, and the
+headroom it removes is only reachable by a zone built to fill it. Raise it, up to
+4096, on a network whose path MTU is known to carry large datagrams and where the
+resolver is not reachable by anyone who would abuse it. A truncation the setting
+caused is logged once at `warn` naming it; a client that asked for *less* than the
+ceiling got what it asked for and nothing is said.
 
-Raise it, up to 4096, on a network whose path MTU is known to carry large
-datagrams and where the resolver is not reachable by anyone who would abuse it.
-When the ceiling does truncate an answer, elodin says so and names the setting:
+The ceiling is also the number the answer's own OPT record reports, RFC 6891
+section 6.2.4 making that field the *responder's* maximum rather than a copy of
+the requestor's — the counterpart to `max-udp-size` in BIND and Unbound. Coming
+from Unbound, note that this is one knob where Unbound has two:
+`edns-buffer-size` advertises and `max-udp-size` truncates; `max_udp_response` is
+both.
 
-```
-ts=… level=warn msg="a 2720-byte answer for big.example. was truncated to 1232 bytes and the client told to retry over TCP: it asked for 4096, and server.max_udp_response is 1232"
-ts=… level=warn msg="to send it over UDP instead, raise server.max_udp_response in the configuration (up to 4096); the cost is that a spoofed query can make this server send that much to an address it did not verify"
-```
-
-Once, at `warn`; every truncation after that at `debug`, so one large signed
-zone does not fill the log. A client that asked for *less* than the ceiling and
-got a truncated answer got what it asked for, and nothing is said — the setting
-had no part in it.
-
-The ceiling is also the number the answer's own OPT record reports. RFC 6891
-section 6.2.4 makes that field the *responder's* maximum, not a copy of the
-requestor's — the counterpart to `max-udp-size` in BIND and Unbound, both of
-which report their own figure regardless of what was asked for. So a client that
-advertises 4096 against the 1232 default is told **1232**, and against
-`max_udp_response: 4096` is told 4096; a client that advertised only 512 is told
-1232 as well, because that is what this server can deliver, and the 512 it asked
-for still bounds the reply it gets. A stub mostly ignores the field; a forwarder
-chaining through elodin does not, and one told a number this server will never
-send sizes its buffers for an answer that cannot arrive and then pays for a TC
-bit and a TCP round trip it was told it would not need. It holds on every path —
-locally built answers, forwarded ones, cache hits, and answers re-encoded to
-carry a DNS cookie.
-
-Coming from Unbound, note that this is one knob where Unbound has two:
-`edns-buffer-size`, which is the figure it advertises, and `max-udp-size`, which
-is the bound it truncates at. `max_udp_response` is both.
-
-The ceiling is UDP only. TCP, DoT and DoH establish a connection before a query
-arrives, so the address is proven, there is nothing to reflect, and an answer
-that fits is sent whole. The OPT record on those goes back exactly as the answer
-carried it — the client's own figure on a locally built answer, the upstream's on
-a forwarded or cached one — because the field bounds a datagram and nothing on a
-stream is bounded by it.
-
-That does mean a truncated answer needs somewhere to go: if you have turned
-`listeners.tcp` off, a client told to retry has nowhere to retry to, and the
-answer is unreachable rather than slow. Either leave TCP on — it is on by
-default — or raise the ceiling to cover the largest answer your clients ask
-for.
+It is UDP only: the stream transports prove the address by handshake, so there is
+nothing to reflect and the OPT record goes back as the answer carried it. That
+does mean a truncated answer needs somewhere to go — with `listeners.tcp` off, a
+client told to retry has nowhere to retry to. Leave TCP on, or raise the ceiling.
 
 ### Rate limiting
 
@@ -1015,121 +740,54 @@ for.
 server:
   rate_limit:
     enabled: true                 # on by default
-    responses_per_second: 500     # per client prefix (/24 for IPv4, /64 for IPv6), and per transport class
+    responses_per_second: 500     # per client prefix (/24 or /64), and per transport class
     slip: 2                       # answer every 2nd query over the budget truncated; 0 drops them all
 ```
 
 A UDP query carries no proof of where it came from, so the answer goes wherever
-the source address said. That is what makes any resolver an amplifier: a 40-byte
-query with an OPT record advertising 4096 buys the sender two orders of magnitude
-of traffic aimed at whoever they named, and DNSSEC and `ANY` answers are the
-usual way to get the most of it. A spoofed source port of 53 pointed at another
-resolver is the same trick made into a loop between the two. How much one
-datagram can be is capped separately, by
-[`server.max_udp_response`](#how-large-a-udp-answer-may-be); this is the cap on
-how many of them.
+the source address said — which is what makes any resolver an amplifier. How
+large one datagram can be is capped by
+[`max_udp_response`](#how-large-a-udp-answer-may-be); this is the cap on how many
+of them.
 
-What bounds it is a budget on how much this server will send *to one place*. The
-sender's own rate is not worth measuring — they are not the ones receiving it,
-and with a spoofed address there is nothing of theirs to measure — so the budget
-is kept per destination prefix, /24 and /64, which is the granularity an attacker
-picks addresses within. An IPv4 client that reached a listener bound to `::`
-arrives as `::ffff:a.b.c.d`, and is budgeted on its /24 rather than on the
-`::/64` those bytes fall in — the same reading of the mapping that
-[`server.allow_from`](#who-may-ask) applies.
+The budget is on what this server will send *to one place*, not on how fast one
+sender asks: with a spoofed address there is nothing of the sender's to measure.
+So it is kept per destination prefix, /24 and /64, the granularity an attacker
+picks addresses within, in a fixed table allocated once so the limiter is not
+itself somewhere to put pressure.
 
 Over-budget queries are not simply dropped. Every `slip`th one comes back as a
-header and a question with the TC bit set: thirty-odd bytes, too small to be
-worth reflecting, and the standard way of telling a client to ask again over TCP
-where the handshake proves the address. A client behind a genuinely busy NAT
-therefore keeps resolving, one round trip slower; a spoofed source cannot follow
-it up. Set `slip: 0` to drop them instead and answer nothing.
+header and a question with the TC bit set: too small to be worth reflecting, and
+the standard way of telling a client to ask again over TCP where the handshake
+proves the address. A client behind a busy NAT keeps resolving, one round trip
+slower; a spoofed source cannot follow it up. `slip: 0` drops them instead.
 
-500 responses a second to one /24 — about 600 KB/s at the 1232-byte response
-ceiling — is far past what a household or an office behind one NAT asks for and
-far below what makes reflection worth an attacker's bandwidth, which is why it
-is on by default. The accounting is a fixed table of
-16,384 buckets — 640 KB, allocated once — so the limiter is not itself somewhere to
-put pressure, and which prefixes share a bucket is decided by a key drawn at
-startup rather than by anything an attacker can work out.
+TCP, DoT and DoH are charged too, for the work behind an answer rather than for
+amplification — without that, a flood down a handful of long-lived connections is
+one the limiter never sees. **Two budgets per prefix, though, not one:**
+datagrams charge one and connections the other, each getting
+`responses_per_second`, and neither can be spent from the other's side, since a
+spoofed UDP flood naming a prefix would otherwise close the connections of the
+clients who actually live there. The cost is that a client willing to ask both
+ways can draw twice the figure, half of it only over a completed handshake.
+`src/server/ratelimit.odin` argues this out.
 
-Two source addresses are refused outright before any of this: port 0, which
-nothing receives on, and this server's own listening endpoint, which is a query
-that would make it answer itself forever. A source outside `server.allow_from`
-is refused earlier still — see [Who may ask](#who-may-ask), which is the bound
-on *whether* this server takes part in a reflection attack rather than on how
-much one gets out of it.
+`slip` is a UDP mechanism, so over-budget queries on a connection are refused
+instead: TCP and DoT closed, DoH answered `429 Too Many Requests`, and over
+HTTP/2 the stream refused with a 429 while the connection stays. Such a
+connection is drained briefly first, since closing a socket with unread data
+resets it and the client's kernel would throw away the answers already sent.
 
-Refusals are not charged to the budget, though the check sits right beside it.
-The budget is kept per /24, so a denied source in the same /24 as an allowed one
-would be spending its neighbour's: charging them would turn a narrowed allow
-list into a way to have the clients beside it dropped. Nothing is sent to a
-refused source, so there is nothing for a response budget to bound.
+The budget is spent on questions, on every transport: a scanner's 404, a
+`.mobileconfig` download or a POST naming the wrong content type reaches no
+resolver, cache or upstream. Refusals are not charged either, the budget being
+per /24 — charging a denied source would turn a narrowed allow list into a way to
+have the clients beside it dropped.
 
-TCP, DoT and DoH are charged too, for the other half of what
-a flood costs. Amplification is not their problem — a connection is established
-before a query arrives on one, so the address is proven and nothing is reflected
-— but the work behind an answer is the same wherever the query came from, and
-that is the upstream round trips and the cache churn. All three pipeline: one
-connection carries as many queries as the socket will take, and
-`server.max_connections` bounds how many clients are here at once rather than how
-fast one of them asks. Without the budget, a flood delivered over a handful of
-long-lived connections is one the limiter never sees.
-
-Two budgets per prefix, though, not one: datagrams are charged to one and
-connections to the other, each getting `responses_per_second`, and neither can be
-spent from the other side. The reason is that the budget is keyed on the query's
-source address, and on a datagram that field is written by whoever sent it. Under
-one shared budget, anybody able to send UDP could empty the budget of any prefix
-they liked — a spoofed flood naming sources in a /24, above the configured rate,
-keeps that /24's bucket empty for as long as it runs — and every genuine TCP, DoT
-or DoH connection from that /24 would then have its first query refused and its
-connection closed. Somebody who cannot receive a byte at the address, and who is
-asking none of that network's questions, would be deciding what this server does
-for the clients who actually live there, on a default configuration. It would also
-empty the budget a slip's own advice sends a client to.
-
-The cost of the separation is that a client willing to ask both ways can draw
-twice `responses_per_second` — a factor of two on the work behind an answer, on a
-figure you chose, and half of it only reachable over a completed handshake from an
-address that is therefore real. That is the trade, taken deliberately; the
-alternative was letting anyone with a raw socket switch off a stranger's TCP.
-
-What differs besides the budget is the answer an over-budget query gets. `slip` is
-a UDP mechanism — the TC bit tells a client to ask again over TCP, and a client
-that is already there can do nothing with it — so on a connection everything over
-the budget is refused: TCP and DoT are closed, and DoH is answered `429 Too Many
-Requests` and then closed, HTTP having a way to say it. Over HTTP/2 the stream is
-refused with a 429 and the connection stays, since one over-budget request is no
-reason to take the requests in flight beside it down as well.
-
-What the budget is spent on is a question, on every transport. Over HTTP that
-means a request has to be one before it is charged: a scanner's 404, a
-`.mobileconfig` download, a POST naming the wrong content type and a `dns=`
-parameter that is not a DNS message reach no resolver, no cache and no upstream,
-and charging them would let anything that can address the endpoint spend the
-budget of the clients sharing its prefix.
-
-A connection cut off this way is drained before it closes. A client that
-pipelines has queries in flight that were never read when the budget ran out, and
-closing a socket in that state resets it rather than ending it — which would have
-the client's kernel throw away the answers that went out before the budget was
-gone. So what is left unread is read and discarded first, briefly and up to a
-bound, and then the connection ends.
-
-The TCP retry a slip invites is charged to the stream budget, which is the one the
-datagram flood cannot reach — so a client sent to TCP by a flood in its prefix
-arrives at a budget that flood has not spent. It is still a budget: a client that
-has emptied the stream side itself is refused there like anything else, and a slip
-says the address is worth proving rather than reserving anything for the proof.
-
-Both counters cover every transport. `elodin_rate_limited_total` counts what was
-withheld wherever it came from; `elodin_rate_limit_slipped_total` counts truncated
-answers, so it only ever moves for UDP.
-
-`cookies.require` is the sharper instrument for an attack actually under way:
-it makes a UDP client prove it can receive at the address it claims before any
-answer is sent at all. See [DNS cookies](#dns-cookies).
+`elodin_rate_limited_total` counts what was withheld;
+`elodin_rate_limit_slipped_total` counts truncated answers, so it only ever moves
+for UDP. `cookies.require` is the sharper instrument for an attack actually under
+way.
 
 ### DNS cookies
 
@@ -1141,60 +799,40 @@ cookies:
   secret: ""             # 32 hex characters; empty draws a random one at startup
 ```
 
-A client talking to elodin over UDP has two things standing between it and a
-forged answer from somewhere on the local network: a 16-bit transaction ID and a
-randomised source port. That is about 32 bits, and both are visible to anyone on
-the path. Cookies (RFC 7873, RFC 9018) add 64 bits that are not: a client that
-has asked once holds a token only this server could have produced, and an answer
-that comes back without it did not come from here.
-
-Nothing is remembered per client. The token is recomputed on each query from the
+A client talking to elodin over UDP has a 16-bit transaction ID and a randomised
+source port between it and a forged answer — about 32 bits, both visible to
+anyone on the path. Cookies (RFC 7873, RFC 9018) add 64 bits that are not.
+Nothing is remembered per client: the token is recomputed on each query from the
 client's own cookie, its address and a timestamp, keyed by a secret this process
-holds — so there is no table for a flood of clients to fill, and a cookie that
-does leak stops working within the hour. Clients that do not use cookies are
-untouched: an answer only carries one when the query did.
+holds, so there is no table for a flood of clients to fill and a leaked cookie
+stops working within the hour. An answer carries one only when the query did.
 
-`require` is the other half of the mechanism, and is off by default. With it on,
-a UDP query that carries a cookie but cannot show a valid server cookie is
-answered with BADCOOKIE and a cookie to come back with, before the name is
-looked up at all — so an attacker forging queries from someone else's address
-never gets an answer sent there. The cost falls on honest clients too, one extra
-round trip the first time each one asks, which is why RFC 7873 has it for use
-while an attack is actually under way. Queries carrying no cookie, and queries
-over TCP, DoT or DoH, are unaffected either way. It needs `enabled`, since what
-it demands is a cookie this server issued; the two together are rejected at
-startup rather than left looking like a protection that is on.
+`require` makes a UDP query that carries a cookie show a valid server one before
+it is answered — otherwise BADCOOKIE and a cookie to come back with, before the
+name is looked up at all, so an attacker forging queries from someone else's
+address never gets an answer sent there. It costs honest clients one extra round
+trip the first time each asks, which is why RFC 7873 has it for use while an
+attack is under way, and why it is off by default. Queries with no cookie, and
+queries over TCP, DoT or DoH, are unaffected. It needs `enabled`, and the two
+together are rejected at startup rather than left looking like a protection that
+is on.
 
 `secret` matters when more than one elodin answers on the same address: without
 it each draws its own at startup and rejects the cookies the others handed out.
-A single instance can leave it empty.
 
-The client's cookie stops at elodin and is never forwarded upstream, whatever
-either setting is on or off. It is a secret between that client and this server —
-a stable identifier an upstream has no business seeing — and its server half was
-minted here, so an upstream that implements cookies would read it as a forgery
-and answer BADCOOKIE instead of the question.
+`upstream` turns the mechanism the other way round, presenting a random client
+cookie per server plus the server cookie that server last issued. A reply
+carrying a cookie that is not ours cannot have come from the server we asked, so
+it is passed over and the socket keeps waiting for the genuine one — answering a
+spoofing attempt with SERVFAIL would hand the attacker most of what it was after.
+Once a server has issued a cookie, a reply from it with the option left off is
+passed over the same way (RFC 7873 §5.3); a server that has never sent one does
+not implement them, and the exchange carries on without. A BADCOOKIE reply
+carries a fresh server cookie, so the query is asked once more with it.
 
-`upstream` turns the same mechanism the other way round, and is also on by
-default. elodin presents a cookie of its own to plain UDP and TCP upstreams:
-a random client cookie per server, and the server cookie that server last issued.
-A reply carrying a cookie that is not ours cannot have come from the server we
-asked, so it is passed over and the socket keeps waiting for the genuine one —
-which is the point, since answering a spoofing attempt with SERVFAIL would hand
-the attacker most of what it was after. Once a server has issued a cookie, a
-reply from it with the option left off is passed over the same way: a check an
-attacker can decline to take is not a check at all, and RFC 7873 §5.3 has the
-response discarded. A server that has never sent one is a server that does not
-implement them, and the exchange carries on without. The cookie the upstream sends back is
-removed before the answer goes anywhere near a client or the cache: it belongs
-to that conversation and to no other. A BADCOOKIE reply carries a fresh server
-cookie, so the query is asked once more with it.
-
-Two things bound what that covers. Only queries that already carry an OPT record
-get a cookie, since adding one would negotiate EDNS on behalf of a client that
-never asked — with DNSSEC validation on, which is the default, every forwarded
-query carries one. And DoT and DoH upstreams are left out, because a certificate
-already establishes more than a cookie can.
+Neither side's cookie crosses over: the client's stops at elodin whatever the
+settings, its server half having been minted here, and the upstream's is removed
+before the answer goes near a client or the cache.
 
 | | client-facing | upstream |
 |---|---|---|
@@ -1206,13 +844,18 @@ already establishes more than a cookie can.
 | a cookie that does not check out | answered anyway, or BADCOOKIE with `require` | ignored, and the wait continues |
 | a message with no cookie | answered, and given none back | accepted, unless that server has issued one before |
 
+Only queries that already carry an OPT record get a cookie, since adding one
+would negotiate EDNS on behalf of a client that never asked — with validation on,
+which is the default, every forwarded query carries one. DoT and DoH upstreams
+are left out, a certificate establishing more than a cookie can.
+
 ### EDNS padding
 
 Encryption hides what a DNS message says, not how long it is, and DNS messages
 are distinctive enough by length that an observer holding a list of candidate
 names can often tell which one was asked. RFC 7830 defines the mitigation — an
-EDNS option carrying nothing but zeroes — and RFC 8467 fixes the block sizes it
-is applied in. elodin does both halves, on DoT and DoH only:
+EDNS option carrying nothing but zeroes — and RFC 8467 fixes the block sizes.
+elodin does both halves, on DoT and DoH only:
 
 | | client-facing | upstream |
 |---|---|---|
@@ -1222,24 +865,18 @@ is applied in. elodin does both halves, on DoT and DoH only:
 | the other side's padding | replaced with ours | stripped before the answer is cached |
 
 There is no setting. The RFC gives one pair of numbers rather than a knob, and a
-deployment padding to a block of its own choosing would be recognisable by it —
+deployment padding to a block of its own choosing would be recognisable by it,
 which is the opposite of the point.
 
 UDP and plain TCP are left out deliberately (RFC 8467 §5): padding a message
 anyone on the path can read hides nothing from them, and on UDP the bytes would
-come out of `server.max_udp_response`, enlarging exactly the datagrams the
-[UDP answer ceiling](#how-large-a-udp-answer-may-be) exists to bound. A client that did not
-send the option gets no padding either (RFC 7830 §4) — it never budgeted for the
-bytes.
-
-Upstream, only queries that already carry an OPT record are padded, for the same
-reason cookies are: minting one would negotiate EDNS on behalf of a client that
-never asked. With DNSSEC validation on, which is the default, every forwarded
-query carries one. An upstream that pads its replies back — which is what a
-padding-aware server does with a padded query — has that padding taken off
-before the answer is stored, so the cache holds the answer rather than the
-answer plus a block of zeroes, and the copies it serves over UDP stay the size
-they were.
+come out of `server.max_udp_response`, enlarging exactly the datagrams the [UDP
+answer ceiling](#how-large-a-udp-answer-may-be) exists to bound. A client that
+did not send the option gets no padding either (RFC 7830 §4) — it never budgeted
+for the bytes. Upstream, only queries that already carry an OPT record are
+padded, for the same reason cookies are. An upstream that pads its replies back
+has that padding taken off before the answer is stored, so the cache holds the
+answer rather than the answer plus a block of zeroes.
 
 ### DNS rebinding protection
 
@@ -1253,184 +890,80 @@ rebind:
 A page loaded from `rebind.attacker.example` is same-origin with whatever that
 name resolves to, for as long as it resolves to it. So the attacker publishes the
 name with a one-second TTL, lets the browser fetch the page, and answers the next
-lookup with `192.168.1.1` — and the page is now allowed, by the browser's own
-rules, to read the router's admin interface. Nothing was broken into: the
-same-origin policy is keyed on a name, the attacker owns the name, and the
-attacker also decides what it means. The victim's browser is the proxy and the
-victim's LAN is the vantage point.
+lookup with `192.168.1.1` — and the page may now read the router's admin
+interface. The browser cannot see this happening; the resolver can, which is why
+dnsmasq (`--stop-dns-rebind`), Unbound (`private-address`) and AdGuard Home all
+have a version of it.
 
-The browser cannot see this happening; it asked a resolver and believed the
-answer. The resolver can, which is why this is a resolver's job and why every
-comparable product does it — dnsmasq's `--stop-dns-rebind`, Unbound's
-`private-address`, AdGuard Home's rebinding protection.
-
-elodin checks the answer section of an upstream reply for addresses in loopback
+elodin refuses an upstream answer that points a public name at loopback
 (`127.0.0.0/8`, `::1`), the RFC 1918 ranges, link-local (`169.254.0.0/16`,
-`fe80::/10`), IPv6 unique-local (`fc00::/7`), `0.0.0.0/8` and `::`. It reads A
-and AAAA records and the `ipv4hint`/`ipv6hint` parameters of SVCB and HTTPS
-records, which are addresses a browser connects to without ever asking for the A
-record. `169.254.169.254` is worth naming on its own: it is the cloud instance
-metadata endpoint, it answers unauthenticated to anything that can reach it, and
-what it hands back is credentials. `0.0.0.0` is in the set for a similar reason
-rather than as tidiness: browsers on Linux and macOS reach services bound to
-`127.0.0.1` by connecting to `0.0.0.0`, which is what the "0.0.0.0 Day"
-disclosure was about, so it is a working bypass and not merely an odd answer.
-
-Beside an SVCB or HTTPS answer it reads the additional section too, since RFC
-9460 section 5 has the client take the target's address from there without
-issuing a second query. Everywhere else the additional section is left alone: it
-is glue for names other than the one asked about, which a stub does not connect
-to.
+`fe80::/10`), IPv6 unique-local (`fc00::/7`), `0.0.0.0/8` or `::`. It reads A and
+AAAA records and the `ipv4hint`/`ipv6hint` parameters of SVCB and HTTPS records,
+and beside an SVCB or HTTPS answer the additional section too, since RFC 9460
+section 5 has the client take the target's address from there. Two entries in
+that set are worth naming: `169.254.169.254` is the cloud instance metadata
+endpoint, which answers unauthenticated and hands back credentials, and
+`0.0.0.0` is how browsers on Linux and macOS reach services bound to
+`127.0.0.1` — the "0.0.0.0 Day" bypass.
 
 One offending record refuses the whole answer rather than being filtered out of
-it, so a mixed answer cannot be used to sneak one through and the guard does not
-have to be exhaustive over every way an address can be written into a message.
+it, and an answer elodin cannot decode is refused too for those same five
+question types: forwarding it verbatim was the way round the guard, glibc's
+resolver only ever walking the answer section. That reads `detail=unreadable`
+in the query log, against `detail=rebind` for a private address.
 
-An answer elodin cannot decode is refused too, for those same five question
-types. That was the way round the whole guard and it was free: the attacker owns
-the authoritative server, so a truthful answer section carrying `192.168.1.1`
-with an `ARCOUNT` of 100 and nothing behind it is rejected by the decoder, was
-forwarded verbatim, and glibc's resolver — which only ever walks the answer
-section — handed it to the browser. The cost of closing it is that a name whose
-upstream emits something elodin's decoder rejects now returns NODATA for A and
-AAAA where it used to be forwarded; such an answer was already not cacheable and
-not re-encodable. Every other question type is forwarded exactly as before. In
-the query log this one reads `outcome=blocked detail=unreadable`, against
-`detail=rebind` for an answer that named a private address.
-The client gets NODATA — NOERROR with an empty answer section, an SOA so it knows
-how long to remember, and RFC 8914 extended error 15 saying why:
+The client gets NODATA, with an SOA and RFC 8914 extended error 15. Not
+SERVFAIL: a stub with two servers reads SERVFAIL as *this* server having failed
+and asks the other, which on a home network is the router — and the router
+answers `192.168.1.1` quite happily. The check runs before the answer is cached,
+which is the ordering the whole thing rests on, and the refusal is not cached
+either. Refusals are counted as `rebind=` and `elodin_rebind_refused_total`.
 
-```
-ts=… level=warn msg="refused an answer for rebind.attacker.example carrying the private address 192.168.1.1: a public name resolving into private space is how a DNS rebinding attack reaches a service on this network, so the client was told NODATA"
-ts=… level=info msg=query client=192.168.1.20:41234 proto=udp qtype=A qname=rebind.attacker.example outcome=blocked detail=rebind ms=12.4
-```
+**Why it is off by default.** dnsmasq, AdGuard Home and Unbound all ship theirs
+off, for the same reason: a box on a LAN that every device points at is commonly
+the one running **split horizon**, where a public zone answering with a LAN
+address is the configuration rather than the attack. On by default, every one of
+those names would become NODATA on upgrade — not degraded, gone, and looking
+exactly like a name that does not exist. [DNSSEC](#dnssec) defaults the other way
+because an upstream that cannot return DNSSEC records is a misconfiguration to
+fix, where split horizon is not.
 
-NODATA rather than SERVFAIL, deliberately. A stub resolver configured with two
-servers treats SERVFAIL as *this* server having failed and asks the other one,
-which on a home network is the router — and the router answers `192.168.1.1`
-quite happily. The refusal would route the attack around itself. NODATA is an
-answer, so the stub stops. It is the same reasoning that has blocklist hits
-answer NXDOMAIN rather than REFUSED.
-
-The check runs before the answer is cached, which is the ordering the whole thing
-rests on: cached first, the first client's private answer is stored and every
-later client is served it without the check ever running again. The refusal is
-not cached either — what elodin saw was one answer, not a property of the name.
-
-Refusals are counted as `rebind=` in the stats line and as
-`elodin_rebind_refused_total` on the metrics endpoint. The first since start is a
-`warn` naming the address and both settings that would allow it; every one after
-is `debug`, so that whoever is triggering it does not decide how much this server
-writes to disk.
-
-#### Why it is off by default, and why to turn it on
-
-dnsmasq, AdGuard Home and Unbound all ship their version of this **off**, and
-elodin follows them. The reason is not deference — it is who runs this. elodin is
-a forwarder for a box on a LAN that every device points at, and that box is
-commonly the one running **split horizon**: a public zone whose names answer with
-a LAN address, an upstream that is the operator's own internal server, a homelab
-whose `nas.example.com` is `192.168.1.50` by design. On by default, every one of
-those names would become NODATA the moment the operator upgraded — not degraded,
-gone, and looking exactly like a name that does not exist — for a configuration
-that was never wrong. A security default that breaks working resolution for a
-large share of the people it ships to is one they turn off in a hurry; off by
-default, and turned on deliberately, is the honest arrangement.
-
-This is a different trade from [DNSSEC validation](#dnssec), which *is* on by
-default here. An upstream that cannot return DNSSEC records is a misconfiguration
-to fix. A public name answering with a private address is, for this program's
-audience, an ordinary and supported thing to be doing — so the two do not default
-the same way.
-
-**Turn it on if you are not running split horizon.** The failure it prevents is
-silent — a page reaching your router's admin interface produces no line anywhere
-— while the guard itself is loud: a `warn` at the first refusal naming the
-address and both settings that would allow it, a `rebind=` counter, a query-log
-line. It is one line:
+**Turn it on if you are not running split horizon** — the failure it prevents is
+silent, while the guard itself is loud. And if you do run split horizon, turn it
+on and name the zones:
 
 ```yaml
 rebind:
   enabled: true
+  allow_domains: [corp.example, home.arpa]
 ```
 
-And if you *do* run split horizon, you can still turn it on: name the zones that
-are allowed to answer with private addresses in `rebind.allow_domains`, described
-below, which `--check` reads.
+Each entry covers itself and everything below it, the way
+`--rebind-domain-ok=/corp.example/` does in dnsmasq, so write the zone rather
+than a wildcard — a `*.corp.example` is refused at load. Matching is against the
+name that was asked for, so a CNAME from an attacker's name into an exempt zone
+exempts nothing. `allow_loopback: true` opens loopback for every name; prefer
+`allow_domains`, since a service bound to `127.0.0.1` is the one least likely to
+authenticate.
 
-#### What turning it on makes unresolvable
+A zone with a route under [`upstream.zones`](#per-domain-upstreams) needs no
+entry here — the route already says that zone is answered locally, and the
+exemption follows from it. `allow_domains` is for the site whose *default*
+upstream is the internal server, where there is no per-zone route to read that
+fact off.
 
-- **Split horizon through an internal upstream.** A site whose upstream is its
-  own DNS server, resolving `nas.corp.example` to an RFC 1918 address through the
-  public name space, gets NODATA for every such name once the guard is on. This
-  is the case `allow_domains` exists for; name the zones and they work again:
+Two other things stop resolving once it is on: a development host that a public
+zone points at `127.0.0.1`, which either setting covers, and **a chained
+sinkhole** — an upstream filtering resolver that answers blocked names with
+`0.0.0.0` or `127.0.0.1` has those answers refused here. The name is blocked
+either way, but `rebind=` then tracks your own ad blocking, so **check whether
+your upstream sinkholes before reading a rising `rebind=` as an attack**.
 
-  ```yaml
-  rebind:
-    allow_domains: [corp.example, home.arpa]
-  ```
-
-  A zone with a route under [`upstream.zones`](#per-domain-upstreams) needs no
-  entry here: the route already says that zone is answered locally, and the
-  exemption follows from it. `allow_domains` is for the site whose *default*
-  upstream is the internal server, where there is no per-zone route to read that
-  fact off.
-
-  Each entry covers itself and everything below it, the way
-  `--rebind-domain-ok=/corp.example/` does in dnsmasq — so write the zone rather
-  than a wildcard, and a `*.corp.example` copied from [`rewrites`](#rewrites) is
-  refused at load rather than kept as an entry that matches nothing. Matching is
-  against the name that was asked for, not the owner name of the offending
-  record, so a CNAME from an attacker's name into an exempt zone exempts nothing.
-
-- **Names that legitimately resolve to loopback**, such as a development host
-  pointed at `127.0.0.1` by a public zone. `allow_loopback: true` covers all of
-  them at once; `allow_domains` covers the one you meant. Prefer the second:
-  loopback is the address a rebinding attack most wants, because a service bound
-  to `127.0.0.1` is the one its author most believed only local processes could
-  reach, and so the one least likely to authenticate.
-
-- **A chained sinkhole.** If elodin forwards to another filtering resolver that
-  answers blocked names with `0.0.0.0` or `127.0.0.1` — a Pi-hole, or dnsmasq
-  with `--address=/ads.example/0.0.0.0` — those answers become NODATA here. The
-  name is blocked either way, so nothing an operator wanted stops resolving, but
-  `rebind=` will climb in proportion to how much that upstream is filtering. **If
-  you see `rebind=` rising, check whether your upstream sinkholes before
-  concluding you are being attacked**: a counter that tracks your own ad blocking
-  says nothing about an attacker. Moving the filtering into elodin's own
-  [sink lists](#sink-lists) settles it, and `allow_loopback` settles the
-  `127.0.0.1` half.
-
-  `0.0.0.0` is not dropped from the set to make that counter tidier. It is a
-  working bypass — see above — and leaving the most interesting target in the set
-  open in order to keep a number clean is the wrong trade.
-
-Four things that look like they would break and do not. `rewrites` need no
-exemption: a rewritten name is answered out of the configuration long before
-anything is forwarded, so `nas.home` pointing at `192.168.1.50` never reaches an
-upstream and never reaches this check. Reverse lookups are unaffected — a PTR
-answer is a name, not an address, and the RFC 6303 reverse zones are handled
-separately (see [DNSSEC](#dnssec)). elodin's own blocking, whatever
-`blocking.response` is set to, builds its answer locally rather than forwarding
-for one — including `zeroip`, whose `0.0.0.0` and `::` are in the refused set but
-never travel the path this check sits on. And `localhost.`, with everything under
-it, may be answered with `127.0.0.1` or `::1` with nothing configured: RFC 6761
-section 6.3 makes those the only answers that name can have, so a loopback answer
-for it is legitimate by definition rather than by anybody's policy. Only as far
-as loopback, though — `evil.localhost` answered with `192.168.1.1` gets no
-latitude from that, since it is not an answer the RFC permits either.
-
-That exemption is not what you meet first, though. With `special_use.enabled` at
-its default, the table under [Names that are never
-forwarded](#names-that-are-never-forwarded) answers everything below `localhost.`
-before anything is forwarded, so the guard is never asked about those names at
-all — `evil.localhost` comes back as `127.0.0.1` rather than as a refusal. The
-exemption is what keeps `localhost.` resolvable in the one configuration where
-that table is off, and is deliberately the guard's own rather than deferred to
-it.
-
-`enabled: false` is the default, so none of the above happens until you turn the
-guard on; the same line turns it back off if you do.
+What needs no exemption: `rewrites`, answered before anything is forwarded;
+reverse lookups, a PTR answer being a name rather than an address; elodin's own
+blocking, `zeroip` included, which builds its answer locally; and `localhost.`,
+which RFC 6761 section 6.3 makes loopback-only by definition — though the
+[reserved-name table](#reserved-names) answers those names first anyway.
 
 ### Rewrites
 
@@ -1446,7 +979,9 @@ rewrites:
     answer: block              # answered as if it were on a blocklist
 ```
 
-Wildcards match subdomains only, so `*.lan` covers `host.lan` but not `lan`.
+Wildcards match subdomains only, so `*.lan` covers `host.lan` but not `lan`. An
+optional `ttl` sets what the answer carries. Rewrites are matched before
+everything else, the block lists included.
 
 #### Other record types
 
@@ -1466,64 +1001,47 @@ rewrites:
     answers: ["A 192.168.1.50", "AAAA fd00::50"]
 ```
 
-`A`, `AAAA`, `CNAME`, `MX`, `TXT` and `SRV`. The fields are in the order their
+`A`, `AAAA`, `CNAME`, `MX`, `TXT` and `SRV`, with the fields in the order their
 RFCs print them, so a line from your registrar's mail page or your SIP
-provider's instructions can be copied across as it stands.
-
-The short forms above are unchanged and are still what most rules want: a bare
-address is an A or a AAAA, a bare name is a CNAME, `block` sinks the name. A type
-token only counts when something follows it, so `answer: mx` is still a CNAME to
-the host called `mx`.
+provider's instructions can be copied across as it stands. The short forms are
+unchanged and still what most rules want: a bare address is an A or AAAA, a bare
+name is a CNAME, `block` sinks the name. A type token only counts when something
+follows it, so `answer: mx` is still a CNAME to the host called `mx`.
 
 TXT unquoted is one string to the end of the line. Quoted, it is a sequence —
 `'TXT "part one" "part two"'` — which is what a TXT record is, and what anything
 over 255 bytes has to be written as, that being the limit on each string. Inside
-the quotes, `\"` is a quote and `\\` a backslash; a zone file's numeric escapes
-(`\065`) are not read, so a backslash before anything else is that character and
-nothing more.
-
-An answer that names a type and gets it wrong is a config error naming the rule,
-not a CNAME to whatever was written: `MX ten mail.example.com` fails `--check`,
-and so does a type this does not answer (`PTR nas.home`, `NS ns1.internal`) and
-anything else with a space in it that does not start with a type. A host name in
-an answer is checked against the wire's limits too — a 64-byte label or a name
-over 255 bytes fails `--check` rather than becoming a rule that silently
-forwards the query it was written to answer.
+the quotes `\"` is a quote and `\\` a backslash; zone-file numeric escapes
+(`\065`) are not read.
 
 **A rule holding only MX, TXT and SRV records is additive**: the types it lists
 are answered here, and every other type at that name is looked up as though the
-rule were not there — the rules below it are still tried, and then the upstream.
-That is what you want for `example.com` with two MX records and an SPF `TXT` — a
-real domain whose website must go on resolving — and it is what `--mx-host` and
-`--txt-record` do in dnsmasq. Add an address, a name or `block` to the same rule
-and it speaks for the whole name again: those are the answers that say where a
-name points, so the types the rule has no record of are NODATA, exactly as they
-were before these kinds existed.
+rule were not there — the rules below it, then the upstream. That is what you
+want for `example.com` with two MX records and an SPF `TXT`, a real domain whose
+website must go on resolving, and it is what `--mx-host` and `--txt-record` do in
+dnsmasq. Add an address, a name or `block` to the same rule and it speaks for the
+whole name again, so the types it has no record of are NODATA.
 
-The corollary is worth knowing before you write one for an internal-only name:
-if nothing else resolves that name, its other types now come back NXDOMAIN
-rather than NODATA, and a client that caches that NXDOMAIN will stop asking for
-the MX or SRV the rule exists to serve (RFC 8020). Give such a rule an address
-as well — or `block` — and the rule speaks for the name, which is what you
-wanted if the name is only yours. Records for a name that really does resolve
-elsewhere, which is what these types are usually for, are unaffected.
+The corollary matters for an internal-only name: if nothing else resolves it, its
+other types now come back NXDOMAIN rather than NODATA, and a client that caches
+that will stop asking for the MX or SRV the rule exists to serve (RFC 8020). Give
+such a rule an address as well, or `block`, and it speaks for the name.
 
-A CNAME may not share its rule with other records, and there may be only one of
-them: a CNAME says this name *is* another name, so it already answers every type,
-and a resolver handed a CNAME beside an MX has been handed a malformed answer
-(RFC 2181 section 10.1). Put the other records on the name it points at.
-`block` is exempt — it is not a record, and it answers before the rest of the
-rule is read.
+A CNAME may not share its rule with other records and there may be only one: a
+CNAME says this name *is* another name, so it already answers every type, and a
+CNAME beside an MX is a malformed answer (RFC 2181 section 10.1). Put the other
+records on the name it points at. `block` is exempt, not being a record.
 
 The MX exchange and the SRV target get no address in the additional section —
 this server would have to resolve them upstream to find one, and clients ask for
 it themselves.
 
-Three things that loaded before this and now fail `--check`, each because it was
-producing an answer no client could use: an answer with a space in it that does
-not begin with a record type (it became a CNAME to a name with a space), a CNAME
-beside another record in the same rule, and a host name the wire cannot carry —
-a label over 63 bytes or a name over 255, in a rule's `domain` or in an answer.
+An answer that names a type and gets it wrong is a config error naming the rule
+rather than a CNAME to whatever was written: `MX ten mail.example.com` fails
+`--check`, as does a type this does not answer (`PTR nas.home`, `NS
+ns1.internal`), anything else with a space in it that does not start with a type,
+a CNAME beside another record, and a host name the wire cannot carry — a label
+over 63 bytes or a name over 255, in a rule's `domain` or in an answer.
 
 #### Reverse lookups
 
@@ -1532,51 +1050,37 @@ answers `50.1.168.192.in-addr.arpa`, with the rule's own TTL, so `nslookup
 192.168.1.50` gives back `nas.home` instead of the blackhole servers' NXDOMAIN.
 dnsmasq and AdGuard Home both do this, and without it every `ssh` banner, mail
 server check and log viewer on the LAN reports a name that does not exist for a
-name this server is answering. Nothing to configure — writing the forward rule is
-writing the reverse one.
+name this server is answering. Nothing to configure. Other types at a synthesised
+name are NODATA with an SOA rather than a forwarded query.
 
 Only a rule that really does hand out the address gets to name it, and only if
-the address is one this network holds:
+the address is one this network holds. Nothing is synthesised for:
 
-- a wildcard rule answers every name below its suffix with the same address, so
-  there is no one name to point back at and none is invented;
-- a rule with `answer: block` hands out no address at all, so there is nothing to
-  reverse;
-- a rule the forward direction never reaches — one shadowed by an earlier
-  wildcard over the same name, or by an earlier rule with the same `domain:` —
-  supplies nothing either, or `192.168.1.50` would reverse to a name that
-  resolves to some other address. The test is on the answer, not on which rule
-  won: if the rule shadowing it hands out the same address, the name does resolve
-  to it and still gets the PTR;
-- an address named by several rules gets the first rule's name, in file order,
-  which is the precedence the forward direction already uses;
-- a rule with `ptr: false` keeps its forward answer and stops claiming the
-  address — see below;
+- a wildcard rule, which answers every name below its suffix with the same
+  address, so there is no one name to point back at;
+- a rule with `answer: block`, which hands out no address at all;
+- a rule the forward direction never reaches — shadowed by an earlier wildcard or
+  by an earlier rule with the same `domain:` — unless the rule shadowing it hands
+  out the same address, the test being on the answer rather than on which rule
+  won;
 - an address outside RFC 1918, RFC 3927 link-local, `fd00::/8` unique-local and
-  RFC 4291 IPv6 link-local gets nothing — a rule pointing a local name at a
-  public address says nothing about who owns that address, and its real PTR is
-  somebody else's to answer. Loopback and `0.0.0.0` are left out too: a rule
-  pointing a name at one of those is sinking it rather than addressing it.
-  (`fd00::/8` rather than all of RFC 4193's `fc00::/7`, matching the reverse zone
-  that is served locally: `fc00::/8` is the half of that block nobody defined an
-  assignment method for, and no `c.f.ip6.arpa` is served here to answer under.);
-- a rule written for the reverse name itself wins, the synthesis being what
-  happens when nothing more specific was said;
-- a `dnssec.trust_anchors` entry over the reverse zone turns the synthesis off
-  for the names it covers, while `dnssec.enabled` is on. Anchoring a zone is a
-  request to validate it, and an answer invented here carries no signature — a
-  validating client below you, holding the same anchor, would get SERVFAIL for
-  it. A site that signs its own reverse space is publishing these PTRs already.
-  With validation off the anchors are inert here as they are everywhere else in
-  this server, and every locally answered name — rewrites, blocked names, the
-  reserved-name table — is unsigned in the same way.
+  RFC 4291 IPv6 link-local. A rule pointing a local name at a public address says
+  nothing about who owns it, and its real PTR is somebody else's to answer;
+  loopback and `0.0.0.0` are out too, a rule pointing at one of those being a
+  sinkhole rather than an address.
 
-Three things to know before turning this loose on an existing installation.
+An address named by several rules gets the first rule's name in file order, the
+precedence the forward direction already uses, and a rule written for the reverse
+name itself wins outright — the synthesis is what happens when nothing more
+specific was said. A `dnssec.trust_anchors` entry over the reverse zone turns it
+off for the names it covers while `dnssec.enabled` is on: anchoring a zone is a
+request to validate it, and an answer invented here carries no signature, so a
+validating client below you holding the same anchor would get SERVFAIL.
 
-If you sink a name by pointing it at a host on your LAN — `ads.example.com:
-192.168.1.10`, a block page served off the router — that host's reverse would
-become `ads.example.com`. Nothing here can tell that rule from a rule naming the
-host itself, so say so with `ptr: false`:
+Two things to know before turning this loose on an existing installation. If you
+sink a name by pointing it at a host on your LAN — a block page served off the
+router — that host's reverse would become the sunk name, and nothing here can
+tell that rule from one naming the host itself. Say so with `ptr: false`:
 
 ```yaml
 rewrites:
@@ -1586,26 +1090,17 @@ rewrites:
 ```
 
 The rule keeps its forward answer and stops claiming the address. File order
-settles it too — a rule for the host, above the sinkhole rules, takes the address
-back — and `answer: block` and the [sink lists](#sink-lists) sink a name without
-handing out an address to be reversed at all. The key is for when the block page
-really does have to be an address.
-
-If your upstream serves your reverse zone, the addresses named in `rewrites` are
-now answered here instead. They are the ones you wrote down; signing that zone
-and anchoring it is how to say you meant the upstream's answer.
+settles it too, and `answer: block` or the [sink lists](#sink-lists) sink a name
+without handing out an address to reverse at all; the key is for when the block
+page really does have to be an address.
 
 And the reverse direction makes your local name inventory sweepable: anyone your
 [client allow list](#who-may-ask) admits can walk RFC 1918 reverse space and
-collect the names, where before they had to guess forward names. dnsmasq and
-AdGuard Home give the same answers to the same sweep, and the allow list defaults
-to local networks only — but if that list is wide, this is one more thing behind
-it.
+collect the names, where before they had to guess forward ones. dnsmasq and
+AdGuard Home answer the same sweep the same way, and the allow list defaults to
+local networks only — but if that list is wide, this is one more thing behind it.
 
-Other types for a synthesised name are NODATA with an SOA rather than a
-forwarded query — the name exists, and there is nothing else at it.
-
-### Names that are never forwarded
+### Reserved names
 
 ```yaml
 special_use:
@@ -1616,8 +1111,8 @@ special_use:
   home_arpa: false # home.arpa. (RFC 8375 sections 3 and 4)
 ```
 
-Three names are answered here rather than asked about, whatever `upstream.servers`
-says:
+Three names are answered here rather than asked about, whatever
+`upstream.servers` says:
 
 | name | answer | why |
 |---|---|---|
@@ -1625,121 +1120,66 @@ says:
 | `onion.` and below | NXDOMAIN | RFC 7686 2, unless the upstream is Tor-aware |
 | `invalid.` and below | NXDOMAIN | RFC 6761 6.4. It cannot exist |
 
-`.onion` is the one this exists for. The query is the disclosure: forwarding it
-tells the upstream operator — and anyone on the path to a plain-UDP upstream —
-that somebody on this network is reaching for one specific hidden service, which
+`.onion` is the one this exists for: the query is the disclosure, since
+forwarding it tells the upstream operator — and anyone on the path to a plain-UDP
+upstream — that somebody here is reaching for one specific hidden service, which
 is what Tor was being used not to publish. `localhost.` is a correctness problem
-rather than a privacy one: forwarded, the name resolves to whatever the upstream
-says, which is a rebinding primitive given away for free.
+instead: forwarded, it resolves to whatever the upstream says, which is a
+rebinding primitive given away for free.
 
-Answers from the table are counted as `special_use=` in the `msg=stats` line and
-as `elodin_special_use_total` on the metrics endpoint, and logged individually as
-`outcome=local detail=special-use` when `log.queries` is on. That counter is
-worth a panel: it is not a number that should climb on a network nobody is
-resolving `.onion` from, so it climbing tells you either that somebody is, or
-that `localhost.` lookups are reaching this resolver rather than being answered
-from a hosts file.
+These answers carry a 10-minute TTL and a synthesised SOA so a downstream
+resolver can cache the negative, and they are not put in elodin's own cache. They
+show as `outcome=local detail=special-use` and are counted as `special_use=` and
+`elodin_special_use_total` — a counter worth a panel, since it climbing on a
+network nobody resolves `.onion` from says either that somebody is, or that
+`localhost.` lookups are reaching this resolver rather than a hosts file.
 
 **`local.`, `test.` and `home.arpa.` are off by default**, though RFC 6762, RFC
-6761 and RFC 8375 ask for the same handling. They are the reserved names that
-networks really do serve — an Active Directory domain under `.local` older than
-the reservation, an internal `.test` zone that RFC 6761 explicitly permits, a
-home router authoritative for `home.arpa` — and answering them with NXDOMAIN on
-an upgrade would take those hostnames away from a network that had them. Turn
-them on if nothing here serves them; against a public upstream the only thing
-that changes is that the NXDOMAIN arrives without the round trip and without the
-hostname having left the building.
+6761 and RFC 8375 ask for the same handling, because they are the reserved names
+networks really do serve: an Active Directory domain under `.local` older than
+the reservation, an internal `.test` zone RFC 6761 permits, a home router
+authoritative for `home.arpa`. Answering them with NXDOMAIN on an upgrade would
+take those hostnames away from a network that had them. Turn them on if nothing
+here serves them; against a public upstream the only change is that the NXDOMAIN
+arrives without the round trip and without the hostname having left the building.
+A `rewrites` rule outranks all of this, but what a rewrite cannot do is send the
+query somewhere — a network whose router answers `.local` dynamically wants a
+route under [`upstream.zones`](#per-domain-upstreams) pointed at it, alongside
+the `local: false` that is already the default.
 
-`home_arpa` is the one of the three that is about privacy rather than a wrong
-answer, and it is worth turning on if no router here answers `home.arpa`. Those
-names are your own network's — the printer, the NAS — and forwarded they name
-your hardware to a public resolver in exchange for the blackhole servers'
-NXDOMAIN. RFC 8375 section 3 says not to send them. What it does *not* do is
-send them to your router instead — that is
-[`upstream.zones`](#per-domain-upstreams), which is what a network whose router
-*does* answer the zone wants, and is why this key cannot simply default on.
+`home_arpa` is about privacy rather than a wrong answer: those names are your own
+network's, and forwarded they name your hardware to a public resolver in exchange
+for the blackhole servers' NXDOMAIN. What it does *not* do is send them to your
+router instead — that is [`upstream.zones`](#per-domain-upstreams), which is what
+a network whose router *does* answer the zone wants, and is why this key cannot
+simply default on. The zone is served empty rather than absent,
+which is what RFC 8375 section 4 asks for — `printer.home.arpa` is NXDOMAIN,
+`home.arpa` itself NODATA with its own SOA and NS. One query still goes out with
+the key on, `home.arpa DS`, whose signed proof lives in `arpa` and which a
+validating client below elodin needs to conclude "insecure" instead of "broken";
+see [DNSSEC](#dnssec).
 
-`home.arpa` is answered as an empty zone rather than as a name that does not
-exist, which is what RFC 8375 section 4 asks for and what the blackhole servers
-serve today: `printer.home.arpa` is NXDOMAIN, and `home.arpa` itself is NODATA,
-with its own SOA and NS for the types that ask. Turning the key on changes the
-route those queries take, not the rcode your clients see.
+A site running `.local` may not have working names there in the first place: with
+validation on, its upstream's unsigned answer is checked against a root that
+publishes a signed proof there is no `local.` to delegate, and SERVFAIL is the
+likely verdict. `local: true` at least turns that into a clean NXDOMAIN, and a
+`rewrites` rule turns it into an answer.
 
-One query still goes out with the key on: `home.arpa DS`. The signed proof that
-this delegation carries no DS lives in `arpa`, RFC 8375 section 4 requires that
-it be fetched rather than invented, and a validating client below elodin needs
-it to conclude "insecure" instead of "broken" — answering that one from the
-table would turn every `home.arpa` name into SERVFAIL for such a client. The
-question names no host of yours, and the answer is the same for every home
-network. See [DNSSEC](#dnssec) for the other half of how `home.arpa` is handled,
-which is what keeps that forwarded `DS` off the chain walk.
+One upstream really should be asked `.onion`: a local `tor` with `DNSPort` and
+`AutomapHostsOnResolve`. That wants `onion: false` and keeps the rest of the
+table — RFC 7686 2 addresses a caching server "where not explicitly adapted to
+interoperate with Tor", so this is the adapted case it leaves room for. It is
+warned about at startup, the setting being a claim about the upstream rather than
+about this resolver. `enabled: false` forwards those names too, and stands
+validation down for them the same way rather than SERVFAILing an answer it just
+asked for; the cost, if you turn the table off for some reason other than tor, is
+that an ordinary upstream's NXDOMAIN for a `.onion` name arrives as insecure
+rather than as the root-signed nonexistence it could have proved.
 
-Note that such a site may not have working `.local` names in the first place.
-With `dnssec.enabled` on — the default — the unsigned answer its upstream gives
-is checked against a root that publishes a signed proof there is no `local.` to
-delegate, and SERVFAIL is the likely verdict; the sites this default protects
-are the ones running with validation off. If `.local` is SERVFAILing for you,
-`local: true` at least turns that into a clean NXDOMAIN, and a `rewrites` rule
-turns it into an answer.
-
-A rewrite outranks all of this, since `rewrites` are matched first: a site that
-knows what its own `.local` names resolve to can say so and keep that answer.
-What a rewrite cannot do is send the query somewhere — a network whose router
-answers `.local` dynamically wants a route under
-[`upstream.zones`](#per-domain-upstreams) pointed at it, alongside the
-`local: false` that is already the default.
-
-There is one upstream for which `.onion` really is the right question to ask: a
-local `tor` with `DNSPort` and `AutomapHostsOnResolve`, which answers those names
-with mapped addresses. That setup wants `onion: false`, and keeps everything else
-in the table. RFC 7686 2 addresses a caching server "where not explicitly adapted
-to interoperate with Tor", so this is the adapted case the RFC leaves room for
-rather than a departure from it. It is warned about at startup, since the setting
-is a claim about the upstream and not about this resolver.
-
-What that upstream answers is unsigned, and cannot be anything else: the root
-publishes a signed proof that there is no `onion.` to delegate, so a validator
-reads a mapped address under it as unsigned data inside the root zone and calls
-it forgery. Forwarding `.onion` therefore also takes those names out of DNSSEC
-validation, exactly as the RFC 6303 reverse zones are — they come back as
-insecure, without the AD bit, rather than as SERVFAIL.
-
-That follows from the forwarding, not from which key asked for it: `onion: false`
-and `enabled: false` both send these names to the upstream, so both stand
-validation down for them. The narrow reading, where only `onion: false` did, left
-`enabled: false` forwarding `.onion` and then SERVFAILing the answer — a trap for
-exactly the tor operator the escape hatch exists for, who has no reason to read
-the difference off the two key names.
-
-The cost, since it is a real one: if you set `enabled: false` for some reason
-other than tor and your upstream is an ordinary public resolver, its NXDOMAIN for
-a `.onion` name now arrives as insecure rather than as the root-signed
-nonexistence it could have proved, and a forged address for one is passed on
-rather than caught as Bogus. That is the exposure `onion: false` already accepts,
-and it is bounded by both keys defaulting to `true`, so neither forwards until
-somebody writes it down. Nothing else moves:
-validation is untouched for every other name, and for `.onion` too while the
-table is answering it.
-
-`localhost.` and `invalid.` have no key of their own, and are not going to grow
-one. Neither has a deployment that wants them forwarded — no upstream is
-authoritative for either, and RFC 6761 6.3 and 6.4 leave a resolver nothing to
-defer to about them — so a key would only ever be set by somebody working around
-a symptom. `enabled: false` is still there for an operator who wants none of
-this, and says so in the log — and it forwards `.onion` without validating it,
-so a Tor-aware upstream works behind it without `onion: false` having to be
-written down as well.
-
-`example.` is deliberately not in the table. It is reserved, but RFC 6761 6.5 is
-the one entry in that document that asks for the opposite: caching servers should
-*not* treat example names as special, `example.com` and its siblings being
-delegated names that resolve.
-
-These answers carry a 10-minute TTL and a synthesised SOA so a resolver
-downstream can cache the negative, and they are not put in elodin's own cache —
-they are built from a table already in memory, and an entry would only outlive
-the reload meant to change it. They show in the query log as `outcome=local
-detail=special-use`.
+`localhost.` and `invalid.` have no key of their own and are not going to grow
+one, neither having a deployment that wants them forwarded. `example.` is
+deliberately absent: it is reserved, but RFC 6761 6.5 asks for the opposite,
+`example.com` and its siblings being delegated names that resolve.
 
 ### Metrics
 
@@ -1751,10 +1191,8 @@ metrics:
   path: /metrics
 ```
 
-Off by default, and nothing is bound until it is turned on: a resolver that
-opens a port nobody wrote in a file has widened an operator's exposure on their
-behalf. The endpoint speaks plain HTTP and serves the Prometheus text exposition
-format, version 0.0.4.
+Off by default, and nothing is bound until it is turned on. The endpoint speaks
+plain HTTP and serves the Prometheus text exposition format.
 
 ```
 scrape_configs:
@@ -1764,29 +1202,25 @@ scrape_configs:
 ```
 
 **It is not on the path a query takes.** Every number it publishes is a counter
-the resolver already maintains for the `msg=stats` line, read at scrape time
-from the atomic it already lives in, so turning the endpoint on adds no work per
-query and turning it off removes none. There is no latency histogram and no
-per-name label, because both would mean measuring on the path being measured.
-The isolation is structural rather than a promise: the endpoint has one thread
-of its own, never queues work on either worker pool, never spawns a thread per
-connection — so nothing reaching this port can spend the budget
-`server.max_connections` keeps for clients — and answers one request per
-connection before closing, so a scraper holding a socket open cannot keep the
-next scrape out. Two scrapers at once are served one after the other.
+the resolver already maintains for the `msg=stats` line, read at scrape time from
+the atomic it already lives in. There is no latency histogram and no per-name
+label, because both would mean measuring on the path being measured. The
+isolation is structural: one thread of its own, no work queued on either worker
+pool, no thread per connection — so nothing reaching this port can spend the
+budget `max_connections` keeps for clients — and one request per connection before
+closing, so a scraper holding a socket open cannot keep the next scrape out.
 
-It binds loopback by default rather than the `0.0.0.0` the DNS listeners use.
-Nothing here is a secret in the way an answer is, but together these numbers
-describe a network — how much it queries, how much of that is blocked, which
-upstreams are reachable — and there is no authentication in front of them. A
-bind beyond loopback is logged as a warning at startup, once.
+It binds loopback rather than the `0.0.0.0` the DNS listeners use: nothing here
+is a secret in the way an answer is, but together these numbers describe a
+network and there is no authentication in front of them. A wider bind is logged
+as a warning at startup.
 
 | metric | type | what it is |
 |---|---|---|
 | `elodin_build_info{version}` | gauge | a constant 1, carrying the version as a label |
 | `elodin_uptime_seconds` | gauge | seconds since this process finished starting |
 | `elodin_queries_total` | counter | queries accepted, whatever became of them |
-| `elodin_answers_total{outcome}` | counter | `forwarded`, `cached`, `blocked`, `rewritten`, `failed` — the same words the `msg=query` line uses, except that an answer the rebinding guard withheld is logged as `blocked` and counted in `elodin_rebind_refused_total` instead of here, and that `outcome=local` is not among them: of those, only the reserved-name table is counted, in `elodin_special_use_total` |
+| `elodin_answers_total{outcome}` | counter | `forwarded`, `cached`, `blocked`, `rewritten`, `failed` |
 | `elodin_queries_dropped_total` | counter | turned away before any work: the backlog was full, or the source could not be answered |
 | `elodin_queries_refused_total` | counter | turned away by `server.allow_from` |
 | `elodin_connections_refused_total` | counter | refused because `server.max_connections` was full |
@@ -1795,16 +1229,16 @@ bind beyond loopback is logged as a warning at startup, once.
 | `elodin_rate_limited_total` | counter | queries the rate limiter withheld an answer from |
 | `elodin_rate_limit_slipped_total` | counter | those answered truncated instead, to send a real client to TCP |
 | `elodin_dnssec_answers_total{result}` | counter | `secure` and `bogus` |
-| `elodin_rebind_refused_total` | counter | answers withheld because a public name was pointed into private address space |
-| `elodin_special_use_total` | counter | queries answered from the reserved-name table instead of being forwarded — a rising figure is `.onion` or `localhost.` lookups on your network that stopped here |
+| `elodin_rebind_refused_total` | counter | answers withheld because a public name was pointed into private space |
+| `elodin_special_use_total` | counter | queries answered from the reserved-name table instead of being forwarded |
 | `elodin_cache_entries` / `_bytes` | gauge | what the cache holds, against `max_entries` and `max_bytes` |
 | `elodin_cache_hits_total` / `_misses_total` / `_evictions_total` | counter | how it is doing |
-| `elodin_cache_stale_total` | counter | expired answers served because no fresh one could be got, with `cache.serve_stale` on |
-| `elodin_cache_withheld_total` | counter | answers the cache handed over that were then refused rather than served, so `_hits_total` counts them and the query log does not |
+| `elodin_cache_stale_total` | counter | expired answers served because no fresh one could be got |
+| `elodin_cache_withheld_total` | counter | answers the cache handed over that were then refused rather than served |
 | `elodin_filter_rules{list}` | gauge | rules loaded, `block` and `allow` |
 | `elodin_upstream_queries_total{upstream}` | counter | queries sent to each upstream, by its configured name |
 | `elodin_upstream_failures_total{upstream}` | counter | exchanges that produced no usable answer |
-| `elodin_upstream_latency_seconds_total{upstream}` | counter | cumulative round-trip time; divide by the query counter under `rate()` for the mean over a window |
+| `elodin_upstream_latency_seconds_total{upstream}` | counter | cumulative round-trip time; divide by the query counter under `rate()` for the mean |
 | `elodin_upstream_up{upstream}` | gauge | 0 while an upstream is in its failure cooldown |
 | `elodin_pool_workers{pool}` / `elodin_pool_pending{pool}` | gauge | the `query` and `upstream` pools; `pending` that does not return to zero is `server.workers` set too low |
 | `process_cpu_seconds_total` | counter | user plus system CPU |
@@ -1812,16 +1246,13 @@ bind beyond loopback is logged as a warning at startup, once.
 | `process_threads`, `process_open_fds`, `process_max_fds` | gauge | thread and descriptor counts |
 | `process_start_time_seconds` | gauge | when this process began serving |
 
-The `process_` family carries the names every Prometheus client library uses for
-these, deliberately: a dashboard or an alert written against a Go or a Python
-service works here without being told it is looking at something else.
-
-`elodin_answers_total` does not sum to `elodin_queries_total`. A query the
-backlog or the allow list turned away never reached an outcome — that is
-`dropped` and `refused` — and one answered from a local zone is not counted
-apart from the rest.
-
-Useful starting points:
+`elodin_answers_total` does not sum to `elodin_queries_total`: queries the
+backlog or the allow list turned away never reached an outcome, an answer the
+rebinding guard withheld is counted in `elodin_rebind_refused_total`, and of the
+`outcome=local` answers only the reserved-name table is counted, in
+`elodin_special_use_total`. The `process_` family carries the names every
+Prometheus client library uses, so a dashboard written against a Go or Python
+service works here unchanged.
 
 ```promql
 sum(rate(elodin_queries_total[5m]))
@@ -1831,14 +1262,11 @@ rate(elodin_upstream_latency_seconds_total[5m]) / rate(elodin_upstream_queries_t
 min by (upstream) (elodin_upstream_up) == 0
 ```
 
-A Grafana dashboard over those metrics is in
+A Grafana dashboard is in
 [`examples/grafana-dashboard.json`](examples/grafana-dashboard.json) — import it
 under **Dashboards → New → Import**. It asks for a Prometheus data source and
 picks up `job` and `instance` from `elodin_build_info`, so it works against one
-instance or a fleet without editing. Five rows: an overview of headline rates,
-queries by outcome and by what turned them away, the cache, per-upstream traffic
-and health, and the process against its limits. Restarts are annotated from
-`process_start_time_seconds`.
+instance or a fleet without editing.
 
 ## What is implemented
 
@@ -1847,206 +1275,47 @@ CAA, SVCB/HTTPS, DS, DNSKEY, RRSIG and everything else. Types the codec does not
 model natively are carried through as opaque RDATA per RFC 3597, and forwarded
 answers are passed back byte for byte, so DNSSEC records survive untouched. With
 validation on, an answer for a client that did not ask for DNSSEC records is
-rebuilt without them; every other answer still goes back verbatim, bar the two
-bytes of payload size in the OPT record — see [How large a UDP answer may
-be](#how-large-a-udp-answer-may-be).
+rebuilt without them; every other answer goes back verbatim, bar the two bytes of
+payload size in the OPT record.
 
-Also handled: EDNS0 (the client's OPT record is forwarded upstream so payload
+Also handled: EDNS0 — the client's OPT record is forwarded upstream so payload
 sizes are negotiated end to end, minus its cookie and its client-subnet option,
-which both stop here — and a query with two OPT records, or with one whose
-options cannot be read, is refused with FORMERR rather than forwarded, because
-neither is a message those two can be taken back out of; over UDP the OPT that
-comes back to the client carries *this* server's payload size, per RFC 6891
-section 6.2.4, while on the stream
-transports it is passed through as it stands — see [How large a UDP answer may
-be](#how-large-a-udp-answer-may-be)), DNS
-cookies in both directions (RFC 7873, RFC 9018) — answered for clients, and
-presented to plain upstreams with the reply checked against what we sent —
-EDNS(0) padding in both directions on DoT and DoH, and on neither of the clear
-transports (RFC 7830, RFC 8467) — see [EDNS padding](#edns-padding) —
-truncation with the TC bit and the UDP→TCP retry, `version.bind`/`hostname.bind`
-in the CHAOS class, local NODATA answers for `resolver.arpa` (RFC 9462 section
-6.1), refusal of zone-transfer requests, and the reserved names of RFC 6761 and
-RFC 7686 answered here instead of being forwarded — see [Names that are never
-forwarded](#names-that-are-never-forwarded).
+which both stop here; a query with two OPT records, or with one whose options
+cannot be read, is answered FORMERR rather than forwarded, neither being a
+message those two can be taken back out of. Then DNS cookies in both directions,
+[EDNS(0) padding](#edns-padding) in both directions on DoT and DoH and on
+neither of the clear transports, truncation with the TC bit and the UDP→TCP
+retry, `version.bind`/`hostname.bind` in the CHAOS class, local NODATA answers
+for `resolver.arpa`, refusal of zone-transfer requests, and the reserved names of
+RFC 6761 and RFC 7686 answered here instead of forwarded.
 
-The cache stores upstream answers as untouched wire bytes plus the offsets of
-their TTL fields, and rewrites those TTLs in place on each hit. That keeps the
-original name compression intact and avoids a decode/encode round trip on the
-hot path. It is bounded by `cache.max_bytes` as well as `cache.max_entries`,
-because an entry's size is decided by whoever answered the query: see
-[Resource use](#resource-use).
+## Sizing
 
-The TTLs it writes are bounded at both ends, and both ends reach the client, on
-different answers. `cache.max_ttl` is a ceiling on every answer this server
-passes on from an upstream — forwarded or cached — as well as on how long the
-entry is kept, so no client is told to hold such a record for longer than a day
-by default however large a figure the upstream sent. It does not reach the
-answers this server writes itself: a blocked name carries `blocking.block_ttl`
-and a local zone its own `ttl`, neither of which is bounded by this and both of
-which are yours to set. `cache.min_ttl` is a floor on the copies served from an
-entry; the copy forwarded on the miss that filled that entry carries the
-upstream's own figure, which a ceiling can only shorten. Neither is a promise
-that a client drops a record when this cache does: an entry lives for the
-smallest TTL in the message it holds, and a negative one for the SOA's own
-figure capped by `cache.negative_ttl` (RFC 2308), while every record in it still
-goes out carrying its own TTL up to the ceiling. A TTL arriving with its top
-bit set is taken as zero, per RFC 2181 section 8, which also leaves the answer
-uncacheable unless `cache.min_ttl` raises it — a zeroed TTL meets that floor
-like any other. Section 8 applies to forwarded answers too, cache or no cache.
+A worker thread is held for the whole of an upstream round trip, so sustained
+throughput on cache misses is roughly `server.workers / upstream_rtt`. Two
+consequences: **every query shares that pool**, so running short on workers
+delays cache hits as much as misses; and **memory scales with workers**, as a
+floor rather than a peak, because a worker holds its scratch arena from its first
+query onward — `free_all` on Odin's temp allocator keeps and zeroes the first
+block instead of returning it.
 
-## Capacity
-
-Everything below comes out of `mise run bench`, against a mock upstream held at
-a realistic 20 ms. The harness lives in `bench/` and is documented there; the run
-these figures are from is `bench/results/2026-08-03-ryzen7-6850u.md`. Re-taking
-them is the point — a number here that the harness does not produce is a number
-to delete.
-
-Four settings are not at their shipped values, and the numbers should be read
-knowing it. **DNSSEC validation is off**, because the mock serves an unsigned
-zone with no chain to the root and every answer would otherwise be SERVFAIL.
-**Rate limiting is off**, because the load generator is one address asking as
-fast as it can, which is exactly what the limiter exists to stop — at the shipped
-500 responses a second per prefix none of these figures is reachable.
-`server.workers` and `server.upstream_workers` are **pinned at 128 and 64**
-rather than derived from the machine, so a row means the same thing on any host.
-And `upstream.attempts` is **1** rather than 2, so a failure shows up as one
-instead of being retried into a slower success. What DNSSEC and rate limiting
-cost is a separate question from what the transports cost, which is the reason
-they are held out rather than an argument that they are free.
-
-The machine is a Ryzen 7 PRO 6850U laptop, 16 logical cores. It is a 15 W part
-that cannot hold its boost clock through a long run, so read these as the shape
-of the thing rather than as a specification: the same table taken from a cold
-machine and from a hot one differs by 20–30%, and figures in one table should
-not be compared with figures in another.
-
-| workload | throughput | p50 | p99 | peak RSS |
-|---|---|---|---|---|
-| cache hits | 164,000 qps | 1.1 ms | 3.2 ms | 43 MB |
-| blocked | 157,000 qps | 1.2 ms | 2.9 ms | 43 MB |
-| rewritten | 158,000 qps | 1.2 ms | 2.8 ms | 43 MB |
-| light mixed load (20 in flight) | 136,000 qps | 0.13 ms | 0.42 ms | 43 MB |
-| sustained cache misses | 6,100 qps | 21 ms | 24 ms | 47 MB |
-
-Every transport serves many clients at once. With 100 concurrent clients, each
-holding its own connection for the run:
-
-| transport | throughput | p50 | p99 | answered per client (min–max) |
-|---|---|---|---|---|
-| UDP | 158,000 qps | 0.59 ms | 1.7 ms | 15659 – 15923 |
-| TCP | 177,000 qps | 0.21 ms | 4.4 ms | 17206 – 18486 |
-| DoT | 133,000 qps | 0.36 ms | 5.4 ms | 12935 – 13743 |
-| DoH over HTTP/1.1 | 65,000 qps | 0.81 ms | 11 ms | 6256 – 6787 |
-| DoH over HTTP/2 | 30,000 qps | 0.59 ms | 21 ms | 2777 – 3233 |
-
-No errors on any of them. The per-client spread stays inside 9% on UDP, TCP, DoT
-and HTTP/1.1, so no client is starved by the others; on HTTP/2 it is 16%, which
-is what multiplexing costs in fairness — streams from one connection compete for
-the same worker pool rather than taking turns. TCP was also run at 500
-concurrent connections: 149,000 qps, with the spread widening to 28% as the
-per-connection threads start contending.
-
-How each transport reaches that:
-
-- **UDP** has one reader thread that hands every datagram to the worker pool.
-  There is no per-client state and no connection limit.
-- **TCP, DoT and DoH** give each connection a thread, capped by
-  `server.max_connections` (512). Within a single connection, TCP, DoT and
-  HTTP/1.1 answer one query at a time; **HTTP/2 multiplexes**. Connections are
-  reused, so the cap bounds concurrent *clients*, not queries per second — the
-  100-connection runs above carry well over 100,000 qps.
-
-HTTP/2 costs about two and a half times as much CPU per query as HTTP/1.1 on
-answers that come straight from the cache — 220 µs against 87 µs — because of
-framing, HPACK and the hand-off to the worker pool, and it serves under half the
-throughput on that workload. It earns all of that back the moment queries are
-slow, which is when a browser is actually waiting. Ten clients issuing eight
-concurrent requests each, all of them cache misses against a 20 ms upstream:
-
-| | throughput | p50 |
-|---|---|---|
-| HTTP/1.1 | 460 qps | 171 ms |
-| HTTP/2 | 3,702 qps | 21 ms |
-
-Eight times the throughput at an eighth of the latency — the eight requests
-overlap instead of queueing, and p50 settles at one upstream round trip.
-
-Past `max_connections`, DoT and DoH refuse cleanly during the handshake. Plain
-TCP cannot: the kernel completes the handshake from the listen backlog before
-the server sees it, so a refused client gets a connection reset on first use and
-has to reconnect. Either way the first refusal since start is a `warn` naming
-the setting and every one after it is `debug` — the same shape as an
-`allow_from` refusal, and for the same reason: how many of them there are is
-decided by whoever is opening the connections.
-
-```
-ts=… level=warn msg="tcp: refusing a connection, server.max_connections (512) is reached"
-ts=… level=warn msg="raise server.max_connections if this server should hold more clients at once; these are counted as conn_refused= in the stats line, and further ones are logged at debug level"
-```
-
-The counting does not stop with the logging: every one of them is a
-`conn_refused=` in the stats line, so a server that has been sitting at its limit
-since long after that `warn` scrolled away still says so. It is kept apart from
-`refused=`, which is the allow list turning a source away — this is a client
-elodin would serve and has no room for, and the setting to reach for is a
-different one.
-
-A connection can also be refused *below* the limit, when the OS will not give
-the process another thread — `RLIMIT_NPROC`, a cgroup `pids.max`, or memory.
-Raising `max_connections` there cannot help and would make it worse, so it is
-counted and named separately:
-
-```
-ts=… level=warn msg="tcp: refusing a connection, the OS would not start a thread for it - this is below server.max_connections (512), so raising that will not help"
-ts=… level=warn msg="check the process thread and memory limits (RLIMIT_NPROC, cgroup pids.max); these are counted as conn_failed= in the stats line, and further ones are logged at debug level"
-```
-
-The number that governs sizing is the sustained cache-miss row. A worker thread is occupied for
-the whole of an upstream round trip, so
-
-```
-sustained cache-miss throughput  ≈  server.workers / upstream_rtt
-```
-
-which is about 50 qps per worker against a 20 ms upstream, so a 128-worker pool
-carries roughly 6,000 misses per second. Two consequences worth knowing:
-
-- **Every query shares that pool**, so running short on workers delays cache
-  hits as much as misses. At a pool of 8 workers, answers that take 60 µs to
-  produce from cache were coming back after 413 ms because the workers were all
-  parked on upstream I/O.
-- **Memory scales with workers**, at roughly 0.3 MB of scratch arena each — and
-  it is a floor rather than a peak. A worker holds its arena from its first
-  query onward, because `free_all` on Odin's temp allocator keeps and zeroes the
-  first block instead of returning it.
-
-That second point is why `server.workers` and `server.upstream_workers` are not
-fixed numbers any more. Left unset — which is what `0` means, and what the
-shipped configuration says — they are worked out at startup from the machine:
+That second point is why the worker counts are not fixed numbers. Left unset —
+which is what `0` means, and what the shipped configuration says — they are
+derived at startup from the machine:
 
 ```
 workers           = clamp(usable_cpus * 4, 16, 128), lowered if the threads
                     that implies would take more than 1/32 of usable memory
 upstream_workers  = workers / 2
+max_pending       = workers * 8
 ```
 
 "Usable" is what this process can have rather than what the box holds: the CPU
 affinity mask, and a cgroup CPU or memory limit where there is one, so a
-container or a systemd unit with `CPUQuota=`/`MemoryMax=` sizes itself for what
-it was given. A two-core home box lands on 16 workers and 8 racers rather than
-the 128 and 64 every installation used to get, and a 32-core resolver still gets
-those 128. Whatever the machine says, a number in the configuration wins — and
-the two can be set independently, since an unset `upstream_workers` follows a
-configured `workers`.
-
-The numbers it settled on, and what it read them from, are logged on the second
-line after startup and printed by `--check`:
-
-```
-ts=… level=info msg=sizing workers=16 upstream_workers=8 max_pending=128 origin="derived from 4 usable CPUs and 7.7 GiB"
-```
+container or a unit with `CPUQuota=`/`MemoryMax=` sizes itself for what it was
+given. A number in the configuration always wins, and the two worker counts can
+be set independently — an unset `upstream_workers` follows a configured
+`workers`. What it settled on is logged after startup and printed by `--check`:
 
 ```console
 $ elodin --check
@@ -2055,146 +1324,89 @@ $ elodin --check
   answering queries from 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, ::1/128, fc00::/7, fe80::/10; every other source is refused
 ```
 
-Past capacity the server drops queries rather than queueing them
-(`server.max_pending`, derived as `workers * 8`). With 6,000 clients all asking
-for cache misses at once — some fifty times the concurrency a 128-worker pool has
-against a 20 ms upstream — that is 4,900 qps served at a bounded 166 ms,
-and about 25,000 queries dropped over twenty seconds. Given an effectively
-unbounded queue the same load serves a comparable 5,900 qps but at 978 ms,
-because the backlog rather than the work becomes the latency, and every client
-waits behind queries whose own clients have already given up. A dropped query
-gets no answer at all, so a client sees it as a timeout and retries, which is
-the failure DNS is built for. A DoH client over HTTP/2 is told instead: its
-stream is the other path that queues, and past the limit it is answered 503
-rather than left to wait on a connection that is already open.
+Past `max_pending` the server drops queries rather than queueing them: queueing
+past that point only adds latency to answers whose clients have already given up,
+and every other client then waits behind them. A dropped query gets no answer at
+all, so a client sees a timeout and retries, which is the failure DNS is built
+for. A DoH client over HTTP/2 is answered 503 instead, its stream being the other
+path that queues and there being a client on an open connection to tell.
 
-### Resource use
+Concurrency differs by transport. **UDP** has one reader thread that hands every
+datagram to the worker pool, with no per-client state and no connection limit.
+**TCP, DoT and DoH** give each connection a thread, capped together by
+`server.max_connections` (512); within a connection TCP, DoT and HTTP/1.1 answer
+one query at a time while **HTTP/2 multiplexes**. Connections are reused, so the
+cap bounds concurrent *clients* rather than queries per second.
 
-CPU, measured on the server process alone while it was saturated:
+HTTP/2 costs more CPU per query than HTTP/1.1 on cache hits — framing, HPACK, the
+hand-off to the worker pool — and earns it back when queries are slow, which is
+when a browser is actually waiting: its concurrent requests overlap instead of
+queueing, so latency settles at one upstream round trip rather than accumulating
+one per request. TLS handshakes are the expensive thing on the encrypted
+transports, orders of magnitude more CPU than answering on an established
+connection, and ECDSA P-256 costs about half what RSA-2048 does — which is why
+`mise run certs` generates ECDSA, and why you should use it in production too.
 
-| transport | CPU per query | at 5,000 qps |
-|---|---|---|
-| TCP | 37 µs | 0.19 core |
-| UDP | 37 µs | 0.19 core |
-| DoT | 61 µs | 0.31 core |
-| DoH over HTTP/1.1 | 87 µs | 0.44 core |
-| DoH over HTTP/2 | 220 µs | 1.10 core |
+Past `max_connections`, DoT and DoH refuse cleanly during the handshake. Plain
+TCP cannot: the kernel completes the handshake from the listen backlog before the
+server sees it, so a refused client gets a reset on first use and has to
+reconnect. Either way it is counted as `conn_refused=`, kept apart from
+`refused=` because this is a client elodin would serve and has no room for. A
+connection refused *below* the limit, when the OS will not give the process
+another thread — `RLIMIT_NPROC`, a cgroup `pids.max`, memory — is `conn_failed=`,
+where raising `max_connections` cannot help and would make it worse.
 
-Answering queries is cheap. **TLS handshakes are not**: 1.1 ms of CPU each with
-an ECDSA P-256 certificate and 2.3 ms with RSA-2048 — some thirty times the cost
-of answering a query on an established connection. A client that reuses its
-connection costs 61 µs per query over DoT; one that reconnects for every query
-costs more than a thousand. Sustained fresh handshakes top out around 3,300/s
-(ECDSA) or 2,400/s (RSA) and consume most of the machine doing it. `mise run
-certs` generates ECDSA for that reason; use ECDSA for real deployments too.
+`mise run bench` measures all of this; the harness is documented in
+[`bench/README.md`](bench/README.md) and its committed runs are under
+`bench/results/`. Read those as the shape of the thing rather than as a
+specification, and re-take them rather than quoting an old run against a change.
 
-Memory, for a full configuration under load:
-
-| | |
-|---|---|
-| idle, no lists | 11 MB |
-| worker scratch arenas | ~0.26 MB per worker (34 MB at a 128-worker pool) |
-| blocklists | ~129 B per rule (31 MB for 250,000 rules) |
-| answer cache | ~463 B per entry (4 MB at the default 10,000) |
-| **realistic total under load** | **154 MB** with 250,000 rules and 180,000 cached answers |
-
-Each row but the first is a difference between two runs that vary in one thing,
-so the cache is not charged for the worker arenas that the same load brings up.
-The worker row is measured against a pinned 128-worker pool, which the
-benchmarks name explicitly rather than derive; a machine that derives 16 pays
-4 MB there instead of 34, and the total below moves with it.
-
-The cache row is a *typical* entry, not a bound. An entry holds the response as
-it arrived — up to 64 KiB, since a query over TCP, DoT or DoH is answered with
-the whole message rather than a 512-byte UDP one — plus an offset and a TTL for
-each of its records, which for a response packed with minimal records is about
-twice the wire size again. So `cache.max_entries` alone would stand for
-something near 640 MB at its default, reachable by anyone who can serve maximal
-answers from a zone they control and walk elodin through enough distinct names.
-`cache.max_bytes` is the bound that holds: 64 MiB by default, evicting from the
-least recently used end whenever either bound is passed. `cache_bytes=` in the
-five-minute stats line reports what is held against it.
-
-Disk is negligible: a binary under a megabyte, and a blocklist cache the size of
-the lists themselves (6.5 MB for two large ones). Nothing is written in steady
-state — with one exception.
-
-That exception is `log.queries`, which writes 32 MB/s at 185k qps, about 183
-bytes per query. It wants rotation. The line was 104 bytes before it became
-logfmt; the keys are most of the difference, and they are disk rather than work.
-The committed run predates logfmt, so its own logging section still reports the
-104-byte line rather than this one — re-take it with `mise run bench -only
-logging` before quoting either figure against a change.
-
-The `race` strategy is the other setting with a real price: it multiplies
-upstream traffic by the number of servers.
+One thing to watch on disk: `log.queries` writes a line per query and wants
+rotation. Nothing else is written in steady state, and the blocklist cache is the
+size of the lists.
 
 ## Known limitations
 
-- DNSSEC validation is **on by default**, and where a distribution's crypto
-  policy forbids SHA-1 signatures the two RSA/SHA-1 algorithms degrade to
-  insecure rather than validating. See the DNSSEC section above.
+- DNSSEC validation is on by default, and where a distribution's crypto policy
+  forbids SHA-1 signatures the two RSA/SHA-1 algorithms degrade to insecure
+  rather than validating. See [DNSSEC](#dnssec).
 - [Rebinding protection](#dns-rebinding-protection) runs only for A, AAAA, ANY,
   SVCB and HTTPS questions — the ones a browser can be made to ask. Addresses in
   the additional section are left alone unless the answer carried an SVCB or
-  HTTPS record: ordinarily they are glue for names other than the one asked
-  about, a stub does not resolve a hostname out of them, and elodin stores and
-  serves a response as a whole under the question's key, so there is no way to
-  retrieve one on its own. SVCB is the exception because RFC 9460 section 5 has
-  the client use them directly. An answer the codec cannot decode is refused for
-  those five question types rather than forwarded unchecked — see the section
-  above — and forwarded as before for every other type.
-- **Connection-oriented transports get a thread per connection**, capped for
-  TCP, DoT and DoH together by `server.max_connections` (512). That is fine for
-  clients that hold a connection open and pipeline over it, but it does not suit
-  tens of thousands of concurrent connections. UDP is the exception: one reader
-  thread and no per-client state, bounded instead by the per-prefix datagram
-  budget described under [Rate limiting](#rate-limiting).
-- Upstream I/O is synchronous, so concurrency is bounded by thread count rather
-  than by in-flight queries. The h2 upstream client is the exception — its
-  queries multiplex onto one connection — but a worker is still held for the
-  round trip. Async upstream I/O, or several UDP reader threads behind
-  `SO_REUSEPORT`, would lift both this and the item above; neither is needed at
-  the scale measured in the previous section. A second UDP reader is no longer
-  blocked on the rate limiter: its bucket table is behind a mutex, which every
-  stream connection's thread already takes for the queries it reads.
+  HTTPS record.
+- **Connection-oriented transports get a thread per connection**, capped for TCP,
+  DoT and DoH together by `server.max_connections`. That suits clients that hold
+  a connection open and pipeline over it, not tens of thousands of concurrent
+  connections. UDP is the exception: one reader thread and no per-client state.
+- **Upstream I/O is synchronous**, so concurrency is bounded by thread count
+  rather than by in-flight queries. The h2 upstream client multiplexes onto one
+  connection, but a worker is still held for the round trip. Async upstream I/O,
+  or several UDP readers behind `SO_REUSEPORT`, would lift both this and the item
+  above.
 - **DNS cookies do not cover every query.** Only queries that already carry an
-  OPT record are given one on the way upstream, so a non-EDNS client behind
-  elodin gets no cookie protection unless DNSSEC validation is on — which it is
-  by default, and which puts an OPT record on every forwarded query. Cookie
-  secrets, both the client-facing one and the client cookies held per upstream,
-  are drawn once at startup and never rotated: restarting costs each client and
-  each upstream one extra round trip.
-- **elodin does not advertise its own DoT or DoH endpoints over DDR.** Queries
-  for `resolver.arpa` are answered NODATA rather than forwarded, which keeps
-  clients on this server, but nothing designates its encrypted listeners
-  automatically: a client that should use them is pointed at them by
-  configuration, by the [Apple mobileconfig
+  OPT record are given one upstream, so a non-EDNS client behind elodin gets no
+  cookie protection unless DNSSEC validation is on — which it is by default.
+  Cookie secrets are drawn once at startup and never rotated: restarting costs
+  each client and each upstream one extra round trip.
+- **elodin does not advertise its own DoT or DoH endpoints over DDR.**
+  `resolver.arpa` is answered NODATA rather than forwarded, which keeps clients
+  here, but nothing designates its encrypted listeners automatically: point
+  clients at them by configuration, by the [Apple
   profile](#apple-devices-ios-ipados-macos), or by a `rewrites` rule.
 - **EDNS Client Subnet is not implemented, and a client's option is dropped on
   the way upstream** (RFC 7871). Forwarding one is only correct alongside the
-  per-network caching in section 7.3, which this cache does not do — its key is
+  per-network caching of section 7.3, which this cache does not do — its key is
   the question plus the DO and CD bits — so a subnet a client named would steer
   the answer every other client behind elodin is then given, and would tell a
-  public upstream where that client claims to be. Nothing is sent in its place:
-  the upstream scopes on elodin's own address, as it does for a query that never
-  carried the option. There is no setting to turn forwarding back on, because
-  there is nowhere honest to file the answers yet. A query whose EDNS elodin
-  cannot account for — one carrying more than one OPT record, or an OPT whose
-  RDATA is not a well-formed option list, neither of which RFC 6891 section
-  6.1.1 permits — is answered FORMERR before anything is looked up, since an
-  option hidden in either shape survives a strip that reports success. That
-  refusal is not about the subnet: a malformed OPT record costs the client the
-  answer and not only the option it mangled, and it keeps the cookie strip
-  honest too.
+  public upstream where that client claims to be. Nothing is sent in its place,
+  and there is no setting to turn forwarding back on, because there is nowhere
+  honest to file the answers yet.
 - No per-client rules, no query log database, no web or API surface. Statistics
   go to the log every five minutes, and to a Prometheus endpoint when
-  [`metrics.enabled`](#metrics) is set — but that endpoint is counters only,
-  with no latency histogram and no per-name label, for the reason given there.
-- Configuration is read once at startup, with one exception: `SIGHUP` reloads
-  the DoT/DoH certificates (see [Reloading](#reloading)). Nothing else -
-  listener addresses, the upstream set, blocking - can be changed without a
-  restart yet.
+  [`metrics.enabled`](#metrics) is set — counters only.
+- Configuration is read once at startup, with one exception: `SIGHUP` reloads the
+  DoT/DoH certificates. Listener addresses, the upstream set and blocking need a
+  restart.
 
 ## Layout
 
@@ -2202,12 +1414,12 @@ upstream traffic by the number of servers.
 src/main/      entry point: arguments, startup order, signals, maintenance loop
 src/dns/       message codec: names, compression, records, EDNS, TTL patching
 src/yaml/      YAML subset parser and typed accessors
-src/config/    configuration schema, loading and validation
+src/config/    configuration schema, loading, validation and worker sizing
 src/filter/    sink-list matching and list-format parsers
 src/cache/     LRU answer cache
 src/dnssec/    validation: canonical form, signatures, NSEC/NSEC3, chain of trust
 src/upstream/  transports (UDP/TCP/DoT/DoH), pooling, strategies, cookies, HTTP/1.1 and h2 clients
-src/server/    resolver, listeners, DoH endpoint, cookies, list refresh
+src/server/    resolver, listeners, DoH endpoint, cookies, local zones, list refresh
 src/h2/        HTTP/2 framing, HPACK, and the server connection state machine
 src/tlsx/      OpenSSL bindings and a small TLS wrapper
 src/pool/      worker pool
@@ -2224,56 +1436,45 @@ packaging/     systemd unit and the .deb build script
 ```
 
 Two worker pools run underneath: one answering queries, one dedicated to racing
-upstreams. They are kept separate on purpose — a race job is submitted *by* a
-query handler and waited on by it, so sharing a pool could deadlock once every
-worker was blocked on jobs nobody was left to run. TCP, DoT and DoH connections
-get a thread each instead, capped by `server.max_connections`.
+upstreams. They are separate on purpose — a race job is submitted *by* a query
+handler and waited on by it, so one pool could deadlock once every worker was
+blocked on jobs nobody was left to run.
 
 ## Testing
 
-Two layers, both run by `mise run verify`, a third that watches what those two
-do to memory, and a fourth — fuzzing — that runs on its own schedule. A fifth,
-`mise run bench`, measures rather than asserts: it is where every number in
-[Capacity](#capacity) comes from, and it is documented in
-[`bench/README.md`](bench/README.md).
+`mise run verify` runs the first two layers. A third watches what those two do to
+memory, fuzzing runs on its own schedule, and `mise run bench` measures rather
+than asserts.
 
-**Unit tests** (`mise run test`, 720 cases) cover the message codec — round trips
-for every modelled RDATA type, compression, truncation, EDNS, pointer loops,
-hostile record counts — plus the YAML parser, configuration loading, list
-parsing and matching, the cache, and the HTTP/2 codec — the HPACK cases run the
-worked examples from RFC 7541 appendix C, so the codec is checked against the
-specification's own vectors rather than against itself.
+**Unit tests** (`mise run test`) cover the message codec — round trips for every
+modelled RDATA type, compression, truncation, EDNS, pointer loops, hostile record
+counts — plus the YAML parser, configuration loading, list parsing and matching,
+the cache, and the HTTP/2 codec, whose HPACK cases run the worked examples from
+RFC 7541 appendix C so the codec is checked against the specification's own
+vectors rather than against itself. They run per package, so a failure names one.
+Much of `tlsx`, `upstream`, `h2` and `server` is the suite grown around bugs
+found some other way that had to stay found.
 
-They run per package, so a failure names one: `dns` 60, `yaml` 34, `config` 64,
-`filter` 25, `logx` 1, `metrics` 9, `privdrop` 9, `cache` 24, `dnssec` 173,
-`tlsx` 5, `upstream` 42, `h2` 69, `server` 205. Much of `tlsx`, `upstream`, `h2`
-and `server` is what the suite grew around bugs that were found some other way
-and had to stay found — the HTTP reader's framing and body limits, the TLS
-handshake retry, the HTTP/2 stream table under RST_STREAM, and the DoH request
-parser read against an allocator that scribbles over what it releases.
+The DNSSEC cases work from real signed traffic captured from a public resolver
+(`src/dnssec/fixtures_test.odin`): the root and `com` with RSA/SHA-256,
+`example.com` and `www.cloudflare.com` with ECDSA P-256, `ed25519.nl` with
+Ed25519, a real NSEC denial from the root, a real NSEC3 denial from `com`, and a
+real unsigned delegation. The validator walks those chains the whole distance,
+and the same fixtures are then tampered with — a flipped address byte, a stripped
+signature, a corrupted DS digest, a mismatched anchor, a clock a year later — and
+every one has to come back bogus. Signatures expire, so the tests pin the moment
+they are judged against rather than reading the clock. Three cases hold specific
+attacks down: a DNSKEY set signed by a key sharing the attested key's tag, an
+injected RRSIG naming the zone a denial is checked against, and a response built
+to make one question cost as many upstream lookups as possible — each checked
+against the code as it stood before its fix, so they are known to fail when the
+property they guard does.
 
-The DNSSEC cases work the same way. `src/dnssec/fixtures_test.odin` holds real
-signed traffic captured from a public resolver: the root and `com` signed with
-RSA/SHA-256, `example.com` and `www.cloudflare.com` with ECDSA P-256,
-`ed25519.nl` with Ed25519, a real NSEC denial from the root, a real NSEC3 denial
-from `com`, and a real unsigned delegation. The validator walks those chains for
-the whole distance, and the same fixtures are then tampered with — a flipped
-address byte, a stripped signature, a corrupted DS digest, a trust anchor that
-does not match, a clock a year later — and every one of them has to come back
-bogus. Signatures expire, so the tests pin the moment they are judged against
-rather than reading the clock.
-
-Three of those cases exist to hold specific attacks down: a DNSKEY set signed by
-a key sharing the attested key's tag, an injected RRSIG trying to name the zone a
-denial is checked against, and a response built to make one question cost as many
-upstream lookups as possible. Each was checked against the code as it stood
-before the fix, so they are known to fail when the property they guard does.
-
-**Integration tests** (`mise run itest`, 211 cases, ~55s) start the built binary
-as a separate process against scripted mock upstreams, so what is exercised is
-the artefact that ships rather than the library it was compiled from. The suite
-is hermetic: no public resolver is contacted, ports are allocated from a private
-range, and the certificate for the TLS cases is generated by the suite itself.
+**Integration tests** (`mise run itest`) start the built binary as a separate
+process against scripted mock upstreams, so what is exercised is the artefact
+that ships rather than the library it was compiled from. The suite is hermetic:
+no public resolver is contacted, ports come from a private range, and the
+certificate for the TLS cases is generated by the suite itself.
 
 ```
 mise run itest              # summary
@@ -2282,111 +1483,87 @@ mise run itest              # summary
 ./bin/itest --binary <path> # test a specific build
 ```
 
-What it covers:
-
-| area | cases |
-|---|---|
-| command line | `--version`, `--help`, `--check` accepting and rejecting configs, error text and line numbers, a DoT listener with no certificate, an unknown `server.user`, a privilege drop that cannot happen stopping the server, the shipped example config |
-| shutdown | `SIGTERM` produces an orderly exit rather than a killed process |
-| logging | every line a real start-to-shutdown wrote parses as logfmt, a query is fields rather than a sentence, and a name a client chose cannot forge a field of its own |
-| wire format | all 23 captured fixtures replayed and compared byte for byte, EDNS forwarding, 0x20 case preservation, truncation and the TC bit, FORMERR / NOTIMP / silent-drop handling |
-| transaction ids | a forwarded query does not carry the client's id, over enough forwards that a fixed or counting one could not pass by chance (RFC 5452) |
-| who may ask | a source outside `allow_from` gets nothing over UDP and no connection over TCP, one inside is answered, an empty list serves everybody, the shipped default answers loopback, the first refusal is logged once and names the setting, an unparseable entry fails `--check` |
-| UDP answer size | the default holds a client asking for 4096 to 1232, a raised ceiling sends the whole answer, the ceiling does not apply over TCP, the answer's own OPT reports the ceiling rather than the client's figure, and a client's own small buffer is not blamed on the setting |
-| listeners | UDP, TCP (single and pipelined), DoT, DoH POST and GET, keep-alive, two pipelined requests in one segment, 404 / 405 / 415 / 400 / 505, a request line that is not three tokens and a mandatory single `Host`, a refusal read back over a body the server never read |
-| Apple profile | the `.mobileconfig` downloaded end to end over HTTP/1.1 and HTTP/2, its `ServerURL` built from the request host / `:authority`, the managed-DNS payload and Apple content type, GET-only |
-| DoH over HTTP/2 | ALPN selection, POST and GET, Huffman-coded headers, CONTINUATION, a dynamic table size update at and past the advertised limit, concurrent streams proved parallel by timing, flow control with a tiny window, DATA splitting for a 27 KiB answer, PING, RST_STREAM, malformed requests reset with PROTOCOL_ERROR while the connection carries on, error statuses, HTTP/1.1 fallback |
-| DoH upstreams | a query resolved over an h2 upstream, one connection multiplexed across queries rather than reopened, fallback to HTTP/1.1 when the upstream does not offer h2 |
-| blocking | all five response modes, hosts vs domains vs adblock semantics, allow precedence, wildcards, modifiers, dnsmasq syntax, unusable rules, case folding |
-| rewrites | A, AAAA, CNAME, wildcard scope, `block`, NODATA for unmatched types, MX with two preferences, TXT, and SRV with four distinct fields answered from the zone-file form, a CNAME beside another record refused, a record-only rule falling through to the rules below it while an alias past it is refused, a record-only rule leaving the name's other types to the upstream while a rule with an address still claims them, an unsupported type token and an unencodable host name each failing `--check`, the PTR synthesised for an address a rule hands out in both families, a wildcard, a public address, a rule shadowed by an earlier wildcard, a rule sunk by `block` and a rule with `ptr: false` each getting none, and another type at a synthesised name answered rather than forwarded |
-| rebinding | a private address is forwarded while the guard is off, refused as NODATA once it is on, a public address is untouched, an `allow_domains` zone may answer privately while a name just outside it may not, and `allow_loopback` opens loopback without opening RFC 1918 |
-| rate limiting | a flood from one source answered in full with the limiter off and cut to the budget with it on, truncated answers over the budget, the bytes one address can be made to receive compared between the two, the same flood pipelined down one TCP connection cut to its budget with nothing truncated, and a TCP client still answered after a datagram flood has spent the prefix's UDP budget |
-| cache | hits avoid the upstream, TTL countdown, cross-transport reuse, question re-casing, negative caching, key separation by type |
-| upstreams | failover, round-robin, race, health cooldown, TCP and DoT clients, connection pooling, UDP→TCP retry, total outage → SERVFAIL |
-| per-domain upstreams | a routed name is answered by its own upstream and never reaches the public one, the zone apex follows the route, everything else still goes to `upstream.servers`, a bare suffix match is not routed, an operator anchor over a routed zone puts validation back, and the longest of two nested routes wins |
-| blocklist downloads | two lists fetched over HTTP and both applied, written to the cache directory, reused on restart without re-fetching, unwritable cache directory degrades to a warning |
-| DNSSEC | an answer with no chain of trust is refused rather than served, the forwarded query carries DO and CD, a CD client is served unvalidated, the refusal carries an extended DNS error, and none of it happens unless it is configured |
-| reserved names | `localhost.` resolves to loopback in both families and is NODATA for a type it has none of, `.onion` and `.invalid` are NXDOMAIN with an SOA at the reserved apex, none of it reaches the upstream, `.local` / `.test` / `home.arpa` are forwarded by default, `local: true` answers `.local` and nothing else, `home_arpa: true` serves the zone empty while the apex `DS` is still fetched, `onion: false` hands `.onion` upstream on its own, and the answers are counted on the metrics endpoint |
-| DNS cookies | a client cookie comes back with a server cookie behind it and works again, the client's own cookie never reaches the upstream and the upstream's never reaches the client, an impossible length is FORMERR, a query with no EDNS goes upstream without one, upstream BADCOOKIE is retried invisibly, each side turns off independently, and `require` turns an unproven UDP client away while leaving cookieless and TCP clients alone |
-| certificate reload | the listener serves what it started with, `SIGHUP` swaps in a certificate renewed on disk, and a bad one on disk leaves the working one in place |
-| metrics | no port is open unless the configuration asks for one, a scrape reports the queries that actually went through and the process figures out of `/proc`, the configured path is the only one served, and anything else is a 404 or a 405 |
+It covers the command line and `--check`, orderly shutdown, that every line of a
+real run parses as logfmt, the wire format (captured fixtures replayed and
+compared byte for byte, EDNS forwarding, 0x20 case preservation, truncation,
+FORMERR/NOTIMP handling), forwarded transaction ids per RFC 5452, `allow_from`,
+the UDP answer-size ceiling, every listener including DoH over both HTTP versions
+and the Apple profile end to end, h2 upstreams, blocking and rewrites in every
+mode — the new record types from their zone-file form, additive rules falling
+through, and the PTR synthesis in both families with each of the cases that gets
+none — rate limiting on both budgets, the rebinding guard on and off, the cache,
+all three upstream strategies with health cooldown and pooling, per-domain
+routes including nested ones and an anchor that puts validation back, blocklist
+downloads and their cache directory, DNSSEC refusal and the CD bypass, the
+reserved-name table with each key, cookies in both directions, certificate
+reload over `SIGHUP`, and the metrics endpoint.
 
 `src/itest/fixtures.odin` holds real DNS responses captured from a public
-resolver, including compression pointers, DNSSEC records and types the codec
-does not model. The mock replays them verbatim and the suite compares the bytes
-the client receives against the bytes the upstream sent. Generating the fixtures
-with elodin's own encoder instead would let a codec bug agree with itself and
-still pass.
+resolver, including compression pointers, DNSSEC records and types the codec does
+not model. The mock replays them verbatim and the suite compares the bytes the
+client receives against the bytes the upstream sent — generating the fixtures
+with elodin's own encoder would let a codec bug agree with itself and still pass.
 
 **Memory** is checked in two places, because no one place can see all of it.
-
 `odin test` wraps every test in a tracking allocator, and
 `ODIN_TEST_FAIL_ON_BAD_MEMORY` — set for `mise run test` — turns what it finds
 into a failing test rather than a warning line among the passes. That catches a
-procedure which keeps what it was lent. It cannot catch anything else: nearly
-every allocation on the query path comes from a per-request arena that is reset
-whole, so a leak there is invisible by construction, and the memory that is
-*not* arena-backed belongs to the running server rather than to any procedure a
-test calls.
+procedure which keeps what it was lent, and nothing else: nearly every allocation
+on the query path comes from a per-request arena that is reset whole, so a leak
+there is invisible by construction, and the memory that is *not* arena-backed
+belongs to the running server rather than to any procedure a test calls.
 
 So `mise run leakcheck` builds the binary with `-sanitize:address` and runs the
-integration suite against it, with `--graceful-stop` so each server is asked to
-exit rather than killed — a sanitizer reports on its way out, and a killed
-process never gets there. LeakSanitizer writes one report per process and the
-job fails if there are any. This is the layer that reaches the configuration,
-the listeners' TLS contexts, and the answers a race worker allocates on the heap
-because it may outlive the caller's arena; every one of those has leaked at some
-point, and none of them is reachable from a unit test. Being ASan rather than
-LSan alone, it also catches a use-after-free — which is how the certificate
-reload was found to be freeing a context a connection was still about to read.
+integration suite against it, asking each server to exit rather than killing it —
+a sanitizer reports on its way out, and a killed process never gets there. This
+is the layer that reaches the configuration, the listeners' TLS contexts, and the
+answers a race worker allocates on the heap because it may outlive the caller's
+arena; every one of those has leaked at some point, and none is reachable from a
+unit test. Being ASan rather than LSan alone, it also catches a use-after-free —
+which is how the certificate reload was found to be freeing a context a
+connection was still about to read. It is not part of `mise run verify`, which is
+the fast local gate; CI runs it on every change.
 
-It runs on one architecture and takes about two and a half minutes, against the
-plain suite's one. Not part of `mise run verify`, which is the fast local gate;
-CI runs it on every change.
-
-**Fuzzing** covers the three parsers that read bytes somebody else chose: the
-DNS wire codec (`dns.decode_message`, plus `dns.truncated_response`, which the
-UDP read loop reaches for a rate-limited query without decoding it first), the
-HPACK decoder, and the YAML parser, which reads the configuration file. The
-blocklist formats are not covered: a downloaded list goes to
-`filter.parse_list`, not through the YAML parser, and has no target of its own.
-Odin has no `-fsanitize=fuzzer`, so `mise run fuzz` emits LLVM IR for each target
-and has clang instrument and link it into a libFuzzer binary at `bin/fuzz_*`,
-with ASan on and bounds checks still in.
-
-Running one is open-ended, so it is not part of `mise run verify`.
-`.github/workflows/fuzz.yml` does it nightly instead, twenty minutes per target
-against a corpus cached between runs so coverage compounds rather than
-restarting each night, and `workflow_dispatch` runs it on demand after a parser
-is touched. What CI runs on every change is the bounded half:
-`mise run fuzz-regression` replays `testdata/fuzz-corpus/` — eighteen seeds and
-one committed crash — through each target once, generating nothing new, so a
-crash fuzzing has already found stays found instead of only living in whoever's
-corpus turned it up.
+**Fuzzing** covers the three parsers that read bytes somebody else chose: the DNS
+wire codec (`dns.decode_message`, plus `dns.truncated_response`, which the UDP
+read loop reaches for a rate-limited query without decoding it first), the HPACK
+decoder, and the YAML parser, which reads the configuration file. The blocklist
+formats are not covered: a downloaded list goes to `filter.parse_list` rather
+than through the YAML parser, and has no target of its own. Odin has no
+`-fsanitize=fuzzer`, so
+`mise run fuzz` emits LLVM IR per target and has clang instrument and link it
+into a libFuzzer binary at `bin/fuzz_*`, with ASan on and bounds checks still in.
+Running one is open-ended, so `.github/workflows/fuzz.yml` does it nightly
+against a corpus cached between runs, and `workflow_dispatch` runs it on demand
+after a parser is touched. What CI runs on every change is
+`mise run fuzz-regression`, which replays `testdata/fuzz-corpus/` through each
+target once and generates nothing new, so a crash fuzzing has already found stays
+found.
 
 **Against live DNS**, because none of the layers above can prove the absence of
-false failures — they work from fixtures and generated input, so they can show
+false failures: they work from fixtures and generated input, so they can show
 that a forged answer is refused and cannot show that validation leaves working
-names working. A validator that refused everything would pass the entire suite.
-
-`go run ./cmd/bench -survey 9.9.9.9:53` from `bench/` asks every name in
+names working — a validator that refused everything would pass the entire suite.
+From `bench/`, `go run ./cmd/bench -survey 9.9.9.9:53` asks every name in
 `bench/domains.txt` through elodin with validation on, asks a reference
-validating resolver the same thing, and compares the rcode and the AD bit. The
-run in `bench/results/2026-08-03-dnssec-survey.md` covers 129 names: no false
-failure, all four deliberately broken zones (`dnssec-failed.org`,
-`brokendnssec.net`, `sigfail.verteiltesysteme.net`, `rhybar.cz`) refused, and
-the same verdict as the reference on 120 of the 125 that are meant to resolve.
-
-The five that differ — `cmu.edu`, `comcast.net`, `pir.org`, `afilias.info` and
-`kisa.or.kr` — come back served but without the AD bit, and every one of them is
-signed with DNSSEC algorithm 5 or 7, RSA/SHA-1, which this machine's OpenSSL
-refuses to compute under the Fedora crypto policy. That is the downgrade the
-DNSSEC section describes, measured: a fact about the host rather than the zone,
-and the safe direction to fail in.
+validating resolver the same thing, and compares the rcode and the AD bit: the
+deliberately broken zones in that list have to be refused and everything else has
+to resolve. Names served without the AD bit are the SHA-1 downgrade described
+under [DNSSEC](#dnssec) — a fact about the host's crypto policy rather than about
+the zone.
 
 Interoperability with a foreign HTTP/2 implementation is checked by hand with
-curl (which uses nghttp2): `curl --http2 -k -H 'content-type:
-application/dns-message' --data-binary @query.bin https://127.0.0.1:443/dns-query`.
+curl, which uses nghttp2: `curl --http2 -k -H 'content-type:
+application/dns-message' --data-binary @query.bin
+https://127.0.0.1:443/dns-query`.
+
+CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
+`main`: `mise run check` once, `mise run test` and `mise run itest` on both
+architectures, `mise run fuzz-regression` and `mise run leakcheck` once,
+`mise run build` on both, and —
+on both — a `mise run deb` that is then installed on the runner, asked to resolve
+a handful of names through the takeover it just performed, and removed again with
+a check that the runner got its own resolver back.
 
 ## License
 
