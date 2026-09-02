@@ -432,20 +432,56 @@ Per-upstream, labelled by the name in the configuration.
 
 The name is the one label here whose bytes come from a file rather than from
 this source, which is what the escaping in `metrics.write_label_value` is for.
+
+Every upstream this server has, the routed ones included: an operator watching
+whether their domain controller is answering wants the same four series for it
+that they get for the public resolvers, and a route that is failing is exactly
+the thing that goes unnoticed otherwise, since it affects only the internal
+names.
+
+A name that appears in more than one group is emitted once, from the first
+group that has it. Two samples with identical label sets in one family is
+malformed exposition, and Prometheus rejects the whole scrape for it - so the
+one arrangement that would silently break the endpoint is the ordinary one of
+listing the router in `upstream.servers` and in a route for its own zone. What
+that costs is a merged view of an upstream reached two ways, which is a
+narrower loss than a metrics endpoint that returns nothing.
 */
 @(private)
 render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
-	if s.group == nil {
+	if s.group == nil && len(s.routes) == 0 {
 		return
 	}
+
+	// Gathered once and walked four times, so the de-duplication happens in one
+	// place rather than in each family below.
+	all := make([dynamic]^upstream.Upstream, 0, 8, context.temp_allocator)
+	seen := make(map[string]bool, context.temp_allocator)
+	add :: proc(all: ^[dynamic]^upstream.Upstream, seen: ^map[string]bool, g: ^upstream.Group) {
+		if g == nil {
+			return
+		}
+		for u in g.servers {
+			if seen[u.spec.name] {
+				continue
+			}
+			seen[u.spec.name] = true
+			append(all, u)
+		}
+	}
+	add(&all, &seen, s.group)
+	for route in s.routes {
+		add(&all, &seen, route.group)
+	}
+
 	metrics.family(b, "elodin_upstream_queries_total", .Counter, "Queries sent to each upstream.")
-	for u in s.group.servers {
+	for u in all {
 		us := upstream.stats_of(u)
 		metrics.sample(b, "elodin_upstream_queries_total", us.queries, metrics.Label{"upstream", u.spec.name})
 	}
 
 	metrics.family(b, "elodin_upstream_failures_total", .Counter, "Exchanges with each upstream that did not produce a usable answer.")
-	for u in s.group.servers {
+	for u in all {
 		us := upstream.stats_of(u)
 		metrics.sample(b, "elodin_upstream_failures_total", us.failures, metrics.Label{"upstream", u.spec.name})
 	}
@@ -459,7 +495,7 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 	operator comparing two upstreams wants.
 	*/
 	metrics.family(b, "elodin_upstream_latency_seconds_total", .Counter, "Cumulative round-trip time to each upstream.")
-	for u in s.group.servers {
+	for u in all {
 		us := upstream.stats_of(u)
 		metrics.sample(
 			b,
@@ -470,7 +506,7 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 	}
 
 	metrics.family(b, "elodin_upstream_up", .Gauge, "1 while an upstream is being used, 0 while it is in its failure cooldown.")
-	for u in s.group.servers {
+	for u in all {
 		metrics.sample(b, "elodin_upstream_up", u64(1) if upstream.healthy(u) else u64(0), metrics.Label{"upstream", u.spec.name})
 	}
 }

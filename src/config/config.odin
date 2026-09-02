@@ -76,6 +76,49 @@ Upstream_Config :: struct {
 	bootstrap:    []string,
 	max_idle:     int,
 	idle_timeout: time.Duration,
+	/*
+	The zones that do not go to `servers` above, and where each of them goes
+	instead. Empty on a server that forwards everything to one place, which is
+	every configuration that existed before this field did.
+
+	Always empty on a route's own `upstream` below: routes do not nest, and
+	`load_upstream` refuses a `zones` key inside one rather than reading it and
+	doing nothing with it. The field is here rather than beside it because a
+	route is a whole upstream configuration in its own right - its own
+	strategy, timeout and server list - and that is the type `make_group`
+	takes.
+	*/
+	zones:        []Zone_Route,
+}
+
+/*
+One zone-to-upstream route: the names it claims, and the servers that answer
+them.
+
+This is dnsmasq's `server=/corp.example/10.0.0.1`, unbound's `forward-zone`,
+blocky's `conditionalMapping` and AdGuard Home's `[/corp.example/]10.0.0.1`. A
+network that runs its own DNS for its own zone - a domain controller for
+`corp.example`, a router authoritative for `home.arpa.` - has no other way to
+keep those names resolving while everything else goes to a public resolver.
+Without it the choice is a public upstream that has never heard of the zone, or
+an internal upstream that has to recurse the whole Internet.
+
+`domains` are canonical: lowercased, with the root dot, matched at or below on
+label boundaries. So `corp.example.` claims `corp.example.` itself and
+everything under it, and `dev.corp.example.` in a second route wins over it for
+the names it covers, longest match first. That is what `server=/corp.example/`
+means to a dnsmasq operator and what a zone name looks like to everybody else.
+
+What a route implies, beyond where the query goes, is in `resolve_query` and
+`rebind_refusal`: a routed zone holds local data under a public parent, so the
+chain walk is off for it (unless the operator anchored the zone themselves) and
+the rebinding guard lets its private addresses through. Both follow from the
+same statement the route makes, which is that this zone is served here rather
+than out there.
+*/
+Zone_Route :: struct {
+	domains:  []string,
+	upstream: Upstream_Config,
 }
 
 /*
@@ -579,6 +622,12 @@ asks of a resolver on a network with nothing serving the zone. Both deployments
 are real and only the operator knows which one they are running, so this is a
 key rather than a default. It closes the leak for the second of them and does
 nothing for the first, which is the whole of what it claims.
+
+The first of them has `Zone_Route`: a route for `home.arpa.` pointed at the
+router sends the names there rather than to a public resolver, which closes the
+leak for a network that does have a local authority and is the arrangement RFC
+8375 is actually describing. This key stays for the network that has none - a
+route needs somewhere to route to.
 
 Two details of the shape, both from RFC 8375 section 4 item 4.B and both argued
 in `localzones.odin`. The zone is served empty rather than absent, so the apex

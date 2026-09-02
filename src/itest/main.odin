@@ -153,6 +153,9 @@ main :: proc() {
 	section(&r, "upstream strategies")
 	run_strategy_cases(&r)
 
+	section(&r, "per-domain upstreams")
+	run_zone_route_cases(&r)
+
 	if cert_ok {
 		section(&r, "doh over http/2")
 		run_h2_cases(&r)

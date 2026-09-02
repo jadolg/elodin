@@ -148,6 +148,14 @@ matched on the question rather than on the record's owner name - see the field.
 `rebind.allow_loopback` is the other one, and is dnsmasq's
 `--rebind-localhost-ok`.
 
+A zone with an `upstream.zones` route is exempt without appearing in either
+list. The route says the zone is answered by a local authority, and answering
+with local addresses is what a local authority does, so the fact is already in
+the configuration and asking for it twice would only leave the second half to be
+forgotten. `allow_domains` covers what a route cannot: the site whose default
+upstream is the internal server, where there is no per-zone route to read the
+fact off.
+
 `localhost.` is exempt without being configured, and only as far as loopback.
 RFC 6761 section 6.3 makes 127.0.0.1 and ::1 the only answers that name may
 have, so a loopback answer for it is legitimate by definition rather than by
@@ -225,7 +233,21 @@ rebind_refusal :: proc(
 	case:
 		return nil, "", false
 	}
-	if rebind_exempt(s.cfg.rebind.allow_domains, q.name) {
+	/*
+	A zone with an `upstream.zones` route is exempt without being listed, which
+	is the second half of what a route means. Split horizon is the named reason
+	this guard defaults off, and a route is the operator stating in the
+	configuration that this zone is answered by a local authority - which
+	answers with local addresses, that being the whole of its job. Making them
+	write the same zone into `rebind.allow_domains` as well would hand them a
+	second thing to configure before the first one worked, and the symptom of
+	forgetting is every internal name coming back NODATA.
+
+	`allow_domains` keeps its own reason to exist: it covers the site whose
+	*default* upstream is internal, which is the arrangement operators reach for
+	when there is no route to reach for instead.
+	*/
+	if rebind_exempt(s.cfg.rebind.allow_domains, q.name) || is_zone_routed(s, q.name) {
 		return nil, "", false
 	}
 
@@ -678,7 +700,7 @@ report_rebind :: proc(name: string, addr: [16]u8, v6: bool, allocator: mem.Alloc
 		text,
 	)
 	logx.warnf(
-		"if that name is served locally on purpose, add its zone to rebind.allow_domains (or set rebind.allow_loopback for 127.0.0.0/8 and ::1, or rebind.enabled to false); refusals are counted as rebind= in the stats line, and further ones are logged at debug level",
+		"if that name is served locally on purpose, route its zone to the server that answers it with upstream.zones, or add the zone to rebind.allow_domains (or set rebind.allow_loopback for 127.0.0.0/8 and ::1, or rebind.enabled to false); refusals are counted as rebind= in the stats line, and further ones are logged at debug level",
 	)
 }
 

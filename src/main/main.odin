@@ -232,6 +232,47 @@ allow_from_line :: proc(s: config.Server_Config) -> string {
 	)
 }
 
+/*
+Inline `blocking.rules` entries written in the shape of a dnsmasq route.
+
+`server=/corp.example/10.0.0.1` is dnsmasq for "send this zone to that server",
+and it is the exact string an operator migrating from dnsmasq reaches for when
+they want `upstream.zones`. Pasted into `blocking.rules` it does the opposite:
+`parse_adblock_line` reads the form, discards the target and adds the domain to
+the *block* set with `{.Apex, .Subdomains}`, so the zone the operator meant to
+route is blackholed instead. That is right where the form actually turns up -
+in a downloaded list of otherwise adblock syntax, where it does mean a
+blackhole - and wrong here, so the warning is scoped to rules written by hand in
+the configuration file rather than to anything a list contains.
+
+It fails closed and the query log says `outcome=blocked detail=list`, so it is
+diagnosable. It is still worth one line at startup, because "I configured the
+route and now the zone answers NXDOMAIN" is a long way from "the rule you wrote
+is a block rule".
+*/
+route_shaped_rules :: proc(cfg: ^config.Config, allocator := context.allocator) -> []string {
+	out := make([dynamic]string, 0, 0, allocator)
+	for rule in cfg.blocking.rules {
+		if strings.has_prefix(strings.trim_space(rule), "server=/") {
+			append(&out, rule)
+		}
+	}
+	for rule in cfg.blocking.allow_rules {
+		if strings.has_prefix(strings.trim_space(rule), "server=/") {
+			append(&out, rule)
+		}
+	}
+	return out[:]
+}
+
+route_rule_warning :: proc(rule: string, allocator := context.allocator) -> string {
+	return fmt.aprintf(
+		"blocking rule %q blocks that domain, it does not route it; to send a zone to its own server use upstream.zones",
+		strings.trim_space(rule),
+		allocator = allocator,
+	)
+}
+
 main :: proc() {
 	// Writing to a socket whose peer has gone away raises SIGPIPE, whose
 	// default disposition kills the process. A client hanging up mid-answer is
@@ -308,11 +349,20 @@ main :: proc() {
 		}
 	}
 
+	misrouted := route_shaped_rules(&cfg, context.temp_allocator)
+
 	if opts.check_only {
-		fmt.printfln("%s is valid: %d upstreams, %d blocklists, %d rewrites",
-			opts.config_path, len(cfg.upstream.servers), len(cfg.blocking.lists), len(cfg.rewrites))
+		fmt.printfln("%s is valid: %d upstreams, %d zone routes, %d blocklists, %d rewrites",
+			opts.config_path,
+			len(cfg.upstream.servers),
+			len(cfg.upstream.zones),
+			len(cfg.blocking.lists),
+			len(cfg.rewrites))
 		fmt.printfln("  %s", sizing_line(cfg.server))
 		fmt.printfln("  %s", allow_from_line(cfg.server))
+		for rule in misrouted {
+			fmt.printfln("  warning: %s", route_rule_warning(rule, context.temp_allocator))
+		}
 		return
 	}
 
@@ -330,6 +380,12 @@ main :: proc() {
 		logx.warnf("%s", allow_from_line(cfg.server))
 	} else {
 		logx.infof("%s", allow_from_line(cfg.server))
+	}
+	// Said under `--check` as well, which is where an operator looks before
+	// restarting; both readings go through the same procedure so the two can
+	// not drift apart.
+	for rule in misrouted {
+		logx.warnf("%s", route_rule_warning(rule, context.temp_allocator))
 	}
 	/*
 	Said out loud for the same reason an empty allow list is: with the table
@@ -381,6 +437,35 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	}
 	defer upstream.destroy_group(group)
 
+	/*
+	One group per `upstream.zones` entry, built the same way the default is.
+
+	A route whose servers are all unusable is fatal rather than dropped. The
+	names it claims are the ones an operator added the route to keep resolving,
+	and a server that quietly carried on without it would send them to the
+	public upstream instead - which is both the leak the route was written to
+	stop and the answer least likely to be noticed, since the public resolver
+	replies rather than failing. Refusing to start says so at the one moment
+	somebody is watching.
+	*/
+	routes := make([]server.Zone_Route, len(cfg.upstream.zones))
+	defer delete(routes)
+	defer for route in routes {
+		upstream.destroy_group(route.group)
+	}
+	for zone, i in cfg.upstream.zones {
+		zg, zerr := upstream.make_group(zone.upstream, race_pool, cookies = cfg.cookies.upstream)
+		if zerr != .None {
+			logx.errorf("upstream.zones[%d]: no usable servers for %s, giving up", i, zone.domains[0])
+			os.exit(1)
+		}
+		routes[i] = server.Zone_Route {
+			domains = zone.domains,
+			group   = zg,
+		}
+		logx.infof("routing %s to its own upstream", strings.join(zone.domains, ", ", context.temp_allocator))
+	}
+
 	answers: ^cache.Cache
 	if cfg.cache.enabled {
 		answers = cache.make_cache(
@@ -402,6 +487,7 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	s := server.Server {
 		cfg          = cfg,
 		group        = group,
+		routes       = routes,
 		answers      = answers,
 		filters      = filters,
 		handler_pool = handler_pool,
@@ -478,7 +564,7 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 		cfg.rebind.enabled,
 	)
 
-	maintenance_loop(&s, &listeners, group, answers, cfg, opts)
+	maintenance_loop(&s, &listeners, answers, cfg, opts)
 }
 
 /*
@@ -541,7 +627,6 @@ when SIGHUP asks for it.
 maintenance_loop :: proc(
 	s: ^server.Server,
 	listeners: ^server.Listeners,
-	group: ^upstream.Group,
 	answers: ^cache.Cache,
 	cfg: ^config.Config,
 	opts: Options,
@@ -569,7 +654,7 @@ maintenance_loop :: proc(
 				logx.debugf("cache: swept %d expired entries", removed)
 			}
 		}
-		if closed := upstream.groom(group); closed > 0 {
+		if closed := server.groom_upstreams(s); closed > 0 {
 			logx.debugf("upstream: closed %d idle connections", closed)
 		}
 		if dropped := server.sweep_validator(s); dropped > 0 {

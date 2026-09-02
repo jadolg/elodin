@@ -117,7 +117,12 @@ Stats :: struct {
 
 Server :: struct {
 	cfg:          ^config.Config,
+	// The default upstream: everything that no route in `routes` claims, plus
+	// every lookup the validator makes on its own account. See `routes.odin`.
 	group:        ^upstream.Group,
+	// The per-domain upstreams, in configuration order. Empty on a server that
+	// forwards everything to one place.
+	routes:       []Zone_Route,
 	answers:      ^cache.Cache,
 	filters:      ^filter.Engine,
 	validator:    ^dnssec.Validator,
@@ -685,11 +690,17 @@ resolve_query :: proc(
 	// `special_use.onion: false` comes back unsigned under a root that signs a
 	// proof there is no `onion.` at all, which is Bogus to a validator and
 	// SERVFAIL to the client. See `localzones.odin`.
+	//
+	// A zone with an `upstream.zones` route is the general case of the two
+	// above, reached by configuration rather than by a table: the route says
+	// this zone is answered by a local authority, whose unsigned data sits
+	// under a signed public parent that delegates nothing to it. The same
+	// anchor escape hatch applies, and for the same reason. See `routes.odin`.
 	validating :=
 		s.validator != nil &&
 		!msg.flags.cd &&
 		q.class == .IN &&
-		!(is_locally_served(q.name) && !covered_by_local_anchor(s, q.name)) &&
+		!served_locally(s, q.name) &&
 		!special_use_deferred(s, q.name)
 
 	key_buf: [cache.KEY_MAX]u8
@@ -943,7 +954,13 @@ resolve_query :: proc(
 	}
 	dns.set_id_in_place(forwarded, dns.random_id())
 
-	resp, winner, uerr := upstream.resolve(s.group, forwarded, allocator)
+	/*
+	Down the zone's own route when it has one, and to the default group when it
+	does not. The client's question is the only thing that follows a route: the
+	chain lookups the validator makes go to the default group whatever the name,
+	which `validator_query` explains.
+	*/
+	resp, winner, uerr := upstream.resolve(route_group(s, q.name), forwarded, allocator)
 	if uerr != .None {
 		logx.debugf("query %s %s from %s failed: %v", dns.type_name(q.type), q.name, client, uerr)
 		/*
