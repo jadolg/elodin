@@ -432,6 +432,11 @@ it. And listing the same server in `upstream.servers` and in a route for its own
 zone is an ordinary thing to write, which without the de-duplication below emits
 two samples with identical label sets in one family - malformed exposition, and
 Prometheus rejects the whole scrape for it, not just the duplicate.
+
+Once each, and each carrying both groups' figures: the two entries are separate
+`Upstream` values with separate counters, so a de-duplication that kept the
+first would leave the route's queries and failures out of the endpoint under a
+name that looks like it is being reported. See `render_upstream_metrics`.
 */
 @(test)
 test_routed_upstreams_are_reported_once_each :: proc(t: ^testing.T) {
@@ -485,5 +490,95 @@ test_routed_upstreams_are_reported_once_each :: proc(t: ^testing.T) {
 	)
 	testing.expect_value(t, strings.count(text, `elodin_upstream_up{upstream="router"}`), 1)
 	testing.expect_value(t, strings.count(text, `elodin_upstream_up{upstream="dc1"}`), 1)
+	free_all(context.temp_allocator)
+}
+
+/*
+The summing itself, driven with counters that are not zero.
+
+`test_routed_upstreams_are_reported_once_each` above proves one sample per name
+and that a routed upstream gets a series at all, but every counter in its
+fixture is zero - so it would pass equally against the de-duplication that kept
+the first group and dropped the rest, which is the defect that motivated the
+merge. This drives real figures into two upstreams sharing a name and asserts
+the endpoint reports their total.
+
+The traffic is failures against a port nothing is listening on, which is the
+cheapest way to move `queries` and `failures` at once: `record_failure`
+increments both. Three of them on one group and none on the other also sets up
+the `up` gauge's own claim - a name is up while any upstream wearing it is
+usable - since `FAILURE_THRESHOLD` is 3, so the first group is in cooldown and
+the second is not.
+*/
+@(test)
+test_two_upstreams_of_one_name_have_their_figures_added :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+
+	// A port nothing is bound to, so every exchange fails inside the timeout.
+	dead := make([]config.Upstream_Spec, 1, context.temp_allocator)
+	dead[0] = config.Upstream_Spec{name = "router", kind = .UDP, address = "127.0.0.1", port = 1}
+	spec := cfg.upstream
+	spec.servers = dead
+	spec.attempts = 1
+	spec.timeout = 200 * time.Millisecond
+
+	failing, ferr := upstream.make_group(spec, nil, context.allocator, false)
+	if !testing.expectf(t, ferr == .None, "cannot build the failing group: %v", ferr) {
+		return
+	}
+	defer upstream.destroy_group(failing)
+	idle, ierr := upstream.make_group(spec, nil, context.allocator, false)
+	if !testing.expectf(t, ierr == .None, "cannot build the idle group: %v", ierr) {
+		return
+	}
+	defer upstream.destroy_group(idle)
+
+	query := route_query("probe.example.")
+	/*
+	Three on one and one on the other, and neither number is arbitrary.
+
+	Three is `FAILURE_THRESHOLD`, so that copy of the name is parked while the
+	other stays usable - which is what makes the `up` assertion below
+	discriminate. And the second group has to contribute a non-zero count of its
+	own, or the total is the first group's total and the sum assertion would
+	hold just as well against the de-duplication that dropped it.
+	*/
+	for _ in 0 ..< 3 {
+		_, _, _ = upstream.resolve(failing, query, context.temp_allocator)
+	}
+	_, _, _ = upstream.resolve(idle, query, context.temp_allocator)
+
+	s := Server {
+		cfg    = &cfg,
+		group  = failing,
+		routes = []Zone_Route{{domains = []string{"corp.example."}, group = idle}},
+	}
+
+	b := strings.builder_make(context.temp_allocator)
+	render_upstream_metrics(&b, &s)
+	text := strings.to_string(b)
+
+	// One sample, carrying both groups' figures rather than the first group's.
+	testing.expect_value(t, strings.count(text, `elodin_upstream_queries_total{upstream="router"}`), 1)
+	testing.expectf(
+		t,
+		strings.contains(text, `elodin_upstream_queries_total{upstream="router"} 4`),
+		"the two groups' query counts were not added; got:\n%s",
+		text,
+	)
+	testing.expectf(
+		t,
+		strings.contains(text, `elodin_upstream_failures_total{upstream="router"} 4`),
+		"the two groups' failure counts were not added; got:\n%s",
+		text,
+	)
+	// Up, because the idle copy of the name is still usable even though the
+	// other is in its cooldown. Dropping either would report the wrong one.
+	testing.expectf(
+		t,
+		strings.contains(text, `elodin_upstream_up{upstream="router"} 1`),
+		"a name with one usable upstream was reported down; got:\n%s",
+		text,
+	)
 	free_all(context.temp_allocator)
 }

@@ -591,14 +591,29 @@ load_route_domains :: proc(
 			continue
 		}
 		if first, seen := claimed[domain]; seen {
-			errorf(
-				l,
-				"%s[%d]: %q is already routed by upstream.zones[%d]; one zone goes to one place",
-				domains_path,
-				j,
-				written,
-				first,
-			)
+			// Two spellings of one zone in one route - `corp.example` and
+			// `CORP.example.` - is the same refusal, but "already routed by
+			// upstream.zones[0]" read while looking at upstream.zones[0] names
+			// the entry as its own culprit, which sends an operator looking for
+			// a second route that is not there.
+			if first == index {
+				errorf(
+					l,
+					"%s[%d]: %q is already listed in this route; one zone goes in one place",
+					domains_path,
+					j,
+					written,
+				)
+			} else {
+				errorf(
+					l,
+					"%s[%d]: %q is already routed by upstream.zones[%d]; one zone goes to one place",
+					domains_path,
+					j,
+					written,
+					first,
+				)
+			}
 			continue
 		}
 		claimed[domain] = index

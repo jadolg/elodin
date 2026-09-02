@@ -439,13 +439,21 @@ that they get for the public resolvers, and a route that is failing is exactly
 the thing that goes unnoticed otherwise, since it affects only the internal
 names.
 
-A name that appears in more than one group is emitted once, from the first
-group that has it. Two samples with identical label sets in one family is
+A name that appears in more than one group is emitted once, with the groups'
+figures added together. Two samples with identical label sets in one family is
 malformed exposition, and Prometheus rejects the whole scrape for it - so the
 one arrangement that would silently break the endpoint is the ordinary one of
-listing the router in `upstream.servers` and in a route for its own zone. What
-that costs is a merged view of an upstream reached two ways, which is a
-narrower loss than a metrics endpoint that returns nothing.
+listing the router in `upstream.servers` and in a route for its own zone.
+
+Added rather than the first one kept, which is the difference between a merged
+view and a missing one. The two entries are separate `Upstream` values with
+separate counters and separate failure cooldowns, so keeping the first would
+report the default group's traffic under a name the route is also using and
+leave the route's queries, failures and latency out of the endpoint entirely -
+which is exactly the "a failing route goes unnoticed" case above, rebuilt by
+the de-duplication meant to serve it. `up` is the same reasoning in gauge form:
+the name is up while any of the upstreams wearing it is usable, so an operator
+sees zero only once the server really has nowhere to send those names.
 */
 @(private)
 render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
@@ -453,37 +461,59 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 		return
 	}
 
-	// Gathered once and walked four times, so the de-duplication happens in one
-	// place rather than in each family below.
-	all := make([dynamic]^upstream.Upstream, 0, 8, context.temp_allocator)
-	seen := make(map[string]bool, context.temp_allocator)
-	add :: proc(all: ^[dynamic]^upstream.Upstream, seen: ^map[string]bool, g: ^upstream.Group) {
+	// One series per configured name, gathered once and walked four times, so
+	// the de-duplication happens in one place rather than in each family below.
+	Series :: struct {
+		name:     string,
+		queries:  u64,
+		failures: u64,
+		latency:  u64,
+		up:       bool,
+	}
+	all := make([dynamic]Series, 0, 8, context.temp_allocator)
+	at := make(map[string]int, context.temp_allocator)
+	add :: proc(all: ^[dynamic]Series, at: ^map[string]int, g: ^upstream.Group) {
 		if g == nil {
 			return
 		}
 		for u in g.servers {
-			if seen[u.spec.name] {
+			us := upstream.stats_of(u)
+			live := upstream.healthy(u)
+			if i, found := at[u.spec.name]; found {
+				all[i].queries += us.queries
+				all[i].failures += us.failures
+				all[i].latency += us.latency_ns_total
+				if live {
+					all[i].up = true
+				}
 				continue
 			}
-			seen[u.spec.name] = true
-			append(all, u)
+			at[u.spec.name] = len(all^)
+			append(
+				all,
+				Series {
+					name = u.spec.name,
+					queries = us.queries,
+					failures = us.failures,
+					latency = us.latency_ns_total,
+					up = live,
+				},
+			)
 		}
 	}
-	add(&all, &seen, s.group)
+	add(&all, &at, s.group)
 	for route in s.routes {
-		add(&all, &seen, route.group)
+		add(&all, &at, route.group)
 	}
 
 	metrics.family(b, "elodin_upstream_queries_total", .Counter, "Queries sent to each upstream.")
 	for u in all {
-		us := upstream.stats_of(u)
-		metrics.sample(b, "elodin_upstream_queries_total", us.queries, metrics.Label{"upstream", u.spec.name})
+		metrics.sample(b, "elodin_upstream_queries_total", u.queries, metrics.Label{"upstream", u.name})
 	}
 
 	metrics.family(b, "elodin_upstream_failures_total", .Counter, "Exchanges with each upstream that did not produce a usable answer.")
 	for u in all {
-		us := upstream.stats_of(u)
-		metrics.sample(b, "elodin_upstream_failures_total", us.failures, metrics.Label{"upstream", u.spec.name})
+		metrics.sample(b, "elodin_upstream_failures_total", u.failures, metrics.Label{"upstream", u.name})
 	}
 
 	/*
@@ -496,18 +526,17 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 	*/
 	metrics.family(b, "elodin_upstream_latency_seconds_total", .Counter, "Cumulative round-trip time to each upstream.")
 	for u in all {
-		us := upstream.stats_of(u)
 		metrics.sample(
 			b,
 			"elodin_upstream_latency_seconds_total",
-			f64(us.latency_ns_total) / f64(time.Second),
-			metrics.Label{"upstream", u.spec.name},
+			f64(u.latency) / f64(time.Second),
+			metrics.Label{"upstream", u.name},
 		)
 	}
 
 	metrics.family(b, "elodin_upstream_up", .Gauge, "1 while an upstream is being used, 0 while it is in its failure cooldown.")
 	for u in all {
-		metrics.sample(b, "elodin_upstream_up", u64(1) if upstream.healthy(u) else u64(0), metrics.Label{"upstream", u.spec.name})
+		metrics.sample(b, "elodin_upstream_up", u64(1) if u.up else u64(0), metrics.Label{"upstream", u.name})
 	}
 }
 
