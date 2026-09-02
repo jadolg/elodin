@@ -268,15 +268,25 @@ route_shaped_rules :: proc(cfg: ^config.Config, allocator := context.allocator) 
 /*
 One line per rule found, worded for both lists.
 
-`blocking.allow_rules` is scanned as well as `blocking.rules`, and there the
-form does not block - it exempts. Saying "blocks that domain" about an entry in
-the allow list would be telling an operator something that is not true of their
-file, so the warning says what the rule is rather than what it does: either way
-it is a list rule and either way it is not a route.
+`blocking.allow` (`cfg.blocking.allow_rules`) is scanned as well as
+`blocking.rules`, and the form does a different nothing in each. In
+`blocking.rules` it blackholes the zone, as above. In `blocking.allow` it does
+not exempt it either: `build_filter_sets` prefixes those entries with `@@`
+before parsing them, which puts the string past `parse_adblock_line`'s dnsmasq
+branch and into the generic one, where the `/` still in it is read as a
+path-scoped rule and the whole entry is discarded. So the rule adds nothing to
+either set and the zone goes on being resolved by `upstream.servers`, which
+looks exactly like the route not working.
+
+The warning therefore says what the rule is and what it is not, and leaves what
+it does to the list it is in - claiming either "blocks that domain" or "exempts
+that domain" would be untrue of one of the two files. Both lists are named by
+the key an operator writes rather than by the field they land in, so the line
+can be searched for in the file it is about.
 */
 route_rule_warning :: proc(rule: string, allocator := context.allocator) -> string {
 	return fmt.aprintf(
-		"blocking rule %q is a list rule, not a route: it changes what is blocked rather than where the zone is sent; to send a zone to its own server use upstream.zones",
+		"blocking rule %q is a list rule, not a route: it does not send the zone anywhere - under blocking.rules that form blackholes the zone, and under blocking.allow it is discarded; to send a zone to its own server use upstream.zones",
 		strings.trim_space(rule),
 		allocator = allocator,
 	)

@@ -31,8 +31,21 @@ INTERNAL :: [4]u8{10, 0, 0, 7}
 @(private = "file")
 PUBLIC :: [4]u8{198, 51, 100, 9}
 
+/*
+The `dnssec` section is a parameter rather than something a caller appends.
+
+Appending it would put a second top-level `dnssec:` in the document, and which
+of the two won would then be the YAML loader's business rather than the test's -
+`yaml` happens to keep the last, so the anchored case below would go on passing
+for a reason nothing in it states. One key, written once, whoever is asking.
+*/
 @(private = "file")
-routed_config :: proc(udp_port, public_port, internal_port: int, extra := "") -> string {
+DEFAULT_DNSSEC :: `dnssec:
+  enabled: true
+`
+
+@(private = "file")
+routed_config :: proc(udp_port, public_port, internal_port: int, dnssec := DEFAULT_DNSSEC) -> string {
 	return fmt.tprintf(
 		`log:
   level: info
@@ -52,15 +65,13 @@ cache:
   enabled: false
 blocking:
   enabled: false
-dnssec:
+%srebind:
   enabled: true
-rebind:
-  enabled: true
-%s`,
+`,
 		udp_port,
 		public_port,
 		internal_port,
-		extra,
+		dnssec,
 	)
 }
 
@@ -211,7 +222,7 @@ run_zone_route_cases :: proc(r: ^Runner) {
 		this assertion while proving nothing about the routed zone.
 		*/
 		anchored_port := next_port(r)
-		extra := `dnssec:
+		anchors := `dnssec:
   enabled: true
   trust_anchors:
     - ". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"
@@ -220,7 +231,7 @@ run_zone_route_cases :: proc(r: ^Runner) {
 		anchored, started := start_server(
 			r,
 			Server_Options {
-				config = routed_config(anchored_port, public_port, internal_port, extra),
+				config = routed_config(anchored_port, public_port, internal_port, anchors),
 				udp_port = anchored_port,
 			},
 		)

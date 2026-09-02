@@ -464,9 +464,11 @@ is the whole point of the key being off by default.
 
 > **Coming from dnsmasq:** `server=/corp.example/10.0.0.1` in `blocking.rules`
 > does not route that zone — it *blocks* it. That form turns up in downloaded
-> blocklists, where it means a blackhole, so the list parser reads it as one.
-> `--check` warns if it finds one written by hand in `blocking.rules`. Routing
-> lives under `upstream.zones` and nowhere else.
+> blocklists, where it means a blackhole, so the list parser reads it as one. In
+> `blocking.allow` it does not even do that: the entry is discarded and neither
+> list changes, which looks exactly like the route not working. `--check` warns
+> about either one written by hand. Routing lives under `upstream.zones` and
+> nowhere else.
 
 ### Sink lists
 
@@ -2041,7 +2043,7 @@ ts=… level=info msg=sizing workers=16 upstream_workers=8 max_pending=128 origi
 
 ```console
 $ elodin --check
-/etc/elodin/elodin.yaml is valid: 2 upstreams, 4 blocklists, 0 rewrites
+/etc/elodin/elodin.yaml is valid: 2 upstreams, 0 zone routes, 4 blocklists, 0 rewrites
   workers=16 upstream_workers=8 max_pending=128 (derived from 4 usable CPUs and 7.7 GiB)
   answering queries from 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, ::1/128, fc00::/7, fe80::/10; every other source is refused
 ```

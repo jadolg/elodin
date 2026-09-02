@@ -455,14 +455,103 @@ load_upstream_zones :: proc(l: ^Loader, cfg: ^Config, n: ^yaml.Node) {
 }
 
 /*
+One entry of a zone list, canonicalised and held to the three refusals.
+
+`rebind.allow_domains` and every `upstream.zones[].domains` take a list of the
+same thing - a plain zone name, covering itself and everything below it - and
+refuse the same three ways of writing one that matches nothing a client can ask
+for. An operator arrives with `*.corp.example` from the `rewrites` section, or
+`.corp.example` from `no_proxy`, or with the root; kept as written, each would
+sit in the file looking like the fix while nothing about the deployment changed.
+
+The failures the two lists are guarding are different - there an exemption that
+never fires and every internal name still answering NODATA, here a zone that
+goes on being resolved by the public upstream - and the root is the one refusal
+whose wording has to say which, so it comes in as `root_reason`. The other two
+name only the entry and what to write instead, which is the same sentence
+either way. `path` is the list without its index: `rebind.allow_domains`, or
+`upstream.zones[0].domains`.
+*/
+@(private)
+canonical_zone_entry :: proc(
+	l: ^Loader,
+	written: string,
+	path: string,
+	index: int,
+	root_reason: string,
+) -> (
+	domain: string,
+	ok: bool,
+) {
+	domain = canonical_domain(written, l.allocator)
+
+	/*
+	`rewrites` further down does take a `*.` prefix, so an operator who has
+	written one there writes one here too, and `canonical_domain` keeps the
+	star. Neither of these lists has a use for one - an entry already covers
+	everything below itself - so `*.corp.example.` would sit in it matching
+	nothing any client can ask for, with no line anywhere saying why.
+
+	`zone` is what the entry meant; a bare `*` leaves nothing of it and is the
+	root, which the next check refuses for what it is.
+	*/
+	wildcard := strings.has_prefix(domain, "*.")
+	zone := domain
+	if wildcard {
+		zone = domain[2:]
+		if zone == "" {
+			zone = "."
+		}
+	}
+
+	// The root is always the whole setting written in a way nothing about the
+	// file admits to, and there is always a plainer way to say that; what it is
+	// differs per list, so the caller says.
+	if zone == "." {
+		errorf(l, "%s[%d]: %q %s", path, index, written, root_reason)
+		return "", false
+	}
+	/*
+	Named rather than quietly stripped: `*.corp.example` means "below" in the
+	section that does take it and these lists mean "at or below", so obeying it
+	would widen what was written past what it says.
+	*/
+	if wildcard {
+		errorf(
+			l,
+			"%s[%d]: %q takes no wildcard; write %q, which already covers everything below it",
+			path,
+			index,
+			written,
+			strings.trim_suffix(zone, "."),
+		)
+		return "", false
+	}
+	/*
+	An empty label - a leading dot, or two of them in a row - is the other way to
+	write an entry that matches nothing, and `.corp.example` is a form operators
+	arrive with because `no_proxy` takes it and means by it what these lists
+	write plain.
+	*/
+	if strings.has_prefix(zone, ".") || strings.contains(zone, "..") {
+		errorf(
+			l,
+			"%s[%d]: %q has an empty label; write the zone as a plain name, such as corp.example",
+			path,
+			index,
+			written,
+		)
+		return "", false
+	}
+	return domain, true
+}
+
+/*
 The `domains` of one route, canonicalised and checked.
 
-The three refusals are the ones `rebind.allow_domains` makes, for the same
-reason and against the same mistakes - an operator arrives with `*.corp.example`
-from the rewrites section, or `.corp.example` from `no_proxy`, and either would
-sit in the file matching nothing while every internal name went on being sent to
-the public upstream. The wording differs because what a bad entry costs differs:
-there it is an exemption that never fires, here it is a zone that keeps leaking.
+The three refusals are `canonical_zone_entry`'s, shared with
+`rebind.allow_domains`; the fourth is this list's own, since two routes claiming
+one zone is not a question the other list can be asked.
 */
 @(private)
 load_route_domains :: proc(
@@ -487,62 +576,25 @@ load_route_domains :: proc(
 		return nil
 	}
 
+	// The root would route every name there is, which is `upstream.servers`
+	// written in a way nothing about the file makes obvious - and it would take
+	// the DNSSEC bypass and the rebinding exemption a route implies with it,
+	// across the whole name space.
+	ROOT :: "routes every name; put those servers in upstream.servers if that is what you mean"
+
+	domains_path := fmt.tprintf("%s.domains", path)
 	out := make([]string, len(list), l.allocator)
 	kept := 0
 	for written, j in list {
-		domain := canonical_domain(written, l.allocator)
-
-		wildcard := strings.has_prefix(domain, "*.")
-		zone := domain
-		if wildcard {
-			zone = domain[2:]
-			if zone == "" {
-				zone = "."
-			}
-		}
-
-		/*
-		The root routes every name there is, which is `upstream.servers` written
-		in a way nothing about the file makes obvious - and it would take the
-		DNSSEC bypass and the rebinding exemption a route implies with it,
-		across the whole name space. Refused for what it is.
-		*/
-		if zone == "." {
-			errorf(
-				l,
-				"%s.domains[%d]: %q routes every name; put those servers in upstream.servers if that is what you mean",
-				path,
-				j,
-				written,
-			)
-			continue
-		}
-		if wildcard {
-			errorf(
-				l,
-				"%s.domains[%d]: %q takes no wildcard; write %q, which already covers everything below it",
-				path,
-				j,
-				written,
-				strings.trim_suffix(zone, "."),
-			)
-			continue
-		}
-		if strings.has_prefix(zone, ".") || strings.contains(zone, "..") {
-			errorf(
-				l,
-				"%s.domains[%d]: %q has an empty label; write the zone as a plain name, such as corp.example",
-				path,
-				j,
-				written,
-			)
+		domain, good := canonical_zone_entry(l, written, domains_path, j, ROOT)
+		if !good {
 			continue
 		}
 		if first, seen := claimed[domain]; seen {
 			errorf(
 				l,
-				"%s.domains[%d]: %q is already routed by upstream.zones[%d]; one zone goes to one place",
-				path,
+				"%s[%d]: %q is already routed by upstream.zones[%d]; one zone goes to one place",
+				domains_path,
 				j,
 				written,
 				first,
@@ -606,8 +658,18 @@ check_route_reachable :: proc(l: ^Loader, cfg: ^Config, route: Zone_Route) {
 		on:     bool,
 		reason: string,
 	}
-	// `localhost.` and `invalid.` have no key of their own: with the table on at
-	// all they are answered here, which is what RFC 6761 asks for.
+	/*
+	A copy of `server.special_use_zone`'s own list, and it has to stay one.
+
+	This package cannot import `server` - `server` imports this one - so the
+	zones are written out again here rather than read from the single place that
+	decides them. A key added there and not here does not break anything loudly:
+	it leaves a route under the new zone loading cleanly and then never firing,
+	which is the exact failure this check exists to catch. Add the entry in both.
+
+	`localhost.` and `invalid.` have no key of their own: with the table on at
+	all they are answered there, which is what RFC 6761 asks for.
+	*/
 	table := [?]Shadow {
 		{"localhost.", true, "special_use.enabled answers localhost. here (RFC 6761)"},
 		{"invalid.", true, "special_use.enabled answers invalid. here (RFC 6761)"},
@@ -1050,81 +1112,22 @@ load_rebind :: proc(l: ^Loader, cfg: ^Config) {
 			errorf(l, "rebind.allow_domains: expected a list of domains, such as [home.example]")
 			return
 		}
+		/*
+		The root would exempt every name there is, which is `rebind.enabled:
+		false` written in a way nothing about the file makes obvious. Refused
+		rather than obeyed, on the same reasoning that `allow_from:` with no
+		value is refused: the two readings are a setting and its opposite.
+		*/
+		ROOT :: "exempts every name; set rebind.enabled to false if that is what you mean"
+
 		out := make([]string, len(list), l.allocator)
 		kept := 0
 		for entry, i in list {
-			domain := canonical_domain(entry, l.allocator)
-
-			/*
-			`rewrites` further down does take a `*.` prefix, so an operator who
-			has written one there writes one here too, and `canonical_domain`
-			keeps the star. This list has no use for one - an entry already
-			covers everything below itself - so `*.corp.example.` would sit in
-			it matching nothing any client can ask for, and the symptom of that
-			is every internal name still answering NODATA after the fix was
-			applied, with no line anywhere saying why. That is the one failure
-			this setting exists to prevent, so the star is named here instead of
-			at three in the morning.
-
-			`zone` is what the entry meant; a bare `*` leaves nothing of it and
-			is the root, which the next check refuses for what it is.
-			*/
-			wildcard := strings.has_prefix(domain, "*.")
-			zone := domain
-			if wildcard {
-				zone = domain[2:]
-				if zone == "" {
-					zone = "."
-				}
-			}
-
-			/*
-			The root would exempt every name there is, which is `rebind.enabled:
-			false` written in a way nothing about the file makes obvious. Refused
-			rather than obeyed, on the same reasoning that `allow_from:` with no
-			value is refused: the two readings are a setting and its opposite.
-			*/
-			if zone == "." {
-				errorf(
-					l,
-					"rebind.allow_domains[%d]: %q exempts every name; set rebind.enabled to false if that is what you mean",
-					i,
-					entry,
-				)
-				continue
-			}
-			/*
-			Named rather than quietly stripped: `*.corp.example` means "below"
-			in the section that does take it and this list means "at or below",
-			so obeying it would widen an exemption past what was written.
-			*/
-			if wildcard {
-				errorf(
-					l,
-					"rebind.allow_domains[%d]: %q takes no wildcard; write %q, which already covers everything below it",
-					i,
-					entry,
-					strings.trim_suffix(zone, "."),
-				)
-				continue
-			}
-			/*
-			An empty label - a leading dot, or two of them in a row - is the
-			other way to write an entry that matches nothing, and
-			`.corp.example` is a form operators arrive with because `no_proxy`
-			takes it and means by it what this list writes plain. Kept as
-			written it would sit in the configuration looking like the fix while
-			every internal name went on answering NODATA, which is the failure
-			the wildcard check above exists to prevent; refused for the same
-			reason.
-			*/
-			if strings.has_prefix(zone, ".") || strings.contains(zone, "..") {
-				errorf(
-					l,
-					"rebind.allow_domains[%d]: %q has an empty label; write the zone as a plain name, such as corp.example",
-					i,
-					entry,
-				)
+			// The wildcard and empty-label refusals with it, shared with
+			// `upstream.zones[].domains`, which takes the same shape of list
+			// against the same mistakes. See `canonical_zone_entry`.
+			domain, good := canonical_zone_entry(l, entry, "rebind.allow_domains", i, ROOT)
+			if !good {
 				continue
 			}
 			out[kept] = domain

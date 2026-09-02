@@ -385,6 +385,12 @@ special_use_zone :: proc(
 	if !s.cfg.special_use.enabled {
 		return "", .None
 	}
+	// The zones below are listed a second time in `config.check_route_reachable`,
+	// which refuses an `upstream.zones` route that one of them would answer
+	// before anything is forwarded. The config package cannot import this one, so
+	// a zone added here has to be added there too or a route under it will load
+	// cleanly and never fire.
+	//
 	// The two with no key of their own.
 	if name_at_or_below(name, "localhost.") {
 		return "localhost.", .Loopback
