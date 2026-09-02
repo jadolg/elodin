@@ -265,9 +265,18 @@ route_shaped_rules :: proc(cfg: ^config.Config, allocator := context.allocator) 
 	return out[:]
 }
 
+/*
+One line per rule found, worded for both lists.
+
+`blocking.allow_rules` is scanned as well as `blocking.rules`, and there the
+form does not block - it exempts. Saying "blocks that domain" about an entry in
+the allow list would be telling an operator something that is not true of their
+file, so the warning says what the rule is rather than what it does: either way
+it is a list rule and either way it is not a route.
+*/
 route_rule_warning :: proc(rule: string, allocator := context.allocator) -> string {
 	return fmt.aprintf(
-		"blocking rule %q blocks that domain, it does not route it; to send a zone to its own server use upstream.zones",
+		"blocking rule %q is a list rule, not a route: it changes what is blocked rather than where the zone is sent; to send a zone to its own server use upstream.zones",
 		strings.trim_space(rule),
 		allocator = allocator,
 	)

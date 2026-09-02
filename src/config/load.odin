@@ -557,6 +557,80 @@ load_route_domains :: proc(
 	return out[:kept]
 }
 
+/*
+Whether `name` is `zone` or sits under it, both already canonical.
+
+The resolver's own `name_at_or_below` folds case because the names reaching it
+are whatever the client spelled. Nothing here is: both sides have been through
+`canonical_domain` or are written lowercase in this file, so the comparison is
+bytes and the fold would only hide a name that failed to be canonicalised.
+*/
+@(private)
+domain_at_or_below :: proc(name, zone: string) -> bool {
+	if len(name) < len(zone) {
+		return false
+	}
+	if len(name) == len(zone) {
+		return name == zone
+	}
+	// The zone has to begin right after a label break, or it is a bare string
+	// suffix of some other name rather than a subtree of it.
+	if name[len(name) - len(zone) - 1] != '.' {
+		return false
+	}
+	return name[len(name) - len(zone):] == zone
+}
+
+/*
+A route into a zone the special-use table already answers never fires.
+
+`special_use_zone` runs in `resolve_query` before anything is forwarded, so a
+name inside an enabled entry is answered from the table and the route below it
+is never consulted. Written together they are the exact mistake the rest of this
+section is shaped against: a route sitting in the file looking like the fix
+while the names it claims go on being answered somewhere else - and the one that
+costs the most is `home.arpa`, since an operator who turned the key on to stop
+the leak and then added the route to send the names to their router keeps the
+key's NXDOMAIN and never sees the router.
+
+Refused by name, the way `special_use.local` without `special_use.enabled` is,
+rather than left to be discovered from the outside.
+*/
+@(private)
+check_route_reachable :: proc(l: ^Loader, cfg: ^Config, route: Zone_Route) {
+	if !cfg.special_use.enabled {
+		return
+	}
+	Shadow :: struct {
+		zone:   string,
+		on:     bool,
+		reason: string,
+	}
+	// `localhost.` and `invalid.` have no key of their own: with the table on at
+	// all they are answered here, which is what RFC 6761 asks for.
+	table := [?]Shadow {
+		{"localhost.", true, "special_use.enabled answers localhost. here (RFC 6761)"},
+		{"invalid.", true, "special_use.enabled answers invalid. here (RFC 6761)"},
+		{"onion.", cfg.special_use.onion, "special_use.onion answers onion. here"},
+		{"local.", cfg.special_use.local, "special_use.local answers local. here"},
+		{"test.", cfg.special_use.test, "special_use.test answers test. here"},
+		{"home.arpa.", cfg.special_use.home_arpa, "special_use.home_arpa answers home.arpa. here"},
+	}
+	for domain in route.domains {
+		for entry in table {
+			if !entry.on || !domain_at_or_below(domain, entry.zone) {
+				continue
+			}
+			errorf(
+				l,
+				"upstream.zones: the route for %s would never be used: %s, before a query is forwarded; turn that key off to route the zone instead",
+				domain,
+				entry.reason,
+			)
+		}
+	}
+}
+
 @(private)
 load_upstream_spec :: proc(
 	l: ^Loader,
@@ -1838,19 +1912,27 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	at startup where it reads as "no usable upstream servers" about a resolver
 	whose default upstream is fine.
 	*/
-	for route, i in cfg.upstream.zones {
+	/*
+	Named by their zone rather than by their index. An entry the loader refused
+	outright - a route that is not a mapping, or one with a `zones` key of its
+	own - is never appended, so the position of a route in this slice is not its
+	position in the file once anything ahead of it has gone wrong, and an index
+	that points at the wrong route is worse than no index at all.
+	*/
+	for route in cfg.upstream.zones {
 		if len(route.domains) == 0 {
 			// Already reported by the loader, which refused every domain it was
 			// given; a second line saying the route is empty adds nothing.
 			continue
 		}
 		if len(route.upstream.servers) == 0 {
-			errorf(l, "upstream.zones[%d].servers: a route for %s needs at least one server", i, route.domains[0])
+			errorf(l, "upstream.zones: the route for %s needs at least one server", route.domains[0])
 		}
 		if route.upstream.attempts < 1 {
-			errorf(l, "upstream.zones[%d].attempts must be at least 1", i)
+			errorf(l, "upstream.zones: the route for %s needs attempts of at least 1", route.domains[0])
 		}
 		check_bootstrap(l, route.upstream.servers)
+		check_route_reachable(l, cfg, route)
 	}
 
 	// Only when there is a cache to size. A setting left over in a file that

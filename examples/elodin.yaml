@@ -223,10 +223,17 @@ upstream:
   # Two things follow from a route, so that turning it on is one decision rather
   # than three: names in the zone are served insecure, since a local zone's
   # unsigned data sits under a public parent that delegates nothing to it and
-  # validating it would SERVFAIL every internal name (a trust_anchors entry over
-  # a zone you sign yourself turns that back on); and the zone is exempt from
-  # the rebinding guard below, since answering with private addresses is what a
-  # local authority is for.
+  # validating it would SERVFAIL every internal name; and the zone is exempt
+  # from the rebinding guard below, since answering with private addresses is
+  # what a local authority is for.
+  #
+  # A dnssec.trust_anchors entry covering a routed zone stands the first of
+  # those down, so the names are validated like any other. That is not the same
+  # as the zone validating: the walk starts at the root and descends by DS, so
+  # it reaches a signed zone only where the public tree delegates to it, and
+  # standing the bypass down over a purely internal zone turns a working
+  # insecure answer into SERVFAIL. trust_anchors also replaces the built-in root
+  # keys rather than adding to them, so list the root DS alongside your own.
   #
   # What does not follow a route is the DNSSEC chain walk - DS and DNSKEY for
   # the zones above a name always go to the servers above, because a server

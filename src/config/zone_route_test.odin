@@ -244,3 +244,58 @@ test_a_routed_hostname_needs_a_bootstrap_resolver :: proc(t: ^testing.T) {
 		"no bootstrap resolver is configured",
 	)
 }
+
+/*
+A route into a zone the special-use table answers, which is a route that never
+fires.
+
+`special_use_zone` runs in `resolve_query` before anything is forwarded, so with
+`special_use.home_arpa` on the names are answered from the table and the route
+below them is never consulted. The operator upgrading from the key to a route -
+which is exactly what the README sends them to do once their router does answer
+the zone - would otherwise keep the key's NXDOMAIN and never see the router.
+
+The control is the same file with the key left at its default, where the route
+is the only thing claiming those names and the load is clean.
+*/
+@(test)
+test_a_route_under_an_enabled_special_use_zone_is_refused :: proc(t: ^testing.T) {
+	expect_one_error(
+		t,
+		"upstream:\n  servers: [1.1.1.1]\n  zones:\n    - domains: [home.arpa]\n      servers: [192.168.1.1]\n" +
+		"special_use:\n  home_arpa: true\n",
+		"would never be used",
+	)
+	// A name below the table's own entry is inside it just as the apex is.
+	expect_one_error(
+		t,
+		"upstream:\n  servers: [1.1.1.1]\n  zones:\n    - domains: [lab.test]\n      servers: [10.0.0.1]\n" +
+		"special_use:\n  test: true\n",
+		"would never be used",
+	)
+	// And the whole table off puts every one of them back within reach.
+	cfg, err := load_string(
+		"upstream:\n  servers: [1.1.1.1]\n  zones:\n    - domains: [home.arpa]\n      servers: [192.168.1.1]\n" +
+		"special_use:\n  enabled: false\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, err == nil, "a route under a table nothing consults was refused")
+	testing.expect_value(t, len(cfg.upstream.zones), 1)
+	free_all(context.temp_allocator)
+}
+
+// The control for the case above: with the key at its default the route is the
+// only thing claiming the zone, and the file loads.
+@(test)
+test_a_route_over_a_default_off_special_use_zone_is_kept :: proc(t: ^testing.T) {
+	cfg, err := load_string(
+		"upstream:\n  servers: [1.1.1.1]\n  zones:\n    - domains: [home.arpa]\n      servers: [192.168.1.1]\n",
+		context.temp_allocator,
+	)
+	if e, has := err.?; has {
+		testing.expectf(t, false, "config errors: %v", e.messages)
+		return
+	}
+	testing.expect_value(t, len(cfg.upstream.zones), 1)
+	free_all(context.temp_allocator)
+}

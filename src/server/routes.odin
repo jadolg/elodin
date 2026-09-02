@@ -34,7 +34,10 @@ goes:
      grants the RFC 6303 reverse zones, with the same escape hatch:
      `covered_by_local_anchor` stands it down for an operator who signed the
      zone and configured an anchor over it, that being a deliberate request to
-     validate exactly these names.
+     validate exactly these names. Standing it down is all it does: the chain
+     walk starts at the root and descends by `DS`, so an anchor below the root
+     is not a starting point, and a zone signed purely internally still cannot
+     be reached. Anchoring such a zone trades an insecure answer for SERVFAIL.
 
 A fourth falls out in `rebind.odin`: a routed zone may answer with private
 addresses, because answering with private addresses is what a local authority
@@ -122,8 +125,13 @@ groom_upstreams :: proc(s: ^Server) -> (closed: int) {
 	if s.group != nil {
 		closed += upstream.groom(s.group)
 	}
+	// Guarded the same way the default group is: `upstream.groom` walks
+	// `g.servers` without a nil check of its own, and a `Zone_Route` is a plain
+	// struct anybody can build with no group in it.
 	for route in s.routes {
-		closed += upstream.groom(route.group)
+		if route.group != nil {
+			closed += upstream.groom(route.group)
+		}
 	}
 	return
 }

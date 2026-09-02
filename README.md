@@ -429,9 +429,16 @@ forgotten:
   parent that delegates nothing to it, so walking the public chain for a name
   inside it finds a missing delegation and calls a perfectly good answer bogus —
   SERVFAIL for a name that was never public. Routed names are served insecure,
-  without the AD bit, exactly as the RFC 6303 private reverse zones are. If you
-  sign the zone yourself, a [`trust_anchors`](#dnssec) entry over it turns
-  validation back on for those names, and that request wins.
+  without the AD bit, exactly as the RFC 6303 private reverse zones are. A
+  [`trust_anchors`](#dnssec) entry covering the zone stands that bypass down —
+  the names are then validated like any other. Read that as "the bypass is off",
+  not as "the zone now validates": the chain walk starts at the root and descends
+  by `DS`, so it reaches a signed internal zone only if the public tree delegates
+  to it. A zone signed purely internally has no such delegation, and standing the
+  bypass down there turns a working insecure answer into SERVFAIL. Note also that
+  `trust_anchors` *replaces* the built-in root keys rather than adding to them,
+  so a list naming only your own zone leaves the validator with no root anchor
+  and SERVFAILs everything — list the root DS alongside it.
 - **The zone may answer with private addresses.** A route says the zone is
   answered by a local authority, and answering with local addresses is what a
   local authority is for, so [rebind protection](#dns-rebinding-protection)
@@ -447,6 +454,13 @@ proof from the parent, and that answer breaks a chain instead of completing it.
 The answer cache is keyed on the question and not on which upstream produced it,
 which is sound because the routing table is built once at startup and
 configuration is not reloaded. Restart after changing a route.
+
+A route into a zone [`special_use`](#names-that-are-never-forwarded) already
+answers is refused at load. Those names are answered from the table before
+anything is forwarded, so a route under `special_use.home_arpa: true` would sit
+in the file looking like the fix while every `home.arpa` name went on getting the
+table's NXDOMAIN — turn the key off in the same edit that adds the route, which
+is the whole point of the key being off by default.
 
 > **Coming from dnsmasq:** `server=/corp.example/10.0.0.1` in `blocking.rules`
 > does not route that zone — it *blocks* it. That form turns up in downloaded

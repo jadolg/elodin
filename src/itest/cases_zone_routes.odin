@@ -183,15 +183,32 @@ run_zone_route_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
-	start_case(r, "upstream.zones: an anchor over a routed zone re-enables validation")
+	start_case(r, "upstream.zones: an anchor over a routed zone stands the bypass down")
 	{
 		/*
-		The escape hatch, proven where it matters. A site that signs
-		`corp.example` and configures a trust anchor over it has asked for those
-		names to be checked against it, and that deliberate request outranks a
-		default meant for zones nobody signs. The mock cannot satisfy a
-		validator, so the routed name SERVFAILs where it was served before -
-		which is the bypass standing down rather than the route disappearing.
+		The escape hatch, and what it is and is not.
+
+		A site that anchors `corp.example` has asked for those names to be
+		checked, and that request outranks a default meant for zones nobody
+		signs: the routed name SERVFAILs where it was served before. What that
+		proves is only the bypass standing down - the route itself is unchanged,
+		and the query still goes to the internal mock, which simply cannot
+		satisfy a validator.
+
+		It is deliberately not a claim that anchoring a zone makes it validate.
+		The chain walk starts at the root and descends by `DS` (`zone_trust`), so
+		an anchor below the root does not seed it; a zone signed purely
+		internally, with no `DS` in the public tree, cannot be reached whatever
+		is anchored over it. Anchoring such a zone therefore trades a working
+		insecure answer for SERVFAIL, which is what this case actually
+		demonstrates. Making a below-root anchor a starting point for the walk is
+		its own change, in `src/dnssec`, and it would apply to the RFC 6303
+		reverse zones before it applied here.
+
+		The root anchor is re-listed alongside because `trust_anchors` replaces
+		the built-in keys rather than adding to them - without it there would be
+		no root anchor at all and every name would SERVFAIL, which would pass
+		this assertion while proving nothing about the routed zone.
 		*/
 		anchored_port := next_port(r)
 		extra := `dnssec:
