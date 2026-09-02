@@ -662,9 +662,32 @@ key's NXDOMAIN and never sees the router.
 
 Refused by name, the way `special_use.local` without `special_use.enabled` is,
 rather than left to be discovered from the outside.
+
+`resolver.arpa.` is the same refusal with no key attached, and so is checked
+first and outside the guard below. See `server.is_resolver_arpa`.
 */
 @(private)
 check_route_reachable :: proc(l: ^Loader, cfg: ^Config, route: Zone_Route) {
+	/*
+	The DDR zone, which no configuration can bring within reach of a route.
+
+	`is_resolver_arpa` runs in `resolve_query` ahead of the special-use table
+	and ahead of everything that forwards, and no key turns it off - RFC 9462
+	has the resolver answer for its own designation rather than fetch somebody
+	else's. So a route here is the same trap as one under an enabled key, minus
+	the key: there is nothing to turn off, and nothing to say about the route
+	but that it will never fire.
+	*/
+	for domain in route.domains {
+		if domain_at_or_below(domain, "resolver.arpa.") {
+			errorf(
+				l,
+				"upstream.zones: the route for %s would never be used: this server answers resolver.arpa. itself, for DDR (RFC 9462), before a query is forwarded",
+				domain,
+			)
+		}
+	}
+
 	if !cfg.special_use.enabled {
 		return
 	}
@@ -1996,7 +2019,12 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 		if len(route.upstream.servers) == 0 {
 			errorf(l, "upstream.zones: the route for %s needs at least one server", route.domains[0])
 		}
-		if route.upstream.attempts < 1 {
+		// Only where the route is the one that said so. `attempts` is inherited,
+		// so `upstream.attempts: 0` would otherwise name every route in the file
+		// for a number none of them wrote, beside the one line about the key
+		// that did - and an operator fixing the routes would find the error
+		// still there.
+		if route.upstream.attempts < 1 && cfg.upstream.attempts >= 1 {
 			errorf(l, "upstream.zones: the route for %s needs attempts of at least 1", route.domains[0])
 		}
 		check_bootstrap(l, route.upstream.servers)

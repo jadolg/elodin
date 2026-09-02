@@ -286,6 +286,75 @@ test_a_route_under_an_enabled_special_use_zone_is_refused :: proc(t: ^testing.T)
 }
 
 /*
+A route into `resolver.arpa`, which is the same trap with no key attached.
+
+`is_resolver_arpa` answers that zone in `resolve_query` ahead of everything that
+forwards, and no configuration key turns it off - so unlike the special-use
+zones above there is no edit that would bring such a route within reach, and
+leaving it to load cleanly would leave it looking configured for the life of the
+file. Refused whichever way the special-use table is set, which is the second
+case here.
+*/
+@(test)
+test_a_route_into_the_ddr_zone_is_refused :: proc(t: ^testing.T) {
+	expect_one_error(
+		t,
+		"upstream:\n  servers: [1.1.1.1]\n  zones:\n    - domains: [resolver.arpa]\n      servers: [10.0.0.1]\n",
+		"would never be used",
+	)
+	// A name inside it is inside it just as the apex is, and the whole
+	// special-use table off changes nothing about this one.
+	expect_one_error(
+		t,
+		"upstream:\n  servers: [1.1.1.1]\n  zones:\n    - domains: [_dns.resolver.arpa]\n      servers: [10.0.0.1]\n" +
+		"special_use:\n  enabled: false\n",
+		"would never be used",
+	)
+}
+
+/*
+The counterpart to the `attempts` inheritance: a number the route did not write.
+
+`attempts` comes down from the section above, so `upstream.attempts: 0` is one
+mistake in one place. Naming every route for it as well would send an operator
+editing routes that say nothing about attempts, and the error would still be
+there afterwards. One line, about the key that was actually written.
+*/
+@(test)
+test_a_bad_inherited_attempts_is_reported_once :: proc(t: ^testing.T) {
+	_, err := load_string(
+		"upstream:\n  attempts: 0\n  servers: [1.1.1.1]\n  zones:\n" +
+		"    - domains: [corp.example]\n      servers: [10.0.0.1]\n" +
+		"    - domains: [lab.example]\n      servers: [10.0.0.2]\n",
+		context.temp_allocator,
+	)
+	e, has := err.?
+	if !testing.expect(t, has, "attempts of 0 was accepted") {
+		return
+	}
+	routes_named := 0
+	key_named := 0
+	for msg in e.messages {
+		if strings.contains(msg, "needs attempts of at least 1") {
+			routes_named += 1
+		}
+		if strings.contains(msg, "upstream.attempts must be at least 1") {
+			key_named += 1
+		}
+	}
+	testing.expectf(t, routes_named == 0, "the routes were named for an inherited number; got %v", e.messages)
+	testing.expect_value(t, key_named, 1)
+
+	// A route that writes the number itself is still its own error.
+	expect_one_error(
+		t,
+		"upstream:\n  servers: [1.1.1.1]\n  zones:\n    - domains: [corp.example]\n      attempts: 0\n      servers: [10.0.0.1]\n",
+		"the route for corp.example. needs attempts of at least 1",
+	)
+	free_all(context.temp_allocator)
+}
+
+/*
 A route the operator anchored gives up no validation, and `--check` has to be
 able to tell.
 

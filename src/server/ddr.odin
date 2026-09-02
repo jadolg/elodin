@@ -50,6 +50,12 @@ RESOLVER_ARPA_TTL :: u32(300)
 
 // Whether `name` is the DDR zone or a name inside it. Same label-boundary and
 // case-folding rules as the locally-served zones next door.
+//
+// Named a second time in `config.check_route_reachable`, which refuses an
+// `upstream.zones` route into this zone: it is answered here before anything is
+// forwarded and no key turns that off, so such a route could only ever sit in
+// the file looking configured. The config package cannot import this one, hence
+// the second copy of the name.
 @(private)
 is_resolver_arpa :: proc(name: string) -> bool {
 	return name_at_or_below(name, RESOLVER_ARPA)

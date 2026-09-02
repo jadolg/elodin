@@ -306,7 +306,7 @@ route_implication_warning :: proc(
 		return "", false
 	}
 	// Validation is given up only where it was being done: with `dnssec.enabled`
-	// there is nothing to lose, and with an anchor over every name the route
+	// off there is nothing to lose, and with an anchor over every name the route
 	// claims the bypass never applies to them in the first place.
 	insecure := cfg.dnssec.enabled && !config.route_is_anchored(cfg, route)
 	if !insecure && !cfg.rebind.enabled {
