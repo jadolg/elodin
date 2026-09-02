@@ -915,34 +915,356 @@ load_rewrites :: proc(l: ^Loader, cfg: ^Config) {
 		}
 
 		answers := make([dynamic]Rewrite_Answer, 0, len(raw), l.allocator)
-		for a in raw {
-			switch {
-			case a == "block", a == "deny":
-				append(&answers, Rewrite_Answer{kind = .Block})
-			case:
-				addr := net.parse_address(a)
-				switch v in addr {
-				case net.IP4_Address:
-					append(&answers, Rewrite_Answer{kind = .A, v4 = cast([4]u8)v})
-				case net.IP6_Address:
-					ans := Rewrite_Answer {
-						kind = .AAAA,
-					}
-					for group, gi in v {
-						x := u16(group)
-						ans.v6[gi * 2] = u8(x >> 8)
-						ans.v6[gi * 2 + 1] = u8(x)
-					}
-					append(&answers, ans)
-				case:
-					append(&answers, Rewrite_Answer{kind = .CNAME, name = canonical_domain(a, l.allocator)})
-				}
+		for a, ai in raw {
+			ans, parsed := parse_rewrite_answer(l, a, fmt.tprintf("%s.answers[%d]", path, ai))
+			if !parsed {
+				continue
 			}
+			append(&answers, ans)
 		}
 		rw.answers = answers[:]
 		append(&out, rw)
 	}
 	cfg.rewrites = out[:]
+}
+
+/*
+One entry of `answer:` / `answers:`, in either of the two forms.
+
+The short form is what the file has always taken and is what most rules are: a
+bare address is an A or a AAAA, a bare name is a CNAME, and `block` is the name
+sunk as though a list had named it. It stays exactly as it was, spaces and all -
+a value this cannot make sense of is a CNAME to whatever was written, which is
+how a typo has always been read here.
+
+The long form is a type token and then that type's RDATA, spelled the way a zone
+file spells it:
+
+    "A 192.168.1.50"
+    "MX 10 mail.example.com"
+    "SRV 0 5 5060 sip.example.com"
+    'TXT "v=spf1 -all"'
+
+Zone-file syntax rather than a shape of this file's own because the fields are
+not this file's to name: an operator reaching for `MX` knows a preference comes
+first from RFC 1035, and one reaching for `SRV` knows priority, weight and port
+from RFC 2782, and every document they will consult while writing the rule -
+their registrar's, their mail provider's, the RFC - prints it in that order. A
+`{preference: 10, exchange: ...}` mapping would be this file asking to be
+learned separately in order to say the same thing.
+
+The type token has to be followed by something, which is what keeps the two
+forms from colliding. `answer: mx` is a CNAME to the host called `mx`, because a
+host really can be called that and a bare token cannot be an MX record - it
+carries no preference and no exchange. Only `MX <something>` is read as a type.
+
+An answer this cannot parse is an error rather than a fallback. That is the
+difference the type token buys and the reason it is worth having: `MX ten
+mail.example.com` is a mistake with one reading, and `--check` says so with the
+rule and the field named, where the short form has no choice but to accept
+whatever it is given.
+*/
+@(private)
+parse_rewrite_answer :: proc(
+	l: ^Loader,
+	text: string,
+	path: string,
+) -> (
+	ans: Rewrite_Answer,
+	ok: bool,
+) {
+	trimmed := strings.trim_space(text)
+	if trimmed == "" {
+		errorf(l, "%s: empty answer", path)
+		return {}, false
+	}
+	if trimmed == "block" || trimmed == "deny" {
+		return Rewrite_Answer{kind = .Block}, true
+	}
+
+	head, rest, typed := split_first_field(trimmed)
+	if typed {
+		switch {
+		case strings.equal_fold(head, "a"):
+			addr, is4 := net.parse_address(rest).(net.IP4_Address)
+			if !is4 {
+				errorf(l, "%s: A needs an IPv4 address, got %q", path, rest)
+				return {}, false
+			}
+			return Rewrite_Answer{kind = .A, v4 = cast([4]u8)addr}, true
+
+		case strings.equal_fold(head, "aaaa"):
+			addr, is6 := net.parse_address(rest).(net.IP6_Address)
+			if !is6 {
+				errorf(l, "%s: AAAA needs an IPv6 address, got %q", path, rest)
+				return {}, false
+			}
+			return v6_rewrite_answer(addr), true
+
+		case strings.equal_fold(head, "cname"):
+			name := rdata_name(l, rest, path, "CNAME") or_return
+			return Rewrite_Answer{kind = .CNAME, name = name}, true
+
+		case strings.equal_fold(head, "mx"):
+			return parse_mx_answer(l, rest, path)
+
+		case strings.equal_fold(head, "srv"):
+			return parse_srv_answer(l, rest, path)
+
+		case strings.equal_fold(head, "txt"):
+			strs := parse_txt_strings(l, rest, path) or_return
+			return Rewrite_Answer{kind = .TXT, strings = strs}, true
+		}
+	}
+
+	// The short form, unchanged: an address is what it looks like, and anything
+	// else is a name to point at.
+	switch v in net.parse_address(trimmed) {
+	case net.IP4_Address:
+		return Rewrite_Answer{kind = .A, v4 = cast([4]u8)v}, true
+	case net.IP6_Address:
+		return v6_rewrite_answer(v), true
+	}
+	return Rewrite_Answer{kind = .CNAME, name = canonical_domain(trimmed, l.allocator)}, true
+}
+
+/*
+`MX <preference> <exchange>`, RFC 1035 section 3.3.9.
+
+RFC 7505's "null MX" - `MX 0 .` - is a legal and useful thing to write here: it
+is how a domain says it accepts no mail at all, and `canonical_domain` holds the
+root as ".", which the encoder writes as the single zero byte the RFC asks for.
+*/
+@(private)
+parse_mx_answer :: proc(l: ^Loader, rest, path: string) -> (ans: Rewrite_Answer, ok: bool) {
+	fields: [2]string
+	if rdata_fields(rest, fields[:]) != 2 {
+		errorf(l, "%s: MX takes a preference and a host, as \"MX 10 mail.example.com\"", path)
+		return {}, false
+	}
+	pref, pref_ok := parse_rdata_u16(fields[0])
+	if !pref_ok {
+		errorf(l, "%s: MX preference %q is not a number from 0 to 65535", path, fields[0])
+		return {}, false
+	}
+	name := rdata_name(l, fields[1], path, "MX") or_return
+	return Rewrite_Answer{kind = .MX, preference = pref, name = name}, true
+}
+
+/*
+`SRV <priority> <weight> <port> <target>`, RFC 2782.
+
+A target of "." is that RFC's way of saying the service is decidedly not
+available at this domain, and goes through for the same reason the null MX does.
+*/
+@(private)
+parse_srv_answer :: proc(l: ^Loader, rest, path: string) -> (ans: Rewrite_Answer, ok: bool) {
+	fields: [4]string
+	if rdata_fields(rest, fields[:]) != 4 {
+		errorf(
+			l,
+			"%s: SRV takes a priority, weight, port and target, as \"SRV 0 5 5060 sip.example.com\"",
+			path,
+		)
+		return {}, false
+	}
+	names := [3]string{"priority", "weight", "port"}
+	numbers: [3]u16
+	for i in 0 ..< 3 {
+		v, v_ok := parse_rdata_u16(fields[i])
+		if !v_ok {
+			errorf(l, "%s: SRV %s %q is not a number from 0 to 65535", path, names[i], fields[i])
+			return {}, false
+		}
+		numbers[i] = v
+	}
+	name := rdata_name(l, fields[3], path, "SRV") or_return
+	return Rewrite_Answer {
+			kind = .SRV,
+			priority = numbers[0],
+			weight = numbers[1],
+			port = numbers[2],
+			name = name,
+		},
+		true
+}
+
+/*
+The <character-string>s of a TXT record, quoted as a zone file quotes them.
+
+Unquoted, the whole of the rest is one string, which is what makes the common
+case short: `TXT hello` needs no ceremony to say one word. Quoted, it is a
+sequence - `TXT "part one" "part two"` - because that is what a TXT record
+actually is (RFC 1035 section 3.3.14) and what a long DKIM key has to be written
+as. Inside the quotes `\"` is a quote and `\\` a backslash; any other backslash
+stands for the character after it, which is the zone-file rule minus the `\DDD`
+decimal escapes, and those are left out because nothing an operator pastes from
+a provider's console contains one.
+
+255 bytes is the limit on each string, from the length octet that precedes it,
+and going over is an error here rather than a truncation later: a DKIM key
+silently cut in half is a mail domain that fails to verify with nothing in the
+logs to say why. Splitting it for the operator was the alternative, and it would
+change what the record says - concatenation is the client's business, and where
+the pieces join is the client's business too.
+*/
+@(private)
+parse_txt_strings :: proc(l: ^Loader, rest, path: string) -> (out: []string, ok: bool) {
+	if rest == "" {
+		errorf(l, "%s: TXT needs some text, as 'TXT \"v=spf1 -all\"'", path)
+		return nil, false
+	}
+	strs := make([dynamic]string, 0, 1, l.allocator)
+
+	if rest[0] != '"' {
+		if len(rest) > 255 {
+			errorf(l, "%s: TXT string is %d bytes, and each may be at most 255", path, len(rest))
+			return nil, false
+		}
+		append(&strs, strings.clone(rest, l.allocator))
+		return strs[:], true
+	}
+
+	i := 0
+	for i < len(rest) {
+		// Whitespace between strings, and nothing else may sit there.
+		if rest[i] == ' ' || rest[i] == '\t' {
+			i += 1
+			continue
+		}
+		if rest[i] != '"' {
+			errorf(l, "%s: TXT has %q outside a quoted string", path, rest[i:])
+			return nil, false
+		}
+		i += 1
+
+		b := strings.builder_make(l.allocator)
+		closed := false
+		for i < len(rest) {
+			c := rest[i]
+			if c == '"' {
+				i += 1
+				closed = true
+				break
+			}
+			if c == '\\' && i + 1 < len(rest) {
+				i += 1
+				c = rest[i]
+			}
+			strings.write_byte(&b, c)
+			i += 1
+		}
+		if !closed {
+			errorf(l, "%s: TXT has a quoted string that is never closed", path)
+			return nil, false
+		}
+		s := strings.to_string(b)
+		if len(s) > 255 {
+			errorf(l, "%s: TXT string is %d bytes, and each may be at most 255", path, len(s))
+			return nil, false
+		}
+		append(&strs, s)
+	}
+	return strs[:], true
+}
+
+// The bytes of an IPv6 literal, in the order the wire wants them.
+@(private)
+v6_rewrite_answer :: proc(v: net.IP6_Address) -> (ans: Rewrite_Answer) {
+	ans.kind = .AAAA
+	for group, gi in v {
+		x := u16(group)
+		ans.v6[gi * 2] = u8(x >> 8)
+		ans.v6[gi * 2 + 1] = u8(x)
+	}
+	return ans
+}
+
+/*
+A domain name out of an RDATA field.
+
+`canonical_domain` takes anything at all, so the check is here: a field with a
+space in it is two fields that were meant to be one, and the message says which
+record was being written rather than leaving the operator to find it.
+*/
+@(private)
+rdata_name :: proc(l: ^Loader, text, path, type: string) -> (name: string, ok: bool) {
+	trimmed := strings.trim_space(text)
+	if trimmed == "" || strings.index_any(trimmed, " \t") >= 0 {
+		errorf(l, "%s: %s needs one host name, got %q", path, type, text)
+		return "", false
+	}
+	return canonical_domain(trimmed, l.allocator), true
+}
+
+/*
+Splits `s` at the first run of spaces or tabs.
+
+`ok` is false when there is no split to make, which the caller reads as "this is
+one token and so cannot be a type followed by its RDATA".
+*/
+@(private)
+split_first_field :: proc(s: string) -> (head, rest: string, ok: bool) {
+	i := strings.index_any(s, " \t")
+	if i < 0 {
+		return s, "", false
+	}
+	return s[:i], strings.trim_space(s[i:]), true
+}
+
+/*
+Fills `out` with the whitespace-separated fields of `s` and reports how many
+there were, `len(out) + 1` standing for "more than that".
+
+Every caller wants an exact count, so the overflow value only has to be wrong in
+a way that fails the comparison, and stopping at that point keeps a rule with a
+hundred trailing words from being walked to the end.
+*/
+@(private)
+rdata_fields :: proc(s: string, out: []string) -> int {
+	n := 0
+	rest := strings.trim_space(s)
+	for rest != "" {
+		field := rest
+		if i := strings.index_any(rest, " \t"); i >= 0 {
+			field = rest[:i]
+			rest = strings.trim_space(rest[i:])
+		} else {
+			rest = ""
+		}
+		if n == len(out) {
+			return n + 1
+		}
+		out[n] = field
+		n += 1
+	}
+	return n
+}
+
+/*
+A decimal number that fits in the 16 bits an MX preference or an SRV field has.
+
+Deliberately stricter than `strconv`: this is a configuration file, and
+`0x1f`, `+5`, `1_000` and a leading space are all shapes that would be accepted
+somewhere and mean something else here. A number is digits.
+*/
+@(private)
+parse_rdata_u16 :: proc(s: string) -> (v: u16, ok: bool) {
+	if len(s) == 0 || len(s) > 5 {
+		return 0, false
+	}
+	n := 0
+	for i in 0 ..< len(s) {
+		c := s[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n * 10 + int(c - '0')
+	}
+	if n > 65535 {
+		return 0, false
+	}
+	return u16(n), true
 }
 
 // Lowercase with a trailing dot, matching the form the resolver compares against.

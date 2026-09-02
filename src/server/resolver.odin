@@ -1769,8 +1769,63 @@ apply_rewrite :: proc(
 					data = dns.Rdata_Name{name = a.name},
 				},
 			)
+		case .MX:
+			if q.type == .MX || q.type == .ANY {
+				append(
+					&answers,
+					dns.Record {
+						name = q.name,
+						type = .MX,
+						class = .IN,
+						ttl = rule.ttl,
+						data = dns.Rdata_MX{preference = a.preference, exchange = a.name},
+					},
+				)
+			}
+		case .TXT:
+			if q.type == .TXT || q.type == .ANY {
+				append(
+					&answers,
+					dns.Record {
+						name = q.name,
+						type = .TXT,
+						class = .IN,
+						ttl = rule.ttl,
+						data = dns.Rdata_TXT{strings = a.strings},
+					},
+				)
+			}
+		case .SRV:
+			if q.type == .SRV || q.type == .ANY {
+				append(
+					&answers,
+					dns.Record {
+						name = q.name,
+						type = .SRV,
+						class = .IN,
+						ttl = rule.ttl,
+						data = dns.Rdata_SRV {
+							priority = a.priority,
+							weight = a.weight,
+							port = a.port,
+							target = a.name,
+						},
+					},
+				)
+			}
 		}
 	}
+
+	/*
+	No additional section, for the MX exchange or the SRV target.
+
+	A zone's own server would put the target's address there and save the client
+	a round trip, and this cannot: the target is a name in some other zone as
+	often as not, and the only way to learn its address is to resolve it -
+	upstream, from inside the procedure that exists to answer without going
+	upstream. A client that needs the address asks for it, which is what every
+	client already does when a real server declines to glue.
+	*/
 
 	if blocked {
 		return build_block_response(s, query, q, allocator, limit), true

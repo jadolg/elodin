@@ -399,6 +399,22 @@ rebind:
 #   - domain: ads.example.com
 #     answer: 192.168.1.10          # a block page on a host that has its own name
 #     ptr: false                    # so leave 192.168.1.10's reverse alone
+#
+# An answer can also name its type and carry that type's fields, in the order a
+# zone file (and the RFC, and your registrar's setup page) puts them:
+# rewrites:
+#   - domain: example.com
+#     answers:
+#       - "MX 10 mail.example.com"
+#       - "MX 20 backup.example.com"
+#       - 'TXT "v=spf1 include:_spf.example.com -all"'
+#   - domain: _sip._tcp.example.com
+#     answer: "SRV 0 5 5060 sip.example.com"
+#
+# A, AAAA, CNAME, MX, TXT and SRV. Unlike the short forms above, a typed answer
+# that does not parse fails --check instead of quietly becoming a CNAME, and TXT
+# takes either one unquoted line or a sequence of quoted strings of 255 bytes
+# each.
 
 # Names the RFCs reserved, answered here instead of being sent upstream.
 #

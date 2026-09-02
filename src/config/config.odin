@@ -274,15 +274,42 @@ Rewrite_Kind :: enum u8 {
 	A,
 	AAAA,
 	CNAME,
+	MX,
+	TXT,
+	SRV,
 	// Answer the query as if the name were blocked.
 	Block,
 }
 
+/*
+One record a rule answers with, in the shape the encoder wants it.
+
+The fields are a flat union rather than a tagged one: `kind` says which of them
+mean anything, and the rest are zero. A `union` would cost a second dispatch in
+`apply_rewrite` and buy nothing - there are seven kinds, the widest is sixteen
+bytes, and the whole table is read once per matching query.
+
+`name` is the one field several kinds share, being the same thing in each: a
+CNAME's target, an MX's exchange, an SRV's target. `preference` and `priority`
+are separate for the same reason they have separate names in RFC 1035 section
+3.3.9 and RFC 2782 - one is a mail router's rank and the other is a service
+instance's, and a reader of a config file should not have to know they happen to
+be the same width.
+*/
 Rewrite_Answer :: struct {
-	kind: Rewrite_Kind,
-	v4:   [4]u8,
-	v6:   [16]u8,
-	name: string,
+	kind:       Rewrite_Kind,
+	v4:         [4]u8,
+	v6:         [16]u8,
+	// CNAME target, MX exchange, SRV target. Canonical, lowercase, trailing dot.
+	name:       string,
+	// MX (RFC 1035 section 3.3.9).
+	preference: u16,
+	// SRV (RFC 2782).
+	priority:   u16,
+	weight:     u16,
+	port:       u16,
+	// TXT, one <character-string> per element, each at most 255 bytes.
+	strings:    []string,
 }
 
 Rewrite :: struct {

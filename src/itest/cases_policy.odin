@@ -333,6 +333,8 @@ rewrites:
   - {{ domain: shadowed.lab, answer: 192.168.1.70 }}
   - {{ domain: sink.example.org, answers: [block, 192.168.1.60] }}
   - {{ domain: blockpage.example.org, answer: 192.168.1.80, ptr: false }}
+  - {{ domain: mail.example.org, answers: ["MX 10 mx1.example.org", "MX 20 mx2.example.org", "TXT v=spf1 -all"] }}
+  - {{ domain: _sip._tcp.example.org, answer: "SRV 0 5 5060 sip.example.org" }}
 `,
 		udp_port,
 		upstream_port,
@@ -417,6 +419,81 @@ rewrites:
 			h, _ := parse_header(res.wire)
 			check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)
 			check_eq_int(r, h.ancount, 0, "answer count")
+		}
+	}
+	end_case(r)
+
+	start_case(r, "rewrite: MX answers with both hosts and their preferences")
+	{
+		res := query_udp(udp_port, build_query("mail.example.org.", u16(dns.Type.MX)))
+		if check(r, res.ok, "no response") {
+			msg, derr := dns.decode_message(res.wire, context.temp_allocator)
+			if check(r, derr == .None, "response did not decode: %v", derr) &&
+			   check(r, len(msg.answer) == 2, "expected two MX records, got %d", len(msg.answer)) {
+				for rec, i in msg.answer {
+					mx, is_mx := rec.data.(dns.Rdata_MX)
+					if !check(r, is_mx, "answer %d is not an MX record", i) {
+						continue
+					}
+					want_pref := u16(10) if i == 0 else u16(20)
+					want_host := "mx1.example.org." if i == 0 else "mx2.example.org."
+					check(r, mx.preference == want_pref, "preference %d, want %d", mx.preference, want_pref)
+					check_eq_str(r, mx.exchange, want_host, "exchange")
+				}
+			}
+		}
+	}
+	end_case(r)
+
+	start_case(r, "rewrite: TXT answers with the text as written")
+	{
+		res := query_udp(udp_port, build_query("mail.example.org.", u16(dns.Type.TXT)))
+		if check(r, res.ok, "no response") {
+			msg, derr := dns.decode_message(res.wire, context.temp_allocator)
+			if check(r, derr == .None, "response did not decode: %v", derr) &&
+			   check(r, len(msg.answer) == 1, "expected one TXT record, got %d", len(msg.answer)) {
+				txt, is_txt := msg.answer[0].data.(dns.Rdata_TXT)
+				if check(r, is_txt, "the answer is not a TXT record") &&
+				   check(r, len(txt.strings) == 1, "expected one string, got %d", len(txt.strings)) {
+					check_eq_str(r, txt.strings[0], "v=spf1 -all", "text")
+				}
+			}
+		}
+	}
+	end_case(r)
+
+	start_case(r, "rewrite: SRV answers with priority, weight, port and target")
+	{
+		res := query_udp(udp_port, build_query("_sip._tcp.example.org.", u16(dns.Type.SRV)))
+		if check(r, res.ok, "no response") {
+			msg, derr := dns.decode_message(res.wire, context.temp_allocator)
+			if check(r, derr == .None, "response did not decode: %v", derr) &&
+			   check(r, len(msg.answer) == 1, "expected one SRV record, got %d", len(msg.answer)) {
+				srv, is_srv := msg.answer[0].data.(dns.Rdata_SRV)
+				if check(r, is_srv, "the answer is not an SRV record") {
+					// Four different numbers, so a swapped pair cannot pass.
+					check(r, srv.priority == 0, "priority %d, want 0", srv.priority)
+					check(r, srv.weight == 5, "weight %d, want 5", srv.weight)
+					check(r, srv.port == 5060, "port %d, want 5060", srv.port)
+					check_eq_str(r, srv.target, "sip.example.org.", "target")
+				}
+			}
+		}
+	}
+	end_case(r)
+
+	start_case(r, "rewrite: a record rule is NODATA for the types it has none of")
+	{
+		// The upstream would have synthesised an A for this name, so an empty
+		// answer is the proof the rule answered rather than the query leaving.
+		mock_reset_counts(mock)
+		res := query_udp(udp_port, build_query("mail.example.org.", u16(dns.Type.A)))
+		if check(r, res.ok, "no response") {
+			h, _ := parse_header(res.wire)
+			check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)
+			check_eq_int(r, h.ancount, 0, "answer count")
+			check_eq_int(r, h.nscount, 1, "authority count")
+			check_eq_int(r, mock_total(mock), 0, "upstream queries for a name answered here")
 		}
 	}
 	end_case(r)
