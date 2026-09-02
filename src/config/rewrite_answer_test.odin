@@ -516,6 +516,72 @@ test_rewrite_domain_must_fit_the_wire :: proc(t: ^testing.T) {
 }
 
 /*
+Records that each fit and together do not.
+
+A rule answers with all of its records of the queried type at once, and the
+encoder's response to a message it cannot fill is to truncate rather than to
+complain - at the same 65535 over TCP as over UDP, so the client has nowhere
+larger to retry. It takes hundreds of records at one name to reach, which is not
+an answer anybody can use anyway.
+*/
+@(test)
+test_a_rule_may_not_hold_more_than_a_message :: proc(t: ^testing.T) {
+	long := strings.repeat("x", 255, context.temp_allocator)
+	b := strings.builder_make(context.temp_allocator)
+	strings.write_string(&b, "[")
+	for i in 0 ..< 300 {
+		if i > 0 {
+			strings.write_string(&b, ", ")
+		}
+		strings.write_string(&b, "\"TXT ")
+		strings.write_string(&b, long)
+		strings.write_string(&b, "\"")
+	}
+	strings.write_string(&b, "]")
+
+	msg := error_from(strings.to_string(b))
+	if testing.expect(t, msg != "", "300 full-length TXT records were accepted") {
+		testing.expect(t, strings.contains(msg, "at most"), "the message should name the limit")
+	}
+
+	// A handful of the same records is fine, the limit being about hundreds.
+	ok_rules := rules_from(t, `["TXT one", "TXT two", "TXT three"]`)
+	testing.expect(t, len(ok_rules) == 1, "three TXT records should load")
+
+	free_all(context.temp_allocator)
+}
+
+/*
+An answer that cannot be parsed takes its whole rule with it.
+
+Only `load_string` treating these errors as fatal kept a half-parsed rule out of
+the resolver, and that became load-bearing when a rule with no usable answers
+started reading to the server as a record-only rule it should step over. The
+rule is dropped here instead, the way every other failure in `load_rewrites`
+drops one.
+*/
+@(test)
+test_a_bad_answer_drops_its_rule :: proc(t: ^testing.T) {
+	src := "upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - domain: example.com\n    answers: [\"MX ten mail.example.com\", 192.168.1.50]\n  - domain: other.example\n    answer: 192.168.1.51\n"
+	cfg, err := load_string(src, context.temp_allocator)
+	if _, has := err.?; !testing.expect(t, has, "a bad answer was accepted") {
+		return
+	}
+	// The rule with the bad answer is gone rather than standing with one answer
+	// missing; the rule after it is untouched.
+	for rule in cfg.rewrites {
+		testing.expectf(
+			t,
+			rule.domain != "example.com.",
+			"the rule with the unparseable answer was kept: %v",
+			rule,
+		)
+	}
+
+	free_all(context.temp_allocator)
+}
+
+/*
 The 255-byte limit on one <character-string>, which is the length octet in front
 of it and not a policy of this file's.
 

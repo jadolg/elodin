@@ -374,6 +374,56 @@ test_a_record_only_rule_steps_aside_for_the_rules_below_it :: proc(t: ^testing.T
 }
 
 /*
+What the walk may not do: reach an alias for a name some rule above it holds
+records for.
+
+The two rules are each legal on their own, and `answers_agree` in the loader
+cannot see the pair - one is a wildcard over the other. Answering the `A` with
+that CNAME would make `mail.lan` an alias and the holder of an MX at once, which
+is the RFC 2181 section 10.1 violation the loader refuses inside one rule; a
+client following the alias would resolve the MX elsewhere and get a different
+answer from the one this server just gave it.
+*/
+@(test)
+test_the_walk_will_not_reach_an_alias_past_records :: proc(t: ^testing.T) {
+	rules := make([]config.Rewrite, 2, context.temp_allocator)
+	rules[0] = config.Rewrite {
+		domain  = "mail.lan.",
+		answers = answers_of({kind = .MX, preference = 10, name = "mx.lan."}),
+		ttl     = 300,
+		ptr     = true,
+	}
+	rules[1] = config.Rewrite {
+		domain   = "lan.",
+		wildcard = true,
+		answers  = answers_of({kind = .CNAME, name = "host.example.com."}),
+		ttl      = 300,
+		ptr      = true,
+	}
+
+	// Nothing here can answer it: the MX rule has no A and the alias may not
+	// apply, so the name goes on down the pipeline.
+	_, outcome, _ := ask(rules, "mail.lan.", .A)
+	testing.expect_value(t, outcome, Outcome.Refused)
+
+	// The MX is still answered, and the alias still answers every other name
+	// under the wildcard.
+	mx, _, mx_ok := ask(rules, "mail.lan.", .MX)
+	if testing.expect(t, mx_ok, "the MX query went unanswered") {
+		testing.expect_value(t, len(mx.answer), 1)
+		testing.expect_value(t, mx.answer[0].type, dns.Type.MX)
+	}
+	other, _, other_ok := ask(rules, "www.lan.", .A)
+	if testing.expect(t, other_ok, "the wildcard went unanswered") {
+		if testing.expect(t, len(other.answer) == 1, "the alias should have answered") {
+			testing.expect_value(t, other.answer[0].type, dns.Type.CNAME)
+		}
+	}
+
+	free_all(context.temp_allocator)
+}
+
+/*
 And the reverse direction follows the same walk, or it would name an address the
 forward direction does not give out.
 

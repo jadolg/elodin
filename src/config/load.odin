@@ -882,7 +882,7 @@ load_rewrites :: proc(l: ^Loader, cfg: ^Config) {
 	}
 	out := make([dynamic]Rewrite, 0, len(entries), l.allocator)
 
-	for e, i in entries {
+	rules: for e, i in entries {
 		path := fmt.tprintf("rewrites[%d]", i)
 		rw := Rewrite {
 			ttl = 300,
@@ -960,12 +960,22 @@ load_rewrites :: proc(l: ^Loader, cfg: ^Config) {
 			}
 			ans, parsed := parse_rewrite_answer(l, a, apath)
 			if !parsed {
-				continue
+				// The whole rule goes, the way every other failure in here
+				// treats one. Keeping a rule that lost an answer left the
+				// resolver relying on these errors being fatal to `load_string`
+				// - true today, and a rule with an empty `answers` reads to the
+				// server as a record-only rule with nothing to say, which it
+				// would step over in silence.
+				continue rules
 			}
 			append(&answers, ans)
 		}
-		if !answers_agree(l, answers[:], fmt.tprintf("%s.%s", path, key)) {
-			continue
+		apath := fmt.tprintf("%s.%s", path, key)
+		if !answers_agree(l, answers[:], apath) {
+			continue rules
+		}
+		if !answers_fit_a_message(l, answers[:], apath) {
+			continue rules
 		}
 		rw.answers = answers[:]
 		append(&out, rw)
@@ -1012,6 +1022,59 @@ answers_agree :: proc(l: ^Loader, answers: []Rewrite_Answer, path: string) -> bo
 			l,
 			"%s: a CNAME cannot sit beside other records at the same name (RFC 2181 section 10.1) - it already answers every type, so put the other records on the name it points at",
 			path,
+		)
+		return false
+	}
+	return true
+}
+
+/*
+Whether every record a rule holds can be sent in one message.
+
+The per-record limits in `parse_txt_strings` are not the whole of it: a rule
+answers with all of its records of the queried type at once, so a rule can be
+made of records that each fit and together do not. The encoder does not report
+that either - it fills the message, sets the truncated flag and leaves the rest
+out - and the ceiling it is filling to is 65535 whether the query arrived over
+UDP or TCP, so there is no larger transport for the client to retry on. The
+answer is simply short, for as long as the rule stands.
+
+The estimate is deliberately pessimistic. The owner name is the name the client
+asked for, which is not known here, so every record is charged the longest one
+there can be (255 bytes) plus its ten-byte header; in a real message that name
+is written once and pointed at thereafter. A rule that this refuses is a rule
+with hundreds of records at one name, which is not an answer any client can use.
+*/
+@(private)
+answers_fit_a_message :: proc(l: ^Loader, answers: []Rewrite_Answer, path: string) -> bool {
+	total := 0
+	for a in answers {
+		rdata := 0
+		switch a.kind {
+		case .A:
+			rdata = 4
+		case .AAAA:
+			rdata = 16
+		case .CNAME, .SRV, .MX:
+			// The name, plus a length octet for its first label and the root's
+			// zero, and the fixed fields of an MX or an SRV in front of it.
+			rdata = len(a.name) + 2 + 6
+		case .TXT:
+			for s in a.strings {
+				rdata += 1 + len(s)
+			}
+		case .Block:
+		}
+		total += 255 + 10 + rdata
+	}
+	if total > MAX_RECORD_RDATA {
+		errorf(
+			l,
+			"%s: these %d records come to about %d bytes, and one answer may be at most %d",
+			path,
+			len(answers),
+			total,
+			MAX_RECORD_RDATA,
 		)
 		return false
 	}

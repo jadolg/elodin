@@ -1751,6 +1751,7 @@ apply_rewrite :: proc(
 	one rule, and that is the rule the operator writes.
 	*/
 	from := 0
+	records_held := false
 	search: for {
 		i, found := find_rewrite_index(s.cfg.rewrites, q.name, from)
 		if !found {
@@ -1860,6 +1861,35 @@ apply_rewrite :: proc(
 		}
 
 		/*
+		An alias cannot answer a name that some rule above it holds records for.
+
+		The walk is what makes this reachable, and it is the same rule
+		`answers_agree` enforces inside one rule (RFC 2181 section 10.1) meeting
+		the case that spans two of them:
+
+		    - domain: mail.lan
+		      answers: ["MX 10 mx.lan"]
+		    - domain: "*.lan"
+		      answer: host.example.com
+
+		An `A mail.lan` query walks past the MX rule and reaches the wildcard,
+		and answering it with that CNAME would make `mail.lan` an alias and the
+		holder of an MX at once - a client following the alias resolves the MX
+		somewhere else and gets a different answer than this server just gave.
+		By the time the walk has stepped past records, an alias is the one thing
+		the rules below cannot say, so the rule is skipped whole: `answers_agree`
+		has already established that a rule with a CNAME holds nothing else, so
+		there is nothing else in it to lose.
+
+		`block` is looked at first, above, and keeps its precedence: a rule that
+		sinks the name is not making a claim about records at all.
+		*/
+		if records_held && rule_holds_alias(rule) {
+			from = i + 1
+			continue search
+		}
+
+		/*
 		A rule that only adds records to a name does not get to answer for the rest
 		of it.
 
@@ -1889,6 +1919,9 @@ apply_rewrite :: proc(
 		*/
 		if len(answers) == 0 && !rule_claims_name(rule) {
 			from = i + 1
+			if len(rule.answers) > 0 {
+				records_held = true
+			}
 			continue search
 		}
 
@@ -1942,6 +1975,19 @@ is not enough to decide that - a duplicated `domain:` is two rules with one name
 between them, and only the first of them is ever reached. Both callers go
 through one loop so that the precedence cannot be described twice and drift.
 */
+// Whether `rule` makes the name an alias. `answers_agree` in the loader keeps a
+// CNAME from sharing a rule with any record, so this is a property of the whole
+// rule rather than of one answer. See `apply_rewrite`.
+@(private)
+rule_holds_alias :: proc(rule: config.Rewrite) -> bool {
+	for a in rule.answers {
+		if a.kind == .CNAME {
+			return true
+		}
+	}
+	return false
+}
+
 @(private)
 find_rewrite_index :: proc(
 	rules: []config.Rewrite,
