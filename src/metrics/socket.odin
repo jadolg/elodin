@@ -90,12 +90,20 @@ socket_drops :: proc(inodes: []u64, drops: []u64, allocator := context.temp_allo
 	// IPv4 and IPv6 sockets are listed in separate files, and a listener bound
 	// to `::` is in the second. Both are read: a failure to open one is not a
 	// failure to open the other, and the readers are all in one of them.
+	//
+	// Stopping once every reader has been found, because the readers all bind
+	// one endpoint and so are all in one of the two files: reading the other
+	// would parse every UDP socket on the host a second time, per scrape, for
+	// an answer that is already complete.
 	for path in ([]string{"/proc/net/udp", "/proc/net/udp6"}) {
 		text, ok := read_proc_file(path, allocator)
 		if !ok {
 			continue
 		}
 		matched += add_socket_drops(text, inodes, drops)
+		if matched == len(inodes) {
+			return true
+		}
 	}
 	return matched == len(inodes)
 }

@@ -332,10 +332,16 @@ start_udp :: proc(s: ^Server, l: ^Listeners) -> bool {
 		*/
 		socket, got, err := bind_udp_reader(endpoint.address, bound_port, buffer)
 		if err != nil {
-			report_bind_failure("listeners.udp", cfg.address, bound_port, err)
+			// Closed before anything is logged. `sockets` lives in this
+			// thread's temp arena, and the reporting helpers in this file -
+			// `report_refusal`, `report_shed` - reset that arena on their way
+			// out; a line written while descriptors are still only in there
+			// would be one release of `logx` away from closing whatever the
+			// arena handed out next.
 			for open in sockets {
 				net.close(open)
 			}
+			report_bind_failure("listeners.udp", cfg.address, bound_port, err)
 			return false
 		}
 		append(&sockets, socket)
@@ -356,10 +362,12 @@ start_udp :: proc(s: ^Server, l: ^Listeners) -> bool {
 			*/
 			b, berr := net.bound_endpoint(socket)
 			if berr != nil {
-				logx.errorf("listeners.udp: cannot read the port the first reader bound (%v)", berr)
+				// Closed before the line, for the reason the bind failure
+				// above gives.
 				for open in sockets {
 					net.close(open)
 				}
+				logx.errorf("listeners.udp: cannot read the port the first reader bound (%v)", berr)
 				return false
 			}
 			l.udp_bound = b
@@ -393,10 +401,13 @@ start_udp :: proc(s: ^Server, l: ^Listeners) -> bool {
 		l.udp[i].ctx = ctx
 	}
 
+	// The port that was bound rather than the one that was asked for. They are
+	// the same figure everywhere but `port: 0`, where the file names no port at
+	// all and this line is the only place the one the kernel chose is said.
 	logx.infof(
 		"listening for DNS on %s:%d/udp (%s)",
 		cfg.address,
-		cfg.port,
+		l.udp_bound.port,
 		udp_readers_line(len(l.udp), buffer, granted),
 	)
 	return true

@@ -837,6 +837,14 @@ stop applying: the thing deciding whose queries are served is the kernel's queue
 rather than the rate limiter's budget, and no setting in the file can reach it.
 Bounded to one line per five-minute report, and only when the figure has moved,
 so a server that dropped datagrams once at three in the morning says so once.
+
+What the line does not do is name the cause. `sk_drops` is the socket's whole
+count of datagrams the kernel would not deliver, and a full receive queue is the
+usual reason but not the only one - a bad UDP checksum is charged here too. A
+handful over five minutes on a busy interface is corruption on the wire; a
+figure that climbs with the load is the queue. The line says which number moved
+and leaves the reader to tell those apart, rather than sending somebody to raise
+`readers` over a bad cable.
 */
 @(private)
 report_udp_drops :: proc(l: ^server.Listeners, last: ^u64) {
@@ -852,7 +860,7 @@ report_udp_drops :: proc(l: ^server.Listeners, last: ^u64) {
 		return
 	}
 	logx.warnf(
-		"udp: the kernel dropped %d datagrams before any reader could take them (%d since start): more than %d reader(s) can drain. Raise listeners.udp.readers, raise listeners.udp.receive_buffer with net.core.rmem_max to match, or put a packet filter in front of this server",
+		"udp: the kernel dropped %d datagrams before any reader could take them (%d since start, across %d reader(s)). A figure that climbs with the load is more traffic than the readers can drain: raise listeners.udp.readers, raise listeners.udp.receive_buffer with net.core.rmem_max to match, or put a packet filter in front of this server. A few at a time is more likely to be corrupt datagrams, which are counted here too",
 		total - last^,
 		total,
 		len(l.udp),

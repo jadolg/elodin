@@ -1,6 +1,7 @@
 package metrics
 
 import "core:net"
+import "core:os"
 import "core:testing"
 
 /*
@@ -107,6 +108,20 @@ test_a_bound_socket_is_found_by_its_inode :: proc(t: ^testing.T) {
 @(test)
 test_socket_inode_says_nothing_about_what_is_not_a_socket :: proc(t: ^testing.T) {
 	testing.expect_value(t, socket_inode(-1), 0)
-	// 0 is standard input: open, and not a socket.
-	testing.expect_value(t, socket_inode(0), 0)
+
+	/*
+	A descriptor this test opened, rather than one it inherited.
+
+	Standard input would be the obvious open non-socket, and usually is - but
+	whoever started the process decides that, and a runner using socket
+	activation or an inetd-style supervisor hands its child a socket on fd 0.
+	That would fail this case for a reason that has nothing to do with the
+	parser.
+	*/
+	f, err := os.open("/dev/null")
+	if !testing.expectf(t, err == nil, "cannot open /dev/null: %v", err) {
+		return
+	}
+	defer os.close(f)
+	testing.expect_value(t, socket_inode(int(os.fd(f))), 0)
 }
