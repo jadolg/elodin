@@ -8,14 +8,23 @@ import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:logx"
+import "elodin:metrics"
 import "elodin:pool"
 import "elodin:tlsx"
 
 Listeners :: struct {
-	udp_socket:     net.UDP_Socket,
-	// What the UDP socket actually bound, read once: `plausible_source` needs
-	// it for every datagram, and asking the kernel each time is a syscall per
-	// query for an answer that cannot change.
+	/*
+	The UDP readers, one per thread, each with a socket of its own.
+
+	Empty when UDP is off, and one entry long unless `listeners.udp.readers`
+	says otherwise. Allocated once at startup and never resized, because each
+	loop holds a pointer into it for the life of the process.
+	*/
+	udp:            []Udp_Reader,
+	// What the UDP sockets actually bound - one endpoint, since every reader
+	// binds the same one. Read once: `plausible_source` needs it for every
+	// datagram, and asking the kernel each time is a syscall per query for an
+	// answer that cannot change.
 	udp_bound:      net.Endpoint,
 	tcp_socket:     net.TCP_Socket,
 	dot_socket:     net.TCP_Socket,
@@ -24,7 +33,6 @@ Listeners :: struct {
 	// the same lifetime: opened by `start_listeners`, closed by
 	// `stop_listeners`, and its loop joined with the rest.
 	metrics_socket: net.TCP_Socket,
-	udp_open:       bool,
 	tcp_open:       bool,
 	dot_open:       bool,
 	doh_open:       bool,
@@ -54,8 +62,10 @@ Listeners :: struct {
 	timeout allows. A loop that released its own context on the way out would
 	pull the ground from under both. `destroy_listeners` releases them instead,
 	once there is nothing left that could be holding one.
+
+	The UDP loops' contexts are held the same way and in the same place as their
+	sockets, in `udp` above, since there is now one of each per reader.
 	*/
-	udp_loop_ctx:     ^Udp_Context,
 	stream_loop_ctx:  [dynamic]^Stream_Context,
 	metrics_loop_ctx: ^Metrics_Context,
 }
@@ -152,8 +162,8 @@ start_listeners :: proc(s: ^Server, l: ^Listeners) -> bool {
 
 stop_listeners :: proc(l: ^Listeners) {
 	sync.atomic_store(&l.stop, true)
-	if l.udp_open {
-		net.close(l.udp_socket)
+	for reader in l.udp {
+		net.close(reader.socket)
 	}
 	if l.tcp_open {
 		net.close(l.tcp_socket)
@@ -181,10 +191,14 @@ worker pool drains, and it reads the context of the loop that queued it. The
 caller drains the pools between the two.
 */
 destroy_listeners :: proc(l: ^Listeners) {
-	if l.udp_loop_ctx != nil {
-		free(l.udp_loop_ctx)
-		l.udp_loop_ctx = nil
+	for &reader in l.udp {
+		if reader.ctx != nil {
+			free(reader.ctx)
+			reader.ctx = nil
+		}
 	}
+	delete(l.udp)
+	l.udp = nil
 	for ctx in l.stream_loop_ctx {
 		free(ctx)
 	}
@@ -198,10 +212,43 @@ destroy_listeners :: proc(l: ^Listeners) {
 
 // --- UDP ------------------------------------------------------------------
 
+/*
+One reader: a socket, the thread that drains it, and what it has drained.
+
+They exist because everything a datagram costs before the rate limiter sees it
+happens on the thread that read it, so a single reader is one core's worth of
+drain rate for the whole server, and past that rate the kernel drops datagrams
+in the receive queue - where no configuration and no budget can reach them. See
+`listeners.udp.readers`, and the measurement it points at.
+*/
+Udp_Reader :: struct {
+	socket:   net.UDP_Socket,
+	/*
+	This socket's inode, as `/proc/net/udp` names it, or 0 when it could not be
+	read.
+
+	Kept so the drop counter the kernel keeps for this socket can be found
+	again: the file is keyed by inode, and matching on the bound address instead
+	would pick up every other socket on the port - which, with `SO_REUSEPORT`,
+	is precisely the other readers.
+	*/
+	inode:    u64,
+	// Datagrams this reader has taken off its socket, whatever became of them.
+	// Read by the metrics endpoint; incremented by the loop.
+	received: u64,
+	// The context handed to the loop. Released by `destroy_listeners`, not by
+	// the loop, for the reason the field comment on `stream_loop_ctx` gives.
+	ctx:      ^Udp_Context,
+}
+
 @(private)
 Udp_Context :: struct {
 	server:    ^Server,
 	listeners: ^Listeners,
+	// The reader this loop is, in `listeners.udp`. A pointer rather than an
+	// index because the loop touches it per datagram; the slice is allocated
+	// once and never resized, so it stays valid for the life of the process.
+	reader:    ^Udp_Reader,
 }
 
 @(private)
@@ -209,6 +256,11 @@ Udp_Job :: struct {
 	ctx:    ^Udp_Context,
 	data:   []u8,
 	client: net.Endpoint,
+	// The socket the datagram arrived on, which is the one the answer goes back
+	// out of. Every reader's socket is bound to the same address and port, so
+	// any of them would put the same thing on the wire; replying on the one
+	// that received keeps a query's send queue and its receive queue together.
+	socket: net.UDP_Socket,
 }
 
 @(private)
@@ -219,54 +271,233 @@ start_udp :: proc(s: ^Server, l: ^Listeners) -> bool {
 		logx.errorf("listeners.udp: %q is not a valid bind address", cfg.address)
 		return false
 	}
-	socket, err := net.make_bound_udp_socket(endpoint.address, endpoint.port)
-	if err != nil {
-		report_bind_failure("listeners.udp", cfg.address, cfg.port, err)
-		return false
+	// Both guards are for a `Listeners` built by hand rather than loaded from a
+	// file - the tests do that. A loaded configuration has been through
+	// `validate`, which derives the reader count and refuses a receive buffer
+	// outside its bounds, so neither branch is reachable from a running server.
+	readers := max(cfg.readers, 1)
+	buffer := cfg.receive_buffer if cfg.receive_buffer > 0 else config.DEFAULT_UDP_RECEIVE_BUFFER
+
+	/*
+	Bound into a list of their own before `l.udp` exists.
+
+	So that a bind that fails halfway leaves `l.udp` empty rather than half
+	filled: `stop_listeners` closes every socket it finds there, and a reader
+	that was never bound holds a zero, which is descriptor 0 and somebody else's.
+	Nothing is published to the listener until every socket is open.
+	*/
+	sockets := make([dynamic]net.UDP_Socket, 0, readers, context.temp_allocator)
+	granted := 0
+	bound_port := endpoint.port
+	for i in 0 ..< readers {
+		/*
+		The first socket binds what the file asked for and the rest bind what
+		the first got.
+
+		The two differ only when the port is 0, which is an ephemeral bind - what
+		every test uses. Asking the kernel for 0 again would hand each reader a
+		port of its own, which is one listener per reader on ports nobody knows
+		rather than one listener with several readers.
+		*/
+		socket, got, err := bind_udp_reader(endpoint.address, bound_port, buffer)
+		if err != nil {
+			report_bind_failure("listeners.udp", cfg.address, bound_port, err)
+			for open in sockets {
+				net.close(open)
+			}
+			return false
+		}
+		append(&sockets, socket)
+		if i == 0 {
+			granted = got
+			// Read once, from the first socket, and used for the rest: they all
+			// bind the same endpoint, and `plausible_source` asks about the
+			// endpoint rather than about any one socket.
+			if b, berr := net.bound_endpoint(socket); berr == nil {
+				l.udp_bound = b
+				bound_port = b.port
+			}
+		}
+	}
+
+	l.udp = make([]Udp_Reader, len(sockets))
+	for socket, i in sockets {
+		l.udp[i].socket = socket
+		l.udp[i].inode = metrics.socket_inode(int(socket))
+	}
+
+	for i in 0 ..< len(l.udp) {
+		ctx := new(Udp_Context)
+		ctx.server = s
+		ctx.listeners = l
+		ctx.reader = &l.udp[i]
+		if conn_spawn(&l.conns, ctx, udp_loop, counted = false) != .Started {
+			logx.errorf("listeners.udp: cannot start read loop %d of %d", i + 1, len(l.udp))
+			// Nothing was ever handed this one, so it is ours to release. The
+			// loops already started are holding their own, and are left to
+			// `stop_listeners`, which is also what closes the sockets: closing
+			// them here would leave it closing descriptors this process has
+			// already given back. The flag is what those loops come out on,
+			// within one `LISTENER_POLL`.
+			free(ctx)
+			sync.atomic_store(&l.stop, true)
+			return false
+		}
+		l.udp[i].ctx = ctx
+	}
+
+	logx.infof(
+		"listening for DNS on %s:%d/udp (%s)",
+		cfg.address,
+		cfg.port,
+		udp_readers_line(len(l.udp), buffer, granted),
+	)
+	return true
+}
+
+/*
+Bind one reader's socket.
+
+`SO_REUSEPORT` before the bind, because it is what lets the second and later
+readers bind a port the first already has: the kernel then gives each socket its
+own receive queue and picks between them by a hash of the datagram's 4-tuple.
+It is set even for a single reader, so that the socket a lone reader binds is
+the same socket the first of several would bind, rather than a case that only
+the default configuration exercises.
+
+What that opens is bounded by the kernel: Linux requires every socket sharing a
+port to have been bound by the same effective uid, so a share of this server's
+datagrams is available to whoever can already run as this server's user - who
+could read the answers off the wire in any case.
+
+`net.set_option` cannot set either of the two options here - it knows the name
+`Reuse_Port` but refuses it, and `Receive_Buffer_Size` it does set without
+saying what the kernel granted - so both go through `setsockopt` directly.
+*/
+@(private)
+bind_udp_reader :: proc(
+	address: net.Address,
+	port: int,
+	buffer: int,
+) -> (
+	socket: net.UDP_Socket,
+	granted: int,
+	err: net.Network_Error,
+) {
+	socket = net.make_unbound_udp_socket(net.family_from_address(address)) or_return
+	if !set_reuse_port(socket) {
+		net.close(socket)
+		// Not a bind error, but reported as one: the operator sees it beside
+		// the address it was for, and the socket is no more usable than one
+		// whose bind failed.
+		return {}, 0, net.Bind_Error.Unknown
 	}
 	// A large receive buffer absorbs query bursts that arrive while every
-	// worker is busy.
-	_ = net.set_option(socket, .Receive_Buffer_Size, 1 << 20)
-	// So the read loop below wakes up now and then and can see `stop`.
+	// worker is busy. What the kernel actually granted is reported at startup:
+	// it clamps this to `net.core.rmem_max`, which is 208 KiB by default.
+	granted = set_receive_buffer(socket, buffer)
+	// So the read loop wakes up now and then and can see `stop`.
 	_ = net.set_option(socket, .Receive_Timeout, LISTENER_POLL)
-
-	l.udp_socket = socket
-	l.udp_open = true
-	if bound, berr := net.bound_endpoint(socket); berr == nil {
-		l.udp_bound = bound
+	if berr := net.bind(socket, {address, port}); berr != nil {
+		net.close(socket)
+		return {}, 0, berr
 	}
+	return socket, granted, nil
+}
 
-	ctx := new(Udp_Context)
-	ctx.server = s
-	ctx.listeners = l
-	if conn_spawn(&l.conns, ctx, udp_loop, counted = false) != .Started {
-		logx.errorf("listeners.udp: cannot start the read loop")
-		// Nothing was ever handed it, so it is ours to release.
-		free(ctx)
-		return false
+/*
+Datagrams the kernel dropped on the readers' receive queues, added up.
+
+`false` is "cannot be measured here" and not "none": see `metrics.socket_drops`,
+which is where the counter comes from and where the difference is argued out.
+The metrics endpoint publishes the per-reader figures instead, since which
+reader is dropping says whether one client is flooding one 4-tuple or the
+listener as a whole is behind.
+*/
+udp_receive_drops :: proc(l: ^Listeners) -> (total: u64, ok: bool) {
+	if len(l.udp) == 0 {
+		return 0, false
 	}
-	l.udp_loop_ctx = ctx
-	logx.infof("listening for DNS on %s:%d/udp", cfg.address, cfg.port)
-	return true
+	drops := make([]u64, len(l.udp), context.temp_allocator)
+	inodes := make([]u64, len(l.udp), context.temp_allocator)
+	for reader, i in l.udp {
+		inodes[i] = reader.inode
+	}
+	if !metrics.socket_drops(inodes, drops) {
+		return 0, false
+	}
+	for n in drops {
+		total += n
+	}
+	return total, true
+}
+
+/*
+What the readers add up to, in one line.
+
+Written once and used twice, so that startup and `--check` cannot come to
+different views of the same configuration - the same reason
+`connection_limits_line` exists.
+
+The granted receive buffer is said rather than the requested one, and both when
+they differ, because the difference is a sysctl an operator has not set: asking
+for a megabyte and being given 208 KiB is the ordinary case on an untuned Linux,
+and a server that reported only what it asked for would be describing a burst
+tolerance it does not have. `granted` is 0 where there is no socket to ask -
+`--check`, which parses a file and binds nothing - and the line then says what
+was asked for and does not claim it was given.
+*/
+udp_readers_line :: proc(readers, asked, granted: int) -> string {
+	// "1 reader" rather than "1 readers", which is the single-core machine and
+	// the configuration everything had before this setting existed - so it is
+	// the wording most installations will read.
+	count := "1 reader" if readers == 1 else fmt.tprintf("%d readers", readers)
+	if granted <= 0 {
+		return fmt.tprintf("%s, asking for %.0M of receive buffer each", count, asked)
+	}
+	if granted < asked {
+		return fmt.tprintf(
+			"%s, %.0M of receive buffer each of the %.0M asked for; net.core.rmem_max is the ceiling",
+			count,
+			granted,
+			asked,
+		)
+	}
+	return fmt.tprintf("%s, %.0M of receive buffer each", count, granted)
 }
 
 @(private)
 udp_loop :: proc(data: rawptr) {
 	ctx := cast(^Udp_Context)data
 	l := ctx.listeners
+	// This loop's own socket and its own buffer. Neither is shared with the
+	// other readers: that is the whole of what having several of them buys.
+	socket := ctx.reader.socket
 	buf := make([]u8, 65535)
 	defer delete(buf)
 
 	// Labelled for the submit below, whose `break` would otherwise leave only
 	// the switch it sits in.
 	loop: for !sync.atomic_load(&l.stop) {
-		n, client, err := net.recv_udp(l.udp_socket, buf)
+		n, client, err := net.recv_udp(socket, buf)
 		if err != nil {
 			if sync.atomic_load(&l.stop) {
 				break
 			}
 			continue
 		}
+		/*
+		Counted here, before anything can turn the datagram away.
+
+		It is what says whether the readers are sharing the load: the kernel
+		picks between them by a hash of the 4-tuple, so a flood from one source
+		port lands entirely on one reader while ordinary traffic spreads. An
+		operator watching one reader's count climb while the others sit still is
+		looking at that, and no other counter in this process can show it -
+		everything else is charged after the datagram has been read, by whichever
+		thread read it.
+		*/
+		sync.atomic_add(&ctx.reader.received, 1)
 		if n < dns.HEADER_SIZE {
 			continue
 		}
@@ -313,7 +544,7 @@ udp_loop :: proc(data: rawptr) {
 		case .Allow:
 		case .Truncate:
 			if tc, built := dns.truncated_response(buf[:n], context.temp_allocator); built {
-				_, _ = net.send_udp(l.udp_socket, tc, client)
+				_, _ = net.send_udp(socket, tc, client)
 			}
 			free_all(context.temp_allocator)
 			continue
@@ -341,6 +572,7 @@ udp_loop :: proc(data: rawptr) {
 		job := new(Udp_Job)
 		job.ctx = ctx
 		job.client = client
+		job.socket = socket
 		job.data = make([]u8, n)
 		copy(job.data, buf[:n])
 
@@ -810,7 +1042,7 @@ udp_job :: proc(data: rawptr) {
 	if !ok || len(response) == 0 {
 		return
 	}
-	_, _ = net.send_udp(job.ctx.listeners.udp_socket, response, job.client)
+	_, _ = net.send_udp(job.socket, response, job.client)
 }
 
 // --- TCP and DoT ----------------------------------------------------------

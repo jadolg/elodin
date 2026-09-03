@@ -875,10 +875,10 @@ test_implausible_sources_are_refused :: proc(t: ^testing.T) {
 		testing.expectf(t, false, "cannot read the bound port: %v", berr)
 		return
 	}
+	// `plausible_source` reads the bound endpoint and nothing else, so the
+	// socket is here only to have bound a port that no other test can hold.
 	l := Listeners {
-		udp_socket = socket,
-		udp_bound  = bound,
-		udp_open   = true,
+		udp_bound = bound,
 	}
 
 	Case :: struct {
@@ -928,7 +928,6 @@ test_mapped_loopback_on_our_own_port_is_not_a_client :: proc(t: ^testing.T) {
 	PORT :: 5353
 	l := Listeners {
 		udp_bound = net.Endpoint{address = net.IP6_Any, port = PORT},
-		udp_open  = true,
 	}
 
 	Case :: struct {
@@ -993,11 +992,9 @@ test_the_bound_address_is_recognised_through_the_v4_mapping :: proc(t: ^testing.
 
 	mapped_bind := Listeners {
 		udp_bound = mapped(192, 0, 2, 53, PORT),
-		udp_open  = true,
 	}
 	v4_bind := Listeners {
 		udp_bound = v4(192, 0, 2, 53, PORT),
-		udp_open  = true,
 	}
 
 	testing.expectf(
