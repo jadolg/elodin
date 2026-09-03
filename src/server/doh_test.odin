@@ -698,6 +698,118 @@ test_doh_keeps_the_connection_after_a_429 :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+/*
+A refusal keeps the connection, but not one the client asked to have closed.
+
+`Connection: close` is the client saying it wants no second request on this
+socket, and the 429 carries the client's own `keep_alive` rather than an opinion
+of its own - so the one refusal that still ends a connection is the one whose
+client asked for it. RFC 9112 9.6: a recipient that reads the field sends no
+further requests on that connection, and answering it `keep-alive` would leave
+this end waiting out `client_timeout` for a request that is never coming.
+
+The client here does not shut its send side down, so a handler that ignored the
+field and went back to reading would sit on the receive timeout below rather than
+return; that is the regression this measures, and why the wait is timed. Nothing
+is drained on the way out: the request was read in full, body included, so a
+client that meant the field it sent left nothing in the receive queue for the
+close to turn into an RST.
+*/
+@(test)
+test_doh_429_honours_connection_close :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the bound port: %v", berr)
+		return
+	}
+
+	client, derr := net.dial_tcp_from_endpoint(bound)
+	if derr != nil {
+		testing.expectf(t, false, "cannot dial the listener: %v", derr)
+		return
+	}
+	defer net.close(client)
+
+	body := strings.builder_make(context.temp_allocator)
+	strings.write_string(&body, "POST /dns-query HTTP/1.1\r\nHost: dns.example\r\nConnection: close\r\n")
+	strings.write_string(&body, "Content-Type: application/dns-message\r\nContent-Length: ")
+	strings.write_int(&body, dns.HEADER_SIZE)
+	strings.write_string(&body, "\r\n\r\n")
+	for _ in 0 ..< dns.HEADER_SIZE {
+		strings.write_byte(&body, 0)
+	}
+	if !send_all(t, client, strings.to_string(body)) {
+		return
+	}
+
+	accepted, _, aerr := net.accept_tcp(listener)
+	if aerr != nil {
+		testing.expectf(t, false, "nothing connected: %v", aerr)
+		return
+	}
+	defer net.close(accepted)
+	// Longer than the handler should take, so a regression that reads on shows up
+	// as a slow `serve_doh` rather than as a read that gave up on the request.
+	_ = net.set_option(accepted, .Receive_Timeout, 2 * time.Second)
+
+	cfg := config.default_config()
+	cfg.listeners.doh.path = "/dns-query"
+	s := Server {
+		cfg = &cfg,
+	}
+	s.limiter = make_rate_limiter(1, 2)
+	defer destroy_rate_limiter(s.limiter)
+
+	peer := net.Endpoint {
+		address = net.IP4_Loopback,
+		port    = 40003,
+	}
+	for _ in 0 ..< RRL_BURST_SECONDS {
+		testing.expect(
+			t,
+			stream_rate_check(s.limiter, peer, time.tick_now()),
+			"the stream budget refused a query it had room for",
+		)
+	}
+
+	start := time.tick_now()
+	serve_doh(&s, Conn{socket = accepted, peer = peer}, "test")
+	spent := time.tick_since(start)
+
+	testing.expectf(
+		t,
+		spent < time.Second,
+		"the refusal took %v, which is the handler reading on past a `Connection: close`",
+		spent,
+	)
+
+	_ = net.set_option(client, .Receive_Timeout, 500 * time.Millisecond)
+	answer := strings.builder_make(context.temp_allocator)
+	for {
+		chunk: [4096]u8
+		n, rerr := net.recv_tcp(client, chunk[:])
+		if rerr != nil || n <= 0 {
+			break
+		}
+		strings.write_bytes(&answer, chunk[:n])
+	}
+
+	head := strings.to_string(answer)
+	testing.expect(t, strings.contains(head, "HTTP/1.1 429"), "an over-budget query was not answered 429")
+	testing.expect(
+		t,
+		strings.contains(head, "Connection: close"),
+		"the refusal answered keep-alive to a client that asked for a close",
+	)
+	free_all(context.temp_allocator)
+}
+
 @(private = "file")
 send_all :: proc(t: ^testing.T, socket: net.TCP_Socket, raw: string) -> bool {
 	sent := 0

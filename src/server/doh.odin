@@ -34,7 +34,7 @@ limit plus the largest body it accepts - so draining one costs no more than
 serving one would have.
 
 The idle wait applies per read. `HTTP_LINGER_BODY_IDLE` is what every drain here
-passes, because every refusal that closes is one `read_http_request` handed back,
+passes, because every refusal that drains is one `read_http_request` handed back,
 decided on the request line or on a repeated `Host` - before the body those
 headers declared has been read. What is unread there is not something the client
 has already put on the wire but a body still on its way, and over any distance
@@ -50,8 +50,9 @@ is why it is a quarter of a second rather than a second, that being the bound
 Passed by the caller rather than defaulted, though there is one value to pass, so
 that a path added later has to answer where its unread bytes are rather than
 inherit an answer. The 429 in `serve_doh_request` is the path that used to have
-the other one, and it drains nothing now: it keeps the connection, so there is no
-close for a drain to protect.
+the other one, and it drains nothing now: it keeps the connection, and where the
+client asked for `Connection: close` the request it refused was read in full, so
+neither case leaves the close anything to trip over.
 
 The deadline bounds the drain as a whole, which the idle wait alone does not. A
 client sending a byte inside every wait stays inside all of them for as long as it
@@ -575,9 +576,13 @@ serve_doh_request :: proc(s: ^Server, conn: Conn, req: Http_Request_In, path: st
 
 	Nothing is drained here for the same reason nothing is drained after an answer:
 	the drain exists to keep a close from turning into an RST that discards the
-	status along with it (see `http_linger`), and there is no close. What a
-	pipelining client sent ahead is the next request, which is read and refused in
-	its turn.
+	status along with it (see `http_linger`), and on a kept connection there is no
+	close. What a pipelining client sent ahead is the next request, which is read
+	and refused in its turn. The one close left on this path is the client's own -
+	an HTTP/1.0 request, or one carrying `Connection: close` - and that one needs no
+	drain either: the request was read in full, body and all, so a client that meant
+	the field it sent has nothing left in the receive queue for the close to trip
+	over.
 
 	Nor is the connection ended after some count of refusals. A client that ignores
 	429 indefinitely is not worth serving, but disconnecting it is not what stops it
@@ -587,7 +592,7 @@ serve_doh_request :: proc(s: ^Server, conn: Conn, req: Http_Request_In, path: st
 	flooder occupies the same one slot either way.
 	*/
 	if !stream_rate_check(s.limiter, conn.peer, time.tick_now()) {
-		report_rate_limited(client, .DoH, false)
+		report_rate_limited(client, .DoH, !req.keep_alive)
 		return send_http_error(conn, "doh", 429, "too many requests", req.keep_alive)
 	}
 

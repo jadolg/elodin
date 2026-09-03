@@ -517,17 +517,10 @@ the caller says which it was rather than the line assuming.
 */
 @(private)
 report_rate_limited :: proc(client: string, proto: Protocol, closing: bool) {
-	if closing {
-		logx.debugf(
-			"%s: closing the connection from %s, its prefix is over server.rate_limit.responses_per_second",
-			proto_name(proto),
-			client,
-		)
-		return
-	}
 	logx.debugf(
-		"%s: refusing a query from %s, its prefix is over server.rate_limit.responses_per_second",
+		"%s: %s from %s, its prefix is over server.rate_limit.responses_per_second",
 		proto_name(proto),
+		"closing the connection" if closing else "refusing a query",
 		client,
 	)
 }
