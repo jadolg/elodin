@@ -10,6 +10,14 @@ read-side limit appears at whatever packet rate saturates one core, which here
 is around two million a second. Everything the arms are compared on is a ratio
 between two arms on the same machine.
 
+**The slip figures here are of the version measured, not of the current one.**
+What this run found — that the truncated answers were charged to no budget, so
+their number was a fraction of the arrival rate — was taken up as issue #232 and
+fixed by giving them a pool of their own.
+`2026-09-03-slip-budget.md` re-runs the two arm groups that measure it: 18.97
+MB/s at the named address became 0.54, and the unrelated bystander's 55% became
+99%. Every other figure below still stands.
+
 The question neither test layer answers. `src/server/ratelimit.odin` argues that
 a budget per destination prefix bounds what one address can be made to receive,
 and `src/itest/cases_ratelimit.odin` asserts the mechanism: a flood is cut to the

@@ -147,9 +147,43 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 			)
 			check(r, full > 0, "the budget answered nothing at all")
 
-			// Every second query over the budget comes back truncated, which is
-			// what lets a real client behind a busy NAT retry over TCP.
+			// Some of what is over the budget comes back truncated, which is what
+			// lets a real client behind a busy NAT retry over TCP. How many is the
+			// block below: the spacing says which datagrams may be, and the slip's
+			// own pool says how many of those are.
 			check(r, res.truncated > 0, "nothing came back truncated, so a legitimate client would just stall")
+
+			/*
+			At most every second, and bounded by a budget rather than by the size
+			of the flood: the truncated answers come out of a pool of their own at
+			an eighth of the rate (`RRL_SLIP_SHARE`), so this flood of ten times
+			the budget draws a handful of them and not the eighty-odd that one per
+			two over-limit datagrams would be. That is the whole of what makes
+			`responses_per_second` a description of what this server emits - see
+			`bench/results/2026-09-03-rate-limit-bystander.md` for what it emitted
+			without it.
+
+			The ceiling is over-allowed on purpose: the pool's burst plus twice
+			what the drain can refill, so the case fails on the uncharged
+			behaviour and not on how long a loaded machine took to read its
+			answers.
+
+			The eighth and its floor of one are spelled out here rather than
+			read from `RRL_SLIP_SHARE`, which is private to the server package.
+			The floor matters: without it a `RATE` below eight would compute a
+			ceiling of zero, which no run can be under and the check above
+			demands be exceeded.
+			*/
+			SLIP_RATE :: max(RATE / 8, 1)
+			slip_ceiling := SLIP_RATE * 2 + SLIP_RATE * 4
+			check(
+				r,
+				res.truncated <= slip_ceiling,
+				"%d of %d queries came back truncated, past the %d the slip's own budget allows",
+				res.truncated,
+				QUERIES,
+				slip_ceiling,
+			)
 			check(
 				r,
 				res.answered < QUERIES,

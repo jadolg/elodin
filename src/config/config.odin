@@ -535,10 +535,11 @@ Response rate limiting.
 
 `responses_per_second` is per client prefix - /24 for IPv4, /64 for IPv6 -
 because an attacker spoofing a victim's address picks freely within their range,
-so a per-address budget would only be spread across it. `slip` answers every Nth
-query over the budget with a truncated response rather than dropping it, which
-tells a real client to come back over TCP where the handshake proves the address
-an answer would go to; 0 drops them all.
+so a per-address budget would only be spread across it. `slip` answers at most
+every Nth query over the budget with a truncated response rather than dropping
+it, which tells a real client to come back over TCP where the handshake proves
+the address an answer would go to; 0 drops them all. At most, because those
+answers have a budget of their own - see below.
 
 The figure is charged twice over, not once: each prefix gets it for datagrams and
 again for queries read off a connection, and neither budget can be spent from the
@@ -552,6 +553,16 @@ asking both ways can draw twice the figure.
 TCP, so it has nothing to say to a client that is already on a connection.
 Over-budget queries end a TCP or DoT connection instead; DoH answers 429 and keeps
 it, a refusal that costs a TLS handshake being dearer than the answer it withheld.
+
+The truncated answers have a budget too, an eighth of the figure below and at least
+one a second, so `slip` is "at most one in N" and not "one in N of whatever
+arrives". Without it their number was a fraction of the attack rate with no ceiling
+in it - a flood of two million datagrams a second had this server send half a
+million truncated answers a second at the address it named, on a configuration that
+says 500 - and each of those writes came off the thread reading the UDP socket, at
+the expense of every other client's queries. An eighth, rather than the whole
+figure, because a truncated answer is an invitation and not an answer: a client that
+takes it moves onto a connection, whose budget a datagram flood cannot empty.
 
 What this does not bound is how much of the server one client occupies. Both budgets
 are spent by *queries*, so a client that opens connections and asks nothing on them
@@ -757,7 +768,9 @@ default_config :: proc() -> Config {
 		or an office behind one NAT asks for - the busiest of those is a few
 		dozen - and far under what makes reflection worth an attacker's
 		bandwidth. Every second query past it comes back truncated rather than
-		dropped, so a client that really is that busy keeps resolving, over TCP.
+		dropped - up to the 62 a second those answers have a budget of their
+		own for - so a client that really is that busy keeps resolving, over
+		TCP.
 		*/
 		rate_limit                 = Rate_Limit_Config{enabled = true, responses_per_second = 500, slip = 2},
 	}

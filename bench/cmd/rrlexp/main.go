@@ -637,13 +637,17 @@ func volumeArms() []arm {
 				The same two floods against `slip: 0`, which is the other half of
 				the trade-off the default makes.
 
-				`slip: 2` answers every second over-budget datagram with a 40-byte
-				truncated reply, and those replies are the bulk of what an
-				over-limit flood draws: they scale with the attack rather than with
-				the budget. Turning the slip off drops the flood in silence, so what
-				reaches the named address is the budget and nothing else - at the
-				cost of the invitation a real client behind a busy NAT depends on,
-				which the same-prefix row is here to show going away.
+				`slip: 2` answers at most every second over-budget datagram with a
+				40-byte truncated reply, and those replies are charged to a pool of
+				their own - an eighth of `responses_per_second` - so their number is
+				the pool's rather than a fraction of the arrival rate. Comparing the
+				two rows is what says so: they now sit within 0.01 MB/s of each
+				other. Before that pool existed, the truncated replies were the bulk
+				of what an over-limit flood drew and scaled with the attack, which
+				is what these two rows measured 33x apart. Turning the slip off
+				still drops the flood in silence, at the cost of the invitation a
+				real client behind a busy NAT depends on, which the same-prefix row
+				is here to show going away.
 			*/
 			name:     "cached-flood/slip-0",
 			question: "what the reflected volume becomes with the slip turned off",

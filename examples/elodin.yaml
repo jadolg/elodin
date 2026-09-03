@@ -114,10 +114,21 @@ server:
   # A UDP answer goes wherever the source address said, so a resolver that
   # answers everything is an amplifier: a small spoofed query buys the sender a
   # large response aimed at somebody else. The budget bounds what any one
-  # address can be made to receive. Every `slip`th query over it is answered
-  # with a truncated response rather than dropped, which tells a real client to
-  # come back over TCP, where the handshake proves the address; 0 drops them
-  # all.
+  # address can be made to receive. At most every `slip`th query over it is
+  # answered with a truncated response rather than dropped, which tells a real
+  # client to come back over TCP, where the handshake proves the address; 0
+  # drops them all.
+  #
+  # Those truncated answers have a budget of their own - an eighth of the figure
+  # below, at least one a second - so `slip` means at most one in N and not one
+  # in N of however much arrives. Uncharged, their number was a fraction of the
+  # attack rate with nothing capping it: a flood of two million datagrams a
+  # second had this server send half a million truncated answers a second at the
+  # address the flood named, and each of those writes came off the thread reading
+  # the UDP socket, at every other client's expense. An eighth rather than the
+  # whole figure because a truncated answer is an invitation, not an answer: a
+  # client that takes it moves to a connection, whose budget a datagram flood
+  # cannot empty, so it needs far fewer of them than it would need answers.
   #
   # TCP, DoT and DoH are charged too, for the work behind an answer rather than
   # for amplification: they pipeline, so one connection carries queries as fast as
