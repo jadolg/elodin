@@ -20,6 +20,10 @@ import (
 // the readers.
 func runClient(s *server, c clientSpec, dur time.Duration, tag string, track bool, st *stats) func() {
 	switch {
+	case c.handshake:
+		// Against the listener the ALPN belongs to, since what a handshake
+		// flood chooses is which of the two TLS listeners it costs.
+		return runHandshakeFlood(handshakeAddr(s, c), s.certPath, c, dur, st)
 	case c.idle:
 		return runIdle(s.tcpAddr, c, dur, st)
 	case c.redial:
@@ -28,11 +32,22 @@ func runClient(s *server, c clientSpec, dur time.Duration, tag string, track boo
 	switch c.transport {
 	case "tcp":
 		return runTCP(s.tcpAddr, c, dur, tag, track, st)
+	case "dot":
+		return runDoT(s.dotAddr, s.certPath, c, dur, tag, track, st)
 	case "doh1", "doh2":
 		return runDoH(s.dohAddr, s.certPath, c, dur, tag, track, st)
 	default:
 		return runUDP(s.udpAddr, c, dur, tag, track, st)
 	}
+}
+
+// handshakeAddr is where a handshake flood dials: the DoT listener, or the DoH
+// one when the flood is offering an HTTP ALPN.
+func handshakeAddr(s *server, c clientSpec) string {
+	if isDoH(c) {
+		return s.dohAddr
+	}
+	return s.dotAddr
 }
 
 /*
@@ -186,6 +201,27 @@ func udpWriter(conn *net.UDPConn, c clientSpec, dur time.Duration, tag string, i
 }
 
 func runTCP(dst string, c clientSpec, dur time.Duration, tag string, track bool, st *stats) func() {
+	return runStream(func() (net.Conn, error) { return dialTCP(dst, c.src) }, c, dur, tag, track, st)
+}
+
+/*
+runStream is the client both stream transports are: `sockets` connections, each
+with a writer pipelining queries and a reader counting what comes back.
+
+`dial` is the only difference between TCP and DoT - one of them handshakes
+first - and it is a parameter rather than two copies of this so the pair cannot
+drift into counting differently. Several results are read as a TCP row against a
+DoT one.
+
+A connection this client could not get is counted and passed over rather than
+fatal, and only a client that got none at all stops the run. The arms this
+matters in are the handshake floods: the victim there dials into a server being
+made to handshake as fast as it can, so a refused or timed-out connection is a
+thing the arm is measuring - and one of them ending the process would take the
+report for every arm already run with it. A client that could open nothing has
+measured nothing, and that is worth stopping for.
+*/
+func runStream(dial func() (net.Conn, error), c clientSpec, dur time.Duration, tag string, track bool, st *stats) func() {
 	var conns []net.Conn
 	var wg sync.WaitGroup
 	// Closed by the stop function, so a reader can tell the harness ending the
@@ -193,9 +229,10 @@ func runTCP(dst string, c clientSpec, dur time.Duration, tag string, track bool,
 	stopped := make(chan struct{})
 
 	for i := 0; i < c.sockets; i++ {
-		conn, err := dialTCP(dst, c.src)
+		conn, err := dial()
 		if err != nil {
-			fatal(fmt.Errorf("tcp from %s: %w", c.src, err))
+			st.failed.Add(1)
+			continue
 		}
 		conns = append(conns, conn)
 		t := newTracker(track)
@@ -209,6 +246,10 @@ func runTCP(dst string, c clientSpec, dur time.Duration, tag string, track bool,
 			defer wg.Done()
 			tcpWriter(conn, c, dur, tag, idx, st, t)
 		}(i)
+	}
+	if len(conns) == 0 {
+		fatal(fmt.Errorf("%s from %s: not one of %d connections could be opened",
+			c.transport, c.src, c.sockets))
 	}
 
 	return func() {

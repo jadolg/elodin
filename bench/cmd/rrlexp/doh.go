@@ -3,8 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
@@ -85,13 +83,13 @@ thing to explain away in a security scan. `ServerName` is the SAN `makeCert`
 writes, since the connection is made to an address rather than a name.
 */
 func newDoHClient(addr, certPath string, c clientSpec, tag string, track bool, st *stats) (*dohClient, error) {
-	pem, err := os.ReadFile(certPath)
-	if err != nil {
-		return nil, fmt.Errorf("reading the arm's certificate: %w", err)
+	alpn := "h2"
+	if c.transport == "doh1" {
+		alpn = "http/1.1"
 	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		return nil, fmt.Errorf("%s holds no certificate", certPath)
+	tlsCfg, err := tlsConfig(certPath, alpn)
+	if err != nil {
+		return nil, err
 	}
 
 	dials := &counter{}
@@ -100,11 +98,6 @@ func newDoHClient(addr, certPath string, c clientSpec, tag string, track bool, s
 		// the queries are charged to.
 		LocalAddr: &net.TCPAddr{IP: net.ParseIP(c.src)},
 		Timeout:   5 * time.Second,
-	}
-	tlsCfg := &tls.Config{
-		RootCAs:    pool,
-		ServerName: "localhost",
-		MinVersion: tls.VersionTLS12,
 	}
 	tr := &http.Transport{
 		TLSClientConfig:     tlsCfg,
@@ -115,13 +108,7 @@ func newDoHClient(addr, certPath string, c clientSpec, tag string, track bool, s
 			return dialer.DialContext(ctx, network, addr)
 		},
 	}
-	if c.transport == "doh1" {
-		tlsCfg.NextProtos = []string{"http/1.1"}
-		tr.ForceAttemptHTTP2 = false
-	} else {
-		tlsCfg.NextProtos = []string{"h2"}
-		tr.ForceAttemptHTTP2 = true
-	}
+	tr.ForceAttemptHTTP2 = c.transport != "doh1"
 
 	return &dohClient{
 		http:  &http.Client{Transport: tr, Timeout: 20 * time.Second},
@@ -292,7 +279,10 @@ func makeCert(dir string) (certPath, keyPath string, err error) {
 	args := append(strings.Fields("req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes"),
 		"-keyout", keyPath, "-out", certPath,
 		"-days", "30", "-subj", "/CN=elodin.rrlexp",
-		"-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1")
+		// Both loopback addresses, so an arm on either family can be served
+		// this certificate; the clients pass ServerName "localhost" and verify
+		// it either way. See `tlsConfig`.
+		"-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1")
 	cmd := exec.Command("openssl", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return "", "", fmt.Errorf("openssl: %w: %s", err, out)

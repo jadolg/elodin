@@ -96,6 +96,63 @@ Rows that depend on the server doing a particular thing assert it: the blocked
 row fails unless the answers are NXDOMAIN, so a rule that stopped matching shows
 up as a failed run rather than as a number that quietly measures forwarding.
 
+## The rate-limiting experiment
+
+`cmd/rrlexp` is a separate thing from the matrix above, and not part of `mise run
+bench`. Every arm runs two clients against one server at once — a flood and a
+victim asking at a household rate — and reports what the *victim* got, which is
+the question the response limiter's own tests cannot answer from one client at a
+time. `cmd/rrlexp/main.go` opens with what each group of arms claims.
+
+```sh
+mise run release
+cd bench
+go run ./cmd/rrlexp -out results/$(date +%F)-rate-limit.md    # about six minutes
+go run ./cmd/rrlexp -only handshake-flood                     # one group
+```
+
+Four things a publicly reachable instance meets are arms of their own:
+
+| `-only` | what it asks |
+|---|---|
+| `slowloris` | one prefix holding the connection table idle, with and without a share of it |
+| `handshake-flood` | a client that only handshakes, over DoT and DoH, against a DoT victim, with its own quiet baseline |
+| `v6/` | the prefix-isolation arms over IPv6, where a prefix is a /64 |
+| `-soak 1h` | one flood for an hour, with the server read throughout rather than at the end |
+
+### IPv6
+
+The IPv4 arms help themselves to addresses out of 127.0.0.0/8, which is local in
+its entirety on Linux. IPv6 has one loopback address and no equivalent range, so
+sending from two /64s at once takes three addresses this harness cannot create:
+
+```sh
+sudo ip -6 addr add fd00:1::2/128 dev lo   # the flood
+sudo ip -6 addr add fd00:1::3/128 dev lo   # a victim in its /64
+sudo ip -6 addr add fd00:2::1/128 dev lo   # a victim in another /64
+```
+
+ULAs on `lo`, so the arms stay as local as the IPv4 ones, and inside `fc00::/7`,
+which `server.allow_from` allows by default the way it allows loopback. Without
+them the `v6/` arms are skipped — named in the run and in the report, with the
+command above, rather than quietly left out. `ip -6 addr del` the same three to
+put the machine back.
+
+### The soak
+
+```sh
+go run ./cmd/rrlexp -soak 1h -soak-sample 1m -out results/$(date +%F)-soak.md
+```
+
+`-soak` is a mode rather than an arm: it runs the soak arm alone, since an hour
+of load behind six minutes of unrelated arms is six minutes of waiting to find
+out whether the harness got as far as starting it. The report gains a row per
+sample — resident memory, threads, descriptors, cache entries, connections being
+served, and the victim's answer rate over that window rather than averaged over
+the hour. An arm that stopped answering for its last ten minutes has the same
+average as one that behaved throughout, which is the whole reason the mode
+exists.
+
 ## The DNSSEC survey
 
 ```sh

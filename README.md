@@ -1460,6 +1460,20 @@ transports, orders of magnitude more CPU than answering on an established
 connection, and ECDSA P-256 costs about half what RSA-2048 does — which is why
 `mise run certs` generates ECDSA, and why you should use it in production too.
 
+**Nothing here bounds how often a client may ask for a handshake.** A response
+budget is spent by answers and the connection share by connections *held*, so a
+client that connects, handshakes and hangs up spends neither.
+`bench/results/2026-09-03-handshake-floods.md` measures one: 7,000 handshakes a
+second out of a 4-core machine, 205 µs of CPU each, 1.4 cores in total, with
+`conn_refused` at zero throughout because the shipped table was never reached. A
+DoT client already running its one connection at capacity lost 16 points of its
+answer rate and six times its latency; a client arriving during it was served
+every query. Tightening `max_connections_per_prefix` bounds the cost — a share of
+half a table cut the handshake rate by a third in that report — but it cannot be
+made into a limit on *arrivals* without limiting legitimate reconnection too. If
+you expose DoT or DoH to the internet, rate-limit connections per source in front
+of the resolver.
+
 Past `max_connections`, or past one client's share of it, DoT and DoH refuse
 cleanly during the handshake. Plain TCP cannot: the kernel completes the
 handshake from the listen backlog before the server sees it, so a refused client
@@ -1493,6 +1507,12 @@ size of the lists.
   `server.max_connections_per_prefix`. That suits clients that hold a connection
   open and pipeline over it, not tens of thousands of concurrent connections. UDP
   is the exception: one reader thread and no per-client state.
+- **No setting bounds the rate of TLS handshakes.** Both per-client bounds are
+  spent by something a handshake flood does not do — asking questions, or holding
+  a connection — so a client that only connects and hangs up is charged for
+  nothing while costing about 205 µs of CPU per handshake. Measured in
+  `bench/results/2026-09-03-handshake-floods.md`; see [Sizing](#sizing) for what
+  to do about it.
 - **Upstream I/O is synchronous**, so concurrency is bounded by thread count
   rather than by in-flight queries. The h2 upstream client multiplexes onto one
   connection, but a worker is still held for the round trip. Async upstream I/O,
