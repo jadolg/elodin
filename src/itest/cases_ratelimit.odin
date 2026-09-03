@@ -147,8 +147,10 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 			)
 			check(r, full > 0, "the budget answered nothing at all")
 
-			// Every second query over the budget comes back truncated, which is
-			// what lets a real client behind a busy NAT retry over TCP.
+			// Some of what is over the budget comes back truncated, which is what
+			// lets a real client behind a busy NAT retry over TCP. How many is the
+			// block below: the spacing says which datagrams may be, and the slip's
+			// own pool says how many of those are.
 			check(r, res.truncated > 0, "nothing came back truncated, so a legitimate client would just stall")
 
 			/*
