@@ -101,6 +101,42 @@ Sizing :: struct {
 	machine:                  Machine,
 	derived_workers:          bool,
 	derived_upstream_workers: bool,
+	derived_udp_readers:      bool,
+}
+
+/*
+The most UDP readers the machine will be taken to want, and the fewest.
+
+Readers are sized by parallelism rather than by load, which is the opposite of
+the worker counts above: a reader spends its time in `recvfrom` and in hashing
+the source prefix, so it is on a core rather than parked on an upstream, and one
+past the core count adds contention rather than drain rate. Hence one per usable
+CPU rather than a multiple of it.
+
+Eight is where the derivation stops. A reader drains on the order of a million
+datagrams a second on the hardware this was measured on, so eight is past what a
+10 GbE link delivers in query-sized packets, and the next bound past that is the
+worker pool rather than the socket. An operator on larger hardware can name a
+figure; nothing here refuses one up to `MAX_UDP_READERS`.
+*/
+MIN_DERIVED_UDP_READERS :: 1
+MAX_DERIVED_UDP_READERS :: 8
+
+/*
+Readers for a machine.
+
+A machine whose CPUs could not be counted gets one, which is what elodin had
+before this setting existed. That is the opposite of what `derive_workers` does
+with the same unknown, and deliberately: too few workers is throughput an
+operator can see and raise, while a reader that has no core to run on buys
+nothing and costs a thread and a receive buffer. Guessing wide is the safe
+direction for the first and not for the second.
+*/
+derive_udp_readers :: proc(m: Machine) -> int {
+	if m.cpus <= 0 {
+		return MIN_DERIVED_UDP_READERS
+	}
+	return clamp(m.cpus, MIN_DERIVED_UDP_READERS, MAX_DERIVED_UDP_READERS)
 }
 
 // Handlers for a machine, ignoring any term the machine did not report.

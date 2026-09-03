@@ -21,6 +21,52 @@ Listener :: struct {
 	port:              int,
 	cert_file:         string,
 	key_file:          string,
+	/*
+	UDP only: reader threads, each with a socket of its own on the same port.
+
+	Everything a datagram costs before the rate limiter can see it - the
+	`recvfrom`, the allow-list compare, the siphash of the source prefix -
+	happens on the thread that read it, so one reader is one core's worth of
+	drain rate for the whole server. Past it the kernel's receive queue
+	overflows and datagrams are dropped by the socket rather than by anything
+	this server decides, which is where its fairness properties stop applying:
+	the thing choosing whose queries are served is the queue rather than the
+	budget. Measured on a four-core VM, one reader drains 2.3M datagrams a
+	second and a flood of two million still cost 4% of arrivals to the queue -
+	see `bench/results/2026-09-03-udp-readers.md`, which also says why the
+	reader count could not be shown to help on that hardware.
+
+	Each reader binds the same address and port with `SO_REUSEPORT`, so the
+	kernel hands each socket its own receive queue and spreads arriving
+	datagrams between them by a hash of the 4-tuple. The drain rate then scales
+	with readers instead of being one thread's, which is how BIND and Unbound
+	scale the same path.
+
+	Zero derives one per usable CPU, to a ceiling - see `sizing.odin`. What it
+	does not do is make one client's flood somebody else's problem in a smaller
+	way: a flood from a single source port hashes to a single reader, which is
+	the good case, while one from many source ports is spread over all of them
+	exactly as legitimate traffic is. This is headroom, not a defence; a
+	publicly reachable resolver wants a packet filter in front of it.
+
+	And headroom is all it is claimed to be. The bench could not show a second
+	reader draining more than one on the machine it ran on, the load generator
+	there sharing the cores with the server and loopback charging the sender for
+	the delivery; what it did show is a single reader already keeping up with
+	everything that machine could offer. `elodin_udp_receive_drops_total` is what
+	says whether a particular instance is near its own ceiling.
+	*/
+	readers:           int,
+	/*
+	UDP only: what each reader asks the kernel for as a socket receive buffer.
+
+	This is the burst that can arrive while every reader is busy and still be
+	answered rather than dropped by the socket. Named rather than inherited so
+	that the figure is one an operator can see and change; the kernel clamps it
+	to `net.core.rmem_max`, which is 208 KiB on an untuned Linux, and the
+	startup line says what was actually granted.
+	*/
+	receive_buffer:    int,
 	// DoH only.
 	path:              string,
 	// DoH only: the path an iPhone, iPad or Mac downloads its encrypted-DNS
@@ -39,8 +85,8 @@ Listeners :: struct {
 /*
 Whether anything that has connections is listening.
 
-UDP has none - one reader thread, no per-client state - so a server with only
-that has no connection table, and `max_connections` and the share of it are
+UDP has none - it reads datagrams and keeps no per-client state - so a server
+with only that has no connection table, and `max_connections` and the share of it are
 figures about nothing. Both the startup line and `--check` ask this before saying
 anything about them, through one procedure so the two cannot disagree about when
 the subject exists.
@@ -157,6 +203,31 @@ the largest ceiling there is any point setting.
 MIN_UDP_RESPONSE :: 512
 MAX_UDP_RESPONSE :: 4096
 DEFAULT_MAX_UDP_RESPONSE :: 1232
+
+/*
+The most reader threads `listeners.udp.readers` will accept.
+
+Well past what any of this buys: a reader is a core's worth of drain rate, and
+past the core count the threads contend for the same cores while each still
+holds a receive buffer of its own. The ceiling is here so that a mistyped figure
+fails `--check` instead of asking the OS for thousands of threads at startup,
+not because 64 is a number anybody should need.
+*/
+MAX_UDP_READERS :: 64
+
+/*
+The bounds on `listeners.udp.receive_buffer`, and where it sits by default.
+
+The floor is one maximum-sized datagram: a buffer that cannot hold one query is
+a socket that drops traffic no matter how idle the server is. The ceiling is
+past anything a kernel will grant without `net.core.rmem_max` being raised to
+match, and exists for the same reason `MAX_UDP_READERS` does. 1 MiB is what
+elodin has always asked for, and on an untuned Linux the kernel clamps it to
+`net.core.rmem_max` - 208 KiB - which the startup line then reports.
+*/
+MIN_UDP_RECEIVE_BUFFER :: 64 * 1024
+MAX_UDP_RECEIVE_BUFFER :: 1 << 30
+DEFAULT_UDP_RECEIVE_BUFFER :: 1 << 20
 
 Cache_Config :: struct {
 	enabled:      bool,
@@ -775,9 +846,15 @@ default_config :: proc() -> Config {
 		rate_limit                 = Rate_Limit_Config{enabled = true, responses_per_second = 500, slip = 2},
 	}
 	c.listeners.udp = Listener {
-		enabled = true,
-		address = "0.0.0.0",
-		port    = 53,
+		enabled        = true,
+		address        = "0.0.0.0",
+		port           = 53,
+		// Zero, and worked out from the machine at load, for the reason the
+		// worker counts are: one reader per usable CPU is a property of the
+		// box rather than a number anybody wants to maintain, and a figure
+		// written here would be one on every machine that installs this.
+		readers        = 0,
+		receive_buffer = DEFAULT_UDP_RECEIVE_BUFFER,
 	}
 	c.listeners.tcp = Listener {
 		enabled = true,
