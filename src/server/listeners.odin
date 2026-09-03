@@ -508,12 +508,19 @@ Unlike the two above, `client` arrives formatted: the stream handlers build it
 once per connection and hold it for the connection's life, so there is no address
 to render here and nothing to release afterwards. `logx.debugf` returns without
 formatting anything when debug is off.
+
+`closing` is what the caller did with the connection, and the transports no longer
+agree: the length-prefixed ones end it, DoH answers 429 and keeps it - see
+`serve_doh_request`. An operator reading "closing the connection" for a refusal
+that closed nothing would go looking for a disconnection that never happened, so
+the caller says which it was rather than the line assuming.
 */
 @(private)
-report_rate_limited :: proc(client: string, proto: Protocol) {
+report_rate_limited :: proc(client: string, proto: Protocol, closing: bool) {
 	logx.debugf(
-		"%s: closing the connection from %s, its prefix is over server.rate_limit.responses_per_second",
+		"%s: %s from %s, its prefix is over server.rate_limit.responses_per_second",
 		proto_name(proto),
+		"closing the connection" if closing else "refusing a query",
 		client,
 	)
 }
@@ -1171,7 +1178,7 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 		`max_connections`, which is the slot this close exists to hand back.
 		*/
 		if !stream_rate_check(s.limiter, conn.peer, time.tick_now()) {
-			report_rate_limited(client, proto)
+			report_rate_limited(client, proto, true)
 			if answered {
 				stream_linger(conn)
 			}
@@ -1242,8 +1249,8 @@ write, before the budget ran out, are thrown away along with the queries it
 declined to read, and the client's `recv` fails where it would have returned
 those answers and then the end of the stream. Cutting a flood short is the point
 of the close; taking back what was already answered is not. The DoH endpoint
-drains before its own refusal for the same reason - see `http_linger`, where what
-would be lost is a 429.
+drains before the refusals that close for the same reason - see `http_linger`,
+where what would be lost is the 400 or 505 `read_http_request` hands back.
 
 Discarded rather than framed and answered: the budget is spent, and what these
 bytes ask is the thing being refused. Past either bound the close goes ahead and

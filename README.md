@@ -789,10 +789,13 @@ ways can draw twice the figure, half of it only over a completed handshake.
 `src/server/ratelimit.odin` argues this out.
 
 `slip` is a UDP mechanism, so over-budget queries on a connection are refused
-instead: TCP and DoT closed, DoH answered `429 Too Many Requests`, and over
-HTTP/2 the stream refused with a 429 while the connection stays. Such a
-connection is drained briefly first, since closing a socket with unread data
-resets it and the client's kernel would throw away the answers already sent.
+instead: TCP and DoT closed, and over DoH — both HTTP/1.1 and HTTP/2 — answered
+`429 Too Many Requests` on a connection that stays open unless the client itself
+asked for a close. It stays because ending it charges this server a TLS handshake
+per refusal and the flooding client nothing, which made refusing dearer than
+answering. A connection that is closed with bytes still unread is drained briefly
+first, since closing a socket with unread data resets it and the client's kernel
+would throw away the answers already sent.
 
 The budget is spent on questions, on every transport: a scanner's 404, a
 `.mobileconfig` download or a POST naming the wrong content type reaches no

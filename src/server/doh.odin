@@ -33,35 +33,26 @@ The size is a request this endpoint would have read in full anyway - the header
 limit plus the largest body it accepts - so draining one costs no more than
 serving one would have.
 
-The idle wait applies per read, and there are two of them, because the callers
-disagree about where the bytes still to come are. Each passes the one that
-matches what it refused.
-
-`HTTP_LINGER_IDLE` is for a refusal written after the whole request was read: the
-429 in `serve_doh_request`, which charges the budget once it has a message in
-hand. It is short because of what is left over there - a client that pipelined
-wrote those bytes before it could have read the refusal, so what the close would
-otherwise take back from it is in this server's receive queue already, and a read
-of a queue with something in it returns without waiting at all. Time spent
-waiting past that is time spent on a client that has stopped sending, holding one
-of `max_connections` while it does - and a refusal that costs more than an answer
-is one worth provoking, which the 429 makes any client able to reach the endpoint
-able to do at will. A second of it, per connection, for nothing, is the shape of
-that: one over-budget query and then silence is a cheaper way to spend a slot
-than asking a question is.
-
-`HTTP_LINGER_BODY_IDLE` is for the refusals `read_http_request` hands back, which
-are decided on the request line or on a repeated `Host` - before the body those
+The idle wait applies per read. `HTTP_LINGER_BODY_IDLE` is what every drain here
+passes, because every refusal that drains is one `read_http_request` handed back,
+decided on the request line or on a repeated `Host` - before the body those
 headers declared has been read. What is unread there is not something the client
 has already put on the wire but a body still on its way, and over any distance
 the next segment of it is a round trip away rather than in the queue: a wait of
-the length above drains the first congestion window, gives up on a body that is
-still coming, and closes over the remainder, which is the RST this drain exists
-to avoid and leaves the client reading ECONNRESET instead of the 400. So this one
-is a round trip's worth. It is provokable in the same way - a request line this
-reader will not read costs a client no more than an over-budget query does -
-which is why it is a quarter of a second rather than a second, that being the
-bound `stream_linger` accepts against the same abuse.
+only the time a queued byte takes to arrive drains the first congestion window,
+gives up on a body that is still coming, and closes over the remainder, which is
+the RST this drain exists to avoid and leaves the client reading ECONNRESET
+instead of the 400. So it is a round trip's worth. It is provokable - a request
+line this reader will not read costs a client no more than a query does - which
+is why it is a quarter of a second rather than a second, that being the bound
+`stream_linger` accepts against the same abuse.
+
+Passed by the caller rather than defaulted, though there is one value to pass, so
+that a path added later has to answer where its unread bytes are rather than
+inherit an answer. The 429 in `serve_doh_request` is the path that used to have
+the other one, and it drains nothing now: it keeps the connection, and where the
+client asked for `Connection: close` the request it refused was read in full, so
+neither case leaves the close anything to trip over.
 
 The deadline bounds the drain as a whole, which the idle wait alone does not. A
 client sending a byte inside every wait stays inside all of them for as long as it
@@ -71,7 +62,6 @@ and hold a slot for hours; past the deadline the close goes ahead. See
 */
 HTTP_LINGER_BYTES :: MAX_HEADER_BYTES + MAX_DOH_BODY
 HTTP_LINGER_TIMEOUT :: 1 * time.Second
-HTTP_LINGER_IDLE :: 50 * time.Millisecond
 HTTP_LINGER_BODY_IDLE :: 250 * time.Millisecond
 
 /*
@@ -570,17 +560,40 @@ serve_doh_request :: proc(s: ^Server, conn: Conn, req: Http_Request_In, path: st
 	back in two milliseconds, so the smallest value it can carry would send a client
 	away for hundreds of times the wait there actually is.
 
-	`false` for `keep_alive`, so the connection ends with the refusal for the
-	reason `serve_dns_stream` closes - and the drain before it closes is what keeps
-	the 429 from being lost, this being reached by a client that pipelines: closing
-	a socket with bytes still in its receive queue sends an RST, and an RST has the
-	client's kernel discard what it has not read yet. See `http_linger`.
+	The client's own `keep_alive`, so the refusal leaves the connection where it
+	found it - which is where this parts company with `serve_dns_stream`, and joins
+	`h2_rate_limited`. Ending it charged this server a TLS handshake for every
+	question a flooding client asked and the client nothing: it reconnects and asks
+	again, and the accept path signs another key exchange. Measured against the
+	shipped default in `bench/results/2026-09-03-rate-limit-bystander.md`, one
+	unspoofed client offering 6,123 queries a second over HTTP/1.1 opened 56,249
+	connections in twelve seconds and cost 1.33 cores - 236 us per refusal, where
+	the same flood over HTTP/2, refused on a connection that survives, cost 10.5 us
+	and four connections. The limiter working exactly as designed was what bought
+	the attacker the handshakes, which made a public endpoint's own defence the
+	cheapest way to load it. Keeping the connection costs 7.9 us and 64 connections
+	on the same arm - `bench/results/2026-09-03-doh1-refusal-keeps-the-connection.md`.
+
+	Nothing is drained here for the same reason nothing is drained after an answer:
+	the drain exists to keep a close from turning into an RST that discards the
+	status along with it (see `http_linger`), and on a kept connection there is no
+	close. What a pipelining client sent ahead is the next request, which is read
+	and refused in its turn. The one close left on this path is the client's own -
+	an HTTP/1.0 request, or one carrying `Connection: close` - and that one needs no
+	drain either: the request was read in full, body and all, so a client that meant
+	the field it sent has nothing left in the receive queue for the close to trip
+	over.
+
+	Nor is the connection ended after some count of refusals. A client that ignores
+	429 indefinitely is not worth serving, but disconnecting it is not what stops it
+	- it is what it wants, since the reconnection costs this end a signature and
+	that end a socket - and a connection held is bounded already, by
+	`client_timeout` between requests and by `max_connections` across them. A
+	flooder occupies the same one slot either way.
 	*/
 	if !stream_rate_check(s.limiter, conn.peer, time.tick_now()) {
-		report_rate_limited(client, .DoH)
-		_ = send_http_error(conn, "doh", 429, "too many requests", false)
-		http_linger(conn, HTTP_LINGER_IDLE)
-		return false
+		report_rate_limited(client, .DoH, !req.keep_alive)
+		return send_http_error(conn, "doh", 429, "too many requests", req.keep_alive)
 	}
 
 	response, _, ok := handle_query(s, query, .DoH, client, context.temp_allocator)
@@ -764,11 +777,10 @@ the drain on the idle wait, the limit or the deadline rather than holding the
 thread.
 
 `idle` is the per-read wait, and the caller chooses it because the caller is what
-knows whether the bytes that are left are already here or still arriving:
-`HTTP_LINGER_IDLE` after a request that was read in full, `HTTP_LINGER_BODY_IDLE`
-after one refused with a declared body outstanding. Passed rather than defaulted
-so that a path added later has to answer the question rather than inherit an
-answer.
+knows whether the bytes that are left are already here or still arriving. Every
+caller has a body outstanding today and so passes `HTTP_LINGER_BODY_IDLE`; it is
+passed rather than defaulted so that a path added later has to answer the question
+rather than inherit an answer.
 */
 @(private)
 http_linger :: proc(conn: Conn, idle: time.Duration) {

@@ -217,12 +217,14 @@ about queries this server could not keep up with, and `h2_shed` is where that is
 counted.
 
 The stream is refused rather than the connection closed, which is where this
-parts company with the other three transports. There is no way to say "this
+parts company with the length-prefixed transports. There is no way to say "this
 connection is over its budget" in HTTP/2 short of GOAWAY, and one over-limit
 stream is not a reason to take the requests in flight beside it down as well: a
 browser has a handful open on one connection, and they were not all sent by
 whatever is flooding. A client that keeps asking keeps being answered 429, which
-costs it a stream and this server a HEADERS frame.
+costs it a stream and this server a HEADERS frame. `serve_doh_request` keeps its
+connection for the second half of that reason, having been measured paying a TLS
+handshake per refusal for the want of it.
 */
 @(private)
 h2_rate_limited :: proc(ctx: ^H2_Context, hc: ^h2.Conn, req: ^h2.Request) {

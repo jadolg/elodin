@@ -494,8 +494,8 @@ asking both ways can draw twice the figure.
 
 `slip` applies to UDP alone: a truncated answer is an instruction to ask again over
 TCP, so it has nothing to say to a client that is already on a connection.
-Over-budget queries there end the connection instead, DoH saying so with a 429
-first.
+Over-budget queries end a TCP or DoT connection instead; DoH answers 429 and keeps
+it, a refusal that costs a TLS handshake being dearer than the answer it withheld.
 */
 Rate_Limit_Config :: struct {
 	enabled:              bool,

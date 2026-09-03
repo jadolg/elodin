@@ -463,7 +463,7 @@ func dohArms() []arm {
 		},
 		{
 			/*
-				HTTP/1.1, where the refusal ends the connection.
+				HTTP/1.1, where the refusal used to end the connection.
 
 				Sixty-four connections, for the reason the TCP flood needed
 				sixty-four: an h1 client is served a request at a time per
@@ -472,13 +472,17 @@ func dohArms() []arm {
 				which is what a first run of this arm measured, `limited=0` and
 				nothing refused.
 
-				What the arm is for is the cost of the ending. Every refusal
-				closes a connection the client then re-establishes, so `dials`
-				counts the TLS handshakes an over-budget h1 client is made to pay
-				for, and the CPU column is what the server paid.
+				What the arm is for is what a refusal costs. `dials` counts the
+				TLS handshakes the flood provoked and the CPU column is what the
+				server paid for them, which is how the closing refusal was
+				measured at 263 us against the h2 path's 10.5 - see
+				`bench/results/2026-09-03-doh1-refusal-keeps-the-connection.md`.
+				With the connection kept, `dials` should stay at the socket count
+				above however long the flood runs; a regression that closes again
+				shows up here as tens of thousands.
 			*/
 			name:     "doh1/flood-reconnects",
-			question: "what an over-budget HTTP/1.1 client costs when every refusal ends its connection",
+			question: "what an over-budget HTTP/1.1 client costs, and whether a refusal still costs a handshake",
 			limiter:  true, rps: *rps, slip: *slip,
 			attacker: &clientSpec{src: "127.0.0.2", transport: "doh1", rate: 0, sockets: 64, inflight: 64},
 			victim:   withSrc(victimUDP, "127.0.0.3"),
