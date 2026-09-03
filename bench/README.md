@@ -122,6 +122,7 @@ of them needs an explanation.
 cmd/bench/      orchestrator: starts everything, runs the matrix, prints markdown
 cmd/loadgen/    one scenario against a running server, reports JSON
 cmd/mockdns/    upstream that answers after a fixed delay
+cmd/rrlexp/     the rate-limiting experiment: two clients, one server, per arm
 internal/dnswire/   DNS message building and parsing, independent of elodin
 internal/hist/      latency samples and percentiles
 internal/procstat/  RSS, CPU time and thread count for one pid
