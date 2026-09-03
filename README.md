@@ -892,11 +892,99 @@ rather than impossible — at 16, a table of 512 costs 32 prefixes instead of tw
 — and it is the same granularity, with the same limitation, as the response
 budget above.
 
-UDP is unaffected either way — one reader thread, no per-client state, nothing to
+UDP is unaffected either way — no connections, no per-client state, nothing to
 refuse — which is why a resolver whose table has been taken can look healthy on
 datagrams while every TCP, DoT and DoH client gets nothing.
 `bench/results/2026-09-03-connection-table-share.md` measures that, and the same
 load with a share in place.
+
+### How fast datagrams can be read
+
+```yaml
+listeners:
+  udp:
+    readers: 0                # threads reading the socket; 0 derives one per usable CPU, to 8
+    receive_buffer: 1MiB      # what each reader asks the kernel to hold for it
+```
+
+Everything a datagram costs before the rate limiter can see it — the `recvfrom`,
+the [allow-list](#who-may-ask) compare, the siphash of the source prefix —
+happens on the thread that read it. So the rate at which this server can *hear*
+is the ceiling on every fairness property below it: past what its readers can
+drain, the kernel's receive queue overflows and datagrams are dropped by the
+socket, which is to say by nobody the configuration can reach. The client whose
+queries are lost there is whichever one the queue happened to be full for.
+
+Measured on a four-core aarch64 VM
+(`bench/results/2026-09-03-udp-readers.md`): **one reader drains 2.3 million
+datagrams a second**, or about 400 ns of one core each, and under a flood of two
+million a second the kernel still dropped **4% of arrivals** — 918,000 datagrams
+in ten seconds that reached no budget, no counter and no client. Read that as the
+ceiling rather than as a disaster: the [rate limiter](#rate-limiting) held the
+flood at its budget throughout and a client in an unrelated /24 was answered 98%
+of the time.
+
+The 36% that client lost when
+[issue #233](https://github.com/jadolg/elodin/issues/233) was filed is gone, and
+was mostly not the reader's doing: the slip's truncated answers were charged to
+no budget then, so the read loop was also performing half a million sends a
+second.
+Giving them a pool of their own fixed that (`2026-09-03-slip-budget.md`), and
+what is left is the drain rate itself.
+
+Each reader binds the same address and port with `SO_REUSEPORT` and gets its own
+receive queue, and the kernel spreads arriving datagrams between them by hashing
+the 4-tuple. The drain rate then scales with cores instead of being one of them,
+which is how BIND and Unbound scale the same path. Unset derives one reader per
+usable CPU up to eight — the same "what can this machine have" reading as the
+[worker counts](#sizing) — and the number, with what the kernel actually granted
+for a receive buffer, is in the startup line and in `--check`:
+
+**The scaling is the mechanism's, not a measurement of this one.** The bench
+above could not demonstrate a speed-up from a second reader, because the load
+generator shares the machine with the server it is measuring and loopback
+delivery is paid for by the sender: a second box, or a real NIC, is what would
+answer it. One reader already drains more than this VM can offer, so what the
+extra readers buy here is headroom above a ceiling nothing available could reach
+— and `elodin_udp_receive_drops_total` is how an operator finds out whether their
+own instance is anywhere near it.
+
+```console
+$ elodin --check
+  udp: 4 readers, asking for 1MiB of receive buffer each (derived from 4 usable CPUs)
+```
+
+Sharing a port is bounded by the kernel to processes running as the same
+effective user: elodin binds before it [drops privileges](#privileges), so a
+second process would have to be root — or, on an unprivileged high port, whoever
+elodin already runs as — to take a share of the datagrams. That is somebody who
+could read the traffic off the interface in any case, which is why this is worth
+saying rather than worth worrying about. A *second elodin* is the one thing that
+would qualify and must not be let in — a stale process, a unit started twice, a
+configuration being tried out beside the running one would otherwise be handed
+half the queries and answer them from whatever it was given. So the listener
+asks for the port with an ordinary bind before the readers share it, and a port
+somebody already holds is still refused with `Address_In_Use` exactly as it was
+before the readers existed.
+
+`receive_buffer` is what absorbs a burst that arrives while every reader is busy.
+Linux clamps it to `net.core.rmem_max`, 208 KiB on a machine nobody has tuned, so
+the startup line reports what was granted rather than what was asked for; raise
+the sysctl if you raise this. What the kernel dropped anyway is published per
+reader as `elodin_udp_receive_drops_total`, beside `elodin_udp_datagrams_total`
+for what each reader did read — the two together are the only way to see this
+condition from inside the server, since a datagram dropped in the queue never
+reaches a read and is indistinguishable from one nobody sent. A rise in it is
+also written to the log at the five-minute report, for operators who are not
+scraping.
+
+**None of this is a defence, and it is not meant to be read as one.** It is
+headroom: it raises the rate at which the limiter's guarantees still hold, and
+above that rate they still stop. A flood from a single source port hashes to a
+single reader — which is the good case, the other readers being untouched — while
+one from many source ports spreads over all of them exactly as legitimate traffic
+does. **A publicly reachable instance wants a packet filter in front of it**, or
+upstream scrubbing, which is what every public resolver runs anyway.
 
 ### DNS cookies
 
@@ -1350,6 +1438,8 @@ as a warning at startup.
 | `elodin_upstream_failures_total{upstream}` | counter | exchanges that produced no usable answer |
 | `elodin_upstream_latency_seconds_total{upstream}` | counter | cumulative round-trip time; divide by the query counter under `rate()` for the mean |
 | `elodin_upstream_up{upstream}` | gauge | 0 while an upstream is in its failure cooldown |
+| `elodin_udp_datagrams_total{reader}` | counter | datagrams each UDP reader took off its socket |
+| `elodin_udp_receive_drops_total{reader}` | counter | datagrams the kernel dropped on that reader's receive queue before they could be read; absent where `/proc` cannot be read |
 | `elodin_pool_workers{pool}` / `elodin_pool_pending{pool}` | gauge | the `query` and `upstream` pools; `pending` that does not return to zero is `server.workers` set too low |
 | `process_cpu_seconds_total` | counter | user plus system CPU |
 | `process_resident_memory_bytes` / `_virtual_memory_bytes` | gauge | from `/proc/self/stat` |
@@ -1432,6 +1522,7 @@ $ elodin --check
 /etc/elodin/elodin.yaml is valid: 2 upstreams, 0 zone routes, 4 blocklists, 0 rewrites
   workers=16 upstream_workers=8 max_pending=128 (derived from 4 usable CPUs and 7.7 GiB)
   answering queries from 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, ::1/128, fc00::/7, fe80::/10; every other source is refused
+  udp: 4 readers, asking for 1MiB of receive buffer each (derived from 4 usable CPUs)
   connections: at most 512 at once across TCP, DoT and DoH, of which one client prefix (/24, /64) may hold 256; connections past a prefix's share are refused and counted as conn_refused=
 ```
 
@@ -1442,9 +1533,11 @@ all, so a client sees a timeout and retries, which is the failure DNS is built
 for. A DoH client over HTTP/2 is answered 503 instead, its stream being the other
 path that queues and there being a client on an open connection to tell.
 
-Concurrency differs by transport. **UDP** has one reader thread that hands every
-datagram to the worker pool, with no per-client state and no connection limit.
-**TCP, DoT and DoH** give each connection a thread, capped together by
+Concurrency differs by transport. **UDP** has a reader thread per usable CPU, to
+eight, each handing every datagram it reads to the worker pool, with no
+per-client state and no connection limit; see [how fast datagrams can be
+read](#how-fast-datagrams-can-be-read), which is the ceiling on everything the
+rate limiter achieves. **TCP, DoT and DoH** give each connection a thread, capped together by
 `server.max_connections` (512) and per client by
 [`max_connections_per_prefix`](#how-many-connections-one-client-may-hold) (half
 of it); within a connection TCP, DoT and HTTP/1.1 answer one query at a time
@@ -1506,7 +1599,13 @@ size of the lists.
   DoT and DoH together by `server.max_connections` and per client prefix by
   `server.max_connections_per_prefix`. That suits clients that hold a connection
   open and pipeline over it, not tens of thousands of concurrent connections. UDP
-  is the exception: one reader thread and no per-client state.
+  is the exception: a reader thread per core and no per-client state.
+- **Past what the UDP readers can drain, the kernel decides who is served.**
+  Datagrams that overflow a receive queue are dropped by the socket, so no budget
+  in this server applies to them; `listeners.udp.readers` raises the rate at which
+  that starts and does not remove it. A publicly reachable instance wants a packet
+  filter in front of it. See [how fast datagrams can be
+  read](#how-fast-datagrams-can-be-read) for the measured figure.
 - **No setting bounds the rate of TLS handshakes.** Both per-client bounds are
   spent by something a handshake flood does not do — asking questions, or holding
   a connection — so a client that only connects and hangs up is charged for
@@ -1515,9 +1614,9 @@ size of the lists.
   to do about it.
 - **Upstream I/O is synchronous**, so concurrency is bounded by thread count
   rather than by in-flight queries. The h2 upstream client multiplexes onto one
-  connection, but a worker is still held for the round trip. Async upstream I/O,
-  or several UDP readers behind `SO_REUSEPORT`, would lift both this and the item
-  above.
+  connection, but a worker is still held for the round trip. Async upstream I/O
+  would lift this and the connection item above; the UDP half of it is done, the
+  readers being behind `SO_REUSEPORT` since #233.
 - **DNS cookies do not cover every query.** Only queries that already carry an
   OPT record are given one upstream, so a non-EDNS client behind elodin gets no
   cookie protection unless DNSSEC validation is on — which it is by default.

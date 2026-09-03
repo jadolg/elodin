@@ -283,6 +283,12 @@ load_listener :: proc(l: ^Loader, parent: ^yaml.Node, key: string, dst: ^Listene
 		opt_string(l, n, "cert_file", &dst.cert_file, path)
 		opt_string(l, n, "key_file", &dst.key_file, path)
 	}
+	if key == "udp" {
+		opt_int(l, n, "readers", &dst.readers, path)
+		// A size, so "1MiB" and "1048576" both read, the same as the cache
+		// sizes and `server.max_udp_response` do.
+		opt_bytes(l, n, "receive_buffer", &dst.receive_buffer, path)
+	}
 	if key == "doh" {
 		opt_string(l, n, "path", &dst.path, path)
 		opt_string(l, n, "mobileconfig_path", &dst.mobileconfig_path, path)
@@ -2075,6 +2081,51 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	if cfg.server.upstream_workers == 0 {
 		cfg.server.upstream_workers = derive_upstream_workers(cfg.server.workers)
 		cfg.server.sizing.derived_upstream_workers = true
+	}
+	/*
+	The UDP readers, sized the same way and reported the same way.
+
+	Refused rather than clamped, for the reason `max_udp_response` is: the
+	number decides how much traffic this server can hear at all, so a file
+	naming one it will not get is a file whose author should be told rather
+	than quietly given something else. Checked whether or not UDP is enabled -
+	a mistyped figure under a listener that is off is still a mistake, and one
+	that would surface only when somebody turned the listener on.
+
+	Derived only when it is going to be used, and it measures the machine only
+	if the worker derivation above has not already: a probe whose answer nothing
+	reads would show up in the sizing line as a machine that was consulted about
+	numbers an operator wrote themselves.
+	*/
+	if cfg.listeners.udp.readers < 0 {
+		errorf(l, "listeners.udp.readers must not be negative")
+	}
+	if cfg.listeners.udp.readers > MAX_UDP_READERS {
+		errorf(
+			l,
+			"listeners.udp.readers must be at most %d (it is %d); 0 derives one per usable CPU, to %d",
+			MAX_UDP_READERS,
+			cfg.listeners.udp.readers,
+			MAX_DERIVED_UDP_READERS,
+		)
+	}
+	if cfg.listeners.udp.receive_buffer < MIN_UDP_RECEIVE_BUFFER ||
+	   cfg.listeners.udp.receive_buffer > MAX_UDP_RECEIVE_BUFFER {
+		errorf(
+			l,
+			"listeners.udp.receive_buffer must be between %d and %d bytes (it is %d); %d is the default",
+			MIN_UDP_RECEIVE_BUFFER,
+			MAX_UDP_RECEIVE_BUFFER,
+			cfg.listeners.udp.receive_buffer,
+			DEFAULT_UDP_RECEIVE_BUFFER,
+		)
+	}
+	if cfg.listeners.udp.enabled && cfg.listeners.udp.readers == 0 {
+		if !cfg.server.sizing.derived_workers {
+			cfg.server.sizing.machine = probe_machine()
+		}
+		cfg.listeners.udp.readers = derive_udp_readers(cfg.server.sizing.machine)
+		cfg.server.sizing.derived_udp_readers = true
 	}
 	if cfg.server.rate_limit.enabled {
 		if cfg.server.rate_limit.responses_per_second < 1 {

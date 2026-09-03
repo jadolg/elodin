@@ -262,9 +262,20 @@ test_configured_workers_win :: proc(t: ^testing.T) {
 	testing.expect(t, !cfg.server.sizing.derived_workers, "a configured count is not a derived one")
 	testing.expect_value(t, cfg.server.upstream_workers, 20)
 	testing.expect(t, cfg.server.sizing.derived_upstream_workers, "the unset half should be derived from the set one")
-	// The machine was not measured, and must not be reported as though it had
-	// been: half of 40 is the file's doing, not the hardware's.
-	testing.expect_value(t, cfg.server.sizing.machine, Machine{})
+	// The machine here is measured for the UDP reader count, which is derived
+	// and says so; what it must not be is reported as though the worker counts
+	// had come from it, which `derived_workers` above is what decides.
+	testing.expect(t, cfg.server.sizing.derived_udp_readers, "the reader count was left underived")
+
+	// With nothing left to derive, nothing is measured at all: half of 40 is
+	// the file's doing, not the hardware's, and a machine nobody consulted must
+	// not appear in the line that explains where the numbers came from.
+	quiet, qerr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\nserver:\n  workers: 40\n  upstream_workers: 20\nlisteners:\n  udp: { enabled: false }\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, qerr == nil, "expected a clean load")
+	testing.expect_value(t, quiet.server.sizing.machine, Machine{})
 
 	both := "upstream:\n  servers: [1.1.1.1]\nserver:\n  workers: 40\n  upstream_workers: 40\n"
 	pair, perr := load_string(both, context.temp_allocator)

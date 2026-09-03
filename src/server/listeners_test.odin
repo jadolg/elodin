@@ -117,7 +117,7 @@ test_read_loop_does_not_release_a_context_its_jobs_hold :: proc(t: ^testing.T) {
 		return
 	}
 
-	bound, berr := net.bound_endpoint(l.udp_socket)
+	bound, berr := net.bound_endpoint(l.udp[0].socket)
 	if berr != nil {
 		sync.atomic_store(&barrier.go, true)
 		stop_listeners(&l)
@@ -148,7 +148,7 @@ test_read_loop_does_not_release_a_context_its_jobs_hold :: proc(t: ^testing.T) {
 	// Sockets closed, read loop joined. Anything it releases, it has released.
 	stop_listeners(&l)
 
-	held := l.udp_loop_ctx
+	held := l.udp[0].ctx
 	testing.expect(t, held != nil, "the listener kept no handle on its read loop's context")
 	if queued && held != nil {
 		fresh := new(Udp_Context)
@@ -166,7 +166,7 @@ test_read_loop_does_not_release_a_context_its_jobs_hold :: proc(t: ^testing.T) {
 	pool.destroy(handler_pool)
 
 	destroy_listeners(&l)
-	testing.expect(t, l.udp_loop_ctx == nil, "destroy_listeners left the context behind")
+	testing.expect(t, l.udp == nil, "destroy_listeners left the readers behind")
 }
 
 /*

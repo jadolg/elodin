@@ -154,6 +154,25 @@ listeners:
     enabled: true
     address: "0.0.0.0"
     port: 53
+    # Threads reading the socket, each with a socket of its own on this port
+    # (SO_REUSEPORT) and a receive queue of its own. Everything a datagram costs
+    # before the rate limiter sees it happens on the thread that read it, so one
+    # reader is one core's worth of drain rate for the whole server - and past
+    # that rate the kernel drops datagrams in the receive queue, where no budget
+    # here can reach them. Measured on four cores: one reader drains 2.3M
+    # datagrams a second, and a flood of two million still cost 4% of arrivals
+    # to the queue - see bench/results/2026-09-03-udp-readers.md.
+    #
+    # 0 derives one per usable CPU, to eight. It is headroom rather than a
+    # defence - a publicly reachable resolver wants a packet filter in front of
+    # it - and what the kernel dropped anyway is counted in
+    # elodin_udp_receive_drops_total and reported in the log.
+    readers: 0
+    # What each reader asks the kernel to hold for it: the burst that can arrive
+    # while every reader is busy and still be answered. Linux clamps this to
+    # net.core.rmem_max, 208KiB on an untuned machine, and the startup line says
+    # what was actually granted.
+    receive_buffer: 1MiB
   tcp:
     enabled: true
     address: "0.0.0.0"

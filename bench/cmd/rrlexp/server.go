@@ -86,6 +86,21 @@ func connectionBlock(a arm) string {
 	return b.String()
 }
 
+/*
+readersLine is the arm's `listeners.udp.readers`, or nothing.
+
+Nothing is what every arm but the reader pair wants: the derived count is what a
+deployment runs, and an arm about the response budget should be measuring the
+same server an operator has. The pair that is about the reader count pins both
+its halves - see `readerArms`.
+*/
+func readersLine(a arm) string {
+	if a.readers <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("    readers: %d\n", a.readers)
+}
+
 // armServer is what one arm's configuration is filled in from.
 type armServer struct {
 	logPath     string
@@ -102,6 +117,9 @@ type armServer struct {
 	dohPort      int
 	cacheEntries int
 	metrics      int
+	// The `readers:` line for the UDP listener, or empty to let the server
+	// derive one per usable CPU. See `readersLine`.
+	readers string
 }
 
 // serverConfig is the configuration one arm runs against. The arguments are
@@ -111,7 +129,7 @@ func serverConfig(a armServer) string {
 	return fmt.Sprintf(configTemplate,
 		*logLevel, *logQueries, a.logPath, *workers, *workers/2, a.connections, a.rateLimit,
 		a.listen, a.port, a.dotPort, a.dohPort, a.cert, a.key,
-		a.upHost, a.upPort, a.cacheEntries, a.metrics)
+		a.upHost, a.upPort, a.cacheEntries, a.metrics, a.readers)
 }
 
 /*
@@ -194,7 +212,7 @@ listeners:
     enabled: true
     address: "%[8]s"
     port: %[9]d
-  tcp:
+%[18]s  tcp:
     enabled: true
     address: "%[8]s"
     port: %[9]d
@@ -282,6 +300,7 @@ func startServer(bin, dir, upstream string, a arm) (*server, error) {
 		dohPort:      dohPort,
 		cacheEntries: armCache(a),
 		metrics:      metricsPort,
+		readers:      readersLine(a),
 	})
 
 	cfgPath := filepath.Join(dir, name+".yaml")
@@ -299,7 +318,7 @@ func startServer(bin, dir, upstream string, a arm) (*server, error) {
 		metricsAddr: fmt.Sprintf("127.0.0.1:%d", metricsPort),
 		logPath:     logPath,
 	}
-	s.cmd = exec.Command(bin, "--config", cfgPath, "--no-fetch")
+	s.cmd = serverCommand(bin, cfgPath)
 	if err := s.cmd.Start(); err != nil {
 		return nil, err
 	}
@@ -309,6 +328,29 @@ func startServer(bin, dir, upstream string, a arm) (*server, error) {
 		return nil, fmt.Errorf("did not come up: %w", err)
 	}
 	return s, nil
+}
+
+/*
+serverCommand is how the server under test is started, and on which CPUs.
+
+Ordinarily on all of them, which is what every arm about the rate limiter wants:
+the limiter's work is a few instructions on the path of a datagram, and an arm
+that cut the machine in half would be measuring the half.
+
+`-server-cpus` puts it on a `taskset` list of its own, for the arms that are
+about the server's own scaling. The load generator lives in this process and the
+mock upstream lives in it too, so on one machine they compete for the cores the
+server is trying to use: without keeping the two apart, "more reader threads" and
+"less CPU for the generator" arrive together and the arms cannot be told apart.
+The generator is left where it is - it is the thing that has to keep offering,
+and taking cores from it only lowers the load every arm sees equally.
+*/
+func serverCommand(bin, cfgPath string) *exec.Cmd {
+	args := []string{"--config", cfgPath, "--no-fetch"}
+	if *serverCPUs == "" {
+		return exec.Command(bin, args...)
+	}
+	return exec.Command("taskset", append([]string{"-c", *serverCPUs, bin}, args...)...)
 }
 
 // joinPort is the address a client dials, in the form the family needs: IPv6

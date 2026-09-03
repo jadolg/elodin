@@ -1,5 +1,6 @@
 package server
 
+import "core:fmt"
 import "core:net"
 import "core:strings"
 import "core:sync"
@@ -361,6 +362,8 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 	metrics.sample(&b, "elodin_dnssec_answers_total", st.secure, metrics.Label{"result", "secure"})
 	metrics.sample(&b, "elodin_dnssec_answers_total", st.bogus, metrics.Label{"result", "bogus"})
 
+	render_udp_metrics(&b, l)
+
 	render_cache_metrics(&b, s)
 	render_filter_metrics(&b, s)
 	render_upstream_metrics(&b, s)
@@ -368,6 +371,72 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 	render_process_metrics(&b, s.started)
 
 	return strings.to_string(b)
+}
+
+/*
+The UDP readers: what each one took off its socket, and what the kernel threw
+away before it could.
+
+Two series that only mean something beside each other. `received` is this
+process counting; `drops` is the kernel counting datagrams that never reached a
+read, which is the one loss no counter on the query path can see - a query
+dropped in the receive queue looks exactly like a query nobody sent. An operator
+watching a client complain about timeouts while `elodin_queries_total` looks
+healthy is looking for this number.
+
+Labelled per reader rather than summed because the imbalance is the diagnosis.
+The kernel picks a reader by hashing the datagram's 4-tuple, so a flood from one
+source port is one reader's problem and ordinary traffic spreads over all of
+them: one reader carrying everything, or dropping while the others do not, says
+which of the two is happening.
+
+The drops family is omitted entirely when `/proc` could not be read or a
+socket's line was not found in it, rather than published as zeros - the same
+reasoning as the process family below. A flat zero for "nothing was dropped" and
+a flat zero for "this cannot be measured here" are indistinguishable in a graph
+and differ completely in what they are worth.
+*/
+@(private)
+render_udp_metrics :: proc(b: ^strings.Builder, l: ^Listeners) {
+	if len(l.udp) == 0 {
+		return
+	}
+	metrics.family(b, "elodin_udp_datagrams_total", .Counter, "Datagrams read off each UDP reader's socket.")
+	for &reader, i in l.udp {
+		metrics.sample(
+			b,
+			"elodin_udp_datagrams_total",
+			sync.atomic_load(&reader.received),
+			metrics.Label{"reader", reader_label(i)},
+		)
+	}
+
+	drops, measured := udp_reader_drops(l)
+	if !measured {
+		return
+	}
+	metrics.family(
+		b,
+		"elodin_udp_receive_drops_total",
+		.Counter,
+		"Datagrams the kernel dropped on each reader's receive queue before they could be read.",
+	)
+	for n, i in drops {
+		metrics.sample(b, "elodin_udp_receive_drops_total", n, metrics.Label{"reader", reader_label(i)})
+	}
+}
+
+/*
+The reader index as a label value.
+
+Formatted into the temporary arena, which the metrics loop resets after every
+scrape - the same arena the rendered page itself is built in. The label is
+copied into the builder by `metrics.sample` before it returns, so nothing here
+outlives the reset.
+*/
+@(private)
+reader_label :: proc(i: int) -> string {
+	return fmt.tprintf("%d", i)
 }
 
 /*

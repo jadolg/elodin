@@ -354,14 +354,42 @@ func hasHandshakeFlood(rows []row) bool {
 	return false
 }
 
+/*
+sumFamily adds up every sample of one family, whatever its labels.
+
+The UDP families carry a label per reader, and what the table wants is the
+listener: an arm with four readers would otherwise need four columns that mean
+nothing on their own.
+*/
+func sumFamily(c map[string]int64, family string) int64 {
+	var n int64
+	for k, v := range c {
+		if k == family || strings.HasPrefix(k, family+"{") {
+			n += v
+		}
+	}
+	return n
+}
+
+/*
+serverTable is the server's own account of the arm.
+
+`read` and `queue drops` are the two that say whether the readers kept up:
+`read` is datagrams taken off the sockets, and `queue drops` is what the kernel
+threw away because none of them got there first. A datagram counted in the
+second was never charged to any budget and was never seen by anything else in
+this table - it is the loss the server cannot otherwise report, and the reason
+`listeners.udp.readers` exists.
+*/
 func serverTable(b *strings.Builder, rows []row) {
 	b.WriteString("\n## What the server spent, and what it says it did\n\n")
-	b.WriteString("| arm | CPU/s | peak RSS | queries | limited | slipped | shed | forwarded |\n")
-	b.WriteString("|---|---:|---:|---:|---:|---:|---:|---:|\n")
+	b.WriteString("| arm | CPU/s | peak RSS | read | queue drops | queries | limited | slipped | shed | forwarded |\n")
+	b.WriteString("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, r := range rows {
 		c := r.srv
-		fmt.Fprintf(b, "| %s | %.2f | %d MB | %d | %d | %d | %d | %d |\n",
+		fmt.Fprintf(b, "| %s | %.2f | %d MB | %d | %d | %d | %d | %d | %d | %d |\n",
 			r.arm.name, r.cpu.Seconds()/r.elapsed.Seconds(), r.peakRSS/(1<<20),
+			sumFamily(c, "elodin_udp_datagrams_total"), sumFamily(c, "elodin_udp_receive_drops_total"),
 			c["elodin_queries_total"], c["elodin_rate_limited_total"], c["elodin_rate_limit_slipped_total"],
 			c["elodin_queries_dropped_total"], c[`elodin_answers_total{outcome="forwarded"}`])
 	}
