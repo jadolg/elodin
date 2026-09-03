@@ -346,6 +346,19 @@ a server authoritative for `corp.example` answers `corp.example DS` out of its
 own zone rather than fetching the signed proof from the parent, and that answer
 breaks a chain instead of completing it.
 
+A client's own `DS` query at a route's apex is sent the same way, to whatever
+answers the parent zone — `upstream.servers`, or the route covering the parent if
+there is one. It is the one question a routed zone does not answer for itself: a
+validating client below elodin asks `home.arpa DS` on its way down from `arpa`,
+and the router the route points at replies out of its own zone with an unsigned
+"no data" instead of the signed proof that lives in the parent, which the client
+reads as a broken chain and turns into SERVFAIL for the whole zone. RFC 8375
+section 4 item 4.B requires that one query to be forwarded for exactly this
+reason. Names *below* the apex, and the apex's own `DNSKEY`, stay on the route —
+those are the zone's own data. That one query is also the only part of a routed
+zone the public upstream hears, and it names no host: the zone's own name, which
+its parent already publishes if the delegation exists.
+
 The answer cache is keyed on the question rather than on which upstream produced
 it, which holds because the routing table is built once at startup — restart
 after changing a route. `--check` and the startup log say out loud what each
@@ -620,7 +633,8 @@ is no chain to walk and refusing them would be worse than not validating them:
   default; a router here that does answer the zone wants
   [`upstream.zones`](#per-domain-upstreams) pointed at it, and if nothing serves
   the zone at all, [`special_use.home_arpa`](#reserved-names) answers those names
-  here. Either way the `home.arpa DS` query itself goes upstream, RFC 8375
+  here. Either way the `home.arpa DS` query itself goes to `upstream.servers` —
+  not down the route, and not answered from the reserved-name table — RFC 8375
   requiring that proof be fetched rather than invented. If you do run the zone,
   its private addresses trip [rebind
   protection](#dns-rebinding-protection) unless it is routed or named in

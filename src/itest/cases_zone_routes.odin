@@ -272,6 +272,41 @@ run_zone_route_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	start_case(r, "upstream.zones: the apex DS does not follow the route")
+	{
+		/*
+		The one exception to the case above, and issue #227.
+
+		A validating client below this server walks down from `example.` and
+		asks `corp.example. DS` for itself. The domain controller the route
+		points at is authoritative for the zone and answers that out of its own
+		data - an unsigned "no data", no NSEC - while the signed proof about the
+		delegation lives in the parent and nowhere else. The client reads that as
+		a chain broken rather than provably absent, which is SERVFAIL for every
+		name in the zone: the failure RFC 8375 section 4 item 4.B carves this
+		query out of the same MUST NOT to prevent, and the one the chain lookups
+		elodin makes on its own account already avoid by staying on the default
+		group.
+
+		Asserted on which mock was asked rather than on the answer, since what is
+		under test is where the question went. Both directions, because a
+		carve-out that sent it to both upstreams would keep the DS working and go
+		on telling the domain controller nothing it did not know, while a
+		selector that had simply stopped matching the zone would pass the
+		public-side half alone.
+		*/
+		mock_reset_counts(public)
+		mock_reset_counts(internal)
+		res := query_udp(udp_port, build_query("corp.example.", u16(dns.Type.DS)))
+		if check(r, res.ok, "no response") {
+			h, _ := parse_header(res.wire)
+			check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode for the routed apex DS")
+		}
+		check(r, mock_total(public) > 0, "the apex DS never reached the upstream that can answer it")
+		check(r, mock_total(internal) == 0, "the apex DS was sent to the zone's own authority")
+	}
+	end_case(r)
+
 	start_case(r, "upstream.zones: everything else still goes to upstream.servers")
 	{
 		/*

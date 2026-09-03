@@ -1,5 +1,6 @@
 package server
 
+import "elodin:dns"
 import "elodin:upstream"
 
 /*
@@ -19,7 +20,10 @@ for the one zone an RFC names.
 Three things follow from a route, and only the first is about where the packet
 goes:
 
-  1. The client's question is sent to the route's group instead of the default.
+  1. The client's question is sent to the route's group instead of the default -
+     every question but one. A `DS` at the route's own apex asks about the
+     delegation rather than about anything inside the zone, and the proof lives
+     in the parent; `route_group` sends that one to whoever answers the parent.
   2. The chain walk is not, ever. A router authoritative for `home.arpa.`
      answers `home.arpa. DS` out of its own zone - NODATA, unsigned, no NSEC -
      rather than forwarding to `arpa.` where the proof that the delegation
@@ -47,11 +51,14 @@ so it implies membership in `rebind.allow_domains` for the names it claims,
 rather than making them configure the same fact twice.
 
 What a route does not change is the cache. The key is name/type/class/DO/CD with
-no upstream identity in it, which stays sound only because a name always routes
-the same way: the table is built once at startup from a file that is never
-reloaded (SIGHUP reloads TLS certificates and nothing else). A future reload
-that could move a zone from one route to another would have to flush, or key on
-the route, or it would serve one upstream's answers on another's behalf.
+no upstream identity in it, which stays sound only because a question always
+routes the same way: the table is built once at startup from a file that is
+never reloaded (SIGHUP reloads TLS certificates and nothing else). A future
+reload that could move a zone from one route to another would have to flush, or
+key on the route, or it would serve one upstream's answers on another's behalf.
+The apex `DS` carve-out is within that: what it splits is one name's types, and
+the type is in the key, so the parent's answer and the zone's own cannot be
+served for each other.
 */
 Zone_Route :: struct {
 	// Canonical, lowercase, root-dotted, as `config.Zone_Route` left them.
@@ -71,13 +78,90 @@ same length that both match one name would have to be the same domain.
 what `resolve_query` holds. Matching is `name_at_or_below`: label boundaries and
 case-insensitive, so `notcorp.example.` is outside `corp.example.` and
 `NAS.Corp.Example.` is inside it.
+
+`type` is here for one carve-out, the same one `special_use_zone` makes and for
+the same reason: a `DS` query at a route's apex is answered by the zone's parent
+and by nothing else, so it is asked of whoever answers the parent rather than of
+the zone's own authority (issue #227). A validating stub below this server walks
+down from `arpa.` and asks `home.arpa. DS` for itself; the router the route
+points at is authoritative for `home.arpa.` and answers that out of its own zone
+- an unsigned NODATA with no NSEC beside it - while the signed proof that the
+delegation carries no DS lives in `arpa.`. The stub is then shown a chain broken
+rather than proved absent, which is Bogus, which is SERVFAIL for every name in
+the zone. RFC 8375 section 4 item 4.B carves the same query out of the same MUST
+NOT ("MUST result in forwarding whatever queries are necessary"), and
+`validator_query` already carves it out for the lookups this server makes on its
+own account, so leaving the client's copy of that question on the route was the
+one place the three disagreed.
+
+Three things the carve-out deliberately is not:
+
+  - It is not `DNSKEY`. A zone's keys are its own data, published in the zone
+    and signed by it, so the authority a route points at is exactly the right
+    place to ask - the argument that moves `DS` off the route is the argument
+    for leaving `DNSKEY` on it.
+  - It is not the names below the apex. `nas.home.arpa. DS` asks about a
+    delegation inside a zone that exists nowhere but this network, and the
+    answer to that one really is on the router.
+  - It is not conditional on the zone being delegated in the public tree.
+    Nothing at load can tell an internal zone from a public signed one, and the
+    unconditional form costs a zone with no public parent one query answered
+    NXDOMAIN or SERVFAIL by the default group - where following the route would
+    have got an unsigned NODATA that no validator can use either.
+
+What it does not touch is whether the answer is validated. `served_locally` still
+covers the routed zone's apex, so the parent's signed DS is passed to the client
+with the upstream's signatures intact and without the AD bit, for the client to
+check against its own anchor - which is exactly what `LOCALLY_SERVED_ZONES` does
+with the same query for `home.arpa.` today, and the client asking it is the only
+party that has a use for the proof.
+
+The privacy cost is one name and it is worth naming: a route otherwise means the
+public resolver never hears any part of the zone (issue #200), and the apex `DS`
+is now one question that reaches it. No host inside the zone is in it - the name
+is the zone's own, which its public parent already publishes if the delegation
+exists and answers NXDOMAIN for if it does not - and only a validating client
+below this server ever asks it. RFC 8375 section 4 item 4.B makes the same
+trade for `home.arpa.` explicitly, weighing this one query against SERVFAIL for
+every name in the zone.
+
+The parent rather than `s.group` flatly, because the parent may itself be routed:
+with `corp.example.` on the domain controller and `dev.corp.example.` on a lab
+server, `dev.corp.example. DS` is the domain controller's to answer, and it is
+the one machine that holds that delegation. `dns.name_parent` of a route domain
+is always shorter than the domain, and the root is refused as a route domain at
+load, so the walk up is one step and cannot land back on the same route.
 */
 @(private)
-route_group :: proc(s: ^Server, name: string) -> ^upstream.Group {
-	if route, found := zone_route(s, name); found {
+route_group :: proc(s: ^Server, name: string, type: dns.Type) -> ^upstream.Group {
+	target := name
+	if type == .DS && is_route_apex(s, name) {
+		target = dns.name_parent(name)
+	}
+	if route, found := zone_route(s, target); found {
 		return route.group
 	}
 	return s.group
+}
+
+/*
+Whether `name` is the apex of a route: a domain some entry names exactly.
+
+Equality against every route's domains rather than a question about the longest
+match, which comes to the same thing and says it in fewer moving parts: a domain
+equal to the name is the longest domain that can match it, so the route that
+claims the name is the route that names it.
+*/
+@(private)
+is_route_apex :: proc(s: ^Server, name: string) -> bool {
+	for candidate in s.routes {
+		for domain in candidate.domains {
+			if dns.name_equal_fold(name, domain) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 /*

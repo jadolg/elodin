@@ -26,6 +26,10 @@ Route_Mock :: struct {
 	reply:  []u8,
 	asked:  bool,
 	name:   string,
+	// The question this mock is waiting for, when the case cares. Empty answers
+	// whatever arrives first, which is what the cases that bind one pair of
+	// sockets and ask one question want.
+	want:   string,
 }
 
 /*
@@ -35,28 +39,72 @@ The name is what separates this from the mocks in the other files: a test that
 only asks whether a socket was written to cannot tell a routed question from the
 chain lookups the validator makes on its own account, and those two go to
 different groups on purpose.
+
+A `want` skips packets asking about anything else rather than answering them.
+The tests in this package run in parallel against sockets bound to port zero,
+and a port a finished test's mock has released is one the kernel can hand to the
+next test that asks - so a query another case's server is still retrying can
+arrive here, be recorded as the question this case asked, and fail it on a name
+it never mentioned. Waiting for the name turns that into a packet nobody
+answered, which is what it is.
 */
 @(private = "file")
 serve_route :: proc(x: ^Route_Mock) {
 	buf: [4096]u8
-	n, remote, err := net.recv_udp(x.socket, buf[:])
-	if err != nil || n < dns.HEADER_SIZE || len(x.reply) > len(buf) {
+	for {
+		n, remote, err := net.recv_udp(x.socket, buf[:])
+		if err != nil || n < dns.HEADER_SIZE || len(x.reply) > len(buf) {
+			return
+		}
+		asked_for := ""
+		if msg, derr := dns.decode_message(buf[:n], context.temp_allocator); derr == .None && len(msg.question) > 0 {
+			asked_for = msg.question[0].name
+		}
+		if x.want != "" && !dns.name_equal_fold(asked_for, x.want) {
+			continue
+		}
+		x.name = asked_for
+		x.asked = true
+		out: [4096]u8
+		copy(out[:], x.reply)
+		out[0], out[1] = buf[0], buf[1]
+		_, _ = net.send_udp(x.socket, out[:len(x.reply)], remote)
 		return
 	}
-	if msg, derr := dns.decode_message(buf[:n], context.temp_allocator); derr == .None && len(msg.question) > 0 {
-		x.name = msg.question[0].name
-	}
-	x.asked = true
-	out: [4096]u8
-	copy(out[:], x.reply)
-	out[0], out[1] = buf[0], buf[1]
-	_, _ = net.send_udp(x.socket, out[:len(x.reply)], remote)
 }
 
+/*
+Whether nothing asked `socket` about `name`.
+
+`mock_untouched` reads one packet and calls any packet at all a leak, which is
+sound for a socket nothing else in the process knows about and not for one whose
+port may have been another test's a moment ago - see `serve_route` above. This
+reads for as long as that one does and holds only the question this case asked
+against the socket.
+*/
 @(private = "file")
-route_query :: proc(name: string) -> []u8 {
+route_mock_quiet :: proc(socket: net.UDP_Socket, name: string) -> bool {
+	_ = net.set_option(socket, .Receive_Timeout, 20 * time.Millisecond)
+	defer _ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+	buf: [4096]u8
+	for {
+		n, _, err := net.recv_udp(socket, buf[:])
+		if err != nil || n < dns.HEADER_SIZE {
+			return true
+		}
+		msg, derr := dns.decode_message(buf[:n], context.temp_allocator)
+		if derr == .None && len(msg.question) > 0 && dns.name_equal_fold(msg.question[0].name, name) {
+			return false
+		}
+	}
+}
+
+// `type` defaults to the `A` every case here asked for before the apex `DS`
+// carve-out gave one of them a reason to ask for something else.
+@(private = "file")
+route_query :: proc(name: string, type: dns.Type = .A) -> []u8 {
 	questions := make([]dns.Question, 1, context.temp_allocator)
-	questions[0] = dns.Question{name = name, type = .A, class = .IN}
+	questions[0] = dns.Question{name = name, type = type, class = .IN}
 	msg := dns.Message{id = 0x7f7f, question = questions}
 	msg.flags.rd = true
 	wire, _, err := dns.encode_message(msg, context.temp_allocator)
@@ -73,6 +121,30 @@ route_reply :: proc(name: string, addr: [4]u8) -> []u8 {
 	question := make([]dns.Question, 1, context.temp_allocator)
 	question[0] = dns.Question{name = name, type = .A, class = .IN}
 	msg := dns.Message{question = question, answer = answer}
+	msg.flags.qr = true
+	msg.flags.rd = true
+	msg.flags.ra = true
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	if err != .None {
+		return nil
+	}
+	return wire
+}
+
+/*
+An empty answer that echoes the question, for the types with no `Rdata` here.
+
+`upstream.response_matches` compares the reply's first question with the query's
+name, type and class and drops a reply that differs, so a mock standing in for
+the parent of a routed zone cannot answer a `DS` query with the `A` record
+`route_reply` builds - the reply would be discarded as an off-path packet and
+the test would read as the upstream never having answered.
+*/
+@(private = "file")
+route_reply_nodata :: proc(name: string, type: dns.Type) -> []u8 {
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question{name = name, type = type, class = .IN}
+	msg := dns.Message{question = question}
 	msg.flags.qr = true
 	msg.flags.rd = true
 	msg.flags.ra = true
@@ -135,20 +207,20 @@ test_the_longest_route_wins :: proc(t: ^testing.T) {
 		routes = routes,
 	}
 
-	testing.expect(t, route_group(&s, "nas.corp.example.") == &broad, "the zone's own route did not answer for it")
-	testing.expect(t, route_group(&s, "corp.example.") == &broad, "the apex did not follow its route")
-	testing.expect(t, route_group(&s, "build.dev.corp.example.") == &narrow, "the longer route did not win")
-	testing.expect(t, route_group(&s, "dev.corp.example.") == &narrow, "the longer route did not take its own apex")
+	testing.expect(t, route_group(&s, "nas.corp.example.", .A) == &broad, "the zone's own route did not answer for it")
+	testing.expect(t, route_group(&s, "corp.example.", .A) == &broad, "the apex did not follow its route")
+	testing.expect(t, route_group(&s, "build.dev.corp.example.", .A) == &narrow, "the longer route did not win")
+	testing.expect(t, route_group(&s, "dev.corp.example.", .A) == &narrow, "the longer route did not take its own apex")
 
 	// Outside every route, and the two ways to be outside one: a different zone,
 	// and a name that merely ends in the same bytes without a label break.
-	testing.expect(t, route_group(&s, "example.com.") == &fallback, "an unrouted name left the default group")
-	testing.expect(t, route_group(&s, "notcorp.example.") == &fallback, "a suffix match was treated as a subtree")
+	testing.expect(t, route_group(&s, "example.com.", .A) == &fallback, "an unrouted name left the default group")
+	testing.expect(t, route_group(&s, "notcorp.example.", .A) == &fallback, "a suffix match was treated as a subtree")
 
 	// DNS names compare without regard to case, and nothing lowercases the
 	// question on the way in - the response echoes it back as the client spelled
 	// it - so the match has to fold case itself.
-	testing.expect(t, route_group(&s, "NAS.Corp.Example.") == &broad, "the match did not fold case")
+	testing.expect(t, route_group(&s, "NAS.Corp.Example.", .A) == &broad, "the match did not fold case")
 
 	// A server with no routes configured at all is every deployment that
 	// existed before this feature: everything goes to the default group.
@@ -156,7 +228,72 @@ test_the_longest_route_wins :: proc(t: ^testing.T) {
 		cfg   = &cfg,
 		group = &fallback,
 	}
-	testing.expect(t, route_group(&plain, "nas.corp.example.") == &fallback, "a server with no routes routed something")
+	testing.expect(t, route_group(&plain, "nas.corp.example.", .A) == &fallback, "a server with no routes routed something")
+	free_all(context.temp_allocator)
+}
+
+/*
+The apex `DS` goes to whoever answers the parent, which is not always the default
+group.
+
+`test_a_client_ds_query_at_a_routed_apex_leaves_the_route` below drives the
+carve-out through the resolver against the deployment it was written for, where
+the parent is `arpa.`, nothing routes it, and "the parent" and "the default
+group" are the same upstream. This is the selector on its own, on the fixture
+that tells those two apart: `corp.example.` on the domain controller and
+`dev.corp.example.` on a lab server, where the delegation `dev.corp.example. DS`
+asks about is held by the domain controller and by nothing else. Sending it to
+the public upstream would satisfy the sentence in issue #227 and still hand the
+stub an NXDOMAIN for a zone that exists, so the two halves are asserted apart.
+
+The single-label route is the edge the walk up has to survive: an internal
+`.test` zone's parent is the root, which is refused as a route domain at load,
+so `zone_route` finds nothing for it and the default group answers.
+*/
+@(test)
+test_an_apex_ds_is_asked_of_the_parents_own_upstream :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	broad := upstream.Group{}
+	narrow := upstream.Group{}
+	lab := upstream.Group{}
+	fallback := upstream.Group{}
+
+	s := Server {
+		cfg    = &cfg,
+		group  = &fallback,
+		routes = []Zone_Route {
+			{domains = []string{"corp.example."}, group = &broad},
+			{domains = []string{"dev.corp.example."}, group = &narrow},
+			{domains = []string{"test."}, group = &lab},
+		},
+	}
+
+	// The apex of the outermost route: `example.` is routed nowhere, so the
+	// parent's upstream is the default one.
+	testing.expect(t, route_group(&s, "corp.example.", .DS) == &fallback, "the apex DS followed its own route")
+	testing.expect(t, route_group(&s, "CORP.Example.", .DS) == &fallback, "the apex DS match did not fold case")
+
+	// The apex of a route carved out of another route: the parent is routed, and
+	// the machine it points at is the one holding that delegation.
+	testing.expect(
+		t,
+		route_group(&s, "dev.corp.example.", .DS) == &broad,
+		"the nested apex DS did not go to the parent zone's own upstream",
+	)
+
+	// A route whose parent is the root, which no route can claim.
+	testing.expect(t, route_group(&s, "test.", .DS) == &fallback, "a single-label route's apex DS did not fall back")
+
+	// Everything the carve-out is not: a DS below the apex, the apex DNSKEY, and
+	// the apex under any other type.
+	testing.expect(t, route_group(&s, "nas.corp.example.", .DS) == &broad, "a DS below the apex left the route")
+	testing.expect(t, route_group(&s, "corp.example.", .DNSKEY) == &broad, "the apex DNSKEY left the route")
+	testing.expect(t, route_group(&s, "corp.example.", .SOA) == &broad, "the apex SOA left the route")
+
+	// An unrouted name is not an apex, whatever the type: the DS for a public
+	// zone goes where every other question about it goes.
+	testing.expect(t, route_group(&s, "example.com.", .DS) == &fallback, "an unrouted DS moved")
+	testing.expect(t, route_group(&s, "notcorp.example.", .DS) == &fallback, "a suffix match was treated as an apex")
 	free_all(context.temp_allocator)
 }
 
@@ -278,6 +415,106 @@ test_an_unrouted_question_still_goes_to_the_default_upstream :: proc(t: ^testing
 	testing.expect(t, x.asked, "the default upstream was never asked")
 	testing.expect_value(t, x.name, "www.example.com.")
 	testing.expect(t, mock_untouched(route_socket), "an unrouted name was sent to the route's server")
+	free_all(context.temp_allocator)
+}
+
+/*
+The one question a client asks that does not follow the route: `DS` at the apex.
+
+Issue #227. A route sends the client's own questions to the local authority, and
+a validating stub below this server asks `home.arpa. DS` for itself on its way
+down from `arpa.`. The router the route points at is authoritative for
+`home.arpa.` and answers that out of its own zone - an unsigned NODATA, no NSEC
+- while the signed proof that the delegation carries no DS lives in `arpa.` and
+nowhere else. The stub sees a chain broken rather than proved absent, which is
+Bogus, which is SERVFAIL for every name in the zone: the failure RFC 8375
+section 4 item 4.B carves the apex `DS` out of the MUST NOT to prevent, and the
+one `special_use_zone` and `validator_query` already carve out here.
+
+`home.arpa.` with `special_use.home_arpa` off is the exact configuration the
+README recommends for that deployment - the key on refuses a route for the zone
+at load - so it is the fixture, rather than the `corp.example.` the other cases
+use.
+
+Four cases, because the carve-out has to be that narrow. A name below the apex
+is a question about a name that exists nowhere but this network, and its answer
+really is on the router. `DNSKEY` at the apex is the zone's own data, so the
+authority for the zone is the right place to ask even though `DS` beside it is
+not. And every other type at the apex - `A` stands in for them - is the ordinary
+routed question this feature exists for.
+*/
+@(test)
+test_a_client_ds_query_at_a_routed_apex_leaves_the_route :: proc(t: ^testing.T) {
+	Case :: struct {
+		name:     string,
+		type:     dns.Type,
+		to_route: bool,
+	}
+	cases := []Case {
+		{"home.arpa.", .DS, false},
+		{"nas.home.arpa.", .DS, true},
+		{"home.arpa.", .DNSKEY, true},
+		{"home.arpa.", .A, true},
+	}
+
+	for c in cases {
+		def_socket, derr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+		if !testing.expectf(t, derr == nil, "cannot bind the default mock: %v", derr) {
+			return
+		}
+		defer net.close(def_socket)
+		_ = net.set_option(def_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+		def_bound, _ := net.bound_endpoint(def_socket)
+
+		route_socket, rerr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+		if !testing.expectf(t, rerr == nil, "cannot bind the routed mock: %v", rerr) {
+			return
+		}
+		defer net.close(route_socket)
+		_ = net.set_option(route_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+		route_bound, _ := net.bound_endpoint(route_socket)
+
+		cfg := forwarding_config()
+		group := mock_group(t, cfg.upstream, def_bound.port)
+		defer upstream.destroy_group(group)
+		routed := mock_group(t, cfg.upstream, route_bound.port)
+		defer upstream.destroy_group(routed)
+
+		s := Server {
+			cfg    = &cfg,
+			group  = group,
+			routes = []Zone_Route{{domains = []string{"home.arpa."}, group = routed}},
+		}
+
+		x := Route_Mock {
+			socket = route_socket if c.to_route else def_socket,
+			reply  = route_reply_nodata(c.name, c.type),
+			want   = c.name,
+		}
+		mock := thread.create_and_start_with_poly_data(&x, serve_route)
+		_, _, ok := handle_query(&s, route_query(c.name, c.type), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		thread.join(mock)
+		thread.destroy(mock)
+
+		testing.expectf(t, ok, "nothing came back at all for %s %s", dns.type_name(c.type), c.name)
+		testing.expectf(
+			t,
+			x.asked,
+			"%s %s did not reach the %s upstream",
+			dns.type_name(c.type),
+			c.name,
+			"routed" if c.to_route else "default",
+		)
+		testing.expect_value(t, x.name, c.name)
+		testing.expectf(
+			t,
+			route_mock_quiet(route_socket if !c.to_route else def_socket, c.name),
+			"%s %s was sent to the %s upstream as well",
+			dns.type_name(c.type),
+			c.name,
+			"routed" if !c.to_route else "default",
+		)
+	}
 	free_all(context.temp_allocator)
 }
 

@@ -966,8 +966,12 @@ resolve_query :: proc(
 	does not. The client's question is the only thing that follows a route: the
 	chain lookups the validator makes go to the default group whatever the name,
 	which `validator_query` explains.
+
+	The type goes with the name for one question the client asks that does not
+	follow the route either - a `DS` at the route's own apex, which only the
+	zone's parent can prove and which `route_group` sends there.
 	*/
-	resp, winner, uerr := upstream.resolve(route_group(s, q.name), forwarded, allocator)
+	resp, winner, uerr := upstream.resolve(route_group(s, q.name, q.type), forwarded, allocator)
 	if uerr != .None {
 		logx.debugf("query %s %s from %s failed: %v", dns.type_name(q.type), q.name, client, uerr)
 		/*
