@@ -2103,6 +2103,24 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	if cfg.server.max_pending == 0 {
 		cfg.server.max_pending = cfg.server.workers * 8
 	}
+	/*
+	The table itself, refused rather than clamped.
+
+	`conn_manager_init` reads anything below one as one connection, so a server
+	configured with zero came up serving a single client and said "at most 0 at
+	once" on the startup line and in `elodin_connections_max` - a figure that
+	described neither the file nor the running server. It is also the number the
+	share below is derived from and reported against, so a nonsense table makes
+	a nonsense share: at or below zero the derivation and the clamp both land on
+	one, which then reads as "any one client prefix may hold all of them".
+	*/
+	if cfg.server.max_connections < 1 {
+		errorf(
+			l,
+			"server.max_connections must be at least 1 (it is %d); 512 is the default",
+			cfg.server.max_connections,
+		)
+	}
 	if cfg.server.max_connections_per_prefix < 0 {
 		errorf(l, "server.max_connections_per_prefix must not be negative")
 	}
@@ -2117,8 +2135,10 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	for. At or above `max_connections` there is no cap left to apply - the total
 	is reached first, from wherever the connections came - and storing that as
 	the table's own size is what makes it inert without `conn_spawn` needing a
-	special case for it. `max(..., 1)` is for a `max_connections` of zero or
-	less, which `conn_manager_init` already reads as one connection.
+	special case for it. The `max(..., 1)` guards keep the arithmetic sane for a
+	table the check above has already refused: the load fails, but validation
+	runs to the end first and the figures it prints on the way have to mean
+	something.
 	*/
 	if cfg.server.max_connections_per_prefix == 0 {
 		cfg.server.max_connections_per_prefix = max(cfg.server.max_connections / 2, 1)

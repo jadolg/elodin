@@ -1,5 +1,6 @@
 package config
 
+import "core:fmt"
 import "core:net"
 import "core:strings"
 import "core:testing"
@@ -922,6 +923,39 @@ test_the_connection_share_is_derived_from_the_table :: proc(t: ^testing.T) {
 	e, has := nerr.?
 	if testing.expect(t, has, "a negative share was accepted") {
 		testing.expect(t, strings.contains(e.messages[0], "max_connections_per_prefix"))
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+And the table the share is derived from has to be a table.
+
+`conn_manager_init` reads anything below one as one connection, so a zero or a
+negative used to load: the server came up serving a single client while the
+startup line and `--check` said "at most 0 at once ... any one client prefix may
+hold all of them", and `elodin_connections_max` published the same. Refused
+here for the reason `max_udp_response` is refused rather than clamped - a figure
+an operator can read off the server has to be the one the server is using - and
+because every figure below is derived from it.
+*/
+@(test)
+test_the_connection_table_must_be_at_least_one :: proc(t: ^testing.T) {
+	sources := []string{"max_connections: 0", "max_connections: -5"}
+	for src in sources {
+		_, err := load_string(
+			fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nserver:\n  %s\n", src),
+			context.temp_allocator,
+		)
+		e, has := err.?
+		if testing.expectf(t, has, "%q was accepted", src) {
+			testing.expectf(
+				t,
+				strings.contains(e.messages[0], "server.max_connections must be at least 1"),
+				"%q was refused for the wrong reason: %s",
+				src,
+				e.messages[0],
+			)
+		}
 	}
 	free_all(context.temp_allocator)
 }

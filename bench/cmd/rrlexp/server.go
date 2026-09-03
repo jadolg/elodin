@@ -61,13 +61,25 @@ connectionBlock is the arm's connection-table settings, indented for the templat
 Empty for every arm that is about the response budget, which is what leaves them
 on the shipped 512 with a share derived from it. The connection arms name all
 three, since what they are about is the relationship between the three numbers.
+
+Each figure is written only when the arm set it. A zero `client_timeout` emitted
+as `0s` is not the default - it is no read timeout at all, so an idle connection
+would be held for the run whatever the arm meant - and an arm that pins one
+figure and not another should get the shipped value for the rest rather than a
+zero that reads as a decision.
 */
 func connectionBlock(a arm) string {
-	if a.maxConns == 0 {
-		return ""
+	var b strings.Builder
+	if a.maxConns > 0 {
+		fmt.Fprintf(&b, "  max_connections: %d\n", a.maxConns)
 	}
-	return fmt.Sprintf("  max_connections: %d\n  max_connections_per_prefix: %d\n  client_timeout: %s\n",
-		a.maxConns, a.perPrefix, a.clientTimeout)
+	if a.perPrefix > 0 {
+		fmt.Fprintf(&b, "  max_connections_per_prefix: %d\n", a.perPrefix)
+	}
+	if a.clientTimeout > 0 {
+		fmt.Fprintf(&b, "  client_timeout: %s\n", a.clientTimeout)
+	}
+	return b.String()
 }
 
 // armServer is what one arm's configuration is filled in from.
