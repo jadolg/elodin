@@ -279,6 +279,102 @@ test_a_connection_past_the_limit_is_counted :: proc(t: ^testing.T) {
 	testing.expect_value(t, sync.atomic_load(&s.stats.conn_failed), u64(0))
 }
 
+/*
+A client that has filled its share of the table is refused with the table not
+full.
+
+The accept loop is where this has to be shown. `conn_spawn` refusing over the
+share is one thing; the loop reading the client's prefix off the address the
+accept returned, charging the connection to it, and turning the refusal into
+`conn_refused=` is the other, and a share checked against a prefix nobody filled
+in would pass every unit test in `conns_test.odin` while bounding nothing.
+
+`max_connections` of 4 with a share of 1, so the refusal cannot be the table
+running out: three slots are free when the second connection from loopback is
+turned away, and the case says so afterwards rather than leaving it to be
+inferred from the counter. Both connections come from 127.0.0.1, which is one
+/24 and therefore one client.
+*/
+@(test)
+test_a_connection_over_its_prefix_share_is_refused :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	cfg.listeners.udp.enabled = false
+	cfg.listeners.tcp = config.Listener {
+		enabled = true,
+		address = "127.0.0.1",
+		port    = 0,
+	}
+	cfg.listeners.dot.enabled = false
+	cfg.listeners.doh.enabled = false
+	cfg.cache.enabled = false
+	cfg.blocking.enabled = false
+	cfg.log.queries = false
+	cfg.server.max_connections = 4
+	// Set rather than left at the default, which is zero: the derivation from
+	// `max_connections` happens at load, and this configuration never went
+	// through it.
+	cfg.server.max_connections_per_prefix = 1
+	cfg.server.client_timeout = 5 * time.Second
+
+	handler_pool := pool.make_pool(1)
+	s := Server {
+		cfg          = &cfg,
+		handler_pool = handler_pool,
+	}
+
+	l: Listeners
+	if !start_listeners(&s, &l) {
+		pool.destroy(handler_pool)
+		testing.expect(t, false, "could not start the TCP listener")
+		return
+	}
+	defer {
+		stop_listeners(&l)
+		pool.destroy(handler_pool)
+		destroy_listeners(&l)
+	}
+
+	bound, berr := net.bound_endpoint(l.tcp_socket)
+	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
+		return
+	}
+
+	// Held open with nothing written on it, which is the shape of the problem:
+	// the connection asks no questions, so nothing charges it to a budget, and
+	// it occupies its slot until `client_timeout` gives up on it.
+	first, ferr := net.dial_tcp(bound)
+	if !testing.expectf(t, ferr == nil, "cannot open the first connection: %v", ferr) {
+		return
+	}
+	defer net.close(first)
+
+	if !testing.expect(t, wait_until(slot_taken, &l, 2 * time.Second), "the first connection never landed") {
+		return
+	}
+
+	second, serr := net.dial_tcp(bound)
+	if !testing.expectf(t, serr == nil, "cannot open the second connection: %v", serr) {
+		return
+	}
+	defer net.close(second)
+
+	probe := Refused_Probe {
+		server = &s,
+		want   = 1,
+	}
+	counted := wait_until(conn_refused_reached, &probe, 2 * time.Second)
+	testing.expectf(
+		t,
+		counted,
+		"a second connection from one prefix was served or lost rather than refused: conn_refused=%d",
+		sync.atomic_load(&s.stats.conn_refused),
+	)
+	// The premise the refusal rests on: the table had room, so what refused the
+	// connection was the client's share of it and not `max_connections`.
+	testing.expect_value(t, active_connections(&l.conns), 1)
+	testing.expect_value(t, sync.atomic_load(&s.stats.conn_failed), u64(0))
+}
+
 @(private = "file")
 month_number :: proc(name: string) -> int {
 	names := []string{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}

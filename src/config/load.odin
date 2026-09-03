@@ -195,6 +195,7 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 	opt_int(l, n, "workers", &cfg.server.workers, "server")
 	opt_int(l, n, "upstream_workers", &cfg.server.upstream_workers, "server")
 	opt_int(l, n, "max_connections", &cfg.server.max_connections, "server")
+	opt_int(l, n, "max_connections_per_prefix", &cfg.server.max_connections_per_prefix, "server")
 	opt_int(l, n, "max_pending", &cfg.server.max_pending, "server")
 	// A size, so "1232" and "1232B" and "4KiB" all read, the same as the cache
 	// sizes do.
@@ -2102,6 +2103,30 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	if cfg.server.max_pending == 0 {
 		cfg.server.max_pending = cfg.server.workers * 8
 	}
+	if cfg.server.max_connections_per_prefix < 0 {
+		errorf(l, "server.max_connections_per_prefix must not be negative")
+	}
+	/*
+	One client's share of the connection table, worked out here for the reason
+	`max_pending` is: `--check` and the run that follows it then agree by
+	construction, and a figure nobody wrote in the file is one an operator can
+	still read off the server.
+
+	Half of the table, and never more than the table. Half is what leaves the
+	other half for everybody else, which is the whole property the cap exists
+	for. At or above `max_connections` there is no cap left to apply - the total
+	is reached first, from wherever the connections came - and storing that as
+	the table's own size is what makes it inert without `conn_spawn` needing a
+	special case for it. `max(..., 1)` is for a `max_connections` of zero or
+	less, which `conn_manager_init` already reads as one connection.
+	*/
+	if cfg.server.max_connections_per_prefix == 0 {
+		cfg.server.max_connections_per_prefix = max(cfg.server.max_connections / 2, 1)
+	}
+	cfg.server.max_connections_per_prefix = min(
+		cfg.server.max_connections_per_prefix,
+		max(cfg.server.max_connections, 1),
+	)
 	// A group on its own would read as a privilege drop that was configured,
 	// and nothing at all is what it would do.
 	if cfg.server.group != "" && cfg.server.user == "" {

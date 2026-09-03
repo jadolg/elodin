@@ -137,6 +137,9 @@ main :: proc() {
 	section(&r, "rate limiting")
 	run_rate_limit_cases(&r)
 
+	section(&r, "connection limits")
+	run_connection_limit_cases(&r)
+
 	section(&r, "client access control")
 	run_acl_cases(&r)
 

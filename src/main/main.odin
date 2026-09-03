@@ -453,6 +453,14 @@ main :: proc() {
 			len(cfg.rewrites))
 		fmt.printfln("  %s", sizing_line(cfg.server))
 		fmt.printfln("  %s", allow_from_line(cfg.server))
+		// Only where it applies, as at startup: with no stream listener there is
+		// no connection table for either figure to bound.
+		if config.stream_listeners_enabled(cfg.listeners) {
+			fmt.printfln(
+				"  %s",
+				server.connection_limits_line(cfg.server.max_connections, cfg.server.max_connections_per_prefix),
+			)
+		}
 		for rule in misrouted {
 			fmt.printfln("  warning: %s", route_rule_warning(rule, context.temp_allocator))
 		}

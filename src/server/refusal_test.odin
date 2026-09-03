@@ -91,12 +91,37 @@ wording stays free to change.
 @(test)
 test_a_spawn_failure_names_its_own_cause :: proc(t: ^testing.T) {
 	limit := spawn_failure_words(.Limit_Reached)
+	share := spawn_failure_words(.Prefix_Limit_Reached)
 	failed := spawn_failure_words(.Thread_Failed)
 
 	testing.expect(
 		t,
 		strings.contains(limit.line, "server.max_connections") && strings.contains(limit.hint, "raise"),
 		"a full connection limit does not tell the operator to raise it",
+	)
+	/*
+	And a client that has filled its own share is not told the table is full.
+
+	The two are one connection apart and a `warn` apart, and the wrong one of
+	them is worse than saying nothing: an operator whose table is half empty,
+	told to raise `max_connections`, raises it and hands the client that filled
+	its share a larger share of a larger table. So the line names the setting
+	that actually refused the connection.
+	*/
+	testing.expect(
+		t,
+		strings.contains(share.line, "server.max_connections_per_prefix"),
+		"a connection refused over one client's share does not name the setting that refused it",
+	)
+	testing.expect(
+		t,
+		strings.contains(share.hint, "raise server.max_connections_per_prefix"),
+		"a filled share does not tell the operator which figure to raise",
+	)
+	testing.expect(
+		t,
+		strings.contains(share.hint, "conn_refused="),
+		"a filled share does not say where it is counted",
 	)
 	testing.expect(
 		t,
@@ -118,7 +143,58 @@ test_a_spawn_failure_names_its_own_cause :: proc(t: ^testing.T) {
 	Shared, whichever cause happened first would suppress the other for the
 	lifetime of the process - so a server that filled its connection limit in the
 	first minute would never say a word about the pids ceiling it hit an hour
-	later.
+	later, or about the client that spent the afternoon holding its whole share.
 	*/
-	testing.expect(t, limit.reported != failed.reported, "both spawn failures share one once-only flag")
+	testing.expect(t, limit.reported != failed.reported, "the two connection limits share one once-only flag")
+	testing.expect(t, share.reported != limit.reported, "a filled share is silenced by a full table")
+	testing.expect(t, share.reported != failed.reported, "a filled share is silenced by a refused thread")
+}
+
+/*
+Each cause names the limit that refused the connection, not simply a limit.
+
+The lines take a number, and there are two it could be. A share refused against
+`max_connections` reads as a table that is full at a moment when it is mostly
+empty - which is the same wrong turn the wording is careful to avoid, arrived at
+through the argument instead of the format string. Nothing else in the suite
+would notice: both lines still print a plausible figure.
+*/
+@(test)
+test_a_spawn_failure_names_the_limit_that_refused_it :: proc(t: ^testing.T) {
+	cm: Conn_Manager
+	conn_manager_init(&cm, 512, 256)
+	defer conn_manager_shutdown(&cm)
+
+	testing.expect_value(t, spawn_failure_limit(.Limit_Reached, &cm), 512)
+	testing.expect_value(t, spawn_failure_limit(.Prefix_Limit_Reached, &cm), 256)
+	// A thread the OS would not start happened below the table, so the table is
+	// the figure that says "below": see the line it prints.
+	testing.expect_value(t, spawn_failure_limit(.Thread_Failed, &cm), 512)
+}
+
+/*
+What the connection table allows, said once at startup.
+
+The default share is derived from `max_connections` at load, so neither figure
+need appear in anybody's configuration file - and an operator whose client
+cannot connect has no other place to read them. The no-cap form is the one worth
+pinning: it has to say that one client may hold the table, because that is the
+surprising half of that configuration.
+*/
+@(test)
+test_the_connection_limits_line_says_what_one_client_may_hold :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+
+	capped := connection_limits_line(512, 256)
+	testing.expect(t, strings.contains(capped, "512"), "the line does not say how many connections there are")
+	testing.expect(t, strings.contains(capped, "256"), "the line does not say what one client may hold")
+
+	// A share as large as the table is no cap, and reads as one rather than as a
+	// limit that happens never to be reached.
+	uncapped := connection_limits_line(512, 512)
+	testing.expect(
+		t,
+		strings.contains(uncapped, "all of them"),
+		"a share as large as the table is not reported as no cap at all",
+	)
 }

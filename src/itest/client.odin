@@ -365,6 +365,59 @@ tcp_pipeline_flood :: proc(tcp_port: int, query: []u8, count: int, drain := 700 
 }
 
 /*
+Open `count` connections at once, ask one question on each, and count the
+answers.
+
+Every connection is opened before any question is asked, and that order is the
+whole of it. A connection that is answered and then closed hands its slot back,
+so a run that opened and finished them one at a time would find room for every
+one however small a share of the table its client is allowed - which is a client
+using connections rather than holding them, and not the thing being measured.
+
+A refusal is not visible at the moment it happens: the kernel completes the
+handshake out of the listen backlog before the server sees the connection, so
+the dial succeeds whether or not there was room. It shows up as the question on
+that connection going unanswered - a reset, usually, since the server closes
+with the query still unread.
+*/
+tcp_hold_and_query :: proc(
+	tcp_port: int,
+	query: []u8,
+	count: int,
+	timeout := CLIENT_TIMEOUT,
+) -> (
+	answered: int,
+	opened: int,
+) {
+	sockets := make([]net.TCP_Socket, count, context.temp_allocator)
+	for i in 0 ..< count {
+		socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = tcp_port})
+		if err != nil {
+			break
+		}
+		_ = net.set_option(socket, .Receive_Timeout, timeout)
+		_ = net.set_option(socket, .Send_Timeout, timeout)
+		sockets[i] = socket
+		opened += 1
+	}
+	defer {
+		for i in 0 ..< opened {
+			net.close(sockets[i])
+		}
+	}
+
+	for i in 0 ..< opened {
+		conn := Test_Conn {
+			socket = sockets[i],
+		}
+		if stream_query(&conn, query, context.temp_allocator).ok {
+			answered += 1
+		}
+	}
+	return
+}
+
+/*
 `conn_read_full` for a plain socket, and also how the read ended.
 
 The end of the stream and a reset are the same "no more answers" to the loop

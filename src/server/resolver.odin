@@ -56,7 +56,9 @@ Stats :: struct {
 	*/
 	refused:      u64,
 	/*
-	Connections turned away because `server.max_connections` was already full.
+	Connections turned away for want of a slot: `server.max_connections` full,
+	or this client's prefix already holding all of
+	`server.max_connections_per_prefix` that it may.
 
 	Counted rather than only logged, because the log says it once. The line for
 	this is demoted to `debug` after the first, on the reasoning that a peer
@@ -65,16 +67,20 @@ Stats :: struct {
 	on counting. Without this, a server sitting at its limit for a week shows one
 	`warn` from the first minute and nothing since.
 
-	Apart from `refused`, which is the allow list turning a source away: this is
-	a client this server would serve and has no room for, and the setting to
-	reach for is a different one.
+	The two limits share the counter because they are the same event to whoever
+	is watching it: a client this server would serve, refused because there is no
+	room for it. Which figure did the refusing is in the `warn` line, and it has
+	to be, since raising the wrong one of the two makes the other worse.
+
+	Apart from `refused`, which is the allow list turning a source away, and
+	apart from `conn_failed`, which is nothing here deciding anything.
 	*/
 	conn_refused: u64,
 	/*
 	Connections turned away because the OS would not start a thread for one.
 
-	Counted apart from `conn_refused` because it happens *below* the limit -
-	`RLIMIT_NPROC`, a cgroup `pids.max`, or memory - and the two point an
+	Counted apart from `conn_refused` because it happens *below* every limit
+	here - `RLIMIT_NPROC`, a cgroup `pids.max`, or memory - and the two point an
 	operator in opposite directions. Folded together, a host that ran out of
 	threads at a tenth of `max_connections` would read as a server that had
 	filled it, and the obvious response would be to raise a number that was never

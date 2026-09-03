@@ -108,7 +108,16 @@ report_bind_failure :: proc(setting: string, address: string, port: int, err: ne
 }
 
 start_listeners :: proc(s: ^Server, l: ^Listeners) -> bool {
-	conn_manager_init(&l.conns, s.cfg.server.max_connections)
+	conn_manager_init(&l.conns, s.cfg.server.max_connections, s.cfg.server.max_connections_per_prefix)
+	// Said only where it applies: with every stream listener off there are no
+	// client connections for the table to bound, and the line would be about a
+	// limit nothing in this run can reach.
+	if config.stream_listeners_enabled(s.cfg.listeners) {
+		logx.infof(
+			"%s",
+			connection_limits_line(s.cfg.server.max_connections, s.cfg.server.max_connections_per_prefix),
+		)
+	}
 
 	if s.cfg.listeners.udp.enabled {
 		if !start_udp(s, l) {
@@ -526,6 +535,35 @@ report_rate_limited :: proc(client: string, proto: Protocol, closing: bool) {
 }
 
 /*
+What the connection table allows, said once at startup.
+
+Neither figure is in anybody's file by default - `max_connections` ships with one
+and the per-prefix share is derived from it at load - so an operator working out
+why a client cannot connect has nowhere else to read them. Returned rather than
+printed so a test can hold the two forms side by side, and so `--check` can say
+the same thing in the same words - an operator reads that before restarting, and
+two wordings of one fact drift apart.
+
+The no-cap form is not a shorter version of the other: it says the thing worth
+knowing about that configuration, which is that one client may take the table.
+That is where this server was before the setting existed, and it is still
+reachable on purpose, by setting the share to `max_connections` or above.
+*/
+connection_limits_line :: proc(limit, prefix_limit: int) -> string {
+	if prefix_limit <= 0 || prefix_limit >= limit {
+		return fmt.tprintf(
+			"connections: at most %d at once across TCP, DoT and DoH, and any one client prefix (/24, /64) may hold all of them",
+			limit,
+		)
+	}
+	return fmt.tprintf(
+		"connections: at most %d at once across TCP, DoT and DoH, of which one client prefix (/24, /64) may hold %d; connections past a prefix's share are refused and counted as conn_refused=",
+		limit,
+		prefix_limit,
+	)
+}
+
+/*
 Say why a connection could not be given a thread, once, and then quietly.
 
 The same reasoning as `report_refusal`, and reached the same way: a peer opening
@@ -535,29 +573,36 @@ that would change the outcome, and because a connection refused for want of a
 slot and one refused for want of an allow-list entry look identical from the
 client's side.
 
-The two causes are told apart because they ask for opposite things. Naming
+The three causes are told apart because they ask for different things. Naming
 `max_connections` at a host that ran out of threads sends an operator to raise a
-limit that was never the bound, and the raise makes it worse. Each keeps its own
-flag, so one of them going quiet does not silence the other.
+limit that was never the bound, and the raise makes it worse; naming it at a
+client that has filled its own share sends them to raise the table, which hands
+that same client more of it and still refuses the next connection from it. Each
+keeps its own flag, so one of them going quiet does not silence the others.
 */
 @(private)
 conn_limit_reported: bool
 
 @(private)
+conn_prefix_limit_reported: bool
+
+@(private)
 conn_failed_reported: bool
 
 /*
-Everything that differs between the two causes, chosen in one place.
+Everything that differs between the three causes, chosen in one place.
 
 Split out of the reporter because the choosing is the part that can be wrong and
 the printing is not: a branch inverted here says "raising max_connections will
 not help" to the operator whose only problem is `max_connections`, and tells the
-host that ran out of pids to raise it. Both lines still appear in the log, and
-both still count something, so nothing downstream of the mistake looks wrong.
-Returned as data so a test can hold the two side by side - the same reason
+host that ran out of pids to raise it. Every line still appears in the log, and
+every one still counts something, so nothing downstream of the mistake looks
+wrong. Returned as data so a test can hold them side by side - the same reason
 `refused_unit` is its own procedure.
 
-`brief` and `line` take the transport and the limit, in that order.
+`brief` and `line` take the transport and the limit, in that order, and which
+limit that is comes from `spawn_failure_limit`: a share refused against the
+table's own size would read as a table that is full when it is not.
 */
 @(private)
 Spawn_Failure_Words :: struct {
@@ -571,13 +616,22 @@ Spawn_Failure_Words :: struct {
 
 @(private)
 spawn_failure_words :: proc(why: Spawn_Result) -> Spawn_Failure_Words {
-	if why == .Limit_Reached {
+	switch why {
+	case .Limit_Reached:
 		return Spawn_Failure_Words {
 			reported = &conn_limit_reported,
 			brief = "%s: refusing a connection, the limit of %d is reached",
 			line = "%s: refusing a connection, server.max_connections (%d) is reached",
 			hint = "raise server.max_connections if this server should hold more clients at once; these are counted as conn_refused= in the stats line, and further ones are logged at debug level",
 		}
+	case .Prefix_Limit_Reached:
+		return Spawn_Failure_Words {
+			reported = &conn_prefix_limit_reported,
+			brief = "%s: refusing a connection, this client's prefix already holds the %d it may",
+			line = "%s: refusing a connection, this client's /24 or /64 already holds server.max_connections_per_prefix (%d) of them",
+			hint = "raise server.max_connections_per_prefix if one client network should be able to hold more of server.max_connections at once, or set it to max_connections to let any one of them hold the table; these are counted as conn_refused= in the stats line, and further ones are logged at debug level",
+		}
+	case .Started, .Thread_Failed:
 	}
 	return Spawn_Failure_Words {
 		reported = &conn_failed_reported,
@@ -587,8 +641,25 @@ spawn_failure_words :: proc(why: Spawn_Result) -> Spawn_Failure_Words {
 	}
 }
 
+/*
+The limit a refusal is about, which is not the same number for all three.
+
+A prefix's share is the figure that refused the connection, so it is the figure
+the line has to name: printing `max_connections` there would tell an operator
+their table is full at a moment when half of it is free, and send them to raise
+the setting that was not the bound. Paired with the words in a procedure of its
+own for the same reason they are - the pairing is what can be wrong.
+*/
 @(private)
-report_spawn_failure :: proc(proto: Protocol, why: Spawn_Result, limit: int) {
+spawn_failure_limit :: proc(why: Spawn_Result, cm: ^Conn_Manager) -> int {
+	// Set once by `conn_manager_init` and never written again, so read without
+	// the manager's lock - which the accept loop is not holding here anyway.
+	return cm.prefix_limit if why == .Prefix_Limit_Reached else cm.limit
+}
+
+@(private)
+report_spawn_failure :: proc(proto: Protocol, why: Spawn_Result, cm: ^Conn_Manager) {
+	limit := spawn_failure_limit(why, cm)
 	words := spawn_failure_words(why)
 	say, first := report_once(words.reported, logx.enabled(.Debug))
 	if !say {
@@ -1013,7 +1084,16 @@ accept_loop :: proc(data: rawptr) {
 		job.socket = client_socket
 		job.client = client
 
-		if spawned := conn_spawn(&l.conns, job, stream_job); spawned != .Started {
+		/*
+		The client's prefix goes with the job, so the connection is counted
+		against its own share of the table as well as against the total. It is
+		read here, from the address the accept returned, rather than anywhere
+		further in: this is the only place that sees a connection before it costs
+		a thread, and a share checked after the thread exists would be a limit on
+		nothing.
+		*/
+		if spawned := conn_spawn(&l.conns, job, stream_job, client_prefix(client.address));
+		   spawned != .Started {
 			/*
 			Counted first, and logged only once.
 
@@ -1024,21 +1104,26 @@ accept_loop :: proc(data: rawptr) {
 			`conn_refused=` in the stats line long after the one `warn` scrolled
 			away.
 
-			Which of the two refusals it was decides both the counter and the
-			line. A host that cannot give this process another thread refuses
-			connections well below `max_connections`, and telling that operator to
-			raise `max_connections` sends them somewhere the fix is not.
+			Which refusal it was decides the line, and the counter follows what
+			the refusal says about this server. Both limits are this server
+			deciding it has no room for a client it would otherwise serve, so both
+			are `conn_refused=` and an operator watching the counter sees a client
+			being turned away either way; the `warn` under it says which figure
+			did it, because raising the wrong one of the two makes the other
+			worse. A host that cannot give this process another thread is not a
+			limit doing its job at all - it happens below both, and it is counted
+			apart as `conn_failed=` so that raising nothing is the advice.
 
 			`report_spawn_failure` releases the temp arena the line was formatted
 			out of: this loop is the one place that never resets it, and nothing
 			here outlives the iteration.
 			*/
-			if spawned == .Limit_Reached {
-				sync.atomic_add(&ctx.server.stats.conn_refused, 1)
-			} else {
+			if spawned == .Thread_Failed {
 				sync.atomic_add(&ctx.server.stats.conn_failed, 1)
+			} else {
+				sync.atomic_add(&ctx.server.stats.conn_refused, 1)
 			}
-			report_spawn_failure(ctx.proto, spawned, l.conns.limit)
+			report_spawn_failure(ctx.proto, spawned, &l.conns)
 			net.close(client_socket)
 			free(job)
 		}

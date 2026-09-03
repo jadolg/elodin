@@ -26,6 +26,19 @@ server:
   workers: 0
   upstream_workers: 0 # threads used by the "race" strategy; 0 is half of `workers`
   max_connections: 512 # concurrent TCP / DoT / DoH connections
+  # How many of those one client may hold. 0 derives half of max_connections,
+  # which leaves the rest of the table for everybody else; anything at or above
+  # max_connections is no cap, and lets one client hold all of it.
+  #
+  # A client here is a /24 or a /64, the same unit the rate limit is kept in -
+  # so on a private network every device on 192.168.1.0/24 shares one share
+  # between them, and a resolver serving more devices than half its table wants
+  # this raised or max_connections raised under it. On a public instance it is
+  # the other way round: without it, one stranger holding idle connections can
+  # take every slot and lock out the clients who use TCP, DoT or DoH. Nothing
+  # else bounds that - the rate limit is spent by queries, and a connection that
+  # asks nothing is free - so this is the only setting that says otherwise.
+  max_connections_per_prefix: 0
   client_timeout: 10s
   # Queries queued or in flight before new ones are dropped. 0 derives it as
   # `workers * 8`, which keeps the backlog to about eight upstream round trips

@@ -289,7 +289,7 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 		&b,
 		"elodin_connections_refused_total",
 		.Counter,
-		"Connections turned away because server.max_connections was full.",
+		"Connections turned away for want of a slot: server.max_connections was full, or the client's prefix already held its share of it.",
 		st.conn_refused,
 	)
 	metrics.scalar(
@@ -312,6 +312,17 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 		.Gauge,
 		"What server.max_connections allows.",
 		i64(s.cfg.server.max_connections),
+	)
+	// Published beside the total because `_active` against `_max` alone cannot
+	// say whether a server refusing connections is full or is refusing one
+	// client that has filled its own share - which are different problems with
+	// different settings behind them.
+	metrics.scalar(
+		&b,
+		"elodin_connections_max_per_prefix",
+		.Gauge,
+		"How many of server.max_connections one client prefix (/24, /64) may hold; equal to the total when there is no such cap.",
+		i64(s.cfg.server.max_connections_per_prefix),
 	)
 
 	limited, slipped := rate_limit_stats(s.limiter)
