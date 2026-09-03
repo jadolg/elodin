@@ -187,6 +187,16 @@ type arm struct {
 	*/
 	dur    time.Duration
 	sample time.Duration
+	/*
+		`listeners.udp.readers` for the arm.
+
+		Zero leaves it out, which derives one per usable CPU - what a deployment
+		gets. The reader arms pin it instead, because the pair of them is asking
+		what the reader count itself is worth and a figure that depends on the
+		machine would make the two rows incomparable on any other one. See
+		`readerArms`.
+	*/
+	readers int
 	// `cache.max_entries` for the arm. Zero is the harness's own large figure;
 	// see `armCache`.
 	cacheEntries int
@@ -321,6 +331,7 @@ var (
 	workers    = flag.Int("workers", 64, "server.workers, pinned rather than derived from this machine")
 	only       = flag.String("only", "", "run only arms whose name contains this")
 	keep       = flag.Bool("keep", false, "keep the generated configs and server logs")
+	serverCPUs = flag.String("server-cpus", "", "run the server under `taskset -c` on these CPUs, keeping it off the generator's (e.g. 0,1)")
 	logLevel   = flag.String("log-level", "info", "log.level for the server under test")
 	logQueries = flag.Bool("log-queries", false, "log.queries for the server under test")
 	out        = flag.String("out", "", "also write the report here")
@@ -422,6 +433,7 @@ func matrix() []arm {
 	arms = append(arms, dohArms()...)
 	arms = append(arms, connectionArms()...)
 	arms = append(arms, handshakeArms()...)
+	arms = append(arms, readerArms()...)
 	arms = append(arms, v6Arms()...)
 	return arms
 }
