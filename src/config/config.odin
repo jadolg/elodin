@@ -451,6 +451,15 @@ Server_Config :: struct {
 	`max_connections` raised underneath it. On a public instance the opposite is
 	true and the default is the point: a stranger's /24 gets half the table at
 	most, whatever it does.
+
+	And note what it does not bound, which is an actor. A prefix is not a person:
+	an attacker holding a /48 has 65,536 /64s to take a share from, so on IPv6 the
+	table can still be filled out of enough prefixes - two of them, against a
+	share of half. What the figure buys there is cost rather than impossibility,
+	and lowering it is what raises the cost: a share of 16 makes a table of 512
+	thirty-two prefixes' work instead of two. Same granularity, and the same
+	limitation, as `rate_limit` - deliberately, so that the two agree about who a
+	client is. See `client_prefix`.
 	*/
 	max_connections_per_prefix: int,
 	/*

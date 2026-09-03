@@ -854,6 +854,15 @@ connection per device and reuses it, so a share in the low tens is generous for
 anybody legitimate and leaves a stranger holding a fortieth of the table instead
 of half of it.
 
+Note that what it bounds is a *prefix* rather than an actor, and the two are
+furthest apart on IPv6: a /48 is 65,536 /64s and a routine allocation from a
+hosting provider or a tunnel broker, so a stranger who has one can take a share
+from each and fill the table out of as many prefixes as that takes. Two of them
+are enough against the default 256. The share is what makes that expensive
+rather than impossible — at 16, a table of 512 costs 32 prefixes instead of two
+— and it is the same granularity, with the same limitation, as the response
+budget above.
+
 UDP is unaffected either way — one reader thread, no per-client state, nothing to
 refuse — which is why a resolver whose table has been taken can look healthy on
 datagrams while every TCP, DoT and DoH client gets nothing.
