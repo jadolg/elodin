@@ -116,7 +116,7 @@ Four things a publicly reachable instance meets are arms of their own:
 | `-only` | what it asks |
 |---|---|
 | `slowloris` | one prefix holding the connection table idle, with and without a share of it |
-| `handshake-flood` | a client that only handshakes, over DoT and DoH, against a DoT victim |
+| `handshake-flood` | a client that only handshakes, over DoT and DoH, against a DoT victim, with its own quiet baseline |
 | `v6/` | the prefix-isolation arms over IPv6, where a prefix is a /64 |
 | `-soak 1h` | one flood for an hour, with the server read throughout rather than at the end |
 

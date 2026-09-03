@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -73,12 +74,25 @@ func runDoT(dst, certPath string, c clientSpec, dur time.Duration, tag string, t
 	return runStream(func() (net.Conn, error) { return dialDoT(dst, c.src, cfg) }, c, dur, tag, track, st)
 }
 
-// dialDoT is one DoT connection from `src`, handshake included: `tls.Client`
-// defers it, and a client that has not handshaked has not yet cost the server
-// the thing these arms are about.
+/*
+dialDoT is one DoT connection from `src`, handshake included: `tls.Client`
+defers it, and a client that has not handshaked has not yet cost the server the
+thing these arms are about.
+
+Bounded, for the reason `handshakeWorker` bounds its own: the kernel completes
+the TCP handshake out of the listen backlog, so this dial succeeds against a
+server with no thread to spare and then waits in `Handshake` for one. That wait
+has no natural end - the victim of a handshake flood is dialling into exactly
+that - and an unbounded one here would hang the arm before it started rather
+than report what the arm found.
+*/
 func dialDoT(dst, src string, cfg *tls.Config) (net.Conn, error) {
 	raw, err := dialTCP(dst, src)
 	if err != nil {
+		return nil, err
+	}
+	if err := raw.SetDeadline(time.Now().Add(handshakeDeadline)); err != nil {
+		raw.Close()
 		return nil, err
 	}
 	conn := tls.Client(raw, cfg)
@@ -86,8 +100,25 @@ func dialDoT(dst, src string, cfg *tls.Config) (net.Conn, error) {
 		raw.Close()
 		return nil, err
 	}
+	// Cleared once it is up: the deadline was for getting the connection, and
+	// the queries that follow are paced by the arm rather than by a clock here.
+	if err := raw.SetDeadline(time.Time{}); err != nil {
+		conn.Close()
+		return nil, err
+	}
 	return conn, nil
 }
+
+/*
+How long a handshake is given before the client gives up on it.
+
+One figure for the victim's handshake and the flood's, so that a run where the
+server is too busy to handshake reads the same way from both sides. Five seconds
+is far past what an idle loopback handshake costs (single-digit milliseconds in
+every arm here) and far short of an arm, so it bounds a wedge without truncating
+a slow success.
+*/
+const handshakeDeadline = 5 * time.Second
 
 /*
 runHandshakeFlood is a client that connects, handshakes, closes, and does it
@@ -115,8 +146,9 @@ What each counter means here:
     the kernel completes the TCP handshake out of the listen backlog, so the dial
     succeeds and the TLS handshake is what fails.
   - `failed` is a dial that never connected, which on loopback is the backlog
-    overflowing rather than a decision of the server's - the one number here that
-    says the harness ran out.
+    overflowing rather than a decision of the server's - plus a handshake this
+    client abandoned, at its own deadline or because the arm ended. The numbers
+    here that say the harness ran out rather than the server refusing.
   - the latencies are how long a completed handshake took, which is the server's
     own cost coming back as the flood's own experience of it.
 */
@@ -167,9 +199,22 @@ func handshakeWorker(ctx context.Context, dst, src string, dur time.Duration, cf
 		// A deadline rather than none: a handshake against a server with no
 		// thread to spare can sit in the backlog for as long as the arm lasts,
 		// and a worker parked there is one not measuring anything.
-		_ = raw.SetDeadline(time.Now().Add(5 * time.Second))
+		_ = raw.SetDeadline(time.Now().Add(handshakeDeadline))
 		if err := conn.HandshakeContext(ctx); err != nil {
-			st.closed.Add(1)
+			/*
+				A refusal only if the server decided it.
+
+				`closed` is rendered as the server's refusals, so the two ways
+				this can fail without the server having refused anything have to
+				be kept out of it: the arm ending under the client's feet, and
+				the deadline above expiring. Both are the harness's own, and
+				`failed` is where the harness's own belong.
+			*/
+			if ctx.Err() != nil || errors.Is(err, os.ErrDeadlineExceeded) {
+				st.failed.Add(1)
+			} else {
+				st.closed.Add(1)
+			}
 			raw.Close()
 			continue
 		}

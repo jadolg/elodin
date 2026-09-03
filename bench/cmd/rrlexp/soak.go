@@ -28,16 +28,28 @@ everything before them has the same average as one that behaved throughout.
 // One reading of the server, and of the clients, while the arm was running.
 type sample struct {
 	at time.Duration
+	/*
+		Whether the server answered when it was asked.
+
+		`counters` cannot distinguish a scrape it could not make from a server
+		with nothing to report - both are an empty map - so the distinction is
+		made here, once, where the reading happens. A missed scrape rendered as
+		zeros is the one thing a series about drift must not do: it would show
+		the memory falling to nothing and then the window after it climbing back
+		from it.
+	*/
+	ok bool
 	// The server's `/metrics`, whole: what to read out of it is the report's
 	// business, and a sample that kept only today's columns would have to be
 	// re-taken to answer tomorrow's question.
 	srv map[string]int64
-	// The victim and the flood as of the same moment, so a window can be a
-	// difference rather than a rate averaged over everything so far.
-	victimOffered  int64
-	victimFull     int64
-	victimClosed   int64
-	attackerAnswer int64
+	// The victim as of the same moment, so a window can be a difference rather
+	// than a rate averaged over everything so far. What the flood got is the
+	// server's own `queries_total` in the same row, which is the figure the
+	// limiter decided rather than the one a socket buffer delivered.
+	victimOffered int64
+	victimFull    int64
+	victimClosed  int64
 }
 
 /*
@@ -55,6 +67,19 @@ func startSoakSampler(srv *server, a arm, r *row) func() {
 	done := make(chan struct{})
 	stopped := make(chan struct{})
 	start := time.Now()
+
+	/*
+		The first reading is taken now, before any of the measured window has
+		run, and it is the baseline the first window's rates are differences
+		from rather than a row of its own.
+
+		Without it the first row would divide everything the server had done
+		since it started - the warm-up flood and the readiness probes included -
+		by the time since the arm began, and read as a window that refused fifty
+		per cent more datagrams than any window after it. Which it did not: the
+		warm-up did.
+	*/
+	r.samples = append(r.samples, takeSample(srv, r, 0))
 
 	go func() {
 		defer close(stopped)
@@ -84,15 +109,14 @@ the slice needs no lock; the client counters it reads are atomics the clients ar
 still writing, which is what makes the reading safe to do while they run.
 */
 func takeSample(srv *server, r *row, at time.Duration) sample {
+	got := srv.counters()
 	s := sample{
 		at:            at,
-		srv:           srv.counters(),
+		ok:            len(got) > 0,
+		srv:           got,
 		victimOffered: r.victim.offered.Load(),
 		victimFull:    r.victim.full.Load(),
 		victimClosed:  r.victim.closed.Load(),
-	}
-	if r.attacker != nil {
-		s.attackerAnswer = r.attacker.full.Load()
 	}
 	return s
 }
@@ -117,16 +141,24 @@ func soakTable(b *strings.Builder, rows []row) {
 	}
 	b.WriteString("\n## The soak: what changed while it ran\n\n")
 	for _, r := range rows {
-		if len(r.samples) == 0 {
+		if len(r.samples) < 2 {
 			continue
 		}
 		fmt.Fprintf(b, "### %s — %s, sampled every %s\n\n", r.arm.name, armDuration(r.arm), r.arm.sample)
 		b.WriteString("| at | RSS | threads | fds | cache entries | cache bytes | conns active | conns refused | answers/s | limited/s | victim answered | victim refused |\n")
 		b.WriteString("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
-		prev := sample{}
-		for _, s := range r.samples {
+		// The reading taken before the window opened is the baseline rather
+		// than a row: see `startSoakSampler`.
+		prev := r.samples[0]
+		for _, s := range r.samples[1:] {
 			soakRow(b, s, prev)
-			prev = s
+			// A missed scrape is not a baseline. The window after it is a
+			// difference from the last reading that happened, over the longer
+			// interval that separates them, which the counters being cumulative
+			// makes correct.
+			if s.ok {
+				prev = s
+			}
 		}
 		fmt.Fprintf(b, "\nRead the gauges as of the sample and the rates over the window before it. %s\n",
 			soakVerdict(r))
@@ -134,6 +166,14 @@ func soakTable(b *strings.Builder, rows []row) {
 }
 
 func soakRow(b *strings.Builder, s, prev sample) {
+	if !s.ok {
+		// Everything in the row but the clock came from a scrape that did not
+		// happen. The clients' own counters did arrive, but a row half read as
+		// a reading is worse than one that says it is not one.
+		fmt.Fprintf(b, "| %s | — | — | — | — | — | — | — | — | — | the server could not be read | — |\n",
+			s.at.Round(time.Second))
+		return
+	}
 	window := (s.at - prev.at).Seconds()
 	if window <= 0 {
 		window = 1
@@ -169,10 +209,10 @@ a leak - what it can do is put the two numbers next to each other so that the
 question is asked rather than left to whoever scrolls furthest.
 */
 func soakVerdict(r row) string {
-	if len(r.samples) < 2 {
-		return "One sample, so there is no drift to report; run for longer than -soak-sample."
+	first, last := goodSample(r.samples, false), goodSample(r.samples, true)
+	if first.at == last.at || !first.ok || !last.ok {
+		return "Fewer than two readings the server answered, so there is no drift to report."
 	}
-	first, last := r.samples[0], r.samples[len(r.samples)-1]
 	rssFirst := first.srv["process_resident_memory_bytes"] / (1 << 20)
 	rssLast := last.srv["process_resident_memory_bytes"] / (1 << 20)
 	return fmt.Sprintf(
@@ -184,9 +224,32 @@ func soakVerdict(r row) string {
 		(last.at - first.at).Round(time.Second))
 }
 
+/*
+goodSample is the first or the last reading the server answered.
+
+The ends of the series, for the drift line, and they have to be readings rather
+than positions: a scrape that failed at either end would otherwise be compared
+against a real one and report the whole of the server's memory as having
+appeared or gone.
+*/
+func goodSample(samples []sample, last bool) sample {
+	for i := range samples {
+		s := samples[i]
+		if last {
+			s = samples[len(samples)-1-i]
+		}
+		if s.ok {
+			return s
+		}
+	}
+	return sample{}
+}
+
+// hasSamples asks whether any arm produced a series: the baseline reading and at
+// least one window after it, which is the least the table can be read from.
 func hasSamples(rows []row) bool {
 	for _, r := range rows {
-		if len(r.samples) > 0 {
+		if len(r.samples) > 1 {
 			return true
 		}
 	}

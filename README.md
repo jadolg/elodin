@@ -1463,11 +1463,11 @@ connection, and ECDSA P-256 costs about half what RSA-2048 does — which is why
 **Nothing here bounds how often a client may ask for a handshake.** A response
 budget is spent by answers and the connection share by connections *held*, so a
 client that connects, handshakes and hangs up spends neither.
-`bench/results/2026-09-03-handshake-floods.md` measures one: 6,000 handshakes a
-second out of a 4-core machine, 205 µs of CPU each, 1.2 cores in total, with
+`bench/results/2026-09-03-handshake-floods.md` measures one: 7,000 handshakes a
+second out of a 4-core machine, 205 µs of CPU each, 1.4 cores in total, with
 `conn_refused` at zero throughout because the shipped table was never reached. A
 DoT client already running its one connection at capacity lost 16 points of its
-answer rate and four times its latency; a client arriving during it was served
+answer rate and six times its latency; a client arriving during it was served
 every query. Tightening `max_connections_per_prefix` bounds the cost — a share of
 half a table cut the handshake rate by a third in that report — but it cannot be
 made into a limit on *arrivals* without limiting legitimate reconnection too. If

@@ -212,6 +212,14 @@ with a writer pipelining queries and a reader counting what comes back.
 first - and it is a parameter rather than two copies of this so the pair cannot
 drift into counting differently. Several results are read as a TCP row against a
 DoT one.
+
+A connection this client could not get is counted and passed over rather than
+fatal, and only a client that got none at all stops the run. The arms this
+matters in are the handshake floods: the victim there dials into a server being
+made to handshake as fast as it can, so a refused or timed-out connection is a
+thing the arm is measuring - and one of them ending the process would take the
+report for every arm already run with it. A client that could open nothing has
+measured nothing, and that is worth stopping for.
 */
 func runStream(dial func() (net.Conn, error), c clientSpec, dur time.Duration, tag string, track bool, st *stats) func() {
 	var conns []net.Conn
@@ -223,7 +231,8 @@ func runStream(dial func() (net.Conn, error), c clientSpec, dur time.Duration, t
 	for i := 0; i < c.sockets; i++ {
 		conn, err := dial()
 		if err != nil {
-			fatal(fmt.Errorf("%s from %s: %w", c.transport, c.src, err))
+			st.failed.Add(1)
+			continue
 		}
 		conns = append(conns, conn)
 		t := newTracker(track)
@@ -237,6 +246,10 @@ func runStream(dial func() (net.Conn, error), c clientSpec, dur time.Duration, t
 			defer wg.Done()
 			tcpWriter(conn, c, dur, tag, idx, st, t)
 		}(i)
+	}
+	if len(conns) == 0 {
+		fatal(fmt.Errorf("%s from %s: not one of %d connections could be opened",
+			c.transport, c.src, c.sockets))
 	}
 
 	return func() {

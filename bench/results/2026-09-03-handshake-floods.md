@@ -6,12 +6,11 @@ that adds these arms:
 
 ```
 mise run release
-cd bench && go run ./cmd/rrlexp -duration 10s -warmup 2s
+cd bench && go run ./cmd/rrlexp -only handshake-flood -duration 10s -warmup 2s
 ```
 
-The whole matrix, because the DoT baseline these rows are read against is one of
-the two quiet baselines rather than part of the group; `-only handshake-flood`
-runs the six flood arms without it.
+The selector takes all seven arms below, the quiet DoT baseline they are read
+against included.
 
 The gap this closes is the second one issue #235 lists. `cmd/bench
 -transport=handshake` already says what a fresh TLS handshake costs, as a
@@ -34,45 +33,48 @@ during the flood is.
 
 | arm | flood | completed/s | CPU/s | CPU per handshake | `conn_refused` |
 |---|---|---:|---:|---:|---:|
-| `handshake-flood/dot` | DoT | **5,971** | **1.23** | 206 µs | **0** |
-| `handshake-flood/dot/same-prefix` | DoT | 6,267 | 1.28 | 205 µs | **0** |
-| `handshake-flood/doh` | DoH (h2 ALPN) | 6,710 | 1.37 | 204 µs | **0** |
-| `handshake-flood/arriving-client` | DoT | 6,903 | 1.40 | 202 µs | **0** |
+| `handshake-flood/dot` | DoT | **6,922** | **1.41** | 204 µs | **0** |
+| `handshake-flood/dot/same-prefix` | DoT | 6,539 | 1.35 | 207 µs | **0** |
+| `handshake-flood/doh` | DoH (h2 ALPN) | 6,950 | 1.44 | 207 µs | **0** |
+| `handshake-flood/arriving-client` | DoT | 7,224 | 1.49 | 206 µs | **0** |
 
-Six thousand handshakes a second, about 205 µs of server CPU each, which is 1.2
-to 1.4 of this machine's four cores — and `conn_refused` is **zero** in every
-row. With the shipped configuration nothing refused anything: the table is 512
-with a share of 256, the flood holds at most 32 connections at once, and so
-neither bound is ever reached. The limiter is on at its default throughout and
+Seven thousand handshakes a second, about 205 µs of server CPU each, which is 1.4
+of this machine's four cores — and `conn_refused` is **zero** in every row. With
+the shipped configuration nothing refused anything: the table is 512 with a share
+of 256, the flood holds at most 32 connections at once, and so neither bound is
+ever reached. The limiter is on at its default throughout and
 `elodin_rate_limited_total` is zero too, because this client asks nothing.
 
 The DoH listener is the same story as the DoT one. Framing and HPACK are not
-reached — the flood closes the moment the handshake is up — so what the arm
-confirms is that the choice of TLS listener does not change the price.
+reached — the flood closes the moment the handshake is up, before an h2 preface —
+so what the arm confirms is that the two accept paths cost the same, not what an
+h2 request costs. The `doh2` arms in
+`2026-09-03-rate-limit-bystander.md` are where that is measured.
 
 ## What it did to the bystander
 
 | arm | victim | answered | p50 | p99 |
 |---|---|---:|---:|---:|
-| `quiet-baseline/dot` | DoT, another /24, nobody else here | 486/500 (**97%**) | 234.1 ms | 597.5 ms |
-| `handshake-flood/dot` | DoT, another /24 | 404/500 (**81%**) | **1.0296 s** | 2.174 s |
-| `handshake-flood/dot/same-prefix` | DoT, inside the flooded /24 | 410/500 (82%) | 1.0287 s | 2.1389 s |
-| `handshake-flood/doh` | DoT, another /24 | 426/500 (85%) | 934.3 ms | 1.8341 s |
-| `handshake-flood/arriving-client` | TCP, another /24, one connection per query | 358/358 (**100%**) | 25.4 ms | 38.8 ms |
+| `handshake-flood/quiet-baseline-dot` | DoT, another /24, nobody else here | 500/500 (**100%**) | 153.4 ms | 440.8 ms |
+| `handshake-flood/dot` | DoT, another /24 | 419/499 (**84%**) | **943.5 ms** | 2.0082 s |
+| `handshake-flood/dot/same-prefix` | DoT, inside the flooded /24 | 410/500 (82%) | 1.01 s | 2.1211 s |
+| `handshake-flood/doh` | DoT, another /24 | 412/500 (82%) | 1.0865 s | 2.1321 s |
+| `handshake-flood/arriving-client` | TCP, another /24, one connection per query | 354/354 (**100%**) | 25.2 ms | 46.6 ms |
 
 Two different answers, and the difference is the point.
 
-A **DoT client running its one connection at capacity** loses 16 points of its
-answer rate and four times its latency. Read the baseline first: a stream
+A **DoT client running its one connection at capacity** loses 16 to 18 points of
+its answer rate and six times its latency. Read the baseline first: a stream
 connection is served one query at a time and an upstream round trip is 20 ms, so
-a client offering 50 q/s on a single connection is already at its ceiling and
-already sitting at 234 ms — the same effect `quiet-baseline/tcp` has shown since
-the first run of this harness. The flood does not create that queue. It makes it
-four times as long.
+a client offering 50 q/s on a single connection is already at its ceiling, and
+already sitting at 153 ms with the server to itself — the same effect
+`quiet-baseline/tcp` has shown since the first run of this harness, and the one
+figure here with real run-to-run spread (an earlier run of the same arm gave
+234 ms). The flood does not create that queue. It makes it six times as long.
 
 A **client arriving during the flood** is unaffected: every query answered at one
 upstream round trip. The prefix makes no difference either — inside the flooded
-/24 (82%) or outside it (81%) is the same result, which is what you would expect
+/24 (82%) or outside it (84%) is the same result, which is what you would expect
 of a load nothing charges to a prefix in the first place.
 
 So this is not a resolver being knocked over. It is a resolver spending a third
@@ -86,24 +88,24 @@ smaller than the flood's concurrency and therefore reachable at all:
 
 | arm | table | share | attempted/s | completed/s | refused/s | CPU/s | victim answered |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `handshake-flood/no-share` | 64 | 64 | 8,544 | **6,552** | 1,992 | **1.36** | 265/316 (84%), 51 connections closed |
-| `handshake-flood/share` | 64 | 32 | 15,957 | **4,023** | 11,934 | **0.90** | 280/280 (**100%**) |
+| `handshake-flood/no-share` | 64 | 64 | 9,149 | **7,061** | 2,088 | **1.46** | 269/335 (80%), 66 connections closed |
+| `handshake-flood/share` | 64 | 32 | 17,720 | **4,529** | 13,190 | **0.99** | 294/294 (**100%**) |
 
 A share bounds how many handshakes run *at once*, which turns out to bound the
-rate too: 6,552 completed a second becomes 4,023, and 1.36 of a core becomes
-0.90. The arriving client goes from having 51 of its connections closed on it to
-being served every query it asks. `conn_refused` is 23,412 in the first row and
-142,571 in the second — the refusals a share buys are cheap, which is why the CPU
-falls while the attempts nearly double.
+rate too: 7,061 completed a second becomes 4,529, and 1.46 of a core becomes
+0.99. The arriving client goes from having 66 of its connections closed on it to
+being served every query it asks. `conn_refused` is 24,224 in the first row and
+154,791 in the second — the refusals a share buys are cheap, which is why the CPU
+falls by a third while the attempts nearly double.
 
 That is a bound on the cost, not a defence against it. The flood still gets four
-thousand handshakes a second out of a table it is being held to half of, and on
-the shipped 512/256 a flood of this shape reaches neither figure. A share sized to
-be a bound nobody trips over is not a share that stops this.
+and a half thousand handshakes a second out of a table it is being held to half
+of, and on the shipped 512/256 a flood of this shape reaches neither figure. A
+share sized to be a bound nobody trips over is not a share that stops this.
 
 ## What this does not say
 
-**The six thousand is this machine's ceiling, not an attacker's.** The flood, the
+**The seven thousand is this machine's ceiling, not an attacker's.** The flood, the
 victim and the server share four cores here, and the flood's own TLS work is paid
 for out of the same ones. A generator with the bandwidth of a botnet behind it
 would reach further; what the arm establishes is the *price per handshake* and

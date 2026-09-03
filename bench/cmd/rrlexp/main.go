@@ -768,12 +768,15 @@ made. A handshake holds one for a millisecond or two and gives it back.
 
 So the flood here is `sockets` workers dialling, handshaking, closing and going
 again, and the victim is a DoT client of the ordinary kind: one connection, a
-query every 20 ms, latency measured. Read every row against `quiet-baseline/dot`,
-which is that victim with the server to itself.
+query every 20 ms, latency measured. Read every row against
+`handshake-flood/quiet-baseline-dot`, which is that victim with the server to
+itself.
 
-Both TLS listeners get an arm, because the handshake is not the whole of what a
-DoH one costs: the h2 path has frames and HPACK behind it, and the arm says
-whether that shows up at the bystander.
+Both TLS listeners get an arm, because the two do not accept a connection by the
+same code and a difference in what a handshake costs would be the arm's to find.
+Neither reaches the h2 path itself: the flood closes as soon as the handshake is
+up, so no preface, no frames and no HPACK - what an over-budget h2 client costs
+is a question the `doh2` arms above answer with requests.
 
 The last pair is what a share can and cannot do about it. `slowloris` showed the
 share holding a prefix to half the table; a handshake flood is not holding
@@ -787,28 +790,69 @@ victim there arrives per query rather than holding a connection, since what the
 pair is about is whether a client can still get in.
 */
 func handshakeArms() []arm {
-	/*
-		Concurrency, not a rate: there is nothing to pace, and this many
-		dialers is enough to keep the server handshaking flat out.
+	var arms []arm
+	arms = append(arms, handshakeDefaultArms()...)
+	arms = append(arms, handshakeShareArms()...)
+	return arms
+}
 
-		`dialers` rather than `workers` because that is the flag for the
-		server's own thread pool, and the two figures have nothing to do with
-		each other. The table and the share are the small ones the `slowloris`
-		arms use, for the same reason those do: what the last pair shows is a
-		client held to half a table, and the property is scale-free.
-	*/
-	const dialers, table, share = 32, 64, 32
-	victimDoT := clientSpec{src: "127.1.0.1", transport: "dot", rate: *victimRate, sockets: 1}
-	// A client turning up while it is happening, asking on a connection of its
-	// own each time. The plain TCP one from `connectionArms`, for the same
-	// reason: what is being measured is whether a connection can be had.
-	arriving := clientSpec{src: "127.1.0.1", transport: "tcp", rate: *victimRate, sockets: 1, redial: true}
-	flood := func(src, transport string, n int) *clientSpec {
-		return &clientSpec{src: src, transport: transport, sockets: n, handshake: true}
-	}
+/*
+Concurrency, not a rate: there is nothing to pace, and this many dialers is
+enough to keep the server handshaking flat out.
+
+`hsDialers` rather than `workers` because that is the flag for the server's own
+thread pool, and the two figures have nothing to do with each other. The table
+and the share are the small ones the `slowloris` arms use, for the same reason
+those do: what `handshakeShareArms` shows is a client held to half a table, and
+the property is scale-free.
+*/
+const (
+	hsDialers = 32
+	hsTable   = 64
+	hsShare   = 32
+)
+
+// The DoT client every handshake arm is measured at: one connection, a query
+// every 20 ms, latency tracked.
+func handshakeVictim() clientSpec {
+	return clientSpec{src: "127.1.0.1", transport: "dot", rate: *victimRate, sockets: 1}
+}
+
+/*
+A client turning up while the flood is happening, asking on a connection of its
+own each time.
+
+The plain TCP one from `connectionArms`, for the same reason that group uses it:
+what is being measured is whether a connection can be had at all, and a client
+that dialled once at the start would say nothing about the next one through the
+door.
+*/
+func arrivingVictim() clientSpec {
+	return clientSpec{src: "127.1.0.1", transport: "tcp", rate: *victimRate, sockets: 1, redial: true}
+}
+
+// handshakeFlood is `n` workers dialling, handshaking and closing against the
+// listener `transport` names.
+func handshakeFlood(src, transport string, n int) *clientSpec {
+	return &clientSpec{src: src, transport: transport, sockets: n, handshake: true}
+}
+
+// The four arms that run the shipped connection table, which is the
+// configuration a public instance would meet this load with.
+func handshakeDefaultArms() []arm {
+	victimDoT := handshakeVictim()
 	return []arm{
 		{
-			name:     "quiet-baseline/dot",
+			/*
+				Named for the group rather than beside the other two quiet
+				baselines, so that `-only handshake-flood` brings it along.
+
+				`-only` is a substring of the arm's name, and a group whose
+				control does not match its own selector is a group that can be
+				run without the row every other row is read against - which is
+				six numbers and nothing to compare them with.
+			*/
+			name:     "handshake-flood/quiet-baseline-dot",
 			question: "what a DoT victim's queries cost with the server to itself, which is what the handshake arms compare against",
 			limiter:  true, rps: *rps, slip: *slip,
 			victim: victimDoT,
@@ -817,45 +861,52 @@ func handshakeArms() []arm {
 			name:     "handshake-flood/dot",
 			question: "what a client doing only DoT handshakes does to a DoT client in another /24",
 			limiter:  true, rps: *rps, slip: *slip,
-			attacker: flood("127.0.0.2", "dot", dialers),
+			attacker: handshakeFlood("127.0.0.2", "dot", hsDialers),
 			victim:   victimDoT,
 		},
 		{
 			name:     "handshake-flood/dot/same-prefix",
 			question: "the same flood with the victim inside its /24, where they share a connection share as well as a budget",
 			limiter:  true, rps: *rps, slip: *slip,
-			attacker: flood("127.0.0.2", "dot", dialers),
+			attacker: handshakeFlood("127.0.0.2", "dot", hsDialers),
 			victim:   withSrc(victimDoT, "127.0.0.3"),
 		},
 		{
 			name:     "handshake-flood/doh",
-			question: "the same load against the DoH listener, where an h2 connection costs more than its handshake",
+			question: "the same load against the DoH listener, which accepts a connection by its own code - the flood closes before any h2 frame, so this is the handshake alone",
 			limiter:  true, rps: *rps, slip: *slip,
-			attacker: flood("127.0.0.2", "doh2", dialers),
+			attacker: handshakeFlood("127.0.0.2", "doh2", hsDialers),
 			victim:   victimDoT,
 		},
 		{
 			name:     "handshake-flood/arriving-client",
 			question: "whether a client turning up mid-flood can get a connection and an answer",
 			limiter:  true, rps: *rps, slip: *slip,
-			attacker: flood("127.0.0.2", "dot", dialers),
-			victim:   arriving,
+			attacker: handshakeFlood("127.0.0.2", "dot", hsDialers),
+			victim:   arrivingVictim(),
 		},
+	}
+}
+
+// And the pair that pins a table small enough for a share to reach a flood
+// holding nothing: as many dialers as the table has slots, with and without one.
+func handshakeShareArms() []arm {
+	return []arm{
 		{
 			name:     "handshake-flood/no-share",
 			question: "a flood with as many workers as the table has slots, and nothing bounding its share of them",
 			limiter:  true, rps: *rps, slip: *slip,
-			maxConns: table, perPrefix: table, clientTimeout: time.Minute,
-			attacker: flood("127.0.0.2", "dot", table),
-			victim:   arriving,
+			maxConns: hsTable, perPrefix: hsTable, clientTimeout: time.Minute,
+			attacker: handshakeFlood("127.0.0.2", "dot", hsTable),
+			victim:   arrivingVictim(),
 		},
 		{
 			name:     "handshake-flood/share",
 			question: "the same load held to half the table, which is what the share does and does not do about handshakes",
 			limiter:  true, rps: *rps, slip: *slip,
-			maxConns: table, perPrefix: share, clientTimeout: time.Minute,
-			attacker: flood("127.0.0.2", "dot", table),
-			victim:   arriving,
+			maxConns: hsTable, perPrefix: hsShare, clientTimeout: time.Minute,
+			attacker: handshakeFlood("127.0.0.2", "dot", hsTable),
+			victim:   arrivingVictim(),
 		},
 	}
 }

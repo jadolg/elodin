@@ -9,20 +9,20 @@ sudo ip -6 addr add fd00:1::2/128 dev lo     # the flood
 sudo ip -6 addr add fd00:1::3/128 dev lo     # a victim in its /64
 sudo ip -6 addr add fd00:2::1/128 dev lo     # a victim in another /64
 mise run release
-cd bench && go run ./cmd/rrlexp -duration 10s -warmup 2s          # both families
-cd bench && go run ./cmd/rrlexp -only v6/ -duration 10s -warmup 2s   # the repeat
+cd bench && go run ./cmd/rrlexp -duration 10s -warmup 2s              # both families
+cd bench && go run ./cmd/rrlexp -only v6/ -duration 10s -warmup 2s   # twice more
 ```
 
 The whole matrix, so that the IPv4 rows quoted beside the IPv6 ones are from the
 same run of the same binary on the same machine, and then the three IPv6 arms
-again on their own — for the reason the last section gives.
+twice more on their own — for the reason the *collateral damage* section gives.
 
 The third gap issue #235 lists. Every other arm of this harness is IPv4
 loopback, and the budget is kept per /24 there and per /64 here — one procedure
 deciding both (`client_prefix` in `src/server/ratelimit.odin`), so these arms ask
 whether the second half of it holds up as well as the first. `src/itest` has the
-case that matters most, a `::` listener keeping the families apart after issue
-#170; what an integration case cannot show is a bystander's answer rate.
+case that matters most, a `::` listener keeping the families apart after
+issue #170; what an integration case cannot show is a bystander's answer rate.
 
 Three arms against a server listening on `::1`, everything else as the IPv4 arms
 have it: a 20,000 q/s flood from `fd00:1::2`, a victim asking 50 q/s, ten
@@ -64,14 +64,16 @@ do not show up.
 |---|---|---:|
 | `v6/same-prefix/limiter-on`, first run | `fd00:1::3`, inside the flooded /64 | 74/500 (15%) |
 | `v6/same-prefix/limiter-on`, second run | `fd00:1::3`, inside the flooded /64 | 17/500 (3%) |
+| `v6/same-prefix/limiter-on`, third run | `fd00:1::3`, inside the flooded /64 | 21/500 (4%) |
 | `same-prefix/limiter-on` | `127.0.0.3`, inside the flooded /24 | 11/500 (2%) |
 
 A victim inside the flooded prefix shares the budget with the flood by design,
 and how the shared budget splits between a client offering 50 q/s and one
-offering 20,000 is a race rather than a ratio: two runs of the same arm gave 15%
-and 3%. Read the row as "most of it is gone", which is the same thing the IPv4
-arm says, and not as a difference between the families — there is no mechanism
-that would make one.
+offering 20,000 is a race rather than a ratio: three runs of the same arm gave
+15%, 3% and 4%. Read the row as "most of it is gone", which is the same thing
+the IPv4 arm says, and not as a difference between the families — there is no
+mechanism that would make one, and the outlier is the arm's own spread rather
+than the address family.
 
 ## What this does not say
 

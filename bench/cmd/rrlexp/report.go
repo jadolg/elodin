@@ -171,6 +171,12 @@ func specOf(c *clientSpec) clientSpec {
 }
 
 func floodTable(b *strings.Builder, rows []row) {
+	// Guarded like the tables below it: a run whose only floods are handshake
+	// floods has nothing to put here, and a heading over an empty table reads
+	// as a measurement that came back blank.
+	if !hasQueryFlood(rows) {
+		return
+	}
 	b.WriteString("\n## The flood: what it drew, and what the address it named received\n\n")
 	b.WriteString("| arm | limiter | flood | via | offered/s | answered/s | truncated/s | bytes/s at the source | amplification |\n")
 	b.WriteString("|---|---|---|---|---:|---:|---:|---:|---:|\n")
@@ -199,6 +205,17 @@ func floodTable(b *strings.Builder, rows []row) {
 			float64(a.truncated.Load())/secs,
 			float64(a.bytesIn.Load())/secs/1e6, amp)
 	}
+}
+
+// hasQueryFlood asks whether any arm had a flood that sent queries, which is
+// every flood but the handshake ones.
+func hasQueryFlood(rows []row) bool {
+	for _, r := range rows {
+		if r.attacker != nil && !r.arm.attacker.handshake {
+			return true
+		}
+	}
+	return false
 }
 
 /*
@@ -286,7 +303,7 @@ func handshakeTable(b *strings.Builder, rows []row) {
 	}
 	b.WriteString("\n## The handshake floods: a client that only connects\n\n")
 	b.WriteString("| arm | flood via | table | share | attempted/s | completed/s | refused/s | dial failed/s | conn_refused | handshake p50 | CPU/s | CPU per handshake | victim answered | victim p50 |\n")
-	b.WriteString("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+	b.WriteString("|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, r := range rows {
 		if r.attacker == nil || !r.arm.attacker.handshake {
 			continue
@@ -318,8 +335,9 @@ func handshakeRow(b *strings.Builder, r row) {
 		answered, round(v.pct(0.5)))
 }
 
-// figure is a setting the arm pinned, or a dash where it left the shipped
-// default in place - which is not the same thing as a zero.
+// figure is a setting the arm pinned, or the word `shipped` where it left the
+// default in place - which is not the same thing as a zero, and is why the
+// column is not always a number.
 func figure(n int) string {
 	if n <= 0 {
 		return "shipped"
