@@ -9,27 +9,47 @@ import (
 
 // -------------------------------------------------------------- the reporting
 
-func renderReport(rows []row) string {
+func renderReport(rows []row, skips []skip) string {
 	var b strings.Builder
 	b.WriteString("# Response rate limiting: what a bystander gets\n\n")
-	fmt.Fprintf(&b, "Each arm: one server, two clients at once, %s measured after %s of the same load.\n",
-		*duration, *warmup)
-	fmt.Fprintf(&b, "The victim offers %d q/s; the flood offers %d q/s (0 = flat out). Limit: %d responses/s per /24, slip %d.\n",
+	if *soak > 0 {
+		fmt.Fprintf(&b, "A soak run: the soak arm alone, %s of load after %s of the same, with the server read every %s.\n",
+			*soak, *warmup, *soakSample)
+	} else {
+		fmt.Fprintf(&b, "Each arm: one server, two clients at once, %s measured after %s of the same load.\n",
+			*duration, *warmup)
+	}
+	fmt.Fprintf(&b, "The victim offers %d q/s; the flood offers %d q/s (0 = flat out). Limit: %d responses/s per client prefix - a /24, or a /64 in the IPv6 arms - slip %d.\n",
 		*victimRate, *floodRate, *rps, *slip)
 	fmt.Fprintf(&b, "Every name is asked once, so every query is a cache miss and a %s upstream round trip.\n", *upDelay)
-	fmt.Fprintf(&b, "server.workers %d, upstream_workers %d, everything else the shipped default.\n\n", *workers, *workers/2)
+	fmt.Fprintf(&b, "server.workers %d, upstream_workers %d, and the shipped default for everything an arm does not name.\n\n", *workers, *workers/2)
 
 	victimTable(&b, rows)
 	floodTable(&b, rows)
 	dohTable(&b, rows)
 	connTable(&b, rows)
+	handshakeTable(&b, rows)
+	soakTable(&b, rows)
 	serverTable(&b, rows)
 
 	b.WriteString("\n## What each arm was asking\n\n")
 	for _, r := range rows {
 		fmt.Fprintf(&b, "- **%s** — %s\n", r.arm.name, r.arm.question)
 	}
+	skipList(&b, skips)
 	return b.String()
+}
+
+// skipList names the arms this machine could not run, so a missing section is
+// an answer the run did not have rather than a question it never asked.
+func skipList(b *strings.Builder, skips []skip) {
+	if len(skips) == 0 {
+		return
+	}
+	b.WriteString("\n## Arms this run could not take\n\n")
+	for _, s := range skips {
+		fmt.Fprintf(b, "- **%s** — %s\n", s.name, s.why)
+	}
 }
 
 func victimTable(b *strings.Builder, rows []row) {
@@ -109,7 +129,10 @@ func dohTable(b *strings.Builder, rows []row) {
 
 func hasDoH(rows []row) bool {
 	for _, r := range rows {
-		if isDoH(r.arm.victim) || (r.arm.attacker != nil && isDoH(*r.arm.attacker)) {
+		if isDoH(r.arm.victim) {
+			return true
+		}
+		if a := r.arm.attacker; a != nil && isDoH(*a) && !a.handshake {
 			return true
 		}
 	}
@@ -117,7 +140,10 @@ func hasDoH(rows []row) bool {
 }
 
 func dohRow(b *strings.Builder, r row, what string, c clientSpec, st *stats) {
-	if st == nil || !isDoH(c) {
+	// A handshake flood offers a TLS handshake and no request, so it has no
+	// status, no answer and no connection it kept: `handshakeTable` is where a
+	// flood against the DoH port on those terms is read.
+	if st == nil || !isDoH(c) || c.handshake {
 		return
 	}
 	secs := r.elapsed.Seconds()
@@ -149,7 +175,9 @@ func floodTable(b *strings.Builder, rows []row) {
 	b.WriteString("| arm | limiter | flood | via | offered/s | answered/s | truncated/s | bytes/s at the source | amplification |\n")
 	b.WriteString("|---|---|---|---|---:|---:|---:|---:|---:|\n")
 	for _, r := range rows {
-		if r.attacker == nil {
+		// Handshake floods send no queries at all, so every column here would
+		// be a zero standing where a rate belongs. `handshakeTable` is theirs.
+		if r.attacker == nil || r.arm.attacker.handshake {
 			continue
 		}
 		secs := r.elapsed.Seconds()
@@ -221,6 +249,87 @@ func connTable(b *strings.Builder, rows []row) {
 func hasIdle(rows []row) bool {
 	for _, r := range rows {
 		if r.arm.attacker != nil && r.arm.attacker.idle {
+			return true
+		}
+	}
+	return false
+}
+
+/*
+handshakeTable is the arms where the flood never asks a question.
+
+`attempted` against `completed` is what the server let through: a handshake the
+client began and the server had no thread for arrives as a connection that went
+away, counted here as `refused` - the connection slot is taken before the
+handshake starts, so a full table is a failed handshake rather than a refused
+query. `dial failed` is the listen backlog overflowing, which is the harness
+running out rather than the server deciding anything, and is worth watching only
+because it caps what the arm can offer.
+
+`CPU per handshake` is the price the flood is paying for, and the reason these
+arms exist: it is asymmetric key work, it is charged to no budget, and the whole
+of what bounds it is how many the server will do at once. The victim columns
+beside it are what that cost buys the attacker.
+
+`conn_refused` is the server's own count of connections it had no room for, next
+to the flood's own view of the same thing. It is the larger of the two: it counts
+the victim's refusals and the warm-up's as well. Read it as the total turned away
+in the arm rather than as a check on the column beside it.
+
+`table` and `share` are written where the arm pinned them. Most of these arms do
+not: a handshake flood holds nothing for long, so the shipped share is not what
+stands between it and the server, and the pair at the end is what says so.
+*/
+func handshakeTable(b *strings.Builder, rows []row) {
+	if !hasHandshakeFlood(rows) {
+		return
+	}
+	b.WriteString("\n## The handshake floods: a client that only connects\n\n")
+	b.WriteString("| arm | flood via | table | share | attempted/s | completed/s | refused/s | dial failed/s | conn_refused | handshake p50 | CPU/s | CPU per handshake | victim answered | victim p50 |\n")
+	b.WriteString("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+	for _, r := range rows {
+		if r.attacker == nil || !r.arm.attacker.handshake {
+			continue
+		}
+		handshakeRow(b, r)
+	}
+}
+
+func handshakeRow(b *strings.Builder, r row) {
+	secs := r.elapsed.Seconds()
+	a := r.attacker
+	done := float64(a.full.Load()) / secs
+	perHandshake := "—"
+	if done > 0 {
+		perHandshake = fmt.Sprintf("%.0f µs", r.cpu.Seconds()/secs/done*1e6)
+	}
+	v := r.victim
+	answered := "—"
+	if offered := v.offered.Load(); offered > 0 {
+		answered = fmt.Sprintf("%.0f%% (%d/%d)", 100*float64(v.full.Load())/float64(offered), v.full.Load(), offered)
+	}
+	fmt.Fprintf(b, "| %s | %s | %s | %s | %.0f | %.0f | %.0f | %.0f | %d | %s | %.2f | %s | %s | %s |\n",
+		r.arm.name, r.arm.attacker.transport,
+		figure(r.arm.maxConns), figure(r.arm.perPrefix),
+		float64(a.offered.Load())/secs, done,
+		float64(a.closed.Load())/secs, float64(a.failed.Load())/secs,
+		r.srv["elodin_connections_refused_total"],
+		round(a.pct(0.5)), r.cpu.Seconds()/secs, perHandshake,
+		answered, round(v.pct(0.5)))
+}
+
+// figure is a setting the arm pinned, or a dash where it left the shipped
+// default in place - which is not the same thing as a zero.
+func figure(n int) string {
+	if n <= 0 {
+		return "shipped"
+	}
+	return fmt.Sprintf("%d", n)
+}
+
+func hasHandshakeFlood(rows []row) bool {
+	for _, r := range rows {
+		if r.arm.attacker != nil && r.arm.attacker.handshake {
 			return true
 		}
 	}

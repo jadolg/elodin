@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -23,7 +24,14 @@ type server struct {
 	pid     int
 	udpAddr string
 	tcpAddr string
+	dotAddr string
 	dohAddr string
+	/*
+		Where `waitReady` probes from, which is the arm's family rather than one
+		address: an IPv4 probe cannot reach a listener bound to `::1`, and the
+		IPv6 arms have one.
+	*/
+	probeSrc string
 	// The certificate the DoH listener serves, so a DoH client can verify what
 	// it connects to rather than being told to skip it.
 	certPath    string
@@ -32,19 +40,15 @@ type server struct {
 	stopOnce    sync.Once
 }
 
-// armPorts takes the three ports an arm's server binds. Fresh per arm, so a
+// armPorts takes the four ports an arm's server binds. Fresh per arm, so a
 // listener from the arm before cannot still be holding one.
-func armPorts() (dns, doh, metrics int, err error) {
-	if dns, err = freePort(); err != nil {
-		return 0, 0, 0, err
+func armPorts() (dns, dot, doh, metrics int, err error) {
+	for _, port := range []*int{&dns, &dot, &doh, &metrics} {
+		if *port, err = freePort(); err != nil {
+			return 0, 0, 0, 0, err
+		}
 	}
-	if doh, err = freePort(); err != nil {
-		return 0, 0, 0, err
-	}
-	if metrics, err = freePort(); err != nil {
-		return 0, 0, 0, err
-	}
-	return dns, doh, metrics, nil
+	return dns, dot, doh, metrics, nil
 }
 
 // rateLimitBlock is the arm's `server.rate_limit`, indented for the template.
@@ -90,16 +94,77 @@ type armServer struct {
 	cert, key   string
 	upHost      string
 	upPort      string
-	port        int
-	dohPort     int
-	metrics     int
+	// What the DNS listeners bind, which is also the family the arm's clients
+	// are on. See `armListen`.
+	listen       string
+	port         int
+	dotPort      int
+	dohPort      int
+	cacheEntries int
+	metrics      int
 }
 
-// serverConfig is the configuration one arm runs against.
+// serverConfig is the configuration one arm runs against. The arguments are
+// indexed rather than positional: the listener address is written into four
+// blocks, and a template with seventeen `%s` in it is one a reader has to count.
 func serverConfig(a armServer) string {
 	return fmt.Sprintf(configTemplate,
 		*logLevel, *logQueries, a.logPath, *workers, *workers/2, a.connections, a.rateLimit,
-		a.port, a.port, a.dohPort, a.cert, a.key, a.upHost, a.upPort, a.metrics)
+		a.listen, a.port, a.dotPort, a.dohPort, a.cert, a.key,
+		a.upHost, a.upPort, a.cacheEntries, a.metrics)
+}
+
+/*
+armListen is the address an arm's listeners bind.
+
+127.0.0.1 unless the arm names another, which only the IPv6 arms do. One figure
+for every listener rather than one each: an arm asks what a client of one family
+gets from a server serving that family, and a wildcard bind would be a different
+question - the one `src/itest/cases_ratelimit.odin` asks, about whether a `::`
+listener tells the families apart.
+*/
+func armListen(a arm) string {
+	if a.listen == "" {
+		return "127.0.0.1"
+	}
+	return a.listen
+}
+
+/*
+probeSrcFor is where `waitReady` asks from: a prefix no arm's clients use, in the
+arm's own family.
+
+`::1` for the IPv6 arms, which is its own /64 and so not a prefix any of their
+budgets are kept under - the same reasoning that keeps the IPv4 probes in
+127.8.0.0/24.
+*/
+func probeSrcFor(listen string) string {
+	if isV6(listen) {
+		return "::1"
+	}
+	return "127.8.0.1"
+}
+
+// isV6 reports whether an address literal is IPv6, which decides the family
+// every socket in the arm is opened in.
+func isV6(addr string) bool {
+	ip := net.ParseIP(addr)
+	return ip != nil && ip.To4() == nil
+}
+
+/*
+armCache is `cache.max_entries` for the arm.
+
+Large by default, for the reason the template gives: every name in a run is
+asked once, so a run's worth of misses has to fit or the arm measures eviction
+the generator caused. The soak arm sets the shipped figure instead, because over
+an hour eviction is not an artefact - it is the thing being watched.
+*/
+func armCache(a arm) int {
+	if a.cacheEntries > 0 {
+		return a.cacheEntries
+	}
+	return 400000
 }
 
 /*
@@ -114,35 +179,43 @@ measuring the machine rather than the limiter. `log.level: info` is so the
 stats line the report reads `limited=`/`slipped=` off is written.
 */
 const configTemplate = `log:
-  level: %s
-  queries: %t
-  file: %s
+  level: %[1]s
+  queries: %[2]t
+  file: %[3]s
 
 server:
-  workers: %d
-  upstream_workers: %d
-%s  rate_limit:
-%s
+  workers: %[4]d
+  upstream_workers: %[5]d
+%[6]s  rate_limit:
+%[7]s
 
 listeners:
   udp:
     enabled: true
-    address: "127.0.0.1"
-    port: %d
+    address: "%[8]s"
+    port: %[9]d
   tcp:
     enabled: true
-    address: "127.0.0.1"
-    port: %d
-  # On in every arm rather than only the DoH ones, so the listener an arm does
-  # not use is still there to be sure it costs nothing: a bystander's result
-  # would mean less if the DoH arms ran against a differently configured server.
+    address: "%[8]s"
+    port: %[9]d
+  # DoT and DoH are on in every arm rather than only the arms that use them, so
+  # a listener an arm does not use is still there to be sure it costs nothing: a
+  # bystander's result would mean less if the DoH arms ran against a differently
+  # configured server. The DoT one is also where a TLS handshake is reachable
+  # without HTTP on top of it, which is what the handshake-flood arms need.
+  dot:
+    enabled: true
+    address: "%[8]s"
+    port: %[10]d
+    cert_file: %[12]s
+    key_file: %[13]s
   doh:
     enabled: true
-    address: "127.0.0.1"
-    port: %d
+    address: "%[8]s"
+    port: %[11]d
     path: /dns-query
-    cert_file: %s
-    key_file: %s
+    cert_file: %[12]s
+    key_file: %[13]s
 
 upstream:
   strategy: failover
@@ -152,15 +225,16 @@ upstream:
   servers:
     - name: mock
       type: udp
-      address: %s
-      port: %s
+      address: %[14]s
+      port: %[15]s
 
 cache:
   enabled: true
   # Every query in a run asks about a name of its own, so a run's worth of
   # misses has to fit without evicting: a cache churning is a cost of the
-  # generator's making rather than of the load.
-  max_entries: 400000
+  # generator's making rather than of the load. The soak arm asks for the
+  # shipped figure instead - see armCache in server.go.
+  max_entries: %[16]d
 
 blocking:
   enabled: false
@@ -170,16 +244,18 @@ dnssec:
 
 # Off by default; on here because the limiter's own counters are the server's
 # side of the story, and reading them from the process beats inferring them
-# from what the clients saw.
+# from what the clients saw. On 127.0.0.1 whatever the listeners bind - it is
+# the harness reading the server rather than part of the load, and loopback
+# IPv4 is on every machine that can run the IPv4 arms at all.
 metrics:
   enabled: true
   address: "127.0.0.1"
-  port: %d
+  port: %[17]d
   path: /metrics
 `
 
 func startServer(bin, dir, upstream string, a arm) (*server, error) {
-	port, dohPort, metricsPort, err := armPorts()
+	port, dotPort, dohPort, metricsPort, err := armPorts()
 	if err != nil {
 		return nil, err
 	}
@@ -191,17 +267,21 @@ func startServer(bin, dir, upstream string, a arm) (*server, error) {
 	name := strings.NewReplacer("/", "-").Replace(a.name)
 	logPath := filepath.Join(dir, name+".log")
 
+	listen := armListen(a)
 	cfg := serverConfig(armServer{
-		logPath:     logPath,
-		rateLimit:   rateLimitBlock(a),
-		connections: connectionBlock(a),
-		cert:        cert,
-		key:         key,
-		upHost:      host,
-		upPort:      upPort,
-		port:        port,
-		dohPort:     dohPort,
-		metrics:     metricsPort,
+		logPath:      logPath,
+		rateLimit:    rateLimitBlock(a),
+		connections:  connectionBlock(a),
+		cert:         cert,
+		key:          key,
+		upHost:       host,
+		upPort:       upPort,
+		listen:       listen,
+		port:         port,
+		dotPort:      dotPort,
+		dohPort:      dohPort,
+		cacheEntries: armCache(a),
+		metrics:      metricsPort,
 	})
 
 	cfgPath := filepath.Join(dir, name+".yaml")
@@ -210,9 +290,11 @@ func startServer(bin, dir, upstream string, a arm) (*server, error) {
 	}
 
 	s := &server{
-		udpAddr:     fmt.Sprintf("127.0.0.1:%d", port),
-		tcpAddr:     fmt.Sprintf("127.0.0.1:%d", port),
-		dohAddr:     fmt.Sprintf("127.0.0.1:%d", dohPort),
+		udpAddr:     joinPort(listen, port),
+		tcpAddr:     joinPort(listen, port),
+		dotAddr:     joinPort(listen, dotPort),
+		dohAddr:     joinPort(listen, dohPort),
+		probeSrc:    probeSrcFor(listen),
 		certPath:    cert,
 		metricsAddr: fmt.Sprintf("127.0.0.1:%d", metricsPort),
 		logPath:     logPath,
@@ -222,25 +304,31 @@ func startServer(bin, dir, upstream string, a arm) (*server, error) {
 		return nil, err
 	}
 	s.pid = s.cmd.Process.Pid
-	if err := waitReady(s.udpAddr, 10*time.Second); err != nil {
+	if err := waitReady(s.udpAddr, s.probeSrc, 10*time.Second); err != nil {
 		s.stop()
 		return nil, fmt.Errorf("did not come up: %w", err)
 	}
 	return s, nil
 }
 
+// joinPort is the address a client dials, in the form the family needs: IPv6
+// carries brackets, and `net.JoinHostPort` is what puts them there.
+func joinPort(host string, port int) string {
+	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
 /*
 waitReady polls until a query is answered.
 
-From 127.8.0.1, which is a prefix no arm asks from: the probes spend budget, and
-spending the victim's or the attacker's would put an arm's first result inside a
-bucket the harness had already drawn from.
+From `src`, which is a prefix no arm asks from - 127.8.0.1, or `::1` in the IPv6
+arms: the probes spend budget, and spending the victim's or the attacker's would
+put an arm's first result inside a bucket the harness had already drawn from.
 */
-func waitReady(addr string, within time.Duration) error {
+func waitReady(addr, src string, within time.Duration) error {
 	deadline := time.Now().Add(within)
 	var last error
 	for time.Now().Before(deadline) {
-		conn, err := dialUDP(addr, "127.8.0.1")
+		conn, err := dialUDP(addr, src)
 		if err != nil {
 			last = err
 			time.Sleep(50 * time.Millisecond)
