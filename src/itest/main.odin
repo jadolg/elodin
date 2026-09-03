@@ -146,6 +146,9 @@ main :: proc() {
 	section(&r, "udp response ceiling")
 	run_udp_size_cases(&r)
 
+	section(&r, "udp readers")
+	run_udp_reader_cases(&r)
+
 	section(&r, "cache")
 	run_cache_cases(&r)
 	run_cache_bytes_cases(&r)
