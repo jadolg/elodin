@@ -196,6 +196,25 @@ sizing_origin :: proc(s: config.Server_Config) -> string {
 	return "from the configuration"
 }
 
+/*
+Where the reader count came from, when the machine is what decided it.
+
+Empty for a figure an operator wrote, for the same reason `sizing_origin`
+returns "from the configuration" rather than naming a machine it never
+consulted: crediting the hardware with somebody's own number sends them looking
+for a setting they already have.
+*/
+@(private)
+udp_readers_origin :: proc(s: config.Server_Config) -> string {
+	if !s.sizing.derived_udp_readers {
+		return ""
+	}
+	if s.sizing.machine.cpus > 0 {
+		return fmt.tprintf(" (derived from %s)", usable_cpus(s.sizing.machine.cpus))
+	}
+	return " (derived; this machine's CPUs could not be counted)"
+}
+
 @(private)
 sizing_line :: proc(s: config.Server_Config) -> string {
 	return fmt.tprintf(
@@ -453,6 +472,16 @@ main :: proc() {
 			len(cfg.rewrites))
 		fmt.printfln("  %s", sizing_line(cfg.server))
 		fmt.printfln("  %s", allow_from_line(cfg.server))
+		// Only where it applies, and without a granted figure: nothing here has
+		// bound a socket, so what the kernel would allow each reader is not
+		// known yet. Startup prints the same line with that filled in.
+		if cfg.listeners.udp.enabled {
+			fmt.printfln(
+				"  udp: %s%s",
+				server.udp_readers_line(cfg.listeners.udp.readers, cfg.listeners.udp.receive_buffer, 0),
+				udp_readers_origin(cfg.server),
+			)
+		}
 		// Only where it applies, as at startup: with no stream listener there is
 		// no connection table for either figure to bound.
 		if config.stream_listeners_enabled(cfg.listeners) {
@@ -745,6 +774,10 @@ maintenance_loop :: proc(
 	TICK :: 30 * time.Second
 	last_refresh := time.now()
 	last_report := time.now()
+	// What the kernel had dropped at the last report, so the line below is
+	// about the interval rather than about the whole run. A counter that only
+	// grows says nothing about whether it is still growing.
+	last_udp_drops: u64
 
 	for sync.atomic_load(&s.running) {
 		switch wait_for_tick(TICK) {
@@ -782,10 +815,48 @@ maintenance_loop :: proc(
 
 		if time.diff(last_report, time.now()) >= 5 * time.Minute {
 			report(s, answers)
+			report_udp_drops(listeners, &last_udp_drops)
 			last_report = time.now()
 		}
 		free_all(context.temp_allocator)
 	}
+}
+
+/*
+Say when the kernel is throwing datagrams away before this server can read them.
+
+The one loss nothing else in this process can report. A datagram that overflows
+a reader's receive queue never reaches a read, so it is charged to no counter on
+the query path and its absence is indistinguishable from a client that did not
+ask - which is why the condition is normally learned from complaints rather than
+from the server. `elodin_udp_receive_drops_total` carries the same number per
+reader for anybody scraping; this line is for the operator who is not.
+
+A `warn` because it is the point past which this server's fairness properties
+stop applying: the thing deciding whose queries are served is the kernel's queue
+rather than the rate limiter's budget, and no setting in the file can reach it.
+Bounded to one line per five-minute report, and only when the figure has moved,
+so a server that dropped datagrams once at three in the morning says so once.
+*/
+@(private)
+report_udp_drops :: proc(l: ^server.Listeners, last: ^u64) {
+	total, ok := server.udp_receive_drops(l)
+	if !ok {
+		return
+	}
+	defer last^ = total
+	// Counters that only grow, so anything but growth is the kernel having
+	// nothing new to report - or, if a figure ever went backwards, a socket
+	// this process no longer owns, which is not something to raise an alarm over.
+	if total <= last^ {
+		return
+	}
+	logx.warnf(
+		"udp: the kernel dropped %d datagrams before any reader could take them (%d since start): more than %d reader(s) can drain. Raise listeners.udp.readers, raise listeners.udp.receive_buffer with net.core.rmem_max to match, or put a packet filter in front of this server",
+		total - last^,
+		total,
+		len(l.udp),
+	)
 }
 
 report :: proc(s: ^server.Server, answers: ^cache.Cache) {
