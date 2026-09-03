@@ -61,11 +61,11 @@ into that, which is the half of #233 this run does settle.
 
 **The bystander loss that motivated #233 is already gone, and was not the
 reader's doing.** That arm measured 64% for a client in an unrelated /24; here the
-same flood leaves it at 96–98% with a single reader. The difference is issue
-#232's fix: the slip's truncated answers were charged to no budget, so the read
-loop was performing half a million sends a second of its own on top of the reads.
-`2026-09-03-slip-budget.md` records that, and the header of the bystander file
-says so. The read-side ceiling is real; the 36% was mostly the writes.
+same flood leaves it at 96–98% with a single reader. The difference is the fix
+for issue #232: the slip's truncated answers were charged to no budget, so the
+read loop was performing half a million sends a second of its own on top of the
+reads. `2026-09-03-slip-budget.md` records that, and the header of the bystander
+file says so. The read-side ceiling is real; the 36% was mostly the writes.
 
 ## What this run does not show
 

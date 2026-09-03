@@ -924,10 +924,11 @@ ceiling rather than as a disaster: the [rate limiter](#rate-limiting) held the
 flood at its budget throughout and a client in an unrelated /24 was answered 98%
 of the time.
 
-The 36% that client lost when [issue
-#233](https://github.com/jadolg/elodin/issues/233) was filed is gone, and was
-mostly not the reader's doing: the slip's truncated answers were charged to no
-budget then, so the read loop was also performing half a million sends a second.
+The 36% that client lost when
+[issue #233](https://github.com/jadolg/elodin/issues/233) was filed is gone, and
+was mostly not the reader's doing: the slip's truncated answers were charged to
+no budget then, so the read loop was also performing half a million sends a
+second.
 Giving them a pool of their own fixed that (`2026-09-03-slip-budget.md`), and
 what is left is the drain rate itself.
 
