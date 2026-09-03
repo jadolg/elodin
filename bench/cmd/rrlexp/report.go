@@ -22,6 +22,7 @@ func renderReport(rows []row) string {
 	victimTable(&b, rows)
 	floodTable(&b, rows)
 	dohTable(&b, rows)
+	connTable(&b, rows)
 	serverTable(&b, rows)
 
 	b.WriteString("\n## What each arm was asking\n\n")
@@ -170,6 +171,60 @@ func floodTable(b *strings.Builder, rows []row) {
 			float64(a.truncated.Load())/secs,
 			float64(a.bytesIn.Load())/secs/1e6, amp)
 	}
+}
+
+/*
+connTable is the arms where what a client takes is the connection table itself.
+
+`held` is what the holder is occupying and `refused` is what the server turned
+away, both counted from the holder's side: a connection it opened and was not
+closed on is one of the server's slots gone until the client gives it back. The
+victim column beside them is the point of the pair - the same load, a share
+away from locking a client in another /24 out of a resolver whose datagram
+service is still answering.
+
+`conn_refused` is the server's own count, and it is the larger of the two on
+purpose: it counts every connection this server had no room for, which is the
+holder's refusals plus the victim's plus the warm-up's. Read it as the total
+turned away in the arm rather than as a check on `refused` beside it.
+*/
+func connTable(b *strings.Builder, rows []row) {
+	if !hasIdle(rows) {
+		return
+	}
+
+	b.WriteString("\n## The connection table: who is holding it\n\n")
+	b.WriteString("| arm | table | share | opened | held | refused | conn_refused | victim answered | victim p50 |\n")
+	b.WriteString("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+	for _, r := range rows {
+		if r.arm.attacker == nil || !r.arm.attacker.idle {
+			continue
+		}
+		a := r.attacker
+		opened, refused := a.dials.Load(), a.closed.Load()
+		v := r.victim
+		answered := 0.0
+		if offered := v.offered.Load(); offered > 0 {
+			answered = 100 * float64(v.full.Load()) / float64(offered)
+		}
+		share := "none"
+		if r.arm.perPrefix > 0 && r.arm.perPrefix < r.arm.maxConns {
+			share = fmt.Sprintf("%d", r.arm.perPrefix)
+		}
+		fmt.Fprintf(b, "| %s | %d | %s | %d | %d | %d | %d | %.0f%% (%d/%d) | %s |\n",
+			r.arm.name, r.arm.maxConns, share, opened, opened-refused, refused,
+			r.srv["elodin_connections_refused_total"],
+			answered, v.full.Load(), v.offered.Load(), round(v.pct(0.5)))
+	}
+}
+
+func hasIdle(rows []row) bool {
+	for _, r := range rows {
+		if r.arm.attacker != nil && r.arm.attacker.idle {
+			return true
+		}
+	}
+	return false
 }
 
 func serverTable(b *strings.Builder, rows []row) {

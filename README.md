@@ -808,6 +808,67 @@ have the clients beside it dropped.
 for UDP. `cookies.require` is the sharper instrument for an attack actually under
 way.
 
+What none of this bounds is how much of the server one client *occupies*, since
+both budgets are spent by queries and a connection that asks nothing is free.
+That is the next section.
+
+### How many connections one client may hold
+
+```yaml
+server:
+  max_connections: 512            # TCP, DoT and DoH connections at once, for the whole server
+  max_connections_per_prefix: 0   # how many of them one client may hold; 0 derives half
+```
+
+`max_connections` is one budget for the whole server, and on its own it says
+nothing about how it is shared. Nothing else counted a client's connections
+either — [rate limiting](#rate-limiting) charges *queries*, so a client that
+opens connections and asks nothing on them spends no budget however many it
+holds, and `client_timeout` reclaiming an idle one after ten seconds is a delay
+rather than a limit to somebody willing to open another. So the answer to "how
+many of my 512 connections can one stranger have" was "all of them".
+
+`max_connections_per_prefix` is the share. It is counted against established
+connections, per /24 and per /64 — the same unit the response budget uses, so
+the two agree about who a client is — and a connection past a client's share is
+closed on accept and counted as `conn_refused=`, like one past the table itself.
+The log line under it names which of the two figures refused it, because raising
+the wrong one makes the other worse.
+
+`0` derives half of `max_connections`, so the default table of 512 gives any one
+prefix 256. Anything at or above `max_connections` is no cap at all — one client
+may hold the whole table, which is what elodin did before this setting existed
+and what an operator serving a single large NAT should ask for on purpose. Both
+figures are in the log at startup, and in
+`elodin_connections_max` / `elodin_connections_max_per_prefix`.
+
+**On a private network, note what a prefix is.** Every device on
+`192.168.1.0/24` is one client to this setting, sharing 256 connections between
+them; a resolver serving more devices than half its table wants the share raised,
+or `max_connections` raised underneath it. Half is chosen to be a bound nobody
+trips over rather than a tight one: it guarantees that no single client can lock
+the rest out, and asks nothing of an operator who has not read this.
+
+On a public instance, consider going much lower. A real client holds one
+connection per device and reuses it, so a share in the low tens is generous for
+anybody legitimate and leaves a stranger holding a fortieth of the table instead
+of half of it.
+
+Note that what it bounds is a *prefix* rather than an actor, and the two are
+furthest apart on IPv6: a /48 is 65,536 /64s and a routine allocation from a
+hosting provider or a tunnel broker, so a stranger who has one can take a share
+from each and fill the table out of as many prefixes as that takes. Two of them
+are enough against the default 256. The share is what makes that expensive
+rather than impossible — at 16, a table of 512 costs 32 prefixes instead of two
+— and it is the same granularity, with the same limitation, as the response
+budget above.
+
+UDP is unaffected either way — one reader thread, no per-client state, nothing to
+refuse — which is why a resolver whose table has been taken can look healthy on
+datagrams while every TCP, DoT and DoH client gets nothing.
+`bench/results/2026-09-03-connection-table-share.md` measures that, and the same
+load with a share in place.
+
 ### DNS cookies
 
 ```yaml
@@ -1242,9 +1303,10 @@ as a warning at startup.
 | `elodin_answers_total{outcome}` | counter | `forwarded`, `cached`, `blocked`, `rewritten`, `failed` |
 | `elodin_queries_dropped_total` | counter | turned away before any work: the backlog was full, or the source could not be answered |
 | `elodin_queries_refused_total` | counter | turned away by `server.allow_from` |
-| `elodin_connections_refused_total` | counter | refused because `server.max_connections` was full |
+| `elodin_connections_refused_total` | counter | refused for want of a slot: `server.max_connections` full, or the client's prefix already holding its share |
 | `elodin_connections_failed_total` | counter | refused because the OS would not start a thread |
 | `elodin_connections_active` / `_max` | gauge | connection threads in use, and what the limit allows |
+| `elodin_connections_max_per_prefix` | gauge | how many of those one client prefix may hold; equal to `_max` when there is no share |
 | `elodin_rate_limited_total` | counter | queries the rate limiter withheld an answer from |
 | `elodin_rate_limit_slipped_total` | counter | those answered truncated instead, to send a real client to TCP |
 | `elodin_dnssec_answers_total{result}` | counter | `secure` and `bogus` |
@@ -1341,6 +1403,7 @@ $ elodin --check
 /etc/elodin/elodin.yaml is valid: 2 upstreams, 0 zone routes, 4 blocklists, 0 rewrites
   workers=16 upstream_workers=8 max_pending=128 (derived from 4 usable CPUs and 7.7 GiB)
   answering queries from 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, ::1/128, fc00::/7, fe80::/10; every other source is refused
+  connections: at most 512 at once across TCP, DoT and DoH, of which one client prefix (/24, /64) may hold 256; connections past a prefix's share are refused and counted as conn_refused=
 ```
 
 Past `max_pending` the server drops queries rather than queueing them: queueing
@@ -1353,9 +1416,11 @@ path that queues and there being a client on an open connection to tell.
 Concurrency differs by transport. **UDP** has one reader thread that hands every
 datagram to the worker pool, with no per-client state and no connection limit.
 **TCP, DoT and DoH** give each connection a thread, capped together by
-`server.max_connections` (512); within a connection TCP, DoT and HTTP/1.1 answer
-one query at a time while **HTTP/2 multiplexes**. Connections are reused, so the
-cap bounds concurrent *clients* rather than queries per second.
+`server.max_connections` (512) and per client by
+[`max_connections_per_prefix`](#how-many-connections-one-client-may-hold) (half
+of it); within a connection TCP, DoT and HTTP/1.1 answer one query at a time
+while **HTTP/2 multiplexes**. Connections are reused, so the cap bounds
+concurrent *clients* rather than queries per second.
 
 HTTP/2 costs more CPU per query than HTTP/1.1 on cache hits — framing, HPACK, the
 hand-off to the worker pool — and earns it back when queries are slow, which is
@@ -1366,13 +1431,14 @@ transports, orders of magnitude more CPU than answering on an established
 connection, and ECDSA P-256 costs about half what RSA-2048 does — which is why
 `mise run certs` generates ECDSA, and why you should use it in production too.
 
-Past `max_connections`, DoT and DoH refuse cleanly during the handshake. Plain
-TCP cannot: the kernel completes the handshake from the listen backlog before the
-server sees it, so a refused client gets a reset on first use and has to
-reconnect. Either way it is counted as `conn_refused=`, kept apart from
-`refused=` because this is a client elodin would serve and has no room for. A
-connection refused *below* the limit, when the OS will not give the process
-another thread — `RLIMIT_NPROC`, a cgroup `pids.max`, memory — is `conn_failed=`,
+Past `max_connections`, or past one client's share of it, DoT and DoH refuse
+cleanly during the handshake. Plain TCP cannot: the kernel completes the
+handshake from the listen backlog before the server sees it, so a refused client
+gets a reset on first use and has to reconnect. Either way it is counted as
+`conn_refused=`, kept apart from `refused=` because this is a client elodin would
+serve and has no room for; which of the two limits refused it is in the `warn`
+line beside it. A connection refused *below* both, when the OS will not give the
+process another thread — `RLIMIT_NPROC`, a cgroup `pids.max`, memory — is `conn_failed=`,
 where raising `max_connections` cannot help and would make it worse.
 
 `mise run bench` measures all of this; the harness is documented in
@@ -1394,9 +1460,10 @@ size of the lists.
   the additional section are left alone unless the answer carried an SVCB or
   HTTPS record.
 - **Connection-oriented transports get a thread per connection**, capped for TCP,
-  DoT and DoH together by `server.max_connections`. That suits clients that hold
-  a connection open and pipeline over it, not tens of thousands of concurrent
-  connections. UDP is the exception: one reader thread and no per-client state.
+  DoT and DoH together by `server.max_connections` and per client prefix by
+  `server.max_connections_per_prefix`. That suits clients that hold a connection
+  open and pipeline over it, not tens of thousands of concurrent connections. UDP
+  is the exception: one reader thread and no per-client state.
 - **Upstream I/O is synchronous**, so concurrency is bounded by thread count
   rather than by in-flight queries. The h2 upstream client multiplexes onto one
   connection, but a worker is still held for the round trip. Async upstream I/O,

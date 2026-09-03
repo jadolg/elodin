@@ -36,6 +36,19 @@ Listeners :: struct {
 	doh: Listener,
 }
 
+/*
+Whether anything that has connections is listening.
+
+UDP has none - one reader thread, no per-client state - so a server with only
+that has no connection table, and `max_connections` and the share of it are
+figures about nothing. Both the startup line and `--check` ask this before saying
+anything about them, through one procedure so the two cannot disagree about when
+the subject exists.
+*/
+stream_listeners_enabled :: proc(l: Listeners) -> bool {
+	return l.tcp.enabled || l.dot.enabled || l.doh.enabled
+}
+
 Upstream_Kind :: enum u8 {
 	UDP,
 	TCP,
@@ -394,7 +407,7 @@ Server_Config :: struct {
 	every worker costs memory permanently and a number that suits a rack-mounted
 	resolver is one a home router pays for and never uses.
 	*/
-	workers:          int,
+	workers:                    int,
 	/*
 	Worker threads dedicated to racing upstreams, kept separate so a burst of
 	races cannot starve the handlers that submitted them.
@@ -402,10 +415,53 @@ Server_Config :: struct {
 	Zero derives it as half of `workers`, whether that came from the file or
 	from the machine.
 	*/
-	upstream_workers: int,
+	upstream_workers:           int,
 	// Per-connection read timeout for TCP, DoT and DoH clients.
-	client_timeout:   time.Duration,
-	max_connections:  int,
+	client_timeout:             time.Duration,
+	// Stream connections - TCP, DoT and DoH together - that may exist at once,
+	// for the whole server. How much of it one client may hold is
+	// `max_connections_per_prefix`.
+	max_connections:            int,
+	/*
+	The most of `max_connections` any one client prefix may hold at once.
+
+	`max_connections` is one budget for the whole server, and on its own it says
+	nothing about how that budget is shared. Nothing else bounds a client's share
+	either: `rate_limit` charges *queries*, so a client that opens connections and
+	asks nothing spends no budget at all, and `client_timeout` reclaiming an idle
+	connection after ten seconds is a delay rather than a limit to somebody willing
+	to open another. Without this the answer to "how many of my 512 connections can
+	one stranger have" is "all of them", and no configured limit says otherwise.
+
+	Kept per prefix - /24 and /64 - rather than per address, which is the
+	granularity `rate_limit` keeps its budgets at and for the same reason: an
+	attacker picks addresses freely inside the range they have, so a per-address
+	cap is one they can multiply by picking another. `client_prefix` in
+	`src/server/ratelimit.odin` is what both this and the response budget ask, so
+	the two cannot come to different views of who a client is.
+
+	Zero derives half of `max_connections`: an even split with everybody else, and
+	far above what any real client network holds at once. Anything at or above
+	`max_connections` is no cap at all - one client may have the whole table, which
+	is what this server did before the setting existed.
+
+	Note what a prefix is on a private network. Every device on a 192.168.1.0/24
+	LAN is one client to this setting, sharing one cap between them, so a resolver
+	serving more devices than half its table wants the figure raised - or
+	`max_connections` raised underneath it. On a public instance the opposite is
+	true and the default is the point: a stranger's /24 gets half the table at
+	most, whatever it does.
+
+	And note what it does not bound, which is an actor. A prefix is not a person:
+	an attacker holding a /48 has 65,536 /64s to take a share from, so on IPv6 the
+	table can still be filled out of enough prefixes - two of them, against a
+	share of half. What the figure buys there is cost rather than impossibility,
+	and lowering it is what raises the cost: a share of 16 makes a table of 512
+	thirty-two prefixes' work instead of two. Same granularity, and the same
+	limitation, as `rate_limit` - deliberately, so that the two agree about who a
+	client is. See `client_prefix`.
+	*/
+	max_connections_per_prefix: int,
 	/*
 	Queries allowed to be queued or in flight before new ones are dropped.
 
@@ -424,7 +480,7 @@ Server_Config :: struct {
 	and HTTP/1.1 DoH answer on their own connection thread and are bounded by
 	`max_connections` instead.
 	*/
-	max_pending:      int,
+	max_pending:                int,
 	/*
 	Account the process switches to once the listeners have bound.
 
@@ -434,9 +490,9 @@ Server_Config :: struct {
 	every reason to want it to be somebody else by the time that begins. A name
 	or a numeric uid; empty leaves the process as it started.
 	*/
-	user:             string,
+	user:                       string,
 	// Group to go with `user`. Empty takes the user's primary group.
-	group:            string,
+	group:                      string,
 	/*
 	Networks a query is accepted from, in CIDR form. See `acl.odin`.
 
@@ -444,7 +500,7 @@ Server_Config :: struct {
 	serves the machine and the network it is on rather than the internet. An
 	empty list is no restriction, for a resolver that is meant to be public.
 	*/
-	allow_from:       []Prefix,
+	allow_from:                 []Prefix,
 	/*
 	The largest UDP response this server will send, whatever the client asked
 	for.
@@ -467,11 +523,11 @@ Server_Config :: struct {
 	datagrams and where the resolver is not reachable by anyone who would abuse
 	it. Below 512 there is nothing sensible to send, so that is the floor.
 	*/
-	max_udp_response: int,
-	rate_limit:       Rate_Limit_Config,
+	max_udp_response:           int,
+	rate_limit:                 Rate_Limit_Config,
 	// What the two worker counts were derived from, when they were. Not a
 	// setting: filled in at load so startup and `--check` can report it.
-	sizing:           Sizing,
+	sizing:                     Sizing,
 }
 
 /*
@@ -496,6 +552,11 @@ asking both ways can draw twice the figure.
 TCP, so it has nothing to say to a client that is already on a connection.
 Over-budget queries end a TCP or DoT connection instead; DoH answers 429 and keeps
 it, a refusal that costs a TLS handshake being dearer than the answer it withheld.
+
+What this does not bound is how much of the server one client occupies. Both budgets
+are spent by *queries*, so a client that opens connections and asks nothing on them
+is charged nothing here however many it holds. `max_connections_per_prefix` is that
+bound, keyed to the same prefix so the two agree about who a client is.
 */
 Rate_Limit_Config :: struct {
 	enabled:              bool,
@@ -672,17 +733,21 @@ default_config :: proc() -> Config {
 		// actually has. A fixed 128 and 64 sized every installation for five
 		// thousand cache misses a second, and the threads that pays for keep
 		// their scratch arenas resident whether or not the load ever arrives.
-		workers          = 0,
-		upstream_workers = 0,
-		client_timeout   = 10 * time.Second,
-		max_connections  = 512,
-		max_pending      = 0,
+		workers                    = 0,
+		upstream_workers           = 0,
+		client_timeout             = 10 * time.Second,
+		max_connections            = 512,
+		// Zero, and worked out from `max_connections` at load: an operator who
+		// raises the table expects one client's share to move with it, and a
+		// figure written here would stay at half of the default table for ever.
+		max_connections_per_prefix = 0,
+		max_pending                = 0,
 		// The local networks, and nothing else: a resolver that has not been
 		// configured must not be an open one. See `DEFAULT_ALLOW_FROM`.
-		allow_from       = DEFAULT_ALLOW_FROM,
+		allow_from                 = DEFAULT_ALLOW_FROM,
 		// The DNS Flag Day 2020 figure. See the field, and the measurement in
 		// bench/results/2026-08-06-edns-response-sizes.md.
-		max_udp_response = DEFAULT_MAX_UDP_RESPONSE,
+		max_udp_response           = DEFAULT_MAX_UDP_RESPONSE,
 		/*
 		On by default, and generous.
 
@@ -694,7 +759,7 @@ default_config :: proc() -> Config {
 		bandwidth. Every second query past it comes back truncated rather than
 		dropped, so a client that really is that busy keeps resolving, over TCP.
 		*/
-		rate_limit       = Rate_Limit_Config{enabled = true, responses_per_second = 500, slip = 2},
+		rate_limit                 = Rate_Limit_Config{enabled = true, responses_per_second = 500, slip = 2},
 	}
 	c.listeners.udp = Listener {
 		enabled = true,

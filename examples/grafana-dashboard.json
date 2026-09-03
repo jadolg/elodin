@@ -770,7 +770,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Four different problems, kept apart on purpose. Rising drops means server.workers is too low; rising refusals means a client is not on server.allow_from; refused connections means max_connections is full; failed connections means the OS would not start a thread, which happens below the limit and is not fixed by raising it.",
+      "description": "Four different problems, kept apart on purpose. Rising drops means server.workers is too low; rising refusals means a client is not on server.allow_from; refused connections means max_connections is full or one client prefix has filled its share of it (the log line says which); failed connections means the OS would not start a thread, which happens below the limit and is not fixed by raising it.",
       "fieldConfig": {
         "defaults": {
           "color": {

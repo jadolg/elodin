@@ -1,5 +1,6 @@
 package config
 
+import "core:fmt"
 import "core:net"
 import "core:strings"
 import "core:testing"
@@ -855,6 +856,105 @@ test_rebind_allow_domains_will_not_take_an_empty_label :: proc(t: ^testing.T) {
 		e, has := err.?
 		if testing.expect(t, has, "an empty label was accepted, and would match nothing") {
 			testing.expect(t, strings.contains(e.messages[0], "rebind.allow_domains"))
+		}
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+One client's share of the connection table: derived from the table, and never
+larger than it.
+
+`max_connections` is a budget for the whole server, and before this setting
+existed nothing said how it was shared - so one client could hold all 512 slots
+and no configured limit said otherwise. The default is half, which leaves the
+other half for everybody else; a figure at or above the table is stored as the
+table's own size, which is no cap at all and is how an operator asks for the old
+behaviour on purpose.
+
+Derived at load rather than at startup, for the reason the worker counts are:
+`--check` and the run after it then report the same number by construction.
+*/
+@(test)
+test_the_connection_share_is_derived_from_the_table :: proc(t: ^testing.T) {
+	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	testing.expect(t, err == nil, "expected a clean load")
+	testing.expect_value(t, cfg.server.max_connections, 512)
+	testing.expect_value(t, cfg.server.max_connections_per_prefix, 256)
+
+	// It follows the table rather than the shipped default of it: an operator
+	// who raises one expects a client's share to move with it.
+	raised, rerr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\nserver:\n  max_connections: 4096\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, rerr == nil, "expected a clean load")
+	testing.expect_value(t, raised.server.max_connections_per_prefix, 2048)
+
+	// A number in the file wins.
+	set, serr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\nserver:\n  max_connections_per_prefix: 8\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, serr == nil, "expected a clean load")
+	testing.expect_value(t, set.server.max_connections_per_prefix, 8)
+
+	/*
+	And a number past the table is the table.
+
+	Clamped rather than kept as written, so that `conn_spawn` can compare
+	against it without a special case: a share that cannot be reached before
+	the total is reached is a share that never refuses anything, which is what
+	asking for more than the table means.
+	*/
+	over, oerr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\nserver:\n  max_connections: 64\n  max_connections_per_prefix: 10000\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, oerr == nil, "a share larger than the table is not an error")
+	testing.expect_value(t, over.server.max_connections_per_prefix, 64)
+
+	// Negative is refused rather than read as one of the two special values it
+	// sits next to.
+	_, nerr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\nserver:\n  max_connections_per_prefix: -1\n",
+		context.temp_allocator,
+	)
+	e, has := nerr.?
+	if testing.expect(t, has, "a negative share was accepted") {
+		testing.expect(t, strings.contains(e.messages[0], "max_connections_per_prefix"))
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+And the table the share is derived from has to be a table.
+
+`conn_manager_init` reads anything below one as one connection, so a zero or a
+negative used to load: the server came up serving a single client while the
+startup line and `--check` said "at most 0 at once ... any one client prefix may
+hold all of them", and `elodin_connections_max` published the same. Refused
+here for the reason `max_udp_response` is refused rather than clamped - a figure
+an operator can read off the server has to be the one the server is using - and
+because every figure below is derived from it.
+*/
+@(test)
+test_the_connection_table_must_be_at_least_one :: proc(t: ^testing.T) {
+	sources := []string{"max_connections: 0", "max_connections: -5"}
+	for src in sources {
+		_, err := load_string(
+			fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nserver:\n  %s\n", src),
+			context.temp_allocator,
+		)
+		e, has := err.?
+		if testing.expectf(t, has, "%q was accepted", src) {
+			testing.expectf(
+				t,
+				strings.contains(e.messages[0], "server.max_connections must be at least 1"),
+				"%q was refused for the wrong reason: %s",
+				src,
+				e.messages[0],
+			)
 		}
 	}
 	free_all(context.temp_allocator)

@@ -195,6 +195,7 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 	opt_int(l, n, "workers", &cfg.server.workers, "server")
 	opt_int(l, n, "upstream_workers", &cfg.server.upstream_workers, "server")
 	opt_int(l, n, "max_connections", &cfg.server.max_connections, "server")
+	opt_int(l, n, "max_connections_per_prefix", &cfg.server.max_connections_per_prefix, "server")
 	opt_int(l, n, "max_pending", &cfg.server.max_pending, "server")
 	// A size, so "1232" and "1232B" and "4KiB" all read, the same as the cache
 	// sizes do.
@@ -2102,6 +2103,50 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	if cfg.server.max_pending == 0 {
 		cfg.server.max_pending = cfg.server.workers * 8
 	}
+	/*
+	The table itself, refused rather than clamped.
+
+	`conn_manager_init` reads anything below one as one connection, so a server
+	configured with zero came up serving a single client and said "at most 0 at
+	once" on the startup line and in `elodin_connections_max` - a figure that
+	described neither the file nor the running server. It is also the number the
+	share below is derived from and reported against, so a nonsense table makes
+	a nonsense share: at or below zero the derivation and the clamp both land on
+	one, which then reads as "any one client prefix may hold all of them".
+	*/
+	if cfg.server.max_connections < 1 {
+		errorf(
+			l,
+			"server.max_connections must be at least 1 (it is %d); 512 is the default",
+			cfg.server.max_connections,
+		)
+	}
+	if cfg.server.max_connections_per_prefix < 0 {
+		errorf(l, "server.max_connections_per_prefix must not be negative")
+	}
+	/*
+	One client's share of the connection table, worked out here for the reason
+	`max_pending` is: `--check` and the run that follows it then agree by
+	construction, and a figure nobody wrote in the file is one an operator can
+	still read off the server.
+
+	Half of the table, and never more than the table. Half is what leaves the
+	other half for everybody else, which is the whole property the cap exists
+	for. At or above `max_connections` there is no cap left to apply - the total
+	is reached first, from wherever the connections came - and storing that as
+	the table's own size is what makes it inert without `conn_spawn` needing a
+	special case for it. The `max(..., 1)` guards keep the arithmetic sane for a
+	table the check above has already refused: the load fails, but validation
+	runs to the end first and the figures it prints on the way have to mean
+	something.
+	*/
+	if cfg.server.max_connections_per_prefix == 0 {
+		cfg.server.max_connections_per_prefix = max(cfg.server.max_connections / 2, 1)
+	}
+	cfg.server.max_connections_per_prefix = min(
+		cfg.server.max_connections_per_prefix,
+		max(cfg.server.max_connections, 1),
+	)
 	// A group on its own would read as a privilege drop that was configured,
 	// and nothing at all is what it would do.
 	if cfg.server.group != "" && cfg.server.user == "" {

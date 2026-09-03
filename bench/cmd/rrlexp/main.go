@@ -25,6 +25,13 @@ means nothing on its own: a server that was never saturated would serve the
 victim with no limiter at all. The pair is what says whether the limiter is
 carrying the result.
 
+The `slowloris` arms at the end ask the same question of a different resource.
+What a bystander needs is not only an answer but somewhere to ask, and the
+connection table is a per-client share of its own: those arms hold connections
+open and idle from one prefix - load no response budget can see, since a budget
+is spent by queries - and report what a client in another /24 gets while it is
+happening, with `server.max_connections_per_prefix` set and unset.
+
 The load generator builds and parses DNS messages itself (`internal/dnswire`)
 and the upstream is in-process here, for the reason bench/README.md gives: a
 generator sharing the codec under test could agree with a bug in it.
@@ -75,6 +82,28 @@ type clientSpec struct {
 		get the server to produce them at its own speed rather than its upstream's.
 	*/
 	qmode string
+	/*
+		Open `sockets` connections, ask nothing on any of them, and hold them for
+		the arm.
+
+		The load `server.max_connections` had no other bound against: the response
+		limiter charges queries, so a client that never asks one spends no budget
+		however many connections it is holding. Only the stream transports have
+		anything to hold, so this is a TCP client; over UDP there is nothing to
+		occupy.
+	*/
+	idle bool
+	/*
+		Ask each query on a connection of its own, TCP only.
+
+		For the victim of an `idle` client, where the thing being measured is
+		whether a connection can be had at all: a client that dialled once at the
+		start would report a single refused connection and then stop, and one that
+		holds a connection it *was* given says nothing about the next client
+		through the door. A connection per query is also what a client with no
+		persistent one does, which is most of them.
+	*/
+	redial bool
 }
 
 func (c clientSpec) name(idx, seq int, tag string) string {
@@ -92,6 +121,17 @@ type arm struct {
 	limiter  bool
 	rps      int
 	slip     int
+	/*
+		`server.max_connections` and `server.max_connections_per_prefix` for the
+		arm, and how long an idle connection is kept.
+
+		Zero leaves each out of the configuration, which is what every arm about
+		the response budget wants: the shipped default, and a share derived from
+		it. The connection arms name all three - see `connectionArms`.
+	*/
+	maxConns      int
+	perPrefix     int
+	clientTimeout time.Duration
 	// nil for the arms that measure a victim with nobody else on the server.
 	attacker *clientSpec
 	victim   clientSpec
@@ -299,6 +339,7 @@ func matrix() []arm {
 	arms = append(arms, transportArms()...)
 	arms = append(arms, volumeArms()...)
 	arms = append(arms, dohArms()...)
+	arms = append(arms, connectionArms()...)
 	return arms
 }
 
@@ -486,6 +527,76 @@ func dohArms() []arm {
 			limiter:  true, rps: *rps, slip: *slip,
 			attacker: &clientSpec{src: "127.0.0.2", transport: "doh1", rate: 0, sockets: 64, inflight: 64},
 			victim:   withSrc(victimUDP, "127.0.0.3"),
+		},
+	}
+}
+
+/*
+Who gets the connection table, which is a different question from who gets the
+answers.
+
+Every arm above measures a client asking too much. This one measures a client
+asking nothing: `sockets` connections opened from one /24 and held idle for the
+whole arm. Nothing charges for them - the budget is spent by queries, and these
+have none - so before `server.max_connections_per_prefix` existed the only bound
+was the table's own size, and one client could hold all of it.
+
+The victim is on TCP because that is where the occupancy is. A UDP client is not
+affected by a full connection table at all, which is worth saying rather than
+demonstrating: the read loop has no per-client state and no connection to be
+refused. So a resolver whose table is full is one that has lost its TCP, DoT and
+DoH clients while its datagram service looks perfectly healthy - and the ones
+lost are the clients that proved their address by handshake.
+
+A table of 64 rather than the shipped 512, and a share of 32 rather than the
+derived 256. Filling 512 slots would measure this load generator's sockets more
+than the server's share-out, and the property is scale-free: what the pair shows
+is a client held to half the table where it used to have all of it. The
+`client_timeout` is raised past the arm's own length so that a slot reclaimed
+from an idle holder is never what serves the victim - that reclamation is real,
+and it is a ten-second delay rather than a bound.
+*/
+func connectionArms() []arm {
+	const table, share = 64, 32
+	// More connections than the table has, so the attacker is bounded by
+	// something in every arm: by the share where there is one, and by the table
+	// itself where there is not.
+	slowloris := clientSpec{transport: "tcp", sockets: table + 32, idle: true}
+	// A query every 20 ms on a connection of its own, from another /24.
+	victim := clientSpec{src: "127.1.0.1", transport: "tcp", rate: *victimRate, sockets: 1, redial: true}
+	return []arm{
+		{
+			name:     "slowloris/no-share",
+			question: "what one client holding idle connections does to a client in another /24 when nothing bounds its share",
+			limiter:  true, rps: *rps, slip: *slip,
+			maxConns: table, perPrefix: table, clientTimeout: time.Minute,
+			attacker: withSrcP(&slowloris, "127.0.0.2"),
+			victim:   victim,
+		},
+		{
+			name:     "slowloris/share",
+			question: "the same load with a share of half the table, which is the shipped default in miniature",
+			limiter:  true, rps: *rps, slip: *slip,
+			maxConns: table, perPrefix: share, clientTimeout: time.Minute,
+			attacker: withSrcP(&slowloris, "127.0.0.2"),
+			victim:   victim,
+		},
+		{
+			/*
+				And the same share against a client that is asking questions.
+
+				A share is only worth having if it costs an ordinary client
+				nothing, and an ordinary client is one connection per device
+				rather than 96 of them. This arm is the regression: a victim on
+				TCP, a flood on UDP from its own /24, and a share that neither of
+				them comes close to.
+			*/
+			name:     "slowloris/share-costs-a-normal-client-nothing",
+			question: "whether a share that bounds a holder is felt by a client holding one connection",
+			limiter:  true, rps: *rps, slip: *slip,
+			maxConns: table, perPrefix: share, clientTimeout: time.Minute,
+			attacker: &clientSpec{src: "127.0.0.2", transport: "udp", rate: *floodRate, sockets: 4},
+			victim:   victim,
 		},
 	}
 }

@@ -46,6 +46,13 @@ reaches that as fast as the socket allows. `server.max_connections` bounds how
 many clients are here at once, not how fast one of them asks, so without this a
 flood delivered over a handful of connections is one the limiter never sees.
 
+How much of "here" one client may be is not this file's either, and it is not a
+gap in it: what is charged below is queries, so a client that opens connections
+and asks nothing on them spends nothing however many it holds. That is
+`server.max_connections_per_prefix`, in `conns.odin`, keyed through the same
+`client_prefix` as the budgets - so the two bounds agree about who a client is
+while bounding different things, occupancy and rate.
+
 Charged to a budget of their own, though. Each prefix has two: datagrams are spent
 out of one and connections out of the other, at the same rate, and neither is a
 way to spend the other. See `Rate_Class`.
@@ -370,39 +377,65 @@ elapsed_tokens :: proc(r: ^Rate_Limiter, last_ns, now_ns: i64) -> f64 {
 }
 
 /*
-The prefix an answer would be delivered to, hashed.
+Who a client is, for every per-client bound this server keeps: the /24 an IPv4
+address sits in, or the /64 an IPv6 one does.
 
 /24 and /64 are the units an attacker picks addresses within, so they are the
-units the budget is kept in. The hash is keyed (see `hash_key`), and never
-returns 0, which marks a bucket as unused.
+units a bound has to be kept in - a bound kept per address is one they multiply
+by picking another. Two things ask: the response budget below, keyed on the
+prefix an answer would be delivered to, and the share of `max_connections` one
+client may hold (`conn_spawn` in `conns.odin`). They ask the same procedure so
+they cannot come to different views of who is being limited, which would make
+the looser of the two the only bound.
 
-The v4 mapping is undone first, so an IPv4 client is keyed on its /24 whichever
-kind of socket it arrived on. Left mapped it would be keyed as IPv6, and every
+The v4 mapping is undone first, so an IPv4 client is read as its /24 whichever
+kind of socket it arrived on. Left mapped it would be read as IPv6, and every
 `::ffff:a.b.c.d` address is zeroes in the four groups a /64 is taken from - so
-the whole IPv4 side of a listener bound to `::` would share one bucket, and any
-one client there could spend the budget of all the others. `unmap_v4` is the same
-normalisation `is_loopback` reads a source through, and the rule the ACL compared
-it against on the way in.
+the whole IPv4 side of a listener bound to `::` would be one prefix, and any one
+client there could spend the budget, or occupy the connections, of all the
+others. `unmap_v4` is the same normalisation `is_loopback` reads a source
+through, and the rule the ACL compared it against on the way in.
+
+`n` of 0 is an address that was neither family, which nothing this server
+accepts produces; each caller says what it does with one. Compared by value, so
+`bytes` beyond `n` has to stay zero - which is why the whole struct is returned
+fresh rather than filled in through a pointer.
+*/
+Client_Prefix :: struct {
+	bytes: [8]u8,
+	n:     u8,
+}
+
+client_prefix :: proc(address: net.Address) -> Client_Prefix {
+	p: Client_Prefix
+	switch a in unmap_v4(address) {
+	case net.IP4_Address:
+		p.bytes[0], p.bytes[1], p.bytes[2] = a[0], a[1], a[2]
+		p.n = 3
+	case net.IP6_Address:
+		for i in 0 ..< 4 {
+			p.bytes[i * 2] = u8(u16(a[i]) >> 8)
+			p.bytes[i * 2 + 1] = u8(u16(a[i]))
+		}
+		p.n = 8
+	}
+	return p
+}
+
+/*
+The prefix an answer would be delivered to, hashed into a bucket key.
+
+The hash is keyed (see `hash_key`), and never returns 0, which marks a bucket as
+unused. Only the prefix's own bytes are hashed, so the two families cannot
+collide by length: three bytes of IPv4 against eight of IPv6.
 */
 @(private)
 prefix_key :: proc(r: ^Rate_Limiter, address: net.Address) -> u64 {
-	buf: [16]u8
-	n := 0
-	switch a in unmap_v4(address) {
-	case net.IP4_Address:
-		buf[0], buf[1], buf[2] = a[0], a[1], a[2]
-		n = 3
-	case net.IP6_Address:
-		for i in 0 ..< 4 {
-			buf[i * 2] = u8(u16(a[i]) >> 8)
-			buf[i * 2 + 1] = u8(u16(a[i]))
-		}
-		n = 8
-	}
-	if n == 0 {
+	p := client_prefix(address)
+	if p.n == 0 {
 		return 1
 	}
-	h := siphash.sum_bytes_2_4(buf[:n], r.hash_key[:])
+	h := siphash.sum_bytes_2_4(p.bytes[:p.n], r.hash_key[:])
 	return h if h != 0 else 1
 }
 

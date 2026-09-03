@@ -134,6 +134,12 @@ server:
   workers: %d
   upstream_workers: %d
   max_connections: %d
+  # The whole table to one prefix, for the same reason the limiter is off below:
+  # every client here is 127.0.0.1, so all of them are one client to a per-prefix
+  # share, and the shipped default of half the table would refuse the second half
+  # of the 500-connection TCP row rather than measure it. A real deployment keeps
+  # the share; see bench/results/2026-09-03-connection-table-share.md.
+  max_connections_per_prefix: %d
   max_pending: %d
   client_timeout: 10s
   # The load generator is one address sending as fast as it can, which is
@@ -188,7 +194,7 @@ rewrites:
     answer: 192.0.2.10
 `,
 		o.logLevel, o.logQueries, filepath.Join(h.dir, o.name+".log"),
-		o.workers, o.upstreamWorkers, o.maxConnections, o.maxPending,
+		o.workers, o.upstreamWorkers, o.maxConnections, o.maxConnections, o.maxPending,
 		dnsPort, dnsPort, dotPort,
 		filepath.Join(h.dir, o.certKind+"-cert.pem"), filepath.Join(h.dir, o.certKind+"-key.pem"),
 		dohPort,

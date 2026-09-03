@@ -19,6 +19,12 @@ import (
 // runs for dur; the returned stop closes the sockets, which is also what ends
 // the readers.
 func runClient(s *server, c clientSpec, dur time.Duration, tag string, track bool, st *stats) func() {
+	switch {
+	case c.idle:
+		return runIdle(s.tcpAddr, c, dur, st)
+	case c.redial:
+		return runTCPRedial(s.tcpAddr, c, dur, tag, track, st)
+	}
 	switch c.transport {
 	case "tcp":
 		return runTCP(s.tcpAddr, c, dur, tag, track, st)
@@ -261,6 +267,138 @@ func tcpWriter(conn net.Conn, c clientSpec, dur time.Duration, tag string, idx i
 		st.bytesOut.Add(int64(len(q)))
 		return true
 	})
+}
+
+/*
+runIdle opens connections and holds them, asking nothing on any of them.
+
+The whole client. There is no writer, because writing is the thing this load does
+not do: what it occupies is a slot in `server.max_connections` and a thread behind
+it, and the response limiter never sees a client that asks no questions.
+
+Each connection gets a reader, and the reader is the measurement. A connection the
+server had no room for is closed on accept - the kernel completed the handshake out
+of the listen backlog first, so the dial succeeded either way - and the read is
+what finds that out. So `dials` is what was opened and `closed` is what the server
+refused; the difference is what this client is holding.
+
+`failed` counts a dial that never connected at all, which on loopback is the
+listen backlog overflowing rather than anything the server decided. Worth keeping
+apart: it is the one number here that says the harness, not the server, ran out.
+*/
+func runIdle(dst string, c clientSpec, dur time.Duration, st *stats) func() {
+	var conns []net.Conn
+	var wg sync.WaitGroup
+	stopped := make(chan struct{})
+
+	for i := 0; i < c.sockets; i++ {
+		conn, err := dialTCP(dst, c.src)
+		if err != nil {
+			st.failed.Add(1)
+			continue
+		}
+		st.dials.Add(1)
+		conns = append(conns, conn)
+
+		wg.Add(1)
+		go func(conn net.Conn) {
+			defer wg.Done()
+			buf := make([]byte, 1)
+			// Blocks for the arm on a connection the server kept. A refusal
+			// arrives here as an EOF or a reset, and only counts as one if the
+			// harness had not already asked the client to stop.
+			if _, err := conn.Read(buf); err != nil {
+				select {
+				case <-stopped:
+				default:
+					st.closed.Add(1)
+				}
+			}
+		}(conn)
+	}
+
+	return func() {
+		close(stopped)
+		for _, conn := range conns {
+			conn.Close()
+		}
+		wg.Wait()
+	}
+}
+
+/*
+runTCPRedial asks each query on a connection of its own.
+
+For the victim of a client holding the table: what is being measured is whether a
+connection can be had, so the client has to ask for one per query. A client that
+dialled once at the start would report one refused connection and then fall
+silent, and one that was given a connection would keep answering out of it and
+say nothing about the next client to arrive.
+
+`offered` is counted before the dial rather than after it, so a query that could
+not be sent for want of a connection is still a query this client wanted answered.
+That is the whole of the victim's experience here: the refusal is not a rcode or a
+truncated answer, it is the absence of anywhere to ask.
+*/
+func runTCPRedial(dst string, c clientSpec, dur time.Duration, tag string, track bool, st *stats) func() {
+	stopped := make(chan struct{})
+	var wg sync.WaitGroup
+	t := newTracker(track)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		seq := 0
+		pace(c.rate, dur, func() bool {
+			select {
+			case <-stopped:
+				return false
+			default:
+			}
+			seq++
+			id := uint16(seq)
+			st.offered.Add(1)
+			conn, err := dialTCP(dst, c.src)
+			if err != nil {
+				st.failed.Add(1)
+				return true
+			}
+			st.dials.Add(1)
+			defer conn.Close()
+			// One round trip and no more, so a connection is never held past
+			// the query it was opened for.
+			_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+			q := frame(dnswire.Query(id, c.name(0, seq, tag), dnswire.TypeA, ednsSize))
+			t.put(id)
+			if _, err := conn.Write(q); err != nil {
+				st.closed.Add(1)
+				return true
+			}
+			st.bytesOut.Add(int64(len(q)))
+			var hdr [2]byte
+			if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+				// No answer and no connection: the server closed it, which is
+				// what a refusal on accept looks like from out here.
+				st.closed.Add(1)
+				return true
+			}
+			msg := make([]byte, binary.BigEndian.Uint16(hdr[:]))
+			if _, err := io.ReadFull(conn, msg); err != nil {
+				return true
+			}
+			rep, perr := dnswire.ParseReply(msg)
+			if perr != nil {
+				return true
+			}
+			record(st, len(msg)+2, rep, t)
+			return true
+		})
+	}()
+
+	return func() {
+		close(stopped)
+		wg.Wait()
+	}
 }
 
 // frame prefixes a message with its length, which is how DNS travels on a

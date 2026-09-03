@@ -55,28 +55,57 @@ func rateLimitBlock(a arm) string {
 	return fmt.Sprintf("    enabled: true\n    responses_per_second: %d\n    slip: %d", a.rps, a.slip)
 }
 
+/*
+connectionBlock is the arm's connection-table settings, indented for the template.
+
+Empty for every arm that is about the response budget, which is what leaves them
+on the shipped 512 with a share derived from it. The connection arms name all
+three, since what they are about is the relationship between the three numbers.
+
+Each figure is written only when the arm set it. A zero `client_timeout` emitted
+as `0s` is not the default - it is no read timeout at all, so an idle connection
+would be held for the run whatever the arm meant - and an arm that pins one
+figure and not another should get the shipped value for the rest rather than a
+zero that reads as a decision.
+*/
+func connectionBlock(a arm) string {
+	var b strings.Builder
+	if a.maxConns > 0 {
+		fmt.Fprintf(&b, "  max_connections: %d\n", a.maxConns)
+	}
+	if a.perPrefix > 0 {
+		fmt.Fprintf(&b, "  max_connections_per_prefix: %d\n", a.perPrefix)
+	}
+	if a.clientTimeout > 0 {
+		fmt.Fprintf(&b, "  client_timeout: %s\n", a.clientTimeout)
+	}
+	return b.String()
+}
+
 // armServer is what one arm's configuration is filled in from.
 type armServer struct {
-	logPath   string
-	rateLimit string
-	cert, key string
-	upHost    string
-	upPort    string
-	port      int
-	dohPort   int
-	metrics   int
+	logPath     string
+	rateLimit   string
+	connections string
+	cert, key   string
+	upHost      string
+	upPort      string
+	port        int
+	dohPort     int
+	metrics     int
 }
 
 // serverConfig is the configuration one arm runs against.
 func serverConfig(a armServer) string {
 	return fmt.Sprintf(configTemplate,
-		*logLevel, *logQueries, a.logPath, *workers, *workers/2, a.rateLimit,
+		*logLevel, *logQueries, a.logPath, *workers, *workers/2, a.connections, a.rateLimit,
 		a.port, a.port, a.dohPort, a.cert, a.key, a.upHost, a.upPort, a.metrics)
 }
 
 /*
 Everything not named here is the shipped default, including
-`max_udp_response`, which is the figure the budget is denominated in.
+`max_udp_response`, which is the figure the budget is denominated in, and the
+connection table, which only the `slowloris` arms pin.
 
 `workers` and `upstream_workers` are pinned instead of derived from this
 machine, for the reason the integration suite pins them: an arm whose flood
@@ -92,7 +121,7 @@ const configTemplate = `log:
 server:
   workers: %d
   upstream_workers: %d
-  rate_limit:
+%s  rate_limit:
 %s
 
 listeners:
@@ -163,15 +192,16 @@ func startServer(bin, dir, upstream string, a arm) (*server, error) {
 	logPath := filepath.Join(dir, name+".log")
 
 	cfg := serverConfig(armServer{
-		logPath:   logPath,
-		rateLimit: rateLimitBlock(a),
-		cert:      cert,
-		key:       key,
-		upHost:    host,
-		upPort:    upPort,
-		port:      port,
-		dohPort:   dohPort,
-		metrics:   metricsPort,
+		logPath:     logPath,
+		rateLimit:   rateLimitBlock(a),
+		connections: connectionBlock(a),
+		cert:        cert,
+		key:         key,
+		upHost:      host,
+		upPort:      upPort,
+		port:        port,
+		dohPort:     dohPort,
+		metrics:     metricsPort,
 	})
 
 	cfgPath := filepath.Join(dir, name+".yaml")
