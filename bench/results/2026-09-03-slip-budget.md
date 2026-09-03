@@ -41,6 +41,14 @@ The `limiter-off` rows differ between runs by a third. That is this machine's
 capacity to answer a cached name and not anything the change touches; both
 arms are floors on the reflection a limiter prevents rather than worst cases.
 
+**A second run, after review moved the pool's refill from 62.5 tokens a second to
+62** — the rate was computed in floating point and the figure every document
+quotes is 62, so it is divided as integers now. The same arm: 1,985,498 offered/s,
+462 answered/s, **57 truncated/s, 0.54 MB/s**, and the uninvolved bystander at
+482/499 (97%) against `slip: 0`'s 491/499 (98%). Which is the same result to
+within the spread of the arm; the tables above are the first run, and this
+paragraph is the build that was merged.
+
 ## What it cost a bystander in an unrelated /24
 
 500 queries offered at 50 q/s from `127.1.0.1` while `127.0.0.1` floods flat out.
@@ -51,6 +59,10 @@ arms are floors on the reflection a limiter prevents rather than worst cases.
 | cached-flood/limiter-on — **after** | **493 (99%)** | 0 | 7 | 33.6ms | 59.4ms |
 | cached-flood/slip-0 — before | 493 (99%) | 0 | 6 | 32.4ms | 53.6ms |
 | cached-flood/slip-0 — after | 495 (99%) | 0 | 5 | 34.1ms | 68.5ms |
+
+The two "after" rows are the claim, not their exact percentages: the repeat run
+put the default at 97% and `slip: 0` at 98%. What matters is that the pair moved
+from 44 points apart to inside each other's spread.
 
 This is the second cost the uncharged slip imposed, and it was the larger one.
 Half a million small writes a second come off the single thread reading the UDP
