@@ -557,6 +557,22 @@ first query into a zone and not the ones after it.
 | an algorithm we cannot check | insecure, not bogus — RFC 4035 treats unverifiable data as unsigned |
 | bad signature, broken chain, missing proof | SERVFAIL, with an extended DNS error (RFC 8914) saying which |
 
+A refusal reaches the log as a warning carrying the verdict, the reason and the
+server the answer came from, with `outcome=failed detail=dnssec:<upstream>` on
+the query line beside it:
+
+```
+ts=2026-08-07T09:12:52Z level=warn msg="dnssec: A xc.example.com from 192.0.2.10:44188 did not validate: Bogus (denial of existence not proven); answer came from quad9-dot"
+ts=2026-08-07T09:12:52Z level=info msg=query client=192.0.2.10:44188 proto=udp qtype=A qname=xc.example.com outcome=failed detail=dnssec:quad9-dot ms=126.5
+```
+
+The upstream is on both lines because the verdict belongs to the answer and not
+to the name: where the members of a group disagree about a zone — one that
+cannot reach it, one serving a denial that proves nothing — the same question
+fails through one server and validates through another, and nothing else on the
+line tells those apart. The reason stays in front of the name, so
+`detail=dnssec` still matches every one of them.
+
 The trust anchors are the root key-signing keys IANA publishes, both KSK-2017 and
 KSK-2024, compiled in, so a rollover between the two needs no new build.
 `trust_anchors` replaces them, taking either bare DS fields or a full

@@ -1,5 +1,6 @@
 package server
 
+import "core:fmt"
 import "core:mem"
 import "core:sync"
 import "core:time"
@@ -993,16 +994,35 @@ resolve_query :: proc(
 		case .Bogus, .Indeterminate:
 			sync.atomic_add(&s.stats.bogus, 1)
 			sync.atomic_add(&s.stats.failed, 1)
+			/*
+			Both lines name the upstream the refused answer came from.
+
+			A verdict here is a property of the answer and not of the name, so
+			the same question put to a different server can validate perfectly.
+			A group whose members disagree about a zone - one that cannot reach
+			it at all, one handing out a denial that proves nothing - is then a
+			server that fails some queries for that name and answers the rest,
+			and every other field on these two lines is identical across both.
+			Without the upstream there is nothing in the log to tell them apart
+			and the next step is a packet capture; with it, the counts per
+			server say which one to stop asking.
+
+			`client` is kept beside it. The pair is the point: one says whose
+			query went unanswered, the other says who is to blame for that, and
+			an operator reading either alone has half the story.
+			*/
+			from := answering_upstream(winner)
 			logx.warnf(
-				"dnssec: %s %s from %s did not validate: %v (%s)",
+				"dnssec: %s %s from %s did not validate: %v (%s); answer came from %s",
 				dns.type_name(q.type),
 				dns.name_trim_root(q.name),
 				client,
 				result.status,
 				result.reason,
+				from,
 			)
 			out, built := dnssec_failure_response(msg, result, allocator, limit)
-			log_query(s, client, proto, q, .Failed, "dnssec", started)
+			log_query(s, client, proto, q, .Failed, fmt.tprintf("dnssec:%s", from), started)
 			return out, .Failed, built
 		case .Secure:
 			sync.atomic_add(&s.stats.secure, 1)
@@ -1281,9 +1301,23 @@ resolve_query :: proc(
 	sync.atomic_add(&s.stats.forwarded, 1)
 	out := fit_response(resp, limit, msg, allocator)
 	settle_ad_bit(out, msg, validating)
-	name := winner.spec.name if winner != nil else "?"
-	log_query(s, client, proto, q, .Forwarded, name, started)
+	log_query(s, client, proto, q, .Forwarded, answering_upstream(winner), started)
 	return out, .Forwarded, true
+}
+
+/*
+The configured name of the upstream that answered, for the log.
+
+`upstream.resolve` names a winner whenever it reports success, so `?` is a
+default that should not be reachable rather than a state with a meaning of its
+own - both callers are past the point where the absence of an answer has already
+been handled. It is here rather than inline because the two of them have to
+agree: the same server has to appear under the same name whether its answer was
+served or refused, or counting the refusals against the servings does not work.
+*/
+@(private)
+answering_upstream :: proc(u: ^upstream.Upstream) -> string {
+	return u.spec.name if u != nil else "?"
 }
 
 /*
@@ -2078,6 +2112,16 @@ answer_chaos :: proc(
 	return out, true
 }
 
+/*
+One line per query, once `log.queries` is on.
+
+`detail` says where the outcome came from, and takes one of three shapes: the
+name of the upstream that answered, on `outcome=forwarded`; a bare token naming
+the guard that decided, on everything else - `list`, `rewrite`, `cache`,
+`upstream`; or `reason:upstream` where a named server supplied an answer this
+server then refused, which today is `dnssec:<name>` alone. The reason stays in
+front so that grepping the token still finds every one of them.
+*/
 @(private)
 log_query :: proc(
 	s: ^Server,
@@ -2095,7 +2139,7 @@ log_query :: proc(
 	/*
 	Two of these are not this server's text, so both go through `quote`: a
 	query name is bytes a client chose, and `detail` carries an upstream's name
-	out of the configuration when one answered.
+	out of the configuration whenever one is named in it.
 
 	Presentation form is not enough on its own. It escapes the control range,
 	the space and the backslash, but `"` and `=` are printable and go through as
