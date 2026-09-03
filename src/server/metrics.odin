@@ -411,12 +411,8 @@ render_udp_metrics :: proc(b: ^strings.Builder, l: ^Listeners) {
 		)
 	}
 
-	drops := make([]u64, len(l.udp), context.temp_allocator)
-	inodes := make([]u64, len(l.udp), context.temp_allocator)
-	for reader, i in l.udp {
-		inodes[i] = reader.inode
-	}
-	if !metrics.socket_drops(inodes, drops) {
+	drops, measured := udp_reader_drops(l)
+	if !measured {
 		return
 	}
 	metrics.family(

@@ -7,6 +7,7 @@ import "core:testing"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:logx"
 import "elodin:pool"
 
 /*
@@ -326,4 +327,80 @@ test_the_startup_line_says_what_was_granted :: proc(t: ^testing.T) {
 		"a request that was granted was reported as clamped",
 	)
 	free_all(context.temp_allocator)
+}
+
+/*
+A port somebody else already holds is still refused.
+
+`SO_REUSEPORT` is what lets the readers share a port with each other, and left
+to itself it would let a second elodin share one with them: same effective uid,
+same address, and the kernel takes the newcomer into the group and gives it a
+quarter of the datagrams. A stale process or a unit started twice would then be
+answering production queries from whatever configuration it was handed, with
+nothing said anywhere. Before the readers existed that second start was refused,
+and this is the case that says it still is.
+
+Asked of a listener that is running rather than of a bare socket, because the
+first half of the claim matters as much as the second: the readers have to be
+able to share the port with each other while nobody else can join them.
+*/
+@(test)
+test_a_port_already_held_is_refused :: proc(t: ^testing.T) {
+	// A port the kernel says is free, given up again before it is asked for by
+	// name. `port: 0` is the one case the check cannot apply to - there is no
+	// port to ask about until a reader has one - so this test needs a number.
+	probe, perr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if perr != nil {
+		testing.expectf(t, false, "cannot find a free port: %v", perr)
+		return
+	}
+	bound, berr := net.bound_endpoint(probe)
+	net.close(probe)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the free port: %v", berr)
+		return
+	}
+
+	cfg: config.Config
+	fixture(&cfg, READERS)
+	cfg.listeners.udp.port = bound.port
+	handler_pool := pool.make_pool(2)
+	s := Server {
+		cfg          = &cfg,
+		handler_pool = handler_pool,
+	}
+
+	l: Listeners
+	if !start_listeners(&s, &l) {
+		// The port was taken between the probe and here, which is nobody's bug.
+		pool.destroy(handler_pool)
+		logx.infof("the free port %d was taken before the listener could bind it", bound.port)
+		return
+	}
+	defer {
+		stop_listeners(&l)
+		pool.destroy(handler_pool)
+		destroy_listeners(&l)
+	}
+	testing.expect_value(t, len(l.udp), READERS)
+
+	// The second server is the one this is about: a whole listener of its own,
+	// asking for a port the first one is holding.
+	second_cfg: config.Config
+	fixture(&second_cfg, READERS)
+	second_cfg.listeners.udp.port = bound.port
+	second_pool := pool.make_pool(2)
+	second := Server {
+		cfg          = &second_cfg,
+		handler_pool = second_pool,
+	}
+	second_l: Listeners
+	started := start_listeners(&second, &second_l)
+	// Whether or not it got anywhere: `start_listeners` builds the connection
+	// manager before it binds anything, and `stop_listeners` is what gives it
+	// back.
+	stop_listeners(&second_l)
+	pool.destroy(second_pool)
+	destroy_listeners(&second_l)
+	testing.expect(t, !started, "a second listener joined the running one's port and took a share of its datagrams")
 }

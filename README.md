@@ -959,7 +959,13 @@ effective user: elodin binds before it [drops privileges](#privileges), so a
 second process would have to be root — or, on an unprivileged high port, whoever
 elodin already runs as — to take a share of the datagrams. That is somebody who
 could read the traffic off the interface in any case, which is why this is worth
-saying rather than worth worrying about.
+saying rather than worth worrying about. A *second elodin* is the one thing that
+would qualify and must not be let in — a stale process, a unit started twice, a
+configuration being tried out beside the running one would otherwise be handed
+half the queries and answer them from whatever it was given. So the listener
+asks for the port with an ordinary bind before the readers share it, and a port
+somebody already holds is still refused with `Address_In_Use` exactly as it was
+before the readers existed.
 
 `receive_buffer` is what absorbs a burst that arrives while every reader is busy.
 Linux clamps it to `net.core.rmem_max`, 208 KiB on a machine nobody has tuned, so

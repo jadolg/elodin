@@ -33,7 +33,10 @@ port may be shared when it is asked for, so a socket that binds without this
 holds the port alone whatever is set afterwards.
 
 Every socket sharing a port must have been bound by the same effective uid, so
-what this opens is available to whoever can already run as this server's user.
+what this opens is available to whoever can already run as this server's user -
+which, for a port bound before `drop_privileges`, is root. A second elodin is
+the one case that would qualify and must not be let in, and `start_udp` asks a
+plain bind first so that it still meets the `Address_In_Use` it always did.
 */
 @(private)
 set_reuse_port :: proc(socket: net.UDP_Socket) -> bool {

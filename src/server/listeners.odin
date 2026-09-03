@@ -279,6 +279,37 @@ start_udp :: proc(s: ^Server, l: ^Listeners) -> bool {
 	buffer := cfg.receive_buffer if cfg.receive_buffer > 0 else config.DEFAULT_UDP_RECEIVE_BUFFER
 
 	/*
+	Nobody else is already on this port.
+
+	`SO_REUSEPORT` is what lets the readers share a port with each other, and it
+	would let them share one with anybody else running as the same effective
+	user - which, for the port this server binds before it drops privileges,
+	means a second elodin. A stale process, a unit started twice, a
+	configuration being tried out beside the running one: without this the
+	kernel would take the second listener into the group and hand it half the
+	datagrams, and the operator would have a resolver answering half its queries
+	from a configuration nobody meant to be serving. Before the readers existed
+	the second bind was refused outright, and it still is.
+
+	Asked with a plain bind, which is refused by exactly the case the readers
+	must not join and is refused by everything that would have refused them
+	anyway - systemd-resolved on port 53 holds it without `SO_REUSEPORT`, and a
+	reuse-port bind is turned away from that too. The probe is closed again
+	before the readers bind; UDP has no lingering state to leave behind.
+
+	Only for a port the file named. An ephemeral bind has no port to ask about
+	until the first reader has one, and a probe would take a different one.
+	*/
+	if endpoint.port != 0 {
+		probe, perr := net.make_bound_udp_socket(endpoint.address, endpoint.port)
+		if perr != nil {
+			report_bind_failure("listeners.udp", cfg.address, cfg.port, perr)
+			return false
+		}
+		net.close(probe)
+	}
+
+	/*
 	Bound into a list of their own before `l.udp` exists.
 
 	So that a bind that fails halfway leaves `l.udp` empty rather than half
@@ -310,13 +341,29 @@ start_udp :: proc(s: ^Server, l: ^Listeners) -> bool {
 		append(&sockets, socket)
 		if i == 0 {
 			granted = got
-			// Read once, from the first socket, and used for the rest: they all
-			// bind the same endpoint, and `plausible_source` asks about the
-			// endpoint rather than about any one socket.
-			if b, berr := net.bound_endpoint(socket); berr == nil {
-				l.udp_bound = b
-				bound_port = b.port
+			/*
+			Read once, from the first socket, and used for the rest: they all
+			bind the same endpoint, and `plausible_source` asks about the
+			endpoint rather than about any one socket.
+
+			Fatal when it cannot be read, rather than carried on from. The port
+			the rest of the readers ask for is this one, so an unknown port with
+			`port: 0` in the file would send every reader back to the kernel for
+			an ephemeral port of its own - the listener-per-reader this loop
+			exists to avoid, and silently. `plausible_source` would be comparing
+			against a zero endpoint besides, which is a check that has stopped
+			checking.
+			*/
+			b, berr := net.bound_endpoint(socket)
+			if berr != nil {
+				logx.errorf("listeners.udp: cannot read the port the first reader bound (%v)", berr)
+				for open in sockets {
+					net.close(open)
+				}
+				return false
 			}
+			l.udp_bound = b
+			bound_port = b.port
 		}
 	}
 
@@ -406,24 +453,41 @@ bind_udp_reader :: proc(
 }
 
 /*
-Datagrams the kernel dropped on the readers' receive queues, added up.
+What the kernel dropped on each reader's receive queue, in reader order.
 
-`false` is "cannot be measured here" and not "none": see `metrics.socket_drops`,
-which is where the counter comes from and where the difference is argued out.
-The metrics endpoint publishes the per-reader figures instead, since which
-reader is dropping says whether one client is flooding one 4-tuple or the
-listener as a whole is behind.
+One place, because both callers ask the same question of the same sockets and
+differ only in what they do with the answer: the scrape publishes a sample per
+reader and the five-minute line adds them up. `false` is "cannot be measured
+here" and not "none" - see `metrics.socket_drops`, which is where the counter
+comes from and where the difference is argued out.
 */
-udp_receive_drops :: proc(l: ^Listeners) -> (total: u64, ok: bool) {
+@(private)
+udp_reader_drops :: proc(l: ^Listeners, allocator := context.temp_allocator) -> (drops: []u64, ok: bool) {
 	if len(l.udp) == 0 {
-		return 0, false
+		return nil, false
 	}
-	drops := make([]u64, len(l.udp), context.temp_allocator)
-	inodes := make([]u64, len(l.udp), context.temp_allocator)
+	drops = make([]u64, len(l.udp), allocator)
+	inodes := make([]u64, len(l.udp), allocator)
 	for reader, i in l.udp {
 		inodes[i] = reader.inode
 	}
 	if !metrics.socket_drops(inodes, drops) {
+		return nil, false
+	}
+	return drops, true
+}
+
+/*
+Datagrams the kernel dropped on the readers' receive queues, added up.
+
+`false` is "cannot be measured here" and not "none", for the reason
+`udp_reader_drops` above gives. The metrics endpoint publishes the per-reader
+figures instead, since which reader is dropping says whether one client is
+flooding one 4-tuple or the listener as a whole is behind.
+*/
+udp_receive_drops :: proc(l: ^Listeners) -> (total: u64, ok: bool) {
+	drops, measured := udp_reader_drops(l)
+	if !measured {
 		return 0, false
 	}
 	for n in drops {
