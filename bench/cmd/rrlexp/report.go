@@ -21,6 +21,7 @@ func renderReport(rows []row) string {
 
 	victimTable(&b, rows)
 	floodTable(&b, rows)
+	dohTable(&b, rows)
 	serverTable(&b, rows)
 
 	b.WriteString("\n## What each arm was asking\n\n")
@@ -49,8 +50,97 @@ func victimTable(b *strings.Builder, rows []row) {
 		fmt.Fprintf(b, "| %s | %s | %s%s | %d | %d (%.0f%%) | %d | %d | %s | %s | %s |\n",
 			r.arm.name, r.arm.victim.src, r.arm.victim.transport, closed, offered,
 			v.full.Load(), pct, v.truncated.Load(), noReply,
-			round(v.pct(0.5)), round(v.pct(0.99)), v.rcodeSummary())
+			round(v.pct(0.5)), round(v.pct(0.99)), outcomes(r.arm.victim, v))
 	}
+}
+
+/*
+outcomes is what came back, in the terms the transport answers in.
+
+A rate-limited datagram is a missing reply and a rate-limited DoH request is a
+429, so a single column cannot be read as one thing across the arms: it names the
+statuses where those are the answer and the rcodes where they are.
+*/
+func outcomes(c clientSpec, st *stats) string {
+	if isDoH(c) {
+		return st.statusSummary()
+	}
+	return st.rcodeSummary()
+}
+
+func isDoH(c clientSpec) bool {
+	return c.transport == "doh1" || c.transport == "doh2"
+}
+
+/*
+dohTable is the arms where a refusal has a shape the other tables cannot show.
+
+`429/s` is the limiter refusing a request that the connection then survives -
+what DoH/2 does - and `no status/s` is a request whose connection went away
+instead, which is what DoH/1.1 and the stream transports do. `connections` is how
+many the client had to open: one for a flood that is refused and stays, and one
+per refusal for a flood that is cut off.
+
+`CPU per refused request` is why the two matter. A datagram over the budget costs
+a hash and a drop; an h2 request over it costs the frames, the HPACK and a
+response, and the connection staying open is what lets the client keep asking at
+that price.
+
+The CPU column is the whole arm's, so it includes the 500 answers a second the
+budget does allow - about 0.1 of a core, going by the arms where that is all the
+server is doing. It is worth subtracting before reading the per-refusal figure as
+the price of a refusal, and worth not bothering when the figures either side of it
+differ by more than an order of magnitude.
+*/
+func dohTable(b *strings.Builder, rows []row) {
+	if !hasDoH(rows) {
+		return
+	}
+
+	b.WriteString("\n## The DoH arms: what a refusal looks like, and what it costs\n\n")
+	b.WriteString("| arm | client | via | offered/s | answered/s | 429/s | no status/s | connections | CPU | CPU per refused request |\n")
+	b.WriteString("|---|---|---|---:|---:|---:|---:|---:|---:|---:|\n")
+	for _, r := range rows {
+		dohRow(b, r, "flood", specOf(r.arm.attacker), r.attacker)
+		dohRow(b, r, "victim", r.arm.victim, r.victim)
+	}
+}
+
+func hasDoH(rows []row) bool {
+	for _, r := range rows {
+		if isDoH(r.arm.victim) || (r.arm.attacker != nil && isDoH(*r.arm.attacker)) {
+			return true
+		}
+	}
+	return false
+}
+
+func dohRow(b *strings.Builder, r row, what string, c clientSpec, st *stats) {
+	if st == nil || !isDoH(c) {
+		return
+	}
+	secs := r.elapsed.Seconds()
+	refusedPerSec := float64(st.refused.Load()) / secs
+	perRefusal := "—"
+	if refusedPerSec > 0 {
+		perRefusal = fmt.Sprintf("%.1f µs", r.cpu.Seconds()/secs/refusedPerSec*1e6)
+	}
+	fmt.Fprintf(b, "| %s | %s | %s | %.0f | %.0f | %.0f | %.0f | %d | %.2f | %s |\n",
+		r.arm.name, what, c.transport,
+		float64(st.offered.Load())/secs,
+		float64(st.full.Load())/secs,
+		refusedPerSec,
+		float64(st.failed.Load())/secs,
+		st.dials.Load(), r.cpu.Seconds()/secs, perRefusal)
+}
+
+// specOf is the zero spec for an arm with no flood, so one loop can walk both
+// sides of every arm.
+func specOf(c *clientSpec) clientSpec {
+	if c == nil {
+		return clientSpec{}
+	}
+	return *c
 }
 
 func floodTable(b *strings.Builder, rows []row) {
@@ -63,11 +153,18 @@ func floodTable(b *strings.Builder, rows []row) {
 		}
 		secs := r.elapsed.Seconds()
 		a := r.attacker
-		amp := 0.0
-		if out := a.bytesOut.Load(); out > 0 {
-			amp = float64(a.bytesIn.Load()) / float64(out)
+		/*
+			Left out over DoH, where it would be two kinds of wrong: a handshake
+			settled that the client is where it says it is, so there is no third
+			party for an answer to be aimed at and nothing to amplify - and these
+			byte counters are DNS payloads, which over DoH ignore the TLS records
+			and HTTP framing the transport wraps them in.
+		*/
+		amp := "n/a"
+		if out := a.bytesOut.Load(); out > 0 && !isDoH(*r.arm.attacker) {
+			amp = fmt.Sprintf("x%.1f", float64(a.bytesIn.Load())/float64(out))
 		}
-		fmt.Fprintf(b, "| %s | %s | %s | %s | %.0f | %.0f | %.0f | %.2f MB | x%.1f |\n",
+		fmt.Fprintf(b, "| %s | %s | %s | %s | %.0f | %.0f | %.0f | %.2f MB | %s |\n",
 			r.arm.name, onOff(r.arm.limiter), r.arm.attacker.src, r.arm.attacker.transport,
 			float64(a.offered.Load())/secs, float64(a.full.Load())/secs,
 			float64(a.truncated.Load())/secs,

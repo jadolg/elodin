@@ -23,8 +23,11 @@ So each arm runs two clients against one server: a flood, and a victim asking at
 limiter off, because "the victim was served" says nothing on its own — a server
 that was never saturated would serve it with no limiter at all.
 
-Fifteen arms, ten measured seconds each after two seconds of the same load, so
-no arm reports a fresh bucket's burst allowance. Shipped limiter defaults (500
+Twenty-one arms, ten measured seconds each after two seconds of the same load, so
+no arm reports a fresh bucket's burst allowance. Two runs of the same harness on
+the same machine: the fifteen datagram and stream arms, then the six DoH ones,
+which have a section and tables of their own further down because a refusal there
+is a status rather than a missing datagram. Shipped limiter defaults (500
 responses/s per /24, `slip: 2`, `max_udp_response` 1232), `workers` 64 and
 `upstream_workers` 32 pinned rather than derived, mock upstream at 20 ms
 answering 70 A records — 1151 bytes, the largest answer the default
@@ -155,6 +158,88 @@ range; `slip: 0` is right for one reachable by strangers at high packet rates,
 where the slip is both the reflected volume and the bystanders' loss. The default
 stays as it is.
 
+## DoH
+
+The two things only DoH reaches. Multiplexing: every other stream client here is
+served a query at a time, which is why eight pipelined TCP connections offered the
+limiter about 400 queries a second and never reached the budget at all. And the
+refusal: TCP and DoT end the connection, DoH/1.1 answers 429 and then ends it, and
+DoH/2 answers 429 and keeps going.
+
+| arm | victim | via | answered | no answer | p50 | p99 | statuses |
+|---|---|---|---:|---:|---:|---:|---|
+| doh2/one-connection-flood | 127.0.0.3 | udp | 500 (100%) | 0 | 20.2ms | 21.8ms | — |
+| doh2/flood-vs-doh-victim | 127.0.0.3 | doh2 | 4 (1%) | 496 | 20.2ms | 20.6ms | 4×200, 496×429 |
+| doh2/flood-vs-doh-victim-other-prefix | 127.1.0.1 | doh2 | **500 (100%)** | 0 | 20.3ms | 22.6ms | 500×200 |
+| doh2/flood-vs-other-prefix | 127.1.0.1 | udp | **500 (100%)** | 0 | 20.3ms | 23ms | — |
+| doh2/flood-vs-other-prefix/limiter-off | 127.1.0.1 | udp | 500 (100%) | 0 | 21.4ms | 30ms | — |
+| doh1/flood-reconnects | 127.0.0.3 | udp | 500 (100%) | 0 | 24ms | 41.8ms | — |
+
+| arm | flood | via | offered/s | answered/s | 429/s | connections opened | CPU |
+|---|---|---|---:|---:|---:|---:|---:|
+| doh2/one-connection-flood | 127.0.0.2 | doh2 | 72,539 | 500 | 72,039 | 4 | 0.76 |
+| doh2/flood-vs-doh-victim | 127.0.0.2 | doh2 | 71,876 | 500 | 71,376 | 1 | 0.75 |
+| doh2/flood-vs-doh-victim-other-prefix | 127.0.0.2 | doh2 | 72,048 | 500 | 71,548 | 2 | 0.76 |
+| doh2/flood-vs-other-prefix | 127.0.0.1 | doh2 | 70,307 | 500 | 69,807 | 2 | 0.75 |
+| doh2/flood-vs-other-prefix/limiter-off | 127.0.0.1 | doh2 | 3,041 | 3,041 | 0 | 1 | 0.21 |
+| doh1/flood-reconnects | 127.0.0.2 | doh1 | 6,123 | 501 | 5,622 | **56,249** | 1.33 |
+
+No amplification column: a handshake settled that the client is where it says it
+is, so there is no third party for an answer to be aimed at.
+
+**The budget is the only thing bounding a DoH/2 client, and it holds.** One
+connection with sixty-four requests outstanding offers 72,539 a second - a hundred
+and eighty times what eight pipelined TCP connections managed, because nothing
+here serialises - and 500 a second is what it is answered. Serialisation was doing
+the bounding on the length-prefixed transports and it does none here, which makes
+this the arm the stream budget exists for.
+
+**Its prefix is a boundary in both directions.** A DoH victim in another /24 is
+served 500 of 500 through the same flood, and a UDP victim inside the flooded /24
+is served 500 of 500 as well - the datagram pool is untouched by what a connection
+spends, which is the separation the file argues for, arriving from the DoH side.
+
+**A DoH victim inside the flooded /24 has no recourse.** It gets 4 answers of 500
+and 496 refusals - a few percent, and it varies the way `same-prefix/slip-0` does
+and for the same reason: both clients are racing for each refilled token, and a
+repeat of this arm answered 33 of 400. Over UDP the slip sends such a client to TCP, and TCP is a
+budget the flood has not emptied; here the client is already on the stream pool,
+and the pool it has not spent is the datagram one - which is the transport it chose
+DoH to avoid. Nor is there a `Retry-After`, deliberately: `doh.odin` explains that
+the field counts whole seconds and the budget has a token back in two milliseconds,
+so the smallest value it could carry would send a client away for hundreds of times
+the wait there is. The 429 is honest and immediate, and a client that reads it
+learns only to try again.
+
+**The 429-that-keeps-the-connection is cheap, and costs bystanders nothing.**
+Refusing 70,000 requests a second costs 0.75 of a core - 10.5 µs each, against
+about 0.5 µs for a dropped datagram - and the client in another /24 stays at 100%
+with its latency unmoved. That is the opposite of the slip result on UDP, and for a
+structural reason: this work happens on the flooding connection's own reader thread
+rather than in the single UDP read loop every client's datagrams pass through.
+
+**Closing the connection instead costs twenty-two times as much.** DoH/1.1 answers
+429 with `keep_alive` false, so every refusal ends a connection the client
+immediately re-establishes: 56,249 connections in twelve seconds, about 4,700 TLS
+handshakes a second, 1.33 cores - 236 µs per refusal. It is also the only DoH arm
+where the bystander's latency moved at all, p50 20.2 ms to 24 ms and p99 to 41.8 ms.
+The decision is defensible - it is what the length-prefixed transports do, and RFC
+6585 4 is written for exactly this - but the number an operator should have is that
+an over-budget h1 client makes this server do ECDSA rather than DNS, and that h2's
+refusal is two orders of magnitude cheaper for the same answer.
+
+**And the limiter costs CPU here rather than saving it.** With it off, the same
+flood is bounded by the server's own capacity instead: it settles at 3,041 answers
+a second, 64 workers against a 20 ms upstream, and spends 0.21 of a core - while
+the victim still gets 100%, because a DoH flood at three thousand a second starves
+nothing. Turning the limiter on cuts the answered work sixfold and the bytes it
+returns sixfold, and raises CPU three and a half times, because a flood that is
+refused quickly is a flood that asks twenty-three times as often. The saving is in
+the upstream round trips and the cache churn (500 forwards a second against
+2,843) and not in processor time. On UDP the limiter saves both; here it trades one for
+the other, and the trade is still worth making, since what it bounds is the work an
+attacker can direct at everything else the server is doing.
+
 ## What the numbers do not say
 
 The two clients use real source addresses on loopback — 127.0.0.1 and 127.1.0.1
@@ -169,18 +254,18 @@ offering 50 q/s against a 20 ms upstream queues at the edge of its own capacity,
 and the idle control measures 147 ms. Read the TCP rows for their answer rate;
 their latency describes the client pattern.
 
-**UDP and TCP only, of the four transports.** DoT needs no arm of its own: it is
-served by the same `serve_dns_stream` as TCP and charged at the same
-`stream_rate_check` call site, so what a DoT arm would measure is the cost of TLS,
-which `mise run bench` already reports. DoH is a gap rather than an omission —
-`doh.odin` and `doh2.odin` each charge the budget themselves, and HTTP/2 brings a
-property no arm here reaches: a client multiplexes concurrent requests down one
-connection, so where eight pipelined TCP connections could not reach the stream
-budget at all — a connection is served a query at a time — a single h2 connection
-plausibly can. Its refusal differs too. TCP and DoT end the connection; an
-over-budget h2 request is answered 429 and the connection stays open, so a flood
-keeps paying for frame and HPACK work per refused request, which is the same shape
-as the slip finding above and worth measuring the same way.
+**DoT is the one transport with no arm of its own.** It is served by the same
+`serve_dns_stream` as TCP and charged at the same `stream_rate_check` call site, so
+what a DoT arm would measure is the cost of TLS, which `mise run bench` already
+reports, and not anything about the limiter. The other three each have their own
+enforcement point — the UDP read loop, `doh.odin`, `doh2.odin` — and each is
+measured above.
+
+**The DoH client is Go's own HTTP stack**, which keeps the independence the rest of
+the harness has: elodin's h2 and HPACK are the things under test, and a generator
+sharing them could agree with a bug in either. Its byte counters are DNS payloads,
+so they leave out the TLS records and HTTP framing around them — which is why the
+DoH tables report no bytes-at-the-source figure.
 
 One machine, loopback, no packet loss and no path MTU. The absolute packet rates
 are higher than any real link would deliver — that is what makes the read-side
@@ -197,6 +282,6 @@ Deliberately not part of `mise run bench`: every scenario there turns rate
 limiting off, because the load generator is one address asking as fast as it can,
 and this is the run that leaves it on.
 
-`-only <substring>` runs one arm. The flags that move the result are
+`-only doh` runs the DoH arms alone, and `-only <substring>` any single one. The flags that move the result are
 `-flood-rate` (0 is flat out), `-victim-rate`, `-rps`, `-slip` and
 `-answer-records`, which sets the answer size the budget is denominated in.

@@ -18,11 +18,15 @@ import (
 // runClient starts one client and returns the function that stops it. Sending
 // runs for dur; the returned stop closes the sockets, which is also what ends
 // the readers.
-func runClient(udpAddr, tcpAddr string, c clientSpec, dur time.Duration, tag string, track bool, st *stats) func() {
-	if c.transport == "tcp" {
-		return runTCP(tcpAddr, c, dur, tag, track, st)
+func runClient(s *server, c clientSpec, dur time.Duration, tag string, track bool, st *stats) func() {
+	switch c.transport {
+	case "tcp":
+		return runTCP(s.tcpAddr, c, dur, tag, track, st)
+	case "doh1", "doh2":
+		return runDoH(s.dohAddr, s.certPath, c, dur, tag, track, st)
+	default:
+		return runUDP(s.udpAddr, c, dur, tag, track, st)
 	}
-	return runUDP(udpAddr, c, dur, tag, track, st)
 }
 
 /*

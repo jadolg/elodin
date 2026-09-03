@@ -48,11 +48,24 @@ import (
 // A client, which is a source address and a way of asking from it.
 type clientSpec struct {
 	src       string
-	transport string // udp or tcp
+	transport string // udp, tcp, doh1 or doh2
 	// Queries per second offered, in total across sockets. 0 is as fast as the
 	// socket accepts, which is what an unthrottled flood is.
-	rate    int
+	rate int
+	// Connections. On DoH this is `MaxConnsPerHost`, so 1 is the single
+	// multiplexed connection the h2 arms are about.
 	sockets int
+	/*
+		Requests in flight at once, DoH only.
+
+		The datagram and stream clients have one query in the air per socket,
+		which is what those transports do. An h2 client does not: it multiplexes,
+		and that is the property the TCP arms could not reach - eight pipelined
+		connections offer the limiter about 400 queries a second because each is
+		served one at a time, where one h2 connection with this many requests
+		outstanding passes the budget on its own.
+	*/
+	inflight int
 	/*
 		`unique` asks a name of its own every time, so every query is a cache miss
 		and an upstream round trip - the most work a query can cost. `fixed` asks
@@ -96,10 +109,52 @@ type stats struct {
 	// Connections the server closed on us, which is what an over-budget query
 	// on a stream transport looks like from out here.
 	closed atomic.Int64
+	/*
+		DoH only, where a refusal is a status rather than a missing datagram.
 
-	mu     sync.Mutex
-	lat    []time.Duration
-	rcodes map[int]int64
+		`refused` is a request answered with a status other than 200 - 429 is the
+		limiter saying so, and `statusSummary` is what says it was. `failed` is a
+		request that got no status at all, which is the connection having gone:
+		what DoH/1.1 does to a client over its budget. `dials` is connections
+		opened, so a refusal that costs a reconnect is visible as one.
+	*/
+	refused atomic.Int64
+	failed  atomic.Int64
+	dials   atomic.Int64
+
+	mu       sync.Mutex
+	lat      []time.Duration
+	rcodes   map[int]int64
+	statuses map[int]int64
+}
+
+func (s *stats) addStatus(code int) {
+	s.mu.Lock()
+	if s.statuses == nil {
+		s.statuses = map[int]int64{}
+	}
+	s.statuses[code]++
+	s.mu.Unlock()
+}
+
+// statusSummary is the DoH half of `rcodeSummary`: which HTTP statuses came
+// back, since 429 rather than a rcode is how the limiter answers here.
+func (s *stats) statusSummary() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.statuses) == 0 {
+		return "—"
+	}
+	keys := make([]int, 0, len(s.statuses))
+	for k := range s.statuses {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%d×%d", s.statuses[k], k))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func (s *stats) addRcode(c int) {
@@ -243,6 +298,7 @@ func matrix() []arm {
 	arms = append(arms, prefixArms()...)
 	arms = append(arms, transportArms()...)
 	arms = append(arms, volumeArms()...)
+	arms = append(arms, dohArms()...)
 	return arms
 }
 
@@ -345,6 +401,86 @@ func transportArms() []arm {
 			question: "a TCP flood with enough connections to actually reach the stream budget",
 			limiter:  true, rps: *rps, slip: *slip,
 			attacker: &clientSpec{src: "127.0.0.2", transport: "tcp", rate: 0, sockets: 64},
+			victim:   withSrc(victimUDP, "127.0.0.3"),
+		},
+	}
+}
+
+/*
+The two things only DoH reaches.
+
+Multiplexing: every other stream client here is served a query at a time, so
+eight pipelined TCP connections offered the limiter about 400 queries a second
+and never reached the budget at all. One h2 connection with sixty-four requests
+outstanding is not bounded that way, and whether the stream budget holds against
+it is the first question.
+
+The refusal: TCP and DoT end the connection, DoH/1.1 answers 429 and then ends
+it, and DoH/2 answers 429 and keeps going - so a flood there is refused without
+being cut off, and keeps paying for HPACK and frame work per request. Whether
+that costs a client somewhere else is the second, and it is the shape the slip
+finding took on UDP.
+*/
+func dohArms() []arm {
+	victimUDP := clientSpec{transport: "udp", rate: *victimRate, sockets: 1}
+	// One connection, sixty-four requests in the air, as fast as they complete.
+	h2flood := clientSpec{transport: "doh2", rate: 0, sockets: 1, inflight: 64}
+	return []arm{
+		{
+			name:     "doh2/one-connection-flood",
+			question: "can one multiplexed connection reach the stream budget, where eight pipelined TCP ones could not",
+			limiter:  true, rps: *rps, slip: *slip,
+			attacker: withSrcP(&h2flood, "127.0.0.2"),
+			victim:   withSrc(victimUDP, "127.0.0.3"),
+		},
+		{
+			name:     "doh2/flood-vs-doh-victim",
+			question: "a DoH victim inside the flooded /24, where both clients spend the same stream budget",
+			limiter:  true, rps: *rps, slip: *slip,
+			attacker: withSrcP(&h2flood, "127.0.0.2"),
+			victim:   clientSpec{src: "127.0.0.3", transport: "doh2", rate: *victimRate, sockets: 1, inflight: 4},
+		},
+		{
+			name:     "doh2/flood-vs-doh-victim-other-prefix",
+			question: "and a DoH victim outside it, which is whether the stream budget's prefix is a boundary too",
+			limiter:  true, rps: *rps, slip: *slip,
+			attacker: withSrcP(&h2flood, "127.0.0.2"),
+			victim:   clientSpec{src: "127.1.0.1", transport: "doh2", rate: *victimRate, sockets: 1, inflight: 4},
+		},
+		{
+			name:     "doh2/flood-vs-other-prefix",
+			question: "what the 429-and-stay-open refusal costs a client in another /24",
+			limiter:  true, rps: *rps, slip: *slip,
+			attacker: withSrcP(&h2flood, "127.0.0.1"),
+			victim:   withSrc(victimUDP, "127.1.0.1"),
+		},
+		{
+			name:     "doh2/flood-vs-other-prefix/limiter-off",
+			question: "the same flood with no limiter, which is what makes the row above the limiter's doing",
+			limiter:  false,
+			attacker: withSrcP(&h2flood, "127.0.0.1"),
+			victim:   withSrc(victimUDP, "127.1.0.1"),
+		},
+		{
+			/*
+				HTTP/1.1, where the refusal ends the connection.
+
+				Sixty-four connections, for the reason the TCP flood needed
+				sixty-four: an h1 client is served a request at a time per
+				connection, so four of them offer about 200 requests a second
+				against a 20 ms upstream and never reach a 500/s budget at all -
+				which is what a first run of this arm measured, `limited=0` and
+				nothing refused.
+
+				What the arm is for is the cost of the ending. Every refusal
+				closes a connection the client then re-establishes, so `dials`
+				counts the TLS handshakes an over-budget h1 client is made to pay
+				for, and the CPU column is what the server paid.
+			*/
+			name:     "doh1/flood-reconnects",
+			question: "what an over-budget HTTP/1.1 client costs when every refusal ends its connection",
+			limiter:  true, rps: *rps, slip: *slip,
+			attacker: &clientSpec{src: "127.0.0.2", transport: "doh1", rate: 0, sockets: 64, inflight: 64},
 			victim:   withSrc(victimUDP, "127.0.0.3"),
 		},
 	}
@@ -474,7 +610,7 @@ func (r row) line() string {
 			float64(r.attacker.bytesIn.Load())/secs/1e6)
 	}
 	return fmt.Sprintf("%-34s victim %3.0f%% answered (%d/%d) [%s], p50 %6s p99 %7s%s",
-		r.arm.name, pct, full, offered, v.rcodeSummary(), round(v.pct(0.5)), round(v.pct(0.99)), extra)
+		r.arm.name, pct, full, offered, outcomes(r.arm.victim, v), round(v.pct(0.5)), round(v.pct(0.99)), extra)
 }
 
 func round(d time.Duration) time.Duration {
@@ -502,7 +638,7 @@ func runArm(bin, dir, upstream string, a arm) (row, error) {
 	// is what keeps the measured window from being a burst allowance.
 	if a.attacker != nil {
 		warm := &stats{}
-		stopWarm := runClient(srv.udpAddr, srv.tcpAddr, *a.attacker, *warmup, "warm", false, warm)
+		stopWarm := runClient(srv, *a.attacker, *warmup, "warm", false, warm)
 		time.Sleep(*warmup)
 		stopWarm()
 	} else {
@@ -515,9 +651,9 @@ func runArm(bin, dir, upstream string, a arm) (row, error) {
 
 	var stopAttack func()
 	if a.attacker != nil {
-		stopAttack = runClient(srv.udpAddr, srv.tcpAddr, *a.attacker, *duration, "atk", false, r.attacker)
+		stopAttack = runClient(srv, *a.attacker, *duration, "atk", false, r.attacker)
 	}
-	stopVictim := runClient(srv.udpAddr, srv.tcpAddr, a.victim, *duration, "vic", true, r.victim)
+	stopVictim := runClient(srv, a.victim, *duration, "vic", true, r.victim)
 
 	time.Sleep(*duration)
 	r.elapsed = time.Since(start)

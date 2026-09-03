@@ -19,19 +19,59 @@ import (
 // ----------------------------------------------------------------- the server
 
 type server struct {
-	cmd         *exec.Cmd
-	pid         int
-	udpAddr     string
-	tcpAddr     string
+	cmd     *exec.Cmd
+	pid     int
+	udpAddr string
+	tcpAddr string
+	dohAddr string
+	// The certificate the DoH listener serves, so a DoH client can verify what
+	// it connects to rather than being told to skip it.
+	certPath    string
 	metricsAddr string
 	logPath     string
 	stopOnce    sync.Once
 }
 
+// armPorts takes the three ports an arm's server binds. Fresh per arm, so a
+// listener from the arm before cannot still be holding one.
+func armPorts() (dns, doh, metrics int, err error) {
+	if dns, err = freePort(); err != nil {
+		return 0, 0, 0, err
+	}
+	if doh, err = freePort(); err != nil {
+		return 0, 0, 0, err
+	}
+	if metrics, err = freePort(); err != nil {
+		return 0, 0, 0, err
+	}
+	return dns, doh, metrics, nil
+}
+
+// rateLimitBlock is the arm's `server.rate_limit`, indented for the template.
+func rateLimitBlock(a arm) string {
+	if !a.limiter {
+		return "    enabled: false"
+	}
+	return fmt.Sprintf("    enabled: true\n    responses_per_second: %d\n    slip: %d", a.rps, a.slip)
+}
+
+// armServer is what one arm's configuration is filled in from.
+type armServer struct {
+	logPath   string
+	rateLimit string
+	cert, key string
+	upHost    string
+	upPort    string
+	port      int
+	dohPort   int
+	metrics   int
+}
+
 // serverConfig is the configuration one arm runs against.
-func serverConfig(logPath, rl, host, upPort string, port, metricsPort int) string {
+func serverConfig(a armServer) string {
 	return fmt.Sprintf(configTemplate,
-		*logLevel, *logQueries, logPath, *workers, *workers/2, rl, port, port, host, upPort, metricsPort)
+		*logLevel, *logQueries, a.logPath, *workers, *workers/2, a.rateLimit,
+		a.port, a.port, a.dohPort, a.cert, a.key, a.upHost, a.upPort, a.metrics)
 }
 
 /*
@@ -64,6 +104,16 @@ listeners:
     enabled: true
     address: "127.0.0.1"
     port: %d
+  # On in every arm rather than only the DoH ones, so the listener an arm does
+  # not use is still there to be sure it costs nothing: a bystander's result
+  # would mean less if the DoH arms ran against a differently configured server.
+  doh:
+    enabled: true
+    address: "127.0.0.1"
+    port: %d
+    path: /dns-query
+    cert_file: %s
+    key_file: %s
 
 upstream:
   strategy: failover
@@ -100,11 +150,11 @@ metrics:
 `
 
 func startServer(bin, dir, upstream string, a arm) (*server, error) {
-	port, err := freePort()
+	port, dohPort, metricsPort, err := armPorts()
 	if err != nil {
 		return nil, err
 	}
-	metricsPort, err := freePort()
+	cert, key, err := makeCert(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -112,12 +162,17 @@ func startServer(bin, dir, upstream string, a arm) (*server, error) {
 	name := strings.NewReplacer("/", "-").Replace(a.name)
 	logPath := filepath.Join(dir, name+".log")
 
-	rl := "    enabled: false"
-	if a.limiter {
-		rl = fmt.Sprintf("    enabled: true\n    responses_per_second: %d\n    slip: %d", a.rps, a.slip)
-	}
-
-	cfg := serverConfig(logPath, rl, host, upPort, port, metricsPort)
+	cfg := serverConfig(armServer{
+		logPath:   logPath,
+		rateLimit: rateLimitBlock(a),
+		cert:      cert,
+		key:       key,
+		upHost:    host,
+		upPort:    upPort,
+		port:      port,
+		dohPort:   dohPort,
+		metrics:   metricsPort,
+	})
 
 	cfgPath := filepath.Join(dir, name+".yaml")
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
@@ -127,6 +182,8 @@ func startServer(bin, dir, upstream string, a arm) (*server, error) {
 	s := &server{
 		udpAddr:     fmt.Sprintf("127.0.0.1:%d", port),
 		tcpAddr:     fmt.Sprintf("127.0.0.1:%d", port),
+		dohAddr:     fmt.Sprintf("127.0.0.1:%d", dohPort),
+		certPath:    cert,
 		metricsAddr: fmt.Sprintf("127.0.0.1:%d", metricsPort),
 		logPath:     logPath,
 	}
