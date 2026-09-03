@@ -553,6 +553,16 @@ TCP, so it has nothing to say to a client that is already on a connection.
 Over-budget queries end a TCP or DoT connection instead; DoH answers 429 and keeps
 it, a refusal that costs a TLS handshake being dearer than the answer it withheld.
 
+The truncated answers have a budget too, an eighth of the figure below and at least
+one a second, so `slip` is "at most one in N" and not "one in N of whatever
+arrives". Without it their number was a fraction of the attack rate with no ceiling
+in it - a flood of two million datagrams a second had this server send half a
+million truncated answers a second at the address it named, on a configuration that
+says 500 - and each of those writes came off the thread reading the UDP socket, at
+the expense of every other client's queries. An eighth, rather than the whole
+figure, because a truncated answer is an invitation and not an answer: a client that
+takes it moves onto a connection, whose budget a datagram flood cannot empty.
+
 What this does not bound is how much of the server one client occupies. Both budgets
 are spent by *queries*, so a client that opens connections and asks nothing on them
 is charged nothing here however many it holds. `max_connections_per_prefix` is that

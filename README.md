@@ -757,7 +757,7 @@ server:
   rate_limit:
     enabled: true                 # on by default
     responses_per_second: 500     # per client prefix (/24 or /64), and per transport class
-    slip: 2                       # answer every 2nd query over the budget truncated; 0 drops them all
+    slip: 2                       # answer at most every 2nd query over the budget truncated; 0 drops them all
 ```
 
 A UDP query carries no proof of where it came from, so the answer goes wherever
@@ -777,6 +777,34 @@ header and a question with the TC bit set: too small to be worth reflecting, and
 the standard way of telling a client to ask again over TCP where the handshake
 proves the address. A client behind a busy NAT keeps resolving, one round trip
 slower; a spoofed source cannot follow it up. `slip: 0` drops them instead.
+
+Those truncated answers are charged to a budget of their own — **an eighth of
+`responses_per_second` per prefix**, so at the default, 62 a second — which makes
+`slip` "at most one in N" rather than "one in N of whatever arrives". It has to be
+a budget, because before it was one their number was a fixed fraction of the attack
+with no ceiling in it: a flood of two million datagrams a second had this server
+send half a million truncated answers a second, 19 MB/s, at the address the flood
+named, where the same configuration's 500 responses/s implies 0.58 MB/s. Byte for
+byte the attacker loses on that exchange, so it is not amplification — what it is
+is this server made a source of traffic proportional to somebody else's attack, and
+half a million writes a second taken from the one thread reading the UDP socket,
+which cost a bystander in an unrelated prefix 44 points of its answer rate. An
+eighth and not the whole figure because a truncated answer is an invitation rather
+than an answer: a client that acts on one moves to a connection, whose budget a
+datagram flood cannot reach, so it needs far fewer of them than it would need
+answers. `bench/results/2026-09-03-rate-limit-bystander.md` is where the uncharged
+figures were measured and `2026-09-03-slip-budget.md` is the same arms with the
+budget in place: 0.54 MB/s at the named address, and the uninvolved bystander back
+to 99%.
+
+The cost is that the invitation is worth less to a client inside a flooded prefix:
+62 a second spread over the flood's own datagrams, rather than every second
+datagram in the bucket. That holds up at the rates a busy NAT produces — a prefix
+asking twice its budget has a few hundred over-limit datagrams a second to spread
+them across, and one invitation that lands moves that client onto a connection for
+good — and not against millions a second, where the client is left with the stream
+budget and nothing pointing it there. `src/server/ratelimit.odin` argues the trade
+out.
 
 TCP, DoT and DoH are charged too, for the work behind an answer rather than for
 amplification — without that, a flood down a handful of long-lived connections is

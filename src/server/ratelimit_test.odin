@@ -580,11 +580,19 @@ That is what keeps a real client behind a busy NAT resolving: a TC response is
 too small to be worth reflecting and tells it to come back over TCP, where the
 handshake proves the address. A spoofed source cannot follow that up, which is
 the whole point of answering that way rather than at length.
+
+Every `slip`th while there is a slip token to spend, that is: what the spacing
+decides is which over-limit datagram may be truncated, and the pool decides how
+many of those are - so this asserts the alternation over as many datagrams as the
+pool can pay for, and `test_the_slip_budget_is_a_pool_of_its_own` takes it from
+there. `RATE` is 80 so that an eighth of it is a whole number: 10 truncated
+answers a second, `RRL_BURST_SECONDS` of them banked.
 */
 @(test)
 test_rate_limit_slips_a_truncated_answer :: proc(t: ^testing.T) {
-	RATE :: 5
+	RATE :: 80
 	SLIP :: 2
+	SLIPS :: RATE / RRL_SLIP_SHARE * RRL_BURST_SECONDS
 	r := make_rate_limiter(RATE, SLIP)
 	defer destroy_rate_limiter(r)
 
@@ -593,9 +601,10 @@ test_rate_limit_slips_a_truncated_answer :: proc(t: ^testing.T) {
 		testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Allow)
 	}
 
-	// Over the budget from here: one dropped, one truncated, alternating.
+	// Over the budget from here: one dropped, one truncated, alternating, for as
+	// long as the slip pool holds out - which is `SLIP` of these per token in it.
 	truncated, dropped := 0, 0
-	for _ in 0 ..< 100 {
+	for _ in 0 ..< SLIP * SLIPS {
 		switch rate_check(r, client, at(0)) {
 		case .Allow:
 			testing.expect(t, false, "an empty bucket allowed a response")
@@ -605,12 +614,26 @@ test_rate_limit_slips_a_truncated_answer :: proc(t: ^testing.T) {
 			dropped += 1
 		}
 	}
-	testing.expectf(t, truncated == 50, "%d of 100 over-limit queries were truncated, expected 50", truncated)
-	testing.expectf(t, dropped == 50, "%d of 100 over-limit queries were dropped, expected 50", dropped)
+	testing.expectf(
+		t,
+		truncated == SLIPS,
+		"%d of the first %d over-limit queries were truncated, expected %d",
+		truncated,
+		SLIP * SLIPS,
+		SLIPS,
+	)
+	testing.expectf(
+		t,
+		dropped == SLIPS,
+		"%d of the first %d over-limit queries were dropped, expected %d",
+		dropped,
+		SLIP * SLIPS,
+		SLIPS,
+	)
 
 	limited, slipped := rate_limit_stats(r)
-	testing.expect_value(t, limited, u64(100))
-	testing.expect_value(t, slipped, u64(50))
+	testing.expect_value(t, limited, u64(SLIP * SLIPS))
+	testing.expect_value(t, slipped, u64(SLIPS))
 
 	// slip = 0 is "drop them all".
 	strict := make_rate_limiter(RATE, 0)
@@ -621,6 +644,163 @@ test_rate_limit_slips_a_truncated_answer :: proc(t: ^testing.T) {
 	for _ in 0 ..< 10 {
 		testing.expect_value(t, rate_check(strict, client, at(0)), Rate_Verdict.Drop)
 	}
+}
+
+/*
+Truncated answers are bounded by a budget of their own, not by how much arrives.
+
+`slip` picks every Nth over-limit datagram, so charged to nothing the count of
+truncated answers is a fixed fraction of the flood: at two million datagrams a
+second the shipped default sent half a million truncated answers a second at
+whatever address the flood had named. Byte for byte that is a loss for the sender
+- a 51-byte query draws a 40-byte reply - so it is not amplification. What it is
+instead is this server made the source of traffic proportional to an attack, at
+an address that never asked, on a figure the operator set to 500; and a write per
+reply, competing with the single UDP read loop that would otherwise be picking up
+other clients' queries.
+
+So what is asserted is a ratio and not a count: the same limiter offered ten
+times as much must truncate no more. The bound is `responses_per_second`, the
+figure an operator configured, rather than the arrival rate, which is the
+attacker's. `test_the_slip_budget_is_a_pool_of_its_own` says what the bound
+actually is; this one says only that the flood does not set it.
+
+`bench/results/2026-09-03-rate-limit-bystander.md` is where the unbounded figures
+were measured.
+*/
+@(test)
+test_slip_replies_are_bounded_by_a_budget_not_by_the_flood :: proc(t: ^testing.T) {
+	RATE :: 500
+	SLIP :: 2
+
+	small := truncated_under_flood(RATE, SLIP, 20_000)
+	large := truncated_under_flood(RATE, SLIP, 200_000)
+
+	testing.expectf(
+		t,
+		small == large,
+		"a flood ten times the size drew %d truncated answers against %d, so their number follows the attack and not a budget",
+		large,
+		small,
+	)
+	testing.expectf(
+		t,
+		large <= RATE * RRL_BURST_SECONDS,
+		"%d truncated answers went out at one instant, past the %d a prefix's whole response budget holds",
+		large,
+		RATE * RRL_BURST_SECONDS,
+	)
+}
+
+/*
+Truncated answers a fresh limiter sends when `offered` over-limit datagrams
+arrive at one instant, the prefix's datagram pool already emptied.
+
+One instant throughout, so nothing refills and the count is the pool's and not
+the clock's.
+*/
+@(private = "file")
+truncated_under_flood :: proc(rate, slip, offered: int) -> int {
+	r := make_rate_limiter(rate, slip)
+	defer destroy_rate_limiter(r)
+
+	client := v4(192, 0, 2, 77)
+	for _ in 0 ..< rate * RRL_BURST_SECONDS {
+		rate_check(r, client, at(0))
+	}
+
+	truncated := 0
+	for _ in 0 ..< offered {
+		if rate_check(r, client, at(0)) == .Truncate {
+			truncated += 1
+		}
+	}
+	return truncated
+}
+
+/*
+What the bound on truncated answers actually is: a pool, refilled like the others
+and spent from neither of them.
+
+An eighth of `responses_per_second` per prefix, banked `RRL_BURST_SECONDS` deep -
+the arithmetic and the reason for the fraction are in `RRL_SLIP_SHARE`. Three
+things are asserted about it, and the third is the one that matters most: a second
+of quiet buys the prefix its whole `responses_per_second` in *full* answers,
+undiminished by the truncated ones sent while the budget was empty. The slip is a
+reply this server sends and is charged for, but it is not charged to the pool an
+answer comes out of - a client whose prefix was flooded is not made to pay for the
+invitations the flood drew.
+
+The other two: the pool is exactly its capacity however much is offered against
+it, and it comes back with the clock rather than staying dry - a client behind a
+busy NAT keeps being told to go to TCP for as long as the flood lasts, just not
+once per datagram the flood sends.
+
+One instant per stage, so nothing refills except where the stage is the refill.
+*/
+@(test)
+test_the_slip_budget_is_a_pool_of_its_own :: proc(t: ^testing.T) {
+	// An eighth of 80 is a whole number, so the figures below are exact rather
+	// than rounded: 10 truncated answers a second, 20 banked.
+	RATE :: 80
+	SLIP :: 2
+	SLIPS :: RATE / RRL_SLIP_SHARE * RRL_BURST_SECONDS
+
+	r := make_rate_limiter(RATE, SLIP)
+	defer destroy_rate_limiter(r)
+
+	client := v4(203, 0, 113, 5)
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Allow)
+	}
+
+	// The pool, to the token, against a flood far larger than it.
+	truncated := 0
+	for _ in 0 ..< 10_000 {
+		if rate_check(r, client, at(0)) == .Truncate {
+			truncated += 1
+		}
+	}
+	testing.expectf(t, truncated == SLIPS, "%d truncated answers came out of a pool holding %d", truncated, SLIPS)
+
+	// A second on, and the response budget is the whole of what an operator
+	// configured: the slips were not taken out of it.
+	allowed := 0
+	for _ in 0 ..< RATE {
+		if rate_check(r, client, at(1000)) == .Allow {
+			allowed += 1
+		}
+	}
+	testing.expectf(
+		t,
+		allowed == RATE,
+		"a second of refill answered %d datagrams in full, not the %d responses/s configured",
+		allowed,
+		RATE,
+	)
+
+	// Nor was the stream pool, which is the one the truncated answers send a
+	// client to.
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		testing.expect(t, stream_rate_check(r, client, at(1000)), "a connection was refused a query the stream pool had room for")
+	}
+	testing.expect(t, !stream_rate_check(r, client, at(1000)), "the stream pool answered past what it holds")
+
+	// And the slip pool refills too: a second of it, and no more, for the flood
+	// that is still arriving.
+	refilled := 0
+	for _ in 0 ..< 10_000 {
+		if rate_check(r, client, at(1000)) == .Truncate {
+			refilled += 1
+		}
+	}
+	testing.expectf(
+		t,
+		refilled == RATE / RRL_SLIP_SHARE,
+		"a second of refill truncated %d answers, expected the %d a second the pool accrues",
+		refilled,
+		RATE / RRL_SLIP_SHARE,
+	)
 }
 
 /*
@@ -853,10 +1033,16 @@ responses this server sent.
 The limiter here has a slip configured, which is what makes that observable at
 all, and the last part of the test is the same limiter still slipping for UDP -
 the slip belongs to the datagram pool, not to a mode the bucket is put into.
+
+The rate is 40 rather than a handful because what that last part asserts is the
+1-in-`SLIP` spacing, and the truncated answers come out of a pool of their own at
+an eighth of the rate - so the rate has to be large enough that the pool has room
+for the slips being counted. `test_the_slip_budget_is_a_pool_of_its_own` is where
+running it dry is the subject.
 */
 @(test)
 test_stream_queries_are_refused_rather_than_truncated :: proc(t: ^testing.T) {
-	RATE :: 5
+	RATE :: 40
 	SLIP :: 2
 	r := make_rate_limiter(RATE, SLIP)
 	defer destroy_rate_limiter(r)
@@ -1098,11 +1284,13 @@ interleaving, which is why the assertions are equalities rather than thresholds.
 */
 @(test)
 test_rate_limit_accounts_exactly_under_concurrent_callers :: proc(t: ^testing.T) {
-	RATE :: 100
+	RATE :: 80
 	SLIP :: 2
 	THREADS :: 8
 	ROUNDS :: 500
 	CAPACITY :: RATE * RRL_BURST_SECONDS
+	// The slip pool, an eighth of the rate; 80 so that eighth divides evenly.
+	SLIPS :: RATE / RRL_SLIP_SHARE * RRL_BURST_SECONDS
 
 	r := make_rate_limiter(RATE, SLIP)
 	defer destroy_rate_limiter(r)
@@ -1157,9 +1345,14 @@ test_rate_limit_accounts_exactly_under_concurrent_callers :: proc(t: ^testing.T)
 	// that pool's capacity.
 	over_datagram := u64(THREADS / 2 * ROUNDS - CAPACITY)
 	testing.expect_value(t, limited, over_datagram * 2)
-	// `over` counted once per over-limit datagram and never lost, so every SLIPth
-	// one of them slipped - exactly, not approximately. The connections' refusals
-	// are not among them: they do not reach the counter.
-	testing.expect_value(t, slipped, over_datagram / SLIP)
-	testing.expect_value(t, u64(truncated), over_datagram / SLIP)
+	/*
+	The slip pool spent to the token, like the other two: this flood offers far
+	more than `SLIPS` over-limit datagrams, so what comes back truncated is the
+	pool and not a share of the arrival rate - and it is that exactly, which a
+	decrement lost between two threads would put it over. The connections'
+	refusals are not among them: they reach neither the pool nor `over`.
+	*/
+	testing.expect(t, over_datagram / SLIP > SLIPS, "the flood was too small to run the slip pool dry")
+	testing.expect_value(t, slipped, u64(SLIPS))
+	testing.expect_value(t, u64(truncated), u64(SLIPS))
 }
