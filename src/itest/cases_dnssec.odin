@@ -23,6 +23,7 @@ dnssec_config :: proc(r: ^Runner, udp_port: int, upstream_port: int, extra := ""
 	return fmt.tprintf(
 		`log:
   level: info
+  queries: true
 listeners:
   udp: {{enabled: true, address: 127.0.0.1, port: %d}}
   tcp: {{enabled: false}}
@@ -75,7 +76,46 @@ run_dnssec_cases :: proc(r: ^Runner) {
 
 	start_case(r, "dnssec: the refusal is logged with a reason")
 	{
-		check(r, log_contains(&srv, "dnssec:"), "the log does not explain the refusal:\n%s", read_log(&srv))
+		check(r, log_contains(&srv, "did not validate"), "the log does not explain the refusal:\n%s", read_log(&srv))
+	}
+	end_case(r)
+
+	start_case(r, "dnssec: the refusal names the upstream the answer came from")
+	{
+		/*
+		Both lines have to name the server, and the reason is what an operator
+		does next rather than tidiness.
+
+		A verdict here is a property of the answer, so a group whose members
+		disagree about a zone refuses some queries for a name and answers the
+		rest, with every other field on the line identical either way. The
+		upstream is the field that separates them, and counting it is how the
+		server worth removing gets found; a line without it leaves a packet
+		capture as the only way to tell.
+
+		An unnamed server is known by the address it was configured as, which is
+		what `describe_upstream` builds. The exact string is what gets asserted
+		rather than merely that something follows the colon, which a placeholder
+		left behind by a half-finished change would satisfy just as well.
+		*/
+		from := fmt.tprintf("udp://127.0.0.1:%d", upstream_port)
+		text := read_log(&srv)
+		check(
+			r,
+			strings.contains(text, fmt.tprintf("answer came from %s", from)),
+			"the warning does not name the upstream (expected %q):\n%s",
+			from,
+			text,
+		)
+		// The reason stays in front of the name, so `detail=dnssec` still finds
+		// every refusal whether or not the reader cares which server it was.
+		check(
+			r,
+			strings.contains(text, fmt.tprintf("detail=dnssec:%s ", from)),
+			"the query log does not carry the upstream beside the reason (expected detail=dnssec:%s):\n%s",
+			from,
+			text,
+		)
 	}
 	end_case(r)
 
