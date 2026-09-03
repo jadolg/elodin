@@ -114,10 +114,10 @@ server:
   # A UDP answer goes wherever the source address said, so a resolver that
   # answers everything is an amplifier: a small spoofed query buys the sender a
   # large response aimed at somebody else. The budget bounds what any one
-  # address can be made to receive. Every `slip`th query over it is answered
-  # with a truncated response rather than dropped, which tells a real client to
-  # come back over TCP, where the handshake proves the address; 0 drops them
-  # all.
+  # address can be made to receive. At most every `slip`th query over it is
+  # answered with a truncated response rather than dropped, which tells a real
+  # client to come back over TCP, where the handshake proves the address; 0
+  # drops them all.
   #
   # Those truncated answers have a budget of their own - an eighth of the figure
   # below, at least one a second - so `slip` means at most one in N and not one

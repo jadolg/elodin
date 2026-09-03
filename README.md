@@ -772,11 +772,12 @@ So it is kept per destination prefix, /24 and /64, the granularity an attacker
 picks addresses within, in a fixed table allocated once so the limiter is not
 itself somewhere to put pressure.
 
-Over-budget queries are not simply dropped. Every `slip`th one comes back as a
-header and a question with the TC bit set: too small to be worth reflecting, and
-the standard way of telling a client to ask again over TCP where the handshake
-proves the address. A client behind a busy NAT keeps resolving, one round trip
-slower; a spoofed source cannot follow it up. `slip: 0` drops them instead.
+Over-budget queries are not simply dropped. At most every `slip`th one comes back
+as a header and a question with the TC bit set: too small to be worth reflecting,
+and the standard way of telling a client to ask again over TCP where the
+handshake proves the address. A client behind a busy NAT keeps resolving, one
+round trip slower; a spoofed source cannot follow it up. `slip: 0` drops them
+instead.
 
 Those truncated answers are charged to a budget of their own — **an eighth of
 `responses_per_second` per prefix**, so at the default, 62 a second — which makes

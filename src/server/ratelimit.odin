@@ -28,12 +28,13 @@ By prefix rather than by address: /24 for IPv4 and /64 for IPv6, since an
 attacker spoofing addresses picks them freely within the range they are aiming
 at, and a per-address budget would just be spread across it.
 
-Over-limit queries are not all dropped. Every `slip`th one is answered with a
-header and a question and the TC bit set, which is 30-odd bytes rather than
-4096 - too small to be worth reflecting - and which tells a real client to ask
-again over TCP, where the handshake proves the address. A client stuck behind a
-busy NAT therefore still resolves, at the cost of a round trip, while a spoofed
-source gets a truncated answer it cannot follow up.
+Over-limit queries are not all dropped. At most every `slip`th one is answered
+with a header and a question and the TC bit set, which is 30-odd bytes rather
+than 4096 - too small to be worth reflecting - and which tells a real client to
+ask again over TCP, where the handshake proves the address. A client stuck behind
+a busy NAT therefore still resolves, at the cost of a round trip, while a spoofed
+source gets a truncated answer it cannot follow up. At most, because those
+answers are charged to a budget of their own - further down.
 
 This is what BIND's `rate-limit` and Knot's RRL do, and the shape is theirs.
 
@@ -237,7 +238,9 @@ Rate_Bucket :: struct {
 	// was charged.
 	last_ns: i64,
 	/*
-	Over-limit datagrams since the last one that was answered, for `slip`.
+	Over-limit datagrams since the last one answered in full, for `slip`. A
+	truncated answer does not reset it; only a datagram the `Datagram` pool paid
+	for does.
 
 	Datagrams and nothing else, because a datagram is all a slip can be spent on: a
 	truncated answer is an instruction to ask again over TCP, so a query that is
