@@ -165,8 +165,14 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 			what the drain can refill, so the case fails on the uncharged
 			behaviour and not on how long a loaded machine took to read its
 			answers.
+
+			The eighth and its floor of one are spelled out here rather than
+			read from `RRL_SLIP_SHARE`, which is private to the server package.
+			The floor matters: without it a `RATE` below eight would compute a
+			ceiling of zero, which no run can be under and the check above
+			demands be exceeded.
 			*/
-			SLIP_RATE :: RATE / 8
+			SLIP_RATE :: max(RATE / 8, 1)
 			slip_ceiling := SLIP_RATE * 2 + SLIP_RATE * 4
 			check(
 				r,

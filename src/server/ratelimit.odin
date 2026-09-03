@@ -233,7 +233,8 @@ Rate_Bucket :: struct {
 	// One budget per class, brought forward together and spent apart, each at its
 	// own rate - see `Rate_Class`.
 	tokens:  [Rate_Class]f64,
-	// When both were last brought forward, which is whenever either was charged.
+	// When the pools were last brought forward, which is whenever any of them
+	// was charged.
 	last_ns: i64,
 	/*
 	Over-limit datagrams since the last one that was answered, for `slip`.
@@ -307,10 +308,14 @@ make_rate_limiter :: proc(
 	r := new(Rate_Limiter, allocator)
 	r.allocator = allocator
 	r.buckets = make([]Rate_Bucket, RRL_BUCKETS, allocator)
-	rps := f64(max(responses_per_second, 1))
+	configured := max(responses_per_second, 1)
+	rps := f64(configured)
 	r.rate[.Datagram] = rps
 	r.rate[.Stream] = rps
-	r.rate[.Slip] = max(rps / RRL_SLIP_SHARE, 1)
+	// Divided as integers, so the slip pool refills at the whole number the
+	// startup line prints and the documentation quotes rather than at a figure
+	// an eighth of a token above it.
+	r.rate[.Slip] = f64(max(configured / RRL_SLIP_SHARE, 1))
 	for class in Rate_Class {
 		r.capacity[class] = r.rate[class] * RRL_BURST_SECONDS
 	}
@@ -351,10 +356,7 @@ rate_bucket :: proc(r: ^Rate_Limiter, client: net.Endpoint, now_ns: i64) -> ^Rat
 
 	// What each pool has accrued since any of them was last charged, read once:
 	// the collision check below weighs it and the refill afterwards spends it.
-	gained: [Rate_Class]f64
-	for class in Rate_Class {
-		gained[class] = elapsed_tokens(r, class, b.last_ns, now_ns)
-	}
+	gained := elapsed_tokens(r, b.last_ns, now_ns)
 
 	if b.key != key {
 		/*
@@ -482,12 +484,23 @@ stream_rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick
 	return false
 }
 
+/*
+What every pool has accrued between `last_ns` and `now_ns`, one figure per class.
+
+The elapsed time is converted once and each pool's rate multiplied through it: the
+three differ only in rate, so a division per pool would be the same division three
+times - on the path every datagram takes, under the table lock.
+*/
 @(private)
-elapsed_tokens :: proc(r: ^Rate_Limiter, class: Rate_Class, last_ns, now_ns: i64) -> f64 {
+elapsed_tokens :: proc(r: ^Rate_Limiter, last_ns, now_ns: i64) -> (gained: [Rate_Class]f64) {
 	if last_ns == 0 || now_ns <= last_ns {
-		return 0
+		return
 	}
-	return f64(now_ns - last_ns) / f64(time.Second) * r.rate[class]
+	seconds := f64(now_ns - last_ns) / f64(time.Second)
+	for class in Rate_Class {
+		gained[class] = seconds * r.rate[class]
+	}
+	return
 }
 
 /*

@@ -535,10 +535,11 @@ Response rate limiting.
 
 `responses_per_second` is per client prefix - /24 for IPv4, /64 for IPv6 -
 because an attacker spoofing a victim's address picks freely within their range,
-so a per-address budget would only be spread across it. `slip` answers every Nth
-query over the budget with a truncated response rather than dropping it, which
-tells a real client to come back over TCP where the handshake proves the address
-an answer would go to; 0 drops them all.
+so a per-address budget would only be spread across it. `slip` answers at most
+every Nth query over the budget with a truncated response rather than dropping
+it, which tells a real client to come back over TCP where the handshake proves
+the address an answer would go to; 0 drops them all. At most, because those
+answers have a budget of their own - see below.
 
 The figure is charged twice over, not once: each prefix gets it for datagrams and
 again for queries read off a connection, and neither budget can be spent from the
@@ -767,7 +768,9 @@ default_config :: proc() -> Config {
 		or an office behind one NAT asks for - the busiest of those is a few
 		dozen - and far under what makes reflection worth an attacker's
 		bandwidth. Every second query past it comes back truncated rather than
-		dropped, so a client that really is that busy keeps resolving, over TCP.
+		dropped - up to the 62 a second those answers have a budget of their
+		own for - so a client that really is that busy keeps resolving, over
+		TCP.
 		*/
 		rate_limit                 = Rate_Limit_Config{enabled = true, responses_per_second = 500, slip = 2},
 	}
