@@ -456,7 +456,7 @@ test_doh_answers_a_request_that_arrives_split :: proc(t: ^testing.T) {
 }
 
 /*
-A query over the budget is answered 429 and the connection ends.
+A query over the budget is answered 429 and the connection survives it.
 
 DoH pipelines - `Connection: keep-alive` is what this endpoint advertises - so a
 client sitting on one connection can put queries through it as fast as the socket
@@ -464,8 +464,9 @@ carries them, and until the limiter was charged here that rate was bounded by
 nothing at all: `max_connections` counts connections, and this is one.
 
 429 rather than the bare close TCP and DoT get, because over HTTP there is a
-status to say it with, and `Connection: close` because the refusal ends the
-connection either way.
+status to say it with; and the connection is kept, because ending it charges this
+server a TLS handshake per refusal and the client nothing - see
+`serve_doh_request`.
 
 Nothing behind `handle_query` is wired up in this server - no cache, no filters,
 no upstream group - which is the other half of what this checks: the charge lands
@@ -506,8 +507,9 @@ test_doh_refuses_a_query_over_the_rate_limit :: proc(t: ^testing.T) {
 	if !send_all(t, client, strings.to_string(body)) {
 		return
 	}
-	// So `http_linger` after the refusal reaches the end of the connection rather
-	// than sitting out its timeout.
+	// The refusal keeps the connection, so what ends `serve_doh` is the end of the
+	// stream rather than the refusal: without this the handler waits for a second
+	// request until the receive timeout below.
 	net.shutdown(client, .Send)
 
 	accepted, _, aerr := net.accept_tcp(listener)
@@ -557,7 +559,16 @@ test_doh_refuses_a_query_over_the_rate_limit :: proc(t: ^testing.T) {
 
 	head := strings.to_string(answer)
 	testing.expect(t, strings.contains(head, "HTTP/1.1 429"), "an over-budget query was not answered 429")
-	testing.expect(t, strings.contains(head, "Connection: close"), "the refusal left the connection open")
+	testing.expect(
+		t,
+		strings.contains(head, "Connection: keep-alive"),
+		"the refusal ended the connection, which makes the next refusal cost a handshake",
+	)
+	testing.expect(
+		t,
+		!strings.contains(head, "Connection: close"),
+		"the refusal ended the connection, which makes the next refusal cost a handshake",
+	)
 
 	limited, slipped := rate_limit_stats(s.limiter)
 	testing.expect_value(t, limited, u64(1))
@@ -567,25 +578,28 @@ test_doh_refuses_a_query_over_the_rate_limit :: proc(t: ^testing.T) {
 }
 
 /*
-The drain after a 429 does not sit out its deadline on a client that has gone
-quiet.
+A connection over its budget is refused a query at a time rather than refused
+once and closed.
 
-`http_linger` reads what the client had already sent before the connection closes,
-so that closing on unread bytes does not send an RST and have the client's kernel
-throw the 429 away along with them - see `http_linger`. A client that sent one
-query and nothing else has nothing there to read, and every client that can
-address this endpoint can be that client: a 429 asks for no more than a question
-the budget has no room for. Waiting a whole `HTTP_LINGER_TIMEOUT` for bytes that
-are not coming makes the refusal a cheaper way to hold one of `max_connections`
-than a question that gets answered is.
+The refusal is the cheapest thing this endpoint does and the close beside it was
+the dearest: `Connection: close` sent the client back through the accept path and
+a TLS handshake for every question it asked, so a client offering six thousand
+queries a second had this server signing about that many key exchanges. More CPU
+went on refusing than the flood cost the client, which never has to spoof an
+address to provoke it - 236 us per refusal against the HTTP/2 path's 10.5 us on
+the same flood, measured in `bench/results/2026-09-03-rate-limit-bystander.md`.
 
-The client here never shuts its send side down, so the drain's first read has
-nothing to return and no end of stream to end it early either; what ends it is
-`HTTP_LINGER_IDLE`. The 429 still has to arrive - what is bounded is how long the
-drain waits, not whether it runs.
+So the two queries here go out pipelined, on one connection, both over the
+budget, and both come back 429 on a connection that is still open. What the close
+did to the second one is why they are pipelined: it was written before its client
+could have read the first refusal, so it arrived either way, and `http_linger`
+read it and threw it away.
+
+The client shuts its send side down after writing, which is what ends `serve_doh`
+now that a refusal does not: in the server proper that is `client_timeout`.
 */
 @(test)
-test_doh_refusal_does_not_wait_out_a_silent_client :: proc(t: ^testing.T) {
+test_doh_keeps_the_connection_after_a_429 :: proc(t: ^testing.T) {
 	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
 	if lerr != nil {
 		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
@@ -606,16 +620,19 @@ test_doh_refusal_does_not_wait_out_a_silent_client :: proc(t: ^testing.T) {
 	defer net.close(client)
 
 	body := strings.builder_make(context.temp_allocator)
-	strings.write_string(&body, "POST /dns-query HTTP/1.1\r\nHost: dns.example\r\n")
-	strings.write_string(&body, "Content-Type: application/dns-message\r\nContent-Length: ")
-	strings.write_int(&body, dns.HEADER_SIZE)
-	strings.write_string(&body, "\r\n\r\n")
-	for _ in 0 ..< dns.HEADER_SIZE {
-		strings.write_byte(&body, 0)
+	for _ in 0 ..< 2 {
+		strings.write_string(&body, "POST /dns-query HTTP/1.1\r\nHost: dns.example\r\n")
+		strings.write_string(&body, "Content-Type: application/dns-message\r\nContent-Length: ")
+		strings.write_int(&body, dns.HEADER_SIZE)
+		strings.write_string(&body, "\r\n\r\n")
+		for _ in 0 ..< dns.HEADER_SIZE {
+			strings.write_byte(&body, 0)
+		}
 	}
 	if !send_all(t, client, strings.to_string(body)) {
 		return
 	}
+	net.shutdown(client, .Send)
 
 	accepted, _, aerr := net.accept_tcp(listener)
 	if aerr != nil {
@@ -623,8 +640,9 @@ test_doh_refusal_does_not_wait_out_a_silent_client :: proc(t: ^testing.T) {
 		return
 	}
 	defer net.close(accepted)
-	// Longer than the drain is allowed to take, so that a regression shows up as a
-	// slow `serve_doh` rather than as a read that gave up on the request.
+	// Longer than the handler should need for either request, so that a
+	// regression that goes back to closing shows up as a missing second refusal
+	// rather than as a read this test gave up on.
 	_ = net.set_option(accepted, .Receive_Timeout, 2 * time.Second)
 
 	cfg := config.default_config()
@@ -637,7 +655,7 @@ test_doh_refusal_does_not_wait_out_a_silent_client :: proc(t: ^testing.T) {
 
 	peer := net.Endpoint {
 		address = net.IP4_Loopback,
-		port    = 40001,
+		port    = 40002,
 	}
 	for _ in 0 ..< RRL_BURST_SECONDS {
 		testing.expect(
@@ -647,16 +665,7 @@ test_doh_refusal_does_not_wait_out_a_silent_client :: proc(t: ^testing.T) {
 		)
 	}
 
-	start := time.tick_now()
 	serve_doh(&s, Conn{socket = accepted, peer = peer}, "test")
-	spent := time.tick_since(start)
-
-	testing.expectf(
-		t,
-		spent < HTTP_LINGER_TIMEOUT / 2,
-		"the refusal took %v, which is the drain waiting out a client that had stopped sending",
-		spent,
-	)
 
 	_ = net.set_option(client, .Receive_Timeout, 500 * time.Millisecond)
 	answer := strings.builder_make(context.temp_allocator)
@@ -668,11 +677,24 @@ test_doh_refusal_does_not_wait_out_a_silent_client :: proc(t: ^testing.T) {
 		}
 		strings.write_bytes(&answer, chunk[:n])
 	}
+
+	head := strings.to_string(answer)
+	testing.expectf(
+		t,
+		strings.count(head, "HTTP/1.1 429") == 2,
+		"the second over-budget query cost a connection instead of a 429: %q",
+		head,
+	)
 	testing.expect(
 		t,
-		strings.contains(strings.to_string(answer), "HTTP/1.1 429"),
-		"the bounded drain cost the client its 429",
+		!strings.contains(head, "Connection: close"),
+		"a refusal ended the connection, which charges the next one a TLS handshake",
 	)
+
+	// Both refusals are the budget's, and neither is a truncated UDP answer.
+	limited, slipped := rate_limit_stats(s.limiter)
+	testing.expect_value(t, limited, u64(2))
+	testing.expect_value(t, slipped, u64(0))
 	free_all(context.temp_allocator)
 }
 

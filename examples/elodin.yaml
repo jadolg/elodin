@@ -110,8 +110,9 @@ server:
   # for amplification: they pipeline, so one connection carries queries as fast as
   # the socket does, and max_connections counts clients rather than queries. `slip`
   # is a UDP answer and does not apply there - a client already on a connection
-  # cannot act on a TC bit - so an over-budget query ends the connection, DoH
-  # saying so with a 429 first.
+  # cannot act on a TC bit - so an over-budget query ends a TCP or DoT
+  # connection, while DoH answers 429 and keeps it: reconnecting after every
+  # refusal costs the server a TLS handshake and the client nothing.
   #
   # They are charged to a budget of their own: each prefix gets the figure below
   # for datagrams and again for connections. Not a shared one, and not to be made
