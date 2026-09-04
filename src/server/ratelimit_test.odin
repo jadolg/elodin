@@ -2,6 +2,7 @@ package server
 
 import "core:log"
 import "core:net"
+import "core:strings"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -1921,4 +1922,51 @@ test_a_mapped_client_matches_an_ipv4_override :: proc(t: ^testing.T) {
 		got,
 		BIG * RRL_BURST_SECONDS,
 	)
+}
+
+/*
+The lines an operator reads name the network and the figures it will be charged.
+
+These lines are the whole of the visibility this setting has: the counters are
+not labelled per prefix, so nothing else can say which figures a client was
+accounted against, and the commonest way to get a per-prefix setting wrong is an
+entry that does not match the clients it was meant for. A renderer that dropped a
+network, or printed a figure the limiter does not use, would leave that mistake
+undiagnosable.
+
+The truncated-answer budget is the one worth asserting: an eighth of the figure
+and at least one a second, which is arithmetic the operator did not write and
+cannot check against the file.
+*/
+@(test)
+test_the_override_lines_say_what_will_be_charged :: proc(t: ^testing.T) {
+	overrides := []config.Rate_Limit_Override {
+		override("198.51.100.0/24", 4000, 2),
+		override("203.0.113.0/24", 50, 0),
+	}
+	lines := rate_limit_override_lines(overrides, context.temp_allocator)
+	// A header and one line per network.
+	if !testing.expect_value(t, len(lines), 3) {
+		return
+	}
+
+	testing.expect(t, strings.contains(lines[0], "2 network(s)"), "the header did not count the networks")
+	// And says what decides where they overlap, since the lines are in file
+	// order and file order decides nothing.
+	testing.expect(t, strings.contains(lines[0], "most specific"), "the header did not say which entry wins")
+
+	testing.expect(t, strings.contains(lines[1], "198.51.100.0/24"), "the first network was not named")
+	testing.expect(t, strings.contains(lines[1], "4000 responses/s"), "the first figure was not printed")
+	// 4000/8, derived by `make_rate_tier` and nowhere in the file.
+	testing.expect(t, strings.contains(lines[1], "500 truncated answers/s"), "the derived slip budget was not printed")
+
+	testing.expect(t, strings.contains(lines[2], "203.0.113.0/24"), "the second network was not named")
+	testing.expect(t, strings.contains(lines[2], "50 responses/s"), "the second figure was not printed")
+	// `slip: 0` is a different sentence, not a slip budget of zero.
+	testing.expect(t, strings.contains(lines[2], "dropped"), "slip: 0 was not reported as dropping")
+
+	// Nothing configured, nothing said - so a deployment with no overrides gets
+	// no line at startup and none under `--check`.
+	testing.expect_value(t, len(rate_limit_override_lines(nil, context.temp_allocator)), 0)
+	free_all(context.temp_allocator)
 }

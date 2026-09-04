@@ -483,9 +483,25 @@ test_rate_limit_overrides_are_checked :: proc(t: ^testing.T) {
 		{"      - { prefix: 198.51.100.0/24 }\n", "an override with no figure of its own"},
 		{"      - { prefix: 198.51.100.0/24, responses_per_second: 0 }\n", "a budget of zero"},
 		{"      - { prefix: 198.51.100.0/24, responses_per_second: 5000, slip: -2 }\n", "a negative slip"},
+		// -1 in particular, which is the loader's own marker for an entry that
+		// said nothing about `slip`. Read as silence it would inherit the figure
+		// above without a word, while `slip: -1` at the top level is refused.
+		{"      - { prefix: 198.51.100.0/24, responses_per_second: 5000, slip: -1 }\n", "a slip of minus one"},
 		{
 			"      - { prefix: 198.51.100.0/24, responses_per_second: 5000 }\n      - { prefix: 198.51.100.0/24, responses_per_second: 50 }\n",
 			"the same network twice",
+		},
+		/*
+		And the entries written without a `-` in front of them, which is a
+		mapping where a list belongs and the commonest way to write this
+		setting wrong. `yaml.items` answers nil to that exactly as it does to
+		`overrides: []`, so read off the item count it would be a file that
+		passes `--check`, starts clean, names no network in the log and puts
+		every prefix back on the default.
+		*/
+		{
+			"      prefix: 198.51.100.0/24\n      responses_per_second: 5000\n",
+			"the entries written as a mapping rather than a list",
 		},
 	}
 	for c in cases {

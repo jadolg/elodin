@@ -2,6 +2,7 @@ package server
 
 import "core:crypto"
 import "core:crypto/siphash"
+import "core:fmt"
 import "core:mem"
 import "core:net"
 import "core:sync"
@@ -878,12 +879,17 @@ start_rate_limiter :: proc(s: ^Server) -> bool {
 			cfg.responses_per_second,
 		)
 	}
-	report_rate_limit_overrides(s.limiter, cfg.overrides)
+	// Out of the temp arena, which startup resets around this: the lines are read
+	// once and `--check` renders the same ones from the same procedure.
+	for line in rate_limit_override_lines(cfg.overrides, context.temp_allocator) {
+		logx.infof("%s", line)
+	}
 	return true
 }
 
 /*
-Say which networks are not on the default, one line each, at startup.
+Which networks are not on the default, one line each, in the words both the
+startup log and `--check` say it in.
 
 Every one of these is a figure that appears nowhere else an operator can see it:
 the counters are not labelled per prefix (that would be cardinality a peer
@@ -892,47 +898,69 @@ accounted on. Without these lines the only record that a network was configured
 differently is the file, and the commonest failure of a per-prefix setting is
 that the entry does not match the clients it was meant for.
 
+Returned rather than printed, for the reason `connection_limits_line` is: an
+operator reads `--check` before restarting, and that is the moment a wrong entry
+is cheapest to find. Two wordings of one fact drift apart, so there is one.
+
+Built out of `make_rate_tier`, which is the procedure the limiter itself derives
+a tier with - so what is printed is what will be charged because it is the same
+arithmetic on the same figures, and not because two places were kept in step by
+hand. The slip pool in particular is a fraction an operator did not write.
+
 One line each rather than a count, and the whole list rather than the first few,
-because the list is short by construction - `RRL_MAX_OVERRIDES` is the ceiling
-and an operator hand-writes a handful. A file that names 255 networks writes 255
-lines once at startup, which is a diagnosis rather than a flood.
+because the list is short by construction: `RRL_MAX_OVERRIDES` is the ceiling and
+an operator hand-writes a handful. A file that names 255 networks writes 255
+lines once, which is a diagnosis rather than a flood.
 */
-@(private)
-report_rate_limit_overrides :: proc(r: ^Rate_Limiter, overrides: []config.Rate_Limit_Override) {
+rate_limit_override_lines :: proc(
+	overrides: []config.Rate_Limit_Override,
+	allocator := context.allocator,
+) -> []string {
 	if len(overrides) == 0 {
-		return
+		return nil
 	}
+	out := make([dynamic]string, 0, len(overrides) + 1, allocator)
 	// In the order they were configured, which is not the order they are applied
 	// in: where two of them contain a client the most specific decides. Said
-	// rather than implied, because a list printed in file order looks like a
-	// list of precedence and is not one.
-	logx.infof(
-		"rate limit: %d network(s) with figures of their own, listed as configured; where two contain a client the most specific decides:",
-		len(overrides),
+	// rather than implied, because a list printed in file order looks like a list
+	// of precedence and is not one.
+	append(
+		&out,
+		fmt.aprintf(
+			"rate limit: %d network(s) with figures of their own, listed as configured; where two contain a client the most specific decides:",
+			len(overrides),
+			allocator = allocator,
+		),
 	)
-	for o, i in overrides {
-		// The limiter's own derived figures rather than the file's, so what is
-		// printed is what will be charged - the slip pool in particular is a
-		// fraction an operator did not write.
-		tier := r.tiers[i + 1]
-		text := config.format_prefix(o.prefix, context.temp_allocator)
+	for o in overrides {
+		tier := make_rate_tier(o.responses_per_second, o.slip)
+		text := config.format_prefix(o.prefix, allocator)
+		defer delete(text, allocator)
 		if tier.slip > 0 {
-			logx.infof(
-				"rate limit: %s: %d responses/s, 1 in %d over the datagram budget answered truncated, up to %d truncated answers/s",
-				text,
-				o.responses_per_second,
-				tier.slip,
-				int(tier.rate[.Slip]),
+			append(
+				&out,
+				fmt.aprintf(
+					"rate limit: %s: %d responses/s, 1 in %d over the datagram budget answered truncated, up to %d truncated answers/s",
+					text,
+					int(tier.rate[.Datagram]),
+					tier.slip,
+					int(tier.rate[.Slip]),
+					allocator = allocator,
+				),
 			)
-		} else {
-			logx.infof(
+			continue
+		}
+		append(
+			&out,
+			fmt.aprintf(
 				"rate limit: %s: %d responses/s, anything over that dropped",
 				text,
-				o.responses_per_second,
-			)
-		}
+				int(tier.rate[.Datagram]),
+				allocator = allocator,
+			),
+		)
 	}
-	free_all(context.temp_allocator)
+	return out[:]
 }
 
 stop_rate_limiter :: proc(s: ^Server) {

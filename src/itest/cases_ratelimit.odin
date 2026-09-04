@@ -506,11 +506,21 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 				QUERIES,
 				floor,
 			)
-			// And the operator can see which networks are not on the default.
+			/*
+			And the operator can see which networks are not on the default.
+
+			The figure is in the needle rather than the network alone: the
+			default `server.allow_from` starts with `127.0.0.0/8`, and
+			`allow_from_line` prints it at `info` on every start - so a case
+			looking for the network on its own would pass with the override
+			never reported at all.
+			*/
+			reported := fmt.tprintf("127.0.0.0/8: %d responses/s", WIDE)
 			check(
 				r,
-				log_contains(&named, "127.0.0.0/8"),
-				"the override was never reported at startup; log:\n%s",
+				log_contains(&named, reported),
+				"the override was never reported at startup (looking for %q); log:\n%s",
+				reported,
 				read_log(&named),
 			)
 		}

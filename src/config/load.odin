@@ -254,6 +254,23 @@ load_rate_limit_overrides :: proc(l: ^Loader, rl: ^yaml.Node, cfg: ^Config) {
 		)
 		return
 	}
+	/*
+	On the node's own kind rather than on whether `items` came back empty, for
+	the reason `load_upstream_zones` says it there: `overrides: []` is a list
+	with nothing in it, which is a file saying no network has figures of its
+	own, and a mapping written where a list belongs is a mistake. `items`
+	answers nil to both, so without this the commonest way to write this
+	setting wrong - the entries indented under `overrides:` with no `-` in
+	front of them - would pass `--check`, start clean, name no network in the
+	log and put every prefix back on the default.
+	*/
+	if child.kind != .Sequence {
+		errorf(
+			l,
+			"server.rate_limit.overrides: expected a list of networks with figures of their own, such as [{prefix: 198.51.100.0/24, responses_per_second: 5000}]; each entry needs a \"-\" in front of it",
+		)
+		return
+	}
 	entries := yaml.items(child)
 	if len(entries) == 0 {
 		return
@@ -327,15 +344,35 @@ load_rate_limit_overrides :: proc(l: ^Loader, rl: ^yaml.Node, cfg: ^Config) {
 			prefix = p,
 			slip   = -1,
 		}
-		opt_int(l, e, "responses_per_second", &o.responses_per_second, path)
-		opt_int(l, e, "slip", &o.slip, path)
-		if o.responses_per_second == 0 {
+		/*
+		Absent is asked of the node rather than read off the parsed figure: an
+		entry that wrote `responses_per_second: 0` said something, and telling
+		it the key is missing would send an operator looking for a line that is
+		already there. A figure that was written is left for `validate`, which
+		holds it to the same "at least 1" the default is held to.
+		*/
+		if yaml.is_null(yaml.get(e, "responses_per_second")) {
 			errorf(
 				l,
 				"%s: missing responses_per_second; an entry with no figure of its own is the default, which is what leaving the network out already means",
 				path,
 			)
 			continue
+		}
+		opt_int(l, e, "responses_per_second", &o.responses_per_second, path)
+		/*
+		Same question for `slip`, and for a sharper reason: -1 is this loader's
+		marker for silence, so an operator who writes `slip: -1` would otherwise
+		be handed the inherited figure without a word - while `slip: -1` at the
+		top level is refused. Asking the node keeps the two answers the same.
+		*/
+		if !yaml.is_null(yaml.get(e, "slip")) {
+			o.slip = 0
+			opt_int(l, e, "slip", &o.slip, path)
+			if o.slip < 0 {
+				errorf(l, "%s: slip must not be negative", path)
+				continue
+			}
 		}
 		append(&out, o)
 	}
@@ -2278,13 +2315,10 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 			if o.responses_per_second < 1 {
 				errorf(l, "server.rate_limit.overrides: %s: responses_per_second must be at least 1", label)
 			}
+			// Not "must not be negative": a negative figure an operator wrote is
+			// refused beside the line it was written on, so anything below zero
+			// here is the loader's own marker for an entry that said nothing.
 			if o.slip < 0 {
-				// Not "must not be negative": -1 is this loader's own marker for
-				// an entry that said nothing, so a negative figure an operator
-				// actually wrote is the only way to get here with one.
-				if o.slip < -1 {
-					errorf(l, "server.rate_limit.overrides: %s: slip must not be negative", label)
-				}
 				o.slip = cfg.server.rate_limit.slip
 			}
 		}
