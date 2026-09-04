@@ -578,8 +578,13 @@ test_stats_of_carries_every_counter :: proc(t: ^testing.T) {
 		refused      = 8,
 		conn_refused = 9,
 		conn_failed  = 10,
-		secure       = 11,
-		bogus        = 12,
+		handshakes   = 11,
+		secure       = 12,
+		bogus        = 13,
+		// Distinct and non-zero like the rest: whole-struct equality cannot fail
+		// over a field the snapshot drops if the value it was given was zero.
+		rebind       = 14,
+		special_use  = 15,
 	}
 	s := Server {
 		stats = want,

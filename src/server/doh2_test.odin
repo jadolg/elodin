@@ -355,7 +355,7 @@ test_doh2_refuses_a_request_over_the_rate_limit :: proc(t: ^testing.T) {
 		"the refusal carried a body, which can park the reader on flow control",
 	)
 
-	limited, slipped := rate_limit_stats(limiter)
+	limited, slipped, _ := rate_limit_stats(limiter)
 	testing.expect_value(t, limited, u64(1))
 	// A truncated DNS answer is a UDP answer; nothing here may be counted as one.
 	testing.expect_value(t, slipped, u64(0))
@@ -397,7 +397,7 @@ test_doh2_rate_limit_charges_only_queries :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(answer, "not found"), "the request was refused rather than answered 404")
 	testing.expect(t, !strings.contains(answer, "429"), "a request that is not a query was charged to the budget")
 
-	limited, _ := rate_limit_stats(limiter)
+	limited, _, _ := rate_limit_stats(limiter)
 	testing.expect_value(t, limited, u64(0))
 }
 
@@ -478,6 +478,6 @@ test_doh2_rate_limit_charges_only_well_formed_queries :: proc(t: ^testing.T) {
 	)
 	testing.expect(t, !strings.contains(answer, "429"), "a request that is not a query was charged to the budget")
 
-	limited, _ := rate_limit_stats(limiter)
+	limited, _, _ := rate_limit_stats(limiter)
 	testing.expect_value(t, limited, u64(0))
 }

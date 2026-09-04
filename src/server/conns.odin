@@ -22,14 +22,23 @@ Conn_Manager :: struct {
 	/*
 	The most of `limit` any one client prefix may hold, or 0 for no such cap.
 
-	`limit` on its own is a budget with no share-out: nothing else in this server
-	counts connections per client - the rate limiter charges queries, so a client
-	that opens connections and asks nothing on them is charged nothing - so
-	without this one prefix may hold every slot and lock everybody else out.
+	`limit` on its own is a budget with no share-out, and nothing else in this
+	server bounds how long a client keeps what it was given: the rate limiter
+	charges opening a connection and charges the queries asked over it, both of
+	which are rates a client inside its budget goes on paying while holding every
+	connection it opened. So without this one prefix may hold every slot and lock
+	everybody else out.
+
+	Occupancy against arrival, in other words - two bounds that need each other.
+	A share alone does not bound arrivals: a flood that holds each connection for
+	the length of a handshake never reaches a share of 256 out of 512, which is
+	measured in `bench/results/2026-09-03-handshake-floods.md`. An arrival budget
+	alone does not bound occupancy: a client that opens connections slowly and
+	never closes them fills the table inside any rate.
 
 	Kept per /24 and /64 rather than per address, because that is the granularity
-	an attacker picks addresses within, and the granularity the response budget
-	is already kept at. See `client_prefix`.
+	an attacker picks addresses within, and the granularity the limiter's budgets
+	are already kept at. See `client_prefix`.
 	*/
 	prefix_limit: int,
 	// Accept and read loops live here too, but must not eat into the limit the

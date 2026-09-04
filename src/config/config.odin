@@ -498,11 +498,13 @@ Server_Config :: struct {
 
 	`max_connections` is one budget for the whole server, and on its own it says
 	nothing about how that budget is shared. Nothing else bounds a client's share
-	either: `rate_limit` charges *queries*, so a client that opens connections and
-	asks nothing spends no budget at all, and `client_timeout` reclaiming an idle
-	connection after ten seconds is a delay rather than a limit to somebody willing
-	to open another. Without this the answer to "how many of my 512 connections can
-	one stranger have" is "all of them", and no configured limit says otherwise.
+	either: `rate_limit` bounds how fast a prefix may *open* connections and how
+	many queries it may ask over them, and neither of those is how long it keeps
+	one - a client inside its arrival budget can hold every connection it is
+	given, and `client_timeout` reclaiming an idle one after ten seconds is a delay
+	rather than a limit to somebody willing to open another. Without this the answer
+	to "how many of my 512 connections can one stranger have" is "all of them", and
+	no configured limit says otherwise.
 
 	Kept per prefix - /24 and /64 - rather than per address, which is the
 	granularity `rate_limit` keeps its budgets at and for the same reason: an
@@ -612,13 +614,38 @@ it, which tells a real client to come back over TCP where the handshake proves
 the address an answer would go to; 0 drops them all. At most, because those
 answers have a budget of their own - see below.
 
-The figure is charged twice over, not once: each prefix gets it for datagrams and
-again for queries read off a connection, and neither budget can be spent from the
-other's side. Deliberately, and not to be quietly consolidated - a UDP source
-address is written by whoever sent the datagram, so one shared budget let a spoofed
-flood naming a prefix close the TCP, DoT and DoH connections of the clients who
-live in it. `ratelimit.odin` is where that is argued out. The cost is that a client
-asking both ways can draw twice the figure.
+The figure is charged three times over, not once: each prefix gets it for
+datagrams, again for queries read off a connection, and again for the connections
+it opens - and no budget can be spent from another's side. Deliberately, and not
+to be quietly consolidated - a UDP source address is written by whoever sent the
+datagram, so one shared budget let a spoofed flood naming a prefix close the TCP,
+DoT and DoH connections of the clients who live in it, and would let the same
+flood stop them opening one. `ratelimit.odin` is where that is argued out. The
+cost is that a client using every way in can draw three times the figure, two
+thirds of it only over a completed handshake from an address that is therefore
+real.
+
+The third of those is what bounds a client that asks nothing at all. Opening a
+connection costs this server a TLS handshake on DoT and DoH - 205 µs of CPU on the
+machine `bench/results/2026-09-03-handshake-floods.md` was taken on - and a client
+that dials, handshakes and hangs up reaches neither budget of answers, while
+holding each connection too briefly for `max_connections_per_prefix` to notice.
+Uncharged, 32 such dialers drew 6,922 handshakes a second and 1.4 of four cores,
+and took a sixth of the answers from a DoT client in an unrelated prefix. The whole
+figure rather than a share of it, because a connection is what a query is asked
+over: a client entitled to `responses_per_second` queries on connections has to be
+able to open that many, or `dig +tcp` and every stub that reconnects per lookup
+would be held below the budget an operator set.
+
+Which makes this one figure three bounds, and the third has a burst worth sizing.
+A prefix banks two seconds of each pool, so it may open twice this many
+connections at once and then this many a second - and unlike answers, arrivals
+come in bursts: every device on a network reconnects together when this resolver
+restarts or a link comes back. That burst is bounded by how many devices share a
+prefix, which at the shipped 500 is a figure no real network reaches. An operator
+who tunes this far *below* the default is the one who has to check it against
+their device count rather than against their query rate; `client_timeout` sets the
+steady arrival rate underneath it, at about one device in ten per second.
 
 `slip` applies to UDP alone: a truncated answer is an instruction to ask again over
 TCP, so it has nothing to say to a client that is already on a connection.
@@ -635,10 +662,15 @@ the expense of every other client's queries. An eighth, rather than the whole
 figure, because a truncated answer is an invitation and not an answer: a client that
 takes it moves onto a connection, whose budget a datagram flood cannot empty.
 
-What this does not bound is how much of the server one client occupies. Both budgets
-are spent by *queries*, so a client that opens connections and asks nothing on them
-is charged nothing here however many it holds. `max_connections_per_prefix` is that
-bound, keyed to the same prefix so the two agree about who a client is.
+What this does not bound is how much of the server one client *occupies*. What is
+charged here is arriving and asking, both of which are rates; how long a connection
+is held once it has been paid for is `max_connections_per_prefix`, keyed to the same
+prefix so the two agree about who a client is.
+
+Nor is any of it a defence against a botnet. Every budget here is per prefix, so an
+actor with addresses in n of them has n of every figure, and on IPv6 a routine /48
+is 65,536 /64s. A publicly reachable instance wants a per-source connection rate
+limit in front of it as well - see the README.
 */
 Rate_Limit_Config :: struct {
 	enabled:              bool,

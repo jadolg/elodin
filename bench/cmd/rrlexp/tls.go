@@ -124,13 +124,14 @@ const handshakeDeadline = 5 * time.Second
 runHandshakeFlood is a client that connects, handshakes, closes, and does it
 again as fast as the server will let it.
 
-Not a query in the whole arm. The response budget is spent by answers, so a
-client that asks nothing is charged nothing however fast it arrives - and what it
-is buying with that is the most expensive thing a stream client can ask for: an
-ECDHE exchange and a signature, per connection, on a thread out of
-`server.max_connections`. The slot is taken before the handshake starts
-(`accept_loop` in src/server/listeners.odin), so a share of the table is the one
-bound that reaches this load at all, which is why the arms run with one and
+Not a query in the whole arm. The response budgets are spent by answers, so a
+client that asks nothing reaches neither of them however fast it arrives - and
+what it is buying with that is the most expensive thing a stream client can ask
+for: an ECDHE exchange and a signature, per connection, on a thread out of
+`server.max_connections`. What reaches this load is the arrival budget, charged
+per accepted connection in `accept_loop` (src/server/listeners.odin) before the
+handshake runs; a share of the table barely does, since the flood gives every
+slot back within a millisecond or two, which is why the arms also run with one and
 without.
 
 `sockets` is how many of these run at once, which is the concurrency an attacker

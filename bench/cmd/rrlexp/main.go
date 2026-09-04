@@ -107,11 +107,12 @@ type clientSpec struct {
 		Open `sockets` connections, ask nothing on any of them, and hold them for
 		the arm.
 
-		The load `server.max_connections` had no other bound against: the response
-		limiter charges queries, so a client that never asks one spends no budget
-		however many connections it is holding. Only the stream transports have
-		anything to hold, so this is a TCP client; over UDP there is nothing to
-		occupy.
+		The load `server.max_connections` has no other bound against: the limiter
+		charges opening a connection and charges the queries asked over it, and
+		both are rates a client that dials slowly and then asks nothing stays
+		inside for as long as it holds what it was given. Only the stream
+		transports have anything to hold, so this is a TCP client; over UDP there
+		is nothing to occupy.
 	*/
 	idle bool
 	/*
@@ -768,15 +769,22 @@ func volumeArms() []arm {
 }
 
 /*
-The load that neither bound sees: a client doing nothing but handshakes.
+The load no bound saw until issue #247: a client doing nothing but handshakes.
 
 `cmd/bench -transport=handshake` already says what a fresh handshake costs, as a
 throughput figure from a server with nobody else on it. What no arm asked is what
-that load does to somebody trying to resolve, and it is the load with the least
-standing in the way of it: the response budget is spent by answers, so a client
-that sends no query is charged nothing however fast it arrives, and the
-connection share bounds how many connections are held rather than how many are
-made. A handshake holds one for a millisecond or two and gives it back.
+that load does to somebody trying to resolve, and when these arms were written it
+was the load with the least standing in the way of it: the response budgets are
+spent by answers, so a client that sends no query was charged nothing however fast
+it arrived, and the connection share bounds how many connections are held rather
+than how many are made. A handshake holds one for a millisecond or two and gives it
+back.
+
+The server charges arrivals now - one token per accepted connection, out of
+`responses_per_second` - so these arms measure the bound rather than its absence,
+and `bench/results/2026-09-04-handshake-budget.md` is both columns. They are still
+the arms to run: what a refusal costs, and how much faster a flood dials once
+being refused is cheap, are only visible here.
 
 So the flood here is `sockets` workers dialling, handshaking, closing and going
 again, and the victim is a DoT client of the ordinary kind: one connection, a
@@ -799,7 +807,11 @@ slots. It pins the same table, share and `client_timeout` the `slowloris` pair
 uses, so the two pairs are read against each other; the timeout has nothing to
 reclaim here, since a handshake flood gives every slot back on its own. The
 victim there arrives per query rather than holding a connection, since what the
-pair is about is whether a client can still get in.
+pair is about is whether a client can still get in. Since arrivals are charged,
+the budget reaches this load long before either table figure does and the pair
+measures the same thing twice - kept because the *before* column is the only
+measurement of a share against this load, and because a run where the share did
+the work again would mean the budget had stopped.
 */
 func handshakeArms() []arm {
 	var arms []arm
@@ -896,6 +908,42 @@ func handshakeDefaultArms() []arm {
 			limiter:  true, rps: *rps, slip: *slip,
 			attacker: handshakeFlood("127.0.0.2", "dot", hsDialers),
 			victim:   arrivingVictim(),
+		},
+		{
+			/*
+				The bystander that pays for the *refusals* rather than for the
+				handshakes, and the one arm here whose reason to exist came from
+				charging arrivals rather than from leaving them uncharged.
+
+				Refusing at the accept is cheap, so a flood held to its budget
+				dials several times faster than one being served - and every one of
+				those dials takes the rate limiter's table lock in the accept loop,
+				which is the same mutex the UDP readers take for every datagram.
+				Separate pools stop one class spending another's tokens; they do
+				nothing about a lock. A UDP client in an unrelated prefix is what
+				that would show up on, and no arm was measuring one under this
+				load: every victim above is on a connection, where the accept loop
+				is upstream of them anyway.
+
+				Read against `handshake-flood/quiet-baseline-udp`, and read the
+				two together across a `main` build and a patched one - the figure
+				that matters is whether the datagram path got worse in exchange
+				for the stream path getting better.
+			*/
+			name:     "handshake-flood/udp-bystander",
+			question: "what a flood held to its arrival budget - and therefore dialling far faster - does to a UDP client in another /24",
+			limiter:  true, rps: *rps, slip: *slip,
+			attacker: handshakeFlood("127.0.0.2", "dot", hsDialers),
+			victim:   clientSpec{src: "127.1.0.1", transport: "udp", rate: *victimRate, sockets: 1},
+		},
+		{
+			// The same UDP client with the server to itself. Named into the group
+			// for the reason the DoT baseline is: a row with nothing to compare it
+			// against is six numbers.
+			name:     "handshake-flood/quiet-baseline-udp",
+			question: "what that UDP client's queries cost with nobody else here",
+			limiter:  true, rps: *rps, slip: *slip,
+			victim: clientSpec{src: "127.1.0.1", transport: "udp", rate: *victimRate, sockets: 1},
 		},
 	}
 }

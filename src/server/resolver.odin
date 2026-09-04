@@ -87,6 +87,30 @@ Stats :: struct {
 	the bound.
 	*/
 	conn_failed:  u64,
+	/*
+	TLS handshakes that completed, on the DoT and DoH listeners together.
+
+	The cost of arriving, which no other counter here sees. Every figure beside
+	this one is about a query, and a client that dials, handshakes and hangs up
+	asks none - so a flood of exactly that showed up in nothing at all: not
+	`queries`, not the limiter's `limited`, and not `conn_refused`, which stayed
+	at zero right through the flood that drew 1.4 of four cores in
+	`bench/results/2026-09-03-handshake-floods.md`. A handshake was about 205 µs
+	of CPU there, so this number times that is roughly what the listeners spent
+	getting clients in the door - the quantity that tells a busy resolver from a
+	flooded one.
+
+	Completed ones, and only those. A handshake that failed is logged at `debug`
+	and left uncounted: it is a scanner, a client that trusts no certificate here,
+	or a probe, and none of them is the load this exists to make visible - while a
+	figure covering both would move for reasons an operator cannot act on.
+	`conn_rate_limited=` is the refusals, which is the other side of the same
+	question.
+
+	Plain TCP is not here. There is no handshake to complete, so the name would be
+	a lie, and a bare accept is not the cost this measures.
+	*/
+	handshakes:   u64,
 	// Answers that carried a valid chain of signatures, and answers refused
 	// because they did not.
 	secure:       u64,
@@ -2444,6 +2468,7 @@ stats_of :: proc(s: ^Server) -> Stats {
 		refused = sync.atomic_load(&s.stats.refused),
 		conn_refused = sync.atomic_load(&s.stats.conn_refused),
 		conn_failed = sync.atomic_load(&s.stats.conn_failed),
+		handshakes = sync.atomic_load(&s.stats.handshakes),
 		secure = sync.atomic_load(&s.stats.secure),
 		bogus = sync.atomic_load(&s.stats.bogus),
 		rebind = sync.atomic_load(&s.stats.rebind),

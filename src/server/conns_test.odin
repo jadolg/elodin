@@ -84,10 +84,11 @@ One client must not be able to hold every slot in the table.
 
 This is the whole of the finding: `max_connections` bounded how many connections
 existed and nothing bounded whose they were, so 512 of them from one source
-address were 512 the rest of the network could not have. The response limiter
-does not reach it either - it charges queries, and a connection that asks nothing
-spends nothing - so a client that opens connections and sits there was, to every
-counter this server kept, several well-behaved clients.
+address were 512 the rest of the network could not have. The limiter does not
+reach it either - what it charges is opening a connection and the queries asked
+over it, both of them rates a client can stay inside while never letting go - so a
+client that opens connections slowly and sits there is, to every counter this
+server keeps, several well-behaved clients.
 
 Two slots each out of four, so the case can tell a share being full from the
 table being full: the third connection from the flooded /24 is refused with half

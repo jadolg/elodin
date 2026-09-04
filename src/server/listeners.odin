@@ -986,6 +986,72 @@ report_spawn_failure :: proc(proto: Protocol, why: Spawn_Result, cm: ^Conn_Manag
 }
 
 /*
+Say that a client is opening connections faster than its prefix may, once.
+
+Bounded like every other refusal in this file, and for the same reason: the peer
+decides how many there are. What makes the demotion safe here is
+`conn_rate_limited=` in the stats line, which goes on counting after the one
+`warn` has scrolled away - the counter and the line were written together
+deliberately, since a handshake flood with nothing counting it is the condition
+issue #247 was filed about.
+
+Kept apart from `report_spawn_failure` rather than folded in as a fourth cause,
+because it is not one: those three are the connection *table* refusing, reached
+after a slot was asked for, and this one is the arrival budget refusing before
+anything asks. The settings behind them are different and so is the advice, which
+is the whole reason that procedure tells its own three apart.
+
+The `warn` does not name the client and the `debug` lines do, which is
+`report_refusal`'s split and is here for the same two reasons. The `warn` is one
+line at the default level and what it has to carry is the setting, since that is
+what an operator changes; putting an address there would put an attacker's address
+list in the log at the default level, one line per connection until the flag flips.
+But `debug` is where somebody who has gone looking arrives, and the one thing they
+need there is who - the counter is deliberately not labelled per prefix (see
+`render_metrics`), and the hint under the `warn` sends them to write a filter rule
+keyed on a source address. A `debug` line that said "this client's prefix" and
+nothing else would answer the question the level exists to answer with the fact it
+had already withheld.
+*/
+@(private)
+conn_rate_limit_reported: bool
+
+@(private)
+report_conn_rate_limit :: proc(client: net.Endpoint, proto: Protocol, rate: int) {
+	say, first := report_once(&conn_rate_limit_reported, logx.enabled(.Debug))
+	if !say {
+		return
+	}
+	// As in `report_refusal`: the accept loop never resets its own temp arena,
+	// and the line was formatted out of it.
+	defer free_all(context.temp_allocator)
+
+	transport := proto_name(proto)
+	if !first {
+		// The stack rather than the arena, as in `report_refusal`: an address is
+		// a fixed few dozen bytes, and this is the level every refusal reaches.
+		buf: [64]u8
+		builder := strings.builder_from_bytes(buf[:])
+		who := net.endpoint_to_string(client, &builder)
+		logx.debugf(
+			"%s: refused a connection from %s, whose /24 or /64 is opening them faster than %d/s",
+			transport,
+			who,
+			rate,
+		)
+		return
+	}
+	logx.warnf(
+		"%s: refusing a connection, this client's /24 or /64 is opening them faster than server.rate_limit.responses_per_second (%d) allows",
+		transport,
+		rate,
+	)
+	logx.warnf(
+		"a client that only opens connections asks nothing, so it reaches neither response budget however fast it does it - and on DoT and DoH each one costs a TLS handshake; opening one is therefore charged to the same per-prefix figure as an answer. Raise server.rate_limit.responses_per_second if this client network should be able to reconnect faster, and put a per-source connection rate limit in front of a publicly reachable instance. These are counted as conn_rate_limited= in the stats line, and further ones are logged at debug level",
+	)
+}
+
+/*
 Whether a datagram's source could be a client waiting for an answer.
 
 Two things it cannot be, both free to check and both well established:
@@ -1386,6 +1452,38 @@ accept_loop :: proc(data: rawptr) {
 			continue
 		}
 
+		/*
+		The prefix's budget for *arriving*, spent here and nowhere further in.
+
+		This is the only bound on what a client that only dials costs. The
+		response budgets are spent by queries, so a peer that completes a
+		handshake and hangs up reaches neither of them; `max_connections` and its
+		per-prefix share bound how many connections are *held*, and this peer
+		holds each one for the length of a handshake and no longer. Measured, that
+		was 6,922 handshakes a second and 1.4 of four cores, with every counter
+		this server had at the time reading zero - see
+		`bench/results/2026-09-03-handshake-floods.md`, and `ratelimit.odin` for
+		the pool.
+
+		After the allow list rather than before it: a source this server has
+		decided not to serve is closed above without spending anything, so a
+		narrowed list cannot become a way to empty the budget of the prefix beside
+		it. Before everything else, because a refusal here costs an accept and a
+		close, and every step past it - a thread, a TLS handshake - is the cost
+		being bounded. `conn_spawn` below is the other way round for the same
+		reason: it walks its thread list and asks the OS about each entry, so the
+		cheaper bound goes first.
+
+		Closed rather than answered, for the reason the allow list's refusal is:
+		writing a reason takes a connection, and a connection is what is being
+		refused.
+		*/
+		if !conn_rate_check(ctx.server.limiter, client, time.tick_now()) {
+			report_conn_rate_limit(client, ctx.proto, ctx.server.cfg.server.rate_limit.responses_per_second)
+			net.close(client_socket)
+			continue
+		}
+
 		job := new(Stream_Job)
 		job.ctx = ctx
 		job.socket = client_socket
@@ -1472,6 +1570,9 @@ stream_job :: proc(data: rawptr) {
 			net.close(job.socket)
 			return
 		}
+		// Counted here, where a handshake has actually completed - see
+		// `Stats.handshakes` for what the figure is for.
+		sync.atomic_add(&s.stats.handshakes, 1)
 		defer tlsx.close(conn)
 		serve_dns_stream(s, {socket = job.socket, tls = conn, peer = job.client}, .DoT, client)
 	case .DoH:
@@ -1481,6 +1582,7 @@ stream_job :: proc(data: rawptr) {
 			net.close(job.socket)
 			return
 		}
+		sync.atomic_add(&s.stats.handshakes, 1)
 		defer tlsx.close(conn)
 		if tlsx.alpn_protocol(conn) == "h2" {
 			serve_doh2(s, conn, client, job.client)

@@ -870,11 +870,11 @@ report_udp_drops :: proc(l: ^server.Listeners, last: ^u64) {
 report :: proc(s: ^server.Server, answers: ^cache.Cache) {
 	st := server.stats_of(s)
 	cs := cache.stats(answers)
-	limited, slipped := server.rate_limit_stats(s.limiter)
+	limited, slipped, conn_limited := server.rate_limit_stats(s.limiter)
 	logx.eventf(
 		.Info,
 		"stats",
-		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d refused=%d conn_refused=%d conn_failed=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d special_use=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d",
+		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d refused=%d conn_refused=%d conn_rate_limited=%d conn_failed=%d handshakes=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d special_use=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d",
 		st.queries,
 		st.blocked,
 		st.cached,
@@ -883,7 +883,13 @@ report :: proc(s: ^server.Server, answers: ^cache.Cache) {
 		st.dropped,
 		st.refused,
 		st.conn_refused,
+		// Beside `conn_refused` because the pair is the diagnosis: a table that
+		// is full and a client arriving too fast are different problems with
+		// different settings behind them, and the second used to show up in
+		// neither figure.
+		conn_limited,
 		st.conn_failed,
+		st.handshakes,
 		limited,
 		slipped,
 		st.secure,

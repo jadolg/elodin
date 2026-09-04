@@ -631,7 +631,7 @@ test_rate_limit_slips_a_truncated_answer :: proc(t: ^testing.T) {
 		SLIPS,
 	)
 
-	limited, slipped := rate_limit_stats(r)
+	limited, slipped, _ := rate_limit_stats(r)
 	testing.expect_value(t, limited, u64(SLIP * SLIPS))
 	testing.expect_value(t, slipped, u64(SLIPS))
 
@@ -811,10 +811,24 @@ every caller.
 test_rate_limit_disabled_allows_everything :: proc(t: ^testing.T) {
 	for i in 0 ..< 1000 {
 		testing.expect_value(t, rate_check(nil, v4(192, 0, 2, u8(i % 256)), at(0)), Rate_Verdict.Allow)
+		testing.expect(
+			t,
+			stream_rate_check(nil, v4(192, 0, 2, u8(i % 256)), at(0)),
+			"a disabled limiter refused a query on a connection",
+		)
+		// Including the connections themselves: `rate_limit.enabled: false` has
+		// to mean the accept loop is back to where it was, or turning the
+		// limiter off would leave a bound on nothing an operator asked for.
+		testing.expect(
+			t,
+			conn_rate_check(nil, v4(192, 0, 2, u8(i % 256)), at(0)),
+			"a disabled limiter refused a connection",
+		)
 	}
-	limited, slipped := rate_limit_stats(nil)
+	limited, slipped, conn_limited := rate_limit_stats(nil)
 	testing.expect_value(t, limited, u64(0))
 	testing.expect_value(t, slipped, u64(0))
+	testing.expect_value(t, conn_limited, u64(0))
 }
 
 /*
@@ -1052,7 +1066,7 @@ test_stream_queries_are_refused_rather_than_truncated :: proc(t: ^testing.T) {
 		testing.expect(t, !stream_rate_check(r, client, at(0)), "an over-budget query was answered on a connection")
 	}
 
-	limited, slipped := rate_limit_stats(r)
+	limited, slipped, _ := rate_limit_stats(r)
 	testing.expect_value(t, limited, u64(20))
 	testing.expect_value(t, slipped, u64(0))
 
@@ -1108,7 +1122,7 @@ test_a_stream_refusal_does_not_advance_the_slip :: proc(t: ^testing.T) {
 	testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Drop)
 	testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Truncate)
 
-	limited, slipped := rate_limit_stats(r)
+	limited, slipped, _ := rate_limit_stats(r)
 	// Three over the budget: the connection's and the two datagrams.
 	testing.expect_value(t, limited, u64(3))
 	testing.expect_value(t, slipped, u64(1))
@@ -1148,14 +1162,15 @@ test_a_stream_answer_does_not_reset_the_slip :: proc(t: ^testing.T) {
 
 	testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Truncate)
 
-	limited, slipped := rate_limit_stats(r)
+	limited, slipped, _ := rate_limit_stats(r)
 	testing.expect_value(t, limited, u64(SLIP))
 	testing.expect_value(t, slipped, u64(1))
 }
 
 /*
-Two budgets per prefix, and a datagram flood cannot reach the one connections are
-answered out of.
+A budget per prefix per class, and a datagram flood cannot reach the one
+connections are answered out of. `test_a_datagram_flood_cannot_stop_a_prefix_connecting`
+is the same property for the third of them, the arrivals.
 
 Stated as the attack rather than as a property, because the attack is the reason
 the separation is there. The bucket is keyed on the query's source address, and over
@@ -1174,9 +1189,10 @@ over a connection must not empty what its neighbours' datagrams are answered out
 of.
 
 The cost of the split is asserted here too rather than left implicit. The prefix
-draws RATE*BURST out of each pool, so a client willing to ask both ways gets twice
-what an operator configured - a constant, and the trade is argued at the top of
-`ratelimit.odin`. What must not come back is one pool lending to the other.
+draws RATE*BURST out of each pool, so a client willing to use every way in gets a
+multiple of what an operator configured - a constant, and the trade is argued at
+the top of `ratelimit.odin`. What must not come back is one pool lending to the
+other.
 */
 @(test)
 test_the_stream_budget_is_not_the_datagram_one :: proc(t: ^testing.T) {
@@ -1225,14 +1241,174 @@ test_the_stream_budget_is_not_the_datagram_one :: proc(t: ^testing.T) {
 	testing.expect_value(t, rate_check(r, v6(0xcccc, 2), at(0)), Rate_Verdict.Allow)
 }
 
+/*
+Opening a connection is charged, which is the load nothing here used to see.
+
+The client this is about asks nothing at all: it dials, completes a TLS handshake
+and hangs up. So it spends no datagram budget and no stream budget however fast it
+goes, and the connection table it touches is a table it holds one slot of for the
+length of a handshake - measured, 6,922 of them a second and 1.4 of four cores,
+with every counter this server published reading zero
+(`bench/results/2026-09-03-handshake-floods.md`).
+
+The numbers are the same shape as every other pool: `rate * RRL_BURST_SECONDS`
+banked, and a second of quiet worth a second of the rate.
+*/
+@(test)
+test_connections_are_charged_to_a_budget_of_their_own :: proc(t: ^testing.T) {
+	RATE :: 100
+	r := make_rate_limiter(RATE, 0)
+	defer destroy_rate_limiter(r)
+
+	client := v4(203, 0, 113, 40)
+	opened := 0
+	for _ in 0 ..< 1000 {
+		if conn_rate_check(r, client, at(0)) {
+			opened += 1
+		}
+	}
+	testing.expectf(
+		t,
+		opened == RATE * RRL_BURST_SECONDS,
+		"a full bucket accepted %d connections at once, expected %d",
+		opened,
+		RATE * RRL_BURST_SECONDS,
+	)
+	testing.expect(t, !conn_rate_check(r, client, at(0)), "a connection was accepted past what the pool holds")
+
+	// A quarter of a second is a quarter of the rate, and not a connection more.
+	refilled := 0
+	for _ in 0 ..< 1000 {
+		if conn_rate_check(r, client, at(250)) {
+			refilled += 1
+		}
+	}
+	testing.expectf(t, refilled == RATE / 4, "a quarter second refilled %d connections, expected %d", refilled, RATE / 4)
+
+	// Counted, and counted apart from the queries: nothing was asked here, so
+	// `limited=` must not move for it - a handshake flood and a query flood are
+	// different problems with different settings behind them.
+	limited, slipped, conn_limited := rate_limit_stats(r)
+	testing.expect_value(t, limited, u64(0))
+	testing.expect_value(t, slipped, u64(0))
+	// Every dial above that was not accepted: 1000 less the burst, the one
+	// asserted refusal between the loops, and 1000 less the quarter-second refill.
+	refusals := u64(1000 - opened) + 1 + u64(1000 - refilled)
+	testing.expectf(t, conn_limited == refusals, "conn_limited counted %d refusals, expected %d", conn_limited, refusals)
+}
+
+/*
+A spoofed datagram flood must not be able to stop a prefix's clients connecting.
+
+The sharper half of the separation the top of `ratelimit.odin` argues for. A UDP
+source address is written by whoever sent the datagram, so if arrivals were
+charged to the datagram pool, anyone with a raw socket could keep prefix P's pool
+empty and P's real clients would be refused *on accept* - not refused an answer
+they could retry for, but unable to get a connection at all. That is a door
+further out than the one the stream pool closed.
+
+Both ways round, since a pool that can be drained from the other side is not a
+separate pool: the flood must not reach the arrivals, and a client dialling flat
+out must not empty what its neighbours' datagrams and queries are answered out of.
+*/
+@(test)
+test_a_datagram_flood_cannot_stop_a_prefix_connecting :: proc(t: ^testing.T) {
+	RATE :: 10
+	SLIP :: 2
+	r := make_rate_limiter(RATE, SLIP)
+	defer destroy_rate_limiter(r)
+
+	// The flood: one prefix's datagram pool spent dry, and its slip pool with it.
+	victim := v4(198, 51, 100, 30)
+	for _ in 0 ..< 1000 {
+		_ = rate_check(r, victim, at(0))
+	}
+	testing.expect_value(t, rate_check(r, victim, at(0)), Rate_Verdict.Drop)
+
+	// A real client in the same /24 opens its prefix's whole allowance anyway.
+	opened := 0
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		if conn_rate_check(r, v4(198, 51, 100, 31), at(0)) {
+			opened += 1
+		}
+	}
+	testing.expectf(
+		t,
+		opened == RATE * RRL_BURST_SECONDS,
+		"a datagram flood took %d of the %d connections the prefix was owed",
+		opened,
+		RATE * RRL_BURST_SECONDS,
+	)
+	// A budget of its own, not an exemption.
+	testing.expect(
+		t,
+		!conn_rate_check(r, v4(198, 51, 100, 32), at(0)),
+		"the connection budget accepted past what it holds",
+	)
+
+	// The other way about, on a prefix of its own: a client dialling flat out
+	// spends the connection pool dry, and the prefix's datagrams and its queries
+	// on the connections it did get are answered regardless.
+	dialer := v6(0xdddd, 1)
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		testing.expect(t, conn_rate_check(r, dialer, at(0)), "a connection was refused that the pool had room for")
+	}
+	testing.expect(t, !conn_rate_check(r, dialer, at(0)), "the connection budget accepted past what it holds")
+	testing.expect_value(t, rate_check(r, v6(0xdddd, 2), at(0)), Rate_Verdict.Allow)
+	testing.expect(t, stream_rate_check(r, v6(0xdddd, 2), at(0)), "dialling emptied the pool the queries are answered out of")
+}
+
+/*
+The arrival budget is per prefix, like everything else here.
+
+Same reasoning: an attacker picks addresses freely inside the range they hold, so
+a bound kept per address is one they multiply by picking another - and a bound
+kept globally would let one dialer decide whether anybody else may connect, which
+is the failure a shared bound always is. Two addresses in one /24 share; two /24s
+do not.
+*/
+@(test)
+test_the_connection_budget_is_kept_per_prefix :: proc(t: ^testing.T) {
+	RATE :: 10
+	r := make_rate_limiter(RATE, 0)
+	defer destroy_rate_limiter(r)
+
+	// One /24 dialled dry, one address at a time.
+	opened := 0
+	for i in 0 ..< 1000 {
+		if conn_rate_check(r, v4(203, 0, 113, u8(i % 256)), at(0)) {
+			opened += 1
+		}
+	}
+	testing.expectf(
+		t,
+		opened == RATE * RRL_BURST_SECONDS,
+		"256 addresses in one /24 opened %d connections, expected the prefix's %d",
+		opened,
+		RATE * RRL_BURST_SECONDS,
+	)
+
+	// The /24 beside it has its own, untouched.
+	testing.expect(t, conn_rate_check(r, v4(203, 0, 114, 1), at(0)), "a neighbouring /24 was refused a connection")
+	// And so does another /64.
+	testing.expect(t, conn_rate_check(r, v6(0xeeee, 1), at(0)), "an IPv6 prefix was refused a connection")
+}
+
+// Which of a prefix's pools a charging thread below spends from. All three
+// entry points are hammered, because all three decrement under the one lock.
+@(private = "file")
+Charge :: enum {
+	Datagram,
+	Stream,
+	Connection,
+}
+
 // One charging thread's share of the work below, and what it saw.
 @(private = "file")
 Hammer :: struct {
 	limiter:   ^Rate_Limiter,
 	client:    net.Endpoint,
-	// Which of the prefix's two pools this thread spends from. Both are hammered,
-	// because both entry points decrement under the one lock.
-	stream:    bool,
+	charge:    Charge,
 	rounds:    int,
 	allowed:   int,
 	truncated: int,
@@ -1241,18 +1417,23 @@ Hammer :: struct {
 @(private = "file")
 hammer :: proc(h: ^Hammer) {
 	for _ in 0 ..< h.rounds {
-		if h.stream {
+		switch h.charge {
+		case .Stream:
 			if stream_rate_check(h.limiter, h.client, at(0)) {
 				h.allowed += 1
 			}
-			continue
-		}
-		switch rate_check(h.limiter, h.client, at(0)) {
-		case .Allow:
-			h.allowed += 1
-		case .Truncate:
-			h.truncated += 1
-		case .Drop:
+		case .Connection:
+			if conn_rate_check(h.limiter, h.client, at(0)) {
+				h.allowed += 1
+			}
+		case .Datagram:
+			switch rate_check(h.limiter, h.client, at(0)) {
+			case .Allow:
+				h.allowed += 1
+			case .Truncate:
+				h.truncated += 1
+			case .Drop:
+			}
 		}
 	}
 }
@@ -1269,10 +1450,12 @@ once loses one of the two decrements, and `over` loses slips the same way. Both
 are counted here rather than only the first, because the numbers an operator reads
 are as much of the limiter as the verdicts are.
 
-Half the threads charge datagrams and half charge connections, so both pools are
-spent concurrently and each is asserted to the token: they live in one bucket
-behind one lock, and a pool that came out over its capacity would be one the other
-half's decrements had raced with.
+A third of the threads charge datagrams, a third queries on connections and a
+third connections opened, so all three pools are spent concurrently and each is
+asserted to the token: they live in one bucket behind one lock, and a pool that
+came out over its capacity would be one the others' decrements had raced with. The
+arrival pool belongs here as much as the other two - there is an accept loop per
+stream transport, so three threads charge it whatever the connections are doing.
 
 Every thread charges the same prefix at the same instant, so nothing refills
 during the run and the arithmetic is exact: a full pool and no more, whoever spent
@@ -1283,7 +1466,9 @@ interleaving, which is why the assertions are equalities rather than thresholds.
 test_rate_limit_accounts_exactly_under_concurrent_callers :: proc(t: ^testing.T) {
 	RATE :: 80
 	SLIP :: 2
-	THREADS :: 8
+	// One per class, three deep, so every pool has several threads on it.
+	PER_CLASS :: 3
+	THREADS :: PER_CLASS * len(Charge)
 	ROUNDS :: 500
 	CAPACITY :: RATE * RRL_BURST_SECONDS
 	// The slip pool, an eighth of the rate; 80 so that eighth divides evenly.
@@ -1299,7 +1484,7 @@ test_rate_limit_accounts_exactly_under_concurrent_callers :: proc(t: ^testing.T)
 		hammers[i] = Hammer {
 			limiter = r,
 			client  = client,
-			stream  = i % 2 == 1,
+			charge  = Charge(i % len(Charge)),
 			rounds  = ROUNDS,
 		}
 		threads[i] = thread.create_and_start_with_poly_data(&hammers[i], hammer)
@@ -1308,48 +1493,48 @@ test_rate_limit_accounts_exactly_under_concurrent_callers :: proc(t: ^testing.T)
 			return
 		}
 	}
-	datagrams, streams, truncated := 0, 0, 0
+	spent: [Charge]int
+	truncated := 0
 	for i in 0 ..< THREADS {
 		thread.join(threads[i])
 		thread.destroy(threads[i])
-		if hammers[i].stream {
-			streams += hammers[i].allowed
-		} else {
-			datagrams += hammers[i].allowed
-		}
+		spent[hammers[i].charge] += hammers[i].allowed
 		truncated += hammers[i].truncated
 	}
 
-	testing.expectf(
-		t,
-		datagrams == CAPACITY,
-		"%d threads spent %d datagrams out of a pool holding %d",
-		THREADS / 2,
-		datagrams,
-		CAPACITY,
-	)
-	testing.expectf(
-		t,
-		streams == CAPACITY,
-		"%d threads spent %d queries on connections out of a pool holding %d",
-		THREADS / 2,
-		streams,
-		CAPACITY,
-	)
+	for charge in Charge {
+		testing.expectf(
+			t,
+			spent[charge] == CAPACITY,
+			"%d threads spent %d out of the %s pool, which holds %d",
+			PER_CLASS,
+			spent[charge],
+			charge,
+			CAPACITY,
+		)
+	}
 
-	limited, slipped := rate_limit_stats(r)
-	// Each half spent its own pool, so each half went over by its own rounds less
-	// that pool's capacity.
-	over_datagram := u64(THREADS / 2 * ROUNDS - CAPACITY)
-	testing.expect_value(t, limited, over_datagram * 2)
+	limited, slipped, conn_limited := rate_limit_stats(r)
+	// Each third spent its own pool, so each went over by its own rounds less that
+	// pool's capacity.
+	over := u64(PER_CLASS * ROUNDS - CAPACITY)
 	/*
-	The slip pool spent to the token, like the other two: this flood offers far
+	`limited` is the datagrams and the queries, and the connections are counted
+	apart - see `Rate_Limiter.conn_limited`. A change that folded the two together
+	would leave this test passing on the sum and lose the distinction an operator
+	reads the counters for, so both are asserted.
+	*/
+	testing.expect_value(t, limited, over * 2)
+	testing.expect_value(t, conn_limited, over)
+	/*
+	The slip pool spent to the token, like the other three: this flood offers far
 	more than `SLIPS` over-limit datagrams, so what comes back truncated is the
 	pool and not a share of the arrival rate - and it is that exactly, which a
-	decrement lost between two threads would put it over. The connections'
-	refusals are not among them: they reach neither the pool nor `over`.
+	decrement lost between two threads would put it over. Neither the connections'
+	queries nor their arrivals are among them: they reach neither the pool nor
+	`over`.
 	*/
-	testing.expect(t, over_datagram / SLIP > SLIPS, "the flood was too small to run the slip pool dry")
+	testing.expect(t, over / SLIP > SLIPS, "the flood was too small to run the slip pool dry")
 	testing.expect_value(t, slipped, u64(SLIPS))
 	testing.expect_value(t, u64(truncated), u64(SLIPS))
 }

@@ -570,7 +570,7 @@ test_doh_refuses_a_query_over_the_rate_limit :: proc(t: ^testing.T) {
 		"the refusal ended the connection, which makes the next refusal cost a handshake",
 	)
 
-	limited, slipped := rate_limit_stats(s.limiter)
+	limited, slipped, _ := rate_limit_stats(s.limiter)
 	testing.expect_value(t, limited, u64(1))
 	// A truncated DNS answer is a UDP answer; nothing here may be counted as one.
 	testing.expect_value(t, slipped, u64(0))
@@ -692,7 +692,7 @@ test_doh_keeps_the_connection_after_a_429 :: proc(t: ^testing.T) {
 	)
 
 	// Both refusals are the budget's, and neither is a truncated UDP answer.
-	limited, slipped := rate_limit_stats(s.limiter)
+	limited, slipped, _ := rate_limit_stats(s.limiter)
 	testing.expect_value(t, limited, u64(2))
 	testing.expect_value(t, slipped, u64(0))
 	free_all(context.temp_allocator)
