@@ -237,6 +237,43 @@ route_reply_ds :: proc(name: string) -> []u8 {
 	return wire
 }
 
+/*
+NOERROR with an address in the answer section, which is not a NODATA.
+
+What an NXDOMAIN-hijacking resolver answers for a name its parent zone does not
+delegate: the rcode is rewritten to NOERROR and the answer section carries a
+synthesised address. It is the deployment the NXDOMAIN case is written around -
+an internal `corp.example.com` under a public `example.com` that delegates no
+`corp` - reached through an upstream that does not return NXDOMAIN for anything.
+Read as the proof, the route would never be asked and the client would be handed
+an answer to a `DS` query that is neither a DS nor a denial of one.
+
+`response_matches` compares the question and not the answer, so a reply shaped
+like this is accepted from the wire exactly as a real hijacker's is.
+*/
+@(private = "file")
+route_reply_hijacked :: proc(name: string) -> []u8 {
+	answer := make([]dns.Record, 1, context.temp_allocator)
+	answer[0] = dns.Record {
+		name  = name,
+		type  = .A,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_A{addr = {203, 0, 113, 7}},
+	}
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question{name = name, type = .DS, class = .IN}
+	msg := dns.Message{question = question, answer = answer}
+	msg.flags.qr = true
+	msg.flags.rd = true
+	msg.flags.ra = true
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	if err != .None {
+		return nil
+	}
+	return wire
+}
+
 // One UDP upstream on loopback, as `upstream.servers` would name it.
 @(private = "file")
 mock_group :: proc(t: ^testing.T, cfg: config.Upstream_Config, port: int) -> ^upstream.Group {
@@ -653,14 +690,17 @@ test_an_apex_ds_goes_back_on_the_route_unless_the_parent_proves_no_ds :: proc(t:
 		// A `DS` RRset in the answer rather than a NODATA, which is a parent
 		// that delegates the zone and signs the delegation.
 		signed:   bool,
+		// NOERROR with an address in the answer, which is a hijacker rather than
+		// a parent: neither the DS nor the denial of one.
+		hijacked: bool,
 		to_route: bool,
 		// What the client is handed, which is the last upstream to speak.
 		client:   dns.Rcode,
 	}
 	cases := []Case {
-		{"no such name", .NX_Domain, false, true, .No_Error},
-		{"a DS RRset", .No_Error, true, true, .No_Error},
-		{"no DS at the delegation", .No_Error, false, false, .No_Error},
+		{"no such name", .NX_Domain, false, false, true, .No_Error},
+		{"a DS RRset", .No_Error, true, false, true, .No_Error},
+		{"no DS at the delegation", .No_Error, false, false, false, .No_Error},
 		/*
 		SERVFAIL says nothing about the delegation, so the route answers it - the
 		reading `parent_answers_apex_ds` takes from
@@ -669,7 +709,17 @@ test_an_apex_ds_goes_back_on_the_route_unless_the_parent_proves_no_ds :: proc(t:
 		resolver that mangles every `DS` it meets, must not take an internal zone
 		down with it.
 		*/
-		{"SERVFAIL", .Serv_Fail, false, true, .No_Error},
+		{"SERVFAIL", .Serv_Fail, false, false, true, .No_Error},
+		/*
+		And the same reading of a rewritten NOERROR. A resolver that hijacks
+		NXDOMAIN answers the routed zone's apex `DS` with NOERROR and a
+		synthesised address, which is the first case above with the rcode written
+		over: the answer section holds no DS and is not empty, so it is no more a
+		NODATA than the SERVFAIL is. Read as the proof it would keep the question
+		at the parent and hand a validating client a broken chain - this
+		carve-out's own failure, arriving through the query it sends out.
+		*/
+		{"a hijacked NOERROR", .No_Error, false, true, true, .No_Error},
 	}
 
 	for c in cases {
@@ -701,9 +751,15 @@ test_an_apex_ds_goes_back_on_the_route_unless_the_parent_proves_no_ds :: proc(t:
 			routes = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
 		}
 
+		parent_reply := route_reply_nodata("corp.example.", .DS, c.parent)
+		if c.signed {
+			parent_reply = route_reply_ds("corp.example.")
+		} else if c.hijacked {
+			parent_reply = route_reply_hijacked("corp.example.")
+		}
 		parent := Route_Mock {
 			socket = def_socket,
-			reply  = route_reply_ds("corp.example.") if c.signed else route_reply_nodata("corp.example.", .DS, c.parent),
+			reply  = parent_reply,
 			want   = "corp.example.",
 		}
 		authority := Route_Mock {
@@ -756,22 +812,25 @@ test_an_apex_ds_goes_back_on_the_route_unless_the_parent_proves_no_ds :: proc(t:
 			)
 		}
 
-		// What the client is handed: the answer of whichever upstream was asked
-		// last, so never the parent's NXDOMAIN once the route has spoken for the
-		// zone - and never the parent's DS either, which is the half of this a
-		// rcode assertion alone would miss.
+		/*
+		What the client is handed: the answer of whichever upstream was asked
+		last, so never the parent's NXDOMAIN once the route has spoken for the
+		zone - and never the parent's records either, which is the half of this a
+		rcode assertion alone would miss. The route answers with a NODATA, so an
+		empty answer section is the assertion, and it covers the parent's DS and
+		a hijacker's synthesised address in one: both would arrive as a record
+		here.
+		*/
 		decoded, derr2 := dns.decode_message(out, context.temp_allocator)
 		testing.expect_value(t, derr2, dns.Decode_Error.None)
 		testing.expect_value(t, dns.Rcode(decoded.flags.rcode), c.client)
 		if c.to_route {
-			for rec in decoded.answer {
-				testing.expectf(
-					t,
-					rec.type != .DS,
-					"the parent's DS reached the client for a zone the route answers (%s)",
-					c.what,
-				)
-			}
+			testing.expectf(
+				t,
+				len(decoded.answer) == 0,
+				"the parent's answer reached the client for a zone the route answers (%s)",
+				c.what,
+			)
 		}
 	}
 	free_all(context.temp_allocator)

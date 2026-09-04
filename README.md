@@ -387,7 +387,11 @@ A reply that says nothing about the name — SERVFAIL, REFUSED — counts as no
 answer here rather than as an answer to pass on, which is a departure from how
 every other rcode is handled: for a question about a *delegation*, only NOERROR
 and NXDOMAIN say anything, so an upstream with an ACL, or a CPE resolver that
-mangles every `DS` it meets, must not take an internal zone down with it. And if
+mangles every `DS` it meets, must not take an internal zone down with it. A
+NOERROR whose answer section carries something that is not a DS is read the same
+way: "no data" means nothing in the answer at all, and a resolver that hijacks
+NXDOMAIN answers this question with NOERROR and a synthesised address, which is
+the first case above with the rcode written over. And if
 the local server cannot be reached either, the answer is SERVFAIL rather than
 whatever the parent said: a signed "this name does not exist" over a zone that is
 served locally is the one answer worth withholding, since the client caches it
@@ -398,8 +402,9 @@ back the moment its authority does. A parent whose upstreams are all in their
 failure cooldown is not waited for at all; the question goes straight to the
 route.
 
-Where the parent said nothing — no reply, SERVFAIL, REFUSED, or its group already
-in that cooldown — the route's answer goes to the client and is not cached. It
+Where the parent said nothing — no reply, SERVFAIL, REFUSED, a NOERROR with the
+wrong thing in it, or its group already in that cooldown — the route's answer
+goes to the client and is not cached. It
 stood in for a fact nothing established, and keeping it would hold the very
 broken chain this carve-out exists to prevent over the zone for
 [`cache.negative_ttl`](#cache) after a single lost round trip. The next query

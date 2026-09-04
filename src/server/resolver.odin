@@ -1018,8 +1018,9 @@ resolve_query :: proc(
 	`parent_answers_apex_ds` is the test and `apex_ds_off_route` argues it. A
 	NODATA is `home.arpa.`'s answer from `arpa.`, it is RFC 8375 section 4 item
 	4.B's whole subject, and it is the only thing the parent can tell a
-	validating client that the route cannot. An NXDOMAIN, a `DS` RRset, an
-	undecodable reply and no reply at all are each the route's to answer instead
+	validating client that the route cannot. An NXDOMAIN, a `DS` RRset, a NOERROR
+	carrying something that is neither, an undecodable reply and no reply at all
+	are each the route's to answer instead
 	- a zone nothing public delegates, a signed zone whose internal view is
 	another view, and an outage out there that must not take the chain out from
 	under a zone that is answering perfectly well.
@@ -1448,8 +1449,9 @@ resolve_query :: proc(
 	`unproven_apex_ds` is the one answer on this path that is served and not
 	stored, and it is the routed apex `DS` above: the route answered in the
 	parent's place, and no statement about the delegation was ever got out of the
-	parent's group - no reply, a SERVFAIL or a REFUSED, a reply that would not
-	decode, or a group already parked when the question arrived.
+	parent's group - no reply, a SERVFAIL or a REFUSED, a NOERROR whose answer
+	section holds something that is not a DS, a reply that would not decode, or a
+	group already parked when the question arrived.
 
 	Storing it would memoise the outage into the failure the carve-out exists to
 	prevent. `home.arpa.` is the case: the router the route points at answers its

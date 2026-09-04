@@ -57,9 +57,22 @@ routes the same way: the table is built once at startup from a file that is
 never reloaded (SIGHUP reloads TLS certificates and nothing else). A future
 reload that could move a zone from one route to another would have to flush, or
 key on the route, or it would serve one upstream's answers on another's behalf.
-The apex `DS` carve-out is within that: what it splits is one name's types, and
-the type is in the key, so the parent's answer and the zone's own cannot be
-served for each other.
+The apex `DS` carve-out is the one question where that reading is not the whole
+story, and it is worth saying so rather than resting on "the type is in the key".
+The type is in the key, but the carve-out does not split by type: both the
+parent's proof and the route's answer are answers to the same `DS` at the same
+name, so both would be filed under the one entry. What keeps that sound is the
+narrowness of the choice between them. Which upstream answers is a function of
+what the parent's group said, so a name that reached its proof goes on reaching
+it; and wherever the parent established nothing - no reply, a rewritten rcode, a
+group already parked - `resolve_query` serves the route's answer and stores
+nothing, so the entry is never the stand-in for a fact nobody checked. What is
+left is a parent *group* whose members disagree about the zone - one that
+publishes the proof beside one that rewrites the rcode - where the entry can be
+the parent's proof on one query and the route's own NODATA on the next. That is
+the worst this carve-out can do to the cache, and it is the behaviour the zone
+had before the carve-out existed: an unsigned NODATA for the apex `DS`, served
+for the entry's lifetime.
 */
 Zone_Route :: struct {
 	// Canonical, lowercase, root-dotted, as `config.Zone_Route` left them.
@@ -173,7 +186,7 @@ carve-out was built to fetch: a NODATA, the parent saying the delegation exists
 and carries no DS. That is RFC 8375 section 4 item 4.B's whole subject, it is
 `home.arpa.`'s answer from `arpa.`, and it is the only thing the parent can tell
 a validating client that the route cannot. Every other reply goes back on the
-route - `parent_answers_apex_ds` is the test, and there are four ways to fail it:
+route - `parent_answers_apex_ds` is the test, and there are five ways to fail it:
 
   - NXDOMAIN. The parent zone has no such name, so nothing in the public tree
     delegates this zone: there is no proof of an insecure delegation to be had,
@@ -208,6 +221,15 @@ route - `parent_answers_apex_ds` is the test, and there are four ways to fail it
     delegation, and `parent_answers_apex_ds` sets out why this file reads those
     the same way `upstream.resolve_answerable` does rather than the way an
     ordinary client question is read.
+  - A NOERROR that is not a NODATA: the rcode says the name is there and the
+    answer section carries something other than a DS. An NXDOMAIN-hijacking
+    resolver answers exactly that for a name its parent zone does not delegate -
+    NOERROR with a synthesised address - which is the deployment the NXDOMAIN
+    case above is written around, met through an upstream that rewrites the
+    rcode. Read as the proof it is not, the route would never be asked and a
+    validating client would be handed an answer to a `DS` query that is neither
+    a DS nor a denial of one: a broken chain, which is this carve-out's own
+    failure arriving through the question it sends out.
 
 `home.arpa.` is the one deployment none of that touches, which is the point:
 `arpa.` delegates the zone and publishes the proof, so the answer is a NODATA,
@@ -237,10 +259,18 @@ Two things, read off the one reply, because `resolve_query` has two decisions to
 make about it and they are not the same decision.
 
 `proved` is whether this is the client's answer, so that the route is not asked
-in its place: NOERROR with no `DS` record in the answer, which is a NODATA - the
-name is there and the type is not. That is the reply this carve-out went to
-fetch, and `apex_ds_off_route` argues why every other one is the route's to
-answer.
+in its place: NOERROR with an empty answer section, which is a NODATA - the name
+is there and the type is not. That is the reply this carve-out went to fetch, and
+`apex_ds_off_route` argues why every other one is the route's to answer.
+
+An *empty* section rather than merely one with no `DS` in it, because a NODATA
+carries nothing in the answer at all - a denial's NSEC or NSEC3 travels in the
+authority section, and a positive answer's DS and its RRSIG are what the answer
+section holds when the delegation is signed. So NOERROR with anything else in it
+is neither: an NXDOMAIN-hijacking resolver's synthesised address is the one that
+actually arrives, and reading that as the proof would keep the question at a
+parent that never answered it. It is `settled` no more than a SERVFAIL is, the
+rcode having been rewritten by something that is not the parent zone.
 
 The NODATA is read from the answer section alone. Whether the NSEC or NSEC3
 beside it actually proves it is the client's question and not this server's - a
@@ -254,9 +284,10 @@ public delegates this zone") and so does a `DS` RRset ("it is delegated and
 signed out here"). Those are facts about the public tree, and the route's answer
 standing in for one of them is the answer for that zone until the public tree
 changes. Nothing else is: no reply at all, an rcode that is neither NOERROR nor
-NXDOMAIN, and a reply that would not decode are all this server failing to reach
-a statement rather than a statement, so the route's answer stands in for a fact
-nobody established. `resolve_query` serves that answer and declines to store it,
+NXDOMAIN, a NOERROR whose answer section holds something that is not a DS, and a
+reply that would not decode are all this server failing to reach a statement
+rather than a statement, so the route's answer stands in for a fact nobody
+established. `resolve_query` serves that answer and declines to store it,
 for the reason it gives at the store.
 
 SERVFAIL and REFUSED being no statement at all is worth setting down, because
@@ -306,6 +337,11 @@ parent_answers_apex_ds :: proc(
 		if rec.type == .DS {
 			return false, true
 		}
+	}
+	// A NODATA carries nothing here. Anything else under a NOERROR is a rcode
+	// somebody rewrote rather than the parent's answer to this question.
+	if len(msg.answer) != 0 {
+		return false, false
 	}
 	return true, true
 }
