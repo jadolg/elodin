@@ -974,78 +974,70 @@ resolve_query :: proc(
 	asked := route_group(s, q.name, q.type)
 	resp, winner, uerr := upstream.resolve(asked, forwarded, allocator)
 	/*
-	And back on the route when the parent's group establishes no delegation:
-	because it says there is no such zone, or because it did not answer at all.
+	And back on the route unless the parent answered the one thing the parent was
+	asked for: that this delegation carries no DS.
 
-	`apex_ds_off_route` argues the whole of it. In short: an NXDOMAIN for a
-	routed apex's `DS` says the public tree delegates nothing here, so there is
-	no proof to fetch, the route's authority is the only thing that can answer,
-	and passing the NXDOMAIN on would take a working insecure zone and hand the
-	client a signed proof that every name in it is gone.
+	`no_ds_answer` is the test and `apex_ds_off_route` argues it. A NODATA is
+	`home.arpa.`'s answer from `arpa.`, it is RFC 8375 section 4 item 4.B's whole
+	subject, and it is the only thing the parent can tell a validating client
+	that the route cannot. An NXDOMAIN, a `DS` RRset, an undecodable reply and no
+	reply at all are each the route's to answer instead - a zone nothing public
+	delegates, a signed zone whose internal view is another view, and an outage
+	out there that must not take the chain out from under a zone that is
+	answering perfectly well.
 
-	A parent's group that could not be reached at all reaches the same place by
-	a shorter road, and it is why this is not a test of the rcode alone. Before
-	the carve-out a routed zone answered every question about itself with the
-	public upstream uninvolved, which is most of why an operator routes one - so
-	letting the apex `DS` fail with that upstream would make one outage out
-	there break the chain for every name in an internal zone that is answering
-	perfectly well, which is the failure the carve-out exists to prevent wearing
-	a different hat. Asking the parent first costs nothing here: the route is
-	asked second, and only once the parent has produced nothing.
-
-	A reply that arrived and said SERVFAIL is deliberately not in that set. The
-	parent's group answered, and for the client's own question the rcode is the
-	answer, here as everywhere else on this path.
+	A reply that arrived saying SERVFAIL goes to the client as it stands. The
+	parent's group answered; the rcode is the answer, here as everywhere else on
+	this path.
 
 	Only when the two groups differ, as well. A route may list a zone and its
 	parent together, and then `route_group` has already sent this question to the
 	route's own group: asking it again puts the same question to the same servers
-	for the same answer, and the denial is the route's own rather than an outside
-	claim about it.
+	for the same answer, and what came back is the route's own word rather than
+	an outside claim about it.
 
 	`forwarded` is safe to send twice: `attach_cookie` builds each upstream's
 	copy in its own buffer, so nothing about the first exchange is left in this
 	one. The transaction ID is drawn again all the same, the second exchange
 	being a new one on the wire, and the client's own ID goes back on below.
 	*/
-	unbacked_denial := false
-	if apex_ds_off_route(s, q.name, q.type) {
-		denied := uerr == .None && dns.peek_rcode(resp) == .NX_Domain
-		if denied || uerr != .None {
-			if own := zone_route_group(s, q.name); own != asked {
-				dns.set_id_in_place(forwarded, dns.random_id())
-				again, second, aerr := upstream.resolve(own, forwarded, allocator)
-				switch {
-				case aerr == .None:
-					logx.debugf(
-						"query DS %s: the parent's group established no delegation (nxdomain=%v, error=%v), so the route was asked instead",
-						q.name,
-						denied,
-						uerr,
-					)
-					resp, winner, uerr = again, second, .None
-				case denied:
-					/*
-					The client gets the parent's NXDOMAIN, and the cache does not
-					keep it. See the store below.
-					*/
-					unbacked_denial = true
-					logx.debugf(
-						"query DS %s: the parent's group answered NXDOMAIN and the route did not answer (%v); not storing the denial",
-						q.name,
-						aerr,
-					)
-				case:
-					// Neither group produced anything. `uerr` still holds the
-					// parent's failure, which the error path below reads and
-					// answers from - there is no denial to serve or to store.
-					logx.debugf(
-						"query DS %s: neither the parent's group (%v) nor the route (%v) answered",
-						q.name,
-						uerr,
-						aerr,
-					)
-				}
+	unbacked_apex_ds := false
+	if apex_ds_off_route(s, q.name, q.type) && !(uerr == .None && no_ds_answer(resp, allocator)) {
+		if own := zone_route_group(s, q.name); own != asked {
+			dns.set_id_in_place(forwarded, dns.random_id())
+			again, second, aerr := upstream.resolve(own, forwarded, allocator)
+			switch {
+			case aerr == .None:
+				logx.debugf(
+					"query DS %s: the parent's group did not say the delegation carries no DS (error=%v, rcode=%v), so the route was asked instead",
+					q.name,
+					uerr,
+					dns.peek_rcode(resp) if uerr == .None else dns.Rcode.No_Error,
+				)
+				resp, winner, uerr = again, second, .None
+			case uerr == .None:
+				/*
+				The parent said something, just not the proof, and the route that
+				should have answered instead could not be reached. The client gets
+				what there is and the cache does not keep it - see the store below.
+				*/
+				unbacked_apex_ds = true
+				logx.debugf(
+					"query DS %s: the route did not answer (%v); serving the parent's %v without storing it",
+					q.name,
+					aerr,
+					dns.peek_rcode(resp),
+				)
+			case:
+				// Neither group produced anything. `uerr` still holds the
+				// parent's failure, which the error path below reads and
+				// answers from - there is nothing to serve or to store.
+				logx.debugf(
+					"query DS %s: neither the parent's group (%v) nor the route (%v) answered",
+					q.name,
+					uerr,
+					aerr,
+				)
 			}
 		}
 	}
@@ -1382,28 +1374,30 @@ resolve_query :: proc(
 	}
 
 	/*
-	`unbacked_denial` is the one answer on this path that is served and not
-	stored, and it is the apex `DS` above: the parent's group said the zone is
-	not delegated, and the route that would have spoken for it could not be
-	reached, so the denial goes to the client for want of anything better and
-	stops there.
+	`unbacked_apex_ds` is the one answer on this path that is served and not
+	stored, and it is the apex `DS` above: the parent's group said something
+	other than "this delegation carries no DS", and the route that should have
+	answered in its place could not be reached. What the parent said goes to the
+	client for want of anything better and stops there.
 
-	Storing it would pin the failure the carve-out exists to prevent. The
-	parent's NXDOMAIN is signed and its negative TTL is the parent's to choose -
-	an hour is ordinary - so one lost exchange with the internal authority would
-	hold a *signed* proof of non-existence over the routed zone's apex for that
-	long, with the authority answering perfectly well the whole time. Every
-	validating client below here then reads the zone as provably absent rather
-	than merely unsigned, and one implementing RFC 8020 reads it as proof
-	that every name under the apex is gone with it. The same reasoning as the
-	`Unreadable` verdict above: a transient cause must not be memoised into a
-	name that stays dark for `cache.max_ttl`.
+	Storing it would pin the failure the carve-out exists to prevent, from a
+	cause that has nothing to do with the zone. The parent's answer is signed and
+	its TTL is the parent's to choose - an hour is ordinary for either an
+	NXDOMAIN's negative TTL or a `DS` - so one lost exchange with the internal
+	authority would hold a signed proof of non-existence, or a chain requirement
+	the internal view cannot satisfy, over the routed apex for that long, with
+	the authority answering perfectly well the whole time. Every validating
+	client below here then reads the zone as provably absent rather than merely
+	unsigned, or as signed when it is not, and one implementing RFC 8020 reads an
+	NXDOMAIN as proof that every name under the apex is gone with it. The same
+	reasoning as the `Unreadable` verdict above: a transient cause must not be
+	memoised into a name that stays dark for `cache.max_ttl`.
 
 	Nothing else changes. The next query asks again, which is what happened
 	before any of this was memoised, and one that reaches the route gets the
 	route's answer and stores that.
 	*/
-	if s.cfg.cache.enabled && have_decoded && !unbacked_denial {
+	if s.cfg.cache.enabled && have_decoded && !unbacked_apex_ds {
 		cache.put(s.answers, key, resp, decoded, generation)
 	}
 

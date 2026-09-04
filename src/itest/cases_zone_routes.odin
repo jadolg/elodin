@@ -47,6 +47,44 @@ DEFAULT_DNSSEC :: `dnssec:
   enabled: true
 `
 
+/*
+A `DS` answer for `name`, as a parent that signs its delegation gives one.
+
+`Rdata_Raw` rather than a modelled DS: what the server reads is the record's
+type, not anything inside it, and the bytes are a well-formed DS RDATA all the
+same - key tag, algorithm 8, digest type 2, a SHA-256-sized digest - so a
+decoder walking the section finds a record it can measure rather than reject.
+
+On the heap rather than the temp allocator, as every other canned payload in the
+suite is: the mock holds this slice for the whole run, and `end_case` empties the
+temp arena under it long before the case that asks for it.
+*/
+@(private = "file")
+signed_delegation_reply :: proc(name: string) -> []u8 {
+	digest := make([]u8, 36)
+	digest[0], digest[1] = 0x30, 0x39
+	digest[2], digest[3] = 8, 2
+	answer := make([]dns.Record, 1, context.temp_allocator)
+	answer[0] = dns.Record {
+		name  = name,
+		type  = .DS,
+		class = .IN,
+		ttl   = 3600,
+		data  = dns.Rdata_Raw{data = digest},
+	}
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question{name = name, type = .DS, class = .IN}
+	msg := dns.Message{question = question, answer = answer}
+	msg.flags.qr = true
+	msg.flags.rd = true
+	msg.flags.ra = true
+	wire, _, err := dns.encode_message(msg, context.allocator)
+	if err != .None {
+		return nil
+	}
+	return wire
+}
+
 @(private = "file")
 routed_config :: proc(udp_port, public_port, internal_port: int, dnssec := DEFAULT_DNSSEC) -> string {
 	return fmt.tprintf(
@@ -209,6 +247,9 @@ run_zone_route_cases :: proc(r: ^Runner) {
 	is the case it is for.
 	*/
 	mock_rcode(public, "denied.example.", u16(dns.Type.DS), .NX_Domain)
+	// And the one it signs, for the case below it: a zone the public tree really
+	// does delegate, whose DS is not the "no data" the carve-out went to fetch.
+	mock_reply(public, "signed.example.", u16(dns.Type.DS), signed_delegation_reply("signed.example."))
 	if !mock_start(public) {
 		skip_case(r, "upstream.zones", "cannot start the public mock")
 		return
@@ -384,6 +425,68 @@ rebind: {{enabled: false}}
 			check(r, mock_total(internal) > 0, "the denied apex DS was not put back on the route")
 		} else {
 			skip_case(r, "upstream.zones: denied apex DS", "server did not start")
+		}
+	}
+	end_case(r)
+
+	start_case(r, "upstream.zones: an apex DS the parent signs goes back to the route too")
+	{
+		/*
+		The second way the parent's answer is not the one the carve-out went for:
+		a zone that really is delegated and signed in the public tree, routed to
+		an internal view of itself. That is split horizon, and the internal view
+		is very unlikely to be the signed one - so handing the client the public
+		DS makes it demand a DNSKEY the view has no matching key for, and bogus
+		is what it gets, where the same deployment resolved before the carve-out
+		existed.
+
+		`signed.example.` is answered with a DS RRset by the public mock and
+		routed to the internal one, and the assertion is that the internal mock
+		was asked and the client's answer carries no DS. The rule is one line in
+		`no_ds_answer`: only a NODATA keeps the question at the parent.
+		*/
+		signed_port := next_port(r)
+		config := fmt.tprintf(
+			`log:
+  level: info
+listeners:
+  udp: {{enabled: true, address: 127.0.0.1, port: %d}}
+  tcp: {{enabled: false}}
+upstream:
+  timeout: 2s
+  attempts: 1
+  servers:
+    - udp://127.0.0.1:%d
+  zones:
+    - domains: [signed.example]
+      servers:
+        - udp://127.0.0.1:%d
+cache: {{enabled: false}}
+blocking: {{enabled: false}}
+dnssec: {{enabled: false}}
+rebind: {{enabled: false}}
+`,
+			signed_port,
+			public_port,
+			internal_port,
+		)
+		signed, started := start_server(r, Server_Options{config = config, udp_port = signed_port})
+		if started {
+			defer stop_server(&signed)
+			mock_reset_counts(internal)
+			res := query_udp(signed_port, build_query("signed.example.", u16(dns.Type.DS)))
+			if check(r, res.ok, "no response") {
+				h, _ := parse_header(res.wire)
+				check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode for a signed routed apex")
+				check(
+					r,
+					!answer_has_type(res.wire, u16(dns.Type.DS)),
+					"the parent's DS reached the client for a zone the route answers",
+				)
+			}
+			check(r, mock_total(internal) > 0, "the signed apex DS was not put back on the route")
+		} else {
+			skip_case(r, "upstream.zones: signed apex DS", "server did not start")
 		}
 	}
 	end_case(r)

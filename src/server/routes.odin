@@ -1,5 +1,6 @@
 package server
 
+import "core:mem"
 import "elodin:dns"
 import "elodin:upstream"
 
@@ -104,17 +105,18 @@ Three things the carve-out deliberately is not:
     delegation inside a zone that exists nowhere but this network, and the
     answer to that one really is on the router.
   - It is not decided at load by whether the public tree delegates the zone,
-    because nothing at load can know that. It is decided by the answer: a
-    parent's group that establishes no delegation - an NXDOMAIN, or no reply at
-    all - leaves the route as the only thing that can answer, and
-    `resolve_query` then puts the question back on it. See
-    `apex_ds_off_route`, which is where that reading is argued.
+    because nothing at load can know that. It is decided by the answer, and by
+    the narrowest reading of it: the parent's reply is passed to the client only
+    when it is the one this carve-out went to fetch - a NODATA, the statement
+    that the delegation carries no DS. Anything else and `resolve_query` puts
+    the question back on the route. See `apex_ds_off_route`, where that reading
+    is argued case by case.
 
 What it does not touch is whether the answer is validated. `served_locally` still
-covers the routed zone's apex, so the parent's signed DS is passed to the client
-with the upstream's signatures intact and without the AD bit, for the client to
-check against its own anchor - which is exactly what `LOCALLY_SERVED_ZONES` does
-with the same query for `home.arpa.` today, and the client asking it is the only
+covers the routed zone's apex, so the parent's proof is passed to the client with
+the upstream's signatures intact and without the AD bit, for the client to check
+against its own anchor - which is exactly what `LOCALLY_SERVED_ZONES` does with
+the same query for `home.arpa.` today, and the client asking it is the only
 party that has a use for the proof.
 
 The privacy cost is one name and it is worth naming: a route otherwise means the
@@ -165,41 +167,90 @@ zone_route_group :: proc(s: ^Server, name: string) -> ^upstream.Group {
 /*
 Whether this is the apex `DS` that `route_group` sends to the parent's group.
 
-`resolve_query` asks because for this one question, and no other, an NXDOMAIN
-from that group is not an answer to pass on. It says the parent zone has no such
-name in it - that nothing in the public tree delegates this zone - and three
-things follow. There is no signed proof of an insecure delegation to be had,
-because there is no delegation. The route's own authority is the only thing that
-can say anything about the name at all. And handing the client the NXDOMAIN
-instead is actively worse than what it replaced: an unsigned NODATA from the
-route leaves a lenient validator free to treat the zone as unsigned and resolve
-it (systemd-resolved's default `DNSSEC=allow-downgrade` does exactly that),
-while a signed proof of non-existence takes that freedom away - and a validator
-that implements RFC 8020, as unbound's `harden-below-nxdomain` does by default,
-reads it as proof that every name under the apex is gone too. That is a routed
-`corp.example.com` under a signed `example.com` going dark, which is the failure
-this carve-out exists to prevent, met coming the other way.
+`resolve_query` asks because for this one question, and no other, the parent's
+answer has to be read before it is passed on. Exactly one answer is the one this
+carve-out was built to fetch: a NODATA, the parent saying the delegation exists
+and carries no DS. That is RFC 8375 section 4 item 4.B's whole subject, it is
+`home.arpa.`'s answer from `arpa.`, and it is the only thing the parent can tell
+a validating client that the route cannot. Every other reply goes back on the
+route - `no_ds_answer` is the test, and there are three ways to fail it:
 
-So the question goes back on the route, and the deployment keeps exactly the
-behaviour it had before the carve-out existed. `home.arpa.` is untouched by it:
-`arpa.` does delegate the zone, so the answer there is a NODATA carrying the
-signed proof, never an NXDOMAIN, and the fallback never fires.
+  - NXDOMAIN. The parent zone has no such name, so nothing in the public tree
+    delegates this zone: there is no proof of an insecure delegation to be had,
+    and the route's authority is the only thing that can say anything about the
+    name at all. Passing it on is worse than the answer it replaced, too. An
+    unsigned NODATA from the route leaves a lenient validator free to treat the
+    zone as unsigned and resolve it - systemd-resolved's default
+    `DNSSEC=allow-downgrade` does exactly that - while a signed proof of
+    non-existence takes that freedom away, and a validator implementing RFC
+    8020, as unbound's `harden-below-nxdomain` does by default, reads it as
+    proof that every name under the apex is gone with it. A routed
+    `corp.example.com` under a signed `example.com` going dark is the failure
+    this carve-out exists to prevent, met coming the other way.
+  - A `DS` RRset. The zone is delegated and signed in the public tree, and the
+    route points at a view of it that is very unlikely to be the signed one -
+    split horizon, which `rebind.odin` names as the reason its guard defaults
+    off. Handing the client the public DS makes it demand a `DNSKEY` the
+    internal view has no matching key for, and Bogus is what it gets, where
+    before the carve-out the same deployment resolved. An operator who really
+    is mirroring the signed zone loses the secure path and keeps the insecure
+    one, which is the trade this whole file makes for a routed zone anyway
+    (point 3 above), and `trust_anchors` is the escape hatch there as here.
+  - No reply at all. A routed zone used to answer for itself with the public
+    upstream uninvolved, which on a network with an internal authority and a
+    poor path out is most of the point; an outage out there must not take the
+    chain out from under every name in a zone that is answering perfectly well.
+    A reply that arrived saying SERVFAIL is not this case - one server declining
+    to say is still the parent's group having spoken, and the rcode is the
+    client's answer as it is everywhere else on this path.
 
-A parent's group that did not answer at all is read the same way, for the reason
-`resolve_query` sets out beside the fallback: a routed zone used to answer for
-itself with the public upstream uninvolved, and an outage out there must not
-take the chain out from under every name in an internal zone that is answering.
-A reply that arrived saying SERVFAIL is not read that way - one server declining
-to say is still the parent's group having spoken.
+`home.arpa.` is the one deployment none of that touches, which is the point:
+`arpa.` delegates the zone and publishes the proof, so the answer is a NODATA,
+it passes, and the client gets what issue #227 was about.
 
-Deciding it on the answer rather than at load is what issue #227 left open as
-"cannot be known at load". It cannot - but it can be known from the reply, at
-the cost of one extra query for a routed apex that has no public parent, and
+Deciding it on the answer rather than at load is what the issue left open as
+"cannot be known at load". It cannot - but it can be read off the reply, at the
+cost of one extra query for a routed apex whose parent says anything else, and
 only for `DS`.
 */
 @(private)
 apex_ds_off_route :: proc(s: ^Server, name: string, type: dns.Type) -> bool {
 	return type == .DS && is_route_apex(s, name)
+}
+
+/*
+Whether `resp` is the parent saying this delegation carries no DS.
+
+NOERROR with no `DS` record in the answer, which is a NODATA: the name is there
+and the type is not. That is the one reply `resolve_query` passes to the client
+for a routed apex, and `apex_ds_off_route` argues why each of the others is the
+route's to answer instead.
+
+Read from the answer section alone. Whether the NSEC or NSEC3 beside it actually
+proves the NODATA is the client's question, not this server's - a routed zone is
+served insecure here either way, so the records travel with their signatures
+intact and the client checks them against its own anchor. What this decides is
+only which upstream the question belongs to.
+
+A reply that cannot be decoded is not a proof of anything, so it fails the test
+and the route is asked. `resolve_query` has the same reading of an undecodable
+answer further down, where it refuses to cache one.
+*/
+@(private)
+no_ds_answer :: proc(resp: []u8, allocator: mem.Allocator) -> bool {
+	if dns.peek_rcode(resp) != .No_Error {
+		return false
+	}
+	msg, err := dns.decode_through_answer(resp, allocator)
+	if err != .None {
+		return false
+	}
+	for rec in msg.answer {
+		if rec.type == .DS {
+			return false
+		}
+	}
+	return true
 }
 
 /*

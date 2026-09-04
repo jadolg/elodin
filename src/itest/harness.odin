@@ -646,6 +646,21 @@ answer_addresses :: proc(wire: []u8, allocator := context.temp_allocator) -> []s
 	return out[:]
 }
 
+// Whether the answer section carries a record of this type, for assertions about
+// which upstream's answer came back rather than about what is in it.
+answer_has_type :: proc(wire: []u8, qtype: u16, allocator := context.temp_allocator) -> bool {
+	msg, err := dns.decode_message(wire, allocator)
+	if err != .None {
+		return false
+	}
+	for rec in msg.answer {
+		if u16(rec.type) == qtype {
+			return true
+		}
+	}
+	return false
+}
+
 // The smallest TTL in the answer section, for cache assertions.
 min_answer_ttl :: proc(wire: []u8) -> (ttl: u32, ok: bool) {
 	msg, err := dns.decode_message(wire, context.temp_allocator)

@@ -201,6 +201,42 @@ route_reply_nodata :: proc(name: string, type: dns.Type, rcode := dns.Rcode.No_E
 	return wire
 }
 
+/*
+A `DS` answer, which is the reply a parent that does signs its delegation gives.
+
+`Rdata_Raw` rather than a modelled DS: what the carve-out reads is the record's
+type and nothing inside it, and a digest this test invented would be no more
+checkable than an opaque one. The bytes are a well-formed DS RDATA all the same -
+key tag, algorithm 8, digest type 2, and a SHA-256-sized digest - so a decoder
+walking the answer section finds a record it can measure rather than one it has
+to reject.
+*/
+@(private = "file")
+route_reply_ds :: proc(name: string) -> []u8 {
+	digest := make([]u8, 36, context.temp_allocator)
+	digest[0], digest[1] = 0x30, 0x39
+	digest[2], digest[3] = 8, 2
+	answer := make([]dns.Record, 1, context.temp_allocator)
+	answer[0] = dns.Record {
+		name  = name,
+		type  = .DS,
+		class = .IN,
+		ttl   = 3600,
+		data  = dns.Rdata_Raw{data = digest},
+	}
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question{name = name, type = .DS, class = .IN}
+	msg := dns.Message{question = question, answer = answer}
+	msg.flags.qr = true
+	msg.flags.rd = true
+	msg.flags.ra = true
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	if err != .None {
+		return nil
+	}
+	return wire
+}
+
 // One UDP upstream on loopback, as `upstream.servers` would name it.
 @(private = "file")
 mock_group :: proc(t: ^testing.T, cfg: config.Upstream_Config, port: int) -> ^upstream.Group {
@@ -575,36 +611,47 @@ test_a_client_ds_query_at_a_routed_apex_leaves_the_route :: proc(t: ^testing.T) 
 }
 
 /*
-An apex `DS` the parent's group calls nonexistent goes back on the route.
+The parent keeps the question only by proving the delegation carries no DS.
 
-The other half of the carve-out above, and the deployment it is there for is the
-commonest internal zone there is: `corp.example.com` on a domain controller,
-under an `example.com` that is public and signed and delegates no `corp`. Asked
-for `corp.example.com. DS`, the public upstream does not answer "insecure
-delegation" - it answers, with a signature over it, that the name does not exist
-at all. Passing that to the client is worse than the answer it replaced: an
-unsigned NODATA from the domain controller leaves a lenient validator free to
-call the zone unsigned and resolve it, while a signed proof of non-existence
-takes that away, and a validator implementing RFC 8020 reads it as proof that
-every name under the apex is gone with it.
+The other half of the carve-out above. Sending the apex `DS` to the parent is
+worth doing for one answer - a NODATA, the proof that the delegation is insecure,
+which is `home.arpa.`'s answer from `arpa.` and the whole of what RFC 8375
+section 4 item 4.B asks to be fetched. Every other answer is the route's to give,
+and each of the two here is a deployment that breaks if it is not:
 
-So an NXDOMAIN from the parent's group is not passed on, it is a signal: nothing
-public delegates this zone, and the route is the only thing that can answer.
-`apex_ds_off_route` argues it in full.
+  - *No such name.* An internal `corp.example.com` under a public, signed
+    `example.com` that delegates no `corp`. The parent answers, with a signature
+    over it, that the name does not exist. Passing that on is worse than the
+    answer it replaced: an unsigned NODATA from the domain controller leaves a
+    lenient validator free to call the zone unsigned and resolve it, while a
+    signed proof of non-existence takes that away - and a validator implementing
+    RFC 8020 reads it as proof that every name under the apex is gone with it.
+  - *A `DS` RRset.* Split horizon over a zone that really is delegated and signed
+    in public, routed to an internal view that is not the signed one. Handing the
+    client the public DS makes it demand a `DNSKEY` the internal view has no
+    matching key for, and Bogus is what it gets - where the same deployment
+    resolved before the carve-out existed.
 
-Both cases run against the same fixture and differ only in what the parent's
-group says, which is the point - what the route does has to follow from the
-parent's answer and from nothing else. The NODATA case is `home.arpa.`'s: a real
-insecure delegation, where the proof is exactly what the client came for and the
-route must not be asked at all.
+All three cases run against one fixture and differ only in what the parent says,
+which is the point: what the route does has to follow from the parent's answer
+and from nothing else. `apex_ds_off_route` argues each of them in full.
 */
 @(test)
-test_an_apex_ds_the_parent_denies_falls_back_to_the_route :: proc(t: ^testing.T) {
+test_an_apex_ds_goes_back_on_the_route_unless_the_parent_proves_no_ds :: proc(t: ^testing.T) {
 	Case :: struct {
+		// What the parent's group says about `corp.example. DS`.
+		what:     string,
 		parent:   dns.Rcode,
+		// A `DS` RRset in the answer rather than a NODATA, which is a parent
+		// that delegates the zone and signs the delegation.
+		signed:   bool,
 		to_route: bool,
 	}
-	cases := []Case{{.NX_Domain, true}, {.No_Error, false}}
+	cases := []Case {
+		{"no such name", .NX_Domain, false, true},
+		{"a DS RRset", .No_Error, true, true},
+		{"no DS at the delegation", .No_Error, false, false},
+	}
 
 	for c in cases {
 		def_socket, derr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
@@ -637,7 +684,7 @@ test_an_apex_ds_the_parent_denies_falls_back_to_the_route :: proc(t: ^testing.T)
 
 		parent := Route_Mock {
 			socket = def_socket,
-			reply  = route_reply_nodata("corp.example.", .DS, c.parent),
+			reply  = route_reply_ds("corp.example.") if c.signed else route_reply_nodata("corp.example.", .DS, c.parent),
 			want   = "corp.example.",
 		}
 		authority := Route_Mock {
@@ -671,15 +718,15 @@ test_an_apex_ds_the_parent_denies_falls_back_to_the_route :: proc(t: ^testing.T)
 			thread.destroy(route_thread)
 		}
 
-		if !testing.expectf(t, ok, "nothing came back at all for a parent that said %v", c.parent) {
+		if !testing.expectf(t, ok, "nothing came back at all for a parent that said %s", c.what) {
 			return
 		}
-		testing.expectf(t, parent.asked, "the parent's group was not asked at all (%v)", c.parent)
+		testing.expectf(t, parent.asked, "the parent's group was not asked at all (%s)", c.what)
 		testing.expectf(
 			t,
 			authority.asked == c.to_route,
-			"with the parent answering %v the route was %sasked",
-			c.parent,
+			"with the parent answering %s the route was %sasked",
+			c.what,
 			"not " if c.to_route else "",
 		)
 		if !c.to_route {
@@ -690,12 +737,23 @@ test_an_apex_ds_the_parent_denies_falls_back_to_the_route :: proc(t: ^testing.T)
 			)
 		}
 
-		// What the client is handed either way: the answer of whichever upstream
-		// was asked last, and never the parent's NXDOMAIN once the route has
-		// spoken for the zone.
+		// What the client is handed: the answer of whichever upstream was asked
+		// last, so never the parent's NXDOMAIN once the route has spoken for the
+		// zone - and never the parent's DS either, which is the half of this a
+		// rcode assertion alone would miss.
 		decoded, derr2 := dns.decode_message(out, context.temp_allocator)
 		testing.expect_value(t, derr2, dns.Decode_Error.None)
 		testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
+		if c.to_route {
+			for rec in decoded.answer {
+				testing.expectf(
+					t,
+					rec.type != .DS,
+					"the parent's DS reached the client for a zone the route answers (%s)",
+					c.what,
+				)
+			}
+		}
 	}
 	free_all(context.temp_allocator)
 }

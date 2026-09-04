@@ -360,23 +360,35 @@ That one query is also the only part of a routed zone the public upstream hears,
 and it names no host: the zone's own name, which its parent already publishes if
 the delegation exists.
 
-If the parent answers NXDOMAIN, the question goes back on the route. That answer
-means nothing in the public tree delegates the zone — the ordinary case being an
-internal `corp.example.com` under a public, signed `example.com` — so there is no
-proof to fetch and the local authority is the only thing that can answer at all.
-Passing the NXDOMAIN on would be worse than the answer it replaced: an unsigned
-"no data" from the local server lets a lenient validator treat the zone as
-unsigned and resolve it, while a *signed* proof of non-existence takes that away,
-and a validator implementing RFC 8020 reads it as proof that every name under the
-apex is gone too. `home.arpa` is unaffected — `arpa` does delegate it, so the
-answer there is the insecure-delegation proof the client came for.
+The parent keeps that question only if it answers the thing it was asked for:
+"no data", meaning the delegation exists and carries no DS. That is `home.arpa`'s
+answer from `arpa`, and it is the only thing the parent can tell a validating
+client that the local authority cannot. Anything else goes back on the route:
 
-The question also goes back on the route when the parent's group does not answer
-at all, so a routed zone keeps standing on its own: `upstream.servers` being
-down, or unreachable from the network the resolver sits on, does not take the
-chain out from under a zone whose own authority is answering. A reply that
-arrives saying SERVFAIL is passed on as any other rcode is — one server
-declining to say is still the parent's group having spoken.
+- **NXDOMAIN** — nothing in the public tree delegates the zone, the ordinary case
+  being an internal `corp.example.com` under a public, signed `example.com`. There
+  is no proof to fetch, and passing the NXDOMAIN on would be worse than the answer
+  it replaced: an unsigned "no data" from the local server lets a lenient validator
+  treat the zone as unsigned and resolve it, while a *signed* proof of
+  non-existence takes that away — and a validator implementing RFC 8020 reads it as
+  proof that every name under the apex is gone too.
+- **A DS record** — the zone is delegated and signed in public and the route points
+  at another view of it, which is split horizon. Handing the client the public DS
+  makes it demand a `DNSKEY` the internal view has no matching key for, and it gets
+  bogus instead of an answer. If you really are routing to a mirror of the signed
+  zone, it is served insecure like any other routed zone; a
+  [`trust_anchors`](#dnssec) entry over it is how you ask for it to be validated.
+- **No answer at all** — a routed zone keeps standing on its own, so
+  `upstream.servers` being down, or unreachable from the network the resolver sits
+  on, does not take the chain out from under a zone whose own authority is
+  answering.
+
+A reply that arrives saying SERVFAIL is passed on as any other rcode is — one
+server declining to say is still the parent's group having spoken. And when the
+parent says one of those things but the route cannot be reached to answer in its
+place, the client gets what the parent said and the cache does not keep it: one
+lost exchange with a local server must not pin a signed denial over the zone for
+the parent's whole TTL.
 
 The answer cache is keyed on the question rather than on which upstream produced
 it, which holds because the routing table is built once at startup — restart
