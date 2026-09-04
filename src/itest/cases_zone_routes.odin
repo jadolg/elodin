@@ -47,6 +47,47 @@ DEFAULT_DNSSEC :: `dnssec:
   enabled: true
 `
 
+/*
+A `DS` answer for `name`, as a parent that signs its delegation gives one.
+
+`Rdata_Raw` rather than a modelled DS: what the server reads is the record's
+type, not anything inside it, and the bytes are a well-formed DS RDATA all the
+same - key tag, algorithm 8, digest type 2, a SHA-256-sized digest - so a
+decoder walking the section finds a record it can measure rather than reject.
+
+The wire goes on the heap rather than into the temp allocator, as every other
+canned payload in the suite does: the mock holds that slice for the whole run,
+and `end_case` empties the temp arena under it long before the case that asks
+for it. The records it is built from are another matter - `encode_message` copies
+the RDATA into the wire, so nothing here outlives the call and the temp arena is
+where it belongs.
+*/
+@(private = "file")
+signed_delegation_reply :: proc(name: string) -> []u8 {
+	digest := make([]u8, 36, context.temp_allocator)
+	digest[0], digest[1] = 0x30, 0x39
+	digest[2], digest[3] = 8, 2
+	answer := make([]dns.Record, 1, context.temp_allocator)
+	answer[0] = dns.Record {
+		name  = name,
+		type  = .DS,
+		class = .IN,
+		ttl   = 3600,
+		data  = dns.Rdata_Raw{data = digest},
+	}
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question{name = name, type = .DS, class = .IN}
+	msg := dns.Message{question = question, answer = answer}
+	msg.flags.qr = true
+	msg.flags.rd = true
+	msg.flags.ra = true
+	wire, _, err := dns.encode_message(msg, context.allocator)
+	if err != .None {
+		return nil
+	}
+	return wire
+}
+
 @(private = "file")
 routed_config :: proc(udp_port, public_port, internal_port: int, dnssec := DEFAULT_DNSSEC) -> string {
 	return fmt.tprintf(
@@ -197,6 +238,21 @@ run_zone_route_cases :: proc(r: ^Runner) {
 	public_port := next_port(r)
 	public := mock_make("public", public_port)
 	mock_synth_all(public, PUBLIC)
+	/*
+	The one question this mock denies, scripted here rather than in the case that
+	needs it: `match_rule` walks `m.rules` from the serving threads without the
+	mutex, so appending a rule to a mock that is already running races with them -
+	and the append reallocates the moment the rules outgrow their capacity, which
+	turns the race into a read of freed memory. Every other rule in the suite is
+	written before `mock_start` for the same reason.
+
+	Read with "an apex DS the parent denies goes back to the route" below, which
+	is the case it is for.
+	*/
+	mock_rcode(public, "denied.example.", u16(dns.Type.DS), .NX_Domain)
+	// And the one it signs, for the case below it: a zone the public tree really
+	// does delegate, whose DS is not the "no data" the carve-out went to fetch.
+	mock_reply(public, "signed.example.", u16(dns.Type.DS), signed_delegation_reply("signed.example."))
 	if !mock_start(public) {
 		skip_case(r, "upstream.zones", "cannot start the public mock")
 		return
@@ -269,6 +325,173 @@ run_zone_route_cases :: proc(r: ^Runner) {
 		}
 		u, t, s := mock_counts(public)
 		check(r, u + t + s == 0, "the routed apex leaked to the public upstream")
+	}
+	end_case(r)
+
+	start_case(r, "upstream.zones: the apex DS does not follow the route")
+	{
+		/*
+		The one exception to the case above, and issue #227.
+
+		A validating client below this server walks down from `example.` and
+		asks `corp.example. DS` for itself. The domain controller the route
+		points at is authoritative for the zone and answers that out of its own
+		data - an unsigned "no data", no NSEC - while the signed proof about the
+		delegation lives in the parent and nowhere else. The client reads that as
+		a chain broken rather than provably absent, which is SERVFAIL for every
+		name in the zone: the failure RFC 8375 section 4 item 4.B carves this
+		query out of the same MUST NOT to prevent, and the one the chain lookups
+		elodin makes on its own account already avoid by staying on the default
+		group.
+
+		Asserted on which mock was asked rather than on the answer, since what is
+		under test is where the question went. Both directions, because a
+		carve-out that sent it to both upstreams would keep the DS working and go
+		on telling the domain controller nothing it did not know, while a
+		selector that had simply stopped matching the zone would pass the
+		public-side half alone.
+		*/
+		mock_reset_counts(public)
+		mock_reset_counts(internal)
+		res := query_udp(udp_port, build_query("corp.example.", u16(dns.Type.DS)))
+		if check(r, res.ok, "no response") {
+			h, _ := parse_header(res.wire)
+			check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode for the routed apex DS")
+		}
+		check(r, mock_total(public) > 0, "the apex DS never reached the upstream that can answer it")
+		check(r, mock_total(internal) == 0, "the apex DS was sent to the zone's own authority")
+	}
+	end_case(r)
+
+	start_case(r, "upstream.zones: an apex DS the parent denies goes back to the route")
+	{
+		/*
+		The other side of the carve-out above, on the deployment it exists for:
+		an internal zone under a public parent that delegates nothing to it -
+		`corp.example.com` on a domain controller, `example.com` signed and
+		public. Asked for that zone's `DS`, the public upstream does not answer
+		"insecure delegation"; it answers, signed, that the name does not exist.
+
+		Handing that to the client is worse than the answer it replaced. An
+		unsigned NODATA from the domain controller leaves a lenient validator
+		free to treat the zone as unsigned and resolve it, where a signed proof
+		of non-existence takes that freedom away - and a validator implementing
+		RFC 8020 reads it as proof that every name under the apex is gone too.
+		So an NXDOMAIN from the parent's group is read as "nothing public
+		delegates this zone" and the question goes back on the route, which is
+		the only thing that can answer for it at all.
+
+		A zone of its own and a server of its own, because the public mock
+		answers this one question NXDOMAIN and the case above needs it answering
+		normally. The control for this case is that one: there the parent replies
+		NOERROR and the route is never asked.
+
+		The rule that denies `denied.example. DS` is scripted where the mock is
+		built, above, rather than here - a rule appended to a running mock races
+		with the threads reading them.
+		*/
+		denied_port := next_port(r)
+		config := fmt.tprintf(
+			`log:
+  level: info
+listeners:
+  udp: {{enabled: true, address: 127.0.0.1, port: %d}}
+  tcp: {{enabled: false}}
+upstream:
+  timeout: 2s
+  attempts: 1
+  servers:
+    - udp://127.0.0.1:%d
+  zones:
+    - domains: [denied.example]
+      servers:
+        - udp://127.0.0.1:%d
+cache: {{enabled: false}}
+blocking: {{enabled: false}}
+dnssec: {{enabled: false}}
+rebind: {{enabled: false}}
+`,
+			denied_port,
+			public_port,
+			internal_port,
+		)
+		denied, started := start_server(r, Server_Options{config = config, udp_port = denied_port})
+		if started {
+			defer stop_server(&denied)
+			mock_reset_counts(internal)
+			res := query_udp(denied_port, build_query("denied.example.", u16(dns.Type.DS)))
+			if check(r, res.ok, "no response") {
+				h, _ := parse_header(res.wire)
+				// The route's answer, not the parent's NXDOMAIN.
+				check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode after the parent denied the zone")
+			}
+			check(r, mock_total(internal) > 0, "the denied apex DS was not put back on the route")
+		} else {
+			skip_case(r, "upstream.zones: denied apex DS", "server did not start")
+		}
+	}
+	end_case(r)
+
+	start_case(r, "upstream.zones: an apex DS the parent signs goes back to the route too")
+	{
+		/*
+		The second way the parent's answer is not the one the carve-out went for:
+		a zone that really is delegated and signed in the public tree, routed to
+		an internal view of itself. That is split horizon, and the internal view
+		is very unlikely to be the signed one - so handing the client the public
+		DS makes it demand a DNSKEY the view has no matching key for, and bogus
+		is what it gets, where the same deployment resolved before the carve-out
+		existed.
+
+		`signed.example.` is answered with a DS RRset by the public mock and
+		routed to the internal one, and the assertion is that the internal mock
+		was asked and the client's answer carries no DS. The rule is one line in
+		`parent_answers_apex_ds`: of the statements a parent can make about the
+		delegation, only a NODATA keeps the question there.
+		*/
+		signed_port := next_port(r)
+		config := fmt.tprintf(
+			`log:
+  level: info
+listeners:
+  udp: {{enabled: true, address: 127.0.0.1, port: %d}}
+  tcp: {{enabled: false}}
+upstream:
+  timeout: 2s
+  attempts: 1
+  servers:
+    - udp://127.0.0.1:%d
+  zones:
+    - domains: [signed.example]
+      servers:
+        - udp://127.0.0.1:%d
+cache: {{enabled: false}}
+blocking: {{enabled: false}}
+dnssec: {{enabled: false}}
+rebind: {{enabled: false}}
+`,
+			signed_port,
+			public_port,
+			internal_port,
+		)
+		signed, started := start_server(r, Server_Options{config = config, udp_port = signed_port})
+		if started {
+			defer stop_server(&signed)
+			mock_reset_counts(internal)
+			res := query_udp(signed_port, build_query("signed.example.", u16(dns.Type.DS)))
+			if check(r, res.ok, "no response") {
+				h, _ := parse_header(res.wire)
+				check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode for a signed routed apex")
+				check(
+					r,
+					!answer_has_type(res.wire, u16(dns.Type.DS)),
+					"the parent's DS reached the client for a zone the route answers",
+				)
+			}
+			check(r, mock_total(internal) > 0, "the signed apex DS was not put back on the route")
+		} else {
+			skip_case(r, "upstream.zones: signed apex DS", "server did not start")
+		}
 	}
 	end_case(r)
 

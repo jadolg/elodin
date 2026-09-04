@@ -966,8 +966,195 @@ resolve_query :: proc(
 	does not. The client's question is the only thing that follows a route: the
 	chain lookups the validator makes go to the default group whatever the name,
 	which `validator_query` explains.
+
+	The type goes with the name for one question the client asks that does not
+	follow the route either - a `DS` at the route's own apex, which only the
+	zone's parent can prove and which `route_group` sends there.
 	*/
-	resp, winner, uerr := upstream.resolve(route_group(s, q.name), forwarded, allocator)
+	asked := route_group(s, q.name, q.type)
+	/*
+	And the zone's own group beside it, which for that one question is not where
+	the question just went.
+
+	Both read once. `apex_ds_off_route` and `zone_route_group` each walk the whole
+	route table, the skip below and the fallback under it both want the pair, and
+	the answers cannot change between them - the table is built at startup and
+	never reloaded, which is the same fact the cache key rests on.
+
+	`own` is only asked for when the carve-out fired: for every other question
+	`route_group` has already returned the zone's own group, so the two are the
+	same group and `own != asked` is false wherever it is tested below.
+	*/
+	apex_ds := apex_ds_off_route(s, q.name, q.type)
+	own := zone_route_group(s, q.name) if apex_ds else asked
+	/*
+	Unless that group is parked, in which case the apex `DS` skips it.
+
+	`group_reachable` argues it: a group whose every upstream sits in its failure
+	cooldown still costs `attempts` rounds over every server before returning, so
+	with the default five-second timeout an upstream that has gone away is ten
+	seconds of waiting before the route is asked in its place. A validating stub
+	gives up in two to five, so the deployment the carve-out protects - an
+	internal authority behind a poor path out - would see the zone fail anyway,
+	having waited on an upstream this server already knew was down. The route is
+	where the question lands once the wait is over; this is only not waiting.
+
+	The parent is then not asked at all, so nothing established what the public
+	tree says about this delegation and the route's answer stands in for a fact
+	nobody checked. `unproven_apex_ds` carries that down to the store, which is
+	where it matters; the cooldown is ten seconds and a cache entry is minutes.
+
+	Only when the route can actually answer in its place, which is the whole
+	argument for skipping. A route group in its own cooldown has nothing to offer
+	the question, and `resolve_sequential` gives a parked server one honest try in
+	its second round - so skipping a parked parent for a parked route throws away
+	the parent's own second-round attempt, which is the one that would have
+	fetched the proof if the path out had come back inside the ten seconds, and
+	guarantees the SERVFAIL it was trying to avert. With both parked the wait is
+	spent either way; this only chooses not to spend it on a group whose answer is
+	already covered.
+	*/
+	unproven_apex_ds := false
+	if apex_ds && own != asked && !group_reachable(asked) && group_reachable(own) {
+		logx.debugf("query DS %s: the parent's group is parked, asking the route instead", q.name)
+		asked = own
+		unproven_apex_ds = true
+	}
+	resp: []u8
+	winner: ^upstream.Upstream
+	uerr: upstream.Error
+	if apex_ds && own != asked {
+		/*
+		The parent's group is asked the way `validator_query` asks the lookups
+		this server makes on its own account, and for the reason the reading
+		below gives: for a question about a delegation only NOERROR and NXDOMAIN
+		say anything, so a member that hands back SERVFAIL or REFUSED has not
+		answered and the group's other members are asked before the route is.
+
+		`resolve` alone left a group whose members disagree about the zone - one
+		publishing the proof beside a CPE resolver that mangles every `DS` it
+		meets - answering from whichever one it happened to reach: the parent's
+		proof on one query and the route's own unsigned NODATA on the next, which
+		is the residual cache flap `routes.odin` names as the worst this carve-out
+		can do. An answerable reply returns from the first exchange and none of
+		the sweep runs, so `home.arpa.`'s NODATA costs exactly what it did.
+
+		The route's own exchange below stays on `resolve`: whatever it says is
+		the client's answer, rcode and all, which is the ordinary reading of a
+		client's question and the one this carve-out departs from only for the
+		parent.
+		*/
+		resp, winner, uerr = upstream.resolve_answerable(asked, forwarded, allocator)
+	} else {
+		resp, winner, uerr = upstream.resolve(asked, forwarded, allocator)
+	}
+	/*
+	And back on the route unless the parent answered the one thing the parent was
+	asked for: that this delegation carries no DS.
+
+	`parent_answers_apex_ds` is the test and `apex_ds_off_route` argues it. A
+	NODATA is `home.arpa.`'s answer from `arpa.`, it is RFC 8375 section 4 item
+	4.B's whole subject, and it is the only thing the parent can tell a
+	validating client that the route cannot. An NXDOMAIN, a `DS` RRset, a NOERROR
+	carrying something that is neither, an undecodable reply and no reply at all
+	are each the route's to answer instead - a zone nothing public delegates, a
+	signed zone whose internal view is another view, and an outage out there that
+	must not take the chain out from under a zone that is answering perfectly
+	well.
+
+	A reply that says nothing about the name - SERVFAIL, REFUSED - is read the
+	same way as no reply at all, which is where this parts company with how an
+	ordinary client question is answered. `parent_answers_apex_ds` sets out why:
+	the rcode of a question about a delegation says nothing about the delegation
+	unless it is NOERROR or NXDOMAIN, so an upstream's ACL must not take an
+	internal zone down with it. The parent's rcode is not passed on at all: where
+	the route cannot be reached either, the query is a SERVFAIL - or an expired
+	entry, where `serve_stale` kept one - rather than whatever the parent said,
+	which is argued beside the second exchange below.
+
+	Only when the two groups differ, as well. A route may list a zone and its
+	parent together, and then `route_group` has already sent this question to the
+	route's own group: asking it again puts the same question to the same servers
+	for the same answer, and what came back is the route's own word rather than
+	an outside claim about it. Pointer equality, so what it catches is one entry
+	covering both - two entries naming the same servers are two `Group` values
+	and this does not see through them, which costs that operator one wasted
+	exchange and nothing else.
+
+	`forwarded` is safe to send twice: `attach_cookie` builds each upstream's
+	copy in its own buffer, so nothing about the first exchange is left in this
+	one. The transaction ID is drawn again all the same, the second exchange
+	being a new one on the wire, and the client's own ID goes back on below.
+	*/
+	if apex_ds && own != asked {
+		/*
+		`settled` is the second half of the same reading, and it decides only
+		whether the route's answer is kept: see the store below.
+		*/
+		proved, settled := parent_answers_apex_ds(resp, q.name, uerr == .None, allocator)
+		if !proved {
+			/*
+			Two lines rather than one with both fields, because there is no
+			rcode to name when nothing arrived: printing the zero value beside
+			the error read as the parent having answered NOERROR, which is the
+			one thing this branch has established it did not.
+			*/
+			if uerr == .None {
+				logx.debugf(
+					"query DS %s: the parent's group answered %v rather than proving the delegation carries no DS, so the route was asked instead",
+					q.name,
+					dns.peek_rcode(resp),
+				)
+			} else {
+				logx.debugf(
+					"query DS %s: the parent's group did not answer (%v), so the route was asked instead",
+					q.name,
+					uerr,
+				)
+			}
+			dns.set_id_in_place(forwarded, dns.random_id())
+			again, second, aerr := upstream.resolve(own, forwarded, allocator)
+			/*
+			And the route's answer is the only one that can be served from here.
+
+			What the parent said is not the proof - that is how this branch was
+			reached - so it is not an answer to the question that was asked, and
+			handing it to the client for want of anything better is the failure
+			the rule above refuses. For the headline deployment it would be a
+			*signed* NXDOMAIN over a zone whose own authority may have answered a
+			millisecond later, and the cache that does the damage is the client's
+			rather than this server's: the client keeps that proof for the
+			parent's negative TTL, and one implementing RFC 8020 reads it as
+			covering every name under the apex. Suppressing our own store, which
+			is what this branch used to do instead, does not reach any of that.
+			The store is withheld anyway in the other arrangement - the route
+			did answer, and what it said stands in for a fact nobody
+			established - but that is a question about the next client rather
+			than about which reply this one gets.
+
+			So the route's failure becomes the query's, and the error path below
+			turns it into stale-if-there-is-any and SERVFAIL otherwise. SERVFAIL
+			says what is true - the delegation could not be established - and no
+			validator caches it as a proof of anything, so the zone comes back
+			the moment its authority does.
+			*/
+			if aerr == .None {
+				resp, winner, uerr = again, second, .None
+				/*
+				And whether that answer is one to keep turns on what the parent
+				managed to say, not on the route having answered. See the store.
+				*/
+				unproven_apex_ds = !settled
+			} else {
+				logx.debugf(
+					"query DS %s: the route did not answer either (%v); the delegation is unestablished",
+					q.name,
+					aerr,
+				)
+				uerr = aerr
+			}
+		}
+	}
 	if uerr != .None {
 		logx.debugf("query %s %s from %s failed: %v", dns.type_name(q.type), q.name, client, uerr)
 		/*
@@ -1292,15 +1479,56 @@ resolve_query :: proc(
 			So it goes unstored and the next query asks again, which is what the
 			whole-message version of this - `answer-unreadable` above - already
 			does.
+
+			`unproven_apex_ds` is read here as well as at the store below, and for
+			the reason given there: an apex `DS` the route answered in the
+			parent's place, with nothing established about the delegation, is
+			served and not kept. A verdict stamped on those bytes is a verdict
+			about an answer nobody checked, and the entry carrying it would
+			answer the next client without the parent ever being asked again -
+			which is the one thing that reading is meant to prevent. One apex per
+			routed zone is also not the case the memoisation above was written
+			for.
 			*/
-			if s.cfg.cache.enabled && have_decoded && cloak_verdict_worth_keeping(verdict) {
+			if s.cfg.cache.enabled &&
+			   have_decoded &&
+			   !unproven_apex_ds &&
+			   cloak_verdict_worth_keeping(verdict) {
 				cache.put(s.answers, key, resp, decoded, generation, u8(verdict))
 			}
 			return out, cloak_outcome(verdict), true
 		}
 	}
 
-	if s.cfg.cache.enabled && have_decoded {
+	/*
+	`unproven_apex_ds` is the one answer on this path that is served and not
+	stored, and it is the routed apex `DS` above: the route answered in the
+	parent's place, and no statement about the delegation was ever got out of the
+	parent's group - no reply, a SERVFAIL or a REFUSED, a NOERROR whose answer
+	section holds something that is not a DS, a reply that would not decode, or a
+	group already parked when the question arrived.
+
+	Storing it would memoise the outage into the failure the carve-out exists to
+	prevent. `home.arpa.` is the case: the router the route points at answers its
+	own apex `DS` with an unsigned NODATA, which is exactly the broken chain issue
+	#227 is about, and kept here it is served to every validating client below for
+	`cache.negative_ttl` - five minutes by default, and the router's own SOA figure
+	when the operator set that to zero - with `arpa.` answering perfectly well the
+	whole time and the proof one query away. The cause was one lost exchange or a
+	ten-second cooldown; the consequence must not outlive it.
+
+	Only that reading of it. A parent that answered NXDOMAIN, or with a `DS`
+	RRset, said something about the public tree that holds until the public tree
+	changes, so the route's answer for those zones is the answer and is kept like
+	any other - `parent_answers_apex_ds` is where the two are told apart. The
+	proof itself is the parent's own answer and is stored as it always was.
+
+	The same rule as the `Unreadable` verdict above and as `cache.put`'s own
+	refusal of transient failures: the next query asks again, which is what
+	happened before any of this was memoised, and the one that reaches a parent
+	willing to speak stores what it said.
+	*/
+	if s.cfg.cache.enabled && have_decoded && !unproven_apex_ds {
 		cache.put(s.answers, key, resp, decoded, generation)
 	}
 

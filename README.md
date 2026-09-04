@@ -346,6 +346,87 @@ a server authoritative for `corp.example` answers `corp.example DS` out of its
 own zone rather than fetching the signed proof from the parent, and that answer
 breaks a chain instead of completing it.
 
+A client's own `DS` query at a route's apex is kept off the route for the same
+reason, and goes to whatever answers the parent zone — `upstream.servers`, or
+the route covering the parent if there is one. It is the one question a routed
+zone does not answer for itself: a validating client below elodin asks
+`home.arpa DS` on its way down from `arpa`, and the router the route points at
+replies out of its own zone with an unsigned "no data" instead of the signed
+proof that lives in the parent, which the client reads as a broken chain and
+turns into SERVFAIL for the whole zone. RFC 8375 section 4 item 4.B requires
+that one query to be forwarded for exactly this reason. Names *below* the apex,
+and the apex's own `DNSKEY`, stay on the route — those are the zone's own data.
+That one query is also the only part of a routed zone the public upstream hears,
+and it names no host: the zone's own name, which its parent already publishes if
+the delegation exists.
+
+The parent keeps that question only if it answers the thing it was asked for:
+"no data", meaning the delegation exists and carries no DS. That is `home.arpa`'s
+answer from `arpa`, and it is the only thing the parent can tell a validating
+client that the local authority cannot. Anything else goes back on the route:
+
+- **NXDOMAIN** — nothing in the public tree delegates the zone, the ordinary case
+  being an internal `corp.example.com` under a public, signed `example.com`. There
+  is no proof to fetch, and passing the NXDOMAIN on would be worse than the answer
+  it replaced: an unsigned "no data" from the local server lets a lenient validator
+  treat the zone as unsigned and resolve it, while a *signed* proof of
+  non-existence takes that away — and a validator implementing RFC 8020 reads it as
+  proof that every name under the apex is gone too.
+- **A DS record** — the zone is delegated and signed in public and the route points
+  at another view of it, which is split horizon. Handing the client the public DS
+  makes it demand a `DNSKEY` the internal view has no matching key for, and it gets
+  bogus instead of an answer. If you really are routing to a mirror of the signed
+  zone, it is served insecure like any other routed zone; a
+  [`trust_anchors`](#dnssec) entry over it is how you ask for it to be validated.
+- **No answer at all** — a routed zone keeps standing on its own, so
+  `upstream.servers` being down, or unreachable from the network the resolver sits
+  on, does not take the chain out from under a zone whose own authority is
+  answering.
+
+"No data" is also what a parent says about a name that sits in its own zone
+without being a delegation — `corp.example.com` published there as an A record,
+or existing because `vpn.corp.example.com` is public. elodin does not tell that
+apart from an insecure delegation (it would have to read the NS bit out of the
+NSEC/NSEC3 bitmap), and passes the proof on either way. For that case the client
+is right to act on it: the public tree does cover those names with signed data,
+so the local server's unsigned answers below them are bogus, and the zone
+resolved before only because the local NODATA hid the parent's proof. Anchor the
+zone with [`trust_anchors`](#dnssec), or do not route a name the public tree
+publishes.
+
+A reply that says nothing about the name — SERVFAIL, REFUSED — counts as no
+answer here rather than as an answer to pass on, which is a departure from how
+every other rcode is handled: for a question about a *delegation*, only NOERROR
+and NXDOMAIN say anything, so an upstream with an ACL, or a CPE resolver that
+mangles every `DS` it meets, must not take an internal zone down with it. The
+rest of that group is asked before the route is, so one server in
+`upstream.servers` that refuses every `DS` does not hide a proof another one of
+them is publishing. A NOERROR whose answer section carries something that is
+not a DS is read the same way: "no data" means nothing in the answer at all,
+and a resolver that hijacks NXDOMAIN answers this question with NOERROR and a
+synthesised address, which is the first case above with the rcode written over.
+And if the local server cannot be reached either, the answer is SERVFAIL rather
+than whatever the parent said: a signed "this name does not exist" over a zone
+that is served locally is the one answer worth withholding, since the client
+caches it for the parent's whole negative TTL and a resolver implementing RFC
+8020 reads it as covering every name under the apex. A SERVFAIL says what is
+true — the delegation could not be established — and nothing keeps it, so the
+zone comes back the moment its authority does. A parent whose upstreams are all
+in their failure cooldown is not waited for at all; the question goes straight
+to the route — so long as the route is out of its own cooldown, since skipping a
+parent that may have come back for a server that is also down would only lose
+the try that would have proved the delegation.
+
+Where the parent said nothing — no reply, SERVFAIL, REFUSED, a NOERROR with the
+wrong thing in it, or its group already in that cooldown — the route's answer
+goes to the client and is not cached. It stood in for a fact nothing
+established, and keeping it would hold the very broken chain this carve-out
+exists to prevent over the zone for [`cache.negative_ttl`](#cache) after a
+single lost round trip. The next query asks again. An answer the route gave
+because the parent *did* say something — NXDOMAIN, or a DS record — is cached
+like any other, that statement about the public tree holding until the public
+tree changes.
+
 The answer cache is keyed on the question rather than on which upstream produced
 it, which holds because the routing table is built once at startup — restart
 after changing a route. `--check` and the startup log say out loud what each
@@ -620,7 +701,8 @@ is no chain to walk and refusing them would be worse than not validating them:
   default; a router here that does answer the zone wants
   [`upstream.zones`](#per-domain-upstreams) pointed at it, and if nothing serves
   the zone at all, [`special_use.home_arpa`](#reserved-names) answers those names
-  here. Either way the `home.arpa DS` query itself goes upstream, RFC 8375
+  here. Either way the `home.arpa DS` query itself goes to `upstream.servers` —
+  not down the route, and not answered from the reserved-name table — RFC 8375
   requiring that proof be fetched rather than invented. If you do run the zone,
   its private addresses trip [rebind
   protection](#dns-rebinding-protection) unless it is routed or named in

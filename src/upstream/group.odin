@@ -136,13 +136,31 @@ resolve_answerable :: proc(
 	MAX_LOOKUPS_PER_QUERY, so no client can turn one question into an unbounded
 	fan-out.
 
-	Health is left alone on purpose. SERVFAIL is a legitimate answer to plenty
-	of questions, and a server that gives one has not failed in the sense
-	`record_failure` tracks - it answered, promptly, and for the client's own
-	queries this server goes on using it.
+	Health is left alone where the rcode is concerned, on purpose. SERVFAIL is a
+	legitimate answer to plenty of questions, and a server that gives one has not
+	failed in the sense `record_failure` tracks - it answered, promptly, and for
+	the client's own queries this server goes on using it.
+
+	A server already in its cooldown is another matter, and is skipped. It is
+	there because its own exchanges timed out three times over, so what asking it
+	again buys is `g.timeout` of waiting per parked member before this returns -
+	and the callers cannot afford it. A chain walk pays that at every step of a
+	descent bounded by `MAX_LOOKUPS_PER_QUERY`, and `resolve_query` puts a
+	client's own apex `DS` through here, where a validating stub gives up in two
+	to five seconds. `resolve_sequential`'s first round skips parked servers for
+	the same reason, and its second round tries them anyway because it has
+	nothing else to offer; this has the rest of the group.
+
+	A group whose every member is parked therefore sweeps nobody, and the first
+	reply stands - which is the same answer as before for a group that has
+	nothing to give, reached without the wait.
 	*/
 	for u in g.servers {
 		if u == winner {
+			continue
+		}
+		if !healthy(u) {
+			logx.debugf("upstream %s is in its cooldown, not asked again for this one", u.spec.name)
 			continue
 		}
 		resp, xerr := exchange(u, query, g.timeout, allocator)

@@ -110,6 +110,13 @@ mock_reply :: proc(m: ^Mock, qname: string, qtype: u16, payload: []u8) {
 	append(&m.rules, Mock_Rule{qname = qname, qtype = qtype, behaviour = .Reply, payload = payload})
 }
 
+// One name and type answered with a bare rcode, everything else left to the
+// rules and the fallback around it. `mock_make`'s fallback is NXDOMAIN for the
+// whole mock; this is for a mock that answers normally apart from one question.
+mock_rcode :: proc(m: ^Mock, qname: string, qtype: u16, rcode: dns.Rcode) {
+	append(&m.rules, Mock_Rule{qname = qname, qtype = qtype, behaviour = .Rcode_Only, rcode = rcode})
+}
+
 mock_silent :: proc(m: ^Mock) {
 	m.fallback = Mock_Rule {
 		behaviour = .Silent,

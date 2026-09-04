@@ -2002,6 +2002,89 @@ test_a_chain_lookup_is_asked_elsewhere_when_one_upstream_declines :: proc(t: ^te
 	free_all(context.temp_allocator)
 }
 
+/*
+And the sweep does not spend the timeout on a server already in its cooldown.
+
+The reason is what the sweep costs when it does. A parked member is one whose own
+exchanges timed out three times over, and asking it again buys `g.timeout` of
+waiting before this procedure returns - per parked member, at every step of a
+chain walk, and on the path a client's own apex `DS` takes through here, where a
+validating stub gives up in two to five seconds. It is the failure the routed
+apex `DS` was moved off the route to avert, reached by waiting instead.
+
+Two responders, and the second is the one that could answer: parked, so it is
+not asked, and the first server's SERVFAIL stands. Asserted on the hit count
+rather than on the clock - had the sweep gone to it, its answer would have won
+and this would read NOERROR - so nothing here turns on how long a timeout takes.
+The cooldown is written onto the upstream rather than waited for, three failures
+being what `record_failure` needs and none of them what this case is about.
+*/
+@(test)
+test_the_sweep_leaves_a_parked_upstream_alone :: proc(t: ^testing.T) {
+	refuser := Rcode_Mock{}
+	answerer := Rcode_Mock{}
+
+	bad, bad_thread, bad_ok := start_rcode_mock(t, &refuser, "refuser", .Serv_Fail)
+	if !bad_ok {
+		return
+	}
+	defer {
+		sync.atomic_store(&refuser.stop, true)
+		thread.join(bad_thread)
+		thread.destroy(bad_thread)
+		net.close(refuser.socket)
+		destroy(bad)
+	}
+
+	good, good_thread, good_ok := start_rcode_mock(t, &answerer, "answerer", .No_Error)
+	if !good_ok {
+		return
+	}
+	defer {
+		sync.atomic_store(&answerer.stop, true)
+		thread.join(good_thread)
+		thread.destroy(good_thread)
+		net.close(answerer.socket)
+		destroy(good)
+	}
+
+	good.failures = FAILURE_THRESHOLD
+	good.down_until = time.time_add(time.now(), COOLDOWN)
+
+	servers := make([]^Upstream, 2, context.allocator)
+	defer delete(servers, context.allocator)
+	servers[0] = bad
+	servers[1] = good
+
+	g := Group {
+		servers   = servers,
+		strategy  = .Failover,
+		timeout   = time.Second,
+		attempts  = 1,
+		allocator = context.allocator,
+	}
+
+	query := dns.Message {
+		id       = 0x2B2B,
+		question = []dns.Question{{name = "bahn.de.", type = .DS, class = .IN}},
+	}
+	query.flags.rd = true
+	wire, _, enc := dns.encode_message(query, context.temp_allocator)
+	testing.expectf(t, enc == dns.Encode_Error.None, "cannot encode the query: %v", enc)
+	if enc != .None {
+		return
+	}
+
+	resp, winner, err := resolve_answerable(&g, wire, context.allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expect_value(t, dns.peek_rcode(resp), dns.Rcode.Serv_Fail)
+	testing.expect_value(t, winner, bad)
+	testing.expect_value(t, sync.atomic_load(&answerer.hits), 0)
+	delete(resp, context.allocator)
+
+	free_all(context.temp_allocator)
+}
+
 // The other half: when nobody can answer, the first reply still comes back with
 // its rcode intact, so `zone_step` reads it and calls the chain unavailable
 // rather than the caller getting a transport error it would report differently.
