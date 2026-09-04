@@ -210,15 +210,21 @@ checkable than an opaque one. The bytes are a well-formed DS RDATA all the same 
 key tag, algorithm 8, digest type 2, and a SHA-256-sized digest - so a decoder
 walking the answer section finds a record it can measure rather than one it has
 to reject.
+
+`owner` is the record's own name, which defaults to the question's and is given
+separately for the one case that wants them apart: `response_matches` pins the
+reply's question and nothing pins its answer section, so a `DS` for some other
+name is a reply this predicate must not read as "the public tree delegates and
+signs this zone".
 */
 @(private = "file")
-route_reply_ds :: proc(name: string) -> []u8 {
+route_reply_ds :: proc(name: string, owner := "") -> []u8 {
 	digest := make([]u8, 36, context.temp_allocator)
 	digest[0], digest[1] = 0x30, 0x39
 	digest[2], digest[3] = 8, 2
 	answer := make([]dns.Record, 1, context.temp_allocator)
 	answer[0] = dns.Record {
-		name  = name,
+		name  = owner if owner != "" else name,
 		type  = .DS,
 		class = .IN,
 		ttl   = 3600,
@@ -282,6 +288,25 @@ mock_group :: proc(t: ^testing.T, cfg: config.Upstream_Config, port: int) -> ^up
 	servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = port}
 	one.servers = servers
 	group, gerr := upstream.make_group(one, nil, context.allocator, false)
+	testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr)
+	return group
+}
+
+/*
+Two UDP upstreams in one group, in the order `upstream.servers` lists them.
+
+For the arrangement a single-server group cannot show: a group whose members
+disagree about the zone, which is the case `parent_answers_apex_ds` reads through
+`upstream.resolve_answerable` rather than through `resolve`.
+*/
+@(private = "file")
+mock_group_pair :: proc(t: ^testing.T, cfg: config.Upstream_Config, first, second: int) -> ^upstream.Group {
+	two := cfg
+	servers := make([]config.Upstream_Spec, 2, context.temp_allocator)
+	servers[0] = config.Upstream_Spec{name = "mock-a", kind = .UDP, address = "127.0.0.1", port = first}
+	servers[1] = config.Upstream_Spec{name = "mock-b", kind = .UDP, address = "127.0.0.1", port = second}
+	two.servers = servers
+	group, gerr := upstream.make_group(two, nil, context.allocator, false)
 	testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr)
 	return group
 }
@@ -941,16 +966,29 @@ seconds.
 test_an_apex_ds_the_route_answered_unproven_is_not_cached :: proc(t: ^testing.T) {
 	Case :: struct {
 		// What the parent's group manages to say about `corp.example. DS`.
-		what:   string,
-		serve:  bool,
-		rcode:  dns.Rcode,
+		what:       string,
+		serve:      bool,
+		rcode:      dns.Rcode,
+		// NOERROR carrying a `DS` for a name that is not the one asked about,
+		// which `response_matches` does not screen and which says nothing about
+		// this delegation.
+		foreign_ds: bool,
 		// Whether the route's answer is one to keep.
-		stored: bool,
+		stored:     bool,
 	}
 	cases := []Case {
-		{"nothing at all", false, .No_Error, false},
-		{"SERVFAIL", true, .Serv_Fail, false},
-		{"no such name", true, .NX_Domain, true},
+		{"nothing at all", false, .No_Error, false, false},
+		{"SERVFAIL", true, .Serv_Fail, false, false},
+		{"no such name", true, .NX_Domain, false, true},
+		/*
+		A `DS` in the answer settles the delegation only when it is the
+		delegation's own. A record about some other zone is not a statement about
+		this one, so the route's answer stands in for a fact nobody established
+		and the store refuses it, exactly as it does for the SERVFAIL above -
+		where reading the type alone would have kept it for `negative_ttl` on the
+		strength of a record about a different name.
+		*/
+		{"a DS for another name", true, .No_Error, true, false},
 	}
 
 	for c in cases {
@@ -993,9 +1031,13 @@ test_an_apex_ds_the_route_answered_unproven_is_not_cached :: proc(t: ^testing.T)
 			routes  = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
 		}
 
+		parent_reply := route_reply_nodata("corp.example.", .DS, c.rcode)
+		if c.foreign_ds {
+			parent_reply = route_reply_ds("corp.example.", owner = "other.example.")
+		}
 		parent := Route_Mock {
 			socket = def_socket,
-			reply  = route_reply_nodata("corp.example.", .DS, c.rcode),
+			reply  = parent_reply,
 			want   = "corp.example.",
 		}
 		authority := Route_Mock {
@@ -1244,6 +1286,190 @@ test_a_parked_parent_group_is_skipped_for_an_apex_ds :: proc(t: ^testing.T) {
 	key := cache.make_key(key_buf[:], "corp.example.", .DS, .IN, false, false)
 	_, _, cached := cache.get(answers, key, context.temp_allocator)
 	testing.expect(t, !cached, "an answer given while the parent was skipped was stored")
+	free_all(context.temp_allocator)
+}
+
+/*
+A parked parent is still asked when the route is parked too.
+
+The other side of the case above, and the condition that keeps the skip from
+costing more than it saves. `resolve_sequential` gives a parked server one honest
+try in its second round, which is exactly the try that pays off when the path out
+has come back inside its ten seconds - so passing over a parked parent for a
+route that is equally parked throws that try away and turns an apex `DS` the
+parent would have proved into a SERVFAIL for the whole zone. Nothing is bought
+by it either: with both groups parked the wait is spent either way.
+
+Both groups are parked the way the resolver parks one, three exchanges against a
+socket nobody answers, and then the parent starts answering - which is the state
+an upstream is in for the rest of its cooldown after the network comes back. The
+assertion is that the parent was asked and its proof is what the client got.
+*/
+@(test)
+test_a_parked_parent_is_still_asked_when_the_route_is_parked_too :: proc(t: ^testing.T) {
+	def_socket, derr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, derr == nil, "cannot bind the default mock: %v", derr) {
+		return
+	}
+	defer net.close(def_socket)
+	def_bound, _ := net.bound_endpoint(def_socket)
+
+	route_socket, rerr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, rerr == nil, "cannot bind the routed mock: %v", rerr) {
+		return
+	}
+	defer net.close(route_socket)
+	route_bound, _ := net.bound_endpoint(route_socket)
+
+	cfg := forwarding_config()
+	cfg.upstream.timeout = 50 * time.Millisecond
+	// Round 0 skips a parked server and round 1 tries it anyway, so it takes two
+	// attempts for there to be anything here to keep.
+	cfg.upstream.attempts = 2
+
+	group := mock_group(t, cfg.upstream, def_bound.port)
+	defer upstream.destroy_group(group)
+	routed := mock_group(t, cfg.upstream, route_bound.port)
+	defer upstream.destroy_group(routed)
+
+	// `FAILURE_THRESHOLD` is 3 and each attempt counts, so two of these park a
+	// group; three keeps it parked with room to spare. The name is not the one
+	// the assertions below are about.
+	for _ in 0 ..< 3 {
+		_, _, _ = upstream.resolve(group, route_query("park.example."), context.temp_allocator)
+		_, _, _ = upstream.resolve(routed, route_query("park.example."), context.temp_allocator)
+	}
+
+	s := Server {
+		cfg    = &cfg,
+		group  = group,
+		routes = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
+	}
+
+	_ = net.set_option(def_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+	parent := Route_Mock {
+		socket = def_socket,
+		reply  = route_reply_nodata("corp.example.", .DS),
+		want   = "corp.example.",
+	}
+	parent_mock := thread.create_and_start_with_poly_data(&parent, serve_route)
+	out, _, ok := handle_query(
+		&s,
+		route_query("corp.example.", .DS),
+		.UDP,
+		"127.0.0.1:5555",
+		context.temp_allocator,
+	)
+	thread.join(parent_mock)
+	thread.destroy(parent_mock)
+
+	if !testing.expect(t, ok, "nothing came back at all") {
+		return
+	}
+	testing.expect(t, parent.asked, "the parent was passed over for a route that was parked too")
+
+	decoded, derr2 := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr2, dns.Decode_Error.None)
+	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
+	free_all(context.temp_allocator)
+}
+
+/*
+A refusal from one member of the parent's group does not send the question down
+the route while another member holds the proof.
+
+`upstream.resolve` hands back whatever the first upstream to reply said, and a
+REFUSED is a reply - so a group with a CPE resolver that mangles every `DS` in it
+beside a public resolver that publishes the proof answered from whichever one
+`resolve` happened to reach: the proof on one query and the route's own unsigned
+NODATA on the next, filed under the same cache entry. `resolve_query` asks the
+parent's group through `upstream.resolve_answerable` for that reason, which is
+the reading `parent_answers_apex_ds` takes of the rcode carried through to how
+the question is put.
+
+The refusing member is first in `upstream.servers` and the group is `Failover`,
+so `resolve` reaches it and nothing else without the sweep. The route's socket is
+bound and unserved: asked at all, this case is a SERVFAIL rather than a proof.
+*/
+@(test)
+test_an_apex_ds_sweeps_the_parents_group_past_a_refusal :: proc(t: ^testing.T) {
+	refuser, aerr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, aerr == nil, "cannot bind the refusing mock: %v", aerr) {
+		return
+	}
+	defer net.close(refuser)
+	_ = net.set_option(refuser, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+	refuser_bound, _ := net.bound_endpoint(refuser)
+
+	prover, berr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, berr == nil, "cannot bind the proving mock: %v", berr) {
+		return
+	}
+	defer net.close(prover)
+	_ = net.set_option(prover, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+	prover_bound, _ := net.bound_endpoint(prover)
+
+	route_socket, rerr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, rerr == nil, "cannot bind the routed mock: %v", rerr) {
+		return
+	}
+	defer net.close(route_socket)
+	route_bound, _ := net.bound_endpoint(route_socket)
+
+	cfg := forwarding_config()
+	// Only the unserved route socket ever waits this out, and only when the
+	// sweep failed to find the proof.
+	cfg.upstream.timeout = 200 * time.Millisecond
+
+	group := mock_group_pair(t, cfg.upstream, refuser_bound.port, prover_bound.port)
+	defer upstream.destroy_group(group)
+	routed := mock_group(t, cfg.upstream, route_bound.port)
+	defer upstream.destroy_group(routed)
+
+	s := Server {
+		cfg    = &cfg,
+		group  = group,
+		routes = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
+	}
+
+	refused := Route_Mock {
+		socket = refuser,
+		reply  = route_reply_nodata("corp.example.", .DS, .Refused),
+		want   = "corp.example.",
+	}
+	proved := Route_Mock {
+		socket = prover,
+		reply  = route_reply_nodata("corp.example.", .DS),
+		want   = "corp.example.",
+	}
+	refused_mock := thread.create_and_start_with_poly_data(&refused, serve_route)
+	proved_mock := thread.create_and_start_with_poly_data(&proved, serve_route)
+	out, _, ok := handle_query(
+		&s,
+		route_query("corp.example.", .DS),
+		.UDP,
+		"127.0.0.1:5555",
+		context.temp_allocator,
+	)
+	thread.join(refused_mock)
+	thread.destroy(refused_mock)
+	thread.join(proved_mock)
+	thread.destroy(proved_mock)
+
+	if !testing.expect(t, ok, "nothing came back at all") {
+		return
+	}
+	testing.expect(t, refused.asked, "the first upstream in the group was never asked")
+	testing.expect(t, proved.asked, "the group's other member was never asked past the refusal")
+	testing.expect(
+		t,
+		route_mock_quiet(route_socket, "corp.example."),
+		"a refusal from one upstream sent the apex DS down the route",
+	)
+
+	decoded, derr2 := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr2, dns.Decode_Error.None)
+	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
 	free_all(context.temp_allocator)
 }
 

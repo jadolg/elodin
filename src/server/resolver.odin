@@ -1003,14 +1003,51 @@ resolve_query :: proc(
 	tree says about this delegation and the route's answer stands in for a fact
 	nobody checked. `unproven_apex_ds` carries that down to the store, which is
 	where it matters; the cooldown is ten seconds and a cache entry is minutes.
+
+	Only when the route can actually answer in its place, which is the whole
+	argument for skipping. A route group in its own cooldown has nothing to offer
+	the question, and `resolve_sequential` gives a parked server one honest try in
+	its second round - so skipping a parked parent for a parked route throws away
+	the parent's own second-round attempt, which is the one that would have
+	fetched the proof if the path out had come back inside the ten seconds, and
+	guarantees the SERVFAIL it was trying to avert. With both parked the wait is
+	spent either way; this only chooses not to spend it on a group whose answer is
+	already covered.
 	*/
 	unproven_apex_ds := false
-	if apex_ds && own != asked && !group_reachable(asked) {
+	if apex_ds && own != asked && !group_reachable(asked) && group_reachable(own) {
 		logx.debugf("query DS %s: the parent's group is parked, asking the route instead", q.name)
 		asked = own
 		unproven_apex_ds = true
 	}
-	resp, winner, uerr := upstream.resolve(asked, forwarded, allocator)
+	resp: []u8
+	winner: ^upstream.Upstream
+	uerr: upstream.Error
+	if apex_ds && own != asked {
+		/*
+		The parent's group is asked the way `validator_query` asks the lookups
+		this server makes on its own account, and for the reason the reading
+		below gives: for a question about a delegation only NOERROR and NXDOMAIN
+		say anything, so a member that hands back SERVFAIL or REFUSED has not
+		answered and the group's other members are asked before the route is.
+
+		`resolve` alone left a group whose members disagree about the zone - one
+		publishing the proof beside a CPE resolver that mangles every `DS` it
+		meets - answering from whichever one it happened to reach: the parent's
+		proof on one query and the route's own unsigned NODATA on the next, which
+		is the residual cache flap `routes.odin` names as the worst this carve-out
+		can do. An answerable reply returns from the first exchange and none of
+		the sweep runs, so `home.arpa.`'s NODATA costs exactly what it did.
+
+		The route's own exchange below stays on `resolve`: whatever it says is
+		the client's answer, rcode and all, which is the ordinary reading of a
+		client's question and the one this carve-out departs from only for the
+		parent.
+		*/
+		resp, winner, uerr = upstream.resolve_answerable(asked, forwarded, allocator)
+	} else {
+		resp, winner, uerr = upstream.resolve(asked, forwarded, allocator)
+	}
 	/*
 	And back on the route unless the parent answered the one thing the parent was
 	asked for: that this delegation carries no DS.
@@ -1030,8 +1067,10 @@ resolve_query :: proc(
 	ordinary client question is answered. `parent_answers_apex_ds` sets out why:
 	the rcode of a question about a delegation says nothing about the delegation
 	unless it is NOERROR or NXDOMAIN, so an upstream's ACL must not take an
-	internal zone down with it. The parent's rcode still reaches the client when
-	the route cannot be reached either.
+	internal zone down with it. The parent's rcode is not passed on at all: where
+	the route cannot be reached either, the query is a SERVFAIL - or an expired
+	entry, where `serve_stale` kept one - rather than whatever the parent said,
+	which is argued beside the second exchange below.
 
 	Only when the two groups differ, as well. A route may list a zone and its
 	parent together, and then `route_group` has already sent this question to the
@@ -1052,7 +1091,7 @@ resolve_query :: proc(
 		`settled` is the second half of the same reading, and it decides only
 		whether the route's answer is kept: see the store below.
 		*/
-		proved, settled := parent_answers_apex_ds(resp, uerr == .None, allocator)
+		proved, settled := parent_answers_apex_ds(resp, q.name, uerr == .None, allocator)
 		if !proved {
 			/*
 			Two lines rather than one with both fields, because there is no

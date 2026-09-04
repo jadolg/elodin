@@ -67,12 +67,16 @@ what the parent's group said, so a name that reached its proof goes on reaching
 it; and wherever the parent established nothing - no reply, a rewritten rcode, a
 group already parked - `resolve_query` serves the route's answer and stores
 nothing, so the entry is never the stand-in for a fact nobody checked. What is
-left is a parent *group* whose members disagree about the zone - one that
-publishes the proof beside one that rewrites the rcode - where the entry can be
-the parent's proof on one query and the route's own NODATA on the next. That is
-the worst this carve-out can do to the cache, and it is the behaviour the zone
-had before the carve-out existed: an unsigned NODATA for the apex `DS`, served
-for the entry's lifetime.
+left is a parent *group* whose members disagree about the zone, where the entry
+can be the parent's proof on one query and the route's own NODATA on the next.
+Most of that is closed rather than merely narrow: a member that rewrites the
+rcode to SERVFAIL or REFUSED is passed over, `resolve_query` asking the group
+through `upstream.resolve_answerable`, so the proof is found wherever the group
+holds it. What survives is a member that rewrites the rcode to a NOERROR with
+something in the answer section, which is answerable and stops the sweep. That
+is the worst this carve-out can do to the cache, and it is the behaviour the
+zone had before the carve-out existed: an unsigned NODATA for the apex `DS`,
+served for the entry's lifetime.
 */
 Zone_Route :: struct {
 	// Canonical, lowercase, root-dotted, as `config.Zone_Route` left them.
@@ -214,13 +218,16 @@ client that the route cannot. Every other reply goes back on the route -
     poor path out is most of the point; an outage out there must not take the
     chain out from under every name in a zone that is answering perfectly well.
     `group_reachable` keeps that from being paid for twice over: a parent group
-    already parked by its own failures is not asked at all.
+    already parked by its own failures is not asked at all, so long as the route
+    is out of its own cooldown and can answer in its place.
   - A reply that says nothing about the name: SERVFAIL, REFUSED, and every other
     rcode that is neither NOERROR nor NXDOMAIN. An upstream with an ACL, or a
     CPE resolver that mangles every `DS` it meets, is not a statement about this
-    delegation, and `parent_answers_apex_ds` sets out why this file reads those
-    the same way `upstream.resolve_answerable` does rather than the way an
-    ordinary client question is read.
+    delegation, so `resolve_query` asks the parent's group through
+    `upstream.resolve_answerable` - the group's other members first, and the
+    route only once none of them will say anything. `parent_answers_apex_ds`
+    sets out why that is the reading here rather than the way an ordinary client
+    question is read.
   - A NOERROR that is not a NODATA: the rcode says the name is there and the
     answer section carries something other than a DS. An NXDOMAIN-hijacking
     resolver answers exactly that for a name its parent zone does not delegate -
@@ -314,29 +321,42 @@ rather than a statement, so the route's answer stands in for a fact nobody
 established. `resolve_query` serves that answer and declines to store it,
 for the reason it gives at the store.
 
-SERVFAIL and REFUSED being no statement at all is worth setting down, because
-`upstream.resolve_answerable` draws the line elsewhere for a different question:
-there, the rcode of a client's question is the client's answer, and only the
-lookups this server makes on its own account insist on a reply that says
-something. What that procedure says about *why* is the rule here too - "NOERROR
-and NXDOMAIN are the only rcodes that say anything about a delegation" - and
-this question, though the client's, is about a delegation. Being about the
-delegation is the whole reason `route_group` diverts it by type.
+SERVFAIL and REFUSED being no statement at all is the reading
+`upstream.resolve_answerable` already takes, and `resolve_query` asks the
+parent's group through it rather than through `resolve` for that reason: what
+that procedure says about *why* - "NOERROR and NXDOMAIN are the only rcodes that
+say anything about a delegation" - is the rule here too, and this question,
+though the client's, is about a delegation. Being about the delegation is the
+whole reason `route_group` diverts it by type. So a group with one member that
+publishes the proof and one that mangles every `DS` answers from the one that
+can, rather than from whichever it reached first, and this predicate sees the
+reply that says something wherever the group holds one. Only the route's own
+exchange keeps the ordinary reading, its rcode being the client's answer.
 
 So a REFUSED from an upstream with an ACL, or the SERVFAIL a CPE resolver hands
 back for every `DS` it does not understand, says nothing about this zone, and
 passing it on would take every name in an internal zone that is answering
 perfectly well down with it - issue #227's failure reached through an upstream
 that has nothing to do with the zone. The route can answer, so the route is
-asked, and the parent's rcode reaches the client only when the route cannot be
-reached either.
+asked, and the parent's rcode is not passed on at all: where the route cannot be
+reached either the query is a SERVFAIL, or an expired entry where `serve_stale`
+kept one, which is the paragraph above this one.
 
 `reached` is `uerr == .None`. A reply that never arrived says nothing by the
 same reading, so the route is asked then too and nothing is kept.
+
+`name` is the question's own name, and the `DS` that makes the reply `settled`
+has to be at it. `upstream.response_matches` pins the reply's *question* to the
+one that went out, and nothing pins its answer section: a `DS` for some other
+name in there is not "the public tree delegates and signs this zone", so reading
+it as one would keep the route's answer in the cache on the strength of a record
+about a different zone. Held to the name it falls through to the empty-section
+test below, which is the unsettled reading the rest of a rewritten NOERROR gets.
 */
 @(private)
 parent_answers_apex_ds :: proc(
 	resp: []u8,
+	name: string,
 	reached: bool,
 	allocator: mem.Allocator,
 ) -> (
@@ -358,7 +378,7 @@ parent_answers_apex_ds :: proc(
 		return false, false
 	}
 	for rec in msg.answer {
-		if rec.type == .DS {
+		if rec.type == .DS && dns.name_equal_fold(rec.name, name) {
 			return false, true
 		}
 	}
@@ -373,14 +393,20 @@ parent_answers_apex_ds :: proc(
 /*
 Whether any upstream in `g` is out of its failure cooldown.
 
-Asked about the parent's group before an apex `DS` is sent there, and only
-there. `resolve_sequential` spends the group's whole budget on a group that is
+Asked about both groups before an apex `DS` is sent to the parent's, and nowhere
+else. `resolve_sequential` spends the group's whole budget on a group that is
 entirely parked - round 0 skips the unhealthy servers, round 1 tries them anyway
 - so with the default `timeout: 5s` and `attempts: 2` a public upstream that has
 gone away costs ten seconds or more before the route is asked in its place. A
 validating stub gives up in two to five, so the deployment `apex_ds_off_route`
 describes - an internal authority behind a poor path out - would still see the
 zone fail, having waited for an upstream this server already knows is down.
+
+Both, because the skip is only worth making when something else can answer.
+Round 1's honest try is exactly the one that pays off when a parked group has
+come back inside its ten seconds, so passing over a parked parent for a route
+that is parked too throws that try away and buys a certain SERVFAIL with it.
+`resolve_query` asks for the pair.
 
 Three consecutive failures park an upstream and the cooldown is ten seconds, so
 what this skips is a group that has already proved itself unreachable, for as

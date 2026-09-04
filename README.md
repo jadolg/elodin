@@ -398,7 +398,10 @@ A reply that says nothing about the name — SERVFAIL, REFUSED — counts as no
 answer here rather than as an answer to pass on, which is a departure from how
 every other rcode is handled: for a question about a *delegation*, only NOERROR
 and NXDOMAIN say anything, so an upstream with an ACL, or a CPE resolver that
-mangles every `DS` it meets, must not take an internal zone down with it. A
+mangles every `DS` it meets, must not take an internal zone down with it. The
+rest of that group is asked before the route is, so one server in
+`upstream.servers` that refuses every `DS` does not hide a proof another one of
+them is publishing. A
 NOERROR whose answer section carries something that is not a DS is read the same
 way: "no data" means nothing in the answer at all, and a resolver that hijacks
 NXDOMAIN answers this question with NOERROR and a synthesised address, which is
@@ -411,7 +414,9 @@ as covering every name under the apex. A SERVFAIL says what is true — the
 delegation could not be established — and nothing keeps it, so the zone comes
 back the moment its authority does. A parent whose upstreams are all in their
 failure cooldown is not waited for at all; the question goes straight to the
-route.
+route — so long as the route is out of its own cooldown, since skipping a parent
+that may have come back for a server that is also down would only lose the try
+that would have proved the delegation.
 
 Where the parent said nothing — no reply, SERVFAIL, REFUSED, a NOERROR with the
 wrong thing in it, or its group already in that cooldown — the route's answer
