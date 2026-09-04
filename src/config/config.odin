@@ -671,12 +671,88 @@ Nor is any of it a defence against a botnet. Every budget here is per prefix, so
 actor with addresses in n of them has n of every figure, and on IPv6 a routine /48
 is 65,536 /64s. A publicly reachable instance wants a per-source connection rate
 limit in front of it as well - see the README.
+
+`overrides` is what makes the figures above defaults rather than the only answer.
+See `Rate_Limit_Override`.
 */
 Rate_Limit_Config :: struct {
 	enabled:              bool,
 	responses_per_second: int,
 	slip:                 int,
+	overrides:            []Rate_Limit_Override,
 }
+
+/*
+A network whose budgets are not the defaults above.
+
+The unit every budget here is kept in is a /24 or a /64, because that is the
+granularity an attacker picks addresses within. The consequence is that the unit
+means two incompatible things depending on where this server is: on a LAN a /24
+is a household or an office, and the shipped 500 responses a second is "far past
+what the busiest of those asks for". On the internet a /24 behind carrier-grade
+NAT is thousands of subscribers, and 500 a second is what they get between them.
+One figure cannot be right for both, and nothing in the file said which one a
+given prefix was.
+
+So a prefix can be named and given its own. Everything else stays on the
+defaults, which is the shape `allow_from` already has and the reason the
+vocabulary was there to reuse.
+
+What the slip does about this without an override is real but bounded, and the
+bound is worth knowing before deciding not to write one. A prefix over its
+datagram budget has at most every `slip`th over-limit query answered truncated,
+which sends that client to TCP - where it is served out of a budget of its own,
+so it keeps resolving one round trip slower. That holds while the prefix's
+*total* stays inside the two budgets together. Past that it does not: the stream
+pool is `responses_per_second` as well, and a client that opens a connection per
+query spends the arrival budget too, so a /24 asking more than about twice the
+figure is a /24 being refused rather than delayed however the slip is set. A busy
+carrier NAT reaches that.
+
+`slip` per entry because the two settings are one decision rather than two. A
+public prefix wants a large budget and often `slip: 0` - a truncated answer is an
+invitation to open a connection, and an operator who has concluded that nobody
+legitimate is behind the address being flooded does not want to send one. A LAN
+wants the small budget and `slip: 2`. Those are two coherent shapes, and an
+override is where one of them can be written down for the network it applies to.
+
+Left out, an entry inherits `slip` from the figure above rather than defaulting to
+0 or to 2: an operator naming a network to raise its budget has said nothing about
+its truncated answers, and the safe reading of silence is the setting they already
+chose.
+
+**Not finer than the accounting.** An override on an IPv4 network longer than /24,
+or an IPv6 one longer than /64, is refused at load. Every address in a /24 shares
+one bucket, so a /28 or a /32 entry could only ever be applied to the whole /24
+that contains it - which is not what the operator wrote, and is the kind of
+surprise a startup error is cheaper than.
+
+Not a security control either way. Raising a prefix's budget raises what this
+server will send to it and what it will spend on it, which is the operator's
+decision to make about a network they know something about. Lowering one is the
+sharper instrument: a prefix that is being used for reflection can be given a
+figure of its own without narrowing what every other client gets.
+*/
+Rate_Limit_Override :: struct {
+	prefix:               Prefix,
+	responses_per_second: int,
+	slip:                 int,
+}
+
+/*
+How many networks `server.rate_limit.overrides` may name.
+
+The limiter indexes a bucket's figures with one byte, because that is what the
+bucket's padding had going spare, so 255 overrides plus the default is what it
+can address - `RRL_MAX_OVERRIDES` in `src/server/ratelimit.odin` reads this and
+asserts that it still fits.
+
+It is a ceiling on a mistake rather than a limit anyone reaches. The setting
+exists to name the handful of prefixes whose meaning of "a client" differs from
+the rest; a file that names hundreds is a routing table in the wrong place, and
+is better told so at startup than truncated silently.
+*/
+MAX_RATE_LIMIT_OVERRIDES :: 255
 
 /*
 Refusing an upstream answer that points a public name into private address space.

@@ -5,6 +5,7 @@ import "core:net"
 import "core:testing"
 import "core:thread"
 import "core:time"
+import "elodin:config"
 
 /*
 What the limiter owes, stated as tests.
@@ -1537,4 +1538,387 @@ test_rate_limit_accounts_exactly_under_concurrent_callers :: proc(t: ^testing.T)
 	testing.expect(t, over / SLIP > SLIPS, "the flood was too small to run the slip pool dry")
 	testing.expect_value(t, slipped, u64(SLIPS))
 	testing.expect_value(t, u64(truncated), u64(SLIPS))
+}
+
+/*
+An override, written the way the loader hands one over.
+
+The loader fills `slip` in from the top-level figure when an entry does not name
+one, so a helper that left it at zero here would be testing a configuration the
+loader cannot produce - `slip: 0` means "drop them all" rather than "inherit".
+*/
+@(private = "file")
+override :: proc(text: string, rps: int, slip: int) -> config.Rate_Limit_Override {
+	p, ok := config.parse_prefix(text)
+	if !ok {
+		panic("the test named a prefix that does not parse")
+	}
+	return {prefix = p, responses_per_second = rps, slip = slip}
+}
+
+/*
+How many datagrams a prefix is answered in full, out of a bucket brought to
+`ms`, offering far more than any budget under test.
+*/
+@(private = "file")
+drain :: proc(r: ^Rate_Limiter, client: net.Endpoint, ms: i64 = 0) -> int {
+	allowed := 0
+	for _ in 0 ..< 20_000 {
+		if rate_check(r, client, at(ms)) == .Allow {
+			allowed += 1
+		}
+	}
+	return allowed
+}
+
+/*
+A named network is answered out of its own figure, and nothing else moves.
+
+The whole of #234: the budget is kept per /24 and per /64 because that is the
+granularity an attacker picks addresses within, and the consequence is that the
+unit means "a household" on a LAN and "thousands of subscribers behind carrier
+NAT" on the internet - with one figure for both and no way to say which a given
+prefix was. So a prefix can be named and given its own.
+
+Asserted in both directions, because an override that leaked would be worse than
+one that did nothing: the named network gets its figure, and the /24 beside it
+gets the default rather than the override's.
+*/
+@(test)
+test_an_override_gives_a_named_network_its_own_budget :: proc(t: ^testing.T) {
+	RATE :: 10
+	CGNAT :: 100
+	overrides := []config.Rate_Limit_Override{override("198.51.100.0/24", CGNAT, 2)}
+
+	r := make_rate_limiter(RATE, 2, overrides)
+	defer destroy_rate_limiter(r)
+
+	named := drain(r, v4(198, 51, 100, 7))
+	testing.expectf(
+		t,
+		named == CGNAT * RRL_BURST_SECONDS,
+		"the named /24 was answered %d datagrams, expected its own %d",
+		named,
+		CGNAT * RRL_BURST_SECONDS,
+	)
+
+	// The /24 next door, which the file says nothing about.
+	other := drain(r, v4(198, 51, 101, 7))
+	testing.expectf(
+		t,
+		other == RATE * RRL_BURST_SECONDS,
+		"an unnamed /24 was answered %d datagrams, expected the default %d",
+		other,
+		RATE * RRL_BURST_SECONDS,
+	)
+
+	// And it refills at its own rate too, not the default's: a tier that got the
+	// capacity right and the rate wrong would pass the two checks above.
+	refilled := drain(r, v4(198, 51, 100, 7), 1000)
+	testing.expectf(
+		t,
+		refilled == CGNAT,
+		"a second of refill answered %d datagrams, expected the named network's %d",
+		refilled,
+		CGNAT,
+	)
+}
+
+/*
+Where two entries both contain a client, the more specific one decides.
+
+An operator who writes `10.0.0.0/8` beside `10.1.2.0/24` means the /24's figure
+inside it and the /8's everywhere else, which is how every routing table and
+every ACL they have met behaves. The alternative - first match wins - would make
+the figure a client gets depend on the order the file happens to list the
+networks in, which is the one thing `config.prefix_match` promises does not
+decide anything.
+*/
+@(test)
+test_the_most_specific_override_decides :: proc(t: ^testing.T) {
+	RATE :: 10
+	WIDE :: 50
+	NARROW :: 500
+	// Written widest first, so a first-match implementation would answer with
+	// `WIDE` for the /24 and pass nothing below.
+	overrides := []config.Rate_Limit_Override {
+		override("10.0.0.0/8", WIDE, 2),
+		override("10.1.2.0/24", NARROW, 2),
+	}
+
+	r := make_rate_limiter(RATE, 2, overrides)
+	defer destroy_rate_limiter(r)
+
+	inside := drain(r, v4(10, 1, 2, 3))
+	testing.expectf(
+		t,
+		inside == NARROW * RRL_BURST_SECONDS,
+		"the /24 inside the /8 was answered %d, expected the /24's %d",
+		inside,
+		NARROW * RRL_BURST_SECONDS,
+	)
+
+	elsewhere := drain(r, v4(10, 9, 9, 9))
+	testing.expectf(
+		t,
+		elsewhere == WIDE * RRL_BURST_SECONDS,
+		"a /24 elsewhere in the /8 was answered %d, expected the /8's %d",
+		elsewhere,
+		WIDE * RRL_BURST_SECONDS,
+	)
+
+	outside := drain(r, v4(192, 0, 2, 1))
+	testing.expectf(
+		t,
+		outside == RATE * RRL_BURST_SECONDS,
+		"a /24 outside both was answered %d, expected the default %d",
+		outside,
+		RATE * RRL_BURST_SECONDS,
+	)
+}
+
+/*
+An override carries its own `slip`, because the two settings are one decision.
+
+A public prefix wants a large budget and often `slip: 0`: a truncated answer is
+an invitation to open a connection, and an operator who has concluded that
+nobody legitimate is behind the address being flooded does not want to send one.
+A LAN wants the small budget and `slip: 2`. Under one global `slip` those two
+shapes cannot both be configured, which is what #234 means by "two coherent
+profiles rather than four independent knobs".
+*/
+@(test)
+test_an_override_carries_its_own_slip :: proc(t: ^testing.T) {
+	RATE :: 10
+	overrides := []config.Rate_Limit_Override{override("203.0.113.0/24", RATE, 0)}
+
+	r := make_rate_limiter(RATE, 2, overrides)
+	defer destroy_rate_limiter(r)
+
+	/*
+	Counted in the same pass that spends the budget, not after it.
+
+	The slip pool is an eighth of the figure and holds two seconds of that, so at
+	`RATE` 10 it is two tokens: a first pass that drained the datagram budget
+	would spend both on the way and leave a second pass reading zero whatever the
+	`slip` was. That is the pool doing its job, and it would have made this case
+	pass for the wrong reason.
+	*/
+	named, elsewhere := 0, 0
+	for _ in 0 ..< 1000 {
+		if rate_check(r, v4(203, 0, 113, 9), at(0)) == .Truncate {
+			named += 1
+		}
+		if rate_check(r, v4(192, 0, 2, 9), at(0)) == .Truncate {
+			elsewhere += 1
+		}
+	}
+	testing.expectf(t, named == 0, "a network configured slip: 0 was sent %d truncated answers", named)
+	// The network on the default is still invited to TCP, so the row above is
+	// this entry's `slip` and not a limiter that stopped slipping.
+	testing.expect(t, elsewhere > 0, "the default slip stopped working once an override set slip: 0")
+}
+
+/*
+A bucket handed from one prefix to another is accounted on the newcomer's
+figures.
+
+The one ordering hazard in `rate_bucket`. The takeover test has to weigh what is
+in the bucket against the capacity of the prefix that *has* it, and the claim has
+to fill it to the capacity of the prefix taking it over. Read the other way round,
+a newcomer from a network with a large figure would find a small bucket "not yet
+refilled" and never take it, and a newcomer with a small figure would be handed a
+bucket filled past anything it is entitled to.
+
+Reaching it needs an actual collision, and the table is 16,384 buckets behind a
+hash keyed with process entropy - so the collision is searched for rather than
+constructed. Every /24 in `10.0.0.0/8` is walked to fill the table, then a /24
+outside the override is tried until it lands on a bucket a `10.x` prefix already
+holds. With four times as many prefixes as buckets the first candidate normally
+does.
+*/
+@(test)
+test_a_bucket_changing_hands_takes_the_new_prefixs_figures :: proc(t: ^testing.T) {
+	RATE :: 10
+	WIDE :: 500
+	overrides := []config.Rate_Limit_Override{override("10.0.0.0/8", WIDE, 2)}
+
+	r := make_rate_limiter(RATE, 2, overrides)
+	defer destroy_rate_limiter(r)
+
+	// Which bucket each /24 of the override lands in, so a collision can be
+	// looked up rather than hunted pairwise.
+	owners := make(map[u64]net.Endpoint, 1 << 16)
+	defer delete(owners)
+	for a in 0 ..< 256 {
+		for b in 0 ..< 256 {
+			client := v4(10, u8(a), u8(b), 1)
+			owners[prefix_key(r, client.address) % RRL_BUCKETS] = client
+		}
+	}
+
+	// A /24 on the default tier that shares a bucket with one on the override's.
+	newcomer: net.Endpoint
+	incumbent: net.Endpoint
+	found := false
+	search: for a in 0 ..< 256 {
+		for b in 0 ..< 256 {
+			candidate := v4(192, u8(a), u8(b), 1)
+			slot := prefix_key(r, candidate.address) % RRL_BUCKETS
+			if owner, ok := owners[slot]; ok {
+				newcomer, incumbent, found = candidate, owner, true
+				break search
+			}
+		}
+	}
+	if !testing.expect(t, found, "no collision was found, so the takeover path was never reached") {
+		return
+	}
+
+	/*
+	The incumbent spends its own budget dry and is left there. Its bucket now
+	holds nothing, and nothing is below the *default* capacity as well as below
+	the override's - so a takeover test that weighed the newcomer's figures would
+	refuse the handover just the same, and this half of the case says only that
+	the bucket is occupied.
+	*/
+	testing.expect_value(t, drain(r, incumbent), WIDE * RRL_BURST_SECONDS)
+
+	/*
+	A second later the incumbent's pools have refilled by a second of `WIDE`,
+	which is under its own capacity of `WIDE * 2`, so the bucket is *not* handed
+	over - and the newcomer shares what is in it. What it can spend there is the
+	incumbent's tokens, at the incumbent's rate, because that is what sharing a
+	bucket has always meant: `RRL_BUCKETS` calls it "what collides shares a
+	budget", and with figures per prefix it is a rate as well.
+
+	Asserted rather than glossed over, because it is the one direction of this
+	change that gives a prefix *more* than its own configuration says. It is not
+	reachable on purpose: the collision was hunted for above over 65,536 prefixes
+	against a table keyed with process entropy, which is exactly what an attacker
+	outside this process cannot do. See `Rate_Bucket.tier`.
+	*/
+	shared := drain(r, newcomer, 1000)
+	testing.expectf(
+		t,
+		shared == WIDE,
+		"a client sharing a named network's bucket was answered %d, expected the second of %d that bucket had accrued",
+		shared,
+		WIDE,
+	)
+
+	/*
+	And once the incumbent has been quiet long enough to be entitled to
+	everything, the bucket does change hands - to the newcomer's figures and not
+	the incumbent's. This is the half that would break if the claim filled the
+	bucket to the tier it read before reassigning.
+	*/
+	taken := drain(r, newcomer, 60_000)
+	testing.expectf(
+		t,
+		taken == RATE * RRL_BURST_SECONDS,
+		"the newcomer took over a refilled bucket and was answered %d, expected its own %d",
+		taken,
+		RATE * RRL_BURST_SECONDS,
+	)
+}
+
+/*
+A limiter with no overrides is the limiter that was here before there were any.
+
+The guard on the whole change: `tiers[0]` is the configured pair, every bucket
+starts on tier 0, and `resolve_tier` returns 0 without looking at anything when
+the list is empty. So a deployment that names no network pays nothing for the
+setting existing - not a walk per bucket claim, and not a byte in the table.
+*/
+@(test)
+test_no_overrides_is_the_default_everywhere :: proc(t: ^testing.T) {
+	RATE :: 25
+	r := make_rate_limiter(RATE, 2)
+	defer destroy_rate_limiter(r)
+
+	testing.expect_value(t, len(r.tiers), 1)
+	testing.expect_value(t, len(r.prefixes), 0)
+	testing.expect_value(t, r.tiers[0].slip, 2)
+	testing.expect_value(t, resolve_tier(r, v4(198, 51, 100, 1).address), u8(0))
+
+	for client in ([]net.Endpoint{v4(198, 51, 100, 1), v4(10, 0, 0, 1), v6(0xabcd, 1)}) {
+		got := drain(r, client)
+		testing.expectf(
+			t,
+			got == RATE * RRL_BURST_SECONDS,
+			"a prefix was answered %d datagrams with no overrides configured, expected %d",
+			got,
+			RATE * RRL_BURST_SECONDS,
+		)
+	}
+}
+
+/*
+An IPv6 override is keyed on the /64, like everything else here.
+
+The families are separate all the way down - `client_prefix` reads three bytes of
+IPv4 and eight of IPv6, and `config.prefix_match` refuses to compare one against
+the other - so this is the half of the change that a v4-only test would not have
+reached.
+*/
+@(test)
+test_an_ipv6_override_is_keyed_on_the_64 :: proc(t: ^testing.T) {
+	RATE :: 10
+	BIG :: 200
+	// The /48 the `v6` helper's addresses sit in: 2001:db8:<prefix>::/48 covers
+	// every /64 it can produce, which is what an operator naming a customer
+	// allocation would write.
+	overrides := []config.Rate_Limit_Override{override("2001:db8::/32", BIG, 2)}
+
+	r := make_rate_limiter(RATE, 2, overrides)
+	defer destroy_rate_limiter(r)
+
+	inside := drain(r, v6(0x1111, 1))
+	testing.expectf(
+		t,
+		inside == BIG * RRL_BURST_SECONDS,
+		"a /64 inside the named /32 was answered %d, expected %d",
+		inside,
+		BIG * RRL_BURST_SECONDS,
+	)
+
+	// An IPv4 client is not inside an IPv6 entry, however the bytes line up.
+	outside := drain(r, v4(32, 1, 13, 184))
+	testing.expectf(
+		t,
+		outside == RATE * RRL_BURST_SECONDS,
+		"an IPv4 client matched an IPv6 override: answered %d, expected the default %d",
+		outside,
+		RATE * RRL_BURST_SECONDS,
+	)
+}
+
+/*
+A v4-mapped client matches an IPv4 override.
+
+The deployment `config.source_allowed` goes out of its way to support - an IPv4
+client arriving on a socket bound to `::` - and the one every judgement about a
+source has to make the same way. An override resolved without undoing the
+mapping would read such a client as IPv6, miss the entry, and put the whole IPv4
+side of a wildcard listener on the default while its operator was looking at a
+configuration that said otherwise.
+*/
+@(test)
+test_a_mapped_client_matches_an_ipv4_override :: proc(t: ^testing.T) {
+	RATE :: 10
+	BIG :: 100
+	overrides := []config.Rate_Limit_Override{override("198.51.100.0/24", BIG, 2)}
+
+	r := make_rate_limiter(RATE, 2, overrides)
+	defer destroy_rate_limiter(r)
+
+	got := drain(r, mapped(198, 51, 100, 7))
+	testing.expectf(
+		t,
+		got == BIG * RRL_BURST_SECONDS,
+		"a v4-mapped client was answered %d, expected the IPv4 override's %d",
+		got,
+		BIG * RRL_BURST_SECONDS,
+	)
 }

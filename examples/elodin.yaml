@@ -161,6 +161,17 @@ server:
   # an actor with addresses in several prefixes has several copies of each. If this
   # instance is reachable from the internet, put a per-source limit on new
   # connections in front of it as well - the README has an nftables rule.
+  #
+  # The figures are defaults rather than the only answer. A /24 is a household
+  # here and thousands of subscribers behind a carrier NAT on the internet, so a
+  # network can be named and given its own: most specific entry wins, an entry
+  # cannot be finer than the /24 or /64 the budgets are kept in, and a `slip`
+  # left out is inherited from below. Each entry is named in the log at startup,
+  # which is the only place that says which networks are not on the default.
+  #
+  #   overrides:
+  #     - { prefix: 198.51.100.0/24, responses_per_second: 5000 }
+  #     - { prefix: 203.0.113.0/24, responses_per_second: 50, slip: 0 }
   rate_limit:
     enabled: true
     responses_per_second: 500

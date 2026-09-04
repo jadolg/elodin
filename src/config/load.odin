@@ -209,7 +209,137 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 		opt_bool(l, rl, "enabled", &cfg.server.rate_limit.enabled, "server.rate_limit")
 		opt_int(l, rl, "responses_per_second", &cfg.server.rate_limit.responses_per_second, "server.rate_limit")
 		opt_int(l, rl, "slip", &cfg.server.rate_limit.slip, "server.rate_limit")
+		load_rate_limit_overrides(l, rl, cfg)
 	}
+}
+
+/*
+The most specific network a rate-limit override may name, by family.
+
+The budgets are accounted per /24 and per /64, so an entry finer than that could
+only ever be applied to the whole prefix containing it. See
+`Rate_Limit_Override`.
+*/
+@(private)
+OVERRIDE_MAX_BITS_V4 :: 24
+
+@(private)
+OVERRIDE_MAX_BITS_V6 :: 64
+
+/*
+Read `server.rate_limit.overrides` into the networks it names.
+
+Parsed at load, with the parser `allow_from` uses, so a network that will not
+parse fails `--check` rather than coming up as a server quietly applying the
+default to a prefix the operator thought they had configured. The figures are
+checked here too: the loader is the only thing that sees an entry beside the line
+it was written on, and a limiter built out of a bad figure has nothing left to
+complain with.
+
+An entry that names no `slip` carries -1 out of here, and `validate` fills it in
+from the top-level figure once that is known to be final. Reading it during this
+pass would inherit whatever had been parsed so far, which depends on the order
+the keys happen to appear in the file.
+*/
+@(private)
+load_rate_limit_overrides :: proc(l: ^Loader, rl: ^yaml.Node, cfg: ^Config) {
+	child := yaml.get(rl, "overrides")
+	if child == nil {
+		return
+	}
+	if yaml.is_null(child) {
+		errorf(
+			l,
+			"server.rate_limit.overrides: expected a list of networks with figures of their own, such as [{prefix: 198.51.100.0/24, responses_per_second: 5000}]; it has no value",
+		)
+		return
+	}
+	entries := yaml.items(child)
+	if len(entries) == 0 {
+		return
+	}
+	if len(entries) > MAX_RATE_LIMIT_OVERRIDES {
+		errorf(
+			l,
+			"server.rate_limit.overrides names %d networks, which is more than the %d the limiter can account for; this setting is for the handful of prefixes whose meaning of \"a client\" differs from the rest",
+			len(entries),
+			MAX_RATE_LIMIT_OVERRIDES,
+		)
+		return
+	}
+	out := make([dynamic]Rate_Limit_Override, 0, len(entries), l.allocator)
+
+	for e, i in entries {
+		path := fmt.tprintf("server.rate_limit.overrides[%d]", i)
+		text := ""
+		opt_string(l, e, "prefix", &text, path)
+		if text == "" {
+			errorf(l, "%s: missing prefix, which is the network this entry is about", path)
+			continue
+		}
+		p, pok := parse_prefix(text)
+		if !pok {
+			errorf(l, "%s: %q is not a network in CIDR form such as 198.51.100.0/24 or 2001:db8::/32", path, text)
+			continue
+		}
+		/*
+		Finer than the accounting is refused rather than quietly widened.
+
+		Every address in a /24 shares one bucket, so a /28 entry could only be
+		applied to the /24 around it - sixteen times the network the operator
+		named. The error says what to write instead, because the fix is
+		mechanical and the mistake is an easy one to make: somebody thinking
+		about one client reaches for /32.
+		*/
+		limit := u8(OVERRIDE_MAX_BITS_V6) if p.v6 else u8(OVERRIDE_MAX_BITS_V4)
+		if p.bits > limit {
+			errorf(
+				l,
+				"%s: %q is finer than the /%d these budgets are accounted per, so it could only ever be applied to the whole /%d around it; name that network instead",
+				path,
+				text,
+				limit,
+				limit,
+			)
+			continue
+		}
+		/*
+		The same network twice is refused. `prefix_match` takes the most specific
+		entry, so two of equal length would leave the figure decided by the order
+		they happen to be written in - which is the one thing that procedure's
+		contract promises does not decide anything.
+		*/
+		duplicate := false
+		for existing in out {
+			if existing.prefix == p {
+				errorf(l, "%s: %q already has figures of its own from an earlier entry", path, text)
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			continue
+		}
+
+		// -1 is "the entry did not say", which `validate` fills in. 0 is a value
+		// `slip` can be given on purpose, so it cannot stand for absence.
+		o := Rate_Limit_Override {
+			prefix = p,
+			slip   = -1,
+		}
+		opt_int(l, e, "responses_per_second", &o.responses_per_second, path)
+		opt_int(l, e, "slip", &o.slip, path)
+		if o.responses_per_second == 0 {
+			errorf(
+				l,
+				"%s: missing responses_per_second; an entry with no figure of its own is the default, which is what leaving the network out already means",
+				path,
+			)
+			continue
+		}
+		append(&out, o)
+	}
+	cfg.server.rate_limit.overrides = out[:]
 }
 
 /*
@@ -2134,6 +2264,46 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 		if cfg.server.rate_limit.slip < 0 {
 			errorf(l, "server.rate_limit.slip must not be negative")
 		}
+		/*
+		The overrides' own figures, held to the same rules as the defaults they
+		replace, and the inherited `slip` filled in here.
+
+		Here rather than in the loader because the top-level figures are only
+		final once the whole `rate_limit` map has been read: an entry written
+		above `slip:` in the same file would otherwise inherit the value from
+		before it was parsed.
+		*/
+		for &o in cfg.server.rate_limit.overrides {
+			label := format_prefix(o.prefix, context.temp_allocator)
+			if o.responses_per_second < 1 {
+				errorf(l, "server.rate_limit.overrides: %s: responses_per_second must be at least 1", label)
+			}
+			if o.slip < 0 {
+				// Not "must not be negative": -1 is this loader's own marker for
+				// an entry that said nothing, so a negative figure an operator
+				// actually wrote is the only way to get here with one.
+				if o.slip < -1 {
+					errorf(l, "server.rate_limit.overrides: %s: slip must not be negative", label)
+				}
+				o.slip = cfg.server.rate_limit.slip
+			}
+		}
+	} else if len(cfg.server.rate_limit.overrides) > 0 {
+		/*
+		Overrides with the limiter off are refused rather than ignored.
+
+		Every one of them is an operator saying what a named network's budget
+		should be, and with `enabled: false` there is no budget at all - so
+		accepting the pair silently would be this server agreeing to a
+		configuration it does not implement. The two readings ("I meant to turn
+		it on" and "these are notes for later") are far enough apart to be worth
+		asking about.
+		*/
+		errorf(
+			l,
+			"server.rate_limit.overrides names %d network(s), but server.rate_limit.enabled is false, so there are no budgets to override",
+			len(cfg.server.rate_limit.overrides),
+		)
 	}
 	if cfg.server.max_pending < 0 {
 		errorf(l, "server.max_pending must not be negative")

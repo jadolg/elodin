@@ -101,9 +101,18 @@ server:
     # exceed it, `slip` sends it to TCP rather than dropping it, so it keeps
     # resolving one round trip slower.
     #
+    # That last part has a ceiling, and on a public instance it is the number to
+    # know. The TCP the slip sends a client to is charged to a budget of the
+    # same size, and a client that opens a connection per query spends the
+    # arrival budget too - so a /24 whose *total* passes about twice this figure
+    # is being refused rather than delayed, however `slip` is set. A busy
+    # carrier NAT reaches that. `overrides` below is how to say so for the
+    # ranges you know about.
+    #
     # Lower it if you are being used for reflection and the victim is visible;
     # 100 is still 120 KB/s. Watch elodin_rate_limited_total before and after,
-    # since the same change costs real clients their datagrams.
+    # since the same change costs real clients their datagrams. Lowering it for
+    # one network rather than for all of them is also an override.
     responses_per_second: 500
     # At most every second over-budget datagram comes back with the TC bit: too
     # small to reflect, and the standard way of telling a real client to come
@@ -117,6 +126,38 @@ server:
     # `slip: 0` drops them all instead, and is what you want only if you have
     # decided nobody legitimate is behind the address being flooded.
     slip: 2
+
+    # The networks the two figures above are wrong for, and what they get
+    # instead. This is the setting that makes "a /24" mean something you chose:
+    # everything not named here stays on the defaults.
+    #
+    # A public instance is where it earns its keep, because a /24 on the
+    # internet is not a household. Carrier-grade NAT puts thousands of
+    # subscribers behind a handful of addresses, and 500 responses a second is
+    # what they get between them; the ranges are published by the operators who
+    # use them, and an entry per range is a great deal less blunt than raising
+    # the default for everybody.
+    #
+    # Where two entries both contain a client, the more specific decides, as in
+    # a routing table - so a /8 and a /24 inside it is a coherent pair and the
+    # order does not matter. An entry cannot be finer than /24 (or /64 on IPv6),
+    # because that is the unit the budgets are accounted in; a /32 is refused at
+    # startup rather than quietly applied to the 256 addresses around it.
+    #
+    # `slip` per entry, since the two are one decision: a network given a large
+    # budget usually wants `slip: 0` when it goes over, and a network given a
+    # small one is usually a network you are being used to attack. Left out, an
+    # entry inherits the `slip` above.
+    #
+    # Every entry is named in the log at startup with the figures it derives.
+    # Read those lines once after a change: the counters are not labelled per
+    # prefix, so an entry that does not match the clients it was meant for is
+    # visible there and nowhere else.
+    #
+    # overrides:
+    #   - { prefix: 198.51.100.0/24, responses_per_second: 5000 }
+    #   - { prefix: "2001:db8:1000::/36", responses_per_second: 5000 }
+    #   - { prefix: 203.0.113.0/24, responses_per_second: 50, slip: 0 }
 
   # The account to be after the ports are bound. The packaged systemd unit
   # binds :53, :853 and :443 through AmbientCapabilities and runs under

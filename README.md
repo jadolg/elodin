@@ -1045,6 +1045,64 @@ have the clients beside it dropped.
 for UDP. `cookies.require` is the sharper instrument for an attack actually under
 way.
 
+#### When a /24 is not a household
+
+```yaml
+server:
+  rate_limit:
+    responses_per_second: 500
+    slip: 2
+    overrides:
+      # A carrier NAT: thousands of subscribers, not one household.
+      - { prefix: 198.51.100.0/24, responses_per_second: 5000 }
+      # A network being used for reflection, given a figure of its own rather
+      # than narrowing what every other client gets.
+      - { prefix: 203.0.113.0/24, responses_per_second: 50, slip: 0 }
+```
+
+The budgets are kept per /24 and per /64 because that is the granularity an
+attacker picks addresses within, and that reasoning is right. The consequence is
+that the unit means two incompatible things depending on where this server is: on
+a LAN a /24 is a household or an office, and 500 responses a second is far past
+what the busiest of those asks for. On the internet a /24 behind carrier-grade NAT
+is thousands of subscribers, and 500 a second is what they get **between them**.
+
+`overrides` is where an operator says which a given network is. Each entry names
+a network and the figures it gets; everything else stays on the defaults above.
+Where two entries both contain a client the more specific one decides, as in a
+routing table, so `10.0.0.0/8` beside `10.1.2.0/24` means the /24's figure inside
+it and the /8's everywhere else — the order they are written in decides nothing.
+An entry that names no `slip` inherits the one above it.
+
+**An entry cannot be finer than the accounting.** An IPv4 network longer than /24,
+or an IPv6 one longer than /64, is refused at startup: every address in a /24
+shares one bucket, so a `/32` could only ever be applied to the whole /24 around
+it, which is 256 addresses getting a figure written for one. Write the /24.
+
+Without an override, what the slip does about a busy NAT is real but bounded, and
+the bound is worth knowing before deciding you do not need one. A prefix over its
+datagram budget has at most every `slip`th over-limit query answered truncated,
+which sends that client to TCP — where it is served out of a budget of its own, so
+it keeps resolving one round trip slower. That holds while the prefix's *total*
+stays inside the two budgets together. Past that it does not: the stream pool is
+`responses_per_second` as well, and a client that opens a connection per query
+spends the arrival budget too, so a /24 asking more than about twice the figure is
+being refused rather than delayed however `slip` is set. A busy carrier NAT
+reaches that.
+
+`slip` is per entry because the two settings are one decision rather than two. A
+public prefix usually wants a large budget and `slip: 0` — a truncated answer is
+an invitation to open a connection, and an operator who has concluded that nobody
+legitimate is behind the address being flooded does not want to send one. A LAN
+wants the small budget and `slip: 2`.
+
+Every network with figures of its own is named in the log at startup, one line
+each, with the truncated-answer budget it derives. Nothing else can tell an
+operator which tier a client was accounted on: the counters are not labelled per
+prefix, because a series per /24 is cardinality a peer would choose. So a
+misconfigured entry — one that does not match the clients it was meant for — is
+visible in those lines and nowhere else.
+
 What none of this bounds is how much of the server one client *occupies*. Every
 budget here is a rate — arriving, and asking — and a client that stays inside them
 can still hold every connection it was given for as long as it likes. That is the
