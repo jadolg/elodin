@@ -250,24 +250,36 @@ server: {{ user: root }}
 			res.output,
 		)
 
+		/*
+		The rest of the file, checked with the certificate this suite already
+		has - `r.cert_file`, which is `certs/cert.pem` when the tree has one and
+		a freshly generated pair in the work directory otherwise. Written as an
+		absolute path, since `--check` resolves these against elodin's own
+		working directory rather than this test's.
+
+		Only when there is a certificate to name: a machine with no `openssl`
+		leaves the harness without one and skips every TLS case, and the first
+		half above is the assertion that does not need it.
+		*/
 		src, read_err := os.read_entire_file(
 			"examples/public.yaml",
 			context.temp_allocator,
 		)
-		if check(r, read_err == nil, "could not read examples/public.yaml: %v", read_err) {
+		have_cert := r.cert_file != "" && r.key_file != ""
+		if have_cert && check(r, read_err == nil, "could not read examples/public.yaml: %v", read_err) {
 			// `replace_all` reports whether it allocated rather than whether it
 			// matched, so the flag says nothing useful here and the text is
 			// taken as it comes back either way.
 			text, _ := strings.replace_all(
 				string(src),
 				"/etc/elodin/cert.pem",
-				"certs/cert.pem",
+				r.cert_file,
 				context.temp_allocator,
 			)
 			text, _ = strings.replace_all(
 				text,
 				"/etc/elodin/key.pem",
-				"certs/key.pem",
+				r.key_file,
 				context.temp_allocator,
 			)
 			path := filepath.join({r.work_dir, "public-with-certs.yaml"}, context.temp_allocator) or_else ""
