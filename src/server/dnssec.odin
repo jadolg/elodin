@@ -166,8 +166,13 @@ validator_query :: proc(
 	on its own account follows a route, whatever the name or the type. The
 	client's own question does follow one, with the single exception `route_group`
 	carves out for a `DS` at a route's apex - the same argument as this one
-	reached from the other side, and the reason the two now agree rather than only
-	this one being right. The route points at a local authority for the zone, and
+	reached from the other side, and the reason the client's copy of that question
+	no longer lands somewhere this one calls wrong. The two are not the same
+	selector even so: `route_group` asks the group that answers the *parent*,
+	which for a route nested inside another route is that outer route's group
+	rather than `s.group`. A chain walk reaching an anchored zone that deep wants
+	the public tree, which is what this hands it. The route points at a local
+	authority for the zone, and
 	a local authority answers questions about its own zone out of its own data: a
 	router authoritative for `home.arpa.` answers `home.arpa. DS` with an unsigned
 	NODATA rather than forwarding to `arpa.`, where the signed proof that the

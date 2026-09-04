@@ -371,6 +371,13 @@ and a validator implementing RFC 8020 reads it as proof that every name under th
 apex is gone too. `home.arpa` is unaffected — `arpa` does delegate it, so the
 answer there is the insecure-delegation proof the client came for.
 
+The question also goes back on the route when the parent's group does not answer
+at all, so a routed zone keeps standing on its own: `upstream.servers` being
+down, or unreachable from the network the resolver sits on, does not take the
+chain out from under a zone whose own authority is answering. A reply that
+arrives saying SERVFAIL is passed on as any other rcode is — one server
+declining to say is still the parent's group having spoken.
+
 The answer cache is keyed on the question rather than on which upstream produced
 it, which holds because the routing table is built once at startup — restart
 after changing a route. `--check` and the startup log say out loud what each

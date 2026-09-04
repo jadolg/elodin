@@ -78,10 +78,22 @@ serve_route :: proc(x: ^Route_Mock) {
 	backing: [4096]u8
 	mem.arena_init(&scratch, backing[:])
 	buf: [4096]u8
+	if len(x.reply) > len(buf) {
+		return
+	}
 	for {
 		n, remote, err := net.recv_udp(x.socket, buf[:])
-		if err != nil || n < dns.HEADER_SIZE || len(x.reply) > len(buf) {
+		if err != nil {
+			// The receive timeout expiring, which is how this returns when the
+			// question it wants never arrives.
 			return
+		}
+		// A datagram too short to be a question is skipped rather than taken as
+		// the end of the wait: giving up on one would hand a stray runt from
+		// another parallel test the power to fail this case on "never asked",
+		// which is the flake the loop exists to close.
+		if n < dns.HEADER_SIZE {
+			continue
 		}
 		free_all(mem.arena_allocator(&scratch))
 		q, ok := dns.peek_question(buf[:n], mem.arena_allocator(&scratch))
@@ -114,8 +126,14 @@ route_mock_quiet :: proc(socket: net.UDP_Socket, name: string) -> bool {
 	buf: [4096]u8
 	for {
 		n, _, err := net.recv_udp(socket, buf[:])
-		if err != nil || n < dns.HEADER_SIZE {
+		if err != nil {
 			return true
+		}
+		// Skipped rather than read as silence, the same way `serve_route` skips
+		// it: a runt ahead of a real leak would otherwise report the socket
+		// quiet with the leaked query still sitting in its buffer.
+		if n < dns.HEADER_SIZE {
+			continue
 		}
 		// The temp allocator is safe here where it is not in `serve_route`: this
 		// runs on the test's own thread, and nothing decoded escapes the call.
@@ -679,6 +697,84 @@ test_an_apex_ds_the_parent_denies_falls_back_to_the_route :: proc(t: ^testing.T)
 		testing.expect_value(t, derr2, dns.Decode_Error.None)
 		testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
 	}
+	free_all(context.temp_allocator)
+}
+
+/*
+A parent's group that does not answer at all also puts the question on the route.
+
+The fourth arrangement, and the one that decides whether a routed zone still
+stands on its own. Before the carve-out the apex `DS` went to the local
+authority like every other question about the zone, so the public upstream being
+down, unreachable, or absent from the network entirely had no bearing on it. Read
+as an rcode test alone the carve-out would hand that dependency back: one outage
+out there, and a validating client below here gets SERVFAIL for the apex `DS`,
+which is a broken chain and SERVFAIL for every name in an internal zone whose
+authority is answering perfectly well - the failure the carve-out exists to
+prevent, arriving by the road it opened.
+
+The parent's socket is bound and nobody serves it, which is what an upstream
+that has gone away looks like from here, and the timeout is cut so the case does
+not sit out `forwarding_config`'s three seconds. The control is
+`test_an_apex_ds_the_parent_denies_falls_back_to_the_route` above: a parent that
+answers NOERROR keeps the question, so this is the absence of a reply doing the
+work and not the fallback firing for everything.
+*/
+@(test)
+test_an_apex_ds_the_parent_could_not_answer_falls_back_to_the_route :: proc(t: ^testing.T) {
+	def_socket, derr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, derr == nil, "cannot bind the default mock: %v", derr) {
+		return
+	}
+	defer net.close(def_socket)
+	def_bound, _ := net.bound_endpoint(def_socket)
+
+	route_socket, rerr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, rerr == nil, "cannot bind the routed mock: %v", rerr) {
+		return
+	}
+	defer net.close(route_socket)
+	_ = net.set_option(route_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+	route_bound, _ := net.bound_endpoint(route_socket)
+
+	cfg := forwarding_config()
+	cfg.upstream.timeout = 200 * time.Millisecond
+
+	group := mock_group(t, cfg.upstream, def_bound.port)
+	defer upstream.destroy_group(group)
+	routed := mock_group(t, cfg.upstream, route_bound.port)
+	defer upstream.destroy_group(routed)
+
+	s := Server {
+		cfg    = &cfg,
+		group  = group,
+		routes = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
+	}
+
+	authority := Route_Mock {
+		socket = route_socket,
+		reply  = route_reply_nodata("corp.example.", .DS),
+		want   = "corp.example.",
+	}
+	route_thread := thread.create_and_start_with_poly_data(&authority, serve_route)
+	out, _, ok := handle_query(
+		&s,
+		route_query("corp.example.", .DS),
+		.UDP,
+		"127.0.0.1:5555",
+		context.temp_allocator,
+	)
+	thread.join(route_thread)
+	thread.destroy(route_thread)
+
+	if !testing.expect(t, ok, "nothing came back at all") {
+		return
+	}
+	testing.expect(t, authority.asked, "the route was not asked after the parent's group went quiet")
+
+	decoded, derr2 := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr2, dns.Decode_Error.None)
+	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
 	free_all(context.temp_allocator)
 }
 

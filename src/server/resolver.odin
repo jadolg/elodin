@@ -974,7 +974,8 @@ resolve_query :: proc(
 	asked := route_group(s, q.name, q.type)
 	resp, winner, uerr := upstream.resolve(asked, forwarded, allocator)
 	/*
-	And back on the route when the parent says there is no such zone.
+	And back on the route when the parent's group establishes no delegation:
+	because it says there is no such zone, or because it did not answer at all.
 
 	`apex_ds_off_route` argues the whole of it. In short: an NXDOMAIN for a
 	routed apex's `DS` says the public tree delegates nothing here, so there is
@@ -982,11 +983,19 @@ resolve_query :: proc(
 	and passing the NXDOMAIN on would take a working insecure zone and hand the
 	client a signed proof that every name in it is gone.
 
-	Only NXDOMAIN, and only when the second exchange succeeds. A SERVFAIL from
-	the parent's group is one server declining to say rather than a statement
-	about the delegation, and a route that cannot be reached either leaves the
-	parent's answer as the only one there is - in both cases what came back
-	first is what the client gets.
+	A parent's group that could not be reached at all reaches the same place by
+	a shorter road, and it is why this is not a test of the rcode alone. Before
+	the carve-out a routed zone answered every question about itself with the
+	public upstream uninvolved, which is most of why an operator routes one - so
+	letting the apex `DS` fail with that upstream would make one outage out
+	there break the chain for every name in an internal zone that is answering
+	perfectly well, which is the failure the carve-out exists to prevent wearing
+	a different hat. Asking the parent first costs nothing here: the route is
+	asked second, and only once the parent has produced nothing.
+
+	A reply that arrived and said SERVFAIL is deliberately not in that set. The
+	parent's group answered, and for the client's own question the rcode is the
+	answer, here as everywhere else on this path.
 
 	Only when the two groups differ, as well. A route may list a zone and its
 	parent together, and then `route_group` has already sent this question to the
@@ -1000,27 +1009,43 @@ resolve_query :: proc(
 	being a new one on the wire, and the client's own ID goes back on below.
 	*/
 	unbacked_denial := false
-	if uerr == .None && apex_ds_off_route(s, q.name, q.type) && dns.peek_rcode(resp) == .NX_Domain {
-		if own := zone_route_group(s, q.name); own != asked {
-			dns.set_id_in_place(forwarded, dns.random_id())
-			again, second, aerr := upstream.resolve(own, forwarded, allocator)
-			if aerr == .None {
-				logx.debugf(
-					"query DS %s: the parent's group answered NXDOMAIN, so the route was asked instead",
-					q.name,
-				)
-				resp, winner = again, second
-			} else {
-				/*
-				The client gets the parent's NXDOMAIN, and the cache does not
-				keep it. See the store below.
-				*/
-				unbacked_denial = true
-				logx.debugf(
-					"query DS %s: the parent's group answered NXDOMAIN and the route did not answer (%v); not storing the denial",
-					q.name,
-					aerr,
-				)
+	if apex_ds_off_route(s, q.name, q.type) {
+		denied := uerr == .None && dns.peek_rcode(resp) == .NX_Domain
+		if denied || uerr != .None {
+			if own := zone_route_group(s, q.name); own != asked {
+				dns.set_id_in_place(forwarded, dns.random_id())
+				again, second, aerr := upstream.resolve(own, forwarded, allocator)
+				switch {
+				case aerr == .None:
+					logx.debugf(
+						"query DS %s: the parent's group established no delegation (nxdomain=%v, error=%v), so the route was asked instead",
+						q.name,
+						denied,
+						uerr,
+					)
+					resp, winner, uerr = again, second, .None
+				case denied:
+					/*
+					The client gets the parent's NXDOMAIN, and the cache does not
+					keep it. See the store below.
+					*/
+					unbacked_denial = true
+					logx.debugf(
+						"query DS %s: the parent's group answered NXDOMAIN and the route did not answer (%v); not storing the denial",
+						q.name,
+						aerr,
+					)
+				case:
+					// Neither group produced anything. `uerr` still holds the
+					// parent's failure, which the error path below reads and
+					// answers from - there is no denial to serve or to store.
+					logx.debugf(
+						"query DS %s: neither the parent's group (%v) nor the route (%v) answered",
+						q.name,
+						uerr,
+						aerr,
+					)
+				}
 			}
 		}
 	}

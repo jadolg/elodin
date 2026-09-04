@@ -104,9 +104,10 @@ Three things the carve-out deliberately is not:
     delegation inside a zone that exists nowhere but this network, and the
     answer to that one really is on the router.
   - It is not decided at load by whether the public tree delegates the zone,
-    because nothing at load can know that. It is decided by the answer: an
-    NXDOMAIN from the parent's group says the delegation is not there to ask
-    about, and `resolve_query` then puts the question back on the route. See
+    because nothing at load can know that. It is decided by the answer: a
+    parent's group that establishes no delegation - an NXDOMAIN, or no reply at
+    all - leaves the route as the only thing that can answer, and
+    `resolve_query` then puts the question back on it. See
     `apex_ds_off_route`, which is where that reading is argued.
 
 What it does not touch is whether the answer is validated. `served_locally` still
@@ -130,7 +131,11 @@ with `corp.example.` on the domain controller and `dev.corp.example.` on a lab
 server, `dev.corp.example. DS` is the domain controller's to answer, and it is
 the one machine that holds that delegation. `dns.name_parent` of a route domain
 is always shorter than the domain, and the root is refused as a route domain at
-load, so the walk up is one step and cannot land back on the same route.
+load, so the walk up is one step and terminates. It can land back on the route
+it started from, one entry being free to list a zone and its parent together,
+and that is the right answer rather than a loop to guard against: the parent's
+authority is the route's own, so the question stays where it was going and
+`resolve_query` skips the fallback for it.
 */
 @(private)
 route_group :: proc(s: ^Server, name: string, type: dns.Type) -> ^upstream.Group {
@@ -147,7 +152,7 @@ The group the route points at for `name`, the apex `DS` carve-out ignored.
 which for the one question that leaves the route is a different place, and both
 callers of it want the second: `route_group` itself, to ask the question of the
 parent's zone rather than of the parent's name, and `resolve_query`, to put an
-apex `DS` back on the route when the parent has said there is no such zone.
+apex `DS` back on the route when the parent's group established no delegation.
 */
 @(private)
 zone_route_group :: proc(s: ^Server, name: string) -> ^upstream.Group {
@@ -179,6 +184,13 @@ So the question goes back on the route, and the deployment keeps exactly the
 behaviour it had before the carve-out existed. `home.arpa.` is untouched by it:
 `arpa.` does delegate the zone, so the answer there is a NODATA carrying the
 signed proof, never an NXDOMAIN, and the fallback never fires.
+
+A parent's group that did not answer at all is read the same way, for the reason
+`resolve_query` sets out beside the fallback: a routed zone used to answer for
+itself with the public upstream uninvolved, and an outage out there must not
+take the chain out from under every name in an internal zone that is answering.
+A reply that arrived saying SERVFAIL is not read that way - one server declining
+to say is still the parent's group having spoken.
 
 Deciding it on the answer rather than at load is what issue #227 left open as
 "cannot be known at load". It cannot - but it can be known from the reply, at
