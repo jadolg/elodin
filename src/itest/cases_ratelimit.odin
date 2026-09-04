@@ -1,6 +1,7 @@
 package itest
 
 import "core:fmt"
+import "core:net"
 import "core:time"
 import "elodin:dns"
 
@@ -351,11 +352,16 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 	produce. Raising `responses_per_second` is not available either: the whole point
 	of one a second is that a shared pool would still be empty across the drain.
 
-	What stands in for the probe is the flood. `wait_ready` has already had an
-	answer over UDP, and the listeners bind udp before tcp, so what this case has to
-	clear is the gap between two `listen_tcp` calls at startup - against which two
-	hundred datagrams and a 250 ms drain are a far wider margin than the one spare
-	token the probe used to leave behind.
+	What stands in for the probe is `query_tcp_once_bound`, which retries only
+	while the *dial* fails. That is the distinction the probe could not make: a
+	connect refused by the kernel is a listener that has not bound yet and costs no
+	arrival, while a connection accepted and then closed is this budget refusing
+	one - so the retry waits out the udp-before-tcp bind gap and still spends
+	exactly the one token the case is entitled to. Left as a timing argument it
+	would not have been sound: `start_udp` binds *and* starts its readers before
+	`start_tcp` runs, so `wait_ready` answering over UDP says nothing about the
+	stream listener, and a dial in that gap would have failed as though the pools
+	had been merged.
 
 	The UDP result is checked first, because what follows means nothing if the flood
 	did not arrive: two hundred datagrams answered a handful of times is the budget
@@ -394,7 +400,7 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 				QUERIES,
 			)
 
-			answer := query_tcp(tcp_port, query)
+			answer := query_tcp_once_bound(tcp_port, query, 5 * time.Second)
 			defer delete(answer.wire)
 			check(
 				r,
@@ -462,5 +468,45 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 			}
 		}
 		end_case(r)
+	}
+}
+
+/*
+One TCP query, dialled once the listener is there to dial.
+
+`query_tcp` with the retry a case can only afford on the *connect*. A dial the
+kernel refuses is a listener that has not bound yet and costs nothing; a
+connection accepted and then closed is the arrival budget refusing one, and
+retrying *that* would spend a token per attempt and turn a bound doing its job
+into a case that waits out its deadline. So the loop asks again only while the
+dial itself failed, and the first socket it gets carries the one query it came to
+ask.
+
+Here rather than in `client.odin` because it exists for the one case that cannot
+afford the readiness probe - see the note on the datagram-flood case above. Every
+other stream case passes `tcp_port` to `start_server` and lets `wait_tcp`
+establish the same precondition out of a budget it has room in.
+
+`timeout` bounds how long the bind gap may last, not how long an answer may take;
+the socket gets `CLIENT_TIMEOUT` for that, as `query_tcp` gives it.
+*/
+@(private = "file")
+query_tcp_once_bound :: proc(tcp_port: int, query: []u8, timeout: time.Duration) -> Query_Result {
+	deadline := time.time_add(time.now(), timeout)
+	for {
+		socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = tcp_port})
+		if err != nil {
+			if time.diff(deadline, time.now()) >= 0 {
+				return {}
+			}
+			continue
+		}
+		defer net.close(socket)
+		_ = net.set_option(socket, .Receive_Timeout, CLIENT_TIMEOUT)
+		_ = net.set_option(socket, .Send_Timeout, CLIENT_TIMEOUT)
+		conn := Test_Conn {
+			socket = socket,
+		}
+		return stream_query(&conn, query, context.allocator)
 	}
 }

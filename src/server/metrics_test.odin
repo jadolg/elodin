@@ -26,10 +26,14 @@ metrics_fixture :: proc(stats: Stats) -> (Server, config.Config) {
 	return s, cfg
 }
 
+// `limiter` defaults to none, which is what every case about `Stats` wants: the
+// endpoint reads the limiter's counters through `rate_limit_stats`, which answers
+// zeroes for a nil one. A case about those counters passes one in.
 @(private)
-render_fixture :: proc(stats: Stats) -> string {
+render_fixture :: proc(stats: Stats, limiter: ^Rate_Limiter = nil) -> string {
 	s, cfg := metrics_fixture(stats)
 	s.cfg = &cfg
+	s.limiter = limiter
 	listeners: Listeners
 	return render_metrics(&s, &listeners, context.temp_allocator)
 }
@@ -99,17 +103,14 @@ a metric name on it.
 */
 @(test)
 test_the_limiters_counters_reach_the_endpoint :: proc(t: ^testing.T) {
-	s, cfg := metrics_fixture(Stats{})
-	s.cfg = &cfg
 	// Distinct values, so a series reading the wrong counter fails.
-	s.limiter = make_rate_limiter(500, 2)
-	defer destroy_rate_limiter(s.limiter)
-	s.limiter.limited = 3
-	s.limiter.slipped = 5
-	s.limiter.conn_limited = 7
+	limiter := make_rate_limiter(500, 2)
+	defer destroy_rate_limiter(limiter)
+	limiter.limited = 3
+	limiter.slipped = 5
+	limiter.conn_limited = 7
 
-	listeners: Listeners
-	page := render_metrics(&s, &listeners, context.temp_allocator)
+	page := render_fixture(Stats{}, limiter)
 	expect_line(t, page, "elodin_rate_limited_total 3")
 	expect_line(t, page, "elodin_rate_limit_slipped_total 5")
 	expect_line(t, page, "elodin_connections_rate_limited_total 7")

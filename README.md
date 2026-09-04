@@ -918,7 +918,21 @@ for a query: `dig +tcp`, a `curl` per lookup and every stub that does not keep a
 connection open spend one connection per answer, so a prefix entitled to 500
 queries over connections has to be able to open 500. A smaller connection budget
 would be a quiet reduction of the query budget for exactly the clients that
-reconnect. Refusals are counted as `conn_rate_limited=` in the stats line and
+reconnect.
+
+**So `responses_per_second` is now three bounds, and one of them has a burst to
+size.** A prefix banks two seconds of each budget, so it can open
+`2 × responses_per_second` connections at once — 1000 at the default — and then
+`responses_per_second` a second. Answers arrive spread out and connections do not:
+the moment that tests this is every device on a network reconnecting together,
+after this resolver restarts or after a link comes back. That burst is bounded by
+how many devices share a prefix, so at the default it is not a figure any real
+network reaches. An operator who has tuned `responses_per_second` far *below* the
+default should check it against that number rather than against their query rate —
+`client_timeout` reclaiming an idle connection every 10 seconds is also what sets
+the steady arrival rate, at roughly one device in ten per second.
+
+Refusals are counted as `conn_rate_limited=` in the stats line and
 `elodin_connections_rate_limited_total` on the endpoint, apart from
 `conn_refused=`, which is the connection *table* being full — arrival and occupancy
 are different problems with different settings behind them. Completed handshakes

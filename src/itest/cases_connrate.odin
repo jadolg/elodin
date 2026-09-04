@@ -168,10 +168,22 @@ run_connection_rate_cases :: proc(r: ^Runner) {
 			counter scraped above and only then hands `report_conn_rate_limit`
 			the line, so a scrape that has seen the refusal is no ordering at all
 			on the log file - see `wait_for_log`.
+
+			The needle carries the words around the setting rather than the
+			setting alone, because the setting alone is not this line:
+			`report_rate_limited` names it too, for a *query* the budget
+			refused. That one is debug-only and this case runs at info, so the
+			short needle would pass today - and pass for the wrong reason the
+			moment either of those changes, which is exactly the confusion the
+			assertion above this one exists to rule out.
 			*/
 			check(
 				r,
-				wait_for_log(&srv, "server.rate_limit.responses_per_second", 5 * time.Second),
+				wait_for_log(
+					&srv,
+					"is opening them faster than server.rate_limit.responses_per_second",
+					5 * time.Second,
+				),
 				"the refusal never named the setting behind it; log:\n%s",
 				read_log(&srv),
 			)

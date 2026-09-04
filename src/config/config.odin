@@ -637,6 +637,16 @@ over: a client entitled to `responses_per_second` queries on connections has to 
 able to open that many, or `dig +tcp` and every stub that reconnects per lookup
 would be held below the budget an operator set.
 
+Which makes this one figure three bounds, and the third has a burst worth sizing.
+A prefix banks two seconds of each pool, so it may open twice this many
+connections at once and then this many a second - and unlike answers, arrivals
+come in bursts: every device on a network reconnects together when this resolver
+restarts or a link comes back. That burst is bounded by how many devices share a
+prefix, which at the shipped 500 is a figure no real network reaches. An operator
+who tunes this far *below* the default is the one who has to check it against
+their device count rather than against their query rate; `client_timeout` sets the
+steady arrival rate underneath it, at about one device in ten per second.
+
 `slip` applies to UDP alone: a truncated answer is an instruction to ask again over
 TCP, so it has nothing to say to a client that is already on a connection.
 Over-budget queries end a TCP or DoT connection instead; DoH answers 429 and keeps
