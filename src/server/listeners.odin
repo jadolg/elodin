@@ -1001,16 +1001,23 @@ after a slot was asked for, and this one is the arrival budget refusing before
 anything asks. The settings behind them are different and so is the advice, which
 is the whole reason that procedure tells its own three apart.
 
-Nothing here names the client. The line an operator needs from a flood is which
-setting refused it and that it is happening; who it was is a `debug` question, and
-answering it at `warn` would put an attacker's address list in the log at the
-default level, one line per connection until the flag flips.
+The `warn` does not name the client and the `debug` lines do, which is
+`report_refusal`'s split and is here for the same two reasons. The `warn` is one
+line at the default level and what it has to carry is the setting, since that is
+what an operator changes; putting an address there would put an attacker's address
+list in the log at the default level, one line per connection until the flag flips.
+But `debug` is where somebody who has gone looking arrives, and the one thing they
+need there is who - the counter is deliberately not labelled per prefix (see
+`render_metrics`), and the hint under the `warn` sends them to write a filter rule
+keyed on a source address. A `debug` line that said "this client's prefix" and
+nothing else would answer the question the level exists to answer with the fact it
+had already withheld.
 */
 @(private)
 conn_rate_limit_reported: bool
 
 @(private)
-report_conn_rate_limit :: proc(proto: Protocol, rate: int) {
+report_conn_rate_limit :: proc(client: net.Endpoint, proto: Protocol, rate: int) {
 	say, first := report_once(&conn_rate_limit_reported, logx.enabled(.Debug))
 	if !say {
 		return
@@ -1021,7 +1028,17 @@ report_conn_rate_limit :: proc(proto: Protocol, rate: int) {
 
 	transport := proto_name(proto)
 	if !first {
-		logx.debugf("%s: refusing a connection, this client's prefix is opening them faster than %d/s", transport, rate)
+		// The stack rather than the arena, as in `report_refusal`: an address is
+		// a fixed few dozen bytes, and this is the level every refusal reaches.
+		buf: [64]u8
+		builder := strings.builder_from_bytes(buf[:])
+		who := net.endpoint_to_string(client, &builder)
+		logx.debugf(
+			"%s: refused a connection from %s, whose /24 or /64 is opening them faster than %d/s",
+			transport,
+			who,
+			rate,
+		)
 		return
 	}
 	logx.warnf(
@@ -1462,7 +1479,7 @@ accept_loop :: proc(data: rawptr) {
 		refused.
 		*/
 		if !conn_rate_check(ctx.server.limiter, client, time.tick_now()) {
-			report_conn_rate_limit(ctx.proto, ctx.server.cfg.server.rate_limit.responses_per_second)
+			report_conn_rate_limit(client, ctx.proto, ctx.server.cfg.server.rate_limit.responses_per_second)
 			net.close(client_socket)
 			continue
 		}

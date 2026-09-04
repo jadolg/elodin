@@ -148,6 +148,27 @@ run_connection_rate_cases :: proc(r: ^Runner) {
 		)
 		if check(r, ok, "the limited server did not start") {
 			defer stop_server(&srv)
+			/*
+			Read as a difference, because the readiness probe got here first.
+
+			`wait_tcp` is a connection, so it spends one of this prefix's banked
+			arrivals - and it retries with no backoff, so a probe accepted
+			without being answered spends another, and once the pool is dry those
+			attempts are refusals on this counter. Against an absolute reading
+			the equality below would then fail for something the server under
+			test did not do. A baseline taken after startup puts every one of
+			them on the far side of it, which is `cases_conns.odin`'s reason for
+			the same shape.
+			*/
+			before := conn_counters(metrics_port)
+			/*
+			And the baseline is a reading rather than the -1 that means the page
+			had neither series on it. A difference of two sentinels is zero, which
+			is the one value a difference must not be able to fake - the row above
+			this case reads `rate_limited` absolutely and would catch the series
+			going away, but nothing else would catch it here.
+			*/
+			check(r, before.rate_limited >= 0 && before.refused >= 0, "the metrics endpoint published neither connection counter")
 			answered := dial_and_query(tcp_port, query, DIALS)
 			check(r, answered >= 1, "a client was refused every one of %d connections", DIALS)
 			check(r, answered < DIALS, "%d of %d connections were served, so the budget never bit", answered, DIALS)
@@ -159,8 +180,13 @@ run_connection_rate_cases :: proc(r: ^Runner) {
 			the confusion the two counters exist to keep apart.
 			*/
 			counters := conn_counters(metrics_port)
-			check_eq_int(r, counters.rate_limited, DIALS - answered, "connections the arrival budget refused")
-			check_eq_int(r, counters.refused, 0, "connections refused for want of a slot")
+			check_eq_int(
+				r,
+				counters.rate_limited - before.rate_limited,
+				DIALS - answered,
+				"connections the arrival budget refused",
+			)
+			check_eq_int(r, counters.refused - before.refused, 0, "connections refused for want of a slot")
 			/*
 			And the operator is told which setting refused it, once, by name.
 
