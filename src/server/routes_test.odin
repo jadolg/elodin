@@ -1,5 +1,6 @@
 package server
 
+import "core:mem"
 import "core:net"
 import "core:strings"
 import "core:testing"
@@ -22,14 +23,18 @@ deployment it was written for still does not work.
 
 @(private = "file")
 Route_Mock :: struct {
-	socket: net.UDP_Socket,
-	reply:  []u8,
-	asked:  bool,
-	name:   string,
+	socket:   net.UDP_Socket,
+	reply:    []u8,
+	asked:    bool,
+	// What was asked, for the test to read once the mock has been joined. It is
+	// held in `name_buf` rather than pointing at whatever memory the question
+	// was decoded into, that memory belonging to the mock thread.
+	name:     string,
 	// The question this mock is waiting for, when the case cares. Empty answers
 	// whatever arrives first, which is what the cases that bind one pair of
 	// sockets and ask one question want.
-	want:   string,
+	want:     string,
+	name_buf: [512]u8,
 }
 
 /*
@@ -47,23 +52,40 @@ next test that asks - so a query another case's server is still retrying can
 arrive here, be recorded as the question this case asked, and fail it on a name
 it never mentioned. Waiting for the name turns that into a packet nobody
 answered, which is what it is.
+
+The name is copied into `name_buf` on the way out, and that is the part not to
+undo. `thread.create_and_start_with_poly_data` is called with no `init_context`,
+which per `thread.Thread.init_context` gives this procedure a temporary
+allocator of its own that the runtime destroys when the thread dies - so a name
+decoded into temp memory here is freed by `thread.join` returning, which is
+precisely when the test reads it. That read is a use-after-free; it was one for
+as long as this mock has existed, and it segfaulted the test runner on arm64
+while passing on amd64, the way that class of bug does. `name_buf` lives in the
+caller's own frame, which outlives the mock by construction.
+
+The stack arena below keeps that honest rather than merely fixed: nothing this
+procedure decodes can outlive the arena it was decoded into, so the copy is the
+only way anything leaves. `peek_question` reads one name and stops, where a
+whole-message decode would allocate per record for a reply the mock never looks
+at.
 */
 @(private = "file")
 serve_route :: proc(x: ^Route_Mock) {
+	scratch: mem.Arena
+	backing: [4096]u8
+	mem.arena_init(&scratch, backing[:])
 	buf: [4096]u8
 	for {
 		n, remote, err := net.recv_udp(x.socket, buf[:])
 		if err != nil || n < dns.HEADER_SIZE || len(x.reply) > len(buf) {
 			return
 		}
-		asked_for := ""
-		if msg, derr := dns.decode_message(buf[:n], context.temp_allocator); derr == .None && len(msg.question) > 0 {
-			asked_for = msg.question[0].name
-		}
-		if x.want != "" && !dns.name_equal_fold(asked_for, x.want) {
+		free_all(mem.arena_allocator(&scratch))
+		q, ok := dns.peek_question(buf[:n], mem.arena_allocator(&scratch))
+		if x.want != "" && !(ok && dns.name_equal_fold(q.name, x.want)) {
 			continue
 		}
-		x.name = asked_for
+		x.name = string(x.name_buf[:copy(x.name_buf[:], q.name)])
 		x.asked = true
 		out: [4096]u8
 		copy(out[:], x.reply)
@@ -92,8 +114,10 @@ route_mock_quiet :: proc(socket: net.UDP_Socket, name: string) -> bool {
 		if err != nil || n < dns.HEADER_SIZE {
 			return true
 		}
-		msg, derr := dns.decode_message(buf[:n], context.temp_allocator)
-		if derr == .None && len(msg.question) > 0 && dns.name_equal_fold(msg.question[0].name, name) {
+		// The temp allocator is safe here where it is not in `serve_route`: this
+		// runs on the test's own thread, and nothing decoded escapes the call.
+		if q, ok := dns.peek_question(buf[:n], context.temp_allocator);
+		   ok && dns.name_equal_fold(q.name, name) {
 			return false
 		}
 	}
