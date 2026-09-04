@@ -1047,7 +1047,7 @@ report_conn_rate_limit :: proc(client: net.Endpoint, proto: Protocol, rate: int)
 		rate,
 	)
 	logx.warnf(
-		"a client that only opens connections asks nothing, so it reaches neither response budget however fast it does it - and on DoT and DoH each one costs a TLS handshake; opening one is therefore charged to the same per-prefix figure as an answer. Raise server.rate_limit.responses_per_second if this client network should be able to reconnect faster, and put a per-source connection rate limit in front of a publicly reachable instance. These are counted as conn_rate_limited= in the stats line, and further ones are logged at debug level",
+		"a client that only opens connections asks nothing, so it reaches neither response budget however fast it does it - and on DoT and DoH each one costs a TLS handshake; opening one is therefore charged to the same per-prefix figure as an answer. Raise server.rate_limit.responses_per_second - or, where server.rate_limit.overrides names this client's network, the figure above is that entry's and the entry is what to raise - if this client network should be able to reconnect faster, and put a per-source connection rate limit in front of a publicly reachable instance. These are counted as conn_rate_limited= in the stats line, and further ones are logged at debug level",
 	)
 }
 
@@ -1479,7 +1479,14 @@ accept_loop :: proc(data: rawptr) {
 		refused.
 		*/
 		if !conn_rate_check(ctx.server.limiter, client, time.tick_now()) {
-			report_conn_rate_limit(client, ctx.proto, ctx.server.cfg.server.rate_limit.responses_per_second)
+			// The figure this client's own network is held to, which is the
+			// top-level one only where no override names it - see
+			// `prefix_response_budget`.
+			report_conn_rate_limit(
+				client,
+				ctx.proto,
+				prefix_response_budget(ctx.server.limiter, client.address),
+			)
 			net.close(client_socket)
 			continue
 		}

@@ -304,7 +304,19 @@ load_rate_limit_overrides :: proc(l: ^Loader, rl: ^yaml.Node, cfg: ^Config) {
 	for e, i in entries {
 		path := fmt.tprintf("server.rate_limit.overrides[%d]", i)
 		text := ""
+		/*
+		`opt_string` has already said its piece when the key is there and is
+		not a string, so "missing" is not also said: an operator told a line is
+		absent goes looking for one that is in the file, which is the mistake
+		the `responses_per_second` check below goes out of its way to avoid.
+		Counted rather than asked of the node, because `prefix: ""` is a key
+		that parsed and named nothing, and that one does need saying.
+		*/
+		said := len(l.errors)
 		opt_string(l, e, "prefix", &text, path)
+		if len(l.errors) > said {
+			continue
+		}
 		if text == "" {
 			errorf(l, "%s: missing prefix, which is the network this entry is about", path)
 			continue

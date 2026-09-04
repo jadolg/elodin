@@ -793,6 +793,36 @@ resolve_tier :: proc(r: ^Rate_Limiter, address: net.Address) -> u8 {
 }
 
 /*
+The per-prefix figure `address`'s own network is held to, for the lines that
+name one.
+
+`report_conn_rate_limit` quotes a number and tells an operator which setting to
+raise, and with figures per prefix that number is no longer whatever the top of
+the file says: a client inside an entry in `server.rate_limit.overrides` was
+refused at that entry's figure. Reading the top-level one there would send an
+operator to a line that is not the one refusing their client, which is the
+mistake the override lines at startup exist to prevent.
+
+The *configured* figure for the client's own network rather than the tier of the
+bucket it happened to land in: a bucket shared through a collision is accounted
+on whichever prefix claimed it, and that is a property of the table rather than
+of anything in the file an operator can edit.
+
+`tiers` and `prefixes` are written once in `make_rate_limiter` and never again,
+so no lock is needed here - unlike every other reader of a bucket. 0 with no
+limiter, which no caller reaches: a refusal to report comes from a budget, and a
+budget comes from a limiter.
+*/
+prefix_response_budget :: proc(r: ^Rate_Limiter, address: net.Address) -> int {
+	if r == nil {
+		return 0
+	}
+	// `Connection` because this is what the arrival budget refused; every class
+	// but `Slip` carries the whole figure anyway - see `Rate_Tier`.
+	return int(r.tiers[resolve_tier(r, address)].rate[.Connection])
+}
+
+/*
 Who a client is, for every per-client bound this server keeps: the /24 an IPv4
 address sits in, or the /64 an IPv6 one does.
 

@@ -1867,9 +1867,9 @@ reached.
 test_an_ipv6_override_is_keyed_on_the_64 :: proc(t: ^testing.T) {
 	RATE :: 10
 	BIG :: 200
-	// The /48 the `v6` helper's addresses sit in: 2001:db8:<prefix>::/48 covers
-	// every /64 it can produce, which is what an operator naming a customer
-	// allocation would write.
+	// The /32 the `v6` helper's addresses sit in. It varies the third group, so
+	// `2001:db8::/32` is the shortest entry that covers every /64 it can
+	// produce - a /48 would claim one of them and miss the rest.
 	overrides := []config.Rate_Limit_Override{override("2001:db8::/32", BIG, 2)}
 
 	r := make_rate_limiter(RATE, 2, overrides)
