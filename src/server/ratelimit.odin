@@ -206,7 +206,8 @@ The table is fixed at construction and never grows.
 
 A cache of buckets that allocated per source would be a memory bound written in
 terms of how many distinct addresses an attacker cares to name, which is not a
-bound. Sixteen thousand buckets is 768 KB - a bucket carries a budget per pool -
+bound. Sixteen thousand buckets is 896 KB - a bucket carries a budget per pool,
+so the figure moves with `Rate_Class`; charging arrivals took it from 768 KB -
 and more prefixes than a resolver serves; what collides shares a budget, which is
 a limit that is too strict on rare occasions rather than a limit that fails.
 */

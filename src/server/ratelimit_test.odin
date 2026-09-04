@@ -1168,8 +1168,9 @@ test_a_stream_answer_does_not_reset_the_slip :: proc(t: ^testing.T) {
 }
 
 /*
-Two budgets per prefix, and a datagram flood cannot reach the one connections are
-answered out of.
+A budget per prefix per class, and a datagram flood cannot reach the one
+connections are answered out of. `test_a_datagram_flood_cannot_stop_a_prefix_connecting`
+is the same property for the third of them, the arrivals.
 
 Stated as the attack rather than as a property, because the attack is the reason
 the separation is there. The bucket is keyed on the query's source address, and over
@@ -1188,9 +1189,10 @@ over a connection must not empty what its neighbours' datagrams are answered out
 of.
 
 The cost of the split is asserted here too rather than left implicit. The prefix
-draws RATE*BURST out of each pool, so a client willing to ask both ways gets twice
-what an operator configured - a constant, and the trade is argued at the top of
-`ratelimit.odin`. What must not come back is one pool lending to the other.
+draws RATE*BURST out of each pool, so a client willing to use every way in gets a
+multiple of what an operator configured - a constant, and the trade is argued at
+the top of `ratelimit.odin`. What must not come back is one pool lending to the
+other.
 */
 @(test)
 test_the_stream_budget_is_not_the_datagram_one :: proc(t: ^testing.T) {

@@ -1,6 +1,7 @@
 package itest
 
 import "core:fmt"
+import "core:time"
 import "elodin:dns"
 
 /*
@@ -160,10 +161,17 @@ run_connection_rate_cases :: proc(r: ^Runner) {
 			counters := conn_counters(metrics_port)
 			check_eq_int(r, counters.rate_limited, DIALS - answered, "connections the arrival budget refused")
 			check_eq_int(r, counters.refused, 0, "connections refused for want of a slot")
-			// And the operator is told which setting refused it, once, by name.
+			/*
+			And the operator is told which setting refused it, once, by name.
+
+			Waited for rather than read once: `conn_rate_check` charges the
+			counter scraped above and only then hands `report_conn_rate_limit`
+			the line, so a scrape that has seen the refusal is no ordering at all
+			on the log file - see `wait_for_log`.
+			*/
 			check(
 				r,
-				log_contains(&srv, "server.rate_limit.responses_per_second"),
+				wait_for_log(&srv, "server.rate_limit.responses_per_second", 5 * time.Second),
 				"the refusal never named the setting behind it; log:\n%s",
 				read_log(&srv),
 			)

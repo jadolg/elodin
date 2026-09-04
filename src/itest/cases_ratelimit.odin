@@ -338,8 +338,24 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 
 	One response a second, which is what makes the case say something rather than
 	measure a refill. A shared budget stays empty for a whole second after the
-	flood, and the TCP query lands well inside it; two budgets and the connection is
-	answered out of its own, which the flood never touched.
+	flood, and the TCP query lands well inside it; separate budgets and the
+	connection is answered out of its own, which the flood never touched.
+
+	One a second is also two *arrivals* banked, since the connection budget is
+	denominated in the same figure - and that is why this is the one stream case in
+	the suite that does not pass `tcp_port` to `start_server`. The TCP readiness
+	probe is a connection, so it spends an arrival; a probe that is accepted and
+	then has to be retried spends both, and the query below is then refused on
+	*accept* with nothing wrong with the pools at all. This case would report that
+	as the separation having been lost, which is the one reading it must never
+	produce. Raising `responses_per_second` is not available either: the whole point
+	of one a second is that a shared pool would still be empty across the drain.
+
+	What stands in for the probe is the flood. `wait_ready` has already had an
+	answer over UDP, and the listeners bind udp before tcp, so what this case has to
+	clear is the gap between two `listen_tcp` calls at startup - against which two
+	hundred datagrams and a 250 ms drain are a far wider margin than the one spare
+	token the probe used to leave behind.
 
 	The UDP result is checked first, because what follows means nothing if the flood
 	did not arrive: two hundred datagrams answered a handful of times is the budget
@@ -359,7 +375,8 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 					tcp_port,
 				),
 				udp_port = udp_port,
-				tcp_port = tcp_port,
+				// No `tcp_port`, deliberately - see above. The probe it runs is a
+				// connection, and this case cannot spare the arrival.
 			},
 		)
 		if check(r, ok, "server did not start") {
