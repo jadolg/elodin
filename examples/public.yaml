@@ -1,0 +1,325 @@
+# elodin as a public resolver
+#
+# The deployment: a resolver on the internet that anybody may query - a
+# community resolver, an encrypted-DNS endpoint for your own devices while they
+# roam, one node of an anycast set. Every choice here follows from one
+# difference: the clients are strangers, and one of them is hostile.
+#
+# Read this whole file before running it. `server.allow_from: []` is how you
+# say the resolver is public, and it is the one setting in this tree that turns
+# a safe default into a thing an attacker can use - elodin warns about it at
+# every start for that reason. A resolver that answers everyone is a resolver
+# that can be made to send answers to anyone.
+#
+# What is not here: rewrites, and any local zone. A public resolver that
+# answers a name differently from the rest of the DNS is a resolver its users
+# cannot check, so this one only filters, and says what it filters.
+#
+# Certificates: the paths below are for a real certificate for the name your
+# clients use - DoT and DoH clients check it, and a self-signed one is refused
+# by all of them. `--check` fails if the files are not there, which is the
+# point.
+#
+# Anything not written here is the shipped default; examples/elodin.yaml is the
+# annotated reference for all of them.
+
+log:
+  level: info
+  # Off, and on a public resolver that is not a performance decision - it is
+  # that these queries belong to strangers who cannot see what you keep. Leave
+  # it off, and if you turn it on to debug something, say so publicly and turn
+  # it off again. The counters below carry everything an operator needs in
+  # aggregate.
+  queries: false
+
+server:
+  # This is what makes the resolver public. The shipped default is the local
+  # networks, which is what keeps an unconfigured install from being an open
+  # resolver; an empty list removes the restriction entirely.
+  #
+  # Note the brackets. `allow_from:` with nothing after it is refused at load,
+  # since the two things it could have meant are the default and its exact
+  # opposite. And note what an empty list does not remove: the rate limit
+  # below, the UDP answer ceiling, and the connection share are what stand
+  # between "anybody may ask" and "anybody may be sent answers they did not
+  # ask for".
+  allow_from: []
+
+  # Left to derive: 4 per usable CPU, capped at 128, which a box with 32 or
+  # more cores and a few GB of memory reaches - about 6,400 cache misses a
+  # second against a 20 ms upstream, with cache hits costing a fraction of
+  # that. Below that the core count is what sets it. A worker is held for a
+  # whole upstream round trip, so if you need more than the ceiling, the shape
+  # is `target_qps * upstream_rtt`: set a number here and `--check` will
+  # report it. Budget ~0.3 MB resident per worker, paid from its first query
+  # onward.
+  workers: 0
+
+  # The table, and one client's share of it.
+  #
+  # 2,048 concurrent TCP/DoT/DoH connections, each of which is a thread - so
+  # this is also a claim about what the box and its `RLIMIT_NPROC` or cgroup
+  # `pids.max` will give the process. A connection refused because the OS
+  # would not give another thread is counted apart, as conn_failed=, and
+  # raising this figure makes that worse rather than better.
+  #
+  # 24 of them for any one /24 or /64. The shipped default derives half the
+  # table, which is a bound nobody legitimate trips over; on a public instance
+  # that is far too generous, because a real client holds one connection per
+  # device and reuses it. A share in the low tens is ample for anybody honest
+  # and leaves a stranger holding roughly a percent of the table instead of
+  # half of it.
+  #
+  # What this bounds is a prefix rather than an actor, and on IPv6 those are
+  # far apart: a /48 is 65,536 /64s and a routine allocation, so a stranger
+  # with one can take a share from each. The low figure is what makes filling
+  # the table expensive - 24 at a time rather than 1,024 - not impossible.
+  max_connections: 2048
+  max_connections_per_prefix: 24
+
+  # Ten seconds, as it ships. It is the read timeout on an idle connection, so
+  # it is also how long a stranger's connection occupies a slot for free.
+  client_timeout: 10s
+
+  # The DNS Flag Day 2020 figure, written out here rather than left implicit
+  # because on a public resolver it is the amplification factor. A client's
+  # advertised buffer arrives on a datagram nobody verified, so an attacker
+  # aiming answers at a victim asks for the largest one it can: this is the
+  # ceiling on what it gets, and the denomination of the budget below. Do not
+  # raise it here. The cost is a TC bit and a TCP retry on the handful of
+  # answers between 1232 and what the client asked for.
+  max_udp_response: 1232
+
+  rate_limit:
+    enabled: true
+    # Left at the shipped 500 per client prefix, in both directions of the
+    # trade. Multiplied out it is the ceiling on what one victim network can be
+    # made to receive: 500 * 1232 bytes is about 600 KB/s aimed at one /24,
+    # small enough not to be worth an attacker's bandwidth. In the other
+    # direction it has to be generous enough for a real /24 that is a carrier
+    # NAT with thousands of subscribers behind it - and when such a client does
+    # exceed it, `slip` sends it to TCP rather than dropping it, so it keeps
+    # resolving one round trip slower.
+    #
+    # Lower it if you are being used for reflection and the victim is visible;
+    # 100 is still 120 KB/s. Watch elodin_rate_limited_total before and after,
+    # since the same change costs real clients their datagrams.
+    responses_per_second: 500
+    # At most every second over-budget datagram comes back with the TC bit: too
+    # small to reflect, and the standard way of telling a real client to come
+    # back over TCP where the handshake proves its address. At most, because
+    # those truncated answers have a budget of their own - an eighth of the
+    # figure above, so 62 a second here - which is what keeps the slip from
+    # becoming the flood it is answering: without it a flood of two million
+    # datagrams a second had this server send half a million truncated answers
+    # a second at the address the flood named.
+    #
+    # `slip: 0` drops them all instead, and is what you want only if you have
+    # decided nobody legitimate is behind the address being flooded.
+    slip: 2
+
+  # The account to be after the ports are bound. The packaged systemd unit
+  # binds :53, :853 and :443 through AmbientCapabilities and runs under
+  # DynamicUser, so it needs nothing here; set these if you start this by hand
+  # as root. Everything after the bind parses bytes a stranger chose, which is
+  # the whole argument for not being root while it happens.
+  #   user: elodin
+  #   group: elodin
+
+listeners:
+  # Plain DNS stays on. A public resolver that answers only over TLS is a
+  # resolver most clients cannot use, and the amplification that comes with
+  # Do53 is what `max_udp_response` and `rate_limit` above are for. Turn UDP
+  # and TCP off if this endpoint is deliberately encrypted-only - and keep them
+  # on together if they are on at all, since a truncated UDP answer has to have
+  # a TCP listener to retry against.
+  udp:
+    enabled: true
+    address: "0.0.0.0"
+    port: 53
+    # Left to derive - one reader thread per usable CPU, to eight - and on a
+    # public instance this is the figure under every other bound in this file.
+    # Everything a datagram costs before the rate limiter can see it happens on
+    # the thread that read it, so past what the readers drain the kernel's
+    # receive queue overflows and the datagrams dropped there are chosen by the
+    # queue rather than by any budget. Measured, one reader drains 2.3 million
+    # datagrams a second and a flood of two million still cost 4% of arrivals
+    # to the queue.
+    #
+    # Read it as headroom and not as a defence: it raises the rate at which the
+    # limiter's guarantees still hold, and above that rate they still stop. A
+    # publicly reachable resolver wants a packet filter in front of it, which is
+    # what every public resolver runs anyway.
+    # `elodin_udp_receive_drops_total` is how you find out where you are.
+    readers: 0
+    # What each reader asks the kernel to hold while every reader is busy.
+    # Linux clamps it to net.core.rmem_max, 208 KiB on a machine nobody has
+    # tuned, and the startup line reports what was granted rather than what was
+    # asked for - so raise the sysctl if you mean this.
+    receive_buffer: 1MiB
+  tcp:
+    enabled: true
+    address: "0.0.0.0"
+    port: 53
+  # DoT. The transport a phone's private-DNS setting speaks.
+  dot:
+    enabled: true
+    address: "0.0.0.0"
+    port: 853
+    cert_file: /etc/elodin/cert.pem
+    key_file: /etc/elodin/key.pem
+  # DoH, over HTTP/2 or HTTP/1.1 by ALPN. Firefox and Chrome will only use a
+  # DoH resolver over HTTP/2; curl and dnscrypt-proxy are happy with either.
+  doh:
+    enabled: true
+    address: "0.0.0.0"
+    port: 443
+    path: /dns-query
+    cert_file: /etc/elodin/cert.pem
+    key_file: /etc/elodin/key.pem
+    # An iOS, iPadOS or macOS device installs a profile from this path and
+    # sends all of its DNS here over HTTPS, no app needed. The URL inside is
+    # built from the host the request arrived on, so it matches the
+    # certificate. Set it to "" to withhold the profile.
+    mobileconfig_path: /apple-doh.mobileconfig
+
+  # Use an ECDSA key. A TLS handshake is orders of magnitude more CPU than
+  # answering on an established connection, and measured here ECDSA P-256
+  # costs about half what RSA-2048 does: 3,264 handshakes a second against
+  # 2,372 on the same core. On a public endpoint the handshake rate is what a
+  # stranger controls, so that ratio is a security property as much as a
+  # performance one.
+
+upstream:
+  # Failover over two DoT resolvers. The path from this box to its upstream is
+  # the public internet and carries the queries of everybody who trusts this
+  # resolver, so it is encrypted and the certificate name is pinned.
+  #
+  # Consider `race` if you have three or more upstreams and latency matters
+  # more than the extra queries: it asks all of them and takes the first
+  # answer, at the cost of one query per upstream per miss and a thread pool to
+  # run them (`upstream_workers`).
+  strategy: failover
+  timeout: 5s
+  attempts: 2
+  # More pooled connections per upstream than the shipped 8: on a busy
+  # resolver every cache miss wants one, and a miss that has to open a fresh
+  # TLS session pays a handshake before it can ask.
+  max_idle: 32
+  idle_timeout: 30s
+  servers:
+    - name: cloudflare-dot
+      type: tls
+      address: 1.1.1.1
+      port: 853
+      hostname: cloudflare-dns.com
+    - name: quad9-dot
+      type: tls
+      address: 9.9.9.9
+      port: 853
+      hostname: dns.quad9.net
+  bootstrap: [1.1.1.1, 9.9.9.9]
+
+cache:
+  enabled: true
+  # Sized for a public resolver's tail: many clients asking many different
+  # names, where the hit rate comes from breadth rather than from one
+  # household's habits. Both bounds are checked and eviction is from the least
+  # recently used end when either is passed. The two are matched here rather
+  # than one guarding the other: at a measured ~463 bytes an entry, 500,000
+  # answers is about 220 MiB, so a cache of average answers reaches both bounds
+  # at roughly the same time and a cache of large ones reaches the byte bound
+  # first. Neither is a bound on the other - a count of entries says nothing
+  # about memory.
+  max_entries: 500000
+  max_bytes: 256MiB
+  min_ttl: 0
+  max_ttl: 24h
+  negative_ttl: 300
+  # On. An upstream that goes away must not take every client's resolution with
+  # it: an expired entry is served only after the refresh has failed (RFC
+  # 8767), with a 30-second TTL so the client comes back.
+  serve_stale: true
+
+blocking:
+  # On, and deliberately narrow: malware and phishing, no advertising lists.
+  # A public resolver's users cannot see your configuration, so every name you
+  # withhold is a difference between what they asked the DNS and what they were
+  # told, and the ones they will not think to suspect are the ones a broad ad
+  # list catches. Publish the list you run.
+  #
+  # Set `enabled: false` for a resolver that filters nothing at all, which is
+  # a perfectly good thing for a public resolver to be.
+  enabled: true
+  response: nxdomain
+  block_ttl: 60
+  cache_dir: /var/cache/elodin
+  refresh: 24h
+  lists:
+    - name: cyberhost-malware
+      url: https://lists.cyberhost.uk/malware.txt
+      format: domains
+  allowlists: []
+
+dnssec:
+  # On, as it ships, and not to be turned off here. A public resolver's answers
+  # are taken on trust by clients that have no way to check them, and
+  # validation is the part of this that makes them checkable. The upstreams
+  # above both return the records it needs.
+  enabled: true
+  max_nsec3_iterations: 100
+
+cookies:
+  # On. It costs one hash per query and it takes forging an answer to one of
+  # this resolver's clients from "guess the transaction ID and the source port"
+  # to "guess 64 bits you were never shown".
+  enabled: true
+  # Off, and this is the lever to reach for while a spoofing attack is actually
+  # under way: it refuses any UDP query that carries a cookie but cannot show
+  # one this server issued, before the name is looked up. The price is one
+  # extra round trip for every new client, which is why it is not on
+  # permanently. RFC 7873 section 5.2.3 has it for exactly this.
+  require: false
+  upstream: true
+  # Set this when more than one elodin answers on the same address - an anycast
+  # set, a pair behind a load balancer - or they will reject each other's
+  # cookies and every client will pay the extra round trip on every hop
+  # change. 32 hex characters; `openssl rand -hex 16` produces one. Empty draws
+  # a random secret at each startup, which is right for a single instance.
+  # secret: ""
+
+rebind:
+  # On, and on a public resolver there is no argument against it. The default
+  # is off because the LAN deployment often points a public name at a private
+  # address on purpose (split horizon); a public resolver never does, and has
+  # every reason to refuse an answer that steers one of its users' browsers at
+  # 192.168.1.1 or at the cloud metadata endpoint.
+  enabled: true
+  allow_loopback: false
+
+special_use:
+  enabled: true
+  onion: true
+  # All three on, which is a change from the shipped defaults, and the change
+  # is right here for the same reason it is wrong on a LAN. These are the
+  # reserved names that some networks genuinely serve - an Active Directory
+  # domain under .local, an internal .test zone, a home network's own
+  # home.arpa - and a resolver on that network must not answer them itself.
+  # This resolver is on nobody's network: it cannot be the local authority for
+  # any of them, and a query for one that arrives here has escaped its network
+  # by mistake. Answering it here (NXDOMAIN, and an empty zone for home.arpa)
+  # is both what the RFCs ask for and one fewer name leaked onward.
+  local: true
+  test: true
+  home_arpa: true
+
+metrics:
+  enabled: true
+  # Loopback, for a local agent or a sidecar to scrape. There is no
+  # authentication in front of this and the numbers describe your traffic;
+  # binding it wider is warned about at startup. On a public box, "wider" means
+  # reachable from the internet, so put it behind the firewall or leave it
+  # here.
+  address: "127.0.0.1"
+  port: 9153
+  path: /metrics

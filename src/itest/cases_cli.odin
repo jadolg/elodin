@@ -206,6 +206,96 @@ server: {{ user: root }}
 		)
 	}
 	end_case(r)
+
+	/*
+	The per-deployment examples, held to the same bar as the reference file.
+
+	Each of them turns settings on that the reference file leaves at their
+	defaults - zone routes, reserved-name keys, a connection share, an empty
+	allow list - and several of those combinations are refused at load on
+	purpose. A file that stops loading is documentation that has quietly
+	become wrong, and it would otherwise be found by whoever copied it.
+	*/
+	start_case(r, "cli: the per-deployment examples are valid")
+	{
+		for path in ([]string {
+			"examples/local-only.yaml",
+			"examples/lan.yaml",
+			"examples/small-device.yaml",
+			"examples/container.yaml",
+			"examples/dev.yaml",
+		}) {
+			res := new_check(r, path, "check-deployment-example")
+			check_eq_int(r, res.exit_code, 0, fmt.tprintf("exit code for %s", path))
+		}
+	}
+	end_case(r)
+
+	/*
+	`examples/public.yaml` is the one that cannot pass here, and that is the
+	file behaving as it says: it enables DoT and DoH against a certificate at
+	an installed path, and `--check` refuses a listener whose certificate is
+	not there rather than starting a resolver that cannot serve it. The rest of
+	the file is held to the bar above by pointing those paths at this tree's own
+	test certificate.
+	*/
+	start_case(r, "cli: the public example needs its certificate")
+	{
+		res := new_check(r, "examples/public.yaml", "check-public-example")
+		check(r, res.exit_code != 0, "public.yaml passed --check without its certificate")
+		check(
+			r,
+			strings.contains(res.output, "listeners.dot.cert_file"),
+			"the missing certificate was not named: %q",
+			res.output,
+		)
+
+		/*
+		The rest of the file, checked with the certificate this suite already
+		has - `r.cert_file`, which is `certs/cert.pem` when the tree has one and
+		a freshly generated pair in the work directory otherwise. Written as an
+		absolute path, since `--check` resolves these against elodin's own
+		working directory rather than this test's.
+
+		Only when there is a certificate to name: a machine with no `openssl`
+		leaves the harness without one and skips every TLS case, and the first
+		half above is the assertion that does not need it.
+		*/
+		src, read_err := os.read_entire_file(
+			"examples/public.yaml",
+			context.temp_allocator,
+		)
+		have_cert := r.cert_file != "" && r.key_file != ""
+		if have_cert && check(r, read_err == nil, "could not read examples/public.yaml: %v", read_err) {
+			// `replace_all` reports whether it allocated rather than whether it
+			// matched, so the flag says nothing useful here and the text is
+			// taken as it comes back either way.
+			text, _ := strings.replace_all(
+				string(src),
+				"/etc/elodin/cert.pem",
+				r.cert_file,
+				context.temp_allocator,
+			)
+			text, _ = strings.replace_all(
+				text,
+				"/etc/elodin/key.pem",
+				r.key_file,
+				context.temp_allocator,
+			)
+			path := filepath.join({r.work_dir, "public-with-certs.yaml"}, context.temp_allocator) or_else ""
+			_ = os.write_entire_file(path, transmute([]u8)text)
+
+			res = new_check(r, path, "check-public-example-certs")
+			check_eq_int(r, res.exit_code, 0, "exit code for public.yaml with a certificate it has")
+			check(
+				r,
+				strings.contains(res.output, "server.allow_from is empty"),
+				"the open-resolver warning was not reported: %q",
+				res.output,
+			)
+		}
+	}
+	end_case(r)
 }
 
 @(private = "file")
