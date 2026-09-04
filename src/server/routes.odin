@@ -200,6 +200,8 @@ route - `parent_answers_apex_ds` is the test, and there are four ways to fail it
     upstream uninvolved, which on a network with an internal authority and a
     poor path out is most of the point; an outage out there must not take the
     chain out from under every name in a zone that is answering perfectly well.
+    `group_reachable` keeps that from being paid for twice over: a parent group
+    already parked by its own failures is not asked at all.
   - A reply that says nothing about the name: SERVFAIL, REFUSED, and every other
     rcode that is neither NOERROR nor NXDOMAIN. An upstream with an ACL, or a
     CPE resolver that mangles every `DS` it meets, is not a statement about this
@@ -210,6 +212,13 @@ route - `parent_answers_apex_ds` is the test, and there are four ways to fail it
 `home.arpa.` is the one deployment none of that touches, which is the point:
 `arpa.` delegates the zone and publishes the proof, so the answer is a NODATA,
 it passes, and the client gets what issue #227 was about.
+
+When the route cannot be reached to answer in the parent's place, the query is a
+SERVFAIL rather than the parent's reply passed on. `resolve_query` argues it
+beside the second exchange; the short of it is that a reply which is not the
+proof is not an answer to this question, and that the cache which does the damage
+is the client's - it keeps a signed denial for the parent's negative TTL - so
+withholding only this server's copy would never have reached it.
 
 Deciding it on the answer rather than at load is what the issue left open as
 "cannot be known at load". It cannot - but it can be read off the reply, at the
@@ -287,6 +296,36 @@ same reading, so the route is asked then too.
 @(private)
 parent_answers_apex_ds :: proc(resp: []u8, reached: bool, allocator: mem.Allocator) -> bool {
 	return reached && no_ds_answer(resp, allocator)
+}
+
+/*
+Whether any upstream in `g` is out of its failure cooldown.
+
+Asked about the parent's group before an apex `DS` is sent there, and only
+there. `resolve_sequential` spends the group's whole budget on a group that is
+entirely parked - round 0 skips the unhealthy servers, round 1 tries them anyway
+- so with the default `timeout: 5s` and `attempts: 2` a public upstream that has
+gone away costs ten seconds or more before the route is asked in its place. A
+validating stub gives up in two to five, so the deployment `apex_ds_off_route`
+describes - an internal authority behind a poor path out - would still see the
+zone fail, having waited for an upstream this server already knows is down.
+
+Three consecutive failures park an upstream and the cooldown is ten seconds, so
+what this skips is a group that has already proved itself unreachable, for as
+long as that is still true. Nothing else consults it: an ordinary question has
+nowhere else to go, and waiting is the honest thing to do there.
+*/
+@(private)
+group_reachable :: proc(g: ^upstream.Group) -> bool {
+	if g == nil {
+		return false
+	}
+	for u in g.servers {
+		if upstream.healthy(u) {
+			return true
+		}
+	}
+	return false
 }
 
 /*

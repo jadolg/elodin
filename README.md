@@ -387,11 +387,16 @@ A reply that says nothing about the name — SERVFAIL, REFUSED — counts as no
 answer here rather than as an answer to pass on, which is a departure from how
 every other rcode is handled: for a question about a *delegation*, only NOERROR
 and NXDOMAIN say anything, so an upstream with an ACL, or a CPE resolver that
-mangles every `DS` it meets, must not take an internal zone down with it. And
-when the parent does say something but the route cannot be reached to answer in
-its place, the client gets what the parent said and the cache does not keep it:
-one lost exchange with a local server must not pin a signed denial over the zone
-for the parent's whole TTL.
+mangles every `DS` it meets, must not take an internal zone down with it. And if
+the local server cannot be reached either, the answer is SERVFAIL rather than
+whatever the parent said: a signed "this name does not exist" over a zone that is
+served locally is the one answer worth withholding, since the client caches it
+for the parent's whole negative TTL and a resolver implementing RFC 8020 reads it
+as covering every name under the apex. A SERVFAIL says what is true — the
+delegation could not be established — and nothing keeps it, so the zone comes
+back the moment its authority does. A parent whose upstreams are all in their
+failure cooldown is not waited for at all; the question goes straight to the
+route.
 
 The answer cache is keyed on the question rather than on which upstream produced
 it, which holds because the routing table is built once at startup — restart

@@ -972,6 +972,24 @@ resolve_query :: proc(
 	zone's parent can prove and which `route_group` sends there.
 	*/
 	asked := route_group(s, q.name, q.type)
+	/*
+	Unless that group is parked, in which case the apex `DS` skips it.
+
+	`group_reachable` argues it: a group whose every upstream sits in its failure
+	cooldown still costs `attempts` rounds over every server before returning, so
+	with the default five-second timeout an upstream that has gone away is ten
+	seconds of waiting before the route is asked in its place. A validating stub
+	gives up in two to five, so the deployment the carve-out protects - an
+	internal authority behind a poor path out - would see the zone fail anyway,
+	having waited on an upstream this server already knew was down. The route is
+	where the question lands once the wait is over; this is only not waiting.
+	*/
+	if apex_ds_off_route(s, q.name, q.type) && !group_reachable(asked) {
+		if own := zone_route_group(s, q.name); own != asked {
+			logx.debugf("query DS %s: the parent's group is parked, asking the route first", q.name)
+			asked = own
+		}
+	}
 	resp, winner, uerr := upstream.resolve(asked, forwarded, allocator)
 	/*
 	And back on the route unless the parent answered the one thing the parent was
@@ -1005,44 +1023,59 @@ resolve_query :: proc(
 	one. The transaction ID is drawn again all the same, the second exchange
 	being a new one on the wire, and the client's own ID goes back on below.
 	*/
-	unbacked_apex_ds := false
 	if apex_ds_off_route(s, q.name, q.type) &&
 	   !parent_answers_apex_ds(resp, uerr == .None, allocator) {
 		if own := zone_route_group(s, q.name); own != asked {
-			dns.set_id_in_place(forwarded, dns.random_id())
-			again, second, aerr := upstream.resolve(own, forwarded, allocator)
-			switch {
-			case aerr == .None:
+			/*
+			Two lines rather than one with both fields, because there is no
+			rcode to name when nothing arrived: printing the zero value beside
+			the error read as the parent having answered NOERROR, which is the
+			one thing this branch has established it did not.
+			*/
+			if uerr == .None {
 				logx.debugf(
-					"query DS %s: the parent's group did not say the delegation carries no DS (error=%v, rcode=%v), so the route was asked instead",
+					"query DS %s: the parent's group answered %v rather than proving the delegation carries no DS, so the route was asked instead",
 					q.name,
-					uerr,
-					dns.peek_rcode(resp) if uerr == .None else dns.Rcode.No_Error,
-				)
-				resp, winner, uerr = again, second, .None
-			case uerr == .None:
-				/*
-				The parent said something, just not the proof, and the route that
-				should have answered instead could not be reached. The client gets
-				what there is and the cache does not keep it - see the store below.
-				*/
-				unbacked_apex_ds = true
-				logx.debugf(
-					"query DS %s: the route did not answer (%v); serving the parent's %v without storing it",
-					q.name,
-					aerr,
 					dns.peek_rcode(resp),
 				)
-			case:
-				// Neither group produced anything. `uerr` still holds the
-				// parent's failure, which the error path below reads and
-				// answers from - there is nothing to serve or to store.
+			} else {
 				logx.debugf(
-					"query DS %s: neither the parent's group (%v) nor the route (%v) answered",
+					"query DS %s: the parent's group did not answer (%v), so the route was asked instead",
 					q.name,
 					uerr,
+				)
+			}
+			dns.set_id_in_place(forwarded, dns.random_id())
+			again, second, aerr := upstream.resolve(own, forwarded, allocator)
+			/*
+			And the route's answer is the only one that can be served from here.
+
+			What the parent said is not the proof - that is how this branch was
+			reached - so it is not an answer to the question that was asked, and
+			handing it to the client for want of anything better is the failure
+			the rule above refuses. For the headline deployment it would be a
+			*signed* NXDOMAIN over a zone whose own authority may have answered a
+			millisecond later, and the cache that does the damage is the client's
+			rather than this server's: the client keeps that proof for the
+			parent's negative TTL, and one implementing RFC 8020 reads it as
+			covering every name under the apex. Suppressing our own store, which
+			is what this branch used to do instead, does not reach any of that.
+
+			So the route's failure becomes the query's, and the error path below
+			turns it into stale-if-there-is-any and SERVFAIL otherwise. SERVFAIL
+			says what is true - the delegation could not be established - and no
+			validator caches it as a proof of anything, so the zone comes back
+			the moment its authority does.
+			*/
+			if aerr == .None {
+				resp, winner, uerr = again, second, .None
+			} else {
+				logx.debugf(
+					"query DS %s: the route did not answer either (%v); the delegation is unestablished",
+					q.name,
 					aerr,
 				)
+				uerr = aerr
 			}
 		}
 	}
@@ -1371,50 +1404,14 @@ resolve_query :: proc(
 			whole-message version of this - `answer-unreadable` above - already
 			does.
 			*/
-			/*
-			`unbacked_apex_ds` holds here too, and for the reason the store
-			below states: an answer the route could not be reached to check is
-			not one to file under the name, whatever else is true of it. This
-			store is reachable for such an answer - a parent that hands back a
-			`CNAME` for a `DS` question puts a chain in front of the walk - and
-			leaving it out would let the one path that stores a refusal keep
-			what the ordinary path deliberately does not.
-			*/
-			if s.cfg.cache.enabled &&
-			   have_decoded &&
-			   !unbacked_apex_ds &&
-			   cloak_verdict_worth_keeping(verdict) {
+			if s.cfg.cache.enabled && have_decoded && cloak_verdict_worth_keeping(verdict) {
 				cache.put(s.answers, key, resp, decoded, generation, u8(verdict))
 			}
 			return out, cloak_outcome(verdict), true
 		}
 	}
 
-	/*
-	`unbacked_apex_ds` is the one answer on this path that is served and not
-	stored, and it is the apex `DS` above: the parent's group said something
-	other than "this delegation carries no DS", and the route that should have
-	answered in its place could not be reached. What the parent said goes to the
-	client for want of anything better and stops there.
-
-	Storing it would pin the failure the carve-out exists to prevent, from a
-	cause that has nothing to do with the zone. The parent's answer is signed and
-	its TTL is the parent's to choose - an hour is ordinary for either an
-	NXDOMAIN's negative TTL or a `DS` - so one lost exchange with the internal
-	authority would hold a signed proof of non-existence, or a chain requirement
-	the internal view cannot satisfy, over the routed apex for that long, with
-	the authority answering perfectly well the whole time. Every validating
-	client below here then reads the zone as provably absent rather than merely
-	unsigned, or as signed when it is not, and one implementing RFC 8020 reads an
-	NXDOMAIN as proof that every name under the apex is gone with it. The same
-	reasoning as the `Unreadable` verdict above: a transient cause must not be
-	memoised into a name that stays dark for `cache.max_ttl`.
-
-	Nothing else changes. The next query asks again, which is what happened
-	before any of this was memoised, and one that reaches the route gets the
-	route's answer and stores that.
-	*/
-	if s.cfg.cache.enabled && have_decoded && !unbacked_apex_ds {
+	if s.cfg.cache.enabled && have_decoded {
 		cache.put(s.answers, key, resp, decoded, generation)
 	}
 
