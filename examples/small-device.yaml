@@ -1,0 +1,260 @@
+# elodin on a router or a small board
+#
+# The deployment: elodin is the DNS on a home router, a Raspberry Pi or any
+# box where memory is counted in tens of megabytes and the CPU is an ARM or
+# MIPS core rather than a server's. It serves the LAN behind it, the way
+# examples/lan.yaml does, and every difference from that file is about fitting.
+#
+# What is expensive on such a box, in the order it will hurt:
+#
+#   1. Blocklists, at ~129 bytes a rule. Measured, AdGuard's filter_1 is
+#      179,583 rules and so around 23 MB resident - on a 128 MB router that is
+#      a fifth of the machine, and it is the first thing to cut.
+#   2. The answer cache, at ~463 bytes an entry.
+#   3. Worker threads, at ~0.26 MB each of scratch arena, held from a
+#      worker's first query onward rather than only under load.
+#   4. TLS handshakes, which are orders of magnitude more CPU than answering
+#      on an established connection - which is why no DoT or DoH listener is
+#      enabled below.
+#
+# The base process is about 11 MB before any of that.
+#
+# The example assumes the LAN is 192.168.1.0/24 and that this box is
+# 192.168.1.1 - the router itself. Anything not written here is the shipped
+# default; examples/elodin.yaml is the annotated reference for all of them.
+
+log:
+  level: info
+  # Off, and here it is about the disk as much as the privacy: a line per query
+  # on a flash device is write amplification you cannot see until the flash
+  # gives up. The msg=stats line every five minutes costs nothing.
+  queries: false
+  # Leave empty for stderr, which under procd or systemd means the system log.
+  # A file on flash wants rotation you probably do not have.
+  file: ""
+
+server:
+  allow_from:
+    - 127.0.0.0/8
+    - 192.168.1.0/24
+    - fe80::/10
+
+  # Four workers, pinned rather than derived. A worker is busy for a whole
+  # upstream round trip, so four is about 200 cache misses a second against a
+  # 20 ms upstream, and a household's steady rate is a couple of queries a
+  # second with peaks in the tens. Every worker fewer is ~0.26 MB of scratch
+  # arena not allocated.
+  #
+  # Left unset, the derivation would land somewhere between 4 and 16 here
+  # depending on what it can measure - 4 per usable CPU, floored at 16, lowered
+  # when the threads that implies would take more than a thirty-second of
+  # memory, which on a small board is the term that binds: measured, a 64 MiB
+  # limit derives 4 workers, 128 MiB derives 5 and 256 MiB derives 10. A number
+  # written here is the same number whether or not the box's kernel reports a
+  # limit at all, which on embedded firmware is not a given.
+  #
+  # This is the one number here to raise if the LAN feels slow rather than the
+  # box feels full: every query shares this pool, so a shortage delays cache
+  # hits as much as misses. `max_pending` follows it at 8x (32 here), which is
+  # the backlog past which queries are dropped instead of queued.
+  workers: 4
+  # One thread rather than the two this would derive. The racer pool is created
+  # whatever the strategy and `failover` below submits nothing to it, so this
+  # is a stack rather than an arena - but on a small box that is still worth
+  # not paying. Raise it with the strategy if you ever set `race`.
+  upstream_workers: 1
+
+  # Every TCP, DoT or DoH connection is a thread, so this figure is a claim
+  # about what the box can hold. 64 is generous for a household - a client
+  # opens one and reuses it - and the per-prefix share below derives half of
+  # it, which is fine here because the whole LAN is one /24 and there is
+  # nobody hostile inside the allow list.
+  max_connections: 64
+
+  # The shipped budget, unchanged: 500 answers a second per client prefix, and
+  # the whole LAN is one prefix. On a household that is never reached; on a
+  # box this size the pool above would be the bottleneck long before the
+  # limiter was.
+  rate_limit:
+    enabled: true
+    responses_per_second: 500
+    slip: 2
+
+listeners:
+  udp:
+    enabled: true
+    # The LAN address rather than 0.0.0.0. On a router the other interface is
+    # the internet, and a resolver that never binds it cannot be probed on it
+    # at all - which matters more here than on a box behind a NAT, and costs
+    # nothing since the clients are all on this side.
+    address: "192.168.1.1"
+    port: 53
+    # One reader rather than one per core. Each is a thread and a kernel
+    # receive buffer, and what they buy is drain rate under a flood - one
+    # reader was measured draining 2.3 million datagrams a second, which no LAN
+    # will offer and this box's cores could not keep up with anyway.
+    readers: 1
+    # Down from the 1 MiB default, since this is kernel memory per reader on a
+    # box that is counting it. An untuned Linux clamps the request to
+    # net.core.rmem_max - 208 KiB - so this is close to what would have been
+    # granted regardless; the startup line reports what actually was.
+    receive_buffer: 256KiB
+  tcp:
+    enabled: true
+    address: "192.168.1.1"
+    port: 53
+  # No DoT and no DoH. Measured on a laptop core, a fresh TLS handshake costs
+  # about 1,100 µs of CPU with an ECDSA key against 37 µs to answer a query
+  # over UDP; on a router's core that ratio is worse, and a handful of
+  # devices reconnecting is a load the box cannot refuse. If you want
+  # encrypted DNS for the LAN, put it on a machine that can afford the
+  # handshakes - the DoT and DoH sections of examples/lan.yaml are the ones to
+  # copy - and leave this box forwarding.
+  dot:
+    enabled: false
+  doh:
+    enabled: false
+
+upstream:
+  # Failover, not round_robin and certainly not race. One warm pooled TLS
+  # connection to one upstream is the cheapest arrangement there is; race would
+  # ask every server for every miss and want a thread pool to do it.
+  strategy: failover
+  timeout: 5s
+  attempts: 2
+  # Fewer pooled connections than the shipped 8. Each is a socket and a TLS
+  # session's state, and four workers cannot use eight of them at once.
+  max_idle: 2
+  idle_timeout: 30s
+  servers:
+    - name: cloudflare-dot
+      type: tls
+      address: 1.1.1.1
+      port: 853
+      hostname: cloudflare-dns.com
+    - name: quad9-dot
+      type: tls
+      address: 9.9.9.9
+      port: 853
+      hostname: dns.quad9.net
+  bootstrap: [1.1.1.1, 9.9.9.9]
+
+  # The names of the things on your network, sent to whatever already answers
+  # them. On a router that is usually dnsmasq, still running for DHCP and
+  # still the only thing that knows which lease has which name - moved to a
+  # port of its own with `port=5353` so elodin can have 53.
+  #
+  # Delete this block if elodin is the only DNS on the box, and write the
+  # network's names in `rewrites` with `special_use.home_arpa: true` instead -
+  # examples/lan.yaml does it that way. The two are mutually exclusive by
+  # construction: with that key on, a route for the zone would never fire and
+  # the loader refuses the pair.
+  #
+  # Two things follow from the route, and both are what you want for a zone
+  # your own dnsmasq answers: the names are served insecure, since an internal
+  # zone has no signed delegation from the public parent, and they are exempt
+  # from the rebinding guard below, since answering with 192.168.1.x is the
+  # whole job. `--check` says both out loud.
+  zones:
+    - domains: [home.arpa]
+      servers: ["127.0.0.1:5353"]
+
+cache:
+  enabled: true
+  # 4,000 entries at a measured ~463 bytes each is about 1.9 MB, and that is
+  # the bound that will actually be reached at this ratio - the byte ceiling is
+  # the guard against a handful of very large answers filling it instead.
+  # A household's working set is a few thousand names, so this is not as small
+  # as it looks; the hit rate on a LAN comes from every device asking for the
+  # same names.
+  max_entries: 4000
+  max_bytes: 8MiB
+  min_ttl: 0
+  max_ttl: 24h
+  negative_ttl: 300
+  # On, and worth more here than anywhere else: a router reboots, a PPPoE
+  # session drops, and the alternative to a stale answer is every device on the
+  # network failing at once. The refresh is tried first (RFC 8767).
+  serve_stale: true
+
+blocking:
+  enabled: true
+  response: nxdomain
+  block_ttl: 60
+  # One list rather than four, and this is the figure to actually count.
+  # Measured on the lists this tree ships as examples: StevenBlack's hosts
+  # file is 79,994 rules, AdGuard's filter_1 is 179,583, and the malware list
+  # below is 77,526 - so at ~129 bytes a rule, one list here is about 10 MB
+  # and the four in examples/lan.yaml are 331,075 unique rules and 58 MB
+  # resident, measured, with the cache still empty. On a 128 MB router that is
+  # the difference between a fifth of the machine and half of it.
+  #
+  # Check yours rather than trusting these: the "list <name>: N rules" and
+  # "filter: N block rules" lines at startup are what you are paying for,
+  # times ~129 bytes.
+  #
+  # Overlapping lists collapse where the domains are identical - those four
+  # parse 337,183 rules and store 331,075 - which is under 2%, so a second
+  # list of the same kind costs very nearly what the first one did. Add one
+  # curated list rather than three broad ones.
+  lists:
+    - name: cyberhost-malware
+      url: https://lists.cyberhost.uk/malware.txt
+      format: domains
+
+  # tmpfs, deliberately. The cache is written after every refresh, and on a
+  # router the alternative is a weekly write to the flash the firmware lives
+  # on. The cost is that the lists are downloaded again on every boot, which
+  # needs the WAN up before they apply - a boot with no internet starts with
+  # no filtering rather than with yesterday's, and elodin logs the list as
+  # unavailable and carries on answering.
+  #
+  # Point it at persistent storage (/var/lib/elodin, an SD card, a USB stick)
+  # if the box has some and you would rather have the lists at boot.
+  cache_dir: /tmp/elodin
+  # Weekly rather than daily. A refresh is a download, a parse and a rebuild of
+  # the rule set, which on this hardware is a visible pause; malware lists move
+  # slowly enough that a week is not a meaningful loss.
+  refresh: 168h
+
+dnssec:
+  # On, and this is the one expensive thing kept. Validation is signature
+  # arithmetic per answer that needs it, which on a slow core is real - but the
+  # alternative is trusting the path to an upstream, and the queries this box
+  # forwards are its whole network's.
+  #
+  # If the box genuinely cannot keep up, the honest trade is to turn this off
+  # here and rely on the DoT upstreams above, both of which validate: you keep
+  # an authenticated channel to a validating resolver and give up your own
+  # proof. Cut the lists and the cache first - they cost far more than this.
+  enabled: true
+
+cookies:
+  # Cheap enough to keep: one hash per query, and nothing at all for clients
+  # that do not use cookies.
+  enabled: true
+  require: false
+  upstream: true
+
+rebind:
+  # On. The router's own admin interface is exactly what a rebinding attack
+  # wants, and it is on this box. The zone routed above is exempt because the
+  # route says it is answered locally, which is what makes turning this on
+  # safe here.
+  enabled: true
+  allow_loopback: false
+
+special_use:
+  enabled: true
+  onion: true
+  # Off, because the route above sends the zone to dnsmasq. On is for a network
+  # where nothing answers home.arpa - see examples/lan.yaml - and the two
+  # together are refused at load rather than leaving a route that never fires.
+  home_arpa: false
+  local: false
+  test: false
+
+metrics:
+  # Off. It is a thread and an open port for numbers the msg=stats line already
+  # writes to the log every five minutes.
+  enabled: false

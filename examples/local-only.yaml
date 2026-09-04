@@ -1,0 +1,210 @@
+# elodin on one machine, resolving for that machine only
+#
+# The deployment: a workstation, a laptop or a single server that points its own
+# /etc/resolv.conf at 127.0.0.1 and serves nothing else. Nobody else on the
+# network can reach it, which is what most of the choices below follow from.
+#
+# What it is not: a resolver other hosts use. If a second machine is ever going
+# to ask, start from examples/lan.yaml instead - widening the listener and the
+# allow list here gets you most of the way there, but the sizing, the cache and
+# the rate limit below are all chosen for a single client.
+#
+# Anything not written here is the shipped default; examples/elodin.yaml is the
+# annotated reference for all of them.
+#
+#   sudo setcap 'cap_net_bind_service=+ep' ./bin/elodin
+#   ./bin/elodin --config examples/local-only.yaml --check
+#
+# Binding 127.0.0.1:53 does not clash with systemd-resolved, whose stub sits on
+# 127.0.0.53:53 - a wildcard bind would. What resolv.conf names is the other
+# half: point it at 127.0.0.1, or install the .deb and say yes to the takeover,
+# which stops and masks resolved and writes the file for you.
+
+log:
+  level: info
+  # Off, as it ships. On a single machine the query log is a record of what you
+  # personally looked up, and it is a line per query on the same disk you are
+  # working on. `dig` and the five-minute msg=stats line answer most questions
+  # without it.
+  queries: false
+
+server:
+  # Bound to loopback below, so the only source that can arrive is this host -
+  # a packet from the network naming 127.0.0.1 as its source is a martian the
+  # kernel drops before elodin sees it. The list is here anyway because it costs
+  # a prefix compare and it is what keeps the mistake of widening the listener
+  # from also opening the resolver. Note this replaces the shipped default
+  # wholesale, which is why loopback has to be written out.
+  allow_from:
+    - 127.0.0.0/8
+    - ::1/128
+
+  # Sized for one client rather than for a network. Left unset, the derivation
+  # lands at 16 on any machine with a few GB of memory - 4 per usable CPU,
+  # floored at 16 - and every worker holds a 256 KiB scratch arena from its
+  # first query onward, about 0.26 MB resident each, measured. Eight is still
+  # 400 cache misses a second against a 20 ms upstream, which is more than a
+  # desktop's whole browsing session asks for in a burst.
+  workers: 8
+  # The racer pool is created whatever the strategy, and with `failover` below
+  # nothing is ever submitted to it. One thread rather than the four this
+  # would derive; what that saves is stacks, since a thread that never takes a
+  # job never fills a scratch arena. Raise it with the strategy if you ever set
+  # `race`.
+  upstream_workers: 1
+
+  # Nothing off this machine can connect, so the connection table is bounding
+  # this host's own `dig +tcp` and any local client that speaks DoT or DoH to
+  # loopback. 64 threads is plenty for that, and each connection is a thread.
+  max_connections: 64
+
+  rate_limit:
+    # Off, which is a decision this deployment gets to make and a LAN or public
+    # resolver does not. The budget exists because a UDP answer goes wherever
+    # the source address said, so anyone can have this server aim traffic at a
+    # third party. Bound to loopback there is no third party: the only source
+    # that reaches the socket is this host, and the only place an answer can be
+    # delivered is this host. What the limit would still do is throttle a
+    # runaway local client, and with it on that arrives as your own machine
+    # being answered truncated or not at all past 500 queries a second - a
+    # `cargo build` or a browser opening a hundred tabs can reach that, and
+    # there is nobody else here for the budget to protect.
+    enabled: false
+
+listeners:
+  udp:
+    enabled: true
+    # Loopback rather than the 0.0.0.0 that ships. The allow list above is the
+    # policy; this is the socket, and a socket that was never bound to the
+    # network cannot be reached even by a configuration mistake.
+    #
+    # One address per listener, so this serves IPv4 loopback and not ::1. That
+    # matches what a resolv.conf naming 127.0.0.1 asks for. If something here
+    # resolves over IPv6 loopback, bind "::" instead and leave the allow list
+    # above to do the restricting - an IPv4 client reaching a "::" socket
+    # arrives as ::ffff:127.0.0.1 and is compared as 127.0.0.1.
+    address: "127.0.0.1"
+    port: 53
+    # One reader thread rather than the one per usable CPU this would derive.
+    # Readers are how fast the server can hear - everything a datagram costs
+    # before the rate limiter sees it happens on the thread that read it - and
+    # that only matters when something is arriving faster than one core can
+    # drain, which was measured at 2.3 million datagrams a second. The only
+    # sender here is this machine. Each one saved is a thread and a receive
+    # buffer.
+    readers: 1
+  tcp:
+    enabled: true
+    address: "127.0.0.1"
+    port: 53
+  # No DoT or DoH. They exist so that clients on a network can reach this
+  # resolver without the path seeing the queries, and there is no path here -
+  # the loopback interface is inside the machine.
+  dot:
+    enabled: false
+  doh:
+    enabled: false
+
+upstream:
+  # The path from this machine to the resolver is the internet, so it is
+  # encrypted. Failover rather than round_robin: with one client there is no
+  # load to spread, and a single upstream keeps its pooled TLS connection warm
+  # instead of paying a handshake on alternate queries.
+  strategy: failover
+  servers:
+    - name: cloudflare-dot
+      type: tls
+      address: 1.1.1.1
+      port: 853
+      hostname: cloudflare-dns.com
+    - name: quad9-dot
+      type: tls
+      address: 9.9.9.9
+      port: 853
+      hostname: dns.quad9.net
+  # Used to resolve the blocklist hosts and any upstream named by hostname.
+  # These are IP literals above, so this is for the lists.
+  bootstrap: [1.1.1.1, 9.9.9.9]
+
+cache:
+  enabled: true
+  # One machine's working set, not a network's. The point of a cache here is
+  # the repeat lookups a single browser makes, which is a few thousand names.
+  # At a measured ~463 bytes an entry, 5,000 answers is about 2.3 MB, so the
+  # entry count is what will bind and the 16 MiB ceiling is only the guard
+  # against a run of unusually large answers.
+  max_entries: 5000
+  max_bytes: 16MiB
+  # Left at zero deliberately. Raising the floor would hold a short-TTL answer
+  # longer than its owner asked, and the names that publish 30-second TTLs are
+  # the ones doing failover with them - a CDN or a load balancer moving traffic
+  # off a host that has gone away. The saving would be a handful of queries.
+  min_ttl: 0
+  max_ttl: 24h
+  # On. A laptop's upstream goes away often - wifi drops, a VPN comes up, a
+  # captive portal appears - and this answers from an expired entry rather than
+  # failing while it is down. RFC 8767: the refresh is tried first and the
+  # stale copy is used only once that has failed, and it goes out with a
+  # 30-second TTL so the client comes back for a fresh one.
+  serve_stale: true
+
+blocking:
+  enabled: true
+  # NXDOMAIN, as it ships. On a machine where you are the one seeing the
+  # results, "no such name" is the answer that makes a blocked request fail
+  # fast; `zeroip` would have the browser wait on a connection to 0.0.0.0.
+  response: nxdomain
+  # What the packaged unit uses. Started by hand as your own user, point it at
+  # a directory that user can write - ~/.cache/elodin - since this is reopened
+  # by the refresh hours after the start. A directory it cannot write is a
+  # warning rather than an error: the lists still apply, they are just fetched
+  # again on the next start.
+  cache_dir: /var/cache/elodin
+  refresh: 24h
+  lists:
+    - name: steven-black
+      url: https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
+      format: hosts
+    - name: cyberhost-malware
+      url: https://lists.cyberhost.uk/malware.txt
+      format: domains
+
+dnssec:
+  # On, as it ships. The upstreams above are DoT to two public resolvers that
+  # both return DNSSEC records, which is what this needs. The case for turning
+  # it off is an upstream that cannot - an ISP box, a captive portal - and the
+  # answer to that is to not use one as an upstream.
+  #
+  # Worth knowing on a laptop: a captive portal intercepts port 53 and will not
+  # let 853 out until you have signed in, so this configuration resolves
+  # nothing at all on hotel wifi until the portal is satisfied. That is the DoT
+  # upstream rather than validation, and it is the honest cost of not talking
+  # to whatever the network hands you.
+  enabled: true
+
+rebind:
+  # On. This machine is not running split horizon and no local zone answers
+  # here with a private address, which is the deployment the default is off
+  # for - so the guard costs nothing and refuses the answer that would let a
+  # web page reach a service bound to this machine's own loopback.
+  enabled: true
+  # Left off: `localhost.` gets its loopback answer from the reserved-name
+  # table below without it, and any other public name pointing at 127.0.0.1 is
+  # the attack this is here to refuse.
+  allow_loopback: false
+
+special_use:
+  enabled: true
+  onion: true
+  # local., test. and home_arpa left off, which is the shipped default and the
+  # right call for a machine that moves between networks. Each of them would
+  # answer the zone here, and this machine may well be sitting on a network
+  # whose router or Active Directory server is the thing that legitimately
+  # answers it. A resolver that serves one network only can turn them on - see
+  # examples/lan.yaml and examples/public.yaml.
+
+metrics:
+  # Off, as it ships. Turn it on if you already run a node exporter and want
+  # the counters; the msg=stats log line carries the same numbers every five
+  # minutes without opening a port.
+  enabled: false

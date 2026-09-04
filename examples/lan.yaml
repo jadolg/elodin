@@ -1,0 +1,352 @@
+# elodin as the resolver for one network
+#
+# The deployment: a box on a home or small-office LAN - a NUC, a Pi, a server
+# in the rack - that every device on that network points at, by DHCP option 6
+# or by hand. It filters ads and malware for the whole network, answers the
+# network's own names, and forwards everything else over DoT.
+#
+# The example assumes 192.168.1.0/24 and a resolver at 192.168.1.2. Change the
+# network in `server.allow_from`, the addresses in `rewrites`, and nothing else
+# has to move.
+#
+# Two facts about a LAN resolver drive most of the choices below. The clients
+# are known and trusted, which is what lets the connection table be shared
+# without a per-client share. And they are all one prefix - every device on
+# 192.168.1.0/24 is a single /24 to the rate limiter and to the connection
+# cap - so the per-prefix figures are being spent by the whole network rather
+# than by one device.
+#
+# Anything not written here is the shipped default; examples/elodin.yaml is the
+# annotated reference for all of them.
+
+log:
+  level: info
+  # Off. This is not about disk - it is that on a shared resolver the query log
+  # is a record of every household member's or colleague's browsing, held on a
+  # box they do not administer. Turn it on to debug something, and turn it off
+  # again. The msg=stats line every five minutes, and the metrics endpoint at
+  # the bottom, answer "is it working" without keeping any of that.
+  queries: false
+
+server:
+  # The networks this box serves, replacing the shipped default wholesale. This
+  # is narrower than the default on purpose: the default covers all of RFC 1918
+  # because it has to suit a network it has never seen, and you know which one
+  # yours is. Loopback stays, for `dig @127.0.0.1` on the box itself and for
+  # anything local that resolves through it.
+  #
+  # fe80::/10 is here because a client that reaches this box over IPv6 on the
+  # LAN commonly arrives from a link-local address. Add your ULA prefix
+  # (fd00::/8 territory) or your delegated /64 if your network has one; drop
+  # both lines if it has no IPv6 at all.
+  allow_from:
+    - 127.0.0.0/8
+    - 192.168.1.0/24
+    - fe80::/10
+
+  # Left to derive from the machine. A resolver for a household or an office
+  # floor is not throughput-bound - a busy home network is a few dozen queries
+  # a second, most of them cache hits - and the derivation (4 per usable CPU,
+  # floor 16) is already generous for that. Set a number only if you have
+  # measured a need: `target_qps * upstream_rtt` is the shape of it, so 2,000
+  # queries a second of cache misses against a 20 ms upstream wants 40.
+  workers: 0
+
+  # The whole table, and all of it available to one prefix.
+  #
+  # `max_connections_per_prefix` exists because on a public resolver one
+  # stranger holding idle connections must not be able to lock everybody else
+  # out. Here there is no everybody else: `allow_from` above already decides
+  # who may connect at all, and every device on the LAN shares one /24, so a
+  # share would only ration the network against itself - 256 connections for
+  # all your devices together, and a phone that reconnects gets refused
+  # because the laptops were holding them. Setting it to the table size is how
+  # you say "no per-client cap", which is what elodin did before the setting
+  # existed.
+  #
+  # This is only safe *because* the allow list is narrow. If you widen the
+  # allow list - a guest VLAN, a VPN range you do not control - put the share
+  # back to 0 (half the table) and read examples/public.yaml.
+  max_connections: 512
+  max_connections_per_prefix: 512
+
+  rate_limit:
+    enabled: true
+    # Raised from the shipped 500, because the budget is per client prefix and
+    # this whole network is one prefix. Every device on 192.168.1.0/24 draws
+    # from the same 1,000 answers a second; a household asking a few dozen a
+    # second never comes close, and an office floor with a hundred busy
+    # machines might touch it at a peak. Work it out as devices times their
+    # peak rate, and remember the figure is charged twice over - once for
+    # datagrams and once for queries arriving on connections.
+    #
+    # What it still protects, on a network that trusts its clients: this box
+    # answers UDP, and a UDP source address is written by whoever sent the
+    # datagram. One compromised device, or one machine on a guest VLAN that
+    # can reach the resolver, can have it aim answers at a third party. The
+    # ceiling on that is this figure times `max_udp_response`, so about
+    # 1.2 MB/s per victim prefix here.
+    responses_per_second: 1000
+    # At most every second query over budget comes back truncated rather than
+    # dropped, which tells a real client to ask again over TCP. On a LAN that
+    # is what keeps a genuinely busy device resolving instead of timing out.
+    # "At most" because those truncated answers have a budget of their own, an
+    # eighth of the figure above - so this server cannot be made to spend its
+    # read loop sending them.
+    slip: 2
+
+  # Privileges: the packaged systemd unit binds :53 through
+  # AmbientCapabilities and never runs as root, so nothing needs setting here.
+  # If you start this by hand as root, name an account and elodin will not
+  # still be root when the first query arrives:
+  #   user: elodin
+  #   group: elodin
+
+listeners:
+  udp:
+    enabled: true
+    # 0.0.0.0 serves every interface this box has, which is what a resolver for
+    # the LAN wants and is safe because `allow_from` above is what decides who
+    # is answered. If the box also has a public address, binding the LAN
+    # address (192.168.1.2) is the belt to that braces - nothing is then
+    # listening on the public side at all.
+    address: "0.0.0.0"
+    port: 53
+    # Left to derive: one reader thread per usable CPU, to eight. A reader is
+    # the rate at which this server can hear at all, and one of them drains 2.3
+    # million datagrams a second where that was measured - orders of magnitude
+    # past a LAN. `elodin_udp_receive_drops_total` is what would say otherwise;
+    # if it is zero, this number is already too high rather than too low.
+    readers: 0
+  tcp:
+    enabled: true
+    address: "0.0.0.0"
+    port: 53
+  # DoT and DoH for the network's own clients: a phone on the wifi that speaks
+  # DoT to this box gets its queries hidden from everything else on the LAN,
+  # and a device configured with the .mobileconfig profile keeps using this
+  # resolver rather than falling back to its vendor's.
+  #
+  # Both need a certificate for the name the clients use. `mise run certs`
+  # makes a self-signed one for testing; on a LAN the workable options are a
+  # real certificate for a name you own (an internal name with a public zone,
+  # via DNS-01) or your own CA installed on the devices. A self-signed
+  # certificate is refused by every DoT and DoH client that checks, which is
+  # all of them.
+  #
+  # Left off here because a certificate is a thing you have to have first, and
+  # a listener that cannot load one fails the start rather than degrading.
+  dot:
+    enabled: false
+    address: "0.0.0.0"
+    port: 853
+    cert_file: /etc/elodin/cert.pem
+    key_file: /etc/elodin/key.pem
+  doh:
+    enabled: false
+    address: "0.0.0.0"
+    port: 443
+    path: /dns-query
+    cert_file: /etc/elodin/cert.pem
+    key_file: /etc/elodin/key.pem
+    mobileconfig_path: /apple-doh.mobileconfig
+
+upstream:
+  # round_robin rather than the shipped failover, and the reason is not load -
+  # a LAN's query rate is nothing to either of these servers. It is that the
+  # queries this box forwards are the whole network's browsing, and failover
+  # sends all of it to one company for as long as that company is up.
+  # Alternating splits the stream so neither of them holds the complete
+  # picture. The cost is that both connections stay warm rather than one, which
+  # is two pooled TLS sessions instead of one.
+  #
+  # Use failover instead if one upstream is clearly closer than the other -
+  # then this is trading latency on half your queries for a privacy gain you
+  # can also get by choosing a single resolver you trust.
+  strategy: round_robin
+  timeout: 5s
+  attempts: 2
+  servers:
+    - name: cloudflare-dot
+      type: tls
+      address: 1.1.1.1
+      port: 853
+      hostname: cloudflare-dns.com
+    - name: quad9-dot
+      type: tls
+      address: 9.9.9.9
+      port: 853
+      hostname: dns.quad9.net
+  bootstrap: [1.1.1.1, 9.9.9.9]
+
+  # If your router, NAS or domain controller is authoritative for a zone, send
+  # that zone to it rather than to a public resolver that has never heard of
+  # it. Each route is a whole upstream in its own right and inherits what it
+  # does not say from the settings above.
+  #
+  # Note the interaction with `special_use.home_arpa` at the bottom of this
+  # file: it is on, which answers the whole zone here, and a route for
+  # home.arpa. under it would never fire - so the loader refuses the pair by
+  # name rather than letting you find out from the outside. Pick one. The key
+  # is for a network where nothing serves the zone (this one, where the names
+  # are in `rewrites` below); the route is for one where the router does.
+  # zones:
+  #   - domains: [home.arpa]         # needs special_use.home_arpa: false
+  #     servers: [192.168.1.1]
+  #   - domains: [corp.example]
+  #     servers: [10.0.0.1]
+
+cache:
+  enabled: true
+  # Bigger than the shipped 10,000, because one cache in front of a whole
+  # network is the cheapest thing here: every device's lookup of the same name
+  # is one entry and every device after the first gets it for free. At a
+  # measured ~463 bytes an entry, 50,000 answers is about 23 MB, so the entry
+  # count is what will bind and the 128 MiB ceiling is the guard for a network
+  # whose answers run larger than average - a count of entries is not a bound
+  # on memory. Both are checked, and eviction is from the least recently used
+  # end when either is passed.
+  max_entries: 50000
+  max_bytes: 128MiB
+  min_ttl: 0
+  max_ttl: 24h
+  negative_ttl: 300
+  # On. When the WAN link blips - and on a household connection it does - the
+  # network keeps resolving from expired entries instead of every device
+  # showing an error at once. The refresh is tried first and the stale copy
+  # used only if that fails (RFC 8767), and it goes out with a 30-second TTL.
+  serve_stale: true
+
+blocking:
+  enabled: true
+  # NXDOMAIN. `nodata` is the gentler answer for clients that handle an empty
+  # response badly, and `zeroip` is what you want if something on the network
+  # needs a connection to fail fast rather than a lookup to; both are here for
+  # deployments where NXDOMAIN confuses a device. On a LAN NXDOMAIN is right:
+  # it is what the client would get for a name that does not exist, which is
+  # the fiction being maintained.
+  response: nxdomain
+  block_ttl: 60
+  cache_dir: /var/cache/elodin
+  refresh: 24h
+  lists:
+    - name: steven-black
+      url: https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
+      format: hosts
+    - name: adguard-dns
+      url: https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt
+      format: adblock
+    - name: android-tracking
+      url: https://raw.githubusercontent.com/Perflyst/PiHoleBlocklist/master/android-tracking.txt
+      format: domains
+    - name: cyberhost-malware
+      url: https://lists.cyberhost.uk/malware.txt
+      format: domains
+    # A file for the network's own additions, kept apart from the downloaded
+    # lists so a refresh cannot lose them.
+    # - name: local
+    #   file: /etc/elodin/blocklist.txt
+
+  rules:
+    - "||doubleclick.net^"
+
+  # The other half of running lists on a network other people use: something
+  # will break, and this is where it goes. An entry here outranks every list.
+  # `allow` takes adblock syntax; `allowlists` takes whole files or URLs of the
+  # same, for a maintained exception list.
+  # allow:
+  #   - "||some-shop.example^"
+  allowlists: []
+
+dnssec:
+  # On, as it ships, and the DoT upstreams above both return the records it
+  # needs. Worth keeping on a shared resolver in particular: a forged answer
+  # here is one every device on the network takes.
+  enabled: true
+
+cookies:
+  enabled: true
+  # Off, as it ships. It is the lever for an attack under way - it costs every
+  # new UDP client one extra round trip - and a LAN resolver behind a NAT is
+  # not reachable by the off-path attacker it defends against.
+  require: false
+  upstream: true
+
+rebind:
+  # On, which is a change from the shipped default, and the one setting in this
+  # file to think about before copying it.
+  #
+  # It refuses an upstream answer that points a public name into private
+  # address space - the DNS half of a rebinding attack, where a page served
+  # from a name the attacker owns is re-answered with 192.168.1.1 and can then
+  # read your router's admin interface using the browser as the proxy. That is
+  # exactly the shape of attack a LAN resolver is on the wrong end of.
+  #
+  # It ships off because the deployment it ships to often does this on purpose:
+  # split horizon, where a public zone answers with a LAN address. If you do
+  # that, keep it on and name those zones below rather than turning it off.
+  # Names in `rewrites` need nothing - they are answered here and never reach
+  # an upstream. A zone with an `upstream.zones` route needs nothing either.
+  enabled: true
+  # allow_domains:
+  #   - corp.example
+  allow_loopback: false
+
+# The network's own names, answered here. A rule is matched before the block
+# lists, before the reserved-name table below and before anything is
+# forwarded, so these names never leave the building.
+#
+# The reverse comes with them: nas.home.arpa below also answers PTR for
+# 50.1.168.192.in-addr.arpa, so `nslookup 192.168.1.50` gives back the name you
+# wrote. Nothing is invented - a wildcard names no one host, and `ptr: false`
+# is how a rule says its address belongs to something else.
+rewrites:
+  - domain: nas.home.arpa
+    answer: 192.168.1.50
+    ttl: 300
+  - domain: printer.home.arpa
+    answer: 192.168.1.60
+  # A name the network should not resolve at all, answered as if it were on a
+  # blocklist - the per-name form of the lists above, for the one appliance
+  # that phones home.
+  - domain: telemetry.example.com
+    answer: block
+  # A wildcard covers subdomains only, so this answers anything under
+  # svc.home.arpa and not svc.home.arpa itself.
+  # - domain: "*.svc.home.arpa"
+  #   answers: [192.168.1.2]
+
+special_use:
+  enabled: true
+  onion: true
+  # On, which is a change from the default, and it is the privacy decision in
+  # this file. RFC 8375 reserved home.arpa for a home network's own names and
+  # asks that those queries not be sent to the public DNS. Nothing on this
+  # network is authoritative for the zone - the names are in `rewrites` above,
+  # which are matched first - so with this on, a lookup for a printer that is
+  # off, or a typo, is answered here instead of telling a public resolver the
+  # names of the things on your network.
+  #
+  # Turn it off if your router serves the zone, and give it an
+  # `upstream.zones` route instead; the two together are refused at load.
+  home_arpa: true
+  # local. and test. stay off, the shipped default. Turning them on answers
+  # those zones here with NXDOMAIN, which is right for a network where nothing
+  # serves them and wrong the moment something does - an Active Directory
+  # domain under .local, an internal .test zone. If neither exists on your
+  # network, turning them on stops the same kind of leak home_arpa does.
+  local: false
+  test: false
+
+metrics:
+  # On, and on loopback. Everything it serves is a counter this box keeps
+  # anyway for the stats line, so scraping costs nothing per query, and
+  # examples/grafana-dashboard.json is built against it.
+  enabled: true
+  # Loopback because there is no authentication in front of it and the numbers
+  # describe the network - query rates, block rates, which upstreams are up. A
+  # Prometheus on another box needs this widened to the LAN address, which
+  # elodin says out loud at startup; keep it off the public side either way.
+  address: "127.0.0.1"
+  port: 9153
+  path: /metrics

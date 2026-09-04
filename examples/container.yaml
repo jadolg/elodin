@@ -1,0 +1,264 @@
+# elodin in a container, in front of a cluster's own DNS
+#
+# The deployment: a caching, validating forwarder that runs beside or in front
+# of a cluster's DNS - a DaemonSet on each node, a sidecar in a pod, or a
+# plain container on a Docker host. Pods ask it, it answers the cluster's own
+# names out of the cluster's DNS and everything else out of the public
+# internet, and it keeps a cache so that neither of those is asked twice for
+# the same name.
+#
+# The example assumes a Kubernetes cluster with pods on 10.244.0.0/16,
+# services on 10.96.0.0/12, kube-dns at 10.96.0.10 and the cluster domain
+# `cluster.local`. Every one of those is a number to change.
+#
+# Three things are different here from every other example in this directory:
+#
+#   * The sizing is left entirely to the derivation, because in a container the
+#     derivation is reading your limits rather than the host's - the CPU
+#     affinity mask and the cgroup CPU and memory limits. A pod with
+#     `limits.cpu: 1` sizes itself for one CPU on a 64-core node.
+#   * Nothing is written to disk, so there is no blocklist cache to keep and
+#     the filesystem can be read-only.
+#   * The metrics endpoint is bound wide, because the thing that scrapes it is
+#     outside the pod. That is the one place in this tree where widening it is
+#     the right answer, and elodin still says so at startup.
+#
+# Anything not written here is the shipped default; examples/elodin.yaml is
+# the annotated reference for all of them.
+
+log:
+  level: info
+  # Off. In a cluster the log is collected, indexed and kept, so a line per
+  # query is a bill as well as a record of what every workload looks up. The
+  # metrics endpoint below is the interface to use here.
+  queries: false
+  # stderr, which is what a container's log collector reads.
+  file: ""
+
+server:
+  # The pod and service networks, replacing the shipped default. The default's
+  # 10.0.0.0/8 would already cover both of these on most clusters, but writing
+  # them out is what makes the file say which cluster it is for - and it drops
+  # 172.16/12 and 192.168/16, which a pod has no business querying from.
+  #
+  # Loopback is here for the container's own liveness probe. A probe that runs
+  # `dig @127.0.0.1` inside the pod is a client like any other.
+  allow_from:
+    - 127.0.0.0/8
+    - 10.244.0.0/16
+    - 10.96.0.0/12
+
+  # Left to derive, and in a container that is the point rather than a default
+  # nobody changed. "Usable" is what this process may have: the affinity mask
+  # and the cgroup limits, so `resources.limits` sizes the pool and
+  # `--check` reports what it settled on. The rule is 4 per usable CPU, floored
+  # at 16 and capped at 128, lowered whenever the threads that implies would
+  # take more than a thirty-second of usable memory - so a pod limited to one
+  # CPU and 512 MiB derives 16 workers, the same pod at 256 MiB derives 10, and
+  # at 128 MiB it derives 5.
+  #
+  # If you pin a number here, pin the limits too: a 128-worker pool in a pod
+  # limited to 256 MiB is about 34 MB of scratch arenas out of that budget.
+  workers: 0
+  upstream_workers: 0
+
+  # A cluster's clients are pods, which is a lot of addresses but few
+  # connections each - and per-prefix means per /24, which on most CNIs is one
+  # node's worth of pods. Half of 256 for a node is far more than its pods
+  # will hold.
+  max_connections: 256
+  max_connections_per_prefix: 0
+
+  rate_limit:
+    enabled: true
+    # Raised from the shipped 500 because a /24 here is a whole node's pods
+    # rather than a household - a node running a hundred workloads that each
+    # resolve on every request can pass 500 answers a second without anything
+    # being wrong. Watch elodin_rate_limited_total after a change; if it moves
+    # in normal operation the figure is too low.
+    responses_per_second: 2000
+    slip: 2
+
+  # Nothing here. A container runs as whatever the image or `runAsUser` says
+  # and there is no root to put down; binding :53 needs
+  # NET_BIND_SERVICE in `securityContext.capabilities.add`, or run on 5353
+  # below and let the Service map 53 to it.
+  user: ""
+
+listeners:
+  udp:
+    enabled: true
+    # Every interface the pod has, which is one. The allow list above is what
+    # decides who is answered.
+    address: "0.0.0.0"
+    port: 53
+    # Derived like the worker counts, and from the same reading of the cgroup:
+    # one reader thread per usable CPU, to eight, so a pod limited to one CPU
+    # gets one reader rather than one per core of the node it landed on. That
+    # is the whole reason to leave it unset here.
+    readers: 0
+  tcp:
+    enabled: true
+    address: "0.0.0.0"
+    port: 53
+  # No DoT or DoH. Inside a cluster the network between a pod and this
+  # resolver is the cluster's own, and if that needs encrypting it is the
+  # service mesh's job rather than a second TLS implementation's. A DoH
+  # endpoint for clients *outside* the cluster is examples/public.yaml.
+  dot:
+    enabled: false
+  doh:
+    enabled: false
+
+upstream:
+  # The public half. Everything that is not a cluster name goes out over DoT,
+  # so a node's DNS traffic is not readable by whatever shares its network.
+  strategy: failover
+  timeout: 5s
+  attempts: 2
+  max_idle: 8
+  idle_timeout: 30s
+  servers:
+    - name: cloudflare-dot
+      type: tls
+      address: 1.1.1.1
+      port: 853
+      hostname: cloudflare-dns.com
+    - name: quad9-dot
+      type: tls
+      address: 9.9.9.9
+      port: 853
+      hostname: dns.quad9.net
+  # Note what this is not: the cluster's DNS. Bootstrap resolves upstream
+  # hostnames and blocklist hosts, and pointing it at kube-dns would make this
+  # resolver depend on the thing it is meant to be caching for.
+  bootstrap: [1.1.1.1, 9.9.9.9]
+
+  # The cluster half. This is the whole reason to run a forwarder here rather
+  # than a public resolver: `cluster.local` is answered by kube-dns and by
+  # nothing else on earth, and a public upstream has never heard of it.
+  #
+  # Two consequences of a route, and in a cluster both are exactly right.
+  # Names in the zone are served insecure - so kube-dns does not have to
+  # return DNSSEC records for names nothing signs - and the zone is exempt
+  # from the rebinding guard below, so a service's 10.96.x.x address is not
+  # refused as a public name pointing into private space. `--check` prints
+  # both.
+  #
+  # The reverse zone comes with it: a pod that looks up 10.244.1.7 wants
+  # kube-dns's answer, not the public DNS's NXDOMAIN. 10.in-addr.arpa covers
+  # both the pod and service CIDRs here; narrow it (96.10.in-addr.arpa and so
+  # on) if this node also talks to 10.x hosts that are not the cluster's.
+  #
+  # And note `special_use.local` at the bottom, which stays off. `cluster.local`
+  # sits under the reserved `.local`, and with that key on the zone would be
+  # answered here as nonexistent before anything was forwarded - so the loader
+  # refuses the pair by name rather than leaving a route that never fires.
+  zones:
+    - domains: [cluster.local, 10.in-addr.arpa]
+      servers: [10.96.0.10]
+      # kube-dns is one address behind a Service, so there is nothing to fail
+      # over to; a second entry here would be a second copy of the same
+      # endpoint. Keep the attempt count so a dropped datagram is retried.
+      attempts: 2
+      timeout: 2s
+
+cache:
+  enabled: true
+  # The reason this container exists. A cluster resolves the same few hundred
+  # service names continuously, and every hit here is a query kube-dns does
+  # not serve - which is the load that makes cluster DNS fall over.
+  #
+  # Both bounds are checked; at a measured ~463 bytes an entry, 64 MiB is
+  # about 145,000 average answers, so the entry count below is the one that
+  # bites first and the byte ceiling is the guard. Size the byte figure against
+  # the pod's memory limit, not the node's.
+  max_entries: 50000
+  max_bytes: 64MiB
+  # Left at zero. It is tempting to raise the floor to smooth over kube-dns,
+  # but service addresses change on a rollout and a floor would have pods hold
+  # the old one past its TTL. `serve_stale` below is the safe version of the
+  # same wish: it only applies when the upstream has actually failed.
+  min_ttl: 0
+  max_ttl: 24h
+  negative_ttl: 300
+  # On. kube-dns is itself a set of pods that get rescheduled, and this is
+  # what keeps a rollout of it from being an outage for everything else. The
+  # refresh is tried first and the expired copy used only once it has failed
+  # (RFC 8767), with a 30-second TTL on the way out.
+  serve_stale: true
+
+blocking:
+  # Off, and the two reasons are separate. A resolver in the request path of
+  # other people's workloads should not be deciding which names they may
+  # resolve - a filtered name looks to them like a service that is down. And
+  # the lists need a writable cache directory and an egress route to fetch
+  # them, both of which a read-only, network-policied container should not
+  # have.
+  #
+  # If you do want filtering here, give the pod a writable volume and set
+  # `cache_dir` to it; without one the lists are re-downloaded on every start
+  # and every restart.
+  enabled: false
+
+dnssec:
+  # On for the public half. The routed zone above is served insecure, so this
+  # asks nothing of kube-dns - which is what makes the two halves able to
+  # coexist under one setting.
+  enabled: true
+
+cookies:
+  enabled: true
+  require: false
+  # On, as it ships. It is what covers the plain-UDP hop to kube-dns: forging
+  # an answer to one of our queries then means guessing 64 bits as well as the
+  # transaction ID and the source port.
+  #
+  # With one limit worth knowing here. A cookie is only put on a query that
+  # already carries an OPT record, since adding one would negotiate EDNS the
+  # client never asked for - and the routed zone is not validated, so unlike
+  # the public half of this file it is not this server that adds the OPT.
+  # Cluster queries from a client that sends no EDNS therefore make that hop
+  # without a cookie. A server that does not implement cookies is unaffected
+  # either way: the exchange carries on without one.
+  upstream: true
+
+rebind:
+  # On. A pod's browser-shaped clients are rarer than a LAN's, but the answer
+  # this refuses - a public name pointing at 169.254.169.254, the cloud
+  # metadata endpoint - is the one that matters most in a cluster, where that
+  # address hands out credentials.
+  #
+  # The routed zone above is exempt, which is why this can be on at all. If
+  # your cluster also forwards a corporate zone that answers with RFC 1918
+  # addresses, either route it too or name it in allow_domains.
+  enabled: true
+  # allow_domains:
+  #   - corp.example
+  allow_loopback: false
+
+special_use:
+  enabled: true
+  onion: true
+  # Off, and load-bearing: `cluster.local` is under the reserved `.local`, and
+  # this key answers that whole zone here. With it on, the route above would
+  # never be reached - the loader refuses the pair rather than letting you
+  # discover it from a pod that cannot resolve its own service.
+  local: false
+  # test. and home_arpa. left off too, for the same shape of reason: another
+  # cluster's chart may well use a name under one of them, and answering them
+  # here is a decision for a resolver that is nobody's local authority.
+  test: false
+  home_arpa: false
+
+metrics:
+  enabled: true
+  # 0.0.0.0, unlike everywhere else in this directory, because the Prometheus
+  # that scrapes this is outside the pod and loopback would be unreachable to
+  # it. elodin logs a warning at startup saying the endpoint is served to
+  # anything that can reach it without authentication, and that warning is
+  # correct - what makes this safe is a NetworkPolicy that lets only the
+  # scraper reach this port, not the binding.
+  address: "0.0.0.0"
+  port: 9153
+  path: /metrics
