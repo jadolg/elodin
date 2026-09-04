@@ -72,11 +72,20 @@ can be the parent's proof on one query and the route's own NODATA on the next.
 Most of that is closed rather than merely narrow: a member that rewrites the
 rcode to SERVFAIL or REFUSED is passed over, `resolve_query` asking the group
 through `upstream.resolve_answerable`, so the proof is found wherever the group
-holds it. What survives is a member that rewrites the rcode to a NOERROR with
-something in the answer section, which is answerable and stops the sweep. That
-is the worst this carve-out can do to the cache, and it is the behaviour the
-zone had before the carve-out existed: an unsigned NODATA for the apex `DS`,
-served for the entry's lifetime.
+holds it. What survives is a member whose reply is answerable without being the
+proof, since that one stops the sweep before the member holding the proof is
+reached: a NOERROR with something in the answer section, an NXDOMAIN, or a `DS`
+RRset. The first of those keeps nothing - `parent_answers_apex_ds` leaves it
+unsettled, so `resolve_query` serves the route's answer and stores none of it,
+and the next query is free to reach the member that can prove the delegation.
+The other two are settled by design, being statements about the public tree, so
+the route's answer does go into the entry and stands for `cache.negative_ttl`
+while another member of the same group was publishing the proof all along - one
+upstream answering NXDOMAIN for an empty non-terminal that its neighbour answers
+NODATA for, against RFC 8020, is how that actually arises. That is the worst
+this carve-out can do to the cache, and it is the behaviour the zone had before
+the carve-out existed: an unsigned NODATA for the apex `DS`, served for the
+entry's lifetime.
 */
 Zone_Route :: struct {
 	// Canonical, lowercase, root-dotted, as `config.Zone_Route` left them.
@@ -418,6 +427,17 @@ pay the parent's full budget again - nothing was stored to answer it from, by
 the rule at the store. That is the price of not memoising an outage, and it is
 the right way round: a stall every ten seconds recovers the moment the path
 does, where a stored answer would go on being served after it.
+
+The price is worth stating in full, because it is paid by the client rather than
+by this server. `healthy` goes true again the moment the cooldown elapses, so
+against an uplink that blackholes packets - no ICMP, nothing to fail fast on -
+the first apex `DS` after each expiry runs the group to the end of its budget,
+`attempts` rounds over every server, twenty seconds at the defaults. A
+validating stub gives up in two to five and SERVFAILs the zone for that round,
+so what recovers in ten seconds is this server's willingness to try, not
+necessarily the client's answer. Bounding it means a deadline of this question's
+own or asking both groups at once, neither of which belongs in the same change
+as the carve-out.
 */
 @(private)
 group_reachable :: proc(g: ^upstream.Group) -> bool {
