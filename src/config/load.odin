@@ -227,7 +227,8 @@ OVERRIDE_MAX_BITS_V4 :: 24
 OVERRIDE_MAX_BITS_V6 :: 64
 
 /*
-What an entry looks like, for the two errors that say the setting is not a list.
+What one entry looks like, and what the whole setting looks like, for the errors
+that say it has the wrong shape.
 
 Passed as an *argument* rather than written into the format string, because
 `errorf` is a `printf` and Odin's `fmt` reads `{` as the start of a brace-style
@@ -235,9 +236,15 @@ directive: `such as [{prefix: ...}]` in the format renders as
 `such as [%!(MISSING ARGUMENT)%!(MISSING CLOSE BRACE)refix: ...}]`, which is the
 message an operator gets for the commonest way to write this setting wrong. An
 argument is never rescanned for directives, so the braces reach the reader.
+
+The list form is built out of the entry form rather than written twice, so the
+two examples cannot come to disagree about what an entry is.
 */
 @(private)
-OVERRIDES_EXAMPLE :: "[{prefix: 198.51.100.0/24, responses_per_second: 5000}]"
+OVERRIDE_EXAMPLE :: "{prefix: 198.51.100.0/24, responses_per_second: 5000}"
+
+@(private)
+OVERRIDES_EXAMPLE :: "[" + OVERRIDE_EXAMPLE + "]"
 
 /*
 Read `server.rate_limit.overrides` into the networks it names.
@@ -303,6 +310,27 @@ load_rate_limit_overrides :: proc(l: ^Loader, rl: ^yaml.Node, cfg: ^Config) {
 
 	for e, i in entries {
 		path := fmt.tprintf("server.rate_limit.overrides[%d]", i)
+		/*
+		An entry that is not a mapping is said to be that, rather than reported
+		as a missing key.
+
+		`- 198.51.100.0/24` - the network on its own, which is what
+		`allow_from`'s entries look like and so the shorthand somebody reaches
+		for here - is a scalar, and `yaml.get` answers nil for every key of a
+		scalar. Read through the "missing prefix" branch below it becomes "this
+		entry does not name a network", said to an operator looking straight at
+		the network they wrote. What is actually missing is the figures, and the
+		shape that carries them.
+		*/
+		if e == nil || e.kind != .Mapping {
+			errorf(
+				l,
+				"%s: expected a network and the figures it gets, such as %s; a network on its own does not say what it is being given",
+				path,
+				OVERRIDE_EXAMPLE,
+			)
+			continue
+		}
 		text := ""
 		/*
 		`opt_string` has already said its piece when the key is there and is

@@ -830,11 +830,18 @@ agree: the length-prefixed ones end it, DoH answers 429 and keeps it - see
 `serve_doh_request`. An operator reading "closing the connection" for a refusal
 that closed nothing would go looking for a disconnection that never happened, so
 the caller says which it was rather than the line assuming.
+
+The setting is named with the caveat `report_conn_rate_limit` carries, and for
+its reason: since `server.rate_limit.overrides` exists, the figure that refused
+this client is the top-level one only where no entry names its network. An
+operator sent to a line that is not the one refusing them is the mistake the
+override lines at startup exist to prevent, and a message that only knows about
+the top of the file would reintroduce it here.
 */
 @(private)
 report_rate_limited :: proc(client: string, proto: Protocol, closing: bool) {
 	logx.debugf(
-		"%s: %s from %s, its prefix is over server.rate_limit.responses_per_second",
+		"%s: %s from %s, its prefix is over server.rate_limit.responses_per_second - or, where server.rate_limit.overrides names this client's network, over that entry's figure",
 		proto_name(proto),
 		"closing the connection" if closing else "refusing a query",
 		client,

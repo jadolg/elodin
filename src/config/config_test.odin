@@ -477,6 +477,14 @@ test_rate_limit_overrides_are_checked :: proc(t: ^testing.T) {
 	}
 	cases := []Bad {
 		{"      - { responses_per_second: 5000 }\n", "an override with no prefix"},
+		/*
+		The network on its own, which is what an `allow_from` entry looks like
+		and so the shorthand this setting invites. A scalar answers nil to every
+		key, so read through the missing-key branch it becomes "this entry does
+		not name a network" - said to an operator looking straight at the
+		network they wrote. The message has to be about the shape.
+		*/
+		{"      - 198.51.100.0/24\n", "a network written on its own rather than as an entry"},
 		{"      - { prefix: not-a-network, responses_per_second: 5000 }\n", "an unparseable prefix"},
 		{"      - { prefix: 198.51.100.5/25, responses_per_second: 5000 }\n", "an IPv4 network finer than /24"},
 		{"      - { prefix: \"2001:db8::1/128\", responses_per_second: 50 }\n", "an IPv6 network finer than /64"},
@@ -525,6 +533,28 @@ test_rate_limit_overrides_are_checked :: proc(t: ^testing.T) {
 				!strings.contains(m, "%!"),
 				"the message for %s did not render: %s",
 				c.what,
+				m,
+			)
+		}
+	}
+
+	/*
+	And the network written on its own is told about its shape rather than about
+	a line that is in the file.
+
+	Asserted on the message and not only on there being one, because the loop
+	above passes either way: "missing prefix" is an error too, and it is the
+	wrong one - it sends an operator looking for the network they can already
+	see. This is the one case here where the text is the fix.
+	*/
+	bare := with_overrides("      - 198.51.100.0/24\n")
+	_, berr := load_string(bare, context.temp_allocator)
+	if e, has := berr.?; has {
+		for m in e.messages {
+			testing.expectf(
+				t,
+				!strings.contains(m, "missing prefix"),
+				"a network written on its own was reported as a missing key: %s",
 				m,
 			)
 		}

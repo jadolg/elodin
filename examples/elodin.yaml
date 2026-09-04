@@ -165,9 +165,10 @@ server:
   # The figures are defaults rather than the only answer. A /24 is a household
   # here and thousands of subscribers behind a carrier NAT on the internet, so a
   # network can be named and given its own: most specific entry wins, an entry
-  # cannot be finer than the /24 or /64 the budgets are kept in, and a `slip`
-  # left out is inherited from below. Each entry is named in the log at startup,
-  # which is the only place that says which networks are not on the default.
+  # cannot be finer than the /24 or /64 the budgets are kept in, and an entry
+  # that names no `slip` inherits the `slip` above it. Each entry is named in
+  # the log at startup, which is the only place that says which networks are
+  # not on the default.
   #
   #   overrides:
   #     - { prefix: 198.51.100.0/24, responses_per_second: 5000 }

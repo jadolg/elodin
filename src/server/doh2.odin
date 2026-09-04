@@ -230,8 +230,12 @@ handshake per refusal for the want of it.
 h2_rate_limited :: proc(ctx: ^H2_Context, hc: ^h2.Conn, req: ^h2.Request) {
 	// Nothing is released after the line, as in `h2_shed`: `h2.serve` resets this
 	// arena between frames.
+	//
+	// The setting is named with the same caveat `report_rate_limited` carries:
+	// with `server.rate_limit.overrides` in the file, the figure that refused
+	// this client is the top-level one only where no entry names its network.
 	logx.debugf(
-		"doh/h2: refusing a request from %s, its prefix is over server.rate_limit.responses_per_second",
+		"doh/h2: refusing a request from %s, its prefix is over server.rate_limit.responses_per_second - or, where server.rate_limit.overrides names this client's network, over that entry's figure",
 		ctx.client,
 	)
 	h2.respond(hc, req.stream_id, h2.Response{status = 429})

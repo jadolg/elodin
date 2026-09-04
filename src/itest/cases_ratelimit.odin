@@ -37,9 +37,11 @@ config_rate_limit :: proc(
 	// so the rest of the suite binds no more than it is asking about.
 	udp_address := "127.0.0.1",
 	// `warn` for every case that only reads answers, which is all of them but
-	// the one asserting a startup line: the limiter reports what it was
-	// configured with at `info`, and a flood at that level writes a line per
-	// refusal for the first of each kind.
+	// the one asserting a startup line: what the limiter was configured with is
+	// reported at `info`, and the rest of the suite has no use for those lines
+	// or for the other dozen a start writes at that level. A refused datagram
+	// logs nothing at any level short of debug, so this is about what a failing
+	// case has to be read out of and not about the volume a flood produces.
 	log_level := "warn",
 ) -> string {
 	tcp := "{ enabled: false }"
