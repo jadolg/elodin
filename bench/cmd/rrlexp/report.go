@@ -283,15 +283,26 @@ query. `dial failed` is the listen backlog overflowing, which is the harness
 running out rather than the server deciding anything, and is worth watching only
 because it caps what the arm can offer.
 
-`CPU per handshake` is the price the flood is paying for, and the reason these
-arms exist: it is asymmetric key work, it is charged to no budget, and the whole
-of what bounds it is how many the server will do at once. The victim columns
-beside it are what that cost buys the attacker.
+`CPU per handshake` is the whole arm's CPU divided by the handshakes that
+completed, so read it with an eye on `refused/s`. Where nothing refuses, it is
+what a handshake costs - asymmetric key work, a couple of hundred microseconds.
+Where the arrival budget is refusing tens of thousands a second, most of the
+numerator is accept-and-close and the column over-states a handshake by as much
+as the flood over-dials: it becomes what the flood paid the server per handshake
+it got, which is the more useful figure of the two anyway. `CPU/s` is the column
+to compare across arms. The victim columns beside them are what that cost buys
+the attacker.
 
-`conn_refused` is the server's own count of connections it had no room for, next
-to the flood's own view of the same thing. It is the larger of the two: it counts
-the victim's refusals and the warm-up's as well. Read it as the total turned away
-in the arm rather than as a check on the column beside it.
+Three server-side counters, because the two refusals are different events and
+were not both visible when these arms were first run. `conn_refused` is
+connections the table had no room for. `conn_rate_limited` is connections the
+per-prefix arrival budget turned away, which is
+`server.rate_limit.responses_per_second` doing the bounding - it read as nothing
+at all before there was such a budget, which is what issue #247 was about.
+`handshakes` is the server's own count of TLS handshakes that completed, next to
+the flood's `completed/s` view of the same thing. All three are totals for the
+arm, so they include the victim's and the warm-up's; read them as what the server
+did rather than as a check on the column beside them.
 
 `table` and `share` are written where the arm pinned them. Most of these arms do
 not: a handshake flood holds nothing for long, so the shipped share is not what
@@ -302,8 +313,8 @@ func handshakeTable(b *strings.Builder, rows []row) {
 		return
 	}
 	b.WriteString("\n## The handshake floods: a client that only connects\n\n")
-	b.WriteString("| arm | flood via | table | share | attempted/s | completed/s | refused/s | dial failed/s | conn_refused | handshake p50 | CPU/s | CPU per handshake | victim answered | victim p50 |\n")
-	b.WriteString("|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+	b.WriteString("| arm | flood via | table | share | attempted/s | completed/s | refused/s | dial failed/s | conn_refused | conn_rate_limited | handshakes | handshake p50 | CPU/s | CPU per handshake | victim answered | victim p50 |\n")
+	b.WriteString("|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, r := range rows {
 		if r.attacker == nil || !r.arm.attacker.handshake {
 			continue
@@ -325,12 +336,14 @@ func handshakeRow(b *strings.Builder, r row) {
 	if offered := v.offered.Load(); offered > 0 {
 		answered = fmt.Sprintf("%.0f%% (%d/%d)", 100*float64(v.full.Load())/float64(offered), v.full.Load(), offered)
 	}
-	fmt.Fprintf(b, "| %s | %s | %s | %s | %.0f | %.0f | %.0f | %.0f | %d | %s | %.2f | %s | %s | %s |\n",
+	fmt.Fprintf(b, "| %s | %s | %s | %s | %.0f | %.0f | %.0f | %.0f | %d | %d | %d | %s | %.2f | %s | %s | %s |\n",
 		r.arm.name, r.arm.attacker.transport,
 		figure(r.arm.maxConns), figure(r.arm.perPrefix),
 		float64(a.offered.Load())/secs, done,
 		float64(a.closed.Load())/secs, float64(a.failed.Load())/secs,
 		r.srv["elodin_connections_refused_total"],
+		r.srv["elodin_connections_rate_limited_total"],
+		r.srv["elodin_tls_handshakes_total"],
 		round(a.pct(0.5)), r.cpu.Seconds()/secs, perHandshake,
 		answered, round(v.pct(0.5)))
 }
