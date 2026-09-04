@@ -506,8 +506,28 @@ test_rate_limit_overrides_are_checked :: proc(t: ^testing.T) {
 	}
 	for c in cases {
 		_, err := load_string(with_overrides(c.body), context.temp_allocator)
-		_, has := err.?
-		testing.expectf(t, has, "%s was accepted", c.what)
+		e, has := err.?
+		if !testing.expectf(t, has, "%s was accepted", c.what) {
+			continue
+		}
+		/*
+		And the message reached the operator whole. Every one of these is a
+		`printf` format, so a literal `{` or `%` written into one renders as
+		`%!(MISSING ARGUMENT)` or `%!(NO VERB)` and eats the text around it - a
+		mistake nothing else here would catch, since a garbled message is still
+		an error and this loop only asked whether there was one. The one that
+		matters most is the entry written without its `-`, whose message carries
+		an example of the shape a list should have.
+		*/
+		for m in e.messages {
+			testing.expectf(
+				t,
+				!strings.contains(m, "%!"),
+				"the message for %s did not render: %s",
+				c.what,
+				m,
+			)
+		}
 	}
 
 	// And overrides beside a limiter that is switched off, which is an operator

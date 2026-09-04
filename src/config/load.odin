@@ -227,6 +227,19 @@ OVERRIDE_MAX_BITS_V4 :: 24
 OVERRIDE_MAX_BITS_V6 :: 64
 
 /*
+What an entry looks like, for the two errors that say the setting is not a list.
+
+Passed as an *argument* rather than written into the format string, because
+`errorf` is a `printf` and Odin's `fmt` reads `{` as the start of a brace-style
+directive: `such as [{prefix: ...}]` in the format renders as
+`such as [%!(MISSING ARGUMENT)%!(MISSING CLOSE BRACE)refix: ...}]`, which is the
+message an operator gets for the commonest way to write this setting wrong. An
+argument is never rescanned for directives, so the braces reach the reader.
+*/
+@(private)
+OVERRIDES_EXAMPLE :: "[{prefix: 198.51.100.0/24, responses_per_second: 5000}]"
+
+/*
 Read `server.rate_limit.overrides` into the networks it names.
 
 Parsed at load, with the parser `allow_from` uses, so a network that will not
@@ -250,7 +263,8 @@ load_rate_limit_overrides :: proc(l: ^Loader, rl: ^yaml.Node, cfg: ^Config) {
 	if yaml.is_null(child) {
 		errorf(
 			l,
-			"server.rate_limit.overrides: expected a list of networks with figures of their own, such as [{prefix: 198.51.100.0/24, responses_per_second: 5000}]; it has no value",
+			"server.rate_limit.overrides: expected a list of networks with figures of their own, such as %s; it has no value",
+			OVERRIDES_EXAMPLE,
 		)
 		return
 	}
@@ -267,7 +281,8 @@ load_rate_limit_overrides :: proc(l: ^Loader, rl: ^yaml.Node, cfg: ^Config) {
 	if child.kind != .Sequence {
 		errorf(
 			l,
-			"server.rate_limit.overrides: expected a list of networks with figures of their own, such as [{prefix: 198.51.100.0/24, responses_per_second: 5000}]; each entry needs a \"-\" in front of it",
+			"server.rate_limit.overrides: expected a list of networks with figures of their own, such as %s; each entry needs a \"-\" in front of it",
+			OVERRIDES_EXAMPLE,
 		)
 		return
 	}
@@ -338,11 +353,22 @@ load_rate_limit_overrides :: proc(l: ^Loader, rl: ^yaml.Node, cfg: ^Config) {
 			continue
 		}
 
-		// -1 is "the entry did not say", which `validate` fills in. 0 is a value
-		// `slip` can be given on purpose, so it cannot stand for absence.
+		/*
+		`slip` of -1 is "the entry did not say", which `validate` fills in; 0 is a
+		value `slip` can be given on purpose, so it cannot stand for absence.
+
+		`responses_per_second` starts at 1 rather than 0 so that a figure
+		`opt_int` could not read leaves a value `validate` has nothing to say
+		about. Left at 0 it would draw a second error - "must be at least 1" -
+		beside the "expected an integer" the operator actually needs, telling
+		them their figure was too small when what they wrote was not a number.
+		Every path that reaches `append` below has either read a figure or
+		reported why it could not.
+		*/
 		o := Rate_Limit_Override {
-			prefix = p,
-			slip   = -1,
+			prefix               = p,
+			responses_per_second = 1,
+			slip                 = -1,
 		}
 		/*
 		Absent is asked of the node rather than read off the parsed figure: an
@@ -2311,8 +2337,10 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 		before it was parsed.
 		*/
 		for &o in cfg.server.rate_limit.overrides {
-			label := format_prefix(o.prefix, context.temp_allocator)
 			if o.responses_per_second < 1 {
+				// Rendered where it is said, so a file whose entries are all fine
+				// renders nothing: the common case is every entry valid.
+				label := format_prefix(o.prefix, context.temp_allocator)
 				errorf(l, "server.rate_limit.overrides: %s: responses_per_second must be at least 1", label)
 			}
 			// Not "must not be negative": a negative figure an operator wrote is
