@@ -157,6 +157,7 @@ run_reload_cases :: proc(r: ^Runner) {
 		Server_Options {
 			config = config_for_reload(udp_port, dot_port, active_cert, active_key),
 			udp_port = udp_port,
+			dot_port = dot_port,
 		},
 	)
 	if !ok {

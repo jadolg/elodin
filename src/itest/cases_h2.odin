@@ -51,7 +51,14 @@ run_h2_cases :: proc(r: ^Runner) {
 
 	udp_port := next_port(r)
 	doh_port := next_port(r)
-	srv, ok := start_server(r, Server_Options{config = config_h2(r, udp_port, doh_port, upstream_port), udp_port = udp_port})
+	srv, ok := start_server(
+		r,
+		Server_Options {
+			config = config_h2(r, udp_port, doh_port, upstream_port),
+			udp_port = udp_port,
+			doh_port = doh_port,
+		},
+	)
 	if !ok {
 		skip_case(r, "doh/h2", "server did not start")
 		return
@@ -220,7 +227,11 @@ run_h2_cases :: proc(r: ^Runner) {
 		slow_doh := next_port(r)
 		slow_srv, sok := start_server(
 			r,
-			Server_Options{config = config_h2(r, slow_dns, slow_doh, slow_port), udp_port = slow_dns},
+			Server_Options {
+				config = config_h2(r, slow_dns, slow_doh, slow_port),
+				udp_port = slow_dns,
+				doh_port = slow_doh,
+			},
 		)
 		if check(r, sok, "the slow server did not start") {
 			defer stop_server(&slow_srv)
@@ -487,7 +498,11 @@ run_h2_large_response_case :: proc(r: ^Runner) {
 	doh_port := next_port(r)
 	srv, ok := start_server(
 		r,
-		Server_Options{config = config_h2(r, udp_port, doh_port, upstream_port, "tcp://"), udp_port = udp_port},
+		Server_Options {
+			config = config_h2(r, udp_port, doh_port, upstream_port, "tcp://"),
+			udp_port = udp_port,
+			doh_port = doh_port,
+		},
 	)
 	if !ok {
 		skip_case(r, "h2: large response", "server did not start")

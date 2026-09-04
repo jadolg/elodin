@@ -180,6 +180,11 @@ run_binary :: proc(r: ^Runner, args: []string, tag: string) -> Run_Result {
 
 Server_Options :: struct {
 	config:    string,
+	// The ports a case is going to use. `udp_port` is where the server is told
+	// to listen and how the log and configuration are named, so it is always
+	// set; the rest are the endpoints `start_server` probes before handing the
+	// server over. A case that leaves one at zero is saying it does not dial
+	// that endpoint - not that the endpoint is off.
 	udp_port:  int,
 	tcp_port:  int,
 	dot_port:  int,
@@ -196,6 +201,13 @@ Write the configuration, start the binary, and wait until it answers.
 
 Readiness is established by querying the server rather than by sleeping, so the
 suite neither races the process nor pays for a fixed delay.
+
+One probe per endpoint the case named, because the listeners come up in
+sequence and not together: `start_listeners` binds udp, then tcp, then dot,
+then doh, so an answer over UDP says only that the first of them is serving.
+Whichever endpoint a case dials first is the one that decides whether it is
+racing a bind, and for the TLS endpoints losing that race is not a lone red
+case - the dial fails, and every case behind it in the group fails with it.
 */
 start_server :: proc(r: ^Runner, opts: Server_Options) -> (srv: Server, ok: bool) {
 	srv, ok = start_server_raw(r, opts.config, opts.udp_port, opts.allow_fetch)
@@ -212,6 +224,16 @@ start_server :: proc(r: ^Runner, opts: Server_Options) -> (srv: Server, ok: bool
 	}
 	if opts.tcp_port > 0 && !wait_tcp(opts.tcp_port, 5 * time.Second + opts.warmup) {
 		fail(r, "server on port %d never answered over tcp; log:\n%s", opts.udp_port, read_log(&srv))
+		stop_server(&srv)
+		return srv, false
+	}
+	if opts.dot_port > 0 && !wait_dot(opts.dot_port, 5 * time.Second + opts.warmup) {
+		fail(r, "server on port %d never answered over dot; log:\n%s", opts.udp_port, read_log(&srv))
+		stop_server(&srv)
+		return srv, false
+	}
+	if opts.doh_port > 0 && !wait_doh(opts.doh_port, 5 * time.Second + opts.warmup) {
+		fail(r, "server on port %d never handshook over doh; log:\n%s", opts.udp_port, read_log(&srv))
 		stop_server(&srv)
 		return srv, false
 	}
@@ -336,6 +358,71 @@ wait_tcp :: proc(tcp_port: int, timeout: time.Duration) -> bool {
 		if res.ok {
 			return true
 		}
+	}
+	return false
+}
+
+/*
+How long to wait between attempts at a stream listener that is not up yet.
+
+The probes above need no such pause: a datagram sent to an unbound port is
+answered by nothing at all, and a TCP dial that is refused is retried through
+`query_tcp`, so an attempt already costs a socket timeout. The dials below are
+refused immediately instead, and retrying them flat out would spin a core for
+the whole deadline to save milliseconds on the rare run that has to wait.
+*/
+@(private)
+PROBE_RETRY_PAUSE :: 10 * time.Millisecond
+
+/*
+Probe until the server answers over DoT.
+
+The same argument as `wait_tcp`, one listener further along: `start_listeners`
+binds udp, then tcp, then dot, then doh, so neither probe above says anything
+yet about the two TLS listeners. A case that dials DoT passes `dot_port` in
+`Server_Options` and this establishes the endpoint serves before the case leans
+on it - a CHAOS version.bind query, answered locally, so no upstream has to be
+reachable and no fixture is spent.
+*/
+@(private)
+wait_dot :: proc(dot_port: int, timeout: time.Duration) -> bool {
+	probe := build_query("version.bind.", u16(dns.Type.TXT), class = u16(dns.Class.CH))
+	deadline := time.time_add(time.now(), timeout)
+	for time.diff(deadline, time.now()) < 0 {
+		res := query_dot(dot_port, probe, context.temp_allocator)
+		if res.ok {
+			return true
+		}
+		time.sleep(PROBE_RETRY_PAUSE)
+	}
+	return false
+}
+
+/*
+Probe until the DoH listener completes a handshake.
+
+A handshake rather than a request, because the endpoint path is per-case
+configuration the harness is not told - and because the handshake is the part
+being raced: `h2_connect` and `h2_negotiated` report "cannot open an h2
+connection" and "" when the TLS layer is what failed, which is how a single
+lost race reads as the whole h2 group regressing at once.
+
+A bare TCP connect would not settle it. The socket is bound before the accept
+loop is running, so a connect can succeed against a listener that cannot yet
+talk; finishing a handshake takes a server that accepted and replied, which is
+the state the first dial of a case needs. The ALPN list is the one the h2 cases
+offer, so the probe negotiates what they go on to negotiate.
+*/
+@(private)
+wait_doh :: proc(doh_port: int, timeout: time.Duration) -> bool {
+	deadline := time.time_add(time.now(), timeout)
+	for time.diff(deadline, time.now()) < 0 {
+		conn, ok := dial_tls(doh_port, []string{"h2", "http/1.1"})
+		if ok {
+			close_tls(&conn)
+			return true
+		}
+		time.sleep(PROBE_RETRY_PAUSE)
 	}
 	return false
 }
