@@ -106,11 +106,11 @@ Three things the carve-out deliberately is not:
     answer to that one really is on the router.
   - It is not decided at load by whether the public tree delegates the zone,
     because nothing at load can know that. It is decided by the answer, and by
-    the narrowest reading of it: the parent's reply is passed to the client only
-    when it is the one this carve-out went to fetch - a NODATA, the statement
+    the narrowest reading of it: the one reply that keeps the question at the
+    parent is the one this carve-out went to fetch - a NODATA, the statement
     that the delegation carries no DS. Anything else and `resolve_query` puts
-    the question back on the route. See `apex_ds_off_route`, where that reading
-    is argued case by case.
+    the question back on the route. See `apex_ds_off_route` and
+    `parent_answers_apex_ds`, where that reading is argued case by case.
 
 What it does not touch is whether the answer is validated. `served_locally` still
 covers the routed zone's apex, so the parent's proof is passed to the client with
@@ -173,7 +173,7 @@ carve-out was built to fetch: a NODATA, the parent saying the delegation exists
 and carries no DS. That is RFC 8375 section 4 item 4.B's whole subject, it is
 `home.arpa.`'s answer from `arpa.`, and it is the only thing the parent can tell
 a validating client that the route cannot. Every other reply goes back on the
-route - `no_ds_answer` is the test, and there are three ways to fail it:
+route - `parent_answers_apex_ds` is the test, and there are four ways to fail it:
 
   - NXDOMAIN. The parent zone has no such name, so nothing in the public tree
     delegates this zone: there is no proof of an insecure delegation to be had,
@@ -200,9 +200,12 @@ route - `no_ds_answer` is the test, and there are three ways to fail it:
     upstream uninvolved, which on a network with an internal authority and a
     poor path out is most of the point; an outage out there must not take the
     chain out from under every name in a zone that is answering perfectly well.
-    A reply that arrived saying SERVFAIL is not this case - one server declining
-    to say is still the parent's group having spoken, and the rcode is the
-    client's answer as it is everywhere else on this path.
+  - A reply that says nothing about the name: SERVFAIL, REFUSED, and every other
+    rcode that is neither NOERROR nor NXDOMAIN. An upstream with an ACL, or a
+    CPE resolver that mangles every `DS` it meets, is not a statement about this
+    delegation, and `parent_answers_apex_ds` sets out why this file reads those
+    the same way `upstream.resolve_answerable` does rather than the way an
+    ordinary client question is read.
 
 `home.arpa.` is the one deployment none of that touches, which is the point:
 `arpa.` delegates the zone and publishes the proof, so the answer is a NODATA,
@@ -251,6 +254,39 @@ no_ds_answer :: proc(resp: []u8, allocator: mem.Allocator) -> bool {
 		}
 	}
 	return true
+}
+
+/*
+Whether the parent's group's reply is the client's answer, so that the route is
+not asked in its place.
+
+One reply is: the NODATA this carve-out went to fetch, the parent saying the
+delegation carries no DS. `no_ds_answer` is that test, and `apex_ds_off_route`
+argues why every other reply is the route's to answer.
+
+SERVFAIL and REFUSED are not exceptions to that, and the choice is worth setting
+down because `upstream.resolve_answerable` draws the line elsewhere for a
+different question: there, the rcode of a client's question is the client's
+answer, and only the lookups this server makes on its own account insist on a
+reply that says something. What that procedure says about *why* is the rule here
+too - "NOERROR and NXDOMAIN are the only rcodes that say anything about a
+delegation" - and this question, though the client's, is about a delegation.
+Being about the delegation is the whole reason `route_group` diverts it by type.
+
+So a REFUSED from an upstream with an ACL, or the SERVFAIL a CPE resolver hands
+back for every `DS` it does not understand, says nothing about this zone, and
+passing it on would take every name in an internal zone that is answering
+perfectly well down with it - issue #227's failure reached through an upstream
+that has nothing to do with the zone. The route can answer, so the route is
+asked, and the parent's rcode reaches the client only when the route cannot be
+reached either.
+
+`reached` is `uerr == .None`. A reply that never arrived says nothing by the
+same reading, so the route is asked then too.
+*/
+@(private)
+parent_answers_apex_ds :: proc(resp: []u8, reached: bool, allocator: mem.Allocator) -> bool {
+	return reached && no_ds_answer(resp, allocator)
 }
 
 /*

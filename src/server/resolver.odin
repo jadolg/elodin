@@ -977,18 +977,22 @@ resolve_query :: proc(
 	And back on the route unless the parent answered the one thing the parent was
 	asked for: that this delegation carries no DS.
 
-	`no_ds_answer` is the test and `apex_ds_off_route` argues it. A NODATA is
-	`home.arpa.`'s answer from `arpa.`, it is RFC 8375 section 4 item 4.B's whole
-	subject, and it is the only thing the parent can tell a validating client
-	that the route cannot. An NXDOMAIN, a `DS` RRset, an undecodable reply and no
-	reply at all are each the route's to answer instead - a zone nothing public
-	delegates, a signed zone whose internal view is another view, and an outage
-	out there that must not take the chain out from under a zone that is
-	answering perfectly well.
+	`parent_answers_apex_ds` is the test and `apex_ds_off_route` argues it. A
+	NODATA is `home.arpa.`'s answer from `arpa.`, it is RFC 8375 section 4 item
+	4.B's whole subject, and it is the only thing the parent can tell a
+	validating client that the route cannot. An NXDOMAIN, a `DS` RRset, an
+	undecodable reply and no reply at all are each the route's to answer instead
+	- a zone nothing public delegates, a signed zone whose internal view is
+	another view, and an outage out there that must not take the chain out from
+	under a zone that is answering perfectly well.
 
-	A reply that arrived saying SERVFAIL goes to the client as it stands. The
-	parent's group answered; the rcode is the answer, here as everywhere else on
-	this path.
+	A reply that says nothing about the name - SERVFAIL, REFUSED - is read the
+	same way as no reply at all, which is where this parts company with how an
+	ordinary client question is answered. `parent_answers_apex_ds` sets out why:
+	the rcode of a question about a delegation says nothing about the delegation
+	unless it is NOERROR or NXDOMAIN, so an upstream's ACL must not take an
+	internal zone down with it. The parent's rcode still reaches the client when
+	the route cannot be reached either.
 
 	Only when the two groups differ, as well. A route may list a zone and its
 	parent together, and then `route_group` has already sent this question to the
@@ -1002,7 +1006,8 @@ resolve_query :: proc(
 	being a new one on the wire, and the client's own ID goes back on below.
 	*/
 	unbacked_apex_ds := false
-	if apex_ds_off_route(s, q.name, q.type) && !(uerr == .None && no_ds_answer(resp, allocator)) {
+	if apex_ds_off_route(s, q.name, q.type) &&
+	   !parent_answers_apex_ds(resp, uerr == .None, allocator) {
 		if own := zone_route_group(s, q.name); own != asked {
 			dns.set_id_in_place(forwarded, dns.random_id())
 			again, second, aerr := upstream.resolve(own, forwarded, allocator)
@@ -1366,7 +1371,19 @@ resolve_query :: proc(
 			whole-message version of this - `answer-unreadable` above - already
 			does.
 			*/
-			if s.cfg.cache.enabled && have_decoded && cloak_verdict_worth_keeping(verdict) {
+			/*
+			`unbacked_apex_ds` holds here too, and for the reason the store
+			below states: an answer the route could not be reached to check is
+			not one to file under the name, whatever else is true of it. This
+			store is reachable for such an answer - a parent that hands back a
+			`CNAME` for a `DS` question puts a chain in front of the walk - and
+			leaving it out would let the one path that stores a refusal keep
+			what the ordinary path deliberately does not.
+			*/
+			if s.cfg.cache.enabled &&
+			   have_decoded &&
+			   !unbacked_apex_ds &&
+			   cloak_verdict_worth_keeping(verdict) {
 				cache.put(s.answers, key, resp, decoded, generation, u8(verdict))
 			}
 			return out, cloak_outcome(verdict), true

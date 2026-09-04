@@ -383,12 +383,15 @@ client that the local authority cannot. Anything else goes back on the route:
   on, does not take the chain out from under a zone whose own authority is
   answering.
 
-A reply that arrives saying SERVFAIL is passed on as any other rcode is — one
-server declining to say is still the parent's group having spoken. And when the
-parent says one of those things but the route cannot be reached to answer in its
-place, the client gets what the parent said and the cache does not keep it: one
-lost exchange with a local server must not pin a signed denial over the zone for
-the parent's whole TTL.
+A reply that says nothing about the name — SERVFAIL, REFUSED — counts as no
+answer here rather than as an answer to pass on, which is a departure from how
+every other rcode is handled: for a question about a *delegation*, only NOERROR
+and NXDOMAIN say anything, so an upstream with an ACL, or a CPE resolver that
+mangles every `DS` it meets, must not take an internal zone down with it. And
+when the parent does say something but the route cannot be reached to answer in
+its place, the client gets what the parent said and the cache does not keep it:
+one lost exchange with a local server must not pin a signed denial over the zone
+for the parent's whole TTL.
 
 The answer cache is keyed on the question rather than on which upstream produced
 it, which holds because the routing table is built once at startup — restart

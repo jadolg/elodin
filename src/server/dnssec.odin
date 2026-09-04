@@ -172,14 +172,14 @@ validator_query :: proc(
 	which for a route nested inside another route is that outer route's group
 	rather than `s.group`. A chain walk reaching an anchored zone that deep wants
 	the public tree, which is what this hands it. The route points at a local
-	authority for the zone, and
-	a local authority answers questions about its own zone out of its own data: a
-	router authoritative for `home.arpa.` answers `home.arpa. DS` with an unsigned
-	NODATA rather than forwarding to `arpa.`, where the signed proof that the
-	delegation carries no DS is the only copy there is. That answer breaks the
-	chain instead of completing it - the failure of issue #194, rebuilt by a
-	different road. The default group is the one that can reach the public
-	parent, so the chain walk always goes there. See `routes.odin`.
+	authority for the zone, and a local authority answers questions about its own
+	zone out of its own data: a router authoritative for `home.arpa.` answers
+	`home.arpa. DS` with an unsigned NODATA rather than forwarding to `arpa.`,
+	where the signed proof that the delegation carries no DS is the only copy
+	there is. That answer breaks the chain instead of completing it - the failure
+	of issue #194, rebuilt by a different road. The default group is the one that
+	can reach the public parent, so the chain walk always goes there. See
+	`routes.odin`.
 
 	Nothing is lost by it: a routed zone is served insecure anyway, so the walk
 	is not run for its names at all unless the operator anchored the zone, and

@@ -55,13 +55,16 @@ type, not anything inside it, and the bytes are a well-formed DS RDATA all the
 same - key tag, algorithm 8, digest type 2, a SHA-256-sized digest - so a
 decoder walking the section finds a record it can measure rather than reject.
 
-On the heap rather than the temp allocator, as every other canned payload in the
-suite is: the mock holds this slice for the whole run, and `end_case` empties the
-temp arena under it long before the case that asks for it.
+The wire goes on the heap rather than into the temp allocator, as every other
+canned payload in the suite does: the mock holds that slice for the whole run,
+and `end_case` empties the temp arena under it long before the case that asks
+for it. The records it is built from are another matter - `encode_message` copies
+the RDATA into the wire, so nothing here outlives the call and the temp arena is
+where it belongs.
 */
 @(private = "file")
 signed_delegation_reply :: proc(name: string) -> []u8 {
-	digest := make([]u8, 36)
+	digest := make([]u8, 36, context.temp_allocator)
 	digest[0], digest[1] = 0x30, 0x39
 	digest[2], digest[3] = 8, 2
 	answer := make([]dns.Record, 1, context.temp_allocator)
@@ -443,7 +446,8 @@ rebind: {{enabled: false}}
 		`signed.example.` is answered with a DS RRset by the public mock and
 		routed to the internal one, and the assertion is that the internal mock
 		was asked and the client's answer carries no DS. The rule is one line in
-		`no_ds_answer`: only a NODATA keeps the question at the parent.
+		`parent_answers_apex_ds`: of the statements a parent can make about the
+		delegation, only a NODATA keeps the question there.
 		*/
 		signed_port := next_port(r)
 		config := fmt.tprintf(

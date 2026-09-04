@@ -616,8 +616,9 @@ The parent keeps the question only by proving the delegation carries no DS.
 The other half of the carve-out above. Sending the apex `DS` to the parent is
 worth doing for one answer - a NODATA, the proof that the delegation is insecure,
 which is `home.arpa.`'s answer from `arpa.` and the whole of what RFC 8375
-section 4 item 4.B asks to be fetched. Every other answer is the route's to give,
-and each of the two here is a deployment that breaks if it is not:
+section 4 item 4.B asks to be fetched. Every other *statement about the
+delegation* is the route's to give, and each of the three here is a deployment
+that breaks if it is not:
 
   - *No such name.* An internal `corp.example.com` under a public, signed
     `example.com` that delegates no `corp`. The parent answers, with a signature
@@ -632,9 +633,16 @@ and each of the two here is a deployment that breaks if it is not:
     matching key for, and Bogus is what it gets - where the same deployment
     resolved before the carve-out existed.
 
-All three cases run against one fixture and differ only in what the parent says,
+  - *SERVFAIL.* An upstream with an ACL, or a CPE resolver that answers every
+    `DS` query it does not understand with a refusal. It says nothing about the
+    delegation, so the route answers - the one place this file reads a client's
+    rcode the way `upstream.resolve_answerable` reads its own rather than passing
+    it on, and `parent_answers_apex_ds` argues why.
+
+All four cases run against one fixture and differ only in what the parent says,
 which is the point: what the route does has to follow from the parent's answer
-and from nothing else. `apex_ds_off_route` argues each of them in full.
+and from nothing else. `apex_ds_off_route` and `parent_answers_apex_ds` argue
+each of them in full.
 */
 @(test)
 test_an_apex_ds_goes_back_on_the_route_unless_the_parent_proves_no_ds :: proc(t: ^testing.T) {
@@ -646,11 +654,22 @@ test_an_apex_ds_goes_back_on_the_route_unless_the_parent_proves_no_ds :: proc(t:
 		// that delegates the zone and signs the delegation.
 		signed:   bool,
 		to_route: bool,
+		// What the client is handed, which is the last upstream to speak.
+		client:   dns.Rcode,
 	}
 	cases := []Case {
-		{"no such name", .NX_Domain, false, true},
-		{"a DS RRset", .No_Error, true, true},
-		{"no DS at the delegation", .No_Error, false, false},
+		{"no such name", .NX_Domain, false, true, .No_Error},
+		{"a DS RRset", .No_Error, true, true, .No_Error},
+		{"no DS at the delegation", .No_Error, false, false, .No_Error},
+		/*
+		SERVFAIL says nothing about the delegation, so the route answers it - the
+		reading `parent_answers_apex_ds` takes from
+		`upstream.resolve_answerable` and the one place this file departs from
+		"the rcode is the client's answer". An upstream with an ACL, or a CPE
+		resolver that mangles every `DS` it meets, must not take an internal zone
+		down with it.
+		*/
+		{"SERVFAIL", .Serv_Fail, false, true, .No_Error},
 	}
 
 	for c in cases {
@@ -733,7 +752,7 @@ test_an_apex_ds_goes_back_on_the_route_unless_the_parent_proves_no_ds :: proc(t:
 			testing.expect(
 				t,
 				route_mock_quiet(route_socket, "corp.example."),
-				"a real insecure delegation was re-asked down the route",
+				"an answer that was the parent's to give was re-asked down the route",
 			)
 		}
 
@@ -743,7 +762,7 @@ test_an_apex_ds_goes_back_on_the_route_unless_the_parent_proves_no_ds :: proc(t:
 		// rcode assertion alone would miss.
 		decoded, derr2 := dns.decode_message(out, context.temp_allocator)
 		testing.expect_value(t, derr2, dns.Decode_Error.None)
-		testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
+		testing.expect_value(t, dns.Rcode(decoded.flags.rcode), c.client)
 		if c.to_route {
 			for rec in decoded.answer {
 				testing.expectf(
@@ -774,9 +793,9 @@ prevent, arriving by the road it opened.
 The parent's socket is bound and nobody serves it, which is what an upstream
 that has gone away looks like from here, and the timeout is cut so the case does
 not sit out `forwarding_config`'s three seconds. The control is
-`test_an_apex_ds_the_parent_denies_falls_back_to_the_route` above: a parent that
-answers NOERROR keeps the question, so this is the absence of a reply doing the
-work and not the fallback firing for everything.
+`test_an_apex_ds_goes_back_on_the_route_unless_the_parent_proves_no_ds` above: a
+parent that answers the proof keeps the question, so this is the absence of a
+reply doing the work and not the fallback firing for everything.
 */
 @(test)
 test_an_apex_ds_the_parent_could_not_answer_falls_back_to_the_route :: proc(t: ^testing.T) {
