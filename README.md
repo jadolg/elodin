@@ -398,6 +398,15 @@ back the moment its authority does. A parent whose upstreams are all in their
 failure cooldown is not waited for at all; the question goes straight to the
 route.
 
+Where the parent said nothing — no reply, SERVFAIL, REFUSED, or its group already
+in that cooldown — the route's answer goes to the client and is not cached. It
+stood in for a fact nothing established, and keeping it would hold the very
+broken chain this carve-out exists to prevent over the zone for
+[`cache.negative_ttl`](#cache) after a single lost round trip. The next query
+asks again. An answer the route gave because the parent *did* say something —
+NXDOMAIN, or a DS record — is cached like any other, that statement about the
+public tree holding until the public tree changes.
+
 The answer cache is keyed on the question rather than on which upstream produced
 it, which holds because the routing table is built once at startup — restart
 after changing a route. `--check` and the startup log say out loud what each

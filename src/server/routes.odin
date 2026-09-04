@@ -231,56 +231,42 @@ apex_ds_off_route :: proc(s: ^Server, name: string, type: dns.Type) -> bool {
 }
 
 /*
-Whether `resp` is the parent saying this delegation carries no DS.
+What the parent's group's reply settles about a routed zone's apex `DS`.
 
-NOERROR with no `DS` record in the answer, which is a NODATA: the name is there
-and the type is not. That is the one reply `resolve_query` passes to the client
-for a routed apex, and `apex_ds_off_route` argues why each of the others is the
-route's to answer instead.
+Two things, read off the one reply, because `resolve_query` has two decisions to
+make about it and they are not the same decision.
 
-Read from the answer section alone. Whether the NSEC or NSEC3 beside it actually
-proves the NODATA is the client's question, not this server's - a routed zone is
-served insecure here either way, so the records travel with their signatures
-intact and the client checks them against its own anchor. What this decides is
-only which upstream the question belongs to.
+`proved` is whether this is the client's answer, so that the route is not asked
+in its place: NOERROR with no `DS` record in the answer, which is a NODATA - the
+name is there and the type is not. That is the reply this carve-out went to
+fetch, and `apex_ds_off_route` argues why every other one is the route's to
+answer.
 
-A reply that cannot be decoded is not a proof of anything, so it fails the test
-and the route is asked. `resolve_query` has the same reading of an undecodable
-answer further down, where it refuses to cache one.
-*/
-@(private)
-no_ds_answer :: proc(resp: []u8, allocator: mem.Allocator) -> bool {
-	if dns.peek_rcode(resp) != .No_Error {
-		return false
-	}
-	msg, err := dns.decode_through_answer(resp, allocator)
-	if err != .None {
-		return false
-	}
-	for rec in msg.answer {
-		if rec.type == .DS {
-			return false
-		}
-	}
-	return true
-}
+The NODATA is read from the answer section alone. Whether the NSEC or NSEC3
+beside it actually proves it is the client's question and not this server's - a
+routed zone is served insecure here either way, so the records travel with their
+signatures intact and the client checks them against its own anchor. What this
+decides is only which upstream the question belongs to.
 
-/*
-Whether the parent's group's reply is the client's answer, so that the route is
-not asked in its place.
+`settled` is whether the parent said anything about the delegation that holds
+for as long as a cache entry does. The proof does; so does NXDOMAIN ("nothing
+public delegates this zone") and so does a `DS` RRset ("it is delegated and
+signed out here"). Those are facts about the public tree, and the route's answer
+standing in for one of them is the answer for that zone until the public tree
+changes. Nothing else is: no reply at all, an rcode that is neither NOERROR nor
+NXDOMAIN, and a reply that would not decode are all this server failing to reach
+a statement rather than a statement, so the route's answer stands in for a fact
+nobody established. `resolve_query` serves that answer and declines to store it,
+for the reason it gives at the store.
 
-One reply is: the NODATA this carve-out went to fetch, the parent saying the
-delegation carries no DS. `no_ds_answer` is that test, and `apex_ds_off_route`
-argues why every other reply is the route's to answer.
-
-SERVFAIL and REFUSED are not exceptions to that, and the choice is worth setting
-down because `upstream.resolve_answerable` draws the line elsewhere for a
-different question: there, the rcode of a client's question is the client's
-answer, and only the lookups this server makes on its own account insist on a
-reply that says something. What that procedure says about *why* is the rule here
-too - "NOERROR and NXDOMAIN are the only rcodes that say anything about a
-delegation" - and this question, though the client's, is about a delegation.
-Being about the delegation is the whole reason `route_group` diverts it by type.
+SERVFAIL and REFUSED being no statement at all is worth setting down, because
+`upstream.resolve_answerable` draws the line elsewhere for a different question:
+there, the rcode of a client's question is the client's answer, and only the
+lookups this server makes on its own account insist on a reply that says
+something. What that procedure says about *why* is the rule here too - "NOERROR
+and NXDOMAIN are the only rcodes that say anything about a delegation" - and
+this question, though the client's, is about a delegation. Being about the
+delegation is the whole reason `route_group` diverts it by type.
 
 So a REFUSED from an upstream with an ACL, or the SERVFAIL a CPE resolver hands
 back for every `DS` it does not understand, says nothing about this zone, and
@@ -291,11 +277,37 @@ asked, and the parent's rcode reaches the client only when the route cannot be
 reached either.
 
 `reached` is `uerr == .None`. A reply that never arrived says nothing by the
-same reading, so the route is asked then too.
+same reading, so the route is asked then too and nothing is kept.
 */
 @(private)
-parent_answers_apex_ds :: proc(resp: []u8, reached: bool, allocator: mem.Allocator) -> bool {
-	return reached && no_ds_answer(resp, allocator)
+parent_answers_apex_ds :: proc(
+	resp: []u8,
+	reached: bool,
+	allocator: mem.Allocator,
+) -> (
+	proved: bool,
+	settled: bool,
+) {
+	if !reached {
+		return false, false
+	}
+	rcode := dns.peek_rcode(resp)
+	if rcode == .NX_Domain {
+		return false, true
+	}
+	if rcode != .No_Error {
+		return false, false
+	}
+	msg, err := dns.decode_through_answer(resp, allocator)
+	if err != .None {
+		return false, false
+	}
+	for rec in msg.answer {
+		if rec.type == .DS {
+			return false, true
+		}
+	}
+	return true, true
 }
 
 /*

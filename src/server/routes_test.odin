@@ -856,6 +856,138 @@ test_an_apex_ds_the_parent_could_not_answer_falls_back_to_the_route :: proc(t: ^
 }
 
 /*
+The route's answer is kept only when the parent said something lasting.
+
+The case above serves it; this one is about the *next* client, and the two
+readings of the parent's silence part company there. Kept, the route's unsigned
+NODATA for its own apex `DS` is issue #227's broken chain served straight out of
+this cache to every validating client below - for `cache.negative_ttl`, five
+minutes by default, with `arpa.` answering perfectly well the whole time and the
+proof one query away. The cause was one lost exchange, or a ten-second failure
+cooldown; the consequence must not outlive it, which is the rule the `Unreadable`
+verdict and `cache.put`'s own refusal of transient failures already follow.
+
+Narrow, and the NXDOMAIN case is what keeps it narrow: a parent that says the
+name does not exist has said something about the public tree that holds until the
+public tree changes, so the route's answer for that zone - the routed
+`corp.example.com` under a signed `example.com` this whole carve-out is written
+around - is the answer, and it is kept like any other. Both arrangements run
+against one fixture and differ only in what the parent managed to say.
+
+The parent's socket is bound and served only for the cases that answer; the
+timeout is cut so the silent one does not sit out `forwarding_config`'s three
+seconds.
+*/
+@(test)
+test_an_apex_ds_the_route_answered_unproven_is_not_cached :: proc(t: ^testing.T) {
+	Case :: struct {
+		// What the parent's group manages to say about `corp.example. DS`.
+		what:   string,
+		serve:  bool,
+		rcode:  dns.Rcode,
+		// Whether the route's answer is one to keep.
+		stored: bool,
+	}
+	cases := []Case {
+		{"nothing at all", false, .No_Error, false},
+		{"SERVFAIL", true, .Serv_Fail, false},
+		{"no such name", true, .NX_Domain, true},
+	}
+
+	for c in cases {
+		def_socket, derr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+		if !testing.expectf(t, derr == nil, "cannot bind the default mock: %v", derr) {
+			return
+		}
+		defer net.close(def_socket)
+		if c.serve {
+			_ = net.set_option(def_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+		}
+		def_bound, _ := net.bound_endpoint(def_socket)
+
+		route_socket, rerr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+		if !testing.expectf(t, rerr == nil, "cannot bind the routed mock: %v", rerr) {
+			return
+		}
+		defer net.close(route_socket)
+		_ = net.set_option(route_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+		route_bound, _ := net.bound_endpoint(route_socket)
+
+		cfg := forwarding_config()
+		cfg.cache.enabled = true
+		cfg.upstream.timeout = 200 * time.Millisecond
+
+		answers := cache.make_cache(
+			cache.Options{max_entries = 8, max_ttl = 3600, negative_ttl = 300},
+		)
+		defer cache.destroy(answers)
+
+		group := mock_group(t, cfg.upstream, def_bound.port)
+		defer upstream.destroy_group(group)
+		routed := mock_group(t, cfg.upstream, route_bound.port)
+		defer upstream.destroy_group(routed)
+
+		s := Server {
+			cfg     = &cfg,
+			group   = group,
+			answers = answers,
+			routes  = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
+		}
+
+		parent := Route_Mock {
+			socket = def_socket,
+			reply  = route_reply_nodata("corp.example.", .DS, c.rcode),
+			want   = "corp.example.",
+		}
+		authority := Route_Mock {
+			socket = route_socket,
+			reply  = route_reply_nodata("corp.example.", .DS),
+			want   = "corp.example.",
+		}
+		parent_mock: ^thread.Thread
+		if c.serve {
+			parent_mock = thread.create_and_start_with_poly_data(&parent, serve_route)
+		}
+		route_thread := thread.create_and_start_with_poly_data(&authority, serve_route)
+		out, _, ok := handle_query(
+			&s,
+			route_query("corp.example.", .DS),
+			.UDP,
+			"127.0.0.1:5555",
+			context.temp_allocator,
+		)
+		if parent_mock != nil {
+			thread.join(parent_mock)
+			thread.destroy(parent_mock)
+		}
+		thread.join(route_thread)
+		thread.destroy(route_thread)
+
+		if !testing.expectf(t, ok, "nothing came back at all with the parent saying %s", c.what) {
+			return
+		}
+		testing.expectf(t, authority.asked, "the route was not asked (%s)", c.what)
+
+		// The client gets the route's answer either way; only the entry differs.
+		decoded, derr2 := dns.decode_message(out, context.temp_allocator)
+		testing.expect_value(t, derr2, dns.Decode_Error.None)
+		testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
+
+		key_buf: [cache.KEY_MAX]u8
+		key := cache.make_key(key_buf[:], "corp.example.", .DS, .IN, false, false)
+		_, _, cached := cache.get(answers, key, context.temp_allocator)
+		testing.expectf(
+			t,
+			cached == c.stored,
+			"with the parent saying %s the route's answer was %skept",
+			c.what,
+			"not " if c.stored else "",
+		)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
 An apex `DS` neither group could settle is a SERVFAIL, and nothing is kept.
 
 The third arrangement of the case above: the parent's group answers something
@@ -989,6 +1121,15 @@ test_a_parked_parent_group_is_skipped_for_an_apex_ds :: proc(t: ^testing.T) {
 	spends the timeout on a server known to be down.
 	*/
 	cfg.upstream.attempts = 2
+	/*
+	The cache is on for the last assertion below. The cooldown is ten seconds and
+	an entry is minutes, so an answer nothing out there was consulted about is one
+	the store has to refuse - `test_an_apex_ds_the_route_answered_unproven_is_not_cached`
+	makes the same point for a parent that was asked and said nothing.
+	*/
+	cfg.cache.enabled = true
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, negative_ttl = 300})
+	defer cache.destroy(answers)
 
 	group := mock_group(t, cfg.upstream, def_bound.port)
 	defer upstream.destroy_group(group)
@@ -1002,9 +1143,10 @@ test_a_parked_parent_group_is_skipped_for_an_apex_ds :: proc(t: ^testing.T) {
 	}
 
 	s := Server {
-		cfg    = &cfg,
-		group  = group,
-		routes = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
+		cfg     = &cfg,
+		group   = group,
+		answers = answers,
+		routes  = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
 	}
 
 	authority := Route_Mock {
@@ -1036,6 +1178,13 @@ test_a_parked_parent_group_is_skipped_for_an_apex_ds :: proc(t: ^testing.T) {
 	decoded, derr2 := dns.decode_message(out, context.temp_allocator)
 	testing.expect_value(t, derr2, dns.Decode_Error.None)
 	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
+
+	// And it is not kept: the parent was never asked, so nothing established
+	// what the public tree says and the entry would outlive the cooldown.
+	key_buf: [cache.KEY_MAX]u8
+	key := cache.make_key(key_buf[:], "corp.example.", .DS, .IN, false, false)
+	_, _, cached := cache.get(answers, key, context.temp_allocator)
+	testing.expect(t, !cached, "an answer given while the parent was skipped was stored")
 	free_all(context.temp_allocator)
 }
 
