@@ -197,6 +197,18 @@ run_zone_route_cases :: proc(r: ^Runner) {
 	public_port := next_port(r)
 	public := mock_make("public", public_port)
 	mock_synth_all(public, PUBLIC)
+	/*
+	The one question this mock denies, scripted here rather than in the case that
+	needs it: `match_rule` walks `m.rules` from the serving threads without the
+	mutex, so appending a rule to a mock that is already running races with them -
+	and the append reallocates the moment the rules outgrow their capacity, which
+	turns the race into a read of freed memory. Every other rule in the suite is
+	written before `mock_start` for the same reason.
+
+	Read with "an apex DS the parent denies goes back to the route" below, which
+	is the case it is for.
+	*/
+	mock_rcode(public, "denied.example.", u16(dns.Type.DS), .NX_Domain)
 	if !mock_start(public) {
 		skip_case(r, "upstream.zones", "cannot start the public mock")
 		return
@@ -329,9 +341,12 @@ run_zone_route_cases :: proc(r: ^Runner) {
 		answers this one question NXDOMAIN and the case above needs it answering
 		normally. The control for this case is that one: there the parent replies
 		NOERROR and the route is never asked.
+
+		The rule that denies `denied.example. DS` is scripted where the mock is
+		built, above, rather than here - a rule appended to a running mock races
+		with the threads reading them.
 		*/
 		denied_port := next_port(r)
-		mock_rcode(public, "denied.example.", u16(dns.Type.DS), .NX_Domain)
 		config := fmt.tprintf(
 			`log:
   level: info

@@ -6,6 +6,7 @@ import "core:strings"
 import "core:testing"
 import "core:thread"
 import "core:time"
+import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:upstream"
@@ -678,6 +679,99 @@ test_an_apex_ds_the_parent_denies_falls_back_to_the_route :: proc(t: ^testing.T)
 		testing.expect_value(t, derr2, dns.Decode_Error.None)
 		testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
 	}
+	free_all(context.temp_allocator)
+}
+
+/*
+The denial the fallback could not check is served and not stored.
+
+The third arrangement of the case above: the parent's group says the zone is not
+delegated and the route that would have spoken for it does not answer. The
+client gets the NXDOMAIN - there is nothing else to give it - and the point of
+this case is what happens to the *next* client.
+
+Stored, that one exchange would pin the outage the carve-out exists to prevent.
+The parent's NXDOMAIN is signed and its negative TTL is the parent's to pick, so
+a single lost round trip to the internal authority would hold a signed proof of
+non-existence over the routed zone's apex for as long as the parent said,
+against an authority that is answering perfectly well. Every validating client
+below here would then read the zone as provably absent rather than merely
+unsigned, and one implementing RFC 8020 as proof that every name under the apex
+is gone with it. The cause is transient and must not be memoised, which is the
+rule `answer-unreadable` and the `Unreadable` verdict already follow.
+
+The route's socket is bound and nobody serves it, which is what an internal
+authority that dropped one datagram looks like from here. The group's timeout is
+cut for it: `forwarding_config`'s three seconds is a figure no other case in
+this file ever waits out, and this is the one that would.
+*/
+@(test)
+test_an_apex_ds_denial_the_route_could_not_answer_is_not_cached :: proc(t: ^testing.T) {
+	def_socket, derr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, derr == nil, "cannot bind the default mock: %v", derr) {
+		return
+	}
+	defer net.close(def_socket)
+	_ = net.set_option(def_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+	def_bound, _ := net.bound_endpoint(def_socket)
+
+	route_socket, rerr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, rerr == nil, "cannot bind the routed mock: %v", rerr) {
+		return
+	}
+	defer net.close(route_socket)
+	route_bound, _ := net.bound_endpoint(route_socket)
+
+	cfg := forwarding_config()
+	cfg.cache.enabled = true
+	cfg.upstream.timeout = 200 * time.Millisecond
+
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, negative_ttl = 300})
+	defer cache.destroy(answers)
+
+	group := mock_group(t, cfg.upstream, def_bound.port)
+	defer upstream.destroy_group(group)
+	routed := mock_group(t, cfg.upstream, route_bound.port)
+	defer upstream.destroy_group(routed)
+
+	s := Server {
+		cfg     = &cfg,
+		group   = group,
+		answers = answers,
+		routes  = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
+	}
+
+	parent := Route_Mock {
+		socket = def_socket,
+		reply  = route_reply_nodata("corp.example.", .DS, .NX_Domain),
+		want   = "corp.example.",
+	}
+	parent_mock := thread.create_and_start_with_poly_data(&parent, serve_route)
+	out, _, ok := handle_query(
+		&s,
+		route_query("corp.example.", .DS),
+		.UDP,
+		"127.0.0.1:5555",
+		context.temp_allocator,
+	)
+	thread.join(parent_mock)
+	thread.destroy(parent_mock)
+
+	if !testing.expect(t, ok, "nothing came back at all") {
+		return
+	}
+	testing.expect(t, parent.asked, "the parent's group was not asked at all")
+
+	// The client is told what the only server that answered said.
+	decoded, derr2 := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr2, dns.Decode_Error.None)
+	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.NX_Domain)
+
+	// And the next client is not: nothing was kept, so the route is asked again.
+	key_buf: [cache.KEY_MAX]u8
+	key := cache.make_key(key_buf[:], "corp.example.", .DS, .IN, false, false)
+	_, _, cached := cache.get(answers, key, context.temp_allocator)
+	testing.expect(t, !cached, "the parent's unchecked denial was stored against the routed zone")
 	free_all(context.temp_allocator)
 }
 

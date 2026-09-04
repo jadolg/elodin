@@ -971,7 +971,8 @@ resolve_query :: proc(
 	follow the route either - a `DS` at the route's own apex, which only the
 	zone's parent can prove and which `route_group` sends there.
 	*/
-	resp, winner, uerr := upstream.resolve(route_group(s, q.name, q.type), forwarded, allocator)
+	asked := route_group(s, q.name, q.type)
+	resp, winner, uerr := upstream.resolve(asked, forwarded, allocator)
 	/*
 	And back on the route when the parent says there is no such zone.
 
@@ -987,20 +988,40 @@ resolve_query :: proc(
 	parent's answer as the only one there is - in both cases what came back
 	first is what the client gets.
 
+	Only when the two groups differ, as well. A route may list a zone and its
+	parent together, and then `route_group` has already sent this question to the
+	route's own group: asking it again puts the same question to the same servers
+	for the same answer, and the denial is the route's own rather than an outside
+	claim about it.
+
 	`forwarded` is safe to send twice: `attach_cookie` builds each upstream's
 	copy in its own buffer, so nothing about the first exchange is left in this
 	one. The transaction ID is drawn again all the same, the second exchange
 	being a new one on the wire, and the client's own ID goes back on below.
 	*/
+	unbacked_denial := false
 	if uerr == .None && apex_ds_off_route(s, q.name, q.type) && dns.peek_rcode(resp) == .NX_Domain {
-		dns.set_id_in_place(forwarded, dns.random_id())
-		again, second, aerr := upstream.resolve(zone_route_group(s, q.name), forwarded, allocator)
-		if aerr == .None {
-			logx.debugf(
-				"query DS %s: the parent's group answered NXDOMAIN, so the route was asked instead",
-				q.name,
-			)
-			resp, winner = again, second
+		if own := zone_route_group(s, q.name); own != asked {
+			dns.set_id_in_place(forwarded, dns.random_id())
+			again, second, aerr := upstream.resolve(own, forwarded, allocator)
+			if aerr == .None {
+				logx.debugf(
+					"query DS %s: the parent's group answered NXDOMAIN, so the route was asked instead",
+					q.name,
+				)
+				resp, winner = again, second
+			} else {
+				/*
+				The client gets the parent's NXDOMAIN, and the cache does not
+				keep it. See the store below.
+				*/
+				unbacked_denial = true
+				logx.debugf(
+					"query DS %s: the parent's group answered NXDOMAIN and the route did not answer (%v); not storing the denial",
+					q.name,
+					aerr,
+				)
+			}
 		}
 	}
 	if uerr != .None {
@@ -1335,7 +1356,29 @@ resolve_query :: proc(
 		}
 	}
 
-	if s.cfg.cache.enabled && have_decoded {
+	/*
+	`unbacked_denial` is the one answer on this path that is served and not
+	stored, and it is the apex `DS` above: the parent's group said the zone is
+	not delegated, and the route that would have spoken for it could not be
+	reached, so the denial goes to the client for want of anything better and
+	stops there.
+
+	Storing it would pin the failure the carve-out exists to prevent. The
+	parent's NXDOMAIN is signed and its negative TTL is the parent's to choose -
+	an hour is ordinary - so one lost exchange with the internal authority would
+	hold a *signed* proof of non-existence over the routed zone's apex for that
+	long, with the authority answering perfectly well the whole time. Every
+	validating client below here then reads the zone as provably absent rather
+	than merely unsigned, and one implementing RFC 8020 reads it as proof
+	that every name under the apex is gone with it. The same reasoning as the
+	`Unreadable` verdict above: a transient cause must not be memoised into a
+	name that stays dark for `cache.max_ttl`.
+
+	Nothing else changes. The next query asks again, which is what happened
+	before any of this was memoised, and one that reaches the route gets the
+	route's answer and stores that.
+	*/
+	if s.cfg.cache.enabled && have_decoded && !unbacked_denial {
 		cache.put(s.answers, key, resp, decoded, generation)
 	}
 
