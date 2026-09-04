@@ -47,17 +47,32 @@ reaches that as fast as the socket allows. `server.max_connections` bounds how
 many clients are here at once, not how fast one of them asks, so without this a
 flood delivered over a handful of connections is one the limiter never sees.
 
-How much of "here" one client may be is not this file's either, and it is not a
-gap in it: what is charged below is queries, so a client that opens connections
-and asks nothing on them spends nothing however many it holds. That is
-`server.max_connections_per_prefix`, in `conns.odin`, keyed through the same
-`client_prefix` as the budgets - so the two bounds agree about who a client is
-while bounding different things, occupancy and rate.
+Opening one is charged as well, which is a different thing from the queries asked
+on it. A client that dials, completes a TLS handshake and hangs up asks nothing,
+so no budget of answers ever sees it - and a handshake is 205 µs of this server's
+CPU, from an address that has to be real, so it needs no spoofing and no volume.
+Measured on a four-core machine, 32 dialers drew 6,922 handshakes a second, 1.4 of
+those four cores, while taking a sixth of the answers from a DoT client in another
+prefix that was running its one connection at capacity - with every counter this
+server published reading zero. `bench/results/2026-09-03-handshake-floods.md` is
+that run. So arriving is charged too, one token per accepted connection, spent in
+the accept loop before a thread exists and before `accept_tls` runs, where a
+refusal costs a prefix compare and a close.
 
-Charged to a budget of their own, though. A prefix's datagrams are spent out of one
-pool and its connections out of the other, at the same rate, and neither is a way
-to spend the other. There is a third, for the truncated answers, further down. See
-`Rate_Class`.
+What is still not charged here is *occupancy*: how long a connection is held once
+it has been paid for, and therefore how much of the table one client may fill. That
+is `server.max_connections_per_prefix`, in `conns.odin`, keyed through the same
+`client_prefix` as the budgets - so all three bounds agree about who a client is
+while bounding different things, arrival rate, query rate and occupancy. And a
+share cannot stand in for an arrival budget: bounding how many connections are
+*held* bounds arrivals only where the share is small enough to be reached, and the
+run above never reached the shipped 256 of 512 with a flood that holds 32
+connections at a time.
+
+Charged to a budget of their own, though - all of them. A prefix's datagrams are
+spent out of one pool, the queries it asks over connections out of another, and the
+connections themselves out of a third, and none is a way to spend another. There is
+a fourth, for the truncated answers, further down. See `Rate_Class`.
 
 One shared budget is what this began as, and it was wrong - which is worth writing
 down, because the argument for sharing is the one that reads better. It goes: what
@@ -88,6 +103,19 @@ change that charges one class against the other's pool, or lends a token across
 when the first runs dry, hands the flood back its authority over the connections.
 `test_the_stream_budget_is_not_the_datagram_one` is the test that says so, and the
 reason it is worth more than it looks.
+
+The connection pool is separate for the same reason and more sharply. A datagram
+that could spend it would be a way to stop a stranger's clients from *connecting*,
+which is a door further out than the one above: a client refused a query at least
+got here, and can retry. `test_a_datagram_flood_cannot_stop_a_prefix_connecting`
+is that property. It is separate from the stream pool too, and there the argument
+is not spoofing but arithmetic: a connection is the vehicle for a query, and a
+client is entitled to spend one on each - `dig +tcp`, a `curl` per lookup and every
+stub that does not keep a connection open all ask exactly that way, and the
+`handshake-flood/arriving-client` arm is that client measured. So the connection
+pool gets the whole of `responses_per_second` and not a share of it: anything
+smaller would be a quiet reduction of the query budget for the clients that
+reconnect, reached through a setting that says nothing about connections.
 
 What differs besides the pool is what an over-limit query is answered with: `slip`
 sends a truncated answer over UDP and does not apply to a connection, for the
@@ -150,6 +178,26 @@ sends about that much, rather than one that sends a stranger 19 MB/s and costs a
 uninvolved client 44 points of its answer rate. `slip: 0` is still there for a
 deployment that wants neither, and it is now within 0.01 MB/s of the default on
 every figure the bench reports - the default stopped being the expensive choice.
+
+What the connection budget is worth, and what it is not, said as plainly. On the
+shipped 500 it holds one unspoofed client to 500 arrivals a second where nothing
+held it before: about a tenth of a core at the 205 µs a handshake cost on the
+machine the flood was measured on, against the 1.4 cores of four it drew
+uncharged. What it is not is a defence against a botnet. It is per prefix like
+everything else here, so an actor with addresses in n prefixes has n of it, and on
+IPv6 a routine /48 is 65,536 /64s - the same granularity and the same limitation
+the response budget has, and the reason a publicly reachable instance still wants a
+per-source connection *rate* limit in front of it, in the packet filter or whatever
+terminates TLS in the deployment. The bound here is what keeps a single client with
+one real address from spending a third of the server; it is not what makes the
+address count stop mattering.
+
+It is also not free to a client that shares a prefix with a flood, in exactly the
+way the slip pool is not: a NAT whose /24 somebody is dialling into gets its share
+of 500 arrivals a second and no more. That is the same trade the rest of this file
+makes, and it is the direction to fail in - a client behind that NAT holding a
+connection open keeps resolving on the stream pool, which the arrivals cannot
+touch.
 */
 
 /*
@@ -200,18 +248,25 @@ thing an operator can ask for.
 RRL_SLIP_SHARE :: 8
 
 /*
-Which of a prefix's three budgets a reply is charged to.
+Which of a prefix's four budgets something is charged to.
 
 The separation is the point, and the note at the top of this file is where the
 reasoning for it lives: under one budget a spoofed datagram flood could empty the
 bucket of a prefix it was only naming, and close the connections of the clients who
-live there.
+live there - or, once arrivals are charged, stop them opening one at all.
 
 `Datagram` is UDP, where the source address is whatever the sender wrote and what
 the budget bounds is amplification - how much traffic one address can be made to
-receive. `Stream` is TCP, DoT and DoH, where a handshake settled where the client
-is and what the budget bounds is work - the upstream round trips and the cache
-churn behind an answer.
+receive. `Stream` is queries read off a connection - TCP, DoT and DoH - where a
+handshake settled where the client is and what the budget bounds is work: the
+upstream round trips and the cache churn behind an answer.
+
+`Connection` is the connection itself, one token per accepted arrival, spent in
+the accept loop before a thread exists and before any TLS handshake. What it
+bounds is the cost of *getting here*, which is the one load on this server that
+neither of the two above charges and the cheapest one to mount: a client that
+dials, handshakes and hangs up asks nothing, so it spends nothing out of
+`Datagram` or `Stream` however fast it does it.
 
 `Slip` is the truncated answer an over-limit datagram is given instead of nothing,
 which is neither a transport nor an answer: what it bounds is how much traffic an
@@ -224,6 +279,7 @@ to both.
 Rate_Class :: enum u8 {
 	Datagram,
 	Stream,
+	Connection,
 	Slip,
 }
 
@@ -262,9 +318,10 @@ Rate_Limiter :: struct {
 	/*
 	Tokens per second, and the most that may be banked, one of each per pool.
 
-	`Datagram` and `Stream` both get `responses_per_second`, which is the doubling
-	the file's note accepts; `Slip` gets a fraction of it, for the reason in
-	`RRL_SLIP_SHARE`.
+	`Datagram`, `Stream` and `Connection` all get `responses_per_second` - the
+	multiplication the file's note accepts, and the whole figure for `Connection`
+	because a connection is what a query is asked over; `Slip` gets a fraction of
+	it, for the reason in `RRL_SLIP_SHARE`.
 	*/
 	rate:      [Rate_Class]f64,
 	capacity:  [Rate_Class]f64,
@@ -301,6 +358,25 @@ Rate_Limiter :: struct {
 	// limiter, and read by tests.
 	limited:   u64,
 	slipped:   u64,
+	/*
+	Connections refused for want of a `Connection` token.
+
+	Apart from `limited`, which counts queries this server withheld an answer
+	from, because this one is not a query: nothing was asked and nothing was
+	withheld. Folded together, a handshake flood would read as a query flood to
+	whoever is watching the counter, and the two do not ask for the same thing -
+	`cookies.require` and a smaller `slip` are answers to one and nothing to the
+	other.
+
+	Apart from the `conn_refused` in `Stats` too, which is the connection *table*
+	being full or a prefix holding its share of it. That is a bound on occupancy
+	and this is a bound on arrival: an operator seeing `conn_refused` raises
+	`max_connections` or its share, and one seeing this raises
+	`rate_limit.responses_per_second` or decides the client should be refused.
+	`conn_refused` reading zero right through a handshake flood is what this
+	counter exists to stop.
+	*/
+	conn_limited: u64,
 }
 
 make_rate_limiter :: proc(
@@ -315,6 +391,7 @@ make_rate_limiter :: proc(
 	rps := f64(configured)
 	r.rate[.Datagram] = rps
 	r.rate[.Stream] = rps
+	r.rate[.Connection] = rps
 	// Divided as integers, so the slip pool refills at the whole number the
 	// startup line prints and the documentation quotes rather than at a figure
 	// an eighth of a token above it.
@@ -488,10 +565,55 @@ stream_rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick
 }
 
 /*
+Charge one accepted connection to `client`'s prefix and say whether to serve it.
+
+Called from the accept loop, once per connection, before a thread is created and
+before `accept_tls` runs a handshake. That is the whole point of it: a handshake is
+the expensive part and a refusal at the accept is a prefix compare and a close, so
+the token has to be spent while a refusal is still cheap. A budget checked further
+in would be a budget checked after the cost it is bounding.
+
+Its own pool, for the two reasons the top of this file gives. A datagram must not
+be able to spend it, or a spoofed flood naming a prefix would stop the clients who
+live there from connecting at all; and the queries asked over connections must not
+spend it either, since a client that opens a connection per query is entitled to
+both.
+
+What is charged is *arriving*, not being served. A connection this returns `true`
+for and that `conn_spawn` then refuses for want of a slot has still spent its
+token: it arrived, it cost an accept, and the alternative is asking the connection
+table - which walks its thread list and asks the OS about each entry - before the
+cheaper of the two bounds. Nothing is given back either, since there is nothing to
+give back to: a bucket refills on time and not on outcomes.
+
+`false` means close the socket. There is nothing to write on it and nothing worth
+writing: a refusal a client can read costs a connection to deliver, which is the
+cost being refused. `report_conn_rate_limit` in `listeners.odin` is what says so
+in the log, once.
+*/
+conn_rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) -> bool {
+	if r == nil {
+		return true
+	}
+	sync.mutex_lock(&r.lock)
+	defer sync.mutex_unlock(&r.lock)
+
+	b := rate_bucket(r, client, now._nsec)
+
+	if b.tokens[.Connection] >= 1 {
+		b.tokens[.Connection] -= 1
+		return true
+	}
+
+	sync.atomic_add(&r.conn_limited, 1)
+	return false
+}
+
+/*
 What every pool has accrued between `last_ns` and `now_ns`, one figure per class.
 
 The elapsed time is converted once and each pool's rate multiplied through it: the
-three differ only in rate, so a division per pool would be the same division three
+pools differ only in rate, so a division per pool would be the same division four
 times - on the path every datagram takes, under the table lock.
 */
 @(private)
@@ -576,19 +698,20 @@ start_rate_limiter :: proc(s: ^Server) -> bool {
 	}
 	s.limiter = make_rate_limiter(cfg.responses_per_second, cfg.slip)
 	// The budgets are named in the line rather than left to the documentation: an
-	// operator reading `500` needs to know it is 500 datagrams and 500 queries on
-	// connections, not 500 between them - and that the truncated answers have a
-	// figure of their own, since it is the one thing here they did not write.
+	// operator reading `500` needs to know it is 500 datagrams, 500 queries on
+	// connections and 500 connections opened, not 500 between them - and that the
+	// truncated answers have a figure of their own, since it is the one thing here
+	// they did not write.
 	if cfg.slip > 0 {
 		logx.infof(
-			"rate limit: %d responses/s per client prefix (/24, /64), counted separately for datagrams and for connections; 1 in %d over the datagram budget answered truncated, up to %d truncated answers/s, and over a connection nothing is",
+			"rate limit: %d responses/s per client prefix (/24, /64), counted separately for datagrams, for queries on a connection and for connections opened; 1 in %d over the datagram budget answered truncated, up to %d truncated answers/s, and over a connection nothing is",
 			cfg.responses_per_second,
 			cfg.slip,
 			int(s.limiter.rate[.Slip]),
 		)
 	} else {
 		logx.infof(
-			"rate limit: %d responses/s per client prefix (/24, /64), counted separately for datagrams and for connections; anything over that dropped",
+			"rate limit: %d responses/s per client prefix (/24, /64), counted separately for datagrams, for queries on a connection and for connections opened; anything over that dropped",
 			cfg.responses_per_second,
 		)
 	}
@@ -601,9 +724,11 @@ stop_rate_limiter :: proc(s: ^Server) {
 }
 
 // Read for the periodic stats line and by tests.
-rate_limit_stats :: proc(r: ^Rate_Limiter) -> (limited, slipped: u64) {
+rate_limit_stats :: proc(r: ^Rate_Limiter) -> (limited, slipped, conn_limited: u64) {
 	if r == nil {
-		return 0, 0
+		return 0, 0, 0
 	}
-	return sync.atomic_load(&r.limited), sync.atomic_load(&r.slipped)
+	return sync.atomic_load(&r.limited),
+		sync.atomic_load(&r.slipped),
+		sync.atomic_load(&r.conn_limited)
 }

@@ -10,12 +10,13 @@ binary.
 
 `server.max_connections` bounds how many stream connections exist at once for
 the whole server, and on its own it says nothing about whose they are. Nothing
-else counted them per client either: the response limiter charges *queries*, so
-a client that opens connections and asks nothing on them spends no budget at
-all, and `client_timeout` reclaiming an idle one after ten seconds is a delay
-rather than a limit to somebody willing to open another. So one source could
-hold every slot, and the clients who were locked out of the table were locked
-out by a configuration that said nothing about it.
+else bounds how long a client keeps one either: the limiter charges opening a
+connection and charges the queries asked over it (`cases_connrate.odin` is that
+half), and both are rates a client can stay inside while letting go of nothing,
+while `client_timeout` reclaiming an idle one after ten seconds is a delay rather
+than a limit to somebody willing to open another. So one source could hold every
+slot, and the clients who were locked out of the table were locked out by a
+configuration that said nothing about it.
 
 `server.max_connections_per_prefix` is the bound, and the two runs below are the
 same four connections from one client against a server with it and against one

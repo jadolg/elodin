@@ -59,8 +59,11 @@ test_every_counter_reaches_the_endpoint :: proc(t: ^testing.T) {
 			refused = 8,
 			conn_refused = 9,
 			conn_failed = 10,
-			secure = 11,
-			bogus = 12,
+			handshakes = 11,
+			secure = 12,
+			bogus = 13,
+			rebind = 14,
+			special_use = 15,
 		},
 	)
 
@@ -74,8 +77,42 @@ test_every_counter_reaches_the_endpoint :: proc(t: ^testing.T) {
 	expect_line(t, page, "elodin_queries_refused_total 8")
 	expect_line(t, page, "elodin_connections_refused_total 9")
 	expect_line(t, page, "elodin_connections_failed_total 10")
-	expect_line(t, page, `elodin_dnssec_answers_total{result="secure"} 11`)
-	expect_line(t, page, `elodin_dnssec_answers_total{result="bogus"} 12`)
+	expect_line(t, page, "elodin_tls_handshakes_total 11")
+	expect_line(t, page, `elodin_dnssec_answers_total{result="secure"} 12`)
+	expect_line(t, page, `elodin_dnssec_answers_total{result="bogus"} 13`)
+	expect_line(t, page, "elodin_rebind_refused_total 14")
+	expect_line(t, page, "elodin_special_use_total 15")
+	free_all(context.temp_allocator)
+}
+
+/*
+The limiter's own counters reach the endpoint too, including the connections it
+refused.
+
+Separate from the test above because these do not come off `Stats`: the endpoint
+reads them through `rate_limit_stats`, so a counter added to the limiter and not
+added there publishes a zero for as long as nobody checks. `conn_rate_limited` is
+the one that matters most here - `elodin_connections_refused_total` reading zero
+through a handshake flood is the blindness issue #247 was filed about, and a
+series that reported the new bound as a flat zero would be the same blindness with
+a metric name on it.
+*/
+@(test)
+test_the_limiters_counters_reach_the_endpoint :: proc(t: ^testing.T) {
+	s, cfg := metrics_fixture(Stats{})
+	s.cfg = &cfg
+	// Distinct values, so a series reading the wrong counter fails.
+	s.limiter = make_rate_limiter(500, 2)
+	defer destroy_rate_limiter(s.limiter)
+	s.limiter.limited = 3
+	s.limiter.slipped = 5
+	s.limiter.conn_limited = 7
+
+	listeners: Listeners
+	page := render_metrics(&s, &listeners, context.temp_allocator)
+	expect_line(t, page, "elodin_rate_limited_total 3")
+	expect_line(t, page, "elodin_rate_limit_slipped_total 5")
+	expect_line(t, page, "elodin_connections_rate_limited_total 7")
 	free_all(context.temp_allocator)
 }
 

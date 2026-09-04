@@ -325,8 +325,37 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 		"How many of server.max_connections one client prefix (/24, /64) may hold; equal to the total when there is no such cap.",
 		i64(s.cfg.server.max_connections_per_prefix),
 	)
+	/*
+	The cost of arriving, which the two series above cannot show.
 
-	limited, slipped := rate_limit_stats(s.limiter)
+	`_refused_total` is the table saying it has no room and `_active` is what it
+	is holding, and a client that dials, handshakes and hangs up moves neither:
+	it holds one slot for the length of a handshake, out of a table it never
+	comes close to filling. These two are that load, from both sides - what got
+	through and what the arrival budget turned away.
+
+	Not labelled per prefix, though the budget is kept per prefix. What a series
+	per /24 costs is cardinality an attacker chooses, on the one endpoint whose
+	whole design is that nothing reaching it decides how much work it is - see
+	the note on the metrics listener in the README. A rate on these two says the
+	same thing about whether it is happening, and the `debug` log says who.
+	*/
+	metrics.scalar(
+		&b,
+		"elodin_tls_handshakes_total",
+		.Counter,
+		"TLS handshakes completed on the DoT and DoH listeners.",
+		st.handshakes,
+	)
+
+	limited, slipped, conn_limited := rate_limit_stats(s.limiter)
+	metrics.scalar(
+		&b,
+		"elodin_connections_rate_limited_total",
+		.Counter,
+		"Connections turned away because the client's prefix was opening them faster than server.rate_limit.responses_per_second allows.",
+		conn_limited,
+	)
 	metrics.scalar(
 		&b,
 		"elodin_rate_limited_total",
