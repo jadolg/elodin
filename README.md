@@ -360,6 +360,17 @@ That one query is also the only part of a routed zone the public upstream hears,
 and it names no host: the zone's own name, which its parent already publishes if
 the delegation exists.
 
+If the parent answers NXDOMAIN, the question goes back on the route. That answer
+means nothing in the public tree delegates the zone — the ordinary case being an
+internal `corp.example.com` under a public, signed `example.com` — so there is no
+proof to fetch and the local authority is the only thing that can answer at all.
+Passing the NXDOMAIN on would be worse than the answer it replaced: an unsigned
+"no data" from the local server lets a lenient validator treat the zone as
+unsigned and resolve it, while a *signed* proof of non-existence takes that away,
+and a validator implementing RFC 8020 reads it as proof that every name under the
+apex is gone too. `home.arpa` is unaffected — `arpa` does delegate it, so the
+answer there is the insecure-delegation proof the client came for.
+
 The answer cache is keyed on the question rather than on which upstream produced
 it, which holds because the routing table is built once at startup — restart
 after changing a route. `--check` and the startup log say out loud what each

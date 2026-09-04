@@ -167,13 +167,14 @@ the parent of a routed zone cannot answer a `DS` query with the `A` record
 the test would read as the upstream never having answered.
 */
 @(private = "file")
-route_reply_nodata :: proc(name: string, type: dns.Type) -> []u8 {
+route_reply_nodata :: proc(name: string, type: dns.Type, rcode := dns.Rcode.No_Error) -> []u8 {
 	question := make([]dns.Question, 1, context.temp_allocator)
 	question[0] = dns.Question{name = name, type = type, class = .IN}
 	msg := dns.Message{question = question}
 	msg.flags.qr = true
 	msg.flags.rd = true
 	msg.flags.ra = true
+	msg.flags.rcode = u8(rcode)
 	wire, _, err := dns.encode_message(msg, context.temp_allocator)
 	if err != .None {
 		return nil
@@ -550,6 +551,132 @@ test_a_client_ds_query_at_a_routed_apex_leaves_the_route :: proc(t: ^testing.T) 
 			c.name,
 			"routed" if !c.to_route else "default",
 		)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+An apex `DS` the parent's group calls nonexistent goes back on the route.
+
+The other half of the carve-out above, and the deployment it is there for is the
+commonest internal zone there is: `corp.example.com` on a domain controller,
+under an `example.com` that is public and signed and delegates no `corp`. Asked
+for `corp.example.com. DS`, the public upstream does not answer "insecure
+delegation" - it answers, with a signature over it, that the name does not exist
+at all. Passing that to the client is worse than the answer it replaced: an
+unsigned NODATA from the domain controller leaves a lenient validator free to
+call the zone unsigned and resolve it, while a signed proof of non-existence
+takes that away, and a validator implementing RFC 8020 reads it as proof that
+every name under the apex is gone with it.
+
+So an NXDOMAIN from the parent's group is not passed on, it is a signal: nothing
+public delegates this zone, and the route is the only thing that can answer.
+`apex_ds_off_route` argues it in full.
+
+Both cases run against the same fixture and differ only in what the parent's
+group says, which is the point - what the route does has to follow from the
+parent's answer and from nothing else. The NODATA case is `home.arpa.`'s: a real
+insecure delegation, where the proof is exactly what the client came for and the
+route must not be asked at all.
+*/
+@(test)
+test_an_apex_ds_the_parent_denies_falls_back_to_the_route :: proc(t: ^testing.T) {
+	Case :: struct {
+		parent:   dns.Rcode,
+		to_route: bool,
+	}
+	cases := []Case{{.NX_Domain, true}, {.No_Error, false}}
+
+	for c in cases {
+		def_socket, derr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+		if !testing.expectf(t, derr == nil, "cannot bind the default mock: %v", derr) {
+			return
+		}
+		defer net.close(def_socket)
+		_ = net.set_option(def_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+		def_bound, _ := net.bound_endpoint(def_socket)
+
+		route_socket, rerr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+		if !testing.expectf(t, rerr == nil, "cannot bind the routed mock: %v", rerr) {
+			return
+		}
+		defer net.close(route_socket)
+		_ = net.set_option(route_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+		route_bound, _ := net.bound_endpoint(route_socket)
+
+		cfg := forwarding_config()
+		group := mock_group(t, cfg.upstream, def_bound.port)
+		defer upstream.destroy_group(group)
+		routed := mock_group(t, cfg.upstream, route_bound.port)
+		defer upstream.destroy_group(routed)
+
+		s := Server {
+			cfg    = &cfg,
+			group  = group,
+			routes = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
+		}
+
+		parent := Route_Mock {
+			socket = def_socket,
+			reply  = route_reply_nodata("corp.example.", .DS, c.parent),
+			want   = "corp.example.",
+		}
+		authority := Route_Mock {
+			socket = route_socket,
+			reply  = route_reply_nodata("corp.example.", .DS),
+			want   = "corp.example.",
+		}
+		parent_mock := thread.create_and_start_with_poly_data(&parent, serve_route)
+		/*
+		The route's mock is only started for the case that expects it. A thread
+		blocked on a socket nothing sends to would hold the test open for
+		`MOCK_RECV_TIMEOUT`, and the assertion that it stayed quiet is
+		`route_mock_quiet` reading the socket itself - which cannot be done from
+		two places at once.
+		*/
+		route_thread: ^thread.Thread
+		if c.to_route {
+			route_thread = thread.create_and_start_with_poly_data(&authority, serve_route)
+		}
+		out, _, ok := handle_query(
+			&s,
+			route_query("corp.example.", .DS),
+			.UDP,
+			"127.0.0.1:5555",
+			context.temp_allocator,
+		)
+		thread.join(parent_mock)
+		thread.destroy(parent_mock)
+		if route_thread != nil {
+			thread.join(route_thread)
+			thread.destroy(route_thread)
+		}
+
+		if !testing.expectf(t, ok, "nothing came back at all for a parent that said %v", c.parent) {
+			return
+		}
+		testing.expectf(t, parent.asked, "the parent's group was not asked at all (%v)", c.parent)
+		testing.expectf(
+			t,
+			authority.asked == c.to_route,
+			"with the parent answering %v the route was %sasked",
+			c.parent,
+			"not " if c.to_route else "",
+		)
+		if !c.to_route {
+			testing.expect(
+				t,
+				route_mock_quiet(route_socket, "corp.example."),
+				"a real insecure delegation was re-asked down the route",
+			)
+		}
+
+		// What the client is handed either way: the answer of whichever upstream
+		// was asked last, and never the parent's NXDOMAIN once the route has
+		// spoken for the zone.
+		decoded, derr2 := dns.decode_message(out, context.temp_allocator)
+		testing.expect_value(t, derr2, dns.Decode_Error.None)
+		testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
 	}
 	free_all(context.temp_allocator)
 }

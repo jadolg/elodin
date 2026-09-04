@@ -103,11 +103,11 @@ Three things the carve-out deliberately is not:
   - It is not the names below the apex. `nas.home.arpa. DS` asks about a
     delegation inside a zone that exists nowhere but this network, and the
     answer to that one really is on the router.
-  - It is not conditional on the zone being delegated in the public tree.
-    Nothing at load can tell an internal zone from a public signed one, and the
-    unconditional form costs a zone with no public parent one query answered
-    NXDOMAIN or SERVFAIL by the default group - where following the route would
-    have got an unsigned NODATA that no validator can use either.
+  - It is not decided at load by whether the public tree delegates the zone,
+    because nothing at load can know that. It is decided by the answer: an
+    NXDOMAIN from the parent's group says the delegation is not there to ask
+    about, and `resolve_query` then puts the question back on the route. See
+    `apex_ds_off_route`, which is where that reading is argued.
 
 What it does not touch is whether the answer is validated. `served_locally` still
 covers the routed zone's apex, so the parent's signed DS is passed to the client
@@ -134,14 +134,60 @@ load, so the walk up is one step and cannot land back on the same route.
 */
 @(private)
 route_group :: proc(s: ^Server, name: string, type: dns.Type) -> ^upstream.Group {
-	target := name
-	if type == .DS && is_route_apex(s, name) {
-		target = dns.name_parent(name)
+	if apex_ds_off_route(s, name, type) {
+		return zone_route_group(s, dns.name_parent(name))
 	}
-	if route, found := zone_route(s, target); found {
+	return zone_route_group(s, name)
+}
+
+/*
+The group the route points at for `name`, the apex `DS` carve-out ignored.
+
+`route_group` answers where a question goes. This answers where the zone is,
+which for the one question that leaves the route is a different place, and both
+callers of it want the second: `route_group` itself, to ask the question of the
+parent's zone rather than of the parent's name, and `resolve_query`, to put an
+apex `DS` back on the route when the parent has said there is no such zone.
+*/
+@(private)
+zone_route_group :: proc(s: ^Server, name: string) -> ^upstream.Group {
+	if route, found := zone_route(s, name); found {
 		return route.group
 	}
 	return s.group
+}
+
+/*
+Whether this is the apex `DS` that `route_group` sends to the parent's group.
+
+`resolve_query` asks because for this one question, and no other, an NXDOMAIN
+from that group is not an answer to pass on. It says the parent zone has no such
+name in it - that nothing in the public tree delegates this zone - and three
+things follow. There is no signed proof of an insecure delegation to be had,
+because there is no delegation. The route's own authority is the only thing that
+can say anything about the name at all. And handing the client the NXDOMAIN
+instead is actively worse than what it replaced: an unsigned NODATA from the
+route leaves a lenient validator free to treat the zone as unsigned and resolve
+it (systemd-resolved's default `DNSSEC=allow-downgrade` does exactly that),
+while a signed proof of non-existence takes that freedom away - and a validator
+that implements RFC 8020, as unbound's `harden-below-nxdomain` does by default,
+reads it as proof that every name under the apex is gone too. That is a routed
+`corp.example.com` under a signed `example.com` going dark, which is the failure
+this carve-out exists to prevent, met coming the other way.
+
+So the question goes back on the route, and the deployment keeps exactly the
+behaviour it had before the carve-out existed. `home.arpa.` is untouched by it:
+`arpa.` does delegate the zone, so the answer there is a NODATA carrying the
+signed proof, never an NXDOMAIN, and the fallback never fires.
+
+Deciding it on the answer rather than at load is what issue #227 left open as
+"cannot be known at load". It cannot - but it can be known from the reply, at
+the cost of one extra query for a routed apex that has no public parent, and
+only for `DS`.
+*/
+@(private)
+apex_ds_off_route :: proc(s: ^Server, name: string, type: dns.Type) -> bool {
+	return type == .DS && is_route_apex(s, name)
 }
 
 /*

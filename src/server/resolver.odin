@@ -972,6 +972,37 @@ resolve_query :: proc(
 	zone's parent can prove and which `route_group` sends there.
 	*/
 	resp, winner, uerr := upstream.resolve(route_group(s, q.name, q.type), forwarded, allocator)
+	/*
+	And back on the route when the parent says there is no such zone.
+
+	`apex_ds_off_route` argues the whole of it. In short: an NXDOMAIN for a
+	routed apex's `DS` says the public tree delegates nothing here, so there is
+	no proof to fetch, the route's authority is the only thing that can answer,
+	and passing the NXDOMAIN on would take a working insecure zone and hand the
+	client a signed proof that every name in it is gone.
+
+	Only NXDOMAIN, and only when the second exchange succeeds. A SERVFAIL from
+	the parent's group is one server declining to say rather than a statement
+	about the delegation, and a route that cannot be reached either leaves the
+	parent's answer as the only one there is - in both cases what came back
+	first is what the client gets.
+
+	`forwarded` is safe to send twice: `attach_cookie` builds each upstream's
+	copy in its own buffer, so nothing about the first exchange is left in this
+	one. The transaction ID is drawn again all the same, the second exchange
+	being a new one on the wire, and the client's own ID goes back on below.
+	*/
+	if uerr == .None && apex_ds_off_route(s, q.name, q.type) && dns.peek_rcode(resp) == .NX_Domain {
+		dns.set_id_in_place(forwarded, dns.random_id())
+		again, second, aerr := upstream.resolve(zone_route_group(s, q.name), forwarded, allocator)
+		if aerr == .None {
+			logx.debugf(
+				"query DS %s: the parent's group answered NXDOMAIN, so the route was asked instead",
+				q.name,
+			)
+			resp, winner = again, second
+		}
+	}
 	if uerr != .None {
 		logx.debugf("query %s %s from %s failed: %v", dns.type_name(q.type), q.name, client, uerr)
 		/*

@@ -307,6 +307,72 @@ run_zone_route_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	start_case(r, "upstream.zones: an apex DS the parent denies goes back to the route")
+	{
+		/*
+		The other side of the carve-out above, on the deployment it exists for:
+		an internal zone under a public parent that delegates nothing to it -
+		`corp.example.com` on a domain controller, `example.com` signed and
+		public. Asked for that zone's `DS`, the public upstream does not answer
+		"insecure delegation"; it answers, signed, that the name does not exist.
+
+		Handing that to the client is worse than the answer it replaced. An
+		unsigned NODATA from the domain controller leaves a lenient validator
+		free to treat the zone as unsigned and resolve it, where a signed proof
+		of non-existence takes that freedom away - and a validator implementing
+		RFC 8020 reads it as proof that every name under the apex is gone too.
+		So an NXDOMAIN from the parent's group is read as "nothing public
+		delegates this zone" and the question goes back on the route, which is
+		the only thing that can answer for it at all.
+
+		A zone of its own and a server of its own, because the public mock
+		answers this one question NXDOMAIN and the case above needs it answering
+		normally. The control for this case is that one: there the parent replies
+		NOERROR and the route is never asked.
+		*/
+		denied_port := next_port(r)
+		mock_rcode(public, "denied.example.", u16(dns.Type.DS), .NX_Domain)
+		config := fmt.tprintf(
+			`log:
+  level: info
+listeners:
+  udp: {{enabled: true, address: 127.0.0.1, port: %d}}
+  tcp: {{enabled: false}}
+upstream:
+  timeout: 2s
+  attempts: 1
+  servers:
+    - udp://127.0.0.1:%d
+  zones:
+    - domains: [denied.example]
+      servers:
+        - udp://127.0.0.1:%d
+cache: {{enabled: false}}
+blocking: {{enabled: false}}
+dnssec: {{enabled: false}}
+rebind: {{enabled: false}}
+`,
+			denied_port,
+			public_port,
+			internal_port,
+		)
+		denied, started := start_server(r, Server_Options{config = config, udp_port = denied_port})
+		if started {
+			defer stop_server(&denied)
+			mock_reset_counts(internal)
+			res := query_udp(denied_port, build_query("denied.example.", u16(dns.Type.DS)))
+			if check(r, res.ok, "no response") {
+				h, _ := parse_header(res.wire)
+				// The route's answer, not the parent's NXDOMAIN.
+				check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode after the parent denied the zone")
+			}
+			check(r, mock_total(internal) > 0, "the denied apex DS was not put back on the route")
+		} else {
+			skip_case(r, "upstream.zones: denied apex DS", "server did not start")
+		}
+	}
+	end_case(r)
+
 	start_case(r, "upstream.zones: everything else still goes to upstream.servers")
 	{
 		/*
