@@ -109,7 +109,7 @@ run_connection_rate_cases :: proc(r: ^Runner) {
 			defer stop_server(&srv)
 			answered := dial_and_query(tcp_port, query, DIALS)
 			check_eq_int(r, answered, DIALS, "connections answered with the limiter off")
-			check_eq_int(r, conn_rate_limited_count(metrics_port), 0, "connections the arrival budget refused")
+			check_eq_int(r, conn_counters(metrics_port).rate_limited, 0, "connections the arrival budget refused")
 		}
 	}
 	end_case(r)
@@ -157,13 +157,9 @@ run_connection_rate_cases :: proc(r: ^Runner) {
 			*query* budget after its connection was accepted would too, which is
 			the confusion the two counters exist to keep apart.
 			*/
-			check_eq_int(
-				r,
-				conn_rate_limited_count(metrics_port),
-				DIALS - answered,
-				"connections the arrival budget refused",
-			)
-			check_eq_int(r, conn_refused_total(metrics_port), 0, "connections refused for want of a slot")
+			counters := conn_counters(metrics_port)
+			check_eq_int(r, counters.rate_limited, DIALS - answered, "connections the arrival budget refused")
+			check_eq_int(r, counters.refused, 0, "connections refused for want of a slot")
 			// And the operator is told which setting refused it, once, by name.
 			check(
 				r,
@@ -196,20 +192,34 @@ dial_and_query :: proc(tcp_port: int, query: []u8, n: int) -> int {
 	return answered
 }
 
+/*
+The two connection counters, read off one scrape.
+
+One page rather than one each, so the pair an assertion compares was taken at the
+same instant and the case pays a single round trip.
+
+`metric_value` answers -1 for a series that is not on the page - the endpoint
+never came up, or the name changed - and that is passed through rather than
+clamped to 0. Both rows above assert a zero, and a missing series read as a zero
+is exactly the reading that would make those assertions pass for the wrong
+reason: the limiter-off row is the only thing here that would notice
+`elodin_connections_rate_limited_total` going away, and clamped it would go on
+passing after the series was gone.
+*/
 @(private = "file")
-conn_rate_limited_count :: proc(metrics_port: int) -> int {
-	return max(metric_value(conn_rate_metrics_page(metrics_port), "elodin_connections_rate_limited_total"), 0)
+Conn_Counters :: struct {
+	rate_limited: int,
+	refused:      int,
 }
 
 @(private = "file")
-conn_refused_total :: proc(metrics_port: int) -> int {
-	return max(metric_value(conn_rate_metrics_page(metrics_port), "elodin_connections_refused_total"), 0)
-}
-
-@(private = "file")
-conn_rate_metrics_page :: proc(metrics_port: int) -> string {
-	if !wait_http(metrics_port, "/metrics") {
-		return ""
+conn_counters :: proc(metrics_port: int) -> Conn_Counters {
+	page := ""
+	if wait_http(metrics_port, "/metrics") {
+		page = string(http_request(metrics_port, "GET", "/metrics", context.temp_allocator).body)
 	}
-	return string(http_request(metrics_port, "GET", "/metrics", context.temp_allocator).body)
+	return {
+		rate_limited = metric_value(page, "elodin_connections_rate_limited_total"),
+		refused = metric_value(page, "elodin_connections_refused_total"),
+	}
 }

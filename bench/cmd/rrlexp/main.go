@@ -897,6 +897,42 @@ func handshakeDefaultArms() []arm {
 			attacker: handshakeFlood("127.0.0.2", "dot", hsDialers),
 			victim:   arrivingVictim(),
 		},
+		{
+			/*
+				The bystander that pays for the *refusals* rather than for the
+				handshakes, and the one arm here whose reason to exist came from
+				charging arrivals rather than from leaving them uncharged.
+
+				Refusing at the accept is cheap, so a flood held to its budget
+				dials several times faster than one being served - and every one of
+				those dials takes the rate limiter's table lock in the accept loop,
+				which is the same mutex the UDP readers take for every datagram.
+				Separate pools stop one class spending another's tokens; they do
+				nothing about a lock. A UDP client in an unrelated prefix is what
+				that would show up on, and no arm was measuring one under this
+				load: every victim above is on a connection, where the accept loop
+				is upstream of them anyway.
+
+				Read against `handshake-flood/quiet-baseline-udp`, and read the
+				two together across a `main` build and a patched one - the figure
+				that matters is whether the datagram path got worse in exchange
+				for the stream path getting better.
+			*/
+			name:     "handshake-flood/udp-bystander",
+			question: "what a flood held to its arrival budget - and therefore dialling far faster - does to a UDP client in another /24",
+			limiter:  true, rps: *rps, slip: *slip,
+			attacker: handshakeFlood("127.0.0.2", "dot", hsDialers),
+			victim:   clientSpec{src: "127.1.0.1", transport: "udp", rate: *victimRate, sockets: 1},
+		},
+		{
+			// The same UDP client with the server to itself. Named into the group
+			// for the reason the DoT baseline is: a row with nothing to compare it
+			// against is six numbers.
+			name:     "handshake-flood/quiet-baseline-udp",
+			question: "what that UDP client's queries cost with nobody else here",
+			limiter:  true, rps: *rps, slip: *slip,
+			victim: clientSpec{src: "127.1.0.1", transport: "udp", rate: *victimRate, sockets: 1},
+		},
 	}
 }
 

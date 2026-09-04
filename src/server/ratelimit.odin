@@ -181,9 +181,10 @@ every figure the bench reports - the default stopped being the expensive choice.
 
 What the connection budget is worth, and what it is not, said as plainly. On the
 shipped 500 it holds one unspoofed client to 500 arrivals a second where nothing
-held it before: about a tenth of a core at the 205 µs a handshake cost on the
-machine the flood was measured on, against the 1.4 cores of four it drew
-uncharged. What it is not is a defence against a botnet. It is per prefix like
+held it before, which measured as 0.25 to 0.29 of four cores against the 1.25 to
+1.42 the same flood drew uncharged - a fifth, and the remainder is the accepts and
+closes rather than the key work, since a bound this cheap to trip is one the flood
+trips four times as often. What it is not is a defence against a botnet. It is per prefix like
 everything else here, so an actor with addresses in n prefixes has n of it, and on
 IPv6 a routine /48 is 65,536 /64s - the same granularity and the same limitation
 the response budget has, and the reason a publicly reachable instance still wants a
@@ -337,11 +338,13 @@ Rate_Limiter :: struct {
 	*/
 	hash_key:  [16]u8,
 	/*
-	The bucket table, which has as many callers as there are connections.
+	The bucket table, which has as many callers as there are connections, plus
+	the loops.
 
 	One thread reads the UDP socket, but every TCP, DoT and DoH connection is
-	served on a thread of its own and charges the queries it reads from there, so
-	the single-reader assumption this table was written under no longer holds.
+	served on a thread of its own and charges the queries it reads from there, and
+	each of the three accept loops charges the connections it accepts - so the
+	single-reader assumption this table was written under no longer holds.
 	Unlocked, what that costs is not a crash but a limiter that under-counts at
 	exactly the moment it is counting something: `tokens` read, decremented and
 	written back by two threads at once loses one of the two decrements, and
@@ -351,6 +354,17 @@ Rate_Limiter :: struct {
 	critical section is a hash, a compare and a few flops - shorter than the
 	syscall that delivered the query and orders of magnitude shorter than
 	answering it - so a finer lock would buy contention on a lock nobody holds.
+
+	Which is worth checking rather than asserting, now the accept loops are on it:
+	refusing an arrival is cheap, so a flood held to its budget dials several times
+	faster than one being served, and 27,000 acquisitions a second off an accept
+	loop is not the load this was written against. Measured, the datagram path does
+	not notice - `handshake-flood/udp-bystander` in
+	`bench/results/2026-09-04-handshake-budget.md` answers every query at 22.5 ms
+	against its own quiet 20.4 ms, under a flood taking this lock 27,499 times a
+	second. That is one rate on four cores and not a bound on what a much larger
+	accept rate would do; the answer to a much larger accept rate is the packet
+	filter the README asks for.
 	*/
 	lock:      sync.Mutex,
 	allocator: mem.Allocator,

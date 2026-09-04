@@ -905,11 +905,11 @@ an address that is therefore real. `src/server/ratelimit.odin` argues this out.
 client that dials, completes a TLS handshake and hangs up asks nothing, so no
 budget of *answers* ever saw it, and it holds each connection too briefly for
 [`max_connections_per_prefix`](#how-many-connections-one-client-may-hold) to
-notice — 32 such dialers drew 6,469 handshakes a second and 1.35 of four cores
-while `conn_refused` and `elodin_rate_limited_total` both read zero, and took 15
+notice — 32 such dialers drew 6,032 handshakes a second and 1.25 of four cores
+while `conn_refused` and `elodin_rate_limited_total` both read zero, and took 16
 points of answer rate and four times the latency from a DoT client in an unrelated
-prefix. With the budget the same load gets 461 handshakes a second and costs 0.23
-of a core, and that bystander loses 6 points instead of 15.
+prefix. With the budget the same load gets 462 handshakes a second and costs 0.29
+of a core, and that bystander loses 10 points instead of 16.
 `bench/results/2026-09-04-handshake-budget.md` is the before and after;
 `2026-09-03-handshake-floods.md` is where the load is described.
 
@@ -1032,11 +1032,11 @@ because that is the granularity an attacker picks addresses within. An actor wit
 addresses in *n* prefixes therefore has *n* copies of every figure here, and on
 IPv6 a routine allocation from a hosting provider or a tunnel broker is a /48 —
 65,536 /64s. And a refusal, though far cheaper than the handshake it refuses, is
-not free: with the arrival budget in place a flood of 32 dialers went from 6,469
-handshakes a second to 461, and from 1.35 of four cores to 0.23, but its *dial*
-rate rose from 6,469 to 28,485 a second because being refused had become cheap.
-The DoT bystander in that run went from 82% of its queries answered to 91%, where
-the quiet baseline is 97–98%. A packet filter is the only place that stops a peer
+not free: with the arrival budget in place a flood of 32 dialers went from 6,032
+handshakes a second to 462, and from 1.25 of four cores to 0.29, but its *dial*
+rate rose from 6,032 to 25,129 a second because being refused had become cheap.
+The DoT bystander in that run went from 82% of its queries answered to 88%, where
+the quiet baseline is 98%. A packet filter is the only place that stops a peer
 from making this server refuse it.
 
 ```
@@ -1754,9 +1754,9 @@ cores in total, with `conn_refused` at zero throughout because the shipped table
 was never reached. A DoT client already running its one connection at capacity
 lost 16 points of its answer rate and six times its latency. So opening a
 connection is charged to the prefix's own budget now — see [rate
-limiting](#rate-limiting) — which on the shipped 500 held the same flood to 461
-handshakes a second and 0.23 of a core, and gave that DoT client back half of what
-it had lost. It is per prefix like everything else, and a refusal is cheap rather
+limiting](#rate-limiting) — which on the shipped 500 held the same flood to 462
+handshakes a second and 0.29 of a core, and gave that DoT client back a good third
+of what it had lost. It is per prefix like everything else, and a refusal is cheap rather
 than free, so **if you expose DoT or DoH to the internet, rate-limit connections
 per source in front of the resolver as well**: see [a connection rate limit in
 front](#a-connection-rate-limit-in-front).
@@ -1802,15 +1802,15 @@ size of the lists.
   read](#how-fast-datagrams-can-be-read) for the measured figure.
 - **The bound on TLS handshakes is per prefix, and a refusal is cheap rather than
   free.** Opening a connection is charged to
-  `server.rate_limit.responses_per_second`, which held a 32-worker flood to 461
-  handshakes a second and 0.23 of four cores against 6,469 and 1.35 uncharged. But
+  `server.rate_limit.responses_per_second`, which held a 32-worker flood to 462
+  handshakes a second and 0.29 of four cores against 6,032 and 1.25 uncharged. But
   it is keyed on the /24 and /64 like every other budget here, so an actor with
   addresses in several prefixes has several copies of it, and the flood's *dial*
-  rate rose four and a half times once being refused was cheap — the DoT bystander
-  in that run recovers to 91% of its queries answered where the quiet baseline is
-  97%. A publicly reachable instance wants a per-source connection rate limit in
-  front of it: see [a connection rate limit in
-  front](#a-connection-rate-limit-in-front), and
+  rate rose four times once being refused was cheap — the DoT bystander in that run
+  recovers to 88% of its queries answered where the quiet baseline is 98%. A UDP
+  bystander is untouched either way, which the same report measures. A publicly
+  reachable instance wants a per-source connection rate limit in front of it: see
+  [a connection rate limit in front](#a-connection-rate-limit-in-front), and
   `bench/results/2026-09-04-handshake-budget.md` for the figures.
 - **Upstream I/O is synchronous**, so concurrency is bounded by thread count
   rather than by in-flight queries. The h2 upstream client multiplexes onto one

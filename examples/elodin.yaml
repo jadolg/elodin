@@ -143,8 +143,8 @@ server:
   # spent before any TLS handshake. That is the load nothing else here saw: a
   # client that dials, handshakes and hangs up asks no question, so no budget of
   # answers touches it, and it holds each connection too briefly for
-  # max_connections_per_prefix to notice. Uncharged, 32 such dialers drew 6,469
-  # handshakes a second and 1.35 of four cores out of this server, and took 15
+  # max_connections_per_prefix to notice. Uncharged, 32 such dialers drew 6,032
+  # handshakes a second and 1.25 of four cores out of this server, and took 16
   # points of answer rate off a DoT client in an unrelated prefix - see
   # bench/results/2026-09-04-handshake-budget.md. Refusals are conn_rate_limited=
   # in the stats line, apart from conn_refused=, which is the table being full.
