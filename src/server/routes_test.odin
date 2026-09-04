@@ -30,9 +30,9 @@ Route_Mock :: struct {
 	// held in `name_buf` rather than pointing at whatever memory the question
 	// was decoded into, that memory belonging to the mock thread.
 	name:     string,
-	// The question this mock is waiting for, when the case cares. Empty answers
-	// whatever arrives first, which is what the cases that bind one pair of
-	// sockets and ask one question want.
+	// The question this mock is waiting for. Every case sets it: a mock that
+	// answers whatever arrives first is one another test's stray retry can be
+	// recorded by, which is the flake `serve_route` below describes.
 	want:     string,
 	name_buf: [512]u8,
 }
@@ -45,13 +45,15 @@ only asks whether a socket was written to cannot tell a routed question from the
 chain lookups the validator makes on its own account, and those two go to
 different groups on purpose.
 
-A `want` skips packets asking about anything else rather than answering them.
-The tests in this package run in parallel against sockets bound to port zero,
-and a port a finished test's mock has released is one the kernel can hand to the
-next test that asks - so a query another case's server is still retrying can
-arrive here, be recorded as the question this case asked, and fail it on a name
-it never mentioned. Waiting for the name turns that into a packet nobody
-answered, which is what it is.
+`want` skips packets asking about anything else rather than answering them, and
+every case names one. The tests in this package run in parallel against sockets
+bound to port zero, and a port a finished test's mock has released is one the
+kernel can hand to the next test that asks - so a query another case's server is
+still retrying can arrive here, be recorded as the question this case asked, and
+fail it on a name it never mentioned. Waiting for the name turns that into a
+packet nobody answered, which is what it is. Nothing about how many sockets a
+case binds changes that, the stray packet coming from outside the case
+altogether, so there is no shape of case that wants the unfiltered reading.
 
 The name is copied into `name_buf` on the way out, and that is the part not to
 undo. `thread.create_and_start_with_poly_data` is called with no `init_context`,
@@ -82,7 +84,7 @@ serve_route :: proc(x: ^Route_Mock) {
 		}
 		free_all(mem.arena_allocator(&scratch))
 		q, ok := dns.peek_question(buf[:n], mem.arena_allocator(&scratch))
-		if x.want != "" && !(ok && dns.name_equal_fold(q.name, x.want)) {
+		if !ok || !dns.name_equal_fold(q.name, x.want) {
 			continue
 		}
 		x.name = string(x.name_buf[:copy(x.name_buf[:], q.name)])
@@ -362,6 +364,7 @@ test_a_routed_question_reaches_its_own_upstream_and_not_the_default :: proc(t: ^
 	x := Route_Mock {
 		socket = route_socket,
 		reply  = route_reply("nas.corp.example.", {10, 0, 0, 7}),
+		want   = "nas.corp.example.",
 	}
 	mock := thread.create_and_start_with_poly_data(&x, serve_route)
 	out, _, ok := handle_query(&s, route_query("nas.corp.example."), .UDP, "127.0.0.1:5555", context.temp_allocator)
@@ -373,7 +376,11 @@ test_a_routed_question_reaches_its_own_upstream_and_not_the_default :: proc(t: ^
 	}
 	testing.expect(t, x.asked, "the routed upstream was never asked")
 	testing.expect_value(t, x.name, "nas.corp.example.")
-	testing.expect(t, mock_untouched(def_socket), "the name leaked to the default upstream as well")
+	testing.expect(
+		t,
+		route_mock_quiet(def_socket, "nas.corp.example."),
+		"the name leaked to the default upstream as well",
+	)
 
 	decoded, derr2 := dns.decode_message(out, context.temp_allocator)
 	testing.expect_value(t, derr2, dns.Decode_Error.None)
@@ -429,6 +436,7 @@ test_an_unrouted_question_still_goes_to_the_default_upstream :: proc(t: ^testing
 	x := Route_Mock {
 		socket = def_socket,
 		reply  = route_reply("www.example.com.", {93, 184, 216, 34}),
+		want   = "www.example.com.",
 	}
 	mock := thread.create_and_start_with_poly_data(&x, serve_route)
 	_, _, ok := handle_query(&s, route_query("www.example.com."), .UDP, "127.0.0.1:5555", context.temp_allocator)
@@ -438,7 +446,11 @@ test_an_unrouted_question_still_goes_to_the_default_upstream :: proc(t: ^testing
 	testing.expect(t, ok, "nothing came back at all")
 	testing.expect(t, x.asked, "the default upstream was never asked")
 	testing.expect_value(t, x.name, "www.example.com.")
-	testing.expect(t, mock_untouched(route_socket), "an unrouted name was sent to the route's server")
+	testing.expect(
+		t,
+		route_mock_quiet(route_socket, "www.example.com."),
+		"an unrouted name was sent to the route's server",
+	)
 	free_all(context.temp_allocator)
 }
 
@@ -653,6 +665,7 @@ test_a_routed_zone_may_answer_with_private_addresses :: proc(t: ^testing.T) {
 		x := Route_Mock {
 			socket = socket,
 			reply  = route_reply(c.name, {192, 168, 1, 50}),
+			want   = c.name,
 		}
 		mock := thread.create_and_start_with_poly_data(&x, serve_route)
 		out, outcome, ok := handle_query(&s, route_query(c.name), .UDP, "127.0.0.1:5555", context.temp_allocator)

@@ -162,16 +162,19 @@ validator_query :: proc(
 	Another in the group may know, and if none do the reply still comes back
 	for `zone_step` to read the rcode off and call the chain unavailable.
 
-	`s.group` rather than `route_group`, deliberately, and this is the one place
-	in the server where a name with a route does not follow it. The route points
-	at a local authority for the zone, and a local authority answers questions
-	about its own zone out of its own data: a router authoritative for
-	`home.arpa.` answers `home.arpa. DS` with an unsigned NODATA rather than
-	forwarding to `arpa.`, where the signed proof that the delegation carries no
-	DS is the only copy there is. That answer breaks the chain instead of
-	completing it - the failure of issue #194, rebuilt by a different road. The
-	default group is the one that can reach the public parent, so the chain walk
-	always goes there. See `routes.odin`.
+	`s.group` rather than `route_group`, deliberately: no lookup this server makes
+	on its own account follows a route, whatever the name or the type. The
+	client's own question does follow one, with the single exception `route_group`
+	carves out for a `DS` at a route's apex - the same argument as this one
+	reached from the other side, and the reason the two now agree rather than only
+	this one being right. The route points at a local authority for the zone, and
+	a local authority answers questions about its own zone out of its own data: a
+	router authoritative for `home.arpa.` answers `home.arpa. DS` with an unsigned
+	NODATA rather than forwarding to `arpa.`, where the signed proof that the
+	delegation carries no DS is the only copy there is. That answer breaks the
+	chain instead of completing it - the failure of issue #194, rebuilt by a
+	different road. The default group is the one that can reach the public
+	parent, so the chain walk always goes there. See `routes.odin`.
 
 	Nothing is lost by it: a routed zone is served insecure anyway, so the walk
 	is not run for its names at all unless the operator anchored the zone, and
