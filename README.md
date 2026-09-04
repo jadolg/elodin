@@ -383,6 +383,17 @@ client that the local authority cannot. Anything else goes back on the route:
   on, does not take the chain out from under a zone whose own authority is
   answering.
 
+"No data" is also what a parent says about a name that sits in its own zone
+without being a delegation — `corp.example.com` published there as an A record,
+or existing because `vpn.corp.example.com` is public. elodin does not tell that
+apart from an insecure delegation (it would have to read the NS bit out of the
+NSEC/NSEC3 bitmap), and passes the proof on either way. For that case the client
+is right to act on it: the public tree does cover those names with signed data,
+so the local server's unsigned answers below them are bogus, and the zone
+resolved before only because the local NODATA hid the parent's proof. Anchor the
+zone with [`trust_anchors`](#dnssec), or do not route a name the public tree
+publishes.
+
 A reply that says nothing about the name — SERVFAIL, REFUSED — counts as no
 answer here rather than as an answer to pass on, which is a departure from how
 every other rcode is handled: for a question about a *delegation*, only NOERROR

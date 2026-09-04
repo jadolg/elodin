@@ -1037,7 +1037,10 @@ resolve_query :: proc(
 	parent together, and then `route_group` has already sent this question to the
 	route's own group: asking it again puts the same question to the same servers
 	for the same answer, and what came back is the route's own word rather than
-	an outside claim about it.
+	an outside claim about it. Pointer equality, so what it catches is one entry
+	covering both - two entries naming the same servers are two `Group` values
+	and this does not see through them, which costs that operator one wasted
+	exchange and nothing else.
 
 	`forwarded` is safe to send twice: `attach_cookie` builds each upstream's
 	copy in its own buffer, so nothing about the first exchange is left in this
@@ -1437,8 +1440,21 @@ resolve_query :: proc(
 			So it goes unstored and the next query asks again, which is what the
 			whole-message version of this - `answer-unreadable` above - already
 			does.
+
+			`unproven_apex_ds` is read here as well as at the store below, and for
+			the reason given there: an apex `DS` the route answered in the
+			parent's place, with nothing established about the delegation, is
+			served and not kept. A verdict stamped on those bytes is a verdict
+			about an answer nobody checked, and the entry carrying it would
+			answer the next client without the parent ever being asked again -
+			which is the one thing that reading is meant to prevent. One apex per
+			routed zone is also not the case the memoisation above was written
+			for.
 			*/
-			if s.cfg.cache.enabled && have_decoded && cloak_verdict_worth_keeping(verdict) {
+			if s.cfg.cache.enabled &&
+			   have_decoded &&
+			   !unproven_apex_ds &&
+			   cloak_verdict_worth_keeping(verdict) {
 				cache.put(s.answers, key, resp, decoded, generation, u8(verdict))
 			}
 			return out, cloak_outcome(verdict), true
