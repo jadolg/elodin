@@ -830,11 +830,18 @@ agree: the length-prefixed ones end it, DoH answers 429 and keeps it - see
 `serve_doh_request`. An operator reading "closing the connection" for a refusal
 that closed nothing would go looking for a disconnection that never happened, so
 the caller says which it was rather than the line assuming.
+
+The setting is named with the caveat `report_conn_rate_limit` carries, and for
+its reason: since `server.rate_limit.overrides` exists, the figure that refused
+this client is the top-level one only where no entry names its network. An
+operator sent to a line that is not the one refusing them is the mistake the
+override lines at startup exist to prevent, and a message that only knows about
+the top of the file would reintroduce it here.
 */
 @(private)
 report_rate_limited :: proc(client: string, proto: Protocol, closing: bool) {
 	logx.debugf(
-		"%s: %s from %s, its prefix is over server.rate_limit.responses_per_second",
+		"%s: %s from %s, its prefix is over server.rate_limit.responses_per_second - or, where server.rate_limit.overrides names this client's network, over that entry's figure",
 		proto_name(proto),
 		"closing the connection" if closing else "refusing a query",
 		client,
@@ -1047,7 +1054,7 @@ report_conn_rate_limit :: proc(client: net.Endpoint, proto: Protocol, rate: int)
 		rate,
 	)
 	logx.warnf(
-		"a client that only opens connections asks nothing, so it reaches neither response budget however fast it does it - and on DoT and DoH each one costs a TLS handshake; opening one is therefore charged to the same per-prefix figure as an answer. Raise server.rate_limit.responses_per_second if this client network should be able to reconnect faster, and put a per-source connection rate limit in front of a publicly reachable instance. These are counted as conn_rate_limited= in the stats line, and further ones are logged at debug level",
+		"a client that only opens connections asks nothing, so it reaches neither response budget however fast it does it - and on DoT and DoH each one costs a TLS handshake; opening one is therefore charged to the same per-prefix figure as an answer. Raise server.rate_limit.responses_per_second - or, where server.rate_limit.overrides names this client's network, the figure above is that entry's and the entry is what to raise - if this client network should be able to reconnect faster, and put a per-source connection rate limit in front of a publicly reachable instance. These are counted as conn_rate_limited= in the stats line, and further ones are logged at debug level",
 	)
 }
 
@@ -1479,7 +1486,14 @@ accept_loop :: proc(data: rawptr) {
 		refused.
 		*/
 		if !conn_rate_check(ctx.server.limiter, client, time.tick_now()) {
-			report_conn_rate_limit(client, ctx.proto, ctx.server.cfg.server.rate_limit.responses_per_second)
+			// The figure this client's own network is held to, which is the
+			// top-level one only where no override names it - see
+			// `prefix_response_budget`.
+			report_conn_rate_limit(
+				client,
+				ctx.proto,
+				prefix_response_budget(ctx.server.limiter, client.address),
+			)
 			net.close(client_socket)
 			continue
 		}

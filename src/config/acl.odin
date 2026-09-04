@@ -177,6 +177,43 @@ prefix_list_contains :: proc(prefixes: []Prefix, addr: [16]u8, v6: bool) -> bool
 }
 
 /*
+Which prefix in `prefixes` claims `address`, taking the most specific of them.
+
+`allow_from` asks only whether *some* entry matches, and answers with the first
+it finds, because every entry there means the same thing. A list that carries a
+figure per entry cannot do that: an operator who writes `10.0.0.0/8` beside
+`10.1.2.0/24` means the /24's figure for the clients inside it and the /8's for
+everybody else, which is how every routing table and every ACL they have met
+behaves. So this answers with the longest match rather than the first, and the
+order the entries were written in decides nothing.
+
+Ties cannot arise. Two entries of the same length either differ somewhere in the
+address, in which case at most one of them contains it, or they are the same
+network written twice - which the loader refuses, so a duplicate is a startup
+error rather than a silent choice between two figures.
+
+Normalised through `address_bytes` like every other source-side check in this
+file, so a v4-mapped client arriving on a `::` listener matches an IPv4 entry.
+One procedure for the whole package, deliberately - see `unmap_bytes`.
+*/
+prefix_match :: proc(prefixes: []Prefix, address: net.Address) -> (index: int, found: bool) {
+	if len(prefixes) == 0 || address == nil {
+		return -1, false
+	}
+	bytes, v6 := address_bytes(address)
+	best, best_bits := -1, -1
+	for p, i in prefixes {
+		if p.v6 != v6 || !prefix_contains(p, bytes) {
+			continue
+		}
+		if int(p.bits) > best_bits {
+			best, best_bits = i, int(p.bits)
+		}
+	}
+	return best, best >= 0
+}
+
+/*
 Read one entry of `server.allow_from`.
 
 Accepts `10.0.0.0/8`, `::1/128` and a bare address, which is taken as the single

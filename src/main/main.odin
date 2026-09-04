@@ -490,6 +490,21 @@ main :: proc() {
 				server.connection_limits_line(cfg.server.max_connections, cfg.server.max_connections_per_prefix),
 			)
 		}
+		/*
+		The networks with budgets of their own, in the words the startup log uses.
+
+		Here because this is where a wrong entry is cheapest to find. Nothing else
+		says which prefix a client will be accounted on - the counters are not
+		labelled per prefix, deliberately - so an entry that does not match the
+		clients it was written for shows up in these lines and in no number
+		anywhere. An operator reads `--check` before restarting, which is before
+		the mistake is serving anybody.
+		*/
+		if cfg.server.rate_limit.enabled {
+			for line in server.rate_limit_override_lines(cfg.server.rate_limit.overrides, context.temp_allocator) {
+				fmt.printfln("  %s", line)
+			}
+		}
 		for rule in misrouted {
 			fmt.printfln("  warning: %s", route_rule_warning(rule, context.temp_allocator))
 		}

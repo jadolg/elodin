@@ -36,13 +36,20 @@ config_rate_limit :: proc(
 	// `::` for the case that needs both families on one port; loopback otherwise,
 	// so the rest of the suite binds no more than it is asking about.
 	udp_address := "127.0.0.1",
+	// `warn` for every case that only reads answers, which is all of them but
+	// the one asserting a startup line: what the limiter was configured with is
+	// reported at `info`, and the rest of the suite has no use for those lines
+	// or for the other dozen a start writes at that level. A refused datagram
+	// logs nothing at any level short of debug, so this is about what a failing
+	// case has to be read out of and not about the volume a flood produces.
+	log_level := "warn",
 ) -> string {
 	tcp := "{ enabled: false }"
 	if tcp_port > 0 {
 		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port)
 	}
 	return fmt.tprintf(
-		`log: {{ level: warn }}
+		`log: {{ level: %s }}
 listeners:
   udp: {{ enabled: true, address: "%s", port: %d }}
   tcp: %s
@@ -60,6 +67,7 @@ upstream:
 cache: {{ enabled: true, max_entries: 100 }}
 blocking: {{ enabled: false }}
 `,
+		log_level,
 		udp_address,
 		udp_port,
 		tcp,
@@ -406,6 +414,116 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 				r,
 				answer.ok,
 				"a TCP query was refused after a datagram flood spent the prefix's UDP budget",
+			)
+		}
+	}
+	end_case(r)
+
+	/*
+	A network named in `overrides` is answered out of its own figure.
+
+	The budget is kept per /24 and per /64, which means one figure has to serve
+	two incompatible meanings of "a client": a household on a LAN, and thousands
+	of subscribers behind carrier-grade NAT on the internet. This is the setting
+	that lets an operator say which a given network is.
+
+	The pair below is the same flood at the same tiny default, against a server
+	that names loopback and one that does not. `127.0.0.0/8` is the entry, since
+	every client this suite has is on loopback and a /8 is coarser than the /24
+	the budgets are accounted per - so the case can show an override reaching a
+	real client through the running binary, which is the half the unit tests
+	cannot reach. Which *other* prefixes keep the default is asserted in
+	`src/server/ratelimit_test.odin`, where source addresses can be chosen
+	freely.
+	*/
+	start_case(r, "rate limit: a network named in overrides is answered out of its own budget")
+	{
+		// Two a second is a burst of four, so the default is reached almost
+		// immediately and the override's 200 is not reached at all by QUERIES.
+		TINY :: 2
+		WIDE :: 200
+
+		udp_port := next_port(r)
+		limited, lok := start_server(
+			r,
+			Server_Options {
+				config = config_rate_limit(
+					udp_port,
+					upstream_port,
+					fmt.tprintf("enabled: true, responses_per_second: %d, slip: 0", TINY),
+				),
+				udp_port = udp_port,
+			},
+		)
+		floor := 0
+		if check(r, lok, "the server on the default alone did not start") {
+			defer stop_server(&limited)
+			res := udp_flood(udp_port, query, QUERIES)
+			floor = res.answered
+			// The burst plus a second or so of refill, as the arm above it reads.
+			check(
+				r,
+				floor <= TINY * 2 + TINY * 2,
+				"%d of %d answered at %d responses/s, so the default was not the bound",
+				floor,
+				QUERIES,
+				TINY,
+			)
+		}
+
+		override_port := next_port(r)
+		named, nok := start_server(
+			r,
+			Server_Options {
+				config = config_rate_limit(
+					override_port,
+					upstream_port,
+					fmt.tprintf(
+						"enabled: true, responses_per_second: %d, slip: 0, overrides: [{{ prefix: 127.0.0.0/8, responses_per_second: %d }}]",
+						TINY,
+						WIDE,
+					),
+					// So the startup line naming the override is written.
+					log_level = "info",
+				),
+				udp_port = override_port,
+			},
+		)
+		if check(r, nok, "the server with an override did not start") {
+			defer stop_server(&named)
+			res := udp_flood(override_port, query, QUERIES)
+			/*
+			Read against the run above rather than against `QUERIES`: what the
+			case claims is that naming the network raised its budget, and a
+			figure that happened to equal the whole flood would say the same
+			thing less clearly. The mock answers after 20 ms, so how much of a
+			200-query flood arrives inside the drain is the runner's business and
+			not the limiter's.
+			*/
+			check(
+				r,
+				res.answered > floor,
+				"a network named in overrides was answered %d of %d, no better than the %d the default allowed",
+				res.answered,
+				QUERIES,
+				floor,
+			)
+			/*
+			And the operator can see which networks are not on the default.
+
+			The figure is in the needle rather than the network alone: the
+			default `server.allow_from` starts with `127.0.0.0/8`, and
+			`allow_from_line` prints it at `info` on every start - so a case
+			looking for the network on its own would pass with the override
+			never reported at all.
+			*/
+			reported := fmt.tprintf("127.0.0.0/8: %d responses/s", WIDE)
+			check(
+				r,
+				log_contains(&named, reported),
+				"the override was never reported at startup (looking for %q); log:\n%s",
+				reported,
+				read_log(&named),
 			)
 		}
 	}

@@ -411,6 +411,233 @@ test_rate_limit_settings_are_checked :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+// A configuration whose `server.rate_limit.overrides` is `body`.
+@(private = "file")
+with_overrides :: proc(body: string) -> string {
+	return fmt.tprintf(
+		"upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    responses_per_second: 500\n    slip: 2\n    overrides:\n%s",
+		body,
+	)
+}
+
+/*
+An override is read into the network and the figures it names.
+
+The parse, and the two things about it worth pinning: the prefix goes through the
+parser `allow_from` uses, and an entry that says nothing about `slip` inherits
+the figure above it rather than defaulting to 0 - which would be "truncate
+nothing", a setting the operator did not ask for and the opposite of what the
+file says two lines up.
+*/
+@(test)
+test_rate_limit_overrides_are_read :: proc(t: ^testing.T) {
+	src := with_overrides(
+		"      - { prefix: 198.51.100.0/24, responses_per_second: 5000, slip: 0 }\n      - { prefix: \"2001:db8::/32\", responses_per_second: 50 }\n",
+	)
+	cfg, err := load_string(src, context.temp_allocator)
+	if e, has := err.?; has {
+		testing.expectf(t, false, "a valid pair of overrides was rejected: %v", e.messages)
+		return
+	}
+	o := cfg.server.rate_limit.overrides
+	if !testing.expect_value(t, len(o), 2) {
+		return
+	}
+
+	testing.expect_value(t, o[0].responses_per_second, 5000)
+	testing.expect_value(t, o[0].slip, 0)
+	testing.expect_value(t, o[0].prefix.bits, u8(24))
+	testing.expect(t, !o[0].prefix.v6, "an IPv4 network was read as IPv6")
+
+	testing.expect_value(t, o[1].responses_per_second, 50)
+	// Not named, so inherited from `slip: 2` above rather than left at 0.
+	testing.expect_value(t, o[1].slip, 2)
+	testing.expect_value(t, o[1].prefix.bits, u8(32))
+	testing.expect(t, o[1].prefix.v6, "an IPv6 network was read as IPv4")
+
+	free_all(context.temp_allocator)
+}
+
+/*
+Every way an override can be wrong is a startup error rather than a default
+quietly applied.
+
+The one that matters most is the network finer than the accounting. A /32 is what
+somebody thinking about a single client reaches for, and the budgets are kept per
+/24 - so it could only ever be applied to the whole /24 around it, giving 256
+addresses a figure that was written for one. That is a mistake only measurement
+would find, which is why it is refused with a message naming what to write
+instead.
+*/
+@(test)
+test_rate_limit_overrides_are_checked :: proc(t: ^testing.T) {
+	Bad :: struct {
+		body: string,
+		what: string,
+	}
+	cases := []Bad {
+		{"      - { responses_per_second: 5000 }\n", "an override with no prefix"},
+		/*
+		The network on its own, which is what an `allow_from` entry looks like
+		and so the shorthand this setting invites. A scalar answers nil to every
+		key, so read through the missing-key branch it becomes "this entry does
+		not name a network" - said to an operator looking straight at the
+		network they wrote. The message has to be about the shape.
+		*/
+		{"      - 198.51.100.0/24\n", "a network written on its own rather than as an entry"},
+		{"      - { prefix: not-a-network, responses_per_second: 5000 }\n", "an unparseable prefix"},
+		{"      - { prefix: 198.51.100.5/25, responses_per_second: 5000 }\n", "an IPv4 network finer than /24"},
+		{"      - { prefix: \"2001:db8::1/128\", responses_per_second: 50 }\n", "an IPv6 network finer than /64"},
+		{"      - { prefix: 198.51.100.0/24 }\n", "an override with no figure of its own"},
+		{"      - { prefix: 198.51.100.0/24, responses_per_second: 0 }\n", "a budget of zero"},
+		{"      - { prefix: 198.51.100.0/24, responses_per_second: 5000, slip: -2 }\n", "a negative slip"},
+		// -1 in particular, which is the loader's own marker for an entry that
+		// said nothing about `slip`. Read as silence it would inherit the figure
+		// above without a word, while `slip: -1` at the top level is refused.
+		{"      - { prefix: 198.51.100.0/24, responses_per_second: 5000, slip: -1 }\n", "a slip of minus one"},
+		{
+			"      - { prefix: 198.51.100.0/24, responses_per_second: 5000 }\n      - { prefix: 198.51.100.0/24, responses_per_second: 50 }\n",
+			"the same network twice",
+		},
+		/*
+		And the entries written without a `-` in front of them, which is a
+		mapping where a list belongs and the commonest way to write this
+		setting wrong. `yaml.items` answers nil to that exactly as it does to
+		`overrides: []`, so read off the item count it would be a file that
+		passes `--check`, starts clean, names no network in the log and puts
+		every prefix back on the default.
+		*/
+		{
+			"      prefix: 198.51.100.0/24\n      responses_per_second: 5000\n",
+			"the entries written as a mapping rather than a list",
+		},
+	}
+	for c in cases {
+		_, err := load_string(with_overrides(c.body), context.temp_allocator)
+		e, has := err.?
+		if !testing.expectf(t, has, "%s was accepted", c.what) {
+			continue
+		}
+		/*
+		And the message reached the operator whole. Every one of these is a
+		`printf` format, so a literal `{` or `%` written into one renders as
+		`%!(MISSING ARGUMENT)` or `%!(NO VERB)` and eats the text around it - a
+		mistake nothing else here would catch, since a garbled message is still
+		an error and this loop only asked whether there was one. The one that
+		matters most is the entry written without its `-`, whose message carries
+		an example of the shape a list should have.
+		*/
+		for m in e.messages {
+			testing.expectf(
+				t,
+				!strings.contains(m, "%!"),
+				"the message for %s did not render: %s",
+				c.what,
+				m,
+			)
+		}
+	}
+
+	/*
+	And the network written on its own is told about its shape rather than about
+	a line that is in the file.
+
+	Asserted on the message and not only on there being one, because the loop
+	above passes either way: "missing prefix" is an error too, and it is the
+	wrong one - it sends an operator looking for the network they can already
+	see. This is the one case here where the text is the fix.
+	*/
+	bare := with_overrides("      - 198.51.100.0/24\n")
+	_, berr := load_string(bare, context.temp_allocator)
+	if e, has := berr.?; has {
+		for m in e.messages {
+			testing.expectf(
+				t,
+				!strings.contains(m, "missing prefix"),
+				"a network written on its own was reported as a missing key: %s",
+				m,
+			)
+		}
+	}
+
+	// And overrides beside a limiter that is switched off, which is an operator
+	// configuring budgets for a server that will not keep any.
+	disabled := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    enabled: false\n    overrides:\n      - { prefix: 198.51.100.0/24, responses_per_second: 5000 }\n"
+	_, derr := load_string(disabled, context.temp_allocator)
+	_, dhas := derr.?
+	testing.expect(t, dhas, "overrides were accepted with the limiter switched off")
+
+	free_all(context.temp_allocator)
+}
+
+/*
+A /24 written with host bits set is the network, as `allow_from` reads it.
+
+`parse_prefix` masks rather than refusing, which is what BIND and Unbound do with
+the same input, so `198.51.100.7/24` is the same entry as `198.51.100.0/24` and
+not a /32 in disguise. Worth its own case because the length check sits right
+beside it: an operator who wrote the first form must not be told to name a
+network they had already named.
+*/
+@(test)
+test_an_override_prefix_is_masked_not_refused :: proc(t: ^testing.T) {
+	src := with_overrides("      - { prefix: 198.51.100.7/24, responses_per_second: 5000 }\n")
+	cfg, err := load_string(src, context.temp_allocator)
+	if e, has := err.?; has {
+		testing.expectf(t, false, "a /24 written with host bits was rejected: %v", e.messages)
+		return
+	}
+	o := cfg.server.rate_limit.overrides
+	if !testing.expect_value(t, len(o), 1) {
+		return
+	}
+	testing.expect_value(t, o[0].prefix.bits, u8(24))
+	testing.expect_value(t, o[0].prefix.addr[3], u8(0))
+	free_all(context.temp_allocator)
+}
+
+/*
+The most specific entry claims an address, whatever order the file lists them in.
+
+`prefix_match` is what the limiter resolves a prefix's figures through, so this
+is the arithmetic behind "the /24 inside the /8 gets the /24's figure". Written
+widest-first here, so a first-match implementation passes the /8 and fails.
+*/
+@(test)
+test_prefix_match_takes_the_most_specific :: proc(t: ^testing.T) {
+	wide, _ := parse_prefix("10.0.0.0/8")
+	narrow, _ := parse_prefix("10.1.2.0/24")
+	six, _ := parse_prefix("2001:db8::/32")
+	list := []Prefix{wide, narrow, six}
+
+	inside, ok := prefix_match(list, net.Address(net.IP4_Address{10, 1, 2, 3}))
+	testing.expect(t, ok, "an address inside both entries matched neither")
+	testing.expect_value(t, inside, 1)
+
+	elsewhere, eok := prefix_match(list, net.Address(net.IP4_Address{10, 9, 9, 9}))
+	testing.expect(t, eok, "an address inside the /8 matched nothing")
+	testing.expect_value(t, elsewhere, 0)
+
+	_, none := prefix_match(list, net.Address(net.IP4_Address{192, 0, 2, 1}))
+	testing.expect(t, !none, "an address outside every entry matched one")
+
+	// The families do not reach each other, and a v4-mapped address is IPv4.
+	v6addr := net.IP6_Address{0x2001, 0x0db8, 0, 0, 0, 0, 0, 1}
+	sixth, sok := prefix_match(list, net.Address(v6addr))
+	testing.expect(t, sok, "an IPv6 address inside the /32 matched nothing")
+	testing.expect_value(t, sixth, 2)
+
+	m := net.IP6_Address{0, 0, 0, 0, 0, 0xffff, 0x0a01, 0x0203}
+	mapped, mok := prefix_match(list, net.Address(m))
+	testing.expect(t, mok, "a v4-mapped address matched no IPv4 entry")
+	testing.expect_value(t, mapped, 1)
+
+	// An empty list claims nothing, which is what every deployment that
+	// configures no override asks of this.
+	_, empty := prefix_match(nil, net.Address(net.IP4_Address{10, 1, 2, 3}))
+	testing.expect(t, !empty, "an empty list claimed an address")
+}
+
 @(test)
 test_tls_listener_requires_cert :: proc(t: ^testing.T) {
 	src := "upstream:\n  servers: [1.1.1.1]\nlisteners:\n  dot:\n    enabled: true\n"

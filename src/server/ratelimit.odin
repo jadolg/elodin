@@ -2,10 +2,12 @@ package server
 
 import "core:crypto"
 import "core:crypto/siphash"
+import "core:fmt"
 import "core:mem"
 import "core:net"
 import "core:sync"
 import "core:time"
+import "elodin:config"
 import "elodin:logx"
 
 /*
@@ -250,6 +252,21 @@ thing an operator can ask for.
 RRL_SLIP_SHARE :: 8
 
 /*
+How many networks may be given figures of their own.
+
+`Rate_Bucket.tier` is one byte, chosen because that is what the bucket's padding
+had going spare - see there - so the figure is what a byte can index beside the
+default. It is stated in `config` because the loader is what enforces it: a file
+that names more is a startup error rather than a server silently applying the
+default to whatever fell off the end. The assertion below is what keeps the two
+from drifting, since the reason for the number lives here and the number itself
+does not.
+*/
+RRL_MAX_OVERRIDES :: config.MAX_RATE_LIMIT_OVERRIDES
+
+#assert(RRL_MAX_OVERRIDES <= int(max(u8)))
+
+/*
 Which of a prefix's four budgets something is charged to.
 
 The separation is the point, and the note at the top of this file is where the
@@ -313,21 +330,70 @@ Rate_Bucket :: struct {
 	`slip` an operator asked for while the pool decides how many of those pass.
 	*/
 	over:    u32,
+	/*
+	Which set of figures this bucket is accounted against - an index into
+	`Rate_Limiter.tiers`, 0 being the configured defaults.
+
+	Resolved once, when the bucket is claimed, and not per charge: the override
+	list is a walk over the operator's networks, and the path this is on is the
+	one every datagram takes. A bucket keeps its tier for as long as it keeps its
+	key, and a takeover re-resolves it for the prefix taking over.
+
+	Free in this struct's padding. `key`, `tokens`, `last_ns` and `over` come to
+	52 bytes and the alignment rounds to 56 either way, so the table is the same
+	896 KB it was before there were tiers - which is the reason this is an index
+	rather than a copy of the figures.
+
+	A collision therefore shares a tier as well as a budget: two prefixes in one
+	bucket are accounted against whichever of them claimed it. That is the same
+	trade `RRL_BUCKETS` already documents, one step further - and it is not
+	attacker-reachable, since the hash is keyed with process entropy, so nobody
+	outside this process can arrange to collide with a network that has a large
+	figure.
+	*/
+	tier:    u8,
+}
+
+/*
+One set of figures, and everything derived from it.
+
+The limiter holds an array of these rather than one set: `tiers[0]` is what
+`server.rate_limit.responses_per_second` and `slip` say, and each configured
+override adds one. A bucket names its own with `Rate_Bucket.tier`.
+
+Kept as a set per tier rather than as a rate plus arithmetic, because `capacity`
+and the `Slip` rate are both derived from `responses_per_second` and deriving
+them per charge would be the same two flops on every datagram forever.
+*/
+@(private)
+Rate_Tier :: struct {
+	/*
+	Tokens per second, and the most that may be banked, one of each per pool.
+
+	`Datagram`, `Stream` and `Connection` all get this tier's
+	`responses_per_second` - the multiplication the file's note accepts, and the
+	whole figure for `Connection` because a connection is what a query is asked
+	over; `Slip` gets a fraction of it, for the reason in `RRL_SLIP_SHARE`.
+	*/
+	rate:     [Rate_Class]f64,
+	capacity: [Rate_Class]f64,
+	slip:     int,
 }
 
 Rate_Limiter :: struct {
 	buckets:   []Rate_Bucket,
 	/*
-	Tokens per second, and the most that may be banked, one of each per pool.
+	The configured figures, and one entry per override. `tiers[0]` is the
+	default; `tiers[i+1]` belongs to `prefixes[i]`.
 
-	`Datagram`, `Stream` and `Connection` all get `responses_per_second` - the
-	multiplication the file's note accepts, and the whole figure for `Connection`
-	because a connection is what a query is asked over; `Slip` gets a fraction of
-	it, for the reason in `RRL_SLIP_SHARE`.
+	Two parallel slices rather than a slice of pairs, so that resolving a tier is
+	one call to `config.prefix_match` over exactly the bytes it compares and
+	nothing else - the normalisation a source-side check needs lives in that
+	procedure, and having one caller of it here is what keeps this file from
+	growing a second opinion about what a v4-mapped client is.
 	*/
-	rate:      [Rate_Class]f64,
-	capacity:  [Rate_Class]f64,
-	slip:      int,
+	tiers:     []Rate_Tier,
+	prefixes:  []config.Prefix,
 	/*
 	Keyed with process entropy, so which prefixes share a bucket is not
 	something an attacker can work out and use.
@@ -394,27 +460,66 @@ Rate_Limiter :: struct {
 	conn_limited: u64,
 }
 
+/*
+The figures one tier is built out of.
+
+Split from `make_rate_limiter` because it is now done once per configured
+override as well as once for the defaults, and every one of them has to be built
+the same way: a tier that derived its `Slip` rate or its capacity differently
+from the others would be a prefix whose budget does not mean what the same
+figure means everywhere else.
+*/
+@(private)
+make_rate_tier :: proc(responses_per_second: int, slip: int) -> (t: Rate_Tier) {
+	configured := max(responses_per_second, 1)
+	rps := f64(configured)
+	t.rate[.Datagram] = rps
+	t.rate[.Stream] = rps
+	t.rate[.Connection] = rps
+	// Divided as integers, so the slip pool refills at the whole number the
+	// startup line prints and the documentation quotes rather than at a figure
+	// an eighth of a token above it.
+	t.rate[.Slip] = f64(max(configured / RRL_SLIP_SHARE, 1))
+	for class in Rate_Class {
+		t.capacity[class] = t.rate[class] * RRL_BURST_SECONDS
+	}
+	t.slip = max(slip, 0)
+	return
+}
+
+/*
+`overrides` defaults to none, which is every caller that does not configure any -
+the tests included. Tier 0 is always the pair passed here, so a limiter with no
+overrides behaves exactly as it did before there were tiers.
+*/
 make_rate_limiter :: proc(
 	responses_per_second: int,
 	slip: int,
+	overrides: []config.Rate_Limit_Override = nil,
 	allocator := context.allocator,
 ) -> ^Rate_Limiter {
 	r := new(Rate_Limiter, allocator)
 	r.allocator = allocator
 	r.buckets = make([]Rate_Bucket, RRL_BUCKETS, allocator)
-	configured := max(responses_per_second, 1)
-	rps := f64(configured)
-	r.rate[.Datagram] = rps
-	r.rate[.Stream] = rps
-	r.rate[.Connection] = rps
-	// Divided as integers, so the slip pool refills at the whole number the
-	// startup line prints and the documentation quotes rather than at a figure
-	// an eighth of a token above it.
-	r.rate[.Slip] = f64(max(configured / RRL_SLIP_SHARE, 1))
-	for class in Rate_Class {
-		r.capacity[class] = r.rate[class] * RRL_BURST_SECONDS
+
+	/*
+	One tier for the defaults and one per override, in the order they were
+	configured, so `prefixes[i]` and `tiers[i + 1]` are the same entry.
+
+	Capped at what `Rate_Bucket.tier` can name. A file with more overrides than
+	that is refused at load rather than truncated here - `RRL_MAX_OVERRIDES` is
+	where that limit is stated - so the slice below is only ever as long as it
+	can index.
+	*/
+	kept := min(len(overrides), RRL_MAX_OVERRIDES)
+	r.tiers = make([]Rate_Tier, kept + 1, allocator)
+	r.prefixes = make([]config.Prefix, kept, allocator)
+	r.tiers[0] = make_rate_tier(responses_per_second, slip)
+	for o, i in overrides[:kept] {
+		r.prefixes[i] = o.prefix
+		r.tiers[i + 1] = make_rate_tier(o.responses_per_second, o.slip)
 	}
-	r.slip = max(slip, 0)
+
 	crypto.rand_bytes(r.hash_key[:])
 	return r
 }
@@ -424,6 +529,8 @@ destroy_rate_limiter :: proc(r: ^Rate_Limiter) {
 		return
 	}
 	delete(r.buckets, r.allocator)
+	delete(r.tiers, r.allocator)
+	delete(r.prefixes, r.allocator)
 	free(r, r.allocator)
 }
 
@@ -443,15 +550,26 @@ forward to `now_ns`. The caller holds the lock.
 Every pool is refilled on every charge, whichever one is about to be spent: they
 accrue from the same instant, differing only in rate, so bringing the idle ones
 along costs a flop each and lets a single `last_ns` stand for the set.
+
+Which figures those rates are is the bucket's own, through `Rate_Bucket.tier`.
+Every reading below therefore goes through `tier`, and the two that matter are
+the takeover test and the claim: the test weighs what is in the bucket against
+the capacity of the prefix that *has* it, and the claim fills it to the capacity
+of the prefix taking it over. Read the other way round, a newcomer from a network
+with a large figure would find a small bucket "not yet refilled" and never take
+it, and a newcomer with a small figure would be handed a bucket filled past what
+it is entitled to.
 */
 @(private)
 rate_bucket :: proc(r: ^Rate_Limiter, client: net.Endpoint, now_ns: i64) -> ^Rate_Bucket {
 	key := prefix_key(r, client.address)
 	b := &r.buckets[key % RRL_BUCKETS]
+	tier := &r.tiers[b.tier]
 
 	// What each pool has accrued since any of them was last charged, read once:
 	// the collision check below weighs it and the refill afterwards spends it.
-	gained := elapsed_tokens(r, b.last_ns, now_ns)
+	// At the tier the bucket is on now, which is the one that has been accruing.
+	gained := elapsed_tokens(tier, b.last_ns, now_ns)
 
 	if b.key != key {
 		/*
@@ -472,7 +590,7 @@ rate_bucket :: proc(r: ^Rate_Limiter, client: net.Endpoint, now_ns: i64) -> ^Rat
 		refilled := true
 		if b.key != 0 {
 			for class in Rate_Class {
-				if b.tokens[class] + gained[class] < r.capacity[class] {
+				if b.tokens[class] + gained[class] < tier.capacity[class] {
 					refilled = false
 					break
 				}
@@ -480,8 +598,12 @@ rate_bucket :: proc(r: ^Rate_Limiter, client: net.Endpoint, now_ns: i64) -> ^Rat
 		}
 		if refilled {
 			b.key = key
+			// The newcomer's own figures, resolved here and nowhere on the
+			// charging path - see `Rate_Bucket.tier`.
+			b.tier = resolve_tier(r, client.address)
+			tier = &r.tiers[b.tier]
 			for class in Rate_Class {
-				b.tokens[class] = r.capacity[class]
+				b.tokens[class] = tier.capacity[class]
 				// Full as of now, so there is nothing left of the elapsed time
 				// to bring forward below.
 				gained[class] = 0
@@ -491,7 +613,7 @@ rate_bucket :: proc(r: ^Rate_Limiter, client: net.Endpoint, now_ns: i64) -> ^Rat
 	}
 
 	for class in Rate_Class {
-		b.tokens[class] = min(r.capacity[class], b.tokens[class] + gained[class])
+		b.tokens[class] = min(tier.capacity[class], b.tokens[class] + gained[class])
 	}
 	b.last_ns = now_ns
 	return b
@@ -532,7 +654,11 @@ rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) -> Ra
 	datagram may be answered that way and the pool says whether it is; a
 	candidate that finds the pool empty is dropped like the rest.
 	*/
-	if r.slip > 0 && int(b.over) % r.slip == 0 && b.tokens[.Slip] >= 1 {
+	// This prefix's own `slip`, not the file's: an override carries one, because a
+	// network given a large budget is usually a network an operator wants a
+	// different answer for when it goes over. See `Rate_Limit_Override`.
+	slip := r.tiers[b.tier].slip
+	if slip > 0 && int(b.over) % slip == 0 && b.tokens[.Slip] >= 1 {
 		b.tokens[.Slip] -= 1
 		sync.atomic_add(&r.slipped, 1)
 		return .Truncate
@@ -632,15 +758,68 @@ pools differ only in rate, so a division per pool would be the same division fou
 times - on the path every datagram takes, under the table lock.
 */
 @(private)
-elapsed_tokens :: proc(r: ^Rate_Limiter, last_ns, now_ns: i64) -> (gained: [Rate_Class]f64) {
+elapsed_tokens :: proc(tier: ^Rate_Tier, last_ns, now_ns: i64) -> (gained: [Rate_Class]f64) {
 	if last_ns == 0 || now_ns <= last_ns {
 		return
 	}
 	seconds := f64(now_ns - last_ns) / f64(time.Second)
 	for class in Rate_Class {
-		gained[class] = seconds * r.rate[class]
+		gained[class] = seconds * tier.rate[class]
 	}
 	return
+}
+
+/*
+Which tier `address` belongs to: an index into `Rate_Limiter.tiers`.
+
+0 unless an override claims it, and the most specific one where several do -
+`config.prefix_match` is what decides that, and is where the source-side
+normalisation lives, so a v4-mapped client matches an IPv4 entry here exactly as
+it does in `allow_from`.
+
+Called once per bucket claim and never per charge. It walks the operator's list,
+which is short but is a walk, and the charging path is the one every datagram
+takes - see `Rate_Bucket.tier`.
+*/
+@(private)
+resolve_tier :: proc(r: ^Rate_Limiter, address: net.Address) -> u8 {
+	if len(r.prefixes) == 0 {
+		return 0
+	}
+	if idx, found := config.prefix_match(r.prefixes, address); found {
+		return u8(idx + 1)
+	}
+	return 0
+}
+
+/*
+The per-prefix figure `address`'s own network is held to, for the lines that
+name one.
+
+`report_conn_rate_limit` quotes a number and tells an operator which setting to
+raise, and with figures per prefix that number is no longer whatever the top of
+the file says: a client inside an entry in `server.rate_limit.overrides` was
+refused at that entry's figure. Reading the top-level one there would send an
+operator to a line that is not the one refusing their client, which is the
+mistake the override lines at startup exist to prevent.
+
+The *configured* figure for the client's own network rather than the tier of the
+bucket it happened to land in: a bucket shared through a collision is accounted
+on whichever prefix claimed it, and that is a property of the table rather than
+of anything in the file an operator can edit.
+
+`tiers` and `prefixes` are written once in `make_rate_limiter` and never again,
+so no lock is needed here - unlike every other reader of a bucket. 0 with no
+limiter, which no caller reaches: a refusal to report comes from a budget, and a
+budget comes from a limiter.
+*/
+prefix_response_budget :: proc(r: ^Rate_Limiter, address: net.Address) -> int {
+	if r == nil {
+		return 0
+	}
+	// `Connection` because this is what the arrival budget refused; every class
+	// but `Slip` carries the whole figure anyway - see `Rate_Tier`.
+	return int(r.tiers[resolve_tier(r, address)].rate[.Connection])
 }
 
 /*
@@ -711,7 +890,7 @@ start_rate_limiter :: proc(s: ^Server) -> bool {
 	if !cfg.enabled {
 		return true
 	}
-	s.limiter = make_rate_limiter(cfg.responses_per_second, cfg.slip)
+	s.limiter = make_rate_limiter(cfg.responses_per_second, cfg.slip, cfg.overrides)
 	// The budgets are named in the line rather than left to the documentation: an
 	// operator reading `500` needs to know it is 500 datagrams, 500 queries on
 	// connections and 500 connections opened, not 500 between them - and that the
@@ -722,7 +901,7 @@ start_rate_limiter :: proc(s: ^Server) -> bool {
 			"rate limit: %d responses/s per client prefix (/24, /64), counted separately for datagrams, for queries on a connection and for connections opened; 1 in %d over the datagram budget answered truncated, up to %d truncated answers/s, and over a connection nothing is",
 			cfg.responses_per_second,
 			cfg.slip,
-			int(s.limiter.rate[.Slip]),
+			int(s.limiter.tiers[0].rate[.Slip]),
 		)
 	} else {
 		logx.infof(
@@ -730,7 +909,88 @@ start_rate_limiter :: proc(s: ^Server) -> bool {
 			cfg.responses_per_second,
 		)
 	}
+	// Out of the temp arena, which startup resets around this: the lines are read
+	// once and `--check` renders the same ones from the same procedure.
+	for line in rate_limit_override_lines(cfg.overrides, context.temp_allocator) {
+		logx.infof("%s", line)
+	}
 	return true
+}
+
+/*
+Which networks are not on the default, one line each, in the words both the
+startup log and `--check` say it in.
+
+Every one of these is a figure that appears nowhere else an operator can see it:
+the counters are not labelled per prefix (that would be cardinality a peer
+chooses - see `render_metrics`), so a scrape cannot say which tier a client was
+accounted on. Without these lines the only record that a network was configured
+differently is the file, and the commonest failure of a per-prefix setting is
+that the entry does not match the clients it was meant for.
+
+Returned rather than printed, for the reason `connection_limits_line` is: an
+operator reads `--check` before restarting, and that is the moment a wrong entry
+is cheapest to find. Two wordings of one fact drift apart, so there is one.
+
+Built out of `make_rate_tier`, which is the procedure the limiter itself derives
+a tier with - so what is printed is what will be charged because it is the same
+arithmetic on the same figures, and not because two places were kept in step by
+hand. The slip pool in particular is a fraction an operator did not write.
+
+One line each rather than a count, and the whole list rather than the first few,
+because the list is short by construction: `RRL_MAX_OVERRIDES` is the ceiling and
+an operator hand-writes a handful. A file that names 255 networks writes 255
+lines once, which is a diagnosis rather than a flood.
+*/
+rate_limit_override_lines :: proc(
+	overrides: []config.Rate_Limit_Override,
+	allocator := context.allocator,
+) -> []string {
+	if len(overrides) == 0 {
+		return nil
+	}
+	out := make([dynamic]string, 0, len(overrides) + 1, allocator)
+	// In the order they were configured, which is not the order they are applied
+	// in: where two of them contain a client the most specific decides. Said
+	// rather than implied, because a list printed in file order looks like a list
+	// of precedence and is not one.
+	append(
+		&out,
+		fmt.aprintf(
+			"rate limit: %d network(s) with figures of their own, listed as configured; where two contain a client the most specific decides:",
+			len(overrides),
+			allocator = allocator,
+		),
+	)
+	for o in overrides {
+		tier := make_rate_tier(o.responses_per_second, o.slip)
+		text := config.format_prefix(o.prefix, allocator)
+		defer delete(text, allocator)
+		if tier.slip > 0 {
+			append(
+				&out,
+				fmt.aprintf(
+					"rate limit: %s: %d responses/s, 1 in %d over the datagram budget answered truncated, up to %d truncated answers/s",
+					text,
+					int(tier.rate[.Datagram]),
+					tier.slip,
+					int(tier.rate[.Slip]),
+					allocator = allocator,
+				),
+			)
+			continue
+		}
+		append(
+			&out,
+			fmt.aprintf(
+				"rate limit: %s: %d responses/s, anything over that dropped",
+				text,
+				int(tier.rate[.Datagram]),
+				allocator = allocator,
+			),
+		)
+	}
+	return out[:]
 }
 
 stop_rate_limiter :: proc(s: ^Server) {
