@@ -213,7 +213,8 @@ Loki that is `| logfmt` and nothing else:
 
 Statistics go to the log every five minutes as `msg=stats`: `queries`,
 `blocked`, `cached`, `forwarded`, `failed`, `dropped`, `refused`,
-`conn_refused`, `conn_failed`, `limited`, `truncated`, `secure`, `bogus`,
+`conn_refused`, `conn_rate_limited`, `conn_failed`, `handshakes`, `limited`,
+`truncated`, `secure`, `bogus`,
 `rebind` and `special_use`, plus `cache_entries`, `cache_bytes`, `cache_hits`,
 `cache_withheld`, `cache_misses`, `cache_stale` and `cache_evictions`.
 `log.queries` adds one `msg=query` line per query. A query name is the one field
@@ -838,7 +839,7 @@ client told to retry has nowhere to retry to. Leave TCP on, or raise the ceiling
 server:
   rate_limit:
     enabled: true                 # on by default
-    responses_per_second: 500     # per client prefix (/24 or /64), and per transport class
+    responses_per_second: 500     # per client prefix (/24 or /64), and per budget: datagrams, queries on a connection, connections opened
     slip: 2                       # answer at most every 2nd query over the budget truncated; 0 drops them all
 ```
 
@@ -891,13 +892,44 @@ out.
 
 TCP, DoT and DoH are charged too, for the work behind an answer rather than for
 amplification — without that, a flood down a handful of long-lived connections is
-one the limiter never sees. **Two budgets per prefix, though, not one:**
-datagrams charge one and connections the other, each getting
-`responses_per_second`, and neither can be spent from the other's side, since a
-spoofed UDP flood naming a prefix would otherwise close the connections of the
-clients who actually live there. The cost is that a client willing to ask both
-ways can draw twice the figure, half of it only over a completed handshake.
-`src/server/ratelimit.odin` argues this out.
+one the limiter never sees. **Three budgets per prefix, though, not one:**
+datagrams charge one, queries read off a connection charge another, and opening a
+connection charges a third — each getting the whole of `responses_per_second`, and
+none of them spendable from another's side, since a spoofed UDP flood naming a
+prefix would otherwise close the connections of the clients who actually live
+there, or stop them opening one. The cost is that a client using every way in can
+draw three times the figure, two thirds of it only over a completed handshake from
+an address that is therefore real. `src/server/ratelimit.odin` argues this out.
+
+**Opening a connection is charged because arriving is the expensive part.** A
+client that dials, completes a TLS handshake and hangs up asks nothing, so no
+budget of *answers* ever saw it, and it holds each connection too briefly for
+[`max_connections_per_prefix`](#how-many-connections-one-client-may-hold) to
+notice — 32 such dialers drew 6,469 handshakes a second and 1.35 of four cores
+while `conn_refused` and `elodin_rate_limited_total` both read zero, and took 15
+points of answer rate and four times the latency from a DoT client in an unrelated
+prefix. With the budget the same load gets 461 handshakes a second and costs 0.23
+of a core, and that bystander loses 6 points instead of 15.
+`bench/results/2026-09-04-handshake-budget.md` is the before and after;
+`2026-09-03-handshake-floods.md` is where the load is described.
+
+The whole figure rather than a fraction of it, because a connection is the vehicle
+for a query: `dig +tcp`, a `curl` per lookup and every stub that does not keep a
+connection open spend one connection per answer, so a prefix entitled to 500
+queries over connections has to be able to open 500. A smaller connection budget
+would be a quiet reduction of the query budget for exactly the clients that
+reconnect. Refusals are counted as `conn_rate_limited=` in the stats line and
+`elodin_connections_rate_limited_total` on the endpoint, apart from
+`conn_refused=`, which is the connection *table* being full — arrival and occupancy
+are different problems with different settings behind them. Completed handshakes
+are `handshakes=` and `elodin_tls_handshakes_total`, which is the first counter
+here that says anything about what getting clients in the door costs.
+
+What it does not do is stop a botnet, and it does not bring that bystander back to
+its quiet baseline: refusing at the accept is cheap but not free, and a peer whose
+dials cost it nothing simply dials four times faster. **A publicly reachable
+instance wants a per-source connection rate limit in front of it** — see
+[below](#a-connection-rate-limit-in-front).
 
 `slip` is a UDP mechanism, so over-budget queries on a connection are refused
 instead: TCP and DoT closed, and over DoH — both HTTP/1.1 and HTTP/2 — answered
@@ -919,9 +951,10 @@ have the clients beside it dropped.
 for UDP. `cookies.require` is the sharper instrument for an attack actually under
 way.
 
-What none of this bounds is how much of the server one client *occupies*, since
-both budgets are spent by queries and a connection that asks nothing is free.
-That is the next section.
+What none of this bounds is how much of the server one client *occupies*. Every
+budget here is a rate — arriving, and asking — and a client that stays inside them
+can still hold every connection it was given for as long as it likes. That is the
+next section.
 
 ### How many connections one client may hold
 
@@ -932,12 +965,19 @@ server:
 ```
 
 `max_connections` is one budget for the whole server, and on its own it says
-nothing about how it is shared. Nothing else counted a client's connections
-either — [rate limiting](#rate-limiting) charges *queries*, so a client that
-opens connections and asks nothing on them spends no budget however many it
-holds, and `client_timeout` reclaiming an idle one after ten seconds is a delay
-rather than a limit to somebody willing to open another. So the answer to "how
-many of my 512 connections can one stranger have" was "all of them".
+nothing about how it is shared. Nothing else bounds how long a client keeps what
+it was given either — [rate limiting](#rate-limiting) charges opening a connection
+and charges the queries asked over it, and both are rates a client can stay inside
+while letting go of nothing, while `client_timeout` reclaiming an idle one after
+ten seconds is a delay rather than a limit to somebody willing to open another. So
+the answer to "how many of my 512 connections can one stranger have" was "all of
+them".
+
+The two bounds need each other. A share does not bound arrivals: a flood that
+holds each connection only for the length of a handshake never reaches 256 out of
+512, which is what the measurement in the previous section is about. An arrival
+budget does not bound occupancy: a client opening one connection a second and
+closing none fills any table inside any rate.
 
 `max_connections_per_prefix` is the share. It is counted against established
 connections, per /24 and per /64 — the same unit the response budget uses, so
@@ -979,6 +1019,73 @@ refuse — which is why a resolver whose table has been taken can look healthy o
 datagrams while every TCP, DoT and DoH client gets nothing.
 `bench/results/2026-09-03-connection-table-share.md` measures that, and the same
 load with a share in place.
+
+### A connection rate limit in front
+
+If this resolver is reachable from the internet, put a per-source limit on *new
+connections* in front of it — in nftables or iptables on the same host, or in
+whatever terminates TLS if something else does. Not instead of the two bounds
+above; as well as them.
+
+The reason is arithmetic. Everything elodin bounds, it bounds per /24 and per /64,
+because that is the granularity an attacker picks addresses within. An actor with
+addresses in *n* prefixes therefore has *n* copies of every figure here, and on
+IPv6 a routine allocation from a hosting provider or a tunnel broker is a /48 —
+65,536 /64s. And a refusal, though far cheaper than the handshake it refuses, is
+not free: with the arrival budget in place a flood of 32 dialers went from 6,469
+handshakes a second to 461, and from 1.35 of four cores to 0.23, but its *dial*
+rate rose from 6,469 to 28,485 a second because being refused had become cheap.
+The DoT bystander in that run went from 82% of its queries answered to 91%, where
+the quiet baseline is 97–98%. A packet filter is the only place that stops a peer
+from making this server refuse it.
+
+```
+# nftables: at most 10 new DNS connections a second per /24 and per /64,
+# bursting to 40. Keyed on the same prefixes elodin keys its own budgets on.
+table inet filter {
+  set conn_rate4 {
+    type ipv4_addr
+    flags dynamic, timeout
+    size 65535
+    timeout 1m
+  }
+  set conn_rate6 {
+    type ipv6_addr
+    flags dynamic, timeout
+    size 65535
+    timeout 1m
+  }
+  chain input {
+    type filter hook input priority filter
+    tcp dport { 53, 443, 853 } ct state new meta nfproto ipv4 \
+      add @conn_rate4 { ip saddr and 255.255.255.0 limit rate over 10/second burst 40 packets } \
+      counter drop
+    tcp dport { 53, 443, 853 } ct state new meta nfproto ipv6 \
+      add @conn_rate6 { ip6 saddr and ffff:ffff:ffff:ffff:: limit rate over 10/second burst 40 packets } \
+      counter drop
+  }
+}
+```
+
+Trim the port list to the listeners you actually expose — 853 for DoT, 443 for
+DoH, 53 for TCP — and check it with `nft --check --file` before loading it, since
+a rule in the `input` hook that is wrong about its ports can lock you out of the
+host.
+
+Size it above what your clients do and below what a flood does: a stub resolver
+opens one connection and keeps it, and even a large NAT reconnecting every device
+at once is a burst rather than a rate. Ten a second per prefix is generous for
+anything legitimate and two to three orders of magnitude under what a single host
+can offer. On a private network, remember that every device on `192.168.1.0/24` is
+one source to a rule like this, exactly as it is one client to
+`responses_per_second` — size the burst for the whole LAN, or leave this to the
+in-server budget, which is what a resolver that is not reachable from outside
+wants anyway.
+
+The figures behind this are in `bench/results/2026-09-04-handshake-budget.md` and
+`2026-09-03-handshake-floods.md`; `2026-09-03-udp-readers.md` reaches the same
+conclusion about datagram floods, where the equivalent advice is
+[`listeners.udp.readers`](#how-fast-datagrams-can-be-read) plus a filter.
 
 ### How fast datagrams can be read
 
@@ -1486,8 +1593,9 @@ the atomic it already lives in. There is no latency histogram and no per-name
 label, because both would mean measuring on the path being measured. The
 isolation is structural: one thread of its own, no work queued on either worker
 pool, no thread per connection — so nothing reaching this port can spend the
-budget `max_connections` keeps for clients — and one request per connection before
-closing, so a scraper holding a socket open cannot keep the next scrape out.
+budget `max_connections` keeps for clients, or the per-prefix arrival budget the
+DNS listeners charge — and one request per connection before closing, so a scraper
+holding a socket open cannot keep the next scrape out.
 
 It binds loopback rather than the `0.0.0.0` the DNS listeners use: nothing here
 is a secret in the way an answer is, but together these numbers describe a
@@ -1503,9 +1611,11 @@ as a warning at startup.
 | `elodin_queries_dropped_total` | counter | turned away before any work: the backlog was full, or the source could not be answered |
 | `elodin_queries_refused_total` | counter | turned away by `server.allow_from` |
 | `elodin_connections_refused_total` | counter | refused for want of a slot: `server.max_connections` full, or the client's prefix already holding its share |
+| `elodin_connections_rate_limited_total` | counter | refused because the prefix was opening connections faster than `rate_limit.responses_per_second` allows |
 | `elodin_connections_failed_total` | counter | refused because the OS would not start a thread |
 | `elodin_connections_active` / `_max` | gauge | connection threads in use, and what the limit allows |
 | `elodin_connections_max_per_prefix` | gauge | how many of those one client prefix may hold; equal to `_max` when there is no share |
+| `elodin_tls_handshakes_total` | counter | TLS handshakes completed on the DoT and DoH listeners |
 | `elodin_rate_limited_total` | counter | queries the rate limiter withheld an answer from |
 | `elodin_rate_limit_slipped_total` | counter | those answered truncated instead, to send a real client to TCP |
 | `elodin_dnssec_answers_total{result}` | counter | `secure` and `bogus` |
@@ -1635,19 +1745,21 @@ transports, orders of magnitude more CPU than answering on an established
 connection, and ECDSA P-256 costs about half what RSA-2048 does — which is why
 `mise run certs` generates ECDSA, and why you should use it in production too.
 
-**Nothing here bounds how often a client may ask for a handshake.** A response
-budget is spent by answers and the connection share by connections *held*, so a
-client that connects, handshakes and hangs up spends neither.
-`bench/results/2026-09-03-handshake-floods.md` measures one: 7,000 handshakes a
-second out of a 4-core machine, 205 µs of CPU each, 1.4 cores in total, with
-`conn_refused` at zero throughout because the shipped table was never reached. A
-DoT client already running its one connection at capacity lost 16 points of its
-answer rate and six times its latency; a client arriving during it was served
-every query. Tightening `max_connections_per_prefix` bounds the cost — a share of
-half a table cut the handshake rate by a third in that report — but it cannot be
-made into a limit on *arrivals* without limiting legitimate reconnection too. If
-you expose DoT or DoH to the internet, rate-limit connections per source in front
-of the resolver.
+**How often a client may ask for a handshake is bounded by the rate limiter, and
+only per prefix.** A response budget is spent by answers and the connection share
+by connections *held*, so a client that connects, handshakes and hangs up spent
+neither, and `bench/results/2026-09-03-handshake-floods.md` measures what that
+cost: 7,000 handshakes a second out of a 4-core machine, 205 µs of CPU each, 1.4
+cores in total, with `conn_refused` at zero throughout because the shipped table
+was never reached. A DoT client already running its one connection at capacity
+lost 16 points of its answer rate and six times its latency. So opening a
+connection is charged to the prefix's own budget now — see [rate
+limiting](#rate-limiting) — which on the shipped 500 held the same flood to 461
+handshakes a second and 0.23 of a core, and gave that DoT client back half of what
+it had lost. It is per prefix like everything else, and a refusal is cheap rather
+than free, so **if you expose DoT or DoH to the internet, rate-limit connections
+per source in front of the resolver as well**: see [a connection rate limit in
+front](#a-connection-rate-limit-in-front).
 
 Past `max_connections`, or past one client's share of it, DoT and DoH refuse
 cleanly during the handshake. Plain TCP cannot: the kernel completes the
@@ -1688,12 +1800,18 @@ size of the lists.
   that starts and does not remove it. A publicly reachable instance wants a packet
   filter in front of it. See [how fast datagrams can be
   read](#how-fast-datagrams-can-be-read) for the measured figure.
-- **No setting bounds the rate of TLS handshakes.** Both per-client bounds are
-  spent by something a handshake flood does not do — asking questions, or holding
-  a connection — so a client that only connects and hangs up is charged for
-  nothing while costing about 205 µs of CPU per handshake. Measured in
-  `bench/results/2026-09-03-handshake-floods.md`; see [Sizing](#sizing) for what
-  to do about it.
+- **The bound on TLS handshakes is per prefix, and a refusal is cheap rather than
+  free.** Opening a connection is charged to
+  `server.rate_limit.responses_per_second`, which held a 32-worker flood to 461
+  handshakes a second and 0.23 of four cores against 6,469 and 1.35 uncharged. But
+  it is keyed on the /24 and /64 like every other budget here, so an actor with
+  addresses in several prefixes has several copies of it, and the flood's *dial*
+  rate rose four and a half times once being refused was cheap — the DoT bystander
+  in that run recovers to 91% of its queries answered where the quiet baseline is
+  97%. A publicly reachable instance wants a per-source connection rate limit in
+  front of it: see [a connection rate limit in
+  front](#a-connection-rate-limit-in-front), and
+  `bench/results/2026-09-04-handshake-budget.md` for the figures.
 - **Upstream I/O is synchronous**, so concurrency is bounded by thread count
   rather than by in-flight queries. The h2 upstream client multiplexes onto one
   connection, but a worker is still held for the round trip. Async upstream I/O
@@ -1807,7 +1925,9 @@ the UDP answer-size ceiling, every listener including DoH over both HTTP version
 and the Apple profile end to end, h2 upstreams, blocking and rewrites in every
 mode — the new record types from their zone-file form, additive rules falling
 through, and the PTR synthesis in both families with each of the cases that gets
-none — rate limiting on both budgets, the rebinding guard on and off, the cache,
+none — rate limiting on every budget, including the share of the connection table
+one client may hold and the rate at which it may open them, the rebinding guard on
+and off, the cache,
 all three upstream strategies with health cooldown and pooling, per-domain
 routes including nested ones and an anchor that puts validation back, blocklist
 downloads and their cache directory, DNSSEC refusal and the CD bypass, the

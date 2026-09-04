@@ -36,8 +36,9 @@ server:
   # this raised or max_connections raised under it. On a public instance it is
   # the other way round: without it, one stranger holding idle connections can
   # take every slot and lock out the clients who use TCP, DoT or DoH. Nothing
-  # else bounds that - the rate limit is spent by queries, and a connection that
-  # asks nothing is free - so this is the only setting that says otherwise.
+  # else bounds that - the rate limit charges opening a connection and charges the
+  # queries asked over it, and a client can stay inside both while letting go of
+  # nothing - so this is the only setting that says how long one may be held.
   max_connections_per_prefix: 0
   client_timeout: 10s
   # Queries queued or in flight before new ones are dropped. 0 derives it as
@@ -138,12 +139,28 @@ server:
   # connection, while DoH answers 429 and keeps it: reconnecting after every
   # refusal costs the server a TLS handshake and the client nothing.
   #
-  # They are charged to a budget of their own: each prefix gets the figure below
-  # for datagrams and again for connections. Not a shared one, and not to be made
-  # into one - a UDP source address is written by whoever sent the datagram, so a
-  # single budget let a spoofed flood naming your /24 close the connections of the
-  # clients in it. The cost is that a client asking both ways can draw twice the
-  # figure.
+  # Opening a connection is charged as well, one token per accepted connection,
+  # spent before any TLS handshake. That is the load nothing else here saw: a
+  # client that dials, handshakes and hangs up asks no question, so no budget of
+  # answers touches it, and it holds each connection too briefly for
+  # max_connections_per_prefix to notice. Uncharged, 32 such dialers drew 6,469
+  # handshakes a second and 1.35 of four cores out of this server, and took 15
+  # points of answer rate off a DoT client in an unrelated prefix - see
+  # bench/results/2026-09-04-handshake-budget.md. Refusals are conn_rate_limited=
+  # in the stats line, apart from conn_refused=, which is the table being full.
+  #
+  # They are charged to budgets of their own: each prefix gets the figure below
+  # for datagrams, again for queries read off a connection, and again for
+  # connections opened. Not one shared budget, and not to be made into one - a UDP
+  # source address is written by whoever sent the datagram, so a single budget let
+  # a spoofed flood naming your /24 close the connections of the clients in it,
+  # and would let it stop them connecting at all. The cost is that a client using
+  # every way in can draw three times the figure.
+  #
+  # And note what none of it can do: every budget here is per /24 and per /64, so
+  # an actor with addresses in several prefixes has several copies of each. If this
+  # instance is reachable from the internet, put a per-source limit on new
+  # connections in front of it as well - the README has an nftables rule.
   rate_limit:
     enabled: true
     responses_per_second: 500
