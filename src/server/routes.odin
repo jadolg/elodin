@@ -290,9 +290,9 @@ make about it and they are not the same decision.
 in its place: NOERROR with an empty answer section, which is a NODATA and says
 the parent holds no DS for this name. It does not say the name is a delegation -
 `apex_ds_off_route` sets out what that leaves out and why the answer still
-passes. The name
-is there and the type is not. That is the reply this carve-out went to fetch, and
-`apex_ds_off_route` argues why every other one is the route's to answer.
+passes. The name is there and the type is not. That is the reply this carve-out
+went to fetch, and `apex_ds_off_route` argues why every other one is the route's
+to answer.
 
 An *empty* section rather than merely one with no `DS` in it, because a NODATA
 carries nothing in the answer at all - a denial's NSEC or NSEC3 travels in the

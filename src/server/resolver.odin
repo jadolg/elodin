@@ -1057,10 +1057,10 @@ resolve_query :: proc(
 	4.B's whole subject, and it is the only thing the parent can tell a
 	validating client that the route cannot. An NXDOMAIN, a `DS` RRset, a NOERROR
 	carrying something that is neither, an undecodable reply and no reply at all
-	are each the route's to answer instead
-	- a zone nothing public delegates, a signed zone whose internal view is
-	another view, and an outage out there that must not take the chain out from
-	under a zone that is answering perfectly well.
+	are each the route's to answer instead - a zone nothing public delegates, a
+	signed zone whose internal view is another view, and an outage out there that
+	must not take the chain out from under a zone that is answering perfectly
+	well.
 
 	A reply that says nothing about the name - SERVFAIL, REFUSED - is read the
 	same way as no reply at all, which is where this parts company with how an
