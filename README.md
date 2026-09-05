@@ -213,6 +213,15 @@ already makes these choices.
   granted.
 - `listeners.udp.readers` against your core count. Left at `0` it derives one
   reader per usable CPU, up to eight, which `--check` prints.
+- The descriptor limit, if you raise `server.max_connections`. Every held
+  connection is a descriptor, and `RLIMIT_NOFILE` is the one bound on this
+  server that is not in its configuration file — systemd leaves the soft limit
+  at 1024 unless a unit says otherwise, which the shipped one does
+  (`LimitNOFILE=8192`). Raise the table past it and the listener stops
+  accepting rather than the table filling: accepts fail, are counted as
+  `conn_failed=`, and the loop backs off a second at a time until there is
+  room. `--check` and startup both say so when the limit cannot cover the
+  table, and say nothing when it can.
 
 **What elodin bounds on its own,** measured and holding for an hour of
 flooding (`bench/results/2026-09-03-soak-one-hour.md`):
@@ -1817,7 +1826,7 @@ as a warning at startup.
 | `elodin_queries_refused_total` | counter | turned away by `server.allow_from` |
 | `elodin_connections_refused_total` | counter | refused for want of a slot: `server.max_connections` full, or the client's prefix already holding its share |
 | `elodin_connections_rate_limited_total` | counter | refused because the prefix was opening connections faster than `rate_limit.responses_per_second` allows |
-| `elodin_connections_failed_total` | counter | refused because the OS would not start a thread |
+| `elodin_connections_failed_total` | counter | refused because the OS would not give the process what a connection needs — a thread, or a descriptor to accept onto |
 | `elodin_connections_active` / `_max` | gauge | connection threads in use, and what the limit allows |
 | `elodin_connections_max_per_prefix` | gauge | how many of those one client prefix may hold; equal to `_max` when there is no share |
 | `elodin_tls_handshakes_total` | counter | TLS handshakes completed on the DoT and DoH listeners |
@@ -1973,8 +1982,13 @@ gets a reset on first use and has to reconnect. Either way it is counted as
 `conn_refused=`, kept apart from `refused=` because this is a client elodin would
 serve and has no room for; which of the two limits refused it is in the `warn`
 line beside it. A connection refused *below* both, when the OS will not give the
-process another thread — `RLIMIT_NPROC`, a cgroup `pids.max`, memory — is `conn_failed=`,
-where raising `max_connections` cannot help and would make it worse.
+process what a connection needs, is `conn_failed=`, where raising
+`max_connections` cannot help and would make it worse. Two things reach it: no
+thread — `RLIMIT_NPROC`, a cgroup `pids.max`, memory — and no descriptor to
+accept onto, `RLIMIT_NOFILE`. The `warn` beside it says which, because they are
+raised in different places; on the descriptor side the accept loop also waits a
+second between attempts, the connection staying queued so that retrying at once
+would be a busy wait rather than a retry.
 
 `mise run bench` measures all of this; the harness is documented in
 [`bench/README.md`](bench/README.md) and its committed runs are under
