@@ -93,6 +93,29 @@ ACCEPT_FIRST_WAIT :: time.Millisecond
 ACCEPT_BACKOFF :: LISTENER_POLL
 
 /*
+How many times the wait may double before it is the ceiling anyway.
+
+Ten, because a millisecond doubled ten times is 1.024 seconds and the ceiling is
+one - so there is no eleventh useful step, and every failure past it wants the
+ceiling by definition rather than by arithmetic.
+
+Bounding it is not tidiness. `ACCEPT_FIRST_WAIT << steps` is an `i64` of
+nanoseconds, and a base of a million overflows one at 44 steps: the first version
+of this guarded at 62 on the reasoning that `1 << 62` nanoseconds is centuries,
+which is true of a base of *one* and not of this one. Past 44 the shift wrapped,
+several values came out zero or negative, `act.wait > 0` was false for them, and
+the loop spent those iterations neither waiting nor counting - a burst of exactly
+the busy-accept this file exists to remove, about thirty-five seconds into a
+descriptor shortage and invisible in the counter.
+
+The assertion below is what keeps that from coming back the next time somebody
+raises one of the two constants: it fails to compile rather than overflowing at
+runtime.
+*/
+ACCEPT_ESCALATION_STEPS :: 10
+#assert(ACCEPT_FIRST_WAIT << uint(ACCEPT_ESCALATION_STEPS) >= ACCEPT_BACKOFF)
+
+/*
 What the loop does about one accept error, as data.
 
 The whole of the loop's decision, so that it can be tested as a sequence rather
@@ -123,11 +146,11 @@ accept_action :: proc(err: net.Accept_Error, failures: int) -> Accept_Action {
 	if n <= ACCEPT_FAST_RETRIES {
 		return Accept_Action{failures = n}
 	}
+	// The ceiling for anything past the useful doublings, so the shift can never
+	// be one that overflows - see `ACCEPT_ESCALATION_STEPS`.
 	wait := ACCEPT_BACKOFF
-	// `1 << 62` nanoseconds is centuries; the shift is bounded well before it
-	// could overflow, and the clamp is what the ceiling is for.
-	if steps := uint(n - ACCEPT_FAST_RETRIES - 1); steps < 62 {
-		wait = min(ACCEPT_BACKOFF, ACCEPT_FIRST_WAIT << steps)
+	if steps := n - ACCEPT_FAST_RETRIES - 1; steps < ACCEPT_ESCALATION_STEPS {
+		wait = min(ACCEPT_BACKOFF, ACCEPT_FIRST_WAIT << uint(steps))
 	}
 	return Accept_Action{failures = n, wait = wait, report = wait >= ACCEPT_BACKOFF}
 }
@@ -296,10 +319,13 @@ descriptor_limit_line :: proc(soft_limit: int, d: Descriptor_Demand) -> (line: s
 The soft `RLIMIT_NOFILE`, or 0 where it cannot be read.
 
 `sysconf(_SC_OPEN_MAX)` rather than a `getrlimit` binding of our own: it reports
-the live soft limit - verified against a process whose limit was lowered under it
-- and `metrics/process.odin` already reads the same figure for
-`process_max_fds`, so there is one answer to this question in the tree rather
-than two.
+the live soft limit, verified against a process whose limit was lowered under it.
+
+`metrics/process.odin` reads the same figure for `process_max_fds`, and this does
+not call into it: that procedure answers a different question - what the process
+holds *now*, off `/proc/self/stat` - and reading a `/proc` file to learn a limit
+that startup already knows would be the wrong shape here. Two callers of one
+libc function rather than one answer with two names.
 */
 descriptor_limit :: proc() -> int {
 	if limit := posix.sysconf(._OPEN_MAX); limit > 0 {

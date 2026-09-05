@@ -301,3 +301,49 @@ test_a_short_wait_does_not_spend_the_one_warning :: proc(t: ^testing.T) {
 	testing.expect(t, act.wait > 0 && act.wait < ACCEPT_BACKOFF, "the first wait is a short one")
 	testing.expect(t, !act.report, "a wait that may yet clear must not spend the warning")
 }
+
+/*
+Every wait, for far longer than a shortage would ever be left running.
+
+The bound this asserts is not an edge case: the first version of `accept_action`
+overflowed `i64` at the 48th consecutive failure - some thirty-five seconds into
+a descriptor shortage - and produced waits of zero and below. `act.wait > 0` is
+what the loops test, so those iterations neither slept nor counted: the spin
+came back, briefly, in the middle of the fix for it, and the counter said
+nothing.
+
+Two hundred iterations rather than the forty the first test of this ran, because
+forty stopped eight short of the first wrapped value. A test that stops before
+the arithmetic goes wrong is the shape of test this whole review has been about.
+*/
+@(test)
+test_no_wait_is_ever_zero_or_negative :: proc(t: ^testing.T) {
+	failures := 0
+	for i in 0 ..< 200 {
+		act := accept_action(.Insufficient_Resources, failures)
+		failures = act.failures
+		if act.failures <= ACCEPT_FAST_RETRIES {
+			// The free retries, which are a wait of nothing on purpose.
+			testing.expect_value(t, act.wait, 0)
+			continue
+		}
+		testing.expectf(
+			t,
+			act.wait > 0,
+			"iteration %d (failure %d): wait is %v, so the loop would neither sleep nor count",
+			i,
+			act.failures,
+			act.wait,
+		)
+		testing.expectf(
+			t,
+			act.wait <= ACCEPT_BACKOFF,
+			"iteration %d: wait is %v, past the ceiling of %v",
+			i,
+			act.wait,
+			ACCEPT_BACKOFF,
+		)
+	}
+	// And it is the ceiling by then, not something merely positive.
+	testing.expect_value(t, accept_action(.Insufficient_Resources, failures).wait, ACCEPT_BACKOFF)
+}
