@@ -39,10 +39,82 @@ the alternative - a thread per scraper - is the resource this endpoint is meant
 not to spend.
 */
 
+/*
+The `msg=stats` line, built here rather than in `main`.
+
+Every other figure this server reports at startup or on a schedule is built by a
+procedure that returns it - `connection_limits_line`, `udp_readers_line`,
+`rate_limit_override_lines` - and each of them says the same reason: returned so
+a test can hold it, and so two wordings of one fact cannot drift apart. This line
+was the exception, and it is the one that drifted. `cache_withheld` was added to
+the endpoint and not to the line, which the comment beside it in `main` still
+records; `accept_backoff` was added to the struct, the endpoint, the README and
+every hint that points an operator at this line, and not to the line.
+
+So it is here, beside `render` - which the endpoint's own guard test already
+covers - and `test_the_stats_line_carries_every_counter` holds it to the same
+standard: a counter added to `Stats` and left out of this format string is a
+failing test rather than a figure that reads zero forever.
+
+`main` still decides *when* to say it, which is the part that belongs there.
+*/
+stats_line :: proc(
+	st: Stats,
+	cs: cache.Stats,
+	cache_entries, cache_bytes: int,
+	limited, slipped, conn_limited: u64,
+) -> string {
+	return fmt.tprintf(
+		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d rewritten=%d dropped=%d refused=%d conn_refused=%d conn_rate_limited=%d conn_failed=%d accept_backoff=%d handshakes=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d special_use=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d",
+		st.queries,
+		st.blocked,
+		st.cached,
+		st.forwarded,
+		st.failed,
+		// Published by the endpoint as `outcome="rewritten"` since it existed,
+		// and absent from this line until the guard below started reading the
+		// struct instead of a list somebody maintained by hand.
+		st.rewritten,
+		st.dropped,
+		st.refused,
+		st.conn_refused,
+		// Beside `conn_refused` because the pair is the diagnosis: a table that
+		// is full and a client arriving too fast are different problems with
+		// different settings behind them, and the second used to show up in
+		// neither figure.
+		conn_limited,
+		st.conn_failed,
+		// Not a connection, which is why it is last of this group rather than
+		// folded into one of them: it counts the times a listener could not
+		// accept at all.
+		st.accept_backoff,
+		st.handshakes,
+		limited,
+		slipped,
+		st.secure,
+		st.bogus,
+		st.rebind,
+		st.special_use,
+		cache_entries,
+		cache_bytes,
+		cs.hits,
+		// Beside `cache_hits` because it qualifies it: `get` counts a hit when it
+		// hands the bytes over, and the resolver may then refuse them. Without
+		// this the line shows `cache_hits` and `cached=` drifting apart with
+		// nothing to account for the gap.
+		cs.withheld,
+		cs.misses,
+		cs.stale,
+		cs.evictions,
+	)
+}
+
 @(private)
 Metrics_Context :: struct {
-	server:    ^Server,
-	listeners: ^Listeners,
+	server:          ^Server,
+	listeners:       ^Listeners,
+	// As on `Stream_Context`, and for its reason.
+	accept_reported: bool,
 }
 
 /*
@@ -115,11 +187,36 @@ metrics_accept_loop :: proc(data: rawptr) {
 	ctx := cast(^Metrics_Context)data
 	l := ctx.listeners
 
+	// As in the DNS accept loops.
+	run: Accept_Run
 	for !sync.atomic_load(&l.stop) {
 		client_socket, client, err := net.accept_tcp(l.metrics_socket)
+		if err != nil && sync.atomic_load(&l.stop) {
+			break
+		}
+		/*
+		The DNS listeners' handling exactly, including reading every field of the
+		action on every path - this is the quietest socket in the process, so the
+		poll tick is almost the only thing that ever takes its run to zero, and a
+		re-arm read only after a successful accept was one this loop would never
+		have performed.
+
+		`accept_backoff=` counts the waiting rather than a connection, which is
+		what lets this loop share it without putting a scraper into a
+		client-facing counter.
+		*/
+		act := accept_action(err, run)
+		run = act.run
+		if act.recovered {
+			rearm_accept_reports(&ctx.accept_reported)
+		}
 		if err != nil {
-			if sync.atomic_load(&l.stop) {
-				break
+			if act.wait > 0 {
+				sync.atomic_add(&ctx.server.stats.accept_backoff, 1)
+				if act.report {
+					report_accept_failure("metrics", act.run, err, &ctx.accept_reported)
+				}
+				time.sleep(act.wait)
 			}
 			continue
 		}
@@ -299,6 +396,13 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 		.Counter,
 		"Connections turned away because the OS would not start a thread for one.",
 		st.conn_failed,
+	)
+	metrics.scalar(
+		&b,
+		"elodin_accept_backoffs_total",
+		.Counter,
+		"Times a listener waited before retrying an accept it could not complete; a few while a burst clears, then steadily for as long as it does not - about one a second per listener out of descriptors, about twenty for one meeting a stream of per-connection errors.",
+		st.accept_backoff,
 	)
 	metrics.scalar(
 		&b,

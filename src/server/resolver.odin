@@ -88,6 +88,24 @@ Stats :: struct {
 	*/
 	conn_failed:  u64,
 	/*
+	Times a listener waited before trying an accept again.
+
+	Not a count of connections, which is what sets it apart from every counter
+	above: an accept that fails for want of a descriptor leaves the peer on the
+	queue, so nothing was turned away and nobody was refused - what happened is
+	that this server stopped taking connections for a second. Counting it as
+	`conn_failed=` would report a refusal that did not occur, and would report
+	one per second of the outage rather than one per client.
+
+	So it climbs for as long as accepts are failing - quickly at first, while the
+	wait is escalating, and then about once a second per listener once it has
+	reached the ceiling. That is the shape to read it in: a handful is a burst
+	that cleared, and a rate that sits near one per listener is a server that is
+	not accepting at all. The `warn` beside it says which listener and why, and
+	is only said once the wait has stopped escalating.
+	*/
+	accept_backoff: u64,
+	/*
 	TLS handshakes that completed, on the DoT and DoH listeners together.
 
 	The cost of arriving, which no other counter here sees. Every figure beside
@@ -2468,6 +2486,7 @@ stats_of :: proc(s: ^Server) -> Stats {
 		refused = sync.atomic_load(&s.stats.refused),
 		conn_refused = sync.atomic_load(&s.stats.conn_refused),
 		conn_failed = sync.atomic_load(&s.stats.conn_failed),
+		accept_backoff = sync.atomic_load(&s.stats.accept_backoff),
 		handshakes = sync.atomic_load(&s.stats.handshakes),
 		secure = sync.atomic_load(&s.stats.secure),
 		bogus = sync.atomic_load(&s.stats.bogus),

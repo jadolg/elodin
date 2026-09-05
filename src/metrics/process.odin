@@ -59,11 +59,32 @@ STAT_FIRST :: 3
 @(private)
 STAT_FIELDS :: STAT_RSS - STAT_FIRST + 1
 
+/*
+The soft `RLIMIT_NOFILE`, or 0 where it cannot be read.
+
+`sysconf(_SC_OPEN_MAX)` reports the live soft limit rather than the value it had
+at exec - checked against a process whose limit was lowered under it - so it is
+also the right answer for a caller asking at startup whether the limit covers
+what it is about to allocate. `server.descriptor_limit` is that caller; this is
+where the question is answered, so that the figure an operator is warned about
+and the figure `process_max_fds` publishes cannot disagree.
+
+Zero for "could not be read", which callers have to tell apart from a small
+limit. An *unlimited* soft limit is not that case and does not come back as zero:
+glibc answers this one with `getdtablesize()`, which is `min(rlim_cur, INT_MAX)`,
+so `RLIM_INFINITY` arrives as `INT_MAX` and reads as a limit nothing can exceed -
+which is the right answer for every caller here.
+*/
+descriptor_limit :: proc() -> int {
+	if limit := posix.sysconf(._OPEN_MAX); limit > 0 {
+		return int(limit)
+	}
+	return 0
+}
+
 process_stats :: proc() -> (p: Process) {
 	p.open_fds = open_fd_count()
-	if limit := posix.sysconf(._OPEN_MAX); limit > 0 {
-		p.max_fds = i64(limit)
-	}
+	p.max_fds = i64(descriptor_limit())
 
 	// One line, of about thirty small numbers.
 	buf: [1024]u8

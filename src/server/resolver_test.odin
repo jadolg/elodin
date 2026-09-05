@@ -585,6 +585,9 @@ test_stats_of_carries_every_counter :: proc(t: ^testing.T) {
 		// over a field the snapshot drops if the value it was given was zero.
 		rebind       = 14,
 		special_use  = 15,
+		// Not a connection and not a query - see `Stats.accept_backoff` - but
+		// carried by the same snapshot, and dropped by it just as silently.
+		accept_backoff = 16,
 	}
 	s := Server {
 		stats = want,
