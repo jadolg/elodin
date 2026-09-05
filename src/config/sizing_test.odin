@@ -296,3 +296,33 @@ test_negative_worker_counts_are_refused :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(e.messages), 2)
 	free_all(context.temp_allocator)
 }
+
+/*
+A route's pool counts too, which is the whole reason this is a procedure.
+
+`main` builds one group per `upstream.zones` entry, so a configuration with
+routes holds several pools rather than one; counting only the top-level servers
+would under-report the descriptors a routed configuration wants by exactly the
+part that grows with the routing.
+*/
+@(test)
+test_pooled_upstream_connections_counts_every_route :: proc(t: ^testing.T) {
+	plain := Upstream_Config {
+		max_idle = 8,
+		servers  = []Upstream_Spec{{name = "a"}, {name = "b"}},
+	}
+	testing.expect_value(t, pooled_upstream_connections(plain), 16)
+
+	routed := plain
+	routed.zones = []Zone_Route {
+		{
+			domains = []string{"corp.example."},
+			upstream = Upstream_Config{max_idle = 4, servers = []Upstream_Spec{{name = "dc1"}}},
+		},
+		{
+			domains = []string{"home.arpa."},
+			upstream = Upstream_Config{max_idle = 2, servers = []Upstream_Spec{{name = "r1"}, {name = "r2"}}},
+		},
+	}
+	testing.expect_value(t, pooled_upstream_connections(routed), 16 + 4 + 4)
+}

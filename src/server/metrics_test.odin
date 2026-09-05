@@ -1,8 +1,11 @@
 package server
 
+import "core:fmt"
+import "core:reflect"
 import "core:strings"
 import "core:testing"
 import "core:time"
+import "elodin:cache"
 import "elodin:config"
 
 /*
@@ -68,6 +71,7 @@ test_every_counter_reaches_the_endpoint :: proc(t: ^testing.T) {
 			bogus = 13,
 			rebind = 14,
 			special_use = 15,
+			accept_backoff = 16,
 		},
 	)
 
@@ -78,6 +82,7 @@ test_every_counter_reaches_the_endpoint :: proc(t: ^testing.T) {
 	expect_line(t, page, `elodin_answers_total{outcome="failed"} 5`)
 	expect_line(t, page, `elodin_answers_total{outcome="rewritten"} 6`)
 	expect_line(t, page, "elodin_queries_dropped_total 7")
+	expect_line(t, page, "elodin_accept_backoffs_total 16")
 	expect_line(t, page, "elodin_queries_refused_total 8")
 	expect_line(t, page, "elodin_connections_refused_total 9")
 	expect_line(t, page, "elodin_connections_failed_total 10")
@@ -203,4 +208,81 @@ expect_line :: proc(t: ^testing.T, page: string, line: string, loc := #caller_lo
 	// that happens to start with it.
 	wanted := strings.concatenate({line, "\n"}, context.temp_allocator)
 	testing.expectf(t, strings.contains(page, wanted), "%q is not on the page", line, loc = loc)
+}
+
+/*
+Every counter in `Stats` appears in the line, with its own value.
+
+Read off the struct rather than off a list kept here by hand, which is the
+difference between a guard and a note. The first version of this test carried the
+list, and so had exactly the failure it was written to close: it checked the
+counters somebody remembered, and `Stats.rewritten` - published by the endpoint
+since it existed, absent from the line since it existed - passed it.
+
+`reflect.struct_field_names` cannot forget. A counter added to `Stats` and left
+out of `stats_line` fails here on the day it is added, which is what the other
+two guards do for the snapshot and the endpoint.
+
+Distinct values, and the value is asserted with the name, so a field printed from
+the wrong counter fails rather than passing on the presence of its key. Every
+field of `Stats` is a `u64` and every one belongs in the line, so there is no
+exception list - and if either ever stops being true, this test is where it has
+to be argued.
+*/
+@(test)
+test_the_stats_line_carries_every_counter :: proc(t: ^testing.T) {
+	st := Stats {
+		queries        = 1,
+		blocked        = 2,
+		cached         = 3,
+		forwarded      = 4,
+		failed         = 5,
+		rewritten      = 6,
+		dropped        = 7,
+		refused        = 8,
+		conn_refused   = 9,
+		conn_failed    = 10,
+		handshakes     = 11,
+		secure         = 12,
+		bogus          = 13,
+		rebind         = 14,
+		special_use    = 15,
+		accept_backoff = 16,
+	}
+	cs := cache.Stats {
+		hits      = 20,
+		misses    = 21,
+		stale     = 22,
+		withheld  = 23,
+		evictions = 24,
+	}
+	line := stats_line(st, cs, 30, 31, 40, 41, 42)
+
+	for name in reflect.struct_field_names(Stats) {
+		value := reflect.struct_field_value_by_name(st, name)
+		count, ok := value.(u64)
+		testing.expectf(t, ok, "Stats.%s is not a u64; this guard assumes every counter is one", name)
+		if !ok {
+			continue
+		}
+		want := fmt.tprintf("%s=%d", name, count)
+		testing.expectf(t, strings.contains(line, want), "the stats line is missing %q: %s", want, line)
+	}
+
+	// The figures that do not live in `Stats` - the limiter's and the cache's -
+	// which the walk above cannot see.
+	for want in ([]string {
+			"conn_rate_limited=42",
+			"limited=40",
+			"truncated=41",
+			"cache_entries=30",
+			"cache_bytes=31",
+			"cache_hits=20",
+			"cache_withheld=23",
+			"cache_misses=21",
+			"cache_stale=22",
+			"cache_evictions=24",
+		}) {
+		testing.expectf(t, strings.contains(line, want), "the stats line is missing %q: %s", want, line)
+	}
 }

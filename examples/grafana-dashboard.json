@@ -770,7 +770,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Five different problems, kept apart on purpose. Rising drops means server.workers is too low; rising refusals means a client is not on server.allow_from; refused connections means max_connections is full or one client prefix has filled its share of it (the log line says which); rate-limited connections means a prefix is opening them faster than server.rate_limit.responses_per_second allows, which is arrival rather than occupancy and is the only series a handshake flood shows up on; failed connections means the OS would not start a thread, which happens below the limit and is not fixed by raising it.",
+      "description": "Six different problems, kept apart on purpose. Rising drops means server.workers is too low; rising refusals means a client is not on server.allow_from; refused connections means max_connections is full or one client prefix has filled its share of it (the log line says which); rate-limited connections means a prefix is opening them faster than server.rate_limit.responses_per_second allows, which is arrival rather than occupancy and is the only series a handshake flood shows up on; failed connections means the OS would not start a thread, which happens below the limit and is not fixed by raising it. Accept backoffs are the odd one out: not connections at all, but seconds this server spent unable to accept any - a few while a burst clears and then steadily while it does not - about one a second per listener out of descriptors, about twenty for one meeting a stream of per-connection errors - so a flat line rather than a spike is a listener that has stopped taking connections entirely. When that is the cause this series goes flat rather than climbing - the metrics endpoint accepts through a loop of its own and cannot be scraped either, so the scrape gaps and up goes to 0. The msg=stats log line is the reading that survives it.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -896,6 +896,21 @@
                 }
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "accept backoffs (not accepting)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#8f5fd1"
+                }
+              }
+            ]
           }
         ]
       },
@@ -981,9 +996,21 @@
           "range": true,
           "instant": false,
           "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(elodin_accept_backoffs_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "accept backoffs (not accepting)",
+          "range": true,
+          "instant": false,
+          "refId": "F"
         }
       ],
-      "title": "Turned away",
+      "title": "Turned away, and not accepted",
       "type": "timeseries"
     },
     {

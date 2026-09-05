@@ -489,6 +489,18 @@ main :: proc() {
 				"  %s",
 				server.connection_limits_line(cfg.server.max_connections, cfg.server.max_connections_per_prefix),
 			)
+			/*
+			The descriptor limit is deliberately *not* said here, though it bounds
+			this same table and startup warns about it.
+
+			Every other figure in these lines is read from the file being checked.
+			That one would be read from whichever process runs the check - an
+			interactive shell with the distribution's 1024, where the service has
+			the unit's `LimitNOFILE` - so it would warn about a server that is
+			fine and stay silent about one that is not, and an operator would
+			reasonably read it as a statement about the server. See
+			`server.descriptor_limit_line`.
+			*/
 		}
 		/*
 		The networks with budgets of their own, in the words the startup log uses.
@@ -886,43 +898,22 @@ report :: proc(s: ^server.Server, answers: ^cache.Cache) {
 	st := server.stats_of(s)
 	cs := cache.stats(answers)
 	limited, slipped, conn_limited := server.rate_limit_stats(s.limiter)
+	// Built by `server.stats_line`, for the reason every other reported line in
+	// this server is: a counter left out of it is a failing test there rather
+	// than a figure that reads zero forever here.
 	logx.eventf(
 		.Info,
 		"stats",
-		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d refused=%d conn_refused=%d conn_rate_limited=%d conn_failed=%d handshakes=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d special_use=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d",
-		st.queries,
-		st.blocked,
-		st.cached,
-		st.forwarded,
-		st.failed,
-		st.dropped,
-		st.refused,
-		st.conn_refused,
-		// Beside `conn_refused` because the pair is the diagnosis: a table that
-		// is full and a client arriving too fast are different problems with
-		// different settings behind them, and the second used to show up in
-		// neither figure.
-		conn_limited,
-		st.conn_failed,
-		st.handshakes,
-		limited,
-		slipped,
-		st.secure,
-		st.bogus,
-		st.rebind,
-		st.special_use,
-		cache.len_entries(answers),
-		cache.bytes_used(answers),
-		cs.hits,
-		// Beside `cache_hits` because it qualifies it: `get` counts a hit when it
-		// hands the bytes over, and the resolver may then refuse them. Without
-		// this the line shows `cache_hits` and `cached=` drifting apart with
-		// nothing to account for the gap, which is the drift the counter exists
-		// to close - the metrics endpoint got it and this line did not.
-		cs.withheld,
-		cs.misses,
-		cs.stale,
-		cs.evictions,
+		"%s",
+		server.stats_line(
+			st,
+			cs,
+			cache.len_entries(answers),
+			cache.bytes_used(answers),
+			limited,
+			slipped,
+			conn_limited,
+		),
 	)
 }
 
