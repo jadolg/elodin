@@ -26,6 +26,18 @@ but the first.
 @(private = "file")
 CERT_DIR :: "/tmp/elodin-tlsx-test"
 
+/*
+How long a generated certificate lives.
+
+Thirty rather than the two it was, now that an expired one is noticed rather than
+handshaken with: the reuse is there to keep key generation off the clock, and a
+lifetime measured in days spent it again every other day for no reason. Still
+short enough that a forgotten key in the system temp directory is not a permanent
+one.
+*/
+@(private = "file")
+CERT_DAYS :: "30"
+
 @(private = "file")
 cert_once: sync.Once
 @(private = "file")
@@ -35,16 +47,57 @@ key_path: string
 @(private = "file")
 cert_ok: bool
 
+/*
+Whether a certificate already on disk can still be handshaken with.
+
+The reuse above it is the point of the cache and was also a time bomb: the
+generated certificate lives for `CERT_DAYS`, the files are reused whenever they
+exist, and nothing looked at the date. So every machine that ran these tests more
+than that long ago failed `test_verifying_context_refuses_a_name_it_cannot_bind`
+on its *control* case - the name the certificate carries, refused - and went on
+failing it, on every run, until somebody deleted the directory by hand. It is not
+a flake and a re-run does not clear it; the one that found this had expired eight
+minutes before the run that caught it.
+
+`-checkend` asks the question directly, and asks it about an hour from now rather
+than about this instant, so a certificate cannot expire between this check and
+the handshakes that follow it.
+
+A certificate is only rejected when openssl runs and says so. If it cannot be run
+at all the certificate is kept: this suite needs openssl to *make* one, so a host
+without it has nothing to gain from throwing away the one it has, and a
+developer's own `certs/` pair should not be discarded over a missing tool.
+*/
+@(private = "file")
+cert_still_valid :: proc(path: string) -> bool {
+	process, perr := os.process_start(
+		os.Process_Desc{command = []string{"openssl", "x509", "-in", path, "-noout", "-checkend", "3600"}},
+	)
+	if perr != nil {
+		return true
+	}
+	state, werr := os.process_wait(process)
+	if werr != nil {
+		return true
+	}
+	return state.exit_code == 0
+}
+
+@(private = "file")
+usable_pair :: proc(cert, key: string) -> bool {
+	return os.exists(cert) && os.exists(key) && cert_still_valid(cert)
+}
+
 @(private = "file")
 generate_certs :: proc() {
-	if os.exists("certs/cert.pem") && os.exists("certs/key.pem") {
+	if usable_pair("certs/cert.pem", "certs/key.pem") {
 		cert_path, key_path, cert_ok = "certs/cert.pem", "certs/key.pem", true
 		return
 	}
 
 	cert_path = CERT_DIR + "/cert.pem"
 	key_path = CERT_DIR + "/key.pem"
-	if os.exists(cert_path) && os.exists(key_path) {
+	if usable_pair(cert_path, key_path) {
 		cert_ok = true
 		return
 	}
@@ -70,7 +123,7 @@ generate_certs :: proc() {
 				"-out",
 				cert_path,
 				"-days",
-				"2",
+				CERT_DAYS,
 				"-subj",
 				"/CN=elodin.local",
 				"-addext",
