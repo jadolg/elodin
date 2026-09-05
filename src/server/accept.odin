@@ -153,7 +153,27 @@ ACCEPT_QUEUE_CEILING :: 50 * time.Millisecond
 
 @(private)
 accept_ceiling :: proc(err: net.Accept_Error) -> time.Duration {
-	return ACCEPT_BACKOFF if err == .Insufficient_Resources else ACCEPT_QUEUE_CEILING
+	/*
+	The short ceiling is justified by the failed accept taking an entry off the
+	queue, so it belongs to the errors that do.
+
+	`Unknown` is where `accept(2)`'s pending-network-error set lands, and
+	`Unsupported_Socket` is `EOPNOTSUPP`, which is in that set too - it also
+	means "this socket cannot accept", and the ambiguity is settled by which way
+	round is worse: a per-connection error held to a second starves the queue
+	behind it, while a permanent one held to fifty milliseconds costs twenty
+	wasted syscalls a second. The second is the cheaper mistake.
+
+	`Invalid_Argument` (EBADF, ENOTSOCK), `Not_Listening` (EINVAL) and
+	`Network_Unreachable` are a socket that has stopped working with no such
+	ambiguity: they consume nothing, so twenty attempts a second buy exactly what
+	one buys.
+	*/
+	#partial switch err {
+	case .Unknown, .Unsupported_Socket:
+		return ACCEPT_QUEUE_CEILING
+	}
+	return ACCEPT_BACKOFF
 }
 
 /*
@@ -402,8 +422,8 @@ accept_failure_words :: proc(shortage: bool, listener_flag: ^bool) -> Accept_Fai
 }
 
 /*
-The cadence named is the ceiling this *run* is held to, not the wait of the
-attempt that triggered the line.
+The cadence named is the ceiling this attempt is held to, not the wait it
+happens to be taking on the way up to it.
 
 They differ, and the ceiling is the one worth saying. The report fires when the
 listener has spent `ACCEPT_REPORT_AFTER` not accepting, which for a shortage is
@@ -419,11 +439,19 @@ line got wrong.
 */
 @(private)
 report_accept_failure :: proc(listener: string, run: Accept_Run, err: net.Accept_Error, listener_flag: ^bool) {
-	// Both from the run rather than from this attempt: a shortage met at any
-	// point in it is what the operator has to hear about, whatever error
-	// happened to land on the failure that crossed the threshold.
+	/*
+	The diagnosis from the run, the cadence from this attempt, and the two are
+	not the same question.
+
+	*What is wrong* is the run's: a shortage met at any point in it is what the
+	operator has to act on, whatever error happened to land on the failure that
+	crossed the threshold. *How often this listener is trying* is this attempt's,
+	because that is what the loop is about to do - a run that met a shortage and
+	is now taking queue errors waits fifty milliseconds, and a line saying a
+	second would describe neither the past nor the present.
+	*/
 	words := accept_failure_words(run.shortage, listener_flag)
-	settles_at := ACCEPT_BACKOFF if run.shortage else ACCEPT_QUEUE_CEILING
+	settles_at := accept_ceiling(err)
 	say, first := report_once(words.reported, logx.enabled(.Debug))
 	if !say {
 		return
@@ -437,7 +465,10 @@ report_accept_failure :: proc(listener: string, run: Accept_Run, err: net.Accept
 		return
 	}
 	logx.warnf(words.line, listener, settles_at, err)
-	logx.warnf(words.hint)
+	// Through `%s` rather than as the format itself: it is long prose that an
+	// operator-facing edit will touch, and the day one gains a percent sign it
+	// would print `%!s(MISSING)` in the one line this design allots.
+	logx.warnf("%s", words.hint)
 }
 
 /*

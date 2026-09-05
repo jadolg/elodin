@@ -626,3 +626,35 @@ test_the_report_describes_the_run_not_the_last_attempt :: proc(t: ^testing.T) {
 		"the operator has to be sent to the descriptor limit, whatever the last attempt returned",
 	)
 }
+
+/*
+Only the error class that drains the queue gets the short ceiling.
+
+The fifty milliseconds is justified by the failed accept taking an entry off the
+queue, which is true of the pending-network-error set - all of which arrive as
+`Unknown` - and false of a socket that has stopped working. Those consume
+nothing, so twenty attempts a second buys what one buys, at twenty times the
+syscalls.
+*/
+@(test)
+test_a_dead_socket_waits_as_long_as_a_shortage :: proc(t: ^testing.T) {
+	// `EOPNOTSUPP` is in `accept(2)`'s pending set as well as meaning a socket
+	// that cannot accept, and the tie is broken towards draining: holding a
+	// per-connection error to a second starves the queue behind it, while
+	// holding a permanent one to fifty milliseconds wastes syscalls.
+	testing.expect_value(t, accept_ceiling(.Unknown), ACCEPT_QUEUE_CEILING)
+	testing.expect_value(t, accept_ceiling(.Unsupported_Socket), ACCEPT_QUEUE_CEILING)
+	for err in ([]net.Accept_Error {
+			.Insufficient_Resources,
+			.Invalid_Argument,
+			.Not_Listening,
+			.Network_Unreachable,
+		}) {
+		testing.expectf(
+			t,
+			accept_ceiling(err) == ACCEPT_BACKOFF,
+			"%v drains nothing, so there is nothing to be gained by retrying it sooner",
+			err,
+		)
+	}
+}
