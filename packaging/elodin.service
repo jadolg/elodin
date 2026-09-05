@@ -42,8 +42,8 @@ ConfigurationDirectory=elodin
 # Every connection elodin holds is a descriptor, and systemd leaves the soft
 # limit at 1024 otherwise - which the shipped server.max_connections (512) fits
 # under and nothing much above 900 does. Past the limit the accept loop cannot
-# take a connection at all: it waits a second between attempts, warns once
-# naming this setting, and counts each wait as accept_backoff=. 8192 leaves
+# take a connection at all: it waits between attempts, escalating to a second,
+# warns once naming this setting, and counts each wait as accept_backoff=. 8192 leaves
 # room to raise max_connections into the thousands without editing the unit;
 # past that, raise this with it.
 LimitNOFILE=8192

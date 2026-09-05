@@ -901,7 +901,7 @@ report :: proc(s: ^server.Server, answers: ^cache.Cache) {
 	logx.eventf(
 		.Info,
 		"stats",
-		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d refused=%d conn_refused=%d conn_rate_limited=%d conn_failed=%d handshakes=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d special_use=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d",
+		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d refused=%d conn_refused=%d conn_rate_limited=%d conn_failed=%d accept_backoff=%d handshakes=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d special_use=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d",
 		st.queries,
 		st.blocked,
 		st.cached,
@@ -916,6 +916,12 @@ report :: proc(s: ^server.Server, answers: ^cache.Cache) {
 		// neither figure.
 		conn_limited,
 		st.conn_failed,
+		// Not a connection, which is why it is last of this group rather than
+		// folded into one of them: it counts the times a listener could not
+		// accept at all. Everything that sends an operator here - the accept
+		// warnings, the descriptor line at startup, the unit file - names this
+		// field, so it has to be in the line those readers are looking at.
+		st.accept_backoff,
 		st.handshakes,
 		limited,
 		slipped,

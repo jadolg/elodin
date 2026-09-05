@@ -128,15 +128,14 @@ metrics_accept_loop :: proc(data: rawptr) {
 			// The DNS listeners' handling exactly: `accept_backoff=` counts
 			// the waiting rather than a connection, so this loop can share it
 			// without putting a scraper into a client-facing counter.
-			if !accept_failed(err) {
-				failures = 0
-				continue
-			}
-			failures += 1
-			if failures > ACCEPT_FAST_RETRIES {
+			act := accept_action(err, failures)
+			failures = act.failures
+			if act.wait > 0 {
 				sync.atomic_add(&ctx.server.stats.accept_backoff, 1)
-				report_accept_failure("metrics", err, &ctx.accept_reported)
-				time.sleep(ACCEPT_BACKOFF)
+				if act.report {
+					report_accept_failure("metrics", err, &ctx.accept_reported)
+				}
+				time.sleep(act.wait)
 			}
 			continue
 		}
@@ -322,7 +321,7 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 		&b,
 		"elodin_accept_backoffs_total",
 		.Counter,
-		"Times a listener waited before retrying an accept it could not complete; one per second per listener while accepts are failing.",
+		"Times a listener waited before retrying an accept it could not complete; a few while a burst clears, then about one per second per listener for as long as it does not.",
 		st.accept_backoff,
 	)
 	metrics.scalar(

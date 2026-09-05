@@ -3,6 +3,7 @@ package server
 import "core:fmt"
 import "core:net"
 import "core:sys/posix"
+import "core:time"
 import "elodin:logx"
 
 /*
@@ -52,34 +53,84 @@ accept_failed :: proc(err: net.Accept_Error) -> bool {
 }
 
 /*
-How many times a failing accept is retried at once before the loop waits.
+How many times a failing accept is retried at once before the loop waits at all.
 
-Small, because the thing it buys is that a per-connection error clears without a
-wait, and the queue moves past one of those in one attempt. Not one, so that a
-handful arriving together - a network event does not produce exactly one - still
-costs nothing.
-
-The cost of it being too large is a spin of that many iterations, which is
-nothing; the cost of it being too small is a listener that goes deaf for a second
-over an error that would have cleared. So it errs upward.
+Small, because what it buys is that a per-connection error clears without a wait,
+and the queue moves past one of those in one attempt. Not one, so that a handful
+arriving together - a network event does not produce exactly one - still costs
+nothing.
 */
 ACCEPT_FAST_RETRIES :: 3
 
 /*
-How long a loop waits once a failure has not cleared.
+The first wait, and the longest one.
 
-`LISTENER_POLL` rather than a figure of its own, because the loop already has
-exactly this constant and exactly this meaning: it is the longest an accept loop
-ever goes without looking at `stop`. A shorter wait would buy nothing - what it
-waits out is a descriptor shortage, not a busy moment - and a longer one would be
-a second meaning for "how long shutdown can take", which the poll interval
-already is.
+Waits escalate rather than starting at the ceiling, which is the difference
+between waiting out the two conditions that arrive as the same error. A run of
+pending network errors - four queued connections behind an nftables `reject`, a
+flapping route - is over in a millisecond or two of waiting and then the queue
+moves; a descriptor shortage is not over at all. Starting at the ceiling made the
+first of those cost a listener a full second of deafness per failure for as long
+as bad entries kept arriving, which is a worse failure than the spin this change
+set out to remove: the spin at least kept accepting.
 
-So a spinning loop becomes one attempt per second per listener, and shutdown is
-no slower than it was: a loop asleep here would have been blocked in `accept` for
-the same second anyway.
+Doubling from a millisecond reaches the ceiling in about a second of total
+waiting, so a shortage is at one attempt per second almost immediately, while a
+burst that clears costs single-digit milliseconds.
+
+`LISTENER_POLL` is the ceiling because the loop already has that constant with
+that meaning: the longest it ever goes without looking at `stop`.
+
+It does cost shutdown something, which is worth stating rather than waving at:
+under a descriptor shortage `accept` returns at once, so before this change a
+loop saw `stop` within microseconds of it being set, and now it may be most of a
+second into a wait. `conn_manager_shutdown` joins without a deadline, so an
+elodin stopped while out of descriptors takes up to a second longer per listener
+to go. Against a shutdown that already waits on client connections for up to
+`server.client_timeout`, that is not the slow part.
 */
+ACCEPT_FIRST_WAIT :: time.Millisecond
 ACCEPT_BACKOFF :: LISTENER_POLL
+
+/*
+What the loop does about one accept error, as data.
+
+The whole of the loop's decision, so that it can be tested as a sequence rather
+than as a shape: nothing else in `accept_loop` and `metrics_accept_loop` decides
+anything, and `is this the fourth failure in a row or the first after a
+success` is exactly the sort of thing that is wrong in a way no unit test of a
+classifier would show.
+
+`report` is deliberately not "we waited". A wait short enough to be part of the
+escalation is a condition that may yet clear, and the one `warn` this design
+allots per listener must not be spent on one that does: it is said when the wait
+has reached the ceiling, which is the point at which the condition has outlived
+every reading of it but the persistent one.
+*/
+Accept_Action :: struct {
+	// The consecutive-failure count carried into the next iteration.
+	failures: int,
+	// Zero where the loop should retry at once.
+	wait:     time.Duration,
+	report:   bool,
+}
+
+accept_action :: proc(err: net.Accept_Error, failures: int) -> Accept_Action {
+	if !accept_failed(err) {
+		return Accept_Action{failures = 0}
+	}
+	n := failures + 1
+	if n <= ACCEPT_FAST_RETRIES {
+		return Accept_Action{failures = n}
+	}
+	wait := ACCEPT_BACKOFF
+	// `1 << 62` nanoseconds is centuries; the shift is bounded well before it
+	// could overflow, and the clamp is what the ceiling is for.
+	if steps := uint(n - ACCEPT_FAST_RETRIES - 1); steps < 62 {
+		wait = min(ACCEPT_BACKOFF, ACCEPT_FIRST_WAIT << steps)
+	}
+	return Accept_Action{failures = n, wait = wait, report = wait >= ACCEPT_BACKOFF}
+}
 
 /*
 Say why an accept loop is waiting, once, and then quietly.
@@ -88,6 +139,9 @@ Say why an accept loop is waiting, once, and then quietly.
 and what decides the line rate here is a condition that lasts rather than a peer
 that repeats, so a line per attempt would be a line per second for as long as it
 holds. `accept_backoff=` in the stats line is what makes the demotion safe.
+
+Reached only once the wait has escalated to `ACCEPT_BACKOFF` - see
+`accept_action` - so the flag below is not spent on a burst that clears.
 
 Two shapes, because the two ask for different things. A descriptor shortage is an
 environment that has to be raised, and the limit to raise is not in elodin's

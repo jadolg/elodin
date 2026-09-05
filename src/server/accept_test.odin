@@ -3,6 +3,7 @@ package server
 import "core:net"
 import "core:strings"
 import "core:testing"
+import "core:time"
 
 /*
 Every `net.Accept_Error`, against a table written out by hand.
@@ -184,4 +185,119 @@ test_the_descriptor_limit_is_readable :: proc(t: ^testing.T) {
 		descriptor_limit() > 0,
 		"RLIMIT_NOFILE has to be readable, or the shortage warning can never be printed",
 	)
+}
+
+/*
+The loop's own behaviour, as a sequence, without a socket.
+
+The classifier tests above say which errors are failures; none of them says what
+the loop does with a *run* of them, which is the whole of this change and the
+part where "the fourth in a row" and "the first after a success" are easy to get
+wrong. `accept_action` is the whole decision, so driving it with a sequence is
+driving the loop.
+*/
+@(test)
+test_a_burst_that_clears_costs_almost_nothing :: proc(t: ^testing.T) {
+	/*
+	The shape the review caught: four connections behind an nftables reject, or a
+	flapping route, arriving together. `accept(2)` says to retry these at once,
+	and a flat back-off charged the whole listener a second of deafness for each
+	one - worse than the spin this change removes, since the spin at least kept
+	accepting.
+	*/
+	failures := 0
+	total: time.Duration
+	reports := 0
+	for _ in 0 ..< 4 {
+		act := accept_action(.Unknown, failures)
+		failures = act.failures
+		total += act.wait
+		reports += 1 if act.report else 0
+	}
+	testing.expect(
+		t,
+		total < 10 * time.Millisecond,
+		"a burst of pending network errors must not cost the listener a perceptible wait",
+	)
+	testing.expect_value(t, reports, 0)
+
+	// And the queue moves on: one accepted connection puts it back to nothing.
+	after := accept_action(.None, failures)
+	testing.expect_value(t, after.failures, 0)
+	testing.expect_value(t, after.wait, 0)
+}
+
+@(test)
+test_the_first_failures_are_retried_at_once :: proc(t: ^testing.T) {
+	failures := 0
+	for i in 1 ..= ACCEPT_FAST_RETRIES {
+		act := accept_action(.Insufficient_Resources, failures)
+		failures = act.failures
+		testing.expectf(t, act.wait == 0, "failure %d should be retried at once", i)
+		testing.expect_value(t, act.failures, i)
+	}
+	// The next one waits, because it has not cleared.
+	act := accept_action(.Insufficient_Resources, failures)
+	testing.expect(t, act.wait > 0, "a failure that survives the free retries has to be waited out")
+}
+
+@(test)
+test_a_shortage_reaches_one_attempt_a_second_and_stays :: proc(t: ^testing.T) {
+	failures := 0
+	total: time.Duration
+	first_report := -1
+	// Long enough to be well past the escalation, short enough to be a test.
+	for i in 0 ..< 40 {
+		act := accept_action(.Insufficient_Resources, failures)
+		failures = act.failures
+		total += act.wait
+		if act.report && first_report < 0 {
+			first_report = i
+		}
+	}
+	testing.expect(
+		t,
+		accept_action(.Insufficient_Resources, failures).wait == ACCEPT_BACKOFF,
+		"a shortage that does not clear settles at the ceiling",
+	)
+	testing.expect(
+		t,
+		first_report >= 0 && total <= 40 * ACCEPT_BACKOFF,
+		"the escalation has to reach the ceiling, and cannot exceed it",
+	)
+	/*
+	The spin the issue is about, bounded. Three free retries and the escalation
+	come to about a second between them, and every attempt after that waits the
+	ceiling - so forty attempts at a condition that never clears is some
+	twenty-eight seconds of waiting rather than forty iterations at whatever
+	speed the CPU manages.
+	*/
+	testing.expect(
+		t,
+		total > 25 * time.Second,
+		"a shortage that does not clear has to cost about a second per attempt, not nothing",
+	)
+	/*
+	And the escalation is quick: the report is what an operator sees, and it
+	should not be minutes away.
+	*/
+	testing.expect(
+		t,
+		first_report < 15,
+		"the ceiling, and so the warning, has to be reached in the first seconds",
+	)
+}
+
+/*
+Waiting is not reporting.
+
+The one `warn` a listener gets has to be spent on a condition that lasted. A
+burst that clears inside the escalation is not one, and the flag it would have
+burned belongs to the socket that genuinely goes bad later.
+*/
+@(test)
+test_a_short_wait_does_not_spend_the_one_warning :: proc(t: ^testing.T) {
+	act := accept_action(.Unknown, ACCEPT_FAST_RETRIES)
+	testing.expect(t, act.wait > 0 && act.wait < ACCEPT_BACKOFF, "the first wait is a short one")
+	testing.expect(t, !act.report, "a wait that may yet clear must not spend the warning")
 }

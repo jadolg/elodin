@@ -218,9 +218,8 @@ already makes these choices.
   server that is not in its configuration file — systemd leaves the soft limit
   at 1024 unless a unit says otherwise, which the shipped one does
   (`LimitNOFILE=8192`). Raise the table past it and the listener stops
-  accepting rather than the table filling: accepts fail, the loop waits a second
-  between attempts, and `elodin_accept_backoffs_total` climbs at one per second
-  per listener while it does. Startup warns when the limit cannot cover the
+  accepting rather than the table filling: accepts fail, the loop waits between
+  attempts, and `elodin_accept_backoffs_total` climbs while it does. Startup warns when the limit cannot cover the
   table and says nothing when it can — `--check` does not, because it would be
   reading its own process's limit rather than the service's.
 
@@ -1829,7 +1828,7 @@ as a warning at startup.
 | `elodin_connections_refused_total` | counter | refused for want of a slot: `server.max_connections` full, or the client's prefix already holding its share |
 | `elodin_connections_rate_limited_total` | counter | refused because the prefix was opening connections faster than `rate_limit.responses_per_second` allows |
 | `elodin_connections_failed_total` | counter | refused because the OS would not start a thread |
-| `elodin_accept_backoffs_total` | counter | times a listener waited before retrying an accept it could not complete; one per second per listener while accepts are failing, usually for want of file descriptors |
+| `elodin_accept_backoffs_total` | counter | times a listener waited before retrying an accept it could not complete; a few while a burst clears, then about one per second per listener for as long as it does not — usually for want of file descriptors |
 | `elodin_connections_active` / `_max` | gauge | connection threads in use, and what the limit allows |
 | `elodin_connections_max_per_prefix` | gauge | how many of those one client prefix may hold; equal to `_max` when there is no share |
 | `elodin_tls_handshakes_total` | counter | TLS handshakes completed on the DoT and DoH listeners |
@@ -1992,11 +1991,14 @@ worse.
 A shortage of **file descriptors** is the one failure here that turns no client
 away, and it is counted separately for that reason. An accept that cannot
 allocate a descriptor leaves the peer on the queue, so nothing was refused; what
-happened is that the listener stopped accepting. It waits a second between
-attempts rather than retrying into the same shortage, and each wait is
-`accept_backoff=` — one per second per listener, so a rate sitting at one is a
-listener taking no connections at all. The `warn` beside the first says which
-listener and names `RLIMIT_NOFILE`.
+happened is that the listener stopped accepting. It waits between attempts rather than
+retrying into the same shortage, escalating from a millisecond to a second so
+that an error which clears by itself — `accept(2)` passes pending network errors
+through, and says to retry those at once — costs nothing measurable, while one
+that does not clear settles at a second. Each wait is `accept_backoff=`, so a
+rate sitting near one per listener is a listener taking no connections at all.
+The `warn` beside it names the listener and `RLIMIT_NOFILE`, and is said only
+once the waiting has stopped escalating.
 
 `mise run bench` measures all of this; the harness is documented in
 [`bench/README.md`](bench/README.md) and its committed runs are under

@@ -1476,16 +1476,19 @@ accept_loop :: proc(data: rawptr) {
 			there is room, so calling it turned away would be a refusal that
 			never happened. `accept_backoff=` counts the waiting instead, which
 			is what actually occurred.
+
+			Every decision is `accept_action`'s, so that the sequence - four
+			failures then a success then a shortage - can be tested without a
+			socket.
 			*/
-			if !accept_failed(err) {
-				failures = 0
-				continue
-			}
-			failures += 1
-			if failures > ACCEPT_FAST_RETRIES {
+			act := accept_action(err, failures)
+			failures = act.failures
+			if act.wait > 0 {
 				sync.atomic_add(&ctx.server.stats.accept_backoff, 1)
-				report_accept_failure(proto_name(ctx.proto), err, &ctx.accept_reported)
-				time.sleep(ACCEPT_BACKOFF)
+				if act.report {
+					report_accept_failure(proto_name(ctx.proto), err, &ctx.accept_reported)
+				}
+				time.sleep(act.wait)
 			}
 			continue
 		}
