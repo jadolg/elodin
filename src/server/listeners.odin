@@ -122,17 +122,33 @@ start_listeners :: proc(s: ^Server, l: ^Listeners) -> bool {
 	// Said only where it applies: with every stream listener off there are no
 	// client connections for the table to bound, and the line would be about a
 	// limit nothing in this run can reach.
-	if config.stream_listeners_enabled(s.cfg.listeners) {
+	streams := config.stream_listeners_enabled(s.cfg.listeners)
+	if streams {
 		logx.infof(
 			"%s",
 			connection_limits_line(s.cfg.server.max_connections, s.cfg.server.max_connections_per_prefix),
 		)
-		// Startup only - `--check` reads a different process's limit. See
-		// `descriptor_limit_line`.
+	}
+	/*
+	The descriptor warning, which is not gated on the same thing as the line
+	above it.
+
+	That line is about the connection table and is silent where nothing can fill
+	one. This is about every descriptor the process can want, and the metrics
+	endpoint is an accept loop like any other - it meets the same shortage and
+	waits in the same place - so a UDP-only configuration with `metrics.enabled`
+	is a configuration this has something to say about. The demand is counted
+	whatever the listeners are: the worker pools and the upstream pools hold
+	descriptors in every configuration.
+
+	Startup only - `--check` reads a different process's limit. See
+	`descriptor_limit_line`.
+	*/
+	if streams || s.cfg.metrics.enabled {
 		if line, short := descriptor_limit_line(
 			descriptor_limit(),
 			Descriptor_Demand {
-				max_connections = s.cfg.server.max_connections,
+				max_connections = s.cfg.server.max_connections if streams else 0,
 				pooled_upstream = config.pooled_upstream_connections(s.cfg.upstream),
 				workers = s.cfg.server.workers,
 				upstream_workers = s.cfg.server.upstream_workers,
@@ -1492,7 +1508,16 @@ accept_loop :: proc(data: rawptr) {
 			}
 			continue
 		}
-		run = {}
+		/*
+		An accepted connection carries the run rather than clearing it, so that
+		the oscillating shortage - one descriptor freed, one connection served,
+		`EMFILE` again - is still recognised as one. See `ACCEPT_REPORT_AFTER`.
+		*/
+		accepted := accept_action(.None, run)
+		run = accepted.run
+		if accepted.recovered {
+			rearm_accept_reports(&ctx.accept_reported)
+		}
 
 		/*
 		Closed here rather than handed a thread that would answer REFUSED.

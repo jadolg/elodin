@@ -209,7 +209,12 @@ metrics_accept_loop :: proc(data: rawptr) {
 			}
 			continue
 		}
-		run = {}
+		// As in the DNS accept loops.
+		accepted := accept_action(.None, run)
+		run = accepted.run
+		if accepted.recovered {
+			rearm_accept_reports(&ctx.accept_reported)
+		}
 		serve_metrics(ctx.server, l, client_socket, client)
 		net.close(client_socket)
 		// This loop is the one place that never resets the arena otherwise, and

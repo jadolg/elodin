@@ -2,6 +2,7 @@ package server
 
 import "core:fmt"
 import "core:net"
+import "core:sync"
 import "core:time"
 import "elodin:logx"
 import "elodin:metrics"
@@ -159,19 +160,45 @@ accept_ceiling :: proc(err: net.Accept_Error) -> time.Duration {
 How long a listener has to have been failing before it says so.
 
 One rule for both ceilings, in the terms an operator would use: the `warn` is
-said once this listener has actually spent about a second not accepting. Not
-"once the wait reached its ceiling", which is what this was and which read very
-differently on either side of it - a shortage reached its ceiling after a second,
-and a queue error reached its own after sixty-three milliseconds, so a route flap
-queueing ten bad entries burned the one warning a listener gets on a condition
-that had lasted a sixteenth of a second. That is the case the doc below calls out
-as the thing not to spend it on.
+said once this listener has spent about a second not accepting. Not "once the
+wait reached its ceiling", which is what this was and which read very differently
+on either side of it - a shortage reached its ceiling after a second, and a queue
+error reached its own after sixty-three milliseconds, so a route flap queueing
+ten bad entries burned the one warning a listener gets on a condition that had
+lasted a sixteenth of a second.
 
 Stated as a duration rather than as a count of failures because the two ceilings
 make the same count mean different things, and what matters is neither: it is how
 long this listener has not been taking connections.
 */
 ACCEPT_REPORT_AFTER :: time.Second
+
+/*
+What one accepted connection pays back, and why it is not everything.
+
+The obvious reading of "a second of not accepting" is a second since the last
+success, and it is the wrong one, because the likeliest descriptor shortage is
+not a solid one. `max_connections` above `RLIMIT_NOFILE` gives the oscillating
+shape: the table accepts until descriptors run out, then a client disconnects,
+one descriptor frees, one accept succeeds, and `EMFILE` resumes. A rule that
+zeroed the run on any success never accumulates its second there - so the one
+line that names `RLIMIT_NOFILE`, on the one failure whose remedy is not in
+elodin's configuration at all, would never be said, for an outage of any length.
+
+So a success pays back a fixed `ACCEPT_FIRST_WAIT` rather than the lot. A burst
+that really has cleared is worth about a hundred of those and is gone within a
+hundred accepts, which a working listener does immediately; a shortage letting
+one connection through per ten failures adds far more per cycle than it takes
+back, climbs to the second, and says so. Halving was tried first and decays too
+fast to notice that second shape at all.
+
+Between them is a band - roughly one success in five - where the accumulation and
+the repayment balance below the threshold and no `warn` is said. That is
+deliberate rather than missed: the listener there is still accepting several
+connections a second, and `accept_backoff=` is climbing the whole time, which is
+the signal that is always on. The `warn` is the one that adds *which limit*, and
+it is spent on the listener that has genuinely stopped.
+*/
 
 /*
 A run of consecutive failures, carried by the loop between iterations.
@@ -201,15 +228,30 @@ allots per listener must not be spent on one that does - see
 */
 Accept_Action :: struct {
 	// Carried into the next iteration.
-	run:    Accept_Run,
+	run:       Accept_Run,
 	// Zero where the loop should retry at once.
-	wait:   time.Duration,
-	report: bool,
+	wait:      time.Duration,
+	report:    bool,
+	/*
+	This listener has gone back to accepting normally, so a later trouble may
+	say so again.
+
+	The flags are one line per listener for the life of the process otherwise: a
+	shortage met and survived on the first day would leave an unrelated one on
+	the thirtieth logged at `debug` and nowhere else. Set when the decay above
+	reaches zero rather than on any success, which is the same distinction that
+	rule is about.
+	*/
+	recovered: bool,
 }
 
 accept_action :: proc(err: net.Accept_Error, run: Accept_Run) -> Accept_Action {
 	if !accept_failed(err) {
-		return Accept_Action{}
+		healed := max(0, run.waited - ACCEPT_FIRST_WAIT)
+		return Accept_Action {
+			run = Accept_Run{waited = healed},
+			recovered = run.waited > 0 && healed == 0,
+		}
 	}
 	n := run.failures + 1
 	if n <= ACCEPT_FAST_RETRIES {
@@ -257,6 +299,22 @@ operator actually needed to hear about.
 */
 @(private)
 accept_shortage_reported: bool
+
+/*
+Let a listener that has recovered say so again.
+
+Both flags, because both are stale for the same reason once the trouble has
+passed: the process-wide one so that a second shortage is announced rather than
+left at `debug`, and this listener's own so that a socket going bad later is not
+silenced by a transient run that burned it. Clearing the shared one from
+whichever listener recovers first is deliberate - the next listener still in
+trouble will set it again on its next report, which is the outcome worth having.
+*/
+@(private)
+rearm_accept_reports :: proc(listener_flag: ^bool) {
+	sync.atomic_store(&accept_shortage_reported, false)
+	sync.atomic_store(listener_flag, false)
+}
 
 @(private)
 Accept_Failure_Words :: struct {

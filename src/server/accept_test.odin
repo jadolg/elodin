@@ -221,11 +221,12 @@ test_a_burst_that_clears_costs_almost_nothing :: proc(t: ^testing.T) {
 	)
 	testing.expect_value(t, reports, 0)
 
-	// And the queue moves on: one accepted connection puts it back to nothing.
+	// And the queue moves on: an accepted connection ends the run and pays back
+	// part of what it waited - see `ACCEPT_REPORT_AFTER`.
 	after := accept_action(.None, run)
 	testing.expect_value(t, after.run.failures, 0)
-	testing.expect_value(t, after.run.waited, 0)
 	testing.expect_value(t, after.wait, 0)
+	testing.expect(t, after.run.waited < run.waited, "an accepted connection pays some of it back")
 }
 
 @(test)
@@ -436,4 +437,63 @@ test_the_warning_waits_for_a_second_of_not_accepting :: proc(t: ^testing.T) {
 		"and only once it has cost a second: %v",
 		shortage.waited,
 	)
+}
+
+/*
+The shortage that lets one connection through between failures is still one.
+
+`max_connections` above `RLIMIT_NOFILE` does not produce a solid outage: the
+table accepts until descriptors run out, a client disconnects, one descriptor
+frees, one accept succeeds, and `EMFILE` resumes. A rule that zeroed the run on
+any success never accumulated its second there, so the single line naming
+`RLIMIT_NOFILE` - the one failure whose remedy is not in elodin's configuration
+at all - was never said, for an outage of any length.
+
+Modelled at one success per ten failures, which is what a table larger than the
+descriptor limit produces under load.
+*/
+@(test)
+test_an_oscillating_shortage_is_still_reported :: proc(t: ^testing.T) {
+	run: Accept_Run
+	said := false
+	for _ in 0 ..< 60 {
+		for _ in 0 ..< 10 {
+			act := accept_action(.Insufficient_Resources, run)
+			run = act.run
+			said ||= act.report
+		}
+		// One connection gets through, which is the shape being tested.
+		run = accept_action(.None, run).run
+	}
+	testing.expect(
+		t,
+		said,
+		"a shortage interrupted by the odd successful accept still has to name RLIMIT_NOFILE",
+	)
+}
+
+/*
+And a listener that really has recovered says so, so a later trouble is not
+silenced by an earlier one.
+*/
+@(test)
+test_a_burst_that_clears_hands_the_warning_back :: proc(t: ^testing.T) {
+	run: Accept_Run
+	for _ in 0 ..< 10 {
+		run = accept_action(.Unknown, run).run
+	}
+	testing.expect(t, run.waited > 0, "the burst waited something")
+
+	recovered := false
+	for _ in 0 ..< 200 {
+		act := accept_action(.None, run)
+		run = act.run
+		recovered ||= act.recovered
+	}
+	testing.expect(t, recovered, "a listener accepting normally again has to re-arm its warning")
+	testing.expect_value(t, run.waited, 0)
+
+	// Once, not on every accept after it: the flags are only worth clearing at
+	// the moment the run reaches zero.
+	testing.expect(t, !accept_action(.None, run).recovered, "a healthy listener does not re-arm forever")
 }

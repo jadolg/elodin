@@ -70,7 +70,10 @@ where the question is answered, so that the figure an operator is warned about
 and the figure `process_max_fds` publishes cannot disagree.
 
 Zero for "could not be read", which callers have to tell apart from a small
-limit: `RLIM_INFINITY` comes back as -1 here.
+limit. An *unlimited* soft limit is not that case and does not come back as zero:
+glibc answers this one with `getdtablesize()`, which is `min(rlim_cur, INT_MAX)`,
+so `RLIM_INFINITY` arrives as `INT_MAX` and reads as a limit nothing can exceed -
+which is the right answer for every caller here.
 */
 descriptor_limit :: proc() -> int {
 	if limit := posix.sysconf(._OPEN_MAX); limit > 0 {
