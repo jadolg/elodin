@@ -444,3 +444,28 @@ read_small_file :: proc(path: string, buf: []u8) -> (text: string, ok: bool) {
 	}
 	return string(buf[:n]), true
 }
+
+/*
+Pooled upstream connections this configuration can hold open at once.
+
+`upstream.max_idle` is a per-server figure - `make_upstream` gives every server
+its own pool - so the total is that many for each server named anywhere, and a
+zone route is named anywhere: `main` builds one group per `upstream.zones` entry,
+each with the route's own `max_idle` and its own servers.
+
+Counted rather than estimated because it is the second largest thing this process
+holds descriptors for, after the connection table, and because a configuration
+with a dozen routes has a pool that is no longer a rounding error against it. See
+`server.descriptors_wanted`, which is the only caller and the reason this is a
+figure rather than a comment.
+
+Idle sockets, so this is a ceiling and not a reading: a pool holds what has been
+dialled and not yet timed out, which on a quiet server is nothing.
+*/
+pooled_upstream_connections :: proc(cfg: Upstream_Config) -> int {
+	total := cfg.max_idle * len(cfg.servers)
+	for route in cfg.zones {
+		total += route.upstream.max_idle * len(route.upstream.servers)
+	}
+	return total
+}

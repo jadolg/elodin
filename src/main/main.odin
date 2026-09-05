@@ -489,6 +489,22 @@ main :: proc() {
 				"  %s",
 				server.connection_limits_line(cfg.server.max_connections, cfg.server.max_connections_per_prefix),
 			)
+			/*
+			The descriptor limit, said here only when it cannot cover that table.
+
+			This is the one figure in these lines that is not from the file being
+			checked - it is the machine's, and an operator raising
+			`max_connections` past it gets a listener that stops accepting rather
+			than a table that fills. Said in the words startup uses, and silent
+			for the configurations that are fine, which is nearly all of them.
+			*/
+			if line, short := server.descriptor_limit_line(
+				server.descriptor_limit(),
+				cfg.server.max_connections,
+				config.pooled_upstream_connections(cfg.upstream),
+			); short {
+				fmt.printfln("  %s", line)
+			}
 		}
 		/*
 		The networks with budgets of their own, in the words the startup log uses.
