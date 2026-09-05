@@ -65,12 +65,16 @@ stats_line :: proc(
 	limited, slipped, conn_limited: u64,
 ) -> string {
 	return fmt.tprintf(
-		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d refused=%d conn_refused=%d conn_rate_limited=%d conn_failed=%d accept_backoff=%d handshakes=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d special_use=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d",
+		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d rewritten=%d dropped=%d refused=%d conn_refused=%d conn_rate_limited=%d conn_failed=%d accept_backoff=%d handshakes=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d special_use=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d",
 		st.queries,
 		st.blocked,
 		st.cached,
 		st.forwarded,
 		st.failed,
+		// Published by the endpoint as `outcome="rewritten"` since it existed,
+		// and absent from this line until the guard below started reading the
+		// struct instead of a list somebody maintained by hand.
+		st.rewritten,
 		st.dropped,
 		st.refused,
 		st.conn_refused,

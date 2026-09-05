@@ -279,8 +279,8 @@ Loki that is `| logfmt` and nothing else:
 
 Statistics go to the log every five minutes as `msg=stats`: `queries`,
 `blocked`, `cached`, `forwarded`, `failed`, `dropped`, `refused`,
-`conn_refused`, `conn_rate_limited`, `conn_failed`, `accept_backoff`,
-`handshakes`, `limited`,
+`rewritten`, `conn_refused`, `conn_rate_limited`, `conn_failed`,
+`accept_backoff`, `handshakes`, `limited`,
 `truncated`, `secure`, `bogus`,
 `rebind` and `special_use`, plus `cache_entries`, `cache_bytes`, `cache_hits`,
 `cache_withheld`, `cache_misses`, `cache_stale` and `cache_evictions`.

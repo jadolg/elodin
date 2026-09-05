@@ -40,8 +40,12 @@ ConfigurationDirectory=elodin
 # MemoryMax=256M
 
 # Every connection elodin holds is a descriptor, and systemd leaves the soft
-# limit at 1024 otherwise - which the shipped server.max_connections (512) fits
-# under and nothing much above 900 does. Past the limit the accept loop cannot
+# limit at 1024 otherwise. The shipped server.max_connections (512) fits under
+# it, but not by as much as the table alone suggests: the worker pools, the
+# upstream pools and the readers want a couple of hundred more between them, so
+# a 1024 limit is short somewhere above 700 rather than above 1000, and lower
+# again on a box with cores enough to derive more workers. Past the limit the
+# accept loop cannot
 # take a connection at all: it waits between attempts, escalating to a second,
 # warns once naming this setting, and counts each wait as accept_backoff=. 8192 leaves
 # room to raise max_connections into the thousands without editing the unit;

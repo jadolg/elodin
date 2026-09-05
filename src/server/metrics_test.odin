@@ -1,5 +1,7 @@
 package server
 
+import "core:fmt"
+import "core:reflect"
 import "core:strings"
 import "core:testing"
 import "core:time"
@@ -209,23 +211,23 @@ expect_line :: proc(t: ^testing.T, page: string, line: string, loc := #caller_lo
 }
 
 /*
-Every counter the endpoint publishes is also in the line, with its own value.
+Every counter in `Stats` appears in the line, with its own value.
 
-The third of the three guards, and the one that was missing. `stats_of` carries a
-counter, `render` publishes it, and this line is where an operator reads it when
-`metrics.enabled` is off - which is the default, so for most deployments it is
-the only place the figure exists at all.
+Read off the struct rather than off a list kept here by hand, which is the
+difference between a guard and a note. The first version of this test carried the
+list, and so had exactly the failure it was written to close: it checked the
+counters somebody remembered, and `Stats.rewritten` - published by the endpoint
+since it existed, absent from the line since it existed - passed it.
 
-Both of the counters this project has added and then failed to report went
-missing exactly here: `cache_withheld` reached the endpoint and not the line, and
-`accept_backoff` reached the struct, the endpoint, the README and every hint that
-points at this line, and not the line. Neither of the other two guards could see
-it, because neither reads the line.
+`reflect.struct_field_names` cannot forget. A counter added to `Stats` and left
+out of `stats_line` fails here on the day it is added, which is what the other
+two guards do for the snapshot and the endpoint.
 
-Distinct values, so a field printed in the wrong position fails rather than
-passing on a coincidence, and the assertion is per counter rather than over the
-whole string: what has to be true is that each one is *there*, not that the line
-is spelled a particular way.
+Distinct values, and the value is asserted with the name, so a field printed from
+the wrong counter fails rather than passing on the presence of its key. Every
+field of `Stats` is a `u64` and every one belongs in the line, so there is no
+exception list - and if either ever stops being true, this test is where it has
+to be argued.
 */
 @(test)
 test_the_stats_line_carries_every_counter :: proc(t: ^testing.T) {
@@ -256,25 +258,23 @@ test_the_stats_line_carries_every_counter :: proc(t: ^testing.T) {
 	}
 	line := stats_line(st, cs, 30, 31, 40, 41, 42)
 
+	for name in reflect.struct_field_names(Stats) {
+		value := reflect.struct_field_value_by_name(st, name)
+		count, ok := value.(u64)
+		testing.expectf(t, ok, "Stats.%s is not a u64; this guard assumes every counter is one", name)
+		if !ok {
+			continue
+		}
+		want := fmt.tprintf("%s=%d", name, count)
+		testing.expectf(t, strings.contains(line, want), "the stats line is missing %q: %s", want, line)
+	}
+
+	// The figures that do not live in `Stats` - the limiter's and the cache's -
+	// which the walk above cannot see.
 	for want in ([]string {
-			"queries=1",
-			"blocked=2",
-			"cached=3",
-			"forwarded=4",
-			"failed=5",
-			"dropped=7",
-			"refused=8",
-			"conn_refused=9",
 			"conn_rate_limited=42",
-			"conn_failed=10",
-			"accept_backoff=16",
-			"handshakes=11",
 			"limited=40",
 			"truncated=41",
-			"secure=12",
-			"bogus=13",
-			"rebind=14",
-			"special_use=15",
 			"cache_entries=30",
 			"cache_bytes=31",
 			"cache_hits=20",
