@@ -188,7 +188,7 @@ metrics_accept_loop :: proc(data: rawptr) {
 	l := ctx.listeners
 
 	// As in the DNS accept loops.
-	failures := 0
+	run: Accept_Run
 	for !sync.atomic_load(&l.stop) {
 		client_socket, client, err := net.accept_tcp(l.metrics_socket)
 		if err != nil {
@@ -198,18 +198,18 @@ metrics_accept_loop :: proc(data: rawptr) {
 			// The DNS listeners' handling exactly: `accept_backoff=` counts
 			// the waiting rather than a connection, so this loop can share it
 			// without putting a scraper into a client-facing counter.
-			act := accept_action(err, failures)
-			failures = act.failures
+			act := accept_action(err, run)
+			run = act.run
 			if act.wait > 0 {
 				sync.atomic_add(&ctx.server.stats.accept_backoff, 1)
 				if act.report {
-					report_accept_failure("metrics", err, &ctx.accept_reported)
+					report_accept_failure("metrics", err, act.wait, &ctx.accept_reported)
 				}
 				time.sleep(act.wait)
 			}
 			continue
 		}
-		failures = 0
+		run = {}
 		serve_metrics(ctx.server, l, client_socket, client)
 		net.close(client_socket)
 		// This loop is the one place that never resets the arena otherwise, and
@@ -391,7 +391,7 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 		&b,
 		"elodin_accept_backoffs_total",
 		.Counter,
-		"Times a listener waited before retrying an accept it could not complete; a few while a burst clears, then about one per second per listener for as long as it does not.",
+		"Times a listener waited before retrying an accept it could not complete; a few while a burst clears, then steadily for as long as it does not - about one a second per listener out of descriptors, about twenty for one meeting a stream of per-connection errors.",
 		st.accept_backoff,
 	)
 	metrics.scalar(

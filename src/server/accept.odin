@@ -149,6 +149,36 @@ accept_ceiling :: proc(err: net.Accept_Error) -> time.Duration {
 }
 
 /*
+How long a listener has to have been failing before it says so.
+
+One rule for both ceilings, in the terms an operator would use: the `warn` is
+said once this listener has actually spent about a second not accepting. Not
+"once the wait reached its ceiling", which is what this was and which read very
+differently on either side of it - a shortage reached its ceiling after a second,
+and a queue error reached its own after sixty-three milliseconds, so a route flap
+queueing ten bad entries burned the one warning a listener gets on a condition
+that had lasted a sixteenth of a second. That is the case the doc below calls out
+as the thing not to spend it on.
+
+Stated as a duration rather than as a count of failures because the two ceilings
+make the same count mean different things, and what matters is neither: it is how
+long this listener has not been taking connections.
+*/
+ACCEPT_REPORT_AFTER :: time.Second
+
+/*
+A run of consecutive failures, carried by the loop between iterations.
+
+`waited` alongside `failures` because the report is decided on the time and the
+wait on the count, and neither can be got from the other once the two ceilings
+are in play.
+*/
+Accept_Run :: struct {
+	failures: int,
+	waited:   time.Duration,
+}
+
+/*
 What the loop does about one accept error, as data.
 
 The whole of the loop's decision, so that it can be tested as a sequence rather
@@ -159,25 +189,24 @@ classifier would show.
 
 `report` is deliberately not "we waited". A wait short enough to be part of the
 escalation is a condition that may yet clear, and the one `warn` this design
-allots per listener must not be spent on one that does: it is said when the wait
-has reached the ceiling, which is the point at which the condition has outlived
-every reading of it but the persistent one.
+allots per listener must not be spent on one that does - see
+`ACCEPT_REPORT_AFTER`.
 */
 Accept_Action :: struct {
-	// The consecutive-failure count carried into the next iteration.
-	failures: int,
+	// Carried into the next iteration.
+	run:    Accept_Run,
 	// Zero where the loop should retry at once.
-	wait:     time.Duration,
-	report:   bool,
+	wait:   time.Duration,
+	report: bool,
 }
 
-accept_action :: proc(err: net.Accept_Error, failures: int) -> Accept_Action {
+accept_action :: proc(err: net.Accept_Error, run: Accept_Run) -> Accept_Action {
 	if !accept_failed(err) {
-		return Accept_Action{failures = 0}
+		return Accept_Action{}
 	}
-	n := failures + 1
+	n := run.failures + 1
 	if n <= ACCEPT_FAST_RETRIES {
-		return Accept_Action{failures = n}
+		return Accept_Action{run = Accept_Run{failures = n, waited = run.waited}}
 	}
 	// The ceiling for anything past the useful doublings, so the shift can never
 	// be one that overflows - see `ACCEPT_ESCALATION_STEPS`.
@@ -186,10 +215,12 @@ accept_action :: proc(err: net.Accept_Error, failures: int) -> Accept_Action {
 	if steps := n - ACCEPT_FAST_RETRIES - 1; steps < ACCEPT_ESCALATION_STEPS {
 		wait = min(ceiling, ACCEPT_FIRST_WAIT << uint(steps))
 	}
-	// Said once the wait has stopped escalating, which is where the condition has
-	// outlived every reading of it but the persistent one - whichever ceiling
-	// this failure is held to.
-	return Accept_Action{failures = n, wait = wait, report = wait >= ceiling}
+	waited := run.waited + wait
+	return Accept_Action {
+		run = Accept_Run{failures = n, waited = waited},
+		wait = wait,
+		report = waited >= ACCEPT_REPORT_AFTER,
+	}
 }
 
 /*
@@ -200,8 +231,8 @@ and what decides the line rate here is a condition that lasts rather than a peer
 that repeats, so a line per attempt would be a line per second for as long as it
 holds. `accept_backoff=` in the stats line is what makes the demotion safe.
 
-Reached only once the wait has escalated to `ACCEPT_BACKOFF` - see
-`accept_action` - so the flag below is not spent on a burst that clears.
+Reached only once this listener has spent `ACCEPT_REPORT_AFTER` not accepting -
+see `accept_action` - so the flag below is not spent on a burst that clears.
 
 Two shapes, because the two ask for different things. A descriptor shortage is an
 environment that has to be raised, and the limit to raise is not in elodin's
@@ -249,7 +280,12 @@ accept_failure_words :: proc(err: net.Accept_Error, listener_flag: ^bool) -> Acc
 }
 
 @(private)
-report_accept_failure :: proc(listener: string, err: net.Accept_Error, listener_flag: ^bool) {
+report_accept_failure :: proc(
+	listener: string,
+	err: net.Accept_Error,
+	wait: time.Duration,
+	listener_flag: ^bool,
+) {
 	words := accept_failure_words(err, listener_flag)
 	say, first := report_once(words.reported, logx.enabled(.Debug))
 	if !say {
@@ -259,11 +295,14 @@ report_accept_failure :: proc(listener: string, err: net.Accept_Error, listener_
 	// resets its own temp arena, and the line was formatted out of it.
 	defer free_all(context.temp_allocator)
 
+	// The figure this listener is actually waiting, which since the two ceilings
+	// exist is not `ACCEPT_BACKOFF` for every caller: a queue error settles at a
+	// twentieth of it, and a line naming the wrong one is off by that much.
 	if !first {
-		logx.debugf(words.brief, listener, ACCEPT_BACKOFF, err)
+		logx.debugf(words.brief, listener, wait, err)
 		return
 	}
-	logx.warnf(words.line, listener, ACCEPT_BACKOFF, err)
+	logx.warnf(words.line, listener, wait, err)
 	logx.warnf(words.hint)
 }
 

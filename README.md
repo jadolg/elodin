@@ -1828,7 +1828,7 @@ as a warning at startup.
 | `elodin_connections_refused_total` | counter | refused for want of a slot: `server.max_connections` full, or the client's prefix already holding its share |
 | `elodin_connections_rate_limited_total` | counter | refused because the prefix was opening connections faster than `rate_limit.responses_per_second` allows |
 | `elodin_connections_failed_total` | counter | refused because the OS would not start a thread |
-| `elodin_accept_backoffs_total` | counter | times a listener waited before retrying an accept it could not complete; a few while a burst clears, then steadily for as long as it does not — usually for want of file descriptors. Read it in the `msg=stats` line rather than here when descriptors are what ran out: this endpoint has an accept loop of its own and cannot be scraped either |
+| `elodin_accept_backoffs_total` | counter | times a listener waited before retrying an accept it could not complete; a few while a burst clears, then steadily for as long as it does not — about one a second per listener out of descriptors, about twenty for one meeting a stream of per-connection errors. Read it in the `msg=stats` line rather than here when descriptors are what ran out: this endpoint has an accept loop of its own and cannot be scraped either |
 | `elodin_connections_active` / `_max` | gauge | connection threads in use, and what the limit allows |
 | `elodin_connections_max_per_prefix` | gauge | how many of those one client prefix may hold; equal to `_max` when there is no share |
 | `elodin_tls_handshakes_total` | counter | TLS handshakes completed on the DoT and DoH listeners |

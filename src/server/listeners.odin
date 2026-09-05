@@ -1454,9 +1454,9 @@ accept_loop :: proc(data: rawptr) {
 	l := ctx.listeners
 	listener := listening_socket(l, ctx.proto)
 
-	// Consecutive failures, reset by anything that is not one - an accepted
-	// connection, or the poll tick. See `accept_failed`.
-	failures := 0
+	// The run of consecutive failures, reset by anything that is not one - an
+	// accepted connection, or the poll tick. See `accept_failed`.
+	run: Accept_Run
 	for !sync.atomic_load(&l.stop) {
 		client_socket, client, err := net.accept_tcp(listener)
 		if err != nil {
@@ -1481,18 +1481,18 @@ accept_loop :: proc(data: rawptr) {
 			failures then a success then a shortage - can be tested without a
 			socket.
 			*/
-			act := accept_action(err, failures)
-			failures = act.failures
+			act := accept_action(err, run)
+			run = act.run
 			if act.wait > 0 {
 				sync.atomic_add(&ctx.server.stats.accept_backoff, 1)
 				if act.report {
-					report_accept_failure(proto_name(ctx.proto), err, &ctx.accept_reported)
+					report_accept_failure(proto_name(ctx.proto), err, act.wait, &ctx.accept_reported)
 				}
 				time.sleep(act.wait)
 			}
 			continue
 		}
-		failures = 0
+		run = {}
 
 		/*
 		Closed here rather than handed a thread that would answer REFUSED.

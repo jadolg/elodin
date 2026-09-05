@@ -205,12 +205,12 @@ test_a_burst_that_clears_costs_almost_nothing :: proc(t: ^testing.T) {
 	one - worse than the spin this change removes, since the spin at least kept
 	accepting.
 	*/
-	failures := 0
+	run: Accept_Run
 	total: time.Duration
 	reports := 0
 	for _ in 0 ..< 4 {
-		act := accept_action(.Unknown, failures)
-		failures = act.failures
+		act := accept_action(.Unknown, run)
+		run = act.run
 		total += act.wait
 		reports += 1 if act.report else 0
 	}
@@ -222,34 +222,35 @@ test_a_burst_that_clears_costs_almost_nothing :: proc(t: ^testing.T) {
 	testing.expect_value(t, reports, 0)
 
 	// And the queue moves on: one accepted connection puts it back to nothing.
-	after := accept_action(.None, failures)
-	testing.expect_value(t, after.failures, 0)
+	after := accept_action(.None, run)
+	testing.expect_value(t, after.run.failures, 0)
+	testing.expect_value(t, after.run.waited, 0)
 	testing.expect_value(t, after.wait, 0)
 }
 
 @(test)
 test_the_first_failures_are_retried_at_once :: proc(t: ^testing.T) {
-	failures := 0
+	run: Accept_Run
 	for i in 1 ..= ACCEPT_FAST_RETRIES {
-		act := accept_action(.Insufficient_Resources, failures)
-		failures = act.failures
+		act := accept_action(.Insufficient_Resources, run)
+		run = act.run
 		testing.expectf(t, act.wait == 0, "failure %d should be retried at once", i)
-		testing.expect_value(t, act.failures, i)
+		testing.expect_value(t, act.run.failures, i)
 	}
 	// The next one waits, because it has not cleared.
-	act := accept_action(.Insufficient_Resources, failures)
+	act := accept_action(.Insufficient_Resources, run)
 	testing.expect(t, act.wait > 0, "a failure that survives the free retries has to be waited out")
 }
 
 @(test)
 test_a_shortage_reaches_one_attempt_a_second_and_stays :: proc(t: ^testing.T) {
-	failures := 0
+	run: Accept_Run
 	total: time.Duration
 	first_report := -1
 	// Long enough to be well past the escalation, short enough to be a test.
 	for i in 0 ..< 40 {
-		act := accept_action(.Insufficient_Resources, failures)
-		failures = act.failures
+		act := accept_action(.Insufficient_Resources, run)
+		run = act.run
 		total += act.wait
 		if act.report && first_report < 0 {
 			first_report = i
@@ -257,7 +258,7 @@ test_a_shortage_reaches_one_attempt_a_second_and_stays :: proc(t: ^testing.T) {
 	}
 	testing.expect(
 		t,
-		accept_action(.Insufficient_Resources, failures).wait == ACCEPT_BACKOFF,
+		accept_action(.Insufficient_Resources, run).wait == ACCEPT_BACKOFF,
 		"a shortage that does not clear settles at the ceiling",
 	)
 	testing.expect(
@@ -297,7 +298,7 @@ burned belongs to the socket that genuinely goes bad later.
 */
 @(test)
 test_a_short_wait_does_not_spend_the_one_warning :: proc(t: ^testing.T) {
-	act := accept_action(.Unknown, ACCEPT_FAST_RETRIES)
+	act := accept_action(.Unknown, Accept_Run{failures = ACCEPT_FAST_RETRIES})
 	testing.expect(t, act.wait > 0 && act.wait < ACCEPT_BACKOFF, "the first wait is a short one")
 	testing.expect(t, !act.report, "a wait that may yet clear must not spend the warning")
 }
@@ -318,11 +319,11 @@ the arithmetic goes wrong is the shape of test this whole review has been about.
 */
 @(test)
 test_no_wait_is_ever_zero_or_negative :: proc(t: ^testing.T) {
-	failures := 0
+	run: Accept_Run
 	for i in 0 ..< 200 {
-		act := accept_action(.Insufficient_Resources, failures)
-		failures = act.failures
-		if act.failures <= ACCEPT_FAST_RETRIES {
+		act := accept_action(.Insufficient_Resources, run)
+		run = act.run
+		if act.run.failures <= ACCEPT_FAST_RETRIES {
 			// The free retries, which are a wait of nothing on purpose.
 			testing.expect_value(t, act.wait, 0)
 			continue
@@ -332,7 +333,7 @@ test_no_wait_is_ever_zero_or_negative :: proc(t: ^testing.T) {
 			act.wait > 0,
 			"iteration %d (failure %d): wait is %v, so the loop would neither sleep nor count",
 			i,
-			act.failures,
+			act.run.failures,
 			act.wait,
 		)
 		testing.expectf(
@@ -345,7 +346,7 @@ test_no_wait_is_ever_zero_or_negative :: proc(t: ^testing.T) {
 		)
 	}
 	// And it is the ceiling by then, not something merely positive.
-	testing.expect_value(t, accept_action(.Insufficient_Resources, failures).wait, ACCEPT_BACKOFF)
+	testing.expect_value(t, accept_action(.Insufficient_Resources, run).wait, ACCEPT_BACKOFF)
 }
 
 /*
@@ -360,11 +361,11 @@ ones, which is the starvation this design argues against met from the other side
 */
 @(test)
 test_a_stream_of_queue_errors_settles_far_below_the_shortage_ceiling :: proc(t: ^testing.T) {
-	failures := 0
+	run: Accept_Run
 	settled: time.Duration
 	for _ in 0 ..< 40 {
-		act := accept_action(.Unknown, failures)
-		failures = act.failures
+		act := accept_action(.Unknown, run)
+		run = act.run
 		settled = act.wait
 	}
 	testing.expect_value(t, settled, ACCEPT_QUEUE_CEILING)
@@ -375,9 +376,64 @@ test_a_stream_of_queue_errors_settles_far_below_the_shortage_ceiling :: proc(t: 
 	)
 
 	// The shortage still gets the long one: nothing is drained by waiting there.
-	shortage := 0
+	shortage: Accept_Run
 	for _ in 0 ..< 40 {
-		shortage = accept_action(.Insufficient_Resources, shortage).failures
+		shortage = accept_action(.Insufficient_Resources, shortage).run
 	}
 	testing.expect_value(t, accept_action(.Insufficient_Resources, shortage).wait, ACCEPT_BACKOFF)
+}
+
+/*
+The one warning is spent on time not accepting, not on reaching a ceiling.
+
+Deciding it on the ceiling read very differently on either side of the two: a
+shortage reached its own after a second, and a queue error reached its after
+sixty-three milliseconds - so ten bad entries from a route flap, which is this
+file's own example of a burst that clears, permanently burned the one `warn` a
+listener gets, on a line telling the operator its socket may no longer be usable.
+
+The rule is a duration now, and the assertion is what an operator would say: ten
+consecutive queue errors say nothing, because a sixteenth of a second is not a
+listener in trouble; a run that really does go on says so, whichever ceiling it
+is held to.
+*/
+@(test)
+test_the_warning_waits_for_a_second_of_not_accepting :: proc(t: ^testing.T) {
+	run: Accept_Run
+	for _ in 0 ..< 10 {
+		act := accept_action(.Unknown, run)
+		run = act.run
+		testing.expectf(
+			t,
+			!act.report,
+			"a burst of ten queue errors is %v of waiting and must not spend the warning",
+			run.waited,
+		)
+	}
+	testing.expect(t, run.waited < ACCEPT_REPORT_AFTER, "ten of them are not a second")
+
+	// Kept up, the same condition does earn it.
+	for _ in 0 ..< 60 {
+		run = accept_action(.Unknown, run).run
+	}
+	testing.expect(t, accept_action(.Unknown, run).report, "a run that lasts a second has to be said")
+
+	// And the shortage earns it on the same rule, which is what makes it one
+	// rule: about a second of waiting, reached by a different road.
+	shortage: Accept_Run
+	said := -1
+	for i in 0 ..< 40 {
+		act := accept_action(.Insufficient_Resources, shortage)
+		shortage = act.run
+		if act.report && said < 0 {
+			said = i
+		}
+	}
+	testing.expect(t, said >= 0, "a shortage has to be said too")
+	testing.expectf(
+		t,
+		shortage.waited >= ACCEPT_REPORT_AFTER,
+		"and only once it has cost a second: %v",
+		shortage.waited,
+	)
 }
