@@ -180,6 +180,59 @@ misspelt account name fails `--check`; running as root with no `server.user`
 logs a warning. `blocking.cache_dir` changes owner along with the process, since
 a refresh hours later has to reopen it.
 
+### Running this publicly
+
+`allow_from: []` (see [Who may ask](#who-may-ask)) is the one setting that turns
+this from a LAN resolver into one anybody can reach, and every default in this
+file is sized for a household rather than for that. This is the checklist for
+the difference and the figures behind it, rather than a repeat of them —
+[`examples/public.yaml`](examples/public.yaml) is the configuration that
+already makes these choices.
+
+**What has to be in front of it, because nothing behind it can be:**
+
+- A packet filter, or upstream scrubbing, for the datagram rate. Past what the
+  UDP readers can drain, the kernel's own receive queue decides who is served,
+  not the limiter — see [how fast datagrams can be
+  read](#how-fast-datagrams-can-be-read). Measured on a 4-core aarch64 VM: one
+  reader drains 2.3 million datagrams a second, and a flood of two million a
+  second still cost the queue 4% of arrivals with that reader nowhere near
+  saturated. Scale the figure to your own cores, and watch
+  `elodin_udp_receive_drops_total` to see whether your instance is anywhere
+  near it.
+- A per-source connection rate limit. Nothing bounds how many TLS handshakes a
+  source can *start*, only how many connections it can *hold* at once — see
+  [a connection rate limit in front](#a-connection-rate-limit-in-front) for the
+  nftables rule and the figures behind it.
+
+**What to tune in the kernel:**
+
+- `net.core.rmem_max` — 208 KiB on a machine nobody has tuned, which clamps
+  `listeners.udp.receive_buffer` regardless of what is configured. Raise the
+  sysctl if you raise the setting; the startup line reports what was actually
+  granted.
+- `listeners.udp.readers` against your core count. Left at `0` it derives one
+  reader per usable CPU, up to eight, which `--check` prints.
+
+**What elodin bounds on its own,** measured and holding for an hour of
+flooding (`bench/results/2026-09-03-soak-one-hour.md`):
+
+- The response budget: 500 responses/s per /24 or /64 by default, so at most
+  about 0.58 MB/s aimed at one victim ([rate limiting](#rate-limiting)).
+- A per-prefix share of the connection table ([how many connections one client
+  may hold](#how-many-connections-one-client-may-hold)).
+- Steady state under a 20,000 q/s flood held for an hour: 74–75 MB resident,
+  103 threads, the cache pinned at `max_entries` after turning over 187 times,
+  and the connection table lending and reclaiming a slot 174,176 times without
+  leaking one or refusing one. Nothing measured there drifts with uptime.
+
+**What it does not bound:** a packet flood above the readers' drain rate, or a
+handshake flood — the accept refuses both, but a refusal is cheap rather than
+free, and a source paying nothing to dial again simply dials faster. That gap
+is what the packet filter and the connection rate limit above are for; none of
+this is a defence on its own, and the sections it links to say so again where
+the figures are.
+
 ### Signals
 
 `SIGTERM` and `SIGINT` stop the listeners and let the worker pools drain. Open
