@@ -121,6 +121,21 @@ metrics_accept_loop :: proc(data: rawptr) {
 			if sync.atomic_load(&l.stop) {
 				break
 			}
+			/*
+			The DNS listeners' handling, for the same reason and with one
+			difference: nothing here is counted.
+
+			`conn_failed=` is a client elodin would have served and could not,
+			and this port is deliberately outside that accounting - a scraper
+			cannot spend the connection table, so a scraper's accept must not
+			move the counter an operator reads to see whether their clients are
+			being turned away. The `warn` is shared, because a process out of
+			descriptors is one fact rather than one per listener.
+			*/
+			if accept_retry(err) == .After_Backoff {
+				report_accept_failure("metrics", err)
+				time.sleep(ACCEPT_BACKOFF)
+			}
 			continue
 		}
 		serve_metrics(ctx.server, l, client_socket, client)

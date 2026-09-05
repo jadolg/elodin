@@ -127,6 +127,15 @@ start_listeners :: proc(s: ^Server, l: ^Listeners) -> bool {
 			"%s",
 			connection_limits_line(s.cfg.server.max_connections, s.cfg.server.max_connections_per_prefix),
 		)
+		// Only where it is short, and `--check` says the same. See
+		// `descriptor_limit_line`.
+		if line, short := descriptor_limit_line(
+			descriptor_limit(),
+			s.cfg.server.max_connections,
+			config.pooled_upstream_connections(s.cfg.upstream),
+		); short {
+			logx.warnf("%s", line)
+		}
 	}
 
 	if s.cfg.listeners.udp.enabled {
@@ -1435,6 +1444,24 @@ accept_loop :: proc(data: rawptr) {
 		if err != nil {
 			if sync.atomic_load(&l.stop) {
 				break
+			}
+			/*
+			Most of these are the poll tick this loop is built on, and cost
+			nothing. The rest are told apart by `accept_retry`, because the ones
+			that leave the connection queued fail again immediately and a bare
+			`continue` over those is a busy wait - see `accept.odin`.
+
+			Counted as `conn_failed=` rather than `conn_refused=`, on the same
+			division the spawn failures below draw: no limit in this
+			configuration decided this, the OS would not give the process what a
+			connection needs, and raising `max_connections` cannot help and would
+			make it worse. That it is a descriptor here and a thread there is
+			what the `warn` line says.
+			*/
+			if accept_retry(err) == .After_Backoff {
+				sync.atomic_add(&ctx.server.stats.conn_failed, 1)
+				report_accept_failure(proto_name(ctx.proto), err)
+				time.sleep(ACCEPT_BACKOFF)
 			}
 			continue
 		}
