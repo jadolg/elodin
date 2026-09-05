@@ -127,12 +127,17 @@ start_listeners :: proc(s: ^Server, l: ^Listeners) -> bool {
 			"%s",
 			connection_limits_line(s.cfg.server.max_connections, s.cfg.server.max_connections_per_prefix),
 		)
-		// Only where it is short, and `--check` says the same. See
+		// Startup only - `--check` reads a different process's limit. See
 		// `descriptor_limit_line`.
 		if line, short := descriptor_limit_line(
 			descriptor_limit(),
-			s.cfg.server.max_connections,
-			config.pooled_upstream_connections(s.cfg.upstream),
+			Descriptor_Demand {
+				max_connections = s.cfg.server.max_connections,
+				pooled_upstream = config.pooled_upstream_connections(s.cfg.upstream),
+				workers = s.cfg.server.workers,
+				upstream_workers = s.cfg.server.upstream_workers,
+				udp_readers = s.cfg.listeners.udp.readers if s.cfg.listeners.udp.enabled else 0,
+			},
 		); short {
 			logx.warnf("%s", line)
 		}
@@ -1209,6 +1214,16 @@ Stream_Context :: struct {
 	server:    ^Server,
 	listeners: ^Listeners,
 	proto:     Protocol,
+	/*
+	Whether this listener has already said that its accepts keep failing.
+
+	Per listener rather than shared, because what it reports is one socket: a
+	listener whose own socket has gone bad says nothing about its neighbour, and
+	one flag between them would let whichever failed first silence the other. The
+	descriptor shortage is the opposite case and keeps a flag for the process -
+	see `accept_failure_words`.
+	*/
+	accept_reported: bool,
 }
 
 @(private)
@@ -1439,6 +1454,9 @@ accept_loop :: proc(data: rawptr) {
 	l := ctx.listeners
 	listener := listening_socket(l, ctx.proto)
 
+	// Consecutive failures, reset by anything that is not one - an accepted
+	// connection, or the poll tick. See `accept_failed`.
+	failures := 0
 	for !sync.atomic_load(&l.stop) {
 		client_socket, client, err := net.accept_tcp(listener)
 		if err != nil {
@@ -1447,24 +1465,31 @@ accept_loop :: proc(data: rawptr) {
 			}
 			/*
 			Most of these are the poll tick this loop is built on, and cost
-			nothing. The rest are told apart by `accept_retry`, because the ones
-			that leave the connection queued fail again immediately and a bare
-			`continue` over those is a busy wait - see `accept.odin`.
+			nothing. What is left is counted rather than judged on the spot, for
+			the reason `accept_failed` sets out: a per-connection network error
+			and a descriptor shortage arrive as the same value, and only whether
+			it clears tells them apart.
 
-			Counted as `conn_failed=` rather than `conn_refused=`, on the same
-			division the spawn failures below draw: no limit in this
-			configuration decided this, the OS would not give the process what a
-			connection needs, and raising `max_connections` cannot help and would
-			make it worse. That it is a descriptor here and a thread there is
-			what the `warn` line says.
+			Not counted as `conn_failed=`. That is a connection this server would
+			have served and could not, and on this path there is no such
+			connection: a shortage leaves the peer queued, to be accepted when
+			there is room, so calling it turned away would be a refusal that
+			never happened. `accept_backoff=` counts the waiting instead, which
+			is what actually occurred.
 			*/
-			if accept_retry(err) == .After_Backoff {
-				sync.atomic_add(&ctx.server.stats.conn_failed, 1)
-				report_accept_failure(proto_name(ctx.proto), err)
+			if !accept_failed(err) {
+				failures = 0
+				continue
+			}
+			failures += 1
+			if failures > ACCEPT_FAST_RETRIES {
+				sync.atomic_add(&ctx.server.stats.accept_backoff, 1)
+				report_accept_failure(proto_name(ctx.proto), err, &ctx.accept_reported)
 				time.sleep(ACCEPT_BACKOFF)
 			}
 			continue
 		}
+		failures = 0
 
 		/*
 		Closed here rather than handed a thread that would answer REFUSED.

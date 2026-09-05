@@ -41,8 +41,10 @@ not to spend.
 
 @(private)
 Metrics_Context :: struct {
-	server:    ^Server,
-	listeners: ^Listeners,
+	server:          ^Server,
+	listeners:       ^Listeners,
+	// As on `Stream_Context`, and for its reason.
+	accept_reported: bool,
 }
 
 /*
@@ -115,29 +117,30 @@ metrics_accept_loop :: proc(data: rawptr) {
 	ctx := cast(^Metrics_Context)data
 	l := ctx.listeners
 
+	// As in the DNS accept loops.
+	failures := 0
 	for !sync.atomic_load(&l.stop) {
 		client_socket, client, err := net.accept_tcp(l.metrics_socket)
 		if err != nil {
 			if sync.atomic_load(&l.stop) {
 				break
 			}
-			/*
-			The DNS listeners' handling, for the same reason and with one
-			difference: nothing here is counted.
-
-			`conn_failed=` is a client elodin would have served and could not,
-			and this port is deliberately outside that accounting - a scraper
-			cannot spend the connection table, so a scraper's accept must not
-			move the counter an operator reads to see whether their clients are
-			being turned away. The `warn` is shared, because a process out of
-			descriptors is one fact rather than one per listener.
-			*/
-			if accept_retry(err) == .After_Backoff {
-				report_accept_failure("metrics", err)
+			// The DNS listeners' handling exactly: `accept_backoff=` counts
+			// the waiting rather than a connection, so this loop can share it
+			// without putting a scraper into a client-facing counter.
+			if !accept_failed(err) {
+				failures = 0
+				continue
+			}
+			failures += 1
+			if failures > ACCEPT_FAST_RETRIES {
+				sync.atomic_add(&ctx.server.stats.accept_backoff, 1)
+				report_accept_failure("metrics", err, &ctx.accept_reported)
 				time.sleep(ACCEPT_BACKOFF)
 			}
 			continue
 		}
+		failures = 0
 		serve_metrics(ctx.server, l, client_socket, client)
 		net.close(client_socket)
 		// This loop is the one place that never resets the arena otherwise, and
@@ -314,6 +317,13 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 		.Counter,
 		"Connections turned away because the OS would not start a thread for one.",
 		st.conn_failed,
+	)
+	metrics.scalar(
+		&b,
+		"elodin_accept_backoffs_total",
+		.Counter,
+		"Times a listener waited before retrying an accept it could not complete; one per second per listener while accepts are failing.",
+		st.accept_backoff,
 	)
 	metrics.scalar(
 		&b,

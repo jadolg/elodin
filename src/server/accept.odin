@@ -6,90 +6,105 @@ import "core:sys/posix"
 import "elodin:logx"
 
 /*
-What an accept loop does with an error, which is not the same for all of them.
+Whether an accept error is a failure at all.
 
-`net.accept_tcp` fails for three unrelated reasons and the loop used to answer
-all of them with `continue`. That is right for two of them and wrong for the
-third:
+`net.accept_tcp` returns for three unrelated reasons and only one of them is
+trouble:
 
   - **The poll tick.** The listening sockets carry a `Receive_Timeout` of
     `LISTENER_POLL` so the loop wakes to see `stop` (`start_stream`), and every
     tick of it returns `Would_Block` - `Timeout` on a platform that reports it
-    that way. It is the ordinary idle path, once a second per listener, and it
-    has to stay free: no line, no counter, and no sleep on top of the second the
-    kernel already waited.
+    that way. It is the ordinary idle path, once a second per listener.
   - **A connection that went away.** `Aborted` is a peer that closed between the
-    SYN and the accept, `Interrupted` a signal. The queue has moved on, the next
-    accept is a fresh one, and retrying at once is the whole handling.
-  - **The process is out of descriptors.** `EMFILE`, `ENFILE`, `ENOBUFS` and
-    `ENOMEM` all arrive as `Insufficient_Resources`, and the connection stays
-    queued. So the next accept fails on the same shortage immediately, and a loop
-    that answers with `continue` is a busy wait - a core per listener, serving
-    nothing, for as long as the shortage lasts.
+    SYN and the accept, `Interrupted` a signal. The queue has moved on and the
+    next accept is a fresh one.
+  - **Everything else**, which is a failure and which the loop counts.
 
-`Now` for the first two, `After_Backoff` for everything else. **The default is
-the back-off, deliberately.** An error this does not know about is one whose
-persistence it also does not know, and the safe reading of "unknown, repeated at
-full speed" is the failure above. It also means the mapping this file believes -
-that a descriptor shortage arrives as `Insufficient_Resources` - is not what the
-fix rests on: were it wrong, the shortage would fall to the default and still be
-backed off, and what would be lost is the specific hint in the log rather than
-the loop.
+Deliberately not the whole decision. What to *do* about a failure cannot be read
+off this enum, because Linux hands two very different things through it. From
+`accept(2)`:
+
+> Linux accept() passes already-pending network errors on the new socket as an
+> error code from accept(). [...] These errors should be treated like EAGAIN by
+> retrying.
+
+That set - `EPROTO`, `ENETDOWN`, `ENOPROTOOPT`, `EHOSTDOWN`, `ENONET`,
+`EHOSTUNREACH`, `ENETUNREACH`, and `EPERM` from a firewall reject - is per
+connection and clears as soon as the queue moves past it. `core:net` maps all of
+them to `Unknown` (`EOPNOTSUPP` to `Unsupported_Socket`), which is where a
+descriptor shortage would also land if the mapping this file believes were ever
+wrong. One asks to be retried at once; the other asks to be waited out, and they
+arrive as the same value.
+
+So the loop does not decide on the value. It counts *consecutive* failures and
+retries the first `ACCEPT_FAST_RETRIES` immediately, which is what `accept(2)`
+asks for and costs a pending network error nothing at all - no wait, no line, no
+counter. A failure that survives that many attempts in a row is one that is not
+clearing, and only then is it waited out. That is the reading that does not
+depend on telling the two apart, which is the reading available.
 */
-Accept_Retry :: enum {
-	Now,
-	After_Backoff,
-}
-
-accept_retry :: proc(err: net.Accept_Error) -> Accept_Retry {
+accept_failed :: proc(err: net.Accept_Error) -> bool {
 	#partial switch err {
 	case .None, .Would_Block, .Timeout, .Aborted, .Interrupted:
-		return .Now
+		return false
 	}
-	return .After_Backoff
+	return true
 }
 
 /*
-How long a loop waits before trying an accept that failed again.
+How many times a failing accept is retried at once before the loop waits.
+
+Small, because the thing it buys is that a per-connection error clears without a
+wait, and the queue moves past one of those in one attempt. Not one, so that a
+handful arriving together - a network event does not produce exactly one - still
+costs nothing.
+
+The cost of it being too large is a spin of that many iterations, which is
+nothing; the cost of it being too small is a listener that goes deaf for a second
+over an error that would have cleared. So it errs upward.
+*/
+ACCEPT_FAST_RETRIES :: 3
+
+/*
+How long a loop waits once a failure has not cleared.
 
 `LISTENER_POLL` rather than a figure of its own, because the loop already has
 exactly this constant and exactly this meaning: it is the longest an accept loop
-ever goes without looking at `stop`. A shorter back-off would buy nothing - the
-condition it waits out is a descriptor shortage, not a busy moment - and a longer
-one would be a second meaning for "how long shutdown can take", which is the
-thing the poll interval already is.
+ever goes without looking at `stop`. A shorter wait would buy nothing - what it
+waits out is a descriptor shortage, not a busy moment - and a longer one would be
+a second meaning for "how long shutdown can take", which the poll interval
+already is.
 
 So a spinning loop becomes one attempt per second per listener, and shutdown is
-no slower than it was: a loop asleep here is a loop that was going to be blocked
-in `accept` for the same second anyway.
+no slower than it was: a loop asleep here would have been blocked in `accept` for
+the same second anyway.
 */
 ACCEPT_BACKOFF :: LISTENER_POLL
 
 /*
-Say why an accept loop is backing off, once, and then quietly.
+Say why an accept loop is waiting, once, and then quietly.
 
 `report_spawn_failure`'s reasoning, met one step earlier: this is the same loop,
-and what decides the line rate here is a shortage that lasts rather than a peer
-that repeats, so a line per attempt would be a line per back-off for as long as
-the condition holds. The counter is what makes the demotion safe - `conn_failed=`
-goes on climbing after the one `warn` has scrolled away.
+and what decides the line rate here is a condition that lasts rather than a peer
+that repeats, so a line per attempt would be a line per second for as long as it
+holds. `accept_backoff=` in the stats line is what makes the demotion safe.
 
 Two shapes, because the two ask for different things. A descriptor shortage is an
-environment that has to be raised, and the setting to raise is not in elodin's
+environment that has to be raised, and the limit to raise is not in elodin's
 configuration at all - which is the whole reason it needs saying, since every
 other refusal in this file names a key an operator can find in their own file.
 Anything else reaching here is a listening socket that has stopped working, where
 there is nothing to raise and the useful thing is the error itself.
 
-Each keeps its own flag so one going quiet does not silence the other, and the
-words are returned as data for the reason `spawn_failure_words` returns them: the
-choosing is the part that can be wrong and a test can hold the two side by side.
+The shortage keeps one flag for the process and the other shape keeps one per
+listener, which is what each of them is: descriptors are exhausted for the
+process, so the second listener to notice is repeating the first, while a socket
+that has gone bad is one socket and says nothing about its neighbour. Sharing
+that second flag would let whichever listener failed first silence the one an
+operator actually needed to hear about.
 */
 @(private)
-accept_resources_reported: bool
-
-@(private)
-accept_unexpected_reported: bool
+accept_shortage_reported: bool
 
 @(private)
 Accept_Failure_Words :: struct {
@@ -102,33 +117,26 @@ Accept_Failure_Words :: struct {
 }
 
 @(private)
-accept_failure_words :: proc(err: net.Accept_Error) -> Accept_Failure_Words {
+accept_failure_words :: proc(err: net.Accept_Error, listener_flag: ^bool) -> Accept_Failure_Words {
 	if err == .Insufficient_Resources {
 		return Accept_Failure_Words {
-			reported = &accept_resources_reported,
-			brief = "%s: still out of descriptors, not accepting for %v (%v)",
-			line = "%s: cannot accept, the process is out of file descriptors - waiting %v before trying again (%v)",
-			hint = "raise the descriptor limit (RLIMIT_NOFILE, LimitNOFILE= in the systemd unit) so it covers server.max_connections with room over; until it does, connections are refused rather than served, and are counted as conn_failed= in the stats line",
+			reported = &accept_shortage_reported,
+			brief = "%s: still out of descriptors, waiting %v before accepting again (%v)",
+			line = "%s: cannot accept, the process is out of file descriptors - waiting %v between attempts until that clears (%v)",
+			hint = "raise the descriptor limit (RLIMIT_NOFILE, LimitNOFILE= in the systemd unit) so it covers server.max_connections with room over; until it does, no connection can be accepted on any listener, and each wait is counted as accept_backoff= in the stats line",
 		}
 	}
 	return Accept_Failure_Words {
-		reported = &accept_unexpected_reported,
-		brief = "%s: accept failed again, not accepting for %v (%v)",
-		line = "%s: accept failed and the listening socket may no longer be usable - waiting %v before trying again (%v)",
-		hint = "nothing in the configuration bounds this one; the error beside it is what the kernel said, and these are counted as conn_failed= in the stats line",
+		reported = listener_flag,
+		brief = "%s: accept is still failing, waiting %v before trying again (%v)",
+		line = "%s: accept keeps failing and this listening socket may no longer be usable - waiting %v between attempts (%v)",
+		hint = "nothing in the configuration bounds this one; the error beside it is what the kernel said, and each wait is counted as accept_backoff= in the stats line",
 	}
 }
 
-/*
-Named by the listener rather than by a `Protocol`, because the metrics endpoint
-has an accept loop too and is not one. It shares the flags with the DNS
-listeners deliberately: what is being rate-limited is the operator's attention,
-and one line about a descriptor shortage is the whole message however many loops
-met it.
-*/
 @(private)
-report_accept_failure :: proc(listener: string, err: net.Accept_Error) {
-	words := accept_failure_words(err)
+report_accept_failure :: proc(listener: string, err: net.Accept_Error, listener_flag: ^bool) {
+	words := accept_failure_words(err, listener_flag)
 	say, first := report_once(words.reported, logx.enabled(.Debug))
 	if !say {
 		return
@@ -146,60 +154,86 @@ report_accept_failure :: proc(listener: string, err: net.Accept_Error) {
 }
 
 /*
-Descriptors this configuration wants at most, against the one limit that is not
-in it.
+Descriptors this configuration can hold open at once, against the one limit that
+is not in it.
 
-Two terms are counted because two are worth counting and both are exact. The
-connection table is the one that moves: `max_connections` is a promise to hold
-that many sockets at once, and a limit below it is a promise the process cannot
-keep. The idle upstream pool is the next largest and is as easy to know -
-`upstream.max_idle` per configured server.
+Every term is a set of descriptors that can be held *at the same time*, and the
+sets are disjoint, so the total is their sum:
 
-Everything else is a handful and is covered by a reserve rather than enumerated:
-up to four listening sockets, the metrics listener, up to eight UDP readers, the
-log, and the list files while they load. `DESCRIPTOR_RESERVE` is deliberately
-larger than that adds up to, because the failure this bounds is a listener that
-stops accepting and the cost of the slack is nothing.
+  - the connection table, which is a promise to hold that many client sockets;
+  - the idle upstream pools, `upstream.max_idle` per configured server, routes
+    included;
+  - the worker pools, since a worker doing an upstream exchange holds a socket
+    for the round trip and a socket checked out of a pool is not in it - so
+    `workers` and `upstream_workers` are in-flight upstream sockets that the
+    pools do not account for;
+  - the UDP readers, one socket each, which is up to `MAX_UDP_READERS` (64) when
+    an operator sets the figure rather than the eight a derivation will pick.
 
-A count, not a measurement: it says what the configuration could want, not what
-the process holds. `process_open_fds` is the other question and the metrics
-endpoint already answers it.
+`DESCRIPTOR_RESERVE` covers what is left - four listening sockets, the metrics
+socket, the log, and the list files while they load - and is a cushion rather
+than a count, which is why it is larger than that adds up to.
+
+A ceiling on what the configuration permits, not a reading of what is held.
+`process_open_fds` is the other question and the metrics endpoint answers it.
 */
-DESCRIPTOR_RESERVE :: 64
+DESCRIPTOR_RESERVE :: 32
 
-descriptors_wanted :: proc(max_connections, upstream_idle: int) -> int {
-	return max_connections + upstream_idle + DESCRIPTOR_RESERVE
+Descriptor_Demand :: struct {
+	max_connections:  int,
+	pooled_upstream:  int,
+	workers:          int,
+	upstream_workers: int,
+	udp_readers:      int,
+}
+
+descriptors_wanted :: proc(d: Descriptor_Demand) -> int {
+	return(
+		d.max_connections +
+		d.pooled_upstream +
+		d.workers +
+		d.upstream_workers +
+		d.udp_readers +
+		DESCRIPTOR_RESERVE \
+	)
 }
 
 /*
-Said only when the limit cannot cover the table, at startup and by `--check`
-alike.
+Said at startup only, and only when the limit cannot cover the table.
 
-Quiet otherwise, which is the departure from `connection_limits_line` beside it
-and is the point: that line reports a figure an operator cannot read anywhere
-else, and this one reports an environment they can - `ulimit -n` - and that is
-almost always fine. A line every start saying so would be noise in the steady
-state, and the steady state is where this server's log has to stay readable.
+Quiet otherwise, which is the departure from `connection_limits_line` beside it:
+that line reports a figure an operator cannot read anywhere else, and this one
+reports an environment they can - `ulimit -n` - and which is almost always fine.
+A line every start saying so would be noise in the steady state, and the steady
+state is where this server's log has to stay readable.
 
-The same words in both places for the reason that one gives: an operator reads
-`--check` before restarting, and two wordings of one fact drift apart.
+Startup only, and *not* `--check`, which is the other departure and the sharper
+one. Every other figure `--check` prints is read from the file it was handed, and
+this one would be read from whichever process happens to be running the check - a
+shell with the distribution's 1024 rather than the service with the unit's
+`LimitNOFILE`. That check would warn about a service that is fine and stay silent
+about one that is not, which is worse than not being printed: the operator would
+be reading it as a statement about the server. At startup the process is the
+server, so the figure is the right one.
 
 A warning rather than a refusal to start. The configuration is not wrong - the
-machine is short - and a server that will serve `soft - reserve` clients instead
-of `max_connections` is worth more to the operator than one that will not start
-at all. What it must not do is meet the shortage silently, which is what it did.
+machine is short - and a server that will hold fewer clients than asked is worth
+more to the operator than one that will not start at all. What it must not do is
+meet the shortage silently, which is what it did.
 */
-descriptor_limit_line :: proc(soft_limit, max_connections, upstream_idle: int) -> (line: string, short: bool) {
-	wanted := descriptors_wanted(max_connections, upstream_idle)
+descriptor_limit_line :: proc(soft_limit: int, d: Descriptor_Demand) -> (line: string, short: bool) {
+	wanted := descriptors_wanted(d)
 	if soft_limit <= 0 || soft_limit >= wanted {
 		return "", false
 	}
 	return fmt.tprintf(
-		"descriptors: the limit is %d, short of the %d this configuration can want (server.max_connections %d, %d pooled upstream connections, and %d for the listeners, the readers and the log). Past it, connections are refused rather than served and are counted as conn_failed=; raise RLIMIT_NOFILE (LimitNOFILE= in the systemd unit)",
+		"descriptors: the limit is %d, short of the %d this configuration can want (server.max_connections %d, %d pooled upstream connections, %d worker threads that hold one for a round trip, %d UDP readers, and %d over). Past it, accepts fail and the listeners wait between attempts, counted as accept_backoff=; raise RLIMIT_NOFILE (LimitNOFILE= in the systemd unit)",
 		soft_limit,
 		wanted,
-		max_connections,
-		upstream_idle,
+		d.max_connections,
+		d.pooled_upstream,
+		d.workers + d.upstream_workers,
+		d.udp_readers,
 		DESCRIPTOR_RESERVE,
 	), true
 }

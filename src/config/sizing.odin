@@ -453,14 +453,17 @@ its own pool - so the total is that many for each server named anywhere, and a
 zone route is named anywhere: `main` builds one group per `upstream.zones` entry,
 each with the route's own `max_idle` and its own servers.
 
-Counted rather than estimated because it is the second largest thing this process
-holds descriptors for, after the connection table, and because a configuration
-with a dozen routes has a pool that is no longer a rounding error against it. See
+Counted rather than estimated because a configuration with a dozen routes has a
+pool that is no longer a rounding error against the connection table. See
 `server.descriptors_wanted`, which is the only caller and the reason this is a
 figure rather than a comment.
 
-Idle sockets, so this is a ceiling and not a reading: a pool holds what has been
-dialled and not yet timed out, which on a quiet server is nothing.
+**Idle sockets only, which is not every socket this server holds upstream.** A
+connection checked out of a pool for a round trip is not in the pool, and one
+dialled when the pool is empty was never in it - so in-flight exchanges are
+bounded by the worker pools rather than by `max_idle`, and are counted there.
+This is a ceiling on the pools and not on upstream sockets: what it names is what
+can be held open while nothing is being asked.
 */
 pooled_upstream_connections :: proc(cfg: Upstream_Config) -> int {
 	total := cfg.max_idle * len(cfg.servers)

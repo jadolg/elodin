@@ -218,10 +218,11 @@ already makes these choices.
   server that is not in its configuration file — systemd leaves the soft limit
   at 1024 unless a unit says otherwise, which the shipped one does
   (`LimitNOFILE=8192`). Raise the table past it and the listener stops
-  accepting rather than the table filling: accepts fail, are counted as
-  `conn_failed=`, and the loop backs off a second at a time until there is
-  room. `--check` and startup both say so when the limit cannot cover the
-  table, and say nothing when it can.
+  accepting rather than the table filling: accepts fail, the loop waits a second
+  between attempts, and `elodin_accept_backoffs_total` climbs at one per second
+  per listener while it does. Startup warns when the limit cannot cover the
+  table and says nothing when it can — `--check` does not, because it would be
+  reading its own process's limit rather than the service's.
 
 **What elodin bounds on its own,** measured and holding for an hour of
 flooding (`bench/results/2026-09-03-soak-one-hour.md`):
@@ -279,7 +280,8 @@ Loki that is `| logfmt` and nothing else:
 
 Statistics go to the log every five minutes as `msg=stats`: `queries`,
 `blocked`, `cached`, `forwarded`, `failed`, `dropped`, `refused`,
-`conn_refused`, `conn_rate_limited`, `conn_failed`, `handshakes`, `limited`,
+`conn_refused`, `conn_rate_limited`, `conn_failed`, `accept_backoff`,
+`handshakes`, `limited`,
 `truncated`, `secure`, `bogus`,
 `rebind` and `special_use`, plus `cache_entries`, `cache_bytes`, `cache_hits`,
 `cache_withheld`, `cache_misses`, `cache_stale` and `cache_evictions`.
@@ -1826,7 +1828,8 @@ as a warning at startup.
 | `elodin_queries_refused_total` | counter | turned away by `server.allow_from` |
 | `elodin_connections_refused_total` | counter | refused for want of a slot: `server.max_connections` full, or the client's prefix already holding its share |
 | `elodin_connections_rate_limited_total` | counter | refused because the prefix was opening connections faster than `rate_limit.responses_per_second` allows |
-| `elodin_connections_failed_total` | counter | refused because the OS would not give the process what a connection needs — a thread, or a descriptor to accept onto |
+| `elodin_connections_failed_total` | counter | refused because the OS would not start a thread |
+| `elodin_accept_backoffs_total` | counter | times a listener waited before retrying an accept it could not complete; one per second per listener while accepts are failing, usually for want of file descriptors |
 | `elodin_connections_active` / `_max` | gauge | connection threads in use, and what the limit allows |
 | `elodin_connections_max_per_prefix` | gauge | how many of those one client prefix may hold; equal to `_max` when there is no share |
 | `elodin_tls_handshakes_total` | counter | TLS handshakes completed on the DoT and DoH listeners |
@@ -1982,13 +1985,18 @@ gets a reset on first use and has to reconnect. Either way it is counted as
 `conn_refused=`, kept apart from `refused=` because this is a client elodin would
 serve and has no room for; which of the two limits refused it is in the `warn`
 line beside it. A connection refused *below* both, when the OS will not give the
-process what a connection needs, is `conn_failed=`, where raising
-`max_connections` cannot help and would make it worse. Two things reach it: no
-thread — `RLIMIT_NPROC`, a cgroup `pids.max`, memory — and no descriptor to
-accept onto, `RLIMIT_NOFILE`. The `warn` beside it says which, because they are
-raised in different places; on the descriptor side the accept loop also waits a
-second between attempts, the connection staying queued so that retrying at once
-would be a busy wait rather than a retry.
+process another thread — `RLIMIT_NPROC`, a cgroup `pids.max`, memory — is
+`conn_failed=`, where raising `max_connections` cannot help and would make it
+worse.
+
+A shortage of **file descriptors** is the one failure here that turns no client
+away, and it is counted separately for that reason. An accept that cannot
+allocate a descriptor leaves the peer on the queue, so nothing was refused; what
+happened is that the listener stopped accepting. It waits a second between
+attempts rather than retrying into the same shortage, and each wait is
+`accept_backoff=` — one per second per listener, so a rate sitting at one is a
+listener taking no connections at all. The `warn` beside the first says which
+listener and names `RLIMIT_NOFILE`.
 
 `mise run bench` measures all of this; the harness is documented in
 [`bench/README.md`](bench/README.md) and its committed runs are under
