@@ -210,6 +210,34 @@ are in play.
 Accept_Run :: struct {
 	failures: int,
 	waited:   time.Duration,
+	/*
+	A descriptor shortage was met during this run.
+
+	Carried because the report describes the run and not the one attempt that
+	happened to cross the threshold. `accept(2)` interleaves pending network
+	errors freely with a shortage - a firewall reject arriving while the process
+	is out of descriptors is two unrelated facts about the same second - and all
+	of those reach `core:net` as `Unknown`. Choosing the wording from whichever
+	of them landed on the crossing attempt gave the operator "this listening
+	socket may no longer be usable" for a descriptor shortage, and the fifty
+	millisecond cadence with it, both wrong.
+
+	Sticky for the run, because the shortage is the one worth naming: it is the
+	failure whose remedy is not in elodin's configuration at all, and a run that
+	has seen one is a run about that.
+	*/
+	shortage: bool,
+	/*
+	This run reached the reporting threshold.
+
+	What makes a recovery worth acting on. A listener that never said anything
+	has nothing to hand back, and clearing the shared flag from one was an
+	unbounded line rate: with `waited` held at the threshold, the listener that
+	*is* in trouble reports on every failure, so a neighbour recovering every
+	second - four failures and one idle tick will do it - made it say both lines
+	again, for the length of the outage.
+	*/
+	reported: bool,
 }
 
 /*
@@ -248,14 +276,24 @@ Accept_Action :: struct {
 accept_action :: proc(err: net.Accept_Error, run: Accept_Run) -> Accept_Action {
 	if !accept_failed(err) {
 		healed := max(0, run.waited - ACCEPT_FIRST_WAIT)
+		cleared := run.waited > 0 && healed == 0
 		return Accept_Action {
-			run = Accept_Run{waited = healed},
-			recovered = run.waited > 0 && healed == 0,
+			run = Accept_Run{waited = healed, shortage = run.shortage && !cleared, reported = run.reported && !cleared},
+			// Only a run that said something has something to take back.
+			recovered = cleared && run.reported,
 		}
 	}
+	shortage := run.shortage || err == .Insufficient_Resources
 	n := run.failures + 1
 	if n <= ACCEPT_FAST_RETRIES {
-		return Accept_Action{run = Accept_Run{failures = n, waited = run.waited}}
+		return Accept_Action {
+			run = Accept_Run {
+				failures = n,
+				waited = run.waited,
+				shortage = shortage,
+				reported = run.reported,
+			},
+		}
 	}
 	// The ceiling for anything past the useful doublings, so the shift can never
 	// be one that overflows - see `ACCEPT_ESCALATION_STEPS`.
@@ -278,10 +316,16 @@ accept_action :: proc(err: net.Accept_Error, run: Accept_Run) -> Accept_Action {
 	on a listener doing any work at all.
 	*/
 	waited := min(run.waited + wait, ACCEPT_REPORT_AFTER)
+	report := waited >= ACCEPT_REPORT_AFTER
 	return Accept_Action {
-		run = Accept_Run{failures = n, waited = waited},
+		run = Accept_Run {
+			failures = n,
+			waited = waited,
+			shortage = shortage,
+			reported = run.reported || report,
+		},
 		wait = wait,
-		report = waited >= ACCEPT_REPORT_AFTER,
+		report = report,
 	}
 }
 
@@ -340,8 +384,8 @@ Accept_Failure_Words :: struct {
 }
 
 @(private)
-accept_failure_words :: proc(err: net.Accept_Error, listener_flag: ^bool) -> Accept_Failure_Words {
-	if err == .Insufficient_Resources {
+accept_failure_words :: proc(shortage: bool, listener_flag: ^bool) -> Accept_Failure_Words {
+	if shortage {
 		return Accept_Failure_Words {
 			reported = &accept_shortage_reported,
 			brief = "%s: still out of descriptors, waiting %v before accepting again (%v)",
@@ -358,8 +402,8 @@ accept_failure_words :: proc(err: net.Accept_Error, listener_flag: ^bool) -> Acc
 }
 
 /*
-`settles_at` is the ceiling this failure is held to, not the wait of the attempt
-that triggered the line.
+The cadence named is the ceiling this *run* is held to, not the wait of the
+attempt that triggered the line.
 
 They differ, and the ceiling is the one worth saying. The report fires when the
 listener has spent `ACCEPT_REPORT_AFTER` not accepting, which for a shortage is
@@ -374,13 +418,12 @@ twentieth of that, and naming the shortage's figure at it was the last thing thi
 line got wrong.
 */
 @(private)
-report_accept_failure :: proc(
-	listener: string,
-	err: net.Accept_Error,
-	settles_at: time.Duration,
-	listener_flag: ^bool,
-) {
-	words := accept_failure_words(err, listener_flag)
+report_accept_failure :: proc(listener: string, run: Accept_Run, err: net.Accept_Error, listener_flag: ^bool) {
+	// Both from the run rather than from this attempt: a shortage met at any
+	// point in it is what the operator has to hear about, whatever error
+	// happened to land on the failure that crossed the threshold.
+	words := accept_failure_words(run.shortage, listener_flag)
+	settles_at := ACCEPT_BACKOFF if run.shortage else ACCEPT_QUEUE_CEILING
 	say, first := report_once(words.reported, logx.enabled(.Debug))
 	if !say {
 		return

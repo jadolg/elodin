@@ -84,7 +84,7 @@ is the mistake this arrangement exists to prevent.
 test_the_accept_failure_words_send_a_shortage_to_the_descriptor_limit :: proc(t: ^testing.T) {
 	mine, theirs: bool
 
-	short := accept_failure_words(.Insufficient_Resources, &mine)
+	short := accept_failure_words(true, &mine)
 	testing.expect(
 		t,
 		strings.contains(short.hint, "RLIMIT_NOFILE") && strings.contains(short.hint, "LimitNOFILE"),
@@ -96,7 +96,7 @@ test_the_accept_failure_words_send_a_shortage_to_the_descriptor_limit :: proc(t:
 		"a shortage is the process's, so it is reported once for the process and not once per listener",
 	)
 
-	other := accept_failure_words(.Not_Listening, &mine)
+	other := accept_failure_words(false, &mine)
 	testing.expect(
 		t,
 		!strings.contains(other.hint, "RLIMIT_NOFILE"),
@@ -104,7 +104,7 @@ test_the_accept_failure_words_send_a_shortage_to_the_descriptor_limit :: proc(t:
 	)
 	testing.expect(
 		t,
-		other.reported == &mine && accept_failure_words(.Not_Listening, &theirs).reported == &theirs,
+		other.reported == &mine && accept_failure_words(false, &theirs).reported == &theirs,
 		"a socket that has gone bad is one socket, so each listener keeps its own flag",
 	)
 	testing.expect(
@@ -478,14 +478,23 @@ silenced by an earlier one.
 */
 @(test)
 test_a_burst_that_clears_hands_the_warning_back :: proc(t: ^testing.T) {
+	// Long enough to have reported: only a run that said something has anything
+	// to give back - see `test_a_listener_that_never_reported_does_not_rearm`.
 	run: Accept_Run
-	for _ in 0 ..< 10 {
+	for _ in 0 ..< 40 {
 		run = accept_action(.Unknown, run).run
 	}
-	testing.expect(t, run.waited > 0, "the burst waited something")
+	testing.expect(t, run.reported, "the run said something")
+	testing.expect(t, run.waited > 0, "and waited something")
 
+	/*
+	A thousand-odd accepts, which is the worst case by construction: `waited` is
+	capped at `ACCEPT_REPORT_AFTER` and repaid `ACCEPT_FIRST_WAIT` at a time, so
+	no outage however long can cost more than this to recover from - which is the
+	whole reason for the cap.
+	*/
 	recovered := false
-	for _ in 0 ..< 200 {
+	for _ in 0 ..< 1200 {
 		act := accept_action(.None, run)
 		run = act.run
 		recovered ||= act.recovered
@@ -513,14 +522,14 @@ the loops and this is the fact about `accept_action` the loops have to respect.
 @(test)
 test_the_idle_tick_can_be_what_recovers_a_listener :: proc(t: ^testing.T) {
 	run: Accept_Run
-	for _ in 0 ..< 6 {
+	for _ in 0 ..< 40 {
 		run = accept_action(.Unknown, run).run
 	}
-	testing.expect(t, run.waited > 0, "the burst waited something")
+	testing.expect(t, run.reported && run.waited > 0, "the burst reported and waited")
 
 	// Nothing but poll ticks from here - no connection arrives at all.
 	recovered := false
-	for _ in 0 ..< 200 {
+	for _ in 0 ..< 2000 {
 		act := accept_action(.Would_Block, run)
 		run = act.run
 		recovered ||= act.recovered
@@ -556,4 +565,64 @@ test_a_long_outage_does_not_become_unrecoverable :: proc(t: ^testing.T) {
 		recovered ||= act.recovered
 	}
 	testing.expect(t, recovered, "an hour-long outage still has to hand the warning back once it clears")
+}
+
+/*
+A listener that never said anything cannot hand back a warning it never took.
+
+The shape the review caught, and it compounds two earlier fixes: `waited` is held
+at the threshold, so the listener that *is* in trouble reports on every failure,
+and `report_once` is the only thing keeping that to one line. Clearing the shared
+flag from any recovery meant a neighbour that took four failures and then went
+quiet for a second - which no listener has to be in trouble to do - handed the
+warning back, and the one still out of descriptors said both lines again. For the
+length of the outage.
+*/
+@(test)
+test_a_listener_that_never_reported_does_not_rearm :: proc(t: ^testing.T) {
+	quiet: Accept_Run
+	for _ in 0 ..< ACCEPT_FAST_RETRIES + 1 {
+		quiet = accept_action(.Unknown, quiet).run
+	}
+	testing.expect(t, quiet.waited > 0, "it waited a little")
+	testing.expect(t, !quiet.reported, "but it never reached the threshold")
+
+	recovered := false
+	for _ in 0 ..< 50 {
+		act := accept_action(.Would_Block, quiet)
+		quiet = act.run
+		recovered ||= act.recovered
+	}
+	testing.expect_value(t, quiet.waited, 0)
+	testing.expect(t, !recovered, "a run that never reported has no warning to give back")
+}
+
+/*
+And the run's own diagnosis survives an unrelated error landing on the crossing
+attempt.
+
+A firewall reject arriving while the process is out of descriptors is two facts
+about the same second, and both reach `core:net` as `Unknown`. Reading the
+wording off that one attempt told the operator their socket may be unusable, at a
+fifty-millisecond cadence, during a descriptor shortage.
+*/
+@(test)
+test_the_report_describes_the_run_not_the_last_attempt :: proc(t: ^testing.T) {
+	run: Accept_Run
+	for _ in 0 ..< 20 {
+		run = accept_action(.Insufficient_Resources, run).run
+	}
+	testing.expect(t, run.shortage, "the run has met a shortage")
+
+	// A pending network error lands next, and must not change the diagnosis.
+	act := accept_action(.Unknown, run)
+	testing.expect(t, act.run.shortage, "one interleaved queue error does not un-see a shortage")
+
+	flag: bool
+	words := accept_failure_words(act.run.shortage, &flag)
+	testing.expect(
+		t,
+		strings.contains(words.hint, "RLIMIT_NOFILE"),
+		"the operator has to be sent to the descriptor limit, whatever the last attempt returned",
+	)
 }
