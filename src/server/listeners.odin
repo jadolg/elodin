@@ -1475,30 +1475,39 @@ accept_loop :: proc(data: rawptr) {
 	run: Accept_Run
 	for !sync.atomic_load(&l.stop) {
 		client_socket, client, err := net.accept_tcp(listener)
+		if err != nil && sync.atomic_load(&l.stop) {
+			break
+		}
+		/*
+		Every outcome goes through `accept_action`, including the successful
+		accept and the poll tick, and every field it returns is consumed here.
+
+		One call rather than one per branch, because the branches were how the
+		re-arm got lost: `recovered` is reached by any call that takes the run to
+		zero, and on a quiet listener that is the idle tick far more often than
+		an accepted connection. Read on one path only, it was discarded on the
+		one that usually produces it, and the flags stayed set for the life of
+		the process.
+
+		A failure is counted rather than judged on the spot, for the reason
+		`accept_failed` sets out: a per-connection network error and a descriptor
+		shortage arrive as the same value, and only whether it clears tells them
+		apart. Not counted as `conn_failed=` - that is a connection this server
+		would have served and could not, and a shortage leaves the peer queued to
+		be accepted when there is room, so calling it turned away would be a
+		refusal that never happened. `accept_backoff=` counts the waiting, which
+		is what occurred.
+
+		An accepted connection carries the run rather than clearing it, so that
+		the oscillating shortage - one descriptor freed, one connection served,
+		`EMFILE` again - is still recognised as one. See `ACCEPT_REPORT_AFTER`.
+		*/
+		act := accept_action(err, run)
+		run = act.run
+		if act.recovered {
+			rearm_accept_reports(&ctx.accept_reported)
+		}
 		if err != nil {
-			if sync.atomic_load(&l.stop) {
-				break
-			}
-			/*
-			Most of these are the poll tick this loop is built on, and cost
-			nothing. What is left is counted rather than judged on the spot, for
-			the reason `accept_failed` sets out: a per-connection network error
-			and a descriptor shortage arrive as the same value, and only whether
-			it clears tells them apart.
-
-			Not counted as `conn_failed=`. That is a connection this server would
-			have served and could not, and on this path there is no such
-			connection: a shortage leaves the peer queued, to be accepted when
-			there is room, so calling it turned away would be a refusal that
-			never happened. `accept_backoff=` counts the waiting instead, which
-			is what actually occurred.
-
-			Every decision is `accept_action`'s, so that the sequence - four
-			failures then a success then a shortage - can be tested without a
-			socket.
-			*/
-			act := accept_action(err, run)
-			run = act.run
 			if act.wait > 0 {
 				sync.atomic_add(&ctx.server.stats.accept_backoff, 1)
 				if act.report {
@@ -1507,16 +1516,6 @@ accept_loop :: proc(data: rawptr) {
 				time.sleep(act.wait)
 			}
 			continue
-		}
-		/*
-		An accepted connection carries the run rather than clearing it, so that
-		the oscillating shortage - one descriptor freed, one connection served,
-		`EMFILE` again - is still recognised as one. See `ACCEPT_REPORT_AFTER`.
-		*/
-		accepted := accept_action(.None, run)
-		run = accepted.run
-		if accepted.recovered {
-			rearm_accept_reports(&ctx.accept_reported)
 		}
 
 		/*

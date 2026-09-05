@@ -191,15 +191,26 @@ metrics_accept_loop :: proc(data: rawptr) {
 	run: Accept_Run
 	for !sync.atomic_load(&l.stop) {
 		client_socket, client, err := net.accept_tcp(l.metrics_socket)
+		if err != nil && sync.atomic_load(&l.stop) {
+			break
+		}
+		/*
+		The DNS listeners' handling exactly, including reading every field of the
+		action on every path - this is the quietest socket in the process, so the
+		poll tick is almost the only thing that ever takes its run to zero, and a
+		re-arm read only after a successful accept was one this loop would never
+		have performed.
+
+		`accept_backoff=` counts the waiting rather than a connection, which is
+		what lets this loop share it without putting a scraper into a
+		client-facing counter.
+		*/
+		act := accept_action(err, run)
+		run = act.run
+		if act.recovered {
+			rearm_accept_reports(&ctx.accept_reported)
+		}
 		if err != nil {
-			if sync.atomic_load(&l.stop) {
-				break
-			}
-			// The DNS listeners' handling exactly: `accept_backoff=` counts
-			// the waiting rather than a connection, so this loop can share it
-			// without putting a scraper into a client-facing counter.
-			act := accept_action(err, run)
-			run = act.run
 			if act.wait > 0 {
 				sync.atomic_add(&ctx.server.stats.accept_backoff, 1)
 				if act.report {
@@ -208,12 +219,6 @@ metrics_accept_loop :: proc(data: rawptr) {
 				time.sleep(act.wait)
 			}
 			continue
-		}
-		// As in the DNS accept loops.
-		accepted := accept_action(.None, run)
-		run = accepted.run
-		if accepted.recovered {
-			rearm_accept_reports(&ctx.accept_reported)
 		}
 		serve_metrics(ctx.server, l, client_socket, client)
 		net.close(client_socket)

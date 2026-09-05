@@ -264,7 +264,20 @@ accept_action :: proc(err: net.Accept_Error, run: Accept_Run) -> Accept_Action {
 	if steps := n - ACCEPT_FAST_RETRIES - 1; steps < ACCEPT_ESCALATION_STEPS {
 		wait = min(ceiling, ACCEPT_FIRST_WAIT << uint(steps))
 	}
-	waited := run.waited + wait
+	/*
+	Held at the threshold rather than allowed to run away.
+
+	Past `ACCEPT_REPORT_AFTER` this figure carries no more information - it has
+	already said everything it decides - and what it costs to keep counting is
+	the recovery: a minute-long outage would leave a minute of waiting to be
+	repaid a millisecond at a time, which is sixty thousand accepts, and an hour
+	would be three and a half million. The flags would then never be re-armed
+	after any real outage, which is the thing they exist for.
+
+	Capped, the worst case is a thousand accepts or idle ticks to clear - instant
+	on a listener doing any work at all.
+	*/
+	waited := min(run.waited + wait, ACCEPT_REPORT_AFTER)
 	return Accept_Action {
 		run = Accept_Run{failures = n, waited = waited},
 		wait = wait,
@@ -457,11 +470,19 @@ descriptor_limit_line :: proc(soft_limit: int, d: Descriptor_Demand) -> (line: s
 	if soft_limit <= 0 || soft_limit >= wanted {
 		return "", false
 	}
+	// Named for what it is where there is no connection table. Printing
+	// `server.max_connections 0` at an operator whose file says 512 reads as
+	// this server misunderstanding their configuration, when what it means is
+	// that no stream listener is enabled to fill one.
+	table := fmt.tprintf("server.max_connections %d", d.max_connections)
+	if d.max_connections == 0 {
+		table = "no connection table, every stream listener being off"
+	}
 	return fmt.tprintf(
-		"descriptors: the limit is %d, short of the %d this configuration can want (server.max_connections %d, %d pooled upstream connections, %d worker threads that hold one for a round trip, %d UDP readers, and %d over). Past it, accepts fail and the listeners wait between attempts, counted as accept_backoff=; raise RLIMIT_NOFILE (LimitNOFILE= in the systemd unit)",
+		"descriptors: the limit is %d, short of the %d this configuration can want (%s, %d pooled upstream connections, %d worker threads that hold one for a round trip, %d UDP readers, and %d over). Past it, accepts fail and the listeners wait between attempts, counted as accept_backoff=; raise RLIMIT_NOFILE (LimitNOFILE= in the systemd unit)",
 		soft_limit,
 		wanted,
-		d.max_connections,
+		table,
 		d.pooled_upstream,
 		d.workers + d.upstream_workers,
 		d.udp_readers,

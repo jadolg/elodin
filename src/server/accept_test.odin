@@ -497,3 +497,63 @@ test_a_burst_that_clears_hands_the_warning_back :: proc(t: ^testing.T) {
 	// the moment the run reaches zero.
 	testing.expect(t, !accept_action(.None, run).recovered, "a healthy listener does not re-arm forever")
 }
+
+/*
+The idle tick is what usually hands the warning back, so a caller reading
+`recovered` on the accept path alone reads it on the path that rarely produces
+it.
+
+That is not a hypothetical: both loops did exactly that for a round. A listener
+that took a burst, warned, and then went quiet reached zero on a poll tick, and
+the one `recovered` it would ever produce was discarded - after which
+`run.waited` was already zero, so no later accept could produce another and the
+flags stayed set for the life of the process. Asserted here because the fix is in
+the loops and this is the fact about `accept_action` the loops have to respect.
+*/
+@(test)
+test_the_idle_tick_can_be_what_recovers_a_listener :: proc(t: ^testing.T) {
+	run: Accept_Run
+	for _ in 0 ..< 6 {
+		run = accept_action(.Unknown, run).run
+	}
+	testing.expect(t, run.waited > 0, "the burst waited something")
+
+	// Nothing but poll ticks from here - no connection arrives at all.
+	recovered := false
+	for _ in 0 ..< 200 {
+		act := accept_action(.Would_Block, run)
+		run = act.run
+		recovered ||= act.recovered
+	}
+	testing.expect(
+		t,
+		recovered,
+		"a listener that goes quiet after a burst has to hand its warning back on the idle path",
+	)
+}
+
+/*
+An outage cannot cost more to recover from than it took to notice.
+
+`waited` is capped at the threshold, because past it the figure decides nothing
+more and the only thing it still does is lengthen the repayment. Uncapped, an
+hour-long shortage left three and a half million milliseconds to repay before a
+later trouble could be reported again.
+*/
+@(test)
+test_a_long_outage_does_not_become_unrecoverable :: proc(t: ^testing.T) {
+	run: Accept_Run
+	// An hour of solid shortage, at the ceiling for all but the first few.
+	for _ in 0 ..< 3600 {
+		run = accept_action(.Insufficient_Resources, run).run
+	}
+	testing.expect_value(t, run.waited, ACCEPT_REPORT_AFTER)
+
+	recovered := false
+	for _ in 0 ..< 2000 {
+		act := accept_action(.None, run)
+		run = act.run
+		recovered ||= act.recovered
+	}
+	testing.expect(t, recovered, "an hour-long outage still has to hand the warning back once it clears")
+}
