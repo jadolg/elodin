@@ -278,9 +278,9 @@ Loki that is `| logfmt` and nothing else:
 ```
 
 Statistics go to the log every five minutes as `msg=stats`: `queries`,
-`blocked`, `cached`, `forwarded`, `failed`, `dropped`, `refused`,
-`rewritten`, `conn_refused`, `conn_rate_limited`, `conn_failed`,
-`accept_backoff`, `handshakes`, `limited`,
+`blocked`, `cached`, `forwarded`, `failed`, `rewritten`, `dropped`, `refused`,
+`conn_refused`, `conn_rate_limited`, `conn_failed`, `accept_backoff`,
+`handshakes`, `limited`,
 `truncated`, `secure`, `bogus`,
 `rebind` and `special_use`, plus `cache_entries`, `cache_bytes`, `cache_hits`,
 `cache_withheld`, `cache_misses`, `cache_stale` and `cache_evictions`.
@@ -1828,7 +1828,7 @@ as a warning at startup.
 | `elodin_connections_refused_total` | counter | refused for want of a slot: `server.max_connections` full, or the client's prefix already holding its share |
 | `elodin_connections_rate_limited_total` | counter | refused because the prefix was opening connections faster than `rate_limit.responses_per_second` allows |
 | `elodin_connections_failed_total` | counter | refused because the OS would not start a thread |
-| `elodin_accept_backoffs_total` | counter | times a listener waited before retrying an accept it could not complete; a few while a burst clears, then about one per second per listener for as long as it does not — usually for want of file descriptors |
+| `elodin_accept_backoffs_total` | counter | times a listener waited before retrying an accept it could not complete; a few while a burst clears, then steadily for as long as it does not — usually for want of file descriptors. Read it in the `msg=stats` line rather than here when descriptors are what ran out: this endpoint has an accept loop of its own and cannot be scraped either |
 | `elodin_connections_active` / `_max` | gauge | connection threads in use, and what the limit allows |
 | `elodin_connections_max_per_prefix` | gauge | how many of those one client prefix may hold; equal to `_max` when there is no share |
 | `elodin_tls_handshakes_total` | counter | TLS handshakes completed on the DoT and DoH listeners |

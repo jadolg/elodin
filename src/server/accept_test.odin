@@ -347,3 +347,37 @@ test_no_wait_is_ever_zero_or_negative :: proc(t: ^testing.T) {
 	// And it is the ceiling by then, not something merely positive.
 	testing.expect_value(t, accept_action(.Insufficient_Resources, failures).wait, ACCEPT_BACKOFF)
 }
+
+/*
+A stream of per-connection errors is not held to the shortage's ceiling.
+
+The burst test above covers four of them. This is the case the review raised
+against it: a firewall rejecting a steady stream, or a flapping route, where
+every accept fails and nothing resets the count. Those failures are *delivered
+by* the accept, so the entry leaves the queue - a second between attempts would
+leave a listener taking one connection a second with good ones queued behind bad
+ones, which is the starvation this design argues against met from the other side.
+*/
+@(test)
+test_a_stream_of_queue_errors_settles_far_below_the_shortage_ceiling :: proc(t: ^testing.T) {
+	failures := 0
+	settled: time.Duration
+	for _ in 0 ..< 40 {
+		act := accept_action(.Unknown, failures)
+		failures = act.failures
+		settled = act.wait
+	}
+	testing.expect_value(t, settled, ACCEPT_QUEUE_CEILING)
+	testing.expect(
+		t,
+		ACCEPT_QUEUE_CEILING * 10 <= ACCEPT_BACKOFF,
+		"the queue ceiling has to be far enough below the shortage's to keep the queue moving",
+	)
+
+	// The shortage still gets the long one: nothing is drained by waiting there.
+	shortage := 0
+	for _ in 0 ..< 40 {
+		shortage = accept_action(.Insufficient_Resources, shortage).failures
+	}
+	testing.expect_value(t, accept_action(.Insufficient_Resources, shortage).wait, ACCEPT_BACKOFF)
+}

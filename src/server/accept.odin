@@ -2,9 +2,9 @@ package server
 
 import "core:fmt"
 import "core:net"
-import "core:sys/posix"
 import "core:time"
 import "elodin:logx"
+import "elodin:metrics"
 
 /*
 Whether an accept error is a failure at all.
@@ -116,6 +116,39 @@ ACCEPT_ESCALATION_STEPS :: 10
 #assert(ACCEPT_FIRST_WAIT << uint(ACCEPT_ESCALATION_STEPS) >= ACCEPT_BACKOFF)
 
 /*
+The ceiling for a failure that is not a shortage, which is a different question.
+
+What a wait costs depends on what the failed accept did to the queue, and the two
+conditions that reach here differ in exactly that:
+
+  - A descriptor shortage consumes nothing. The peer stays queued, no accept can
+    succeed until the shortage clears, and a second between attempts costs the
+    queue nothing at all - it is not moving either way.
+  - A per-connection error - `EPROTO`, `EHOSTUNREACH`, `EPERM` from a firewall
+    reject - is *delivered by* the accept that fails, so the entry is gone and
+    the queue has moved. Waiting a second there does cost: it holds the next
+    connection behind an error that has already been dealt with.
+
+A burst of those clears inside the escalation and never reaches a ceiling. A
+sustained stream of them does, and against a full second it would leave a
+listener taking one connection a second with good ones queued behind the bad -
+which is the starvation this file already argues against, arrived at from the
+other side. Fifty milliseconds still ends any spin, at twenty attempts a second,
+and each of those attempts takes an entry off the queue.
+
+The classification only picks the ceiling here. It does not decide whether to
+wait, so a shortage that arrived as something other than `Insufficient_Resources`
+would still be waited out - at twenty attempts a second rather than one, which is
+a pace rather than a spin.
+*/
+ACCEPT_QUEUE_CEILING :: 50 * time.Millisecond
+
+@(private)
+accept_ceiling :: proc(err: net.Accept_Error) -> time.Duration {
+	return ACCEPT_BACKOFF if err == .Insufficient_Resources else ACCEPT_QUEUE_CEILING
+}
+
+/*
 What the loop does about one accept error, as data.
 
 The whole of the loop's decision, so that it can be tested as a sequence rather
@@ -148,11 +181,15 @@ accept_action :: proc(err: net.Accept_Error, failures: int) -> Accept_Action {
 	}
 	// The ceiling for anything past the useful doublings, so the shift can never
 	// be one that overflows - see `ACCEPT_ESCALATION_STEPS`.
-	wait := ACCEPT_BACKOFF
+	ceiling := accept_ceiling(err)
+	wait := ceiling
 	if steps := n - ACCEPT_FAST_RETRIES - 1; steps < ACCEPT_ESCALATION_STEPS {
-		wait = min(ACCEPT_BACKOFF, ACCEPT_FIRST_WAIT << uint(steps))
+		wait = min(ceiling, ACCEPT_FIRST_WAIT << uint(steps))
 	}
-	return Accept_Action{failures = n, wait = wait, report = wait >= ACCEPT_BACKOFF}
+	// Said once the wait has stopped escalating, which is where the condition has
+	// outlived every reading of it but the persistent one - whichever ceiling
+	// this failure is held to.
+	return Accept_Action{failures = n, wait = wait, report = wait >= ceiling}
 }
 
 /*
@@ -318,18 +355,11 @@ descriptor_limit_line :: proc(soft_limit: int, d: Descriptor_Demand) -> (line: s
 /*
 The soft `RLIMIT_NOFILE`, or 0 where it cannot be read.
 
-`sysconf(_SC_OPEN_MAX)` rather than a `getrlimit` binding of our own: it reports
-the live soft limit, verified against a process whose limit was lowered under it.
-
-`metrics/process.odin` reads the same figure for `process_max_fds`, and this does
-not call into it: that procedure answers a different question - what the process
-holds *now*, off `/proc/self/stat` - and reading a `/proc` file to learn a limit
-that startup already knows would be the wrong shape here. Two callers of one
-libc function rather than one answer with two names.
+`metrics.descriptor_limit` rather than a copy of it here: `process_max_fds`
+publishes the same figure from the same `sysconf(_SC_OPEN_MAX)`, and two readings
+of one limit are two things to keep in step. It reports the live soft limit,
+verified against a process whose limit was lowered under it.
 */
 descriptor_limit :: proc() -> int {
-	if limit := posix.sysconf(._OPEN_MAX); limit > 0 {
-		return int(limit)
-	}
-	return 0
+	return metrics.descriptor_limit()
 }

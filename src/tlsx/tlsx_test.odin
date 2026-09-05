@@ -70,9 +70,23 @@ developer's own `certs/` pair should not be discarded over a missing tool.
 */
 @(private = "file")
 cert_still_valid :: proc(path: string) -> bool {
-	process, perr := os.process_start(
-		os.Process_Desc{command = []string{"openssl", "x509", "-in", path, "-noout", "-checkend", "3600"}},
-	)
+	// `-noout` suppresses the certificate and not the verdict: openssl writes
+	// "Certificate will not expire" on the way to exit 0, and this runs on every
+	// test binary. The exit code is the answer; the line is noise in a suite's
+	// output. Discarded rather than captured - nothing here reads it - and a
+	// /dev/null that will not open is not a reason to fail the check.
+	devnull, nerr := os.open("/dev/null", {.Write})
+	defer if nerr == nil {
+		os.close(devnull)
+	}
+	desc := os.Process_Desc {
+		command = []string{"openssl", "x509", "-in", path, "-noout", "-checkend", "3600"},
+	}
+	if nerr == nil {
+		desc.stdout = devnull
+		desc.stderr = devnull
+	}
+	process, perr := os.process_start(desc)
 	if perr != nil {
 		return true
 	}
