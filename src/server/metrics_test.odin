@@ -3,6 +3,7 @@ package server
 import "core:strings"
 import "core:testing"
 import "core:time"
+import "elodin:cache"
 import "elodin:config"
 
 /*
@@ -68,6 +69,7 @@ test_every_counter_reaches_the_endpoint :: proc(t: ^testing.T) {
 			bogus = 13,
 			rebind = 14,
 			special_use = 15,
+			accept_backoff = 16,
 		},
 	)
 
@@ -78,6 +80,7 @@ test_every_counter_reaches_the_endpoint :: proc(t: ^testing.T) {
 	expect_line(t, page, `elodin_answers_total{outcome="failed"} 5`)
 	expect_line(t, page, `elodin_answers_total{outcome="rewritten"} 6`)
 	expect_line(t, page, "elodin_queries_dropped_total 7")
+	expect_line(t, page, "elodin_accept_backoffs_total 16")
 	expect_line(t, page, "elodin_queries_refused_total 8")
 	expect_line(t, page, "elodin_connections_refused_total 9")
 	expect_line(t, page, "elodin_connections_failed_total 10")
@@ -203,4 +206,83 @@ expect_line :: proc(t: ^testing.T, page: string, line: string, loc := #caller_lo
 	// that happens to start with it.
 	wanted := strings.concatenate({line, "\n"}, context.temp_allocator)
 	testing.expectf(t, strings.contains(page, wanted), "%q is not on the page", line, loc = loc)
+}
+
+/*
+Every counter the endpoint publishes is also in the line, with its own value.
+
+The third of the three guards, and the one that was missing. `stats_of` carries a
+counter, `render` publishes it, and this line is where an operator reads it when
+`metrics.enabled` is off - which is the default, so for most deployments it is
+the only place the figure exists at all.
+
+Both of the counters this project has added and then failed to report went
+missing exactly here: `cache_withheld` reached the endpoint and not the line, and
+`accept_backoff` reached the struct, the endpoint, the README and every hint that
+points at this line, and not the line. Neither of the other two guards could see
+it, because neither reads the line.
+
+Distinct values, so a field printed in the wrong position fails rather than
+passing on a coincidence, and the assertion is per counter rather than over the
+whole string: what has to be true is that each one is *there*, not that the line
+is spelled a particular way.
+*/
+@(test)
+test_the_stats_line_carries_every_counter :: proc(t: ^testing.T) {
+	st := Stats {
+		queries        = 1,
+		blocked        = 2,
+		cached         = 3,
+		forwarded      = 4,
+		failed         = 5,
+		rewritten      = 6,
+		dropped        = 7,
+		refused        = 8,
+		conn_refused   = 9,
+		conn_failed    = 10,
+		handshakes     = 11,
+		secure         = 12,
+		bogus          = 13,
+		rebind         = 14,
+		special_use    = 15,
+		accept_backoff = 16,
+	}
+	cs := cache.Stats {
+		hits      = 20,
+		misses    = 21,
+		stale     = 22,
+		withheld  = 23,
+		evictions = 24,
+	}
+	line := stats_line(st, cs, 30, 31, 40, 41, 42)
+
+	for want in ([]string {
+			"queries=1",
+			"blocked=2",
+			"cached=3",
+			"forwarded=4",
+			"failed=5",
+			"dropped=7",
+			"refused=8",
+			"conn_refused=9",
+			"conn_rate_limited=42",
+			"conn_failed=10",
+			"accept_backoff=16",
+			"handshakes=11",
+			"limited=40",
+			"truncated=41",
+			"secure=12",
+			"bogus=13",
+			"rebind=14",
+			"special_use=15",
+			"cache_entries=30",
+			"cache_bytes=31",
+			"cache_hits=20",
+			"cache_withheld=23",
+			"cache_misses=21",
+			"cache_stale=22",
+			"cache_evictions=24",
+		}) {
+		testing.expectf(t, strings.contains(line, want), "the stats line is missing %q: %s", want, line)
+	}
 }

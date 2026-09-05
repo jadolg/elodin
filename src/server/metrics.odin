@@ -39,6 +39,72 @@ the alternative - a thread per scraper - is the resource this endpoint is meant
 not to spend.
 */
 
+/*
+The `msg=stats` line, built here rather than in `main`.
+
+Every other figure this server reports at startup or on a schedule is built by a
+procedure that returns it - `connection_limits_line`, `udp_readers_line`,
+`rate_limit_override_lines` - and each of them says the same reason: returned so
+a test can hold it, and so two wordings of one fact cannot drift apart. This line
+was the exception, and it is the one that drifted. `cache_withheld` was added to
+the endpoint and not to the line, which the comment beside it in `main` still
+records; `accept_backoff` was added to the struct, the endpoint, the README and
+every hint that points an operator at this line, and not to the line.
+
+So it is here, beside `render` - which the endpoint's own guard test already
+covers - and `test_the_stats_line_carries_every_counter` holds it to the same
+standard: a counter added to `Stats` and left out of this format string is a
+failing test rather than a figure that reads zero forever.
+
+`main` still decides *when* to say it, which is the part that belongs there.
+*/
+stats_line :: proc(
+	st: Stats,
+	cs: cache.Stats,
+	cache_entries, cache_bytes: int,
+	limited, slipped, conn_limited: u64,
+) -> string {
+	return fmt.tprintf(
+		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d dropped=%d refused=%d conn_refused=%d conn_rate_limited=%d conn_failed=%d accept_backoff=%d handshakes=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d special_use=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d",
+		st.queries,
+		st.blocked,
+		st.cached,
+		st.forwarded,
+		st.failed,
+		st.dropped,
+		st.refused,
+		st.conn_refused,
+		// Beside `conn_refused` because the pair is the diagnosis: a table that
+		// is full and a client arriving too fast are different problems with
+		// different settings behind them, and the second used to show up in
+		// neither figure.
+		conn_limited,
+		st.conn_failed,
+		// Not a connection, which is why it is last of this group rather than
+		// folded into one of them: it counts the times a listener could not
+		// accept at all.
+		st.accept_backoff,
+		st.handshakes,
+		limited,
+		slipped,
+		st.secure,
+		st.bogus,
+		st.rebind,
+		st.special_use,
+		cache_entries,
+		cache_bytes,
+		cs.hits,
+		// Beside `cache_hits` because it qualifies it: `get` counts a hit when it
+		// hands the bytes over, and the resolver may then refuse them. Without
+		// this the line shows `cache_hits` and `cached=` drifting apart with
+		// nothing to account for the gap.
+		cs.withheld,
+		cs.misses,
+		cs.stale,
+		cs.evictions,
+	)
+}
+
 @(private)
 Metrics_Context :: struct {
 	server:          ^Server,

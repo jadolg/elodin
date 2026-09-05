@@ -57,11 +57,19 @@ server:
 
   # The table, and one client's share of it.
   #
-  # 2,048 concurrent TCP/DoT/DoH connections, each of which is a thread - so
-  # this is also a claim about what the box and its `RLIMIT_NPROC` or cgroup
-  # `pids.max` will give the process. A connection refused because the OS
+  # 2,048 concurrent TCP/DoT/DoH connections, each of which is a thread and a
+  # file descriptor - so this is also a claim about what the box will give the
+  # process, in two limits rather than one. A connection refused because the OS
   # would not give another thread is counted apart, as conn_failed=, and
   # raising this figure makes that worse rather than better.
+  #
+  # The descriptor limit is the one that bites first at this figure, and it is
+  # not in this file: systemd leaves the soft RLIMIT_NOFILE at 1024 unless the
+  # unit says otherwise, and the shipped unit sets LimitNOFILE=8192, which this
+  # table fits inside. Copy this configuration onto a box that has neither and
+  # elodin will say so at startup - a table it cannot accept into is a listener
+  # that stops accepting, counted as accept_backoff=, rather than a table that
+  # fills.
   #
   # 24 of them for any one /24 or /64. The shipped default derives half the
   # table, which is a bound nobody legitimate trips over; on a public instance

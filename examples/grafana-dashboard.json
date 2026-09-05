@@ -896,6 +896,21 @@
                 }
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "accept backoffs (not accepting)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#8f5fd1"
+                }
+              }
+            ]
           }
         ]
       },
