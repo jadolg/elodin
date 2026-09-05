@@ -1998,7 +1998,8 @@ through, and says to retry those at once — costs nothing measurable, while one
 that does not clear settles at a second. Each wait is `accept_backoff=`, so a
 rate sitting near one per listener is a listener taking no connections at all.
 The `warn` beside it names the listener and `RLIMIT_NOFILE`, and is said only
-once the waiting has stopped escalating.
+once that listener has spent about a second not accepting — so a burst that
+clears by itself never spends it.
 
 `mise run bench` measures all of this; the harness is documented in
 [`bench/README.md`](bench/README.md) and its committed runs are under

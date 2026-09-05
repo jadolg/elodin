@@ -108,12 +108,19 @@ the loop spent those iterations neither waiting nor counting - a burst of exactl
 the busy-accept this file exists to remove, about thirty-five seconds into a
 descriptor shortage and invisible in the counter.
 
-The assertion below is what keeps that from coming back the next time somebody
-raises one of the two constants: it fails to compile rather than overflowing at
-runtime.
+Two assertions, because the two ends fail differently. The first says the
+escalation actually reaches the ceiling, so lowering the step count cannot leave
+a wait that never gets there. The second says the shift stays inside an `i64`,
+and it is written as a comparison against the largest base that survives it
+rather than as the shift itself: Odin folds a `#assert` in arbitrary precision,
+so `ACCEPT_FIRST_WAIT << 44 >= ACCEPT_BACKOFF` is true at compile time and
+`-237377h` at runtime - which is to say the obvious spelling of this assertion
+asserts nothing about the overflow it is here to prevent. Checked both ways: at
+44 steps the second fails to compile, at 10 it does not.
 */
 ACCEPT_ESCALATION_STEPS :: 10
 #assert(ACCEPT_FIRST_WAIT << uint(ACCEPT_ESCALATION_STEPS) >= ACCEPT_BACKOFF)
+#assert(i64(ACCEPT_FIRST_WAIT) <= max(i64) >> uint(ACCEPT_ESCALATION_STEPS))
 
 /*
 The ceiling for a failure that is not a shortage, which is a different question.
@@ -279,11 +286,27 @@ accept_failure_words :: proc(err: net.Accept_Error, listener_flag: ^bool) -> Acc
 	}
 }
 
+/*
+`settles_at` is the ceiling this failure is held to, not the wait of the attempt
+that triggered the line.
+
+They differ, and the ceiling is the one worth saying. The report fires when the
+listener has spent `ACCEPT_REPORT_AFTER` not accepting, which for a shortage is
+the thirteenth failure - still one doubling short of the ceiling, so the attempt
+itself waits 512ms while every attempt after it waits a second. Said once per
+listener, a line naming 512ms would be the operator's only line and would report
+a cadence that never happens again, disagreeing with the `accept_backoff` rate
+the documentation tells them to expect.
+
+Which ceiling, though, and not `ACCEPT_BACKOFF`: a queue error settles at a
+twentieth of that, and naming the shortage's figure at it was the last thing this
+line got wrong.
+*/
 @(private)
 report_accept_failure :: proc(
 	listener: string,
 	err: net.Accept_Error,
-	wait: time.Duration,
+	settles_at: time.Duration,
 	listener_flag: ^bool,
 ) {
 	words := accept_failure_words(err, listener_flag)
@@ -295,14 +318,11 @@ report_accept_failure :: proc(
 	// resets its own temp arena, and the line was formatted out of it.
 	defer free_all(context.temp_allocator)
 
-	// The figure this listener is actually waiting, which since the two ceilings
-	// exist is not `ACCEPT_BACKOFF` for every caller: a queue error settles at a
-	// twentieth of it, and a line naming the wrong one is off by that much.
 	if !first {
-		logx.debugf(words.brief, listener, wait, err)
+		logx.debugf(words.brief, listener, settles_at, err)
 		return
 	}
-	logx.warnf(words.line, listener, wait, err)
+	logx.warnf(words.line, listener, settles_at, err)
 	logx.warnf(words.hint)
 }
 
