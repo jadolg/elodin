@@ -779,7 +779,7 @@ first query into a zone and not the ones after it.
 | wildcards | a wildcard answer must come with a proof that the name had nothing of its own |
 | unsigned zones | insecure: served, no AD bit |
 | bounds | 32 DS/DNSKEY lookups and 64 signature checks per question, 24 labels of chain, 8 signatures per RRset, 64 keys per zone, 8 hint targets per answer, 100 NSEC3 iterations |
-| an algorithm we cannot check | insecure, not bogus — RFC 4035 treats unverifiable data as unsigned |
+| an algorithm we cannot check | an insecure delegation at the DS, whether unimplemented here or refused by the host's crypto policy — RFC 6840 section 5.2 |
 | bad signature, broken chain, missing proof | SERVFAIL, with an extended DNS error (RFC 8914) saying which |
 
 A refusal reaches the log as a warning carrying the verdict, the reason and the
@@ -870,9 +870,15 @@ Two things worth knowing with validation on:
 
 - **Distribution crypto policy can take algorithms away.** Fedora and RHEL ship an
   OpenSSL that refuses SHA-1 signatures outright, covering DNSSEC algorithms 5
-  and 7. elodin treats an algorithm it cannot check as unsigned rather than as
-  broken, so those zones come back without the AD bit instead of failing — the
-  safe direction, but a silent downgrade.
+  and 7. elodin asks the library which algorithms it will actually run — one
+  known-good signature per algorithm, at start-up — and names anything refused in
+  a warning as it starts, so the downgrade is not a silent one. A zone signed
+  only with a refused algorithm is then an insecure *delegation*, which is where
+  RFC 6840 section 5.2 puts that decision: served, no AD bit, same as any
+  unsigned zone. A zone that publishes a refused algorithm beside one we can
+  check is validated on the one we can check, and an RRset inside it that
+  arrives with only the refused signature is bogus rather than unsigned — the
+  strip attack RFC 6840 section 5.11 is about.
 - **NS records in the authority section of a positive answer are not required to
   be signed**, a forwarder being unable to tell the parent's copy of a delegation
   from the child's. The answer section is validated in full; this affects only
@@ -2014,7 +2020,8 @@ size of the lists.
 
 - DNSSEC validation is on by default, and where a distribution's crypto policy
   forbids SHA-1 signatures the two RSA/SHA-1 algorithms degrade to insecure
-  rather than validating. See [DNSSEC](#dnssec).
+  delegations rather than validating. Start-up says so; see
+  [DNSSEC](#dnssec).
 - [Rebinding protection](#dns-rebinding-protection) runs only for A, AAAA, ANY,
   SVCB and HTTPS questions — the ones a browser can be made to ask. Addresses in
   the additional section are left alone unless the answer carried an SVCB or
