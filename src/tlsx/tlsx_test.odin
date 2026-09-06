@@ -1,5 +1,6 @@
 package tlsx
 
+import "core:mem"
 import "core:net"
 import "core:os"
 import "core:strings"
@@ -756,4 +757,229 @@ test_verifying_context_refuses_a_name_it_cannot_bind :: proc(t: ^testing.T) {
 			testing.expectf(t, err != .None, "%s was accepted", c.what)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// The ALPN list against a context that has been destroyed
+// ---------------------------------------------------------------------------
+
+@(private = "file")
+Held_Block :: struct {
+	ptr:  rawptr,
+	size: int,
+}
+
+/*
+An allocator that scribbles over what it is asked to free and keeps the block.
+
+"Returned to the allocator" is not otherwise observable: freed bytes may still
+read back correctly for as long as nothing else asks for that size, so a test
+that only frees and looks proves nothing about a machine other than the one it
+ran on. This makes the release itself the signal - the contents are destroyed at
+the moment of the free, deterministically - while holding the block back so
+nothing is written through a dangling pointer to memory the heap has reissued.
+
+`release` hands everything over for real, because `odin test` fails a test that
+still owes the allocator anything when it returns.
+*/
+@(private = "file")
+Scribbler :: struct {
+	under: mem.Allocator,
+	held:  [dynamic]Held_Block,
+}
+
+@(private = "file")
+scribbler_proc :: proc(
+	allocator_data: rawptr,
+	mode: mem.Allocator_Mode,
+	size, alignment: int,
+	old_memory: rawptr,
+	old_size: int,
+	loc := #caller_location,
+) -> (
+	[]byte,
+	mem.Allocator_Error,
+) {
+	s := (^Scribbler)(allocator_data)
+	// Only a sized free can be scribbled over; `free` on a bare pointer passes
+	// no size, and those are handed straight through.
+	if mode == .Free && old_memory != nil && old_size > 0 {
+		mem.set(old_memory, 0xAA, old_size)
+		append(&s.held, Held_Block{ptr = old_memory, size = old_size})
+		return nil, .None
+	}
+	return s.under.procedure(s.under.data, mode, size, alignment, old_memory, old_size, loc)
+}
+
+@(private = "file")
+scribbler_init :: proc(s: ^Scribbler) -> mem.Allocator {
+	s.under = context.allocator
+	s.held.allocator = s.under
+	return mem.Allocator{procedure = scribbler_proc, data = s}
+}
+
+@(private = "file")
+scribbler_release :: proc(s: ^Scribbler) {
+	for b in s.held {
+		_, _ = s.under.procedure(s.under.data, .Free, 0, 0, b.ptr, b.size)
+	}
+	delete(s.held)
+}
+
+@(private = "file")
+Alpn_Client :: struct {
+	endpoint:     net.Endpoint,
+	ctx:          ^Context,
+	conn:         ^Conn,
+	err:          Error,
+	// Copied rather than cloned: this runs on its own thread, and a string
+	// allocated there and freed on the test's thread crosses allocators.
+	protocol:     [64]u8,
+	protocol_len: int,
+}
+
+@(private = "file")
+alpn_client_worker :: proc(a: ^Alpn_Client) {
+	sock, derr := net.dial_tcp_from_endpoint(a.endpoint)
+	if derr != nil {
+		a.err = .IO_Error
+		return
+	}
+	_ = net.set_option(sock, .Receive_Timeout, 10 * time.Second)
+	_ = net.set_option(sock, .Send_Timeout, 10 * time.Second)
+	conn, cerr := client_connect(a.ctx, sock, "")
+	if cerr != .None {
+		net.close(sock)
+		a.err = cerr
+		return
+	}
+	a.conn = conn
+	a.protocol_len = copy(a.protocol[:], alpn_protocol(conn))
+	a.err = .None
+}
+
+/*
+The ALPN list must outlive the `Context` that installed it.
+
+`server_context` hands OpenSSL a raw pointer to the list, which `SSL_CTX` keeps
+and the selection callback dereferences on every handshake. The `SSL_CTX` is
+reference counted and an accepted connection holds one from `SSL_new` on, so it
+survives a certificate reload freeing the `Context` that built it - but the list
+had the `Context`'s lifetime instead, and `context_destroy` handed it back while
+handshakes that would still read it were in flight.
+
+That window is as wide as a peer cares to make it: `server.reload_tls` takes the
+reference under its lock and leaves the handshake outside it on purpose, so a
+client that connects and then stalls before its ClientHello decides when
+`alpn_select` runs. What it read afterwards was memory the allocator had
+reissued, and OpenSSL copies whatever the callback names into the ServerHello -
+up to 255 bytes of it, back to an unauthenticated peer.
+
+So this is the reload, in the order the server does it: take the session, free
+the context, and only then shake hands. The client offers "http/1.1" first and
+must still be answered "h2", which is the server's own list read in the server's
+own order - nothing a scribbled-over buffer could produce.
+*/
+@(test)
+test_alpn_outlives_the_context_that_installed_it :: proc(t: ^testing.T) {
+	posix.sigignore(.SIGPIPE)
+
+	cert, key, have := ensure_certs()
+	if !have {
+		testing.expect(t, false, "no certificate available and openssl could not make one")
+		return
+	}
+
+	scribbler: Scribbler
+	alloc := scribbler_init(&scribbler)
+	defer scribbler_release(&scribbler)
+
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the bound port: %v", berr)
+		return
+	}
+
+	sctx, serr := server_context(cert, key, []string{"h2", "http/1.1"}, alloc)
+	if serr != .None {
+		testing.expectf(t, false, "server_context: %v", serr)
+		return
+	}
+	// Offered in the opposite order to the server's preference, so the protocol
+	// that comes back says whose list decided it.
+	cctx, cerr := client_context(false, "", []string{"http/1.1", "h2"})
+	if cerr != .None {
+		context_destroy(sctx)
+		testing.expectf(t, false, "client_context: %v", cerr)
+		return
+	}
+	defer context_destroy(cctx)
+
+	client := new(Alpn_Client)
+	defer free(client)
+	client.endpoint = bound
+	client.ctx = cctx
+	client.err = .Handshake_Failed
+	worker := thread.create_and_start_with_poly_data(client, alpn_client_worker)
+	defer {
+		thread.join(worker)
+		thread.destroy(worker)
+		if client.conn != nil {
+			close(client.conn)
+		}
+	}
+
+	sock, _, aerr := net.accept_tcp(listener)
+	if aerr != nil {
+		context_destroy(sctx)
+		testing.expectf(t, false, "cannot accept: %v", aerr)
+		return
+	}
+	_ = net.set_option(sock, .Receive_Timeout, 10 * time.Second)
+	_ = net.set_option(sock, .Send_Timeout, 10 * time.Second)
+
+	// The half of accepting that reads the context, and the only half the
+	// reload's lock covers.
+	session, sserr := server_session(sctx, sock)
+	if sserr != .None {
+		context_destroy(sctx)
+		net.close(sock)
+		testing.expectf(t, false, "server_session: %v", sserr)
+		return
+	}
+
+	// The reload: the listener's slot now holds a fresh context and this one is
+	// released. The `SSL` above keeps the `SSL_CTX` alive; nothing on this side
+	// keeps anything else alive.
+	context_destroy(sctx)
+
+	// And the heap moves on, the way it would on a server still answering
+	// queries. Sizes around the encoded list's, so a block handed back lands in
+	// the bin the next request draws from.
+	churn: [64][]u8
+	for i in 0 ..< len(churn) {
+		churn[i] = make([]u8, 8 + i, context.temp_allocator)
+		mem.set(raw_data(churn[i]), 0xAA, len(churn[i]))
+	}
+	defer free_all(context.temp_allocator)
+
+	server_conn, herr := server_handshake(session)
+	if herr != .None {
+		net.close(sock)
+		testing.expectf(t, false, "the handshake failed after the context was released: %v", herr)
+		return
+	}
+	defer close(server_conn)
+
+	testing.expect_value(t, alpn_protocol(server_conn), "h2")
+
+	thread.join(worker)
+	testing.expect_value(t, client.err, Error.None)
+	testing.expect_value(t, string(client.protocol[:client.protocol_len]), "h2")
 }

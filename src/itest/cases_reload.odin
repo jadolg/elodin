@@ -128,6 +128,25 @@ wait_for_handshake :: proc(dot_port: int, ca_file, hostname: string, within: tim
 	return false
 }
 
+/*
+Wait until `needle` has been logged at least `want` times.
+
+The reload cases make the server log the same line more than once, so a case
+that has to know *its* reload finished counts rather than looks: reading for the
+line itself would be satisfied by the one an earlier case provoked.
+*/
+@(private = "file")
+wait_for_log_count :: proc(srv: ^Server, needle: string, want: int, within: time.Duration) -> bool {
+	deadline := time.time_add(time.now(), within)
+	for time.diff(time.now(), deadline) > 0 {
+		if log_count(srv, needle) >= want {
+			return true
+		}
+		time.sleep(20 * time.Millisecond)
+	}
+	return false
+}
+
 run_reload_cases :: proc(r: ^Runner) {
 	// Heap, not scratch: end_case resets the temp allocator between cases and
 	// these paths are read again by every case in this function.
@@ -192,6 +211,74 @@ run_reload_cases :: proc(r: ^Runner) {
 			// the context is swapped, and the log line the reload writes can reach
 			// the file a beat later, so a single read races it on a loaded runner.
 			check(r, wait_for_log(&srv, "reloaded the certificate", 2 * time.Second), "no reload was logged")
+		}
+	}
+	end_case(r)
+
+	start_case(r, "tls reload: a connection held across the reload still negotiates ALPN")
+	{
+		/*
+		The listener's ALPN preference list is read by OpenSSL on every
+		handshake, out of memory the `SSL_CTX` points at. A connection takes its
+		reference to that context when it is accepted; the ClientHello that makes
+		the selection callback run arrives whenever the client chooses to send
+		it, deliberately outside the lock the reload holds. So a connection
+		opened before a SIGHUP and handshaken after it is where that list has to
+		still be there - and where, while it was freed along with the wrapper the
+		reload releases, the callback walked reclaimed heap and OpenSSL copied
+		what it found into the ServerHello.
+
+		Nothing on disk changes here: a reload rebuilds the context and releases
+		the displaced one whether or not the certificate is new, which is the
+		whole of what this case needs.
+		*/
+		socket, derr := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = dot_port})
+		if check(r, derr == nil, "cannot open a connection to the DoT port") {
+			held: ^tlsx.Conn
+			defer {
+				if held != nil {
+					tlsx.close(held)
+				} else {
+					net.close(socket)
+				}
+			}
+			_ = net.set_option(socket, .Receive_Timeout, CLIENT_TIMEOUT)
+			_ = net.set_option(socket, .Send_Timeout, CLIENT_TIMEOUT)
+
+			// A whole handshake on a second connection, to establish that the
+			// one above has been accepted: one accept loop serves this listener
+			// and takes connections in the order they arrive, so a later one
+			// getting as far as a completed handshake puts the earlier one's
+			// reference to the current context beyond doubt.
+			check(
+				r,
+				dot_handshake_verifies(dot_port, cert_b, "reload-b.test"),
+				"the server stopped completing handshakes",
+			)
+
+			reloads := log_count(&srv, "reloaded the certificate")
+			if check(r, signal_reload(&srv), "could not deliver SIGHUP") &&
+			   check(
+					   r,
+					   wait_for_log_count(&srv, "reloaded the certificate", reloads + 1, 3 * time.Second),
+					   "the reload never completed",
+				   ) {
+				// Verification off: the certificate either side of this reload is
+				// the same one, and what is under test is the ALPN list.
+				ctx, cerr := tlsx.client_context(false, "", []string{"dot"}, context.temp_allocator)
+				if check(r, cerr == .None, "cannot build the client context") {
+					defer tlsx.context_destroy(ctx)
+					conn, terr := tlsx.client_connect(ctx, socket, "")
+					if check(r, terr == .None, "the handshake failed after the reload it was held across") {
+						held = conn
+						check(
+							r,
+							tlsx.alpn_protocol(conn) == "dot",
+							"the reloaded listener did not select the protocol it advertises",
+						)
+					}
+				}
+			}
 		}
 	}
 	end_case(r)

@@ -42,6 +42,26 @@ SSL_TLSEXT_ERR_OK :: 0
 SSL_TLSEXT_ERR_ALERT_FATAL :: 2
 SSL_TLSEXT_ERR_NOACK :: 3
 
+// The ex_data class an SSL_CTX belongs to. OpenSSL only exposes
+// SSL_CTX_get_ex_new_index as a macro over CRYPTO_get_ex_new_index with this.
+CRYPTO_EX_INDEX_SSL_CTX :: 1
+
+/*
+Releases one piece of ex_data when the object carrying it is finally freed - for
+an SSL_CTX, when the last reference to it goes.
+
+Called once per registered index for every object of the class, so `ptr` is nil
+for an object that never had anything stored at that index.
+*/
+CRYPTO_EX_Free :: #type proc "c" (
+	parent: rawptr,
+	ptr: rawptr,
+	ad: rawptr,
+	idx: c.int,
+	argl: c.long,
+	argp: rawptr,
+)
+
 ALPN_Select_Cb :: #type proc "c" (
 	ssl: ^SSL,
 	out: ^[^]u8,
@@ -69,6 +89,7 @@ foreign libssl {
 	SSL_CTX_check_private_key :: proc(ctx: ^SSL_CTX) -> c.int ---
 	SSL_CTX_set_alpn_protos :: proc(ctx: ^SSL_CTX, protos: [^]u8, len: c.uint) -> c.int ---
 	SSL_CTX_set_alpn_select_cb :: proc(ctx: ^SSL_CTX, cb: ALPN_Select_Cb, arg: rawptr) ---
+	SSL_CTX_set_ex_data :: proc(ctx: ^SSL_CTX, idx: c.int, data: rawptr) -> c.int ---
 
 	SSL_new :: proc(ctx: ^SSL_CTX) -> ^SSL ---
 	SSL_free :: proc(ssl: ^SSL) ---
@@ -87,6 +108,8 @@ foreign libssl {
 
 @(default_calling_convention = "c")
 foreign libcrypto {
+	CRYPTO_get_ex_new_index :: proc(class_index: c.int, argl: c.long, argp: rawptr, new_func: rawptr, dup_func: rawptr, free_func: CRYPTO_EX_Free) -> c.int ---
+
 	ERR_get_error :: proc() -> c.ulong ---
 	ERR_clear_error :: proc() ---
 	ERR_error_string_n :: proc(e: c.ulong, buf: [^]u8, len: c.size_t) ---
