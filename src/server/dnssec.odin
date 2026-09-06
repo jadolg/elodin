@@ -46,19 +46,6 @@ start_validator :: proc(s: ^Server) -> bool {
 	zone that is insecure here and secure everywhere else.
 	*/
 	dnssec.probe_algorithms()
-	/*
-	And refused to start on, for the reason a trust anchor that will not parse
-	is: a library that will run none of them is a validator that validates
-	nothing, and it would spend its uptime saying otherwise - every delegation
-	insecure, every answer unvalidated, no AD bit and no SERVFAIL anywhere to
-	show for it. An operator who wants that has `dnssec.enabled: false` to say
-	so with.
-	*/
-	if !dnssec.any_algorithm_supported() {
-		logx.errorf("dnssec: the linked libcrypto will run none of the DNSSEC algorithms this build implements")
-		logx.errorf("dnssec: nothing could be validated; check the host crypto policy, or set dnssec.enabled: false")
-		return false
-	}
 
 	anchors: []dnssec.Trust_Anchor
 	if len(s.cfg.dnssec.trust_anchors) > 0 {
@@ -93,6 +80,26 @@ start_validator :: proc(s: ^Server) -> bool {
 			}
 		}
 		s.anchor_zones = zones[:]
+	}
+
+	/*
+	And refused to start on, for the reason an anchor that will not parse is: an
+	anchor naming an algorithm the library will not run anchors nothing, so the
+	zone it covers is an insecure delegation the moment it is asked about - the
+	root anchors being the whole DNS. The server would come up, report how many
+	anchors it is validating against, and validate not one answer: no AD bit
+	anywhere and no SERVFAIL either, which is the failure a validating resolver
+	exists to not have. An operator who does want unvalidated answers has
+	`dnssec.enabled: false` to ask for them with.
+	*/
+	if !dnssec.usable_anchor(anchors if len(anchors) > 0 else dnssec.root_anchors()) {
+		logx.errorf("dnssec: no trust anchor names an algorithm and digest this build can check")
+		logx.errorf("dnssec: nothing would be validated; check the host crypto policy, or set dnssec.enabled: false")
+		// The validator is still nil, and `destroy_validator` takes that; what
+		// this is here for is the anchors parsed above, which the refusal to
+		// start would otherwise leave behind.
+		stop_validator(s)
+		return false
 	}
 
 	s.validator = dnssec.make_validator(

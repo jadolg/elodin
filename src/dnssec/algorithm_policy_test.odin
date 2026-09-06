@@ -278,9 +278,15 @@ chain_validator :: proc(allocator: mem.Allocator, tamper: ^Tamper = nil) -> ^Val
 
 /*
 The policy table is one table for the whole package, and the test runner runs
-tests on four threads. Everything that writes it holds this, so that a test
+tests on several threads. Everything that writes it holds this, so that a test
 asking what a refusing host does cannot be read by a test asking what this host
 does.
+
+The lock only covers the tests that take it, which leaves one invariant for
+whoever adds the next fixture: no other test in this package may depend on
+RSA/SHA-1. Nothing does today - every captured chain is algorithm 8, 13 or 15 -
+and the first one that does will flake against the tests here rather than fail
+honestly.
 */
 @(private = "file")
 policy_lock: sync.Mutex
@@ -399,6 +405,69 @@ test_the_table_reports_what_the_library_answered :: proc(t: ^testing.T) {
 		)
 	}
 	free_all(context.temp_allocator)
+}
+
+/*
+And the digest half of the probe is measured against a second transcription.
+
+The algorithm vectors have a failure that announces itself - `Bad` rather than
+`Refused` - and the digest ones have nothing of the sort: `run_probe` compares
+what the library computed against a constant, so one wrong hex digit in that
+constant is indistinguishable from a library that will not compute the digest,
+and would quietly take the digest type out of `digest_supported` on every host.
+A SHA-384 typo would make every delegation attested only by a SHA-384 DS an
+insecure delegation, everywhere, for as long as nobody looked.
+
+Recomputing the digest here would not catch it - that is what `run_probe` does,
+against the same constant. So these are the same three published numbers
+written down a second time, from `openssl dgst` rather than from the table they
+are checked against. A typo in either transcription now has to be made twice,
+identically, to survive.
+*/
+@(test)
+test_the_digest_probe_expects_the_published_numbers :: proc(t: ^testing.T) {
+	Published :: struct {
+		digest_type: u8,
+		digest:      string,
+	}
+	published := []Published {
+		{DIGEST_SHA1, "da39a3ee5e6b4b0d3255bfef95601890afd80709"},
+		{DIGEST_SHA256, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+		{
+			DIGEST_SHA384,
+			"38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b",
+		},
+	}
+
+	testing.expect_value(t, len(DIGEST_PROBES), len(published))
+	for probe in DIGEST_PROBES {
+		want, known := "", false
+		for entry in published {
+			if entry.digest_type == probe.digest_type {
+				want, known = entry.digest, true
+				break
+			}
+		}
+		if !testing.expectf(t, known, "%s: no published digest to check the probe against", probe.name) {
+			continue
+		}
+		testing.expectf(
+			t,
+			probe.want == want,
+			"%s: the probe expects %s, the published digest of the empty string is %s",
+			probe.name,
+			probe.want,
+			want,
+		)
+		testing.expectf(
+			t,
+			len(probe.want) == digest_size(probe.digest_type) * 2,
+			"%s: the probe expects %d bytes of digest, the type is %d",
+			probe.name,
+			len(probe.want) / 2,
+			digest_size(probe.digest_type),
+		)
+	}
 }
 
 // An algorithm nobody implements is not an algorithm anybody refused, and the
@@ -619,16 +688,19 @@ test_one_refused_ds_does_not_make_a_mixed_delegation_insecure :: proc(t: ^testin
 }
 
 /*
-A library that will run nothing is reported as running nothing.
+An anchor whose algorithm the library will not run anchors nothing.
 
 `start_validator` refuses to start on this, so the answer it reads has to be
-the right one in both directions: false while anything is left, true again the
-moment something is. Getting it wrong the safe-looking way - reporting
-something runnable when nothing is - is a server that starts and validates
-nothing.
+right in both directions. Getting it wrong the safe-looking way - reporting an
+anchor usable when it is not - is a server that comes up, says how many anchors
+it holds, and validates nothing behind them.
+
+The built-in root anchors are the case that matters: both name RSA/SHA-256, so
+a host whose policy took that one algorithm away would leave this server with
+no way into the DNS at all, whatever else it could still verify.
 */
 @(test)
-test_a_library_that_runs_nothing_says_so :: proc(t: ^testing.T) {
+test_an_anchor_the_library_cannot_follow_is_not_usable :: proc(t: ^testing.T) {
 	sync.mutex_lock(&policy_lock)
 	defer sync.mutex_unlock(&policy_lock)
 	probe_algorithms()
@@ -636,14 +708,27 @@ test_a_library_that_runs_nothing_says_so :: proc(t: ^testing.T) {
 	before := sync.atomic_load(&refused_algorithms)
 	defer sync.atomic_store(&refused_algorithms, before)
 
-	testing.expect(t, any_algorithm_supported(), "this build's libcrypto runs at least one algorithm")
+	testing.expect(t, usable_anchor(root_anchors()), "the built-in root anchors are followable on this build")
 
-	sync.atomic_store(&refused_algorithms, ALL_ALGORITHMS)
-	testing.expect(t, !any_algorithm_supported(), "every algorithm refused is nothing left to validate with")
+	// One algorithm gone, and it is the only one the root anchors name.
+	sync.atomic_or(&refused_algorithms, algorithm_bit(ALG_RSASHA256))
+	testing.expect(
+		t,
+		!usable_anchor(root_anchors()),
+		"refusing RSA/SHA-256 leaves the root anchors naming nothing this build can check",
+	)
+	testing.expect(t, algorithm_supported(ALG_ED25519), "while other algorithms carry on running")
 
-	// One survivor is still a validator.
-	sync.atomic_store(&refused_algorithms, ALL_ALGORITHMS & ~algorithm_bit(ALG_ED25519))
-	testing.expect(t, any_algorithm_supported(), "one algorithm left is one algorithm to validate with")
-	testing.expect(t, algorithm_supported(ALG_ED25519), "and it is the one left")
-	testing.expect(t, !algorithm_supported(ALG_ECDSAP256SHA256), "not one of the refused ones")
+	// An anchor set is usable when any one of its anchors is.
+	mixed := []Trust_Anchor {
+		{zone = ".", ds = {key_tag = 1, algorithm = ALG_RSASHA256, digest_type = DIGEST_SHA256}},
+		{zone = ".", ds = {key_tag = 2, algorithm = ALG_ED25519, digest_type = DIGEST_SHA256}},
+	}
+	testing.expect(t, usable_anchor(mixed), "one anchor left is one way into the chain")
+	testing.expect(t, !usable_anchor(nil), "and no anchors at all is no way in")
+
+	// A digest the build does not compute takes its anchor with it, algorithm
+	// or no algorithm.
+	gost := []Trust_Anchor{{zone = ".", ds = {key_tag = 3, algorithm = ALG_ED25519, digest_type = 3}}}
+	testing.expect(t, !usable_anchor(gost), "an anchor is only as followable as its digest")
 }

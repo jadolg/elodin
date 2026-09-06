@@ -42,6 +42,30 @@ root_anchors :: proc() -> []Trust_Anchor {
 }
 
 /*
+Is there an anchor here this build can start a chain from?
+
+An anchor names an algorithm and a digest, and `fetch_keys` can only follow one
+it can check - so a set with none of them left after `probe_algorithms` anchors
+nothing. The zone it names is then an insecure delegation the moment it is
+asked about, and for the root anchors that is the whole DNS: a server that
+would validate not one answer while reporting how many anchors it holds.
+`start_validator` refuses to start on it.
+
+One usable anchor is enough to start, which for an operator who has anchored
+several zones means the ones whose anchor did not survive are insecure - as
+they would be on any resolver that cannot check their algorithm, and as the
+start-up warning from the probe says.
+*/
+usable_anchor :: proc(anchors: []Trust_Anchor) -> bool {
+	for anchor in anchors {
+		if algorithm_supported(anchor.ds.algorithm) && digest_supported(anchor.ds.digest_type) {
+			return true
+		}
+	}
+	return false
+}
+
+/*
 Read a trust anchor from a line of configuration.
 
 Both the bare fields and a full presentation-form DS record are accepted, so an
@@ -86,7 +110,15 @@ parse_trust_anchor :: proc(text: string, allocator := context.allocator) -> (anc
 	if !digest_ok || len(digest) == 0 {
 		return {}, false
 	}
-	if len(digest) != digest_size(u8(digest_type)) && digest_supported(u8(digest_type)) {
+	/*
+	`digest_size` rather than `digest_supported`: this is a length check on a
+	digest type we recognise, and since the probe landed `digest_supported` also
+	answers for what the local crypto policy will compute. Reading it here would
+	make the same anchor line parse or fail depending on when it was parsed -
+	`--check` runs before the probe, `start_validator` after it - over a
+	question that has nothing to do with the policy.
+	*/
+	if len(digest) != digest_size(u8(digest_type)) && digest_size(u8(digest_type)) != 0 {
 		return {}, false
 	}
 

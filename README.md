@@ -779,7 +779,8 @@ first query into a zone and not the ones after it.
 | wildcards | a wildcard answer must come with a proof that the name had nothing of its own |
 | unsigned zones | insecure: served, no AD bit |
 | bounds | 32 DS/DNSKEY lookups and 64 signature checks per question, 24 labels of chain, 8 signatures per RRset, 64 keys per zone, 8 hint targets per answer, 100 NSEC3 iterations |
-| an algorithm we cannot check | an insecure delegation at the DS, whether unimplemented here or refused by the host's crypto policy — RFC 6840 section 5.2 |
+| a DS set naming nothing we can check | an insecure delegation, whether the algorithm is unimplemented here or refused by the host's crypto policy — RFC 6840 section 5.2 |
+| a DS set naming something we can check | that path has to hold up: a DNSKEY set it does not lead to is bogus, however many uncheckable DS records sit beside it |
 | bad signature, broken chain, missing proof | SERVFAIL, with an extended DNS error (RFC 8914) saying which |
 
 A refusal reaches the log as a warning carrying the verdict, the reason and the
@@ -878,7 +879,11 @@ Two things worth knowing with validation on:
   unsigned zone. A zone that publishes a refused algorithm beside one we can
   check is validated on the one we can check, and an RRset inside it that
   arrives with only the refused signature is bogus rather than unsigned — the
-  strip attack RFC 6840 section 5.11 is about.
+  strip attack RFC 6840 section 5.11 is about. If no trust anchor survives the
+  probe the server refuses to start rather than come up validating nothing:
+  the built-in root anchors both name RSA/SHA-256, so a policy that took that
+  one algorithm away would leave no way into the DNS at all. `dnssec.enabled:
+  false` is how to ask for unvalidated answers on purpose.
 - **NS records in the authority section of a positive answer are not required to
   be signed**, a forwarder being unable to tell the parent's copy of a delegation
   from the child's. The answer section is validated in full; this affects only
@@ -2020,7 +2025,8 @@ size of the lists.
 
 - DNSSEC validation is on by default, and where a distribution's crypto policy
   forbids SHA-1 signatures the two RSA/SHA-1 algorithms degrade to insecure
-  delegations rather than validating. Start-up says so; see
+  delegations rather than validating. Start-up says so, and refuses to start
+  outright if the policy leaves no trust anchor followable; see
   [DNSSEC](#dnssec).
 - [Rebinding protection](#dns-rebinding-protection) runs only for A, AAAA, ANY,
   SVCB and HTTPS questions — the ones a browser can be made to ask. Addresses in
