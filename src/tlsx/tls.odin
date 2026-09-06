@@ -214,6 +214,12 @@ alpn_encodable :: proc(protocols: []string) -> bool {
 Encode ALPN protocol names into OpenSSL's wire format at the front of `dst`:
 each name prefixed by its one-byte length, all concatenated. Returns how many
 bytes were written. `dst` must have room for them; see `alpn_wire_size`.
+
+Every name must be one `alpn_encodable` accepts, which every caller checks
+first. Without that check this silently produces something other than what it
+was given: a name past 255 bytes is announced as its length modulo 256, and an
+empty one writes a zero into the middle of the list, which on the server side
+is the terminator `alpn_select` stops its walk at.
 */
 @(private)
 encode_alpn_into :: proc(dst: []u8, protocols: []string) -> int {
@@ -237,7 +243,8 @@ alpn_wire_size :: proc(protocols: []string) -> int {
 }
 
 // The same encoding into a fresh buffer, for the client side, where OpenSSL
-// copies the list for itself and no terminator is wanted.
+// copies the list for itself and no terminator is wanted. Same precondition:
+// the caller has already put the names past `alpn_encodable`.
 @(private)
 encode_alpn :: proc(protocols: []string, allocator := context.allocator) -> []u8 {
 	total := alpn_wire_size(protocols)

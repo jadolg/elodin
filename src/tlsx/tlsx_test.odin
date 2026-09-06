@@ -959,15 +959,25 @@ test_alpn_outlives_the_context_that_installed_it :: proc(t: ^testing.T) {
 	// keeps anything else alive.
 	context_destroy(sctx)
 
-	// And the heap moves on, the way it would on a server still answering
-	// queries. Sizes around the encoded list's, so a block handed back lands in
-	// the bin the next request draws from.
+	/*
+	And the process goes on allocating between the release and the handshake
+	that reads the list, the way a server still answering queries would.
+
+	The scribbler is what makes the release observable for a list on the
+	allocator the context was built with. This covers a list released anywhere
+	else the heap can hand back: the sizes bracket the encoded list's and come
+	from the allocator underneath the scribbler, so a block genuinely returned
+	is one of the blocks reissued here, written over before the handshake reads
+	it.
+	*/
 	churn: [64][]u8
 	for i in 0 ..< len(churn) {
-		churn[i] = make([]u8, 8 + i, context.temp_allocator)
+		churn[i] = make([]u8, 4 + i)
 		mem.set(raw_data(churn[i]), 0xAA, len(churn[i]))
 	}
-	defer free_all(context.temp_allocator)
+	defer for c in churn {
+		delete(c)
+	}
 
 	server_conn, herr := server_handshake(session)
 	if herr != .None {

@@ -448,9 +448,21 @@ succeed there, and the line the listeners print once they are bound says the
 same thing without needing an answer.
 */
 wait_for_log :: proc(srv: ^Server, needle: string, timeout: time.Duration) -> bool {
+	return wait_for_log_count(srv, needle, 1, timeout)
+}
+
+/*
+The same wait, for a line this suite logs more than once.
+
+A case whose own action repeats something an earlier case already provoked
+cannot read for the line: the earlier one satisfies it and the wait returns
+before this server has done anything. So it takes `log_count` before acting and
+waits for one more than that.
+*/
+wait_for_log_count :: proc(srv: ^Server, needle: string, want: int, timeout: time.Duration) -> bool {
 	deadline := time.time_add(time.now(), timeout)
 	for time.diff(deadline, time.now()) < 0 {
-		if log_contains(srv, needle) {
+		if log_count(srv, needle) >= want {
 			return true
 		}
 		time.sleep(20 * time.Millisecond)

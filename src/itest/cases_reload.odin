@@ -128,25 +128,6 @@ wait_for_handshake :: proc(dot_port: int, ca_file, hostname: string, within: tim
 	return false
 }
 
-/*
-Wait until `needle` has been logged at least `want` times.
-
-The reload cases make the server log the same line more than once, so a case
-that has to know *its* reload finished counts rather than looks: reading for the
-line itself would be satisfied by the one an earlier case provoked.
-*/
-@(private = "file")
-wait_for_log_count :: proc(srv: ^Server, needle: string, want: int, within: time.Duration) -> bool {
-	deadline := time.time_add(time.now(), within)
-	for time.diff(time.now(), deadline) > 0 {
-		if log_count(srv, needle) >= want {
-			return true
-		}
-		time.sleep(20 * time.Millisecond)
-	}
-	return false
-}
-
 run_reload_cases :: proc(r: ^Runner) {
 	// Heap, not scratch: end_case resets the temp allocator between cases and
 	// these paths are read again by every case in this function.
@@ -245,11 +226,15 @@ run_reload_cases :: proc(r: ^Runner) {
 			_ = net.set_option(socket, .Receive_Timeout, CLIENT_TIMEOUT)
 			_ = net.set_option(socket, .Send_Timeout, CLIENT_TIMEOUT)
 
-			// A whole handshake on a second connection, to establish that the
-			// one above has been accepted: one accept loop serves this listener
-			// and takes connections in the order they arrive, so a later one
-			// getting as far as a completed handshake puts the earlier one's
-			// reference to the current context beyond doubt.
+			// A whole handshake on a second connection, to place the one above
+			// well inside the server. One accept loop serves this listener and
+			// spawns a thread per connection in the order they arrive, so a
+			// later connection completing a whole handshake says the earlier
+			// one's thread was started before it. What that does not order is
+			// that thread reaching `server_session`, which is where the
+			// reference to the current context is taken; what covers the rest
+			// is the reload being a maintenance-loop poll - 200ms - further
+			// away still.
 			check(
 				r,
 				dot_handshake_verifies(dot_port, cert_b, "reload-b.test"),
