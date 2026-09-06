@@ -162,6 +162,39 @@ test_nsec_no_data_refuses_a_parent_side_record :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_nsec_no_data_refuses_the_child_apex_for_a_ds :: proc(t: ^testing.T) {
+	/*
+	The other half of that exception, and the one worth more to an attacker.
+
+	A DS lives in the parent zone and nowhere else, so a record the child signed
+	at its own apex - SOA set - never lists the type and never says a word about
+	it. Reading one as a DS denial takes a signed zone's genuine apex NSEC, which
+	anyone may fetch and replay, and turns it into an authenticated "this
+	delegation is unsigned": every zone below the cut drops out of the chain of
+	trust, with no signature forged anywhere. RFC 6840 section 4.4.
+	*/
+	zone := e_zone()
+	testing.expect_value(t, nsec_proves_no_data(zone, "example.", .DS), Proof.Failed)
+	// The same record still denies the types that really do live at that apex.
+	testing.expect_value(t, nsec_proves_no_data(zone, "example.", .TXT), Proof.Proven)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_nsec_no_data_lets_the_root_deny_its_own_ds :: proc(t: ^testing.T) {
+	/*
+	The root has no parent, so its apex record is the only one that could ever
+	answer `DS .` and the SOA on it is not the mark of the wrong side of a cut.
+	Refusing it would turn a question with a perfectly good answer into a
+	SERVFAIL, and would buy nothing: the root's keys come from the trust anchor,
+	so a denial here detaches no subtree from anything.
+	*/
+	zone := []Nsec_Rr{nsec_rr(".", "a.", {.NS, .SOA, .RRSIG, .NSEC, .DNSKEY})}
+	testing.expect_value(t, nsec_proves_no_data(zone, ".", .DS), Proof.Proven)
+	free_all(context.temp_allocator)
+}
+
+@(test)
 test_nsec_no_data_falls_back_to_the_wildcard :: proc(t: ^testing.T) {
 	/*
 	Nothing on the name itself, so a wildcard answered, and the proof is that

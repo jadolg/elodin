@@ -198,6 +198,11 @@ nsec3_proves_no_data :: proc(
 		if qtype != .DS && bitmap_has(match.rr.types, .NS) && !bitmap_has(match.rr.types, .SOA) {
 			return .Failed
 		}
+		// SOA set is the child's own apex, which holds no DS and never did -
+		// see `denial_is_the_childs_own_apex`.
+		if denial_is_the_childs_own_apex(match.rr.types, qname, qtype) {
+			return .Failed
+		}
 		return .Proven
 	}
 
