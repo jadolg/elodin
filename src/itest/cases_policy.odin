@@ -828,6 +828,19 @@ blocking: {{ enabled: false }}
 		mock_reset_counts(mock)
 		first := query_udp(udp_port, build_query(POISONED_NAME, u16(dns.Type.A), id = 10))
 		if check(r, first.ok, "no response to the first query") {
+			/*
+			The premise, before the judgement. What this case measures is a
+			second upstream query, and a reply elodin threw away for some
+			reason of its own - a question that did not match, a decode that
+			failed, a rule the mock never matched - produces exactly that too,
+			so the case would pass while `put` was never asked the question.
+			The header says the poisoned reply is the one that came back: the
+			rcode the attacker wrote, over the answer section they left alone.
+			*/
+			h, _ := parse_header(first.wire)
+			check(r, h.rcode == int(dns.Rcode.NX_Domain), "rcode %d, want the NXDOMAIN the mock sent", h.rcode)
+			check_eq_int(r, h.ancount, 1, "answer count, the A record under the name error")
+
 			count_after_first := mock_total(mock)
 			second := query_udp(udp_port, build_query(POISONED_NAME, u16(dns.Type.A), id = 11))
 			if check(r, second.ok, "no response to the second query") {

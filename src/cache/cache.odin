@@ -375,6 +375,11 @@ name error beside it denies. And the owner, because a redirection reached from
 somewhere else is not the answer to this question: the DNAME covering
 `a.sub.example.com.` sits at `sub.example.com.`, an ancestor, and reading it as
 the answer would cost the entry for every `QTYPE=DNAME` question under a DNAME.
+
+The class along with them, because a record in another class is not data at the
+name this question asked about either - the classes are separate trees, and a
+`CH` record sitting at the owner name says nothing about the `IN` name a name
+error beside it denies.
 */
 @(private)
 answers_the_question :: proc(msg: dns.Message, rec: dns.Record) -> bool {
@@ -382,10 +387,23 @@ answers_the_question :: proc(msg: dns.Message, rec: dns.Record) -> bool {
 		return false
 	}
 	q := msg.question[0]
+	if q.class != rec.class {
+		return false
+	}
 	if q.type != rec.type && q.type != .ANY {
 		return false
 	}
 	return dns.name_equal_fold(q.name, rec.name)
+}
+
+// The class the response was asked in. `IN` where there is no question to read
+// it from, which is the class every path into this cache asks in.
+@(private)
+question_class :: proc(msg: dns.Message) -> dns.Class {
+	if len(msg.question) == 0 {
+		return .IN
+	}
+	return msg.question[0].class
 }
 
 /*
@@ -592,7 +610,16 @@ put :: proc(c: ^Cache, key: string, wire: []u8, msg: dns.Message, checked: u64 =
 			// the name they lead to rather than for the one asked about -
 			// unless the redirection is itself the answer, below.
 			case .CNAME, .DNAME:
-				if answers_the_question(msg, rec) {
+				/*
+				And unless it is in another class, which is not a redirection
+				this question could follow: the classes are separate trees, so
+				a `CH` record in the answer to an `IN` question is not a hop on
+				the way to anything and is data at the denied name like any
+				other type here. Refused rather than exempted - the whole of
+				this guard is that a name error carries the chain and nothing
+				else, and a record from another tree is not the chain.
+				*/
+				if rec.class != question_class(msg) || answers_the_question(msg, rec) {
 					return false
 				}
 			case:

@@ -228,6 +228,48 @@ test_nxdomain_over_a_dname_above_the_queried_name_is_cached :: proc(t: ^testing.
 	free_all(context.temp_allocator)
 }
 
+/*
+And a redirection from another class is not one this question could follow.
+
+The exemption is for the chain the question is walking, and the classes are
+separate trees: a `CH` record at the queried owner is not a hop towards anything
+an `IN` question could reach, so it is data at the denied name like any other
+type in that section. Refused rather than waved through, which is the direction
+the whole guard runs in - a name error carries the chain and nothing else.
+*/
+@(test)
+test_nxdomain_over_a_cname_in_another_class_is_not_cached :: proc(t: ^testing.T) {
+	c := make_cache(Options{max_entries = 8, max_ttl = 3600, negative_ttl = 300})
+	defer destroy(c)
+
+	answer := make([]dns.Record, 1, context.temp_allocator)
+	answer[0] = dns.Record {
+		name  = "www.example.com.",
+		type  = .CNAME,
+		class = .CH,
+		ttl   = 300,
+		data  = dns.Rdata_Name{name = "target.example.net."},
+	}
+	m := dns.Message {
+		id       = 0x3336,
+		question = []dns.Question{{name = "www.example.com.", type = .A, class = .IN}},
+		answer   = answer,
+	}
+	m.flags.qr = true
+	m.flags.ra = true
+	m.flags.rcode = u8(dns.Rcode.NX_Domain)
+	wire, _, err := dns.encode_message(m, context.temp_allocator)
+	testing.expect(t, err == .None, "the test nxdomain did not encode")
+	msg, derr := dns.decode_message(wire, context.temp_allocator)
+	testing.expect(t, derr == .None, "the test nxdomain did not decode")
+
+	kb: [KEY_MAX]u8
+	key := key_for_nx(kb[:], "www.example.com.")
+	testing.expect(t, !put(c, key, wire, msg), "an NXDOMAIN over a CNAME in another class was stored")
+	testing.expect_value(t, len_entries(c), 0)
+	free_all(context.temp_allocator)
+}
+
 @(private = "file")
 key_for_nx :: proc(buf: []u8, name: string) -> string {
 	return make_key(buf, name, .A, .IN, false)
