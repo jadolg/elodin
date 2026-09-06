@@ -617,3 +617,33 @@ test_one_refused_ds_does_not_make_a_mixed_delegation_insecure :: proc(t: ^testin
 	)
 	free_all(context.temp_allocator)
 }
+
+/*
+A library that will run nothing is reported as running nothing.
+
+`start_validator` refuses to start on this, so the answer it reads has to be
+the right one in both directions: false while anything is left, true again the
+moment something is. Getting it wrong the safe-looking way - reporting
+something runnable when nothing is - is a server that starts and validates
+nothing.
+*/
+@(test)
+test_a_library_that_runs_nothing_says_so :: proc(t: ^testing.T) {
+	sync.mutex_lock(&policy_lock)
+	defer sync.mutex_unlock(&policy_lock)
+	probe_algorithms()
+
+	before := sync.atomic_load(&refused_algorithms)
+	defer sync.atomic_store(&refused_algorithms, before)
+
+	testing.expect(t, any_algorithm_supported(), "this build's libcrypto runs at least one algorithm")
+
+	sync.atomic_store(&refused_algorithms, ALL_ALGORITHMS)
+	testing.expect(t, !any_algorithm_supported(), "every algorithm refused is nothing left to validate with")
+
+	// One survivor is still a validator.
+	sync.atomic_store(&refused_algorithms, ALL_ALGORITHMS & ~algorithm_bit(ALG_ED25519))
+	testing.expect(t, any_algorithm_supported(), "one algorithm left is one algorithm to validate with")
+	testing.expect(t, algorithm_supported(ALG_ED25519), "and it is the one left")
+	testing.expect(t, !algorithm_supported(ALG_ECDSAP256SHA256), "not one of the refused ones")
+}

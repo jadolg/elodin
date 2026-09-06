@@ -46,6 +46,19 @@ start_validator :: proc(s: ^Server) -> bool {
 	zone that is insecure here and secure everywhere else.
 	*/
 	dnssec.probe_algorithms()
+	/*
+	And refused to start on, for the reason a trust anchor that will not parse
+	is: a library that will run none of them is a validator that validates
+	nothing, and it would spend its uptime saying otherwise - every delegation
+	insecure, every answer unvalidated, no AD bit and no SERVFAIL anywhere to
+	show for it. An operator who wants that has `dnssec.enabled: false` to say
+	so with.
+	*/
+	if !dnssec.any_algorithm_supported() {
+		logx.errorf("dnssec: the linked libcrypto will run none of the DNSSEC algorithms this build implements")
+		logx.errorf("dnssec: nothing could be validated; check the host crypto policy, or set dnssec.enabled: false")
+		return false
+	}
 
 	anchors: []dnssec.Trust_Anchor
 	if len(s.cfg.dnssec.trust_anchors) > 0 {

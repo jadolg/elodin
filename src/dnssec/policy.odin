@@ -39,6 +39,15 @@ check. A zone publishing only a refused algorithm keeps resolving exactly as it
 did before; a zone publishing one beside a supported one stops being
 strippable.
 
+The digest half of the table answers for DS digests and for those only.
+NSEC3's iterated hash is SHA-1 by definition (RFC 5155) and `nsec3.odin` calls
+`digest` for it directly: there is no second algorithm to fall back on and no
+verdict to reach, so a library that could not compute SHA-1 at all would leave
+every NSEC3 denial unprovable whatever this table said. Nothing has been seen
+to do that - crypto policies restrict what a signature may be made with, not
+what may be hashed - and the probe is here so that the DS path does not have to
+assume it.
+
 What this does not cover is a policy that turns an algorithm down for something
 about a particular key rather than for the algorithm itself - a modulus below
 some floor, say. The probe would find that algorithm runnable, and a zone whose
@@ -104,6 +113,25 @@ algorithm_supported :: proc "contextless" (algorithm: u8) -> bool {
 	bit := algorithm_bit(algorithm)
 	return bit != 0 && sync.atomic_load(&refused_algorithms) & bit == 0
 }
+
+/*
+Will the library run anything at all?
+
+False is not a degraded mode, it is validation gone: every delegation has an
+unusable DS, every zone below the root is insecure, and every answer goes out
+unvalidated with no AD bit and no SERVFAIL to show for it. A broken
+`OPENSSL_CONF`, a provider that did not load, a FIPS container - any of them
+reach it, and none of them announce themselves. `start_validator` refuses to
+start on this rather than spend the uptime saying it validates.
+*/
+any_algorithm_supported :: proc "contextless" () -> bool {
+	return sync.atomic_load(&refused_algorithms) & ALL_ALGORITHMS != ALL_ALGORITHMS
+}
+
+// Every bit `algorithm_bit` hands out; all of them set is a library that will
+// verify nothing this build knows how to ask it for.
+@(private)
+ALL_ALGORITHMS :: u32(0xff)
 
 // Implemented here, and turned down by the library: the one case where
 // `verify_signature` has an answer without asking libcrypto for one.
