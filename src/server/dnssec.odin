@@ -38,6 +38,15 @@ start_validator :: proc(s: ^Server) -> bool {
 		return true
 	}
 
+	/*
+	Before anything is validated, and before the line below reports what we are
+	validating against: this asks the linked libcrypto which algorithms it will
+	actually run, and it is where an operator on a host whose crypto policy
+	rules one out finds that out - as a warning at start-up, rather than as a
+	zone that is insecure here and secure everywhere else.
+	*/
+	dnssec.probe_algorithms()
+
 	anchors: []dnssec.Trust_Anchor
 	if len(s.cfg.dnssec.trust_anchors) > 0 {
 		parsed := make([dynamic]dnssec.Trust_Anchor, 0, len(s.cfg.dnssec.trust_anchors))

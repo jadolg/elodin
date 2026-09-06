@@ -297,6 +297,10 @@ make_validator :: proc(
 	opts: Options,
 	allocator := context.allocator,
 ) -> ^Validator {
+	// Nothing may validate against a table nobody has checked against the
+	// library; a build that never called this on its own gets it here.
+	probe_algorithms()
+
 	v := new(Validator, allocator)
 	v.allocator = allocator
 	v.query = query
@@ -1516,7 +1520,6 @@ validate_rrset :: proc(
 	have to hold a signature it was never in a position to make.
 	*/
 	unsupported := false
-	refused := false
 	exhausted := false
 	/*
 	One chain walk per distinct signer, not one per signature.
@@ -1603,10 +1606,15 @@ validate_rrset :: proc(
 		#partial switch result {
 		case .Ok:
 			return .Secure, expanded_from, "", sig.signer, sig
-		case .Unsupported:
+		case .Unsupported, .Refused:
+			/*
+			The same thing to say about this RRset. One is an algorithm this
+			build never implemented and the other one the library declined to
+			run, and neither looked at the signature before deciding - so
+			neither is evidence that what arrived is genuine, which is all the
+			verdict below turns on.
+			*/
 			unsupported = true
-		case .Refused:
-			refused = true
 		}
 	}
 
@@ -1650,34 +1658,26 @@ validate_rrset :: proc(
 	Nothing here was checkable, and the zone it belongs to is signed with
 	something that was.
 
-	An algorithm we do not implement makes a *delegation* insecure - `zone_step`
-	settles that at the DS, per RFC 6840 section 5.2 - but it cannot make an
-	RRset inside an established zone insecure, which is the correction in
-	section 5.11 of the same document. A zone signed with two algorithms
+	An algorithm this build cannot check makes a *delegation* insecure -
+	`zone_step` settles that at the DS, per RFC 6840 section 5.2 - but it cannot
+	make an RRset inside an established zone insecure, which is the correction
+	in section 5.11 of the same document. A zone signed with two algorithms
 	publishes an RRSIG for each, so treating this as unsigned would let an
 	attacker strip the signature we can verify, alter the records, and have what
 	is left reach the client as merely unvalidated instead of refused. The whole
 	point of the second algorithm, inverted.
+
+	"Cannot check" covers the algorithm the library declined as well as the one
+	this build never implemented, and it has to: the refusal is a decision about
+	the algorithm taken before the signature is read, so a forgery earns it as
+	readily as the genuine article. Which one it was is settled at the
+	delegation instead, where the escape hatch belongs - `probe_algorithms`
+	takes a refused algorithm out of `algorithm_supported` at start-up, so a
+	zone that publishes only that algorithm has no usable DS and goes insecure
+	in front of this loop rather than through it.
 	*/
 	if unsupported {
 		return .Bogus, "", "no signature this build can verify", "", {}
-	}
-
-	/*
-	The library would not run an algorithm we do implement, which is a statement
-	about this machine rather than about the zone.
-
-	Refusing here would make a zone unresolvable on a host whose crypto policy
-	rules SHA-1 out - Fedora and RHEL, for algorithms 5 and 7 - while the same
-	build resolved it everywhere else, so the data is treated as unsigned as it
-	always has been. That leaves the section 5.11 downgrade open on those hosts
-	for zones that publish a refused algorithm alongside a supported one; the
-	place to close it is `algorithm_supported`, which should answer for what the
-	linked library will actually run so that the delegation goes insecure at the
-	DS instead.
-	*/
-	if refused {
-		return .Insecure, "", "algorithm refused by local policy", "", {}
 	}
 	return .Bogus, "", missing, "", {}
 }

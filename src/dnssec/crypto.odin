@@ -65,10 +65,16 @@ Verify_Result :: enum u8 {
 
 	Distribution crypto policy lands here: Fedora and RHEL ship an OpenSSL that
 	refuses SHA-1 signatures outright, which takes algorithms 5 and 7 with it.
-	Kept apart from `Unsupported` because the two want different answers — this
-	one is a local policy about a zone that has done nothing wrong, so the data
-	is treated as unsigned rather than refused, and a zone that is unresolvable
-	here would resolve on the same build elsewhere.
+	Kept apart from `Unsupported` because the two are different statements - this
+	one is about the machine, and a zone unresolvable here would resolve on the
+	same build elsewhere - but they reach the same verdict, because a refusal is
+	returned before any signature byte is read and so says nothing about the
+	signature that earned it.
+
+	What keeps that from costing anything is `probe_algorithms`: an algorithm
+	the library turns down leaves `algorithm_supported` before any zone is
+	walked, so the delegation settles insecure at the DS rather than an RRset
+	settling it inside a zone already established as secure. See policy.odin.
 	*/
 	Refused,
 }
@@ -81,24 +87,6 @@ MAX_MODULUS_BYTES :: 1024
 // exponent. Real ones are three bytes; this leaves room to spare and keeps the
 // rest of the field from being read as one.
 MAX_EXPONENT_BYTES :: 512
-
-algorithm_supported :: proc "contextless" (algorithm: u8) -> bool {
-	switch algorithm {
-	case ALG_RSASHA1, ALG_RSASHA1_NSEC3, ALG_RSASHA256, ALG_RSASHA512:
-		return true
-	case ALG_ECDSAP256SHA256, ALG_ECDSAP384SHA384, ALG_ED25519, ALG_ED448:
-		return true
-	}
-	return false
-}
-
-digest_supported :: proc "contextless" (digest_type: u8) -> bool {
-	switch digest_type {
-	case DIGEST_SHA1, DIGEST_SHA256, DIGEST_SHA384:
-		return true
-	}
-	return false
-}
 
 digest_size :: proc "contextless" (digest_type: u8) -> int {
 	switch digest_type {
@@ -144,6 +132,31 @@ Check one DNSSEC signature.
 both exactly as they appear on the wire; `data` is the canonical signing input.
 */
 verify_signature :: proc(
+	algorithm: u8,
+	public_key: []u8,
+	signature: []u8,
+	data: []u8,
+	allocator := context.temp_allocator,
+) -> Verify_Result {
+	/*
+	Asked once, at start-up, rather than again per signature. `probe_algorithms`
+	put a known-good signature of this algorithm to this very library; if it
+	would not run then, it will not run now, and answering from that keeps one
+	verdict where a second call could produce a different one.
+	*/
+	if algorithm_refused(algorithm) {
+		return .Refused
+	}
+	return verify_now(algorithm, public_key, signature, data, allocator)
+}
+
+/*
+The same check with the local policy left out, which is how the policy is
+decided in the first place: `run_probe` calls this, and could not call the
+procedure above without asking the table it is being built to fill.
+*/
+@(private)
+verify_now :: proc(
 	algorithm: u8,
 	public_key: []u8,
 	signature: []u8,
