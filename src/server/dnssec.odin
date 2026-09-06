@@ -89,12 +89,17 @@ start_validator :: proc(s: ^Server) -> bool {
 
 	The root is the zone that decides. Every chain starts there - `zone_trust`
 	asks for the root's keys and walks down through DS records - so a set that
-	cannot seed the root seeds nothing, whatever else is in it. Without the
-	check the server comes up, reports how many anchors it is validating
-	against, and validates not one answer: no AD bit anywhere and no SERVFAIL
-	either, which is the failure a validating resolver exists to not have. An
-	operator who does want unvalidated answers has `dnssec.enabled: false` to
-	ask for them with.
+	cannot seed the root seeds nothing, whatever else is in it.
+
+	The two ways of failing that fail differently, which is why they are told
+	apart below. An anchor for the root whose algorithm the library will not run
+	leaves `fetch_keys` with nothing checkable, so the root is insecure and
+	every answer goes out unvalidated: no AD bit anywhere and no SERVFAIL
+	either, which is the failure a validating resolver exists to not have. No
+	root anchor at all leaves `zone_keys` with nothing to match, which is
+	`Indeterminate` and SERVFAILs every name instead. Neither is a server worth
+	starting; an operator who does want unvalidated answers has
+	`dnssec.enabled: false` to ask for them with.
 	*/
 	in_use := anchors if len(anchors) > 0 else dnssec.root_anchors()
 	if !dnssec.usable_anchor(in_use, ".") {

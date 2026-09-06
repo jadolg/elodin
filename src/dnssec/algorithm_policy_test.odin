@@ -768,3 +768,113 @@ test_an_anchor_the_library_cannot_follow_is_not_usable :: proc(t: ^testing.T) {
 	gost := []Trust_Anchor{{zone = ".", ds = {key_tag = 3, algorithm = ALG_ED25519, digest_type = 3}}}
 	testing.expect(t, !usable_anchor(gost, "."), "an anchor is only as followable as its digest")
 }
+
+/*
+A signature this build cannot check is rejected for nothing.
+
+`MAX_VERIFICATIONS_PER_QUERY` is the allowance an attacker fills, and a zone
+mid-rollover hands them the material to fill it with: it really does publish
+the refused algorithm, so copies of its own RRSIG carry a real key tag, a real
+algorithm and a window that is genuinely open, and every cheap test in front of
+the crypto passes them. Charged a verification each, sixty-four of them ahead
+of the ECDSA signature turn a name that resolves into `Indeterminate` and a
+SERVFAIL.
+
+Nothing is spent on them now, because nothing has to be: the policy table
+answers for a refused algorithm without asking libcrypto, so the answer is in
+hand before the meter is touched. The padded set costs exactly what the
+unpadded one costs, and still validates.
+*/
+@(test)
+test_refused_signatures_cannot_spend_the_verification_budget :: proc(t: ^testing.T) {
+	now := time.unix(FIXTURE_TIME, 0)
+	unix := u32(FIXTURE_TIME)
+
+	sig_of :: proc(rdata_hex: string) -> Rrsig {
+		rdata, ok := decode_hex(rdata_hex, context.temp_allocator)
+		if !ok {
+			panic("a fixture signature is not hex")
+		}
+		sig, err := parse_rrsig(rdata, context.temp_allocator)
+		if err != .None {
+			panic("a fixture signature did not parse")
+		}
+		return sig
+	}
+
+	records := make([]dns.Record, 1, context.temp_allocator)
+	records[0] = dns.Record {
+		name  = "migrating.",
+		type  = .A,
+		class = .IN,
+		ttl   = CHAIN_TTL,
+		data  = dns.Rdata_A{addr = {192, 0, 2, 1}},
+	}
+
+	runs_rsasha1 := hold_policy()
+	defer release_policy(runs_rsasha1)
+	refuse_rsasha1()
+
+	// What the answer costs untouched: the chain down to the zone, and the one
+	// signature that carries the set.
+	baseline := Budget{}
+	{
+		v := chain_validator(context.temp_allocator)
+		defer destroy_validator(v)
+		plain := make([]Rrsig, 1, context.temp_allocator)
+		plain[0] = sig_of(MIGRATING_A_SIG_13)
+		status, _, reason, _, _ := validate_rrset(
+			v,
+			&baseline,
+			"migrating.",
+			.A,
+			.IN,
+			records,
+			plain,
+			unix,
+			now,
+			context.temp_allocator,
+		)
+		testing.expectf(t, status == .Secure, "the unpadded answer did not validate: %v, %s", status, reason)
+	}
+
+	// And the same answer with the zone's own RSA/SHA-1 signature copied in
+	// front of it, as many times as the allowance would bear.
+	padded := make([]Rrsig, MAX_VERIFICATIONS_PER_QUERY + 1, context.temp_allocator)
+	for i in 0 ..< MAX_VERIFICATIONS_PER_QUERY {
+		padded[i] = sig_of(MIGRATING_A_SIG_5)
+	}
+	padded[MAX_VERIFICATIONS_PER_QUERY] = sig_of(MIGRATING_A_SIG_13)
+
+	v := chain_validator(context.temp_allocator)
+	defer destroy_validator(v)
+	budget := Budget{}
+	status, _, reason, _, _ := validate_rrset(
+		v,
+		&budget,
+		"migrating.",
+		.A,
+		.IN,
+		records,
+		padded,
+		unix,
+		now,
+		context.temp_allocator,
+	)
+	testing.expectf(
+		t,
+		status == .Secure,
+		"%d refused signatures in front of the good one denied the answer: %v, %s",
+		MAX_VERIFICATIONS_PER_QUERY,
+		status,
+		reason,
+	)
+	testing.expectf(
+		t,
+		budget.verifications == baseline.verifications,
+		"the padding spent %d verifications against a baseline of %d: a signature the library will not run is not free",
+		budget.verifications,
+		baseline.verifications,
+	)
+	free_all(context.temp_allocator)
+}

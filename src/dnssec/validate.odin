@@ -1598,6 +1598,23 @@ validate_rrset :: proc(
 		if !signature_worth_trying(sig, keys, unix) {
 			continue
 		}
+		/*
+		A third free reject, and one only the policy table can make: this
+		signature names a key the zone published, of an algorithm the library
+		will not run, so the verdict is known without asking - `verify_signature`
+		would answer from the same table and spend a verification getting there.
+
+		Which matters because the allowance is what an attacker fills. A zone
+		mid-rollover really does publish the refused algorithm, so copies of its
+		own signature pass every cheap test above and used to cost a
+		verification each: sixty-four of them in front of the one that would
+		have held, and the answer is `Indeterminate` and a SERVFAIL for a name
+		that resolves.
+		*/
+		if !algorithm_supported(sig.algorithm) {
+			unsupported = true
+			continue
+		}
 		if !spend_verification(budget) {
 			exhausted = true
 			break

@@ -318,18 +318,34 @@ run_probe :: proc() {
 		key, key_ok := decode_hex(probe.key, scratch)
 		signature, sig_ok := decode_hex(probe.signature, scratch)
 		data, data_ok := decode_hex(PROBE_DATA, scratch)
-		ran := key_ok && sig_ok && data_ok
-		if ran {
-			ran = verify_now(probe.algorithm, key, signature, data, scratch) == .Ok
+		result := Verify_Result.Bad
+		if key_ok && sig_ok && data_ok {
+			result = verify_now(probe.algorithm, key, signature, data, scratch)
 		}
 		free_all(scratch)
-		if !ran {
+		if result != .Ok {
 			algorithms |= algorithm_bit(probe.algorithm)
 			logx.warnf(
 				"dnssec: this build's libcrypto will not verify %s (algorithm %d); a zone signed with it alone is insecure here rather than validated",
 				probe.name,
 				probe.algorithm,
 			)
+			/*
+			Which of the two it was, because they read very differently in a bug
+			report. `Refused` is a crypto policy declining the algorithm, which
+			is what this probe is for. `Bad` is the library refusing to import
+			the key or rejecting a signature that verifies everywhere else -
+			`test_no_probe_vector_can_be_rejected_as_a_forgery` says the vectors
+			are sound, so on a released build it means a libcrypto that will not
+			take this key type at all, and the operator is looking for a
+			different fault than the message above suggests.
+			*/
+			if result == .Bad {
+				logx.errorf(
+					"dnssec: and it declined the %s probe key rather than the algorithm, which is not a crypto policy; this build and that libcrypto disagree about the key format",
+					probe.name,
+				)
+			}
 		}
 	}
 

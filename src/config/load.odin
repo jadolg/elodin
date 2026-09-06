@@ -2504,8 +2504,14 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	algorithm the linked libcrypto will actually run is a question about the
 	host, and `probe_algorithms` has not run when a configuration is read -
 	`--check` on one machine would otherwise answer for another.
+
+	And only where validation is on. With `enabled: false` these anchors are
+	read by nothing - `start_validator` returns before it looks at them - so a
+	set that would anchor nothing anchors nothing that was going to happen, and
+	refusing the file over it would stop a resolver that had been working from
+	loading at all. `route_is_anchored` makes the same allowance.
 	*/
-	if len(cfg.dnssec.trust_anchors) > 0 && !dnssec.anchors_the_root(parsed_anchors[:]) {
+	if cfg.dnssec.enabled && len(cfg.dnssec.trust_anchors) > 0 && !dnssec.anchors_the_root(parsed_anchors[:]) {
 		errorf(l, "dnssec.trust_anchors covers no root anchor, so no name could be validated; anchor \".\" as well")
 	}
 

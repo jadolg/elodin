@@ -475,5 +475,17 @@ test_a_trust_anchor_set_without_the_root_is_refused :: proc(t: ^testing.T) {
 	// the same as anchoring nothing.
 	_, none := load_string(src(""), context.temp_allocator)
 	testing.expect(t, none == nil, "no anchors at all uses the built-in root keys")
+
+	/*
+	And with validation off the question does not arise. Nothing reads these -
+	`start_validator` returns before it looks at them - so a set left behind by
+	an operator who turned DNSSEC off must not stop the file from loading.
+	*/
+	off := fmt.tprintf(
+		"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  enabled: false\n%s",
+		"  trust_anchors:\n    - \"corp.example. " + DS + "\"\n",
+	)
+	_, disabled := load_string(off, context.temp_allocator)
+	testing.expect(t, disabled == nil, "anchors nothing reads should not stop a file loading")
 	free_all(context.temp_allocator)
 }
