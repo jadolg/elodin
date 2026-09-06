@@ -144,3 +144,167 @@ test_the_rcode_guard_leaves_honest_answers_alone :: proc(t: ^testing.T) {
 	testing.expect_value(t, nodata.status, Status.Secure)
 	free_all(context.temp_allocator)
 }
+
+/*
+And the guard is not gated on the rest of the message holding up.
+
+`worst` is the worst verdict any RRset in the answer section reached, and what
+is in that section is the sender's choice. An attacker who has flipped the rcode
+appends one unsigned RRset from a zone that really is unsigned - no forgery, no
+signature to break - and the message comes out `Insecure` rather than `Secure`.
+`Insecure` is forwarded to the client, so a guard that only ran on `Secure`
+answers cost the attacker one extra record and gave back the whole attack: the
+zone's signed records under a header saying the name does not exist.
+*/
+@(test)
+test_an_unsigned_rrset_does_not_buy_past_the_rcode_guard :: proc(t: ^testing.T) {
+	v := make_validator(rc_query, nil, Options{})
+	defer destroy_validator(v)
+
+	signed, serr := dns.decode_message(rc_unhex(rc_fixture("example_a").wire), context.temp_allocator)
+	testing.expect(t, serr == .None, "the signed fixture did not decode")
+	// reddit.com has no DS in com in the captured set, so its records are
+	// genuinely unsigned and validate as `Insecure` on their own merits.
+	unsigned, uerr := dns.decode_message(rc_unhex(rc_fixture("reddit_a").wire), context.temp_allocator)
+	testing.expect(t, uerr == .None, "the unsigned fixture did not decode")
+
+	answer := make([dynamic]dns.Record, 0, len(signed.answer) + len(unsigned.answer), context.temp_allocator)
+	append(&answer, ..signed.answer)
+	for rec in unsigned.answer {
+		if rec.type == .A {
+			append(&answer, rec)
+		}
+	}
+
+	msg := signed
+	msg.answer = answer[:]
+	msg.flags.rcode = u8(dns.Rcode.NX_Domain)
+	wire, _, eerr := dns.encode_message(msg, context.temp_allocator)
+	testing.expect(t, eerr == .None, "the spliced message did not encode")
+
+	res := validate(v, "www.example.com.", .A, wire, rc_now())
+	testing.expectf(
+		t,
+		res.status == .Bogus,
+		"one appended unsigned RRset made the flipped rcode %v (%q) instead of Bogus",
+		res.status,
+		res.reason,
+	)
+	testing.expect(t, len(res.answer) == 0, "a refused answer must name no authenticated RRsets")
+	free_all(context.temp_allocator)
+}
+
+/*
+And `ANY` is not a way round it either.
+
+`chain_shape` reports whether the question was answered, and for `ANY` it stops
+at the first record of any type at the queried name - a CNAME included. Writing
+the guard in terms of that shape meant choosing between two wrong answers:
+refuse an ordinary NXDOMAIN-after-a-CNAME asked as `ANY`, or exempt `ANY`
+altogether and leave the whole of this bug open for one qtype. `dig ANY` is a
+question people really ask, entries are keyed by type, and an exemption is a
+thing to be steered towards rather than an edge to be tolerated.
+
+`denial_contradicted` asks a different question - is the name the rcode speaks
+for one this server has just proven exists - which has the same answer whatever
+the client asked about, so neither wrong answer is on offer.
+*/
+@(test)
+test_the_rcode_guard_is_not_escaped_by_asking_any :: proc(t: ^testing.T) {
+	v := make_validator(rc_query, nil, Options{})
+	defer destroy_validator(v)
+
+	wire := rc_unhex(rc_fixture("example_a").wire)
+	honest := validate(v, "www.example.com.", .ANY, wire, rc_now())
+	testing.expectf(t, honest.status == .Secure, "the capture should validate as ANY (%v, %q)", honest.status, honest.reason)
+
+	forged := validate(v, "www.example.com.", .ANY, with_rcode(wire, .NX_Domain), rc_now())
+	testing.expectf(
+		t,
+		forged.status == .Bogus,
+		"an ANY question let the flipped rcode through as %v (%q)",
+		forged.status,
+		forged.reason,
+	)
+	free_all(context.temp_allocator)
+}
+
+/*
+The walk itself, at its own level.
+
+Three of the shapes below cannot be built out of the captured chains - there is
+no signed CNAME among them that stops short - and the rule is small enough that
+driving it directly says more than a fixture would. What the tests above supply
+is the part this cannot: that the sets it is handed are ones real signatures
+produced.
+*/
+@(test)
+test_denial_contradicted_reads_the_end_of_the_chain :: proc(t: ^testing.T) {
+	rec :: proc(name: string, type: dns.Type, target := "") -> dns.Record {
+		out := dns.Record{name = name, type = type, class = .IN, ttl = 60}
+		if type == .CNAME {
+			out.data = dns.Rdata_Name{name = target}
+		} else {
+			out.data = dns.Rdata_A{addr = {203, 0, 113, 1}}
+		}
+		return out
+	}
+	set :: proc(name: string, type: dns.Type) -> Authenticated_Set {
+		return Authenticated_Set{name = name, type = type, class = .IN}
+	}
+
+	// A record at the queried name, with no chain: the rcode denies a name the
+	// answer has just proven.
+	direct := []dns.Record{rec("www.example.com.", .A)}
+	testing.expect(
+		t,
+		denial_contradicted(direct, []Authenticated_Set{set("www.example.com.", .A)}, "www.example.com.", .IN),
+		"a proven name under NXDOMAIN was not read as a contradiction",
+	)
+
+	// A chain that stops short. The rcode is about `target.example.`, which
+	// nothing here says anything about - RFC 2308 section 2.1's own shape, and
+	// the one `denial_claimed` declines to vouch for rather than refusing.
+	chain := []dns.Record{rec("www.example.com.", .CNAME, "target.example.")}
+	testing.expect(
+		t,
+		!denial_contradicted(chain, []Authenticated_Set{set("www.example.com.", .CNAME)}, "www.example.com.", .IN),
+		"an ordinary NXDOMAIN after a CNAME was called a contradiction",
+	)
+
+	// The same chain, with the target's own records in the answer. Now the
+	// denied name is the proven one.
+	full := []dns.Record{rec("www.example.com.", .CNAME, "target.example."), rec("target.example.", .A)}
+	kept_full := []Authenticated_Set{set("www.example.com.", .CNAME), set("target.example.", .A)}
+	testing.expect(
+		t,
+		denial_contradicted(full, kept_full, "www.example.com.", .IN),
+		"a proven chain target under NXDOMAIN was not read as a contradiction",
+	)
+
+	// A record of a type nobody asked for still proves the name. The question
+	// this asks is existence, not whether the answer was answered.
+	other := []dns.Record{rec("www.example.com.", .CNAME, "target.example."), rec("target.example.", .AAAA)}
+	kept_other := []Authenticated_Set{set("www.example.com.", .CNAME), set("target.example.", .AAAA)}
+	testing.expect(
+		t,
+		denial_contradicted(other, kept_other, "www.example.com.", .IN),
+		"a proven name was missed because its type was not the one asked about",
+	)
+
+	// Records the verdict does not cover are not read at all, which is what
+	// stops the sender steering the walk: the same two shapes, with nothing
+	// authenticated, say nothing.
+	testing.expect(t, !denial_contradicted(direct, nil, "www.example.com.", .IN), "an unauthenticated record was counted")
+	testing.expect(
+		t,
+		!denial_contradicted(full, []Authenticated_Set{set("www.example.com.", .CNAME)}, "www.example.com.", .IN),
+		"an unauthenticated record at the chain's end was counted",
+	)
+
+	// A loop is a stall and proves nothing either way.
+	loop := []dns.Record{rec("a.example.", .CNAME, "b.example."), rec("b.example.", .CNAME, "a.example.")}
+	kept_loop := []Authenticated_Set{set("a.example.", .CNAME), set("b.example.", .CNAME)}
+	testing.expect(t, !denial_contradicted(loop, kept_loop, "a.example.", .IN), "a CNAME loop was read as a proof")
+	free_all(context.temp_allocator)
+}

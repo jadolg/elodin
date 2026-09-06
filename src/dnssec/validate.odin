@@ -712,6 +712,91 @@ chain_shape :: proc(
 	return .None
 }
 
+/*
+Does the answer prove the existence of the name the rcode denies?
+
+An NXDOMAIN is about the *last* name in the CNAME chain, not the one the client
+asked about (RFC 6604 section 3): `www.example.com. CNAME target.example.` with
+NXDOMAIN beside it says `target.example.` is missing and says nothing at all
+about `www.example.com.`, which the chain has just shown to exist. So the walk
+follows the chain to its end and asks one question there - is there a record at
+this name that this server authenticated - because a record at a name is proof
+the name exists, whatever its type.
+
+Only the authenticated sets are followed, and that is what makes the answer
+worth anything. Both halves of a response are the sender's to write, so a walk
+over the section as it arrived could be steered with records nobody signed: one
+appended CNAME redirects the walk to a name the sender chose and empties it, and
+one appended record at the end fills it. Neither is possible over sets that had
+to survive a zone's signature to get into `kept`.
+
+`chain_shape` is the wrong instrument for this and was tried first. It reports
+whether the *question* was answered, so it stops at the first record of the type
+asked for - and for `ANY` that is the CNAME itself, which would read an ordinary
+NXDOMAIN-after-a-CNAME as a contradiction and refuse it. Their two questions
+only look alike: a chain ending in an AAAA where an A was asked for is
+`.Chain_Only` and no answer to the question, and is still a name proven to exist
+under a header that denies it.
+*/
+@(private)
+denial_contradicted :: proc(
+	records: []dns.Record,
+	kept: []Authenticated_Set,
+	qname: string,
+	class: dns.Class,
+) -> bool {
+	if len(kept) == 0 {
+		return false
+	}
+	name := qname
+	hops := 0
+	for hops < MAX_CNAME_CHAIN {
+		target := ""
+		present := false
+		for r in records {
+			if r.class != class || !dns.name_equal_fold(r.name, name) {
+				continue
+			}
+			/*
+			An RRSIG is not data at a name for this purpose. Nothing signs one
+			(RFC 4035 section 2.2), so it is never in `kept` on its own account
+			and the loop below would not find it there anyway - but saying so
+			here keeps the rule readable rather than resting on that.
+			*/
+			if r.type == .RRSIG || r.type == .OPT {
+				continue
+			}
+			if !set_authenticated(kept, r.name, r.type, class) {
+				continue
+			}
+			present = true
+			if r.type == .CNAME {
+				if v, is_name := r.data.(dns.Rdata_Name); is_name {
+					target = v.name
+				}
+			}
+		}
+		if target == "" {
+			// The end of the chain, and so the name the rcode speaks for.
+			return present
+		}
+		name = target
+		hops += 1
+	}
+	// A chain this long is a loop or a stall, and proves nothing either way.
+	return false
+}
+
+@(private)
+set_authenticated :: proc(kept: []Authenticated_Set, name: string, type: dns.Type, class: dns.Class) -> bool {
+	for s in kept {
+		if s.type == type && s.class == class && dns.name_equal_fold(s.name, name) {
+			return true
+		}
+	}
+	return false
+}
+
 @(private)
 authenticated_only :: proc(
 	section: []dns.Record,
@@ -1243,14 +1328,36 @@ validate_answer :: proc(
 	between `.Direct`, `.Chain_Only` and `.None`, each of which is already
 	answered on its own terms.
 
-	`.Direct` only. A chain that stopped short is the ordinary NXDOMAIN-after-a-
-	CNAME shape, where the rcode speaks for the *target's* zone rather than for
-	anything in this answer section, and it is handled below by the
-	`denial_claimed` branch - which is `Insecure` because the proof lives at a
-	zone this path never walked to, not because the message contradicts itself.
+	Which name the rcode is about is the whole of the rest. In a CNAME chain it
+	is the last name in it and not the one asked about (RFC 6604 section 3), so
+	a chain that stops short is the ordinary NXDOMAIN-after-a-CNAME and no
+	contradiction at all: the denial is of a target this path never walked to,
+	and it is `denial_claimed` below that declines to vouch for it - `Insecure`,
+	for want of a proof, rather than because the message disagrees with itself.
+	`denial_contradicted` follows the chain to that name and asks only whether
+	an authenticated record is sitting at it.
+
+	Not gated on the whole message being `Secure`, which was a way round the
+	whole thing. `worst` is the worst verdict any RRset in the section reached,
+	and the section is the sender's to fill: one unsigned RRset appended from a
+	zone that really is unsigned - `www.reddit.com. A` in the captured set -
+	comes back `Insecure`, drags `worst` down with it, and would leave the
+	flipped rcode sailing past a check that only ran on `Secure`. `Insecure` is
+	not refused; `resolve_query` forwards it, so the client still reads NXDOMAIN
+	with the zone's own signed records underneath, which is the harm again minus
+	the AD bit - and it costs the attacker one appended record and no forgery.
+	`Bogus` and `Indeterminate` are the two left out, because those are refused
+	already and the reason they carry is the one that explains the refusal.
+
+	What makes that safe is `denial_contradicted` reading none of the sender's
+	additions: it walks the RRsets this path authenticated and nothing else, so
+	a record bolted on beside them can lower `worst` without being able to move
+	the question this asks.
 	*/
-	if worst == .Secure && shape == .Direct && dns.rcode_of(msg) == .NX_Domain {
-		return {status = .Bogus, reason = "rcode contradicts the authenticated answer"}
+	if worst != .Bogus && worst != .Indeterminate && dns.rcode_of(msg) == .NX_Domain {
+		if denial_contradicted(msg.answer, authenticated[:], qname, class) {
+			return {status = .Bogus, reason = "rcode contradicts the authenticated answer"}
+		}
 	}
 
 	/*
