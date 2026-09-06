@@ -308,3 +308,157 @@ test_denial_contradicted_reads_the_end_of_the_chain :: proc(t: ^testing.T) {
 	testing.expect(t, !denial_contradicted(loop, kept_loop, "a.example.", .IN), "a CNAME loop was read as a proof")
 	free_all(context.temp_allocator)
 }
+
+/*
+The two ways round the guard that cost the attacker one more byte each.
+
+Both were found reviewing the guard above rather than reported with #271, and
+both reach the same place by a different door: the client reads a name error for
+a signed name, and no proof of it was ever asked for. Neither needs a forgery.
+*/
+
+/*
+One unsigned record must not reroute a forged denial away from its proof.
+
+`validate` picks the path from the answer section holding *something* it could
+authenticate - any record, at any name. So a forged NXDOMAIN for a signed name
+is `Bogus` while that section is empty, because `validate_denial` demands a
+proof and finds none; append one record from a zone that really is unsigned and
+the message goes to `validate_answer` instead, where nothing ever demanded one.
+The check that catches it there is `shape == .None`, and it used to be gated on
+`worst` - which the same appended record had already dragged to `Insecure`.
+
+`Insecure` is forwarded to the client. So the record bought the attacker the
+denial that the empty version was refused for, in exchange for a CNAME anyone
+can copy out of an unsigned zone.
+*/
+@(test)
+test_an_unsigned_record_does_not_reroute_a_forged_denial :: proc(t: ^testing.T) {
+	v := make_validator(rc_query, nil, Options{})
+	defer destroy_validator(v)
+
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question{name = "www.example.com.", type = .A, class = .IN}
+	forged := dns.Message{question = question}
+	forged.flags.qr = true
+	forged.flags.rcode = u8(dns.Rcode.NX_Domain)
+
+	// Empty, this is already refused: `validate_denial` asks for a proof.
+	bare, _, berr := dns.encode_message(forged, context.temp_allocator)
+	testing.expect(t, berr == .None, "the bare forgery did not encode")
+	testing.expect_value(t, validate(v, "www.example.com.", .A, bare, rc_now()).status, Status.Bogus)
+
+	// And one unsigned record from an unsigned zone must not change that.
+	// reddit.com has no DS in com in the captured set, so this is a record an
+	// attacker copies rather than makes.
+	junk := make([]dns.Record, 1, context.temp_allocator)
+	junk[0] = dns.Record {
+		name  = "www.reddit.com.",
+		type  = .CNAME,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_Name{name = "reddit.map.fastly.net."},
+	}
+	forged.answer = junk
+	wire, _, err := dns.encode_message(forged, context.temp_allocator)
+	testing.expect(t, err == .None, "the spliced forgery did not encode")
+
+	res := validate(v, "www.example.com.", .A, wire, rc_now())
+	testing.expectf(
+		t,
+		res.status == .Bogus,
+		"one unsigned record rerouted a forged denial to %v (%q); it would have been forwarded to the client",
+		res.status,
+		res.reason,
+	)
+	free_all(context.temp_allocator)
+}
+
+/*
+And the extended rcode is not a way to say NXDOMAIN to the client only.
+
+`rcode_of` composes twelve bits - the header's four and eight more from the OPT
+record's TTL (RFC 6891 section 6.1.3) - while every consumer this guard is
+written for reads the four. So setting a bit in the OPT's top byte alongside the
+flipped nibble made the message unanswerable to us and a name error to them:
+`answerable_rcode` bailed out before `validate_answer` was ever entered, the
+verdict was `Insecure`, and `resolve_query` forwarded it with the signed records
+still in the answer section and a header saying the name is not there.
+*/
+@(test)
+test_the_extended_rcode_is_not_a_way_past_the_guard :: proc(t: ^testing.T) {
+	v := make_validator(rc_query, nil, Options{})
+	defer destroy_validator(v)
+
+	flipped := with_rcode(rc_unhex(rc_fixture("example_a").wire), .NX_Domain)
+	msg, derr := dns.decode_message(flipped, context.temp_allocator)
+	testing.expect(t, derr == .None, "the flipped capture did not decode")
+
+	// The upper eight bits of the extended rcode live in the OPT record's TTL.
+	extra := make([dynamic]dns.Record, 0, len(msg.additional), context.temp_allocator)
+	touched := false
+	for rec in msg.additional {
+		r := rec
+		if r.type == .OPT {
+			r.ttl |= 0x01000000
+			touched = true
+		}
+		append(&extra, r)
+	}
+	testing.expect(t, touched, "the capture should carry an OPT record")
+	msg.additional = extra[:]
+
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	testing.expect(t, err == .None, "the re-encoded message did not encode")
+
+	// The premise, read back off the wire: the client sees a name error, and we
+	// see something else entirely.
+	decoded, rerr := dns.decode_message(wire, context.temp_allocator)
+	testing.expect(t, rerr == .None, "the re-encoded message did not decode")
+	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.NX_Domain)
+	testing.expect(t, dns.rcode_of(decoded) != .NX_Domain, "the extended rcode should differ from the header's")
+
+	res := validate(v, "www.example.com.", .A, wire, rc_now())
+	testing.expectf(
+		t,
+		res.status == .Bogus,
+		"an extended rcode carried the flipped header past the guard as %v (%q)",
+		res.status,
+		res.reason,
+	)
+	free_all(context.temp_allocator)
+}
+
+/*
+And a real BADVERS is still not a forgery.
+
+The check above keys on the header's nibble, which BADVERS leaves at zero - the
+whole of its value is in the OPT record. An upstream that cannot do the EDNS
+version we asked for has said nothing about the name, and reporting that as a
+DNSSEC failure is what `answerable_rcode` exists to avoid.
+*/
+@(test)
+test_badvers_is_still_not_a_forgery :: proc(t: ^testing.T) {
+	v := make_validator(rc_query, nil, Options{})
+	defer destroy_validator(v)
+
+	msg, derr := dns.decode_message(rc_unhex(rc_fixture("example_a").wire), context.temp_allocator)
+	testing.expect(t, derr == .None, "the capture did not decode")
+
+	extra := make([dynamic]dns.Record, 0, len(msg.additional), context.temp_allocator)
+	for rec in msg.additional {
+		r := rec
+		if r.type == .OPT {
+			// BADVERS is 16: all of it in the OPT, nothing in the header.
+			r.ttl |= 0x01000000
+		}
+		append(&extra, r)
+	}
+	msg.additional = extra[:]
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	testing.expect(t, err == .None, "the re-encoded message did not encode")
+
+	res := validate(v, "www.example.com.", .A, wire, rc_now())
+	testing.expectf(t, res.status == .Insecure, "a BADVERS was called %v (%q)", res.status, res.reason)
+	free_all(context.temp_allocator)
+}

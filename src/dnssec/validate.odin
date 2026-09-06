@@ -461,8 +461,29 @@ validate :: proc(
 	REFUSED, SERVFAIL and the rest carry nothing to authenticate. Demanding a
 	denial of existence from them would turn every upstream error into a DNSSEC
 	failure, and report it as a forgery in the bargain.
+
+	One shape is refused rather than excused, and it is the way round the guard
+	below. `rcode_of` composes the twelve bits: the header's four, and eight
+	more from the OPT record's TTL (RFC 6891 section 6.1.3). Every consumer the
+	guard is written for reads the four - glibc's `res_query`, Go's
+	`checkHeader` - so an attacker who flips the nibble to 3 *and* sets a bit in
+	the OPT's top byte hands us a rcode of 19 while handing the client
+	NXDOMAIN. Excused as "nothing to authenticate", that answer is forwarded,
+	and the client reads a name error over the zone's own signed records: the
+	whole of #271 again for the price of one more byte.
+
+	No legitimate response is shaped this way. The only extended rcode a
+	responder sends to a query is BADVERS, whose low nibble is zero, so this
+	refuses nothing an upstream produces and leaves the BADVERS path exactly
+	where it was. Refused rather than read as a denial, because a header this
+	server and its client would read two different ways is not a claim worth
+	repairing - and `cache.put` already fails closed on the composed rcode, so
+	nothing of it is kept either way.
 	*/
 	if !answerable_rcode(msg) {
+		if dns.Rcode(msg.flags.rcode) == .NX_Domain {
+			return {status = .Bogus, reason = "extended rcode contradicts the header's denial"}
+		}
 		return {status = .Insecure, reason = "no data to authenticate"}
 	}
 
@@ -760,13 +781,13 @@ denial_contradicted :: proc(
 			/*
 			An RRSIG is not data at a name for this purpose. Nothing signs one
 			(RFC 4035 section 2.2), so it is never in `kept` on its own account
-			and the loop below would not find it there anyway - but saying so
+			and `authenticated_rrset` would not find it there anyway - but saying so
 			here keeps the rule readable rather than resting on that.
 			*/
 			if r.type == .RRSIG || r.type == .OPT {
 				continue
 			}
-			if !set_authenticated(kept, r.name, r.type, class) {
+			if _, vouched := authenticated_rrset(kept, r.name, r.type, class); !vouched {
 				continue
 			}
 			present = true
@@ -784,16 +805,6 @@ denial_contradicted :: proc(
 		hops += 1
 	}
 	// A chain this long is a loop or a stall, and proves nothing either way.
-	return false
-}
-
-@(private)
-set_authenticated :: proc(kept: []Authenticated_Set, name: string, type: dns.Type, class: dns.Class) -> bool {
-	for s in kept {
-		if s.type == type && s.class == class && dns.name_equal_fold(s.name, name) {
-			return true
-		}
-	}
 	return false
 }
 
@@ -1291,7 +1302,29 @@ validate_answer :: proc(
 	it asked about - a denial of existence that was never proven.
 	*/
 	shape := chain_shape(msg.answer, qname, qtype, class)
-	if worst == .Secure && shape == .None {
+	/*
+	Not gated on `worst`, for the same reason the rcode guard below is not, and
+	this one is the load-bearing half of the pair.
+
+	`validate` sends a response here on the strength of the answer section
+	holding one authenticatable record - any record, at any name. So a forged
+	NXDOMAIN for a signed name goes to `validate_denial` and is refused as
+	`Bogus, "no denial of existence"` while its answer section is empty, and one
+	appended record from a zone that really is unsigned - `www.reddit.com.
+	CNAME`, no forgery, no signature to break - reroutes the whole message to
+	this path instead, where nothing ever demanded a proof. Gated on `worst`,
+	the check that would have caught it here was skipped too, because that
+	unsigned record had already dragged `worst` to `Insecure`; the verdict fell
+	through as `Insecure`, `resolve_query` forwards those, and the client read a
+	name error for a signed name that nobody had proven anything about.
+
+	A record that does not address the question cannot make a response an
+	answer, whatever its zone thinks of it, and being unable to authenticate the
+	record is not a reason to hold it to less. `Bogus` and `Indeterminate` are
+	the two left out, because those are refused already and their own reason is
+	the one that explains the refusal.
+	*/
+	if worst != .Bogus && worst != .Indeterminate && shape == .None {
 		return {status = .Bogus, reason = "answer does not address the question"}
 	}
 
