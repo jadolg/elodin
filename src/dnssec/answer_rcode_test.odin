@@ -258,7 +258,7 @@ test_denial_contradicted_reads_the_end_of_the_chain :: proc(t: ^testing.T) {
 	direct := []dns.Record{rec("www.example.com.", .A)}
 	testing.expect(
 		t,
-		denial_contradicted(direct, []Authenticated_Set{set("www.example.com.", .A)}, "www.example.com.", .IN),
+		denial_contradicted(direct, []Authenticated_Set{set("www.example.com.", .A)}, "www.example.com.", .A, .IN),
 		"a proven name under NXDOMAIN was not read as a contradiction",
 	)
 
@@ -268,8 +268,28 @@ test_denial_contradicted_reads_the_end_of_the_chain :: proc(t: ^testing.T) {
 	chain := []dns.Record{rec("www.example.com.", .CNAME, "target.example.")}
 	testing.expect(
 		t,
-		!denial_contradicted(chain, []Authenticated_Set{set("www.example.com.", .CNAME)}, "www.example.com.", .IN),
+		!denial_contradicted(chain, []Authenticated_Set{set("www.example.com.", .CNAME)}, "www.example.com.", .A, .IN),
 		"an ordinary NXDOMAIN after a CNAME was called a contradiction",
+	)
+
+	/*
+	The same records, asked about as themselves. RFC 1034 section 4.3.2 step 3a
+	restarts the walk at the target only when the query type does *not* match
+	the CNAME, so for `CNAME` and for `ANY` this record is the answer and the
+	rcode is about the name that was asked about - which the record proves.
+	Walked past as a hop, a flipped rcode over a signed `dig CNAME` answer came
+	back `Secure` with AD set.
+	*/
+	kept_chain := []Authenticated_Set{set("www.example.com.", .CNAME)}
+	testing.expect(
+		t,
+		denial_contradicted(chain, kept_chain, "www.example.com.", .CNAME, .IN),
+		"a CNAME question walked past the record that refutes the denial",
+	)
+	testing.expect(
+		t,
+		denial_contradicted(chain, kept_chain, "www.example.com.", .ANY, .IN),
+		"an ANY question walked past the record that refutes the denial",
 	)
 
 	// The same chain, with the target's own records in the answer. Now the
@@ -278,7 +298,7 @@ test_denial_contradicted_reads_the_end_of_the_chain :: proc(t: ^testing.T) {
 	kept_full := []Authenticated_Set{set("www.example.com.", .CNAME), set("target.example.", .A)}
 	testing.expect(
 		t,
-		denial_contradicted(full, kept_full, "www.example.com.", .IN),
+		denial_contradicted(full, kept_full, "www.example.com.", .A, .IN),
 		"a proven chain target under NXDOMAIN was not read as a contradiction",
 	)
 
@@ -288,24 +308,24 @@ test_denial_contradicted_reads_the_end_of_the_chain :: proc(t: ^testing.T) {
 	kept_other := []Authenticated_Set{set("www.example.com.", .CNAME), set("target.example.", .AAAA)}
 	testing.expect(
 		t,
-		denial_contradicted(other, kept_other, "www.example.com.", .IN),
+		denial_contradicted(other, kept_other, "www.example.com.", .A, .IN),
 		"a proven name was missed because its type was not the one asked about",
 	)
 
 	// Records the verdict does not cover are not read at all, which is what
 	// stops the sender steering the walk: the same two shapes, with nothing
 	// authenticated, say nothing.
-	testing.expect(t, !denial_contradicted(direct, nil, "www.example.com.", .IN), "an unauthenticated record was counted")
+	testing.expect(t, !denial_contradicted(direct, nil, "www.example.com.", .A, .IN), "an unauthenticated record was counted")
 	testing.expect(
 		t,
-		!denial_contradicted(full, []Authenticated_Set{set("www.example.com.", .CNAME)}, "www.example.com.", .IN),
+		!denial_contradicted(full, []Authenticated_Set{set("www.example.com.", .CNAME)}, "www.example.com.", .A, .IN),
 		"an unauthenticated record at the chain's end was counted",
 	)
 
 	// A loop is a stall and proves nothing either way.
 	loop := []dns.Record{rec("a.example.", .CNAME, "b.example."), rec("b.example.", .CNAME, "a.example.")}
 	kept_loop := []Authenticated_Set{set("a.example.", .CNAME), set("b.example.", .CNAME)}
-	testing.expect(t, !denial_contradicted(loop, kept_loop, "a.example.", .IN), "a CNAME loop was read as a proof")
+	testing.expect(t, !denial_contradicted(loop, kept_loop, "a.example.", .A, .IN), "a CNAME loop was read as a proof")
 	free_all(context.temp_allocator)
 }
 
@@ -394,20 +414,7 @@ test_the_extended_rcode_is_not_a_way_past_the_guard :: proc(t: ^testing.T) {
 	msg, derr := dns.decode_message(flipped, context.temp_allocator)
 	testing.expect(t, derr == .None, "the flipped capture did not decode")
 
-	// The upper eight bits of the extended rcode live in the OPT record's TTL.
-	extra := make([dynamic]dns.Record, 0, len(msg.additional), context.temp_allocator)
-	touched := false
-	for rec in msg.additional {
-		r := rec
-		if r.type == .OPT {
-			r.ttl |= 0x01000000
-			touched = true
-		}
-		append(&extra, r)
-	}
-	testing.expect(t, touched, "the capture should carry an OPT record")
-	msg.additional = extra[:]
-
+	msg.additional = with_extended_rcode(msg.additional)
 	wire, _, err := dns.encode_message(msg, context.temp_allocator)
 	testing.expect(t, err == .None, "the re-encoded message did not encode")
 
@@ -430,35 +437,118 @@ test_the_extended_rcode_is_not_a_way_past_the_guard :: proc(t: ^testing.T) {
 }
 
 /*
-And a real BADVERS is still not a forgery.
+And with the nibble left at 0 the client reads NOERROR, which is not a denial
+bug at all but the whole validator stepped over.
 
-The check above keys on the header's nibble, which BADVERS leaves at zero - the
-whole of its value is in the OPT record. An upstream that cannot do the EDNS
-version we asked for has said nothing about the name, and reporting that as a
-DNSSEC failure is what `answerable_rcode` exists to avoid.
+The same one byte, and now the client takes the answer section instead of
+discarding it. A forged `www.example.com. A` whose signature no longer covers it
+is `Bogus` on its own; excused as "nothing to authenticate" it was forwarded as
+`Insecure` and believed. Nothing here is about NXDOMAIN any more - it is every
+answer this server would otherwise have checked.
 */
 @(test)
-test_badvers_is_still_not_a_forgery :: proc(t: ^testing.T) {
+test_a_forgery_does_not_hide_behind_an_extended_rcode :: proc(t: ^testing.T) {
 	v := make_validator(rc_query, nil, Options{})
 	defer destroy_validator(v)
 
 	msg, derr := dns.decode_message(rc_unhex(rc_fixture("example_a").wire), context.temp_allocator)
 	testing.expect(t, derr == .None, "the capture did not decode")
 
-	extra := make([dynamic]dns.Record, 0, len(msg.additional), context.temp_allocator)
-	for rec in msg.additional {
+	// Rewrite the address the client would use, leaving the signature alone.
+	answer := make([dynamic]dns.Record, 0, len(msg.answer), context.temp_allocator)
+	touched := false
+	for rec in msg.answer {
 		r := rec
-		if r.type == .OPT {
-			// BADVERS is 16: all of it in the OPT, nothing in the header.
-			r.ttl |= 0x01000000
+		if a, is_a := r.data.(dns.Rdata_A); is_a {
+			bad := a
+			bad.addr[3] ~= 0xff
+			r.data = bad
+			touched = true
 		}
-		append(&extra, r)
+		append(&answer, r)
 	}
-	msg.additional = extra[:]
+	testing.expect(t, touched, "the capture should carry an A record")
+	msg.answer = answer[:]
+
+	// Plain, this is refused on the signature alone.
+	plain, _, perr := dns.encode_message(msg, context.temp_allocator)
+	testing.expect(t, perr == .None, "the forgery did not encode")
+	testing.expect_value(t, validate(v, "www.example.com.", .A, plain, rc_now()).status, Status.Bogus)
+
+	// One bit in the OPT's top byte, and the header's own nibble left at 0.
+	msg.additional = with_extended_rcode(msg.additional)
 	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	testing.expect(t, err == .None, "the re-encoded message did not encode")
+	testing.expect(t, err == .None, "the re-encoded forgery did not encode")
+
+	decoded, rerr := dns.decode_message(wire, context.temp_allocator)
+	testing.expect(t, rerr == .None, "the re-encoded forgery did not decode")
+	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
+	testing.expect(t, u16(dns.rcode_of(decoded)) > 0xf, "the extended rcode should be set")
+
+	res := validate(v, "www.example.com.", .A, wire, rc_now())
+	testing.expectf(
+		t,
+		res.status == .Bogus,
+		"an extended rcode carried a forged answer past the validator as %v (%q)",
+		res.status,
+		res.reason,
+	)
+	free_all(context.temp_allocator)
+}
+
+/*
+And a real BADVERS is still not a forgery.
+
+This is the half of the pair that says what the refusal above is allowed to
+cost. An extended rcode is not a variant of the ordinary ones: the two a
+responder sends to a query are BADVERS (16) and BADCOOKIE (23), and both say it
+declined to answer before looking anything up - so both carry a question and an
+OPT and nothing else. That empty answer section is the whole of what separates
+one from a rewritten header, since BADVERS leaves the nibble at 0 exactly as the
+attack above does.
+
+Reporting one as a forgery is what `answerable_rcode` exists to avoid, and the
+first attempt at that guard got this wrong in a way that only a realistic
+BADVERS catches: written against a capture whose answer section was still full,
+the test passed while pinning the attack shape itself as acceptable.
+*/
+@(test)
+test_badvers_is_still_not_a_forgery :: proc(t: ^testing.T) {
+	v := make_validator(rc_query, nil, Options{})
+	defer destroy_validator(v)
+
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question{name = "www.example.com.", type = .A, class = .IN}
+	msg := dns.Message{question = question}
+	msg.flags.qr = true
+	// What an upstream that cannot do the EDNS version we asked for sends back:
+	// the question, an OPT, and nothing it looked up (RFC 6891 section 6.1.3).
+	msg.additional = with_extended_rcode([]dns.Record{dns.make_opt(4096, true)})
+
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	testing.expect(t, err == .None, "the BADVERS did not encode")
+
+	decoded, derr := dns.decode_message(wire, context.temp_allocator)
+	testing.expect(t, derr == .None, "the BADVERS did not decode")
+	testing.expect_value(t, dns.rcode_of(decoded), dns.Rcode.Bad_Vers)
 
 	res := validate(v, "www.example.com.", .A, wire, rc_now())
 	testing.expectf(t, res.status == .Insecure, "a BADVERS was called %v (%q)", res.status, res.reason)
 	free_all(context.temp_allocator)
+}
+
+// The upper eight bits of the extended rcode live in the OPT record's TTL (RFC
+// 6891 section 6.1.3). Setting the lowest of them is BADVERS on its own, and
+// what an attacker adds to a rewritten header.
+@(private = "file")
+with_extended_rcode :: proc(additional: []dns.Record) -> []dns.Record {
+	out := make([dynamic]dns.Record, 0, len(additional), context.temp_allocator)
+	for rec in additional {
+		r := rec
+		if r.type == .OPT {
+			r.ttl |= 0x01000000
+		}
+		append(&out, r)
+	}
+	return out[:]
 }

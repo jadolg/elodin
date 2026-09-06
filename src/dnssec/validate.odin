@@ -462,27 +462,45 @@ validate :: proc(
 	denial of existence from them would turn every upstream error into a DNSSEC
 	failure, and report it as a forgery in the bargain.
 
-	One shape is refused rather than excused, and it is the way round the guard
-	below. `rcode_of` composes the twelve bits: the header's four, and eight
-	more from the OPT record's TTL (RFC 6891 section 6.1.3). Every consumer the
-	guard is written for reads the four - glibc's `res_query`, Go's
-	`checkHeader` - so an attacker who flips the nibble to 3 *and* sets a bit in
-	the OPT's top byte hands us a rcode of 19 while handing the client
-	NXDOMAIN. Excused as "nothing to authenticate", that answer is forwarded,
-	and the client reads a name error over the zone's own signed records: the
-	whole of #271 again for the price of one more byte.
+	Two shapes are refused rather than excused, and between them they are the
+	way round everything below. `rcode_of` composes twelve bits: the header's
+	four, and eight more from the OPT record's TTL (RFC 6891 section 6.1.3).
+	Every consumer this validator's verdicts are written for reads the four -
+	glibc's `res_query`, Go's `checkHeader` - so one bit set in the OPT's top
+	byte gives this server and its client two different rcodes off one message,
+	and the excuse above is written in terms of ours.
 
-	No legitimate response is shaped this way. The only extended rcode a
-	responder sends to a query is BADVERS, whose low nibble is zero, so this
-	refuses nothing an upstream produces and leaves the BADVERS path exactly
-	where it was. Refused rather than read as a denial, because a header this
-	server and its client would read two different ways is not a claim worth
-	repairing - and `cache.put` already fails closed on the composed rcode, so
-	nothing of it is kept either way.
+	With the nibble at 3 the client reads a name error. With the nibble left at
+	0 it reads NOERROR and takes the answer section, and that half is not a
+	denial bug at all but the whole validator stepped over: the same forged
+	`www.example.com. A`, signature no longer covering it, is `Bogus` plain and
+	was `Insecure` with one byte set, forwarded, and believed. Neither costs the
+	attacker a forgery they did not already have to make.
+
+	Which of the two is safe to refuse turns on what an extended rcode means. It
+	is not a variant of the rcodes above; the ones a responder can send to a
+	query are BADVERS (16, RFC 6891 section 6.1.3) and BADCOOKIE (23, RFC 7873
+	section 5.3), the rest being TSIG and TKEY codes that never appear on one.
+	Both say the responder declined to answer *before* looking anything up, so
+	both carry a question and an OPT and nothing else - which is what separates
+	them from a rewritten header. BADCOOKIE's nibble is 7 and reaches neither
+	test; BADVERS's is 0, so the answer-and-authority test is what keeps a real
+	one out of this - asserted in `test_badvers_is_still_not_a_forgery` rather
+	than assumed, because the whole of that path exists to stop an EDNS mismatch
+	being reported as a forgery.
+
+	`cache.put` fails closed on the composed rcode either way, so nothing of
+	either shape was ever kept; what is closed here is what reached the client
+	that asked.
 	*/
 	if !answerable_rcode(msg) {
-		if dns.Rcode(msg.flags.rcode) == .NX_Domain {
-			return {status = .Bogus, reason = "extended rcode contradicts the header's denial"}
+		if u16(dns.rcode_of(msg)) > 0xf {
+			if dns.Rcode(msg.flags.rcode) == .NX_Domain {
+				return {status = .Bogus, reason = "extended rcode contradicts the header's denial"}
+			}
+			if len(msg.answer) > 0 || len(msg.authority) > 0 {
+				return {status = .Bogus, reason = "extended rcode over an answered response"}
+			}
 		}
 		return {status = .Insecure, reason = "no data to authenticate"}
 	}
@@ -744,6 +762,19 @@ follows the chain to its end and asks one question there - is there a record at
 this name that this server authenticated - because a record at a name is proof
 the name exists, whatever its type.
 
+Where the chain ends is the client's question as much as the records, and that
+is the part it is easy to get wrong. A CNAME is a hop only while the client
+wanted something else: RFC 1034 section 4.3.2 step 3a restarts the walk at the
+target *unless* the query type matches the CNAME, so for `CNAME` and for `ANY`
+the record is the answer, the walk stops, and the rcode is about the name that
+was asked about. Read as a hop instead, a flipped rcode over a signed
+`dig CNAME` answer walked past the very record that refutes it, found the target
+empty, and came back `Secure` - #271 intact for that one question.
+
+The general rule and both of those cases are the same line: a record that
+matches the question ends the walk, whatever the type. It is only when nothing
+here answers the question that a CNAME means go on looking.
+
 Only the authenticated sets are followed, and that is what makes the answer
 worth anything. Both halves of a response are the sender's to write, so a walk
 over the section as it arrived could be steered with records nobody signed: one
@@ -751,19 +782,18 @@ appended CNAME redirects the walk to a name the sender chose and empties it, and
 one appended record at the end fills it. Neither is possible over sets that had
 to survive a zone's signature to get into `kept`.
 
-`chain_shape` is the wrong instrument for this and was tried first. It reports
-whether the *question* was answered, so it stops at the first record of the type
-asked for - and for `ANY` that is the CNAME itself, which would read an ordinary
-NXDOMAIN-after-a-CNAME as a contradiction and refuse it. Their two questions
-only look alike: a chain ending in an AAAA where an A was asked for is
-`.Chain_Only` and no answer to the question, and is still a name proven to exist
-under a header that denies it.
+Close to `chain_shape` and not the same question, which is why it is written out
+rather than borrowed. That one reports whether the question was *answered*; this
+one reports whether a name was *proven*. A chain ending in an AAAA where an A was
+asked for is `.Chain_Only` and no answer at all, and is still a name shown to
+exist under a header that denies it.
 */
 @(private)
 denial_contradicted :: proc(
 	records: []dns.Record,
 	kept: []Authenticated_Set,
 	qname: string,
+	qtype: dns.Type,
 	class: dns.Class,
 ) -> bool {
 	if len(kept) == 0 {
@@ -791,6 +821,15 @@ denial_contradicted :: proc(
 				continue
 			}
 			present = true
+			/*
+			The question answered here, so the walk ends here and the rcode is
+			about this name - which this record has just shown to exist. Ahead
+			of the CNAME case below on purpose: that is what stops a `CNAME` or
+			`ANY` question stepping over the record that refutes the denial.
+			*/
+			if r.type == qtype || qtype == .ANY {
+				return true
+			}
 			if r.type == .CNAME {
 				if v, is_name := r.data.(dns.Rdata_Name); is_name {
 					target = v.name
@@ -1388,7 +1427,7 @@ validate_answer :: proc(
 	the question this asks.
 	*/
 	if worst != .Bogus && worst != .Indeterminate && dns.rcode_of(msg) == .NX_Domain {
-		if denial_contradicted(msg.answer, authenticated[:], qname, class) {
+		if denial_contradicted(msg.answer, authenticated[:], qname, qtype, class) {
 			return {status = .Bogus, reason = "rcode contradicts the authenticated answer"}
 		}
 	}

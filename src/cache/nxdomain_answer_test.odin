@@ -22,7 +22,15 @@ whose records were in the packet.
 */
 
 @(private = "file")
-nx_with_answer :: proc(name: string, type: dns.Type, allocator := context.allocator) -> ([]u8, dns.Message) {
+nx_with_answer :: proc(
+	name: string,
+	type: dns.Type,
+	qtype := dns.Type.A,
+	allocator := context.allocator,
+) -> (
+	[]u8,
+	dns.Message,
+) {
 	data: dns.Record_Data
 	#partial switch type {
 	case .CNAME:
@@ -32,7 +40,7 @@ nx_with_answer :: proc(name: string, type: dns.Type, allocator := context.alloca
 	}
 	m := dns.Message {
 		id        = 0x3333,
-		question  = []dns.Question{{name = name, type = .A, class = .IN}},
+		question  = []dns.Question{{name = name, type = qtype, class = .IN}},
 		answer    = []dns.Record{{name = name, type = type, class = .IN, ttl = 300, data = data}},
 		authority = []dns.Record {
 			{
@@ -71,7 +79,7 @@ test_nxdomain_carrying_data_is_not_cached :: proc(t: ^testing.T) {
 	c := make_cache(Options{max_entries = 8, max_ttl = 3600, negative_ttl = 300})
 	defer destroy(c)
 
-	wire, msg := nx_with_answer("mail.example.com.", .A, context.temp_allocator)
+	wire, msg := nx_with_answer("mail.example.com.", .A, allocator = context.temp_allocator)
 	kb: [KEY_MAX]u8
 	key := key_for_nx(kb[:], "mail.example.com.")
 
@@ -92,12 +100,36 @@ test_nxdomain_after_a_cname_is_still_cached :: proc(t: ^testing.T) {
 	c := make_cache(Options{max_entries = 8, max_ttl = 3600, negative_ttl = 300})
 	defer destroy(c)
 
-	wire, msg := nx_with_answer("www.example.com.", .CNAME, context.temp_allocator)
+	wire, msg := nx_with_answer("www.example.com.", .CNAME, allocator = context.temp_allocator)
 	kb: [KEY_MAX]u8
 	key := key_for_nx(kb[:], "www.example.com.")
 
 	testing.expect(t, put(c, key, wire, msg), "an NXDOMAIN after a CNAME should still be cached")
 	testing.expect_value(t, len_entries(c), 1)
+	free_all(context.temp_allocator)
+}
+
+/*
+Unless the CNAME is what was asked about.
+
+The exemption above is for a redirection, and a redirection is only what a CNAME
+is while the client wanted something else: ask for the CNAME itself and RFC 1034
+section 4.3.2 step 3a stops the walk there, so the record is data at the very
+name the rcode denies. Entries are keyed by type, so what one spoofed packet
+over a genuine `dig CNAME` answer would take away is `name/CNAME` for the whole
+of `negative_ttl`.
+*/
+@(test)
+test_nxdomain_over_the_cname_that_was_asked_for_is_not_cached :: proc(t: ^testing.T) {
+	c := make_cache(Options{max_entries = 8, max_ttl = 3600, negative_ttl = 300})
+	defer destroy(c)
+
+	wire, msg := nx_with_answer("www.example.com.", .CNAME, .CNAME, context.temp_allocator)
+	kb: [KEY_MAX]u8
+	key := make_key(kb[:], "www.example.com.", .CNAME, .IN, false)
+
+	testing.expect(t, !put(c, key, wire, msg), "an NXDOMAIN over the CNAME that was asked for was stored")
+	testing.expect_value(t, len_entries(c), 0)
 	free_all(context.temp_allocator)
 }
 

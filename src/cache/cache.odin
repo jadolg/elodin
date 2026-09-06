@@ -544,15 +544,28 @@ put :: proc(c: ^Cache, key: string, wire: []u8, msg: dns.Message, checked: u64 =
 	meant is not knowable here, and the entry has to be one or the other to be
 	given a lifetime at all. The response still reaches the client that caused
 	the fetch; what it does not do is outlive it.
+
+	The exemption for a redirection is only good while the client wanted
+	something else. Ask for the CNAME itself and that record is the answer, not
+	a hop on the way to one (RFC 1034 section 4.3.2 step 3a stops the walk when
+	the query type matches), so it is data at the very name the rcode denies -
+	and entries are keyed by type, so what a spoofed packet would take away is
+	`name/CNAME` for the whole of `negative_ttl`.
 	*/
 	if rcode == .NX_Domain {
+		qtype := msg.question[0].type if len(msg.question) > 0 else dns.Type.None
 		for rec in msg.answer {
 			#partial switch rec.type {
 			// A DNAME and the CNAME it synthesizes are the redirection
 			// itself (RFC 6672 section 3.4.1), an RRSIG rides on whatever
 			// it covers, and an OPT is transport with no owner name at all.
-			// None of them is data at the name being denied.
-			case .CNAME, .DNAME, .RRSIG, .OPT:
+			// None of them is data at the name being denied - unless the
+			// redirection is what was asked about.
+			case .CNAME, .DNAME:
+				if rec.type == qtype || qtype == .ANY {
+					return false
+				}
+			case .RRSIG, .OPT:
 			case:
 				return false
 			}
