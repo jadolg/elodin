@@ -240,8 +240,14 @@ test_an_unsupported_algorithm_is_not_reported_as_a_forgery :: proc(t: ^testing.T
 		testing.expectf(t, result == .Unsupported, "algorithm %d should be unsupported, got %v", algorithm, result)
 		testing.expectf(t, !algorithm_supported(algorithm), "and the table should agree about %d", algorithm)
 	}
+	/*
+	`algorithm_bit` rather than `algorithm_supported`, which answers for the
+	local crypto policy as well and so is not a property of this build: on a
+	host whose OpenSSL declines SHA-1 signatures, algorithms 5 and 7 are
+	implemented here and unsupported there. See policy.odin.
+	*/
 	for algorithm in ([]u8{ALG_RSASHA1, ALG_RSASHA1_NSEC3, ALG_RSASHA256, ALG_RSASHA512, ALG_ECDSAP256SHA256, ALG_ECDSAP384SHA384, ALG_ED25519, ALG_ED448}) {
-		testing.expectf(t, algorithm_supported(algorithm), "algorithm %d is implemented", algorithm)
+		testing.expectf(t, algorithm_bit(algorithm) != 0, "algorithm %d is implemented", algorithm)
 	}
 	free_all(context.temp_allocator)
 }

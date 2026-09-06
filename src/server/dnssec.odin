@@ -38,6 +38,15 @@ start_validator :: proc(s: ^Server) -> bool {
 		return true
 	}
 
+	/*
+	Before anything is validated, and before the line below reports what we are
+	validating against: this asks the linked libcrypto which algorithms it will
+	actually run, and it is where an operator on a host whose crypto policy
+	rules one out finds that out - as a warning at start-up, rather than as a
+	zone that is insecure here and secure everywhere else.
+	*/
+	dnssec.probe_algorithms()
+
 	anchors: []dnssec.Trust_Anchor
 	if len(s.cfg.dnssec.trust_anchors) > 0 {
 		parsed := make([dynamic]dnssec.Trust_Anchor, 0, len(s.cfg.dnssec.trust_anchors))
@@ -71,6 +80,41 @@ start_validator :: proc(s: ^Server) -> bool {
 			}
 		}
 		s.anchor_zones = zones[:]
+	}
+
+	/*
+	And refused to start on, for the reason an anchor that will not parse is: an
+	anchor naming an algorithm the library will not run anchors nothing, so the
+	zone it covers is an insecure delegation the moment it is asked about.
+
+	The root is the zone that decides. Every chain starts there - `zone_trust`
+	asks for the root's keys and walks down through DS records - so a set that
+	cannot seed the root seeds nothing, whatever else is in it.
+
+	The two ways of failing that fail differently, which is why they are told
+	apart below. An anchor for the root whose algorithm the library will not run
+	leaves `fetch_keys` with nothing checkable, so the root is insecure and
+	every answer goes out unvalidated: no AD bit anywhere and no SERVFAIL
+	either, which is the failure a validating resolver exists to not have. No
+	root anchor at all leaves `zone_keys` with nothing to match, which is
+	`Indeterminate` and SERVFAILs every name instead. Neither is a server worth
+	starting; an operator who does want unvalidated answers has
+	`dnssec.enabled: false` to ask for them with.
+	*/
+	in_use := anchors if len(anchors) > 0 else dnssec.root_anchors()
+	if !dnssec.usable_anchor(in_use, ".") {
+		if dnssec.anchors_the_root(in_use) {
+			logx.errorf("dnssec: no trust anchor for the root names an algorithm and digest this build can check")
+			logx.errorf("dnssec: nothing would be validated; check the host crypto policy, or set dnssec.enabled: false")
+		} else {
+			logx.errorf("dnssec: no trust anchor covers the root, which is where every chain of trust starts")
+			logx.errorf("dnssec: every name would fail to validate; anchor `.` as well, or set dnssec.enabled: false")
+		}
+		// The validator is still nil, and `destroy_validator` takes that; what
+		// this is here for is the anchors parsed above, which the refusal to
+		// start would otherwise leave behind.
+		stop_validator(s)
+		return false
 	}
 
 	s.validator = dnssec.make_validator(

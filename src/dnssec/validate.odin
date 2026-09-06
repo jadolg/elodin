@@ -297,6 +297,10 @@ make_validator :: proc(
 	opts: Options,
 	allocator := context.allocator,
 ) -> ^Validator {
+	// Nothing may validate against a table nobody has checked against the
+	// library; a build that never called this on its own gets it here.
+	probe_algorithms()
+
 	v := new(Validator, allocator)
 	v.allocator = allocator
 	v.query = query
@@ -1516,7 +1520,6 @@ validate_rrset :: proc(
 	have to hold a signature it was never in a position to make.
 	*/
 	unsupported := false
-	refused := false
 	exhausted := false
 	/*
 	One chain walk per distinct signer, not one per signature.
@@ -1595,6 +1598,23 @@ validate_rrset :: proc(
 		if !signature_worth_trying(sig, keys, unix) {
 			continue
 		}
+		/*
+		A third free reject, and one only the policy table can make: this
+		signature names a key the zone published, of an algorithm the library
+		will not run, so the verdict is known without asking - `verify_signature`
+		would answer from the same table and spend a verification getting there.
+
+		Which matters because the allowance is what an attacker fills. A zone
+		mid-rollover really does publish the refused algorithm, so copies of its
+		own signature pass every cheap test above and used to cost a
+		verification each: sixty-four of them in front of the one that would
+		have held, and the answer is `Indeterminate` and a SERVFAIL for a name
+		that resolves.
+		*/
+		if !algorithm_supported(sig.algorithm) {
+			unsupported = true
+			continue
+		}
 		if !spend_verification(budget) {
 			exhausted = true
 			break
@@ -1603,10 +1623,15 @@ validate_rrset :: proc(
 		#partial switch result {
 		case .Ok:
 			return .Secure, expanded_from, "", sig.signer, sig
-		case .Unsupported:
+		case .Unsupported, .Refused:
+			/*
+			The same thing to say about this RRset. One is an algorithm this
+			build never implemented and the other one the library declined to
+			run, and neither looked at the signature before deciding - so
+			neither is evidence that what arrived is genuine, which is all the
+			verdict below turns on.
+			*/
 			unsupported = true
-		case .Refused:
-			refused = true
 		}
 	}
 
@@ -1650,34 +1675,26 @@ validate_rrset :: proc(
 	Nothing here was checkable, and the zone it belongs to is signed with
 	something that was.
 
-	An algorithm we do not implement makes a *delegation* insecure - `zone_step`
-	settles that at the DS, per RFC 6840 section 5.2 - but it cannot make an
-	RRset inside an established zone insecure, which is the correction in
-	section 5.11 of the same document. A zone signed with two algorithms
+	An algorithm this build cannot check makes a *delegation* insecure -
+	`zone_step` settles that at the DS, per RFC 6840 section 5.2 - but it cannot
+	make an RRset inside an established zone insecure, which is the correction
+	in section 5.11 of the same document. A zone signed with two algorithms
 	publishes an RRSIG for each, so treating this as unsigned would let an
 	attacker strip the signature we can verify, alter the records, and have what
 	is left reach the client as merely unvalidated instead of refused. The whole
 	point of the second algorithm, inverted.
+
+	"Cannot check" covers the algorithm the library declined as well as the one
+	this build never implemented, and it has to: the refusal is a decision about
+	the algorithm taken before the signature is read, so a forgery earns it as
+	readily as the genuine article. Which one it was is settled at the
+	delegation instead, where the escape hatch belongs - `probe_algorithms`
+	takes a refused algorithm out of `algorithm_supported` at start-up, so a
+	zone that publishes only that algorithm has no usable DS and goes insecure
+	in front of this loop rather than through it.
 	*/
 	if unsupported {
 		return .Bogus, "", "no signature this build can verify", "", {}
-	}
-
-	/*
-	The library would not run an algorithm we do implement, which is a statement
-	about this machine rather than about the zone.
-
-	Refusing here would make a zone unresolvable on a host whose crypto policy
-	rules SHA-1 out - Fedora and RHEL, for algorithms 5 and 7 - while the same
-	build resolved it everywhere else, so the data is treated as unsigned as it
-	always has been. That leaves the section 5.11 downgrade open on those hosts
-	for zones that publish a refused algorithm alongside a supported one; the
-	place to close it is `algorithm_supported`, which should answer for what the
-	linked library will actually run so that the delegation goes insecure at the
-	DS instead.
-	*/
-	if refused {
-		return .Insecure, "", "algorithm refused by local policy", "", {}
 	}
 	return .Bogus, "", missing, "", {}
 }
@@ -2483,12 +2500,32 @@ fetch_keys :: proc(
 	}
 
 	sigs := sigs_covering(msg.answer, zone, .DNSKEY, class, allocator)
-	unsupported := false
+
+	/*
+	Whether anything in this DS set names something this build can check, which
+	is the whole of what makes a delegation insecure.
+
+	RFC 6840 section 5.2 asks about the set: a delegation is insecure when the
+	resolver supports *none* of the algorithms the parent published. Asking it
+	per record instead - "did some DS name something we cannot check" - is a
+	different question with a much larger answer, because a parent is free to
+	publish an algorithm we cannot check beside one we can, and every zone
+	mid-rollover does. A DNSKEY set that then failed to verify against the DS we
+	*could* check came back insecure rather than bogus, which is a tampered
+	DNSKEY response taking a signed zone out of validation - and `zone_step`
+	caches that for the DS TTL, so it stays out.
+	*/
+	checkable := false
+	for ds in ds_set {
+		if algorithm_supported(ds.algorithm) && digest_supported(ds.digest_type) {
+			checkable = true
+			break
+		}
+	}
 
 	exhausted := false
 	ds_loop: for ds in ds_set {
 		if !algorithm_supported(ds.algorithm) || !digest_supported(ds.digest_type) {
-			unsupported = true
 			continue
 		}
 		for key in parsed {
@@ -2541,28 +2578,32 @@ fetch_keys :: proc(
 				case .Ok:
 					return parsed[:], .Secure
 				case .Unsupported, .Refused:
-					// Both mean the same thing here. This is the delegation, and
-					// a delegation we cannot follow is insecure whether the
-					// algorithm is one we never implemented or one the library
-					// declined to run (RFC 6840 section 5.2).
-					unsupported = true
+					/*
+					The DS named an algorithm the table reports as checkable and
+					the library declined it anyway, which `probe_algorithms`
+					leaves only one way to reach: a policy that turns a key down
+					for something about the key rather than the algorithm. Not
+					evidence that the parent published nothing we can check, so
+					it does not touch `checkable` - the zone comes back bogus,
+					which is the direction policy.odin argues for and the only
+					one available.
+					*/
 				case .Bad:
 				}
 			}
 		}
 	}
 	/*
-	Before the verdict below, and not through it. `unsupported` is set by any DS
-	naming an algorithm this build cannot check, which a parent is free to
-	publish beside a supported one - so leaving through that return when the
-	allowance ran out would let a padded DNSKEY set choose `Insecure`, and with
-	it every answer below the zone accepted unvalidated. Running out is a
-	statement about this server, so it says so.
+	Before the verdict below, and not through it. A DS set with nothing
+	checkable in it is insecure however the loop above went, so leaving through
+	that return when the allowance ran out would let a padded DNSKEY set choose
+	`Insecure`, and with it every answer below the zone accepted unvalidated.
+	Running out is a statement about this server, so it says so.
 	*/
 	if exhausted {
 		return nil, .Indeterminate
 	}
-	return nil, .Insecure if unsupported else .Bogus
+	return nil, .Bogus if checkable else .Insecure
 }
 
 // Does this DNSKEY hash to this DS? The digest runs over the owner name in

@@ -399,16 +399,23 @@ test_a_route_knows_whether_an_anchor_covers_it :: proc(t: ^testing.T) {
 	if cfg, ok := load(t, "  trust_anchors:\n    - " + ROOT + "\n    - \"corp.example. " + DS + "\"\n"); ok {
 		testing.expect(t, route_is_anchored(&cfg, cfg.upstream.zones[0]), "an anchor over the routed zone was ignored")
 	}
-	// An anchor inside the zone covers its own names and leaves the rest of the
-	// zone exactly as insecure as it was.
-	if cfg, ok := load(t, "  trust_anchors:\n    - \"dev.corp.example. " + DS + "\"\n"); ok {
+	/*
+	An anchor inside the zone covers its own names and leaves the rest of the
+	zone exactly as insecure as it was.
+
+	The root anchor rides along with this one and the one below it because a set
+	without it is refused outright now - it anchors nothing, every chain
+	starting at the root - and what is under test here is which zone an anchor
+	covers, not whether the set is one a server could start on.
+	*/
+	if cfg, ok := load(t, "  trust_anchors:\n    - " + ROOT + "\n    - \"dev.corp.example. " + DS + "\"\n"); ok {
 		testing.expect(t, !route_is_anchored(&cfg, cfg.upstream.zones[0]), "an anchor below the zone was read as covering it")
 	}
 	// One domain of a route anchored and the other not is the whole route still
 	// giving validation up, the line being one sentence about all of them.
 	if cfg, ok := load(
 		t,
-		"  trust_anchors:\n    - \"corp.example. " + DS + "\"\n",
+		"  trust_anchors:\n    - " + ROOT + "\n    - \"corp.example. " + DS + "\"\n",
 		"[corp.example, lab.example]",
 	); ok {
 		testing.expect(t, !route_is_anchored(&cfg, cfg.upstream.zones[0]), "a half-anchored route was called anchored")
@@ -429,5 +436,77 @@ test_a_route_over_a_default_off_special_use_zone_is_kept :: proc(t: ^testing.T) 
 		return
 	}
 	testing.expect_value(t, len(cfg.upstream.zones), 1)
+	free_all(context.temp_allocator)
+}
+
+/*
+A trust anchor set that never names the root is refused by `--check`.
+
+Every chain of trust starts at the root and reaches every other zone through
+its parent's DS, so a validator handed only `corp.example.` has no way in and
+fails every name it is asked. `start_validator` refuses to come up on that, and
+without this the refusal arrives after `--check` has called the file valid -
+the operator restarts a working resolver onto a configuration nothing warned
+them about, which is the shape `--check` exists to prevent.
+
+Only the structural half belongs here. Whether the root anchor names an
+algorithm the linked libcrypto will run is a question about the host, and a
+configuration checked on one machine is often deployed on another.
+*/
+@(test)
+test_a_trust_anchor_set_without_the_root_is_refused :: proc(t: ^testing.T) {
+	ROOT :: `". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"`
+	DS :: `IN DS 12345 8 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF`
+
+	src :: proc(anchors: string) -> string {
+		return fmt.tprintf("upstream:\n  servers: [1.1.1.1]\ndnssec:\n  enabled: true\n%s", anchors)
+	}
+
+	_, alone := load_string(src("  trust_anchors:\n    - \"corp.example. " + DS + "\"\n"), context.temp_allocator)
+	testing.expect(t, alone != nil, "a set anchoring only a zone below the root should be refused")
+
+	_, with_root := load_string(
+		src("  trust_anchors:\n    - " + ROOT + "\n    - \"corp.example. " + DS + "\"\n"),
+		context.temp_allocator,
+	)
+	testing.expect(t, with_root == nil, "the same set with the root anchored is a set a server can start on")
+
+	// The built-in anchors are the root, so configuring none of your own is not
+	// the same as anchoring nothing.
+	_, none := load_string(src(""), context.temp_allocator)
+	testing.expect(t, none == nil, "no anchors at all uses the built-in root keys")
+
+	/*
+	A root anchor with a typo in it is one error, not two. The set this reads
+	does not contain it - it did not parse - so the root check would report it
+	missing to an operator looking straight at the line where they wrote it.
+	*/
+	typo := fmt.tprintf(
+		"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  enabled: true\n%s",
+		"  trust_anchors:\n    - \". IN DS 20326 8 2 NOTHEXATALL\"\n",
+	)
+	_, malformed := load_string(typo, context.temp_allocator)
+	if e, has := malformed.?; has {
+		testing.expectf(
+			t,
+			len(e.messages) == 1,
+			"a mistyped root anchor should be one error, got %v",
+			e.messages,
+		)
+	} else {
+		testing.expect(t, false, "a mistyped root anchor should still be refused")
+	}
+
+	/*
+	And with validation off the question does not arise. Nothing reads these -
+	`start_validator` returns before it looks at them - so a set left behind by
+	an operator who turned DNSSEC off must not stop the file from loading.
+	*/
+	off := fmt.tprintf(
+		"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  enabled: false\n%s",
+		"  trust_anchors:\n    - \"corp.example. " + DS + "\"\n",
+	)
+	_, disabled := load_string(off, context.temp_allocator)
+	testing.expect(t, disabled == nil, "anchors nothing reads should not stop a file loading")
 	free_all(context.temp_allocator)
 }
