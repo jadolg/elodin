@@ -2484,10 +2484,29 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	}
 	// Parsed here rather than at startup so `--check` reports a bad anchor
 	// instead of a resolver that comes up refusing every name.
+	parsed_anchors := make([dynamic]dnssec.Trust_Anchor, 0, len(cfg.dnssec.trust_anchors), l.allocator)
 	for anchor, i in cfg.dnssec.trust_anchors {
-		if _, ok := dnssec.parse_trust_anchor(anchor, l.allocator); !ok {
+		read, ok := dnssec.parse_trust_anchor(anchor, l.allocator)
+		if !ok {
 			errorf(l, "dnssec.trust_anchors[%d]: %q is not a DS record", i, anchor)
+			continue
 		}
+		append(&parsed_anchors, read)
+	}
+	/*
+	And the same reasoning one step further: a set that anchors everything
+	except the root anchors nothing. Every chain starts at the root and reaches
+	the rest through DS records, so a validator handed only `corp.example.` has
+	no way in and fails every name. `start_validator` refuses to come up on
+	that, and this is what keeps `--check` from calling it valid first.
+
+	Only the structural half is asked here. Whether the root anchor names an
+	algorithm the linked libcrypto will actually run is a question about the
+	host, and `probe_algorithms` has not run when a configuration is read -
+	`--check` on one machine would otherwise answer for another.
+	*/
+	if len(cfg.dnssec.trust_anchors) > 0 && !dnssec.anchors_the_root(parsed_anchors[:]) {
+		errorf(l, "dnssec.trust_anchors covers no root anchor, so no name could be validated; anchor \".\" as well")
 	}
 
 	// Same reasoning: a secret that will not parse should fail `--check`, not

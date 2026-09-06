@@ -259,22 +259,33 @@ ALGORITHM_PROBES := []Algorithm_Probe {
 	{ALG_ED448, "Ed448", PROBE_ED448_KEY, PROBE_ED448_SIG},
 }
 
+/*
+One DS digest type, and what `PROBE_DATA` hashes to under it.
+
+`PROBE_DATA` rather than the empty string, which is the obvious thing to hash
+and the wrong one: every DS digest this server computes runs over an owner name
+and a DNSKEY RDATA, so a probe over nothing at all would be the only caller in
+the package handing `EVP_Digest` a nil pointer and a length of zero. A library
+that declined that shape - and every failure here is read as the library
+declining the digest - would drop all three types at once, and with them every
+delegation attested by a DS, into insecure. The probe asks the question the
+same way the code that depends on it will.
+*/
 @(private)
 Digest_Probe :: struct {
 	digest_type: u8,
 	name:        string,
-	// The digest of the empty string, which every one of these publishes.
 	want:        string,
 }
 
 @(private)
 DIGEST_PROBES := []Digest_Probe {
-	{DIGEST_SHA1, "SHA-1", "da39a3ee5e6b4b0d3255bfef95601890afd80709"},
-	{DIGEST_SHA256, "SHA-256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+	{DIGEST_SHA1, "SHA-1", "f7809f355da2917a366b116c0d181b708c2c7875"},
+	{DIGEST_SHA256, "SHA-256", "c4bce1a5f7cb1d0e1fa8fba68ced9f3d9d88923ae5eb7a9a77b932c207f3ec2c"},
 	{
 		DIGEST_SHA384,
 		"SHA-384",
-		"38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b",
+		"325b8c35db4d3b4959dddf0f05261de211117638798881ced929e119222a89eb50331c9843386ecadf031fb640971be4",
 	},
 }
 
@@ -323,11 +334,12 @@ run_probe :: proc() {
 	}
 
 	digests: u32
+	message, message_ok := decode_hex(PROBE_DATA, scratch)
 	for probe in DIGEST_PROBES {
 		out: [64]u8
 		want, want_ok := decode_hex(probe.want, scratch)
 		size := digest_size(probe.digest_type)
-		ran := want_ok && digest(probe.digest_type, nil, out[:size])
+		ran := message_ok && want_ok && digest(probe.digest_type, message, out[:size])
 		if ran {
 			for b, i in want {
 				if out[i] != b {
@@ -344,7 +356,6 @@ run_probe :: proc() {
 				probe.digest_type,
 			)
 		}
-		free_all(scratch)
 	}
 
 	/*

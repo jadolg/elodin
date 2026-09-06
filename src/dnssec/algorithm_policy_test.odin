@@ -393,7 +393,7 @@ test_the_table_reports_what_the_library_answered :: proc(t: ^testing.T) {
 		out: [64]u8
 		want, _ := decode_hex(probe.want, context.temp_allocator)
 		size := digest_size(probe.digest_type)
-		computed := digest(probe.digest_type, nil, out[:size])
+		computed := digest(probe.digest_type, data, out[:size])
 		matched := computed && mem.compare(out[:size], want) == 0
 		testing.expectf(
 			t,
@@ -420,10 +420,10 @@ A SHA-384 typo would make every delegation attested only by a SHA-384 DS an
 insecure delegation, everywhere, for as long as nobody looked.
 
 Recomputing the digest here would not catch it - that is what `run_probe` does,
-against the same constant. So these are the same three published numbers
-written down a second time, from `openssl dgst` rather than from the table they
-are checked against. A typo in either transcription now has to be made twice,
-identically, to survive.
+against the same constant. So these are the same three numbers written down a
+second time, from `printf 'elodin dnssec algorithm probe' | openssl dgst`
+rather than from the table they are checked against. A typo in either
+transcription now has to be made twice, identically, to survive.
 */
 @(test)
 test_the_digest_probe_expects_the_published_numbers :: proc(t: ^testing.T) {
@@ -432,11 +432,11 @@ test_the_digest_probe_expects_the_published_numbers :: proc(t: ^testing.T) {
 		digest:      string,
 	}
 	published := []Published {
-		{DIGEST_SHA1, "da39a3ee5e6b4b0d3255bfef95601890afd80709"},
-		{DIGEST_SHA256, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+		{DIGEST_SHA1, "f7809f355da2917a366b116c0d181b708c2c7875"},
+		{DIGEST_SHA256, "c4bce1a5f7cb1d0e1fa8fba68ced9f3d9d88923ae5eb7a9a77b932c207f3ec2c"},
 		{
 			DIGEST_SHA384,
-			"38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b",
+			"325b8c35db4d3b4959dddf0f05261de211117638798881ced929e119222a89eb50331c9843386ecadf031fb640971be4",
 		},
 	}
 
@@ -455,7 +455,7 @@ test_the_digest_probe_expects_the_published_numbers :: proc(t: ^testing.T) {
 		testing.expectf(
 			t,
 			probe.want == want,
-			"%s: the probe expects %s, the published digest of the empty string is %s",
+			"%s: the probe expects %s, `openssl dgst` makes it %s",
 			probe.name,
 			probe.want,
 			want,

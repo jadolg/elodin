@@ -884,6 +884,16 @@ Two things worth knowing with validation on:
   the built-in root anchors both name RSA/SHA-256, so a policy that took that
   one algorithm away would leave no way into the DNS at all. `dnssec.enabled:
   false` is how to ask for unvalidated answers on purpose.
+- **A policy can also refuse a key rather than an algorithm, and that one costs
+  resolution.** Fedora's and RHEL's DEFAULT policy sets a minimum RSA modulus of
+  2048 bits alongside the SHA-1 ban. The probe verifies with a 2048-bit key, so
+  RSA is reported runnable, and a zone whose own key is smaller is then refused
+  when its signature is checked — inside a zone already established as secure,
+  which is SERVFAIL rather than an unvalidated answer. It is what RFC 6840
+  section 5.11 asks for and what other validators do there, but on such a host a
+  zone with a 1024-bit RSA zone-signing key stops resolving rather than resolving
+  without the AD bit. Answering it any other way means judging the key at the
+  delegation, which nothing here does yet.
 - **NS records in the authority section of a positive answer are not required to
   be signed**, a forwarder being unable to tell the parent's copy of a delegation
   from the child's. The answer section is validated in full; this affects only
