@@ -2483,12 +2483,32 @@ fetch_keys :: proc(
 	}
 
 	sigs := sigs_covering(msg.answer, zone, .DNSKEY, class, allocator)
-	unsupported := false
+
+	/*
+	Whether anything in this DS set names something this build can check, which
+	is the whole of what makes a delegation insecure.
+
+	RFC 6840 section 5.2 asks about the set: a delegation is insecure when the
+	resolver supports *none* of the algorithms the parent published. Asking it
+	per record instead - "did some DS name something we cannot check" - is a
+	different question with a much larger answer, because a parent is free to
+	publish an algorithm we cannot check beside one we can, and every zone
+	mid-rollover does. A DNSKEY set that then failed to verify against the DS we
+	*could* check came back insecure rather than bogus, which is a tampered
+	DNSKEY response taking a signed zone out of validation - and `zone_step`
+	caches that for the DS TTL, so it stays out.
+	*/
+	checkable := false
+	for ds in ds_set {
+		if algorithm_supported(ds.algorithm) && digest_supported(ds.digest_type) {
+			checkable = true
+			break
+		}
+	}
 
 	exhausted := false
 	ds_loop: for ds in ds_set {
 		if !algorithm_supported(ds.algorithm) || !digest_supported(ds.digest_type) {
-			unsupported = true
 			continue
 		}
 		for key in parsed {
@@ -2541,28 +2561,32 @@ fetch_keys :: proc(
 				case .Ok:
 					return parsed[:], .Secure
 				case .Unsupported, .Refused:
-					// Both mean the same thing here. This is the delegation, and
-					// a delegation we cannot follow is insecure whether the
-					// algorithm is one we never implemented or one the library
-					// declined to run (RFC 6840 section 5.2).
-					unsupported = true
+					/*
+					The DS named an algorithm the table reports as checkable and
+					the library declined it anyway, which `probe_algorithms`
+					leaves only one way to reach: a policy that turns a key down
+					for something about the key rather than the algorithm. Not
+					evidence that the parent published nothing we can check, so
+					it does not touch `checkable` - the zone comes back bogus,
+					which is the direction policy.odin argues for and the only
+					one available.
+					*/
 				case .Bad:
 				}
 			}
 		}
 	}
 	/*
-	Before the verdict below, and not through it. `unsupported` is set by any DS
-	naming an algorithm this build cannot check, which a parent is free to
-	publish beside a supported one - so leaving through that return when the
-	allowance ran out would let a padded DNSKEY set choose `Insecure`, and with
-	it every answer below the zone accepted unvalidated. Running out is a
-	statement about this server, so it says so.
+	Before the verdict below, and not through it. A DS set with nothing
+	checkable in it is insecure however the loop above went, so leaving through
+	that return when the allowance ran out would let a padded DNSKEY set choose
+	`Insecure`, and with it every answer below the zone accepted unvalidated.
+	Running out is a statement about this server, so it says so.
 	*/
 	if exhausted {
 		return nil, .Indeterminate
 	}
-	return nil, .Insecure if unsupported else .Bogus
+	return nil, .Bogus if checkable else .Insecure
 }
 
 // Does this DNSKEY hash to this DS? The digest runs over the owner name in

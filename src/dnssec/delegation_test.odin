@@ -414,7 +414,7 @@ test_a_revoked_apex_key_cannot_carry_the_chain :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_an_unfollowable_ds_beside_an_unknown_one_is_still_insecure :: proc(t: ^testing.T) {
+test_an_unfollowable_ds_beside_an_unknown_one_is_bogus :: proc(t: ^testing.T) {
 	/*
 	`uftest.`'s DS set holds one record naming Ed25519 and SHA-256 - both of
 	which we implement, so the set is not refused out of hand - whose digest
@@ -423,12 +423,27 @@ test_an_unfollowable_ds_beside_an_unknown_one_is_still_insecure :: proc(t: ^test
 
 	The first check, the one that spares a pointless DNSKEY lookup, passes this
 	set through. So the verdict has to be reached the second time, after the
-	keys are in hand and none of them satisfies the DS we could follow. A DS we
-	cannot read may well be the one that was right, so the honest answer is an
-	insecure delegation and not a forgery.
+	keys are in hand and none of them satisfies the DS we could follow.
+
+	That verdict is `Bogus`, and it used to be `Insecure` on the reasoning that
+	the DS we cannot read may well have been the one that was right. What is
+	wrong with that reasoning is not the charity, it is who gets to use it. RFC
+	6840 section 5.2 makes a delegation insecure when the validator supports
+	*none* of the algorithms in the DS set; here it supports one, so there is a
+	supported authentication path from parent to child and it does not lead to a
+	key. RFC 4035 section 5.2 calls that Bogus, and every other validator agrees
+	- so the leniency did not keep a zone resolving that would have resolved
+	elsewhere, it only made this resolver the one that accepted it.
+
+	And the DNSKEY response is not signed by the parent. Anyone on the path to a
+	plain UDP or TCP upstream can take the signatures off it, and against any
+	zone whose parent published something we cannot check beside something we
+	can - which is every zone mid-rollover - `Insecure` here was that attacker's
+	answer: the zone out of validation, and `zone_step` caching it for the DS
+	TTL.
 
 	Without this scenario the two checks cover for each other: break either one
-	and the other still produces `Insecure`, and nothing fails.
+	and the other still produces the same verdict, and nothing fails.
 	*/
 	v := scenario_validator(UF_ANCHOR, &UF_FIXTURES)
 	testing.expect(t, v != nil, "the anchor should parse")
@@ -437,8 +452,8 @@ test_an_unfollowable_ds_beside_an_unknown_one_is_still_insecure :: proc(t: ^test
 	result := validate(v, "www.uftest.", .A, scenario_fixture(UF_FIXTURES, "uf_answer"), time.unix(FIXTURE_TIME, 0))
 	testing.expectf(
 		t,
-		result.status == .Insecure,
-		"a DS set we cannot follow to a key is insecure, got %v (%q)",
+		result.status == .Bogus,
+		"a DS set with a supported algorithm that leads to no key is bogus, got %v (%q)",
 		result.status,
 		result.reason,
 	)

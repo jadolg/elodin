@@ -17,9 +17,10 @@ build, whose OpenSSL declines SHA-1 signatures outright - is not the host these
 tests run on. So the chain below is made rather than captured. A synthetic root
 anchors two synthetic zones:
 
-  - `migrating.`, one zone-signing key per algorithm, RSA/SHA-1 (5) beside
-    ECDSA P-256 (13), which is what a zone rolling from one to the other
-    publishes for as long as the roll takes. Its DS names 13.
+  - `migrating.`, one key per algorithm, RSA/SHA-1 (5) beside ECDSA P-256
+    (13), each signing the whole zone, and a DS at the parent for each - what
+    a zone rolling from one algorithm to the other publishes for as long as
+    the roll takes.
   - `legacy.`, signed only with RSA/SHA-1, DS and all. The zone that has not
     rolled yet.
 
@@ -46,96 +47,108 @@ CHAIN_TTL :: 3600
 
 // The synthetic root's key-signing key, which the trust anchor below names.
 @(private = "file")
-ROOT_KEY_TAG :: 45990
+ROOT_KEY_TAG :: 14607
 
 @(private = "file")
-ANCHOR_DIGEST :: "da6c6ec34a279d18f3b660e0c59ff6e5ba31f652cb7d22ef041bc2d092305daf"
+ANCHOR_DIGEST :: "21d7cb2915a6abc7f491ade9ee3ab47258188e726ca1267ef6d68804e22ac010"
 
 @(private = "file")
 ROOT_KSK ::
-	"0101030d26732d708c88c10658e933acba97b2aeb02802f68dfeaeade25a24f6c0de04a7a8ceb5e18d544d9cd58aea74" +
-	"d3ae12dc1a53e52ac8aecf47fba2108a4c2c87ae"
+	"0101030dfea371e31ce9bb1378d73366d08db40af5c7ea0db52c3c437f3f3560fe661f4218ee72c56f76d8c36f6f96ca" +
+	"a5f22a9b733dd1f96fa94ed82358917136d97e06"
 
 @(private = "file")
 ROOT_DNSKEY_SIG ::
-	"00300d0000000e106b36ec806955b900b3a600ee3114e83059419fbbdadcc534e962d53cf47e32e55e96886a541d5f20" +
-	"e094c2bc0be9cfd72daba10a67666e2b917d9274fb929e7dbf5f7cd4558deea027d6ce"
+	"00300d0000000e106b36ec806955b900390f00daf8ca2ab9eca80e0e68ddbbca0ac0f9904f966d923533c73589aa1d03" +
+	"0b857da3eaf806b64ca551a512e3c0eeb92395d5263fc6626044ac67d9e93bcc88443b"
 
 @(private = "file")
-MIGRATING_DS :: "817a0d0287d9b14bd385e52b823dc6f651f6190469e5c5a06ba619ae8791d1827f086514"
+MIGRATING_DS_ECDSA :: "30490d02e8cbcb98298e25d9b2aedd34848206933b6ba59a106073e38871bbec999f49ea"
+
+@(private = "file")
+MIGRATING_DS_RSA :: "97570502d1e0b6200359432c1f241669602d22ee954cc4abbce14bb4cee0d4eaf880afd3"
 
 @(private = "file")
 MIGRATING_DS_SIG ::
-	"002b0d0100000e106b36ec806955b900b3a6004ef7594075a8d8ea000b78c27f45adb34035458ef47cb083f72e677419" +
-	"1fd859ee7a1b00c92dcec36cb4a1f9f852d27b796df54f20f9a4c42540325b96fcca22"
+	"002b0d0100000e106b36ec806955b900390f00af41cdf64a92de8c160c7203daa1961d48371fdaa5a683c2643fab38b7" +
+	"66b8688c8bbb458ad1d30273be8c4d999c5bf6575023e46cc8da143f3fc00833596a31"
 
 @(private = "file")
-MIGRATING_KSK ::
-	"0101030d49c0614ad48e4778eb788455737b893ac126a4da2ceba37e95a04a3209640701f1e2df9c1dbca107d8c553fc" +
-	"a6b5131f19f934275cb3712c2e48bd8abc62e822"
+MIGRATING_ECDSA_KEY ::
+	"0101030d462041543b8789bd532ef5227106291251d7244a045a5f28d0f2684a12d7c9331928f870752989773d9473e0" +
+	"b31c7411cdd8ee3358917a1f838c5f124a88696a"
 
 @(private = "file")
-MIGRATING_ZSK ::
-	"0100030503010001abbf27f685cd3bb80662f09b639379716220d619cee4d5cc3665b8fe22ec01cade75e06379e349e8" +
-	"75f2e21c9f4f945883f40ddaad99a3a26b16a3f1f1dca4b4dfa13cd155f7e00593f6ae932f62466af7375f07f2503508" +
-	"7ded092a2bcf76c76783dd1fe9cb25658854022ad56fd2270378d05b1d2a9f80f7fa85d09a3096976758aef6d413f39a" +
-	"11a0a5a683a14a887c5e23bc2dd556d7df9d95f57aecfb060b2575f02c375fe5b1e02cc75ccf2c1cb5eef5ae24be946e" +
-	"8163a17f0f6d3958bed81aeea8a262100abcb0ddefdfee6686d9b37f83d7fb8b820fdacad88f6e14a26902fb90c8fd5c" +
-	"0091b6ed641bd65985114f871a23d2e7b2cb4b3060f9ec6d"
+MIGRATING_RSA_KEY ::
+	"0101030503010001b9e8913962cb55549f225841c94b7298c1c5de60781f2e232d9f50a2dff3a3b55b2b8b7be293890c" +
+	"4cf375c1cb69e9c42a1d84f8ee0233ad79b5515ad0e0b3aa09ab01ed5e2656e5afdccf57b85cbe5229251dd78d60a697" +
+	"91f66ca58abf2aa7256330211f99a9d591a05633936b2043dea92d0651323b7bbda79bf965a8577a6acc085e8ad3a497" +
+	"3e6de7f974bfc2813aa2233fdd793ff61dfe008ddc0bf48eece06def05e6e89803135488ed1af13e6432058886c4d06b" +
+	"6b912fb730c1d488b510528bfc64164a7378f6eb436b2b90f7058e18be0a3281c4da1368bf70bde55164a7df0281e1e9" +
+	"45d548eb4eb7818ab977d531921e1e277815dcb94951b3a7"
 
 @(private = "file")
-MIGRATING_DNSKEY_SIG ::
-	"00300d0100000e106b36ec806955b900817a096d6967726174696e67006ea0b58e6dcbaf18fdcd95cc232c712aecbe3c" +
-	"8867d71743be0bff25821a43be8ca6d69a1c833bf43b2c5d912cb05844e97d0db5c31618c954133c940fea3e38"
+MIGRATING_DNSKEY_SIG_13 ::
+	"00300d0100000e106b36ec806955b9003049096d6967726174696e6700d943291313a0fdf4296396e0d128ed72716d2d" +
+	"00e7ac167252f20c82b9d086dc76df7df2107699c9603e2f4a5d9292e9871adda4fd2740a6d0e7b6fcd8bde0d4"
+
+@(private = "file")
+MIGRATING_DNSKEY_SIG_5 ::
+	"0030050100000e106b36ec806955b9009757096d6967726174696e670012a875e19218aaf8652b89709fc8d73ff3ca61" +
+	"66c96e2293d09284065b5746390bde1a27eb0bbf7a97a64b2a3c54fb5425607e67d055523ce597eea09c699fd87653e0" +
+	"3dc44183efcf6dc86e2a5c9836b82138ad06bc52d390b7c40c71428e1b681fbe55196291d3224bb335f09894fc425b64" +
+	"d748d94bc03b09877e947054ce657dfb2ec3570fa7fa32cd0b592d35238ef5069a96ed8e8bd6a2164fdcf4a7b7daf858" +
+	"6845e15bf9b1e928158fafaaf0141bfa8ad696bdf3ff7d77939e642cbbaf33653530cf2883f683f3909a906742f657a7" +
+	"bcf3403b0ecb3aa2685635d6cc0d182ac7453c8f5f0075e2a1713b5a4f165891c0c8403946e989e231b02c46b7"
 
 @(private = "file")
 MIGRATING_A_SIG_13 ::
-	"00010d0100000e106b36ec806955b900817a096d6967726174696e670067e8e1d901d8046bd0c2be8d86bf1d1323f974" +
-	"0428d887dd4b3ddcec84958c7641df952d5f460fd29ea0c7e8ceb78a32123e09e972fc2abc47a74ad6e34baa53"
+	"00010d0100000e106b36ec806955b9003049096d6967726174696e6700859ca5fcb207b84a69d5bc556b720b8dd4a3cf" +
+	"a1d7aa9f6c7616aa2223d212b5db3ddfd6bbfd4a3b74d94b6f16e330037fcacaa64f135d186fccd21b8f5d6d4d"
 
 @(private = "file")
 MIGRATING_A_SIG_5 ::
-	"0001050100000e106b36ec806955b9003667096d6967726174696e6700965050d4172179ff3fabd796d20d05e809c690" +
-	"5c25fbaafd2d6c2bb2447e9157ee32965780ccfbc26f7efa74d744bbe079b7490f206654cbee38d3c89b10ac8663c683" +
-	"a37728b71eb407dea91a02ff3781a0f7a054ee2882c5e5fa616d421910af76805974c48c0cbb20a6dbb905aa6efbcd71" +
-	"ba1ab93b9617c04cb73bc50b1c79bd988e3a826d599576f9c84a6a8f361ccc7890e5d525bf5a3126f05b8569ca4a9edd" +
-	"4f88f488ab7880c7f063793972a94ae879314d500129bb62f4fdd5cafbe4f1086159e615f7ef12b43910caec1e03812b" +
-	"ec354d580a8fcdbcd54adc1c333b9fb2067deb02c17abe19fb6d0f9d78889a1611ba801af89a18453c33586000"
+	"0001050100000e106b36ec806955b9009757096d6967726174696e67003c22b0b70c0d19b4c01354cf352c24bf128769" +
+	"4d9bd1591fe6a9204111b5c43023fc4529547395c1809d73f219b8292a58ac1d327c6ff40a7c4d666598b93c5a1ab186" +
+	"07f014e036aecf45c467e0352cbb95d84ebaee34cb51fa40634083f6242b4c92bc36e646662e7491ddc8329fe0bf9418" +
+	"0c4828471e305de725523fddf68dade3511e2dc0f338a437f9abc3f2a6ef52c036e72b9e23700f47fcc2d6af3ce2b364" +
+	"4092df794b46a23756a3e009b1469c4042abd52ce09d4bd463aeb852b0474f167f3ede4181c16adba9712cd219cbf777" +
+	"adb2c06d0236a3c5ae70961edf41e7096a30f41aaeb9e21e506cebe5e1263ac723e01c1f673546ad5de8ee7f3f"
 
 @(private = "file")
-LEGACY_DS :: "20b60502d83d7ee68aefeae083e51a2e71d992107751d373b3dd71611f65debce0e789d5"
+LEGACY_DS :: "1ba4050299d38370c3cf98b78b525e24460953ced89259c25edc7b42f93bf8f086812e0c"
 
 @(private = "file")
 LEGACY_DS_SIG ::
-	"002b0d0100000e106b36ec806955b900b3a600de976289164086a851a52f197c0ed1fae320ffade5c1f5f46a71ae5978" +
-	"373ebd8a3387e972a8811fe29cb7da97ec6e6a13a826a045513dbc355a62f3e5ee90cf"
+	"002b0d0100000e106b36ec806955b900390f00cea420877262414866958fba827106cbda5e2d32f6c20ce5367d634f56" +
+	"d72cf99ac51f8bf5488633e5bc8141c5a1a4461e33517b29bfa2a51d4872b70bb472a0"
 
 @(private = "file")
-LEGACY_KSK ::
-	"01010305030100018f8e45c3fcd84f5e7d307ea1a0288930ccf8ff80a67351a82520a003d2ca172be3c87147b04dbe19" +
-	"86a56f79003a0bc0d5c4159ecc78c1f79afa3aa524894514d64d3749ba50f8a1b5b40f39914ea81bb5afc9303c931700" +
-	"f25663a62fe23aae095fdc3149461bc4e6a994261ab1955c1e33b468ec546ef11e4824f1811c3922381d2dc5bcd77fc3" +
-	"e20f1e5f9a450669bb0ed814e252eb0523e9506024a94658f297a4ebb9e0d06ade97475d4413988b046afae28eb5a499" +
-	"556be0062fe39ce7af3185252f32140289fb4b8e60eb1cd0f463e52e4d76b408a1521359d5e48426196f4bb2bfe5a6fc" +
-	"692464f4d12c52bd1ba5f8d911d4bc104b61804eba173687"
+LEGACY_KEY ::
+	"0101030503010001da49299e117fbd0af3d4c177224d1741c15f9ce6f42950486bceba4b23af45ad3ccf73e0fe7e9219" +
+	"8f1c84f325eb9b00314ec8a06d81bc043141518460e56386e599aca3c918d0aef8531cae83dc1e34f25c41df15d220a2" +
+	"26f103b4b456e13126a32efe0ee6f320a7cfe87382285860199fb41f29da726a0b250487da983e71818fd7b4d217a6a7" +
+	"c5139761146d02e85c6f867fd64fe5e2804de5050a3691f271e78def956a6907443220a9b75afe725a29d6eab32b7aec" +
+	"6d293b7c689292073449d5ec6a41df5f5de512e3c66ed323e4e06f0bdf8d7d3a10165a4776784e12fdd7bc034706e5d7" +
+	"4a8e6101fb3996dbf804986ad150e9dd432fc5200b097a21"
 
 @(private = "file")
 LEGACY_DNSKEY_SIG ::
-	"0030050100000e106b36ec806955b90020b6066c6567616379006464139f579e7c0dbb7fb3a2f827e9b14c22bab42623" +
-	"b417f85f9fa7cd2ba93f57394b830ba2de8c3bbce5bfd4f67f288f6af48facc8d127dc42b0814141e44cd4072122668c" +
-	"2e78bf969a1969b3cde98ff13984ead21d94ab71ce4254c7f1d07aeea8069ca23c073cc383a383ffd4fff9cb767103ab" +
-	"04f15a9f7bcaa330d7dd8f29dc8c758a4a3dd642599968dc9af54124ca6304bb328f23927c6be0519fc2475f1ddf15e3" +
-	"0880969b5a369a1df4902fbd6940a1e20d2de4ce3be4f77da3477eb5db219ff36f7116990d28051d3512bafa85ce1dae" +
-	"06511ace7a26c22a5c9068b87c5ccfe2f201122c67ea2d9c6d5f1ceeb711ed7e910a08bd961c6c4a3923"
+	"0030050100000e106b36ec806955b9001ba4066c65676163790049bcea4308367289522b2e85dfccd24e65b57b0c3ffb" +
+	"5f19a2f0695e5d78a7993fc57699b2ff05bffe042b02edd074681b058d99d218069d88c6fa31ebc316995ff62477ca4b" +
+	"6f97be25afed58c6046a5374f9a84baad5fa1c6f23c68be96428634410408d3f7e0b1740d5e2c5e9aec871cdaa5926ed" +
+	"0a76adaa835598451223e5a691074b74a11815d550ea1ef76ad1a657cee4a793ca83c33d231856285d3e72442963c6e8" +
+	"6c89d802955813e133a6d85f1b081a935b4f934609df782d6d2ce7301f0a6af891ea807096ddb5bd0dba53c765cad009" +
+	"cbef91352e4ddd0265d02a899b81f822e72527da7d6ca24474bf26bcf1e7397d26e10ec7971e2618d577"
 
 @(private = "file")
 LEGACY_A_SIG ::
-	"0001050100000e106b36ec806955b90020b6066c6567616379002ca38dcae44b2641cf7fcd3e21c4a80dfbf3df4f0c2f" +
-	"9bbbc1d7427f6f06e64c6aaf1f8cd3400b42c6490a0ed22b556de428c39f7c719edfd232c765103aa27508966b77fb72" +
-	"afa26872b452415e9360c1241859d29d709e0dce714563ee09d394b3942ff1dafd528918a530e3454af0fc61bb7cf5bd" +
-	"3a4d302abed8390a80c7fd0c33dffdb99e0a87c154dab66bfc2115be4d6b9f35db6fcf2f5c22cb9f85620a2cbccdb9d8" +
-	"20ada59a1c760c74a447b125d3ac725b4b86c9e0bf35115d75ada54e7fe800d82dc16cacde9db4221dd628dfa9f4139f" +
-	"c25b8aefc9473ef69e0f851c7694b7c187e5af071e47aac1d9a087a3e4fa0b14bd1636b0d2e5600308bf"
+	"0001050100000e106b36ec806955b9001ba4066c65676163790094f170fe98782d8a473fc6bc7c97d1410ad3b97a9e88" +
+	"87b7de5ab7edcb7f8a048a8af4009466ef574dbbcb59522e3f8d815c50306ec743f4c1414a041808fe1f6c3f725f3bdf" +
+	"911678fe45e38d7e413b50128e521795453ad43374aad166a2fa93d1d627fbf1ed445b98e6bc97ce21cc45376349b126" +
+	"25449ff2f75668bc77d8a979ae379fd65e9fa1219d685d250769ad3d03ef8c16ad7453d1f3df7b95343cf9abab945831" +
+	"5e0bc821d42ffac552ce352c149d48efbcbec356fd433c2b94793b2b7de475d16423be652be306a5c5f58d2623406f04" +
+	"4e17d65fdff3b44c7b2ce89009a6b67b7279b9423d8c1bd764a1ba255480fc98982af487977e6ee60a5b"
 
 // ---------------------------------------------------------------------------
 // Serving the chain
@@ -173,28 +186,51 @@ message :: proc(qname: string, qtype: dns.Type, answer: []dns.Record, allocator:
 	return out
 }
 
+/*
+What an attacker on the path to the upstream gets to do to a lookup, which for
+this file is one thing: take the signatures off the DNSKEY set of `migrating.`.
+
+That is the cheapest tampering there is - no forgery, nothing to get right -
+and the zone it is aimed at is one whose DS set names two algorithms. What must
+come back is Bogus: the parent attests a key with an algorithm this build can
+check, so a DNSKEY set that will not verify against it is a broken zone and not
+an unsigned one.
+*/
+@(private = "file")
+Tamper :: struct {
+	strip_migrating_dnskey_signatures: bool,
+}
+
 // The DS and DNSKEY lookups the walk makes, and nothing else: a name this chain
 // does not describe is a lookup the test did not mean to provoke, so it fails
 // rather than answering.
 @(private = "file")
 chain_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
+	tamper := Tamper{}
+	if ctx != nil {
+		tamper = (^Tamper)(ctx)^
+	}
 	records := make([dynamic]dns.Record, 0, 3, allocator)
 	switch {
 	case type == .DNSKEY && dns.name_equal_fold(name, "."):
 		append(&records, raw_record(".", .DNSKEY, ROOT_KSK, allocator))
 		append(&records, raw_record(".", .RRSIG, ROOT_DNSKEY_SIG, allocator))
 	case type == .DS && dns.name_equal_fold(name, "migrating."):
-		append(&records, raw_record("migrating.", .DS, MIGRATING_DS, allocator))
+		append(&records, raw_record("migrating.", .DS, MIGRATING_DS_ECDSA, allocator))
+		append(&records, raw_record("migrating.", .DS, MIGRATING_DS_RSA, allocator))
 		append(&records, raw_record("migrating.", .RRSIG, MIGRATING_DS_SIG, allocator))
 	case type == .DNSKEY && dns.name_equal_fold(name, "migrating."):
-		append(&records, raw_record("migrating.", .DNSKEY, MIGRATING_KSK, allocator))
-		append(&records, raw_record("migrating.", .DNSKEY, MIGRATING_ZSK, allocator))
-		append(&records, raw_record("migrating.", .RRSIG, MIGRATING_DNSKEY_SIG, allocator))
+		append(&records, raw_record("migrating.", .DNSKEY, MIGRATING_ECDSA_KEY, allocator))
+		append(&records, raw_record("migrating.", .DNSKEY, MIGRATING_RSA_KEY, allocator))
+		if !tamper.strip_migrating_dnskey_signatures {
+			append(&records, raw_record("migrating.", .RRSIG, MIGRATING_DNSKEY_SIG_13, allocator))
+			append(&records, raw_record("migrating.", .RRSIG, MIGRATING_DNSKEY_SIG_5, allocator))
+		}
 	case type == .DS && dns.name_equal_fold(name, "legacy."):
 		append(&records, raw_record("legacy.", .DS, LEGACY_DS, allocator))
 		append(&records, raw_record("legacy.", .RRSIG, LEGACY_DS_SIG, allocator))
 	case type == .DNSKEY && dns.name_equal_fold(name, "legacy."):
-		append(&records, raw_record("legacy.", .DNSKEY, LEGACY_KSK, allocator))
+		append(&records, raw_record("legacy.", .DNSKEY, LEGACY_KEY, allocator))
 		append(&records, raw_record("legacy.", .RRSIG, LEGACY_DNSKEY_SIG, allocator))
 	case:
 		return nil, false
@@ -218,7 +254,7 @@ apex_answer :: proc(zone: string, addr: [4]u8, sigs: []string, allocator: mem.Al
 }
 
 @(private = "file")
-chain_validator :: proc(allocator: mem.Allocator) -> ^Validator {
+chain_validator :: proc(allocator: mem.Allocator, tamper: ^Tamper = nil) -> ^Validator {
 	digest, ok := decode_hex(ANCHOR_DIGEST, allocator)
 	if !ok {
 		panic("the trust anchor is not hex")
@@ -233,7 +269,7 @@ chain_validator :: proc(allocator: mem.Allocator) -> ^Validator {
 			digest = digest,
 		},
 	}
-	return make_validator(chain_query, nil, Options{anchors = anchors})
+	return make_validator(chain_query, tamper, Options{anchors = anchors})
 }
 
 // ---------------------------------------------------------------------------
@@ -538,6 +574,46 @@ test_a_refused_algorithm_is_settled_at_the_delegation :: proc(t: ^testing.T) {
 		budget.verifications == 2,
 		"reaching an insecure delegation cost %d verifications rather than 2: the DS was walked past and the zone below it asked",
 		budget.verifications,
+	)
+	free_all(context.temp_allocator)
+}
+
+/*
+A DS set that names a refused algorithm beside a checkable one is not an
+insecure delegation.
+
+RFC 6840 section 5.2 makes a delegation insecure when the resolver supports
+*none* of the algorithms in the DS RRset. `fetch_keys` was reading it as "some
+DS named something we cannot check", which is a different set of zones - and a
+much larger one once an algorithm can leave `algorithm_supported` at start-up.
+
+`migrating.` is delegated with two DS records, one per algorithm. Take the
+signatures off its DNSKEY set - the cheapest tampering on the path to an
+upstream, and nothing an attacker has to get right - and the answer is a zone
+whose keys are not the keys the parent attests. That is bogus. Reported
+insecure it is worse than a failure: `zone_step` caches it for the DS TTL, so
+one tampered DNSKEY response takes the whole zone out of validation for as long
+as the cache holds it.
+*/
+@(test)
+test_one_refused_ds_does_not_make_a_mixed_delegation_insecure :: proc(t: ^testing.T) {
+	runs_rsasha1 := hold_policy()
+	defer release_policy(runs_rsasha1)
+	refuse_rsasha1()
+
+	tamper := Tamper {
+		strip_migrating_dnskey_signatures = true,
+	}
+	v := chain_validator(context.temp_allocator, &tamper)
+	defer destroy_validator(v)
+
+	budget := Budget{}
+	status, _, _ := zone_trust(v, &budget, "migrating.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	testing.expectf(
+		t,
+		status == .Bogus,
+		"a zone whose DNSKEY set no longer verifies came back %v: the parent attests an ECDSA key, and only the RSA/SHA-1 DS beside it is unusable here",
+		status,
 	)
 	free_all(context.temp_allocator)
 }
