@@ -282,11 +282,12 @@ tests on several threads. Everything that writes it holds this, so that a test
 asking what a refusing host does cannot be read by a test asking what this host
 does.
 
-The lock only covers the tests that take it, which leaves one invariant for
-whoever adds the next fixture: no other test in this package may depend on
-RSA/SHA-1. Nothing does today - every captured chain is algorithm 8, 13 or 15 -
-and the first one that does will flake against the tests here rather than fail
-honestly.
+The lock only covers the tests that take it, so what these tests refuse has to
+be something no other test in the package uses. RSA/SHA-1 is the one such
+algorithm: every captured chain is signed with 8, 13 or 15, and `crypto.odin`'s
+own vectors are 8, 13 and 15 too. Nothing here may refuse any of those, and the
+next fixture added in RSA/SHA-1 will have to take this lock or move the tests
+here onto an algorithm nobody else wants.
 */
 @(private = "file")
 policy_lock: sync.Mutex
@@ -695,36 +696,51 @@ right in both directions. Getting it wrong the safe-looking way - reporting an
 anchor usable when it is not - is a server that comes up, says how many anchors
 it holds, and validates nothing behind them.
 
-The built-in root anchors are the case that matters: both name RSA/SHA-256, so
-a host whose policy took that one algorithm away would leave this server with
-no way into the DNS at all, whatever else it could still verify. And the zone
-has to be asked about, not just the algorithm: `zone_trust` starts every chain
-at the root and reaches every other zone through its parent's DS, so an anchor
-for a zone below it - usable or not - seeds nothing.
+And the zone has to be asked about, not just the algorithm: `zone_trust` starts
+every chain at the root and reaches every other zone through its parent's DS,
+so an anchor for a zone below it - usable or not - seeds nothing.
+
+The refusal is applied to RSA/SHA-1 here, as everywhere else in this file, and
+the anchors it is applied against are made up for the purpose. Refusing what
+the built-in anchors actually name - RSA/SHA-256, both of them - would be
+refusing the algorithm the captured root and com chains are signed with, and
+every test in the package that walks one runs on another thread while this one
+holds the lock.
 */
 @(test)
 test_an_anchor_the_library_cannot_follow_is_not_usable :: proc(t: ^testing.T) {
-	sync.mutex_lock(&policy_lock)
-	defer sync.mutex_unlock(&policy_lock)
-	probe_algorithms()
+	runs_rsasha1 := hold_policy()
+	defer release_policy(runs_rsasha1)
 
-	before := sync.atomic_load(&refused_algorithms)
-	defer sync.atomic_store(&refused_algorithms, before)
-
+	/*
+	Why one algorithm is enough to take the whole DNS away here, asserted rather
+	than described: the built-in anchors are two keys of one algorithm, so a
+	policy that took just that one leaves this server no way in. Read, not
+	refused - see above.
+	*/
+	for anchor in root_anchors() {
+		testing.expect_value(t, anchor.ds.algorithm, u8(ALG_RSASHA256))
+	}
 	testing.expect(t, usable_anchor(root_anchors(), "."), "the built-in root anchors are followable on this build")
 
-	// One algorithm gone, and it is the only one the root anchors name.
-	sync.atomic_or(&refused_algorithms, algorithm_bit(ALG_RSASHA256))
+	root_sha1 := []Trust_Anchor {
+		{zone = ".", ds = {key_tag = 1, algorithm = ALG_RSASHA1, digest_type = DIGEST_SHA256}},
+	}
+	if runs_rsasha1 {
+		testing.expect(t, usable_anchor(root_sha1, "."), "and an RSA/SHA-1 anchor is followable until it is not")
+	}
+
+	refuse_rsasha1()
 	testing.expect(
 		t,
-		!usable_anchor(root_anchors(), "."),
-		"refusing RSA/SHA-256 leaves the root anchors naming nothing this build can check",
+		!usable_anchor(root_sha1, "."),
+		"an anchor naming the one algorithm this host refuses names nothing this build can check",
 	)
-	testing.expect(t, algorithm_supported(ALG_ED25519), "while other algorithms carry on running")
+	testing.expect(t, algorithm_supported(ALG_ECDSAP256SHA256), "while other algorithms carry on running")
 
 	// A zone's anchor set is usable when any one of its anchors is.
 	mixed := []Trust_Anchor {
-		{zone = ".", ds = {key_tag = 1, algorithm = ALG_RSASHA256, digest_type = DIGEST_SHA256}},
+		{zone = ".", ds = {key_tag = 1, algorithm = ALG_RSASHA1, digest_type = DIGEST_SHA256}},
 		{zone = ".", ds = {key_tag = 2, algorithm = ALG_ED25519, digest_type = DIGEST_SHA256}},
 	}
 	testing.expect(t, usable_anchor(mixed, "."), "one anchor left is one way into the chain")
@@ -737,7 +753,7 @@ test_an_anchor_the_library_cannot_follow_is_not_usable :: proc(t: ^testing.T) {
 	a validator that validates anything.
 	*/
 	below := []Trust_Anchor {
-		{zone = ".", ds = {key_tag = 1, algorithm = ALG_RSASHA256, digest_type = DIGEST_SHA256}},
+		{zone = ".", ds = {key_tag = 1, algorithm = ALG_RSASHA1, digest_type = DIGEST_SHA256}},
 		{zone = "corp.example.", ds = {key_tag = 2, algorithm = ALG_ED25519, digest_type = DIGEST_SHA256}},
 	}
 	testing.expect(t, !usable_anchor(below, "."), "an Ed25519 anchor below the root does not seed the root")

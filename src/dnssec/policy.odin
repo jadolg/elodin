@@ -49,12 +49,22 @@ what may be hashed - and the probe is here so that the DS path does not have to
 assume it.
 
 What this does not cover is a policy that turns an algorithm down for something
-about a particular key rather than for the algorithm itself - a modulus below
-some floor, say. The probe would find that algorithm runnable, and a zone whose
-key the library then declined comes back Bogus rather than insecure. That is
-the safe direction of the two, and the only one available: a refusal that
-arrives at an RRset inside a secure zone cannot be told apart from a stripped
-signature, which is why section 5.11 asks for Bogus there.
+about a particular key rather than for the algorithm itself. The concrete one
+is a minimum RSA modulus - OpenSSL's FIPS provider has such a floor - against a
+zone whose key is smaller than it: the probe verifies its 2048-bit vector,
+reports RSA runnable, and the zone's own key is then declined at
+`EVP_DigestVerifyInit`. Inside a zone the chain has established, that comes
+back Bogus rather than insecure. It is the safe direction of the two and the
+only one available: a refusal arriving at an RRset inside a secure zone cannot
+be told apart from a stripped signature, which is why section 5.11 asks for
+Bogus there.
+
+A second, smaller RSA vector would not move that case to the delegation where
+it belongs. This table holds one bit per algorithm and knows nothing of key
+sizes, so requiring both vectors to verify would refuse RSA outright on such a
+host - taking every 2048-bit zone with it to spare the 1024-bit ones. Answering
+it properly means asking about the key in hand rather than about the algorithm,
+at the DS, which is a larger change than a vector.
 */
 
 /*
@@ -285,29 +295,23 @@ run_probe :: proc() {
 	algorithms: u32
 	for probe in ALGORITHM_PROBES {
 		/*
-		Twice before believing a failure.
-
-		`verify_now` has nowhere to put a resource failure but `.Refused` - a
-		context it could not allocate comes back the same way a policy refusal
-		does (crypto.odin) - and this table is built once and never rebuilt, so
-		one unlucky allocation at start-up would take an algorithm away for the
-		life of the process while the warning below blamed the host. A policy
-		refusal is a decision and repeats; an allocation that failed once has no
-		reason to.
+		Anything but `Ok` is read as the library declining the algorithm, and
+		one path here is not that: `EVP_MD_CTX_new` returning nil is reported as
+		`.Refused` because `verify_now` has nowhere else to put it. That is
+		libcrypto out of heap, at start-up, for a hundred bytes - a process
+		about to fail at something more urgent than DNSSEC, and not a state to
+		build insurance against. The arena below cannot produce it: it is a
+		fixed stack buffer, so exhaustion there is deterministic rather than
+		unlucky, and it surfaces as `.Bad` through a nil key anyway.
 		*/
-		ran := false
-		for _ in 0 ..< 2 {
-			key, key_ok := decode_hex(probe.key, scratch)
-			signature, sig_ok := decode_hex(probe.signature, scratch)
-			data, data_ok := decode_hex(PROBE_DATA, scratch)
-			if key_ok && sig_ok && data_ok {
-				ran = verify_now(probe.algorithm, key, signature, data, scratch) == .Ok
-			}
-			free_all(scratch)
-			if ran {
-				break
-			}
+		key, key_ok := decode_hex(probe.key, scratch)
+		signature, sig_ok := decode_hex(probe.signature, scratch)
+		data, data_ok := decode_hex(PROBE_DATA, scratch)
+		ran := key_ok && sig_ok && data_ok
+		if ran {
+			ran = verify_now(probe.algorithm, key, signature, data, scratch) == .Ok
 		}
+		free_all(scratch)
 		if !ran {
 			algorithms |= algorithm_bit(probe.algorithm)
 			logx.warnf(
