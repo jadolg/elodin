@@ -197,6 +197,24 @@ da_reply :: proc(key: string) -> []u8 {
 	return nil
 }
 
+/*
+The reason every refusal below has to carry.
+
+`Bogus` on its own is a weak thing to assert here, because a fixture chain that
+has quietly come apart produces it too - a lookup that matches the wrong record
+after a reordering of `DA_FIXTURES`, a signature whose window `FIXTURE_TIME` has
+drifted out of - and a test reading only the verdict would stay green while
+exercising nothing at all. Naming the reason pins each refusal to the check it
+is here for.
+
+It is the same string in all three, because `validate_denial` settles a DS
+question against the zone the walk reached before any bit map is read. The bit
+map guard is what stands behind that one, and it is `nsec_unit_test` and
+`nsec3_unit_test` that hold it to account, by calling the two routines directly.
+*/
+@(private = "file")
+DA_REFUSED :: "ds denial from the zone itself"
+
 @(private = "file")
 da_validate :: proc(key, qname: string) -> Result {
 	v := da_validator()
@@ -212,7 +230,7 @@ test_a_ds_denial_carried_by_the_childs_own_apex_nsec_is_bogus :: proc(t: ^testin
 	result := da_validate("da_apex_nodata", "dstest.")
 	testing.expectf(
 		t,
-		result.status == .Bogus,
+		result.status == .Bogus && result.reason == DA_REFUSED,
 		"a zone's own apex NSEC cannot deny the DS its parent holds, got %v (%q)",
 		result.status,
 		result.reason,
@@ -225,7 +243,7 @@ test_a_ds_denial_carried_by_the_childs_own_apex_nsec3_is_bogus :: proc(t: ^testi
 	result := da_validate("da3_apex_nodata", "dstest3.")
 	testing.expectf(
 		t,
-		result.status == .Bogus,
+		result.status == .Bogus && result.reason == DA_REFUSED,
 		"a zone's own apex NSEC3 cannot deny the DS its parent holds, got %v (%q)",
 		result.status,
 		result.reason,
@@ -260,7 +278,7 @@ test_a_ds_denial_from_the_zone_itself_is_bogus_whatever_the_bit_map_says :: proc
 	result := da_validate("bl_apex_nodata", "bltest.")
 	testing.expectf(
 		t,
-		result.status == .Bogus,
+		result.status == .Bogus && result.reason == DA_REFUSED,
 		"a zone cannot deny the DS this server followed to reach it, got %v (%q)",
 		result.status,
 		result.reason,
