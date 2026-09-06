@@ -139,6 +139,39 @@ nsec_proves_name_error :: proc(nsecs: []Nsec_Rr, qname: string, allocator := con
 }
 
 /*
+Is a matching record the child's own apex, being read as a denial of a DS?
+
+A DS lives in the parent zone and nowhere else. The child never publishes one at
+its apex, so the type is missing from the bit map there whatever the delegation
+looks like, and that absence denies nothing. SOA is what marks the apex.
+
+Reading such a record as a DS denial costs an attacker nothing to arrange: the
+child's apex record is public, is signed by the child's own keys, and may be
+fetched and replayed verbatim. A validator that accepts it answers "this signed
+zone is an unsigned delegation" with the AD bit set - and to have got that far it
+must have fetched and checked the very DS it is now denying. RFC 6840 section
+4.4.
+
+The root is the one name with no parent to hold a DS, so its own apex record is
+the only one that could ever answer the question. Refusing that would fail a
+question with a perfectly good answer and protect nothing, because the root's
+keys come from the trust anchor rather than from a DS.
+
+`nsec_proves_no_ds` and `nsec3_proves_no_ds`, which the chain walk uses, reach
+the same conclusion by demanding NS as well - the walk only ever asks at a name
+it already believes is a zone cut. This is the client-facing half, where the
+question arrives as an ordinary NODATA and the type has to be what singles it
+out.
+*/
+@(private)
+denial_is_the_childs_own_apex :: proc(types: []u8, qname: string, qtype: dns.Type) -> bool {
+	if qtype != .DS || qname == "." || qname == "" {
+		return false
+	}
+	return bitmap_has(types, .SOA)
+}
+
+/*
 Prove that `qname` exists but has no records of `qtype` (RFC 4035 section 5.4).
 
 Either an NSEC sits on the name with the type missing from its bit map, or the
@@ -157,6 +190,11 @@ nsec_proves_no_data :: proc(
 		// An NSEC with NS but no SOA belongs to the parent side of a zone cut,
 		// so it says nothing about the type at the child.
 		if bitmap_has(match.rr.types, .NS) && !bitmap_has(match.rr.types, .SOA) && qtype != .DS {
+			return .Failed
+		}
+		// And the converse: SOA set is the child's own apex, which says nothing
+		// about the DS its parent holds.
+		if denial_is_the_childs_own_apex(match.rr.types, qname, qtype) {
 			return .Failed
 		}
 		return .Proven

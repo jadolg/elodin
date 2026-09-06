@@ -418,6 +418,55 @@ test_nsec3_no_data_refuses_a_parent_side_record :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_nsec3_no_data_refuses_the_child_apex_for_a_ds :: proc(t: ^testing.T) {
+	/*
+	The other half of that exception. A DS lives in the parent zone and nowhere
+	else, so the record a child signed at its own apex - SOA set - never lists
+	the type and says nothing about it. Reading one as a DS denial turns a
+	published, replayable apex NSEC3 into an authenticated "this delegation is
+	unsigned" and detaches everything below the cut from the chain of trust.
+	RFC 6840 section 4.4.
+	*/
+	zone := a_zone()
+	testing.expect_value(t, nsec3_proves_no_data(zone, "example.", "example.", .DS, A_ITERATIONS), Proof.Failed)
+	// What that apex record really does deny, it still denies.
+	testing.expect_value(t, nsec3_proves_no_data(zone, "example.", "example.", .TXT, A_ITERATIONS), Proof.Proven)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_nsec3_no_data_lets_a_zone_with_no_parent_deny_its_own_ds :: proc(t: ^testing.T) {
+	/*
+	The root has no parent to hold a DS, so its own apex record is the only one
+	that could ever answer the question and the SOA on it is not the mark of the
+	wrong side of a cut. Rejecting it would SERVFAIL a question with a good
+	answer while protecting nothing: the root's keys come from the trust anchor,
+	not from a DS.
+
+	The deployed root is an NSEC zone, so this shape is hypothetical there - it
+	is pinned anyway, because the two routines are read as a pair and an
+	exemption present in one and missing from the other is how the next reader
+	concludes the rule is something else.
+	*/
+	hash := make([]u8, 20, context.temp_allocator)
+	testing.expect(t, nsec3_hash(".", A_SALT, A_ITERATIONS, hash), "the root should hash")
+	zone := []Nsec3_Rr {
+		{
+			hash = hash,
+			rr = Nsec3 {
+				hash_algorithm = NSEC3_HASH_SHA1,
+				iterations = A_ITERATIONS,
+				salt = A_SALT,
+				next_hash = hash,
+				types = types_bitmap({.NS, .SOA, .RRSIG, .DNSKEY, .NSEC3PARAM}),
+			},
+		},
+	}
+	testing.expect_value(t, nsec3_proves_no_data(zone, ".", ".", .DS, A_ITERATIONS), Proof.Proven)
+	free_all(context.temp_allocator)
+}
+
+@(test)
 test_nsec3_no_data_falls_back_to_the_wildcard :: proc(t: ^testing.T) {
 	/*
 	RFC 5155 section 8.7: nothing on the name itself, so a wildcard is what

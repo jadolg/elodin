@@ -42,6 +42,7 @@ CLASS_IN = 1
 A, NS, SOA, CNAME, MX, TXT = 1, 2, 6, 5, 15, 16
 AAAA, SRV, SVCB, HTTPS = 28, 33, 64, 65
 DS, RRSIG, NSEC, DNSKEY, NSEC3 = 43, 46, 47, 48, 50
+NSEC3PARAM = 51
 
 
 def wire_name(name):
@@ -204,6 +205,52 @@ def type_bitmap(types):
 def nsec_rdata(next_name, types):
     """The next owner name and the types present at this one."""
     return wire_name(next_name) + type_bitmap(types)
+
+
+B32HEX = "0123456789abcdefghijklmnopqrstuv"
+
+
+def base32hex(raw):
+    """Base 32 with the extended hex alphabet, which is how NSEC3 owners read."""
+    bits = "".join(format(byte, "08b") for byte in raw)
+    assert len(bits) % 40 == 0, "an SHA-1 hash is 20 bytes, so this always divides"
+    return "".join(B32HEX[int(bits[i:i + 5], 2)] for i in range(0, len(bits), 5))
+
+
+def nsec3_hash(name, salt, iterations):
+    """RFC 5155 section 5: SHA-1 over the canonical name, salted and iterated."""
+    digest = hashlib.sha1(canonical_name(name) + salt).digest()
+    for _ in range(iterations):
+        digest = hashlib.sha1(digest + salt).digest()
+    return digest
+
+
+def nsec3_rdata(next_hash, types, salt, iterations, flags=0):
+    """The NSEC3 RDATA of RFC 5155 section 3.2."""
+    return (
+        struct.pack("!BBH", 1, flags, iterations)
+        + bytes([len(salt)]) + salt
+        + bytes([len(next_hash)]) + next_hash
+        + type_bitmap(types)
+    )
+
+
+def nsec3_chain(zone, nodes, salt, iterations):
+    """One NSEC3 record per name, in hash order, the last wrapping to the first.
+
+    Returns them keyed by the name they speak for, so a scenario can pick the
+    one its message needs without depending on where in the chain it landed.
+    """
+    hashed = sorted(
+        ((nsec3_hash(name, salt, iterations), name, types) for name, types in nodes),
+        key=lambda entry: entry[0],
+    )
+    out = {}
+    for i, (digest, name, types) in enumerate(hashed):
+        owner = base32hex(digest) + "." + zone
+        next_hash = hashed[(i + 1) % len(hashed)][0]
+        out[name] = RR(owner, NSEC3, nsec3_rdata(next_hash, types, salt, iterations))
+    return out
 
 
 def message(qname, qtype, answer, authority=(), additional=(), rcode=0):
@@ -604,6 +651,70 @@ def zone_cut_under_empty_non_terminal():
     # so the denial has to answer a DS lookup too.
     emit("en_nx_ds", "nx.deep.mid.entest.", "DS",
          message("nx.deep.mid.entest.", DS, [], denial, rcode=3), rcode=3)
+
+
+@scenario
+def ds_denial_from_child_apex():
+    """Cover a DS denial carried by the child's own apex record."""
+    # A DS lives in the parent zone and nowhere else, so the record a child
+    # signs at its own apex never lists the type - and a validator that reads
+    # the missing bit as a denial can be handed the zone's genuine, published
+    # apex NSEC and told the delegation is unsigned. Nothing is forged: the
+    # records are copied verbatim and verify against the child's own keys, which
+    # this server fetched by following the very DS it is then told is absent.
+    #
+    # Both zones below are signed and both have a real DS. `www` under each is
+    # an ordinary name that is not a zone cut, which is the shape a legitimate
+    # DS NODATA really has, and it is here so that refusing the apex cannot be
+    # mistaken for refusing every DS denial.
+    root = Key(".", "dsapex-root")
+    child = Key("dstest.", "dsapex-child")
+    child3 = Key("dstest3.", "dsapex-child3")
+
+    root_keys = [RR(".", DNSKEY, root.rdata)]
+    print("// anchor: %s" % root.ds_text())
+    emit("da_root_dnskey", ".", "DNSKEY", message(".", DNSKEY, root_keys + [sign(root_keys, root)]))
+
+    # The genuine delegations. These are what make each zone come back Secure,
+    # so that the denial below is read against the child's own keys.
+    for tag, zone in (("da", child), ("da3", child3)):
+        ds_set = [RR(zone.zone, DS, zone.ds())]
+        emit("%s_ds" % tag, zone.zone, "DS", message(zone.zone, DS, ds_set + [sign(ds_set, root)]))
+        keys = [RR(zone.zone, DNSKEY, zone.rdata)]
+        emit("%s_dnskey" % tag, zone.zone, "DNSKEY", message(zone.zone, DNSKEY, keys + [sign(keys, zone)]))
+
+    # NSEC. The apex record of `dstest.` exactly as the zone publishes it, in a
+    # NODATA reply to `dstest. DS`.
+    apex_nsec = [RR("dstest.", NSEC, nsec_rdata("www.dstest.", [A, NS, SOA, RRSIG, NSEC, DNSKEY]))]
+    emit("da_apex_nodata", "dstest.", "DS",
+         message("dstest.", DS, [], apex_nsec + [sign(apex_nsec, child)]))
+
+    # The honest shape: `www.dstest.` is a name in the zone, not a cut, so no
+    # NS and no SOA, and its NSEC really does settle that there is no DS there.
+    www_nsec = [RR("www.dstest.", NSEC, nsec_rdata("dstest.", [A, RRSIG, NSEC]))]
+    emit("da_www_nodata", "www.dstest.", "DS",
+         message("www.dstest.", DS, [], www_nsec + [sign(www_nsec, child)]))
+
+    # NSEC3, salt and iterations kept small: what is under test is which bits
+    # the bit map carries, not how expensive the hash was to compute.
+    salt = bytes.fromhex("0a0b")
+    chain = nsec3_chain(
+        "dstest3.",
+        [
+            ("dstest3.", [A, NS, SOA, RRSIG, DNSKEY, NSEC3PARAM]),
+            ("www.dstest3.", [A, RRSIG]),
+        ],
+        salt,
+        0,
+    )
+
+    apex_nsec3 = [chain["dstest3."]]
+    emit("da3_apex_nodata", "dstest3.", "DS",
+         message("dstest3.", DS, [], apex_nsec3 + [sign(apex_nsec3, child3)]))
+
+    www_nsec3 = [chain["www.dstest3."]]
+    emit("da3_www_nodata", "www.dstest3.", "DS",
+         message("www.dstest3.", DS, [], www_nsec3 + [sign(www_nsec3, child3)]))
 
 
 if __name__ == "__main__":
