@@ -1341,6 +1341,32 @@ validate_denial :: proc(
 		return {status = .Indeterminate, reason = "chain of trust unavailable"}
 	}
 
+	/*
+	A DS denial from the very zone the DS is about.
+
+	`established` is what the walk down to `qname` actually reached, and for a
+	DS question it is the one part of this decision an attacker has no hand in.
+	Reaching `qname` itself means `zone_step` fetched the DS at that name and
+	checked it against the parent's keys - so an answer saying that DS does not
+	exist contradicts the work that made the answer readable at all. Every
+	record in it verifies, because they are the child's own and the child's keys
+	are the ones this walk went and got.
+
+	`nsec_proves_no_data` reads the same conclusion off the SOA bit, which is
+	the right test for the record in front of it and is not what this repeats.
+	That bit is the signer's to set: RFC 4470 lets a zone answer NODATA with an
+	NSEC minted for the question rather than one from its chain, and such a
+	record carries neither SOA nor NS, leaving both bit-map guards nothing to
+	read. Nothing sent by the other side is consulted here.
+
+	The root is the one name whose own zone may deny its DS, having no parent to
+	hold one - and `zone_trust` reaches the root from the trust anchor rather
+	than from a DS, so a denial there detaches nothing from anything.
+	*/
+	if qtype == .DS && qname != "." && qname != "" && dns.name_equal_fold(qname, established) {
+		return {status = .Bogus, reason = "ds denial from the zone itself"}
+	}
+
 	nsecs, nsec3s, proved, denial_spent := validated_denial_records(
 		v,
 		budget,

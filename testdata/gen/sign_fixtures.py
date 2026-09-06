@@ -673,6 +673,12 @@ def ds_denial_from_child_apex():
     root = Key(".", "dsapex-root")
     child = Key("dstest.", "dsapex-child")
     child3 = Key("dstest3.", "dsapex-child3")
+    # A third zone whose signer answers NODATA the way RFC 4470 allows, with an
+    # NSEC minted for the question rather than one taken from the chain. Its bit
+    # map holds only what that name really has to offer a validator, so neither
+    # SOA nor NS appears on it, and reading the record alone cannot tell which
+    # side of the cut it came from.
+    blind = Key("bltest.", "dsapex-blind")
 
     root_keys = [RR(".", DNSKEY, root.rdata)]
     print("// anchor: %s" % root.ds_text())
@@ -680,7 +686,7 @@ def ds_denial_from_child_apex():
 
     # The genuine delegations. These are what make each zone come back Secure,
     # so that the denial below is read against the child's own keys.
-    for tag, zone in (("da", child), ("da3", child3)):
+    for tag, zone in (("da", child), ("da3", child3), ("bl", blind)):
         ds_set = [RR(zone.zone, DS, zone.ds())]
         emit("%s_ds" % tag, zone.zone, "DS", message(zone.zone, DS, ds_set + [sign(ds_set, root)]))
         keys = [RR(zone.zone, DNSKEY, zone.rdata)]
@@ -718,6 +724,16 @@ def ds_denial_from_child_apex():
     www_nsec3 = [chain["www.dstest3."]]
     emit("da3_www_nodata", "www.dstest3.", "DS",
          message("www.dstest3.", DS, [], www_nsec3 + [sign(www_nsec3, child3)]))
+
+    # The minimally covering NSEC, at the apex of a zone that plainly has a DS.
+    # RFC 4470 puts the next name one step past the owner - `\000.bltest.` as a
+    # real zone would write it - but nothing here reads a span, because the
+    # record matches the owner exactly, so an ordinary name says the same thing
+    # without teaching this generator to escape a NUL. What matters is the bit
+    # map: no DS, and nothing else naming whose side of the cut this came from.
+    blind_nsec = [RR("bltest.", NSEC, nsec_rdata("a.bltest.", [RRSIG, NSEC]))]
+    emit("bl_apex_nodata", "bltest.", "DS",
+         message("bltest.", DS, [], blind_nsec + [sign(blind_nsec, blind)]))
 
 
 if __name__ == "__main__":

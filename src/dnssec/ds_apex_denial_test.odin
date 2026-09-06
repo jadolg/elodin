@@ -88,6 +88,26 @@ DA_FIXTURES := []Fixture{
 			"81ed36dda67421b987f4569a63066618dffa26092d69131e86f041adfed4fc118e70ab6272d6613d2140efdce806",
 	},
 	{
+		key   = "bl_ds",
+		name  = "bltest.",
+		type  = .DS,
+		rcode = 0,
+		wire  = "12348580000100020000000006626c7465737400002b000106626c7465737400002b000100000e10002428750f021e19" +
+			"29d2c51ca6065a3e8a75093a7dfc52abd4bc63a25f57e1a711fa5bdfdc4d06626c7465737400002e000100000e100053" +
+			"002b0f0100000e107d3b18206a4788207970000f1b24be5a4f4b1dc0572a24266593fdbed027f3d1125fea2a88fefd24" +
+			"93990b6051a326b04d71b430023a00a76597bb951adca8c2439876a298c84dbcc9fd0c",
+	},
+	{
+		key   = "bl_dnskey",
+		name  = "bltest.",
+		type  = .DNSKEY,
+		rcode = 0,
+		wire  = "12348580000100020000000006626c74657374000030000106626c74657374000030000100000e1000240101030f13c7" +
+			"7f51c78b8333fd853b85039723a938e362a3354af1ed00083b89a57a427706626c7465737400002e000100000e10005a" +
+			"00300f0100000e107d3b18206a478820287506626c74657374002c422a3855fb644d884b36778ab6dc8ae38b74636917" +
+			"9f2928ca99c63a7477d1b41fd87138b86d0f5158ed0c45b149a163db6feb884c701889d361caa8e43807",
+	},
+	{
 		key   = "da_apex_nodata",
 		name  = "dstest.",
 		type  = .DS,
@@ -130,6 +150,16 @@ DA_FIXTURES := []Fixture{
 			"746c6a6a6268076473746573743300002e000100000e10005b00320f0200000e107d3b18206a478820c9d90764737465" +
 			"73743300712ec0f32fdd7d46caf9aa05646b31b6c5b8411f0ccac80ed0a8c1930deea11bac35118b2b16460a4cd8ba2a" +
 			"088a07c5cb6c615b0c8591d4d0c444fa83511205",
+	},
+	{
+		key   = "bl_apex_nodata",
+		name  = "bltest.",
+		type  = .DS,
+		rcode = 0,
+		wire  = "12348580000100000002000006626c7465737400002b000106626c7465737400002f000100000e100012016106626c74" +
+			"65737400000600000000000306626c7465737400002e000100000e10005a002f0f0100000e107d3b18206a4788202875" +
+			"06626c7465737400ea6fa83f54677f32464f6f29ca4a3c0dbe19890bce16ab3d6c7eb35edc07e0eafdc02888694a86d9" +
+			"8c903ade3fe21d05593194720ca21e4325ac465083440a06",
 	},
 }
 
@@ -197,6 +227,41 @@ test_a_ds_denial_carried_by_the_childs_own_apex_nsec3_is_bogus :: proc(t: ^testi
 		t,
 		result.status == .Bogus,
 		"a zone's own apex NSEC3 cannot deny the DS its parent holds, got %v (%q)",
+		result.status,
+		result.reason,
+	)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_a_ds_denial_from_the_zone_itself_is_bogus_whatever_the_bit_map_says :: proc(t: ^testing.T) {
+	/*
+	The same attack from a signer that leaves nothing on the record to catch it
+	by.
+
+	RFC 4470 lets a zone answer NODATA with an NSEC minted for the question
+	instead of one taken from its chain, and a signer doing that has no reason
+	to put SOA or NS on it. `bltest.` publishes exactly that at its own apex:
+	no DS, no SOA, no NS. An attacker fetches it once with a harmless query and
+	replays it verbatim as the authority section of a NODATA answer to
+	`DS bltest.` - and both bit-map guards stand down, because there is nothing
+	in the bit map for them to read.
+
+	What settles it is not in the response at all. `zone_trust` walked down to
+	`bltest.` and established it, which for a DS question means `zone_step`
+	fetched the DS at that name and checked it against the parent's keys. A
+	denial of the DS that got us here contradicts the work that made the answer
+	readable, and no record an attacker can send changes that.
+
+	So this is the test for that check on its own: the bit-map guard cannot pass
+	it, and the unit tests in `nsec_unit_test` and `nsec3_unit_test` call the two
+	routines directly, so neither layer can quietly stand in for the other.
+	*/
+	result := da_validate("bl_apex_nodata", "bltest.")
+	testing.expectf(
+		t,
+		result.status == .Bogus,
+		"a zone cannot deny the DS this server followed to reach it, got %v (%q)",
 		result.status,
 		result.reason,
 	)
