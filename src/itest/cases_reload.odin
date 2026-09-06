@@ -196,6 +196,78 @@ run_reload_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	start_case(r, "tls reload: a connection held across the reload still negotiates ALPN")
+	{
+		/*
+		The listener's ALPN preference list is read by OpenSSL on every
+		handshake, out of memory the `SSL_CTX` points at. A connection takes its
+		reference to that context when it is accepted; the ClientHello that makes
+		the selection callback run arrives whenever the client chooses to send
+		it, deliberately outside the lock the reload holds. So a connection
+		opened before a SIGHUP and handshaken after it is where that list has to
+		still be there - and where, while it was freed along with the wrapper the
+		reload releases, the callback walked reclaimed heap and OpenSSL copied
+		what it found into the ServerHello.
+
+		Nothing on disk changes here: a reload rebuilds the context and releases
+		the displaced one whether or not the certificate is new, which is the
+		whole of what this case needs.
+		*/
+		socket, derr := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = dot_port})
+		if check(r, derr == nil, "cannot open a connection to the DoT port") {
+			held: ^tlsx.Conn
+			defer {
+				if held != nil {
+					tlsx.close(held)
+				} else {
+					net.close(socket)
+				}
+			}
+			_ = net.set_option(socket, .Receive_Timeout, CLIENT_TIMEOUT)
+			_ = net.set_option(socket, .Send_Timeout, CLIENT_TIMEOUT)
+
+			// A whole handshake on a second connection, to place the one above
+			// well inside the server. One accept loop serves this listener and
+			// spawns a thread per connection in the order they arrive, so a
+			// later connection completing a whole handshake says the earlier
+			// one's thread was started before it. What that does not order is
+			// that thread reaching `server_session`, which is where the
+			// reference to the current context is taken; what covers the rest
+			// is the reload being a maintenance-loop poll - 200ms - further
+			// away still.
+			check(
+				r,
+				dot_handshake_verifies(dot_port, cert_b, "reload-b.test"),
+				"the server stopped completing handshakes",
+			)
+
+			reloads := log_count(&srv, "reloaded the certificate")
+			if check(r, signal_reload(&srv), "could not deliver SIGHUP") &&
+			   check(
+					   r,
+					   wait_for_log_count(&srv, "reloaded the certificate", reloads + 1, 3 * time.Second),
+					   "the reload never completed",
+				   ) {
+				// Verification off: the certificate either side of this reload is
+				// the same one, and what is under test is the ALPN list.
+				ctx, cerr := tlsx.client_context(false, "", []string{"dot"}, context.temp_allocator)
+				if check(r, cerr == .None, "cannot build the client context") {
+					defer tlsx.context_destroy(ctx)
+					conn, terr := tlsx.client_connect(ctx, socket, "")
+					if check(r, terr == .None, "the handshake failed after the reload it was held across") {
+						held = conn
+						check(
+							r,
+							tlsx.alpn_protocol(conn) == "dot",
+							"the reloaded listener did not select the protocol it advertises",
+						)
+					}
+				}
+			}
+		}
+	}
+	end_case(r)
+
 	start_case(r, "tls reload: a bad certificate on disk leaves the working one in place")
 	{
 		// A truncated key: openssl will not load it, which is what a renewal

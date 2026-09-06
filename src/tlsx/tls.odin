@@ -1,6 +1,7 @@
 package tlsx
 
 import "core:c"
+import "core:c/libc"
 import "core:fmt"
 import "core:mem"
 import "core:net"
@@ -31,9 +32,6 @@ Context :: struct {
 	verify:    bool,
 	// Kept so the matching free uses the allocator the caller supplied.
 	allocator: mem.Allocator,
-	// ALPN protocol list, referenced by the selection callback for as long as
-	// the context lives.
-	alpn:      []u8,
 }
 
 /*
@@ -115,6 +113,7 @@ init_once: sync.Once
 @(private)
 do_init :: proc() {
 	OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, nil)
+	alpn_ex_index = CRYPTO_get_ex_new_index(CRYPTO_EX_INDEX_SSL_CTX, 0, nil, nil, nil, alpn_ex_free)
 }
 
 // Safe to call from any thread and any number of times.
@@ -193,27 +192,131 @@ handshake_error :: proc(ssl: ^SSL, ret: c.int) -> Error {
 }
 
 /*
-Encode ALPN protocol names into OpenSSL's wire format: each name prefixed by its
-one-byte length, all concatenated.
+Whether every name can be put on the wire as written.
+
+The length prefix is one byte, so a longer name would be announced as its own
+length modulo 256 and a different protocol would go out than the one that was
+configured. An empty name has no encoding at all - and on the server side it
+would also read as the terminator that ends `alpn_select`'s walk, cutting the
+preference list short at whatever came before it.
 */
 @(private)
-encode_alpn :: proc(protocols: []string, allocator := context.allocator) -> []u8 {
+alpn_encodable :: proc(protocols: []string) -> bool {
+	for p in protocols {
+		if len(p) == 0 || len(p) > 255 {
+			return false
+		}
+	}
+	return true
+}
+
+/*
+Encode ALPN protocol names into OpenSSL's wire format at the front of `dst`:
+each name prefixed by its one-byte length, all concatenated. Returns how many
+bytes were written. `dst` must have room for them; see `alpn_wire_size`.
+
+Every name must be one `alpn_encodable` accepts, which every caller checks
+first. Without that check this silently produces something other than what it
+was given: a name past 255 bytes is announced as its length modulo 256, and an
+empty one writes a zero into the middle of the list, which on the server side
+is the terminator `alpn_select` stops its walk at.
+*/
+@(private)
+encode_alpn_into :: proc(dst: []u8, protocols: []string) -> int {
+	n := 0
+	for p in protocols {
+		dst[n] = u8(len(p))
+		n += 1
+		copy(dst[n:], transmute([]u8)p)
+		n += len(p)
+	}
+	return n
+}
+
+@(private)
+alpn_wire_size :: proc(protocols: []string) -> int {
 	total := 0
 	for p in protocols {
 		total += 1 + len(p)
 	}
+	return total
+}
+
+// The same encoding into a fresh buffer, for the client side, where OpenSSL
+// copies the list for itself and no terminator is wanted. Same precondition:
+// the caller has already put the names past `alpn_encodable`.
+@(private)
+encode_alpn :: proc(protocols: []string, allocator := context.allocator) -> []u8 {
+	total := alpn_wire_size(protocols)
 	if total == 0 {
 		return nil
 	}
 	out := make([]u8, total, allocator)
-	n := 0
-	for p in protocols {
-		out[n] = u8(len(p))
-		n += 1
-		copy(out[n:], transmute([]u8)p)
-		n += len(p)
-	}
+	encode_alpn_into(out, protocols)
 	return out
+}
+
+/*
+Where a server context's ALPN preference list lives, and what releases it.
+
+The list has to outlive the `Context` that installed it. OpenSSL keeps the bare
+pointer on the `SSL_CTX` and `alpn_select` dereferences it on every handshake,
+while a certificate reload frees the `Context` the moment a replacement is in
+the listener's slot. The `SSL_CTX` survives that - it is reference counted, and
+every accepted connection holds one from `SSL_new` until it closes - so the
+buffer is handed to the `SSL_CTX` as well, through ex_data, and dies with the
+last reference rather than with the wrapper.
+
+Owning it any other way is what the reload showed to be wrong: a peer that
+connects and then stalls before its ClientHello decides when `alpn_select` runs,
+because the handshake is deliberately outside the reload's lock. Freeing with
+the `Context` therefore let a stalled handshake read the list back out of
+reclaimed memory - and OpenSSL copies whatever the callback names straight into
+the ServerHello.
+
+It is libc memory rather than Odin's because the free runs inside `SSL_CTX_free`
+on whichever thread drops the last reference, with no Odin context to reach an
+allocator through.
+*/
+@(private)
+alpn_ex_index: c.int = -1
+
+@(private)
+alpn_ex_free :: proc "c" (parent: rawptr, ptr: rawptr, ad: rawptr, idx: c.int, argl: c.long, argp: rawptr) {
+	// OpenSSL calls every registered index's free function for every SSL_CTX it
+	// frees, so a context that never installed a list arrives here with nil.
+	libc.free(ptr)
+}
+
+/*
+Encode `protocols` and give the result to `ptr` to own.
+
+The ex_data is attached before the callback is installed, so there is no moment
+where the `SSL_CTX` names a buffer nothing will free.
+*/
+@(private)
+install_alpn :: proc(ptr: ^SSL_CTX, protocols: []string) -> Error {
+	// -1 means `CRYPTO_get_ex_new_index` failed during `init`, which leaves no
+	// way to tie the buffer to the context; refusing beats installing a list
+	// with the old lifetime.
+	if alpn_ex_index < 0 || !alpn_encodable(protocols) {
+		return .Alpn_Failed
+	}
+	// One byte more than the names need: the trailing zero is what ends the
+	// walk in `alpn_select`.
+	total := alpn_wire_size(protocols) + 1
+	raw := libc.malloc(libc.size_t(total))
+	if raw == nil {
+		return .Alpn_Failed
+	}
+	wire := mem.byte_slice(raw, total)
+	wire[encode_alpn_into(wire, protocols)] = 0
+	if SSL_CTX_set_ex_data(ptr, alpn_ex_index, raw) != 1 {
+		libc.free(raw)
+		return .Alpn_Failed
+	}
+	SSL_CTX_set_alpn_select_cb(ptr, alpn_select, raw)
+	return .None
 }
 
 /*
@@ -260,6 +363,10 @@ client_context :: proc(
 	}
 
 	if len(alpn) > 0 {
+		if !alpn_encodable(alpn) {
+			SSL_CTX_free(ptr)
+			return nil, .Alpn_Failed
+		}
 		wire := encode_alpn(alpn, context.temp_allocator)
 		if SSL_CTX_set_alpn_protos(ptr, raw_data(wire), c.uint(len(wire))) != 0 {
 			SSL_CTX_free(ptr)
@@ -278,7 +385,9 @@ client_context :: proc(
 Pick a protocol, server preference first.
 
 `arg` points at our length-prefixed preference list, most preferred first, with
-a trailing zero byte marking the end. Choosing by *our* order rather than the
+a trailing zero byte marking the end. It belongs to the `SSL_CTX` this handshake
+holds a reference to (see `alpn_ex_index`), so it is still there however long
+the peer takes to send its ClientHello. Choosing by *our* order rather than the
 client's is what RFC 7301 recommends and is what lets a browser that offers
 "h2, http/1.1" be answered with h2.
 */
@@ -368,42 +477,38 @@ server_context :: proc(
 		return nil, .Certificate_Failed
 	}
 
+	if len(alpn_protocols) > 0 {
+		// Owned by the `SSL_CTX`, not by the wrapper below: the callback reads
+		// it on every handshake, including handshakes still running after a
+		// reload has released the wrapper. See `alpn_ex_index`.
+		if aerr := install_alpn(ptr, alpn_protocols); aerr != .None {
+			SSL_CTX_free(ptr)
+			return nil, aerr
+		}
+	}
+
 	ctx = new(Context, allocator)
 	ctx.ptr = ptr
 	ctx.is_server = true
 	ctx.allocator = allocator
-
-	if len(alpn_protocols) > 0 {
-		// The callback reads this on every handshake, so it has to outlive the
-		// call; it is released with the context. The trailing zero terminates
-		// the list.
-		total := 1
-		for p in alpn_protocols {
-			total += 1 + len(p)
-		}
-		wire := make([]u8, total, allocator)
-		n := 0
-		for p in alpn_protocols {
-			wire[n] = u8(len(p))
-			copy(wire[n + 1:], transmute([]u8)p)
-			n += 1 + len(p)
-		}
-		wire[n] = 0
-		ctx.alpn = wire
-		SSL_CTX_set_alpn_select_cb(ptr, alpn_select, raw_data(wire))
-	}
 	return ctx, .None
 }
 
+/*
+Drop this reference to the `SSL_CTX` and release the wrapper.
+
+Nothing else here has the wrapper's lifetime, which is the point: `SSL_CTX_free`
+is a reference count decrement, and a connection accepted before this call still
+holds one. Anything freed alongside it that a handshake can still reach would be
+freed too early - the ALPN preference list was, until it was given to the
+`SSL_CTX` instead.
+*/
 context_destroy :: proc(ctx: ^Context) {
 	if ctx == nil {
 		return
 	}
 	if ctx.ptr != nil {
 		SSL_CTX_free(ctx.ptr)
-	}
-	if ctx.alpn != nil {
-		delete(ctx.alpn, ctx.allocator)
 	}
 	free(ctx, ctx.allocator)
 }
