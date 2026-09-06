@@ -414,7 +414,9 @@ test_the_extended_rcode_is_not_a_way_past_the_guard :: proc(t: ^testing.T) {
 	msg, derr := dns.decode_message(flipped, context.temp_allocator)
 	testing.expect(t, derr == .None, "the flipped capture did not decode")
 
-	msg.additional = with_extended_rcode(msg.additional)
+	extended, has_opt := with_extended_rcode(msg.additional)
+	testing.expect(t, has_opt, "the capture should carry an OPT record")
+	msg.additional = extended
 	wire, _, err := dns.encode_message(msg, context.temp_allocator)
 	testing.expect(t, err == .None, "the re-encoded message did not encode")
 
@@ -428,7 +430,7 @@ test_the_extended_rcode_is_not_a_way_past_the_guard :: proc(t: ^testing.T) {
 	res := validate(v, "www.example.com.", .A, wire, rc_now())
 	testing.expectf(
 		t,
-		res.status == .Bogus,
+		res.status == .Indeterminate,
 		"an extended rcode carried the flipped header past the guard as %v (%q)",
 		res.status,
 		res.reason,
@@ -476,7 +478,9 @@ test_a_forgery_does_not_hide_behind_an_extended_rcode :: proc(t: ^testing.T) {
 	testing.expect_value(t, validate(v, "www.example.com.", .A, plain, rc_now()).status, Status.Bogus)
 
 	// One bit in the OPT's top byte, and the header's own nibble left at 0.
-	msg.additional = with_extended_rcode(msg.additional)
+	extended, has_opt := with_extended_rcode(msg.additional)
+	testing.expect(t, has_opt, "the capture should carry an OPT record")
+	msg.additional = extended
 	wire, _, err := dns.encode_message(msg, context.temp_allocator)
 	testing.expect(t, err == .None, "the re-encoded forgery did not encode")
 
@@ -488,7 +492,7 @@ test_a_forgery_does_not_hide_behind_an_extended_rcode :: proc(t: ^testing.T) {
 	res := validate(v, "www.example.com.", .A, wire, rc_now())
 	testing.expectf(
 		t,
-		res.status == .Bogus,
+		res.status == .Indeterminate,
 		"an extended rcode carried a forged answer past the validator as %v (%q)",
 		res.status,
 		res.reason,
@@ -497,23 +501,75 @@ test_a_forgery_does_not_hide_behind_an_extended_rcode :: proc(t: ^testing.T) {
 }
 
 /*
-And a real BADVERS is still not a forgery.
+And stripping the answer section instead is the same attack, so telling the two
+apart by what is in the message cannot work.
 
-This is the half of the pair that says what the refusal above is allowed to
-cost. An extended rcode is not a variant of the ordinary ones: the two a
-responder sends to a query are BADVERS (16) and BADCOOKIE (23), and both say it
-declined to answer before looking anything up - so both carry a question and an
-OPT and nothing else. That empty answer section is the whole of what separates
-one from a rewritten header, since BADVERS leaves the nibble at 0 exactly as the
-attack above does.
-
-Reporting one as a forgery is what `answerable_rcode` exists to avoid, and the
-first attempt at that guard got this wrong in a way that only a realistic
-BADVERS catches: written against a capture whose answer section was still full,
-the test passed while pinning the attack shape itself as acceptable.
+The obvious narrowing - excuse an extended rcode only where the response
+answered nothing - is what this pins as insufficient, and it is worth having the
+reason written down because it reads like a safe one. A responder sending
+BADVERS or BADCOOKIE has not answered, so it sends a question and an OPT and
+nothing else. An attacker after a *NODATA* sends exactly that too: NOERROR with
+an empty answer section is "that name has no such record" to everything that
+reads it, and for the DANE lookup in #271 it is the same downgrade as the name
+error - "no TLSA record here", fall back to opportunistic TLS. The two are the
+same bytes, so the sections cannot separate them and neither is forwarded.
 */
 @(test)
-test_badvers_is_still_not_a_forgery :: proc(t: ^testing.T) {
+test_a_forged_nodata_does_not_hide_behind_an_extended_rcode :: proc(t: ^testing.T) {
+	v := make_validator(rc_query, nil, Options{})
+	defer destroy_validator(v)
+
+	msg, derr := dns.decode_message(rc_unhex(rc_fixture("example_a").wire), context.temp_allocator)
+	testing.expect(t, derr == .None, "the capture did not decode")
+	// Everything the zone signed, taken out. What is left says the name has no
+	// A record, and says it for a name whose A record the attacker just deleted.
+	msg.answer = nil
+	msg.authority = nil
+
+	bare, _, berr := dns.encode_message(msg, context.temp_allocator)
+	testing.expect(t, berr == .None, "the stripped message did not encode")
+	// Refused on its own: `validate_denial` asks for a proof and finds none.
+	testing.expect_value(t, validate(v, "www.example.com.", .A, bare, rc_now()).status, Status.Bogus)
+
+	extended, has_opt := with_extended_rcode(msg.additional)
+	testing.expect(t, has_opt, "the capture should carry an OPT record")
+	msg.additional = extended
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	testing.expect(t, err == .None, "the re-encoded message did not encode")
+
+	res := validate(v, "www.example.com.", .A, wire, rc_now())
+	testing.expectf(
+		t,
+		res.status != .Insecure,
+		"an extended rcode carried a forged NODATA past the validator as %v (%q); the client reads NOERROR with an empty answer",
+		res.status,
+		res.reason,
+	)
+	free_all(context.temp_allocator)
+}
+
+/*
+And a real BADVERS is refused without being called a forgery.
+
+This is the half of the pair that says what the refusals above are allowed to
+cost, and the distinction it draws is the one worth keeping. A BADVERS is
+indistinguishable on the wire from the forged NODATA above, so it is refused
+too - but `Indeterminate` rather than `Bogus`, which is this server saying it
+established nothing rather than accusing anyone. The client gets SERVFAIL either
+way; the extended error is `NO_REACHABLE_AUTHORITY` rather than `DNSSEC_BOGUS`,
+and the operator reading the log is not sent looking for an attacker.
+
+Refusing costs a real one nothing it had. `rcode_of` reads twelve bits and every
+client reads four, so forwarding a BADVERS hands the client NOERROR with an
+empty answer - a NODATA it never sent. What this replaces is a silently wrong
+answer, not a working one.
+
+An earlier turn of this guard got the pair backwards, and only a realistic
+BADVERS catches that: written against a capture whose answer section was still
+full, the test passed while pinning the attack shape itself as acceptable.
+*/
+@(test)
+test_badvers_is_refused_without_being_called_a_forgery :: proc(t: ^testing.T) {
 	v := make_validator(rc_query, nil, Options{})
 	defer destroy_validator(v)
 
@@ -523,7 +579,9 @@ test_badvers_is_still_not_a_forgery :: proc(t: ^testing.T) {
 	msg.flags.qr = true
 	// What an upstream that cannot do the EDNS version we asked for sends back:
 	// the question, an OPT, and nothing it looked up (RFC 6891 section 6.1.3).
-	msg.additional = with_extended_rcode([]dns.Record{dns.make_opt(4096, true)})
+	opt, has_opt := with_extended_rcode([]dns.Record{dns.make_opt(4096, true)})
+	testing.expect(t, has_opt, "the BADVERS should carry an OPT record")
+	msg.additional = opt
 
 	wire, _, err := dns.encode_message(msg, context.temp_allocator)
 	testing.expect(t, err == .None, "the BADVERS did not encode")
@@ -533,7 +591,8 @@ test_badvers_is_still_not_a_forgery :: proc(t: ^testing.T) {
 	testing.expect_value(t, dns.rcode_of(decoded), dns.Rcode.Bad_Vers)
 
 	res := validate(v, "www.example.com.", .A, wire, rc_now())
-	testing.expectf(t, res.status == .Insecure, "a BADVERS was called %v (%q)", res.status, res.reason)
+	testing.expectf(t, res.status == .Indeterminate, "a BADVERS was called %v (%q)", res.status, res.reason)
+	testing.expect(t, res.status != .Bogus, "an EDNS version mismatch was reported as a forgery")
 	free_all(context.temp_allocator)
 }
 
@@ -541,14 +600,19 @@ test_badvers_is_still_not_a_forgery :: proc(t: ^testing.T) {
 // 6891 section 6.1.3). Setting the lowest of them is BADVERS on its own, and
 // what an attacker adds to a rewritten header.
 @(private = "file")
-with_extended_rcode :: proc(additional: []dns.Record) -> []dns.Record {
-	out := make([dynamic]dns.Record, 0, len(additional), context.temp_allocator)
+with_extended_rcode :: proc(additional: []dns.Record) -> (out: []dns.Record, ok: bool) {
+	records := make([dynamic]dns.Record, 0, len(additional), context.temp_allocator)
+	found := false
 	for rec in additional {
 		r := rec
 		if r.type == .OPT {
 			r.ttl |= 0x01000000
+			found = true
 		}
-		append(&out, r)
+		append(&records, r)
 	}
-	return out[:]
+	// Without an OPT there is nowhere for the upper bits to go, and a caller
+	// handed the message back unchanged would assert about the ordinary path
+	// while believing it had reached this one. Every caller checks.
+	return records[:], found
 }

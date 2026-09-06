@@ -477,30 +477,38 @@ validate :: proc(
 	was `Insecure` with one byte set, forwarded, and believed. Neither costs the
 	attacker a forgery they did not already have to make.
 
-	Which of the two is safe to refuse turns on what an extended rcode means. It
-	is not a variant of the rcodes above; the ones a responder can send to a
-	query are BADVERS (16, RFC 6891 section 6.1.3) and BADCOOKIE (23, RFC 7873
-	section 5.3), the rest being TSIG and TKEY codes that never appear on one.
-	Both say the responder declined to answer *before* looking anything up, so
-	both carry a question and an OPT and nothing else - which is what separates
-	them from a rewritten header. BADCOOKIE's nibble is 7 and reaches neither
-	test; BADVERS's is 0, so the answer-and-authority test is what keeps a real
-	one out of this - asserted in `test_badvers_is_still_not_a_forgery` rather
-	than assumed, because the whole of that path exists to stop an EDNS mismatch
-	being reported as a forgery.
+	Trying to tell a rewritten header from a real extended rcode by what else is
+	in the message does not work, and the attempt is worth writing down because
+	it looks like it should. A responder sending BADVERS or BADCOOKIE has not
+	answered, so it sends a question and an OPT and nothing else - and so does
+	an attacker who wants a NODATA, since NOERROR with an empty answer section
+	*is* "that name has no such record" to everything that reads it. The two are
+	the same bytes. Testing the sections only moves the attacker from the forged
+	positive answer to the forged NODATA, which for a DANE or MTA-STS lookup is
+	the same downgrade.
 
-	`cache.put` fails closed on the composed rcode either way, so nothing of
-	either shape was ever kept; what is closed here is what reached the client
-	that asked.
+	So neither is forwarded. An extended rcode under a header the client will
+	read as an answer or a denial is one this server cannot reason about and
+	must not pass on, whichever of the two produced it, and the honest report is
+	that nothing was established: `Indeterminate`, which is SERVFAIL to the
+	client and `NO_REACHABLE_AUTHORITY` in the extended error rather than
+	`DNSSEC_BOGUS`. That is the part of "an upstream error is not a forgery"
+	worth keeping, and it is what `test_badvers_is_refused_without_being_called_
+	a_forgery` pins. Refusing costs a real BADVERS nothing it had: forwarded, it
+	reaches the client as NOERROR with an empty answer, so what this replaces is
+	not a working answer but a silently wrong one.
+
+	Only where the nibble reads as an answer. BADCOOKIE's is 7, which a client
+	reads as YXRRSET and acts on as the error it is, and the upstream layer
+	handles it long before this - so nothing here disturbs it.
+
+	`cache.put` fails closed on the composed rcode either way, so none of these
+	shapes was ever kept; what is closed here is what reached the client.
 	*/
 	if !answerable_rcode(msg) {
-		if u16(dns.rcode_of(msg)) > 0xf {
-			if dns.Rcode(msg.flags.rcode) == .NX_Domain {
-				return {status = .Bogus, reason = "extended rcode contradicts the header's denial"}
-			}
-			if len(msg.answer) > 0 || len(msg.authority) > 0 {
-				return {status = .Bogus, reason = "extended rcode over an answered response"}
-			}
+		nibble := dns.Rcode(msg.flags.rcode)
+		if u16(dns.rcode_of(msg)) > 0xf && (nibble == .No_Error || nibble == .NX_Domain) {
+			return {status = .Indeterminate, reason = "extended rcode under an answerable header"}
 		}
 		return {status = .Insecure, reason = "no data to authenticate"}
 	}

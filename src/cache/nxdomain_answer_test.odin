@@ -133,6 +133,101 @@ test_nxdomain_over_the_cname_that_was_asked_for_is_not_cached :: proc(t: ^testin
 	free_all(context.temp_allocator)
 }
 
+/*
+A signature is not the answer to a question about signatures.
+
+The exemption above is about a redirection standing where the answer should be,
+and only two record types can be one. An RRSIG is not data at any name (RFC 4035
+section 2.2): it rides on the record it covers, and the record it covers here is
+the CNAME. So `dig RRSIG` at a name that is a CNAME gets the everyday
+NXDOMAIN-after-a-CNAME with its own signature attached - the shape RFC 2308
+section 2.1 allows - and reading the RRSIG as "the type that was asked for"
+would refuse to remember any of them, sending every repeat of that question back
+to the upstream.
+*/
+@(test)
+test_nxdomain_after_a_cname_is_cached_for_an_rrsig_question :: proc(t: ^testing.T) {
+	c := make_cache(Options{max_entries = 8, max_ttl = 3600, negative_ttl = 300})
+	defer destroy(c)
+
+	answer := make([]dns.Record, 2, context.temp_allocator)
+	answer[0] = dns.Record {
+		name  = "www.example.com.",
+		type  = .CNAME,
+		class = .IN,
+		ttl   = 300,
+		data  = dns.Rdata_Name{name = "target.example.net."},
+	}
+	// The signature's bytes are never read here - what matters is a record of
+	// type RRSIG sitting at the name that was asked about.
+	answer[1] = dns.Record {
+		name  = "www.example.com.",
+		type  = .RRSIG,
+		class = .IN,
+		ttl   = 300,
+		data  = dns.Rdata_Raw{data = make([]u8, 24, context.temp_allocator)},
+	}
+	m := dns.Message {
+		id       = 0x3334,
+		question = []dns.Question{{name = "www.example.com.", type = .RRSIG, class = .IN}},
+		answer   = answer,
+	}
+	m.flags.qr = true
+	m.flags.ra = true
+	m.flags.rcode = u8(dns.Rcode.NX_Domain)
+	wire, _, err := dns.encode_message(m, context.temp_allocator)
+	testing.expect(t, err == .None, "the test nxdomain did not encode")
+	msg, derr := dns.decode_message(wire, context.temp_allocator)
+	testing.expect(t, derr == .None, "the test nxdomain did not decode")
+
+	kb: [KEY_MAX]u8
+	key := make_key(kb[:], "www.example.com.", .RRSIG, .IN, false)
+	testing.expect(t, put(c, key, wire, msg), "an NXDOMAIN after a signed CNAME should still be cached")
+	testing.expect_value(t, len_entries(c), 1)
+	free_all(context.temp_allocator)
+}
+
+/*
+And a redirection reached from somewhere else is not the answer either.
+
+The DNAME that covers `a.sub.example.com.` sits at `sub.example.com.`, an
+ancestor of the name asked about, so a `QTYPE=DNAME` question under a DNAME is
+the ordinary redirection shape and not a contradiction. Comparing the type alone
+would cost the entry for every one of them.
+*/
+@(test)
+test_nxdomain_over_a_dname_above_the_queried_name_is_cached :: proc(t: ^testing.T) {
+	c := make_cache(Options{max_entries = 8, max_ttl = 3600, negative_ttl = 300})
+	defer destroy(c)
+
+	answer := make([]dns.Record, 1, context.temp_allocator)
+	answer[0] = dns.Record {
+		name  = "sub.example.com.",
+		type  = .DNAME,
+		class = .IN,
+		ttl   = 300,
+		data  = dns.Rdata_Name{name = "elsewhere.example.net."},
+	}
+	m := dns.Message {
+		id       = 0x3335,
+		question = []dns.Question{{name = "a.sub.example.com.", type = .DNAME, class = .IN}},
+		answer   = answer,
+	}
+	m.flags.qr = true
+	m.flags.ra = true
+	m.flags.rcode = u8(dns.Rcode.NX_Domain)
+	wire, _, err := dns.encode_message(m, context.temp_allocator)
+	testing.expect(t, err == .None, "the test nxdomain did not encode")
+	msg, derr := dns.decode_message(wire, context.temp_allocator)
+	testing.expect(t, derr == .None, "the test nxdomain did not decode")
+
+	kb: [KEY_MAX]u8
+	key := make_key(kb[:], "a.sub.example.com.", .DNAME, .IN, false)
+	testing.expect(t, put(c, key, wire, msg), "an NXDOMAIN under a DNAME should still be cached")
+	testing.expect_value(t, len_entries(c), 1)
+	free_all(context.temp_allocator)
+}
+
 @(private = "file")
 key_for_nx :: proc(buf: []u8, name: string) -> string {
 	return make_key(buf, name, .A, .IN, false)
