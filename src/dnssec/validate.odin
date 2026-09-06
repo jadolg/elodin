@@ -1211,6 +1211,49 @@ validate_answer :: proc(
 	}
 
 	/*
+	NXDOMAIN over a record this path just authenticated is the sender
+	contradicting the zone, and the zone wins.
+
+	The shape above was settled from signed data; the rcode is the one part of
+	the message no signature covers, and the header is a byte an attacker on a
+	plain UDP or TCP leg can rewrite without touching an RRset. Left alone, a
+	genuine signed answer with one nibble changed came out of here `Secure` -
+	the RRsets are the zone's own and verify perfectly - and the AD bit went out
+	over an authenticated denial for a name whose signed records were sitting in
+	the answer section. Clients decide on the rcode before they read that
+	section (glibc's `res_query` returns HOST_NOT_FOUND, Go's `checkHeader`
+	returns `errNoSuchHost`), so the records were there and nobody looked, and a
+	fail-closed DANE or MTA-STS lookup that would have deferred on a Bogus
+	answer instead proceeded without the record it was checking for. RFC 4035
+	section 5.3 lets a validator authenticate RRsets, not a header claim that
+	contradicts them.
+
+	`Bogus` rather than a correction to NOERROR. Which of the two the sender
+	meant is not knowable from here, and rewriting the header would hand the
+	client an answer this server invented; the honest report is that the message
+	does not hold together. It is what the attacker already had - the response
+	is refused, SERVFAIL - so setting the rcode buys them nothing, and leaving
+	it alone is the case above.
+
+	Read against the shape, never to pick it. `ad_scope_test.odin` records the
+	objection to deciding a path from the rcode: the sender chooses what records
+	to send, so a path chosen from the header can be steered by adding or
+	removing them. Nothing here is chosen from the header - `shape` came from
+	the signed records alone - and adding or removing records can only move it
+	between `.Direct`, `.Chain_Only` and `.None`, each of which is already
+	answered on its own terms.
+
+	`.Direct` only. A chain that stopped short is the ordinary NXDOMAIN-after-a-
+	CNAME shape, where the rcode speaks for the *target's* zone rather than for
+	anything in this answer section, and it is handled below by the
+	`denial_claimed` branch - which is `Insecure` because the proof lives at a
+	zone this path never walked to, not because the message contradicts itself.
+	*/
+	if worst == .Secure && shape == .Direct && dns.rcode_of(msg) == .NX_Domain {
+		return {status = .Bogus, reason = "rcode contradicts the authenticated answer"}
+	}
+
+	/*
 	A wildcard answer is only good if the name really had nothing of its own.
 	Without this an attacker holding one wildcard signature could serve it for
 	names the zone answers for directly.

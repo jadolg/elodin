@@ -522,6 +522,43 @@ put :: proc(c: ^Cache, key: string, wire: []u8, msg: dns.Message, checked: u64 =
 		return false
 	}
 
+	/*
+	An NXDOMAIN whose answer section holds data is not an answer to remember.
+
+	RFC 2308 section 2.1 lets a name error carry CNAME records and nothing else:
+	the rcode speaks for the last name in the chain, and any other record type
+	sitting there is the header contradicting the section beneath it. A
+	well-behaved server does not send one.
+
+	What sends one is an attacker. Take a zone's own signed answer - the TLSA
+	record for a mail host, say - rewrite the low nibble of byte 3, and the
+	records and their signatures are untouched and still verify. `validate_answer`
+	refuses that outright now, which is where the harm is actually closed; this
+	is the same shape stopped one layer further out, on the paths no validator
+	runs on. Cached, it is far worse than forwarded: the negative branch below
+	reads the lifetime from an SOA, a positive answer never carried one, and the
+	fallback is `negative_ttl` - five minutes by default of every client asking
+	that question being told the name does not exist, from one packet.
+
+	Refused rather than repaired. Which half of the contradiction the sender
+	meant is not knowable here, and the entry has to be one or the other to be
+	given a lifetime at all. The response still reaches the client that caused
+	the fetch; what it does not do is outlive it.
+	*/
+	if rcode == .NX_Domain {
+		for rec in msg.answer {
+			#partial switch rec.type {
+			// A DNAME and the CNAME it synthesizes are the redirection
+			// itself (RFC 6672 section 3.4.1), an RRSIG rides on whatever
+			// it covers, and an OPT is transport with no owner name at all.
+			// None of them is data at the name being denied.
+			case .CNAME, .DNAME, .RRSIG, .OPT:
+			case:
+				return false
+			}
+		}
+	}
+
 	offsets, scan_ok := dns.scan_ttl_offsets(wire, c.allocator)
 	if !scan_ok {
 		return false

@@ -694,6 +694,7 @@ run_cache_cases :: proc(r: ^Runner) {
 	mock := mock_make("cache", upstream_port)
 	mock_reply(mock, fix.qname, fix.qtype, from_hex(fix.response, context.allocator))
 	mock_reply(mock, "nx.example.com.", u16(dns.Type.A), nil)
+	mock_reply(mock, POISONED_NAME, u16(dns.Type.A), nxdomain_with_data(POISONED_NAME))
 	// Any other question (the AAAA case below) gets a matching synthesised
 	// answer rather than a canned one for the wrong name.
 	mock_synth_all(mock, {203, 0, 113, 2})
@@ -806,6 +807,75 @@ blocking: {{ enabled: false }}
 		check(r, mock_total(mock) >= 1, "an AAAA query was answered from the A entry")
 	}
 	end_case(r)
+
+	start_case(r, "cache: an NXDOMAIN carrying data is not remembered")
+	{
+		/*
+		The shape an attacker makes out of a genuine answer by rewriting the
+		low nibble of byte 3 of the header: the records and their signatures
+		are untouched, only the rcode says the name is not there. RFC 2308
+		section 2.1 lets a name error carry CNAMEs and nothing else, so this
+		is a response contradicting itself.
+
+		`src/dnssec` refuses it outright where validation is on. This case is
+		the layer under that - validation is off here, as it is for every
+		case in this file - and what it asserts is the part that decides how
+		far one packet reaches: the negative lifetime comes from an SOA, a
+		positive answer never carried one, so the fallback is `negative_ttl`
+		and a single spoofed datagram would otherwise take the name away from
+		every client for a minute. Asked twice, the upstream has to hear both.
+		*/
+		mock_reset_counts(mock)
+		first := query_udp(udp_port, build_query(POISONED_NAME, u16(dns.Type.A), id = 10))
+		if check(r, first.ok, "no response to the first query") {
+			count_after_first := mock_total(mock)
+			second := query_udp(udp_port, build_query(POISONED_NAME, u16(dns.Type.A), id = 11))
+			if check(r, second.ok, "no response to the second query") {
+				check(
+					r,
+					mock_total(mock) > count_after_first,
+					"an NXDOMAIN holding an A record was served from the cache",
+				)
+			}
+		}
+	}
+	end_case(r)
+}
+
+// A name error whose answer section holds the record it denies. Nothing sends
+// this but an attacker; see the case that uses it.
+@(private = "file")
+POISONED_NAME :: "poisoned.example.com."
+
+/*
+The canned reply for it, built once and left on the heap.
+
+The mock keeps the slice for the whole run and `end_case` empties the temp arena
+long before the case that asks for it, which is why every other canned payload
+in the suite is allocated the same way.
+*/
+@(private = "file")
+nxdomain_with_data :: proc(name: string) -> []u8 {
+	answer := make([]dns.Record, 1, context.temp_allocator)
+	answer[0] = dns.Record {
+		name  = name,
+		type  = .A,
+		class = .IN,
+		ttl   = 300,
+		data  = dns.Rdata_A{addr = {203, 0, 113, 9}},
+	}
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question{name = name, type = .A, class = .IN}
+	msg := dns.Message{question = question, answer = answer}
+	msg.flags.qr = true
+	msg.flags.rd = true
+	msg.flags.ra = true
+	msg.flags.rcode = u8(dns.Rcode.NX_Domain)
+	wire, _, err := dns.encode_message(msg, context.allocator)
+	if err != .None {
+		return nil
+	}
+	return wire
 }
 
 // An answer with `records` A records under one owner name: the shape of a
