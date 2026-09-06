@@ -697,7 +697,10 @@ it holds, and validates nothing behind them.
 
 The built-in root anchors are the case that matters: both name RSA/SHA-256, so
 a host whose policy took that one algorithm away would leave this server with
-no way into the DNS at all, whatever else it could still verify.
+no way into the DNS at all, whatever else it could still verify. And the zone
+has to be asked about, not just the algorithm: `zone_trust` starts every chain
+at the root and reaches every other zone through its parent's DS, so an anchor
+for a zone below it - usable or not - seeds nothing.
 */
 @(test)
 test_an_anchor_the_library_cannot_follow_is_not_usable :: proc(t: ^testing.T) {
@@ -708,27 +711,44 @@ test_an_anchor_the_library_cannot_follow_is_not_usable :: proc(t: ^testing.T) {
 	before := sync.atomic_load(&refused_algorithms)
 	defer sync.atomic_store(&refused_algorithms, before)
 
-	testing.expect(t, usable_anchor(root_anchors()), "the built-in root anchors are followable on this build")
+	testing.expect(t, usable_anchor(root_anchors(), "."), "the built-in root anchors are followable on this build")
 
 	// One algorithm gone, and it is the only one the root anchors name.
 	sync.atomic_or(&refused_algorithms, algorithm_bit(ALG_RSASHA256))
 	testing.expect(
 		t,
-		!usable_anchor(root_anchors()),
+		!usable_anchor(root_anchors(), "."),
 		"refusing RSA/SHA-256 leaves the root anchors naming nothing this build can check",
 	)
 	testing.expect(t, algorithm_supported(ALG_ED25519), "while other algorithms carry on running")
 
-	// An anchor set is usable when any one of its anchors is.
+	// A zone's anchor set is usable when any one of its anchors is.
 	mixed := []Trust_Anchor {
 		{zone = ".", ds = {key_tag = 1, algorithm = ALG_RSASHA256, digest_type = DIGEST_SHA256}},
 		{zone = ".", ds = {key_tag = 2, algorithm = ALG_ED25519, digest_type = DIGEST_SHA256}},
 	}
-	testing.expect(t, usable_anchor(mixed), "one anchor left is one way into the chain")
-	testing.expect(t, !usable_anchor(nil), "and no anchors at all is no way in")
+	testing.expect(t, usable_anchor(mixed, "."), "one anchor left is one way into the chain")
+	testing.expect(t, !usable_anchor(nil, "."), "and no anchors at all is no way in")
+
+	/*
+	The finding this test exists for. An anchor below the root is never
+	consulted - `zone_keys` is asked for `.` and nothing else - so a followable
+	one cannot stand in for a root anchor that is not, and a set of them is not
+	a validator that validates anything.
+	*/
+	below := []Trust_Anchor {
+		{zone = ".", ds = {key_tag = 1, algorithm = ALG_RSASHA256, digest_type = DIGEST_SHA256}},
+		{zone = "corp.example.", ds = {key_tag = 2, algorithm = ALG_ED25519, digest_type = DIGEST_SHA256}},
+	}
+	testing.expect(t, !usable_anchor(below, "."), "an Ed25519 anchor below the root does not seed the root")
+	testing.expect(t, anchors_the_root(below), "the root is anchored here, just not followably")
+
+	only_below := below[1:]
+	testing.expect(t, !usable_anchor(only_below, "."), "and a set with no root anchor seeds nothing at all")
+	testing.expect(t, !anchors_the_root(only_below), "which is a different thing to tell an operator")
 
 	// A digest the build does not compute takes its anchor with it, algorithm
 	// or no algorithm.
 	gost := []Trust_Anchor{{zone = ".", ds = {key_tag = 3, algorithm = ALG_ED25519, digest_type = 3}}}
-	testing.expect(t, !usable_anchor(gost), "an anchor is only as followable as its digest")
+	testing.expect(t, !usable_anchor(gost, "."), "an anchor is only as followable as its digest")
 }

@@ -42,23 +42,39 @@ root_anchors :: proc() -> []Trust_Anchor {
 }
 
 /*
-Is there an anchor here this build can start a chain from?
+Is there an anchor for `zone` here that this build can follow?
 
 An anchor names an algorithm and a digest, and `fetch_keys` can only follow one
-it can check - so a set with none of them left after `probe_algorithms` anchors
-nothing. The zone it names is then an insecure delegation the moment it is
-asked about, and for the root anchors that is the whole DNS: a server that
-would validate not one answer while reporting how many anchors it holds.
-`start_validator` refuses to start on it.
+it can check - so a zone whose every anchor names something `probe_algorithms`
+dropped has no anchor at all, and is an insecure delegation the moment it is
+asked about.
 
-One usable anchor is enough to start, which for an operator who has anchored
-several zones means the ones whose anchor did not survive are insecure - as
-they would be on any resolver that cannot check their algorithm, and as the
-start-up warning from the probe says.
+Asked about `.` and only `.` by the one caller that matters. Every chain here
+starts at the root - `zone_trust` opens with `zone_keys(v, budget, ".")` and
+reaches every other zone through its parent's DS - so the root anchor is the
+one that decides whether anything is validated, and an anchor set that cannot
+seed the root seeds nothing whatever else is in it. A caller wanting to know
+about some other zone gets an honest answer about the anchors, but this
+validator will not consult them.
 */
-usable_anchor :: proc(anchors: []Trust_Anchor) -> bool {
+usable_anchor :: proc(anchors: []Trust_Anchor, zone: string) -> bool {
 	for anchor in anchors {
+		if !dns.name_equal_fold(anchor.zone, zone) {
+			continue
+		}
 		if algorithm_supported(anchor.ds.algorithm) && digest_supported(anchor.ds.digest_type) {
+			return true
+		}
+	}
+	return false
+}
+
+// Is any of this set an anchor for the root at all, followable or not? What
+// separates "the crypto policy took the root anchor away" from "nobody
+// anchored the root", which are different things to tell an operator.
+anchors_the_root :: proc(anchors: []Trust_Anchor) -> bool {
+	for anchor in anchors {
+		if dns.name_equal_fold(anchor.zone, ".") {
 			return true
 		}
 	}

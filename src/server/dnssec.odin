@@ -85,16 +85,26 @@ start_validator :: proc(s: ^Server) -> bool {
 	/*
 	And refused to start on, for the reason an anchor that will not parse is: an
 	anchor naming an algorithm the library will not run anchors nothing, so the
-	zone it covers is an insecure delegation the moment it is asked about - the
-	root anchors being the whole DNS. The server would come up, report how many
-	anchors it is validating against, and validate not one answer: no AD bit
-	anywhere and no SERVFAIL either, which is the failure a validating resolver
-	exists to not have. An operator who does want unvalidated answers has
-	`dnssec.enabled: false` to ask for them with.
+	zone it covers is an insecure delegation the moment it is asked about.
+
+	The root is the zone that decides. Every chain starts there - `zone_trust`
+	asks for the root's keys and walks down through DS records - so a set that
+	cannot seed the root seeds nothing, whatever else is in it. Without the
+	check the server comes up, reports how many anchors it is validating
+	against, and validates not one answer: no AD bit anywhere and no SERVFAIL
+	either, which is the failure a validating resolver exists to not have. An
+	operator who does want unvalidated answers has `dnssec.enabled: false` to
+	ask for them with.
 	*/
-	if !dnssec.usable_anchor(anchors if len(anchors) > 0 else dnssec.root_anchors()) {
-		logx.errorf("dnssec: no trust anchor names an algorithm and digest this build can check")
-		logx.errorf("dnssec: nothing would be validated; check the host crypto policy, or set dnssec.enabled: false")
+	in_use := anchors if len(anchors) > 0 else dnssec.root_anchors()
+	if !dnssec.usable_anchor(in_use, ".") {
+		if dnssec.anchors_the_root(in_use) {
+			logx.errorf("dnssec: no trust anchor for the root names an algorithm and digest this build can check")
+			logx.errorf("dnssec: nothing would be validated; check the host crypto policy, or set dnssec.enabled: false")
+		} else {
+			logx.errorf("dnssec: no trust anchor covers the root, which is where every chain of trust starts")
+			logx.errorf("dnssec: every name would fail to validate; anchor `.` as well, or set dnssec.enabled: false")
+		}
 		// The validator is still nil, and `destroy_validator` takes that; what
 		// this is here for is the anchors parsed above, which the refusal to
 		// start would otherwise leave behind.

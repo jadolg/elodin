@@ -284,12 +284,29 @@ run_probe :: proc() {
 
 	algorithms: u32
 	for probe in ALGORITHM_PROBES {
-		key, key_ok := decode_hex(probe.key, scratch)
-		signature, sig_ok := decode_hex(probe.signature, scratch)
-		data, data_ok := decode_hex(PROBE_DATA, scratch)
-		ran := key_ok && sig_ok && data_ok
-		if ran {
-			ran = verify_now(probe.algorithm, key, signature, data, scratch) == .Ok
+		/*
+		Twice before believing a failure.
+
+		`verify_now` has nowhere to put a resource failure but `.Refused` - a
+		context it could not allocate comes back the same way a policy refusal
+		does (crypto.odin) - and this table is built once and never rebuilt, so
+		one unlucky allocation at start-up would take an algorithm away for the
+		life of the process while the warning below blamed the host. A policy
+		refusal is a decision and repeats; an allocation that failed once has no
+		reason to.
+		*/
+		ran := false
+		for _ in 0 ..< 2 {
+			key, key_ok := decode_hex(probe.key, scratch)
+			signature, sig_ok := decode_hex(probe.signature, scratch)
+			data, data_ok := decode_hex(PROBE_DATA, scratch)
+			if key_ok && sig_ok && data_ok {
+				ran = verify_now(probe.algorithm, key, signature, data, scratch) == .Ok
+			}
+			free_all(scratch)
+			if ran {
+				break
+			}
 		}
 		if !ran {
 			algorithms |= algorithm_bit(probe.algorithm)
@@ -299,7 +316,6 @@ run_probe :: proc() {
 				probe.algorithm,
 			)
 		}
-		free_all(scratch)
 	}
 
 	digests: u32
