@@ -355,7 +355,14 @@ run_probe :: proc() {
 		out: [64]u8
 		want, want_ok := decode_hex(probe.want, scratch)
 		size := digest_size(probe.digest_type)
-		ran := message_ok && want_ok && digest(probe.digest_type, message, out[:size])
+		/*
+		`len(want) == size` before the comparison below walks `want`: `digest`
+		fills `out[:size]` and nothing else, so a constant longer than its own
+		digest type would compare against stack bytes nobody wrote, and one over
+		64 would walk off the end of `out`. The test holds the constants to
+		their lengths, and the loop should not need it to.
+		*/
+		ran := message_ok && want_ok && len(want) == size && digest(probe.digest_type, message, out[:size])
 		if ran {
 			for b, i in want {
 				if out[i] != b {

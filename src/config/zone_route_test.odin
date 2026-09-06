@@ -477,6 +477,27 @@ test_a_trust_anchor_set_without_the_root_is_refused :: proc(t: ^testing.T) {
 	testing.expect(t, none == nil, "no anchors at all uses the built-in root keys")
 
 	/*
+	A root anchor with a typo in it is one error, not two. The set this reads
+	does not contain it - it did not parse - so the root check would report it
+	missing to an operator looking straight at the line where they wrote it.
+	*/
+	typo := fmt.tprintf(
+		"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  enabled: true\n%s",
+		"  trust_anchors:\n    - \". IN DS 20326 8 2 NOTHEXATALL\"\n",
+	)
+	_, malformed := load_string(typo, context.temp_allocator)
+	if e, has := malformed.?; has {
+		testing.expectf(
+			t,
+			len(e.messages) == 1,
+			"a mistyped root anchor should be one error, got %v",
+			e.messages,
+		)
+	} else {
+		testing.expect(t, false, "a mistyped root anchor should still be refused")
+	}
+
+	/*
 	And with validation off the question does not arise. Nothing reads these -
 	`start_validator` returns before it looks at them - so a set left behind by
 	an operator who turned DNSSEC off must not stop the file from loading.

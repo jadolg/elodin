@@ -2485,10 +2485,12 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	// Parsed here rather than at startup so `--check` reports a bad anchor
 	// instead of a resolver that comes up refusing every name.
 	parsed_anchors := make([dynamic]dnssec.Trust_Anchor, 0, len(cfg.dnssec.trust_anchors), l.allocator)
+	all_anchors_read := true
 	for anchor, i in cfg.dnssec.trust_anchors {
 		read, ok := dnssec.parse_trust_anchor(anchor, l.allocator)
 		if !ok {
 			errorf(l, "dnssec.trust_anchors[%d]: %q is not a DS record", i, anchor)
+			all_anchors_read = false
 			continue
 		}
 		append(&parsed_anchors, read)
@@ -2510,8 +2512,17 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	set that would anchor nothing anchors nothing that was going to happen, and
 	refusing the file over it would stop a resolver that had been working from
 	loading at all. `route_is_anchored` makes the same allowance.
+
+	Not asked at all when a line above failed to parse. A root anchor with a
+	typo in its digest is absent from the set this reads, so the answer would be
+	"you did not anchor the root" to an operator looking at the line where they
+	did - a second error that sends them somewhere the first one already told
+	them not to go.
 	*/
-	if cfg.dnssec.enabled && len(cfg.dnssec.trust_anchors) > 0 && !dnssec.anchors_the_root(parsed_anchors[:]) {
+	if all_anchors_read &&
+	   cfg.dnssec.enabled &&
+	   len(cfg.dnssec.trust_anchors) > 0 &&
+	   !dnssec.anchors_the_root(parsed_anchors[:]) {
 		errorf(l, "dnssec.trust_anchors covers no root anchor, so no name could be validated; anchor \".\" as well")
 	}
 
