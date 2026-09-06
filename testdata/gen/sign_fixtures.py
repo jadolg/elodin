@@ -219,9 +219,14 @@ def base32hex(raw):
 
 def nsec3_hash(name, salt, iterations):
     """RFC 5155 section 5: SHA-1 over the canonical name, salted and iterated."""
-    digest = hashlib.sha1(canonical_name(name) + salt).digest()
+    # SHA-1 is not a choice here. It is the only hash algorithm NSEC3 has ever
+    # been assigned (RFC 5155 appendix A.1, value 1), so a fixture hashed with
+    # anything else is a record no validator would match. Nothing is being
+    # authenticated by it either: what makes these records trustworthy is the
+    # Ed25519 RRSIG over them.
+    digest = hashlib.sha1(canonical_name(name) + salt).digest()  # nosemgrep: python.lang.security.insecure-hash-algorithms.insecure-hash-algorithm-sha1
     for _ in range(iterations):
-        digest = hashlib.sha1(digest + salt).digest()
+        digest = hashlib.sha1(digest + salt).digest()  # nosemgrep: python.lang.security.insecure-hash-algorithms.insecure-hash-algorithm-sha1
     return digest
 
 
@@ -236,11 +241,9 @@ def nsec3_rdata(next_hash, types, salt, iterations, flags=0):
 
 
 def nsec3_chain(zone, nodes, salt, iterations):
-    """One NSEC3 record per name, in hash order, the last wrapping to the first.
-
-    Returns them keyed by the name they speak for, so a scenario can pick the
-    one its message needs without depending on where in the chain it landed.
-    """
+    """One NSEC3 record per name, in hash order, the last wrapping to the first."""
+    # Keyed by the name each record speaks for, so a scenario can pick the one
+    # its message needs without depending on where in the chain it landed.
     hashed = sorted(
         ((nsec3_hash(name, salt, iterations), name, types) for name, types in nodes),
         key=lambda entry: entry[0],
