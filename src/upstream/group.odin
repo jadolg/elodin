@@ -221,6 +221,17 @@ resolve_insisting :: proc(
 	A group whose every member is parked therefore sweeps nobody, and the first
 	reply stands - which is the same answer as before for a group that has
 	nothing to give, reached without the wait.
+
+	Under `strategy: race` the sweep asks members the race has already asked in
+	parallel, and whose replies `resolve_race` threw away once it had a winner.
+	That is real duplicated work - up to one sequential exchange per remaining
+	member, at `g.timeout` each where they do not answer - and it is still the
+	right trade here: the reply that won the race is one the caller cannot use,
+	and the answer another member gave microseconds later is the client's answer
+	rather than a SERVFAIL. Taking the first *acceptable* reply inside the race
+	instead would spend nothing at all, and wants its own change: it means
+	teaching `Race_State` to keep a reply it will not return yet, on the one
+	path where a worker can outlive the caller.
 	*/
 	for u in g.servers {
 		if u == winner {
@@ -230,7 +241,7 @@ resolve_insisting :: proc(
 			logx.debugf("upstream %s is in its cooldown, not asked again for this one", u.spec.name)
 			continue
 		}
-		resp, xerr := exchange(u, query, g.timeout, allocator)
+		resp, xerr := exchange(u, sweep_query(query), g.timeout, allocator)
 		if xerr != .None {
 			logx.debugf("upstream %s failed: %v", u.spec.name, xerr)
 			continue
@@ -261,6 +272,41 @@ answerable :: proc(response: []u8) -> bool {
 		return true
 	}
 	return false
+}
+
+/*
+The query as it goes to the next server in the sweep: the same bytes under a
+transaction ID of its own.
+
+RFC 5452 section 9.2, and the same reasoning `resolve_query` gives for drawing a
+fresh ID before its second exchange - each exchange is a new one on the wire. It
+matters more here than there. What triggers this sweep is a reply, so the server
+that sent the first one chooses the moment: an upstream that is hostile, or one
+whose traffic an attacker can read, answers with something the caller cannot use
+and thereby induces a second query for the same name to another member of the
+group - carrying, if the ID went unchanged, the ID it has just been told. That
+leaves only the fresh source port between an off-path forgery and an answer this
+server would cache for every client behind it. `cookie_matches` does not cover
+the gap either: a reply with no COOKIE option is accepted from an upstream that
+has never issued one, which is what a spoofed datagram would send.
+
+A copy, because `query` is the caller's buffer and is sent again after this
+returns - `resolve_query` re-sends it to the route, and `attach_cookie` reads it
+per upstream. Scratch space, as `exchange` itself uses for the cookie copy: the
+sweep runs on the request's own thread, whose arena the caller resets.
+
+A message too short to hold a header is handed on untouched. `exchange` is where
+that is refused; inventing bytes for it here would only hide it.
+*/
+@(private)
+sweep_query :: proc(query: []u8) -> []u8 {
+	if len(query) < dns.HEADER_SIZE {
+		return query
+	}
+	out := make([]u8, len(query), context.temp_allocator)
+	copy(out, query)
+	dns.set_id_in_place(out, dns.random_id())
+	return out
 }
 
 // Whether the rcode a client reads off the header is the rcode the responder

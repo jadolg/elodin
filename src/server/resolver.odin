@@ -1648,12 +1648,23 @@ Not answered from a stale entry, for the reason the upstream failure path gives:
 this is an answer that arrived and is being refused deliberately, the same as one
 that did not validate, rather than a refresh that could not be made.
 
-Counted as a failed query, which is what it is, and logged at warning level with
-the upstream named: a server answering BADVERS to EDNS version 0 is misconfigured
-or being interfered with, and either way the operator has one server to look at.
-The detail names it too, so the query log says which upstream cost the client
-this answer.
+Counted as a failed query, which is what it is, and the upstream is named: a
+server answering BADVERS to EDNS version 0 is misconfigured or being interfered
+with, and either way the operator has one server to look at. The query log
+carries that on every occurrence as `outcome=failed detail=rcode:<upstream>`.
+
+The line above it is at warn once and at debug every time after, like
+`report_udp_ceiling` and the AD-bit prune. Those eight bits are two bytes an
+on-path attacker can write into any reply it can reach - the same reading the
+sweep in `upstream.resolve_insisting` is written on - so a per-query warn would
+let one decide how much this server writes to disk, in exactly the
+`dnssec.enabled: false` deployments where the validator's own warn is not
+running either.
 */
+// Set once the first reply has been refused for an unreadable rcode; see below.
+@(private)
+unreadable_rcode_reported: bool
+
 @(private)
 unreadable_rcode_refusal :: proc(
 	s: ^Server,
@@ -1679,14 +1690,27 @@ unreadable_rcode_refusal :: proc(
 		return nil, "", false, false
 	}
 	from := answering_upstream(winner)
-	logx.warnf(
-		"upstream %s answered %v for %s %s from %s, which a client would read as another rcode; answering SERVFAIL",
-		from,
-		rcode,
-		dns.type_name(q.type),
-		dns.name_trim_root(q.name),
-		client,
-	)
+	name := dns.name_trim_root(q.name)
+	if sync.atomic_exchange(&unreadable_rcode_reported, true) {
+		logx.debugf(
+			"upstream %s answered %v for %s %s from %s, which a client would read as another rcode; answering SERVFAIL",
+			from,
+			rcode,
+			dns.type_name(q.type),
+			name,
+			client,
+		)
+	} else {
+		logx.warnf(
+			"upstream %s answered %v for %s %s from %s, which a client would read as another rcode; answering SERVFAIL",
+			from,
+			rcode,
+			dns.type_name(q.type),
+			name,
+			client,
+		)
+		logx.warnf("further replies refused for an rcode a client cannot read are logged at debug level")
+	}
 	sync.atomic_add(&s.stats.failed, 1)
 	response, encoded := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
 	return response, fmt.tprintf("rcode:%s", from), true, encoded

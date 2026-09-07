@@ -33,13 +33,19 @@ second NOERROR. `resolve` is expected to take the first at its word;
 QNAME :: "_25._tcp.mx.example."
 
 @(private = "file")
+QUERY_ID :: u16(0x3c3c)
+
+@(private = "file")
 Canned_Mock :: struct {
-	socket: net.UDP_Socket,
+	socket:  net.UDP_Socket,
 	// Encoded ahead of the thread starting, and never written to after: the
 	// loop only reads it.
-	reply:  []u8,
-	stop:   bool,
-	hits:   int,
+	reply:   []u8,
+	stop:    bool,
+	hits:    int,
+	// The transaction ID of the last query this responder was sent, as an int
+	// so it can be read back atomically.
+	last_id: int,
 }
 
 @(private = "file")
@@ -56,6 +62,7 @@ canned_mock_loop :: proc(m: ^Canned_Mock) {
 			continue
 		}
 		sync.atomic_add(&m.hits, 1)
+		sync.atomic_store(&m.last_id, int(u16(buf[0]) << 8 | u16(buf[1])))
 		copy(out[:], m.reply)
 		// Echo the ID it was asked with, which is drawn fresh per exchange.
 		out[0], out[1] = buf[0], buf[1]
@@ -103,7 +110,7 @@ canned_query :: proc() -> []u8 {
 		class = .IN,
 	}
 	msg := dns.Message {
-		id       = 0x3c3c,
+		id       = QUERY_ID,
 		question = question,
 	}
 	msg.flags.rd = true
@@ -289,6 +296,94 @@ test_an_unreadable_reply_still_comes_back_when_nobody_else_can_answer :: proc(t:
 	// can reach, and counting them as a failure would let one park a healthy
 	// server from a forged packet per query.
 	testing.expect(t, healthy(bad), "an upstream was parked over an rcode it answered with")
+
+	free_all(context.temp_allocator)
+}
+
+/*
+And the query the sweep sends carries a transaction ID of its own.
+
+RFC 5452 section 9.2, and `cases_queryid.odin` states the rule this server keeps:
+on a plain UDP upstream the ID and the source port are the whole of what an
+off-path attacker has to guess. What makes it sharper here than on the ordinary
+forward is that a *reply* is what triggers the sweep, so the server that sent the
+first one picks the moment - an upstream that is hostile, or whose traffic an
+attacker can read, answers unusably and thereby induces a second query for the
+same name to another member of the group. Sent under the ID that upstream has
+just seen, only the fresh source port would be left to guess, and a hit is an
+answer this server caches for every client behind it.
+
+Eight rounds, because a single comparison against a random 16-bit number is a
+one-in-65536 flake either way. The ID the sweep uses has to differ from the
+query's own in at least one of them; reuse fails all eight.
+*/
+@(test)
+test_the_swept_query_carries_a_transaction_id_of_its_own :: proc(t: ^testing.T) {
+	broken := Canned_Mock{}
+	answerer := Canned_Mock{}
+
+	bad, bad_thread, bad_ok := start_canned_mock(t, &broken, "badvers", canned_reply(1))
+	if !bad_ok {
+		return
+	}
+	defer {
+		sync.atomic_store(&broken.stop, true)
+		thread.join(bad_thread)
+		thread.destroy(bad_thread)
+		net.close(broken.socket)
+		destroy(bad)
+	}
+
+	good, good_thread, good_ok := start_canned_mock(t, &answerer, "answerer", canned_reply(0))
+	if !good_ok {
+		return
+	}
+	defer {
+		sync.atomic_store(&answerer.stop, true)
+		thread.join(good_thread)
+		thread.destroy(good_thread)
+		net.close(answerer.socket)
+		destroy(good)
+	}
+
+	servers := make([]^Upstream, 2, context.allocator)
+	defer delete(servers, context.allocator)
+	servers[0] = bad
+	servers[1] = good
+
+	g := Group {
+		servers   = servers,
+		strategy  = .Failover,
+		timeout   = time.Second,
+		attempts  = 1,
+		allocator = context.allocator,
+	}
+
+	wire := canned_query()
+	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
+
+	ROUNDS :: 8
+	own := 0
+	for _ in 0 ..< ROUNDS {
+		resp, winner, err := resolve_readable(&g, wire, context.allocator)
+		testing.expect_value(t, err, Error.None)
+		testing.expect_value(t, winner, good)
+		delete(resp, context.allocator)
+
+		// The first exchange is `resolve`'s and is left exactly as the caller
+		// wrote it: `resolve_query` has already drawn the ID for that one.
+		testing.expect_value(t, u16(sync.atomic_load(&broken.last_id)), QUERY_ID)
+		if u16(sync.atomic_load(&answerer.last_id)) == QUERY_ID {
+			own += 1
+		}
+	}
+
+	testing.expectf(
+		t,
+		own < ROUNDS,
+		"every one of %d swept queries went out under the client-facing query's own ID",
+		ROUNDS,
+	)
 
 	free_all(context.temp_allocator)
 }
