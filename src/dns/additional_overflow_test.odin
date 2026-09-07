@@ -280,3 +280,141 @@ test_a_truncation_drops_a_record_to_keep_the_opt_record :: proc(t: ^testing.T) {
 
 	free_all(context.temp_allocator)
 }
+
+/*
+Three shapes the walk back must not read as its own, all of them reachable from
+a reply this decoder will hand back unchanged and none of them from a message
+this server builds.
+
+An OPT record whose owner name is not the root. RFC 6891 section 6.1.2 makes it
+the root, the decoder reads the RDATA and never looks at the name, and
+`w_record` writes whatever is there in full - so the eleven bytes the walk back
+reserves would be short by the length of the name. Records would go back for a
+record that then did not fit either, which is worse than the truncation it was
+trying to improve, so no room is kept for one at all.
+*/
+@(test)
+test_a_non_root_opt_owner_keeps_no_room :: proc(t: ^testing.T) {
+	named := make_opt(1232, false)
+	named.name = QNAME
+	additional := make([]Record, 1, context.temp_allocator)
+	additional[0] = named
+	whole := message_with(additional)
+
+	// The room the root-owner case sheds a record at; see the case above.
+	room := encoded_size(t, one_answer()) + 21
+
+	wire, truncated, err := encode_message(whole, context.temp_allocator, room)
+	testing.expect_value(t, err, Encode_Error.None)
+	testing.expect(t, truncated, "an answer record was dropped without a truncation being reported")
+	testing.expectf(t, len(wire) <= room, "the message is %d bytes, past the %d it was given", len(wire), room)
+
+	got, derr := decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	// Both, where the root-owner case keeps one: the record that would not fit
+	// took nothing with it.
+	testing.expect_value(t, len(got.answer), 2)
+	testing.expect_value(t, len(got.additional), 0)
+
+	free_all(context.temp_allocator)
+}
+
+/*
+An OPT record in the answer section, which is not the message's EDNS record:
+`find_opt` reads the additional section alone, and a client can put a record of
+type OPT in the question it sends for the asking.
+
+Taken for the real one, it would mark the message's OPT as already written -
+so the walk back would shed answer records to keep room the re-add then
+declined to use, and the client would get neither the records nor the record.
+*/
+@(test)
+test_an_opt_in_the_answer_section_is_not_the_messages_own :: proc(t: ^testing.T) {
+	answer := make([]Record, 3, context.temp_allocator)
+	answer[0] = make_opt(1232, false)
+	answer[1] = a_record(1)
+	answer[2] = a_record(2)
+	whole := message_with(opt_records())
+	whole.answer = answer
+
+	// Room for the OPT-shaped answer record, the first address behind it and
+	// eleven bytes for the message's own OPT record: the second address needs
+	// sixteen and is what the cut lands on.
+	head := whole
+	head.answer = answer[:2]
+	head.authority = nil
+	head.additional = nil
+	room := encoded_size(t, head) + 11
+
+	wire, truncated, err := encode_message(whole, context.temp_allocator, room)
+	testing.expect_value(t, err, Encode_Error.None)
+	testing.expect(t, truncated, "an answer record was dropped without a truncation being reported")
+	testing.expectf(t, len(wire) <= room, "the message is %d bytes, past the %d it was given", len(wire), room)
+
+	got, derr := decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	testing.expect(t, got.flags.tc, "TC is clear on an answer that lost records")
+	testing.expect_value(t, len(got.answer), 2)
+	// The message's own record, from the section `find_opt` reads.
+	testing.expect(t, edns_present(got), "the additional section's OPT record was taken for written")
+
+	free_all(context.temp_allocator)
+}
+
+/*
+An rcode of 16 or more lives half in the header and half in the OPT record's TTL
+(RFC 6891 section 6.1.3), so a message that loses the record to the size ceiling
+goes out as a different rcode: BADVERS read as NOERROR over an empty answer
+section, which is a NODATA, and BADCOOKIE read as YXRRSET.
+
+Dropping the record quietly is what the rest of this file is about, and this is
+the one message it must not be quiet about. The client is sent to TCP instead,
+where the record fits and the rcode it was answered with arrives.
+*/
+@(test)
+test_an_extended_rcode_is_not_dropped_quietly :: proc(t: ^testing.T) {
+	// BADVERS: rcode 16, so the header's four bits are zero and the extended
+	// byte in the TTL is one.
+	badvers := make_opt(1232, false)
+	badvers.ttl = 1 << 24
+	additional := make([]Record, 1, context.temp_allocator)
+	additional[0] = badvers
+
+	question := make([]Question, 1, context.temp_allocator)
+	question[0] = Question {
+		name  = QNAME,
+		type  = .A,
+		class = .IN,
+	}
+	m := Message {
+		id         = 0x1234,
+		question   = question,
+		additional = additional,
+	}
+	m.flags.qr = true
+	testing.expect_value(t, rcode_of(m), Rcode.Bad_Vers)
+
+	// One byte short of the record the top bits live in.
+	room := encoded_size(t, m) - 1
+
+	wire, truncated, err := encode_message(m, context.temp_allocator, room)
+	testing.expect_value(t, err, Encode_Error.None)
+	testing.expect(t, truncated, "a refusal that lost its rcode reported no truncation")
+	testing.expectf(t, len(wire) <= room, "the message is %d bytes, past the %d it was given", len(wire), room)
+
+	got, derr := decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	testing.expect(t, got.flags.tc, "the client was not told to ask again for the rcode it lost")
+
+	// And an OPT record carrying no extended rcode is still dropped quietly,
+	// which is the case either side of this one.
+	plain := m
+	plain_opt := make([]Record, 1, context.temp_allocator)
+	plain_opt[0] = make_opt(1232, false)
+	plain.additional = plain_opt
+	_, plain_truncated, plain_err := encode_message(plain, context.temp_allocator, room)
+	testing.expect_value(t, plain_err, Encode_Error.None)
+	testing.expect(t, !plain_truncated, "an OPT record with nothing in its TTL was reported as a truncation")
+
+	free_all(context.temp_allocator)
+}

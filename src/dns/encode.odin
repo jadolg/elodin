@@ -269,15 +269,29 @@ the root and its RDATA holds no name to compress - so this can be worked out
 before a byte is written, which is what `encode_message` needs to keep room for
 it behind a truncation.
 
-`ok` is false for a message with no OPT record and for one whose OPT record
-carries RDATA of another shape, which is not this arithmetic: no room is kept
-rather than the wrong amount.
+`ok` is false wherever that arithmetic is not the record's, and the caller keeps
+no room rather than the wrong amount:
+
+  - a message with no OPT record in its additional section, which is the section
+    `find_opt` reads and the only one an OPT record is the message's EDNS record
+    in;
+  - an owner name other than the root. RFC 6891 section 6.1.2 makes it the root
+    and `w_record` writes it uncompressed, so a decoded reply that carries
+    something else - the decoder reads the RDATA and never looks at the name -
+    would cost as many bytes as the name is long. Reserving eleven for it is how
+    the walk back below sheds records for a record that then does not fit
+    anyway.
+  - RDATA of another shape than an option list. Nothing builds one, and nothing
+    here has to guess at what it encodes to.
 */
 @(private)
 opt_wire_len :: proc(m: Message) -> (n: int, ok: bool) {
 	for rec in m.additional {
 		if rec.type != .OPT {
 			continue
+		}
+		if rec.name != "." {
+			return 0, false
 		}
 		// The root name, TYPE, CLASS, TTL and RDLENGTH.
 		n = 11
@@ -286,8 +300,6 @@ opt_wire_len :: proc(m: Message) -> (n: int, ok: bool) {
 				n += 4 + len(o.data)
 			}
 		} else if rec.data != nil {
-			// RDATA of another shape on an OPT record, which is not this
-			// arithmetic. Nothing builds one; nothing has to guess at it either.
 			return 0, false
 		}
 		return n, true
@@ -394,10 +406,18 @@ encode_message :: proc(
 				break outer
 			}
 			counts[si] += 1
-			// Asked of the record just written rather than of the one that
-			// overflowed: an OPT record already in the message is not one to
-			// append a second copy of below.
-			if rec.type == .OPT {
+			/*
+			Asked of the record just written rather than of the one that
+			overflowed: an OPT record already in the message is not one to append
+			a second copy of below.
+
+			And only in the additional section, which is the only one `find_opt`
+			reads and the only one `opt_wire_len` measured. A client can put a
+			record of type OPT in its question's answer section for the asking,
+			and taking that for the message's EDNS record would shed answer
+			records for room the re-add below then declines to use.
+			*/
+			if si == 2 && rec.type == .OPT {
 				opt_written = true
 			}
 			if si < 2 && keep_room && len(w.buf) + opt_len <= max_size {
@@ -439,6 +459,25 @@ encode_message :: proc(
 			w_record(&w, rec) or_return
 			if len(w.buf) > max_size {
 				resize(&w.buf, mark)
+				/*
+				An rcode of 16 or more lives half in the header and half in this
+				record's TTL (RFC 6891 section 6.1.3), so a message that loses
+				the record goes out as a different rcode: BADVERS read as NOERROR
+				over an empty answer section, which is a NODATA, and BADCOOKIE as
+				YXRRSET. So that one is a truncation after all - the client is
+				sent to TCP, where the record fits and the rcode it was actually
+				answered with arrives.
+
+				`server.match_client_opt` refuses to strip an OPT record from
+				those same answers for the same reason, and `dns.error_response`
+				will not fall back to a header for one. Not reachable through the
+				server, where `response_limit` floors at 512 bytes and the
+				largest composed-rcode reply it builds is under 300 - and this
+				procedure is exported, so it is not resting on that.
+				*/
+				if rec.ttl & 0xff00_0000 != 0 {
+					truncated = true
+				}
 			} else {
 				counts[2] += 1
 			}
