@@ -1081,14 +1081,16 @@ resolve_query :: proc(
 		can do. An answerable reply returns from the first exchange and none of
 		the sweep runs, so `home.arpa.`'s NODATA costs exactly what it did.
 
-		The route's own exchange below stays on `resolve`: whatever it says is
-		the client's answer, rcode and all, which is the ordinary reading of a
-		client's question and the one this carve-out departs from only for the
-		parent.
+		The route's own exchange below stays on `resolve_readable`, as the
+		ordinary path does: whatever it says is the client's answer, rcode and
+		all, which is the ordinary reading of a client's question and the one
+		this carve-out departs from only for the parent. What that procedure
+		insists on is not a verdict about the name but that the client can read
+		the one it is given - see the guard below the exchanges.
 		*/
 		resp, winner, uerr = upstream.resolve_answerable(asked, forwarded, allocator)
 	} else {
-		resp, winner, uerr = upstream.resolve(asked, forwarded, allocator)
+		resp, winner, uerr = upstream.resolve_readable(asked, forwarded, allocator)
 	}
 	/*
 	And back on the route unless the parent answered the one thing the parent was
@@ -1155,7 +1157,7 @@ resolve_query :: proc(
 				)
 			}
 			dns.set_id_in_place(forwarded, dns.random_id())
-			again, second, aerr := upstream.resolve(own, forwarded, allocator)
+			again, second, aerr := upstream.resolve_readable(own, forwarded, allocator)
 			/*
 			And the route's answer is the only one that can be served from here.
 
@@ -1216,6 +1218,32 @@ resolve_query :: proc(
 		sync.atomic_add(&s.stats.failed, 1)
 		out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
 		log_query(s, client, proto, q, .Failed, "upstream", started)
+		return out, .Failed, built
+	}
+
+	/*
+	And an rcode the client cannot read is not handed to it. See
+	`unreadable_rcode_refusal`, which is also where the reading is argued.
+
+	Above `set_id_in_place` and everything under it, because a response refused
+	here is not one this server hands on in any form - so the validator does not
+	read it, the blocking walk does not, and the cache never sees it. It reads
+	`resp` rather than either exchange's own result, so the parent's reply and
+	the route's second one are both covered, and so is a reply that arrives
+	through a path this procedure grows later.
+	*/
+	if out, detail, refused, built := unreadable_rcode_refusal(
+		s,
+		query,
+		msg,
+		q,
+		resp,
+		winner,
+		client,
+		limit,
+		allocator,
+	); refused {
+		log_query(s, client, proto, q, .Failed, detail, started)
 		return out, .Failed, built
 	}
 
@@ -1594,6 +1622,74 @@ served or refused, or counting the refusals against the servings does not work.
 @(private)
 answering_upstream :: proc(u: ^upstream.Upstream) -> string {
 	return u.spec.name if u != nil else "?"
+}
+
+/*
+An upstream reply whose rcode the client cannot read, answered SERVFAIL instead.
+
+`dns.peek_rcode` composes twelve bits where a stub reads four (RFC 6891 section
+6.1.3), so an extended rcode arrives at the client as a different rcode - and
+where its low nibble is zero, as a plausible one. BADVERS is 16: forwarded as it
+stands it reads as NOERROR over an empty answer section, which is a NODATA, so a
+client asking for a TLSA record or an MTA-STS TXT is told the name has no such
+record rather than that its resolver could not find out. That is #271's harm - a
+downgrade out of one rewritten byte - reached without touching DNSSEC. `validate`
+refuses the same shape now, but with `dnssec.enabled: false` it is not running
+and nothing else catches it.
+
+The group has already been asked by the time this reads the reply:
+`upstream.resolve_readable` sweeps past a member whose rcode a client cannot
+read, so a reply that reaches here is one no server in the group could better.
+SERVFAIL is then what is true - this server could not get an answer it is able
+to pass on - and a client handed one retries or fails closed, which is the
+reading the forged byte was trying to avoid.
+
+Not answered from a stale entry, for the reason the upstream failure path gives:
+this is an answer that arrived and is being refused deliberately, the same as one
+that did not validate, rather than a refresh that could not be made.
+
+Counted as a failed query, which is what it is, and logged at warning level with
+the upstream named: a server answering BADVERS to EDNS version 0 is misconfigured
+or being interfered with, and either way the operator has one server to look at.
+The detail names it too, so the query log says which upstream cost the client
+this answer.
+*/
+@(private)
+unreadable_rcode_refusal :: proc(
+	s: ^Server,
+	query: []u8,
+	msg: dns.Message,
+	q: dns.Question,
+	resp: []u8,
+	winner: ^upstream.Upstream,
+	client: string,
+	limit: int,
+	allocator: mem.Allocator,
+) -> (
+	out: []u8,
+	detail: string,
+	refused: bool,
+	// Whether there was anything to build a SERVFAIL from, which is the
+	// caller's `ok`: one that could not be encoded is not sent at all, the same
+	// as on the upstream failure path.
+	built: bool,
+) {
+	rcode := dns.peek_rcode(resp)
+	if u16(rcode) <= 0xf {
+		return nil, "", false, false
+	}
+	from := answering_upstream(winner)
+	logx.warnf(
+		"upstream %s answered %v for %s %s from %s, which a client would read as another rcode; answering SERVFAIL",
+		from,
+		rcode,
+		dns.type_name(q.type),
+		dns.name_trim_root(q.name),
+		client,
+	)
+	sync.atomic_add(&s.stats.failed, 1)
+	response, encoded := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
+	return response, fmt.tprintf("rcode:%s", from), true, encoded
 }
 
 /*
