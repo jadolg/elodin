@@ -125,8 +125,10 @@ says: the fields in it are set by `set_edns_udp_size` and the option writers
 above, and inventing a second record here would leave two for a reader to
 disagree over.
 
-Fails only where a message with no OPT record cannot be decoded and encoded
-again, which is a message this server would not have got this far with.
+Fails where a message with no reachable OPT record will not decode, will not
+encode again, or turns out to have one after all - the last of which is the two
+readers disagreeing, and all three of which are a message this server would not
+have got this far with.
 */
 ensure_opt :: proc(
 	msg: []u8,
@@ -209,6 +211,13 @@ answer alone.
 
 Fails only where a message that has an OPT record somewhere other than the end
 cannot be decoded and encoded again.
+
+A message that cannot be walked as far as an OPT record is reported the same way
+as one that has none: returned unchanged, and `ok`. So `ok` says the caller has
+nothing further to do here rather than that the bytes provably carry no OPT
+record - an upstream reply whose sections do not walk keeps whatever it arrived
+with, which is the reading every other writer in this file takes of the same
+input.
 */
 remove_opt :: proc(msg: []u8, allocator := context.allocator) -> (out: []u8, ok: bool) {
 	span, has_opt := find_opt_span(msg)
@@ -379,8 +388,9 @@ Opt_Span :: struct {
 	rdlen_pos: int,
 	rd_start:  int,
 	rd_end:    int,
-	// Nothing follows the OPT record, so bytes may be inserted into its RDATA
-	// without moving anything a compression pointer could be aimed at.
+	// Nothing follows the OPT record, so bytes may be inserted into its RDATA -
+	// or the whole record cut away, see `remove_opt` - without moving anything a
+	// compression pointer could be aimed at.
 	last:      bool,
 }
 

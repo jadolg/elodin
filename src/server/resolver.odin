@@ -534,11 +534,13 @@ match_client_opt :: proc(
 
 	Not reachable from here today, and written down rather than left implicit:
 	`unreadable_rcode_refusal` turns an upstream reply like that into a SERVFAIL
-	before the cache or the client sees it, and the only rcode this server
-	composes itself is the BADVERS from `dns.error_response`, which answers a
-	query that carried an OPT record by definition. Both of those are one
-	procedure away from a change that would make this the last thing between a
-	rewritten byte and a client reading the wrong rcode.
+	before the cache or the client sees it, and the two composed rcodes this
+	server writes itself both answer a query that carried an OPT record by
+	definition - the BADVERS from the version gate, which read the version out of
+	that record, and the BADCOOKIE from `cookie_must_be_refused`, which read a
+	cookie option out of it. All three are one procedure away from a change that
+	would make this the last thing between a rewritten byte and a client reading
+	the wrong rcode.
 	*/
 	if u16(dns.peek_rcode(wire)) > 0xf {
 		return wire
