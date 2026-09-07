@@ -323,8 +323,9 @@ type_name :: proc(t: Type) -> string {
 /*
 The registry spelling of a response code, and whether there is one.
 
-RFC 6895 section 2.3 names 0-11 and 16-23; everything between and above is
-unassigned. `known` false is not an error - a composed rcode of 32 is a
+The IANA registry RFC 6895 section 2.3 established names 0-11 and 16-23 -
+DSOTYPENI arriving later with RFC 8490 and BADCOOKIE with RFC 7873 - and
+everything between and above is unassigned. `known` false is not an error - a composed rcode of 32 is a
 perfectly well-formed thing for a responder to send, RFC 6891 section 6.1.3
 having made the field twelve bits wide - so a caller that has to print one is
 expected to print the number instead. Odin's own `%v` renders an unnamed value

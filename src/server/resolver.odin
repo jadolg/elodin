@@ -1724,7 +1724,9 @@ can carry (RFC 6891 section 6.1.3) - and the byte those upper bits come out of i
 one an on-path attacker writes, so it would pick a value that renders as the
 placeholder and leave both the operator's line and the client's extended error
 saying nothing. The number is what is true when the name is not known, and
-`RCODE<n>` is how RFC 6895 section 2.3 spells an unassigned one.
+`RCODE<n>` is the shape RFC 3597 gave the same problem for types and classes -
+nothing standardises it for an rcode, so this follows the neighbouring
+convention rather than a rule.
 */
 @(private)
 rcode_text :: proc(rcode: dns.Rcode) -> string {

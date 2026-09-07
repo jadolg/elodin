@@ -257,6 +257,13 @@ it was and `healthy` goes on reporting it up.
 Not counted by this package, which has no opinion about what a client can read -
 `resolve_readable` sweeps past such a reply but a chain lookup may go on to use
 one. The caller that refuses it is the caller that counts it.
+
+Which means it names the server whose reply was refused, and only that one. A
+sweep that found every member answering unreadably discarded the rest without
+counting them, so a group with two broken members shows one of them - the first
+asked - and the count is of refusals rather than of replies. That is the figure
+the caller has to explain: one query, one refusal, one server to look at. The
+second member surfaces the next time it is the one asked first.
 */
 note_unreadable_rcode :: proc(u: ^Upstream) {
 	if u == nil {

@@ -888,3 +888,132 @@ test_peek_edns_option_takes_the_first_of_duplicates :: proc(t: ^testing.T) {
 	}
 	free_all(context.temp_allocator)
 }
+
+/*
+Every response code this codec names, spelled the way an operator greps for it.
+
+`rcode_name` exists because `%v` on an unnamed `Rcode` prints Odin's `BAD ENUM
+VALUE` placeholder, and the twelve bits it renders come out of a byte an on-path
+attacker writes - so the placeholder is what it would choose. These strings are
+therefore operator- and client-facing output: they reach a `warn` line and the
+EXTRA-TEXT of an extended DNS error, and a typo in one of them ships silently
+otherwise. The spellings are the ones `dig` and BIND print.
+
+The unassigned values are checked as well, in both gaps: 12 to 15 between the
+header's own codes and the extended ones, and everything above 23. Both are
+things a responder may legitimately send - the field is eight bits wide - so
+`known` false is the answer, and the caller prints the number.
+*/
+@(test)
+test_rcode_name_covers_every_named_code :: proc(t: ^testing.T) {
+	Case :: struct {
+		rcode: Rcode,
+		name:  string,
+	}
+	cases := []Case {
+		{.No_Error, "NOERROR"},
+		{.Form_Err, "FORMERR"},
+		{.Serv_Fail, "SERVFAIL"},
+		{.NX_Domain, "NXDOMAIN"},
+		{.Not_Impl, "NOTIMP"},
+		{.Refused, "REFUSED"},
+		{.YX_Domain, "YXDOMAIN"},
+		{.YX_RRSet, "YXRRSET"},
+		{.NX_RRSet, "NXRRSET"},
+		{.Not_Auth, "NOTAUTH"},
+		{.Not_Zone, "NOTZONE"},
+		{.DSO_Type_NI, "DSOTYPENI"},
+		{.Bad_Vers, "BADVERS"},
+		{.Bad_Key, "BADKEY"},
+		{.Bad_Time, "BADTIME"},
+		{.Bad_Mode, "BADMODE"},
+		{.Bad_Name, "BADNAME"},
+		{.Bad_Alg, "BADALG"},
+		{.Bad_Trunc, "BADTRUNC"},
+		{.Bad_Cookie, "BADCOOKIE"},
+	}
+	for c in cases {
+		name, known := rcode_name(c.rcode)
+		testing.expectf(t, known, "%v has no name", c.rcode)
+		testing.expectf(t, name == c.name, "rcode %d is called %q, want %q", u16(c.rcode), name, c.name)
+	}
+
+	// And every value of the enum is in the table above, so a code added to
+	// `Rcode` without a spelling here is a failing test rather than a
+	// placeholder in somebody's log.
+	for r in Rcode {
+		found := false
+		for c in cases {
+			if c.rcode == r {
+				found = true
+				break
+			}
+		}
+		testing.expectf(t, found, "%v is not covered by this case", r)
+	}
+
+	for unassigned in ([]u16{12, 13, 14, 15, 24, 32, 4080, 4095}) {
+		name, known := rcode_name(Rcode(unassigned))
+		testing.expectf(t, !known, "rcode %d is named %q, which the registry does not", unassigned, name)
+		testing.expect_value(t, name, "")
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+The EXTENDED-RCODE byte is cleared, and nothing beside it is.
+
+The byte shares the OPT record's TTL with the EDNS version and the DO bit (RFC
+6891 section 6.1.3), and the version is what `handle_query`'s own gate reads: a
+clear that took it with it would refuse every query this server forwards, and
+one that took DO with it would silently stop asking for signatures.
+*/
+@(test)
+test_clearing_the_extended_rcode_leaves_the_rest_of_the_ttl :: proc(t: ^testing.T) {
+	questions := make([]Question, 1, context.temp_allocator)
+	questions[0] = Question {
+		name  = "example.com.",
+		type  = .A,
+		class = .IN,
+	}
+	// Extended rcode 4, version 0 and DO set: the whole TTL, so that clearing
+	// one field of the three is visible as such.
+	opt := make_opt(1232, true, 4)
+	additional := make([]Record, 1, context.temp_allocator)
+	additional[0] = opt
+	wire, _, err := encode_message(
+		Message{id = 0x4444, question = questions, additional = additional},
+		context.temp_allocator,
+	)
+	testing.expect_value(t, err, Encode_Error.None)
+
+	// The premise: a request carrying a byte RFC 6891 says must be zero.
+	testing.expect_value(t, u16(peek_rcode(wire)), u16(64))
+
+	testing.expect(t, clear_edns_extended_rcode(wire), "the OPT record was not found")
+	testing.expect_value(t, u16(peek_rcode(wire)), u16(0))
+
+	decoded, derr := decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	testing.expect_value(t, edns_version(decoded), u8(0))
+	testing.expect(t, edns_do(decoded), "the DO bit went with the extended rcode")
+	testing.expect_value(t, edns_udp_size(decoded), u16(1232))
+	testing.expect_value(t, decoded.id, u16(0x4444))
+	if testing.expect(t, len(decoded.question) == 1, "the question did not survive") {
+		testing.expect(t, name_equal_fold(decoded.question[0].name, "example.com."), "the question changed")
+	}
+
+	// A message with no OPT record has no field to clear, which is not a
+	// failure to report - and nothing about it may be written to.
+	plain, _, perr := encode_message(Message{id = 0x4545, question = questions}, context.temp_allocator)
+	testing.expect_value(t, perr, Encode_Error.None)
+	before := make([]u8, len(plain), context.temp_allocator)
+	copy(before, plain)
+	testing.expect(t, !clear_edns_extended_rcode(plain), "a message with no OPT record reported one")
+	testing.expect(t, mem.compare(before, plain) == 0, "a message with no OPT record was written to")
+
+	// And a header on its own, which is what a truncated message arrives as.
+	short := make([]u8, HEADER_SIZE, context.temp_allocator)
+	testing.expect(t, !clear_edns_extended_rcode(short), "a bare header reported an OPT record")
+	free_all(context.temp_allocator)
+}

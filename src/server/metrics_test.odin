@@ -117,6 +117,30 @@ through a handshake flood is the blindness issue #247 was filed about, and a
 series that reported the new bound as a flat zero would be the same blindness with
 a metric name on it.
 */
+@(test)
+test_the_limiters_counters_reach_the_endpoint :: proc(t: ^testing.T) {
+	// Distinct values, so a series reading the wrong counter fails.
+	limiter := make_rate_limiter(500, 2)
+	defer destroy_rate_limiter(limiter)
+	limiter.limited = 3
+	limiter.slipped = 5
+	limiter.conn_limited = 7
+
+	page := render_fixture(Stats{}, limiter)
+	expect_line(t, page, "elodin_rate_limited_total 3")
+	expect_line(t, page, "elodin_rate_limit_slipped_total 5")
+	expect_line(t, page, "elodin_connections_rate_limited_total 7")
+	free_all(context.temp_allocator)
+}
+
+/*
+A family is declared once, whatever it holds.
+
+Two `# TYPE` lines for one metric name are a duplicate, and a scraper rejects
+the whole response over it rather than the line - so a page that is merely
+noisy in this respect is a page that reports nothing at all.
+*/
+
 /*
 The upstream that sent an rcode no client could read is named in the scrape.
 
@@ -167,31 +191,10 @@ test_an_unreadable_rcode_is_published_against_the_upstream :: proc(t: ^testing.T
 	// which is what makes the series above the only trace it leaves.
 	expect_line(t, page, `elodin_upstream_failures_total{upstream="broken"} 0`)
 	expect_line(t, page, `elodin_upstream_up{upstream="broken"} 1`)
-}
 
-@(test)
-test_the_limiters_counters_reach_the_endpoint :: proc(t: ^testing.T) {
-	// Distinct values, so a series reading the wrong counter fails.
-	limiter := make_rate_limiter(500, 2)
-	defer destroy_rate_limiter(limiter)
-	limiter.limited = 3
-	limiter.slipped = 5
-	limiter.conn_limited = 7
-
-	page := render_fixture(Stats{}, limiter)
-	expect_line(t, page, "elodin_rate_limited_total 3")
-	expect_line(t, page, "elodin_rate_limit_slipped_total 5")
-	expect_line(t, page, "elodin_connections_rate_limited_total 7")
 	free_all(context.temp_allocator)
 }
 
-/*
-A family is declared once, whatever it holds.
-
-Two `# TYPE` lines for one metric name are a duplicate, and a scraper rejects
-the whole response over it rather than the line - so a page that is merely
-noisy in this respect is a page that reports nothing at all.
-*/
 @(test)
 test_no_family_is_declared_twice :: proc(t: ^testing.T) {
 	page := render_fixture(Stats{})
