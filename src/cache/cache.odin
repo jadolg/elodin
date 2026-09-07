@@ -223,6 +223,17 @@ set depending on the DO bit, and serving one to the other would be wrong.
 `checking_disabled` is part of it for a sharper reason: a client that sets CD
 gets whatever the upstream said, validated or not, and that answer must never
 come back out of the cache for a client that asked us to check.
+
+Whether the query carried an OPT record at all is deliberately not part of it,
+though the answers do differ by it: the query forwarded for an EDNS client
+carries its OPT record upstream and the one forwarded for a client without EDNS
+does not, so the replies come back with and without an OPT record of the
+upstream's. Keying on the difference would double the entries for every name a
+mixed client population asks about - and would still be storing an OPT record
+and handing it out, which RFC 6891 section 6.1.1 forbids outright. So the
+presence of an OPT record is decided per request on the way out instead, by
+`server.match_client_opt`, and what is stored here is an answer either kind of
+client can be served from.
 */
 make_key :: proc(
 	buf: []u8,
