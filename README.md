@@ -412,6 +412,39 @@ resets partway through is retried once first, since some public resolvers do tha
 to a fair share of fresh connections while the very next attempt goes through.
 Only a reset is retried.
 
+An upstream's rcode is the client's answer — SERVFAIL and REFUSED are passed on
+as they arrive, since the rcode is what the client asked for — with one
+exception. An extended rcode (RFC 6891 section 6.1.3) is twelve bits, four in
+the header and eight in the OPT record, and a stub client reads the four: a
+BADVERS forwarded as it stands reads as NOERROR over an empty answer section,
+which is a client being told a name has no such record when what happened is
+that its resolver could not find out. A DANE or MTA-STS client that believes it
+downgrades. So a reply whose composed rcode is 16 or above is not one this
+server passes on: the other members of the group that are not in their failure
+cooldown are asked, and if none of them can answer readably the query is a
+SERVFAIL. A client that asked with EDNS gets an extended DNS error (RFC 8914)
+with it — code 0, `Other`, naming the rcode, since none of the registered codes
+says "the rcode you were sent is not one you could read"; a client that asked
+without EDNS has nowhere to be told and gets the bare SERVFAIL. elodin only ever
+asks in EDNS version 0, which every EDNS implementation is required to support,
+so a BADVERS in reply to one is a protocol violation by that server rather than a
+fact about the name.
+
+Those refusals reach the log as `outcome=failed detail=rcode:<upstream>` and are
+counted as `unreadable_rcode=` in the stats line and
+`elodin_upstream_unreadable_rcode_total{upstream}` on the metrics endpoint. The
+warning naming the upstream is said once and demoted to debug after it, since the
+bytes behind it are ones an on-path attacker can write — which is why the
+counters are there, and why the per-upstream one exists: a reply like this is
+deliberately *not* counted as an upstream failure, so a member doing it keeps a
+clean `elodin_upstream_failures_total` and an `elodin_upstream_up` of 1. Counting
+it as a failure would let one forged packet per query park every server in the
+group, which is a worse outage than the answer being refused.
+
+The same byte is cleared on the way out: RFC 6891 requires a request to leave
+EXTENDED-RCODE at zero, so a client setting it cannot make an upstream that
+echoes the OPT TTL answer every one of its queries unreadably.
+
 An `https` upstream picks between HTTP/2 and HTTP/1.1 with ALPN, preferring h2,
 since some public resolvers answer HTTP/1.1 only. Concurrent queries against an
 h2 upstream multiplex onto one connection; an HTTP/1.1 one uses the same pooled
@@ -1867,6 +1900,7 @@ as a warning at startup.
 | `elodin_upstream_failures_total{upstream}` | counter | exchanges that produced no usable answer |
 | `elodin_upstream_latency_seconds_total{upstream}` | counter | cumulative round-trip time; divide by the query counter under `rate()` for the mean |
 | `elodin_upstream_up{upstream}` | gauge | 0 while an upstream is in its failure cooldown |
+| `elodin_upstream_unreadable_rcode_total{upstream}` | counter | replies from each upstream refused because their rcode is one a client would read as a different rcode — the extended half lives in the OPT record and a stub reads the header. Not counted as a failure above, on purpose: those bytes are forgeable, and a failure would park the group |
 | `elodin_udp_datagrams_total{reader}` | counter | datagrams each UDP reader took off its socket |
 | `elodin_udp_receive_drops_total{reader}` | counter | datagrams the kernel dropped on that reader's receive queue before they could be read; absent where `/proc` cannot be read |
 | `elodin_pool_workers{pool}` / `elodin_pool_pending{pool}` | gauge | the `query` and `upstream` pools; `pending` that does not return to zero is `server.workers` set too low |
@@ -1879,7 +1913,11 @@ as a warning at startup.
 backlog or the allow list turned away never reached an outcome, an answer the
 rebinding guard withheld is counted in `elodin_rebind_refused_total`, and of the
 `outcome=local` answers only the reserved-name table is counted, in
-`elodin_special_use_total`. The `process_` family carries the names every
+`elodin_special_use_total`. `sum(elodin_upstream_unreadable_rcode_total)` is a
+subset of `outcome="failed"` rather than a figure beside it: those queries are
+SERVFAILs like any other, and it says how many of them were an upstream
+answering something no client could read — the `msg=stats` line carries the same
+total as `unreadable_rcode=`. The `process_` family carries the names every
 Prometheus client library uses, so a dashboard written against a Go or Python
 service works here unchanged.
 

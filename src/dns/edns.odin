@@ -181,6 +181,30 @@ set_edns_udp_size :: proc(msg: []u8, size: u16) -> bool {
 }
 
 /*
+Zero the EXTENDED-RCODE byte of an encoded message's OPT record.
+
+RFC 6891 section 6.1.3 splits the rcode across the header's four bits and this
+byte, and requires the byte to be zero in a *request*: a requestor has no rcode
+to state. A client can nevertheless set it, and a forwarder that echoes the
+query's OPT TTL rather than building its own then answers with a composed rcode
+of 16 or more for every query carrying it - which is a reply no client can be
+handed. So it is cleared on the way out, beside where the transaction ID is
+drawn.
+
+Reports false when the message carries no OPT record or cannot be walked to it,
+neither of which is a failure: there is no field to clear. Written in place, as
+the rest of this file does, so a message that arrived with its own name
+compression keeps it.
+*/
+clear_edns_extended_rcode :: proc(msg: []u8) -> bool {
+	span := find_opt_span(msg) or_return
+	// TTL sits between the class and RDLENGTH, so it ends four bytes back, and
+	// the extended rcode is its first byte - the one `peek_rcode` reads.
+	msg[span.rdlen_pos - 4] = 0
+	return true
+}
+
+/*
 The full response code of an encoded message, extended bits included.
 
 `Message.flags` carries only the low four; the other eight live in the OPT

@@ -108,12 +108,10 @@ DNSSEC chain, it is not. NOERROR and NXDOMAIN are the only rcodes that say
 anything about a delegation; anything else leaves the chain unestablished, and
 an unestablished chain is a SERVFAIL for a name that may be perfectly good.
 
-Transport failures are deliberately not retried here - `resolve` has already
-exhausted them, every server for `attempts` rounds. What it leaves unretried is
-the reply that did arrive and said nothing, so that is what this asks again.
-
-The ordinary path is untouched: an answerable reply returns from the call below
-and none of the rest runs.
+The ordinary path is untouched: an answerable reply returns from the first
+exchange and none of the sweep runs. Where nobody in the group can manage one
+the first reply comes back as it stands, rcode and all, for the caller to read
+and decide on - see `resolve_insisting`, which is the sweep both of these are.
 */
 resolve_answerable :: proc(
 	g: ^Group,
@@ -124,22 +122,91 @@ resolve_answerable :: proc(
 	winner: ^Upstream,
 	err: Error,
 ) {
+	return resolve_insisting(g, query, answerable, allocator)
+}
+
+/*
+Resolve `query`, insisting on a reply whose rcode the client can read.
+
+`dns.peek_rcode` composes twelve bits - the header's four, and eight more out of
+the OPT record's TTL (RFC 6891 section 6.1.3). A stub reads the four. So an
+extended rcode reaches the client as a different rcode entirely, and where its
+low nibble is zero it reaches it as a plausible one: BADVERS is 16, so a client
+handed that reply sees NOERROR over an empty answer section, which is a NODATA.
+The upstream said "not in that EDNS version"; the client is told the name has no
+such record. A DANE or MTA-STS client that believes it downgrades.
+
+Which makes it neither a reply to pass on nor a verdict about the name: it is a
+server declining the transport this one asked in. elodin only ever sends EDNS
+version 0, which every EDNS implementation is required to support, so a BADVERS
+in answer to one is that server violating the protocol rather than saying
+anything about the question. The rest of the group is asked, the way a chain
+lookup asks past a server that would not answer it.
+
+The ordinary path is untouched: a readable reply returns from the first exchange
+and none of the sweep runs. Where no member of the group can manage one the
+first reply still comes back, extended rcode and all - `resolve_query` reads it
+and answers SERVFAIL, because turning one reply into another is no more this
+procedure's business here than it is below.
+*/
+resolve_readable :: proc(
+	g: ^Group,
+	query: []u8,
+	allocator := context.allocator,
+) -> (
+	response: []u8,
+	winner: ^Upstream,
+	err: Error,
+) {
+	return resolve_insisting(g, query, readable_rcode, allocator)
+}
+
+/*
+Ask the group, and sweep it once when what came back is not a reply `acceptable`
+will have.
+
+The two callers above differ only in what they will take - a chain lookup wants
+a reply that says something about the name, a client's own question wants one
+whose rcode the client can read - and everything else about the sweep is common
+to both, so it is written once here.
+
+Transport failures are deliberately not retried: `resolve` has already exhausted
+them, every server for `attempts` rounds. What it leaves unretried is the reply
+that did arrive and was no use, so that is what this asks again.
+*/
+@(private)
+resolve_insisting :: proc(
+	g: ^Group,
+	query: []u8,
+	acceptable: proc(response: []u8) -> bool,
+	allocator: mem.Allocator,
+) -> (
+	response: []u8,
+	winner: ^Upstream,
+	err: Error,
+) {
 	response, winner, err = resolve(g, query, allocator)
-	if err != .None || answerable(response) {
+	if err != .None || acceptable(response) {
 		return response, winner, err
 	}
 
 	/*
 	One pass, and the server that already spoke is skipped: it gave its answer
 	and asking it again gets the same one. That bounds the sweep by the server
-	count, and the chain walk calling this is itself bounded by
-	MAX_LOOKUPS_PER_QUERY, so no client can turn one question into an unbounded
-	fan-out.
+	count. A chain walk calling this is itself bounded by
+	MAX_LOOKUPS_PER_QUERY, and a client's own question reaches it once, so no
+	client can turn one question into an unbounded fan-out.
 
 	Health is left alone where the rcode is concerned, on purpose. SERVFAIL is a
 	legitimate answer to plenty of questions, and a server that gives one has not
 	failed in the sense `record_failure` tracks - it answered, promptly, and for
 	the client's own queries this server goes on using it.
+
+	An unreadable rcode is left alone for a sharper reason: those eight bits are
+	two bytes an on-path attacker can write into any reply it can reach. Counting
+	them as a failure would let it park a healthy upstream, and then every member
+	of the group in turn, from one forged packet per query - which is a worse
+	outage than the answer this sweeps past.
 
 	A server already in its cooldown is another matter, and is skipped. It is
 	there because its own exchanges timed out three times over, so what asking it
@@ -154,6 +221,17 @@ resolve_answerable :: proc(
 	A group whose every member is parked therefore sweeps nobody, and the first
 	reply stands - which is the same answer as before for a group that has
 	nothing to give, reached without the wait.
+
+	Under `strategy: race` the sweep asks members the race has already asked in
+	parallel, and whose replies `resolve_race` threw away once it had a winner.
+	That is real duplicated work - up to one sequential exchange per remaining
+	member, at `g.timeout` each where they do not answer - and it is still the
+	right trade here: the reply that won the race is one the caller cannot use,
+	and the answer another member gave microseconds later is the client's answer
+	rather than a SERVFAIL. Taking the first *acceptable* reply inside the race
+	instead would spend nothing at all, and wants its own change: it means
+	teaching `Race_State` to keep a reply it will not return yet, on the one
+	path where a worker can outlive the caller.
 	*/
 	for u in g.servers {
 		if u == winner {
@@ -163,12 +241,12 @@ resolve_answerable :: proc(
 			logx.debugf("upstream %s is in its cooldown, not asked again for this one", u.spec.name)
 			continue
 		}
-		resp, xerr := exchange(u, query, g.timeout, allocator)
+		resp, xerr := exchange(u, sweep_query(query), g.timeout, allocator)
 		if xerr != .None {
 			logx.debugf("upstream %s failed: %v", u.spec.name, xerr)
 			continue
 		}
-		if answerable(resp) {
+		if acceptable(resp) {
 			// The first reply is superseded. It came from the caller's
 			// allocator, which is an arena per request on the query path,
 			// where this is a no-op; it matters where one is not.
@@ -194,6 +272,51 @@ answerable :: proc(response: []u8) -> bool {
 		return true
 	}
 	return false
+}
+
+/*
+The query as it goes to the next server in the sweep: the same bytes under a
+transaction ID of its own.
+
+RFC 5452 section 9.2, and the same reasoning `resolve_query` gives for drawing a
+fresh ID before its second exchange - each exchange is a new one on the wire. It
+matters more here than there. What triggers this sweep is a reply, so the server
+that sent the first one chooses the moment: an upstream that is hostile, or one
+whose traffic an attacker can read, answers with something the caller cannot use
+and thereby induces a second query for the same name to another member of the
+group - carrying, if the ID went unchanged, the ID it has just been told. That
+leaves only the fresh source port between an off-path forgery and an answer this
+server would cache for every client behind it. `cookie_matches` does not cover
+the gap either: a reply with no COOKIE option is accepted from an upstream that
+has never issued one, which is what a spoofed datagram would send.
+
+A copy, because `query` is the caller's buffer and is sent again after this
+returns - `resolve_query` re-sends it to the route, and `attach_cookie` reads it
+per upstream. Scratch space, as `exchange` itself uses for the cookie copy: the
+sweep runs on the request's own thread, whose arena the caller resets.
+
+A message too short to hold a header is handed on untouched. `exchange` is where
+that is refused; inventing bytes for it here would only hide it.
+*/
+@(private)
+sweep_query :: proc(query: []u8) -> []u8 {
+	if len(query) < dns.HEADER_SIZE {
+		return query
+	}
+	out := make([]u8, len(query), context.temp_allocator)
+	copy(out, query)
+	dns.set_id_in_place(out, dns.random_id())
+	return out
+}
+
+// Whether the rcode a client reads off the header is the rcode the responder
+// meant. Everything at 16 and above lives half in the OPT record's TTL, which a
+// stub does not look at; see `resolve_readable`. A reply too short to hold a
+// header, or one carrying no OPT record, reads as its header's own four bits,
+// which is what `peek_rcode` returns for both.
+@(private)
+readable_rcode :: proc(response: []u8) -> bool {
+	return u16(dns.peek_rcode(response)) <= 0xf
 }
 
 @(private)

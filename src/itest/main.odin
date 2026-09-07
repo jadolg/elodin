@@ -160,6 +160,9 @@ main :: proc() {
 	section(&r, "upstream strategies")
 	run_strategy_cases(&r)
 
+	section(&r, "extended rcodes from an upstream")
+	run_extended_rcode_cases(&r)
+
 	section(&r, "per-domain upstreams")
 	run_zone_route_cases(&r)
 

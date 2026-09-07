@@ -65,7 +65,7 @@ stats_line :: proc(
 	limited, slipped, conn_limited: u64,
 ) -> string {
 	return fmt.tprintf(
-		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d rewritten=%d dropped=%d refused=%d conn_refused=%d conn_rate_limited=%d conn_failed=%d accept_backoff=%d handshakes=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d special_use=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d",
+		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d rewritten=%d dropped=%d refused=%d conn_refused=%d conn_rate_limited=%d conn_failed=%d accept_backoff=%d handshakes=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d special_use=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d unreadable_rcode=%d",
 		st.queries,
 		st.blocked,
 		st.cached,
@@ -106,6 +106,11 @@ stats_line :: proc(
 		cs.misses,
 		cs.stale,
 		cs.evictions,
+		// Last, and after the cache's figures, because it is the newest of them
+		// rather than because it belongs there: a scraper reading positions
+		// rather than names is not something this line owes anything to, but an
+		// operator's eye reading the same line every day is.
+		st.unreadable_rcode,
 	)
 }
 
@@ -677,11 +682,12 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 	// One series per configured name, gathered once and walked four times, so
 	// the de-duplication happens in one place rather than in each family below.
 	Series :: struct {
-		name:     string,
-		queries:  u64,
-		failures: u64,
-		latency:  u64,
-		up:       bool,
+		name:       string,
+		queries:    u64,
+		failures:   u64,
+		latency:    u64,
+		unreadable: u64,
+		up:         bool,
 	}
 	all := make([dynamic]Series, 0, 8, context.temp_allocator)
 	at := make(map[string]int, context.temp_allocator)
@@ -696,6 +702,7 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 				all[i].queries += us.queries
 				all[i].failures += us.failures
 				all[i].latency += us.latency_ns_total
+				all[i].unreadable += us.unreadable_rcode
 				if live {
 					all[i].up = true
 				}
@@ -709,6 +716,7 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 					queries = us.queries,
 					failures = us.failures,
 					latency = us.latency_ns_total,
+					unreadable = us.unreadable_rcode,
 					up = live,
 				},
 			)
@@ -727,6 +735,27 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 	metrics.family(b, "elodin_upstream_failures_total", .Counter, "Exchanges with each upstream that did not produce a usable answer.")
 	for u in all {
 		metrics.sample(b, "elodin_upstream_failures_total", u.failures, metrics.Label{"upstream", u.name})
+	}
+
+	/*
+	Which upstream sent an rcode no client could read, which is not in the
+	family above.
+
+	`resolve_insisting` deliberately does not count one of these as a failure -
+	those bits are two bytes an on-path attacker can write, and a failure would
+	let it park the group - so a server doing this holds a clean
+	`elodin_upstream_failures_total` and an `elodin_upstream_up` of 1. Without
+	this series the name is only in the one `warn` line the server says before
+	demoting the rest to debug.
+	*/
+	metrics.family(
+		b,
+		"elodin_upstream_unreadable_rcode_total",
+		.Counter,
+		"Replies from each upstream refused because their rcode is one a client would read as a different rcode: the extended half lives in the OPT record and a stub reads the header.",
+	)
+	for u in all {
+		metrics.sample(b, "elodin_upstream_unreadable_rcode_total", u.unreadable, metrics.Label{"upstream", u.name})
 	}
 
 	/*

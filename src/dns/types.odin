@@ -319,3 +319,48 @@ type_name :: proc(t: Type) -> string {
 	}
 	return "TYPE?"
 }
+
+/*
+The registry spelling of a response code, and whether there is one.
+
+The IANA registry RFC 6895 section 2.3 established names 0-11 and 16-23 -
+DSOTYPENI arriving later with RFC 8490 and BADCOOKIE with RFC 7873 - and
+everything between and above is unassigned. `known` false is not an error - a composed rcode of 32 is a
+perfectly well-formed thing for a responder to send, RFC 6891 section 6.1.3
+having made the field twelve bits wide - so a caller that has to print one is
+expected to print the number instead. Odin's own `%v` renders an unnamed value
+as a `BAD ENUM VALUE` placeholder, which is the one thing that must not reach a
+log line or an extended DNS error: the byte those twelve bits come out of is one
+an on-path attacker writes, so it would choose the placeholder.
+
+The spellings are the ones `dig` prints and an operator greps for, which is why
+they are here rather than left to the enum's own field names.
+*/
+rcode_name :: proc(r: Rcode) -> (name: string, known: bool) {
+	#partial switch r {
+	case .No_Error:   return "NOERROR", true
+	case .Form_Err:   return "FORMERR", true
+	case .Serv_Fail:  return "SERVFAIL", true
+	case .NX_Domain:  return "NXDOMAIN", true
+	case .Not_Impl:   return "NOTIMP", true
+	case .Refused:    return "REFUSED", true
+	case .YX_Domain:  return "YXDOMAIN", true
+	case .YX_RRSet:   return "YXRRSET", true
+	case .NX_RRSet:   return "NXRRSET", true
+	case .Not_Auth:   return "NOTAUTH", true
+	case .Not_Zone:   return "NOTZONE", true
+	case .DSO_Type_NI:return "DSOTYPENI", true
+	// BADVERS and BADSIG share 16: the first is what a responder means by it in
+	// an OPT record, which is the only place these upper bits can travel, and
+	// the second is TSIG's reading of the same number (RFC 6895 section 2.3).
+	case .Bad_Vers:   return "BADVERS", true
+	case .Bad_Key:    return "BADKEY", true
+	case .Bad_Time:   return "BADTIME", true
+	case .Bad_Mode:   return "BADMODE", true
+	case .Bad_Name:   return "BADNAME", true
+	case .Bad_Alg:    return "BADALG", true
+	case .Bad_Trunc:  return "BADTRUNC", true
+	case .Bad_Cookie: return "BADCOOKIE", true
+	}
+	return "", false
+}

@@ -7,6 +7,7 @@ import "core:testing"
 import "core:time"
 import "elodin:cache"
 import "elodin:config"
+import "elodin:upstream"
 
 /*
 A `Server` with counters and nothing else behind them.
@@ -72,6 +73,7 @@ test_every_counter_reaches_the_endpoint :: proc(t: ^testing.T) {
 			rebind = 14,
 			special_use = 15,
 			accept_backoff = 16,
+			unreadable_rcode = 17,
 		},
 	)
 
@@ -91,6 +93,15 @@ test_every_counter_reaches_the_endpoint :: proc(t: ^testing.T) {
 	expect_line(t, page, `elodin_dnssec_answers_total{result="bogus"} 13`)
 	expect_line(t, page, "elodin_rebind_refused_total 14")
 	expect_line(t, page, "elodin_special_use_total 15")
+	/*
+	`unreadable_rcode` is the one counter whose series is not here, and
+	deliberately: it is published per upstream, because "which of the group is
+	doing this" is the question it exists to answer and a total cannot.
+	`sum()` gives the figure this line would have. Its series is pinned by
+	`test_an_unreadable_rcode_is_published_against_the_upstream` below, over a
+	group this fixture has no room for; the stats line's total is pinned by the
+	reflection walk in `test_the_stats_line_carries_every_counter`.
+	*/
 	free_all(context.temp_allocator)
 }
 
@@ -129,6 +140,61 @@ Two `# TYPE` lines for one metric name are a duplicate, and a scraper rejects
 the whole response over it rather than the line - so a page that is merely
 noisy in this respect is a page that reports nothing at all.
 */
+
+/*
+The upstream that sent an rcode no client could read is named in the scrape.
+
+The line the server logs for one of these is said once per process and demoted
+to debug after it, because the bytes behind it are ones an on-path attacker can
+write - so a four-member group with one broken member would otherwise leave an
+operator watching a total climb with no way to tell which member. Nor does
+`elodin_upstream_failures_total` say: `resolve_insisting` refuses to count this
+as a failure, on purpose, so the offending server keeps a clean failure count
+and an `elodin_upstream_up` of 1.
+
+No socket is opened. `make_upstream` resolves a literal address and builds the
+structure; nothing here sends anything.
+*/
+@(test)
+test_an_unreadable_rcode_is_published_against_the_upstream :: proc(t: ^testing.T) {
+	u, uerr := upstream.make_upstream(
+		config.Upstream_Spec{name = "broken", kind = .UDP, address = "127.0.0.1", port = 5353},
+		0,
+		time.Second,
+		context.allocator,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot build the upstream: %v", uerr) {
+		return
+	}
+	defer upstream.destroy(u)
+
+	servers := make([]^upstream.Upstream, 1, context.allocator)
+	defer delete(servers, context.allocator)
+	servers[0] = u
+	g := upstream.Group {
+		servers  = servers,
+		strategy = .Failover,
+		attempts = 1,
+	}
+
+	upstream.note_unreadable_rcode(u)
+	upstream.note_unreadable_rcode(u)
+
+	s, cfg := metrics_fixture(Stats{unreadable_rcode = 2})
+	s.cfg = &cfg
+	s.group = &g
+	listeners: Listeners
+	page := render_metrics(&s, &listeners, context.temp_allocator)
+
+	expect_line(t, page, `elodin_upstream_unreadable_rcode_total{upstream="broken"} 2`)
+	// And it is not counted as a failure or a reason to call the server down,
+	// which is what makes the series above the only trace it leaves.
+	expect_line(t, page, `elodin_upstream_failures_total{upstream="broken"} 0`)
+	expect_line(t, page, `elodin_upstream_up{upstream="broken"} 1`)
+
+	free_all(context.temp_allocator)
+}
+
 @(test)
 test_no_family_is_declared_twice :: proc(t: ^testing.T) {
 	page := render_fixture(Stats{})
@@ -248,6 +314,7 @@ test_the_stats_line_carries_every_counter :: proc(t: ^testing.T) {
 		rebind         = 14,
 		special_use    = 15,
 		accept_backoff = 16,
+		unreadable_rcode = 17,
 	}
 	cs := cache.Stats {
 		hits      = 20,
