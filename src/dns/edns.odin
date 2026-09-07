@@ -230,14 +230,16 @@ remove_opt :: proc(msg: []u8, allocator := context.allocator) -> (out: []u8, ok:
 	behind it whose names may well be pointed at, and those offsets do move,
 	which is why that case is rebuilt instead.
 	*/
-	out = make([]u8, span.rec_start, allocator)
-	copy(out, msg[:span.rec_start])
-	arcount := u16(out[10]) << 8 | u16(out[11])
+	arcount := u16(msg[10]) << 8 | u16(msg[11])
 	if arcount == 0 {
 		// Unreachable: the record was counted in ARCOUNT to be found at all.
+		// Read before the copy is made rather than after, so the one return that
+		// hands back nothing has allocated nothing either.
 		return nil, false
 	}
 	arcount -= 1
+	out = make([]u8, span.rec_start, allocator)
+	copy(out, msg[:span.rec_start])
 	out[10] = u8(arcount >> 8)
 	out[11] = u8(arcount)
 	return out, true

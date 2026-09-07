@@ -434,11 +434,13 @@ advertised_udp_size :: proc(s: ^Server, query: dns.Message, proto: Protocol) -> 
 Write that size onto an answer that is already encoded.
 
 A no-op for a client that asked without EDNS: there is no OPT record to carry a
-number and none is invented for one. Nor is one missing by accident by the time
-this runs - `match_client_opt` has already made the answer's OPT record match the
-request's, so an answer with none is an answer to a client that asked with none.
-A no-op on the stream transports too, where the field bounds nothing and the
-answer's own OPT is left as it is.
+number and none is invented for one. On the answers `handle_query` runs
+`match_client_opt` over first, an OPT record is missing here only because the
+client asked with none - or because the mint failed, which leaves the answer as
+it stands. The three refusals that return ahead of `match_client_opt` reach this
+with whatever `dns.error_response` echoed from the query, which is the same
+answer for the same reason. A no-op on the stream transports too, where the
+field bounds nothing and the answer's own OPT is left as it is.
 */
 @(private)
 advertise_udp_size :: proc(wire: []u8, size: u16, proto: Protocol) -> []u8 {
@@ -489,11 +491,19 @@ the client's own figure, which is what `make_response` puts in a locally built
 answer there. See `attach_cookie`, which mints under the same rule and passes the
 same number.
 
-Eleven bytes longer is a message that may no longer fit, so it is refitted the
-way `attach_cookie` refits an answer its cookie pushed past the ceiling: the
-client is told to ask again over TCP rather than handed a datagram larger than
-the limit. A failed mint or strip leaves the answer as it stands - the OPT
-mismatch is worth correcting, and not worth withholding an answer over.
+Either direction is refitted afterwards, the way `attach_cookie` refits an
+answer its cookie pushed past the ceiling: the client is told to ask again over
+TCP rather than handed a datagram larger than the limit. Minting is the obvious
+reason to need it - eleven bytes longer is a message that may no longer fit -
+and stripping is the less obvious one: `dns.remove_opt` cuts the bytes only
+where the record is the tail of the message, and rebuilds the message where it
+is not, so what comes back from that path is an encoding of the answer rather
+than a shortening of it and is not bounded by what went in. `fit_response` is a
+no-op on anything already within the limit, which is every answer either
+direction returns in practice.
+
+A failed mint or strip leaves the answer as it stands - the OPT mismatch is
+worth correcting, and not worth withholding an answer over.
 */
 @(private)
 match_client_opt :: proc(
@@ -512,10 +522,7 @@ match_client_opt :: proc(
 		if !ok {
 			return wire
 		}
-		if len(out) > limit {
-			return fit_response(out, limit, query, allocator)
-		}
-		return out
+		return fit_response(out, limit, query, allocator)
 	}
 
 	/*
@@ -541,7 +548,7 @@ match_client_opt :: proc(
 	if !ok {
 		return wire
 	}
-	return out
+	return fit_response(out, limit, query, allocator)
 }
 
 /*
