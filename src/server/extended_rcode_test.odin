@@ -60,8 +60,13 @@ serve_one_canned :: proc(x: ^Canned_Exchange) {
 	_, _ = net.send_udp(x.socket, out[:len(x.reply)], remote)
 }
 
+/*
+The client's question. `edns` decides whether it offers an OPT record, which is
+the only place a response can put an extended DNS error: a client that asked
+without one has nowhere to be told why, and gets the bare refusal.
+*/
 @(private = "file")
-tlsa_query :: proc() -> []u8 {
+tlsa_query :: proc(edns := true) -> []u8 {
 	question := make([]dns.Question, 1, context.temp_allocator)
 	question[0] = dns.Question {
 		name  = TLSA_NAME,
@@ -73,11 +78,38 @@ tlsa_query :: proc() -> []u8 {
 		question = question,
 	}
 	msg.flags.rd = true
+	if edns {
+		additional := make([]dns.Record, 1, context.temp_allocator)
+		additional[0] = dns.make_opt(1232, false)
+		msg.additional = additional
+	}
 	wire, _, err := dns.encode_message(msg, context.temp_allocator)
 	if err != .None {
 		return nil
 	}
 	return wire
+}
+
+// The info-code of the extended error a response carries (RFC 8914), or -1 if
+// it has none.
+@(private = "file")
+extended_error_code :: proc(wire: []u8) -> int {
+	msg, err := dns.decode_message(wire, context.temp_allocator)
+	if err != .None {
+		return -1
+	}
+	for rec in msg.additional {
+		opt, is_opt := rec.data.(dns.Rdata_OPT)
+		if !is_opt {
+			continue
+		}
+		for option in opt.options {
+			if option.code == u16(dns.EDNS_Option_Code.Ext_Error) && len(option.data) >= 2 {
+				return int(option.data[0]) << 8 | int(option.data[1])
+			}
+		}
+	}
+	return -1
 }
 
 /*
@@ -300,9 +332,26 @@ test_an_extended_rcode_is_not_forwarded_to_the_client :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(decoded.answer), 0)
 	testing.expect_value(t, decoded.id, u16(0x7d1e))
 
+	/*
+	And the client is told why, the way the rebinding guard and the validator
+	explain their own refusals: RFC 8914 extended error 0, "Other", with the
+	rcode in the text. There is no registered code for "the responder's rcode is
+	not one you could read", and a nearer-sounding one - a network error, an
+	unreachable authority - would say something untrue about an upstream that
+	answered.
+	*/
+	testing.expect_value(t, extended_error_code(out), 0)
+
 	counters := stats_of(&s)
 	testing.expect_value(t, counters.failed, u64(1))
 	testing.expect_value(t, counters.forwarded, u64(0))
+	/*
+	Counted as its own figure as well, which is what makes the once-at-warn line
+	sound: the warning is said once per process and demoted to debug after, so a
+	deployment whose upstream starts doing this has nothing but this counter to
+	show for every query after the first. Same reasoning as `conn_refused`.
+	*/
+	testing.expect_value(t, counters.unreadable_rcode, u64(1))
 
 	free_all(context.temp_allocator)
 }
@@ -354,7 +403,16 @@ test_an_extended_rcode_with_a_nonzero_nibble_is_not_forwarded_either :: proc(t: 
 		reply  = reply,
 	}
 	mock := thread.create_and_start_with_poly_data(&x, serve_one_canned)
-	out, outcome, ok := handle_query(&s, tlsa_query(), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	// Asked without EDNS, which is the other half of this case: there is no OPT
+	// record in the response to carry an extended error, and the refusal has to
+	// go out as a plain SERVFAIL rather than not at all.
+	out, outcome, ok := handle_query(
+		&s,
+		tlsa_query(edns = false),
+		.UDP,
+		"127.0.0.1:5555",
+		context.temp_allocator,
+	)
 	thread.join(mock)
 	thread.destroy(mock)
 
@@ -369,6 +427,13 @@ test_an_extended_rcode_with_a_nonzero_nibble_is_not_forwarded_either :: proc(t: 
 		"the client was handed %v rather than SERVFAIL",
 		dns.peek_rcode(out),
 	)
+
+	decoded, derr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+	testing.expect_value(t, dns.rcode_of(decoded), dns.Rcode.Serv_Fail)
+	testing.expect_value(t, decoded.id, u16(0x7d1e))
+	testing.expect_value(t, len(decoded.answer), 0)
+	testing.expect_value(t, extended_error_code(out), -1)
 
 	free_all(context.temp_allocator)
 }

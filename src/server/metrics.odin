@@ -65,7 +65,7 @@ stats_line :: proc(
 	limited, slipped, conn_limited: u64,
 ) -> string {
 	return fmt.tprintf(
-		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d rewritten=%d dropped=%d refused=%d conn_refused=%d conn_rate_limited=%d conn_failed=%d accept_backoff=%d handshakes=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d special_use=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d",
+		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d rewritten=%d dropped=%d refused=%d conn_refused=%d conn_rate_limited=%d conn_failed=%d accept_backoff=%d handshakes=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d special_use=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d unreadable_rcode=%d",
 		st.queries,
 		st.blocked,
 		st.cached,
@@ -106,6 +106,11 @@ stats_line :: proc(
 		cs.misses,
 		cs.stale,
 		cs.evictions,
+		// Last, and after the cache's figures, because it is the newest of them
+		// rather than because it belongs there: a scraper reading positions
+		// rather than names is not something this line owes anything to, but an
+		// operator's eye reading the same line every day is.
+		st.unreadable_rcode,
 	)
 }
 
@@ -475,6 +480,13 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 		slipped,
 	)
 
+	metrics.scalar(
+		&b,
+		"elodin_upstream_unreadable_rcode_total",
+		.Counter,
+		"Upstream replies refused because their rcode is one a client would read as a different rcode: the extended half lives in the OPT record and a stub reads the header.",
+		st.unreadable_rcode,
+	)
 	metrics.scalar(
 		&b,
 		"elodin_rebind_refused_total",

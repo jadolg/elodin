@@ -238,7 +238,16 @@ test_a_reply_the_client_cannot_read_is_asked_elsewhere :: proc(t: ^testing.T) {
 	testing.expect(t, sync.atomic_load(&answerer.hits) > 0, "the second upstream was never asked")
 	delete(resp, context.allocator)
 
-	free_all(context.temp_allocator)
+	/*
+	The scratch arena is left for the runner to reset rather than reset here.
+
+	`m.reply` points into it, and the responder threads are stopped and joined
+	by the deferred blocks above - which run *after* the last statement of this
+	procedure. Resetting the arena here would hand a live thread a slice into
+	memory this frame had given back, and it is a read nothing would report:
+	`ODIN_TEST_FAIL_ON_BAD_MEMORY` tracks `context.allocator`, and the temporary
+	arena keeps its blocks mapped, so ASan sees nothing either.
+	*/
 }
 
 /*
@@ -297,7 +306,16 @@ test_an_unreadable_reply_still_comes_back_when_nobody_else_can_answer :: proc(t:
 	// server from a forged packet per query.
 	testing.expect(t, healthy(bad), "an upstream was parked over an rcode it answered with")
 
-	free_all(context.temp_allocator)
+	/*
+	The scratch arena is left for the runner to reset rather than reset here.
+
+	`m.reply` points into it, and the responder threads are stopped and joined
+	by the deferred blocks above - which run *after* the last statement of this
+	procedure. Resetting the arena here would hand a live thread a slice into
+	memory this frame had given back, and it is a read nothing would report:
+	`ODIN_TEST_FAIL_ON_BAD_MEMORY` tracks `context.allocator`, and the temporary
+	arena keeps its blocks mapped, so ASan sees nothing either.
+	*/
 }
 
 /*
@@ -385,5 +403,14 @@ test_the_swept_query_carries_a_transaction_id_of_its_own :: proc(t: ^testing.T) 
 		ROUNDS,
 	)
 
-	free_all(context.temp_allocator)
+	/*
+	The scratch arena is left for the runner to reset rather than reset here.
+
+	`m.reply` points into it, and the responder threads are stopped and joined
+	by the deferred blocks above - which run *after* the last statement of this
+	procedure. Resetting the arena here would hand a live thread a slice into
+	memory this frame had given back, and it is a read nothing would report:
+	`ODIN_TEST_FAIL_ON_BAD_MEMORY` tracks `context.allocator`, and the temporary
+	arena keeps its blocks mapped, so ASan sees nothing either.
+	*/
 }

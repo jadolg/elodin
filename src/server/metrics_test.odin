@@ -72,6 +72,7 @@ test_every_counter_reaches_the_endpoint :: proc(t: ^testing.T) {
 			rebind = 14,
 			special_use = 15,
 			accept_backoff = 16,
+			unreadable_rcode = 17,
 		},
 	)
 
@@ -91,6 +92,7 @@ test_every_counter_reaches_the_endpoint :: proc(t: ^testing.T) {
 	expect_line(t, page, `elodin_dnssec_answers_total{result="bogus"} 13`)
 	expect_line(t, page, "elodin_rebind_refused_total 14")
 	expect_line(t, page, "elodin_special_use_total 15")
+	expect_line(t, page, "elodin_upstream_unreadable_rcode_total 17")
 	free_all(context.temp_allocator)
 }
 
@@ -248,6 +250,7 @@ test_the_stats_line_carries_every_counter :: proc(t: ^testing.T) {
 		rebind         = 14,
 		special_use    = 15,
 		accept_backoff = 16,
+		unreadable_rcode = 17,
 	}
 	cs := cache.Stats {
 		hits      = 20,

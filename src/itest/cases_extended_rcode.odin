@@ -27,7 +27,7 @@ what the first case refuses.
 DANE_NAME :: "_25._tcp.mx.test."
 
 @(private = "file")
-config_for :: proc(udp_port: int, servers: string) -> string {
+config_for :: proc(udp_port: int, servers: string, extra := "") -> string {
 	return fmt.tprintf(
 		`log: {{ level: debug, queries: true }}
 listeners:
@@ -42,10 +42,33 @@ upstream:
 cache: {{ enabled: false }}
 blocking: {{ enabled: false }}
 dnssec: {{ enabled: false }}
-`,
+%s`,
 		udp_port,
 		servers,
+		extra,
 	)
+}
+
+// The info-code of the extended error a response carries (RFC 8914), or -1 if
+// it has none.
+@(private = "file")
+extended_error :: proc(wire: []u8) -> int {
+	msg, err := dns.decode_message(wire, context.temp_allocator)
+	if err != .None {
+		return -1
+	}
+	for rec in msg.additional {
+		opt, is_opt := rec.data.(dns.Rdata_OPT)
+		if !is_opt {
+			continue
+		}
+		for option in opt.options {
+			if option.code == u16(dns.EDNS_Option_Code.Ext_Error) && len(option.data) >= 2 {
+				return int(option.data[0]) << 8 | int(option.data[1])
+			}
+		}
+	}
+	return -1
 }
 
 // The certificate association a DANE client is asking for. Raw RDATA because
@@ -124,6 +147,10 @@ run_extended_rcode_cases :: proc(r: ^Runner) {
 							check_eq_int(r, int(dns.rcode_of(msg)), int(dns.Rcode.Serv_Fail), "composed rcode")
 							check_eq_int(r, len(msg.answer), 0, "answer records")
 						}
+						// And the client is told why rather than left with a
+						// bare SERVFAIL: RFC 8914 code 0, "Other", with the
+						// rcode in the text.
+						check_eq_int(r, extended_error(res.wire), 0, "extended DNS error code")
 					}
 				}
 				end_case(r)
@@ -182,5 +209,73 @@ run_extended_rcode_cases :: proc(r: ^Runner) {
 				end_case(r)
 			}
 		}
+	}
+	// --- and the refusal is visible on the metrics endpoint ---
+	{
+		mock_port := next_port(r)
+		broken := mock_make("badvers", mock_port)
+		mock_rcode(broken, DANE_NAME, u16(dns.Type.TLSA), .Bad_Vers)
+		if !mock_start(broken) {
+			skip_case(r, "extended rcode: counted", "cannot start the mock upstream")
+			return
+		}
+		defer mock_stop(broken)
+
+		udp_port := next_port(r)
+		metrics_port := next_port(r)
+		srv, ok := start_server(
+			r,
+			Server_Options {
+				config = config_for(
+					udp_port,
+					fmt.tprintf("    - \"127.0.0.1:%d\"\n", mock_port),
+					fmt.tprintf("metrics: {{ enabled: true, address: \"127.0.0.1\", port: %d }}\n", metrics_port),
+				),
+				udp_port = udp_port,
+			},
+		)
+		if !ok {
+			skip_case(r, "extended rcode: counted", "server did not start")
+			return
+		}
+		defer stop_server(&srv)
+
+		/*
+		The warning naming the upstream is said once per process and demoted to
+		debug after it, because the two bytes behind it are ones an on-path
+		attacker can write into any reply it can reach. That is only sound
+		while something else goes on counting - the same argument
+		`conn_refused` is written on - so this is the figure a deployment that
+		has gone dark this way is left with.
+		*/
+		start_case(r, "an upstream rcode a client cannot read is counted for the operator")
+		{
+			for _ in 0 ..< 3 {
+				res := query_udp(udp_port, build_query(DANE_NAME, u16(dns.Type.TLSA), edns_size = 1232))
+				check(r, res.ok, "no response")
+			}
+			if check(r, wait_http(metrics_port, "/metrics"), "the metrics endpoint never answered") {
+				res := http_request(metrics_port, "GET", "/metrics", context.temp_allocator)
+				if check(r, res.status == 200, "a scrape returned %d", res.status) {
+					page := string(res.body)
+					check_eq_int(
+						r,
+						metric_value(page, "elodin_upstream_unreadable_rcode_total"),
+						3,
+						"elodin_upstream_unreadable_rcode_total",
+					)
+					// The same queries are SERVFAILs like any other, so the
+					// counter above is a subset of this rather than a figure
+					// beside it.
+					check_eq_int(
+						r,
+						metric_value(page, "elodin_answers_total{outcome=\"failed\"}"),
+						3,
+						"failed answers",
+					)
+				}
+			}
+		}
+		end_case(r)
 	}
 }

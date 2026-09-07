@@ -162,6 +162,24 @@ Stats :: struct {
 	be invisible in both directions.
 	*/
 	special_use:  u64,
+	/*
+	Upstream replies refused because the rcode a client would read off the
+	header is not the rcode the responder meant - see
+	`unreadable_rcode_refusal`.
+
+	Counted rather than only logged, for the reason `conn_refused` is: the line
+	beside this is said once and demoted to debug after, because the two bytes
+	that trigger it are ones an on-path attacker can write into any reply it can
+	reach, and that reasoning only holds if something else goes on counting.
+	Without this, a deployment whose only upstream started answering an extended
+	rcode - every query a SERVFAIL - would show one `warn` from whenever it
+	began and a `failed=` that says nothing about why.
+
+	Apart from `failed`, which it also adds to. `failed` is every query this
+	server could not answer, and a rising one of those is the question "what is
+	wrong"; this is one specific answer to it, in a figure small enough to see.
+	*/
+	unreadable_rcode: u64,
 }
 
 Server :: struct {
@@ -1660,10 +1678,29 @@ sweep in `upstream.resolve_insisting` is written on - so a per-query warn would
 let one decide how much this server writes to disk, in exactly the
 `dnssec.enabled: false` deployments where the validator's own warn is not
 running either.
+
+Which is only sound because something else goes on counting: `unreadable_rcode`
+climbs on every one of these, in the stats line and in
+`elodin_upstream_unreadable_rcode_total`, so a server that has gone dark this
+way is visible long after the one warn scrolled away. The reasoning is
+`conn_refused`'s, and so is the shape.
+
+The client is told as much as it asked to be told: RFC 8914 extended error 0
+with the rcode named, the way the rebinding guard and the validator explain
+their own refusals. A client that queried without EDNS has nowhere to put one
+and gets the bare SERVFAIL.
 */
 // Set once the first reply has been refused for an unreadable rcode; see below.
 @(private)
 unreadable_rcode_reported: bool
+
+// RFC 8914 section 4.1: the error does not match any of the pre-defined codes,
+// so the EXTRA-TEXT is what carries it. There is no code for "the responder's
+// rcode is not one a client can be handed", and inventing a nearer-sounding one
+// - a network error, an unreachable authority - would say something untrue about
+// an upstream that answered.
+@(private)
+EDE_OTHER :: 0
 
 @(private)
 unreadable_rcode_refusal :: proc(
@@ -1712,8 +1749,24 @@ unreadable_rcode_refusal :: proc(
 		logx.warnf("further replies refused for an rcode a client cannot read are logged at debug level")
 	}
 	sync.atomic_add(&s.stats.failed, 1)
+	sync.atomic_add(&s.stats.unreadable_rcode, 1)
+
+	named := fmt.tprintf("rcode:%s", from)
+	refusal := dns.make_response(msg, .Serv_Fail, allocator)
+	attach_extended_error(&refusal, EDE_OTHER, fmt.tprintf("upstream rcode %v", rcode), allocator)
+	if encoded, _, enc_err := dns.encode_message(refusal, allocator, limit); enc_err == .None {
+		return encoded, named, true, true
+	}
+	/*
+	The explanation did not fit, or the message would not build. The refusal is
+	the part the client cannot do without, so it goes out without the reason -
+	and through `error_response`, which has the header-only fallback for a
+	message that will not encode at all. `dnssec_failure_response` answers
+	nothing in this case; there is no reason to be the stricter of the two about
+	a SERVFAIL.
+	*/
 	response, encoded := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
-	return response, fmt.tprintf("rcode:%s", from), true, encoded
+	return response, named, true, encoded
 }
 
 /*
@@ -2612,5 +2665,6 @@ stats_of :: proc(s: ^Server) -> Stats {
 		bogus = sync.atomic_load(&s.stats.bogus),
 		rebind = sync.atomic_load(&s.stats.rebind),
 		special_use = sync.atomic_load(&s.stats.special_use),
+		unreadable_rcode = sync.atomic_load(&s.stats.unreadable_rcode),
 	}
 }

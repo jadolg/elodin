@@ -588,6 +588,7 @@ test_stats_of_carries_every_counter :: proc(t: ^testing.T) {
 		// Not a connection and not a query - see `Stats.accept_backoff` - but
 		// carried by the same snapshot, and dropped by it just as silently.
 		accept_backoff = 16,
+		unreadable_rcode = 17,
 	}
 	s := Server {
 		stats = want,

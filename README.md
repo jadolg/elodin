@@ -412,6 +412,24 @@ resets partway through is retried once first, since some public resolvers do tha
 to a fair share of fresh connections while the very next attempt goes through.
 Only a reset is retried.
 
+An upstream's rcode is the client's answer — SERVFAIL and REFUSED are passed on
+as they arrive, since the rcode is what the client asked for — with one
+exception. An extended rcode (RFC 6891 section 6.1.3) is twelve bits, four in
+the header and eight in the OPT record, and a stub client reads the four: a
+BADVERS forwarded as it stands reads as NOERROR over an empty answer section,
+which is a client being told a name has no such record when what happened is
+that its resolver could not find out. A DANE or MTA-STS client that believes it
+downgrades. So a reply whose composed rcode is 16 or above is not one this
+server passes on: the other members of the group are asked, and if none of them
+can answer readably the query is a SERVFAIL carrying an extended DNS error
+(RFC 8914) that names the rcode. elodin only ever asks in EDNS version 0, which
+every EDNS implementation is required to support, so a BADVERS in reply to one
+is a protocol violation by that server rather than a fact about the name. Those
+refusals reach the log as `outcome=failed detail=rcode:<upstream>` and are
+counted as `unreadable_rcode=` and `elodin_upstream_unreadable_rcode_total`; the
+warning naming the upstream is said once and demoted to debug after it, since
+the bytes behind it are ones an on-path attacker can write.
+
 An `https` upstream picks between HTTP/2 and HTTP/1.1 with ALPN, preferring h2,
 since some public resolvers answer HTTP/1.1 only. Concurrent queries against an
 h2 upstream multiplex onto one connection; an HTTP/1.1 one uses the same pooled
@@ -1857,6 +1875,7 @@ as a warning at startup.
 | `elodin_rate_limit_slipped_total` | counter | those answered truncated instead, to send a real client to TCP |
 | `elodin_dnssec_answers_total{result}` | counter | `secure` and `bogus` |
 | `elodin_rebind_refused_total` | counter | answers withheld because a public name was pointed into private space |
+| `elodin_upstream_unreadable_rcode_total` | counter | upstream replies refused because their rcode is one a client would read as a different rcode — the extended half lives in the OPT record and a stub reads the header |
 | `elodin_special_use_total` | counter | queries answered from the reserved-name table instead of being forwarded |
 | `elodin_cache_entries` / `_bytes` | gauge | what the cache holds, against `max_entries` and `max_bytes` |
 | `elodin_cache_hits_total` / `_misses_total` / `_evictions_total` | counter | how it is doing |
@@ -1879,7 +1898,10 @@ as a warning at startup.
 backlog or the allow list turned away never reached an outcome, an answer the
 rebinding guard withheld is counted in `elodin_rebind_refused_total`, and of the
 `outcome=local` answers only the reserved-name table is counted, in
-`elodin_special_use_total`. The `process_` family carries the names every
+`elodin_special_use_total`. `elodin_upstream_unreadable_rcode_total` is a subset
+of `outcome="failed"` rather than a figure beside it: those queries are SERVFAILs
+like any other, and this says how many of them were an upstream answering
+something no client could read. The `process_` family carries the names every
 Prometheus client library uses, so a dashboard written against a Go or Python
 service works here unchanged.
 
