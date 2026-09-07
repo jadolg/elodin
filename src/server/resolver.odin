@@ -437,11 +437,14 @@ A no-op for a client that asked without EDNS: there is no OPT record to carry a
 number and none is invented for one. On the answers `handle_query` runs
 `match_client_opt` over first, an OPT record is missing here only because the
 client asked with none - or because the mint failed or would not have fit, either
-of which leaves the answer as it stands. The three refusals that return ahead of
-`match_client_opt` reach this with whatever `dns.error_response` echoed from the
-query, which is the same answer for the same reason. A no-op on the stream
-transports too, where the field bounds nothing and the answer's own OPT is left
-as it is.
+of which leaves the answer as it stands. Of the three refusals that return ahead
+of `match_client_opt`, two reach this with the OPT record `dns.error_response`
+echoed from the query, which is the same answer for the same reason. The third -
+the FORMERR for a query that did not decode - hands `error_response` an empty
+`dns.Message`, so it echoes nothing and this is a no-op whatever the client sent:
+a datagram this server could not read is not one to derive an EDNS record from.
+A no-op on the stream transports too, where the field bounds nothing and the
+answer's own OPT is left as it is.
 */
 @(private)
 advertise_udp_size :: proc(wire: []u8, size: u16, proto: Protocol) -> []u8 {
@@ -516,9 +519,13 @@ and the one the client got before any of this ran. `fit_response` is still what
 holds the ceiling over that answer, and is a no-op on anything already within the
 limit, which is every answer either direction returns in practice.
 
-A failed mint or strip leaves the answer as it stands - the OPT mismatch is
-worth correcting, and not worth withholding an answer over, nor worth costing
-one a round trip.
+A failed mint or strip keeps the answer rather than withholding it - the OPT
+mismatch is worth correcting, and not worth costing a client its answer. A
+failed strip returns those bytes untouched, since the strip could only have
+shortened them and whatever bounded them still does. A failed mint goes through
+`fit_response` beside the mint that would not fit, so the one procedure that
+holds the ceiling is reached on both, and it is a no-op on an answer already
+within the limit - which every answer arriving here is.
 */
 @(private)
 match_client_opt :: proc(
