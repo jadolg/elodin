@@ -52,7 +52,7 @@ ANSWER_ADDR := [4]u8{192, 0, 2, 7}
 CLIENT_ADVERTISED :: u16(4096)
 
 @(private = "file")
-client_query :: proc(edns: bool) -> []u8 {
+client_query :: proc(edns: bool, advertised := CLIENT_ADVERTISED) -> []u8 {
 	questions := make([]dns.Question, 1, context.temp_allocator)
 	questions[0] = dns.Question {
 		name  = QNAME,
@@ -67,7 +67,7 @@ client_query :: proc(edns: bool) -> []u8 {
 
 	if edns {
 		additional := make([]dns.Record, 1, context.temp_allocator)
-		additional[0] = dns.make_opt(CLIENT_ADVERTISED, false)
+		additional[0] = dns.make_opt(advertised, false)
 		msg.additional = additional
 	}
 
@@ -230,9 +230,16 @@ forward_once :: proc(
 	out: []u8,
 	ok: bool,
 ) {
+	return forward_reply(t, h, query, mock_reply(upstream_edns))
+}
+
+// As `forward_once`, for a case that has to name the reply's size as well as its
+// shape.
+@(private = "file")
+forward_reply :: proc(t: ^testing.T, h: ^Harness, query: []u8, reply: []u8) -> (out: []u8, ok: bool) {
 	x := Exchange {
 		socket = h.socket,
-		reply  = mock_reply(upstream_edns),
+		reply  = reply,
 	}
 	mock := thread.create_and_start_with_poly_data(&x, serve_one)
 	response, outcome, served := handle_query(&h.srv, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
@@ -371,6 +378,133 @@ test_a_forwarded_answer_gives_a_non_edns_client_no_opt :: proc(t: ^testing.T) {
 	testing.expect_value(t, derr, dns.Decode_Error.None)
 	testing.expect(t, !dns.edns_present(m), "an upstream's OPT record reached a client that sent none")
 	expect_the_answer_survived(t, m, "the forwarded answer")
+
+	free_all(context.temp_allocator)
+}
+
+/*
+A reply with no OPT record and `fillers` TXT records behind the answer this
+file's other cases use, so a case can put the answer close to a client's own
+advertised buffer.
+
+The shape is the one an upstream that dropped EDNS sends: no OPT record, and
+large enough that eleven more bytes are eleven a client's buffer may not have.
+*/
+@(private = "file")
+mock_reply_sized :: proc(fillers: int) -> []u8 {
+	questions := make([]dns.Question, 1, context.temp_allocator)
+	questions[0] = dns.Question {
+		name  = QNAME,
+		type  = .A,
+		class = .IN,
+	}
+	answer := make([]dns.Record, 1 + fillers, context.temp_allocator)
+	answer[0] = dns.Record {
+		name  = QNAME,
+		type  = .A,
+		class = .IN,
+		ttl   = 300,
+		data  = dns.Rdata_A{addr = ANSWER_ADDR},
+	}
+	for i in 0 ..< fillers {
+		txt := make([]string, 1, context.temp_allocator)
+		txt[0] = "0123456789abcdefghijklmnopqrstuvwxyz"
+		answer[1 + i] = dns.Record {
+			name  = QNAME,
+			type  = .TXT,
+			class = .IN,
+			ttl   = 300,
+			data  = dns.Rdata_TXT{strings = txt},
+		}
+	}
+
+	msg := dns.Message {
+		id       = CLIENT_ID,
+		question = questions,
+		answer   = answer,
+	}
+	msg.flags.qr = true
+	msg.flags.rd = true
+	msg.flags.ra = true
+
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	if err != .None {
+		return nil
+	}
+	return wire
+}
+
+/*
+An OPT record that will not fit is not minted, and the answer goes as it stands.
+
+The eleven bytes a minted record costs are eleven an answer near the client's own
+buffer does not have, and there is nothing behind them to drop: `encode_message`
+writes the answer section, finds the OPT will not fit, and reports a truncation.
+Refitting that reply hands the client a *complete* answer with TC set and still
+no OPT record - so it discards what it already had and asks again over TCP, every
+time, for nothing. `advertise_udp_size` reports false on the same answer either
+way, which is what says the refit bought nothing.
+
+Measured with the cache off, because the mismatch is not a cache-only one: an
+upstream that dropped EDNS produces it on the forwarding path too, and that is
+the shorter way to say what the answer's size has to be.
+*/
+@(test)
+test_an_opt_record_that_will_not_fit_is_not_minted :: proc(t: ^testing.T) {
+	h: Harness
+	if !harness_start(t, &h, caching = false) {
+		return
+	}
+	defer harness_stop(&h)
+
+	reply := mock_reply_sized(14)
+	if !testing.expect(t, reply != nil, "could not build the upstream's reply") {
+		return
+	}
+	/*
+	The premise, and the whole of what makes this case the case it is: the
+	client's figure leaves room for the answer and not for an OPT record behind
+	it. Above the 512 floor `dns.edns_udp_size` clamps to, or the number the
+	client states is not the number that bounds the answer.
+	*/
+	advertised := u16(len(reply) + 5)
+	if !testing.expectf(
+		t,
+		len(reply) > config.MIN_UDP_RESPONSE,
+		"the reply is %d bytes, which the advertised floor would swallow",
+		len(reply),
+	) {
+		return
+	}
+
+	out, ok := forward_reply(t, &h, client_query(true, advertised), reply)
+	if !ok {
+		return
+	}
+
+	m, derr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+	testing.expectf(
+		t,
+		!m.flags.tc,
+		"TC was set on a complete answer: %d bytes against an advertised %d",
+		len(out),
+		advertised,
+	)
+	testing.expectf(t, len(out) <= int(advertised), "the answer is %d bytes over the client's figure", len(out))
+	// The answer itself, record for record. `expect_the_answer_survived` names
+	// the one-record shape the other cases send, so the A record is checked here
+	// against the fillers behind it.
+	if testing.expect_value(t, len(m.answer), 1 + 14) {
+		addr, is_a := m.answer[0].data.(dns.Rdata_A)
+		if testing.expect(t, is_a, "the answer's RDATA did not survive") {
+			testing.expectf(t, addr.addr == ANSWER_ADDR, "the address came back as %v", addr.addr)
+		}
+		testing.expect_value(t, m.id, CLIENT_ID)
+		testing.expect_value(t, len(m.question), 1)
+	}
+	// And no OPT record either way, which is what says the refit bought nothing.
+	testing.expect(t, !dns.edns_present(m), "the record that would not fit was minted after all")
 
 	free_all(context.temp_allocator)
 }

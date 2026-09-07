@@ -889,7 +889,7 @@ blocking: {{ enabled: false }}
 				check_eq_int(r, mock_total(mock), 1, "upstream queries after the cache hit")
 				check(
 					r,
-					!has_opt_record(bare.wire),
+					!has_opt_record(r, bare.wire),
 					"a cached OPT record was handed to a client that asked without EDNS",
 				)
 				check_eq_int(r, answer_count(bare.wire), 1, "the answer the client came for")
@@ -917,12 +917,12 @@ blocking: {{ enabled: false }}
 			check_eq_int(r, mock_total(mock), 1, "upstream queries after the first client")
 			// The premise again: the entry really was filled by an answer with
 			// no OPT record in it.
-			check(r, !has_opt_record(filled.wire), "the client without EDNS was given an OPT record")
+			check(r, !has_opt_record(r, filled.wire), "the client without EDNS was given an OPT record")
 
 			edns := query_udp(udp_port, build_query(MIXED_BARE_FIRST, u16(dns.Type.A), id = 15, edns_size = 1232))
 			if check(r, edns.ok, "no response to the EDNS client") {
 				check_eq_int(r, mock_total(mock), 1, "upstream queries after the cache hit")
-				if check(r, has_opt_record(edns.wire), "an EDNS client got a cached answer with no OPT record") {
+				if check(r, has_opt_record(r, edns.wire), "an EDNS client got a cached answer with no OPT record") {
 					check_eq_int(
 						r,
 						int(dns.peek_udp_size(edns.wire)),
@@ -945,11 +945,19 @@ MIXED_EDNS_FIRST :: "mixed-edns-first.example.com."
 @(private = "file")
 MIXED_BARE_FIRST :: "mixed-bare-first.example.com."
 
-// Whether the answer carries an OPT record, read off the wire the client got.
+/*
+Whether the answer carries an OPT record, read off the wire the client got.
+
+The decode is checked rather than folded into the answer: reporting "no OPT
+record" for a wire that does not decode at all is how a case asserting the
+absence of one passes over an answer nobody could read - a stale ARCOUNT left
+behind by a strip, say, which is exactly the failure these cases are here to
+catch. So it fails on the spot and the caller's own check reads whatever is left.
+*/
 @(private = "file")
-has_opt_record :: proc(wire: []u8) -> bool {
+has_opt_record :: proc(r: ^Runner, wire: []u8) -> bool {
 	msg, err := dns.decode_message(wire, context.temp_allocator)
-	if err != .None {
+	if !check(r, err == .None, "the answer did not decode: %v", err) {
 		return false
 	}
 	return dns.edns_present(msg)

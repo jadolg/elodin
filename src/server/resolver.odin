@@ -436,11 +436,12 @@ Write that size onto an answer that is already encoded.
 A no-op for a client that asked without EDNS: there is no OPT record to carry a
 number and none is invented for one. On the answers `handle_query` runs
 `match_client_opt` over first, an OPT record is missing here only because the
-client asked with none - or because the mint failed, which leaves the answer as
-it stands. The three refusals that return ahead of `match_client_opt` reach this
-with whatever `dns.error_response` echoed from the query, which is the same
-answer for the same reason. A no-op on the stream transports too, where the
-field bounds nothing and the answer's own OPT is left as it is.
+client asked with none - or because the mint failed or would not have fit, either
+of which leaves the answer as it stands. The three refusals that return ahead of
+`match_client_opt` reach this with whatever `dns.error_response` echoed from the
+query, which is the same answer for the same reason. A no-op on the stream
+transports too, where the field bounds nothing and the answer's own OPT is left
+as it is.
 */
 @(private)
 advertise_udp_size :: proc(wire: []u8, size: u16, proto: Protocol) -> []u8 {
@@ -491,19 +492,33 @@ the client's own figure, which is what `make_response` puts in a locally built
 answer there. See `attach_cookie`, which mints under the same rule and passes the
 same number.
 
-Either direction is refitted afterwards, the way `attach_cookie` refits an
-answer its cookie pushed past the ceiling: the client is told to ask again over
-TCP rather than handed a datagram larger than the limit. Minting is the obvious
-reason to need it - eleven bytes longer is a message that may no longer fit -
-and stripping is the less obvious one: `dns.remove_opt` cuts the bytes only
-where the record is the tail of the message, and rebuilds the message where it
-is not, so what comes back from that path is an encoding of the answer rather
-than a shortening of it and is not bounded by what went in. `fit_response` is a
-no-op on anything already within the limit, which is every answer either
-direction returns in practice.
+Neither direction may hand back a datagram larger than the limit, and the two
+reach that differently.
+
+Stripping is refitted, the way `attach_cookie` refits an answer its cookie
+pushed past the ceiling: `dns.remove_opt` cuts the bytes only where the record
+is the tail of the message, and rebuilds the message where it is not, so what
+comes back from that path is an encoding of the answer rather than a shortening
+of it and is not bounded by what went in. An encoding that came back longer than
+the limit has records that genuinely will not fit, and dropping them with TC set
+is what the client needs to hear.
+
+Minting is not, and refitting it was wrong. Eleven bytes longer is a message
+that may no longer fit, and an answer whose only overflow is the record being
+minted has nothing to drop: `encode_message` writes the answer section, finds the
+OPT will not fit behind it, and reports a truncation - so the client is handed a
+complete answer with TC set and *still* no OPT record, and asks again over TCP
+for bytes it already had. Measured on a 504-byte cached answer with a client
+advertising 512: TC where before there was none, and the same absent OPT record
+either way. So a mint that will not fit is abandoned instead, and the answer goes
+as it stands - which is the outcome an upstream that drops EDNS produces anyway,
+and the one the client got before any of this ran. `fit_response` is still what
+holds the ceiling over that answer, and is a no-op on anything already within the
+limit, which is every answer either direction returns in practice.
 
 A failed mint or strip leaves the answer as it stands - the OPT mismatch is
-worth correcting, and not worth withholding an answer over.
+worth correcting, and not worth withholding an answer over, nor worth costing
+one a round trip.
 */
 @(private)
 match_client_opt :: proc(
@@ -519,10 +534,13 @@ match_client_opt :: proc(
 
 	if dns.edns_present(query) {
 		out, ok := dns.ensure_opt(wire, advertise, allocator)
-		if !ok {
-			return wire
+		// A record that will not fit is a record not minted; see above. The
+		// answer in hand is refitted rather than returned, so the ceiling holds
+		// over it whatever the path that produced it did.
+		if !ok || len(out) > limit {
+			return fit_response(wire, limit, query, allocator)
 		}
-		return fit_response(out, limit, query, allocator)
+		return out
 	}
 
 	/*

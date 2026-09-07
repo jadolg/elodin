@@ -160,6 +160,11 @@ test_remove_opt_with_no_record_is_a_no_op :: proc(t: ^testing.T) {
 
 	out, ok := remove_opt(wire, context.temp_allocator)
 	testing.expect(t, ok, "remove_opt failed on a message with no OPT record")
+	// The caller's own bytes back, not a copy of them: the contract is that a
+	// caller can ask for this without looking first and pay nothing when there
+	// is nothing to do, and equal bytes out of a fresh allocation would satisfy
+	// every assertion here while costing that on every answer.
+	testing.expect(t, raw_data(out) == raw_data(wire), "a copy was made of a message with no OPT record")
 	testing.expect(t, mem.compare(out, wire) == 0, "the message came back changed")
 
 	free_all(context.temp_allocator)
@@ -221,6 +226,8 @@ test_ensure_opt_leaves_an_existing_record_alone :: proc(t: ^testing.T) {
 
 	out, ok := ensure_opt(wire, 4096, context.temp_allocator)
 	testing.expect(t, ok, "ensure_opt failed")
+	// As `remove_opt` on a message with none: the answer comes straight back.
+	testing.expect(t, raw_data(out) == raw_data(wire), "a copy was made of a message that already had one")
 	testing.expect(t, mem.compare(out, wire) == 0, "the message came back changed")
 
 	m, derr := decode_message(out, context.temp_allocator)
