@@ -366,6 +366,47 @@ redirects :: proc(msg: dns.Message) -> bool {
 }
 
 /*
+Is this record the answer to the question the message was asked?
+
+Both halves matter. The type, because a CNAME is a redirection only while the
+client wanted something else - ask for the CNAME itself and resolution stops
+there (RFC 1034 section 4.3.2 step 3a), so the record is data at the very name a
+name error beside it denies. And the owner, because a redirection reached from
+somewhere else is not the answer to this question: the DNAME covering
+`a.sub.example.com.` sits at `sub.example.com.`, an ancestor, and reading it as
+the answer would cost the entry for every `QTYPE=DNAME` question under a DNAME.
+
+The class along with them, because a record in another class is not data at the
+name this question asked about either - the classes are separate trees, and a
+`CH` record sitting at the owner name says nothing about the `IN` name a name
+error beside it denies.
+*/
+@(private)
+answers_the_question :: proc(msg: dns.Message, rec: dns.Record) -> bool {
+	if len(msg.question) == 0 {
+		return false
+	}
+	q := msg.question[0]
+	if q.class != rec.class {
+		return false
+	}
+	if q.type != rec.type && q.type != .ANY {
+		return false
+	}
+	return dns.name_equal_fold(q.name, rec.name)
+}
+
+// The class the response was asked in. `IN` where there is no question to read
+// it from, which is the class every path into this cache asks in.
+@(private)
+question_class :: proc(msg: dns.Message) -> dns.Class {
+	if len(msg.question) == 0 {
+		return .IN
+	}
+	return msg.question[0].class
+}
+
+/*
 Say that the entry under `key` has been looked at again, and found to stand.
 
 Without this a caller whose numbering has moved on is told `recheck` on every hit
@@ -520,6 +561,71 @@ put :: proc(c: ^Cache, key: string, wire: []u8, msg: dns.Message, checked: u64 =
 	case .No_Error, .NX_Domain:
 	case:
 		return false
+	}
+
+	/*
+	An NXDOMAIN whose answer section holds data is not an answer to remember.
+
+	RFC 2308 section 2.1 lets a name error carry CNAME records and nothing else:
+	the rcode speaks for the last name in the chain, and any other record type
+	sitting there is the header contradicting the section beneath it. A
+	well-behaved server does not send one.
+
+	What sends one is an attacker. Take a zone's own signed answer - the TLSA
+	record for a mail host, say - rewrite the low nibble of byte 3, and the
+	records and their signatures are untouched and still verify. `validate_answer`
+	refuses that outright now, which is where the harm is actually closed; this
+	is the same shape stopped one layer further out, on the paths no validator
+	runs on. Cached, it is far worse than forwarded: the negative branch below
+	reads the lifetime from an SOA, a positive answer never carried one, and the
+	fallback is `negative_ttl` - five minutes by default of every client asking
+	that question being told the name does not exist, from one packet.
+
+	Refused rather than repaired. Which half of the contradiction the sender
+	meant is not knowable here, and the entry has to be one or the other to be
+	given a lifetime at all. The response still reaches the client that caused
+	the fetch; what it does not do is outlive it.
+
+	The exemption for a redirection is only good while the client wanted
+	something else. Ask for the CNAME itself and that record is the answer, not
+	a hop on the way to one (RFC 1034 section 4.3.2 step 3a stops the walk when
+	the query type matches), so it is data at the very name the rcode denies -
+	and entries are keyed by type, so what a spoofed packet would take away is
+	`name/CNAME` for the whole of `negative_ttl`.
+	*/
+	if rcode == .NX_Domain {
+		for rec in msg.answer {
+			#partial switch rec.type {
+			// An RRSIG rides on whatever it covers and an OPT is transport
+			// with no owner name at all. Neither is data at any name, so
+			// neither can be the record a name error contradicts - not even
+			// when it is the type that was asked about. `dig RRSIG` at a name
+			// that is a CNAME is answered with the chain and the signature
+			// over it, which is the everyday NXDOMAIN-after-a-CNAME with its
+			// proof attached, and refusing to remember those would send every
+			// repeat of that question back to the upstream.
+			case .RRSIG, .OPT:
+			// A DNAME and the CNAME it synthesizes are the redirection itself
+			// (RFC 6672 section 3.4.1), and the rcode beside them speaks for
+			// the name they lead to rather than for the one asked about -
+			// unless the redirection is itself the answer, below.
+			case .CNAME, .DNAME:
+				/*
+				And unless it is in another class, which is not a redirection
+				this question could follow: the classes are separate trees, so
+				a `CH` record in the answer to an `IN` question is not a hop on
+				the way to anything and is data at the denied name like any
+				other type here. Refused rather than exempted - the whole of
+				this guard is that a name error carries the chain and nothing
+				else, and a record from another tree is not the chain.
+				*/
+				if rec.class != question_class(msg) || answers_the_question(msg, rec) {
+					return false
+				}
+			case:
+				return false
+			}
+		}
 	}
 
 	offsets, scan_ok := dns.scan_ttl_offsets(wire, c.allocator)
