@@ -104,6 +104,9 @@ Stats :: struct {
 	queries:  u64,
 	failures: u64,
 	latency_ns_total: u64,
+	// Replies from this server that the caller could not pass on because their
+	// rcode is not one a client can read; see `note_unreadable_rcode`.
+	unreadable_rcode: u64,
 }
 
 // After this many consecutive failures an upstream is skipped for COOLDOWN.
@@ -234,6 +237,34 @@ record_failure :: proc(u: ^Upstream) {
 	if u.failures == FAILURE_THRESHOLD {
 		logx.warnf("upstream %s: %d consecutive failures, pausing it for %v", u.spec.name, u.failures, COOLDOWN)
 	}
+}
+
+/*
+Count a reply from `u` whose rcode the caller could not hand to a client.
+
+Kept per upstream because that is the question the count has to answer. The line
+the server logs for one of these is said once per process and demoted to debug
+after it - the bytes behind it being ones an on-path attacker can write - so
+without a figure carrying the name, an operator whose group has one broken
+member has no way to tell which of them it is.
+
+Health is deliberately untouched, for the reason `resolve_insisting` gives: a
+reply like this arriving is not evidence the server is down, and treating it as
+such would let a forged packet per query park every member of the group. So this
+is the *only* trace such a server leaves in the numbers: `failures` stays where
+it was and `healthy` goes on reporting it up.
+
+Not counted by this package, which has no opinion about what a client can read -
+`resolve_readable` sweeps past such a reply but a chain lookup may go on to use
+one. The caller that refuses it is the caller that counts it.
+*/
+note_unreadable_rcode :: proc(u: ^Upstream) {
+	if u == nil {
+		return
+	}
+	sync.mutex_lock(&u.mu)
+	defer sync.mutex_unlock(&u.mu)
+	u.stats.unreadable_rcode += 1
 }
 
 stats_of :: proc(u: ^Upstream) -> Stats {

@@ -226,9 +226,19 @@ run_extended_rcode_cases :: proc(r: ^Runner) {
 		srv, ok := start_server(
 			r,
 			Server_Options {
+				// Named in the configuration, because the label on the series
+				// below is the name an operator gave the server - which for an
+				// entry written as a bare address is the address.
 				config = config_for(
 					udp_port,
-					fmt.tprintf("    - \"127.0.0.1:%d\"\n", mock_port),
+					fmt.tprintf(
+						`    - name: badvers
+      type: udp
+      address: 127.0.0.1
+      port: %d
+`,
+						mock_port,
+					),
 					fmt.tprintf("metrics: {{ enabled: true, address: \"127.0.0.1\", port: %d }}\n", metrics_port),
 				),
 				udp_port = udp_port,
@@ -258,11 +268,22 @@ run_extended_rcode_cases :: proc(r: ^Runner) {
 				res := http_request(metrics_port, "GET", "/metrics", context.temp_allocator)
 				if check(r, res.status == 200, "a scrape returned %d", res.status) {
 					page := string(res.body)
+					// Per upstream, because "which member of the group is
+					// doing this" is what the operator is left asking once the
+					// one warn line has scrolled away.
 					check_eq_int(
 						r,
-						metric_value(page, "elodin_upstream_unreadable_rcode_total"),
+						metric_value(page, "elodin_upstream_unreadable_rcode_total{upstream=\"badvers\"}"),
 						3,
 						"elodin_upstream_unreadable_rcode_total",
+					)
+					// And the same server is not called failing for it, which
+					// is why the series above has to exist.
+					check_eq_int(
+						r,
+						metric_value(page, "elodin_upstream_failures_total{upstream=\"badvers\"}"),
+						0,
+						"upstream failures",
 					)
 					// The same queries are SERVFAILs like any other, so the
 					// counter above is a subset of this rather than a figure

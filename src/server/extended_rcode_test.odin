@@ -31,9 +31,14 @@ TLSA_NAME :: "_25._tcp.mx.example."
 
 @(private = "file")
 Canned_Exchange :: struct {
-	socket: net.UDP_Socket,
-	reply:  []u8,
-	got:    bool,
+	socket:   net.UDP_Socket,
+	reply:    []u8,
+	got:      bool,
+	// The query as it arrived, so a case can assert on what this server
+	// actually forwarded rather than only on what came back. Read after the
+	// thread is joined.
+	seen:     [512]u8,
+	seen_len: int,
 }
 
 /*
@@ -51,6 +56,7 @@ serve_one_canned :: proc(x: ^Canned_Exchange) {
 		return
 	}
 	x.got = true
+	x.seen_len = copy(x.seen[:], buf[:n])
 
 	out: [4096]u8
 	copy(out[:], x.reply)
@@ -66,7 +72,7 @@ the only place a response can put an extended DNS error: a client that asked
 without one has nowhere to be told why, and gets the bare refusal.
 */
 @(private = "file")
-tlsa_query :: proc(edns := true) -> []u8 {
+tlsa_query :: proc(edns := true, ext: u8 = 0) -> []u8 {
 	question := make([]dns.Question, 1, context.temp_allocator)
 	question[0] = dns.Question {
 		name  = TLSA_NAME,
@@ -80,7 +86,10 @@ tlsa_query :: proc(edns := true) -> []u8 {
 	msg.flags.rd = true
 	if edns {
 		additional := make([]dns.Record, 1, context.temp_allocator)
-		additional[0] = dns.make_opt(1232, false)
+		// `ext` is the EXTENDED-RCODE byte, which RFC 6891 section 6.1.3 says a
+		// request must leave at zero - so a non-zero one is a client doing
+		// something it may not, which is the point of the case that passes one.
+		additional[0] = dns.make_opt(1232, false, ext)
 		msg.additional = additional
 	}
 	wire, _, err := dns.encode_message(msg, context.temp_allocator)
@@ -94,9 +103,17 @@ tlsa_query :: proc(edns := true) -> []u8 {
 // it has none.
 @(private = "file")
 extended_error_code :: proc(wire: []u8) -> int {
+	code, _ := extended_error(wire)
+	return code
+}
+
+// The info-code and the EXTRA-TEXT of the extended error a response carries,
+// or -1 and "" if it has none.
+@(private = "file")
+extended_error :: proc(wire: []u8) -> (code: int, text: string) {
 	msg, err := dns.decode_message(wire, context.temp_allocator)
 	if err != .None {
-		return -1
+		return -1, ""
 	}
 	for rec in msg.additional {
 		opt, is_opt := rec.data.(dns.Rdata_OPT)
@@ -105,11 +122,11 @@ extended_error_code :: proc(wire: []u8) -> int {
 		}
 		for option in opt.options {
 			if option.code == u16(dns.EDNS_Option_Code.Ext_Error) && len(option.data) >= 2 {
-				return int(option.data[0]) << 8 | int(option.data[1])
+				return int(option.data[0]) << 8 | int(option.data[1]), string(option.data[2:])
 			}
 		}
 	}
-	return -1
+	return -1, ""
 }
 
 /*
@@ -124,7 +141,7 @@ an extended rcode - a codec that dropped the TTL, say - would fail rather than
 quietly assert about an ordinary NOERROR.
 */
 @(private = "file")
-extended_rcode_reply :: proc(nibble: u8 = 0) -> []u8 {
+extended_rcode_reply :: proc(nibble: u8 = 0, ext: u8 = 1) -> []u8 {
 	question := make([]dns.Question, 1, context.temp_allocator)
 	question[0] = dns.Question {
 		name  = TLSA_NAME,
@@ -134,7 +151,7 @@ extended_rcode_reply :: proc(nibble: u8 = 0) -> []u8 {
 	// The upper eight bits of the extended rcode live in the OPT record's TTL
 	// (RFC 6891 section 6.1.3). The lowest of them on its own is BADVERS.
 	additional := make([]dns.Record, 1, context.temp_allocator)
-	additional[0] = dns.make_opt(1232, true, 1)
+	additional[0] = dns.make_opt(1232, true, ext)
 	msg := dns.Message {
 		question   = question,
 		additional = additional,
@@ -573,6 +590,153 @@ test_a_readable_rcode_is_still_the_clients_answer :: proc(t: ^testing.T) {
 	testing.expect_value(t, outcome, Outcome.Forwarded)
 	testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.Serv_Fail)
 	testing.expect(t, mock_untouched(second_socket), "a readable rcode sent the group a second query")
+
+	free_all(context.temp_allocator)
+}
+
+/*
+And a composed rcode nothing has a name for still says what it was.
+
+`Rcode` names 16 to 23; the field is eight bits wide, so 4080 of the 4096
+composed values have no name at all, and Odin's `%v` renders one of those as a
+`BAD ENUM VALUE` placeholder. The whole threat model here is an attacker
+choosing the byte, so it would choose one of those - and the extended error's
+info-code is 0, "Other", which means the text is the only thing it carries. A
+placeholder there tells the client's operator nothing and tells this server's
+operator nothing either, in the one line it gets before the rest are demoted to
+debug.
+
+Extended byte 2 with an empty nibble: composed rcode 32, unassigned, and what
+the client has to be told is the number.
+*/
+@(test)
+test_an_unnamed_extended_rcode_is_reported_as_a_number :: proc(t: ^testing.T) {
+	socket, spec, bound := bind_mock(t, "broken")
+	if !bound {
+		return
+	}
+	defer net.close(socket)
+
+	specs := make([]config.Upstream_Spec, 1, context.temp_allocator)
+	specs[0] = spec
+	cfg := forwarding_config(specs)
+
+	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+		return
+	}
+	defer upstream.destroy_group(group)
+	s := Server{cfg = &cfg, group = group}
+
+	reply := extended_rcode_reply(ext = 2)
+	if !testing.expect(t, len(reply) > dns.HEADER_SIZE, "the fixture did not encode") {
+		return
+	}
+	// The premise: a composed rcode of 32, which is not a value `Rcode` names.
+	testing.expect_value(t, u16(dns.peek_rcode(reply)), u16(32))
+	if _, named := dns.rcode_name(dns.peek_rcode(reply)); named {
+		testing.expect(t, false, "32 is a named rcode now, so this case no longer tests what it says")
+		return
+	}
+
+	x := Canned_Exchange {
+		socket = socket,
+		reply  = reply,
+	}
+	mock := thread.create_and_start_with_poly_data(&x, serve_one_canned)
+	out, outcome, ok := handle_query(&s, tlsa_query(), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	thread.join(mock)
+	thread.destroy(mock)
+
+	testing.expect(t, x.got, "the upstream was never asked")
+	if !testing.expect(t, ok, "nothing came back at all") {
+		return
+	}
+	testing.expect_value(t, outcome, Outcome.Failed)
+	testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.Serv_Fail)
+
+	code, text := extended_error(out)
+	testing.expect_value(t, code, 0)
+	testing.expectf(t, text == "upstream rcode RCODE32", "the client was told %q", text)
+
+	free_all(context.temp_allocator)
+}
+
+/*
+A client cannot make this server ask upstream in an rcode of its own.
+
+RFC 6891 section 6.1.3 requires the OPT record's EXTENDED-RCODE byte to be zero
+in a request, and the version gate reads the two bytes below it rather than this
+one - so a client can set it and, forwarded verbatim, it reaches the upstream.
+An upstream that echoes the query's OPT TTL rather than building its own answers
+with a composed rcode of 16 or more for every query that client sends: the guard
+above then refuses each of them, after sweeping the group for a reply that is
+not. One client's byte, and every member of the group asked for it.
+
+So the byte is cleared where the transaction ID is drawn. Asserted on the query
+the upstream received, because that is the only place the number is observable -
+the same reasoning `cases_queryid.odin` gives for the ID beside it.
+*/
+@(test)
+test_a_clients_extended_rcode_byte_is_not_forwarded :: proc(t: ^testing.T) {
+	socket, spec, bound := bind_mock(t, "echoing")
+	if !bound {
+		return
+	}
+	defer net.close(socket)
+
+	specs := make([]config.Upstream_Spec, 1, context.temp_allocator)
+	specs[0] = spec
+	cfg := forwarding_config(specs)
+
+	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+		return
+	}
+	defer upstream.destroy_group(group)
+	s := Server{cfg = &cfg, group = group}
+
+	// Extended byte 4 on the client's own query: composed rcode 64 to anything
+	// that reads the OPT record, and nothing at all to the version gate.
+	query := tlsa_query(ext = 4)
+	if !testing.expect(t, len(query) > dns.HEADER_SIZE, "the query did not encode") {
+		return
+	}
+	testing.expect_value(t, u16(dns.peek_rcode(query)), u16(64))
+
+	x := Canned_Exchange {
+		socket = socket,
+		reply  = tlsa_answer_reply(),
+	}
+	mock := thread.create_and_start_with_poly_data(&x, serve_one_canned)
+	out, outcome, ok := handle_query(&s, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	thread.join(mock)
+	thread.destroy(mock)
+
+	if !testing.expect(t, x.got, "the upstream was never asked") {
+		return
+	}
+	testing.expectf(
+		t,
+		dns.peek_rcode(x.seen[:x.seen_len]) == .No_Error,
+		"the upstream was asked with composed rcode %d, which is the client's byte forwarded",
+		u16(dns.peek_rcode(x.seen[:x.seen_len])),
+	)
+	// And the query is otherwise untouched: it still asks the same question and
+	// still carries an OPT record for the upstream to answer into.
+	seen, serr := dns.decode_message(x.seen[:x.seen_len], context.temp_allocator)
+	testing.expect_value(t, serr, dns.Decode_Error.None)
+	if testing.expect(t, len(seen.question) == 1, "the forwarded query lost its question") {
+		testing.expect(t, dns.name_equal_fold(seen.question[0].name, TLSA_NAME), "the forwarded question changed")
+	}
+	testing.expect_value(t, dns.edns_udp_size(seen), u16(1232))
+
+	// And the client gets the answer rather than the SERVFAIL its own byte
+	// would have earned it against an echoing upstream.
+	if testing.expect(t, ok, "nothing came back at all") {
+		testing.expect_value(t, outcome, Outcome.Forwarded)
+		testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.No_Error)
+	}
 
 	free_all(context.temp_allocator)
 }

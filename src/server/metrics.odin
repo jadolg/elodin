@@ -482,13 +482,6 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 
 	metrics.scalar(
 		&b,
-		"elodin_upstream_unreadable_rcode_total",
-		.Counter,
-		"Upstream replies refused because their rcode is one a client would read as a different rcode: the extended half lives in the OPT record and a stub reads the header.",
-		st.unreadable_rcode,
-	)
-	metrics.scalar(
-		&b,
 		"elodin_rebind_refused_total",
 		.Counter,
 		"Answers withheld because a public name was pointed into private address space.",
@@ -689,11 +682,12 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 	// One series per configured name, gathered once and walked four times, so
 	// the de-duplication happens in one place rather than in each family below.
 	Series :: struct {
-		name:     string,
-		queries:  u64,
-		failures: u64,
-		latency:  u64,
-		up:       bool,
+		name:       string,
+		queries:    u64,
+		failures:   u64,
+		latency:    u64,
+		unreadable: u64,
+		up:         bool,
 	}
 	all := make([dynamic]Series, 0, 8, context.temp_allocator)
 	at := make(map[string]int, context.temp_allocator)
@@ -708,6 +702,7 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 				all[i].queries += us.queries
 				all[i].failures += us.failures
 				all[i].latency += us.latency_ns_total
+				all[i].unreadable += us.unreadable_rcode
 				if live {
 					all[i].up = true
 				}
@@ -721,6 +716,7 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 					queries = us.queries,
 					failures = us.failures,
 					latency = us.latency_ns_total,
+					unreadable = us.unreadable_rcode,
 					up = live,
 				},
 			)
@@ -739,6 +735,27 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 	metrics.family(b, "elodin_upstream_failures_total", .Counter, "Exchanges with each upstream that did not produce a usable answer.")
 	for u in all {
 		metrics.sample(b, "elodin_upstream_failures_total", u.failures, metrics.Label{"upstream", u.name})
+	}
+
+	/*
+	Which upstream sent an rcode no client could read, which is not in the
+	family above.
+
+	`resolve_insisting` deliberately does not count one of these as a failure -
+	those bits are two bytes an on-path attacker can write, and a failure would
+	let it park the group - so a server doing this holds a clean
+	`elodin_upstream_failures_total` and an `elodin_upstream_up` of 1. Without
+	this series the name is only in the one `warn` line the server says before
+	demoting the rest to debug.
+	*/
+	metrics.family(
+		b,
+		"elodin_upstream_unreadable_rcode_total",
+		.Counter,
+		"Replies from each upstream refused because their rcode is one a client would read as a different rcode: the extended half lives in the OPT record and a stub reads the header.",
+	)
+	for u in all {
+		metrics.sample(b, "elodin_upstream_unreadable_rcode_total", u.unreadable, metrics.Label{"upstream", u.name})
 	}
 
 	/*

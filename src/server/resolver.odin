@@ -1020,6 +1020,25 @@ resolve_query :: proc(
 		forwarded = dns.clone_message_bytes(forwarded, allocator)
 	}
 	dns.set_id_in_place(forwarded, dns.random_id())
+	/*
+	And the client's own EXTENDED-RCODE byte does not go out with it.
+
+	RFC 6891 section 6.1.3 requires that byte to be zero in a request, and the
+	version gate in `handle_query` reads the two bytes below it rather than this
+	one - so a client can set it to anything and have it forwarded verbatim. An
+	upstream that echoes the query's OPT TTL instead of building its own, which
+	lazy forwarders and plenty of CPE do, then answers every query from that
+	client with a composed rcode of 16 or more: unusable, so the group is swept
+	for a reply that is not, and the query is a SERVFAIL either way. One
+	client's byte, and the whole group pays for it.
+
+	Here rather than at the gate because here the buffer is certainly this
+	server's own - the clone above is what makes it so - and because all three
+	ways the outgoing message comes about pass through this point.
+
+	Best-effort by design: a query with no OPT record has no field to clear.
+	*/
+	_ = dns.clear_edns_extended_rcode(forwarded)
 
 	/*
 	Down the zone's own route when it has one, and to the default group when it
@@ -1163,9 +1182,9 @@ resolve_query :: proc(
 			*/
 			if uerr == .None {
 				logx.debugf(
-					"query DS %s: the parent's group answered %v rather than proving the delegation carries no DS, so the route was asked instead",
+					"query DS %s: the parent's group answered %s rather than proving the delegation carries no DS, so the route was asked instead",
 					q.name,
-					dns.peek_rcode(resp),
+					rcode_text(dns.peek_rcode(resp)),
 				)
 			} else {
 				logx.debugf(
@@ -1680,10 +1699,12 @@ let one decide how much this server writes to disk, in exactly the
 running either.
 
 Which is only sound because something else goes on counting: `unreadable_rcode`
-climbs on every one of these, in the stats line and in
-`elodin_upstream_unreadable_rcode_total`, so a server that has gone dark this
-way is visible long after the one warn scrolled away. The reasoning is
-`conn_refused`'s, and so is the shape.
+climbs on every one of these in the stats line, and
+`elodin_upstream_unreadable_rcode_total{upstream}` climbs beside it against the
+server that sent the reply - so both what is happening and which member of the
+group is doing it stay visible long after the one warn scrolled away. The
+reasoning is `conn_refused`'s, and so is the shape. `upstream.record_failure` is
+deliberately not called: see `upstream.note_unreadable_rcode`.
 
 The client is told as much as it asked to be told: RFC 8914 extended error 0
 with the rcode named, the way the rebinding guard and the validator explain
@@ -1693,6 +1714,25 @@ and gets the bare SERVFAIL.
 // Set once the first reply has been refused for an unreadable rcode; see below.
 @(private)
 unreadable_rcode_reported: bool
+
+/*
+What to call an rcode in a line a person reads.
+
+`%v` on an `Rcode` prints Odin's `BAD ENUM VALUE` placeholder for every composed
+value the enum does not name, which is all but eight of the 4080 an OPT record
+can carry (RFC 6891 section 6.1.3) - and the byte those upper bits come out of is
+one an on-path attacker writes, so it would pick a value that renders as the
+placeholder and leave both the operator's line and the client's extended error
+saying nothing. The number is what is true when the name is not known, and
+`RCODE<n>` is how RFC 6895 section 2.3 spells an unassigned one.
+*/
+@(private)
+rcode_text :: proc(rcode: dns.Rcode) -> string {
+	if name, known := dns.rcode_name(rcode); known {
+		return name
+	}
+	return fmt.tprintf("RCODE%d", u16(rcode))
+}
 
 // RFC 8914 section 4.1: the error does not match any of the pre-defined codes,
 // so the EXTRA-TEXT is what carries it. There is no code for "the responder's
@@ -1728,20 +1768,21 @@ unreadable_rcode_refusal :: proc(
 	}
 	from := answering_upstream(winner)
 	name := dns.name_trim_root(q.name)
+	shown := rcode_text(rcode)
 	if sync.atomic_exchange(&unreadable_rcode_reported, true) {
 		logx.debugf(
-			"upstream %s answered %v for %s %s from %s, which a client would read as another rcode; answering SERVFAIL",
+			"upstream %s answered %s for %s %s from %s, which a client would read as another rcode; answering SERVFAIL",
 			from,
-			rcode,
+			shown,
 			dns.type_name(q.type),
 			name,
 			client,
 		)
 	} else {
 		logx.warnf(
-			"upstream %s answered %v for %s %s from %s, which a client would read as another rcode; answering SERVFAIL",
+			"upstream %s answered %s for %s %s from %s, which a client would read as another rcode; answering SERVFAIL",
 			from,
-			rcode,
+			shown,
 			dns.type_name(q.type),
 			name,
 			client,
@@ -1750,11 +1791,28 @@ unreadable_rcode_refusal :: proc(
 	}
 	sync.atomic_add(&s.stats.failed, 1)
 	sync.atomic_add(&s.stats.unreadable_rcode, 1)
+	// And against the server that sent it, which is the half of the question
+	// the total cannot answer once the one warn line has scrolled away.
+	upstream.note_unreadable_rcode(winner)
 
 	named := fmt.tprintf("rcode:%s", from)
 	refusal := dns.make_response(msg, .Serv_Fail, allocator)
-	attach_extended_error(&refusal, EDE_OTHER, fmt.tprintf("upstream rcode %v", rcode), allocator)
-	if encoded, _, enc_err := dns.encode_message(refusal, allocator, limit); enc_err == .None {
+	attach_extended_error(&refusal, EDE_OTHER, fmt.tprintf("upstream rcode %s", shown), allocator)
+	/*
+	`truncated` as well as the error, because those are two different answers.
+	`encode_message` reports a message that would not fit by dropping the OPT
+	record, setting TC and saying so here - which for this response means the
+	explanation is gone and the client is told to ask again over TCP for a
+	SERVFAIL it would get identically. The fallback below is the better of the
+	two, and the comment on it named this case before the flag was read.
+
+	Not reachable today: `response_limit` floors at 512 bytes and the largest
+	refusal this builds is about 330 - a 255-byte name's question, an OPT record
+	and the error text. It is one condition rather than two only because the
+	floor is somewhere else in the file.
+	*/
+	if encoded, truncated, enc_err := dns.encode_message(refusal, allocator, limit);
+	   enc_err == .None && !truncated {
 		return encoded, named, true, true
 	}
 	/*
