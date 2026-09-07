@@ -418,3 +418,92 @@ test_an_extended_rcode_is_not_dropped_quietly :: proc(t: ^testing.T) {
 
 	free_all(context.temp_allocator)
 }
+
+/*
+The additional section is filled as far as it goes.
+
+Nothing on the wire says a record was left out of it, which is the whole of what
+the split at the top of this file is - so abandoning the section at the first
+record that will not fit would drop the records behind it in silence, for a
+client that had room for every one of them. The glue behind the big record here
+is sixteen bytes and the OPT record eleven, against a ceiling with room for
+both.
+*/
+@(test)
+test_the_additional_section_is_filled_past_a_record_that_will_not_fit :: proc(t: ^testing.T) {
+	glue := Record {
+		name  = "ns1.example.com.",
+		type  = .A,
+		class = .IN,
+		ttl   = 300,
+		data  = Rdata_A{addr = {192, 0, 2, 53}},
+	}
+	whole := message_with(opt_records(before = []Record{big_txt(), glue}))
+	/*
+	Room for everything but the TXT record, and thirty-two bytes over: the drop
+	takes the compression map with it, so the glue's owner name goes out in full
+	where the measurement below had it as a two-byte pointer. Nowhere near the
+	two hundred and fifteen the TXT record needs.
+	*/
+	room := encoded_size(t, message_with(opt_records(before = []Record{glue}))) + 32
+
+	wire, truncated, err := encode_message(whole, context.temp_allocator, room)
+	testing.expect_value(t, err, Encode_Error.None)
+	testing.expect(t, !truncated, "an additional record that would not fit reported a truncation")
+	testing.expectf(t, len(wire) <= room, "the message is %d bytes, past the %d it was given", len(wire), room)
+
+	got, derr := decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	testing.expect(t, !got.flags.tc, "TC is set on an answer nothing was dropped from")
+	testing.expect_value(t, len(got.answer), 2)
+	// The glue and the OPT record, both of which were behind the record that
+	// overflowed and both of which fit.
+	testing.expect_value(t, len(got.additional), 2)
+	testing.expect(t, edns_present(got), "the OPT record went out with the record that overflowed")
+
+	free_all(context.temp_allocator)
+}
+
+/*
+A message whose rcode is 16 or more spends a record on its OPT record even where
+the answer came out whole.
+
+The top eight bits live in that record's TTL and nowhere else, so leaving it out
+states a different rcode - and the client cannot tell. Dropping an answer record
+sets TC, which sends it to TCP for the records it lost, and it reads the rcode it
+was actually answered with while it is there. Reading the wrong one, it would
+come back over TCP for the same thing and be no better off.
+
+Room here is one byte short of the whole message, so the answer and authority
+sections fit and only the OPT record does not.
+*/
+@(test)
+test_an_extended_rcode_is_kept_at_the_cost_of_a_record :: proc(t: ^testing.T) {
+	// BADVERS: rcode 16, four zero bits in the header and a one in the TTL.
+	badvers := make_opt(1232, false)
+	badvers.ttl = 1 << 24
+	additional := make([]Record, 1, context.temp_allocator)
+	additional[0] = badvers
+	whole := message_with(additional)
+	testing.expect_value(t, rcode_of(whole), Rcode.Bad_Vers)
+
+	room := encoded_size(t, whole) - 1
+
+	wire, truncated, err := encode_message(whole, context.temp_allocator, room)
+	testing.expect_value(t, err, Encode_Error.None)
+	testing.expect(t, truncated, "records were dropped without a truncation being reported")
+	testing.expectf(t, len(wire) <= room, "the message is %d bytes, past the %d it was given", len(wire), room)
+
+	got, derr := decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	testing.expect(t, got.flags.tc, "records went missing without the client being told")
+	testing.expect(t, edns_present(got), "the record the rcode lives in was dropped")
+	// The rcode it was answered with, which is the point of the exercise.
+	testing.expect_value(t, rcode_of(got), Rcode.Bad_Vers)
+	// Paid for out of the authority section, which is the last thing the walk
+	// back reaches; the answer is untouched.
+	testing.expect_value(t, len(got.answer), 2)
+	testing.expect_value(t, len(got.authority), 0)
+
+	free_all(context.temp_allocator)
+}

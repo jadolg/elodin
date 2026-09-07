@@ -308,6 +308,23 @@ opt_wire_len :: proc(m: Message) -> (n: int, ok: bool) {
 }
 
 /*
+Whether the message's rcode has bits that live only in its OPT record's TTL.
+
+RFC 6891 section 6.1.3 splits an rcode of 16 or more between the header's four
+bits and that byte, so a message that loses the record states the low four on
+their own - a different rcode, and one the client has no way to know is not the
+one it was answered with.
+
+Read through `find_opt`, so it is the same record the rest of this package calls
+the message's own.
+*/
+@(private)
+opt_holds_extended_rcode :: proc(m: Message) -> bool {
+	opt, found := find_opt(m)
+	return found && opt.ttl & 0xff00_0000 != 0
+}
+
+/*
 Serialise a message, truncating at `max_size` if necessary.
 
 TC says that answer or authority data was left out, which is what RFC 2181
@@ -382,6 +399,10 @@ encode_message :: proc(
 	and would come back empty and still without one.
 	*/
 	opt_len, keep_room := opt_wire_len(m)
+	// Whether the OPT record is the only place part of this message's rcode is
+	// written, which is what makes leaving it out a different answer rather
+	// than a smaller one. See the walk back below.
+	opt_required := opt_holds_extended_rcode(m)
 	roomy_mark := -1
 	roomy_counts: [3]u16
 	if keep_room && len(w.buf) + opt_len <= max_size {
@@ -398,12 +419,30 @@ encode_message :: proc(
 			w_record(&w, rec) or_return
 			if len(w.buf) > max_size {
 				resize(&w.buf, mark)
-				if si == 2 {
-					additional_dropped = true
-				} else {
+				if si != 2 {
 					truncated = true
+					break outer
 				}
-				break outer
+				/*
+				The additional section is filled as far as it goes rather than
+				abandoned at the first record that will not fit. Nothing on the
+				wire says a record was left out of it - which is the whole of
+				what the split above is - so a client whose buffer had no room
+				for one glue address would otherwise silently lose the records
+				behind it that did fit, the OPT record it negotiated among them.
+
+				The compression targets recorded for the bytes just dropped are
+				stale, so the map goes before anything else is written - keys
+				freed first, since the map's storage does not own them. What
+				follows may still compress: every target left is one this walk
+				put there *after* the last drop, so it names a name that is
+				really in the buffer, and a record written uncompressed instead
+				would cost the section the room the drop just freed.
+				*/
+				additional_dropped = true
+				writer_free_comp_keys(&w)
+				clear(&w.comp)
+				continue
 			}
 			counts[si] += 1
 			/*
@@ -427,12 +466,29 @@ encode_message :: proc(
 		}
 	}
 
-	// The cut left the OPT record nowhere to go, so it goes back one or more
-	// records further. Only on a truncation: an answer that came out whole is
-	// not one to start dropping records from.
-	if truncated && roomy_mark >= 0 && len(w.buf) + opt_len > max_size {
+	/*
+	The cut left the OPT record nowhere to go, so it goes back one or more
+	records further.
+
+	Two reasons to spend a record on that, and a complete answer is never cut
+	for either of them without one. A truncation is dropping records and sending
+	the client to TCP already, so the ones behind the cut are bytes it will
+	discard - while the OPT record carries what it needs to ask again with.
+
+	The other is a message whose rcode is 16 or more. Its top eight bits live in
+	that record's TTL and nowhere else (RFC 6891 section 6.1.3), so a message
+	that loses the record states a different rcode: BADVERS read as NOERROR over
+	an empty answer section, which is a NODATA, and BADCOOKIE as YXRRSET. A
+	record dropped to keep that honest sets TC like any other, so the client
+	reads the rcode it was answered with and comes back over TCP for the records
+	- rather than reading the wrong rcode and coming back for the same thing.
+	*/
+	if !opt_written && roomy_mark >= 0 && len(w.buf) + opt_len > max_size && (truncated || opt_required) {
 		resize(&w.buf, roomy_mark)
 		counts = roomy_counts
+		// Records left out of the answer or authority section, whichever of the
+		// two brought this about.
+		truncated = true
 	}
 
 	if truncated || additional_dropped {
