@@ -1947,16 +1947,23 @@ unreadable_rcode_refusal :: proc(
 	attach_extended_error(&refusal, EDE_OTHER, fmt.tprintf("upstream rcode %s", shown), allocator)
 	/*
 	`truncated` as well as the error, because those are two different answers.
-	`encode_message` reports a message that would not fit by dropping the OPT
-	record, setting TC and saying so here - which for this response means the
-	explanation is gone and the client is told to ask again over TCP for a
-	SERVFAIL it would get identically. The fallback below is the better of the
-	two, and the comment on it named this case before the flag was read.
+	A refusal that lost its question to the size ceiling is one the client
+	cannot match to anything it asked, and it would go out with TC set telling
+	that client to fetch the same SERVFAIL again over TCP. The fallback below is
+	the better of the two, and the comment on it named this case before the flag
+	was read.
 
-	Not reachable today: `response_limit` floors at 512 bytes and the largest
-	refusal this builds is about 330 - a 255-byte name's question, an OPT record
-	and the error text. It is one condition rather than two only because the
-	floor is somewhere else in the file.
+	What the flag no longer covers is the OPT record: `encode_message` leaves an
+	additional record that will not fit out quietly, since TC is about answer and
+	authority data (RFC 2181 section 9). So a refusal too tight for the record
+	comes back through here without the extended error in it - the same
+	explanation the fallback below also lacks, arrived at without the wasted
+	round trip that used to come with it.
+
+	Not reachable today either way: `response_limit` floors at 512 bytes and the
+	largest refusal this builds is about 330 - a 255-byte name's question, an OPT
+	record and the error text. It is one condition rather than two only because
+	the floor is somewhere else in the file.
 	*/
 	if encoded, truncated, enc_err := dns.encode_message(refusal, allocator, limit);
 	   enc_err == .None && !truncated {

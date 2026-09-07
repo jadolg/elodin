@@ -237,18 +237,40 @@ attach_cookie :: proc(
 		return wire
 	}
 	/*
-	An answer the cookie pushes past the ceiling is truncated rather than sent
-	without one.
+	An answer the cookie will not fit into is sent without one.
 
-	The other way round is available - drop the cookie, send the whole answer -
-	and it is the wrong trade here. `encode_message` re-adds the OPT record
-	after truncating, so the cookie survives this and the client is told to ask
-	again over TCP; dropping it instead would cost the client its cookie on
-	exactly the answers `cookies.require` is meant to protect, and a client that
-	gets no cookie back reads it as a server that does not do them.
+	The other way round - cut the answer so the cookie fits behind it - reads as
+	the safer trade and is not. Twenty-eight bytes of option against a datagram
+	already inside the client's buffer buys a client that is told to throw a
+	complete answer away and ask again over TCP, which is where it would have
+	got its cookie in any case: `cookies.require` gates UDP alone, so a retry
+	there is never turned away for want of one.
+
+	And it did not use to buy even that. The record the cookie goes into is
+	itself what overflows, so there is nothing behind it to drop:
+	`encode_message` set TC for a record it then could not re-add, and the
+	client was handed a complete answer with TC set, no OPT record and no cookie
+	- the outcome this comment used to rule out as the wrong trade, arrived at
+	by accident, plus a wasted round trip on top.
+
+	So the cookie is abandoned and the answer goes as it stands, which is what
+	`match_client_opt` does with an OPT record it cannot mint, for the same
+	reason: an answer that fits is worth more to the client than the EDNS
+	parameters it would have carried. What that costs a `cookies.require` client
+	is the refresh on an answer this size and not its cookie - a client with
+	none is turned away with BADCOOKIE and a fresh one long before it reaches an
+	answer, and the one it holds is good for `COOKIE_MAX_AGE` of asking again.
+	An answer that had to be truncated for its own size keeps the OPT record it
+	arrived with, since `encode_message` keeps room for that behind a cut it is
+	already making; what the client does not get there is the fresh cookie, and
+	it is on its way to TCP for the answer anyway.
+
+	Refitted rather than returned, so the ceiling is held by the one procedure
+	that holds it whatever produced the answer - and that is a no-op on an
+	answer already inside the limit, which is every answer arriving here.
 	*/
 	if len(out) > limit {
-		return fit_response(out, limit, query, allocator)
+		return fit_response(wire, limit, query, allocator)
 	}
 	return out
 }

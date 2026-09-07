@@ -261,11 +261,61 @@ w_record :: proc(w: ^Writer, rec: Record) -> Encode_Error {
 }
 
 /*
+The OPT record's own encoded length: a root owner name, the four fixed fields,
+and four bytes of header per option carried.
+
+Nothing about it depends on where in the message it lands - the owner name is
+the root and its RDATA holds no name to compress - so this can be worked out
+before a byte is written, which is what `encode_message` needs to keep room for
+it behind a truncation.
+
+`ok` is false for a message with no OPT record and for one whose OPT record
+carries RDATA of another shape, which is not this arithmetic: no room is kept
+rather than the wrong amount.
+*/
+@(private)
+opt_wire_len :: proc(m: Message) -> (n: int, ok: bool) {
+	for rec in m.additional {
+		if rec.type != .OPT {
+			continue
+		}
+		// The root name, TYPE, CLASS, TTL and RDLENGTH.
+		n = 11
+		if rdata, is_opt := rec.data.(Rdata_OPT); is_opt {
+			for o in rdata.options {
+				n += 4 + len(o.data)
+			}
+		} else if rec.data != nil {
+			// RDATA of another shape on an OPT record, which is not this
+			// arithmetic. Nothing builds one; nothing has to guess at it either.
+			return 0, false
+		}
+		return n, true
+	}
+	return 0, false
+}
+
+/*
 Serialise a message, truncating at `max_size` if necessary.
 
-When records have to be dropped the TC bit is set and, if the additional section
-carried an OPT record, that record is re-appended so the client still sees our
-EDNS parameters.
+TC says that answer or authority data was left out, which is what RFC 2181
+section 9 makes it: the bit tells a client the records it asked for did not all
+fit and to ask again over TCP. So a record dropped from those two sections sets
+`truncated` and the TC bit, and a record dropped from the additional section
+does not - a responder that could not fit a glue address or an OPT record behind
+a complete answer has answered the question, and a client sent to TCP over it
+gets the same records one round trip later.
+
+The OPT record is re-appended after a cut so the client still sees our EDNS
+parameters, and where a cut in the answer or authority section leaves no room
+for it, records are dropped back until there is. That is the one place this
+prefers the EDNS parameters to a record: the client is being told to ask again
+over TCP either way, so the records behind the cut are bytes it will discard -
+while the OPT record carries the payload size to ask again with, the upper bits
+of the rcode, and any cookie or extended error written into it. An answer that would
+otherwise be *complete* is never cut for it: there the record is left out
+instead, which is `server.match_client_opt`'s reading of the same trade for an
+OPT record it declines to mint.
 */
 encode_message :: proc(
 	m: Message,
@@ -306,20 +356,66 @@ encode_message :: proc(
 	counts: [3]u16
 	sections := [3][]Record{m.answer, m.authority, m.additional}
 
+	/*
+	Where the message stood after the last answer or authority record that still
+	left room for the OPT record, so a truncation can drop back to it.
+
+	One mark rather than a stack of them: the walk back only ever goes to the
+	longest prefix of those two sections that the OPT record fits behind, which
+	is this point by construction, whether that is one record short of the cut
+	or the whole of both sections.
+
+	-1 where there is no such point at all: a message whose question alone
+	leaves no room for the record has nothing to gain by dropping records for it,
+	and would come back empty and still without one.
+	*/
+	opt_len, keep_room := opt_wire_len(m)
+	roomy_mark := -1
+	roomy_counts: [3]u16
+	if keep_room && len(w.buf) + opt_len <= max_size {
+		roomy_mark = len(w.buf)
+	}
+
+	// Two different endings, and they are not the same answer: see above.
+	additional_dropped := false
+	opt_written := false
+
 	outer: for section, si in sections {
 		for rec in section {
 			mark := len(w.buf)
 			w_record(&w, rec) or_return
 			if len(w.buf) > max_size {
 				resize(&w.buf, mark)
-				truncated = true
+				if si == 2 {
+					additional_dropped = true
+				} else {
+					truncated = true
+				}
 				break outer
 			}
 			counts[si] += 1
+			// Asked of the record just written rather than of the one that
+			// overflowed: an OPT record already in the message is not one to
+			// append a second copy of below.
+			if rec.type == .OPT {
+				opt_written = true
+			}
+			if si < 2 && keep_room && len(w.buf) + opt_len <= max_size {
+				roomy_mark = len(w.buf)
+				roomy_counts = counts
+			}
 		}
 	}
 
-	if truncated {
+	// The cut left the OPT record nowhere to go, so it goes back one or more
+	// records further. Only on a truncation: an answer that came out whole is
+	// not one to start dropping records from.
+	if truncated && roomy_mark >= 0 && len(w.buf) + opt_len > max_size {
+		resize(&w.buf, roomy_mark)
+		counts = roomy_counts
+	}
+
+	if truncated || additional_dropped {
 		// Compression targets recorded for the dropped bytes are now stale, so
 		// nothing more may be written that could reference them. OPT uses a
 		// root name and no compressible RDATA, which keeps this safe. The keys
@@ -331,6 +427,12 @@ encode_message :: proc(
 		for rec in m.additional {
 			if rec.type != .OPT {
 				continue
+			}
+			// One already went out ahead of the record that overflowed, and a
+			// message carrying two OPT records is one whose readers are
+			// entitled to disagree about which of them is the message's.
+			if opt_written {
+				break
 			}
 			mark := len(w.buf)
 			w.compress = false
