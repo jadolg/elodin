@@ -552,3 +552,93 @@ test_the_records_ahead_of_the_opt_do_not_spend_its_room :: proc(t: ^testing.T) {
 
 	free_all(context.temp_allocator)
 }
+
+/*
+Glue a referral cannot be read without is the additional section's one
+exception, and RFC 9471 section 3.3 is where it comes from.
+
+A name server named inside the zone being delegated has an address that is
+learnable from this reply and nowhere else, so a referral that could not carry
+it says so. Otherwise the resolver reading it cannot tell a glue set with one
+address in it from a delegation that only has one, and follows it an address
+short - which is the failure the RFC's rule exists to stop, and one this file's
+general reading of TC would otherwise reintroduce.
+*/
+@(private = "file")
+referral :: proc(glue: []Record) -> Message {
+	question := make([]Question, 1, context.temp_allocator)
+	question[0] = Question {
+		name  = "www.sub.example.com.",
+		type  = .A,
+		class = .IN,
+	}
+	authority := make([]Record, 1, context.temp_allocator)
+	authority[0] = Record {
+		name = "sub.example.com.",
+		type = .NS,
+		class = .IN,
+		ttl = 300,
+		// In-domain: the name server lives inside the zone being delegated.
+		data = Rdata_Name{name = "ns1.sub.example.com."},
+	}
+
+	additional := make([dynamic]Record, 0, len(glue) + 1, context.temp_allocator)
+	append(&additional, ..glue)
+	append(&additional, make_opt(1232, false))
+
+	m := Message {
+		id         = 0x1234,
+		question   = question,
+		authority  = authority,
+		additional = additional[:],
+	}
+	m.flags.qr = true
+	return m
+}
+
+@(private = "file")
+address :: proc(name: string, last: u8) -> Record {
+	return Record{name = name, type = .A, class = .IN, ttl = 300, data = Rdata_A{addr = {192, 0, 2, last}}}
+}
+
+@(test)
+test_a_referral_that_drops_in_domain_glue_is_truncated :: proc(t: ^testing.T) {
+	two := referral([]Record{address("ns1.sub.example.com.", 1), address("ns1.sub.example.com.", 2)})
+	// One byte short of the second address, so the glue set goes out partial or
+	// not at all.
+	room := encoded_size(t, two) - 1
+
+	wire, truncated, err := encode_message(two, context.temp_allocator, room)
+	testing.expect_value(t, err, Encode_Error.None)
+	testing.expect(t, truncated, "a referral short of its own glue reported no truncation")
+
+	got, derr := decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	testing.expect(t, got.flags.tc, "the resolver was handed a partial glue set with nothing to say so")
+
+	free_all(context.temp_allocator)
+}
+
+/*
+And the exception is only the exception. Glue for a name server named outside
+the zone being delegated is an address the resolver can go and look up, so
+leaving it out is the ordinary quiet drop - as is any other additional record.
+*/
+@(test)
+test_a_referral_that_drops_out_of_domain_glue_is_not :: proc(t: ^testing.T) {
+	two := referral([]Record{address("ns1.elsewhere.test.", 1), address("ns1.elsewhere.test.", 2)})
+	room := encoded_size(t, two) - 1
+
+	wire, truncated, err := encode_message(two, context.temp_allocator, room)
+	testing.expect_value(t, err, Encode_Error.None)
+	testing.expect(t, !truncated, "a referral was truncated for glue the resolver can resolve itself")
+
+	got, derr := decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	testing.expect(t, !got.flags.tc, "TC over a referral whose own glue is complete")
+	testing.expect_value(t, len(got.authority), 1)
+	// The OPT record still keeps its room against the glue ahead of it.
+	testing.expect(t, edns_present(got), "the OPT record was spent on glue")
+
+	free_all(context.temp_allocator)
+}

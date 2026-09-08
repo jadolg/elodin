@@ -251,6 +251,42 @@ name_equal_fold :: proc(a, b: string) -> bool {
 	return true
 }
 
+/*
+Whether `name` sits strictly below `zone`, the zone's own name excluded.
+
+The comparison folds case throughout, since DNS names compare without regard to
+it (RFC 1035 section 2.3.3, restated for every label by RFC 4343) and the names
+reaching here are whatever the sender spelled - nothing lowers them on the way,
+deliberately, so that a response can echo the question back byte for byte. That
+rules out any byte-wise shortcut on the suffix, however tempting one looks in
+front of the fold.
+
+The zone has to begin right after a label break, or "notexample.com." would
+count as a name below "example.com.".
+
+`server.name_below` is this, and calls it: the server package asks the question
+of configured zones and wildcards, and `encode_message` asks it of a delegation
+it is about to drop glue from. One answer, so neither can be tightened without
+the other following.
+*/
+name_below :: proc(name, zone: string) -> bool {
+	if len(name) <= len(zone) {
+		return false
+	}
+	if name[len(name) - len(zone) - 1] != '.' {
+		return false
+	}
+	return name_equal_fold(name[len(name) - len(zone):], zone)
+}
+
+// `name_below`, with the zone's own name counting as inside it.
+name_at_or_below :: proc(name, zone: string) -> bool {
+	if len(name) == len(zone) {
+		return name_equal_fold(name, zone)
+	}
+	return name_below(name, zone)
+}
+
 // "www.example.com." -> "example.com."; "." -> "."
 name_parent :: proc(name: string) -> string {
 	if name == "" || name == "." {

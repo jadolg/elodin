@@ -621,21 +621,10 @@ looks in front of the fold.
 */
 @(private)
 name_below :: proc(name, zone: string) -> bool {
-	if len(name) <= len(zone) {
-		return false
-	}
-	// The zone has to begin right after a label break, or it is a bare string
-	// suffix of some other name rather than a subtree of it.
-	if name[len(name) - len(zone) - 1] != '.' {
-		return false
-	}
-	return dns.name_equal_fold(name[len(name) - len(zone):], zone)
+	return dns.name_below(name, zone)
 }
 
 @(private)
 name_at_or_below :: proc(name, zone: string) -> bool {
-	if len(name) == len(zone) {
-		return dns.name_equal_fold(name, zone)
-	}
-	return name_below(name, zone)
+	return dns.name_at_or_below(name, zone)
 }
