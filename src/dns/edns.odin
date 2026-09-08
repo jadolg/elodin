@@ -98,7 +98,77 @@ ensure_edns_option :: proc(
 		return out, true
 	}
 
-	// Scratch, not the caller's allocator; see `rebuild_edns_option`.
+	// The list is scratch: `add_opt_record` reads it while encoding and keeps
+	// nothing, and only the answer comes out of the caller's allocator.
+	options := make([]EDNS_Option, 1, context.temp_allocator)
+	options[0] = EDNS_Option {
+		code = u16(code),
+		data = data,
+	}
+	return add_opt_record(msg, udp_size, options, allocator)
+}
+
+/*
+Give the message an OPT record if it has none, carrying nothing but the payload
+size.
+
+The presence of an OPT record in a response is a per-request fact and not a
+property of the answer: RFC 6891 section 6.1.1 forbids caching or forwarding
+one, so what a client gets back has to be decided from what that client asked
+with. This is the minting half of that - a client that asked with EDNS and an
+answer that has no OPT record, which is an upstream that dropped EDNS or a
+cached entry stored for a client that never sent one. `remove_opt` is the other
+half.
+
+Returns the message unchanged when it already has one, whatever that record
+says: the fields in it are set by `set_edns_udp_size` and the option writers
+above, and inventing a second record here would leave two for a reader to
+disagree over.
+
+Fails where a message with no reachable OPT record will not decode, will not
+encode again, or turns out to have one after all - the last of which is the two
+readers disagreeing, and all three of which are a message this server would not
+have got this far with.
+*/
+ensure_opt :: proc(
+	msg: []u8,
+	udp_size: u16,
+	allocator := context.allocator,
+) -> (
+	out: []u8,
+	ok: bool,
+) {
+	if _, has_opt := find_opt_span(msg); has_opt {
+		return msg, true
+	}
+	return add_opt_record(msg, udp_size, nil, allocator)
+}
+
+/*
+Add an OPT record advertising `udp_size` and carrying `options`, to a message
+that has none.
+
+The slow path by construction - a record cannot be spliced into a message that
+has nowhere to splice it - so it decodes and encodes again, out of the temp arena
+for the reason `rebuild_edns_option` gives.
+
+DO stays clear: an answer that reached us without an OPT record reached us
+without signatures, and the bit would say otherwise.
+
+Fails when the message will not decode, will not encode again, or turns out to
+have an OPT record after all - the last of which is the caller's own check
+having failed, and not something to hand back half-changed.
+*/
+@(private)
+add_opt_record :: proc(
+	msg: []u8,
+	udp_size: u16,
+	options: []EDNS_Option,
+	allocator: mem.Allocator,
+) -> (
+	out: []u8,
+	ok: bool,
+) {
 	scratch := context.temp_allocator
 
 	m, derr := decode_message(msg, scratch)
@@ -106,24 +176,106 @@ ensure_edns_option :: proc(
 		return nil, false
 	}
 	if _, has_opt := find_opt(m); has_opt {
-		// It has one and the rewrite still failed, so the message is not
-		// something to hand back half-changed.
 		return nil, false
 	}
 
-	options := make([]EDNS_Option, 1, scratch)
-	options[0] = EDNS_Option {
-		code = u16(code),
-		data = data,
-	}
-	// DO stays clear: this answer reached us without signatures, and the bit
-	// would say otherwise.
 	opt := make_opt(udp_size, false)
 	opt.data = Rdata_OPT{options = options}
 
 	additional := make([dynamic]Record, 0, len(m.additional) + 1, scratch)
 	append(&additional, ..m.additional)
 	append(&additional, opt)
+	m.additional = additional[:]
+
+	encoded, _, eerr := encode_message(m, scratch, MAX_MESSAGE)
+	if eerr != .None {
+		return nil, false
+	}
+	out = make([]u8, len(encoded), allocator)
+	copy(out, encoded)
+	return out, true
+}
+
+/*
+Take the whole OPT record back out.
+
+The counterpart to `ensure_opt`, for a client that asked without EDNS and an
+answer that carries an upstream's OPT record: RFC 6891 section 6.1.1 says an OPT
+record MUST NOT be forwarded, and a requestor that never negotiated EDNS is
+entitled to read one as a malformed reply. A message with no OPT record is
+returned unchanged, so a caller can ask for this without looking first.
+
+Never written in place. The bytes handed in may be a cache entry that other
+clients are still being served from, and the record's absence is this client's
+answer alone.
+
+Fails only where a message that has an OPT record somewhere other than the end
+cannot be decoded and encoded again.
+
+A message that cannot be walked as far as an OPT record is reported the same way
+as one that has none: returned unchanged, and `ok`. So `ok` says the caller has
+nothing further to do here rather than that the bytes provably carry no OPT
+record - an upstream reply whose sections do not walk keeps whatever it arrived
+with, which is the reading every other writer in this file takes of the same
+input.
+*/
+remove_opt :: proc(msg: []u8, allocator := context.allocator) -> (out: []u8, ok: bool) {
+	span, has_opt := find_opt_span(msg)
+	if !has_opt {
+		return msg, true
+	}
+	if !span.last {
+		return rebuild_without_opt(msg, allocator)
+	}
+
+	/*
+	Nothing follows the record, so it is the tail of the message and dropping it
+	is a shorter copy plus a smaller ARCOUNT.
+
+	Which is the whole of it: no name in an OPT record is a compression target -
+	the owner is the root and the RDATA is an option list - so no pointer
+	anywhere in the message is aimed into the bytes being dropped, and every
+	offset before them is where it was. A record in the middle has records
+	behind it whose names may well be pointed at, and those offsets do move,
+	which is why that case is rebuilt instead.
+	*/
+	arcount := u16(msg[10]) << 8 | u16(msg[11])
+	if arcount == 0 {
+		// Unreachable: the record was counted in ARCOUNT to be found at all.
+		// Read before the copy is made rather than after, so the one return that
+		// hands back nothing has allocated nothing either.
+		return nil, false
+	}
+	arcount -= 1
+	out = make([]u8, span.rec_start, allocator)
+	copy(out, msg[:span.rec_start])
+	out[10] = u8(arcount >> 8)
+	out[11] = u8(arcount)
+	return out, true
+}
+
+/*
+The slow path: decode, drop the OPT record, encode again.
+
+For a message whose OPT record is not the last one, where the bytes cannot
+simply be cut - see `remove_opt`. Out of the temp arena, for the reason
+`rebuild_edns_option` gives.
+*/
+@(private)
+rebuild_without_opt :: proc(msg: []u8, allocator: mem.Allocator) -> (out: []u8, ok: bool) {
+	scratch := context.temp_allocator
+
+	m, derr := decode_message(msg, scratch)
+	if derr != .None {
+		return nil, false
+	}
+	additional := make([dynamic]Record, 0, len(m.additional), scratch)
+	for rec in m.additional {
+		if rec.type == .OPT {
+			continue
+		}
+		append(&additional, rec)
+	}
 	m.additional = additional[:]
 
 	encoded, _, eerr := encode_message(m, scratch, MAX_MESSAGE)
@@ -228,13 +380,17 @@ peek_rcode :: proc(msg: []u8) -> Rcode {
 
 @(private)
 Opt_Span :: struct {
+	// Offset of the record's own start - its owner name, which is the root - so
+	// that the whole of it can be dropped. See `remove_opt`.
+	rec_start: int,
 	// Offset of the OPT record's RDLENGTH field, which has to be corrected
 	// whenever the options behind it change size.
 	rdlen_pos: int,
 	rd_start:  int,
 	rd_end:    int,
-	// Nothing follows the OPT record, so bytes may be inserted into its RDATA
-	// without moving anything a compression pointer could be aimed at.
+	// Nothing follows the OPT record, so bytes may be inserted into its RDATA -
+	// or the whole record cut away, see `remove_opt` - without moving anything a
+	// compression pointer could be aimed at.
 	last:      bool,
 }
 
@@ -265,6 +421,7 @@ find_opt_span :: proc(msg: []u8) -> (span: Opt_Span, ok: bool) {
 		}
 	}
 	for i in 0 ..< before + arcount {
+		rec_start := pos
 		pos = skip_name(msg, pos) or_return
 		if pos + 10 > len(msg) {
 			return {}, false
@@ -278,6 +435,7 @@ find_opt_span :: proc(msg: []u8) -> (span: Opt_Span, ok: bool) {
 		}
 		if rtype == .OPT && i >= before {
 			return Opt_Span {
+					rec_start = rec_start,
 					rdlen_pos = pos + 8,
 					rd_start = rd_start,
 					rd_end = rd_end,

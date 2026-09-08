@@ -853,6 +853,123 @@ blocking: {{ enabled: false }}
 		}
 	}
 	end_case(r)
+
+	/*
+	One entry, two kinds of client, and neither of them reads the other's OPT
+	record.
+
+	The key is the question plus DO and CD (`cache.make_key`) and not whether the
+	query carried an OPT record at all, so the entry a client with EDNS fills is
+	the entry a client without EDNS is served from - and the query forwarded for
+	the first carried its OPT record upstream while the second's did not, so the
+	stored bytes have an OPT record or no OPT record depending on which client
+	asked first. RFC 6891 section 6.1.1 forbids exactly that crossing: "An OPT
+	RR MUST NOT be cached, forwarded, or stored in or loaded from Zone Master
+	Files."
+
+	Through the shipped binary because the unit cases for this stop at
+	`handle_query`, and what an OPT record does to a stub is decided by the bytes
+	that leave the socket. `mock_synth_all` answers either client the way a real
+	upstream would - `dns.make_response` echoes an OPT record only for a query
+	that carried one - so the entry really is filled in the shape the first
+	client's query produced.
+	*/
+	start_case(r, "cache: an OPT record does not cross from an EDNS client to one without")
+	{
+		mock_reset_counts(mock)
+		filled := query_udp(udp_port, build_query(MIXED_EDNS_FIRST, u16(dns.Type.A), id = 12, edns_size = 1232))
+		if check(r, filled.ok, "no response to the EDNS client") {
+			check_eq_int(r, mock_total(mock), 1, "upstream queries after the EDNS client")
+			check_eq_int(r, int(dns.peek_udp_size(filled.wire)), 1232, "the payload size the EDNS client is told")
+
+			bare := query_udp(udp_port, build_query(MIXED_EDNS_FIRST, u16(dns.Type.A), id = 13))
+			if check(r, bare.ok, "no response to the client without EDNS") {
+				// The premise: it is the same entry being served, or the two
+				// clients never shared anything and nothing could have crossed.
+				check_eq_int(r, mock_total(mock), 1, "upstream queries after the cache hit")
+				check(
+					r,
+					!has_opt_record(r, bare.wire),
+					"a cached OPT record was handed to a client that asked without EDNS",
+				)
+				check_eq_int(r, answer_count(bare.wire), 1, "the answer the client came for")
+			}
+		}
+	}
+	end_case(r)
+
+	/*
+	And the other direction, which is the one that quietly costs a round trip.
+
+	`dns.set_edns_udp_size` has no field to write into when the answer carries no
+	OPT record, so an EDNS client served from an entry a non-EDNS client filled
+	would be told nothing about what this server can deliver. A downstream
+	forwarder reading no OPT record falls back to the 512 bytes RFC 1035 makes it
+	assume, and pays for the TC bits and TCP retries the 1232 ceiling exists to
+	spare it - for as long as the entry lives, and for no reason to do with the
+	question it asked.
+	*/
+	start_case(r, "cache: a client with EDNS is told the payload size even when a non-EDNS client asked first")
+	{
+		mock_reset_counts(mock)
+		filled := query_udp(udp_port, build_query(MIXED_BARE_FIRST, u16(dns.Type.A), id = 14))
+		if check(r, filled.ok, "no response to the client without EDNS") {
+			check_eq_int(r, mock_total(mock), 1, "upstream queries after the first client")
+			// The premise again: the entry really was filled by an answer with
+			// no OPT record in it.
+			check(r, !has_opt_record(r, filled.wire), "the client without EDNS was given an OPT record")
+
+			edns := query_udp(udp_port, build_query(MIXED_BARE_FIRST, u16(dns.Type.A), id = 15, edns_size = 1232))
+			if check(r, edns.ok, "no response to the EDNS client") {
+				check_eq_int(r, mock_total(mock), 1, "upstream queries after the cache hit")
+				if check(r, has_opt_record(r, edns.wire), "an EDNS client got a cached answer with no OPT record") {
+					check_eq_int(
+						r,
+						int(dns.peek_udp_size(edns.wire)),
+						1232,
+						"the payload size the EDNS client is told",
+					)
+				}
+				check_eq_int(r, answer_count(edns.wire), 1, "the answer the client came for")
+			}
+		}
+	}
+	end_case(r)
+}
+
+// Two names, one per direction, so neither case is served an entry the other
+// one filled. Answered by `mock_synth_all` like any other name here.
+@(private = "file")
+MIXED_EDNS_FIRST :: "mixed-edns-first.example.com."
+
+@(private = "file")
+MIXED_BARE_FIRST :: "mixed-bare-first.example.com."
+
+/*
+Whether the answer carries an OPT record, read off the wire the client got.
+
+The decode is checked rather than folded into the answer: reporting "no OPT
+record" for a wire that does not decode at all is how a case asserting the
+absence of one passes over an answer nobody could read - a stale ARCOUNT left
+behind by a strip, say, which is exactly the failure these cases are here to
+catch. So it fails on the spot and the caller's own check reads whatever is left.
+*/
+@(private = "file")
+has_opt_record :: proc(r: ^Runner, wire: []u8) -> bool {
+	msg, err := dns.decode_message(wire, context.temp_allocator)
+	if !check(r, err == .None, "the answer did not decode: %v", err) {
+		return false
+	}
+	return dns.edns_present(msg)
+}
+
+@(private = "file")
+answer_count :: proc(wire: []u8) -> int {
+	h, ok := parse_header(wire)
+	if !ok {
+		return -1
+	}
+	return h.ancount
 }
 
 // A name error whose answer section holds the record it denies. Nothing sends

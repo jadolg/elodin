@@ -347,17 +347,30 @@ handle_query :: proc(
 		response, outcome, ok = resolve_query(s, query, msg, proto, client, limit, cookie, started, allocator)
 	}
 	if ok {
+		/*
+		The answer's OPT record is made to match the request's before anything
+		is written into it.
+
+		Ahead of the cookie and the payload size because both of those write
+		*into* an OPT record, and until this has run there is no telling whether
+		the one they find belongs to this client. A forwarded or cached answer
+		carries the upstream's, and the cache key is the question plus DO and CD
+		- not whether the client sent an OPT at all - so the same entry is
+		served to clients on both sides of that question.
+		*/
+		response = match_client_opt(response, msg, advertise, limit, allocator)
 		response = attach_cookie(s.cookies, response, cookie, msg, limit, advertise, allocator)
 		/*
 		Last, so that nothing after it can put another number back.
 
-		The four ways an answer reaches this point disagree about what its OPT
-		record says: a locally built one echoes the client's figure, a forwarded
-		or cached one carries the upstream's, and `attach_cookie` re-encodes over
-		the top of either. Writing it here rather than in each of them is what
-		makes the guarantee hold for a path added later, and the cached case
-		needs it here anyway - the stored wire is shared between clients and is
-		not this server's number to begin with.
+		The ways an answer reaches this point disagree about what its OPT record
+		says: a locally built one echoes the client's figure, a forwarded or
+		cached one carries the upstream's, a minted one carries what
+		`match_client_opt` was passed, and `attach_cookie` re-encodes over the top
+		of any of them. Writing it here rather than in each of them is what makes
+		the guarantee hold for a path added later, and the cached case needs it
+		here anyway - the stored wire is shared between clients and is not this
+		server's number to begin with.
 		*/
 		response = advertise_udp_size(response, advertise, proto)
 		// After that rather than before it: padding is a statement about the
@@ -421,8 +434,17 @@ advertised_udp_size :: proc(s: ^Server, query: dns.Message, proto: Protocol) -> 
 Write that size onto an answer that is already encoded.
 
 A no-op for a client that asked without EDNS: there is no OPT record to carry a
-number and none is invented for one. A no-op on the stream transports too, where
-the field bounds nothing and the answer's own OPT is left as it is.
+number and none is invented for one. On the answers `handle_query` runs
+`match_client_opt` over first, an OPT record is missing here only because the
+client asked with none - or because the mint failed or would not have fit, either
+of which leaves the answer as it stands. Of the three refusals that return ahead
+of `match_client_opt`, two reach this with the OPT record `dns.error_response`
+echoed from the query, which is the same answer for the same reason. The third -
+the FORMERR for a query that did not decode - hands `error_response` an empty
+`dns.Message`, so it echoes nothing and this is a no-op whatever the client sent:
+a datagram this server could not read is not one to derive an EDNS record from.
+A no-op on the stream transports too, where the field bounds nothing and the
+answer's own OPT is left as it is.
 */
 @(private)
 advertise_udp_size :: proc(wire: []u8, size: u16, proto: Protocol) -> []u8 {
@@ -431,6 +453,129 @@ advertise_udp_size :: proc(wire: []u8, size: u16, proto: Protocol) -> []u8 {
 	}
 	_ = dns.set_edns_udp_size(wire, size)
 	return wire
+}
+
+/*
+Make the answer's OPT record match the request's: one back for a client that
+sent one, none for a client that did not.
+
+Whether a response carries an OPT record is a fact about the request it answers,
+not about the answer. RFC 6891 section 6.1.1 puts it as a prohibition - an OPT
+record MUST NOT be cached or forwarded - and both halves of what that rules out
+are reachable here, because answers pass through this server as the bytes they
+arrived as and the cache key (`cache.make_key`) does not carry EDNS presence. So
+one entry answers a client that asked with EDNS and a client that asked without,
+and whichever of the two filled it decided what the other one got:
+
+  - a client that never negotiated EDNS receives an OPT record advertising a
+    payload size it did not ask about, which a strict stub is entitled to read as
+    a malformed reply;
+  - a client that did negotiate it receives no OPT record at all, so the answer
+    says nothing about what this server can deliver - `advertise_udp_size` has no
+    field to write the ceiling into - and a downstream forwarder falls back to
+    512 and pays for the TC bits and TCP retries the ceiling would have spared
+    it.
+
+Fixed here rather than by keying the cache on EDNS presence, which would settle
+both halves too. That would double the entries for a name asked about from both
+sides - most names, for a forwarder in front of a mixed LAN - and it would still
+be storing an OPT record and handing it out, under a finer key. This costs work
+on the hits that need it instead, and only those: an answer that already agrees
+with the request is returned as it stands, which is every locally built one
+(`dns.make_response` echoes the client's OPT) and every forwarded one whose
+upstream did EDNS.
+
+A minted record carries nothing but the payload size, which is the whole of what
+a response's OPT record says here once the cookie and the padding have been
+written by the two procedures after this one.
+
+`advertise` is the number a minted record states, and it is written again a
+moment later on UDP; on the stream transports nothing writes it again and it is
+the client's own figure, which is what `make_response` puts in a locally built
+answer there. See `attach_cookie`, which mints under the same rule and passes the
+same number.
+
+Neither direction may hand back a datagram larger than the limit, and the two
+reach that differently.
+
+Stripping is refitted, the way `attach_cookie` refits an answer its cookie
+pushed past the ceiling: `dns.remove_opt` cuts the bytes only where the record
+is the tail of the message, and rebuilds the message where it is not, so what
+comes back from that path is an encoding of the answer rather than a shortening
+of it and is not bounded by what went in. An encoding that came back longer than
+the limit has records that genuinely will not fit, and dropping them with TC set
+is what the client needs to hear.
+
+Minting is not, and refitting it was wrong. Eleven bytes longer is a message
+that may no longer fit, and an answer whose only overflow is the record being
+minted has nothing to drop: `encode_message` writes the answer section, finds the
+OPT will not fit behind it, and reports a truncation - so the client is handed a
+complete answer with TC set and *still* no OPT record, and asks again over TCP
+for bytes it already had. Measured on a 504-byte cached answer with a client
+advertising 512: TC where before there was none, and the same absent OPT record
+either way. So a mint that will not fit is abandoned instead, and the answer goes
+as it stands - which is the outcome an upstream that drops EDNS produces anyway,
+and the one the client got before any of this ran. `fit_response` is still what
+holds the ceiling over that answer, and is a no-op on anything already within the
+limit, which is every answer either direction returns in practice.
+
+A failed mint or strip keeps the answer rather than withholding it - the OPT
+mismatch is worth correcting, and not worth costing a client its answer. A
+failed strip returns those bytes untouched, since the strip could only have
+shortened them and whatever bounded them still does. A failed mint goes through
+`fit_response` beside the mint that would not fit, so the one procedure that
+holds the ceiling is reached on both, and it is a no-op on an answer already
+within the limit - which every answer arriving here is.
+*/
+@(private)
+match_client_opt :: proc(
+	wire: []u8,
+	query: dns.Message,
+	advertise: u16,
+	limit: int,
+	allocator: mem.Allocator,
+) -> []u8 {
+	if len(wire) < dns.HEADER_SIZE {
+		return wire
+	}
+
+	if dns.edns_present(query) {
+		out, ok := dns.ensure_opt(wire, advertise, allocator)
+		// A record that will not fit is a record not minted; see above. The
+		// answer in hand is refitted rather than returned, so the ceiling holds
+		// over it whatever the path that produced it did.
+		if !ok || len(out) > limit {
+			return fit_response(wire, limit, query, allocator)
+		}
+		return out
+	}
+
+	/*
+	An rcode of 16 or more lives half in the header and half in the OPT record
+	(RFC 6891 section 6.1.3), so stripping the record from one of those answers
+	would leave the low four bits behind as a different rcode - BADVERS read as
+	NOERROR over an empty answer section, which is a NODATA. The extra OPT record
+	is the smaller of the two faults, so it stays.
+
+	Not reachable from here today, and written down rather than left implicit:
+	`unreadable_rcode_refusal` turns an upstream reply like that into a SERVFAIL
+	before the cache or the client sees it, and the two composed rcodes this
+	server writes itself both answer a query that carried an OPT record by
+	definition - the BADVERS from the version gate, which read the version out of
+	that record, and the BADCOOKIE from `cookie_must_be_refused`, which read a
+	cookie option out of it. All three are one procedure away from a change that
+	would make this the last thing between a rewritten byte and a client reading
+	the wrong rcode.
+	*/
+	if u16(dns.peek_rcode(wire)) > 0xf {
+		return wire
+	}
+
+	out, ok := dns.remove_opt(wire, allocator)
+	if !ok {
+		return wire
+	}
+	return fit_response(out, limit, query, allocator)
 }
 
 /*

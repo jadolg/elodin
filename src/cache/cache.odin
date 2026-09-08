@@ -223,6 +223,25 @@ set depending on the DO bit, and serving one to the other would be wrong.
 `checking_disabled` is part of it for a sharper reason: a client that sets CD
 gets whatever the upstream said, validated or not, and that answer must never
 come back out of the cache for a client that asked us to check.
+
+Whether the query carried an OPT record at all is deliberately not part of it,
+though the answers stored under one key do differ by it. Two roads get them
+there. With validation off the client's query goes upstream as it wrote it, so
+an EDNS client's OPT record rides along and a client without EDNS sends none,
+and the replies come back with and without an OPT record of the upstream's.
+With validation on - the default - `server.dnssec_upstream_query` puts an OPT
+record on every forwarded query whatever the client sent, so the reply always
+has one, and it is `server.strip_dnssec_records` that then puts an OPT record
+back on the answer only for a client whose own query carried one. Either way
+what is stored under a `dnssec_ok = false` key has an OPT record or has none
+according to which client filled it.
+
+Keying on the difference would settle that, and would double the entries for
+every name a mixed client population asks about - and would still be storing an
+OPT record and handing it out, which RFC 6891 section 6.1.1 forbids outright. So
+the presence of an OPT record is decided per request on the way out instead, by
+`server.match_client_opt`, and what is stored here is an answer either kind of
+client can be served from.
 */
 make_key :: proc(
 	buf: []u8,
