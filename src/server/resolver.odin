@@ -1946,24 +1946,28 @@ unreadable_rcode_refusal :: proc(
 	refusal := dns.make_response(msg, .Serv_Fail, allocator)
 	attach_extended_error(&refusal, EDE_OTHER, fmt.tprintf("upstream rcode %s", shown), allocator)
 	/*
-	`truncated` as well as the error, because those are two different answers.
-	A refusal that lost its question to the size ceiling is one the client
-	cannot match to anything it asked, and it would go out with TC set telling
-	that client to fetch the same SERVFAIL again over TCP. The fallback below is
-	the better of the two, and the comment on it named this case before the flag
-	was read.
+	`truncated` as well as the error, and neither is live: what this pair says is
+	that a refusal is only worth sending whole.
 
-	What the flag no longer covers is the OPT record: `encode_message` leaves an
-	additional record that will not fit out quietly, since TC is about answer and
-	authority data (RFC 2181 section 9). So a refusal too tight for the record
-	comes back through here without the extended error in it - the same
-	explanation the fallback below also lacks, arrived at without the wasted
-	round trip that used to come with it.
+	The error is what catches a refusal with no room for its question -
+	`encode_message` gives that one `.Buffer_Too_Small` and builds nothing, since
+	a reply the client cannot match to anything it asked is not a reply. The flag
+	catches what is left, and after the section split there is exactly one thing:
+	an OPT record carrying the top bits of an rcode that could not be re-added
+	behind a cut (see `dns.w_readd_opt`). A record dropped for size alone is left
+	out quietly now, TC being about answer and authority data (RFC 2181 section
+	9), so a refusal too tight for its OPT record comes back from here without
+	the extended error in it - the same explanation the fallback below also
+	lacks, arrived at without the wasted round trip that used to come with it.
 
-	Not reachable today either way: `response_limit` floors at 512 bytes and the
+	Which cannot happen to this one: SERVFAIL is four bits and writes nothing
+	into that TTL. Both conditions are here for the refusal built with a composed
+	rcode that is not - the fallback below is what that wants, and the flag is
+	what would send it there.
+
+	Unreachable on size either way: `response_limit` floors at 512 bytes and the
 	largest refusal this builds is about 330 - a 255-byte name's question, an OPT
-	record and the error text. It is one condition rather than two only because
-	the floor is somewhere else in the file.
+	record and the error text.
 	*/
 	if encoded, truncated, enc_err := dns.encode_message(refusal, allocator, limit);
 	   enc_err == .None && !truncated {
