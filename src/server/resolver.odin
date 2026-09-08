@@ -357,8 +357,12 @@ handle_query :: proc(
 		carries the upstream's, and the cache key is the question plus DO and CD
 		- not whether the client sent an OPT at all - so the same entry is
 		served to clients on both sides of that question.
+
+		`outcome` is passed because the contents of that record are the
+		upstream's on exactly two of these paths and this server's own on the
+		rest; see `match_client_opt`, where the difference is argued.
 		*/
-		response = match_client_opt(response, msg, advertise, limit, allocator)
+		response = match_client_opt(response, msg, advertise, limit, outcome, allocator)
 		response = attach_cookie(s.cookies, response, cookie, msg, limit, advertise, allocator)
 		/*
 		Last, so that nothing after it can put another number back.
@@ -457,7 +461,9 @@ advertise_udp_size :: proc(wire: []u8, size: u16, proto: Protocol) -> []u8 {
 
 /*
 Make the answer's OPT record match the request's: one back for a client that
-sent one, none for a client that did not.
+sent one, none for a client that did not - and in the one that goes back, this
+server's own version and flags rather than an upstream's, carrying none of the
+options an upstream wrote.
 
 Whether a response carries an OPT record is a fact about the request it answers,
 not about the answer. RFC 6891 section 6.1.1 puts it as a prohibition - an OPT
@@ -526,6 +532,12 @@ shortened them and whatever bounded them still does. A failed mint goes through
 `fit_response` beside the mint that would not fit, so the one procedure that
 holds the ceiling is reached on both, and it is a no-op on an answer already
 within the limit - which every answer arriving here is.
+
+The record that does go back is then made this server's own, which is the rest
+of the sentence in RFC 6891 section 6.1.1: presence is what a client reads first,
+but everything written *inside* a forwarded or cached record crossed too.
+`normalise_client_opt` is where the three fields are written and where each is
+argued.
 */
 @(private)
 match_client_opt :: proc(
@@ -533,6 +545,7 @@ match_client_opt :: proc(
 	query: dns.Message,
 	advertise: u16,
 	limit: int,
+	outcome: Outcome,
 	allocator: mem.Allocator,
 ) -> []u8 {
 	if len(wire) < dns.HEADER_SIZE {
@@ -545,9 +558,12 @@ match_client_opt :: proc(
 		// answer in hand is refitted rather than returned, so the ceiling holds
 		// over it whatever the path that produced it did.
 		if !ok || len(out) > limit {
-			return fit_response(wire, limit, query, allocator)
+			out = fit_response(wire, limit, query, allocator)
 		}
-		return out
+		// On both, so that an answer whose mint was abandoned is still answered
+		// in this server's own version if it turned out to have a record after
+		// all, and so that nothing is left resting on which of the two returned.
+		return normalise_client_opt(out, query, outcome, allocator)
 	}
 
 	/*
@@ -576,6 +592,106 @@ match_client_opt :: proc(
 		return wire
 	}
 	return fit_response(out, limit, query, allocator)
+}
+
+/*
+Make the contents of the answer's OPT record this server's own statement.
+
+RFC 6891 section 6.1.1 forbids caching or forwarding an OPT record, and
+`match_client_opt` above settles the half a client reads first - whether a record
+is there at all. This is the rest of it. An answer passes through this server as
+the bytes it arrived as, so a forwarded or cached one carries the fields the
+upstream wrote, and three of them are statements about a conversation this
+client was not part of.
+
+The version and the flags first, on every answer that carries a record out.
+Both are the responder's own (RFC 6891 section 6.1.3, RFC 3225 section 3), and
+this server is the responder for the answer it sends:
+
+  - VERSION is stated as 0, the one version implemented here. It is also the one
+    `handle_query` refuses a *query* in any other value of, with BADVERS, a
+    screen earlier - so passing an upstream's version on was this server holding
+    requestors to a rule it did not hold itself to, and answering a client in a
+    version it may not implement.
+  - DO is taken from the query. RFC 3225 section 3: "The DO bit of the query
+    MUST be copied in the response." What arrives in a forwarded answer is the
+    upstream's copy of the bit *this server* sent it, which on a validating
+    resolver is not the bit the client sent at all. This is also what
+    `dnssec.strip_dnssec_records` has always done when it rebuilds an answer for
+    a client that asked without DO, so the two paths now agree.
+  - the remaining fifteen flag bits are reserved and MUST be zero (RFC 6891
+    section 6.1.4). `dns.set_edns_version_and_flags` writes them rather than
+    masking, for the same reason: an upstream that set one is not a reason to
+    repeat it.
+
+The EXTENDED-RCODE byte is deliberately not touched. On a response it is the top
+half of an rcode somebody meant - the BADVERS from the version gate, the
+BADCOOKIE from `cookie_must_be_refused` - and clearing it would leave the low
+nibble behind as a different rcode, which is the fault `match_client_opt`
+declines to introduce by stripping a record for the same reason. Nothing
+forwarded can carry one: `unreadable_rcode_refusal` turns an upstream reply with
+a composed rcode above 15 into a SERVFAIL before the cache or the client sees it.
+
+Then the options, and only on the two outcomes whose bytes came from elsewhere.
+`dns.remove_edns_option` is per code and what an upstream may have written is
+open-ended - NSID, an extended error, a cookie, whatever a future upstream
+invents - so the rule is an allowlist rather than a list of things to drop, and
+on those two paths the allowlist is empty. NSID is the plain case: it names the
+instance that answered a question this client never asked, and out of the cache
+it names it to every client that hits the entry.
+
+`.Forwarded` and `.Cached` rather than all of them, because the option this
+server writes itself has to survive. `attach_extended_error` runs on the refusal
+paths - a DNSSEC failure, a rebind block, an upstream rcode no client can read -
+and it runs *before* this, so an unconditional strip would take this server's own
+extended DNS error with it and leave the client a bare SERVFAIL with nothing
+saying why. Those answers are built here by `dns.make_response`, whose OPT record
+starts empty, so what is in one is exactly what this server put there and there
+is nothing to take out. The cookie and the padding are the other two this server
+writes, and both are written after `match_client_opt` returns.
+
+What that leaves standing is an upstream's extended error on an answer this
+server forwards - dropped here rather than passed on. RFC 8914 section 3 makes
+that the implementation's call ("whether or not (and how) to pass along EDE
+information on to their original client is implementation dependent") and gives
+the reason to drop it in the next sentence: an option received by the original
+client "will appear to have come from the resolver or forwarder sending it", so
+a copy forwarded unattributed is this server appearing to say something it never
+looked at. The ones this server does send name the upstream in their EXTRA-TEXT,
+which is what that section asks of a sender.
+
+Run here rather than before `cache.put`, so what a cache entry holds is still
+the reply as it arrived. That is the letter of "MUST NOT be cached" left
+standing, and it is the same trade `match_client_opt` makes just above by
+correcting presence on the way out rather than keying the cache on it: the
+entry's bytes are shared between clients and nothing in them is this client's
+answer until something says so per hit, which the version and the DO bit have to
+be anyway. Nothing reaches a client with an upstream's options in it either way,
+and doing it once per hit rather than once per entry costs an allocation only on
+the entries an upstream actually wrote an option into.
+
+A failed strip keeps the answer with its options rather than withholding it,
+which is `match_client_opt`'s reading of the same choice: the leak is worth
+closing and is not worth costing a client its answer.
+*/
+@(private)
+normalise_client_opt :: proc(
+	wire: []u8,
+	query: dns.Message,
+	outcome: Outcome,
+	allocator: mem.Allocator,
+) -> []u8 {
+	out := wire
+	#partial switch outcome {
+	case .Forwarded, .Cached:
+		if stripped, ok := dns.strip_edns_options(wire, allocator); ok {
+			out = stripped
+		}
+	}
+	// A no-op on an answer with no OPT record, which is what a mint that failed
+	// or would not have fit leaves behind.
+	_ = dns.set_edns_version_and_flags(out, 0, dns.edns_do(query))
+	return out
 }
 
 /*
