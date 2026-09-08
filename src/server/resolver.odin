@@ -688,6 +688,18 @@ A failed strip keeps the answer with its options rather than withholding it,
 which is `match_client_opt`'s reading of the same choice: the leak is worth
 closing and is not worth costing a client its answer.
 
+That fail-open is reachable on purpose, and is worth naming rather than leaving
+as a kindness. Only the rebuild path can fail, and it fails where the reply will
+not decode - so a sender that wants its NSID or its extended error to reach every
+client puts one record the decoder rejects behind its OPT record, and the option
+list goes out intact and into the cache for the entry's lifetime. An upstream can
+do it, and so can anything able to rewrite a reply that crossed the network in
+the clear. It stays this way because the alternative is withholding an answer
+over an EDNS option, and because the same shape already defeats `remove_opt` on
+the other branch, where the cost is an OPT record reaching a client that sent
+none. What would actually close it is a reply that does not decode not being
+served at all, which is a larger question than this one and is not settled here.
+
 The strip is refitted, for the reason `match_client_opt` refits the one above it:
 `dns.strip_edns_options` cuts bytes only where the OPT record is the tail of the
 message and rebuilds the message where it is not, so what comes back from that
@@ -719,11 +731,26 @@ normalise_client_opt :: proc(
 	allocator: mem.Allocator,
 ) -> []u8 {
 	out := wire
-	#partial switch outcome {
+	switch outcome {
 	case .Forwarded, .Cached:
 		if stripped, ok := dns.strip_edns_options(wire, allocator); ok {
 			out = fit_response(stripped, limit, query, allocator)
 		}
+	/*
+	Built here, by `dns.make_response` or `dns.error_response`, whose OPT record
+	is minted with no options in it - so what is in one is what this server put
+	there, and there is nothing to take out.
+
+	Listed rather than left to a `#partial` or a default, so that the set is
+	decided rather than defaulted. An outcome added later stops this compiling
+	until somebody says which side of the line it is on, and the side that fails
+	open is the one where an upstream's options start reaching clients again with
+	no test going red - the two cases below pin `.Forwarded` and `.Cached`, which
+	is exactly what a new label would not be. The stale hits are the live example:
+	the query log already tells `stale` from `cache`, and the day that becomes its
+	own outcome is the day this would have gone quiet.
+	*/
+	case .Blocked, .Rewritten, .Local, .Failed, .Refused:
 	}
 	// A no-op on an answer with no OPT record, which is what a mint that failed
 	// or would not have fit leaves behind.

@@ -730,8 +730,24 @@ rebuild_without_edns_options :: proc(msg: []u8, allocator: mem.Allocator) -> (ou
 	}
 	m.additional = additional[:]
 
-	encoded, _, eerr := encode_message(m, scratch, MAX_MESSAGE)
-	if eerr != .None {
+	/*
+	A re-encode that had to truncate is reported as a failure rather than
+	returned, which is the one place this parts company with the rebuilds beside
+	it.
+
+	They shorten a message by construction, so a truncation there is a message
+	that was already too long. This one can *grow*: a name the sender compressed
+	inside RDATA comes back written in full, which is what `w_record` does with
+	an SRV target. On the stream transports the caller's limit is 65535 and so is
+	`MAX_MESSAGE`, so a large answer that grew past it would come back with
+	records dropped and TC set, and the caller's own refit would find it inside
+	the limit and do nothing - leaving a client told to ask again over the TCP it
+	is already using. Handing back the bytes as they arrived is the better of the
+	two: the caller keeps an answer that is whole and still carries the options,
+	which is a leak, where the other is a name that will not resolve.
+	*/
+	encoded, truncated, eerr := encode_message(m, scratch, MAX_MESSAGE)
+	if eerr != .None || truncated {
 		return nil, false
 	}
 	out = make([]u8, len(encoded), allocator)
