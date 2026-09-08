@@ -341,3 +341,80 @@ test_strip_edns_options_drops_a_second_opt_record :: proc(t: ^testing.T) {
 
 	free_all(context.temp_allocator)
 }
+
+/*
+And the same, with the *first* OPT record empty.
+
+The shape that slipped past the first version of this: "there are no options
+here" is a fact about the record `find_opt_span` stopped at, not about the
+message, so an early return on it handed a second record - options, version, DO
+bit and all - straight to the client. The early return is behind the `span.last`
+check now, which is what makes the two readings the same one.
+*/
+@(test)
+test_strip_edns_options_drops_a_second_opt_behind_an_empty_first :: proc(t: ^testing.T) {
+	questions := make([]Question, 1, context.temp_allocator)
+	questions[0] = Question {
+		name  = NAME,
+		type  = .A,
+		class = .IN,
+	}
+	answer := make([]Record, 1, context.temp_allocator)
+	answer[0] = answer_record()
+
+	// Nothing in the first, everything in the second.
+	first := make_opt(1232, false)
+	second := make_opt(512, true)
+	second.ttl |= u32(1) << 16
+	second.data = Rdata_OPT{options = two_options()}
+
+	additional := make([]Record, 2, context.temp_allocator)
+	additional[0] = first
+	additional[1] = second
+
+	wire, _, err := encode_message(
+		Message{id = 11, question = questions, answer = answer, additional = additional},
+		context.temp_allocator,
+	)
+	testing.expect_value(t, err, Encode_Error.None)
+	// The premise: the option is in the message, in the record that is not the
+	// one a walk stops at.
+	testing.expect(t, holds_an_option(wire), "the fixture carries no option, so this case tests nothing")
+
+	out, ok := strip_edns_options(wire, context.temp_allocator)
+	testing.expect(t, ok, "strip_edns_options failed")
+	testing.expect(t, !holds_an_option(out), "an option survived in the second OPT record")
+
+	after, aerr := decode_message(out, context.temp_allocator)
+	testing.expect_value(t, aerr, Decode_Error.None)
+	opts_out := 0
+	for rec in after.additional {
+		if rec.type == .OPT {
+			opts_out += 1
+		}
+	}
+	testing.expectf(t, opts_out == 1, "%d OPT records came back, not 1", opts_out)
+	testing.expect_value(t, len(after.answer), 1)
+
+	free_all(context.temp_allocator)
+}
+
+// Whether any OPT record anywhere in the message carries an option, which is the
+// question `peek_edns_option` cannot answer: it walks to the first record and
+// stops, which is the whole subject of the case above.
+@(private = "file")
+holds_an_option :: proc(wire: []u8) -> bool {
+	m, err := decode_message(wire, context.temp_allocator)
+	if err != .None {
+		return false
+	}
+	for rec in m.additional {
+		if rec.type != .OPT {
+			continue
+		}
+		if rdata, is_opt := rec.data.(Rdata_OPT); is_opt && len(rdata.options) > 0 {
+			return true
+		}
+	}
+	return false
+}

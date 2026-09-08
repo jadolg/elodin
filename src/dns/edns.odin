@@ -155,8 +155,12 @@ for the reason `rebuild_edns_option` gives.
 DO stays clear, which is the only reading available here: this has the message
 and not the request it answers, and RFC 3225 section 3 makes the bit in a
 response a copy of the one in the query. A caller that does have the query says
-so afterwards - `server.normalise_client_opt` writes the copy over every record
-that goes back, minted here or not.
+so afterwards - `server.normalise_client_opt` writes the copy over the record an
+answer carries at that point, whether it was minted here or arrived with one. A
+record minted *after* that, by `ensure_edns_option` making room for a cookie or
+for padding, keeps the clear bit this writes; nothing reaches those with the
+answer still lacking an OPT record and room to add one, and if something ever
+does, the copy is the caller's to write there too.
 
 Fails when the message will not decode, will not encode again, or turns out to
 have an OPT record after all - the last of which is the caller's own check
@@ -632,8 +636,16 @@ argued.
 A message with no OPT record, or one that cannot be walked as far as one, is
 returned unchanged and `ok` - the same answer `remove_opt` gives, and for the
 same reason: a caller asking for this has nothing further to do either way.
-A record whose RDATA is already empty is returned unchanged too, so the common
-case allocates nothing.
+
+An empty option list is returned unchanged only when that record is also the last
+thing in the message, which is what makes "nothing to strip" true rather than
+merely true of the first record. Nothing may follow it, so there is no second OPT
+record for the rebuild below to drop, and the common case - an upstream that
+wrote no options, with its OPT record where an OPT record goes - allocates
+nothing. An empty record with anything behind it goes to the rebuild instead:
+what is behind it may be another OPT record carrying options, and returning early
+on the first record's emptiness would hand that one to the client whole. Ordered
+the other way round this read as an optimisation and was a hole.
 
 Never written in place, for `remove_opt`'s reason: the bytes handed in may be a
 cache entry other clients are still being served from, and an option's absence
@@ -644,11 +656,16 @@ decoded and encoded again.
 */
 strip_edns_options :: proc(msg: []u8, allocator := context.allocator) -> (out: []u8, ok: bool) {
 	span, has_opt := find_opt_span(msg)
-	if !has_opt || span.rd_start == span.rd_end {
+	if !has_opt {
 		return msg, true
 	}
 	if !span.last {
 		return rebuild_without_edns_options(msg, allocator)
+	}
+	// Nothing follows the record, so an empty list here is the whole message's
+	// answer and not just this record's. See above.
+	if span.rd_start == span.rd_end {
+		return msg, true
 	}
 
 	/*
@@ -677,7 +694,8 @@ simply be cut - see `strip_edns_options`. Out of the temp arena, for the reason
 
 A second OPT record is dropped rather than emptied, and this is the only place
 that can be reached with one: a message carrying two has a record behind the
-first, so `strip_edns_options` never takes its fast path on it. RFC 6891 section
+first, so it is not `span.last`, and both of `strip_edns_options`'s early returns
+are behind that check for exactly this reason. RFC 6891 section
 6.1.1 allows exactly one, to the point of requiring FORMERR for a *query* that
 carries more, and nothing applies that reading to a reply - so a message with two
 is one an upstream should not have sent and not one to pass on as it stands.
