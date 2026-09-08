@@ -659,6 +659,15 @@ strip_unauthenticated :: proc(
 	nothing to distinguish it from a complete one - and the caller's next act is
 	to set the AD bit over it. Failing instead leaves the original standing
 	without the bit, which is the same fallback an encode error already gets.
+
+	`truncated` covers the answer and authority sections, which are the two AD
+	is a claim about: an additional record that will not fit is left out quietly,
+	since TC is not about additional data (RFC 2181 section 9). The OPT record is
+	the one in there worth keeping - it carries the upper bits of the rcode, as
+	the comment above says - and the encoder keeps room for it behind a cut it
+	makes, so losing it takes a `limit` too small for the record on its own.
+	Which is not a limit this is called with: the one caller in the server passes
+	`dns.MAX_MESSAGE`, and so does the default here.
 	*/
 	encoded, truncated, enc := dns.encode_message(msg, allocator, limit)
 	if enc != .None || truncated {

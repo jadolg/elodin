@@ -261,11 +261,195 @@ w_record :: proc(w: ^Writer, rec: Record) -> Encode_Error {
 }
 
 /*
+The OPT record's own encoded length: a root owner name, the four fixed fields,
+and four bytes of header per option carried.
+
+Nothing about it depends on where in the message it lands - the owner name is
+the root and its RDATA holds no name to compress - so this can be worked out
+before a byte is written, which is what `encode_message` needs to keep room for
+it behind a truncation.
+
+`ok` is false wherever that arithmetic is not the record's, and the caller keeps
+no room rather than the wrong amount:
+
+  - a message with no OPT record in its additional section, which is the section
+    `find_opt` reads and the only one an OPT record is the message's EDNS record
+    in;
+  - an owner name other than the root. RFC 6891 section 6.1.2 makes it the root
+    and `w_record` writes it uncompressed, so a decoded reply that carries
+    something else - the decoder reads the RDATA and never looks at the name -
+    would cost as many bytes as the name is long. Reserving eleven for it is how
+    the walk back below sheds records for a record that then does not fit
+    anyway.
+  - RDATA of another shape than an option list. Nothing builds one, and nothing
+    here has to guess at what it encodes to.
+*/
+@(private)
+opt_wire_len :: proc(m: Message) -> (n: int, ok: bool) {
+	for rec in m.additional {
+		if rec.type != .OPT {
+			continue
+		}
+		if rec.name != "." {
+			return 0, false
+		}
+		// The root name, TYPE, CLASS, TTL and RDLENGTH.
+		n = 11
+		if rdata, is_opt := rec.data.(Rdata_OPT); is_opt {
+			for o in rdata.options {
+				n += 4 + len(o.data)
+			}
+		} else if rec.data != nil {
+			return 0, false
+		}
+		return n, true
+	}
+	return 0, false
+}
+
+/*
+Put the message's OPT record back behind a cut, and say whether leaving it out
+would have been a truncation in its own right.
+
+Called with the writer already past whatever was dropped and with no OPT record
+written, so it appends the first one the additional section holds - the record
+`find_opt` and `opt_wire_len` both mean - and gives up on it where even that
+does not fit.
+
+Compression targets recorded for the dropped bytes are stale by the time this
+runs, so nothing written here may reference them: the map is cleared and the
+writer put into uncompressed mode, which an OPT record does not need anyway -
+its owner is the root and its RDATA holds no name. The keys are cloned, so they
+are freed before `clear` drops the entries, or the later
+`writer_release_scratch` finds an empty map and one string per distinct suffix
+leaks.
+
+`rcode_lost` is the one thing a caller cannot work out for itself: an rcode of
+16 or more lives half in the header and half in this record's TTL (RFC 6891
+section 6.1.3), so a message that goes out without it states a different rcode -
+BADVERS read as NOERROR over an empty answer section, which is a NODATA, and
+BADCOOKIE as YXRRSET. That is a truncation after all: the client is sent to TCP,
+where the record fits and the rcode it was answered with arrives.
+`server.match_client_opt` refuses to strip an OPT record from those same answers
+for the same reason. Not reachable through the server, where `response_limit`
+floors at 512 bytes and the largest composed-rcode reply it builds is under 300
+- and this is reached from an exported procedure, so it is not resting on that.
+*/
+@(private)
+w_readd_opt :: proc(
+	w: ^Writer,
+	m: Message,
+	max_size: int,
+	counts: ^[3]u16,
+) -> (
+	rcode_lost: bool,
+	err: Encode_Error,
+) {
+	writer_free_comp_keys(w)
+	clear(&w.comp)
+	w.compress = false
+
+	for rec in m.additional {
+		if rec.type != .OPT {
+			continue
+		}
+		mark := len(w.buf)
+		w_record(w, rec) or_return
+		if len(w.buf) > max_size {
+			resize(&w.buf, mark)
+			return rec.ttl & 0xff00_0000 != 0, .None
+		}
+		counts[2] += 1
+		return false, .None
+	}
+	return false, .None
+}
+
+/*
+Whether a record left out of the additional section is glue a referral cannot be
+read without (RFC 9471 section 3.3).
+
+The general rule above is that additional data is not what TC is about. A
+delegation is the exception the RFC carves out: the address of a name server
+whose own name lives inside the zone being delegated is learnable from this
+reply and nowhere else, so a referral that could not carry it has to say so - or
+the resolver reading it cannot tell a partial glue set from a complete one, and
+follows the delegation an address short.
+
+Asked of exactly that shape and no other. An answer section with anything in it
+is not a referral; a name server named outside the zone being delegated is one
+the resolver can go and look up, which is what makes the RFC's rule an in-domain
+one; and an address record for neither is ordinary additional data.
+*/
+@(private)
+omitted_glue_truncates :: proc(m: Message, rec: Record) -> bool {
+	if len(m.answer) != 0 {
+		return false
+	}
+	if rec.type != .A && rec.type != .AAAA {
+		return false
+	}
+	for ns in m.authority {
+		if ns.type != .NS {
+			continue
+		}
+		target, named := ns.data.(Rdata_Name)
+		if !named || !name_at_or_below(target.name, ns.name) {
+			continue
+		}
+		if name_equal_fold(rec.name, target.name) {
+			return true
+		}
+	}
+	return false
+}
+
+/*
+Whether the message's rcode has bits that live only in its OPT record's TTL.
+
+RFC 6891 section 6.1.3 splits an rcode of 16 or more between the header's four
+bits and that byte, so a message that loses the record states the low four on
+their own - a different rcode, and one the client has no way to know is not the
+one it was answered with.
+
+Read through `find_opt`, so it is the same record the rest of this package calls
+the message's own.
+*/
+@(private)
+opt_holds_extended_rcode :: proc(m: Message) -> bool {
+	opt, found := find_opt(m)
+	return found && opt.ttl & 0xff00_0000 != 0
+}
+
+/*
 Serialise a message, truncating at `max_size` if necessary.
 
-When records have to be dropped the TC bit is set and, if the additional section
-carried an OPT record, that record is re-appended so the client still sees our
-EDNS parameters.
+TC says that answer or authority data was left out, which is what RFC 2181
+section 9 makes it: the bit tells a client the records it asked for did not all
+fit and to ask again over TCP. So a record dropped from those two sections sets
+`truncated` and the TC bit, and a record dropped from the additional section
+does not - a responder that could not fit a glue address or an OPT record behind
+a complete answer has answered the question, and a client sent to TCP over it
+gets the same records one round trip later.
+
+The OPT record is re-appended after a cut so the client still sees our EDNS
+parameters, and the additional section keeps its room as it fills rather than
+spending it on glue. Where a cut in the answer or authority section leaves the
+record no room, records are dropped back until it has some: the client is being
+told to ask again over TCP either way, so the ones behind the cut are bytes it
+will discard - while the OPT record carries the payload size to ask again with,
+the upper bits of the rcode, and any cookie or extended error written into it.
+
+An answer that would otherwise be complete is cut for that record in one case
+only, and it is not an EDNS one: an rcode of 16 or more is written half in the
+header and half in the record's TTL, so a message that lost the record would
+state a different rcode. Every other complete answer keeps its records and goes
+out without the record instead, which is `server.match_client_opt`'s reading of
+the same trade for an OPT record it declines to mint.
+
+The additional section has an exception of its own, and it is RFC 9471 section
+3.3 rather than RFC 2181 section 9: glue a referral cannot be read without. See
+`omitted_glue_truncates`.
 */
 encode_message :: proc(
 	m: Message,
@@ -306,42 +490,157 @@ encode_message :: proc(
 	counts: [3]u16
 	sections := [3][]Record{m.answer, m.authority, m.additional}
 
+	/*
+	Where the message stood after the last answer or authority record that still
+	left room for the OPT record, so a truncation can drop back to it.
+
+	One mark rather than a stack of them: the walk back only ever goes to the
+	longest prefix of those two sections that the OPT record fits behind, which
+	is this point by construction, whether that is one record short of the cut
+	or the whole of both sections.
+
+	-1 where there is no such point at all: a message whose question alone
+	leaves no room for the record has nothing to gain by dropping records for it,
+	and would come back empty and still without one.
+	*/
+	opt_len, keep_room := opt_wire_len(m)
+	// Whether the OPT record is the only place part of this message's rcode is
+	// written, which is what makes leaving it out a different answer rather
+	// than a smaller one. See the walk back below.
+	opt_required := opt_holds_extended_rcode(m)
+	roomy_mark := -1
+	roomy_counts: [3]u16
+	if keep_room && len(w.buf) + opt_len <= max_size {
+		roomy_mark = len(w.buf)
+	}
+
+	// Two different endings, and they are not the same answer: see above.
+	additional_dropped := false
+	opt_written := false
+
 	outer: for section, si in sections {
 		for rec in section {
+			/*
+			The additional section keeps the OPT record's room as it fills.
+
+			The room the walk back below keeps behind a cut is no use if the
+			records ahead of the OPT record spend it, and the OPT record is
+			normally the last one in the section - so an answer whose glue ends
+			eleven bytes short of the ceiling would leave a client that asked
+			with EDNS no record at all: no payload size, no cookie, no extended
+			error, and no cut to walk back from. A glue address is a hint the
+			client can go and ask for; the record it negotiated is not.
+
+			Only while the record would still fit at all. Where it is already
+			past the ceiling nothing behind it can be dropped to help, and
+			holding the room back would cost the section a record for nothing.
+			*/
+			ceiling := max_size
+			if si == 2 && keep_room && !opt_written && rec.type != .OPT {
+				if len(w.buf) + opt_len <= max_size {
+					ceiling = max_size - opt_len
+				}
+			}
+
 			mark := len(w.buf)
 			w_record(&w, rec) or_return
-			if len(w.buf) > max_size {
+			if len(w.buf) > ceiling {
 				resize(&w.buf, mark)
-				truncated = true
-				break outer
+				// The one record in the additional section whose absence is a
+				// truncation, and the answer-and-authority case it joins.
+				if si != 2 || omitted_glue_truncates(m, rec) {
+					truncated = true
+					break outer
+				}
+				/*
+				The additional section is filled as far as it goes rather than
+				abandoned at the first record that will not fit. Nothing on the
+				wire says a record was left out of it - which is the whole of
+				what the split above is - so a client whose buffer had no room
+				for one glue address would otherwise silently lose the records
+				behind it that did fit, the OPT record it negotiated among them.
+
+				Once, and then compression is off for the rest of the message.
+				The targets recorded for the bytes just dropped are stale, so
+				the map has to go - keys freed first, since its storage does not
+				own them - and every record tried after that would otherwise
+				clone a key per distinct suffix into an allocator that is a
+				per-request arena, where the frees are no-ops. A reply carrying
+				thousands of small additional records against a small ceiling
+				would grow that arena by all of them for records none of which
+				are sent. What it costs is the odd byte on the records behind
+				the drop, which go out with their names in full.
+				*/
+				if !additional_dropped {
+					additional_dropped = true
+					writer_free_comp_keys(&w)
+					clear(&w.comp)
+					w.compress = false
+				}
+				continue
 			}
 			counts[si] += 1
+			/*
+			Asked of the record just written rather than of the one that
+			overflowed: an OPT record already in the message is not one to append
+			a second copy of below.
+
+			And only in the additional section, which is the only one `find_opt`
+			reads and the only one `opt_wire_len` measured. A client can put a
+			record of type OPT in its question's answer section for the asking,
+			and taking that for the message's EDNS record would shed answer
+			records for room the re-add below then declines to use.
+			*/
+			if si == 2 && rec.type == .OPT {
+				opt_written = true
+			}
+			if si < 2 && keep_room && len(w.buf) + opt_len <= max_size {
+				roomy_mark = len(w.buf)
+				roomy_counts = counts
+			}
 		}
 	}
 
-	if truncated {
-		// Compression targets recorded for the dropped bytes are now stale, so
-		// nothing more may be written that could reference them. OPT uses a
-		// root name and no compressible RDATA, which keeps this safe. The keys
-		// are cloned, so free them before `clear` drops the entries — otherwise
-		// the later `writer_release_scratch` finds an empty map and one string
-		// per distinct suffix leaks.
-		writer_free_comp_keys(&w)
-		clear(&w.comp)
-		for rec in m.additional {
-			if rec.type != .OPT {
-				continue
-			}
-			mark := len(w.buf)
-			w.compress = false
-			w_record(&w, rec) or_return
-			if len(w.buf) > max_size {
-				resize(&w.buf, mark)
-			} else {
-				counts[2] += 1
-			}
-			break
+	/*
+	The cut left the OPT record nowhere to go, so it goes back one or more
+	records further.
+
+	Two reasons to spend a record on that, and a complete answer is never cut
+	for either of them without one. A truncation is dropping records and sending
+	the client to TCP already, so the ones behind the cut are bytes it will
+	discard - while the OPT record carries what it needs to ask again with.
+
+	The other is a message whose rcode is 16 or more. Its top eight bits live in
+	that record's TTL and nowhere else (RFC 6891 section 6.1.3), so a message
+	that loses the record states a different rcode: BADVERS read as NOERROR over
+	an empty answer section, which is a NODATA, and BADCOOKIE as YXRRSET. A
+	record dropped to keep that honest sets TC like any other, so the client
+	reads the rcode it was answered with and comes back over TCP for the records
+	- rather than reading the wrong rcode and coming back for the same thing.
+	*/
+	if !opt_written && roomy_mark >= 0 && len(w.buf) + opt_len > max_size && (truncated || opt_required) {
+		/*
+		TC for what the walk back takes out of the answer or authority section,
+		and for nothing else: it may have discarded additional records alone,
+		and a complete answer is not one to send a client away from. Asked of
+		the counts rather than assumed from the reason, since the rcode half of
+		this runs over answers nothing has been dropped from.
+
+		Not reachable as things stand - a non-OPT additional record is only
+		written while it leaves the OPT record's room, so the record is written
+		in the walk above and this never runs - which is a reason to derive the
+		flag from what happened rather than to argue about which shapes reach
+		it.
+		*/
+		if counts[0] != roomy_counts[0] || counts[1] != roomy_counts[1] {
+			truncated = true
 		}
+		resize(&w.buf, roomy_mark)
+		counts = roomy_counts
+	}
+
+	if (truncated || additional_dropped) && !opt_written {
+		truncated |= w_readd_opt(&w, m, max_size, &counts) or_return
 	}
 
 	flags := m.flags
