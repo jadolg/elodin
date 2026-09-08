@@ -415,9 +415,31 @@ encode_message :: proc(
 
 	outer: for section, si in sections {
 		for rec in section {
+			/*
+			The additional section keeps the OPT record's room as it fills.
+
+			The room the walk back below keeps behind a cut is no use if the
+			records ahead of the OPT record spend it, and the OPT record is
+			normally the last one in the section - so an answer whose glue ends
+			eleven bytes short of the ceiling would leave a client that asked
+			with EDNS no record at all: no payload size, no cookie, no extended
+			error, and no cut to walk back from. A glue address is a hint the
+			client can go and ask for; the record it negotiated is not.
+
+			Only while the record would still fit at all. Where it is already
+			past the ceiling nothing behind it can be dropped to help, and
+			holding the room back would cost the section a record for nothing.
+			*/
+			ceiling := max_size
+			if si == 2 && keep_room && !opt_written && rec.type != .OPT {
+				if len(w.buf) + opt_len <= max_size {
+					ceiling = max_size - opt_len
+				}
+			}
+
 			mark := len(w.buf)
 			w_record(&w, rec) or_return
-			if len(w.buf) > max_size {
+			if len(w.buf) > ceiling {
 				resize(&w.buf, mark)
 				if si != 2 {
 					truncated = true
@@ -431,17 +453,23 @@ encode_message :: proc(
 				for one glue address would otherwise silently lose the records
 				behind it that did fit, the OPT record it negotiated among them.
 
-				The compression targets recorded for the bytes just dropped are
-				stale, so the map goes before anything else is written - keys
-				freed first, since the map's storage does not own them. What
-				follows may still compress: every target left is one this walk
-				put there *after* the last drop, so it names a name that is
-				really in the buffer, and a record written uncompressed instead
-				would cost the section the room the drop just freed.
+				Once, and then compression is off for the rest of the message.
+				The targets recorded for the bytes just dropped are stale, so
+				the map has to go - keys freed first, since its storage does not
+				own them - and every record tried after that would otherwise
+				clone a key per distinct suffix into an allocator that is a
+				per-request arena, where the frees are no-ops. A reply carrying
+				thousands of small additional records against a small ceiling
+				would grow that arena by all of them for records none of which
+				are sent. What it costs is the odd byte on the records behind
+				the drop, which go out with their names in full.
 				*/
-				additional_dropped = true
-				writer_free_comp_keys(&w)
-				clear(&w.comp)
+				if !additional_dropped {
+					additional_dropped = true
+					writer_free_comp_keys(&w)
+					clear(&w.comp)
+					w.compress = false
+				}
 				continue
 			}
 			counts[si] += 1
@@ -484,11 +512,24 @@ encode_message :: proc(
 	- rather than reading the wrong rcode and coming back for the same thing.
 	*/
 	if !opt_written && roomy_mark >= 0 && len(w.buf) + opt_len > max_size && (truncated || opt_required) {
+		/*
+		TC for what the walk back takes out of the answer or authority section,
+		and for nothing else: it may have discarded additional records alone,
+		and a complete answer is not one to send a client away from. Asked of
+		the counts rather than assumed from the reason, since the rcode half of
+		this runs over answers nothing has been dropped from.
+
+		Not reachable as things stand - a non-OPT additional record is only
+		written while it leaves the OPT record's room, so the record is written
+		in the walk above and this never runs - which is a reason to derive the
+		flag from what happened rather than to argue about which shapes reach
+		it.
+		*/
+		if counts[0] != roomy_counts[0] || counts[1] != roomy_counts[1] {
+			truncated = true
+		}
 		resize(&w.buf, roomy_mark)
 		counts = roomy_counts
-		// Records left out of the answer or authority section, whichever of the
-		// two brought this about.
-		truncated = true
 	}
 
 	if truncated || additional_dropped {

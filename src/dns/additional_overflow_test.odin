@@ -507,3 +507,48 @@ test_an_extended_rcode_is_kept_at_the_cost_of_a_record :: proc(t: ^testing.T) {
 
 	free_all(context.temp_allocator)
 }
+
+/*
+The room the OPT record needs is kept against the records ahead of it too.
+
+It is normally the last record in the section, so the glue in front of it spends
+the ceiling first - and where that leaves eleven bytes short, a client that
+asked with EDNS used to get an answer with no OPT record in it at all: no
+payload size, no cookie, no extended error, and no cut for the walk back to
+work from, since the answer came out whole. The glue goes instead, which is a
+hint the client can ask for again.
+
+Reachable from `server.strip_dnssec_records`, which appends a minted OPT record
+behind the additional records that survived the strip and encodes the lot at the
+client's ceiling, and from `fit_response` re-encoding a forwarded referral for a
+client that advertised less than the entry was stored for.
+*/
+@(test)
+test_the_records_ahead_of_the_opt_do_not_spend_its_room :: proc(t: ^testing.T) {
+	glue := Record {
+		name  = "ns1.example.com.",
+		type  = .A,
+		class = .IN,
+		ttl   = 300,
+		data  = Rdata_A{addr = {192, 0, 2, 53}},
+	}
+	whole := message_with(opt_records(before = []Record{glue}))
+	// One byte short of the two of them, so exactly one can be sent.
+	room := encoded_size(t, whole) - 1
+
+	wire, truncated, err := encode_message(whole, context.temp_allocator, room)
+	testing.expect_value(t, err, Encode_Error.None)
+	testing.expect(t, !truncated, "an additional record that would not fit reported a truncation")
+	testing.expectf(t, len(wire) <= room, "the message is %d bytes, past the %d it was given", len(wire), room)
+
+	got, derr := decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	testing.expect(t, !got.flags.tc, "TC is set on an answer nothing was dropped from")
+	testing.expect_value(t, len(got.answer), 2)
+	testing.expect_value(t, len(got.authority), 1)
+	// The OPT record, and the glue is what paid for it.
+	testing.expect_value(t, len(got.additional), 1)
+	testing.expect(t, edns_present(got), "the glue was sent and the OPT record was not")
+
+	free_all(context.temp_allocator)
+}
