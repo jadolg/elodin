@@ -259,3 +259,85 @@ test_set_edns_version_and_flags_writes_only_its_own_two_fields :: proc(t: ^testi
 
 	free_all(context.temp_allocator)
 }
+
+/*
+A reply carrying two OPT records comes back carrying one.
+
+RFC 6891 section 6.1.1 allows exactly one, to the point of requiring FORMERR for
+a query that carries more, and nothing in this server applies that reading to a
+reply. Emptying both and leaving both would be the half-fix: every other writer
+in `edns.odin` walks with `find_opt_span` and stops at the first record, so the
+second would go to the client still stating the upstream's own EDNS version and
+DO bit - which is the field this whole normalisation exists to make the
+responder's own. So the extra is dropped, and what a caller writes afterwards
+covers the whole of what is left.
+*/
+@(test)
+test_strip_edns_options_drops_a_second_opt_record :: proc(t: ^testing.T) {
+	questions := make([]Question, 1, context.temp_allocator)
+	questions[0] = Question {
+		name  = NAME,
+		type  = .A,
+		class = .IN,
+	}
+	answer := make([]Record, 1, context.temp_allocator)
+	answer[0] = answer_record()
+
+	// Both carry options, and the second states version 1 with DO set: the
+	// fields a writer reaching only the first would leave behind.
+	first := make_opt(1232, false)
+	first.data = Rdata_OPT{options = two_options()}
+	second := make_opt(512, true)
+	second.ttl |= u32(1) << 16
+	second.data = Rdata_OPT{options = two_options()}
+
+	additional := make([]Record, 2, context.temp_allocator)
+	additional[0] = first
+	additional[1] = second
+
+	wire, _, err := encode_message(
+		Message{id = 7, question = questions, answer = answer, additional = additional},
+		context.temp_allocator,
+	)
+	testing.expect_value(t, err, Encode_Error.None)
+
+	// The premise: two records went in, or this case is about nothing.
+	before, berr := decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, berr, Decode_Error.None)
+	opts_in := 0
+	for rec in before.additional {
+		if rec.type == .OPT {
+			opts_in += 1
+		}
+	}
+	testing.expect_value(t, opts_in, 2)
+
+	out, ok := strip_edns_options(wire, context.temp_allocator)
+	testing.expect(t, ok, "strip_edns_options failed")
+	expect_bare_opt(t, out, "the answer with two OPT records")
+
+	after, aerr := decode_message(out, context.temp_allocator)
+	testing.expect_value(t, aerr, Decode_Error.None)
+	opts_out := 0
+	for rec in after.additional {
+		if rec.type == .OPT {
+			opts_out += 1
+		}
+	}
+	testing.expectf(t, opts_out == 1, "%d OPT records came back, not 1", opts_out)
+
+	// And the one left is the one a writer reaches, so writing over it covers
+	// the whole of what the client will read.
+	testing.expect(t, set_edns_version_and_flags(out, 0, false), "no OPT record to write")
+	settled, serr := decode_message(out, context.temp_allocator)
+	testing.expect_value(t, serr, Decode_Error.None)
+	for rec in settled.additional {
+		if rec.type != .OPT {
+			continue
+		}
+		testing.expectf(t, u8(rec.ttl >> 16) == 0, "an OPT record still states version %d", u8(rec.ttl >> 16))
+		testing.expectf(t, rec.ttl & 0x0000_8000 == 0, "an OPT record still has DO set")
+	}
+
+	free_all(context.temp_allocator)
+}

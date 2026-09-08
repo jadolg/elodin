@@ -93,7 +93,7 @@ opt_record :: proc(udp_size: u16, version: u8, do_bit: bool, options: []dns.EDNS
 }
 
 @(private = "file")
-client_query :: proc(do_bit := false) -> []u8 {
+client_query :: proc(do_bit := false, advertised := CLIENT_ADVERTISED) -> []u8 {
 	questions := make([]dns.Question, 1, context.temp_allocator)
 	questions[0] = dns.Question {
 		name  = QNAME,
@@ -103,7 +103,7 @@ client_query :: proc(do_bit := false) -> []u8 {
 	additional := make([]dns.Record, 1, context.temp_allocator)
 	// Version 0 and no options: the client asks in the one version this server
 	// implements, and asks for nothing else.
-	additional[0] = opt_record(CLIENT_ADVERTISED, 0, do_bit, nil)
+	additional[0] = opt_record(advertised, 0, do_bit, nil)
 
 	msg := dns.Message {
 		id         = CLIENT_ID,
@@ -477,6 +477,171 @@ test_a_forwarded_answer_copies_a_do_bit_the_client_set :: proc(t: ^testing.T) {
 		testing.expect(t, dns.edns_do(m), "the client set DO and was answered with it clear")
 	}
 	expect_the_answer_survived(t, m, "the forwarded answer")
+
+	free_all(context.temp_allocator)
+}
+
+@(private = "file")
+put_u16 :: proc(b: ^[dynamic]u8, v: u16) {
+	append(b, u8(v >> 8), u8(v))
+}
+
+// The question's name, which every record below points at rather than repeats.
+@(private = "file")
+put_qname :: proc(b: ^[dynamic]u8) {
+	append(b, 8)
+	append(b, ..transmute([]u8)string("contents"))
+	append(b, 7)
+	append(b, ..transmute([]u8)string("example"))
+	append(b, 3)
+	append(b, ..transmute([]u8)string("com"))
+	append(b, 0)
+}
+
+@(private = "file")
+put_owner_and_head :: proc(b: ^[dynamic]u8, type: u16, rdlength: u16) {
+	// Owner name as a pointer at the question, which is where a real upstream
+	// puts it and what keeps the fixture small enough to reason about.
+	append(b, 0xc0, 0x0c)
+	put_u16(b, type)
+	put_u16(b, u16(dns.Class.IN))
+	put_u16(b, 0)
+	put_u16(b, 300)
+	put_u16(b, rdlength)
+}
+
+/*
+An upstream reply that is longer after a rebuild than it was on the wire, with a
+record behind its OPT record so that a strip has to rebuild it.
+
+Assembled byte by byte rather than through `dns.encode_message`, because the
+whole point is a compression this encoder does not produce: an SRV target
+written as a pointer. `decode_raw_rdata` and the SRV decoder both expand a name
+like that, and `w_record` writes an SRV target with `compress = false` (RFC 3597
+forbids compression in newer types, and SRV is not on `rdata_name_compressible`),
+so every one of them comes back 20 bytes longer than it went in - a two-byte
+pointer replaced by the 22-byte name. Microsoft DNS is the well-known sender of
+these.
+
+`filler` pads the reply to just under a client's advertised buffer, so that the
+answer is inside the limit as it arrives and outside it only after the rebuild.
+That is the case with no other guard on it: `attach_cookie` leaves an answer
+alone for a client that sent no cookie, `advertise_udp_size` writes two bytes,
+and `pad_answer` is a no-op on UDP.
+*/
+@(private = "file")
+grows_on_rebuild_reply :: proc(srv_count: int, filler: int) -> []u8 {
+	b := make([dynamic]u8, 0, 1024, context.temp_allocator)
+
+	put_u16(&b, CLIENT_ID)
+	// QR, RD, RA.
+	append(&b, 0x81, 0x80)
+	put_u16(&b, 1)
+	put_u16(&b, 1)
+	put_u16(&b, 0)
+	// The filler, the SRV records, the OPT record and one record behind it.
+	put_u16(&b, u16(srv_count + 3))
+
+	put_qname(&b)
+	put_u16(&b, u16(dns.Type.A))
+	put_u16(&b, u16(dns.Class.IN))
+
+	put_owner_and_head(&b, u16(dns.Type.A), 4)
+	append(&b, ..ANSWER_ADDR[:])
+
+	// An unknown type, so `decode_raw_rdata` finds no layout to walk and copies
+	// the bytes through untouched however many of them there are.
+	put_owner_and_head(&b, 65280, u16(filler))
+	for _ in 0 ..< filler {
+		append(&b, 0x2a)
+	}
+
+	for _ in 0 ..< srv_count {
+		put_owner_and_head(&b, u16(dns.Type.SRV), 8)
+		put_u16(&b, 10)
+		put_u16(&b, 20)
+		put_u16(&b, 443)
+		append(&b, 0xc0, 0x0c)
+	}
+
+	/*
+	The OPT record: root owner, an NSID to strip, and a record behind it.
+
+	The option is what sends the strip down the rebuild path at all - with an
+	empty list there is nothing to take out and `dns.strip_edns_options` returns
+	the bytes as they stand, which is the shape this case first had and the
+	reason it proved nothing.
+	*/
+	append(&b, 0)
+	put_u16(&b, u16(dns.Type.OPT))
+	put_u16(&b, 4096)
+	put_u16(&b, 0)
+	put_u16(&b, 0)
+	put_u16(&b, u16(4 + len(UPSTREAM_NSID)))
+	put_u16(&b, u16(dns.EDNS_Option_Code.NSID))
+	put_u16(&b, u16(len(UPSTREAM_NSID)))
+	append(&b, ..transmute([]u8)string(UPSTREAM_NSID))
+
+	put_owner_and_head(&b, u16(dns.Type.A), 4)
+	append(&b, ..ANSWER_ADDR[:])
+
+	return b[:]
+}
+
+/*
+The strip may not put an answer back over the client's ceiling.
+
+`dns.strip_edns_options` cuts bytes where the OPT record is the tail of the
+message and rebuilds the message where it is not, so the rebuild path returns an
+encoding of the answer rather than a shortening of it, and is not bounded by what
+went in. On UDP the limit it would escape is `server.max_udp_response`, which is
+an amplification factor rather than a preference, so the ceiling has to hold on
+the paths that grow as well as the ones that shrink.
+
+The client advertises 512 so that its own figure is the limit rather than the
+shipped ceiling, and the fixture is built to sit just under it and cross it only
+once the rebuild has run.
+*/
+@(test)
+test_a_strip_that_rebuilds_still_holds_the_udp_ceiling :: proc(t: ^testing.T) {
+	h: Harness
+	if !harness_start(t, &h, caching = false) {
+		return
+	}
+	defer harness_stop(&h)
+
+	reply := grows_on_rebuild_reply(4, 309)
+
+	/*
+	The premise, measured off the fixture rather than assumed, because every
+	part of it is load-bearing and none of it is visible in the assertion below:
+	the reply arrives inside the limit, and an encoding of it is outside.
+	*/
+	testing.expectf(t, len(reply) <= 512, "the fixture is %d bytes, so it is over the limit before anything runs", len(reply))
+	decoded, derr := dns.decode_message(reply, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+	reencoded, _, eerr := dns.encode_message(decoded, context.temp_allocator, dns.MAX_MESSAGE)
+	testing.expect_value(t, eerr, dns.Encode_Error.None)
+	testing.expectf(
+		t,
+		len(reencoded) > 512,
+		"an encoding of the fixture is %d bytes, so the rebuild cannot push it over the limit and this case tests nothing",
+		len(reencoded),
+	)
+
+	out, ok := forward_once(t, &h, client_query(advertised = 512), reply)
+	if !ok {
+		return
+	}
+
+	testing.expectf(t, len(out) <= 512, "the answer went out at %d bytes against a 512-byte ceiling", len(out))
+	// And the strip it was refitted after did what it was there for.
+	_, still_there := dns.peek_edns_option(out, .NSID)
+	testing.expect(t, !still_there, "the upstream's NSID survived the refit")
+
+	m, merr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, merr, dns.Decode_Error.None)
+	expect_the_answer_survived(t, m, "the refitted answer")
 
 	free_all(context.temp_allocator)
 }

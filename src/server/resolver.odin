@@ -563,7 +563,7 @@ match_client_opt :: proc(
 		// On both, so that an answer whose mint was abandoned is still answered
 		// in this server's own version if it turned out to have a record after
 		// all, and so that nothing is left resting on which of the two returned.
-		return normalise_client_opt(out, query, outcome, allocator)
+		return normalise_client_opt(out, query, limit, outcome, allocator)
 	}
 
 	/*
@@ -660,6 +660,20 @@ a copy forwarded unattributed is this server appearing to say something it never
 looked at. The ones this server does send name the upstream in their EXTRA-TEXT,
 which is what that section asks of a sender.
 
+What that costs is worth writing down rather than leaving to be discovered. An
+operator forwarding to a filtering upstream - Quad9, CleanBrowsing, a corporate
+resolver - has clients that were reading its reason: EDE 15 (Blocked), 16
+(Censored) and 17 (Filtered) ride on the NXDOMAIN or NOERROR that
+`cache.put` does store, so those are the codes this drops both on the way past
+and for an entry's whole lifetime, and a client that used to be told why a name
+was refused now reads a bare NXDOMAIN. They are also the codes with the best case
+for being kept: unlike an EDE explaining one SERVFAIL, they are statements about
+the *name*, which is what the entry is keyed on, so repeating them out of the
+cache is not the drift the general argument against caching an EDE is about. The
+rule is held to anyway - one that keeps whichever options seem harmless is not a
+rule - and if it is to be relaxed, this is the case to relax it for, and the
+allowlist is where it would go.
+
 Run here rather than before `cache.put`, so what a cache entry holds is still
 the reply as it arrived. That is the letter of "MUST NOT be cached" left
 standing, and it is the same trade `match_client_opt` makes just above by
@@ -673,11 +687,34 @@ the entries an upstream actually wrote an option into.
 A failed strip keeps the answer with its options rather than withholding it,
 which is `match_client_opt`'s reading of the same choice: the leak is worth
 closing and is not worth costing a client its answer.
+
+The strip is refitted, for the reason `match_client_opt` refits the one above it:
+`dns.strip_edns_options` cuts bytes only where the OPT record is the tail of the
+message and rebuilds the message where it is not, so what comes back from that
+path is an encoding of the answer rather than a shortening of it and is not
+bounded by what went in. A re-encode can be longer than the bytes it read - a
+name the upstream compressed inside RDATA that `encode_message` writes out in
+full is enough - and nothing downstream would catch it: `attach_cookie` returns
+the answer untouched for a client that sent no cookie, `advertise_udp_size`
+writes two bytes, and `pad_answer` is a no-op off DoT and DoH. On UDP that would
+be a datagram above `server.max_udp_response`, which is the amplification ceiling
+`fit_response` exists to hold, and a ceiling that does not hold on the paths that
+go wrong is not one. It is a no-op on anything already within the limit, which is
+every answer arriving here.
+
+Written in place at the end, so the answer handed in has to be this request's
+own bytes rather than something shared. Every path here satisfies that and none
+of them by accident: `cache.get` copies the entry before returning it - which is
+what lets `serve_from_cache` set the client's ID into it - and an upstream reply
+belongs to the arena the exchange was run on. `dns.strip_edns_options` keeps to
+the stricter rule and never writes what it is given, since it is a `dns`
+procedure with no way to know that; this is the caller that does know.
 */
 @(private)
 normalise_client_opt :: proc(
 	wire: []u8,
 	query: dns.Message,
+	limit: int,
 	outcome: Outcome,
 	allocator: mem.Allocator,
 ) -> []u8 {
@@ -685,7 +722,7 @@ normalise_client_opt :: proc(
 	#partial switch outcome {
 	case .Forwarded, .Cached:
 		if stripped, ok := dns.strip_edns_options(wire, allocator); ok {
-			out = stripped
+			out = fit_response(stripped, limit, query, allocator)
 		}
 	}
 	// A no-op on an answer with no OPT record, which is what a mint that failed

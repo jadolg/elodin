@@ -674,6 +674,18 @@ The slow path: decode, empty the option list, encode again.
 For a message whose OPT record is not the last one, where the bytes cannot
 simply be cut - see `strip_edns_options`. Out of the temp arena, for the reason
 `rebuild_edns_option` gives.
+
+A second OPT record is dropped rather than emptied, and this is the only place
+that can be reached with one: a message carrying two has a record behind the
+first, so `strip_edns_options` never takes its fast path on it. RFC 6891 section
+6.1.1 allows exactly one, to the point of requiring FORMERR for a *query* that
+carries more, and nothing applies that reading to a reply - so a message with two
+is one an upstream should not have sent and not one to pass on as it stands.
+Emptying both would leave the second stating the upstream's own EDNS version and
+DO bit, which every other writer in this file reaches only the first of: they
+walk with `find_opt_span`, which stops at the first record. One record is what
+makes the two halves of a normalisation agree about how much of the message they
+cover.
 */
 @(private)
 rebuild_without_edns_options :: proc(msg: []u8, allocator: mem.Allocator) -> (out: []u8, ok: bool) {
@@ -683,12 +695,22 @@ rebuild_without_edns_options :: proc(msg: []u8, allocator: mem.Allocator) -> (ou
 	if derr != .None {
 		return nil, false
 	}
-	for &rec in m.additional {
+	additional := make([dynamic]Record, 0, len(m.additional), scratch)
+	seen := false
+	for rec in m.additional {
 		if rec.type != .OPT {
+			append(&additional, rec)
 			continue
 		}
-		rec.data = Rdata_OPT{}
+		if seen {
+			continue
+		}
+		seen = true
+		bare := rec
+		bare.data = Rdata_OPT{}
+		append(&additional, bare)
 	}
+	m.additional = additional[:]
 
 	encoded, _, eerr := encode_message(m, scratch, MAX_MESSAGE)
 	if eerr != .None {
