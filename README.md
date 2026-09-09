@@ -2343,9 +2343,9 @@ One allowance in that file is labelled `known defect` rather than argued for: a
 UDP answer is packed against room reserved for the upstream's OPT record, and the
 options in that record are stripped afterwards without the records dropped for
 them being put back, so the client is sent to TCP for records that would have
-fitted. It is admitted narrowly enough that a truncation short by any other
-amount still fails, and the label is there so that whoever fixes it deletes the
-allowance with it.
+fitted — or, in the additional section, quietly loses a glue address. It is
+admitted narrowly enough that a shortfall of any other amount still fails, and
+it is tracked as issue #281, which lists what to delete here when it is fixed.
 
 ```
 mise run parity                                   # 2000 queries, synthetic upstream

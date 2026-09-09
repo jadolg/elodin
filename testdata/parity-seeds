@@ -26,8 +26,10 @@
 
 # The truncation ceiling: an answer is packed against room reserved for the
 # upstream's OPT record, and the options in it are stripped afterwards without
-# the records being put back. Still open - see the "known defect" allowance in
-# parity_compare.odin, which these keep exercising.
+# the records being put back. Still open, tracked as #281 - see the "known
+# defect" allowance in parity_compare.odin, which these keep exercising.
+# Seed 4 shows it on the truncation path and seed 5 on the additional section:
+#     ./bin/itest --parity --parity-runs 400 --parity-seed 4 --parity-explain
 4
 5
 

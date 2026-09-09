@@ -78,6 +78,14 @@ main :: proc() {
 		case "--parity-runs":
 			i += 1
 			parity_opts.runs = int_arg(args, i, "--parity-runs")
+			// Zero parses, sends nothing, and reports a pass: the loop does not
+			// run and the "compared almost nothing" floor is itself guarded by
+			// having sent something. The workflow interpolates this from a
+			// free-text dispatch input, so it is reachable by typo.
+			if parity_opts.runs < 1 {
+				fmt.eprintln("itest: --parity-runs must be at least 1")
+				os.exit(2)
+			}
 		case "--parity-seed":
 			i += 1
 			parity_opts.seed = u64(int_arg(args, i, "--parity-seed"))
@@ -145,6 +153,14 @@ main :: proc() {
 			parity_opts.seed = u64(time.now()._nsec)
 		}
 		parity_opts.verbose = verbose
+		/*
+		Printed here rather than left to the summary, which only prints under
+		-v or --parity-explain. `mise run parity` passes neither, so a passing
+		run drew a seed, used it for every query and threw it away - and the
+		one thing wanted from a passing run is the ability to run it again,
+		under ASan or after a change.
+		*/
+		fmt.printfln("  parity seed: %d", parity_opts.seed)
 		section(&r, "response parity with the upstream")
 		run_parity_cases(&r, parity_opts)
 		elapsed := time.diff(started, time.now())

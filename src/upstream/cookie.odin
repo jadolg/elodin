@@ -151,8 +151,16 @@ cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	That is a change to what this server asks upstream and belongs in its own
 	review; this one is the availability half.
 	*/
-	_, asked_with_cookie := dns.peek_edns_option(query, .Cookie)
-	expected := held && asked_with_cookie
+	// Behind `held`, so the walk happens only where its answer can change the
+	// outcome. `response_accepted` runs per received datagram, so on an
+	// upstream this server holds no cookie for - every cookie-less one - this
+	// would otherwise re-walk the query for each datagram of a spoofing flood
+	// to reach a verdict `held` had already settled.
+	expected := false
+	if held {
+		_, asked_with_cookie := dns.peek_edns_option(query, .Cookie)
+		expected = asked_with_cookie
+	}
 
 	raw, found := dns.peek_edns_option(response, .Cookie)
 	if !found {

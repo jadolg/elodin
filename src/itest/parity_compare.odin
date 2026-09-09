@@ -383,8 +383,11 @@ Why a record that would have fitted was left out anyway.
 A defect, written down as one rather than argued for. It costs a client either a
 TCP round trip or a glue address it has to go and ask for, in both cases for
 room that turned out to be there. Admitted only where the reservation accounts
-for the whole of the gap, so a record short by any other amount still fails, and
-labelled so that whoever fixes it deletes this with it.
+for the whole of the gap, so a record short by any other amount still fails.
+
+Tracked as #281, which says what the fix looks like and lists what to delete
+here when it lands - a labelled allowance with no addressee is one that outlives
+the thing it was waiting for.
 */
 @(private = "file")
 PC_RESERVATION_DEFECT ::
@@ -429,8 +432,9 @@ pc_tc :: proc(c: ^Parity_Compare, up, el: Pw_Msg, policy: Parity_Policy, first_d
 		this narrowly - the gap has to account for the whole of the unused room -
 		so that a truncation short by any other amount still fails.
 
-		Reproduce: --parity-seed 1 --parity-runs 61 against a synthetic upstream
-		whose OPT carries a cookie and an NSID.
+		Tracked as #281, which is where the fix goes and what deletes this.
+		Reproduce with `--parity-runs 400 --parity-seed 4 --parity-explain`;
+		seeds 5 and 11 hit it too, 5 on the additional-section path.
 		*/
 		reserved := pc_reserved_ceiling(up, el, policy)
 		if policy.transport == .UDP &&
@@ -955,8 +959,23 @@ pc_opt_contents :: proc(c: ^Parity_Compare, q: Parity_Query, up, el: Pw_Msg, pol
 				break
 			}
 			/*
-			For the three that are minted, the same bytes on both sides is
-			still a copy rather than a coincidence.
+			Padding is the one mintable code whose value carries no evidence.
+
+			RFC 7830 section 3 defines its content as zeros, so the upstream's
+			padding and this server's are byte-identical whenever their lengths
+			happen to match - which would report a copy on every DoT or DoH
+			answer where both hops padded to the same block. There is nothing
+			for a comparison to learn from it in either direction.
+			*/
+			if u.code == 12 {
+				break
+			}
+			/*
+			For the other two, the same bytes on both sides is a copy rather
+			than a coincidence. Two servers can independently reach the same
+			extended-error info-code, which is why the text is part of the
+			test and the info-code alone is not (see
+			`pc_option_text_allowance`).
 			*/
 			if pc_bytes_equal(e.data, u.data) {
 				pc_add(
