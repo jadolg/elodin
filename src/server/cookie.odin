@@ -265,9 +265,19 @@ attach_cookie :: proc(
 	already making; what the client does not get there is the fresh cookie, and
 	it is on its way to TCP for the answer anyway.
 
+	Reached more often since #281, and it is the same trade rather than a new
+	one. An answer is now packed against the client's own ceiling instead of that
+	less the upstream's options, so one whose slack used to be the length of an
+	option list fills the datagram and the cookie is what will not fit. Only on
+	an answer that had to be cut for that datagram - the room the options were
+	holding came out of a record, and the record is what it goes back to - so
+	what the client gains is a record it would not have been sent and what it
+	gives up is the refresh on a cookie it already holds.
+
 	Refitted rather than returned, so the ceiling is held by the one procedure
-	that holds it whatever produced the answer - and that is a no-op on an
-	answer already inside the limit, which is every answer arriving here.
+	that holds it whatever produced the answer. That is now a no-op by
+	construction and not by luck: `match_client_opt` fits every answer before
+	this runs, and nothing here shortens one.
 	*/
 	if len(out) > limit {
 		return fit_response(wire, limit, query, allocator)
