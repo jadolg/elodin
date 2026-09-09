@@ -2,6 +2,7 @@ package server
 
 import "core:fmt"
 import "core:mem"
+import "core:net"
 import "core:sync"
 import "core:time"
 import "elodin:cache"
@@ -3041,6 +3042,25 @@ log_query :: proc(
 	}
 	elapsed := time.diff(started, time.now())
 	/*
+	The source address and the port it sent from are two fields, not one.
+
+	`client` arrives as the listener wrote it, `host:port`, and the port is a
+	different one on every datagram - so a line that carries the two joined is a
+	line an operator has to take apart again before they can select on the source
+	at all. Split here instead: `client` is what a filter matches on, and `port`
+	stays beside it because on the stream transports it is what tells one
+	connection from another.
+
+	`split_port` reads the bracketed IPv6 form as well, and returns slices of
+	`client` rather than copies, so this adds no allocation to the query path. A
+	label it cannot read goes through whole under `client` with `port=0`: an
+	address this server could not take apart is still the address it saw.
+	*/
+	host, port, split_ok := net.split_port(client)
+	if !split_ok {
+		host, port = client, 0
+	}
+	/*
 	Two of these are not this server's text, so both go through `quote`: a
 	query name is bytes a client chose, and `detail` carries an upstream's name
 	out of the configuration whenever one is named in it.
@@ -3055,8 +3075,9 @@ log_query :: proc(
 	logx.eventf(
 		.Info,
 		"query",
-		"client=%s proto=%s qtype=%s qname=%s outcome=%s detail=%s ms=%.1f",
-		client,
+		"client=%s port=%d proto=%s qtype=%s qname=%s outcome=%s detail=%s ms=%.1f",
+		host,
+		port,
 		proto_name(proto),
 		dns.type_name(q.type),
 		logx.quote(dns.name_trim_root(q.name)),
