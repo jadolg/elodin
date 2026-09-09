@@ -493,24 +493,6 @@ pw_opt :: proc(rec: Pw_RR, allocator: mem.Allocator) -> (opt: Pw_Opt) {
 	return opt
 }
 
-/*
-How many bytes this message's OPT record occupies on the wire.
-
-Zero when it has none. A root owner name is one byte, then the type, the class
-carrying the payload size, the four TTL bytes and the RDATA length - eleven
-before the option list itself.
-*/
-pw_opt_wire_len :: proc(m: Pw_Msg) -> int {
-	if !m.opt.present {
-		return 0
-	}
-	n := 1 + 2 + 2 + 4 + 2
-	for o in m.opt.options {
-		n += 4 + len(o.data)
-	}
-	return n
-}
-
 pw_do :: proc(m: Pw_Msg) -> bool {
 	return m.opt.present && m.opt.flags & PW_DO != 0
 }
