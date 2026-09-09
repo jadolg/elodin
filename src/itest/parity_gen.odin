@@ -340,7 +340,7 @@ pg_name :: proc(g: ^Parity_Gen, allocator: mem.Allocator) -> []u8 {
 		return pg_join(g, [][]u8{label}, allocator)
 
 	case pg_chance(r, 3):
-		// A name near the 255-byte ceiling: four 60-byte labels leave room for
+		// A name near the 255-byte ceiling: three 60-byte labels leave room for
 		// a short zone and the root.
 		labels := make([][]u8, 3, allocator)
 		for j in 0 ..< 3 {

@@ -667,8 +667,8 @@ parity_live_config :: proc(
 	resolving. `bench/cmd/bench/survey.go` turns it on for the same reason.
 
 	The price is that a ttl may have counted down by the time it reaches the
-	client, so `Parity_Policy.cache` widens the ttl rule from equality to a
-	bound. That is a real loss of strictness and it is why the mock mode, which
+	client, so `Parity_Policy.ttl_exact` is false here and the ttl rule is a
+	named difference rather than equality. That is a real loss of strictness and it is why the mock mode, which
 	does not need the cache, does not pay it.
 	*/
 	with_dnssec, _ := strings.replace(

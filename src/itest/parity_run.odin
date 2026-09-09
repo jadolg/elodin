@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:net"
 import "core:strconv"
 import "core:strings"
+import "core:time"
 
 /*
 Driving one parity query and reporting on a run of them.
@@ -142,7 +143,15 @@ parity_ask_udp :: proc(host: string, port: int, query: []u8) -> (answer: []u8, o
 	}
 
 	buf := make([]u8, 65535, context.temp_allocator)
+	// One deadline over the whole sweep, not one per datagram. The receive
+	// timeout restarts on every `recv_udp`, so a stream of datagrams carrying
+	// other transaction ids would keep this loop alive indefinitely; the
+	// equivalent loop in src/upstream/plain.odin is bounded the same way.
+	deadline := time.time_add(time.now(), CLIENT_TIMEOUT)
 	for {
+		if time.diff(deadline, time.now()) > 0 {
+			return nil, false
+		}
 		n, _, rerr := net.recv_udp(socket, buf)
 		if rerr != nil || n < 12 {
 			return nil, false
@@ -314,6 +323,19 @@ parity_check_local :: proc(
 	if m.id != q.id {
 		stats.failures += 1
 		fail(r, "locally answered %s came back with id %d, not %d", q.desc, m.id, q.id)
+		return
+	}
+	/*
+	The generator marks the shapes it means to be answered here. Anything else
+	reaching this path is a query that should have been forwarded and was not,
+	which is a divergence of the largest kind - the upstream was never asked -
+	and it would otherwise be counted under `local` and pass. The floor in
+	`parity_report` is no substitute: it tolerates three quarters of a run
+	disappearing.
+	*/
+	if !q.local {
+		stats.failures += 1
+		fail(r, "%s was answered without asking the upstream, and nothing about it says it should be", q.desc)
 		return
 	}
 	if q.version == 0 {

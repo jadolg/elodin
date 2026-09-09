@@ -307,7 +307,20 @@ pc_header :: proc(
 	first_dropped: int,
 ) {
 	pc_flag(c, "qr", true, el.qr, "")
-	pc_flag(c, "opcode", up.opcode == el.opcode, true, "")
+	if up.opcode != el.opcode {
+		// Not through `pc_flag`: its two columns are the values, and passing a
+		// predicate through them prints "upstream 0, elodin 1" for every
+		// mismatch whatever the opcodes were - which is the one thing a reader
+		// needs from the line.
+		pc_add(
+			c,
+			.Header,
+			"opcode",
+			fmt.aprintf("%d", up.opcode, allocator = c.allocator),
+			fmt.aprintf("%d", el.opcode, allocator = c.allocator),
+			"",
+		)
+	}
 
 	if up.rcode != el.rcode {
 		pc_add(
@@ -911,24 +924,98 @@ pc_opt_contents :: proc(c: ^Parity_Compare, q: Parity_Query, up, el: Pw_Msg, pol
 	*/
 	for u in up.opt.options {
 		for e in el.opt.options {
-			if e.code != u.code || !pc_bytes_equal(e.data, u.data) {
+			if e.code != u.code {
 				continue
 			}
-			pc_add(
-				c,
-				.Edns,
-				fmt.aprintf(
-					"edns option %d written by the upstream reached the client",
-					u.code,
-					allocator = c.allocator,
-				),
-				pc_hex(u.data, c.allocator),
-				pc_hex(e.data, c.allocator),
-				"",
-			)
-			break
+			/*
+			A code this server never writes for itself has no business being
+			here at all, whatever it now says.
+
+			Byte equality is not the test, and was: an option can cross
+			half-rewritten and still be the upstream's. Only three codes are
+			ever minted on the way to a client - the cookie, the padding an
+			encrypted transport needs, and this server's own extended error -
+			so for anything else the code appearing on both sides is the
+			finding, and comparing the values would only ask whether the leak
+			was tidy.
+			*/
+			if !pc_client_mintable(u.code) {
+				pc_add(
+					c,
+					.Edns,
+					fmt.aprintf(
+						"edns option %d written by the upstream reached the client",
+						u.code,
+						allocator = c.allocator,
+					),
+					pc_hex(u.data, c.allocator),
+					pc_hex(e.data, c.allocator),
+					"",
+				)
+				break
+			}
+			/*
+			For the three that are minted, the same bytes on both sides is
+			still a copy rather than a coincidence.
+			*/
+			if pc_bytes_equal(e.data, u.data) {
+				pc_add(
+					c,
+					.Edns,
+					fmt.aprintf(
+						"edns option %d came back with the upstream's own value",
+						u.code,
+						allocator = c.allocator,
+					),
+					pc_hex(u.data, c.allocator),
+					pc_hex(e.data, c.allocator),
+					"",
+				)
+				break
+			}
+			/*
+			And a cookie is checked a third way, because it is the one that can
+			cross in half. RFC 7873 section 5.3 splits it into eight bytes the
+			client chose and a server half behind them; this server writes its
+			own client half over the upstream's, so the two differ as whole
+			values while the upstream's server cookie - the secret half - is
+			still sitting behind it.
+			*/
+			if u.code == 10 && len(u.data) > 8 && len(e.data) > 8 &&
+			   pc_bytes_equal(u.data[8:], e.data[8:]) {
+				pc_add(
+					c,
+					.Edns,
+					"the upstream's server cookie reached the client behind a rewritten client half",
+					pc_hex(u.data, c.allocator),
+					pc_hex(e.data, c.allocator),
+					"",
+				)
+				break
+			}
 		}
 	}
+}
+
+/*
+The option codes this server writes into an answer of its own accord.
+
+Everything else in a client's OPT record can only have come from the upstream,
+which is what makes its presence enough to report without reading its value.
+Kept as a list rather than inferred, so that a fourth one starting to be minted
+is a line somebody adds here deliberately.
+*/
+@(private = "file")
+pc_client_mintable :: proc(code: u16) -> bool {
+	switch code {
+	case 10: // COOKIE, issued to this client (src/server/cookie.odin)
+		return true
+	case 12: // padding, sized for this client's transport (src/dns/padding.odin)
+		return true
+	case 15: // extended DNS error, this server's own (src/server/dnssec.odin)
+		return true
+	}
+	return false
 }
 
 /*

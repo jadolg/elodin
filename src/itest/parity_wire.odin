@@ -93,8 +93,15 @@ Pw_Msg :: struct {
 	ra:         bool,
 	ad:         bool,
 	cd:         bool,
-	// The three reserved header bits between RA and the rcode, which must be
-	// zero and which nothing in the path may set.
+	/*
+	The one reserved header bit left between RA and the rcode, which must be
+	zero and which nothing in the path may set.
+
+	One, not three: RFC 6840 section 5.7 and RFC 4035 section 3.2.2 took the
+	other two for AD and CD, and those are read into their own fields above.
+	Widening this mask to 0x7 would fold them back in and read every AD or CD
+	bit as a reserved bit somebody set.
+	*/
 	z:          u8,
 	// The full twelve-bit rcode: the header's low four bits with the OPT
 	// record's extended eight above them (RFC 6891 section 6.1.3). Reassembled
