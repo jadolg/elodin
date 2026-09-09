@@ -126,14 +126,30 @@ cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	could ever have arrived, and the client gets a timeout and a servfail for a
 	name that resolves.
 
-	It costs the check nothing. The cookie's value is that an off-path attacker
-	has to guess 64 bits it never saw, and that only ever applied to exchanges
-	where those bits were sent. On an exchange carrying no cookie there is
-	nothing to guess and nothing to opt out of: forging one is exactly as hard
-	as it was before cookies existed, which is the same position every reply
-	from a cookie-less upstream is already in. What must not happen is the
+	On the exchange itself this costs nothing. The cookie's value is that an
+	off-path attacker has to guess 64 bits it never saw, and that only ever
+	applied to exchanges where those bits were sent. On one carrying no cookie
+	there is nothing to guess and nothing to opt out of: forging a reply is
+	exactly as hard as it was before cookies existed, which is where every reply
+	from a cookie-less upstream already sits. What must not happen is the
 	reverse - a reply to a query that did carry a cookie being accepted without
 	one - and that is what `held` still governs.
+
+	The residual, stated plainly: which exchanges carry a cookie is decided by
+	the client, so a client that asks without EDNS gets an exchange with no
+	cookie protection on it, and with the cache on the answer it gets is the
+	answer everyone behind this server gets. Before this change that path failed
+	closed - but failing closed there meant never resolving the name at all, for
+	every stub that does not do EDNS, so it was not a defence anyone was
+	choosing.
+
+	The defence rather than the trade is to put an OPT record on the *upstream*
+	query even where the client sent none, and carry a cookie on it. What ruled
+	that out was that it negotiates EDNS on behalf of a client that did not ask
+	- but since #276 the upstream's OPT record does not reach the client at all
+	(`normalise_client_opt`), so the client need never see that it happened.
+	That is a change to what this server asks upstream and belongs in its own
+	review; this one is the availability half.
 	*/
 	_, asked_with_cookie := dns.peek_edns_option(query, .Cookie)
 	expected := held && asked_with_cookie

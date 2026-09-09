@@ -94,7 +94,7 @@ Parity_Query :: struct {
 	version this server does not implement, which RFC 6891 section 6.1.3 says to
 	answer with BADVERS rather than pass on, and a class the resolver serves
 	locally. Those are checked, just not for parity - see
-	`parity_check_local_answer`.
+	`parity_check_local`.
 	*/
 	local:     bool,
 	desc:      string,

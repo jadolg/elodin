@@ -2320,7 +2320,10 @@ agreement.
 
 Every query of a run comes from one 64-bit seed, printed on the way past and
 repeated in any failure, so `--parity-seed` reproduces a nightly run on a laptop.
-`.github/workflows/parity.yml` runs both modes nightly against a fresh seed;
+`mise run parity` runs the synthetic mode; the live one is asked for by name,
+since a task that reaches a public resolver is not one to put behind a bare
+`mise run`. `.github/workflows/parity.yml` runs both nightly against a fresh
+seed;
 `mise run parity-regression` replays the seeds in `testdata/parity-seeds` — the
 ones that have found something — on every pull request, the same division as
 fuzzing.

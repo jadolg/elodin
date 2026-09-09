@@ -105,10 +105,18 @@ jobs:
       # A runner that cannot reach the resolver would fail every query for a
       # reason that has nothing to do with elodin. Finding that out here says
       # which it is.
+      #
+      # An actual query, not a `/dev/udp` redirect: opening one of those only
+      # calls connect(2) on a datagram socket, which sends nothing and succeeds
+      # against any routable address, so the probe would pass on a runner with
+      # no egress at all - which is the one case it exists to catch.
+      - name: Install a DNS client for the probe
+        run: sudo apt-get update && sudo apt-get install -y dnsutils
       - name: Check the resolver answers at all
         run: |
           host=$(echo "${{ matrix.resolver }}" | cut -d: -f1)
-          timeout 10 bash -c "cat < /dev/null > /dev/udp/$host/53" && echo "$host reachable"
+          dig +time=3 +tries=2 +short @"$host" example.com A | grep -qE '^[0-9]+\.' \
+            && echo "$host answered"
 
       - run: mise run build
       - name: Build the suite

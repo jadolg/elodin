@@ -371,6 +371,11 @@ parity_report :: proc(r: ^Runner, opts: Parity_Options, stats: Parity_Stats) {
 	fmt.printfln("    unanswered    %d", stats.unanswered)
 	fmt.printfln("    skipped       %d", stats.skipped)
 	fmt.printfln("    diverged      %d", stats.failures)
+	fmt.printf("    transports    ")
+	for count, transport in stats.transports {
+		fmt.printf("%s=%d ", pg_transport_name(transport), count)
+	}
+	fmt.println()
 	if len(stats.allowances) > 0 {
 		fmt.println("    differences allowed, and why:")
 		for reason, count in stats.allowances {
@@ -389,15 +394,41 @@ parity_hex :: proc(b: []u8) -> string {
 }
 
 parity_split_host_port :: proc(s: string) -> (host: string, port: int, ok: bool) {
-	// Rightmost colon, so a bare IPv6 address is still readable as one.
+	/*
+	A bare IPv6 address is all colons and no port.
+
+	`2001:db8::1` has to come back whole rather than as host `2001:db8:` on port
+	1, so the only forms that carry a port are a bracketed address and a name or
+	IPv4 address with exactly one colon. Everything else is a host on 53.
+	*/
+	if strings.has_prefix(s, "[") {
+		close := strings.index_byte(s, ']')
+		if close < 0 {
+			return "", 0, false
+		}
+		host = s[1:close]
+		rest := s[close + 1:]
+		if rest == "" {
+			return host, 53, true
+		}
+		if !strings.has_prefix(rest, ":") {
+			return "", 0, false
+		}
+		port, ok = strconv.parse_int(rest[1:])
+		if !ok {
+			return "", 0, false
+		}
+		return host, port, true
+	}
+
 	i := strings.last_index_byte(s, ':')
-	if i < 0 {
+	if i < 0 || strings.index_byte(s, ':') != i {
+		// No colon at all, or several - a bare address either way.
 		return s, 53, true
 	}
 	port, ok = strconv.parse_int(s[i + 1:])
 	if !ok {
 		return "", 0, false
 	}
-	host = strings.trim_suffix(strings.trim_prefix(s[:i], "["), "]")
-	return host, port, true
+	return s[:i], port, true
 }

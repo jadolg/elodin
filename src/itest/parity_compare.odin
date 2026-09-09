@@ -981,13 +981,37 @@ pc_same_but_for_id :: proc(a, b: []u8) -> bool {
 	if len(a) != len(b) || len(a) < 12 {
 		return false
 	}
+	/*
+	Case is folded over the question's name and nowhere else.
+
+	That is the only place it may legitimately differ: the client randomised it
+	and the server echoes what it was sent, so the upstream's copy and the
+	client's carry different letters for the same name. Folding the whole
+	message instead - which this did - counts two answers as identical when a
+	byte inside an RDATA differs in case, and a downcased name inside RDATA is
+	exactly the kind of quiet re-encoding this statistic exists to notice.
+	*/
+	name_end := 12
+	for name_end < len(a) {
+		n := int(a[name_end])
+		if n == 0 || n & 0xc0 != 0 {
+			name_end += 1
+			break
+		}
+		name_end += 1 + n
+	}
+	if name_end > len(a) {
+		name_end = len(a)
+	}
 	for i in 2 ..< len(a) {
 		x, y := a[i], b[i]
-		if x >= 'A' && x <= 'Z' {
-			x += 32
-		}
-		if y >= 'A' && y <= 'Z' {
-			y += 32
+		if i >= 12 && i < name_end {
+			if x >= 'A' && x <= 'Z' {
+				x += 32
+			}
+			if y >= 'A' && y <= 'Z' {
+				y += 32
+			}
 		}
 		if x != y {
 			return false

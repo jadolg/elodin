@@ -26,7 +26,11 @@ Two modes, and they ask subtly different things:
         no mock would think to serve.
 
 Neither runs as part of `mise run itest`: the mock mode takes a minute and the
-live mode needs the network. `mise run parity` runs them.
+live mode needs the network. `mise run parity` runs the mock mode; the live one
+is asked for by name, since a task that reaches a public resolver is not one to
+put behind a bare `mise run`:
+
+    ./bin/itest --parity --parity-upstream 1.1.1.1:53
 */
 
 // The datagram ceiling the parity configuration pins, kept next to the
@@ -58,6 +62,17 @@ Parity_Stats :: struct {
 	// resolver disagreed with itself.
 	skipped:    int,
 	failures:   int,
+	/*
+	Queries sent over each transport.
+
+	Reported because a run that believed it was covering four and covered one
+	is a run whose result means less than it says, and that is not a
+	hypothetical: the generator's transport list was once allocated in the
+	arena the loop resets per query, so every query after the first went out
+	over UDP while the summary said nothing was wrong. A count nobody reads is
+	still a count somebody can check.
+	*/
+	transports: [Parity_Transport]int,
 	// How many times each written-down reason was the explanation for a
 	// difference, keyed by the reason itself.
 	allowances: map[string]int,
@@ -106,7 +121,13 @@ run_parity_cases :: proc(r: ^Runner, opts: Parity_Options) {
 // --- mock mode -------------------------------------------------------------
 
 run_parity_mock :: proc(r: ^Runner, opts: Parity_Options) {
-	start_case(r, fmt.tprintf("parity against a synthetic upstream (seed %d)", opts.seed))
+	// Heap, not the arena: `start_case` keeps the pointer and `fail` reads it
+	// back on every divergence, by which time the loop below has reset the temp
+	// allocator many times over. `harness.odin` clones its log path for the
+	// same reason. Freed after `end_case`, which defers run in reverse order.
+	title := fmt.aprintf("parity against a synthetic upstream (seed %d)", opts.seed)
+	defer delete(title)
+	start_case(r, title)
 	defer end_case(r)
 
 	udp_port := next_port(r)
@@ -140,7 +161,15 @@ run_parity_mock :: proc(r: ^Runner, opts: Parity_Options) {
 	}
 	defer stop_server(&srv)
 
-	transports := make([dynamic]Parity_Transport, 0, 4, context.temp_allocator)
+	/*
+	The generator holds this for the whole run, so it cannot come from the
+	temp allocator: the loop below resets that arena after every query, and a
+	slice into it reads reclaimed memory from the second query on. What that
+	looked like was every query going out over UDP while the run reported
+	itself as covering four transports.
+	*/
+	transports := make([dynamic]Parity_Transport, 0, 4, context.allocator)
+	defer delete(transports)
 	append(&transports, Parity_Transport.UDP, Parity_Transport.TCP)
 	if tls {
 		append(&transports, Parity_Transport.DoT, Parity_Transport.DoH)
@@ -173,6 +202,7 @@ parity_one_mock :: proc(
 	q := pg_query(g)
 	mock_reset_replies(mock)
 	stats.sent += 1
+	stats.transports[q.transport] += 1
 
 	answer, answered := parity_ask_elodin(srv, q)
 	if !answered {
@@ -318,7 +348,10 @@ dnssec:
 // --- live mode -------------------------------------------------------------
 
 run_parity_live :: proc(r: ^Runner, opts: Parity_Options) {
-	start_case(r, fmt.tprintf("parity against %s (seed %d)", opts.upstream, opts.seed))
+	// Heap rather than the arena; see `run_parity_mock`.
+	title := fmt.aprintf("parity against %s (seed %d)", opts.upstream, opts.seed)
+	defer delete(title)
+	start_case(r, title)
 	defer end_case(r)
 
 	host, port, split_ok := parity_split_host_port(opts.upstream)
@@ -349,7 +382,15 @@ run_parity_live :: proc(r: ^Runner, opts: Parity_Options) {
 	}
 	defer stop_server(&srv)
 
-	transports := make([dynamic]Parity_Transport, 0, 4, context.temp_allocator)
+	/*
+	The generator holds this for the whole run, so it cannot come from the
+	temp allocator: the loop below resets that arena after every query, and a
+	slice into it reads reclaimed memory from the second query on. What that
+	looked like was every query going out over UDP while the run reported
+	itself as covering four transports.
+	*/
+	transports := make([dynamic]Parity_Transport, 0, 4, context.allocator)
+	defer delete(transports)
 	append(&transports, Parity_Transport.UDP, Parity_Transport.TCP)
 	if tls {
 		append(&transports, Parity_Transport.DoT, Parity_Transport.DoH)
@@ -404,6 +445,7 @@ parity_one_live :: proc(
 ) {
 	q := pg_query(g)
 	stats.sent += 1
+	stats.transports[q.transport] += 1
 
 	policy := Parity_Policy {
 		mode             = .Live,

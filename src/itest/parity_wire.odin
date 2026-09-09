@@ -711,14 +711,18 @@ pw_names_equal_fold :: proc(a, b: []u8) -> bool {
 A section as a sorted multiset of record lines, which is what makes two answers
 that list the same records in a different order compare equal.
 
-Folded, because the one caller is the live mode asking whether a resolver gave
-the same answer twice, and two answers differing only in the case of a
-compressed name are the same answer for that purpose.
+Folded and without the TTL, because the one caller is the live mode asking
+whether a resolver gave the same answer twice. Two answers differing only in the
+case of a compressed name are the same answer for that purpose, and so are two
+whose TTLs differ: the second fetch is a moment later and a cached TTL counts
+down. Judging that unstable would skip every name whose TTL happened to cross a
+second boundary between the two queries - the very difference the live mode
+already tolerates when it compares elodin's answer against the reference.
 */
 pw_section_keys :: proc(recs: []Pw_RR, allocator := context.temp_allocator) -> []string {
 	keys := make([]string, len(recs), allocator)
 	for rec, i in recs {
-		keys[i] = pw_rr_key_folded(rec, allocator)
+		keys[i] = pw_rr_key_folded_no_ttl(rec, allocator)
 	}
 	slice.sort(keys)
 	return keys
