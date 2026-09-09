@@ -501,37 +501,49 @@ the client's own figure, which is what `make_response` puts in a locally built
 answer there. See `attach_cookie`, which mints under the same rule and passes the
 same number.
 
-Neither direction may hand back a datagram larger than the limit, and the two
-reach that differently.
+This is where the ceiling on an answer is held, and it is held last: every path
+out of here ends in `fit_response`, with the OPT record already settled, and
+nothing between here and the wire shortens the message again.
 
-Stripping is refitted, the way `attach_cookie` refits an answer its cookie
-pushed past the ceiling: `dns.remove_opt` cuts the bytes only where the record
-is the tail of the message, and rebuilds the message where it is not, so what
-comes back from that path is an encoding of the answer rather than a shortening
-of it and is not bounded by what went in. An encoding that came back longer than
-the limit has records that genuinely will not fit, and dropping them with TC set
-is what the client needs to hear.
+That ordering is the point rather than a tidying-up. `encode_message` keeps room
+behind a cut for the OPT record of the message it is handed, which on a forwarded
+or a cached answer is the upstream's, options and all - so an answer fitted while
+it still carried them was packed against a ceiling lower than the one it went out
+under by exactly the length of the options stripped afterwards, and nothing put
+back the records that had been dropped for the difference. A client was sent to
+TCP for records that had fitted its datagram, or lost an additional address with
+no TC bit to say it had ever been there. So the forwarded and the cached path hand
+their answers over unfitted, at whatever size the upstream or the entry made them,
+and `normalise_client_opt` strips without refitting. Issue #281.
 
-Minting is not, and refitting it was wrong. Eleven bytes longer is a message
-that may no longer fit, and an answer whose only overflow is the record being
-minted has nothing to drop: `encode_message` writes the answer section, finds the
-OPT will not fit behind it, and reports a truncation - so the client is handed a
-complete answer with TC set and *still* no OPT record, and asks again over TCP
-for bytes it already had. Measured on a 504-byte cached answer with a client
-advertising 512: TC where before there was none, and the same absent OPT record
-either way. So a mint that will not fit is abandoned instead, and the answer goes
-as it stands - which is the outcome an upstream that drops EDNS produces anyway,
-and the one the client got before any of this ran. `fit_response` is still what
-holds the ceiling over that answer, and is a no-op on anything already within the
-limit, which is every answer either direction returns in practice.
+Which direction overflows decides what is given up for it:
+
+  - a strip or a removal that comes back over the limit has records that
+    genuinely will not fit, and dropping them with TC set is what the client
+    needs to hear. `dns.remove_opt` and `dns.strip_edns_options` cut bytes only
+    where the record is the tail of the message and rebuild it where it is not,
+    so what comes back from those paths is an encoding of the answer rather than
+    a shortening of it, and is not bounded by what went in either.
+  - a mint that is itself what overflows is abandoned. Eleven bytes longer is a
+    message that may no longer fit, and an answer whose only overflow is the
+    record being minted has nothing to drop: `encode_message` writes the answer
+    section, finds the OPT will not fit behind it, and reports a truncation - so
+    the client would be handed a complete answer with TC set and *still* no OPT
+    record, and would ask again over TCP for bytes it already had. Measured on a
+    504-byte cached answer with a client advertising 512: TC where before there
+    was none, and the same absent OPT record either way. So the answer goes as it
+    stands - which is the outcome an upstream that drops EDNS produces anyway,
+    and the one the client got before any of this ran.
+  - an answer already over the limit before the mint keeps the minted record
+    instead. It is being cut and marked whatever happens, and that record is what
+    carries the payload size to ask again with, so it goes in and the cut is made
+    with its room kept behind it - the trade `encode_message` argues for every
+    other truncation.
 
 A failed mint or strip keeps the answer rather than withholding it - the OPT
-mismatch is worth correcting, and not worth costing a client its answer. A
-failed strip returns those bytes untouched, since the strip could only have
-shortened them and whatever bounded them still does. A failed mint goes through
-`fit_response` beside the mint that would not fit, so the one procedure that
-holds the ceiling is reached on both, and it is a no-op on an answer already
-within the limit - which every answer arriving here is.
+mismatch is worth correcting, and not worth costing a client its answer. Both
+still go through `fit_response`, so the one procedure that holds the ceiling is
+reached whichever step failed.
 
 The record that does go back is then made this server's own, which is the rest
 of the sentence in RFC 6891 section 6.1.1: presence is what a client reads first,
@@ -554,16 +566,24 @@ match_client_opt :: proc(
 
 	if dns.edns_present(query) {
 		out, ok := dns.ensure_opt(wire, advertise, allocator)
-		// A record that will not fit is a record not minted; see above. The
-		// answer in hand is refitted rather than returned, so the ceiling holds
-		// over it whatever the path that produced it did.
-		if !ok || len(out) > limit {
-			out = fit_response(wire, limit, query, allocator)
+		/*
+		A record that will not fit is a record not minted; see above.
+
+		Asked of the mint rather than of the answer, which is what the ordering
+		below makes possible: the answer in hand may already be past the limit,
+		and one that is going to be cut whatever happens is one the record goes
+		into - `encode_message` keeps its room behind the cut, and the client
+		reads the payload size it needs for the retry off it. What is abandoned
+		is a mint that would cut an answer which otherwise fits.
+		*/
+		if !ok || (len(out) > limit && len(wire) <= limit) {
+			out = wire
 		}
 		// On both, so that an answer whose mint was abandoned is still answered
 		// in this server's own version if it turned out to have a record after
 		// all, and so that nothing is left resting on which of the two returned.
-		return normalise_client_opt(out, query, limit, outcome, allocator)
+		out = normalise_client_opt(out, query, outcome, allocator)
+		return fit_response(out, limit, query, allocator)
 	}
 
 	/*
@@ -584,12 +604,17 @@ match_client_opt :: proc(
 	the wrong rcode.
 	*/
 	if u16(dns.peek_rcode(wire)) > 0xf {
-		return wire
+		// The record crosses to a client that asked for none, so what is written
+		// inside it is still this server's to own - the same normalisation the
+		// EDNS branch runs, on the one answer this branch does not strip the
+		// record from.
+		return fit_response(normalise_client_opt(wire, query, outcome, allocator), limit, query, allocator)
 	}
 
 	out, ok := dns.remove_opt(wire, allocator)
 	if !ok {
-		return wire
+		// The record stays after all, so its contents are owned as above.
+		out = normalise_client_opt(wire, query, outcome, allocator)
 	}
 	return fit_response(out, limit, query, allocator)
 }
@@ -700,19 +725,30 @@ the other branch, where the cost is an OPT record reaching a client that sent
 none. What would actually close it is a reply that does not decode not being
 served at all, which is a larger question than this one and is not settled here.
 
-The strip is refitted, for the reason `match_client_opt` refits the one above it:
+Nothing here fits the answer to the client's datagram, and that is the point:
+`match_client_opt` does it after this has run, on every path, once. The strip
+hands room back - four bytes of header and however many of payload per option -
+and the encoder is what decides which records fit in room like that, measuring
+the OPT record as the message stands when it is encoded. Fitted first and
+stripped second, the answer was packed against a ceiling lower than the one it
+went out under by exactly the length of the options removed, and nothing put back
+the records that had been dropped for room the strip returned: a client was sent
+to TCP for records that had fitted the datagram, or lost an additional address
+with no TC bit to say it was ever there. Issue #281, and
+`server/opt_reservation_test.odin` holds both shapes.
+
+The caller's fit is not merely the ceiling being tidied up afterwards, either.
 `dns.strip_edns_options` cuts bytes only where the OPT record is the tail of the
 message and rebuilds the message where it is not, so what comes back from that
 path is an encoding of the answer rather than a shortening of it and is not
 bounded by what went in. A re-encode can be longer than the bytes it read - a
 name the upstream compressed inside RDATA that `encode_message` writes out in
-full is enough - and nothing downstream would catch it: `attach_cookie` returns
-the answer untouched for a client that sent no cookie, `advertise_udp_size`
-writes two bytes, and `pad_answer` is a no-op off DoT and DoH. On UDP that would
-be a datagram above `server.max_udp_response`, which is the amplification ceiling
-`fit_response` exists to hold, and a ceiling that does not hold on the paths that
-go wrong is not one. It is a no-op on anything already within the limit, which is
-every answer arriving here.
+full is enough - and nothing else downstream would catch it: `attach_cookie`
+returns the answer untouched for a client that sent no cookie,
+`advertise_udp_size` writes two bytes, and `pad_answer` is a no-op off DoT and
+DoH. On UDP that would be a datagram above `server.max_udp_response`, which is
+the amplification ceiling `fit_response` exists to hold, and a ceiling that does
+not hold on the paths that go wrong is not one.
 
 Written in place at the end, so the answer handed in has to be this request's
 own bytes rather than something shared. Every path here satisfies that and none
@@ -726,7 +762,6 @@ procedure with no way to know that; this is the caller that does know.
 normalise_client_opt :: proc(
 	wire: []u8,
 	query: dns.Message,
-	limit: int,
 	outcome: Outcome,
 	allocator: mem.Allocator,
 ) -> []u8 {
@@ -734,7 +769,7 @@ normalise_client_opt :: proc(
 	switch outcome {
 	case .Forwarded, .Cached:
 		if stripped, ok := dns.strip_edns_options(wire, allocator); ok {
-			out = fit_response(stripped, limit, query, allocator)
+			out = stripped
 		}
 	/*
 	Built here, by `dns.make_response` or `dns.error_response`, whose OPT record
@@ -1965,10 +2000,17 @@ resolve_query :: proc(
 	}
 
 	sync.atomic_add(&s.stats.forwarded, 1)
-	out := fit_response(resp, limit, msg, allocator)
-	settle_ad_bit(out, msg, validating)
+	/*
+	Handed back as the upstream sent it, over the client's limit if that is what
+	it is: the OPT record is the upstream's until `match_client_opt` has settled
+	it, and shrinking the answer to this client's datagram before then packs it
+	against room for options that are about to be stripped. `handle_query` fits
+	it once the record is this server's own, which is the one shape the encoder's
+	reservation is right about. See `match_client_opt`.
+	*/
+	settle_ad_bit(resp, msg, validating)
 	log_query(s, client, proto, q, .Forwarded, answering_upstream(winner), started)
-	return out, .Forwarded, true
+	return resp, .Forwarded, true
 }
 
 /*
@@ -2365,9 +2407,12 @@ serve_from_cache :: proc(
 		cache.note_stale_served(s.answers)
 	}
 	sync.atomic_add(&s.stats.cached, 1)
-	out := fit_response(wire, limit, msg, allocator)
+	// Over this client's limit where the entry was stored for a client with a
+	// larger buffer, and left that way: `handle_query` fits it once
+	// `match_client_opt` has settled the OPT record, for the reason the
+	// forwarded path gives.
 	log_query(s, client, proto, q, .Cached, "stale" if hit.stale else "cache", started)
-	return out, .Cached, true
+	return wire, .Cached, true
 }
 
 /*
@@ -2407,6 +2452,15 @@ and the TC bit set.
 Whatever comes back is no larger than `limit`, on every path including the ones
 that fail. That is what the callers rely on: this is the last thing between an
 answer and the wire.
+
+Reached with the answer's OPT record already settled, which is the other half of
+what makes the truncation honest: `encode_message` keeps room behind the cut for
+the record the message carries when it is encoded, so anything that shortens that
+record afterwards - the strip in `normalise_client_opt`, or the whole record for a
+client that asked without EDNS - hands back room the cut had already spent, and
+the records dropped for it are not put back. So a caller that means to change the
+record changes it first and fits second. See `match_client_opt`, which is where
+both happen, and issue #281.
 */
 @(private)
 fit_response :: proc(wire: []u8, limit: int, query: dns.Message, allocator: mem.Allocator) -> []u8 {
