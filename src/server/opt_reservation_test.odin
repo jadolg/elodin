@@ -18,16 +18,18 @@ is room the encoder had already spent, so an answer fitted before the record was
 settled is packed against a ceiling lower than the one it goes out under.
 
 Nothing put those records back, and the client is the one that paid for it. Two
-ways, both here:
+ways, and three cases below - the second way twice, once for each of the two
+things that hand the room back:
 
   - a TCP round trip for records that fitted. The answer is cut and TC set, the
     client asks again over TCP, and the datagram it was sent had room for the
-    rest all along;
+    rest all along. Once for the options an EDNS client's record loses, and once
+    for the whole record a client that asked without EDNS is not sent;
   - an additional record dropped in silence. In the additional section it is a
     glue address that pays for the OPT record's room, which is the right trade
-    when the room is real (see `dns.additional_overflow_test`). Nothing on the
-    wire says an additional record was left out, so a client simply never learns
-    the address - and there is no TC to send it back for the rest.
+    when the room is real (see src/dns/additional_overflow_test.odin). Nothing on
+    the wire says an additional record was left out, so a client simply never
+    learns the address - and there is no TC to send it back for the rest.
 
 Both are pinned against a cached answer, which is the shortest way to a reply
 carrying an upstream's OPT record with the size chosen here: the entry is stored
