@@ -132,6 +132,39 @@ description = "Integration tests: run the built binary against mock upstreams"
 depends = ["build", "prepare"]
 run = "odin build src/itest -collection:elodin=src -out:bin/itest -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES && ./bin/itest"
 
+# Does the answer that reaches the client say what the upstream's answer said?
+# A generator makes queries nobody wrote down and every field of every reply is
+# held against the upstream's, so a record, an option or a flag that goes missing
+# in the middle is caught without anyone having thought to check for it.
+#
+# Not part of `verify`: the default run takes about a minute, and the whole point
+# of it is the long unattended run that finds what a short one does not. The
+# short, bounded shape that belongs in a PR is `parity-regression`.
+[tasks.parity]
+description = "Compare elodin's answers against its upstream's, field by field"
+depends = ["build", "prepare"]
+run = [
+  "odin build src/itest -collection:elodin=src -out:bin/itest -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES",
+  "./bin/itest --parity --parity-runs 2000",
+]
+
+# The seeds that have found something, replayed once each. A divergence that was
+# found stays found, the same way `fuzz-regression` keeps a crash found. Fast
+# enough to gate a pull request.
+[tasks.parity-regression]
+description = "Replay the parity seeds that once diverged"
+depends = ["build", "prepare"]
+run = """
+odin build src/itest -collection:elodin=src -out:bin/itest -extra-linker-flags:"$ELODIN_LDFLAGS" $ELODIN_DEFINES
+status=0
+while read -r seed _; do
+  case "$seed" in ''|'#'*) continue ;; esac
+  echo "parity seed $seed"
+  ./bin/itest --parity --parity-seed "$seed" --parity-runs 400 || status=1
+done < testdata/parity-seeds
+exit $status
+"""
+
 [tasks.leakcheck]
 description = "Run the integration suite against an AddressSanitizer build and fail on any finding"
 depends = ["prepare"]

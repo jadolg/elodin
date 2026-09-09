@@ -3,6 +3,7 @@ package itest
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
+import "core:strconv"
 import "core:strings"
 import "core:sys/posix"
 import "core:time"
@@ -25,6 +26,7 @@ USAGE :: `elodin integration tests
 
 usage:
   itest [-v] [--binary <path>] [--keep] [--graceful-stop]
+  itest --parity [--parity-runs <n>] [--parity-seed <n>] [--parity-upstream <host:port>]
 
 options:
   -v, --verbose       print each case as it runs
@@ -33,6 +35,16 @@ options:
       --graceful-stop end each case with SIGTERM rather than SIGKILL, so an
                       instrumented binary gets to run its exit checks
   -h, --help          print this message
+
+parity (see cases_parity.odin):
+      --parity            run only the parity check, and none of the suite
+      --parity-runs <n>   queries to send (default 500)
+      --parity-seed <n>   the seed to generate them from; a run prints its own,
+                          and passing it back reproduces that run exactly
+      --parity-upstream <host:port>
+                          compare against this resolver rather than against a
+                          synthetic upstream. Needs the network
+      --parity-explain    print every difference, the allowed ones included
 `
 
 main :: proc() {
@@ -44,6 +56,10 @@ main :: proc() {
 	verbose := false
 	keep := false
 	graceful_stop := false
+	parity := false
+	parity_opts := Parity_Options {
+		runs = 500,
+	}
 
 	args := os.args[1:]
 	i := 0
@@ -55,6 +71,19 @@ main :: proc() {
 			keep = true
 		case "--graceful-stop":
 			graceful_stop = true
+		case "--parity":
+			parity = true
+		case "--parity-explain":
+			parity_opts.explain = true
+		case "--parity-runs":
+			i += 1
+			parity_opts.runs = int_arg(args, i, "--parity-runs")
+		case "--parity-seed":
+			i += 1
+			parity_opts.seed = u64(int_arg(args, i, "--parity-seed"))
+		case "--parity-upstream":
+			i += 1
+			parity_opts.upstream = str_arg(args, i, "--parity-upstream")
 		case "--binary":
 			if i + 1 >= len(args) {
 				fmt.eprintln("itest: --binary needs a path")
@@ -104,6 +133,27 @@ main :: proc() {
 	fmt.println()
 
 	started := time.now()
+
+	if parity {
+		/*
+		A seed nobody chose still has to be a seed somebody can choose again, so
+		one is drawn from the clock and printed rather than left implicit. Every
+		query of the run comes out of it, which is what makes a divergence found
+		on a nightly run reproducible on a laptop.
+		*/
+		if parity_opts.seed == 0 {
+			parity_opts.seed = u64(time.now()._nsec)
+		}
+		parity_opts.verbose = verbose
+		section(&r, "response parity with the upstream")
+		run_parity_cases(&r, parity_opts)
+		elapsed := time.diff(started, time.now())
+		report(&r, elapsed)
+		if r.failed > 0 {
+			os.exit(1)
+		}
+		return
+	}
 
 	section(&r, "command line")
 	run_cli_cases(&r)
@@ -205,6 +255,25 @@ main :: proc() {
 	if r.failed > 0 {
 		os.exit(1)
 	}
+}
+
+@(private)
+int_arg :: proc(args: []string, i: int, flag: string) -> int {
+	value, ok := strconv.parse_int(str_arg(args, i, flag))
+	if !ok {
+		fmt.eprintfln("itest: %s needs a number", flag)
+		os.exit(2)
+	}
+	return value
+}
+
+@(private)
+str_arg :: proc(args: []string, i: int, flag: string) -> string {
+	if i >= len(args) {
+		fmt.eprintfln("itest: %s needs a value", flag)
+		os.exit(2)
+	}
+	return args[i]
 }
 
 @(private)

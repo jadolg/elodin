@@ -84,6 +84,22 @@ jobs:
           cache: true
       - run: mise run fuzz-regression
 
+  parity-regression:
+    name: Parity seed regression
+    # The seeds in testdata/parity-seeds, replayed against the synthetic
+    # upstream. Fresh queries are generated nightly by parity.yml — this job's
+    # only job is making sure a divergence that run already found stays found.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - uses: jdx/mise-action@v4
+        with:
+          install: true
+          cache: true
+      - run: mise run parity-regression
+
   build:
     name: Build (${{ matrix.arch }})
     strategy:

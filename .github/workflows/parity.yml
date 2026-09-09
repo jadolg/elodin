@@ -1,0 +1,109 @@
+name: Parity
+
+# Does elodin hand the client what its upstream handed elodin?
+#
+# The shape is the one fuzz.yml uses, and for the same reason: a long unattended
+# run finds what a short gated one does not, and gating a merge on either the
+# time or the network this needs would be the wrong trade. The short, hermetic
+# half runs per-PR in ci.yml as `parity-regression`.
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Queries per job"
+        default: "20000"
+      seed:
+        description: "Seed to reproduce (0 draws a fresh one)"
+        default: "0"
+
+jobs:
+  mock:
+    name: Parity (synthetic upstream)
+    # The one that can be believed without reservation: the reference is the
+    # very message elodin was handed, by a mock that answers any name and type
+    # from a zone built to hold every wire construct the suite can think of. No
+    # network, no nondeterminism, so a divergence here is elodin's and nobody
+    # else's.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - uses: jdx/mise-action@v4
+        with:
+          install: true
+          cache: true
+
+      - run: mise run build
+      - name: Build the suite
+        run: odin build src/itest -collection:elodin=src -out:bin/itest -extra-linker-flags:"$ELODIN_LDFLAGS" $ELODIN_DEFINES
+
+      # The seed is printed by the run itself and appears in any failure, so a
+      # red nightly is reproduced on a laptop with one flag.
+      - name: Compare against the synthetic upstream
+        run: |
+          ./bin/itest --parity \
+            --parity-runs "${{ inputs.runs || '20000' }}" \
+            --parity-seed "${{ inputs.seed || '0' }}" \
+            -v
+
+  live:
+    name: Parity (${{ matrix.resolver }})
+    # Real answers, which no mock would think to serve: signed zones, CNAME
+    # chains into CDNs, types nobody implements. Weaker than the mock job by
+    # construction - the reference is a second query rather than the same
+    # message - so everything it reports has to survive a stability check and
+    # then a second look. See cases_parity.odin.
+    #
+    # Reported rather than enforced, and the difference is deliberate. Its
+    # reference is a resolver nobody here controls: two queries to one anycast
+    # address can be answered by nodes holding different copies, and elodin's
+    # own cache can answer without asking anyone, so an option naming the server
+    # that answered has no server to name. Measured at about one query in two
+    # hundred - small, and not something a commit can fix. A job that goes red
+    # that often for reasons nobody can act on is a job people stop reading, and
+    # then it is worth less than nothing.
+    #
+    # So this one produces a report to read and the mock job above is the gate.
+    # A finding here is followed up by hand, usually by reproducing it against
+    # the synthetic upstream, where the reference is exact and the answer is
+    # either a bug or is not.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        resolver:
+          - 1.1.1.1:53
+          - 8.8.8.8:53
+          - 9.9.9.9:53
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - uses: jdx/mise-action@v4
+        with:
+          install: true
+          cache: true
+
+      # A runner that cannot reach the resolver would fail every query for a
+      # reason that has nothing to do with elodin. Finding that out here says
+      # which it is.
+      - name: Check the resolver answers at all
+        run: |
+          host=$(echo "${{ matrix.resolver }}" | cut -d: -f1)
+          timeout 10 bash -c "cat < /dev/null > /dev/udp/$host/53" && echo "$host reachable"
+
+      - run: mise run build
+      - name: Build the suite
+        run: odin build src/itest -collection:elodin=src -out:bin/itest -extra-linker-flags:"$ELODIN_LDFLAGS" $ELODIN_DEFINES
+
+      - name: Compare against ${{ matrix.resolver }}
+        run: |
+          ./bin/itest --parity \
+            --parity-upstream "${{ matrix.resolver }}" \
+            --parity-runs 2000 \
+            --parity-seed "${{ inputs.seed || '0' }}" \
+            -v

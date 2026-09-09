@@ -1,0 +1,38 @@
+# Seeds for `mise run parity-regression`, one per line.
+#
+# A seed goes in here when a parity run found something with it. The nightly run
+# (.github/workflows/parity.yml) draws a fresh seed each time and so never
+# repeats itself; these are replayed on every pull request, which is what keeps a
+# divergence that was once found from coming back unnoticed. The same division as
+# testdata/fuzz-corpus/ and the nightly fuzz run.
+#
+# Reproduce one with:
+#
+#     ./bin/itest --parity --parity-seed <seed> --parity-runs 400 -v
+#
+# The queries a seed produces depend on the generator, so editing
+# src/itest/parity_gen.odin changes what these replay. That is expected and not a
+# reason to avoid editing it: the seeds are a supply of awkward traffic, not a
+# fixed set of cases, and the properties they are checked against live in
+# parity_compare.odin where they can be read.
+
+# An upstream that had issued a cookie was owed one on every reply after it -
+# including replies to queries this server had sent without one, which is what a
+# client asking without EDNS produces. The correct cookie-less reply was thrown
+# away and the client waited out the upstream timeout. Fixed in
+# src/upstream/cookie.odin; the named case is in src/itest/cases_cookie.odin.
+1
+3
+
+# The truncation ceiling: an answer is packed against room reserved for the
+# upstream's OPT record, and the options in it are stripped afterwards without
+# the records being put back. Still open - see the "known defect" allowance in
+# parity_compare.odin, which these keep exercising.
+4
+5
+
+# General coverage of the upstream OPT path: replies carrying a cookie and an
+# NSID, an option code nothing recognises, and the normalisation that has to
+# keep every one of them from reaching the client.
+7
+11

@@ -34,6 +34,9 @@ Mock_Behaviour :: enum u8 {
 	// reply's question matches the query it sent, so a canned answer for one
 	// name is correctly rejected when a different name was asked.
 	Synth_A,
+	// Answer from the parity check's synthetic zone: any name, any type,
+	// deterministically. See parity_mock.odin.
+	Parity,
 }
 
 Mock_Cookies :: enum u8 {
@@ -91,6 +94,13 @@ Mock :: struct {
 	// The most recent query as it arrived, so tests can assert on what elodin
 	// actually forwarded rather than only on what came back.
 	last_query:  []u8,
+	// The most recent reply as it went out, and how many have gone out. The
+	// parity check holds elodin's answer against these bytes, so it needs them
+	// exactly as this mock wrote them - not as anything downstream re-encoded
+	// them - and needs the count to know that one client query really did cause
+	// one upstream exchange.
+	last_reply:  []u8,
+	replies:     int,
 }
 
 mock_make :: proc(name: string, port: int) -> ^Mock {
@@ -193,6 +203,46 @@ mock_last_query :: proc(m: ^Mock, allocator := context.temp_allocator) -> []u8 {
 	return out
 }
 
+// Unlike `record_query` this takes the lock itself: replies are built on the
+// delayed-reply thread and on every connection thread, none of which is holding
+// it.
+@(private)
+record_reply :: proc(m: ^Mock, reply: []u8) {
+	sync.mutex_lock(&m.mu)
+	defer sync.mutex_unlock(&m.mu)
+	if m.last_reply != nil {
+		delete(m.last_reply)
+	}
+	m.last_reply = make([]u8, len(reply))
+	copy(m.last_reply, reply)
+	m.replies += 1
+}
+
+// A copy of the last reply the mock sent, or nil if it has sent none.
+mock_last_reply :: proc(m: ^Mock, allocator := context.temp_allocator) -> (reply: []u8, count: int) {
+	sync.mutex_lock(&m.mu)
+	defer sync.mutex_unlock(&m.mu)
+	if m.last_reply == nil {
+		return nil, m.replies
+	}
+	out := make([]u8, len(m.last_reply), allocator)
+	copy(out, m.last_reply)
+	return out, m.replies
+}
+
+// Answer anything from the parity check's synthetic zone.
+mock_parity_all :: proc(m: ^Mock) {
+	m.fallback = Mock_Rule {
+		behaviour = .Parity,
+	}
+}
+
+mock_reset_replies :: proc(m: ^Mock) {
+	sync.mutex_lock(&m.mu)
+	defer sync.mutex_unlock(&m.mu)
+	m.replies = 0
+}
+
 @(private)
 record_query :: proc(m: ^Mock, query: []u8) {
 	// Called with m.mu already held.
@@ -285,6 +335,9 @@ mock_stop :: proc(m: ^Mock) {
 	if m.last_query != nil {
 		delete(m.last_query)
 	}
+	if m.last_reply != nil {
+		delete(m.last_reply)
+	}
 	tlsx.context_destroy(m.tls_ctx)
 	free(m)
 }
@@ -324,6 +377,9 @@ build_reply :: proc(
 	reply: []u8,
 	ok: bool,
 ) {
+	defer if ok {
+		record_reply(m, reply)
+	}
 	if m.cookies == .Off {
 		return build_answer(m, query, rule, over_tcp, allocator)
 	}
@@ -416,6 +472,9 @@ build_answer :: proc(
 
 	case .Synth_A:
 		return build_synth_a(query, rule.addr, rule.ttl, allocator), true
+
+	case .Parity:
+		return parity_synth_reply(query, over_tcp, allocator), true
 
 	case .Truncate_UDP:
 		if over_tcp {
