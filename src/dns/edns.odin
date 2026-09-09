@@ -152,8 +152,15 @@ The slow path by construction - a record cannot be spliced into a message that
 has nowhere to splice it - so it decodes and encodes again, out of the temp arena
 for the reason `rebuild_edns_option` gives.
 
-DO stays clear: an answer that reached us without an OPT record reached us
-without signatures, and the bit would say otherwise.
+DO stays clear, which is the only reading available here: this has the message
+and not the request it answers, and RFC 3225 section 3 makes the bit in a
+response a copy of the one in the query. A caller that does have the query says
+so afterwards - `server.normalise_client_opt` writes the copy over the record an
+answer carries at that point, whether it was minted here or arrived with one. A
+record minted *after* that, by `ensure_edns_option` making room for a cookie or
+for padding, keeps the clear bit this writes; nothing reaches those with the
+answer still lacking an OPT record and room to add one, and if something ever
+does, the copy is the caller's to write there too.
 
 Fails when the message will not decode, will not encode again, or turns out to
 have an OPT record after all - the last of which is the caller's own check
@@ -610,4 +617,174 @@ rebuild_edns_option :: proc(
 		return out, true
 	}
 	return nil, false
+}
+
+/*
+Take every option back out of an encoded message's OPT record, leaving the
+record itself and the fields in its header.
+
+The counterpart to `remove_edns_option` for a caller whose rule is an allowlist
+rather than a code: `remove_edns_option` needs the code of the thing it removes,
+and what an upstream may have written into a reply is open-ended - NSID, an
+extended error, a cookie, anything a future upstream invents. There is no list
+of those to walk, so the list that is walked is what stays, and here that is
+nothing. RFC 6891 section 6.1.1 - "An OPT RR MUST NOT be cached, forwarded, or
+stored in or loaded from Zone Master Files" - is the rule this serves;
+`server.match_client_opt` is the caller, and it is where the reading of it is
+argued.
+
+A message with no OPT record, or one that cannot be walked as far as one, is
+returned unchanged and `ok` - the same answer `remove_opt` gives, and for the
+same reason: a caller asking for this has nothing further to do either way.
+
+An empty option list is returned unchanged only when that record is also the last
+thing in the message, which is what makes "nothing to strip" true rather than
+merely true of the first record. Nothing may follow it, so there is no second OPT
+record for the rebuild below to drop, and the common case - an upstream that
+wrote no options, with its OPT record where an OPT record goes - allocates
+nothing. An empty record with anything behind it goes to the rebuild instead:
+what is behind it may be another OPT record carrying options, and returning early
+on the first record's emptiness would hand that one to the client whole. Ordered
+the other way round this read as an optimisation and was a hole.
+
+Never written in place, for `remove_opt`'s reason: the bytes handed in may be a
+cache entry other clients are still being served from, and an option's absence
+is this client's answer alone.
+
+Fails only where a message whose OPT record is not the last one cannot be
+decoded and encoded again.
+*/
+strip_edns_options :: proc(msg: []u8, allocator := context.allocator) -> (out: []u8, ok: bool) {
+	span, has_opt := find_opt_span(msg)
+	if !has_opt {
+		return msg, true
+	}
+	if !span.last {
+		return rebuild_without_edns_options(msg, allocator)
+	}
+	// Nothing follows the record, so an empty list here is the whole message's
+	// answer and not just this record's. See above.
+	if span.rd_start == span.rd_end {
+		return msg, true
+	}
+
+	/*
+	Nothing follows the record, so its RDATA is the tail of the message and
+	dropping the options is a shorter copy plus a zeroed RDLENGTH.
+
+	The same argument `remove_opt` makes for cutting the whole record: an OPT
+	record's RDATA is an option list with no name in it, so no compression
+	pointer anywhere in the message is aimed into the bytes being dropped, and
+	every offset before them is where it was. RDLENGTH itself sits ahead of
+	`rd_start` and so is inside the copy.
+	*/
+	out = make([]u8, span.rd_start, allocator)
+	copy(out, msg[:span.rd_start])
+	out[span.rdlen_pos] = 0
+	out[span.rdlen_pos + 1] = 0
+	return out, true
+}
+
+/*
+The slow path: decode, empty the option list, encode again.
+
+For a message whose OPT record is not the last one, where the bytes cannot
+simply be cut - see `strip_edns_options`. Out of the temp arena, for the reason
+`rebuild_edns_option` gives.
+
+A second OPT record is dropped rather than emptied, and this is the only place
+that can be reached with one: a message carrying two has a record behind the
+first, so it is not `span.last`, and both of `strip_edns_options`'s early returns
+are behind that check for exactly this reason. RFC 6891 section
+6.1.1 allows exactly one, to the point of requiring FORMERR for a *query* that
+carries more, and nothing applies that reading to a reply - so a message with two
+is one an upstream should not have sent and not one to pass on as it stands.
+Emptying both would leave the second stating the upstream's own EDNS version and
+DO bit, which every other writer in this file reaches only the first of: they
+walk with `find_opt_span`, which stops at the first record. One record is what
+makes the two halves of a normalisation agree about how much of the message they
+cover.
+*/
+@(private)
+rebuild_without_edns_options :: proc(msg: []u8, allocator: mem.Allocator) -> (out: []u8, ok: bool) {
+	scratch := context.temp_allocator
+
+	m, derr := decode_message(msg, scratch)
+	if derr != .None {
+		return nil, false
+	}
+	additional := make([dynamic]Record, 0, len(m.additional), scratch)
+	seen := false
+	for rec in m.additional {
+		if rec.type != .OPT {
+			append(&additional, rec)
+			continue
+		}
+		if seen {
+			continue
+		}
+		seen = true
+		bare := rec
+		bare.data = Rdata_OPT{}
+		append(&additional, bare)
+	}
+	m.additional = additional[:]
+
+	/*
+	A re-encode that had to truncate is reported as a failure rather than
+	returned, which is the one place this parts company with the rebuilds beside
+	it.
+
+	They shorten a message by construction, so a truncation there is a message
+	that was already too long. This one can *grow*: a name the sender compressed
+	inside RDATA comes back written in full, which is what `w_record` does with
+	an SRV target. On the stream transports the caller's limit is 65535 and so is
+	`MAX_MESSAGE`, so a large answer that grew past it would come back with
+	records dropped and TC set, and the caller's own refit would find it inside
+	the limit and do nothing - leaving a client told to ask again over the TCP it
+	is already using. Handing back the bytes as they arrived is the better of the
+	two: the caller keeps an answer that is whole and still carries the options,
+	which is a leak, where the other is a name that will not resolve.
+	*/
+	encoded, truncated, eerr := encode_message(m, scratch, MAX_MESSAGE)
+	if eerr != .None || truncated {
+		return nil, false
+	}
+	out = make([]u8, len(encoded), allocator)
+	copy(out, encoded)
+	return out, true
+}
+
+/*
+State the EDNS version and the flag bits of an encoded response's OPT record.
+
+The other two windows onto the TTL that `clear_edns_extended_rcode` writes the
+first of (RFC 6891 section 6.1.3): the extended rcode in the top byte, VERSION
+below it, and sixteen flag bits of which DO is the top one. This writes the
+lower three bytes and leaves the extended rcode alone, because on a response
+that byte is the top half of an rcode somebody meant - a BADVERS or a BADCOOKIE
+this server composed - and zeroing it would hand the client the low nibble on
+its own, which is a different rcode.
+
+Both fields written are the responder's own statement about the answer being
+sent, so a forwarder passing an upstream's on is answering for a server that
+never saw this request. VERSION is the version this answer is written in; DO is
+"copied in the response" from the query per RFC 3225 section 3. The other
+fifteen flag bits are reserved and MUST be zero (RFC 6891 section 6.1.4), so
+they are written rather than masked - an upstream that set one is not a reason
+to forward it.
+
+Reports false when the message carries no OPT record or cannot be walked to it,
+neither of which is a failure: there is no field to write. Written in place, as
+the rest of this file does, so a message that arrived with its own name
+compression keeps it.
+*/
+set_edns_version_and_flags :: proc(msg: []u8, version: u8, do_bit: bool) -> bool {
+	span := find_opt_span(msg) or_return
+	// The TTL ends four bytes before RDLENGTH, so its first byte - the extended
+	// rcode, left as it stands - is at `rdlen_pos - 4` and the version follows it.
+	msg[span.rdlen_pos - 3] = version
+	msg[span.rdlen_pos - 2] = 0x80 if do_bit else 0
+	msg[span.rdlen_pos - 1] = 0
+	return true
 }
