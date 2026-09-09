@@ -503,7 +503,12 @@ same number.
 
 This is where the ceiling on an answer is held, and it is held last: every path
 out of here ends in `fit_response`, with the OPT record already settled, and
-nothing between here and the wire shortens the message again.
+nothing between here and the wire shortens the message again. Every path but the
+guard below, which is the one return that does not, and does not have to: what it
+hands back is too short to hold a header, and so shorter than any `limit` this is
+reached with - `response_limit` floors at `config.MIN_UDP_RESPONSE` on UDP and is
+`dns.MAX_MESSAGE` on the stream transports. Nothing reaches it today either,
+since an answer `resolve_query` reports success for is one it decoded or built.
 
 That ordering is the point rather than a tidying-up. `encode_message` keeps room
 behind a cut for the OPT record of the message it is handed, which on a forwarded
