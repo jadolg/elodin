@@ -81,14 +81,16 @@ Whether a reply may be ours.
 
 Three ways a reply fails (RFC 7873 section 5.3): it echoes a client cookie that
 is not the one we sent, its COOKIE option is not a legal length, or it carries no
-cookie at all when this server has already shown it does cookies.
+cookie at all when one was sent to a server that has already shown it does
+cookies.
 
 That last one is the whole mechanism. A server we have never had a cookie from is
 one that does not implement them, and RFC 7873 has the exchange carry on without
 — but once it has issued one, accepting a reply with the option left off would
 make the check something an attacker opts out of at no cost: it would be back to
 guessing only the transaction ID and the source port, which is what the cookie
-was added to put out of reach.
+was added to put out of reach. It is asked of the query as well as of the
+upstream, though; see the comment on `expected` below.
 
 The option is read off the wire rather than off a decoded message, because a
 decode is a second, stricter test than the one the reply had to pass to get here.
@@ -103,15 +105,38 @@ walked that far carries no cookie as far as this is concerned, which is the
 answer that fails closed.
 */
 @(private)
-cookie_matches :: proc(u: ^Upstream, response: []u8) -> bool {
+cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	if u == nil || !cookies_wanted(u) {
 		return true
 	}
 	sync.mutex_lock(&u.mu)
 	echoed := u.cookie.client
-	// Having issued a cookie is what makes one owed on every reply after it.
-	expected := u.cookie.server_len > 0
+	held := u.cookie.server_len > 0
 	sync.mutex_unlock(&u.mu)
+
+	/*
+	A cookie is owed on a reply to a query that carried one, and only then.
+
+	Having been issued a server cookie is not enough on its own, because this
+	resolver does not put a cookie on every query it sends. `attach_cookie`
+	declines when the query has no OPT record to carry one - which is what a
+	client asking without EDNS produces - and a cookie-aware server answering a
+	query that carried no cookie correctly answers with no cookie of its own
+	(RFC 7873 section 5.2.1). Demanding one there rejects the only reply that
+	could ever have arrived, and the client gets a timeout and a servfail for a
+	name that resolves.
+
+	It costs the check nothing. The cookie's value is that an off-path attacker
+	has to guess 64 bits it never saw, and that only ever applied to exchanges
+	where those bits were sent. On an exchange carrying no cookie there is
+	nothing to guess and nothing to opt out of: forging one is exactly as hard
+	as it was before cookies existed, which is the same position every reply
+	from a cookie-less upstream is already in. What must not happen is the
+	reverse - a reply to a query that did carry a cookie being accepted without
+	one - and that is what `held` still governs.
+	*/
+	_, asked_with_cookie := dns.peek_edns_option(query, .Cookie)
+	expected := held && asked_with_cookie
 
 	raw, found := dns.peek_edns_option(response, .Cookie)
 	if !found {

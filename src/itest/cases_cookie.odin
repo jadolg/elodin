@@ -1,6 +1,7 @@
 package itest
 
 import "core:fmt"
+import "core:time"
 import "elodin:dns"
 
 /*
@@ -247,6 +248,43 @@ run_upstream_cookie_cases :: proc(r: ^Runner) {
 			if check(r, res.ok, "no response") {
 				_, found := find_cookie(mock_last_query(mock))
 				check(r, !found, "a cookie was added to a query with no OPT record")
+			}
+		}
+		end_case(r)
+
+		start_case(r, "cookies: and the answer to it still arrives")
+		{
+			/*
+			The other half of the case above, and the half that was missing.
+
+			Sending the query without a cookie is only correct if the reply that
+			comes back without one is then accepted. A cookie-aware server
+			answers a query that carried no cookie with no cookie of its own
+			(RFC 7873 section 5.2.1), so a resolver that demands one on every
+			reply once it has been issued one turns its own correct behaviour
+			into a timeout - and the client gets SERVFAIL for a name that
+			resolves perfectly well.
+
+			Checking that a datagram came back is not enough to catch that: a
+			timeout produces a datagram too. So this checks the rcode, and that
+			it did not take an upstream timeout to produce it.
+			*/
+			started := time.now()
+			res := query_udp(udp_port, build_query("plain.example.", u16(dns.Type.A), id = 0x4248))
+			elapsed := time.diff(started, time.now())
+			if check(r, res.ok, "no response") {
+				h, _ := parse_header(res.wire)
+				check(
+					r,
+					h.rcode != int(dns.Rcode.Serv_Fail),
+					"servfail for a name the upstream answered; the reply carried no cookie and was turned away",
+				)
+				check(
+					r,
+					elapsed < 2 * time.Second,
+					"the answer took %v, which is an upstream timeout rather than an answer",
+					elapsed,
+				)
 			}
 		}
 		end_case(r)

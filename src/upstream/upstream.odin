@@ -357,7 +357,7 @@ response_accepted :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	if !response_matches(query, response) {
 		return false
 	}
-	return cookie_matches(u, response)
+	return cookie_matches(u, query, response)
 }
 
 // Confirm a reply belongs to the query we sent: matching ID, the QR bit set, and
