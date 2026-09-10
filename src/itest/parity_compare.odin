@@ -161,12 +161,17 @@ fixed bytes, and the RDATA - because the question every caller is asking is
 whether elodin *could* have carried it. Over-estimating would excuse a record
 left out with room to spare, which is the thing they are all here to catch.
 
-Under-estimating is possible and is the side to be wrong on. `encode_message`
-turns compression off for the rest of the message once it has dropped an
-additional record, so the third record of such a section really costs its
-owner name in full; costed here at two bytes it can read as having had room
-when it did not, and the answer to that is a finding somebody reads rather
-than an allowance nobody sees.
+Both ways, in truth, and the sentence above is the intent rather than a
+guarantee. Under by the owner name, because `encode_message` turns compression
+off for the rest of the message once it has dropped an additional record, so
+the third record of such a section really costs its name in full where this
+costs two bytes. Over by whatever a name inside the RDATA compresses to,
+because `pw_canonical_rdata` expands those and `w_record` writes them back
+compressed for the types that may carry one - NS, MX, PTR, SOA and the rest of
+`rdata_name_compressible` - none of which any shape the mock serves puts in an
+additional section. Under-charging produces a finding somebody reads and
+over-charging an allowance nobody sees, so the first is the side to be wrong
+on and the second is worth knowing is there.
 */
 @(private = "file")
 pc_rr_cost :: proc(rec: Pw_RR) -> int {
@@ -742,7 +747,18 @@ pc_missing :: proc(
 		// into this section, and `pc_written_before` walks the additional one.
 		cost := pc_rr_cost(rec)
 		written := pc_written_before(c, index, up, el)
-		owed := pc_opt_cost(el)
+		/*
+		The room the encoder was holding back at this point, which is the OPT
+		record's only while the OPT record is still to come: it reserves that
+		room while filling the section and stops once the record is written
+		(src/dns/encode.odin, `!opt_written`). An upstream that put its OPT
+		record ahead of its glue is re-encoded in that order, and there the
+		ceiling for the glue behind it is the whole datagram.
+		*/
+		owed := 0
+		if el.opt.present && el.opt.start >= written {
+			owed = pc_opt_cost(el)
+		}
 		if written + cost > policy.client_udp_limit - owed {
 			pc_add(
 				c,
@@ -833,7 +849,7 @@ pc_written_before :: proc(c: ^Parity_Compare, index: int, up, el: Pw_Msg) -> int
 		}
 	}
 	if seen != len(el.additional) {
-		return el.size - pc_opt_cost(el)
+		return pc_section_end(el)
 	}
 	if kept < len(el.additional) {
 		return el.additional[kept].start
@@ -842,6 +858,25 @@ pc_written_before :: proc(c: ^Parity_Compare, index: int, up, el: Pw_Msg) -> int
 		return el.opt.start
 	}
 	return el.size
+}
+
+/*
+Where elodin's additional section ran out, as far as it can be told without
+the order to read it from.
+
+The fallback's figure: as if the drop had happened after everything else, the
+most permissive reading there is. Bounded by where the OPT record actually
+begins, because a message that wrote that record early ended its section
+earlier still, and "the end of the message less the record" would be a
+position past the end of the section rather than a permissive reading of it.
+*/
+@(private = "file")
+pc_section_end :: proc(m: Pw_Msg) -> int {
+	end := m.size - pc_opt_cost(m)
+	if m.opt.present {
+		return min(end, m.opt.start)
+	}
+	return end
 }
 
 /*
