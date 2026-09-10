@@ -162,16 +162,19 @@ whether elodin *could* have carried it. Over-estimating would excuse a record
 left out with room to spare, which is the thing they are all here to catch.
 
 Both ways, in truth, and the sentence above is the intent rather than a
-guarantee. Under by the owner name, because `encode_message` turns compression
-off for the rest of the message once it has dropped an additional record, so
-the third record of such a section really costs its name in full where this
-costs two bytes. Over by whatever a name inside the RDATA compresses to,
-because `pw_canonical_rdata` expands those and `w_record` writes them back
-compressed for the types that may carry one - NS, MX, PTR, SOA and the rest of
+guarantee.
+
+Under by the owner name, where a record was written with compression already
+turned off - which `encode_message` does for the rest of a message once it
+has dropped an additional record. That one is not left to the intent:
+`pc_missing` charges the full name to a record dropped behind another.
+
+Over by whatever a name inside the RDATA would have compressed to, because
+`pw_canonical_rdata` expands those and `w_record` writes them back compressed
+for the types that may carry one - NS, MX, PTR, SOA and the rest of
 `rdata_name_compressible` - none of which any shape the mock serves puts in an
-additional section. Under-charging produces a finding somebody reads and
-over-charging an allowance nobody sees, so the first is the side to be wrong
-on and the second is worth knowing is there.
+additional section. Over-charging excuses a record that had room, which is the
+quieter way to be wrong and so the one to know about.
 */
 @(private = "file")
 pc_rr_cost :: proc(rec: Pw_RR) -> int {
@@ -745,8 +748,21 @@ pc_missing :: proc(
 	if kind == .Additional && policy.transport == .UDP && !el.tc && !pc_referral(el) {
 		// Costed inside the guard rather than beside it: `index` is an index
 		// into this section, and `pc_written_before` walks the additional one.
+		written, after_a_drop := pc_written_before(c, index, up, el)
+		/*
+		Costed with its owner name written out where a record ahead of it in
+		this section was dropped: `encode_message` turns compression off at
+		the first drop and leaves it off, so everything behind that one really
+		does carry its name in full. The mock's two glue records are exactly
+		that shape - both owned by ns1.parity.test., fifteen bytes apart on
+		whether the pointer was available - and charging the second of them a
+		pointer it never got would read a record that did not fit as one that
+		did, which is a run failing on something nobody did wrong.
+		*/
 		cost := pc_rr_cost(rec)
-		written := pc_written_before(c, index, up, el)
+		if after_a_drop {
+			cost = len(rec.name) + 10 + len(rec.rdata)
+		}
 		/*
 		The room the encoder was holding back at this point, which is the OPT
 		record's only while the OPT record is still to come: it reserves that
@@ -829,55 +845,62 @@ permissive reading of it, so a fallback can only ever excuse and never
 accuse.
 */
 @(private = "file")
-pc_written_before :: proc(c: ^Parity_Compare, index: int, up, el: Pw_Msg) -> int {
+pc_written_before :: proc(
+	c: ^Parity_Compare,
+	index: int,
+	up, el: Pw_Msg,
+) -> (
+	written: int,
+	after_a_drop: bool,
+) {
 	// Walked in order: each of elodin's records is the next upstream record
 	// that was not dropped, so the count of matches made before `index` is
-	// the count of records it wrote before the drop.
+	// the count of records it wrote before the drop, and any upstream record
+	// before `index` that made no match is a record dropped before this one.
 	kept := 0
 	seen := 0
 	for u, i in up.additional {
-		if seen >= len(el.additional) {
+		if i >= index && seen >= len(el.additional) {
 			break
 		}
-		if pw_rr_key_folded_no_ttl(u, c.allocator) !=
-		   pw_rr_key_folded_no_ttl(el.additional[seen], c.allocator) {
+		if seen < len(el.additional) &&
+		   pw_rr_key_folded_no_ttl(u, c.allocator) ==
+			   pw_rr_key_folded_no_ttl(el.additional[seen], c.allocator) {
+			seen += 1
+			if i < index {
+				kept += 1
+			}
 			continue
 		}
-		seen += 1
 		if i < index {
-			kept += 1
+			after_a_drop = true
 		}
 	}
 	if seen != len(el.additional) {
-		return pc_section_end(el)
+		return pc_additional_end(el), after_a_drop
 	}
 	if kept < len(el.additional) {
-		return el.additional[kept].start
+		return el.additional[kept].start, after_a_drop
 	}
-	if el.opt.present {
-		return el.opt.start
-	}
-	return el.size
+	return pc_additional_end(el), after_a_drop
 }
 
 /*
-Where elodin's additional section ran out, as far as it can be told without
-the order to read it from.
+Where elodin's additional section ended.
 
-The fallback's figure: as if the drop had happened after everything else, the
-most permissive reading there is. Bounded by where the OPT record actually
-begins, because a message that wrote that record early ended its section
-earlier still, and "the end of the message less the record" would be a
-position past the end of the section rather than a permissive reading of it.
+The OPT record is the landmark only where the encoder left it last, which is
+where it appends one of its own - a message that carries the upstream's in
+some other position is re-encoded in that position, and there the section
+ended at the end of the message like any other.
 */
 @(private = "file")
-pc_section_end :: proc(m: Pw_Msg) -> int {
-	end := m.size - pc_opt_cost(m)
-	if m.opt.present {
-		return min(end, m.opt.start)
+pc_additional_end :: proc(m: Pw_Msg) -> int {
+	if m.opt.present && m.opt.start + pc_opt_cost(m) == m.size {
+		return m.opt.start
 	}
-	return end
+	return m.size
 }
+
 
 /*
 What elodin's OPT record costs on the wire, or zero where it has none.
