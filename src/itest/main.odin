@@ -265,6 +265,13 @@ main :: proc() {
 	section(&r, "special-use names")
 	run_special_use_cases(&r)
 
+	// The generated parity run is behind --parity, and nothing gates it. These
+	// are the shapes it found once, written down so a pull request replays them
+	// - the same division as testdata/parity-seeds, for the ones too rare for a
+	// seed to reach.
+	section(&r, "response parity: shapes a run found")
+	run_parity_fixed_cases(&r)
+
 	elapsed := time.diff(started, time.now())
 	report(&r, elapsed)
 

@@ -148,7 +148,7 @@ parity_compare :: proc(
 	pc_identity(&c, q, el)
 	dropped := pc_first_dropped(&c, up, el)
 	pc_header(&c, q, up, el, policy, dropped)
-	pc_records(&c, q, up, el, policy)
+	pc_records(&c, q, up, el, policy, dropped)
 	pc_edns(&c, q, up, el, policy, dropped)
 	return c
 }
@@ -480,10 +480,33 @@ pc_records :: proc(
 	q: Parity_Query,
 	up, el: Pw_Msg,
 	policy: Parity_Policy,
+	first_dropped: int,
 ) {
-	pc_section(c, q, .Answer, "answer", up.answer, el.answer, up, el, policy)
-	pc_section(c, q, .Authority, "authority", up.authority, el.authority, up, el, policy)
-	pc_section(c, q, .Additional, "additional", up.additional, el.additional, up, el, policy)
+	pc_section(c, q, .Answer, "answer", up.answer, el.answer, up, el, policy, first_dropped)
+	pc_section(
+		c,
+		q,
+		.Authority,
+		"authority",
+		up.authority,
+		el.authority,
+		up,
+		el,
+		policy,
+		first_dropped,
+	)
+	pc_section(
+		c,
+		q,
+		.Additional,
+		"additional",
+		up.additional,
+		el.additional,
+		up,
+		el,
+		policy,
+		first_dropped,
+	)
 }
 
 @(private = "file")
@@ -495,6 +518,7 @@ pc_section :: proc(
 	up_recs, el_recs: []Pw_RR,
 	up, el: Pw_Msg,
 	policy: Parity_Policy,
+	first_dropped: int,
 ) {
 	taken := make([]bool, len(el_recs), c.allocator)
 	unmatched := make([dynamic]Pw_RR, 0, len(up_recs), c.allocator)
@@ -537,7 +561,7 @@ pc_section :: proc(
 			}
 		}
 		if matched < 0 {
-			pc_missing(c, q, kind, name, u, up, el, policy)
+			pc_missing(c, q, kind, name, u, up, el, policy, first_dropped)
 			continue
 		}
 		taken[matched] = true
@@ -570,7 +594,7 @@ pc_section :: proc(
 /*
 A record the upstream sent and elodin did not.
 
-Allowed in exactly three situations, and none of them is "the record looked
+Allowed in exactly four situations, and none of them is "the record looked
 unimportant".
 */
 @(private = "file")
@@ -582,6 +606,7 @@ pc_missing :: proc(
 	rec: Pw_RR,
 	up, el: Pw_Msg,
 	policy: Parity_Policy,
+	first_dropped: int,
 ) {
 	what := fmt.aprintf("a record missing from the %s section", name, allocator = c.allocator)
 
@@ -594,6 +619,61 @@ pc_missing :: proc(
 			pw_rr_key(rec, c.allocator),
 			"-",
 			"the answer was cut to fit the client's datagram and tc is set, so the client retries over tcp for the rest",
+		)
+		return
+	}
+
+	/*
+	Cut to fit a datagram from the additional section, where no TC bit says so.
+
+	RFC 2181 section 9: TC is not to be set merely because extra information
+	could not be fitted, the results of additional section processing included,
+	and the RRSet that will not fit is left out with the bit clear instead.
+	`encode_message` in src/dns/encode.odin does exactly that, so unlike the
+	allowance above this one has no bit to read and the arithmetic is the whole
+	of the evidence.
+
+	Judged the way `pc_tc` judges it, and for the same reason: on what elodin
+	wrote rather than on what arrived, because this server expands the
+	compressed names inside the older types' RDATA and an answer that came in
+	under the ceiling can go out over it.
+
+	Narrow on three counts, because "additional records may go missing" would
+	retire the check on the section glue and the OPT record both live in:
+
+	  - over UDP only, the one transport with a datagram to fit;
+	  - only where the next record would genuinely not have fitted, so an
+	    additional record missing with room to spare is still a finding;
+	  - not on a referral, which is `omitted_glue_truncates`' exception (RFC
+	    9471 section 3.3): glue for a name server inside the zone being
+	    delegated is learnable from that reply and nowhere else, so a referral
+	    that could not carry it must set TC. The encoder asks that of an answer
+	    section with nothing in it and this refuses the allowance to the same
+	    shape, so a referral that dropped glue and left TC clear stays the
+	    finding it is today.
+
+	A missing OPT record does not reach here at all: `pw_parse` lifts it out of
+	the section into `Pw_Msg.opt`, where `pc_edns` holds it to its own rule.
+	*/
+	if kind == .Additional &&
+	   policy.transport == .UDP &&
+	   len(el.answer) != 0 &&
+	   first_dropped >= 0 &&
+	   el.size + first_dropped > policy.client_udp_limit {
+		pc_add(
+			c,
+			kind,
+			fmt.aprintf(
+				"%s: %d bytes written, the next record costs %d, and this client's limit is %d",
+				what,
+				el.size,
+				first_dropped,
+				policy.client_udp_limit,
+				allocator = c.allocator,
+			),
+			pw_rr_key(rec, c.allocator),
+			"-",
+			"additional data that did not fit the client's datagram, which RFC 2181 section 9 has left out with tc clear",
 		)
 		return
 	}
