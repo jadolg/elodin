@@ -24,12 +24,14 @@
 1
 3
 
-# The truncation ceiling: an answer is packed against room reserved for the
-# upstream's OPT record, and the options in it are stripped afterwards without
-# the records being put back. Still open, tracked as #281 - see the "known
-# defect" allowance in parity_compare.odin, which these keep exercising.
-# Seed 4 shows it on the truncation path and seed 5 on the additional section:
-#     ./bin/itest --parity --parity-runs 400 --parity-seed 4 --parity-explain
+# The truncation ceiling: an answer was packed against room reserved for the
+# upstream's OPT record, and the options in it were stripped afterwards without
+# the records being put back - so a client was sent to TCP for records that had
+# fitted its datagram, or quietly lost an additional address. Seed 4 showed it on
+# the truncation path and seed 5 on the additional section; seed 11 hit it too.
+# Fixed in src/server/resolver.odin, where the record is settled before the answer
+# is fitted rather than after (#281), and named in
+# src/server/opt_reservation_test.odin.
 4
 5
 

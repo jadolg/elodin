@@ -362,38 +362,6 @@ pc_header :: proc(
 }
 
 /*
-The ceiling the encoder actually packed this answer against.
-
-Lower than the client's, by the length of the options that were stripped after
-the packing was done. `encode_message` reserves room for the OPT record as the
-message stands when it is encoded - which is the upstream's, options and all -
-and `normalise_client_opt` in src/server/resolver.odin strips those options
-afterwards. Nothing puts back what was dropped for room the strip handed back.
-
-Used by both places that admit the consequence, so the two cannot drift apart.
-*/
-@(private = "file")
-pc_reserved_ceiling :: proc(up, el: Pw_Msg, policy: Parity_Policy) -> int {
-	return policy.client_udp_limit - max(pw_opt_wire_len(up) - pw_opt_wire_len(el), 0)
-}
-
-/*
-Why a record that would have fitted was left out anyway.
-
-A defect, written down as one rather than argued for. It costs a client either a
-TCP round trip or a glue address it has to go and ask for, in both cases for
-room that turned out to be there. Admitted only where the reservation accounts
-for the whole of the gap, so a record short by any other amount still fails.
-
-Tracked as #281, which says what the fix looks like and lists what to delete
-here when it lands - a labelled allowance with no addressee is one that outlives
-the thing it was waiting for.
-*/
-@(private = "file")
-PC_RESERVATION_DEFECT ::
-	"known defect: the answer was packed against room reserved for the upstream's opt record, and the options in it were stripped afterwards without the records being put back"
-
-/*
 Truncation.
 
 A datagram that will not hold the answer is cut down and marked, which is the
@@ -416,48 +384,6 @@ pc_tc :: proc(c: ^Parity_Compare, up, el: Pw_Msg, policy: Parity_Policy, first_d
 		return
 	}
 	if el.tc && !up.tc {
-		/*
-		The ceiling the encoder actually packed against.
-
-		It reserves room for the OPT record as the message stands when it is
-		encoded - which is the upstream's, options and all - and the options are
-		stripped afterwards, by `normalise_client_opt`. Nothing puts the records
-		back that were dropped for room the strip then handed back, so the
-		answer is packed against a ceiling lower than the one it goes out under
-		by exactly the length of the options that were removed.
-
-		That is a defect and it is written down here as one: it costs a client a
-		TCP round trip for records that would have fitted. It is admitted rather
-		than failed only so that the rest of the check can run, and admitted
-		this narrowly - the gap has to account for the whole of the unused room -
-		so that a truncation short by any other amount still fails.
-
-		Tracked as #281, which is where the fix goes and what deletes this.
-		Reproduce with `--parity-runs 400 --parity-seed 4 --parity-explain`;
-		seeds 5 and 11 hit it too, 5 on the additional-section path.
-		*/
-		reserved := pc_reserved_ceiling(up, el, policy)
-		if policy.transport == .UDP &&
-		   first_dropped >= 0 &&
-		   el.size + first_dropped <= policy.client_udp_limit &&
-		   el.size + first_dropped > reserved {
-			pc_add(
-				c,
-				.Header,
-				fmt.aprintf(
-					"tc (truncated): %d bytes written, the next record costs %d, the limit is %d, and the encoder packed against %d",
-					el.size,
-					first_dropped,
-					policy.client_udp_limit,
-					reserved,
-					allocator = c.allocator,
-				),
-				"0",
-				"1",
-				PC_RESERVATION_DEFECT,
-			)
-			return
-		}
 		if policy.transport == .UDP &&
 		   first_dropped >= 0 &&
 		   el.size + first_dropped > policy.client_udp_limit {
@@ -644,7 +570,7 @@ pc_section :: proc(
 /*
 A record the upstream sent and elodin did not.
 
-Allowed in exactly two situations, and neither of them is "the record looked
+Allowed in exactly three situations, and none of them is "the record looked
 unimportant".
 */
 @(private = "file")
@@ -686,39 +612,6 @@ pc_missing :: proc(
 			"a dnssec record, and this client set neither do nor the type as its question, so RFC 4035 section 3.2.1 says not to send it",
 		)
 		return
-	}
-
-	/*
-	A hint dropped for room the reservation was holding.
-
-	The other face of the defect above. The additional section keeps the OPT
-	record's room as it fills and a glue address is what pays for it - which is
-	the right trade when the room is real, and is this when it is not. No TC
-	goes with it: nothing on the wire says an additional record was left out, so
-	the client simply never learns the address.
-	*/
-	if kind == .Additional && !el.tc && policy.transport == .UDP {
-		cost := 2 + 10 + len(rec.rdata)
-		if el.size + cost <= policy.client_udp_limit &&
-		   el.size + cost > pc_reserved_ceiling(up, el, policy) {
-			pc_add(
-				c,
-				kind,
-				fmt.aprintf(
-					"%s: %d bytes written, the record costs %d, the limit is %d, and the encoder packed against %d",
-					what,
-					el.size,
-					cost,
-					policy.client_udp_limit,
-					pc_reserved_ceiling(up, el, policy),
-					allocator = c.allocator,
-				),
-				pw_rr_key(rec, c.allocator),
-				"-",
-				PC_RESERVATION_DEFECT,
-			)
-			return
-		}
 	}
 
 	/*
