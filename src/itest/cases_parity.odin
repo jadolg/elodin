@@ -742,9 +742,10 @@ and a run of the length worth running failed on something nobody did wrong.
 
 The shape is the one the run found: a DNSKEY question the mock answers with
 three keys, one NS in the authority section and its A and AAAA glue in the
-additional one. That comes to 626 bytes against a client that can take 512, and
+additional one. That comes to 632 bytes against a client that can take 512, and
 elodin writes 511 of them - the answer whole, the authority whole, the A glue,
-the OPT record, and no AAAA.
+the OPT record, and no AAAA. (626 in the issue, which was written before the
+mock's OPT record carried a six-byte keepalive.)
 
 Every part of that shape is checked before the comparison is asked about it. A
 case whose fixture stopped holding a record to drop would otherwise agree with
@@ -816,10 +817,11 @@ parity_additional_dropped_case :: proc(r: ^Runner) {
 	}
 	c := parity_compare(q, reference, res.wire, policy)
 	/*
-	Both halves of it: nothing unexplained, and the record that went missing
+	Both halves of it: nothing unexplained, and every record that went missing
 	explained by the allowance this case is about rather than by one of the
 	others happening to cover it.
 	*/
+	dropped := len(up.additional) - len(el.additional)
 	named := 0
 	for d in c.diffs {
 		if d.reason == "" {
@@ -832,9 +834,10 @@ parity_additional_dropped_case :: proc(r: ^Runner) {
 	}
 	check(
 		r,
-		named == 1,
-		"%d of the allowed differences say the record did not fit the datagram, not one",
+		named == dropped,
+		"%d of the %d records the datagram cost the additional section were matched to that reason",
 		named,
+		dropped,
 	)
 }
 
@@ -886,11 +889,20 @@ parity_286_shape :: proc(r: ^Runner, up, el: Pw_Msg) -> bool {
 	) {
 		return false
 	}
+	/*
+	Fewer, not one fewer.
+
+	The fixture has a byte of slack - 511 written into 512 - so a reply that
+	grew by two would push the A glue out as well, and a count pinned at one
+	would turn the ordinary suite red over something that is not a bug and not
+	say why. What the case needs is that the datagram cost the additional
+	section a record; how many is the comparison's business, and every one of
+	them is held to the allowance below.
+	*/
 	if !check(
 		r,
-		len(el.additional) == len(up.additional) - 1,
-		"elodin kept %d of the upstream's %d additional records, and this case is about exactly one of them going missing",
-		len(el.additional),
+		len(el.additional) < len(up.additional),
+		"elodin kept all %d of the upstream's additional records, so the datagram cost this answer nothing and there is no drop to judge",
 		len(up.additional),
 	) {
 		return false

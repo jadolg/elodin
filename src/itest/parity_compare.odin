@@ -148,9 +148,22 @@ parity_compare :: proc(
 	pc_identity(&c, q, el)
 	dropped := pc_first_dropped(&c, up, el)
 	pc_header(&c, q, up, el, policy, dropped)
-	pc_records(&c, q, up, el, policy, dropped)
+	pc_records(&c, q, up, el, policy)
 	pc_edns(&c, q, up, el, policy, dropped)
 	return c
+}
+
+/*
+What a record would have cost the message that left it out, in bytes.
+
+Its best case - a two-byte compression pointer for the owner name, the ten
+fixed bytes, and the RDATA - because the question every caller is asking is
+whether elodin *could* have carried it. Over-estimating would excuse a record
+left out with room to spare, which is the thing they are all here to catch.
+*/
+@(private = "file")
+pc_rr_cost :: proc(rec: Pw_RR) -> int {
+	return 2 + 10 + len(rec.rdata)
 }
 
 /*
@@ -166,10 +179,7 @@ middle to make a later one fit, so a small record further down being left out
 says nothing; the only question is whether the one at the truncation point would
 have gone in.
 
-Costed at its best case - a two-byte compression pointer for the owner name, the
-ten fixed bytes, and the RDATA - because the question is whether elodin *could*
-have carried it. Over-estimating would excuse a truncation that had room to
-spare, which is the thing this is here to catch.
+Costed by `pc_rr_cost`, like every other record whose room is in question.
 */
 @(private = "file")
 pc_first_dropped :: proc(c: ^Parity_Compare, up, el: Pw_Msg) -> int {
@@ -194,7 +204,7 @@ pc_first_dropped :: proc(c: ^Parity_Compare, up, el: Pw_Msg) -> int {
 				}
 			}
 			if !found {
-				return 2 + 10 + len(u.rdata)
+				return pc_rr_cost(u)
 			}
 		}
 		return -1
@@ -480,33 +490,10 @@ pc_records :: proc(
 	q: Parity_Query,
 	up, el: Pw_Msg,
 	policy: Parity_Policy,
-	first_dropped: int,
 ) {
-	pc_section(c, q, .Answer, "answer", up.answer, el.answer, up, el, policy, first_dropped)
-	pc_section(
-		c,
-		q,
-		.Authority,
-		"authority",
-		up.authority,
-		el.authority,
-		up,
-		el,
-		policy,
-		first_dropped,
-	)
-	pc_section(
-		c,
-		q,
-		.Additional,
-		"additional",
-		up.additional,
-		el.additional,
-		up,
-		el,
-		policy,
-		first_dropped,
-	)
+	pc_section(c, q, .Answer, "answer", up.answer, el.answer, up, el, policy)
+	pc_section(c, q, .Authority, "authority", up.authority, el.authority, up, el, policy)
+	pc_section(c, q, .Additional, "additional", up.additional, el.additional, up, el, policy)
 }
 
 @(private = "file")
@@ -518,7 +505,6 @@ pc_section :: proc(
 	up_recs, el_recs: []Pw_RR,
 	up, el: Pw_Msg,
 	policy: Parity_Policy,
-	first_dropped: int,
 ) {
 	taken := make([]bool, len(el_recs), c.allocator)
 	unmatched := make([dynamic]Pw_RR, 0, len(up_recs), c.allocator)
@@ -561,7 +547,7 @@ pc_section :: proc(
 			}
 		}
 		if matched < 0 {
-			pc_missing(c, q, kind, name, u, up, el, policy, first_dropped)
+			pc_missing(c, q, kind, name, u, up, el, policy)
 			continue
 		}
 		taken[matched] = true
@@ -606,7 +592,6 @@ pc_missing :: proc(
 	rec: Pw_RR,
 	up, el: Pw_Msg,
 	policy: Parity_Policy,
-	first_dropped: int,
 ) {
 	what := fmt.aprintf("a record missing from the %s section", name, allocator = c.allocator)
 
@@ -633,17 +618,26 @@ pc_missing :: proc(
 	allowance above this one has no bit to read and the arithmetic is the whole
 	of the evidence.
 
-	Judged the way `pc_tc` judges it, and for the same reason: on what elodin
-	wrote rather than on what arrived, because this server expands the
-	compressed names inside the older types' RDATA and an answer that came in
-	under the ceiling can go out over it.
+	The arithmetic is `pc_tc`'s, and on what elodin wrote rather than on what
+	arrived for the same reason: this server expands the compressed names
+	inside the older types' RDATA, and an answer that came in under the ceiling
+	can go out over it.
+
+	This record's own cost rather than `pc_first_dropped`'s, which is the
+	difference between the two sections. A truncation is a tail cut off, so
+	there the first record left out is the only one whose room is in question;
+	the additional section is not cut but filled as far as it goes - the
+	encoder drops a record that will not fit and keeps writing the ones behind
+	it - so several can go missing at once, each for its own reason. Judging
+	them all by the first one's cost would excuse a small record lost with room
+	to spare behind a large one that genuinely did not fit.
 
 	Narrow on three counts, because "additional records may go missing" would
 	retire the check on the section glue and the OPT record both live in:
 
 	  - over UDP only, the one transport with a datagram to fit;
-	  - only where the next record would genuinely not have fitted, so an
-	    additional record missing with room to spare is still a finding;
+	  - only where this record would genuinely not have fitted, so one missing
+	    with room to spare is still a finding;
 	  - not on a referral, which is `omitted_glue_truncates`' exception (RFC
 	    9471 section 3.3): glue for a name server inside the zone being
 	    delegated is learnable from that reply and nowhere else, so a referral
@@ -655,19 +649,19 @@ pc_missing :: proc(
 	A missing OPT record does not reach here at all: `pw_parse` lifts it out of
 	the section into `Pw_Msg.opt`, where `pc_edns` holds it to its own rule.
 	*/
-	if kind == .Additional &&
+	if cost := pc_rr_cost(rec);
+	   kind == .Additional &&
 	   policy.transport == .UDP &&
 	   len(el.answer) != 0 &&
-	   first_dropped >= 0 &&
-	   el.size + first_dropped > policy.client_udp_limit {
+	   el.size + cost > policy.client_udp_limit {
 		pc_add(
 			c,
 			kind,
 			fmt.aprintf(
-				"%s: %d bytes written, the next record costs %d, and this client's limit is %d",
+				"%s: %d bytes written, the record costs %d, and this client's limit is %d",
 				what,
 				el.size,
-				first_dropped,
+				cost,
 				policy.client_udp_limit,
 				allocator = c.allocator,
 			),
