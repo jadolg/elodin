@@ -1971,6 +1971,9 @@ as a warning at startup.
 | `elodin_udp_datagrams_total{reader}` | counter | datagrams each UDP reader took off its socket |
 | `elodin_udp_receive_drops_total{reader}` | counter | datagrams the kernel dropped on that reader's receive queue before they could be read; absent where `/proc` cannot be read |
 | `elodin_pool_workers{pool}` / `elodin_pool_pending{pool}` | gauge | the `query` and `upstream` pools; `pending` that does not return to zero is `server.workers` set too low |
+| `elodin_mobileconfig_signed_total` | counter | Apple configuration profiles signed; one per authority until the certificate is renewed. Published only while the profile endpoint exists |
+| `elodin_mobileconfig_refused_total` | counter | profile requests answered 503: the DoH certificate was outside its validity window, or the signing budget was spent. The only signal that a lapsed certificate has taken the endpoint with it |
+| `elodin_mobileconfig_unknown_host_total` | counter | profile requests answered 400: an authority this listener could not have been reached at — a host the certificate does not cover, or a port it does not answer on. Climbing usually means a renewal dropped a name devices still ask for |
 | `process_cpu_seconds_total` | counter | user plus system CPU |
 | `process_resident_memory_bytes` / `_virtual_memory_bytes` | gauge | from `/proc/self/stat` |
 | `process_threads`, `process_open_fds`, `process_max_fds` | gauge | thread and descriptor counts |

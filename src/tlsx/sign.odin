@@ -1,7 +1,6 @@
 package tlsx
 
 import "core:c"
-import "core:mem"
 import "core:net"
 import "core:strings"
 import "core:sys/posix"
@@ -211,7 +210,7 @@ sign_cms :: proc(s: Signer, payload: []u8, allocator := context.allocator) -> (d
 	if len(encoded) == 0 {
 		return nil, false
 	}
-	copied, aerr := mem.make_aligned([]u8, len(encoded), 1, allocator)
+	copied, aerr := make([]u8, len(encoded), allocator)
 	if aerr != nil {
 		return nil, false
 	}

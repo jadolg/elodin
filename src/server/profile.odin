@@ -30,12 +30,24 @@ that expires between signing and serving takes its cached profiles with it.
 /*
 How many signed profiles to keep.
 
-An operator's certificate names a handful of hosts, and each is asked about on
-one or two authorities - with the port and without. Sixteen holds every real
-deployment's whole working set, and the ceiling is there for the case that is not
-real: the port is part of the URL and so part of the key, and a client picks it.
+Sized against the certificate rather than against traffic, because the
+certificate is what decides how many distinct profiles there are to hold: each
+name it covers is servable on up to three authorities - bare, `:443`, and
+`:<listeners.doh.port>` when that is not 443 - and every one of those is a
+separate URL and so a separate signature. Sixty-four therefore holds the whole
+working set of a certificate naming twenty-odd hosts, which is past what a
+resolver is usually asked to answer for.
+
+That headroom is the point and not generosity. A working set that does not fit
+is one an ordinary client evicts just by working through the names it was given,
+and then every request is a miss paying for a signature, which is the budget
+below spent on nothing and a 503 for whoever asks next. Sixteen, which this was,
+ran out at six names.
+
+An entry costs its authority and the signed profile, so a couple of kilobytes;
+the whole table is under two hundred.
 */
-PROFILE_CACHE_ENTRIES :: 16
+PROFILE_CACHE_ENTRIES :: 64
 
 /*
 The signing budget: how many may be signed at once, and how fast that comes back.
@@ -47,11 +59,13 @@ against answering DNS. What they bound is the other case - a client that keeps
 asking about authorities the cache has never seen - which without them is a way
 to buy a public-key operation with a request that costs nothing to send.
 
-The burst is the cache size deliberately: a certificate renewal empties the cache,
-and the working set has to be able to refill in one go rather than a name at a
-time.
+The burst is the cache size deliberately, and the two have to move together: a
+certificate renewal empties the cache, and a working set that cannot be signed
+back in one go is one the next renewal leaves half-served. It is also what keeps
+a full cache from being reachable by eviction - a burst that outran the table
+would let a client turn the whole of it over before the refill rate caught up.
 */
-PROFILE_SIGN_BURST :: 16
+PROFILE_SIGN_BURST :: PROFILE_CACHE_ENTRIES
 PROFILE_SIGN_RATE :: 4
 
 Profile_Status :: enum u8 {
@@ -87,33 +101,33 @@ Profile_Signer :: struct {
 	kilobytes - and every request that is not the first for its authority takes
 	the lock only long enough to copy.
 	*/
-	mu:            sync.Mutex,
+	mu:             sync.Mutex,
 	// Our own references, so this survives the reload that replaces the context
 	// they came from. See `profile_signer_adopt`.
-	signer:        tlsx.Signer,
+	signer:         tlsx.Signer,
 	// `listeners.doh.path`, which the profile has the device query. Borrowed
 	// from the configuration, which outlives this.
-	doh_path:      string,
+	doh_path:       string,
 	// `listeners.doh.port`, one of the ports an authority may name. See
 	// `profile_servable_port`.
-	doh_port:      int,
-	entries:       [PROFILE_CACHE_ENTRIES]Profile_Entry,
-	clock:         u64,
-	tokens:        f64,
-	tokens_at:     i64,
+	doh_port:       int,
+	entries:        [PROFILE_CACHE_ENTRIES]Profile_Entry,
+	clock:          u64,
+	tokens:         f64,
+	tokens_at:      i64,
 	// False until the first request defines the budget's epoch, so a server that
 	// has been up for a week does not start with a week of accumulated tokens.
 	budget_started: bool,
 	// What the metrics and the tests read; written under `mu`, so atomic only
 	// for the reading.
-	signed_total:  u64,
-	refused_total: u64,
+	signed_total:   u64,
+	refused_total:  u64,
 	// Counted apart from `refused_total` because the two say different things
 	// to an operator: this one is a name mismatch between the request and the
 	// certificate, which is a configuration answer, while a refusal is the
 	// endpoint declining to work at all.
-	unknown_total: u64,
-	allocator:     mem.Allocator,
+	unknown_total:  u64,
+	allocator:      mem.Allocator,
 }
 
 // Take the identity `ctx` serves and start with an empty cache. `doh_path` is
@@ -269,7 +283,7 @@ profile_served :: proc(
 	[]u8,
 	Profile_Status,
 ) {
-	out, err := mem.make_aligned([]u8, len(src), 1, allocator)
+	out, err := make([]u8, len(src), allocator)
 	if err != nil {
 		sync.atomic_add(&p.refused_total, 1)
 		return nil, .Unavailable
@@ -309,7 +323,7 @@ profile_normalise_authority :: proc(authority: string, allocator := context.temp
 	if !folds {
 		return authority
 	}
-	out, err := mem.make_aligned([]u8, len(authority), 1, allocator)
+	out, err := make([]u8, len(authority), allocator)
 	if err != nil {
 		return authority
 	}
@@ -443,7 +457,7 @@ profile_cache_victim :: proc(p: ^Profile_Signer) -> ^Profile_Entry {
 
 @(private)
 profile_clone_string :: proc(s: string, allocator: mem.Allocator) -> string {
-	out, err := mem.make_aligned([]u8, len(s), 1, allocator)
+	out, err := make([]u8, len(s), allocator)
 	if err != nil {
 		return ""
 	}

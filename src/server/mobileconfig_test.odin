@@ -167,7 +167,6 @@ run_serve_doh_mc :: proc(d: ^Mc_Session) {
 	serve_doh(d.server, d.conn, "test")
 }
 
-
 /*
 Run one request through the real `serve_doh` loop and return everything written
 back.
