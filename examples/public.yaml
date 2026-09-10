@@ -86,7 +86,9 @@ server:
   max_connections_per_prefix: 24
 
   # Ten seconds, as it ships. It is the read timeout on an idle connection, so
-  # it is also how long a stranger's connection occupies a slot for free.
+  # it is also how long a stranger's connection occupies a slot for free - and
+  # what a TCP or DoT client that sends edns-tcp-keepalive is told, so shortening
+  # it here shortens what those clients wait between queries too.
   client_timeout: 10s
 
   # The DNS Flag Day 2020 figure, written out here rather than left implicit

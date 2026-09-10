@@ -476,7 +476,7 @@ test_a_client_subnet_is_stripped_from_an_opt_that_is_not_last :: proc(t: ^testin
 
 	decoded, derr := dns.decode_message(wire, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
-	testing.expect(t, client_subnet_sent(decoded), "the subnet was not noticed at all")
+	testing.expect(t, edns_option_sent(decoded, .Client_Subnet), "the subnet was not noticed at all")
 
 	out, ok := dns.remove_edns_option(wire, .Client_Subnet, context.temp_allocator)
 	if !testing.expect(t, ok, "the strip failed on an OPT that is not last") {
@@ -510,7 +510,7 @@ test_a_repeated_client_subnet_in_one_opt_is_stripped_whole :: proc(t: ^testing.T
 
 	decoded, derr := dns.decode_message(wire, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
-	testing.expect(t, client_subnet_sent(decoded), "the repeated subnet was not noticed")
+	testing.expect(t, edns_option_sent(decoded, .Client_Subnet), "the repeated subnet was not noticed")
 
 	out, ok := dns.remove_edns_option(wire, .Client_Subnet, context.temp_allocator)
 	if !testing.expect(t, ok, "the strip failed on a repeated option") {
@@ -519,6 +519,6 @@ test_a_repeated_client_subnet_in_one_opt_is_stripped_whole :: proc(t: ^testing.T
 	after, _ := dns.decode_message(out, context.temp_allocator)
 	_, survived := dns.find_edns_option(after, .Client_Subnet)
 	testing.expect(t, !survived, "a second copy of the subnet survived the strip")
-	testing.expect(t, !client_subnet_sent(after), "the stripped query still reports a subnet")
+	testing.expect(t, !edns_option_sent(after, .Client_Subnet), "the stripped query still reports a subnet")
 	free_all(context.temp_allocator)
 }

@@ -852,15 +852,19 @@ pc_opt_contents :: proc(c: ^Parity_Compare, q: Parity_Query, up, el: Pw_Msg, pol
 				break
 			}
 			/*
-			Padding is the one mintable code whose value carries no evidence.
+			Two of the mintable codes carry no evidence in their value.
 
-			RFC 7830 section 3 defines its content as zeros, so the upstream's
-			padding and this server's are byte-identical whenever their lengths
-			happen to match - which would report a copy on every DoT or DoH
-			answer where both hops padded to the same block. There is nothing
-			for a comparison to learn from it in either direction.
+			RFC 7830 section 3 defines padding's content as zeros, so the
+			upstream's padding and this server's are byte-identical whenever
+			their lengths happen to match - which would report a copy on every
+			DoT or DoH answer where both hops padded to the same block. The
+			keepalive timeout is two octets of `server.client_timeout`, pinned
+			at 10s by `parity_config`, so an upstream that happens to hold its
+			own connections for ten seconds writes the same two bytes - and it
+			is a common enough figure to be the way to bet. There is nothing
+			for a comparison to learn from either in either direction.
 			*/
-			if u.code == 12 {
+			if u.code == 12 || u.code == 11 {
 				break
 			}
 			/*
@@ -914,13 +918,21 @@ The option codes this server writes into an answer of its own accord.
 
 Everything else in a client's OPT record can only have come from the upstream,
 which is what makes its presence enough to report without reading its value.
-Kept as a list rather than inferred, so that a fourth one starting to be minted
+Kept as a list rather than inferred, so that the next one to start being minted
 is a line somebody adds here deliberately.
+
+Two of them are hop-by-hop rather than answers to anything the upstream was
+asked: the keepalive timeout describes the connection this client holds with
+this server, and the padding is sized for that connection's transport. Both are
+therefore written on transports where the query went upstream over another one
+entirely, which is why neither may be compared against the upstream's value.
 */
 @(private = "file")
 pc_client_mintable :: proc(code: u16) -> bool {
 	switch code {
 	case 10: // COOKIE, issued to this client (src/server/cookie.odin)
+		return true
+	case 11: // edns-tcp-keepalive, this connection's idle timeout (src/server/keepalive.odin)
 		return true
 	case 12: // padding, sized for this client's transport (src/dns/padding.odin)
 		return true

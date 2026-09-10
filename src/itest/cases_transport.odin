@@ -19,6 +19,11 @@ listeners:
   tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
   dot: {{ enabled: true, address: "127.0.0.1", port: %d, cert_file: %s, key_file: %s }}
   doh: {{ enabled: true, address: "127.0.0.1", port: %d, path: /dns-query, cert_file: %s, key_file: %s }}
+server:
+  # Named rather than left at the shipped default, because the keepalive cases
+  # below read it back off the wire: what a client is told has to be the idle
+  # timeout this server is actually holding its connections for.
+  client_timeout: 10s
 upstream:
   timeout: 3s
   servers: ["127.0.0.1:%d"]
@@ -286,6 +291,107 @@ run_transport_cases :: proc(r: ^Runner) {
 				_, found := find_padding(res.wire)
 				check(r, !found, "a %d-byte UDP answer came back padded", len(res.wire))
 				h, _ := parse_header(res.wire)
+				check_eq_int(r, h.ancount, fix.ancount, "answer count")
+			}
+		}
+		end_case(r)
+	}
+
+	/*
+	edns-tcp-keepalive, RFC 7828.
+
+	A client on a connection that asks how long an idle one is held is told, and
+	the number is `server.client_timeout` - ten seconds in the configuration
+	above, which is a hundred of the 100ms units section 3.1 counts the TIMEOUT
+	field in. Without it the only way to learn that number is to lose a
+	connection to it, which costs the client the handshake it was reusing the
+	connection to avoid.
+
+	The two transports it does not apply to are here for the rules that exclude
+	them rather than for symmetry. Section 3.3.1 has a server "MUST ignore the
+	option" over UDP, and RFC 8484 section 10 puts the whole extension outside
+	DoH: "Extensions that are specific to the choice of transport, such as
+	[RFC7828], are not applicable to DoH."
+
+	Asked through the listeners rather than of `handle_query`, so what is read
+	is what left this process.
+	*/
+	{
+		// Heap, as `query` above: `end_case` resets the scratch between cases.
+		asking := build_query(
+			fix.qname,
+			fix.qtype,
+			id = 0x2b2b,
+			edns_size = 1232,
+			keepalive = true,
+			allocator = context.allocator,
+		)
+		defer delete(asking)
+
+		// 10s in the units of section 3.1, written as the arithmetic so the
+		// configuration above is the one place the number is stated.
+		want := 10 * 1000 / 100
+
+		start_case(r, "tcp: a client that asks is told the idle timeout")
+		{
+			res := query_tcp(udp_port, asking)
+			if check(r, res.ok, "no response over TCP") {
+				units, found := find_keepalive(res.wire)
+				if check(r, found, "the answer carries no keepalive option") {
+					check_eq_int(r, int(units), want, "idle timeout in 100ms units")
+				}
+				h, _ := parse_header(res.wire)
+				check_eq_int(r, h.ancount, fix.ancount, "answer count")
+			}
+		}
+		end_case(r)
+
+		start_case(r, "dot: a client that asks is told the idle timeout")
+		{
+			res := query_dot(dot_port, asking)
+			if check(r, res.ok, "no response over DoT") {
+				units, found := find_keepalive(res.wire)
+				if check(r, found, "the answer carries no keepalive option") {
+					check_eq_int(r, int(units), want, "idle timeout in 100ms units")
+				}
+				h, _ := parse_header(res.wire)
+				check_eq_int(r, h.ancount, fix.ancount, "answer count")
+			}
+		}
+		end_case(r)
+
+		start_case(r, "tcp: a client that did not ask is told nothing")
+		{
+			res := query_tcp(udp_port, build_query(fix.qname, fix.qtype, id = 0x2b2c, edns_size = 1232))
+			if check(r, res.ok, "no response over TCP") {
+				units, found := find_keepalive(res.wire)
+				check(r, !found, "an unasked-for idle timeout of %d00ms came back", units)
+			}
+		}
+		end_case(r)
+
+		start_case(r, "udp: a keepalive query is answered and the option ignored")
+		{
+			res := query_udp(udp_port, asking)
+			if check(r, res.ok, "no response over UDP") {
+				units, found := find_keepalive(res.wire)
+				check(r, !found, "a datagram answer states a %d00ms idle timeout", units)
+				// Ignored means the question is still answered.
+				h, _ := parse_header(res.wire)
+				check_eq_int(r, h.rcode, 0, "rcode")
+				check_eq_int(r, h.ancount, fix.ancount, "answer count")
+			}
+		}
+		end_case(r)
+
+		start_case(r, "doh: a keepalive query is answered and the option ignored")
+		{
+			res := doh_post(doh_port, "/dns-query", asking)
+			if check(r, res.ok, "no HTTP response") {
+				check_eq_int(r, res.status, 200, "status")
+				units, found := find_keepalive(res.body)
+				check(r, !found, "a DoH answer states a %d00ms idle timeout", units)
+				h, _ := parse_header(res.body)
 				check_eq_int(r, h.ancount, fix.ancount, "answer count")
 			}
 		}

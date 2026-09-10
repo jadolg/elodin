@@ -365,6 +365,11 @@ handle_query :: proc(
 		*/
 		response = match_client_opt(response, msg, advertise, limit, outcome, allocator)
 		response = attach_cookie(s.cookies, response, cookie, msg, limit, advertise, allocator)
+		// And this server's idle timeout, for a client on a connection that
+		// asked what it is. It writes into the same record the cookie does, so
+		// it sits behind that and ahead of everything below which measures the
+		// result; `attach_keepalive` argues the three conditions on it.
+		response = attach_keepalive(s, response, msg, proto, limit, advertise, allocator)
 		/*
 		Last, so that nothing after it can put another number back.
 
@@ -899,16 +904,23 @@ edns_opt_readable :: proc(msg: dns.Message) -> bool {
 }
 
 /*
-Whether the client asked with an EDNS Client Subnet option.
+Whether the client asked with a given EDNS option - which is the question each
+of the strips below opens with.
 
 Read off the decoded message, which is the whole of what it takes by the time
 this is asked: `handle_query` has already turned away the two shapes that could
 hide an option from this decoder - a second OPT record, and an OPT whose RDATA
 is not a well-formed option list - so an option that is not in the list here is
 not in the message either, and the one that is can be taken back out.
+
+Every OPT record is walked rather than the first one `find_edns_option` stops
+at. That is the same answer here, for the reason above, and it is the answer
+that stays right if the gate above is ever loosened: a reader that stops where
+the decoder stopped is exactly how an option can be absent to this server and
+present to the upstream.
 */
 @(private)
-client_subnet_sent :: proc(msg: dns.Message) -> bool {
+edns_option_sent :: proc(msg: dns.Message, code: dns.EDNS_Option_Code) -> bool {
 	for rec in msg.additional {
 		if rec.type != .OPT {
 			continue
@@ -918,7 +930,7 @@ client_subnet_sent :: proc(msg: dns.Message) -> bool {
 			continue
 		}
 		for o in rdata.options {
-			if o.code == u16(dns.EDNS_Option_Code.Client_Subnet) {
+			if o.code == u16(code) {
 				return true
 			}
 		}
@@ -1332,7 +1344,7 @@ resolve_query :: proc(
 	whose RDATA is not a well-formed option list. Both would have survived a
 	removal that reported success; see `edns_opt_readable`.
 	*/
-	if client_subnet_sent(msg) {
+	if edns_option_sent(msg, .Client_Subnet) {
 		stripped, done := dns.remove_edns_option(forwarded, .Client_Subnet, allocator)
 		if !done {
 			/*
@@ -1354,6 +1366,74 @@ resolve_query :: proc(
 				client,
 			)
 			log_query(s, client, proto, q, .Failed, "ecs", started)
+			return out, .Failed, built
+		}
+		forwarded = stripped
+	}
+
+	/*
+	And the client's keepalive request stops here, on every transport and under
+	every setting.
+
+	edns-tcp-keepalive is hop by hop. RFC 7828 defines it over "the TCP session"
+	the two ends of it share, and the session a client named is the one it holds
+	with this server - a statement about that connection has nothing to say to
+	an upstream one hop further on, which would at best ignore it.
+
+	At worst this server is the one committing the offence. Section 3.2.1: "DNS
+	clients MUST NOT include the edns-tcp-keepalive option in queries sent using
+	UDP transport." On the way to a UDP upstream the client sending that query
+	is elodin, and a client's option relayed untouched is this server issuing
+	the exact shape that sentence forbids - from a query where it was legal,
+	over a transport where it is not.
+
+	Unconditional, which the two above only look like. Each of the three asks
+	whether the client sent the option and nothing else, but for those two that
+	is an argument that had to be made - the cookie's strip could have read this
+	server's own cookie settings and did, which let a client's secret travel
+	whenever they were off, and the subnet's could have been a refusal or a
+	rewrite instead. Here there is nothing to weigh: no transport on which
+	relaying it is correct, no setting under which it becomes so, and no
+	substitute worth putting in its place. The only question is whether the
+	option is there.
+
+	Nothing is put back. This server answers the client's question itself, on
+	the transports where it means anything - see `attach_keepalive` - and what
+	it answers is its own idle timeout, which is not a number any upstream has
+	an opinion about.
+
+	The reply direction needs nothing: `normalise_client_opt` mints this
+	server's own OPT record and `dns.strip_edns_options` drops whatever the
+	upstream wrote, so an upstream's keepalive cannot reach a client whether or
+	not this strip runs.
+	*/
+	if edns_option_sent(msg, .TCP_Keepalive) {
+		stripped, done := dns.remove_edns_option(forwarded, .TCP_Keepalive, allocator)
+		if !done {
+			/*
+			Failing closed, as both strips above do, and deliberately out of
+			proportion to what this option is worth.
+
+			On its own merits it would not earn a lost answer: a keepalive
+			option that reached an upstream is one every real resolver ignores,
+			which is a smaller harm than the client's secret or the shared
+			cache. What it is not worth is a third strip that fails a different
+			way from the two beside it. `edns_opt_readable` is what makes all
+			three reachable - the message shapes that could hide an option from
+			a removal are refused long before this - so this branch is
+			unreachable in practice, and the value of writing it is that the
+			list stays one rule rather than three, and a fourth strip added
+			later is read off a list that agrees with itself.
+			*/
+			sync.atomic_add(&s.stats.failed, 1)
+			out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
+			logx.warnf(
+				"could not strip the client keepalive from %s %s from %s; not forwarding",
+				dns.type_name(q.type),
+				dns.name_trim_root(q.name),
+				client,
+			)
+			log_query(s, client, proto, q, .Failed, "keepalive", started)
 			return out, .Failed, built
 		}
 		forwarded = stripped
