@@ -48,6 +48,9 @@ Pw_Option :: struct {
 
 Pw_Opt :: struct {
 	present:   bool,
+	// Where the record began in the message, which is where the section
+	// before it ended. Kept for the same reason `Pw_RR.start` is.
+	start:     int,
 	// An OPT record's owner name must be root (RFC 6891 section 6.1.2).
 	root:      bool,
 	udp_size:  u16,
@@ -208,6 +211,7 @@ pw_parse :: proc(msg: []u8, allocator := context.temp_allocator) -> (out: Pw_Msg
 			continue
 		}
 		out.opt = pw_opt(rec, allocator)
+		out.opt.start = rec.start
 	}
 	out.additional = kept[:]
 	if out.opt.present {

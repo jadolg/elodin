@@ -737,29 +737,31 @@ pc_missing :: proc(
 	A missing OPT record does not reach here at all: `pw_parse` lifts it out of
 	the section into `Pw_Msg.opt`, where `pc_edns` holds it to its own rule.
 	*/
-	if cost, written := pc_rr_cost(rec), pc_written_before(c, index, up, el);
-	   kind == .Additional &&
-	   policy.transport == .UDP &&
-	   !el.tc &&
-	   !pc_referral(el) &&
-	   written + cost > policy.client_udp_limit - pc_opt_cost(el) {
-		pc_add(
-			c,
-			kind,
-			fmt.aprintf(
-				"%s: %d bytes stood written, the record costs %d, and this client's limit is %d less the %d the opt record is owed",
-				what,
-				written,
-				cost,
-				policy.client_udp_limit,
-				pc_opt_cost(el),
-				allocator = c.allocator,
-			),
-			pw_rr_key(rec, c.allocator),
-			"-",
-			"additional data that did not fit the client's datagram, which RFC 2181 section 9 has left out with tc clear",
-		)
-		return
+	if kind == .Additional && policy.transport == .UDP && !el.tc && !pc_referral(el) {
+		// Costed inside the guard rather than beside it: `index` is an index
+		// into this section, and `pc_written_before` walks the additional one.
+		cost := pc_rr_cost(rec)
+		written := pc_written_before(c, index, up, el)
+		owed := pc_opt_cost(el)
+		if written + cost > policy.client_udp_limit - owed {
+			pc_add(
+				c,
+				kind,
+				fmt.aprintf(
+					"%s: %d bytes stood written, the record costs %d, and this client's limit is %d less the %d the opt record is owed",
+					what,
+					written,
+					cost,
+					policy.client_udp_limit,
+					owed,
+					allocator = c.allocator,
+				),
+				pw_rr_key(rec, c.allocator),
+				"-",
+				"additional data that did not fit the client's datagram, which RFC 2181 section 9 has left out with tc clear",
+			)
+			return
+		}
 	}
 
 	pc_add(c, kind, what, pw_rr_key(rec, c.allocator), "-", "")
@@ -795,17 +797,20 @@ How much of the datagram stood written when a record the upstream sent at
 Elodin fills the additional section in the order it was given and leaves out
 what will not fit, so its section is the upstream's with records removed, and
 the record it wrote next after a drop began exactly where the dropped one
-would have. That record's offset is therefore the answer, and where nothing
-was written after the drop the answer is where the OPT record went - the
-encoder appends it once the section is done.
+would have. That record's offset is therefore the answer; where nothing was
+written after the drop, it is wherever the OPT record itself begins, read off
+the wire rather than assumed to be the end of the message - a reply whose
+upstream wrote the OPT record ahead of its glue is re-encoded in the order it
+was decoded, and taking the message's end for the record's position there
+would overstate the room by everything written after it.
 
-Two things could make that reading wrong, and both fall back to the finished
-length, which is what the comparison judged by before it could tell the
-difference. A section holding a record elodin minted is not the upstream's
-with records removed, so the order says nothing about where anything stood;
-and a message with no OPT record has no landmark at the end of it. The
-fallback is the most permissive figure of the three - the high-water mark - so
-a fallback can only ever excuse, never accuse.
+One thing makes that reading wrong, and it falls back to the finished length
+less the OPT record, which is what this judged by before it could tell the
+difference: a section holding a record elodin minted is not the upstream's
+with records removed, so the order says nothing about where anything stood.
+The fallback is as if the drop had happened at the very end, the most
+permissive reading of it, so a fallback can only ever excuse and never
+accuse.
 */
 @(private = "file")
 pc_written_before :: proc(c: ^Parity_Compare, index: int, up, el: Pw_Msg) -> int {
@@ -833,7 +838,10 @@ pc_written_before :: proc(c: ^Parity_Compare, index: int, up, el: Pw_Msg) -> int
 	if kept < len(el.additional) {
 		return el.additional[kept].start
 	}
-	return el.size - pc_opt_cost(el)
+	if el.opt.present {
+		return el.opt.start
+	}
+	return el.size
 }
 
 /*
