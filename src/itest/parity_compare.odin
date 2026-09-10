@@ -514,11 +514,22 @@ pc_section :: proc(
 	policy: Parity_Policy,
 ) {
 	taken := make([]bool, len(el_recs), c.allocator)
-	unmatched := make([dynamic]Pw_RR, 0, len(up_recs), c.allocator)
+	/*
+	A record and where in the section it was sent.
+
+	The position travels with it because the size arithmetic in `pc_missing`
+	is about where in the packing a record would have gone, which its contents
+	do not say.
+	*/
+	Unmatched :: struct {
+		rec:   Pw_RR,
+		index: int,
+	}
+	unmatched := make([dynamic]Unmatched, 0, len(up_recs), c.allocator)
 
 	// First pass: records that came back exactly as they were sent, case
 	// included. In an untouched answer this is all of them.
-	for u in up_recs {
+	for u, ui in up_recs {
 		key := pw_rr_key_no_ttl(u, c.allocator)
 		matched := -1
 		for e, i in el_recs {
@@ -531,7 +542,7 @@ pc_section :: proc(
 			}
 		}
 		if matched < 0 {
-			append(&unmatched, u)
+			append(&unmatched, Unmatched{rec = u, index = ui})
 			continue
 		}
 		taken[matched] = true
@@ -542,7 +553,7 @@ pc_section :: proc(
 	// Named rather than folded into the first pass, so a run says how often it
 	// happens instead of hiding it.
 	for u in unmatched {
-		key := pw_rr_key_folded_no_ttl(u, c.allocator)
+		key := pw_rr_key_folded_no_ttl(u.rec, c.allocator)
 		matched := -1
 		for e, i in el_recs {
 			if taken[i] {
@@ -554,7 +565,7 @@ pc_section :: proc(
 			}
 		}
 		if matched < 0 {
-			pc_missing(c, q, kind, name, u, up, el, policy)
+			pc_missing(c, q, kind, name, u.rec, u.index, up, el, policy)
 			continue
 		}
 		taken[matched] = true
@@ -562,11 +573,11 @@ pc_section :: proc(
 			c,
 			kind,
 			fmt.aprintf("a name in the %s section came back in a different case", name, allocator = c.allocator),
-			pw_rr_key(u, c.allocator),
+			pw_rr_key(u.rec, c.allocator),
 			pw_rr_key(el_recs[matched], c.allocator),
 			"the answer was re-encoded and the name compressed against an earlier one, which RFC 1035 section 4.1.4 matches without regard to case, so the earlier spelling is the one written",
 		)
-		pc_ttl(c, kind, name, u, el_recs[matched], policy)
+		pc_ttl(c, kind, name, u.rec, el_recs[matched], policy)
 	}
 
 	for e, i in el_recs {
@@ -597,6 +608,9 @@ pc_missing :: proc(
 	kind: Parity_Kind,
 	name: string,
 	rec: Pw_RR,
+	// Where in the upstream's section this record was sent, which is where in
+	// elodin's packing it would have gone.
+	index: int,
 	up, el: Pw_Msg,
 	policy: Parity_Policy,
 ) {
@@ -673,19 +687,28 @@ pc_missing :: proc(
 	allowance above this one has no bit to read and the arithmetic is the whole
 	of the evidence.
 
-	The arithmetic is `pc_tc`'s, and on what elodin wrote rather than on what
-	arrived for the same reason: this server expands the compressed names
-	inside the older types' RDATA, and an answer that came in under the ceiling
-	can go out over it.
+	Like `pc_tc` it judges on what elodin wrote rather than on what arrived,
+	because this server expands the compressed names inside the older types'
+	RDATA and an answer that came in under the ceiling can go out over it.
+	Unlike `pc_tc` it asks the question of a particular record at a particular
+	point, and both halves of that matter, because the additional section is
+	not cut but filled as far as it goes: the encoder drops a record that will
+	not fit and keeps writing the ones behind it.
 
-	This record's own cost rather than `pc_first_dropped`'s, which is the
-	difference between the two sections. A truncation is a tail cut off, so
-	there the first record left out is the only one whose room is in question;
-	the additional section is not cut but filled as far as it goes - the
-	encoder drops a record that will not fit and keeps writing the ones behind
-	it - so several can go missing at once, each for its own reason. Judging
-	them all by the first one's cost would excuse a small record lost with room
-	to spare behind a large one that genuinely did not fit.
+	So the cost is this record's own - `pc_first_dropped`'s figure would judge
+	a whole section by whichever record was lost first - and the room is what
+	stood written when this record's turn came rather than the finished
+	message's length. The finished length is the high-water mark, and against
+	it a record dropped early with room to spare is excused the moment the
+	records written after it bring the total near the ceiling. That is the
+	data loss this comparison exists to catch, in the one section it is being
+	loosened for.
+
+	The ceiling is short of the client's limit by what the OPT record costs,
+	which is the room the encoder holds back while it fills the section
+	(src/dns/encode.odin, `ceiling = max_size - opt_len`). Without that, a
+	record dropped for exactly that reserved room - which is what #281 was
+	about - would read as a record dropped for nothing.
 
 	Narrow on three counts, because "additional records may go missing" would
 	retire the check on the section glue and the OPT record both live in:
@@ -693,38 +716,43 @@ pc_missing :: proc(
 	  - over UDP only, the one transport with a datagram to fit;
 	  - only where this record would genuinely not have fitted, so one missing
 	    with room to spare is still a finding;
+	  - with TC clear, because this reason says "with tc clear" and a message
+	    carrying the bit was cut rather than filled. Both sides truncated is
+	    the shape that reaches here - one side truncated is the allowance
+	    above - and it stays the finding it was before this one existed;
 	  - not on a referral, which is `omitted_glue_truncates`' exception (RFC
 	    9471 section 3.3): glue for a name server inside the zone being
 	    delegated is learnable from that reply and nowhere else, so a referral
-	    that could not carry it must set TC. The encoder asks that of an answer
-	    section with nothing in it and this refuses the allowance to the same
-	    shape, so a referral that dropped glue and left TC clear stays the
-	    finding it is today. Deliberately broader than the encoder's own test,
-	    which asks in addition that the record be an address for a name server
-	    named inside the zone being delegated: narrowing it to that would be
-	    this comparison repeating the rule it is here to check, and a judge
-	    that copies the implementation cannot catch the implementation being
-	    wrong. What the breadth costs is a finding on a referral that dropped
-	    additional data of some other kind, which no shape the mock serves
-	    produces - and a finding is the direction to be wrong in.
+	    that could not carry it must set TC.
+
+	`pc_referral` is deliberately looser than the encoder's test, which asks
+	in addition that the record be an address for a name server named inside
+	the zone being delegated. Narrowing it that far would be this comparison
+	repeating the rule it is here to check, and a judge that copies the
+	implementation cannot catch the implementation being wrong. What the
+	looseness costs is a finding on a referral that dropped additional data of
+	another kind, which no shape the mock serves produces - and a finding is
+	the direction to be wrong in.
 
 	A missing OPT record does not reach here at all: `pw_parse` lifts it out of
 	the section into `Pw_Msg.opt`, where `pc_edns` holds it to its own rule.
 	*/
-	if cost := pc_rr_cost(rec);
+	if cost, written := pc_rr_cost(rec), pc_written_before(c, index, up, el);
 	   kind == .Additional &&
 	   policy.transport == .UDP &&
-	   len(el.answer) != 0 &&
-	   el.size + cost > policy.client_udp_limit {
+	   !el.tc &&
+	   !pc_referral(el) &&
+	   written + cost > policy.client_udp_limit - pc_opt_cost(el) {
 		pc_add(
 			c,
 			kind,
 			fmt.aprintf(
-				"%s: %d bytes written, the record costs %d, and this client's limit is %d",
+				"%s: %d bytes stood written, the record costs %d, and this client's limit is %d less the %d the opt record is owed",
 				what,
-				el.size,
+				written,
 				cost,
 				policy.client_udp_limit,
+				pc_opt_cost(el),
 				allocator = c.allocator,
 			),
 			pw_rr_key(rec, c.allocator),
@@ -735,6 +763,96 @@ pc_missing :: proc(
 	}
 
 	pc_add(c, kind, what, pw_rr_key(rec, c.allocator), "-", "")
+}
+
+/*
+Whether this answer is a delegation rather than an answer.
+
+The shape RFC 9471 section 3.3 is about, and the encoder's own reading of it
+(`omitted_glue_truncates`): nothing in the answer section and a name server
+named in the authority section. An answer section with records in it settles
+the question, and so does an empty one over a SOA - a NODATA or an NXDOMAIN
+is not a delegation, and additional data it could not fit is ordinary
+additional data.
+*/
+@(private = "file")
+pc_referral :: proc(m: Pw_Msg) -> bool {
+	if len(m.answer) != 0 {
+		return false
+	}
+	for ns in m.authority {
+		if ns.type == 2 {
+			return true
+		}
+	}
+	return false
+}
+
+/*
+How much of the datagram stood written when a record the upstream sent at
+`index` would have been written.
+
+Elodin fills the additional section in the order it was given and leaves out
+what will not fit, so its section is the upstream's with records removed, and
+the record it wrote next after a drop began exactly where the dropped one
+would have. That record's offset is therefore the answer, and where nothing
+was written after the drop the answer is where the OPT record went - the
+encoder appends it once the section is done.
+
+Two things could make that reading wrong, and both fall back to the finished
+length, which is what the comparison judged by before it could tell the
+difference. A section holding a record elodin minted is not the upstream's
+with records removed, so the order says nothing about where anything stood;
+and a message with no OPT record has no landmark at the end of it. The
+fallback is the most permissive figure of the three - the high-water mark - so
+a fallback can only ever excuse, never accuse.
+*/
+@(private = "file")
+pc_written_before :: proc(c: ^Parity_Compare, index: int, up, el: Pw_Msg) -> int {
+	// Walked in order: each of elodin's records is the next upstream record
+	// that was not dropped, so the count of matches made before `index` is
+	// the count of records it wrote before the drop.
+	kept := 0
+	seen := 0
+	for u, i in up.additional {
+		if seen >= len(el.additional) {
+			break
+		}
+		if pw_rr_key_folded_no_ttl(u, c.allocator) !=
+		   pw_rr_key_folded_no_ttl(el.additional[seen], c.allocator) {
+			continue
+		}
+		seen += 1
+		if i < index {
+			kept += 1
+		}
+	}
+	if seen != len(el.additional) {
+		return el.size - pc_opt_cost(el)
+	}
+	if kept < len(el.additional) {
+		return el.additional[kept].start
+	}
+	return el.size - pc_opt_cost(el)
+}
+
+/*
+What elodin's OPT record costs on the wire, or zero where it has none.
+
+The room `encode_message` holds back while it fills the additional section,
+worked out the way `dns.opt_wire_len` works it out: the root owner name, the
+fixed ten bytes, the RDLENGTH, and four bytes of header per option.
+*/
+@(private = "file")
+pc_opt_cost :: proc(m: Pw_Msg) -> int {
+	if !m.opt.present {
+		return 0
+	}
+	n := PC_MIN_OPT
+	for o in m.opt.options {
+		n += 4 + len(o.data)
+	}
+	return n
 }
 
 /*

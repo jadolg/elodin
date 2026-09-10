@@ -68,6 +68,15 @@ Pw_Opt :: struct {
 PW_DO :: 0x8000
 
 Pw_RR :: struct {
+	/*
+	Where this record began in the message it was read from.
+
+	Kept because a record's position is the one thing its contents cannot say,
+	and the size arithmetic needs it: how much of a datagram was already spent
+	when a record went in is how much was left for the one before it that did
+	not. See `pc_written_before` in parity_compare.odin.
+	*/
+	start: int,
 	// Uncompressed wire form, case as it arrived.
 	name:  []u8,
 	type:  u16,
@@ -234,6 +243,7 @@ pw_records :: proc(
 	pos := start
 	for i in 0 ..< count {
 		rec: Pw_RR
+		rec.start = pos
 		after: int
 		name_ok: bool
 		rec.name, after, name_ok = pw_name(msg, pos, allocator)
