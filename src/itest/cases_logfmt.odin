@@ -1,6 +1,7 @@
 package itest
 
 import "core:fmt"
+import "core:strconv"
 import "core:strings"
 import "elodin:dns"
 
@@ -88,7 +89,12 @@ run_logfmt_cases :: proc(r: ^Runner) {
 				check_eq_str(r, pairs["qtype"], "A", "qtype")
 				check_eq_str(r, pairs["qname"], "plain.example", "qname")
 				check_eq_str(r, pairs["outcome"], "forwarded", "outcome")
-				check(r, strings.has_prefix(pairs["client"], "127.0.0.1:"), "client=%q", pairs["client"])
+				// The address on its own, with the ephemeral port in a field of
+				// its own beside it: `client` is what an operator selects on, so
+				// a port left joined to it would be a port every filter has to
+				// strip.
+				check_eq_str(r, pairs["client"], "127.0.0.1", "client")
+				check(r, port_of(pairs["port"]) > 0, "port=%q", pairs["port"])
 				check(r, pairs["ms"] != "", "the line carries no duration")
 			}
 		}
@@ -109,6 +115,25 @@ run_logfmt_cases :: proc(r: ^Runner) {
 		}
 	}
 	end_case(r)
+}
+
+/*
+The `port` field of a query line, as a number.
+
+0 for anything that is not one - an empty field, or a value with a byte in it
+that is not a digit - so a caller asking for a real port asks `> 0` and a line
+that lost the field fails the check rather than passing it by accident.
+*/
+@(private = "file")
+port_of :: proc(text: string) -> int {
+	if text == "" {
+		return 0
+	}
+	value, ok := strconv.parse_int(text, 10)
+	if !ok {
+		return 0
+	}
+	return value
 }
 
 @(private = "file")
