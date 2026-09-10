@@ -856,19 +856,32 @@ pc_opt_contents :: proc(c: ^Parity_Compare, q: Parity_Query, up, el: Pw_Msg, pol
 				break
 			}
 			/*
-			Two of the mintable codes carry no evidence in their value.
+			Padding carries no evidence in its value at all.
 
-			RFC 7830 section 3 defines padding's content as zeros, so the
-			upstream's padding and this server's are byte-identical whenever
-			their lengths happen to match - which would report a copy on every
-			DoT or DoH answer where both hops padded to the same block. The
-			keepalive timeout is two octets of `server.client_timeout`, pinned
-			at 10s by `parity_config`, so an upstream that happens to hold its
-			own connections for ten seconds writes the same two bytes - and it
-			is a common enough figure to be the way to bet. There is nothing
-			for a comparison to learn from either in either direction.
+			RFC 7830 section 3 defines its content as zeros, so the upstream's
+			padding and this server's are byte-identical whenever their lengths
+			happen to match - which would report a copy on every DoT or DoH
+			answer where both hops padded to the same block. There is nothing
+			for a comparison to learn from it in either direction.
 			*/
-			if u.code == 12 || u.code == 11 {
+			if u.code == 12 {
+				break
+			}
+			/*
+			The keepalive timeout carries evidence in one mode and not the
+			other, which is the `ttl_exact` split.
+
+			It is two octets of an idle timeout. In the live mode both ends
+			chose theirs independently and ten seconds is the way to bet, so the
+			same bytes on both sides says nothing - the same coincidence padding
+			has, arrived at from the other direction. In the mock mode the
+			upstream's value is not a coincidence at all: `pm_opt` states one
+			second where `parity_config` pins ten, so the two can only agree if
+			one of them is the other. That is the only reading under which this
+			option can be caught crossing on a transport where elodin mints one
+			of its own, and it is free.
+			*/
+			if u.code == 11 && policy.mode != .Mock {
 				break
 			}
 			/*

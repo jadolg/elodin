@@ -336,9 +336,12 @@ run_transport_cases :: proc(r: ^Runner) {
 		{
 			res := query_tcp(udp_port, asking)
 			if check(r, res.ok, "no response over TCP") {
-				units, found := find_keepalive(res.wire)
+				timeout, found := find_keepalive(res.wire)
 				if check(r, found, "the answer carries no keepalive option") {
-					check_eq_int(r, int(units), want, "idle timeout in 100ms units")
+					units, sized := keepalive_units(timeout)
+					if check(r, sized, "the keepalive option is %d bytes, not two", len(timeout)) {
+						check_eq_int(r, int(units), want, "idle timeout in 100ms units")
+					}
 				}
 				h, _ := parse_header(res.wire)
 				check_eq_int(r, h.ancount, fix.ancount, "answer count")
@@ -350,9 +353,12 @@ run_transport_cases :: proc(r: ^Runner) {
 		{
 			res := query_dot(dot_port, asking)
 			if check(r, res.ok, "no response over DoT") {
-				units, found := find_keepalive(res.wire)
+				timeout, found := find_keepalive(res.wire)
 				if check(r, found, "the answer carries no keepalive option") {
-					check_eq_int(r, int(units), want, "idle timeout in 100ms units")
+					units, sized := keepalive_units(timeout)
+					if check(r, sized, "the keepalive option is %d bytes, not two", len(timeout)) {
+						check_eq_int(r, int(units), want, "idle timeout in 100ms units")
+					}
 				}
 				h, _ := parse_header(res.wire)
 				check_eq_int(r, h.ancount, fix.ancount, "answer count")
@@ -364,8 +370,8 @@ run_transport_cases :: proc(r: ^Runner) {
 		{
 			res := query_tcp(udp_port, build_query(fix.qname, fix.qtype, id = 0x2b2c, edns_size = 1232))
 			if check(r, res.ok, "no response over TCP") {
-				units, found := find_keepalive(res.wire)
-				check(r, !found, "an unasked-for idle timeout of %d00ms came back", units)
+				timeout, found := find_keepalive(res.wire)
+				check(r, !found, "an unasked-for keepalive option of %d bytes came back", len(timeout))
 			}
 		}
 		end_case(r)
@@ -374,8 +380,11 @@ run_transport_cases :: proc(r: ^Runner) {
 		{
 			res := query_udp(udp_port, asking)
 			if check(r, res.ok, "no response over UDP") {
-				units, found := find_keepalive(res.wire)
-				check(r, !found, "a datagram answer states a %d00ms idle timeout", units)
+				// Any keepalive option at all, whatever it says. The shape a
+				// missed gate would produce here is the client's own option
+				// echoed back, which carries no timeout to print.
+				timeout, found := find_keepalive(res.wire)
+				check(r, !found, "a datagram answer carries a %d-byte keepalive option", len(timeout))
 				// Ignored means the question is still answered.
 				h, _ := parse_header(res.wire)
 				check_eq_int(r, h.rcode, 0, "rcode")
@@ -389,8 +398,8 @@ run_transport_cases :: proc(r: ^Runner) {
 			res := doh_post(doh_port, "/dns-query", asking)
 			if check(r, res.ok, "no HTTP response") {
 				check_eq_int(r, res.status, 200, "status")
-				units, found := find_keepalive(res.body)
-				check(r, !found, "a DoH answer states a %d00ms idle timeout", units)
+				timeout, found := find_keepalive(res.body)
+				check(r, !found, "a DoH answer carries a %d-byte keepalive option", len(timeout))
 				h, _ := parse_header(res.body)
 				check_eq_int(r, h.ancount, fix.ancount, "answer count")
 			}

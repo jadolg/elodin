@@ -681,22 +681,33 @@ find_padding :: proc(wire: []u8) -> (padding: []u8, found: bool) {
 }
 
 /*
-The idle timeout a message states, in the 100ms units of RFC 7828 section 3.1.
+The edns-tcp-keepalive option carried in a message, if it has one.
 
-`found` is false for a message with no such option and for one whose option is
-not the two octets a response carries - which is the same answer a client
-reading it would have to reach, there being nothing to act on either way.
+The raw bytes, as `find_cookie` and `find_padding` hand back theirs, rather than
+the number inside them. A length is the whole of what separates the two shapes
+RFC 7828 section 3.1 defines - none in a query, two octets in a response - so a
+reader that decoded the value and reported a wrong length as "no option" would
+answer "did this server write a keepalive" with "no" for the one wrong answer
+worth catching: the client's own zero-length option echoed back verbatim. Those
+are the bytes a case asserting absence has to be able to see.
+
+`pw_keepalive_units` is the other half, for the cases that want the number.
 */
-find_keepalive :: proc(wire: []u8) -> (units: u16, found: bool) {
+find_keepalive :: proc(wire: []u8) -> (timeout: []u8, found: bool) {
 	msg, err := dns.decode_message(wire, context.temp_allocator)
 	if err != .None {
+		return nil, false
+	}
+	return dns.find_edns_option(msg, .TCP_Keepalive)
+}
+
+// The TIMEOUT those bytes state, in the 100ms units of RFC 7828 section 3.1.
+// `ok` is false for any length but the two octets a response carries.
+keepalive_units :: proc(timeout: []u8) -> (units: u16, ok: bool) {
+	if len(timeout) != 2 {
 		return 0, false
 	}
-	data, has := dns.find_edns_option(msg, .TCP_Keepalive)
-	if !has || len(data) != 2 {
-		return 0, false
-	}
-	return u16(data[0]) << 8 | u16(data[1]), true
+	return u16(timeout[0]) << 8 | u16(timeout[1]), true
 }
 
 Header :: struct {
