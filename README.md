@@ -2151,10 +2151,12 @@ src/pool/      worker pool
 src/logx/      logging, in logfmt
 src/metrics/   Prometheus exposition format, and process figures out of /proc
 src/privdrop/  giving up root once the listeners hold their ports
-src/itest/     integration suite: harness, mock upstreams (DNS, HTTP, DoH/h2), clients, fixtures
+src/itest/     integration suite: harness, mock upstreams (DNS, HTTP, DoH/h2), clients, fixtures,
+               and the upstream-parity check with its own independent wire walker
 src/fuzz/      libFuzzer targets for the DNS, HPACK and YAML parsers, and their shared arena
 testdata/      fuzz corpus and dictionary, committed so a found crash stays
-               found, plus gen/ - the generator behind the DNSSEC fixtures
+               found, the parity seeds that have found a divergence, plus
+               gen/ - the generator behind the DNSSEC fixtures
 bench/         benchmark harness and DNSSEC survey, in Go, with committed results
 examples/      the annotated reference configuration, one per deployment (local-only,
                lan, small-device, public, container), a development one, and a
@@ -2269,6 +2271,89 @@ after a parser is touched. What CI runs on every change is
 target once and generates nothing new, so a crash fuzzing has already found stays
 found.
 
+**Parity with the upstream** (`mise run parity`) asks the one question none of
+the layers above asks: not whether a particular answer is right, but whether
+*anything at all* is lost between the two sides of the resolver. A forwarding
+resolver is a pipe, and a fixed case can only check the parts of the pipe
+somebody thought to check.
+
+So a seeded generator makes queries nobody wrote down — types the codec has no
+structure for, EDNS options it does not recognise, names holding bytes a hostname
+never holds, the 0x20 case randomisation a stub uses, every transport — and every
+field of every answer is held against the upstream's: the full twelve-bit rcode
+with the extended half reassembled, each header flag, and each section as a
+multiset of records with the names inside RDATA expanded. Every place elodin is
+entitled to differ is written down in `src/itest/parity_compare.odin` with the
+reason and the citation, and a difference not on that list fails the run. That is
+the point of the file: a divergence nobody can name is a divergence nobody
+decided on.
+
+The OPT record is the exception, and it is checked the other way round. RFC 6891
+section 6.1.1 forbids caching or forwarding one, so the record a client reads is
+this server's own statement rather than a copy — see `normalise_client_opt` in
+`src/server/resolver.odin`. There the test is that *nothing* of the upstream's
+crossed: an option of theirs reaching a client is the failure, the DO bit has to
+echo the query rather than the answer, and the reserved flag bits have to be
+zero.
+
+It runs in two modes, and they are not equally strong:
+
+- **Against a synthetic upstream**, the reference is the very message elodin was
+  handed — a mock that answers any name and type deterministically from a zone
+  built to hold the awkward constructs (a compressed name inside the RDATA of
+  every type that may carry one, character-strings empty and full-length, TTLs at
+  both ends of their range, unassigned types with opaque RDATA, answers too large
+  for a datagram, an OPT carrying a cookie and an NSID at once). Hermetic and
+  reproducible, so a divergence here is elodin's and nobody else's.
+- **Against a real resolver** (`--parity-upstream 1.1.1.1:53`), the reference is
+  a second, byte-identical query put straight to it, retried over TCP if the
+  datagram would not hold the answer. Weaker by construction — a real resolver
+  rotates RRsets, expires TTLs between two datagrams and answers from whichever
+  anycast node took the query — so a name has to answer the same way twice before
+  it is used as a reference at all, and a difference has to survive asking the
+  whole question again. What it buys is answers no mock would think to serve.
+
+Both are built on their own wire walker (`src/itest/parity_wire.odin`) which does
+not import `elodin:dns`, for the reason the fixtures give: a comparator built on
+the codec under test loses a record identically on both sides and reports
+agreement.
+
+Every query of a run comes from one 64-bit seed, printed on the way past and
+repeated in any failure, so `--parity-seed` reproduces a nightly run on a laptop.
+`mise run parity` runs the synthetic mode; the live one is asked for by name,
+since a task that reaches a public resolver is not one to put behind a bare
+`mise run`. `.github/workflows/parity.yml` runs both nightly against a fresh
+seed;
+`mise run parity-regression` replays the seeds in `testdata/parity-seeds` — the
+ones that have found something — on every pull request, the same division as
+fuzzing.
+
+The two nightly jobs are not both gates, and the difference is deliberate. The
+synthetic-upstream job fails the run: its reference is exact, so a divergence is
+a bug. The live job only reports, because its reference is a resolver nobody here
+controls — two queries to one anycast address can be answered by nodes holding
+different copies, and elodin's own cache can answer without asking anyone at all.
+That residual measures at about one query in two hundred; it is not something a
+commit can fix, and a job that goes red that often for reasons nobody can act on
+is one people stop reading. A finding there is followed up by hand, usually by
+reproducing it against the synthetic upstream where the answer is either a bug or
+is not.
+
+One allowance in that file is labelled `known defect` rather than argued for: a
+UDP answer is packed against room reserved for the upstream's OPT record, and the
+options in that record are stripped afterwards without the records dropped for
+them being put back, so the client is sent to TCP for records that would have
+fitted — or, in the additional section, quietly loses a glue address. It is
+admitted narrowly enough that a shortfall of any other amount still fails, and
+it is tracked as issue #281, which lists what to delete here when it is fixed.
+
+```
+mise run parity                                   # 2000 queries, synthetic upstream
+./bin/itest --parity --parity-seed 1 -v           # reproduce one run
+./bin/itest --parity --parity-explain             # print the allowed differences too
+./bin/itest --parity --parity-upstream 1.1.1.1:53 # against a real resolver
+```
+
 **Against live DNS**, because none of the layers above can prove the absence of
 false failures: they work from fixtures and generated input, so they can show
 that a forged answer is refused and cannot show that validation leaves working
@@ -2288,8 +2373,8 @@ https://127.0.0.1:443/dns-query`.
 
 CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
 `main`: `mise run check` once, `mise run test` and `mise run itest` on both
-architectures, `mise run fuzz-regression` and `mise run leakcheck` once,
-`mise run build` on both, and —
+architectures, `mise run fuzz-regression`, `mise run parity-regression` and
+`mise run leakcheck` once, `mise run build` on both, and —
 on both — a `mise run deb` that is then installed on the runner, asked to resolve
 a handful of names through the takeover it just performed, and removed again with
 a check that the runner got its own resolver back.

@@ -122,7 +122,7 @@ crafted_cookie_option :: proc(parts: ..[]u8) -> []u8 {
 // The query these replies are answers to: "example.com. A IN" with an OPT
 // record, which is what a cookie needs somewhere to live.
 @(private = "file")
-probe_query :: proc() -> []u8 {
+probe_query :: proc(with_cookie := true) -> []u8 {
 	questions := make([]dns.Question, 1, context.temp_allocator)
 	questions[0] = dns.Question {
 		name  = "example.com.",
@@ -131,6 +131,20 @@ probe_query :: proc() -> []u8 {
 	}
 	additional := make([]dns.Record, 1, context.temp_allocator)
 	additional[0] = dns.make_opt(1232, false)
+	if with_cookie {
+		// What this resolver sends to an upstream it holds a server cookie for.
+		// The checks below are about a reply to such a query, so the query has
+		// to be one: a cookie is only owed back when one went out.
+		sent := make([dynamic]u8, 0, 16, context.temp_allocator)
+		append(&sent, ..CLIENT_COOKIE)
+		append(&sent, ..SERVER_COOKIE)
+		options := make([]dns.EDNS_Option, 1, context.temp_allocator)
+		options[0] = dns.EDNS_Option {
+			code = u16(dns.EDNS_Option_Code.Cookie),
+			data = sent[:],
+		}
+		additional[0].data = dns.Rdata_OPT{options = options}
+	}
 	q := dns.Message {
 		id         = 0x2A2A,
 		question   = questions,
@@ -206,7 +220,7 @@ test_upstream_cookie_check_is_not_skipped_on_a_reply_that_does_not_decode :: pro
 		testing.expectf(t, derr != .None, "%s: it decoded after all, so it proves nothing", shape.what)
 
 		// And the judgement, at both the check itself and the gate around it.
-		testing.expectf(t, !cookie_matches(&u, shape.wire), "%s: accepted with no cookie, bypassing the check", shape.what)
+		testing.expectf(t, !cookie_matches(&u, query, shape.wire), "%s: accepted with no cookie, bypassing the check", shape.what)
 		testing.expectf(t, !response_accepted(&u, query, shape.wire), "%s: the gate let it through", shape.what)
 	}
 	free_all(context.temp_allocator)
@@ -226,13 +240,13 @@ test_upstream_cookie_check_still_reads_a_reply_that_decodes :: proc(t: ^testing.
 	with_cookie := crafted(1, 1, 1, crafted_a(4), crafted_opt(nil, crafted_cookie_option(CLIENT_COOKIE, SERVER_COOKIE)))
 	_, derr := dns.decode_message(with_cookie, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
-	testing.expect(t, cookie_matches(&u, with_cookie), "a well-formed reply carrying our cookie was rejected")
+	testing.expect(t, cookie_matches(&u, query, with_cookie), "a well-formed reply carrying our cookie was rejected")
 	testing.expect(t, response_accepted(&u, query, with_cookie), "the gate turned away a good reply")
 
 	without := crafted(1, 1, 1, crafted_a(4), crafted_opt(nil))
 	_, werr := dns.decode_message(without, context.temp_allocator)
 	testing.expect_value(t, werr, dns.Decode_Error.None)
-	testing.expect(t, !cookie_matches(&u, without), "a well-formed reply with no cookie was accepted")
+	testing.expect(t, !cookie_matches(&u, query, without), "a well-formed reply with no cookie was accepted")
 	free_all(context.temp_allocator)
 }
 
@@ -260,7 +274,7 @@ test_upstream_cookie_in_a_reply_that_does_not_decode_is_honoured :: proc(t: ^tes
 	_, derr := dns.decode_message(ours, context.temp_allocator)
 	testing.expect(t, derr != .None, "the fixture decoded, so it tests nothing")
 	testing.expect(t, response_matches(query, ours), "the matcher rejected the fixture")
-	testing.expect(t, cookie_matches(&u, ours), "a reply carrying our cookie was rejected for not decoding")
+	testing.expect(t, cookie_matches(&u, query, ours), "a reply carrying our cookie was rejected for not decoding")
 	testing.expect(t, response_accepted(&u, query, ours), "the gate turned it away")
 
 	// The same message with somebody else's client cookie, which is what a
@@ -272,7 +286,7 @@ test_upstream_cookie_in_a_reply_that_does_not_decode_is_honoured :: proc(t: ^tes
 		crafted_forward_pointer(),
 		crafted_opt(nil, crafted_cookie_option([]u8{0, 1, 2, 3, 4, 5, 6, 7}, SERVER_COOKIE)),
 	)
-	testing.expect(t, !cookie_matches(&u, forged), "a forged client cookie was accepted")
+	testing.expect(t, !cookie_matches(&u, query, forged), "a forged client cookie was accepted")
 
 	// And with a cookie that is not a legal length (RFC 7873 section 5.3).
 	short := crafted(
@@ -282,7 +296,7 @@ test_upstream_cookie_in_a_reply_that_does_not_decode_is_honoured :: proc(t: ^tes
 		crafted_forward_pointer(),
 		crafted_opt(nil, crafted_cookie_option(CLIENT_COOKIE, []u8{0xb0, 0xb1, 0xb2})),
 	)
-	testing.expect(t, !cookie_matches(&u, short), "an illegal cookie length was accepted")
+	testing.expect(t, !cookie_matches(&u, query, short), "an illegal cookie length was accepted")
 	free_all(context.temp_allocator)
 }
 
@@ -297,10 +311,11 @@ cookie is owed.
 @(test)
 test_upstream_cookie_unreadable_option_list_carries_no_cookie :: proc(t: ^testing.T) {
 	u := probe_upstream()
+	query := probe_query()
 
 	// A cookie option whose length says eight bytes more than are there.
 	overlong := crafted(1, 0, 1, crafted_opt(nil, crafted_cookie_option(CLIENT_COOKIE)[:2], []u8{0x00, 0x10}, CLIENT_COOKIE))
-	testing.expect(t, !cookie_matches(&u, overlong), "a cookie was read out of an option list that does not tile")
+	testing.expect(t, !cookie_matches(&u, query, overlong), "a cookie was read out of an option list that does not tile")
 
 	// Three bytes after a good cookie: the start of an option header and not an
 	// option.
@@ -310,7 +325,7 @@ test_upstream_cookie_unreadable_option_list_carries_no_cookie :: proc(t: ^testin
 		1,
 		crafted_opt(nil, crafted_cookie_option(CLIENT_COOKIE, SERVER_COOKIE), []u8{0x00, 0x0a, 0x00}),
 	)
-	testing.expect(t, !cookie_matches(&u, trailing), "a cookie was read out of a list with a trailing stub")
+	testing.expect(t, !cookie_matches(&u, query, trailing), "a cookie was read out of a list with a trailing stub")
 	free_all(context.temp_allocator)
 }
 
@@ -330,7 +345,7 @@ test_upstream_cookie_undecodable_reply_is_tolerated_before_a_cookie_is_owed :: p
 	query := probe_query()
 
 	for shape in undecodable_shapes() {
-		testing.expectf(t, cookie_matches(&u, shape.wire), "%s: refused by a check that is owed nothing yet", shape.what)
+		testing.expectf(t, cookie_matches(&u, query, shape.wire), "%s: refused by a check that is owed nothing yet", shape.what)
 		testing.expectf(t, response_accepted(&u, query, shape.wire), "%s: the gate refused it", shape.what)
 	}
 
@@ -338,7 +353,7 @@ test_upstream_cookie_undecodable_reply_is_tolerated_before_a_cookie_is_owed :: p
 	off := probe_upstream()
 	off.cookies = false
 	for shape in undecodable_shapes() {
-		testing.expectf(t, cookie_matches(&off, shape.wire), "%s: refused with cookies disabled", shape.what)
+		testing.expectf(t, cookie_matches(&off, query, shape.wire), "%s: refused with cookies disabled", shape.what)
 	}
 	free_all(context.temp_allocator)
 }
@@ -590,5 +605,48 @@ test_upstream_cookie_undecodable_reply_is_accepted_when_none_is_owed :: proc(t: 
 	if response != nil {
 		testing.expect(t, mem.compare(response[2:], forged[2:]) == 0, "the bytes that came back are not the ones sent")
 	}
+	free_all(context.temp_allocator)
+}
+
+/*
+A reply with no cookie, to a query that carried none.
+
+This is what a client asking without EDNS produces: `attach_cookie` will not add
+an OPT record on its behalf, so the query goes out bare, and a cookie-aware
+upstream answers it bare in turn (RFC 7873 section 5.2.1). The reply has to be
+accepted. Requiring one here rejected the only answer that could ever arrive, and
+turned a name that resolves into an upstream timeout and a servfail.
+
+The upstream still holds a server cookie throughout - that is the whole point.
+What decides it is the query, not what has been learned.
+*/
+@(test)
+test_upstream_cookie_is_not_owed_on_a_reply_to_a_query_that_carried_none :: proc(t: ^testing.T) {
+	u := probe_upstream()
+	testing.expect(t, u.cookie.server_len > 0, "the premise: this upstream has issued us a cookie")
+
+	bare := probe_query(with_cookie = false)
+	_, sent := dns.peek_edns_option(bare, .Cookie)
+	testing.expect(t, !sent, "the premise: the query carries no cookie")
+
+	without := crafted(1, 1, 1, crafted_a(4), crafted_opt(nil))
+	testing.expect(
+		t,
+		cookie_matches(&u, bare, without),
+		"a reply with no cookie, to a query that sent none, was turned away",
+	)
+	testing.expect(
+		t,
+		response_accepted(&u, bare, without),
+		"the gate turned away the only reply such a query could get",
+	)
+
+	// And the reverse still holds: a query that did carry one is owed one back.
+	asked := probe_query()
+	testing.expect(
+		t,
+		!cookie_matches(&u, asked, without),
+		"a reply with no cookie, to a query that sent one, was accepted",
+	)
 	free_all(context.temp_allocator)
 }

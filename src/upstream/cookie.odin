@@ -81,14 +81,16 @@ Whether a reply may be ours.
 
 Three ways a reply fails (RFC 7873 section 5.3): it echoes a client cookie that
 is not the one we sent, its COOKIE option is not a legal length, or it carries no
-cookie at all when this server has already shown it does cookies.
+cookie at all when one was sent to a server that has already shown it does
+cookies.
 
 That last one is the whole mechanism. A server we have never had a cookie from is
 one that does not implement them, and RFC 7873 has the exchange carry on without
 — but once it has issued one, accepting a reply with the option left off would
 make the check something an attacker opts out of at no cost: it would be back to
 guessing only the transaction ID and the source port, which is what the cookie
-was added to put out of reach.
+was added to put out of reach. It is asked of the query as well as of the
+upstream, though; see the comment on `expected` below.
 
 The option is read off the wire rather than off a decoded message, because a
 decode is a second, stricter test than the one the reply had to pass to get here.
@@ -103,15 +105,62 @@ walked that far carries no cookie as far as this is concerned, which is the
 answer that fails closed.
 */
 @(private)
-cookie_matches :: proc(u: ^Upstream, response: []u8) -> bool {
+cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	if u == nil || !cookies_wanted(u) {
 		return true
 	}
 	sync.mutex_lock(&u.mu)
 	echoed := u.cookie.client
-	// Having issued a cookie is what makes one owed on every reply after it.
-	expected := u.cookie.server_len > 0
+	held := u.cookie.server_len > 0
 	sync.mutex_unlock(&u.mu)
+
+	/*
+	A cookie is owed on a reply to a query that carried one, and only then.
+
+	Having been issued a server cookie is not enough on its own, because this
+	resolver does not put a cookie on every query it sends. `attach_cookie`
+	declines when the query has no OPT record to carry one - which is what a
+	client asking without EDNS produces - and a cookie-aware server answering a
+	query that carried no cookie correctly answers with no cookie of its own
+	(RFC 7873 section 5.2.1). Demanding one there rejects the only reply that
+	could ever have arrived, and the client gets a timeout and a servfail for a
+	name that resolves.
+
+	On the exchange itself this costs nothing. The cookie's value is that an
+	off-path attacker has to guess 64 bits it never saw, and that only ever
+	applied to exchanges where those bits were sent. On one carrying no cookie
+	there is nothing to guess and nothing to opt out of: forging a reply is
+	exactly as hard as it was before cookies existed, which is where every reply
+	from a cookie-less upstream already sits. What must not happen is the
+	reverse - a reply to a query that did carry a cookie being accepted without
+	one - and that is what `held` still governs.
+
+	The residual, stated plainly: which exchanges carry a cookie is decided by
+	the client, so a client that asks without EDNS gets an exchange with no
+	cookie protection on it, and with the cache on the answer it gets is the
+	answer everyone behind this server gets. Before this change that path failed
+	closed - but failing closed there meant never resolving the name at all, for
+	every stub that does not do EDNS, so it was not a defence anyone was
+	choosing.
+
+	The defence rather than the trade is to put an OPT record on the *upstream*
+	query even where the client sent none, and carry a cookie on it. What ruled
+	that out was that it negotiates EDNS on behalf of a client that did not ask
+	- but since #276 the upstream's OPT record does not reach the client at all
+	(`normalise_client_opt`), so the client need never see that it happened.
+	That is a change to what this server asks upstream and belongs in its own
+	review; this one is the availability half.
+	*/
+	// Behind `held`, so the walk happens only where its answer can change the
+	// outcome. `response_accepted` runs per received datagram, so on an
+	// upstream this server holds no cookie for - every cookie-less one - this
+	// would otherwise re-walk the query for each datagram of a spoofing flood
+	// to reach a verdict `held` had already settled.
+	expected := false
+	if held {
+		_, asked_with_cookie := dns.peek_edns_option(query, .Cookie)
+		expected = asked_with_cookie
+	}
 
 	raw, found := dns.peek_edns_option(response, .Cookie)
 	if !found {
