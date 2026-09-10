@@ -163,6 +163,10 @@ run_reload_cases :: proc(r: ^Runner) {
 			config = config_for_reload(udp_port, dot_port, doh_port, active_cert, active_key),
 			udp_port = udp_port,
 			dot_port = dot_port,
+			// Named because the profile cases below dial it: the listeners bind
+			// in sequence and doh is the last of them, so answering over dot
+			// says nothing yet about whether doh is up.
+			doh_port = doh_port,
 		},
 	)
 	if !ok {

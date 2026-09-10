@@ -229,13 +229,19 @@ profile_for_host :: proc(
 		sync.atomic_add(&p.refused_total, 1)
 		return nil, .Unavailable
 	}
-	host, port := tlsx.split_host_port(authority)
+	// Lowercased before anything else looks at it. The certificate check below
+	// is case-insensitive, as DNS names are, but everything after it - the cache
+	// key, the URL in the profile - is a byte comparison, so without this a
+	// client can spell one covered name a thousand ways and get a cache miss and
+	// a signature for each. See `profile_normalise_authority`.
+	key := profile_normalise_authority(authority)
+	host, port := tlsx.split_host_port(key)
 	if !tlsx.signer_covers_host(p.signer, host) || !profile_servable_port(p, port) {
 		sync.atomic_add(&p.unknown_total, 1)
 		return nil, .Unknown_Host
 	}
 
-	if entry := profile_cache_find(p, authority); entry != nil {
+	if entry := profile_cache_find(p, key); entry != nil {
 		p.clock += 1
 		entry.used = p.clock
 		// Asked for a second time, which is what takes it out of reach of the
@@ -248,14 +254,14 @@ profile_for_host :: proc(
 		return nil, .Unavailable
 	}
 
-	plist := build_doh_mobileconfig(authority, p.doh_path, context.temp_allocator)
+	plist := build_doh_mobileconfig(key, p.doh_path, context.temp_allocator)
 	signed, ok := tlsx.sign_cms(p.signer, transmute([]u8)plist, p.allocator)
 	if !ok {
 		sync.atomic_add(&p.refused_total, 1)
 		return nil, .Unavailable
 	}
 	sync.atomic_add(&p.signed_total, 1)
-	profile_cache_put(p, authority, signed)
+	profile_cache_put(p, key, signed)
 	return profile_served(p, signed, allocator)
 }
 
@@ -286,12 +292,60 @@ profile_served :: proc(
 }
 
 /*
+An authority in the one spelling this server will cache and sign for.
+
+A hostname is case-insensitive, and `X509_check_host` compares it that way, so
+`dns.example`, `DNS.EXAMPLE` and `dNs.eXaMpLe` are one name as far as the
+certificate is concerned. Everything downstream of that check compares bytes: the
+cache key, and the URL written into the profile. Left as they arrive, a client
+with one covered name has 2^n spellings of it, every one a cache miss and so a
+signature of its own - which is the signing budget drained by a client that never
+needed a profile, and a 503 for the device that did.
+
+Lowercasing the whole authority rather than the host alone is deliberate and
+safe: what follows the host is a port, which is digits, or the brackets and hex
+of an address literal, where lower case is the canonical spelling anyway.
+
+The input comes back unchanged when there is nothing to fold, which is every
+request a device makes, and also when the scratch allocation fails - a request
+served the way it would have been before is a better answer there than none.
+*/
+@(private)
+profile_normalise_authority :: proc(authority: string, allocator := context.temp_allocator) -> string {
+	folds := false
+	for i in 0 ..< len(authority) {
+		if authority[i] >= 'A' && authority[i] <= 'Z' {
+			folds = true
+			break
+		}
+	}
+	if !folds {
+		return authority
+	}
+	out, err := mem.make_aligned([]u8, len(authority), 1, allocator)
+	if err != nil {
+		return authority
+	}
+	for i in 0 ..< len(authority) {
+		c := authority[i]
+		out[i] = c + ('a' - 'A') if c >= 'A' && c <= 'Z' else c
+	}
+	return string(out)
+}
+
+/*
 Whether `port` is one this listener could have been reached on.
 
 Empty is the ordinary case - a device on 443 sends no port - and the listener's
 own port is the other. 443 is allowed explicitly as well, both because a client
 may spell out the default and because that is the port a deployment forwarding
 into a different internal one is reached at.
+
+Only the canonical decimal spelling of either, which is what the digits below are
+for: `strconv.parse_int` infers a base from an `0x`, `0o`, `0b` or `0z` prefix and
+is happy to read leading zeros, so left to it `:08443`, `:008443` and `:0x1bb` are
+all the port the listener is on - each one a distinct cache key and a distinct
+signature, carrying a URL into the profile that no device can dial.
 
 This is the host check's other half, and it is here for the same two reasons: a
 profile naming a port nothing answers on could not work on the device, and the
@@ -303,11 +357,18 @@ profile_servable_port :: proc(p: ^Profile_Signer, port: string) -> bool {
 	if port == "" {
 		return true
 	}
-	if port == "443" {
-		return true
+	// A port is at most five digits, and a leading zero is a second spelling of
+	// a number that already has one.
+	if len(port) > 5 || port[0] == '0' {
+		return false
 	}
-	n, ok := strconv.parse_int(port)
-	return ok && n == p.doh_port
+	for i in 0 ..< len(port) {
+		if port[i] < '0' || port[i] > '9' {
+			return false
+		}
+	}
+	n, ok := strconv.parse_int(port, 10)
+	return ok && (n == 443 || n == p.doh_port)
 }
 
 @(private)

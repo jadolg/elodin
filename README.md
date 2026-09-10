@@ -780,10 +780,12 @@ system-wide.
 The `ServerURL` inside is built from the authority the request arrived on, and
 that has to be one this listener could actually have been reached at: a host the
 DoH listener's certificate covers, on no port, port 443, or `listeners.doh.port`.
-Anything else gets a 400 rather than a profile the device could never use. (The
+Anything else gets a 400 rather than a profile the device could never use — and
+the port has to be written the ordinary way, in decimal with no leading zero. (The
 port rule means a deployment reached on a public port that is neither 443 nor the
-port elodin is bound to — a NAT forwarding 8443 to 9443, say — has to name that
-port in `listeners.doh.port` to have profiles signed for it.) A
+port elodin is bound to — a NAT forwarding 8443 to an elodin on 9443, say — gets a
+400 for that authority: bind elodin to the public port, or put the device on 443,
+since the URL a profile carries has to be one the device can dial.) A
 listener answering on several names hands each device a profile for the one it
 used. Its identifiers derive from the URL, so reinstalling replaces the profile
 rather than stacking a duplicate. Set `mobileconfig_path: ""` to withhold it; it

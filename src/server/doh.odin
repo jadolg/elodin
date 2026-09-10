@@ -516,7 +516,7 @@ serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 serve_doh_request :: proc(s: ^Server, conn: Conn, req: Http_Request_In, path: string, client: string) -> bool {
 	mc_path := s.cfg.listeners.doh.mobileconfig_path
 	if mc_path != "" && req.path == mc_path {
-		return serve_doh_mobileconfig(s, conn, req, path)
+		return serve_doh_mobileconfig(s, conn, req)
 	}
 	if req.path != path {
 		return send_http_error(conn, "doh", 404, "not found", req.keep_alive)
@@ -635,8 +635,9 @@ Serve the Apple .mobileconfig profile that points a device at this DoH endpoint.
 A GET, since a device downloads it by navigating to the URL; anything else is a
 405. The URL inside it is built from the request's own `Host` header, so a
 client that sends none - or one this server could not have a certificate for -
-gets a 400 rather than a profile naming a host that does not resolve. `doh_path`
-is `listeners.doh.path`, which is what the profile has the device query.
+gets a 400 rather than a profile naming a host that does not resolve. The path
+the profile has the device query is `listeners.doh.path`, which the signer was
+built with; nothing here has to be told it a second time.
 
 What comes back is signed with the listener's own certificate, so the device
 reports a profile it can verify rather than an unsigned one. `profile.odin` owns
@@ -645,7 +646,7 @@ refusals this endpoint could not have made before there was a signature to make
 them about.
 */
 @(private)
-serve_doh_mobileconfig :: proc(s: ^Server, conn: Conn, req: Http_Request_In, doh_path: string) -> bool {
+serve_doh_mobileconfig :: proc(s: ^Server, conn: Conn, req: Http_Request_In) -> bool {
 	if req.method != "GET" {
 		return send_http_error(conn, "doh", 405, "method not allowed", req.keep_alive)
 	}

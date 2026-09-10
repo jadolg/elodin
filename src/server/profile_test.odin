@@ -418,18 +418,20 @@ test_profile_still_serves_from_cache_with_no_budget_left :: proc(t: ^testing.T) 
 }
 
 /*
-A device that has been served keeps being served through a flood of authorities
-that differ only in an invented port.
+A flood of authorities that differ only in an invented port costs no signature at
+all, and the device being served is untouched by it.
 
 The port is part of the URL and so part of the cache key, and a client picks it -
-so a flood can mint distinct keys indefinitely while passing the certificate
-check, which only ever sees the host. Left alone that turns both defences into
-the attack: the flood evicts the entry a real device was being served from, and
-the budget it drained means the re-signing needed to replace that entry is
-refused. The device gets a 503 for a name the certificate covers.
+so without a bound on which ports are servable a flood mints distinct keys
+indefinitely while passing the certificate check, which only ever sees the host.
+That would turn both defences into the attack: the flood evicts the entry a real
+device was being served from, and the budget it drained means the re-signing
+needed to replace that entry is refused. So what is asserted here is the bound
+itself - every invented port is refused as an authority this listener could not
+have been reached at, before any of it reaches the cache or the budget.
 */
 @(test)
-test_profile_survives_a_flood_of_invented_ports :: proc(t: ^testing.T) {
+test_profile_refuses_a_flood_of_invented_ports :: proc(t: ^testing.T) {
 	p, ctx, ok := make_test_profile_signer(t)
 	if !ok {
 		return
@@ -443,19 +445,106 @@ test_profile_survives_a_flood_of_invented_ports :: proc(t: ^testing.T) {
 
 	// Ten seconds of a hundred a second, which outruns the refill by far more
 	// than it has to.
+	refused := 0
 	for tick in 0 ..< 10 {
 		for i in 0 ..< 100 {
-			authority := fmt.tprintf("elodin.local:%d", tick * 100 + i + 1)
-			profile_for_host(p, authority, start + i64(tick), context.temp_allocator)
+			// 1000 through 1999, so every one of these is a port the listener
+			// does not answer on: the test signer is on TEST_DOH_PORT, and 443
+			// is the only other.
+			authority := fmt.tprintf("elodin.local:%d", 1000 + tick * 100 + i)
+			_, status := profile_for_host(p, authority, start + i64(tick), context.temp_allocator)
+			if status == .Unknown_Host {
+				refused += 1
+			}
 		}
 	}
+	testing.expect_value(t, refused, 1000)
+	// Nothing beyond the device's own profile was ever signed, so the budget the
+	// device would need is untouched.
+	testing.expect_value(t, sync.atomic_load(&p.signed_total), u64(1))
 
 	// Asked in the same second as the last of the flood, which is the position a
 	// real device is in: there is no pause for the budget to refill in.
 	again, s2 := profile_for_host(p, "elodin.local", start + 9, context.temp_allocator)
 	testing.expect_value(t, s2, Profile_Status.OK)
-	testing.expect(t, len(again) > 0, "the device should still get its profile")
-	_ = wanted
+	testing.expect(t, bytes.equal(wanted, again), "the device should still get its profile")
+}
+
+/*
+One name spelled in several cases is one authority.
+
+A hostname is case-insensitive and the certificate check treats it that way, so
+every case variant of a covered name passes it. Everything after that compares
+bytes, so without folding the case first each variant is a cache miss with a
+signature behind it - and a name of a dozen characters has thousands of variants,
+which is a signing budget an unauthenticated client can hold at zero for as long
+as it likes. The device that then asks for a name the certificate covers, and has
+never been served, gets a 503.
+*/
+@(test)
+test_profile_folds_the_case_of_the_authority :: proc(t: ^testing.T) {
+	p, ctx, ok := make_test_profile_signer(t)
+	if !ok {
+		return
+	}
+	defer tlsx.context_destroy(ctx)
+	defer destroy_profile_signer(p)
+
+	now := at(0)
+	lower, s1 := profile_for_host(p, "elodin.local", now, context.temp_allocator)
+	testing.expect_value(t, s1, Profile_Status.OK)
+	for spelling in ([]string{"ELODIN.LOCAL", "eLoDiN.lOcAl", "Elodin.Local:8443"}) {
+		again, status := profile_for_host(p, spelling, now, context.temp_allocator)
+		testing.expectf(t, status == .OK, "%s should be served, got %v", spelling, status)
+		if spelling != "Elodin.Local:8443" {
+			testing.expectf(t, bytes.equal(lower, again), "%s should come from the cache", spelling)
+		}
+	}
+	// The three spellings of the bare name are one signature; the one naming the
+	// port is a second authority and so a second.
+	testing.expect_value(t, sync.atomic_load(&p.signed_total), u64(2))
+
+	held := 0
+	for entry in p.entries {
+		if len(entry.authority) > 0 {
+			held += 1
+		}
+	}
+	testing.expect_value(t, held, 2)
+}
+
+/*
+A port has one spelling, and the endpoint will not be talked into a second.
+
+`strconv.parse_int` reads a base out of an `0x`, `0o`, `0b` or `0z` prefix and
+takes leading zeros in its stride, so asked plainly it says `08443`, `008443` and
+`0x20fb` are all 8443. Each would be a distinct cache key with a signature behind
+it - the same unbounded supply the case folding above closes - and the profile it
+yielded would carry a URL no device can dial.
+*/
+@(test)
+test_profile_refuses_a_port_that_is_not_canonical_decimal :: proc(t: ^testing.T) {
+	p, ctx, ok := make_test_profile_signer(t)
+	if !ok {
+		return
+	}
+	defer tlsx.context_destroy(ctx)
+	defer destroy_profile_signer(p)
+
+	now := at(0)
+	for spelling in ([]string{"08443", "008443", "0x20fb", "0o20373", "0443", "8443 ", "+8443"}) {
+		authority := fmt.tprintf("elodin.local:%s", spelling)
+		_, status := profile_for_host(p, authority, now, context.temp_allocator)
+		testing.expectf(t, status == .Unknown_Host, "port %q should be refused, got %v", spelling, status)
+	}
+	testing.expect_value(t, sync.atomic_load(&p.signed_total), u64(0))
+
+	// The canonical spellings still work, so this is a bound on how a port may be
+	// written rather than on which ports are servable.
+	for authority in ([]string{"elodin.local", "elodin.local:443", "elodin.local:8443"}) {
+		_, status := profile_for_host(p, authority, now, context.temp_allocator)
+		testing.expectf(t, status == .OK, "%s should be served, got %v", authority, status)
+	}
 }
 
 /*
