@@ -288,3 +288,38 @@ test_retained_signer_outlives_its_context :: proc(t: ^testing.T) {
 	signed, sok := sign_cms(held, transmute([]u8)string(PROFILE), context.temp_allocator)
 	testing.expect(t, sok && len(signed) > 0, "and should still sign")
 }
+
+/*
+An authority is split into the host a certificate is asked about and the port it
+is not.
+
+The bracket cases are the ones worth pinning. Brackets are the URL spelling of an
+IP literal and of nothing else, so they come off `[::1]` and stay on
+`[elodin.local]` - unwrapping the second would match a certificate against
+`elodin.local` and then hand a device `https://[elodin.local]/dns-query`, an
+authority no client can resolve.
+*/
+@(test)
+test_split_host_port_unwraps_only_address_literals :: proc(t: ^testing.T) {
+	Case :: struct {
+		authority, host, port: string,
+	}
+	for c in ([]Case {
+			{"elodin.local", "elodin.local", ""},
+			{"elodin.local:8443", "elodin.local", "8443"},
+			{"[::1]", "::1", ""},
+			{"[::1]:8443", "::1", "8443"},
+			{"::1", "::1", ""},
+			{"127.0.0.1:8443", "127.0.0.1", "8443"},
+			// Not an address, so not a bracketed literal: left whole, which is
+			// what no certificate will cover.
+			{"[elodin.local]", "[elodin.local]", ""},
+			{"[elodin.local]:8443", "[elodin.local]:8443", ""},
+			// No closing bracket at all.
+			{"[::1", "[::1", ""},
+		}) {
+		host, port := split_host_port(c.authority)
+		testing.expectf(t, host == c.host, "%q: host %q, wanted %q", c.authority, host, c.host)
+		testing.expectf(t, port == c.port, "%q: port %q, wanted %q", c.authority, port, c.port)
+	}
+}

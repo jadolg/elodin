@@ -658,7 +658,7 @@ serve_doh_mobileconfig :: proc(s: ^Server, conn: Conn, req: Http_Request_In, doh
 	profile, status := profile_for_host(s.profiles, req.host, tlsx.unix_now(), context.temp_allocator)
 	switch status {
 	case .Unknown_Host:
-		return send_http_error(conn, "doh", 400, "no certificate for that host", req.keep_alive)
+		return send_http_error(conn, "doh", 400, "not a host and port this server serves", req.keep_alive)
 	case .Unavailable:
 		return send_http_error(conn, "doh", 503, "profile signing unavailable", req.keep_alive)
 	case .OK:

@@ -1,6 +1,7 @@
 package server
 
 import "core:mem"
+import "core:strconv"
 import "core:sync"
 import "elodin:logx"
 import "elodin:tlsx"
@@ -56,8 +57,9 @@ PROFILE_SIGN_RATE :: 4
 Profile_Status :: enum u8 {
 	// A signed profile, in the caller's allocator.
 	OK,
-	// Not a host this certificate covers, so not a profile that could work on
-	// the device. The endpoint answers 400.
+	// Not an authority this listener could have been reached at - a host the
+	// certificate does not cover, or a port it does not answer on. Either way
+	// not a profile that could work on the device. The endpoint answers 400.
 	Unknown_Host,
 	// There is nothing valid to sign with, or the budget to sign is spent. The
 	// endpoint answers 503.
@@ -72,6 +74,18 @@ Profile_Entry :: struct {
 	// When this entry was last handed out, on `Profile_Signer.clock`. The lowest
 	// is what an insertion into a full cache displaces.
 	used:      u64,
+	/*
+	Whether this entry has ever been served from the cache, as opposed to only
+	put there by the signing that created it.
+
+	It is what an eviction looks at first. An authority asked about once and
+	never again is the shape of a client working through a list of them, and an
+	authority asked about repeatedly is the shape of devices being set up
+	against the name their operator published. Preferring the first for
+	eviction means a run of the former cannot displace the latter, which is the
+	difference between a cache and a thing an unauthenticated client empties.
+	*/
+	established: bool,
 }
 
 Profile_Signer :: struct {
@@ -92,6 +106,9 @@ Profile_Signer :: struct {
 	// `listeners.doh.path`, which the profile has the device query. Borrowed
 	// from the configuration, which outlives this.
 	doh_path:      string,
+	// `listeners.doh.port`, one of the ports an authority may name. See
+	// `profile_servable_port`.
+	doh_port:      int,
 	entries:       [PROFILE_CACHE_ENTRIES]Profile_Entry,
 	clock:         u64,
 	tokens:        f64,
@@ -103,6 +120,11 @@ Profile_Signer :: struct {
 	// for the reading.
 	signed_total:  u64,
 	refused_total: u64,
+	// Counted apart from `refused_total` because the two say different things
+	// to an operator: this one is a name mismatch between the request and the
+	// certificate, which is a configuration answer, while a refusal is the
+	// endpoint declining to work at all.
+	unknown_total: u64,
 	allocator:     mem.Allocator,
 }
 
@@ -111,11 +133,13 @@ Profile_Signer :: struct {
 make_profile_signer :: proc(
 	ctx: ^tlsx.Context,
 	doh_path: string,
+	doh_port: int,
 	allocator := context.allocator,
 ) -> ^Profile_Signer {
 	p := new(Profile_Signer, allocator)
 	p.allocator = allocator
 	p.doh_path = doh_path
+	p.doh_port = doh_port
 	p.signer = tlsx.signer_retain(ctx.signer)
 	return p
 }
@@ -140,6 +164,9 @@ profile_signer_adopt :: proc(p: ^Profile_Signer, ctx: ^tlsx.Context) {
 	p.signer = held
 	profile_cache_clear(p)
 	p.budget_started = false
+	// A renewal can arrive with a key that signs nothing, and from here on the
+	// endpoint would answer 503 to everything with no line anywhere saying why.
+	warn_unsigned_profiles(p)
 }
 
 destroy_profile_signer :: proc(p: ^Profile_Signer) {
@@ -202,14 +229,18 @@ profile_for_host :: proc(
 		sync.atomic_add(&p.refused_total, 1)
 		return nil, .Unavailable
 	}
-	host, _ := tlsx.split_host_port(authority)
-	if !tlsx.signer_covers_host(p.signer, host) {
+	host, port := tlsx.split_host_port(authority)
+	if !tlsx.signer_covers_host(p.signer, host) || !profile_servable_port(p, port) {
+		sync.atomic_add(&p.unknown_total, 1)
 		return nil, .Unknown_Host
 	}
 
 	if entry := profile_cache_find(p, authority); entry != nil {
 		p.clock += 1
 		entry.used = p.clock
+		// Asked for a second time, which is what takes it out of reach of the
+		// eviction a run of one-off authorities causes.
+		entry.established = true
 		return profile_served(p, entry.profile, allocator)
 	}
 	if !profile_take_token(p, now_unix) {
@@ -254,6 +285,31 @@ profile_served :: proc(
 	return out, .OK
 }
 
+/*
+Whether `port` is one this listener could have been reached on.
+
+Empty is the ordinary case - a device on 443 sends no port - and the listener's
+own port is the other. 443 is allowed explicitly as well, both because a client
+may spell out the default and because that is the port a deployment forwarding
+into a different internal one is reached at.
+
+This is the host check's other half, and it is here for the same two reasons: a
+profile naming a port nothing answers on could not work on the device, and the
+port is part of the URL and so part of the cache key, so without a bound on it a
+client can mint distinct profiles to sign for as long as it likes.
+*/
+@(private)
+profile_servable_port :: proc(p: ^Profile_Signer, port: string) -> bool {
+	if port == "" {
+		return true
+	}
+	if port == "443" {
+		return true
+	}
+	n, ok := strconv.parse_int(port)
+	return ok && n == p.doh_port
+}
+
 @(private)
 profile_cache_find :: proc(p: ^Profile_Signer, authority: string) -> ^Profile_Entry {
 	for &entry in p.entries {
@@ -268,21 +324,40 @@ profile_cache_find :: proc(p: ^Profile_Signer, authority: string) -> ^Profile_En
 // longest ago when there is no free slot.
 @(private)
 profile_cache_put :: proc(p: ^Profile_Signer, authority: string, signed: []u8) {
-	victim: ^Profile_Entry
-	for &entry in p.entries {
-		if len(entry.authority) == 0 {
-			victim = &entry
-			break
-		}
-		if victim == nil || entry.used < victim.used {
-			victim = &entry
-		}
-	}
+	victim := profile_cache_victim(p)
 	profile_entry_release(p, victim)
 	p.clock += 1
 	victim.authority = profile_clone_string(authority, p.allocator)
 	victim.profile = signed
 	victim.used = p.clock
+}
+
+/*
+The slot a new entry takes: a free one, else the least recently used entry that
+has never been asked for twice, else the least recently used of all.
+
+The middle case is the whole point. A client working through invented authorities
+fills the cache with entries nothing ever comes back for, and plain
+least-recently-used would let that run displace the entry a real device is being
+served from - turning the cache into the thing that denies it. Entries that have
+been asked for again are only reached once there is nothing else to take.
+*/
+@(private)
+profile_cache_victim :: proc(p: ^Profile_Signer) -> ^Profile_Entry {
+	cold: ^Profile_Entry
+	oldest: ^Profile_Entry
+	for &entry in p.entries {
+		if len(entry.authority) == 0 {
+			return &entry
+		}
+		if !entry.established && (cold == nil || entry.used < cold.used) {
+			cold = &entry
+		}
+		if oldest == nil || entry.used < oldest.used {
+			oldest = &entry
+		}
+	}
+	return cold if cold != nil else oldest
 }
 
 @(private)
@@ -323,11 +398,13 @@ profile_take_token :: proc(p: ^Profile_Signer, now_unix: i64) -> bool {
 
 // What the metrics endpoint reports. Read without the lock: these are counters
 // whose readers want a recent value rather than one consistent with each other.
-profile_signer_stats :: proc(p: ^Profile_Signer) -> (signed, refused: u64) {
+profile_signer_stats :: proc(p: ^Profile_Signer) -> (signed, refused, unknown: u64) {
 	if p == nil {
-		return 0, 0
+		return 0, 0, 0
 	}
-	return sync.atomic_load(&p.signed_total), sync.atomic_load(&p.refused_total)
+	return sync.atomic_load(&p.signed_total),
+		sync.atomic_load(&p.refused_total),
+		sync.atomic_load(&p.unknown_total)
 }
 
 // The counterpart to what `start_doh` builds, in the shape the rest of the
@@ -337,13 +414,43 @@ stop_profile_signer :: proc(s: ^Server) {
 	s.profiles = nil
 }
 
-// Said once at startup, where an operator can still do something about it: a
-// context with no usable identity serves 503 from this endpoint forever.
+// A payload with no meaning beyond being something to sign: what the probe below
+// asks is whether the key can produce a CMS structure at all, not what is in it.
+@(private)
+PROFILE_SIGN_PROBE :: "elodin"
+
+/*
+Said where an operator can still do something about it, at startup and again
+whenever the identity is replaced.
+
+Two ways this endpoint can be dead on arrival, and neither announces itself: a
+context that yielded no certificate and key, and a key CMS cannot sign with at
+all - an Ed25519 certificate, say, which TLS is perfectly happy to serve and
+which `CMS_sign` refuses for want of a default digest. Both answer every request
+503, which is the same 503 an expired certificate and a spent budget give, so
+`elodin_mobileconfig_refused_total` climbing says nothing about which.
+
+The second is only learnable by trying, and trying once answers it for every
+request that follows: whether `CMS_sign` works is a property of the key rather
+than of the request.
+*/
 @(private)
 warn_unsigned_profiles :: proc(p: ^Profile_Signer) {
-	if p != nil && !tlsx.signer_present(p.signer) {
+	if p == nil {
+		return
+	}
+	if !tlsx.signer_present(p.signer) {
 		logx.errorf(
 			"listeners.doh: the certificate did not yield a signing identity, the .mobileconfig endpoint will not answer",
 		)
+		return
 	}
+	probe, ok := tlsx.sign_cms(p.signer, transmute([]u8)string(PROFILE_SIGN_PROBE), context.temp_allocator)
+	if !ok {
+		logx.errorf(
+			"listeners.doh: the certificate's key cannot sign a CMS structure (an Ed25519 key cannot), the .mobileconfig endpoint will answer 503 to everything",
+		)
+		return
+	}
+	delete(probe, context.temp_allocator)
 }

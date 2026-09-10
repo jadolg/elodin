@@ -497,16 +497,19 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 	)
 
 	/*
-	Only on a server that serves the profile, so the two lines appearing at all
-	says the endpoint is on.
+	Only on a server that serves the profile, so the lines appearing at all says
+	the endpoint is on.
 
-	`refused` is the one worth an alert. Its ordinary value is zero, and the way
-	it stops being zero without anybody doing anything is a certificate that has
-	gone out of its validity window - at which point the endpoint serves nothing
-	rather than a profile signed with it, and this is the only thing that says so.
+	Two failure series rather than one, because the two are answered differently.
+	`refused` is the endpoint declining to work: a certificate outside its
+	validity window, or a spent signing budget. `unknown` is a request naming a
+	host the certificate does not cover, which is a 400 and usually means a
+	renewal dropped a name that devices are still asking for. Both sit at zero on
+	a healthy server and both can start climbing with nobody having touched
+	anything, which is what makes them worth an alert.
 	*/
 	if s.profiles != nil {
-		signed, refused := profile_signer_stats(s.profiles)
+		signed, refused, unknown := profile_signer_stats(s.profiles)
 		metrics.scalar(
 			&b,
 			"elodin_mobileconfig_signed_total",
@@ -520,6 +523,13 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 			.Counter,
 			"Profile requests answered 503: the certificate was outside its validity window, or the signing budget was spent.",
 			refused,
+		)
+		metrics.scalar(
+			&b,
+			"elodin_mobileconfig_unknown_host_total",
+			.Counter,
+			"Profile requests answered 400 because the listener's certificate does not cover the host they named.",
+			unknown,
 		)
 	}
 

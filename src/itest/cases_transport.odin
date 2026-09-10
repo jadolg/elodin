@@ -486,6 +486,26 @@ run_transport_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	/*
+	A port this listener does not answer on is refused, like a host it has no
+	certificate for.
+
+	The port is part of the URL the profile carries and so part of what is cached
+	and signed, and a client picks it. Bounding it to the ports this server can
+	actually be reached at is what stops a client minting distinct profiles to
+	sign for as long as it cares to.
+	*/
+	start_case(r, "doh: the Apple profile refuses a port this listener does not answer on")
+	{
+		res := doh_raw(
+			doh_port,
+			"GET /apple-doh.mobileconfig HTTP/1.1\r\nHost: elodin.local:1\r\nConnection: close\r\n\r\n",
+		)
+		check(r, res.ok, "no HTTP response")
+		check_eq_int(r, res.status, 400, "status")
+	}
+	end_case(r)
+
 	start_case(r, "doh: the Apple profile path is GET-only")
 	{
 		res := doh_raw(

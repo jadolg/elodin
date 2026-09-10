@@ -226,11 +226,21 @@ The host may be a bracketed IPv6 literal, whose colons are not port separators,
 so the last colon is only a port when it follows the closing bracket. The
 brackets themselves are stripped: what a certificate carries is the address, not
 the URL spelling of it.
+
+Brackets around anything that is not an address are left where they are, and the
+authority comes back whole. They are the URL spelling of an IP literal and of
+nothing else, so `[name]` is not a name with brackets on it - unwrapping it would
+let a caller match `name` against a certificate and then go on to use an
+authority no client can resolve.
 */
 split_host_port :: proc(authority: string) -> (host: string, port: string) {
 	if strings.has_prefix(authority, "[") {
 		if end := strings.index_byte(authority, ']'); end >= 0 {
-			host = authority[1:end]
+			inner := authority[1:end]
+			if net.parse_address(inner) == nil {
+				return authority, ""
+			}
+			host = inner
 			rest := authority[end + 1:]
 			if strings.has_prefix(rest, ":") {
 				port = rest[1:]

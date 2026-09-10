@@ -1333,7 +1333,7 @@ start_doh :: proc(s: ^Server, l: ^Listeners) -> bool {
 	}
 	l.doh_ctx = ctx
 	if cfg.mobileconfig_path != "" {
-		s.profiles = make_profile_signer(ctx, cfg.path)
+		s.profiles = make_profile_signer(ctx, cfg.path, cfg.port)
 		warn_unsigned_profiles(s.profiles)
 	}
 	if !start_stream_listener(s, l, cfg, .DoH, &l.doh_socket, &l.doh_open) {

@@ -383,6 +383,10 @@ test_profile_counters_reach_the_endpoint :: proc(t: ^testing.T) {
 
 	_, status := profile_for_host(signer, "elodin.local", tlsx.unix_now(), context.temp_allocator)
 	testing.expect_value(t, status, Profile_Status.OK)
+	// A host the certificate does not cover: a 400, counted on its own series so
+	// a renewal that dropped a name is not read as the endpoint breaking down.
+	_, unknown := profile_for_host(signer, "dns.example", tlsx.unix_now(), context.temp_allocator)
+	testing.expect_value(t, unknown, Profile_Status.Unknown_Host)
 	// A year past a certificate minted for thirty days: refused, and counted.
 	_, expired := profile_for_host(
 		signer,
@@ -400,4 +404,5 @@ test_profile_counters_reach_the_endpoint :: proc(t: ^testing.T) {
 
 	expect_line(t, page, "elodin_mobileconfig_signed_total 1")
 	expect_line(t, page, "elodin_mobileconfig_refused_total 1")
+	expect_line(t, page, "elodin_mobileconfig_unknown_host_total 1")
 }

@@ -412,7 +412,7 @@ build_h2_mobileconfig :: proc(ctx: ^H2_Context, req: ^h2.Request) -> (resp: h2.R
 	)
 	switch status {
 	case .Unknown_Host:
-		return h2_error(400, "no certificate for that host"), true
+		return h2_error(400, "not a host and port this server serves"), true
 	case .Unavailable:
 		return h2_error(503, "profile signing unavailable"), true
 	case .OK:
