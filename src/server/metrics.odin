@@ -528,7 +528,7 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 			&b,
 			"elodin_mobileconfig_unknown_host_total",
 			.Counter,
-			"Profile requests answered 400 because the listener's certificate does not cover the host they named.",
+			"Profile requests answered 400: an authority this listener could not have been reached at - a host the certificate does not cover, or a port it does not answer on.",
 			unknown,
 		)
 	}

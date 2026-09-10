@@ -317,6 +317,19 @@ test_split_host_port_unwraps_only_address_literals :: proc(t: ^testing.T) {
 			{"[elodin.local]:8443", "[elodin.local]:8443", ""},
 			// No closing bracket at all.
 			{"[::1", "[::1", ""},
+			// Brackets are the URL spelling of an IPv6 literal alone. `[1.2.3.4]`
+			// is not an authority a client can dial, so the address inside it is
+			// not one to match a certificate against.
+			{"[127.0.0.1]", "[127.0.0.1]", ""},
+			{"[127.0.0.1]:8443", "[127.0.0.1]:8443", ""},
+			// Anything trailing the bracket is part of the authority and not part
+			// of the address: unwrapping these would take one address to be an
+			// unbounded set of spellings of itself.
+			{"[::1]x", "[::1]x", ""},
+			{"[::1]x:8443", "[::1]x:8443", ""},
+			// A separator with no port after it is a second spelling of no port.
+			{"[::1]:", "[::1]:", ""},
+			{"elodin.local:", "elodin.local:", ""},
 		}) {
 		host, port := split_host_port(c.authority)
 		testing.expectf(t, host == c.host, "%q: host %q, wanted %q", c.authority, host, c.host)

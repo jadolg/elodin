@@ -588,44 +588,60 @@ test_profile_refuses_an_unbracketed_address_literal :: proc(t: ^testing.T) {
 }
 
 /*
-An authority devices keep asking for is not evicted by a run of authorities asked
-for once each.
+Only the exact bracketed form is an address literal, and every other authority
+carrying a bracket is refused.
 
-The port bound puts a ceiling on what a client can invent against an ordinary
-certificate, but a wildcard SAN has no such ceiling - every name under it is one
-the certificate covers. What stands in the way there is the eviction order: the
-entry a real device is served from has been asked for more than once, and the
-flood's entries never are, so the flood can only ever displace its own.
+The bracket is what tells the host apart from the rest of the authority, so a
+caller that reads it loosely reads a host out of something that is not one. Three
+shapes here, and each would have been signed:
 
-Asked at the end in the same second as the last of the flood, where there is no
-budget left to sign a replacement with - so a cache that had let the entry go
-would have to answer 503.
+  - `[::1]x` and `[::1]x:8443` - the suffix is dropped on the way to the
+    certificate and kept on the way into the cache key and the URL. That is one
+    address covered by the certificate and an unbounded supply of authorities
+    naming it, each a cache entry and a signature of its own, and each a profile
+    pointing a device at an authority it cannot dial.
+  - `[127.0.0.1]` - brackets are the URL spelling of an IPv6 literal and of
+    nothing else, so this is not a second spelling of `127.0.0.1` but an
+    authority no client can dial, from a certificate that covers the address
+    without them.
+  - `[::1]:` - a port separator with nothing after it, which is a second
+    spelling of `[::1]` and so a second signature for a profile already held.
+
+The certificate these run against carries `IP:127.0.0.1` and `IP:::1`, so the
+name check cannot be what refuses them: it is the shape of the authority that is
+being asserted on, and `signed_total` is what says so.
 */
 @(test)
-test_established_profile_survives_a_flood_of_new_hosts :: proc(t: ^testing.T) {
-	p, ctx, ok := make_test_wildcard_signer(t)
+test_profile_refuses_a_malformed_bracketed_authority :: proc(t: ^testing.T) {
+	p, ctx, ok := make_test_profile_signer(t)
 	if !ok {
 		return
 	}
 	defer tlsx.context_destroy(ctx)
 	defer destroy_profile_signer(p)
 
-	start := at(0)
-	wanted, s1 := profile_for_host(p, "wanted.elodin.test", start, context.temp_allocator)
-	testing.expect_value(t, s1, Profile_Status.OK)
-	// A second device asking for the same name, which is what marks it as one
-	// being asked for rather than one merely tried.
-	_, s2 := profile_for_host(p, "wanted.elodin.test", start, context.temp_allocator)
-	testing.expect_value(t, s2, Profile_Status.OK)
-
-	for tick in 0 ..< 20 {
-		for i in 0 ..< 20 {
-			authority := fmt.tprintf("h%d-%d.elodin.test", tick, i)
-			profile_for_host(p, authority, start + i64(tick), context.temp_allocator)
-		}
+	now := at(0)
+	for authority in ([]string{"[::1]x", "[::1]x:8443", "[127.0.0.1]", "[127.0.0.1]:8443", "[::1]:"}) {
+		_, status := profile_for_host(p, authority, now, context.temp_allocator)
+		testing.expectf(
+			t,
+			status == .Unknown_Host,
+			"%q should be refused, got %v",
+			authority,
+			status,
+		)
 	}
+	// An empty port on an ordinary name is the same second spelling, and the
+	// same second signature.
+	_, trailing := profile_for_host(p, "elodin.local:", now, context.temp_allocator)
+	testing.expect_value(t, trailing, Profile_Status.Unknown_Host)
+	testing.expect_value(t, sync.atomic_load(&p.signed_total), u64(0))
 
-	again, s3 := profile_for_host(p, "wanted.elodin.test", start + 19, context.temp_allocator)
-	testing.expect_value(t, s3, Profile_Status.OK)
-	testing.expect(t, bytes.equal(wanted, again), "it should still be the profile that was signed, from the cache")
+	// The forms that are authorities still are, so this bounds how an address may
+	// be spelled and not which addresses are servable.
+	_, plain := profile_for_host(p, "[::1]", now, context.temp_allocator)
+	testing.expect_value(t, plain, Profile_Status.OK)
+	_, ported := profile_for_host(p, "127.0.0.1:8443", now, context.temp_allocator)
+	testing.expect_value(t, ported, Profile_Status.OK)
 }
+

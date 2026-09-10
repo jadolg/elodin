@@ -227,31 +227,46 @@ so the last colon is only a port when it follows the closing bracket. The
 brackets themselves are stripped: what a certificate carries is the address, not
 the URL spelling of it.
 
-Brackets around anything that is not an address are left where they are, and the
-authority comes back whole. They are the URL spelling of an IP literal and of
-nothing else, so `[name]` is not a name with brackets on it - unwrapping it would
-let a caller match `name` against a certificate and then go on to use an
-authority no client can resolve.
+Nothing is unwrapped unless the authority is exactly the bracketed form, which is
+`[` an IPv6 address `]` and then nothing or `:` a port. Three things are turned
+away by that, and the reason is the same one each time - whatever is dropped here
+is still in the caller's cache key and in the URL it writes into a profile:
+
+  - brackets around something that is not an IPv6 address. They are the URL
+    spelling of an IPv6 literal and of nothing else, so `[name]` is not a name
+    with brackets on it and `[1.2.3.4]` is not an authority a client can dial.
+    Unwrapping either would let a caller match the inside against a certificate
+    and then go on to use an authority no client can resolve.
+  - anything trailing the closing bracket. `[::1]x` is not `::1`, and a caller
+    that took it for `::1` would sign a profile per suffix - an unbounded set of
+    spellings of one address, each its own cache entry.
+  - an empty port. `host:` and `[::1]:` are second spellings of `host` and
+    `[::1]`, and a second spelling is a second signature.
+
+A rejected authority comes back whole as the host, which is a name no certificate
+answers for - so the caller's existing name check is what refuses it.
 */
 split_host_port :: proc(authority: string) -> (host: string, port: string) {
 	if strings.has_prefix(authority, "[") {
-		if end := strings.index_byte(authority, ']'); end >= 0 {
-			inner := authority[1:end]
-			if net.parse_address(inner) == nil {
-				return authority, ""
-			}
-			host = inner
-			rest := authority[end + 1:]
-			if strings.has_prefix(rest, ":") {
-				port = rest[1:]
-			}
-			return host, port
+		end := strings.index_byte(authority, ']')
+		if end < 0 {
+			return authority, ""
+		}
+		inner := authority[1:end]
+		if _, is_v6 := net.parse_address(inner).(net.IP6_Address); !is_v6 {
+			return authority, ""
+		}
+		switch rest := authority[end + 1:]; {
+		case rest == "":
+			return inner, ""
+		case len(rest) > 1 && rest[0] == ':':
+			return inner, rest[1:]
 		}
 		return authority, ""
 	}
 	if idx := strings.last_index_byte(authority, ':'); idx >= 0 {
 		// A bare IPv6 literal has several colons and no port at all.
-		if strings.index_byte(authority, ':') == idx {
+		if strings.index_byte(authority, ':') == idx && idx + 1 < len(authority) {
 			return authority[:idx], authority[idx + 1:]
 		}
 	}

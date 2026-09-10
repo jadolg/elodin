@@ -74,30 +74,6 @@ Profile_Entry :: struct {
 	// When this entry was last handed out, on `Profile_Signer.clock`. The lowest
 	// is what an insertion into a full cache displaces.
 	used:      u64,
-	/*
-	Whether this entry has ever been served from the cache, as opposed to only
-	put there by the signing that created it.
-
-	It is what an eviction looks at first. An authority asked about once and
-	never again is the shape of a client working through a list of them, and an
-	authority asked about repeatedly is the shape of devices being set up
-	against the name their operator published. Preferring the first for eviction
-	means a casual run of the former cannot displace the latter.
-
-	It is a heuristic about traffic and not a defence against a client that has
-	read this file: repetition is the client's to choose, so one that asks for
-	each invented authority twice marks every slot established and puts the cache
-	back on plain least-recently-used. What that costs is bounded elsewhere and
-	deliberately - the certificate bounds which hosts can be asked about at all,
-	the port rule and the two normalisations bound how many ways each can be
-	spelled, and the budget bounds the rate - so the residue is a certificate
-	whose SAN is a wildcard or an address, under sustained attack, where a device
-	whose authority is not currently cached can be refused for as long as it
-	lasts. Resolution is untouched throughout; what is refused is a profile
-	download. Closing that last gap means telling one client from another, which
-	this endpoint does not do.
-	*/
-	established: bool,
 }
 
 Profile_Signer :: struct {
@@ -258,9 +234,6 @@ profile_for_host :: proc(
 	if entry := profile_cache_find(p, key); entry != nil {
 		p.clock += 1
 		entry.used = p.clock
-		// Asked for a second time, which is what takes it out of reach of the
-		// eviction a run of one-off authorities causes.
-		entry.established = true
 		return profile_served(p, entry.profile, allocator)
 	}
 	if !profile_take_token(p, now_unix) {
@@ -436,31 +409,36 @@ profile_cache_put :: proc(p: ^Profile_Signer, authority: string, signed: []u8) {
 }
 
 /*
-The slot a new entry takes: a free one, else the least recently used entry that
-has never been asked for twice, else the least recently used of all.
+The slot a new entry takes: a free one, else the one handed out longest ago.
 
-The middle case is the whole point. A client working through invented authorities
-fills the cache with entries nothing ever comes back for, and plain
-least-recently-used would let that run displace the entry a real device is being
-served from - turning the cache into the thing that denies it. Entries that have
-been asked for again are only reached once there is nothing else to take.
+Plainly least-recently-used, and not more than that. What was here before
+preferred entries nothing had come back for, on the theory that a flood of
+invented authorities is made of those and a real device's is not - but which
+entries get asked for twice is the client's to decide, so a flood that repeats
+itself marked every slot and the preference evaporated exactly when it was
+wanted. A rule that holds only against an attacker who has not read it is worse
+than none: it reads as a defence in the code and is not one.
+
+What actually bounds this endpoint is upstream of the cache - the certificate
+decides which hosts may be asked about, the port rule and the two normalisations
+decide how many ways each may be spelled, and the budget decides how fast. On an
+ordinary certificate those leave a working set of a handful, which fits here many
+times over. On a wildcard or address SAN they do not, and a sustained flood can
+push a device's entry out and refuse the re-signing; see the README, which says
+so.
 */
 @(private)
 profile_cache_victim :: proc(p: ^Profile_Signer) -> ^Profile_Entry {
-	cold: ^Profile_Entry
 	oldest: ^Profile_Entry
 	for &entry in p.entries {
 		if len(entry.authority) == 0 {
 			return &entry
 		}
-		if !entry.established && (cold == nil || entry.used < cold.used) {
-			cold = &entry
-		}
 		if oldest == nil || entry.used < oldest.used {
 			oldest = &entry
 		}
 	}
-	return cold if cold != nil else oldest
+	return oldest
 }
 
 @(private)
