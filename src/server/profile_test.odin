@@ -84,7 +84,10 @@ generate_certs :: proc() {
 @(private = "file")
 make_cert :: proc(cert, key: string, name := "") -> bool {
 	subject := "/CN=elodin.local"
-	san := "subjectAltName=DNS:elodin.local,DNS:localhost,IP:127.0.0.1"
+	// The IPv6 SAN is what `test_profile_refuses_an_unbracketed_address_literal`
+	// needs: without an address the certificate covers, that case would be
+	// refused by the name check and would say nothing about the spelling rule.
+	san := "subjectAltName=DNS:elodin.local,DNS:localhost,IP:127.0.0.1,IP:::1"
 	if name != "" {
 		subject = fmt.tprintf("/CN=%s", name)
 		san = fmt.tprintf("subjectAltName=DNS:%s", name)
@@ -545,6 +548,43 @@ test_profile_refuses_a_port_that_is_not_canonical_decimal :: proc(t: ^testing.T)
 		_, status := profile_for_host(p, authority, now, context.temp_allocator)
 		testing.expectf(t, status == .OK, "%s should be served, got %v", authority, status)
 	}
+}
+
+/*
+An address literal is signed for in the one spelling a device can dial.
+
+`::1` and `[::1]` are the same address as far as the certificate is concerned -
+`X509_check_ip_asc` parses both to the same bytes - but only one of them is an
+authority. A profile built from the bare form would carry `https://::1/dns-query`,
+which is not a URL any client can resolve, so the device that installed it would
+resolve through nothing at all; it would also be a second cache key and a second
+signature for an endpoint already held under the first.
+*/
+@(test)
+test_profile_refuses_an_unbracketed_address_literal :: proc(t: ^testing.T) {
+	p, ctx, ok := make_test_profile_signer(t)
+	if !ok {
+		return
+	}
+	defer tlsx.context_destroy(ctx)
+	defer destroy_profile_signer(p)
+
+	now := at(0)
+	_, bare := profile_for_host(p, "::1", now, context.temp_allocator)
+	testing.expect_value(t, bare, Profile_Status.Unknown_Host)
+	_, with_port := profile_for_host(p, "::1:8443", now, context.temp_allocator)
+	testing.expect_value(t, with_port, Profile_Status.Unknown_Host)
+	testing.expect_value(t, sync.atomic_load(&p.signed_total), u64(0))
+
+	// The bracketed spelling of the same address is served, so this is a bound on
+	// how an address may be written and not on which addresses are servable.
+	profile, bracketed := profile_for_host(p, "[::1]:8443", now, context.temp_allocator)
+	testing.expect_value(t, bracketed, Profile_Status.OK)
+	testing.expect(
+		t,
+		bytes.contains(profile, transmute([]u8)string("https://[::1]:8443/dns-query")),
+		"the profile should carry the authority in the form a device can dial",
+	)
 }
 
 /*

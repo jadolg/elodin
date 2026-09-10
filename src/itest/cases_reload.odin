@@ -219,10 +219,22 @@ run_reload_cases :: proc(r: ^Runner) {
 				!dot_handshake_verifies(dot_port, cert_a, "reload-a.test"),
 				"the old certificate is still being served after reload",
 			)
-			// Polled, not read once: the handshake above goes through the moment
-			// the context is swapped, and the log line the reload writes can reach
-			// the file a beat later, so a single read races it on a loaded runner.
-			check(r, wait_for_log(&srv, "reloaded the certificate", 2 * time.Second), "no reload was logged")
+			/*
+			Polled, not read once: the handshake above goes through the moment
+			the context is swapped, and the log line the reload writes can reach
+			the file a beat later, so a single read races it on a loaded runner.
+
+			Named for the doh listener rather than for either: `reload_tls` takes
+			the listeners in order and doh is the second of them, so the dot
+			handshake above says nothing yet about the doh context - or about the
+			profile signer, which `reload_tls_ctx` hands the new identity to just
+			before writing this line. The profile cases below depend on both.
+			*/
+			check(
+				r,
+				wait_for_log(&srv, "listeners.doh: reloaded the certificate", 2 * time.Second),
+				"no reload was logged",
+			)
 		}
 	}
 	end_case(r)

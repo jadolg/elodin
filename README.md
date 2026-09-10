@@ -803,9 +803,19 @@ the signer against its own trust store:
   It still installs.
 
 While the certificate is outside its validity window the endpoint answers 503
-rather than handing out a profile signed with it. Signing is also rate limited
-and the signed profiles are cached per host, so the endpoint cannot be used to
-make the server do public-key work on demand.
+rather than handing out a profile signed with it.
+
+Signing is rate limited and the signed profiles are cached, and what a client may
+ask to have signed is bounded from several directions: only hosts the certificate
+covers, only on a port this listener answers on, and only in one spelling of each
+— the authority is lowercased and the port has to be plain decimal. On an ordinary
+certificate that leaves a handful of authorities, all of them cached.
+
+A certificate whose SAN is a wildcard or an IP address has no such ceiling on the
+hosts it covers, and there the rate limit is what remains. Under a sustained flood
+a device whose authority is not already cached can be refused with a 503 until it
+stops. Resolution is unaffected — it is the profile download that is refused, and
+only while the flood lasts.
 
 ### DNSSEC
 

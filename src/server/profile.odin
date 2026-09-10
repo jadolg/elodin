@@ -81,9 +81,21 @@ Profile_Entry :: struct {
 	It is what an eviction looks at first. An authority asked about once and
 	never again is the shape of a client working through a list of them, and an
 	authority asked about repeatedly is the shape of devices being set up
-	against the name their operator published. Preferring the first for
-	eviction means a run of the former cannot displace the latter, which is the
-	difference between a cache and a thing an unauthenticated client empties.
+	against the name their operator published. Preferring the first for eviction
+	means a casual run of the former cannot displace the latter.
+
+	It is a heuristic about traffic and not a defence against a client that has
+	read this file: repetition is the client's to choose, so one that asks for
+	each invented authority twice marks every slot established and puts the cache
+	back on plain least-recently-used. What that costs is bounded elsewhere and
+	deliberately - the certificate bounds which hosts can be asked about at all,
+	the port rule and the two normalisations bound how many ways each can be
+	spelled, and the budget bounds the rate - so the residue is a certificate
+	whose SAN is a wildcard or an address, under sustained attack, where a device
+	whose authority is not currently cached can be refused for as long as it
+	lasts. Resolution is untouched throughout; what is refused is a profile
+	download. Closing that last gap means telling one client from another, which
+	this endpoint does not do.
 	*/
 	established: bool,
 }
@@ -236,7 +248,9 @@ profile_for_host :: proc(
 	// a signature for each. See `profile_normalise_authority`.
 	key := profile_normalise_authority(authority)
 	host, port := tlsx.split_host_port(key)
-	if !tlsx.signer_covers_host(p.signer, host) || !profile_servable_port(p, port) {
+	if !profile_dialable_authority(key, host) ||
+	   !tlsx.signer_covers_host(p.signer, host) ||
+	   !profile_servable_port(p, port) {
 		sync.atomic_add(&p.unknown_total, 1)
 		return nil, .Unknown_Host
 	}
@@ -331,6 +345,34 @@ profile_normalise_authority :: proc(authority: string, allocator := context.temp
 		out[i] = c + ('a' - 'A') if c >= 'A' && c <= 'Z' else c
 	}
 	return string(out)
+}
+
+/*
+Whether the authority is one a device could dial back.
+
+`split_host_port` leaves an unbracketed IPv6 literal whole - none of the colons
+in `::1` is a port separator, so it is a host with no port - and a certificate
+carrying that address as an IP SAN answers for it quite happily. The URL built
+from it would not: a URL spells an IPv6 address in brackets, so `https://::1/`
+is not an authority any client can dial, and a device handed that profile would
+resolve through nothing. The bracketed spelling of the same address goes
+through, which makes this a bound on how an address may be written rather than
+on which addresses are servable - the same shape as the port rule below, and the
+other half of `split_host_port` refusing to unwrap `[elodin.local]`.
+*/
+@(private)
+profile_dialable_authority :: proc(key: string, host: string) -> bool {
+	if len(key) > 0 && key[0] == '[' {
+		return true
+	}
+	// The only way a colon survives into the host is an authority whose colons
+	// were all part of an address literal.
+	for i in 0 ..< len(host) {
+		if host[i] == ':' {
+			return false
+		}
+	}
+	return true
 }
 
 /*
