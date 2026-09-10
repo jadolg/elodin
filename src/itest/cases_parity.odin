@@ -815,11 +815,27 @@ parity_additional_dropped_case :: proc(r: ^Runner) {
 		client_udp_limit  = PARITY_286_CEILING,
 	}
 	c := parity_compare(q, reference, res.wire, policy)
+	/*
+	Both halves of it: nothing unexplained, and the record that went missing
+	explained by the allowance this case is about rather than by one of the
+	others happening to cover it.
+	*/
+	named := 0
 	for d in c.diffs {
 		if d.reason == "" {
 			fail(r, "%s: upstream %s, elodin %s", d.what, d.upstream, d.elodin)
+			continue
+		}
+		if d.kind == .Additional && strings.contains(d.reason, "RFC 2181 section 9") {
+			named += 1
 		}
 	}
+	check(
+		r,
+		named == 1,
+		"%d of the allowed differences say the record did not fit the datagram, not one",
+		named,
+	)
 }
 
 /*
