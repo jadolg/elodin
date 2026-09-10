@@ -825,18 +825,22 @@ pc_opt_contents :: proc(c: ^Parity_Compare, q: Parity_Query, up, el: Pw_Msg, pol
 				continue
 			}
 			/*
-			A code this server never writes for itself has no business being
-			here at all, whatever it now says.
+			A code this server would not have written into *this* answer has no
+			business being here at all, whatever it now says.
 
 			Byte equality is not the test, and was: an option can cross
-			half-rewritten and still be the upstream's. Only three codes are
-			ever minted on the way to a client - the cookie, the padding an
-			encrypted transport needs, and this server's own extended error -
-			so for anything else the code appearing on both sides is the
-			finding, and comparing the values would only ask whether the leak
-			was tidy.
+			half-rewritten and still be the upstream's. For a code this server
+			never mints, the code appearing on both sides is the finding, and
+			comparing the values would only ask whether the leak was tidy.
+
+			Asked of the answer rather than of the code, because two of the
+			mintable ones are minted under conditions rather than always - see
+			`pc_client_mintable`. A blanket exemption for the code would retire
+			the check on every transport where this server writes nothing, which
+			is most of them for the keepalive: a leak on a UDP answer would then
+			read as this server's own option and pass in silence.
 			*/
-			if !pc_client_mintable(u.code) {
+			if !pc_client_mintable(u.code, q, policy) {
 				pc_add(
 					c,
 					.Edns,
@@ -914,7 +918,8 @@ pc_opt_contents :: proc(c: ^Parity_Compare, q: Parity_Query, up, el: Pw_Msg, pol
 }
 
 /*
-The option codes this server writes into an answer of its own accord.
+Whether this server could have written `code` into the answer to *this* query of
+its own accord.
 
 Everything else in a client's OPT record can only have come from the upstream,
 which is what makes its presence enough to report without reading its value.
@@ -923,21 +928,58 @@ is a line somebody adds here deliberately.
 
 Two of them are hop-by-hop rather than answers to anything the upstream was
 asked: the keepalive timeout describes the connection this client holds with
-this server, and the padding is sized for that connection's transport. Both are
-therefore written on transports where the query went upstream over another one
-entirely, which is why neither may be compared against the upstream's value.
+this server, and the padding is sized for that connection's transport. Neither
+may be compared against the upstream's value for that reason - but both are also
+written only on some answers, so "this server mints this code" is not the same
+statement as "this server minted it here". The query and the transport are taken
+so it can be the second one: an exemption that held on every answer would retire
+the leak check for the codes it names on every transport where this server
+writes nothing at all.
+
+The cookie and the extended error are left unconditional. Both are minted on
+paths with more conditions than a comparison can restate - a cookie keeper that
+may be off, a verdict that may be absent, a validator that may have nothing to
+say - and neither is reached at all by an answer this server merely forwarded,
+which is where a leak would have to show up.
 */
 @(private = "file")
-pc_client_mintable :: proc(code: u16) -> bool {
+pc_client_mintable :: proc(code: u16, q: Parity_Query, policy: Parity_Policy) -> bool {
 	switch code {
 	case 10: // COOKIE, issued to this client (src/server/cookie.odin)
 		return true
-	case 11: // edns-tcp-keepalive, this connection's idle timeout (src/server/keepalive.odin)
-		return true
-	case 12: // padding, sized for this client's transport (src/dns/padding.odin)
-		return true
+	case 11:
+		/*
+		edns-tcp-keepalive, this connection's idle timeout
+		(src/server/keepalive.odin). Written on the two TCP transports, and
+		only back to a client that sent the option: RFC 7828 section 3.3.1
+		has it ignored on UDP, RFC 8484 section 10 puts it outside DoH, and a
+		client that did not ask is told nothing.
+		*/
+		if policy.transport != .TCP && policy.transport != .DoT {
+			return false
+		}
+		return pc_query_sent_option(q, 11)
+	case 12:
+		// Padding, sized for this client's transport (src/dns/padding.odin):
+		// the encrypted transports, and only for a client that padded its own
+		// query (RFC 7830 section 4, RFC 8467 section 5).
+		if policy.transport != .DoT && policy.transport != .DoH {
+			return false
+		}
+		return pc_query_sent_option(q, 12)
 	case 15: // extended DNS error, this server's own (src/server/dnssec.odin)
 		return true
+	}
+	return false
+}
+
+// Whether the generated query carried `code` in its OPT record.
+@(private = "file")
+pc_query_sent_option :: proc(q: Parity_Query, code: u16) -> bool {
+	for o in q.options {
+		if o.code == code {
+			return true
+		}
 	}
 	return false
 }

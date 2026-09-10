@@ -376,6 +376,23 @@ pm_opt :: proc(query: []u8, r: ^Pg_Rand, shape: int, allocator: mem.Allocator) -
 		append(&rdata, 0xde, 0xad, 0xbe, 0xef)
 	}
 
+	/*
+	An idle timeout for a connection this hop is not an end of.
+
+	edns-tcp-keepalive is hop by hop, so an upstream's is meaningless to the
+	client and must not reach it - `dns.strip_edns_options` is what stops it, on
+	every transport and whether or not elodin writes one of its own. Sent as a
+	number elodin would never write, so the two are told apart on the transports
+	where both could be present: 1s against the 10s `parity_config` pins.
+
+	Unconditional, because the leak it asks about is: the check that catches it
+	(`pc_client_mintable`) is the one that goes quiet on exactly the answers
+	elodin mints no keepalive into, and those are the answers this has to be in.
+	*/
+	pm_put16(&rdata, 11)
+	pm_put16(&rdata, 2)
+	append(&rdata, 0, 10)
+
 	out := make([dynamic]u8, 0, 16 + len(rdata), allocator)
 	append(&out, 0) // root owner name
 	pm_put16(&out, 41)
