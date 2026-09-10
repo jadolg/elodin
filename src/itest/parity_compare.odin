@@ -160,6 +160,13 @@ Its best case - a two-byte compression pointer for the owner name, the ten
 fixed bytes, and the RDATA - because the question every caller is asking is
 whether elodin *could* have carried it. Over-estimating would excuse a record
 left out with room to spare, which is the thing they are all here to catch.
+
+Under-estimating is possible and is the side to be wrong on. `encode_message`
+turns compression off for the rest of the message once it has dropped an
+additional record, so the third record of such a section really costs its
+owner name in full; costed here at two bytes it can read as having had room
+when it did not, and the answer to that is a finding somebody reads rather
+than an allowance nobody sees.
 */
 @(private = "file")
 pc_rr_cost :: proc(rec: Pw_RR) -> int {
@@ -608,70 +615,6 @@ pc_missing :: proc(
 		return
 	}
 
-	/*
-	Cut to fit a datagram from the additional section, where no TC bit says so.
-
-	RFC 2181 section 9: TC is not to be set merely because extra information
-	could not be fitted, the results of additional section processing included,
-	and the RRSet that will not fit is left out with the bit clear instead.
-	`encode_message` in src/dns/encode.odin does exactly that, so unlike the
-	allowance above this one has no bit to read and the arithmetic is the whole
-	of the evidence.
-
-	The arithmetic is `pc_tc`'s, and on what elodin wrote rather than on what
-	arrived for the same reason: this server expands the compressed names
-	inside the older types' RDATA, and an answer that came in under the ceiling
-	can go out over it.
-
-	This record's own cost rather than `pc_first_dropped`'s, which is the
-	difference between the two sections. A truncation is a tail cut off, so
-	there the first record left out is the only one whose room is in question;
-	the additional section is not cut but filled as far as it goes - the
-	encoder drops a record that will not fit and keeps writing the ones behind
-	it - so several can go missing at once, each for its own reason. Judging
-	them all by the first one's cost would excuse a small record lost with room
-	to spare behind a large one that genuinely did not fit.
-
-	Narrow on three counts, because "additional records may go missing" would
-	retire the check on the section glue and the OPT record both live in:
-
-	  - over UDP only, the one transport with a datagram to fit;
-	  - only where this record would genuinely not have fitted, so one missing
-	    with room to spare is still a finding;
-	  - not on a referral, which is `omitted_glue_truncates`' exception (RFC
-	    9471 section 3.3): glue for a name server inside the zone being
-	    delegated is learnable from that reply and nowhere else, so a referral
-	    that could not carry it must set TC. The encoder asks that of an answer
-	    section with nothing in it and this refuses the allowance to the same
-	    shape, so a referral that dropped glue and left TC clear stays the
-	    finding it is today.
-
-	A missing OPT record does not reach here at all: `pw_parse` lifts it out of
-	the section into `Pw_Msg.opt`, where `pc_edns` holds it to its own rule.
-	*/
-	if cost := pc_rr_cost(rec);
-	   kind == .Additional &&
-	   policy.transport == .UDP &&
-	   len(el.answer) != 0 &&
-	   el.size + cost > policy.client_udp_limit {
-		pc_add(
-			c,
-			kind,
-			fmt.aprintf(
-				"%s: %d bytes written, the record costs %d, and this client's limit is %d",
-				what,
-				el.size,
-				cost,
-				policy.client_udp_limit,
-				allocator = c.allocator,
-			),
-			pw_rr_key(rec, c.allocator),
-			"-",
-			"additional data that did not fit the client's datagram, which RFC 2181 section 9 has left out with tc clear",
-		)
-		return
-	}
-
 	// DNSSEC records a client that did not set DO has no use for. Stripped by
 	// `strip_dnssec_records` in src/server/dnssec.odin: the validator needed
 	// them, this client did not ask for them, and RFC 4035 section 3.2.1 says
@@ -710,6 +653,83 @@ pc_missing :: proc(
 			pw_rr_key(rec, c.allocator),
 			"-",
 			"this answer carries ad, so what the chain did not cover was pruned before the bit went on it",
+		)
+		return
+	}
+
+	/*
+	Cut to fit a datagram from the additional section, where no TC bit says so.
+
+	Last of the four, because the others name a cause and this one names a
+	consequence. A DNSSEC record a client did not ask for was gone before the
+	answer was ever fitted into a datagram, and an answer near the ceiling
+	would otherwise tally it here - `parity_tally` groups by reason, and a
+	reason that collects other allowances' records is a count nobody can read.
+
+	RFC 2181 section 9: TC is not to be set merely because extra information
+	could not be fitted, the results of additional section processing included,
+	and the RRSet that will not fit is left out with the bit clear instead.
+	`encode_message` in src/dns/encode.odin does exactly that, so unlike the
+	allowance above this one has no bit to read and the arithmetic is the whole
+	of the evidence.
+
+	The arithmetic is `pc_tc`'s, and on what elodin wrote rather than on what
+	arrived for the same reason: this server expands the compressed names
+	inside the older types' RDATA, and an answer that came in under the ceiling
+	can go out over it.
+
+	This record's own cost rather than `pc_first_dropped`'s, which is the
+	difference between the two sections. A truncation is a tail cut off, so
+	there the first record left out is the only one whose room is in question;
+	the additional section is not cut but filled as far as it goes - the
+	encoder drops a record that will not fit and keeps writing the ones behind
+	it - so several can go missing at once, each for its own reason. Judging
+	them all by the first one's cost would excuse a small record lost with room
+	to spare behind a large one that genuinely did not fit.
+
+	Narrow on three counts, because "additional records may go missing" would
+	retire the check on the section glue and the OPT record both live in:
+
+	  - over UDP only, the one transport with a datagram to fit;
+	  - only where this record would genuinely not have fitted, so one missing
+	    with room to spare is still a finding;
+	  - not on a referral, which is `omitted_glue_truncates`' exception (RFC
+	    9471 section 3.3): glue for a name server inside the zone being
+	    delegated is learnable from that reply and nowhere else, so a referral
+	    that could not carry it must set TC. The encoder asks that of an answer
+	    section with nothing in it and this refuses the allowance to the same
+	    shape, so a referral that dropped glue and left TC clear stays the
+	    finding it is today. Deliberately broader than the encoder's own test,
+	    which asks in addition that the record be an address for a name server
+	    named inside the zone being delegated: narrowing it to that would be
+	    this comparison repeating the rule it is here to check, and a judge
+	    that copies the implementation cannot catch the implementation being
+	    wrong. What the breadth costs is a finding on a referral that dropped
+	    additional data of some other kind, which no shape the mock serves
+	    produces - and a finding is the direction to be wrong in.
+
+	A missing OPT record does not reach here at all: `pw_parse` lifts it out of
+	the section into `Pw_Msg.opt`, where `pc_edns` holds it to its own rule.
+	*/
+	if cost := pc_rr_cost(rec);
+	   kind == .Additional &&
+	   policy.transport == .UDP &&
+	   len(el.answer) != 0 &&
+	   el.size + cost > policy.client_udp_limit {
+		pc_add(
+			c,
+			kind,
+			fmt.aprintf(
+				"%s: %d bytes written, the record costs %d, and this client's limit is %d",
+				what,
+				el.size,
+				cost,
+				policy.client_udp_limit,
+				allocator = c.allocator,
+			),
+			pw_rr_key(rec, c.allocator),
+			"-",
+			"additional data that did not fit the client's datagram, which RFC 2181 section 9 has left out with tc clear",
 		)
 		return
 	}
