@@ -17,13 +17,14 @@ than reading the log would.
 */
 
 @(private = "file")
-config_for_reload :: proc(udp_port, dot_port: int, cert_file, key_file: string) -> string {
+config_for_reload :: proc(udp_port, dot_port, doh_port: int, cert_file, key_file: string) -> string {
 	return fmt.tprintf(
 		`log: {{ level: debug }}
 listeners:
   udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
   tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
   dot: {{ enabled: true, address: "127.0.0.1", port: %d, cert_file: %s, key_file: %s }}
+  doh: {{ enabled: true, address: "127.0.0.1", port: %d, cert_file: %s, key_file: %s }}
 upstream:
   timeout: 2s
   servers: ["127.0.0.1:1"]
@@ -33,6 +34,9 @@ blocking: {{ enabled: false }}
 		udp_port,
 		udp_port,
 		dot_port,
+		cert_file,
+		key_file,
+		doh_port,
 		cert_file,
 		key_file,
 	)
@@ -152,10 +156,11 @@ run_reload_cases :: proc(r: ^Runner) {
 
 	udp_port := next_port(r)
 	dot_port := next_port(r)
+	doh_port := next_port(r)
 	srv, ok := start_server(
 		r,
 		Server_Options {
-			config = config_for_reload(udp_port, dot_port, active_cert, active_key),
+			config = config_for_reload(udp_port, dot_port, doh_port, active_cert, active_key),
 			udp_port = udp_port,
 			dot_port = dot_port,
 		},
@@ -177,6 +182,28 @@ run_reload_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	/*
+	The Apple profile is signed by the certificate the listener is presenting.
+
+	`cms_verify` is handed the certificate the signature must chain to, so passing
+	the one that is live and then the one that is not is what makes this an
+	assertion about *which* key signed rather than about whether anything did.
+	*/
+	start_case(r, "tls reload: the Apple profile is signed by the certificate in use")
+	{
+		res := doh_raw(
+			doh_port,
+			"GET /apple-doh.mobileconfig HTTP/1.1\r\nHost: reload-a.test\r\nConnection: close\r\n\r\n",
+		)
+		if check(r, res.ok, "no HTTP response") && check_eq_int(r, res.status, 200, "status") {
+			_, by_a := cms_verify(r, res.body, cert_a)
+			check(r, by_a, "the profile is not signed by the certificate the listener started with")
+			_, by_b := cms_verify(r, res.body, cert_b)
+			check(r, !by_b, "the profile verified against a certificate the server was never given")
+		}
+	}
+	end_case(r)
+
 	start_case(r, "tls reload: SIGHUP swaps in a certificate renewed on disk")
 	{
 		installed := install_cert(active_cert, cert_b) && install_cert(active_key, key_b)
@@ -193,6 +220,41 @@ run_reload_cases :: proc(r: ^Runner) {
 			// the file a beat later, so a single read races it on a loaded runner.
 			check(r, wait_for_log(&srv, "reloaded the certificate", 2 * time.Second), "no reload was logged")
 		}
+	}
+	end_case(r)
+
+	/*
+	The renewal reaches the profile endpoint too, and takes the old profiles with
+	it.
+
+	This is the case the signing had to not break: the profile is signed with the
+	listener's own certificate and kept in a cache, so a renewal has to move the
+	signing identity *and* drop everything signed with the one before it. A cache
+	that survived the swap would answer this with a profile signed by a key the
+	listener has stopped presenting - and would do it for a name the new
+	certificate no longer covers, which is the second half of this case.
+	*/
+	start_case(r, "tls reload: the renewed certificate signs the Apple profile")
+	{
+		res := doh_raw(
+			doh_port,
+			"GET /apple-doh.mobileconfig HTTP/1.1\r\nHost: reload-b.test\r\nConnection: close\r\n\r\n",
+		)
+		if check(r, res.ok, "no HTTP response") && check_eq_int(r, res.status, 200, "status") {
+			_, by_b := cms_verify(r, res.body, cert_b)
+			check(r, by_b, "the profile is not signed by the renewed certificate")
+			_, by_a := cms_verify(r, res.body, cert_a)
+			check(r, !by_a, "the profile is still signed by the certificate that was replaced")
+		}
+
+		// Warmed into the cache before the reload, and no longer a name the
+		// certificate covers after it.
+		stale := doh_raw(
+			doh_port,
+			"GET /apple-doh.mobileconfig HTTP/1.1\r\nHost: reload-a.test\r\nConnection: close\r\n\r\n",
+		)
+		check(r, stale.ok, "no HTTP response")
+		check_eq_int(r, stale.status, 400, "status for the replaced certificate's name")
 	}
 	end_case(r)
 

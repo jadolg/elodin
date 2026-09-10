@@ -7,6 +7,7 @@ import "core:testing"
 import "core:time"
 import "elodin:cache"
 import "elodin:config"
+import "elodin:tlsx"
 import "elodin:upstream"
 
 /*
@@ -352,4 +353,51 @@ test_the_stats_line_carries_every_counter :: proc(t: ^testing.T) {
 		}) {
 		testing.expectf(t, strings.contains(line, want), "the stats line is missing %q: %s", want, line)
 	}
+}
+
+/*
+The profile endpoint's counters are published, and only by a server that has one.
+
+Two things at once. A server with no profile endpoint should not carry series
+that are permanently zero and mean nothing - a scrape saying "zero refused" for a
+server that could never refuse anything is noise an operator has to learn to
+ignore. And the refusal counter is the only thing that says a certificate has
+gone out of its validity window and taken the endpoint with it, so a server that
+does have one must publish it.
+*/
+@(test)
+test_profile_counters_reach_the_endpoint :: proc(t: ^testing.T) {
+	bare := render_fixture(Stats{})
+	testing.expect(
+		t,
+		!strings.contains(bare, "elodin_mobileconfig_"),
+		"a server with no profile endpoint should publish no profile series",
+	)
+
+	signer, ctx, ok := make_test_profile_signer(t)
+	if !ok {
+		return
+	}
+	defer tlsx.context_destroy(ctx)
+	defer destroy_profile_signer(signer)
+
+	_, status := profile_for_host(signer, "elodin.local", tlsx.unix_now(), context.temp_allocator)
+	testing.expect_value(t, status, Profile_Status.OK)
+	// A year past a certificate minted for thirty days: refused, and counted.
+	_, expired := profile_for_host(
+		signer,
+		"elodin.local",
+		tlsx.unix_now() + 365 * 24 * 3600,
+		context.temp_allocator,
+	)
+	testing.expect_value(t, expired, Profile_Status.Unavailable)
+
+	s, cfg := metrics_fixture(Stats{})
+	s.cfg = &cfg
+	s.profiles = signer
+	listeners: Listeners
+	page := render_metrics(&s, &listeners, context.temp_allocator)
+
+	expect_line(t, page, "elodin_mobileconfig_signed_total 1")
+	expect_line(t, page, "elodin_mobileconfig_refused_total 1")
 }

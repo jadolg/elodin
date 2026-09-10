@@ -496,6 +496,33 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 		st.special_use,
 	)
 
+	/*
+	Only on a server that serves the profile, so the two lines appearing at all
+	says the endpoint is on.
+
+	`refused` is the one worth an alert. Its ordinary value is zero, and the way
+	it stops being zero without anybody doing anything is a certificate that has
+	gone out of its validity window - at which point the endpoint serves nothing
+	rather than a profile signed with it, and this is the only thing that says so.
+	*/
+	if s.profiles != nil {
+		signed, refused := profile_signer_stats(s.profiles)
+		metrics.scalar(
+			&b,
+			"elodin_mobileconfig_signed_total",
+			.Counter,
+			"Apple configuration profiles signed. One per host the certificate covers, until the certificate is renewed.",
+			signed,
+		)
+		metrics.scalar(
+			&b,
+			"elodin_mobileconfig_refused_total",
+			.Counter,
+			"Profile requests answered 503: the certificate was outside its validity window, or the signing budget was spent.",
+			refused,
+		)
+	}
+
 	metrics.family(&b, "elodin_dnssec_answers_total", .Counter, "Answers by what validation made of them.")
 	metrics.sample(&b, "elodin_dnssec_answers_total", st.secure, metrics.Label{"result", "secure"})
 	metrics.sample(&b, "elodin_dnssec_answers_total", st.bogus, metrics.Label{"result", "bogus"})

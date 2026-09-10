@@ -777,12 +777,29 @@ the device and it downloads a `.mobileconfig` that, installed under **Settings �
 General → VPN & Device Management**, sends the device's DNS here over HTTPS
 system-wide.
 
-The `ServerURL` inside is built from the host the request arrived on, so it always
-matches the name the certificate is for, and a listener answering on several
-names hands each device a profile for the one it used. Its identifiers derive
-from the URL, so reinstalling replaces the profile rather than stacking a
-duplicate. The profile is unsigned, so the device shows it as *Unverified*. Set
-`mobileconfig_path: ""` to withhold it; it is served only while DoH is enabled.
+The `ServerURL` inside is built from the host the request arrived on, and that
+host has to be one the DoH listener's certificate covers — a request naming
+anything else gets a 400 rather than a profile the device could never use. A
+listener answering on several names hands each device a profile for the one it
+used. Its identifiers derive from the URL, so reinstalling replaces the profile
+rather than stacking a duplicate. Set `mobileconfig_path: ""` to withhold it; it
+is served only while DoH is enabled.
+
+The profile is **signed with the DoH listener's own certificate** — there is
+nothing extra to configure, and the signature follows a renewal without a
+restart. What the device shows depends on that certificate, since it validates
+the signer against its own trust store:
+
+- a certificate from a public CA (Let's Encrypt and the like) — *Verified*, in
+  green. Make sure `cert_file` holds the full chain: the device has the root but
+  not the intermediates, and a leaf served alone cannot be chained to anything.
+- a self-signed certificate — *Not Verified*, as an unsigned profile was before.
+  It still installs.
+
+While the certificate is outside its validity window the endpoint answers 503
+rather than handing out a profile signed with it. Signing is also rate limited
+and the signed profiles are cached per host, so the endpoint cannot be used to
+make the server do public-key work on demand.
 
 ### DNSSEC
 

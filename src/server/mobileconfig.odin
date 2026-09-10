@@ -10,16 +10,21 @@ Mac at this server's DNS-over-HTTPS endpoint.
 iOS 14 and macOS 11 onwards take encrypted DNS as a profile carrying a
 `com.apple.dnsSettings.managed` payload (Apple's Configuration Profile
 Reference). Installing it makes the device resolve through the DoH `ServerURL`
-system-wide, with no app to run. The profile served here is unsigned, so on
-install the device labels it "Unverified" - expected for a self-hosted resolver,
-and no barrier to using it.
+system-wide, with no app to run.
+
+This file builds the profile; `profile.odin` decides whether it may be signed,
+signs it with the listener's own certificate, and keeps what it signed. What the
+device then reports - "Verified" or not - is a question about that certificate's
+chain rather than about anything here.
 
 `ServerURL` is built from the host the request arrived on rather than from a
 name in the config: the client reached this endpoint over the same TLS
 connection whose certificate the DoH URL has to match, so the `Host` header (or
-the HTTP/2 `:authority`) is by construction a name that resolves and verifies.
-Nothing here has to be told what the server is called, and a listener answering
-on several names hands each client a profile for the one it actually used.
+the HTTP/2 `:authority`) is a name that resolves and verifies. That is where the
+name comes from, not a guarantee that it is one - a client sends whatever it
+likes - so the certificate is asked about it before a profile is built, and a
+listener answering on several names hands each client a profile for the one it
+actually used.
 */
 
 // What a device's profile installer expects; anything else and Safari offers to

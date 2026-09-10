@@ -838,3 +838,60 @@ bytes_equal :: proc(a, b: []u8) -> bool {
 	}
 	return true
 }
+
+/*
+Verify a CMS SignedData structure with `openssl` and hand back what was inside it.
+
+The Apple profile endpoint signs with the listener's own certificate, and the
+only assertion worth making about a signature is one made by something that did
+not produce it. `openssl cms` is that: an implementation with no share in this
+server's idea of the format, reading the same bytes a device would.
+
+`ca_file` is the certificate the signature is expected to chain to, so passing
+the wrong one is how a case proves *which* certificate signed - which is what a
+renewal has to change.
+*/
+cms_verify :: proc(r: ^Runner, der: []u8, ca_file: string) -> (payload: string, ok: bool) {
+	der_path := fmt.tprintf("%s/cms-verify.der", r.work_dir)
+	out_path := fmt.tprintf("%s/cms-verify.out", r.work_dir)
+	if werr := os.write_entire_file(der_path, der); werr != nil {
+		return "", false
+	}
+
+	devnull, nerr := os.open("/dev/null", {.Write})
+	defer if nerr == nil {
+		os.close(devnull)
+	}
+	desc := os.Process_Desc {
+		command = []string {
+			"openssl",
+			"cms",
+			"-verify",
+			"-inform",
+			"der",
+			"-in",
+			der_path,
+			"-CAfile",
+			ca_file,
+			"-out",
+			out_path,
+		},
+	}
+	if nerr == nil {
+		desc.stdout = devnull
+		desc.stderr = devnull
+	}
+	process, perr := os.process_start(desc)
+	if perr != nil {
+		return "", false
+	}
+	state, werr := os.process_wait(process)
+	if werr != nil || state.exit_code != 0 {
+		return "", false
+	}
+	data, rerr := os.read_entire_file(out_path, context.temp_allocator)
+	if rerr != nil {
+		return "", false
+	}
+	return string(data), true
+}

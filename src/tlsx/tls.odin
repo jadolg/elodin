@@ -30,6 +30,15 @@ Context :: struct {
 	// reports a verification result when verification is switched off, and
 	// acting on it would reject every self-signed peer we were told to accept.
 	verify:    bool,
+	/*
+	The certificate and key this context serves, for callers that have to sign
+	something with them - see `sign.odin`.
+
+	Borrowed from `ptr` and empty on a client context, which has no certificate
+	of its own. A caller that needs one for longer than it holds this context
+	takes its own references with `signer_retain`.
+	*/
+	signer:    Signer,
 	// Kept so the matching free uses the allocator the caller supplied.
 	allocator: mem.Allocator,
 }
@@ -490,6 +499,7 @@ server_context :: proc(
 	ctx = new(Context, allocator)
 	ctx.ptr = ptr
 	ctx.is_server = true
+	ctx.signer = signer_of(ptr)
 	ctx.allocator = allocator
 	return ctx, .None
 }

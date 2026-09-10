@@ -5,6 +5,7 @@ import "core:strings"
 import "core:time"
 import "elodin:dns"
 import "elodin:logx"
+import "elodin:tlsx"
 
 /*
 The DoH endpoint (RFC 8484) over HTTP/1.1.
@@ -515,7 +516,7 @@ serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 serve_doh_request :: proc(s: ^Server, conn: Conn, req: Http_Request_In, path: string, client: string) -> bool {
 	mc_path := s.cfg.listeners.doh.mobileconfig_path
 	if mc_path != "" && req.path == mc_path {
-		return serve_doh_mobileconfig(conn, req, path)
+		return serve_doh_mobileconfig(s, conn, req, path)
 	}
 	if req.path != path {
 		return send_http_error(conn, "doh", 404, "not found", req.keep_alive)
@@ -636,17 +637,32 @@ A GET, since a device downloads it by navigating to the URL; anything else is a
 client that sends none - or one this server could not have a certificate for -
 gets a 400 rather than a profile naming a host that does not resolve. `doh_path`
 is `listeners.doh.path`, which is what the profile has the device query.
+
+What comes back is signed with the listener's own certificate, so the device
+reports a profile it can verify rather than an unsigned one. `profile.odin` owns
+the deciding; two of the three answers it can give are refusals, and both are
+refusals this endpoint could not have made before there was a signature to make
+them about.
 */
 @(private)
-serve_doh_mobileconfig :: proc(conn: Conn, req: Http_Request_In, doh_path: string) -> bool {
+serve_doh_mobileconfig :: proc(s: ^Server, conn: Conn, req: Http_Request_In, doh_path: string) -> bool {
 	if req.method != "GET" {
 		return send_http_error(conn, "doh", 405, "method not allowed", req.keep_alive)
 	}
+	// Cheap syntax first: a Host with a byte no authority may contain is turned
+	// away without the certificate being consulted about it.
 	if !valid_mobileconfig_host(req.host) {
 		return send_http_error(conn, "doh", 400, "missing or invalid Host header", req.keep_alive)
 	}
 
-	profile := build_doh_mobileconfig(req.host, doh_path, context.temp_allocator)
+	profile, status := profile_for_host(s.profiles, req.host, tlsx.unix_now(), context.temp_allocator)
+	switch status {
+	case .Unknown_Host:
+		return send_http_error(conn, "doh", 400, "no certificate for that host", req.keep_alive)
+	case .Unavailable:
+		return send_http_error(conn, "doh", 503, "profile signing unavailable", req.keep_alive)
+	case .OK:
+	}
 
 	b := strings.builder_make(context.temp_allocator)
 	strings.write_string(&b, "HTTP/1.1 200 OK\r\nContent-Type: ")
@@ -666,7 +682,7 @@ serve_doh_mobileconfig :: proc(conn: Conn, req: Http_Request_In, doh_path: strin
 	if !conn_write_all(conn, transmute([]u8)head) {
 		return false
 	}
-	return conn_write_all(conn, transmute([]u8)profile)
+	return conn_write_all(conn, profile)
 }
 
 /*

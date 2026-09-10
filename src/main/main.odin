@@ -711,6 +711,9 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 		pool.destroy(handler_pool)
 		pool.destroy(race_pool)
 		server.destroy_listeners(&listeners)
+		// Last: a draining job can be a DoH request still building a profile,
+		// and this is what it signs with.
+		server.stop_profile_signer(&s)
 	}
 
 	drop_privileges(cfg, service)

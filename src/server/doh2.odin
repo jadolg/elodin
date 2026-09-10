@@ -392,7 +392,9 @@ Answer the .mobileconfig endpoint over HTTP/2.
 The HTTP/1.1 endpoint's twin: a GET returns the Apple profile, the URL inside it
 built from the request's `:authority` - the HTTP/2 spelling of `Host` - so a
 stream carrying none, or one for a host this server has no certificate for, is
-turned away rather than handed a profile that names an unreachable host.
+turned away rather than handed a profile that names an unreachable host. The
+profile is signed, and refused rather than served unsigned; see
+`serve_doh_mobileconfig`, whose answers this mirrors.
 */
 @(private)
 build_h2_mobileconfig :: proc(ctx: ^H2_Context, req: ^h2.Request) -> (resp: h2.Response, ok: bool) {
@@ -402,11 +404,23 @@ build_h2_mobileconfig :: proc(ctx: ^H2_Context, req: ^h2.Request) -> (resp: h2.R
 	if !valid_mobileconfig_host(req.authority) {
 		return h2_error(400, "missing or invalid :authority"), true
 	}
-	profile := build_doh_mobileconfig(req.authority, ctx.path, context.temp_allocator)
+	profile, status := profile_for_host(
+		ctx.server.profiles,
+		req.authority,
+		tlsx.unix_now(),
+		context.temp_allocator,
+	)
+	switch status {
+	case .Unknown_Host:
+		return h2_error(400, "no certificate for that host"), true
+	case .Unavailable:
+		return h2_error(503, "profile signing unavailable"), true
+	case .OK:
+	}
 	return h2.Response {
 			status = 200,
 			content_type = DOH_MOBILECONFIG_CONTENT_TYPE,
-			body = transmute([]u8)profile,
+			body = profile,
 		},
 		true
 }

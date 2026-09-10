@@ -115,9 +115,10 @@ run_h2_cases :: proc(r: ^Runner) {
 	The Apple .mobileconfig profile is served over HTTP/2 too, since that is the
 	protocol a device negotiates. The URL inside it is built from the `:authority`
 	pseudo-header - the client sends `elodin.local` - and the response carries the
-	Apple content type rather than the DNS-message one.
+	Apple content type rather than the DNS-message one. Signed over this transport
+	as over the other one, and checked the same way; see the HTTP/1.1 case.
 	*/
-	start_case(r, "h2: the Apple profile downloads")
+	start_case(r, "h2: the Apple profile downloads, signed")
 	{
 		c, cok := h2_connect(doh_port)
 		if check(r, cok, "cannot open an h2 connection") {
@@ -132,11 +133,14 @@ run_h2_cases :: proc(r: ^Runner) {
 					"application/x-apple-aspen-config",
 					"content type",
 				)
-				check(
-					r,
-					strings.contains(string(res.body), "<string>https://elodin.local/dns-query</string>"),
-					"the profile does not carry the DoH URL built from :authority",
-				)
+				payload, verified := cms_verify(r, res.body, r.cert_file)
+				if check(r, verified, "the profile is not a signature openssl will verify") {
+					check(
+						r,
+						strings.contains(payload, "<string>https://elodin.local/dns-query</string>"),
+						"the signed profile does not carry the DoH URL built from :authority",
+					)
+				}
 			}
 		}
 	}
