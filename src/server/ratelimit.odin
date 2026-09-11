@@ -30,6 +30,18 @@ By prefix rather than by address: /24 for IPv4 and /64 for IPv6, since an
 attacker spoofing addresses picks them freely within the range they are aiming
 at, and a per-address budget would just be spread across it.
 
+And in bytes rather than in datagrams, which is the other half of "how much".
+What a victim receives is traffic; what the budget counts is sendings, and one
+sending is worth anything from a ~100-byte NODATA to a full 1232-byte DNSSEC
+answer - a twelvefold spread that the attacker picks the end of, by picking the
+question. So an answer larger than `response_size_estimate` is charged as several
+datagrams: `rate_check` admits on one token before the answer exists and
+`rate_charge_response` bills the rest once it has been packed, which makes
+`responses_per_second * response_size_estimate` the bound on what one prefix can
+be made to receive whatever is asked for. Unset, the estimate is
+`server.max_udp_response` and every answer costs exactly one token, which is what
+this did before there was a second figure.
+
 Over-limit queries are not all dropped. At most every `slip`th one is answered
 with a header and a question and the TC bit set, which is 30-odd bytes rather
 than 4096 - too small to be worth reflecting - and which tells a real client to
@@ -395,6 +407,22 @@ Rate_Limiter :: struct {
 	tiers:     []Rate_Tier,
 	prefixes:  []config.Prefix,
 	/*
+	What one answer costs the `Datagram` pool, in bytes - see
+	`rate_charge_response`.
+
+	One figure for the limiter rather than one per tier, unlike everything else
+	here: the budgets say how much this server will do for a network, and this
+	says what one datagram of it weighs. That is a property of what leaves the
+	socket - bounded for the whole process by `server.max_udp_response` - and
+	not of who it is addressed to, so an override changes how many answers a
+	prefix gets and not what one of them costs.
+
+	0 charges one token per answer whatever its size, which is what every caller
+	that does not configure one gets - the tests included - and what the
+	configured figure amounts to anyway when it is at or above the ceiling.
+	*/
+	estimate:  int,
+	/*
 	Keyed with process entropy, so which prefixes share a bucket is not
 	something an attacker can work out and use.
 
@@ -491,15 +519,22 @@ make_rate_tier :: proc(responses_per_second: int, slip: int) -> (t: Rate_Tier) {
 `overrides` defaults to none, which is every caller that does not configure any -
 the tests included. Tier 0 is always the pair passed here, so a limiter with no
 overrides behaves exactly as it did before there were tiers.
+
+`response_size_estimate` defaults to 0, which charges one token per answer
+whatever its size - see `Rate_Limiter.estimate`. The server passes the configured
+figure, which the loader resolves to `server.max_udp_response` when the file does
+not name one, and that amounts to the same thing: no datagram exceeds it.
 */
 make_rate_limiter :: proc(
 	responses_per_second: int,
 	slip: int,
 	overrides: []config.Rate_Limit_Override = nil,
+	response_size_estimate: int = 0,
 	allocator := context.allocator,
 ) -> ^Rate_Limiter {
 	r := new(Rate_Limiter, allocator)
 	r.allocator = allocator
+	r.estimate = response_size_estimate
 	r.buckets = make([]Rate_Bucket, RRL_BUCKETS, allocator)
 
 	/*
@@ -664,6 +699,81 @@ rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) -> Ra
 		return .Truncate
 	}
 	return .Drop
+}
+
+/*
+Charge what the answer turned out to weigh, once it has been packed.
+
+`rate_check` admits a datagram on one token, before there is an answer to
+measure - it runs in the read loop, ahead of the parse and the resolve, which is
+where a query this server will not answer is cheapest to turn away. So the token
+it spends is a deposit, and this is the rest of the bill: an answer of `size`
+bytes costs `ceil(size / estimate)` tokens in total, and what this subtracts is
+the rest of that - the part the deposit did not cover.
+
+Which makes `responses_per_second` a quantity again. A count of sendings is worth
+whatever the answers happened to weigh, and which end of that range they land on
+is the attacker's to choose by choosing the question: between a ~100-byte NODATA
+and a full 1232-byte DNSSEC answer the same budget is 60 KB/s or 616 KB/s aimed
+at one /24. Charged by size, the product `responses_per_second *
+response_size_estimate` is the ceiling whatever is asked for, and the operator
+sets both halves of it. AdGuard DNS charges the same way, for the same reason.
+
+The debt is paid by the next query in the prefix rather than by this one, since
+this one has already been sent. That is the shape a check before the answer
+forces, and it is the right way round: the bucket carries the overspend forward,
+so a prefix being fed large answers runs dry sooner and one asking small
+questions is charged nothing extra.
+
+`Datagram` alone. The stream pool bounds work behind an answer rather than
+traffic toward an address - the handshake settled where the client is - and the
+`Slip` pool buys a 30-odd byte truncated reply, which no estimate an operator may
+set charges more than one token for. `Connection` has no size at all.
+
+The debt is carried in full, with no floor under it, and what that costs is worth
+being plain about. The charge lands after the send, so a prefix that had a full
+bucket can have `capacity` large answers admitted before the first of them is
+billed - the read loop is faster than the workers - and the bill for all of them
+arrives afterwards. The bucket then owes several seconds and the prefix hears
+nothing until it has paid, which is longer than the burst itself took.
+
+That is the arithmetic being right rather than wrong: what it owes is what this
+server sent, and a prefix that has just been sent a second of its budget in one
+breath is a prefix that has had its second. A floor would forgive exactly the
+overspend the setting exists to charge for - the burst is where the large answers
+are - and would leave `responses_per_second * response_size_estimate` an average
+this server exceeds whenever a flood pauses. Bounded, in any case, by what can be
+in flight at once, which `server.max_pending` is the ceiling on.
+
+What it does mean is that a flood in a prefix costs the clients who live there a
+little longer than the flood lasts. That is the same trade the rest of this file
+makes - a spoofed flood already empties the bucket a neighbour's queries are
+answered out of - reaching a few seconds further, and `slip` is still what gets
+one of those clients onto the stream pool where no datagram can follow.
+
+Nothing is charged when there is no estimate, or when the answer fits inside one:
+the common case, since the configured default is the largest datagram this server
+sends, and it costs a compare rather than the table lock.
+*/
+rate_charge_response :: proc(r: ^Rate_Limiter, client: net.Endpoint, size: int, now: time.Tick) {
+	if r == nil || r.estimate <= 0 || size <= r.estimate {
+		return
+	}
+	// Integer ceiling, minus the token `rate_check` already took.
+	extra := f64((size + r.estimate - 1) / r.estimate - 1)
+
+	sync.mutex_lock(&r.lock)
+	defer sync.mutex_unlock(&r.lock)
+
+	/*
+	The bucket as it is now, which is all but always the one that admitted the
+	datagram. A prefix whose bucket changed hands in the microseconds between is
+	charging a stranger's, which is the collision this table already accepts -
+	and a takeover needs every pool refilled to capacity, so the bucket being
+	taken is one nobody was spending from.
+	*/
+	b := rate_bucket(r, client, now._nsec)
+	b.tokens[.Datagram] -= extra
 }
 
 /*
@@ -890,7 +1000,12 @@ start_rate_limiter :: proc(s: ^Server) -> bool {
 	if !cfg.enabled {
 		return true
 	}
-	s.limiter = make_rate_limiter(cfg.responses_per_second, cfg.slip, cfg.overrides)
+	s.limiter = make_rate_limiter(
+		cfg.responses_per_second,
+		cfg.slip,
+		cfg.overrides,
+		cfg.response_size_estimate,
+	)
 	// The budgets are named in the line rather than left to the documentation: an
 	// operator reading `500` needs to know it is 500 datagrams, 500 queries on
 	// connections and 500 connections opened, not 500 between them - and that the
@@ -907,6 +1022,28 @@ start_rate_limiter :: proc(s: ^Server) -> bool {
 		logx.infof(
 			"rate limit: %d responses/s per client prefix (/24, /64), counted separately for datagrams, for queries on a connection and for connections opened; anything over that dropped",
 			cfg.responses_per_second,
+		)
+	}
+	/*
+	And what the figure above is worth in bytes, when that is not simply the
+	figure times the ceiling.
+
+	Said only when the estimate can bite - at or above `max_udp_response` no
+	answer is ever charged more than one token, so the line would describe a
+	setting that is doing nothing. When it does bite, this is the multiplication
+	an operator would otherwise do by hand, and the number they were actually
+	choosing: what one client prefix can be made to receive.
+
+	The default tier's figure. A network named in `overrides` has its own
+	`responses_per_second`, printed on its own line below, and the same estimate
+	applies to it - the unit is one per server, see `Rate_Limiter.estimate`.
+	*/
+	if cfg.response_size_estimate > 0 && cfg.response_size_estimate < s.cfg.server.max_udp_response {
+		logx.infof(
+			"rate limit: an answer over %d bytes is charged as several datagrams, so the %d/s above is about %d KB/s of answers at one prefix however large they are",
+			cfg.response_size_estimate,
+			cfg.responses_per_second,
+			cfg.responses_per_second * cfg.response_size_estimate / 1024,
 		)
 	}
 	// Out of the temp arena, which startup resets around this: the lines are read

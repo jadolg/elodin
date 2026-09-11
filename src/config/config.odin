@@ -681,15 +681,67 @@ actor with addresses in n of them has n of every figure, and on IPv6 a routine /
 is 65,536 /64s. A publicly reachable instance wants a per-source connection rate
 limit in front of it as well - see the README.
 
+What the datagram figure is denominated in is `response_size_estimate`, which is
+the other half of what it means: the count bounds sendings, and an answer larger
+than the estimate is charged as several of them, so the bytes one prefix can be
+made to receive stop depending on which question was asked. Unset it is
+`server.max_udp_response`, and every answer costs one token exactly as before.
+
 `overrides` is what makes the figures above defaults rather than the only answer.
 See `Rate_Limit_Override`.
 */
 Rate_Limit_Config :: struct {
-	enabled:              bool,
-	responses_per_second: int,
-	slip:                 int,
-	overrides:            []Rate_Limit_Override,
+	enabled:                bool,
+	responses_per_second:   int,
+	/*
+	What one datagram costs the budget above, in bytes of answer.
+
+	`responses_per_second` counts sendings, and what a reflection victim
+	receives is bytes. Between a ~100-byte NODATA and a full 1232-byte DNSSEC
+	answer that is a twelvefold spread in what one prefix can be made to
+	receive out of the same figure, and which end of it the answers land on is
+	the attacker's to pick by picking the question. This is the unit that turns
+	the count back into a quantity: an answer larger than this is charged
+	`ceil(size / response_size_estimate)` tokens instead of one, so a prefix's
+	datagram budget bounds `responses_per_second * response_size_estimate`
+	bytes a second whatever is asked for.
+
+	Unset it is `server.max_udp_response`, which is the largest datagram this
+	server will send - so every answer costs exactly one token and nothing
+	changes for a configuration that does not write it. Set it smaller to
+	choose the quantity directly: at the shipped 500 and a 1232-byte ceiling,
+	`response_size_estimate: 128` is a bound of about 64 KB/s at one /24 rather
+	than 600 KB/s, and 500 small answers a second are still 500.
+
+	AdGuard DNS's `response_size_estimate` is the same setting with the same
+	arithmetic, and 1KB is what it ships.
+
+	UDP only, and the datagram pool only. A connection has no size worth
+	charging - the handshake already settled where the client is, so what its
+	budget bounds is the work behind an answer rather than the traffic - and a
+	truncated slip reply is 30-odd bytes by construction, which no estimate an
+	operator can set would charge more than one token for.
+	*/
+	response_size_estimate: int,
+	slip:                   int,
+	overrides:              []Rate_Limit_Override,
 }
+
+/*
+The floor under `server.rate_limit.response_size_estimate`.
+
+The smallest answer this server sends is a header, a question and an OPT record
+- 60-odd bytes for a short name. An estimate under that is one where every
+answer there is costs more than one token, so `responses_per_second` stops being
+a number of responses at all and becomes a byte budget with an arbitrary
+multiplier in front of it. An operator who wants fewer responses has
+`responses_per_second` itself for that, and it says what it means.
+
+The ceiling is `MAX_UDP_RESPONSE`, since a datagram cannot exceed it: anything at
+or above `server.max_udp_response` charges one token per answer, which is what
+leaving this unset already does.
+*/
+MIN_RESPONSE_SIZE_ESTIMATE :: 64
 
 /*
 A network whose budgets are not the defaults above.
@@ -735,6 +787,11 @@ or an IPv6 one longer than /64, is refused at load. Every address in a /24 share
 one bucket, so a /28 or a /32 entry could only ever be applied to the whole /24
 that contains it - which is not what the operator wrote, and is the kind of
 surprise a startup error is cheaper than.
+
+No `response_size_estimate` per entry. That one is a property of what this server
+sends rather than of who it is sending to - the largest datagram it will put on
+the wire is one figure for the whole process - so an override changes how many
+answers a network gets and not what one of them costs.
 
 Not a security control either way. Raising a prefix's budget raises what this
 server will send to it and what it will spend on it, which is the operator's

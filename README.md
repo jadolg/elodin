@@ -1073,6 +1073,7 @@ server:
   rate_limit:
     enabled: true                 # on by default
     responses_per_second: 500     # per client prefix (/24 or /64), and per budget: datagrams, queries on a connection, connections opened
+    response_size_estimate: 1232  # what one answer costs the datagram budget; a larger one is charged as several. Default: max_udp_response
     slip: 2                       # answer at most every 2nd query over the budget truncated; 0 drops them all
 ```
 
@@ -1087,6 +1088,31 @@ sender asks: with a spoofed address there is nothing of the sender's to measure.
 So it is kept per destination prefix, /24 and /64, the granularity an attacker
 picks addresses within, in a fixed table allocated once so the limiter is not
 itself somewhere to put pressure.
+
+**What one of those responses is worth in bytes is `response_size_estimate`.**
+A victim receives traffic, and a count of sendings is worth whatever the answers
+weigh — which the attacker picks by picking the question. At the shipped 500 that
+is about 60 KB/s at one /24 if the answers are ~100-byte NODATAs and about 600
+KB/s if they are full 1232-byte DNSSEC answers, a twelvefold spread in the figure
+an operator thought they were setting. So an answer larger than the estimate is
+charged `ceil(size / response_size_estimate)` tokens instead of one — admitted on
+the first, billed for the rest once it is packed, which the next query from that
+prefix pays for — and the bound becomes `responses_per_second ×
+response_size_estimate` bytes a second whatever is asked for. AdGuard DNS's
+setting of the same name does the same arithmetic.
+
+Left out it is [`max_udp_response`](#how-large-a-udp-answer-may-be), the largest
+datagram this server will send, so no answer is ever charged more than one token
+and the figure means exactly what it meant before there was a second one. Set it
+smaller to choose the quantity directly: with the 1232 ceiling,
+`response_size_estimate: 128` holds a prefix to about 64 KB/s of answers rather
+than 600, while a client whose answers are ordinary — an A record is ~60 bytes —
+still gets its 500 a second. It is the datagram budget only: a connection has no
+size worth charging, and a truncated slip reply is 30-odd bytes by construction.
+The floor is 64 bytes, since below the smallest answer there is the setting stops
+being a size at all; anything at or above `max_udp_response` is what leaving it
+out already does. When it is set low enough to bite, the startup line says what
+the two figures multiply out to.
 
 Over-budget queries are not simply dropped. At most every `slip`th one comes back
 as a header and a question with the TC bit set: too small to be worth reflecting,

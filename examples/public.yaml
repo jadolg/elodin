@@ -103,9 +103,10 @@ server:
   rate_limit:
     enabled: true
     # Left at the shipped 500 per client prefix, in both directions of the
-    # trade. Multiplied out it is the ceiling on what one victim network can be
-    # made to receive: 500 * 1232 bytes is about 600 KB/s aimed at one /24,
-    # small enough not to be worth an attacker's bandwidth. In the other
+    # trade. Multiplied out with `response_size_estimate` below it is the
+    # ceiling on what one victim network can be made to receive: 500 * 1232
+    # bytes is about 600 KB/s aimed at one /24, small enough not to be worth an
+    # attacker's bandwidth. In the other
     # direction it has to be generous enough for a real /24 that is a carrier
     # NAT with thousands of subscribers behind it - and when such a client does
     # exceed it, `slip` sends it to TCP rather than dropping it, so it keeps
@@ -124,6 +125,23 @@ server:
     # since the same change costs real clients their datagrams. Lowering it for
     # one network rather than for all of them is also an override.
     responses_per_second: 500
+    # What one answer costs the figure above, in bytes. An answer larger than
+    # this is charged as several, so the two multiply out to a quantity of
+    # traffic rather than to a count of datagrams worth whatever the answers
+    # happened to weigh - which is the attacker's choice, since they pick the
+    # question. Unset it is `max_udp_response`, so every answer costs one token
+    # and the 600 KB/s above is the ceiling; the figure only moves if you lower
+    # it.
+    #
+    # Lower it to choose the quantity directly. 128 here is about 64 KB/s at one
+    # /24 - a tenth of the traffic - while a client asking for A records, which
+    # are ~60 bytes, still gets its 500 a second. The cost falls on the clients
+    # whose answers really are large: DNSSEC-validating stubs and anything
+    # asking for large TXT sets are charged several tokens an answer, and a busy
+    # /24 of them reaches the budget sooner. The startup line prints what the
+    # two figures come to.
+    #
+    # response_size_estimate: 128
     # At most every second over-budget datagram comes back with the TC bit: too
     # small to reflect, and the standard way of telling a real client to come
     # back over TCP where the handshake proves its address. At most, because

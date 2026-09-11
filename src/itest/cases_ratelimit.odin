@@ -249,6 +249,155 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 	end_case(r)
 
 	/*
+	And what those bytes are denominated in, which is the operator's to choose.
+
+	The case above shows the budget bounding the traffic; this one shows what the
+	bound is worth. A count of answers is worth whatever the answers weigh, and an
+	attacker picks that by picking the question: the same figure buys a victim a
+	flood of ~60-byte A records or one of full-size TXT answers, ten times the
+	traffic out of the same budget. `response_size_estimate` is what charges the
+	large ones as several, so `responses_per_second * response_size_estimate` is
+	the ceiling whichever question is asked.
+
+	Measured on the second flood rather than the first, which is the difference
+	between a burst and an attack. The check runs in the read loop, before the
+	answer exists, so a bucket that is full when a burst arrives admits the whole
+	of it before the first answer has been packed and billed - both servers send
+	that burst. What the size charge decides is everything after it: the debt the
+	burst ran up is in the bucket when the next flood arrives, and a flood that
+	keeps coming is what a reflection attack is.
+
+	Three servers because a bucket is per prefix and every client this suite has
+	is on loopback: two floods at one server would be the second one reading what
+	the first left. Same flood, same budget, and the only differences are the
+	setting and the size of the answer.
+	*/
+	start_case(r, "rate limit: a large answer is charged as several datagrams")
+	{
+		// About 1100 bytes: over the estimate below by a factor of eight, and
+		// inside the 1232 `max_udp_response` default, so what comes back is the
+		// whole answer rather than a TC bit.
+		big := big_txt_answer("large.example.", 4, context.allocator)
+		defer delete(big)
+		mock_reply(mock, "large.example.", u16(dns.Type.TXT), big)
+		big_query := build_query(
+			"large.example.",
+			u16(dns.Type.TXT),
+			id = 2,
+			edns_size = 4096,
+			allocator = context.allocator,
+		)
+		defer delete(big_query)
+
+		// An eighth of the answer, so the multiplier is visible in the count as
+		// well as in the bytes, and above `config.MIN_RESPONSE_SIZE_ESTIMATE`.
+		ESTIMATE :: 128
+
+		// Denominated: the large answers are charged by size.
+		sized_port := next_port(r)
+		sized, sok := start_server(
+			r,
+			Server_Options {
+				config = config_rate_limit(
+					sized_port,
+					upstream_port,
+					fmt.tprintf(
+						"enabled: true, responses_per_second: %d, slip: 0, response_size_estimate: %d",
+						RATE,
+						ESTIMATE,
+					),
+				),
+				udp_port = sized_port,
+			},
+		)
+		if check(r, sok, "the server charging by size did not start") {
+			defer stop_server(&sized)
+			// The burst, which both servers send, and then the flood that
+			// follows it, which is the one being measured.
+			_ = udp_flood(sized_port, big_query, QUERIES)
+			by_size := udp_flood(sized_port, big_query, QUERIES)
+
+			// Counted: every answer is one token whatever it weighs, so the
+			// prefix keeps receiving `responses_per_second` of them. This is the
+			// shipped behaviour and the shape of the finding.
+			counted_port := next_port(r)
+			counted, cok := start_server(
+				r,
+				Server_Options {
+					config = config_rate_limit(
+						counted_port,
+						upstream_port,
+						fmt.tprintf("enabled: true, responses_per_second: %d, slip: 0", RATE),
+					),
+					udp_port = counted_port,
+				},
+			)
+			if check(r, cok, "the server counting datagrams did not start") {
+				defer stop_server(&counted)
+				_ = udp_flood(counted_port, big_query, QUERIES)
+				by_count := udp_flood(counted_port, big_query, QUERIES)
+				check(
+					r,
+					by_count.bytes > 0,
+					"the flood of large answers drew nothing at all once the burst was spent, so this is measuring the mock",
+				)
+				check(
+					r,
+					by_size.bytes * 3 < by_count.bytes,
+					"a flood past the burst drew %d bytes in %d answers charged by size against %d in %d charged by the datagram",
+					by_size.bytes,
+					by_size.answered,
+					by_count.bytes,
+					by_count.answered,
+				)
+			}
+		}
+
+		/*
+		And the client whose answers are ordinary is charged exactly as it was.
+
+		The other half of the setting, and the one an operator is trusting: an
+		answer inside the estimate costs one token, so a prefix asking for A
+		records still gets `responses_per_second` of them. Without this the case
+		above would also pass for a setting that simply lowered the budget.
+
+		The allowance is for the datagrams this loses rather than for the budget:
+		a burst of QUERIES at once is UDP, and a socket that drops one is the
+		suite's own, not the server's.
+		*/
+		small_port := next_port(r)
+		small, mok := start_server(
+			r,
+			Server_Options {
+				config = config_rate_limit(
+					small_port,
+					upstream_port,
+					fmt.tprintf(
+						"enabled: true, responses_per_second: %d, slip: 0, response_size_estimate: %d",
+						RATE,
+						ESTIMATE,
+					),
+				),
+				udp_port = small_port,
+			},
+		)
+		if check(r, mok, "the server answering small queries did not start") {
+			defer stop_server(&small)
+			// The same A query the cases above flood with, whose answer is
+			// well inside the estimate.
+			res := udp_flood(small_port, query, QUERIES)
+			check(
+				r,
+				res.answered >= BURST - 4,
+				"only %d small answers out of a budget that holds %d, so ordinary clients are being charged for size they did not use",
+				res.answered,
+				BURST,
+			)
+		}
+	}
+	end_case(r)
+
+	/*
 	The same flood down one TCP connection, which the limiter used not to see at
 	all.
 

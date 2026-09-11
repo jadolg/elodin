@@ -411,6 +411,84 @@ test_rate_limit_settings_are_checked :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+/*
+What the datagram budget is denominated in, and what it is when nobody says.
+
+The default is the one property that matters for every file already written: the
+estimate resolves to `server.max_udp_response`, which no datagram can exceed, so
+every answer costs exactly one token and the figure means what it meant before
+there was a key. That holds at a raised ceiling too, which is the case a constant
+1232 here would have quietly changed.
+*/
+@(test)
+test_the_response_size_estimate_defaults_to_the_udp_ceiling :: proc(t: ^testing.T) {
+	unset := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    responses_per_second: 500\n"
+	cfg, err := load_string(unset, context.temp_allocator)
+	_, has := err.?
+	testing.expect(t, !has, "a file that names no estimate was refused")
+	testing.expect_value(t, cfg.server.rate_limit.response_size_estimate, DEFAULT_MAX_UDP_RESPONSE)
+
+	raised := "upstream:\n  servers: [1.1.1.1]\nserver:\n  max_udp_response: 4096\n  rate_limit:\n    responses_per_second: 500\n"
+	rcfg, rerr := load_string(raised, context.temp_allocator)
+	_, rhas := rerr.?
+	testing.expect(t, !rhas, "a raised ceiling with no estimate was refused")
+	testing.expect_value(t, rcfg.server.rate_limit.response_size_estimate, 4096)
+
+	// Written, and written as a size: the same spellings `max_udp_response`
+	// takes, since it is the figure this is measured against.
+	sized := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    response_size_estimate: 1KiB\n"
+	scfg, serr := load_string(sized, context.temp_allocator)
+	_, shas := serr.?
+	testing.expect(t, !shas, "an estimate written as a size was refused")
+	testing.expect_value(t, scfg.server.rate_limit.response_size_estimate, 1024)
+
+	free_all(context.temp_allocator)
+}
+
+/*
+An estimate outside its bounds is refused rather than clamped.
+
+Below the floor every answer this server can send costs more than one token,
+which is `responses_per_second` turned into a byte budget with an unstated
+multiplier; above `MAX_UDP_RESPONSE` no datagram is large enough for the figure
+to reach, so it is a key doing nothing. Both are worth a startup error rather
+than a server whose bound is not the one its file states.
+*/
+@(test)
+test_a_response_size_estimate_out_of_bounds_is_refused :: proc(t: ^testing.T) {
+	tiny := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    response_size_estimate: 8\n"
+	_, err := load_string(tiny, context.temp_allocator)
+	e, has := err.?
+	testing.expect(t, has, "an estimate below the floor was accepted")
+	if has {
+		testing.expect_value(t, len(e.messages), 1)
+		testing.expect(
+			t,
+			strings.contains(e.messages[0], "response_size_estimate"),
+			"the error does not name the setting",
+		)
+	}
+
+	huge := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    response_size_estimate: 64KiB\n"
+	_, herr := load_string(huge, context.temp_allocator)
+	_, hhas := herr.?
+	testing.expect(t, hhas, "an estimate above the largest datagram was accepted")
+
+	negative := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    response_size_estimate: -1\n"
+	_, nerr := load_string(negative, context.temp_allocator)
+	_, nhas := nerr.?
+	testing.expect(t, nhas, "a negative estimate was accepted")
+
+	// The floor and the ceiling themselves are inside, not outside.
+	edges := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    response_size_estimate: 64\n"
+	ecfg, eerr := load_string(edges, context.temp_allocator)
+	_, ehas := eerr.?
+	testing.expect(t, !ehas, "the floor itself was refused")
+	testing.expect_value(t, ecfg.server.rate_limit.response_size_estimate, MIN_RESPONSE_SIZE_ESTIMATE)
+
+	free_all(context.temp_allocator)
+}
+
 // A configuration whose `server.rate_limit.overrides` is `body`.
 @(private = "file")
 with_overrides :: proc(body: string) -> string {
