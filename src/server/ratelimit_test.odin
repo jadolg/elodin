@@ -1216,14 +1216,20 @@ test_a_prefix_in_debt_keeps_its_bucket :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, rate_check(r, victim, at(0)), Rate_Verdict.Drop)
 
-	// Every other prefix in a /16, asking once each, a moment later. The victim's
-	// own third octet is skipped: a query there is the victim's bucket being
-	// charged again, not a stranger arriving beside it.
-	for i in 0 ..< 256 {
-		if i == 100 {
-			continue
-		}
-		_ = rate_check(r, v4(198, 51, u8(i), 9), at(10))
+	/*
+	Four times as many distinct /24s as there are buckets, which is the flood
+	`test_a_flood_of_prefixes_does_not_reset_a_live_bucket` uses and the reason
+	it is that many: the property here is about what a stranger who lands on the
+	victim's bucket may do to it, so the flood has to be certain to produce one.
+	A /16's worth - 255 prefixes against `RRL_BUCKETS` - reaches it about once in
+	sixty runs, and the other fifty-nine assert only that the victim is still in
+	debt, which the line above already said.
+
+	Out of 10/8 rather than the victim's own /16: a query in its prefix would be
+	its bucket being charged again, not a stranger arriving beside it.
+	*/
+	for i in 0 ..< RRL_BUCKETS * 4 {
+		_ = rate_check(r, v4(10, u8(i >> 8), u8(i), 1), at(10))
 	}
 	testing.expect_value(t, rate_check(r, victim, at(10)), Rate_Verdict.Drop)
 }
