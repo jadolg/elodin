@@ -242,7 +242,8 @@ validator_query :: proc(
 Re-ask the client's question with DO and CD set.
 
 The client's own EDNS options ride along, but the payload size and the DO bit
-are ours. Its cookie and its client-subnet option are taken back out further
+are ours. The three an upstream has no business seeing - its cookie, its
+client-subnet option and its keepalive request - are taken back out further
 down, and its transaction ID replaced, once this and the plain forwarding path
 have converged.
 */

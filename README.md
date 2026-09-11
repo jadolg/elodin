@@ -1536,6 +1536,37 @@ padded, for the same reason cookies are. An upstream that pads its replies back
 has that padding taken off before the answer is stored, so the cache holds the
 answer rather than the answer plus a block of zeroes.
 
+### Telling a client how long its connection is held
+
+A client that opens a TCP or DoT connection and reuses it has one number it needs
+and cannot see: how long this server will hold the connection idle before
+reclaiming it. That number is `server.client_timeout`, ten seconds by default,
+and without being told it a client either re-handshakes on a cadence it guessed
+or holds a connection it believes is alive and finds out on its next query. On
+DoT that guess costs a full TLS handshake, which is the cost
+[`max_connections_per_prefix`](#how-many-connections-one-client-may-hold) and the
+[connection rate limit](#rate-limiting) are both sized around.
+
+So a client that asks is told. RFC 7828 defines edns-tcp-keepalive for exactly
+this, and a query carrying the option is answered with one stating
+`server.client_timeout` in units of 100 ms — read from the setting when the answer
+is built, so changing it changes what clients are told rather than leaving them
+holding a stale figure.
+
+Three conditions, each from a rule rather than a preference. Only TCP and DoT: on
+UDP there is no connection and RFC 7828 §3.3.1 says a server "MUST ignore the
+option", and RFC 8484 §10 puts the whole extension outside DoH, where the
+connection's lifetime is HTTP's to describe. Only a client that sent the option,
+which is how §3.2.1 has a client signal it cares. And nothing at all when
+`client_timeout` is not a timeout that can be stated — a non-positive setting is
+no idle timeout at all, and the only value the field could carry for that is 0,
+which §3.4 defines as a request to close at once.
+
+The option is hop-by-hop, so a client's own is taken back out of the query before
+it is forwarded. It describes the connection between that client and this server
+and means nothing one hop further on; relayed to a UDP upstream it would also be
+this server sending the shape §3.2.1 forbids outright.
+
 ### DNS rebinding protection
 
 ```yaml
@@ -1949,13 +1980,15 @@ rebuilt without them; every other answer goes back verbatim, bar the two bytes o
 payload size in the OPT record.
 
 Also handled: EDNS0 — the client's OPT record is forwarded upstream so payload
-sizes are negotiated end to end, minus its cookie and its client-subnet option,
-which both stop here; a query with two OPT records, or with one whose options
-cannot be read, is answered FORMERR rather than forwarded, neither being a
-message those two can be taken back out of. Then DNS cookies in both directions,
-[EDNS(0) padding](#edns-padding) in both directions on DoT and DoH and on
-neither of the clear transports, truncation with the TC bit and the UDP→TCP
-retry, `version.bind`/`hostname.bind` in the CHAOS class, local NODATA answers
+sizes are negotiated end to end, minus its cookie, its client-subnet option and
+its keepalive request, which all stop here; a query with two OPT records, or with
+one whose options cannot be read, is answered FORMERR rather than forwarded, no
+such message being one they can be taken back out of. Then DNS cookies in both
+directions, [EDNS(0) padding](#edns-padding) in both directions on DoT and DoH and
+on neither of the clear transports, the
+[connection idle timeout](#telling-a-client-how-long-its-connection-is-held) told
+to a TCP or DoT client that asks for it, truncation with the TC bit and the
+UDP→TCP retry, `version.bind`/`hostname.bind` in the CHAOS class, local NODATA answers
 for `resolver.arpa`, refusal of zone-transfer requests, and the reserved names of
 RFC 6761 and RFC 7686 answered here instead of forwarded.
 

@@ -593,6 +593,10 @@ build_query :: proc(
 	cookie: []u8 = nil,
 	// A PADDING option, same again: the bytes a client pads its query with.
 	padding: []u8 = nil,
+	// An edns-tcp-keepalive option, same again. It carries no value: RFC 7828
+	// section 3.1 gives OPTION-LENGTH 0 in a query, the TIMEOUT being the
+	// server's to state.
+	keepalive := false,
 	allocator := context.temp_allocator,
 ) -> []u8 {
 	buf := make([dynamic]u8, 0, 64, allocator)
@@ -636,6 +640,9 @@ build_query :: proc(
 		if padding != nil {
 			rdlength += 4 + len(padding)
 		}
+		if keepalive {
+			rdlength += 4
+		}
 		append(&buf, u8(rdlength >> 8), u8(rdlength))
 		if cookie != nil {
 			append(&buf, 0, 10) // COOKIE
@@ -646,6 +653,10 @@ build_query :: proc(
 			append(&buf, 0, 12) // PADDING
 			append(&buf, u8(len(padding) >> 8), u8(len(padding)))
 			append(&buf, ..padding)
+		}
+		if keepalive {
+			append(&buf, 0, 11) // edns-tcp-keepalive
+			append(&buf, 0, 0) // no TIMEOUT, which is the only shape a client sends
 		}
 	}
 	return buf[:]
@@ -667,6 +678,36 @@ find_padding :: proc(wire: []u8) -> (padding: []u8, found: bool) {
 		return nil, false
 	}
 	return dns.find_edns_option(msg, .Padding)
+}
+
+/*
+The edns-tcp-keepalive option carried in a message, if it has one.
+
+The raw bytes, as `find_cookie` and `find_padding` hand back theirs, rather than
+the number inside them. A length is the whole of what separates the two shapes
+RFC 7828 section 3.1 defines - none in a query, two octets in a response - so a
+reader that decoded the value and reported a wrong length as "no option" would
+answer "did this server write a keepalive" with "no" for the one wrong answer
+worth catching: the client's own zero-length option echoed back verbatim. Those
+are the bytes a case asserting absence has to be able to see.
+
+`pw_keepalive_units` is the other half, for the cases that want the number.
+*/
+find_keepalive :: proc(wire: []u8) -> (timeout: []u8, found: bool) {
+	msg, err := dns.decode_message(wire, context.temp_allocator)
+	if err != .None {
+		return nil, false
+	}
+	return dns.find_edns_option(msg, .TCP_Keepalive)
+}
+
+// The TIMEOUT those bytes state, in the 100ms units of RFC 7828 section 3.1.
+// `ok` is false for any length but the two octets a response carries.
+keepalive_units :: proc(timeout: []u8) -> (units: u16, ok: bool) {
+	if len(timeout) != 2 {
+		return 0, false
+	}
+	return u16(timeout[0]) << 8 | u16(timeout[1]), true
 }
 
 Header :: struct {

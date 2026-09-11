@@ -487,7 +487,14 @@ Server_Config :: struct {
 	from the machine.
 	*/
 	upstream_workers:           int,
-	// Per-connection read timeout for TCP, DoT and DoH clients.
+	/*
+	Per-connection read timeout for TCP, DoT and DoH clients.
+
+	Also what a TCP or DoT client that sends edns-tcp-keepalive is told, since it
+	is the idle timeout that connection actually has - see `attach_keepalive` in
+	`src/server/keepalive.odin`, where RFC 7828 requires the two to be the same
+	number.
+	*/
 	client_timeout:             time.Duration,
 	// Stream connections - TCP, DoT and DoH together - that may exist at once,
 	// for the whole server. How much of it one client may hold is
