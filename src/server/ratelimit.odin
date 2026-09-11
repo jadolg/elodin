@@ -1044,13 +1044,23 @@ start_rate_limiter :: proc(s: ^Server) -> bool {
 	The default tier's figure. A network named in `overrides` has its own
 	`responses_per_second`, printed on its own line below, and the same estimate
 	applies to it - the unit is one per server, see `Rate_Limiter.estimate`.
+
+	In whichever unit says something, which is one sentence and two renderings of
+	the figure in it rather than two sentences: a tight budget - 10/s at the
+	64-byte floor is 640 bytes - divides into kilobytes as "about 0 KB/s", the one
+	figure on this line an operator cannot have meant.
 	*/
 	if cfg.response_size_estimate > 0 && cfg.response_size_estimate < s.cfg.server.max_udp_response {
+		per_second := cfg.responses_per_second * cfg.response_size_estimate
+		// Out of the temp arena, which startup resets around this, as the
+		// override lines below are.
+		amount :=
+			fmt.tprintf("%d KB/s", per_second / 1024) if per_second >= 1024 else fmt.tprintf("%d bytes/s", per_second)
 		logx.infof(
-			"rate limit: an answer over %d bytes is charged as several datagrams, so the %d/s above is about %d KB/s of answers at one prefix however large they are",
+			"rate limit: an answer over %d bytes is charged as several datagrams, so the %d/s above is about %s of answers at one prefix however large they are",
 			cfg.response_size_estimate,
 			cfg.responses_per_second,
-			cfg.responses_per_second * cfg.response_size_estimate / 1024,
+			amount,
 		)
 	} else if text, say := response_size_estimate_warning(
 		cfg.response_size_estimate,

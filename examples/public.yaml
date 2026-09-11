@@ -106,11 +106,10 @@ server:
     # trade. Multiplied out with `response_size_estimate` below it is the
     # ceiling on what one victim network can be made to receive: 500 * 1232
     # bytes is about 600 KB/s aimed at one /24, small enough not to be worth an
-    # attacker's bandwidth. In the other
-    # direction it has to be generous enough for a real /24 that is a carrier
-    # NAT with thousands of subscribers behind it - and when such a client does
-    # exceed it, `slip` sends it to TCP rather than dropping it, so it keeps
-    # resolving one round trip slower.
+    # attacker's bandwidth. In the other direction it has to be generous enough
+    # for a real /24 that is a carrier NAT with thousands of subscribers behind
+    # it - and when such a client does exceed it, `slip` sends it to TCP rather
+    # than dropping it, so it keeps resolving one round trip slower.
     #
     # That last part has a ceiling, and on a public instance it is the number to
     # know. The TCP the slip sends a client to is charged to a budget of the

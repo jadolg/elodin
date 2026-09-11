@@ -1035,6 +1035,9 @@ open or the queries it may ask over them. Nothing about a large UDP answer says
 anything about the work behind a query on a connection, and a size charged to the
 `Connection` pool would be a datagram deciding whether a stranger's clients may
 connect - which is the hole a separate pool exists to close.
+
+The two transports here; `Slip` is the third, and it is the recourse rather than
+a transport, so it is asked for on its own below.
 */
 @(test)
 test_the_size_charge_is_the_datagram_pool_alone :: proc(t: ^testing.T) {
@@ -1044,11 +1047,14 @@ test_the_size_charge_is_the_datagram_pool_alone :: proc(t: ^testing.T) {
 	defer destroy_rate_limiter(r)
 
 	client := v4(203, 0, 113, 65)
-	// The datagram pool spent and overspent: a full bucket of large answers.
+	// The datagram pool spent and overspent: a full bucket of large answers,
+	// admitted and then billed, which is both the order the server does it in and
+	// the only one that leaves the pool owing rather than at zero.
 	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		if rate_check(r, client, at(0)) == .Allow {
-			rate_charge_response(r, client, 1232, at(0))
-		}
+		testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Allow)
+	}
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		rate_charge_response(r, client, 1232, at(0))
 	}
 	testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Drop)
 
@@ -1078,6 +1084,55 @@ test_the_size_charge_is_the_datagram_pool_alone :: proc(t: ^testing.T) {
 		"large datagram answers took %d of the %d connections the prefix could open",
 		opened,
 		RATE * RRL_BURST_SECONDS,
+	)
+}
+
+/*
+And the way out is still open to a prefix that owes tokens.
+
+The one property the debt must not cost, since it is the only thing a real client
+caught behind a spoofed flood has: `slip` answers one in `slip` over-limit
+datagrams truncated, which is what tells that client to come back over TCP, where
+the handshake proves its address and no datagram budget follows it. A `Slip` pool
+charged for a datagram's size would close that door exactly when a flood of large
+answers had opened the debt - the clients who need the invitation are the ones
+whose prefix is deepest overdrawn.
+
+Nothing charges it, because `rate_charge_response` touches `Datagram` and no
+other pool. Asserted against a bucket that is not merely empty but owing: a full
+bucket admitted and then billed, which is the burst the read loop lets through
+before the first answer is weighed.
+*/
+@(test)
+test_a_prefix_in_debt_is_still_offered_its_slip :: proc(t: ^testing.T) {
+	RATE :: 100
+	SLIP :: 2
+	ESTIMATE :: 128
+	r := make_rate_limiter(RATE, SLIP, nil, ESTIMATE)
+	defer destroy_rate_limiter(r)
+
+	client := v4(203, 0, 113, 68)
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Allow)
+	}
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		rate_charge_response(r, client, 1232, at(0))
+	}
+
+	// A second later the prefix owes some sixteen more, so every one of these is
+	// over the budget - and one in `SLIP` of them comes back truncated anyway.
+	slipped := 0
+	for _ in 0 ..< 10 {
+		if rate_check(r, client, at(1000)) == .Truncate {
+			slipped += 1
+		}
+	}
+	testing.expectf(
+		t,
+		slipped == 10 / SLIP,
+		"a prefix in debt was offered %d truncated answers out of 10, expected the %d its slip spacing owes it",
+		slipped,
+		10 / SLIP,
 	)
 }
 
@@ -1144,24 +1199,49 @@ test_a_prefix_in_debt_keeps_its_bucket :: proc(t: ^testing.T) {
 	defer destroy_rate_limiter(r)
 
 	victim := v4(198, 51, 100, 5)
+	/*
+	Admitted first and billed after, which is the order the read loop and the
+	workers do it in - and the only order that leaves the bucket owing rather
+	than merely empty. Billing as each answer is admitted stops at zero: the
+	check refuses the next datagram the moment the tokens run out, so nothing is
+	left to overspend, and a millisecond of refill would hand the prefix an
+	answer. Overdrawn is the precondition here, so it is set up as a flood sets
+	it up.
+	*/
 	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		if rate_check(r, victim, at(0)) == .Allow {
-			rate_charge_response(r, victim, 1232, at(0))
-		}
+		testing.expect_value(t, rate_check(r, victim, at(0)), Rate_Verdict.Allow)
+	}
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		rate_charge_response(r, victim, 1232, at(0))
 	}
 	testing.expect_value(t, rate_check(r, victim, at(0)), Rate_Verdict.Drop)
 
-	// Every other prefix in a /16, asking once each, a moment later.
+	// Every other prefix in a /16, asking once each, a moment later. The victim's
+	// own third octet is skipped: a query there is the victim's bucket being
+	// charged again, not a stranger arriving beside it.
 	for i in 0 ..< 256 {
+		if i == 100 {
+			continue
+		}
 		_ = rate_check(r, v4(198, 51, u8(i), 9), at(10))
 	}
 	testing.expect_value(t, rate_check(r, victim, at(10)), Rate_Verdict.Drop)
 }
 
+/*
+A limiter that is off allows everything, since that is what a nil one means to
+every caller.
+
+Including the size charge, which `udp_job` makes on every answer it sends without
+asking whether there is a limiter to charge: `rate_limit.enabled: false` leaves
+`Server.limiter` nil, so the nil here is the configuration an operator wrote and
+not a defensive guard against nothing.
+*/
 @(test)
 test_rate_limit_disabled_allows_everything :: proc(t: ^testing.T) {
 	for i in 0 ..< 1000 {
 		testing.expect_value(t, rate_check(nil, v4(192, 0, 2, u8(i % 256)), at(0)), Rate_Verdict.Allow)
+		rate_charge_response(nil, v4(192, 0, 2, u8(i % 256)), 4096, at(0))
 		testing.expect(
 			t,
 			stream_rate_check(nil, v4(192, 0, 2, u8(i % 256)), at(0)),
