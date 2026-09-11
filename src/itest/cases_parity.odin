@@ -687,3 +687,262 @@ parity_live_config :: proc(
 	)
 	return with_cache
 }
+
+// --- fixed cases -----------------------------------------------------------
+
+/*
+A divergence a generated run turned up, asked for by name.
+
+A seed is no use for this one. `parity-regression` replays four hundred queries
+per seed, and the shape below occurs about once in a hundred thousand - it was
+query 2774 of one run and query 12467 of another, so the seeds that found it
+would replay four hundred ordinary queries and pass. The query is written down
+instead, and this runs in the ordinary suite where it gates a pull request
+rather than behind `--parity`, which nothing gates.
+*/
+run_parity_fixed_cases :: proc(r: ^Runner) {
+	parity_additional_dropped_case(r)
+}
+
+/*
+The name the run that found it asked about.
+
+Verbatim, because the mock synthesises its zone from a hash of the name and the
+type (`parity_synth_reply`): a name somebody typed would be answered with some
+other shape, and the shape is the whole of what this case needs. Lower case
+where the run's was mixed, which is the same name - the mock folds the question
+before it hashes it.
+
+Three labels of sixty, which is what makes the reply overflow the client's
+datagram by one record rather than by ten.
+*/
+@(private = "file")
+PARITY_286_NAME ::
+	"pe3ejfjex8s2vf5cvcgt9dzueqrilmudabo8rtn6yewyef0n4vlnpkihf2pr." +
+	"1-ru_xmfmm0qnxytsoewoac2hxp0a-2fp23jqg28t0xnlvhp2s1xwx_1stc7." +
+	"qmbcprg7q7aszhfzwprbgzauaexahf6z7a0yvaib2cqigzgej7jdd5hfdhkd." +
+	"_dns.resolver.parity.test."
+
+// The datagram this client can be sent, and the ceiling the answer is fitted
+// into: the bare 512 of RFC 1035 section 4.2.1, which is also what the query
+// below advertises.
+@(private = "file")
+PARITY_286_CEILING :: 512
+
+/*
+A glue record left out to fit the client's datagram is not a divergence (#286).
+
+RFC 2181 section 9: a responder that could not fit additional data leaves the
+whole RRSet out and sends the reply as it is, with TC clear. The client asked a
+question and has its answer; the address it did not get is ordinary additional
+data it can go and ask for. `encode_message` in src/dns/encode.odin does exactly
+that, and the comparison had no allowance for it - the record fell through to a
+bare "a record missing from the additional section" with no reason beside it,
+and a run of the length worth running failed on something nobody did wrong.
+
+The shape is the one the run found: a DNSKEY question the mock answers with
+three keys, one NS in the authority section and its A and AAAA glue in the
+additional one. That comes to 632 bytes against a client that can take 512, and
+elodin writes 511 of them - the answer whole, the authority whole, the A glue,
+the OPT record, and no AAAA. (626 in the issue, which was written before the
+mock's OPT record carried a six-byte keepalive.)
+
+Every part of that shape is checked before the comparison is asked about it. A
+case whose fixture stopped holding a record to drop would otherwise agree with
+an answer that never dropped one, which is a case that passes and tests nothing.
+*/
+@(private = "file")
+parity_additional_dropped_case :: proc(r: ^Runner) {
+	start_case(
+		r,
+		"parity: a glue record dropped to fit the client's datagram is not a divergence",
+	)
+	defer end_case(r)
+
+	udp_port := next_port(r)
+	mock_port := next_port(r)
+
+	mock := mock_make("parity-fixed", mock_port)
+	mock_parity_all(mock)
+	if !mock_start(mock) {
+		fail(r, "the parity mock did not start on port %d", mock_port)
+		return
+	}
+	defer mock_stop(mock)
+
+	// The same configuration a generated run uses, so the answer is fitted the
+	// same way: no cache, no blocking, no rewrites, one attempt per query.
+	cfg := parity_config(r, udp_port, 0, 0, mock_port, false)
+	srv, ok := start_server(
+		r,
+		Server_Options{config = cfg, udp_port = udp_port, tcp_port = udp_port},
+	)
+	if !ok {
+		return
+	}
+	defer stop_server(&srv)
+
+	q := parity_fixed_query(PARITY_286_NAME, 48, PARITY_286_CEILING)
+	mock_reset_replies(mock)
+	res := query_udp(srv.udp_port, q.wire, context.temp_allocator)
+	if !check(r, res.ok, "no answer came back over udp") {
+		return
+	}
+	/*
+	The last reply, not the only one.
+
+	This client advertised 512 and the forwarded query carries the client's OPT
+	record as it is, so the mock cuts its own reply to 512 and sets TC, and
+	src/upstream/plain.odin asks again over TCP. Two replies for one client
+	query, and the second is the whole answer and the one to hold elodin's
+	against. `parity_one_mock` reads the last reply for the same reason.
+	*/
+	reference, _ := mock_last_reply(mock)
+	if !check(r, reference != nil, "the mock sent no reply") {
+		return
+	}
+
+	up := pw_parse(reference, context.temp_allocator)
+	el := pw_parse(res.wire, context.temp_allocator)
+	if !parity_286_shape(r, up, el) {
+		return
+	}
+
+	policy := Parity_Policy {
+		mode              = .Mock,
+		dnssec_validation = false,
+		ttl_exact         = true,
+		transport         = .UDP,
+		client_udp_limit  = PARITY_286_CEILING,
+	}
+	c := parity_compare(q, reference, res.wire, policy)
+	/*
+	Both halves of it: nothing unexplained, and every record that went missing
+	explained by the allowance this case is about rather than by one of the
+	others happening to cover it.
+	*/
+	dropped := len(up.additional) - len(el.additional)
+	named := 0
+	for d in c.diffs {
+		if d.reason == "" {
+			fail(r, "%s: upstream %s, elodin %s", d.what, d.upstream, d.elodin)
+			continue
+		}
+		if d.kind == .Additional && strings.contains(d.reason, "RFC 2181 section 9") {
+			named += 1
+		}
+	}
+	check(
+		r,
+		named == dropped,
+		"%d of the %d records the datagram cost the additional section were matched to that reason",
+		named,
+		dropped,
+	)
+}
+
+/*
+The shape the case needs, checked before the comparison is asked about it.
+
+None of this is the point of the case; all of it has to hold for the case to
+have a point at all. The mock synthesises its zone from a hash of the name, so
+a change there could leave this name answered with something that fits a
+datagram whole - and a case that compared two identical messages would agree
+with them and report a pass. Each check says what stopped holding, and the way
+to fix one is to find a name the mock still answers this way and put it in
+`PARITY_286_NAME`.
+*/
+@(private = "file")
+parity_286_shape :: proc(r: ^Runner, up, el: Pw_Msg) -> bool {
+	if !check(r, up.ok, "the upstream's reply does not parse: %s", up.err) {
+		return false
+	}
+	if !check(r, el.ok, "elodin's answer does not parse: %s", el.err) {
+		return false
+	}
+	if !check(
+		r,
+		up.size > PARITY_286_CEILING,
+		"the upstream's reply is %d bytes, which fits a %d-byte datagram whole, so nothing had to be left out of it",
+		up.size,
+		PARITY_286_CEILING,
+	) {
+		return false
+	}
+	if !check(
+		r,
+		el.size <= PARITY_286_CEILING,
+		"elodin wrote %d bytes to a client that can take %d",
+		el.size,
+		PARITY_286_CEILING,
+	) {
+		return false
+	}
+	if !check(
+		r,
+		len(el.answer) == len(up.answer) && len(el.authority) == len(up.authority),
+		"the cut reached past the additional section: answer %d of %d, authority %d of %d",
+		len(el.answer),
+		len(up.answer),
+		len(el.authority),
+		len(up.authority),
+	) {
+		return false
+	}
+	/*
+	Fewer, not one fewer.
+
+	The fixture has a byte of slack - 511 written into 512 - so a reply that
+	grew by two would push the A glue out as well, and a count pinned at one
+	would turn the ordinary suite red over something that is not a bug and not
+	say why. What the case needs is that the datagram cost the additional
+	section a record; how many is the comparison's business, and every one of
+	them is held to the allowance below.
+	*/
+	if !check(
+		r,
+		len(el.additional) < len(up.additional),
+		"elodin kept all %d of the upstream's additional records, so the datagram cost this answer nothing and there is no drop to judge",
+		len(up.additional),
+	) {
+		return false
+	}
+	// The bit the whole case turns on: TC clear, so nothing tells the client to
+	// come back over TCP and nothing in the comparison can read the drop off a
+	// flag.
+	return check(
+		r,
+		!el.tc,
+		"elodin set tc, which RFC 2181 section 9 says not to do for additional data that would not fit",
+	)
+}
+
+/*
+A query written down rather than generated.
+
+`pg_query` builds one out of a seed, which is what a run wants and what a fixed
+case cannot have. The fields have to say what the bytes say, because the
+comparison reads both: the question that comes back is held against `name`,
+`qtype` and `qclass`, and the header bits against `rd`, `cd` and `do_bit`.
+*/
+@(private = "file")
+parity_fixed_query :: proc(name: string, qtype: u16, udp_size: u16) -> Parity_Query {
+	q := Parity_Query {
+		id        = 0x286a,
+		qtype     = qtype,
+		qclass    = 1,
+		rd        = true,
+		edns      = true,
+		udp_size  = udp_size,
+		transport = .UDP,
+		desc      = name,
+	}
+	q.wire = build_query(name, qtype, q.id, q.qclass, udp_size)
+	// The question as sent, which is what the echo is compared against. Read
+	// back out of the bytes rather than encoded a second time here.
+	m := pw_parse(q.wire, context.temp_allocator)
+	if m.ok && len(m.question) == 1 {
+		q.name = m.question[0].name
+	}
+	return q
+}
