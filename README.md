@@ -1092,7 +1092,7 @@ itself somewhere to put pressure.
 **What one of those responses is worth in bytes is `response_size_estimate`.**
 A victim receives traffic, and a count of sendings is worth whatever the answers
 weigh — which the attacker picks by picking the question. At the shipped 500 that
-is about 60 KB/s at one /24 if the answers are ~100-byte NODATAs and about 600
+is about 50 KB/s at one /24 if the answers are ~100-byte NODATAs and about 600
 KB/s if they are full 1232-byte DNSSEC answers, a twelvefold spread in the figure
 an operator thought they were setting. So an answer larger than the estimate is
 charged `ceil(size / response_size_estimate)` tokens instead of one — admitted on
@@ -1109,12 +1109,13 @@ smaller to choose the quantity directly: with the 1232 ceiling,
 than 600, while a client whose answers are ordinary — an A record is ~60 bytes —
 still gets its 500 a second. It is the datagram budget only: a connection has no
 size worth charging, and a truncated slip reply is 30-odd bytes by construction.
-The floor is 64 bytes, since below the smallest answer there is the setting stops
-being a size at all; anything at or above `max_udp_response` is what leaving it
-out already does. When it is set low enough to bite, the startup line says what
-the two figures multiply out to — and when it is set *above* `max_udp_response`,
-where no answer can reach it, `--check` and the startup log both say that instead,
-so a figure that looks like a tightening and is not does not pass unremarked.
+The floor is 64 bytes, since below the smallest answer this server sends the
+setting stops being a size at all; anything at or above `max_udp_response` is
+what leaving it out already does. When it is set low enough to bite, the startup
+line says what the two figures multiply out to — and when it is set *above*
+`max_udp_response`, where no answer can reach it, `--check` and the startup log
+both say that instead, so a figure that looks like a tightening and is not does
+not pass unremarked.
 
 Over-budget queries are not simply dropped. At most every `slip`th one comes back
 as a header and a question with the TC bit set: too small to be worth reflecting,
