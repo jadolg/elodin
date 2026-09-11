@@ -1114,13 +1114,16 @@ maximal one, so the `slip` pool's own `responses_per_second / 8` a second sits o
 top of the figure above rather than inside it.
 The floor is 64 bytes, since below the smallest answer this server sends the
 setting stops being a size at all; anything at or above `max_udp_response` is
-what leaving it out already does. When it is set low enough to bite, `--check`
-and the startup line say what the two figures multiply out to — and each
-`overrides` entry's line says the same for its own budget, since the estimate is
-one figure for the server — at whatever scale each figure lands on — `640.0B/s`, `62.5KiB/s`, `4.8MiB/s` — and when it is set *above*
-`max_udp_response`, where no answer can reach it, `--check` and the startup log
-both say that instead, so a figure that looks like a tightening and is not does
-not pass unremarked.
+what leaving it out already does.
+
+When it is set low enough to bite, `--check` and the startup line say what the
+two figures multiply out to, at whatever scale the figure lands on — `640.0B/s`,
+`62.5KiB/s`, `4.8MiB/s`. Each `overrides` entry's line carries the same product
+for its own budget, since the estimate is one figure for the whole server: a
+network raised to 4000/s at an estimate of 128 is told it has bought 500.0KiB/s,
+not 4000 answers of whatever size. And when the estimate is set *above*
+`max_udp_response`, where no answer can reach it, both say that instead, so a
+figure that looks like a tightening and is not does not pass unremarked.
 
 Over-budget queries are not simply dropped. At most every `slip`th one comes back
 as a header and a question with the TC bit set: too small to be worth reflecting,
