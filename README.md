@@ -1073,7 +1073,7 @@ server:
   rate_limit:
     enabled: true                 # on by default
     responses_per_second: 500     # per client prefix (/24 or /64), and per budget: datagrams, queries on a connection, connections opened
-    response_size_estimate: 1232  # what one answer costs the datagram budget; a larger one is charged as several. Default: max_udp_response
+    # response_size_estimate: 128 # bytes one answer costs the datagram budget; a larger one is charged as several. Left out it follows max_udp_response, so every answer costs one token
     slip: 2                       # answer at most every 2nd query over the budget truncated; 0 drops them all
 ```
 
@@ -1115,8 +1115,9 @@ top of the figure above rather than inside it.
 The floor is 64 bytes, since below the smallest answer this server sends the
 setting stops being a size at all; anything at or above `max_udp_response` is
 what leaving it out already does. When it is set low enough to bite, `--check`
-and the startup line say what the two figures multiply out to, at whatever scale
-the figure lands on — `640.0B/s`, `62.5KiB/s`, `4.8MiB/s` — and when it is set *above*
+and the startup line say what the two figures multiply out to — and each
+`overrides` entry's line says the same for its own budget, since the estimate is
+one figure for the server — at whatever scale each figure lands on — `640.0B/s`, `62.5KiB/s`, `4.8MiB/s` — and when it is set *above*
 `max_udp_response`, where no answer can reach it, `--check` and the startup log
 both say that instead, so a figure that looks like a tightening and is not does
 not pass unremarked.

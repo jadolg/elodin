@@ -531,7 +531,12 @@ main :: proc() {
 			); say {
 				fmt.printfln("  warning: %s", text)
 			}
-			for line in server.rate_limit_override_lines(cfg.server.rate_limit.overrides, context.temp_allocator) {
+			for line in server.rate_limit_override_lines(
+				cfg.server.rate_limit.overrides,
+				cfg.server.rate_limit.response_size_estimate,
+				cfg.server.max_udp_response,
+				context.temp_allocator,
+			) {
 				fmt.printfln("  %s", line)
 			}
 		}

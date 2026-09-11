@@ -2379,7 +2379,7 @@ test_the_override_lines_say_what_will_be_charged :: proc(t: ^testing.T) {
 		override("198.51.100.0/24", 4000, 2),
 		override("203.0.113.0/24", 50, 0),
 	}
-	lines := rate_limit_override_lines(overrides, context.temp_allocator)
+	lines := rate_limit_override_lines(overrides, allocator = context.temp_allocator)
 	// A header and one line per network.
 	if !testing.expect_value(t, len(lines), 3) {
 		return
@@ -2402,6 +2402,63 @@ test_the_override_lines_say_what_will_be_charged :: proc(t: ^testing.T) {
 
 	// Nothing configured, nothing said - so a deployment with no overrides gets
 	// no line at startup and none under `--check`.
-	testing.expect_value(t, len(rate_limit_override_lines(nil, context.temp_allocator)), 0)
+	testing.expect_value(t, len(rate_limit_override_lines(nil, allocator = context.temp_allocator)), 0)
+	free_all(context.temp_allocator)
+}
+
+/*
+And an override's count is multiplied out too, wherever the estimate bites.
+
+`response_size_estimate` is one figure for the server, so it denominates a
+network's own budget exactly as it denominates the default one: at 128 bytes a
+full-size answer costs ten tokens, and an operator who raised a network to 4000/s
+because they know it is a carrier NAT is being told about 4000 answers when what
+they have bought is 500 KB/s. The default tier's line says its product out loud -
+`rate_limit_denomination_line` - and a line beside it that said only the count
+would be the same figure in two units, one of them the one nobody meant.
+
+Silent where the estimate cannot bite, which is every configuration that does not
+write one: the loader resolves an unset estimate to `server.max_udp_response`, so
+`estimate < ceiling` is false and these lines read exactly as they did before
+there was a second figure.
+*/
+@(test)
+test_the_override_lines_say_what_the_estimate_makes_of_them :: proc(t: ^testing.T) {
+	overrides := []config.Rate_Limit_Override {
+		override("198.51.100.0/24", 4000, 2),
+		override("203.0.113.0/24", 50, 0),
+	}
+	// 128 bytes under a 1232-byte ceiling, which is the shipped ceiling and the
+	// estimate the documentation works its example at.
+	lines := rate_limit_override_lines(overrides, 128, 1232, context.temp_allocator)
+	if !testing.expect_value(t, len(lines), 3) {
+		return
+	}
+	// 4000 * 128 and 50 * 128, rendered by the `%.1M` every other byte figure
+	// this server prints is rendered by.
+	testing.expect(
+		t,
+		strings.contains(lines[1], "500.0KiB/s"),
+		"the raised network's line did not say what its budget comes to: %q",
+		lines[1],
+	)
+	testing.expect(
+		t,
+		strings.contains(lines[2], "6.2KiB/s"),
+		"the lowered network's line did not say what its budget comes to: %q",
+		lines[2],
+	)
+
+	// And nothing at all when the estimate is the ceiling, which is what a file
+	// that does not write one resolves to.
+	quiet := rate_limit_override_lines(overrides, 1232, 1232, context.temp_allocator)
+	if testing.expect_value(t, len(quiet), 3) {
+		testing.expect(
+			t,
+			!strings.contains(quiet[1], "/s of answers"),
+			"a default estimate put a byte figure on an override's line: %q",
+			quiet[1],
+		)
+	}
 	free_all(context.temp_allocator)
 }

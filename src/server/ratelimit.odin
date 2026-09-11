@@ -1103,7 +1103,12 @@ start_rate_limiter :: proc(s: ^Server) -> bool {
 	}
 	// Out of the temp arena, which startup resets around this: the lines are read
 	// once and `--check` renders the same ones from the same procedure.
-	for line in rate_limit_override_lines(cfg.overrides, context.temp_allocator) {
+	for line in rate_limit_override_lines(
+		cfg.overrides,
+		cfg.response_size_estimate,
+		s.cfg.server.max_udp_response,
+		context.temp_allocator,
+	) {
 		logx.infof("%s", line)
 	}
 	return true
@@ -1224,6 +1229,12 @@ lines once, which is a diagnosis rather than a flood.
 */
 rate_limit_override_lines :: proc(
 	overrides: []config.Rate_Limit_Override,
+	// The denomination and the ceiling it is measured against, so the count on
+	// each line can be multiplied out the way the default tier's is - see the
+	// note in the loop below. 0 for either leaves the lines as bare counts, which
+	// is what a caller with no estimate configured wants.
+	estimate: int = 0,
+	ceiling: int = 0,
 	allocator := context.allocator,
 ) -> []string {
 	if len(overrides) == 0 {
@@ -1246,13 +1257,41 @@ rate_limit_override_lines :: proc(
 		tier := make_rate_tier(o.responses_per_second, o.slip)
 		text := config.format_prefix(o.prefix, allocator)
 		defer delete(text, allocator)
+		/*
+		And what that count is worth in bytes, wherever the estimate can bite.
+
+		`response_size_estimate` is one figure for the whole server - see
+		`Rate_Limiter.estimate` - so it denominates an override's budget exactly as
+		it denominates the default's: a network raised to 5000/s may spend 5000
+		tokens a second, and one full-size answer costs several of them. Left as a
+		bare count the line reads as 5000 large answers a second, which is off by
+		`ceil(max_udp_response / response_size_estimate)` - and the operator raising
+		a budget for a network they know something about is choosing a quantity of
+		traffic, which is the figure `rate_limit_denomination_line` exists to say
+		out loud for the default tier.
+
+		Same wording and same `%.1M` as that line, so the two read as one statement
+		about one setting rather than as two figures in different units.
+		*/
+		budget := ""
+		if estimate > 0 && ceiling > 0 && estimate < ceiling {
+			budget = fmt.aprintf(
+				", about %.1M/s of answers however large they are",
+				int(tier.rate[.Datagram]) * estimate,
+				allocator = allocator,
+			)
+		}
+		defer if len(budget) > 0 {
+			delete(budget, allocator)
+		}
 		if tier.slip > 0 {
 			append(
 				&out,
 				fmt.aprintf(
-					"rate limit: %s: %d responses/s, 1 in %d over the datagram budget answered truncated, up to %d truncated answers/s",
+					"rate limit: %s: %d responses/s%s, 1 in %d over the datagram budget answered truncated, up to %d truncated answers/s",
 					text,
 					int(tier.rate[.Datagram]),
+					budget,
 					tier.slip,
 					int(tier.rate[.Slip]),
 					allocator = allocator,
@@ -1263,9 +1302,10 @@ rate_limit_override_lines :: proc(
 		append(
 			&out,
 			fmt.aprintf(
-				"rate limit: %s: %d responses/s, anything over that dropped",
+				"rate limit: %s: %d responses/s%s, anything over that dropped",
 				text,
 				int(tier.rate[.Datagram]),
+				budget,
 				allocator = allocator,
 			),
 		)
