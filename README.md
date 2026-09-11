@@ -1112,7 +1112,8 @@ size worth charging, and a truncated slip reply is 30-odd bytes by construction.
 The floor is 64 bytes, since below the smallest answer this server sends the
 setting stops being a size at all; anything at or above `max_udp_response` is
 what leaving it out already does. When it is set low enough to bite, `--check`
-and the startup line say what the two figures multiply out to, in KiB — and when it is set *above*
+and the startup line say what the two figures multiply out to, at whatever scale
+the figure lands on — `640.0B/s`, `62.5KiB/s`, `4.8MiB/s` — and when it is set *above*
 `max_udp_response`, where no answer can reach it, `--check` and the startup log
 both say that instead, so a figure that looks like a tightening and is not does
 not pass unremarked.
