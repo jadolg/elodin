@@ -767,10 +767,17 @@ rate_charge_response :: proc(r: ^Rate_Limiter, client: net.Endpoint, size: int, 
 
 	/*
 	The bucket as it is now, which is all but always the one that admitted the
-	datagram. A prefix whose bucket changed hands in the microseconds between is
-	charging a stranger's, which is the collision this table already accepts -
-	and a takeover needs every pool refilled to capacity, so the bucket being
-	taken is one nobody was spending from.
+	datagram: the gap is one answer, and a takeover needs every pool refilled to
+	capacity, which is `RRL_BURST_SECONDS` of quiet.
+
+	Not never, though, and the exception is worth naming rather than defining
+	away: a query held up at an upstream for longer than that is a prefix that
+	looks idle here, since what it is spending has not been billed yet. Its
+	bucket can refill, be claimed by a colliding prefix, and take this charge
+	instead - a stranger debited for somebody else's answer. That is the
+	collision this table already accepts, one step further, and it is bounded by
+	what one answer costs: a handful of tokens out of a full bucket, not a
+	budget.
 	*/
 	b := rate_bucket(r, client, now._nsec)
 	b.tokens[.Datagram] -= extra
@@ -1045,6 +1052,14 @@ start_rate_limiter :: proc(s: ^Server) -> bool {
 			cfg.responses_per_second,
 			cfg.responses_per_second * cfg.response_size_estimate / 1024,
 		)
+	} else if text, say := response_size_estimate_warning(
+		cfg.response_size_estimate,
+		s.cfg.server.max_udp_response,
+		context.temp_allocator,
+	); say {
+		// And the other side of that silence: a key that was written and does
+		// nothing. `--check` says the same sentence from the same procedure.
+		logx.warnf("%s", text)
 	}
 	// Out of the temp arena, which startup resets around this: the lines are read
 	// once and `--check` renders the same ones from the same procedure.
@@ -1052,6 +1067,50 @@ start_rate_limiter :: proc(s: ^Server) -> bool {
 		logx.infof("%s", line)
 	}
 	return true
+}
+
+/*
+The estimate that this server's own ceiling puts out of reach, said once, or
+nothing.
+
+The bounds `response_size_estimate` is validated against are
+`MIN_RESPONSE_SIZE_ESTIMATE` and `MAX_UDP_RESPONSE`, which are the widest a
+figure of this kind can be on any configuration. What bounds it on *this* one is
+`server.max_udp_response`, usually lower, and an estimate above that is a figure
+no answer can reach: an operator who wrote 2048 over the shipped 1232 has
+tightened nothing, and the line that says what the estimate comes to is written
+only when it can bite - which is exactly when this one cannot. So the mistake
+would otherwise be reported nowhere.
+
+A warning rather than a startup error, unlike the bounds themselves: the figure
+is harmless, it is refused nowhere else, and a file shared across hosts whose
+ceilings differ is a reasonable thing to have. What it is not is what its author
+thinks, which is a thing to be told rather than stopped for.
+
+Strictly above, so an unset estimate says nothing: the loader resolves that to
+`max_udp_response` itself, and a file that did not write the key has no mistake
+to be warned about.
+
+Returned rather than printed, for the reason `rate_limit_override_lines` below
+is: an operator reads `--check` before restarting, and that is the moment a
+setting that does nothing is cheapest to find. One wording of one fact, said in
+both places from here.
+*/
+response_size_estimate_warning :: proc(
+	estimate: int,
+	ceiling: int,
+	allocator := context.allocator,
+) -> (text: string, say: bool) {
+	if estimate <= 0 || estimate <= ceiling {
+		return "", false
+	}
+	return fmt.aprintf(
+		"server.rate_limit.response_size_estimate is %d bytes, above the %d server.max_udp_response allows, so no answer can reach it and every one costs a single token - lower it below %d for it to charge anything",
+		estimate,
+		ceiling,
+		ceiling,
+		allocator = allocator,
+	), true
 }
 
 /*

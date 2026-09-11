@@ -398,6 +398,55 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 	end_case(r)
 
 	/*
+	An estimate this server's own ceiling puts out of reach is said out loud.
+
+	The setting is validated against `config.MIN_RESPONSE_SIZE_ESTIMATE` and
+	`config.MAX_UDP_RESPONSE`, which are the widest a figure of this kind can be
+	on any configuration. What bounds it on *this* one is `max_udp_response`, so
+	everything between the two is accepted, charges nothing, and would otherwise
+	say nothing: the line explaining what the estimate comes to is written only
+	when it can bite, which is exactly when this one cannot.
+
+	An operator who writes 2048 over the shipped 1232 has tightened nothing and
+	believes they have. That is the mistake worth a line at startup - the same
+	place a wrong `overrides` entry is caught - rather than a bound that would
+	refuse a figure which is harmless everywhere else.
+	*/
+	start_case(r, "rate limit: an estimate above max_udp_response is reported as doing nothing")
+	{
+		inert_port := next_port(r)
+		inert, iok := start_server(
+			r,
+			Server_Options {
+				config = config_rate_limit(
+					inert_port,
+					upstream_port,
+					fmt.tprintf(
+						"enabled: true, responses_per_second: %d, slip: 0, response_size_estimate: 2048",
+						RATE,
+					),
+				),
+				udp_port = inert_port,
+			},
+		)
+		if check(r, iok, "the server with an unreachable estimate did not start") {
+			defer stop_server(&inert)
+			// The figures are in the needle: a case looking for the setting's
+			// name alone would pass on the error the loader writes for a figure
+			// out of bounds, which is a different thing being reported.
+			reported := "is 2048 bytes, above the 1232 server.max_udp_response allows"
+			check(
+				r,
+				log_contains(&inert, reported),
+				"an estimate no answer can reach was never reported (looking for %q); log:\n%s",
+				reported,
+				read_log(&inert),
+			)
+		}
+	}
+	end_case(r)
+
+	/*
 	The same flood down one TCP connection, which the limiter used not to see at
 	all.
 
