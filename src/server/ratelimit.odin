@@ -1139,6 +1139,11 @@ standing for anything between one and two kibibytes.
 Returned rather than printed, for the reason `rate_limit_override_lines` is: this
 is the figure an operator most wants to confirm before restarting, and `--check`
 is where they read it.
+
+Which is why the sentence names `responses_per_second` rather than pointing at it.
+At startup the count is on the line immediately above this one; under `--check`
+nothing prints it at all, so a "the 500/s above" would refer there to a line that
+is not in the output.
 */
 rate_limit_denomination_line :: proc(
 	responses_per_second: int,
@@ -1150,7 +1155,7 @@ rate_limit_denomination_line :: proc(
 		return "", false
 	}
 	return fmt.aprintf(
-		"rate limit: an answer over %d bytes is charged as several datagrams, so the %d/s above is about %.1M/s of answers at one prefix however large they are",
+		"rate limit: an answer over %d bytes is charged as several datagrams, so %d responses/s is about %.1M/s of answers at one prefix however large they are",
 		estimate,
 		responses_per_second,
 		responses_per_second * estimate,
