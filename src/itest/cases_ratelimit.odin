@@ -86,6 +86,22 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 	upstream_port := next_port(r)
 	mock := mock_make("ratelimit", upstream_port)
 	mock_synth_all(mock, {203, 0, 113, 9})
+	/*
+	The large answer the size case below floods with, registered here rather than
+	where it is used.
+
+	About 1100 bytes: over that case's estimate by a factor of eight, and inside
+	the 1232 `max_udp_response` default, so what comes back is the whole answer
+	rather than a TC bit.
+
+	Here because `mock_reply` keeps the slice rather than copying it, so the
+	payload has to outlive the mock that is still serving it - and a `defer` in
+	the case block runs while the mock is up. Registered before `defer
+	mock_stop`, which puts the free after the stop.
+	*/
+	big := big_txt_answer("large.example.", 4, context.allocator)
+	defer delete(big)
+	mock_reply(mock, "large.example.", u16(dns.Type.TXT), big)
 	if !mock_start(mock) {
 		skip_case(r, "rate limit", "cannot start the mock upstream")
 		return
@@ -274,12 +290,8 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 	*/
 	start_case(r, "rate limit: a large answer is charged as several datagrams")
 	{
-		// About 1100 bytes: over the estimate below by a factor of eight, and
-		// inside the 1232 `max_udp_response` default, so what comes back is the
-		// whole answer rather than a TC bit.
-		big := big_txt_answer("large.example.", 4, context.allocator)
-		defer delete(big)
-		mock_reply(mock, "large.example.", u16(dns.Type.TXT), big)
+		// The answer itself is registered with the mock at the top of this
+		// procedure, where it outlives the mock serving it.
 		big_query := build_query(
 			"large.example.",
 			u16(dns.Type.TXT),
