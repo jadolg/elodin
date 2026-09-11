@@ -809,7 +809,7 @@ test_the_slip_budget_is_a_pool_of_its_own :: proc(t: ^testing.T) {
 What one prefix can be made to receive is bytes, not sendings.
 
 The budget is a count, and a count is worth whatever the answers weigh: the same
-`responses_per_second` buys a victim 60 KB/s of ~100-byte NODATAs or 616 KB/s of
+`responses_per_second` buys a victim 50 KB/s of ~100-byte NODATAs or 616 KB/s of
 full 1232-byte DNSSEC answers, and which of the two it is is the attacker's to
 choose by choosing the question. That is the defect this asserts against - the
 figure an operator sets is a quantity of traffic, and a quantity that moves
