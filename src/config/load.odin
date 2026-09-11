@@ -217,6 +217,26 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 			&cfg.server.rate_limit.response_size_estimate,
 			"server.rate_limit",
 		)
+		/*
+		0 is the loader's own marker for a key nobody wrote, which `validate`
+		turns into `server.max_udp_response`. A file that writes it means
+		something by it, and what it would get is that same resolution: the key
+		doing nothing, silently, which is the one shape this setting is reported
+		in two other places to avoid. So it is refused like any other figure out
+		of bounds - `responses_per_second: 0` already is - and here rather than
+		in `validate`, since by then the two are the same value.
+		*/
+		if written := yaml.get(rl, "response_size_estimate");
+		   written != nil &&
+		   !yaml.is_null(written) &&
+		   cfg.server.rate_limit.response_size_estimate == 0 {
+			errorf(
+				l,
+				"server.rate_limit.response_size_estimate must be between %d and %d bytes (it is 0); leave the key out for one token per answer, which is what 0 would quietly do",
+				MIN_RESPONSE_SIZE_ESTIMATE,
+				MAX_UDP_RESPONSE,
+			)
+		}
 		opt_int(l, rl, "slip", &cfg.server.rate_limit.slip, "server.rate_limit")
 		load_rate_limit_overrides(l, rl, cfg)
 	}

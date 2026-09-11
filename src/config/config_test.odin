@@ -479,6 +479,18 @@ test_a_response_size_estimate_out_of_bounds_is_refused :: proc(t: ^testing.T) {
 	_, nhas := nerr.?
 	testing.expect(t, nhas, "a negative estimate was accepted")
 
+	/*
+	And 0, which is the loader's marker for a key nobody wrote.
+
+	Written, it would resolve to `max_udp_response` like an absent key does - the
+	setting doing nothing, with nothing said about it - so it is refused rather
+	than read as agreement with the default.
+	*/
+	zero := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    response_size_estimate: 0\n"
+	_, zerr := load_string(zero, context.temp_allocator)
+	_, zhas := zerr.?
+	testing.expect(t, zhas, "an estimate written as 0 was accepted")
+
 	// The floor and the ceiling themselves are inside, not outside.
 	edges := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    response_size_estimate: 64\n"
 	ecfg, eerr := load_string(edges, context.temp_allocator)
