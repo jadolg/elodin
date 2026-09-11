@@ -30,6 +30,18 @@ By prefix rather than by address: /24 for IPv4 and /64 for IPv6, since an
 attacker spoofing addresses picks them freely within the range they are aiming
 at, and a per-address budget would just be spread across it.
 
+And in bytes rather than in datagrams, which is the other half of "how much".
+What a victim receives is traffic; what the budget counts is sendings, and one
+sending is worth anything from a ~100-byte NODATA to a full 1232-byte DNSSEC
+answer - a twelvefold spread that the attacker picks the end of, by picking the
+question. So an answer larger than `response_size_estimate` is charged as several
+datagrams: `rate_check` admits on one token before the answer exists and
+`rate_charge_response` bills the rest once it has been packed, which makes
+`responses_per_second * response_size_estimate` the bound on what one prefix can
+be made to receive whatever is asked for. Unset, the estimate is
+`server.max_udp_response` and every answer costs exactly one token, which is what
+this did before there was a second figure.
+
 Over-limit queries are not all dropped. At most every `slip`th one is answered
 with a header and a question and the TC bit set, which is 30-odd bytes rather
 than 4096 - too small to be worth reflecting - and which tells a real client to
@@ -395,6 +407,22 @@ Rate_Limiter :: struct {
 	tiers:     []Rate_Tier,
 	prefixes:  []config.Prefix,
 	/*
+	What one answer costs the `Datagram` pool, in bytes - see
+	`rate_charge_response`.
+
+	One figure for the limiter rather than one per tier, unlike everything else
+	here: the budgets say how much this server will do for a network, and this
+	says what one datagram of it weighs. That is a property of what leaves the
+	socket - bounded for the whole process by `server.max_udp_response` - and
+	not of who it is addressed to, so an override changes how many answers a
+	prefix gets and not what one of them costs.
+
+	0 charges one token per answer whatever its size, which is what every caller
+	that does not configure one gets - the tests included - and what the
+	configured figure amounts to anyway when it is at or above the ceiling.
+	*/
+	estimate:  int,
+	/*
 	Keyed with process entropy, so which prefixes share a bucket is not
 	something an attacker can work out and use.
 
@@ -491,15 +519,22 @@ make_rate_tier :: proc(responses_per_second: int, slip: int) -> (t: Rate_Tier) {
 `overrides` defaults to none, which is every caller that does not configure any -
 the tests included. Tier 0 is always the pair passed here, so a limiter with no
 overrides behaves exactly as it did before there were tiers.
+
+`response_size_estimate` defaults to 0, which charges one token per answer
+whatever its size - see `Rate_Limiter.estimate`. The server passes the configured
+figure, which the loader resolves to `server.max_udp_response` when the file does
+not name one, and that amounts to the same thing: no datagram exceeds it.
 */
 make_rate_limiter :: proc(
 	responses_per_second: int,
 	slip: int,
 	overrides: []config.Rate_Limit_Override = nil,
+	response_size_estimate: int = 0,
 	allocator := context.allocator,
 ) -> ^Rate_Limiter {
 	r := new(Rate_Limiter, allocator)
 	r.allocator = allocator
+	r.estimate = response_size_estimate
 	r.buckets = make([]Rate_Bucket, RRL_BUCKETS, allocator)
 
 	/*
@@ -664,6 +699,117 @@ rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) -> Ra
 		return .Truncate
 	}
 	return .Drop
+}
+
+/*
+Charge what the answer turned out to weigh, once it has been packed.
+
+`rate_check` admits a datagram on one token, before there is an answer to
+measure - it runs in the read loop, ahead of the parse and the resolve, which is
+where a query this server will not answer is cheapest to turn away. So the token
+it spends is a deposit, and this is the rest of the bill: an answer of `size`
+bytes costs `ceil(size / estimate)` tokens in total, and what this subtracts is
+the rest of that - the part the deposit did not cover.
+
+Which makes `responses_per_second` a quantity again. A count of sendings is worth
+whatever the answers happened to weigh, and which end of that range they land on
+is the attacker's to choose by choosing the question: between a ~100-byte NODATA
+and a full 1232-byte DNSSEC answer the same budget is 50 KB/s or 616 KB/s aimed
+at one /24. Charged by size, the product `responses_per_second *
+response_size_estimate` is the ceiling whatever is asked for, and the operator
+sets both halves of it. AdGuard DNS charges the same way, for the same reason.
+
+The debt is paid by the next query in the prefix rather than by this one, since
+this one was admitted before there was anything to weigh. That is the shape a
+check before the answer forces, and it is the right way round: the bucket carries
+the overspend forward, so a prefix being fed large answers runs dry sooner and
+one asking small questions is charged nothing extra.
+
+`Datagram` alone. The stream pool bounds work behind an answer rather than
+traffic toward an address - the handshake settled where the client is - and
+`Connection` has no size at all.
+
+`Slip` is not charged either, and unlike the other two that is worth a figure
+rather than a reason. A truncated reply is a header and the question echoed back,
+which is 30-odd bytes for an ordinary name and 271 for a maximal one, and it is
+sent from the read loop where there is no answer to weigh - so it is outside the
+`responses_per_second * response_size_estimate` bound rather than inside it. What
+it adds is its own pool's refill: `responses_per_second / RRL_SLIP_SHARE` replies
+a second, so at the shipped 500 and an estimate of 128 the prefix may receive
+about 17 KB/s of slip on top of the 64 KB/s of answers, and only if the attacker
+spends a 271-byte query on each of them. Not charged for size because the
+recourse is the point: this is the reply that sends a real client to TCP, and a
+prefix already in debt is exactly the one that needs it. See
+`test_a_prefix_in_debt_is_still_offered_its_slip`, which says so.
+
+The debt is carried in full, with no floor under it, and what that costs is worth
+being plain about. The charge lands after the admission rather than with it, so a
+prefix that had a full bucket can have `capacity` large answers admitted before
+the first of them is billed - the read loop is faster than the workers - and the
+bill for all of them arrives afterwards. The bucket then owes several seconds,
+and the prefix hears nothing until it has paid - longer than the burst itself
+took.
+
+That is the arithmetic being right rather than wrong: what it owes is what this
+server sent, and a prefix that has just been sent a second of its budget in one
+breath is a prefix that has had its second. A floor would forgive exactly the
+overspend the setting exists to charge for - the burst is where the large answers
+are - and would leave `responses_per_second * response_size_estimate` an average
+this server exceeds whenever a flood pauses.
+
+The size of it, said as a figure rather than as "a few seconds". A burst arriving
+at a full bucket is admitted `capacity` deep before the first of it is billed, so
+the prefix owes `capacity * (k - 1)` where `k` is `ceil(size / estimate)` - and
+`capacity` is `RRL_BURST_SECONDS * rate`, so the silence that follows is
+`RRL_BURST_SECONDS * (k - 1)` seconds whatever the rate: 18 at an estimate of 128
+against the 1232 ceiling, and 38 at the 64-byte floor. That is what one short
+spoofed burst buys an attacker who wants a prefix dark, repeated every 18 or 38
+seconds rather than sustained - and against it, that the same prefix received
+`capacity` full-size answers for each of them, which is the traffic this bounds
+and which no setting here delivers twice.
+
+Two things it costs besides. A flood in a prefix costs the clients who live there
+for as long as the debt lasts rather than as long as the flood does; and a
+stranger prefix sharing the bucket through a collision is refused for that time
+too, and cannot take the bucket over while it does, since a pool below zero never
+reaches capacity. Both are the trade the rest of this file makes - a spoofed
+flood already empties the bucket a neighbour's queries are answered out of, and a
+collision already shares a budget - carried a few seconds further. `slip` is the
+answer to both, and it is untouched by any of this: it has a pool of its own, no
+size is charged to it, and one truncated answer moves a real client onto the
+stream pool where no datagram can follow. `test_a_prefix_in_debt_is_still_offered_its_slip`
+is that property.
+
+Nothing is charged when there is no estimate, or when the answer fits inside one:
+the common case, since the configured default is the largest datagram this server
+sends, and it costs a compare rather than the table lock.
+*/
+rate_charge_response :: proc(r: ^Rate_Limiter, client: net.Endpoint, size: int, now: time.Tick) {
+	if r == nil || r.estimate <= 0 || size <= r.estimate {
+		return
+	}
+	// Integer ceiling, minus the token `rate_check` already took.
+	extra := f64((size + r.estimate - 1) / r.estimate - 1)
+
+	sync.mutex_lock(&r.lock)
+	defer sync.mutex_unlock(&r.lock)
+
+	/*
+	The bucket as it is now, which is all but always the one that admitted the
+	datagram: the gap is one answer, and a takeover needs every pool refilled to
+	capacity, which is `RRL_BURST_SECONDS` of quiet.
+
+	Not never, though, and the exception is worth naming rather than defining
+	away: a query held up at an upstream for longer than that is a prefix that
+	looks idle here, since what it is spending has not been billed yet. Its
+	bucket can refill, be claimed by a colliding prefix, and take this charge
+	instead - a stranger debited for somebody else's answer. That is the
+	collision this table already accepts, one step further, and it is bounded by
+	what one answer costs: a handful of tokens out of a full bucket, not a
+	budget.
+	*/
+	b := rate_bucket(r, client, now._nsec)
+	b.tokens[.Datagram] -= extra
 }
 
 /*
@@ -890,7 +1036,12 @@ start_rate_limiter :: proc(s: ^Server) -> bool {
 	if !cfg.enabled {
 		return true
 	}
-	s.limiter = make_rate_limiter(cfg.responses_per_second, cfg.slip, cfg.overrides)
+	s.limiter = make_rate_limiter(
+		cfg.responses_per_second,
+		cfg.slip,
+		cfg.overrides,
+		cfg.response_size_estimate,
+	)
 	// The budgets are named in the line rather than left to the documentation: an
 	// operator reading `500` needs to know it is 500 datagrams, 500 queries on
 	// connections and 500 connections opened, not 500 between them - and that the
@@ -909,12 +1060,152 @@ start_rate_limiter :: proc(s: ^Server) -> bool {
 			cfg.responses_per_second,
 		)
 	}
+	/*
+	And what the figure above is worth in bytes, when that is not simply the
+	figure times the ceiling.
+
+	Said only when the estimate can bite - at or above `max_udp_response` no
+	answer is ever charged more than one token, so the line would describe a
+	setting that is doing nothing. When it does bite, this is the multiplication
+	an operator would otherwise do by hand, and the number they were actually
+	choosing: what one client prefix can be made to receive.
+
+	The default tier's figure. A network named in `overrides` has its own
+	`responses_per_second`, printed on its own line below, and the same estimate
+	applies to it - the unit is one per server, see `Rate_Limiter.estimate`.
+
+	Rendered by `%.1M`, which is what every other byte figure this server prints
+	is rendered by - the receive buffer on the `udp:` line is the one beside it -
+	so the unit on the number is the unit the number was divided by. A figure of
+	its own for each scale, and a digit past the point at every one of them: a
+	tight budget - 10/s at the 64-byte floor - reads "640.0B/s" rather than
+	rounding into "about 0 KB/s", and 16/s at 128 reads "2.0KiB/s" rather than
+	standing for anything between one and two kibibytes. Both are figures an
+	operator cannot have meant, and one threshold hand-written here would have
+	traded the first for the second.
+	*/
+	if text, say := rate_limit_denomination_line(
+		cfg.responses_per_second,
+		cfg.response_size_estimate,
+		s.cfg.server.max_udp_response,
+		context.temp_allocator,
+	); say {
+		logx.infof("%s", text)
+	} else if warning, warn := response_size_estimate_warning(
+		cfg.response_size_estimate,
+		s.cfg.server.max_udp_response,
+		context.temp_allocator,
+	); warn {
+		// And the other side of that silence: a key that was written and does
+		// nothing. Both sentences come from the procedures `--check` renders them
+		// with, and the two cannot both apply - one is the estimate under this
+		// server's ceiling and the other is it above.
+		logx.warnf("%s", warning)
+	}
 	// Out of the temp arena, which startup resets around this: the lines are read
 	// once and `--check` renders the same ones from the same procedure.
-	for line in rate_limit_override_lines(cfg.overrides, context.temp_allocator) {
+	for line in rate_limit_override_lines(
+		cfg.overrides,
+		cfg.response_size_estimate,
+		s.cfg.server.max_udp_response,
+		context.temp_allocator,
+	) {
 		logx.infof("%s", line)
 	}
 	return true
+}
+
+/*
+What `responses_per_second` and `response_size_estimate` multiply out to, which
+is the quantity an operator is choosing, or nothing when the estimate charges
+nothing.
+
+Written only when the estimate is under this server's ceiling, because that is
+when it can bite: at or above it every answer costs a single token and the
+sentence would describe a setting that is doing nothing. The other case has a
+warning of its own - `response_size_estimate_warning` - and the two are exclusive
+by construction.
+
+The default tier's figure. A network named in `overrides` has its own
+`responses_per_second` and the same estimate, since the unit is one per server -
+see `Rate_Limiter.estimate` - so its own line multiplies out the same way.
+
+Rendered by `%.1M`, which is what every other byte figure this server prints is
+rendered by - the receive buffer on the `udp:` line is the one beside it - so the
+unit on the number is the unit the number was divided by. A digit past the point
+at every scale: a tight budget, 10/s at the 64-byte floor, reads "640.0B/s"
+rather than rounding into "0 KB/s", and 16/s at 128 reads "2.0KiB/s" rather than
+standing for anything between one and two kibibytes.
+
+Returned rather than printed, for the reason `rate_limit_override_lines` is: this
+is the figure an operator most wants to confirm before restarting, and `--check`
+is where they read it.
+
+Which is why the sentence names `responses_per_second` rather than pointing at it.
+At startup the count is on the line immediately above this one; under `--check`
+nothing prints it at all, so a "the 500/s above" would refer there to a line that
+is not in the output.
+*/
+rate_limit_denomination_line :: proc(
+	responses_per_second: int,
+	estimate: int,
+	ceiling: int,
+	allocator := context.allocator,
+) -> (text: string, say: bool) {
+	if estimate <= 0 || estimate >= ceiling {
+		return "", false
+	}
+	return fmt.aprintf(
+		"rate limit: an answer over %d bytes is charged as several datagrams, so %d responses/s is about %.1M/s of answers at one prefix however large they are",
+		estimate,
+		responses_per_second,
+		responses_per_second * estimate,
+		allocator = allocator,
+	), true
+}
+
+/*
+The estimate that this server's own ceiling puts out of reach, said once, or
+nothing.
+
+The bounds `response_size_estimate` is validated against are
+`MIN_RESPONSE_SIZE_ESTIMATE` and `MAX_UDP_RESPONSE`, which are the widest a
+figure of this kind can be on any configuration. What bounds it on *this* one is
+`server.max_udp_response`, usually lower, and an estimate above that is a figure
+no answer can reach: an operator who wrote 2048 over the shipped 1232 has
+tightened nothing, and the line that says what the estimate comes to is written
+only when it can bite - which is exactly when this one cannot. So the mistake
+would otherwise be reported nowhere.
+
+A warning rather than a startup error, unlike the bounds themselves: the figure
+is harmless, it is refused nowhere else, and a file shared across hosts whose
+ceilings differ is a reasonable thing to have. What it is not is what its author
+thinks, which is a thing to be told rather than stopped for.
+
+Strictly above, so an unset estimate says nothing: the loader resolves that to
+`max_udp_response` itself, and a file that did not write the key has no mistake
+to be warned about.
+
+Returned rather than printed, for the reason `rate_limit_override_lines` below
+is: an operator reads `--check` before restarting, and that is the moment a
+setting that does nothing is cheapest to find. One wording of one fact, said in
+both places from here.
+*/
+response_size_estimate_warning :: proc(
+	estimate: int,
+	ceiling: int,
+	allocator := context.allocator,
+) -> (text: string, say: bool) {
+	if estimate <= 0 || estimate <= ceiling {
+		return "", false
+	}
+	return fmt.aprintf(
+		"server.rate_limit.response_size_estimate is %d bytes, above the %d server.max_udp_response allows, so no answer can reach it and every one costs a single token - lower it below %d for it to charge anything",
+		estimate,
+		ceiling,
+		ceiling,
+		allocator = allocator,
+	), true
 }
 
 /*
@@ -944,6 +1235,12 @@ lines once, which is a diagnosis rather than a flood.
 */
 rate_limit_override_lines :: proc(
 	overrides: []config.Rate_Limit_Override,
+	// The denomination and the ceiling it is measured against, so the count on
+	// each line can be multiplied out the way the default tier's is - see the
+	// note in the loop below. 0 for either leaves the lines as bare counts, which
+	// is what a caller with no estimate configured wants.
+	estimate: int = 0,
+	ceiling: int = 0,
 	allocator := context.allocator,
 ) -> []string {
 	if len(overrides) == 0 {
@@ -966,13 +1263,41 @@ rate_limit_override_lines :: proc(
 		tier := make_rate_tier(o.responses_per_second, o.slip)
 		text := config.format_prefix(o.prefix, allocator)
 		defer delete(text, allocator)
+		/*
+		And what that count is worth in bytes, wherever the estimate can bite.
+
+		`response_size_estimate` is one figure for the whole server - see
+		`Rate_Limiter.estimate` - so it denominates an override's budget exactly as
+		it denominates the default's: a network raised to 5000/s may spend 5000
+		tokens a second, and one full-size answer costs several of them. Left as a
+		bare count the line reads as 5000 large answers a second, which is off by
+		`ceil(max_udp_response / response_size_estimate)` - and the operator raising
+		a budget for a network they know something about is choosing a quantity of
+		traffic, which is the figure `rate_limit_denomination_line` exists to say
+		out loud for the default tier.
+
+		Same wording and same `%.1M` as that line, so the two read as one statement
+		about one setting rather than as two figures in different units.
+		*/
+		budget := ""
+		if estimate > 0 && ceiling > 0 && estimate < ceiling {
+			budget = fmt.aprintf(
+				", about %.1M/s of answers however large they are",
+				int(tier.rate[.Datagram]) * estimate,
+				allocator = allocator,
+			)
+		}
+		defer if len(budget) > 0 {
+			delete(budget, allocator)
+		}
 		if tier.slip > 0 {
 			append(
 				&out,
 				fmt.aprintf(
-					"rate limit: %s: %d responses/s, 1 in %d over the datagram budget answered truncated, up to %d truncated answers/s",
+					"rate limit: %s: %d responses/s%s, 1 in %d over the datagram budget answered truncated, up to %d truncated answers/s",
 					text,
 					int(tier.rate[.Datagram]),
+					budget,
 					tier.slip,
 					int(tier.rate[.Slip]),
 					allocator = allocator,
@@ -983,9 +1308,10 @@ rate_limit_override_lines :: proc(
 		append(
 			&out,
 			fmt.aprintf(
-				"rate limit: %s: %d responses/s, anything over that dropped",
+				"rate limit: %s: %d responses/s%s, anything over that dropped",
 				text,
 				int(tier.rate[.Datagram]),
+				budget,
 				allocator = allocator,
 			),
 		)

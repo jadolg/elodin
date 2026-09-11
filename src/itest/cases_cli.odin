@@ -57,6 +57,79 @@ run_cli_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	/*
+	A rate-limit figure that is accepted, charges nothing, and says so here.
+
+	`server.rate_limit.response_size_estimate` is bounded at load by the widest a
+	figure of its kind can be on any configuration; what bounds it on a given one
+	is that file's own `server.max_udp_response`. Everything between the two is
+	accepted and unreachable - an operator who writes 2048 over the shipped 1232
+	has tightened nothing and believes they have - and the startup line that says
+	what the estimate comes to is written only when it can bite.
+
+	So `--check` is where it is caught, which is before the file is serving
+	anybody. The same sentence is written to the log at startup, from the same
+	procedure; the integration case in `cases_ratelimit.odin` is that half.
+	*/
+	start_case(r, "cli: --check reports an estimate no answer can reach")
+	{
+		path := filepath.join({r.work_dir, "inert-estimate.yaml"}, context.temp_allocator) or_else ""
+		_ = os.write_entire_file(
+			path,
+			transmute([]u8)string(
+				"upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    enabled: true\n    response_size_estimate: 2048\n",
+			),
+		)
+		res := run_binary(r, []string{"--config", path, "--check"}, "check-inert-estimate")
+		if check(r, res.ok, "could not run the binary") {
+			// Valid, which is the point: it loads, and the warning is the only
+			// thing that says the setting is doing nothing.
+			check_eq_int(r, res.exit_code, 0, "exit code for an estimate above the ceiling")
+			check(
+				r,
+				strings.contains(res.output, "above the 1232 server.max_udp_response allows"),
+				"an estimate no answer can reach was not reported: %q",
+				res.output,
+			)
+		}
+
+		// And the estimate that does bite is multiplied out here, which is the
+		// figure an operator is confirming before they restart: 500/s at 128
+		// bytes is 64,000 bytes a second at one prefix.
+		biting := filepath.join({r.work_dir, "biting-estimate.yaml"}, context.temp_allocator) or_else ""
+		_ = os.write_entire_file(
+			biting,
+			transmute([]u8)string(
+				"upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    enabled: true\n    responses_per_second: 500\n    response_size_estimate: 128\n",
+			),
+		)
+		bres := run_binary(r, []string{"--config", biting, "--check"}, "check-biting-estimate")
+		if check(r, bres.ok, "could not run the binary") {
+			check_eq_int(r, bres.exit_code, 0, "exit code for an estimate under the ceiling")
+			check(
+				r,
+				strings.contains(bres.output, "62.5KiB/s"),
+				"the byte budget the two figures come to was not reported: %q",
+				bres.output,
+			)
+		}
+
+		// And the file that does not name one is not warned at: the loader
+		// resolves an unset estimate to the ceiling itself.
+		quiet := filepath.join({r.work_dir, "default-estimate.yaml"}, context.temp_allocator) or_else ""
+		_ = os.write_entire_file(quiet, transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\n"))
+		qres := run_binary(r, []string{"--config", quiet, "--check"}, "check-default-estimate")
+		if check(r, qres.ok, "could not run the binary") {
+			check(
+				r,
+				!strings.contains(qres.output, "response_size_estimate"),
+				"a file that names no estimate was warned about one: %q",
+				qres.output,
+			)
+		}
+	}
+	end_case(r)
+
 	start_case(r, "cli: --check rejects a config with no upstreams")
 	{
 		path := filepath.join({r.work_dir, "no-upstream.yaml"}, context.temp_allocator) or_else ""

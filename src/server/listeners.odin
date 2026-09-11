@@ -1220,6 +1220,23 @@ udp_job :: proc(data: rawptr) {
 	if !ok || len(response) == 0 {
 		return
 	}
+	/*
+	Charged before the send rather than after it.
+
+	`rate_check` in the read loop admitted this datagram on one token, before
+	there was an answer to weigh; this is what the answer turned out to cost
+	beyond that, and the next query from the prefix is what pays it - see
+	`rate_charge_response`. Before the send because the send is attempted either
+	way: a datagram the socket would not take is one this server built and
+	handed to the kernel, and a budget that only counted the writes that
+	succeeded would be one an attacker could empty for free by filling a send
+	queue.
+
+	Nothing at all when the estimate is the ceiling, which is what a
+	configuration that does not set one resolves to: no answer exceeds it, so
+	this is a compare and a return.
+	*/
+	rate_charge_response(s.limiter, job.client, len(response), time.tick_now())
 	_, _ = net.send_udp(job.socket, response, job.client)
 }
 
