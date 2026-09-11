@@ -1140,11 +1140,11 @@ test_a_prefix_in_debt_is_still_offered_its_slip :: proc(t: ^testing.T) {
 The debt outlives the burst that ran it up, and time is what repays it.
 
 The charge lands after the admission rather than with it, so the read loop can
-admit a full bucket of queries before the first answer is billed - which is what a flood looks like from
-here. What follows is a prefix that owes for every one of them, and is quiet until
-it has paid: ten 1232-byte answers at an estimate of 128 is a hundred tokens, a
-second of a hundred-a-second budget, and the tenth of a second after them is not
-enough.
+admit a full bucket of queries before the first answer is billed - which is what
+a flood looks like from here. What follows is a prefix that owes for every one of
+them, and is quiet until it has paid: ten 1232-byte answers at an estimate of 128
+is a hundred tokens, a second of a hundred-a-second budget, and the tenth of a
+second after them is not enough.
 
 Uncapped on purpose. The overspend is exactly what a floor would forgive - the
 burst is where the large answers are - and forgiving it would leave

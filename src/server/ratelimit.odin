@@ -721,9 +721,9 @@ sets both halves of it. AdGuard DNS charges the same way, for the same reason.
 
 The debt is paid by the next query in the prefix rather than by this one, since
 this one was admitted before there was anything to weigh. That is the shape a
-check before the answer forces, and it is the right way round: the bucket carries the overspend forward,
-so a prefix being fed large answers runs dry sooner and one asking small
-questions is charged nothing extra.
+check before the answer forces, and it is the right way round: the bucket carries
+the overspend forward, so a prefix being fed large answers runs dry sooner and
+one asking small questions is charged nothing extra.
 
 `Datagram` alone. The stream pool bounds work behind an answer rather than
 traffic toward an address - the handshake settled where the client is - and
@@ -739,15 +739,16 @@ a second, so at the shipped 500 and an estimate of 128 the prefix may receive
 about 17 KB/s of slip on top of the 64 KB/s of answers, and only if the attacker
 spends a 271-byte query on each of them. Not charged for size because the
 recourse is the point: this is the reply that sends a real client to TCP, and a
-prefix already in debt is exactly the one that needs it - see
-`test_a_prefix_in_debt_is_still_offered_its_slip`.
+prefix already in debt is exactly the one that needs it. See
+`test_a_prefix_in_debt_is_still_offered_its_slip`, which says so.
 
 The debt is carried in full, with no floor under it, and what that costs is worth
 being plain about. The charge lands after the admission rather than with it, so a
 prefix that had a full bucket can have `capacity` large answers admitted before
 the first of them is billed - the read loop is faster than the workers - and the
-bill for all of them arrives afterwards. The bucket then owes several seconds and the prefix hears
-nothing until it has paid, which is longer than the burst itself took.
+bill for all of them arrives afterwards. The bucket then owes several seconds,
+and the prefix hears nothing until it has paid - longer than the burst itself
+took.
 
 That is the arithmetic being right rather than wrong: what it owes is what this
 server sent, and a prefix that has just been sent a second of its budget in one
