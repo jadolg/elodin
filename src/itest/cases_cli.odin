@@ -93,6 +93,27 @@ run_cli_cases :: proc(r: ^Runner) {
 			)
 		}
 
+		// And the estimate that does bite is multiplied out here, which is the
+		// figure an operator is confirming before they restart: 500/s at 128
+		// bytes is 64,000 bytes a second at one prefix.
+		biting := filepath.join({r.work_dir, "biting-estimate.yaml"}, context.temp_allocator) or_else ""
+		_ = os.write_entire_file(
+			biting,
+			transmute([]u8)string(
+				"upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    enabled: true\n    responses_per_second: 500\n    response_size_estimate: 128\n",
+			),
+		)
+		bres := run_binary(r, []string{"--config", biting, "--check"}, "check-biting-estimate")
+		if check(r, bres.ok, "could not run the binary") {
+			check_eq_int(r, bres.exit_code, 0, "exit code for an estimate under the ceiling")
+			check(
+				r,
+				strings.contains(bres.output, "62.5KiB/s"),
+				"the byte budget the two figures come to was not reported: %q",
+				bres.output,
+			)
+		}
+
 		// And the file that does not name one is not warned at: the loader
 		// resolves an unset estimate to the ceiling itself.
 		quiet := filepath.join({r.work_dir, "default-estimate.yaml"}, context.temp_allocator) or_else ""

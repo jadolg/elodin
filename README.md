@@ -1111,8 +1111,8 @@ still gets its 500 a second. It is the datagram budget only: a connection has no
 size worth charging, and a truncated slip reply is 30-odd bytes by construction.
 The floor is 64 bytes, since below the smallest answer this server sends the
 setting stops being a size at all; anything at or above `max_udp_response` is
-what leaving it out already does. When it is set low enough to bite, the startup
-line says what the two figures multiply out to — and when it is set *above*
+what leaving it out already does. When it is set low enough to bite, `--check`
+and the startup line say what the two figures multiply out to, in KiB — and when it is set *above*
 `max_udp_response`, where no answer can reach it, `--check` and the startup log
 both say that instead, so a figure that looks like a tightening and is not does
 not pass unremarked.

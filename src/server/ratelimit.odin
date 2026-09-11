@@ -742,14 +742,30 @@ server sent, and a prefix that has just been sent a second of its budget in one
 breath is a prefix that has had its second. A floor would forgive exactly the
 overspend the setting exists to charge for - the burst is where the large answers
 are - and would leave `responses_per_second * response_size_estimate` an average
-this server exceeds whenever a flood pauses. Bounded, in any case, by what can be
-in flight at once, which `server.max_pending` is the ceiling on.
+this server exceeds whenever a flood pauses.
 
-What it does mean is that a flood in a prefix costs the clients who live there a
-little longer than the flood lasts. That is the same trade the rest of this file
-makes - a spoofed flood already empties the bucket a neighbour's queries are
-answered out of - reaching a few seconds further, and `slip` is still what gets
-one of those clients onto the stream pool where no datagram can follow.
+The size of it, said as a figure rather than as "a few seconds". A burst arriving
+at a full bucket is admitted `capacity` deep before the first of it is billed, so
+the prefix owes `capacity * (k - 1)` where `k` is `ceil(size / estimate)` - and
+`capacity` is `RRL_BURST_SECONDS * rate`, so the silence that follows is
+`RRL_BURST_SECONDS * (k - 1)` seconds whatever the rate: 18 at an estimate of 128
+against the 1232 ceiling, and 38 at the 64-byte floor. That is what one short
+spoofed burst buys an attacker who wants a prefix dark, repeated every 18 or 38
+seconds rather than sustained - and against it, that the same prefix received
+`capacity` full-size answers for each of them, which is the traffic this bounds
+and which no setting here delivers twice.
+
+Two things it costs besides. A flood in a prefix costs the clients who live there
+for as long as the debt lasts rather than as long as the flood does; and a
+stranger prefix sharing the bucket through a collision is refused for that time
+too, and cannot take the bucket over while it does, since a pool below zero never
+reaches capacity. Both are the trade the rest of this file makes - a spoofed
+flood already empties the bucket a neighbour's queries are answered out of, and a
+collision already shares a budget - carried a few seconds further. `slip` is the
+answer to both, and it is untouched by any of this: it has a pool of its own, no
+size is charged to it, and one truncated answer moves a real client onto the
+stream pool where no datagram can follow. `test_a_prefix_in_debt_is_still_offered_its_slip`
+is that property.
 
 Nothing is charged when there is no estimate, or when the answer fits inside one:
 the common case, since the configured default is the largest datagram this server
@@ -1055,22 +1071,23 @@ start_rate_limiter :: proc(s: ^Server) -> bool {
 	operator cannot have meant, and one threshold hand-written here would have
 	traded the first for the second.
 	*/
-	if cfg.response_size_estimate > 0 && cfg.response_size_estimate < s.cfg.server.max_udp_response {
-		per_second := cfg.responses_per_second * cfg.response_size_estimate
-		logx.infof(
-			"rate limit: an answer over %d bytes is charged as several datagrams, so the %d/s above is about %.1M/s of answers at one prefix however large they are",
-			cfg.response_size_estimate,
-			cfg.responses_per_second,
-			per_second,
-		)
-	} else if text, say := response_size_estimate_warning(
+	if text, say := rate_limit_denomination_line(
+		cfg.responses_per_second,
 		cfg.response_size_estimate,
 		s.cfg.server.max_udp_response,
 		context.temp_allocator,
 	); say {
+		logx.infof("%s", text)
+	} else if warning, warn := response_size_estimate_warning(
+		cfg.response_size_estimate,
+		s.cfg.server.max_udp_response,
+		context.temp_allocator,
+	); warn {
 		// And the other side of that silence: a key that was written and does
-		// nothing. `--check` says the same sentence from the same procedure.
-		logx.warnf("%s", text)
+		// nothing. Both sentences come from the procedures `--check` renders them
+		// with, and the two cannot both apply - one is the estimate under this
+		// server's ceiling and the other is it above.
+		logx.warnf("%s", warning)
 	}
 	// Out of the temp arena, which startup resets around this: the lines are read
 	// once and `--check` renders the same ones from the same procedure.
@@ -1078,6 +1095,50 @@ start_rate_limiter :: proc(s: ^Server) -> bool {
 		logx.infof("%s", line)
 	}
 	return true
+}
+
+/*
+What `responses_per_second` and `response_size_estimate` multiply out to, which
+is the quantity an operator is choosing, or nothing when the estimate charges
+nothing.
+
+Written only when the estimate is under this server's ceiling, because that is
+when it can bite: at or above it every answer costs a single token and the
+sentence would describe a setting that is doing nothing. The other case has a
+warning of its own - `response_size_estimate_warning` - and the two are exclusive
+by construction.
+
+The default tier's figure. A network named in `overrides` has its own
+`responses_per_second` and the same estimate, since the unit is one per server -
+see `Rate_Limiter.estimate` - so its own line multiplies out the same way.
+
+Rendered by `%.1M`, which is what every other byte figure this server prints is
+rendered by - the receive buffer on the `udp:` line is the one beside it - so the
+unit on the number is the unit the number was divided by. A digit past the point
+at every scale: a tight budget, 10/s at the 64-byte floor, reads "640.0B/s"
+rather than rounding into "0 KB/s", and 16/s at 128 reads "2.0KiB/s" rather than
+standing for anything between one and two kibibytes.
+
+Returned rather than printed, for the reason `rate_limit_override_lines` is: this
+is the figure an operator most wants to confirm before restarting, and `--check`
+is where they read it.
+*/
+rate_limit_denomination_line :: proc(
+	responses_per_second: int,
+	estimate: int,
+	ceiling: int,
+	allocator := context.allocator,
+) -> (text: string, say: bool) {
+	if estimate <= 0 || estimate >= ceiling {
+		return "", false
+	}
+	return fmt.aprintf(
+		"rate limit: an answer over %d bytes is charged as several datagrams, so the %d/s above is about %.1M/s of answers at one prefix however large they are",
+		estimate,
+		responses_per_second,
+		responses_per_second * estimate,
+		allocator = allocator,
+	), true
 }
 
 /*

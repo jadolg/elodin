@@ -513,8 +513,17 @@ main :: proc() {
 		the mistake is serving anybody.
 		*/
 		if cfg.server.rate_limit.enabled {
-			// A figure this server's ceiling puts out of reach charges nothing
-			// and is reported nowhere else - see there.
+			// What the two rate-limit figures multiply out to, which is the
+			// quantity being chosen, and - where the estimate is one no answer
+			// can reach - that it charges nothing and is reported nowhere else.
+			if text, say := server.rate_limit_denomination_line(
+				cfg.server.rate_limit.responses_per_second,
+				cfg.server.rate_limit.response_size_estimate,
+				cfg.server.max_udp_response,
+				context.temp_allocator,
+			); say {
+				fmt.printfln("  %s", text)
+			}
 			if text, say := server.response_size_estimate_warning(
 				cfg.server.rate_limit.response_size_estimate,
 				cfg.server.max_udp_response,
