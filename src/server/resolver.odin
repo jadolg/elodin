@@ -209,6 +209,17 @@ Server :: struct {
 	// The strings are the anchors' own; only the slice belongs to this field.
 	anchor_zones: []string,
 	cookies:      ^Cookie_Keeper,
+	/*
+	What signs the Apple configuration profile, or nil when the DoH listener or
+	its profile endpoint is off.
+
+	Held here rather than beside the TLS contexts it takes its identity from
+	because the request handlers reach the server and not the listeners. It owns
+	its references to the certificate and key, so it needs none of the locking
+	that guards those contexts against a reload; `reload_tls` hands it the new
+	identity instead. See `profile.odin`.
+	*/
+	profiles:     ^Profile_Signer,
 	// Nil when rate limiting is off; `rate_check` takes that as "allow".
 	limiter:      ^Rate_Limiter,
 	handler_pool: ^pool.Pool,

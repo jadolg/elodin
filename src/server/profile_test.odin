@@ -1,0 +1,647 @@
+package server
+
+import "core:bytes"
+import "core:fmt"
+import "core:os"
+import "core:sync"
+import "core:testing"
+import "elodin:tlsx"
+
+/*
+The profile endpoint's signing cache.
+
+Signing is the one expensive thing a request to this endpoint can ask for, and
+the host it is asked about arrives in a request header. So these are mostly about
+what the endpoint refuses to do: sign for a name the certificate does not cover,
+sign the same thing twice, sign at a rate an attacker chooses, or hand out
+anything at all once the certificate it would be signed with has expired.
+*/
+
+@(private = "file")
+CERT_DIR :: "/tmp/elodin-server-profile-test"
+
+@(private = "file")
+cert_once: sync.Once
+@(private = "file")
+cert_path: string
+@(private = "file")
+key_path: string
+@(private = "file")
+cert_ok: bool
+
+/*
+Two certificates for the same names, so a test can rotate from one to the other
+and tell which one signed.
+
+Regenerated on every run: these assert on the validity window and on the exact
+names carried, so a pair cached by an older revision of this file would be wrong
+rather than merely slow.
+*/
+@(private = "file")
+second_cert_path: string
+@(private = "file")
+second_key_path: string
+/*
+A wildcard pair, for the cases about a client asking for many distinct
+authorities.
+
+With the port bounded to the ones this listener answers on, a certificate naming
+three hosts can only be asked about a handful of authorities - not enough to fill
+a cache, let alone flood one. A wildcard SAN is the shape that still can, and so
+the one the cache's eviction order and the signing budget have to be tested
+against.
+*/
+@(private = "file")
+wild_cert_path: string
+@(private = "file")
+wild_key_path: string
+
+@(private = "file")
+generate_certs :: proc() {
+	if !os.exists(CERT_DIR) {
+		if err := os.make_directory(CERT_DIR); err != nil {
+			return
+		}
+	}
+	cert_path = CERT_DIR + "/cert.pem"
+	key_path = CERT_DIR + "/key.pem"
+	second_cert_path = CERT_DIR + "/cert2.pem"
+	second_key_path = CERT_DIR + "/key2.pem"
+	if !make_cert(cert_path, key_path) {
+		return
+	}
+	if !make_cert(second_cert_path, second_key_path) {
+		return
+	}
+	wild_cert_path = CERT_DIR + "/wild.pem"
+	wild_key_path = CERT_DIR + "/wild-key.pem"
+	if !make_cert(wild_cert_path, wild_key_path, "*.elodin.test") {
+		return
+	}
+	cert_ok = true
+}
+
+@(private = "file")
+make_cert :: proc(cert, key: string, name := "") -> bool {
+	subject := "/CN=elodin.local"
+	// The IPv6 SAN is what `test_profile_refuses_an_unbracketed_address_literal`
+	// needs: without an address the certificate covers, that case would be
+	// refused by the name check and would say nothing about the spelling rule.
+	san := "subjectAltName=DNS:elodin.local,DNS:localhost,IP:127.0.0.1,IP:::1"
+	if name != "" {
+		subject = fmt.tprintf("/CN=%s", name)
+		san = fmt.tprintf("subjectAltName=DNS:%s", name)
+	}
+	devnull, nerr := os.open("/dev/null", {.Write})
+	defer if nerr == nil {
+		os.close(devnull)
+	}
+	desc := os.Process_Desc {
+		command = []string {
+			"openssl",
+			"req",
+			"-x509",
+			"-newkey",
+			"ec",
+			"-pkeyopt",
+			"ec_paramgen_curve:prime256v1",
+			"-nodes",
+			"-keyout",
+			key,
+			"-out",
+			cert,
+			"-days",
+			"30",
+			"-subj",
+			subject,
+			"-addext",
+			san,
+		},
+	}
+	if nerr == nil {
+		desc.stdout = devnull
+		desc.stderr = devnull
+	}
+	process, perr := os.process_start(desc)
+	if perr != nil {
+		return false
+	}
+	state, werr := os.process_wait(process)
+	return werr == nil && state.exit_code == 0
+}
+
+// Package-visible: `mobileconfig_test` drives the same certificate through the
+// real HTTP endpoints, and a second copy of the generation would be a second
+// `openssl` racing this one over its own output files.
+ensure_profile_certs :: proc() -> (cert, key: string, ok: bool) {
+	sync.once_do(&cert_once, generate_certs)
+	return cert_path, key_path, cert_ok
+}
+
+// A signer over the first certificate, with everything the tests need to drive
+// it by hand: the context is returned so the caller can rotate onto another.
+make_test_profile_signer :: proc(t: ^testing.T) -> (p: ^Profile_Signer, ctx: ^tlsx.Context, ok: bool) {
+	cert, key, cok := ensure_profile_certs()
+	if !cok {
+		testing.expect(t, false, "openssl could not make a certificate")
+		return nil, nil, false
+	}
+	tctx, err := tlsx.server_context(cert, key)
+	if err != .None {
+		testing.expectf(t, false, "no server context: %v", err)
+		return nil, nil, false
+	}
+	return make_profile_signer(tctx, "/dns-query", TEST_DOH_PORT), tctx, true
+}
+
+// The port the test listener is on, so `elodin.local`, `elodin.local:443` and
+// `elodin.local:8443` are the authorities it will sign for and nothing else is.
+@(private = "file")
+TEST_DOH_PORT :: 8443
+
+// The same, over a certificate whose wildcard SAN makes an unbounded number of
+// hosts signable - which is what the cache and the budget have to hold up under.
+@(private = "file")
+make_test_wildcard_signer :: proc(t: ^testing.T) -> (p: ^Profile_Signer, ctx: ^tlsx.Context, ok: bool) {
+	if _, _, cok := ensure_profile_certs(); !cok {
+		testing.expect(t, false, "openssl could not make a certificate")
+		return nil, nil, false
+	}
+	tctx, err := tlsx.server_context(wild_cert_path, wild_key_path)
+	if err != .None {
+		testing.expectf(t, false, "no server context: %v", err)
+		return nil, nil, false
+	}
+	return make_profile_signer(tctx, "/dns-query", TEST_DOH_PORT), tctx, true
+}
+
+// Offsets from now, against certificates minted at test time for 30 days.
+@(private = "file")
+at :: proc(offset: i64) -> i64 {
+	return tlsx.unix_now() + offset
+}
+
+/*
+The same authority is signed once and served from the cache after that.
+
+This is the whole answer to a flood on this endpoint: the second request and
+every one after it costs a copy rather than a signature.
+*/
+@(test)
+test_profile_is_signed_once_per_authority :: proc(t: ^testing.T) {
+	p, ctx, ok := make_test_profile_signer(t)
+	if !ok {
+		return
+	}
+	defer tlsx.context_destroy(ctx)
+	defer destroy_profile_signer(p)
+
+	first, s1 := profile_for_host(p, "elodin.local", at(0), context.temp_allocator)
+	testing.expect_value(t, s1, Profile_Status.OK)
+	testing.expect(t, len(first) > 0, "a profile should have come back")
+
+	second, s2 := profile_for_host(p, "elodin.local", at(0), context.temp_allocator)
+	testing.expect_value(t, s2, Profile_Status.OK)
+	testing.expect(t, bytes.equal(first, second), "the cached profile should be the one already signed")
+	testing.expect_value(t, sync.atomic_load(&p.signed_total), u64(1))
+}
+
+/*
+The profile that comes back is the signed form of the profile for that authority.
+
+The payload travels inside the CMS structure, so the URL the device is being
+pointed at is there in the bytes; a signature over somebody else's profile would
+verify just as well and point the device somewhere else.
+*/
+@(test)
+test_profile_carries_the_authority_it_was_asked_about :: proc(t: ^testing.T) {
+	p, ctx, ok := make_test_profile_signer(t)
+	if !ok {
+		return
+	}
+	defer tlsx.context_destroy(ctx)
+	defer destroy_profile_signer(p)
+
+	profile, status := profile_for_host(p, "elodin.local:8443", at(0), context.temp_allocator)
+	testing.expect_value(t, status, Profile_Status.OK)
+	// DER: a SignedData is a SEQUENCE, so the first byte is the universal
+	// constructed tag. An unsigned profile would start with '<'.
+	testing.expect(t, len(profile) > 0 && profile[0] == 0x30, "the profile should be DER, not plain XML")
+	testing.expect(
+		t,
+		bytes.contains(profile, transmute([]u8)string("https://elodin.local:8443/dns-query")),
+		"the signed payload should be the profile for that authority",
+	)
+}
+
+/*
+An expired certificate serves nothing, cache or no cache.
+
+The cache is what makes this worth a test of its own: an entry signed while the
+certificate was valid is still sitting there when it expires, and serving it
+would be handing a device a profile signed by a certificate that is no longer
+good. The entry has to be refused on the way out, not merely not refreshed.
+*/
+@(test)
+test_profile_is_refused_once_the_certificate_has_expired :: proc(t: ^testing.T) {
+	p, ctx, ok := make_test_profile_signer(t)
+	if !ok {
+		return
+	}
+	defer tlsx.context_destroy(ctx)
+	defer destroy_profile_signer(p)
+
+	warm, s1 := profile_for_host(p, "elodin.local", at(0), context.temp_allocator)
+	testing.expect_value(t, s1, Profile_Status.OK)
+	testing.expect(t, len(warm) > 0, "the cache should have been warmed")
+
+	// A year on, well past the thirty days the test certificate was minted for.
+	expired, status := profile_for_host(p, "elodin.local", at(365 * 24 * 3600), context.temp_allocator)
+	testing.expect_value(t, status, Profile_Status.Unavailable)
+	testing.expect(t, len(expired) == 0, "nothing should be served from a certificate that has expired")
+
+	// And the same for one that is not valid yet.
+	early, estatus := profile_for_host(p, "elodin.local", at(-365 * 24 * 3600), context.temp_allocator)
+	testing.expect_value(t, estatus, Profile_Status.Unavailable)
+	testing.expect(t, len(early) == 0, "nothing should be served before the certificate is valid")
+}
+
+/*
+A host the certificate does not cover is refused without signing anything.
+
+Two things at once: a profile naming a host this server has no certificate for
+could never work on the device, and the host arrives in a header, so signing for
+whatever it says is an invitation to spend the CPU on an unbounded supply of
+distinct profiles.
+*/
+@(test)
+test_profile_refuses_a_host_outside_the_certificate :: proc(t: ^testing.T) {
+	p, ctx, ok := make_test_profile_signer(t)
+	if !ok {
+		return
+	}
+	defer tlsx.context_destroy(ctx)
+	defer destroy_profile_signer(p)
+
+	for host in ([]string{"example.com", "evil.elodin.local", "10.0.0.1", "elodin.local.evil.com:443"}) {
+		profile, status := profile_for_host(p, host, at(0), context.temp_allocator)
+		testing.expectf(t, status == .Unknown_Host, "%s should be refused, got %v", host, status)
+		testing.expectf(t, len(profile) == 0, "%s should get no profile", host)
+	}
+	testing.expect_value(t, sync.atomic_load(&p.signed_total), u64(0))
+}
+
+/*
+Rotating the certificate drops what was signed with the old one.
+
+A renewal is the one moment when every cached entry becomes something that must
+not be served again: it is signed by a key the listener has stopped presenting.
+*/
+@(test)
+test_profile_cache_is_dropped_when_the_certificate_rotates :: proc(t: ^testing.T) {
+	p, ctx, ok := make_test_profile_signer(t)
+	if !ok {
+		return
+	}
+	defer tlsx.context_destroy(ctx)
+	defer destroy_profile_signer(p)
+
+	before, _ := profile_for_host(p, "elodin.local", at(0), context.temp_allocator)
+	testing.expect_value(t, sync.atomic_load(&p.signed_total), u64(1))
+
+	fresh, ferr := tlsx.server_context(second_cert_path, second_key_path)
+	if ferr != .None {
+		testing.expectf(t, false, "no replacement context: %v", ferr)
+		return
+	}
+	defer tlsx.context_destroy(fresh)
+	profile_signer_adopt(p, fresh)
+
+	after, status := profile_for_host(p, "elodin.local", at(0), context.temp_allocator)
+	testing.expect_value(t, status, Profile_Status.OK)
+	testing.expect_value(t, sync.atomic_load(&p.signed_total), u64(2))
+	testing.expect(
+		t,
+		!bytes.equal(before, after),
+		"the profile should have been signed again, by the certificate now in use",
+	)
+}
+
+/*
+The cache holds a bounded number of entries however many authorities are asked
+for.
+
+The port is part of the URL a profile carries and so part of what is cached, and
+a client picks it. Without a ceiling that is a way to spend the server's memory
+one distinct authority at a time.
+*/
+@(test)
+test_profile_cache_is_bounded :: proc(t: ^testing.T) {
+	p, ctx, ok := make_test_wildcard_signer(t)
+	if !ok {
+		return
+	}
+	defer tlsx.context_destroy(ctx)
+	defer destroy_profile_signer(p)
+
+	for i in 1 ..= PROFILE_CACHE_ENTRIES * 4 {
+		authority := fmt.tprintf("h%d.elodin.test", i)
+		// The budget refills over time; each of these is a fresh second so the
+		// signing is allowed and the cache is the thing under test.
+		profile_for_host(p, authority, at(i64(i)), context.temp_allocator)
+	}
+
+	held := 0
+	for entry in p.entries {
+		if len(entry.authority) > 0 {
+			held += 1
+		}
+	}
+	testing.expect_value(t, held, PROFILE_CACHE_ENTRIES)
+}
+
+/*
+Signing is rate limited, and a burst beyond the budget is refused rather than
+paid for.
+
+The cache answers a flood that repeats an authority; this answers one that keeps
+picking new ones, which the cache cannot hold and which each cost a signature.
+*/
+@(test)
+test_profile_signing_budget_is_bounded :: proc(t: ^testing.T) {
+	p, ctx, ok := make_test_wildcard_signer(t)
+	if !ok {
+		return
+	}
+	defer tlsx.context_destroy(ctx)
+	defer destroy_profile_signer(p)
+
+	now := at(0)
+	refused := 0
+	for i in 1 ..= PROFILE_SIGN_BURST * 3 {
+		authority := fmt.tprintf("h%d.elodin.test", i)
+		// All in the same second, so nothing refills.
+		_, status := profile_for_host(p, authority, now, context.temp_allocator)
+		if status == .Unavailable {
+			refused += 1
+		}
+	}
+	testing.expect_value(t, sync.atomic_load(&p.signed_total), u64(PROFILE_SIGN_BURST))
+	testing.expect(t, refused > 0, "a burst past the budget should be refused")
+}
+
+/*
+A flood that exhausts the budget does not stop the endpoint answering for an
+authority it has already signed.
+
+This is what keeps the rate limit from being the attack: the names a real client
+asks for are in the cache, and the cache is consulted before the budget is.
+*/
+@(test)
+test_profile_still_serves_from_cache_with_no_budget_left :: proc(t: ^testing.T) {
+	p, ctx, ok := make_test_wildcard_signer(t)
+	if !ok {
+		return
+	}
+	defer tlsx.context_destroy(ctx)
+	defer destroy_profile_signer(p)
+
+	now := at(0)
+	wanted, s1 := profile_for_host(p, "wanted.elodin.test", now, context.temp_allocator)
+	testing.expect_value(t, s1, Profile_Status.OK)
+
+	for i in 1 ..= PROFILE_SIGN_BURST * 2 {
+		authority := fmt.tprintf("h%d.elodin.test", i)
+		profile_for_host(p, authority, now, context.temp_allocator)
+	}
+
+	again, s2 := profile_for_host(p, "wanted.elodin.test", now, context.temp_allocator)
+	testing.expect_value(t, s2, Profile_Status.OK)
+	testing.expect(t, bytes.equal(wanted, again), "the cached profile should still be served")
+}
+
+/*
+A flood of authorities that differ only in an invented port costs no signature at
+all, and the device being served is untouched by it.
+
+The port is part of the URL and so part of the cache key, and a client picks it -
+so without a bound on which ports are servable a flood mints distinct keys
+indefinitely while passing the certificate check, which only ever sees the host.
+That would turn both defences into the attack: the flood evicts the entry a real
+device was being served from, and the budget it drained means the re-signing
+needed to replace that entry is refused. So what is asserted here is the bound
+itself - every invented port is refused as an authority this listener could not
+have been reached at, before any of it reaches the cache or the budget.
+*/
+@(test)
+test_profile_refuses_a_flood_of_invented_ports :: proc(t: ^testing.T) {
+	p, ctx, ok := make_test_profile_signer(t)
+	if !ok {
+		return
+	}
+	defer tlsx.context_destroy(ctx)
+	defer destroy_profile_signer(p)
+
+	start := at(0)
+	wanted, s1 := profile_for_host(p, "elodin.local", start, context.temp_allocator)
+	testing.expect_value(t, s1, Profile_Status.OK)
+
+	// Ten seconds of a hundred a second, which outruns the refill by far more
+	// than it has to.
+	refused := 0
+	for tick in 0 ..< 10 {
+		for i in 0 ..< 100 {
+			// 1000 through 1999, so every one of these is a port the listener
+			// does not answer on: the test signer is on TEST_DOH_PORT, and 443
+			// is the only other.
+			authority := fmt.tprintf("elodin.local:%d", 1000 + tick * 100 + i)
+			_, status := profile_for_host(p, authority, start + i64(tick), context.temp_allocator)
+			if status == .Unknown_Host {
+				refused += 1
+			}
+		}
+	}
+	testing.expect_value(t, refused, 1000)
+	// Nothing beyond the device's own profile was ever signed, so the budget the
+	// device would need is untouched.
+	testing.expect_value(t, sync.atomic_load(&p.signed_total), u64(1))
+
+	// Asked in the same second as the last of the flood, which is the position a
+	// real device is in: there is no pause for the budget to refill in.
+	again, s2 := profile_for_host(p, "elodin.local", start + 9, context.temp_allocator)
+	testing.expect_value(t, s2, Profile_Status.OK)
+	testing.expect(t, bytes.equal(wanted, again), "the device should still get its profile")
+}
+
+/*
+One name spelled in several cases is one authority.
+
+A hostname is case-insensitive and the certificate check treats it that way, so
+every case variant of a covered name passes it. Everything after that compares
+bytes, so without folding the case first each variant is a cache miss with a
+signature behind it - and a name of a dozen characters has thousands of variants,
+which is a signing budget an unauthenticated client can hold at zero for as long
+as it likes. The device that then asks for a name the certificate covers, and has
+never been served, gets a 503.
+*/
+@(test)
+test_profile_folds_the_case_of_the_authority :: proc(t: ^testing.T) {
+	p, ctx, ok := make_test_profile_signer(t)
+	if !ok {
+		return
+	}
+	defer tlsx.context_destroy(ctx)
+	defer destroy_profile_signer(p)
+
+	now := at(0)
+	lower, s1 := profile_for_host(p, "elodin.local", now, context.temp_allocator)
+	testing.expect_value(t, s1, Profile_Status.OK)
+	for spelling in ([]string{"ELODIN.LOCAL", "eLoDiN.lOcAl", "Elodin.Local:8443"}) {
+		again, status := profile_for_host(p, spelling, now, context.temp_allocator)
+		testing.expectf(t, status == .OK, "%s should be served, got %v", spelling, status)
+		if spelling != "Elodin.Local:8443" {
+			testing.expectf(t, bytes.equal(lower, again), "%s should come from the cache", spelling)
+		}
+	}
+	// The three spellings of the bare name are one signature; the one naming the
+	// port is a second authority and so a second.
+	testing.expect_value(t, sync.atomic_load(&p.signed_total), u64(2))
+
+	held := 0
+	for entry in p.entries {
+		if len(entry.authority) > 0 {
+			held += 1
+		}
+	}
+	testing.expect_value(t, held, 2)
+}
+
+/*
+A port has one spelling, and the endpoint will not be talked into a second.
+
+`strconv.parse_int` reads a base out of an `0x`, `0o`, `0b` or `0z` prefix and
+takes leading zeros in its stride, so asked plainly it says `08443`, `008443` and
+`0x20fb` are all 8443. Each would be a distinct cache key with a signature behind
+it - the same unbounded supply the case folding above closes - and the profile it
+yielded would carry a URL no device can dial.
+*/
+@(test)
+test_profile_refuses_a_port_that_is_not_canonical_decimal :: proc(t: ^testing.T) {
+	p, ctx, ok := make_test_profile_signer(t)
+	if !ok {
+		return
+	}
+	defer tlsx.context_destroy(ctx)
+	defer destroy_profile_signer(p)
+
+	now := at(0)
+	for spelling in ([]string{"08443", "008443", "0x20fb", "0o20373", "0443", "8443 ", "+8443"}) {
+		authority := fmt.tprintf("elodin.local:%s", spelling)
+		_, status := profile_for_host(p, authority, now, context.temp_allocator)
+		testing.expectf(t, status == .Unknown_Host, "port %q should be refused, got %v", spelling, status)
+	}
+	testing.expect_value(t, sync.atomic_load(&p.signed_total), u64(0))
+
+	// The canonical spellings still work, so this is a bound on how a port may be
+	// written rather than on which ports are servable.
+	for authority in ([]string{"elodin.local", "elodin.local:443", "elodin.local:8443"}) {
+		_, status := profile_for_host(p, authority, now, context.temp_allocator)
+		testing.expectf(t, status == .OK, "%s should be served, got %v", authority, status)
+	}
+}
+
+/*
+An address literal is signed for in the one spelling a device can dial.
+
+`::1` and `[::1]` are the same address as far as the certificate is concerned -
+`X509_check_ip_asc` parses both to the same bytes - but only one of them is an
+authority. A profile built from the bare form would carry `https://::1/dns-query`,
+which is not a URL any client can resolve, so the device that installed it would
+resolve through nothing at all; it would also be a second cache key and a second
+signature for an endpoint already held under the first.
+*/
+@(test)
+test_profile_refuses_an_unbracketed_address_literal :: proc(t: ^testing.T) {
+	p, ctx, ok := make_test_profile_signer(t)
+	if !ok {
+		return
+	}
+	defer tlsx.context_destroy(ctx)
+	defer destroy_profile_signer(p)
+
+	now := at(0)
+	_, bare := profile_for_host(p, "::1", now, context.temp_allocator)
+	testing.expect_value(t, bare, Profile_Status.Unknown_Host)
+	_, with_port := profile_for_host(p, "::1:8443", now, context.temp_allocator)
+	testing.expect_value(t, with_port, Profile_Status.Unknown_Host)
+	testing.expect_value(t, sync.atomic_load(&p.signed_total), u64(0))
+
+	// The bracketed spelling of the same address is served, so this is a bound on
+	// how an address may be written and not on which addresses are servable.
+	profile, bracketed := profile_for_host(p, "[::1]:8443", now, context.temp_allocator)
+	testing.expect_value(t, bracketed, Profile_Status.OK)
+	testing.expect(
+		t,
+		bytes.contains(profile, transmute([]u8)string("https://[::1]:8443/dns-query")),
+		"the profile should carry the authority in the form a device can dial",
+	)
+}
+
+/*
+Only the exact bracketed form is an address literal, and every other authority
+carrying a bracket is refused.
+
+The bracket is what tells the host apart from the rest of the authority, so a
+caller that reads it loosely reads a host out of something that is not one. Three
+shapes here, and each would have been signed:
+
+  - `[::1]x` and `[::1]x:8443` - the suffix is dropped on the way to the
+    certificate and kept on the way into the cache key and the URL. That is one
+    address covered by the certificate and an unbounded supply of authorities
+    naming it, each a cache entry and a signature of its own, and each a profile
+    pointing a device at an authority it cannot dial.
+  - `[127.0.0.1]` - brackets are the URL spelling of an IPv6 literal and of
+    nothing else, so this is not a second spelling of `127.0.0.1` but an
+    authority no client can dial, from a certificate that covers the address
+    without them.
+  - `[::1]:` - a port separator with nothing after it, which is a second
+    spelling of `[::1]` and so a second signature for a profile already held.
+
+The certificate these run against carries `IP:127.0.0.1` and `IP:::1`, so the
+name check cannot be what refuses them: it is the shape of the authority that is
+being asserted on, and `signed_total` is what says so.
+*/
+@(test)
+test_profile_refuses_a_malformed_bracketed_authority :: proc(t: ^testing.T) {
+	p, ctx, ok := make_test_profile_signer(t)
+	if !ok {
+		return
+	}
+	defer tlsx.context_destroy(ctx)
+	defer destroy_profile_signer(p)
+
+	now := at(0)
+	for authority in ([]string{"[::1]x", "[::1]x:8443", "[127.0.0.1]", "[127.0.0.1]:8443", "[::1]:"}) {
+		_, status := profile_for_host(p, authority, now, context.temp_allocator)
+		testing.expectf(
+			t,
+			status == .Unknown_Host,
+			"%q should be refused, got %v",
+			authority,
+			status,
+		)
+	}
+	// An empty port on an ordinary name is the same second spelling, and the
+	// same second signature.
+	_, trailing := profile_for_host(p, "elodin.local:", now, context.temp_allocator)
+	testing.expect_value(t, trailing, Profile_Status.Unknown_Host)
+	testing.expect_value(t, sync.atomic_load(&p.signed_total), u64(0))
+
+	// The forms that are authorities still are, so this bounds how an address may
+	// be spelled and not which addresses are servable.
+	_, plain := profile_for_host(p, "[::1]", now, context.temp_allocator)
+	testing.expect_value(t, plain, Profile_Status.OK)
+	_, ported := profile_for_host(p, "127.0.0.1:8443", now, context.temp_allocator)
+	testing.expect_value(t, ported, Profile_Status.OK)
+}
+

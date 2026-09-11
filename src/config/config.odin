@@ -71,7 +71,9 @@ Listener :: struct {
 	path:              string,
 	// DoH only: the path an iPhone, iPad or Mac downloads its encrypted-DNS
 	// configuration profile (.mobileconfig) from. Empty turns it off; when it is
-	// set, the profile is served on the DoH listener alongside `path`.
+	// set, the profile is served on the DoH listener alongside `path`, signed
+	// with this listener's own `cert_file` - so there is nothing further to
+	// configure, and only the hosts that certificate covers can be asked for.
 	mobileconfig_path: string,
 }
 

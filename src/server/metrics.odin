@@ -496,6 +496,43 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 		st.special_use,
 	)
 
+	/*
+	Only on a server that serves the profile, so the lines appearing at all says
+	the endpoint is on.
+
+	Two failure series rather than one, because the two are answered differently.
+	`refused` is the endpoint declining to work: a certificate outside its
+	validity window, or a spent signing budget. `unknown` is a request naming a
+	host the certificate does not cover, which is a 400 and usually means a
+	renewal dropped a name that devices are still asking for. Both sit at zero on
+	a healthy server and both can start climbing with nobody having touched
+	anything, which is what makes them worth an alert.
+	*/
+	if s.profiles != nil {
+		signed, refused, unknown := profile_signer_stats(s.profiles)
+		metrics.scalar(
+			&b,
+			"elodin_mobileconfig_signed_total",
+			.Counter,
+			"Apple configuration profiles signed. One per host the certificate covers, until the certificate is renewed.",
+			signed,
+		)
+		metrics.scalar(
+			&b,
+			"elodin_mobileconfig_refused_total",
+			.Counter,
+			"Profile requests answered 503: the certificate was outside its validity window, or the signing budget was spent.",
+			refused,
+		)
+		metrics.scalar(
+			&b,
+			"elodin_mobileconfig_unknown_host_total",
+			.Counter,
+			"Profile requests answered 400: an authority this listener could not have been reached at - a host the certificate does not cover, or a port it does not answer on.",
+			unknown,
+		)
+	}
+
 	metrics.family(&b, "elodin_dnssec_answers_total", .Counter, "Answers by what validation made of them.")
 	metrics.sample(&b, "elodin_dnssec_answers_total", st.secure, metrics.Label{"result", "secure"})
 	metrics.sample(&b, "elodin_dnssec_answers_total", st.bogus, metrics.Label{"result", "bogus"})

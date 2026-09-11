@@ -1332,6 +1332,10 @@ start_doh :: proc(s: ^Server, l: ^Listeners) -> bool {
 		return false
 	}
 	l.doh_ctx = ctx
+	if cfg.mobileconfig_path != "" {
+		s.profiles = make_profile_signer(ctx, cfg.path, cfg.port)
+		warn_unsigned_profiles(s.profiles)
+	}
 	if !start_stream_listener(s, l, cfg, .DoH, &l.doh_socket, &l.doh_open) {
 		return false
 	}
@@ -1366,12 +1370,12 @@ connection threads read them for every new connection, hence `l.tls_mu`.
 reload_tls :: proc(s: ^Server, l: ^Listeners) -> bool {
 	ok := true
 	if l.dot_open {
-		if !reload_tls_ctx(l, &l.dot_ctx, s.cfg.listeners.dot, DOT_ALPN, "dot") {
+		if !reload_tls_ctx(l, &l.dot_ctx, s.cfg.listeners.dot, DOT_ALPN, "dot", nil) {
 			ok = false
 		}
 	}
 	if l.doh_open {
-		if !reload_tls_ctx(l, &l.doh_ctx, s.cfg.listeners.doh, DOH_ALPN, "doh") {
+		if !reload_tls_ctx(l, &l.doh_ctx, s.cfg.listeners.doh, DOH_ALPN, "doh", s.profiles) {
 			ok = false
 		}
 	}
@@ -1385,6 +1389,9 @@ reload_tls_ctx :: proc(
 	cfg: config.Listener,
 	alpn: []string,
 	name: string,
+	// The profile signer to move onto the renewed certificate, for the listener
+	// that has one. Nil for DoT, which signs nothing.
+	profiles: ^Profile_Signer,
 ) -> bool {
 	fresh, err := tlsx.server_context(cfg.cert_file, cfg.key_file, alpn)
 	if err != .None {
@@ -1415,6 +1422,16 @@ reload_tls_ctx :: proc(
 	slot^ = fresh
 	tlsx.context_destroy(old)
 	sync.rw_mutex_unlock(&l.tls_mu)
+	/*
+	After the swap, and outside the lock the swap takes.
+
+	The signer keeps its own references, so it is never holding a pointer into
+	the context that was just released, and the moment between the two is not a
+	window onto anything unsafe: what it serves until it is told is the profile
+	signed by the certificate that was valid a microsecond ago, and that one is
+	still checked against the clock before it goes out.
+	*/
+	profile_signer_adopt(profiles, fresh)
 	logx.infof("listeners.%s: reloaded the certificate from %s", name, cfg.cert_file)
 	return true
 }

@@ -424,20 +424,24 @@ run_transport_cases :: proc(r: ^Runner) {
 	end_case(r)
 
 	/*
-	The Apple .mobileconfig profile downloads, and carries the DoH URL built from
-	the request's own Host.
+	The Apple .mobileconfig profile downloads, signed, and carries the DoH URL
+	built from the request's own Host.
 
 	The whole point of the endpoint is that an iPhone reaches it over exactly this
 	transport and gets back a file whose ServerURL names the host it used, so this
-	asks for it as a device would - a GET, over the real DoH TLS connection - and
-	checks the profile that comes back is the Apple content type and points at
-	`https://<that host>/dns-query`, the managed-DNS payload iOS installs.
+	asks for it as a device would - a GET, over the real DoH TLS connection.
+
+	The signature is checked by `openssl cms` rather than by looking at the bytes:
+	what a device does with this file is verify it against the certificate chain,
+	and an assertion that the profile merely *looks* signed would pass for a
+	structure no device would accept. The payload recovered from inside it is then
+	the profile, which is what the ServerURL is read out of.
 	*/
-	start_case(r, "doh: the Apple profile downloads and names the request host")
+	start_case(r, "doh: the Apple profile downloads, signed, and names the request host")
 	{
 		res := doh_raw(
 			doh_port,
-			"GET /apple-doh.mobileconfig HTTP/1.1\r\nHost: dns.test.local\r\nConnection: close\r\n\r\n",
+			"GET /apple-doh.mobileconfig HTTP/1.1\r\nHost: elodin.local\r\nConnection: close\r\n\r\n",
 		)
 		if check(r, res.ok, "no HTTP response") {
 			check_eq_int(r, res.status, 200, "status")
@@ -446,18 +450,59 @@ run_transport_cases :: proc(r: ^Runner) {
 				header_contains(res.headers, "content-type: application/x-apple-aspen-config"),
 				"not served as an Apple configuration profile",
 			)
-			body := string(res.body)
-			check(
-				r,
-				strings.contains(body, "<string>https://dns.test.local/dns-query</string>"),
-				"the profile does not carry the DoH URL built from the request Host",
-			)
-			check(
-				r,
-				strings.contains(body, "com.apple.dnsSettings.managed"),
-				"the profile is missing the managed DNS payload",
-			)
+			payload, verified := cms_verify(r, res.body, r.cert_file)
+			if check(r, verified, "the profile is not a signature openssl will verify") {
+				check(
+					r,
+					strings.contains(payload, "<string>https://elodin.local/dns-query</string>"),
+					"the signed profile does not carry the DoH URL built from the request Host",
+				)
+				check(
+					r,
+					strings.contains(payload, "com.apple.dnsSettings.managed"),
+					"the signed profile is missing the managed DNS payload",
+				)
+			}
 		}
+	}
+	end_case(r)
+
+	/*
+	A Host the listener's certificate does not cover is refused.
+
+	A profile naming it could not work - the device would dial a name this server
+	cannot present a certificate for - and signing one per Host a client invents
+	is how an endpoint that does public-key work on request becomes a way to spend
+	the server's CPU. Both are closed by asking the certificate first.
+	*/
+	start_case(r, "doh: the Apple profile refuses a Host outside the certificate")
+	{
+		res := doh_raw(
+			doh_port,
+			"GET /apple-doh.mobileconfig HTTP/1.1\r\nHost: dns.test.local\r\nConnection: close\r\n\r\n",
+		)
+		check(r, res.ok, "no HTTP response")
+		check_eq_int(r, res.status, 400, "status")
+	}
+	end_case(r)
+
+	/*
+	A port this listener does not answer on is refused, like a host it has no
+	certificate for.
+
+	The port is part of the URL the profile carries and so part of what is cached
+	and signed, and a client picks it. Bounding it to the ports this server can
+	actually be reached at is what stops a client minting distinct profiles to
+	sign for as long as it cares to.
+	*/
+	start_case(r, "doh: the Apple profile refuses a port this listener does not answer on")
+	{
+		res := doh_raw(
+			doh_port,
+			"GET /apple-doh.mobileconfig HTTP/1.1\r\nHost: elodin.local:1\r\nConnection: close\r\n\r\n",
+		)
+		check(r, res.ok, "no HTTP response")
+		check_eq_int(r, res.status, 400, "status")
 	}
 	end_case(r)
 
@@ -465,7 +510,7 @@ run_transport_cases :: proc(r: ^Runner) {
 	{
 		res := doh_raw(
 			doh_port,
-			"POST /apple-doh.mobileconfig HTTP/1.1\r\nHost: dns.test.local\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+			"POST /apple-doh.mobileconfig HTTP/1.1\r\nHost: elodin.local\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
 		)
 		check(r, res.ok, "no HTTP response")
 		check_eq_int(r, res.status, 405, "status")

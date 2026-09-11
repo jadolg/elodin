@@ -777,12 +777,45 @@ the device and it downloads a `.mobileconfig` that, installed under **Settings �
 General → VPN & Device Management**, sends the device's DNS here over HTTPS
 system-wide.
 
-The `ServerURL` inside is built from the host the request arrived on, so it always
-matches the name the certificate is for, and a listener answering on several
-names hands each device a profile for the one it used. Its identifiers derive
-from the URL, so reinstalling replaces the profile rather than stacking a
-duplicate. The profile is unsigned, so the device shows it as *Unverified*. Set
-`mobileconfig_path: ""` to withhold it; it is served only while DoH is enabled.
+The `ServerURL` inside is built from the authority the request arrived on, and
+that has to be one this listener could actually have been reached at: a host the
+DoH listener's certificate covers, on no port, port 443, or `listeners.doh.port`.
+Anything else gets a 400 rather than a profile the device could never use — and
+the port has to be written the ordinary way, in decimal with no leading zero. (The
+port rule means a deployment reached on a public port that is neither 443 nor the
+port elodin is bound to — a NAT forwarding 8443 to an elodin on 9443, say — gets a
+400 for that authority: bind elodin to the public port, or put the device on 443,
+since the URL a profile carries has to be one the device can dial.) A
+listener answering on several names hands each device a profile for the one it
+used. Its identifiers derive from the URL, so reinstalling replaces the profile
+rather than stacking a duplicate. Set `mobileconfig_path: ""` to withhold it; it
+is served only while DoH is enabled.
+
+The profile is **signed with the DoH listener's own certificate** — there is
+nothing extra to configure, and the signature follows a renewal without a
+restart. What the device shows depends on that certificate, since it validates
+the signer against its own trust store:
+
+- a certificate from a public CA (Let's Encrypt and the like) — *Verified*, in
+  green. Make sure `cert_file` holds the full chain: the device has the root but
+  not the intermediates, and a leaf served alone cannot be chained to anything.
+- a self-signed certificate — *Not Verified*, as an unsigned profile was before.
+  It still installs.
+
+While the certificate is outside its validity window the endpoint answers 503
+rather than handing out a profile signed with it.
+
+Signing is rate limited and the signed profiles are cached, and what a client may
+ask to have signed is bounded from several directions: only hosts the certificate
+covers, only on a port this listener answers on, and only in one spelling of each
+— the authority is lowercased and the port has to be plain decimal. On an ordinary
+certificate that leaves a handful of authorities, all of them cached.
+
+A certificate whose SAN is a wildcard or an IP address has no such ceiling on the
+hosts it covers, and there the rate limit is what remains. Under a sustained flood
+a device whose authority is not already cached can be refused with a 503 until it
+stops. Resolution is unaffected — it is the profile download that is refused, and
+only while the flood lasts.
 
 ### DNSSEC
 
@@ -1938,6 +1971,9 @@ as a warning at startup.
 | `elodin_udp_datagrams_total{reader}` | counter | datagrams each UDP reader took off its socket |
 | `elodin_udp_receive_drops_total{reader}` | counter | datagrams the kernel dropped on that reader's receive queue before they could be read; absent where `/proc` cannot be read |
 | `elodin_pool_workers{pool}` / `elodin_pool_pending{pool}` | gauge | the `query` and `upstream` pools; `pending` that does not return to zero is `server.workers` set too low |
+| `elodin_mobileconfig_signed_total` | counter | Apple configuration profiles signed; one per authority until the certificate is renewed. Published only while the profile endpoint exists |
+| `elodin_mobileconfig_refused_total` | counter | profile requests answered 503: the DoH certificate was outside its validity window, or the signing budget was spent. The only signal that a lapsed certificate has taken the endpoint with it |
+| `elodin_mobileconfig_unknown_host_total` | counter | profile requests answered 400: an authority this listener could not have been reached at — a host the certificate does not cover, or a port it does not answer on. Climbing usually means a renewal dropped a name devices still ask for |
 | `process_cpu_seconds_total` | counter | user plus system CPU |
 | `process_resident_memory_bytes` / `_virtual_memory_bytes` | gauge | from `/proc/self/stat` |
 | `process_threads`, `process_open_fds`, `process_max_fds` | gauge | thread and descriptor counts |

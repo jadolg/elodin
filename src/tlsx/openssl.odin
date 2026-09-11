@@ -1,6 +1,7 @@
 package tlsx
 
 import "core:c"
+import "core:sys/posix"
 
 // Minimal OpenSSL 3.x bindings: only what a DoT/DoH endpoint and client need.
 // Verified against the headers shipped with OpenSSL 3.x.
@@ -11,6 +12,18 @@ foreign import libcrypto "system:crypto"
 SSL_CTX :: struct {}
 SSL :: struct {}
 SSL_METHOD :: struct {}
+
+// Only what signing an Apple configuration profile needs: the certificate and
+// key a server context already holds, and the CMS structure they are wrapped in.
+X509 :: struct {}
+EVP_PKEY :: struct {}
+BIO :: struct {}
+BIO_METHOD :: struct {}
+CMS_ContentInfo :: struct {}
+ASN1_TIME :: struct {}
+// STACK_OF(X509). OpenSSL's stacks are one implementation behind per-type
+// macros, so there is a single opaque type here rather than one per element.
+OPENSSL_STACK :: struct {}
 
 OPENSSL_INIT_LOAD_SSL_STRINGS :: 0x0020_0000
 OPENSSL_INIT_LOAD_CRYPTO_STRINGS :: 0x0000_0002
@@ -28,8 +41,28 @@ SSL_ERROR_SYSCALL :: 5
 SSL_ERROR_ZERO_RETURN :: 6
 
 SSL_CTRL_SET_TLSEXT_HOSTNAME :: 55
+SSL_CTRL_GET_CHAIN_CERTS :: 115
 SSL_CTRL_SET_MIN_PROTO_VERSION :: 123
 SSL_CTRL_SET_MAX_PROTO_VERSION :: 124
+
+// What `BIO_get_mem_data` is a macro for.
+BIO_CTRL_INFO :: 3
+
+/*
+The CMS_sign flags a configuration profile is signed under.
+
+`CMS_BINARY` keeps the payload byte for byte: without it the input is treated as
+text and its line endings are canonicalised, which would sign something other
+than the profile served. `CMS_NOSMIMECAP` drops the S/MIME capabilities
+attribute, which advertises the ciphers this end can decrypt with and is
+meaningless in a structure nobody replies to.
+
+Notably absent is `CMS_DETACHED`: the profile travels inside the structure, which
+is what makes the signed file a replacement for the unsigned one rather than a
+signature alongside it.
+*/
+CMS_BINARY :: 0x80
+CMS_NOSMIMECAP :: 0x200
 
 TLSEXT_NAMETYPE_host_name :: 0
 
@@ -104,6 +137,11 @@ foreign libssl {
 	SSL_get_error :: proc(ssl: ^SSL, ret: c.int) -> c.int ---
 	SSL_get_verify_result :: proc(ssl: ^SSL) -> c.long ---
 	SSL_get0_alpn_selected :: proc(ssl: ^SSL, data: ^[^]u8, len: ^c.uint) ---
+
+	// The material a context was loaded with, borrowed back out of it. `get0`
+	// means no reference is taken; see `signer_of`.
+	SSL_CTX_get0_certificate :: proc(ctx: ^SSL_CTX) -> ^X509 ---
+	SSL_CTX_get0_privatekey :: proc(ctx: ^SSL_CTX) -> ^EVP_PKEY ---
 }
 
 @(default_calling_convention = "c")
@@ -113,6 +151,34 @@ foreign libcrypto {
 	ERR_get_error :: proc() -> c.ulong ---
 	ERR_clear_error :: proc() ---
 	ERR_error_string_n :: proc(e: c.ulong, buf: [^]u8, len: c.size_t) ---
+
+	X509_free :: proc(x: ^X509) ---
+	X509_up_ref :: proc(x: ^X509) -> c.int ---
+	X509_chain_up_ref :: proc(chain: ^OPENSSL_STACK) -> ^OPENSSL_STACK ---
+	X509_get0_notBefore :: proc(x: ^X509) -> ^ASN1_TIME ---
+	X509_get0_notAfter :: proc(x: ^X509) -> ^ASN1_TIME ---
+	// Negative when the certificate time is before `t`, positive when after, and
+	// zero when the time could not be read at all.
+	X509_cmp_time :: proc(s: ^ASN1_TIME, t: ^posix.time_t) -> c.int ---
+	// OpenSSL's own name matching: subject alternative names, the wildcard rules
+	// and the common-name fallback, rather than a second opinion about RFC 6125.
+	X509_check_host :: proc(x: ^X509, chk: [^]u8, chklen: c.size_t, flags: c.uint, peername: ^cstring) -> c.int ---
+	X509_check_ip_asc :: proc(x: ^X509, ipasc: cstring, flags: c.uint) -> c.int ---
+
+	EVP_PKEY_free :: proc(pkey: ^EVP_PKEY) ---
+	EVP_PKEY_up_ref :: proc(pkey: ^EVP_PKEY) -> c.int ---
+
+	OPENSSL_sk_pop_free :: proc(st: ^OPENSSL_STACK, free_func: rawptr) ---
+
+	BIO_new :: proc(type: ^BIO_METHOD) -> ^BIO ---
+	BIO_new_mem_buf :: proc(buf: rawptr, len: c.int) -> ^BIO ---
+	BIO_s_mem :: proc() -> ^BIO_METHOD ---
+	BIO_ctrl :: proc(bp: ^BIO, cmd: c.int, larg: c.long, parg: rawptr) -> c.long ---
+	BIO_free :: proc(a: ^BIO) -> c.int ---
+
+	CMS_sign :: proc(signcert: ^X509, pkey: ^EVP_PKEY, certs: ^OPENSSL_STACK, data: ^BIO, flags: c.uint) -> ^CMS_ContentInfo ---
+	CMS_ContentInfo_free :: proc(cms: ^CMS_ContentInfo) ---
+	i2d_CMS_bio :: proc(bp: ^BIO, cms: ^CMS_ContentInfo) -> c.int ---
 }
 
 // Macro equivalents that OpenSSL only exposes through SSL_CTX_ctrl / SSL_ctrl.
@@ -127,4 +193,25 @@ ssl_ctx_set_max_proto_version :: proc(ctx: ^SSL_CTX, version: c.long) -> bool {
 
 ssl_set_tlsext_host_name :: proc(ssl: ^SSL, name: cstring) -> bool {
 	return SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, rawptr(name)) == 1
+}
+
+// The intermediates loaded alongside the leaf, or nil when the file held only a
+// leaf. Borrowed from the context, like the leaf and the key beside it.
+ssl_ctx_get0_chain_certs :: proc(ctx: ^SSL_CTX) -> ^OPENSSL_STACK {
+	chain: ^OPENSSL_STACK
+	if SSL_CTX_ctrl(ctx, SSL_CTRL_GET_CHAIN_CERTS, 0, &chain) != 1 {
+		return nil
+	}
+	return chain
+}
+
+// What `BIO_get_mem_data` is a macro for: the bytes a memory BIO has collected,
+// which stay owned by the BIO.
+bio_mem_data :: proc(b: ^BIO) -> []u8 {
+	buf: [^]u8
+	n := BIO_ctrl(b, BIO_CTRL_INFO, 0, &buf)
+	if n <= 0 || buf == nil {
+		return nil
+	}
+	return buf[:n]
 }

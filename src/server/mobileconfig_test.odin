@@ -1,11 +1,14 @@
 package server
 
+import "core:fmt"
 import "core:net"
 import "core:strings"
+import "core:sync"
 import "core:testing"
 import "core:thread"
 import "core:time"
 import "elodin:config"
+import "elodin:tlsx"
 
 /*
 The profile carries the DoH URL built from the host and path it was asked for.
@@ -165,51 +168,48 @@ run_serve_doh_mc :: proc(d: ^Mc_Session) {
 }
 
 /*
-A GET to the profile path is answered end to end over the HTTP/1.1 endpoint.
+Run one request through the real `serve_doh` loop and return everything written
+back.
 
-The routing, the Host capture and the profile build have to line up: a request
-to `mobileconfig_path` with a Host header comes back 200, as the Apple profile
-content type, carrying the URL built from that Host. This goes through the real
-`serve_doh` loop rather than the builder alone, so a break in the wiring between
-them shows up here.
+The three profile cases below differ only in the request line and in what the
+server was given to sign with, so the loopback pair, the handler thread and the
+drain are here once. What is deliberately not factored out is `serve_doh` itself:
+these exist to catch a break in the wiring between routing, the Host capture and
+the signing, and a test that called the builder directly would not see one.
 */
-@(test)
-test_serve_doh_returns_the_profile :: proc(t: ^testing.T) {
+@(private = "file")
+mc_roundtrip :: proc(t: ^testing.T, s: ^Server, request: string) -> (reply: string, ok: bool) {
 	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
 	if lerr != nil {
 		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
-		return
+		return "", false
 	}
 	defer net.close(listener)
 	bound, berr := net.bound_endpoint(listener)
 	if berr != nil {
 		testing.expectf(t, false, "cannot read the bound port: %v", berr)
-		return
+		return "", false
 	}
 
 	client, derr := net.dial_tcp_from_endpoint(bound)
 	if derr != nil {
 		testing.expectf(t, false, "cannot dial the listener: %v", derr)
-		return
+		return "", false
 	}
 	defer net.close(client)
 
 	accepted, _, aerr := net.accept_tcp(listener)
 	if aerr != nil {
 		testing.expectf(t, false, "nothing connected: %v", aerr)
-		return
+		return "", false
 	}
 	defer net.close(accepted)
 	// With nothing following the one request, the handler ends on this rather
 	// than on a close.
 	_ = net.set_option(accepted, .Receive_Timeout, 500 * time.Millisecond)
 
-	cfg := config.default_config()
-	s := Server {
-		cfg = &cfg,
-	}
 	session := Mc_Session {
-		server = &s,
+		server = s,
 		conn   = Conn{socket = accepted},
 	}
 	handler := thread.create_and_start_with_poly_data(&session, run_serve_doh_mc)
@@ -218,10 +218,9 @@ test_serve_doh_returns_the_profile :: proc(t: ^testing.T) {
 		thread.destroy(handler)
 	}
 
-	request := "GET /apple-doh.mobileconfig HTTP/1.1\r\nHost: dns.example\r\nConnection: close\r\n\r\n"
 	if !mc_send_all(t, client, request) {
 		net.shutdown(client, .Send)
-		return
+		return "", false
 	}
 
 	_ = net.set_option(client, .Receive_Timeout, 2 * time.Second)
@@ -234,18 +233,125 @@ test_serve_doh_returns_the_profile :: proc(t: ^testing.T) {
 		}
 		strings.write_bytes(&answer, chunk[:n])
 	}
+	return strings.to_string(answer), true
+}
 
-	reply := strings.to_string(answer)
+// The response body, which for a signed profile is DER and so cannot be read as
+// text up to the next blank line.
+@(private = "file")
+mc_body :: proc(reply: string) -> string {
+	if idx := strings.index(reply, "\r\n\r\n"); idx >= 0 {
+		return reply[idx + 4:]
+	}
+	return ""
+}
+
+@(private = "file")
+GET_PROFILE :: "GET /apple-doh.mobileconfig HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n"
+
+/*
+A GET to the profile path is answered end to end over the HTTP/1.1 endpoint, with
+a signed profile.
+
+The routing, the Host capture, the profile build and the signing have to line up:
+a request to `mobileconfig_path` with a Host the certificate covers comes back
+200, as the Apple profile content type, carrying a CMS structure whose payload is
+the profile for that Host. This goes through the real `serve_doh` loop rather than
+the builder alone, so a break in the wiring between them shows up here.
+*/
+@(test)
+test_serve_doh_returns_the_signed_profile :: proc(t: ^testing.T) {
+	signer, ctx, sok := make_test_profile_signer(t)
+	if !sok {
+		return
+	}
+	defer tlsx.context_destroy(ctx)
+	defer destroy_profile_signer(signer)
+
+	cfg := config.default_config()
+	s := Server {
+		cfg      = &cfg,
+		profiles = signer,
+	}
+	reply, ok := mc_roundtrip(t, &s, fmt.tprintf(GET_PROFILE, "elodin.local"))
+	if !ok {
+		return
+	}
+
 	testing.expect(t, strings.contains(reply, "HTTP/1.1 200"), "the profile request was not answered 200")
 	testing.expect(
 		t,
 		strings.contains(reply, DOH_MOBILECONFIG_CONTENT_TYPE),
 		"the response is not the Apple profile content type",
 	)
+
+	body := mc_body(reply)
+	testing.expect(t, len(body) > 0 && body[0] == 0x30, "the body should be a DER structure, not plain XML")
 	testing.expect(
 		t,
-		strings.contains(reply, "https://dns.example/dns-query"),
-		"the profile does not carry the URL built from the Host header",
+		strings.contains(body, "https://elodin.local/dns-query"),
+		"the signed payload does not carry the URL built from the Host header",
+	)
+	free_all(context.temp_allocator)
+}
+
+/*
+A Host the certificate does not cover is a 400, and nothing is signed for it.
+
+The profile would name a host this server cannot present a certificate for, so it
+could not work on the device that installed it. Refusing is also what keeps the
+work bounded: the Host is a header, and signing whatever it says is an unbounded
+supply of distinct profiles to sign.
+*/
+@(test)
+test_serve_doh_profile_refuses_a_host_outside_the_certificate :: proc(t: ^testing.T) {
+	signer, ctx, sok := make_test_profile_signer(t)
+	if !sok {
+		return
+	}
+	defer tlsx.context_destroy(ctx)
+	defer destroy_profile_signer(signer)
+
+	cfg := config.default_config()
+	s := Server {
+		cfg      = &cfg,
+		profiles = signer,
+	}
+	reply, ok := mc_roundtrip(t, &s, fmt.tprintf(GET_PROFILE, "dns.example"))
+	if !ok {
+		return
+	}
+	testing.expect(
+		t,
+		strings.contains(reply, "HTTP/1.1 400"),
+		"a Host outside the certificate should be a 400",
+	)
+	testing.expect_value(t, sync.atomic_load(&signer.signed_total), u64(0))
+	free_all(context.temp_allocator)
+}
+
+/*
+With nothing to sign with, the endpoint says so rather than serving an unsigned
+profile.
+
+A silent downgrade is the one answer that would be wrong here: a device would
+install a profile reporting itself unverified, and the operator whose certificate
+stopped being usable would have no sign that anything had changed.
+*/
+@(test)
+test_serve_doh_profile_is_unavailable_without_a_signer :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	s := Server {
+		cfg = &cfg,
+	}
+	reply, ok := mc_roundtrip(t, &s, fmt.tprintf(GET_PROFILE, "elodin.local"))
+	if !ok {
+		return
+	}
+	testing.expect(
+		t,
+		strings.contains(reply, "HTTP/1.1 503"),
+		"a server with no signing identity should answer 503",
 	)
 	free_all(context.temp_allocator)
 }
@@ -255,72 +361,22 @@ A POST to the profile path is a 405.
 
 The profile is a download, reached by navigating to it, so only GET makes sense;
 a POST there is a client using the endpoint wrong, and telling it so is better
-than building a profile for a request that was never going to install one.
+than signing a profile for a request that was never going to install one.
 */
 @(test)
 test_serve_doh_profile_rejects_post :: proc(t: ^testing.T) {
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
-		return
-	}
-	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the bound port: %v", berr)
-		return
-	}
-
-	client, derr := net.dial_tcp_from_endpoint(bound)
-	if derr != nil {
-		testing.expectf(t, false, "cannot dial the listener: %v", derr)
-		return
-	}
-	defer net.close(client)
-
-	accepted, _, aerr := net.accept_tcp(listener)
-	if aerr != nil {
-		testing.expectf(t, false, "nothing connected: %v", aerr)
-		return
-	}
-	defer net.close(accepted)
-	_ = net.set_option(accepted, .Receive_Timeout, 500 * time.Millisecond)
-
 	cfg := config.default_config()
 	s := Server {
 		cfg = &cfg,
 	}
-	session := Mc_Session {
-		server = &s,
-		conn   = Conn{socket = accepted},
-	}
-	handler := thread.create_and_start_with_poly_data(&session, run_serve_doh_mc)
-	defer {
-		thread.join(handler)
-		thread.destroy(handler)
-	}
-
-	request := "POST /apple-doh.mobileconfig HTTP/1.1\r\nHost: dns.example\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
-	if !mc_send_all(t, client, request) {
-		net.shutdown(client, .Send)
+	reply, ok := mc_roundtrip(
+		t,
+		&s,
+		"POST /apple-doh.mobileconfig HTTP/1.1\r\nHost: elodin.local\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+	)
+	if !ok {
 		return
 	}
-
-	_ = net.set_option(client, .Receive_Timeout, 2 * time.Second)
-	answer := strings.builder_make(context.temp_allocator)
-	for {
-		chunk: [4096]u8
-		n, rerr := net.recv_tcp(client, chunk[:])
-		if rerr != nil || n <= 0 {
-			break
-		}
-		strings.write_bytes(&answer, chunk[:n])
-	}
-
-	testing.expect(
-		t,
-		strings.contains(strings.to_string(answer), "HTTP/1.1 405"),
-		"a POST to the profile path should be a 405",
-	)
+	testing.expect(t, strings.contains(reply, "HTTP/1.1 405"), "a POST to the profile path should be a 405")
 	free_all(context.temp_allocator)
 }
