@@ -1116,6 +1116,16 @@ The floor is 64 bytes, since below the smallest answer this server sends the
 setting stops being a size at all; anything at or above `max_udp_response` is
 what leaving it out already does.
 
+The bill arrives after the datagram was admitted, not with it, so the debt is
+carried rather than forgiven: a burst that reaches a full bucket is admitted
+whole and billed for all of it afterwards, and the prefix then hears nothing
+until it has paid — about `2 × (ceil(max_udp_response ÷ response_size_estimate) −
+1)` seconds, so 18 at an estimate of 128 and 38 at the 64-byte floor. That is the
+overspend the setting exists to charge for, and forgiving it would make the bound
+above an average rather than a ceiling. `slip` is untouched by it: a real client
+caught behind a spoofed burst in its /24 is still answered truncated and sent to
+TCP, where no datagram budget follows it.
+
 When it is set low enough to bite, `--check` and the startup line say what the
 two figures multiply out to, at whatever scale the figure lands on — `640.0B/s`,
 `62.5KiB/s`, `4.8MiB/s`. Each `overrides` entry's line carries the same product
