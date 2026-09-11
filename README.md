@@ -1108,7 +1108,10 @@ smaller to choose the quantity directly: with the 1232 ceiling,
 `response_size_estimate: 128` holds a prefix to about 64 KB/s of answers rather
 than 600, while a client whose answers are ordinary — an A record is ~60 bytes —
 still gets its 500 a second. It is the datagram budget only: a connection has no
-size worth charging, and a truncated slip reply is 30-odd bytes by construction.
+size worth charging, and a slip reply is not weighed at all — it is a header and
+the question echoed back, 30-odd bytes for an ordinary name and at most 271 for a
+maximal one, so the `slip` pool's own `responses_per_second / 8` a second sits on
+top of the figure above rather than inside it.
 The floor is 64 bytes, since below the smallest answer this server sends the
 setting stops being a size at all; anything at or above `max_udp_response` is
 what leaving it out already does. When it is set low enough to bite, `--check`

@@ -719,8 +719,11 @@ Rate_Limit_Config :: struct {
 	UDP only, and the datagram pool only. A connection has no size worth
 	charging - the handshake already settled where the client is, so what its
 	budget bounds is the work behind an answer rather than the traffic - and a
-	truncated slip reply is 30-odd bytes by construction, which no estimate an
-	operator can set would charge more than one token for.
+	truncated slip reply is never weighed at all, since it is sent from the read
+	loop before there is an answer to weigh. It is a header and the question
+	echoed back - 30-odd bytes for an ordinary name, 271 for a maximal one - and
+	what bounds how many of them a prefix gets is `slip`'s own pool, on top of
+	the figure above rather than inside it.
 	*/
 	response_size_estimate: int,
 	slip:                   int,

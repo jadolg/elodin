@@ -726,9 +726,21 @@ so a prefix being fed large answers runs dry sooner and one asking small
 questions is charged nothing extra.
 
 `Datagram` alone. The stream pool bounds work behind an answer rather than
-traffic toward an address - the handshake settled where the client is - and the
-`Slip` pool buys a 30-odd byte truncated reply, which no estimate an operator may
-set charges more than one token for. `Connection` has no size at all.
+traffic toward an address - the handshake settled where the client is - and
+`Connection` has no size at all.
+
+`Slip` is not charged either, and unlike the other two that is worth a figure
+rather than a reason. A truncated reply is a header and the question echoed back,
+which is 30-odd bytes for an ordinary name and 271 for a maximal one, and it is
+sent from the read loop where there is no answer to weigh - so it is outside the
+`responses_per_second * response_size_estimate` bound rather than inside it. What
+it adds is its own pool's refill: `responses_per_second / RRL_SLIP_SHARE` replies
+a second, so at the shipped 500 and an estimate of 128 the prefix may receive
+about 17 KB/s of slip on top of the 64 KB/s of answers, and only if the attacker
+spends a 271-byte query on each of them. Not charged for size because the
+recourse is the point: this is the reply that sends a real client to TCP, and a
+prefix already in debt is exactly the one that needs it - see
+`test_a_prefix_in_debt_is_still_offered_its_slip`.
 
 The debt is carried in full, with no floor under it, and what that costs is worth
 being plain about. The charge lands after the send, so a prefix that had a full

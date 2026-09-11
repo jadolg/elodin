@@ -225,17 +225,29 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 		in two other places to avoid. So it is refused like any other figure out
 		of bounds - `responses_per_second: 0` already is - and here rather than
 		in `validate`, since by then the two are the same value.
+
+		Read back out of the node rather than off the field, because the field
+		is 0 for two different files: the one that wrote a zero and the one that
+		wrote something `opt_bytes` could not parse. The second has already been
+		refused in its own words a line above, and a second message saying "it
+		is 0" about a file that says `abc` would be the loader describing a
+		value nobody wrote.
+
+		Only with the limiter on, like every other figure in this map: `validate`
+		leaves `responses_per_second` and `slip` unchecked when
+		`rate_limit.enabled` is false, and a key that cannot do anything either
+		way is not worth refusing a start over.
 		*/
 		if written := yaml.get(rl, "response_size_estimate");
-		   written != nil &&
-		   !yaml.is_null(written) &&
-		   cfg.server.rate_limit.response_size_estimate == 0 {
-			errorf(
-				l,
-				"server.rate_limit.response_size_estimate must be between %d and %d bytes (it is 0); leave the key out for one token per answer, which is what 0 would quietly do",
-				MIN_RESPONSE_SIZE_ESTIMATE,
-				MAX_UDP_RESPONSE,
-			)
+		   cfg.server.rate_limit.enabled && !yaml.is_null(written) {
+			if v, ok := yaml.as_bytes(written); ok && v == 0 {
+				errorf(
+					l,
+					"server.rate_limit.response_size_estimate must be between %d and %d bytes (it is 0); leave the key out for one token per answer, which is what 0 would quietly do",
+					MIN_RESPONSE_SIZE_ESTIMATE,
+					MAX_UDP_RESPONSE,
+				)
+			}
 		}
 		opt_int(l, rl, "slip", &cfg.server.rate_limit.slip, "server.rate_limit")
 		load_rate_limit_overrides(l, rl, cfg)

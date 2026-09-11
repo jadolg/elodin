@@ -491,6 +491,41 @@ test_a_response_size_estimate_out_of_bounds_is_refused :: proc(t: ^testing.T) {
 	_, zhas := zerr.?
 	testing.expect(t, zhas, "an estimate written as 0 was accepted")
 
+	/*
+	And a value that is not a size at all is refused once, in its own words.
+
+	The 0 above is the loader's marker for an absent key, and it is also what a
+	field is left holding when `opt_bytes` cannot parse what was written. A
+	refusal that read the field rather than the node would report both as "it is
+	0", so a file saying `abc` would be told about a value it does not contain -
+	beside the message that already says what is actually wrong with it.
+	*/
+	unparseable := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    response_size_estimate: abc\n"
+	_, uerr := load_string(unparseable, context.temp_allocator)
+	ue, uhas := uerr.?
+	testing.expect(t, uhas, "an estimate that is not a size was accepted")
+	if uhas {
+		testing.expect_value(t, len(ue.messages), 1)
+		testing.expect(
+			t,
+			strings.contains(ue.messages[0], "expected a size"),
+			"the one message is not the one that says what is wrong",
+		)
+	}
+
+	/*
+	None of which applies with the limiter off.
+
+	`validate` leaves `responses_per_second` and `slip` unchecked when
+	`rate_limit.enabled` is false, since there are no budgets for them to be
+	figures of, and this key is no different: refusing a start over one of the
+	three and not the other two would be an asymmetry with nothing behind it.
+	*/
+	off := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    enabled: false\n    response_size_estimate: 0\n"
+	_, oerr := load_string(off, context.temp_allocator)
+	_, ohas := oerr.?
+	testing.expect(t, !ohas, "an estimate of 0 was refused with the limiter off")
+
 	// The floor and the ceiling themselves are inside, not outside.
 	edges := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    response_size_estimate: 64\n"
 	ecfg, eerr := load_string(edges, context.temp_allocator)
