@@ -806,13 +806,448 @@ test_the_slip_budget_is_a_pool_of_its_own :: proc(t: ^testing.T) {
 }
 
 /*
+What one prefix can be made to receive is bytes, not sendings.
+
+The budget is a count, and a count is worth whatever the answers weigh: the same
+`responses_per_second` buys a victim 50 KB/s of ~100-byte NODATAs or 616 KB/s of
+full 1232-byte DNSSEC answers, and which of the two it is is the attacker's to
+choose by choosing the question. That is the defect this asserts against - the
+figure an operator sets is a quantity of traffic, and a quantity that moves
+twelvefold with somebody else's query is not one they can set.
+
+Charged by size it stops moving. Both floods below draw the same number of
+tokens; what differs is how many answers those tokens buy, which is the right way
+round.
+
+The ceiling is `capacity * ESTIMATE` and not `RATE * ESTIMATE`, because a full
+bucket is what a quiet prefix may spend at once - `RRL_BURST_SECONDS` of it, the
+same burst the count has always allowed.
+*/
+@(test)
+test_the_bytes_a_prefix_is_sent_do_not_depend_on_the_answer :: proc(t: ^testing.T) {
+	RATE :: 100
+	// Not a figure with anything in particular to recommend it: small enough
+	// against a 1232-byte answer that the multiplier is visible, and above
+	// `config.MIN_RESPONSE_SIZE_ESTIMATE`, which is the smallest an operator can
+	// write.
+	ESTIMATE :: 128
+	LARGE :: 1232
+	SMALL :: 100
+
+	ceiling := RATE * RRL_BURST_SECONDS * ESTIMATE
+
+	large_bytes := 0
+	{
+		r := make_rate_limiter(RATE, 0, nil, ESTIMATE)
+		defer destroy_rate_limiter(r)
+		client := v4(203, 0, 113, 60)
+		for _ in 0 ..< 1000 {
+			if rate_check(r, client, at(0)) != .Allow {
+				continue
+			}
+			// What the read loop and the worker do, in the order they do it:
+			// admitted on one token, billed for the rest once the answer exists.
+			rate_charge_response(r, client, LARGE, at(0))
+			large_bytes += LARGE
+		}
+	}
+
+	small_bytes := 0
+	{
+		r := make_rate_limiter(RATE, 0, nil, ESTIMATE)
+		defer destroy_rate_limiter(r)
+		client := v4(203, 0, 113, 61)
+		for _ in 0 ..< 1000 {
+			if rate_check(r, client, at(0)) != .Allow {
+				continue
+			}
+			rate_charge_response(r, client, SMALL, at(0))
+			small_bytes += SMALL
+		}
+	}
+
+	testing.expectf(
+		t,
+		large_bytes <= ceiling,
+		"a flood answered %d bytes at one prefix, past the %d its budget denominates",
+		large_bytes,
+		ceiling,
+	)
+	testing.expectf(
+		t,
+		small_bytes <= ceiling,
+		"small answers drew %d bytes, past the %d the same budget denominates",
+		small_bytes,
+		ceiling,
+	)
+	/*
+	And the spread is gone: what the attacker chooses now is how many answers
+	their bytes are cut into, not how many bytes their answers come to. Within a
+	token of each other, since the large answer is charged in whole tokens - ten
+	for 1232 bytes at 128 - so the last one may overshoot by a fraction of one.
+	*/
+	testing.expectf(
+		t,
+		large_bytes * 2 > ceiling,
+		"the large flood drew %d bytes of the %d it is entitled to, so this is measuring something else",
+		large_bytes,
+		ceiling,
+	)
+}
+
+/*
+A prefix asking small questions is charged exactly as it was.
+
+The other half of the property above: an answer that fits inside the estimate
+costs one token, so the count is still a count for every client whose answers are
+ordinary - which at the shipped figures is every client, since the estimate is the
+ceiling unless an operator writes one.
+*/
+@(test)
+test_an_answer_inside_the_estimate_costs_one_token :: proc(t: ^testing.T) {
+	RATE :: 100
+	ESTIMATE :: 128
+	r := make_rate_limiter(RATE, 0, nil, ESTIMATE)
+	defer destroy_rate_limiter(r)
+
+	client := v4(203, 0, 113, 62)
+	answered := 0
+	for _ in 0 ..< 1000 {
+		if rate_check(r, client, at(0)) != .Allow {
+			continue
+		}
+		// Exactly the estimate, which is the boundary: `ceil(128/128)` is one.
+		rate_charge_response(r, client, ESTIMATE, at(0))
+		answered += 1
+	}
+	testing.expectf(
+		t,
+		answered == RATE * RRL_BURST_SECONDS,
+		"a prefix whose answers fit the estimate was answered %d times, expected the %d its budget holds",
+		answered,
+		RATE * RRL_BURST_SECONDS,
+	)
+}
+
+/*
+No estimate charges one token per answer, whatever the answer.
+
+Which is what every configuration that does not name one gets: the loader
+resolves it to `server.max_udp_response`, so no datagram can exceed it, and the
+limiter's own default of 0 is the same statement for the callers that build one
+by hand. A change that cost an existing deployment answers it used to get would
+be this test failing.
+*/
+@(test)
+test_without_an_estimate_the_budget_is_the_count_it_was :: proc(t: ^testing.T) {
+	RATE :: 100
+	r := make_rate_limiter(RATE, 0)
+	defer destroy_rate_limiter(r)
+
+	client := v4(203, 0, 113, 63)
+	answered := 0
+	for _ in 0 ..< 1000 {
+		if rate_check(r, client, at(0)) != .Allow {
+			continue
+		}
+		rate_charge_response(r, client, 4096, at(0))
+		answered += 1
+	}
+	testing.expectf(
+		t,
+		answered == RATE * RRL_BURST_SECONDS,
+		"%d answers with no estimate configured, expected the %d the count allows",
+		answered,
+		RATE * RRL_BURST_SECONDS,
+	)
+
+	// The same again for an estimate the answer cannot reach, which is what the
+	// configured default amounts to.
+	big := make_rate_limiter(RATE, 0, nil, 4096)
+	defer destroy_rate_limiter(big)
+	answered = 0
+	for _ in 0 ..< 1000 {
+		if rate_check(big, client, at(0)) != .Allow {
+			continue
+		}
+		rate_charge_response(big, client, 1232, at(0))
+		answered += 1
+	}
+	testing.expectf(
+		t,
+		answered == RATE * RRL_BURST_SECONDS,
+		"%d answers with the estimate above the ceiling, expected the %d the count allows",
+		answered,
+		RATE * RRL_BURST_SECONDS,
+	)
+}
+
+/*
+The overspend is carried, and the next query in the prefix is what pays it.
+
+The check runs before the answer exists, so the token it spends is a deposit and
+the remainder is billed afterwards - there is no way to refuse a datagram for the
+size of an answer that has not been packed yet. What makes that sound is the
+bucket: the debt is still in it when the next query arrives.
+
+Counted exactly rather than approximately, because the arithmetic is the claim:
+one 1232-byte answer at an estimate of 128 is ten tokens of the two hundred a
+full bucket holds, so a hundred and ninety small answers are left and not a
+hundred and ninety-one.
+*/
+@(test)
+test_an_oversized_answer_is_paid_for_by_the_next_query :: proc(t: ^testing.T) {
+	RATE :: 100
+	ESTIMATE :: 128
+	r := make_rate_limiter(RATE, 0, nil, ESTIMATE)
+	defer destroy_rate_limiter(r)
+
+	client := v4(203, 0, 113, 64)
+	testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Allow)
+	rate_charge_response(r, client, 1232, at(0))
+
+	// 1232 bytes at 128 is ten tokens: the one the check took and nine more.
+	COST :: 10
+	left := 0
+	for _ in 0 ..< 1000 {
+		if rate_check(r, client, at(0)) != .Allow {
+			continue
+		}
+		rate_charge_response(r, client, 60, at(0))
+		left += 1
+	}
+	expected := RATE * RRL_BURST_SECONDS - COST
+	testing.expectf(
+		t,
+		left == expected,
+		"one 1232-byte answer left %d small ones in the bucket, expected %d",
+		left,
+		expected,
+	)
+}
+
+/*
+The other three pools are not charged for a datagram's size.
+
+The separation the top of `ratelimit.odin` argues for, asked of the new charge:
+a prefix whose answers are large must not thereby lose the connections it may
+open or the queries it may ask over them. Nothing about a large UDP answer says
+anything about the work behind a query on a connection, and a size charged to the
+`Connection` pool would be a datagram deciding whether a stranger's clients may
+connect - which is the hole a separate pool exists to close.
+
+The two transports here; `Slip` is the third, and it is the recourse rather than
+a transport, so it is asked for on its own below.
+*/
+@(test)
+test_the_size_charge_is_the_datagram_pool_alone :: proc(t: ^testing.T) {
+	RATE :: 10
+	ESTIMATE :: 128
+	r := make_rate_limiter(RATE, 0, nil, ESTIMATE)
+	defer destroy_rate_limiter(r)
+
+	client := v4(203, 0, 113, 65)
+	// The datagram pool spent and overspent: a full bucket of large answers,
+	// admitted and then billed, which is both the order the server does it in and
+	// the only one that leaves the pool owing rather than at zero.
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Allow)
+	}
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		rate_charge_response(r, client, 1232, at(0))
+	}
+	testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Drop)
+
+	streamed := 0
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		if stream_rate_check(r, client, at(0)) {
+			streamed += 1
+		}
+	}
+	testing.expectf(
+		t,
+		streamed == RATE * RRL_BURST_SECONDS,
+		"large datagram answers took %d of the %d queries the prefix's connections were owed",
+		streamed,
+		RATE * RRL_BURST_SECONDS,
+	)
+
+	opened := 0
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		if conn_rate_check(r, client, at(0)) {
+			opened += 1
+		}
+	}
+	testing.expectf(
+		t,
+		opened == RATE * RRL_BURST_SECONDS,
+		"large datagram answers took %d of the %d connections the prefix could open",
+		opened,
+		RATE * RRL_BURST_SECONDS,
+	)
+}
+
+/*
+And the way out is still open to a prefix that owes tokens.
+
+The one property the debt must not cost, since it is the only thing a real client
+caught behind a spoofed flood has: `slip` answers one in `slip` over-limit
+datagrams truncated, which is what tells that client to come back over TCP, where
+the handshake proves its address and no datagram budget follows it. A `Slip` pool
+charged for a datagram's size would close that door exactly when a flood of large
+answers had opened the debt - the clients who need the invitation are the ones
+whose prefix is deepest overdrawn.
+
+Nothing charges it, because `rate_charge_response` touches `Datagram` and no
+other pool. Asserted against a bucket that is not merely empty but owing: a full
+bucket admitted and then billed, which is the burst the read loop lets through
+before the first answer is weighed.
+*/
+@(test)
+test_a_prefix_in_debt_is_still_offered_its_slip :: proc(t: ^testing.T) {
+	RATE :: 100
+	SLIP :: 2
+	ESTIMATE :: 128
+	r := make_rate_limiter(RATE, SLIP, nil, ESTIMATE)
+	defer destroy_rate_limiter(r)
+
+	client := v4(203, 0, 113, 68)
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Allow)
+	}
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		rate_charge_response(r, client, 1232, at(0))
+	}
+
+	// A second later the prefix owes some sixteen more, so every one of these is
+	// over the budget - and one in `SLIP` of them comes back truncated anyway.
+	slipped := 0
+	for _ in 0 ..< 10 {
+		if rate_check(r, client, at(1000)) == .Truncate {
+			slipped += 1
+		}
+	}
+	testing.expectf(
+		t,
+		slipped == 10 / SLIP,
+		"a prefix in debt was offered %d truncated answers out of 10, expected the %d its slip spacing owes it",
+		slipped,
+		10 / SLIP,
+	)
+}
+
+/*
+The debt outlives the burst that ran it up, and time is what repays it.
+
+The charge lands after the admission rather than with it, so the read loop can
+admit a full bucket of queries before the first answer is billed - which is what
+a flood looks like from here. What follows is a prefix that owes for every one of
+them, and is quiet until it has paid: ten 1232-byte answers at an estimate of 128
+is a hundred tokens, a second of a hundred-a-second budget, and the tenth of a
+second after them is not enough.
+
+Uncapped on purpose. The overspend is exactly what a floor would forgive - the
+burst is where the large answers are - and forgiving it would leave
+`responses_per_second * response_size_estimate` an average this server exceeds
+whenever a flood pauses. What it costs is written down beside
+`rate_charge_response`.
+*/
+@(test)
+test_the_debt_from_a_burst_is_carried_until_it_is_repaid :: proc(t: ^testing.T) {
+	RATE :: 100
+	ESTIMATE :: 128
+	r := make_rate_limiter(RATE, 0, nil, ESTIMATE)
+	defer destroy_rate_limiter(r)
+
+	client := v4(203, 0, 113, 66)
+	// A full bucket admitted and then billed, which is the order the read loop
+	// and the workers do it in when a flood arrives faster than it is answered.
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Allow)
+	}
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		rate_charge_response(r, client, 1232, at(0))
+	}
+
+	/*
+	Two hundred answers at ten tokens each is two thousand, of which the admits
+	paid two hundred: eighteen seconds of debt at a hundred a second. A second of
+	refill is not it, and neither is ten.
+	*/
+	testing.expect_value(t, rate_check(r, client, at(1000)), Rate_Verdict.Drop)
+	testing.expect_value(t, rate_check(r, client, at(10_000)), Rate_Verdict.Drop)
+	// And it is repaid rather than permanent: past the eighteen seconds the
+	// prefix is answering again.
+	testing.expect_value(t, rate_check(r, client, at(20_000)), Rate_Verdict.Allow)
+}
+
+/*
+A prefix in debt is not a prefix somebody else can take the bucket of.
+
+The takeover in `rate_bucket` hands a bucket to a newcomer only once every pool
+has refilled to capacity, and a pool below zero is further from that than an
+empty one - so the arithmetic that lets a bucket owe tokens cannot be turned into
+a way to clear a live prefix's accounting by arriving beside it. The flood of
+strangers here is what `test_a_flood_of_prefixes_does_not_reset_a_live_bucket`
+does to a bucket that is merely empty, asked again of one that is overdrawn.
+*/
+@(test)
+test_a_prefix_in_debt_keeps_its_bucket :: proc(t: ^testing.T) {
+	RATE :: 100
+	ESTIMATE :: 128
+	r := make_rate_limiter(RATE, 0, nil, ESTIMATE)
+	defer destroy_rate_limiter(r)
+
+	victim := v4(198, 51, 100, 5)
+	/*
+	Admitted first and billed after, which is the order the read loop and the
+	workers do it in - and the only order that leaves the bucket owing rather
+	than merely empty. Billing as each answer is admitted stops at zero: the
+	check refuses the next datagram the moment the tokens run out, so nothing is
+	left to overspend, and a millisecond of refill would hand the prefix an
+	answer. Overdrawn is the precondition here, so it is set up as a flood sets
+	it up.
+	*/
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		testing.expect_value(t, rate_check(r, victim, at(0)), Rate_Verdict.Allow)
+	}
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		rate_charge_response(r, victim, 1232, at(0))
+	}
+	testing.expect_value(t, rate_check(r, victim, at(0)), Rate_Verdict.Drop)
+
+	/*
+	Four times as many distinct /24s as there are buckets, which is the flood
+	`test_a_flood_of_prefixes_does_not_reset_a_live_bucket` uses and the reason
+	it is that many: the property here is about what a stranger who lands on the
+	victim's bucket may do to it, so the flood has to be certain to produce one.
+	A /16's worth - 255 prefixes against `RRL_BUCKETS` - reaches it about once in
+	sixty runs, and the other fifty-nine assert only that the victim is still in
+	debt, which the line above already said.
+
+	Out of 10/8 rather than the victim's own /16: a query in its prefix would be
+	its bucket being charged again, not a stranger arriving beside it.
+	*/
+	for i in 0 ..< RRL_BUCKETS * 4 {
+		_ = rate_check(r, v4(10, u8(i >> 8), u8(i), 1), at(10))
+	}
+	testing.expect_value(t, rate_check(r, victim, at(10)), Rate_Verdict.Drop)
+}
+
+/*
 A limiter that is off allows everything, since that is what a nil one means to
 every caller.
+
+Including the size charge, which `udp_job` makes on every answer it sends without
+asking whether there is a limiter to charge: `rate_limit.enabled: false` leaves
+`Server.limiter` nil, so the nil here is the configuration an operator wrote and
+not a defensive guard against nothing.
 */
 @(test)
 test_rate_limit_disabled_allows_everything :: proc(t: ^testing.T) {
 	for i in 0 ..< 1000 {
 		testing.expect_value(t, rate_check(nil, v4(192, 0, 2, u8(i % 256)), at(0)), Rate_Verdict.Allow)
+		rate_charge_response(nil, v4(192, 0, 2, u8(i % 256)), 4096, at(0))
 		testing.expect(
 			t,
 			stream_rate_check(nil, v4(192, 0, 2, u8(i % 256)), at(0)),
@@ -1944,7 +2379,7 @@ test_the_override_lines_say_what_will_be_charged :: proc(t: ^testing.T) {
 		override("198.51.100.0/24", 4000, 2),
 		override("203.0.113.0/24", 50, 0),
 	}
-	lines := rate_limit_override_lines(overrides, context.temp_allocator)
+	lines := rate_limit_override_lines(overrides, allocator = context.temp_allocator)
 	// A header and one line per network.
 	if !testing.expect_value(t, len(lines), 3) {
 		return
@@ -1967,6 +2402,63 @@ test_the_override_lines_say_what_will_be_charged :: proc(t: ^testing.T) {
 
 	// Nothing configured, nothing said - so a deployment with no overrides gets
 	// no line at startup and none under `--check`.
-	testing.expect_value(t, len(rate_limit_override_lines(nil, context.temp_allocator)), 0)
+	testing.expect_value(t, len(rate_limit_override_lines(nil, allocator = context.temp_allocator)), 0)
+	free_all(context.temp_allocator)
+}
+
+/*
+And an override's count is multiplied out too, wherever the estimate bites.
+
+`response_size_estimate` is one figure for the server, so it denominates a
+network's own budget exactly as it denominates the default one: at 128 bytes a
+full-size answer costs ten tokens, and an operator who raised a network to 4000/s
+because they know it is a carrier NAT is being told about 4000 answers when what
+they have bought is 500 KB/s. The default tier's line says its product out loud -
+`rate_limit_denomination_line` - and a line beside it that said only the count
+would be the same figure in two units, one of them the one nobody meant.
+
+Silent where the estimate cannot bite, which is every configuration that does not
+write one: the loader resolves an unset estimate to `server.max_udp_response`, so
+`estimate < ceiling` is false and these lines read exactly as they did before
+there was a second figure.
+*/
+@(test)
+test_the_override_lines_say_what_the_estimate_makes_of_them :: proc(t: ^testing.T) {
+	overrides := []config.Rate_Limit_Override {
+		override("198.51.100.0/24", 4000, 2),
+		override("203.0.113.0/24", 50, 0),
+	}
+	// 128 bytes under a 1232-byte ceiling, which is the shipped ceiling and the
+	// estimate the documentation works its example at.
+	lines := rate_limit_override_lines(overrides, 128, 1232, context.temp_allocator)
+	if !testing.expect_value(t, len(lines), 3) {
+		return
+	}
+	// 4000 * 128 and 50 * 128, rendered by the `%.1M` every other byte figure
+	// this server prints is rendered by.
+	testing.expect(
+		t,
+		strings.contains(lines[1], "500.0KiB/s"),
+		"the raised network's line did not say what its budget comes to: %q",
+		lines[1],
+	)
+	testing.expect(
+		t,
+		strings.contains(lines[2], "6.2KiB/s"),
+		"the lowered network's line did not say what its budget comes to: %q",
+		lines[2],
+	)
+
+	// And nothing at all when the estimate is the ceiling, which is what a file
+	// that does not write one resolves to.
+	quiet := rate_limit_override_lines(overrides, 1232, 1232, context.temp_allocator)
+	if testing.expect_value(t, len(quiet), 3) {
+		testing.expect(
+			t,
+			!strings.contains(quiet[1], "/s of answers"),
+			"a default estimate put a byte figure on an override's line: %q",
+			quiet[1],
+		)
+	}
 	free_all(context.temp_allocator)
 }

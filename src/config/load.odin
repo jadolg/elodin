@@ -208,6 +208,47 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 	if rl := yaml.get(n, "rate_limit"); rl != nil {
 		opt_bool(l, rl, "enabled", &cfg.server.rate_limit.enabled, "server.rate_limit")
 		opt_int(l, rl, "responses_per_second", &cfg.server.rate_limit.responses_per_second, "server.rate_limit")
+		// A size, like `max_udp_response` it is denominated against, so "1232"
+		// and "1KiB" both read.
+		opt_bytes(
+			l,
+			rl,
+			"response_size_estimate",
+			&cfg.server.rate_limit.response_size_estimate,
+			"server.rate_limit",
+		)
+		/*
+		0 is the loader's own marker for a key nobody wrote, which `validate`
+		turns into `server.max_udp_response`. A file that writes it means
+		something by it, and what it would get is that same resolution: the key
+		doing nothing, silently, which is the one shape this setting is reported
+		in two other places to avoid. So it is refused like any other figure out
+		of bounds - `responses_per_second: 0` already is - and here rather than
+		in `validate`, since by then the two are the same value.
+
+		Read back out of the node rather than off the field, because the field
+		is 0 for two different files: the one that wrote a zero and the one that
+		wrote something `opt_bytes` could not parse. The second has already been
+		refused in its own words a line above, and a second message saying "it
+		is 0" about a file that says `abc` would be the loader describing a
+		value nobody wrote.
+
+		Only with the limiter on, like every other figure in this map: `validate`
+		leaves `responses_per_second` and `slip` unchecked when
+		`rate_limit.enabled` is false, and a key that cannot do anything either
+		way is not worth refusing a start over.
+		*/
+		if written := yaml.get(rl, "response_size_estimate");
+		   cfg.server.rate_limit.enabled && !yaml.is_null(written) {
+			if v, ok := yaml.as_bytes(written); ok && v == 0 {
+				errorf(
+					l,
+					"server.rate_limit.response_size_estimate must be between %d and %d bytes (it is 0); leave the key out for one token per answer, which is what 0 would quietly do",
+					MIN_RESPONSE_SIZE_ESTIMATE,
+					MAX_UDP_RESPONSE,
+				)
+			}
+		}
 		opt_int(l, rl, "slip", &cfg.server.rate_limit.slip, "server.rate_limit")
 		load_rate_limit_overrides(l, rl, cfg)
 	}
@@ -2366,6 +2407,35 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 		}
 		if cfg.server.rate_limit.slip < 0 {
 			errorf(l, "server.rate_limit.slip must not be negative")
+		}
+		/*
+		The denomination, resolved here to the ceiling it is measured against.
+
+		Unset is `server.max_udp_response`, the largest datagram this server will
+		send, so every answer costs exactly one token and a file that does not
+		write this key means what it meant before there was one to write.
+
+		Written, it is held to bounds of its own. Below
+		`MIN_RESPONSE_SIZE_ESTIMATE` every answer this server can send costs more
+		than a token, which is `responses_per_second` made into a byte budget with
+		a multiplier nobody stated; above `MAX_UDP_RESPONSE` there is no datagram
+		large enough for the figure to reach, so it is a key that does nothing.
+
+		Refused rather than clamped, for the reason `max_udp_response` is: this is
+		what the budget is counted in, and a server that quietly counted in
+		something else would be one whose bound is not the one its file states.
+		*/
+		if cfg.server.rate_limit.response_size_estimate == 0 {
+			cfg.server.rate_limit.response_size_estimate = cfg.server.max_udp_response
+		} else if cfg.server.rate_limit.response_size_estimate < MIN_RESPONSE_SIZE_ESTIMATE ||
+		   cfg.server.rate_limit.response_size_estimate > MAX_UDP_RESPONSE {
+			errorf(
+				l,
+				"server.rate_limit.response_size_estimate must be between %d and %d bytes (it is %d); left out it is server.max_udp_response, which charges one token per answer",
+				MIN_RESPONSE_SIZE_ESTIMATE,
+				MAX_UDP_RESPONSE,
+				cfg.server.rate_limit.response_size_estimate,
+			)
 		}
 		/*
 		The overrides' own figures, held to the same rules as the defaults they

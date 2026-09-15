@@ -47,7 +47,11 @@ blocking: {{ enabled: false }}
 
 // A response of roughly `count * 260` bytes, built as TXT records so it is the
 // answer section rather than anything the server would strip that makes it big.
-@(private = "file")
+//
+// Package-visible because the rate limit cases want the same thing for a
+// different reason: what they need is an answer whose size is worth charging,
+// and two builders of large answers would be two sizes to keep in step.
+@(private)
 big_txt_answer :: proc(name: string, count: int, allocator := context.allocator) -> []u8 {
 	answers := make([]dns.Record, count, context.temp_allocator)
 	for i in 0 ..< count {

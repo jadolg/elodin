@@ -1073,6 +1073,7 @@ server:
   rate_limit:
     enabled: true                 # on by default
     responses_per_second: 500     # per client prefix (/24 or /64), and per budget: datagrams, queries on a connection, connections opened
+    # response_size_estimate: 128 # bytes one answer costs the datagram budget; a larger one is charged as several. Left out it follows max_udp_response, so every answer costs one token
     slip: 2                       # answer at most every 2nd query over the budget truncated; 0 drops them all
 ```
 
@@ -1087,6 +1088,52 @@ sender asks: with a spoofed address there is nothing of the sender's to measure.
 So it is kept per destination prefix, /24 and /64, the granularity an attacker
 picks addresses within, in a fixed table allocated once so the limiter is not
 itself somewhere to put pressure.
+
+**What one of those responses is worth in bytes is `response_size_estimate`.**
+A victim receives traffic, and a count of sendings is worth whatever the answers
+weigh — which the attacker picks by picking the question. At the shipped 500 that
+is about 50 KB/s at one /24 if the answers are ~100-byte NODATAs and about 600
+KB/s if they are full 1232-byte DNSSEC answers, a twelvefold spread in the figure
+an operator thought they were setting. So an answer larger than the estimate is
+charged `ceil(size / response_size_estimate)` tokens instead of one — admitted on
+the first, billed for the rest once it is packed, which the next query from that
+prefix pays for — and the bound becomes `responses_per_second ×
+response_size_estimate` bytes a second whatever is asked for. AdGuard DNS's
+setting of the same name does the same arithmetic.
+
+Left out it is [`max_udp_response`](#how-large-a-udp-answer-may-be), the largest
+datagram this server will send, so no answer is ever charged more than one token
+and the figure means exactly what it meant before there was a second one. Set it
+smaller to choose the quantity directly: with the 1232 ceiling,
+`response_size_estimate: 128` holds a prefix to about 64 KB/s of answers rather
+than 600, while a client whose answers are ordinary — an A record is ~60 bytes —
+still gets its 500 a second. It is the datagram budget only: a connection has no
+size worth charging, and a slip reply is not weighed at all — it is a header and
+the question echoed back, 30-odd bytes for an ordinary name and at most 271 for a
+maximal one, so the `slip` pool's own `responses_per_second / 8` a second sits on
+top of the figure above rather than inside it.
+The floor is 64 bytes, since below the smallest answer this server sends the
+setting stops being a size at all; anything at or above `max_udp_response` is
+what leaving it out already does.
+
+The bill arrives after the datagram was admitted, not with it, so the debt is
+carried rather than forgiven: a burst that reaches a full bucket is admitted
+whole and billed for all of it afterwards, and the prefix then hears nothing
+until it has paid — about `2 × (ceil(max_udp_response ÷ response_size_estimate) −
+1)` seconds, so 18 at an estimate of 128 and 38 at the 64-byte floor. That is the
+overspend the setting exists to charge for, and forgiving it would make the bound
+above an average rather than a ceiling. `slip` is untouched by it: a real client
+caught behind a spoofed burst in its /24 is still answered truncated and sent to
+TCP, where no datagram budget follows it.
+
+When it is set low enough to bite, `--check` and the startup line say what the
+two figures multiply out to, at whatever scale the figure lands on — `640.0B/s`,
+`62.5KiB/s`, `4.8MiB/s`. Each `overrides` entry's line carries the same product
+for its own budget, since the estimate is one figure for the whole server: a
+network raised to 4000/s at an estimate of 128 is told it has bought 500.0KiB/s,
+not 4000 answers of whatever size. And when the estimate is set *above*
+`max_udp_response`, where no answer can reach it, both say that instead, so a
+figure that looks like a tightening and is not does not pass unremarked.
 
 Over-budget queries are not simply dropped. At most every `slip`th one comes back
 as a header and a question with the TC bit set: too small to be worth reflecting,

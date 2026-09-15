@@ -513,7 +513,30 @@ main :: proc() {
 		the mistake is serving anybody.
 		*/
 		if cfg.server.rate_limit.enabled {
-			for line in server.rate_limit_override_lines(cfg.server.rate_limit.overrides, context.temp_allocator) {
+			// What the two rate-limit figures multiply out to, which is the
+			// quantity being chosen, and - where the estimate is one no answer
+			// can reach - that it charges nothing and is reported nowhere else.
+			if text, say := server.rate_limit_denomination_line(
+				cfg.server.rate_limit.responses_per_second,
+				cfg.server.rate_limit.response_size_estimate,
+				cfg.server.max_udp_response,
+				context.temp_allocator,
+			); say {
+				fmt.printfln("  %s", text)
+			}
+			if text, say := server.response_size_estimate_warning(
+				cfg.server.rate_limit.response_size_estimate,
+				cfg.server.max_udp_response,
+				context.temp_allocator,
+			); say {
+				fmt.printfln("  warning: %s", text)
+			}
+			for line in server.rate_limit_override_lines(
+				cfg.server.rate_limit.overrides,
+				cfg.server.rate_limit.response_size_estimate,
+				cfg.server.max_udp_response,
+				context.temp_allocator,
+			) {
 				fmt.printfln("  %s", line)
 			}
 		}
@@ -698,9 +721,11 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	and joins every connection thread, but it does not empty the pools: a query
 	accepted a moment earlier is still queued, and `pool.destroy` runs what is
 	queued before it joins its workers. Those jobs reach for the validator, the
-	filters, the cache and the upstream group, so the pools have to be drained
-	before any of that is torn down - the defers below this one - and the
-	listener contexts released only once nothing is left that could hold one.
+	filters, the cache, the upstream group and the rate limiter - `udp_job`
+	charges the answer it just packed to the prefix it is addressed to - so the
+	pools have to be drained before any of that is torn down - the defers below
+	this one - and the listener contexts released only once nothing is left that
+	could hold one.
 
 	The pools are handled here rather than at the point they are created, where
 	a `defer` of their own would put them last in the unwind and hand every
