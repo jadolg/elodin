@@ -171,9 +171,37 @@ nsec3_refusals :: proc(budget: ^Nsec3_Budget) -> Nsec3_Refusals {
 	return {spent = budget.spent, over_ceiling = budget.over_ceiling}
 }
 
-// Was anything refused since `before`, and which refusal was it? The allowance
-// is named first: a question that ran out of it will meet the ceiling too, and
-// the number an operator has to look at is the one that stopped the proof.
+/*
+Could this reading have been different with a whole allowance?
+
+Only the allowance answers yes, and the difference between the two refusals is
+the difference between a policy and a moment. A record above the ceiling is
+unusable to this server for every question it will ever be asked, so skipping it
+is the answer rather than a gap in one - the records around it still speak, and
+the verdict they give is the verdict a fresh allowance would give too. A record
+the allowance refused is one this server would have read a moment earlier, so a
+negative reading over it is provisional, and anything built on that negative is
+built on a gap.
+
+So this is what a *positive* conclusion drawn from a negative reading has to
+consult - the opt-out fallback, the step that ends a walk - and
+`nsec3_declined` below is for the other question, which is only ever asked of a
+proof that has already failed.
+*/
+@(private)
+nsec3_cut_short :: proc(budget: ^Nsec3_Budget, before: Nsec3_Refusals) -> bool {
+	return budget.spent > before.spent
+}
+
+/*
+Was anything refused since `before`, and which refusal was it?
+
+For naming a failure, never for deciding one: a proof that failed is a proof
+that failed, and this says whether to report it as the records' doing or as
+ours. The allowance is named first because a question that ran out of it will
+meet the ceiling too, and the number an operator has to look at is the one that
+stopped the proof.
+*/
 @(private)
 nsec3_declined :: proc(budget: ^Nsec3_Budget, before: Nsec3_Refusals) -> (declined: bool, reason: string) {
 	if budget.spent > before.spent {
@@ -492,12 +520,14 @@ nsec3_proves_no_data :: proc(
 		below and above returns `Failed`, which the callers turn into
 		`Indeterminate` once they see what it cost, and this joins them.
 
-		A refusal counted against this scan and not the flag on the budget: the
-		flag belongs to the whole question and stays set, and a wildcard that
-		was really looked for and really is not there is a finding whatever some
-		earlier proof spent.
+		The allowance, and counted against this scan rather than read off the
+		budget: a wildcard that was really looked for and really is not there is
+		a finding whatever some earlier proof spent. A record the ceiling
+		refused is not the same thing - it is unusable to this server for good,
+		the records around it still speak, and reading them is what this server
+		does with such a zone rather than an answer it stopped short of.
 		*/
-		if declined, _ := nsec3_declined(budget, before); declined {
+		if nsec3_cut_short(budget, before) {
 			return .Failed
 		}
 		if cover.rr.flags & NSEC3_FLAG_OPT_OUT != 0 {

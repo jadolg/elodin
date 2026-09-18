@@ -2795,14 +2795,18 @@ Kept apart from the lookup around it because this is the whole of the decision
 and none of it needs a network: the records have already been checked against
 the parent's keys, and what is left is what they say.
 
-`cut_short` says this reading could have been changed by hashing that was
-refused, and it is this step's own answer rather than the question's. The flags
-on the budget stay set for everything after whatever set them, so a step that
-reached its verdict from NSEC records, from a record it found, or from hashes
-kept by an earlier scan would otherwise read someone else's refusal as its own
-and be thrown away for it. What it counts instead is the refusals charged while
-it read, and it carries them only on the readings a refusal could have produced:
-a scan finding nothing, and nothing proven at all.
+`cut_short` says this reading could have been different, and it is this step's
+own answer rather than the question's: the counts on the budget only go up, so a
+step that reached its verdict from NSEC records, from a record it found, or from
+hashes kept by an earlier scan would otherwise be thrown away for a refusal that
+was never its own.
+
+Which refusal matters depends on what is being decided, and
+`nsec3_cut_short` has the reasoning. A step that ends the walk - `.Absent` -
+turns on the allowance alone, because a record over the ceiling is one this
+server will not read for any question and the zone it can read is the zone it
+has. A step that settles nothing carries either, since it is failing whatever
+happens and the only thing left to get right is what it is called.
 */
 @(private)
 denial_step :: proc(
@@ -2846,8 +2850,11 @@ denial_step :: proc(
 			if matched {
 				return .No_Cut, false
 			}
-			absent_declined, _ := nsec3_declined(nsec3_budget, before)
-			return .Absent, absent_declined
+			// The allowance only: a record the ceiling refused is one this
+			// server will not read for any question, so the records around it
+			// are the whole of the zone as far as it is concerned, and a walk
+			// that ends on them ends where it would have ended anyway.
+			return .Absent, nsec3_cut_short(nsec3_budget, before)
 		}
 		// Nothing proven either way: a forgery when the records are what they
 		// look like, and a decision of ours when a hash was refused while this

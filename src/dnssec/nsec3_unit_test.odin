@@ -803,3 +803,50 @@ test_a_proof_that_could_not_hash_counts_the_refusal :: proc(t: ^testing.T) {
 	testing.expect_value(t, why, "nsec3 hashing budget spent")
 	free_all(context.temp_allocator)
 }
+
+/*
+And the same distinction where a missing wildcard decides an opt-out.
+
+`nsec3_proves_no_data` reads "no wildcard here" as permission to fall back on
+the opt-out span, so it has to know whether the scan that found no wildcard
+could have been different. Refused for the allowance, it could: the record may
+be one this server would have read a moment earlier. Refused for its iteration
+count, it could not: that record is unreadable for good, the ones around it are
+the zone as far as this server is concerned, and the answer is the same answer
+it will give tomorrow.
+
+Reading the two together turned a zone mid-rollover across the ceiling into
+SERVFAIL where the same records, without the chain on its way out, are an
+insecure answer.
+*/
+@(test)
+test_a_chain_above_the_ceiling_does_not_suppress_an_opt_out :: proc(t: ^testing.T) {
+	zone := a_zone()
+	for &record in zone {
+		record.rr.flags |= NSEC3_FLAG_OPT_OUT
+	}
+	// `a.example.` is in the zone and `*.a.example.` is not, so a name under it
+	// has a closest encloser, a covered next closer and no wildcard.
+	whole := Nsec3_Budget {
+		max_iterations = A_ITERATIONS,
+	}
+	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.a.example.", "example.", .A, &whole), Proof.Opt_Out)
+
+	// The same records with a chain on its way out beside them, every one of it
+	// past the ceiling.
+	mixed := make([dynamic]Nsec3_Rr, context.temp_allocator)
+	for record in zone {
+		leaving := record
+		leaving.rr.iterations = 5000
+		append(&mixed, leaving)
+		append(&mixed, record)
+	}
+
+	budget := Nsec3_Budget {
+		max_iterations = A_ITERATIONS,
+	}
+	testing.expect_value(t, nsec3_proves_no_data(mixed[:], "foo.a.example.", "example.", .A, &budget), Proof.Opt_Out)
+	testing.expect(t, budget.over_ceiling > 0, "the chain on its way out should have been refused, or this proves nothing")
+	testing.expect_value(t, budget.spent, 0)
+	free_all(context.temp_allocator)
+}

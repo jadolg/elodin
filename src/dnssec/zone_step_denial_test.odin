@@ -383,3 +383,45 @@ test_the_deepest_walk_this_server_follows_fits_in_one_allowance :: proc(t: ^test
 	)
 	free_all(context.temp_allocator)
 }
+
+/*
+A chain this server will not read does not stop it reading the one beside it.
+
+A zone changing its NSEC3 parameters publishes both chains at once, and the old
+one can be the reason the ceiling exists: five thousand iterations on its way
+out, nothing on its way in. Every record of the old chain is refused, and that
+refusal is a policy rather than a moment - this server will not read those
+records for any question, so what the new chain says is the whole of what it
+knows about the zone, and it is a complete answer rather than one cut short.
+
+Reading the refusals together got this wrong for as long as it took to be
+noticed here: the step came back undecided, `zone_step` turned that into
+`Indeterminate`, and a subtree that resolves on any other resolver went SERVFAIL
+because of a chain this server had decided to ignore.
+*/
+@(test)
+test_a_chain_above_the_ceiling_does_not_stop_the_one_beside_it :: proc(t: ^testing.T) {
+	nodes := []Node {
+		{"example.", {.NS, .SOA, .RRSIG, .DNSKEY}},
+		{"a.example.", {.A, .RRSIG}},
+	}
+	usable := nsec3_zone(nodes, []u8{0x0a, 0x0b}, 0)
+	leaving := nsec3_zone(nodes, []u8{0x0c, 0x0d}, 5000)
+	testing.expect(t, len(usable) == 2 && len(leaving) == 2, "both chains should build")
+
+	both := make([dynamic]Nsec3_Rr, context.temp_allocator)
+	for i in 0 ..< len(nodes) {
+		append(&both, leaving[i])
+		append(&both, usable[i])
+	}
+
+	budget := Nsec3_Budget {
+		max_iterations = 100,
+	}
+	step, cut_short := denial_step(nil, both[:], "nx.example.", "example.", &budget)
+	testing.expect_value(t, step, Step.Absent)
+	testing.expect(t, !cut_short, "a chain refused for its iterations is not a reading this server stopped short of")
+	testing.expect(t, budget.over_ceiling > 0, "the old chain should have been refused, or this proves nothing")
+	testing.expect_value(t, budget.spent, 0)
+	free_all(context.temp_allocator)
+}
