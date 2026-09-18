@@ -430,7 +430,15 @@ One SERVFAIL is exempt: the one carrying an RFC 8914 extended error that says
 the name failed DNSSEC validation (codes 6 to 12). That is a verdict about the
 name, and asking a member of the group that does not validate would fetch the
 very answer the first member rejected — which matters with `dnssec.enabled:
-false`, where nothing here is checking either.
+false`, where nothing here is checking either. It is a second line rather than
+the defence: an upstream only gets the benefit of it if it sends the extended
+error, and several do not by default (Unbound needs `ede: yes`, dnsmasq has
+none). With `dnssec.enabled` on, as it ships, validation here refuses the
+forgery whichever member of the group supplied it.
+
+The member that was passed over is counted against its name in
+`elodin_upstream_swept_rcode_total{upstream}`, since its health is deliberately
+left alone and no other figure would name it.
 
 What the sweep costs is up to one extra exchange per remaining member of the
 group, and a member that is unreachable but not yet in its cooldown costs
@@ -2036,6 +2044,7 @@ as a warning at startup.
 | `elodin_upstream_latency_seconds_total{upstream}` | counter | cumulative round-trip time; divide by the query counter under `rate()` for the mean |
 | `elodin_upstream_up{upstream}` | gauge | 0 while an upstream is in its failure cooldown |
 | `elodin_upstream_unreadable_rcode_total{upstream}` | counter | replies from each upstream refused because their rcode is one a client would read as a different rcode — the extended half lives in the OPT record and a stub reads the header. Not counted as a failure above, on purpose: those bytes are forgeable, and a failure would park the group |
+| `elodin_upstream_swept_rcode_total{upstream}` | counter | replies from each upstream that another member of its group was asked to answer instead: a SERVFAIL or REFUSED, or an rcode a client could not read. Not a failure either, so this is the only figure naming a member that answers but cannot help — watch it for a group silently paying two exchanges a query |
 | `elodin_udp_datagrams_total{reader}` | counter | datagrams each UDP reader took off its socket |
 | `elodin_udp_receive_drops_total{reader}` | counter | datagrams the kernel dropped on that reader's receive queue before they could be read; absent where `/proc` cannot be read |
 | `elodin_pool_workers{pool}` / `elodin_pool_pending{pool}` | gauge | the `query` and `upstream` pools; `pending` that does not return to zero is `server.workers` set too low |

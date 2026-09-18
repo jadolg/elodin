@@ -107,6 +107,9 @@ Stats :: struct {
 	// Replies from this server that the caller could not pass on because their
 	// rcode is not one a client can read; see `note_unreadable_rcode`.
 	unreadable_rcode: u64,
+	// Replies from this server that another member of its group answered
+	// instead; see `note_swept_rcode`.
+	swept_rcode:      u64,
 }
 
 // After this many consecutive failures an upstream is skipped for COOLDOWN.
@@ -272,6 +275,36 @@ note_unreadable_rcode :: proc(u: ^Upstream) {
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
 	u.stats.unreadable_rcode += 1
+}
+
+/*
+Count a reply from `u` that another member of its group answered instead.
+
+The trace a swept member leaves, and the only one. `resolve_insisting` sweeps
+past a SERVFAIL, a REFUSED or an unreadable rcode without touching health - the
+server replied, and parking it over what it replied is what `note_unreadable_rcode`
+argues against - so `failures` stays at zero, `healthy` goes on reporting it up,
+and the client's query is answered and counted as forwarded. An upstream that
+has stopped being able to answer anything is then invisible in every other
+figure, while the group behind it quietly runs at two exchanges per query.
+
+Counted by this package rather than by the caller, unlike `unreadable_rcode`:
+the sweep is where the decision is made and where the member that was passed
+over is known. It names that member and not the one that answered, which is the
+question an operator has - which of these should I go and look at.
+
+Counted when the sweep starts rather than when it finds something, so that the
+group whose every member answers this way - the one paying the most exchanges
+per query, and returning the first reply after all of them - is the loudest here
+rather than the quietest.
+*/
+note_swept_rcode :: proc(u: ^Upstream) {
+	if u == nil {
+		return
+	}
+	sync.mutex_lock(&u.mu)
+	defer sync.mutex_unlock(&u.mu)
+	u.stats.swept_rcode += 1
 }
 
 stats_of :: proc(u: ^Upstream) -> Stats {

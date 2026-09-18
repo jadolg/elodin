@@ -724,6 +724,7 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 		failures:   u64,
 		latency:    u64,
 		unreadable: u64,
+		swept:      u64,
 		up:         bool,
 	}
 	all := make([dynamic]Series, 0, 8, context.temp_allocator)
@@ -740,6 +741,7 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 				all[i].failures += us.failures
 				all[i].latency += us.latency_ns_total
 				all[i].unreadable += us.unreadable_rcode
+				all[i].swept += us.swept_rcode
 				if live {
 					all[i].up = true
 				}
@@ -754,6 +756,7 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 					failures = us.failures,
 					latency = us.latency_ns_total,
 					unreadable = us.unreadable_rcode,
+					swept = us.swept_rcode,
 					up = live,
 				},
 			)
@@ -793,6 +796,27 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 	)
 	for u in all {
 		metrics.sample(b, "elodin_upstream_unreadable_rcode_total", u.unreadable, metrics.Label{"upstream", u.name})
+	}
+
+	/*
+	Which upstream answered something another member of its group had to answer
+	instead - a SERVFAIL, a REFUSED, or an rcode no client could read.
+
+	The same reasoning as the family above, for the case that is far more
+	common. `resolve_insisting` sweeps past such a reply without counting a
+	failure, so the member that is doing it holds a clean
+	`elodin_upstream_failures_total` and an `elodin_upstream_up` of 1 while
+	every query through the group costs an extra exchange. This is the figure
+	that names it.
+	*/
+	metrics.family(
+		b,
+		"elodin_upstream_swept_rcode_total",
+		.Counter,
+		"Replies from each upstream that another member of its group was asked to answer instead: a SERVFAIL or REFUSED, which say nothing about the name, or an rcode a client could not read.",
+	)
+	for u in all {
+		metrics.sample(b, "elodin_upstream_swept_rcode_total", u.swept, metrics.Label{"upstream", u.name})
 	}
 
 	/*

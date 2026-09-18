@@ -517,6 +517,14 @@ test_a_reply_the_clients_question_cannot_use_is_asked_elsewhere :: proc(t: ^test
 		// legitimate answer to plenty of questions and the sweep is cheap; what
 		// `record_failure` tracks is a server that has stopped replying.
 		testing.expect(t, healthy(bad), "an upstream was parked over an rcode it answered with")
+
+		// Which leaves the counter as the only trace it leaves, so the counter
+		// is asserted: one reply of its own swept past, named against it rather
+		// than against the member that answered.
+		swept := stats_of(bad)
+		testing.expect_value(t, swept.swept_rcode, u64(1))
+		testing.expect_value(t, swept.failures, u64(0))
+		testing.expect_value(t, stats_of(good).swept_rcode, u64(0))
 	}
 }
 
@@ -687,4 +695,9 @@ test_a_lone_upstreams_servfail_is_still_the_clients_answer :: proc(t: ^testing.T
 	testing.expect_value(t, dns.peek_rcode(resp), dns.Rcode.Serv_Fail)
 	testing.expect_value(t, sync.atomic_load(&broken.hits), 1)
 	delete(resp, context.allocator)
+
+	// And it is counted even though the sweep found nobody: a group with
+	// nothing to offer is the one paying the most for this, so it is the one
+	// that must not be silent about it. See `note_swept_rcode`.
+	testing.expect_value(t, stats_of(bad).swept_rcode, u64(1))
 }

@@ -180,6 +180,9 @@ test_an_unreadable_rcode_is_published_against_the_upstream :: proc(t: ^testing.T
 
 	upstream.note_unreadable_rcode(u)
 	upstream.note_unreadable_rcode(u)
+	upstream.note_swept_rcode(u)
+	upstream.note_swept_rcode(u)
+	upstream.note_swept_rcode(u)
 
 	s, cfg := metrics_fixture(Stats{unreadable_rcode = 2})
 	s.cfg = &cfg
@@ -188,6 +191,10 @@ test_an_unreadable_rcode_is_published_against_the_upstream :: proc(t: ^testing.T
 	page := render_metrics(&s, &listeners, context.temp_allocator)
 
 	expect_line(t, page, `elodin_upstream_unreadable_rcode_total{upstream="broken"} 2`)
+	// And the swept series beside it, over the same upstream and the same
+	// reasoning: `resolve_insisting` passed over three of its replies for a
+	// member that could answer, and nothing else in the page says so.
+	expect_line(t, page, `elodin_upstream_swept_rcode_total{upstream="broken"} 3`)
 	// And it is not counted as a failure or a reason to call the server down,
 	// which is what makes the series above the only trace it leaves.
 	expect_line(t, page, `elodin_upstream_failures_total{upstream="broken"} 0`)

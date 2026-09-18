@@ -203,6 +203,16 @@ resolve_insisting :: proc(
 	}
 
 	/*
+	Counted here, at the point the sweep is decided on, rather than where it
+	succeeds: a group whose members all answer this way sweeps every one of them
+	and returns the first reply, which is the arrangement that costs the most
+	exchanges per query and would otherwise be the one leaving no figure at all.
+	The count is of replies that sent the group looking elsewhere, against the
+	member that sent them; `note_swept_rcode` says why nothing else records it.
+	*/
+	note_swept_rcode(winner)
+
+	/*
 	One pass, and the server that already spoke is skipped: it gave its answer
 	and asking it again gets the same one. That bounds the sweep by the server
 	count. A chain walk calling this is itself bounded by
@@ -258,6 +268,17 @@ resolve_insisting :: proc(
 	instead would spend nothing at all, and wants its own change: it means
 	teaching `Race_State` to keep a reply it will not return yet, on the one
 	path where a worker can outlive the caller.
+
+	Since #309 that cost is worth reading twice, because a racing group has a
+	way of paying it on every query. `resolve_race` returns the first reply to
+	arrive whatever its rcode, and the member that REFUSES this server on an ACL
+	is the member that answers in microseconds - so it wins the race essentially
+	always, and the sweep runs behind every race rather than behind the rare
+	unreadable rcode this was written for. A racing group with a member in that
+	state is a group running at up to two exchanges per member per query, with
+	the client waiting on the sequential half. `strategy: failover` pays one
+	exchange for it instead, and the upgrade path above is what would fix it in
+	place.
 	*/
 	for u in g.servers {
 		if u == winner {
@@ -273,6 +294,12 @@ resolve_insisting :: proc(
 			continue
 		}
 		if acceptable(resp) {
+			logx.debugf(
+				"upstream %s answered %v, swept past it to %s",
+				winner.spec.name,
+				dns.peek_rcode(response),
+				u.spec.name,
+			)
 			// The first reply is superseded. It came from the caller's
 			// allocator, which is an arena per request on the query path,
 			// where this is a no-op; it matters where one is not.
@@ -342,16 +369,31 @@ could not be made to verify.
 
 Which is the exception to the paragraph below, and the sharper half of what
 `usable_rcode` decides. A validating upstream that has found a zone bogus
-answers SERVFAIL and says so in an extended error - Unbound, BIND, and the
-public resolvers all attach one. Sweeping past it would ask the next member of
-the group, and if that one does not validate, the answer it gives is the
-forgery, cached here and served to every client behind this server. That is the
-`dnssec.enabled: false` deployment, where nothing else is checking; with
-validation on, `validate` refuses the same answer a second time.
+answers SERVFAIL; sweeping past it asks the next member of the group, and if
+that one does not validate, what comes back is the forgery - cached here, and
+served to every client behind this server. An extended error is how the first
+member says which of the two SERVFAILs it meant, so where there is one, it is
+taken at its word.
 
-So: a SERVFAIL that names a validation failure is a verdict, and is the client's
-answer. A SERVFAIL that names anything else, or names nothing at all, is the
-responder reporting on itself and the group is swept.
+How far that reaches is worth stating exactly, because it is less than the whole
+of the case. Cloudflare and Google attach these, and so does PowerDNS Recursor
+from 5.0, where it is on by default. Unbound has them from 1.16 but `ede:`
+defaults to `no`. BIND 9.18 shipped only codes 3, 18 and 19 - none of them these
+- with the DNSSEC ones arriving later. dnsmasq sends none at all. So a bogus
+SERVFAIL from an upstream in its default configuration may well carry nothing to
+read, and this check will let the sweep go on.
+
+Which is why it is a second line rather than the defence. `dnssec.enabled` is on
+as elodin ships, and with it on `validate` refuses the forgery whichever member
+of the group supplied it. What this covers is the deployment that turned it off
+and left a mixed group behind - and it covers as much of it as the upstream is
+willing to say.
+
+Only the first extended error in a reply is read, which is what
+`peek_edns_option` returns. RFC 8914 section 2 permits several, and a reply
+whose validation code is not the first would be swept past - the same outcome as
+the far more common reply that carries no extended error at all, and no worse
+than it.
 
 Codes 6 to 12 of RFC 8914 section 4 - bogus, the two signature-validity ones,
 DNSKEY and RRSIG missing, the zone key bit, NSEC missing. Not 0 (`Other`), which
