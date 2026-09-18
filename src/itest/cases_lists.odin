@@ -83,17 +83,17 @@ blocking:
 
 		res := query_udp(udp_port, build_query("downloaded.test.", u16(dns.Type.A)))
 		if check(r, res.ok, "no response for a name from the first list") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check(r, h.rcode == int(dns.Rcode.NX_Domain), "the first list was not applied")
 		}
 		res2 := query_udp(udp_port, build_query("sub.fetched.test.", u16(dns.Type.A)))
 		if check(r, res2.ok, "no response for a name from the second list") {
-			h, _ := parse_header(res2.wire)
+			h := parse_header(r, res2.wire)
 			check(r, h.rcode == int(dns.Rcode.NX_Domain), "the second list was not applied")
 		}
 		allowed := query_udp(udp_port, build_query("ok.fetched.test.", u16(dns.Type.A)))
 		if check(r, allowed.ok, "no response for an allowed name") {
-			h, _ := parse_header(allowed.wire)
+			h := parse_header(r, allowed.wire)
 			check(r, h.rcode == int(dns.Rcode.No_Error), "the allow rule from the download was lost")
 		}
 	}
@@ -143,7 +143,7 @@ blocking:
 			check_eq_int(r, http_mock_hits(http, "/hosts.txt"), 1, "fetches after a restart")
 			res := query_udp(port2, build_query("downloaded.test.", u16(dns.Type.A)))
 			if check(r, res.ok, "no response") {
-				h, _ := parse_header(res.wire)
+				h := parse_header(r, res.wire)
 				check(r, h.rcode == int(dns.Rcode.NX_Domain), "the cached list was not applied")
 			}
 			check(r, log_contains(&srv2, "using the cached copy"), "the cache was not reported as used")
@@ -181,7 +181,7 @@ blocking:
 			defer stop_server(&srv3)
 			res := query_udp(port3, build_query("downloaded.test.", u16(dns.Type.A)))
 			if check(r, res.ok, "no response") {
-				h, _ := parse_header(res.wire)
+				h := parse_header(r, res.wire)
 				check(r, h.rcode == int(dns.Rcode.NX_Domain), "the list was not applied")
 			}
 			check(r, log_contains(&srv3, "is not writable"), "no warning about the cache directory")

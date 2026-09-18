@@ -117,7 +117,7 @@ blocking:
 		{
 			res := query_udp(udp_port, build_query("ads.tracker.test.", u16(dns.Type.A)))
 			if check(r, res.ok, "no response") {
-				h, _ := parse_header(res.wire)
+				h := parse_header(r, res.wire)
 				switch mode.response {
 				case "nxdomain":
 					check(r, h.rcode == int(dns.Rcode.NX_Domain), "rcode %d, want NXDOMAIN", h.rcode)
@@ -130,17 +130,17 @@ blocking:
 					check(r, h.rcode == int(dns.Rcode.Refused), "rcode %d, want REFUSED", h.rcode)
 				case "zeroip":
 					check_eq_int(r, h.ancount, 1, "answer count")
-					addrs := answer_addresses(res.wire)
+					addrs := answer_addresses(r, res.wire)
 					if check(r, len(addrs) == 1, "expected one address") {
 						check_eq_str(r, addrs[0], "0.0.0.0", "sink address")
 					}
 				case "custom":
 					check_eq_int(r, h.ancount, 1, "answer count")
-					addrs := answer_addresses(res.wire)
+					addrs := answer_addresses(r, res.wire)
 					if check(r, len(addrs) == 1, "expected one address") {
 						check_eq_str(r, addrs[0], "10.1.2.3", "sink address")
 					}
-					ttl, has := min_answer_ttl(res.wire)
+					ttl, has := min_answer_ttl(r, res.wire)
 					check(r, has && ttl == 42, "block TTL: got %d, want 42", ttl)
 				}
 			}
@@ -152,7 +152,7 @@ blocking:
 			{
 				res := query_udp(udp_port, build_query("ads.tracker.test.", u16(dns.Type.AAAA)))
 				if check(r, res.ok, "no response") {
-					addrs := answer_addresses(res.wire)
+					addrs := answer_addresses(r, res.wire)
 					if check(r, len(addrs) == 1, "expected one address") {
 						check_eq_str(r, addrs[0], "fd00:0000:0000:0000:0000:0000:0000:abcd", "sink address")
 					}
@@ -171,12 +171,12 @@ blocking:
 		{
 			blocked := query_udp(udp_port, build_query("metrics.tracker.test.", u16(dns.Type.A)))
 			if check(r, blocked.ok, "no response for the listed name") {
-				h, _ := parse_header(blocked.wire)
+				h := parse_header(r, blocked.wire)
 				check(r, h.rcode == int(dns.Rcode.NX_Domain), "listed name not blocked")
 			}
 			sub := query_udp(udp_port, build_query("deep.ads.tracker.test.", u16(dns.Type.A)))
 			if check(r, sub.ok, "no response for the subdomain") {
-				h, _ := parse_header(sub.wire)
+				h := parse_header(r, sub.wire)
 				check(r, h.rcode == int(dns.Rcode.No_Error), "a hosts entry blocked its subdomain")
 			}
 		}
@@ -186,7 +186,7 @@ blocking:
 		{
 			res := query_udp(udp_port, build_query("localhost.", u16(dns.Type.A)))
 			if check(r, res.ok, "no response") {
-				h, _ := parse_header(res.wire)
+				h := parse_header(r, res.wire)
 				check(r, h.rcode == int(dns.Rcode.No_Error), "localhost was turned into a block rule")
 			}
 		}
@@ -197,7 +197,7 @@ blocking:
 			for name in ([]string{"evil.test.", "sub.evil.test.", "a.b.evil.test."}) {
 				res := query_udp(udp_port, build_query(name, u16(dns.Type.A)))
 				if check(r, res.ok, "no response for %s", name) {
-					h, _ := parse_header(res.wire)
+					h := parse_header(r, res.wire)
 					check(r, h.rcode == int(dns.Rcode.NX_Domain), "%s was not blocked", name)
 				}
 			}
@@ -209,7 +209,7 @@ blocking:
 			for name in ([]string{"good.evil.test.", "deeper.good.evil.test."}) {
 				res := query_udp(udp_port, build_query(name, u16(dns.Type.A)))
 				if check(r, res.ok, "no response for %s", name) {
-					h, _ := parse_header(res.wire)
+					h := parse_header(r, res.wire)
 					check(r, h.rcode == int(dns.Rcode.No_Error), "%s should have been allowed", name)
 				}
 			}
@@ -220,7 +220,7 @@ blocking:
 		{
 			res := query_udp(udp_port, build_query("modifiers.test.", u16(dns.Type.A)))
 			if check(r, res.ok, "no response") {
-				h, _ := parse_header(res.wire)
+				h := parse_header(r, res.wire)
 				check(r, h.rcode == int(dns.Rcode.NX_Domain), "a rule with $modifiers was dropped")
 			}
 		}
@@ -230,12 +230,12 @@ blocking:
 		{
 			exact := query_udp(udp_port, build_query("exact.test.", u16(dns.Type.A)))
 			if check(r, exact.ok, "no response") {
-				h, _ := parse_header(exact.wire)
+				h := parse_header(r, exact.wire)
 				check(r, h.rcode == int(dns.Rcode.NX_Domain), "the anchored name was not blocked")
 			}
 			sub := query_udp(udp_port, build_query("sub.exact.test.", u16(dns.Type.A)))
 			if check(r, sub.ok, "no response") {
-				h, _ := parse_header(sub.wire)
+				h := parse_header(r, sub.wire)
 				check(r, h.rcode == int(dns.Rcode.No_Error), "an anchored rule blocked a subdomain")
 			}
 		}
@@ -245,7 +245,7 @@ blocking:
 		{
 			res := query_udp(udp_port, build_query("deep.dnsmasq.test.", u16(dns.Type.A)))
 			if check(r, res.ok, "no response") {
-				h, _ := parse_header(res.wire)
+				h := parse_header(r, res.wire)
 				check(r, h.rcode == int(dns.Rcode.NX_Domain), "address=/ rule was not applied")
 			}
 		}
@@ -255,7 +255,7 @@ blocking:
 		{
 			res := query_udp(udp_port, build_query("a-regex-rule.test.", u16(dns.Type.A)))
 			if check(r, res.ok, "no response") {
-				h, _ := parse_header(res.wire)
+				h := parse_header(r, res.wire)
 				check(r, h.rcode == int(dns.Rcode.No_Error), "a regex rule was treated as a domain")
 			}
 		}
@@ -266,7 +266,7 @@ blocking:
 			for name in ([]string{"subtree.test.", "a.subtree.test."}) {
 				res := query_udp(udp_port, build_query(name, u16(dns.Type.A)))
 				if check(r, res.ok, "no response for %s", name) {
-					h, _ := parse_header(res.wire)
+					h := parse_header(r, res.wire)
 					check(r, h.rcode == int(dns.Rcode.NX_Domain), "%s was not blocked", name)
 				}
 			}
@@ -277,12 +277,12 @@ blocking:
 		{
 			sub := query_udp(udp_port, build_query("host.wildcard.test.", u16(dns.Type.A)))
 			if check(r, sub.ok, "no response") {
-				h, _ := parse_header(sub.wire)
+				h := parse_header(r, sub.wire)
 				check(r, h.rcode == int(dns.Rcode.NX_Domain), "the subdomain was not blocked")
 			}
 			apex := query_udp(udp_port, build_query("wildcard.test.", u16(dns.Type.A)))
 			if check(r, apex.ok, "no response") {
-				h, _ := parse_header(apex.wire)
+				h := parse_header(r, apex.wire)
 				check(r, h.rcode == int(dns.Rcode.No_Error), "*.name should not block the apex")
 			}
 		}
@@ -292,7 +292,7 @@ blocking:
 		{
 			res := query_udp(udp_port, build_query("ADS.Tracker.TEST.", u16(dns.Type.A)))
 			if check(r, res.ok, "no response") {
-				h, _ := parse_header(res.wire)
+				h := parse_header(r, res.wire)
 				check(r, h.rcode == int(dns.Rcode.NX_Domain), "an upper-case name evaded the list")
 			}
 		}
@@ -352,11 +352,11 @@ rewrites:
 	{
 		res := query_udp(udp_port, build_query("nas.home.", u16(dns.Type.A)))
 		if check(r, res.ok, "no response") {
-			addrs := answer_addresses(res.wire)
+			addrs := answer_addresses(r, res.wire)
 			if check(r, len(addrs) == 1, "expected one address, got %d", len(addrs)) {
 				check_eq_str(r, addrs[0], "192.168.1.50", "rewritten address")
 			}
-			ttl, has := min_answer_ttl(res.wire)
+			ttl, has := min_answer_ttl(r, res.wire)
 			check(r, has && ttl == 111, "TTL: got %d, want 111", ttl)
 		}
 	}
@@ -366,14 +366,14 @@ rewrites:
 	{
 		v4 := query_udp(udp_port, build_query("host1.lab.", u16(dns.Type.A)))
 		if check(r, v4.ok, "no A response") {
-			addrs := answer_addresses(v4.wire)
+			addrs := answer_addresses(r, v4.wire)
 			if check(r, len(addrs) == 1, "expected one A record") {
 				check_eq_str(r, addrs[0], "10.0.0.1", "A answer")
 			}
 		}
 		v6 := query_udp(udp_port, build_query("host2.lab.", u16(dns.Type.AAAA)))
 		if check(r, v6.ok, "no AAAA response") {
-			addrs := answer_addresses(v6.wire)
+			addrs := answer_addresses(r, v6.wire)
 			if check(r, len(addrs) == 1, "expected one AAAA record") {
 				check_eq_str(r, addrs[0], "fd00:0000:0000:0000:0000:0000:0000:0001", "AAAA answer")
 			}
@@ -385,7 +385,7 @@ rewrites:
 	{
 		res := query_udp(udp_port, build_query("lab.", u16(dns.Type.A)))
 		if check(r, res.ok, "no response") {
-			addrs := answer_addresses(res.wire)
+			addrs := answer_addresses(r, res.wire)
 			// It should have fallen through to the upstream instead.
 			if check(r, len(addrs) == 1, "expected the upstream answer, got %d records", len(addrs)) {
 				check_eq_str(r, addrs[0], "203.0.113.1", "answer source")
@@ -398,7 +398,7 @@ rewrites:
 	{
 		res := query_udp(udp_port, build_query("old.example.org.", u16(dns.Type.A)))
 		if check(r, res.ok, "no response") {
-			check_eq_str(r, first_cname_or_name(res.wire), "new.example.org.", "CNAME target")
+			check_eq_str(r, first_cname_or_name(r, res.wire), "new.example.org.", "CNAME target")
 		}
 	}
 	end_case(r)
@@ -407,7 +407,7 @@ rewrites:
 	{
 		res := query_udp(udp_port, build_query("telemetry.example.org.", u16(dns.Type.A)))
 		if check(r, res.ok, "no response") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check(r, h.rcode == int(dns.Rcode.NX_Domain), "rcode %d, want NXDOMAIN", h.rcode)
 		}
 	}
@@ -417,7 +417,7 @@ rewrites:
 	{
 		res := query_udp(udp_port, build_query("nas.home.", u16(dns.Type.MX)))
 		if check(r, res.ok, "no response") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)
 			check_eq_int(r, h.ancount, 0, "answer count")
 		}
@@ -492,7 +492,7 @@ rewrites:
 		mock_reset_counts(mock)
 		res := query_udp(udp_port, build_query("mail.example.org.", u16(dns.Type.A)))
 		if check(r, res.ok, "no response") {
-			addrs := answer_addresses(res.wire)
+			addrs := answer_addresses(r, res.wire)
 			if check(r, len(addrs) == 1, "expected the upstream answer, got %d records", len(addrs)) {
 				check_eq_str(r, addrs[0], "203.0.113.1", "answer source")
 			}
@@ -512,7 +512,7 @@ rewrites:
 		mock_reset_counts(mock)
 		res := query_udp(udp_port, build_query("mail.lab.", u16(dns.Type.A)))
 		if check(r, res.ok, "no response") {
-			addrs := answer_addresses(res.wire)
+			addrs := answer_addresses(r, res.wire)
 			if check(r, len(addrs) == 1, "expected one address, got %d", len(addrs)) {
 				check_eq_str(r, addrs[0], "10.0.0.1", "the wildcard should have answered")
 			}
@@ -543,7 +543,7 @@ rewrites:
 		mock_reset_counts(mock)
 		res := query_udp(udp_port, build_query("nas.home.", u16(dns.Type.SRV)))
 		if check(r, res.ok, "no response") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)
 			check_eq_int(r, h.ancount, 0, "answer count")
 			check_eq_int(r, h.nscount, 1, "authority count")
@@ -561,10 +561,10 @@ rewrites:
 		mock_reset_counts(mock)
 		res := query_udp(udp_port, build_query("50.1.168.192.in-addr.arpa.", u16(dns.Type.PTR)))
 		if check(r, res.ok, "no response") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)
-			check_eq_str(r, first_cname_or_name(res.wire), "nas.home.", "PTR target")
-			ttl, has := min_answer_ttl(res.wire)
+			check_eq_str(r, first_cname_or_name(r, res.wire), "nas.home.", "PTR target")
+			ttl, has := min_answer_ttl(r, res.wire)
 			check(r, has && ttl == 111, "TTL: got %d, want 111", ttl)
 			check_eq_int(r, mock_total(mock), 0, "upstream queries for a name answered here")
 		}
@@ -581,7 +581,7 @@ rewrites:
 			),
 		)
 		if check(r, res.ok, "no response") {
-			check_eq_str(r, first_cname_or_name(res.wire), "nas6.home.", "PTR target")
+			check_eq_str(r, first_cname_or_name(r, res.wire), "nas6.home.", "PTR target")
 		}
 	}
 	end_case(r)
@@ -596,7 +596,7 @@ rewrites:
 		mock_reset_counts(mock)
 		res := query_udp(udp_port, build_query("1.0.0.10.in-addr.arpa.", u16(dns.Type.PTR)))
 		if check(r, res.ok, "no response") {
-			check_eq_str(r, first_cname_or_name(res.wire), "", "a wildcard must produce no PTR")
+			check_eq_str(r, first_cname_or_name(r, res.wire), "", "a wildcard must produce no PTR")
 			check(r, mock_total(mock) >= 1, "the query should have been forwarded")
 		}
 	}
@@ -610,7 +610,7 @@ rewrites:
 		mock_reset_counts(mock)
 		res := query_udp(udp_port, build_query("9.113.0.203.in-addr.arpa.", u16(dns.Type.PTR)))
 		if check(r, res.ok, "no response") {
-			check_eq_str(r, first_cname_or_name(res.wire), "", "a public address must produce no PTR")
+			check_eq_str(r, first_cname_or_name(r, res.wire), "", "a public address must produce no PTR")
 			check(r, mock_total(mock) >= 1, "the query should have been forwarded")
 		}
 	}
@@ -624,7 +624,7 @@ rewrites:
 		// disagreeing with itself across two answers.
 		v4 := query_udp(udp_port, build_query("shadowed.lab.", u16(dns.Type.A)))
 		if check(r, v4.ok, "no response for the shadowed name") {
-			addrs := answer_addresses(v4.wire)
+			addrs := answer_addresses(r, v4.wire)
 			if check(r, len(addrs) == 1, "expected one address, got %d", len(addrs)) {
 				check_eq_str(r, addrs[0], "10.0.0.1", "the wildcard is what answers")
 			}
@@ -632,7 +632,7 @@ rewrites:
 		mock_reset_counts(mock)
 		res := query_udp(udp_port, build_query("70.1.168.192.in-addr.arpa.", u16(dns.Type.PTR)))
 		if check(r, res.ok, "no response") {
-			check_eq_str(r, first_cname_or_name(res.wire), "", "a shadowed rule must produce no PTR")
+			check_eq_str(r, first_cname_or_name(r, res.wire), "", "a shadowed rule must produce no PTR")
 			check(r, mock_total(mock) >= 1, "the query should have been forwarded")
 		}
 	}
@@ -645,7 +645,7 @@ rewrites:
 		mock_reset_counts(mock)
 		res := query_udp(udp_port, build_query("60.1.168.192.in-addr.arpa.", u16(dns.Type.PTR)))
 		if check(r, res.ok, "no response") {
-			check_eq_str(r, first_cname_or_name(res.wire), "", "a sunk rule must produce no PTR")
+			check_eq_str(r, first_cname_or_name(r, res.wire), "", "a sunk rule must produce no PTR")
 			check(r, mock_total(mock) >= 1, "the query should have been forwarded")
 		}
 	}
@@ -658,7 +658,7 @@ rewrites:
 		// address in the other direction.
 		fwd := query_udp(udp_port, build_query("blockpage.example.org.", u16(dns.Type.A)))
 		if check(r, fwd.ok, "no response for the opted-out name") {
-			addrs := answer_addresses(fwd.wire)
+			addrs := answer_addresses(r, fwd.wire)
 			if check(r, len(addrs) == 1, "expected one address, got %d", len(addrs)) {
 				check_eq_str(r, addrs[0], "192.168.1.80", "the forward answer is unaffected")
 			}
@@ -666,7 +666,7 @@ rewrites:
 		mock_reset_counts(mock)
 		res := query_udp(udp_port, build_query("80.1.168.192.in-addr.arpa.", u16(dns.Type.PTR)))
 		if check(r, res.ok, "no response") {
-			check_eq_str(r, first_cname_or_name(res.wire), "", "ptr: false must produce no PTR")
+			check_eq_str(r, first_cname_or_name(r, res.wire), "", "ptr: false must produce no PTR")
 			check(r, mock_total(mock) >= 1, "the query should have been forwarded")
 		}
 	}
@@ -679,7 +679,7 @@ rewrites:
 		// synthesised an A for it, so an empty answer is the proof it stayed.
 		res := query_udp(udp_port, build_query("50.1.168.192.in-addr.arpa.", u16(dns.Type.A)))
 		if check(r, res.ok, "no response") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)
 			check_eq_int(r, h.ancount, 0, "answer count")
 			check_eq_int(r, h.nscount, 1, "authority count")
@@ -744,7 +744,7 @@ blocking: {{ enabled: false }}
 		second := query_udp(udp_port, build_query(fix.qname, fix.qtype, id = 2))
 		if check(r, second.ok, "no response to the second query") {
 			check_eq_int(r, mock_total(mock), 1, "upstream queries after a cache hit")
-			h, _ := parse_header(second.wire)
+			h := parse_header(r, second.wire)
 			check(r, h.id == 2, "the cached answer kept the wrong ID: %04x", h.id)
 			check_eq_int(r, h.ancount, fix.ancount, "answer count from cache")
 		}
@@ -753,13 +753,13 @@ blocking: {{ enabled: false }}
 
 	start_case(r, "cache: TTLs count down while an entry is held")
 	{
-		before, has_before := min_answer_ttl(query_udp(udp_port, build_query(fix.qname, fix.qtype, id = 3)).wire)
+		before, has_before := min_answer_ttl(r, query_udp(udp_port, build_query(fix.qname, fix.qtype, id = 3)).wire)
 		if !check(r, has_before, "no TTL in the first answer") {
 			end_case(r)
 			return
 		}
 		time.sleep(1100 * time.Millisecond)
-		after, has_after := min_answer_ttl(query_udp(udp_port, build_query(fix.qname, fix.qtype, id = 4)).wire)
+		after, has_after := min_answer_ttl(r, query_udp(udp_port, build_query(fix.qname, fix.qtype, id = 4)).wire)
 		if check(r, has_after, "no TTL in the second answer") {
 			check(r, after < before, "TTL did not decrease: %d then %d", before, after)
 		}
@@ -837,7 +837,7 @@ blocking: {{ enabled: false }}
 			The header says the poisoned reply is the one that came back: the
 			rcode the attacker wrote, over the answer section they left alone.
 			*/
-			h, _ := parse_header(first.wire)
+			h := parse_header(r, first.wire)
 			check(r, h.rcode == int(dns.Rcode.NX_Domain), "rcode %d, want the NXDOMAIN the mock sent", h.rcode)
 			check_eq_int(r, h.ancount, 1, "answer count, the A record under the name error")
 
@@ -892,7 +892,7 @@ blocking: {{ enabled: false }}
 					!has_opt_record(r, bare.wire),
 					"a cached OPT record was handed to a client that asked without EDNS",
 				)
-				check_eq_int(r, answer_count(bare.wire), 1, "the answer the client came for")
+				check_eq_int(r, parse_header(r, bare.wire).ancount, 1, "the answer the client came for")
 			}
 		}
 	}
@@ -930,7 +930,7 @@ blocking: {{ enabled: false }}
 						"the payload size the EDNS client is told",
 					)
 				}
-				check_eq_int(r, answer_count(edns.wire), 1, "the answer the client came for")
+				check_eq_int(r, parse_header(r, edns.wire).ancount, 1, "the answer the client came for")
 			}
 		}
 	}
@@ -945,31 +945,13 @@ MIXED_EDNS_FIRST :: "mixed-edns-first.example.com."
 @(private = "file")
 MIXED_BARE_FIRST :: "mixed-bare-first.example.com."
 
-/*
-Whether the answer carries an OPT record, read off the wire the client got.
-
-The decode is checked rather than folded into the answer: reporting "no OPT
-record" for a wire that does not decode at all is how a case asserting the
-absence of one passes over an answer nobody could read - a stale ARCOUNT left
-behind by a strip, say, which is exactly the failure these cases are here to
-catch. So it fails on the spot and the caller's own check reads whatever is left.
-*/
+// Whether the answer carries an OPT record, read off the wire the client got.
+// `decode_reply` fails the case on bytes nothing could read, so a case asserting
+// the absence of an OPT record cannot pass over an answer nobody decoded.
 @(private = "file")
 has_opt_record :: proc(r: ^Runner, wire: []u8) -> bool {
-	msg, err := dns.decode_message(wire, context.temp_allocator)
-	if !check(r, err == .None, "the answer did not decode: %v", err) {
-		return false
-	}
+	msg := decode_reply(r, wire) or_return
 	return dns.edns_present(msg)
-}
-
-@(private = "file")
-answer_count :: proc(wire: []u8) -> int {
-	h, ok := parse_header(wire)
-	if !ok {
-		return -1
-	}
-	return h.ancount
 }
 
 // A name error whose answer section holds the record it denies. Nothing sends

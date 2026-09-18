@@ -117,8 +117,7 @@ run_udp_size_cases :: proc(r: ^Runner) {
 					"the answer is %d bytes, past the 1232 default ceiling",
 					len(res.wire),
 				)
-				h, hok := parse_header(res.wire)
-				check(r, hok, "the answer does not parse")
+				h := parse_header(r, res.wire)
 				check(r, h.tc, "the truncated answer does not carry TC, so no client would retry")
 			}
 
@@ -159,8 +158,7 @@ run_udp_size_cases :: proc(r: ^Runner) {
 			res := query_udp(udp_port, query, context.temp_allocator)
 			if check(r, res.ok, "no answer came back") {
 				check(r, len(res.wire) > 1232, "the answer is only %d bytes; the ceiling was not lifted", len(res.wire))
-				h, hok := parse_header(res.wire)
-				check(r, hok, "the answer does not parse")
+				h := parse_header(r, res.wire)
 				check(r, !h.tc, "the answer carries TC even though it fits")
 				check_eq_int(r, h.ancount, 10, "answer count")
 			}
@@ -188,8 +186,7 @@ run_udp_size_cases :: proc(r: ^Runner) {
 			res := query_tcp(tcp_port, query, context.temp_allocator)
 			if check(r, res.ok, "no answer came back over tcp") {
 				check(r, len(res.wire) > 1232, "tcp answered only %d bytes; the UDP ceiling leaked", len(res.wire))
-				h, hok := parse_header(res.wire)
-				check(r, hok, "the answer does not parse")
+				h := parse_header(r, res.wire)
 				check(r, !h.tc, "a tcp answer was truncated")
 			}
 		}

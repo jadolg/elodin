@@ -80,17 +80,17 @@ cookies: {{ enabled: false, upstream: false }}
 			answered += 1
 
 			// The client is waiting on the ID it wrote.
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check(r, h.id == CLIENT_ID, "the client got id %04x back, not its own %04x", h.id, CLIENT_ID)
 
+			// Length, not just presence: `parse_header` hands back a zeroed
+			// header for anything shorter, and every short query drawing the
+			// same id 0 would report a collision that never happened.
 			forwarded := mock_last_query(mock)
-			if !check(r, forwarded != nil, "the upstream saw no query") {
+			if !check(r, len(forwarded) >= dns.HEADER_SIZE, "the upstream saw no readable query") {
 				break
 			}
-			fh, fok := parse_header(forwarded)
-			if !check(r, fok, "the forwarded query has no readable header") {
-				break
-			}
+			fh := parse_header(r, forwarded)
 			if fh.id == CLIENT_ID {
 				reused += 1
 			}

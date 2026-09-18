@@ -52,9 +52,9 @@ dnssec: {{ enabled: false }}
 // The info-code of the extended error a response carries (RFC 8914), or -1 if
 // it has none.
 @(private = "file")
-extended_error :: proc(wire: []u8) -> int {
-	msg, err := dns.decode_message(wire, context.temp_allocator)
-	if err != .None {
+extended_error :: proc(r: ^Runner, wire: []u8) -> int {
+	msg, ok := decode_reply(r, wire)
+	if !ok {
 		return -1
 	}
 	for rec in msg.additional {
@@ -150,7 +150,7 @@ run_extended_rcode_cases :: proc(r: ^Runner) {
 						// And the client is told why rather than left with a
 						// bare SERVFAIL: RFC 8914 code 0, "Other", with the
 						// rcode in the text.
-						check_eq_int(r, extended_error(res.wire), 0, "extended DNS error code")
+						check_eq_int(r, extended_error(r, res.wire), 0, "extended DNS error code")
 					}
 				}
 				end_case(r)

@@ -23,9 +23,9 @@ is exactly the move the attack makes: the name is public, the address is not.
 // Read here rather than through a shared helper because only the rebinding cases
 // care about the value, not merely that an EDE is present.
 @(private = "file")
-extended_error_code :: proc(wire: []u8) -> int {
-	msg, err := dns.decode_message(wire, context.temp_allocator)
-	if err != .None {
+extended_error_code :: proc(r: ^Runner, wire: []u8) -> int {
+	msg, ok := decode_reply(r, wire)
+	if !ok {
 		return -1
 	}
 	for rec in msg.additional {
@@ -110,9 +110,9 @@ run_rebind_default_case :: proc(r: ^Runner) {
 	{
 		res := query_udp(udp_port, build_query("rebind.attacker.test.", u16(dns.Type.A)))
 		if check(r, res.ok, "no response") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)
-			addrs := answer_addresses(res.wire)
+			addrs := answer_addresses(r, res.wire)
 			if check(r, len(addrs) == 1, "expected the answer forwarded, got %d addresses", len(addrs)) {
 				check_eq_str(r, addrs[0], "192.168.1.1", "forwarded address")
 			}
@@ -159,12 +159,12 @@ run_rebind_refusal_cases :: proc(r: ^Runner) {
 					// client sent one, as an EDNS-less stub cannot read it anyway.
 					res := query_udp(udp_port, build_query("rebind.attacker.test.", u16(dns.Type.A), edns_size = 1232))
 					if check(r, res.ok, "no response") {
-						h, _ := parse_header(res.wire)
+						h := parse_header(r, res.wire)
 						check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)
 						check_eq_int(r, h.ancount, 0, "answer count")
 						check(r, h.nscount >= 1, "no SOA in the authority section")
-						check_eq_int(r, len(answer_addresses(res.wire)), 0, "addresses handed to the client")
-						check_eq_int(r, extended_error_code(res.wire), 15, "extended error info-code")
+						check_eq_int(r, len(answer_addresses(r, res.wire)), 0, "addresses handed to the client")
+						check_eq_int(r, extended_error_code(r, res.wire), 15, "extended error info-code")
 					}
 					check(r, log_contains(&srv, "outcome=blocked detail=rebind"), "the query log did not record the refusal")
 					check(r, log_contains(&srv, "rebinding attack"), "no warning was logged for the first refusal")
@@ -199,9 +199,9 @@ run_rebind_refusal_cases :: proc(r: ^Runner) {
 				{
 					res := query_udp(udp_port, build_query("example.test.", u16(dns.Type.A)))
 					if check(r, res.ok, "no response") {
-						h, _ := parse_header(res.wire)
+						h := parse_header(r, res.wire)
 						check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)
-						addrs := answer_addresses(res.wire)
+						addrs := answer_addresses(r, res.wire)
 						if check(r, len(addrs) == 1, "expected one address, got %d", len(addrs)) {
 							check_eq_str(r, addrs[0], "198.51.100.7", "forwarded address")
 						}
@@ -252,7 +252,7 @@ run_rebind_exemption_cases :: proc(r: ^Runner) {
 				{
 					res := query_udp(udp_port, build_query("nas.corp.test.", u16(dns.Type.A)))
 					if check(r, res.ok, "no response") {
-						addrs := answer_addresses(res.wire)
+						addrs := answer_addresses(r, res.wire)
 						if check(r, len(addrs) == 1, "expected the exempt answer forwarded, got %d", len(addrs)) {
 							check_eq_str(r, addrs[0], "192.168.1.50", "forwarded address")
 						}
@@ -266,9 +266,9 @@ run_rebind_exemption_cases :: proc(r: ^Runner) {
 					// not a substring, decides.
 					res := query_udp(udp_port, build_query("nas.notcorp.test.", u16(dns.Type.A)))
 					if check(r, res.ok, "no response") {
-						h, _ := parse_header(res.wire)
+						h := parse_header(r, res.wire)
 						check_eq_int(r, h.ancount, 0, "answer count")
-						check_eq_int(r, len(answer_addresses(res.wire)), 0, "addresses handed to the client")
+						check_eq_int(r, len(answer_addresses(r, res.wire)), 0, "addresses handed to the client")
 					}
 				}
 				end_case(r)
@@ -304,7 +304,7 @@ run_rebind_exemption_cases :: proc(r: ^Runner) {
 				{
 					res := query_udp(udp_port, build_query("loop.test.", u16(dns.Type.A)))
 					if check(r, res.ok, "no response") {
-						addrs := answer_addresses(res.wire)
+						addrs := answer_addresses(r, res.wire)
 						if check(r, len(addrs) == 1, "expected loopback forwarded, got %d", len(addrs)) {
 							check_eq_str(r, addrs[0], "127.0.0.1", "forwarded address")
 						}
@@ -316,9 +316,9 @@ run_rebind_exemption_cases :: proc(r: ^Runner) {
 				{
 					res := query_udp(udp_port, build_query("priv.test.", u16(dns.Type.A)))
 					if check(r, res.ok, "no response") {
-						h, _ := parse_header(res.wire)
+						h := parse_header(r, res.wire)
 						check_eq_int(r, h.ancount, 0, "answer count")
-						check_eq_int(r, len(answer_addresses(res.wire)), 0, "addresses handed to the client")
+						check_eq_int(r, len(answer_addresses(r, res.wire)), 0, "addresses handed to the client")
 					}
 				}
 				end_case(r)

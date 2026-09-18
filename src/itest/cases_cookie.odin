@@ -64,7 +64,7 @@ run_cookie_cases :: proc(r: ^Runner) {
 		query := build_query(f.qname, f.qtype, edns_size = 1232, cookie = CLIENT_COOKIE)
 		res := query_udp(udp_port, query)
 		if check(r, res.ok, "no response") {
-			got, found := find_cookie(res.wire)
+			got, found := find_cookie(r, res.wire)
 			if check(r, found, "the answer carries no COOKIE option") {
 				check_eq_int(r, len(got), 24, "cookie length")
 				check(r, bytes_equal(got[:8], CLIENT_COOKIE), "the client cookie was not echoed")
@@ -78,14 +78,14 @@ run_cookie_cases :: proc(r: ^Runner) {
 		first := build_query(f.qname, f.qtype, edns_size = 1232, cookie = CLIENT_COOKIE)
 		res := query_udp(udp_port, first)
 		if check(r, res.ok, "no response") {
-			issued, found := find_cookie(res.wire)
+			issued, found := find_cookie(r, res.wire)
 			if check(r, found, "the answer carries no COOKIE option") {
 				second := build_query(f.qname, f.qtype, id = 0x4243, edns_size = 1232, cookie = issued)
 				again := query_udp(udp_port, second)
 				if check(r, again.ok, "no response to the second query") {
-					h, _ := parse_header(again.wire)
+					h := parse_header(r, again.wire)
 					check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode for a query with a valid cookie")
-					_, renewed := find_cookie(again.wire)
+					_, renewed := find_cookie(r, again.wire)
 					check(r, renewed, "the second answer carries no COOKIE option")
 				}
 			}
@@ -105,7 +105,7 @@ run_cookie_cases :: proc(r: ^Runner) {
 		if check(r, res.ok, "no response") {
 			seen := mock_last_query(mock)
 			if check(r, seen != nil, "the upstream saw no query") {
-				forwarded, has_cookie := find_cookie(seen)
+				forwarded, has_cookie := find_cookie(r, seen)
 				if check(r, has_cookie, "elodin's own cookie did not go upstream") {
 					check(
 						r,
@@ -130,7 +130,7 @@ run_cookie_cases :: proc(r: ^Runner) {
 		query := build_query(f.qname, f.qtype, edns_size = 1232)
 		res := query_udp(udp_port, query)
 		if check(r, res.ok, "no response") {
-			_, found := find_cookie(res.wire)
+			_, found := find_cookie(r, res.wire)
 			check(r, !found, "a client that asked for no cookie was given one")
 		}
 	}
@@ -143,7 +143,7 @@ run_cookie_cases :: proc(r: ^Runner) {
 		query := build_query(f.qname, f.qtype, edns_size = 1232, cookie = make([]u8, 9, context.temp_allocator))
 		res := query_udp(udp_port, query)
 		if check(r, res.ok, "no response") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check_eq_int(r, h.rcode, int(dns.Rcode.Form_Err), "rcode for a malformed cookie")
 		}
 	}
@@ -209,7 +209,7 @@ run_upstream_cookie_cases :: proc(r: ^Runner) {
 		{
 			res := query_udp(udp_port, build_query(f.qname, f.qtype, edns_size = 1232))
 			if check(r, res.ok, "no response") {
-				sent, found := find_cookie(mock_last_query(mock))
+				sent, found := find_cookie(r, mock_last_query(mock))
 				if check(r, found, "the upstream saw no cookie") {
 					// Nothing learned yet, so this is a client cookie alone.
 					check_eq_int(r, len(sent), 8, "cookie length on the first query")
@@ -218,7 +218,7 @@ run_upstream_cookie_cases :: proc(r: ^Runner) {
 				// The second query should carry what the first one learned.
 				second := query_udp(udp_port, build_query("second.example.", u16(dns.Type.A), id = 0x4245, edns_size = 1232))
 				if check(r, second.ok, "no response to the second query") {
-					again, had := find_cookie(mock_last_query(mock))
+					again, had := find_cookie(r, mock_last_query(mock))
 					if check(r, had, "the second query carried no cookie") {
 						check_eq_int(r, len(again), 16, "cookie length on the second query")
 						check(r, bytes_equal(again[:8], sent), "the client cookie changed between queries")
@@ -234,7 +234,7 @@ run_upstream_cookie_cases :: proc(r: ^Runner) {
 			// one belonging to the conversation between us and the upstream.
 			res := query_udp(udp_port, build_query(f.qname, f.qtype, id = 0x4246, edns_size = 1232))
 			if check(r, res.ok, "no response") {
-				_, leaked := find_cookie(res.wire)
+				_, leaked := find_cookie(r, res.wire)
 				check(r, !leaked, "the upstream's cookie reached the client")
 			}
 		}
@@ -246,7 +246,7 @@ run_upstream_cookie_cases :: proc(r: ^Runner) {
 			// asked, and change what may come back.
 			res := query_udp(udp_port, build_query("plain.example.", u16(dns.Type.A), id = 0x4247))
 			if check(r, res.ok, "no response") {
-				_, found := find_cookie(mock_last_query(mock))
+				_, found := find_cookie(r, mock_last_query(mock))
 				check(r, !found, "a cookie was added to a query with no OPT record")
 			}
 		}
@@ -273,7 +273,7 @@ run_upstream_cookie_cases :: proc(r: ^Runner) {
 			res := query_udp(udp_port, build_query("plain.example.", u16(dns.Type.A), id = 0x4248))
 			elapsed := time.diff(started, time.now())
 			if check(r, res.ok, "no response") {
-				h, _ := parse_header(res.wire)
+				h := parse_header(r, res.wire)
 				check(
 					r,
 					h.rcode != int(dns.Rcode.Serv_Fail),
@@ -314,7 +314,7 @@ run_upstream_cookie_cases :: proc(r: ^Runner) {
 		{
 			res := query_udp(udp_port, build_query(f.qname, f.qtype, edns_size = 1232))
 			if check(r, res.ok, "no response") {
-				h, _ := parse_header(res.wire)
+				h := parse_header(r, res.wire)
 				check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode")
 				check(r, h.ancount > 0, "the answer never arrived")
 				check_eq_int(r, mock_total(mock), 2, "queries the upstream saw")
@@ -355,7 +355,7 @@ run_upstream_cookie_cases :: proc(r: ^Runner) {
 		{
 			res := query_udp(udp_port, build_query(f.qname, f.qtype, edns_size = 1232, cookie = CLIENT_COOKIE))
 			if check(r, res.ok, "no response") {
-				forwarded, has_cookie := find_cookie(mock_last_query(mock))
+				forwarded, has_cookie := find_cookie(r, mock_last_query(mock))
 				if check(r, has_cookie, "elodin's own cookie did not go upstream") {
 					check(
 						r,
@@ -364,7 +364,7 @@ run_upstream_cookie_cases :: proc(r: ^Runner) {
 					)
 				}
 				// And with the client-facing side off, the client gets nothing back.
-				_, given := find_cookie(res.wire)
+				_, given := find_cookie(r, res.wire)
 				check(r, !given, "a cookie was issued with the client-facing side off")
 			}
 		}
@@ -394,7 +394,7 @@ run_upstream_cookie_cases :: proc(r: ^Runner) {
 		{
 			res := query_udp(udp_port, build_query(f.qname, f.qtype, edns_size = 1232))
 			if check(r, res.ok, "no response") {
-				_, found := find_cookie(mock_last_query(mock))
+				_, found := find_cookie(r, mock_last_query(mock))
 				check(r, !found, "a cookie went upstream with the setting off")
 			}
 		}
@@ -431,7 +431,7 @@ run_upstream_cookie_cases :: proc(r: ^Runner) {
 		{
 			res := query_udp(udp_port, build_query(f.qname, f.qtype, edns_size = 1232, cookie = CLIENT_COOKIE))
 			if check(r, res.ok, "no response") {
-				forwarded, found := find_cookie(mock_last_query(mock))
+				forwarded, found := find_cookie(r, mock_last_query(mock))
 				check(r, !found, "the client's cookie reached the upstream with both sides off")
 				if found {
 					check(
@@ -471,12 +471,12 @@ run_cookie_require_cases :: proc(r: ^Runner, mock: ^Mock, upstream_port: int) {
 
 			// And the refusal has to carry the cookie to come back with, or the
 			// client has no way past it.
-			issued, found := find_cookie(res.wire)
+			issued, found := find_cookie(r, res.wire)
 			if check(r, found, "BADCOOKIE without a cookie leaves the client stuck") {
 				retry := build_query(f.qname, f.qtype, id = 0x4244, edns_size = 1232, cookie = issued)
 				again := query_udp(udp_port, retry)
 				if check(r, again.ok, "no response to the retry") {
-					h, _ := parse_header(again.wire)
+					h := parse_header(r, again.wire)
 					check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode for the retry")
 					check(r, h.ancount > 0, "the retry was not answered")
 				}
@@ -490,7 +490,7 @@ run_cookie_require_cases :: proc(r: ^Runner, mock: ^Mock, upstream_port: int) {
 		query := build_query(f.qname, f.qtype, edns_size = 1232)
 		res := query_udp(udp_port, query)
 		if check(r, res.ok, "no response") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode")
 			check(r, h.ancount > 0, "a client without cookies was not answered")
 		}
@@ -504,7 +504,7 @@ run_cookie_require_cases :: proc(r: ^Runner, mock: ^Mock, upstream_port: int) {
 		query := build_query(f.qname, f.qtype, edns_size = 1232, cookie = CLIENT_COOKIE)
 		res := query_tcp(udp_port, query)
 		if check(r, res.ok, "no response") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode")
 			check(r, h.ancount > 0, "a TCP client was refused")
 		}
