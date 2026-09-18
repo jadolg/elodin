@@ -761,10 +761,10 @@ def relocated_wildcard_denial():
     # Rewritten once, the wildcard's bit map becomes a NODATA proof for a name
     # that really has the type. Rewritten twice with chosen owners, the two
     # spans cover a qname and the wildcard, and the pair proves NXDOMAIN for a
-    # name the zone answers for. RFC 4035 section 3.1.3.3 is the reason this is
-    # never legitimate: NSEC records are published under their own names and are
-    # never synthesised from a wildcard, so a denial record whose signature
-    # expanded is a denial record that was moved.
+    # name the zone answers for. RFC 4592 section 4.7 is the reason this is
+    # never legitimate: a wildcard owns an NSEC, but "synthesis of these records
+    # will only occur when the query exactly matches the record", so a denial
+    # record whose signature expanded is a denial record that was moved.
     #
     # `wdtest.` carries the same mistake on the other side of the same routine:
     # a DS RRset whose signature expanded. The digest binds the child's name, so
@@ -842,8 +842,8 @@ def relocated_wildcard_denial():
     # really does cover `nx.wctest.` - so the RFC 4035 section 5.3.4 proof the
     # answer's short Labels field calls for is one an attacker can make. That
     # the proof succeeds is the point: the expansion is provable and the record
-    # is still forged, because section 3.1.3.3 never has a zone synthesise an
-    # NSEC from a wildcard.
+    # is still forged, because RFC 4592 section 4.7 has an NSEC synthesised
+    # only for a query that matches it exactly.
     moved_nsec = [RR("nx.wctest.", NSEC, wild_rdata), RR("nx.wctest.", RRSIG, wild_sig.rdata)]
     emit("wc_relocated_answer_nsec", "nx.wctest.", "NSEC",
          message("nx.wctest.", NSEC, moved_nsec,
@@ -854,6 +854,26 @@ def relocated_wildcard_denial():
     emit("wc_nx_ds", "nx.wctest.", "DS",
          message("nx.wctest.", DS, [],
                  wild_nsec + [wild_sig] + real_nsec + [real_sig] + wc_soa + [wc_soa_sig]))
+
+    # The same refusal is owed to the other types that are never synthesised
+    # from a wildcard, and these two do not come from rewriting an owner: a
+    # relocated DS or SOA changes the signing input and the signature dies.
+    # They are what a signer that wildcard signed a DS or an apex SOA emits,
+    # which is the shape `wdtest.` already models for the chain walk - the
+    # answer section is the one place left that took them.
+    #
+    # RFC 4592 section 4.6 has a DS at a wildcard "meaningless and harmless",
+    # and section 4.1 has a wildcard owning an SOA be the apex, which cannot be
+    # a source of synthesis. Neither expansion is a thing a zone can mean.
+    nx = Key("nx.wctest.", "wcard-nxchild")
+    nx_ds = [RR("nx.wctest.", DS, nx.ds())]
+    emit("wc_expanded_ds_answer", "nx.wctest.", "DS",
+         message("nx.wctest.", DS, nx_ds + [sign(nx_ds, wc, labels=1)],
+                 wild_nsec + [wild_sig] + wc_soa + [wc_soa_sig]))
+    nx_soa = [soa_rr("nx.wctest.")]
+    emit("wc_expanded_soa_answer", "nx.wctest.", "SOA",
+         message("nx.wctest.", SOA, nx_soa + [sign(nx_soa, wc, labels=1)],
+                 wild_nsec + [wild_sig] + wc_soa + [wc_soa_sig]))
     wildcard_expanded_ds(root)
     wildcard_dname(root)
 

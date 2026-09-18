@@ -1308,26 +1308,47 @@ validate_answer :: proc(
 			}
 		}
 		/*
-		For every other type an expansion is a fact to be proved: the RFC 4035
-		section 5.3.4 denial below asks whether the wildcard was entitled to
-		stand in for this name, and if it was, the answer is an answer.
+		For most types an expansion is a fact to be proved, and the RFC 4035
+		section 5.3.4 denial below proves it: it asks whether the wildcard was
+		entitled to stand in for this name, and if it was, the answer is an
+		answer.
 
-		An NSEC or NSEC3 is the one case where that proof settles nothing. RFC
-		4035 section 3.1.3.3 has a zone publish these under their own names and
-		never synthesise one from a wildcard, so an expanded one was moved -
-		and the proof an attacker has to make to move it is a true statement
-		they can fetch with one harmless query, the wildcard's own NSEC
-		covering the name they chose. Proving the expansion legitimate while
-		the record is still forged is exactly the shape of the attack.
+		For these four the proof settles nothing, because RFC 4592 section 4
+		says a wildcard never legitimately produces one:
+
+		  - NSEC (section 4.7): a wildcard owns an NSEC of its own, but
+		    "synthesis of these records will only occur when the query exactly
+		    matches the record". NSEC3 goes with it, being the same record
+		    hashed.
+		  - DS (section 4.6): "meaningless and harmless" at a wildcard, and a
+		    synthesized one "will not be very useful as it exists in the
+		    context of a delegation point".
+		  - SOA (section 4.1): a wildcard owning one means the zone apex is
+		    that name, and an apex is not a source of synthesis.
+
+		So an expanded one of these was moved, and what an attacker has to
+		prove to move it is a true statement fetched with one harmless query -
+		the wildcard's own NSEC, covering whatever name they picked. Proving
+		the expansion legitimate while the record is still forged is the whole
+		shape of the attack.
+
+		Section 4.7 also calls a synthesized NSEC harmless, "as [it] will never
+		be used in negative caching or to generate a negative response". That
+		is true here - `parse_nsec` is reached only from the authority section
+		- and it is not the whole account: the AD bit is this server's own
+		claim that the record is what its zone published, and the owner name is
+		the one part of it the signature never covered.
 
 		`signed_labels` drops a literal leading `*.`, so a zone's own
 		`*.zone. NSEC`, asked for by name, comes back with no encloser and
-		still passes. This is the answer-section half of the refusal
-		`verified_rrset` makes for the authority section.
+		still passes. This is the answer-section half of what `verified_rrset`
+		refuses for the authority section and the chain walk refuses for a DS.
 		*/
-		if status == .Secure && encloser != "" && (rec.type == .NSEC || rec.type == .NSEC3) {
+		if status == .Secure &&
+		   encloser != "" &&
+		   (rec.type == .NSEC || rec.type == .NSEC3 || rec.type == .DS || rec.type == .SOA) {
 			status = .Bogus
-			why = "relocated denial record"
+			why = "wildcard expansion not possible"
 		}
 		if encloser != "" {
 			append(&expansions, Wildcard_Expansion{owner = rec.name, encloser = encloser})
@@ -2397,9 +2418,10 @@ verified_rrset :: proc(
 		nothing about the owner the record arrived under, so an attacker may
 		rewrite that owner freely - and the sets this routine verifies are the
 		ones nobody checks a wildcard proof for afterwards. Both are types RFC
-		4035 section 3.1.3.3 never has a zone synthesise from a wildcard: an
-		NSEC or NSEC3 is published under its own name, and an SOA lives at an
-		apex. `signed_labels` drops a literal leading `*.`, so a wildcard's own
+		4592 section 4 never has a wildcard produce: an NSEC is synthesised
+		only for a query matching it exactly (section 4.7), and a wildcard
+		owning an SOA is the apex, which is no source of synthesis (section
+		4.1). `signed_labels` drops a literal leading `*.`, so a wildcard's own
 		NSEC - the record that proves NODATA for a type the wildcard lacks -
 		still comes back with no encloser and still passes.
 		*/
