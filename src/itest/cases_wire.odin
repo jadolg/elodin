@@ -59,11 +59,13 @@ run_wire_cases :: proc(r: ^Runner) {
 		first_cname_or_name(&scratch, bad)
 		min_answer_ttl(&scratch, bad)
 		find_cookie(&scratch, bad)
-		check_eq_int(r, len(scratch.failures), 5, "helpers that refused an undecodable reply")
+		find_padding(&scratch, bad)
+		find_keepalive(&scratch, bad)
+		check_eq_int(r, len(scratch.failures), 7, "helpers that refused an undecodable reply")
 
 		// And the header reader, whose zero value reads as NOERROR.
 		parse_header(&scratch, bad[:8])
-		check_eq_int(r, len(scratch.failures), 6, "a reply too short for a header also fails")
+		check_eq_int(r, len(scratch.failures), 8, "a reply too short for a header also fails")
 	}
 	end_case(r)
 

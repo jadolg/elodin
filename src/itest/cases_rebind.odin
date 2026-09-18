@@ -23,9 +23,9 @@ is exactly the move the attack makes: the name is public, the address is not.
 // Read here rather than through a shared helper because only the rebinding cases
 // care about the value, not merely that an EDE is present.
 @(private = "file")
-extended_error_code :: proc(wire: []u8) -> int {
-	msg, err := dns.decode_message(wire, context.temp_allocator)
-	if err != .None {
+extended_error_code :: proc(r: ^Runner, wire: []u8) -> int {
+	msg, ok := decode_reply(r, wire)
+	if !ok {
 		return -1
 	}
 	for rec in msg.additional {
@@ -164,7 +164,7 @@ run_rebind_refusal_cases :: proc(r: ^Runner) {
 						check_eq_int(r, h.ancount, 0, "answer count")
 						check(r, h.nscount >= 1, "no SOA in the authority section")
 						check_eq_int(r, len(answer_addresses(r, res.wire)), 0, "addresses handed to the client")
-						check_eq_int(r, extended_error_code(res.wire), 15, "extended error info-code")
+						check_eq_int(r, extended_error_code(r, res.wire), 15, "extended error info-code")
 					}
 					check(r, log_contains(&srv, "outcome=blocked detail=rebind"), "the query log did not record the refusal")
 					check(r, log_contains(&srv, "rebinding attack"), "no warning was logged for the first refusal")

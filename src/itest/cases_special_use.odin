@@ -40,9 +40,9 @@ That makes a leak visible as an address rather than only as a query count.
 // none. The apex the negative answer is cached against is the point of several
 // of these cases, and nothing else in the suite reads it.
 @(private = "file")
-authority_soa_owner :: proc(wire: []u8) -> string {
-	msg, err := dns.decode_message(wire, context.temp_allocator)
-	if err != .None {
+authority_soa_owner :: proc(r: ^Runner, wire: []u8) -> string {
+	msg, ok := decode_reply(r, wire)
+	if !ok {
 		return ""
 	}
 	for rec in msg.authority {
@@ -153,7 +153,7 @@ run_special_use_answered_cases :: proc(r: ^Runner) {
 			check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)
 			check_eq_int(r, h.ancount, 0, "answer count")
 			// The name exists, so the SOA is its own rather than a parent's.
-			check_eq_str(r, authority_soa_owner(res.wire), "localhost.", "SOA owner")
+			check_eq_str(r, authority_soa_owner(r, res.wire), "localhost.", "SOA owner")
 		}
 	}
 	end_case(r)
@@ -176,7 +176,7 @@ run_special_use_answered_cases :: proc(r: ^Runner) {
 				check_eq_int(r, len(answer_addresses(r, res.wire)), 0, "addresses handed to the client")
 				// Owned by the apex, so a downstream caches the negative for the
 				// tree rather than for one hidden service.
-				check_eq_str(r, authority_soa_owner(res.wire), c.apex, "SOA owner")
+				check_eq_str(r, authority_soa_owner(r, res.wire), c.apex, "SOA owner")
 			}
 		}
 	}
@@ -272,7 +272,7 @@ run_special_use_key_cases :: proc(r: ^Runner) {
 					if check(r, res.ok, "no response for printer.local.") {
 						h := parse_header(r, res.wire)
 						check(r, h.rcode == int(dns.Rcode.NX_Domain), "rcode %d, want NXDOMAIN", h.rcode)
-						check_eq_str(r, authority_soa_owner(res.wire), "local.", "SOA owner")
+						check_eq_str(r, authority_soa_owner(r, res.wire), "local.", "SOA owner")
 					}
 					// The other key is untouched, so this one is not the whole table.
 					other := query_udp(udp_port, build_query("internal.test.", u16(dns.Type.A)))
@@ -317,7 +317,7 @@ run_special_use_key_cases :: proc(r: ^Runner) {
 						h := parse_header(r, res.wire)
 						check(r, h.rcode == int(dns.Rcode.NX_Domain), "rcode %d, want NXDOMAIN", h.rcode)
 						check_eq_int(r, len(answer_addresses(r, res.wire)), 0, "addresses handed to the client")
-						check_eq_str(r, authority_soa_owner(res.wire), "home.arpa.", "SOA owner")
+						check_eq_str(r, authority_soa_owner(r, res.wire), "home.arpa.", "SOA owner")
 					}
 					// The apex itself: NODATA, not a name error. `arpa` publishes
 					// a signed delegation for it, so a client can prove the name
@@ -328,7 +328,7 @@ run_special_use_key_cases :: proc(r: ^Runner) {
 						h := parse_header(r, apex.wire)
 						check(r, h.rcode == int(dns.Rcode.No_Error), "apex rcode %d, want NOERROR", h.rcode)
 						check_eq_int(r, len(answer_addresses(r, apex.wire)), 0, "addresses at the apex")
-						check_eq_str(r, authority_soa_owner(apex.wire), "home.arpa.", "apex SOA owner")
+						check_eq_str(r, authority_soa_owner(r, apex.wire), "home.arpa.", "apex SOA owner")
 					}
 					// The other key is untouched, so this one is not the whole table.
 					other := query_udp(udp_port, build_query("internal.test.", u16(dns.Type.A)))

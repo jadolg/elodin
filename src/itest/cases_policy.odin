@@ -945,21 +945,12 @@ MIXED_EDNS_FIRST :: "mixed-edns-first.example.com."
 @(private = "file")
 MIXED_BARE_FIRST :: "mixed-bare-first.example.com."
 
-/*
-Whether the answer carries an OPT record, read off the wire the client got.
-
-The decode is checked rather than folded into the answer: reporting "no OPT
-record" for a wire that does not decode at all is how a case asserting the
-absence of one passes over an answer nobody could read - a stale ARCOUNT left
-behind by a strip, say, which is exactly the failure these cases are here to
-catch. So it fails on the spot and the caller's own check reads whatever is left.
-*/
+// Whether the answer carries an OPT record, read off the wire the client got.
+// `decode_reply` fails the case on bytes nothing could read, so a case asserting
+// the absence of an OPT record cannot pass over an answer nobody decoded.
 @(private = "file")
 has_opt_record :: proc(r: ^Runner, wire: []u8) -> bool {
-	msg, err := dns.decode_message(wire, context.temp_allocator)
-	if !check(r, err == .None, "the answer did not decode: %v", err) {
-		return false
-	}
+	msg := decode_reply(r, wire) or_return
 	return dns.edns_present(msg)
 }
 

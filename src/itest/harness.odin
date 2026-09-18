@@ -582,12 +582,14 @@ log_count :: proc(srv: ^Server, needle: string) -> int {
 /*
 Decode a reply, failing the case when the bytes cannot be read.
 
-Every helper below answers a question of the form "is this in the reply", and a
-decode error used to come back as "no" - the same answer a readable reply with
-nothing in it gives. A negative assertion then passed on bytes nothing read,
+Every helper that reads a reply answers a question of the form "is this in it",
+and a decode error used to come back as "no" - the same answer a readable reply
+with nothing in it gives. A negative assertion then passed on bytes nothing read,
 which is the one failure the suite most exists to catch.
+
+Package-visible rather than file-private: the per-file helpers in the case files
+read their own corner of a reply and want the same rule applied to the decode.
 */
-@(private = "file")
 decode_reply :: proc(
 	r: ^Runner,
 	wire: []u8,
