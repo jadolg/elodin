@@ -349,9 +349,17 @@ rebind_readable :: proc(decoded: Decoded_Answer) -> (msg: dns.Message, readable:
 	if !decoded.full {
 		// Neither reading came back, so there is nothing to look at. `err` is
 		// what stopped the shorter of the two, which is the one that got
-		// furthest into the part this guard cares about.
+		// furthest into the part this guard cares about - falling back to what
+		// stopped the whole-message decode for the case where the shorter one
+		// was never attempted. That is a caller asking for a reading this guard
+		// cannot use, which `rebind_reads_answer` is there to prevent; the
+		// fallback is so that the day one gets past it the operator is told a
+		// decode error rather than `None`, which reads as no error at all.
 		if !decoded.partial {
-			return {}, false, decoded.partial_err
+			if decoded.partial_err != .None {
+				return {}, false, decoded.partial_err
+			}
+			return {}, false, decoded.full_err
 		}
 		// The unread section is one the client acts on, so this is the refusal
 		// the whole-message decode was already making.
