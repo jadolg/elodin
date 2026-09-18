@@ -203,16 +203,6 @@ resolve_insisting :: proc(
 	}
 
 	/*
-	Counted here, at the point the sweep is decided on, rather than where it
-	succeeds: a group whose members all answer this way sweeps every one of them
-	and returns the first reply, which is the arrangement that costs the most
-	exchanges per query and would otherwise be the one leaving no figure at all.
-	The count is of replies that sent the group looking elsewhere, against the
-	member that sent them; `note_swept_rcode` says why nothing else records it.
-	*/
-	note_swept_rcode(winner)
-
-	/*
 	One pass, and the server that already spoke is skipped: it gave its answer
 	and asking it again gets the same one. That bounds the sweep by the server
 	count. A chain walk calling this is itself bounded by
@@ -280,6 +270,15 @@ resolve_insisting :: proc(
 	exchange for it instead, and the upgrade path above is what would fix it in
 	place.
 	*/
+	// Counted against the member that was passed over, once, the first time
+	// this actually asks somebody else - so the series measures exchanges this
+	// reply cost the group and nothing else. A lone upstream, or a group whose
+	// every other member is parked, sweeps nobody and is counted nowhere; a
+	// group that asks them all and still comes back with the first reply is
+	// counted once, which is the arrangement paying the most for this.
+	// `note_swept_rcode` says why nothing else records it at all.
+	counted := false
+
 	for u in g.servers {
 		if u == winner {
 			continue
@@ -288,16 +287,23 @@ resolve_insisting :: proc(
 			logx.debugf("upstream %s is in its cooldown, not asked again for this one", u.spec.name)
 			continue
 		}
+		if !counted {
+			note_swept_rcode(winner)
+			counted = true
+		}
 		resp, xerr := exchange(u, sweep_query(query), g.timeout, allocator)
 		if xerr != .None {
 			logx.debugf("upstream %s failed: %v", u.spec.name, xerr)
 			continue
 		}
 		if acceptable(resp) {
+			// The rcode as a number: 4080 of the 4096 composed values have no
+			// name, and `%v` renders one of those as a placeholder - the same
+			// reading `unreadable_rcode_refusal` gives its own line.
 			logx.debugf(
-				"upstream %s answered %v, swept past it to %s",
+				"upstream %s answered rcode %d, swept past it to %s",
 				winner.spec.name,
-				dns.peek_rcode(response),
+				u16(dns.peek_rcode(response)),
 				u.spec.name,
 			)
 			// The first reply is superseded. It came from the caller's

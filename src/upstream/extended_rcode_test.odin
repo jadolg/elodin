@@ -696,8 +696,8 @@ test_a_lone_upstreams_servfail_is_still_the_clients_answer :: proc(t: ^testing.T
 	testing.expect_value(t, sync.atomic_load(&broken.hits), 1)
 	delete(resp, context.allocator)
 
-	// And it is counted even though the sweep found nobody: a group with
-	// nothing to offer is the one paying the most for this, so it is the one
-	// that must not be silent about it. See `note_swept_rcode`.
-	testing.expect_value(t, stats_of(bad).swept_rcode, u64(1))
+	// And nothing is counted against it, because nothing was asked: the series
+	// is the extra exchanges a reply cost its group, and on a lone upstream it
+	// cost none. See `note_swept_rcode`.
+	testing.expect_value(t, stats_of(bad).swept_rcode, u64(0))
 }

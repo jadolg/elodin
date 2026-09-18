@@ -293,10 +293,17 @@ the sweep is where the decision is made and where the member that was passed
 over is known. It names that member and not the one that answered, which is the
 question an operator has - which of these should I go and look at.
 
-Counted when the sweep starts rather than when it finds something, so that the
-group whose every member answers this way - the one paying the most exchanges
-per query, and returning the first reply after all of them - is the loudest here
-rather than the quietest.
+Counted once per sweep that reaches somebody, rather than per reply refused: the
+group whose every member answers this way pays the most exchanges of anyone and
+is counted, and a lone upstream - or a group whose every other member is parked
+- sweeps nobody, costs nothing extra and is counted nowhere. So the series is
+the extra exchanges this reply cost the group, which is what an operator reading
+it wants it to be.
+
+Not confined to the rcodes a client's own question refuses, either.
+`resolve_insisting` is shared with the chain lookups, where `answerable` will
+take only NOERROR and NXDOMAIN, so a FORMERR or a NOTIMP to a `DS` lookup lands
+here too.
 */
 note_swept_rcode :: proc(u: ^Upstream) {
 	if u == nil {

@@ -716,7 +716,7 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 		return
 	}
 
-	// One series per configured name, gathered once and walked four times, so
+	// One series per configured name, gathered once and walked five times, so
 	// the de-duplication happens in one place rather than in each family below.
 	Series :: struct {
 		name:       string,
@@ -800,20 +800,22 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 
 	/*
 	Which upstream answered something another member of its group had to answer
-	instead - a SERVFAIL, a REFUSED, or an rcode no client could read.
+	instead - a SERVFAIL, a REFUSED, an rcode no client could read, or, on a
+	chain lookup, anything that is not an answer about the name.
 
 	The same reasoning as the family above, for the case that is far more
 	common. `resolve_insisting` sweeps past such a reply without counting a
 	failure, so the member that is doing it holds a clean
 	`elodin_upstream_failures_total` and an `elodin_upstream_up` of 1 while
 	every query through the group costs an extra exchange. This is the figure
-	that names it.
+	that names it, and it counts only sweeps that reached somebody, so it is
+	the extra exchanges rather than the refused replies.
 	*/
 	metrics.family(
 		b,
 		"elodin_upstream_swept_rcode_total",
 		.Counter,
-		"Replies from each upstream that another member of its group was asked to answer instead: a SERVFAIL or REFUSED, which say nothing about the name, or an rcode a client could not read.",
+		"Replies from each upstream that another member of its group was asked to answer instead: for a client's own question a SERVFAIL, a REFUSED or an rcode it could not read; for a DNSSEC chain lookup anything that is not NOERROR or NXDOMAIN.",
 	)
 	for u in all {
 		metrics.sample(b, "elodin_upstream_swept_rcode_total", u.swept, metrics.Label{"upstream", u.name})
