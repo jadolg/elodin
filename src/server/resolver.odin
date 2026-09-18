@@ -2416,6 +2416,15 @@ decode_answer :: proc(resp: []u8, answer_section: bool, allocator: mem.Allocator
 	if !answer_section {
 		return out
 	}
+	// Both decodes draw on the same arena, and the shorter one is given the same
+	// name budget over the same bytes - so a reply that spent the budget before
+	// the answer section ended has nothing to gain here and would spend it
+	// twice over. One whose authority or additional section was the expensive
+	// part would read, and is not worth the second budget: no upstream sends
+	// half a megabyte of names in the sections this caller is not reading.
+	if err == .Name_Budget {
+		return out
+	}
 	answer, answer_err := dns.decode_through_answer(resp, allocator)
 	if answer_err == .None {
 		out.msg, out.partial = answer, true

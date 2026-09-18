@@ -186,7 +186,7 @@ expand_rdata_names :: proc(
 		defer delete(name, allocator)
 		// The expansion is thrown away once it has been written back out in
 		// wire form, but a decoder fed an arena does not get the bytes back, so
-		// it is charged like any other name. See `NAME_EXPANSION_FACTOR`.
+		// it is charged like any other name. See `NAME_BUDGET`.
 		if charge_name(r, len(name)) != .None {
 			return nil, false
 		}

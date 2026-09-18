@@ -26,8 +26,7 @@ Encode_Error :: enum u8 {
 }
 
 /*
-What a message's decoded names may cost: a flat allowance, plus this many times
-the message's own wire length.
+What one decode of a message may spend expanding its names into.
 
 Every name is cloned in escaped presentation form, so one 255-octet name of
 unprintable bytes costs 1004 bytes, and a two-byte compression pointer buys a
@@ -36,30 +35,31 @@ and its RDATA name are both pointers, so a reply built entirely of those reaches
 about 130 times its own length - 8.5 MB out of 64 KB - and the same message is
 decoded again for the cache, for the UDP fit and for the validator.
 
-The two terms answer two different things. A small message can honestly reach a
-high multiple of itself and it does not matter that it does: the parity
-generator, which sends legal shapes nobody sends on purpose, gets to about
-fourteen times on replies of a few hundred bytes, and fourteen times nothing is
-nothing. What matters is the figure a full-length reply can reach, and that is
-what the multiplier holds down - to 640 KB at 64 KB of message.
+A flat figure rather than a multiple of the message, for two reasons. It is the
+absolute one that matters: what threatens the box is the megabytes a full-length
+reply can reach, and a short message expanding to many times itself is many times
+nothing. And a multiple would not survive this codebase's own rewrites - a
+message is stripped of its RRSIGs and stored, and `encode_message` compresses
+what it writes, so the same names can come back in half the bytes. The entry
+would then be refused on every cache hit by a budget its own message had passed,
+which is a branch `resolve` documents as unreachable.
 
-What the pair refuses is a full-length reply whose names come to more than the
-allowance and eight times the message together. A record whose owner is a pointer
-is 16 wire bytes, so at 64 KB that boundary sits around 160 presentation
+640 KB is what a 64 KB reply may spend. A record whose owner is a pointer is 16
+wire bytes, so a full-length reply crosses it at around 160 presentation
 characters of name per record - an RRset of four thousand records under one name
-that long, and nothing shorter. It is legal and no real server sends it: a name
+that long, and nothing shorter. That is legal and no real server sends it: a name
 is normally printable and a few dozen characters, written out once for every
-record or two that carries it.
+record or two that carries it. Nothing smaller than a full-length reply can get
+near the figure at all.
 */
-NAME_BUDGET_FLOOR :: 128 * 1024
-NAME_EXPANSION_FACTOR :: 8
+NAME_BUDGET :: 640 * 1024
 
 @(private)
 Reader :: struct {
 	msg:        []u8,
 	pos:        int,
 	// Presentation bytes this message's names have been expanded into so far,
-	// against `NAME_BUDGET_FLOOR` plus `NAME_EXPANSION_FACTOR` times `len(msg)`.
+	// against `NAME_BUDGET`.
 	name_bytes: int,
 }
 
@@ -73,7 +73,7 @@ known until it is decoded; a single name overshoots by at most
 @(private)
 charge_name :: proc(r: ^Reader, n: int) -> Decode_Error {
 	r.name_bytes += n
-	return .Name_Budget if r.name_bytes > NAME_BUDGET_FLOOR + NAME_EXPANSION_FACTOR * len(r.msg) else .None
+	return .Name_Budget if r.name_bytes > NAME_BUDGET else .None
 }
 
 @(private)

@@ -98,8 +98,9 @@ An answer of NXT records whose RDATA holds a pointer byte but no walkable name.
 
 `decode_raw_rdata` takes the expansion buffer before it knows whether the walk
 will get anywhere, and an arena does not take it back when the walk fails on the
-first byte. Nothing here is charged to anything, and the record it buys is
-fourteen wire bytes.
+first byte. That buffer is 255 bytes and more whatever the RDATA holds, and the
+record buying it is fourteen wire bytes, so it is charged like the names it was
+meant to hold.
 */
 @(private = "file")
 unwalkable_raw_answer :: proc() -> []u8 {
@@ -131,7 +132,8 @@ test_unwalkable_raw_rdata_stays_within_the_name_budget :: proc(t: ^testing.T) {
 	msg := unwalkable_raw_answer()
 	defer delete(msg)
 
-	used, _ := decode_into_arena(t, msg)
+	used, err := decode_into_arena(t, msg)
+	testing.expect_value(t, err, Decode_Error.Name_Budget)
 	testing.expectf(
 		t,
 		used <= DECODE_CEILING * len(msg),
@@ -215,11 +217,11 @@ the largest a reply gets. A hundred characters is a long hostname and 4000 A
 records is a large RRset; together they come to 404 KB of names against a budget
 of 652 KB.
 
-It is the factor this pins and not the floor - the names here are three times
-the flat allowance on their own, so the test fails with the factor at two and
-passes at eight. The boundary itself is a good way further out: at this length a
-pointer-owned record costs 16 wire bytes for about 101 of name, and it takes
-around 160 characters of name before a full-length reply of them is refused.
+The names here come to 404 KB against a budget of 640 KB, so the test is a real
+hold on the figure rather than a shape that could never reach it. The boundary
+is a good way further out: a pointer-owned record costs 16 wire bytes for about
+101 of name here, and it takes around 160 characters of name before a
+full-length reply of them is refused.
 */
 @(test)
 test_long_name_pointed_at_by_a_whole_rrset_still_decodes :: proc(t: ^testing.T) {
