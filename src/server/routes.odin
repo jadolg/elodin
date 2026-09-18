@@ -402,28 +402,6 @@ parent_answers_apex_ds :: proc(
 }
 
 /*
-Whether a reply says anything about the name that was asked for.
-
-NOERROR and NXDOMAIN do; every other rcode is the responder saying it did not
-answer. The same test `upstream.resolve_answerable` insists on for a lookup about
-a delegation and `dnssec.answerable_rcode` makes over a decoded message, neither
-of which is exported to here, read off the wire because that is what
-`resolve_query` is holding.
-
-One caller: the fallback that asks the parent after the memory sent the question
-to a route with no answer in it. What an ordinary client question does with such
-an rcode is pass it on, which is the reading everywhere else in this file.
-*/
-@(private)
-reply_answers :: proc(resp: []u8) -> bool {
-	#partial switch dns.peek_rcode(resp) {
-	case .No_Error, .NX_Domain:
-		return true
-	}
-	return false
-}
-
-/*
 Whether any upstream in `g` is out of its failure cooldown.
 
 Asked about both groups before an apex `DS` is sent to the parent's, and nowhere
@@ -568,11 +546,25 @@ and therefore never stops costing.
 What the memory is not, even then, is a reason to stop asking. One answered
 reply is a long way from what parks an upstream - `FAILURE_THRESHOLD` consecutive
 failures - so the group it skips may be answering everything else perfectly well.
-`resolve_query` reaches past it for that reason: where the route it sent the
-question to instead had no answer either - no reply, or an rcode that says
-nothing about the name - the parent is asked after the fact, and a parent that
-has come back with the proof is read and remembered as it always would have been.
-The saving is of a wait the route can cover, never of the answer itself.
+`resolve_query` reaches past it for that reason, and the test it reaches on is
+this memory's own bet: that what the route has to say is the unsigned twin of the
+proof, a NODATA at the apex, which is the answer the parent's silence would have
+left the client with anyway. `parent_answers_apex_ds` is the reading, applied to
+the route's reply rather than the parent's. Anything else - no reply, a SERVFAIL,
+an NXDOMAIN, a `DS` RRset, a NOERROR somebody rewrote - is not that answer, so
+the bet is off and the parent is asked after the fact; a parent that has come
+back with the proof is read and remembered as it always would have been, and
+where it still says nothing the route's reply stands exactly as it would have
+after the wait. The saving is of a wait the route can cover, never of the answer
+itself.
+
+What is left is the one divergence a memory of this kind cannot avoid and this
+file will not pretend away: where the parent recovers inside the window *and* the
+route answered the NODATA, the client is handed the route's unsigned one rather
+than the parent's signed proof, for as long as the window holds. That is the
+trade issue #243 asks for in as many words, and it is bounded on every side - one
+`upstream.COOLDOWN`, one apex, and only after the parent itself replied without
+settling anything.
 
 The window it closes is between one probe and the next, not around the probe
 itself. Nothing is written until the parent's leg returns, so queries that arrive

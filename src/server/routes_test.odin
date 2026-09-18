@@ -1655,7 +1655,14 @@ test_a_parent_that_settles_nothing_is_not_re_asked_for_every_query :: proc(t: ^t
 }
 
 /*
-The memory saves a wait, and gives up nothing when the route has no answer.
+The memory saves a wait, and gives up nothing the parent was the one to settle.
+
+What it bets is that the route's answer is the unsigned twin of the proof - a
+NODATA at the apex, which is what the client would have been left with after the
+wait. Every case here is the bet coming in wrong, and the assertion is that the
+parent gets its turn after all: the memory is not allowed to be what decides that
+the route's version of a statement about this delegation is the one the client
+gets.
 
 The skip it makes is not the parked-group skip's: that one fires only once every
 member of the parent's group has accrued `FAILURE_THRESHOLD` failures, which is a
@@ -1666,14 +1673,16 @@ the one where the *route* is what fails: the parent recovers inside the window
 and holds the proof, and the route the memory sent the question to has nothing to
 say.
 
-Two ways to have nothing to say, and the second is the one an rcode test alone
-would miss. A route that never replies is a transport failure and reads as one
-everywhere. A route that answers SERVFAIL has replied, and `resolve_readable`
-hands that back as a perfectly good answer - the rcode is the client's, which is
-the right reading when the route was asked second and the wrong one here, where
-the parent was never given its turn. An internal authority that is up and failing
-is the deployment: it answers, it answers SERVFAIL, and the proof is one exchange
-away.
+Four ways to be something other than that NODATA, and only the first is a failure
+in the ordinary sense. A route that never replies is a transport failure and
+reads as one everywhere. A route that answers SERVFAIL has replied, and
+`resolve_readable` hands that back as a perfectly good answer - the rcode is the
+client's, which is the right reading when the route was asked second and the
+wrong one here, where the parent was never given its turn; an internal authority
+that is up and failing is the deployment. An NXDOMAIN and a `DS` RRset are the
+two the parent is the authority for - what the public tree delegates, and whether
+it signs it - and a memory written by one unsettled reply must not be what
+decides the client hears the route's version of either.
 
 Asked and answered in both, rather than SERVFAILed with a leg untried. The
 parent's reply is used on the same terms the first exchange reads it on - only
@@ -1685,15 +1694,23 @@ memory the second query is about. The timeout is cut so a route that is not
 serving does not sit out `forwarding_config`'s three seconds.
 */
 @(test)
-test_the_memo_still_asks_the_parent_when_the_route_has_no_answer :: proc(t: ^testing.T) {
+test_the_memo_still_asks_the_parent_unless_the_route_answered_the_nodata :: proc(t: ^testing.T) {
 	Case :: struct {
 		// What the route has to say about `corp.example. DS` on the second
 		// query, the memory having sent it there first.
-		what:  string,
-		serve: bool,
-		rcode: dns.Rcode,
+		what:   string,
+		serve:  bool,
+		rcode:  dns.Rcode,
+		// A `DS` RRset rather than an empty answer section, which is a NOERROR
+		// that is no more the NODATA than the NXDOMAIN beside it is.
+		signed: bool,
 	}
-	cases := []Case{{"nothing at all", false, .No_Error}, {"SERVFAIL", true, .Serv_Fail}}
+	cases := []Case {
+		{"nothing at all", false, .No_Error, false},
+		{"SERVFAIL", true, .Serv_Fail, false},
+		{"NXDOMAIN", true, .NX_Domain, false},
+		{"a DS RRset", true, .No_Error, true},
+	}
 
 	for c in cases {
 		def_socket, derr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
@@ -1769,9 +1786,13 @@ test_the_memo_still_asks_the_parent_when_the_route_has_no_answer :: proc(t: ^tes
 			reply  = route_reply_nodata("corp.example.", .DS),
 			want   = "corp.example.",
 		}
+		route_reply := route_reply_nodata("corp.example.", .DS, c.rcode)
+		if c.signed {
+			route_reply = route_reply_ds("corp.example.")
+		}
 		failing := Route_Mock {
 			socket = route_socket,
-			reply  = route_reply_nodata("corp.example.", .DS, c.rcode),
+			reply  = route_reply,
 			want   = "corp.example.",
 		}
 		second_parent := thread.create_and_start_with_poly_data(&proving, serve_route)

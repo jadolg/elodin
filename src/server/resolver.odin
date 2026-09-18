@@ -1760,15 +1760,26 @@ resolve_query :: proc(
 	zone whose parent had recovered and was holding the proof - which is issue
 	#227's failure, arriving through the saving meant to prevent it.
 
-	Where the route had no answer in it, which is not only a reply that never
-	came. `resolve_readable` hands back a SERVFAIL or a REFUSED as a perfectly
-	good reply - the rcode is the client's answer, which is the ordinary reading
-	of a client's question and the right one when the route was asked second -
-	so a route that mangles this `DS`, or an internal authority that is up and
-	failing, would otherwise stand as the answer while the parent held the proof.
-	`reply_answers` is the test, and it is the one this file already makes about
-	a reply concerning a delegation. A route that did answer is still the
-	client's answer, rcode and all: this changes which group is asked first and
+	Where the route did not answer what the memory bet it would: a NODATA at the
+	apex, the unsigned twin of the proof and the answer the parent's own silence
+	would have left this client with. `parent_answers_apex_ds` is the test, read
+	over the route's reply rather than the parent's, because the question it
+	answers is the same one - is this the statement that the delegation carries
+	no DS - and only the signatures beside it differ.
+
+	Everything else fails it, and each for a reason that is the parent's to
+	settle rather than the route's. A reply that never came. A SERVFAIL or a
+	REFUSED, which `resolve_readable` hands back as a perfectly good reply - the
+	rcode is the client's answer, which is the ordinary reading of a client's
+	question and the right one when the route was asked second, but an internal
+	authority that is up and failing must not stand as the answer while the
+	parent holds the proof. An NXDOMAIN, a `DS` RRset, a NOERROR somebody
+	rewrote: each is a statement about this delegation that the parent, not the
+	route, is the authority for, and the memory must not be what decides that the
+	route's version of it is the one the client gets.
+
+	Where the parent still settles nothing, the route's reply stands exactly as
+	it would have after the wait - this changes which group is asked first, and
 	not how either one is read.
 
 	And only the proof is taken from it, on the same terms the first exchange
@@ -1782,7 +1793,11 @@ resolve_query :: proc(
 	A fresh transaction ID for the same reason the second exchange draws one:
 	each exchange is a new one on the wire (RFC 5452 section 9.2).
 	*/
-	if memoised_parent != nil && (uerr != .None || !reply_answers(resp)) {
+	route_proved := false
+	if memoised_parent != nil {
+		route_proved, _ = parent_answers_apex_ds(resp, q.name, uerr == .None, allocator)
+	}
+	if memoised_parent != nil && !route_proved {
 		dns.set_id_in_place(forwarded, dns.random_id())
 		again, second, perr := upstream.resolve_answerable(memoised_parent, forwarded, allocator)
 		proved, settled := parent_answers_apex_ds(again, q.name, perr == .None, allocator)
