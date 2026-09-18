@@ -49,13 +49,20 @@ H2_Context :: struct {
 	never waited out at all, which before any stream exists - over the preface, or
 	a frame header - held a connection and a thread with no request ever made.
 
-	It is what one frame may take and not what one connection may, which is the
-	same line the DNS stream draws: a peer that keeps completing frames keeps its
-	connection, as a client that keeps completing messages keeps its own. The two
-	are not quite the same bargain here, because `h2_charged` bills the limiter
-	for requests and a peer can complete SETTINGS and PING frames forever without
-	ever making one. Bounding a connection rather than a frame is a question for
-	every transport at once and is not this budget's to answer.
+	It is what one frame may take and not what one connection may, and on this
+	transport those come apart in a way they do not on the others. A peer that
+	keeps completing frames keeps its connection, as a client that keeps completing
+	DNS messages keeps its own - but a DNS message is charged to `stream_rate_check`
+	and a frame is not: `h2_charged` bills the limiter for requests, and SETTINGS,
+	PING and an unknown type are none of them one. A peer sending the first byte of
+	a frame header late in the idle wait and the other eight inside the deadline
+	that byte starts completes nine bytes per two `client_timeout`s, forever, and
+	holds a connection, a thread and one of `max_connections` while nothing bills
+	it. That is a bound on how long a connection may live with no request on it,
+	which is a policy every transport wants an answer to and a browser holding an
+	idle DoH connection for minutes is the reason it is not an obvious one. It is
+	not this budget's to decide; what this budget ends is the trickle inside a
+	frame, which is the defect it was written for.
 	*/
 	budget: Read_Budget,
 }

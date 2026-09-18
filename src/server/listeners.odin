@@ -1966,31 +1966,6 @@ conn_read :: proc(c: Conn, buf: []u8) -> (n: int, ok: bool) {
 }
 
 /*
-The bound on assembling one message, and the idle wait in front of it.
-
-`client_timeout` reaches the socket as SO_RCVTIMEO, which bounds one read and is
-restarted by every byte that arrives: a client sending one byte inside every wait
-is inside all of them, and holds one of `max_connections` for as long as it cares
-to while no query completes, no budget is charged and nothing else reclaims it.
-RFC 7766 6.2.3 names exactly that and says the idle timeout should be reset "on
-the receipt of a full DNS message, rather than on receipt of any part of a DNS
-message". So the reads that assemble one message share a deadline and shorten as
-it runs down.
-
-`deadline` is zero until the first byte of that message arrives, and that is the
-other half of the rule: a connection between questions is not assembling anything,
-so it waits `idle` for the first byte - which is the figure the idle timeout this
-server advertises states (RFC 7828) - and the message gets the whole of `idle`
-from that byte on. Spending the two out of one budget instead would close on a
-keep-alive client that asked late in the window and had its message split across
-segments, which is a client this server has no complaint about.
-
-A non-positive `idle` is no receive timeout on the socket at all - see
-`test_a_timeout_that_cannot_be_stated_is_left_off` for the other half of what that
-setting means - and leaves both unbounded, rather than turning "wait forever" into
-"give up at once".
-*/
-/*
 The least a TLS handshake gets, whatever a connection's reads are given.
 
 `server_handshake` bounds the handshake as a whole now rather than each read of
@@ -2019,6 +1994,31 @@ handshake_timeout :: proc(client_timeout: time.Duration) -> time.Duration {
 	return client_timeout if client_timeout <= 0 else max(client_timeout, HANDSHAKE_FLOOR)
 }
 
+/*
+The bound on assembling one message, and the idle wait in front of it.
+
+`client_timeout` reaches the socket as SO_RCVTIMEO, which bounds one read and is
+restarted by every byte that arrives: a client sending one byte inside every wait
+is inside all of them, and holds one of `max_connections` for as long as it cares
+to while no query completes, no budget is charged and nothing else reclaims it.
+RFC 7766 6.2.3 names exactly that and says the idle timeout should be reset "on
+the receipt of a full DNS message, rather than on receipt of any part of a DNS
+message". So the reads that assemble one message share a deadline and shorten as
+it runs down.
+
+`deadline` is zero until the first byte of that message arrives, and that is the
+other half of the rule: a connection between questions is not assembling anything,
+so it waits `idle` for the first byte - which is the figure the idle timeout this
+server advertises states (RFC 7828) - and the message gets the whole of `idle`
+from that byte on. Spending the two out of one budget instead would close on a
+keep-alive client that asked late in the window and had its message split across
+segments, which is a client this server has no complaint about.
+
+A non-positive `idle` is no receive timeout on the socket at all - see
+`test_a_timeout_that_cannot_be_stated_is_left_off` for the other half of what that
+setting means - and leaves both unbounded, rather than turning "wait forever" into
+"give up at once".
+*/
 @(private)
 Read_Budget :: struct {
 	idle:     time.Duration,
@@ -2034,6 +2034,13 @@ DoH the socket option stopped applying at the handshake - see there. The wait is
 set on every read rather than only when it changes: the message that ran the
 deadline down leaves a short one behind it, and the idle wait for the next message
 is where that is put back.
+
+What that costs is a `setsockopt` per read on the plain-TCP path where there was
+none before - two per message, one for the idle wait and one for the deadline the
+body is read against, since a deadline running down is a different figure every
+time and there is nothing to skip. Over DoT and DoH it costs an atomic store.
+Keeping a socket armed with a wait the message has already spent is not a
+cheaper version of this, it is the bug.
 
 Floored at a microsecond because `net.set_option` carries the wait to the kernel
 as a `timeval`, and anything under a microsecond truncates to a zero one - which
