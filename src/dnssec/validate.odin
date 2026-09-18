@@ -1701,7 +1701,7 @@ validate_denial :: proc(
 	}
 
 	rcode := dns.rcode_of(msg)
-	refused := budget.nsec3.refused
+	before := nsec3_refusals(&budget.nsec3)
 	proof: Proof = .Failed
 	if rcode == .NX_Domain {
 		proof = nsec_proves_name_error(nsecs, qname, allocator) if len(nsecs) > 0 else .Failed
@@ -1726,15 +1726,14 @@ validate_denial :: proc(
 	NSEC proof, which hashes nothing, would otherwise be filed under an
 	allowance it could not have spent.
 	*/
-	if proof == .Failed && budget.nsec3.refused > refused {
-		// Named apart from the signature budget, in the reason and in the log,
-		// because an operator whose names start failing has to be able to tell
-		// SHA-1 rounds from verifications, and both of those from a zone asking
-		// for more iterations than this server computes - which is the whole
-		// point of saying `Indeterminate` rather than `Bogus`.
-		reason := "nsec3 hashing budget spent" if budget.nsec3.exhausted else "nsec3 iterations above the ceiling"
-		logx.debugf("dnssec: the denial of %s was not read to the end: %s", dns.name_trim_root(qname), reason)
-		return {status = .Indeterminate, reason = reason}
+	// Named apart from the signature budget, in the reason and in the log,
+	// because an operator whose names start failing has to be able to tell
+	// SHA-1 rounds from verifications, and both of those from a zone asking for
+	// more iterations than this server computes - which is the whole point of
+	// saying `Indeterminate` rather than `Bogus`.
+	if declined, why := nsec3_declined(&budget.nsec3, before); proof == .Failed && declined {
+		logx.debugf("dnssec: the denial of %s was not read to the end: %s", dns.name_trim_root(qname), why)
+		return {status = .Indeterminate, reason = why}
 	}
 
 	switch proof {
@@ -2271,7 +2270,7 @@ validate_wildcard_proof :: proc(
 			return .Secure, denial.verified, ""
 		}
 	}
-	refused := budget.nsec3.refused
+	before := nsec3_refusals(&budget.nsec3)
 	if len(denial.nsec3s) > 0 {
 		if cover, covered := nsec3_covering(denial.nsec3s, next_closer, &budget.nsec3); covered {
 			// RFC 5155 section 9.2 forbids the AD bit over an opt-out cover:
@@ -2290,14 +2289,9 @@ validate_wildcard_proof :: proc(
 	difference is everything the server says about it: the bogus count, the log
 	line carrying the client's address, the extended error the answer carries.
 	*/
-	if budget.nsec3.refused > refused {
-		declined := "nsec3 hashing budget spent" if budget.nsec3.exhausted else "nsec3 iterations above the ceiling"
-		logx.debugf(
-			"dnssec: the wildcard proof for %s was not read to the end: %s",
-			dns.name_trim_root(owner),
-			declined,
-		)
-		return .Indeterminate, nil, declined
+	if declined, why := nsec3_declined(&budget.nsec3, before); declined {
+		logx.debugf("dnssec: the wildcard proof for %s was not read to the end: %s", dns.name_trim_root(owner), why)
+		return .Indeterminate, nil, why
 	}
 	return .Bogus, nil, "wildcard expansion not proven"
 }
@@ -2764,6 +2758,7 @@ zone_step :: proc(
 		return .Bogus, nil
 	}
 
+	before := nsec3_refusals(&budget.nsec3)
 	cut_short: bool
 	step, cut_short = denial_step(nsecs, nsec3s, child, parent, &budget.nsec3)
 	/*
@@ -2778,10 +2773,11 @@ zone_step :: proc(
 	wrong zone's keys and reported to the client as a forgery.
 	*/
 	if cut_short {
+		_, why := nsec3_declined(&budget.nsec3, before)
 		logx.debugf(
 			"dnssec: the ds denial for %s was not read to the end (%s); the step is undecided",
 			dns.name_trim_root(child),
-			"nsec3 hashing budget spent" if budget.nsec3.exhausted else "nsec3 iterations above the ceiling",
+			why,
 		)
 		return .Indeterminate, nil
 	}
@@ -2827,7 +2823,7 @@ denial_step :: proc(
 		}
 	}
 	if len(nsec3s) > 0 {
-		refused := nsec3_budget.refused
+		before := nsec3_refusals(nsec3_budget)
 		// A proof that found what it was looking for is a proof that hashed:
 		// nothing refused can return `Proven`, so this one needs no caveat.
 		if nsec3_proves_no_ds(nsec3s, child, parent, nsec3_budget) == .Proven {
@@ -2850,12 +2846,14 @@ denial_step :: proc(
 			if matched {
 				return .No_Cut, false
 			}
-			return .Absent, nsec3_budget.refused > refused
+			absent_declined, _ := nsec3_declined(nsec3_budget, before)
+			return .Absent, absent_declined
 		}
 		// Nothing proven either way: a forgery when the records are what they
 		// look like, and a decision of ours when a hash was refused while this
 		// read. The count says which.
-		return .Bogus, nsec3_budget.refused > refused
+		bogus_declined, _ := nsec3_declined(nsec3_budget, before)
+		return .Bogus, bogus_declined
 	}
 	return .Bogus, false
 }

@@ -229,7 +229,7 @@ test_a_step_whose_hashing_ran_out_is_not_read_as_an_absent_name :: proc(t: ^test
 	}
 	step, cut_short := denial_step(nil, zone, "ent.example.", "example.", &short)
 	testing.expect(t, cut_short, "the step should say it was cut short, rather than leave the caller to read a meter that is the whole question's")
-	testing.expect(t, short.exhausted, "the allowance should have been what stopped this")
+	testing.expect(t, short.spent > 0, "the allowance should have been what stopped this")
 	testing.expectf(t, step != .Absent, "a scan cut short is not a name that is not there, got %v", step)
 	free_all(context.temp_allocator)
 }
@@ -286,7 +286,7 @@ test_a_denial_carrying_two_salts_still_fits_in_one_allowance :: proc(t: ^testing
 	// A name six labels below the apex, so the walk has ancestors to try.
 	proof := nsec3_proves_name_error(both[:], "q.r.s.t.u.v.example.", "example.", &budget)
 	testing.expectf(t, proof == .Proven, "a denial mid-rollover should still prove, got %v", proof)
-	testing.expect(t, !budget.exhausted, "and it should not have taken the whole allowance to do it")
+	testing.expect(t, budget.spent == 0, "and it should not have taken the whole allowance to do it")
 
 	// Two chains, so two hashes a name and not ten. Nine names are asked about:
 	// the question, six ancestors, the next closer name and the wildcard.
@@ -320,7 +320,7 @@ test_a_step_that_matched_is_not_cut_short_by_someone_elses_allowance :: proc(t: 
 	// before it in the question.
 	budget := Nsec3_Budget {
 		max_iterations = 150,
-		exhausted      = true,
+		spent          = 3,
 	}
 	step, cut_short := denial_step(nil, zone, "ent.example.", "example.", &budget)
 	testing.expect_value(t, step, Step.No_Cut)
@@ -368,7 +368,7 @@ test_the_deepest_walk_this_server_follows_fits_in_one_allowance :: proc(t: ^test
 	testing.expectf(t, proof == .Proven, "the denial at the bottom of the walk should prove, got %v", proof)
 	testing.expectf(
 		t,
-		!budget.exhausted,
+		budget.spent == 0,
 		"a walk to the chain-depth limit spent %d rounds of %d",
 		budget.rounds,
 		MAX_NSEC3_ROUNDS_PER_QUERY,

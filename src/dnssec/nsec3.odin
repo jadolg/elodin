@@ -134,15 +134,55 @@ client question, so two arriving at once each get their own. A zero
 Nsec3_Budget :: struct {
 	max_iterations: int,
 	rounds:         int,
-	exhausted:      bool,
-	over_ceiling:   bool,
-	// Hashes declined, for either reason. A caller that wants to know whether
-	// *its own* reading was cut short reads this before and after, because the
-	// two flags above belong to the whole question and stay set once set.
-	refused:        int,
+	/*
+	Hashes this server declined to compute, counted apart by reason: the
+	allowance being gone, and a record asking for more iterations than the
+	ceiling. Counts rather than flags, because what a caller needs to know is
+	whether *its own* reading was cut short and by which refusal - and a flag,
+	once set, belongs to every proof after it as much as to the one that set
+	it. `nsec3_refusals` and `nsec3_declined` are how that question is asked.
+	*/
+	spent:          int,
+	over_ceiling:   int,
 	// The hashes kept from this question's scans, for whatever asks next: see
 	// `Nsec3_Hashes`.
 	hashed:         Nsec3_Hashes,
+}
+
+/*
+The refusals a budget has counted so far, to be held against the same reading
+taken afterwards.
+
+A proof that failed and a proof this server would not finish look identical from
+the verdict, and the difference decides whether a client is told its answer was
+forged. The counts settle it, and they have to be read around the proof in
+question rather than off the budget: an allowance is spent once for the whole
+question, so every proof after the one that spent it would otherwise be filed
+under a refusal that was never its own.
+*/
+@(private)
+Nsec3_Refusals :: struct {
+	spent:        int,
+	over_ceiling: int,
+}
+
+@(private)
+nsec3_refusals :: proc(budget: ^Nsec3_Budget) -> Nsec3_Refusals {
+	return {spent = budget.spent, over_ceiling = budget.over_ceiling}
+}
+
+// Was anything refused since `before`, and which refusal was it? The allowance
+// is named first: a question that ran out of it will meet the ceiling too, and
+// the number an operator has to look at is the one that stopped the proof.
+@(private)
+nsec3_declined :: proc(budget: ^Nsec3_Budget, before: Nsec3_Refusals) -> (declined: bool, reason: string) {
+	if budget.spent > before.spent {
+		return true, "nsec3 hashing budget spent"
+	}
+	if budget.over_ceiling > before.over_ceiling {
+		return true, "nsec3 iterations above the ceiling"
+	}
+	return false, ""
 }
 
 // SHA-1 compresses 64-byte blocks and appends a one-byte pad and an eight-byte
@@ -163,7 +203,7 @@ and the first round hashes the wire name rather than a 20-byte digest, which is
 up to nine blocks of its own. Both are the sender's to choose, so both are
 charged for.
 
-Refusing sets `exhausted` rather than only returning false, because the callers
+Refusing counts itself rather than only returning false, because the callers
 that matter are several proofs up and the difference they have to report is
 between a proof that failed and a proof this server stopped reading.
 */
@@ -174,8 +214,7 @@ spend_nsec3_rounds :: proc(budget: ^Nsec3_Budget, rr: Nsec3, name: string) -> bo
 	// and never an undercharge.
 	cost := sha1_blocks(len(name) + 1 + len(rr.salt)) + int(rr.iterations) * sha1_blocks(20 + len(rr.salt))
 	if budget.rounds + cost > MAX_NSEC3_ROUNDS_PER_QUERY {
-		budget.exhausted = true
-		budget.refused += 1
+		budget.spent += 1
 		return false
 	}
 	budget.rounds += cost
@@ -203,8 +242,7 @@ nsec3_hash_with :: proc(rr: Nsec3, name: string, out: []u8, budget: ^Nsec3_Budge
 	}
 	ceiling := budget.max_iterations if budget.max_iterations > 0 else DEFAULT_MAX_NSEC3_ITERATIONS
 	if int(rr.iterations) > ceiling {
-		budget.over_ceiling = true
-		budget.refused += 1
+		budget.over_ceiling += 1
 		return false
 	}
 	if !spend_nsec3_rounds(budget, rr, name) {
@@ -373,14 +411,6 @@ nsec3_closest_encloser :: proc(
 			}
 			return name, previous, true
 		}
-		// Nothing above this name can be matched either once the hashing
-		// allowance is gone, and the caller tells this failure from a real one
-		// by the refusals counted against it. Only the allowance stops the walk
-		// - a record asking for too many iterations is one record, and the name
-		// above may be matched by another.
-		if budget.exhausted {
-			return "", "", false
-		}
 		if dns.name_equal_fold(name, zone) {
 			return "", "", false
 		}
@@ -449,7 +479,7 @@ nsec3_proves_no_data :: proc(
 	if !covered {
 		return .Failed
 	}
-	refused := budget.refused
+	before := nsec3_refusals(budget)
 	wildcard, wildcard_found := nsec3_matching(n3s, wildcard_of(encloser, allocator), budget)
 	if !wildcard_found {
 		/*
@@ -467,7 +497,7 @@ nsec3_proves_no_data :: proc(
 		was really looked for and really is not there is a finding whatever some
 		earlier proof spent.
 		*/
-		if budget.refused > refused {
+		if declined, _ := nsec3_declined(budget, before); declined {
 			return .Failed
 		}
 		if cover.rr.flags & NSEC3_FLAG_OPT_OUT != 0 {

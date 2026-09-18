@@ -654,7 +654,7 @@ test_nsec3_hashing_is_bounded_across_one_question :: proc(t: ^testing.T) {
 	deep := "a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p.q.r.s.t.u.v.w.example."
 	budget := Nsec3_Budget{}
 	testing.expect_value(t, nsec3_proves_name_error(records[:], deep, "example.", &budget), Proof.Failed)
-	testing.expect(t, budget.exhausted, "the hashing allowance should have been the thing that stopped this")
+	testing.expect(t, budget.spent > 0, "the hashing allowance should have been the thing that stopped this")
 	testing.expectf(
 		t,
 		budget.rounds <= MAX_NSEC3_ROUNDS_PER_QUERY,
@@ -690,7 +690,7 @@ test_an_honest_nsec3_denial_hashes_each_name_once :: proc(t: ^testing.T) {
 	// encloser two labels above it and a next closer name of its own.
 	testing.expect_value(t, nsec3_proves_name_error(zone, "a.b.x.y.w.example.", "example.", &budget), Proof.Proven)
 	testing.expect_value(t, budget.rounds, 4 * (1 + A_ITERATIONS))
-	testing.expect(t, !budget.exhausted, "an eleven-record denial cannot be near the allowance")
+	testing.expect(t, budget.spent == 0, "an eleven-record denial cannot be near the allowance")
 	free_all(context.temp_allocator)
 }
 
@@ -718,7 +718,7 @@ test_nsec3_no_data_does_not_read_a_spent_allowance_as_an_absent_wildcard :: proc
 		max_iterations = A_ITERATIONS,
 	}
 	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.w.example.", "example.", .MX, &whole), Proof.Failed)
-	testing.expect(t, !whole.exhausted, "the proof should fit in a whole allowance")
+	testing.expect(t, whole.spent == 0, "the proof should fit in a whole allowance")
 
 	// One round short of the whole proof, so the hash it is denied is the last
 	// one it asks for - the wildcard. Measured above rather than written down,
@@ -728,7 +728,7 @@ test_nsec3_no_data_does_not_read_a_spent_allowance_as_an_absent_wildcard :: proc
 		rounds         = MAX_NSEC3_ROUNDS_PER_QUERY - whole.rounds + 1,
 	}
 	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.w.example.", "example.", .MX, &starved), Proof.Failed)
-	testing.expect(t, starved.exhausted, "the allowance should have been what stopped this")
+	testing.expect(t, starved.spent > 0, "the allowance should have been what stopped this")
 	free_all(context.temp_allocator)
 }
 
@@ -742,9 +742,8 @@ meter reads zero and the proof simply fails - and a denial that fails is
 a number the zone chose and nobody forged. The refusal is this server's, the
 same as running out of allowance, and it has to reach the caller saying so.
 
-That is what `Nsec3_Budget.refused` carries. `over_ceiling` is what tells the
-two refusals apart afterwards, so the operator reading the log finds out which
-number to look at.
+That is what `Nsec3_Budget.over_ceiling` counts, and counting it apart from
+`spent` is what lets the log name the number an operator has to look at.
 */
 @(test)
 test_nsec3_iterations_above_the_ceiling_are_refused_as_ours :: proc(t: ^testing.T) {
@@ -756,9 +755,51 @@ test_nsec3_iterations_above_the_ceiling_are_refused_as_ours :: proc(t: ^testing.
 		max_iterations = 255,
 	}
 	testing.expect_value(t, nsec3_proves_name_error(zone, "nx.example.", "example.", &budget), Proof.Failed)
-	testing.expect(t, budget.refused > 0, "a record the ceiling refused is a hash this server declined")
-	testing.expect(t, budget.over_ceiling, "and the reason has to be readable afterwards")
-	testing.expect(t, !budget.exhausted, "nothing was hashed, so nothing was spent")
+	testing.expect(t, budget.over_ceiling > 0, "a record the ceiling refused is a hash this server declined")
+	testing.expect(t, budget.spent == 0, "nothing was hashed, so nothing was spent")
 	testing.expect_value(t, budget.rounds, 0)
+	free_all(context.temp_allocator)
+}
+
+/*
+A proof that could not hash always leaves the refusal behind.
+
+The callers tell "this failed" from "this server would not finish" by counting
+refusals across the proof, so a proof that gives up without counting one is a
+proof reported to the client as a forgery. The walk up to the closest encloser
+used to do exactly that: it read the flag on the budget, which belongs to the
+whole question and stays set, and returned - so when the scan it had just made
+was answered out of the kept hashes, and the thing that emptied the allowance
+was some earlier proof, this one charged nothing at all and its caller saw a
+proof that simply failed.
+
+Three steps to stand that up, and all three are shapes a real question makes:
+the question's own hash is in hand from an earlier scan, the allowance was
+emptied by something before this proof, and the names above the question have to
+be hashed to get anywhere.
+*/
+@(test)
+test_a_proof_that_could_not_hash_counts_the_refusal :: proc(t: ^testing.T) {
+	zone := a_zone()
+	budget := Nsec3_Budget {
+		max_iterations = A_ITERATIONS,
+	}
+	// In hand, and paid for.
+	_, found := nsec3_matching(zone, "nx.example.", &budget)
+	testing.expect(t, !found, "nx.example. is not in the zone, which is the point of asking about it")
+	testing.expect(t, budget.rounds > 0, "and asking cost something")
+
+	// Emptied, and emptied by a refusal of somebody else's - which is what
+	// leaves the flag on the budget set for every proof after it.
+	budget.rounds = MAX_NSEC3_ROUNDS_PER_QUERY
+	_, elsewhere := nsec3_matching(zone, "other.example.", &budget)
+	testing.expect(t, !elsewhere, "there is nothing to find with nothing left to hash")
+	testing.expect(t, budget.spent > 0, "the allowance should have refused that one")
+
+	before := nsec3_refusals(&budget)
+	testing.expect_value(t, nsec3_proves_name_error(zone, "nx.example.", "example.", &budget), Proof.Failed)
+	declined, why := nsec3_declined(&budget, before)
+	testing.expect(t, declined, "a proof this server would not finish has to be visible as one to its caller")
+	testing.expect_value(t, why, "nsec3 hashing budget spent")
 	free_all(context.temp_allocator)
 }

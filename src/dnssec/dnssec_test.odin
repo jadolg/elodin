@@ -389,7 +389,7 @@ test_an_nsec_denial_that_fails_is_bogus_even_with_the_hashing_spent :: proc(t: ^
 	v := test_validator()
 	defer destroy_validator(v)
 	spent := Budget {
-		nsec3 = {rounds = MAX_NSEC3_ROUNDS_PER_QUERY, exhausted = true},
+		nsec3 = {rounds = MAX_NSEC3_ROUNDS_PER_QUERY, spent = 3},
 	}
 	result := validate_denial(v, &spent, msg, qname, .NSEC, .IN, u32(FIXTURE_TIME), fixture_now(), context.temp_allocator)
 	testing.expect_value(t, result.status, Status.Bogus)
