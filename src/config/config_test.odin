@@ -5,7 +5,6 @@ import "core:net"
 import "core:strings"
 import "core:testing"
 import "core:time"
-import "elodin:dnssec"
 
 @(private = "file")
 GOOD :: `
@@ -183,41 +182,6 @@ test_defaults_applied :: proc(t: ^testing.T) {
 	// A configuration that says nothing about DNSSEC still validates.
 	testing.expect(t, cfg.dnssec.enabled, "DNSSEC validation should be on by default")
 	testing.expect_value(t, cfg.dnssec.max_nsec3_iterations, 100)
-	free_all(context.temp_allocator)
-}
-
-@(test)
-test_nsec3_iteration_ceiling_is_held_to_what_a_query_can_pay_for :: proc(t: ^testing.T) {
-	/*
-	The ceiling is a per-record refusal, and the validator's own per-question
-	hashing allowance is the other half of the bound. Set high enough, the
-	ceiling stops meaning "accept more" and starts meaning "accept nothing": a
-	single record costs more than a whole query may spend, so every NSEC3 denial
-	is answered `Indeterminate` and every name in such a zone comes back
-	SERVFAIL. Refused at load, where it is one line of output, rather than in
-	production, where it is a resolver that came up fine and answers nothing.
-	*/
-	high := fmt.tprintf("dnssec:\n  max_nsec3_iterations: %d\n", dnssec.MAX_NSEC3_ITERATIONS_LIMIT + 1)
-	_, high_err := load_string(high, context.temp_allocator)
-	e, refused := high_err.?
-	if testing.expect(t, refused, "a ceiling past the query allowance was accepted") {
-		named := false
-		for msg in e.messages {
-			if strings.contains(msg, "dnssec.max_nsec3_iterations must not exceed") {
-				named = true
-			}
-		}
-		testing.expectf(t, named, "no error named the ceiling; got %v", e.messages)
-	}
-
-	fine := fmt.tprintf(
-		"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  max_nsec3_iterations: %d\n",
-		dnssec.MAX_NSEC3_ITERATIONS_LIMIT,
-	)
-	cfg, err := load_string(fine, context.temp_allocator)
-	_, has := err.?
-	testing.expect(t, !has, "the limit itself should load")
-	testing.expect_value(t, cfg.dnssec.max_nsec3_iterations, dnssec.MAX_NSEC3_ITERATIONS_LIMIT)
 	free_all(context.temp_allocator)
 }
 

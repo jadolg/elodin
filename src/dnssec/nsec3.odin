@@ -78,7 +78,16 @@ and a name error four hashes, or five for a name two labels below its closest
 encloser. A name eight labels deep in a zone sitting at the default ceiling of
 100 therefore comes to something like 3000 rounds, and at the configurable
 ceiling of `MAX_NSEC3_ITERATIONS_LIMIT` to something like 7500 - inside the
-allowance, and not by much, which is the point of that limit. A question that
+allowance, and not by much, which is the point of that limit.
+
+Those numbers are for a salt of the length zones actually publish, up to the
+thirty-five bytes that still fit one compression block beside the digest. A
+longer one doubles them, and a zone publishing a 40-byte salt at the default
+ceiling can put a deep enough name past the allowance. Nothing in use is
+anywhere near that pair of choices - the salt exists to stop precomputation
+across zones, which a few bytes does - and what such a name gets is
+`Indeterminate`, which is this server saying it did not finish rather than that
+the zone is wrong. A question that
 wants more is answered `Indeterminate`, never `Bogus`: this is an allowance of
 ours running out, not a proof found wanting.
 */

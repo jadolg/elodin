@@ -930,10 +930,9 @@ zero and the zones still publishing NSEC3 use single digits. A query has a
 hashing allowance of its own on top of this, so values above 255 are refused at
 startup: past there the allowance is what answers, and the zones a higher
 ceiling admits are the ones whose proofs it cannot pay for, which is SERVFAIL
-rather than more validation. That bound is new, and it is checked at startup: a
-configuration carrying a larger number - legal before, and only ever more
-restrictive at runtime - is refused rather than started, so an upgrade from a
-version without it wants that line lowered first.
+rather than more validation. A larger number in the configuration is held down
+to 255 at startup, with a line in the log saying so, rather than refused: a
+resolver that will not come up is worse than either.
 
 Being a forwarder rather than a recursor, elodin fetches the material it
 validates against: every DS and DNSKEY down from the root, through the configured

@@ -186,6 +186,40 @@ test_an_nsec3_name_error_that_runs_out_of_hashing_is_indeterminate :: proc(t: ^t
 	}
 	result := validate_denial(v, &short, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 	testing.expect_value(t, result.status, Status.Indeterminate)
-	testing.expect_value(t, result.reason, "verification budget spent")
+	// Named apart from the signature budget: an operator reading this has to be
+	// able to tell which allowance ran out.
+	testing.expect_value(t, result.reason, "nsec3 hashing budget spent")
+	free_all(context.temp_allocator)
+}
+
+/*
+A ceiling the allowance cannot pay for is held down, not obeyed.
+
+`dnssec.max_nsec3_iterations` is an operator's number and
+`MAX_NSEC3_ROUNDS_PER_QUERY` is this package's, and above
+`MAX_NSEC3_ITERATIONS_LIMIT` the second is what answers: the zones a higher
+ceiling admits are the ones whose proofs the allowance cannot pay for, so the
+setting reads as laxer and acts as SERVFAIL for names that were being served.
+
+Held here, where the arithmetic is, rather than refused wherever the option came
+from. A configuration carrying a larger number was legal before this bound
+existed, and refusing it would mean a resolver that does not come up after an
+upgrade - a worse answer than either of the ones this is choosing between.
+*/
+@(test)
+test_an_iteration_ceiling_past_the_allowance_is_held_down :: proc(t: ^testing.T) {
+	v := make_validator(n3_query, nil, Options{max_nsec3_iterations = MAX_NSEC3_ITERATIONS_LIMIT + 1})
+	defer destroy_validator(v)
+	testing.expect_value(t, v.max_nsec3_iterations, MAX_NSEC3_ITERATIONS_LIMIT)
+
+	under := make_validator(n3_query, nil, Options{max_nsec3_iterations = 10})
+	defer destroy_validator(under)
+	testing.expect_value(t, under.max_nsec3_iterations, 10)
+
+	// Unset still means the shipped default, which is what `make_validator`
+	// has always done with a zero here.
+	unset := make_validator(n3_query, nil, Options{})
+	defer destroy_validator(unset)
+	testing.expect_value(t, unset.max_nsec3_iterations, DEFAULT_MAX_NSEC3_ITERATIONS)
 	free_all(context.temp_allocator)
 }

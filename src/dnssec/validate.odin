@@ -309,7 +309,24 @@ make_validator :: proc(
 	v.query = query
 	v.query_ctx = query_ctx
 	v.anchors = opts.anchors if len(opts.anchors) > 0 else root_anchors()
+	/*
+	The ceiling belongs to the same arithmetic as the allowance, so it is held
+	to `MAX_NSEC3_ITERATIONS_LIMIT` here rather than wherever the option came
+	from. Above that the allowance is what answers - the zones a higher ceiling
+	admits are the ones whose proofs it cannot pay for - so a bigger number can
+	only turn zones that were being served as insecure into SERVFAIL. Held down
+	rather than refused, and said out loud, because refusing is a resolver that
+	does not come up after an upgrade, which is worse than either.
+	*/
 	v.max_nsec3_iterations = opts.max_nsec3_iterations if opts.max_nsec3_iterations > 0 else DEFAULT_MAX_NSEC3_ITERATIONS
+	if v.max_nsec3_iterations > MAX_NSEC3_ITERATIONS_LIMIT {
+		logx.warnf(
+			"dnssec: max_nsec3_iterations %d is past what one query's hashing allowance can pay for; using %d",
+			v.max_nsec3_iterations,
+			MAX_NSEC3_ITERATIONS_LIMIT,
+		)
+		v.max_nsec3_iterations = MAX_NSEC3_ITERATIONS_LIMIT
+	}
 	v.max_cached_zones = opts.max_cached_zones if opts.max_cached_zones > 0 else DEFAULT_MAX_CACHED_ZONES
 	v.zones = make(map[string]^Zone_Entry, 64, allocator)
 	return v
@@ -1707,7 +1724,15 @@ validate_denial :: proc(
 	allowance of ours.
 	*/
 	if proof == .Failed && len(nsec3s) > 0 && budget.nsec3.exhausted {
-		return {status = .Indeterminate, reason = "verification budget spent"}
+		// Named apart from the signature budget, in the reason and in the log,
+		// because an operator whose deep names start failing has to be able to
+		// tell SHA-1 rounds from verifications - which is the whole point of
+		// saying `Indeterminate` rather than `Bogus`.
+		logx.debugf(
+			"dnssec: the denial of %s ran out of nsec3 hashing before it was proven",
+			dns.name_trim_root(qname),
+		)
+		return {status = .Indeterminate, reason = "nsec3 hashing budget spent"}
 	}
 
 	switch proof {
@@ -2265,7 +2290,11 @@ validate_wildcard_proof :: proc(
 	address, the extended error the answer carries.
 	*/
 	if len(denial.nsec3s) > 0 && budget.nsec3.exhausted {
-		return .Indeterminate, nil, "verification budget spent"
+		logx.debugf(
+			"dnssec: the wildcard proof for %s ran out of nsec3 hashing before a cover was found",
+			dns.name_trim_root(owner),
+		)
+		return .Indeterminate, nil, "nsec3 hashing budget spent"
 	}
 	return .Bogus, nil, "wildcard expansion not proven"
 }
@@ -2746,6 +2775,10 @@ zone_step :: proc(
 	wrong zone's keys and reported to the client as a forgery.
 	*/
 	if cut_short {
+		logx.debugf(
+			"dnssec: the ds denial for %s ran out of nsec3 hashing; the step is undecided",
+			dns.name_trim_root(child),
+		)
 		return .Indeterminate, nil
 	}
 	if step == .Insecure {
