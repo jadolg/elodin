@@ -2382,6 +2382,18 @@ verified_rrset :: proc(
 		still comes back with no encloser and still passes.
 		*/
 		result, encloser := check_signature(sig, owner, class, records, keys, unix, allocator)
+		if result == .Ok && encloser != "" {
+			// Said out loud, because the two ways to reach it look identical
+			// from the verdict: a relocated record, and a signer that wildcard
+			// signed one it should not have. Without this the operator of a
+			// zone doing the second reads only `no denial of existence`.
+			logx.debugf(
+				"dnssec: %s %s verified against %s but its signature expanded a wildcard; the set is dropped",
+				dns.type_name(type),
+				dns.name_trim_root(owner),
+				dns.name_trim_root(encloser),
+			)
+		}
 		if result == .Ok && encloser == "" {
 			return records, sig.signer, sig, true, false
 		}
@@ -3134,7 +3146,19 @@ dname_covered :: proc(
 		if !dname_synthesizes(rec.name, dname.name, cname.name, target.name, allocator) {
 			continue
 		}
-		// Only now is it worth checking the DNAME itself, which costs a walk.
+		/*
+		Only now is it worth checking the DNAME itself, which costs a walk.
+
+		The status alone, deliberately. A DNAME may sit at a wildcard like any
+		other type, so a legitimate redirection through one carries an RRSIG a
+		label short, and refusing that here is every name behind every wildcard
+		DNAME. What holds the expansion to account is that this record is in the
+		answer section, so `validate_answer`'s own loop reaches the same RRset,
+		records the encloser and makes the RFC 4035 section 5.3.4 proof a
+		condition of the message - which is not a local property. A caller that
+		ever consults a DNAME from somewhere other than `msg.answer` has to
+		bring that proof with it. `wildcard_denial_test.odin` pins both halves.
+		*/
 		records := records_of(msg.answer, rec.name, .DNAME, class, allocator)
 		sigs := sigs_covering(msg.answer, rec.name, .DNAME, class, allocator)
 		status, _, _, _, _ := validate_rrset(v, budget, rec.name, .DNAME, class, records, sigs, unix, now, allocator)
