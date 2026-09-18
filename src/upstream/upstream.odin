@@ -293,12 +293,12 @@ the sweep is where the decision is made and where the member that was passed
 over is known. It names that member and not the one that answered, which is the
 question an operator has - which of these should I go and look at.
 
-Counted once per sweep that reaches somebody, rather than per reply refused: the
-group whose every member answers this way pays the most exchanges of anyone and
-is counted, and a lone upstream - or a group whose every other member is parked
-- sweeps nobody, costs nothing extra and is counted nowhere. So the series is
-the extra exchanges this reply cost the group, which is what an operator reading
-it wants it to be.
+Counted once per sweep that goes on to ask somebody, which is the figure to read
+it as: replies from this member that sent the group looking elsewhere. Not the
+number of extra exchanges - a group of four counts one for a sweep that asks
+three of them - and not every refused reply either: a lone upstream, or a group
+whose other members are all parked or already unreachable on this query, asks
+nobody and is counted nowhere, because nothing was spent.
 
 Not confined to the rcodes a client's own question refuses, either.
 `resolve_insisting` is shared with the chain lookups, where `answerable` will

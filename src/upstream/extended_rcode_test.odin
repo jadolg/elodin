@@ -701,3 +701,100 @@ test_a_lone_upstreams_servfail_is_still_the_clients_answer :: proc(t: ^testing.T
 	// cost none. See `note_swept_rcode`.
 	testing.expect_value(t, stats_of(bad).swept_rcode, u64(0))
 }
+
+/*
+And the sweep does not spend a second timeout on a member this query already
+failed to reach.
+
+The cooldown does not cover it: `FAILURE_THRESHOLD` is three, so the first two
+timeouts cost `g.timeout` each and leave the server `healthy`. A group of one
+member that is not there and one that answers REFUSED is the shape - the first
+is asked by `resolve` and times out, the second answers, and the reply is one the
+sweep will not take. Before this the sweep asked the dead member again, and a
+question that cost one timeout cost two.
+
+A socket bound and closed gives an address nothing is listening on, which is a
+timeout rather than a refusal on UDP. The timeout is 200ms and the assertion is
+that the whole call comes in under three of them: the fixture cannot see a
+skipped exchange, only the wait it would have cost.
+*/
+@(test)
+test_the_sweep_does_not_wait_again_on_a_member_that_timed_out :: proc(t: ^testing.T) {
+	dead_socket, derr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, derr == nil, "cannot bind the dead port: %v", derr) {
+		return
+	}
+	dead_bound, berr := net.bound_endpoint(dead_socket)
+	net.close(dead_socket)
+	if !testing.expectf(t, berr == nil, "cannot read the dead port: %v", berr) {
+		return
+	}
+
+	dead, uerr := make_upstream(
+		config.Upstream_Spec {
+			name = "dead",
+			kind = .UDP,
+			address = "127.0.0.1",
+			port = dead_bound.port,
+		},
+		0,
+		time.Second,
+		context.allocator,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot build the dead upstream: %v", uerr) {
+		return
+	}
+	defer destroy(dead)
+
+	refusing := Canned_Mock{}
+	ref, ref_thread, ref_ok := start_canned_mock(t, &refusing, "refusing", canned_reply(0, .Refused))
+	if !ref_ok {
+		return
+	}
+	defer {
+		sync.atomic_store(&refusing.stop, true)
+		thread.join(ref_thread)
+		thread.destroy(ref_thread)
+		net.close(refusing.socket)
+		destroy(ref)
+	}
+
+	servers := make([]^Upstream, 2, context.allocator)
+	defer delete(servers, context.allocator)
+	servers[0] = dead
+	servers[1] = ref
+
+	TIMEOUT :: 200 * time.Millisecond
+	g := Group {
+		servers   = servers,
+		strategy  = .Failover,
+		timeout   = TIMEOUT,
+		attempts  = 1,
+		allocator = context.allocator,
+	}
+
+	wire := canned_query()
+	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
+
+	started := time.now()
+	resp, winner, err := resolve_readable(&g, wire, context.allocator)
+	spent := time.since(started)
+
+	testing.expect_value(t, err, Error.None)
+	testing.expect_value(t, winner, ref)
+	testing.expect_value(t, dns.peek_rcode(resp), dns.Rcode.Refused)
+	delete(resp, context.allocator)
+
+	// One timeout and a datagram, against a threshold of two: the exact signal
+	// is the counter below, and this is the wall clock saying what it buys.
+	testing.expectf(
+		t,
+		spent < 2 * TIMEOUT,
+		"the query took %v, which is the dead member's timeout paid twice",
+		spent,
+	)
+
+	// And the member that was never asked a second time is not counted as one
+	// the group swept past to: nobody was asked, so nothing was spent.
+	testing.expect_value(t, stats_of(ref).swept_rcode, u64(0))
+}

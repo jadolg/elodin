@@ -1,6 +1,7 @@
 package upstream
 
 import "core:mem"
+import "core:slice"
 import "core:sync"
 import "core:time"
 import "elodin:config"
@@ -79,6 +80,10 @@ resolve :: proc(
 	g: ^Group,
 	query: []u8,
 	allocator := context.allocator,
+	// Where non-nil, every member this call asked and could not reach is
+	// appended. `resolve_insisting` reads it so its sweep does not spend
+	// another `g.timeout` on a server that has just proved silent; see there.
+	unreachable: ^[dynamic]^Upstream = nil,
 ) -> (
 	response: []u8,
 	winner: ^Upstream,
@@ -89,9 +94,9 @@ resolve :: proc(
 		return resolve_race(g, query, allocator)
 	case .Round_Robin:
 		start := int(sync.atomic_add(&g.cursor, 1) % u64(len(g.servers)))
-		return resolve_sequential(g, query, start, allocator)
+		return resolve_sequential(g, query, start, allocator, unreachable)
 	case .Failover:
-		return resolve_sequential(g, query, 0, allocator)
+		return resolve_sequential(g, query, 0, allocator, unreachable)
 	}
 	return nil, nil, .IO_Error
 }
@@ -197,7 +202,11 @@ resolve_insisting :: proc(
 	winner: ^Upstream,
 	err: Error,
 ) {
-	response, winner, err = resolve(g, query, allocator)
+	// Scratch, on the request's own thread, whose arena the caller resets - and
+	// only ever as long as the group.
+	unreachable := make([dynamic]^Upstream, 0, len(g.servers), context.temp_allocator)
+
+	response, winner, err = resolve(g, query, allocator, &unreachable)
 	if err != .None || acceptable(response) {
 		return response, winner, err
 	}
@@ -270,17 +279,34 @@ resolve_insisting :: proc(
 	exchange for it instead, and the upgrade path above is what would fix it in
 	place.
 	*/
-	// Counted against the member that was passed over, once, the first time
-	// this actually asks somebody else - so the series measures exchanges this
-	// reply cost the group and nothing else. A lone upstream, or a group whose
-	// every other member is parked, sweeps nobody and is counted nowhere; a
-	// group that asks them all and still comes back with the first reply is
-	// counted once, which is the arrangement paying the most for this.
-	// `note_swept_rcode` says why nothing else records it at all.
+	// Counted against the member that was passed over, once per sweep that
+	// reaches somebody - not once per exchange the sweep then makes, so a group
+	// of four that asks three of them still counts one. A lone upstream, or a
+	// group whose every other member is either parked or already unreachable on
+	// this query, asks nobody and is counted nowhere. `note_swept_rcode` says
+	// why nothing else records it at all.
 	counted := false
 
 	for u in g.servers {
 		if u == winner {
+			continue
+		}
+		/*
+		And a server this very call already failed to reach is skipped too,
+		which the cooldown above does not cover: three consecutive failures is
+		what parks a server, so the first two cost `g.timeout` each and leave it
+		`healthy`. Without this, a group of one unreachable member and one that
+		answers REFUSED pays that timeout twice for one question - once in
+		`resolve`, once more here - to be handed the same REFUSED, which is a
+		second `timeout` added to a query that took one before issue #309.
+
+		Only what this call proved. A failure from a minute ago is somebody
+		else's news and the member goes on being asked, because a group whose
+		second member is reached only when the first breaks would otherwise
+		carry a stale failure for as long as the first one holds.
+		*/
+		if slice.contains(unreachable[:], u) {
+			logx.debugf("upstream %s did not answer this query, not asked again for it", u.spec.name)
 			continue
 		}
 		if !healthy(u) {
@@ -390,10 +416,18 @@ SERVFAIL from an upstream in its default configuration may well carry nothing to
 read, and this check will let the sweep go on.
 
 Which is why it is a second line rather than the defence. `dnssec.enabled` is on
-as elodin ships, and with it on `validate` refuses the forgery whichever member
-of the group supplied it. What this covers is the deployment that turned it off
-and left a mixed group behind - and it covers as much of it as the upstream is
-willing to say.
+as elodin ships, and with it on two things are true at once: the question goes
+out with CD set, so a validating upstream hands over the bogus data rather than
+a SERVFAIL and there is no extended error to read at all, and `validate` refuses
+that data here whichever member of the group supplied it. What this covers is
+the deployment that turned validation off and left a mixed group behind - and it
+covers as much of it as the upstream is willing to say.
+
+With validation off the question goes out as the client wrote it, which adds a
+precondition of its own: a client that asked without EDNS gets a reply that
+cannot legally carry an OPT record, so it cannot carry an extended error either,
+and the sweep goes on. A stub that asks with EDNS - which most resolvers and
+every DNSSEC-aware client do - is what this can protect.
 
 Only the first extended error in a reply is read, which is what
 `peek_edns_option` returns. RFC 8914 section 2 permits several, and a reply
@@ -405,6 +439,19 @@ Codes 6 to 12 of RFC 8914 section 4 - bogus, the two signature-validity ones,
 DNSKEY and RRSIG missing, the zone key bit, NSEC missing. Not 0 (`Other`), which
 carries no such claim, and not the policy codes: a REFUSED or a SERVFAIL over an
 ACL is exactly what the sweep is for.
+
+The cost of believing any of them is that a validator which is itself broken
+holds the group. A member whose clock has drifted says Signature Expired about
+every signed name it is asked; one carrying a stale root key says DNSSEC Bogus
+about them just as widely. Either pins this server on that member for those
+names and no failover happens - issue #309's own failure, for the subset of
+names that are signed. The two cannot be told apart from here: a validator that
+has found a zone bogus and a validator that is wrong about every zone send the
+same bytes, and reading the claim is the only way to protect the client that
+this does not cover otherwise. So it stands, with the remedy being the
+`dnssec.enabled` that is on by default - where elodin decides this for itself -
+or an operator taking the broken member out of the group. Narrowing the set to
+code 6 alone would not change the shape, only which broken validator does it.
 */
 @(private)
 BOGUS_EDE_FIRST :: 6
@@ -461,6 +508,7 @@ resolve_sequential :: proc(
 	query: []u8,
 	start: int,
 	allocator: mem.Allocator,
+	unreachable: ^[dynamic]^Upstream = nil,
 ) -> (
 	response: []u8,
 	winner: ^Upstream,
@@ -482,6 +530,9 @@ resolve_sequential :: proc(
 				return resp, u, .None
 			}
 			last_err = xerr
+			if unreachable != nil {
+				append(unreachable, u)
+			}
 			logx.debugf("upstream %s failed: %v", u.spec.name, xerr)
 		}
 	}

@@ -808,14 +808,16 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 	failure, so the member that is doing it holds a clean
 	`elodin_upstream_failures_total` and an `elodin_upstream_up` of 1 while
 	every query through the group costs an extra exchange. This is the figure
-	that names it, and it counts only sweeps that reached somebody, so it is
-	the extra exchanges rather than the refused replies.
+	that names it. One per sweep that went on to ask somebody, rather than one
+	per exchange it then made or one per reply refused: a group with nowhere
+	left to ask counts nothing, and a group of four counts one for a sweep that
+	asks three.
 	*/
 	metrics.family(
 		b,
 		"elodin_upstream_swept_rcode_total",
 		.Counter,
-		"Replies from each upstream that another member of its group was asked to answer instead: for a client's own question a SERVFAIL, a REFUSED or an rcode it could not read; for a DNSSEC chain lookup anything that is not NOERROR or NXDOMAIN.",
+		"Replies from each upstream that sent the group to ask another member instead, one per such reply: for a client's own question a SERVFAIL, a REFUSED or an rcode it could not read; for a DNSSEC chain lookup anything that is not NOERROR or NXDOMAIN.",
 	)
 	for u in all {
 		metrics.sample(b, "elodin_upstream_swept_rcode_total", u.swept, metrics.Label{"upstream", u.name})
