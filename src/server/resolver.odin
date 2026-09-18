@@ -191,6 +191,16 @@ Server :: struct {
 	// The per-domain upstreams, in configuration order. Empty on a server that
 	// forwards everything to one place.
 	routes:       []Zone_Route,
+	/*
+	Which routed apexes the parent's group would not settle a `DS` for, and
+	until when.
+
+	Only the apex `DS` carve-out reads or writes it, and only to decide whether
+	to spend a client's query on a parent that has just proved it cannot answer
+	this question. `Apex_Memo` argues it in full; the zero value is no memory of
+	anything, which is what a `Server` built as a literal wants.
+	*/
+	apex_memo:    Apex_Memo,
 	answers:      ^cache.Cache,
 	filters:      ^filter.Engine,
 	validator:    ^dnssec.Validator,
@@ -1551,10 +1561,46 @@ resolve_query :: proc(
 	already covered.
 	*/
 	unproven_apex_ds := false
-	if apex_ds && own != asked && !group_reachable(asked) && group_reachable(own) {
-		logx.debugf("query DS %s: the parent's group is parked, asking the route instead", q.name)
-		asked = own
-		unproven_apex_ds = true
+	/*
+	The parent's group when the memory below is what sent this question to the
+	route, and nil in every other arrangement.
+
+	Held because that arrangement is the one that passes over a group which is
+	*not* parked. Three consecutive failures is what parks one, and the skip
+	above waits for them; the memory stands on a single reply that settled
+	nothing, which an upstream can produce while answering everything else
+	perfectly well. So a route that then cannot answer has to be able to reach
+	past it, and the group to reach for is this one. See the fallback below the
+	exchange.
+	*/
+	memoised_parent: ^upstream.Group
+	if apex_ds && own != asked && group_reachable(own) {
+		/*
+		Or when the parent's group was asked this same question inside the last
+		cooldown and settled nothing, which is the other way this wait is known
+		to be wasted before it is spent. `Apex_Memo` argues it: a group that is
+		answering REFUSED to every `DS` never accrues a failure and so is never
+		parked, and a group behind a blackholed uplink is unparked again every
+		ten seconds however many times it has failed, so `group_reachable` alone
+		leaves both of those paid for by every query. What the memory changes is
+		which group is asked first, not what the client is told: the route
+		answers either way, `unproven_apex_ds` keeps that answer out of the cache
+		exactly as it does above, and where the route cannot answer at all the
+		parent is asked after all.
+		*/
+		if !group_reachable(asked) {
+			logx.debugf("query DS %s: the parent's group is parked, asking the route instead", q.name)
+			asked = own
+			unproven_apex_ds = true
+		} else if apex_ds_memo_applies(s, q.name) {
+			logx.debugf(
+				"query DS %s: the parent's group settled nothing for this apex inside the last cooldown, asking the route instead",
+				q.name,
+			)
+			memoised_parent = asked
+			asked = own
+			unproven_apex_ds = true
+		}
 	}
 	resp: []u8
 	winner: ^upstream.Upstream
@@ -1630,6 +1676,13 @@ resolve_query :: proc(
 		whether the route's answer is kept: see the store below.
 		*/
 		proved, settled := parent_answers_apex_ds(resp, q.name, uerr == .None, allocator)
+		/*
+		And what it managed to say is remembered, for the next query rather than
+		for this one. Settled or not is the whole of it - no answer is kept, and
+		the memory only decides whether the next client's apex `DS` waits on this
+		group again inside the cooldown. See `Apex_Memo`.
+		*/
+		remember_apex_ds_parent(s, q.name, uerr == .None, settled)
 		if !proved {
 			/*
 			Two lines rather than one with both fields, because there is no
@@ -1690,6 +1743,78 @@ resolve_query :: proc(
 					aerr,
 				)
 				uerr = aerr
+			}
+		}
+	}
+	/*
+	And the parent is asked after all when the route the memory chose could not
+	answer at all.
+
+	The memory is of a wait worth saving, not of a group worth giving up on:
+	what wrote it is one reply that settled nothing, and an upstream that
+	SERVFAILs a `DS` it does not like, or loses one datagram, is not an upstream
+	that has stopped answering - three consecutive failures would be, and that
+	is the parked-group skip above, which reaches past nothing because there is
+	nothing left to reach. Here there is. Without this, one unsettled reply
+	would turn the next ten seconds of a route's own outage into SERVFAIL for a
+	zone whose parent had recovered and was holding the proof - which is issue
+	#227's failure, arriving through the saving meant to prevent it.
+
+	Where the route did not answer what the memory bet it would: a NODATA at the
+	apex, the unsigned twin of the proof and the answer the parent's own silence
+	would have left this client with. `parent_answers_apex_ds` is the test, read
+	over the route's reply rather than the parent's, because the question it
+	answers is the same one - is this the statement that the delegation carries
+	no DS - and only the signatures beside it differ.
+
+	Everything else fails it, and each for a reason that is the parent's to
+	settle rather than the route's. A reply that never came. A SERVFAIL or a
+	REFUSED, which `resolve_readable` hands back as a perfectly good reply - the
+	rcode is the client's answer, which is the ordinary reading of a client's
+	question and the right one when the route was asked second, but an internal
+	authority that is up and failing must not stand as the answer while the
+	parent holds the proof. An NXDOMAIN, a `DS` RRset, a NOERROR somebody
+	rewrote: each is a statement about this delegation that the parent, not the
+	route, is the authority for, and the memory must not be what decides that the
+	route's version of it is the one the client gets.
+
+	Where the parent still settles nothing, the route's reply stands exactly as
+	it would have after the wait - this changes which group is asked first, and
+	not how either one is read.
+
+	And only the proof is taken from it, on the same terms the first exchange
+	takes it: an NXDOMAIN or a rewritten rcode is a statement this client is no
+	better for being handed - `apex_ds_off_route` argues each - and the route's
+	own failure standing is what the query is, which the error path below turns
+	into stale-if-there-is-any and SERVFAIL otherwise. What the parent managed
+	to say is written down either way, so a parent that has come back stops
+	being skipped from here on.
+
+	A fresh transaction ID for the same reason the second exchange draws one:
+	each exchange is a new one on the wire (RFC 5452 section 9.2).
+	*/
+	if memoised_parent != nil {
+		route_proved, _ := parent_answers_apex_ds(resp, q.name, uerr == .None, allocator)
+		if !route_proved {
+			dns.set_id_in_place(forwarded, dns.random_id())
+			again, second, perr := upstream.resolve_answerable(memoised_parent, forwarded, allocator)
+			proved, settled := parent_answers_apex_ds(again, q.name, perr == .None, allocator)
+			remember_apex_ds_parent(s, q.name, perr == .None, settled)
+			/*
+			And whether what is served from here is kept turns on what the parent
+			managed to say, exactly as it does when the parent is asked first: the
+			route's reply standing in for an NXDOMAIN or a `DS` RRset is standing in
+			for a fact about the public tree, which holds until the public tree
+			changes, and standing in for nothing established is what the store
+			refuses. Read once for both replies, the proof being `settled` too.
+			*/
+			unproven_apex_ds = !settled
+			if proved {
+				logx.debugf(
+					"query DS %s: the route had no answer, and the parent proved the delegation carries no DS after all",
+					q.name,
+				)
+				resp, winner, uerr = again, second, .None
 			}
 		}
 	}

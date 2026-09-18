@@ -158,6 +158,20 @@ leak_server :: proc(
 		return {}, nil, false
 	}
 
+	/*
+	The arena, so that a case which ends by resetting it takes the mock with it
+	rather than leaving it to a tracking allocator to report.
+
+	Which is why every caller copies `x.socket` into a local before deferring
+	the close: a `defer` runs after the last statement of the scope, and the
+	last statement of most of these cases is `free_all(context.temp_allocator)`.
+	Read through `x` after that, the handle is whatever the freed arena now
+	holds - usually zero, and `net.close` of a zero handle closes file
+	descriptor 0. That descriptor is stdin in an ordinary run and a *parallel
+	test's socket* under `odin test`, which closes stdin before the binary
+	starts: the victim then sees its own socket stop working for no reason it
+	can see. It cost an afternoon once; the copy is one line.
+	*/
 	x := new(Leak_Mock, context.temp_allocator)
 	x^ = Leak_Mock {
 		socket = socket,
@@ -292,7 +306,8 @@ test_special_use_names_are_not_sent_to_the_upstream :: proc(t: ^testing.T) {
 		if !built {
 			return
 		}
-		defer net.close(x.socket)
+		x_socket := x.socket
+		defer net.close(x_socket)
 		defer upstream.destroy_group(s.group)
 
 		out, outcome, ok := handle_query(&s, leak_query(c.name, c.type), .UDP, "127.0.0.1:5555", context.temp_allocator)
@@ -416,7 +431,8 @@ test_a_default_configuration_still_forwards_local_test_and_example :: proc(t: ^t
 		if !built {
 			return
 		}
-		defer net.close(x.socket)
+		x_socket := x.socket
+		defer net.close(x_socket)
 		defer upstream.destroy_group(s.group)
 
 		mock := thread.create_and_start_with_poly_data(x, serve_leak)
@@ -460,7 +476,8 @@ test_the_home_arpa_apex_ds_is_still_forwarded :: proc(t: ^testing.T) {
 		if !built {
 			return
 		}
-		defer net.close(x.socket)
+		x_socket := x.socket
+		defer net.close(x_socket)
 		defer upstream.destroy_group(s.group)
 
 		mock := thread.create_and_start_with_poly_data(x, serve_leak)
@@ -511,7 +528,8 @@ test_a_tor_aware_upstream_can_be_given_onion_back :: proc(t: ^testing.T) {
 	if !built {
 		return
 	}
-	defer net.close(x.socket)
+	x_socket := x.socket
+	defer net.close(x_socket)
 	defer upstream.destroy_group(s.group)
 
 	mock := thread.create_and_start_with_poly_data(x, serve_leak)
@@ -607,7 +625,8 @@ check_onion_is_not_validated :: proc(t: ^testing.T, label: string, apply: proc(c
 	if !built {
 		return
 	}
-	defer net.close(x.socket)
+	x_socket := x.socket
+	defer net.close(x_socket)
 	defer upstream.destroy_group(s.group)
 
 	s.validator = dnssec.make_validator(tor_has_no_chain, nil, dnssec.Options{})
@@ -752,7 +771,8 @@ test_the_special_use_counter_counts_only_what_the_table_answered :: proc(t: ^tes
 		if !built {
 			return
 		}
-		defer net.close(x.socket)
+		x_socket := x.socket
+		defer net.close(x_socket)
 		defer upstream.destroy_group(s.group)
 
 		_, _, _ = handle_query(&s, leak_query(name), .UDP, "127.0.0.1:5555", context.temp_allocator)
@@ -777,7 +797,8 @@ test_the_special_use_counter_counts_only_what_the_table_answered :: proc(t: ^tes
 		if !built {
 			return
 		}
-		defer net.close(x.socket)
+		x_socket := x.socket
+		defer net.close(x_socket)
 		defer upstream.destroy_group(s.group)
 
 		mock := thread.create_and_start_with_poly_data(x, serve_leak)
@@ -890,7 +911,8 @@ test_an_anchor_over_onion_beats_the_key_that_forwards_it :: proc(t: ^testing.T) 
 	if !built {
 		return
 	}
-	defer net.close(x.socket)
+	x_socket := x.socket
+	defer net.close(x_socket)
 	defer upstream.destroy_group(s.group)
 
 	s.validator = dnssec.make_validator(tor_has_no_chain, nil, dnssec.Options{})
@@ -928,7 +950,8 @@ test_an_anchor_over_onion_beats_the_key_that_forwards_it :: proc(t: ^testing.T) 
 	if !obuilt {
 		return
 	}
-	defer net.close(ox.socket)
+	ox_socket := ox.socket
+	defer net.close(ox_socket)
 	defer upstream.destroy_group(os_.group)
 	testing.expect(
 		t,

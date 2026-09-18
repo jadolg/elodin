@@ -1,5 +1,6 @@
 package server
 
+import "core:fmt"
 import "core:mem"
 import "core:net"
 import "core:strings"
@@ -111,23 +112,27 @@ serve_route :: proc(x: ^Route_Mock) {
 }
 
 /*
-Whether nothing asked `socket` about `name`.
+How many questions about `name` are sitting unread in `socket`.
 
 `mock_untouched` reads one packet and calls any packet at all a leak, which is
 sound for a socket nothing else in the process knows about and not for one whose
 port may have been another test's a moment ago - see `serve_route` above. This
-reads for as long as that one does and holds only the question this case asked
-against the socket.
+reads for as long as that one does and counts only the question this case asked.
+
+Counted rather than merely noticed because one case turns on the difference: a
+parent that never replies has to be asked once per query rather than once per
+cooldown, and "was asked at all" cannot tell those apart. One datagram per query
+per server, these fixtures running `attempts: 1` over one-server groups.
 */
 @(private = "file")
-route_mock_quiet :: proc(socket: net.UDP_Socket, name: string) -> bool {
+route_mock_heard :: proc(socket: net.UDP_Socket, name: string) -> (heard: int) {
 	_ = net.set_option(socket, .Receive_Timeout, 20 * time.Millisecond)
 	defer _ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	buf: [4096]u8
 	for {
 		n, _, err := net.recv_udp(socket, buf[:])
 		if err != nil {
-			return true
+			return
 		}
 		// Skipped rather than read as silence, the same way `serve_route` skips
 		// it: a runt ahead of a real leak would otherwise report the socket
@@ -139,9 +144,16 @@ route_mock_quiet :: proc(socket: net.UDP_Socket, name: string) -> bool {
 		// runs on the test's own thread, and nothing decoded escapes the call.
 		if q, ok := dns.peek_question(buf[:n], context.temp_allocator);
 		   ok && dns.name_equal_fold(q.name, name) {
-			return false
+			heard += 1
 		}
 	}
+}
+
+// Whether nothing asked `socket` about `name`, which is the reading most cases
+// want of the count above.
+@(private = "file")
+route_mock_quiet :: proc(socket: net.UDP_Socket, name: string) -> bool {
+	return route_mock_heard(socket, name) == 0
 }
 
 // `type` defaults to the `A` every case here asked for before the apex `DS`
@@ -1346,6 +1358,16 @@ test_a_parked_parent_is_still_asked_when_the_route_is_parked_too :: proc(t: ^tes
 		routes = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
 	}
 
+	/*
+	The premise both assertions below rest on, asserted rather than assumed: the
+	loop above put every server in this fixture in its cooldown, and a fixture
+	where one of them came back is one whose verdict means nothing. Without this
+	a failure here reads as "the parent was passed over" whatever actually went
+	wrong, which is the one thing it cannot have been if the route is parked too.
+	*/
+	testing.expect(t, !group_reachable(group), "the fixture did not park the parent's group")
+	testing.expect(t, !group_reachable(routed), "the fixture did not park the route's group")
+
 	_ = net.set_option(def_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	parent := Route_Mock {
 		socket = def_socket,
@@ -1366,7 +1388,24 @@ test_a_parked_parent_is_still_asked_when_the_route_is_parked_too :: proc(t: ^tes
 	if !testing.expect(t, ok, "nothing came back at all") {
 		return
 	}
-	testing.expect(t, parent.asked, "the parent was passed over for a route that was parked too")
+	/*
+	The counts say which failure this is. The question at the route's socket and
+	not the parent's is the skip firing, which is the thing this case exists to
+	catch; neither socket holding one is the group giving up without sending,
+	which is a different fault in a different place.
+	*/
+	// Counted only where the case has already failed: each count drains its
+	// socket on a twenty-millisecond timeout, which is a cost and a side effect
+	// that the passing path has no use for.
+	if !parent.asked {
+		testing.expectf(
+			t,
+			false,
+			"the parent was passed over for a route that was parked too (%d unread questions at the parent, %d at the route)",
+			route_mock_heard(def_socket, "corp.example."),
+			route_mock_heard(route_socket, "corp.example."),
+		)
+	}
 
 	decoded, derr2 := dns.decode_message(out, context.temp_allocator)
 	testing.expect_value(t, derr2, dns.Decode_Error.None)
@@ -1470,6 +1509,797 @@ test_an_apex_ds_sweeps_the_parents_group_past_a_refusal :: proc(t: ^testing.T) {
 	decoded, derr2 := dns.decode_message(out, context.temp_allocator)
 	testing.expect_value(t, derr2, dns.Decode_Error.None)
 	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
+	free_all(context.temp_allocator)
+}
+
+/*
+A parent that settles nothing is not waited on again for the very next query.
+
+The carve-out stores nothing when the parent establishes nothing, deliberately:
+a stand-in answer kept past the outage that caused it is the failure the whole
+file exists to prevent. What that left is the *probe* being re-paid by every
+query, and two configurations where that is not a rounding error (issue #243) -
+a blackholed uplink, where `healthy` goes true again every cooldown however many
+failures stand against the server, and a parent that answers but never settles,
+which is this fixture: a group answering SERVFAIL to every `DS` accrues no
+failures at all, is never parked, and so is asked again, and waited on again, for
+as long as the configuration stands.
+
+Both arrangements run against one fixture and differ only in what the parent
+says, which is the assertion that matters: the memory is of the parent having
+settled nothing, and a parent that settles the question keeps its place. So the
+SERVFAIL is asked once for two queries and the proof is asked twice, and the
+second half is what keeps this from being "ask the parent less": a route whose
+parent can prove the delegation carries no DS goes on getting that proof, per
+query, which is what issue #227 was about.
+
+The client's answer is asserted on both queries for the same reason. What the
+memory changes is which upstream is asked first, not what comes back - the route
+answers the unsettled case either way, exactly as it does when the parent's group
+is parked - so a second query that came back different would mean the memory had
+started standing in for an answer rather than for a wait.
+
+The parent's mock is started once per query it is expected to take, the route's
+once per query it is expected to take, and the socket that should have been left
+alone is read by `route_mock_quiet` rather than by a thread: a mock waiting on a
+question nobody sends holds the case open for `MOCK_RECV_TIMEOUT`, and the
+reading cannot be done from two places at once.
+*/
+@(test)
+test_a_parent_that_settles_nothing_is_not_re_asked_for_every_query :: proc(t: ^testing.T) {
+	Case :: struct {
+		// What the parent's group says about `corp.example. DS`, every time it
+		// is asked.
+		what:         string,
+		parent:       dns.Rcode,
+		// Whether the query after the threshold goes to the parent's group too.
+		asked_always: bool,
+		// Whether the route answers, which is the other side of the same coin:
+		// the proof is the client's answer and the route is never reached.
+		to_route:     bool,
+	}
+	cases := []Case {
+		{"SERVFAIL", .Serv_Fail, false, true},
+		{"the proof", .No_Error, true, false},
+	}
+
+	for c in cases {
+		def_socket, derr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+		if !testing.expectf(t, derr == nil, "cannot bind the default mock: %v", derr) {
+			return
+		}
+		defer net.close(def_socket)
+		_ = net.set_option(def_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+		def_bound, _ := net.bound_endpoint(def_socket)
+
+		route_socket, rerr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+		if !testing.expectf(t, rerr == nil, "cannot bind the routed mock: %v", rerr) {
+			return
+		}
+		defer net.close(route_socket)
+		_ = net.set_option(route_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+		route_bound, _ := net.bound_endpoint(route_socket)
+
+		cfg := forwarding_config()
+		// Cut, so that a second query which should not have gone to the parent
+		// does not sit out three seconds before this case says so.
+		cfg.upstream.timeout = 200 * time.Millisecond
+
+		group := mock_group(t, cfg.upstream, def_bound.port)
+		defer upstream.destroy_group(group)
+		routed := mock_group(t, cfg.upstream, route_bound.port)
+		defer upstream.destroy_group(routed)
+
+		s := Server {
+			cfg    = &cfg,
+			group  = group,
+			routes = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
+		}
+
+		parent_reply := route_reply_nodata("corp.example.", .DS, c.parent)
+		route_reply := route_reply_nodata("corp.example.", .DS)
+
+		// One query per unsettled reply the memory wants, and one more: the
+		// last is the one the memory is allowed to answer for.
+		for round in 0 ..< upstream.FAILURE_THRESHOLD + 1 {
+			serve_parent := round < upstream.FAILURE_THRESHOLD || c.asked_always
+			parent := Route_Mock {
+				socket = def_socket,
+				reply  = parent_reply,
+				want   = "corp.example.",
+			}
+			authority := Route_Mock {
+				socket = route_socket,
+				reply  = route_reply,
+				want   = "corp.example.",
+			}
+			parent_mock: ^thread.Thread
+			if serve_parent {
+				parent_mock = thread.create_and_start_with_poly_data(&parent, serve_route)
+			}
+			route_thread: ^thread.Thread
+			if c.to_route {
+				route_thread = thread.create_and_start_with_poly_data(&authority, serve_route)
+			}
+			out, _, ok := handle_query(
+				&s,
+				route_query("corp.example.", .DS),
+				.UDP,
+				"127.0.0.1:5555",
+				context.temp_allocator,
+			)
+			if parent_mock != nil {
+				thread.join(parent_mock)
+				thread.destroy(parent_mock)
+			}
+			if route_thread != nil {
+				thread.join(route_thread)
+				thread.destroy(route_thread)
+			}
+
+			if !testing.expectf(t, ok, "nothing came back at all on query %d (%s)", round + 1, c.what) {
+				return
+			}
+			testing.expectf(
+				t,
+				parent.asked == serve_parent,
+				"on query %d the parent's group was %sasked (%s)",
+				round + 1,
+				"not " if serve_parent else "",
+				c.what,
+			)
+			if !serve_parent {
+				testing.expectf(
+					t,
+					route_mock_quiet(def_socket, "corp.example."),
+					"a parent that had just settled nothing was asked the same apex DS again (%s)",
+					c.what,
+				)
+			}
+			testing.expectf(
+				t,
+				authority.asked == c.to_route,
+				"on query %d the route was %sasked (%s)",
+				round + 1,
+				"not " if c.to_route else "",
+				c.what,
+			)
+			if !c.to_route {
+				testing.expectf(
+					t,
+					route_mock_quiet(route_socket, "corp.example."),
+					"an answer the parent proved was re-asked down the route on query %d (%s)",
+					round + 1,
+					c.what,
+				)
+			}
+
+			// The same answer on both queries, from whichever upstream this
+			// arrangement leaves holding the question.
+			decoded, derr2 := dns.decode_message(out, context.temp_allocator)
+			testing.expect_value(t, derr2, dns.Decode_Error.None)
+			testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
+		}
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+The memory saves a wait, and gives up nothing the parent was the one to settle.
+
+What it bets is that the route's answer is the unsigned twin of the proof - a
+NODATA at the apex, which is what the client would have been left with after the
+wait. Every case here is the bet coming in wrong, and the assertion is that the
+parent gets its turn after all: the memory is not allowed to be what decides that
+the route's version of a statement about this delegation is the one the client
+gets.
+
+The skip it makes is not the parked-group skip's: that one fires only once every
+member of the parent's group has accrued `FAILURE_THRESHOLD` failures, which is a
+group that has proved it cannot answer, where this one fires on one reply that
+settled nothing and stands for a whole cooldown. So the leg it saves has to be a
+leg this server can still take, and the arrangement that says whether it is is
+the one where the *route* is what fails: the parent recovers inside the window
+and holds the proof, and the route the memory sent the question to has nothing to
+say.
+
+Four ways to be something other than that NODATA, and only the first is a failure
+in the ordinary sense. A route that never replies is a transport failure and
+reads as one everywhere. A route that answers SERVFAIL has replied, and
+`resolve_readable` hands that back as a perfectly good answer - the rcode is the
+client's, which is the right reading when the route was asked second and the
+wrong one here, where the parent was never given its turn; an internal authority
+that is up and failing is the deployment. An NXDOMAIN and a `DS` RRset are the
+two the parent is the authority for - what the public tree delegates, and whether
+it signs it - and a memory written by one unsettled reply must not be what
+decides the client hears the route's version of either.
+
+Asked and answered in both, rather than SERVFAILed with a leg untried. The
+parent's reply is used on the same terms the first exchange reads it on - only
+the proof is this client's answer - so what the fallback can do is hand over the
+one answer the carve-out went to fetch and nothing else.
+
+The first query is the fixture: a SERVFAIL from the parent is what writes the
+memory the second query is about. The timeout is cut so a route that is not
+serving does not sit out `forwarding_config`'s three seconds.
+*/
+@(test)
+test_the_memo_still_asks_the_parent_unless_the_route_answered_the_nodata :: proc(t: ^testing.T) {
+	Case :: struct {
+		// What the route has to say about `corp.example. DS` on the second
+		// query, the memory having sent it there first.
+		what:   string,
+		serve:  bool,
+		rcode:  dns.Rcode,
+		// A `DS` RRset rather than an empty answer section, which is a NOERROR
+		// that is no more the NODATA than the NXDOMAIN beside it is.
+		signed: bool,
+	}
+	cases := []Case {
+		{"nothing at all", false, .No_Error, false},
+		{"SERVFAIL", true, .Serv_Fail, false},
+		{"NXDOMAIN", true, .NX_Domain, false},
+		{"a DS RRset", true, .No_Error, true},
+	}
+
+	for c in cases {
+		def_socket, derr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+		if !testing.expectf(t, derr == nil, "cannot bind the default mock: %v", derr) {
+			return
+		}
+		defer net.close(def_socket)
+		_ = net.set_option(def_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+		def_bound, _ := net.bound_endpoint(def_socket)
+
+		route_socket, rerr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+		if !testing.expectf(t, rerr == nil, "cannot bind the routed mock: %v", rerr) {
+			return
+		}
+		defer net.close(route_socket)
+		_ = net.set_option(route_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+		route_bound, _ := net.bound_endpoint(route_socket)
+
+		cfg := forwarding_config()
+		cfg.upstream.timeout = 200 * time.Millisecond
+
+		group := mock_group(t, cfg.upstream, def_bound.port)
+		defer upstream.destroy_group(group)
+		routed := mock_group(t, cfg.upstream, route_bound.port)
+		defer upstream.destroy_group(routed)
+
+		s := Server {
+			cfg    = &cfg,
+			group  = group,
+			routes = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
+		}
+
+		// The queries that write the memory: the parent says nothing that
+		// settles the delegation, as many times running as the memory wants,
+		// and the route answers in its place.
+		for _ in 0 ..< upstream.FAILURE_THRESHOLD {
+			refusing := Route_Mock {
+				socket = def_socket,
+				reply  = route_reply_nodata("corp.example.", .DS, .Serv_Fail),
+				want   = "corp.example.",
+			}
+			answering := Route_Mock {
+				socket = route_socket,
+				reply  = route_reply_nodata("corp.example.", .DS),
+				want   = "corp.example.",
+			}
+			arming_parent := thread.create_and_start_with_poly_data(&refusing, serve_route)
+			arming_route := thread.create_and_start_with_poly_data(&answering, serve_route)
+			_, _, arming_ok := handle_query(
+				&s,
+				route_query("corp.example.", .DS),
+				.UDP,
+				"127.0.0.1:5555",
+				context.temp_allocator,
+			)
+			thread.join(arming_parent)
+			thread.destroy(arming_parent)
+			thread.join(arming_route)
+			thread.destroy(arming_route)
+			if !testing.expectf(t, arming_ok, "nothing came back for a query that writes the memory (%s)", c.what) {
+				return
+			}
+			if !testing.expectf(t, refusing.asked, "the parent's group was not asked while the memory was being written (%s)", c.what) {
+				return
+			}
+		}
+
+		/*
+		And the second is the case: the parent is holding the proof this time,
+		and the route has nothing. The memory sends the question to the route
+		first, which is the whole of what it is for - and a route with no answer
+		in it leaves the question unanswered, with the parent right there.
+		*/
+		proving := Route_Mock {
+			socket = def_socket,
+			reply  = route_reply_nodata("corp.example.", .DS),
+			want   = "corp.example.",
+		}
+		route_reply := route_reply_nodata("corp.example.", .DS, c.rcode)
+		if c.signed {
+			route_reply = route_reply_ds("corp.example.")
+		}
+		failing := Route_Mock {
+			socket = route_socket,
+			reply  = route_reply,
+			want   = "corp.example.",
+		}
+		second_parent := thread.create_and_start_with_poly_data(&proving, serve_route)
+		second_route: ^thread.Thread
+		if c.serve {
+			second_route = thread.create_and_start_with_poly_data(&failing, serve_route)
+		}
+		out, _, ok := handle_query(
+			&s,
+			route_query("corp.example.", .DS),
+			.UDP,
+			"127.0.0.1:5555",
+			context.temp_allocator,
+		)
+		thread.join(second_parent)
+		thread.destroy(second_parent)
+		if second_route != nil {
+			thread.join(second_route)
+			thread.destroy(second_route)
+		}
+
+		if !testing.expectf(t, ok, "nothing came back at all for the second query (%s)", c.what) {
+			return
+		}
+		testing.expectf(
+			t,
+			proving.asked,
+			"a parent holding the proof was passed over for a route answering %s",
+			c.what,
+		)
+
+		decoded, derr2 := dns.decode_message(out, context.temp_allocator)
+		testing.expect_value(t, derr2, dns.Decode_Error.None)
+		testing.expectf(
+			t,
+			dns.Rcode(decoded.flags.rcode) == .No_Error,
+			"the client was handed %s rather than the proof the parent was holding (%s)",
+			rcode_text(dns.Rcode(decoded.flags.rcode)),
+			c.what,
+		)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+A parent that never replied is asked again, not remembered as unhelpful.
+
+The memory is of a reply. A group that said nothing has established nothing about
+the next ten seconds either - the datagram that went missing says nothing about
+the one after it - and the next query is exactly as likely to reach it and come
+back with the proof, which is the answer this whole carve-out goes out to fetch.
+Remembering silence would trade that proof for a wait, and trade it for every
+query in the window rather than for the one that timed out; what bounds the
+repeated stall against a group that really is gone is the parking
+`group_reachable` reads, which needs no memory at all.
+
+So the count is the assertion: two queries, two datagrams at the parent. The
+parent's socket is bound and nobody serves it, which is what an upstream that has
+gone away looks like from here, and the route answers both queries in its place.
+*/
+@(test)
+test_a_parent_that_never_replied_is_asked_again :: proc(t: ^testing.T) {
+	def_socket, derr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, derr == nil, "cannot bind the default mock: %v", derr) {
+		return
+	}
+	defer net.close(def_socket)
+	def_bound, _ := net.bound_endpoint(def_socket)
+
+	route_socket, rerr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, rerr == nil, "cannot bind the routed mock: %v", rerr) {
+		return
+	}
+	defer net.close(route_socket)
+	_ = net.set_option(route_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+	route_bound, _ := net.bound_endpoint(route_socket)
+
+	cfg := forwarding_config()
+	cfg.upstream.timeout = 200 * time.Millisecond
+
+	group := mock_group(t, cfg.upstream, def_bound.port)
+	defer upstream.destroy_group(group)
+	routed := mock_group(t, cfg.upstream, route_bound.port)
+	defer upstream.destroy_group(routed)
+
+	s := Server {
+		cfg    = &cfg,
+		group  = group,
+		routes = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
+	}
+
+	// As many queries as would have armed the memory had the parent replied, and
+	// one more, so the count below is taken past the point a memory would have
+	// fired - and past the point the group parks itself, which is what actually
+	// stops the asking here.
+	for round in 0 ..< upstream.FAILURE_THRESHOLD + 1 {
+		authority := Route_Mock {
+			socket = route_socket,
+			reply  = route_reply_nodata("corp.example.", .DS),
+			want   = "corp.example.",
+		}
+		route_thread := thread.create_and_start_with_poly_data(&authority, serve_route)
+		out, _, ok := handle_query(
+			&s,
+			route_query("corp.example.", .DS),
+			.UDP,
+			"127.0.0.1:5555",
+			context.temp_allocator,
+		)
+		thread.join(route_thread)
+		thread.destroy(route_thread)
+
+		if !testing.expectf(t, ok, "nothing came back at all on query %d", round + 1) {
+			return
+		}
+		testing.expectf(t, authority.asked, "the route was not asked on query %d", round + 1)
+
+		decoded, derr2 := dns.decode_message(out, context.temp_allocator)
+		testing.expect_value(t, derr2, dns.Decode_Error.None)
+		testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
+	}
+
+	/*
+	Once per query until the group parks itself, which is the whole point: what
+	bounds the asking against a parent that has gone quiet is
+	`FAILURE_THRESHOLD` transport failures and the cooldown that follows them,
+	read by `group_reachable` in the skip above this memory. So the count is
+	exactly the threshold - three questions, then a parked group nobody asks -
+	and not once, which is what a memory written by silence would have made it.
+	*/
+	testing.expect_value(t, route_mock_heard(def_socket, "corp.example."), upstream.FAILURE_THRESHOLD)
+	free_all(context.temp_allocator)
+}
+
+/*
+What the fallback serves is kept on the same terms the parent-first path keeps it.
+
+`test_an_apex_ds_the_route_answered_unproven_is_not_cached` settles the rule: the
+route's answer goes into the cache when the parent established something about
+the public tree that holds for as long as an entry does, and is refused when
+nobody established anything. The memory's fallback reaches the same arrangement
+by the other road - the route answered first, the parent was asked afterwards -
+and it has to keep the same books, or a reply the parent settled would be fetched
+again by every query for as long as the entry it never made would have lived.
+
+The parent's NXDOMAIN is the case: it settles the delegation without proving it,
+so the route's own answer stands and is the one stored. Both upstreams answer
+NXDOMAIN here, which is what a zone that nothing public delegates and whose
+internal authority does not know the name looks like from both sides.
+*/
+@(test)
+test_the_memo_fallback_keeps_what_the_parent_settled :: proc(t: ^testing.T) {
+	def_socket, derr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, derr == nil, "cannot bind the default mock: %v", derr) {
+		return
+	}
+	defer net.close(def_socket)
+	_ = net.set_option(def_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+	def_bound, _ := net.bound_endpoint(def_socket)
+
+	route_socket, rerr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, rerr == nil, "cannot bind the routed mock: %v", rerr) {
+		return
+	}
+	defer net.close(route_socket)
+	_ = net.set_option(route_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+	route_bound, _ := net.bound_endpoint(route_socket)
+
+	cfg := forwarding_config()
+	cfg.cache.enabled = true
+	cfg.upstream.timeout = 200 * time.Millisecond
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, negative_ttl = 300})
+	defer cache.destroy(answers)
+
+	group := mock_group(t, cfg.upstream, def_bound.port)
+	defer upstream.destroy_group(group)
+	routed := mock_group(t, cfg.upstream, route_bound.port)
+	defer upstream.destroy_group(routed)
+
+	s := Server {
+		cfg     = &cfg,
+		group   = group,
+		answers = answers,
+		routes  = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
+	}
+
+	// The queries that write the memory, whose own answers are kept by nobody.
+	for _ in 0 ..< upstream.FAILURE_THRESHOLD {
+		refusing := Route_Mock {
+			socket = def_socket,
+			reply  = route_reply_nodata("corp.example.", .DS, .Serv_Fail),
+			want   = "corp.example.",
+		}
+		answering := Route_Mock {
+			socket = route_socket,
+			reply  = route_reply_nodata("corp.example.", .DS),
+			want   = "corp.example.",
+		}
+		arming_parent := thread.create_and_start_with_poly_data(&refusing, serve_route)
+		arming_route := thread.create_and_start_with_poly_data(&answering, serve_route)
+		_, _, arming_ok := handle_query(&s, route_query("corp.example.", .DS), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		thread.join(arming_parent)
+		thread.destroy(arming_parent)
+		thread.join(arming_route)
+		thread.destroy(arming_route)
+		if !testing.expect(t, arming_ok, "nothing came back for a query that writes the memory") {
+			return
+		}
+	}
+
+	// And the one the fallback answers: the route says the name is not there,
+	// which is not the NODATA the memory bet on, and the parent says the same
+	// thing about the public tree - a fact that holds for as long as an entry.
+	denying := Route_Mock {
+		socket = def_socket,
+		reply  = route_reply_nodata("corp.example.", .DS, .NX_Domain),
+		want   = "corp.example.",
+	}
+	absent := Route_Mock {
+		socket = route_socket,
+		reply  = route_reply_nodata("corp.example.", .DS, .NX_Domain),
+		want   = "corp.example.",
+	}
+	second_parent := thread.create_and_start_with_poly_data(&denying, serve_route)
+	second_route := thread.create_and_start_with_poly_data(&absent, serve_route)
+	out, _, ok := handle_query(&s, route_query("corp.example.", .DS), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	thread.join(second_parent)
+	thread.destroy(second_parent)
+	thread.join(second_route)
+	thread.destroy(second_route)
+
+	if !testing.expect(t, ok, "nothing came back at all for the second query") {
+		return
+	}
+	testing.expect(t, denying.asked, "the parent was not asked after the route answered something that was not the NODATA")
+	testing.expect(t, absent.asked, "the route was not asked at all")
+
+	decoded, derr2 := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr2, dns.Decode_Error.None)
+	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.NX_Domain)
+
+	key_buf: [cache.KEY_MAX]u8
+	key := cache.make_key(key_buf[:], "corp.example.", .DS, .IN, false, false)
+	_, _, cached := cache.get(answers, key, context.temp_allocator)
+	testing.expect(t, cached, "an answer the parent settled was fetched by the fallback and thrown away")
+	free_all(context.temp_allocator)
+}
+
+/*
+The memory's bookkeeping, asserted where the resolver cannot reach it.
+
+Four things the cases above cannot show, each driving one routed apex through one
+arrangement and reading the memory only by what reaches a socket. A slot table
+with one name in it never chooses a slot and never evicts one; a count needs its
+own boundary walked; and an anchored zone would need a validator standing behind
+the query before the rule that matters there is consulted at all.
+
+  - The count. `upstream.FAILURE_THRESHOLD` unsettled replies in a row inside the
+    window arm the memory and two do not, a parent that settles the question puts
+    the count back to nothing, and a window that runs out takes the count with it
+    - which is what keeps a parent that stumbles once an hour from accumulating
+    its way into being skipped.
+  - One memory per apex. Two routes, and settling one says nothing about the
+    other: a shared count would have one zone's outage withhold another zone's
+    proof.
+  - The table is a fixed size and says which memory it drops. `APEX_MEMO_SLOTS`
+    apexes fill it, the one past its size is refused rather than taking a slot
+    some other apex's count is still running in, and a slot that comes free is
+    given to whoever wants it next. That is the ceiling `Apex_Memo` names.
+  - An anchor turns the memory off rather than bounding it, on both sides.
+    Nothing is read back for an anchored zone, and nothing is written for one
+    either: a memory that can never be acted on would still be holding a slot an
+    apex that could use one does not get.
+
+Called directly rather than through `handle_query` because a validator would then
+have to be standing behind the question, and its own chain lookups go to the same
+default group these cases would be reading - the parent's apex `DS` among them.
+The rules are predicates; this asks them.
+*/
+@(test)
+test_the_apex_memory_counts_is_bounded_and_defers_to_an_anchor :: proc(t: ^testing.T) {
+	// One unsettled reply after another, which is what a client's apex `DS`
+	// leaves behind each time the parent answers without settling anything.
+	strike :: proc(s: ^Server, name: string, times: int) {
+		for _ in 0 ..< times {
+			remember_apex_ds_parent(s, name, true, false)
+		}
+	}
+
+	cfg := config.default_config()
+	routed := upstream.Group{}
+
+	// One route per apex, and one more apex than there are slots.
+	domains := make([][]string, APEX_MEMO_SLOTS + 1, context.temp_allocator)
+	routes := make([]Zone_Route, APEX_MEMO_SLOTS + 1, context.temp_allocator)
+	for i in 0 ..< APEX_MEMO_SLOTS + 1 {
+		domains[i] = make([]string, 1, context.temp_allocator)
+		domains[i][0] = fmt.tprintf("z%d.example.", i)
+		routes[i] = Zone_Route {
+			domains = domains[i],
+			group   = &routed,
+		}
+	}
+	s := Server {
+		cfg    = &cfg,
+		routes = routes,
+	}
+	first := domains[0][0]
+	second := domains[1][0]
+	third := domains[2][0]
+	last := domains[APEX_MEMO_SLOTS][0]
+
+	// Nothing is remembered of an apex nobody has asked about, and nothing at
+	// all of a name that is not a route's apex.
+	testing.expect(t, !apex_ds_parent_unsettled(&s, first), "a memory nobody wrote was read back")
+	strike(&s, "nas.z0.example.", upstream.FAILURE_THRESHOLD)
+	testing.expect(t, !apex_ds_parent_unsettled(&s, "nas.z0.example."), "a name that is no route's apex was remembered")
+
+	// The count: everything short of the threshold leaves the parent where it is.
+	for i in 1 ..< upstream.FAILURE_THRESHOLD {
+		strike(&s, first, 1)
+		testing.expectf(t, !apex_ds_parent_unsettled(&s, first), "%d unsettled replies armed a memory that wants %d", i, upstream.FAILURE_THRESHOLD)
+	}
+	strike(&s, first, 1)
+	testing.expect(t, apex_ds_parent_unsettled(&s, first), "the parent that settled nothing three times running was not remembered")
+	testing.expect(t, !apex_ds_parent_unsettled(&s, second), "one apex's unsettled parent was remembered against another")
+
+	// Case-insensitively, the question's name being whatever the client sent.
+	testing.expect(t, apex_ds_parent_unsettled(&s, strings.to_upper(first, context.temp_allocator)), "the memory did not fold case")
+
+	// A parent that settles the question clears the memory, and the count with
+	// it: what follows has to climb from nothing again.
+	remember_apex_ds_parent(&s, first, true, true)
+	testing.expect(t, !apex_ds_parent_unsettled(&s, first), "a parent that settled the question stayed remembered")
+	strike(&s, first, upstream.FAILURE_THRESHOLD - 1)
+	testing.expect(t, !apex_ds_parent_unsettled(&s, first), "the count survived the parent settling the question")
+	strike(&s, first, 1)
+	testing.expect(t, apex_ds_parent_unsettled(&s, first), "the count did not start again after a settled reply")
+
+	// A settled parent nobody remembered takes no slot of its own.
+	remember_apex_ds_parent(&s, second, true, true)
+	testing.expect(t, !apex_ds_parent_unsettled(&s, second), "a settled parent took a slot of its own")
+
+	// And a reply that never arrived is not a memory. See `Apex_Memo`.
+	remember_apex_ds_parent(&s, second, false, false)
+	remember_apex_ds_parent(&s, second, false, false)
+	remember_apex_ds_parent(&s, second, false, false)
+	testing.expect(t, !apex_ds_parent_unsettled(&s, second), "a parent that never replied was remembered as unhelpful")
+
+	/*
+	Filling the table: every apex but the last, so that the one past its size has
+	nowhere to go.
+	*/
+	for i in 0 ..< APEX_MEMO_SLOTS {
+		strike(&s, domains[i][0], upstream.FAILURE_THRESHOLD)
+	}
+	for i in 0 ..< APEX_MEMO_SLOTS {
+		testing.expectf(t, apex_ds_parent_unsettled(&s, domains[i][0]), "the memory of %s was lost before the table was full", domains[i][0])
+	}
+	/*
+	And the apex past the end of the table gets nothing, rather than taking a
+	slot some other apex's count is still running in. Evicting one to start
+	another is what would make this table useless past its size: with traffic
+	going round more failing apexes than there are slots, every count would be
+	restarted by the next apex and none would ever reach the threshold.
+	*/
+	strike(&s, last, upstream.FAILURE_THRESHOLD)
+	testing.expect(t, !apex_ds_parent_unsettled(&s, last), "an apex past the end of a full table took a live slot")
+	for i in 0 ..< APEX_MEMO_SLOTS {
+		testing.expectf(t, apex_ds_parent_unsettled(&s, domains[i][0]), "the memory of %s was evicted for an apex the table had no room for", domains[i][0])
+	}
+
+	/*
+	The ceiling is a full table rather than a permanent one: a slot whose window
+	has run out is free, which is what keeps a routed zone that stopped failing
+	from holding its slot for good. Asserted by clearing one the way a settled
+	parent does, the window being ten seconds and this test not waiting for it.
+	*/
+	remember_apex_ds_parent(&s, first, true, true)
+	strike(&s, last, upstream.FAILURE_THRESHOLD)
+	testing.expect(t, apex_ds_parent_unsettled(&s, last), "an apex was not given a slot that had come free")
+
+	/*
+	And the two rules that decide whether anything is written at all, each with a
+	slot standing free so that a refusal is the rule's doing and not the table's.
+	Two slots are cleared for the purpose, one per rule: with the table full,
+	every write is refused anyway and an assertion here would pass whatever the
+	guards did.
+
+	The anchored zone first. An operator who anchored a routed zone asked for the
+	public chain, where the route's unsigned answer is a SERVFAIL rather than a
+	stand-in, so nothing is read back for it - and nothing is written either,
+	which is what the free slot makes visible. Unanchoring and striking again is
+	the control: the same apex, the same free slot, remembered this time.
+	*/
+	remember_apex_ds_parent(&s, second, true, true)
+	remember_apex_ds_parent(&s, third, true, true)
+	testing.expect(t, apex_ds_memo_applies(&s, last), "the memory did not apply to a zone served insecure")
+	s.anchor_zones = []string{first}
+	testing.expect(t, !apex_ds_memo_applies(&s, first), "the memory answered for the parent under an anchor the operator asked for")
+	strike(&s, first, upstream.FAILURE_THRESHOLD)
+	testing.expect(t, !apex_ds_parent_unsettled(&s, first), "an anchored apex was remembered")
+	s.anchor_zones = nil
+	strike(&s, first, upstream.FAILURE_THRESHOLD)
+	testing.expect(t, apex_ds_parent_unsettled(&s, first), "the free slot the anchored apex was refused was not there at all")
+
+	/*
+	And a name that is no route's apex, which has the second free slot to take and
+	must not take it: the apex that wants it next has to still find it there.
+	*/
+	strike(&s, "nas.z0.example.", upstream.FAILURE_THRESHOLD)
+	strike(&s, second, upstream.FAILURE_THRESHOLD)
+	testing.expect(t, apex_ds_parent_unsettled(&s, second), "a name that is no route's apex took the last free slot")
+	free_all(context.temp_allocator)
+}
+
+/*
+More failing apexes than slots, asked round-robin, still remembers the ones it can.
+
+The shape a table that evicted live slots gets wrong, and gets wrong silently: a
+default group whose ACL REFUSEs every `DS` under nine routed zones is exactly the
+configuration issue #243 names, and with every apex evicting the last one's count
+before its own next reply, no apex would ever reach the threshold and the memory
+would do nothing at all while looking busy. Whatever the table holds, what it
+holds has to be worth holding.
+
+Round-robin rather than apex by apex, because taking one apex to the threshold
+before starting the next hides it: that apex arms itself on consecutive writes
+whatever the table does with the others.
+*/
+@(test)
+test_the_apex_memory_still_arms_past_its_slot_count :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	routed := upstream.Group{}
+
+	apexes := APEX_MEMO_SLOTS + 1
+	domains := make([][]string, apexes, context.temp_allocator)
+	routes := make([]Zone_Route, apexes, context.temp_allocator)
+	for i in 0 ..< apexes {
+		domains[i] = make([]string, 1, context.temp_allocator)
+		domains[i][0] = fmt.tprintf("z%d.example.", i)
+		routes[i] = Zone_Route {
+			domains = domains[i],
+			group   = &routed,
+		}
+	}
+	s := Server {
+		cfg    = &cfg,
+		routes = routes,
+	}
+
+	// Every apex asked in turn, for as many passes as a client would make in a
+	// second of this configuration.
+	for _ in 0 ..< 4 * upstream.FAILURE_THRESHOLD {
+		for i in 0 ..< apexes {
+			remember_apex_ds_parent(&s, domains[i][0], true, false)
+		}
+	}
+
+	armed := 0
+	for i in 0 ..< apexes {
+		if apex_ds_parent_unsettled(&s, domains[i][0]) {
+			armed += 1
+		}
+	}
+	testing.expectf(
+		t,
+		armed == APEX_MEMO_SLOTS,
+		"%d of %d apexes are remembered after %d round-robin passes, and the table holds %d",
+		armed,
+		apexes,
+		4 * upstream.FAILURE_THRESHOLD,
+		APEX_MEMO_SLOTS,
+	)
 	free_all(context.temp_allocator)
 }
 
