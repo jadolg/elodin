@@ -515,7 +515,14 @@ that is not a rounding error (issue #243):
     Every client `DS` at a routed apex then costs two upstream exchanges for as
     long as the configuration stands.
 
-This is the memory that makes either one a cost per window rather than per query.
+This is the memory for the second of those, which is the one nothing else bounds.
+The first has a memory already and it is `group_reachable`'s: three consecutive
+failures park the group, the skip above fires for the whole cooldown, and what is
+left over there is the first query of each cycle paying the budget - the wait
+rather than its repetition, which is `Apex_Memo`'s business nowhere and issue
+#243's other two options everywhere. The second has nothing at all: a group that
+answers is never parked, so without this it costs its two exchanges per query for
+as long as it stands.
 It keeps no answer and stands in for none: what it remembers is that this parent
 said nothing lasting about this apex, which is `parent_answers_apex_ds`'s
 `settled` read false, and all that follows from it is that the route is asked
@@ -577,16 +584,20 @@ leaves it and what this deliberately is not.
 Fixed slots rather than a map keyed by name. The names are route apexes, so the
 set is settled at startup and small; an array needs no allocation, no destructor,
 and nothing from a `Server` built as a literal. The ceiling is that an operator
-routing more zones than there are slots keeps the memory only for the apexes that
-stay in it, the rest paying what every apex pays today - a map here is the upgrade
-if a deployment ever wants it.
+routing more zones than there are slots keeps the memory for the apexes that hold
+one and no others, the rest paying what every apex pays today - a map here is the
+upgrade if a deployment ever wants it. `remember_apex_ds_parent` is where that
+ceiling is enforced, and it is enforced by leaving live slots alone: a table that
+evicted one apex's count to start another's would, past the slot count, leave
+every apex restarting and none of them ever remembered.
 */
-APEX_MEMO_SLOTS :: 8
-
 Apex_Memo :: struct {
 	mu:    sync.Mutex,
 	slots: [APEX_MEMO_SLOTS]Apex_Memo_Slot,
 }
+
+// How many apexes can be remembered at once. See `Apex_Memo`.
+APEX_MEMO_SLOTS :: 8
 
 Apex_Memo_Slot :: struct {
 	// A route's own domain string, which outlives the request; see
@@ -648,6 +659,16 @@ The window does double duty, and deliberately: it is how long a memory stands an
 how long the count that built it stays consecutive. A slot whose window has run
 out starts again at one, so a parent that stumbles once an hour never accumulates
 its way into being skipped.
+
+Replies rather than moments, which is worth saying because it is what the count
+is: three questions in flight together against a parent having one bad second
+each come back unsettled and each leave a strike, so a busy resolver can reach
+the threshold on a stumble that a quiet one would never have remembered. What
+that costs is what the window and the fallback already bound - the route's
+answer, for ten seconds, where the route can answer at all - and what it would
+take to distinguish is a clock per slot for something the cooldown already
+expires. Named here because the next reader will otherwise read "three in a row"
+as three separate occasions.
 */
 @(private)
 apex_ds_parent_unsettled :: proc(s: ^Server, name: string) -> bool {
@@ -694,6 +715,7 @@ remember_apex_ds_parent :: proc(s: ^Server, name: string, reached, settled: bool
 	if !found || covered_by_local_anchor(s, apex) {
 		return
 	}
+	now := time.now()
 	sync.mutex_lock(&s.apex_memo.mu)
 	defer sync.mutex_unlock(&s.apex_memo.mu)
 	victim := -1
@@ -707,7 +729,17 @@ remember_apex_ds_parent :: proc(s: ^Server, name: string, reached, settled: bool
 		if settled {
 			continue
 		}
-		if victim < 0 || time.diff(s.apex_memo.slots[victim].until, slot.until) < 0 {
+		/*
+		And a slot whose window is still running belongs to the apex that wrote
+		it. Taking it would restart that apex's count, and with more failing
+		apexes than slots and traffic going round them, every apex would be
+		evicted before its own next reply and none would ever reach the
+		threshold - the memory would be a table that is always full and never
+		read. A slot nobody has claimed, or one whose window has run out, is
+		free; where none is, this apex is one of the ones the ceiling leaves out
+		and it pays what every apex paid before this memory existed.
+		*/
+		if victim < 0 && time.diff(now, slot.until) <= 0 {
 			victim = i
 		}
 	}
@@ -718,7 +750,6 @@ remember_apex_ds_parent :: proc(s: ^Server, name: string, reached, settled: bool
 		s.apex_memo.slots[victim] = {}
 		return
 	}
-	now := time.now()
 	// Consecutive means inside the window: a slot whose own has run out is a
 	// count that expired with it, and this reply is the first of the next one.
 	strikes := 1

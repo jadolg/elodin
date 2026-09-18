@@ -1793,30 +1793,29 @@ resolve_query :: proc(
 	A fresh transaction ID for the same reason the second exchange draws one:
 	each exchange is a new one on the wire (RFC 5452 section 9.2).
 	*/
-	route_proved := false
 	if memoised_parent != nil {
-		route_proved, _ = parent_answers_apex_ds(resp, q.name, uerr == .None, allocator)
-	}
-	if memoised_parent != nil && !route_proved {
-		dns.set_id_in_place(forwarded, dns.random_id())
-		again, second, perr := upstream.resolve_answerable(memoised_parent, forwarded, allocator)
-		proved, settled := parent_answers_apex_ds(again, q.name, perr == .None, allocator)
-		remember_apex_ds_parent(s, q.name, perr == .None, settled)
-		/*
-		And whether what is served from here is kept turns on what the parent
-		managed to say, exactly as it does when the parent is asked first: the
-		route's reply standing in for an NXDOMAIN or a `DS` RRset is standing in
-		for a fact about the public tree, which holds until the public tree
-		changes, and standing in for nothing established is what the store
-		refuses. Read once for both replies, the proof being `settled` too.
-		*/
-		unproven_apex_ds = !settled
-		if proved {
-			logx.debugf(
-				"query DS %s: the route had no answer, and the parent proved the delegation carries no DS after all",
-				q.name,
-			)
-			resp, winner, uerr = again, second, .None
+		route_proved, _ := parent_answers_apex_ds(resp, q.name, uerr == .None, allocator)
+		if !route_proved {
+			dns.set_id_in_place(forwarded, dns.random_id())
+			again, second, perr := upstream.resolve_answerable(memoised_parent, forwarded, allocator)
+			proved, settled := parent_answers_apex_ds(again, q.name, perr == .None, allocator)
+			remember_apex_ds_parent(s, q.name, perr == .None, settled)
+			/*
+			And whether what is served from here is kept turns on what the parent
+			managed to say, exactly as it does when the parent is asked first: the
+			route's reply standing in for an NXDOMAIN or a `DS` RRset is standing in
+			for a fact about the public tree, which holds until the public tree
+			changes, and standing in for nothing established is what the store
+			refuses. Read once for both replies, the proof being `settled` too.
+			*/
+			unproven_apex_ds = !settled
+			if proved {
+				logx.debugf(
+					"query DS %s: the route had no answer, and the parent proved the delegation carries no DS after all",
+					q.name,
+				)
+				resp, winner, uerr = again, second, .None
+			}
 		}
 	}
 	if uerr != .None {

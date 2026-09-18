@@ -1358,6 +1358,16 @@ test_a_parked_parent_is_still_asked_when_the_route_is_parked_too :: proc(t: ^tes
 		routes = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
 	}
 
+	/*
+	The premise both assertions below rest on, asserted rather than assumed: the
+	loop above put every server in this fixture in its cooldown, and a fixture
+	where one of them came back is one whose verdict means nothing. Without this
+	a failure here reads as "the parent was passed over" whatever actually went
+	wrong, which is the one thing it cannot have been if the route is parked too.
+	*/
+	testing.expect(t, !group_reachable(group), "the fixture did not park the parent's group")
+	testing.expect(t, !group_reachable(routed), "the fixture did not park the route's group")
+
 	_ = net.set_option(def_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	parent := Route_Mock {
 		socket = def_socket,
@@ -1378,7 +1388,14 @@ test_a_parked_parent_is_still_asked_when_the_route_is_parked_too :: proc(t: ^tes
 	if !testing.expect(t, ok, "nothing came back at all") {
 		return
 	}
-	testing.expect(t, parent.asked, "the parent was passed over for a route that was parked too")
+	// The count says which of the two failures this is: a parent that was never
+	// sent the question, or one whose mock never got to it.
+	testing.expectf(
+		t,
+		parent.asked,
+		"the parent was passed over for a route that was parked too (%d unread questions at its socket)",
+		route_mock_heard(def_socket, "corp.example."),
+	)
 
 	decoded, derr2 := dns.decode_message(out, context.temp_allocator)
 	testing.expect_value(t, derr2, dns.Decode_Error.None)
@@ -2157,19 +2174,35 @@ test_the_apex_memory_counts_is_bounded_and_defers_to_an_anchor :: proc(t: ^testi
 	for i in 0 ..< APEX_MEMO_SLOTS {
 		testing.expectf(t, apex_ds_parent_unsettled(&s, domains[i][0]), "the memory of %s was lost before the table was full", domains[i][0])
 	}
+	/*
+	And the apex past the end of the table gets nothing, rather than taking a
+	slot some other apex's count is still running in. Evicting one to start
+	another is what would make this table useless past its size: with traffic
+	going round more failing apexes than there are slots, every count would be
+	restarted by the next apex and none would ever reach the threshold.
+	*/
 	strike(&s, last, upstream.FAILURE_THRESHOLD)
-	testing.expect(t, apex_ds_parent_unsettled(&s, last), "the apex that filled the table past its size was not remembered")
-	testing.expect(t, !apex_ds_parent_unsettled(&s, first), "the oldest memory survived a table with no room for it")
-	for i in 1 ..< APEX_MEMO_SLOTS {
-		testing.expectf(t, apex_ds_parent_unsettled(&s, domains[i][0]), "the memory of %s was evicted before the oldest one", domains[i][0])
+	testing.expect(t, !apex_ds_parent_unsettled(&s, last), "an apex past the end of a full table took a live slot")
+	for i in 0 ..< APEX_MEMO_SLOTS {
+		testing.expectf(t, apex_ds_parent_unsettled(&s, domains[i][0]), "the memory of %s was evicted for an apex the table had no room for", domains[i][0])
 	}
+
+	/*
+	The ceiling is a full table rather than a permanent one: a slot whose window
+	has run out is free, which is what keeps a routed zone that stopped failing
+	from holding its slot for good. Asserted by clearing one the way a settled
+	parent does, the window being ten seconds and this test not waiting for it.
+	*/
+	remember_apex_ds_parent(&s, first, true, true)
+	strike(&s, last, upstream.FAILURE_THRESHOLD)
+	testing.expect(t, apex_ds_parent_unsettled(&s, last), "an apex was not given a slot that had come free")
 
 	/*
 	And the rule that is not about the window at all: an anchored routed zone is
 	held to the public chain, where the route's unsigned answer is a SERVFAIL
-	rather than a stand-in. `first` has just lost its slot, so what is written
-	for it while the anchor stands can be read afterwards - or not, which is the
-	assertion.
+	rather than a stand-in. `first` was cleared just above and `last` took the
+	slot, so what is written for `first` while the anchor stands can be read
+	afterwards - or not, which is the assertion.
 	*/
 	testing.expect(t, apex_ds_memo_applies(&s, last), "the memory did not apply to a zone served insecure")
 	s.anchor_zones = []string{first, last}
@@ -2177,6 +2210,67 @@ test_the_apex_memory_counts_is_bounded_and_defers_to_an_anchor :: proc(t: ^testi
 	strike(&s, first, upstream.FAILURE_THRESHOLD)
 	s.anchor_zones = nil
 	testing.expect(t, !apex_ds_parent_unsettled(&s, first), "an anchored apex took a slot in a table that cannot act on it")
+	free_all(context.temp_allocator)
+}
+
+/*
+More failing apexes than slots, asked round-robin, still remembers the ones it can.
+
+The shape a table that evicted live slots gets wrong, and gets wrong silently: a
+default group whose ACL REFUSEs every `DS` under nine routed zones is exactly the
+configuration issue #243 names, and with every apex evicting the last one's count
+before its own next reply, no apex would ever reach the threshold and the memory
+would do nothing at all while looking busy. Whatever the table holds, what it
+holds has to be worth holding.
+
+Round-robin rather than apex by apex, because taking one apex to the threshold
+before starting the next hides it: that apex arms itself on consecutive writes
+whatever the table does with the others.
+*/
+@(test)
+test_the_apex_memory_still_arms_past_its_slot_count :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	routed := upstream.Group{}
+
+	apexes := APEX_MEMO_SLOTS + 1
+	domains := make([][]string, apexes, context.temp_allocator)
+	routes := make([]Zone_Route, apexes, context.temp_allocator)
+	for i in 0 ..< apexes {
+		domains[i] = make([]string, 1, context.temp_allocator)
+		domains[i][0] = fmt.tprintf("z%d.example.", i)
+		routes[i] = Zone_Route {
+			domains = domains[i],
+			group   = &routed,
+		}
+	}
+	s := Server {
+		cfg    = &cfg,
+		routes = routes,
+	}
+
+	// Every apex asked in turn, for as many passes as a client would make in a
+	// second of this configuration.
+	for _ in 0 ..< 4 * upstream.FAILURE_THRESHOLD {
+		for i in 0 ..< apexes {
+			remember_apex_ds_parent(&s, domains[i][0], true, false)
+		}
+	}
+
+	armed := 0
+	for i in 0 ..< apexes {
+		if apex_ds_parent_unsettled(&s, domains[i][0]) {
+			armed += 1
+		}
+	}
+	testing.expectf(
+		t,
+		armed == APEX_MEMO_SLOTS,
+		"%d of %d apexes are remembered after %d round-robin passes, and the table holds %d",
+		armed,
+		apexes,
+		4 * upstream.FAILURE_THRESHOLD,
+		APEX_MEMO_SLOTS,
+	)
 	free_all(context.temp_allocator)
 }
 
