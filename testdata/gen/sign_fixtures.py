@@ -41,6 +41,7 @@ CLASS_IN = 1
 
 A, NS, SOA, CNAME, MX, TXT = 1, 2, 6, 5, 15, 16
 AAAA, SRV, SVCB, HTTPS = 28, 33, 64, 65
+DNAME = 39
 DS, RRSIG, NSEC, DNSKEY, NSEC3 = 43, 46, 47, 48, 50
 NSEC3PARAM = 51
 
@@ -470,6 +471,16 @@ def mx_rr(name, target, preference=10):
     return RR(name, MX, struct.pack("!H", preference) + wire_name(target))
 
 
+def soa_rr(zone):
+    """The apex SOA, which a denial carries so the negative TTL has a source."""
+    rdata = (
+        wire_name("ns." + zone)
+        + wire_name("hostmaster." + zone)
+        + struct.pack("!IIIII", 1, 3600, 900, 604800, 300)
+    )
+    return RR(zone, SOA, rdata)
+
+
 def hint_chain(root, children):
     """Emit the trust anchor and each signed zone the hint fixtures answer from."""
     root_keys = [RR(".", DNSKEY, root.rdata)]
@@ -734,6 +745,195 @@ def ds_denial_from_child_apex():
     blind_nsec = [RR("bltest.", NSEC, nsec_rdata("a.bltest.", [RRSIG, NSEC]))]
     emit("bl_apex_nodata", "bltest.", "DS",
          message("bltest.", DS, [], blind_nsec + [sign(blind_nsec, blind)]))
+
+
+@scenario
+def relocated_wildcard_denial():
+    """Cover a wildcard's own NSEC and RRSIG re-owned to some other name."""
+    # RFC 4034 section 3.1.3 lets an RRSIG carry a Labels field shorter than its
+    # owner name, and that is how a wildcard answer is signed: the signature is
+    # computed over `*.<encloser>`, not over the name the asterisk stood in for.
+    # Nothing in the signature names the owner it was published under, so the
+    # zone's genuine `*.wctest. NSEC` and its genuine RRSIG - both public, both
+    # fetchable with one harmless query - verify just as well after the owner
+    # field has been rewritten to any other name in the zone.
+    #
+    # Rewritten once, the wildcard's bit map becomes a NODATA proof for a name
+    # that really has the type. Rewritten twice with chosen owners, the two
+    # spans cover a qname and the wildcard, and the pair proves NXDOMAIN for a
+    # name the zone answers for. RFC 4035 section 3.1.3.3 is the reason this is
+    # never legitimate: NSEC records are published under their own names and are
+    # never synthesised from a wildcard, so a denial record whose signature
+    # expanded is a denial record that was moved.
+    #
+    # `wdtest.` carries the same mistake on the other side of the same routine:
+    # a DS RRset whose signature expanded. The digest binds the child's name, so
+    # a plain replay of some other DS does not survive `ds_matches` - the one
+    # here is what a signer that expanded a wildcard DS would emit, and the
+    # chain walk must still refuse to take a zone cut from it.
+    root = Key(".", "wcard-root")
+    wc = Key("wctest.", "wcard-zone")
+
+    root_keys = [RR(".", DNSKEY, root.rdata)]
+    print("// anchor: %s" % root.ds_text())
+    emit("wc_root_dnskey", ".", "DNSKEY", message(".", DNSKEY, root_keys + [sign(root_keys, root)]))
+
+    wc_ds = [RR(wc.zone, DS, wc.ds())]
+    emit("wc_ds", wc.zone, "DS", message(wc.zone, DS, wc_ds + [sign(wc_ds, root)]))
+    wc_keys = [RR(wc.zone, DNSKEY, wc.rdata)]
+    emit("wc_dnskey", wc.zone, "DNSKEY", message(wc.zone, DNSKEY, wc_keys + [sign(wc_keys, wc)]))
+
+    # The zone as it really is: an apex, a wildcard holding an A, and one
+    # ordinary name holding an A and a TXT. Canonical order puts `*` before `r`,
+    # so the chain is wctest. -> *.wctest. -> real.wctest. -> wctest.
+    wc_soa = [soa_rr("wctest.")]
+    wc_soa_sig = sign(wc_soa, wc)
+    wild_rdata = nsec_rdata("real.wctest.", [A, RRSIG, NSEC])
+    wild_nsec = [RR("*.wctest.", NSEC, wild_rdata)]
+    # Labels 1, because RFC 4034 section 3.1.3 does not count the asterisk. This
+    # is the signature the attack below reuses unchanged.
+    wild_sig = sign(wild_nsec, wc)
+    real_nsec = [RR("real.wctest.", NSEC, nsec_rdata("wctest.", [A, TXT, RRSIG, NSEC]))]
+    real_sig = sign(real_nsec, wc)
+
+    # The chain walk asks for a DS at each name on the way down. `real.wctest.`
+    # is an ordinary name, so its own NSEC answers; `www.wctest.` does not exist,
+    # so the wildcard's NSEC matches and `real.wctest.`'s covers it.
+    emit("wc_real_ds", "real.wctest.", "DS",
+         message("real.wctest.", DS, [], real_nsec + [real_sig] + wc_soa + [wc_soa_sig]))
+    emit("wc_www_ds", "www.wctest.", "DS",
+         message("www.wctest.", DS, [],
+                 real_nsec + [real_sig] + wild_nsec + [wild_sig] + wc_soa + [wc_soa_sig]))
+
+    # The attack. The wildcard's NSEC RDATA and its RRSIG, both verbatim, under
+    # a rewritten owner: NODATA for `real.wctest. TXT`, which the zone really
+    # holds and the wildcard's bit map does not list.
+    relocated = [RR("real.wctest.", NSEC, wild_rdata), RR("real.wctest.", RRSIG, wild_sig.rdata)]
+    emit("wc_relocated_nodata", "real.wctest.", "TXT",
+         message("real.wctest.", TXT, [], relocated + wc_soa + [wc_soa_sig]))
+
+    # The same two records again, under two owners chosen so that the spans
+    # cover both what an NXDOMAIN has to deny: `s.wctest. -> real.wctest.` wraps
+    # and so covers `www.wctest.`, and `!.wctest. -> real.wctest.` covers the
+    # wildcard itself, since `!` sorts before `*`.
+    relocated_nx = [
+        RR("s.wctest.", NSEC, wild_rdata), RR("s.wctest.", RRSIG, wild_sig.rdata),
+        RR("!.wctest.", NSEC, wild_rdata), RR("!.wctest.", RRSIG, wild_sig.rdata),
+    ]
+    emit("wc_relocated_nxdomain", "www.wctest.", "A",
+         message("www.wctest.", A, [], relocated_nx + wc_soa + [wc_soa_sig], rcode=3), rcode=3)
+
+    # The control, and the reason the refusal cannot simply be "the signature
+    # expanded": a wildcard has an NSEC of its own, published under `*.wctest.`,
+    # and it is what proves NODATA for a type the wildcard does not hold. Its
+    # Labels field is not short - the asterisk is a label the name really has -
+    # so this one has to keep working.
+    emit("wc_wildcard_nodata", "www.wctest.", "TXT",
+         message("www.wctest.", TXT, [],
+                 wild_nsec + [wild_sig] + real_nsec + [real_sig] + wc_soa + [wc_soa_sig]))
+    wildcard_expanded_ds(root)
+    wildcard_dname(root)
+
+
+def wildcard_expanded_ds(root):
+    """Emit `wdtest.`, whose DS at one child was signed as a wildcard expansion."""
+    wd = Key("wdtest.", "wcard-dszone")
+    ev = Key("evil.wdtest.", "wcard-evil")
+    fi = Key("fine.wdtest.", "wcard-fine")
+
+    ds_set = [RR(wd.zone, DS, wd.ds())]
+    emit("wd_ds", wd.zone, "DS", message(wd.zone, DS, ds_set + [sign(ds_set, root)]))
+    keys = [RR(wd.zone, DNSKEY, wd.rdata)]
+    emit("wd_dnskey", wd.zone, "DNSKEY", message(wd.zone, DNSKEY, keys + [sign(keys, wd)]))
+
+    # A DS set at `evil.wdtest.` whose digest names that child, so it
+    # matches the key served below, but whose signature was computed over
+    # `*.wdtest.`. Taking the cut means the walk moves to keys the parent never
+    # attested under this name.
+    evil_ds = [RR("evil.wdtest.", DS, ev.ds())]
+    emit("wd_evil_ds", "evil.wdtest.", "DS",
+         message("evil.wdtest.", DS, evil_ds + [sign(evil_ds, wd, labels=1)]))
+    evil_keys = [RR("evil.wdtest.", DNSKEY, ev.rdata)]
+    emit("wd_evil_dnskey", "evil.wdtest.", "DNSKEY",
+         message("evil.wdtest.", DNSKEY, evil_keys + [sign(evil_keys, ev)]))
+    evil_a = [a_rr("evil.wdtest.", "192.0.2.66")]
+    emit("wd_evil_answer", "evil.wdtest.", "A",
+         message("evil.wdtest.", A, evil_a + [sign(evil_a, ev)]))
+
+    # The control for that one: the same delegation shape a label over, with the
+    # DS signed at its own name. Everything else about the two is identical, so
+    # a chain that came apart here fails this one too rather than passing the
+    # refusal off as a verdict about the Labels field.
+    fine_ds = [RR("fine.wdtest.", DS, fi.ds())]
+    emit("wd_fine_ds", "fine.wdtest.", "DS",
+         message("fine.wdtest.", DS, fine_ds + [sign(fine_ds, wd)]))
+    fine_keys = [RR("fine.wdtest.", DNSKEY, fi.rdata)]
+    emit("wd_fine_dnskey", "fine.wdtest.", "DNSKEY",
+         message("fine.wdtest.", DNSKEY, fine_keys + [sign(fine_keys, fi)]))
+    fine_a = [a_rr("fine.wdtest.", "192.0.2.67")]
+    emit("wd_fine_answer", "fine.wdtest.", "A",
+         message("fine.wdtest.", A, fine_a + [sign(fine_a, fi)]))
+
+
+def wildcard_dname(root):
+    """Emit `dwtest.`, which holds a wildcard DNAME and one ordinary name."""
+    # The third caller of the same routine. `dname_covered` asks
+    # `validate_rrset` about the DNAME and reads only the status, so on its own
+    # it would vouch for an unsigned CNAME under a DNAME re-owned to a name the
+    # wildcard does not stand for. What stops that is not there: the DNAME sits
+    # in the answer section, so `validate_answer`'s own loop validates the same
+    # RRset, records the expansion, and makes the RFC 4035 section 5.3.4 proof
+    # a condition of the whole message.
+    #
+    # Both fixtures are here so that stays true, and so that the guard this
+    # scenario is about is not copied to a site where it would refuse the
+    # legitimate one: a DNAME may sit at a wildcard like any other type, and
+    # then every redirection it makes carries an RRSIG one label short.
+    dw = Key("dwtest.", "wcard-dname")
+    ds_set = [RR(dw.zone, DS, dw.ds())]
+    emit("dw_ds", dw.zone, "DS", message(dw.zone, DS, ds_set + [sign(ds_set, root)]))
+    keys = [RR(dw.zone, DNSKEY, dw.rdata)]
+    emit("dw_dnskey", dw.zone, "DNSKEY", message(dw.zone, DNSKEY, keys + [sign(keys, dw)]))
+
+    soa = [soa_rr("dwtest.")]
+    soa_sig = sign(soa, dw)
+    # dwtest. -> *.dwtest. -> real.dwtest. -> dwtest. `real.dwtest.` is what
+    # makes the relocation below a forgery rather than an expansion: the
+    # wildcard does not stand for a name the zone already holds.
+    wild_nsec = [RR("*.dwtest.", NSEC, nsec_rdata("real.dwtest.", [DNAME, RRSIG, NSEC]))]
+    wild_nsec_sig = sign(wild_nsec, dw)
+    real_nsec = [RR("real.dwtest.", NSEC, nsec_rdata("dwtest.", [A, RRSIG, NSEC]))]
+    real_nsec_sig = sign(real_nsec, dw)
+    denial = wild_nsec + [wild_nsec_sig] + real_nsec + [real_nsec_sig] + soa + [soa_sig]
+
+    # The chain walk asks for a DS at each name on the way down, and none of
+    # these four is a zone cut. `real.dwtest.`'s NSEC covers everything after
+    # it, its own name included, so one denial answers all of them.
+    for tag, name in (("y", "y.dwtest."), ("xy", "x.y.dwtest."),
+                      ("real", "real.dwtest."), ("xreal", "x.real.dwtest.")):
+        emit("dw_%s_ds" % tag, name, "DS", message(name, DS, [], denial))
+
+    # The redirection as a server sends it: the DNAME under the name the
+    # wildcard was expanded to, its RRSIG still counting one label, and the
+    # CNAME synthesised from it, unsigned per RFC 6672 section 3.4.1. The
+    # authority section carries the proof that `y.dwtest.` is not in the zone,
+    # and no SOA, because nothing here is being denied.
+    dname_rr = [RR("y.dwtest.", DNAME, wire_name("t.example."))]
+    dname_sig = sign(dname_rr, dw, labels=1)
+    cname = [RR("x.y.dwtest.", CNAME, wire_name("x.t.example."))]
+    emit("dw_wildcard_dname", "x.y.dwtest.", "A",
+         message("x.y.dwtest.", A, dname_rr + [dname_sig] + cname,
+                 real_nsec + [real_nsec_sig]))
+
+    # The same two records with the DNAME's owner rewritten to `real.dwtest.`,
+    # which the zone holds and the wildcard therefore never stands for. The
+    # proof that would have to accompany it is a denial of a name that exists,
+    # so there is none to send.
+    moved = [RR("real.dwtest.", DNAME, wire_name("t.example.")),
+             RR("real.dwtest.", RRSIG, dname_sig.rdata)]
+    moved_cname = [RR("x.real.dwtest.", CNAME, wire_name("x.t.example."))]
+    emit("dw_relocated_dname", "x.real.dwtest.", "A",
+         message("x.real.dwtest.", A, moved + moved_cname))
 
 
 if __name__ == "__main__":
