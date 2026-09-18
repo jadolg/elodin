@@ -204,13 +204,24 @@ ours. The allowance is named first because a question that ran out of it will
 meet the ceiling too, and the number an operator has to look at is the one that
 stopped the proof.
 */
+/*
+The two reasons, named once.
+
+`server` reads the second of them to pick the extended error the client is
+handed - RFC 8914 has a code for exactly this refusal - so these are shared
+symbols rather than strings written twice, and changing the words here cannot
+quietly change what a client is told.
+*/
+NSEC3_BUDGET_SPENT :: "nsec3 hashing budget spent"
+NSEC3_OVER_CEILING :: "nsec3 iterations above the ceiling"
+
 @(private)
 nsec3_declined :: proc(budget: ^Nsec3_Budget, before: Nsec3_Refusals) -> (declined: bool, reason: string) {
 	if budget.spent > before.spent {
-		return true, "nsec3 hashing budget spent"
+		return true, NSEC3_BUDGET_SPENT
 	}
 	if budget.over_ceiling > before.over_ceiling {
-		return true, "nsec3 iterations above the ceiling"
+		return true, NSEC3_OVER_CEILING
 	}
 	return false, ""
 }
@@ -261,9 +272,10 @@ bounds the question.
 
 Both refusals are counted, and counted together, because what the callers have
 to say about them is the same: a proof built on a hash this server declined to
-compute failed for a reason of ours, and reporting it as `Bogus` would put the
-client's address in the log beside the word forgery over a number the zone
-chose. They report `Indeterminate` and name which refusal it was.
+compute failed for a reason of ours, and reporting it as `Bogus` would tell the
+client its answer was forged over a number the zone chose. They report
+`Indeterminate` and name which refusal it was, which is what reaches the client
+as an extended error and an operator as the reason beside the query.
 */
 @(private)
 nsec3_hash_with :: proc(rr: Nsec3, name: string, out: []u8, budget: ^Nsec3_Budget) -> bool {

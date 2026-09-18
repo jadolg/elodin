@@ -308,8 +308,8 @@ spends it, so a step asked after that has to say whether *its* reading could
 have been changed by a refusal. A match cannot: the record was found, and no
 refusal produces a record. Reading the meter instead would throw the step away
 and answer `Indeterminate` for a name the zone plainly holds - SERVFAIL for a
-question that was answered, and a bogus count and a log line that never
-mention the proof that really failed earlier.
+question that was answered, under a reason belonging to some other proof
+entirely.
 */
 @(test)
 test_a_step_that_matched_is_not_cut_short_by_someone_elses_allowance :: proc(t: ^testing.T) {

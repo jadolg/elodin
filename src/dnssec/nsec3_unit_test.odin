@@ -740,8 +740,8 @@ A zone asking for more iterations than this server computes is not a forgery.
 
 The ceiling refuses one record before any hashing is charged for it, so the
 meter reads zero and the proof simply fails - and a denial that fails is
-`Bogus`, which puts the client's address in the log beside the word forgery over
-a number the zone chose and nobody forged. The refusal is this server's, the
+`Bogus`, which tells the client its answer was forged over a number the zone
+chose and nobody forged. The refusal is this server's, the
 same as running out of allowance, and it has to reach the caller saying so.
 
 That is what `Nsec3_Budget.over_ceiling` counts, and counting it apart from

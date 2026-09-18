@@ -11,8 +11,8 @@ paid for.
 
 `MAX_NSEC3_ROUNDS_PER_QUERY` bounds the hashing one question may spend, and the
 answer a proof gets when it runs out has to be `Indeterminate` - this server did
-not finish reading the records - and never `Bogus`, which says forgery, carries
-the client's address into the log and hands the client extended error 6.
+not finish reading the records - and never `Bogus`, which says forgery and hands
+the client extended error 6 to say it.
 
 No other NSEC3 fixture in this package reaches that proof. A DS denial is
 settled by the walk on the way down: under opt-out the name comes back an

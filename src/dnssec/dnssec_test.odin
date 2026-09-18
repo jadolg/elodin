@@ -320,10 +320,10 @@ test_validates_nsec3_name_error :: proc(t: ^testing.T) {
 A denial whose hashing allowance ran out is `Indeterminate`, not `Bogus`.
 
 `MAX_NSEC3_ROUNDS_PER_QUERY` is this server's limit rather than anything the
-records did wrong, and the two verdicts are read very differently: `Bogus` is a
-forgery, logged with the client's address beside the word and handed to the
-client as extended error 6, while `Indeterminate` says only that this server did
-not finish reading the proof. The same distinction every other allowance in
+records did wrong, and the two verdicts say different things about that:
+`Bogus` tells the client its answer was forged, with extended error 6 to say so,
+while `Indeterminate` says only that this server did not finish reading the
+proof. The same distinction every other allowance in
 `validate.odin` makes, made for the one that counts SHA-1.
 
 The proof is real captured traffic - com's NSEC3 denial for a name that is not
@@ -371,10 +371,9 @@ An NSEC denial that fails is a forgery, whatever the NSEC3 meter says.
 The hashing allowance is the whole question's and it stays spent once anything
 spends it, so a proof made entirely of NSEC records - which hash nothing and
 cannot spend it - must not be filed under it. Both answers are SERVFAIL to the
-client and the difference is everything this server says about the query: the
-bogus count, the log line carrying the client's address, the extended error the
-answer carries. A forgery reported as an allowance of ours is a forgery nobody
-hears about.
+client and the difference is what the answer and the log say about why: the
+extended error, and the reason beside it. A forgery reported as an allowance of
+ours is a forgery nobody reads as one.
 
 `nosuchname-xq7.cloudflare.com.` is denied with the "black lies" NSEC, whose bit
 map lists the types the zone really minted for it, so asking for one of those is

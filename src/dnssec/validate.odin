@@ -1731,8 +1731,15 @@ validate_denial :: proc(
 	/*
 	Hashing this server declined, and the same answer as the two allowances
 	above it. A proof built on a hash we would not compute is not a proof found
-	wanting, and `Bogus` would report a decision of ours to the client as a
-	forgery - with its address beside the word in the log.
+	wanting, and `Bogus` says forgery: the client is handed extended error 6,
+	"DNSSEC bogus", over a decision of ours. What the client gets instead says
+	what happened - and the reason travels with it, so the log line naming this
+	query names the allowance too.
+
+	Worth being exact about how far that difference reaches today: `server`
+	counts and logs the two verdicts in one branch, so the bogus counter ticks
+	either way and the warn line is the same. The extended error and the reason
+	text are the whole of what an operator or a client can tell apart.
 
 	Counted over this proof rather than read off the budget, because the flags
 	there belong to the whole question and stay set once anything sets them: an
@@ -2299,8 +2306,8 @@ validate_wildcard_proof :: proc(
 	As above: hashing we declined is not a cover we looked for and failed to
 	find, and what this counts is what this proof was refused rather than what
 	the question has spent. Both answers are SERVFAIL to the client, and the
-	difference is everything the server says about it: the bogus count, the log
-	line carrying the client's address, the extended error the answer carries.
+	difference is the extended error the answer carries and the reason written
+	beside it.
 	*/
 	if declined, why := nsec3_declined(&budget.nsec3, before); declined {
 		logx.debugf("dnssec: the wildcard proof for %s was not read to the end: %s", dns.name_trim_root(owner), why)
