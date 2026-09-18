@@ -188,6 +188,21 @@ Budget :: struct {
 }
 
 /*
+What one client question starts with.
+
+The counters begin at zero and the NSEC3 ceiling comes from the validator, which
+is the one field a `Budget{}` cannot supply for itself. Made here rather than at
+the call site so that the ceiling an operator configured cannot be dropped on the
+way to the proof that reads it: an allowance built without it refuses every
+record asking for any iterations at all, which fails closed and fails loudly
+rather than quietly validating at a number nobody chose.
+*/
+@(private)
+query_budget :: proc(v: ^Validator) -> Budget {
+	return {nsec3 = {max_iterations = v.max_nsec3_iterations}}
+}
+
+/*
 Signature checks one client question may provoke, in total.
 
 A per-RRset cap cannot do this job, and having one was a way to break a zone: a
@@ -475,9 +490,7 @@ validate :: proc(
 	}
 	class := msg.question[0].class if len(msg.question) > 0 else dns.Class.IN
 	unix := u32(time.to_unix_seconds(now))
-	budget := Budget {
-		nsec3 = {max_iterations = v.max_nsec3_iterations},
-	}
+	budget := query_budget(v)
 
 	/*
 	REFUSED, SERVFAIL and the rest carry nothing to authenticate. Demanding a

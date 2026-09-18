@@ -22,9 +22,11 @@ answer's own proof has to find the closest encloser, see the next closer name
 covered and see the wildcard covered - the shape that does the hashing.
 
 Generated - `testdata/gen/sign_fixtures.py`, scenario `nsec3_name_error`.
-Ed25519 throughout, zero iterations and a two-byte salt, root replaced by a
+Ed25519 throughout, twelve iterations and a two-byte salt, root replaced by a
 trust anchor of the generator's own making. What is measured here is how many
-hashes the proof asks for, not how dear one of them is.
+hashes the proof asks for rather than how dear one of them is - but the count is
+not zero, so a ceiling below it has something to refuse, and the last test
+carries the configured number from `make_validator` to the proof that reads it.
 */
 
 @(private = "file")
@@ -67,34 +69,34 @@ N3_FIXTURES := []Fixture{
 		name  = "nx.deep.n3test.",
 		type  = .A,
 		rcode = 3,
-		wire  = "123485830001000000040000026e780464656570066e33746573740000010001203361727067376435636475346a656d" +
-			"66697073633234756d6e626c6b726d7376066e3374657374000032000100000e10002501000000020e0f14b14ca13361" +
-			"9f7df6f0dab64e642d85a4aef279ea000762000000000290203361727067376435636475346a656d6669707363323475" +
-			"6d6e626c6b726d7376066e337465737400002e000100000e10005a00320f0200000e107d3b18206a478820ce66066e33" +
-			"7465737400c01bbeae1b7aca1f677dff655442ce7171ff3d171c9be0add6767f6160099e93ad36ec2ad47194961ee1d2" +
-			"18296ca089e1da3784e629dedb151686d2c317d30a206d353661326372316a747576647336716d703736386263356b69" +
-			"6e6634756661066e3374657374000032000100000e10002401000000020e0f141ab7981da5637c49bacf9678c113d6ba" +
-			"eb4ddb9f0006400000000002206d353661326372316a747576647336716d703736386263356b696e6634756661066e33" +
-			"7465737400002e000100000e10005a00320f0200000e107d3b18206a478820ce66066e33746573740084f5029f3ceff0" +
-			"e1306363e6b4a1ddb9844e618d80c120ebdc0292c98790e95cb435134a664efa06662164ad5ec49f69ef0b68ab40caa8" +
-			"753a3cd156f9bf6909",
+		wire  = "123485830001000000040000026e780464656570066e337465737400000100012071696b343735713237326574383572" +
+			"63686d646e686c6175336b396d62626966066e3374657374000032000100000e1000250100000c020e0f14e030d26bab" +
+			"04d815b54e606e8652fa125b62720e0007620000000002902071696b34373571323732657438357263686d646e686c61" +
+			"75336b396d62626966066e337465737400002e000100000e10005a00320f0200000e107d3b18206a478820ce66066e33" +
+			"7465737400c954c7834400fdcc99c6842667ad18fc6e5465c901b2c848cd23191efcea52b4c7f73c699c0c930227090e" +
+			"c192939403b94e904222209878ebeda474951ce60c2073306f6434717462306a63316264616563316e38636b6e713239" +
+			"646d34736765066e3374657374000032000100000e1000240100000c020e0f14d4a8439742389dd4176c8d9b78d55e1d" +
+			"1365ae4f00064000000000022073306f6434717462306a63316264616563316e38636b6e713239646d34736765066e33" +
+			"7465737400002e000100000e10005a00320f0200000e107d3b18206a478820ce66066e33746573740061295081e4f57a" +
+			"e8080e3328b84ddd71852dad1eb59eaab2cb551d67286c2565b7a7aa28651e449d8763133f28d1cf54343ceef788f944" +
+			"c19f294d395e12150d",
 	},
 	{
 		key   = "n3_deep_ds",
 		name  = "deep.n3test.",
 		type  = .DS,
 		rcode = 3,
-		wire  = "1234858300010000000400000464656570066e337465737400002b0001203361727067376435636475346a656d666970" +
-			"73633234756d6e626c6b726d7376066e3374657374000032000100000e10002501000000020e0f14b14ca133619f7df6" +
-			"f0dab64e642d85a4aef279ea000762000000000290203361727067376435636475346a656d66697073633234756d6e62" +
-			"6c6b726d7376066e337465737400002e000100000e10005a00320f0200000e107d3b18206a478820ce66066e33746573" +
-			"7400c01bbeae1b7aca1f677dff655442ce7171ff3d171c9be0add6767f6160099e93ad36ec2ad47194961ee1d218296c" +
-			"a089e1da3784e629dedb151686d2c317d30a206d353661326372316a747576647336716d703736386263356b696e6634" +
-			"756661066e3374657374000032000100000e10002401000000020e0f141ab7981da5637c49bacf9678c113d6baeb4ddb" +
-			"9f0006400000000002206d353661326372316a747576647336716d703736386263356b696e6634756661066e33746573" +
-			"7400002e000100000e10005a00320f0200000e107d3b18206a478820ce66066e33746573740084f5029f3ceff0e13063" +
-			"63e6b4a1ddb9844e618d80c120ebdc0292c98790e95cb435134a664efa06662164ad5ec49f69ef0b68ab40caa8753a3c" +
-			"d156f9bf6909",
+		wire  = "1234858300010000000400000464656570066e337465737400002b00012071696b34373571323732657438357263686d" +
+			"646e686c6175336b396d62626966066e3374657374000032000100000e1000250100000c020e0f14e030d26bab04d815" +
+			"b54e606e8652fa125b62720e0007620000000002902071696b34373571323732657438357263686d646e686c6175336b" +
+			"396d62626966066e337465737400002e000100000e10005a00320f0200000e107d3b18206a478820ce66066e33746573" +
+			"7400c954c7834400fdcc99c6842667ad18fc6e5465c901b2c848cd23191efcea52b4c7f73c699c0c930227090ec19293" +
+			"9403b94e904222209878ebeda474951ce60c2073306f6434717462306a63316264616563316e38636b6e713239646d34" +
+			"736765066e3374657374000032000100000e1000240100000c020e0f14d4a8439742389dd4176c8d9b78d55e1d1365ae" +
+			"4f00064000000000022073306f6434717462306a63316264616563316e38636b6e713239646d34736765066e33746573" +
+			"7400002e000100000e10005a00320f0200000e107d3b18206a478820ce66066e33746573740061295081e4f57ae8080e" +
+			"3328b84ddd71852dad1eb59eaab2cb551d67286c2565b7a7aa28651e449d8763133f28d1cf54343ceef788f944c19f29" +
+			"4d395e12150d",
 	},
 }
 
@@ -144,7 +146,7 @@ test_an_nsec3_name_error_validates_and_says_what_it_hashed :: proc(t: ^testing.T
 	msg, err := dns.decode_message(n3_reply(), context.temp_allocator)
 	testing.expect(t, err == .None, "the fixture should decode")
 
-	budget := Budget{}
+	budget := query_budget(v)
 	result := validate_denial(v, &budget, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 	testing.expectf(t, result.status == .Secure, "the name error should be proven, got %v (%q)", result.status, result.reason)
 	testing.expect(t, budget.nsec3.rounds > 0, "a proof that hashed nothing is not exercising this")
@@ -173,7 +175,7 @@ test_an_nsec3_name_error_that_runs_out_of_hashing_is_indeterminate :: proc(t: ^t
 	msg, err := dns.decode_message(n3_reply(), context.temp_allocator)
 	testing.expect(t, err == .None, "the fixture should decode")
 
-	whole := Budget{}
+	whole := query_budget(measure_v)
 	validate_denial(measure_v, &whole, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 
 	// A validator of its own, because what the first call learned about the
@@ -181,9 +183,8 @@ test_an_nsec3_name_error_that_runs_out_of_hashing_is_indeterminate :: proc(t: ^t
 	// out.
 	v := n3_validator()
 	defer destroy_validator(v)
-	short := Budget {
-		nsec3 = {rounds = MAX_NSEC3_ROUNDS_PER_QUERY - whole.nsec3.rounds + 1},
-	}
+	short := query_budget(v)
+	short.nsec3.rounds = MAX_NSEC3_ROUNDS_PER_QUERY - whole.nsec3.rounds + 1
 	result := validate_denial(v, &short, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 	testing.expect_value(t, result.status, Status.Indeterminate)
 	// Named apart from the signature budget: an operator reading this has to be
@@ -222,4 +223,65 @@ test_an_iteration_ceiling_past_the_allowance_is_held_down :: proc(t: ^testing.T)
 	defer destroy_validator(unset)
 	testing.expect_value(t, unset.max_nsec3_iterations, DEFAULT_MAX_NSEC3_ITERATIONS)
 	free_all(context.temp_allocator)
+}
+
+/*
+The ceiling an operator configured is the one the proof reads.
+
+`max_nsec3_iterations` is a number in a file, and between it and the record it
+refuses lie `make_validator`, `query_budget`, the `Budget` a question carries and
+`nsec3_hash_with`. Nothing in the package asserts that journey end to end, and
+the failure if a link is dropped is quiet: hashing at a ceiling nobody chose,
+which is more work than the operator asked for and no diagnostic anywhere.
+
+`n3test.` hashes twelve times, so a validator told to accept five has something
+to refuse, and the verdict says which refusal it was rather than calling the
+zone's own number a forgery.
+*/
+@(test)
+test_the_configured_iteration_ceiling_reaches_the_proof :: proc(t: ^testing.T) {
+	msg, err := dns.decode_message(n3_reply(), context.temp_allocator)
+	testing.expect(t, err == .None, "the fixture should decode")
+
+	anchor, parsed := parse_trust_anchor(N3_ANCHOR, context.temp_allocator)
+	testing.expect(t, parsed, "the anchor should parse")
+	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
+	anchors[0] = anchor
+
+	strict := make_validator(n3_query, nil, Options{anchors = anchors, max_nsec3_iterations = 5})
+	defer destroy_validator(strict)
+	budget := query_budget(strict)
+	result := validate_denial(strict, &budget, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	testing.expect_value(t, result.status, Status.Indeterminate)
+	// The walk down to the name reads these same records, so it is the first
+	// thing the ceiling refuses and the reason names the chain. What pins the
+	// journey is the meter: the configured number reached a record and turned
+	// it away, and no hashing was done in the process.
+	testing.expect_value(t, result.reason, "chain of trust unavailable")
+	testing.expect(t, budget.nsec3.over_ceiling > 0, "the configured ceiling should have refused these records")
+	testing.expect_value(t, budget.nsec3.spent, 0)
+	testing.expect_value(t, budget.nsec3.rounds, 0)
+
+	// And the same records under the shipped ceiling, which is the control: the
+	// zone is fine, the number was the whole of the difference.
+	ordinary := n3_validator()
+	defer destroy_validator(ordinary)
+	whole := query_budget(ordinary)
+	held := validate_denial(ordinary, &whole, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	testing.expectf(t, held.status == .Secure, "the denial holds up at the default ceiling, got %v (%q)", held.status, held.reason)
+	free_all(context.temp_allocator)
+}
+
+/*
+The number three operator-facing documents write down.
+
+`MAX_NSEC3_ITERATIONS_LIMIT` is derived from the hashing allowance, and the
+allowance is a measurement that a faster box or a different charge could move.
+The README, `examples/elodin.yaml` and `examples/public.yaml` all name 255 in
+prose, where nothing recomputes. This is what tells whoever retunes the
+allowance that those three want editing.
+*/
+@(test)
+test_the_documented_iteration_limit_is_the_one_this_build_computes :: proc(t: ^testing.T) {
+	testing.expect_value(t, MAX_NSEC3_ITERATIONS_LIMIT, 255)
 }

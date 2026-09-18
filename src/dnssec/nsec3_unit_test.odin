@@ -652,7 +652,9 @@ test_nsec3_hashing_is_bounded_across_one_question :: proc(t: ^testing.T) {
 	// Twenty-four labels: `MAX_CHAIN_DEPTH`, and every one of them an ancestor
 	// the closest-encloser walk has to hash.
 	deep := "a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p.q.r.s.t.u.v.w.example."
-	budget := Nsec3_Budget{}
+	budget := Nsec3_Budget {
+		max_iterations = DEFAULT_MAX_NSEC3_ITERATIONS,
+	}
 	testing.expect_value(t, nsec3_proves_name_error(records[:], deep, "example.", &budget), Proof.Failed)
 	testing.expect(t, budget.spent > 0, "the hashing allowance should have been the thing that stopped this")
 	testing.expectf(

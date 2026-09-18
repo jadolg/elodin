@@ -127,9 +127,11 @@ What one question is allowed to spend on NSEC3 hashing, and the ceiling it
 holds each record's iteration count to.
 
 Carried as part of `Budget`, for the reason written there: the limit is per
-client question, so two arriving at once each get their own. A zero
-`max_iterations` means `DEFAULT_MAX_NSEC3_ITERATIONS`, which is the same reading
-`make_validator` gives the option it comes from.
+client question, so two arriving at once each get their own. `max_iterations` is
+the validator's, and `query_budget` is what puts it here - a zero is read as
+zero, so an allowance built without one refuses every record asking for any
+iterations at all. That is the direction to fail in: loudly, and having done no
+work, rather than quietly at a ceiling nobody configured.
 */
 Nsec3_Budget :: struct {
 	max_iterations: int,
@@ -268,8 +270,7 @@ nsec3_hash_with :: proc(rr: Nsec3, name: string, out: []u8, budget: ^Nsec3_Budge
 	if rr.hash_algorithm != NSEC3_HASH_SHA1 {
 		return false
 	}
-	ceiling := budget.max_iterations if budget.max_iterations > 0 else DEFAULT_MAX_NSEC3_ITERATIONS
-	if int(rr.iterations) > ceiling {
+	if int(rr.iterations) > budget.max_iterations {
 		budget.over_ceiling += 1
 		return false
 	}

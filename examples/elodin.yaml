@@ -422,8 +422,8 @@ dnssec:
   # an arbitrary amount of work. RFC 9276 asks zones for zero. A query has a
   # hashing allowance of its own, and above 255 that allowance is what answers
   # instead — the zones a higher ceiling admits are the ones whose proofs it
-  # cannot pay for — so a larger number here is held down to 255 at startup,
-  # with a line in the log saying so.
+  # cannot pay for — so a larger number here is held down at startup, with a
+  # line in the log naming the number this build computes from its allowance.
   max_nsec3_iterations: 100
 
 cookies:

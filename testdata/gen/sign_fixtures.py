@@ -1007,8 +1007,11 @@ def nsec3_name_error():
     emit("n3_dnskey", zone.zone, "DNSKEY", message(zone.zone, DNSKEY, keys + [sign(keys, zone)]))
 
     # Two names, so the chain is two spans and everything the zone does not hold
-    # falls inside one of them. Zero iterations and a two-byte salt: what is
-    # under test is how much hashing the proof asks for, not how dear one hash is.
+    # falls inside one of them. A two-byte salt and twelve iterations: what is
+    # under test is how much hashing the proof asks for rather than how dear one
+    # hash is, but the count is not zero, so a validator whose ceiling is below
+    # it has something to refuse and the ceiling is carried from the
+    # configuration to the proof by the test rather than by assertion.
     salt = bytes.fromhex("0e0f")
     chain = nsec3_chain(
         "n3test.",
@@ -1017,7 +1020,7 @@ def nsec3_name_error():
             ("a.n3test.", [A, RRSIG]),
         ],
         salt,
-        0,
+        12,
     )
 
     # Each NSEC3 is its own owner name and so its own RRset, with a signature of
