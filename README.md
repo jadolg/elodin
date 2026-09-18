@@ -462,9 +462,11 @@ The member that was passed over is counted against its name in
 left alone and no other figure would name it.
 
 What the sweep costs is up to one extra exchange per remaining member of the
-group, and never more than one `upstream.timeout` of waiting in total: the sweep
-counts what each failure cost it and stops once that reaches the timeout, so a
-group of unreachable spares costs one timeout rather than one apiece. A failure
+group, and a bounded wait: the sweep counts what each exchange cost it and asks
+nobody else once that reaches one `upstream.timeout`. The exchange that crosses
+the line is allowed to finish, so the worst of it is two timeouts rather than
+one — what it rules out is the third and the fourth, however many spares a group
+has. A failure
 that cost nothing — a member whose hostname cannot be resolved, which never
 parks either — is passed over rather than stopping the sweep. A live spare
 standing behind one that swallows the whole timeout waits for that member to

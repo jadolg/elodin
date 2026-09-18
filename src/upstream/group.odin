@@ -320,6 +320,20 @@ resolve_insisting :: proc(
 	because a member that recurses for most of the timeout and then says
 	SERVFAIL has cost this query what a member that said nothing did.
 
+	The budget is checked after each exchange rather than partway through one,
+	so the exchange that crosses it is allowed to finish and the sweep's worst
+	wait is two timeouts rather than one: one spent getting to the line, one for
+	the exchange that stepped over it. Checking it first changes nothing - a
+	member under the line is asked either way, and it is the asking that
+	overshoots. What it rules out is the third and the fourth.
+
+	On the tick clock, not the wall clock. `time.now` is `CLOCK_REALTIME`, and
+	an NTP step backwards between two readings of it - routine enough on the
+	machines this runs on - gives a negative interval, which would leave the
+	total short of the budget for as long as the sweep ran and take away the
+	bound exactly when it is doing its job. `exchange` may keep its wall-clock
+	latency figure: a statistic that goes strange once is not a guard.
+
 	What that bounds is the group of several spares none of which can be
 	reached. At the full timeout apiece a group of four spends three of them -
 	fifteen seconds as elodin ships - to hand back the reply it had in the first
@@ -381,13 +395,13 @@ resolve_insisting :: proc(
 			logx.debugf("upstream %s is in its cooldown, not asked again for this one", u.spec.name)
 			continue
 		}
-		before := time.now()
+		before := time.tick_now()
 		resp, xerr := exchange(u, sweep_query(query), g.timeout, allocator)
 		// Charged whatever the exchange did, because what is being bounded is
 		// the client's wait and an upstream can spend the time either way: a
 		// member that recurses for most of the timeout and then says SERVFAIL
 		// has cost this query exactly what a member that said nothing did.
-		spent += time.since(before)
+		spent += time.tick_since(before)
 		if xerr != .None {
 			logx.debugf("upstream %s failed: %v", u.spec.name, xerr)
 		} else if acceptable(resp) {
@@ -589,8 +603,18 @@ second is it declining to be asked, and the next member of the group may well
 know the answer. Unless the reply says otherwise in an extended error - a
 validation failure behind the SERVFAIL (`BOGUS_EDE_FIRST`) or a blocklist behind
 the REFUSED (`POLICY_EDE_FIRST`), each of which is about the name after all.
-Every other rcode a stub can read is a statement about the name and stands as
-the client's answer.
+
+These two and no others, which is a boundary worth stating because FORMERR (1)
+and NOTIMP (4) would pass the same test: neither is a verdict about the name
+either, and a forwarder that answers NOTIMP to every `SVCB` it is asked - an old
+CPE box - is the shape of issue #309 as exactly as a REFUSED is. They are left
+alone here because the report named these two and because they are rarer by
+orders of magnitude on a forwarding path, so the sweep they would add is work
+this has no measurement of. A resolver that meets one is a second report and a
+line in this switch, not a guess made now.
+
+Every other rcode a stub can read is a statement about the name, or close enough
+to one, and stands as the client's answer.
 */
 @(private)
 usable_rcode :: proc(response: []u8) -> bool {

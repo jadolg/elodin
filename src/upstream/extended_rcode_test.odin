@@ -1224,7 +1224,9 @@ dead spares.
 
 Four members that each sit on the query for most of the timeout and then refuse
 it, behind one that refuses at once. Unbounded that is four of those waits; the
-assertion is that the sweep stops after two, having spent its timeout.
+assertion is that the sweep stops after two - one to reach the budget's line and
+one that crosses it, which is the overshoot the bound allows and the reason it
+is stated as two timeouts rather than one.
 */
 @(test)
 test_the_budget_counts_a_slow_refusal_as_time_spent :: proc(t: ^testing.T) {
@@ -1303,7 +1305,9 @@ test_the_budget_counts_a_slow_refusal_as_time_spent :: proc(t: ^testing.T) {
 	testing.expect_value(t, dns.peek_rcode(resp), dns.Rcode.Refused)
 	delete(resp, context.allocator)
 
-	// Two slow members is 600ms against a 400ms budget; four would be 1.2s.
+	// Two slow members is 600ms: the first leaves the budget short of its line
+	// and the second crosses it, which is the overshoot the bound allows. Four
+	// would be 1.2s.
 	testing.expectf(
 		t,
 		spent < 3 * SLOW,
