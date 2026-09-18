@@ -1682,7 +1682,7 @@ resolve_query :: proc(
 		the memory only decides whether the next client's apex `DS` waits on this
 		group again inside the cooldown. See `Apex_Memo`.
 		*/
-		remember_apex_ds_parent(s, q.name, settled)
+		remember_apex_ds_parent(s, q.name, uerr == .None, settled)
 		if !proved {
 			/*
 			Two lines rather than one with both fields, because there is no
@@ -1760,9 +1760,15 @@ resolve_query :: proc(
 	zone whose parent had recovered and was holding the proof - which is issue
 	#227's failure, arriving through the saving meant to prevent it.
 
-	Only where the route did not answer at all. A route that answered is the
-	client's answer, rcode and all, exactly as it is when the parent's group is
-	asked first and proves nothing: this changes which group is asked first and
+	Where the route had no answer in it, which is not only a reply that never
+	came. `resolve_readable` hands back a SERVFAIL or a REFUSED as a perfectly
+	good reply - the rcode is the client's answer, which is the ordinary reading
+	of a client's question and the right one when the route was asked second -
+	so a route that mangles this `DS`, or an internal authority that is up and
+	failing, would otherwise stand as the answer while the parent held the proof.
+	`reply_answers` is the test, and it is the one this file already makes about
+	a reply concerning a delegation. A route that did answer is still the
+	client's answer, rcode and all: this changes which group is asked first and
 	not how either one is read.
 
 	And only the proof is taken from it, on the same terms the first exchange
@@ -1776,11 +1782,11 @@ resolve_query :: proc(
 	A fresh transaction ID for the same reason the second exchange draws one:
 	each exchange is a new one on the wire (RFC 5452 section 9.2).
 	*/
-	if memoised_parent != nil && uerr != .None {
+	if memoised_parent != nil && (uerr != .None || !reply_answers(resp)) {
 		dns.set_id_in_place(forwarded, dns.random_id())
 		again, second, perr := upstream.resolve_answerable(memoised_parent, forwarded, allocator)
 		proved, settled := parent_answers_apex_ds(again, q.name, perr == .None, allocator)
-		remember_apex_ds_parent(s, q.name, settled)
+		remember_apex_ds_parent(s, q.name, perr == .None, settled)
 		if proved {
 			logx.debugf(
 				"query DS %s: the route could not answer, and the parent proved the delegation carries no DS after all",

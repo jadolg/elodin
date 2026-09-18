@@ -402,6 +402,28 @@ parent_answers_apex_ds :: proc(
 }
 
 /*
+Whether a reply says anything about the name that was asked for.
+
+NOERROR and NXDOMAIN do; every other rcode is the responder saying it did not
+answer. The same test `upstream.resolve_answerable` insists on for a lookup about
+a delegation and `dnssec.answerable_rcode` makes over a decoded message, neither
+of which is exported to here, read off the wire because that is what
+`resolve_query` is holding.
+
+One caller: the fallback that asks the parent after the memory sent the question
+to a route with no answer in it. What an ordinary client question does with such
+an rcode is pass it on, which is the reading everywhere else in this file.
+*/
+@(private)
+reply_answers :: proc(resp: []u8) -> bool {
+	#partial switch dns.peek_rcode(resp) {
+	case .No_Error, .NX_Domain:
+		return true
+	}
+	return false
+}
+
+/*
 Whether any upstream in `g` is out of its failure cooldown.
 
 Asked about both groups before an apex `DS` is sent to the parent's, and nowhere
@@ -531,25 +553,33 @@ A parent that does settle clears its slot rather than leaving it to expire: the
 question was asked, the answer arrived, and the memory of the last failure has
 been overtaken by it.
 
-What the memory is not is a reason to stop asking. It is written by one reply
-that settled nothing, and one reply is a long way from what parks an upstream -
-`FAILURE_THRESHOLD` consecutive failures - so the group it skips may be
-answering everything else perfectly well. `resolve_query` reaches past it for
-that reason: where the route it sent the question to instead could not answer at
-all, the parent is asked after the fact, and a parent that has come back with the
-proof is read and remembered as it always would have been. The saving is of a
-wait the route can cover, never of the answer itself.
+Only a reply is remembered. A parent that said nothing at all - the blackholed
+uplink, the lost datagram - has established nothing about the next ten seconds
+either, and the next query is exactly as likely to reach it and come back with
+the proof; skipping it on that would trade the answer this carve-out exists to
+fetch for a wait, and trade it for every query in the window rather than for the
+one that timed out. What the repeated stall against a group that really is gone
+is bounded by is the parking `group_reachable` reads, which is the skip above
+and needs no memory at all. So what is written down here is the reading a reply
+carried: SERVFAIL, REFUSED, a NOERROR somebody rewrote - the configuration
+answering rather than the network failing, which is the shape that never parks
+and therefore never stops costing.
+
+What the memory is not, even then, is a reason to stop asking. One answered
+reply is a long way from what parks an upstream - `FAILURE_THRESHOLD` consecutive
+failures - so the group it skips may be answering everything else perfectly well.
+`resolve_query` reaches past it for that reason: where the route it sent the
+question to instead had no answer either - no reply, or an rcode that says
+nothing about the name - the parent is asked after the fact, and a parent that
+has come back with the proof is read and remembered as it always would have been.
+The saving is of a wait the route can cover, never of the answer itself.
 
 The window it closes is between one probe and the next, not around the probe
-itself. Nothing is written until the parent's leg returns, so the queries that
-arrive while a first one is still sitting in a blackholed group's whole budget
-find no memory and start their own leg - a validating stub gives up in two to
-five seconds and retries, and the servers are not parked yet, three failures
-being what parks them. Bounding that means bounding the leg rather than
-remembering it: a deadline of this question's own, or asking both groups at once,
-which is where issue #243 leaves it and what this deliberately is not. What this
-ends is the *next* query paying the same wait over again, which is what the
-REFUSING parent costs forever and the blackholed one costs once per cooldown.
+itself. Nothing is written until the parent's leg returns, so queries that arrive
+while a first one is still in flight find no memory and take their own leg.
+Bounding that means bounding the leg rather than remembering it: a deadline of
+this question's own, or asking both groups at once, which is where issue #243
+leaves it and what this deliberately is not.
 
 Fixed slots rather than a map keyed by name. The names are route apexes, so the
 set is settled at startup and small; an array needs no allocation, no destructor,
@@ -591,6 +621,11 @@ apex_ds_parent_unsettled :: proc(s: ^Server, name: string) -> bool {
 /*
 Write down what the parent's group managed to say about this apex `DS`.
 
+`reached` is `parent_answers_apex_ds`'s own third argument, and nothing is written
+without it: a parent that never replied established nothing to remember, for the
+reason `Apex_Memo` gives. Not even a clearing - an existing memory of a parent
+that would not settle this apex is not disproved by a datagram going missing.
+
 `settled` is `parent_answers_apex_ds`'s second return read straight: true and the
 slot is cleared, false and the route is asked first for one `upstream.COOLDOWN`.
 
@@ -600,7 +635,10 @@ being older than any real one, and evicts the stalest memory when every slot is
 in use.
 */
 @(private)
-remember_apex_ds_parent :: proc(s: ^Server, name: string, settled: bool) {
+remember_apex_ds_parent :: proc(s: ^Server, name: string, reached, settled: bool) {
+	if !reached {
+		return
+	}
 	apex, found := route_apex_name(s, name)
 	if !found {
 		return
