@@ -270,12 +270,16 @@ timeout rather than each read of it, so `POLL_INTERVAL` there would be a
 handshake budget of 200ms from before the ClientHello arrives - and a loopback
 handshake that crosses it on a loaded box, under AddressSanitizer or beside the
 rest of the suite, fails as a timeout and reads as the upstream being broken.
-This is the same figure as a whole connection's wait, which is generous for a
-handshake and still not a wait anything hangs on. Put back to `POLL_INTERVAL`
-once the handshake is done, so shutdown still gets its regular chance to notice
-the stop flag.
+A handshake cannot look at `Mock.stop` - it is inside OpenSSL and `poll` - so
+this is also how long `mock_stop` may wait to join a thread whose peer went quiet
+mid-handshake. That is what keeps it to a second rather than the ten a connection
+gets: a loopback handshake is a few milliseconds even under AddressSanitizer, so
+a second is two orders of magnitude of headroom, and a second is also the whole
+of the delay it can cost a teardown. Put back to `POLL_INTERVAL` once the
+handshake is done, so the reads after it keep noticing the stop flag at the old
+cadence.
 */
-HANDSHAKE_TIMEOUT :: 5 * time.Second
+HANDSHAKE_TIMEOUT :: 1 * time.Second
 
 // `cert_file`/`key_file` turn on a TLS listener on the same port for DoT.
 mock_start :: proc(m: ^Mock, cert_file := "", key_file := "") -> bool {

@@ -896,9 +896,12 @@ this server has no complaint about: the rule is one budget per message, not one
 per connection, and RFC 7828 tells a client the connection is held for the whole
 of `client_timeout` whenever it next has something to ask.
 
-Both waits here are 300ms against a 400ms budget. Measured from the connection
-the two of them are 600ms and the message could never arrive; measured from its
-first byte the second half has 300ms of a 400ms budget to make and does.
+Both waits here are 700ms against a one-second budget, which leaves either
+reading of it 300ms of margin: measured from the connection the two of them are
+1.4s and the message could never arrive, and measured from its first byte the
+second half has 700ms of a second to make. The margin matters more than the
+speed here - this is the one case in the change that a slow box could fail with
+correct code, so it is the one that gets the room.
 */
 @(test)
 test_the_wait_for_a_message_is_not_spent_on_reading_it :: proc(t: ^testing.T) {
@@ -921,7 +924,7 @@ test_the_wait_for_a_message_is_not_spent_on_reading_it :: proc(t: ^testing.T) {
 		// split the budget has to survive because it is the one a client is free
 		// to make.
 		split    = 2,
-		wait     = 300 * time.Millisecond,
+		wait     = 700 * time.Millisecond,
 	}
 	client := thread.create_and_start_with_poly_data(&sender, send_late_and_split)
 	defer {
@@ -941,7 +944,7 @@ test_the_wait_for_a_message_is_not_spent_on_reading_it :: proc(t: ^testing.T) {
 	}
 
 	budget := Read_Budget {
-		idle = 400 * time.Millisecond,
+		idle = 1 * time.Second,
 	}
 	length_buf: [2]u8
 	if !testing.expect(t, conn_read_full(conn, length_buf[:], &budget), "the length prefix never arrived") {

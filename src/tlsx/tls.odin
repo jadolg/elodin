@@ -705,6 +705,14 @@ non-blocking.
 
 A zero timeout is the caller having set no SO_RCVTIMEO, and waits as long as the
 peer takes, which is what the blocking handshake did in that case.
+
+The client half - `client_connect`, which dials DoT and DoH upstreams - still
+runs `SSL_connect` on a blocking socket and is still bounded per read, so an
+upstream trickling its ServerHello holds the worker that dialled it. That is the
+same shape at the other trust boundary, where `upstream.read_full_tcp` is too,
+and it is not this procedure's to fix: what reaches here is anonymous and what
+reaches there is configured, and the two want different answers about how long
+to wait before giving up on one.
 */
 @(private)
 accept_loop :: proc(conn: ^Conn) -> Error {

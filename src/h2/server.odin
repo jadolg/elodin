@@ -20,11 +20,22 @@ in SETTINGS), stream priority (parsed and ignored, as RFC 9113 permits), and
 the extended CONNECT protocol.
 */
 
-// Transport, so this package does not depend on the TLS layer.
+/*
+Transport, so this package does not depend on the TLS layer.
+
+`begin` is called where a read that has to complete as a whole starts - the
+preface, a frame header, a frame payload - and is what lets the transport bound
+one of those as a whole rather than bounding each read of it. Without it a peer
+trickling a byte at a time restarts the transport's wait with every byte and is
+never given up on, which on a DoH server is a connection and a thread held for
+nothing before any stream exists. Optional: a transport with nothing to bound
+leaves it nil.
+*/
 IO :: struct {
 	user:  rawptr,
 	read:  proc(user: rawptr, buf: []u8) -> (n: int, ok: bool),
 	write: proc(user: rawptr, buf: []u8) -> bool,
+	begin: proc(user: rawptr),
 }
 
 Request :: struct {
@@ -280,6 +291,11 @@ read_preface :: proc(c: ^Conn) -> bool {
 
 @(private)
 read_exact :: proc(c: ^Conn, buf: []u8) -> bool {
+	// One whole thing off the wire starts here: everything this package reads it
+	// reads through this, so this is the one place that has to say so. See `IO`.
+	if c.io.begin != nil {
+		c.io.begin(c.io.user)
+	}
 	got := 0
 	for got < len(buf) {
 		n, ok := c.io.read(c.io.user, buf[got:])

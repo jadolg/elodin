@@ -38,6 +38,19 @@ H2_Context :: struct {
 	// where the other stream transports carry the same thing.
 	peer:   net.Endpoint,
 	path:   string,
+	/*
+	What the frame being read may take, reset by `h2_begin` where each one starts.
+
+	The other transports bound a message this way and this one needs it for the
+	same reason - see `Read_Budget`. An h2 connection is long-lived by design and
+	nothing here shortens that: the wait for the next frame to start is still the
+	whole of `client_timeout`, as it was when the socket option was the only bound.
+	What it ends is the peer that trickles one byte inside every wait and so is
+	never waited out at all, which before any stream exists - over the preface, or
+	a frame header - is a connection and a thread held while no request is ever
+	made and nothing charges the client for one.
+	*/
+	budget: Read_Budget,
 }
 
 @(private)
@@ -47,11 +60,21 @@ H2_Job :: struct {
 	req:       ^h2.Request,
 }
 
+// Called by `h2.read_exact` where the preface, a frame header or a frame payload
+// starts; `h2_read` then spends this budget across however many reads the peer
+// splits that into.
+@(private)
+h2_begin :: proc(user: rawptr) {
+	ctx := cast(^H2_Context)user
+	ctx.budget = Read_Budget {
+		idle = ctx.server.cfg.server.client_timeout,
+	}
+}
+
 @(private)
 h2_read :: proc(user: rawptr, buf: []u8) -> (n: int, ok: bool) {
 	ctx := cast(^H2_Context)user
-	got, err := tlsx.read(ctx.conn, buf)
-	return got, err == .None && got > 0
+	return conn_read_budgeted(Conn{tls = ctx.conn, peer = ctx.peer}, buf, &ctx.budget)
 }
 
 @(private)
@@ -75,6 +98,7 @@ serve_doh2 :: proc(s: ^Server, conn: ^tlsx.Conn, client: string, peer: net.Endpo
 		user  = &ctx,
 		read  = h2_read,
 		write = h2_write,
+		begin = h2_begin,
 	}
 	hc := h2.make_conn(io, h2_handler, &ctx)
 	// A response waits no longer for flow-control credit than the connection
