@@ -415,11 +415,21 @@ resets partway through is retried once first, since some public resolvers do tha
 to a fair share of fresh connections while the very next attempt goes through.
 Only a reset is retried.
 
-An upstream's rcode is the client's answer — SERVFAIL and REFUSED are passed on
-as they arrive, since the rcode is what the client asked for — with one
-exception. An extended rcode (RFC 6891 section 6.1.3) is twelve bits, four in
-the header and eight in the OPT record, and a stub client reads the four: a
-BADVERS forwarded as it stands reads as NOERROR over an empty answer section,
+An upstream's rcode is the client's answer, with two exceptions.
+
+SERVFAIL and REFUSED are not answers about the name: RFC 2308 section 7.1 reads
+the first as the server reporting on itself, and the second is it declining to be
+asked — an ACL that no longer lists this resolver, its own recursion down,
+throttling. A member of a failover group in that state answers promptly and
+forever, which never trips the cooldown above, so the rest of the group is asked
+instead and the first member keeps its place in the order. Where nobody does
+better — a single upstream, the ordinary arrangement — the rcode that arrived is
+still what the client is handed.
+
+The other exception is an extended rcode. It is twelve bits (RFC 6891 section
+6.1.3), four in the header and eight in the OPT record, and a stub client reads
+the four: a BADVERS forwarded as it stands reads as NOERROR over an empty
+answer section,
 which is a client being told a name has no such record when what happened is
 that its resolver could not find out. A DANE or MTA-STS client that believes it
 downgrades. So a reply whose composed rcode is 16 or above is not one this

@@ -126,7 +126,8 @@ resolve_answerable :: proc(
 }
 
 /*
-Resolve `query`, insisting on a reply whose rcode the client can read.
+Resolve `query`, insisting on a reply the client's own question can be answered
+with: an rcode it can read, and one that says something about the name.
 
 `dns.peek_rcode` composes twelve bits - the header's four, and eight more out of
 the OPT record's TTL (RFC 6891 section 6.1.3). A stub reads the four. So an
@@ -143,10 +144,21 @@ in answer to one is that server violating the protocol rather than saying
 anything about the question. The rest of the group is asked, the way a chain
 lookup asks past a server that would not answer it.
 
-The ordinary path is untouched: a readable reply returns from the first exchange
+SERVFAIL and REFUSED are swept past for a plainer reason: neither is an answer
+about the name. RFC 2308 section 7.1 reads SERVFAIL as the responder reporting
+on itself, and REFUSED is it declining to be asked at all - policy, or an ACL
+that no longer lists this server. A failover group exists so that one member can
+be in that state, and before issue #309 it did not help: `record_failure` counts
+transport failures, so a member that answers REFUSED to everything, promptly and
+forever, is never parked and every client query stopped at it while the member
+beside it held the answer. dnsmasq, Unbound and BIND all move to the next server
+on these two.
+
+The ordinary path is untouched: a usable reply returns from the first exchange
 and none of the sweep runs. Where no member of the group can manage one the
-first reply still comes back, extended rcode and all - `resolve_query` reads it
-and answers SERVFAIL, because turning one reply into another is no more this
+first reply still comes back, rcode and all - which is what a group of one, the
+ordinary deployment, gets for every SERVFAIL its upstream states. `resolve_query`
+reads it and decides, because turning one reply into another is no more this
 procedure's business here than it is below.
 */
 resolve_readable :: proc(
@@ -158,7 +170,7 @@ resolve_readable :: proc(
 	winner: ^Upstream,
 	err: Error,
 ) {
-	return resolve_insisting(g, query, readable_rcode, allocator)
+	return resolve_insisting(g, query, usable_rcode, allocator)
 }
 
 /*
@@ -199,8 +211,11 @@ resolve_insisting :: proc(
 
 	Health is left alone where the rcode is concerned, on purpose. SERVFAIL is a
 	legitimate answer to plenty of questions, and a server that gives one has not
-	failed in the sense `record_failure` tracks - it answered, promptly, and for
-	the client's own queries this server goes on using it.
+	failed in the sense `record_failure` tracks - it answered, promptly, and it
+	keeps its place at the head of the failover order. What the sweep costs a
+	group whose first member states one for everything is a second exchange per
+	query; what parking it would cost is a member the group no longer has when
+	the next one times out.
 
 	An unreadable rcode is left alone for a sharper reason: those eight bits are
 	two bytes an on-path attacker can write into any reply it can reach. Counting
@@ -309,13 +324,29 @@ sweep_query :: proc(query: []u8) -> []u8 {
 	return out
 }
 
-// Whether the rcode a client reads off the header is the rcode the responder
-// meant. Everything at 16 and above lives half in the OPT record's TTL, which a
-// stub does not look at; see `resolve_readable`. A reply too short to hold a
-// header, or one carrying no OPT record, reads as its header's own four bits,
-// which is what `peek_rcode` returns for both.
+/*
+Whether a reply is one the client's own question can be answered with.
+
+Two ways it is not, and `resolve_readable` argues both.
+
+An rcode of 16 or above, because the rcode a client reads off the header is then
+not the rcode the responder meant - the upper eight bits live in the OPT record's
+TTL, which a stub does not look at. A reply too short to hold a header, or one
+carrying no OPT record, reads as its header's own four bits, which is what
+`peek_rcode` returns for both.
+
+SERVFAIL or REFUSED, because neither says anything about the name asked for
+(RFC 2308 section 7.1): the first is the responder reporting on itself and the
+second is it declining to be asked, and the next member of the group may well
+know the answer. Every other rcode a stub can read is a statement about the name
+and stands as the client's answer.
+*/
 @(private)
-readable_rcode :: proc(response: []u8) -> bool {
+usable_rcode :: proc(response: []u8) -> bool {
+	#partial switch dns.peek_rcode(response) {
+	case .Serv_Fail, .Refused:
+		return false
+	}
 	return u16(dns.peek_rcode(response)) <= 0xf
 }
 

@@ -1706,9 +1706,9 @@ say.
 Four ways to be something other than that NODATA, and only the first is a failure
 in the ordinary sense. A route that never replies is a transport failure and
 reads as one everywhere. A route that answers SERVFAIL has replied, and
-`resolve_readable` hands that back as a perfectly good answer - the rcode is the
-client's, which is the right reading when the route was asked second and the
-wrong one here, where the parent was never given its turn; an internal authority
+`resolve_readable` hands that back once nobody else in its group can do better -
+the rcode is the client's, which is the right reading when the route was asked
+second and the wrong one here, where the parent was never given its turn; an internal authority
 that is up and failing is the deployment. An NXDOMAIN and a `DS` RRset are the
 two the parent is the authority for - what the public tree delegates, and whether
 it signs it - and a memory written by one unsettled reply must not be what

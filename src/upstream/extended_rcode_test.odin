@@ -9,7 +9,12 @@ import "elodin:config"
 import "elodin:dns"
 
 /*
-A reply whose rcode the client cannot read is not the group's last word.
+A reply the client's own question cannot use is not the group's last word.
+
+Two kinds of those, and this file holds both: an rcode the client cannot read,
+which is what the fixtures and the first tests are about, and a SERVFAIL or a
+REFUSED, which it reads perfectly well and which says nothing about the name -
+issue #309, at the end.
 
 `dns.peek_rcode` composes twelve bits - the header's four and eight more out of
 the OPT record's TTL (RFC 6891 section 6.1.3) - where a stub reads the four. So
@@ -71,14 +76,17 @@ canned_mock_loop :: proc(m: ^Canned_Mock) {
 }
 
 /*
-A reply for `QNAME`, with `ext` as the upper eight bits of its rcode.
+A reply for `QNAME`, with `ext` as the upper eight bits of its rcode and `rcode`
+as the header's own four.
 
-`make_opt` writes those into the OPT record's TTL, and the header's own nibble is
-left at zero throughout - which is the case rather than a detail of the fixture:
-rcode 16 is four zero bits in the header and a one in the extended byte.
+`make_opt` writes the upper eight into the OPT record's TTL. The header's nibble
+stays at zero for the extended-rcode cases, which is the case rather than a
+detail of the fixture: rcode 16 is four zero bits in the header and a one in the
+extended byte. The SERVFAIL and REFUSED cases are the other way round - nothing
+extended, and the whole rcode in the header where a stub reads it.
 */
 @(private = "file")
-canned_reply :: proc(ext: u8) -> []u8 {
+canned_reply :: proc(ext: u8, rcode := dns.Rcode.No_Error) -> []u8 {
 	question := make([]dns.Question, 1, context.temp_allocator)
 	question[0] = dns.Question {
 		name  = QNAME,
@@ -94,6 +102,7 @@ canned_reply :: proc(ext: u8) -> []u8 {
 	msg.flags.qr = true
 	msg.flags.rd = true
 	msg.flags.ra = true
+	msg.flags.rcode = u8(rcode)
 	wire, _, err := dns.encode_message(msg, context.temp_allocator)
 	if err != .None {
 		return nil
@@ -413,4 +422,146 @@ test_the_swept_query_carries_a_transaction_id_of_its_own :: proc(t: ^testing.T) 
 	`ODIN_TEST_FAIL_ON_BAD_MEMORY` tracks `context.allocator`, and the temporary
 	arena keeps its blocks mapped, so ASan sees nothing either.
 	*/
+}
+
+/*
+And a SERVFAIL or a REFUSED is not the group's last word either.
+
+Different reason, same conclusion. RFC 2308 section 7.1 reads SERVFAIL as the
+server saying nothing about the name - it is a report about the server - and
+REFUSED is the server declining to be asked at all. Neither is a verdict the
+other members of a failover group cannot improve on, and every other resolver
+treats them that way: dnsmasq retries and marks the sender, Unbound counts a
+SERVFAIL from a forward address as a failure and takes the next one, BIND moves
+to the next forwarder.
+
+What made this issue #309 rather than a preference is where it lands. A group of
+two exists so that one of them can be down; an upstream whose ACL changed, or
+whose own recursion is down, answers REFUSED or SERVFAIL promptly and forever,
+which never trips the health cooldown - that counts transport failures - and
+before this every client query stopped at it while the member beside it held the
+answer.
+
+Health is still left alone, on purpose, and the assertion below says so: an
+upstream that answers is not an upstream that has failed in the sense
+`record_failure` tracks, and the sweep is what costs the group nothing to get
+past it.
+*/
+@(test)
+test_a_reply_the_clients_question_cannot_use_is_asked_elsewhere :: proc(t: ^testing.T) {
+	for rcode in ([]dns.Rcode{.Serv_Fail, .Refused}) {
+		broken := Canned_Mock{}
+		answerer := Canned_Mock{}
+
+		bad, bad_thread, bad_ok := start_canned_mock(t, &broken, "broken", canned_reply(0, rcode))
+		if !bad_ok {
+			return
+		}
+		defer {
+			sync.atomic_store(&broken.stop, true)
+			thread.join(bad_thread)
+			thread.destroy(bad_thread)
+			net.close(broken.socket)
+			destroy(bad)
+		}
+
+		good, good_thread, good_ok := start_canned_mock(t, &answerer, "answerer", canned_reply(0))
+		if !good_ok {
+			return
+		}
+		defer {
+			sync.atomic_store(&answerer.stop, true)
+			thread.join(good_thread)
+			thread.destroy(good_thread)
+			net.close(answerer.socket)
+			destroy(good)
+		}
+
+		servers := make([]^Upstream, 2, context.allocator)
+		defer delete(servers, context.allocator)
+		servers[0] = bad
+		servers[1] = good
+
+		g := Group {
+			servers   = servers,
+			strategy  = .Failover,
+			timeout   = time.Second,
+			attempts  = 1,
+			allocator = context.allocator,
+		}
+
+		wire := canned_query()
+		testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
+
+		// The premise: `resolve` alone still takes the first member at its
+		// word, which is what the client was handed before this.
+		plain, plain_winner, plain_err := resolve(&g, wire, context.allocator)
+		testing.expect_value(t, plain_err, Error.None)
+		testing.expect_value(t, dns.peek_rcode(plain), rcode)
+		testing.expect_value(t, plain_winner, bad)
+		delete(plain, context.allocator)
+
+		resp, winner, err := resolve_readable(&g, wire, context.allocator)
+		testing.expect_value(t, err, Error.None)
+		testing.expectf(
+			t,
+			dns.peek_rcode(resp) == .No_Error,
+			"a client's question stopped at the member that answered %v",
+			rcode,
+		)
+		testing.expect_value(t, winner, good)
+		testing.expect(t, sync.atomic_load(&answerer.hits) > 0, "the second upstream was never asked")
+		delete(resp, context.allocator)
+
+		// It answered, promptly, and is not parked for it. SERVFAIL is a
+		// legitimate answer to plenty of questions and the sweep is cheap; what
+		// `record_failure` tracks is a server that has stopped replying.
+		testing.expect(t, healthy(bad), "an upstream was parked over an rcode it answered with")
+	}
+}
+
+/*
+And a group of one hands its SERVFAIL back untouched, at the cost of one query.
+
+Which is the ordinary deployment, and the arrangement the parity suite runs: one
+upstream, and every rcode it states is the client's answer. The sweep skips the
+member that already spoke, so where there is nobody else it does nothing at all -
+no second query, no invented error, the same bytes as before.
+*/
+@(test)
+test_a_lone_upstreams_servfail_is_still_the_clients_answer :: proc(t: ^testing.T) {
+	broken := Canned_Mock{}
+	bad, bad_thread, bad_ok := start_canned_mock(t, &broken, "broken", canned_reply(0, .Serv_Fail))
+	if !bad_ok {
+		return
+	}
+	defer {
+		sync.atomic_store(&broken.stop, true)
+		thread.join(bad_thread)
+		thread.destroy(bad_thread)
+		net.close(broken.socket)
+		destroy(bad)
+	}
+
+	servers := make([]^Upstream, 1, context.allocator)
+	defer delete(servers, context.allocator)
+	servers[0] = bad
+
+	g := Group {
+		servers   = servers,
+		strategy  = .Failover,
+		timeout   = time.Second,
+		attempts  = 1,
+		allocator = context.allocator,
+	}
+
+	wire := canned_query()
+	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
+
+	resp, winner, err := resolve_readable(&g, wire, context.allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expect_value(t, winner, bad)
+	testing.expect_value(t, dns.peek_rcode(resp), dns.Rcode.Serv_Fail)
+	testing.expect_value(t, sync.atomic_load(&broken.hits), 1)
+	delete(resp, context.allocator)
 }
