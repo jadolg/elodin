@@ -142,14 +142,26 @@ expand_rdata_names :: proc(
 	msg := r.msg
 	// The buffer is taken before the walk is known to get anywhere, and an arena
 	// gives nothing back when it does not - the `delete` below is a no-op there.
-	// So it is charged first, at what it may come to: each of the layout's names
-	// expands from two bytes to at most `MAX_NAME_WIRE`, and reserving for all
-	// of them is what keeps the buffer from outgrowing its block and stranding
-	// the first one in the arena uncharged. A record whose walk fails on its
-	// first byte costs this much and buys nothing, which is what makes it worth
-	// charging rather than trusting the walk to be short.
+	// So it is charged first, and a record whose walk fails on its first byte
+	// pays for it and buys nothing.
+	//
+	// Reserved for every name the layout has, each of which may expand from a
+	// two-byte pointer to a whole `MAX_NAME_WIRE`, so the buffer cannot outgrow
+	// its block and strand the first one in the arena uncharged. Charged for
+	// only that part of it, and not for the RDATA it is also going to hold: the
+	// RDATA is already paid for in the wire bytes the record occupies, since
+	// every record's `end - start` comes out of the one message, while the names
+	// are what expand out of proportion to it.
+	//
+	// The difference matters beyond the arithmetic. RDLENGTH grows when a
+	// compressed name is written back out in full, so a charge counting it would
+	// rise every time this codebase re-encodes a message it decoded - and it
+	// re-encodes constantly, to add an OPT record or strip a DNSSEC one. A
+	// message would then decode, be rebuilt, and fail to decode, which is the
+	// thing `NAME_BUDGET` is flat to avoid. `layout.names` is a property of the
+	// type and does not move.
 	reserve := end - start + layout.names * MAX_NAME_WIRE
-	if charge_name(r, reserve) != .None {
+	if charge_name(r, layout.names * MAX_NAME_WIRE) != .None {
 		return nil, false
 	}
 	buf := make([dynamic]u8, 0, reserve, allocator)

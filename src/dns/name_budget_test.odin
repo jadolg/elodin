@@ -208,6 +208,138 @@ test_pointer_px_rdata_stays_within_the_name_budget :: proc(t: ^testing.T) {
 }
 
 /*
+A name the budget refused does not come back as a raw record holding a pointer.
+
+`decode_record` keeps RDATA it could not parse as `Rdata_Raw` rather than
+rejecting the message, which is right for RDATA that is genuinely odd. A name
+refused for the budget is not odd - it is well formed and was simply not paid
+for - and readers take a raw record to mean the opposite: `cnamecheck` refuses
+an answer over a raw CNAME because its target is one no client could read
+either, which would be refusing an answer every client reads fine.
+
+The shape is A records under a 255-octet name up to the budget, then one CNAME
+whose target is a pointer to that name: it is the last record that can reach
+this, since a message with more in it fails on the next owner name anyway.
+*/
+@(test)
+test_a_refused_name_does_not_become_a_raw_record :: proc(t: ^testing.T) {
+	name := long_wire_name()
+	defer delete(name)
+
+	msg := make([dynamic]u8, 0, 16384)
+	defer delete(msg)
+	put_header(&msg, 651)
+	append(&msg, ..name)
+	put_u16(&msg, u16(Type.A))
+	put_u16(&msg, u16(Class.IN))
+	for _ in 0 ..< 650 {
+		append(&msg, 0xc0, 0x0c)
+		put_u16(&msg, u16(Type.A))
+		put_u16(&msg, u16(Class.IN))
+		append(&msg, 0, 0, 0x0e, 0x10)
+		put_u16(&msg, 4)
+		append(&msg, 93, 184, 216, 34)
+	}
+	append(&msg, 0xc0, 0x0c)
+	put_u16(&msg, u16(Type.CNAME))
+	put_u16(&msg, u16(Class.IN))
+	append(&msg, 0, 0, 0x0e, 0x10)
+	put_u16(&msg, 2)
+	append(&msg, 0xc0, 0x0c)
+
+	backing := make([]u8, 8 << 20)
+	defer delete(backing)
+	arena: mem.Arena
+	mem.arena_init(&arena, backing)
+
+	m, err := decode_message(msg[:], mem.arena_allocator(&arena))
+	testing.expect_value(t, err, Decode_Error.Name_Budget)
+	if err == .None && len(m.answer) > 0 {
+		last := m.answer[len(m.answer) - 1]
+		_, raw := last.data.(Rdata_Raw)
+		testing.expect(t, !raw, "the refused CNAME came back as a raw record")
+	}
+}
+
+/*
+A message this codebase rebuilds still decodes afterwards.
+
+`add_opt_record`, `strip_dnssec_records` and their neighbours all decode a reply
+and encode it again, and RDLENGTH grows when a compressed RDATA name is written
+back out in full - a two-byte pointer becomes up to 255 octets. A budget that
+counted RDLENGTH would therefore rise on the rebuild, and a reply that decoded
+on the way in would fail to decode on the way out: `fit_response` re-reads that
+wire whenever it passes the client's limit, and would answer TC for a message it
+had already read.
+
+The fixture is the one that found it: 100 PX records whose two RDATA names are
+pointers, with 300 A records behind them, 6871 bytes on the wire and 57471 once
+the names are expanded. The name octets are 0xc0 so the blob still looks worth
+walking after the rebuild, which is what makes the second reading charge for the
+expansion again.
+*/
+@(test)
+test_a_rebuilt_message_still_decodes :: proc(t: ^testing.T) {
+	name := make([dynamic]u8, 0, 256)
+	defer delete(name)
+	for l in ([]int{63, 63, 63, 61}) {
+		append(&name, u8(l))
+		for _ in 0 ..< l {
+			append(&name, 0xc0)
+		}
+	}
+	append(&name, 0)
+
+	msg := make([dynamic]u8, 0, 16384)
+	defer delete(msg)
+	put_header(&msg, 400)
+	append(&msg, ..name[:])
+	put_u16(&msg, u16(Type.PX))
+	put_u16(&msg, u16(Class.IN))
+	for _ in 0 ..< 100 {
+		append(&msg, 0xc0, 0x0c)
+		put_u16(&msg, u16(Type.PX))
+		put_u16(&msg, u16(Class.IN))
+		append(&msg, 0, 0, 0x0e, 0x10)
+		put_u16(&msg, 6)
+		put_u16(&msg, 10)
+		append(&msg, 0xc0, 0x0c)
+		append(&msg, 0xc0, 0x0c)
+	}
+	for _ in 0 ..< 300 {
+		append(&msg, 0xc0, 0x0c)
+		put_u16(&msg, u16(Type.A))
+		put_u16(&msg, u16(Class.IN))
+		append(&msg, 0, 0, 0x0e, 0x10)
+		put_u16(&msg, 4)
+		append(&msg, 93, 184, 216, 34)
+	}
+
+	backing := make([]u8, 48 << 20)
+	defer delete(backing)
+	arena: mem.Arena
+	mem.arena_init(&arena, backing)
+	a := mem.arena_allocator(&arena)
+
+	first, err := decode_message(msg[:], a)
+	testing.expect_value(t, err, Decode_Error.None)
+
+	rebuilt, truncated, eerr := encode_message(first, a)
+	testing.expect_value(t, eerr, Encode_Error.None)
+	testing.expect(t, !truncated, "the rebuild should have fitted")
+
+	_, again := decode_message(rebuilt, a)
+	testing.expectf(
+		t,
+		again == .None,
+		"%d bytes decoded, rebuilt to %d, and would not decode again: %v",
+		len(msg),
+		len(rebuilt),
+		again,
+	)
+}
+
+/*
 A record of a two-name layout takes its expansion buffer once.
 
 `expand_rdata_names` reserves the buffer before it walks, and PX, SOA, MINFO and

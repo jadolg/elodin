@@ -53,11 +53,13 @@ budget and a record array with the RDATA copies beside it.
 The array and the copies are not in the budget and do not need to be - a record
 costs at least eleven wire bytes, so they are already a fixed multiple of the
 message - but they are in what is measured here, and each reading makes its own.
-Six times the message covers them.
+That multiple is what the smallest record sets: eleven wire bytes buy a `Record`
+of `size_of(Record)`, which is around eight times over, and the RDATA copies are
+one more. Twelve covers it whatever the fixtures below happen to use.
 */
 @(private = "file")
 budget_ceiling :: proc(msg_len: int) -> int {
-	return 2 * (dns.NAME_BUDGET + 6 * msg_len)
+	return 2 * (dns.NAME_BUDGET + 12 * msg_len)
 }
 
 @(private = "file")

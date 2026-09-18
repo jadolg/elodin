@@ -2406,9 +2406,13 @@ nothing to fall back to, since an entry is built out of the whole message or not
 made at all.
 
 Both readings expand the same message into the same arena, and each gets
-`dns.NAME_BUDGET` to itself, so this procedure's ceiling is twice that - about
-1.25 MB, against the 8.5 MB one reading of a hostile reply reached before there
-was a budget at all. One budget across the pair was the other way to do it and
+`dns.NAME_BUDGET` to itself, so the names are bounded at twice that. What the
+arena holds is more: each reading also builds its own record array and its own
+RDATA copies, which are outside the budget and do not need to be in it - a
+record is at least eleven wire bytes, so both are already a fixed multiple of
+the message. Measured, a 64 KB reply built to spend the budget costs 2,031,200
+bytes across the pair, against the 8,550,616 one reading of it reached before
+there was a budget at all. One budget across the pair was the other way to do it and
 costs more than it saves: a reply large enough for the first reading to spend
 most of the budget would lose the shorter reading as well, which is refusing an
 answer this server had no opinion about, and that is the thing the shorter

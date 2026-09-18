@@ -67,8 +67,11 @@ Reader :: struct {
 Charge `n` presentation bytes to the message's expansion budget.
 
 Charged after the clone rather than before it, since what a name costs is not
-known until it is decoded; a single name overshoots by at most
-`MAX_NAME_PRESENTATION`, and nothing else is decoded once the budget is gone.
+known until it is decoded, so a name overshoots the budget by at most
+`MAX_NAME_PRESENTATION` and nothing else is decoded once it is gone. RDATA
+expansion is the exception and charges ahead of itself instead - see
+`expand_rdata_names`, which knows what its buffer will cost before it takes it
+and so overshoots by nothing.
 */
 @(private)
 charge_name :: proc(r: ^Reader, n: int) -> Decode_Error {
@@ -245,6 +248,22 @@ decode_record :: proc(r: ^Reader, allocator: mem.Allocator) -> (rec: Record, err
 	rdata_end := r.pos + rdlength
 
 	rec.data, err = decode_rdata(r, rec.type, rdata_start, rdata_end, allocator)
+	if err == .Name_Budget {
+		/*
+		The one failure not worth retrying, and the one it would be wrong to
+		swallow.
+
+		Every other failure here is about this record - a trailing byte, a
+		length that disagrees - and the bytes may still be worth forwarding.
+		A spent name budget is about the message, so the retry would only spend
+		what is left of it again; and it is a well-formed name that was refused,
+		so keeping the record would put a live compression pointer into an
+		`Rdata_Raw` that readers take to mean the opposite. `cnamecheck` reads
+		a raw CNAME as a target no client could read either and refuses the
+		answer over it, which would be refusing one every client reads fine.
+		*/
+		return {}, err
+	}
 	if err != .None {
 		// Malformed or unrecognised RDATA is preserved rather than rejected, so
 		// odd records still survive a forward. Compressed names in it are still
