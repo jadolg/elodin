@@ -140,6 +140,15 @@ expand_rdata_names :: proc(
 	ok: bool,
 ) {
 	msg := r.msg
+	// The buffer is taken before the walk is known to get anywhere, and an arena
+	// gives nothing back when it does not - the `delete` below is a no-op there.
+	// So it is charged first, at what it may come to: every name in it expands
+	// from two bytes to at most `MAX_NAME_WIRE`. A record whose walk fails on
+	// its first byte costs this much and buys nothing, which is what makes it
+	// worth charging rather than trusting the walk to be short.
+	if charge_name(r, end - start + MAX_NAME_WIRE) != .None {
+		return nil, false
+	}
 	buf := make([dynamic]u8, 0, end - start + MAX_NAME_WIRE, allocator)
 	defer if !ok {
 		delete(buf)

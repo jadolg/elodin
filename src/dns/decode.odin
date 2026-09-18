@@ -43,11 +43,13 @@ fourteen times on replies of a few hundred bytes, and fourteen times nothing is
 nothing. What matters is the figure a full-length reply can reach, and that is
 what the multiplier holds down - to 640 KB at 64 KB of message.
 
-What the pair refuses is a full-length reply whose names still come to more than
-the allowance and eight times the message together: four thousand records of one
-253-character name, say. That is legal, and no real server sends it - a name is
-normally printable, written out once for every record or two that carries it, and
-costs a fraction of the record carrying it.
+What the pair refuses is a full-length reply whose names come to more than the
+allowance and eight times the message together. A record whose owner is a pointer
+is 16 wire bytes, so at 64 KB that boundary sits around 160 presentation
+characters of name per record - an RRset of four thousand records under one name
+that long, and nothing shorter. It is legal and no real server sends it: a name
+is normally printable and a few dozen characters, written out once for every
+record or two that carries it.
 */
 NAME_BUDGET_FLOOR :: 128 * 1024
 NAME_EXPANSION_FACTOR :: 8
@@ -248,7 +250,10 @@ decode_record :: proc(r: ^Reader, allocator: mem.Allocator) -> (rec: Record, err
 		// odd records still survive a forward. Compressed names in it are still
 		// expanded where they can be: a type this decoder does model can fail on
 		// something else entirely - a trailing byte, a length that disagrees -
-		// and come through here with a perfectly good pointer inside it.
+		// and come through here with a perfectly good pointer inside it. Such a
+		// record charges its names to the budget twice, once for each attempt,
+		// which is the right count: the first attempt's clones are in the arena
+		// as surely as the second's.
 		rec.data = decode_raw_rdata(r, rec.type, rdata_start, rdata_end, allocator)
 		err = .None
 	}

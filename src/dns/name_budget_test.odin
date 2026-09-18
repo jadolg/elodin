@@ -93,6 +93,54 @@ pointer_px_answer :: proc() -> []u8 {
 	return msg[:]
 }
 
+/*
+An answer of NXT records whose RDATA holds a pointer byte but no walkable name.
+
+`decode_raw_rdata` takes the expansion buffer before it knows whether the walk
+will get anywhere, and an arena does not take it back when the walk fails on the
+first byte. Nothing here is charged to anything, and the record it buys is
+fourteen wire bytes.
+*/
+@(private = "file")
+unwalkable_raw_answer :: proc() -> []u8 {
+	msg := make([dynamic]u8, 0, 65535)
+	put_header(&msg, 0)
+	append(&msg, 1, 'x', 0)
+	put_u16(&msg, u16(Type.NXT))
+	put_u16(&msg, u16(Class.IN))
+	count := 0
+	for len(msg) + 14 <= 65535 {
+		append(&msg, 0xc0, 0x0c)
+		put_u16(&msg, u16(Type.NXT))
+		put_u16(&msg, u16(Class.IN))
+		append(&msg, 0, 0, 0x0e, 0x10)
+		put_u16(&msg, 2) // rdlength
+		// A reserved label type, so the name walk fails before it starts - but
+		// the second byte is a pointer byte, which is what makes it look worth
+		// walking.
+		append(&msg, 0x80, 0xc0)
+		count += 1
+	}
+	msg[6] = u8(count >> 8)
+	msg[7] = u8(count)
+	return msg[:]
+}
+
+@(test)
+test_unwalkable_raw_rdata_stays_within_the_name_budget :: proc(t: ^testing.T) {
+	msg := unwalkable_raw_answer()
+	defer delete(msg)
+
+	used, _ := decode_into_arena(t, msg)
+	testing.expectf(
+		t,
+		used <= DECODE_CEILING * len(msg),
+		"a %d-byte reply expanded into %d bytes of arena through raw RDATA that never walked",
+		len(msg),
+		used,
+	)
+}
+
 @(private = "file")
 decode_into_arena :: proc(t: ^testing.T, msg: []u8) -> (used: int, err: Decode_Error) {
 	backing := make([]u8, 48 << 20)
@@ -111,8 +159,13 @@ The budget bounds the names. The record array and the RDATA copies beside them
 are not in it and do not need to be - a record costs at least eleven wire bytes,
 so both are already a fixed multiple of the message - but they are in what the
 arena holds, which is what is measured here. Twenty-four times over covers the
-lot; the shapes below cost a hundred and thirty times their own length and more
+shapes below, which cost a hundred and thirty times their own length and more
 with nothing bounding the names.
+
+It is not a ceiling on the decoder. Names are not its only expansion: a TXT
+record of 65 KB of zero-length character-strings decodes to 32 times its own
+length through the retained `[dynamic]string`, which this budget does not touch
+and issue #351 covers.
 */
 @(private = "file")
 DECODE_CEILING :: 24
@@ -153,19 +206,26 @@ test_pointer_px_rdata_stays_within_the_name_budget :: proc(t: ^testing.T) {
 }
 
 /*
-The tightest shape a legitimate answer takes still decodes.
+A full-length answer whose owner names are as long as a real one's get still
+decodes.
 
-One 253-character owner name - the longest there is - written once and pointed
-at by a hundred A records, which is 254 bytes of name for every 16 of wire and
-about as far as a real answer can push the ratio. Ordinary traffic is nowhere
-near; this is the case the factor was chosen against.
+The shape that costs the most and is still something a server would send: one
+name written out once and pointed at by every record of an RRset under it, at
+the largest a reply gets. A hundred characters is a long hostname and 4000 A
+records is a large RRset; together they come to 404 KB of names against a budget
+of 652 KB.
+
+It is the factor this pins and not the floor - the names here are three times
+the flat allowance on their own, so the test fails with the factor at two and
+passes at eight. The boundary itself is a good way further out: at this length a
+pointer-owned record costs 16 wire bytes for about 101 of name, and it takes
+around 160 characters of name before a full-length reply of them is refused.
 */
 @(test)
 test_long_name_pointed_at_by_a_whole_rrset_still_decodes :: proc(t: ^testing.T) {
-	// 63 + 63 + 63 + 61 characters of label, printable this time.
-	name := make([dynamic]u8, 0, 256)
+	name := make([dynamic]u8, 0, 128)
 	defer delete(name)
-	for l in ([]int{63, 63, 63, 61}) {
+	for l in ([]int{63, 36}) {
 		append(&name, u8(l))
 		for _ in 0 ..< l {
 			append(&name, 'a')
@@ -173,20 +233,24 @@ test_long_name_pointed_at_by_a_whole_rrset_still_decodes :: proc(t: ^testing.T) 
 	}
 	append(&name, 0)
 
-	msg := make([dynamic]u8, 0, 2048)
+	msg := make([dynamic]u8, 0, 65535)
 	defer delete(msg)
-	put_header(&msg, 100)
+	put_header(&msg, 0)
 	append(&msg, ..name[:])
 	put_u16(&msg, u16(Type.A))
 	put_u16(&msg, u16(Class.IN))
-	for _ in 0 ..< 100 {
+	count := 0
+	for len(msg) + 16 <= 65535 {
 		append(&msg, 0xc0, 0x0c)
 		put_u16(&msg, u16(Type.A))
 		put_u16(&msg, u16(Class.IN))
 		append(&msg, 0, 0, 0x0e, 0x10)
 		put_u16(&msg, 4)
 		append(&msg, 93, 184, 216, 34)
+		count += 1
 	}
+	msg[6] = u8(count >> 8)
+	msg[7] = u8(count)
 
 	_, err := decode_into_arena(t, msg[:])
 	testing.expect_value(t, err, Decode_Error.None)
