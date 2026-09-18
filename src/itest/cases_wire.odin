@@ -63,9 +63,13 @@ run_wire_cases :: proc(r: ^Runner) {
 		find_keepalive(&scratch, bad)
 		check_eq_int(r, len(scratch.failures), 7, "helpers that refused an undecodable reply")
 
-		// And the header reader, whose zero value reads as NOERROR.
-		parse_header(&scratch, bad[:8])
+		// And the header reader, whose zero value reads as NOERROR. It fails the
+		// case and still hands the zeros back, which is why a case that counts
+		// what it reads needs a length guard of its own; assert both halves,
+		// since the second is what `cases_queryid.odin` defends against.
+		short := parse_header(&scratch, bad[:8])
 		check_eq_int(r, len(scratch.failures), 8, "a reply too short for a header also fails")
+		check(r, short == Header{}, "a header read from too few bytes is not zeroed")
 	}
 	end_case(r)
 

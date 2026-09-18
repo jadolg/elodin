@@ -710,7 +710,7 @@ answer "did this server write a keepalive" with "no" for the one wrong answer
 worth catching: the client's own zero-length option echoed back verbatim. Those
 are the bytes a case asserting absence has to be able to see.
 
-`pw_keepalive_units` is the other half, for the cases that want the number.
+`keepalive_units` is the other half, for the cases that want the number.
 */
 find_keepalive :: proc(r: ^Runner, wire: []u8) -> (timeout: []u8, found: bool) {
 	msg := decode_reply(r, wire) or_return
@@ -743,9 +743,12 @@ Header :: struct {
 /*
 Read the header straight from the bytes, without the decoder under test.
 
-A reply too short to hold one fails the case rather than handing back a zeroed
+A reply too short to hold one fails the case as well as handing back a zeroed
 header: that zero reads as NOERROR with every count at zero, which is what most
-cases assert, so bytes nothing could read used to satisfy them.
+cases assert, so bytes nothing could read used to satisfy them. The caller's own
+checks still run over the zeroed header, so a case that counts or accumulates
+what it reads here - `cases_queryid.odin` draws distinct transaction IDs from it -
+wants a length guard of its own rather than a second failure line.
 */
 parse_header :: proc(r: ^Runner, wire: []u8) -> (h: Header) {
 	if len(wire) < 12 {
