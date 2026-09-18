@@ -2129,6 +2129,7 @@ test_the_apex_memory_counts_is_bounded_and_defers_to_an_anchor :: proc(t: ^testi
 	}
 	first := domains[0][0]
 	second := domains[1][0]
+	third := domains[2][0]
 	last := domains[APEX_MEMO_SLOTS][0]
 
 	// Nothing is remembered of an apex nobody has asked about, and nothing at
@@ -2169,9 +2170,8 @@ test_the_apex_memory_counts_is_bounded_and_defers_to_an_anchor :: proc(t: ^testi
 	testing.expect(t, !apex_ds_parent_unsettled(&s, second), "a parent that never replied was remembered as unhelpful")
 
 	/*
-	Filling the table: every apex but the last, in order, so the first one
-	written is the one whose memory expires first and therefore the one the next
-	write evicts.
+	Filling the table: every apex but the last, so that the one past its size has
+	nowhere to go.
 	*/
 	for i in 0 ..< APEX_MEMO_SLOTS {
 		strike(&s, domains[i][0], upstream.FAILURE_THRESHOLD)
@@ -2203,18 +2203,36 @@ test_the_apex_memory_counts_is_bounded_and_defers_to_an_anchor :: proc(t: ^testi
 	testing.expect(t, apex_ds_parent_unsettled(&s, last), "an apex was not given a slot that had come free")
 
 	/*
-	And the rule that is not about the window at all: an anchored routed zone is
-	held to the public chain, where the route's unsigned answer is a SERVFAIL
-	rather than a stand-in. `first` was cleared just above and `last` took the
-	slot, so what is written for `first` while the anchor stands can be read
-	afterwards - or not, which is the assertion.
+	And the two rules that decide whether anything is written at all, each with a
+	slot standing free so that a refusal is the rule's doing and not the table's.
+	Two slots are cleared for the purpose, one per rule: with the table full,
+	every write is refused anyway and an assertion here would pass whatever the
+	guards did.
+
+	The anchored zone first. An operator who anchored a routed zone asked for the
+	public chain, where the route's unsigned answer is a SERVFAIL rather than a
+	stand-in, so nothing is read back for it - and nothing is written either,
+	which is what the free slot makes visible. Unanchoring and striking again is
+	the control: the same apex, the same free slot, remembered this time.
 	*/
+	remember_apex_ds_parent(&s, second, true, true)
+	remember_apex_ds_parent(&s, third, true, true)
 	testing.expect(t, apex_ds_memo_applies(&s, last), "the memory did not apply to a zone served insecure")
-	s.anchor_zones = []string{first, last}
-	testing.expect(t, !apex_ds_memo_applies(&s, last), "the memory answered for the parent under an anchor the operator asked for")
+	s.anchor_zones = []string{first}
+	testing.expect(t, !apex_ds_memo_applies(&s, first), "the memory answered for the parent under an anchor the operator asked for")
 	strike(&s, first, upstream.FAILURE_THRESHOLD)
+	testing.expect(t, !apex_ds_parent_unsettled(&s, first), "an anchored apex was remembered")
 	s.anchor_zones = nil
-	testing.expect(t, !apex_ds_parent_unsettled(&s, first), "an anchored apex took a slot in a table that cannot act on it")
+	strike(&s, first, upstream.FAILURE_THRESHOLD)
+	testing.expect(t, apex_ds_parent_unsettled(&s, first), "the free slot the anchored apex was refused was not there at all")
+
+	/*
+	And a name that is no route's apex, which has the second free slot to take and
+	must not take it: the apex that wants it next has to still find it there.
+	*/
+	strike(&s, "nas.z0.example.", upstream.FAILURE_THRESHOLD)
+	strike(&s, second, upstream.FAILURE_THRESHOLD)
+	testing.expect(t, apex_ds_parent_unsettled(&s, second), "a name that is no route's apex took the last free slot")
 	free_all(context.temp_allocator)
 }
 

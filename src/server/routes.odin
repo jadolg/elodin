@@ -665,10 +665,20 @@ is: three questions in flight together against a parent having one bad second
 each come back unsettled and each leave a strike, so a busy resolver can reach
 the threshold on a stumble that a quiet one would never have remembered. What
 that costs is what the window and the fallback already bound - the route's
-answer, for ten seconds, where the route can answer at all - and what it would
-take to distinguish is a clock per slot for something the cooldown already
-expires. Named here because the next reader will otherwise read "three in a row"
-as three separate occasions.
+answer, for ten seconds, where the route can answer at all.
+
+And the same window read from the other end is this memory's real ceiling, which
+is worth stating plainly rather than leaving a reader to find: an apex asked
+about less often than once per `upstream.COOLDOWN` never arms it at all. Each
+reply's strike expires before the next reply arrives, the count starts again at
+one, and a memory that did arm would have expired before the next query could
+read it anyway. So a parent with an ACL that REFUSEs every `DS`, asked once every
+fifteen seconds, goes on paying its two exchanges per query exactly as it did
+before this existed; what this bounds is the same parent asked faster than its
+own memory expires. Widening it means keeping a memory longer than the cause it
+stands for, which is the thing issue #243 asked to be bounded by "something like
+the cooldown", and a separate clock per slot is the change if a deployment ever
+shows the rate matters.
 */
 @(private)
 apex_ds_parent_unsettled :: proc(s: ^Server, name: string) -> bool {
@@ -701,10 +711,13 @@ slot is cleared, false and it counts as one more reply in a row that settled
 nothing - `upstream.FAILURE_THRESHOLD` of them inside the window and the route is
 asked first for the rest of it.
 
-The slot chosen is this apex's own where it has one, and otherwise the one whose
-memory expires soonest - which takes an unclaimed slot first, its zero `until`
-being older than any real one, and evicts the stalest memory when every slot is
-in use.
+The slot chosen is this apex's own where it has one, and otherwise the first that
+is free: never claimed, or claimed by a memory whose window has run out. Where
+every slot is live, nothing is written and this apex pays what every apex paid
+before this memory existed. Nothing is evicted, ever, which is the ceiling
+`Apex_Memo` names and the reason it is a ceiling rather than a failure: a table
+that took a live slot to start a new count would, past its size, leave every
+apex restarting and none of them ever remembered.
 */
 @(private)
 remember_apex_ds_parent :: proc(s: ^Server, name: string, reached, settled: bool) {
