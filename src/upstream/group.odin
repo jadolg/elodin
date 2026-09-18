@@ -80,9 +80,19 @@ resolve :: proc(
 	g: ^Group,
 	query: []u8,
 	allocator := context.allocator,
-	// Where non-nil, every member this call asked and could not reach is
-	// appended. `resolve_insisting` reads it so its sweep does not spend
-	// another `g.timeout` on a server that has just proved silent; see there.
+	/*
+	Where non-nil, every member this call asked and could not reach is appended.
+	`resolve_insisting` reads it so its sweep does not spend another `g.timeout`
+	on a server that has just proved silent; see there.
+
+	Filled by the sequential paths, which learn of a failure by waiting for it.
+	A race of two or more fills nothing: it returns the moment the first member
+	answers, and the member that is not there says so only at the end of its own
+	timeout, long after - so at the point this returns there is nothing true to
+	report. That is the strategy `resolve_insisting` already names as the one
+	paying most for a sweep, and the fix for it is the same one sketched there:
+	take the first *acceptable* reply inside the race.
+	*/
 	unreachable: ^[dynamic]^Upstream = nil,
 ) -> (
 	response: []u8,
@@ -91,7 +101,7 @@ resolve :: proc(
 ) {
 	switch g.strategy {
 	case .Race:
-		return resolve_race(g, query, allocator)
+		return resolve_race(g, query, allocator, unreachable)
 	case .Round_Robin:
 		start := int(sync.atomic_add(&g.cursor, 1) % u64(len(g.servers)))
 		return resolve_sequential(g, query, start, allocator, unreachable)
@@ -279,13 +289,20 @@ resolve_insisting :: proc(
 	exchange for it instead, and the upgrade path above is what would fix it in
 	place.
 	*/
-	// Counted against the member that was passed over, once per sweep that
-	// reaches somebody - not once per exchange the sweep then makes, so a group
-	// of four that asks three of them still counts one. A lone upstream, or a
-	// group whose every other member is either parked or already unreachable on
-	// this query, asks nobody and is counted nowhere. `note_swept_rcode` says
-	// why nothing else records it at all.
-	counted := false
+	/*
+	Counted here, against the member whose reply sent the group looking, and
+	once per such reply rather than once per exchange the sweep then makes.
+
+	Before where the sweep succeeds, and before knowing whether it will ask
+	anybody at all, because the question the figure answers is which member is
+	answering what its group cannot use - and the arrangement that most needs an
+	answer to it is the one where the sweep finds nowhere to go: a member
+	REFUSING everything beside a member in its cooldown breaks every query this
+	server takes, while `failures` and `up` both report it well. What the sweep
+	spends is a different question, and `elodin_upstream_queries_total` per
+	member is where it is already answered.
+	*/
+	note_swept_rcode(winner)
 
 	for u in g.servers {
 		if u == winner {
@@ -304,6 +321,10 @@ resolve_insisting :: proc(
 		else's news and the member goes on being asked, because a group whose
 		second member is reached only when the first breaks would otherwise
 		carry a stale failure for as long as the first one holds.
+
+		Under `strategy: race` this list is empty for a group of two or more, so
+		the saving is the sequential strategies'. `resolve` says why: the race
+		is over before a dead member has finished not answering.
 		*/
 		if slice.contains(unreachable[:], u) {
 			logx.debugf("upstream %s did not answer this query, not asked again for it", u.spec.name)
@@ -312,10 +333,6 @@ resolve_insisting :: proc(
 		if !healthy(u) {
 			logx.debugf("upstream %s is in its cooldown, not asked again for this one", u.spec.name)
 			continue
-		}
-		if !counted {
-			note_swept_rcode(winner)
-			counted = true
 		}
 		resp, xerr := exchange(u, sweep_query(query), g.timeout, allocator)
 		if xerr != .None {
@@ -459,6 +476,28 @@ BOGUS_EDE_FIRST :: 6
 BOGUS_EDE_LAST :: 12
 
 /*
+And the extended errors that make a REFUSED a statement about the name: 15
+(Blocked), 16 (Censored) and 17 (Filtered) of RFC 8914 section 4. Each one says
+the responder holds an answer and will not give it *for this name* - an internal
+blocklist, an external requirement, or a list the client itself asked for.
+
+Which is a policy about the question rather than a report about the server, so
+it is the client's answer and the group is not swept. It is also the one thing
+that keeps a filtering resolver usable as a member of a group: elodin in front
+of AdGuard Home, Blocky or an RPZ rule that blocks with REFUSED, with a public
+resolver beside it for everything else, would otherwise have every blocked name
+re-asked of the public one and answered.
+
+Not 18 (Prohibited), which is the opposite case and the one the sweep is for:
+that is the responder declining *this client* - an ACL that no longer lists this
+server - and it says nothing about the name at all.
+*/
+@(private)
+POLICY_EDE_FIRST :: 15
+@(private)
+POLICY_EDE_LAST :: 17
+
+/*
 Whether a reply is one the client's own question can be answered with.
 
 Two ways it is not, and `resolve_readable` argues both.
@@ -472,34 +511,36 @@ what `peek_rcode` returns for both.
 SERVFAIL or REFUSED, because neither says anything about the name asked for
 (RFC 2308 section 7.1): the first is the responder reporting on itself and the
 second is it declining to be asked, and the next member of the group may well
-know the answer. Unless the SERVFAIL says otherwise in an extended error, which
-`BOGUS_EDE_FIRST` is about. Every other rcode a stub can read is a statement
-about the name and stands as the client's answer.
+know the answer. Unless the reply says otherwise in an extended error - a
+validation failure behind the SERVFAIL (`BOGUS_EDE_FIRST`) or a blocklist behind
+the REFUSED (`POLICY_EDE_FIRST`), each of which is about the name after all.
+Every other rcode a stub can read is a statement about the name and stands as
+the client's answer.
 */
 @(private)
 usable_rcode :: proc(response: []u8) -> bool {
 	rcode := dns.peek_rcode(response)
 	#partial switch rcode {
 	case .Serv_Fail:
-		return validation_failure(response)
+		return extended_error_within(response, BOGUS_EDE_FIRST, BOGUS_EDE_LAST)
 	case .Refused:
-		return false
+		return extended_error_within(response, POLICY_EDE_FIRST, POLICY_EDE_LAST)
 	}
 	return u16(rcode) <= 0xf
 }
 
-// Whether the reply carries an extended error saying this name could not be
-// validated. A reply with no OPT record, no extended error, or an option too
-// short to hold the two-byte info-code makes no such claim; see the constants
-// above.
+// Whether the reply carries an RFC 8914 extended error between `first` and
+// `last`, which is how both exceptions above are read. A reply with no OPT
+// record, no extended error, or an option too short to hold the two-byte
+// info-code makes no such claim.
 @(private)
-validation_failure :: proc(response: []u8) -> bool {
+extended_error_within :: proc(response: []u8, first, last: u16) -> bool {
 	data, found := dns.peek_edns_option(response, .Ext_Error)
 	if !found || len(data) < 2 {
 		return false
 	}
 	info := u16(data[0]) << 8 | u16(data[1])
-	return BOGUS_EDE_FIRST <= info && info <= BOGUS_EDE_LAST
+	return first <= info && info <= last
 }
 
 @(private)
@@ -629,6 +670,7 @@ resolve_race :: proc(
 	g: ^Group,
 	query: []u8,
 	allocator: mem.Allocator,
+	unreachable: ^[dynamic]^Upstream = nil,
 ) -> (
 	response: []u8,
 	winner: ^Upstream,
@@ -647,6 +689,9 @@ resolve_race :: proc(
 	}
 	if len(candidates) == 1 {
 		resp, xerr := exchange(candidates[0], query, g.timeout, allocator)
+		if xerr != .None && unreachable != nil {
+			append(unreachable, candidates[0])
+		}
 		return resp, candidates[0], xerr
 	}
 
@@ -681,7 +726,7 @@ resolve_race :: proc(
 		submitted += 1
 	}
 	if submitted == 0 {
-		return resolve_sequential(g, query, 0, allocator)
+		return resolve_sequential(g, query, 0, allocator, unreachable)
 	}
 
 	if !sync.sema_wait_with_timeout(&st.sema, g.timeout) {

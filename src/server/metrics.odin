@@ -808,10 +808,10 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 	failure, so the member that is doing it holds a clean
 	`elodin_upstream_failures_total` and an `elodin_upstream_up` of 1 while
 	every query through the group costs an extra exchange. This is the figure
-	that names it. One per sweep that went on to ask somebody, rather than one
-	per exchange it then made or one per reply refused: a group with nowhere
-	left to ask counts nothing, and a group of four counts one for a sweep that
-	asks three.
+	that names it. One per reply the group could not use - not one per exchange
+	the sweep then made, and counted whether or not there was anybody left to
+	ask, since a group with nowhere to go is the arrangement breaking the most
+	queries.
 	*/
 	metrics.family(
 		b,

@@ -442,6 +442,13 @@ clock or a stale root key, states one of these about every signed name and is
 believed, so no failover happens for those names until it is taken out of the
 group.
 
+A REFUSED that carries an RFC 8914 extended error of 15, 16 or 17 — blocked,
+censored or filtered — is exempt on the same grounds: those say the responder is
+declining *this name* on policy, which is a statement about it, so a filtering
+resolver (AdGuard Home, Blocky, an RPZ rule) stays usable as a member of a group
+as long as it says what it did. Code 18, prohibited, is not exempt: that is the
+responder declining this *client*, which is the ACL case the sweep exists for.
+
 The member that was passed over is counted against its name in
 `elodin_upstream_swept_rcode_total{upstream}`, since its health is deliberately
 left alone and no other figure would name it.
@@ -2059,7 +2066,7 @@ as a warning at startup.
 | `elodin_upstream_latency_seconds_total{upstream}` | counter | cumulative round-trip time; divide by the query counter under `rate()` for the mean |
 | `elodin_upstream_up{upstream}` | gauge | 0 while an upstream is in its failure cooldown |
 | `elodin_upstream_unreadable_rcode_total{upstream}` | counter | replies from each upstream refused because their rcode is one a client would read as a different rcode — the extended half lives in the OPT record and a stub reads the header. Not counted as a failure above, on purpose: those bytes are forgeable, and a failure would park the group |
-| `elodin_upstream_swept_rcode_total{upstream}` | counter | replies from each upstream that another member of its group was asked to answer instead: for a client's question a SERVFAIL, a REFUSED or an unreadable rcode, and for a DNSSEC chain lookup anything that is not NOERROR or NXDOMAIN. One per reply, counted only where there was another member left to ask. Not a failure either, so this is the only figure naming a member that answers but cannot help |
+| `elodin_upstream_swept_rcode_total{upstream}` | counter | replies from each upstream that another member of its group was asked to answer instead: for a client's question a SERVFAIL, a REFUSED or an unreadable rcode, and for a DNSSEC chain lookup anything that is not NOERROR or NXDOMAIN. One per such reply, whether or not there was another member left to ask — a member REFUSING everything beside one in its cooldown breaks every query while both look healthy, and this is what names it. Not a failure either, so this is the only figure naming a member that answers but cannot help |
 | `elodin_udp_datagrams_total{reader}` | counter | datagrams each UDP reader took off its socket |
 | `elodin_udp_receive_drops_total{reader}` | counter | datagrams the kernel dropped on that reader's receive queue before they could be read; absent where `/proc` cannot be read |
 | `elodin_pool_workers{pool}` / `elodin_pool_pending{pool}` | gauge | the `query` and `upstream` pools; `pending` that does not return to zero is `server.workers` set too low |

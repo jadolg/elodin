@@ -529,7 +529,8 @@ test_a_reply_the_clients_question_cannot_use_is_asked_elsewhere :: proc(t: ^test
 }
 
 /*
-Except where the SERVFAIL says the name could not be validated: that one stands.
+Except where the reply says, in an extended error, that it is about the name
+after all: those stand.
 
 The exception `BOGUS_EDE_FIRST` is written on, and the case it protects is a
 group whose members do not all validate - a validating resolver beside an ISP
@@ -540,32 +541,44 @@ server would cache it and hand it to every client behind it. RFC 8914 is how the
 first member says which of the two SERVFAILs it meant, and every validating
 resolver attaches one.
 
-Three replies, one per reading: extended error 6 (DNSSEC Bogus) stands as the
-answer, extended error 22 (No Reachable Authority) is the server reporting on
-itself and is swept past, and a SERVFAIL carrying no extended error at all makes
-no claim and is swept past too - which is the case the test above covers, and is
+The REFUSED half is the same shape for a different reason. 15, 16 and 17 -
+blocked, censored, filtered - are a responder declining this *name* on policy,
+which a filtering member of a group has to be able to say or its blocks are
+fetched from the member beside it. 18, prohibited, is that responder declining
+this *client*, which says nothing about the name and is exactly what the sweep
+is for.
+
+Eight replies, one per reading, and in both halves a reply carrying no extended
+error at all makes no claim and is swept past - the case the tests above cover,
 here for the contrast.
 */
 @(test)
-test_a_servfail_that_names_a_validation_failure_is_the_answer :: proc(t: ^testing.T) {
+test_an_extended_error_that_names_the_reason_is_the_answer :: proc(t: ^testing.T) {
 	Case :: struct {
 		what:   string,
+		rcode:  dns.Rcode,
 		// -1 for a reply with no extended error in it at all.
 		ede:    int,
 		stands: bool,
 	}
 	cases := []Case {
-		{"DNSSEC Bogus", 6, true},
-		{"NSEC Missing", 12, true},
-		{"No Reachable Authority", 22, false},
-		{"no extended error", -1, false},
+		{"DNSSEC Bogus", .Serv_Fail, 6, true},
+		{"NSEC Missing", .Serv_Fail, 12, true},
+		{"No Reachable Authority", .Serv_Fail, 22, false},
+		{"a SERVFAIL with no extended error", .Serv_Fail, -1, false},
+		{"Blocked", .Refused, 15, true},
+		{"Filtered", .Refused, 17, true},
+		// The responder declining this client rather than this name, which is
+		// the case the sweep exists for.
+		{"Prohibited", .Refused, 18, false},
+		{"a REFUSED with no extended error", .Refused, -1, false},
 	}
 
 	for c in cases {
 		broken := Canned_Mock{}
 		answerer := Canned_Mock{}
 
-		bad, bad_thread, bad_ok := start_canned_mock(t, &broken, "broken", ede_servfail(c.ede))
+		bad, bad_thread, bad_ok := start_canned_mock(t, &broken, "broken", ede_reply(c.rcode, c.ede))
 		if !bad_ok {
 			return
 		}
@@ -610,8 +623,8 @@ test_a_servfail_that_names_a_validation_failure_is_the_answer :: proc(t: ^testin
 		if c.stands {
 			testing.expectf(
 				t,
-				winner == bad && dns.peek_rcode(resp) == .Serv_Fail,
-				"%s was swept past, so an unvalidated answer reached the client",
+				winner == bad && dns.peek_rcode(resp) == c.rcode,
+				"%s was swept past, so the client was answered from somewhere else",
 				c.what,
 			)
 		} else {
@@ -627,15 +640,15 @@ test_a_servfail_that_names_a_validation_failure_is_the_answer :: proc(t: ^testin
 }
 
 /*
-A SERVFAIL for `QNAME` carrying RFC 8914 extended error `info`, or none at all
-where `info` is negative.
+A reply for `QNAME` with `rcode` in its header, carrying RFC 8914 extended error
+`info`, or none at all where `info` is negative.
 
 The option goes in after the message is encoded, the way one reaches a reply on
 the wire: `set_edns_option` needs the OPT record `canned_reply` already writes.
 */
 @(private = "file")
-ede_servfail :: proc(info: int) -> []u8 {
-	wire := canned_reply(0, .Serv_Fail)
+ede_reply :: proc(rcode: dns.Rcode, info: int) -> []u8 {
+	wire := canned_reply(0, rcode)
 	if info < 0 || len(wire) == 0 {
 		return wire
 	}
@@ -696,10 +709,10 @@ test_a_lone_upstreams_servfail_is_still_the_clients_answer :: proc(t: ^testing.T
 	testing.expect_value(t, sync.atomic_load(&broken.hits), 1)
 	delete(resp, context.allocator)
 
-	// And nothing is counted against it, because nothing was asked: the series
-	// is the extra exchanges a reply cost its group, and on a lone upstream it
-	// cost none. See `note_swept_rcode`.
-	testing.expect_value(t, stats_of(bad).swept_rcode, u64(0))
+	// And it is counted, though there was nobody to ask: the series is the
+	// replies a group could not use, which is the figure that names the member
+	// answering them. See `note_swept_rcode`.
+	testing.expect_value(t, stats_of(bad).swept_rcode, u64(1))
 }
 
 /*
@@ -794,7 +807,7 @@ test_the_sweep_does_not_wait_again_on_a_member_that_timed_out :: proc(t: ^testin
 		spent,
 	)
 
-	// And the member that was never asked a second time is not counted as one
-	// the group swept past to: nobody was asked, so nothing was spent.
-	testing.expect_value(t, stats_of(ref).swept_rcode, u64(0))
+	// The REFUSED is counted against the member that sent it, as every reply
+	// the group cannot use is, whether or not the sweep found anywhere to go.
+	testing.expect_value(t, stats_of(ref).swept_rcode, u64(1))
 }

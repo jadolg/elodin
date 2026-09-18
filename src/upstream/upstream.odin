@@ -293,12 +293,15 @@ the sweep is where the decision is made and where the member that was passed
 over is known. It names that member and not the one that answered, which is the
 question an operator has - which of these should I go and look at.
 
-Counted once per sweep that goes on to ask somebody, which is the figure to read
-it as: replies from this member that sent the group looking elsewhere. Not the
-number of extra exchanges - a group of four counts one for a sweep that asks
-three of them - and not every refused reply either: a lone upstream, or a group
-whose other members are all parked or already unreachable on this query, asks
-nobody and is counted nowhere, because nothing was spent.
+One per reply the group could not use, which is the figure to read it as, and
+not the number of extra exchanges it caused: a group of four counts one for a
+sweep that asks three of them, and a lone upstream counts one for a reply there
+was nobody else to improve on. That last case is deliberate rather than
+tolerated - the arrangement that most needs naming is a member REFUSING
+everything beside a member in its cooldown, where the sweep finds nowhere to go
+and every client query breaks while `failures` and `up` both look healthy. What
+the sweep spends is a different question, and `elodin_upstream_queries_total`
+per member already answers it.
 
 Not confined to the rcodes a client's own question refuses, either.
 `resolve_insisting` is shared with the chain lookups, where `answerable` will
