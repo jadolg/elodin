@@ -1701,12 +1701,6 @@ validate_denial :: proc(
 	The hashing allowance, and the same answer as the two above it. A proof this
 	server stopped hashing partway through is not a proof it found wanting, and
 	`Bogus` would report our own limit to the client as a forgery - with its
-	address beside the word in the log.
-	*/
-	/*
-	The hashing allowance, and the same answer as the two above it. A proof this
-	server stopped hashing partway through is not a proof it found wanting, and
-	`Bogus` would report our own limit to the client as a forgery - with its
 	address beside the word in the log. Only where there were NSEC3 records to
 	hash: the flag is the whole question's and stays set once anything sets it,
 	so reading it over an NSEC-only proof would file a forgery under an
@@ -2768,13 +2762,13 @@ Kept apart from the lookup around it because this is the whole of the decision
 and none of it needs a network: the records have already been checked against
 the parent's keys, and what is left is what they say.
 
-`cut_short` says this reading was made with hashing refused, and it is this
-step's own answer rather than the meter's. The flag on the budget is the
-question's: it stays set for everything after whatever emptied it, so a step
-that reached its verdict from NSEC records, or from a hash that was granted
-before the allowance ran out, would read someone else's exhaustion as its own
-and be thrown away for it. Only a reading that a refusal could have changed
-carries it.
+`cut_short` says this reading could have been changed by hashing that was
+refused, and it is this step's own answer rather than the meter's. The flag on
+the budget is the question's: it stays set for everything after whatever emptied
+it, so a step that reached its verdict from NSEC records, or from a record it
+found, would otherwise read someone else's exhaustion as its own and be thrown
+away for it. Only the readings a refusal could have produced - a scan finding
+nothing, and nothing proven at all - carry it.
 */
 @(private)
 denial_step :: proc(
@@ -2801,14 +2795,29 @@ denial_step :: proc(
 			return .Insecure, false
 		}
 		if proven, matched := nsec3_proves_no_delegation(nsec3s, child, parent, nsec3_budget); proven {
-			// An NSEC3 zone publishes a record for every empty non-terminal
-			// (RFC 5155 section 7.1), so a name with none of its own is a name
-			// that is not there. `matched` comes from the scan that proved
-			// there is no delegation rather than from a third pass over the
-			// same records: see `nsec3_proves_no_delegation` for what asking
-			// twice cost.
-			return (.No_Cut if matched else .Absent), nsec3_budget.exhausted
+			/*
+			An NSEC3 zone publishes a record for every empty non-terminal (RFC
+			5155 section 7.1), so a name with none of its own is a name that is
+			not there. `matched` comes from the scan that proved there is no
+			delegation rather than from a third pass over the same records: see
+			`nsec3_proves_no_delegation` for what asking twice cost.
+
+			A match is a record found, which no refusal could have produced, so
+			`.No_Cut` is this step's answer whatever the meter says. `.Absent`
+			is the other half of the same scan finding nothing, which a refusal
+			could have produced and which ends the walk, so it carries the
+			doubt.
+			*/
+			if matched {
+				return .No_Cut, false
+			}
+			return .Absent, nsec3_budget.exhausted
 		}
+		// Nothing proven either way. That is a forgery when the records are what
+		// they look like, and our own limit when the hashing stopped, and this
+		// cannot tell the two apart once the meter was empty before the step
+		// began - so it says the safe one: an allowance of ours, never a forgery
+		// this server did not finish looking for.
 		return .Bogus, nsec3_budget.exhausted
 	}
 	return .Bogus, false

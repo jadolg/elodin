@@ -74,18 +74,19 @@ RFC 5155 section 7.1 asks for a record on every empty non-terminal too, which is
 what lets an NSEC3 zone tell "not a cut" from "not there" without the rcode.
 */
 @(private = "file")
-nsec3_zone :: proc(nodes: []Node) -> []Nsec3_Rr {
+nsec3_zone :: proc(nodes: []Node, salt := D_SALT, iterations: u16 = 0) -> []Nsec3_Rr {
 	out := make([]Nsec3_Rr, len(nodes), context.temp_allocator)
 	for node, i in nodes {
 		hash := make([]u8, 20, context.temp_allocator)
-		if !nsec3_hash(node.name, D_SALT, 0, hash) {
+		if !nsec3_hash(node.name, salt, iterations, hash) {
 			return nil
 		}
 		out[i] = Nsec3_Rr {
 			hash = hash,
 			rr = Nsec3 {
 				hash_algorithm = NSEC3_HASH_SHA1,
-				salt = D_SALT,
+				salt = salt,
+				iterations = iterations,
 				types = bitmap_of(node.types),
 			},
 		}
@@ -236,4 +237,92 @@ test_a_step_whose_hashing_ran_out_is_not_read_as_an_absent_name :: proc(t: ^test
 denial_step_probe :: proc(zone: []Nsec3_Rr, child: string, budget: ^Nsec3_Budget) -> Step {
 	step, _ := denial_step(nil, zone, child, "example.", budget)
 	return step
+}
+
+/*
+A zone changing its salt is not a zone this server stops answering for.
+
+RFC 5155 section 7.3 has a zone that wants different NSEC3 parameters publish a
+second complete chain alongside the first and remove the old one afterwards, so
+for as long as that takes a denial can carry records under two salts. They
+arrive interleaved, because a chain is in hash order and two chains' hashes fall
+through each other, and one kept hash would then be missed by every record in
+turn - a hash per record, which is the multiplication the reuse exists to
+prevent and which a zone near the iteration ceiling cannot pay for out of one
+allowance.
+
+A hundred iterations here, which is legal, is the ceiling this server ships with
+and is what a zone that has not read RFC 9276 still publishes. The proof has to
+hold up, and with one kept hash it does not: ninety hashes at a hundred and one
+rounds each is more than a whole allowance, so a zone mid-rollover would have
+gone SERVFAIL for as long as the rollover lasted.
+*/
+@(test)
+test_a_denial_carrying_two_salts_still_fits_in_one_allowance :: proc(t: ^testing.T) {
+	nodes := []Node {
+		{"example.", {.NS, .SOA, .RRSIG, .DNSKEY}},
+		{"a.example.", {.A, .RRSIG}},
+		{"b.example.", {.A, .RRSIG}},
+		{"c.example.", {.A, .RRSIG}},
+		{"d.example.", {.A, .RRSIG}},
+	}
+	old_salt := []u8{0x01, 0x02}
+	new_salt := []u8{0x11, 0x22, 0x33, 0x44}
+	iterations :: 100
+	old_chain := nsec3_zone(nodes, old_salt, iterations)
+	new_chain := nsec3_zone(nodes, new_salt, iterations)
+	testing.expect(t, len(old_chain) == len(nodes) && len(new_chain) == len(nodes), "both chains should build")
+
+	both := make([dynamic]Nsec3_Rr, context.temp_allocator)
+	for i in 0 ..< len(nodes) {
+		append(&both, old_chain[i])
+		append(&both, new_chain[i])
+	}
+
+	budget := Nsec3_Budget {
+		max_iterations = 150,
+	}
+	// A name six labels below the apex, so the walk has ancestors to try.
+	proof := nsec3_proves_name_error(both[:], "q.r.s.t.u.v.example.", "example.", &budget)
+	testing.expectf(t, proof == .Proven, "a denial mid-rollover should still prove, got %v", proof)
+	testing.expect(t, !budget.exhausted, "and it should not have taken the whole allowance to do it")
+
+	// Two chains, so two hashes a name and not ten. Nine names are asked about:
+	// the question, six ancestors, the next closer name and the wildcard.
+	per_hash := 1 + iterations
+	testing.expectf(
+		t,
+		budget.rounds <= 18 * per_hash,
+		"%d rounds for a two-chain denial, which is more than two hashes a name",
+		budget.rounds,
+	)
+	free_all(context.temp_allocator)
+}
+
+/*
+A step that found its record keeps its answer, whatever the meter says.
+
+The allowance belongs to the whole question and stays spent once anything
+spends it, so a step asked after that has to say whether *its* reading could
+have been changed by a refusal. A match cannot: the record was found, and no
+refusal produces a record. Reading the meter instead would throw the step away
+and answer `Indeterminate` for a name the zone plainly holds - SERVFAIL for a
+question that was answered, and a bogus count and a log line that never
+mention the proof that really failed earlier.
+*/
+@(test)
+test_a_step_that_matched_is_not_cut_short_by_someone_elses_allowance :: proc(t: ^testing.T) {
+	zone := nsec3_zone({{"example.", {.NS, .SOA, .RRSIG, .DNSKEY}}, {"ent.example.", {.A, .RRSIG}}})
+	testing.expect(t, len(zone) == 2, "the chain should build")
+
+	// Enough for this step, and the meter already flagged by whatever came
+	// before it in the question.
+	budget := Nsec3_Budget {
+		max_iterations = 150,
+		exhausted      = true,
+	}
+	step, cut_short := denial_step(nil, zone, "ent.example.", "example.", &budget)
+	testing.expect_value(t, step, Step.No_Cut)
+	testing.expect(t, !cut_short, "a record that was found is not a reading a refusal could have changed")
+	free_all(context.temp_allocator)
 }

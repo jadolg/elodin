@@ -123,7 +123,7 @@ Nsec3_Budget :: struct {
 	max_iterations: int,
 	rounds:         int,
 	exhausted:      bool,
-	// The last hash computed, kept for whatever asks for it next: see
+	// The hashes kept from this question's scans, for whatever asks next: see
 	// `Nsec3_Hashes`.
 	hashed:         Nsec3_Hashes,
 }
@@ -189,25 +189,31 @@ nsec3_hash_with :: proc(rr: Nsec3, name: string, out: []u8, budget: ^Nsec3_Budge
 }
 
 /*
-The last hash computed, and what it was computed from.
+The hashes kept from one question's scans, and what each was computed from.
 
 Two things ask for the same hash over and over. Every record a zone publishes
 carries the parameters of its single NSEC3PARAM, so a scan over a denial's
 records asks for one name's hash once per record. And the proofs ask each
 other: `nsec3_proves_no_ds` scans for a match on the name, hands the same name
 to `nsec3_closest_encloser`, whose first step is that same scan, and then asks
-for a cover over it - three passes, one hash. Keeping the last one is what makes
-an honest proof cheap enough for the allowance to be tight, so it is kept on the
-budget and lives as long as the question does rather than as long as a scan.
+for a cover over it - three passes, one hash. Keeping them is what makes an
+honest proof cheap enough for the allowance to be tight, so they are kept on the
+budget and live as long as the question does rather than as long as a scan.
 
-One entry, because the shape of the asking is a run of the same name and not a
-working set: a second entry would buy another hash or two per proof for a
-lookup on every record. A sender that chose a different salt for every record
-defeats it and pays for a hash per record out of the budget, which is the whole
-point of the budget.
+Two of them, not one, because a zone changing its NSEC3 salt publishes both
+chains at once (RFC 5155 section 7.3) and a denial then carries records under
+two parameter sets. They interleave, because the records are in hash order and
+two chains' hashes fall through each other, so one entry would be missed by
+every record in turn - a hash apiece, which is the cost this reuse exists to
+avoid and which a zone at the iteration ceiling cannot pay. Two entries turn
+that back into two hashes a scan. A third parameter set in one response is not a
+rollover, and what it meets is the allowance.
+
+Round robin rather than anything cleverer: the asking is runs, so the entry to
+give up is the one that has been sat on longest.
 */
 @(private)
-Nsec3_Hashes :: struct {
+Nsec3_Hash :: struct {
 	name:       string,
 	algorithm:  u8,
 	salt:       []u8,
@@ -216,30 +222,40 @@ Nsec3_Hashes :: struct {
 	have:       bool,
 }
 
+@(private)
+Nsec3_Hashes :: struct {
+	kept: [2]Nsec3_Hash,
+	next: int,
+}
+
 /*
-The kept hash belongs to the name and to all three of the parameters that
-produced it, and the algorithm is in the key for the same reason as the rest.
-Only SHA-1 is ever computed, so a record naming another hash has to miss here
-and be refused by `nsec3_hash_with` - reusing a neighbour's digest for it would
-read a record this package cannot check as one it had.
+A kept hash belongs to the name and to all three of the parameters that produced
+it, and the algorithm is in the key for the same reason as the rest. Only SHA-1
+is ever computed, so a record naming another hash has to miss here and be
+refused by `nsec3_hash_with` - reusing a neighbour's digest for it would read a
+record this package cannot check as one it had.
 */
 @(private)
 nsec3_hash_of :: proc(name: string, rr: Nsec3, budget: ^Nsec3_Budget) -> (hash: []u8, ok: bool) {
-	c := &budget.hashed
-	if c.have &&
-	   c.name == name &&
-	   c.algorithm == rr.hash_algorithm &&
-	   c.iterations == rr.iterations &&
-	   len(c.salt) == len(rr.salt) &&
-	   mem.compare(c.salt, rr.salt) == 0 {
-		return c.hash[:], true
+	for &kept in budget.hashed.kept {
+		if kept.have &&
+		   kept.name == name &&
+		   kept.algorithm == rr.hash_algorithm &&
+		   kept.iterations == rr.iterations &&
+		   len(kept.salt) == len(rr.salt) &&
+		   mem.compare(kept.salt, rr.salt) == 0 {
+			return kept.hash[:], true
+		}
 	}
+
+	c := &budget.hashed.kept[budget.hashed.next]
 	if !nsec3_hash_with(rr, name, c.hash[:], budget) {
-		// The previous hash is still the hash of its own name and parameters,
-		// so a record this one could not be computed for leaves it alone.
+		// Both entries still hold the hash of their own name and parameters, so
+		// a record this one could not be computed for leaves them alone.
 		return nil, false
 	}
 	c.name, c.algorithm, c.salt, c.iterations, c.have = name, rr.hash_algorithm, rr.salt, rr.iterations, true
+	budget.hashed.next = (budget.hashed.next + 1) % len(budget.hashed.kept)
 	return c.hash[:], true
 }
 

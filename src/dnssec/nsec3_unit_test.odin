@@ -671,14 +671,14 @@ An honest denial hashes a name once, not once per record.
 A zone publishes one NSEC3PARAM, so every record in a denial carries the same
 salt and iteration count and the hash of a name is the same for all of them.
 Computing it per record instead multiplies an honest proof by the length of the
-chain in the response - eleven here, so this proof would cost fifty-five hashes
-rather than five, and the allowance would have to be eleven times what it is.
+chain in the response - eleven here, so this proof would cost forty-four hashes
+rather than four, and the allowance would have to be eleven times what it is.
 
-Five, for a name two labels below the encloser: the question, the two names the
-walk tries above it, the next closer name and the wildcard. The next closer is
-one of the names the walk already hashed, and it costs a hash again because what
-is kept is the last one and the wildcard search came between - one entry is what
-a run of the same name needs, and a working set is what it is not.
+Five names are asked about, for a question two labels below its closest
+encloser: the question, the two names the walk tries above it, the next closer
+name and the wildcard. Four hashes, because the next closer is one of the names
+the walk already hashed and it is still in hand when the cover is looked for -
+which is what the second kept entry is for.
 */
 @(test)
 test_an_honest_nsec3_denial_hashes_each_name_once :: proc(t: ^testing.T) {
@@ -689,7 +689,7 @@ test_an_honest_nsec3_denial_hashes_each_name_once :: proc(t: ^testing.T) {
 	// `x.y.w.example.` is in the zone, so `a.b.x.y.w.example.` has a closest
 	// encloser two labels above it and a next closer name of its own.
 	testing.expect_value(t, nsec3_proves_name_error(zone, "a.b.x.y.w.example.", "example.", &budget), Proof.Proven)
-	testing.expect_value(t, budget.rounds, 5 * (1 + A_ITERATIONS))
+	testing.expect_value(t, budget.rounds, 4 * (1 + A_ITERATIONS))
 	testing.expect(t, !budget.exhausted, "an eleven-record denial cannot be near the allowance")
 	free_all(context.temp_allocator)
 }
