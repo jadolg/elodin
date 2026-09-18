@@ -41,6 +41,7 @@ CLASS_IN = 1
 
 A, NS, SOA, CNAME, MX, TXT = 1, 2, 6, 5, 15, 16
 AAAA, SRV, SVCB, HTTPS = 28, 33, 64, 65
+DNAME = 39
 DS, RRSIG, NSEC, DNSKEY, NSEC3 = 43, 46, 47, 48, 50
 NSEC3PARAM = 51
 
@@ -831,6 +832,7 @@ def relocated_wildcard_denial():
          message("www.wctest.", TXT, [],
                  wild_nsec + [wild_sig] + real_nsec + [real_sig] + wc_soa + [wc_soa_sig]))
     wildcard_expanded_ds(root)
+    wildcard_dname(root)
 
 
 def wildcard_expanded_ds(root):
@@ -871,6 +873,67 @@ def wildcard_expanded_ds(root):
     fine_a = [a_rr("fine.wdtest.", "192.0.2.67")]
     emit("wd_fine_answer", "fine.wdtest.", "A",
          message("fine.wdtest.", A, fine_a + [sign(fine_a, fi)]))
+
+
+def wildcard_dname(root):
+    """Emit `dwtest.`, which holds a wildcard DNAME and one ordinary name."""
+    # The third caller of the same routine. `dname_covered` asks
+    # `validate_rrset` about the DNAME and reads only the status, so on its own
+    # it would vouch for an unsigned CNAME under a DNAME re-owned to a name the
+    # wildcard does not stand for. What stops that is not there: the DNAME sits
+    # in the answer section, so `validate_answer`'s own loop validates the same
+    # RRset, records the expansion, and makes the RFC 4035 section 5.3.4 proof
+    # a condition of the whole message.
+    #
+    # Both fixtures are here so that stays true, and so that the guard this
+    # scenario is about is not copied to a site where it would refuse the
+    # legitimate one: a DNAME may sit at a wildcard like any other type, and
+    # then every redirection it makes carries an RRSIG one label short.
+    dw = Key("dwtest.", "wcard-dname")
+    ds_set = [RR(dw.zone, DS, dw.ds())]
+    emit("dw_ds", dw.zone, "DS", message(dw.zone, DS, ds_set + [sign(ds_set, root)]))
+    keys = [RR(dw.zone, DNSKEY, dw.rdata)]
+    emit("dw_dnskey", dw.zone, "DNSKEY", message(dw.zone, DNSKEY, keys + [sign(keys, dw)]))
+
+    soa = [soa_rr("dwtest.")]
+    soa_sig = sign(soa, dw)
+    # dwtest. -> *.dwtest. -> real.dwtest. -> dwtest. `real.dwtest.` is what
+    # makes the relocation below a forgery rather than an expansion: the
+    # wildcard does not stand for a name the zone already holds.
+    wild_nsec = [RR("*.dwtest.", NSEC, nsec_rdata("real.dwtest.", [DNAME, RRSIG, NSEC]))]
+    wild_nsec_sig = sign(wild_nsec, dw)
+    real_nsec = [RR("real.dwtest.", NSEC, nsec_rdata("dwtest.", [A, RRSIG, NSEC]))]
+    real_nsec_sig = sign(real_nsec, dw)
+    denial = wild_nsec + [wild_nsec_sig] + real_nsec + [real_nsec_sig] + soa + [soa_sig]
+
+    # The chain walk asks for a DS at each name on the way down, and none of
+    # these four is a zone cut. `real.dwtest.`'s NSEC covers everything after
+    # it, its own name included, so one denial answers all of them.
+    for tag, name in (("y", "y.dwtest."), ("xy", "x.y.dwtest."),
+                      ("real", "real.dwtest."), ("xreal", "x.real.dwtest.")):
+        emit("dw_%s_ds" % tag, name, "DS", message(name, DS, [], denial))
+
+    # The redirection as a server sends it: the DNAME under the name the
+    # wildcard was expanded to, its RRSIG still counting one label, and the
+    # CNAME synthesised from it, unsigned per RFC 6672 section 3.4.1. The
+    # authority section carries the proof that `y.dwtest.` is not in the zone,
+    # and no SOA, because nothing here is being denied.
+    dname_rr = [RR("y.dwtest.", DNAME, wire_name("t.example."))]
+    dname_sig = sign(dname_rr, dw, labels=1)
+    cname = [RR("x.y.dwtest.", CNAME, wire_name("x.t.example."))]
+    emit("dw_wildcard_dname", "x.y.dwtest.", "A",
+         message("x.y.dwtest.", A, dname_rr + [dname_sig] + cname,
+                 real_nsec + [real_nsec_sig]))
+
+    # The same two records with the DNAME's owner rewritten to `real.dwtest.`,
+    # which the zone holds and the wildcard therefore never stands for. The
+    # proof that would have to accompany it is a denial of a name that exists,
+    # so there is none to send.
+    moved = [RR("real.dwtest.", DNAME, wire_name("t.example.")),
+             RR("real.dwtest.", RRSIG, dname_sig.rdata)]
+    moved_cname = [RR("x.real.dwtest.", CNAME, wire_name("x.t.example."))]
+    emit("dw_relocated_dname", "x.real.dwtest.", "A",
+         message("x.real.dwtest.", A, moved + moved_cname))
 
 
 if __name__ == "__main__":
