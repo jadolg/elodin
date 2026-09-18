@@ -1734,8 +1734,17 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 	// what decides whether the refusal below drains first - see `stream_linger`.
 	answered := false
 	for {
+		/*
+		One deadline for the length prefix and the body behind it, taken where the
+		message begins and not restarted by the bytes that arrive inside it - see
+		`read_deadline`. A connection waiting for its next question still waits the
+		whole of `client_timeout` for the first byte of it, which is what the idle
+		timeout this server advertises (RFC 7828) says it will do.
+		*/
+		deadline := read_deadline(s.cfg.server.client_timeout)
+
 		length_buf: [2]u8
-		if !conn_read_full(conn, length_buf[:]) {
+		if !conn_read_full(conn, length_buf[:], deadline) {
 			return
 		}
 		length := int(length_buf[0]) << 8 | int(length_buf[1])
@@ -1744,7 +1753,7 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 		}
 
 		query := make([]u8, length, context.temp_allocator)
-		if !conn_read_full(conn, query) {
+		if !conn_read_full(conn, query, deadline) {
 			return
 		}
 
@@ -1946,10 +1955,60 @@ conn_read :: proc(c: Conn, buf: []u8) -> (n: int, ok: bool) {
 	return got, err == nil && got > 0
 }
 
+/*
+When the reads that make up one message have to be done by, or the zero tick for
+a read that is not bounded as a whole.
+
+`client_timeout` reaches the socket as SO_RCVTIMEO, which bounds one read and is
+restarted by every byte that arrives: a client sending one byte inside every wait
+is inside all of them, and holds one of `max_connections` for as long as it cares
+to while no query completes, no budget is charged and nothing else reclaims it.
+RFC 7766 6.2.3 names exactly that and says the idle timeout should be reset "on
+the receipt of a full DNS message, rather than on receipt of any part of a DNS
+message". So the caller takes a deadline once, where a message begins, and every
+read that goes into it waits only for what is left of it.
+
+A non-positive budget is no receive timeout on the socket at all - see
+`test_a_timeout_that_cannot_be_stated_is_left_off` for the other half of what that
+setting means - and the zero tick this returns for it leaves those reads unbounded
+too, rather than turning "wait forever" into "give up at once".
+*/
 @(private)
-conn_read_full :: proc(c: Conn, buf: []u8) -> bool {
+read_deadline :: proc(budget: time.Duration) -> time.Tick {
+	return time.tick_add(time.tick_now(), budget) if budget > 0 else time.Tick{}
+}
+
+/*
+Give this read what is left of the deadline, or say the deadline is spent.
+
+`conn_set_read_timeout` rather than a bare `net.set_option`, because over DoT and
+DoH the socket option stopped applying at the handshake - see there. The reads
+that share a deadline shorten as it runs down, so the last of them waits for what
+remains rather than for the whole of `client_timeout` again.
+*/
+@(private)
+conn_arm_read :: proc(c: Conn, deadline: time.Tick) -> bool {
+	if deadline == (time.Tick{}) {
+		return true
+	}
+	left := time.tick_diff(time.tick_now(), deadline)
+	if left <= 0 {
+		return false
+	}
+	conn_set_read_timeout(c, left)
+	return true
+}
+
+// Read exactly `len(buf)` bytes, within what is left of `deadline`. The deadline
+// is a parameter rather than a default so that a path added later has to say what
+// bounds it as a whole; `read_deadline` makes the one that means "nothing does".
+@(private)
+conn_read_full :: proc(c: Conn, buf: []u8, deadline: time.Tick) -> bool {
 	got := 0
 	for got < len(buf) {
+		if !conn_arm_read(c, deadline) {
+			return false
+		}
 		n, ok := conn_read(c, buf[got:])
 		if !ok {
 			return false

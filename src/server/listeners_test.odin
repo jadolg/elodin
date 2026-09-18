@@ -539,7 +539,7 @@ test_a_refused_pipeline_keeps_the_answers_already_written :: proc(t: ^testing.T)
 	// a budget with nothing left in it: what `serve_dns_stream` does from there,
 	// in the order it does it.
 	first: [STRIDE]u8
-	if !conn_read_full(conn, first[:]) {
+	if !conn_read_full(conn, first[:], read_deadline(3 * time.Second)) {
 		testing.expect(t, false, "the first query never arrived")
 		return
 	}
@@ -731,4 +731,123 @@ test_loopback_is_127_over_8_in_both_forms :: proc(t: ^testing.T) {
 		groups[group] |= 0x0100
 		testing.expectf(t, !is_loopback(groups_address(groups)), "a bit set in group %d of `::1` is not `::1`", group)
 	}
+}
+
+/*
+A message trickled a byte at a time is given up on at `client_timeout`, not held
+for as long as the client keeps trickling.
+
+`client_timeout` reaches the socket as SO_RCVTIMEO, which bounds one read: every
+byte that arrives restarts it, so before `read_deadline` the only thing that ever
+reclaimed an accepted connection could not fire at all against a client sending a
+byte inside every wait. Nothing else caught it either - the connection and
+connection-rate limits bound how many are opened and how fast, and the query
+budgets are charged per message, so a connection on which no message ever
+completes is charged nothing and counted against nothing while it holds one of
+`max_connections`. RFC 7766 6.2.3 names the attack and says the idle timeout is
+reset "on the receipt of a full DNS message, rather than on receipt of any part of
+a DNS message".
+
+The drip is shorter than `client_timeout`, which is what makes it a drip: every
+byte lands inside the window the byte before it opened. Against a server holding
+one deadline across the message, the connection ends after roughly
+`client_timeout` regardless - about three bytes in here - so what is asserted is
+that it ended before the message it was feeding could have finished arriving.
+
+The bytes are a bare DNS header behind its length prefix, as the pipeline case
+above uses: what is under test is a message that never finishes arriving, and
+nothing ever parses one of those.
+*/
+@(test)
+test_a_drip_fed_message_is_reclaimed_at_the_deadline :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	cfg.listeners.udp.enabled = false
+	cfg.listeners.tcp = config.Listener {
+		enabled = true,
+		address = "127.0.0.1",
+		port    = 0,
+	}
+	cfg.listeners.dot.enabled = false
+	cfg.listeners.doh.enabled = false
+	cfg.cache.enabled = false
+	cfg.blocking.enabled = false
+	cfg.log.queries = false
+	// Short, because the case spends it: the drip below is paced off it, and the
+	// whole test takes a couple of multiples of it.
+	cfg.server.client_timeout = 400 * time.Millisecond
+	DRIP :: 150 * time.Millisecond
+
+	handler_pool := pool.make_pool(1)
+	s := Server {
+		cfg          = &cfg,
+		handler_pool = handler_pool,
+	}
+
+	l: Listeners
+	if !start_listeners(&s, &l) {
+		pool.destroy(handler_pool)
+		testing.expect(t, false, "could not start the TCP listener")
+		return
+	}
+	defer {
+		stop_listeners(&l)
+		pool.destroy(handler_pool)
+		destroy_listeners(&l)
+	}
+
+	bound, berr := net.bound_endpoint(l.tcp_socket)
+	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
+		return
+	}
+
+	client, derr := net.dial_tcp(bound)
+	if !testing.expectf(t, derr == nil, "cannot open the connection: %v", derr) {
+		return
+	}
+	defer net.close(client)
+	// The read below is both how the close is noticed and what paces the drip: it
+	// waits a drip's worth for something the server has no reason to send, so the
+	// loop turns over at the drip interval whether or not the connection is still
+	// there.
+	_ = net.set_option(client, .Receive_Timeout, DRIP)
+
+	message: [2 + dns.HEADER_SIZE]u8
+	message[1] = u8(dns.HEADER_SIZE)
+
+	sent := 0
+	closed := false
+	for sent < len(message) && !closed {
+		n, serr := net.send_tcp(client, message[sent:][:1])
+		if serr != nil || n != 1 {
+			// The server closed and the RST came back before this byte went out,
+			// which is the same outcome noticed one byte later.
+			closed = true
+			break
+		}
+		sent += 1
+
+		reply: [1]u8
+		rn, rerr := net.recv_tcp(client, reply[:])
+		// A graceful close is no bytes and no error; a reset is
+		// `Connection_Closed`. `Would_Block` is the drip's own wait expiring with
+		// the connection still up, which is the loop doing its job.
+		if (rn == 0 && rerr == nil) || (rerr != nil && rerr != net.TCP_Recv_Error.Would_Block) {
+			closed = true
+		}
+	}
+
+	testing.expectf(
+		t,
+		closed,
+		"a client trickling a byte every %v held the connection through the whole message",
+		DRIP,
+	)
+	testing.expectf(
+		t,
+		sent < len(message),
+		"the connection survived all %d bytes of a message trickled a byte every %v, which is %v of it",
+		len(message),
+		DRIP,
+		time.Duration(len(message)) * DRIP,
+	)
 }

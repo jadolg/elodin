@@ -249,8 +249,12 @@ serve_metrics :: proc(s: ^Server, l: ^Listeners, socket: net.TCP_Socket, client:
 		peer   = client,
 	}
 	r := Http_Reader {
-		conn = conn,
-		buf  = make([dynamic]u8, 0, METRICS_REQUEST_BUF, context.temp_allocator),
+		conn     = conn,
+		buf      = make([dynamic]u8, 0, METRICS_REQUEST_BUF, context.temp_allocator),
+		// The socket options above bound one read each and are restarted by every
+		// byte; this bounds the request as a whole. One request is read here, so
+		// this is also the bound on the connection - see `Http_Reader.deadline`.
+		deadline = read_deadline(METRICS_TIMEOUT),
 	}
 	req, status, ok := read_http_request(&r)
 	if !ok {

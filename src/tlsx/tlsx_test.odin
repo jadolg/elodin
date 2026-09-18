@@ -993,3 +993,134 @@ test_alpn_outlives_the_context_that_installed_it :: proc(t: ^testing.T) {
 	testing.expect_value(t, client.err, Error.None)
 	testing.expect_value(t, string(client.protocol[:client.protocol_len]), "h2")
 }
+
+@(private = "file")
+Drip_Ctx :: struct {
+	socket: net.TCP_Socket,
+	stop:   bool,
+}
+
+// A byte every `DRIP_INTERVAL`, for `DRIP_BYTES` of them or until the test says
+// to stop - whichever comes first. A handshake bounded per read outlasts the whole
+// of it, so the trickle has to be long enough that doing so is unmistakable, and
+// the stop flag is what keeps the case that passes from paying for its length.
+@(private = "file")
+DRIP_INTERVAL :: 150 * time.Millisecond
+@(private = "file")
+DRIP_BYTES :: 40
+
+@(private = "file")
+drip_worker :: proc(d: ^Drip_Ctx) {
+	/*
+	A handshake record carrying the TLS 1.0 version a ClientHello does, declaring
+	a body of 512 bytes that nothing after it ever reaches. OpenSSL has a record
+	in progress and waits for the rest of it, so what is under test is a handshake
+	that is going somewhere rather than one refused for being malformed; past the
+	first five bytes the contents do not matter, because the record they are in
+	never ends.
+	*/
+	hello: [DRIP_BYTES]u8
+	copy(hello[:], []u8{0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00, 0x01, 0xfc, 0x03, 0x03})
+	for i in 0 ..< len(hello) {
+		if sync.atomic_load(&d.stop) {
+			return
+		}
+		n, err := net.send_tcp(d.socket, hello[i:][:1])
+		if err != nil || n != 1 {
+			return
+		}
+		time.sleep(DRIP_INTERVAL)
+	}
+}
+
+/*
+A handshake trickled a byte at a time is given up on at the socket's timeout, not
+held for as long as the peer keeps trickling.
+
+SO_RCVTIMEO bounds one read and is restarted by every byte that arrives, so a
+handshake run on a blocking socket had no bound across the whole of it: a peer
+sending a byte inside every wait held the connection, its thread and one of the
+server's connection slots indefinitely, and did it before the handshake completed
+- so before anything the server counts per connection or per query could see it.
+`accept_loop` takes one deadline instead; see it, and `read_deadline` on the
+server side, where the data phase has the same shape.
+
+The drip is shorter than the timeout, which is what makes it a drip. Forty bytes
+at that interval is six seconds of trickle against a handshake given 400ms, so what is asserted is that the handshake gave up long before the trickle
+ran out - a handshake bounded per read instead would still have been waiting.
+*/
+@(test)
+test_a_drip_fed_handshake_is_given_up_on_at_the_deadline :: proc(t: ^testing.T) {
+	cert, key, have := ensure_certs()
+	if !testing.expect(t, have, "no certificate available and openssl could not make one") {
+		return
+	}
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen on loopback: %v", lerr) {
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the bound port: %v", berr) {
+		return
+	}
+
+	sctx, serr := server_context(cert, key)
+	if !testing.expectf(t, serr == .None, "server_context: %v", serr) {
+		return
+	}
+	defer context_destroy(sctx)
+
+	client, derr := net.dial_tcp_from_endpoint(bound)
+	if !testing.expectf(t, derr == nil, "cannot dial: %v", derr) {
+		return
+	}
+	defer net.close(client)
+
+	accepted, _, aerr := net.accept_tcp(listener)
+	if !testing.expectf(t, aerr == nil, "nothing connected: %v", aerr) {
+		return
+	}
+	defer net.close(accepted)
+	// What `stream_job` puts on an accepted socket, shortened so the case is
+	// quick: the figure the handshake is bounded by.
+	BUDGET :: 400 * time.Millisecond
+	_ = net.set_option(accepted, .Receive_Timeout, BUDGET)
+	_ = net.set_option(accepted, .Send_Timeout, BUDGET)
+
+	drip := Drip_Ctx {
+		socket = client,
+	}
+	dripper := thread.create_and_start_with_poly_data(&drip, drip_worker)
+	defer {
+		sync.atomic_store(&drip.stop, true)
+		thread.join(dripper)
+		thread.destroy(dripper)
+	}
+
+	session, sserr := server_session(sctx, accepted)
+	if !testing.expectf(t, sserr == .None, "server_session: %v", sserr) {
+		return
+	}
+
+	start := time.tick_now()
+	conn, herr := server_handshake(session)
+	elapsed := time.tick_since(start)
+	if conn != nil {
+		close(conn)
+		testing.expect(t, false, "a handshake completed out of a trickle that never sent a ClientHello")
+		return
+	}
+
+	testing.expectf(t, herr == .Timeout, "the handshake ended as %v rather than a timeout", herr)
+	// Generously above the budget and well below the trickle, so a slow machine
+	// does not fail the case and a handshake bounded per read cannot pass it.
+	testing.expectf(
+		t,
+		elapsed < 2 * time.Second,
+		"the handshake was held for %v by a byte every %v, against a %v budget",
+		elapsed,
+		DRIP_INTERVAL,
+		time.Duration(BUDGET),
+	)
+}
