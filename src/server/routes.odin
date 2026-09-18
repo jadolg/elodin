@@ -596,6 +596,31 @@ Apex_Memo_Slot :: struct {
 	until: time.Time,
 }
 
+/*
+Whether the memory may answer for the parent's group here at all.
+
+The window is the whole of it wherever the route's answer can be served, and
+`validating` is where it cannot. A routed zone is served insecure - that is what
+`served_locally` does, and what this memory bets on when it lets the route's
+unsigned NODATA stand in for the parent's signed proof - unless the operator
+anchored the zone themselves, which is a request to hold it to the public chain
+and which `covered_by_local_anchor` honours by leaving `validating` on. The route
+has no signatures to offer that chain, so its answer is not a stand-in for the
+proof there but a Bogus verdict and a SERVFAIL, and a memory of one unsettled
+reply would spend a whole cooldown of them while the parent was healthy and
+holding what the client asked for. `routes.odin`'s own summary of anchoring a
+routed zone - an insecure answer traded for SERVFAIL - is what that operator
+asked for, and this must not make the trade for them ten seconds at a time.
+
+The skip above it is the same shape with no such choice: a parent whose every
+member is parked cannot be asked instead, so the route's answer, validated or
+not, is all there is.
+*/
+@(private)
+apex_ds_memo_applies :: proc(s: ^Server, name: string, validating: bool) -> bool {
+	return !validating && apex_ds_parent_unsettled(s, name)
+}
+
 // Whether the parent's group failed to settle this apex `DS` inside the window.
 @(private)
 apex_ds_parent_unsettled :: proc(s: ^Server, name: string) -> bool {

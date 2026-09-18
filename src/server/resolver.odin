@@ -1592,7 +1592,7 @@ resolve_query :: proc(
 			logx.debugf("query DS %s: the parent's group is parked, asking the route instead", q.name)
 			asked = own
 			unproven_apex_ds = true
-		} else if apex_ds_parent_unsettled(s, q.name) {
+		} else if apex_ds_memo_applies(s, q.name, validating) {
 			logx.debugf(
 				"query DS %s: the parent's group settled nothing for this apex inside the last cooldown, asking the route instead",
 				q.name,
@@ -1802,13 +1802,21 @@ resolve_query :: proc(
 		again, second, perr := upstream.resolve_answerable(memoised_parent, forwarded, allocator)
 		proved, settled := parent_answers_apex_ds(again, q.name, perr == .None, allocator)
 		remember_apex_ds_parent(s, q.name, perr == .None, settled)
+		/*
+		And whether what is served from here is kept turns on what the parent
+		managed to say, exactly as it does when the parent is asked first: the
+		route's reply standing in for an NXDOMAIN or a `DS` RRset is standing in
+		for a fact about the public tree, which holds until the public tree
+		changes, and standing in for nothing established is what the store
+		refuses. Read once for both replies, the proof being `settled` too.
+		*/
+		unproven_apex_ds = !settled
 		if proved {
 			logx.debugf(
-				"query DS %s: the route could not answer, and the parent proved the delegation carries no DS after all",
+				"query DS %s: the route had no answer, and the parent proved the delegation carries no DS after all",
 				q.name,
 			)
 			resp, winner, uerr = again, second, .None
-			unproven_apex_ds = false
 		}
 	}
 	if uerr != .None {

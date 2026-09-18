@@ -1,5 +1,6 @@
 package server
 
+import "core:fmt"
 import "core:mem"
 import "core:net"
 import "core:strings"
@@ -1912,6 +1913,222 @@ test_a_parent_that_never_replied_is_asked_again :: proc(t: ^testing.T) {
 	}
 
 	testing.expect_value(t, route_mock_heard(def_socket, "corp.example."), 2)
+	free_all(context.temp_allocator)
+}
+
+/*
+What the fallback serves is kept on the same terms the parent-first path keeps it.
+
+`test_an_apex_ds_the_route_answered_unproven_is_not_cached` settles the rule: the
+route's answer goes into the cache when the parent established something about
+the public tree that holds for as long as an entry does, and is refused when
+nobody established anything. The memory's fallback reaches the same arrangement
+by the other road - the route answered first, the parent was asked afterwards -
+and it has to keep the same books, or a reply the parent settled would be fetched
+again by every query for as long as the entry it never made would have lived.
+
+The parent's NXDOMAIN is the case: it settles the delegation without proving it,
+so the route's own answer stands and is the one stored. Both upstreams answer
+NXDOMAIN here, which is what a zone that nothing public delegates and whose
+internal authority does not know the name looks like from both sides.
+*/
+@(test)
+test_the_memo_fallback_keeps_what_the_parent_settled :: proc(t: ^testing.T) {
+	def_socket, derr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, derr == nil, "cannot bind the default mock: %v", derr) {
+		return
+	}
+	defer net.close(def_socket)
+	_ = net.set_option(def_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+	def_bound, _ := net.bound_endpoint(def_socket)
+
+	route_socket, rerr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, rerr == nil, "cannot bind the routed mock: %v", rerr) {
+		return
+	}
+	defer net.close(route_socket)
+	_ = net.set_option(route_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+	route_bound, _ := net.bound_endpoint(route_socket)
+
+	cfg := forwarding_config()
+	cfg.cache.enabled = true
+	cfg.upstream.timeout = 200 * time.Millisecond
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, negative_ttl = 300})
+	defer cache.destroy(answers)
+
+	group := mock_group(t, cfg.upstream, def_bound.port)
+	defer upstream.destroy_group(group)
+	routed := mock_group(t, cfg.upstream, route_bound.port)
+	defer upstream.destroy_group(routed)
+
+	s := Server {
+		cfg     = &cfg,
+		group   = group,
+		answers = answers,
+		routes  = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
+	}
+
+	// The query that writes the memory, and whose own answer is kept by nobody.
+	refusing := Route_Mock {
+		socket = def_socket,
+		reply  = route_reply_nodata("corp.example.", .DS, .Serv_Fail),
+		want   = "corp.example.",
+	}
+	answering := Route_Mock {
+		socket = route_socket,
+		reply  = route_reply_nodata("corp.example.", .DS),
+		want   = "corp.example.",
+	}
+	first_parent := thread.create_and_start_with_poly_data(&refusing, serve_route)
+	first_route := thread.create_and_start_with_poly_data(&answering, serve_route)
+	_, _, first_ok := handle_query(&s, route_query("corp.example.", .DS), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	thread.join(first_parent)
+	thread.destroy(first_parent)
+	thread.join(first_route)
+	thread.destroy(first_route)
+	if !testing.expect(t, first_ok, "nothing came back for the query that writes the memory") {
+		return
+	}
+
+	// And the one the fallback answers: the route says the name is not there,
+	// which is not the NODATA the memory bet on, and the parent says the same
+	// thing about the public tree - a fact that holds for as long as an entry.
+	denying := Route_Mock {
+		socket = def_socket,
+		reply  = route_reply_nodata("corp.example.", .DS, .NX_Domain),
+		want   = "corp.example.",
+	}
+	absent := Route_Mock {
+		socket = route_socket,
+		reply  = route_reply_nodata("corp.example.", .DS, .NX_Domain),
+		want   = "corp.example.",
+	}
+	second_parent := thread.create_and_start_with_poly_data(&denying, serve_route)
+	second_route := thread.create_and_start_with_poly_data(&absent, serve_route)
+	out, _, ok := handle_query(&s, route_query("corp.example.", .DS), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	thread.join(second_parent)
+	thread.destroy(second_parent)
+	thread.join(second_route)
+	thread.destroy(second_route)
+
+	if !testing.expect(t, ok, "nothing came back at all for the second query") {
+		return
+	}
+	testing.expect(t, denying.asked, "the parent was not asked after the route answered something that was not the NODATA")
+	testing.expect(t, absent.asked, "the route was not asked at all")
+
+	decoded, derr2 := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr2, dns.Decode_Error.None)
+	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.NX_Domain)
+
+	key_buf: [cache.KEY_MAX]u8
+	key := cache.make_key(key_buf[:], "corp.example.", .DS, .IN, false, false)
+	_, _, cached := cache.get(answers, key, context.temp_allocator)
+	testing.expect(t, cached, "an answer the parent settled was fetched by the fallback and thrown away")
+	free_all(context.temp_allocator)
+}
+
+/*
+The memory's bookkeeping, asserted where the resolver cannot reach it.
+
+Three things the cases above cannot show, each configuring one routed apex and
+reading the memory only through what reaches a socket. A slot table with one name
+in it never chooses a slot, never evicts one, and an anchored zone would need a
+validator standing behind the query before the rule that matters there is even
+consulted.
+
+  - One memory per apex. Two routes, and settling one says nothing about the
+    other: a shared flag would have the first parent's silence skip the second
+    parent, which is a zone's proof withheld on the strength of a different
+    zone's outage.
+  - The table is a fixed size and says which memory it drops. `APEX_MEMO_SLOTS`
+    apexes fill it, the next one evicts the memory that would have expired first,
+    and the rest stay. An operator with more routed apexes than slots keeps the
+    memory for the ones that stay in it, which is the ceiling `Apex_Memo` names.
+  - `validating` is the one thing that turns the memory off rather than bounding
+    it. An operator who anchored the routed zone asked for the public chain, and
+    the route has no signatures for it: the route's answer is a SERVFAIL there,
+    not a stand-in, so the memory must not spend a cooldown of them.
+
+Called directly rather than through `handle_query` because a validator would then
+have to be standing behind the question, and its own chain lookups go to the same
+default group these cases would be reading - the parent's apex `DS` among them.
+The rule is a predicate; this asks it.
+*/
+@(test)
+test_the_apex_memory_is_per_apex_bounded_and_off_under_an_anchor :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	routed := upstream.Group{}
+
+	// One route per apex, and one more apex than there are slots.
+	domains := make([][]string, APEX_MEMO_SLOTS + 1, context.temp_allocator)
+	routes := make([]Zone_Route, APEX_MEMO_SLOTS + 1, context.temp_allocator)
+	for i in 0 ..< APEX_MEMO_SLOTS + 1 {
+		domains[i] = make([]string, 1, context.temp_allocator)
+		domains[i][0] = fmt.tprintf("z%d.example.", i)
+		routes[i] = Zone_Route {
+			domains = domains[i],
+			group   = &routed,
+		}
+	}
+	s := Server {
+		cfg    = &cfg,
+		routes = routes,
+	}
+	first := domains[0][0]
+	second := domains[1][0]
+	last := domains[APEX_MEMO_SLOTS][0]
+
+	// Nothing is remembered of an apex nobody has asked about, and nothing at
+	// all of a name that is not a route's apex.
+	testing.expect(t, !apex_ds_parent_unsettled(&s, first), "a memory nobody wrote was read back")
+	remember_apex_ds_parent(&s, "nas.z0.example.", true, false)
+	testing.expect(t, !apex_ds_parent_unsettled(&s, "nas.z0.example."), "a name that is no route's apex was remembered")
+
+	// One apex at a time: the second route's parent is unaffected by the first's.
+	remember_apex_ds_parent(&s, first, true, false)
+	testing.expect(t, apex_ds_parent_unsettled(&s, first), "the parent that settled nothing was not remembered")
+	testing.expect(t, !apex_ds_parent_unsettled(&s, second), "one apex's unsettled parent was remembered against another")
+
+	// Case-insensitively, the question's name being whatever the client sent.
+	testing.expect(t, apex_ds_parent_unsettled(&s, strings.to_upper(first, context.temp_allocator)), "the memory did not fold case")
+
+	// A parent that settles the question clears it, and a parent that settles
+	// one nobody remembered writes nothing.
+	remember_apex_ds_parent(&s, first, true, true)
+	testing.expect(t, !apex_ds_parent_unsettled(&s, first), "a parent that settled the question stayed remembered")
+	remember_apex_ds_parent(&s, second, true, true)
+	testing.expect(t, !apex_ds_parent_unsettled(&s, second), "a settled parent took a slot of its own")
+
+	// And a reply that never arrived is not a memory. See `Apex_Memo`.
+	remember_apex_ds_parent(&s, first, false, false)
+	testing.expect(t, !apex_ds_parent_unsettled(&s, first), "a parent that never replied was remembered as unhelpful")
+
+	/*
+	Filling the table: every apex but the last, in order, so the first one
+	written is the one whose memory expires first and therefore the one the next
+	write evicts.
+	*/
+	for i in 0 ..< APEX_MEMO_SLOTS {
+		remember_apex_ds_parent(&s, domains[i][0], true, false)
+	}
+	for i in 0 ..< APEX_MEMO_SLOTS {
+		testing.expectf(t, apex_ds_parent_unsettled(&s, domains[i][0]), "the memory of %s was lost before the table was full", domains[i][0])
+	}
+	remember_apex_ds_parent(&s, last, true, false)
+	testing.expect(t, apex_ds_parent_unsettled(&s, last), "the apex that filled the table past its size was not remembered")
+	testing.expect(t, !apex_ds_parent_unsettled(&s, first), "the oldest memory survived a table with no room for it")
+	for i in 1 ..< APEX_MEMO_SLOTS {
+		testing.expectf(t, apex_ds_parent_unsettled(&s, domains[i][0]), "the memory of %s was evicted before the oldest one", domains[i][0])
+	}
+
+	/*
+	And the rule that is not about the window at all: an anchored routed zone is
+	held to the public chain, where the route's unsigned answer is a SERVFAIL
+	rather than a stand-in, so the memory does not apply however fresh it is.
+	*/
+	testing.expect(t, apex_ds_memo_applies(&s, last, false), "the memory did not apply to a zone served insecure")
+	testing.expect(t, !apex_ds_memo_applies(&s, last, true), "the memory answered for the parent under an anchor the operator asked for")
 	free_all(context.temp_allocator)
 }
 
