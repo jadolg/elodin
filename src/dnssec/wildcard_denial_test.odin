@@ -1,6 +1,7 @@
 package dnssec
 
 import "core:mem"
+import "core:slice"
 import "core:testing"
 import "core:time"
 import "elodin:dns"
@@ -24,11 +25,12 @@ under. Once is NODATA for a type the name really has; twice, with the owners
 chosen so the two spans cover a qname and the wildcard, is NXDOMAIN for a name
 the zone answers for. Both go out with AD=1 and into the cache.
 
-RFC 4035 section 3.1.3.3 is what makes this always a forgery rather than a
-case to be handled: NSEC records are published under their own names and are
-never synthesised from a wildcard, so a denial record whose signature expanded
-is a denial record that was moved. Unbound rewrites the owner to the canonical
-one before verifying, for the same reason and with the same effect.
+RFC 4592 section 4.7 is what makes this always a forgery rather than a case
+to be handled: a wildcard owns an NSEC of its own, but "synthesis of these
+records will only occur when the query exactly matches the record", so a denial
+record whose signature expanded is a denial record that was moved. Unbound
+rewrites the owner to the canonical one before verifying, for the same reason
+and with the same effect.
 
 `wdtest.` is the other side of the same routine. A DS RRset whose signature
 expanded would hand the chain walk a zone cut the parent never signed under
@@ -151,6 +153,75 @@ WC_FIXTURES := []Fixture{
 			"000e100000038400093a800000012c0677637465737400002e000100000e10005a00060f0100000e107d3b18206a4788" +
 			"20ec37067763746573740086680c77a5776baafe6dc6996b459f2db0022c6b7be012df9a745cc780e505b5655c414383" +
 			"74e8b74cc3c4b96d7c2005bf0dbd8e48945fd8935e28ddf4e18405",
+	},
+	{
+		key   = "wc_relocated_answer_nsec",
+		name  = "nx.wctest.",
+		type  = .NSEC,
+		rcode = 0,
+		wire  = "123485800001000200040000026e780677637465737400002f0001026e780677637465737400002f000100000e100015" +
+			"047265616c06776374657374000006400000000003026e780677637465737400002e000100000e10005a002f0f010000" +
+			"0e107d3b18206a478820ec3706776374657374000d68c8d5dc40d3f7c0db71853379cd1fd3843c0870874513452e8a83" +
+			"84cfb879d6f0e24496d31170eb85f95dbc793b4c7a0cf3382d7d0f70f65694bedf0b6205012a0677637465737400002f" +
+			"000100000e100015047265616c06776374657374000006400000000003012a0677637465737400002e000100000e1000" +
+			"5a002f0f0100000e107d3b18206a478820ec3706776374657374000d68c8d5dc40d3f7c0db71853379cd1fd3843c0870" +
+			"874513452e8a8384cfb879d6f0e24496d31170eb85f95dbc793b4c7a0cf3382d7d0f70f65694bedf0b62050677637465" +
+			"7374000006000100000e100032026e7306776374657374000a686f73746d617374657206776374657374000000000100" +
+			"000e100000038400093a800000012c0677637465737400002e000100000e10005a00060f0100000e107d3b18206a4788" +
+			"20ec37067763746573740086680c77a5776baafe6dc6996b459f2db0022c6b7be012df9a745cc780e505b5655c414383" +
+			"74e8b74cc3c4b96d7c2005bf0dbd8e48945fd8935e28ddf4e18405",
+	},
+	{
+		key   = "wc_nx_ds",
+		name  = "nx.wctest.",
+		type  = .DS,
+		rcode = 0,
+		wire  = "123485800001000000060000026e780677637465737400002b0001012a0677637465737400002f000100000e10001504" +
+			"7265616c06776374657374000006400000000003012a0677637465737400002e000100000e10005a002f0f0100000e10" +
+			"7d3b18206a478820ec3706776374657374000d68c8d5dc40d3f7c0db71853379cd1fd3843c0870874513452e8a8384cf" +
+			"b879d6f0e24496d31170eb85f95dbc793b4c7a0cf3382d7d0f70f65694bedf0b6205047265616c067763746573740000" +
+			"2f000100000e10001006776374657374000006400080000003047265616c0677637465737400002e000100000e10005a" +
+			"002f0f0200000e107d3b18206a478820ec3706776374657374004f63ff1d2d3194702640919b3e2551ae708ceb46817f" +
+			"edb87f7ff8f8035b529e8b17a7250c0ddc729ebbe2baafbc627ce68808cdbcd2c973804038b370803408067763746573" +
+			"74000006000100000e100032026e7306776374657374000a686f73746d61737465720677637465737400000000010000" +
+			"0e100000038400093a800000012c0677637465737400002e000100000e10005a00060f0100000e107d3b18206a478820" +
+			"ec37067763746573740086680c77a5776baafe6dc6996b459f2db0022c6b7be012df9a745cc780e505b5655c41438374" +
+			"e8b74cc3c4b96d7c2005bf0dbd8e48945fd8935e28ddf4e18405",
+	},
+	{
+		key   = "wc_expanded_ds_answer",
+		name  = "nx.wctest.",
+		type  = .DS,
+		rcode = 0,
+		wire  = "123485800001000200040000026e780677637465737400002b0001026e780677637465737400002b000100000e100024" +
+			"7aa70f02335f2cfd3f90a99d69cb7a23326394dc425d26ffe41547587c4f501c955d299e026e78067763746573740000" +
+			"2e000100000e10005a002b0f0100000e107d3b18206a478820ec370677637465737400f61e0fbd28accc96acb7b8640e" +
+			"80dde7736f561a1c4725d608efd379362c7984213ef2825690cd9674c224d77befa76d544cc02a88ba1b124535a70c07" +
+			"6c3803012a0677637465737400002f000100000e100015047265616c06776374657374000006400000000003012a0677" +
+			"637465737400002e000100000e10005a002f0f0100000e107d3b18206a478820ec3706776374657374000d68c8d5dc40" +
+			"d3f7c0db71853379cd1fd3843c0870874513452e8a8384cfb879d6f0e24496d31170eb85f95dbc793b4c7a0cf3382d7d" +
+			"0f70f65694bedf0b620506776374657374000006000100000e100032026e7306776374657374000a686f73746d617374" +
+			"657206776374657374000000000100000e100000038400093a800000012c0677637465737400002e000100000e10005a" +
+			"00060f0100000e107d3b18206a478820ec37067763746573740086680c77a5776baafe6dc6996b459f2db0022c6b7be0" +
+			"12df9a745cc780e505b5655c41438374e8b74cc3c4b96d7c2005bf0dbd8e48945fd8935e28ddf4e18405",
+	},
+	{
+		key   = "wc_expanded_soa_answer",
+		name  = "nx.wctest.",
+		type  = .SOA,
+		rcode = 0,
+		wire  = "123485800001000200040000026e78067763746573740000060001026e7806776374657374000006000100000e100038" +
+			"026e73026e7806776374657374000a686f73746d6173746572026e7806776374657374000000000100000e1000000384" +
+			"00093a800000012c026e780677637465737400002e000100000e10005a00060f0100000e107d3b18206a478820ec3706" +
+			"77637465737400a060d20ac5c4a71e15350345e127966224003e4a1398988a70e914f736009bfbde6620e859affbf405" +
+			"31d9fabfd22e3b4daf3030f8b280cb0881eb81d14f4700012a0677637465737400002f000100000e100015047265616c" +
+			"06776374657374000006400000000003012a0677637465737400002e000100000e10005a002f0f0100000e107d3b1820" +
+			"6a478820ec3706776374657374000d68c8d5dc40d3f7c0db71853379cd1fd3843c0870874513452e8a8384cfb879d6f0" +
+			"e24496d31170eb85f95dbc793b4c7a0cf3382d7d0f70f65694bedf0b620506776374657374000006000100000e100032" +
+			"026e7306776374657374000a686f73746d617374657206776374657374000000000100000e100000038400093a800000" +
+			"012c0677637465737400002e000100000e10005a00060f0100000e107d3b18206a478820ec3706776374657374008668" +
+			"0c77a5776baafe6dc6996b459f2db0022c6b7be012df9a745cc780e505b5655c41438374e8b74cc3c4b96d7c2005bf0d" +
+			"bd8e48945fd8935e28ddf4e18405",
 	},
 	{
 		key   = "wd_ds",
@@ -351,6 +422,19 @@ WC_FIXTURES := []Fixture{
 	},
 }
 
+/*
+What the chain walk sees, which is not always what the client was sent.
+
+Matched on name and type, first entry wins - and two fixtures here share
+`nx.wctest. DS` on purpose. `wc_nx_ds` is the honest denial the walk needs on
+its way down to that name; `wc_expanded_ds_answer` is an attack reply, handed
+to `validate` by key through `wc_reply` and never something an upstream should
+be answering a walk with. `wc_nx_ds` is listed first so the walk gets the
+denial, and `test_an_expanded_ds_or_soa_answer_is_not_secure_either` asserts
+that it still does: with the two swapped, the DS and NSEC repros quietly stop
+reproducing - every test still passes, because the message is refused a step
+earlier for an unrelated reason.
+*/
 @(private = "file")
 wc_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
 	for f in WC_FIXTURES {
@@ -383,6 +467,13 @@ settles as, which is what dropping the relocated NSEC leaves behind.
 */
 @(private = "file")
 WC_UNPROVEN :: "no denial of existence"
+
+// What `validate_answer` settles at for a type RFC 4592 section 4 says a
+// wildcard never produces. Named for the same reason as the one above: a bare
+// `Bogus` would also be what a fixture chain that had quietly come apart
+// returns.
+@(private = "file")
+WC_IMPOSSIBLE :: "wildcard expansion not possible"
 
 @(private = "file")
 wc_validate :: proc(key, qname: string, type: dns.Type) -> Result {
@@ -533,6 +624,85 @@ test_a_relocated_wildcard_dname_does_not_redirect :: proc(t: ^testing.T) {
 		"a wildcard DNAME re-owned elsewhere cannot redirect, got %v (%q)",
 		result.status,
 		result.reason,
+	)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_a_relocated_wildcard_nsec_in_the_answer_is_not_secure :: proc(t: ^testing.T) {
+	/*
+	The same relocation one section over, and the reason "the expansion was
+	proven" is not enough on its own.
+
+	`validate_answer` reads a short Labels field as a wildcard expansion and
+	asks for the RFC 4035 section 5.3.4 proof that the expansion was the right
+	thing to do. Here that proof is real: the authority section carries the
+	genuine `*.wctest. NSEC`, unmodified, and it does cover `nx.wctest.`. The
+	attacker is proving something true.
+
+	What the proof does not say is that the answer's own NSEC belongs at that
+	owner, and RFC 4592 section 4.7 is why it never can: an NSEC at a wildcard
+	is synthesised "only ... when the query exactly matches the record", so an
+	expanded one was moved. Without the refusal the record goes out at AD=1,
+	with a next-name and a type bit map of the sender's choosing, saying
+	`nx.wctest.` exists.
+	*/
+	result := wc_validate("wc_relocated_answer_nsec", "nx.wctest.", .NSEC)
+	testing.expectf(
+		t,
+		result.status == .Bogus && result.reason == WC_IMPOSSIBLE,
+		"a wildcard's NSEC re-owned into the answer section is not authenticated, got %v (%q)",
+		result.status,
+		result.reason,
+	)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_an_expanded_ds_or_soa_answer_is_not_secure_either :: proc(t: ^testing.T) {
+	/*
+	The other two types on the same line, and they arrive differently.
+
+	An NSEC is relocated by rewriting an owner, because the signature never
+	covered it. A DS or an SOA cannot be moved that way - the digest and the
+	apex are part of what was signed, so a rewrite dies in the signature. What
+	reaches here instead is what a signer that wildcard signed one emits, which
+	is the shape `wdtest.` already models for the chain walk.
+
+	RFC 4592 makes both meaningless rather than merely unproven: section 4.6
+	has a DS at a wildcard "meaningless and harmless" and a synthesized one of
+	no use away from a delegation point, and section 4.1 has a wildcard owning
+	an SOA be the zone apex, which is not a source of synthesis. The chain walk
+	refuses an expanded DS already and `verified_rrset` refuses an expanded SOA
+	in the authority section; the answer section was the one place left that
+	took either, at AD=1.
+	*/
+	// The walk down to `nx.wctest.` asks for its DS, and both the denial and
+	// the attack are filed under that name and type. `wc_query` takes the
+	// first, so the order of the two decides whether what follows reproduces
+	// anything; see the comment on `wc_query`.
+	walked, answered := wc_query(nil, "nx.wctest.", .DS, context.temp_allocator)
+	testing.expect(
+		t,
+		answered && slice.equal(walked, wc_reply("wc_nx_ds")),
+		"the chain walk has to reach the denial at nx.wctest., not an attack reply filed under it",
+	)
+
+	ds := wc_validate("wc_expanded_ds_answer", "nx.wctest.", .DS)
+	testing.expectf(
+		t,
+		ds.status == .Bogus && ds.reason == WC_IMPOSSIBLE,
+		"a DS answer whose signature expanded a wildcard is not authenticated, got %v (%q)",
+		ds.status,
+		ds.reason,
+	)
+	soa := wc_validate("wc_expanded_soa_answer", "nx.wctest.", .SOA)
+	testing.expectf(
+		t,
+		soa.status == .Bogus && soa.reason == WC_IMPOSSIBLE,
+		"an SOA answer whose signature expanded a wildcard is not authenticated, got %v (%q)",
+		soa.status,
+		soa.reason,
 	)
 	free_all(context.temp_allocator)
 }
