@@ -191,6 +191,16 @@ Server :: struct {
 	// The per-domain upstreams, in configuration order. Empty on a server that
 	// forwards everything to one place.
 	routes:       []Zone_Route,
+	/*
+	Which routed apexes the parent's group would not settle a `DS` for, and
+	until when.
+
+	Only the apex `DS` carve-out reads or writes it, and only to decide whether
+	to spend a client's query on a parent that has just proved it cannot answer
+	this question. `Apex_Memo` argues it in full; the zero value is no memory of
+	anything, which is what a `Server` built as a literal wants.
+	*/
+	apex_memo:    Apex_Memo,
 	answers:      ^cache.Cache,
 	filters:      ^filter.Engine,
 	validator:    ^dnssec.Validator,
@@ -1551,10 +1561,31 @@ resolve_query :: proc(
 	already covered.
 	*/
 	unproven_apex_ds := false
-	if apex_ds && own != asked && !group_reachable(asked) && group_reachable(own) {
-		logx.debugf("query DS %s: the parent's group is parked, asking the route instead", q.name)
-		asked = own
-		unproven_apex_ds = true
+	if apex_ds && own != asked && group_reachable(own) {
+		/*
+		Or when the parent's group was asked this same question inside the last
+		cooldown and settled nothing, which is the other way this wait is known
+		to be wasted before it is spent. `Apex_Memo` argues it: a group that is
+		answering REFUSED to every `DS` never accrues a failure and so is never
+		parked, and a group behind a blackholed uplink is unparked again every
+		ten seconds however many times it has failed, so `group_reachable` alone
+		leaves both of those paid for by every query. What the memory changes is
+		when the parent is asked, not what the client is told: the route answers
+		either way, and `unproven_apex_ds` keeps that answer out of the cache
+		exactly as it does above.
+		*/
+		if !group_reachable(asked) {
+			logx.debugf("query DS %s: the parent's group is parked, asking the route instead", q.name)
+			asked = own
+			unproven_apex_ds = true
+		} else if apex_ds_parent_unsettled(s, q.name) {
+			logx.debugf(
+				"query DS %s: the parent's group settled nothing for this apex inside the last cooldown, asking the route instead",
+				q.name,
+			)
+			asked = own
+			unproven_apex_ds = true
+		}
 	}
 	resp: []u8
 	winner: ^upstream.Upstream
@@ -1630,6 +1661,13 @@ resolve_query :: proc(
 		whether the route's answer is kept: see the store below.
 		*/
 		proved, settled := parent_answers_apex_ds(resp, q.name, uerr == .None, allocator)
+		/*
+		And what it managed to say is remembered, for the next query rather than
+		for this one. Settled or not is the whole of it - no answer is kept, and
+		the memory only decides whether the next client's apex `DS` waits on this
+		group again inside the cooldown. See `Apex_Memo`.
+		*/
+		remember_apex_ds_parent(s, q.name, settled)
 		if !proved {
 			/*
 			Two lines rather than one with both fields, because there is no

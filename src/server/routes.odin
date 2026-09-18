@@ -1,6 +1,8 @@
 package server
 
 import "core:mem"
+import "core:sync"
+import "core:time"
 import "elodin:dns"
 import "elodin:upstream"
 
@@ -462,14 +464,155 @@ claims the name is the route that names it.
 */
 @(private)
 is_route_apex :: proc(s: ^Server, name: string) -> bool {
+	_, found := route_apex_name(s, name)
+	return found
+}
+
+/*
+The route table's own spelling of `name`, when `name` is a route's apex.
+
+`is_route_apex` wants only the fact. The memo below wants the string, and it
+wants this one rather than the question's: the question's name is decoded into
+the per-request arena and is gone the moment the response is written, where a
+route's domain is read from the configuration at startup and outlives every
+request. Same name either way - `dns.name_equal_fold` is what picked it - so
+what this buys is a key the memo can hold on to.
+*/
+@(private)
+route_apex_name :: proc(s: ^Server, name: string) -> (apex: string, found: bool) {
 	for candidate in s.routes {
 		for domain in candidate.domains {
 			if dns.name_equal_fold(name, domain) {
-				return true
+				return domain, true
 			}
 		}
 	}
+	return "", false
+}
+
+/*
+What a parent could not settle about a routed apex, and for how long that stands.
+
+The probe `route_group` sends to the parent's group is paid for by the client's
+own question, and where the parent settles nothing the route answers and nothing
+is stored - the rule at `resolve_query`'s store, which is there so that an outage
+is not memoised into the failure this carve-out exists to prevent. The price is
+that the probe is re-paid by every query, and there are two configurations where
+that is not a rounding error (issue #243):
+
+  - An uplink that blackholes packets. `group_reachable` passes over the parent's
+    group only while every member is parked, and `healthy` goes true again the
+    moment `COOLDOWN` elapses however many failures stand against the server, so
+    the first apex `DS` after each expiry runs the group to the end of its budget
+    - `attempts` rounds over every server, twenty seconds at the defaults. A
+    validating stub gives up in two to five, so it SERVFAILs the apex `DS` and
+    with it every name in a zone whose own authority is answering in
+    milliseconds, once per cooldown cycle.
+  - A parent that answers but never settles. `exchange` counts a reply as a
+    success whatever its rcode, so a member that REFUSEs or SERVFAILs every `DS`
+    - an upstream with an ACL, a CPE resolver that mangles the type - never
+    accrues a failure, is never parked, and `group_reachable` is true forever.
+    Every client `DS` at a routed apex then costs two upstream exchanges for as
+    long as the configuration stands.
+
+This is the memory that makes either one a cost per window rather than per query.
+It keeps no answer and stands in for none: what it remembers is that this parent
+said nothing lasting about this apex, which is `parent_answers_apex_ds`'s
+`settled` read false, and all that follows from it is that the route is asked
+first while the memory holds. The client is handed what it would have been handed
+after the wait, `unproven_apex_ds` travels with it exactly as it does when the
+parent's group is parked, and the store refuses it for the same reason - so
+nothing reaches the cache that the no-store rule would have kept out of it. The
+window is `upstream.COOLDOWN`, the clock the parked-group skip already runs on,
+so a parent that recovers is asked again within ten seconds of doing so and the
+proof is back in the client's hands.
+
+A parent that does settle clears its slot rather than leaving it to expire: the
+question was asked, the answer arrived, and the memory of the last failure has
+been overtaken by it.
+
+Fixed slots rather than a map keyed by name. The names are route apexes, so the
+set is settled at startup and small; an array needs no allocation, no destructor,
+and nothing from a `Server` built as a literal. The ceiling is that an operator
+routing more zones than there are slots keeps the memory only for the apexes that
+stay in it, the rest paying what every apex pays today - a map here is the upgrade
+if a deployment ever wants it.
+*/
+APEX_MEMO_SLOTS :: 8
+
+Apex_Memo :: struct {
+	mu:    sync.Mutex,
+	slots: [APEX_MEMO_SLOTS]Apex_Memo_Slot,
+}
+
+Apex_Memo_Slot :: struct {
+	// A route's own domain string, which outlives the request; see
+	// `route_apex_name`. Empty in a slot nothing has claimed.
+	name:  string,
+	// When this stops being remembered. The zero value is in the past, which is
+	// what makes a cleared slot read as no memory at all.
+	until: time.Time,
+}
+
+// Whether the parent's group failed to settle this apex `DS` inside the window.
+@(private)
+apex_ds_parent_unsettled :: proc(s: ^Server, name: string) -> bool {
+	now := time.now()
+	sync.mutex_lock(&s.apex_memo.mu)
+	defer sync.mutex_unlock(&s.apex_memo.mu)
+	for slot in s.apex_memo.slots {
+		if slot.name != "" && dns.name_equal_fold(slot.name, name) {
+			return time.diff(now, slot.until) > 0
+		}
+	}
 	return false
+}
+
+/*
+Write down what the parent's group managed to say about this apex `DS`.
+
+`settled` is `parent_answers_apex_ds`'s second return read straight: true and the
+slot is cleared, false and the route is asked first for one `upstream.COOLDOWN`.
+
+The slot chosen is this apex's own where it has one, and otherwise the one whose
+memory expires soonest - which takes an unclaimed slot first, its zero `until`
+being older than any real one, and evicts the stalest memory when every slot is
+in use.
+*/
+@(private)
+remember_apex_ds_parent :: proc(s: ^Server, name: string, settled: bool) {
+	apex, found := route_apex_name(s, name)
+	if !found {
+		return
+	}
+	sync.mutex_lock(&s.apex_memo.mu)
+	defer sync.mutex_unlock(&s.apex_memo.mu)
+	victim := -1
+	for slot, i in s.apex_memo.slots {
+		if slot.name == apex {
+			victim = i
+			break
+		}
+		// A parent that settled has nothing to write down, so it takes no slot
+		// from an apex that has something in one.
+		if settled {
+			continue
+		}
+		if victim < 0 || time.diff(s.apex_memo.slots[victim].until, slot.until) < 0 {
+			victim = i
+		}
+	}
+	if victim < 0 {
+		return
+	}
+	if settled {
+		s.apex_memo.slots[victim] = {}
+		return
+	}
+	s.apex_memo.slots[victim] = {
+		name  = apex,
+		until = time.time_add(time.now(), upstream.COOLDOWN),
+	}
 }
 
 /*

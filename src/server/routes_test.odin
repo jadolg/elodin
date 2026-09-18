@@ -1474,6 +1474,176 @@ test_an_apex_ds_sweeps_the_parents_group_past_a_refusal :: proc(t: ^testing.T) {
 }
 
 /*
+A parent that settles nothing is not waited on again for the very next query.
+
+The carve-out stores nothing when the parent establishes nothing, deliberately:
+a stand-in answer kept past the outage that caused it is the failure the whole
+file exists to prevent. What that left is the *probe* being re-paid by every
+query, and two configurations where that is not a rounding error (issue #243) -
+a blackholed uplink, where `healthy` goes true again every cooldown however many
+failures stand against the server, and a parent that answers but never settles,
+which is this fixture: a group answering SERVFAIL to every `DS` accrues no
+failures at all, is never parked, and so is asked again, and waited on again, for
+as long as the configuration stands.
+
+Both arrangements run against one fixture and differ only in what the parent
+says, which is the assertion that matters: the memory is of the parent having
+settled nothing, and a parent that settles the question keeps its place. So the
+SERVFAIL is asked once for two queries and the proof is asked twice, and the
+second half is what keeps this from being "ask the parent less": a route whose
+parent can prove the delegation carries no DS goes on getting that proof, per
+query, which is what issue #227 was about.
+
+The client's answer is asserted on both queries for the same reason. What the
+memory changes is which upstream is asked first, not what comes back - the route
+answers the unsettled case either way, exactly as it does when the parent's group
+is parked - so a second query that came back different would mean the memory had
+started standing in for an answer rather than for a wait.
+
+The parent's mock is started once per query it is expected to take, the route's
+once per query it is expected to take, and the socket that should have been left
+alone is read by `route_mock_quiet` rather than by a thread: a mock waiting on a
+question nobody sends holds the case open for `MOCK_RECV_TIMEOUT`, and the
+reading cannot be done from two places at once.
+*/
+@(test)
+test_a_parent_that_settles_nothing_is_not_re_asked_for_every_query :: proc(t: ^testing.T) {
+	Case :: struct {
+		// What the parent's group says about `corp.example. DS`, both times it
+		// is asked.
+		what:         string,
+		parent:       dns.Rcode,
+		// Whether the second query goes to the parent's group as well.
+		asked_twice:  bool,
+		// Whether the route answers, which is the other side of the same coin:
+		// the proof is the client's answer and the route is never reached.
+		to_route:     bool,
+	}
+	cases := []Case {
+		{"SERVFAIL", .Serv_Fail, false, true},
+		{"the proof", .No_Error, true, false},
+	}
+
+	for c in cases {
+		def_socket, derr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+		if !testing.expectf(t, derr == nil, "cannot bind the default mock: %v", derr) {
+			return
+		}
+		defer net.close(def_socket)
+		_ = net.set_option(def_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+		def_bound, _ := net.bound_endpoint(def_socket)
+
+		route_socket, rerr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+		if !testing.expectf(t, rerr == nil, "cannot bind the routed mock: %v", rerr) {
+			return
+		}
+		defer net.close(route_socket)
+		_ = net.set_option(route_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+		route_bound, _ := net.bound_endpoint(route_socket)
+
+		cfg := forwarding_config()
+		// Cut, so that a second query which should not have gone to the parent
+		// does not sit out three seconds before this case says so.
+		cfg.upstream.timeout = 200 * time.Millisecond
+
+		group := mock_group(t, cfg.upstream, def_bound.port)
+		defer upstream.destroy_group(group)
+		routed := mock_group(t, cfg.upstream, route_bound.port)
+		defer upstream.destroy_group(routed)
+
+		s := Server {
+			cfg    = &cfg,
+			group  = group,
+			routes = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
+		}
+
+		parent_reply := route_reply_nodata("corp.example.", .DS, c.parent)
+		route_reply := route_reply_nodata("corp.example.", .DS)
+
+		for round in 0 ..< 2 {
+			serve_parent := round == 0 || c.asked_twice
+			parent := Route_Mock {
+				socket = def_socket,
+				reply  = parent_reply,
+				want   = "corp.example.",
+			}
+			authority := Route_Mock {
+				socket = route_socket,
+				reply  = route_reply,
+				want   = "corp.example.",
+			}
+			parent_mock: ^thread.Thread
+			if serve_parent {
+				parent_mock = thread.create_and_start_with_poly_data(&parent, serve_route)
+			}
+			route_thread: ^thread.Thread
+			if c.to_route {
+				route_thread = thread.create_and_start_with_poly_data(&authority, serve_route)
+			}
+			out, _, ok := handle_query(
+				&s,
+				route_query("corp.example.", .DS),
+				.UDP,
+				"127.0.0.1:5555",
+				context.temp_allocator,
+			)
+			if parent_mock != nil {
+				thread.join(parent_mock)
+				thread.destroy(parent_mock)
+			}
+			if route_thread != nil {
+				thread.join(route_thread)
+				thread.destroy(route_thread)
+			}
+
+			if !testing.expectf(t, ok, "nothing came back at all on query %d (%s)", round + 1, c.what) {
+				return
+			}
+			testing.expectf(
+				t,
+				parent.asked == serve_parent,
+				"on query %d the parent's group was %sasked (%s)",
+				round + 1,
+				"not " if serve_parent else "",
+				c.what,
+			)
+			if !serve_parent {
+				testing.expectf(
+					t,
+					route_mock_quiet(def_socket, "corp.example."),
+					"a parent that had just settled nothing was asked the same apex DS again (%s)",
+					c.what,
+				)
+			}
+			testing.expectf(
+				t,
+				authority.asked == c.to_route,
+				"on query %d the route was %sasked (%s)",
+				round + 1,
+				"not " if c.to_route else "",
+				c.what,
+			)
+			if !c.to_route {
+				testing.expectf(
+					t,
+					route_mock_quiet(route_socket, "corp.example."),
+					"an answer the parent proved was re-asked down the route on query %d (%s)",
+					round + 1,
+					c.what,
+				)
+			}
+
+			// The same answer on both queries, from whichever upstream this
+			// arrangement leaves holding the question.
+			decoded, derr2 := dns.decode_message(out, context.temp_allocator)
+			testing.expect_value(t, derr2, dns.Decode_Error.None)
+			testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
+		}
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
 A routed zone is served insecure, and an anchor over it takes that back.
 
 `served_locally` is the predicate `resolve_query` reads to decide whether to
