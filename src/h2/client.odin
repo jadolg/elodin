@@ -226,6 +226,11 @@ client_serve :: proc(c: ^Client) {
 
 @(private)
 client_read_exact :: proc(c: ^Client, buf: []u8) -> bool {
+	// One whole thing off the wire starts here, as it does in `read_exact` on the
+	// server side, and for the same reason. See `IO`.
+	if c.io.begin != nil {
+		c.io.begin(c.io.user)
+	}
 	got := 0
 	for got < len(buf) {
 		n, ok := c.io.read(c.io.user, buf[got:])

@@ -30,6 +30,11 @@ trickling a byte at a time restarts the transport's wait with every byte and is
 never given up on, which on a DoH server is a connection and a thread held for
 nothing before any stream exists. Optional: a transport with nothing to bound
 leaves it nil.
+
+Both halves of this package call it, though only the server has a transport that
+sets one today. A hook that fired on one path and not the other would hand a
+client transport that set it a bound it never got, which is the failure it exists
+to prevent.
 */
 IO :: struct {
 	user:  rawptr,
