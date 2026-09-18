@@ -292,11 +292,11 @@ resolve_insisting :: proc(
 	exchange for it instead, and the upgrade path above is what would fix it in
 	place.
 
-	What bounds it meanwhile is the budget below: the sweep spends one
-	`g.timeout` on whatever members it has left, however many those are. So what
-	a racing group pays is duplicated exchanges rather than waiting - its members
-	are there and answer, they simply answer the same unusable thing - and the
-	arrangement that would have cost a timeout apiece no longer can.
+	What bounds it meanwhile is the rule below: the sweep stops at the first
+	member it cannot reach, so it spends at most one `g.timeout` waiting however
+	many members are left. What a racing group pays is therefore duplicated
+	exchanges rather than waiting - its members are there and answer, they simply
+	answer the same unusable thing.
 	*/
 	/*
 	Counted here, against the member whose reply sent the group looking, and
@@ -314,39 +314,29 @@ resolve_insisting :: proc(
 	note_swept_rcode(winner)
 
 	/*
-	Each member the sweep will ask gets a share of one `g.timeout`, and that is
-	the whole of what the sweep may spend waiting.
+	And the sweep stops at the first member it cannot reach at all.
 
-	What it bounds is the group with several spares it cannot reach: at the full
-	timeout apiece, a group of four would spend three of them - fifteen seconds
-	as elodin ships - and hand back the reply it had in the first millisecond,
-	holding one of a bounded set of query workers for the whole wait. A client
-	repeating one such name is then a way to empty the pool.
+	Which is what bounds it. Asking every remaining member at the full timeout
+	is a group of four spending three of them - fifteen seconds as elodin ships
+	- to hand back the reply it had in the first millisecond, holding one of a
+	bounded set of query workers for the whole wait; a client repeating one such
+	name is then a way to empty the pool. Stopping at the first silence caps the
+	whole sweep at one timeout however many members are left.
 
-	A share each rather than a deadline the loop breaks on, because a deadline
-	spends the budget on whoever happens to be first: one dead spare ahead of a
-	live one consumes it, and the member that had the answer is never asked -
-	which is issue #309's own failure, arriving through the bound meant to keep
-	the fix affordable. Divided, every remaining member is asked and the sum is
-	still one timeout.
+	Not by dividing the timeout between them, which was tried and taken back
+	out. `exchange` counts a timeout as a failure, so a member cut off by a
+	share it would have answered inside gets `record_failure` for being asked
+	impatiently, and three of those park the spare this whole change exists to
+	keep. The wait is what must be bounded; what a member is judged on has to go
+	on being the group's own timeout.
 
-	The cost is that a slow member may be cut off in a large group, where the
-	full timeout would have waited for it. That is the right way round: this is
-	a second question about a name the group has already answered unusably, the
-	reply in hand is what it improves on, and a member that needs seconds is one
-	`resolve` gives its full timeout to on the next query anyway.
+	What it costs is a live spare standing behind a dead one: the dead one is
+	asked first, the sweep stops there, and the client gets the reply in hand.
+	That is three queries long. Each of those exchanges is a real failure at the
+	real timeout, so the dead member parks, the sweep skips it from then on and
+	reaches the live one - and after each cooldown expiry one query pays for it
+	again, which is the arrangement every other part of this file already makes.
 	*/
-	candidates := 0
-	for u in g.servers {
-		if u != winner && !slice.contains(unreachable[:], u) && healthy(u) {
-			candidates += 1
-		}
-	}
-	share := g.timeout
-	if candidates > 1 {
-		share = g.timeout / time.Duration(candidates)
-	}
-
 	for u in g.servers {
 		if u == winner {
 			continue
@@ -377,10 +367,10 @@ resolve_insisting :: proc(
 			logx.debugf("upstream %s is in its cooldown, not asked again for this one", u.spec.name)
 			continue
 		}
-		resp, xerr := exchange(u, sweep_query(query), share, allocator)
+		resp, xerr := exchange(u, sweep_query(query), g.timeout, allocator)
 		if xerr != .None {
-			logx.debugf("upstream %s failed: %v", u.spec.name, xerr)
-			continue
+			logx.debugf("upstream %s failed: %v, ending the sweep for this query", u.spec.name, xerr)
+			break
 		}
 		if acceptable(resp) {
 			// Said here rather than above, because what makes a filtering
@@ -543,6 +533,16 @@ re-asked of the public one and answered.
 Not 18 (Prohibited), which is the opposite case and the one the sweep is for:
 that is the responder declining *this client* - an ACL that no longer lists this
 server - and it says nothing about the name at all.
+
+Believing it costs what believing the SERVFAIL codes costs, and in the same
+quiet way: a filtering member whose blocklist has gone wrong, or one that says
+Blocked where it means Prohibited, states this about every name and is taken at
+its word, so the group is pinned on it while `failures` stays at zero, `up` at
+one and `swept_rcode` at zero - the reply was accepted rather than swept, so
+nothing counts it. What an operator has is clients being refused everything and
+a group whose figures all look well. The remedy is the same: the member that is
+refusing is named in its own logs, and an upstream meant to filter belongs on
+its own rather than in a group.
 */
 @(private)
 POLICY_EDE_FIRST :: 15
@@ -779,9 +779,6 @@ resolve_race :: proc(
 	}
 	if len(candidates) == 1 {
 		resp, xerr := exchange(candidates[0], query, g.timeout, allocator)
-		if xerr != .None && unreachable != nil {
-			append(unreachable, candidates[0])
-		}
 		return resp, candidates[0], xerr
 	}
 

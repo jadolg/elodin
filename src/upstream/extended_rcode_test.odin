@@ -47,6 +47,9 @@ Canned_Mock :: struct {
 	// loop only reads it.
 	reply:   []u8,
 	stop:    bool,
+	// How long to sit on a query before answering it, for the member that is
+	// slow rather than absent.
+	delay:   time.Duration,
 	hits:    int,
 	// The transaction ID of the last query this responder was sent, as an int
 	// so it can be read back atomically.
@@ -68,6 +71,9 @@ canned_mock_loop :: proc(m: ^Canned_Mock) {
 		}
 		sync.atomic_add(&m.hits, 1)
 		sync.atomic_store(&m.last_id, int(u16(buf[0]) << 8 | u16(buf[1])))
+		if m.delay > 0 {
+			time.sleep(m.delay)
+		}
 		copy(out[:], m.reply)
 		// Echo the ID it was asked with, which is drawn fresh per exchange.
 		out[0], out[1] = buf[0], buf[1]
@@ -813,19 +819,21 @@ test_the_sweep_does_not_wait_again_on_a_member_that_timed_out :: proc(t: ^testin
 }
 
 /*
-And a live spare standing behind a dead one is still asked.
+And a live spare standing behind a dead one is reached once the dead one parks.
 
-The bound is a share of one timeout each rather than a deadline the loop stops
-at, and this is why. A deadline is spent by whoever is asked first, so a group
-of `[refuses, not there, has the answer]` would spend it on the middle member
-and never reach the third - which is issue #309's own failure arriving through
-the bound meant to keep the fix affordable.
+The sweep stops at the first member it cannot reach, which is what keeps its
+cost to one timeout however many members are left. The price is this group -
+`[refuses, not there, has the answer]` - where the sweep stops at the middle
+member and the client is handed the REFUSED it started with.
 
-Two members left, so each gets half of the group's timeout: the dead one is cut
-off at that and the one behind it answers.
+For three queries. Each of those exchanges is a real failure at the group's own
+timeout, which is the point of not cutting it short: the dead member accrues
+`FAILURE_THRESHOLD` and parks, the sweep skips a parked member, and the one
+behind it answers. So the assertion is that the group heals itself inside the
+threshold rather than that the first query is perfect.
 */
 @(test)
-test_a_live_spare_behind_a_dead_one_is_still_asked :: proc(t: ^testing.T) {
+test_a_live_spare_behind_a_dead_one_is_reached_once_the_dead_one_parks :: proc(t: ^testing.T) {
 	refusing := Canned_Mock{}
 	ref, ref_thread, ref_ok := start_canned_mock(t, &refusing, "refusing", canned_reply(0, .Refused))
 	if !ref_ok {
@@ -894,14 +902,34 @@ test_a_live_spare_behind_a_dead_one_is_still_asked :: proc(t: ^testing.T) {
 	wire := canned_query()
 	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
 
-	resp, winner, err := resolve_readable(&g, wire, context.allocator)
-	testing.expect_value(t, err, Error.None)
-	testing.expectf(
+	/*
+	One more query than the threshold: the first `FAILURE_THRESHOLD` of them
+	pay a timeout at the dead member and are answered with the REFUSED, and the
+	one after that finds it parked and reaches the member behind it.
+	*/
+	answered := false
+	for i in 0 ..< FAILURE_THRESHOLD + 1 {
+		resp, winner, err := resolve_readable(&g, wire, context.allocator)
+		testing.expect_value(t, err, Error.None)
+		if winner == good && dns.peek_rcode(resp) == .No_Error {
+			answered = true
+		} else {
+			testing.expectf(
+				t,
+				winner == ref && dns.peek_rcode(resp) == .Refused,
+				"query %d came back from neither the refusing member nor the one with the answer",
+				i,
+			)
+		}
+		delete(resp, context.allocator)
+	}
+
+	testing.expect(
 		t,
-		winner == good && dns.peek_rcode(resp) == .No_Error,
-		"the sweep stopped at the member that was not there, so the client got the REFUSED",
+		answered,
+		"the member with the answer was never reached, so a dead spare in front of it stands forever",
 	)
-	delete(resp, context.allocator)
+	testing.expect(t, !healthy(dead), "the dead member was never parked, so the sweep never gets past it")
 }
 
 /*
@@ -1000,4 +1028,87 @@ test_the_sweep_spends_one_timeout_on_the_members_it_has_left :: proc(t: ^testing
 		"the sweep took %v, which is a timeout for every spare rather than one for the sweep",
 		spent,
 	)
+}
+
+/*
+And a member the sweep asks is judged on the group's timeout, not on a smaller
+one.
+
+The rule that keeps this honest: `exchange` counts a timeout as a failure, and
+three failures park a server for `COOLDOWN`. So a sweep that asked with anything
+less than `g.timeout` would mark down a member for being asked impatiently -
+answering well inside what its group allows - and three queries later the spare
+this whole change exists to keep would be out of the group. Which is how the
+first version of the bound was wrong: it divided the timeout between the members
+it had left.
+
+A member that answers at three quarters of the timeout, asked four times: the
+assertion is that it is still in the group at the end, and that its answer is
+what the client got.
+*/
+@(test)
+test_a_slow_member_the_sweep_reaches_is_not_marked_down :: proc(t: ^testing.T) {
+	refusing := Canned_Mock{}
+	ref, ref_thread, ref_ok := start_canned_mock(t, &refusing, "refusing", canned_reply(0, .Refused))
+	if !ref_ok {
+		return
+	}
+	defer {
+		sync.atomic_store(&refusing.stop, true)
+		thread.join(ref_thread)
+		thread.destroy(ref_thread)
+		net.close(refusing.socket)
+		destroy(ref)
+	}
+
+	TIMEOUT :: 400 * time.Millisecond
+	slow := Canned_Mock {
+		delay = 300 * time.Millisecond,
+	}
+	good, good_thread, good_ok := start_canned_mock(t, &slow, "slow", canned_reply(0))
+	if !good_ok {
+		return
+	}
+	defer {
+		sync.atomic_store(&slow.stop, true)
+		thread.join(good_thread)
+		thread.destroy(good_thread)
+		net.close(slow.socket)
+		destroy(good)
+	}
+
+	servers := make([]^Upstream, 2, context.allocator)
+	defer delete(servers, context.allocator)
+	servers[0] = ref
+	servers[1] = good
+
+	g := Group {
+		servers   = servers,
+		strategy  = .Failover,
+		timeout   = TIMEOUT,
+		attempts  = 1,
+		allocator = context.allocator,
+	}
+
+	wire := canned_query()
+	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
+
+	for i in 0 ..< FAILURE_THRESHOLD + 1 {
+		resp, winner, err := resolve_readable(&g, wire, context.allocator)
+		testing.expect_value(t, err, Error.None)
+		testing.expectf(
+			t,
+			winner == good && dns.peek_rcode(resp) == .No_Error,
+			"query %d did not reach the slow member, which answers inside the group's timeout",
+			i,
+		)
+		delete(resp, context.allocator)
+	}
+
+	testing.expect(
+		t,
+		healthy(good),
+		"the slow member was parked for answering inside the timeout its group allows",
+	)
+	testing.expect_value(t, stats_of(good).failures, u64(0))
 }

@@ -602,6 +602,13 @@ main :: proc() {
 	where the sweep in `upstream.resolve_insisting` can turn a rejected answer
 	into a served one.
 
+	Said as a condition rather than as a verdict, because from here the two
+	cannot be told apart: a group of two upstreams that both validate is in no
+	danger from this, a group where one does and one does not is, and nothing in
+	the configuration says which. The line names the arrangement and what would
+	follow from it, and an operator who knows their upstreams reads it in one
+	go.
+
 	A member that validates answers SERVFAIL for a zone it found bogus. The
 	sweep asks the next member, and if that one does not validate, what comes
 	back is the forgery - cached here, and served to every client behind this
@@ -614,16 +621,8 @@ main :: proc() {
 	ships, `validate` refuses that answer here whichever member supplied it and
 	there is nothing to warn about.
 	*/
-	if !cfg.dnssec.enabled {
-		groups := 1 if len(cfg.upstream.servers) > 1 else 0
-		for route in cfg.upstream.zones {
-			if len(route.upstream.servers) > 1 {
-				groups += 1
-			}
-		}
-		if groups > 0 {
-			logx.warnf("dnssec.enabled is off and an upstream group has more than one server: a SERVFAIL from a member that validates is asked of the next one, which may not - see elodin_upstream_swept_rcode_total")
-		}
+	if !cfg.dnssec.enabled && any_group_of_several(&cfg) {
+		logx.warnf("dnssec.enabled is off and an upstream group has more than one server: if its members do not all validate, a SERVFAIL from one that does is asked of one that does not - see elodin_upstream_swept_rcode_total")
 	}
 
 	switch {
@@ -643,6 +642,21 @@ main :: proc() {
 		logx.warnf("special_use.onion is off: .onion queries are forwarded, which is only safe to a Tor-aware upstream")
 	}
 	run(&cfg, opts, service)
+}
+
+// Whether any upstream group - the default one or a zone route's - has somewhere
+// else to go, which is what makes the sweep above possible at all.
+@(private)
+any_group_of_several :: proc(cfg: ^config.Config) -> bool {
+	if len(cfg.upstream.servers) > 1 {
+		return true
+	}
+	for route in cfg.upstream.zones {
+		if len(route.upstream.servers) > 1 {
+			return true
+		}
+	}
+	return false
 }
 
 run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
