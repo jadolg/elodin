@@ -287,3 +287,42 @@ allowance that those three want editing.
 test_the_documented_iteration_limit_is_the_one_this_build_computes :: proc(t: ^testing.T) {
 	testing.expect_value(t, MAX_NSEC3_ITERATIONS_LIMIT, 255)
 }
+
+/*
+A refusal at one step is not the reason a later one gave up.
+
+A step can be refused a hash and decide anyway - a chain above the ceiling
+beside one this server can read is exactly that - and the walk carries on. If
+what stops it five labels later is a lookup nobody answered, saying "nsec3
+iterations above the ceiling" tells the client to go and look at a zone's
+parameters over an upstream that timed out. Which is the misdirection this
+branch added the precise reason to remove, pointing the other way.
+
+So the reason is written where the walk gives up rather than worked out
+afterwards from counters that only ever go up. What this holds to account is
+the half of that this fixture can reach: a walk stopped by its lookups says so
+in those words, where every `Indeterminate` from a walk used to say the same
+sentence about a chain.
+*/
+@(test)
+test_a_walk_that_ran_out_of_lookups_does_not_blame_the_hashing :: proc(t: ^testing.T) {
+	msg, err := dns.decode_message(n3_reply(), context.temp_allocator)
+	testing.expect(t, err == .None, "the fixture should decode")
+
+	v := n3_validator()
+	testing.expect(t, v != nil, "the anchor should parse")
+	defer destroy_validator(v)
+
+	// A name two labels below the one the fixtures answer for, so the walk
+	// hashes its way down `n3test.` and then asks for a DS nobody wrote.
+	// Enough lookups to reach the zone and not enough to ask about the name
+	// below it, so the walk stops on the allowance that is not the hashing one.
+	budget := query_budget(v)
+	budget.lookups = MAX_LOOKUPS_PER_QUERY - 3
+	result := validate_denial(v, &budget, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	testing.expect_value(t, result.status, Status.Indeterminate)
+	testing.expect_value(t, result.reason, "lookup budget spent")
+	testing.expect_value(t, budget.nsec3.over_ceiling, 0)
+	testing.expect_value(t, budget.nsec3.spent, 0)
+	free_all(context.temp_allocator)
+}

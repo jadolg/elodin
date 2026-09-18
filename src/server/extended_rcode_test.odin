@@ -869,10 +869,20 @@ test_a_dnssec_refusal_names_which_refusal_it_was :: proc(t: ^testing.T) {
 			EDE_UNSUPPORTED_NSEC3_ITERATIONS,
 			"a zone asking for more hashing than this server does",
 		},
+		// No code of its own describes "this server would not spend more CPU on
+		// your question", and 22 is what every other allowance in the validator
+		// already sends - the signature budget, the lookup budget - so this
+		// goes with them rather than inventing a distinction the rest of the
+		// package does not make.
 		{
 			{status = .Indeterminate, reason = dnssec.NSEC3_BUDGET_SPENT},
 			EDE_NO_REACHABLE_AUTHORITY,
-			"an allowance of ours, which no code of its own describes",
+			"an allowance of ours",
+		},
+		{
+			{status = .Indeterminate, reason = "lookup budget spent"},
+			EDE_NO_REACHABLE_AUTHORITY,
+			"the allowance beside it, which answers the same way",
 		},
 	}
 	for c in cases {

@@ -182,9 +182,48 @@ is per client question: two queries arriving at once each get their own.
 Budget :: struct {
 	lookups:       int,
 	verifications: int,
+	/*
+	Why the walk gave up, written where it gave up.
+
+	`zone_trust` reports one `Indeterminate` for every allowance a walk can run
+	out of, and what a client is told about it - the extended error on the
+	answer - comes from the reason beside it. Working that out afterwards from
+	the counters gets it wrong, because a step can be refused a hash and decide
+	anyway: a zone mid-rollover raises the NSEC3 count at one label and a
+	lookup fails five labels later, and the counters then say the hashing did
+	it. So each place that gives up says so in its own words, the last writer is
+	the step that stopped the walk, and `zone_trust` clears it on the way in so
+	nothing older can be read as this walk's.
+	*/
+	walk_stopped:  string,
 	// The hashing a denial proved with NSEC3 may spend, which no count of
 	// lookups or verifications bounds: see `MAX_NSEC3_ROUNDS_PER_QUERY`.
 	nsec3:         Nsec3_Budget,
+}
+
+/*
+Why a walk that came back `Indeterminate` stopped, in the words of the step that
+stopped it.
+
+"chain of trust unavailable" is the fallback and the truth for most of them - a
+lookup that could not be made, a parent that did not answer. The allowances can
+be said more precisely, and saying them is worth a line, because this reason is
+what picks the extended error the client is handed: the walk is where a zone
+whose NSEC3 iteration count is past the ceiling is met first, since every name
+inside one reaches its DS denial before the answer's own proof is read, so
+without this the precise code would be the one nobody ever sees.
+*/
+@(private)
+walk_reason :: proc(budget: ^Budget) -> string {
+	return budget.walk_stopped if budget.walk_stopped != "" else "chain of trust unavailable"
+}
+
+// Give up on a step, saying why. The words reach the client as an extended
+// error, so they are the ones an operator would want to read first.
+@(private)
+walk_gave_up :: proc(budget: ^Budget, reason: string) -> Step {
+	budget.walk_stopped = reason
+	return .Indeterminate
 }
 
 /*
@@ -197,27 +236,6 @@ way to the proof that reads it: an allowance built without it refuses every
 record asking for any iterations at all, which fails closed and fails loudly
 rather than quietly validating at a number nobody chose.
 */
-/*
-Why a walk that came back `Indeterminate` stopped, in the words of the thing
-that stopped it.
-
-`zone_trust` reports the one verdict for every allowance it can run out of, and
-for most of them "chain of trust unavailable" is the whole truth: a lookup it
-could not make, a signature budget it could not spend. NSEC3 hashing is the one
-that can be said more precisely, and it is worth saying, because this reason is
-what picks the extended error the client is handed - and the walk is where a
-zone whose iteration count is past the ceiling is met first. Every name inside
-such a zone reaches its DS denial before the answer's own proof is read, so
-without this the precise code would be the one nobody ever sees.
-*/
-@(private)
-walk_reason :: proc(budget: ^Budget, before: Nsec3_Refusals) -> string {
-	if declined, why := nsec3_declined(&budget.nsec3, before); declined {
-		return why
-	}
-	return "chain of trust unavailable"
-}
-
 @(private)
 query_budget :: proc(v: ^Validator) -> Budget {
 	return {nsec3 = {max_iterations = v.max_nsec3_iterations}}
@@ -1673,7 +1691,6 @@ validate_denial :: proc(
 	forged NXDOMAIN that DNSSEC exists to refuse. Walking down to the name costs
 	a lookup and settles it.
 	*/
-	walked := nsec3_refusals(&budget.nsec3)
 	status, keys, established := zone_trust(v, budget, qname, now, allocator)
 	#partial switch status {
 	case .Insecure:
@@ -1681,7 +1698,7 @@ validate_denial :: proc(
 	case .Bogus:
 		return {status = .Bogus, reason = "broken chain of trust"}
 	case .Indeterminate:
-		return {status = .Indeterminate, reason = walk_reason(budget, walked)}
+		return {status = .Indeterminate, reason = walk_reason(budget)}
 	}
 
 	/*
@@ -2028,13 +2045,12 @@ validate_rrset :: proc(
 	}
 
 	missing := "signature missing" if len(sigs) == 0 else "no valid signature"
-	before_owner := nsec3_refusals(&budget.nsec3)
 	owner_status, _, _ := zone_trust(v, budget, owner, now, allocator)
 	switch owner_status {
 	case .Insecure:
 		return .Insecure, "", "unsigned zone", "", {}
 	case .Indeterminate:
-		return .Indeterminate, "", walk_reason(budget, before_owner), "", {}
+		return .Indeterminate, "", walk_reason(budget), "", {}
 	case .Bogus:
 		return .Bogus, "", "broken chain of trust", "", {}
 	case .Secure:
@@ -2282,13 +2298,12 @@ validate_wildcard_proof :: proc(
 	reason: string,
 ) {
 	// Established from the expanded name, for the same reason as the denial path.
-	walked := nsec3_refusals(&budget.nsec3)
 	trust, keys, established := zone_trust(v, budget, owner, now, allocator)
 	if trust != .Secure {
 		// A chain this server could not walk is not a proof that failed, and the
 		// two must not reach the log or the client saying the same thing.
 		if trust == .Indeterminate {
-			return trust, nil, walk_reason(budget, walked)
+			return trust, nil, walk_reason(budget)
 		}
 		return trust, nil, "wildcard expansion not proven"
 	}
@@ -2580,8 +2595,14 @@ zone_trust :: proc(
 	keys: []Dnskey,
 	established: string,
 ) {
+	// Cleared on the way in, so that what a caller reads afterwards is this
+	// walk's own answer and not one left behind by an earlier proof.
+	budget.walk_stopped = ""
 	root_status, root_keys := zone_keys(v, budget, ".", now, allocator)
 	if root_status != .Secure {
+		if root_status == .Indeterminate {
+			budget.walk_stopped = "chain of trust unavailable"
+		}
 		return root_status, nil, "."
 	}
 
@@ -2589,6 +2610,7 @@ zone_trust :: proc(
 	keys = root_keys
 	depth := label_count(name)
 	if depth > MAX_CHAIN_DEPTH {
+		budget.walk_stopped = "chain of trust unavailable"
 		return .Indeterminate, nil, "."
 	}
 
@@ -2685,11 +2707,11 @@ zone_step :: proc(
 	}
 
 	if !spend_lookup(budget) {
-		return .Indeterminate, nil
+		return walk_gave_up(budget, "lookup budget spent"), nil
 	}
 	wire, ok := v.query(v.query_ctx, child, .DS, allocator)
 	if !ok {
-		return .Indeterminate, nil
+		return walk_gave_up(budget, "chain of trust unavailable"), nil
 	}
 	msg, derr := dns.decode_message(wire, allocator)
 	if derr != .None {
@@ -2706,7 +2728,7 @@ zone_step :: proc(
 	conclusion for the same rcodes on the response being validated.
 	*/
 	if !answerable_rcode(msg) {
-		return .Indeterminate, nil
+		return walk_gave_up(budget, "chain of trust unavailable"), nil
 	}
 	unix := u32(time.to_unix_seconds(now))
 	// We asked in class IN, and the transport already checked the reply's
@@ -2749,7 +2771,10 @@ zone_step :: proc(
 			// A step this server ran out of allowance on is one it did not
 			// read, which is `Indeterminate` territory rather than a broken
 			// delegation - the same distinction the denial path below makes.
-			return .Indeterminate if exhausted else .Bogus, nil
+			if exhausted {
+				return walk_gave_up(budget, "verification budget spent"), nil
+			}
+			return .Bogus, nil
 		}
 
 		set := make([dynamic]Ds, 0, len(ds_records), allocator)
@@ -2782,7 +2807,10 @@ zone_step :: proc(
 				cache_put(v, child, .Insecure, nil, rrset_ttl(ds_records), now)
 				return .Insecure, nil
 			}
-			return .Bogus if kstatus == .Bogus else .Indeterminate, nil
+			if kstatus == .Bogus {
+				return .Bogus, nil
+			}
+			return walk_gave_up(budget, "chain of trust unavailable"), nil
 		}
 		cache_put(v, child, .Secure, child_keys, rrset_ttl(ds_records), now)
 		return .Secure, child_keys
@@ -2796,7 +2824,7 @@ zone_step :: proc(
 	// A chain step this server ran out of allowance on is one it did not read,
 	// which is `Indeterminate` territory rather than a broken delegation.
 	if ds_spent {
-		return .Indeterminate, nil
+		return walk_gave_up(budget, "verification budget spent"), nil
 	}
 	if len(nsecs) == 0 && len(nsec3s) == 0 {
 		return .Bogus, nil
@@ -2823,7 +2851,7 @@ zone_step :: proc(
 			dns.name_trim_root(child),
 			why,
 		)
-		return .Indeterminate, nil
+		return walk_gave_up(budget, why), nil
 	}
 	if step == .Insecure {
 		cache_put(v, child, .Insecure, nil, negative_ttl(msg), now)
