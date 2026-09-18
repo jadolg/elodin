@@ -664,8 +664,16 @@ Replies rather than moments, which is worth saying because it is what the count
 is: three questions in flight together against a parent having one bad second
 each come back unsettled and each leave a strike, so a busy resolver can reach
 the threshold on a stumble that a quiet one would never have remembered. What
-that costs is what the window and the fallback already bound - the route's
-answer, for ten seconds, where the route can answer at all.
+that costs is worth following to where it lands, because the fallback does not
+reach it: the route the memory sends the question to is the zone's own authority
+and normally answers the NODATA perfectly well, so the parent is not asked again,
+and a parent that recovered a second after its bad one has its proof withheld
+from every client for the rest of the window. Ten seconds of an unsigned NODATA
+where a signed one was available is the worst this costs, and a busy resolver is
+where it is likeliest, three questions in flight together being easier to come by
+than three bad seconds in a row. Distinguishing them means a second clock per
+slot for something the cooldown already expires; the ceiling is written down
+instead.
 
 And the same window read from the other end is this memory's real ceiling, which
 is worth stating plainly rather than leaving a reader to find: an apex asked

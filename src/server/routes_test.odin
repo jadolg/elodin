@@ -1394,13 +1394,18 @@ test_a_parked_parent_is_still_asked_when_the_route_is_parked_too :: proc(t: ^tes
 	catch; neither socket holding one is the group giving up without sending,
 	which is a different fault in a different place.
 	*/
-	testing.expectf(
-		t,
-		parent.asked,
-		"the parent was passed over for a route that was parked too (%d unread questions at the parent, %d at the route)",
-		route_mock_heard(def_socket, "corp.example."),
-		route_mock_heard(route_socket, "corp.example."),
-	)
+	// Counted only where the case has already failed: each count drains its
+	// socket on a twenty-millisecond timeout, which is a cost and a side effect
+	// that the passing path has no use for.
+	if !parent.asked {
+		testing.expectf(
+			t,
+			false,
+			"the parent was passed over for a route that was parked too (%d unread questions at the parent, %d at the route)",
+			route_mock_heard(def_socket, "corp.example."),
+			route_mock_heard(route_socket, "corp.example."),
+		)
+	}
 
 	decoded, derr2 := dns.decode_message(out, context.temp_allocator)
 	testing.expect_value(t, derr2, dns.Decode_Error.None)
@@ -2087,8 +2092,9 @@ the query before the rule that matters there is consulted at all.
     other: a shared count would have one zone's outage withhold another zone's
     proof.
   - The table is a fixed size and says which memory it drops. `APEX_MEMO_SLOTS`
-    apexes fill it, the next one evicts the memory that would have expired first,
-    and the rest stay. That is the ceiling `Apex_Memo` names.
+    apexes fill it, the one past its size is refused rather than taking a slot
+    some other apex's count is still running in, and a slot that comes free is
+    given to whoever wants it next. That is the ceiling `Apex_Memo` names.
   - An anchor turns the memory off rather than bounding it, on both sides.
     Nothing is read back for an anchored zone, and nothing is written for one
     either: a memory that can never be acted on would still be holding a slot an
