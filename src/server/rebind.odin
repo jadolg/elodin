@@ -116,13 +116,13 @@ That last clause is narrower than "when the decode fails", and the difference
 matters in both directions. `decode_message` refuses a message for a malformed
 record anywhere in it, authority and additional sections included, and a stub
 reads neither - so refusing on those two would take down a name that resolves
-today over bytes nothing acts on. `rebind_decode` therefore falls back to the
+today over bytes nothing acts on. `rebind_readable` therefore falls back to the
 answer section alone, which is what has to be readable, and keeps the whole-
 message requirement for the one case where the rest is acted on: an answer
 carrying SVCB or HTTPS, whose additional section a client following RFC 9460
 section 5 connects to. The ARCOUNT bypass above is refused by either decode -
 the count check is in the prologue both share - so nothing is given back to the
-attacker; see `rebind_decode`.
+attacker; see `rebind_readable`.
 
 What it still costs is a name whose upstream emits an answer section this decoder
 rejects becoming NODATA for A and AAAA where it used to be forwarded - an answer
@@ -198,11 +198,59 @@ SVCB_IPV4HINT :: 4
 SVCB_IPV6HINT :: 6
 
 /*
+Whether this query's answer has to be read before it can be passed on.
+
+The cheap half of the refusal below, asked by `resolve_query` before it decodes
+anything: everything here is settled from the question and the configuration,
+without looking at a single byte of the answer.
+
+Split out so that the decode it gates can be the one the cache and the chain walk
+were doing anyway. The guard now reads the answer section of the same
+`dns.Message` those two read instead of making a second pass over the same bytes
+for itself, which is issue #188.
+
+The five types are the ones an address reaches a client through:
+`first_private_answer` takes addresses out of A, AAAA and the `ipv4hint` and
+`ipv6hint` of SVCB and HTTPS, and ANY can carry any of them. Nothing in an MX, a
+TXT or an SOA is something a browser connects to.
+
+A zone with an `upstream.zones` route is exempt without being listed, which is
+the second half of what a route means. Split horizon is the named reason this
+guard defaults off, and a route is the operator stating in the configuration
+that this zone is answered by a local authority - which answers with local
+addresses, that being the whole of its job. Making them write the same zone into
+`rebind.allow_domains` as well would hand them a second thing to configure
+before the first one worked, and the symptom of forgetting is every internal
+name coming back NODATA.
+
+`allow_domains` keeps its own reason to exist: it covers the site whose *default*
+upstream is internal, which is the arrangement operators reach for when there is
+no route to reach for instead.
+*/
+@(private)
+rebind_reads_answer :: proc(s: ^Server, q: dns.Question) -> bool {
+	if !s.cfg.rebind.enabled {
+		return false
+	}
+	#partial switch q.type {
+	case .A, .AAAA, .ANY, .SVCB, .HTTPS:
+	case:
+		return false
+	}
+	return !rebind_exempt(s.cfg.rebind.allow_domains, q.name) && !is_zone_routed(s, q.name)
+}
+
+/*
 The answer to send instead, when the upstream's answer cannot be passed on.
 
 `refused` false means there was nothing to object to and the caller carries on
-with the response it has. It is false for every query when `rebind.enabled` is
-off, which is the only cost this feature has on a server that does not want it.
+with the response it has.
+
+Reached only when `rebind_reads_answer` above said yes, which is the precondition
+for everything here. That is where `rebind.enabled` is read - one bool per query
+being the whole cost of this feature on a server that does not want it - and it
+is also where the exemptions are, so a caller that skipped it would be running
+the check on a name the operator said to leave alone.
 
 `detail` is what the query log records beside `outcome=blocked`, and separates
 the two reasons: `rebind` for an answer that named a private address, and
@@ -217,7 +265,7 @@ rebind_refusal :: proc(
 	s: ^Server,
 	query: dns.Message,
 	q: dns.Question,
-	resp: []u8,
+	decoded: Decoded_Answer,
 	limit: int,
 	allocator: mem.Allocator,
 ) -> (
@@ -225,42 +273,7 @@ rebind_refusal :: proc(
 	detail: string,
 	refused: bool,
 ) {
-	if !s.cfg.rebind.enabled {
-		return nil, "", false
-	}
-	#partial switch q.type {
-	case .A, .AAAA, .ANY, .SVCB, .HTTPS:
-	case:
-		return nil, "", false
-	}
-	/*
-	A zone with an `upstream.zones` route is exempt without being listed, which
-	is the second half of what a route means. Split horizon is the named reason
-	this guard defaults off, and a route is the operator stating in the
-	configuration that this zone is answered by a local authority - which
-	answers with local addresses, that being the whole of its job. Making them
-	write the same zone into `rebind.allow_domains` as well would hand them a
-	second thing to configure before the first one worked, and the symptom of
-	forgetting is every internal name coming back NODATA.
-
-	`allow_domains` keeps its own reason to exist: it covers the site whose
-	*default* upstream is internal, which is the arrangement operators reach for
-	when there is no route to reach for instead.
-	*/
-	if rebind_exempt(s.cfg.rebind.allow_domains, q.name) || is_zone_routed(s, q.name) {
-		return nil, "", false
-	}
-
-	/*
-	Decoded here rather than sharing the decode the cache block does a few lines
-	below. Deliberate and temporary: four changes are in flight against
-	`resolve_query` at once, and one procedure call is what rebases cleanly
-	between them where a restructured cache block does not. Folding the two into
-	one decode is issue #188, to be done in the merge pass once there is a single
-	shape to fold into - it is not an oversight, and it costs only the cache-miss
-	path for the five question types above.
-	*/
-	decoded, readable, err := rebind_decode(resp, allocator)
+	msg, readable, err := rebind_readable(decoded)
 	if !readable {
 		sync.atomic_add(&s.stats.rebind, 1)
 		report_unreadable(q.name, err)
@@ -273,7 +286,7 @@ rebind_refusal :: proc(
 	// meaning different things about the same address.
 	loopback_ok := s.cfg.rebind.allow_loopback || name_at_or_below(q.name, LOCALHOST_ZONE)
 
-	addr, v6, found := first_private_answer(decoded, loopback_ok)
+	addr, v6, found := first_private_answer(msg, loopback_ok)
 	if !found {
 		return nil, "", false
 	}
@@ -284,7 +297,7 @@ rebind_refusal :: proc(
 }
 
 /*
-The response, decoded as far as this guard has to read it.
+The response, read as far as this guard has to read it.
 
 `readable` false is the fail-closed case: bytes that cannot be checked are not
 passed on, and `err` is what stopped the read. What is decided here is how much
@@ -292,15 +305,16 @@ of a message has to be readable before the answer counts as checkable, and it is
 the answer section - plus the additional section when the answer carries an SVCB
 or HTTPS record.
 
-The full decode is tried first, because it is what the checks want. When it
-fails, the question is which part of the message failed. A stub reads the answer
-section and nothing else - glibc's `getanswer` never walks past it - so an answer
-section that reads cleanly beside an authority or additional section that does
-not is one this server can still check and still pass on. Refusing it would take
-a name down over a part of the message nothing acts on, and that name resolves
-today. `decode_through_answer` is the same decode stopped after the answer
-section, and is what `resolve_query` already falls back to for the CNAME walk,
-for the same reason.
+Both readings come from `decode_answer`, which made them for every reader on
+this path at once. The whole message is what the checks want. When it did not
+decode, the question is which part of it failed. A stub reads the answer section
+and nothing else - glibc's `getanswer` never walks past it - so an answer section
+that reads cleanly beside an authority or additional section that does not is one
+this server can still check and still pass on. Refusing it would take a name down
+over a part of the message nothing acts on, and that name resolves today.
+`Decoded_Answer.partial` is that same decode stopped after the answer section,
+and it is what the CNAME walk in `resolve_query` falls back to as well, for the
+same reason.
 
 None of which reopens the bypass the fail-closed rule was written for. That one
 is an ARCOUNT claiming records that are not in the message, and the count check
@@ -331,31 +345,24 @@ by the same rule as the message: not checkable, not passed on. Every other type
 is raw all the time by design and is none of this guard's business.
 */
 @(private)
-rebind_decode :: proc(
-	resp: []u8,
-	allocator: mem.Allocator,
-) -> (
-	msg: dns.Message,
-	readable: bool,
-	err: dns.Decode_Error,
-) {
-	decoded, full_err := dns.decode_message(resp, allocator)
-	if full_err != .None {
-		answer, answer_err := dns.decode_through_answer(resp, allocator)
-		if answer_err != .None {
-			return {}, false, answer_err
+rebind_readable :: proc(decoded: Decoded_Answer) -> (msg: dns.Message, readable: bool, err: dns.Decode_Error) {
+	if !decoded.full {
+		// Neither reading came back, so there is nothing to look at. `err` is
+		// what stopped the shorter of the two, which is the one that got
+		// furthest into the part this guard cares about.
+		if !decoded.partial {
+			return {}, false, decoded.partial_err
 		}
 		// The unread section is one the client acts on, so this is the refusal
 		// the whole-message decode was already making.
-		if answer_has_service(answer) {
-			return {}, false, full_err
+		if answer_has_service(decoded.msg) {
+			return {}, false, decoded.full_err
 		}
-		decoded = answer
 	}
-	if answer_has_raw_address(decoded) {
+	if answer_has_raw_address(decoded.msg) {
 		return {}, false, .Bad_Rdata
 	}
-	return decoded, true, .None
+	return decoded.msg, true, .None
 }
 
 /*

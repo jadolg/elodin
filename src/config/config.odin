@@ -171,9 +171,9 @@ the names it covers, longest match first. That is what `server=/corp.example/`
 means to a dnsmasq operator and what a zone name looks like to everybody else.
 
 What a route implies, beyond where the query goes, is in `resolve_query` and
-`rebind_refusal`: a routed zone holds local data under a public parent, so the
-chain walk is off for it (unless the operator anchored the zone themselves) and
-the rebinding guard lets its private addresses through. Both follow from the
+`rebind_reads_answer`: a routed zone holds local data under a public parent, so
+the chain walk is off for it (unless the operator anchored the zone themselves)
+and the rebinding guard lets its private addresses through. Both follow from the
 same statement the route makes, which is that this zone is served here rather
 than out there.
 */

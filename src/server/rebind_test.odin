@@ -1,5 +1,6 @@
 package server
 
+import "core:mem"
 import "core:net"
 import "core:testing"
 import "core:thread"
@@ -249,6 +250,12 @@ and it does two things a concurrent mock cannot. It cannot miss a leak that
 arrived after the mock had stopped waiting for one, and it costs milliseconds
 rather than a receive timeout that is deliberately long enough to be no deadline
 at all - see the note on `MOCK_RECV_TIMEOUT`.
+
+`request` is the allocator the request itself is served from, which every decode
+on the forwarding path takes its memory from. It is the caller's so that a test
+can hand in one that counts - see
+`test_the_check_does_not_decode_the_answer_twice`, which is about what the guard
+spends rather than about what it answers.
 */
 @(private = "file")
 ask_raw :: proc(
@@ -259,6 +266,7 @@ ask_raw :: proc(
 	reply: []u8,
 	answers: ^cache.Cache = nil,
 	forwarded := true,
+	request := context.temp_allocator,
 ) -> (
 	wire: []u8,
 	outcome: Outcome,
@@ -300,7 +308,7 @@ ask_raw :: proc(
 		// nothing is going to send to is the one value that hangs.
 		_ = net.set_option(socket, .Receive_Timeout, 20 * time.Millisecond)
 	}
-	out, got, sent := handle_query(&s, rebind_query_type(name, type), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, got, sent := handle_query(&s, rebind_query_type(name, type), .UDP, "127.0.0.1:5555", request)
 	if forwarded {
 		thread.join(mock)
 		thread.destroy(mock)
@@ -1335,4 +1343,111 @@ test_an_ipv4_embedded_in_ipv6_cannot_hide_a_private_address :: proc(t: ^testing.
 		testing.expectf(t, len(lmsg.answer) == 1, "allow_loopback no longer reaches ::1")
 	}
 	free_all(context.temp_allocator)
+}
+
+/*
+The guard reads the answer the cache is about to read, and does not decode it a
+second time.
+
+Written as a measurement because there is nothing else to look at. Both readings
+are of the same bytes by the same decoder and they agree, so every answer this
+server sends is identical whether the decode happened once or twice - the only
+trace the second one leaves is what it spent. That is issue #188: on a cache
+miss the guard decoded the response for itself and the cache block a few lines
+below decoded it again.
+
+The reply is one RRset of twelve addresses, which is twelve records and twelve
+names to allocate: a dozen allocations that either happen once or happen twice,
+rather than the two or three a single-record answer would make hard to tell from
+noise. Twelve also keeps it inside a 512-byte datagram, so nothing here is about
+truncation.
+
+Held against the same query with the guard off rather than against a figure of
+its own. The cache decodes on this path whatever `rebind.enabled` says, so the
+absolute cost is mostly the cache's and would move with any change to it; the
+difference between the two runs is the guard's alone. And calibrated against a
+decode measured right here rather than a constant written into the test, because
+what one costs is a property of this decoder and this reply and would otherwise
+have to be rewritten every time either of them moved.
+*/
+@(test)
+test_the_check_does_not_decode_the_answer_twice :: proc(t: ^testing.T) {
+	records := make([]dns.Record, 12, context.temp_allocator)
+	for i in 0 ..< len(records) {
+		records[i] = a_record("many.example.", {93, 184, 216, u8(i + 1)})
+	}
+	reply := rebind_reply_of("many.example.", .A, records)
+
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.temp_allocator)
+	_, derr := dns.decode_message(reply, mem.tracking_allocator(&track))
+	one_decode := track.total_allocation_count
+	mem.tracking_allocator_destroy(&track)
+	if !testing.expectf(t, derr == .None, "the reply this measures did not decode: %v", derr) {
+		return
+	}
+	if !testing.expectf(
+		t,
+		one_decode > 4,
+		"one decode of the reply cost %d allocations, which is too few to tell anything apart",
+		one_decode,
+	) {
+		return
+	}
+
+	off, measured_off := forwarding_cost(t, reply, false)
+	on, measured_on := forwarding_cost(t, reply, true)
+	if !measured_off || !measured_on {
+		return
+	}
+	testing.expectf(
+		t,
+		on - off < one_decode,
+		"turning the guard on cost %d more allocations on a cache miss and one decode of the answer costs %d, so the answer was decoded twice",
+		on - off,
+		one_decode,
+	)
+	free_all(context.temp_allocator)
+}
+
+/*
+What one cache-miss query allocates out of the request's own allocator, with the
+guard on or off.
+
+The two assertions are there to keep a measurement of the wrong thing from being
+compared: both runs have to reach the upstream and store what came back, because
+a query answered from the cache, or refused, decodes a different number of times
+than the path under test.
+*/
+@(private = "file")
+forwarding_cost :: proc(t: ^testing.T, reply: []u8, guard: bool) -> (allocations: i64, ok: bool) {
+	cfg := rebind_config()
+	cfg.rebind.enabled = guard
+	cfg.cache.enabled = true
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
+	defer cache.destroy(answers)
+
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.temp_allocator)
+	defer mem.tracking_allocator_destroy(&track)
+
+	_, outcome, sent := ask_raw(
+		t,
+		&cfg,
+		"many.example.",
+		.A,
+		reply,
+		answers,
+		request = mem.tracking_allocator(&track),
+	)
+	if !sent {
+		return 0, false
+	}
+	if !testing.expectf(t, outcome == .Forwarded, "the query did not reach the upstream: %v", outcome) {
+		return 0, false
+	}
+	if !testing.expect_value(t, cache.len_entries(answers), 1) {
+		return 0, false
+	}
+	return track.total_allocation_count, true
 }
