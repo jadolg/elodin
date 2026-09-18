@@ -427,6 +427,34 @@ udp_ceiling :: proc(s: ^Server) -> int {
 }
 
 /*
+The UDP payload size this server advertises to an upstream.
+
+The counterpart of `udp_ceiling` pointed the other way: that one is what this
+server will send a client, this is what it is willing to have an upstream send
+it. 1232 is the DNS Flag Day 2020 figure (RFC 9715) and what dnsmasq, Unbound,
+BIND and dnsproxy all default their own outgoing figure to, for the reason RFC
+6891 section 6.2.5 gives - a datagram past the path MTU is fragmented, and the
+second fragment carries no port and no transaction ID, so anything on the path
+can supply it. A signed answer still rarely fits in 512 bytes, which is why this
+is not simply left unset; what changed is that it is no longer 4096.
+
+Lowered on the two DNSSEC paths as well, which chose their own figure and were
+never the hole - 4096 is simply over an ordinary 1500-byte path MTU, which is
+the whole of what flag day was about, and a signed answer is the message most
+likely to be that large. The cost is a truncation and a TCP fetch for a DNSKEY
+set or a large RRset, and against a `udp://` upstream with no TCP service at all
+a failure: `exchange_tcp` cannot dial, and `record_failure` counts it. Three
+*consecutive* ones park the server - `record_success` zeroes the count, so
+ordinary traffic in between clears it - and such an upstream is already failing
+every client that asks without EDNS, which is held to 512 by RFC 1035. That is
+the trade every comparable resolver made in 2020.
+
+Not configurable, and deliberately: an operator lowering it gains nothing TCP
+does not already give them, and one raising it is asking for the fragments.
+*/
+UPSTREAM_UDP_SIZE :: 1232
+
+/*
 The UDP payload size this server puts in an answer's OPT record.
 
 RFC 6891 section 6.2.4 makes that field the responder's own maximum rather than
@@ -901,13 +929,32 @@ for every option in it and asking per option is what went wrong before: the
 client's subnet had a gate of its own and the client's cookie, which is a secret
 and the more expensive of the two to hand to a stranger, had none.
 
-Only the additional section is counted, because that is the only section
-`find_opt` and `find_opt_span` look in. A record of type OPT in the answer
-section is not the message's EDNS record, and a client can put one there for the
-asking.
+Only the additional section is counted for the pair above, because that is the
+only section `find_opt` and `find_opt_span` look in. A record of type OPT in the
+answer or authority section is not the message's EDNS record, and a client can
+put one there for the asking.
+
+Which is the third shape, and the same defect once more: a record this server
+does not read is one it cannot strip a cookie from or rewrite a payload size in,
+and it is forwarded as it stands to an upstream that may well read it - taking
+the first OPT it meets whatever section that is in, which is what this server's
+own `peek_udp_size` did until #325. A query has no answer or authority section
+to begin with, so nothing legitimate is being turned away: the records that do
+belong in one, a prerequisite in an UPDATE or the SOA of an IXFR, are not OPT
+records and are not counted here.
 */
 @(private)
 edns_opt_readable :: proc(msg: dns.Message) -> bool {
+	for rec in msg.answer {
+		if rec.type == .OPT {
+			return false
+		}
+	}
+	for rec in msg.authority {
+		if rec.type == .OPT {
+			return false
+		}
+	}
 	seen := false
 	for rec in msg.additional {
 		if rec.type != .OPT {
@@ -1506,6 +1553,63 @@ resolve_query :: proc(
 	Best-effort by design: a query with no OPT record has no field to clear.
 	*/
 	_ = dns.clear_edns_extended_rcode(forwarded)
+
+	/*
+	And the payload size the upstream is told is ours, not the client's.
+
+	The number in that field decides how large a datagram the upstream may send
+	*this server*, so forwarding the client's figure lets an anonymous client
+	choose it: 65535 advertised is a multi-fragment UDP answer arriving here,
+	and the second fragment carries neither the transaction ID nor the port, so
+	an off-path attacker needs only the IP header's 16-bit fragment ID to graft
+	its own records onto a genuine reply - which then lands in the shared cache,
+	under the CD=1 key any client can ask for. Nothing about the client's own
+	message is a statement about what this server can reassemble.
+
+	A clamp rather than a plain write: a client that advertised less than the
+	ceiling, or that asked without EDNS at all, is not overruled upward. There
+	is nothing to gain from asking for more room than the answer we may send
+	back can use, and a stub that advertised 512 is often one behind a path that
+	could not carry more.
+
+	Floored at 512 for the other end of the same argument. RFC 6891 section
+	6.2.3 has a responder treat anything under 512 as 512, so a smaller figure
+	buys a client nothing there - but written out it is a lever pointed the
+	other way: one datagram advertising zero and every answer over 512 bytes
+	comes back truncated and is re-fetched over TCP, a UDP query in and an
+	upstream connection out. `exchange_udp` floors its own buffer at 512 for the
+	same reason, so there was never anything below it to gain.
+
+	Here with the ID and the extended rcode because the three want the same
+	thing: the one point all the ways the outgoing message comes about pass
+	through, with the buffer certainly this server's own. The DNSSEC rewrite
+	arrives having already written `UPSTREAM_UDP_SIZE`, so this leaves it as it
+	is; `validator_query`, which does not come this way at all, writes the same
+	constant itself.
+
+	Written whatever transport the group's members speak, rather than only for
+	the `udp://` ones the fragments are a hazard on. Which member answers is not
+	known here - a failover group can hold a `udp://` and a `tls://` server and
+	move between them - so scoping it would mean a copy of the query per member
+	instead of one buffer for the group, and the field bounds nothing on a
+	stream: RFC 7766 section 6.2.1.1 says not to apply the requestor's payload
+	size there, and an upstream that did would already be truncating for every
+	client that advertised 512, which is every client that asked without EDNS at
+	all. What it would cost against such a server is a TC=1 that only
+	`exchange_udp` knows how to retry.
+
+	Best-effort, like the clear above: a query with no OPT record has no field
+	to write into, and 512 is what a responder assumes without one.
+
+	Read with `peek_udp_size`, which looks in the additional section alone, the
+	same place `set_edns_udp_size` writes: a client may put a record of type OPT
+	in its answer section for the asking, and reading the figure from one place
+	while writing it to another would let that decoy choose what is written.
+	*/
+	_ = dns.set_edns_udp_size(
+		forwarded,
+		u16(clamp(int(dns.peek_udp_size(forwarded)), dns.MAX_UDP_SIZE, UPSTREAM_UDP_SIZE)),
+	)
 
 	/*
 	Down the zone's own route when it has one, and to the default group when it

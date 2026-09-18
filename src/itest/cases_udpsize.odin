@@ -91,6 +91,11 @@ run_udp_size_cases :: proc(r: ^Runner) {
 	big := big_txt_answer("big.example.", 10, context.allocator)
 	defer delete(big)
 	mock_reply(mock, "big.example.", u16(dns.Type.TXT), big)
+	// For the last case below, which is about the query going out rather than
+	// the answer coming back and wants a small one. Registered here with the
+	// rest: `mock_synth` appends to the rule list without a lock, and the
+	// serving threads read it.
+	mock_synth(mock, "buffer.example.", u16(dns.Type.A), {192, 0, 2, 11})
 	if !mock_start(mock) {
 		skip_case(r, "max_udp_response", "cannot start the mock upstream")
 		return
@@ -277,6 +282,69 @@ run_udp_size_cases :: proc(r: ^Runner) {
 				"a client's own 512-byte buffer was reported as the server's ceiling; log:\n%s",
 				read_log(&srv),
 			)
+		}
+	}
+	end_case(r)
+
+	/*
+	And the number this server advertises to its *upstream*, which is the same
+	field pointed the other way.
+
+	On a query it says how large a datagram the sender can receive, so forwarded
+	verbatim it lets an anonymous client decide that the answers arriving at this
+	server should be 65000 bytes of fragmented UDP - and the second fragment
+	carries neither port nor transaction ID, which is what fragment-based
+	poisoning of a forwarder needs. RFC 9715 and every comparable resolver put
+	1232 there instead.
+
+	A plain `udp://` upstream, because that is the deployment the hole is in, and
+	read off the query the mock received, because that is the only place the
+	number is observable. `src/server/upstream_udp_size_test.odin` holds the same
+	property at the unit level, including the half that must not change: a client
+	that advertised less is not overruled upward.
+	*/
+	start_case(r, "upstream: a client's 65000-byte edns buffer is not forwarded upstream")
+	{
+		udp_port := next_port(r)
+		config := fmt.tprintf(
+			`log: {{ level: warn }}
+listeners:
+  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
+  tcp: {{ enabled: false }}
+upstream:
+  timeout: 3s
+  servers: ["udp://127.0.0.1:%d"]
+cache: {{ enabled: false }}
+blocking: {{ enabled: false }}
+`,
+			udp_port,
+			upstream_port,
+		)
+		srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
+		if check(r, ok, "server did not start") {
+			defer stop_server(&srv)
+			asked := build_query(
+				"buffer.example.",
+				u16(dns.Type.A),
+				id = 0x62,
+				edns_size = 65000,
+				allocator = context.temp_allocator,
+			)
+			// The premise, read the same way the assertion below reads the
+			// forwarded copy.
+			check_eq_int(r, int(dns.peek_udp_size(asked)), 65000, "the payload size the client asked with")
+			res := query_udp(udp_port, asked, context.temp_allocator)
+			if check(r, res.ok, "no answer came back") {
+				forwarded := mock_last_query(mock)
+				if check(r, len(forwarded) >= dns.HEADER_SIZE, "the upstream saw no readable query") {
+					check_eq_int(
+						r,
+						int(dns.peek_udp_size(forwarded)),
+						1232,
+						"the payload size the upstream was asked with",
+					)
+				}
+			}
 		}
 	}
 	end_case(r)

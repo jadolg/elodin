@@ -335,15 +335,23 @@ responder must assume without being told otherwise.
 
 Distinct from `edns_udp_size`, which clamps into the range this server is
 willing to *send*; this reports what the message actually said.
+
+Only the additional section is looked in, for the reason `find_opt_span` gives:
+that is where RFC 6891 section 6.1.1 puts the record, and it is the only section
+`find_opt` and `find_opt_span` read, so a record of type OPT anywhere else is not
+the message's EDNS record. A client can put one in its answer section for the
+asking - and a reader that took it would be sizing a buffer, and picking the
+figure a rewrite writes, off a record the writer never touches and the upstream
+never reads.
 */
 peek_udp_size :: proc(msg: []u8) -> u16 {
 	if len(msg) < HEADER_SIZE {
 		return MAX_UDP_SIZE
 	}
 	qdcount := int(u16(msg[4]) << 8 | u16(msg[5]))
-	total := int(u16(msg[6]) << 8 | u16(msg[7]))
-	total += int(u16(msg[8]) << 8 | u16(msg[9]))
-	total += int(u16(msg[10]) << 8 | u16(msg[11]))
+	before := int(u16(msg[6]) << 8 | u16(msg[7]))
+	before += int(u16(msg[8]) << 8 | u16(msg[9]))
+	arcount := int(u16(msg[10]) << 8 | u16(msg[11]))
 
 	pos := HEADER_SIZE
 	for _ in 0 ..< qdcount {
@@ -356,7 +364,7 @@ peek_udp_size :: proc(msg: []u8) -> u16 {
 			return MAX_UDP_SIZE
 		}
 	}
-	for _ in 0 ..< total {
+	for i in 0 ..< before + arcount {
 		next, ok := skip_name(msg, pos)
 		if !ok {
 			return MAX_UDP_SIZE
@@ -366,7 +374,7 @@ peek_udp_size :: proc(msg: []u8) -> u16 {
 			return MAX_UDP_SIZE
 		}
 		// OPT carries the payload size where every other type carries its class.
-		if Type(u16(msg[pos]) << 8 | u16(msg[pos + 1])) == .OPT {
+		if i >= before && Type(u16(msg[pos]) << 8 | u16(msg[pos + 1])) == .OPT {
 			return u16(msg[pos + 2]) << 8 | u16(msg[pos + 3])
 		}
 		rdlength := int(u16(msg[pos + 8]) << 8 | u16(msg[pos + 9]))

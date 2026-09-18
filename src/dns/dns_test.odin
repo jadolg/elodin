@@ -524,6 +524,37 @@ test_peek_udp_size_reads_the_opt_record :: proc(t: ^testing.T) {
 	testing.expect_value(t, behind_err, Encode_Error.None)
 	testing.expect_value(t, peek_udp_size(behind_wire), u16(2048))
 
+	/*
+	And an OPT outside the additional section is not the message's EDNS record.
+
+	RFC 6891 section 6.1.1 puts it in the additional section, and `find_opt` and
+	`find_opt_span` read no other - so a reader that took one from the answer
+	section would be reporting a number the writers never touch and the peer
+	never reads. A client can put one there for the asking, which is the whole
+	of why this matters: it is what sizes a receive buffer and what a rewrite on
+	the way upstream takes its figure from.
+	*/
+	decoyed := Message {
+		id         = 1,
+		question   = []Question{{name = "example.com.", type = .A, class = .IN}},
+		answer     = []Record{make_opt(65000, false)},
+		additional = []Record{make_opt(1232, false)},
+	}
+	decoyed_wire, _, decoy_err := encode_message(decoyed, context.temp_allocator)
+	testing.expect_value(t, decoy_err, Encode_Error.None)
+	testing.expect_value(t, peek_udp_size(decoyed_wire), u16(1232))
+
+	// And with nothing in the additional section to find, the decoy does not
+	// stand in for the record that is missing.
+	alone := Message {
+		id       = 1,
+		question = []Question{{name = "example.com.", type = .A, class = .IN}},
+		answer   = []Record{make_opt(65000, false)},
+	}
+	alone_wire, _, alone_err := encode_message(alone, context.temp_allocator)
+	testing.expect_value(t, alone_err, Encode_Error.None)
+	testing.expect_value(t, peek_udp_size(alone_wire), u16(MAX_UDP_SIZE))
+
 	testing.expect_value(t, peek_udp_size({}), u16(MAX_UDP_SIZE))
 	testing.expect_value(t, peek_udp_size(behind_wire[:HEADER_SIZE + 2]), u16(MAX_UDP_SIZE))
 
