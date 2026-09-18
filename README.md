@@ -449,16 +449,25 @@ resolver (AdGuard Home, Blocky, an RPZ rule) stays usable as a member of a group
 as long as it says what it did. Code 18, prohibited, is not exempt: that is the
 responder declining this *client*, which is the ACL case the sweep exists for.
 
+A filtering member that says nothing — most of them, today — has its blocks asked
+of the member beside it and answered. The server says so once, at warn, the first
+time it sweeps a REFUSED carrying no such code, naming the member; and
+`dnssec.enabled: false` with any group of more than one server gets a line at
+startup, for the same reason on the validation side. Neither changes what the
+server does: an upstream meant to filter belongs on its own, as the only member
+of its group or behind a zone route.
+
 The member that was passed over is counted against its name in
 `elodin_upstream_swept_rcode_total{upstream}`, since its health is deliberately
 left alone and no other figure would name it.
 
 What the sweep costs is up to one extra exchange per remaining member of the
-group. A member this query has already failed to reach is not asked again, so a
-group with one dead member and one that declines pays that member's timeout once
-rather than twice; a member that is unreachable but has not been tried yet costs
-`upstream.timeout` before the next is tried. Two upstreams — what the examples
-configure — pay one extra exchange for a name the first cannot answer.
+group, and never more than one `upstream.timeout` of waiting in total: once that
+budget is spent the members still unasked are left alone and the reply in hand is
+the answer. A member this query has already failed to reach is not asked again
+either, so a group with one dead member and one that declines pays that member's
+timeout once rather than twice. Two upstreams — what the examples configure — pay
+one extra exchange for a name the first cannot answer.
 
 REFUSED is worth one more thought here, because it is also what some resolvers
 answer when they are rate-limiting rather than when they are declining on

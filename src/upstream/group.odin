@@ -215,6 +215,7 @@ resolve_insisting :: proc(
 	// Scratch, on the request's own thread, whose arena the caller resets - and
 	// only ever as long as the group.
 	unreachable := make([dynamic]^Upstream, 0, len(g.servers), context.temp_allocator)
+	started := time.now()
 
 	response, winner, err = resolve(g, query, allocator, &unreachable)
 	if err != .None || acceptable(response) {
@@ -288,6 +289,12 @@ resolve_insisting :: proc(
 	the client waiting on the sequential half. `strategy: failover` pays one
 	exchange for it instead, and the upgrade path above is what would fix it in
 	place.
+
+	What bounds it meanwhile is the budget below: the sweep spends one
+	`g.timeout` on whatever members it has left, however many those are. So what
+	a racing group pays is duplicated exchanges rather than waiting - its members
+	are there and answer, they simply answer the same unusable thing - and the
+	arrangement that would have cost a timeout apiece no longer can.
 	*/
 	/*
 	Counted here, against the member whose reply sent the group looking, and
@@ -304,6 +311,7 @@ resolve_insisting :: proc(
 	*/
 	note_swept_rcode(winner)
 
+	asked := 0
 	for u in g.servers {
 		if u == winner {
 			continue
@@ -334,11 +342,43 @@ resolve_insisting :: proc(
 			logx.debugf("upstream %s is in its cooldown, not asked again for this one", u.spec.name)
 			continue
 		}
+		/*
+		And the whole sweep is bounded by one `g.timeout`, however many members
+		are left.
+
+		What it is bounding is the group that has several spares and cannot
+		reach any of them: each costs the full timeout before the next is tried,
+		so a group of four would spend three of them - at the shipped five
+		seconds, fifteen - and hand back the reply it had in the first
+		millisecond. No stub is still listening by then, and each of those
+		queries holds one of a bounded set of workers for the whole wait, so a
+		client repeating one name is a way to empty the pool.
+
+		A budget rather than a count of exchanges, because what is worth
+		spending here is time and not attempts: a group whose spares answer in
+		milliseconds gets asked all of them, which is the case this sweep exists
+		for, and the exchange in flight when the budget runs out is allowed to
+		finish, so the worst of it is two timeouts rather than one.
+
+		The first member is asked regardless - `time.since` at that point is
+		whatever `resolve` spent, and a sweep that refused to ask anybody would
+		be no sweep at all.
+		*/
+		if asked > 0 && time.since(started) >= g.timeout {
+			logx.debugf(
+				"sweep for this query has spent %v, leaving %s and any after it unasked",
+				time.since(started),
+				u.spec.name,
+			)
+			break
+		}
+		asked += 1
 		resp, xerr := exchange(u, sweep_query(query), g.timeout, allocator)
 		if xerr != .None {
 			logx.debugf("upstream %s failed: %v", u.spec.name, xerr)
 			continue
 		}
+		report_swept_refusal(winner, response)
 		if acceptable(resp) {
 			// The rcode as a number: 4080 of the 4096 composed values have no
 			// name, and `%v` renders one of those as a placeholder - the same
@@ -462,7 +502,11 @@ holds the group. A member whose clock has drifted says Signature Expired about
 every signed name it is asked; one carrying a stale root key says DNSSEC Bogus
 about them just as widely. Either pins this server on that member for those
 names and no failover happens - issue #309's own failure, for the subset of
-names that are signed. The two cannot be told apart from here: a validator that
+names that are signed, and a quiet one: the reply is accepted rather than swept,
+so `note_swept_rcode` is not called and nothing in the metrics names the member.
+What an operator has then is the SERVFAILs their clients report and a group whose
+every figure looks well, which is where #309 started. The two cannot be told
+apart from here: a validator that
 has found a zone bogus and a validator that is wrong about every zone send the
 same bytes, and reading the claim is the only way to protect the client that
 this does not cover otherwise. So it stands, with the remedy being the
@@ -527,6 +571,44 @@ usable_rcode :: proc(response: []u8) -> bool {
 		return extended_error_within(response, POLICY_EDE_FIRST, POLICY_EDE_LAST)
 	}
 	return u16(rcode) <= 0xf
+}
+
+/*
+Say once, at warn, that a REFUSED carrying no policy extended error was swept.
+
+The one deployment this change can quietly break: a filtering resolver as a
+member of a group - AdGuard Home in its REFUSED blocking mode, Blocky, an RPZ
+rule - beside a public resolver for everything else. A blocked name is now
+re-asked of the member beside it and answered, and where the filtering member
+says why it refused (`POLICY_EDE_FIRST`) that does not happen; where it says
+nothing, which is most of them today, it does. An operator's first sign would
+otherwise be the ads coming back.
+
+Once per process and at debug after that, the shape `unreadable_rcode_refusal`
+uses and for the same reason: the line names bytes an upstream chose, so a
+per-query warn would let one decide how much this server writes to disk.
+
+Only REFUSED. A swept SERVFAIL is the ordinary business of this sweep - a name
+whose authority is down produces them all day - and warning about those would
+bury the one line that means something.
+*/
+@(private)
+refusal_reported: bool
+
+@(private)
+report_swept_refusal :: proc(u: ^Upstream, response: []u8) {
+	if dns.peek_rcode(response) != .Refused {
+		return
+	}
+	if sync.atomic_exchange(&refusal_reported, true) {
+		logx.debugf("upstream %s refused this name without saying why; another member answered it", u.spec.name)
+		return
+	}
+	logx.warnf(
+		"upstream %s refused a name without an extended error saying why, and another member of its group answered it: if %s is a filtering resolver, its blocks are being asked elsewhere - see elodin_upstream_swept_rcode_total",
+		u.spec.name,
+		u.spec.name,
+	)
 }
 
 // Whether the reply carries an RFC 8914 extended error between `first` and

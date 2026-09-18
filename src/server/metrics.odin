@@ -817,7 +817,7 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 		b,
 		"elodin_upstream_swept_rcode_total",
 		.Counter,
-		"Replies from each upstream that sent the group to ask another member instead, one per such reply: for a client's own question a SERVFAIL, a REFUSED or an rcode it could not read; for a DNSSEC chain lookup anything that is not NOERROR or NXDOMAIN.",
+		"Replies from each upstream that its group could not use, one per reply and whether or not another member was left to ask: for a client's own question a SERVFAIL, a REFUSED or an rcode it could not read; for a DNSSEC chain lookup anything that is not NOERROR or NXDOMAIN.",
 	)
 	for u in all {
 		metrics.sample(b, "elodin_upstream_swept_rcode_total", u.swept, metrics.Label{"upstream", u.name})

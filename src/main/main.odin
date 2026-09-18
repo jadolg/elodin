@@ -597,6 +597,35 @@ main :: proc() {
 	together to work, and a line telling an operator to write both would now be
 	telling them to do something that changes nothing.
 	*/
+	/*
+	Validation off and a group with somewhere else to go: the one arrangement
+	where the sweep in `upstream.resolve_insisting` can turn a rejected answer
+	into a served one.
+
+	A member that validates answers SERVFAIL for a zone it found bogus. The
+	sweep asks the next member, and if that one does not validate, what comes
+	back is the forgery - cached here, and served to every client behind this
+	server. `usable_rcode` keeps the SERVFAIL where the member says why in an
+	RFC 8914 extended error, but most do not by default: Unbound needs
+	`ede: yes` and dnsmasq has none, so the check cannot be relied on and this
+	line says so once rather than pretending otherwise.
+
+	Only with validation off. With `dnssec.enabled` on, which is how elodin
+	ships, `validate` refuses that answer here whichever member supplied it and
+	there is nothing to warn about.
+	*/
+	if !cfg.dnssec.enabled {
+		groups := 1 if len(cfg.upstream.servers) > 1 else 0
+		for route in cfg.upstream.zones {
+			if len(route.upstream.servers) > 1 {
+				groups += 1
+			}
+		}
+		if groups > 0 {
+			logx.warnf("dnssec.enabled is off and an upstream group has more than one server: a SERVFAIL from a member that validates is asked of the next one, which may not - see elodin_upstream_swept_rcode_total")
+		}
+	}
+
 	switch {
 	case !cfg.special_use.enabled:
 		logx.warnf("special_use.enabled is off: localhost., onion. and invalid. are forwarded to the upstream")

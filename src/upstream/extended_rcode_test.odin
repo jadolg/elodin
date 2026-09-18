@@ -811,3 +811,101 @@ test_the_sweep_does_not_wait_again_on_a_member_that_timed_out :: proc(t: ^testin
 	// the group cannot use is, whether or not the sweep found anywhere to go.
 	testing.expect_value(t, stats_of(ref).swept_rcode, u64(1))
 }
+
+/*
+And however many members a group has left, the sweep spends one timeout on them.
+
+The shape is a group of three whose first member answers REFUSED at once and
+whose two spares are not there. Unbounded, that is a timeout per spare - at the
+shipped five seconds, ten of them for a reply the group had in its first
+millisecond, with a query worker held for the whole of it. Bounded, the first
+spare is asked and the second is not, because by then the budget is gone.
+
+The assertion is the wall clock, against a threshold between one timeout and
+two: a fixture cannot see an exchange that was never made, only the wait it
+would have cost. The dead ports are bound and closed, which on UDP is a timeout
+rather than a refusal - `exchange_udp` does not connect its socket, so no ICMP
+comes back.
+*/
+@(test)
+test_the_sweep_spends_one_timeout_on_the_members_it_has_left :: proc(t: ^testing.T) {
+	dead_upstream :: proc(t: ^testing.T, name: string) -> (^Upstream, bool) {
+		socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+		if !testing.expectf(t, serr == nil, "cannot bind a dead port: %v", serr) {
+			return nil, false
+		}
+		bound, berr := net.bound_endpoint(socket)
+		net.close(socket)
+		if !testing.expectf(t, berr == nil, "cannot read a dead port: %v", berr) {
+			return nil, false
+		}
+		u, uerr := make_upstream(
+			config.Upstream_Spec{name = name, kind = .UDP, address = "127.0.0.1", port = bound.port},
+			0,
+			time.Second,
+			context.allocator,
+		)
+		if !testing.expectf(t, uerr == .None, "cannot build %s: %v", name, uerr) {
+			return nil, false
+		}
+		return u, true
+	}
+
+	refusing := Canned_Mock{}
+	ref, ref_thread, ref_ok := start_canned_mock(t, &refusing, "refusing", canned_reply(0, .Refused))
+	if !ref_ok {
+		return
+	}
+	defer {
+		sync.atomic_store(&refusing.stop, true)
+		thread.join(ref_thread)
+		thread.destroy(ref_thread)
+		net.close(refusing.socket)
+		destroy(ref)
+	}
+
+	first, first_ok := dead_upstream(t, "spare-one")
+	if !first_ok {
+		return
+	}
+	defer destroy(first)
+	second, second_ok := dead_upstream(t, "spare-two")
+	if !second_ok {
+		return
+	}
+	defer destroy(second)
+
+	servers := make([]^Upstream, 3, context.allocator)
+	defer delete(servers, context.allocator)
+	servers[0] = ref
+	servers[1] = first
+	servers[2] = second
+
+	TIMEOUT :: 200 * time.Millisecond
+	g := Group {
+		servers   = servers,
+		strategy  = .Failover,
+		timeout   = TIMEOUT,
+		attempts  = 1,
+		allocator = context.allocator,
+	}
+
+	wire := canned_query()
+	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
+
+	started := time.now()
+	resp, winner, err := resolve_readable(&g, wire, context.allocator)
+	spent := time.since(started)
+
+	testing.expect_value(t, err, Error.None)
+	testing.expect_value(t, winner, ref)
+	testing.expect_value(t, dns.peek_rcode(resp), dns.Rcode.Refused)
+	delete(resp, context.allocator)
+
+	testing.expectf(
+		t,
+		spent < 2 * TIMEOUT,
+		"the sweep took %v, which is a timeout for every spare rather than one for the sweep",
+		spent,
+	)
+}
