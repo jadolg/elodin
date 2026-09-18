@@ -635,7 +635,7 @@ test_a_refused_algorithm_is_settled_at_the_delegation :: proc(t: ^testing.T) {
 	v := chain_validator(context.temp_allocator)
 	defer destroy_validator(v)
 
-	budget := Budget{}
+	budget := query_budget(v)
 	status, _, established := zone_trust(v, &budget, "legacy.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 	testing.expectf(t, status == .Insecure, "the delegation to legacy. came back %v", status)
 	testing.expect_value(t, established, "legacy.")
@@ -677,7 +677,7 @@ test_one_refused_ds_does_not_make_a_mixed_delegation_insecure :: proc(t: ^testin
 	v := chain_validator(context.temp_allocator, &tamper)
 	defer destroy_validator(v)
 
-	budget := Budget{}
+	budget := query_budget(v)
 	status, _, _ := zone_trust(v, &budget, "migrating.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 	testing.expectf(
 		t,
@@ -848,7 +848,7 @@ test_refused_signatures_cannot_spend_the_verification_budget :: proc(t: ^testing
 
 	v := chain_validator(context.temp_allocator)
 	defer destroy_validator(v)
-	budget := Budget{}
+	budget := query_budget(v)
 	status, _, reason, _, _ := validate_rrset(
 		v,
 		&budget,

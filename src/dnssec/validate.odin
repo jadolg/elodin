@@ -2922,10 +2922,20 @@ denial_step :: proc(
 			if matched {
 				return .No_Cut, false
 			}
-			// The allowance only: a record the ceiling refused is one this
-			// server will not read for any question, so the records around it
-			// are the whole of the zone as far as it is concerned, and a walk
-			// that ends on them ends where it would have ended anyway.
+			/*
+			The allowance only: a record the ceiling refused is one this server
+			will not read for any question, so the records around it are the
+			whole of the zone as far as it is concerned, and a walk that ends on
+			them ends where it would have ended anyway.
+
+			Which holds while the zone keeps its chains complete, as RFC 5155
+			section 7.3 asks of one changing its parameters. A zone whose
+			readable chain is missing a name its unreadable one holds ends the
+			walk here, and a delegation below is then judged against the
+			parent's keys - a broken zone answering SERVFAIL for itself, not
+			something anyone else can arrange, and the price of not reading
+			every mid-rollover zone as unresolvable.
+			*/
 			return .Absent, nsec3_cut_short(nsec3_budget, before)
 		}
 		// Nothing proven either way: a forgery when the records are what they

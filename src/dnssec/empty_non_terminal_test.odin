@@ -170,7 +170,7 @@ test_the_walk_passes_through_an_empty_non_terminal :: proc(t: ^testing.T) {
 	testing.expect(t, v != nil, "the anchor should parse")
 	defer destroy_validator(v)
 
-	budget := Budget{}
+	budget := query_budget(v)
 	status, keys, zone := zone_trust(v, &budget, "deep.mid.entest.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 	testing.expect_value(t, status, Status.Secure)
 	testing.expect_value(t, zone, "deep.mid.entest.")
@@ -232,7 +232,7 @@ test_the_walk_stops_at_a_name_the_zone_says_is_not_there :: proc(t: ^testing.T) 
 	testing.expect(t, v != nil, "the anchor should parse")
 	defer destroy_validator(v)
 
-	budget := Budget{}
+	budget := query_budget(v)
 	status, _, zone := zone_trust(
 		v,
 		&budget,

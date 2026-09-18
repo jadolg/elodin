@@ -337,9 +337,12 @@ test_a_denial_whose_hashing_ran_out_is_indeterminate_not_bogus :: proc(t: ^testi
 	v := da_validator()
 	testing.expect(t, v != nil, "the anchor should parse")
 	defer destroy_validator(v)
-	none := Budget {
-		nsec3 = {rounds = MAX_NSEC3_ROUNDS_PER_QUERY},
-	}
+	// Built the way a question builds one, so the ceiling is the validator's
+	// rather than a zero that would refuse every record asking for any
+	// iterations at all - which is a different refusal from the one under test,
+	// and would pass this test while proving nothing about it.
+	none := query_budget(v)
+	none.nsec3.rounds = MAX_NSEC3_ROUNDS_PER_QUERY
 	result := validate_denial(v, &none, msg, qname, .DS, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 	testing.expectf(
 		t,
@@ -352,7 +355,7 @@ test_a_denial_whose_hashing_ran_out_is_indeterminate_not_bogus :: proc(t: ^testi
 	// The control: the same records, the same question, a whole allowance.
 	fresh_v := da_validator()
 	defer destroy_validator(fresh_v)
-	fresh := Budget{}
+	fresh := query_budget(fresh_v)
 	held := validate_denial(fresh_v, &fresh, msg, qname, .DS, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 	testing.expectf(t, held.status == .Secure, "the denial itself holds up, got %v (%q)", held.status, held.reason)
 	free_all(context.temp_allocator)

@@ -539,6 +539,17 @@ nsec3_proves_no_data :: proc(
 		refused is not the same thing - it is unusable to this server for good,
 		the records around it still speak, and reading them is what this server
 		does with such a zone rather than an answer it stopped short of.
+
+		That rests on something the zone owes: RFC 5155 section 7.3 has a zone
+		changing its parameters publish both chains complete, so a name the
+		readable chain does not hold is a name the other one does not hold
+		either. A zone that breaks that - two chains disagreeing about which
+		names exist, the deciding record present only in the one past the
+		ceiling - gets its NODATA served insecure where a refusal would have
+		been safer. The trade is deliberate: the alternative reads every zone
+		mid-rollover as unprovable, which is SERVFAIL for a subtree that
+		resolves everywhere else, and nothing here is an attacker's to arrange,
+		since every record in play carries the zone's own signature.
 		*/
 		if nsec3_cut_short(budget, before) {
 			return .Failed

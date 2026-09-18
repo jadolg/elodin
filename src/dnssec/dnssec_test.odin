@@ -58,7 +58,7 @@ test_validator :: proc(anchors: []Trust_Anchor = nil) -> ^Validator {
 // Walks the chain with a fresh budget, the way `validate` does.
 @(private = "file")
 trust :: proc(v: ^Validator, name: string) -> (Status, []Dnskey, string) {
-	budget := Budget{}
+	budget := query_budget(v)
 	return zone_trust(v, &budget, name, fixture_now(), context.temp_allocator)
 }
 
@@ -345,7 +345,7 @@ test_a_denial_that_runs_out_of_hashing_is_indeterminate :: proc(t: ^testing.T) {
 	// and the next would read the answer rather than work it out.
 	base_v := test_validator()
 	defer destroy_validator(base_v)
-	fresh := Budget{}
+	fresh := query_budget(base_v)
 	baseline := validate_denial(base_v, &fresh, msg, qname, .A, .IN, u32(FIXTURE_TIME), fixture_now(), context.temp_allocator)
 	testing.expectf(
 		t,
@@ -357,9 +357,11 @@ test_a_denial_that_runs_out_of_hashing_is_indeterminate :: proc(t: ^testing.T) {
 
 	v := test_validator()
 	defer destroy_validator(v)
-	spent := Budget {
-		nsec3 = {rounds = MAX_NSEC3_ROUNDS_PER_QUERY},
-	}
+	// Through `query_budget`, so the ceiling is the validator's: a zero would
+	// refuse these records for their iteration count instead, which is a
+	// different refusal and would pass this test for the wrong reason.
+	spent := query_budget(v)
+	spent.nsec3.rounds = MAX_NSEC3_ROUNDS_PER_QUERY
 	result := validate_denial(v, &spent, msg, qname, .A, .IN, u32(FIXTURE_TIME), fixture_now(), context.temp_allocator)
 	testing.expect_value(t, result.status, Status.Indeterminate)
 	testing.expect_value(t, result.reason, NSEC3_BUDGET_SPENT)
@@ -388,9 +390,9 @@ test_an_nsec_denial_that_fails_is_bogus_even_with_the_hashing_spent :: proc(t: ^
 	qname :: "nosuchname-xq7.cloudflare.com."
 	v := test_validator()
 	defer destroy_validator(v)
-	spent := Budget {
-		nsec3 = {rounds = MAX_NSEC3_ROUNDS_PER_QUERY, spent = 3},
-	}
+	spent := query_budget(v)
+	spent.nsec3.rounds = MAX_NSEC3_ROUNDS_PER_QUERY
+	spent.nsec3.spent = 3
 	result := validate_denial(v, &spent, msg, qname, .NSEC, .IN, u32(FIXTURE_TIME), fixture_now(), context.temp_allocator)
 	testing.expect_value(t, result.status, Status.Bogus)
 	testing.expect_value(t, result.reason, "denial of existence not proven")
@@ -710,7 +712,7 @@ fetch_forged :: proc(wire: string) -> Status {
 	v := make_validator(canned_query, &canned, Options{})
 	defer destroy_validator(v)
 
-	budget := Budget{}
+	budget := query_budget(v)
 	_, status := fetch_keys(
 		v,
 		&budget,
@@ -1190,7 +1192,7 @@ downgrade_status :: proc(zone_status: Status) -> Status {
 	defer destroy_validator(v)
 
 	records, sigs := unsupported_rrset(ZONE, keys[0])
-	budget := Budget{}
+	budget := query_budget(v)
 	status, _, _, _, _ := validate_rrset(
 		v,
 		&budget,

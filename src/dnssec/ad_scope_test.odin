@@ -990,7 +990,7 @@ test_a_messages_denial_records_are_verified_once :: proc(t: ^testing.T) {
 	}
 
 	now := time.unix(FIXTURE_TIME, 0)
-	budget := Budget{}
+	budget := query_budget(v)
 	trust, keys, established := zone_trust(v, &budget, "cloudflare.com.", now, context.temp_allocator)
 	if !testing.expectf(t, trust == .Secure, "the fixture's zone did not establish, got %v", trust) {
 		return

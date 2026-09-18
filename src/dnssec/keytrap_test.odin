@@ -199,7 +199,7 @@ kt_baseline :: proc(t: ^testing.T) -> (spent: int, ok: bool) {
 	v := make_validator(kt_query, nil, Options{})
 	defer destroy_validator(v)
 
-	budget := Budget{}
+	budget := query_budget(v)
 	status, _, _ := zone_trust(v, &budget, "cloudflare.com.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 	if !testing.expectf(t, status == .Secure, "the untampered chain did not establish, got %v", status) {
 		return 0, false
@@ -227,7 +227,7 @@ test_a_padded_ds_set_cannot_run_unbounded_verifications :: proc(t: ^testing.T) {
 	v := make_validator(kt_query, &pads, Options{})
 	defer destroy_validator(v)
 
-	budget := Budget{}
+	budget := query_budget(v)
 	status, _, _ := zone_trust(v, &budget, "cloudflare.com.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 	testing.expectf(
 		t,
@@ -269,7 +269,7 @@ test_free_rejectable_ds_padding_costs_the_chain_nothing :: proc(t: ^testing.T) {
 	v := make_validator(kt_query, &pads, Options{})
 	defer destroy_validator(v)
 
-	budget := Budget{}
+	budget := query_budget(v)
 	status, _, _ := zone_trust(v, &budget, "cloudflare.com.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 	testing.expectf(
 		t,
@@ -309,7 +309,7 @@ test_lapsed_ds_padding_costs_the_chain_nothing :: proc(t: ^testing.T) {
 	v := make_validator(kt_query, &pads, Options{})
 	defer destroy_validator(v)
 
-	budget := Budget{}
+	budget := query_budget(v)
 	status, _, _ := zone_trust(v, &budget, "cloudflare.com.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 	testing.expectf(
 		t,
@@ -343,7 +343,7 @@ test_a_padded_root_dnskey_set_is_bounded :: proc(t: ^testing.T) {
 	v := make_validator(kt_query, &pads, Options{})
 	defer destroy_validator(v)
 
-	budget := Budget{}
+	budget := query_budget(v)
 	status, _ := zone_keys(v, &budget, ".", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 	testing.expectf(
 		t,
@@ -376,7 +376,7 @@ test_a_padded_dnskey_set_cannot_run_unbounded_verifications :: proc(t: ^testing.
 	v := make_validator(kt_query, &pads, Options{})
 	defer destroy_validator(v)
 
-	budget := Budget{}
+	budget := query_budget(v)
 	status, _, _ := zone_trust(v, &budget, "cloudflare.com.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 	testing.expectf(
 		t,
@@ -405,7 +405,7 @@ test_free_rejectable_dnskey_padding_costs_the_chain_nothing :: proc(t: ^testing.
 	v := make_validator(kt_query, &pads, Options{})
 	defer destroy_validator(v)
 
-	budget := Budget{}
+	budget := query_budget(v)
 	status, _, _ := zone_trust(v, &budget, "cloudflare.com.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 	testing.expectf(
 		t,
@@ -451,7 +451,7 @@ test_duplicate_ds_records_do_not_multiply_the_dnskey_check :: proc(t: ^testing.T
 	v := make_validator(kt_query, &pads, Options{})
 	defer destroy_validator(v)
 
-	budget := Budget{}
+	budget := query_budget(v)
 	status, _, _ := zone_trust(v, &budget, "cloudflare.com.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 	testing.expectf(
 		t,
@@ -532,7 +532,7 @@ test_an_exhausted_key_check_is_not_a_downgrade :: proc(t: ^testing.T) {
 	v := make_validator(kt_query, &pads, Options{})
 	defer destroy_validator(v)
 
-	budget := Budget{}
+	budget := query_budget(v)
 	_, status := fetch_keys(
 		v,
 		&budget,

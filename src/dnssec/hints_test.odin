@@ -393,7 +393,7 @@ test_sh_zone_chain_is_sound :: proc(t: ^testing.T) {
 	testing.expect(t, v != nil, "the anchor should parse")
 	defer destroy_validator(v)
 
-	budget := Budget{}
+	budget := query_budget(v)
 	for zone in ([]string{"hinttest.", "other."}) {
 		status, keys, established := zone_trust(v, &budget, zone, time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 		testing.expect_value(t, status, Status.Secure)
@@ -643,7 +643,7 @@ test_a_wildcard_hint_is_dropped :: proc(t: ^testing.T) {
 	msg, derr := dns.decode_message(wire, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
 
-	budget := Budget{}
+	budget := query_budget(v)
 	unix := u32(FIXTURE_TIME)
 	records := records_of(msg.additional, "wild.hinttest.", .A, .IN, context.temp_allocator)
 	sigs := sigs_covering(msg.additional, "wild.hinttest.", .A, .IN, context.temp_allocator)

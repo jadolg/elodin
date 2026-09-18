@@ -160,7 +160,7 @@ test_wildcard_zone_chain_is_sound :: proc(t: ^testing.T) {
 	testing.expect(t, v != nil, "the anchor should parse")
 	defer destroy_validator(v)
 
-	budget := Budget{}
+	budget := query_budget(v)
 	status, keys, zone := zone_trust(v, &budget, "wildcardtest.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 	testing.expect_value(t, status, Status.Secure)
 	testing.expect_value(t, zone, "wildcardtest.")
