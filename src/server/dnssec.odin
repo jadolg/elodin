@@ -17,10 +17,6 @@ untouched: a bogus one becomes SERVFAIL, a good one may gain the AD bit, and a
 client that never asked for DNSSEC records has them taken back out.
 */
 
-// A signed answer rarely fits in 512 bytes, so our own upstream queries always
-// advertise room for one.
-UPSTREAM_UDP_SIZE :: 4096
-
 // Extended DNS error codes, RFC 8914. Sent only to clients that use EDNS0,
 // which is the only place there is to put them.
 EDE_DNSSEC_BOGUS :: 6

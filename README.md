@@ -515,6 +515,14 @@ The same byte is cleared on the way out: RFC 6891 requires a request to leave
 EXTENDED-RCODE at zero, so a client setting it cannot make an upstream that
 echoes the OPT TTL answer every one of its queries unreadably.
 
+The EDNS payload size a forwarded query carries is elodin's own, capped at the
+1232 bytes of DNS Flag Day 2020 (RFC 9715), never the client's figure: that
+field says how large a datagram *this server* is prepared to receive, and
+passing the client's on would let any of them ask the upstream for 65000 bytes
+of fragmented UDP — whose second fragment carries neither port nor transaction
+ID. A client that advertised less than 1232 is not overruled upward. An answer
+that no longer fits comes back truncated and is re-fetched over TCP.
+
 An `https` upstream picks between HTTP/2 and HTTP/1.1 with ALPN, preferring h2,
 since some public resolvers answer HTTP/1.1 only. Concurrent queries against an
 h2 upstream multiplex onto one connection; an HTTP/1.1 one uses the same pooled

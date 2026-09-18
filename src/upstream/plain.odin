@@ -38,12 +38,18 @@ exchange_udp :: proc(
 	/*
 	Sized from what the query itself advertised, not from a fixed number.
 
-	A responder may fill whatever room the OPT record offered it, and this query
-	is the client's own message forwarded verbatim — so the figure is the
-	client's, and it goes as high as 65535. A buffer smaller than that figure
+	A responder may fill whatever room the OPT record offered it, so the buffer
+	has to hold whatever this query asked for. A buffer smaller than that figure
 	turns a perfectly good answer into a failure: Linux reports the shortfall
 	rather than hiding it, which lands in the error path below, and three of
 	those in a row park a healthy upstream for the cooldown.
+
+	Read off the query rather than assumed, and the callers are what keep it
+	small: every query that reaches here has had its OPT record written by this
+	server (`UPSTREAM_UDP_SIZE`), so the figure is ours and not a client's. The
+	clamp is the floor and the wire's own ceiling, not a policy - a query built
+	by hand asking for more would be honoured, and would only cost this one
+	buffer.
 
 	One byte over, so a datagram that ignores the advertised size is
 	recognisable rather than merely truncated.

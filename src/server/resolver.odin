@@ -427,6 +427,23 @@ udp_ceiling :: proc(s: ^Server) -> int {
 }
 
 /*
+The UDP payload size this server advertises to an upstream.
+
+The counterpart of `udp_ceiling` pointed the other way: that one is what this
+server will send a client, this is what it is willing to have an upstream send
+it. 1232 is the DNS Flag Day 2020 figure (RFC 9715) and what dnsmasq, Unbound,
+BIND and dnsproxy all default their own outgoing figure to, for the reason RFC
+6891 section 6.2.5 gives - a datagram past the path MTU is fragmented, and the
+second fragment carries no port and no transaction ID, so anything on the path
+can supply it. A signed answer still rarely fits in 512 bytes, which is why this
+is not simply left unset; what changed is that it is no longer 4096.
+
+Not configurable, and deliberately: an operator lowering it gains nothing TCP
+does not already give them, and one raising it is asking for the fragments.
+*/
+UPSTREAM_UDP_SIZE :: 1232
+
+/*
 The UDP payload size this server puts in an answer's OPT record.
 
 RFC 6891 section 6.2.4 makes that field the responder's own maximum rather than
@@ -1506,6 +1523,36 @@ resolve_query :: proc(
 	Best-effort by design: a query with no OPT record has no field to clear.
 	*/
 	_ = dns.clear_edns_extended_rcode(forwarded)
+
+	/*
+	And the payload size the upstream is told is ours, not the client's.
+
+	The number in that field decides how large a datagram the upstream may send
+	*this server*, so forwarding the client's figure lets an anonymous client
+	choose it: 65535 advertised is a multi-fragment UDP answer arriving here,
+	and the second fragment carries neither the transaction ID nor the port, so
+	an off-path attacker needs only the IP header's 16-bit fragment ID to graft
+	its own records onto a genuine reply - which then lands in the shared cache,
+	under the CD=1 key any client can ask for. Nothing about the client's own
+	message is a statement about what this server can reassemble.
+
+	`min` rather than a plain write: a client that advertised less than the
+	ceiling, or that asked without EDNS at all, is not overruled upward. There
+	is nothing to gain from asking for more room than the answer we may send
+	back can use, and a stub that advertised 512 is often one behind a path that
+	could not carry more.
+
+	Here with the ID and the extended rcode because the three want the same
+	thing: the one point all the ways the outgoing message comes about pass
+	through, with the buffer certainly this server's own. The DNSSEC rewrite
+	arrives having already written `UPSTREAM_UDP_SIZE`, so this leaves it as it
+	is; `validator_query`, which does not come this way at all, writes the same
+	constant itself.
+
+	Best-effort, like the clear above: a query with no OPT record has no field
+	to write into, and 512 is what a responder assumes without one.
+	*/
+	_ = dns.set_edns_udp_size(forwarded, min(dns.peek_udp_size(forwarded), UPSTREAM_UDP_SIZE))
 
 	/*
 	Down the zone's own route when it has one, and to the default group when it
