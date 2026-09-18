@@ -531,6 +531,26 @@ A parent that does settle clears its slot rather than leaving it to expire: the
 question was asked, the answer arrived, and the memory of the last failure has
 been overtaken by it.
 
+What the memory is not is a reason to stop asking. It is written by one reply
+that settled nothing, and one reply is a long way from what parks an upstream -
+`FAILURE_THRESHOLD` consecutive failures - so the group it skips may be
+answering everything else perfectly well. `resolve_query` reaches past it for
+that reason: where the route it sent the question to instead could not answer at
+all, the parent is asked after the fact, and a parent that has come back with the
+proof is read and remembered as it always would have been. The saving is of a
+wait the route can cover, never of the answer itself.
+
+The window it closes is between one probe and the next, not around the probe
+itself. Nothing is written until the parent's leg returns, so the queries that
+arrive while a first one is still sitting in a blackholed group's whole budget
+find no memory and start their own leg - a validating stub gives up in two to
+five seconds and retries, and the servers are not parked yet, three failures
+being what parks them. Bounding that means bounding the leg rather than
+remembering it: a deadline of this question's own, or asking both groups at once,
+which is where issue #243 leaves it and what this deliberately is not. What this
+ends is the *next* query paying the same wait over again, which is what the
+REFUSING parent costs forever and the blackholed one costs once per cooldown.
+
 Fixed slots rather than a map keyed by name. The names are route apexes, so the
 set is settled at startup and small; an array needs no allocation, no destructor,
 and nothing from a `Server` built as a literal. The ceiling is that an operator

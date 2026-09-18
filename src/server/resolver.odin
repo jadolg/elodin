@@ -1561,6 +1561,19 @@ resolve_query :: proc(
 	already covered.
 	*/
 	unproven_apex_ds := false
+	/*
+	The parent's group when the memory below is what sent this question to the
+	route, and nil in every other arrangement.
+
+	Held because that arrangement is the one that passes over a group which is
+	*not* parked. Three consecutive failures is what parks one, and the skip
+	above waits for them; the memory stands on a single reply that settled
+	nothing, which an upstream can produce while answering everything else
+	perfectly well. So a route that then cannot answer has to be able to reach
+	past it, and the group to reach for is this one. See the fallback below the
+	exchange.
+	*/
+	memoised_parent: ^upstream.Group
 	if apex_ds && own != asked && group_reachable(own) {
 		/*
 		Or when the parent's group was asked this same question inside the last
@@ -1570,9 +1583,10 @@ resolve_query :: proc(
 		parked, and a group behind a blackholed uplink is unparked again every
 		ten seconds however many times it has failed, so `group_reachable` alone
 		leaves both of those paid for by every query. What the memory changes is
-		when the parent is asked, not what the client is told: the route answers
-		either way, and `unproven_apex_ds` keeps that answer out of the cache
-		exactly as it does above.
+		which group is asked first, not what the client is told: the route
+		answers either way, `unproven_apex_ds` keeps that answer out of the cache
+		exactly as it does above, and where the route cannot answer at all the
+		parent is asked after all.
 		*/
 		if !group_reachable(asked) {
 			logx.debugf("query DS %s: the parent's group is parked, asking the route instead", q.name)
@@ -1583,6 +1597,7 @@ resolve_query :: proc(
 				"query DS %s: the parent's group settled nothing for this apex inside the last cooldown, asking the route instead",
 				q.name,
 			)
+			memoised_parent = asked
 			asked = own
 			unproven_apex_ds = true
 		}
@@ -1729,6 +1744,50 @@ resolve_query :: proc(
 				)
 				uerr = aerr
 			}
+		}
+	}
+	/*
+	And the parent is asked after all when the route the memory chose could not
+	answer at all.
+
+	The memory is of a wait worth saving, not of a group worth giving up on:
+	what wrote it is one reply that settled nothing, and an upstream that
+	SERVFAILs a `DS` it does not like, or loses one datagram, is not an upstream
+	that has stopped answering - three consecutive failures would be, and that
+	is the parked-group skip above, which reaches past nothing because there is
+	nothing left to reach. Here there is. Without this, one unsettled reply
+	would turn the next ten seconds of a route's own outage into SERVFAIL for a
+	zone whose parent had recovered and was holding the proof - which is issue
+	#227's failure, arriving through the saving meant to prevent it.
+
+	Only where the route did not answer at all. A route that answered is the
+	client's answer, rcode and all, exactly as it is when the parent's group is
+	asked first and proves nothing: this changes which group is asked first and
+	not how either one is read.
+
+	And only the proof is taken from it, on the same terms the first exchange
+	takes it: an NXDOMAIN or a rewritten rcode is a statement this client is no
+	better for being handed - `apex_ds_off_route` argues each - and the route's
+	own failure standing is what the query is, which the error path below turns
+	into stale-if-there-is-any and SERVFAIL otherwise. What the parent managed
+	to say is written down either way, so a parent that has come back stops
+	being skipped from here on.
+
+	A fresh transaction ID for the same reason the second exchange draws one:
+	each exchange is a new one on the wire (RFC 5452 section 9.2).
+	*/
+	if memoised_parent != nil && uerr != .None {
+		dns.set_id_in_place(forwarded, dns.random_id())
+		again, second, perr := upstream.resolve_answerable(memoised_parent, forwarded, allocator)
+		proved, settled := parent_answers_apex_ds(again, q.name, perr == .None, allocator)
+		remember_apex_ds_parent(s, q.name, settled)
+		if proved {
+			logx.debugf(
+				"query DS %s: the route could not answer, and the parent proved the delegation carries no DS after all",
+				q.name,
+			)
+			resp, winner, uerr = again, second, .None
+			unproven_apex_ds = false
 		}
 	}
 	if uerr != .None {

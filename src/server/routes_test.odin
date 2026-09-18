@@ -1644,6 +1644,131 @@ test_a_parent_that_settles_nothing_is_not_re_asked_for_every_query :: proc(t: ^t
 }
 
 /*
+The memory saves a wait, and gives up nothing when the route cannot answer.
+
+The skip it makes is not the parked-group skip's: that one fires only once every
+member of the parent's group has accrued `FAILURE_THRESHOLD` failures, which is
+a group that has proved it cannot answer, where this one fires on a single reply
+that settled nothing - one SERVFAIL, one lost packet - and stands for a whole
+cooldown. So the leg it saves has to be a leg this server can still take, and the
+arrangement that says whether it is is the one where the *route* is what fails:
+the parent recovers inside the window and holds the proof, and the route the
+memory sent the question to has nothing to say.
+
+Asked and answered, rather than SERVFAILed with a leg untried. The parent's reply
+is used on the same terms the first exchange reads it on - only the proof is this
+client's answer, an NXDOMAIN or a rewritten rcode is not - so what the fallback
+can do is give the client the one answer the carve-out went to fetch, and never
+hand on a statement the route's own failure would otherwise have spared it.
+
+The route is left bound and unserved for the second query, which is what a route
+that has gone away looks like from here; the timeout is cut so it does not sit
+out `forwarding_config`'s three seconds. The first query is the fixture: a
+SERVFAIL from the parent is what writes the memory that the second query is
+about.
+*/
+@(test)
+test_the_memo_still_asks_the_parent_when_the_route_cannot_answer :: proc(t: ^testing.T) {
+	def_socket, derr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, derr == nil, "cannot bind the default mock: %v", derr) {
+		return
+	}
+	defer net.close(def_socket)
+	_ = net.set_option(def_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+	def_bound, _ := net.bound_endpoint(def_socket)
+
+	route_socket, rerr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, rerr == nil, "cannot bind the routed mock: %v", rerr) {
+		return
+	}
+	defer net.close(route_socket)
+	_ = net.set_option(route_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+	route_bound, _ := net.bound_endpoint(route_socket)
+
+	cfg := forwarding_config()
+	cfg.upstream.timeout = 200 * time.Millisecond
+
+	group := mock_group(t, cfg.upstream, def_bound.port)
+	defer upstream.destroy_group(group)
+	routed := mock_group(t, cfg.upstream, route_bound.port)
+	defer upstream.destroy_group(routed)
+
+	s := Server {
+		cfg    = &cfg,
+		group  = group,
+		routes = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
+	}
+
+	// The first query writes the memory: the parent says nothing that settles
+	// the delegation, and the route answers in its place.
+	refusing := Route_Mock {
+		socket = def_socket,
+		reply  = route_reply_nodata("corp.example.", .DS, .Serv_Fail),
+		want   = "corp.example.",
+	}
+	answering := Route_Mock {
+		socket = route_socket,
+		reply  = route_reply_nodata("corp.example.", .DS),
+		want   = "corp.example.",
+	}
+	first_parent := thread.create_and_start_with_poly_data(&refusing, serve_route)
+	first_route := thread.create_and_start_with_poly_data(&answering, serve_route)
+	_, _, first_ok := handle_query(
+		&s,
+		route_query("corp.example.", .DS),
+		.UDP,
+		"127.0.0.1:5555",
+		context.temp_allocator,
+	)
+	thread.join(first_parent)
+	thread.destroy(first_parent)
+	thread.join(first_route)
+	thread.destroy(first_route)
+	if !testing.expect(t, first_ok, "nothing came back for the query that writes the memory") {
+		return
+	}
+	if !testing.expect(t, refusing.asked, "the parent's group was not asked for the first query") {
+		return
+	}
+
+	/*
+	And the second is the case: the parent is holding the proof this time, and
+	nothing is serving the route. The memory sends the question to the route
+	first, which is the whole of what it is for - but a route that cannot answer
+	leaves the question unanswered, and the parent is right there.
+	*/
+	proving := Route_Mock {
+		socket = def_socket,
+		reply  = route_reply_nodata("corp.example.", .DS),
+		want   = "corp.example.",
+	}
+	second_parent := thread.create_and_start_with_poly_data(&proving, serve_route)
+	out, _, ok := handle_query(
+		&s,
+		route_query("corp.example.", .DS),
+		.UDP,
+		"127.0.0.1:5555",
+		context.temp_allocator,
+	)
+	thread.join(second_parent)
+	thread.destroy(second_parent)
+
+	if !testing.expect(t, ok, "nothing came back at all for the second query") {
+		return
+	}
+	testing.expect(
+		t,
+		proving.asked,
+		"a parent holding the proof was passed over on the strength of one unsettled reply",
+	)
+
+	decoded, derr2 := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr2, dns.Decode_Error.None)
+	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
+	free_all(context.temp_allocator)
+}
+
+/*
 A routed zone is served insecure, and an anchor over it takes that back.
 
 `served_locally` is the predicate `resolve_query` reads to decide whether to
