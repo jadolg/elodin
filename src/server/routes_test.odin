@@ -1388,13 +1388,18 @@ test_a_parked_parent_is_still_asked_when_the_route_is_parked_too :: proc(t: ^tes
 	if !testing.expect(t, ok, "nothing came back at all") {
 		return
 	}
-	// The count says which of the two failures this is: a parent that was never
-	// sent the question, or one whose mock never got to it.
+	/*
+	The counts say which failure this is. The question at the route's socket and
+	not the parent's is the skip firing, which is the thing this case exists to
+	catch; neither socket holding one is the group giving up without sending,
+	which is a different fault in a different place.
+	*/
 	testing.expectf(
 		t,
 		parent.asked,
-		"the parent was passed over for a route that was parked too (%d unread questions at its socket)",
+		"the parent was passed over for a route that was parked too (%d unread questions at the parent, %d at the route)",
 		route_mock_heard(def_socket, "corp.example."),
+		route_mock_heard(route_socket, "corp.example."),
 	)
 
 	decoded, derr2 := dns.decode_message(out, context.temp_allocator)
