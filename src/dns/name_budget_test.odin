@@ -1,0 +1,193 @@
+package dns
+
+import "core:mem"
+import "core:testing"
+
+// A 255-octet wire name (four labels of low bytes) whose presentation form is
+// four characters per octet: the worst expansion a single name can buy.
+@(private = "file")
+long_wire_name :: proc() -> []u8 {
+	out := make([dynamic]u8, 0, 256)
+	for l in ([]int{63, 63, 63, 61}) {
+		append(&out, u8(l))
+		for _ in 0 ..< l {
+			append(&out, 0x01)
+		}
+	}
+	append(&out, 0)
+	return out[:]
+}
+
+@(private = "file")
+put_header :: proc(buf: ^[dynamic]u8, ancount: u16) {
+	append(buf, 0x12, 0x34, 0x81, 0x80, 0, 1, u8(ancount >> 8), u8(ancount), 0, 0, 0, 0)
+}
+
+@(private = "file")
+put_u16 :: proc(buf: ^[dynamic]u8, v: u16) {
+	append(buf, u8(v >> 8), u8(v))
+}
+
+// An answer of MX records whose owner and exchange are both two-byte pointers
+// to one 255-octet name, which is the shape reported in issue #298.
+@(private = "file")
+pointer_mx_answer :: proc() -> []u8 {
+	name := long_wire_name()
+	defer delete(name)
+
+	// 16 bytes a record: pointer owner, type, class, ttl, rdlength, rdata.
+	count := u16((65535 - 12 - len(name) - 4) / 16)
+	msg := make([dynamic]u8, 0, 65535)
+	put_header(&msg, count)
+	append(&msg, ..name)
+	put_u16(&msg, u16(Type.MX))
+	put_u16(&msg, u16(Class.IN))
+	for _ in 0 ..< count {
+		append(&msg, 0xc0, 0x0c) // owner: the question's name
+		put_u16(&msg, u16(Type.MX))
+		put_u16(&msg, u16(Class.IN))
+		append(&msg, 0, 0, 0x0e, 0x10)
+		put_u16(&msg, 4) // rdlength
+		put_u16(&msg, 10) // preference
+		append(&msg, 0xc0, 0x0c) // exchange: the same name again
+	}
+	return msg[:]
+}
+
+/*
+An answer of PX records - a type the codec keeps as raw bytes - whose two RDATA
+names point at one 255-octet name.
+
+The owners are pointers to a two-byte question name, so nothing but the RDATA
+expansion pays for anything here: this is the same amplification reached through
+`decode_raw_rdata` rather than through the record's own owner.
+*/
+@(private = "file")
+pointer_px_answer :: proc() -> []u8 {
+	name := long_wire_name()
+	defer delete(name)
+
+	msg := make([dynamic]u8, 0, 65535)
+	// Header (12) + question "x." (3) + qtype/qclass (4): the long name then
+	// starts at offset 19 as the first record's owner.
+	long_at := u16(19)
+	count := u16((65535 - 19 - (len(name) + 16) - 1) / 18 + 1)
+	put_header(&msg, count)
+	append(&msg, 1, 'x', 0)
+	put_u16(&msg, u16(Type.PX))
+	put_u16(&msg, u16(Class.IN))
+	for i in 0 ..< count {
+		if i == 0 {
+			append(&msg, ..name)
+		} else {
+			append(&msg, 0xc0, 0x0c)
+		}
+		put_u16(&msg, u16(Type.PX))
+		put_u16(&msg, u16(Class.IN))
+		append(&msg, 0, 0, 0x0e, 0x10)
+		put_u16(&msg, 6) // rdlength
+		put_u16(&msg, 10) // preference
+		append(&msg, 0xc0, u8(long_at))
+		append(&msg, 0xc0, u8(long_at))
+	}
+	return msg[:]
+}
+
+@(private = "file")
+decode_into_arena :: proc(t: ^testing.T, msg: []u8) -> (used: int, err: Decode_Error) {
+	backing := make([]u8, 48 << 20)
+	defer delete(backing)
+	arena: mem.Arena
+	mem.arena_init(&arena, backing)
+
+	_, derr := decode_message(msg, mem.arena_allocator(&arena))
+	return arena.offset, derr
+}
+
+/*
+The whole decode has to stay within a small multiple of the message.
+
+The budget bounds the names. The record array and the RDATA copies beside them
+are not in it and do not need to be - a record costs at least eleven wire bytes,
+so both are already a fixed multiple of the message - but they are in what the
+arena holds, which is what is measured here. Twenty-four times over covers the
+lot; the shapes below cost a hundred and thirty times their own length and more
+with nothing bounding the names.
+*/
+@(private = "file")
+DECODE_CEILING :: 24
+
+@(test)
+test_pointer_mx_answer_stays_within_the_name_budget :: proc(t: ^testing.T) {
+	msg := pointer_mx_answer()
+	defer delete(msg)
+
+	used, err := decode_into_arena(t, msg)
+	testing.expect_value(t, err, Decode_Error.Name_Budget)
+	testing.expectf(
+		t,
+		used <= DECODE_CEILING * len(msg),
+		"a %d-byte reply expanded into %d bytes of arena",
+		len(msg),
+		used,
+	)
+}
+
+@(test)
+test_pointer_px_rdata_stays_within_the_name_budget :: proc(t: ^testing.T) {
+	msg := pointer_px_answer()
+	defer delete(msg)
+
+	used, err := decode_into_arena(t, msg)
+	// The owners are cheap here, so it is the RDATA expansion that spends the
+	// budget; the record after it then fails on its own owner name, which is
+	// what refuses the message.
+	testing.expect_value(t, err, Decode_Error.Name_Budget)
+	testing.expectf(
+		t,
+		used <= DECODE_CEILING * len(msg),
+		"a %d-byte reply expanded into %d bytes of arena through raw RDATA",
+		len(msg),
+		used,
+	)
+}
+
+/*
+The tightest shape a legitimate answer takes still decodes.
+
+One 253-character owner name - the longest there is - written once and pointed
+at by a hundred A records, which is 254 bytes of name for every 16 of wire and
+about as far as a real answer can push the ratio. Ordinary traffic is nowhere
+near; this is the case the factor was chosen against.
+*/
+@(test)
+test_long_name_pointed_at_by_a_whole_rrset_still_decodes :: proc(t: ^testing.T) {
+	// 63 + 63 + 63 + 61 characters of label, printable this time.
+	name := make([dynamic]u8, 0, 256)
+	defer delete(name)
+	for l in ([]int{63, 63, 63, 61}) {
+		append(&name, u8(l))
+		for _ in 0 ..< l {
+			append(&name, 'a')
+		}
+	}
+	append(&name, 0)
+
+	msg := make([dynamic]u8, 0, 2048)
+	defer delete(msg)
+	put_header(&msg, 100)
+	append(&msg, ..name[:])
+	put_u16(&msg, u16(Type.A))
+	put_u16(&msg, u16(Class.IN))
+	for _ in 0 ..< 100 {
+		append(&msg, 0xc0, 0x0c)
+		put_u16(&msg, u16(Type.A))
+		put_u16(&msg, u16(Class.IN))
+		append(&msg, 0, 0, 0x0e, 0x10)
+		put_u16(&msg, 4)
+		append(&msg, 93, 184, 216, 34)
+	}
+
+	_, err := decode_into_arena(t, msg[:])
+	testing.expect_value(t, err, Decode_Error.None)
+}

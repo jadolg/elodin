@@ -11,6 +11,7 @@ Decode_Error :: enum u8 {
 	Loop_Detected,
 	Bad_Rdata,
 	Truncated_Header,
+	Name_Budget,
 }
 
 Encode_Error :: enum u8 {
@@ -24,10 +25,53 @@ Encode_Error :: enum u8 {
 	Bad_Rdata,
 }
 
+/*
+What a message's decoded names may cost: a flat allowance, plus this many times
+the message's own wire length.
+
+Every name is cloned in escaped presentation form, so one 255-octet name of
+unprintable bytes costs 1004 bytes, and a two-byte compression pointer buys a
+fresh copy of the whole expansion. A record is only 16 wire bytes when its owner
+and its RDATA name are both pointers, so a reply built entirely of those reaches
+about 130 times its own length - 8.5 MB out of 64 KB - and the same message is
+decoded again for the cache, for the UDP fit and for the validator.
+
+The two terms answer two different things. A small message can honestly reach a
+high multiple of itself and it does not matter that it does: the parity
+generator, which sends legal shapes nobody sends on purpose, gets to about
+fourteen times on replies of a few hundred bytes, and fourteen times nothing is
+nothing. What matters is the figure a full-length reply can reach, and that is
+what the multiplier holds down - to 640 KB at 64 KB of message.
+
+What the pair refuses is a full-length reply whose names still come to more than
+the allowance and eight times the message together: four thousand records of one
+253-character name, say. That is legal, and no real server sends it - a name is
+normally printable, written out once for every record or two that carries it, and
+costs a fraction of the record carrying it.
+*/
+NAME_BUDGET_FLOOR :: 128 * 1024
+NAME_EXPANSION_FACTOR :: 8
+
 @(private)
 Reader :: struct {
-	msg: []u8,
-	pos: int,
+	msg:        []u8,
+	pos:        int,
+	// Presentation bytes this message's names have been expanded into so far,
+	// against `NAME_BUDGET_FLOOR` plus `NAME_EXPANSION_FACTOR` times `len(msg)`.
+	name_bytes: int,
+}
+
+/*
+Charge `n` presentation bytes to the message's expansion budget.
+
+Charged after the clone rather than before it, since what a name costs is not
+known until it is decoded; a single name overshoots by at most
+`MAX_NAME_PRESENTATION`, and nothing else is decoded once the budget is gone.
+*/
+@(private)
+charge_name :: proc(r: ^Reader, n: int) -> Decode_Error {
+	r.name_bytes += n
+	return .Name_Budget if r.name_bytes > NAME_BUDGET_FLOOR + NAME_EXPANSION_FACTOR * len(r.msg) else .None
 }
 
 @(private)
@@ -81,6 +125,9 @@ r_name :: proc(r: ^Reader, allocator: mem.Allocator) -> (name: string, err: Deco
 	name, next, err = decode_name(r.msg, r.pos, allocator)
 	if err != .None {
 		return
+	}
+	if err = charge_name(r, len(name)); err != .None {
+		return "", err
 	}
 	r.pos = next
 	return
@@ -202,7 +249,7 @@ decode_record :: proc(r: ^Reader, allocator: mem.Allocator) -> (rec: Record, err
 		// expanded where they can be: a type this decoder does model can fail on
 		// something else entirely - a trailing byte, a length that disagrees -
 		// and come through here with a perfectly good pointer inside it.
-		rec.data = decode_raw_rdata(r.msg, rec.type, rdata_start, rdata_end, allocator)
+		rec.data = decode_raw_rdata(r, rec.type, rdata_start, rdata_end, allocator)
 		err = .None
 	}
 	r.pos = rdata_end
@@ -328,7 +375,7 @@ decode_rdata :: proc(
 		return Rdata_OPT{options = opts[:]}, .None
 	}
 
-	return decode_raw_rdata(r.msg, type, start, end, allocator), .None
+	return decode_raw_rdata(r, type, start, end, allocator), .None
 }
 
 // Cheap header peek for paths that only need the ID or the QR bit and do not

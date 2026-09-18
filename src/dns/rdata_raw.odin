@@ -94,10 +94,14 @@ Never fails: RDATA that does not walk cleanly - too short for its own layout, a
 name that will not decode or that runs past the end of the record, an expansion
 that would not fit an RDLENGTH - is copied exactly as it arrived. That is the
 decoder's standing posture for odd RDATA, and a record that cannot be understood
-here may still be the answer somebody wanted.
+here may still be the answer somebody wanted. A record whose expansion would
+pass the message's name budget lands here too, and its pointer travels on
+unexpanded - which matters only for the last record of a message, since the
+budget stays spent and the next owner name refuses the decode outright.
 */
 @(private)
-decode_raw_rdata :: proc(msg: []u8, type: Type, start, end: int, allocator: mem.Allocator) -> Rdata_Raw {
+decode_raw_rdata :: proc(r: ^Reader, type: Type, start, end: int, allocator: mem.Allocator) -> Rdata_Raw {
+	msg := r.msg
 	layout, known := raw_rdata_layout(type)
 	// Walking costs an allocation, and the overwhelming majority of raw RDATA
 	// has no pointer anywhere in it. Two set high bits are what a pointer starts
@@ -105,7 +109,7 @@ decode_raw_rdata :: proc(msg: []u8, type: Type, start, end: int, allocator: mem.
 	// worth attempting, since the byte may equally be part of a signature or a
 	// flags field.
 	if known && holds_pointer_byte(msg[start:end]) {
-		if expanded, ok := expand_rdata_names(msg, layout, start, end, allocator); ok {
+		if expanded, ok := expand_rdata_names(r, layout, start, end, allocator); ok {
 			return Rdata_Raw{data = expanded}
 		}
 	}
@@ -127,7 +131,7 @@ holds_pointer_byte :: proc "contextless" (rdata: []u8) -> bool {
 
 @(private)
 expand_rdata_names :: proc(
-	msg: []u8,
+	r: ^Reader,
 	layout: Raw_Layout,
 	start, end: int,
 	allocator: mem.Allocator,
@@ -135,6 +139,7 @@ expand_rdata_names :: proc(
 	out: []u8,
 	ok: bool,
 ) {
+	msg := r.msg
 	buf := make([dynamic]u8, 0, end - start + MAX_NAME_WIRE, allocator)
 	defer if !ok {
 		delete(buf)
@@ -170,6 +175,12 @@ expand_rdata_names :: proc(
 			return nil, false
 		}
 		defer delete(name, allocator)
+		// The expansion is thrown away once it has been written back out in
+		// wire form, but a decoder fed an arena does not get the bytes back, so
+		// it is charged like any other name. See `NAME_EXPANSION_FACTOR`.
+		if charge_name(r, len(name)) != .None {
+			return nil, false
+		}
 		if next > end {
 			return nil, false
 		}
