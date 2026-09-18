@@ -1,6 +1,7 @@
 package dnssec
 
 import "core:mem"
+import "core:slice"
 import "core:testing"
 import "core:time"
 import "elodin:dns"
@@ -27,8 +28,9 @@ the zone answers for. Both go out with AD=1 and into the cache.
 RFC 4592 section 4.7 is what makes this always a forgery rather than a case
 to be handled: a wildcard owns an NSEC of its own, but "synthesis of these
 records will only occur when the query exactly matches the record", so a denial
-record whose signature expanded is a denial record that was moved. Unbound rewrites the owner to the canonical
-one before verifying, for the same reason and with the same effect.
+record whose signature expanded is a denial record that was moved. Unbound
+rewrites the owner to the canonical one before verifying, for the same reason
+and with the same effect.
 
 `wdtest.` is the other side of the same routine. A DS RRset whose signature
 expanded would hand the chain walk a zone cut the parent never signed under
@@ -420,6 +422,19 @@ WC_FIXTURES := []Fixture{
 	},
 }
 
+/*
+What the chain walk sees, which is not always what the client was sent.
+
+Matched on name and type, first entry wins - and two fixtures here share
+`nx.wctest. DS` on purpose. `wc_nx_ds` is the honest denial the walk needs on
+its way down to that name; `wc_expanded_ds_answer` is an attack reply, handed
+to `validate` by key through `wc_reply` and never something an upstream should
+be answering a walk with. `wc_nx_ds` is listed first so the walk gets the
+denial, and `test_an_expanded_ds_or_soa_answer_is_not_secure_either` asserts
+that it still does: with the two swapped, the DS and NSEC repros quietly stop
+reproducing - every test still passes, because the message is refused a step
+earlier for an unrelated reason.
+*/
 @(private = "file")
 wc_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
 	for f in WC_FIXTURES {
@@ -628,8 +643,9 @@ test_a_relocated_wildcard_nsec_in_the_answer_is_not_secure :: proc(t: ^testing.T
 	What the proof does not say is that the answer's own NSEC belongs at that
 	owner, and RFC 4592 section 4.7 is why it never can: an NSEC at a wildcard
 	is synthesised "only ... when the query exactly matches the record", so an
-	expanded one was moved. Without the refusal the record goes out at AD=1, with a next-name
-	and a type bit map of the sender's choosing, saying `nx.wctest.` exists.
+	expanded one was moved. Without the refusal the record goes out at AD=1,
+	with a next-name and a type bit map of the sender's choosing, saying
+	`nx.wctest.` exists.
 	*/
 	result := wc_validate("wc_relocated_answer_nsec", "nx.wctest.", .NSEC)
 	testing.expectf(
@@ -661,6 +677,17 @@ test_an_expanded_ds_or_soa_answer_is_not_secure_either :: proc(t: ^testing.T) {
 	in the authority section; the answer section was the one place left that
 	took either, at AD=1.
 	*/
+	// The walk down to `nx.wctest.` asks for its DS, and both the denial and
+	// the attack are filed under that name and type. `wc_query` takes the
+	// first, so the order of the two decides whether what follows reproduces
+	// anything; see the comment on `wc_query`.
+	walked, answered := wc_query(nil, "nx.wctest.", .DS, context.temp_allocator)
+	testing.expect(
+		t,
+		answered && slice.equal(walked, wc_reply("wc_nx_ds")),
+		"the chain walk has to reach the denial at nx.wctest., not an attack reply filed under it",
+	)
+
 	ds := wc_validate("wc_expanded_ds_answer", "nx.wctest.", .DS)
 	testing.expectf(
 		t,
