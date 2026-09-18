@@ -813,6 +813,98 @@ test_the_sweep_does_not_wait_again_on_a_member_that_timed_out :: proc(t: ^testin
 }
 
 /*
+And a live spare standing behind a dead one is still asked.
+
+The bound is a share of one timeout each rather than a deadline the loop stops
+at, and this is why. A deadline is spent by whoever is asked first, so a group
+of `[refuses, not there, has the answer]` would spend it on the middle member
+and never reach the third - which is issue #309's own failure arriving through
+the bound meant to keep the fix affordable.
+
+Two members left, so each gets half of the group's timeout: the dead one is cut
+off at that and the one behind it answers.
+*/
+@(test)
+test_a_live_spare_behind_a_dead_one_is_still_asked :: proc(t: ^testing.T) {
+	refusing := Canned_Mock{}
+	ref, ref_thread, ref_ok := start_canned_mock(t, &refusing, "refusing", canned_reply(0, .Refused))
+	if !ref_ok {
+		return
+	}
+	defer {
+		sync.atomic_store(&refusing.stop, true)
+		thread.join(ref_thread)
+		thread.destroy(ref_thread)
+		net.close(refusing.socket)
+		destroy(ref)
+	}
+
+	answerer := Canned_Mock{}
+	good, good_thread, good_ok := start_canned_mock(t, &answerer, "answerer", canned_reply(0))
+	if !good_ok {
+		return
+	}
+	defer {
+		sync.atomic_store(&answerer.stop, true)
+		thread.join(good_thread)
+		thread.destroy(good_thread)
+		net.close(answerer.socket)
+		destroy(good)
+	}
+
+	dead_socket, derr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, derr == nil, "cannot bind the dead port: %v", derr) {
+		return
+	}
+	dead_bound, berr := net.bound_endpoint(dead_socket)
+	net.close(dead_socket)
+	if !testing.expectf(t, berr == nil, "cannot read the dead port: %v", berr) {
+		return
+	}
+	dead, uerr := make_upstream(
+		config.Upstream_Spec {
+			name = "not-there",
+			kind = .UDP,
+			address = "127.0.0.1",
+			port = dead_bound.port,
+		},
+		0,
+		time.Second,
+		context.allocator,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot build the dead upstream: %v", uerr) {
+		return
+	}
+	defer destroy(dead)
+
+	servers := make([]^Upstream, 3, context.allocator)
+	defer delete(servers, context.allocator)
+	servers[0] = ref
+	servers[1] = dead
+	servers[2] = good
+
+	g := Group {
+		servers   = servers,
+		strategy  = .Failover,
+		timeout   = 400 * time.Millisecond,
+		attempts  = 1,
+		allocator = context.allocator,
+	}
+
+	wire := canned_query()
+	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
+
+	resp, winner, err := resolve_readable(&g, wire, context.allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expectf(
+		t,
+		winner == good && dns.peek_rcode(resp) == .No_Error,
+		"the sweep stopped at the member that was not there, so the client got the REFUSED",
+	)
+	delete(resp, context.allocator)
+}
+
+/*
 And however many members a group has left, the sweep spends one timeout on them.
 
 The shape is a group of three whose first member answers REFUSED at once and

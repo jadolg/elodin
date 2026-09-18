@@ -214,8 +214,10 @@ resolve_insisting :: proc(
 ) {
 	// Scratch, on the request's own thread, whose arena the caller resets - and
 	// only ever as long as the group.
-	unreachable := make([dynamic]^Upstream, 0, len(g.servers), context.temp_allocator)
-	started := time.now()
+	// No capacity asked for: the fast path is a first reply the caller can use,
+	// where nothing is ever appended and this stays an empty header.
+	unreachable: [dynamic]^Upstream
+	unreachable.allocator = context.temp_allocator
 
 	response, winner, err = resolve(g, query, allocator, &unreachable)
 	if err != .None || acceptable(response) {
@@ -311,7 +313,40 @@ resolve_insisting :: proc(
 	*/
 	note_swept_rcode(winner)
 
-	asked := 0
+	/*
+	Each member the sweep will ask gets a share of one `g.timeout`, and that is
+	the whole of what the sweep may spend waiting.
+
+	What it bounds is the group with several spares it cannot reach: at the full
+	timeout apiece, a group of four would spend three of them - fifteen seconds
+	as elodin ships - and hand back the reply it had in the first millisecond,
+	holding one of a bounded set of query workers for the whole wait. A client
+	repeating one such name is then a way to empty the pool.
+
+	A share each rather than a deadline the loop breaks on, because a deadline
+	spends the budget on whoever happens to be first: one dead spare ahead of a
+	live one consumes it, and the member that had the answer is never asked -
+	which is issue #309's own failure, arriving through the bound meant to keep
+	the fix affordable. Divided, every remaining member is asked and the sum is
+	still one timeout.
+
+	The cost is that a slow member may be cut off in a large group, where the
+	full timeout would have waited for it. That is the right way round: this is
+	a second question about a name the group has already answered unusably, the
+	reply in hand is what it improves on, and a member that needs seconds is one
+	`resolve` gives its full timeout to on the next query anyway.
+	*/
+	candidates := 0
+	for u in g.servers {
+		if u != winner && !slice.contains(unreachable[:], u) && healthy(u) {
+			candidates += 1
+		}
+	}
+	share := g.timeout
+	if candidates > 1 {
+		share = g.timeout / time.Duration(candidates)
+	}
+
 	for u in g.servers {
 		if u == winner {
 			continue
@@ -342,44 +377,17 @@ resolve_insisting :: proc(
 			logx.debugf("upstream %s is in its cooldown, not asked again for this one", u.spec.name)
 			continue
 		}
-		/*
-		And the whole sweep is bounded by one `g.timeout`, however many members
-		are left.
-
-		What it is bounding is the group that has several spares and cannot
-		reach any of them: each costs the full timeout before the next is tried,
-		so a group of four would spend three of them - at the shipped five
-		seconds, fifteen - and hand back the reply it had in the first
-		millisecond. No stub is still listening by then, and each of those
-		queries holds one of a bounded set of workers for the whole wait, so a
-		client repeating one name is a way to empty the pool.
-
-		A budget rather than a count of exchanges, because what is worth
-		spending here is time and not attempts: a group whose spares answer in
-		milliseconds gets asked all of them, which is the case this sweep exists
-		for, and the exchange in flight when the budget runs out is allowed to
-		finish, so the worst of it is two timeouts rather than one.
-
-		The first member is asked regardless - `time.since` at that point is
-		whatever `resolve` spent, and a sweep that refused to ask anybody would
-		be no sweep at all.
-		*/
-		if asked > 0 && time.since(started) >= g.timeout {
-			logx.debugf(
-				"sweep for this query has spent %v, leaving %s and any after it unasked",
-				time.since(started),
-				u.spec.name,
-			)
-			break
-		}
-		asked += 1
-		resp, xerr := exchange(u, sweep_query(query), g.timeout, allocator)
+		resp, xerr := exchange(u, sweep_query(query), share, allocator)
 		if xerr != .None {
 			logx.debugf("upstream %s failed: %v", u.spec.name, xerr)
 			continue
 		}
-		report_swept_refusal(winner, response)
 		if acceptable(resp) {
+			// Said here rather than above, because what makes a filtering
+			// member's block bypassed is another member *answering* - a second
+			// REFUSED from behind the same ACL bypasses nothing, and warning
+			// about it would spend the one-shot line on it.
+			report_swept_refusal(winner, response)
 			// The rcode as a number: 4080 of the 4096 composed values have no
 			// name, and `%v` renders one of those as a placeholder - the same
 			// reading `unreadable_rcode_refusal` gives its own line.

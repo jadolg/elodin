@@ -1711,8 +1711,8 @@ the rcode is the client's, which is the right reading when the route was asked
 second and the wrong one here, where the parent was never given its turn; an
 internal authority that is up and failing is the deployment. An NXDOMAIN and a
 `DS` RRset are the two the parent is the authority for - what the public tree
-delegates, and whether it signs it - and a memory written by one unsettled reply must not be what
-decides the client hears the route's version of either.
+delegates, and whether it signs it - and a memory written by one unsettled reply
+must not be what decides the client hears the route's version of either.
 
 Asked and answered in both, rather than SERVFAILed with a leg untried. The
 parent's reply is used on the same terms the first exchange reads it on - only
