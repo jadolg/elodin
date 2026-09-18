@@ -60,17 +60,21 @@ shape by capping hash calculations per pass (`MAX_NSEC3_CALCULATIONS`, the
 CVE-2023-50868 fix) and this is that cap, counted across the question rather
 than per pass.
 
-8192 rounds is about 1.5 ms of SHA-1 on a current machine, which puts NSEC3
-hashing in the same order as the signature verifications
-`MAX_VERIFICATIONS_PER_QUERY` already allows, and a hundredth of what the
-paragraph above measures. Real traffic is nowhere near it: a zone following RFC
-9276 uses zero iterations, so a denial costs one round per name tried and a
-whole question tens. What the number has to leave room for is the other end of
-what is still legal - a zone at the iteration ceiling, asked about a name deep
-enough to walk eight ancestors - and that is around 6500 rounds with the reuse
-`Nsec3_Hashes` does. A question that wants more is answered `Indeterminate`,
-never `Bogus`: this is an allowance of ours running out, not a proof found
-wanting.
+A whole allowance measures at 2 ms of SHA-1 on this box, optimised, against the
+55 ms above, and it is 2 ms whichever way it is spent: the weighting is what
+makes the long salt no better a buy than the short one. That puts NSEC3 hashing
+in the same order as the signature verifications `MAX_VERIFICATIONS_PER_QUERY`
+already allows.
+
+Real traffic is nowhere near it. A zone following RFC 9276 uses zero
+iterations, so a denial costs one round per name tried and a whole question
+tens - the zones still publishing NSEC3 at the time of writing use zero, five
+and ten. What the number has to leave room for is the other end of what is
+still legal: a zone sitting at the iteration ceiling, where the chain walk and
+the denial together hash thirty-odd names, comes to around 3500 rounds with the
+reuse `Nsec3_Hashes` does. A question that wants more than the allowance is
+answered `Indeterminate`, never `Bogus`: this is an allowance of ours running
+out, not a proof found wanting.
 */
 MAX_NSEC3_ROUNDS_PER_QUERY :: 8192
 
