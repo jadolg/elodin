@@ -79,6 +79,23 @@ out, not a proof found wanting.
 MAX_NSEC3_ROUNDS_PER_QUERY :: 8192
 
 /*
+The largest iteration ceiling worth configuring.
+
+The ceiling refuses a record and `MAX_NSEC3_ROUNDS_PER_QUERY` refuses a
+question, and past this the second makes the first meaningless rather than
+stricter: a record at the ceiling carrying the longest salt costs four rounds
+per iteration, so above 511 the four hashes a single proof needs no longer fit
+in a whole allowance and every NSEC3 denial in every zone comes back
+`Indeterminate`. `config` refuses a number above this at load, because the
+symptom otherwise is a resolver that starts, says nothing about it, and answers
+SERVFAIL for every name in an NSEC3 zone.
+
+It leaves nothing anyone wants out of reach. RFC 9276 asks zones for zero, the
+default here is 100, and the zones still publishing NSEC3 use single digits.
+*/
+MAX_NSEC3_ITERATIONS_LIMIT :: MAX_NSEC3_ROUNDS_PER_QUERY / 16 - 1
+
+/*
 What one question is allowed to spend on NSEC3 hashing, and the ceiling it
 holds each record's iteration count to.
 
@@ -356,6 +373,19 @@ nsec3_proves_no_data :: proc(
 	}
 	wildcard, wildcard_found := nsec3_matching(n3s, wildcard_of(encloser, allocator), budget)
 	if !wildcard_found {
+		/*
+		The one place in this file where a scan finding nothing decides
+		something, and so the one place the allowance has to be read before the
+		result is. A scan this server stopped partway through says nothing about
+		what it did not reach, and reading it as "the zone publishes no wildcard
+		here" turns an unfinished proof into an insecure answer - the verdict
+		that serves the records rather than refusing them. Every other negative
+		below and above returns `Failed`, which the callers turn into
+		`Indeterminate` once they see `exhausted`, and this joins them.
+		*/
+		if budget.exhausted {
+			return .Failed
+		}
 		if cover.rr.flags & NSEC3_FLAG_OPT_OUT != 0 {
 			return .Opt_Out
 		}

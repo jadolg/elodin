@@ -2552,6 +2552,20 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	if cfg.dnssec.max_nsec3_iterations < 0 {
 		errorf(l, "dnssec.max_nsec3_iterations must not be negative")
 	}
+	/*
+	And not so high that the query-wide hashing allowance cannot pay for one
+	proof: see `dnssec.MAX_NSEC3_ITERATIONS_LIMIT`. A number above it reads as
+	a laxer setting and acts as a resolver that answers SERVFAIL for every name
+	in an NSEC3 zone, which is worth refusing here rather than discovering in
+	production.
+	*/
+	if cfg.dnssec.max_nsec3_iterations > dnssec.MAX_NSEC3_ITERATIONS_LIMIT {
+		errorf(
+			l,
+			"dnssec.max_nsec3_iterations must not exceed %d, past which one record's hashing outgrows what a whole query may spend",
+			dnssec.MAX_NSEC3_ITERATIONS_LIMIT,
+		)
+	}
 	// Parsed here rather than at startup so `--check` reports a bad anchor
 	// instead of a resolver that comes up refusing every name.
 	parsed_anchors := make([dynamic]dnssec.Trust_Anchor, 0, len(cfg.dnssec.trust_anchors), l.allocator)

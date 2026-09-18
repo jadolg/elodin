@@ -675,3 +675,40 @@ test_an_honest_nsec3_denial_hashes_each_name_once :: proc(t: ^testing.T) {
 	testing.expect(t, !budget.exhausted, "an eleven-record denial cannot be near the allowance")
 	free_all(context.temp_allocator)
 }
+
+/*
+A scan cut short by the allowance is not a record that is not there.
+
+`nsec3_proves_no_data` reads a missing wildcard as permission to fall back on
+the opt-out span, which is the one place in this file where a *negative* result
+from a scan decides anything. Hashing that ran out returns the same "not found"
+as hashing that finished, so a question whose meter emptied one hash before the
+wildcard was reached came back `Opt_Out` - served to the client as an insecure
+answer - where the whole proof says `Failed`. The records below hold the
+wildcard `*.w.example.` with MX set, so an MX question is a denial contradicted
+by the zone's own bit map: `Failed` with a whole allowance, and nothing less
+than `Failed` with part of one.
+*/
+@(test)
+test_nsec3_no_data_does_not_read_a_spent_allowance_as_an_absent_wildcard :: proc(t: ^testing.T) {
+	zone := a_zone()
+	for &record in zone {
+		record.rr.flags |= NSEC3_FLAG_OPT_OUT
+	}
+
+	whole := Nsec3_Budget {
+		max_iterations = A_ITERATIONS,
+	}
+	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.w.example.", "example.", .MX, &whole), Proof.Failed)
+	testing.expect(t, !whole.exhausted, "the proof should fit in a whole allowance")
+
+	// Everything up to the wildcard, and not the wildcard: the question, the
+	// walk's two names and the cover.
+	starved := Nsec3_Budget {
+		max_iterations = A_ITERATIONS,
+		rounds         = MAX_NSEC3_ROUNDS_PER_QUERY - 4 * (1 + A_ITERATIONS),
+	}
+	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.w.example.", "example.", .MX, &starved), Proof.Failed)
+	testing.expect(t, starved.exhausted, "the allowance should have been what stopped this")
+	free_all(context.temp_allocator)
+}

@@ -326,12 +326,13 @@ client as extended error 6, while `Indeterminate` says only that this server did
 not finish reading the proof. The same distinction every other allowance in
 `validate.odin` makes, made for the one that counts SHA-1.
 
-The proof itself is real captured traffic - com's NSEC3 denial for a name that
-is not there - so the only difference between the two calls below is the meter.
-The hashing runs out in the DS denial the walk down to the name reads, before
-the answer's own proof is reached, which is why the reason names the chain: the
-allowance is one allowance, and whichever proof reaches it first is the one that
-stops.
+The proof is real captured traffic - com's NSEC3 denial for a name that is not
+there - so the only difference between the two calls is the meter. What runs out
+here is the walk down to the name, whose DS denial is itself NSEC3, and it
+answers in `zone_trust`'s words. The other place the meter can empty is the
+answer's own proof, which com cannot reach: its chain is opt-out, so the walk
+settles the name as an unsigned delegation before any proof is read.
+`ds_apex_denial_test` has the signed NSEC3 denial that does reach it.
 */
 @(test)
 test_a_denial_that_runs_out_of_hashing_is_indeterminate :: proc(t: ^testing.T) {
@@ -339,8 +340,8 @@ test_a_denial_that_runs_out_of_hashing_is_indeterminate :: proc(t: ^testing.T) {
 	testing.expect(t, err == .None, "the captured denial should decode")
 
 	qname :: "zzzz-does-not-exist-xq7.com."
-	// A validator apiece, because what the first call learns about the zone is
-	// cached and the second would read the answer rather than work it out.
+	// A validator apiece, because what one call learns about the zone is cached
+	// and the next would read the answer rather than work it out.
 	base_v := test_validator()
 	defer destroy_validator(base_v)
 	fresh := Budget{}

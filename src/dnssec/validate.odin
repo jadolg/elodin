@@ -1703,6 +1703,12 @@ validate_denial :: proc(
 	`Bogus` would report our own limit to the client as a forgery - with its
 	address beside the word in the log.
 	*/
+	/*
+	The hashing allowance, and the same answer as the two above it. A proof this
+	server stopped hashing partway through is not a proof it found wanting, and
+	`Bogus` would report our own limit to the client as a forgery - with its
+	address beside the word in the log.
+	*/
 	if proof == .Failed && budget.nsec3.exhausted {
 		return {status = .Indeterminate, reason = "verification budget spent"}
 	}
