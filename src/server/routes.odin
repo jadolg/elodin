@@ -543,9 +543,10 @@ carried: SERVFAIL, REFUSED, a NOERROR somebody rewrote - the configuration
 answering rather than the network failing, which is the shape that never parks
 and therefore never stops costing.
 
-What the memory is not, even then, is a reason to stop asking. One answered
-reply is a long way from what parks an upstream - `FAILURE_THRESHOLD` consecutive
-failures - so the group it skips may be answering everything else perfectly well.
+What the memory is not, even then, is a reason to stop asking. What it stands on
+is `upstream.FAILURE_THRESHOLD` unsettled replies in a row - the count that parks
+an upstream, borrowed because the question is the same one - and a group that
+answers everything else perfectly well can still reach it.
 `resolve_query` reaches past it for that reason, and the test it reaches on is
 this memory's own bet: that what the route has to say is the unsigned twin of the
 proof, a NODATA at the apex, which is the answer the parent's silence would have
@@ -563,8 +564,8 @@ file will not pretend away: where the parent recovers inside the window *and* th
 route answered the NODATA, the client is handed the route's unsigned one rather
 than the parent's signed proof, for as long as the window holds. That is the
 trade issue #243 asks for in as many words, and it is bounded on every side - one
-`upstream.COOLDOWN`, one apex, and only after the parent itself replied without
-settling anything.
+`upstream.COOLDOWN`, one apex, a zone the operator did not anchor, and only after
+the parent itself replied three times running without settling anything.
 
 The window it closes is between one probe and the next, not around the probe
 itself. Nothing is written until the parent's leg returns, so queries that arrive
@@ -590,38 +591,64 @@ Apex_Memo :: struct {
 Apex_Memo_Slot :: struct {
 	// A route's own domain string, which outlives the request; see
 	// `route_apex_name`. Empty in a slot nothing has claimed.
-	name:  string,
-	// When this stops being remembered. The zero value is in the past, which is
-	// what makes a cleared slot read as no memory at all.
-	until: time.Time,
+	name:    string,
+	// When this stops being remembered, and until when the count below stays
+	// consecutive. The zero value is in the past, which is what makes a cleared
+	// slot read as no memory at all.
+	until:   time.Time,
+	// Unsettled replies in a row inside the window, against
+	// `upstream.FAILURE_THRESHOLD`. See `apex_ds_parent_unsettled`.
+	strikes: int,
 }
 
 /*
 Whether the memory may answer for the parent's group here at all.
 
-The window is the whole of it wherever the route's answer can be served, and
-`validating` is where it cannot. A routed zone is served insecure - that is what
-`served_locally` does, and what this memory bets on when it lets the route's
-unsigned NODATA stand in for the parent's signed proof - unless the operator
-anchored the zone themselves, which is a request to hold it to the public chain
-and which `covered_by_local_anchor` honours by leaving `validating` on. The route
-has no signatures to offer that chain, so its answer is not a stand-in for the
-proof there but a Bogus verdict and a SERVFAIL, and a memory of one unsettled
-reply would spend a whole cooldown of them while the parent was healthy and
-holding what the client asked for. `routes.odin`'s own summary of anchoring a
-routed zone - an insecure answer traded for SERVFAIL - is what that operator
-asked for, and this must not make the trade for them ten seconds at a time.
+The window is the whole of it wherever the route's answer can be served, and an
+anchor over the zone is where it cannot. A routed zone is served insecure - that
+is what `served_locally` does, and what this memory bets on when it lets the
+route's unsigned NODATA stand in for the parent's signed proof - unless the
+operator anchored the zone themselves, which is a request to hold exactly these
+names to the public chain. The route has no signatures to offer that chain, so
+its answer there is a Bogus verdict and a SERVFAIL rather than a stand-in, and a
+memory would spend a whole cooldown of them while the parent was healthy and
+holding what the client asked for. `routes.odin`'s summary of anchoring a routed
+zone - an insecure answer traded for SERVFAIL - is what that operator asked for,
+and this must not make the trade for them ten seconds at a time.
+
+`covered_by_local_anchor` rather than `resolve_query`'s `validating`, which is
+the same fact for an ordinary query and not for every query. `validating` also
+goes false when the client sets CD, and a downstream resolver doing its own
+validation is exactly who sets it - it wants the signed proof to check, and it is
+the party an anchor over a routed zone is configured for. It goes false again
+when the validator could not be built. Neither is a statement that this zone's
+unsigned answer will do, and the zone is what this asks about.
 
 The skip above it is the same shape with no such choice: a parent whose every
 member is parked cannot be asked instead, so the route's answer, validated or
 not, is all there is.
 */
 @(private)
-apex_ds_memo_applies :: proc(s: ^Server, name: string, validating: bool) -> bool {
-	return !validating && apex_ds_parent_unsettled(s, name)
+apex_ds_memo_applies :: proc(s: ^Server, name: string) -> bool {
+	return !covered_by_local_anchor(s, name) && apex_ds_parent_unsettled(s, name)
 }
 
-// Whether the parent's group failed to settle this apex `DS` inside the window.
+/*
+Whether the parent's group has failed to settle this apex `DS` often enough,
+recently enough, to be passed over for it.
+
+`upstream.FAILURE_THRESHOLD` consecutive unsettled replies inside the window, the
+same count that parks an upstream and for the same reason: one reply is a blip,
+and the blip is exactly the case where the next query reaches a parent that has
+come back and is holding the proof. Three in a row inside ten seconds is a
+parent that is not going to settle this delegation today - the ACL, the CPE
+resolver that mangles every `DS` - which is the shape this memory is for.
+
+The window does double duty, and deliberately: it is how long a memory stands and
+how long the count that built it stays consecutive. A slot whose window has run
+out starts again at one, so a parent that stumbles once an hour never accumulates
+its way into being skipped.
+*/
 @(private)
 apex_ds_parent_unsettled :: proc(s: ^Server, name: string) -> bool {
 	now := time.now()
@@ -629,7 +656,7 @@ apex_ds_parent_unsettled :: proc(s: ^Server, name: string) -> bool {
 	defer sync.mutex_unlock(&s.apex_memo.mu)
 	for slot in s.apex_memo.slots {
 		if slot.name != "" && dns.name_equal_fold(slot.name, name) {
-			return time.diff(now, slot.until) > 0
+			return slot.strikes >= upstream.FAILURE_THRESHOLD && time.diff(now, slot.until) > 0
 		}
 	}
 	return false
@@ -643,8 +670,15 @@ without it: a parent that never replied established nothing to remember, for the
 reason `Apex_Memo` gives. Not even a clearing - an existing memory of a parent
 that would not settle this apex is not disproved by a datagram going missing.
 
+Nor is anything written for a zone the operator anchored, which is the same
+question `apex_ds_memo_applies` asks before reading one. A memory that can never
+be acted on is not free: the table is a fixed size, and an entry in it is a slot
+an apex that would have been spared the wait does not get.
+
 `settled` is `parent_answers_apex_ds`'s second return read straight: true and the
-slot is cleared, false and the route is asked first for one `upstream.COOLDOWN`.
+slot is cleared, false and it counts as one more reply in a row that settled
+nothing - `upstream.FAILURE_THRESHOLD` of them inside the window and the route is
+asked first for the rest of it.
 
 The slot chosen is this apex's own where it has one, and otherwise the one whose
 memory expires soonest - which takes an unclaimed slot first, its zero `until`
@@ -657,7 +691,7 @@ remember_apex_ds_parent :: proc(s: ^Server, name: string, reached, settled: bool
 		return
 	}
 	apex, found := route_apex_name(s, name)
-	if !found {
+	if !found || covered_by_local_anchor(s, apex) {
 		return
 	}
 	sync.mutex_lock(&s.apex_memo.mu)
@@ -684,9 +718,17 @@ remember_apex_ds_parent :: proc(s: ^Server, name: string, reached, settled: bool
 		s.apex_memo.slots[victim] = {}
 		return
 	}
+	now := time.now()
+	// Consecutive means inside the window: a slot whose own has run out is a
+	// count that expired with it, and this reply is the first of the next one.
+	strikes := 1
+	if s.apex_memo.slots[victim].name == apex && time.diff(now, s.apex_memo.slots[victim].until) > 0 {
+		strikes = s.apex_memo.slots[victim].strikes + 1
+	}
 	s.apex_memo.slots[victim] = {
-		name  = apex,
-		until = time.time_add(time.now(), upstream.COOLDOWN),
+		name    = apex,
+		until   = time.time_add(now, upstream.COOLDOWN),
+		strikes = strikes,
 	}
 }
 

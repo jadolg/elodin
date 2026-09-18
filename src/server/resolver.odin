@@ -1592,7 +1592,7 @@ resolve_query :: proc(
 			logx.debugf("query DS %s: the parent's group is parked, asking the route instead", q.name)
 			asked = own
 			unproven_apex_ds = true
-		} else if apex_ds_memo_applies(s, q.name, validating) {
+		} else if apex_ds_memo_applies(s, q.name) {
 			logx.debugf(
 				"query DS %s: the parent's group settled nothing for this apex inside the last cooldown, asking the route instead",
 				q.name,
