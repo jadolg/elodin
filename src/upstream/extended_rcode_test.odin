@@ -1210,3 +1210,104 @@ test_a_member_that_fails_for_free_does_not_end_the_sweep :: proc(t: ^testing.T) 
 	testing.expect(t, healthy(stuck), "the unresolvable member parked after all, so this is not the case it says")
 	testing.expect_value(t, stats_of(stuck).failures, u64(0))
 }
+
+/*
+And the budget counts a slow answer too, not only a silence.
+
+What is being bounded is the client's wait, and an upstream can spend it either
+way: a recursor that works on a name for most of the timeout and then says
+SERVFAIL has cost this query exactly what one that said nothing did. A budget
+charged only for failures would let a group of those spend a timeout apiece -
+the arrangement the bound exists for, arrived at by the commoner road, since a
+loaded recursor answering SERVFAIL slowly is a great deal more usual than four
+dead spares.
+
+Four members that each sit on the query for most of the timeout and then refuse
+it, behind one that refuses at once. Unbounded that is four of those waits; the
+assertion is that the sweep stops after two, having spent its timeout.
+*/
+@(test)
+test_the_budget_counts_a_slow_refusal_as_time_spent :: proc(t: ^testing.T) {
+	TIMEOUT :: 400 * time.Millisecond
+	SLOW :: 300 * time.Millisecond
+	SLOW_MEMBERS :: 4
+
+	refusing := Canned_Mock{}
+	ref, ref_thread, ref_ok := start_canned_mock(t, &refusing, "refusing", canned_reply(0, .Refused))
+	if !ref_ok {
+		return
+	}
+	defer {
+		sync.atomic_store(&refusing.stop, true)
+		thread.join(ref_thread)
+		thread.destroy(ref_thread)
+		net.close(refusing.socket)
+		destroy(ref)
+	}
+
+	// Heap rather than the stack: the responder threads read their mocks until
+	// they are stopped below, and a slice keeps each one's address stable.
+	mocks := make([]Canned_Mock, SLOW_MEMBERS, context.allocator)
+	defer delete(mocks, context.allocator)
+	threads := make([]^thread.Thread, SLOW_MEMBERS, context.allocator)
+	defer delete(threads, context.allocator)
+	slow := make([]^Upstream, SLOW_MEMBERS, context.allocator)
+	defer delete(slow, context.allocator)
+
+	started := 0
+	defer for i in 0 ..< started {
+		sync.atomic_store(&mocks[i].stop, true)
+		thread.join(threads[i])
+		thread.destroy(threads[i])
+		net.close(mocks[i].socket)
+		destroy(slow[i])
+	}
+
+	for i in 0 ..< SLOW_MEMBERS {
+		mocks[i] = Canned_Mock {
+			delay = SLOW,
+		}
+		u, th, ok := start_canned_mock(t, &mocks[i], "slow", canned_reply(0, .Refused))
+		if !ok {
+			return
+		}
+		slow[i] = u
+		threads[i] = th
+		started += 1
+	}
+
+	servers := make([]^Upstream, SLOW_MEMBERS + 1, context.allocator)
+	defer delete(servers, context.allocator)
+	servers[0] = ref
+	for i in 0 ..< SLOW_MEMBERS {
+		servers[i + 1] = slow[i]
+	}
+
+	g := Group {
+		servers   = servers,
+		strategy  = .Failover,
+		timeout   = TIMEOUT,
+		attempts  = 1,
+		allocator = context.allocator,
+	}
+
+	wire := canned_query()
+	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
+
+	begin := time.now()
+	resp, winner, err := resolve_readable(&g, wire, context.allocator)
+	spent := time.since(begin)
+
+	testing.expect_value(t, err, Error.None)
+	testing.expect_value(t, winner, ref)
+	testing.expect_value(t, dns.peek_rcode(resp), dns.Rcode.Refused)
+	delete(resp, context.allocator)
+
+	// Two slow members is 600ms against a 400ms budget; four would be 1.2s.
+	testing.expectf(
+		t,
+		spent < 3 * SLOW,
+		"the sweep took %v, so a slow refusal was not charged to its budget",
+		spent,
+	)
+}

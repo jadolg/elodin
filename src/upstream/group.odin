@@ -315,8 +315,10 @@ resolve_insisting :: proc(
 
 	/*
 	And the sweep has one `g.timeout` of waiting to spend, counted as it spends
-	it: a member that fails costs whatever it took to fail, and once the total
-	reaches the budget the members after it are left alone.
+	it: every exchange costs what it took, answered or not, and once the total
+	reaches the budget the members after it are left alone. Answered or not,
+	because a member that recurses for most of the timeout and then says
+	SERVFAIL has cost this query what a member that said nothing did.
 
 	What that bounds is the group of several spares none of which can be
 	reached. At the full timeout apiece a group of four spends three of them -
@@ -381,16 +383,14 @@ resolve_insisting :: proc(
 		}
 		before := time.now()
 		resp, xerr := exchange(u, sweep_query(query), g.timeout, allocator)
+		// Charged whatever the exchange did, because what is being bounded is
+		// the client's wait and an upstream can spend the time either way: a
+		// member that recurses for most of the timeout and then says SERVFAIL
+		// has cost this query exactly what a member that said nothing did.
+		spent += time.since(before)
 		if xerr != .None {
-			spent += time.since(before)
 			logx.debugf("upstream %s failed: %v", u.spec.name, xerr)
-			if spent >= g.timeout {
-				logx.debugf("the sweep for this query has waited %v, leaving the rest of the group unasked", spent)
-				break
-			}
-			continue
-		}
-		if acceptable(resp) {
+		} else if acceptable(resp) {
 			// Said here rather than above, because what makes a filtering
 			// member's block bypassed is another member *answering* - a second
 			// REFUSED from behind the same ACL bypasses nothing, and warning
@@ -410,8 +410,13 @@ resolve_insisting :: proc(
 			// where this is a no-op; it matters where one is not.
 			_ = delete(response, allocator)
 			return resp, u, .None
+		} else {
+			_ = delete(resp, allocator)
 		}
-		_ = delete(resp, allocator)
+		if spent >= g.timeout {
+			logx.debugf("the sweep for this query has waited %v, leaving the rest of the group unasked", spent)
+			break
+		}
 	}
 
 	// Nobody could answer. The first reply stands, rcode and all: the caller
@@ -624,6 +629,14 @@ refusal_reported: bool
 @(private)
 report_swept_refusal :: proc(u: ^Upstream, response: []u8) {
 	if dns.peek_rcode(response) != .Refused {
+		return
+	}
+	// And only where the reply really said nothing. `resolve_insisting` is
+	// shared with the chain lookups, whose `answerable` takes NOERROR and
+	// NXDOMAIN alone - so a REFUSED carrying a policy code is swept there, and
+	// a line saying it carried none would be false and would spend the one
+	// warning this process has on saying so.
+	if extended_error_within(response, POLICY_EDE_FIRST, POLICY_EDE_LAST) {
 		return
 	}
 	if sync.atomic_exchange(&refusal_reported, true) {
