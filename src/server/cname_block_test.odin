@@ -848,7 +848,7 @@ A malformed record in a section the walk never reads does not cost the answer.
 The walk reads the answer section. The cache reads the whole message, so a
 record it cannot parse anywhere means the answer is not stored - which is fine,
 and was always the behaviour. What is not fine is refusing to *serve* it: for a
-round this gate was `!have_decoded`, which is the whole message, so one bad
+round this gate was the whole-message decode having failed, so one bad
 RDLENGTH in an additional section turned a clean, walkable answer into SERVFAIL,
 and only once blocking was on.
 

@@ -1787,13 +1787,6 @@ resolve_query :: proc(
 		resp = present_response(resp, msg, q.type, result, allocator)
 	}
 
-	// Before the cache, not after it: an answer stored first is one every later
-	// client is served without this running again. See `rebind.odin`.
-	if out, detail, blocked := rebind_refusal(s, msg, q, resp, limit, allocator); blocked {
-		log_query(s, client, proto, q, .Blocked, detail, started)
-		return out, .Blocked, true
-	}
-
 	/*
 	The TTLs bounded once, here, so the client's copy and the entry's are the
 	same bytes.
@@ -1829,10 +1822,15 @@ resolve_query :: proc(
 	wire afterwards would leave the two disagreeing about the same answer, with
 	the entry outliving what its own bytes tell a client.
 
-	After the rebinding refusal, not before it. An answer that refusal turns
-	back is replaced wholesale, so bounding its TTLs first is work done on bytes
-	nobody is handed - and `rebind.odin` reads the answer section, not the TTLs,
-	so nothing it decides changes by waiting.
+	Before the rebinding refusal, where this used to run after it. The argument
+	for the old order was that an answer the refusal turns back is replaced
+	wholesale, so bounding its TTLs first is work done on bytes nobody is handed.
+	That is true and it is worth a walk of the answers this server refuses; what
+	it cost was a whole decode of the answers it does not. The refusal reads the
+	same message the cache reads, the cache's reading has to be of the bytes as
+	they now stand - the paragraph above - and so the one decode that serves both
+	can only sit below this. `rebind.odin` reads addresses and not TTLs, so
+	nothing either of them decides changes by the swap.
 
 	Best-effort, and it does not refuse. `dns.cap_ttls` bounds every record it
 	can read and stops at the first it cannot, which for the malformed messages
@@ -1852,44 +1850,62 @@ resolve_query :: proc(
 	dns.cap_ttls(resp, cache.ttl_ceiling(s.answers))
 
 	/*
-	Decoded once for the two things below that both need it: the chain walk reads
-	the answer section, and the cache reads the whole message. Decoding for each
-	of them separately meant a second full pass over every forwarded response,
-	which is the one part of this that every query pays for.
+	Decoded once for the three things below that read it: the rebinding check
+	looks through the answer section for private addresses, the chain walk reads
+	that same section, and the cache reads the whole message. Decoding for each
+	of them separately meant two or three full passes over every forwarded
+	response, which is the one part of this that every query pays for.
 
-	Skipped when neither of them will run, which is the only arrangement that was
+	Skipped when none of them will run, which is the only arrangement that was
 	not already paying for a decode here.
+
+	The answer-section fallback is attempted only for the two readers that can
+	use one. With the cache the only reader, a message that would not decode in
+	full is simply not stored, and a second attempt at it buys nothing.
 	*/
-	decoded: dns.Message
-	have_decoded := false
+	checking_rebind := rebind_reads_answer(s, q)
 	walking := s.cfg.blocking.enabled && s.filters != nil
-	if s.cfg.cache.enabled || walking {
-		if d, dec_err := dns.decode_message(resp, allocator); dec_err == .None {
-			decoded, have_decoded = d, true
+	decoded: Decoded_Answer
+	if s.cfg.cache.enabled || walking || checking_rebind {
+		decoded = decode_answer(resp, walking || checking_rebind, allocator)
+	}
+
+	/*
+	Before the cache, not after it: an answer stored first is one every later
+	client is served without this running again. See `rebind.odin`, and
+	`test_a_refused_answer_is_not_cached`, which is what says so.
+
+	Below the decode rather than above it now, which is the same position in the
+	order - nothing between here and where this used to sit stores anything or
+	changes what the guard reads.
+	*/
+	if checking_rebind {
+		if out, detail, blocked := rebind_refusal(s, msg, q, decoded, limit, allocator); blocked {
+			log_query(s, client, proto, q, .Blocked, detail, started)
+			return out, .Blocked, true
 		}
 	}
 
 	/*
 	What the walk needs is the answer section, and only that.
 
-	Read separately from the decode above, which wants the whole message because
-	the cache stores the whole message. Holding the walk to that standard turned
-	one malformed record in an authority or additional section - sections the
-	walk never looks at - into SERVFAIL for a name whose answer section was
-	clean, and only once blocking was on. That is not the check failing closed,
-	it is the check refusing an answer it had no opinion about.
+	Which is why the decode above keeps a reading that stops there. Holding the
+	walk to the whole-message standard the cache needs turned one malformed
+	record in an authority or additional section - sections the walk never looks
+	at - into SERVFAIL for a name whose answer section was clean, and only once
+	blocking was on. That is not the check failing closed, it is the check
+	refusing an answer it had no opinion about.
 
-	Only reached when the full decode already failed, so the common path pays
-	nothing for it.
+	`walking` is asked again on the fallback because the reading is also made for
+	the rebinding check above, which has a rule of its own about when a half-read
+	message is enough. Taking it unguarded here would hand the walk a fallback it
+	never asked for, and with blocking off would put `block_cloaked_answer` on a
+	path it does not run on today.
 	*/
+	walkable := decoded.full || (walking && decoded.partial)
 	walk_answer: []dns.Record
-	walkable := have_decoded
-	if have_decoded {
-		walk_answer = decoded.answer
-	} else if walking {
-		if d, dec_err := dns.decode_through_answer(resp, allocator); dec_err == .None {
-			walk_answer, walkable = d.answer, true
-		}
+	if walkable {
+		walk_answer = decoded.msg.answer
 	}
 
 	/*
@@ -2001,22 +2017,24 @@ resolve_query :: proc(
 			allocator,
 		); verdict != .Clear {
 			/*
-			`have_decoded`, not `walkable`. The two part company for an answer
-			whose section beyond the answer would not parse: the walk runs on the
-			partial decode, and `decoded` is still the zero message it was
-			declared as.
+			`decoded.full`, not `walkable`. The two part company for an answer
+			whose sections past the answer would not parse: the walk runs on the
+			partial reading, and `decoded.msg` is then the answer section alone
+			rather than the whole message these bytes hold.
 
-			Storing from that puts an entry in built from nothing to do with
-			these bytes. `scan_ttl_offsets` is far more forgiving than the
+			Storing from that puts an entry in whose account of itself came from
+			sections that were never read. `cache.put` takes the decode as the
+			description of the wire beside it - what the rcode means, whether
+			the answer redirects, how long any of it is good for - and a reading
+			that stopped after the answer section has no authority section, so a
+			denial arrives with no SOA in it and is given the fallback lifetime
+			rather than the one its own zone set. Nothing further on notices the
+			disagreement: `scan_ttl_offsets` is far more forgiving than the
 			decoder - it follows no compression pointers and bounds no name - so
-			it succeeds on the real wire and the entry goes in with
-			`redirects = false` and a lifetime derived as if the answer were a
-			denial. `redirects = false` is the trap: `get` computes `recheck`
-			from it, so the entry can never be re-walked, and the refusal it
-			carries is replayed on every hit until it expires. An operator who
-			then writes the documented allow rule and reloads gets nothing - the
-			name stays blocked against the very rule meant to release it, which
-			is the opposite of the invariant the comment above states.
+			it succeeds on the real wire and the entry goes in looking sound.
+			Add the refusal this particular store stamps on it and that reading
+			is replayed on every hit until it expires, against bytes that say
+			something else.
 
 			So it is not cached at all in that case. The next query for the name
 			asks the upstream again, which is what happened before any of this
@@ -2055,10 +2073,10 @@ resolve_query :: proc(
 			for.
 			*/
 			if s.cfg.cache.enabled &&
-			   have_decoded &&
+			   decoded.full &&
 			   !unproven_apex_ds &&
 			   cloak_verdict_worth_keeping(verdict) {
-				cache.put(s.answers, key, resp, decoded, generation, u8(verdict))
+				cache.put(s.answers, key, resp, decoded.msg, generation, u8(verdict))
 			}
 			return out, cloak_outcome(verdict), true
 		}
@@ -2092,8 +2110,8 @@ resolve_query :: proc(
 	happened before any of this was memoised, and the one that reaches a parent
 	willing to speak stores what it said.
 	*/
-	if s.cfg.cache.enabled && have_decoded && !unproven_apex_ds {
-		cache.put(s.answers, key, resp, decoded, generation)
+	if s.cfg.cache.enabled && decoded.full && !unproven_apex_ds {
+		cache.put(s.answers, key, resp, decoded.msg, generation)
 	}
 
 	sync.atomic_add(&s.stats.forwarded, 1)
@@ -2108,6 +2126,71 @@ resolve_query :: proc(
 	settle_ad_bit(resp, msg, validating)
 	log_query(s, client, proto, q, .Forwarded, answering_upstream(winner), started)
 	return resp, .Forwarded, true
+}
+
+/*
+The forwarded response, decoded once for everything on this path that reads it.
+
+Three things do, and they do not all want the same reading. The cache stores the
+whole message, and will not store one it could not read in full. The chain walk
+and the rebinding check read the answer section, and refusing what they were
+about to check over a malformed record in a section neither of them looks at
+would take down a name that resolves today - so when the whole message will not
+decode they are offered `decode_through_answer`'s reading instead, which stops
+after the answer section and is the most of the message a stub reads anyway.
+
+`msg` holds whichever reading was got, and the two flags say which it is. Both
+false is a response this server cannot read at all; what to do about that is each
+reader's own decision, and they differ - the cache declines to store it, the walk
+answers SERVFAIL for a name it was going to check, the rebinding guard refuses it
+as unreadable.
+
+Both errors are kept because the rebinding guard reports the one that stopped it,
+and which of the two that is depends on how far it got. See `rebind_readable`.
+*/
+@(private)
+Decoded_Answer :: struct {
+	// The reading, whole or answer-section-only. The zero message when neither
+	// flag below is set.
+	msg:         dns.Message,
+	// The whole message read.
+	full:        bool,
+	// The answer section alone, read because the whole message would not.
+	// Never set together with `full`.
+	partial:     bool,
+	// What stopped the whole-message decode, and what stopped the shorter one.
+	// `.None` where the decode was not attempted.
+	full_err:    dns.Decode_Error,
+	partial_err: dns.Decode_Error,
+}
+
+/*
+Read the response as far as this query's readers need it.
+
+`answer_section` says whether anything is going to read the answer section on its
+own, which is the chain walk and the rebinding check. It is what decides whether
+the shorter decode is worth attempting: with the cache the only reader there is
+nothing to fall back to, since an entry is built out of the whole message or not
+made at all.
+*/
+@(private)
+decode_answer :: proc(resp: []u8, answer_section: bool, allocator: mem.Allocator) -> (out: Decoded_Answer) {
+	whole, err := dns.decode_message(resp, allocator)
+	if err == .None {
+		out.msg, out.full = whole, true
+		return out
+	}
+	out.full_err = err
+	if !answer_section {
+		return out
+	}
+	answer, answer_err := dns.decode_through_answer(resp, allocator)
+	if answer_err == .None {
+		out.msg, out.partial = answer, true
+	} else {
+		out.partial_err = answer_err
+	}
+	return out
 }
 
 /*
@@ -2424,7 +2507,7 @@ serve_from_cache :: proc(
 	if hit.recheck {
 		// The entry decoded once already, on the way in, so this is the copy being
 		// decoded rather than a question of whether it can be. That rests on the
-		// two `have_decoded` guards at the stores above and not on anything
+		// two `decoded.full` guards at the stores above and not on anything
 		// `cache.put` checks: `put` never decodes, it takes an already-decoded
 		// message and trusts it to describe the bytes beside it. A third store
 		// written without that guard would break this quietly.
@@ -2466,7 +2549,7 @@ serve_from_cache :: proc(
 			// not been looked at, and stamping it here would say it had - which
 			// is the one way this mechanism could come to skip a walk it owed.
 			// Unreachable as things stand, because both stores are guarded on
-			// `have_decoded`, and not a thing to leave resting on that.
+			// `decoded.full`, and not a thing to leave resting on that.
 			cache.note_checked(s.answers, hit.key, hit.serial, hit.checked, u8(Cloak_Verdict.Clear))
 		} else {
 			/*
