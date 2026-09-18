@@ -21,6 +21,7 @@ client that never asked for DNSSEC records has them taken back out.
 // which is the only place there is to put them.
 EDE_DNSSEC_BOGUS :: 6
 EDE_NO_REACHABLE_AUTHORITY :: 22
+EDE_UNSUPPORTED_NSEC3_ITERATIONS :: 27
 
 /*
 Build the validator and wire it to the upstream group.
@@ -494,8 +495,14 @@ The answer for a question whose response did not check out.
 
 SERVFAIL is the only correct reply: an answer that cannot be authenticated must
 not reach the client, and there is nothing else to send. The extended error says
-which of the two reasons it was, so the difference between a forged answer and
-an unreachable parent zone is visible from the client side.
+which reason it was, so the difference between a forged answer, an unreachable
+parent zone and a zone asking for more hashing than this server does is visible
+from the client side.
+
+The third has a code of its own (RFC 8914 section 4.28) and is worth using:
+"no reachable authority" over a zone whose NSEC3 iteration count is past the
+ceiling sends whoever is debugging it to look at connectivity, which is the one
+thing that is fine.
 */
 @(private)
 dnssec_failure_response :: proc(
@@ -507,7 +514,13 @@ dnssec_failure_response :: proc(
 	out: []u8,
 	ok: bool,
 ) {
-	code := u16(EDE_DNSSEC_BOGUS) if result.status == .Bogus else u16(EDE_NO_REACHABLE_AUTHORITY)
+	code := u16(EDE_NO_REACHABLE_AUTHORITY)
+	switch {
+	case result.status == .Bogus:
+		code = u16(EDE_DNSSEC_BOGUS)
+	case result.reason == dnssec.NSEC3_OVER_CEILING:
+		code = u16(EDE_UNSUPPORTED_NSEC3_ITERATIONS)
+	}
 	resp := dns.make_response(query, .Serv_Fail, allocator)
 	attach_extended_error(&resp, code, result.reason, allocator)
 

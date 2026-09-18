@@ -182,6 +182,63 @@ is per client question: two queries arriving at once each get their own.
 Budget :: struct {
 	lookups:       int,
 	verifications: int,
+	/*
+	Why the walk gave up, written where it gave up.
+
+	`zone_trust` reports one `Indeterminate` for every allowance a walk can run
+	out of, and what a client is told about it - the extended error on the
+	answer - comes from the reason beside it. Working that out afterwards from
+	the counters gets it wrong, because a step can be refused a hash and decide
+	anyway: a zone mid-rollover raises the NSEC3 count at one label and a
+	lookup fails five labels later, and the counters then say the hashing did
+	it. So each place that gives up says so in its own words, the last writer is
+	the step that stopped the walk, and `zone_trust` clears it on the way in so
+	nothing older can be read as this walk's.
+	*/
+	walk_stopped:  string,
+	// The hashing a denial proved with NSEC3 may spend, which no count of
+	// lookups or verifications bounds: see `MAX_NSEC3_ROUNDS_PER_QUERY`.
+	nsec3:         Nsec3_Budget,
+}
+
+/*
+Why a walk that came back `Indeterminate` stopped, in the words of the step that
+stopped it.
+
+"chain of trust unavailable" is the fallback and the truth for most of them - a
+lookup that could not be made, a parent that did not answer. The allowances can
+be said more precisely, and saying them is worth a line, because this reason is
+what picks the extended error the client is handed: the walk is where a zone
+whose NSEC3 iteration count is past the ceiling is met first, since every name
+inside one reaches its DS denial before the answer's own proof is read, so
+without this the precise code would be the one nobody ever sees.
+*/
+@(private)
+walk_reason :: proc(budget: ^Budget) -> string {
+	return budget.walk_stopped if budget.walk_stopped != "" else "chain of trust unavailable"
+}
+
+// Give up on a step, saying why. The words reach the client as an extended
+// error, so they are the ones an operator would want to read first.
+@(private)
+walk_gave_up :: proc(budget: ^Budget, reason: string) -> Step {
+	budget.walk_stopped = reason
+	return .Indeterminate
+}
+
+/*
+What one client question starts with.
+
+The counters begin at zero and the NSEC3 ceiling comes from the validator, which
+is the one field a `Budget{}` cannot supply for itself. Made here rather than at
+the call site so that the ceiling an operator configured cannot be dropped on the
+way to the proof that reads it: an allowance built without it refuses every
+record asking for any iterations at all, which fails closed and fails loudly
+rather than quietly validating at a number nobody chose.
+*/
+@(private)
+query_budget :: proc(v: ^Validator) -> Budget {
+	return {nsec3 = {max_iterations = v.max_nsec3_iterations}}
 }
 
 /*
@@ -306,7 +363,24 @@ make_validator :: proc(
 	v.query = query
 	v.query_ctx = query_ctx
 	v.anchors = opts.anchors if len(opts.anchors) > 0 else root_anchors()
+	/*
+	The ceiling belongs to the same arithmetic as the allowance, so it is held
+	to `MAX_NSEC3_ITERATIONS_LIMIT` here rather than wherever the option came
+	from. Above that the allowance is what answers - the zones a higher ceiling
+	admits are the ones whose proofs it cannot pay for - so a bigger number can
+	only turn zones that were being served as insecure into SERVFAIL. Held down
+	rather than refused, and said out loud, because refusing is a resolver that
+	does not come up after an upgrade, which is worse than either.
+	*/
 	v.max_nsec3_iterations = opts.max_nsec3_iterations if opts.max_nsec3_iterations > 0 else DEFAULT_MAX_NSEC3_ITERATIONS
+	if v.max_nsec3_iterations > MAX_NSEC3_ITERATIONS_LIMIT {
+		logx.warnf(
+			"dnssec: max_nsec3_iterations %d is past what one query's hashing allowance can pay for; using %d",
+			v.max_nsec3_iterations,
+			MAX_NSEC3_ITERATIONS_LIMIT,
+		)
+		v.max_nsec3_iterations = MAX_NSEC3_ITERATIONS_LIMIT
+	}
 	v.max_cached_zones = opts.max_cached_zones if opts.max_cached_zones > 0 else DEFAULT_MAX_CACHED_ZONES
 	v.zones = make(map[string]^Zone_Entry, 64, allocator)
 	return v
@@ -455,7 +529,7 @@ validate :: proc(
 	}
 	class := msg.question[0].class if len(msg.question) > 0 else dns.Class.IN
 	unix := u32(time.to_unix_seconds(now))
-	budget := Budget{}
+	budget := query_budget(v)
 
 	/*
 	REFUSED, SERVFAIL and the rest carry nothing to authenticate. Demanding a
@@ -1624,7 +1698,7 @@ validate_denial :: proc(
 	case .Bogus:
 		return {status = .Bogus, reason = "broken chain of trust"}
 	case .Indeterminate:
-		return {status = .Indeterminate, reason = "chain of trust unavailable"}
+		return {status = .Indeterminate, reason = walk_reason(budget)}
 	}
 
 	/*
@@ -1679,17 +1753,46 @@ validate_denial :: proc(
 	}
 
 	rcode := dns.rcode_of(msg)
+	before := nsec3_refusals(&budget.nsec3)
 	proof: Proof = .Failed
 	if rcode == .NX_Domain {
 		proof = nsec_proves_name_error(nsecs, qname, allocator) if len(nsecs) > 0 else .Failed
 		if proof != .Proven && len(nsec3s) > 0 {
-			proof = nsec3_proves_name_error(nsec3s, qname, established, v.max_nsec3_iterations, allocator)
+			proof = nsec3_proves_name_error(nsec3s, qname, established, &budget.nsec3, allocator)
 		}
 	} else {
 		proof = nsec_proves_no_data(nsecs, qname, qtype, allocator) if len(nsecs) > 0 else .Failed
 		if proof != .Proven && len(nsec3s) > 0 {
-			proof = nsec3_proves_no_data(nsec3s, qname, established, qtype, v.max_nsec3_iterations, allocator)
+			proof = nsec3_proves_no_data(nsec3s, qname, established, qtype, &budget.nsec3, allocator)
 		}
+	}
+
+	/*
+	Hashing this server declined, and the same answer as the two allowances
+	above it. A proof built on a hash we would not compute is not a proof found
+	wanting, and `Bogus` says forgery: the client is handed extended error 6,
+	"DNSSEC bogus", over a decision of ours. What the client gets instead says
+	what happened - and the reason travels with it, so the log line naming this
+	query names the allowance too.
+
+	Worth being exact about how far that difference reaches today: `server`
+	counts and logs the two verdicts in one branch, so the bogus counter ticks
+	either way and the warn line is the same. The extended error and the reason
+	text are the whole of what an operator or a client can tell apart.
+
+	Counted over this proof rather than read off the budget, because the flags
+	there belong to the whole question and stay set once anything sets them: an
+	NSEC proof, which hashes nothing, would otherwise be filed under an
+	allowance it could not have spent.
+	*/
+	// Named apart from the signature budget, in the reason and in the log,
+	// because an operator whose names start failing has to be able to tell
+	// SHA-1 rounds from verifications, and both of those from a zone asking for
+	// more iterations than this server computes - which is the whole point of
+	// saying `Indeterminate` rather than `Bogus`.
+	if declined, why := nsec3_declined(&budget.nsec3, before); proof == .Failed && declined {
+		logx.debugf("dnssec: the denial of %s was not read to the end: %s", dns.name_trim_root(qname), why)
+		return {status = .Indeterminate, reason = why}
 	}
 
 	switch proof {
@@ -1947,7 +2050,7 @@ validate_rrset :: proc(
 	case .Insecure:
 		return .Insecure, "", "unsigned zone", "", {}
 	case .Indeterminate:
-		return .Indeterminate, "", "chain of trust unavailable", "", {}
+		return .Indeterminate, "", walk_reason(budget), "", {}
 	case .Bogus:
 		return .Bogus, "", "broken chain of trust", "", {}
 	case .Secure:
@@ -2200,7 +2303,7 @@ validate_wildcard_proof :: proc(
 		// A chain this server could not walk is not a proof that failed, and the
 		// two must not reach the log or the client saying the same thing.
 		if trust == .Indeterminate {
-			return trust, nil, "chain of trust unavailable"
+			return trust, nil, walk_reason(budget)
 		}
 		return trust, nil, "wildcard expansion not proven"
 	}
@@ -2226,8 +2329,9 @@ validate_wildcard_proof :: proc(
 			return .Secure, denial.verified, ""
 		}
 	}
+	before := nsec3_refusals(&budget.nsec3)
 	if len(denial.nsec3s) > 0 {
-		if cover, covered := nsec3_covering(denial.nsec3s, next_closer, v.max_nsec3_iterations); covered {
+		if cover, covered := nsec3_covering(denial.nsec3s, next_closer, &budget.nsec3); covered {
 			// RFC 5155 section 9.2 forbids the AD bit over an opt-out cover:
 			// the span may be hiding an unsigned delegation, so the next closer
 			// name is not proven absent and the wildcard may not have applied.
@@ -2236,6 +2340,17 @@ validate_wildcard_proof :: proc(
 			}
 			return .Secure, denial.verified, ""
 		}
+	}
+	/*
+	As above: hashing we declined is not a cover we looked for and failed to
+	find, and what this counts is what this proof was refused rather than what
+	the question has spent. Both answers are SERVFAIL to the client, and the
+	difference is the extended error the answer carries and the reason written
+	beside it.
+	*/
+	if declined, why := nsec3_declined(&budget.nsec3, before); declined {
+		logx.debugf("dnssec: the wildcard proof for %s was not read to the end: %s", dns.name_trim_root(owner), why)
+		return .Indeterminate, nil, why
 	}
 	return .Bogus, nil, "wildcard expansion not proven"
 }
@@ -2480,8 +2595,14 @@ zone_trust :: proc(
 	keys: []Dnskey,
 	established: string,
 ) {
+	// Cleared on the way in, so that what a caller reads afterwards is this
+	// walk's own answer and not one left behind by an earlier proof.
+	budget.walk_stopped = ""
 	root_status, root_keys := zone_keys(v, budget, ".", now, allocator)
 	if root_status != .Secure {
+		if root_status == .Indeterminate {
+			budget.walk_stopped = "chain of trust unavailable"
+		}
 		return root_status, nil, "."
 	}
 
@@ -2489,6 +2610,7 @@ zone_trust :: proc(
 	keys = root_keys
 	depth := label_count(name)
 	if depth > MAX_CHAIN_DEPTH {
+		budget.walk_stopped = "chain of trust unavailable"
 		return .Indeterminate, nil, "."
 	}
 
@@ -2585,11 +2707,11 @@ zone_step :: proc(
 	}
 
 	if !spend_lookup(budget) {
-		return .Indeterminate, nil
+		return walk_gave_up(budget, "lookup budget spent"), nil
 	}
 	wire, ok := v.query(v.query_ctx, child, .DS, allocator)
 	if !ok {
-		return .Indeterminate, nil
+		return walk_gave_up(budget, "chain of trust unavailable"), nil
 	}
 	msg, derr := dns.decode_message(wire, allocator)
 	if derr != .None {
@@ -2606,7 +2728,7 @@ zone_step :: proc(
 	conclusion for the same rcodes on the response being validated.
 	*/
 	if !answerable_rcode(msg) {
-		return .Indeterminate, nil
+		return walk_gave_up(budget, "chain of trust unavailable"), nil
 	}
 	unix := u32(time.to_unix_seconds(now))
 	// We asked in class IN, and the transport already checked the reply's
@@ -2649,7 +2771,10 @@ zone_step :: proc(
 			// A step this server ran out of allowance on is one it did not
 			// read, which is `Indeterminate` territory rather than a broken
 			// delegation - the same distinction the denial path below makes.
-			return .Indeterminate if exhausted else .Bogus, nil
+			if exhausted {
+				return walk_gave_up(budget, "verification budget spent"), nil
+			}
+			return .Bogus, nil
 		}
 
 		set := make([dynamic]Ds, 0, len(ds_records), allocator)
@@ -2682,7 +2807,10 @@ zone_step :: proc(
 				cache_put(v, child, .Insecure, nil, rrset_ttl(ds_records), now)
 				return .Insecure, nil
 			}
-			return .Bogus if kstatus == .Bogus else .Indeterminate, nil
+			if kstatus == .Bogus {
+				return .Bogus, nil
+			}
+			return walk_gave_up(budget, "chain of trust unavailable"), nil
 		}
 		cache_put(v, child, .Secure, child_keys, rrset_ttl(ds_records), now)
 		return .Secure, child_keys
@@ -2696,13 +2824,35 @@ zone_step :: proc(
 	// A chain step this server ran out of allowance on is one it did not read,
 	// which is `Indeterminate` territory rather than a broken delegation.
 	if ds_spent {
-		return .Indeterminate, nil
+		return walk_gave_up(budget, "verification budget spent"), nil
 	}
 	if len(nsecs) == 0 && len(nsec3s) == 0 {
 		return .Bogus, nil
 	}
 
-	step = denial_step(nsecs, nsec3s, child, parent, v.max_nsec3_iterations)
+	before := nsec3_refusals(&budget.nsec3)
+	cut_short: bool
+	step, cut_short = denial_step(nsecs, nsec3s, child, parent, &budget.nsec3)
+	/*
+	A step whose NSEC3 hashing ran out is one this server did not read to the
+	end, which is `Indeterminate` territory rather than anything the records
+	said - the same reading `ds_spent` above gets.
+
+	Whatever the step says, not only `.Bogus`. A scan cut short returns "no such
+	record", and every reading built on one of those is a reading of our own
+	limit: `.Absent` most of all, which ends the walk at this zone and calls it
+	`Secure`, leaving a name that really is delegated to be judged against the
+	wrong zone's keys and reported to the client as a forgery.
+	*/
+	if cut_short {
+		_, why := nsec3_declined(&budget.nsec3, before)
+		logx.debugf(
+			"dnssec: the ds denial for %s was not read to the end (%s); the step is undecided",
+			dns.name_trim_root(child),
+			why,
+		)
+		return walk_gave_up(budget, why), nil
+	}
 	if step == .Insecure {
 		cache_put(v, child, .Insecure, nil, negative_ttl(msg), now)
 	}
@@ -2716,35 +2866,85 @@ not a cut, or a name that is not there at all?
 Kept apart from the lookup around it because this is the whole of the decision
 and none of it needs a network: the records have already been checked against
 the parent's keys, and what is left is what they say.
+
+`cut_short` says this reading could have been different, and it is this step's
+own answer rather than the question's: the counts on the budget only go up, so a
+step that reached its verdict from NSEC records, from a record it found, or from
+hashes kept by an earlier scan would otherwise be thrown away for a refusal that
+was never its own.
+
+Which refusal matters depends on what is being decided, and
+`nsec3_cut_short` has the reasoning. A step that ends the walk - `.Absent` -
+turns on the allowance alone, because a record over the ceiling is one this
+server will not read for any question and the zone it can read is the zone it
+has. A step that settles nothing carries either, since it is failing whatever
+happens and the only thing left to get right is what it is called.
 */
 @(private)
 denial_step :: proc(
 	nsecs: []Nsec_Rr,
 	nsec3s: []Nsec3_Rr,
 	child, parent: string,
-	max_nsec3_iterations: int,
-) -> Step {
+	nsec3_budget: ^Nsec3_Budget,
+) -> (
+	step: Step,
+	cut_short: bool,
+) {
 	if len(nsecs) > 0 {
 		if nsec_proves_no_ds(nsecs, child) == .Proven {
-			return .Insecure
+			return .Insecure, false
 		}
 		if nsec_proves_no_delegation(nsecs, child) {
-			return .No_Cut if nsec_shows_node(nsecs, child) else .Absent
+			return (.No_Cut if nsec_shows_node(nsecs, child) else .Absent), false
 		}
 	}
 	if len(nsec3s) > 0 {
-		if nsec3_proves_no_ds(nsec3s, child, parent, max_nsec3_iterations) == .Proven {
-			return .Insecure
+		before := nsec3_refusals(nsec3_budget)
+		// A proof that found what it was looking for is a proof that hashed:
+		// nothing refused can return `Proven`, so this one needs no caveat.
+		if nsec3_proves_no_ds(nsec3s, child, parent, nsec3_budget) == .Proven {
+			return .Insecure, false
 		}
-		if nsec3_proves_no_delegation(nsec3s, child, parent, max_nsec3_iterations) {
-			// An NSEC3 zone publishes a record for every empty non-terminal
-			// (RFC 5155 section 7.1), so a name with none of its own is a name
-			// that is not there.
-			_, matched := nsec3_matching(nsec3s, child, max_nsec3_iterations)
-			return .No_Cut if matched else .Absent
+		if proven, matched := nsec3_proves_no_delegation(nsec3s, child, parent, nsec3_budget); proven {
+			/*
+			An NSEC3 zone publishes a record for every empty non-terminal (RFC
+			5155 section 7.1), so a name with none of its own is a name that is
+			not there. `matched` comes from the scan that proved there is no
+			delegation rather than from a third pass over the same records: see
+			`nsec3_proves_no_delegation` for what asking twice cost.
+
+			A match is a record found, which no refusal could have produced, so
+			`.No_Cut` is this step's answer whatever the meter says. `.Absent`
+			is the other half of the same scan finding nothing, which a refusal
+			could have produced and which ends the walk, so it carries the
+			doubt.
+			*/
+			if matched {
+				return .No_Cut, false
+			}
+			/*
+			The allowance only: a record the ceiling refused is one this server
+			will not read for any question, so the records around it are the
+			whole of the zone as far as it is concerned, and a walk that ends on
+			them ends where it would have ended anyway.
+
+			Which holds while the zone keeps its chains complete, as RFC 5155
+			section 7.3 asks of one changing its parameters. A zone whose
+			readable chain is missing a name its unreadable one holds ends the
+			walk here, and a delegation below is then judged against the
+			parent's keys - a broken zone answering SERVFAIL for itself, not
+			something anyone else can arrange, and the price of not reading
+			every mid-rollover zone as unresolvable.
+			*/
+			return .Absent, nsec3_cut_short(nsec3_budget, before)
 		}
+		// Nothing proven either way: a forgery when the records are what they
+		// look like, and a decision of ours when a hash was refused while this
+		// read. The count says which.
+		bogus_declined, _ := nsec3_declined(nsec3_budget, before)
+		return .Bogus, bogus_declined
 	}
-	return .Bogus
+	return .Bogus, false
 }
 
 /*

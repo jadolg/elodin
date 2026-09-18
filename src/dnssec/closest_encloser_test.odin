@@ -184,7 +184,7 @@ test_ce_zone_chain_is_sound :: proc(t: ^testing.T) {
 	testing.expect(t, v != nil, "the anchor should parse")
 	defer destroy_validator(v)
 
-	budget := Budget{}
+	budget := query_budget(v)
 	status, keys, zone := zone_trust(v, &budget, "x.y.cetest.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 	testing.expect_value(t, status, Status.Secure)
 	testing.expect_value(t, zone, "cetest.")

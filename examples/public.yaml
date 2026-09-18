@@ -335,6 +335,9 @@ dnssec:
   # validation is the part of this that makes them checkable. The upstreams
   # above both return the records it needs.
   enabled: true
+  # Hashing one NSEC3 record may ask for; a record above it is not computed, so
+  # a name whose proof needs one is SERVFAIL rather than work we do. RFC 9276 asks
+  # zones for zero. A larger number is held down to 255 — see examples/elodin.yaml.
   max_nsec3_iterations: 100
 
 cookies:

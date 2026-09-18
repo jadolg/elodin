@@ -58,7 +58,7 @@ test_validator :: proc(anchors: []Trust_Anchor = nil) -> ^Validator {
 // Walks the chain with a fresh budget, the way `validate` does.
 @(private = "file")
 trust :: proc(v: ^Validator, name: string) -> (Status, []Dnskey, string) {
-	budget := Budget{}
+	budget := query_budget(v)
 	return zone_trust(v, &budget, name, fixture_now(), context.temp_allocator)
 }
 
@@ -313,6 +313,89 @@ test_validates_nsec3_name_error :: proc(t: ^testing.T) {
 		result.status == .Secure || result.status == .Insecure,
 		"an NSEC3 name error should be proven or opted out, not bogus",
 	)
+	free_all(context.temp_allocator)
+}
+
+/*
+A denial whose hashing allowance ran out is `Indeterminate`, not `Bogus`.
+
+`MAX_NSEC3_ROUNDS_PER_QUERY` is this server's limit rather than anything the
+records did wrong, and the two verdicts say different things about that:
+`Bogus` tells the client its answer was forged, with extended error 6 to say so,
+while `Indeterminate` says only that this server did not finish reading the
+proof. The same distinction every other allowance in
+`validate.odin` makes, made for the one that counts SHA-1.
+
+The proof is real captured traffic - com's NSEC3 denial for a name that is not
+there - so the only difference between the two calls is the meter. What runs out
+here is the walk down to the name, whose DS denial is itself NSEC3, and it names
+the allowance rather than the chain: the reason is what picks the extended error
+the client is handed, so a walk stopped by hashing has to say so. The other place the meter can empty is the
+answer's own proof, which com cannot reach: its chain is opt-out, so the walk
+settles the name as an unsigned delegation before any proof is read.
+`ds_apex_denial_test` has the signed NSEC3 denial that does reach it.
+*/
+@(test)
+test_a_denial_that_runs_out_of_hashing_is_indeterminate :: proc(t: ^testing.T) {
+	msg, err := dns.decode_message(unhex(fixture("nxdomain_com").wire), context.temp_allocator)
+	testing.expect(t, err == .None, "the captured denial should decode")
+
+	qname :: "zzzz-does-not-exist-xq7.com."
+	// A validator apiece, because what one call learns about the zone is cached
+	// and the next would read the answer rather than work it out.
+	base_v := test_validator()
+	defer destroy_validator(base_v)
+	fresh := query_budget(base_v)
+	baseline := validate_denial(base_v, &fresh, msg, qname, .A, .IN, u32(FIXTURE_TIME), fixture_now(), context.temp_allocator)
+	testing.expectf(
+		t,
+		baseline.status == .Secure || baseline.status == .Insecure,
+		"the denial should hold up with a whole allowance, got %v (%s)",
+		baseline.status,
+		baseline.reason,
+	)
+
+	v := test_validator()
+	defer destroy_validator(v)
+	// Through `query_budget`, so the ceiling is the validator's: a zero would
+	// refuse these records for their iteration count instead, which is a
+	// different refusal and would pass this test for the wrong reason.
+	spent := query_budget(v)
+	spent.nsec3.rounds = MAX_NSEC3_ROUNDS_PER_QUERY
+	result := validate_denial(v, &spent, msg, qname, .A, .IN, u32(FIXTURE_TIME), fixture_now(), context.temp_allocator)
+	testing.expect_value(t, result.status, Status.Indeterminate)
+	testing.expect_value(t, result.reason, NSEC3_BUDGET_SPENT)
+	free_all(context.temp_allocator)
+}
+
+/*
+An NSEC denial that fails is a forgery, whatever the NSEC3 meter says.
+
+The hashing allowance is the whole question's and it stays spent once anything
+spends it, so a proof made entirely of NSEC records - which hash nothing and
+cannot spend it - must not be filed under it. Both answers are SERVFAIL to the
+client and the difference is what the answer and the log say about why: the
+extended error, and the reason beside it. A forgery reported as an allowance of
+ours is a forgery nobody reads as one.
+
+`nosuchname-xq7.cloudflare.com.` is denied with the "black lies" NSEC, whose bit
+map lists the types the zone really minted for it, so asking for one of those is
+a NODATA denial contradicted by the denial's own records.
+*/
+@(test)
+test_an_nsec_denial_that_fails_is_bogus_even_with_the_hashing_spent :: proc(t: ^testing.T) {
+	msg, err := dns.decode_message(unhex(fixture("nodata_cloudflare").wire), context.temp_allocator)
+	testing.expect(t, err == .None, "the captured denial should decode")
+
+	qname :: "nosuchname-xq7.cloudflare.com."
+	v := test_validator()
+	defer destroy_validator(v)
+	spent := query_budget(v)
+	spent.nsec3.rounds = MAX_NSEC3_ROUNDS_PER_QUERY
+	spent.nsec3.spent = 3
+	result := validate_denial(v, &spent, msg, qname, .NSEC, .IN, u32(FIXTURE_TIME), fixture_now(), context.temp_allocator)
+	testing.expect_value(t, result.status, Status.Bogus)
+	testing.expect_value(t, result.reason, "denial of existence not proven")
 	free_all(context.temp_allocator)
 }
 
@@ -629,7 +712,7 @@ fetch_forged :: proc(wire: string) -> Status {
 	v := make_validator(canned_query, &canned, Options{})
 	defer destroy_validator(v)
 
-	budget := Budget{}
+	budget := query_budget(v)
 	_, status := fetch_keys(
 		v,
 		&budget,
@@ -1109,7 +1192,7 @@ downgrade_status :: proc(zone_status: Status) -> Status {
 	defer destroy_validator(v)
 
 	records, sigs := unsupported_rrset(ZONE, keys[0])
-	budget := Budget{}
+	budget := query_budget(v)
 	status, _, _, _, _ := validate_rrset(
 		v,
 		&budget,

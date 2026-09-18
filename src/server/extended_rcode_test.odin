@@ -6,6 +6,7 @@ import "core:thread"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:dnssec"
 import "elodin:upstream"
 
 /*
@@ -825,5 +826,73 @@ test_a_clients_extended_rcode_byte_is_not_forwarded :: proc(t: ^testing.T) {
 		testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.No_Error)
 	}
 
+	free_all(context.temp_allocator)
+}
+
+/*
+Which extended error a DNSSEC refusal carries, and why the third one exists.
+
+SERVFAIL is all a client gets when an answer cannot be authenticated, so the
+extended error is the whole of what it is told about why. Three refusals reach
+here and they want a client to do different things: a forged answer is a
+forgery, an unreachable parent zone is worth retrying, and a zone whose NSEC3
+records ask for more hashing than this server does is neither - it is this
+resolver declining work over a number the zone chose, and RFC 8914 section 4.28
+has a code that says exactly that.
+
+Sending "no reachable authority" for it, which is what everything non-bogus used
+to get, sends whoever is debugging the zone to look at connectivity, which is
+the one thing that is fine.
+*/
+@(test)
+test_a_dnssec_refusal_names_which_refusal_it_was :: proc(t: ^testing.T) {
+	// With an OPT record, because an extended error has nowhere else to go:
+	// `attach_extended_error` writes into the response's OPT, and a client that
+	// did not send one gets the bare SERVFAIL and no reason at all.
+	additional := make([]dns.Record, 1, context.temp_allocator)
+	additional[0] = dns.make_opt(1232, false)
+	query := dns.Message {
+		id         = 0x1234,
+		flags      = dns.Flags{rd = true},
+		question   = {{name = "nx.n3test.", type = .A, class = .IN}},
+		additional = additional,
+	}
+	cases := []struct {
+		result: dnssec.Result,
+		code:   int,
+		what:   string,
+	} {
+		{{status = .Bogus, reason = "denial of existence not proven"}, EDE_DNSSEC_BOGUS, "a forgery"},
+		{{status = .Indeterminate, reason = "chain of trust unavailable"}, EDE_NO_REACHABLE_AUTHORITY, "a chain this server could not walk"},
+		{
+			{status = .Indeterminate, reason = dnssec.NSEC3_OVER_CEILING},
+			EDE_UNSUPPORTED_NSEC3_ITERATIONS,
+			"a zone asking for more hashing than this server does",
+		},
+		// No code of its own describes "this server would not spend more CPU on
+		// your question", and 22 is what every other allowance in the validator
+		// already sends - the signature budget, the lookup budget - so this
+		// goes with them rather than inventing a distinction the rest of the
+		// package does not make.
+		{
+			{status = .Indeterminate, reason = dnssec.NSEC3_BUDGET_SPENT},
+			EDE_NO_REACHABLE_AUTHORITY,
+			"an allowance of ours",
+		},
+		{
+			{status = .Indeterminate, reason = "lookup budget spent"},
+			EDE_NO_REACHABLE_AUTHORITY,
+			"the allowance beside it, which answers the same way",
+		},
+	}
+	for c in cases {
+		wire, ok := dnssec_failure_response(query, c.result, context.temp_allocator, dns.MAX_MESSAGE)
+		if !testing.expectf(t, ok, "the refusal for %s should encode", c.what) {
+			continue
+		}
+		code, text := extended_error(wire)
+		testing.expectf(t, code == c.code, "%s should carry extended error %d, got %d", c.what, c.code, code)
+		testing.expectf(t, text == c.result.reason, "and the reason it was given: %q, got %q", c.result.reason, text)
+	}
 	free_all(context.temp_allocator)
 }

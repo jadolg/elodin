@@ -313,3 +313,50 @@ test_a_ds_denial_at_a_name_that_is_not_a_zone_cut_still_holds_under_nsec3 :: pro
 	)
 	free_all(context.temp_allocator)
 }
+
+/*
+The same NSEC3 denial, read with the hashing allowance already spent.
+
+`MAX_NSEC3_ROUNDS_PER_QUERY` bounds what one question may spend on SHA-1, and
+what a proof stopped partway through has to come back as is `Indeterminate`:
+this server did not finish reading it, which is not the same statement as
+"forged" and must not reach the client as one.
+
+What runs out here is the walk down to the name, whose DS denial is this very
+fixture, and it answers in `zone_trust`'s words. The answer's own proof is the
+other place the meter can empty, and it takes a name error to reach - the walk
+settles a DS question before the proof is read, and every hash the proof would
+want is one the walk already made. `nsec3_name_error_test` is that case.
+*/
+@(test)
+test_a_denial_whose_hashing_ran_out_is_indeterminate_not_bogus :: proc(t: ^testing.T) {
+	qname :: "www.dstest3."
+	msg, err := dns.decode_message(da_reply("da3_www_nodata"), context.temp_allocator)
+	testing.expect(t, err == .None, "the fixture should decode")
+
+	v := da_validator()
+	testing.expect(t, v != nil, "the anchor should parse")
+	defer destroy_validator(v)
+	// Built the way a question builds one, so the ceiling is the validator's
+	// rather than a zero that would refuse every record asking for any
+	// iterations at all - which is a different refusal from the one under test,
+	// and would pass this test while proving nothing about it.
+	none := query_budget(v)
+	none.nsec3.rounds = MAX_NSEC3_ROUNDS_PER_QUERY
+	result := validate_denial(v, &none, msg, qname, .DS, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	testing.expectf(
+		t,
+		result.status == .Indeterminate,
+		"a walk that could not hash is not a broken delegation, got %v (%q)",
+		result.status,
+		result.reason,
+	)
+
+	// The control: the same records, the same question, a whole allowance.
+	fresh_v := da_validator()
+	defer destroy_validator(fresh_v)
+	fresh := query_budget(fresh_v)
+	held := validate_denial(fresh_v, &fresh, msg, qname, .DS, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	testing.expectf(t, held.status == .Secure, "the denial itself holds up, got %v (%q)", held.status, held.reason)
+	free_all(context.temp_allocator)
+}
