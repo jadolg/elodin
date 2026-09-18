@@ -153,6 +153,40 @@ WC_FIXTURES := []Fixture{
 			"74e8b74cc3c4b96d7c2005bf0dbd8e48945fd8935e28ddf4e18405",
 	},
 	{
+		key   = "wc_relocated_answer_nsec",
+		name  = "nx.wctest.",
+		type  = .NSEC,
+		rcode = 0,
+		wire  = "123485800001000200040000026e780677637465737400002f0001026e780677637465737400002f000100000e100015" +
+			"047265616c06776374657374000006400000000003026e780677637465737400002e000100000e10005a002f0f010000" +
+			"0e107d3b18206a478820ec3706776374657374000d68c8d5dc40d3f7c0db71853379cd1fd3843c0870874513452e8a83" +
+			"84cfb879d6f0e24496d31170eb85f95dbc793b4c7a0cf3382d7d0f70f65694bedf0b6205012a0677637465737400002f" +
+			"000100000e100015047265616c06776374657374000006400000000003012a0677637465737400002e000100000e1000" +
+			"5a002f0f0100000e107d3b18206a478820ec3706776374657374000d68c8d5dc40d3f7c0db71853379cd1fd3843c0870" +
+			"874513452e8a8384cfb879d6f0e24496d31170eb85f95dbc793b4c7a0cf3382d7d0f70f65694bedf0b62050677637465" +
+			"7374000006000100000e100032026e7306776374657374000a686f73746d617374657206776374657374000000000100" +
+			"000e100000038400093a800000012c0677637465737400002e000100000e10005a00060f0100000e107d3b18206a4788" +
+			"20ec37067763746573740086680c77a5776baafe6dc6996b459f2db0022c6b7be012df9a745cc780e505b5655c414383" +
+			"74e8b74cc3c4b96d7c2005bf0dbd8e48945fd8935e28ddf4e18405",
+	},
+	{
+		key   = "wc_nx_ds",
+		name  = "nx.wctest.",
+		type  = .DS,
+		rcode = 0,
+		wire  = "123485800001000000060000026e780677637465737400002b0001012a0677637465737400002f000100000e10001504" +
+			"7265616c06776374657374000006400000000003012a0677637465737400002e000100000e10005a002f0f0100000e10" +
+			"7d3b18206a478820ec3706776374657374000d68c8d5dc40d3f7c0db71853379cd1fd3843c0870874513452e8a8384cf" +
+			"b879d6f0e24496d31170eb85f95dbc793b4c7a0cf3382d7d0f70f65694bedf0b6205047265616c067763746573740000" +
+			"2f000100000e10001006776374657374000006400080000003047265616c0677637465737400002e000100000e10005a" +
+			"002f0f0200000e107d3b18206a478820ec3706776374657374004f63ff1d2d3194702640919b3e2551ae708ceb46817f" +
+			"edb87f7ff8f8035b529e8b17a7250c0ddc729ebbe2baafbc627ce68808cdbcd2c973804038b370803408067763746573" +
+			"74000006000100000e100032026e7306776374657374000a686f73746d61737465720677637465737400000000010000" +
+			"0e100000038400093a800000012c0677637465737400002e000100000e10005a00060f0100000e107d3b18206a478820" +
+			"ec37067763746573740086680c77a5776baafe6dc6996b459f2db0022c6b7be012df9a745cc780e505b5655c41438374" +
+			"e8b74cc3c4b96d7c2005bf0dbd8e48945fd8935e28ddf4e18405",
+	},
+	{
 		key   = "wd_ds",
 		name  = "wdtest.",
 		type  = .DS,
@@ -531,6 +565,35 @@ test_a_relocated_wildcard_dname_does_not_redirect :: proc(t: ^testing.T) {
 		t,
 		result.status == .Bogus && result.reason == "wildcard expansion not proven",
 		"a wildcard DNAME re-owned elsewhere cannot redirect, got %v (%q)",
+		result.status,
+		result.reason,
+	)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_a_relocated_wildcard_nsec_in_the_answer_is_not_secure :: proc(t: ^testing.T) {
+	/*
+	The same relocation one section over, and the reason "the expansion was
+	proven" is not enough on its own.
+
+	`validate_answer` reads a short Labels field as a wildcard expansion and
+	asks for the RFC 4035 section 5.3.4 proof that the expansion was the right
+	thing to do. Here that proof is real: the authority section carries the
+	genuine `*.wctest. NSEC`, unmodified, and it does cover `nx.wctest.`. The
+	attacker is proving something true.
+
+	What the proof does not say is that the answer's own NSEC belongs at that
+	owner, and RFC 4035 section 3.1.3.3 is why it never can: a zone does not
+	synthesise an NSEC or an NSEC3 from a wildcard, so an expanded one was
+	moved. Without the refusal the record goes out at AD=1, with a next-name
+	and a type bit map of the sender's choosing, saying `nx.wctest.` exists.
+	*/
+	result := wc_validate("wc_relocated_answer_nsec", "nx.wctest.", .NSEC)
+	testing.expectf(
+		t,
+		result.status == .Bogus && result.reason == "relocated denial record",
+		"a wildcard's NSEC re-owned into the answer section is not authenticated, got %v (%q)",
 		result.status,
 		result.reason,
 	)

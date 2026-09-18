@@ -831,6 +831,29 @@ def relocated_wildcard_denial():
     emit("wc_wildcard_nodata", "www.wctest.", "TXT",
          message("www.wctest.", TXT, [],
                  wild_nsec + [wild_sig] + real_nsec + [real_sig] + wc_soa + [wc_soa_sig]))
+
+    # The same relocation one section over. An answer-section NSEC is not a
+    # proof of anything here, so this one is not an NXDOMAIN forged - it is an
+    # authenticated statement about `nx.wctest.` that the zone never made,
+    # carrying a chosen next-name and a chosen type bit map, going out at AD=1
+    # and into the cache for whatever reads it there.
+    #
+    # The authority section is the genuine `*.wctest. NSEC`, unmodified, which
+    # really does cover `nx.wctest.` - so the RFC 4035 section 5.3.4 proof the
+    # answer's short Labels field calls for is one an attacker can make. That
+    # the proof succeeds is the point: the expansion is provable and the record
+    # is still forged, because section 3.1.3.3 never has a zone synthesise an
+    # NSEC from a wildcard.
+    moved_nsec = [RR("nx.wctest.", NSEC, wild_rdata), RR("nx.wctest.", RRSIG, wild_sig.rdata)]
+    emit("wc_relocated_answer_nsec", "nx.wctest.", "NSEC",
+         message("nx.wctest.", NSEC, moved_nsec,
+                 wild_nsec + [wild_sig] + wc_soa + [wc_soa_sig]))
+    # The chain walk asks for a DS at `nx.wctest.` on the way to that answer.
+    # The wildcard matches the name and its NSEC denies the type; `real.wctest.`
+    # is what proves no closer name exists.
+    emit("wc_nx_ds", "nx.wctest.", "DS",
+         message("nx.wctest.", DS, [],
+                 wild_nsec + [wild_sig] + real_nsec + [real_sig] + wc_soa + [wc_soa_sig]))
     wildcard_expanded_ds(root)
     wildcard_dname(root)
 

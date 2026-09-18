@@ -1307,6 +1307,28 @@ validate_answer :: proc(
 				why = ""
 			}
 		}
+		/*
+		For every other type an expansion is a fact to be proved: the RFC 4035
+		section 5.3.4 denial below asks whether the wildcard was entitled to
+		stand in for this name, and if it was, the answer is an answer.
+
+		An NSEC or NSEC3 is the one case where that proof settles nothing. RFC
+		4035 section 3.1.3.3 has a zone publish these under their own names and
+		never synthesise one from a wildcard, so an expanded one was moved -
+		and the proof an attacker has to make to move it is a true statement
+		they can fetch with one harmless query, the wildcard's own NSEC
+		covering the name they chose. Proving the expansion legitimate while
+		the record is still forged is exactly the shape of the attack.
+
+		`signed_labels` drops a literal leading `*.`, so a zone's own
+		`*.zone. NSEC`, asked for by name, comes back with no encloser and
+		still passes. This is the answer-section half of the refusal
+		`verified_rrset` makes for the authority section.
+		*/
+		if status == .Secure && encloser != "" && (rec.type == .NSEC || rec.type == .NSEC3) {
+			status = .Bogus
+			why = "relocated denial record"
+		}
 		if encloser != "" {
 			append(&expansions, Wildcard_Expansion{owner = rec.name, encloser = encloser})
 		}
