@@ -305,23 +305,26 @@ test_the_validating_rewrite_advertises_the_flag_day_size :: proc(t: ^testing.T) 
 }
 
 /*
-And a client cannot steer the rewrite with a record the rewrite never touches.
+And a client cannot carry a second payload size upstream in a section this
+server does not read.
 
 `find_opt`, `find_opt_span` and `edns_opt_readable` all read the additional
 section alone - RFC 6891 section 6.1.1 is where the record belongs - and a client
-may put a record of type OPT in its answer section for the asking. `peek_udp_size`
-used to walk every section and return the first one it met, so the decoy below
-was what both this rewrite and the receive buffer in `upstream/plain.odin` read,
-while the real record went out with whatever the decoy said and the buffer was
-sized at the decoy's figure. The two readers now look in the same place.
+may put a record of type OPT in its answer section for the asking. Two things
+went wrong with that. `peek_udp_size` used to walk every section and return the
+first record it met, so the decoy was what this rewrite and the receive buffer in
+`upstream/plain.odin` both read while the real record went out saying whatever
+the decoy said; that is fixed in the codec, and `dns.test_peek_udp_size_reads_the_opt_record`
+holds it. And the decoy itself was forwarded, so an upstream reading the first
+OPT *it* met - which is exactly what this server did until #325 - would answer
+the client's 65000 whatever this server wrote in the record it does read.
 
-The decoy asks for less than the real record, because that is the direction the
-cap cannot catch: a rewrite that takes the decoy's 700 writes 700 into the record
-the upstream actually reads, and on the validating path that is 1232 lowered to
-whatever a spoofable datagram chose.
+The second is what this case is about, and the gate that already refuses the two
+other EDNS shapes this server cannot account for is where it is settled: FORMERR,
+and the query is not forwarded at all.
 */
 @(test)
-test_an_opt_outside_the_additional_section_does_not_steer_the_rewrite :: proc(t: ^testing.T) {
+test_a_query_carrying_an_opt_outside_the_additional_section_is_refused :: proc(t: ^testing.T) {
 	question := make([]dns.Question, 1, context.temp_allocator)
 	question[0] = dns.Question {
 		name  = QNAME,
@@ -329,9 +332,9 @@ test_an_opt_outside_the_additional_section_does_not_steer_the_rewrite :: proc(t:
 		class = .IN,
 	}
 	answer := make([]dns.Record, 1, context.temp_allocator)
-	answer[0] = dns.make_opt(700, false)
+	answer[0] = dns.make_opt(65000, false)
 	additional := make([]dns.Record, 1, context.temp_allocator)
-	additional[0] = dns.make_opt(65000, false)
+	additional[0] = dns.make_opt(1232, false)
 	msg := dns.Message {
 		id         = CLIENT_ID,
 		question   = question,
@@ -343,25 +346,39 @@ test_an_opt_outside_the_additional_section_does_not_steer_the_rewrite :: proc(t:
 	if !testing.expect_value(t, werr, dns.Encode_Error.None) {
 		return
 	}
-	// The premise: the message really does carry both, and the one that counts
-	// is the one in the additional section.
-	testing.expect_value(t, dns.peek_udp_size(query), u16(65000))
+	// The premise: the message carries both records, and the one the codec
+	// reports is the one in the additional section.
+	testing.expect_value(t, dns.peek_udp_size(query), u16(1232))
 	if opt, had := dns.find_opt(msg); testing.expect(t, had, "the fixture lost its real opt record") {
 		// An OPT record carries the payload size where every other type carries
 		// its class.
-		testing.expect_value(t, u16(opt.class), u16(65000))
+		testing.expect_value(t, u16(opt.class), u16(1232))
 	}
 
-	advertised, ok := forward_and_read_size(t, query)
-	if !ok {
+	s, _, x, built := forwarding_server(t)
+	if !built {
 		return
 	}
+	defer net.close(x.socket)
+	defer upstream.destroy_group(s.group)
+
+	// No mock thread: nothing may be forwarded, and `mock_untouched` reads the
+	// socket after the call has returned rather than racing it.
+	out, outcome, answered := handle_query(&s, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	testing.expect(t, mock_untouched(x.socket), "the decoy was forwarded to the upstream")
+	if !testing.expect(t, answered, "nothing came back at all") {
+		return
+	}
+	testing.expect_value(t, outcome, Outcome.Failed)
 	testing.expectf(
 		t,
-		advertised == 1232,
-		"the upstream was told it could send %d bytes, which is the decoy's figure, not the cap",
-		advertised,
+		dns.peek_rcode(out) == .Form_Err,
+		"the client was handed %v rather than FORMERR",
+		dns.peek_rcode(out),
 	)
+	decoded, derr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+	testing.expect_value(t, decoded.id, CLIENT_ID)
 
 	free_all(context.temp_allocator)
 }

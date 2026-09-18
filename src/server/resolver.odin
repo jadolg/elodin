@@ -918,13 +918,32 @@ for every option in it and asking per option is what went wrong before: the
 client's subnet had a gate of its own and the client's cookie, which is a secret
 and the more expensive of the two to hand to a stranger, had none.
 
-Only the additional section is counted, because that is the only section
-`find_opt` and `find_opt_span` look in. A record of type OPT in the answer
-section is not the message's EDNS record, and a client can put one there for the
-asking.
+Only the additional section is counted for the pair above, because that is the
+only section `find_opt` and `find_opt_span` look in. A record of type OPT in the
+answer or authority section is not the message's EDNS record, and a client can
+put one there for the asking.
+
+Which is the third shape, and the same defect once more: a record this server
+does not read is one it cannot strip a cookie from or rewrite a payload size in,
+and it is forwarded as it stands to an upstream that may well read it - taking
+the first OPT it meets whatever section that is in, which is what this server's
+own `peek_udp_size` did until #325. A query has no answer or authority section
+to begin with, so nothing legitimate is being turned away: the records that do
+belong in one, a prerequisite in an UPDATE or the SOA of an IXFR, are not OPT
+records and are not counted here.
 */
 @(private)
 edns_opt_readable :: proc(msg: dns.Message) -> bool {
+	for rec in msg.answer {
+		if rec.type == .OPT {
+			return false
+		}
+	}
+	for rec in msg.authority {
+		if rec.type == .OPT {
+			return false
+		}
+	}
 	seen := false
 	for rec in msg.additional {
 		if rec.type != .OPT {

@@ -520,8 +520,18 @@ The EDNS payload size a forwarded query carries is elodin's own, capped at the
 field says how large a datagram *this server* is prepared to receive, and
 passing the client's on would let any of them ask the upstream for 65000 bytes
 of fragmented UDP — whose second fragment carries neither port nor transaction
-ID. A client that advertised less than 1232 is not overruled upward. An answer
-that no longer fits comes back truncated and is re-fetched over TCP.
+ID. A client that advertised less than 1232 is not overruled upward. On a
+`udp://` upstream an answer that no longer fits comes back truncated and is
+re-fetched over TCP; on `tcp://`, `tls://` and `https://` the figure bounds
+nothing, since RFC 7766 section 6.2.1.1 says not to apply the requestor's
+payload size over a stream, and a truncated reply from an upstream that applied
+it anyway is passed on to the client as it stands.
+
+A query carrying a record of type OPT outside its additional section — where RFC
+6891 puts the one that counts — is answered FORMERR and not forwarded, alongside
+the two other EDNS shapes elodin declines to read: a second OPT record, and an
+OPT whose options do not parse. All three are records this server cannot strip a
+cookie from or rewrite a size in, and would hand to an upstream untouched.
 
 An `https` upstream picks between HTTP/2 and HTTP/1.1 with ALPN, preferring h2,
 since some public resolvers answer HTTP/1.1 only. Concurrent queries against an
