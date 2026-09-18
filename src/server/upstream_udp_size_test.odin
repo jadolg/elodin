@@ -303,3 +303,65 @@ test_the_validating_rewrite_advertises_the_flag_day_size :: proc(t: ^testing.T) 
 
 	free_all(context.temp_allocator)
 }
+
+/*
+And a client cannot steer the rewrite with a record the rewrite never touches.
+
+`find_opt`, `find_opt_span` and `edns_opt_readable` all read the additional
+section alone - RFC 6891 section 6.1.1 is where the record belongs - and a client
+may put a record of type OPT in its answer section for the asking. `peek_udp_size`
+used to walk every section and return the first one it met, so the decoy below
+was what both this rewrite and the receive buffer in `upstream/plain.odin` read,
+while the real record went out with whatever the decoy said and the buffer was
+sized at the decoy's figure. The two readers now look in the same place.
+
+The decoy asks for less than the real record, because that is the direction the
+cap cannot catch: a rewrite that takes the decoy's 700 writes 700 into the record
+the upstream actually reads, and on the validating path that is 1232 lowered to
+whatever a spoofable datagram chose.
+*/
+@(test)
+test_an_opt_outside_the_additional_section_does_not_steer_the_rewrite :: proc(t: ^testing.T) {
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question {
+		name  = QNAME,
+		type  = .A,
+		class = .IN,
+	}
+	answer := make([]dns.Record, 1, context.temp_allocator)
+	answer[0] = dns.make_opt(700, false)
+	additional := make([]dns.Record, 1, context.temp_allocator)
+	additional[0] = dns.make_opt(65000, false)
+	msg := dns.Message {
+		id         = CLIENT_ID,
+		question   = question,
+		answer     = answer,
+		additional = additional,
+	}
+	msg.flags.rd = true
+	query, _, werr := dns.encode_message(msg, context.temp_allocator)
+	if !testing.expect_value(t, werr, dns.Encode_Error.None) {
+		return
+	}
+	// The premise: the message really does carry both, and the one that counts
+	// is the one in the additional section.
+	testing.expect_value(t, dns.peek_udp_size(query), u16(65000))
+	if opt, had := dns.find_opt(msg); testing.expect(t, had, "the fixture lost its real opt record") {
+		// An OPT record carries the payload size where every other type carries
+		// its class.
+		testing.expect_value(t, u16(opt.class), u16(65000))
+	}
+
+	advertised, ok := forward_and_read_size(t, query)
+	if !ok {
+		return
+	}
+	testing.expectf(
+		t,
+		advertised == 1232,
+		"the upstream was told it could send %d bytes, which is the decoy's figure, not the cap",
+		advertised,
+	)
+
+	free_all(context.temp_allocator)
+}

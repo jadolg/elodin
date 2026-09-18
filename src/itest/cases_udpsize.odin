@@ -91,6 +91,11 @@ run_udp_size_cases :: proc(r: ^Runner) {
 	big := big_txt_answer("big.example.", 10, context.allocator)
 	defer delete(big)
 	mock_reply(mock, "big.example.", u16(dns.Type.TXT), big)
+	// For the last case below, which is about the query going out rather than
+	// the answer coming back and wants a small one. Registered here with the
+	// rest: `mock_synth` appends to the rule list without a lock, and the
+	// serving threads read it.
+	mock_synth(mock, "buffer.example.", u16(dns.Type.A), {192, 0, 2, 11})
 	if !mock_start(mock) {
 		skip_case(r, "max_udp_response", "cannot start the mock upstream")
 		return
@@ -318,9 +323,6 @@ blocking: {{ enabled: false }}
 		srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 		if check(r, ok, "server did not start") {
 			defer stop_server(&srv)
-			// A small answer: what is under test is the query going out, and a
-			// large one would only add a truncation and a TCP retry to it.
-			mock_synth(mock, "buffer.example.", u16(dns.Type.A), {192, 0, 2, 11})
 			asked := build_query(
 				"buffer.example.",
 				u16(dns.Type.A),

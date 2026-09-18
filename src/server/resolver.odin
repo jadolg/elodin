@@ -1549,8 +1549,24 @@ resolve_query :: proc(
 	is; `validator_query`, which does not come this way at all, writes the same
 	constant itself.
 
+	Written whatever transport the group's members speak, rather than only for
+	the `udp://` ones the fragments are a hazard on. Which member answers is not
+	known here - a failover group can hold a `udp://` and a `tls://` server and
+	move between them - so scoping it would mean a copy of the query per member
+	instead of one buffer for the group, and the field bounds nothing on a
+	stream: RFC 7766 section 6.2.1.1 says not to apply the requestor's payload
+	size there, and an upstream that did would already be truncating for every
+	client that advertised 512, which is every client that asked without EDNS at
+	all. What it would cost against such a server is a TC=1 that only
+	`exchange_udp` knows how to retry.
+
 	Best-effort, like the clear above: a query with no OPT record has no field
 	to write into, and 512 is what a responder assumes without one.
+
+	Read with `peek_udp_size`, which looks in the additional section alone, the
+	same place `set_edns_udp_size` writes: a client may put a record of type OPT
+	in its answer section for the asking, and reading the figure from one place
+	while writing it to another would let that decoy choose what is written.
 	*/
 	_ = dns.set_edns_udp_size(forwarded, min(dns.peek_udp_size(forwarded), UPSTREAM_UDP_SIZE))
 
