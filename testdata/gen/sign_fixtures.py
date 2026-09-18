@@ -772,19 +772,15 @@ def relocated_wildcard_denial():
     # chain walk must still refuse to take a zone cut from it.
     root = Key(".", "wcard-root")
     wc = Key("wctest.", "wcard-zone")
-    wd = Key("wdtest.", "wcard-dszone")
-    ev = Key("evil.wdtest.", "wcard-evil")
-    fi = Key("fine.wdtest.", "wcard-fine")
 
     root_keys = [RR(".", DNSKEY, root.rdata)]
     print("// anchor: %s" % root.ds_text())
     emit("wc_root_dnskey", ".", "DNSKEY", message(".", DNSKEY, root_keys + [sign(root_keys, root)]))
 
-    for tag, zone in (("wc", wc), ("wd", wd)):
-        ds_set = [RR(zone.zone, DS, zone.ds())]
-        emit("%s_ds" % tag, zone.zone, "DS", message(zone.zone, DS, ds_set + [sign(ds_set, root)]))
-        keys = [RR(zone.zone, DNSKEY, zone.rdata)]
-        emit("%s_dnskey" % tag, zone.zone, "DNSKEY", message(zone.zone, DNSKEY, keys + [sign(keys, zone)]))
+    wc_ds = [RR(wc.zone, DS, wc.ds())]
+    emit("wc_ds", wc.zone, "DS", message(wc.zone, DS, wc_ds + [sign(wc_ds, root)]))
+    wc_keys = [RR(wc.zone, DNSKEY, wc.rdata)]
+    emit("wc_dnskey", wc.zone, "DNSKEY", message(wc.zone, DNSKEY, wc_keys + [sign(wc_keys, wc)]))
 
     # The zone as it really is: an apex, a wildcard holding an A, and one
     # ordinary name holding an A and a TXT. Canonical order puts `*` before `r`,
@@ -834,8 +830,21 @@ def relocated_wildcard_denial():
     emit("wc_wildcard_nodata", "www.wctest.", "TXT",
          message("www.wctest.", TXT, [],
                  wild_nsec + [wild_sig] + real_nsec + [real_sig] + wc_soa + [wc_soa_sig]))
+    wildcard_expanded_ds(root)
 
-    # `wdtest.`: a DS set at `evil.wdtest.` whose digest names that child, so it
+
+def wildcard_expanded_ds(root):
+    """Emit `wdtest.`, whose DS at one child was signed as a wildcard expansion."""
+    wd = Key("wdtest.", "wcard-dszone")
+    ev = Key("evil.wdtest.", "wcard-evil")
+    fi = Key("fine.wdtest.", "wcard-fine")
+
+    ds_set = [RR(wd.zone, DS, wd.ds())]
+    emit("wd_ds", wd.zone, "DS", message(wd.zone, DS, ds_set + [sign(ds_set, root)]))
+    keys = [RR(wd.zone, DNSKEY, wd.rdata)]
+    emit("wd_dnskey", wd.zone, "DNSKEY", message(wd.zone, DNSKEY, keys + [sign(keys, wd)]))
+
+    # A DS set at `evil.wdtest.` whose digest names that child, so it
     # matches the key served below, but whose signature was computed over
     # `*.wdtest.`. Taking the cut means the walk moves to keys the parent never
     # attested under this name.
