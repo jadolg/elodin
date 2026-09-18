@@ -525,7 +525,11 @@ ID. A client that advertised less than 1232 is not overruled upward. On a
 re-fetched over TCP; on `tcp://`, `tls://` and `https://` the figure bounds
 nothing, since RFC 7766 section 6.2.1.1 says not to apply the requestor's
 payload size over a stream, and a truncated reply from an upstream that applied
-it anyway is passed on to the client as it stands.
+it anyway is passed on to the client as it stands — which for a client already on
+TCP or DoT is the end of the road, since TCP is where a TC bit sends it. An
+upstream that truncates a stream reply by the requestor's figure cannot serve
+answers over 1232 bytes through elodin; it also could not serve them to any
+client that asked without EDNS, which RFC 1035 holds to 512.
 
 A query carrying a record of type OPT outside its additional section — where RFC
 6891 puts the one that counts — is answered FORMERR and not forwarded, alongside

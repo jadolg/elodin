@@ -438,6 +438,17 @@ second fragment carries no port and no transaction ID, so anything on the path
 can supply it. A signed answer still rarely fits in 512 bytes, which is why this
 is not simply left unset; what changed is that it is no longer 4096.
 
+Lowered on the two DNSSEC paths as well, which chose their own figure and were
+never the hole - 4096 is simply over an ordinary 1500-byte path MTU, which is
+the whole of what flag day was about, and a signed answer is the message most
+likely to be that large. The cost is a truncation and a TCP fetch for a DNSKEY
+set or a large RRset, and against a `udp://` upstream with no TCP service at all
+a failure: `exchange_tcp` cannot dial, and `record_failure` counts it. Three
+*consecutive* ones park the server - `record_success` zeroes the count, so
+ordinary traffic in between clears it - and such an upstream is already failing
+every client that asks without EDNS, which is held to 512 by RFC 1035. That is
+the trade every comparable resolver made in 2020.
+
 Not configurable, and deliberately: an operator lowering it gains nothing TCP
 does not already give them, and one raising it is asking for the fragments.
 */
@@ -1555,11 +1566,19 @@ resolve_query :: proc(
 	under the CD=1 key any client can ask for. Nothing about the client's own
 	message is a statement about what this server can reassemble.
 
-	`min` rather than a plain write: a client that advertised less than the
+	A clamp rather than a plain write: a client that advertised less than the
 	ceiling, or that asked without EDNS at all, is not overruled upward. There
 	is nothing to gain from asking for more room than the answer we may send
 	back can use, and a stub that advertised 512 is often one behind a path that
 	could not carry more.
+
+	Floored at 512 for the other end of the same argument. RFC 6891 section
+	6.2.3 has a responder treat anything under 512 as 512, so a smaller figure
+	buys a client nothing there - but written out it is a lever pointed the
+	other way: one datagram advertising zero and every answer over 512 bytes
+	comes back truncated and is re-fetched over TCP, a UDP query in and an
+	upstream connection out. `exchange_udp` floors its own buffer at 512 for the
+	same reason, so there was never anything below it to gain.
 
 	Here with the ID and the extended rcode because the three want the same
 	thing: the one point all the ways the outgoing message comes about pass
@@ -1587,7 +1606,10 @@ resolve_query :: proc(
 	in its answer section for the asking, and reading the figure from one place
 	while writing it to another would let that decoy choose what is written.
 	*/
-	_ = dns.set_edns_udp_size(forwarded, min(dns.peek_udp_size(forwarded), UPSTREAM_UDP_SIZE))
+	_ = dns.set_edns_udp_size(
+		forwarded,
+		u16(clamp(int(dns.peek_udp_size(forwarded)), dns.MAX_UDP_SIZE, UPSTREAM_UDP_SIZE)),
+	)
 
 	/*
 	Down the zone's own route when it has one, and to the default group when it

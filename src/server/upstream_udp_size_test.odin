@@ -67,10 +67,10 @@ serve_one :: proc(x: ^Seen_Query) {
 	_, _ = net.send_udp(x.socket, out[:len(reply)], remote)
 }
 
-// The client's question, advertising `advertised` bytes of room, or no EDNS at
-// all when that is zero.
+// The client's question, advertising `advertised` bytes of room - or asking
+// without EDNS at all, which has no field to advertise in and is held to 512.
 @(private = "file")
-client_query :: proc(advertised: u16) -> []u8 {
+client_query :: proc(advertised: u16, edns := true) -> []u8 {
 	question := make([]dns.Question, 1, context.temp_allocator)
 	question[0] = dns.Question {
 		name  = QNAME,
@@ -82,7 +82,7 @@ client_query :: proc(advertised: u16) -> []u8 {
 		question = question,
 	}
 	msg.flags.rd = true
-	if advertised > 0 {
+	if edns {
 		additional := make([]dns.Record, 1, context.temp_allocator)
 		additional[0] = dns.make_opt(advertised, false)
 		msg.additional = additional
@@ -300,6 +300,47 @@ test_the_validating_rewrite_advertises_the_flag_day_size :: proc(t: ^testing.T) 
 	if testing.expect(t, len(out.question) == 1, "the validating rewrite lost the question") {
 		testing.expect(t, dns.name_equal_fold(out.question[0].name, QNAME), "the question changed")
 	}
+
+	free_all(context.temp_allocator)
+}
+
+/*
+And it cannot push the figure below 512 either.
+
+RFC 6891 section 6.2.3 has a responder treat anything under 512 as 512, so a
+smaller number buys a client nothing on the receiving end - but written out it is
+the cap's lever pointed the other way: zero advertised, and every upstream answer
+over 512 bytes comes back truncated and is re-fetched over TCP. One unsigned
+datagram in, an upstream connection out, for as long as the client cares to send
+them.
+
+Zero rather than some other small number because it is the figure the lever is
+worth most at, and because an OPT record is entitled to carry it: the field is
+two bytes wide and nothing about the wire forbids it.
+*/
+@(test)
+test_a_client_cannot_push_the_upstream_payload_size_below_512 :: proc(t: ^testing.T) {
+	query := client_query(0, edns = true)
+	if !testing.expect(t, len(query) > dns.HEADER_SIZE, "the query did not encode") {
+		return
+	}
+	// The premise: an OPT record really is there, advertising zero - not a query
+	// that went out without one.
+	testing.expect_value(t, dns.peek_udp_size(query), u16(0))
+	msg, derr := dns.decode_message(query, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+	testing.expect(t, dns.edns_present(msg), "the fixture lost its opt record")
+
+	advertised, ok := forward_and_read_size(t, query)
+	if !ok {
+		return
+	}
+	testing.expectf(
+		t,
+		advertised == 512,
+		"the upstream was told it could send %d bytes, which is the client's figure below the floor",
+		advertised,
+	)
 
 	free_all(context.temp_allocator)
 }
