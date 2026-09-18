@@ -4,6 +4,7 @@ import "core:net"
 import "core:strconv"
 import "core:sync"
 import "core:testing"
+import "core:thread"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
@@ -539,7 +540,10 @@ test_a_refused_pipeline_keeps_the_answers_already_written :: proc(t: ^testing.T)
 	// a budget with nothing left in it: what `serve_dns_stream` does from there,
 	// in the order it does it.
 	first: [STRIDE]u8
-	if !conn_read_full(conn, first[:]) {
+	first_budget := Read_Budget {
+		idle = 3 * time.Second,
+	}
+	if !conn_read_full(conn, first[:], &first_budget) {
 		testing.expect(t, false, "the first query never arrived")
 		return
 	}
@@ -730,5 +734,313 @@ test_loopback_is_127_over_8_in_both_forms :: proc(t: ^testing.T) {
 		groups := [8]u16{0, 0, 0, 0, 0, 0, 0, 1}
 		groups[group] |= 0x0100
 		testing.expectf(t, !is_loopback(groups_address(groups)), "a bit set in group %d of `::1` is not `::1`", group)
+	}
+}
+
+/*
+A message trickled a byte at a time is given up on at `client_timeout`, not held
+for as long as the client keeps trickling.
+
+`client_timeout` reaches the socket as SO_RCVTIMEO, which bounds one read: every
+byte that arrives restarts it, so before `Read_Budget` the only thing that ever
+reclaimed an accepted connection could not fire at all against a client sending a
+byte inside every wait. Nothing else caught it either - the connection and
+connection-rate limits bound how many are opened and how fast, and the query
+budgets are charged per message, so a connection on which no message ever
+completes is charged nothing and counted against nothing while it holds one of
+`max_connections`. RFC 7766 6.2.3 names the attack and says the idle timeout is
+reset "on the receipt of a full DNS message, rather than on receipt of any part of
+a DNS message".
+
+The drip is shorter than `client_timeout`, which is what makes it a drip: every
+byte lands inside the window the byte before it opened. Against a server holding
+one deadline across the message, the connection ends after roughly
+`client_timeout` regardless - about three bytes in here - so what is asserted is
+that it ended before the message it was feeding could have finished arriving.
+
+The bytes are a bare DNS header behind its length prefix, as the pipeline case
+above uses: what is under test is a message that never finishes arriving, and
+nothing ever parses one of those.
+*/
+@(test)
+test_a_drip_fed_message_is_reclaimed_at_the_deadline :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	cfg.listeners.udp.enabled = false
+	cfg.listeners.tcp = config.Listener {
+		enabled = true,
+		address = "127.0.0.1",
+		port    = 0,
+	}
+	cfg.listeners.dot.enabled = false
+	cfg.listeners.doh.enabled = false
+	cfg.cache.enabled = false
+	cfg.blocking.enabled = false
+	cfg.log.queries = false
+	// Short, because the case spends it: the drip below is paced off it, and the
+	// whole test takes a couple of multiples of it.
+	cfg.server.client_timeout = 400 * time.Millisecond
+	DRIP :: 150 * time.Millisecond
+
+	handler_pool := pool.make_pool(1)
+	s := Server {
+		cfg          = &cfg,
+		handler_pool = handler_pool,
+	}
+
+	l: Listeners
+	if !start_listeners(&s, &l) {
+		pool.destroy(handler_pool)
+		testing.expect(t, false, "could not start the TCP listener")
+		return
+	}
+	defer {
+		stop_listeners(&l)
+		pool.destroy(handler_pool)
+		destroy_listeners(&l)
+	}
+
+	bound, berr := net.bound_endpoint(l.tcp_socket)
+	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
+		return
+	}
+
+	client, derr := net.dial_tcp(bound)
+	if !testing.expectf(t, derr == nil, "cannot open the connection: %v", derr) {
+		return
+	}
+	defer net.close(client)
+	// The read below is both how the close is noticed and what paces the drip: it
+	// waits a drip's worth for something the server has no reason to send, so the
+	// loop turns over at the drip interval whether or not the connection is still
+	// there.
+	_ = net.set_option(client, .Receive_Timeout, DRIP)
+
+	message: [2 + dns.HEADER_SIZE]u8
+	message[1] = u8(dns.HEADER_SIZE)
+
+	sent := 0
+	closed := false
+	for sent < len(message) && !closed {
+		n, serr := net.send_tcp(client, message[sent:][:1])
+		if serr != nil || n != 1 {
+			// The server closed and the RST came back before this byte went out,
+			// which is the same outcome noticed one byte later.
+			closed = true
+			break
+		}
+		sent += 1
+
+		reply: [1]u8
+		rn, rerr := net.recv_tcp(client, reply[:])
+		// A graceful close is no bytes and no error; a reset is
+		// `Connection_Closed`. `Would_Block` is the drip's own wait expiring with
+		// the connection still up, which is the loop doing its job.
+		if (rn == 0 && rerr == nil) || (rerr != nil && rerr != net.TCP_Recv_Error.Would_Block) {
+			closed = true
+		}
+	}
+
+	testing.expectf(
+		t,
+		closed,
+		"a client trickling a byte every %v held the connection through the whole message",
+		DRIP,
+	)
+	testing.expectf(
+		t,
+		sent < len(message),
+		"the connection survived all %d bytes of a message trickled a byte every %v, which is %v of it",
+		len(message),
+		DRIP,
+		time.Duration(len(message)) * DRIP,
+	)
+}
+
+@(private = "file")
+Late_Sender :: struct {
+	endpoint: net.Endpoint,
+	message:  []u8,
+	split:    int,
+	wait:     time.Duration,
+}
+
+// Connect, wait, send the front of the message, wait again, send the rest. Both
+// waits are shorter than the budget and longer than what is left of it once the
+// first one has been spent out of the same figure.
+@(private = "file")
+send_late_and_split :: proc(s: ^Late_Sender) {
+	socket, err := net.dial_tcp_from_endpoint(s.endpoint)
+	if err != nil {
+		return
+	}
+	defer net.close(socket)
+	time.sleep(s.wait)
+	if _, serr := net.send_tcp(socket, s.message[:s.split]); serr != nil {
+		return
+	}
+	time.sleep(s.wait)
+	_, _ = net.send_tcp(socket, s.message[s.split:])
+	// Held open until the reader has had its turn; closing here would race the
+	// second half off the wire.
+	time.sleep(500 * time.Millisecond)
+}
+
+/*
+Waiting for a message to start does not spend the budget for reading one.
+
+The deadline covers the message, and it begins at the message's first byte rather
+than where the connection started waiting for one - see `Read_Budget`. Sharing one
+figure between the two instead would close on a keep-alive client that asked late
+in its idle window and had its message split across segments, which is a client
+this server has no complaint about: the rule is one budget per message, not one
+per connection, and RFC 7828 tells a client the connection is held for the whole
+of `client_timeout` whenever it next has something to ask.
+
+Both waits here are 700ms against a one-second budget, which leaves either
+reading of it 300ms of margin: measured from the connection the two of them are
+1.4s and the message could never arrive, and measured from its first byte the
+second half has 700ms of a second to make. The margin matters more than the
+speed here - this is the one case in the change that a slow box could fail with
+correct code, so it is the one that gets the room.
+*/
+@(test)
+test_the_wait_for_a_message_is_not_spent_on_reading_it :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen on loopback: %v", lerr) {
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the bound port: %v", berr) {
+		return
+	}
+
+	message: [2 + dns.HEADER_SIZE]u8
+	message[1] = u8(dns.HEADER_SIZE)
+	sender := Late_Sender {
+		endpoint = bound,
+		message  = message[:],
+		// The length prefix in one segment and the body in the next, which is the
+		// split the budget has to survive because it is the one a client is free
+		// to make.
+		split    = 2,
+		wait     = 700 * time.Millisecond,
+	}
+	client := thread.create_and_start_with_poly_data(&sender, send_late_and_split)
+	defer {
+		thread.join(client)
+		thread.destroy(client)
+	}
+
+	accepted, _, aerr := net.accept_tcp(listener)
+	if !testing.expectf(t, aerr == nil, "nothing connected: %v", aerr) {
+		return
+	}
+	defer net.close(accepted)
+	// Long, so that what ends a read here is the budget and never the socket.
+	_ = net.set_option(accepted, .Receive_Timeout, 5 * time.Second)
+	conn := Conn {
+		socket = accepted,
+	}
+
+	budget := Read_Budget {
+		idle = 1 * time.Second,
+	}
+	length_buf: [2]u8
+	if !testing.expect(t, conn_read_full(conn, length_buf[:], &budget), "the length prefix never arrived") {
+		return
+	}
+	body: [dns.HEADER_SIZE]u8
+	testing.expect(
+		t,
+		conn_read_full(conn, body[:], &budget),
+		"a message split after its length prefix was given up on, though neither half was late",
+	)
+}
+
+/*
+A deadline with less than a microsecond left still arms a read that expires.
+
+`net.set_option` carries the wait to the kernel as a `timeval`, so anything under
+a microsecond truncates to a zero one - and SO_RCVTIMEO of zero is no timeout at
+all rather than one that has already expired. A read armed with the raw remainder
+in that window waits forever, which is the hold the budget exists to end, reached
+by landing a read inside the last microsecond of it.
+
+Asserted on a TLS connection because that is where the figure that was set can be
+read back; `conn_arm_read` is the one that computes it either way.
+*/
+@(test)
+test_a_nearly_spent_deadline_does_not_arm_an_endless_read :: proc(t: ^testing.T) {
+	tls := tlsx.Conn{}
+	tlsx.set_timeouts(&tls, 10 * time.Second, 10 * time.Second)
+
+	// Exactly 500ns left, read from the same instant the deadline was built on, so
+	// the window under test is the one this case gets rather than whatever the
+	// clock happens to leave.
+	now := time.tick_now()
+	budget := Read_Budget {
+		idle     = 10 * time.Second,
+		deadline = time.tick_add(now, 500),
+	}
+
+	if testing.expect(t, conn_arm_read(Conn{tls = &tls}, &budget, now), "500ns left read as none") {
+		testing.expectf(
+			t,
+			time.Duration(tls.read_timeout_ns) >= time.Microsecond,
+			"a read was armed with %v, which reaches the kernel as no timeout at all",
+			time.Duration(tls.read_timeout_ns),
+		)
+	}
+	// And the write deadline is still the connection's: what is nearly spent is
+	// the budget for reading a message.
+	testing.expect_value(t, time.Duration(tls.write_timeout_ns), 10 * time.Second)
+}
+
+/*
+Shortening how long an idle connection is held does not shorten the handshake in
+front of it.
+
+`server_handshake` bounds a handshake as a whole now, and the figure it uses is
+the socket's receive timeout - which `stream_job` sets from `client_timeout`, the
+same value RFC 7828 advertises as how long an idle connection is kept. An
+operator shortens that to reclaim slots sooner, which says nothing about how long
+a client may take to shake hands: a handshake is several round trips and whatever
+a lossy path makes of them, so the two sharing one figure would have a
+high-latency client failing to connect at all. Hence the floor, and hence this,
+because a floor that quietly stopped applying would look exactly like it working.
+*/
+@(test)
+test_the_handshake_keeps_its_floor_under_a_short_client_timeout :: proc(t: ^testing.T) {
+	Want :: struct {
+		client_timeout: time.Duration,
+		handshake:      time.Duration,
+	}
+	cases := []Want {
+		// Above the floor, so the connection's own figure stands: an operator who
+		// raised it meant the handshake too.
+		{30 * time.Second, 30 * time.Second},
+		// The shipped default, comfortably above.
+		{10 * time.Second, 10 * time.Second},
+		// Below it, and the handshake keeps the floor.
+		{1 * time.Second, HANDSHAKE_FLOOR},
+		{50 * time.Millisecond, HANDSHAKE_FLOOR},
+		// Exactly the floor is not below it.
+		{HANDSHAKE_FLOOR, HANDSHAKE_FLOOR},
+		// No receive timeout at all is what a non-positive value means, and a
+		// floor is not a bound the operator asked to add - see
+		// `test_a_timeout_that_cannot_be_stated_is_left_off`.
+		{0, 0},
+		{-1 * time.Second, -1 * time.Second},
+	}
+	for c in cases {
+		testing.expectf(
+			t,
+			handshake_timeout(c.client_timeout) == c.handshake,
+			"a %v client timeout gives the handshake %v, expected %v",
+			c.client_timeout,
+			handshake_timeout(c.client_timeout),
+			c.handshake,
+		)
 	}
 }

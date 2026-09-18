@@ -1568,3 +1568,105 @@ test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
 	)
 	free_all(context.temp_allocator)
 }
+
+@(private = "file")
+Dripper :: struct {
+	endpoint: net.Endpoint,
+	request:  string,
+	stop:     bool,
+}
+
+// A byte every `DOH_DRIP_INTERVAL` until the request runs out or the test says to
+// stop. The stop flag is what keeps the case that passes from waiting out a
+// trickle written to be longer than any per-read wait.
+@(private = "file")
+DOH_DRIP_INTERVAL :: 150 * time.Millisecond
+
+@(private = "file")
+drip_request :: proc(d: ^Dripper) {
+	socket, err := net.dial_tcp_from_endpoint(d.endpoint)
+	if err != nil {
+		return
+	}
+	defer net.close(socket)
+	raw := transmute([]u8)d.request
+	for i in 0 ..< len(raw) {
+		if sync.atomic_load(&d.stop) {
+			return
+		}
+		n, serr := net.send_tcp(socket, raw[i:][:1])
+		if serr != nil || n != 1 {
+			return
+		}
+		time.sleep(DOH_DRIP_INTERVAL)
+	}
+}
+
+/*
+A request trickled a byte at a time is given up on at the deadline the request
+began with, not held for as long as the client keeps trickling.
+
+The socket's receive timeout bounds one read and is restarted by every byte that
+arrives, so a request line, its headers and its body - as many reads as the client
+cares to split them into - had no bound between them: a client sending a byte
+inside every wait holds the connection, and one of `max_connections`, for as long
+as it likes while no request ever completes and nothing charges it for one. See
+`Http_Reader.budget`, and `Read_Budget` where the DNS stream has the same
+shape and RFC 7766 6.2.3 says what a server should do about it.
+
+The receive timeout here is five seconds, far longer than the deadline, so the
+reader giving up inside two is the deadline doing it and not the socket: a reader
+bounded only per read would still be collecting bytes when this case ends.
+*/
+@(test)
+test_doh_reader_gives_up_on_a_drip_fed_request :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen on loopback: %v", lerr) {
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the bound port: %v", berr) {
+		return
+	}
+
+	// A request that would be read and answered if the whole of it ever arrived,
+	// so what ends the read is how it was sent and not what it says.
+	dripper := Dripper {
+		endpoint = bound,
+		request  = "GET /dns-query?dns=AAABAAABAAAAAAAA HTTP/1.1\r\nHost: dns.example\r\n\r\n",
+	}
+	client := thread.create_and_start_with_poly_data(&dripper, drip_request)
+	defer {
+		sync.atomic_store(&dripper.stop, true)
+		thread.join(client)
+		thread.destroy(client)
+	}
+
+	accepted, _, aerr := net.accept_tcp(listener)
+	if !testing.expectf(t, aerr == nil, "nothing connected: %v", aerr) {
+		return
+	}
+	defer net.close(accepted)
+	_ = net.set_option(accepted, .Receive_Timeout, 5 * time.Second)
+
+	r := Http_Reader {
+		conn   = Conn{socket = accepted},
+		buf    = make([dynamic]u8, 0, HTTP_BUF_SIZE),
+		budget = Read_Budget{idle = 400 * time.Millisecond},
+	}
+	defer delete(r.buf)
+
+	start := time.tick_now()
+	_, _, ok := read_http_request(&r)
+	elapsed := time.tick_since(start)
+
+	testing.expect(t, !ok, "a request trickled a byte at a time was read to the end")
+	testing.expectf(
+		t,
+		elapsed < 2 * time.Second,
+		"the reader was held for %v by a byte every %v, against a 400ms budget",
+		elapsed,
+		DOH_DRIP_INTERVAL,
+	)
+}

@@ -86,10 +86,19 @@ dot_padding_serve :: proc(m: ^Dot_Padding_Mock) {
 	framed[0] = u8(len(reply) >> 8)
 	framed[1] = u8(len(reply))
 	copy(framed[2:], reply)
+	/*
+	Counted before the write rather than after it, because after it is a race the
+	case can lose: `exchange` returns as soon as the client has read this reply,
+	and the case asserts on the counter straight away, while the join that would
+	have ordered the two is deferred to the end. The mock had read the query and
+	built the answer by here, which is what the counter is asked about; a write
+	that then fails is the exchange failing, which the case checks first and stops
+	on. `asked` and `option` are stored ahead of the write for the same reason.
+	*/
+	sync.atomic_add(&m.served, 1)
 	if _, werr := tlsx.write(conn, framed); werr != .None {
 		return
 	}
-	sync.atomic_add(&m.served, 1)
 	free_all(context.temp_allocator)
 }
 

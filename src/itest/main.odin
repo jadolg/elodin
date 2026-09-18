@@ -240,6 +240,15 @@ main :: proc() {
 		skip_case(&r, "doh over http/2", "no certificate")
 	}
 
+	// Needs a certificate: one of the two transports it trickles at is the DoH
+	// listener, and the other is TCP on the same server.
+	if cert_ok {
+		section(&r, "slow drip")
+		run_slow_drip_cases(&r)
+	} else {
+		skip_case(&r, "slow drip", "no certificate")
+	}
+
 	section(&r, "upstream transports")
 	run_upstream_transport_cases(&r)
 	run_stale_connection_cases(&r)

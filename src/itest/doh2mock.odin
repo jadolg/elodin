@@ -105,7 +105,9 @@ doh2_mock_loop :: proc(m: ^Doh2_Mock) {
 		if err != nil {
 			continue
 		}
-		_ = net.set_option(client, .Receive_Timeout, POLL_INTERVAL)
+		// The handshake is bounded by this as a whole, not per read - see
+		// `HANDSHAKE_TIMEOUT`.
+		_ = net.set_option(client, .Receive_Timeout, HANDSHAKE_TIMEOUT)
 		conn := new(Doh2_Conn)
 		conn.mock = m
 		conn.socket = client
@@ -133,6 +135,9 @@ doh2_mock_conn :: proc(conn: ^Doh2_Conn) {
 		net.close(conn.socket)
 		return
 	}
+	// Back to the poll interval now the handshake is done, so this thread keeps
+	// noticing the stop flag.
+	tlsx.set_read_timeout(tls_conn, POLL_INTERVAL)
 	conn.tls = tls_conn
 	defer tlsx.close(tls_conn)
 

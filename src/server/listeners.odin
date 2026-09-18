@@ -1691,6 +1691,9 @@ stream_job :: proc(data: rawptr) {
 		defer net.close(job.socket)
 		serve_dns_stream(s, {socket = job.socket, peer = job.client}, .TCP, client)
 	case .DoT:
+		// The handshake is bounded as a whole, and by this - not by what the
+		// connection's reads are given. See `handshake_timeout`; put back below.
+		_ = net.set_option(job.socket, .Receive_Timeout, handshake_timeout(timeout))
 		conn, err := accept_tls(job.ctx.listeners, .DoT, job.socket)
 		if err != .None {
 			logx.debugf("dot: handshake with %s failed: %v", client, err)
@@ -1701,8 +1704,13 @@ stream_job :: proc(data: rawptr) {
 		// `Stats.handshakes` for what the figure is for.
 		sync.atomic_add(&s.stats.handshakes, 1)
 		defer tlsx.close(conn)
+		// Back to the connection's own figure now the handshake is done.
+		tlsx.set_read_timeout(conn, timeout)
 		serve_dns_stream(s, {socket = job.socket, tls = conn, peer = job.client}, .DoT, client)
 	case .DoH:
+		// The handshake is bounded as a whole, and by this - not by what the
+		// connection's reads are given. See `handshake_timeout`; put back below.
+		_ = net.set_option(job.socket, .Receive_Timeout, handshake_timeout(timeout))
 		conn, err := accept_tls(job.ctx.listeners, .DoH, job.socket)
 		if err != .None {
 			logx.debugf("doh: handshake with %s failed: %v", client, err)
@@ -1711,6 +1719,8 @@ stream_job :: proc(data: rawptr) {
 		}
 		sync.atomic_add(&s.stats.handshakes, 1)
 		defer tlsx.close(conn)
+		// Back to the connection's own figure now the handshake is done.
+		tlsx.set_read_timeout(conn, timeout)
 		if tlsx.alpn_protocol(conn) == "h2" {
 			serve_doh2(s, conn, client, job.client)
 		} else {
@@ -1734,8 +1744,17 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 	// what decides whether the refusal below drains first - see `stream_linger`.
 	answered := false
 	for {
+		/*
+		One budget for the length prefix and the body behind it, taken fresh per
+		message and not restarted by the bytes that arrive inside one - see
+		`Read_Budget`.
+		*/
+		budget := Read_Budget {
+			idle = s.cfg.server.client_timeout,
+		}
+
 		length_buf: [2]u8
-		if !conn_read_full(conn, length_buf[:]) {
+		if !conn_read_full(conn, length_buf[:], &budget) {
 			return
 		}
 		length := int(length_buf[0]) << 8 | int(length_buf[1])
@@ -1744,7 +1763,7 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 		}
 
 		query := make([]u8, length, context.temp_allocator)
-		if !conn_read_full(conn, query) {
+		if !conn_read_full(conn, query, &budget) {
 			return
 		}
 
@@ -1946,11 +1965,131 @@ conn_read :: proc(c: Conn, buf: []u8) -> (n: int, ok: bool) {
 	return got, err == nil && got > 0
 }
 
+/*
+The least a TLS handshake gets, whatever a connection's reads are given.
+
+`server_handshake` bounds the handshake as a whole now rather than each read of
+it, and the figure it uses is the socket's receive timeout - which is
+`client_timeout`, the same value RFC 7828 advertises to a connected client as
+how long an idle connection is held. Those two are not the same want. Ten
+seconds of idle is generous, but an operator who shortens `client_timeout` to
+reclaim slots sooner would otherwise be capping a whole TLS handshake at the
+same figure, and a handshake is several round trips plus whatever a lossy path
+makes of them: a high-latency client would start failing to connect at all,
+which is not what shortening an idle timeout asks for.
+
+So the handshake has a floor under it and the connection's figure is put back
+once the handshake is done. Five seconds is many times over what a handshake
+costs on any path worth serving, and it is still a bound - which is the whole
+point, the trickle being what `accept_loop` is there to end.
+
+A non-positive `client_timeout` is no receive timeout at all and stays that way:
+the operator asked for no bound, and a floor is not a bound they asked to add.
+*/
 @(private)
-conn_read_full :: proc(c: Conn, buf: []u8) -> bool {
+HANDSHAKE_FLOOR :: 5 * time.Second
+
+@(private)
+handshake_timeout :: proc(client_timeout: time.Duration) -> time.Duration {
+	return client_timeout if client_timeout <= 0 else max(client_timeout, HANDSHAKE_FLOOR)
+}
+
+/*
+The bound on assembling one message, and the idle wait in front of it.
+
+`client_timeout` reaches the socket as SO_RCVTIMEO, which bounds one read and is
+restarted by every byte that arrives: a client sending one byte inside every wait
+is inside all of them, and holds one of `max_connections` for as long as it cares
+to while no query completes, no budget is charged and nothing else reclaims it.
+RFC 7766 6.2.3 names exactly that and says the idle timeout should be reset "on
+the receipt of a full DNS message, rather than on receipt of any part of a DNS
+message". So the reads that assemble one message share a deadline and shorten as
+it runs down.
+
+`deadline` is zero until the first byte of that message arrives, and that is the
+other half of the rule: a connection between questions is not assembling anything,
+so it waits `idle` for the first byte - which is the figure the idle timeout this
+server advertises states (RFC 7828) - and the message gets the whole of `idle`
+from that byte on. Spending the two out of one budget instead would close on a
+keep-alive client that asked late in the window and had its message split across
+segments, which is a client this server has no complaint about.
+
+A non-positive `idle` is no receive timeout on the socket at all - see
+`test_a_timeout_that_cannot_be_stated_is_left_off` for the other half of what that
+setting means - and leaves both unbounded, rather than turning "wait forever" into
+"give up at once".
+*/
+@(private)
+Read_Budget :: struct {
+	idle:     time.Duration,
+	deadline: time.Tick,
+}
+
+/*
+Give this read the idle wait or what is left of the message's deadline, and say
+when the deadline is spent.
+
+`conn_set_read_timeout` rather than a bare `net.set_option`, because over DoT and
+DoH the socket option stopped applying at the handshake - see there. The wait is
+set on every read rather than only when it changes: the message that ran the
+deadline down leaves a short one behind it, and the idle wait for the next message
+is where that is put back.
+
+What that costs is a `setsockopt` per read on the plain-TCP path where there was
+none before - two per message, one for the idle wait and one for the deadline the
+body is read against, since a deadline running down is a different figure every
+time and there is nothing to skip. Over DoT and DoH it costs an atomic store.
+Keeping a socket armed with a wait the message has already spent is not a
+cheaper version of this, it is the bug.
+
+Floored at a microsecond because `net.set_option` carries the wait to the kernel
+as a `timeval`, and anything under a microsecond truncates to a zero one - which
+SO_RCVTIMEO reads as no timeout at all rather than as one that has expired. A read
+armed that way waits forever, which is the hold this deadline exists to end,
+reachable by landing a read inside the last microsecond of it.
+
+`now` is passed in rather than read here, so that a case can put a read inside
+that window without racing the clock to do it.
+*/
+@(private)
+conn_arm_read :: proc(c: Conn, b: ^Read_Budget, now: time.Tick) -> bool {
+	if b.idle <= 0 {
+		return true
+	}
+	if b.deadline == (time.Tick{}) {
+		conn_set_read_timeout(c, b.idle)
+		return true
+	}
+	left := time.tick_diff(now, b.deadline)
+	if left <= 0 {
+		return false
+	}
+	conn_set_read_timeout(c, max(left, time.Microsecond))
+	return true
+}
+
+// One read against a budget: the only place the message's deadline is started, so
+// that every reader shares one answer to what counts as the message beginning.
+@(private)
+conn_read_budgeted :: proc(c: Conn, buf: []u8, b: ^Read_Budget) -> (n: int, ok: bool) {
+	if !conn_arm_read(c, b, time.tick_now()) {
+		return 0, false
+	}
+	n, ok = conn_read(c, buf)
+	if ok && b.idle > 0 && b.deadline == (time.Tick{}) {
+		b.deadline = time.tick_add(time.tick_now(), b.idle)
+	}
+	return n, ok
+}
+
+// Read exactly `len(buf)` bytes, within what the budget has left. The budget is a
+// parameter rather than a default so that a path added later has to say what
+// bounds it as a whole; a zero `idle` is the one that means nothing does.
+@(private)
+conn_read_full :: proc(c: Conn, buf: []u8, b: ^Read_Budget) -> bool {
 	got := 0
 	for got < len(buf) {
-		n, ok := conn_read(c, buf[got:])
+		n, ok := conn_read_budgeted(c, buf[got:], b)
 		if !ok {
 			return false
 		}

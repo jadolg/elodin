@@ -168,9 +168,11 @@ Classify a handshake that did not complete.
 errno before anything else makes a system call, so both are taken here, right
 where the failure happened.
 
-A blocking socket only ever asks to be retried because SO_RCVTIMEO or
-SO_SNDTIMEO cut a wait short, which is a timeout rather than a protocol
-failure, and a syscall-level error is the transport giving up rather than the
+A blocking socket - which is the client half, `client_connect` - only ever asks
+to be retried because SO_RCVTIMEO or SO_SNDTIMEO cut a wait short, which is a
+timeout rather than a protocol failure. The server half is non-blocking and
+waits those out in `accept_loop`, so what reaches here from it is never a
+would-block. A syscall-level error is the transport giving up rather than the
 peer refusing us. Telling those apart is what lets a caller log the difference
 between "the upstream is slow", "the upstream hung up on us", and "the
 certificate did not check out".
@@ -178,7 +180,14 @@ certificate did not check out".
 @(private)
 handshake_error :: proc(ssl: ^SSL, ret: c.int) -> Error {
 	saved := posix.errno()
-	code := SSL_get_error(ssl, ret)
+	return classify_handshake(SSL_get_error(ssl, ret), ret, saved)
+}
+
+// The half of `handshake_error` that reads neither, for a caller that has already
+// taken both in that order - see `accept_loop`, which needs the code to tell a
+// retry from a failure before it knows there is a failure to classify.
+@(private)
+classify_handshake :: proc(code: c.int, ret: c.int, saved: posix.Errno) -> Error {
 	last_handshake_errno = .NONE
 
 	switch code {
@@ -666,18 +675,75 @@ The session is consumed either way: a handshake that fails releases the `SSL`
 before returning, so a caller has nothing left to clean up after an error.
 */
 server_handshake :: proc(session: Server_Session, allocator := context.allocator) -> (conn: ^Conn, err: Error) {
-	ERR_clear_error()
-	if ret := SSL_accept(session.ssl); ret != 1 {
-		err = handshake_error(session.ssl, ret)
-		SSL_free(session.ssl)
-		return nil, err
-	}
 	conn = new(Conn, allocator)
 	conn.ssl = session.ssl
 	conn.socket = session.socket
 	conn.allocator = allocator
+	// Before the handshake rather than after it: the socket's timeouts are read
+	// here, and the deadline below needs them.
 	adopt_socket(conn)
+
+	if err = accept_loop(conn); err != .None {
+		SSL_free(conn.ssl)
+		free(conn, allocator)
+		return nil, err
+	}
 	return conn, .None
+}
+
+/*
+Shake hands within one deadline, however many messages the peer splits it into.
+
+SO_RCVTIMEO bounds one read and is restarted by every byte that arrives, so a
+handshake run on a blocking socket has no bound at all against a peer that sends
+a byte inside every wait: it holds the connection, its thread and one of the
+server's connection slots for as long as it cares to, before any of the server's
+per-query budgets can see it. The data phase is already bounded this way - see
+`transfer`, which takes its deadline once and waits in `poll` - and this is the
+same shape in front of it, on the socket `adopt_socket` has just made
+non-blocking.
+
+A zero timeout is the caller having set no SO_RCVTIMEO, and waits as long as the
+peer takes, which is what the blocking handshake did in that case.
+
+The client half - `client_connect`, which dials DoT and DoH upstreams - still
+runs `SSL_connect` on a blocking socket and is still bounded per read, so an
+upstream trickling its ServerHello holds the worker that dialled it. That is the
+same shape at the other trust boundary, where `upstream.read_full_tcp` is too,
+and it is not this procedure's to fix: what reaches here is anonymous and what
+reaches there is configured, and the two want different answers about how long
+to wait before giving up on one.
+*/
+@(private)
+accept_loop :: proc(conn: ^Conn) -> Error {
+	timeout := time.Duration(conn.read_timeout_ns)
+	deadline := time.tick_add(time.tick_now(), timeout)
+	for {
+		ERR_clear_error()
+		ret := SSL_accept(conn.ssl)
+		if ret == 1 {
+			return .None
+		}
+		// Both taken here, in this order, for the reason `handshake_error` gives:
+		// errno before anything else makes a system call, and the code before
+		// anything else touches the session. A would-block is the retry to wait out
+		// rather than a failure now that the socket is non-blocking; everything
+		// else goes to the same classifier the blocking path uses.
+		saved := posix.errno()
+		code := SSL_get_error(conn.ssl, ret)
+		switch code {
+		case SSL_ERROR_WANT_READ:
+			if !wait_ready(conn, {.IN}, timeout, deadline) {
+				return .Timeout
+			}
+		case SSL_ERROR_WANT_WRITE:
+			if !wait_ready(conn, {.OUT}, timeout, deadline) {
+				return .Timeout
+			}
+		case:
+			return classify_handshake(code, ret, saved)
+		}
+	}
 }
 
 // Both halves, for a caller with no context lifetime to worry about.
@@ -687,14 +753,16 @@ server_accept :: proc(ctx: ^Context, socket: net.TCP_Socket, allocator := contex
 }
 
 /*
-Take over the socket once the handshake is done.
+Take over the socket: carry the caller's timeouts over as poll deadlines and stop
+blocking on it.
 
-Up to here only one thread has touched this connection, so the handshake ran on
-a blocking socket bounded by whatever timeouts the caller set - which is exactly
-what it wants. The data phase is different: it may have a reader and a writer at
-the same time, and the lock keeping them out of each other's way must not span a
-wait. So the timeouts are carried over as poll deadlines and the socket goes
-non-blocking.
+A blocking read waits on SO_RCVTIMEO, which bounds one read and is restarted by
+every byte, and it waits inside OpenSSL where nothing outside can shorten it.
+Neither of the two things that follow can live with that. The data phase may have
+a reader and a writer at once, and the lock keeping them out of each other's way
+must not span a wait. The server handshake has to end at a deadline of its own
+rather than whenever a trickling peer stops - see `accept_loop`, which is why the
+client half takes this after its handshake and the server half before.
 */
 @(private)
 adopt_socket :: proc(conn: ^Conn) {
@@ -757,7 +825,7 @@ reader parked on an idle connection holds nothing a writer needs.
 */
 @(private)
 transfer :: proc(conn: ^Conn, op: Op, buf: []u8, timeout: time.Duration) -> (n: int, err: Error) {
-	deadline := time.time_add(time.now(), timeout)
+	deadline := time.tick_add(time.tick_now(), timeout)
 	for {
 		sync.mutex_lock(&conn.mu)
 		ERR_clear_error()
@@ -800,14 +868,23 @@ transfer :: proc(conn: ^Conn, op: Op, buf: []u8, timeout: time.Duration) -> (n: 
 	}
 }
 
-// Wait for the socket, with the connection's lock released. A zero timeout
-// waits indefinitely, which is what a blocking socket with no SO_RCVTIMEO did.
+/*
+Wait for the socket, with the connection's lock released. A zero timeout waits
+indefinitely, which is what a blocking socket with no SO_RCVTIMEO did.
+
+The deadline is a `Tick` rather than a `Time` because it is a bound on waiting
+rather than a moment anyone reads off a clock: `Time` is the wall clock, and a
+backward step of it - an NTP correction on a host whose clock has drifted -
+extends every deadline in flight by the size of the step, which on a handshake
+is the unbounded hold `accept_loop` exists to end, arriving by another route. A
+forward step cuts healthy waits short. The monotonic clock has neither.
+*/
 @(private)
-wait_ready :: proc(conn: ^Conn, events: posix.Poll_Event, timeout: time.Duration, deadline: time.Time) -> bool {
+wait_ready :: proc(conn: ^Conn, events: posix.Poll_Event, timeout: time.Duration, deadline: time.Tick) -> bool {
 	for {
 		ms: c.int = -1
 		if timeout > 0 {
-			remaining := time.diff(time.now(), deadline)
+			remaining := time.tick_diff(time.tick_now(), deadline)
 			if remaining <= 0 {
 				return false
 			}

@@ -38,6 +38,41 @@ H2_Context :: struct {
 	// where the other stream transports carry the same thing.
 	peer:   net.Endpoint,
 	path:   string,
+	/*
+	What the frame being read may take, reset by `h2_begin` where each one starts.
+
+	The other transports bound a message this way and this one needs it for the
+	same reason - see `Read_Budget`. An h2 connection is long-lived by design and
+	nothing here shortens that: the wait for the next frame to start is still the
+	whole of `client_timeout`, as it was when the socket option was the only bound.
+	What it ends is the peer that trickles one byte inside every wait and so is
+	never waited out at all, which before any stream exists - over the preface, or
+	a frame header - held a connection and a thread with no request ever made.
+
+	It is what one frame may take and not what one connection may, and those come
+	apart here. A peer that keeps completing frames keeps its connection, as a
+	client that keeps completing DNS messages keeps its own - but a DNS message is
+	charged to `stream_rate_check` and a frame is not: `h2_charged` bills the
+	limiter for requests, and SETTINGS, PING and an unknown type are none of them
+	one. A peer sending the first byte of a frame header late in the idle wait and
+	the other eight inside the deadline that byte starts completes nine bytes per
+	two `client_timeout`s, forever, and holds a connection, a thread and one of
+	`max_connections` while nothing bills it.
+
+	Both HTTP endpoints have that gap rather than this one alone: over HTTP/1.1
+	`serve_doh_request` answers a request for another path 404 and honours the
+	client's keep-alive, and `stream_rate_check` is below that return, so a peer
+	asking for the wrong path once per `client_timeout` holds a connection for
+	nothing too. Only the length-prefixed transports charge everything they keep a
+	connection for.
+
+	So it is a bound on how long a connection may live with no request on it, which
+	is a policy every transport wants one answer to and a browser holding an idle
+	DoH connection for minutes is the reason it is not an obvious one. Not this
+	budget's to decide; what this budget ends is the trickle inside a frame, which
+	is the defect it was written for.
+	*/
+	budget: Read_Budget,
 }
 
 @(private)
@@ -47,11 +82,21 @@ H2_Job :: struct {
 	req:       ^h2.Request,
 }
 
+// Called by `h2.read_exact` where the preface, a frame header or a frame payload
+// starts; `h2_read` then spends this budget across however many reads the peer
+// splits that into.
+@(private)
+h2_begin :: proc(user: rawptr) {
+	ctx := cast(^H2_Context)user
+	ctx.budget = Read_Budget {
+		idle = ctx.server.cfg.server.client_timeout,
+	}
+}
+
 @(private)
 h2_read :: proc(user: rawptr, buf: []u8) -> (n: int, ok: bool) {
 	ctx := cast(^H2_Context)user
-	got, err := tlsx.read(ctx.conn, buf)
-	return got, err == .None && got > 0
+	return conn_read_budgeted(Conn{tls = ctx.conn, peer = ctx.peer}, buf, &ctx.budget)
 }
 
 @(private)
@@ -75,6 +120,7 @@ serve_doh2 :: proc(s: ^Server, conn: ^tlsx.Conn, client: string, peer: net.Endpo
 		user  = &ctx,
 		read  = h2_read,
 		write = h2_write,
+		begin = h2_begin,
 	}
 	hc := h2.make_conn(io, h2_handler, &ctx)
 	// A response waits no longer for flow-control credit than the connection
