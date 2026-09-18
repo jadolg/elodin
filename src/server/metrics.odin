@@ -720,7 +720,7 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 		return
 	}
 
-	// One series per configured name, gathered once and walked four times, so
+	// One series per configured name, gathered once and walked five times, so
 	// the de-duplication happens in one place rather than in each family below.
 	Series :: struct {
 		name:       string,
@@ -728,6 +728,7 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 		failures:   u64,
 		latency:    u64,
 		unreadable: u64,
+		swept:      u64,
 		up:         bool,
 	}
 	all := make([dynamic]Series, 0, 8, context.temp_allocator)
@@ -744,6 +745,7 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 				all[i].failures += us.failures
 				all[i].latency += us.latency_ns_total
 				all[i].unreadable += us.unreadable_rcode
+				all[i].swept += us.swept_rcode
 				if live {
 					all[i].up = true
 				}
@@ -758,6 +760,7 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 					failures = us.failures,
 					latency = us.latency_ns_total,
 					unreadable = us.unreadable_rcode,
+					swept = us.swept_rcode,
 					up = live,
 				},
 			)
@@ -797,6 +800,31 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 	)
 	for u in all {
 		metrics.sample(b, "elodin_upstream_unreadable_rcode_total", u.unreadable, metrics.Label{"upstream", u.name})
+	}
+
+	/*
+	Which upstream answered something another member of its group had to answer
+	instead - a SERVFAIL, a REFUSED, an rcode no client could read, or, on a
+	chain lookup, anything that is not an answer about the name.
+
+	The same reasoning as the family above, for the case that is far more
+	common. `resolve_insisting` sweeps past such a reply without counting a
+	failure, so the member that is doing it holds a clean
+	`elodin_upstream_failures_total` and an `elodin_upstream_up` of 1 while
+	every query through the group costs an extra exchange. This is the figure
+	that names it. One per reply the group could not use - not one per exchange
+	the sweep then made, and counted whether or not there was anybody left to
+	ask, since a group with nowhere to go is the arrangement breaking the most
+	queries.
+	*/
+	metrics.family(
+		b,
+		"elodin_upstream_swept_rcode_total",
+		.Counter,
+		"Replies from each upstream that its group could not use, one per reply and whether or not another member was left to ask: for a client's own question a SERVFAIL, a REFUSED or an rcode it could not read; for a DNSSEC chain lookup anything that is not NOERROR or NXDOMAIN.",
+	)
+	for u in all {
+		metrics.sample(b, "elodin_upstream_swept_rcode_total", u.swept, metrics.Label{"upstream", u.name})
 	}
 
 	/*

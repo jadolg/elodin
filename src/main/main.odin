@@ -548,6 +548,9 @@ main :: proc() {
 				fmt.printfln("  warning: %s", text)
 			}
 		}
+		if text, say := mixed_validation_warning(&cfg); say {
+			fmt.printfln("  warning: %s", text)
+		}
 		return
 	}
 
@@ -597,6 +600,10 @@ main :: proc() {
 	together to work, and a line telling an operator to write both would now be
 	telling them to do something that changes nothing.
 	*/
+	if text, say := mixed_validation_warning(&cfg); say {
+		logx.warnf("%s", text)
+	}
+
 	switch {
 	case !cfg.special_use.enabled:
 		logx.warnf("special_use.enabled is off: localhost., onion. and invalid. are forwarded to the upstream")
@@ -614,6 +621,46 @@ main :: proc() {
 		logx.warnf("special_use.onion is off: .onion queries are forwarded, which is only safe to a Tor-aware upstream")
 	}
 	run(&cfg, opts, service)
+}
+
+/*
+Validation off and a group with somewhere else to go: the one arrangement where
+the sweep in `upstream.resolve_insisting` can turn a rejected answer into a
+served one.
+
+A member that validates answers SERVFAIL for a zone it found bogus. The sweep
+asks the next member, and if that one does not validate, what comes back is the
+forgery - cached, and served to every client behind this server. `usable_rcode`
+keeps the SERVFAIL where the member says why in an RFC 8914 extended error, but
+most do not by default: Unbound needs `ede: yes` and dnsmasq has none, so the
+check cannot be relied on and this says so once rather than pretending
+otherwise.
+
+Said as a condition rather than as a verdict, because from here the two cannot
+be told apart: a group of two upstreams that both validate is in no danger from
+this, a group where one does and one does not is, and nothing in the
+configuration says which. The line names the arrangement and what would follow
+from it, and an operator who knows their upstreams reads it in one go.
+
+One procedure for the startup log and for `--check`, which is where an operator
+looks before restarting, so the two readings cannot drift apart.
+*/
+@(private)
+mixed_validation_warning :: proc(cfg: ^config.Config) -> (text: string, say: bool) {
+	if cfg.dnssec.enabled {
+		return "", false
+	}
+	several := len(cfg.upstream.servers) > 1
+	for route in cfg.upstream.zones {
+		if len(route.upstream.servers) > 1 {
+			several = true
+		}
+	}
+	if !several {
+		return "", false
+	}
+	return "dnssec.enabled is off and an upstream group has more than one server: if its members do not all validate, a SERVFAIL from one that does is asked of one that does not - see elodin_upstream_swept_rcode_total",
+		true
 }
 
 run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {

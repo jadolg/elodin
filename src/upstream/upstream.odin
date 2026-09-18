@@ -107,6 +107,9 @@ Stats :: struct {
 	// Replies from this server that the caller could not pass on because their
 	// rcode is not one a client can read; see `note_unreadable_rcode`.
 	unreadable_rcode: u64,
+	// Replies from this server that another member of its group answered
+	// instead; see `note_swept_rcode`.
+	swept_rcode:      u64,
 }
 
 // After this many consecutive failures an upstream is skipped for COOLDOWN.
@@ -272,6 +275,46 @@ note_unreadable_rcode :: proc(u: ^Upstream) {
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
 	u.stats.unreadable_rcode += 1
+}
+
+/*
+Count a reply from `u` that another member of its group answered instead.
+
+The trace a swept member leaves, and the only one. `resolve_insisting` sweeps
+past a SERVFAIL, a REFUSED or an unreadable rcode without touching health - the
+server replied, and parking it over what it replied is what `note_unreadable_rcode`
+argues against - so `failures` stays at zero, `healthy` goes on reporting it up,
+and the client's query is answered and counted as forwarded. An upstream that
+has stopped being able to answer anything is then invisible in every other
+figure, while the group behind it quietly runs at two exchanges per query.
+
+Counted by this package rather than by the caller, unlike `unreadable_rcode`:
+the sweep is where the decision is made and where the member that was passed
+over is known. It names that member and not the one that answered, which is the
+question an operator has - which of these should I go and look at.
+
+One per reply the group could not use, which is the figure to read it as, and
+not the number of extra exchanges it caused: a group of four counts one for a
+sweep that asks three of them, and a lone upstream counts one for a reply there
+was nobody else to improve on. That last case is deliberate rather than
+tolerated - the arrangement that most needs naming is a member REFUSING
+everything beside a member in its cooldown, where the sweep finds nowhere to go
+and every client query breaks while `failures` and `up` both look healthy. What
+the sweep spends is a different question, and `elodin_upstream_queries_total`
+per member already answers it.
+
+Not confined to the rcodes a client's own question refuses, either.
+`resolve_insisting` is shared with the chain lookups, where `answerable` will
+take only NOERROR and NXDOMAIN, so a FORMERR or a NOTIMP to a `DS` lookup lands
+here too.
+*/
+note_swept_rcode :: proc(u: ^Upstream) {
+	if u == nil {
+		return
+	}
+	sync.mutex_lock(&u.mu)
+	defer sync.mutex_unlock(&u.mu)
+	u.stats.swept_rcode += 1
 }
 
 stats_of :: proc(u: ^Upstream) -> Stats {

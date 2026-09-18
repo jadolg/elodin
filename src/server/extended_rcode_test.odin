@@ -535,15 +535,23 @@ test_a_broken_upstream_is_asked_past_for_an_extended_rcode :: proc(t: ^testing.T
 }
 
 /*
-An rcode the client can read is still the client's answer, and still ends the
-search.
+An rcode that states something about the name is still the client's answer, and
+still ends the search.
 
-This is the half that must not change. SERVFAIL is a reply, and for a client's
-own question the rcode is the answer - `upstream.resolve_answerable`'s own
-reading says so, and passing it on is honest. A guard that swept the group for
-one would turn every declining upstream into a second query, and every ACL a
-resolver applies to a client of ours into an answer fetched from somewhere that
-does not apply it.
+This is the half that must not change. NXDOMAIN is a verdict about the name
+rather than a report about the server, and for a client's own question the rcode
+is the answer - `upstream.resolve_answerable`'s own reading says so, and passing
+it on is honest. A guard that swept the group for one would turn every name a
+zone does not hold into a second query to every other member, and every question
+a resolver answers into a race between two of them.
+
+SERVFAIL and REFUSED are the two that are not such a verdict, and issue #309 is
+what the group does with them; `test_a_group_with_a_spare_is_asked_past_a_servfail`
+below is that case. The cost written down there is REFUSED as an ACL: a member
+that declines this question on policy has the member beside it asked, which is a
+resolver upstream of ours applying a rule we then ask somewhere else about. That
+is the trade the issue makes, and it is made for the deployment where two
+upstreams are configured so that one of them can be broken.
 
 Two upstreams, and the second must be left alone: it is read after the call has
 returned rather than raced, which is both exact and quick. See `mock_untouched`.
@@ -575,7 +583,7 @@ test_a_readable_rcode_is_still_the_clients_answer :: proc(t: ^testing.T) {
 
 	x := Canned_Exchange {
 		socket = first_socket,
-		reply  = plain_rcode_reply(.Serv_Fail),
+		reply  = plain_rcode_reply(.NX_Domain),
 	}
 	mock := thread.create_and_start_with_poly_data(&x, serve_one_canned)
 	out, outcome, ok := handle_query(&s, tlsa_query(), .UDP, "127.0.0.1:5555", context.temp_allocator)
@@ -588,10 +596,89 @@ test_a_readable_rcode_is_still_the_clients_answer :: proc(t: ^testing.T) {
 	}
 
 	testing.expect_value(t, outcome, Outcome.Forwarded)
-	testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.Serv_Fail)
+	testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.NX_Domain)
 	testing.expect(t, mock_untouched(second_socket), "a readable rcode sent the group a second query")
 
 	free_all(context.temp_allocator)
+}
+
+/*
+And where the first member SERVFAILs or REFUSEs, the client gets the answer the
+member beside it had all along.
+
+Issue #309, over the path a client's question actually takes. RFC 2308 section
+7.1 reads SERVFAIL as the responder saying nothing about the name, and REFUSED as
+it declining to be asked; neither is a statement the rest of a failover group
+cannot improve on, and neither trips the health cooldown, which counts transport
+failures - so a member in that state answers promptly and forever, and before
+this every client query stopped at it.
+
+Counted as a forward rather than a failure, because that is what happened: a
+question went to the group and an answer came back.
+*/
+@(test)
+test_a_group_with_a_spare_is_asked_past_a_servfail :: proc(t: ^testing.T) {
+	for rcode in ([]dns.Rcode{.Serv_Fail, .Refused}) {
+		broken_socket, broken_spec, broken_ok := bind_mock(t, "broken")
+		if !broken_ok {
+			return
+		}
+		defer net.close(broken_socket)
+		good_socket, good_spec, good_ok := bind_mock(t, "good")
+		if !good_ok {
+			return
+		}
+		defer net.close(good_socket)
+
+		specs := make([]config.Upstream_Spec, 2, context.temp_allocator)
+		specs[0] = broken_spec
+		specs[1] = good_spec
+		cfg := forwarding_config(specs)
+
+		group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+		if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+			return
+		}
+		defer upstream.destroy_group(group)
+		s := Server{cfg = &cfg, group = group}
+
+		broken := Canned_Exchange {
+			socket = broken_socket,
+			reply  = plain_rcode_reply(rcode),
+		}
+		good := Canned_Exchange {
+			socket = good_socket,
+			reply  = tlsa_answer_reply(),
+		}
+		broken_mock := thread.create_and_start_with_poly_data(&broken, serve_one_canned)
+		good_mock := thread.create_and_start_with_poly_data(&good, serve_one_canned)
+		out, outcome, ok := handle_query(&s, tlsa_query(), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		thread.join(broken_mock)
+		thread.join(good_mock)
+		thread.destroy(broken_mock)
+		thread.destroy(good_mock)
+
+		testing.expect(t, broken.got, "the first upstream was never asked")
+		testing.expectf(t, good.got, "a %v ended the search with a spare upstream standing by", rcode)
+		if !testing.expect(t, ok, "nothing came back at all") {
+			return
+		}
+
+		testing.expect_value(t, outcome, Outcome.Forwarded)
+		testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.No_Error)
+
+		decoded, derr := dns.decode_message(out, context.temp_allocator)
+		testing.expect_value(t, derr, dns.Decode_Error.None)
+		if testing.expect(t, len(decoded.answer) == 1, "the client was not served the record the second upstream had") {
+			testing.expect_value(t, decoded.answer[0].type, dns.Type.TLSA)
+		}
+
+		counters := stats_of(&s)
+		testing.expect_value(t, counters.forwarded, u64(1))
+		testing.expect_value(t, counters.failed, u64(0))
+
+		free_all(context.temp_allocator)
+	}
 }
 
 /*

@@ -415,11 +415,78 @@ resets partway through is retried once first, since some public resolvers do tha
 to a fair share of fresh connections while the very next attempt goes through.
 Only a reset is retried.
 
-An upstream's rcode is the client's answer — SERVFAIL and REFUSED are passed on
-as they arrive, since the rcode is what the client asked for — with one
-exception. An extended rcode (RFC 6891 section 6.1.3) is twelve bits, four in
-the header and eight in the OPT record, and a stub client reads the four: a
-BADVERS forwarded as it stands reads as NOERROR over an empty answer section,
+An upstream's rcode is the client's answer, with two exceptions.
+
+SERVFAIL and REFUSED are not answers about the name: RFC 2308 section 7.1 reads
+the first as the server reporting on itself, and the second is it declining to
+be asked — an ACL that no longer lists this resolver, its own recursion down,
+throttling. A member of a failover group in that state answers promptly and
+forever, which never trips the cooldown above, so the rest of the group is asked
+instead and the first member keeps its place in the order. Where nobody does
+better — a single upstream, the ordinary arrangement — the rcode that arrived is
+still what the client is handed.
+
+One SERVFAIL is exempt: the one carrying an RFC 8914 extended error that says
+the name failed DNSSEC validation (codes 6 to 12). That is a verdict about the
+name, and asking a member of the group that does not validate would fetch the
+very answer the first member rejected — which matters with `dnssec.enabled:
+false`, where nothing here is checking either. It is a second line rather than
+the defence, and it has preconditions: the upstream has to send the extended
+error, which several do not by default (Unbound needs `ede: yes`, dnsmasq has
+none), and the client has to have asked with EDNS, since a reply to a query
+without an OPT record cannot carry one. With `dnssec.enabled` on, as it ships,
+the question goes out with CD set — so there is no SERVFAIL to read — and
+validation here refuses the forgery whichever member of the group supplied it.
+The other edge of it: an upstream whose own validation is broken, a drifted
+clock or a stale root key, states one of these about every signed name and is
+believed, so no failover happens for those names until it is taken out of the
+group.
+
+A REFUSED that carries an RFC 8914 extended error of 15, 16 or 17 — blocked,
+censored or filtered — is exempt on the same grounds: those say the responder is
+declining *this name* on policy, which is a statement about it, so a filtering
+resolver (AdGuard Home, Blocky, an RPZ rule) stays usable as a member of a group
+as long as it says what it did. Code 18, prohibited, is not exempt: that is the
+responder declining this *client*, which is the ACL case the sweep exists for.
+
+A filtering member that says nothing — most of them, today — has its blocks asked
+of the member beside it and answered. The server says so once, at warn, the first
+time it sweeps a REFUSED carrying no such code, naming the member; and
+`dnssec.enabled: false` with any group of more than one server gets a line at
+startup, for the same reason on the validation side. Neither changes what the
+server does: an upstream meant to filter belongs on its own, as the only member
+of its group or behind a zone route.
+
+The member that was passed over is counted against its name in
+`elodin_upstream_swept_rcode_total{upstream}`, since its health is deliberately
+left alone and no other figure would name it.
+
+What the sweep costs is up to one extra exchange per remaining member of the
+group, and a bounded wait: the sweep counts what each exchange cost it and asks
+nobody else once that reaches one `upstream.timeout`. The exchange that crosses
+the line is allowed to finish, so the worst of it is two timeouts rather than
+one — what it rules out is the third and the fourth, however many spares a group
+has. A failure
+that cost nothing — a member whose hostname cannot be resolved, which never
+parks either — is passed over rather than stopping the sweep. A live spare
+standing behind one that swallows the whole timeout waits for that member to
+accrue its three failures and be parked, three queries, after which the sweep
+skips it and reaches the live one. A member this query has already failed to reach is not asked again
+either, so a group with one dead member and one that declines pays that member's
+timeout once rather than twice. Two upstreams — what the examples configure — pay
+one extra exchange for a name the first cannot answer.
+
+REFUSED is worth one more thought here, because it is also what some resolvers
+answer when they are rate-limiting rather than when they are declining on
+policy. Health is deliberately untouched for it, so there is no backoff: a
+throttled member has its questions taken to the member beside it, at the moment
+it asked to be asked less. A group of two public resolvers under one busy client
+is the shape to watch `elodin_upstream_swept_rcode_total` for.
+
+The other exception is an extended rcode. It is twelve bits (RFC 6891 section
+6.1.3), four in the header and eight in the OPT record, and a stub client reads
+the four: a BADVERS forwarded as it stands reads as NOERROR over an empty
+answer section,
 which is a client being told a name has no such record when what happened is
 that its resolver could not find out. A DANE or MTA-STS client that believes it
 downgrades. So a reply whose composed rcode is 16 or above is not one this
@@ -2015,6 +2082,7 @@ as a warning at startup.
 | `elodin_upstream_latency_seconds_total{upstream}` | counter | cumulative round-trip time; divide by the query counter under `rate()` for the mean |
 | `elodin_upstream_up{upstream}` | gauge | 0 while an upstream is in its failure cooldown |
 | `elodin_upstream_unreadable_rcode_total{upstream}` | counter | replies from each upstream refused because their rcode is one a client would read as a different rcode — the extended half lives in the OPT record and a stub reads the header. Not counted as a failure above, on purpose: those bytes are forgeable, and a failure would park the group |
+| `elodin_upstream_swept_rcode_total{upstream}` | counter | replies from each upstream that another member of its group was asked to answer instead: for a client's question a SERVFAIL, a REFUSED or an unreadable rcode, and for a DNSSEC chain lookup anything that is not NOERROR or NXDOMAIN. One per such reply, whether or not there was another member left to ask — a member REFUSING everything beside one in its cooldown breaks every query while both look healthy, and this is what names it. Not a failure either, so this is the only figure naming a member that answers but cannot help |
 | `elodin_udp_datagrams_total{reader}` | counter | datagrams each UDP reader took off its socket |
 | `elodin_udp_receive_drops_total{reader}` | counter | datagrams the kernel dropped on that reader's receive queue before they could be read; absent where `/proc` cannot be read |
 | `elodin_pool_workers{pool}` / `elodin_pool_pending{pool}` | gauge | the `query` and `upstream` pools; `pending` that does not return to zero is `server.workers` set too low |
