@@ -996,3 +996,51 @@ test_a_nearly_spent_deadline_does_not_arm_an_endless_read :: proc(t: ^testing.T)
 	// the budget for reading a message.
 	testing.expect_value(t, time.Duration(tls.write_timeout_ns), 10 * time.Second)
 }
+
+/*
+Shortening how long an idle connection is held does not shorten the handshake in
+front of it.
+
+`server_handshake` bounds a handshake as a whole now, and the figure it uses is
+the socket's receive timeout - which `stream_job` sets from `client_timeout`, the
+same value RFC 7828 advertises as how long an idle connection is kept. An
+operator shortens that to reclaim slots sooner, which says nothing about how long
+a client may take to shake hands: a handshake is several round trips and whatever
+a lossy path makes of them, so the two sharing one figure would have a
+high-latency client failing to connect at all. Hence the floor, and hence this,
+because a floor that quietly stopped applying would look exactly like it working.
+*/
+@(test)
+test_the_handshake_keeps_its_floor_under_a_short_client_timeout :: proc(t: ^testing.T) {
+	Want :: struct {
+		client_timeout: time.Duration,
+		handshake:      time.Duration,
+	}
+	cases := []Want {
+		// Above the floor, so the connection's own figure stands: an operator who
+		// raised it meant the handshake too.
+		{30 * time.Second, 30 * time.Second},
+		// The shipped default, comfortably above.
+		{10 * time.Second, 10 * time.Second},
+		// Below it, and the handshake keeps the floor.
+		{1 * time.Second, HANDSHAKE_FLOOR},
+		{50 * time.Millisecond, HANDSHAKE_FLOOR},
+		// Exactly the floor is not below it.
+		{HANDSHAKE_FLOOR, HANDSHAKE_FLOOR},
+		// No receive timeout at all is what a non-positive value means, and a
+		// floor is not a bound the operator asked to add - see
+		// `test_a_timeout_that_cannot_be_stated_is_left_off`.
+		{0, 0},
+		{-1 * time.Second, -1 * time.Second},
+	}
+	for c in cases {
+		testing.expectf(
+			t,
+			handshake_timeout(c.client_timeout) == c.handshake,
+			"a %v client timeout gives the handshake %v, expected %v",
+			c.client_timeout,
+			handshake_timeout(c.client_timeout),
+			c.handshake,
+		)
+	}
+}

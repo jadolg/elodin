@@ -1691,6 +1691,9 @@ stream_job :: proc(data: rawptr) {
 		defer net.close(job.socket)
 		serve_dns_stream(s, {socket = job.socket, peer = job.client}, .TCP, client)
 	case .DoT:
+		// The handshake is bounded as a whole, and by this - not by what the
+		// connection's reads are given. See `handshake_timeout`; put back below.
+		_ = net.set_option(job.socket, .Receive_Timeout, handshake_timeout(timeout))
 		conn, err := accept_tls(job.ctx.listeners, .DoT, job.socket)
 		if err != .None {
 			logx.debugf("dot: handshake with %s failed: %v", client, err)
@@ -1701,8 +1704,13 @@ stream_job :: proc(data: rawptr) {
 		// `Stats.handshakes` for what the figure is for.
 		sync.atomic_add(&s.stats.handshakes, 1)
 		defer tlsx.close(conn)
+		// Back to the connection's own figure now the handshake is done.
+		tlsx.set_read_timeout(conn, timeout)
 		serve_dns_stream(s, {socket = job.socket, tls = conn, peer = job.client}, .DoT, client)
 	case .DoH:
+		// The handshake is bounded as a whole, and by this - not by what the
+		// connection's reads are given. See `handshake_timeout`; put back below.
+		_ = net.set_option(job.socket, .Receive_Timeout, handshake_timeout(timeout))
 		conn, err := accept_tls(job.ctx.listeners, .DoH, job.socket)
 		if err != .None {
 			logx.debugf("doh: handshake with %s failed: %v", client, err)
@@ -1711,6 +1719,8 @@ stream_job :: proc(data: rawptr) {
 		}
 		sync.atomic_add(&s.stats.handshakes, 1)
 		defer tlsx.close(conn)
+		// Back to the connection's own figure now the handshake is done.
+		tlsx.set_read_timeout(conn, timeout)
 		if tlsx.alpn_protocol(conn) == "h2" {
 			serve_doh2(s, conn, client, job.client)
 		} else {
@@ -1980,6 +1990,35 @@ A non-positive `idle` is no receive timeout on the socket at all - see
 setting means - and leaves both unbounded, rather than turning "wait forever" into
 "give up at once".
 */
+/*
+The least a TLS handshake gets, whatever a connection's reads are given.
+
+`server_handshake` bounds the handshake as a whole now rather than each read of
+it, and the figure it uses is the socket's receive timeout - which is
+`client_timeout`, the same value RFC 7828 advertises to a connected client as
+how long an idle connection is held. Those two are not the same want. Ten
+seconds of idle is generous, but an operator who shortens `client_timeout` to
+reclaim slots sooner would otherwise be capping a whole TLS handshake at the
+same figure, and a handshake is several round trips plus whatever a lossy path
+makes of them: a high-latency client would start failing to connect at all,
+which is not what shortening an idle timeout asks for.
+
+So the handshake has a floor under it and the connection's figure is put back
+once the handshake is done. Five seconds is many times over what a handshake
+costs on any path worth serving, and it is still a bound - which is the whole
+point, the trickle being what `accept_loop` is there to end.
+
+A non-positive `client_timeout` is no receive timeout at all and stays that way:
+the operator asked for no bound, and a floor is not a bound they asked to add.
+*/
+@(private)
+HANDSHAKE_FLOOR :: 5 * time.Second
+
+@(private)
+handshake_timeout :: proc(client_timeout: time.Duration) -> time.Duration {
+	return client_timeout if client_timeout <= 0 else max(client_timeout, HANDSHAKE_FLOOR)
+}
+
 @(private)
 Read_Budget :: struct {
 	idle:     time.Duration,

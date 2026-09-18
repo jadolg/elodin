@@ -717,7 +717,7 @@ to wait before giving up on one.
 @(private)
 accept_loop :: proc(conn: ^Conn) -> Error {
 	timeout := time.Duration(conn.read_timeout_ns)
-	deadline := time.time_add(time.now(), timeout)
+	deadline := time.tick_add(time.tick_now(), timeout)
 	for {
 		ERR_clear_error()
 		ret := SSL_accept(conn.ssl)
@@ -825,7 +825,7 @@ reader parked on an idle connection holds nothing a writer needs.
 */
 @(private)
 transfer :: proc(conn: ^Conn, op: Op, buf: []u8, timeout: time.Duration) -> (n: int, err: Error) {
-	deadline := time.time_add(time.now(), timeout)
+	deadline := time.tick_add(time.tick_now(), timeout)
 	for {
 		sync.mutex_lock(&conn.mu)
 		ERR_clear_error()
@@ -868,14 +868,23 @@ transfer :: proc(conn: ^Conn, op: Op, buf: []u8, timeout: time.Duration) -> (n: 
 	}
 }
 
-// Wait for the socket, with the connection's lock released. A zero timeout
-// waits indefinitely, which is what a blocking socket with no SO_RCVTIMEO did.
+/*
+Wait for the socket, with the connection's lock released. A zero timeout waits
+indefinitely, which is what a blocking socket with no SO_RCVTIMEO did.
+
+The deadline is a `Tick` rather than a `Time` because it is a bound on waiting
+rather than a moment anyone reads off a clock: `Time` is the wall clock, and a
+backward step of it - an NTP correction on a host whose clock has drifted -
+extends every deadline in flight by the size of the step, which on a handshake
+is the unbounded hold `accept_loop` exists to end, arriving by another route. A
+forward step cuts healthy waits short. The monotonic clock has neither.
+*/
 @(private)
-wait_ready :: proc(conn: ^Conn, events: posix.Poll_Event, timeout: time.Duration, deadline: time.Time) -> bool {
+wait_ready :: proc(conn: ^Conn, events: posix.Poll_Event, timeout: time.Duration, deadline: time.Tick) -> bool {
 	for {
 		ms: c.int = -1
 		if timeout > 0 {
-			remaining := time.diff(time.now(), deadline)
+			remaining := time.tick_diff(time.tick_now(), deadline)
 			if remaining <= 0 {
 				return false
 			}

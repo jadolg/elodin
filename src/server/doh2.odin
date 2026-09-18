@@ -47,8 +47,15 @@ H2_Context :: struct {
 	whole of `client_timeout`, as it was when the socket option was the only bound.
 	What it ends is the peer that trickles one byte inside every wait and so is
 	never waited out at all, which before any stream exists - over the preface, or
-	a frame header - is a connection and a thread held while no request is ever
-	made and nothing charges the client for one.
+	a frame header - held a connection and a thread with no request ever made.
+
+	It is what one frame may take and not what one connection may, which is the
+	same line the DNS stream draws: a peer that keeps completing frames keeps its
+	connection, as a client that keeps completing messages keeps its own. The two
+	are not quite the same bargain here, because `h2_charged` bills the limiter
+	for requests and a peer can complete SETTINGS and PING frames forever without
+	ever making one. Bounding a connection rather than a frame is a question for
+	every transport at once and is not this budget's to answer.
 	*/
 	budget: Read_Budget,
 }

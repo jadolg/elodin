@@ -42,6 +42,13 @@ BUDGET :: 1 * time.Second
 // reclaimed.
 @(private = "file")
 DRIP_LIMIT :: 8
+// What a reclaimed connection costs the client: the budget is a second and a
+// drip is 400ms, so the close lands on the third, and the room above that is for
+// a loaded box rather than for a server that took its time about it. Asserted
+// because `closed` alone would pass on a connection that went away for any
+// reason at all, including the last drip of a run that hit `DRIP_LIMIT`.
+@(private = "file")
+DRIPS_ALLOWED :: 5
 
 @(private = "file")
 config_drip :: proc(r: ^Runner, udp_port, tcp_port, doh_port, upstream_port: int) -> string {
@@ -140,7 +147,7 @@ run_slow_drip_cases :: proc(r: ^Runner) {
 			message[1] = u8(dns.HEADER_SIZE)
 			sent, closed := drip_until_closed(&conn, message[:])
 			check(r, closed, "a byte every %v held the connection for all %d bytes", DRIP, sent)
-			check(r, sent < len(message), "the whole message was accepted a byte at a time")
+			check(r, sent <= DRIPS_ALLOWED, "the connection was held for %d drips of a %v budget", sent, BUDGET)
 		}
 	}
 	end_case(r)
@@ -162,7 +169,7 @@ run_slow_drip_cases :: proc(r: ^Runner) {
 			tlsx.set_read_timeout(conn.tls, DRIP)
 			sent, closed := drip_until_closed(&conn, transmute([]u8)string(h2.PREFACE))
 			check(r, closed, "a byte every %v held the connection for all %d bytes", DRIP, sent)
-			check(r, sent < len(h2.PREFACE), "the whole preface was accepted a byte at a time")
+			check(r, sent <= DRIPS_ALLOWED, "the connection was held for %d drips of a %v budget", sent, BUDGET)
 		}
 	}
 	end_case(r)
