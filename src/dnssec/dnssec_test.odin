@@ -316,6 +316,54 @@ test_validates_nsec3_name_error :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+/*
+A denial whose hashing allowance ran out is `Indeterminate`, not `Bogus`.
+
+`MAX_NSEC3_ROUNDS_PER_QUERY` is this server's limit rather than anything the
+records did wrong, and the two verdicts are read very differently: `Bogus` is a
+forgery, logged with the client's address beside the word and handed to the
+client as extended error 6, while `Indeterminate` says only that this server did
+not finish reading the proof. The same distinction every other allowance in
+`validate.odin` makes, made for the one that counts SHA-1.
+
+The proof itself is real captured traffic - com's NSEC3 denial for a name that
+is not there - so the only difference between the two calls below is the meter.
+The hashing runs out in the DS denial the walk down to the name reads, before
+the answer's own proof is reached, which is why the reason names the chain: the
+allowance is one allowance, and whichever proof reaches it first is the one that
+stops.
+*/
+@(test)
+test_a_denial_that_runs_out_of_hashing_is_indeterminate :: proc(t: ^testing.T) {
+	msg, err := dns.decode_message(unhex(fixture("nxdomain_com").wire), context.temp_allocator)
+	testing.expect(t, err == .None, "the captured denial should decode")
+
+	qname :: "zzzz-does-not-exist-xq7.com."
+	// A validator apiece, because what the first call learns about the zone is
+	// cached and the second would read the answer rather than work it out.
+	base_v := test_validator()
+	defer destroy_validator(base_v)
+	fresh := Budget{}
+	baseline := validate_denial(base_v, &fresh, msg, qname, .A, .IN, u32(FIXTURE_TIME), fixture_now(), context.temp_allocator)
+	testing.expectf(
+		t,
+		baseline.status == .Secure || baseline.status == .Insecure,
+		"the denial should hold up with a whole allowance, got %v (%s)",
+		baseline.status,
+		baseline.reason,
+	)
+
+	v := test_validator()
+	defer destroy_validator(v)
+	spent := Budget {
+		nsec3 = {rounds = MAX_NSEC3_ROUNDS_PER_QUERY},
+	}
+	result := validate_denial(v, &spent, msg, qname, .A, .IN, u32(FIXTURE_TIME), fixture_now(), context.temp_allocator)
+	testing.expect_value(t, result.status, Status.Indeterminate)
+	testing.expect_value(t, result.reason, "chain of trust unavailable")
+	free_all(context.temp_allocator)
+}
+
 @(test)
 test_validates_nodata :: proc(t: ^testing.T) {
 	// cloudflare.com answers a nonexistent name with NODATA and an NSEC that

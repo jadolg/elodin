@@ -182,6 +182,9 @@ is per client question: two queries arriving at once each get their own.
 Budget :: struct {
 	lookups:       int,
 	verifications: int,
+	// The hashing a denial proved with NSEC3 may spend, which no count of
+	// lookups or verifications bounds: see `MAX_NSEC3_ROUNDS_PER_QUERY`.
+	nsec3:         Nsec3_Budget,
 }
 
 /*
@@ -455,7 +458,9 @@ validate :: proc(
 	}
 	class := msg.question[0].class if len(msg.question) > 0 else dns.Class.IN
 	unix := u32(time.to_unix_seconds(now))
-	budget := Budget{}
+	budget := Budget {
+		nsec3 = {max_iterations = v.max_nsec3_iterations},
+	}
 
 	/*
 	REFUSED, SERVFAIL and the rest carry nothing to authenticate. Demanding a
@@ -1683,13 +1688,23 @@ validate_denial :: proc(
 	if rcode == .NX_Domain {
 		proof = nsec_proves_name_error(nsecs, qname, allocator) if len(nsecs) > 0 else .Failed
 		if proof != .Proven && len(nsec3s) > 0 {
-			proof = nsec3_proves_name_error(nsec3s, qname, established, v.max_nsec3_iterations, allocator)
+			proof = nsec3_proves_name_error(nsec3s, qname, established, &budget.nsec3, allocator)
 		}
 	} else {
 		proof = nsec_proves_no_data(nsecs, qname, qtype, allocator) if len(nsecs) > 0 else .Failed
 		if proof != .Proven && len(nsec3s) > 0 {
-			proof = nsec3_proves_no_data(nsec3s, qname, established, qtype, v.max_nsec3_iterations, allocator)
+			proof = nsec3_proves_no_data(nsec3s, qname, established, qtype, &budget.nsec3, allocator)
 		}
+	}
+
+	/*
+	The hashing allowance, and the same answer as the two above it. A proof this
+	server stopped hashing partway through is not a proof it found wanting, and
+	`Bogus` would report our own limit to the client as a forgery - with its
+	address beside the word in the log.
+	*/
+	if proof == .Failed && budget.nsec3.exhausted {
+		return {status = .Indeterminate, reason = "verification budget spent"}
 	}
 
 	switch proof {
@@ -2227,7 +2242,7 @@ validate_wildcard_proof :: proc(
 		}
 	}
 	if len(denial.nsec3s) > 0 {
-		if cover, covered := nsec3_covering(denial.nsec3s, next_closer, v.max_nsec3_iterations); covered {
+		if cover, covered := nsec3_covering(denial.nsec3s, next_closer, &budget.nsec3); covered {
 			// RFC 5155 section 9.2 forbids the AD bit over an opt-out cover:
 			// the span may be hiding an unsigned delegation, so the next closer
 			// name is not proven absent and the wildcard may not have applied.
@@ -2236,6 +2251,11 @@ validate_wildcard_proof :: proc(
 			}
 			return .Secure, denial.verified, ""
 		}
+	}
+	// As above: hashing we stopped short of is not a cover we looked for and
+	// failed to find.
+	if budget.nsec3.exhausted {
+		return .Indeterminate, nil, "verification budget spent"
 	}
 	return .Bogus, nil, "wildcard expansion not proven"
 }
@@ -2702,7 +2722,13 @@ zone_step :: proc(
 		return .Bogus, nil
 	}
 
-	step = denial_step(nsecs, nsec3s, child, parent, v.max_nsec3_iterations)
+	step = denial_step(nsecs, nsec3s, child, parent, &budget.nsec3)
+	// A step whose NSEC3 hashing ran out is one this server did not read to the
+	// end, which is `Indeterminate` territory rather than a broken delegation -
+	// the same reading `ds_spent` above gets.
+	if step == .Bogus && budget.nsec3.exhausted {
+		return .Indeterminate, nil
+	}
 	if step == .Insecure {
 		cache_put(v, child, .Insecure, nil, negative_ttl(msg), now)
 	}
@@ -2722,7 +2748,7 @@ denial_step :: proc(
 	nsecs: []Nsec_Rr,
 	nsec3s: []Nsec3_Rr,
 	child, parent: string,
-	max_nsec3_iterations: int,
+	nsec3_budget: ^Nsec3_Budget,
 ) -> Step {
 	if len(nsecs) > 0 {
 		if nsec_proves_no_ds(nsecs, child) == .Proven {
@@ -2733,14 +2759,14 @@ denial_step :: proc(
 		}
 	}
 	if len(nsec3s) > 0 {
-		if nsec3_proves_no_ds(nsec3s, child, parent, max_nsec3_iterations) == .Proven {
+		if nsec3_proves_no_ds(nsec3s, child, parent, nsec3_budget) == .Proven {
 			return .Insecure
 		}
-		if nsec3_proves_no_delegation(nsec3s, child, parent, max_nsec3_iterations) {
+		if nsec3_proves_no_delegation(nsec3s, child, parent, nsec3_budget) {
 			// An NSEC3 zone publishes a record for every empty non-terminal
 			// (RFC 5155 section 7.1), so a name with none of its own is a name
 			// that is not there.
-			_, matched := nsec3_matching(nsec3s, child, max_nsec3_iterations)
+			_, matched := nsec3_matching(nsec3s, child, nsec3_budget)
 			return .No_Cut if matched else .Absent
 		}
 	}

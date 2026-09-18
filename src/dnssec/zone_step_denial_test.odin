@@ -6,6 +6,20 @@ import "core:testing"
 import "elodin:dns"
 
 /*
+A fresh hashing allowance, held to `max_iterations` per record.
+
+Every call below gets its own, the way every client question does. The proofs
+take one rather than a bare ceiling so that no path can hash without being
+charged for it - see `MAX_NSEC3_ROUNDS_PER_QUERY`.
+*/
+@(private = "file")
+budget_at :: proc(max_iterations: int) -> ^Nsec3_Budget {
+	b := new(Nsec3_Budget, context.temp_allocator)
+	b.max_iterations = max_iterations
+	return b
+}
+
+/*
 What a DS denial is allowed to say about the name below it.
 
 The walk down to a zone's keys asks for a DS at every label, and a denial that
@@ -98,7 +112,7 @@ test_a_denial_of_a_name_that_is_not_there_ends_the_walk :: proc(t: ^testing.T) {
 	// walk must stop on the second rather than ask about the label below it.
 	zone := nsec3_zone({{"example.", {.NS, .SOA, .RRSIG, .DNSKEY}}, {"a.example.", {.A, .RRSIG}}})
 	testing.expect(t, len(zone) == 2, "the chain should build")
-	testing.expect_value(t, denial_step(nil, zone, "nx.example.", "example.", 150), Step.Absent)
+	testing.expect_value(t, denial_step(nil, zone, "nx.example.", "example.", budget_at(150)), Step.Absent)
 
 	// And NSEC, where the same span answers for every name inside it, so the
 	// walk would otherwise keep going label by label to `MAX_CHAIN_DEPTH`.
@@ -107,7 +121,7 @@ test_a_denial_of_a_name_that_is_not_there_ends_the_walk :: proc(t: ^testing.T) {
 		nsec_rr_of("a.example.", "z.example.", {.A, .RRSIG, .NSEC}),
 		nsec_rr_of("z.example.", "example.", {.A, .RRSIG, .NSEC}),
 	}
-	testing.expect_value(t, denial_step(nsecs, nil, "nx.example.", "example.", 150), Step.Absent)
+	testing.expect_value(t, denial_step(nsecs, nil, "nx.example.", "example.", budget_at(150)), Step.Absent)
 	free_all(context.temp_allocator)
 }
 
@@ -123,7 +137,7 @@ test_a_denial_at_an_empty_non_terminal_keeps_the_walk_going :: proc(t: ^testing.
 		},
 	)
 	testing.expect(t, len(zone) == 3, "the chain should build")
-	testing.expect_value(t, denial_step(nil, zone, "ent.example.", "example.", 150), Step.No_Cut)
+	testing.expect_value(t, denial_step(nil, zone, "ent.example.", "example.", budget_at(150)), Step.No_Cut)
 
 	/*
 	An NSEC zone publishes no record on an empty non-terminal at all (RFC 4035
@@ -137,7 +151,7 @@ test_a_denial_at_an_empty_non_terminal_keeps_the_walk_going :: proc(t: ^testing.
 		nsec_rr_of("example.", "a.ent.example.", {.NS, .SOA, .RRSIG, .NSEC, .DNSKEY}),
 		nsec_rr_of("a.ent.example.", "example.", {.A, .RRSIG, .NSEC}),
 	}
-	testing.expect_value(t, denial_step(nsecs, nil, "ent.example.", "example.", 150), Step.No_Cut)
+	testing.expect_value(t, denial_step(nsecs, nil, "ent.example.", "example.", budget_at(150)), Step.No_Cut)
 	free_all(context.temp_allocator)
 }
 
@@ -146,13 +160,13 @@ test_a_denial_at_an_unsigned_delegation_still_ends_the_chain :: proc(t: ^testing
 	// Neither of the two readings above: the name is there, it is delegated,
 	// and it carries no DS, which is where the chain of trust stops.
 	zone := nsec3_zone({{"example.", {.NS, .SOA, .RRSIG, .DNSKEY}}, {"sub.example.", {.NS}}})
-	testing.expect_value(t, denial_step(nil, zone, "sub.example.", "example.", 150), Step.Insecure)
+	testing.expect_value(t, denial_step(nil, zone, "sub.example.", "example.", budget_at(150)), Step.Insecure)
 
 	nsecs := []Nsec_Rr {
 		nsec_rr_of("example.", "sub.example.", {.NS, .SOA, .RRSIG, .NSEC, .DNSKEY}),
 		nsec_rr_of("sub.example.", "example.", {.NS, .NSEC}),
 	}
-	testing.expect_value(t, denial_step(nsecs, nil, "sub.example.", "example.", 150), Step.Insecure)
+	testing.expect_value(t, denial_step(nsecs, nil, "sub.example.", "example.", budget_at(150)), Step.Insecure)
 	free_all(context.temp_allocator)
 }
 
@@ -161,6 +175,6 @@ test_a_denial_that_settles_nothing_is_refused :: proc(t: ^testing.T) {
 	// Records from some other part of the zone say nothing about this name, and
 	// "says nothing" must not be read as either answer.
 	nsecs := []Nsec_Rr{nsec_rr_of("a.example.", "b.example.", {.A, .RRSIG, .NSEC})}
-	testing.expect_value(t, denial_step(nsecs, nil, "q.other.", "other.", 150), Step.Bogus)
+	testing.expect_value(t, denial_step(nsecs, nil, "q.other.", "other.", budget_at(150)), Step.Bogus)
 	free_all(context.temp_allocator)
 }
