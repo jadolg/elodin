@@ -101,6 +101,33 @@ nsec_matching :: proc(nsecs: []Nsec_Rr, name: string) -> (rr: Nsec_Rr, found: bo
 	return {}, false
 }
 
+/*
+May this record speak about `name`?
+
+RFC 6840 section 4.1: an NSEC with NS set and SOA clear is what a parent
+publishes at a delegation, and the parent does not answer for what is inside the
+child. Its span swallows every name under the cut all the same, so a proof that
+reads the span without reading the bit map will deny any name in the child -
+against the parent's keys, and with AD.
+
+`nsec_proves_no_data` makes this check on a record that matches. This is the
+covering half of it, and what used to make that half unreachable was the walk:
+it descends to the child and judges the denial against the child's keys, so the
+parent's record is dropped before it is read. A name the walk stops above -
+because something remembered it as no zone cut - takes that away, so the check
+belongs with the proof rather than with the walk.
+
+Names beside the cut rather than under it are still the parent's to deny, which
+is why this asks where the name sits rather than refusing the record outright.
+*/
+@(private)
+nsec_speaks_for :: proc(n: Nsec_Rr, name: string) -> bool {
+	if !bitmap_has(n.rr.types, .NS) || bitmap_has(n.rr.types, .SOA) {
+		return true
+	}
+	return !name_in_zone(name, n.owner) || dns.name_equal_fold(name, n.owner)
+}
+
 @(private)
 nsec_covering :: proc(nsecs: []Nsec_Rr, name: string) -> (rr: Nsec_Rr, found: bool) {
 	for n in nsecs {
@@ -123,6 +150,11 @@ nsec_proves_name_error :: proc(nsecs: []Nsec_Rr, qname: string, allocator := con
 	if !found {
 		return .Failed
 	}
+	// The record has to be one that speaks for this name at all; see
+	// `nsec_speaks_for`.
+	if !nsec_speaks_for(covering, qname) {
+		return .Failed
+	}
 
 	// The closest encloser is the deepest ancestor of qname that the covering
 	// span shows to exist, which is whichever of its two ends shares more with
@@ -132,7 +164,10 @@ nsec_proves_name_error :: proc(nsecs: []Nsec_Rr, qname: string, allocator := con
 	encloser := from_owner if label_count(from_owner) >= label_count(from_next) else from_next
 
 	wildcard := wildcard_of(encloser, allocator)
-	if _, covered := nsec_covering(nsecs, wildcard); !covered {
+	// And the same of the record that swallows the wildcard: a delegation's
+	// span reaches `*.<child>` as readily as anything else under the cut.
+	wc, covered := nsec_covering(nsecs, wildcard)
+	if !covered || !nsec_speaks_for(wc, wildcard) {
 		return .Failed
 	}
 	return .Proven
@@ -253,9 +288,13 @@ nsec_proves_no_delegation :: proc(nsecs: []Nsec_Rr, name: string) -> bool {
 	if match, found := nsec_matching(nsecs, name); found {
 		return !bitmap_has(match.rr.types, .NS) || bitmap_has(match.rr.types, .SOA)
 	}
-	// The name does not exist, so nothing is delegated at it.
-	_, covered := nsec_covering(nsecs, name)
-	return covered
+	// The name does not exist, so nothing is delegated at it - unless the
+	// record saying so is the parent's own at a cut above, which speaks for
+	// nothing inside the child and so cannot say the name is missing. See
+	// `nsec_speaks_for`; refusing here is what stops the walk settling on the
+	// parent of a delegation it skipped.
+	covering, covered := nsec_covering(nsecs, name)
+	return covered && nsec_speaks_for(covering, name)
 }
 
 /*

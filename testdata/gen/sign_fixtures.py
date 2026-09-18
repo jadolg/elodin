@@ -1037,6 +1037,111 @@ def nsec3_name_error():
          message("deep.n3test.", DS, [], authority, rcode=3), rcode=3)
 
 
+@scenario
+def deep_run_of_empty_non_terminals():
+    """Cover a zone that answers every DS below its apex with a minted NSEC."""
+    # RFC 4470 lets a zone answer a name it does not hold with an NSEC minted
+    # for the question, and such a record says the name is there and carries no
+    # NS - which is exactly an empty non-terminal. A zone serving those answers
+    # every label of every name that way, so a client asking for a name eight
+    # labels deep has the chain walk descend all eight, one blocking DS lookup
+    # apiece, for one question. Nothing here is forged: every record verifies
+    # against the zone's own key, which is what makes the cost real.
+    #
+    # `drtest.` is that zone, and `l1.l2.l3.l4.l5.l6.l7.l8.drtest.` the name.
+    root = Key(".", "deeprun-root")
+    zone = Key("drtest.", "deeprun-zone")
+
+    root_keys = [RR(".", DNSKEY, root.rdata)]
+    print("// anchor: %s" % root.ds_text())
+    emit("dr_root_dnskey", ".", "DNSKEY", message(".", DNSKEY, root_keys + [sign(root_keys, root)]))
+
+    ds_set = [RR("drtest.", DS, zone.ds())]
+    emit("dr_ds", "drtest.", "DS", message("drtest.", DS, ds_set + [sign(ds_set, root)]))
+
+    zone_keys = [RR("drtest.", DNSKEY, zone.rdata)]
+    emit("dr_dnskey", "drtest.", "DNSKEY",
+         message("drtest.", DNSKEY, zone_keys + [sign(zone_keys, zone)]))
+
+    # One DS denial per label of the name, each minted for the name asked about.
+    # No NS bit, so none of them is a delegation, and the walk has to keep going
+    # past every one of them.
+    # The next name is the epsilon successor RFC 4470 section 3.1 asks for - the
+    # queried name with a leading zero-octet label - and not something like
+    # `zz.<name>`. The span of an NSEC denies everything strictly inside it, so a
+    # next name any further along would have these records denying real names
+    # below them, `sub.` among them.
+    labels = ["l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8"]
+    for i, label in enumerate(labels):
+        name = ".".join(labels[i:]) + ".drtest."
+        minted = [RR(name, NSEC, nsec_rdata("\x00." + name, [RRSIG, NSEC]))]
+        emit("dr_ds_%s" % label, name, "DS",
+             message(name, DS, [], minted + [sign(minted, zone)]))
+
+    # And the question itself: NODATA at the deepest name, denied the same way.
+    qname = ".".join(labels) + ".drtest."
+    minted = [RR(qname, NSEC, nsec_rdata("\x00." + qname, [RRSIG, NSEC]))]
+    emit("dr_nodata", qname, "A", message(qname, A, [], minted + [sign(minted, zone)]))
+
+    # A real zone cut at the bottom of the run, so that "the walk may skip the
+    # descent" can never quietly become "the walk may stop descending". Its DS
+    # is signed by `drtest.`, which is the closest zone above it - everything in
+    # between being no cut at all.
+    sub = Key("sub." + qname, "deeprun-sub")
+    sub_ds = [RR(sub.zone, DS, sub.ds())]
+    emit("dr_sub_ds", sub.zone, "DS", message(sub.zone, DS, sub_ds + [sign(sub_ds, zone)]))
+
+    sub_keys = [RR(sub.zone, DNSKEY, sub.rdata)]
+    emit("dr_sub_dnskey", sub.zone, "DNSKEY",
+         message(sub.zone, DNSKEY, sub_keys + [sign(sub_keys, sub)]))
+
+    sub_answer = [RR(sub.zone, A, bytes([192, 0, 2, 1]))]
+    emit("dr_sub_answer", sub.zone, "A",
+         message(sub.zone, A, sub_answer + [sign(sub_answer, sub)]))
+
+    # A DS answer whose denial verifies but speaks for some other name, which is
+    # what a step reads as broken. It stands in for the one way a remembered
+    # non-cut turns harmful: the name it names stops existing, the walk skips it
+    # on the memo's word, and the denial that comes back is for a name one label
+    # too far down - under NSEC3 that is neither matched nor covered. The walk
+    # has to forget the name above rather than keep reading it for an hour.
+    stray = [RR("zzz.drtest.", NSEC, nsec_rdata("\x00.zzz.drtest.", [RRSIG, NSEC]))]
+    emit("dr_stray_denial", "b.c.drtest.", "DS",
+         message("b.c.drtest.", DS, [], stray + [sign(stray, zone)]))
+
+    # And the same step broken the other way: a DS answer with nothing in it to
+    # read. That is what a delegation appearing at a remembered non-cut looks
+    # like from here - the question lands inside the new child zone, and what it
+    # signs is not the parent's to verify, so the denial is dropped and both
+    # slices come back empty.
+    emit("dr_bare_ds", "e.f.drtest.", "DS", message("e.f.drtest.", DS, []))
+
+    # A NODATA from the zone below the run, for the denial path's own version of
+    # the heal: the answer path reaches `validate_rrset`, a denial reaches
+    # `validate_denial`, and each has to give back a name the walk could not
+    # reach on its own account.
+    sub_nodata = [RR(sub.zone, NSEC,
+                     nsec_rdata("zz." + sub.zone, [A, NS, SOA, RRSIG, NSEC, DNSKEY]))]
+    emit("dr_sub_nodata", sub.zone, "AAAA",
+         message(sub.zone, AAAA, [], sub_nodata + [sign(sub_nodata, sub)]))
+
+    # The parent's own record at the zone cut: NS set, SOA clear, which is what
+    # a delegation NSEC looks like. Its span swallows everything under `sub.`,
+    # the wildcard included - but RFC 6840 section 4.1 says a record from the
+    # parent side of a cut speaks for nothing below it, so it must not be
+    # allowed to deny a name inside the child. Signed by `drtest.`, because the
+    # parent is who publishes it.
+    deleg = [RR(sub.zone, NSEC, nsec_rdata("zz." + sub.zone, [NS, RRSIG, NSEC]))]
+    emit("dr_delegation_nsec", "www." + sub.zone, "A",
+         message("www." + sub.zone, A, [], deleg + [sign(deleg, zone)], rcode=3), rcode=3)
+    # The same record answering the DS the walk asks on its way down, which is
+    # what lets the walk settle on the parent and read the denial above against
+    # the parent's keys. Whoever can put the one in front of the validator can
+    # put the other.
+    emit("dr_www_ds", "www." + sub.zone, "DS",
+         message("www." + sub.zone, DS, [], deleg + [sign(deleg, zone)], rcode=3), rcode=3)
+
+
 if __name__ == "__main__":
     wanted = sys.argv[1:] or list(SCENARIOS)
     for name in wanted:

@@ -438,22 +438,27 @@ nsec3_closest_encloser :: proc(
 	budget: ^Nsec3_Budget,
 ) -> (
 	encloser, next_closer: string,
+	// The record that matched the encloser. Handed back rather than left to be
+	// hashed for a second time: `nsec3_proves_name_error` has to read its bit
+	// map, and the other callers must not - an opt-out proof rests on a
+	// delegation record being the encloser, which is the whole mechanism.
+	match: Nsec3_Rr,
 	ok: bool,
 ) {
 	if !name_in_zone(qname, zone) {
-		return "", "", false
+		return "", "", {}, false
 	}
 	name := qname
 	previous := ""
 	for {
-		if _, found := nsec3_matching(n3s, name, budget); found {
+		if found_match, found := nsec3_matching(n3s, name, budget); found {
 			if previous == "" {
-				return "", "", false
+				return "", "", {}, false
 			}
-			return name, previous, true
+			return name, previous, found_match, true
 		}
 		if dns.name_equal_fold(name, zone) {
-			return "", "", false
+			return "", "", {}, false
 		}
 		previous = name
 		name = dns.name_parent(name)
@@ -467,8 +472,26 @@ nsec3_proves_name_error :: proc(
 	budget: ^Nsec3_Budget,
 	allocator := context.temp_allocator,
 ) -> Proof {
-	encloser, next_closer, ok := nsec3_closest_encloser(n3s, qname, zone, budget)
+	encloser, next_closer, match, ok := nsec3_closest_encloser(n3s, qname, zone, budget)
 	if !ok {
+		return .Failed
+	}
+	/*
+	The encloser has to be a name whose zone answers for what is under it.
+
+	NS set with SOA clear is the parent's own record at a delegation, and the
+	parent does not answer for names inside the child - so it encloses none of
+	them, and a proof built on it would deny every name in the child against
+	the parent's keys. The same statement `nsec_speaks_for` makes on the NSEC
+	side.
+
+	Here rather than in `nsec3_closest_encloser`, and that distinction is the
+	whole of it: an opt-out proof reaches the same routine and *must* take a
+	delegation as the encloser, because declining to speak for what is under an
+	unsigned delegation is exactly what opt-out is. This is the one caller that
+	claims a name is absent.
+	*/
+	if bitmap_has(match.rr.types, .NS) && !bitmap_has(match.rr.types, .SOA) {
 		return .Failed
 	}
 	cover, covered := nsec3_covering(n3s, next_closer, budget)
@@ -512,7 +535,7 @@ nsec3_proves_no_data :: proc(
 
 	// No record on the name itself: a wildcard must be what answered, and it
 	// must be missing the type too.
-	encloser, next_closer, ok := nsec3_closest_encloser(n3s, qname, zone, budget)
+	encloser, next_closer, _, ok := nsec3_closest_encloser(n3s, qname, zone, budget)
 	if !ok {
 		return .Failed
 	}
@@ -584,7 +607,7 @@ nsec3_proves_no_ds :: proc(n3s: []Nsec3_Rr, name, zone: string, budget: ^Nsec3_B
 		return .Proven
 	}
 
-	_, next_closer, ok := nsec3_closest_encloser(n3s, name, zone, budget)
+	_, next_closer, _, ok := nsec3_closest_encloser(n3s, name, zone, budget)
 	if !ok {
 		return .Failed
 	}

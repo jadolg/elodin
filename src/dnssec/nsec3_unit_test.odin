@@ -331,7 +331,7 @@ test_nsec3_closest_encloser_walks_up_to_the_deepest_match :: proc(t: ^testing.T)
 	zone := a_zone()
 	// `deep.x.y.w.example.` has no record; `x.y.w.example.` does, so that is the
 	// closest encloser and the name one label longer is the next closer.
-	encloser, next_closer, ok := nsec3_closest_encloser(zone, "deep.x.y.w.example.", "example.", budget_at(A_ITERATIONS))
+	encloser, next_closer, _, ok := nsec3_closest_encloser(zone, "deep.x.y.w.example.", "example.", budget_at(A_ITERATIONS))
 	testing.expect(t, ok, "the walk should find an encloser")
 	testing.expect_value(t, encloser, "x.y.w.example.")
 	testing.expect_value(t, next_closer, "deep.x.y.w.example.")
@@ -343,7 +343,7 @@ test_nsec3_closest_encloser_refuses_a_name_that_exists :: proc(t: ^testing.T) {
 	// A match on the queried name itself contradicts whatever the caller was
 	// about to prove, so there is no encloser to hand back.
 	zone := a_zone()
-	_, _, ok := nsec3_closest_encloser(zone, "a.example.", "example.", budget_at(A_ITERATIONS))
+	_, _, _, ok := nsec3_closest_encloser(zone, "a.example.", "example.", budget_at(A_ITERATIONS))
 	testing.expect(t, !ok, "a name with a record of its own has no next closer")
 	free_all(context.temp_allocator)
 }
@@ -351,7 +351,7 @@ test_nsec3_closest_encloser_refuses_a_name_that_exists :: proc(t: ^testing.T) {
 @(test)
 test_nsec3_closest_encloser_refuses_out_of_zone_and_unanchored_walks :: proc(t: ^testing.T) {
 	zone := a_zone()
-	_, _, out_of_zone := nsec3_closest_encloser(zone, "nx.other.", "example.", budget_at(A_ITERATIONS))
+	_, _, _, out_of_zone := nsec3_closest_encloser(zone, "nx.other.", "example.", budget_at(A_ITERATIONS))
 	testing.expect(t, !out_of_zone, "a name outside the zone cannot be enclosed by it")
 
 	// Without the apex record the walk reaches the top having matched nothing,
@@ -361,7 +361,7 @@ test_nsec3_closest_encloser_refuses_out_of_zone_and_unanchored_walks :: proc(t: 
 	for record in zone[1:] {
 		append(&no_apex, record)
 	}
-	_, _, unanchored := nsec3_closest_encloser(no_apex[:], "nx.example.", "example.", budget_at(A_ITERATIONS))
+	_, _, _, unanchored := nsec3_closest_encloser(no_apex[:], "nx.example.", "example.", budget_at(A_ITERATIONS))
 	testing.expect(t, !unanchored, "a walk that reaches the apex without a match proves nothing")
 	free_all(context.temp_allocator)
 }
@@ -850,5 +850,36 @@ test_a_chain_above_the_ceiling_does_not_suppress_an_opt_out :: proc(t: ^testing.
 	testing.expect_value(t, nsec3_proves_no_data(mixed[:], "foo.a.example.", "example.", .A, &budget), Proof.Opt_Out)
 	testing.expect(t, budget.over_ceiling > 0, "the chain on its way out should have been refused, or this proves nothing")
 	testing.expect_value(t, budget.spent, 0)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_nsec3_a_delegation_is_no_closest_encloser_for_a_name_error :: proc(t: ^testing.T) {
+	/*
+	`a.example.` is a delegation in this zone - NS and DS, no SOA - so the
+	names under it belong to the child and the parent answers for none of
+	them. Taking it as the closest encloser would let the parent's own records
+	prove any name in the child does not exist, against the parent's keys, and
+	that answer reaches the client with AD.
+
+	The walk is what used to make this unreachable: it descends to the child
+	and judges the denial against the child's keys, so the parent's records are
+	dropped before the proof reads them. Anything that lets the walk stop above
+	a cut takes that away.
+
+	Only this proof refuses it. An opt-out proof rests on a delegation being
+	the encloser - declining to speak for what is under an unsigned delegation
+	is what opt-out is - and the test below it holds that line.
+	*/
+	zone := a_zone()
+	testing.expect_value(
+		t,
+		nsec3_proves_name_error(zone, "q.a.example.", "example.", budget_at(A_ITERATIONS)),
+		Proof.Failed,
+	)
+
+	// The mechanism it must not disturb is held by
+	// `test_a_chain_above_the_ceiling_does_not_suppress_an_opt_out`, which
+	// proves `Opt_Out` over this same delegation with the flag actually set.
 	free_all(context.temp_allocator)
 }
