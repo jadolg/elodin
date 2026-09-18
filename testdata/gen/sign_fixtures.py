@@ -979,6 +979,61 @@ def wildcard_dname(root):
          message("x.real.dwtest.", A, moved + moved_cname))
 
 
+@scenario
+def nsec3_name_error():
+    """Cover a name error proven with NSEC3 in a zone whose chain holds up."""
+    # Every other NSEC3 fixture here is a DS denial, where the walk down to the
+    # name settles the question before the answer's own proof is read - under
+    # opt-out the name comes back as an unsigned delegation, and without it the
+    # step answers from a record on the name itself. Neither reaches
+    # `validate_denial`'s NSEC3 proof, which is the one that hashes a closest
+    # encloser, a next closer name and a wildcard.
+    #
+    # `n3test.` is that shape: signed, no opt-out, and asked about a name two
+    # labels below its apex so the proof has to walk. The same three records
+    # answer the DS lookup the chain walk makes on the way down, because they
+    # are the denial that zone really sends for anything under `deep.n3test.`.
+    root = Key(".", "n3err-root")
+    zone = Key("n3test.", "n3err-zone")
+
+    root_keys = [RR(".", DNSKEY, root.rdata)]
+    print("// anchor: %s" % root.ds_text())
+    emit("n3_root_dnskey", ".", "DNSKEY",
+         message(".", DNSKEY, root_keys + [sign(root_keys, root)]))
+
+    ds_set = [RR(zone.zone, DS, zone.ds())]
+    emit("n3_ds", zone.zone, "DS", message(zone.zone, DS, ds_set + [sign(ds_set, root)]))
+    keys = [RR(zone.zone, DNSKEY, zone.rdata)]
+    emit("n3_dnskey", zone.zone, "DNSKEY", message(zone.zone, DNSKEY, keys + [sign(keys, zone)]))
+
+    # Two names, so the chain is two spans and everything the zone does not hold
+    # falls inside one of them. Zero iterations and a two-byte salt: what is
+    # under test is how much hashing the proof asks for, not how dear one hash is.
+    salt = bytes.fromhex("0e0f")
+    chain = nsec3_chain(
+        "n3test.",
+        [
+            ("n3test.", [A, NS, SOA, RRSIG, DNSKEY, NSEC3PARAM]),
+            ("a.n3test.", [A, RRSIG]),
+        ],
+        salt,
+        0,
+    )
+
+    # Each NSEC3 is its own owner name and so its own RRset, with a signature of
+    # its own - a validator that verified one and read all of them would be
+    # taking the rest on trust.
+    authority = []
+    for record in (chain["n3test."], chain["a.n3test."]):
+        authority += [record, sign([record], zone)]
+
+    # The reply under test, and the DS denial the walk reads on its way to it.
+    emit("n3_nx", "nx.deep.n3test.", "A",
+         message("nx.deep.n3test.", A, [], authority, rcode=3), rcode=3)
+    emit("n3_deep_ds", "deep.n3test.", "DS",
+         message("deep.n3test.", DS, [], authority, rcode=3), rcode=3)
+
+
 if __name__ == "__main__":
     wanted = sys.argv[1:] or list(SCENARIOS)
     for name in wanted:

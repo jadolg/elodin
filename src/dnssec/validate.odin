@@ -1703,6 +1703,15 @@ validate_denial :: proc(
 	`Bogus` would report our own limit to the client as a forgery - with its
 	address beside the word in the log.
 	*/
+	/*
+	The hashing allowance, and the same answer as the two above it. A proof this
+	server stopped hashing partway through is not a proof it found wanting, and
+	`Bogus` would report our own limit to the client as a forgery - with its
+	address beside the word in the log. Only where there were NSEC3 records to
+	hash: the flag is the whole question's and stays set once anything sets it,
+	so reading it over an NSEC-only proof would file a forgery under an
+	allowance of ours.
+	*/
 	if proof == .Failed && len(nsec3s) > 0 && budget.nsec3.exhausted {
 		return {status = .Indeterminate, reason = "verification budget spent"}
 	}

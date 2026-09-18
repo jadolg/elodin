@@ -68,15 +68,19 @@ whole allowance - where counting rounds flat would have sold it five times the
 most. Either way it puts NSEC3 hashing in the same order as the signature
 verifications `MAX_VERIFICATIONS_PER_QUERY` already allows.
 
-Real traffic is nowhere near it. A zone following RFC 9276 uses zero
-iterations, so a denial costs one round per name tried and a whole question
-tens - the zones still publishing NSEC3 at the time of writing use zero, five
-and ten. What the number has to leave room for is the other end of what is
-still legal: a zone sitting at the iteration ceiling, where the chain walk and
-the denial together hash thirty-odd names, comes to around 3500 rounds with the
-reuse `Nsec3_Hashes` does. A question that wants more than the allowance is
-answered `Indeterminate`, never `Bogus`: this is an allowance of ours running
-out, not a proof found wanting.
+Real traffic is nowhere near it. A zone following RFC 9276 uses zero iterations,
+so a hash is one round and a whole question tens - the zones still publishing
+NSEC3 at the time of writing use zero, five and ten. What the number has to
+leave room for is the other end of what is still legal, and the counts are
+measured rather than guessed at: with the reuse `Nsec3_Hashes` does, a chain
+step costs one hash where the zone holds the name and three where it does not,
+and a name error four hashes, or five for a name two labels below its closest
+encloser. A name eight labels deep in a zone sitting at the default ceiling of
+100 therefore comes to something like 3000 rounds, and at the configurable
+ceiling of `MAX_NSEC3_ITERATIONS_LIMIT` to something like 7500 - inside the
+allowance, and not by much, which is the point of that limit. A question that
+wants more is answered `Indeterminate`, never `Bogus`: this is an allowance of
+ours running out, not a proof found wanting.
 */
 MAX_NSEC3_ROUNDS_PER_QUERY :: 8192
 
@@ -93,12 +97,13 @@ resolver that came up fine and answers nothing.
 
 What it promises is a floor, not a guarantee, and the difference is worth being
 plain about. At this ceiling a record with a salt of ordinary length costs 256
-blocks a hash, so a whole allowance still affords thirty-two of them - several
-times over what a denial spends. With the longest salt the same allowance
-affords six, which is one proof and little more, and a deep name in such a zone
-runs out. No single number could say otherwise while the depth is the
-question's to choose: the allowance is the bound, and this only keeps the
-ceiling in the range where the bound can be met.
+blocks a hash, so a whole allowance affords thirty-two of them: a name error
+spends four or five of those and the walk down to it one a step, so a name of
+ordinary depth fits and a very deep one does not. With the longest salt the same
+allowance affords six hashes, which is one proof and nothing around it. No
+single number could do better while the depth is the question's to choose: the
+allowance is the bound, and this only keeps the ceiling in the range where the
+bound can be met at all.
 
 It leaves nothing anyone wants out of reach. RFC 9276 asks zones for zero, the
 default here is 100, and the zones still publishing NSEC3 use single digits.
@@ -118,6 +123,9 @@ Nsec3_Budget :: struct {
 	max_iterations: int,
 	rounds:         int,
 	exhausted:      bool,
+	// The last hash computed, kept for whatever asks for it next: see
+	// `Nsec3_Hashes`.
+	hashed:         Nsec3_Hashes,
 }
 
 // SHA-1 compresses 64-byte blocks and appends a one-byte pad and an eight-byte
@@ -181,14 +189,22 @@ nsec3_hash_with :: proc(rr: Nsec3, name: string, out: []u8, budget: ^Nsec3_Budge
 }
 
 /*
-One name's hash, kept across a scan of the records.
+The last hash computed, and what it was computed from.
 
-Every record a zone publishes carries the parameters of its single NSEC3PARAM,
-so a scan over a denial's records asks for the same hash of the same name every
-time. Computing it once and comparing it against each record is what keeps an
-honest proof cheap enough for the allowance above to be tight. A sender that
-chose a different salt for every record gets a hash per record, and pays for
-each one out of the budget.
+Two things ask for the same hash over and over. Every record a zone publishes
+carries the parameters of its single NSEC3PARAM, so a scan over a denial's
+records asks for one name's hash once per record. And the proofs ask each
+other: `nsec3_proves_no_ds` scans for a match on the name, hands the same name
+to `nsec3_closest_encloser`, whose first step is that same scan, and then asks
+for a cover over it - three passes, one hash. Keeping the last one is what makes
+an honest proof cheap enough for the allowance to be tight, so it is kept on the
+budget and lives as long as the question does rather than as long as a scan.
+
+One entry, because the shape of the asking is a run of the same name and not a
+working set: a second entry would buy another hash or two per proof for a
+lookup on every record. A sender that chose a different salt for every record
+defeats it and pays for a hash per record out of the budget, which is the whole
+point of the budget.
 */
 @(private)
 Nsec3_Hashes :: struct {
@@ -201,37 +217,36 @@ Nsec3_Hashes :: struct {
 }
 
 /*
-The kept hash belongs to all three of the parameters that produced it, and the
-algorithm is in the key for the same reason as the other two. Only SHA-1 is ever
-computed, so a record naming another hash has to miss here and be refused by
-`nsec3_hash_with` - reusing a neighbour's digest for it would read a record this
-package cannot check as one it had.
+The kept hash belongs to the name and to all three of the parameters that
+produced it, and the algorithm is in the key for the same reason as the rest.
+Only SHA-1 is ever computed, so a record naming another hash has to miss here
+and be refused by `nsec3_hash_with` - reusing a neighbour's digest for it would
+read a record this package cannot check as one it had.
 */
 @(private)
-nsec3_hash_of :: proc(c: ^Nsec3_Hashes, rr: Nsec3, budget: ^Nsec3_Budget) -> (hash: []u8, ok: bool) {
+nsec3_hash_of :: proc(name: string, rr: Nsec3, budget: ^Nsec3_Budget) -> (hash: []u8, ok: bool) {
+	c := &budget.hashed
 	if c.have &&
+	   c.name == name &&
 	   c.algorithm == rr.hash_algorithm &&
 	   c.iterations == rr.iterations &&
 	   len(c.salt) == len(rr.salt) &&
 	   mem.compare(c.salt, rr.salt) == 0 {
 		return c.hash[:], true
 	}
-	if !nsec3_hash_with(rr, c.name, c.hash[:], budget) {
-		// The previous hash is still the hash of its own parameters, so a
-		// record this one could not be computed for leaves it alone.
+	if !nsec3_hash_with(rr, name, c.hash[:], budget) {
+		// The previous hash is still the hash of its own name and parameters,
+		// so a record this one could not be computed for leaves it alone.
 		return nil, false
 	}
-	c.algorithm, c.salt, c.iterations, c.have = rr.hash_algorithm, rr.salt, rr.iterations, true
+	c.name, c.algorithm, c.salt, c.iterations, c.have = name, rr.hash_algorithm, rr.salt, rr.iterations, true
 	return c.hash[:], true
 }
 
 @(private)
 nsec3_matching :: proc(n3s: []Nsec3_Rr, name: string, budget: ^Nsec3_Budget) -> (rr: Nsec3_Rr, found: bool) {
-	hashes := Nsec3_Hashes {
-		name = name,
-	}
 	for n in n3s {
-		h, ok := nsec3_hash_of(&hashes, n.rr, budget)
+		h, ok := nsec3_hash_of(name, n.rr, budget)
 		if !ok {
 			if budget.exhausted {
 				break
@@ -253,11 +268,8 @@ is the one holding the wrap-around span.
 */
 @(private)
 nsec3_covering :: proc(n3s: []Nsec3_Rr, name: string, budget: ^Nsec3_Budget) -> (rr: Nsec3_Rr, found: bool) {
-	hashes := Nsec3_Hashes {
-		name = name,
-	}
 	for n in n3s {
-		h, ok := nsec3_hash_of(&hashes, n.rr, budget)
+		h, ok := nsec3_hash_of(name, n.rr, budget)
 		if !ok {
 			if budget.exhausted {
 				break

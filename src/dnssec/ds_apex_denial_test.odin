@@ -320,16 +320,13 @@ The same NSEC3 denial, read with the hashing allowance already spent.
 `MAX_NSEC3_ROUNDS_PER_QUERY` bounds what one question may spend on SHA-1, and
 what a proof stopped partway through has to come back as is `Indeterminate`:
 this server did not finish reading it, which is not the same statement as
-"forged" and must not reach the client as one. `dstest3.` is the denial in this
-package that shows it, because the proof is reached at all - it is signed, its
-chain is not opt-out, and so the walk establishes the zone and hands the records
-to `validate_denial` rather than settling the name as unsigned on the way down.
+"forged" and must not reach the client as one.
 
-Two meters, because there are two places the allowance can empty and they answer
-in different words. Emptied outright, the walk down to the name runs out first.
-Funded with exactly what the walk costs - measured with a validator of its own,
-since a number written here would rot the first time the fixture changed - the
-walk finishes and the answer's own proof is what stops.
+What runs out here is the walk down to the name, whose DS denial is this very
+fixture, and it answers in `zone_trust`'s words. The answer's own proof is the
+other place the meter can empty, and it takes a name error to reach - the walk
+settles a DS question before the proof is read, and every hash the proof would
+want is one the walk already made. `nsec3_name_error_test` is that case.
 */
 @(test)
 test_a_denial_whose_hashing_ran_out_is_indeterminate_not_bogus :: proc(t: ^testing.T) {
@@ -337,34 +334,26 @@ test_a_denial_whose_hashing_ran_out_is_indeterminate_not_bogus :: proc(t: ^testi
 	msg, err := dns.decode_message(da_reply("da3_www_nodata"), context.temp_allocator)
 	testing.expect(t, err == .None, "the fixture should decode")
 
-	walk_v := da_validator()
-	testing.expect(t, walk_v != nil, "the anchor should parse")
-	defer destroy_validator(walk_v)
+	v := da_validator()
+	testing.expect(t, v != nil, "the anchor should parse")
+	defer destroy_validator(v)
 	none := Budget {
 		nsec3 = {rounds = MAX_NSEC3_ROUNDS_PER_QUERY},
 	}
-	chain := validate_denial(walk_v, &none, msg, qname, .DS, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	result := validate_denial(v, &none, msg, qname, .DS, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 	testing.expectf(
 		t,
-		chain.status == .Indeterminate,
+		result.status == .Indeterminate,
 		"a walk that could not hash is not a broken delegation, got %v (%q)",
-		chain.status,
-		chain.reason,
+		result.status,
+		result.reason,
 	)
 
-	measure_v := da_validator()
-	defer destroy_validator(measure_v)
-	measured := Budget{}
-	zone_trust(measure_v, &measured, qname, time.unix(FIXTURE_TIME, 0), context.temp_allocator)
-	testing.expect(t, measured.nsec3.rounds > 0, "the walk down to this name hashes, or it funds nothing")
-
-	proof_v := da_validator()
-	defer destroy_validator(proof_v)
-	walk_only := Budget {
-		nsec3 = {rounds = MAX_NSEC3_ROUNDS_PER_QUERY - measured.nsec3.rounds},
-	}
-	result := validate_denial(proof_v, &walk_only, msg, qname, .DS, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
-	testing.expect_value(t, result.status, Status.Indeterminate)
-	testing.expect_value(t, result.reason, "verification budget spent")
+	// The control: the same records, the same question, a whole allowance.
+	fresh_v := da_validator()
+	defer destroy_validator(fresh_v)
+	fresh := Budget{}
+	held := validate_denial(fresh_v, &fresh, msg, qname, .DS, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	testing.expectf(t, held.status == .Secure, "the denial itself holds up, got %v (%q)", held.status, held.reason)
 	free_all(context.temp_allocator)
 }

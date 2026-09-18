@@ -666,16 +666,19 @@ test_nsec3_hashing_is_bounded_across_one_question :: proc(t: ^testing.T) {
 }
 
 /*
-An honest denial hashes each name once, not once per record.
+An honest denial hashes a name once, not once per record.
 
 A zone publishes one NSEC3PARAM, so every record in a denial carries the same
 salt and iteration count and the hash of a name is the same for all of them.
 Computing it per record instead multiplies an honest proof by the length of the
-chain in the response - eleven here, and eleven times the cap above is what the
-allowance would have to be raised to if this reuse were dropped.
+chain in the response - eleven here, so this proof would cost fifty-five hashes
+rather than five, and the allowance would have to be eleven times what it is.
 
-Four names are hashed for this proof: the question, the closest encloser the
-walk stops at, the next closer name, and the wildcard at the encloser.
+Five, for a name two labels below the encloser: the question, the two names the
+walk tries above it, the next closer name and the wildcard. The next closer is
+one of the names the walk already hashed, and it costs a hash again because what
+is kept is the last one and the wildcard search came between - one entry is what
+a run of the same name needs, and a working set is what it is not.
 */
 @(test)
 test_an_honest_nsec3_denial_hashes_each_name_once :: proc(t: ^testing.T) {
@@ -683,8 +686,10 @@ test_an_honest_nsec3_denial_hashes_each_name_once :: proc(t: ^testing.T) {
 	budget := Nsec3_Budget {
 		max_iterations = A_ITERATIONS,
 	}
-	testing.expect_value(t, nsec3_proves_name_error(zone, "nx.example.", "example.", &budget), Proof.Proven)
-	testing.expect_value(t, budget.rounds, 4 * (1 + A_ITERATIONS))
+	// `x.y.w.example.` is in the zone, so `a.b.x.y.w.example.` has a closest
+	// encloser two labels above it and a next closer name of its own.
+	testing.expect_value(t, nsec3_proves_name_error(zone, "a.b.x.y.w.example.", "example.", &budget), Proof.Proven)
+	testing.expect_value(t, budget.rounds, 5 * (1 + A_ITERATIONS))
 	testing.expect(t, !budget.exhausted, "an eleven-record denial cannot be near the allowance")
 	free_all(context.temp_allocator)
 }
@@ -715,13 +720,15 @@ test_nsec3_no_data_does_not_read_a_spent_allowance_as_an_absent_wildcard :: proc
 	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.w.example.", "example.", .MX, &whole), Proof.Failed)
 	testing.expect(t, !whole.exhausted, "the proof should fit in a whole allowance")
 
-	// Everything up to the wildcard, and not the wildcard: the question, the
-	// walk's two names and the cover.
+	// One round short of the whole proof, so the hash it is denied is the last
+	// one it asks for - the wildcard. Measured above rather than written down,
+	// since a number here would rot the first time the proof changed.
 	starved := Nsec3_Budget {
 		max_iterations = A_ITERATIONS,
-		rounds         = MAX_NSEC3_ROUNDS_PER_QUERY - 4 * (1 + A_ITERATIONS),
+		rounds         = MAX_NSEC3_ROUNDS_PER_QUERY - whole.rounds + 1,
 	}
 	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.w.example.", "example.", .MX, &starved), Proof.Failed)
 	testing.expect(t, starved.exhausted, "the allowance should have been what stopped this")
 	free_all(context.temp_allocator)
 }
+
