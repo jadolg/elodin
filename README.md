@@ -463,10 +463,13 @@ left alone and no other figure would name it.
 
 What the sweep costs is up to one extra exchange per remaining member of the
 group, and never more than one `upstream.timeout` of waiting in total: the sweep
-stops at the first member it cannot reach at all, so a group of unreachable
-spares costs one timeout rather than one apiece. A live spare standing behind a
-dead one waits for the dead one to accrue its three failures and be parked —
-three queries — after which the sweep skips it and reaches the live one. A member this query has already failed to reach is not asked again
+counts what each failure cost it and stops once that reaches the timeout, so a
+group of unreachable spares costs one timeout rather than one apiece. A failure
+that cost nothing — a member whose hostname cannot be resolved, which never
+parks either — is passed over rather than stopping the sweep. A live spare
+standing behind one that swallows the whole timeout waits for that member to
+accrue its three failures and be parked, three queries, after which the sweep
+skips it and reaches the live one. A member this query has already failed to reach is not asked again
 either, so a group with one dead member and one that declines pays that member's
 timeout once rather than twice. Two upstreams — what the examples configure — pay
 one extra exchange for a name the first cannot answer.

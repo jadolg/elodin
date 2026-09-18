@@ -1112,3 +1112,101 @@ test_a_slow_member_the_sweep_reaches_is_not_marked_down :: proc(t: ^testing.T) {
 	)
 	testing.expect_value(t, stats_of(good).failures, u64(0))
 }
+
+/*
+And a member that fails for free never stands in front of one that can answer.
+
+`exchange` refuses an upstream whose hostname it cannot resolve before it sends
+anything - no bootstrap servers configured, or a bootstrap resolver that is down
+- and returns `.Not_Resolved` without calling `record_failure`. So that member
+costs nothing, records nothing, never accrues `FAILURE_THRESHOLD` and never
+parks: `healthy` reports it up for as long as it is in the configuration.
+
+Which is why the sweep's bound is the time it has spent rather than the failures
+it has seen. A bound on attempts would stop at this member on every query and
+never reach the one behind it - issue #309's failure, for a group whose
+configuration says it has a spare, and this one would not heal.
+
+`[refuses, cannot be resolved, has the answer]`, and the first query is expected
+to come back from the third.
+*/
+@(test)
+test_a_member_that_fails_for_free_does_not_end_the_sweep :: proc(t: ^testing.T) {
+	refusing := Canned_Mock{}
+	ref, ref_thread, ref_ok := start_canned_mock(t, &refusing, "refusing", canned_reply(0, .Refused))
+	if !ref_ok {
+		return
+	}
+	defer {
+		sync.atomic_store(&refusing.stop, true)
+		thread.join(ref_thread)
+		thread.destroy(ref_thread)
+		net.close(refusing.socket)
+		destroy(ref)
+	}
+
+	answerer := Canned_Mock{}
+	good, good_thread, good_ok := start_canned_mock(t, &answerer, "answerer", canned_reply(0))
+	if !good_ok {
+		return
+	}
+	defer {
+		sync.atomic_store(&answerer.stop, true)
+		thread.join(good_thread)
+		thread.destroy(good_thread)
+		net.close(answerer.socket)
+		destroy(good)
+	}
+
+	// A name rather than an address, and no bootstrap servers to turn it into
+	// one: `bootstrap_resolve` gives up without a query, which is the free
+	// failure this is about. `.invalid` is reserved by RFC 2606, so nothing
+	// here depends on what the network would say about it.
+	stuck, uerr := make_upstream(
+		config.Upstream_Spec {
+			name = "unresolvable",
+			kind = .UDP,
+			address = "upstream.invalid",
+			port = 53,
+		},
+		0,
+		time.Second,
+		context.allocator,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot build the unresolvable upstream: %v", uerr) {
+		return
+	}
+	defer destroy(stuck)
+
+	servers := make([]^Upstream, 3, context.allocator)
+	defer delete(servers, context.allocator)
+	servers[0] = ref
+	servers[1] = stuck
+	servers[2] = good
+
+	g := Group {
+		servers   = servers,
+		strategy  = .Failover,
+		timeout   = 400 * time.Millisecond,
+		attempts  = 1,
+		allocator = context.allocator,
+	}
+
+	wire := canned_query()
+	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
+
+	resp, winner, err := resolve_readable(&g, wire, context.allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expectf(
+		t,
+		winner == good && dns.peek_rcode(resp) == .No_Error,
+		"the sweep stopped at the member it could not resolve, so the spare behind it was never asked",
+	)
+	delete(resp, context.allocator)
+
+	// The premise, read off the upstream rather than assumed: it failed, and
+	// nothing about it changed - which is why no number of queries would ever
+	// move it out of the way.
+	testing.expect(t, healthy(stuck), "the unresolvable member parked after all, so this is not the case it says")
+	testing.expect_value(t, stats_of(stuck).failures, u64(0))
+}

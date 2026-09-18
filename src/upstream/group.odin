@@ -314,29 +314,41 @@ resolve_insisting :: proc(
 	note_swept_rcode(winner)
 
 	/*
-	And the sweep stops at the first member it cannot reach at all.
+	And the sweep has one `g.timeout` of waiting to spend, counted as it spends
+	it: a member that fails costs whatever it took to fail, and once the total
+	reaches the budget the members after it are left alone.
 
-	Which is what bounds it. Asking every remaining member at the full timeout
-	is a group of four spending three of them - fifteen seconds as elodin ships
-	- to hand back the reply it had in the first millisecond, holding one of a
-	bounded set of query workers for the whole wait; a client repeating one such
-	name is then a way to empty the pool. Stopping at the first silence caps the
-	whole sweep at one timeout however many members are left.
+	What that bounds is the group of several spares none of which can be
+	reached. At the full timeout apiece a group of four spends three of them -
+	fifteen seconds as elodin ships - to hand back the reply it had in the first
+	millisecond, holding one of a bounded set of query workers for the whole
+	wait; a client repeating one such name is then a way to empty the pool.
 
-	Not by dividing the timeout between them, which was tried and taken back
-	out. `exchange` counts a timeout as a failure, so a member cut off by a
-	share it would have answered inside gets `record_failure` for being asked
-	impatiently, and three of those park the spare this whole change exists to
-	keep. The wait is what must be bounded; what a member is judged on has to go
-	on being the group's own timeout.
+	Waiting, and not attempts, because the two are not the same thing at all.
+	`exchange` refuses an upstream whose hostname it cannot resolve before it
+	sends anything - no bootstrap servers, or a bootstrap resolver that is down
+	- and that costs nothing and records no failure, so such a member never
+	parks and is in the way of every sweep for as long as it is configured.
+	Counting attempts would stop there every time and never reach the member
+	behind it, which is issue #309's own failure and one that does not heal. A
+	failure that cost no time is simply passed over.
 
-	What it costs is a live spare standing behind a dead one: the dead one is
-	asked first, the sweep stops there, and the client gets the reply in hand.
-	That is three queries long. Each of those exchanges is a real failure at the
-	real timeout, so the dead member parks, the sweep skips it from then on and
-	reaches the live one - and after each cooldown expiry one query pays for it
-	again, which is the arrangement every other part of this file already makes.
+	Nor by dividing the timeout between the members, which was tried and taken
+	back out: `exchange` counts a timeout as a failure, so a member cut off by a
+	share it would have answered inside gets marked down for being asked
+	impatiently, and three of those park the spare this change exists to keep.
+	The wait is what must be bounded; what a member is judged on has to go on
+	being the group's own timeout.
+
+	What remains is a live spare standing behind one that is dead rather than
+	unresolvable: the dead one is asked first, takes the budget, and the client
+	gets the reply in hand. That is three queries long. Each of those exchanges
+	is a real failure at the real timeout, so the dead member parks, the sweep
+	skips it from then on and reaches the live one - and after each cooldown
+	expiry one query pays for it again, which is the arrangement every other
+	part of this file already makes.
 	*/
+	spent: time.Duration
 	for u in g.servers {
 		if u == winner {
 			continue
@@ -367,10 +379,16 @@ resolve_insisting :: proc(
 			logx.debugf("upstream %s is in its cooldown, not asked again for this one", u.spec.name)
 			continue
 		}
+		before := time.now()
 		resp, xerr := exchange(u, sweep_query(query), g.timeout, allocator)
 		if xerr != .None {
-			logx.debugf("upstream %s failed: %v, ending the sweep for this query", u.spec.name, xerr)
-			break
+			spent += time.since(before)
+			logx.debugf("upstream %s failed: %v", u.spec.name, xerr)
+			if spent >= g.timeout {
+				logx.debugf("the sweep for this query has waited %v, leaving the rest of the group unasked", spent)
+				break
+			}
+			continue
 		}
 		if acceptable(resp) {
 			// Said here rather than above, because what makes a filtering
