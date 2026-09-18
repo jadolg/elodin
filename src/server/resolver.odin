@@ -2404,6 +2404,15 @@ own, which is the chain walk and the rebinding check. It is what decides whether
 the shorter decode is worth attempting: with the cache the only reader there is
 nothing to fall back to, since an entry is built out of the whole message or not
 made at all.
+
+Both readings expand the same message into the same arena, and each gets
+`dns.NAME_BUDGET` to itself, so this procedure's ceiling is twice that - about
+1.25 MB, against the 8.5 MB one reading of a hostile reply reached before there
+was a budget at all. One budget across the pair was the other way to do it and
+costs more than it saves: a reply large enough for the first reading to spend
+most of the budget would lose the shorter reading as well, which is refusing an
+answer this server had no opinion about, and that is the thing the shorter
+reading exists to stop.
 */
 @(private)
 decode_answer :: proc(resp: []u8, answer_section: bool, allocator: mem.Allocator) -> (out: Decoded_Answer) {
@@ -2414,15 +2423,6 @@ decode_answer :: proc(resp: []u8, answer_section: bool, allocator: mem.Allocator
 	}
 	out.full_err = err
 	if !answer_section {
-		return out
-	}
-	// Both decodes draw on the same arena, and the shorter one is given the same
-	// name budget over the same bytes - so a reply that spent the budget before
-	// the answer section ended has nothing to gain here and would spend it
-	// twice over. One whose authority or additional section was the expensive
-	// part would read, and is not worth the second budget: no upstream sends
-	// half a megabyte of names in the sections this caller is not reading.
-	if err == .Name_Budget {
 		return out
 	}
 	answer, answer_err := dns.decode_through_answer(resp, allocator)

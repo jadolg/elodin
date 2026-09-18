@@ -208,16 +208,54 @@ test_pointer_px_rdata_stays_within_the_name_budget :: proc(t: ^testing.T) {
 }
 
 /*
+A record of a two-name layout takes its expansion buffer once.
+
+`expand_rdata_names` reserves the buffer before it walks, and PX, SOA, MINFO and
+RP carry two names - each of which may expand from a two-byte pointer to a whole
+`MAX_NAME_WIRE`. Reserved for one name the buffer outgrows its block on the
+second, and under an arena the block it abandons is never given back and was
+never charged: one PX record whose two names point at a 255-octet name costs
+4,648 bytes with the reserve right and 5,170 with it wrong.
+
+A tight figure on purpose. The gap is one abandoned block, not an order of
+magnitude, and nothing else here would notice it.
+*/
+@(test)
+test_a_two_name_layout_does_not_outgrow_its_buffer :: proc(t: ^testing.T) {
+	name := long_wire_name()
+	defer delete(name)
+
+	msg := make([dynamic]u8, 0, 512)
+	defer delete(msg)
+	put_header(&msg, 1)
+	append(&msg, ..name)
+	put_u16(&msg, u16(Type.PX))
+	put_u16(&msg, u16(Class.IN))
+	append(&msg, 0xc0, 0x0c)
+	put_u16(&msg, u16(Type.PX))
+	put_u16(&msg, u16(Class.IN))
+	append(&msg, 0, 0, 0x0e, 0x10)
+	put_u16(&msg, 6) // rdlength
+	put_u16(&msg, 10) // preference
+	append(&msg, 0xc0, 0x0c)
+	append(&msg, 0xc0, 0x0c)
+
+	used, err := decode_into_arena(t, msg[:])
+	testing.expect_value(t, err, Decode_Error.None)
+	testing.expectf(t, used < 5000, "one PX record cost %d bytes of arena", used)
+}
+
+/*
 A full-length answer whose owner names are as long as a real one's get still
 decodes.
 
 The shape that costs the most and is still something a server would send: one
 name written out once and pointed at by every record of an RRset under it, at
 the largest a reply gets. A hundred characters is a long hostname and 4000 A
-records is a large RRset; together they come to 404 KB of names against a budget
-of 652 KB.
+records is a large RRset; together they come to 404 KB of names against the
+640 KB budget.
 
-The names here come to 404 KB against a budget of 640 KB, so the test is a real
+The names here come to 404 KB against the 640 KB budget, so the test is a real
 hold on the figure rather than a shape that could never reach it. The boundary
 is a good way further out: a pointer-owned record costs 16 wire bytes for about
 101 of name here, and it takes around 160 characters of name before a
