@@ -2369,8 +2369,20 @@ verified_rrset :: proc(
 			)
 			return nil, "", {}, false, true
 		}
-		result, _ := check_signature(sig, owner, class, records, keys, unix, allocator)
-		if result == .Ok {
+		/*
+		The encloser is what the caller does not get to discard here. A short
+		Labels field means the signature was made over `*.<encloser>` and says
+		nothing about the owner the record arrived under, so an attacker may
+		rewrite that owner freely - and the sets this routine verifies are the
+		ones nobody checks a wildcard proof for afterwards. Both are types RFC
+		4035 section 3.1.3.3 never has a zone synthesise from a wildcard: an
+		NSEC or NSEC3 is published under its own name, and an SOA lives at an
+		apex. `signed_labels` drops a literal leading `*.`, so a wildcard's own
+		NSEC - the record that proves NODATA for a type the wildcard lacks -
+		still comes back with no encloser and still passes.
+		*/
+		result, encloser := check_signature(sig, owner, class, records, keys, unix, allocator)
+		if result == .Ok && encloser == "" {
 			return records, sig.signer, sig, true, false
 		}
 	}
@@ -2568,8 +2580,11 @@ zone_step :: proc(
 				exhausted = true
 				break
 			}
-			result, _ := check_signature(sig, child, class, ds_records, parent_keys, unix, allocator)
-			if result == .Ok {
+			// And not from a wildcard either. A DS is the parent's word about
+			// one child, so a signature made over `*.<parent>` is not the
+			// parent naming this cut; see `verified_rrset` for the rest of it.
+			result, encloser := check_signature(sig, child, class, ds_records, parent_keys, unix, allocator)
+			if result == .Ok && encloser == "" {
 				verified = true
 				break
 			}
