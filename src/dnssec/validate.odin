@@ -1701,6 +1701,7 @@ validate_denial :: proc(
 	}
 
 	rcode := dns.rcode_of(msg)
+	refused := budget.nsec3.refused
 	proof: Proof = .Failed
 	if rcode == .NX_Domain {
 		proof = nsec_proves_name_error(nsecs, qname, allocator) if len(nsecs) > 0 else .Failed
@@ -1715,24 +1716,25 @@ validate_denial :: proc(
 	}
 
 	/*
-	The hashing allowance, and the same answer as the two above it. A proof this
-	server stopped hashing partway through is not a proof it found wanting, and
-	`Bogus` would report our own limit to the client as a forgery - with its
-	address beside the word in the log. Only where there were NSEC3 records to
-	hash: the flag is the whole question's and stays set once anything sets it,
-	so reading it over an NSEC-only proof would file a forgery under an
-	allowance of ours.
+	Hashing this server declined, and the same answer as the two allowances
+	above it. A proof built on a hash we would not compute is not a proof found
+	wanting, and `Bogus` would report a decision of ours to the client as a
+	forgery - with its address beside the word in the log.
+
+	Counted over this proof rather than read off the budget, because the flags
+	there belong to the whole question and stay set once anything sets them: an
+	NSEC proof, which hashes nothing, would otherwise be filed under an
+	allowance it could not have spent.
 	*/
-	if proof == .Failed && len(nsec3s) > 0 && budget.nsec3.exhausted {
+	if proof == .Failed && budget.nsec3.refused > refused {
 		// Named apart from the signature budget, in the reason and in the log,
-		// because an operator whose deep names start failing has to be able to
-		// tell SHA-1 rounds from verifications - which is the whole point of
-		// saying `Indeterminate` rather than `Bogus`.
-		logx.debugf(
-			"dnssec: the denial of %s ran out of nsec3 hashing before it was proven",
-			dns.name_trim_root(qname),
-		)
-		return {status = .Indeterminate, reason = "nsec3 hashing budget spent"}
+		// because an operator whose names start failing has to be able to tell
+		// SHA-1 rounds from verifications, and both of those from a zone asking
+		// for more iterations than this server computes - which is the whole
+		// point of saying `Indeterminate` rather than `Bogus`.
+		reason := "nsec3 hashing budget spent" if budget.nsec3.exhausted else "nsec3 iterations above the ceiling"
+		logx.debugf("dnssec: the denial of %s was not read to the end: %s", dns.name_trim_root(qname), reason)
+		return {status = .Indeterminate, reason = reason}
 	}
 
 	switch proof {
@@ -2269,6 +2271,7 @@ validate_wildcard_proof :: proc(
 			return .Secure, denial.verified, ""
 		}
 	}
+	refused := budget.nsec3.refused
 	if len(denial.nsec3s) > 0 {
 		if cover, covered := nsec3_covering(denial.nsec3s, next_closer, &budget.nsec3); covered {
 			// RFC 5155 section 9.2 forbids the AD bit over an opt-out cover:
@@ -2281,20 +2284,20 @@ validate_wildcard_proof :: proc(
 		}
 	}
 	/*
-	As above: hashing we stopped short of is not a cover we looked for and
-	failed to find. Only where there were NSEC3 records to hash, though - the
-	flag is the question's and stays set once anything sets it, so reading it
-	over an NSEC-only proof would file a forgery as an allowance of ours. Both
-	answers are SERVFAIL to the client, and the difference is everything the
-	server says about it: the bogus count, the log line carrying the client's
-	address, the extended error the answer carries.
+	As above: hashing we declined is not a cover we looked for and failed to
+	find, and what this counts is what this proof was refused rather than what
+	the question has spent. Both answers are SERVFAIL to the client, and the
+	difference is everything the server says about it: the bogus count, the log
+	line carrying the client's address, the extended error the answer carries.
 	*/
-	if len(denial.nsec3s) > 0 && budget.nsec3.exhausted {
+	if budget.nsec3.refused > refused {
+		declined := "nsec3 hashing budget spent" if budget.nsec3.exhausted else "nsec3 iterations above the ceiling"
 		logx.debugf(
-			"dnssec: the wildcard proof for %s ran out of nsec3 hashing before a cover was found",
+			"dnssec: the wildcard proof for %s was not read to the end: %s",
 			dns.name_trim_root(owner),
+			declined,
 		)
-		return .Indeterminate, nil, "nsec3 hashing budget spent"
+		return .Indeterminate, nil, declined
 	}
 	return .Bogus, nil, "wildcard expansion not proven"
 }
@@ -2776,8 +2779,9 @@ zone_step :: proc(
 	*/
 	if cut_short {
 		logx.debugf(
-			"dnssec: the ds denial for %s ran out of nsec3 hashing; the step is undecided",
+			"dnssec: the ds denial for %s was not read to the end (%s); the step is undecided",
 			dns.name_trim_root(child),
+			"nsec3 hashing budget spent" if budget.nsec3.exhausted else "nsec3 iterations above the ceiling",
 		)
 		return .Indeterminate, nil
 	}
@@ -2796,12 +2800,13 @@ and none of it needs a network: the records have already been checked against
 the parent's keys, and what is left is what they say.
 
 `cut_short` says this reading could have been changed by hashing that was
-refused, and it is this step's own answer rather than the meter's. The flag on
-the budget is the question's: it stays set for everything after whatever emptied
-it, so a step that reached its verdict from NSEC records, or from a record it
-found, would otherwise read someone else's exhaustion as its own and be thrown
-away for it. Only the readings a refusal could have produced - a scan finding
-nothing, and nothing proven at all - carry it.
+refused, and it is this step's own answer rather than the question's. The flags
+on the budget stay set for everything after whatever set them, so a step that
+reached its verdict from NSEC records, from a record it found, or from hashes
+kept by an earlier scan would otherwise read someone else's refusal as its own
+and be thrown away for it. What it counts instead is the refusals charged while
+it read, and it carries them only on the readings a refusal could have produced:
+a scan finding nothing, and nothing proven at all.
 */
 @(private)
 denial_step :: proc(
@@ -2822,6 +2827,7 @@ denial_step :: proc(
 		}
 	}
 	if len(nsec3s) > 0 {
+		refused := nsec3_budget.refused
 		// A proof that found what it was looking for is a proof that hashed:
 		// nothing refused can return `Proven`, so this one needs no caveat.
 		if nsec3_proves_no_ds(nsec3s, child, parent, nsec3_budget) == .Proven {
@@ -2844,14 +2850,12 @@ denial_step :: proc(
 			if matched {
 				return .No_Cut, false
 			}
-			return .Absent, nsec3_budget.exhausted
+			return .Absent, nsec3_budget.refused > refused
 		}
-		// Nothing proven either way. That is a forgery when the records are what
-		// they look like, and our own limit when the hashing stopped, and this
-		// cannot tell the two apart once the meter was empty before the step
-		// began - so it says the safe one: an allowance of ours, never a forgery
-		// this server did not finish looking for.
-		return .Bogus, nsec3_budget.exhausted
+		// Nothing proven either way: a forgery when the records are what they
+		// look like, and a decision of ours when a hash was refused while this
+		// read. The count says which.
+		return .Bogus, nsec3_budget.refused > refused
 	}
 	return .Bogus, false
 }

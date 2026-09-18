@@ -1,5 +1,6 @@
 package dnssec
 
+import "core:fmt"
 import "core:mem"
 import "core:slice"
 import "core:testing"
@@ -324,5 +325,61 @@ test_a_step_that_matched_is_not_cut_short_by_someone_elses_allowance :: proc(t: 
 	step, cut_short := denial_step(nil, zone, "ent.example.", "example.", &budget)
 	testing.expect_value(t, step, Step.No_Cut)
 	testing.expect(t, !cut_short, "a record that was found is not a reading a refusal could have changed")
+	free_all(context.temp_allocator)
+}
+
+/*
+The deepest name a chain walk will follow still fits in one allowance.
+
+`MAX_CHAIN_DEPTH` is twenty-four labels, and every one of them is a name the
+walk hashes on the way down before the answer's own proof hashes any. The
+allowance is sized for that with room over, and the sizing is prose in
+`nsec3.odin` until something runs it: a change to the reuse, to what a proof
+scans, or to the charge itself moves the number, and the first anyone would
+otherwise hear of it is a deep name in a signed zone answering SERVFAIL.
+
+A hundred iterations, the ceiling this server ships, and a salt of the length
+zones really publish.
+*/
+@(test)
+test_the_deepest_walk_this_server_follows_fits_in_one_allowance :: proc(t: ^testing.T) {
+	nodes := make([dynamic]Node, context.temp_allocator)
+	append(&nodes, Node{"example.", {.NS, .SOA, .RRSIG, .DNSKEY}})
+	// A chain of empty non-terminals twenty-odd labels deep, each a name the
+	// walk has to read a denial for.
+	name := "example."
+	for i in 0 ..< 22 {
+		name = fmt.tprintf("n%d.%s", i, name)
+		append(&nodes, Node{name, {.A, .RRSIG}})
+	}
+	zone := nsec3_zone(nodes[:], []u8{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}, 100)
+	testing.expect(t, len(zone) == len(nodes), "the chain should build")
+
+	budget := Nsec3_Budget {
+		max_iterations = 100,
+	}
+	// Every step of the walk, then the denial of a name under the deepest one.
+	for node in nodes[1:] {
+		step, cut_short := denial_step(nil, zone, node.name, "example.", &budget)
+		testing.expectf(t, !cut_short, "the walk ran out at %s after %d rounds", node.name, budget.rounds)
+		testing.expectf(t, step == .No_Cut, "%s is a name the zone holds, got %v", node.name, step)
+	}
+	proof := nsec3_proves_name_error(zone, fmt.tprintf("nx.%s", name), "example.", &budget)
+	testing.expectf(t, proof == .Proven, "the denial at the bottom of the walk should prove, got %v", proof)
+	testing.expectf(
+		t,
+		!budget.exhausted,
+		"a walk to the chain-depth limit spent %d rounds of %d",
+		budget.rounds,
+		MAX_NSEC3_ROUNDS_PER_QUERY,
+	)
+	// And with room left, not by a hair: the sizing comment claims this.
+	testing.expectf(
+		t,
+		budget.rounds < MAX_NSEC3_ROUNDS_PER_QUERY / 2,
+		"the deepest walk this server follows spent %d rounds of %d, which is no headroom at all",
+		budget.rounds,
+		MAX_NSEC3_ROUNDS_PER_QUERY,
+	)
 	free_all(context.temp_allocator)
 }

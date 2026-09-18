@@ -732,3 +732,33 @@ test_nsec3_no_data_does_not_read_a_spent_allowance_as_an_absent_wildcard :: proc
 	free_all(context.temp_allocator)
 }
 
+
+/*
+A zone asking for more iterations than this server computes is not a forgery.
+
+The ceiling refuses one record before any hashing is charged for it, so the
+meter reads zero and the proof simply fails - and a denial that fails is
+`Bogus`, which puts the client's address in the log beside the word forgery over
+a number the zone chose and nobody forged. The refusal is this server's, the
+same as running out of allowance, and it has to reach the caller saying so.
+
+That is what `Nsec3_Budget.refused` carries. `over_ceiling` is what tells the
+two refusals apart afterwards, so the operator reading the log finds out which
+number to look at.
+*/
+@(test)
+test_nsec3_iterations_above_the_ceiling_are_refused_as_ours :: proc(t: ^testing.T) {
+	zone := a_zone()
+	for &record in zone {
+		record.rr.iterations = 300
+	}
+	budget := Nsec3_Budget {
+		max_iterations = 255,
+	}
+	testing.expect_value(t, nsec3_proves_name_error(zone, "nx.example.", "example.", &budget), Proof.Failed)
+	testing.expect(t, budget.refused > 0, "a record the ceiling refused is a hash this server declined")
+	testing.expect(t, budget.over_ceiling, "and the reason has to be readable afterwards")
+	testing.expect(t, !budget.exhausted, "nothing was hashed, so nothing was spent")
+	testing.expect_value(t, budget.rounds, 0)
+	free_all(context.temp_allocator)
+}

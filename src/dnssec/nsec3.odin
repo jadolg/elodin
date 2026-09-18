@@ -101,8 +101,11 @@ question, and high enough the second makes the first meaningless rather than
 laxer: every record costs more than a whole question may spend, so every NSEC3
 denial in every zone is `Indeterminate` and every name in one is SERVFAIL. A
 setting that reads as "accept more" and acts as "accept nothing" is worth
-refusing at load, which `config` does, rather than leaving to be discovered as a
-resolver that came up fine and answers nothing.
+catching, so `make_validator` holds a larger number down to this and says so in
+the log rather than leaving it to be discovered as a resolver that came up fine
+and answers nothing. Held down rather than refused at load: a configuration
+carrying a larger number was legal before this bound existed, and a resolver
+that does not come back from an upgrade is worse than either.
 
 What it promises is a floor, not a guarantee, and the difference is worth being
 plain about. At this ceiling a record with a salt of ordinary length costs 256
@@ -132,6 +135,11 @@ Nsec3_Budget :: struct {
 	max_iterations: int,
 	rounds:         int,
 	exhausted:      bool,
+	over_ceiling:   bool,
+	// Hashes declined, for either reason. A caller that wants to know whether
+	// *its own* reading was cut short reads this before and after, because the
+	// two flags above belong to the whole question and stay set once set.
+	refused:        int,
 	// The hashes kept from this question's scans, for whatever asks next: see
 	// `Nsec3_Hashes`.
 	hashed:         Nsec3_Hashes,
@@ -167,6 +175,7 @@ spend_nsec3_rounds :: proc(budget: ^Nsec3_Budget, rr: Nsec3, name: string) -> bo
 	cost := sha1_blocks(len(name) + 1 + len(rr.salt)) + int(rr.iterations) * sha1_blocks(20 + len(rr.salt))
 	if budget.rounds + cost > MAX_NSEC3_ROUNDS_PER_QUERY {
 		budget.exhausted = true
+		budget.refused += 1
 		return false
 	}
 	budget.rounds += cost
@@ -178,9 +187,14 @@ Hash `name` with one record's parameters.
 
 Refusing an iteration count above the budget's ceiling is a denial-of-service
 guard: the work is the validator's, the number is the zone's, and RFC 9276 asks
-for zero anyway. Refusing here makes the proof fail rather than succeed, and
-callers turn that into an insecure answer rather than a bogus one. The ceiling
-bounds one record; `MAX_NSEC3_ROUNDS_PER_QUERY` bounds the question.
+for zero anyway. The ceiling bounds one record; `MAX_NSEC3_ROUNDS_PER_QUERY`
+bounds the question.
+
+Both refusals are counted, and counted together, because what the callers have
+to say about them is the same: a proof built on a hash this server declined to
+compute failed for a reason of ours, and reporting it as `Bogus` would put the
+client's address in the log beside the word forgery over a number the zone
+chose. They report `Indeterminate` and name which refusal it was.
 */
 @(private)
 nsec3_hash_with :: proc(rr: Nsec3, name: string, out: []u8, budget: ^Nsec3_Budget) -> bool {
@@ -189,6 +203,8 @@ nsec3_hash_with :: proc(rr: Nsec3, name: string, out: []u8, budget: ^Nsec3_Budge
 	}
 	ceiling := budget.max_iterations if budget.max_iterations > 0 else DEFAULT_MAX_NSEC3_ITERATIONS
 	if int(rr.iterations) > ceiling {
+		budget.over_ceiling = true
+		budget.refused += 1
 		return false
 	}
 	if !spend_nsec3_rounds(budget, rr, name) {
@@ -273,9 +289,10 @@ nsec3_matching :: proc(n3s: []Nsec3_Rr, name: string, budget: ^Nsec3_Budget) -> 
 	for n in n3s {
 		h, ok := nsec3_hash_of(name, n.rr, budget)
 		if !ok {
-			if budget.exhausted {
-				break
-			}
+			// Not `break`, even once the allowance is gone: a record whose
+			// hash is one of the kept ones still answers for free, and giving
+			// up at the first refusal would let the order the records arrive
+			// in decide the verdict.
 			continue
 		}
 		if mem.compare(n.hash, h) == 0 {
@@ -296,9 +313,10 @@ nsec3_covering :: proc(n3s: []Nsec3_Rr, name: string, budget: ^Nsec3_Budget) -> 
 	for n in n3s {
 		h, ok := nsec3_hash_of(name, n.rr, budget)
 		if !ok {
-			if budget.exhausted {
-				break
-			}
+			// Not `break`, even once the allowance is gone: a record whose
+			// hash is one of the kept ones still answers for free, and giving
+			// up at the first refusal would let the order the records arrive
+			// in decide the verdict.
 			continue
 		}
 		// Both ends of the span must be the width of the hash we computed, or
@@ -356,8 +374,10 @@ nsec3_closest_encloser :: proc(
 			return name, previous, true
 		}
 		// Nothing above this name can be matched either once the hashing
-		// allowance is gone, and the caller reads `exhausted` rather than this
-		// failure to tell the two apart.
+		// allowance is gone, and the caller tells this failure from a real one
+		// by the refusals counted against it. Only the allowance stops the walk
+		// - a record asking for too many iterations is one record, and the name
+		// above may be matched by another.
 		if budget.exhausted {
 			return "", "", false
 		}
@@ -429,6 +449,7 @@ nsec3_proves_no_data :: proc(
 	if !covered {
 		return .Failed
 	}
+	refused := budget.refused
 	wildcard, wildcard_found := nsec3_matching(n3s, wildcard_of(encloser, allocator), budget)
 	if !wildcard_found {
 		/*
@@ -439,9 +460,14 @@ nsec3_proves_no_data :: proc(
 		here" turns an unfinished proof into an insecure answer - the verdict
 		that serves the records rather than refusing them. Every other negative
 		below and above returns `Failed`, which the callers turn into
-		`Indeterminate` once they see `exhausted`, and this joins them.
+		`Indeterminate` once they see what it cost, and this joins them.
+
+		A refusal counted against this scan and not the flag on the budget: the
+		flag belongs to the whole question and stays set, and a wildcard that
+		was really looked for and really is not there is a finding whatever some
+		earlier proof spent.
 		*/
-		if budget.exhausted {
+		if budget.refused > refused {
 			return .Failed
 		}
 		if cover.rr.flags & NSEC3_FLAG_OPT_OUT != 0 {

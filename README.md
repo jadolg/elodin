@@ -923,16 +923,20 @@ off is for an upstream that cannot be trusted to return DNSSEC records — an IS
 or captive-portal resolver — against which every signed zone would otherwise stop
 resolving rather than merely going unverified.
 
-`max_nsec3_iterations` is the most hashing a single NSEC3 record may ask for;
-one above it is treated as unusable, which leaves the zone insecure rather than
-letting it set the resolver an arbitrary amount of work. RFC 9276 asks zones for
-zero and the zones still publishing NSEC3 use single digits. A query has a
-hashing allowance of its own on top of this, so values above 255 are refused at
-startup: past there the allowance is what answers, and the zones a higher
-ceiling admits are the ones whose proofs it cannot pay for, which is SERVFAIL
-rather than more validation. A larger number in the configuration is held down
-to 255 at startup, with a line in the log saying so, rather than refused: a
-resolver that will not come up is worse than either.
+`max_nsec3_iterations` is the most hashing a single NSEC3 record may ask for.
+A record above it is not computed, so a proof resting on one cannot be read and
+the name comes back SERVFAIL — not because the records are wrong, which is what
+this server means by bogus, but because it declined the work. RFC 9276 asks
+zones for zero and the zones still publishing NSEC3 use single digits, so this
+is a guard against a zone that has picked a number nobody should, rather than a
+setting to tune.
+
+A query also has a hashing allowance of its own, and above a ceiling of 255 that
+allowance is what answers: the zones a higher ceiling admits are the ones whose
+proofs it cannot pay for, so a larger number buys SERVFAIL rather than more
+validation. A configuration carrying one is held down to 255 at startup, with a
+line in the log saying so, rather than refused — a resolver that will not come
+up is worse than either.
 
 Being a forwarder rather than a recursor, elodin fetches the material it
 validates against: every DS and DNSKEY down from the root, through the configured
