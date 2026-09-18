@@ -1703,7 +1703,7 @@ validate_denial :: proc(
 	`Bogus` would report our own limit to the client as a forgery - with its
 	address beside the word in the log.
 	*/
-	if proof == .Failed && budget.nsec3.exhausted {
+	if proof == .Failed && len(nsec3s) > 0 && budget.nsec3.exhausted {
 		return {status = .Indeterminate, reason = "verification budget spent"}
 	}
 
@@ -2252,9 +2252,16 @@ validate_wildcard_proof :: proc(
 			return .Secure, denial.verified, ""
 		}
 	}
-	// As above: hashing we stopped short of is not a cover we looked for and
-	// failed to find.
-	if budget.nsec3.exhausted {
+	/*
+	As above: hashing we stopped short of is not a cover we looked for and
+	failed to find. Only where there were NSEC3 records to hash, though - the
+	flag is the question's and stays set once anything sets it, so reading it
+	over an NSEC-only proof would file a forgery as an allowance of ours. Both
+	answers are SERVFAIL to the client, and the difference is everything the
+	server says about it: the bogus count, the log line carrying the client's
+	address, the extended error the answer carries.
+	*/
+	if len(denial.nsec3s) > 0 && budget.nsec3.exhausted {
 		return .Indeterminate, nil, "verification budget spent"
 	}
 	return .Bogus, nil, "wildcard expansion not proven"
@@ -2722,7 +2729,8 @@ zone_step :: proc(
 		return .Bogus, nil
 	}
 
-	step = denial_step(nsecs, nsec3s, child, parent, &budget.nsec3)
+	cut_short: bool
+	step, cut_short = denial_step(nsecs, nsec3s, child, parent, &budget.nsec3)
 	/*
 	A step whose NSEC3 hashing ran out is one this server did not read to the
 	end, which is `Indeterminate` territory rather than anything the records
@@ -2734,7 +2742,7 @@ zone_step :: proc(
 	`Secure`, leaving a name that really is delegated to be judged against the
 	wrong zone's keys and reported to the client as a forgery.
 	*/
-	if budget.nsec3.exhausted {
+	if cut_short {
 		return .Indeterminate, nil
 	}
 	if step == .Insecure {
@@ -2750,6 +2758,14 @@ not a cut, or a name that is not there at all?
 Kept apart from the lookup around it because this is the whole of the decision
 and none of it needs a network: the records have already been checked against
 the parent's keys, and what is left is what they say.
+
+`cut_short` says this reading was made with hashing refused, and it is this
+step's own answer rather than the meter's. The flag on the budget is the
+question's: it stays set for everything after whatever emptied it, so a step
+that reached its verdict from NSEC records, or from a hash that was granted
+before the allowance ran out, would read someone else's exhaustion as its own
+and be thrown away for it. Only a reading that a refusal could have changed
+carries it.
 */
 @(private)
 denial_step :: proc(
@@ -2757,18 +2773,23 @@ denial_step :: proc(
 	nsec3s: []Nsec3_Rr,
 	child, parent: string,
 	nsec3_budget: ^Nsec3_Budget,
-) -> Step {
+) -> (
+	step: Step,
+	cut_short: bool,
+) {
 	if len(nsecs) > 0 {
 		if nsec_proves_no_ds(nsecs, child) == .Proven {
-			return .Insecure
+			return .Insecure, false
 		}
 		if nsec_proves_no_delegation(nsecs, child) {
-			return .No_Cut if nsec_shows_node(nsecs, child) else .Absent
+			return (.No_Cut if nsec_shows_node(nsecs, child) else .Absent), false
 		}
 	}
 	if len(nsec3s) > 0 {
+		// A proof that found what it was looking for is a proof that hashed:
+		// nothing refused can return `Proven`, so this one needs no caveat.
 		if nsec3_proves_no_ds(nsec3s, child, parent, nsec3_budget) == .Proven {
-			return .Insecure
+			return .Insecure, false
 		}
 		if proven, matched := nsec3_proves_no_delegation(nsec3s, child, parent, nsec3_budget); proven {
 			// An NSEC3 zone publishes a record for every empty non-terminal
@@ -2777,10 +2798,11 @@ denial_step :: proc(
 			// there is no delegation rather than from a third pass over the
 			// same records: see `nsec3_proves_no_delegation` for what asking
 			// twice cost.
-			return .No_Cut if matched else .Absent
+			return (.No_Cut if matched else .Absent), nsec3_budget.exhausted
 		}
+		return .Bogus, nsec3_budget.exhausted
 	}
-	return .Bogus
+	return .Bogus, false
 }
 
 /*

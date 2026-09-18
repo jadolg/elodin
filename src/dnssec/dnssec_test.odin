@@ -365,6 +365,38 @@ test_a_denial_that_runs_out_of_hashing_is_indeterminate :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+/*
+An NSEC denial that fails is a forgery, whatever the NSEC3 meter says.
+
+The hashing allowance is the whole question's and it stays spent once anything
+spends it, so a proof made entirely of NSEC records - which hash nothing and
+cannot spend it - must not be filed under it. Both answers are SERVFAIL to the
+client and the difference is everything this server says about the query: the
+bogus count, the log line carrying the client's address, the extended error the
+answer carries. A forgery reported as an allowance of ours is a forgery nobody
+hears about.
+
+`nosuchname-xq7.cloudflare.com.` is denied with the "black lies" NSEC, whose bit
+map lists the types the zone really minted for it, so asking for one of those is
+a NODATA denial contradicted by the denial's own records.
+*/
+@(test)
+test_an_nsec_denial_that_fails_is_bogus_even_with_the_hashing_spent :: proc(t: ^testing.T) {
+	msg, err := dns.decode_message(unhex(fixture("nodata_cloudflare").wire), context.temp_allocator)
+	testing.expect(t, err == .None, "the captured denial should decode")
+
+	qname :: "nosuchname-xq7.cloudflare.com."
+	v := test_validator()
+	defer destroy_validator(v)
+	spent := Budget {
+		nsec3 = {rounds = MAX_NSEC3_ROUNDS_PER_QUERY, exhausted = true},
+	}
+	result := validate_denial(v, &spent, msg, qname, .NSEC, .IN, u32(FIXTURE_TIME), fixture_now(), context.temp_allocator)
+	testing.expect_value(t, result.status, Status.Bogus)
+	testing.expect_value(t, result.reason, "denial of existence not proven")
+	free_all(context.temp_allocator)
+}
+
 @(test)
 test_validates_nodata :: proc(t: ^testing.T) {
 	// cloudflare.com answers a nonexistent name with NODATA and an NSEC that

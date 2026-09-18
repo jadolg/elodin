@@ -923,6 +923,15 @@ off is for an upstream that cannot be trusted to return DNSSEC records — an IS
 or captive-portal resolver — against which every signed zone would otherwise stop
 resolving rather than merely going unverified.
 
+`max_nsec3_iterations` is the most hashing a single NSEC3 record may ask for;
+one above it is treated as unusable, which leaves the zone insecure rather than
+letting it set the resolver an arbitrary amount of work. RFC 9276 asks zones for
+zero and the zones still publishing NSEC3 use single digits. A query has a
+hashing allowance of its own on top of this, so values above 255 are refused at
+startup: past there the allowance is what answers, and the zones a higher
+ceiling admits are the ones whose proofs it cannot pay for, which is SERVFAIL
+rather than more validation.
+
 Being a forwarder rather than a recursor, elodin fetches the material it
 validates against: every DS and DNSKEY down from the root, through the configured
 upstreams, with DO and CD set. Zone keys are cached, so the cost falls on the
