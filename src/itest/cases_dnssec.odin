@@ -67,7 +67,7 @@ run_dnssec_cases :: proc(r: ^Runner) {
 		// feature decorative.
 		res := query_udp(udp_port, build_query("unsigned.test.", u16(dns.Type.A)))
 		if check(r, res.ok, "no response") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check_eq_int(r, h.rcode, int(dns.Rcode.Serv_Fail), "rcode")
 			check_eq_int(r, h.ancount, 0, "answers in a refused response")
 		}
@@ -146,11 +146,11 @@ run_dnssec_cases :: proc(r: ^Runner) {
 		// resolvers that chain behind us.
 		res := query_udp(udp_port, build_query("cd.test.", u16(dns.Type.A), checking_disabled = true))
 		if check(r, res.ok, "no response") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode for a CD query")
 			check_eq_int(r, h.ancount, 1, "answers for a CD query")
 
-			addrs := answer_addresses(res.wire)
+			addrs := answer_addresses(r, res.wire)
 			if check(r, len(addrs) == 1, "expected one address, got %d", len(addrs)) {
 				check_eq_str(r, addrs[0], "203.0.113.55", "address")
 			}
@@ -168,7 +168,7 @@ run_dnssec_cases :: proc(r: ^Runner) {
 		// default, proven end to end while validation is on everywhere else.
 		res := query_udp(udp_port, build_query("20.2.168.192.in-addr.arpa.", u16(dns.Type.PTR)))
 		if check(r, res.ok, "no response") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode for a private reverse name")
 		}
 	}
@@ -181,7 +181,7 @@ run_dnssec_cases :: proc(r: ^Runner) {
 		// does. The gate is narrow, not a hole for every in-addr.arpa name.
 		res := query_udp(udp_port, build_query("8.8.8.8.in-addr.arpa.", u16(dns.Type.PTR)))
 		if check(r, res.ok, "no response") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check_eq_int(r, h.rcode, int(dns.Rcode.Serv_Fail), "rcode for a public reverse name")
 		}
 	}
@@ -220,13 +220,13 @@ dnssec:
 
 			covered := query_udp(anchored_port, build_query("1.1.168.192.in-addr.arpa.", u16(dns.Type.PTR)))
 			if check(r, covered.ok, "no response for the anchored name") {
-				h, _ := parse_header(covered.wire)
+				h := parse_header(r, covered.wire)
 				check_eq_int(r, h.rcode, int(dns.Rcode.Serv_Fail), "rcode for an anchored private name")
 			}
 
 			uncovered := query_udp(anchored_port, build_query("1.1.10.in-addr.arpa.", u16(dns.Type.PTR)))
 			if check(r, uncovered.ok, "no response for the unanchored name") {
-				h, _ := parse_header(uncovered.wire)
+				h := parse_header(r, uncovered.wire)
 				check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode for an unanchored private name")
 			}
 		}
@@ -274,7 +274,7 @@ dnssec: {{enabled: false}}
 			defer stop_server(&plain)
 			res := query_udp(plain_port, build_query("unsigned.test.", u16(dns.Type.A)))
 			if check(r, res.ok, "no response") {
-				h, _ := parse_header(res.wire)
+				h := parse_header(r, res.wire)
 				check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode with validation off")
 				check_eq_int(r, h.ancount, 1, "answers with validation off")
 			}
@@ -308,7 +308,7 @@ blocking: {{enabled: false}}
 
 				res := query_udp(default_port, build_query("default.test.", u16(dns.Type.A)))
 				if check(r, res.ok, "no response") {
-					h, _ := parse_header(res.wire)
+					h := parse_header(r, res.wire)
 					check_eq_int(r, h.rcode, int(dns.Rcode.Serv_Fail), "rcode under the shipped defaults")
 				}
 			} else {

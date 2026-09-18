@@ -33,6 +33,40 @@ blocking: {{ enabled: false }}
 }
 
 run_wire_cases :: proc(r: ^Runner) {
+	start_case(r, "harness: a reply the helpers cannot decode fails the case")
+	{
+		/*
+		Twelve bytes that parse as a header and cannot decode as a message: the
+		header claims one answer record and the record is not there.
+
+		Every helper used to report this as "the thing you asked about is
+		absent", which is exactly what a negative assertion wants to hear, so a
+		case could go green on bytes nothing read. A scratch runner collects the
+		failures instead of this case taking them.
+		*/
+		bad := []u8{0x12, 0x34, 0x81, 0x80, 0, 0, 0, 1, 0, 0, 0, 0}
+
+		scratch: Runner
+		defer {
+			for f in scratch.failures {
+				delete(f)
+			}
+			delete(scratch.failures)
+		}
+
+		answer_has_type(&scratch, bad, u16(dns.Type.A))
+		answer_addresses(&scratch, bad)
+		first_cname_or_name(&scratch, bad)
+		min_answer_ttl(&scratch, bad)
+		find_cookie(&scratch, bad)
+		check_eq_int(r, len(scratch.failures), 5, "helpers that refused an undecodable reply")
+
+		// And the header reader, whose zero value reads as NOERROR.
+		parse_header(&scratch, bad[:8])
+		check_eq_int(r, len(scratch.failures), 6, "a reply too short for a header also fails")
+	}
+	end_case(r)
+
 	upstream_port := next_port(r)
 	mock := mock_make("wire", upstream_port)
 
@@ -69,7 +103,7 @@ run_wire_cases :: proc(r: ^Runner) {
 
 			res := use_tcp ? query_tcp(udp_port, query) : query_udp(udp_port, query)
 			if check(r, res.ok, "no response") {
-				h, _ := parse_header(res.wire)
+				h := parse_header(r, res.wire)
 				check(r, h.id == 0x7a5c, "transaction ID: got %04x, want 7a5c", h.id)
 				check_eq_int(r, h.ancount, f.ancount, "answer count")
 				check_eq_int(r, h.rcode, f.rcode, "rcode")
@@ -188,7 +222,7 @@ run_wire_cases :: proc(r: ^Runner) {
 		bad := []u8{0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 7, 'e', 'x'}
 		res := query_udp(udp_port, bad)
 		if check(r, res.ok, "no response to a truncated question") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check(r, h.rcode == int(dns.Rcode.Form_Err), "rcode %d, want FORMERR", h.rcode)
 		}
 	}
@@ -200,7 +234,7 @@ run_wire_cases :: proc(r: ^Runner) {
 		q[2] = (q[2] & 0x87) | (2 << 3) // opcode STATUS
 		res := query_udp(udp_port, q)
 		if check(r, res.ok, "no response") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check(r, h.rcode == int(dns.Rcode.Not_Impl), "rcode %d, want NOTIMP", h.rcode)
 		}
 	}
@@ -213,7 +247,7 @@ run_wire_cases :: proc(r: ^Runner) {
 		query := build_query(f.qname, f.qtype)
 		res := query_udp(udp_port, query)
 		if check(r, res.ok, "no response") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check(r, h.tc, "the TC bit was not set")
 			check(r, len(res.wire) <= 512, "response is %d bytes, over the 512 limit", len(res.wire))
 			check_eq_int(r, h.qdcount, 1, "question count in a truncated reply")
@@ -227,7 +261,7 @@ run_wire_cases :: proc(r: ^Runner) {
 		query := build_query(f.qname, f.qtype)
 		res := query_tcp(udp_port, query)
 		if check(r, res.ok, "no response") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check(r, !h.tc, "TC set on a TCP reply")
 			check_eq_int(r, h.ancount, f.ancount, "answer count")
 		}

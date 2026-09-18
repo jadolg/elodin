@@ -86,7 +86,7 @@ run_h2_cases :: proc(r: ^Runner) {
 				check_eq_str(r, h2_header_value(res, "content-type"), "application/dns-message", "content type")
 				check(r, h2_header_value(res, "cache-control") != "", "no cache-control header")
 				if check(r, len(res.body) >= dns.HEADER_SIZE, "body too short: %d", len(res.body)) {
-					h, _ := parse_header(res.body)
+					h := parse_header(r, res.body)
 					check_eq_int(r, h.ancount, fix.ancount, "answer count")
 					check(r, h.id == 0x2222, "transaction ID not echoed: %04x", h.id)
 				}
@@ -104,7 +104,7 @@ run_h2_cases :: proc(r: ^Runner) {
 			if check(r, h2_collect(c, []u32{1}), "stream 1 never completed") {
 				res, _ := h2_stream(c, 1)
 				check_eq_int(r, res.status, 200, "status")
-				h, _ := parse_header(res.body)
+				h := parse_header(r, res.body)
 				check_eq_int(r, h.ancount, fix.ancount, "answer count")
 			}
 		}
@@ -314,7 +314,7 @@ run_h2_cases :: proc(r: ^Runner) {
 				res, _ := h2_stream(c, 1)
 				check_eq_int(r, res.status, 200, "status")
 				if check(r, len(res.body) >= dns.HEADER_SIZE, "body too short: %d", len(res.body)) {
-					h, _ := parse_header(res.body)
+					h := parse_header(r, res.body)
 					check_eq_int(r, h.ancount, fix.ancount, "answer count")
 				}
 				check(r, res.data_frames > 1, "the body arrived in one frame despite an 8-byte window")
@@ -473,7 +473,7 @@ run_h2_cases :: proc(r: ^Runner) {
 		res := doh_post(doh_port, "/dns-query", query)
 		if check(r, res.ok, "no HTTP/1.1 response") {
 			check_eq_int(r, res.status, 200, "status")
-			h, _ := parse_header(res.body)
+			h := parse_header(r, res.body)
 			check_eq_int(r, h.ancount, fix.ancount, "answer count")
 		}
 	}
@@ -527,7 +527,7 @@ run_h2_large_response_case :: proc(r: ^Runner) {
 				check(r, len(res.body) > 16384, "response is only %d bytes, too small to split", len(res.body))
 				check(r, res.data_frames > 1, "a %d-byte body arrived in one DATA frame", len(res.body))
 				check_eq_int(r, len(res.body), len(big), "reassembled length")
-				h, _ := parse_header(res.body)
+				h := parse_header(r, res.body)
 				check(r, h.ancount == 100, "answer count: got %d, want 100", h.ancount)
 			}
 		}

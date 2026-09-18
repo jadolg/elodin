@@ -41,7 +41,7 @@ blocking: {{ enabled: false }}
 				{
 					res := query_udp(udp_port, build_query(fix.qname, fix.qtype))
 					if check(r, res.ok, "no response") {
-						h, _ := parse_header(res.wire)
+						h := parse_header(r, res.wire)
 						check_eq_int(r, h.ancount, fix.ancount, "answer count")
 					}
 					h2_hits, h1_hits := doh2_mock_counts(mock)
@@ -100,7 +100,7 @@ blocking: {{ enabled: false }}
 				{
 					res := query_udp(udp_port, build_query(fix.qname, fix.qtype))
 					if check(r, res.ok, "no response") {
-						h, _ := parse_header(res.wire)
+						h := parse_header(r, res.wire)
 						check_eq_int(r, h.ancount, fix.ancount, "answer count")
 					}
 					h2_hits, h1_hits := doh2_mock_counts(mock)

@@ -69,8 +69,8 @@ index_byte :: proc(s: string, c: u8) -> int {
 QNAME :: "probe.test."
 
 @(private = "file")
-first_address :: proc(wire: []u8) -> string {
-	addrs := answer_addresses(wire)
+first_address :: proc(r: ^Runner, wire: []u8) -> string {
+	addrs := answer_addresses(r, wire)
 	return addrs[0] if len(addrs) > 0 else ""
 }
 
@@ -146,7 +146,7 @@ blocking: {{ enabled: false }}
 				for i in 0 ..< 4 {
 					res := query_udp(udp_port, build_query(QNAME, u16(dns.Type.A), id = u16(i)))
 					if check(r, res.ok, "no response on attempt %d", i) {
-						check_eq_str(r, first_address(res.wire), "198.51.100.1", "answering upstream")
+						check_eq_str(r, first_address(r, res.wire), "198.51.100.1", "answering upstream")
 					}
 				}
 			}
@@ -172,7 +172,7 @@ blocking: {{ enabled: false }}
 				for i in 0 ..< 6 {
 					res := query_udp(udp_port, build_query(QNAME, u16(dns.Type.A), id = u16(i)))
 					if check(r, res.ok, "no response on attempt %d", i) {
-						seen[first_address(res.wire)] += 1
+						seen[first_address(r, res.wire)] += 1
 					}
 				}
 				check_eq_int(r, len(seen), 3, "distinct upstreams used over six queries")
@@ -219,7 +219,7 @@ blocking: {{ enabled: false }}
 					res := query_udp(udp_port, build_query(QNAME, u16(dns.Type.A)))
 					elapsed := time.diff(started, time.now())
 					if check(r, res.ok, "no response") {
-						check_eq_str(r, first_address(res.wire), "198.51.100.8", "winning upstream")
+						check_eq_str(r, first_address(r, res.wire), "198.51.100.8", "winning upstream")
 						check(
 							r,
 							elapsed < 500 * time.Millisecond,
@@ -236,7 +236,7 @@ blocking: {{ enabled: false }}
 					// corrupt the next query.
 					res := query_udp(udp_port, build_query(QNAME, u16(dns.Type.A), id = 99))
 					if check(r, res.ok, "no response") {
-						h, _ := parse_header(res.wire)
+						h := parse_header(r, res.wire)
 						check(r, h.id == 99, "wrong ID after a race: %04x", h.id)
 					}
 				}
@@ -276,7 +276,7 @@ blocking: {{ enabled: false }}
 				{
 					res := query_udp(udp_port, build_query(QNAME, u16(dns.Type.A)))
 					if check(r, res.ok, "no response") {
-						check_eq_str(r, first_address(res.wire), "198.51.100.7", "answering upstream")
+						check_eq_str(r, first_address(r, res.wire), "198.51.100.7", "answering upstream")
 					}
 				}
 				end_case(r)
@@ -293,7 +293,7 @@ blocking: {{ enabled: false }}
 					elapsed := time.diff(started, time.now())
 
 					if check(r, res.ok, "no response after the cooldown started") {
-						check_eq_str(r, first_address(res.wire), "198.51.100.7", "answering upstream")
+						check_eq_str(r, first_address(r, res.wire), "198.51.100.7", "answering upstream")
 						check(
 							r,
 							elapsed < 500 * time.Millisecond,
@@ -345,7 +345,7 @@ blocking: {{ enabled: false }}
 				{
 					res := query_udp(udp_port, build_query(fix.qname, fix.qtype))
 					if check(r, res.ok, "no response") {
-						h, _ := parse_header(res.wire)
+						h := parse_header(r, res.wire)
 						check_eq_int(r, h.ancount, fix.ancount, "answer count")
 					}
 					_, tcp_count, _ := mock_counts(mock)
@@ -402,7 +402,7 @@ blocking: {{ enabled: false }}
 				{
 					res := query_udp(udp_port, build_query(fix.qname, fix.qtype))
 					if check(r, res.ok, "no response") {
-						h, _ := parse_header(res.wire)
+						h := parse_header(r, res.wire)
 						check_eq_int(r, h.ancount, fix.ancount, "answer count")
 					}
 					_, _, tls_count := mock_counts(mock)
@@ -459,7 +459,7 @@ blocking: {{ enabled: false }}
 				{
 					res := query_tcp(tcp_port, build_query("google.com.", u16(dns.Type.TXT)))
 					if check(r, res.ok, "no response") {
-						h, _ := parse_header(res.wire)
+						h := parse_header(r, res.wire)
 						check(r, !h.tc, "the client was handed a truncated answer")
 						check(r, h.ancount > 1, "expected the full answer, got %d records", h.ancount)
 					}
@@ -506,7 +506,7 @@ blocking: {{ enabled: false }}
 				{
 					res := query_udp(udp_port, build_query("anything.test.", u16(dns.Type.A)))
 					if check(r, res.ok, "the server went quiet instead of answering") {
-						h, _ := parse_header(res.wire)
+						h := parse_header(r, res.wire)
 						check(r, h.rcode == int(dns.Rcode.Serv_Fail), "rcode %d, want SERVFAIL", h.rcode)
 						check_eq_int(r, h.qdcount, 1, "the question was not echoed")
 					}
@@ -609,7 +609,7 @@ blocking: {{ enabled: false }}
 		{
 			first := query_udp(udp_port, build_query(fix.qname, fix.qtype, id = 1))
 			if check(r, first.ok, "the first query failed") {
-				h, _ := parse_header(first.wire)
+				h := parse_header(r, first.wire)
 				check_eq_int(r, h.ancount, fix.ancount, "answer count on the first query")
 			}
 
@@ -618,7 +618,7 @@ blocking: {{ enabled: false }}
 
 			second := query_udp(udp_port, build_query(fix.qname, fix.qtype, id = 2))
 			if check(r, second.ok, "no response after the pooled connection went stale") {
-				h, _ := parse_header(second.wire)
+				h := parse_header(r, second.wire)
 				check(
 					r,
 					h.rcode == int(dns.Rcode.No_Error),

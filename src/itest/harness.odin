@@ -579,6 +579,29 @@ log_count :: proc(srv: ^Server, needle: string) -> int {
 
 // --- DNS message helpers ---------------------------------------------------
 
+/*
+Decode a reply, failing the case when the bytes cannot be read.
+
+Every helper below answers a question of the form "is this in the reply", and a
+decode error used to come back as "no" - the same answer a readable reply with
+nothing in it gives. A negative assertion then passed on bytes nothing read,
+which is the one failure the suite most exists to catch.
+*/
+@(private = "file")
+decode_reply :: proc(
+	r: ^Runner,
+	wire: []u8,
+	allocator := context.temp_allocator,
+) -> (msg: dns.Message, ok: bool) {
+	err: dns.Decode_Error
+	msg, err = dns.decode_message(wire, allocator)
+	if err != .None {
+		fail(r, "the reply (%d bytes) could not be decoded: %v", len(wire), err)
+		return {}, false
+	}
+	return msg, true
+}
+
 // Build a query by hand rather than through the dns package, so a codec bug
 // cannot hide by being applied to both sides.
 build_query :: proc(
@@ -663,20 +686,14 @@ build_query :: proc(
 }
 
 // The COOKIE option carried in a message, if it has one.
-find_cookie :: proc(wire: []u8) -> (cookie: []u8, found: bool) {
-	msg, err := dns.decode_message(wire, context.temp_allocator)
-	if err != .None {
-		return nil, false
-	}
+find_cookie :: proc(r: ^Runner, wire: []u8) -> (cookie: []u8, found: bool) {
+	msg := decode_reply(r, wire) or_return
 	return dns.find_edns_option(msg, .Cookie)
 }
 
 // The PADDING option carried in a message, if it has one.
-find_padding :: proc(wire: []u8) -> (padding: []u8, found: bool) {
-	msg, err := dns.decode_message(wire, context.temp_allocator)
-	if err != .None {
-		return nil, false
-	}
+find_padding :: proc(r: ^Runner, wire: []u8) -> (padding: []u8, found: bool) {
+	msg := decode_reply(r, wire) or_return
 	return dns.find_edns_option(msg, .Padding)
 }
 
@@ -693,11 +710,8 @@ are the bytes a case asserting absence has to be able to see.
 
 `pw_keepalive_units` is the other half, for the cases that want the number.
 */
-find_keepalive :: proc(wire: []u8) -> (timeout: []u8, found: bool) {
-	msg, err := dns.decode_message(wire, context.temp_allocator)
-	if err != .None {
-		return nil, false
-	}
+find_keepalive :: proc(r: ^Runner, wire: []u8) -> (timeout: []u8, found: bool) {
+	msg := decode_reply(r, wire) or_return
 	return dns.find_edns_option(msg, .TCP_Keepalive)
 }
 
@@ -724,10 +738,17 @@ Header :: struct {
 	arcount:  int,
 }
 
-// Read the header straight from the bytes, without the decoder under test.
-parse_header :: proc(wire: []u8) -> (h: Header, ok: bool) {
+/*
+Read the header straight from the bytes, without the decoder under test.
+
+A reply too short to hold one fails the case rather than handing back a zeroed
+header: that zero reads as NOERROR with every count at zero, which is what most
+cases assert, so bytes nothing could read used to satisfy them.
+*/
+parse_header :: proc(r: ^Runner, wire: []u8) -> (h: Header) {
 	if len(wire) < 12 {
-		return {}, false
+		fail(r, "the reply is %d bytes, too short to hold a header", len(wire))
+		return {}
 	}
 	h.id = u16(wire[0]) << 8 | u16(wire[1])
 	h.qr = wire[2] & 0x80 != 0
@@ -740,7 +761,7 @@ parse_header :: proc(wire: []u8) -> (h: Header, ok: bool) {
 	h.ancount = int(u16(wire[6]) << 8 | u16(wire[7]))
 	h.nscount = int(u16(wire[8]) << 8 | u16(wire[9]))
 	h.arcount = int(u16(wire[10]) << 8 | u16(wire[11]))
-	return h, true
+	return h
 }
 
 from_hex :: proc(s: string, allocator := context.temp_allocator) -> []u8 {
@@ -762,9 +783,9 @@ fixture :: proc(key: string) -> Fixture {
 
 // The A/AAAA addresses in a response, as dotted or colon text, for assertions
 // that care about which answer came back.
-answer_addresses :: proc(wire: []u8, allocator := context.temp_allocator) -> []string {
-	msg, err := dns.decode_message(wire, allocator)
-	if err != .None {
+answer_addresses :: proc(r: ^Runner, wire: []u8, allocator := context.temp_allocator) -> []string {
+	msg, ok := decode_reply(r, wire, allocator)
+	if !ok {
 		return nil
 	}
 	out := make([dynamic]string, 0, len(msg.answer), allocator)
@@ -788,9 +809,9 @@ answer_addresses :: proc(wire: []u8, allocator := context.temp_allocator) -> []s
 
 // Whether the answer section carries a record of this type, for assertions about
 // which upstream's answer came back rather than about what is in it.
-answer_has_type :: proc(wire: []u8, qtype: u16, allocator := context.temp_allocator) -> bool {
-	msg, err := dns.decode_message(wire, allocator)
-	if err != .None {
+answer_has_type :: proc(r: ^Runner, wire: []u8, qtype: u16, allocator := context.temp_allocator) -> bool {
+	msg, ok := decode_reply(r, wire, allocator)
+	if !ok {
 		return false
 	}
 	for rec in msg.answer {
@@ -802,9 +823,9 @@ answer_has_type :: proc(wire: []u8, qtype: u16, allocator := context.temp_alloca
 }
 
 // The smallest TTL in the answer section, for cache assertions.
-min_answer_ttl :: proc(wire: []u8) -> (ttl: u32, ok: bool) {
-	msg, err := dns.decode_message(wire, context.temp_allocator)
-	if err != .None || len(msg.answer) == 0 {
+min_answer_ttl :: proc(r: ^Runner, wire: []u8) -> (ttl: u32, ok: bool) {
+	msg := decode_reply(r, wire) or_return
+	if len(msg.answer) == 0 {
 		return 0, false
 	}
 	ttl = max(u32)
@@ -814,9 +835,9 @@ min_answer_ttl :: proc(wire: []u8) -> (ttl: u32, ok: bool) {
 	return ttl, true
 }
 
-first_cname_or_name :: proc(wire: []u8) -> string {
-	msg, err := dns.decode_message(wire, context.temp_allocator)
-	if err != .None {
+first_cname_or_name :: proc(r: ^Runner, wire: []u8) -> string {
+	msg, ok := decode_reply(r, wire)
+	if !ok {
 		return ""
 	}
 	for rec in msg.answer {

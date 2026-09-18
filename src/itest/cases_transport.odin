@@ -83,12 +83,12 @@ run_transport_cases :: proc(r: ^Runner) {
 	{
 		res := query_udp(udp_port, query)
 		if check(r, res.ok, "no response over UDP") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check(r, h.id == 0x1111, "transaction ID not echoed: got %04x", h.id)
 			check(r, h.qr, "QR bit not set")
 			check(r, h.ra, "RA bit not set")
 			check_eq_int(r, h.ancount, fix.ancount, "answer count")
-			addrs := answer_addresses(res.wire)
+			addrs := answer_addresses(r, res.wire)
 			check(r, len(addrs) == 2, "expected 2 addresses, got %d", len(addrs))
 		}
 	}
@@ -99,7 +99,7 @@ run_transport_cases :: proc(r: ^Runner) {
 	{
 		res := query_tcp(udp_port, query)
 		if check(r, res.ok, "no response over TCP") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check_eq_int(r, h.ancount, fix.ancount, "answer count")
 			check(r, h.id == 0x1111, "transaction ID not echoed")
 		}
@@ -116,7 +116,7 @@ run_transport_cases :: proc(r: ^Runner) {
 			if !check(r, res.ok, "query %d on the shared connection failed", i + 1) {
 				break
 			}
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check(r, int(h.id) == i + 1, "query %d came back with ID %d", i + 1, h.id)
 		}
 	}
@@ -127,7 +127,7 @@ run_transport_cases :: proc(r: ^Runner) {
 	{
 		res := query_dot(dot_port, query)
 		if check(r, res.ok, "no response over DoT") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check_eq_int(r, h.ancount, fix.ancount, "answer count")
 			check(r, h.id == 0x1111, "transaction ID not echoed")
 		}
@@ -143,7 +143,7 @@ run_transport_cases :: proc(r: ^Runner) {
 			check(r, header_contains(res.headers, "content-type: application/dns-message"), "content type header missing")
 			check(r, header_contains(res.headers, "cache-control: max-age="), "cache-control header missing")
 			if check(r, len(res.body) >= dns.HEADER_SIZE, "body too short: %d bytes", len(res.body)) {
-				h, _ := parse_header(res.body)
+				h := parse_header(r, res.body)
 				check_eq_int(r, h.ancount, fix.ancount, "answer count")
 				check(r, h.id == 0x1111, "transaction ID not echoed")
 			}
@@ -157,7 +157,7 @@ run_transport_cases :: proc(r: ^Runner) {
 		if check(r, res.ok, "no HTTP response") {
 			check_eq_int(r, res.status, 200, "status")
 			if check(r, len(res.body) >= dns.HEADER_SIZE, "body too short") {
-				h, _ := parse_header(res.body)
+				h := parse_header(r, res.body)
 				check_eq_int(r, h.ancount, fix.ancount, "answer count")
 			}
 		}
@@ -258,9 +258,9 @@ run_transport_cases :: proc(r: ^Runner) {
 					len(res.wire),
 					len(res.wire) % dns.PAD_RESPONSE_BLOCK,
 				)
-				_, found := find_padding(res.wire)
+				_, found := find_padding(r, res.wire)
 				check(r, found, "the answer carries no padding option")
-				h, _ := parse_header(res.wire)
+				h := parse_header(r, res.wire)
 				check_eq_int(r, h.ancount, fix.ancount, "answer count")
 			}
 		}
@@ -278,7 +278,7 @@ run_transport_cases :: proc(r: ^Runner) {
 					len(res.body),
 					len(res.body) % dns.PAD_RESPONSE_BLOCK,
 				)
-				_, found := find_padding(res.body)
+				_, found := find_padding(r, res.body)
 				check(r, found, "the answer carries no padding option")
 			}
 		}
@@ -288,9 +288,9 @@ run_transport_cases :: proc(r: ^Runner) {
 		{
 			res := query_udp(udp_port, padded)
 			if check(r, res.ok, "no response over UDP") {
-				_, found := find_padding(res.wire)
+				_, found := find_padding(r, res.wire)
 				check(r, !found, "a %d-byte UDP answer came back padded", len(res.wire))
-				h, _ := parse_header(res.wire)
+				h := parse_header(r, res.wire)
 				check_eq_int(r, h.ancount, fix.ancount, "answer count")
 			}
 		}
@@ -336,14 +336,14 @@ run_transport_cases :: proc(r: ^Runner) {
 		{
 			res := query_tcp(udp_port, asking)
 			if check(r, res.ok, "no response over TCP") {
-				timeout, found := find_keepalive(res.wire)
+				timeout, found := find_keepalive(r, res.wire)
 				if check(r, found, "the answer carries no keepalive option") {
 					units, sized := keepalive_units(timeout)
 					if check(r, sized, "the keepalive option is %d bytes, not two", len(timeout)) {
 						check_eq_int(r, int(units), want, "idle timeout in 100ms units")
 					}
 				}
-				h, _ := parse_header(res.wire)
+				h := parse_header(r, res.wire)
 				check_eq_int(r, h.ancount, fix.ancount, "answer count")
 			}
 		}
@@ -353,14 +353,14 @@ run_transport_cases :: proc(r: ^Runner) {
 		{
 			res := query_dot(dot_port, asking)
 			if check(r, res.ok, "no response over DoT") {
-				timeout, found := find_keepalive(res.wire)
+				timeout, found := find_keepalive(r, res.wire)
 				if check(r, found, "the answer carries no keepalive option") {
 					units, sized := keepalive_units(timeout)
 					if check(r, sized, "the keepalive option is %d bytes, not two", len(timeout)) {
 						check_eq_int(r, int(units), want, "idle timeout in 100ms units")
 					}
 				}
-				h, _ := parse_header(res.wire)
+				h := parse_header(r, res.wire)
 				check_eq_int(r, h.ancount, fix.ancount, "answer count")
 			}
 		}
@@ -370,7 +370,7 @@ run_transport_cases :: proc(r: ^Runner) {
 		{
 			res := query_tcp(udp_port, build_query(fix.qname, fix.qtype, id = 0x2b2c, edns_size = 1232))
 			if check(r, res.ok, "no response over TCP") {
-				timeout, found := find_keepalive(res.wire)
+				timeout, found := find_keepalive(r, res.wire)
 				check(r, !found, "an unasked-for keepalive option of %d bytes came back", len(timeout))
 			}
 		}
@@ -383,10 +383,10 @@ run_transport_cases :: proc(r: ^Runner) {
 				// Any keepalive option at all, whatever it says. The shape a
 				// missed gate would produce here is the client's own option
 				// echoed back, which carries no timeout to print.
-				timeout, found := find_keepalive(res.wire)
+				timeout, found := find_keepalive(r, res.wire)
 				check(r, !found, "a datagram answer carries a %d-byte keepalive option", len(timeout))
 				// Ignored means the question is still answered.
-				h, _ := parse_header(res.wire)
+				h := parse_header(r, res.wire)
 				check_eq_int(r, h.rcode, 0, "rcode")
 				check_eq_int(r, h.ancount, fix.ancount, "answer count")
 			}
@@ -398,9 +398,9 @@ run_transport_cases :: proc(r: ^Runner) {
 			res := doh_post(doh_port, "/dns-query", asking)
 			if check(r, res.ok, "no HTTP response") {
 				check_eq_int(r, res.status, 200, "status")
-				timeout, found := find_keepalive(res.body)
+				timeout, found := find_keepalive(r, res.body)
 				check(r, !found, "a DoH answer carries a %d-byte keepalive option", len(timeout))
-				h, _ := parse_header(res.body)
+				h := parse_header(r, res.body)
 				check_eq_int(r, h.ancount, fix.ancount, "answer count")
 			}
 		}
@@ -701,7 +701,7 @@ run_transport_cases :: proc(r: ^Runner) {
 			q := build_query("example.com.", qtype)
 			res := query_udp(udp_port, q)
 			if check(r, res.ok, "no response for type %d", qtype) {
-				h, _ := parse_header(res.wire)
+				h := parse_header(r, res.wire)
 				check(r, h.rcode == int(dns.Rcode.Refused), "type %d: rcode %d, want REFUSED", qtype, h.rcode)
 			}
 		}
@@ -713,7 +713,7 @@ run_transport_cases :: proc(r: ^Runner) {
 		q := build_query("example.com.", u16(dns.Type.A), class = 4) // HS
 		res := query_udp(udp_port, q)
 		if check(r, res.ok, "no response") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check(r, h.rcode == int(dns.Rcode.Refused), "rcode %d, want REFUSED", h.rcode)
 		}
 	}

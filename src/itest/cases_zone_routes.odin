@@ -295,10 +295,10 @@ run_zone_route_cases :: proc(r: ^Runner) {
 		mock_reset_counts(public)
 		res := query_udp(udp_port, build_query("nas.corp.example.", u16(dns.Type.A)))
 		if check(r, res.ok, "no response") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode for a routed name")
 
-			addrs := answer_addresses(res.wire)
+			addrs := answer_addresses(r, res.wire)
 			if check(r, len(addrs) == 1, "expected one address, got %d", len(addrs)) {
 				check_eq_str(r, addrs[0], "10.0.0.7", "address for a routed name")
 			}
@@ -318,7 +318,7 @@ run_zone_route_cases :: proc(r: ^Runner) {
 		mock_reset_counts(public)
 		res := query_udp(udp_port, build_query("corp.example.", u16(dns.Type.A)))
 		if check(r, res.ok, "no response") {
-			addrs := answer_addresses(res.wire)
+			addrs := answer_addresses(r, res.wire)
 			if check(r, len(addrs) == 1, "expected one address, got %d", len(addrs)) {
 				check_eq_str(r, addrs[0], "10.0.0.7", "address for the routed apex")
 			}
@@ -355,7 +355,7 @@ run_zone_route_cases :: proc(r: ^Runner) {
 		mock_reset_counts(internal)
 		res := query_udp(udp_port, build_query("corp.example.", u16(dns.Type.DS)))
 		if check(r, res.ok, "no response") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode for the routed apex DS")
 		}
 		check(r, mock_total(public) > 0, "the apex DS never reached the upstream that can answer it")
@@ -421,7 +421,7 @@ rebind: {{enabled: false}}
 			mock_reset_counts(internal)
 			res := query_udp(denied_port, build_query("denied.example.", u16(dns.Type.DS)))
 			if check(r, res.ok, "no response") {
-				h, _ := parse_header(res.wire)
+				h := parse_header(r, res.wire)
 				// The route's answer, not the parent's NXDOMAIN.
 				check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode after the parent denied the zone")
 			}
@@ -480,11 +480,11 @@ rebind: {{enabled: false}}
 			mock_reset_counts(internal)
 			res := query_udp(signed_port, build_query("signed.example.", u16(dns.Type.DS)))
 			if check(r, res.ok, "no response") {
-				h, _ := parse_header(res.wire)
+				h := parse_header(r, res.wire)
 				check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode for a signed routed apex")
 				check(
 					r,
-					!answer_has_type(res.wire, u16(dns.Type.DS)),
+					!answer_has_type(r, res.wire, u16(dns.Type.DS)),
 					"the parent's DS reached the client for a zone the route answers",
 				)
 			}
@@ -511,7 +511,7 @@ rebind: {{enabled: false}}
 		mock_reset_counts(internal)
 		res := query_udp(udp_port, build_query("www.example.com.", u16(dns.Type.A)))
 		if check(r, res.ok, "no response") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check_eq_int(r, h.rcode, int(dns.Rcode.Serv_Fail), "rcode for an unrouted name")
 		}
 		u, t, s := mock_counts(internal)
@@ -527,7 +527,7 @@ rebind: {{enabled: false}}
 		mock_reset_counts(internal)
 		res := query_udp(udp_port, build_query("notcorp.example.", u16(dns.Type.A)))
 		if check(r, res.ok, "no response") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check_eq_int(r, h.rcode, int(dns.Rcode.Serv_Fail), "rcode for a suffix that is not a subtree")
 		}
 		u, t, s := mock_counts(internal)
@@ -580,7 +580,7 @@ rebind: {{enabled: false}}
 			defer stop_server(&anchored)
 			res := query_udp(anchored_port, build_query("nas.corp.example.", u16(dns.Type.A)))
 			if check(r, res.ok, "no response for the anchored routed name") {
-				h, _ := parse_header(res.wire)
+				h := parse_header(r, res.wire)
 				check_eq_int(r, h.rcode, int(dns.Rcode.Serv_Fail), "rcode for an anchored routed name")
 			}
 		} else {
@@ -635,7 +635,7 @@ rebind: {{enabled: false}}
 			// which here is the one the broader route does not use.
 			deep := query_udp(nested_port, build_query("build.dev.corp.example.", u16(dns.Type.A)))
 			if check(r, deep.ok, "no response for the nested zone") {
-				addrs := answer_addresses(deep.wire)
+				addrs := answer_addresses(r, deep.wire)
 				if check(r, len(addrs) == 1, "expected one address, got %d", len(addrs)) {
 					check_eq_str(r, addrs[0], "198.51.100.9", "address for the nested zone")
 				}
@@ -645,7 +645,7 @@ rebind: {{enabled: false}}
 			// server, so the longer entry took only what it claimed.
 			shallow := query_udp(nested_port, build_query("nas.corp.example.", u16(dns.Type.A)))
 			if check(r, shallow.ok, "no response for the outer zone") {
-				addrs := answer_addresses(shallow.wire)
+				addrs := answer_addresses(r, shallow.wire)
 				if check(r, len(addrs) == 1, "expected one address, got %d", len(addrs)) {
 					check_eq_str(r, addrs[0], "10.0.0.7", "address for the outer zone")
 				}

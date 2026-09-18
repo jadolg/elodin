@@ -120,14 +120,14 @@ run_special_use_answered_cases :: proc(r: ^Runner) {
 	{
 		v4 := query_udp(udp_port, build_query("localhost.", u16(dns.Type.A)))
 		if check(r, v4.ok, "no response for localhost. A") {
-			addrs := answer_addresses(v4.wire)
+			addrs := answer_addresses(r, v4.wire)
 			if check(r, len(addrs) == 1, "localhost. A returned %d addresses", len(addrs)) {
 				check_eq_str(r, addrs[0], "127.0.0.1", "localhost. A")
 			}
 		}
 		v6 := query_udp(udp_port, build_query("localhost.", u16(dns.Type.AAAA)))
 		if check(r, v6.ok, "no response for localhost. AAAA") {
-			addrs := answer_addresses(v6.wire)
+			addrs := answer_addresses(r, v6.wire)
 			if check(r, len(addrs) == 1, "localhost. AAAA returned %d addresses", len(addrs)) {
 				// Full form: `answer_addresses` prints every group rather than
 				// compressing the run of zeros.
@@ -137,7 +137,7 @@ run_special_use_answered_cases :: proc(r: ^Runner) {
 		// The reservation is of the subtree, not of the one label.
 		sub := query_udp(udp_port, build_query("dev.localhost.", u16(dns.Type.A)))
 		if check(r, sub.ok, "no response for dev.localhost.") {
-			addrs := answer_addresses(sub.wire)
+			addrs := answer_addresses(r, sub.wire)
 			if check(r, len(addrs) == 1, "dev.localhost. returned %d addresses", len(addrs)) {
 				check_eq_str(r, addrs[0], "127.0.0.1", "dev.localhost. A")
 			}
@@ -149,7 +149,7 @@ run_special_use_answered_cases :: proc(r: ^Runner) {
 	{
 		res := query_udp(udp_port, build_query("localhost.", u16(dns.Type.MX)))
 		if check(r, res.ok, "no response for localhost. MX") {
-			h, _ := parse_header(res.wire)
+			h := parse_header(r, res.wire)
 			check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)
 			check_eq_int(r, h.ancount, 0, "answer count")
 			// The name exists, so the SOA is its own rather than a parent's.
@@ -171,9 +171,9 @@ run_special_use_answered_cases :: proc(r: ^Runner) {
 		for c in cases {
 			res := query_udp(udp_port, build_query(c.name, u16(dns.Type.A)))
 			if check(r, res.ok, "no response for %s", c.name) {
-				h, _ := parse_header(res.wire)
+				h := parse_header(r, res.wire)
 				check(r, h.rcode == int(dns.Rcode.NX_Domain), "%s: rcode %d, want NXDOMAIN", c.name, h.rcode)
-				check_eq_int(r, len(answer_addresses(res.wire)), 0, "addresses handed to the client")
+				check_eq_int(r, len(answer_addresses(r, res.wire)), 0, "addresses handed to the client")
 				// Owned by the apex, so a downstream caches the negative for the
 				// tree rather than for one hidden service.
 				check_eq_str(r, authority_soa_owner(res.wire), c.apex, "SOA owner")
@@ -225,9 +225,9 @@ run_special_use_default_forwarding_cases :: proc(r: ^Runner) {
 		for name in ([]string{"printer.local.", "internal.test.", "www.example.com.", "printer.home.arpa."}) {
 			res := query_udp(udp_port, build_query(name, u16(dns.Type.A)))
 			if check(r, res.ok, "no response for %s", name) {
-				h, _ := parse_header(res.wire)
+				h := parse_header(r, res.wire)
 				check(r, h.rcode == int(dns.Rcode.No_Error), "%s: rcode %d, want NOERROR", name, h.rcode)
-				addrs := answer_addresses(res.wire)
+				addrs := answer_addresses(r, res.wire)
 				if check(r, len(addrs) == 1, "%s returned %d addresses", name, len(addrs)) {
 					check_eq_str(r, addrs[0], "198.51.100.7", "forwarded address")
 				}
@@ -270,14 +270,14 @@ run_special_use_key_cases :: proc(r: ^Runner) {
 				{
 					res := query_udp(udp_port, build_query("printer.local.", u16(dns.Type.A)))
 					if check(r, res.ok, "no response for printer.local.") {
-						h, _ := parse_header(res.wire)
+						h := parse_header(r, res.wire)
 						check(r, h.rcode == int(dns.Rcode.NX_Domain), "rcode %d, want NXDOMAIN", h.rcode)
 						check_eq_str(r, authority_soa_owner(res.wire), "local.", "SOA owner")
 					}
 					// The other key is untouched, so this one is not the whole table.
 					other := query_udp(udp_port, build_query("internal.test.", u16(dns.Type.A)))
 					if check(r, other.ok, "no response for internal.test.") {
-						addrs := answer_addresses(other.wire)
+						addrs := answer_addresses(r, other.wire)
 						if check(r, len(addrs) == 1, "internal.test. returned %d addresses", len(addrs)) {
 							check_eq_str(r, addrs[0], "198.51.100.7", "forwarded address")
 						}
@@ -314,9 +314,9 @@ run_special_use_key_cases :: proc(r: ^Runner) {
 					// Inside the zone: a name error, cached against the apex.
 					res := query_udp(udp_port, build_query("printer.home.arpa.", u16(dns.Type.A)))
 					if check(r, res.ok, "no response for printer.home.arpa.") {
-						h, _ := parse_header(res.wire)
+						h := parse_header(r, res.wire)
 						check(r, h.rcode == int(dns.Rcode.NX_Domain), "rcode %d, want NXDOMAIN", h.rcode)
-						check_eq_int(r, len(answer_addresses(res.wire)), 0, "addresses handed to the client")
+						check_eq_int(r, len(answer_addresses(r, res.wire)), 0, "addresses handed to the client")
 						check_eq_str(r, authority_soa_owner(res.wire), "home.arpa.", "SOA owner")
 					}
 					// The apex itself: NODATA, not a name error. `arpa` publishes
@@ -325,15 +325,15 @@ run_special_use_key_cases :: proc(r: ^Runner) {
 					// section 3.
 					apex := query_udp(udp_port, build_query("home.arpa.", u16(dns.Type.A)))
 					if check(r, apex.ok, "no response for home.arpa.") {
-						h, _ := parse_header(apex.wire)
+						h := parse_header(r, apex.wire)
 						check(r, h.rcode == int(dns.Rcode.No_Error), "apex rcode %d, want NOERROR", h.rcode)
-						check_eq_int(r, len(answer_addresses(apex.wire)), 0, "addresses at the apex")
+						check_eq_int(r, len(answer_addresses(r, apex.wire)), 0, "addresses at the apex")
 						check_eq_str(r, authority_soa_owner(apex.wire), "home.arpa.", "apex SOA owner")
 					}
 					// The other key is untouched, so this one is not the whole table.
 					other := query_udp(udp_port, build_query("internal.test.", u16(dns.Type.A)))
 					if check(r, other.ok, "no response for internal.test.") {
-						addrs := answer_addresses(other.wire)
+						addrs := answer_addresses(r, other.wire)
 						if check(r, len(addrs) == 1, "internal.test. returned %d addresses", len(addrs)) {
 							check_eq_str(r, addrs[0], "198.51.100.7", "forwarded address")
 						}
@@ -401,9 +401,9 @@ run_special_use_key_cases :: proc(r: ^Runner) {
 				{
 					res := query_udp(udp_port, build_query("duskgytldkxiuqc6otgh4.onion.", u16(dns.Type.A)))
 					if check(r, res.ok, "no response for the .onion name") {
-						h, _ := parse_header(res.wire)
+						h := parse_header(r, res.wire)
 						check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)
-						addrs := answer_addresses(res.wire)
+						addrs := answer_addresses(r, res.wire)
 						if check(r, len(addrs) == 1, "the .onion name returned %d addresses", len(addrs)) {
 							check_eq_str(r, addrs[0], "198.51.100.7", "the Tor-aware upstream's answer")
 						}
@@ -412,7 +412,7 @@ run_special_use_key_cases :: proc(r: ^Runner) {
 					// exists so an operator need not reach for `enabled: false`.
 					local := query_udp(udp_port, build_query("localhost.", u16(dns.Type.A)))
 					if check(r, local.ok, "no response for localhost.") {
-						addrs := answer_addresses(local.wire)
+						addrs := answer_addresses(r, local.wire)
 						if check(r, len(addrs) == 1, "localhost. returned %d addresses", len(addrs)) {
 							check_eq_str(r, addrs[0], "127.0.0.1", "localhost. A")
 						}
