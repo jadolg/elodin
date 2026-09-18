@@ -1042,7 +1042,7 @@ handshake run on a blocking socket had no bound across the whole of it: a peer
 sending a byte inside every wait held the connection, its thread and one of the
 server's connection slots indefinitely, and did it before the handshake completed
 - so before anything the server counts per connection or per query could see it.
-`accept_loop` takes one deadline instead; see it, and `read_deadline` on the
+`accept_loop` takes one deadline instead; see it, and `Read_Budget` on the
 server side, where the data phase has the same shape.
 
 The drip is shorter than the timeout, which is what makes it a drip. Forty bytes
@@ -1081,7 +1081,14 @@ test_a_drip_fed_handshake_is_given_up_on_at_the_deadline :: proc(t: ^testing.T) 
 	if !testing.expectf(t, aerr == nil, "nothing connected: %v", aerr) {
 		return
 	}
-	defer net.close(accepted)
+	// Closed here only while the handshake has not taken the socket over. A
+	// handshake that succeeded owns it, `close` below closes it, and closing the
+	// same descriptor twice in a test binary whose cases run in parallel is how
+	// another case loses a socket it still holds.
+	handshaken := false
+	defer if !handshaken {
+		net.close(accepted)
+	}
 	// What `stream_job` puts on an accepted socket, shortened so the case is
 	// quick: the figure the handshake is bounded by.
 	BUDGET :: 400 * time.Millisecond
@@ -1107,6 +1114,7 @@ test_a_drip_fed_handshake_is_given_up_on_at_the_deadline :: proc(t: ^testing.T) 
 	conn, herr := server_handshake(session)
 	elapsed := time.tick_since(start)
 	if conn != nil {
+		handshaken = true
 		close(conn)
 		testing.expect(t, false, "a handshake completed out of a trickle that never sent a ClientHello")
 		return

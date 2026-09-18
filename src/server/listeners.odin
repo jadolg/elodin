@@ -1735,16 +1735,16 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 	answered := false
 	for {
 		/*
-		One deadline for the length prefix and the body behind it, taken where the
-		message begins and not restarted by the bytes that arrive inside it - see
-		`read_deadline`. A connection waiting for its next question still waits the
-		whole of `client_timeout` for the first byte of it, which is what the idle
-		timeout this server advertises (RFC 7828) says it will do.
+		One budget for the length prefix and the body behind it, taken fresh per
+		message and not restarted by the bytes that arrive inside one - see
+		`Read_Budget`.
 		*/
-		deadline := read_deadline(s.cfg.server.client_timeout)
+		budget := Read_Budget {
+			idle = s.cfg.server.client_timeout,
+		}
 
 		length_buf: [2]u8
-		if !conn_read_full(conn, length_buf[:], deadline) {
+		if !conn_read_full(conn, length_buf[:], &budget) {
 			return
 		}
 		length := int(length_buf[0]) << 8 | int(length_buf[1])
@@ -1753,7 +1753,7 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 		}
 
 		query := make([]u8, length, context.temp_allocator)
-		if !conn_read_full(conn, query, deadline) {
+		if !conn_read_full(conn, query, &budget) {
 			return
 		}
 
@@ -1956,8 +1956,7 @@ conn_read :: proc(c: Conn, buf: []u8) -> (n: int, ok: bool) {
 }
 
 /*
-When the reads that make up one message have to be done by, or the zero tick for
-a read that is not bounded as a whole.
+The bound on assembling one message, and the idle wait in front of it.
 
 `client_timeout` reaches the socket as SO_RCVTIMEO, which bounds one read and is
 restarted by every byte that arrives: a client sending one byte inside every wait
@@ -1965,51 +1964,86 @@ is inside all of them, and holds one of `max_connections` for as long as it care
 to while no query completes, no budget is charged and nothing else reclaims it.
 RFC 7766 6.2.3 names exactly that and says the idle timeout should be reset "on
 the receipt of a full DNS message, rather than on receipt of any part of a DNS
-message". So the caller takes a deadline once, where a message begins, and every
-read that goes into it waits only for what is left of it.
+message". So the reads that assemble one message share a deadline and shorten as
+it runs down.
 
-A non-positive budget is no receive timeout on the socket at all - see
+`deadline` is zero until the first byte of that message arrives, and that is the
+other half of the rule: a connection between questions is not assembling anything,
+so it waits `idle` for the first byte - which is the figure the idle timeout this
+server advertises states (RFC 7828) - and the message gets the whole of `idle`
+from that byte on. Spending the two out of one budget instead would close on a
+keep-alive client that asked late in the window and had its message split across
+segments, which is a client this server has no complaint about.
+
+A non-positive `idle` is no receive timeout on the socket at all - see
 `test_a_timeout_that_cannot_be_stated_is_left_off` for the other half of what that
-setting means - and the zero tick this returns for it leaves those reads unbounded
-too, rather than turning "wait forever" into "give up at once".
+setting means - and leaves both unbounded, rather than turning "wait forever" into
+"give up at once".
 */
 @(private)
-read_deadline :: proc(budget: time.Duration) -> time.Tick {
-	return time.tick_add(time.tick_now(), budget) if budget > 0 else time.Tick{}
+Read_Budget :: struct {
+	idle:     time.Duration,
+	deadline: time.Tick,
 }
 
 /*
-Give this read what is left of the deadline, or say the deadline is spent.
+Give this read the idle wait or what is left of the message's deadline, and say
+when the deadline is spent.
 
 `conn_set_read_timeout` rather than a bare `net.set_option`, because over DoT and
-DoH the socket option stopped applying at the handshake - see there. The reads
-that share a deadline shorten as it runs down, so the last of them waits for what
-remains rather than for the whole of `client_timeout` again.
+DoH the socket option stopped applying at the handshake - see there. The wait is
+set on every read rather than only when it changes: the message that ran the
+deadline down leaves a short one behind it, and the idle wait for the next message
+is where that is put back.
+
+Floored at a microsecond because `net.set_option` carries the wait to the kernel
+as a `timeval`, and anything under a microsecond truncates to a zero one - which
+SO_RCVTIMEO reads as no timeout at all rather than as one that has expired. A read
+armed that way waits forever, which is the hold this deadline exists to end,
+reachable by landing a read inside the last microsecond of it.
+
+`now` is passed in rather than read here, so that a case can put a read inside
+that window without racing the clock to do it.
 */
 @(private)
-conn_arm_read :: proc(c: Conn, deadline: time.Tick) -> bool {
-	if deadline == (time.Tick{}) {
+conn_arm_read :: proc(c: Conn, b: ^Read_Budget, now: time.Tick) -> bool {
+	if b.idle <= 0 {
 		return true
 	}
-	left := time.tick_diff(time.tick_now(), deadline)
+	if b.deadline == (time.Tick{}) {
+		conn_set_read_timeout(c, b.idle)
+		return true
+	}
+	left := time.tick_diff(now, b.deadline)
 	if left <= 0 {
 		return false
 	}
-	conn_set_read_timeout(c, left)
+	conn_set_read_timeout(c, max(left, time.Microsecond))
 	return true
 }
 
-// Read exactly `len(buf)` bytes, within what is left of `deadline`. The deadline
-// is a parameter rather than a default so that a path added later has to say what
-// bounds it as a whole; `read_deadline` makes the one that means "nothing does".
+// One read against a budget: the only place the message's deadline is started, so
+// that every reader shares one answer to what counts as the message beginning.
 @(private)
-conn_read_full :: proc(c: Conn, buf: []u8, deadline: time.Tick) -> bool {
+conn_read_budgeted :: proc(c: Conn, buf: []u8, b: ^Read_Budget) -> (n: int, ok: bool) {
+	if !conn_arm_read(c, b, time.tick_now()) {
+		return 0, false
+	}
+	n, ok = conn_read(c, buf)
+	if ok && b.idle > 0 && b.deadline == (time.Tick{}) {
+		b.deadline = time.tick_add(time.tick_now(), b.idle)
+	}
+	return n, ok
+}
+
+// Read exactly `len(buf)` bytes, within what the budget has left. The budget is a
+// parameter rather than a default so that a path added later has to say what
+// bounds it as a whole; a zero `idle` is the one that means nothing does.
+@(private)
+conn_read_full :: proc(c: Conn, buf: []u8, b: ^Read_Budget) -> bool {
 	got := 0
 	for got < len(buf) {
-		if !conn_arm_read(c, deadline) {
-			return false
-		}
-		n, ok := conn_read(c, buf[got:])
+		n, ok := conn_read_budgeted(c, buf[got:], b)
 		if !ok {
 			return false
 		}

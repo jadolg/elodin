@@ -262,6 +262,21 @@ timeout gives every loop a regular chance to notice the stop flag.
 */
 POLL_INTERVAL :: 200 * time.Millisecond
 
+/*
+What a TLS handshake on one of these mocks may take in total.
+
+`tlsx.server_handshake` bounds the whole handshake by the socket's receive
+timeout rather than each read of it, so `POLL_INTERVAL` there would be a
+handshake budget of 200ms from before the ClientHello arrives - and a loopback
+handshake that crosses it on a loaded box, under AddressSanitizer or beside the
+rest of the suite, fails as a timeout and reads as the upstream being broken.
+This is the same figure as a whole connection's wait, which is generous for a
+handshake and still not a wait anything hangs on. Put back to `POLL_INTERVAL`
+once the handshake is done, so shutdown still gets its regular chance to notice
+the stop flag.
+*/
+HANDSHAKE_TIMEOUT :: 5 * time.Second
+
 // `cert_file`/`key_file` turn on a TLS listener on the same port for DoT.
 mock_start :: proc(m: ^Mock, cert_file := "", key_file := "") -> bool {
 	if cert_file != "" {
@@ -648,7 +663,7 @@ mock_tls_loop :: proc(m: ^Mock) {
 		if err != nil {
 			continue
 		}
-		_ = net.set_option(client, .Receive_Timeout, POLL_INTERVAL)
+		_ = net.set_option(client, .Receive_Timeout, HANDSHAKE_TIMEOUT)
 		conn := new(Mock_Conn)
 		conn.mock = m
 		conn.socket = client
@@ -672,6 +687,9 @@ mock_tcp_conn :: proc(conn: ^Mock_Conn) {
 			net.close(conn.socket)
 			return
 		}
+		// The handshake's budget was the long one; the reads after it are back on
+		// the poll interval that lets this thread notice the stop flag.
+		tlsx.set_read_timeout(c, POLL_INTERVAL)
 		tls_conn = c
 	}
 	// Cleanup is deferred at function scope on purpose. An Odin `defer` fires

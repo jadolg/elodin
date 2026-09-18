@@ -180,7 +180,14 @@ certificate did not check out".
 @(private)
 handshake_error :: proc(ssl: ^SSL, ret: c.int) -> Error {
 	saved := posix.errno()
-	code := SSL_get_error(ssl, ret)
+	return classify_handshake(SSL_get_error(ssl, ret), ret, saved)
+}
+
+// The half of `handshake_error` that reads neither, for a caller that has already
+// taken both in that order - see `accept_loop`, which needs the code to tell a
+// retry from a failure before it knows there is a failure to classify.
+@(private)
+classify_handshake :: proc(code: c.int, ret: c.int, saved: posix.Errno) -> Error {
 	last_handshake_errno = .NONE
 
 	switch code {
@@ -709,12 +716,14 @@ accept_loop :: proc(conn: ^Conn) -> Error {
 		if ret == 1 {
 			return .None
 		}
-		// Read before anything else touches the session, as `handshake_error`
-		// says; a would-block is the retry to wait out rather than a failure now
-		// that the socket is non-blocking, and everything else is classified
-		// there. Nothing between here and that call makes a system call, so the
-		// errno it reads is still this one's.
-		switch SSL_get_error(conn.ssl, ret) {
+		// Both taken here, in this order, for the reason `handshake_error` gives:
+		// errno before anything else makes a system call, and the code before
+		// anything else touches the session. A would-block is the retry to wait out
+		// rather than a failure now that the socket is non-blocking; everything
+		// else goes to the same classifier the blocking path uses.
+		saved := posix.errno()
+		code := SSL_get_error(conn.ssl, ret)
+		switch code {
 		case SSL_ERROR_WANT_READ:
 			if !wait_ready(conn, {.IN}, timeout, deadline) {
 				return .Timeout
@@ -724,7 +733,7 @@ accept_loop :: proc(conn: ^Conn) -> Error {
 				return .Timeout
 			}
 		case:
-			return handshake_error(conn.ssl, ret)
+			return classify_handshake(code, ret, saved)
 		}
 	}
 }

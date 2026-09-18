@@ -1611,7 +1611,7 @@ arrives, so a request line, its headers and its body - as many reads as the clie
 cares to split them into - had no bound between them: a client sending a byte
 inside every wait holds the connection, and one of `max_connections`, for as long
 as it likes while no request ever completes and nothing charges it for one. See
-`Http_Reader.deadline`, and `read_deadline` where the DNS stream has the same
+`Http_Reader.budget`, and `Read_Budget` where the DNS stream has the same
 shape and RFC 7766 6.2.3 says what a server should do about it.
 
 The receive timeout here is five seconds, far longer than the deadline, so the
@@ -1651,9 +1651,9 @@ test_doh_reader_gives_up_on_a_drip_fed_request :: proc(t: ^testing.T) {
 	_ = net.set_option(accepted, .Receive_Timeout, 5 * time.Second)
 
 	r := Http_Reader {
-		conn     = Conn{socket = accepted},
-		buf      = make([dynamic]u8, 0, HTTP_BUF_SIZE),
-		deadline = read_deadline(400 * time.Millisecond),
+		conn   = Conn{socket = accepted},
+		buf    = make([dynamic]u8, 0, HTTP_BUF_SIZE),
+		budget = Read_Budget{idle = 400 * time.Millisecond},
 	}
 	defer delete(r.buf)
 
@@ -1665,7 +1665,7 @@ test_doh_reader_gives_up_on_a_drip_fed_request :: proc(t: ^testing.T) {
 	testing.expectf(
 		t,
 		elapsed < 2 * time.Second,
-		"the reader was held for %v by a byte every %v, against a 400ms deadline",
+		"the reader was held for %v by a byte every %v, against a 400ms budget",
 		elapsed,
 		DOH_DRIP_INTERVAL,
 	)

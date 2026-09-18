@@ -4,6 +4,7 @@ import "core:net"
 import "core:strconv"
 import "core:sync"
 import "core:testing"
+import "core:thread"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
@@ -539,7 +540,10 @@ test_a_refused_pipeline_keeps_the_answers_already_written :: proc(t: ^testing.T)
 	// a budget with nothing left in it: what `serve_dns_stream` does from there,
 	// in the order it does it.
 	first: [STRIDE]u8
-	if !conn_read_full(conn, first[:], read_deadline(3 * time.Second)) {
+	first_budget := Read_Budget {
+		idle = 3 * time.Second,
+	}
+	if !conn_read_full(conn, first[:], &first_budget) {
 		testing.expect(t, false, "the first query never arrived")
 		return
 	}
@@ -738,7 +742,7 @@ A message trickled a byte at a time is given up on at `client_timeout`, not held
 for as long as the client keeps trickling.
 
 `client_timeout` reaches the socket as SO_RCVTIMEO, which bounds one read: every
-byte that arrives restarts it, so before `read_deadline` the only thing that ever
+byte that arrives restarts it, so before `Read_Budget` the only thing that ever
 reclaimed an accepted connection could not fire at all against a client sending a
 byte inside every wait. Nothing else caught it either - the connection and
 connection-rate limits bound how many are opened and how fast, and the query
@@ -850,4 +854,142 @@ test_a_drip_fed_message_is_reclaimed_at_the_deadline :: proc(t: ^testing.T) {
 		DRIP,
 		time.Duration(len(message)) * DRIP,
 	)
+}
+
+@(private = "file")
+Late_Sender :: struct {
+	endpoint: net.Endpoint,
+	message:  []u8,
+	split:    int,
+	wait:     time.Duration,
+}
+
+// Connect, wait, send the front of the message, wait again, send the rest. Both
+// waits are shorter than the budget and longer than what is left of it once the
+// first one has been spent out of the same figure.
+@(private = "file")
+send_late_and_split :: proc(s: ^Late_Sender) {
+	socket, err := net.dial_tcp_from_endpoint(s.endpoint)
+	if err != nil {
+		return
+	}
+	defer net.close(socket)
+	time.sleep(s.wait)
+	if _, serr := net.send_tcp(socket, s.message[:s.split]); serr != nil {
+		return
+	}
+	time.sleep(s.wait)
+	_, _ = net.send_tcp(socket, s.message[s.split:])
+	// Held open until the reader has had its turn; closing here would race the
+	// second half off the wire.
+	time.sleep(500 * time.Millisecond)
+}
+
+/*
+Waiting for a message to start does not spend the budget for reading one.
+
+The deadline covers the message, and it begins at the message's first byte rather
+than where the connection started waiting for one - see `Read_Budget`. Sharing one
+figure between the two instead would close on a keep-alive client that asked late
+in its idle window and had its message split across segments, which is a client
+this server has no complaint about: the rule is one budget per message, not one
+per connection, and RFC 7828 tells a client the connection is held for the whole
+of `client_timeout` whenever it next has something to ask.
+
+Both waits here are 300ms against a 400ms budget. Measured from the connection
+the two of them are 600ms and the message could never arrive; measured from its
+first byte the second half has 300ms of a 400ms budget to make and does.
+*/
+@(test)
+test_the_wait_for_a_message_is_not_spent_on_reading_it :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen on loopback: %v", lerr) {
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the bound port: %v", berr) {
+		return
+	}
+
+	message: [2 + dns.HEADER_SIZE]u8
+	message[1] = u8(dns.HEADER_SIZE)
+	sender := Late_Sender {
+		endpoint = bound,
+		message  = message[:],
+		// The length prefix in one segment and the body in the next, which is the
+		// split the budget has to survive because it is the one a client is free
+		// to make.
+		split    = 2,
+		wait     = 300 * time.Millisecond,
+	}
+	client := thread.create_and_start_with_poly_data(&sender, send_late_and_split)
+	defer {
+		thread.join(client)
+		thread.destroy(client)
+	}
+
+	accepted, _, aerr := net.accept_tcp(listener)
+	if !testing.expectf(t, aerr == nil, "nothing connected: %v", aerr) {
+		return
+	}
+	defer net.close(accepted)
+	// Long, so that what ends a read here is the budget and never the socket.
+	_ = net.set_option(accepted, .Receive_Timeout, 5 * time.Second)
+	conn := Conn {
+		socket = accepted,
+	}
+
+	budget := Read_Budget {
+		idle = 400 * time.Millisecond,
+	}
+	length_buf: [2]u8
+	if !testing.expect(t, conn_read_full(conn, length_buf[:], &budget), "the length prefix never arrived") {
+		return
+	}
+	body: [dns.HEADER_SIZE]u8
+	testing.expect(
+		t,
+		conn_read_full(conn, body[:], &budget),
+		"a message split after its length prefix was given up on, though neither half was late",
+	)
+}
+
+/*
+A deadline with less than a microsecond left still arms a read that expires.
+
+`net.set_option` carries the wait to the kernel as a `timeval`, so anything under
+a microsecond truncates to a zero one - and SO_RCVTIMEO of zero is no timeout at
+all rather than one that has already expired. A read armed with the raw remainder
+in that window waits forever, which is the hold the budget exists to end, reached
+by landing a read inside the last microsecond of it.
+
+Asserted on a TLS connection because that is where the figure that was set can be
+read back; `conn_arm_read` is the one that computes it either way.
+*/
+@(test)
+test_a_nearly_spent_deadline_does_not_arm_an_endless_read :: proc(t: ^testing.T) {
+	tls := tlsx.Conn{}
+	tlsx.set_timeouts(&tls, 10 * time.Second, 10 * time.Second)
+
+	// Exactly 500ns left, read from the same instant the deadline was built on, so
+	// the window under test is the one this case gets rather than whatever the
+	// clock happens to leave.
+	now := time.tick_now()
+	budget := Read_Budget {
+		idle     = 10 * time.Second,
+		deadline = time.tick_add(now, 500),
+	}
+
+	if testing.expect(t, conn_arm_read(Conn{tls = &tls}, &budget, now), "500ns left read as none") {
+		testing.expectf(
+			t,
+			time.Duration(tls.read_timeout_ns) >= time.Microsecond,
+			"a read was armed with %v, which reaches the kernel as no timeout at all",
+			time.Duration(tls.read_timeout_ns),
+		)
+	}
+	// And the write deadline is still the connection's: what is nearly spent is
+	// the budget for reading a message.
+	testing.expect_value(t, time.Duration(tls.write_timeout_ns), 10 * time.Second)
 }

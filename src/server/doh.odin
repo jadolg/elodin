@@ -98,31 +98,27 @@ Http_Request_In :: struct {
 
 @(private)
 Http_Reader :: struct {
-	conn:     Conn,
-	buf:      [dynamic]u8,
-	pos:      int,
+	conn:   Conn,
+	buf:    [dynamic]u8,
+	pos:    int,
 	/*
-	When the request being read has to be here by, taken once per request by the
-	caller's loop - see `read_deadline`, and `serve_dns_stream` where the same
-	deadline bounds one DNS message.
+	What the request being read may take, taken fresh per request by the caller's
+	loop - see `Read_Budget`, and `serve_dns_stream` where the same budget bounds
+	one DNS message.
 
 	A request line, its headers and its body are as many reads as the client cares
 	to split them into, and the per-read wait is restarted by each one: without a
 	bound across the whole of them a client trickling a byte at a time holds this
 	connection, and one of `max_connections`, for as long as it likes while no
-	request ever completes. The zero tick means nothing bounds it, which is what a
-	non-positive timeout has always meant here.
+	request ever completes.
 	*/
-	deadline: time.Tick,
+	budget: Read_Budget,
 }
 
 @(private)
 http_fill :: proc(r: ^Http_Reader) -> bool {
-	if !conn_arm_read(r.conn, r.deadline) {
-		return false
-	}
 	chunk: [4096]u8
-	n, ok := conn_read(r.conn, chunk[:])
+	n, ok := conn_read_budgeted(r.conn, chunk[:], &r.budget)
 	if !ok {
 		return false
 	}
@@ -498,9 +494,12 @@ serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 	defer delete(r.buf)
 
 	for {
-		// Per request, so a connection kept alive between requests still waits the
-		// whole of `client_timeout` for the next one to start.
-		r.deadline = read_deadline(s.cfg.server.client_timeout)
+		// Per request, so a connection kept alive between requests waits the whole
+		// of `client_timeout` for the next one to start and the request that then
+		// starts gets the whole of it too.
+		r.budget = Read_Budget {
+			idle = s.cfg.server.client_timeout,
+		}
 
 		req, status, ok := read_http_request(&r)
 		if !ok {
