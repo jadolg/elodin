@@ -892,7 +892,7 @@ blocking: {{ enabled: false }}
 					!has_opt_record(r, bare.wire),
 					"a cached OPT record was handed to a client that asked without EDNS",
 				)
-				check_eq_int(r, answer_count(r, bare.wire), 1, "the answer the client came for")
+				check_eq_int(r, parse_header(r, bare.wire).ancount, 1, "the answer the client came for")
 			}
 		}
 	}
@@ -930,7 +930,7 @@ blocking: {{ enabled: false }}
 						"the payload size the EDNS client is told",
 					)
 				}
-				check_eq_int(r, answer_count(r, edns.wire), 1, "the answer the client came for")
+				check_eq_int(r, parse_header(r, edns.wire).ancount, 1, "the answer the client came for")
 			}
 		}
 	}
@@ -952,11 +952,6 @@ MIXED_BARE_FIRST :: "mixed-bare-first.example.com."
 has_opt_record :: proc(r: ^Runner, wire: []u8) -> bool {
 	msg := decode_reply(r, wire) or_return
 	return dns.edns_present(msg)
-}
-
-@(private = "file")
-answer_count :: proc(r: ^Runner, wire: []u8) -> int {
-	return parse_header(r, wire).ancount
 }
 
 // A name error whose answer section holds the record it denies. Nothing sends

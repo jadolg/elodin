@@ -84,8 +84,8 @@ cookies: {{ enabled: false, upstream: false }}
 			check(r, h.id == CLIENT_ID, "the client got id %04x back, not its own %04x", h.id, CLIENT_ID)
 
 			// Length, not just presence: `parse_header` hands back a zeroed
-			// header for anything shorter, and counting its id 0 as a distinct
-			// draw would report a collision that never happened.
+			// header for anything shorter, and every short query drawing the
+			// same id 0 would report a collision that never happened.
 			forwarded := mock_last_query(mock)
 			if !check(r, len(forwarded) >= dns.HEADER_SIZE, "the upstream saw no readable query") {
 				break

@@ -580,12 +580,16 @@ log_count :: proc(srv: ^Server, needle: string) -> int {
 // --- DNS message helpers ---------------------------------------------------
 
 /*
-Decode a reply, failing the case when the bytes cannot be read.
+Decode a message, failing the case when the bytes cannot be read.
 
-Every helper that reads a reply answers a question of the form "is this in it",
-and a decode error used to come back as "no" - the same answer a readable reply
-with nothing in it gives. A negative assertion then passed on bytes nothing read,
-which is the one failure the suite most exists to catch.
+Every helper that reads one answers a question of the form "is this in it", and
+a decode error used to come back as "no" - the same answer a readable message
+with nothing in it gives. A negative assertion then passed on bytes nothing
+read, which is the one failure the suite most exists to catch.
+
+A message rather than a reply: the cookie cases read what the mock upstream was
+asked, so the bytes are as often a forwarded query, and naming the wrong one
+would send a reader after the wrong half of the exchange.
 
 Package-visible rather than file-private: the per-file helpers in the case files
 read their own corner of a reply and want the same rule applied to the decode.
@@ -598,7 +602,7 @@ decode_reply :: proc(
 	err: dns.Decode_Error
 	msg, err = dns.decode_message(wire, allocator)
 	if err != .None {
-		fail(r, "the reply (%d bytes) could not be decoded: %v", len(wire), err)
+		fail(r, "the message (%d bytes) could not be decoded: %v", len(wire), err)
 		return {}, false
 	}
 	return msg, true
@@ -815,10 +819,7 @@ answer_addresses :: proc(r: ^Runner, wire: []u8, allocator := context.temp_alloc
 // Whether the answer section carries a record of this type, for assertions about
 // which upstream's answer came back rather than about what is in it.
 answer_has_type :: proc(r: ^Runner, wire: []u8, qtype: u16, allocator := context.temp_allocator) -> bool {
-	msg, ok := decode_reply(r, wire, allocator)
-	if !ok {
-		return false
-	}
+	msg := decode_reply(r, wire, allocator) or_return
 	for rec in msg.answer {
 		if u16(rec.type) == qtype {
 			return true
