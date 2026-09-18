@@ -196,15 +196,6 @@ nsec3_cut_short :: proc(budget: ^Nsec3_Budget, before: Nsec3_Refusals) -> bool {
 }
 
 /*
-Was anything refused since `before`, and which refusal was it?
-
-For naming a failure, never for deciding one: a proof that failed is a proof
-that failed, and this says whether to report it as the records' doing or as
-ours. The allowance is named first because a question that ran out of it will
-meet the ceiling too, and the number an operator has to look at is the one that
-stopped the proof.
-*/
-/*
 The two reasons, named once.
 
 `server` reads the second of them to pick the extended error the client is
@@ -215,6 +206,15 @@ quietly change what a client is told.
 NSEC3_BUDGET_SPENT :: "nsec3 hashing budget spent"
 NSEC3_OVER_CEILING :: "nsec3 iterations above the ceiling"
 
+/*
+Was anything refused since `before`, and which refusal was it?
+
+For naming a failure, never for deciding one: a proof that failed is a proof
+that failed, and this says whether to report it as the records' doing or as
+ours. The allowance is named first because a question that ran out of it will
+meet the ceiling too, and the number an operator has to look at is the one that
+stopped the proof.
+*/
 @(private)
 nsec3_declined :: proc(budget: ^Nsec3_Budget, before: Nsec3_Refusals) -> (declined: bool, reason: string) {
 	if budget.spent > before.spent {

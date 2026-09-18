@@ -197,6 +197,27 @@ way to the proof that reads it: an allowance built without it refuses every
 record asking for any iterations at all, which fails closed and fails loudly
 rather than quietly validating at a number nobody chose.
 */
+/*
+Why a walk that came back `Indeterminate` stopped, in the words of the thing
+that stopped it.
+
+`zone_trust` reports the one verdict for every allowance it can run out of, and
+for most of them "chain of trust unavailable" is the whole truth: a lookup it
+could not make, a signature budget it could not spend. NSEC3 hashing is the one
+that can be said more precisely, and it is worth saying, because this reason is
+what picks the extended error the client is handed - and the walk is where a
+zone whose iteration count is past the ceiling is met first. Every name inside
+such a zone reaches its DS denial before the answer's own proof is read, so
+without this the precise code would be the one nobody ever sees.
+*/
+@(private)
+walk_reason :: proc(budget: ^Budget, before: Nsec3_Refusals) -> string {
+	if declined, why := nsec3_declined(&budget.nsec3, before); declined {
+		return why
+	}
+	return "chain of trust unavailable"
+}
+
 @(private)
 query_budget :: proc(v: ^Validator) -> Budget {
 	return {nsec3 = {max_iterations = v.max_nsec3_iterations}}
@@ -1652,6 +1673,7 @@ validate_denial :: proc(
 	forged NXDOMAIN that DNSSEC exists to refuse. Walking down to the name costs
 	a lookup and settles it.
 	*/
+	walked := nsec3_refusals(&budget.nsec3)
 	status, keys, established := zone_trust(v, budget, qname, now, allocator)
 	#partial switch status {
 	case .Insecure:
@@ -1659,7 +1681,7 @@ validate_denial :: proc(
 	case .Bogus:
 		return {status = .Bogus, reason = "broken chain of trust"}
 	case .Indeterminate:
-		return {status = .Indeterminate, reason = "chain of trust unavailable"}
+		return {status = .Indeterminate, reason = walk_reason(budget, walked)}
 	}
 
 	/*
@@ -2006,12 +2028,13 @@ validate_rrset :: proc(
 	}
 
 	missing := "signature missing" if len(sigs) == 0 else "no valid signature"
+	before_owner := nsec3_refusals(&budget.nsec3)
 	owner_status, _, _ := zone_trust(v, budget, owner, now, allocator)
 	switch owner_status {
 	case .Insecure:
 		return .Insecure, "", "unsigned zone", "", {}
 	case .Indeterminate:
-		return .Indeterminate, "", "chain of trust unavailable", "", {}
+		return .Indeterminate, "", walk_reason(budget, before_owner), "", {}
 	case .Bogus:
 		return .Bogus, "", "broken chain of trust", "", {}
 	case .Secure:
@@ -2259,12 +2282,13 @@ validate_wildcard_proof :: proc(
 	reason: string,
 ) {
 	// Established from the expanded name, for the same reason as the denial path.
+	walked := nsec3_refusals(&budget.nsec3)
 	trust, keys, established := zone_trust(v, budget, owner, now, allocator)
 	if trust != .Secure {
 		// A chain this server could not walk is not a proof that failed, and the
 		// two must not reach the log or the client saying the same thing.
 		if trust == .Indeterminate {
-			return trust, nil, "chain of trust unavailable"
+			return trust, nil, walk_reason(budget, walked)
 		}
 		return trust, nil, "wildcard expansion not proven"
 	}

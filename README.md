@@ -924,9 +924,13 @@ or captive-portal resolver — against which every signed zone would otherwise s
 resolving rather than merely going unverified.
 
 `max_nsec3_iterations` is the most hashing a single NSEC3 record may ask for.
-A record above it is not computed, so a proof resting on one cannot be read and
-the name comes back SERVFAIL — not because the records are wrong, which is what
-this server means by bogus, but because it declined the work. RFC 9276 asks
+A record above it is not computed, so what a proof rests on is whatever records
+are left. Usually there are none that answer and the name comes back SERVFAIL —
+not because the records are wrong, which is what this server means by bogus, but
+because it declined the work, and the extended error on the answer says so. Where
+the records that remain amount to an opt-out span, the answer is served without
+the AD bit instead, which is what RFC 9276 asks for a zone whose iteration count
+nobody should be publishing. RFC 9276 asks
 zones for zero and the zones still publishing NSEC3 use single digits, so this
 is a guard against a zone that has picked a number nobody should, rather than a
 setting to tune.

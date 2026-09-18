@@ -328,8 +328,9 @@ proof. The same distinction every other allowance in
 
 The proof is real captured traffic - com's NSEC3 denial for a name that is not
 there - so the only difference between the two calls is the meter. What runs out
-here is the walk down to the name, whose DS denial is itself NSEC3, and it
-answers in `zone_trust`'s words. The other place the meter can empty is the
+here is the walk down to the name, whose DS denial is itself NSEC3, and it names
+the allowance rather than the chain: the reason is what picks the extended error
+the client is handed, so a walk stopped by hashing has to say so. The other place the meter can empty is the
 answer's own proof, which com cannot reach: its chain is opt-out, so the walk
 settles the name as an unsigned delegation before any proof is read.
 `ds_apex_denial_test` has the signed NSEC3 denial that does reach it.
@@ -361,7 +362,7 @@ test_a_denial_that_runs_out_of_hashing_is_indeterminate :: proc(t: ^testing.T) {
 	}
 	result := validate_denial(v, &spent, msg, qname, .A, .IN, u32(FIXTURE_TIME), fixture_now(), context.temp_allocator)
 	testing.expect_value(t, result.status, Status.Indeterminate)
-	testing.expect_value(t, result.reason, "chain of trust unavailable")
+	testing.expect_value(t, result.reason, NSEC3_BUDGET_SPENT)
 	free_all(context.temp_allocator)
 }
 

@@ -254,10 +254,12 @@ test_the_configured_iteration_ceiling_reaches_the_proof :: proc(t: ^testing.T) {
 	result := validate_denial(strict, &budget, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 	testing.expect_value(t, result.status, Status.Indeterminate)
 	// The walk down to the name reads these same records, so it is the first
-	// thing the ceiling refuses and the reason names the chain. What pins the
-	// journey is the meter: the configured number reached a record and turned
-	// it away, and no hashing was done in the process.
-	testing.expect_value(t, result.reason, "chain of trust unavailable")
+	// thing the ceiling refuses - and it says which refusal that was rather
+	// than reporting a chain it could not reach, which is what carries RFC
+	// 8914's code for this to the client instead of "no reachable authority".
+	// The meter is the rest of the journey: the configured number reached a
+	// record and turned it away, and no hashing was done in the process.
+	testing.expect_value(t, result.reason, NSEC3_OVER_CEILING)
 	testing.expect(t, budget.nsec3.over_ceiling > 0, "the configured ceiling should have refused these records")
 	testing.expect_value(t, budget.nsec3.spent, 0)
 	testing.expect_value(t, budget.nsec3.rounds, 0)
