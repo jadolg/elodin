@@ -418,13 +418,24 @@ Only a reset is retried.
 An upstream's rcode is the client's answer, with two exceptions.
 
 SERVFAIL and REFUSED are not answers about the name: RFC 2308 section 7.1 reads
-the first as the server reporting on itself, and the second is it declining to be
-asked — an ACL that no longer lists this resolver, its own recursion down,
+the first as the server reporting on itself, and the second is it declining to
+be asked — an ACL that no longer lists this resolver, its own recursion down,
 throttling. A member of a failover group in that state answers promptly and
 forever, which never trips the cooldown above, so the rest of the group is asked
 instead and the first member keeps its place in the order. Where nobody does
 better — a single upstream, the ordinary arrangement — the rcode that arrived is
 still what the client is handed.
+
+One SERVFAIL is exempt: the one carrying an RFC 8914 extended error that says
+the name failed DNSSEC validation (codes 6 to 12). That is a verdict about the
+name, and asking a member of the group that does not validate would fetch the
+very answer the first member rejected — which matters with `dnssec.enabled:
+false`, where nothing here is checking either.
+
+What the sweep costs is up to one extra exchange per remaining member of the
+group, and a member that is unreachable but not yet in its cooldown costs
+`upstream.timeout` of that before the next is tried. Two upstreams — what the
+examples configure — pay one extra exchange for a name the first cannot answer.
 
 The other exception is an extended rcode. It is twelve bits (RFC 6891 section
 6.1.3), four in the header and eight in the OPT record, and a stub client reads

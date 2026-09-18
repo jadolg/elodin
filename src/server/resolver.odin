@@ -1776,10 +1776,10 @@ resolve_query :: proc(
 	route's group could do better - the rcode is the client's answer, which is
 	the ordinary reading of a client's question and the right one when the route
 	was asked second, but an internal authority that is up and failing must not
-	stand as the answer while the parent holds the proof. An NXDOMAIN, a `DS` RRset, a NOERROR somebody
-	rewrote: each is a statement about this delegation that the parent, not the
-	route, is the authority for, and the memory must not be what decides that the
-	route's version of it is the one the client gets.
+	stand as the answer while the parent holds the proof. An NXDOMAIN, a `DS`
+	RRset, a NOERROR somebody rewrote: each is a statement about this delegation
+	that the parent, not the route, is the authority for, and the memory must not
+	be what decides that the route's version of it is the one the client gets.
 
 	Where the parent still settles nothing, the route's reply stands exactly as
 	it would have after the wait - this changes which group is asked first, and

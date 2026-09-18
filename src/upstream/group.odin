@@ -157,9 +157,9 @@ on these two.
 The ordinary path is untouched: a usable reply returns from the first exchange
 and none of the sweep runs. Where no member of the group can manage one the
 first reply still comes back, rcode and all - which is what a group of one, the
-ordinary deployment, gets for every SERVFAIL its upstream states. `resolve_query`
-reads it and decides, because turning one reply into another is no more this
-procedure's business here than it is below.
+ordinary deployment, gets for every SERVFAIL its upstream states.
+`resolve_query` reads it and decides, because turning one reply into another is
+no more this procedure's business here than it is below.
 */
 resolve_readable :: proc(
 	g: ^Group,
@@ -212,10 +212,21 @@ resolve_insisting :: proc(
 	Health is left alone where the rcode is concerned, on purpose. SERVFAIL is a
 	legitimate answer to plenty of questions, and a server that gives one has not
 	failed in the sense `record_failure` tracks - it answered, promptly, and it
-	keeps its place at the head of the failover order. What the sweep costs a
-	group whose first member states one for everything is a second exchange per
-	query; what parking it would cost is a member the group no longer has when
-	the next one times out.
+	keeps its place at the head of the failover order. What parking it would cost
+	is a member the group no longer has when the next one times out.
+
+	The sweep's own cost is worth stating plainly, because SERVFAIL is a far more
+	common reply than the unreadable rcode this was first written for. A group of
+	two pays one extra exchange for a name its first member cannot answer. A
+	group of three or more pays up to one per remaining member, and a member that
+	is unreachable but has not yet accrued its three failures - a fresh start, or
+	the ten seconds after a cooldown expired - costs `g.timeout` of that on the
+	client's own latency path before the next is tried. The same arithmetic
+	applies to upstream traffic: a client asking names that SERVFAIL turns each
+	of its queries into up to one exchange per member of the group. Both are the
+	price of the group having somewhere else to go, and both were already the
+	arrangement for the rcodes above; what issue #309 changed is how often it is
+	reached.
 
 	An unreadable rcode is left alone for a sharper reason: those eight bits are
 	two bytes an on-path attacker can write into any reply it can reach. Counting
@@ -325,29 +336,75 @@ sweep_query :: proc(query: []u8) -> []u8 {
 }
 
 /*
+The RFC 8914 extended errors that make a SERVFAIL a statement about the name
+rather than about the server: every one of them says the data for this name
+could not be made to verify.
+
+Which is the exception to the paragraph below, and the sharper half of what
+`usable_rcode` decides. A validating upstream that has found a zone bogus
+answers SERVFAIL and says so in an extended error - Unbound, BIND, and the
+public resolvers all attach one. Sweeping past it would ask the next member of
+the group, and if that one does not validate, the answer it gives is the
+forgery, cached here and served to every client behind this server. That is the
+`dnssec.enabled: false` deployment, where nothing else is checking; with
+validation on, `validate` refuses the same answer a second time.
+
+So: a SERVFAIL that names a validation failure is a verdict, and is the client's
+answer. A SERVFAIL that names anything else, or names nothing at all, is the
+responder reporting on itself and the group is swept.
+
+Codes 6 to 12 of RFC 8914 section 4 - bogus, the two signature-validity ones,
+DNSKEY and RRSIG missing, the zone key bit, NSEC missing. Not 0 (`Other`), which
+carries no such claim, and not the policy codes: a REFUSED or a SERVFAIL over an
+ACL is exactly what the sweep is for.
+*/
+@(private)
+BOGUS_EDE_FIRST :: 6
+@(private)
+BOGUS_EDE_LAST :: 12
+
+/*
 Whether a reply is one the client's own question can be answered with.
 
 Two ways it is not, and `resolve_readable` argues both.
 
 An rcode of 16 or above, because the rcode a client reads off the header is then
-not the rcode the responder meant - the upper eight bits live in the OPT record's
-TTL, which a stub does not look at. A reply too short to hold a header, or one
-carrying no OPT record, reads as its header's own four bits, which is what
-`peek_rcode` returns for both.
+not the rcode the responder meant - the upper eight bits live in the OPT
+record's TTL, which a stub does not look at. A reply too short to hold a header,
+or one carrying no OPT record, reads as its header's own four bits, which is
+what `peek_rcode` returns for both.
 
 SERVFAIL or REFUSED, because neither says anything about the name asked for
 (RFC 2308 section 7.1): the first is the responder reporting on itself and the
 second is it declining to be asked, and the next member of the group may well
-know the answer. Every other rcode a stub can read is a statement about the name
-and stands as the client's answer.
+know the answer. Unless the SERVFAIL says otherwise in an extended error, which
+`BOGUS_EDE_FIRST` is about. Every other rcode a stub can read is a statement
+about the name and stands as the client's answer.
 */
 @(private)
 usable_rcode :: proc(response: []u8) -> bool {
-	#partial switch dns.peek_rcode(response) {
-	case .Serv_Fail, .Refused:
+	rcode := dns.peek_rcode(response)
+	#partial switch rcode {
+	case .Serv_Fail:
+		return validation_failure(response)
+	case .Refused:
 		return false
 	}
-	return u16(dns.peek_rcode(response)) <= 0xf
+	return u16(rcode) <= 0xf
+}
+
+// Whether the reply carries an extended error saying this name could not be
+// validated. A reply with no OPT record, no extended error, or an option too
+// short to hold the two-byte info-code makes no such claim; see the constants
+// above.
+@(private)
+validation_failure :: proc(response: []u8) -> bool {
+	data, found := dns.peek_edns_option(response, .Ext_Error)
+	if !found || len(data) < 2 {
+		return false
+	}
+	info := u16(data[0]) << 8 | u16(data[1])
+	return BOGUS_EDE_FIRST <= info && info <= BOGUS_EDE_LAST
 }
 
 @(private)

@@ -521,6 +521,129 @@ test_a_reply_the_clients_question_cannot_use_is_asked_elsewhere :: proc(t: ^test
 }
 
 /*
+Except where the SERVFAIL says the name could not be validated: that one stands.
+
+The exception `BOGUS_EDE_FIRST` is written on, and the case it protects is a
+group whose members do not all validate - a validating resolver beside an ISP
+box that does not - with elodin's own `dnssec.enabled: false`, where nothing
+here is checking either. The first member finds a zone bogus and SERVFAILs it;
+sweeping on would fetch the forgery from the member that never looked, and this
+server would cache it and hand it to every client behind it. RFC 8914 is how the
+first member says which of the two SERVFAILs it meant, and every validating
+resolver attaches one.
+
+Three replies, one per reading: extended error 6 (DNSSEC Bogus) stands as the
+answer, extended error 22 (No Reachable Authority) is the server reporting on
+itself and is swept past, and a SERVFAIL carrying no extended error at all makes
+no claim and is swept past too - which is the case the test above covers, and is
+here for the contrast.
+*/
+@(test)
+test_a_servfail_that_names_a_validation_failure_is_the_answer :: proc(t: ^testing.T) {
+	Case :: struct {
+		what:   string,
+		// -1 for a reply with no extended error in it at all.
+		ede:    int,
+		stands: bool,
+	}
+	cases := []Case {
+		{"DNSSEC Bogus", 6, true},
+		{"NSEC Missing", 12, true},
+		{"No Reachable Authority", 22, false},
+		{"no extended error", -1, false},
+	}
+
+	for c in cases {
+		broken := Canned_Mock{}
+		answerer := Canned_Mock{}
+
+		bad, bad_thread, bad_ok := start_canned_mock(t, &broken, "broken", ede_servfail(c.ede))
+		if !bad_ok {
+			return
+		}
+		defer {
+			sync.atomic_store(&broken.stop, true)
+			thread.join(bad_thread)
+			thread.destroy(bad_thread)
+			net.close(broken.socket)
+			destroy(bad)
+		}
+
+		good, good_thread, good_ok := start_canned_mock(t, &answerer, "answerer", canned_reply(0))
+		if !good_ok {
+			return
+		}
+		defer {
+			sync.atomic_store(&answerer.stop, true)
+			thread.join(good_thread)
+			thread.destroy(good_thread)
+			net.close(answerer.socket)
+			destroy(good)
+		}
+
+		servers := make([]^Upstream, 2, context.allocator)
+		defer delete(servers, context.allocator)
+		servers[0] = bad
+		servers[1] = good
+
+		g := Group {
+			servers   = servers,
+			strategy  = .Failover,
+			timeout   = time.Second,
+			attempts  = 1,
+			allocator = context.allocator,
+		}
+
+		wire := canned_query()
+		testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
+
+		resp, winner, err := resolve_readable(&g, wire, context.allocator)
+		testing.expect_value(t, err, Error.None)
+		if c.stands {
+			testing.expectf(
+				t,
+				winner == bad && dns.peek_rcode(resp) == .Serv_Fail,
+				"%s was swept past, so an unvalidated answer reached the client",
+				c.what,
+			)
+		} else {
+			testing.expectf(
+				t,
+				winner == good && dns.peek_rcode(resp) == .No_Error,
+				"%s ended the search with a member that could answer standing by",
+				c.what,
+			)
+		}
+		delete(resp, context.allocator)
+	}
+}
+
+/*
+A SERVFAIL for `QNAME` carrying RFC 8914 extended error `info`, or none at all
+where `info` is negative.
+
+The option goes in after the message is encoded, the way one reaches a reply on
+the wire: `set_edns_option` needs the OPT record `canned_reply` already writes.
+*/
+@(private = "file")
+ede_servfail :: proc(info: int) -> []u8 {
+	wire := canned_reply(0, .Serv_Fail)
+	if info < 0 || len(wire) == 0 {
+		return wire
+	}
+	// Info-code, and no text behind it: RFC 8914 section 2 makes the text
+	// optional, and what this server reads is the code.
+	data := make([]u8, 2, context.temp_allocator)
+	data[0] = u8(u16(info) >> 8)
+	data[1] = u8(info)
+	out, ok := dns.set_edns_option(wire, .Ext_Error, data, context.temp_allocator)
+	if !ok {
+		return nil
+	}
+	return out
+}
+
+/*
 And a group of one hands its SERVFAIL back untouched, at the cost of one query.
 
 Which is the ordinary deployment, and the arrangement the parity suite runs: one
