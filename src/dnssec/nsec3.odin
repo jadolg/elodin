@@ -60,11 +60,13 @@ shape by capping hash calculations per pass (`MAX_NSEC3_CALCULATIONS`, the
 CVE-2023-50868 fix) and this is that cap, counted across the question rather
 than per pass.
 
-A whole allowance measures at 2 ms of SHA-1 on this box, optimised, against the
-55 ms above, and it is 2 ms whichever way it is spent: the weighting is what
-makes the long salt no better a buy than the short one. That puts NSEC3 hashing
-in the same order as the signature verifications `MAX_VERIFICATIONS_PER_QUERY`
-already allows.
+A whole allowance measures at 2.1 ms of SHA-1 at worst on this box, optimised,
+against the 55 ms above. At worst because the charge is by block rather than by
+round: a 255-byte salt costs five blocks a round where a short one costs a
+single block, so the longest salt now buys the least - half a millisecond for a
+whole allowance - where counting rounds flat would have sold it five times the
+most. Either way it puts NSEC3 hashing in the same order as the signature
+verifications `MAX_VERIFICATIONS_PER_QUERY` already allows.
 
 Real traffic is nowhere near it. A zone following RFC 9276 uses zero
 iterations, so a denial costs one round per name tried and a whole question
@@ -82,18 +84,26 @@ MAX_NSEC3_ROUNDS_PER_QUERY :: 8192
 The largest iteration ceiling worth configuring.
 
 The ceiling refuses a record and `MAX_NSEC3_ROUNDS_PER_QUERY` refuses a
-question, and past this the second makes the first meaningless rather than
-stricter: a record at the ceiling carrying the longest salt costs four rounds
-per iteration, so above 511 the four hashes a single proof needs no longer fit
-in a whole allowance and every NSEC3 denial in every zone comes back
-`Indeterminate`. `config` refuses a number above this at load, because the
-symptom otherwise is a resolver that starts, says nothing about it, and answers
-SERVFAIL for every name in an NSEC3 zone.
+question, and high enough the second makes the first meaningless rather than
+laxer: every record costs more than a whole question may spend, so every NSEC3
+denial in every zone is `Indeterminate` and every name in one is SERVFAIL. A
+setting that reads as "accept more" and acts as "accept nothing" is worth
+refusing at load, which `config` does, rather than leaving to be discovered as a
+resolver that came up fine and answers nothing.
+
+What it promises is a floor, not a guarantee, and the difference is worth being
+plain about. At this ceiling a record with a salt of ordinary length costs 256
+blocks a hash, so a whole allowance still affords thirty-two of them - several
+times over what a denial spends. With the longest salt the same allowance
+affords six, which is one proof and little more, and a deep name in such a zone
+runs out. No single number could say otherwise while the depth is the
+question's to choose: the allowance is the bound, and this only keeps the
+ceiling in the range where the bound can be met.
 
 It leaves nothing anyone wants out of reach. RFC 9276 asks zones for zero, the
 default here is 100, and the zones still publishing NSEC3 use single digits.
 */
-MAX_NSEC3_ITERATIONS_LIMIT :: MAX_NSEC3_ROUNDS_PER_QUERY / 16 - 1
+MAX_NSEC3_ITERATIONS_LIMIT :: MAX_NSEC3_ROUNDS_PER_QUERY / 32 - 1
 
 /*
 What one question is allowed to spend on NSEC3 hashing, and the ceiling it
@@ -110,23 +120,34 @@ Nsec3_Budget :: struct {
 	exhausted:      bool,
 }
 
+// SHA-1 compresses 64-byte blocks and appends a one-byte pad and an eight-byte
+// length, so an input of `n` bytes is this many of them.
+@(private)
+sha1_blocks :: proc(n: int) -> int {
+	return (n + 9 + 63) / 64
+}
+
 /*
 Charge one hash to the question's allowance.
 
-The unit is a SHA-1 round, weighted by the salt: a round hashes the 20-byte
-digest with the salt appended, so a 255-byte salt is four compression blocks
-where a short one is a single block, and counting rounds alone would let the
-longest salt buy four times the work at the same price. The first round hashes
-the wire name rather than a digest, which is the same handful of blocks and is
-charged as one round like the rest.
+The unit is one SHA-1 compression block, which is what a round of the shortest
+kind costs: everything here is a number of those. Counting rounds flat instead
+would sell the two things that make a round expensive at the price of a cheap
+one - a 255-byte salt is four more blocks on every round of the iteration loop,
+and the first round hashes the wire name rather than a 20-byte digest, which is
+up to nine blocks of its own. Both are the sender's to choose, so both are
+charged for.
 
 Refusing sets `exhausted` rather than only returning false, because the callers
 that matter are several proofs up and the difference they have to report is
 between a proof that failed and a proof this server stopped reading.
 */
 @(private)
-spend_nsec3_rounds :: proc(budget: ^Nsec3_Budget, rr: Nsec3) -> bool {
-	cost := (1 + int(rr.iterations)) * (1 + len(rr.salt) / 64)
+spend_nsec3_rounds :: proc(budget: ^Nsec3_Budget, rr: Nsec3, name: string) -> bool {
+	// The wire name is the presentation name's length plus the root label, or
+	// shorter where an escape stood for one byte - so this is an upper bound
+	// and never an undercharge.
+	cost := sha1_blocks(len(name) + 1 + len(rr.salt)) + int(rr.iterations) * sha1_blocks(20 + len(rr.salt))
 	if budget.rounds + cost > MAX_NSEC3_ROUNDS_PER_QUERY {
 		budget.exhausted = true
 		return false
@@ -153,7 +174,7 @@ nsec3_hash_with :: proc(rr: Nsec3, name: string, out: []u8, budget: ^Nsec3_Budge
 	if int(rr.iterations) > ceiling {
 		return false
 	}
-	if !spend_nsec3_rounds(budget, rr) {
+	if !spend_nsec3_rounds(budget, rr, name) {
 		return false
 	}
 	return nsec3_hash(name, rr.salt, rr.iterations, out)
@@ -427,14 +448,30 @@ nsec3_proves_no_ds :: proc(n3s: []Nsec3_Rr, name, zone: string, budget: ^Nsec3_B
 	return .Proven
 }
 
-// Whether the records show that nothing is delegated at `name`, so the parent
-// zone's keys still cover everything below it.
-nsec3_proves_no_delegation :: proc(n3s: []Nsec3_Rr, name, zone: string, budget: ^Nsec3_Budget) -> bool {
+/*
+Whether the records show that nothing is delegated at `name`, so the parent
+zone's keys still cover everything below it.
+
+`matched` says whether that was settled by a record on the name itself, which
+the caller needs and the scan already knows. Returning it is not a convenience:
+asking again is a second scan over the same records for an answer this one had,
+and a second scan can disagree with the first - once the hashing allowance
+empties between them, the repeat finds nothing and the name reads as one the
+zone does not hold.
+*/
+nsec3_proves_no_delegation :: proc(
+	n3s: []Nsec3_Rr,
+	name, zone: string,
+	budget: ^Nsec3_Budget,
+) -> (
+	proven: bool,
+	matched: bool,
+) {
 	if match, found := nsec3_matching(n3s, name, budget); found {
-		return !bitmap_has(match.rr.types, .NS) || bitmap_has(match.rr.types, .SOA)
+		return !bitmap_has(match.rr.types, .NS) || bitmap_has(match.rr.types, .SOA), true
 	}
 	// Opt-out spans prove nothing about what they cover, so they cannot rule a
 	// delegation out.
 	cover, covered := nsec3_covering(n3s, name, budget)
-	return covered && cover.rr.flags & NSEC3_FLAG_OPT_OUT == 0
+	return covered && cover.rr.flags & NSEC3_FLAG_OPT_OUT == 0, false
 }

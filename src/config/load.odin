@@ -2553,16 +2553,17 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 		errorf(l, "dnssec.max_nsec3_iterations must not be negative")
 	}
 	/*
-	And not so high that the query-wide hashing allowance cannot pay for one
-	proof: see `dnssec.MAX_NSEC3_ITERATIONS_LIMIT`. A number above it reads as
-	a laxer setting and acts as a resolver that answers SERVFAIL for every name
-	in an NSEC3 zone, which is worth refusing here rather than discovering in
-	production.
+	And not so high that the per-query hashing allowance is what answers
+	instead: see `dnssec.MAX_NSEC3_ITERATIONS_LIMIT`. Raising this past the
+	range that allowance can meet buys no validation at all - the zones it
+	admits are the ones whose proofs then run the allowance out - so the
+	setting reads as laxer and acts as SERVFAIL for names that were being
+	served. Refused here, where it is one line of output.
 	*/
 	if cfg.dnssec.max_nsec3_iterations > dnssec.MAX_NSEC3_ITERATIONS_LIMIT {
 		errorf(
 			l,
-			"dnssec.max_nsec3_iterations must not exceed %d, past which one record's hashing outgrows what a whole query may spend",
+			"dnssec.max_nsec3_iterations must not exceed %d: a higher ceiling admits zones whose hashing a query cannot afford, which is SERVFAIL rather than more validation",
 			dnssec.MAX_NSEC3_ITERATIONS_LIMIT,
 		)
 	}

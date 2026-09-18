@@ -565,14 +565,27 @@ test_nsec3_no_delegation_reads_matches_and_covers :: proc(t: ^testing.T) {
 	opt-out span may be hiding exactly the delegation being ruled out.
 	*/
 	zone := a_zone()
-	testing.expect(t, nsec3_proves_no_delegation(zone, "ai.example.", "example.", budget_at(A_ITERATIONS)), "an ordinary name is not a cut")
-	testing.expect(t, nsec3_proves_no_delegation(zone, "example.", "example.", budget_at(A_ITERATIONS)), "the apex has SOA, so it is not a cut below the parent")
-	testing.expect(t, !nsec3_proves_no_delegation(zone, "y.w.example.", "example.", budget_at(A_ITERATIONS)), "a delegation is a cut")
-	testing.expect(t, nsec3_proves_no_delegation(zone, "nx.example.", "example.", budget_at(A_ITERATIONS)), "a covered absent name is not a cut")
+	ordinary, ordinary_matched := nsec3_proves_no_delegation(zone, "ai.example.", "example.", budget_at(A_ITERATIONS))
+	testing.expect(t, ordinary, "an ordinary name is not a cut")
+	testing.expect(t, ordinary_matched, "and the record that says so is on the name itself")
+
+	apex, apex_matched := nsec3_proves_no_delegation(zone, "example.", "example.", budget_at(A_ITERATIONS))
+	testing.expect(t, apex, "the apex has SOA, so it is not a cut below the parent")
+	testing.expect(t, apex_matched, "on a record of its own")
+
+	delegation, _ := nsec3_proves_no_delegation(zone, "y.w.example.", "example.", budget_at(A_ITERATIONS))
+	testing.expect(t, !delegation, "a delegation is a cut")
+
+	// A name with no record of its own, only a span over it: not a cut either,
+	// and `matched` is what tells the caller it is not there at all.
+	absent, absent_matched := nsec3_proves_no_delegation(zone, "nx.example.", "example.", budget_at(A_ITERATIONS))
+	testing.expect(t, absent, "a covered absent name is not a cut")
+	testing.expect(t, !absent_matched, "and nothing matched it, because the zone does not hold it")
 
 	opt_out := a_zone()
 	opt_out[5].rr.flags |= NSEC3_FLAG_OPT_OUT
-	testing.expect(t, !nsec3_proves_no_delegation(opt_out, "nx.example.", "example.", budget_at(A_ITERATIONS)), "an opt-out span cannot rule a delegation out")
+	covered_by_opt_out, _ := nsec3_proves_no_delegation(opt_out, "nx.example.", "example.", budget_at(A_ITERATIONS))
+	testing.expect(t, !covered_by_opt_out, "an opt-out span cannot rule a delegation out")
 	free_all(context.temp_allocator)
 }
 

@@ -1703,12 +1703,6 @@ validate_denial :: proc(
 	`Bogus` would report our own limit to the client as a forgery - with its
 	address beside the word in the log.
 	*/
-	/*
-	The hashing allowance, and the same answer as the two above it. A proof this
-	server stopped hashing partway through is not a proof it found wanting, and
-	`Bogus` would report our own limit to the client as a forgery - with its
-	address beside the word in the log.
-	*/
 	if proof == .Failed && budget.nsec3.exhausted {
 		return {status = .Indeterminate, reason = "verification budget spent"}
 	}
@@ -2729,10 +2723,18 @@ zone_step :: proc(
 	}
 
 	step = denial_step(nsecs, nsec3s, child, parent, &budget.nsec3)
-	// A step whose NSEC3 hashing ran out is one this server did not read to the
-	// end, which is `Indeterminate` territory rather than a broken delegation -
-	// the same reading `ds_spent` above gets.
-	if step == .Bogus && budget.nsec3.exhausted {
+	/*
+	A step whose NSEC3 hashing ran out is one this server did not read to the
+	end, which is `Indeterminate` territory rather than anything the records
+	said - the same reading `ds_spent` above gets.
+
+	Whatever the step says, not only `.Bogus`. A scan cut short returns "no such
+	record", and every reading built on one of those is a reading of our own
+	limit: `.Absent` most of all, which ends the walk at this zone and calls it
+	`Secure`, leaving a name that really is delegated to be judged against the
+	wrong zone's keys and reported to the client as a forgery.
+	*/
+	if budget.nsec3.exhausted {
 		return .Indeterminate, nil
 	}
 	if step == .Insecure {
@@ -2768,11 +2770,13 @@ denial_step :: proc(
 		if nsec3_proves_no_ds(nsec3s, child, parent, nsec3_budget) == .Proven {
 			return .Insecure
 		}
-		if nsec3_proves_no_delegation(nsec3s, child, parent, nsec3_budget) {
+		if proven, matched := nsec3_proves_no_delegation(nsec3s, child, parent, nsec3_budget); proven {
 			// An NSEC3 zone publishes a record for every empty non-terminal
 			// (RFC 5155 section 7.1), so a name with none of its own is a name
-			// that is not there.
-			_, matched := nsec3_matching(nsec3s, child, nsec3_budget)
+			// that is not there. `matched` comes from the scan that proved
+			// there is no delegation rather than from a third pass over the
+			// same records: see `nsec3_proves_no_delegation` for what asking
+			// twice cost.
 			return .No_Cut if matched else .Absent
 		}
 	}

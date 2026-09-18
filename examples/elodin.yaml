@@ -420,9 +420,9 @@ dnssec:
   # NSEC3 records asking for more hashing than this are treated as unusable,
   # which makes the zone insecure rather than letting it hand the resolver an
   # arbitrary amount of work. RFC 9276 asks zones for zero. A query has a
-  # hashing allowance of its own, so anything above 511 is refused at startup:
-  # past that one record outgrows what a whole query may spend, and every NSEC3
-  # zone would answer SERVFAIL.
+  # hashing allowance of its own, and above 255 that allowance is what answers
+  # instead — the zones a higher ceiling admits are the ones whose proofs it
+  # cannot pay for — so anything above 255 is refused at startup.
   max_nsec3_iterations: 100
 
 cookies:

@@ -178,3 +178,44 @@ test_a_denial_that_settles_nothing_is_refused :: proc(t: ^testing.T) {
 	testing.expect_value(t, denial_step(nsecs, nil, "q.other.", "other.", budget_at(150)), Step.Bogus)
 	free_all(context.temp_allocator)
 }
+
+/*
+A step read with the hashing allowance nearly gone is never "not there".
+
+`.Absent` is the one reading that ends the walk, and `zone_trust` ends it by
+returning `Secure` for the zone reached so far. That makes it the expensive
+thing to get wrong: a name that really is delegated, judged against its parent's
+keys, is an answer with no valid signature - our own limit reaching the client
+as a forgery, which is the outcome this whole allowance exists to avoid.
+
+It was reachable. The step used to ask the records three times over - once for
+the DS, once for the delegation, once more for the match it already had - and
+the third scan is the one that ran out, turning a name the zone holds into a
+name it does not. The records below cost one round per hash, so the meter can be
+set to the exact hash the failure needed.
+*/
+@(test)
+test_a_step_whose_hashing_ran_out_is_not_read_as_an_absent_name :: proc(t: ^testing.T) {
+	zone := nsec3_zone({{"example.", {.NS, .SOA, .RRSIG, .DNSKEY}}, {"ent.example.", {.A, .RRSIG}}})
+	testing.expect(t, len(zone) == 2, "the chain should build")
+
+	// Two hashes: the DS scan and the delegation scan, which is all the step
+	// needs and one less than it used to take.
+	enough := Nsec3_Budget {
+		max_iterations = 150,
+		rounds         = MAX_NSEC3_ROUNDS_PER_QUERY - 2,
+	}
+	testing.expect_value(t, denial_step(nil, zone, "ent.example.", "example.", &enough), Step.No_Cut)
+	testing.expect(t, !enough.exhausted, "two hashes is what this step costs")
+
+	// One short of that, and the step has to say so rather than guess: `Bogus`
+	// here, which `zone_step` turns into `Indeterminate` when it sees the meter.
+	short := Nsec3_Budget {
+		max_iterations = 150,
+		rounds         = MAX_NSEC3_ROUNDS_PER_QUERY - 1,
+	}
+	step := denial_step(nil, zone, "ent.example.", "example.", &short)
+	testing.expect(t, short.exhausted, "the allowance should have been what stopped this")
+	testing.expectf(t, step != .Absent, "a scan cut short is not a name that is not there, got %v", step)
+	free_all(context.temp_allocator)
+}
