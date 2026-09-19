@@ -1285,42 +1285,8 @@ resolve_query :: proc(
 			}
 			stale_hit = stored
 		}
-
-		/*
-		And the verdict, for a question the answer cache could not answer.
-
-		Second, because an answer is what the client asked for: a name whose
-		entry is live is served from it, and only a question that would
-		otherwise go to an upstream is worth asking this. That ordering also
-		says what happens when a verdict and a fresh answer exist at once - the
-		answer wins, which is the right way round for a zone that has been
-		fixed and re-fetched by a request the verdict did not apply to.
-
-		Only while this request would have reached a verdict of its own.
-		`validating` is recomputed per query - a validator switched off by a
-		reload, a zone an operator has since routed or anchored - and the entry
-		carries no record of the rules it was refused under, so serving it to a
-		request that is not being validated would be a verdict outliving the
-		configuration that reached it.
-
-		An expired one is passed over rather than lent out as the stale
-		fallback. A verdict is not data to cover an outage with, which is the
-		reading `serve_stale` is given where the upstream fails below: the
-		client is told SERVFAIL either way, and holding a minute-old refusal for
-		a day to say it would be the memory outliving the thing it remembered.
-		*/
-		if validating {
-			if wire, hit, found := cache.get(s.answers, verdict_key, allocator, probe = true);
-			   found && !hit.stale {
-				remembered := Cached_Answer {
-					wire   = wire,
-					key    = verdict_key,
-					serial = hit.serial,
-				}
-				return serve_bogus_verdict(s, remembered, query, msg, q, proto, client, started)
-			}
-		}
 	}
+
 
 	/*
 	RD=0 asks for whatever this server already knows, not for a fresh lookup -
@@ -1352,6 +1318,48 @@ resolve_query :: proc(
 		out, built := dns.error_response(query, msg, .Refused, allocator, limit)
 		log_query(s, client, proto, q, .Refused, "rd", started)
 		return out, .Refused, built
+	}
+
+
+	/*
+	And the verdict this question was refused under, if there is one.
+
+	Here rather than up with the answer lookup, and the position is the whole of
+	what it means. This is the last thing before the query goes to an upstream,
+	which is the cost it exists to save: a live answer is served above without
+	ever reaching it, and an RD=0 query - which makes no upstream call to save -
+	keeps the reading the gate above gives it, down to the expired answer it is
+	handed rather than refused.
+
+	That ordering also says what happens when a verdict and a fresh answer exist
+	at once: the answer wins, which is the right way round for a zone that has
+	been fixed and re-fetched by a request the verdict did not apply to.
+
+	Only while this request would have reached a verdict of its own.
+	`validating` is recomputed per query - a validator switched off by a reload,
+	a zone an operator has since routed or anchored - and the entry carries no
+	record of the rules it was refused under, so serving it to a request that is
+	not being validated would be a verdict outliving the configuration that
+	reached it.
+
+	An expired one is passed over rather than lent out as the stale fallback. A
+	verdict is not data to cover an outage with, which is the reading
+	`serve_stale` is given where the upstream fails below: the client is told
+	SERVFAIL either way, and holding a minute-old refusal for a day to say it
+	would be the memory outliving the thing it remembered. `cache.deadline`
+	gives a verdict no stale window for that reason, so this asks a question the
+	cache has already answered - and asks it anyway rather than resting on it.
+	*/
+	if validating && s.cfg.cache.enabled {
+		if wire, hit, found := cache.get(s.answers, verdict_key, allocator, probe = true);
+		   found && !hit.stale {
+			remembered := Cached_Answer {
+				wire   = wire,
+				key    = verdict_key,
+				serial = hit.serial,
+			}
+			return serve_bogus_verdict(s, remembered, query, msg, q, proto, client, started)
+		}
 	}
 
 	// Validation needs the signatures, so the question goes out again with DO
@@ -2729,6 +2737,26 @@ the next client with the parent still unasked.
 
 And a refusal that would not encode, which is what the build below is checked
 for - `cache.put` refuses a truncated one for the same reason.
+
+Against the question and not against the server whose answer failed, which is
+the one thing here that costs a working deployment something.
+
+`report_bogus` says why the distinction is real: a verdict is a property of the
+answer, so a group whose members disagree about a zone - one handing back data
+that does not check out, the rest handing back data that does - fails the
+queries that land on the broken member and answers the rest. Remembered by
+name, the first query to land there refuses every query for that name until the
+entry expires, and one member in N becomes a total failure for a minute instead
+of an intermittent one.
+
+Kept this way even so, because which member will answer is not known when the
+memory is read. The lookup runs before anything is forwarded - that is the cost
+it exists to save - and under `upstream.strategy: race` the winner is not
+decided until the replies are in, so a memory scoped to a server could only be
+consulted after the exchange it is there to avoid. It is also what a validating
+resolver does: Unbound's `val-bogus-ttl` is keyed by the question. What bounds
+it is the minute, and what points at the cause is the warn, which names the
+upstream the refused answer came from.
 
 Under a key of its own (`cache.make_key`'s `verdict`), which is what lets this
 be remembered at all without taking something away. An entry replaces what is

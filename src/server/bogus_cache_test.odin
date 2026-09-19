@@ -128,12 +128,12 @@ unsigned_answer :: proc() -> []u8 {
 }
 
 @(private = "file")
-bogus_client_query :: proc(with_edns := false) -> []u8 {
+bogus_client_query :: proc(with_edns := false, rd := true) -> []u8 {
 	m := dns.Message {
 		id       = 0x7a7a,
 		question = []dns.Question{{name = BOGUS_NAME, type = .A, class = .IN}},
 	}
-	m.flags.rd = true
+	m.flags.rd = rd
 	if with_edns {
 		additional := make([]dns.Record, 1, context.temp_allocator)
 		additional[0] = dns.make_opt(1232, false)
@@ -479,7 +479,9 @@ test_a_verdict_is_remembered_without_taking_the_answer_kept_for_an_outage :: pro
 	kept, hit, found := cache.get(f.answers, f.key, context.temp_allocator)
 	if testing.expect(t, found, "the expired answer was dropped when the verdict was written down") {
 		testing.expect(t, hit.stale, "the entry under the question's key is no longer the expired answer")
-		testing.expect(t, !hit.bogus, "the verdict replaced the answer being kept for an outage")
+		if e, still_there := f.answers.entries[f.key]; still_there {
+			testing.expect(t, !e.bogus, "the verdict replaced the answer being kept for an outage")
+		}
 		testing.expect(
 			t,
 			len(kept) >= dns.HEADER_SIZE && kept[7] == 1,
@@ -489,9 +491,11 @@ test_a_verdict_is_remembered_without_taking_the_answer_kept_for_an_outage :: pro
 
 	// And the verdict was written down all the same, which is the half that
 	// giving way to the expired answer would have cost.
-	verdict, vhit, remembered := cache.get(f.answers, f.vkey, context.temp_allocator)
+	verdict, _, remembered := cache.get(f.answers, f.vkey, context.temp_allocator)
 	if testing.expect(t, remembered, "the verdict was not remembered beside the expired answer") {
-		testing.expect(t, vhit.bogus, "what is under the verdict key is not a verdict")
+		if e, in_cache := f.answers.entries[f.vkey]; testing.expect(t, in_cache, "the verdict went in elsewhere") {
+			testing.expect(t, e.bogus, "what is under the verdict key is not a verdict")
+		}
 		testing.expect(t, is_servfail(verdict), "the verdict is not a refusal")
 	}
 
@@ -499,6 +503,33 @@ test_a_verdict_is_remembered_without_taking_the_answer_kept_for_an_outage :: pro
 	_, again, served_again := handle_query(&f.server, bogus_client_query(), .UDP, "test", context.temp_allocator)
 	testing.expect(t, served_again, "no response was produced for the second query")
 	testing.expect_value(t, again, Outcome.Failed)
+	testing.expect_value(t, sync.atomic_load(&f.mock.seen), asked)
+
+	/*
+	And the client that asked for local knowledge and nothing else still gets
+	it.
+
+	RD=0 is answered from what this server already holds or refused, and the
+	expired answer is something it holds - which is why the gate hands it over
+	rather than refusing, and why the verdict is looked for below that gate
+	rather than above it. There is no upstream call on this path for a verdict
+	to save, so reading one here would only take the fallback away from the
+	clients the gate was written for.
+	*/
+	local, from_cache, answered := handle_query(
+		&f.server,
+		bogus_client_query(rd = false),
+		.UDP,
+		"test",
+		context.temp_allocator,
+	)
+	testing.expect(t, answered, "no response was produced for the RD=0 query")
+	testing.expect_value(t, from_cache, Outcome.Cached)
+	testing.expect(
+		t,
+		len(local) >= dns.HEADER_SIZE && local[3] & 0xf == u8(dns.Rcode.No_Error) && local[7] == 1,
+		"the RD=0 client was refused from the verdict instead of served what this server holds",
+	)
 	testing.expect_value(t, sync.atomic_load(&f.mock.seen), asked)
 
 	free_all(context.temp_allocator)

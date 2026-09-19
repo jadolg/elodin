@@ -190,9 +190,9 @@ test_a_bogus_verdict_is_kept_for_its_own_minute :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, time.diff(e.inserted, e.expires), time.Duration(BOGUS_TTL) * time.Second)
 
-	_, hit, found := get(c, key, context.temp_allocator)
+	_, _, found := get(c, key, context.temp_allocator)
 	testing.expect(t, found, "the verdict was stored and then not found")
-	testing.expect(t, hit.bogus, "the entry came back as an answer rather than as a verdict")
+	testing.expect(t, e.bogus, "the entry went in as an answer rather than as a verdict")
 	free_all(context.temp_allocator)
 }
 

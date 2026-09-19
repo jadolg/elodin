@@ -36,9 +36,13 @@ Entry :: struct {
 	/*
 	The entry is a `Bogus` verdict this server reached and not an answer it was
 	given: the bytes are its own SERVFAIL, and what they say is that the question
-	could not be answered rather than what the answer is. Kept for `BOGUS_TTL`
-	and never mistaken for data - `get` hands the flag back and the caller serves
-	the refusal again instead of the answer it does not have.
+	could not be answered rather than what the answer is.
+
+	Nothing here has to tell a caller so, because a verdict is stored under a key
+	of its own (`make_key`'s `verdict`) and is looked up only by a caller that
+	came for one. What this is read for is the entry's own lifetime: `put` gives
+	it `BOGUS_TTL` rather than anything the message carried, and `deadline`
+	refuses it the stale window an answer gets.
 	*/
 	bogus:       bool,
 	/*
@@ -107,9 +111,6 @@ Hit :: struct {
 	refused: u8,
 	// Which entry the bytes came out of, for `note_checked`.
 	serial:  u64,
-	// The bytes are a stored `Bogus` verdict rather than an answer; see
-	// `Entry.bogus`. The caller serves them as the refusal they are.
-	bogus:   bool,
 }
 
 Stats :: struct {
@@ -385,7 +386,6 @@ get :: proc(
 	hit.serial = e.serial
 	hit.recheck = e.redirects && e.checked != checked_against
 	hit.refused = e.refused
-	hit.bogus = e.bogus
 
 	elapsed := u32(max(0, time.duration_seconds(time.diff(e.inserted, now))))
 	out := make([]u8, len(e.wire), allocator)
@@ -924,11 +924,19 @@ and `sweep` both read it from here, because an entry one of them keeps and the
 other refuses is either memory held for a day for nothing or an answer served
 from data too old to serve, depending on which of the two runs first.
 
+A verdict has no life past its expiry, whatever `serve_stale` says. The stale
+window is there to cover an upstream outage with an answer, and a verdict is not
+an answer: the caller refuses to serve an expired one - see
+`server.resolve_query` - so a day of stale window would be a day of an entry
+nothing can ever be served from, holding a slot and its bytes against the
+answers that can. Every name somebody breaks for a minute would leave one
+behind.
+
 The caller holds the lock.
 */
 @(private)
 deadline :: proc(c: ^Cache, e: ^Entry) -> time.Time {
-	return time.time_add(e.expires, MAX_STALE) if c.serve_stale else e.expires
+	return time.time_add(e.expires, MAX_STALE) if c.serve_stale && !e.bogus else e.expires
 }
 
 /*
