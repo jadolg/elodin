@@ -248,22 +248,6 @@ decode_record :: proc(r: ^Reader, allocator: mem.Allocator) -> (rec: Record, err
 	rdata_end := r.pos + rdlength
 
 	rec.data, err = decode_rdata(r, rec.type, rdata_start, rdata_end, allocator)
-	if err == .Name_Budget {
-		/*
-		The one failure not worth retrying, and the one it would be wrong to
-		swallow.
-
-		Every other failure here is about this record - a trailing byte, a
-		length that disagrees - and the bytes may still be worth forwarding.
-		A spent name budget is about the message, so the retry would only spend
-		what is left of it again; and it is a well-formed name that was refused,
-		so keeping the record would put a live compression pointer into an
-		`Rdata_Raw` that readers take to mean the opposite. `cnamecheck` reads
-		a raw CNAME as a target no client could read either and refuses the
-		answer over it, which would be refusing one every client reads fine.
-		*/
-		return {}, err
-	}
 	if err != .None {
 		// Malformed or unrecognised RDATA is preserved rather than rejected, so
 		// odd records still survive a forward. Compressed names in it are still
@@ -275,6 +259,27 @@ decode_record :: proc(r: ^Reader, allocator: mem.Allocator) -> (rec: Record, err
 		// as surely as the second's.
 		rec.data = decode_raw_rdata(r, rec.type, rdata_start, rdata_end, allocator)
 		err = .None
+	}
+	/*
+	A spent budget fails the message, whichever path above noticed.
+
+	The raw path cannot say so itself: `decode_raw_rdata` never fails - a record
+	of a type this decoder does not model is kept as bytes whatever is wrong
+	with it - so when the budget stops it expanding a name it copies the RDATA
+	verbatim and says nothing. That leaves a live compression pointer in an
+	`Rdata_Raw`, which is the one thing `encode_message` refuses to write: the
+	message would decode here and then fail to be built again, taking
+	`fit_response` to an empty TC answer and `remove_edns_option` to no answer
+	at all, for a reply this server had read.
+
+	Asked after the fallback rather than before it so the modelled path lands
+	here too - its own refusal would otherwise be swallowed by the retry the
+	same way. Reachable only on a message's last record, since any record after
+	it fails on its own owner name, and that is exactly the record an upstream
+	would append.
+	*/
+	if r.name_bytes > NAME_BUDGET {
+		return {}, .Name_Budget
 	}
 	r.pos = rdata_end
 	return

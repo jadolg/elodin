@@ -217,47 +217,91 @@ for - and readers take a raw record to mean the opposite: `cnamecheck` refuses
 an answer over a raw CNAME because its target is one no client could read
 either, which would be refusing an answer every client reads fine.
 
-The shape is A records under a 255-octet name up to the budget, then one CNAME
-whose target is a pointer to that name: it is the last record that can reach
-this, since a message with more in it fails on the next owner name anyway.
+Both kinds of record reach it. A CNAME is a type this decoder models, so the
+refusal comes back from `decode_rdata` as an error; a PX is not, so it goes to
+`decode_raw_rdata`, which never fails and would keep the bytes without a word.
+That one also has to be caught, and by more than the error: what it leaves
+behind is a blob `encode_message` will not write, so a message that decoded
+could not be built again.
+
+The shape is A records under a 255-octet name up to the budget, then the record
+in question: it is the last record that can reach this at all, since a message
+with more in it fails on the next owner name anyway.
 */
-@(test)
-test_a_refused_name_does_not_become_a_raw_record :: proc(t: ^testing.T) {
+@(private = "file")
+answer_ending_in :: proc(type: Type, rdata: []u8, records: int) -> []u8 {
 	name := long_wire_name()
 	defer delete(name)
 
 	msg := make([dynamic]u8, 0, 16384)
-	defer delete(msg)
-	put_header(&msg, 651)
+	put_header(&msg, 0)
+	append(&msg, 1, 'x', 0)
+	put_u16(&msg, u16(Type.A))
+	put_u16(&msg, u16(Class.IN))
+
+	// The long name inline, as the first record's owner, for the rest to point
+	// at - so the owner names are what spends nearly all of the budget.
 	append(&msg, ..name)
 	put_u16(&msg, u16(Type.A))
 	put_u16(&msg, u16(Class.IN))
-	for _ in 0 ..< 650 {
-		append(&msg, 0xc0, 0x0c)
+	append(&msg, 0, 0, 0x0e, 0x10)
+	put_u16(&msg, 4)
+	append(&msg, 93, 184, 216, 34)
+
+	count := 1
+	for count < records - 1 {
+		append(&msg, 0xc0, 0x13)
 		put_u16(&msg, u16(Type.A))
 		put_u16(&msg, u16(Class.IN))
 		append(&msg, 0, 0, 0x0e, 0x10)
 		put_u16(&msg, 4)
 		append(&msg, 93, 184, 216, 34)
+		count += 1
 	}
+
+	// This one's owner is the short question name, so the only thing left that
+	// can cross the budget is its RDATA.
 	append(&msg, 0xc0, 0x0c)
-	put_u16(&msg, u16(Type.CNAME))
+	put_u16(&msg, u16(type))
 	put_u16(&msg, u16(Class.IN))
 	append(&msg, 0, 0, 0x0e, 0x10)
-	put_u16(&msg, 2)
-	append(&msg, 0xc0, 0x0c)
+	put_u16(&msg, u16(len(rdata)))
+	append(&msg, ..rdata)
+	count += 1
 
-	backing := make([]u8, 8 << 20)
-	defer delete(backing)
-	arena: mem.Arena
-	mem.arena_init(&arena, backing)
+	msg[6] = u8(count >> 8)
+	msg[7] = u8(count)
+	return msg[:]
+}
 
-	m, err := decode_message(msg[:], mem.arena_allocator(&arena))
-	testing.expect_value(t, err, Decode_Error.Name_Budget)
-	if err == .None && len(m.answer) > 0 {
-		last := m.answer[len(m.answer) - 1]
-		_, raw := last.data.(Rdata_Raw)
-		testing.expect(t, !raw, "the refused CNAME came back as a raw record")
+@(test)
+test_a_refused_name_does_not_become_a_raw_record :: proc(t: ^testing.T) {
+	// A CNAME whose target is a pointer, and a PX whose two names are: the
+	// modelled path and the unmodelled one.
+	// The record counts put each fixture's own RDATA over the line: a CNAME
+	// carries one name and a PX two, so they cross a record apart.
+	for fixture in ([]struct {
+			type:    Type,
+			rdata:   []u8,
+			records: int,
+		}{{.CNAME, {0xc0, 0x13}, 653}, {.PX, {0, 10, 0xc0, 0x13, 0xc0, 0x13}, 652}}) {
+		msg := answer_ending_in(fixture.type, fixture.rdata, fixture.records)
+		defer delete(msg)
+
+		backing := make([]u8, 16 << 20)
+		defer delete(backing)
+		arena: mem.Arena
+		mem.arena_init(&arena, backing)
+		a := mem.arena_allocator(&arena)
+
+		m, err := decode_message(msg, a)
+		testing.expectf(t, err == .Name_Budget, "%v: decoded %v, %d records", fixture.type, err, len(m.answer))
+		if err != .None {
+			continue
+		}
+		// It decoded, so it has to be something that can be written again.
+		_, _, eerr := encode_message(m, a)
+		testing.expectf(t, eerr == .None, "%v: decoded but would not re-encode: %v", fixture.type, eerr)
 	}
 }
 

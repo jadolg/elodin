@@ -2412,7 +2412,10 @@ RDATA copies, which are outside the budget and do not need to be in it - a
 record is at least eleven wire bytes, so both are already a fixed multiple of
 the message. Measured, a 64 KB reply built to spend the budget costs 2,031,200
 bytes across the pair, against the 8,550,616 one reading of it reached before
-there was a budget at all. One budget across the pair was the other way to do it and
+there was a budget at all. That is this procedure's figure and not the request's:
+`fit_response` reads the same wire again into the same arena when it passes the
+client's limit, and the validator does too, each for a budget of its own. One
+budget across the pair was the other way to do it and
 costs more than it saves: a reply large enough for the first reading to spend
 most of the budget would lose the shorter reading as well, which is refusing an
 answer this server had no opinion about, and that is the thing the shorter
