@@ -698,14 +698,19 @@ Result :: struct {
 	// A short phrase for the log line and the extended DNS error.
 	reason:    string,
 	/*
-	Whether a chain walk of this question was turned away for want of a slot.
+	Whether this verdict *is* the shedding: a walk of this question was turned
+	away for want of a slot, and that is what the status and reason report.
 
-	Carried as a fact rather than left for the caller to read off `reason`,
-	which is one string for a message that can hold several verdicts: a response
-	whose RRsets are partly shed and partly forged aggregates to the forgery,
-	and a caller matching the string would then be wrong about both. The caller
-	still decides what to do with it - a proven forgery is a forgery whatever
-	else happened - but it decides on the fact.
+	Both halves matter, and the second is the one that is easy to lose. A
+	question can have a walk shed somewhere and then fail for a quite different
+	allowance - a verification budget spent, an NSEC3 count over the ceiling -
+	and telling a caller "this was shed" would have it counted as load shedding
+	and logged with words that contradict `reason`. So this is set only where
+	the two agree.
+
+	Carried as a fact rather than left for the caller to match on `reason`,
+	which is a string this package is free to reword and which one clobbered
+	assignment would silently change the meaning of.
 	*/
 	shed:      bool,
 	/*
@@ -920,7 +925,7 @@ validate :: proc(
 	}
 	if answerable > 0 {
 		out := validate_answer(v, &budget, msg, qname, qtype, class, unix, now, allocator)
-		out.shed = budget.shed_walk
+		out.shed = shed_verdict(&budget, out)
 		count_shed(v, out)
 		return out
 	}
@@ -934,7 +939,7 @@ validate :: proc(
 		return {status = .Insecure, reason = "nothing to authenticate"}
 	}
 	denied := validate_denial(v, &budget, msg, qname, qtype, class, unix, now, allocator)
-	denied.shed = budget.shed_walk
+	denied.shed = shed_verdict(&budget, denied)
 	count_shed(v, denied)
 	return denied
 }
@@ -3007,6 +3012,21 @@ may_look_up :: proc(v: ^Validator, budget: ^Budget) -> bool {
 }
 
 /*
+Whether this question's verdict is the shedding, rather than merely a question
+that had a walk shed somewhere along the way.
+
+Both are needed. `shed_walk` alone says a slot was refused, which can happen to a
+question that then answers perfectly or fails for something else entirely; the
+reason alone is a string, and one clobbered assignment would change what a
+caller concludes from it. Together they are exact, and they are read here once
+rather than by every caller that wants to know.
+*/
+@(private)
+shed_verdict :: proc(budget: ^Budget, result: Result) -> bool {
+	return budget.shed_walk && result.reason == WALKS_IN_FLIGHT
+}
+
+/*
 Count a question the shedding actually cost, once, when its verdict is in.
 
 Not where the slot is refused, which is several times for one question and says
@@ -3016,9 +3036,10 @@ after the answer is already settled. Both are questions this resolver answered
 perfectly, and a number that moved for them would be useless for the one thing
 an operator is told to do with it - read it beside a rise in SERVFAIL.
 
-So it counts what that rise is made of: a question left undecided with a walk of
-its own turned away. `Bogus` is excluded with `Secure` - the answer was proved
-forged, and the shedding is not what settled it.
+So it counts what that rise is made of: a question left undecided *by* the
+shedding, which is what `Result.shed` already means - see `shed_verdict`.
+`Bogus` is excluded with `Secure`: the answer was proved forged, and the
+shedding is not what settled it.
 */
 @(private)
 count_shed :: proc(v: ^Validator, result: Result) {

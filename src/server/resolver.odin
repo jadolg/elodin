@@ -2018,14 +2018,16 @@ resolve_query :: proc(
 		#partial switch result.status {
 		case .Bogus, .Indeterminate:
 			/*
-			The fact the validator carried, and only where the verdict is
-			undecided.
+			The fact the validator carried: this verdict *is* the shedding, not
+			merely a question that had a walk turned away somewhere.
 
-			`Bogus` outranks `Indeterminate`, so a response holding both a shed
-			walk and a genuine forgery comes back as the forgery - which is what
-			it is, and is counted and logged as one. Shedding is the reading only
-			where nothing was proved against the answer, which is the case the
-			counter and the once-only line are for.
+			`Result.shed` is set only where the status and the reason agree on
+			that, so a question shed in one place and failed for another
+			allowance - a verification budget, an NSEC3 count over the ceiling -
+			is not read as load shedding and logged with words its own reason
+			contradicts. `Bogus` outranks `Indeterminate` besides, so a response
+			holding both a shed walk and a proved forgery comes back as the
+			forgery, is counted as one and logged as one.
 			*/
 			shed := result.shed && result.status == .Indeterminate
 			/*
