@@ -298,6 +298,25 @@ Dnssec_Config :: struct {
 	// unusable, which makes the zone insecure rather than letting it set the
 	// validator an arbitrary amount of work (RFC 9276).
 	max_nsec3_iterations: int,
+	/*
+	Chain-of-trust walks that may be waiting on an upstream at once.
+
+	The chain walk is the one part of validation that blocks the worker already
+	answering a client, and it blocks it once per label of the name being walked.
+	Nothing about the name is this server's to choose, so without a bound a
+	client picking names whose upper labels are fresh holds every worker there
+	(issue #356). Past this many, a walk reads the caches and answers SERVFAIL
+	where it would have gone upstream, which is what an upstream that did not
+	answer already produces.
+
+	Zero, the default, is half of `server.workers`: a flood then costs half the
+	pool and the other half keeps answering. It is exposed because the cost of
+	the number being too small is real - a resolver whose honest cache-miss load
+	is above it turns the surplus into SERVFAIL - and it is not a number anybody
+	here can know. `elodin_dnssec_walks_shed_total` is how an operator finds out
+	they need a bigger one.
+	*/
+	max_chain_walks:      int,
 }
 
 Cookie_Config :: struct {
@@ -1080,6 +1099,8 @@ default_config :: proc() -> Config {
 	c.dnssec = Dnssec_Config {
 		enabled              = true,
 		max_nsec3_iterations = 100,
+		// Derived from `server.workers` at start-up; see the field.
+		max_chain_walks      = 0,
 	}
 	c.cookies = Cookie_Config {
 		enabled  = true,

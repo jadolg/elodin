@@ -25,10 +25,15 @@ So what is bounded here is not the walk but the number of them in flight. The
 first test is the reproduction: without a bound, every thread that asks is a
 thread parked on the walk's first round trip at the same moment.
 
-The two after it are the other half of the bargain - that a walk turned away
-still reads its caches, and that being turned away is `Indeterminate` and never
-a downgrade to `Insecure`, which would make load shedding into a way of
-stripping a zone's signatures.
+The rest are the other half of the bargain, and the third of them is there
+because the second reads better than the truth. A walk turned away still reads
+its caches, so a chain both caches answer is unaffected - but a cached apex is
+not a cached name, and a hostname below one still costs a DS per label. Both
+shapes are pinned, so what a flood costs is written down rather than implied.
+
+Last, that being turned away is `Indeterminate` and never a downgrade to
+`Insecure`, which would make load shedding into a way of stripping a zone's
+signatures.
 */
 
 /*
@@ -186,12 +191,13 @@ test_only_so_many_chain_walks_block_at_once :: proc(t: ^testing.T) {
 }
 
 /*
-A walk with no slot still answers out of the cache.
+A walk that needs no lookup is not affected by the bound at all.
 
-This is what keeps the bound from being a second denial of service. The zones a
-resolver answers for all day are cached, and a question about one of them needs
-no round trip at all - so a flood holding every slot must not stop it being
-answered, and must not cost it its AD bit either.
+This is what keeps the bound from being a second denial of service, and it is
+why the slot is taken at the first upstream lookup rather than on the way into
+the walk: a question a warm cache answers must neither be refused while every
+slot is held nor take a slot other walks need - and must not move `walks_shed`,
+which an operator reads as the flood's own number.
 */
 @(test)
 test_a_shed_walk_still_answers_from_the_cache :: proc(t: ^testing.T) {
@@ -219,6 +225,48 @@ test_a_shed_walk_still_answers_from_the_cache :: proc(t: ^testing.T) {
 	calls := up.calls
 	sync.mutex_unlock(&up.mu)
 	testing.expectf(t, calls == 0, "a cached chain should ask nobody, it asked %d times", calls)
+	testing.expect(t, !budget.holds_walk, "a walk that asked nobody should have taken no slot")
+	testing.expect_value(t, walks_shed(v), u64(0))
+	free_all(context.temp_allocator)
+}
+
+/*
+And a name *below* a warm apex is not a warm name: while every slot is held, it
+stops.
+
+The walk has to rule out a zone cut at every label, so `www.example.com.` costs
+a DS lookup even with `example.com.` cached and secure - only the non-cut memo
+makes that free, and a name nobody has asked for before is not in it. So a flood
+holding every slot does reach past its own names into ordinary traffic, which is
+the trade #356 asks for and is worth a test of its own rather than a sentence
+somebody has to believe.
+*/
+@(test)
+test_a_shed_walk_below_a_warm_apex_still_stops :: proc(t: ^testing.T) {
+	up := Slow_Upstream{}
+	v := make_validator(slow_query, &up, Options{max_chain_walks = 1})
+	defer destroy_validator(v)
+
+	now := time.unix(FIXTURE_TIME, 0)
+	keys := []Dnskey{}
+	cache_put(v, ".", .Secure, keys, MAX_ZONE_TTL, now)
+	cache_put(v, "com.", .Secure, keys, MAX_ZONE_TTL, now)
+	cache_put(v, "example.com.", .Secure, keys, MAX_ZONE_TTL, now)
+
+	testing.expect(t, take_walk_slot(v), "the one slot should be free")
+	defer drop_walk_slot(v)
+
+	budget := query_budget(v)
+	status, _, _ := zone_trust(v, &budget, "www.example.com.", now, context.temp_allocator)
+	testing.expect_value(t, status, Status.Indeterminate)
+	testing.expect_value(t, walk_reason(&budget), WALKS_IN_FLIGHT)
+	// This one is the flood's cost and belongs in the number an operator reads.
+	testing.expect_value(t, walks_shed(v), u64(1))
+
+	sync.mutex_lock(&up.mu)
+	calls := up.calls
+	sync.mutex_unlock(&up.mu)
+	testing.expectf(t, calls == 0, "a shed walk should reach no upstream, it reached one %d times", calls)
 	free_all(context.temp_allocator)
 }
 

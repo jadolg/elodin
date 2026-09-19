@@ -2,6 +2,7 @@ package server
 
 import "core:mem"
 import "core:sync"
+import "elodin:config"
 import "elodin:dns"
 import "elodin:dnssec"
 import "elodin:logx"
@@ -120,7 +121,7 @@ start_validator :: proc(s: ^Server) -> bool {
 		dnssec.Options {
 			anchors = anchors,
 			max_nsec3_iterations = s.cfg.dnssec.max_nsec3_iterations,
-			max_chain_walks = max(1, s.cfg.server.workers / 2),
+			max_chain_walks = configured_chain_walks(s.cfg),
 		},
 	)
 	logx.infof(
@@ -128,6 +129,29 @@ start_validator :: proc(s: ^Server) -> bool {
 		len(anchors) if len(anchors) > 0 else len(dnssec.root_anchors()),
 	)
 	return true
+}
+
+/*
+How many chain walks may be waiting on an upstream at once.
+
+Half the handler pool unless an operator named a figure. Half rather than all
+because the walk blocks the worker answering the client: a flood then holds half
+the pool and the other half keeps answering, which is the difference between a
+resolver degraded and one down. Half rather than a quarter because the walks
+past the bound are answered SERVFAIL, so the number is also the honest
+cache-miss load this server can validate at, and erring small costs real
+answers.
+
+At least one whatever the arithmetic says. A one-worker configuration still has
+to be able to walk a chain, and the bound is on walks at once rather than on
+walks.
+*/
+@(private)
+configured_chain_walks :: proc(cfg: ^config.Config) -> int {
+	if cfg.dnssec.max_chain_walks > 0 {
+		return cfg.dnssec.max_chain_walks
+	}
+	return max(1, cfg.server.workers / 2)
 }
 
 /*
@@ -168,11 +192,17 @@ submit to their own pool, so there is no way for this to wait on a worker it is
 occupying.
 
 It is still a worker held for a round trip, and a chain walk makes one of these
-per label. What stops a client choosing how many workers are held that way is
-`Options.max_chain_walks` above: half the pool, so the other half keeps
-answering while a flood holds its half. The walks past it read the caches and
-give up where they would have called this, which the client sees as the SERVFAIL
-an unreachable authority produces. See `Validator.walks` and issue #356.
+per label of a name the client chose. What stops a client choosing how many
+workers are held that way is `configured_chain_walks` above: half the pool by
+default, so the other half keeps answering while a flood holds its half. A walk
+past the bound reads the caches and gives up where it would have called this,
+which the client sees as the SERVFAIL an unreachable authority produces.
+
+Not only the flood's own names, and the difference is worth knowing before
+setting the number: a walk needs a DS lookup at every label below the deepest
+zone it has cached, so while every slot is held, a hostname nobody has asked for
+before under a warm signed zone is SERVFAIL as well. See `Validator.walks`,
+`dnssec.max_chain_walks` and issue #356.
 */
 @(private)
 validator_query :: proc(

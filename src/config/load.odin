@@ -1435,6 +1435,7 @@ load_dnssec :: proc(l: ^Loader, cfg: ^Config) {
 	}
 	opt_bool(l, n, "enabled", &cfg.dnssec.enabled, "dnssec")
 	opt_int(l, n, "max_nsec3_iterations", &cfg.dnssec.max_nsec3_iterations, "dnssec")
+	opt_int(l, n, "max_chain_walks", &cfg.dnssec.max_chain_walks, "dnssec")
 
 	if a := yaml.get(n, "trust_anchors"); !yaml.is_null(a) {
 		if list, ok := yaml.as_string_list(a, l.allocator); ok {
@@ -2551,6 +2552,12 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 
 	if cfg.dnssec.max_nsec3_iterations < 0 {
 		errorf(l, "dnssec.max_nsec3_iterations must not be negative")
+	}
+	// Zero derives it from `server.workers`. Negative is not "no limit" - the
+	// limit is a denial-of-service guard - so it is a mistake worth reporting
+	// rather than reading as one more way of asking for the default.
+	if cfg.dnssec.max_chain_walks < 0 {
+		errorf(l, "dnssec.max_chain_walks must not be negative; 0 derives it from server.workers")
 	}
 	// Parsed here rather than at startup so `--check` reports a bad anchor
 	// instead of a resolver that comes up refusing every name.

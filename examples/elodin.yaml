@@ -427,6 +427,18 @@ dnssec:
   # line in the log naming the number this build computes from its allowance.
   max_nsec3_iterations: 100
 
+  # Chain-of-trust walks that may be waiting on an upstream at once. The walk
+  # blocks the worker answering the client, once per label of the name being
+  # walked, and how many labels there are is the client's to choose — so without
+  # a bound a flood of fresh names holds every worker. Past this many, a walk
+  # reads the caches and answers SERVFAIL where it would have gone upstream,
+  # which is what an upstream that did not answer already produces.
+  #
+  # 0 is half of server.workers. Raise it if elodin_dnssec_walks_shed_total is
+  # moving on a resolver nobody is flooding: that is honest cache-miss load
+  # being turned into SERVFAIL, and the number is too small for this deployment.
+  # max_chain_walks: 0
+
 cookies:
   # Clients that send a DNS cookie get one back (RFC 7873). It costs one hash
   # per query and it takes forging an answer to a client on this network from

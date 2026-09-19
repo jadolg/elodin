@@ -912,6 +912,7 @@ only while the flood lasts.
 dnssec:
   enabled: true
   max_nsec3_iterations: 100
+  max_chain_walks: 0     # 0 is half of server.workers
   trust_anchors: []      # empty uses the built-in root keys
 ```
 
@@ -934,6 +935,24 @@ nobody should be publishing. RFC 9276 asks
 zones for zero and the zones still publishing NSEC3 use single digits, so this
 is a guard against a zone that has picked a number nobody should, rather than a
 setting to tune.
+
+`max_chain_walks` is how many chain-of-trust walks may be waiting on an upstream
+at once. Establishing the zone an answer was signed by means one DS lookup per
+label of the name, each a blocking round trip on the worker already answering the
+client, and how many labels there are is the client's to choose — so without a
+bound, a flood of names whose upper labels are fresh holds every worker for the
+better part of a second apiece. Past this many, a walk reads the caches and
+answers SERVFAIL where it would have gone upstream, with the same extended error
+an upstream that did not answer produces. It is never served as insecure: load
+shedding must not be a way to strip a zone's signatures.
+
+Zero, the default, is half of `server.workers` — a flood then costs half the pool
+and the other half keeps answering. What the bound costs while it binds is more
+than the flood's own names: a cached apex is not a cached name, so a hostname
+nobody has asked for before under a zone this resolver knows well is SERVFAIL
+too. `elodin_dnssec_walks_shed_total` counts the walks that stopped, and a
+resolver nobody is flooding should read zero — if it does not, honest cache-miss
+load is being turned into SERVFAIL and the number wants raising.
 
 A query also has a hashing allowance of its own, and above a ceiling of 255 —
 derived from that allowance, so a build that retunes it says its own number in
@@ -2112,7 +2131,7 @@ as a warning at startup.
 | `elodin_rate_limited_total` | counter | queries the rate limiter withheld an answer from |
 | `elodin_rate_limit_slipped_total` | counter | those answered truncated instead, to send a real client to TCP |
 | `elodin_dnssec_answers_total{result}` | counter | `secure` and `bogus` |
-| `elodin_dnssec_walks_shed_total` | counter | chain-of-trust walks that read the caches only, because half the workers were already walking one upstream. Zero on a resolver nobody is flooding; rising alongside SERVFAIL means the shedding is this server's, not an upstream going away |
+| `elodin_dnssec_walks_shed_total` | counter | chain-of-trust walks that stopped short of an upstream, because `dnssec.max_chain_walks` were already waiting on one. Zero on a resolver nobody is flooding; rising alongside SERVFAIL means the shedding is this server's, not an upstream going away — and if nobody is flooding it, the bound is too small |
 | `elodin_rebind_refused_total` | counter | answers withheld because a public name was pointed into private space |
 | `elodin_special_use_total` | counter | queries answered from the reserved-name table instead of being forwarded |
 | `elodin_cache_entries` / `_bytes` | gauge | what the cache holds, against `max_entries` and `max_bytes` |

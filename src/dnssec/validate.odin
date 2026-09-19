@@ -130,10 +130,19 @@ Validator :: struct {
 	The flood then costs a fixed number of threads rather than all of them, which
 	is the difference between a resolver degraded and one down.
 
-	Held only by a walk that would otherwise be blocking, and taken at the walk
-	rather than at the lookup: a walk the caches can answer never asks for one,
-	so ordinary traffic over warm zones is untouched by a flood holding every
-	slot.
+	A slot is taken at the first lookup that would go upstream, not on the way
+	into the walk, so a walk both caches can answer never asks for one and a
+	flood holding every slot cannot stop it.
+
+	What such a flood *does* stop, and it is worth being exact because it is more
+	than it sounds: any walk that needs even one round trip. A cached apex is not
+	enough on its own - a name below it still costs a DS per label to rule out a
+	cut, and only the non-cut memo makes those free - so while every slot is held,
+	a hostname nobody has asked for before under a zone this resolver knows well
+	comes back SERVFAIL. `test_a_shed_walk_below_a_warm_apex_still_stops` pins
+	that shape so nobody has to rediscover it. It is the trade #356 asks for -
+	the alternative is every thread held and nothing answered at all - and it is
+	why `max_chain_walks` is an operator's number rather than only ours.
 	*/
 	walks:                int,
 	max_chain_walks:      int,
@@ -277,15 +286,19 @@ Budget :: struct {
 	*/
 	walk_stopped:  string,
 	/*
-	Set for a walk that found no slot in `Validator.walks`: it may read the
-	caches and may not go upstream.
+	Whether this walk holds one of `Validator.walks`.
 
-	On the budget rather than on the validator because it is a property of this
-	walk, and it is cleared again on the way out of `zone_trust` so that a
-	later walk in the same query - a second signer, an address hint - gets its
-	own answer rather than this one's.
+	Taken at the first lookup that would go upstream rather than on the way into
+	`zone_trust`, so a walk the caches can answer never asks for one - and kept
+	for the rest of the walk once taken, because a walk that has already spent a
+	round trip must be allowed to finish rather than stopped halfway, which
+	would spend the upstream traffic and get nothing back for it.
+
+	On the budget rather than on the validator because the slot belongs to this
+	walk. `zone_trust` gives it back on the way out, so a later walk in the same
+	query - a second signer, an address hint - asks for its own.
 	*/
-	cache_only:    bool,
+	holds_walk:    bool,
 	// The hashing a denial proved with NSEC3 may spend, which no count of
 	// lookups or verifications bounds: see `MAX_NSEC3_ROUNDS_PER_QUERY`.
 	nsec3:         Nsec3_Budget,
@@ -712,6 +725,10 @@ validate :: proc(
 	class := msg.question[0].class if len(msg.question) > 0 else dns.Class.IN
 	unix := u32(time.to_unix_seconds(now))
 	budget := query_budget(v)
+	// `zone_trust` gives its slot back itself; this is for the paths that reach
+	// a lookup without one - `zone_keys` called on its own, today only from the
+	// tests - so a slot can never outlive the question that took it.
+	defer end_walk(v, &budget)
 
 	/*
 	REFUSED, SERVFAIL and the rest carry nothing to authenticate. Demanding a
@@ -2770,23 +2787,28 @@ verified_rrset :: proc(
 // ---------------------------------------------------------------------------
 
 /*
-Take a slot for a walk that is about to block, or report that there is none.
+Take a slot for a lookup that is about to block, or report that there is none.
 
-Optimistic: the count goes up first and comes back down when the answer is no.
-That can leave it briefly above the limit, and it can never let a walk in above
-it - which is the direction that matters - while a compare-and-swap loop would
-spin exactly when the contention it spins on is an attack.
+Exact rather than optimistic. Adding first and backing off when the answer turns
+out to be no is a line shorter, but every loser inflates the count while it does
+so, and losers are what a flood is made of - so walks would be turned away with
+slots genuinely free, at exactly the moment the slots matter. The loop below
+retries only when somebody else changed the count in between, which is progress
+rather than contention.
 
 See `Validator.walks`.
 */
 @(private)
 take_walk_slot :: proc(v: ^Validator) -> bool {
-	if sync.atomic_add(&v.walks, 1) >= v.max_chain_walks {
-		sync.atomic_sub(&v.walks, 1)
-		sync.atomic_add(&v.shed, 1)
-		return false
+	for {
+		held := sync.atomic_load(&v.walks)
+		if held >= v.max_chain_walks {
+			return false
+		}
+		if _, swapped := sync.atomic_compare_exchange_weak(&v.walks, held, held + 1); swapped {
+			return true
+		}
 	}
-	return true
 }
 
 @(private)
@@ -2794,8 +2816,41 @@ drop_walk_slot :: proc(v: ^Validator) {
 	sync.atomic_sub(&v.walks, 1)
 }
 
-// Chain walks turned away because the server was already walking as many as it
-// will. Zero on a resolver that is not being flooded.
+/*
+May this walk go upstream, and if it has not asked before, take the slot that
+lets it?
+
+Counted where the answer is no rather than where the slot is refused, so
+`walks_shed` is walks that actually stopped: a walk both caches could answer is
+refused a slot under a flood and finishes anyway, and counting that would leave
+the number moving on a resolver working perfectly.
+*/
+@(private)
+may_look_up :: proc(v: ^Validator, budget: ^Budget) -> bool {
+	if budget.holds_walk {
+		return true
+	}
+	if take_walk_slot(v) {
+		budget.holds_walk = true
+		return true
+	}
+	sync.atomic_add(&v.shed, 1)
+	return false
+}
+
+// Give back the slot this walk took, if it took one. Safe to call twice, which
+// is what lets `validate` hold the line for any path that walks without going
+// through `zone_trust`.
+@(private)
+end_walk :: proc(v: ^Validator, budget: ^Budget) {
+	if budget.holds_walk {
+		drop_walk_slot(v)
+		budget.holds_walk = false
+	}
+}
+
+// Chain walks that had to stop because the server was already going upstream for
+// as many as it will. Zero on a resolver that is not being flooded.
 walks_shed :: proc(v: ^Validator) -> u64 {
 	return sync.atomic_load(&v.shed) if v != nil else 0
 }
@@ -2835,23 +2890,13 @@ zone_trust :: proc(
 	// walk's own answer and not one left behind by an earlier proof.
 	budget.walk_stopped = ""
 	/*
-	A walk with no slot still runs - it simply may not go upstream. That is what
-	keeps a flood holding every slot from breaking ordinary traffic: the zones a
-	resolver answers for all day are in the cache, and a walk that never needed
-	a round trip never notices the shortage. What it cannot do is reach a name
-	nobody has asked about yet, and that comes back `Indeterminate` rather than
-	insecure - a downgrade is the one thing load shedding must not be able to
-	produce.
+	The walk asks for a slot at its first upstream lookup and gives it back
+	here. One that never needs a lookup never takes one, so a flood holding
+	every slot cannot stop a chain both caches can answer; one that needs a
+	lookup it cannot make comes back `Indeterminate`, never insecure - a
+	downgrade is the one thing load shedding must not be able to produce.
 	*/
-	walking := take_walk_slot(v)
-	defer if walking {
-		drop_walk_slot(v)
-	}
-	// Restored rather than cleared: a caller that set it meant it, and walks
-	// are not nested today but the saving costs a word.
-	outer_cache_only := budget.cache_only
-	budget.cache_only = outer_cache_only || !walking
-	defer budget.cache_only = outer_cache_only
+	defer end_walk(v, budget)
 
 	root_status, root_keys := zone_keys(v, budget, ".", now, allocator)
 	if root_status != .Secure {
@@ -2980,7 +3025,7 @@ zone_step :: proc(
 		return .No_Cut, nil
 	}
 
-	if budget.cache_only {
+	if !may_look_up(v, budget) {
 		return walk_gave_up(budget, WALKS_IN_FLIGHT), nil
 	}
 	if !spend_lookup(budget) {
@@ -3297,7 +3342,7 @@ fetch_keys :: proc(
 	keys: []Dnskey,
 	status: Status,
 ) {
-	if budget.cache_only {
+	if !may_look_up(v, budget) {
 		budget.walk_stopped = WALKS_IN_FLIGHT
 		return nil, .Indeterminate
 	}
