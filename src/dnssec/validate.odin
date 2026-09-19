@@ -384,22 +384,6 @@ Budget :: struct {
 	// Which set of threads this question is spending, and so which of
 	// `Validator.max_walks` bounds it. See `Walk_Pool`.
 	pool:          Walk_Pool,
-	/*
-	Set while work is being done that cannot change the verdict.
-
-	Only the address hints beside an answer, today. They are authenticated after
-	the verdict is settled and dropped rather than fatal when anything runs
-	short, so a walk of theirs that finds no slot has stopped nothing: the
-	client gets the answer it was getting, with the AD bit it had earned, one
-	round trip poorer. Counting that would have
-	`elodin_dnssec_queries_shed_total` move on a question that was answered
-	perfectly, which is the one thing the number must not do.
-
-	The slot is still asked for - a hint walk goes upstream like any other, and
-	that is what the bound is about - it is only the counting and the
-	`shed_walk` marker that are held back.
-	*/
-	best_effort:   bool,
 	// The hashing a denial proved with NSEC3 may spend, which no count of
 	// lookups or verifications bounds: see `MAX_NSEC3_ROUNDS_PER_QUERY`.
 	nsec3:         Nsec3_Budget,
@@ -937,6 +921,7 @@ validate :: proc(
 	if answerable > 0 {
 		out := validate_answer(v, &budget, msg, qname, qtype, class, unix, now, allocator)
 		out.shed = budget.shed_walk
+		count_shed(v, out)
 		return out
 	}
 	/*
@@ -950,6 +935,7 @@ validate :: proc(
 	}
 	denied := validate_denial(v, &budget, msg, qname, qtype, class, unix, now, allocator)
 	denied.shed = budget.shed_walk
+	count_shed(v, denied)
 	return denied
 }
 
@@ -1589,12 +1575,6 @@ validated_hints :: proc(
 	if len(targets) == 0 {
 		return nil
 	}
-	// Everything below this line is a bonus for the client, not a part of the
-	// verdict - see `Budget.best_effort`. Restored rather than cleared, since
-	// nothing says a caller cannot already be inside such a stretch.
-	outer_best_effort := budget.best_effort
-	budget.best_effort = true
-	defer budget.best_effort = outer_best_effort
 
 	out := make([dynamic]Authenticated_Set, 0, 2 * len(targets), allocator)
 	seen := make([dynamic]dns.Question, 0, 2 * len(targets), allocator)
@@ -2250,6 +2230,7 @@ validate_rrset :: proc(
 	*/
 	unsupported := false
 	exhausted := false
+	skipped_for_shed := false
 	/*
 	One chain walk per distinct signer, not one per signature.
 
@@ -2272,6 +2253,10 @@ validate_rrset :: proc(
 		status:      Status,
 		keys:        []Dnskey,
 		established: string,
+		// Whether this walk was the one turned away for want of a slot, rather
+		// than stopped by anything about the zone. Read below, where a
+		// signature it would have judged is skipped.
+		shed:        bool,
 	}
 	walked := make([dynamic]Walked, 0, 4, allocator)
 
@@ -2293,15 +2278,20 @@ validate_rrset :: proc(
 		keys: []Dnskey
 		established: string
 		seen_walk := false
+		walk_shed := false
 		for w in walked {
 			if dns.name_equal_fold(w.signer, sig.signer) {
 				zone_status, keys, established = w.status, w.keys, w.established
+				walk_shed = w.shed
 				seen_walk = true
 				break
 			}
 		}
 		if !seen_walk {
 			zone_status, keys, established = zone_trust(v, budget, sig.signer, now, allocator)
+			// Exact for this walk: `zone_trust` clears the reason on the way in,
+			// so what is there afterwards is this walk's own.
+			walk_shed = budget.walk_stopped == WALKS_IN_FLIGHT
 			// The walk held up and still did not reach the zone this signature
 			// names; see `forget_unreached_non_cut`. The signer is the
 			// response's to choose rather than the client's, so what it can
@@ -2316,10 +2306,16 @@ validate_rrset :: proc(
 					status = zone_status,
 					keys = keys,
 					established = established,
+					shed = walk_shed,
 				},
 			)
 		}
 		if zone_status != .Secure || !dns.name_equal_fold(sig.signer, established) {
+			// A signature this server never looked at, because it refused
+			// itself the lookup that would have reached the signer. Remembered
+			// so the verdict below cannot call the set forged on the strength
+			// of one that was not tried; see that return.
+			skipped_for_shed ||= walk_shed
 			continue
 		}
 		/*
@@ -2427,10 +2423,18 @@ validate_rrset :: proc(
 	`Indeterminate` is the honest report - the same one every other allowance in
 	this file gives, for the same reason.
 
+	This walk, not this question. `Budget.shed_walk` is sticky across the whole
+	question, and reading it here would have a shed anywhere - an earlier RRset,
+	a wholly different name in a CNAME chain - excuse a set that was proved
+	forged on signatures every one of which was tried. That hides real forgeries
+	from `elodin_dnssec_answers_total` and from the log while a flood is on,
+	which is the attacker's own doing twice over. `skipped_for_shed` is set only
+	where a signature of *this* set went unjudged.
+
 	After the switch, so an `Insecure` owner still wins: an unsigned zone needs
 	no signature, and no walk of ours changes that.
 	*/
-	if budget.shed_walk {
+	if skipped_for_shed {
 		return .Indeterminate, "", WALKS_IN_FLIGHT, "", {}
 	}
 
@@ -2998,15 +3002,29 @@ may_look_up :: proc(v: ^Validator, budget: ^Budget) -> bool {
 	// walk it goes on to try is refused too - a single question would move the
 	// counter five or ten times, and the number an operator reads against a
 	// SERVFAIL rise would be several times what happened.
-	// Neither counted nor remembered for work that could not have changed the
-	// verdict; see `Budget.best_effort`.
-	if !budget.best_effort {
-		if !budget.shed_walk {
-			sync.atomic_add(&v.shed, 1)
-		}
-		budget.shed_walk = true
-	}
+	budget.shed_walk = true
 	return false
+}
+
+/*
+Count a question the shedding actually cost, once, when its verdict is in.
+
+Not where the slot is refused, which is several times for one question and says
+nothing about the outcome: a question can be refused at one signer's walk and
+answered `Secure` on the next signature, or have a bonus address hint refused
+after the answer is already settled. Both are questions this resolver answered
+perfectly, and a number that moved for them would be useless for the one thing
+an operator is told to do with it - read it beside a rise in SERVFAIL.
+
+So it counts what that rise is made of: a question left undecided with a walk of
+its own turned away. `Bogus` is excluded with `Secure` - the answer was proved
+forged, and the shedding is not what settled it.
+*/
+@(private)
+count_shed :: proc(v: ^Validator, result: Result) {
+	if result.shed && result.status == .Indeterminate {
+		sync.atomic_add(&v.shed, 1)
+	}
 }
 
 // Give back the slot this walk took, if it took one. Safe to call twice, which

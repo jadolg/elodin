@@ -102,6 +102,7 @@ Sizing :: struct {
 	derived_workers:          bool,
 	derived_upstream_workers: bool,
 	derived_chain_walks:      bool,
+	derived_connection_walks: bool,
 	derived_udp_readers:      bool,
 }
 

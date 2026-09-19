@@ -197,7 +197,6 @@ test_only_so_many_chain_walks_block_at_once :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expectf(t, shed == WALKERS - SLOTS, "%d walks should say so in their own words, %d did", WALKERS - SLOTS, shed)
-	testing.expect_value(t, queries_shed(v), u64(WALKERS - SLOTS))
 }
 
 /*
@@ -240,7 +239,6 @@ test_a_shed_walk_still_answers_from_the_cache :: proc(t: ^testing.T) {
 	// slot this test is holding itself, and a walk that took a second would
 	// have made it two.
 	testing.expect_value(t, sync.atomic_load(&v.walks[.Shared]), 1)
-	testing.expect_value(t, queries_shed(v), u64(0))
 	free_all(context.temp_allocator)
 }
 
@@ -274,8 +272,6 @@ test_a_shed_walk_below_a_warm_apex_still_stops :: proc(t: ^testing.T) {
 	status, _, _ := zone_trust(v, &budget, "www.example.com.", now, context.temp_allocator)
 	testing.expect_value(t, status, Status.Indeterminate)
 	testing.expect_value(t, walk_reason(&budget), WALKS_IN_FLIGHT)
-	// This one is the flood's cost and belongs in the number an operator reads.
-	testing.expect_value(t, queries_shed(v), u64(1))
 
 	sync.mutex_lock(&up.mu)
 	calls := up.calls
@@ -345,43 +341,57 @@ captured_query :: proc(
 }
 
 /*
-A signature this server never looked at must not come back as a forgery.
+A shed somewhere else in the question must not excuse a set that was proved
+forged.
 
-The one shape of this bound that could accuse a zone, and it arrives by the back
-door. `validate_rrset` walks to each signature's signer and skips the signature
-when the walk does not reach it, then settles what the failure *means* by
-walking to the owner - and the signer's chain is a prefix of the owner's, so a
-slot freeing in between is all it takes for the second walk to succeed where the
-first did not. Nothing verified, the zone is signed, and the answer is `Bogus`:
-EDE 6, "DNSSEC Bogus", for a set whose only signature was never tried.
+`validate_rrset` will not call a set forged when a signature of *that set* went
+unjudged because its signer's walk was turned away - which is right, and is what
+`skipped_for_shed` is for. What it must not do is read the question-wide
+`Budget.shed_walk`: a response can hold one RRset whose walk was shed and
+another whose signatures were every one of them tried against cached keys and
+every one of them failed. The second is a forgery, and excusing it would take
+real forgeries out of `elodin_dnssec_answers_total` and out of the log for
+exactly as long as a flood kept the slots full - the attacker's own doing,
+twice.
 
-The interval is a race on a running server and is made explicit here - the walk
-is shed while the test holds the only slot, and the slot is given back before
-the set is judged, which is the same sequence with the timing taken out. The
-signature is a fabricated one so that nothing verifies and the tail is reached;
-what is on trial is the verdict, not the cryptography.
+So the marker is per walk, and the walk here is not this set's: the question is
+marked shed before the call, the chain this set names is warm, and the verdict
+is the forgery.
+
+The other half - a signature of this set skipped because its own walk was shed -
+has no unit test, and cannot have one in this process. The signer's chain is a
+prefix of the owner's, so a single-threaded run that sheds the signer walk sheds
+the owner walk too and returns before the guard; reaching it needs a slot to
+free between the two, which is a race by construction.
 */
 @(test)
-test_a_walk_this_server_shed_is_not_called_a_forgery :: proc(t: ^testing.T) {
-	v := make_validator(captured_query, nil, Options{max_chain_walks = 1})
+test_a_shed_elsewhere_does_not_excuse_a_forgery :: proc(t: ^testing.T) {
+	seen := Captured{}
+	v := make_validator(captured_query, &seen, Options{max_chain_walks = 1})
 	defer destroy_validator(v)
 
 	now := time.unix(FIXTURE_TIME, 0)
 	unix := u32(FIXTURE_TIME)
 	budget := query_budget(v)
 
-	// A flood holds the only slot, and this query's signer walk is turned away.
+	// A flood holds the only slot, and one walk of this question is turned away.
 	testing.expect(t, take_walk_slot(v), "the one slot should be free")
 	shed_status, _, _ := zone_trust(v, &budget, "cloudflare.com.", now, context.temp_allocator)
 	testing.expect_value(t, shed_status, Status.Indeterminate)
 	testing.expect_value(t, walk_reason(&budget), WALKS_IN_FLIGHT)
-	testing.expect(t, budget.shed_walk, "the budget should remember that a walk was turned away")
+	testing.expect(t, budget.shed_walk, "the question should be marked as having had a walk turned away")
 
-	// The flood ebbs, so the walk to the owner below finds a slot and succeeds.
+	// The flood ebbs, so the set below is judged against a chain that is reached.
 	drop_walk_slot(v)
 
 	records := []dns.Record {
-		{name = "cloudflare.com.", type = .A, class = .IN, ttl = 300, data = dns.Rdata_Raw{data = {0xc0, 0xa8, 0x00, 0x01}}},
+		{
+			name = "cloudflare.com.",
+			type = .A,
+			class = .IN,
+			ttl = 300,
+			data = dns.Rdata_Raw{data = {0xc0, 0xa8, 0x00, 0x01}},
+		},
 	}
 	sigs := []Rrsig {
 		{
@@ -409,8 +419,8 @@ test_a_walk_this_server_shed_is_not_called_a_forgery :: proc(t: ^testing.T) {
 		now,
 		context.temp_allocator,
 	)
-	testing.expect_value(t, status, Status.Indeterminate)
-	testing.expect_value(t, reason, WALKS_IN_FLIGHT)
+	testing.expect_value(t, status, Status.Bogus)
+	testing.expect_value(t, reason, "no valid signature")
 	free_all(context.temp_allocator)
 }
 
@@ -505,7 +515,6 @@ test_a_connection_thread_is_held_to_its_own_bound :: proc(t: ^testing.T) {
 	// having asked, and saying so, rather than refused for want of a slot.
 	testing.expect_value(t, status, Status.Indeterminate)
 	testing.expect(t, walk_reason(&budget) != WALKS_IN_FLIGHT, "the shared bound should not have refused it")
-	testing.expect_value(t, queries_shed(v), u64(0))
 	free_all(context.temp_allocator)
 }
 
@@ -532,5 +541,53 @@ test_a_connection_thread_is_still_bounded :: proc(t: ^testing.T) {
 	calls := up.calls
 	sync.mutex_unlock(&up.mu)
 	testing.expectf(t, calls == 0, "a shed walk should reach no upstream, it reached one %d times", calls)
+	free_all(context.temp_allocator)
+}
+
+/*
+The counter is questions the shedding cost, counted where the verdict is.
+
+Not where a slot is refused: one question asks for several, and a question can
+be refused at one signer's walk, answered `Secure` on the next signature, and
+have a bonus address hint refused after the verdict is already settled. All of
+those are questions this resolver answered, and a number that moved for them is
+useless for the one thing an operator is told to do with it - read it beside a
+rise in SERVFAIL. So it is counted once, in `validate`, for a question left
+undecided with a walk of its own turned away.
+*/
+@(test)
+test_the_counter_is_questions_the_shedding_cost :: proc(t: ^testing.T) {
+	seen := Captured{}
+	v := make_validator(captured_query, &seen, Options{max_chain_walks = 1})
+	defer destroy_validator(v)
+
+	now := time.unix(FIXTURE_TIME, 0)
+	answer: []u8
+	for f in FIXTURES {
+		if f.key == "reddit_a" {
+			decoded, ok := decode_hex(f.wire, context.temp_allocator)
+			testing.expect(t, ok, "the fixture should decode")
+			answer = decoded
+		}
+	}
+	testing.expect(t, len(answer) > 0, "the reddit fixture should be in the captured set")
+
+	// Answered without shedding first: an unsigned delegation, which is a
+	// question this resolver answers rather than refuses.
+	warm := validate(v, "www.reddit.com.", .A, answer, now)
+	testing.expect_value(t, warm.status, Status.Insecure)
+	testing.expect_value(t, queries_shed(v), u64(0))
+
+	// Now with every slot held. The chain is cached by the run above, so a
+	// fresh validator is what makes this a cold question again.
+	cold := make_validator(captured_query, &seen, Options{max_chain_walks = 1})
+	defer destroy_validator(cold)
+	testing.expect(t, take_walk_slot(cold), "the one slot should be free")
+	defer drop_walk_slot(cold)
+
+	out := validate(cold, "www.reddit.com.", .A, answer, now)
+	testing.expect_value(t, out.status, Status.Indeterminate)
+	testing.expect(t, out.shed, "the result should carry the fact that a walk was turned away")
+	testing.expect_value(t, queries_shed(cold), u64(1))
 	free_all(context.temp_allocator)
 }

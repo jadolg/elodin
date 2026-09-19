@@ -1000,9 +1000,12 @@ is a restart with real traffic pointed at a cold cache, and so is one upstream i
 the group black-holing, since every walk then runs to the timeout and holds its
 slot for the whole of it. Read a rising count as "more concurrent cold walks than
 this bound allows" and go looking: if upstream latency is normal and the load is
-yours, the number wants raising. `--check` and the startup log both name the
-number in use, and startup warns if a configured one leaves no workers reserved
-at all, which is the bound switched off.
+yours, the number wants raising. `--check` and the startup log both name the two
+numbers in use, and startup warns if a configured one leaves nothing reserved in
+its own pool, which is that bound switched off. The client is told the answer
+could not be established and no more: which internal limit stopped the walk is in
+the log and the counter, not in the extended error, since it would otherwise tell
+one client how busy this server is with everybody else's traffic.
 
 One thing the number does not account for: with `strategy: race`, a walk waiting
 on an upstream also holds one job per candidate server in the racer pool

@@ -224,8 +224,12 @@ this is the one place `--check` can show a number an operator is otherwise told
 to raise without being told what it is. See `config.derive_chain_walks`.
 */
 @(private)
-sizing_line :: proc(s: config.Server_Config, chain_walks := 0) -> string {
-	walks := fmt.tprintf(" chain_walks=%d", chain_walks) if chain_walks > 0 else ""
+sizing_line :: proc(s: config.Server_Config, chain_walks := 0, connection_walks := 0) -> string {
+	// Both, because they are two settings and an operator capping the upstream
+	// volume a flood can provoke has to set both - so seeing only one here
+	// would send them away thinking the other did not exist.
+	walks :=
+		fmt.tprintf(" chain_walks=%d connection_walks=%d", chain_walks, connection_walks) if chain_walks > 0 else ""
 	return fmt.tprintf(
 		"workers=%d upstream_workers=%d max_pending=%d%s (%s)",
 		s.workers,
@@ -480,7 +484,14 @@ main :: proc() {
 			len(cfg.upstream.zones),
 			len(cfg.blocking.lists),
 			len(cfg.rewrites))
-		fmt.printfln("  %s", sizing_line(cfg.server, cfg.dnssec.max_chain_walks if cfg.dnssec.enabled else 0))
+		fmt.printfln(
+			"  %s",
+			sizing_line(
+				cfg.server,
+				cfg.dnssec.max_chain_walks if cfg.dnssec.enabled else 0,
+				cfg.dnssec.max_connection_walks if cfg.dnssec.enabled else 0,
+			),
+		)
 		fmt.printfln("  %s", allow_from_line(cfg.server))
 		// Only where it applies, and without a granted figure: nothing here has
 		// bound a socket, so what the kernel would allow each reader is not

@@ -138,6 +138,17 @@ start_validator :: proc(s: ^Server) -> bool {
 			s.cfg.server.workers,
 		)
 	}
+	// The same for the other pool, and said the same way. A bound that allows as
+	// many walks as there are connection threads is that bound switched off, and
+	// nothing else in the configuration would tell an operator so.
+	if !s.cfg.server.sizing.derived_connection_walks &&
+	   s.cfg.dnssec.max_connection_walks >= s.cfg.server.max_connections {
+		logx.warnf(
+			"dnssec: max_connection_walks %d leaves none of the %d connection threads reserved, so a flood of fresh names can hold them all; see issue #356",
+			s.cfg.dnssec.max_connection_walks,
+			s.cfg.server.max_connections,
+		)
+	}
 
 	s.validator = dnssec.make_validator(
 		validator_query,
@@ -592,8 +603,28 @@ dnssec_failure_response :: proc(
 	case result.reason == dnssec.NSEC3_OVER_CEILING:
 		code = u16(EDE_UNSUPPORTED_NSEC3_ITERATIONS)
 	}
+	/*
+	The reason goes out as RFC 8914 extra text, except this one.
+
+	Every other reason here describes the answer or the zone, which is what the
+	client asked about. `WALKS_IN_FLIGHT` describes how busy this server is
+	right now, and that is a different thing to hand out: it is state one client
+	can read about every other client's traffic. An attacker running a slow
+	probe for any cold name beside their flood would be told exactly when the
+	slots saturate, which turns tuning the flood from guesswork into a closed
+	loop.
+
+	The code is unchanged - 22, the same an unreachable authority gets, which is
+	the truth here - and the operator loses nothing: the reason is in the log
+	line and the count is in `elodin_dnssec_queries_shed_total`. A client is
+	told the answer could not be established, which is all it can act on.
+	*/
+	text := result.reason
+	if result.reason == dnssec.WALKS_IN_FLIGHT {
+		text = ""
+	}
 	resp := dns.make_response(query, .Serv_Fail, allocator)
-	attach_extended_error(&resp, code, result.reason, allocator)
+	attach_extended_error(&resp, code, text, allocator)
 
 	encoded, _, err := dns.encode_message(resp, allocator, limit)
 	if err != .None {

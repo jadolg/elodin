@@ -2375,6 +2375,7 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	// from the pool. See `Dnssec_Config.max_connection_walks`.
 	if cfg.dnssec.max_connection_walks == 0 {
 		cfg.dnssec.max_connection_walks = derive_chain_walks(cfg.server.max_connections)
+		cfg.server.sizing.derived_connection_walks = true
 	}
 	/*
 	The UDP readers, sized the same way and reported the same way.
