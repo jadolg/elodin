@@ -160,6 +160,53 @@ test_servfail_not_cached :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+/*
+The one SERVFAIL this cache keeps, and for a minute rather than for as long as
+the bytes beside it claim.
+
+`bogus` is the caller saying it reached this verdict itself, so the rcode gate
+above stands aside - and nothing else about the entry may come from the answer
+that failed to validate. This fixture is that answer's shape: a record carrying
+a five-minute TTL, under an operator floor of an hour. Neither figure decides
+anything; the lifetime is `BOGUS_TTL`, which is what stops a broken zone from
+choosing how long this server goes on refusing it.
+*/
+@(test)
+test_a_bogus_verdict_is_kept_for_its_own_minute :: proc(t: ^testing.T) {
+	c := make_cache(Options{max_entries = 8, min_ttl = 3600, max_ttl = 86400})
+	defer destroy(c)
+
+	wire, msg := build_answer("bogus.example.", 300, context.temp_allocator)
+	msg.flags.rcode = u8(dns.Rcode.Serv_Fail)
+	kb: [KEY_MAX]u8
+	key := key_for(kb[:], "bogus.example.")
+	if !testing.expect(t, put(c, key, wire, msg, bogus = true), "a bogus verdict was not stored") {
+		return
+	}
+
+	e := c.entries[key]
+	if !testing.expect(t, e != nil, "the entry went in under another key") {
+		return
+	}
+	testing.expect_value(t, time.diff(e.inserted, e.expires), time.Duration(BOGUS_TTL) * time.Second)
+
+	_, _, found := get(c, key, context.temp_allocator)
+	testing.expect(t, found, "the verdict was stored and then not found")
+	testing.expect(t, e.bogus, "the entry went in as an answer rather than as a verdict")
+
+	// And the flag admits the refusal and nothing else: an answer handed in
+	// with it set would be pinned for the minute under none of the rules an
+	// answer is kept by.
+	answer_wire, answer_msg := build_answer("answer.example.", 300, context.temp_allocator)
+	ab: [KEY_MAX]u8
+	testing.expect(
+		t,
+		!put(c, key_for(ab[:], "answer.example."), answer_wire, answer_msg, bogus = true),
+		"an answer was stored as a verdict",
+	)
+	free_all(context.temp_allocator)
+}
+
 @(test)
 test_truncated_not_cached :: proc(t: ^testing.T) {
 	c := make_cache(Options{max_entries = 8, max_ttl = 3600})

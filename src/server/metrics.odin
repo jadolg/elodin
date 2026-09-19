@@ -538,7 +538,12 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 		)
 	}
 
-	metrics.family(&b, "elodin_dnssec_answers_total", .Counter, "Answers by what validation made of them.")
+	metrics.family(
+		&b,
+		"elodin_dnssec_answers_total",
+		.Counter,
+		"Answers by what validation made of them. `bogus` counts queries refused for failing to validate rather than validations run: a verdict is remembered for a minute (see cache.BOGUS_TTL), and every query refused from that memory is counted here, which is what keeps the figure honest now that only the first refusal since start is logged.",
+	)
 	metrics.sample(&b, "elodin_dnssec_answers_total", st.secure, metrics.Label{"result", "secure"})
 	metrics.sample(&b, "elodin_dnssec_answers_total", st.bogus, metrics.Label{"result", "bogus"})
 	// The only aggregate evidence that a rise in SERVFAIL is this server shedding

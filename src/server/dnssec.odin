@@ -364,9 +364,20 @@ otherwise push ordinary answers past the point where they need a retry over TCP.
 @(private)
 prune_failure_reported: bool
 
-// Set once the first walk has been turned away for want of a slot. See the
-// branch in `resolve_query` that reads it: the count is
-// `elodin_dnssec_queries_shed_total`, and the line is said once.
+/*
+And a third, for the verdict this server reached about itself.
+
+Same argument as the one above, one step further in. A shed walk is an
+`Indeterminate`, so it would share that flag - and the two are provoked by
+different things at different rates. A shed is the only one of the three whose
+rate a client chooses: under a flood it is every query, so sharing would have
+the first shed spend the `warn` that a genuinely unreachable parent needed, or
+the reverse. They are also the two an operator would act on differently, which
+is the test for whether a flag is worth splitting.
+
+Its line says what no other line here can: which setting was reached, and where
+the count lives. See `report_bogus`.
+*/
 @(private)
 chain_walk_shed_reported: bool
 
@@ -570,6 +581,86 @@ without_dnssec :: proc(records: []dns.Record, qtype: dns.Type, allocator: mem.Al
 		append(&out, rec)
 	}
 	return out[:]
+}
+
+/*
+Say, once, that an answer did not validate.
+
+Both lines name the upstream the refused answer came from.
+
+A verdict here is a property of the answer and not of the name, so the same
+question put to a different server can validate perfectly. A group whose members
+disagree about a zone - one that cannot reach it at all, one handing out a denial
+that proves nothing - is then a server that fails some queries for that name and
+answers the rest, and every other field on these two lines is identical across
+both. Without the upstream there is nothing in the log to tell them apart and the
+next step is a packet capture; with it, the counts per server say which one to
+stop asking.
+
+`client` is kept beside it. The pair is the point: one says whose query went
+unanswered, the other says who is to blame for that, and an operator reading
+either alone has half the story.
+
+Through `report_once`, like every other per-query warning on the client path.
+Which question is asked is the client's to choose, so a line per refusal is a
+line per query for anyone who cares to ask for a name whose zone is broken - and
+at the rate `ratelimit` allows one source, that is gigabytes a day of identical
+warnings, dropped by journald's per-unit limit along with every legitimate line
+or filling the disk where `log.file` is set. The first refusal since start is the
+`warn` an operator has to have, every one after it is `debug`, and `bogus=` in
+the stats line carries the count. The memory this server keeps of the verdict
+(`cache.BOGUS_TTL`) bounds the upstream traffic behind them; this bounds what
+they write down.
+*/
+@(private)
+bogus_reported: bool
+
+/*
+A flag of its own for the verdict that is not one.
+
+`Indeterminate` reaches this procedure beside `Bogus` because both are SERVFAIL
+to the client, and it is the cheap one to provoke: a lost DNSKEY datagram or a
+walk that ran out of its allowance under load produces it, and unlike a `Bogus`
+verdict nothing remembers it, so it stays cheap. Sharing one flag, the first
+such transient since start would spend the single `warn` and a zone that really
+is broken would be debug lines for the life of the process - which is the
+guarantee this is here to make, lost to the failure mode least worth hearing
+about.
+*/
+@(private)
+indeterminate_reported: bool
+
+@(private)
+report_bogus :: proc(q: dns.Question, client: string, result: dnssec.Result, from: string, shed := false) {
+	reported := &bogus_reported if result.status == .Bogus else &indeterminate_reported
+	if shed {
+		reported = &chain_walk_shed_reported
+	}
+	say, first := report_once(reported, logx.enabled(.Debug))
+	if !say {
+		return
+	}
+	format := "dnssec: %s %s from %s did not validate: %v (%s); answer came from %s"
+	if !first {
+		logx.debugf(format, dns.type_name(q.type), dns.name_trim_root(q.name), client, result.status, result.reason, from)
+		return
+	}
+	/*
+	The one verdict here that is about this server rather than about the answer,
+	so the line says so and names the setting - and leaves the upstream out of
+	it, since blaming a server that answered perfectly well for a lookup this
+	one declined to make would send an operator to the wrong place entirely.
+	*/
+	if shed {
+		logx.warnf(
+			"dnssec: %s %s from %s was not validated: this server was already walking as many chains of trust as dnssec.max_chain_walks and dnssec.max_connection_walks allow, so it stopped looking. Counted as elodin_dnssec_queries_shed_total; further ones are logged at debug level",
+			dns.type_name(q.type),
+			dns.name_trim_root(q.name),
+			client,
+		)
+		return
+	}
+	logx.warnf(format, dns.type_name(q.type), dns.name_trim_root(q.name), client, result.status, result.reason, from)
 }
 
 /*
