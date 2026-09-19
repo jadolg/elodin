@@ -277,6 +277,15 @@ OPT record and handing it out, which RFC 6891 section 6.1.1 forbids outright. So
 the presence of an OPT record is decided per request on the way out instead, by
 `server.match_client_opt`, and what is stored here is an answer either kind of
 client can be served from.
+
+`verdict` is the one thing in here that is not part of the question. It says the
+entry is a `Bogus` verdict rather than an answer to it, and it is a key of its
+own for a reason the caller could not get any other way: an entry replaces what
+is under its key, so a verdict sharing the answer's key would throw away the
+expired answer `serve_stale` is holding for that name - and the two are wanted at
+once. The verdict is what the next minute of queries is answered with; the
+expired answer is what covers the upstream being down after that minute runs
+out. See `server.remember_bogus_verdict`.
 */
 make_key :: proc(
 	buf: []u8,
@@ -285,6 +294,7 @@ make_key :: proc(
 	class: dns.Class,
 	dnssec_ok: bool,
 	checking_disabled := false,
+	verdict := false,
 ) -> string {
 	n := 0
 	limit := len(buf) - 8
@@ -302,7 +312,8 @@ make_key :: proc(
 	buf[n + 3] = u8(u16(class))
 	buf[n + 4] = 1 if dnssec_ok else 0
 	buf[n + 5] = 1 if checking_disabled else 0
-	return string(buf[:n + 6])
+	buf[n + 6] = 1 if verdict else 0
+	return string(buf[:n + 7])
 }
 
 /*
@@ -326,12 +337,23 @@ the answer is wrong, only that nothing has looked at it under the rules the
 caller says are current. A caller with no such notion leaves this at zero, gets
 `recheck` on nothing it stored at zero as well, and pays nothing for the
 mechanism.
+
+`probe` is a lookup that is not the query's own, and it is counted in neither
+direction. The one caller is the verdict a question was refused under
+(`make_key`'s `verdict`), which is looked for only once the answer cache has
+already been asked and has already counted what it found - so counting this too
+would put two lookups in `elodin_cache_misses_total` for one query and take the
+identity an operator reads these numbers by, that hits and misses are what the
+queries came to, away from them. What a verdict costs shows as `bogus=` and in
+the query log, which is where a refusal belongs; nothing about it is an answer
+this cache served.
 */
 get :: proc(
 	c: ^Cache,
 	key: string,
 	allocator := context.allocator,
 	checked_against: u64 = 0,
+	probe := false,
 ) -> (
 	wire: []u8,
 	hit: Hit,
@@ -345,14 +367,18 @@ get :: proc(
 
 	e, found := c.entries[key]
 	if !found {
-		c.stats.misses += 1
+		if !probe {
+			c.stats.misses += 1
+		}
 		return nil, {}, false
 	}
 
 	now := time.now()
 	if time.diff(deadline(c, e), now) > 0 {
 		remove_entry(c, e)
-		c.stats.misses += 1
+		if !probe {
+			c.stats.misses += 1
+		}
 		return nil, {}, false
 	}
 
@@ -383,11 +409,15 @@ get :: proc(
 		were answered from the cache, while the same query is counted forwarded
 		one package away.
 		*/
-		c.stats.misses += 1
+		if !probe {
+			c.stats.misses += 1
+		}
 		hit.stale = true
 	} else {
 		dns.patch_ttls(out, e.ttl_offsets, e.ttls, elapsed, c.min_ttl)
-		c.stats.hits += 1
+		if !probe {
+			c.stats.hits += 1
+		}
 	}
 
 	// An expired entry moves to the front along with the fresh ones. Something

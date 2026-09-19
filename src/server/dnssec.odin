@@ -522,9 +522,25 @@ they write down.
 @(private)
 bogus_reported: bool
 
+/*
+A flag of its own for the verdict that is not one.
+
+`Indeterminate` reaches this procedure beside `Bogus` because both are SERVFAIL
+to the client, and it is the cheap one to provoke: a lost DNSKEY datagram or a
+walk that ran out of its allowance under load produces it, and unlike a `Bogus`
+verdict nothing remembers it, so it stays cheap. Sharing one flag, the first
+such transient since start would spend the single `warn` and a zone that really
+is broken would be debug lines for the life of the process - which is the
+guarantee this is here to make, lost to the failure mode least worth hearing
+about.
+*/
+@(private)
+indeterminate_reported: bool
+
 @(private)
 report_bogus :: proc(q: dns.Question, client: string, result: dnssec.Result, from: string) {
-	say, first := report_once(&bogus_reported, logx.enabled(.Debug))
+	reported := &bogus_reported if result.status == .Bogus else &indeterminate_reported
+	say, first := report_once(reported, logx.enabled(.Debug))
 	if !say {
 		return
 	}

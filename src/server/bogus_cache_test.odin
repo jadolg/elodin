@@ -28,9 +28,10 @@ The verdict is remembered instead (`cache.BOGUS_TTL`), and what is written down
 is this server's own SERVFAIL rather than the answer that failed: there is
 nothing in the cache for a later reload, or a bug, to serve as data. The bounds
 on that memory are as much of the subject as the memory is, so each one is a
-test here: it is only a verdict that is kept, only while nothing expired is
-being held for the same name, and only while this request would have reached a
-verdict of its own.
+test here: it is only a verdict that is kept and never a walk that could not be
+finished, it is kept under a key of its own so that the answer `serve_stale`
+holds for the same name is untouched, and it answers only a request that would
+have reached a verdict of its own.
 */
 
 @(private = "file")
@@ -165,6 +166,11 @@ Fixture :: struct {
 	server:    Server,
 	key_buf:   [cache.KEY_MAX]u8,
 	key:       string,
+	// Where the verdict for the same question is kept. A key of its own, so
+	// that remembering one takes nothing away from the answer under the key
+	// above; see `cache.make_key`.
+	vkey_buf:  [cache.KEY_MAX]u8,
+	vkey:      string,
 }
 
 @(private = "file")
@@ -245,6 +251,7 @@ fixture_start :: proc(t: ^testing.T, f: ^Fixture, answer_keys: bool, serve_stale
 	f.validator = dnssec.make_validator(validator_query, &f.server, dnssec.Options{})
 	f.server.validator = f.validator
 	f.key = cache.make_key(f.key_buf[:], BOGUS_NAME, .A, .IN, false, false)
+	f.vkey = cache.make_key(f.vkey_buf[:], BOGUS_NAME, .A, .IN, false, false, verdict = true)
 
 	f.worker = thread.create_and_start_with_poly_data(&f.mock, counting_mock_serve)
 	return true
@@ -302,18 +309,33 @@ test_a_bogus_verdict_is_not_asked_of_the_upstream_twice :: proc(t: ^testing.T) {
 
 	// What the entry holds is the refusal and not the answer that failed: the
 	// unvalidated data must not be anywhere a later hit could reach it.
-	stored, _, found := cache.get(f.answers, f.key, context.temp_allocator)
+	stored, _, found := cache.get(f.answers, f.vkey, context.temp_allocator)
 	if testing.expect(t, found, "the verdict was not remembered") {
 		testing.expect(t, is_servfail(stored), "the answer that did not validate was stored")
 		testing.expect(t, stored[6] == 0 && stored[7] == 0, "the stored refusal carries an answer section")
 	}
 
+	counted := cache.stats(f.answers)
 	second, again, served_again := handle_query(&f.server, query, .UDP, "test", context.temp_allocator)
 	testing.expect(t, served_again, "no response was produced for the second query")
 	testing.expect_value(t, again, Outcome.Failed)
 	testing.expect(t, is_servfail(second), "the second query was not refused")
 	// The whole of it: the second client query cost nothing upstream.
 	testing.expect_value(t, sync.atomic_load(&f.mock.seen), asked)
+
+	/*
+	And it cost the cache's own numbers one lookup rather than two.
+
+	The verdict is looked for under a key of its own, after the answer cache has
+	already been asked and has already counted what it found, so it is asked for
+	as a `probe` and counted in neither direction. Counted, one query would show
+	up as two misses and the identity an operator reads these numbers by - hits
+	and misses are what the queries came to - would stop holding on exactly the
+	traffic this change is about.
+	*/
+	settled := cache.stats(f.answers)
+	testing.expect_value(t, settled.misses - counted.misses, 1)
+	testing.expect_value(t, settled.hits, counted.hits)
 
 	/*
 	And the explanation survives the entry, whoever caused it.
@@ -396,7 +418,7 @@ test_a_verdict_that_could_not_be_reached_is_not_remembered :: proc(t: ^testing.T
 	testing.expect_value(t, outcome, Outcome.Failed)
 	testing.expect(t, is_servfail(first), "the query was not refused")
 
-	_, _, found := cache.get(f.answers, f.key, context.temp_allocator)
+	_, _, found := cache.get(f.answers, f.vkey, context.temp_allocator)
 	testing.expect(t, !found, "a walk this server could not finish was stored as a verdict")
 
 	asked := sync.atomic_load(&f.mock.seen)
@@ -412,17 +434,19 @@ test_a_verdict_that_could_not_be_reached_is_not_remembered :: proc(t: ^testing.T
 }
 
 /*
-The memory gives way to what `serve_stale` is holding.
+The memory is kept without taking the answer `serve_stale` is holding.
 
-`cache.put` replaces whatever is under the key, and on this path what is under
-the key is the expired answer kept for exactly the outage that may be starting.
-A zone midway through a key rollover is the common cause of a `Bogus` verdict
-and also the moment an operator most wants RFC 8767's fallback intact, so the
-verdict is not written down while there is something to fall back on: this name
-goes on costing what it cost before.
+An entry replaces what is under its key, so a verdict filed under the question's
+own key would throw away the expired answer being kept for exactly the outage
+that may be starting - and a verdict that gave way to that answer instead would
+leave a name somebody controls costing an upstream exchange per query for as
+long as `cache.MAX_STALE`, which is the whole of what this is about. They are
+wanted at once and they answer different minutes, so the verdict has a key of
+its own: it refuses the next minute of queries, and what is under the question's
+key is still there to cover the upstream going down after that.
 */
 @(test)
-test_a_verdict_does_not_evict_the_answer_kept_for_an_outage :: proc(t: ^testing.T) {
+test_a_verdict_is_remembered_without_taking_the_answer_kept_for_an_outage :: proc(t: ^testing.T) {
 	f: Fixture
 	if !fixture_start(t, &f, answer_keys = true, serve_stale = true) {
 		return
@@ -452,16 +476,30 @@ test_a_verdict_does_not_evict_the_answer_kept_for_an_outage :: proc(t: ^testing.
 	testing.expect_value(t, outcome, Outcome.Failed)
 	testing.expect(t, is_servfail(out), "the query was not refused")
 
-	stored, hit, found := cache.get(f.answers, f.key, context.temp_allocator)
-	if testing.expect(t, found, "the expired answer was dropped along with the verdict") {
-		testing.expect(t, hit.stale, "the entry is no longer the expired answer")
+	kept, hit, found := cache.get(f.answers, f.key, context.temp_allocator)
+	if testing.expect(t, found, "the expired answer was dropped when the verdict was written down") {
+		testing.expect(t, hit.stale, "the entry under the question's key is no longer the expired answer")
 		testing.expect(t, !hit.bogus, "the verdict replaced the answer being kept for an outage")
 		testing.expect(
 			t,
-			len(stored) >= dns.HEADER_SIZE && stored[7] == 1,
-			"what is left under the key is not the answer that was there",
+			len(kept) >= dns.HEADER_SIZE && kept[7] == 1,
+			"what is left under the question's key is not the answer that was there",
 		)
 	}
+
+	// And the verdict was written down all the same, which is the half that
+	// giving way to the expired answer would have cost.
+	verdict, vhit, remembered := cache.get(f.answers, f.vkey, context.temp_allocator)
+	if testing.expect(t, remembered, "the verdict was not remembered beside the expired answer") {
+		testing.expect(t, vhit.bogus, "what is under the verdict key is not a verdict")
+		testing.expect(t, is_servfail(verdict), "the verdict is not a refusal")
+	}
+
+	asked := sync.atomic_load(&f.mock.seen)
+	_, again, served_again := handle_query(&f.server, bogus_client_query(), .UDP, "test", context.temp_allocator)
+	testing.expect(t, served_again, "no response was produced for the second query")
+	testing.expect_value(t, again, Outcome.Failed)
+	testing.expect_value(t, sync.atomic_load(&f.mock.seen), asked)
 
 	free_all(context.temp_allocator)
 }

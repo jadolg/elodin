@@ -1218,6 +1218,19 @@ resolve_query :: proc(
 
 	key_buf: [cache.KEY_MAX]u8
 	key := cache.make_key(key_buf[:], q.name, q.type, q.class, dns.edns_do(msg), msg.flags.cd)
+	// Where a `Bogus` verdict for this question is remembered, if one was
+	// reached. A key of its own so that the memory costs the answer under the
+	// question's own key nothing; see `remember_bogus_verdict`.
+	verdict_buf: [cache.KEY_MAX]u8
+	verdict_key := cache.make_key(
+		verdict_buf[:],
+		q.name,
+		q.type,
+		q.class,
+		dns.edns_do(msg),
+		msg.flags.cd,
+		verdict = true,
+	)
 
 	/*
 	Which rule sets an answer is matched against here, read once and used for
@@ -1267,36 +1280,44 @@ resolve_query :: proc(
 				serial  = hit.serial,
 				checked = generation,
 			}
-			switch {
-			/*
-			A remembered `Bogus` verdict is served as the refusal it is and
-			never as an answer - the bytes are this server's own SERVFAIL. See
-			the store in the validating branch below.
-
-			An expired one is dropped rather than kept as the stale fallback. A
-			verdict is not data to cover an outage with, which is the reading
-			`serve_stale` is given where the upstream fails below: the client is
-			told SERVFAIL either way, and holding a minute-old refusal for a day
-			to say it would be the memory outliving the thing it remembered.
-			*/
-			case hit.bogus:
-				/*
-				And only while this request would have reached a verdict of its
-				own. `validating` is recomputed per query - a validator switched
-				off by a reload, a zone an operator has since routed or
-				anchored - and the entry carries no record of the rules it was
-				refused under, so serving it to a request that is not being
-				validated would be a verdict outliving the configuration that
-				reached it. Ignored rather than dropped: the query goes upstream
-				as a miss would, and the answer it brings back replaces this.
-				*/
-				if !hit.stale && validating {
-					return serve_bogus_verdict(s, stored, query, msg, q, proto, client, started)
-				}
-			case !hit.stale:
+			if !hit.stale {
 				return serve_from_cache(s, stored, query, msg, q, proto, client, limit, validating, started, allocator)
-			case:
-				stale_hit = stored
+			}
+			stale_hit = stored
+		}
+
+		/*
+		And the verdict, for a question the answer cache could not answer.
+
+		Second, because an answer is what the client asked for: a name whose
+		entry is live is served from it, and only a question that would
+		otherwise go to an upstream is worth asking this. That ordering also
+		says what happens when a verdict and a fresh answer exist at once - the
+		answer wins, which is the right way round for a zone that has been
+		fixed and re-fetched by a request the verdict did not apply to.
+
+		Only while this request would have reached a verdict of its own.
+		`validating` is recomputed per query - a validator switched off by a
+		reload, a zone an operator has since routed or anchored - and the entry
+		carries no record of the rules it was refused under, so serving it to a
+		request that is not being validated would be a verdict outliving the
+		configuration that reached it.
+
+		An expired one is passed over rather than lent out as the stale
+		fallback. A verdict is not data to cover an outage with, which is the
+		reading `serve_stale` is given where the upstream fails below: the
+		client is told SERVFAIL either way, and holding a minute-old refusal for
+		a day to say it would be the memory outliving the thing it remembered.
+		*/
+		if validating {
+			if wire, hit, found := cache.get(s.answers, verdict_key, allocator, probe = true);
+			   found && !hit.stale {
+				remembered := Cached_Answer {
+					wire   = wire,
+					key    = verdict_key,
+					serial = hit.serial,
+				}
+				return serve_bogus_verdict(s, remembered, query, msg, q, proto, client, started)
 			}
 		}
 	}
@@ -2013,7 +2034,7 @@ resolve_query :: proc(
 			from := answering_upstream(winner)
 			report_bogus(q, client, result, from)
 			out, built := dnssec_failure_response(msg, result, allocator, limit)
-			remember_bogus_verdict(s, key, msg, result, stale_hit, unproven_apex_ds, allocator)
+			remember_bogus_verdict(s, verdict_key, msg, result, unproven_apex_ds, allocator)
 			log_query(s, client, proto, q, .Failed, fmt.tprintf("dnssec:%s", from), started)
 			return out, .Failed, built
 		case .Secure:
@@ -2702,19 +2723,23 @@ transient this procedure declines to memoise at the `Unreadable` verdict and at
 `unproven_apex_ds`, and it is why the budget case is dangerous rather than
 merely wasteful: heavy load would convert itself into refusals.
 
-An answer with a stale entry behind it. `cache.put` replaces what is under the
-key, and on this path what is under the key is the expired answer `serve_stale`
-was holding for exactly the outage that may be starting. A zone mid key-rollover
-is the common cause of a `Bogus` verdict and also the moment an operator most
-wants RFC 8767's fallback intact, so the memory gives way to it: while there is
-something expired to fall back on, this name costs what it cost before.
-
 A routed apex `DS` nothing proved, on the terms the two stores below give: an
 answer that stood in for a statement the parent never made is not one to hand to
 the next client with the parent still unasked.
 
 And a refusal that would not encode, which is what the build below is checked
 for - `cache.put` refuses a truncated one for the same reason.
+
+Under a key of its own (`cache.make_key`'s `verdict`), which is what lets this
+be remembered at all without taking something away. An entry replaces what is
+under its key, and what is under the question's own key here is the expired
+answer `serve_stale` is holding for exactly the outage that may be starting - a
+zone midway through a key rollover is the common cause of a verdict and the
+moment RFC 8767's fallback is worth most. Both are wanted, and they answer
+different minutes: the verdict is what the next one is answered with, and the
+expired answer is what covers the upstream being down after it runs out.
+Sharing the key would have made that a choice between refusing cheaply for a
+minute and keeping a fallback for a day, and it is not one.
 
 The copy that is kept is built here rather than taken from the client's: this
 one carries the extended error whoever caused the fetch, and is built to no
@@ -2730,14 +2755,13 @@ other entry.
 @(private)
 remember_bogus_verdict :: proc(
 	s: ^Server,
-	key: string,
+	verdict_key: string,
 	msg: dns.Message,
 	result: dnssec.Result,
-	stale_hit: Cached_Answer,
 	unproven_apex_ds: bool,
 	allocator: mem.Allocator,
 ) {
-	if !s.cfg.cache.enabled || result.status != .Bogus || stale_hit.wire != nil || unproven_apex_ds {
+	if !s.cfg.cache.enabled || result.status != .Bogus || unproven_apex_ds {
 		return
 	}
 	asked := msg
@@ -2758,7 +2782,7 @@ remember_bogus_verdict :: proc(
 	if derr != .None {
 		return
 	}
-	cache.put(s.answers, key, wire, refusal, bogus = true)
+	cache.put(s.answers, verdict_key, wire, refusal, bogus = true)
 }
 
 /*
@@ -2795,6 +2819,14 @@ serve_bogus_verdict :: proc(
 ) {
 	sync.atomic_add(&s.stats.bogus, 1)
 	sync.atomic_add(&s.stats.failed, 1)
+	/*
+	Not counted as `cached`, and nothing to reconcile: the client was refused
+	rather than answered, and the lookup that found these bytes was a `probe`,
+	which the cache counts in neither direction. `note_withheld` is what the
+	paths that take a *counted* hit and then decline to serve it use - the cloak
+	refusal, the unreadable-entry drop - and it is not needed here because there
+	is no hit on the books to account for.
+	*/
 	wire := hit.wire
 	dns.set_id_in_place(wire, msg.id)
 	dns.copy_question_case(wire, query)
