@@ -573,7 +573,7 @@ pc_section :: proc(
 			}
 		}
 		if matched < 0 {
-			pc_missing(c, q, kind, name, u.rec, u.index, up, el, policy)
+			pc_missing(c, q, kind, name, u.rec, u.index, up, el, el_recs, policy)
 			continue
 		}
 		taken[matched] = true
@@ -620,9 +620,47 @@ pc_missing :: proc(
 	// elodin's packing it would have gone.
 	index: int,
 	up, el: Pw_Msg,
+	// What elodin wrote in this same section, for the signature allowance
+	// below: a record can only be "the same set signed again" if the set is
+	// there to compare it against.
+	el_recs: []Pw_RR,
 	policy: Parity_Policy,
 ) {
 	what := fmt.aprintf("a record missing from the %s section", name, allocator = c.allocator)
+
+	/*
+	The upstream signed the same RRset again between the two fetches.
+
+	The same argument the ttl allowance makes, reached by a different road: the
+	reference and this answer are two separate fetches, and a zone signed on the
+	fly mints a signature per query. Cloudflare's are the ones in reach of the
+	generator - `ietf.org` answers with an inception and expiration that move
+	with the clock - so the bytes cannot be equal and neither side is wrong.
+	Two fetches a second apart came back with windows 53 seconds apart, which is
+	what this is.
+
+	Matched on what identifies the RRset rather than on what signs it: the type
+	covered, the algorithm, the label count, the original ttl, the key tag and
+	the signer are the signature's account of *which set by which key*, and
+	those a re-mint keeps. What it is allowed to change is the validity window
+	and the signature itself, and nothing else - a record whose covered type or
+	signer moved is not the same set signed again, and is still a difference.
+
+	So this cannot hide the thing the section is checked for. An RRSIG elodin
+	dropped is still reported: there is nothing in its section carrying the same
+	identity for this to find.
+	*/
+	if rec.type == 46 && pc_signed_again(rec, el_recs) {
+		pc_add(
+			c,
+			kind,
+			what,
+			pw_rr_key(rec, c.allocator),
+			"-",
+			"the zone signs on the fly, and the reference and this answer are two separate fetches, so the same rrset came back under a signature minted at a different moment",
+		)
+		return
+	}
 
 	// Cut to fit a datagram, with TC set so the client comes back over TCP.
 	if el.tc && !up.tc && policy.transport == .UDP {
@@ -951,6 +989,91 @@ pc_added_record_allowance :: proc(
 		return "the soa that anchors a denial of existence, which comes back with the proof this server asked for"
 	}
 	return ""
+}
+
+/*
+Whether elodin's own section carries this signature's RRset, signed again.
+
+The identity fields of RFC 4034 section 3.1: type covered, algorithm, labels and
+original ttl are the first eight bytes of the RDATA, the key tag is the two at
+offset sixteen, and the signer's name follows at eighteen, uncompressed
+(section 3.1.7) - so it can be walked and compared where it stands. The eight
+bytes between them are the expiration and the inception, and everything past the
+signer is the signature; those are what a re-mint is allowed to move.
+*/
+@(private = "file")
+pc_signed_again :: proc(rec: Pw_RR, el_recs: []Pw_RR) -> bool {
+	for e in el_recs {
+		if e.type != rec.type || e.class != rec.class {
+			continue
+		}
+		if !pc_name_equal_fold(e.name, rec.name) {
+			continue
+		}
+		if pc_same_signed_set(rec.rdata, e.rdata) {
+			return true
+		}
+	}
+	return false
+}
+
+@(private = "file")
+pc_same_signed_set :: proc(a, b: []u8) -> bool {
+	// Eight fixed bytes, eight of validity, two of key tag, then the signer.
+	if len(a) < 18 || len(b) < 18 {
+		return false
+	}
+	if !pc_bytes_equal(a[:8], b[:8]) || !pc_bytes_equal(a[16:18], b[16:18]) {
+		return false
+	}
+	a_end, a_ok := pc_name_end(a, 18)
+	b_end, b_ok := pc_name_end(b, 18)
+	if !a_ok || !b_ok {
+		return false
+	}
+	return pc_name_equal_fold(a[18:a_end], b[18:b_end])
+}
+
+// Where an uncompressed name ends. A pointer is not legal in RRSIG RDATA and is
+// refused rather than followed: this reads one record's rdata and has no
+// message to follow it into.
+@(private = "file")
+pc_name_end :: proc(buf: []u8, start: int) -> (end: int, ok: bool) {
+	i := start
+	for i < len(buf) {
+		length := int(buf[i])
+		if length == 0 {
+			return i + 1, true
+		}
+		if length >= 0xc0 {
+			return 0, false
+		}
+		i += 1 + length
+	}
+	return 0, false
+}
+
+// The signer name in an RRSIG's rdata, held to the case-insensitive comparison
+// RFC 1035 section 2.3.3 gives every name. `pc_bytes_equal` below is the rest
+// of the record, where a byte is a byte.
+@(private = "file")
+pc_name_equal_fold :: proc(a, b: []u8) -> bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i in 0 ..< len(a) {
+		x, y := a[i], b[i]
+		if x >= 'A' && x <= 'Z' {
+			x += 32
+		}
+		if y >= 'A' && y <= 'Z' {
+			y += 32
+		}
+		if x != y {
+			return false
+		}
+	}
+	return true
 }
 
 @(private = "file")

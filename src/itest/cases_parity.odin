@@ -61,6 +61,18 @@ Parity_Stats :: struct {
 	// The reference was unusable: the mock never saw the query, or the live
 	// resolver disagreed with itself.
 	skipped:    int,
+	/*
+	Differences the upstream turned out to produce itself: asked again the way
+	elodin asks it, it gave the answer elodin gave. See `upstream_also_says`.
+
+	Counted apart from `skipped` because it is a different statement. A skip
+	says the run could not establish a reference; this says it established one,
+	found a difference against it, and then watched the upstream produce that
+	same difference on its own. A run where this climbs is worth looking at -
+	it is upstream behaviour, but it is also the number that would hide a real
+	divergence if something ever made it large.
+	*/
+	upstream_split: int,
 	failures:   int,
 	/*
 	Queries sent over each transport.
@@ -479,6 +491,34 @@ parity_one_live :: proc(
 			}
 		}
 		if attempt == 1 {
+			/*
+			Unless the upstream is what differs.
+
+			The two reference asks above establish that the resolver answers
+			this question the same way twice - as the *client* asks it. A
+			validating elodin does not ask it that way: RFC 4035 section 3.2.2
+			has it set CD so it reaches its own verdict rather than inheriting
+			the upstream's, and a resolver keeps what it has not validated
+			apart from what it has. So the copy elodin is handed comes out of a
+			pool the stability check never looked in.
+
+			Where a zone is served by providers that do not agree - `github.com`
+			answers from Route53 and from NS1 with different SOA records - that
+			pool can hold both, and 1.1.1.1 hands back whichever, while the
+			CD=0 answer the reference asked for stays on one of them. The
+			difference is then real, reproducible, and produced entirely by the
+			upstream: elodin forwarded what it was given.
+
+			So a difference that survived both attempts is held against the
+			question asked the way elodin asks it, and reported only if the
+			upstream answers *that* consistently too. One extra pair of
+			exchanges per divergence, which is what the retry above already
+			costs, and none at all for a run that finds nothing.
+			*/
+			if upstream_also_says(host, port, q, c.answer, policy) {
+				stats.upstream_split += 1
+				return
+			}
 			parity_report_diffs(r, q, c, opts, stats, index)
 		}
 	}
@@ -543,6 +583,63 @@ parity_live_attempt :: proc(
 		}
 	}
 	return .Compared, c
+}
+
+/*
+Whether the upstream itself produces the answer elodin gave.
+
+`parity_live_attempt` establishes the reference by asking twice with the
+client's own query, and a difference that survives two attempts is real in the
+sense that the bytes differed. It is not yet this server's: a live resolver
+answers from whichever anycast node took the query, rotates an RRset between two
+datagrams and keeps what it has not validated apart from what it has - and
+elodin's copy comes down a path the reference asks never touch, because RFC 4035
+section 3.2.2 has a validating resolver set CD to reach its own verdict rather
+than inherit the upstream's.
+
+Both halves of that were measured rather than supposed. `github.com` answers
+from Route53 and from NS1 with different SOA records, and 1.1.1.1 hands back
+either of them under CD while holding to one without it; `github.com A` rotates
+its addresses between nodes, so the reference settles on one and elodin is
+given another. Neither is something this server did.
+
+So the question is asked again, the way elodin asks it, and the answers are held
+against *elodin's* rather than against each other: an upstream that produces the
+same answer at all has produced the difference, and there is nothing here to
+report. Three asks, because one is the coin landing the same way twice and the
+run must not become a way to lose real divergences in retries.
+
+Held to the same policy as the comparison it is excusing, so a probe cannot
+agree by a rule the reference was not judged by. A probe that will not complete
+proves nothing and does not excuse anything.
+*/
+@(private = "file")
+upstream_also_says :: proc(
+	host: string,
+	port: int,
+	q: Parity_Query,
+	answer: []u8,
+	policy: Parity_Policy,
+) -> bool {
+	if len(q.wire) < 4 || len(answer) == 0 {
+		return false
+	}
+	asked := make([]u8, len(q.wire), context.temp_allocator)
+	copy(asked, q.wire)
+	// CD, the fifth bit of the second flags byte (RFC 1035 section 4.1.1 as
+	// extended by RFC 4035 section 3.2.2).
+	asked[3] |= 0x10
+	for _ in 0 ..< 3 {
+		probe, ok := parity_ask_reference(host, port, asked)
+		if !ok {
+			return false
+		}
+		c := parity_compare(q, probe, answer, policy)
+		if !parity_failed(c.diffs[:]) {
+			return true
+		}
+	}
+	return false
 }
 
 /*

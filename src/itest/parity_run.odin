@@ -392,6 +392,7 @@ parity_report :: proc(r: ^Runner, opts: Parity_Options, stats: Parity_Stats) {
 	fmt.printfln("    answered here %d", stats.local)
 	fmt.printfln("    unanswered    %d", stats.unanswered)
 	fmt.printfln("    skipped       %d", stats.skipped)
+	fmt.printfln("    upstream split %d", stats.upstream_split)
 	fmt.printfln("    diverged      %d", stats.failures)
 	fmt.printf("    transports    ")
 	for count, transport in stats.transports {
