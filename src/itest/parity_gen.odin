@@ -458,7 +458,10 @@ pg_randomise_case :: proc(r: ^Pg_Rand, name: []u8) {
 
 // --- encoding --------------------------------------------------------------
 
-@(private = "file")
+// Package-visible rather than file-private: `upstream_also_says` builds the
+// query elodin forwards out of the one the client sent, and the encoding of a
+// `Parity_Query` is this file's to define wherever it is needed.
+@(private)
 pg_encode :: proc(q: Parity_Query, allocator: mem.Allocator) -> []u8 {
 	buf := make([dynamic]u8, 0, 128, allocator)
 

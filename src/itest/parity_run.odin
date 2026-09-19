@@ -369,6 +369,35 @@ parity_report :: proc(r: ^Runner, opts: Parity_Options, stats: Parity_Stats) {
 		)
 	}
 
+	/*
+	A run that excused most of its differences is not a run that passed either.
+
+	`upstream_split` is a difference the upstream was shown to produce itself,
+	and on a healthy run it is a handful in a thousand - the sweep this was
+	written against saw one or two per two hundred queries. What it must not
+	become is the place divergences go to be forgotten: the probe agreeing for
+	some reason of its own, or a change to what it asks, would turn every real
+	finding into a silent skip and the run would still print PASS.
+
+	So it is held to the same shape as the coverage floor below, a quarter, and
+	it is printed on every run rather than only under `-v` - a count that is
+	only visible when somebody already suspects something is not a check.
+	*/
+	if stats.upstream_split > 0 {
+		fmt.printfln(
+			"  %d difference(s) were the upstream's own, asked again the way this server asks it",
+			stats.upstream_split,
+		)
+	}
+	if stats.compared > 0 && stats.upstream_split * 4 > stats.compared {
+		fail(
+			r,
+			"%d of %d compared queries were excused as the upstream disagreeing with itself; the reference is not one",
+			stats.upstream_split,
+			stats.compared,
+		)
+	}
+
 	// A run that compared almost nothing is not a run that passed. The floor is
 	// deliberately low - the live mode legitimately skips unstable names, and
 	// some generated questions are answered locally - but a mode that compared
@@ -392,7 +421,7 @@ parity_report :: proc(r: ^Runner, opts: Parity_Options, stats: Parity_Stats) {
 	fmt.printfln("    answered here %d", stats.local)
 	fmt.printfln("    unanswered    %d", stats.unanswered)
 	fmt.printfln("    skipped       %d", stats.skipped)
-	fmt.printfln("    upstream split %d", stats.upstream_split)
+	fmt.printfln("    split upstream %d", stats.upstream_split)
 	fmt.printfln("    diverged      %d", stats.failures)
 	fmt.printf("    transports    ")
 	for count, transport in stats.transports {

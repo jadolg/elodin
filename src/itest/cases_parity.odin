@@ -511,9 +511,10 @@ parity_one_live :: proc(
 
 			So a difference that survived both attempts is held against the
 			question asked the way elodin asks it, and reported only if the
-			upstream answers *that* consistently too. One extra pair of
-			exchanges per divergence, which is what the retry above already
-			costs, and none at all for a run that finds nothing.
+			upstream answers *that* consistently too. Up to five further
+			exchanges, paid on a divergence and never on a query that agreed -
+			the same trade the retry above makes, which is why it is affordable
+			at all.
 			*/
 			if upstream_also_says(host, port, q, c.answer, policy) {
 				stats.upstream_split += 1
@@ -606,8 +607,13 @@ given another. Neither is something this server did.
 So the question is asked again, the way elodin asks it, and the answers are held
 against *elodin's* rather than against each other: an upstream that produces the
 same answer at all has produced the difference, and there is nothing here to
-report. Three asks, because one is the coin landing the same way twice and the
-run must not become a way to lose real divergences in retries.
+report.
+
+Five asks, because the disagreements this is for are not coin flips. 1.1.1.1
+answers `github.com` with NS1's copy about one time in three and Route53's the
+rest, so three asks miss it about three times in ten and the run reports a
+difference the upstream made. Five brings that under one in seven, and they are
+paid only where something already diverged.
 
 Held to the same policy as the comparison it is excusing, so a probe cannot
 agree by a rule the reference was not judged by. A probe that will not complete
@@ -624,12 +630,30 @@ upstream_also_says :: proc(
 	if len(q.wire) < 4 || len(answer) == 0 {
 		return false
 	}
-	asked := make([]u8, len(q.wire), context.temp_allocator)
-	copy(asked, q.wire)
-	// CD, the fifth bit of the second flags byte (RFC 1035 section 4.1.1 as
-	// extended by RFC 4035 section 3.2.2).
-	asked[3] |= 0x10
-	for _ in 0 ..< 3 {
+	/*
+	Built from the question rather than by flipping a bit in it, because the
+	forwarded query differs from the client's in more than CD.
+	`server.dnssec_upstream_query` puts an OPT record on it carrying DO and
+	`server.UPSTREAM_UDP_SIZE`, whatever the client sent - and DO is as much a
+	part of what a resolver answers from as CD is, which elodin's own cache says
+	out loud by keying on both. The generator sets DO on well under half the
+	queries it makes, so a probe that only set CD would still be asking in the
+	other half about a pool neither side used.
+
+	The client's own options go no further than elodin sends them: the cookie
+	and any ECS are stripped before forwarding, so a probe carrying them would
+	be asking a question this server never asks.
+	*/
+	forwarded := q
+	forwarded.cd = true
+	forwarded.edns = true
+	forwarded.do_bit = true
+	// `server.UPSTREAM_UDP_SIZE`, which is not this package's to import.
+	forwarded.udp_size = 1232
+	forwarded.options = nil
+	asked := pg_encode(forwarded, context.temp_allocator)
+	seen := make([dynamic][]u8, 0, 5, context.temp_allocator)
+	for _ in 0 ..< 5 {
 		probe, ok := parity_ask_reference(host, port, asked)
 		if !ok {
 			return false
@@ -638,6 +662,24 @@ upstream_also_says :: proc(
 		if !parity_failed(c.diffs[:]) {
 			return true
 		}
+		/*
+		Or the upstream does not hold still at all.
+
+		The probes are held against each other as well as against elodin,
+		because the upstream's answer varies in ways this one question cannot
+		show: `org.` bumps its SOA serial every few minutes and 1.1.1.1 keeps
+		copies from three different moments, and a copy carrying fewer records
+		fits a client's datagram where the full proof does not - so the
+		reference truncates on one ask and not on the next. Neither difference
+		has to look like elodin's answer to be the upstream's doing, and a rule
+		that only recognised its own reflection would report both.
+		*/
+		for earlier in seen[:] {
+			if !parity_stable_twice(earlier, probe) {
+				return true
+			}
+		}
+		append(&seen, probe)
 	}
 	return false
 }

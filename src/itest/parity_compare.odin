@@ -606,8 +606,9 @@ pc_section :: proc(
 /*
 A record the upstream sent and elodin did not.
 
-Allowed in exactly four situations, and none of them is "the record looked
-unimportant".
+Allowed in exactly five situations, and none of them is "the record looked
+unimportant". Their order is not arbitrary: each names a cause, except the last,
+which names a consequence and so goes last - see the note on it.
 */
 @(private = "file")
 pc_missing :: proc(
@@ -627,40 +628,6 @@ pc_missing :: proc(
 	policy: Parity_Policy,
 ) {
 	what := fmt.aprintf("a record missing from the %s section", name, allocator = c.allocator)
-
-	/*
-	The upstream signed the same RRset again between the two fetches.
-
-	The same argument the ttl allowance makes, reached by a different road: the
-	reference and this answer are two separate fetches, and a zone signed on the
-	fly mints a signature per query. Cloudflare's are the ones in reach of the
-	generator - `ietf.org` answers with an inception and expiration that move
-	with the clock - so the bytes cannot be equal and neither side is wrong.
-	Two fetches a second apart came back with windows 53 seconds apart, which is
-	what this is.
-
-	Matched on what identifies the RRset rather than on what signs it: the type
-	covered, the algorithm, the label count, the original ttl, the key tag and
-	the signer are the signature's account of *which set by which key*, and
-	those a re-mint keeps. What it is allowed to change is the validity window
-	and the signature itself, and nothing else - a record whose covered type or
-	signer moved is not the same set signed again, and is still a difference.
-
-	So this cannot hide the thing the section is checked for. An RRSIG elodin
-	dropped is still reported: there is nothing in its section carrying the same
-	identity for this to find.
-	*/
-	if rec.type == 46 && pc_signed_again(rec, el_recs) {
-		pc_add(
-			c,
-			kind,
-			what,
-			pw_rr_key(rec, c.allocator),
-			"-",
-			"the zone signs on the fly, and the reference and this answer are two separate fetches, so the same rrset came back under a signature minted at a different moment",
-		)
-		return
-	}
 
 	// Cut to fit a datagram, with TC set so the client comes back over TCP.
 	if el.tc && !up.tc && policy.transport == .UDP {
@@ -718,9 +685,43 @@ pc_missing :: proc(
 	}
 
 	/*
+	The upstream signed the same RRset again between the two fetches.
+
+	The same argument the ttl allowance makes, reached by a different road: the
+	reference and this answer are two separate fetches, and a zone signed on the
+	fly mints a signature per query. Cloudflare's are the ones in reach of the
+	generator - `ietf.org` answers with an inception and expiration that move
+	with the clock - so the bytes cannot be equal and neither side is wrong.
+	Two fetches a second apart came back with windows 53 seconds apart, which is
+	what this is.
+
+	Matched on what identifies the RRset rather than on what signs it: the type
+	covered, the algorithm, the label count, the original ttl, the key tag and
+	the signer are the signature's account of *which set by which key*, and
+	those a re-mint keeps. What it is allowed to change is the validity window
+	and the signature itself, and nothing else - a record whose covered type or
+	signer moved is not the same set signed again, and is still a difference.
+
+	So this cannot hide the thing the section is checked for. An RRSIG elodin
+	dropped is still reported: there is nothing in its section carrying the same
+	identity for this to find.
+	*/
+	if policy.mode == .Live && rec.type == 46 && pc_signed_again(rec, el_recs) {
+		pc_add(
+			c,
+			kind,
+			what,
+			pw_rr_key(rec, c.allocator),
+			"-",
+			"the zone signs on the fly, and the reference and this answer are two separate fetches, so the same rrset came back under a signature minted at a different moment",
+		)
+		return
+	}
+
+	/*
 	Cut to fit a datagram from the additional section, where no TC bit says so.
 
-	Last of the four, because the others name a cause and this one names a
+	Last of the five, because the others name a cause and this one names a
 	consequence. A DNSSEC record a client did not ask for was gone before the
 	answer was ever fitted into a datagram, and an answer near the ceiling
 	would otherwise tally it here - `parity_tally` groups by reason, and a
@@ -1021,6 +1022,21 @@ pc_signed_again :: proc(rec: Pw_RR, el_recs: []Pw_RR) -> bool {
 pc_same_signed_set :: proc(a, b: []u8) -> bool {
 	// Eight fixed bytes, eight of validity, two of key tag, then the signer.
 	if len(a) < 18 || len(b) < 18 {
+		return false
+	}
+	/*
+	And the same length, which is the whole of what is left to check.
+
+	Everything past the signer is the signature, and a key signing the same set
+	again produces one of exactly the same size - the algorithm and the modulus
+	decide it, not the moment. Without this the allowance would excuse an RRSIG
+	whose signature came back truncated or empty, and `pc_added_record_allowance`
+	already excuses every dnssec record on the other side of the comparison, so
+	between them a mangled signature would pass through the gate unnamed. What
+	this does not check is the signature's content, which no comparison here
+	could: two mints over the same set differ in every byte of it.
+	*/
+	if len(a) != len(b) {
 		return false
 	}
 	if !pc_bytes_equal(a[:8], b[:8]) || !pc_bytes_equal(a[16:18], b[16:18]) {
