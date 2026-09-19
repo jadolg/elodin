@@ -307,7 +307,14 @@ Dnssec_Config :: struct {
 	client picking names whose upper labels are fresh holds every worker there
 	(issue #356). Past this many, a walk reads the caches and answers SERVFAIL
 	where it would have gone upstream, which is what an upstream that did not
-	answer already produces.
+	answer already produces - and that covers every cold name while it binds,
+	unsigned ones included, since a zone cannot be known to be unsigned without
+	the DS lookup that shows it.
+
+	Counted for queries on the shared handler pool only, which is UDP and
+	HTTP/2. The others answer on the connection's own thread and are bounded by
+	`server.max_connections` instead, so they hold no worker anybody is waiting
+	for and are never turned away.
 
 	Zero, the default, is `server.workers` less a reserved quarter of them, so
 	some are always free to answer what needs no walk. It is exposed because the

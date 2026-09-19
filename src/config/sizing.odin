@@ -172,7 +172,10 @@ Handlers kept back from the chain walk.
 
 The chain walk blocks the worker answering the client, once per label of a name
 the client chose, so without a bound a flood of fresh names holds every worker
-and the resolver stops answering anything at all (issue #356). What has to be
+and the resolver stops answering anything at all (issue #356). "Worker" is the
+shared pool - UDP and HTTP/2 - which is why this is derived from `workers`: the
+stream transports answer on a thread per connection and are bounded by
+`max_connections`, and a walk there holds nothing anybody else is waiting for. What has to be
 guaranteed is that some workers are always free to answer - a cache hit, a name
 already validated, a question with no DNSSEC in it - and that is a *reservation*
 rather than a ceiling.

@@ -124,7 +124,9 @@ Validator :: struct {
 	`MAX_CACHED_NON_CUTS` says why, and #356 is the record of it.
 
 	So the bound is not on the walk but on how many of them may be doing this at
-	once. Past `max_chain_walks`, a walk runs against the caches alone and
+	once - and only on the ones that hold a worker of the shared pool, since a
+	query answered on its own connection thread costs nobody else an answer
+	however long it takes (`Budget.own_thread`). Past `max_chain_walks`, a walk runs against the caches alone and
 	answers `Indeterminate` where it would have gone upstream - the same verdict,
 	and the same extended error, that an upstream which did not answer produces.
 	The flood then costs a fixed number of threads rather than all of them, which
@@ -134,15 +136,27 @@ Validator :: struct {
 	into the walk, so a walk both caches can answer never asks for one and a
 	flood holding every slot cannot stop it.
 
-	What such a flood *does* stop, and it is worth being exact because it is more
-	than it sounds: any walk that needs even one round trip. A cached apex is not
-	enough on its own - a name below it still costs a DS per label to rule out a
-	cut, and only the non-cut memo makes those free - so while every slot is held,
-	a hostname nobody has asked for before under a zone this resolver knows well
-	comes back SERVFAIL. `test_a_shed_walk_below_a_warm_apex_still_stops` pins
-	that shape so nobody has to rediscover it. It is the trade #356 asks for -
-	the alternative is every thread held and nothing answered at all - and it is
-	why `max_chain_walks` is an operator's number rather than only ours.
+	What such a flood *does* stop, and it is worth being exact because it is much
+	more than it sounds: any walk that needs even one round trip, which is very
+	nearly every cold name there is.
+
+	Two steps to that. A cached apex is not a cached name - a name below one
+	still costs a DS per label to rule out a cut, and only the non-cut memo makes
+	those free - so a hostname nobody has asked for before under a zone this
+	resolver knows well is refused.
+	`test_a_shed_walk_below_a_warm_apex_still_stops` pins that. And an *unsigned*
+	name is refused with it: `zone_step` cannot say `.Insecure` without the DS
+	lookup that proves there is no delegation, so a name that would have been
+	served insecure comes back SERVFAIL instead.
+	`test_a_shed_walk_cannot_tell_an_unsigned_zone_from_a_signed_one` pins that
+	one. So while every slot is held, what still answers is what both caches
+	hold, and nothing else.
+
+	That is why the bound is a reservation rather than a ceiling, and why it is
+	spent only by queries holding a worker somebody else is waiting for - see
+	`Budget.own_thread`. It is still the trade #356 asks for, the alternative
+	being every thread held and nothing answered at all, and it is why
+	`max_chain_walks` is an operator's number rather than only ours.
 	*/
 	walks:                int,
 	max_chain_walks:      int,
@@ -333,6 +347,15 @@ Budget :: struct {
 	hand.
 	*/
 	keep_slot:     bool,
+	/*
+	Whether this query has a thread nothing else is waiting for.
+
+	The bound exists to keep a *shared* pool of workers from being held by
+	chain walks; a query answered on its own connection thread cannot hold a
+	worker anybody else wants, so it takes no slot and is never turned away. See
+	`Validator.walks`.
+	*/
+	own_thread:    bool,
 	// The hashing a denial proved with NSEC3 may spend, which no count of
 	// lookups or verifications bounds: see `MAX_NSEC3_ROUNDS_PER_QUERY`.
 	nsec3:         Nsec3_Budget,
@@ -751,6 +774,16 @@ validate :: proc(
 	wire: []u8,
 	now: time.Time,
 	allocator := context.temp_allocator,
+	/*
+	False for a question answered on a thread of its own, which is every
+	transport but UDP and HTTP/2 - see `Validator.walks`. Such a query is never
+	turned away for want of a slot, because holding its own thread costs nobody
+	else an answer.
+
+	Defaulted to the bounded reading, so a caller that has not thought about it
+	gets the guard rather than silently opting out of it.
+	*/
+	shared_worker := true,
 ) -> Result {
 	msg, derr := dns.decode_message(wire, allocator)
 	if derr != .None {
@@ -766,6 +799,7 @@ validate :: proc(
 	at all, so a slot can never outlive the question that took it.
 	*/
 	budget.keep_slot = true
+	budget.own_thread = !shared_worker
 	defer end_walk(v, &budget)
 
 	/*
@@ -2885,15 +2919,21 @@ the number moving on a resolver working perfectly.
 */
 @(private)
 may_look_up :: proc(v: ^Validator, budget: ^Budget) -> bool {
-	if budget.holds_walk {
+	if budget.holds_walk || budget.own_thread {
 		return true
 	}
 	if take_walk_slot(v) {
 		budget.holds_walk = true
 		return true
 	}
+	// Once per query, not once per walk. A shed query holds no slot, so every
+	// walk it goes on to try is refused too - a single question would move the
+	// counter five or ten times, and the number an operator reads against a
+	// SERVFAIL rise would be several times what happened.
+	if !budget.shed_walk {
+		sync.atomic_add(&v.shed, 1)
+	}
 	budget.shed_walk = true
-	sync.atomic_add(&v.shed, 1)
 	return false
 }
 

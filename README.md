@@ -959,12 +959,24 @@ walking, so a flood is answered rather than absorbed. That is the trade — work
 starvation for upstream volume, degraded rather than down — and an operator who
 would rather cap the volume sets a smaller number here.
 
-What the bound costs while it binds is more than the flood's own names: a cached
-apex is not a cached name, so a hostname nobody has asked for before under a zone
-this resolver knows well is SERVFAIL too. `elodin_dnssec_walks_shed_total` counts
-the walks that stopped, and a resolver nobody is flooding should read zero — if it
-does not, honest cache-miss load is being refused and the number wants raising.
-The startup log names the number in use.
+It applies to queries answered on a worker of the shared pool, which is UDP and
+DoH over HTTP/2. TCP, DoT and DoH over HTTP/1.1 answer on the connection's own
+thread and are bounded by `max_connections` instead, so a slow walk there delays
+that client and nobody else; they are never turned away for want of a slot.
+
+What the bound costs while it binds is much more than the flood's own names, and
+it is worth reading before choosing a number. A cached apex is not a cached name
+— a name below one still costs a DS lookup per label — and a cold name in an
+*unsigned* zone costs one too, because there is no way to know a zone is unsigned
+without asking for the DS and being shown there is none. So while every slot is
+held, what still answers is what the caches hold: every other cold name is
+SERVFAIL, signed or not.
+
+`elodin_dnssec_walks_shed_total` counts the queries that stopped, and a resolver
+nobody is flooding should read zero — if it does not, honest cache-miss load is
+being refused and the number wants raising. `--check` and the startup log both
+name the number in use, and startup warns if it is large enough to leave no
+workers reserved at all, which is the bound switched off.
 
 One thing the number does not account for: with `strategy: race`, a walk waiting
 on an upstream also holds one job per candidate server in the racer pool

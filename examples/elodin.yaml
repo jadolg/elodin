@@ -436,12 +436,15 @@ dnssec:
   #
   # 0 is server.workers less a reserved quarter of them: the point is to keep
   # some workers always free to answer what needs no walk, not to cap what this
-  # resolver validates. Raise it if elodin_dnssec_walks_shed_total is moving on
-  # a resolver nobody is flooding — that is honest cache-miss load being refused
-  # — and lower it to cap the upstream volume a flood can provoke, which the
-  # reservation on its own does not. With strategy: race the bound covers
-  # handler threads only: a walk waiting on an upstream also holds one racer job
-  # per candidate server, so raise upstream_workers with the number of upstreams.
+  # resolver validates. It applies to UDP and DoH/2, which share that pool; TCP,
+  # DoT and DoH/1.1 answer on the connection's own thread and are never turned
+  # away. While it binds, every cold name is SERVFAIL — including names in
+  # unsigned zones, since a zone cannot be known to be unsigned without the DS
+  # lookup that shows it. Raise it if elodin_dnssec_walks_shed_total is moving on
+  # a resolver nobody is flooding, and lower it to cap the upstream volume a
+  # flood can provoke, which the reservation on its own does not. With
+  # strategy: race a walk also holds one racer job per candidate server, so
+  # raise upstream_workers with the number of upstreams.
   # max_chain_walks: 0
 
 cookies:

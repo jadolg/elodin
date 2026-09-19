@@ -114,6 +114,26 @@ start_validator :: proc(s: ^Server) -> bool {
 		return false
 	}
 
+	/*
+	A number that leaves no reservation is the bound switched off, and #356 with
+	it: the walks are what hold the workers, so allowing as many walks as there
+	are workers allows a client to hold all of them.
+
+	Said rather than refused or held down, which is this file's rule for a
+	configured number everywhere else: an operator who names a figure gets it. A
+	resolver that will not start, or one quietly running at a number nobody
+	chose, is worse than one that says what it is doing. The comparison is
+	against the handler pool because that is what the bound protects - see
+	`handle_query`'s `shared_worker`.
+	*/
+	if s.cfg.dnssec.max_chain_walks >= s.cfg.server.workers {
+		logx.warnf(
+			"dnssec: max_chain_walks %d leaves none of the %d workers reserved, so a flood of fresh names can hold them all; see issue #356",
+			s.cfg.dnssec.max_chain_walks,
+			s.cfg.server.workers,
+		)
+	}
+
 	s.validator = dnssec.make_validator(
 		validator_query,
 		s,
@@ -187,9 +207,15 @@ produces.
 
 Not only the flood's own names, and the difference is worth knowing before
 setting the number: a walk needs a DS lookup at every label below the deepest
-zone it has cached, so while every slot is held, a hostname nobody has asked for
-before under a warm signed zone is SERVFAIL as well. See `Validator.walks`,
-`dnssec.max_chain_walks` and issue #356.
+zone it has cached, and it cannot call a zone unsigned without one either - so
+while every slot is held, what still answers is what the caches hold, and every
+other cold name is SERVFAIL, signed or not.
+
+Which is why only a query on a pool worker spends a slot. The bound is there to
+keep these workers free; a question answered on its own connection thread is
+bounded by `max_connections` instead and is never turned away. See
+`handle_query`'s `shared_worker`, `Validator.walks`, `dnssec.max_chain_walks`
+and issue #356.
 */
 @(private)
 validator_query :: proc(

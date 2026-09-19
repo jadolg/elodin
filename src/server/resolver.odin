@@ -259,6 +259,20 @@ handle_query :: proc(
 	proto: Protocol,
 	client: string,
 	allocator := context.allocator,
+	/*
+	Whether this call is running on a worker of the shared pool.
+
+	True for UDP and for HTTP/2, which hand their work to `handler_pool`; false
+	for TCP, DoT and HTTP/1.1, which answer on the connection's own thread and
+	are bounded by `max_connections` instead. The only thing that reads it is
+	the DNSSEC chain-walk bound, which exists to keep pool workers free and has
+	no business turning away a query that holds a thread nobody is waiting for.
+	See `dnssec.Validator.walks`.
+
+	Defaulted to the pooled reading so that a caller which has not thought about
+	it gets the guard; the four that have say so.
+	*/
+	shared_worker := true,
 ) -> (
 	response: []u8,
 	outcome: Outcome,
@@ -366,7 +380,18 @@ handle_query :: proc(
 		log_query(s, client, proto, q, .Refused, "edns", started)
 		response, outcome, ok = out, .Refused, built
 	} else {
-		response, outcome, ok = resolve_query(s, query, msg, proto, client, limit, cookie, started, allocator)
+		response, outcome, ok = resolve_query(
+			s,
+			query,
+			msg,
+			proto,
+			client,
+			limit,
+			cookie,
+			started,
+			allocator,
+			shared_worker,
+		)
 	}
 	if ok {
 		/*
@@ -1017,6 +1042,9 @@ resolve_query :: proc(
 	cookie: Cookie_Request,
 	started: time.Time,
 	allocator: mem.Allocator,
+	// See `handle_query`: whether a worker of the shared pool is what this is
+	// holding.
+	shared_worker: bool,
 ) -> (
 	response: []u8,
 	outcome: Outcome,
@@ -1978,7 +2006,15 @@ resolve_query :: proc(
 	dns.set_id_in_place(resp, msg.id)
 
 	if validating {
-		result := dnssec.validate(s.validator, q.name, q.type, resp, time.now(), allocator)
+		result := dnssec.validate(
+			s.validator,
+			q.name,
+			q.type,
+			resp,
+			time.now(),
+			allocator,
+			shared_worker = shared_worker,
+		)
 		#partial switch result.status {
 		case .Bogus, .Indeterminate:
 			sync.atomic_add(&s.stats.bogus, 1)

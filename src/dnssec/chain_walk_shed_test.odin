@@ -404,3 +404,86 @@ test_a_walk_this_server_shed_is_not_called_a_forgery :: proc(t: ^testing.T) {
 	testing.expect_value(t, reason, WALKS_IN_FLIGHT)
 	free_all(context.temp_allocator)
 }
+
+/*
+And a shed walk cannot tell an unsigned zone from a signed one, so it refuses
+that too.
+
+The half of the blast radius that is easiest to miss. `zone_step` reaches
+`.Insecure` only by asking for the DS and reading a proof that there is no
+delegation, so a walk with no slot has no way to say "this name is in an
+unsigned zone, forward the answer". It says `Indeterminate`, and the client gets
+SERVFAIL for a name that has nothing to do with DNSSEC at all.
+
+Which makes the real cost of a full table "every cold name", not "every cold
+signed name" - the thing an operator sizing `dnssec.max_chain_walks` has to know,
+and the reason the bound reserves workers rather than capping them.
+*/
+@(test)
+test_a_shed_walk_cannot_tell_an_unsigned_zone_from_a_signed_one :: proc(t: ^testing.T) {
+	up := Slow_Upstream{}
+	v := make_validator(captured_query, nil, Options{max_chain_walks = 1})
+	defer destroy_validator(v)
+
+	now := time.unix(FIXTURE_TIME, 0)
+	// The chain above the name is known and signed; what is not known is
+	// whether anything is delegated below it, which is the DS lookup.
+	keys := []Dnskey{}
+	cache_put(v, ".", .Secure, keys, MAX_ZONE_TTL, now)
+	cache_put(v, "com.", .Secure, keys, MAX_ZONE_TTL, now)
+
+	testing.expect(t, take_walk_slot(v), "the one slot should be free")
+	defer drop_walk_slot(v)
+
+	budget := query_budget(v)
+	status, _, _ := zone_trust(v, &budget, "unsigned.example.com.", now, context.temp_allocator)
+	// Not `.Insecure`, which is the answer that would have been forwarded.
+	testing.expect_value(t, status, Status.Indeterminate)
+	testing.expect_value(t, walk_reason(&budget), WALKS_IN_FLIGHT)
+
+	sync.mutex_lock(&up.mu)
+	calls := up.calls
+	sync.mutex_unlock(&up.mu)
+	testing.expectf(t, calls == 0, "a shed walk should reach no upstream, it reached one %d times", calls)
+	free_all(context.temp_allocator)
+}
+
+/*
+A question answered on its own connection thread is never turned away.
+
+TCP, DoT and HTTP/1.1 answer on the connection's thread rather than on a worker
+of the shared pool - `max_connections` is what bounds them - so a walk there
+holds nothing anybody else is waiting for, and the bound has no business
+refusing it. Without this, a hundred DoT clients asking cold names on a
+sixteen-worker box would have had most of them refused with no attacker present
+at all.
+*/
+@(test)
+test_a_query_on_its_own_thread_is_never_shed :: proc(t: ^testing.T) {
+	up := Slow_Upstream{}
+	v := make_validator(slow_query, &up, Options{max_chain_walks = 1})
+	defer destroy_validator(v)
+
+	now := time.unix(FIXTURE_TIME, 0)
+	// Every slot taken, which is the flood at its worst.
+	testing.expect(t, take_walk_slot(v), "the one slot should be free")
+	defer drop_walk_slot(v)
+
+	budget := query_budget(v)
+	budget.own_thread = true
+	// Released before the walk, so this reaches the upstream rather than
+	// waiting on it: what is on trial is whether it was allowed to ask at all.
+	sync.atomic_store(&up.released, true)
+	status, _, _ := zone_trust(v, &budget, "a.b.c.example.com.", now, context.temp_allocator)
+
+	sync.mutex_lock(&up.mu)
+	calls := up.calls
+	sync.mutex_unlock(&up.mu)
+	testing.expectf(t, calls > 0, "the walk should have reached the upstream, it asked %d times", calls)
+	// The upstream answered nothing, so the walk ends there - but it ends
+	// having asked, and saying so, rather than refused for want of a slot.
+	testing.expect_value(t, status, Status.Indeterminate)
+	testing.expect(t, walk_reason(&budget) != WALKS_IN_FLIGHT, "a query on its own thread should never be shed")
+	testing.expect_value(t, walks_shed(v), u64(0))
+	free_all(context.temp_allocator)
+}
