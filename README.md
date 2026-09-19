@@ -2112,6 +2112,7 @@ as a warning at startup.
 | `elodin_rate_limited_total` | counter | queries the rate limiter withheld an answer from |
 | `elodin_rate_limit_slipped_total` | counter | those answered truncated instead, to send a real client to TCP |
 | `elodin_dnssec_answers_total{result}` | counter | `secure` and `bogus` |
+| `elodin_dnssec_walks_shed_total` | counter | chain-of-trust walks that read the caches only, because half the workers were already walking one upstream. Zero on a resolver nobody is flooding; rising alongside SERVFAIL means the shedding is this server's, not an upstream going away |
 | `elodin_rebind_refused_total` | counter | answers withheld because a public name was pointed into private space |
 | `elodin_special_use_total` | counter | queries answered from the reserved-name table instead of being forwarded |
 | `elodin_cache_entries` / `_bytes` | gauge | what the cache holds, against `max_entries` and `max_bytes` |

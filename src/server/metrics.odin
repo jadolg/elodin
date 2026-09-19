@@ -6,6 +6,7 @@ import "core:strings"
 import "core:sync"
 import "core:time"
 import "elodin:cache"
+import "elodin:dnssec"
 import "elodin:filter"
 import "elodin:logx"
 import "elodin:metrics"
@@ -540,6 +541,18 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 	metrics.family(&b, "elodin_dnssec_answers_total", .Counter, "Answers by what validation made of them.")
 	metrics.sample(&b, "elodin_dnssec_answers_total", st.secure, metrics.Label{"result", "secure"})
 	metrics.sample(&b, "elodin_dnssec_answers_total", st.bogus, metrics.Label{"result", "bogus"})
+	// Zero on a resolver nobody is flooding, and the only aggregate evidence
+	// that a rise in SERVFAIL is this server shedding rather than an upstream
+	// going away. See `Validator.walks` in src/dnssec/validate.odin.
+	if s.validator != nil {
+		metrics.scalar(
+			&b,
+			"elodin_dnssec_walks_shed_total",
+			.Counter,
+			"Chain-of-trust walks that read the caches only, because as many were already going upstream as this server allows at once.",
+			dnssec.walks_shed(s.validator),
+		)
+	}
 
 	render_udp_metrics(&b, l)
 

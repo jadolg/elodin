@@ -117,7 +117,11 @@ start_validator :: proc(s: ^Server) -> bool {
 	s.validator = dnssec.make_validator(
 		validator_query,
 		s,
-		dnssec.Options{anchors = anchors, max_nsec3_iterations = s.cfg.dnssec.max_nsec3_iterations},
+		dnssec.Options {
+			anchors = anchors,
+			max_nsec3_iterations = s.cfg.dnssec.max_nsec3_iterations,
+			max_chain_walks = max(1, s.cfg.server.workers / 2),
+		},
 	)
 	logx.infof(
 		"dnssec: validating against %d trust anchor(s)",
@@ -162,6 +166,13 @@ Runs on the handler thread that is already answering a client, so it borrows
 that request's arena and blocks on the same upstream group. Racing upstreams
 submit to their own pool, so there is no way for this to wait on a worker it is
 occupying.
+
+It is still a worker held for a round trip, and a chain walk makes one of these
+per label. What stops a client choosing how many workers are held that way is
+`Options.max_chain_walks` above: half the pool, so the other half keeps
+answering while a flood holds its half. The walks past it read the caches and
+give up where they would have called this, which the client sees as the SERVFAIL
+an unreachable authority produces. See `Validator.walks` and issue #356.
 */
 @(private)
 validator_query :: proc(
