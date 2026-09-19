@@ -541,9 +541,11 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 	metrics.family(&b, "elodin_dnssec_answers_total", .Counter, "Answers by what validation made of them.")
 	metrics.sample(&b, "elodin_dnssec_answers_total", st.secure, metrics.Label{"result", "secure"})
 	metrics.sample(&b, "elodin_dnssec_answers_total", st.bogus, metrics.Label{"result", "bogus"})
-	// Zero on a resolver nobody is flooding, and the only aggregate evidence
-	// that a rise in SERVFAIL is this server shedding rather than an upstream
-	// going away - the more so because the log line for it is said once. Emitted
+	// The only aggregate evidence that a rise in SERVFAIL is this server shedding
+	// rather than an upstream going away - the more so because the log line for
+	// it is said once. What it cannot say is why the bound was reached: an
+	// attack and honest saturation are the same from in here, and a single slow
+	// upstream reaches it as readily as a flood. Emitted
 	// with validation off as well, like the two above it: a series that
 	// disappears is a dashboard that breaks, and `queries_shed` reads a nil
 	// validator as nought. See `Validator.walks` in src/dnssec.

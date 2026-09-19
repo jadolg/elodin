@@ -446,9 +446,11 @@ dnssec:
   #
   # While it binds, every cold name is SERVFAIL — including names in unsigned
   # zones, since a zone cannot be known to be unsigned without the DS lookup
-  # that shows it. Raise it if elodin_dnssec_queries_shed_total is moving on a
-  # resolver nobody is flooding, and lower it to cap the upstream volume a flood
-  # can provoke, which the reservation on its own does not. With strategy: race
+  # that shows it. elodin_dnssec_queries_shed_total says the bound was reached
+  # but not why — a flood, a cold cache after a restart and one black-holing
+  # upstream all look the same from in here — so check upstream latency first
+  # and raise this if the load turns out to be yours. Lower it to cap the
+  # upstream volume a flood can provoke, which the reservation does not. With strategy: race
   # a walk also holds one racer job per candidate server, so raise
   # upstream_workers with the number of upstreams.
   # max_chain_walks: 0

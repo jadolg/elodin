@@ -324,8 +324,9 @@ Dnssec_Config :: struct {
 	which nothing here bounds. It is exposed because the
 	cost of the number being too small is real - a resolver whose honest
 	cache-miss load is above it turns the surplus into SERVFAIL - and it is not a
-	number anybody here can know. `elodin_dnssec_queries_shed_total` is how an
-	operator finds out they need a bigger one, and a smaller one is how they cap
+	number anybody here can know. `elodin_dnssec_queries_shed_total` says the bound was
+	reached - not why, since an attack and honest saturation are the same from
+	in here - and is how an operator finds out they may need a bigger one, and a smaller one is how they cap
 	the upstream volume a flood can provoke, which the reservation does not.
 	*/
 	max_chain_walks:      int,

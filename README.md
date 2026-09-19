@@ -991,11 +991,16 @@ client's own question. The answer is discarded rather than cached, too, so a
 legitimate cold name asked repeatedly during a flood is re-forwarded and shed
 again each time rather than settling.
 
-`elodin_dnssec_queries_shed_total` counts the queries that stopped, and a resolver
-nobody is flooding should read zero — if it does not, honest cache-miss load is
-being refused and the number wants raising. `--check` and the startup log both
-name the number in use, and startup warns if it is large enough to leave no
-workers reserved at all, which is the bound switched off.
+`elodin_dnssec_queries_shed_total` counts the queries that stopped. It says the
+bound was reached; it does not say why, and nothing here can — an attack and
+honest saturation look identical from inside. A flood is one way to reach it. So
+is a restart with real traffic pointed at a cold cache, and so is one upstream in
+the group black-holing, since every walk then runs to the timeout and holds its
+slot for the whole of it. Read a rising count as "more concurrent cold walks than
+this bound allows" and go looking: if upstream latency is normal and the load is
+yours, the number wants raising. `--check` and the startup log both name the
+number in use, and startup warns if a configured one leaves no workers reserved
+at all, which is the bound switched off.
 
 One thing the number does not account for: with `strategy: race`, a walk waiting
 on an upstream also holds one job per candidate server in the racer pool
@@ -2182,7 +2187,7 @@ as a warning at startup.
 | `elodin_rate_limited_total` | counter | queries the rate limiter withheld an answer from |
 | `elodin_rate_limit_slipped_total` | counter | those answered truncated instead, to send a real client to TCP |
 | `elodin_dnssec_answers_total{result}` | counter | `secure` and `bogus` |
-| `elodin_dnssec_queries_shed_total` | counter | chain-of-trust walks that stopped short of an upstream, because `dnssec.max_chain_walks` were already waiting on one. Zero on a resolver nobody is flooding; rising alongside SERVFAIL means the shedding is this server's, not an upstream going away — and if nobody is flooding it, the bound is too small |
+| `elodin_dnssec_queries_shed_total` | counter | questions whose chain-of-trust walk stopped short of an upstream, because `dnssec.max_chain_walks` were already waiting on one; one per question. Rising alongside SERVFAIL means the shedding is this server's, not an upstream going away — but it cannot tell an attack from honest saturation, and a slow upstream reaches it too. See `dnssec.max_chain_walks` |
 | `elodin_rebind_refused_total` | counter | answers withheld because a public name was pointed into private space |
 | `elodin_special_use_total` | counter | queries answered from the reserved-name table instead of being forwarded |
 | `elodin_cache_entries` / `_bytes` | gauge | what the cache holds, against `max_entries` and `max_bytes` |

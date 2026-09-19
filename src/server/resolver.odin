@@ -2068,7 +2068,6 @@ resolve_query :: proc(
 			`elodin_dnssec_queries_shed_total` is what carries the rest, and
 			`debug` is where an operator asks about a later episode.
 			*/
-			say, first := report_once(&chain_walk_shed_reported, logx.enabled(.Debug))
 			if !shed {
 				logx.warnf(
 					"dnssec: %s %s from %s did not validate: %v (%s); answer came from %s",
@@ -2079,23 +2078,36 @@ resolve_query :: proc(
 					result.reason,
 					from,
 				)
-			} else if first {
-				logx.warnf(
-					"dnssec: %s %s from %s did not validate: %v (%s); this server was already walking as many chains as dnssec.max_chain_walks allows, so it stopped looking. Counted as elodin_dnssec_queries_shed_total; further ones are logged at debug level",
-					dns.type_name(q.type),
-					dns.name_trim_root(q.name),
-					client,
-					result.status,
-					result.reason,
-				)
-			} else if say {
-				logx.debugf(
-					"dnssec: %s %s from %s was not validated: %s",
-					dns.type_name(q.type),
-					dns.name_trim_root(q.name),
-					client,
-					result.reason,
-				)
+			} else {
+				/*
+				Inside the branch, not above it. `report_once` turns the flag as
+				a side effect of being asked, so asking it on every failed
+				validation would let one ordinary bogus answer - an hour after
+				start, from a zone with a broken chain - spend the single line
+				that explains shedding. The flood that followed would then log
+				nothing at all and leave an operator a bare counter. Reached
+				only where a walk was actually shed, it cannot be spent by
+				anything else.
+				*/
+				say, first := report_once(&chain_walk_shed_reported, logx.enabled(.Debug))
+				if first {
+					logx.warnf(
+						"dnssec: %s %s from %s did not validate: %v (%s); this server was already walking as many chains as dnssec.max_chain_walks allows, so it stopped looking. Counted as elodin_dnssec_queries_shed_total; further ones are logged at debug level",
+						dns.type_name(q.type),
+						dns.name_trim_root(q.name),
+						client,
+						result.status,
+						result.reason,
+					)
+				} else if say {
+					logx.debugf(
+						"dnssec: %s %s from %s was not validated: %s",
+						dns.type_name(q.type),
+						dns.name_trim_root(q.name),
+						client,
+						result.reason,
+					)
+				}
 			}
 			out, built := dnssec_failure_response(msg, result, allocator, limit)
 			log_query(s, client, proto, q, .Failed, fmt.tprintf("dnssec:%s", from), started)

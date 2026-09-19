@@ -3287,7 +3287,26 @@ zone_step :: proc(
 			if kstatus == .Bogus {
 				return .Bogus, nil
 			}
-			return walk_gave_up(budget, "chain of trust unavailable"), nil
+			/*
+			Only where nothing more precise was written, as at the root in
+			`zone_trust`. `fetch_keys` says when it was this server's own
+			shedding that stopped it, and overwriting that sends the client a
+			code about the authority - and, worse, hides the reason from
+			`resolve_query`, which reads it to decide whether the query was
+			shed: the answer would be counted as a forgery and logged at `warn`
+			once per query, which is the log amplification the shed path exists
+			to avoid.
+
+			Not reachable today, because `validate` holds one slot for the whole
+			question and `zone_step`'s own DS query always precedes this - so a
+			question that got here was never shed. `Budget.keep_slot` says a
+			caller may walk without that, and the tests do, so the guard is here
+			rather than an argument about why it is not needed.
+			*/
+			if budget.walk_stopped == "" {
+				budget.walk_stopped = "chain of trust unavailable"
+			}
+			return .Indeterminate, nil
 		}
 		cache_put(v, child, .Secure, child_keys, rrset_ttl(ds_records), now)
 		return .Secure, child_keys
