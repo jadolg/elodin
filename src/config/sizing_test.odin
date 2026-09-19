@@ -62,6 +62,84 @@ test_derive_workers_is_capped_by_memory :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_derive_chain_walks_reserves_a_quarter :: proc(t: ^testing.T) {
+	// Everything but a reserved quarter, which is the whole of the shape: the
+	// bound exists to keep workers free, not to cap what the resolver validates.
+	testing.expect_value(t, derive_chain_walks(128), 96)
+	testing.expect_value(t, derive_chain_walks(16), 12)
+	// The floor on the reservation binds on a small pool, where a quarter would
+	// be one worker or none and the resolver would stop answering while it
+	// walked.
+	testing.expect_value(t, derive_chain_walks(8), 6)
+	testing.expect_value(t, derive_chain_walks(4), 2)
+	// And a pool too small to reserve from still walks: the bound is on walks at
+	// once, so zero would be a resolver that validates nothing.
+	testing.expect_value(t, derive_chain_walks(2), 1)
+	testing.expect_value(t, derive_chain_walks(1), 1)
+}
+
+@(test)
+test_chain_walks_are_derived_at_load :: proc(t: ^testing.T) {
+	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\nserver:\n  workers: 16\n", context.temp_allocator)
+	testing.expect(t, err == nil, "expected a clean load")
+	// Derived at load rather than at start-up, so `--check` and the run that
+	// follows it name the same number.
+	testing.expect_value(t, cfg.dnssec.max_chain_walks, derive_chain_walks(16))
+
+	// A number in the file wins, as everywhere else in this file.
+	set, serr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\nserver:\n  workers: 16\ndnssec:\n  max_chain_walks: 3\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, serr == nil, "expected a clean load")
+	testing.expect_value(t, set.dnssec.max_chain_walks, 3)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_connection_walks_are_derived_from_the_connection_limit :: proc(t: ^testing.T) {
+	// Sized from the threads the stream transports actually have, which is
+	// `max_connections` and not the handler pool - two numbers an order of
+	// magnitude apart, so one figure would be wrong at both ends.
+	cfg, err := load_string(
+		"upstream:\n  servers: [1.1.1.1]\nserver:\n  workers: 16\n  max_connections: 512\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, err == nil, "expected a clean load")
+	testing.expect_value(t, cfg.dnssec.max_chain_walks, derive_chain_walks(16))
+	testing.expect_value(t, cfg.dnssec.max_connection_walks, derive_chain_walks(512))
+
+	// And it is a setting, because `max_connections` is the wrong lever: it
+	// would cut how many clients may connect at all.
+	set, serr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  max_connection_walks: 24\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, serr == nil, "expected a clean load")
+	testing.expect_value(t, set.dnssec.max_connection_walks, 24)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_a_negative_chain_walk_bound_is_refused :: proc(t: ^testing.T) {
+	// Not read as one more way of asking for the default: the bound is a
+	// denial-of-service guard, so a number that cannot be one is a mistake to
+	// report rather than to paper over.
+	_, err := load_string(
+		"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  max_chain_walks: -1\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, err != nil, "a negative chain-walk bound should be refused")
+
+	_, cerr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  max_connection_walks: -1\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, cerr != nil, "a negative connection-walk bound should be refused")
+	free_all(context.temp_allocator)
+}
+
+@(test)
 test_derive_upstream_workers_is_half :: proc(t: ^testing.T) {
 	testing.expect_value(t, derive_upstream_workers(128), 64)
 	testing.expect_value(t, derive_upstream_workers(16), 8)

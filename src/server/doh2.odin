@@ -80,6 +80,16 @@ H2_Job :: struct {
 	ctx:       ^H2_Context,
 	h2conn:    ^h2.Conn,
 	req:       ^h2.Request,
+	/*
+	Whether this job is going to run on a worker of the shared pool.
+
+	Normally it is - that is what makes HTTP/2 the one stream transport the
+	DNSSEC chain-walk bound counts against the pool. The shutdown path below
+	answers inline on the connection's reader thread instead, and a query there
+	holds no pool worker, so it must not spend a pool slot. See
+	`handle_query`'s `shared_worker`.
+	*/
+	on_pool:   bool,
 }
 
 // Called by `h2.read_exact` where the preface, a frame header or a frame payload
@@ -167,6 +177,9 @@ h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	job.ctx = ctx
 	job.h2conn = hc
 	job.req = req
+	// Cleared again in the `.Stopped` arm below, which is the one path that
+	// answers without a pool worker.
+	job.on_pool = true
 
 	// The job outlives this call, so it needs its own reference; the pool may
 	// still be running it after the reader thread has gone.
@@ -197,7 +210,9 @@ h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 		free(job)
 		h2_shed(ctx, hc, req)
 	case .Stopped:
-		// Shutting down: answer inline rather than dropping the stream.
+		// Shutting down: answer inline rather than dropping the stream - on this
+		// reader thread rather than a pool worker, which is what `on_pool` says.
+		job.on_pool = false
 		h2_answer(job)
 	}
 }
@@ -314,7 +329,7 @@ h2_answer :: proc(data: rawptr) {
 		free(job)
 	}
 
-	resp, ok := build_h2_response(ctx, req)
+	resp, ok := build_h2_response(ctx, req, job.on_pool)
 	if !ok {
 		return
 	}
@@ -399,7 +414,14 @@ h2_query_message :: proc(
 }
 
 @(private)
-build_h2_response :: proc(ctx: ^H2_Context, req: ^h2.Request) -> (resp: h2.Response, ok: bool) {
+build_h2_response :: proc(
+	ctx: ^H2_Context,
+	req: ^h2.Request,
+	on_pool := true,
+) -> (
+	resp: h2.Response,
+	ok: bool,
+) {
 	path, _ := h2_split_path(req.path)
 
 	mc_path := ctx.server.cfg.listeners.doh.mobileconfig_path
@@ -418,7 +440,14 @@ build_h2_response :: proc(ctx: ^H2_Context, req: ^h2.Request) -> (resp: h2.Respo
 		return h2_error(status, why), true
 	}
 
-	answer, _, handled := handle_query(ctx.server, message, .DoH, ctx.client, context.temp_allocator)
+	answer, _, handled := handle_query(
+		ctx.server,
+		message,
+		.DoH,
+		ctx.client,
+		context.temp_allocator,
+		shared_worker = on_pool,
+	)
 	if !handled || len(answer) == 0 {
 		return h2_error(500, "no response"), true
 	}

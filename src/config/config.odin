@@ -298,6 +298,56 @@ Dnssec_Config :: struct {
 	// unusable, which makes the zone insecure rather than letting it set the
 	// validator an arbitrary amount of work (RFC 9276).
 	max_nsec3_iterations: int,
+	/*
+	Chain-of-trust walks that may be waiting on an upstream at once.
+
+	The chain walk is the one part of validation that blocks the worker already
+	answering a client, and it blocks it once per label of the name being walked.
+	Nothing about the name is this server's to choose, so without a bound a
+	client picking names whose upper labels are fresh holds every worker there
+	(issue #356). Past this many, a walk reads the caches and answers SERVFAIL
+	where it would have gone upstream, which is what an upstream that did not
+	answer already produces - and that covers every cold name while it binds,
+	unsigned ones included, since a zone cannot be known to be unsigned without
+	the DS lookup that shows it.
+
+	This is the bound for the shared handler pool, which is UDP and HTTP/2. The
+	connection transports have one of their own, derived the same way from
+	`server.max_connections` and counted apart, so a flood on one cannot spend
+	the other's allowance. Not a second setting: what sizes it is
+	`server.max_connections`, which already is one.
+
+	Zero, the default, is `server.workers` less a reserved quarter of them, so
+	that quarter cannot be held inside a walk - it turns over in a round trip
+	rather than in the thirty a walk may take. Free of the walk rather than idle:
+	a reserved worker may still be parked on the query's own upstream forward,
+	which nothing here bounds. It is exposed because the
+	cost of the number being too small is real - a resolver whose honest
+	cache-miss load is above it turns the surplus into SERVFAIL - and it is not a
+	number anybody here can know. `elodin_dnssec_queries_shed_total` says the bound was
+	reached - not why, since an attack and honest saturation are the same from
+	in here - and is how an operator finds out they may need a bigger one, and a smaller one is how they cap
+	the upstream volume a flood can provoke, which the reservation does not.
+	*/
+	max_chain_walks:      int,
+	/*
+	The same, for the transports answered on a thread of their own: TCP, DoT and
+	HTTP/1.1.
+
+	A setting of its own because the two are sized by different things and the
+	numbers differ by an order of magnitude - zero derives it from
+	`server.max_connections` the same way `max_chain_walks` is derived from
+	`server.workers`, so the default is 384 against 512 connections where the
+	other is 12 against 16 workers.
+
+	It exists because `server.max_connections` is the wrong lever for the job an
+	operator would reach for it to do. Lowering `max_chain_walks` caps the
+	upstream volume a flood can provoke through the shared pool; without this,
+	the only way to cap the same thing on the stream transports was to cut how
+	many clients may connect at all, which is a price for legitimate traffic
+	that has nothing to do with DNSSEC.
+	*/
+	max_connection_walks: int,
 }
 
 Cookie_Config :: struct {
@@ -1080,6 +1130,10 @@ default_config :: proc() -> Config {
 	c.dnssec = Dnssec_Config {
 		enabled              = true,
 		max_nsec3_iterations = 100,
+		// Derived from `server.workers` and `server.max_connections` at load;
+		// see the fields.
+		max_chain_walks      = 0,
+		max_connection_walks = 0,
 	}
 	c.cookies = Cookie_Config {
 		enabled  = true,

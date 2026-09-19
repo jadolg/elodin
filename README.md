@@ -912,6 +912,8 @@ only while the flood lasts.
 dnssec:
   enabled: true
   max_nsec3_iterations: 100
+  max_chain_walks: 0     # 0 is server.workers less a reserved quarter
+  max_connection_walks: 0 # the same, from server.max_connections
   trust_anchors: []      # empty uses the built-in root keys
 ```
 
@@ -934,6 +936,84 @@ nobody should be publishing. RFC 9276 asks
 zones for zero and the zones still publishing NSEC3 use single digits, so this
 is a guard against a zone that has picked a number nobody should, rather than a
 setting to tune.
+
+`max_chain_walks` is how many chain-of-trust walks may be waiting on an upstream
+at once. Establishing the zone an answer was signed by means one DS lookup per
+label of the name, each a blocking round trip on the worker already answering the
+client, and how many labels there are is the client's to choose — so without a
+bound, a flood of names whose upper labels are fresh holds every worker for the
+better part of a second apiece. Past this many, a walk reads the caches and
+answers SERVFAIL where it would have gone upstream, with the same extended error
+an upstream that did not answer produces. It is never served as insecure: load
+shedding must not be a way to strip a zone's signatures.
+
+Zero, the default, is `server.workers` less a reserved quarter of them (at least
+two). The reserved quarter is free of the *walk*, not idle — one may still be
+parked on the query's own upstream forward, which nothing here bounds — so what
+the reservation buys is that those workers come back in a round trip instead of
+in the thirty a walk may take, and the pool keeps draining its queue. Enough of a
+flood will still fill every worker; what it can no longer do is hold them for a
+walk apiece.
+
+It is a reservation rather than a ceiling on purpose: every cache-missing
+name that is not already known to be no zone cut needs a slot, so a resolver that
+is merely busy — a restart with real traffic pointed at it, where nearly every
+query is a cold walk — would refuse validated answers if the bound were set to
+what a flood should be allowed. Reserving leaves the honest load nearly untouched
+and still denies an attacker the last worker.
+
+What it does not bound tightly is upstream volume: nearly the whole pool may be
+walking, so a flood is answered rather than absorbed. That is the trade — worker
+starvation for upstream volume, degraded rather than down — and an operator who
+would rather cap the volume sets a smaller number here.
+
+There are two of these bounds, and `max_chain_walks` is the one for the shared
+handler pool — UDP and DoH over HTTP/2. TCP, DoT and DoH over HTTP/1.1 answer on
+the connection's own thread and get `max_connection_walks`, derived the same way
+from `server.max_connections` and counted separately, so a flood on one transport
+cannot spend the other's allowance. Two numbers because the two are sized by
+different things: a figure right for sixteen workers would refuse ordinary stream
+traffic, and one right for 512 connections would bound the pool at nothing. The
+defaults differ accordingly — 12 against 16 workers, 384 against 512 connections
+— so lowering one does nothing for the other, and an operator capping the upstream
+volume a flood can provoke has to set both.
+
+What the bound costs while it binds is much more than the flood's own names, and
+it is worth reading before choosing a number. A cached apex is not a cached name
+— a name below one still costs a DS lookup per label — and a cold name in an
+*unsigned* zone costs one too, because there is no way to know a zone is unsigned
+without asking for the DS and being shown there is none. So while every slot is
+held, what still answers is what the caches hold: every other cold name is
+SERVFAIL, signed or not.
+
+One thing shedding does not do is save the forward: the upstream answer is
+already in hand by the time validation runs, so what is saved is the chain walk's
+own DS and DNSKEY lookups — the amplification #356 is about — and not the
+client's own question. The answer is discarded rather than cached, too, so a
+legitimate cold name asked repeatedly during a flood is re-forwarded and shed
+again each time rather than settling.
+
+`elodin_dnssec_queries_shed_total` counts the queries that stopped. It says the
+bound was reached; it does not say why, and nothing here can — an attack and
+honest saturation look identical from inside. A flood is one way to reach it. So
+is a restart with real traffic pointed at a cold cache, and so is one upstream in
+the group black-holing, since every walk then runs to the timeout and holds its
+slot for the whole of it. Read a rising count as "more concurrent cold walks than
+this bound allows" and go looking: if upstream latency is normal and the load is
+yours, the number wants raising. `--check` and the startup log both name the two
+numbers in use, and startup warns if a configured one leaves nothing reserved in
+its own pool, which is that bound switched off. The client is told the answer
+could not be established and no more: which internal limit stopped the walk is in
+the log and the counter, not in the extended error, since it would otherwise tell
+one client how busy this server is with everybody else's traffic.
+
+One thing the number does not account for: with `strategy: race`, a walk waiting
+on an upstream also holds one job per candidate server in the racer pool
+(`server.upstream_workers`), so a group of three upstreams turns each walk into
+three jobs, and the handler threads the reservation was keeping free can still
+queue there. Raise `upstream_workers` with the number of upstreams if that matters
+more than the memory. `failover` and `round_robin` resolve on the calling thread
+and have no racer job to take, so they are unaffected.
 
 A query also has a hashing allowance of its own, and above a ceiling of 255 —
 derived from that allowance, so a build that retunes it says its own number in
@@ -2112,6 +2192,7 @@ as a warning at startup.
 | `elodin_rate_limited_total` | counter | queries the rate limiter withheld an answer from |
 | `elodin_rate_limit_slipped_total` | counter | those answered truncated instead, to send a real client to TCP |
 | `elodin_dnssec_answers_total{result}` | counter | `secure` and `bogus` |
+| `elodin_dnssec_queries_shed_total` | counter | questions whose chain-of-trust walk stopped short of an upstream, because `dnssec.max_chain_walks` were already waiting on one; one per question. Rising alongside SERVFAIL means the shedding is this server's, not an upstream going away — but it cannot tell an attack from honest saturation, and a slow upstream reaches it too. See `dnssec.max_chain_walks` |
 | `elodin_rebind_refused_total` | counter | answers withheld because a public name was pointed into private space |
 | `elodin_special_use_total` | counter | queries answered from the reserved-name table instead of being forwarded |
 | `elodin_cache_entries` / `_bytes` | gauge | what the cache holds, against `max_entries` and `max_bytes` |

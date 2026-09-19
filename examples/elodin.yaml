@@ -427,6 +427,42 @@ dnssec:
   # line in the log naming the number this build computes from its allowance.
   max_nsec3_iterations: 100
 
+  # Chain-of-trust walks that may be waiting on an upstream at once. The walk
+  # blocks the worker answering the client, once per label of the name being
+  # walked, and how many labels there are is the client's to choose — so without
+  # a bound a flood of fresh names holds every worker. Past this many, a walk
+  # reads the caches and answers SERVFAIL where it would have gone upstream,
+  # which is what an upstream that did not answer already produces.
+  #
+  # 0 is server.workers less a reserved quarter of them: the point is to keep
+  # that quarter out of the walk, so it comes back in a round trip rather than
+  # in the thirty a walk may take, not to cap what this resolver validates.
+  #
+  # This is the bound for UDP and DoH/2, which share the handler pool. TCP, DoT
+  # and DoH/1.1 answer on the connection's own thread and get
+  # max_connection_walks below, counted apart so a flood on one transport
+  # cannot spend the other's allowance. The two defaults differ by an order of
+  # magnitude because the thread counts do, so lowering one does nothing for
+  # the other.
+  #
+  # While it binds, every cold name is SERVFAIL — including names in unsigned
+  # zones, since a zone cannot be known to be unsigned without the DS lookup
+  # that shows it. elodin_dnssec_queries_shed_total says the bound was reached
+  # but not why — a flood, a cold cache after a restart and one black-holing
+  # upstream all look the same from in here — so check upstream latency first
+  # and raise this if the load turns out to be yours. Lower it to cap the
+  # upstream volume a flood can provoke, which the reservation does not. With strategy: race
+  # a walk also holds one racer job per candidate server, so raise
+  # upstream_workers with the number of upstreams.
+  # max_chain_walks: 0
+
+  # The same for TCP, DoT and DoH/1.1, which answer on the connection's own
+  # thread. 0 is server.max_connections less a reserved quarter — 384 at the
+  # default 512. Set this rather than cutting max_connections when what you want
+  # is less upstream volume: max_connections decides how many clients may
+  # connect at all, which is a price legitimate traffic pays for nothing.
+  # max_connection_walks: 0
+
 cookies:
   # Clients that send a DNS cookie get one back (RFC 7873). It costs one hash
   # per query and it takes forging an answer to a client on this network from

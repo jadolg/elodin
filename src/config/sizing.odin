@@ -101,6 +101,8 @@ Sizing :: struct {
 	machine:                  Machine,
 	derived_workers:          bool,
 	derived_upstream_workers: bool,
+	derived_chain_walks:      bool,
+	derived_connection_walks: bool,
 	derived_udp_readers:      bool,
 }
 
@@ -165,6 +167,77 @@ races does not queue behind itself.
 */
 derive_upstream_workers :: proc(workers: int) -> int {
 	return max(workers / 2, 1)
+}
+
+/*
+Handlers kept back from the chain walk.
+
+The chain walk blocks the worker answering the client, once per label of a name
+the client chose, so without a bound a flood of fresh names holds every worker
+and the resolver stops answering anything at all (issue #356). This is called twice, with the size
+of each pool a query can be answered on: `workers` for the shared one, which is
+UDP and HTTP/2, and `max_connections` for the thread-per-connection transports.
+Two bounds rather than one because the numbers differ by an order of magnitude
+and a single figure is wrong at both ends - and counted apart so a flood on one
+transport cannot spend the other's allowance. What has to be
+guaranteed is that most of the pool keeps *turning over* - and that is a
+*reservation* rather than a ceiling.
+
+Turning over, not idle, and the difference is worth stating because the wrong
+reading oversells this. The reserved workers are free of the *walk*, not free of
+work: one may be parked on the query's own upstream forward, which takes no slot
+and is not bounded here. What the reservation buys is that at most
+`max_chain_walks` of them can be inside a chain walk, and a walk is up to
+`MAX_LOOKUPS_PER_QUERY` round trips against a forward's one - so the rest come
+back in a round trip rather than in a second, and the pool keeps draining its
+queue instead of standing still. Enough of a flood will still fill every worker
+and shed at `try_submit`; what it can no longer do is hold them for thirty round
+trips apiece, which is the whole of #356.
+
+Stated this way round on purpose. A ceiling of half the pool also caps honest
+throughput at half, and the walks past it are answered SERVFAIL: every
+cache-missing name that is not in the non-cut memo needs a slot, so a resolver
+that is merely busy - a restart with real traffic pointed at it, where nearly
+every query is a cold walk - would refuse validated answers that resolved fine
+before. Reserving instead leaves the honest load nearly untouched and still
+denies an attacker the last worker.
+
+A quarter, and never fewer than two. The reserved workers serve what needs no
+walk, which is mostly cache hits at tens of microseconds but also ordinary
+forwarding at an upstream round trip, so the number has to be enough to keep
+that moving rather than merely non-zero: a quarter of the derived floor is four,
+which is some hundreds of forwards a second, and a quarter of the ceiling is
+thirty-two.
+
+What this does not bound tightly is upstream volume - #356's other cost - since
+nearly the whole pool may still be walking. That is the trade the issue asks for
+in as many words: worker starvation traded for upstream volume, which is the
+difference between a resolver degraded and one down. An operator who would
+rather cap the volume has `dnssec.max_chain_walks` to name a smaller number
+with.
+*/
+RESERVED_HANDLERS_SHARE :: 4
+MIN_RESERVED_HANDLERS :: 2
+
+/*
+Chain-of-trust walks that may be waiting on an upstream at once.
+
+Everything but the reservation above. At least one whatever the arithmetic says:
+a one-worker configuration still has to be able to walk a chain, since the bound
+is on walks at once rather than on walks.
+
+Deliberately not clamped to `upstream_workers`. A walk waiting on an upstream
+holds a racer job per candidate server under `strategy: race`, so the racer pool
+is a second resource this can exhaust - but the clamp cannot be right: the
+candidate count is not known here, so it is too loose for a group of three
+upstreams and, worse, it binds on the strategies that use no racer at all.
+`failover` and `round_robin` resolve on the calling thread, so an operator
+trimming `upstream_workers` on one of those would have silently cut the chain
+walks with it. The racer interaction is in the README, where the number of
+upstreams is known.
+*/
+derive_chain_walks :: proc(threads: int) -> int {
+	return max(threads - max(threads / RESERVED_HANDLERS_SHARE, MIN_RESERVED_HANDLERS), 1)
 }
 
 // What this process can see of the machine, at the moment it asks.
