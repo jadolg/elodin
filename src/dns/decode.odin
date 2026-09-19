@@ -134,6 +134,14 @@ r_name :: proc(r: ^Reader, allocator: mem.Allocator) -> (name: string, err: Deco
 		return
 	}
 	if err = charge_name(r, len(name)); err != .None {
+		// The one place a name is decoded and then not kept, so the one place
+		// that has to hand it back. An allocator that takes things back is not
+		// what this decoder is normally fed - a caller serving a query hands it
+		// an arena and drops the lot - and a decode that fails anywhere leaves
+		// everything before it unreachable for the same reason. That is the
+		// contract rather than this procedure's business; dropping a name it
+		// has in hand would be.
+		delete(name, allocator)
 		return "", err
 	}
 	r.pos = next
