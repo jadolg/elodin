@@ -912,7 +912,7 @@ only while the flood lasts.
 dnssec:
   enabled: true
   max_nsec3_iterations: 100
-  max_chain_walks: 0     # 0 is half of server.workers
+  max_chain_walks: 0     # 0 is server.workers less a reserved quarter
   trust_anchors: []      # empty uses the built-in root keys
 ```
 
@@ -946,22 +946,33 @@ answers SERVFAIL where it would have gone upstream, with the same extended error
 an upstream that did not answer produces. It is never served as insecure: load
 shedding must not be a way to strip a zone's signatures.
 
-Zero, the default, is half of `server.workers`, held down to `upstream_workers`
-— a flood then costs half the pool and the other half keeps answering. What the
-bound costs while it binds is more than the flood's own names: a cached apex is
-not a cached name, so a hostname nobody has asked for before under a zone this
-resolver knows well is SERVFAIL too. `elodin_dnssec_walks_shed_total` counts the
-walks that stopped, and a resolver nobody is flooding should read zero — if it
+Zero, the default, is `server.workers` less a reserved quarter of them (at least
+two). It is a reservation rather than a ceiling on purpose: every cache-missing
+name that is not already known to be no zone cut needs a slot, so a resolver that
+is merely busy — a restart with real traffic pointed at it, where nearly every
+query is a cold walk — would refuse validated answers if the bound were set to
+what a flood should be allowed. Reserving leaves the honest load nearly untouched
+and still denies an attacker the last worker.
+
+What it does not bound tightly is upstream volume: nearly the whole pool may be
+walking, so a flood is answered rather than absorbed. That is the trade — worker
+starvation for upstream volume, degraded rather than down — and an operator who
+would rather cap the volume sets a smaller number here.
+
+What the bound costs while it binds is more than the flood's own names: a cached
+apex is not a cached name, so a hostname nobody has asked for before under a zone
+this resolver knows well is SERVFAIL too. `elodin_dnssec_walks_shed_total` counts
+the walks that stopped, and a resolver nobody is flooding should read zero — if it
 does not, honest cache-miss load is being refused and the number wants raising.
 The startup log names the number in use.
 
-With `strategy: race` the half-the-pool figure is the handler pool only. A walk
-waiting on an upstream also holds one job per candidate server in the racer pool
+One thing the number does not account for: with `strategy: race`, a walk waiting
+on an upstream also holds one job per candidate server in the racer pool
 (`server.upstream_workers`), so a group of three upstreams turns each walk into
-three jobs, and the handler threads the bound was keeping free can still queue
-there. Raise `upstream_workers` with the number of upstreams if that matters
-more than the memory; `failover` submits one at a time and does not have this
-shape.
+three jobs, and the handler threads the reservation was keeping free can still
+queue there. Raise `upstream_workers` with the number of upstreams if that matters
+more than the memory. `failover` and `round_robin` resolve on the calling thread
+and have no racer job to take, so they are unaffected.
 
 A query also has a hashing allowance of its own, and above a ceiling of 255 —
 derived from that allowance, so a build that retunes it says its own number in

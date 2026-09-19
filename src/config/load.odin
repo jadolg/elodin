@@ -2362,11 +2362,11 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	`--check` and the run that follows it have to agree, and an operator told to
 	raise a number has to be able to see what it currently is.
 
-	Both worker counts are settled by now, which is why it is derived after
-	them. See `derive_chain_walks`.
+	The worker count is settled by now, which is why it is derived after it. See
+	`derive_chain_walks`.
 	*/
 	if cfg.dnssec.max_chain_walks == 0 {
-		cfg.dnssec.max_chain_walks = derive_chain_walks(cfg.server.workers, cfg.server.upstream_workers)
+		cfg.dnssec.max_chain_walks = derive_chain_walks(cfg.server.workers)
 	}
 	/*
 	The UDP readers, sized the same way and reported the same way.

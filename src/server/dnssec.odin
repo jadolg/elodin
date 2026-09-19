@@ -125,11 +125,16 @@ start_validator :: proc(s: ^Server) -> bool {
 	)
 	// The bound is named here because it is the number an operator watching
 	// `elodin_dnssec_walks_shed_total` rise is being told to raise, and
-	// `config.derive_chain_walks` usually picked it rather than the file.
+	// `config.derive_chain_walks` usually picked it rather than the file. Read
+	// back off the validator rather than off the configuration: a validator
+	// built from a configuration that never went through `config.validate` -
+	// which is every one the tests assemble by hand - substitutes its own
+	// default, and a log line naming a number nothing is using is worse than no
+	// line at all.
 	logx.infof(
 		"dnssec: validating against %d trust anchor(s), at most %d chain walks upstream at once",
 		len(anchors) if len(anchors) > 0 else len(dnssec.root_anchors()),
-		s.cfg.dnssec.max_chain_walks,
+		dnssec.chain_walk_limit(s.validator),
 	)
 	return true
 }
@@ -173,10 +178,12 @@ occupying.
 
 It is still a worker held for a round trip, and a chain walk makes one of these
 per label of a name the client chose. What stops a client choosing how many
-workers are held that way is `configured_chain_walks` above: half the pool by
-default, so the other half keeps answering while a flood holds its half. A walk
-past the bound reads the caches and gives up where it would have called this,
-which the client sees as the SERVFAIL an unreachable authority produces.
+workers are held that way is `dnssec.max_chain_walks`, which
+`config.derive_chain_walks` sets to everything but a reserved quarter of the
+pool: that quarter is always free to answer what needs no walk, whatever a flood
+is doing. A walk past the bound reads the caches and gives up where it would
+have called this, which the client sees as the SERVFAIL an unreachable authority
+produces.
 
 Not only the flood's own names, and the difference is worth knowing before
 setting the number: a walk needs a DS lookup at every label below the deepest

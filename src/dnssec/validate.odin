@@ -315,6 +315,24 @@ Budget :: struct {
 	forgery while this server is refusing itself lookups is worth that.
 	*/
 	shed_walk:     bool,
+	/*
+	Whether the slot outlives each walk, which is the caller saying it will give
+	it back itself.
+
+	`validate` sets this, because the verdict is the query's and not any one
+	walk's: one answer can need a walk per signer and another to the owner, and
+	a query whose first walk spent real round trips must not have its second
+	turned away and the traffic thrown out - the whole answer is SERVFAIL either
+	way. Holding it across the query costs no extra round trips, since
+	`MAX_LOOKUPS_PER_QUERY` bounds those whatever the slot does, and it makes the
+	slot mean what the bound is about: a handler thread inside a validation that
+	has gone upstream.
+
+	Left unset by a caller that walks on its own - the tests do - so each walk
+	there gives its slot back on the way out and nothing has to be released by
+	hand.
+	*/
+	keep_slot:     bool,
 	// The hashing a denial proved with NSEC3 may spend, which no count of
 	// lookups or verifications bounds: see `MAX_NSEC3_ROUNDS_PER_QUERY`.
 	nsec3:         Nsec3_Budget,
@@ -539,11 +557,11 @@ change it is not caching but not holding a handler thread for the walk.
 /*
 Chain walks allowed upstream at once when the caller names no figure.
 
-The server derives its own from the handler pool - half of it, so a flood can
-take at most half the threads and the rest keep answering - and this is for
-every other caller, the tests among them. Eight is well past what a single
-thread can want, since a walk is entered and left on one thread and never
-nested, so nothing sequential ever meets it.
+The server derives its own from the handler pool - all of it but a reserved
+quarter, so some threads are always free to answer what needs no walk - and this
+is for every other caller, the tests among them. Eight is well past what a single
+thread can want, since a walk is entered and left on one thread and never nested,
+so nothing sequential ever meets it.
 */
 DEFAULT_MAX_CHAIN_WALKS :: 8
 
@@ -741,9 +759,13 @@ validate :: proc(
 	class := msg.question[0].class if len(msg.question) > 0 else dns.Class.IN
 	unix := u32(time.to_unix_seconds(now))
 	budget := query_budget(v)
-	// `zone_trust` gives its slot back itself; this is for the paths that reach
-	// a lookup without one - `zone_keys` called on its own, today only from the
-	// tests - so a slot can never outlive the question that took it.
+	/*
+	The slot is this question's rather than each walk's - see `keep_slot` - so
+	the walks below hand it on to one another and it is given back here, once,
+	whichever of them took it. This also covers a lookup reached without a walk
+	at all, so a slot can never outlive the question that took it.
+	*/
+	budget.keep_slot = true
 	defer end_walk(v, &budget)
 
 	/*
@@ -2886,6 +2908,13 @@ end_walk :: proc(v: ^Validator, budget: ^Budget) {
 	}
 }
 
+// Walks this validator will have waiting on an upstream at once - the figure in
+// force, which is `DEFAULT_MAX_CHAIN_WALKS` when the caller named none. What a
+// server reports at start-up, so the log cannot name a number nothing is using.
+chain_walk_limit :: proc(v: ^Validator) -> int {
+	return v.max_chain_walks if v != nil else 0
+}
+
 // Chain walks that had to stop because the server was already going upstream for
 // as many as it will. Zero on a resolver that is not being flooded.
 walks_shed :: proc(v: ^Validator) -> u64 {
@@ -2933,7 +2962,9 @@ zone_trust :: proc(
 	lookup it cannot make comes back `Indeterminate`, never insecure - a
 	downgrade is the one thing load shedding must not be able to produce.
 	*/
-	defer end_walk(v, budget)
+	defer if !budget.keep_slot {
+		end_walk(v, budget)
+	}
 
 	root_status, root_keys := zone_keys(v, budget, ".", now, allocator)
 	if root_status != .Secure {

@@ -339,10 +339,10 @@ dnssec:
   # a name whose proof needs one is SERVFAIL rather than work we do. RFC 9276 asks
   # zones for zero. A larger number is held down to 255 — see examples/elodin.yaml.
   max_nsec3_iterations: 100
-  # Chain walks that may be waiting on an upstream at once; 0 is half of
-  # server.workers. The bound is what stops a client choosing names whose labels
-  # are all fresh from holding every worker on a DS lookup apiece. Watch
-  # elodin_dnssec_walks_shed_total — see examples/elodin.yaml.
+  # Chain walks that may be waiting on an upstream at once; 0 is server.workers
+  # less a reserved quarter. The reservation is what stops a client choosing
+  # names whose labels are all fresh from holding every worker on a DS lookup
+  # apiece. Watch elodin_dnssec_walks_shed_total — see examples/elodin.yaml.
   # max_chain_walks: 0
 
 cookies:

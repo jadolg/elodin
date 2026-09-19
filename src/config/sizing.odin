@@ -168,30 +168,59 @@ derive_upstream_workers :: proc(workers: int) -> int {
 }
 
 /*
+Handlers kept back from the chain walk.
+
+The chain walk blocks the worker answering the client, once per label of a name
+the client chose, so without a bound a flood of fresh names holds every worker
+and the resolver stops answering anything at all (issue #356). What has to be
+guaranteed is that some workers are always free to answer - a cache hit, a name
+already validated, a question with no DNSSEC in it - and that is a *reservation*
+rather than a ceiling.
+
+Stated this way round on purpose. A ceiling of half the pool also caps honest
+throughput at half, and the walks past it are answered SERVFAIL: every
+cache-missing name that is not in the non-cut memo needs a slot, so a resolver
+that is merely busy - a restart with real traffic pointed at it, where nearly
+every query is a cold walk - would refuse validated answers that resolved fine
+before. Reserving instead leaves the honest load nearly untouched and still
+denies an attacker the last worker.
+
+A quarter, and never fewer than two. The reserved workers serve what needs no
+walk, which is mostly cache hits at tens of microseconds but also ordinary
+forwarding at an upstream round trip, so the number has to be enough to keep
+that moving rather than merely non-zero: a quarter of the derived floor is four,
+which is some hundreds of forwards a second, and a quarter of the ceiling is
+thirty-two.
+
+What this does not bound tightly is upstream volume - #356's other cost - since
+nearly the whole pool may still be walking. That is the trade the issue asks for
+in as many words: worker starvation traded for upstream volume, which is the
+difference between a resolver degraded and one down. An operator who would
+rather cap the volume has `dnssec.max_chain_walks` to name a smaller number
+with.
+*/
+RESERVED_HANDLERS_SHARE :: 4
+MIN_RESERVED_HANDLERS :: 2
+
+/*
 Chain-of-trust walks that may be waiting on an upstream at once.
 
-Half the handler pool. The walk blocks the worker answering the client, once per
-label of a name the client chose, so without a bound a flood of fresh names
-holds every worker; half leaves the other half answering, which is the
-difference between a resolver degraded and one down. Half rather than a quarter
-because the walks past the bound are answered SERVFAIL, so this number is also
-the honest cache-miss load the resolver can validate at, and erring small costs
-real answers.
+Everything but the reservation above. At least one whatever the arithmetic says:
+a one-worker configuration still has to be able to walk a chain, since the bound
+is on walks at once rather than on walks.
 
-Held down to the racer count as well, which only bites on a configuration that
-names one: a walk waiting on an upstream occupies a race job per candidate
-server, and the two derived numbers are the same figure anyway. It does not make
-the arithmetic exact - how many candidates a group has is not known here, and
-with `strategy: race` and three upstreams even one walk wants three jobs - so
-what it rules out is the mismatch nobody meant, `workers: 64` beside
-`upstream_workers: 2`. The rest is the operator's, and the README says so.
-
-At least one whatever the arithmetic says: a one-worker configuration still has
-to be able to walk a chain, since the bound is on walks at once rather than on
-walks.
+Deliberately not clamped to `upstream_workers`. A walk waiting on an upstream
+holds a racer job per candidate server under `strategy: race`, so the racer pool
+is a second resource this can exhaust - but the clamp cannot be right: the
+candidate count is not known here, so it is too loose for a group of three
+upstreams and, worse, it binds on the strategies that use no racer at all.
+`failover` and `round_robin` resolve on the calling thread, so an operator
+trimming `upstream_workers` on one of those would have silently cut the chain
+walks with it. The racer interaction is in the README, where the number of
+upstreams is known.
 */
-derive_chain_walks :: proc(workers, upstream_workers: int) -> int {
-	return max(min(workers / 2, upstream_workers), 1)
+derive_chain_walks :: proc(workers: int) -> int {
+	return max(workers - max(workers / RESERVED_HANDLERS_SHARE, MIN_RESERVED_HANDLERS), 1)
 }
 
 // What this process can see of the machine, at the moment it asks.

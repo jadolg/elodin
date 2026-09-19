@@ -309,12 +309,13 @@ Dnssec_Config :: struct {
 	where it would have gone upstream, which is what an upstream that did not
 	answer already produces.
 
-	Zero, the default, is half of `server.workers`: a flood then costs half the
-	pool and the other half keeps answering. It is exposed because the cost of
-	the number being too small is real - a resolver whose honest cache-miss load
-	is above it turns the surplus into SERVFAIL - and it is not a number anybody
-	here can know. `elodin_dnssec_walks_shed_total` is how an operator finds out
-	they need a bigger one.
+	Zero, the default, is `server.workers` less a reserved quarter of them, so
+	some are always free to answer what needs no walk. It is exposed because the
+	cost of the number being too small is real - a resolver whose honest
+	cache-miss load is above it turns the surplus into SERVFAIL - and it is not a
+	number anybody here can know. `elodin_dnssec_walks_shed_total` is how an
+	operator finds out they need a bigger one, and a smaller one is how they cap
+	the upstream volume a flood can provoke, which the reservation does not.
 	*/
 	max_chain_walks:      int,
 }

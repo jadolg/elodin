@@ -235,7 +235,11 @@ test_a_shed_walk_still_answers_from_the_cache :: proc(t: ^testing.T) {
 	calls := up.calls
 	sync.mutex_unlock(&up.mu)
 	testing.expectf(t, calls == 0, "a cached chain should ask nobody, it asked %d times", calls)
-	testing.expect(t, !budget.holds_walk, "a walk that asked nobody should have taken no slot")
+	// The count, not the budget's flag: `zone_trust` clears that on the way out
+	// whether or not a slot was taken, so it reads false either way. One is the
+	// slot this test is holding itself, and a walk that took a second would
+	// have made it two.
+	testing.expect_value(t, sync.atomic_load(&v.walks), 1)
 	testing.expect_value(t, walks_shed(v), u64(0))
 	free_all(context.temp_allocator)
 }
