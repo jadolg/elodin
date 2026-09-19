@@ -61,6 +61,18 @@ Parity_Stats :: struct {
 	// The reference was unusable: the mock never saw the query, or the live
 	// resolver disagreed with itself.
 	skipped:    int,
+	/*
+	Differences the upstream turned out to produce itself: asked again the way
+	elodin asks it, it gave the answer elodin gave. See `upstream_also_says`.
+
+	Counted apart from `skipped` because it is a different statement. A skip
+	says the run could not establish a reference; this says it established one,
+	found a difference against it, and then watched the upstream produce that
+	same difference on its own. A run where this climbs is worth looking at -
+	it is upstream behaviour, but it is also the number that would hide a real
+	divergence if something ever made it large.
+	*/
+	upstream_split: int,
 	failures:   int,
 	/*
 	Queries sent over each transport.
@@ -479,6 +491,35 @@ parity_one_live :: proc(
 			}
 		}
 		if attempt == 1 {
+			/*
+			Unless the upstream is what differs.
+
+			The two reference asks above establish that the resolver answers
+			this question the same way twice - as the *client* asks it. A
+			validating elodin does not ask it that way: RFC 4035 section 3.2.2
+			has it set CD so it reaches its own verdict rather than inheriting
+			the upstream's, and a resolver keeps what it has not validated
+			apart from what it has. So the copy elodin is handed comes out of a
+			pool the stability check never looked in.
+
+			Where a zone is served by providers that do not agree - `github.com`
+			answers from Route53 and from NS1 with different SOA records - that
+			pool can hold both, and 1.1.1.1 hands back whichever, while the
+			CD=0 answer the reference asked for stays on one of them. The
+			difference is then real, reproducible, and produced entirely by the
+			upstream: elodin forwarded what it was given.
+
+			So a difference that survived both attempts is held against the
+			question asked the way elodin asks it, and reported only if the
+			upstream answers *that* consistently too. Up to five further
+			exchanges, paid on a divergence and never on a query that agreed -
+			the same trade the retry above makes, which is why it is affordable
+			at all.
+			*/
+			if upstream_also_says(host, port, q, c.answer, policy) {
+				stats.upstream_split += 1
+				return
+			}
 			parity_report_diffs(r, q, c, opts, stats, index)
 		}
 	}
@@ -543,6 +584,104 @@ parity_live_attempt :: proc(
 		}
 	}
 	return .Compared, c
+}
+
+/*
+Whether the upstream itself produces the answer elodin gave.
+
+`parity_live_attempt` establishes the reference by asking twice with the
+client's own query, and a difference that survives two attempts is real in the
+sense that the bytes differed. It is not yet this server's: a live resolver
+answers from whichever anycast node took the query, rotates an RRset between two
+datagrams and keeps what it has not validated apart from what it has - and
+elodin's copy comes down a path the reference asks never touch, because RFC 4035
+section 3.2.2 has a validating resolver set CD to reach its own verdict rather
+than inherit the upstream's.
+
+Both halves of that were measured rather than supposed. `github.com` answers
+from Route53 and from NS1 with different SOA records, and 1.1.1.1 hands back
+either of them under CD while holding to one without it; `github.com A` rotates
+its addresses between nodes, so the reference settles on one and elodin is
+given another. Neither is something this server did.
+
+So the question is asked again, the way elodin asks it, and the answers are held
+against *elodin's* rather than against each other: an upstream that produces the
+same answer at all has produced the difference, and there is nothing here to
+report.
+
+Five asks, because the disagreements this is for are not coin flips. 1.1.1.1
+answers `github.com` with NS1's copy about one time in three and Route53's the
+rest, so three asks miss it about three times in ten and the run reports a
+difference the upstream made. Five brings that under one in seven, and they are
+paid only where something already diverged.
+
+Held to the same policy as the comparison it is excusing, so a probe cannot
+agree by a rule the reference was not judged by. A probe that will not complete
+proves nothing and does not excuse anything.
+*/
+@(private = "file")
+upstream_also_says :: proc(
+	host: string,
+	port: int,
+	q: Parity_Query,
+	answer: []u8,
+	policy: Parity_Policy,
+) -> bool {
+	if len(q.wire) < 4 || len(answer) == 0 {
+		return false
+	}
+	/*
+	Built from the question rather than by flipping a bit in it, because the
+	forwarded query differs from the client's in more than CD.
+	`server.dnssec_upstream_query` puts an OPT record on it carrying DO and
+	`server.UPSTREAM_UDP_SIZE`, whatever the client sent - and DO is as much a
+	part of what a resolver answers from as CD is, which elodin's own cache says
+	out loud by keying on both. The generator sets DO on well under half the
+	queries it makes, so a probe that only set CD would still be asking in the
+	other half about a pool neither side used.
+
+	The client's own options go no further than elodin sends them: the cookie
+	and any ECS are stripped before forwarding, so a probe carrying them would
+	be asking a question this server never asks.
+	*/
+	forwarded := q
+	forwarded.cd = true
+	forwarded.edns = true
+	forwarded.do_bit = true
+	// `server.UPSTREAM_UDP_SIZE`, which is not this package's to import.
+	forwarded.udp_size = 1232
+	forwarded.options = nil
+	asked := pg_encode(forwarded, context.temp_allocator)
+	seen := make([dynamic][]u8, 0, 5, context.temp_allocator)
+	for _ in 0 ..< 5 {
+		probe, ok := parity_ask_reference(host, port, asked)
+		if !ok {
+			return false
+		}
+		c := parity_compare(q, probe, answer, policy)
+		if !parity_failed(c.diffs[:]) {
+			return true
+		}
+		/*
+		Or the upstream does not hold still at all.
+
+		The probes are held against each other as well as against elodin,
+		because the upstream's answer varies in ways this one question cannot
+		show: `org.` bumps its SOA serial every few minutes and 1.1.1.1 keeps
+		copies from three different moments, and a copy carrying fewer records
+		fits a client's datagram where the full proof does not - so the
+		reference truncates on one ask and not on the next. Neither difference
+		has to look like elodin's answer to be the upstream's doing, and a rule
+		that only recognised its own reflection would report both.
+		*/
+		for earlier in seen[:] {
+			if !parity_stable_twice(earlier, probe) {
+				return true
+			}
+		}
+		append(&seen, probe)
+	}
+	return false
 }
 
 /*
