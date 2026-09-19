@@ -276,16 +276,29 @@ answer_ending_in :: proc(type: Type, rdata: []u8, records: int) -> []u8 {
 
 @(test)
 test_a_refused_name_does_not_become_a_raw_record :: proc(t: ^testing.T) {
+	// What one of these owner names costs, read rather than written down, so
+	// the fixture follows `NAME_BUDGET` and the escaping wherever they go.
+	wire := long_wire_name()
+	defer delete(wire)
+	owner, _, derr := decode_name(wire, 0)
+	defer delete(owner)
+	testing.expect_value(t, derr, Decode_Error.None)
+
+	// As many owner names as fit beside the two-byte question name, and then
+	// the record under test. What is left over has to be enough for that
+	// record's own cheap owner and not enough for the name in its RDATA, or the
+	// budget would be crossed somewhere other than where this is looking.
+	owners := (NAME_BUDGET - 2) / len(owner)
+	left := NAME_BUDGET - 2 - owners * len(owner)
+	testing.expectf(t, left > 2 && left - 2 < len(owner), "the fixture leaves %d bytes, which lands elsewhere", left)
+
 	// A CNAME whose target is a pointer, and a PX whose two names are: the
-	// modelled path and the unmodelled one.
-	// The record counts put each fixture's own RDATA over the line: a CNAME
-	// carries one name and a PX two, so they cross a record apart.
+	// modelled path into the check and the unmodelled one.
 	for fixture in ([]struct {
-			type:    Type,
-			rdata:   []u8,
-			records: int,
-		}{{.CNAME, {0xc0, 0x13}, 653}, {.PX, {0, 10, 0xc0, 0x13, 0xc0, 0x13}, 652}}) {
-		msg := answer_ending_in(fixture.type, fixture.rdata, fixture.records)
+			type:  Type,
+			rdata: []u8,
+		}{{.CNAME, {0xc0, 0x13}}, {.PX, {0, 10, 0xc0, 0x13, 0xc0, 0x13}}}) {
+		msg := answer_ending_in(fixture.type, fixture.rdata, owners + 1)
 		defer delete(msg)
 
 		backing := make([]u8, 16 << 20)
@@ -299,7 +312,9 @@ test_a_refused_name_does_not_become_a_raw_record :: proc(t: ^testing.T) {
 		if err != .None {
 			continue
 		}
-		// It decoded, so it has to be something that can be written again.
+		// It decoded, so it has to be something that can be written again. This
+		// is what fails when the refusal is swallowed: the record kept its
+		// compression pointer, and `encode_message` will not write one.
 		_, _, eerr := encode_message(m, a)
 		testing.expectf(t, eerr == .None, "%v: decoded but would not re-encode: %v", fixture.type, eerr)
 	}
