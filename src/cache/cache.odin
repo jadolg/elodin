@@ -34,6 +34,18 @@ Entry :: struct {
 	*/
 	redirects:   bool,
 	/*
+	The entry is a `Bogus` verdict this server reached and not an answer it was
+	given: the bytes are its own SERVFAIL, and what they say is that the question
+	could not be answered rather than what the answer is.
+
+	Nothing here has to tell a caller so, because a verdict is stored under a key
+	of its own (`make_key`'s `verdict`) and is looked up only by a caller that
+	came for one. What this is read for is the entry's own lifetime: `put` gives
+	it `BOGUS_TTL` rather than anything the message carried, and `deadline`
+	refuses it the stale window an answer gets.
+	*/
+	bogus:       bool,
+	/*
 	What the caller had decided about this answer when it stored it, in whatever
 	numbering the caller keeps - see `put` and `get`. Zero for a caller that does
 	not keep one, which reads as "decided under nothing you would recognise" and
@@ -160,6 +172,30 @@ question rather than two, and this is the answer to the second.
 MAX_STALE :: 24 * time.Hour
 
 /*
+How long a failed DNSSEC verdict is remembered. See `Entry.bogus`.
+
+Without it, a question whose answer does not validate costs an upstream exchange
+every time anybody asks it - a name with a broken signature is then the cheapest
+thing on the Internet to make this server do work for, and every one of those
+queries is also a line in the log. RFC 4035 section 4.7 allows a bogus answer to
+be cached with a short TTL for exactly that reason; Unbound does it under
+`val-bogus-ttl`, sixty seconds by default, and BIND caches the SERVFAIL itself
+under `servfail-ttl`.
+
+Short, because a verdict is not an answer. What produces most of them is an
+operator midway through a key rollover, and the resolver has to notice that the
+zone is working again within a minute rather than within the day `max_ttl`
+allows. A minute is also what makes the memory worth having: at any query rate
+worth defending against, it is the difference between one upstream exchange and
+hundreds of thousands.
+
+Deliberately not a configuration key, for the reason `MAX_STALE` is not: it is a
+property of what a verdict is good for rather than of a deployment, and an
+operator who does not want it cached at all turns the cache off.
+*/
+BOGUS_TTL :: 60
+
+/*
 What the cache may hold when the operator has not said.
 
 A count on its own is not a bound on memory. An entry holds the response as it
@@ -242,6 +278,15 @@ OPT record and handing it out, which RFC 6891 section 6.1.1 forbids outright. So
 the presence of an OPT record is decided per request on the way out instead, by
 `server.match_client_opt`, and what is stored here is an answer either kind of
 client can be served from.
+
+`verdict` is the one thing in here that is not part of the question. It says the
+entry is a `Bogus` verdict rather than an answer to it, and it is a key of its
+own for a reason the caller could not get any other way: an entry replaces what
+is under its key, so a verdict sharing the answer's key would throw away the
+expired answer `serve_stale` is holding for that name - and the two are wanted at
+once. The verdict is what the next minute of queries is answered with; the
+expired answer is what covers the upstream being down after that minute runs
+out. See `server.remember_bogus_verdict`.
 */
 make_key :: proc(
 	buf: []u8,
@@ -250,6 +295,7 @@ make_key :: proc(
 	class: dns.Class,
 	dnssec_ok: bool,
 	checking_disabled := false,
+	verdict := false,
 ) -> string {
 	n := 0
 	limit := len(buf) - 8
@@ -267,7 +313,8 @@ make_key :: proc(
 	buf[n + 3] = u8(u16(class))
 	buf[n + 4] = 1 if dnssec_ok else 0
 	buf[n + 5] = 1 if checking_disabled else 0
-	return string(buf[:n + 6])
+	buf[n + 6] = 1 if verdict else 0
+	return string(buf[:n + 7])
 }
 
 /*
@@ -291,12 +338,23 @@ the answer is wrong, only that nothing has looked at it under the rules the
 caller says are current. A caller with no such notion leaves this at zero, gets
 `recheck` on nothing it stored at zero as well, and pays nothing for the
 mechanism.
+
+`probe` is a lookup that is not the query's own, and it is counted in neither
+direction. The one caller is the verdict a question was refused under
+(`make_key`'s `verdict`), which is looked for only once the answer cache has
+already been asked and has already counted what it found - so counting this too
+would put two lookups in `elodin_cache_misses_total` for one query and take the
+identity an operator reads these numbers by, that hits and misses are what the
+queries came to, away from them. What a verdict costs shows as `bogus=` and in
+the query log, which is where a refusal belongs; nothing about it is an answer
+this cache served.
 */
 get :: proc(
 	c: ^Cache,
 	key: string,
 	allocator := context.allocator,
 	checked_against: u64 = 0,
+	probe := false,
 ) -> (
 	wire: []u8,
 	hit: Hit,
@@ -310,14 +368,18 @@ get :: proc(
 
 	e, found := c.entries[key]
 	if !found {
-		c.stats.misses += 1
+		if !probe {
+			c.stats.misses += 1
+		}
 		return nil, {}, false
 	}
 
 	now := time.now()
 	if time.diff(deadline(c, e), now) > 0 {
 		remove_entry(c, e)
-		c.stats.misses += 1
+		if !probe {
+			c.stats.misses += 1
+		}
 		return nil, {}, false
 	}
 
@@ -347,11 +409,15 @@ get :: proc(
 		were answered from the cache, while the same query is counted forwarded
 		one package away.
 		*/
-		c.stats.misses += 1
+		if !probe {
+			c.stats.misses += 1
+		}
 		hit.stale = true
 	} else {
 		dns.patch_ttls(out, e.ttl_offsets, e.ttls, elapsed, c.min_ttl)
-		c.stats.hits += 1
+		if !probe {
+			c.stats.hits += 1
+		}
 	}
 
 	// An expired entry moves to the front along with the fresh ones. Something
@@ -566,8 +632,22 @@ with the entry and handed back by `get` as `recheck` once the caller says its
 numbering has moved on. The cache does not read it: what it counts is a number
 the caller recognises, and a caller with nothing to say leaves it at zero, which
 `get` will always report as out of date rather than silently current.
+
+`bogus` is the caller saying the bytes are a refusal it reached itself rather
+than an answer somebody sent: a SERVFAIL, which is otherwise one of the
+transient failures above and refused, and which is all the flag admits - an
+answer handed in with it set is refused like any other message whose rcode does
+not belong. It is stored for `BOGUS_TTL`. See `Entry.bogus`.
 */
-put :: proc(c: ^Cache, key: string, wire: []u8, msg: dns.Message, checked: u64 = 0, refused: u8 = 0) -> bool {
+put :: proc(
+	c: ^Cache,
+	key: string,
+	wire: []u8,
+	msg: dns.Message,
+	checked: u64 = 0,
+	refused: u8 = 0,
+	bogus := false,
+) -> bool {
 	if c == nil || len(wire) < dns.HEADER_SIZE {
 		return false
 	}
@@ -576,10 +656,34 @@ put :: proc(c: ^Cache, key: string, wire: []u8, msg: dns.Message, checked: u64 =
 	}
 
 	rcode := dns.rcode_of(msg)
-	#partial switch rcode {
-	case .No_Error, .NX_Domain:
-	case:
-		return false
+	/*
+	A transient failure is not an answer to remember - except the one this
+	server reached itself, which is `bogus`: a SERVFAIL built here because the
+	answer did not validate, whose whole point is not to have to ask again. Its
+	lifetime is `BOGUS_TTL` and nothing the sender chose, which is what keeps a
+	verdict about somebody else's broken zone from being that zone's to extend.
+	*/
+	if bogus {
+		/*
+		And it really is the refusal it says it is.
+
+		The flag is the caller's word that these bytes are a verdict it reached
+		itself, and it turns off more than the rcode gate below: the lifetime
+		stops being read from the message, so neither `negative_ttl` nor the
+		`min_ttl` floor reaches the entry. Set over an answer, that would pin
+		the answer for `BOGUS_TTL` under none of the rules an answer is kept
+		by - so what the flag admits is the one rcode this cache would
+		otherwise never keep, and nothing else.
+		*/
+		if rcode != .Serv_Fail {
+			return false
+		}
+	} else {
+		#partial switch rcode {
+		case .No_Error, .NX_Domain:
+		case:
+			return false
+		}
 	}
 
 	/*
@@ -676,16 +780,24 @@ put :: proc(c: ^Cache, key: string, wire: []u8, msg: dns.Message, checked: u64 =
 	}
 
 	effective: u32
-	if rcode == .NX_Domain || len(msg.answer) == 0 {
-		effective = dns.negative_ttl(msg, c.negative_ttl)
-		if c.negative_ttl > 0 {
-			effective = min(effective, c.negative_ttl)
-		}
+	if bogus {
+		// Bounded by the ceiling like everything else here, and not raised by
+		// `min_ttl`: that floor is how long the shortest *answer* is good for,
+		// and stretching a verdict to meet it would hold a zone broken past the
+		// minute this is allowed to.
+		effective = min(u32(BOGUS_TTL), c.max_ttl)
 	} else {
-		v, has := dns.min_ttl(ttls)
-		effective = v if has else 0
+		if rcode == .NX_Domain || len(msg.answer) == 0 {
+			effective = dns.negative_ttl(msg, c.negative_ttl)
+			if c.negative_ttl > 0 {
+				effective = min(effective, c.negative_ttl)
+			}
+		} else {
+			v, has := dns.min_ttl(ttls)
+			effective = v if has else 0
+		}
+		effective = clamp(effective, c.min_ttl, c.max_ttl)
 	}
-	effective = clamp(effective, c.min_ttl, c.max_ttl)
 	if effective == 0 {
 		delete(offsets, c.allocator)
 		delete(ttls, c.allocator)
@@ -716,6 +828,7 @@ put :: proc(c: ^Cache, key: string, wire: []u8, msg: dns.Message, checked: u64 =
 	e.ttl_offsets = offsets
 	e.ttls = ttls
 	e.redirects = redirects(msg)
+	e.bogus = bogus
 	e.checked = checked
 	e.refused = refused
 	e.inserted = now
@@ -827,11 +940,19 @@ and `sweep` both read it from here, because an entry one of them keeps and the
 other refuses is either memory held for a day for nothing or an answer served
 from data too old to serve, depending on which of the two runs first.
 
+A verdict has no life past its expiry, whatever `serve_stale` says. The stale
+window is there to cover an upstream outage with an answer, and a verdict is not
+an answer: the caller refuses to serve an expired one - see
+`server.resolve_query` - so a day of stale window would be a day of an entry
+nothing can ever be served from, holding a slot and its bytes against the
+answers that can. Every name somebody breaks for a minute would leave one
+behind.
+
 The caller holds the lock.
 */
 @(private)
 deadline :: proc(c: ^Cache, e: ^Entry) -> time.Time {
-	return time.time_add(e.expires, MAX_STALE) if c.serve_stale else e.expires
+	return time.time_add(e.expires, MAX_STALE) if c.serve_stale && !e.bogus else e.expires
 }
 
 /*

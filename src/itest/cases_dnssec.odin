@@ -119,6 +119,36 @@ run_dnssec_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	start_case(r, "dnssec: a second refusal does not write a second warning")
+	{
+		/*
+		The line is bounded by `report_once`, like every other per-query warning
+		on the client path.
+
+		Which name is asked about is the client's to choose, so a line per
+		refusal is a line per query: one client asking for a zone with a broken
+		signature at the rate the limiter allows writes gigabytes a day of
+		identical warnings, and journald's per-unit limit then drops them along
+		with every legitimate line. The first one is the warning an operator has
+		to have; the rest are debug, and `bogus=` in the stats line counts them.
+
+		A different name from the first refusal's, and the cache is off in this
+		configuration, so this really is a second trip through the branch rather
+		than a question that never reached it.
+		*/
+		before := log_count(&srv, "did not validate")
+		if check(r, before == 1, "expected one refusal warning before this case, found %d", before) {
+			res := query_udp(udp_port, build_query("second.test.", u16(dns.Type.A)))
+			if check(r, res.ok, "no response") {
+				h := parse_header(r, res.wire)
+				check_eq_int(r, h.rcode, int(dns.Rcode.Serv_Fail), "rcode for the second refusal")
+			}
+			after := log_count(&srv, "did not validate")
+			check(r, after == before, "a second refusal wrote another warning (%d lines now)", after)
+		}
+	}
+	end_case(r)
+
 	start_case(r, "dnssec: the forwarded query asks for signatures")
 	{
 		// DO to get the signatures, CD so the upstream's own opinion of them
