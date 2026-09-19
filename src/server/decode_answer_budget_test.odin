@@ -107,15 +107,24 @@ test_reading_a_reply_twice_costs_two_budgets_at_most :: proc(t: ^testing.T) {
 /*
 The bound holds when the first reading failed for some reason other than names.
 
-An answer section that stops just short of the budget, followed by a malformed
-record in the authority section: the whole-message decode fails on the malformed
-record, the answer section is read again, and those names are expanded a second
-time into the same arena. Nothing about that is particular to a budget failure,
-which is why the ceiling is stated for the pair rather than for the one error.
+An answer section that costs most of a budget, followed by a malformed record in
+the authority section: the whole-message decode fails on the malformed record,
+the answer section is read again, and those names are expanded a second time
+into the same arena. Nothing about that is particular to a budget failure, which
+is why the ceiling is stated for the pair rather than for the one error.
+
+The record count is taken from the budget rather than written down, at a third
+of it a reading, so that neither end is near a boundary: the first reading has
+to survive - the point is a failure that is not the budget's - while the two
+together have to come to more than one budget, or nothing here is being charged
+twice.
 */
 @(test)
 test_a_near_budget_answer_read_twice_stays_within_the_pair :: proc(t: ^testing.T) {
-	msg := name_budget_bomb(records = 320, trailing_authority = true)
+	// Two names a record, each a 255-octet name of unprintable octets, so each
+	// costs about `MAX_NAME_PRESENTATION`.
+	records := dns.NAME_BUDGET / (3 * dns.MAX_NAME_PRESENTATION)
+	msg := name_budget_bomb(records = records, trailing_authority = true)
 	defer delete(msg)
 
 	arena: mem.Arena
@@ -124,6 +133,13 @@ test_a_near_budget_answer_read_twice_stays_within_the_pair :: proc(t: ^testing.T
 
 	testing.expect_value(t, out.full_err, dns.Decode_Error.Short_Buffer)
 	testing.expect(t, out.partial, "the answer section should have read on its own")
+	testing.expectf(
+		t,
+		arena.offset > dns.NAME_BUDGET,
+		"%d records read twice cost only %d bytes, so they were not read twice",
+		records,
+		arena.offset,
+	)
 	testing.expectf(
 		t,
 		arena.offset <= budget_ceiling(len(msg)),

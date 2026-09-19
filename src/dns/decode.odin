@@ -69,9 +69,9 @@ Charge `n` presentation bytes to the message's expansion budget.
 Charged after the clone rather than before it, since what a name costs is not
 known until it is decoded, so a name overshoots the budget by at most
 `MAX_NAME_PRESENTATION` and nothing else is decoded once it is gone. RDATA
-expansion is the exception and charges ahead of itself instead - see
-`expand_rdata_names`, which knows what its buffer will cost before it takes it
-and so overshoots by nothing.
+expansion overshoots by that much per name in the layout, since it reads them
+one after another before anything checks again; its buffer is the one thing
+charged ahead of itself, because that one is known before it is taken.
 */
 @(private)
 charge_name :: proc(r: ^Reader, n: int) -> Decode_Error {

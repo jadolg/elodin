@@ -2412,10 +2412,16 @@ RDATA copies, which are outside the budget and do not need to be in it - a
 record is at least eleven wire bytes, so both are already a fixed multiple of
 the message. Measured, a 64 KB reply built to spend the budget costs 2,031,200
 bytes across the pair, against the 8,550,616 one reading of it reached before
-there was a budget at all. That is this procedure's figure and not the request's:
-`fit_response` reads the same wire again into the same arena when it passes the
-client's limit, and the validator does too, each for a budget of its own. One
-budget across the pair was the other way to do it and
+there was a budget at all.
+
+That is this procedure's figure and not the request's. The budget is per
+reading, and a request may hold many into the one arena: `fit_response` reads
+this wire again when it passes the client's limit, and the validator reads a
+reply of its own for each chain step, up to `dnssec.MAX_LOOKUPS_PER_QUERY` of
+them. A signed zone answering every step with a full-length name bomb therefore
+still reaches tens of megabytes in one request - far under the hundreds it
+reached before, and not the same thing as bounded. Issue #354 is the counter
+that would make it so. One budget across the pair was the other way to do it and
 costs more than it saves: a reply large enough for the first reading to spend
 most of the budget would lose the shorter reading as well, which is refusing an
 answer this server had no opinion about, and that is the thing the shorter
@@ -2912,13 +2918,21 @@ fit_response :: proc(wire: []u8, limit: int, query: dns.Message, allocator: mem.
 	is exactly as large as one that was allowed to. The ceiling has to hold on
 	the paths that go wrong or it is not a ceiling.
 
-	Neither step is reachable from a well-formed answer - a message that decoded
-	re-encodes, and one that did not is answered from the query instead - which
-	is the reason to settle it here rather than to reason about how an upstream
-	might arrive at one. The client is told to ask again over TCP, where the
-	address is proven and the whole answer fits. If even that cannot be built,
-	nothing is sent: a client that waits out its timeout is a better failure than
-	a datagram this server promised not to send.
+	The re-encode is not reachable from a well-formed answer - a message that
+	decoded re-encodes - and the decode was not either until names got a budget.
+	Now a reply that spends `dns.NAME_BUDGET` arrives here well formed: nothing
+	upstream of this refused it, because with blocking off and the cache on it is
+	forwarded without the answer section ever being read on its own. It used to
+	be truncated properly and is now answered TC with an empty answer section,
+	which is the same answer one byte too large would get and costs the client a
+	round trip rather than an answer. That is the trade a budget is: the reply
+	has to be read to be cut down, and reading it is what was refused.
+
+	The client is told to ask again over TCP, where the address is proven and the
+	whole answer fits - and where the decode is not attempted at all, since the
+	bytes are already inside the limit. If even that cannot be built, nothing is
+	sent: a client that waits out its timeout is a better failure than a datagram
+	this server promised not to send.
 	*/
 	out, ok := dns.error_response(wire, query, .No_Error, allocator, limit)
 	if !ok || len(out) < dns.HEADER_SIZE || len(out) > limit {
