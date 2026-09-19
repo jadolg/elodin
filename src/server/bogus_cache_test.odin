@@ -1,5 +1,6 @@
 package server
 
+import "core:mem"
 import "core:net"
 import "core:sync"
 import "core:testing"
@@ -16,8 +17,8 @@ What a name that does not validate costs the server that refuses it.
 
 The refusal itself is not in question - an answer with no chain to the anchor is
 SERVFAIL and always was. What this is about is the second query for it, and the
-ten thousandth: nothing on that path was ever stored, so every one of them was
-an exchange with an upstream that was only ever going to hand back the same
+ten thousandth: nothing on that path was stored, so every one of them was an
+exchange with an upstream that was only ever going to hand back the same
 unusable answer. Which name is asked about is the client's choice, so a zone
 somebody breaks on purpose is the cheapest way there is to spend this server's
 upstream budget - and it is not a fetch anybody benefits from, because the
@@ -25,7 +26,11 @@ answer is thrown away when it arrives.
 
 The verdict is remembered instead (`cache.BOGUS_TTL`), and what is written down
 is this server's own SERVFAIL rather than the answer that failed: there is
-nothing in the cache for a later reload, or a bug, to serve as data.
+nothing in the cache for a later reload, or a bug, to serve as data. The bounds
+on that memory are as much of the subject as the memory is, so each one is a
+test here: it is only a verdict that is kept, only while nothing expired is
+being held for the same name, and only while this request would have reached a
+verdict of its own.
 */
 
 @(private = "file")
@@ -37,19 +42,29 @@ An upstream that answers everything the same way, and counts what it was asked.
 A loop rather than the one-shot mocks elsewhere in this package, because a
 validating query is more than one exchange: the client's question goes out
 first, and then the validator asks for the keys of the zone it would have to
-check the answer against. What this test asserts is not that the upstream sees
-one query - it is that a second identical *client* query adds nothing at all to
-whatever the first one cost.
+check the answer against. What these tests assert is not that the upstream sees
+one query - it is what a second identical *client* query adds to whatever the
+first one cost.
+
+`answer_keys` is which of the two verdicts this mock produces. Answering the key
+lookup with a zone that published none is an answer that was checked and failed,
+which is `Bogus`; saying nothing to it at all leaves the walk unable to finish,
+which is `Indeterminate`. The server treats the two alike towards the client and
+must not treat them alike in the cache.
 */
 @(private = "file")
 Counting_Mock :: struct {
-	socket: net.UDP_Socket,
+	socket:      net.UDP_Socket,
 	// A copy of its own, not a slice of the test's arena: the loop outlives the
 	// body it was started from on every early return here.
-	reply:  [512]u8,
-	length: int,
-	seen:   u64,
-	stop:   bool,
+	reply:       [512]u8,
+	length:      int,
+	// How many bytes of the question section the fixture's reply carries, so a
+	// query for something else can be told apart from the client's.
+	question:    int,
+	answer_keys: bool,
+	seen:        u64,
+	stop:        bool,
 }
 
 @(private = "file")
@@ -61,19 +76,32 @@ counting_mock_serve :: proc(m: ^Counting_Mock) {
 		if err != nil || n < dns.HEADER_SIZE {
 			continue
 		}
-		// Counted on arrival, so a query this test says was never sent is one
+		// Counted on arrival, so a query these tests say was never sent is one
 		// that was never counted either.
 		sync.atomic_add(&m.seen, 1)
-		out := m.reply
-		// The query's transaction id back, so the reply is matched to it.
-		out[0], out[1] = buf[0], buf[1]
-		_, _ = net.send_udp(m.socket, out[:m.length], remote)
+		if n >= dns.HEADER_SIZE + m.question &&
+		   mem.compare(buf[dns.HEADER_SIZE:][:m.question], m.reply[dns.HEADER_SIZE:][:m.question]) == 0 {
+			out := m.reply
+			// The query's transaction id back, so the reply is matched to it.
+			out[0], out[1] = buf[0], buf[1]
+			_, _ = net.send_udp(m.socket, out[:m.length], remote)
+			continue
+		}
+		if !m.answer_keys {
+			continue
+		}
+		// The question back with an empty answer section: a zone that published
+		// no keys, which is a chain that fails rather than one that could not be
+		// read.
+		buf[2] |= 0x80 // QR
+		buf[3] |= 0x80 // RA
+		_, _ = net.send_udp(m.socket, buf[:n], remote)
 	}
 }
 
 // An ordinary unsigned answer. Nothing signs it, so a validator holding it
-// against the root anchor cannot authenticate it - which is the verdict this
-// test is about, reached without a captured chain.
+// against the root anchor cannot authenticate it - which is the verdict these
+// tests are about, reached without a captured chain.
 @(private = "file")
 unsigned_answer :: proc() -> []u8 {
 	m := dns.Message {
@@ -99,12 +127,17 @@ unsigned_answer :: proc() -> []u8 {
 }
 
 @(private = "file")
-bogus_client_query :: proc() -> []u8 {
+bogus_client_query :: proc(with_edns := false) -> []u8 {
 	m := dns.Message {
 		id       = 0x7a7a,
 		question = []dns.Question{{name = BOGUS_NAME, type = .A, class = .IN}},
 	}
 	m.flags.rd = true
+	if with_edns {
+		additional := make([]dns.Record, 1, context.temp_allocator)
+		additional[0] = dns.make_opt(1232, false)
+		m.additional = additional
+	}
 	wire, _, err := dns.encode_message(m, context.temp_allocator)
 	if err != .None {
 		panic("failed to encode the client query")
@@ -112,38 +145,78 @@ bogus_client_query :: proc() -> []u8 {
 	return wire
 }
 
-@(test)
-test_a_bogus_verdict_is_not_asked_of_the_upstream_twice :: proc(t: ^testing.T) {
+/*
+A resolver with one upstream, a real validator and an answer cache.
+
+Held in one struct because the server points at the configuration and every part
+of it has to be torn down in an order: the mock's loop reads its own socket, and
+the validator asks the group questions on the thread that is answering a client.
+The caller keeps it on its own stack, so nothing here may be moved after
+`fixture_start` has handed the server a pointer into it.
+*/
+@(private = "file")
+Fixture :: struct {
+	cfg:       config.Config,
+	answers:   ^cache.Cache,
+	group:     ^upstream.Group,
+	validator: ^dnssec.Validator,
+	mock:      Counting_Mock,
+	worker:    ^thread.Thread,
+	server:    Server,
+	key_buf:   [cache.KEY_MAX]u8,
+	key:       string,
+}
+
+@(private = "file")
+fixture_start :: proc(t: ^testing.T, f: ^Fixture, answer_keys: bool, serve_stale := false) -> bool {
 	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
 	if serr != nil {
 		testing.expectf(t, false, "cannot bind the mock upstream: %v", serr)
-		return
+		return false
 	}
-	defer net.close(socket)
+	f.mock.socket = socket
+	f.mock.answer_keys = answer_keys
 	// Short, because it is what the serve loop uses to notice that the test is
 	// over; nothing here waits on a query that is not coming.
 	_ = net.set_option(socket, .Receive_Timeout, 100 * time.Millisecond)
 	bound, berr := net.bound_endpoint(socket)
 	if berr != nil {
 		testing.expectf(t, false, "cannot read the mock's port: %v", berr)
-		return
+		net.close(socket)
+		return false
 	}
 
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = true
-	cfg.dnssec.enabled = true
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
+	answer := unsigned_answer()
+	if len(answer) > len(f.mock.reply) {
+		testing.expect(t, false, "the fixture does not fit the mock's buffer")
+		net.close(socket)
+		return false
+	}
+	f.mock.length = copy(f.mock.reply[:], answer)
+	name_buf: [dns.MAX_NAME_WIRE]u8
+	name_len, name_err := dns.encode_name(BOGUS_NAME, name_buf[:])
+	if name_err != .None {
+		testing.expect(t, false, "the fixture's name does not encode")
+		net.close(socket)
+		return false
+	}
+	f.mock.question = name_len + 4
+
+	f.cfg = config.default_config()
+	f.cfg.log.queries = false
+	f.cfg.cache.enabled = true
+	f.cfg.cache.serve_stale = serve_stale
+	f.cfg.dnssec.enabled = true
+	f.cfg.upstream.strategy = .Failover
+	f.cfg.upstream.attempts = 1
 	/*
-	Short, and it is the validator's lookup that spends it: this mock answers
-	the client's question and nothing else, so the walk for the zone's keys gets
-	no reply and the wait for it is most of what this test takes. A second on
-	loopback is far past what the answered exchange needs and bounds the
-	unanswered one; the client's own query timing out instead would fail the
-	assertions below rather than pass them quietly.
+	Short, and it is the validator's lookup that may spend it: a mock that does
+	not answer the walk's questions leaves it waiting, which is most of what
+	that case takes. A second on loopback is far past what an answered exchange
+	needs, and the client's own query timing out instead would fail the
+	assertions rather than pass them quietly.
 	*/
-	cfg.upstream.timeout = 1 * time.Second
+	f.cfg.upstream.timeout = 1 * time.Second
 	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
 	servers[0] = config.Upstream_Spec {
 		name    = "mock",
@@ -151,85 +224,123 @@ test_a_bogus_verdict_is_not_asked_of_the_upstream_twice :: proc(t: ^testing.T) {
 		address = "127.0.0.1",
 		port    = bound.port,
 	}
-	cfg.upstream.servers = servers
+	f.cfg.upstream.servers = servers
 
-	g, gerr := upstream.make_group(cfg.upstream, nil)
+	g, gerr := upstream.make_group(f.cfg.upstream, nil)
 	if gerr != .None {
 		testing.expectf(t, false, "cannot build the upstream group: %v", gerr)
-		return
+		net.close(socket)
+		return false
 	}
-	defer upstream.destroy_group(g)
-
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
-	defer cache.destroy(answers)
-
-	s := Server {
-		cfg     = &cfg,
-		group   = g,
-		answers = answers,
+	f.group = g
+	f.answers = cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, serve_stale = serve_stale})
+	f.server = Server {
+		cfg     = &f.cfg,
+		group   = f.group,
+		answers = f.answers,
 	}
 	// The real thing, asking this mock for the chain it needs, exactly as the
-	// running server's does. Held in a local of its own as well, so the server
-	// can stop validating below without the teardown losing track of it.
-	validator := dnssec.make_validator(validator_query, &s, dnssec.Options{})
-	defer dnssec.destroy_validator(validator)
-	s.validator = validator
+	// running server's does. Kept in a field of its own as well, so a test can
+	// stop the server validating without the teardown losing track of it.
+	f.validator = dnssec.make_validator(validator_query, &f.server, dnssec.Options{})
+	f.server.validator = f.validator
+	f.key = cache.make_key(f.key_buf[:], BOGUS_NAME, .A, .IN, false, false)
 
-	m := Counting_Mock {
-		socket = socket,
+	f.worker = thread.create_and_start_with_poly_data(&f.mock, counting_mock_serve)
+	return true
+}
+
+@(private = "file")
+fixture_stop :: proc(f: ^Fixture) {
+	sync.atomic_store(&f.mock.stop, true)
+	thread.join(f.worker)
+	thread.destroy(f.worker)
+	dnssec.destroy_validator(f.validator)
+	upstream.destroy_group(f.group)
+	cache.destroy(f.answers)
+	net.close(f.mock.socket)
+}
+
+@(private = "file")
+is_servfail :: proc(wire: []u8) -> bool {
+	return len(wire) >= dns.HEADER_SIZE && wire[3] & 0xf == u8(dns.Rcode.Serv_Fail)
+}
+
+@(private = "file")
+carries_extended_error :: proc(opt: dns.Record) -> bool {
+	options, ok := opt.data.(dns.Rdata_OPT)
+	if !ok {
+		return false
 	}
-	answer := unsigned_answer()
-	if !testing.expect(t, len(answer) <= len(m.reply), "the fixture does not fit the mock's buffer") {
+	for option in options.options {
+		if option.code == u16(dns.EDNS_Option_Code.Ext_Error) && len(option.data) >= 2 {
+			return true
+		}
+	}
+	return false
+}
+
+@(test)
+test_a_bogus_verdict_is_not_asked_of_the_upstream_twice :: proc(t: ^testing.T) {
+	f: Fixture
+	if !fixture_start(t, &f, answer_keys = true) {
 		return
 	}
-	m.length = copy(m.reply[:], answer)
-	mock := thread.create_and_start_with_poly_data(&m, counting_mock_serve)
-	defer {
-		sync.atomic_store(&m.stop, true)
-		thread.join(mock)
-		thread.destroy(mock)
-	}
+	defer fixture_stop(&f)
 
 	query := bogus_client_query()
 
-	first, outcome, served := handle_query(&s, query, .UDP, "test", context.temp_allocator)
+	first, outcome, served := handle_query(&f.server, query, .UDP, "test", context.temp_allocator)
 	testing.expect(t, served, "no response was produced for the first query")
 	testing.expect_value(t, outcome, Outcome.Failed)
-	testing.expect(
-		t,
-		len(first) >= dns.HEADER_SIZE && first[3] & 0xf == u8(dns.Rcode.Serv_Fail),
-		"the first query was not refused",
-	)
+	testing.expect(t, is_servfail(first), "the first query was not refused")
 
-	asked := sync.atomic_load(&m.seen)
+	asked := sync.atomic_load(&f.mock.seen)
 	if !testing.expect(t, asked > 0, "the upstream was never asked, so nothing was validated") {
 		return
 	}
 
 	// What the entry holds is the refusal and not the answer that failed: the
 	// unvalidated data must not be anywhere a later hit could reach it.
-	key_buf: [cache.KEY_MAX]u8
-	key := cache.make_key(key_buf[:], BOGUS_NAME, .A, .IN, false, false)
-	stored, _, found := cache.get(answers, key, context.temp_allocator)
+	stored, _, found := cache.get(f.answers, f.key, context.temp_allocator)
 	if testing.expect(t, found, "the verdict was not remembered") {
-		testing.expect(
-			t,
-			len(stored) >= dns.HEADER_SIZE && stored[3] & 0xf == u8(dns.Rcode.Serv_Fail),
-			"the answer that did not validate was stored",
-		)
+		testing.expect(t, is_servfail(stored), "the answer that did not validate was stored")
 		testing.expect(t, stored[6] == 0 && stored[7] == 0, "the stored refusal carries an answer section")
 	}
 
-	second, again, served_again := handle_query(&s, query, .UDP, "test", context.temp_allocator)
+	second, again, served_again := handle_query(&f.server, query, .UDP, "test", context.temp_allocator)
 	testing.expect(t, served_again, "no response was produced for the second query")
 	testing.expect_value(t, again, Outcome.Failed)
-	testing.expect(
-		t,
-		len(second) >= dns.HEADER_SIZE && second[3] & 0xf == u8(dns.Rcode.Serv_Fail),
-		"the second query was not refused",
-	)
+	testing.expect(t, is_servfail(second), "the second query was not refused")
 	// The whole of it: the second client query cost nothing upstream.
-	testing.expect_value(t, sync.atomic_load(&m.seen), asked)
+	testing.expect_value(t, sync.atomic_load(&f.mock.seen), asked)
+
+	/*
+	And the explanation survives the entry, whoever caused it.
+
+	The queries above carry no EDNS, so the refusal they were answered with had
+	nowhere to put an extended error - `dns.make_response` attaches an OPT
+	record only when the query had one. The copy that was stored is built with
+	one regardless, because which client happens to miss first is not a thing
+	the next client's diagnostics should depend on.
+	*/
+	third, edns, served_edns := handle_query(
+		&f.server,
+		bogus_client_query(with_edns = true),
+		.UDP,
+		"test",
+		context.temp_allocator,
+	)
+	testing.expect(t, served_edns, "no response was produced for the EDNS client")
+	testing.expect_value(t, edns, Outcome.Failed)
+	testing.expect_value(t, sync.atomic_load(&f.mock.seen), asked)
+	msg, derr := dns.decode_message(third, context.temp_allocator)
+	if testing.expect(t, derr == .None, "the response does not decode") {
+		opt, has := dns.find_opt(msg)
+		if testing.expect(t, has, "the EDNS client got no OPT record back") {
+			testing.expect(t, carries_extended_error(opt), "the remembered refusal explains nothing to an EDNS client")
+		}
+	}
 
 	/*
 	And the verdict stops answering the moment this server stops validating.
@@ -240,16 +351,117 @@ test_a_bogus_verdict_is_not_asked_of_the_upstream_twice :: proc(t: ^testing.T) {
 	the question goes upstream as it would on a miss, and the answer that comes
 	back is the one the client gets.
 	*/
-	s.validator = nil
-	third, plain, served_plain := handle_query(&s, query, .UDP, "test", context.temp_allocator)
+	f.server.validator = nil
+	fourth, plain, served_plain := handle_query(&f.server, query, .UDP, "test", context.temp_allocator)
 	testing.expect(t, served_plain, "no response was produced with validation off")
 	testing.expect_value(t, plain, Outcome.Forwarded)
 	testing.expect(
 		t,
-		len(third) >= dns.HEADER_SIZE && third[3] & 0xf == u8(dns.Rcode.No_Error),
+		len(fourth) >= dns.HEADER_SIZE && fourth[3] & 0xf == u8(dns.Rcode.No_Error),
 		"the remembered verdict answered a query this server was not validating",
 	)
-	testing.expect(t, sync.atomic_load(&m.seen) > asked, "the upstream was not asked once the verdict stopped applying")
+	testing.expect(
+		t,
+		sync.atomic_load(&f.mock.seen) > asked,
+		"the upstream was not asked once the verdict stopped applying",
+	)
+
+	free_all(context.temp_allocator)
+}
+
+/*
+An `Indeterminate` verdict is not a verdict to keep.
+
+The two share a branch because both are SERVFAIL to the client, and they are
+opposite statements about the answer: `Bogus` was checked and failed, while
+`Indeterminate` is this server saying it could not finish looking - a key lookup
+that got no reply, a parent that answered SERVFAIL, a walk that ran out of its
+allowance. Kept, one lost datagram would refuse a perfectly good name to every
+client for a minute, with the upstream never asked again in the meantime.
+
+The mock here answers the client's question and nothing else, which is exactly
+that: the walk cannot be made, and the answer might have been fine.
+*/
+@(test)
+test_a_verdict_that_could_not_be_reached_is_not_remembered :: proc(t: ^testing.T) {
+	f: Fixture
+	if !fixture_start(t, &f, answer_keys = false) {
+		return
+	}
+	defer fixture_stop(&f)
+
+	query := bogus_client_query()
+	first, outcome, served := handle_query(&f.server, query, .UDP, "test", context.temp_allocator)
+	testing.expect(t, served, "no response was produced")
+	testing.expect_value(t, outcome, Outcome.Failed)
+	testing.expect(t, is_servfail(first), "the query was not refused")
+
+	_, _, found := cache.get(f.answers, f.key, context.temp_allocator)
+	testing.expect(t, !found, "a walk this server could not finish was stored as a verdict")
+
+	asked := sync.atomic_load(&f.mock.seen)
+	_, _, served_again := handle_query(&f.server, query, .UDP, "test", context.temp_allocator)
+	testing.expect(t, served_again, "no response was produced for the second query")
+	testing.expect(
+		t,
+		sync.atomic_load(&f.mock.seen) > asked,
+		"the second query was answered from a memory of a verdict that was never reached",
+	)
+
+	free_all(context.temp_allocator)
+}
+
+/*
+The memory gives way to what `serve_stale` is holding.
+
+`cache.put` replaces whatever is under the key, and on this path what is under
+the key is the expired answer kept for exactly the outage that may be starting.
+A zone midway through a key rollover is the common cause of a `Bogus` verdict
+and also the moment an operator most wants RFC 8767's fallback intact, so the
+verdict is not written down while there is something to fall back on: this name
+goes on costing what it cost before.
+*/
+@(test)
+test_a_verdict_does_not_evict_the_answer_kept_for_an_outage :: proc(t: ^testing.T) {
+	f: Fixture
+	if !fixture_start(t, &f, answer_keys = true, serve_stale = true) {
+		return
+	}
+	defer fixture_stop(&f)
+
+	// An answer for the same question, expired, and inside the window
+	// `serve_stale` keeps one for.
+	wire := unsigned_answer()
+	decoded, derr := dns.decode_message(wire, context.temp_allocator)
+	if !testing.expect(t, derr == .None, "the fixture does not decode") {
+		return
+	}
+	if !testing.expect(t, cache.put(f.answers, f.key, wire, decoded), "the answer was not cached") {
+		return
+	}
+	if e, in_cache := f.answers.entries[f.key]; in_cache {
+		e.expires = time.time_add(time.now(), -1 * time.Second)
+		e.inserted = time.time_add(time.now(), -3600 * time.Second)
+	} else {
+		testing.expect(t, false, "the answer went in under another key")
+		return
+	}
+
+	out, outcome, served := handle_query(&f.server, bogus_client_query(), .UDP, "test", context.temp_allocator)
+	testing.expect(t, served, "no response was produced")
+	testing.expect_value(t, outcome, Outcome.Failed)
+	testing.expect(t, is_servfail(out), "the query was not refused")
+
+	stored, hit, found := cache.get(f.answers, f.key, context.temp_allocator)
+	if testing.expect(t, found, "the expired answer was dropped along with the verdict") {
+		testing.expect(t, hit.stale, "the entry is no longer the expired answer")
+		testing.expect(t, !hit.bogus, "the verdict replaced the answer being kept for an outage")
+		testing.expect(
+			t,
+			len(stored) >= dns.HEADER_SIZE && stored[7] == 1,
+			"what is left under the key is not the answer that was there",
+		)
+	}
 
 	free_all(context.temp_allocator)
 }

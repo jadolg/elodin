@@ -2013,35 +2013,7 @@ resolve_query :: proc(
 			from := answering_upstream(winner)
 			report_bogus(q, client, result, from)
 			out, built := dnssec_failure_response(msg, result, allocator, limit)
-			/*
-			The verdict is remembered, so the next client asking the same
-			question is not another exchange with the upstream.
-
-			Nothing was cached on this path before, and a verdict is the one
-			answer nobody ever stops asking for: a zone with a broken signature
-			refuses every query for it, and each refusal was a round trip to an
-			upstream that was only ever going to hand back the same unusable
-			answer. Whoever is asking decides how many of those there are, which
-			makes a name somebody controls and deliberately breaks the cheapest
-			way there is to spend this server's upstream budget - and RFC 4035
-			section 4.7 allows precisely this store to close it. The lifetime is
-			`cache.BOGUS_TTL` rather than anything the answer carried; see there
-			for why a minute.
-
-			Stored as the refusal itself, which is what the next client is owed
-			and what `serve_bogus_verdict` hands back. The answer that failed to
-			validate is not kept at all - the entry is this server's own
-			SERVFAIL, so there is nothing in the cache for a later change of
-			mind, a reload or a bug to serve as data.
-
-			`built` first, because a response that would not encode is not one to
-			remember; `cache.put` refuses a truncated one for the same reason.
-			*/
-			if built && s.cfg.cache.enabled {
-				if refusal, rerr := dns.decode_message(out, allocator); rerr == .None {
-					cache.put(s.answers, key, out, refusal, bogus = true)
-				}
-			}
+			remember_bogus_verdict(s, key, msg, result, stale_hit, unproven_apex_ds, allocator)
 			log_query(s, client, proto, q, .Failed, fmt.tprintf("dnssec:%s", from), started)
 			return out, .Failed, built
 		case .Secure:
@@ -2698,6 +2670,95 @@ Cached_Answer :: struct {
 	// The rule sets the re-match is made against, and the number stamped on the
 	// entry when it comes back clean.
 	checked: u64,
+}
+
+/*
+Write down that this question's answer did not validate.
+
+Nothing on this path was kept before, and a verdict is the one answer nobody
+ever stops asking for: a zone with a broken signature refuses every query for
+it, and each refusal was a round trip to an upstream that was only ever going to
+hand back the same unusable answer. Whoever is asking decides how many of those
+there are, which makes a name somebody controls and deliberately breaks the
+cheapest way there is to spend this server's upstream budget - and RFC 4035
+section 4.7 allows precisely this store to close it. The lifetime is
+`cache.BOGUS_TTL` rather than anything the answer carried; see there for why a
+minute.
+
+What is kept is the refusal and never the answer that failed, so there is
+nothing in the cache for a later change of mind, a reload or a bug to serve as
+data. Four things are not kept at all:
+
+`Indeterminate`. The branch above handles it beside `Bogus` because both are
+SERVFAIL to the client, but they are opposite statements: `Bogus` is an answer
+that was checked and failed, while `Indeterminate` is this server saying it
+could not finish looking - a DS or DNSKEY lookup that got no reply, a parent
+that answered SERVFAIL, a walk that ran out of its per-request allowance
+(`walk_reason` in `src/dnssec/validate.odin` lists them). Memoising that would
+turn one lost datagram, or one request that ran out of budget under load, into a
+minute of hard refusal for every client asking a name that is perfectly fine -
+and the recovery would not be noticed until the entry expired. It is the same
+transient this procedure declines to memoise at the `Unreadable` verdict and at
+`unproven_apex_ds`, and it is why the budget case is dangerous rather than
+merely wasteful: heavy load would convert itself into refusals.
+
+An answer with a stale entry behind it. `cache.put` replaces what is under the
+key, and on this path what is under the key is the expired answer `serve_stale`
+was holding for exactly the outage that may be starting. A zone mid key-rollover
+is the common cause of a `Bogus` verdict and also the moment an operator most
+wants RFC 8767's fallback intact, so the memory gives way to it: while there is
+something expired to fall back on, this name costs what it cost before.
+
+A routed apex `DS` nothing proved, on the terms the two stores below give: an
+answer that stood in for a statement the parent never made is not one to hand to
+the next client with the parent still unasked.
+
+And a refusal that would not encode, which is what the build below is checked
+for - `cache.put` refuses a truncated one for the same reason.
+
+The copy that is kept is built here rather than taken from the client's: this
+one carries the extended error whoever caused the fetch, and is built to no
+client's datagram limit. `dns.make_response` attaches an OPT record only when
+the query carried one, and `attach_extended_error` writes into that record or
+nowhere - so storing the copy a client without EDNS was answered with would hand
+every EDNS client that hit the entry a bare SERVFAIL with no EDE for the next
+minute, decided by which client happened to miss first. `match_client_opt` takes
+the record back out for a client that asked without EDNS, and `fit_response`
+shrinks the message to whatever this one can receive, exactly as they do for any
+other entry.
+*/
+@(private)
+remember_bogus_verdict :: proc(
+	s: ^Server,
+	key: string,
+	msg: dns.Message,
+	result: dnssec.Result,
+	stale_hit: Cached_Answer,
+	unproven_apex_ds: bool,
+	allocator: mem.Allocator,
+) {
+	if !s.cfg.cache.enabled || result.status != .Bogus || stale_hit.wire != nil || unproven_apex_ds {
+		return
+	}
+	asked := msg
+	if _, has := dns.find_opt(msg); !has {
+		opt := make([]dns.Record, 1, allocator)
+		// The payload size is this server's to state and `advertise_udp_size`
+		// writes its own over it on the way out, so what is in here only has to
+		// be a number. DO is the client's, and the key already keeps the two
+		// kinds of client apart.
+		opt[0] = dns.make_opt(UPSTREAM_UDP_SIZE, dns.edns_do(msg))
+		asked.additional = opt
+	}
+	wire, built := dnssec_failure_response(asked, result, allocator, dns.MAX_MESSAGE)
+	if !built {
+		return
+	}
+	refusal, derr := dns.decode_message(wire, allocator)
+	if derr != .None {
+		return
+	}
+	cache.put(s.answers, key, wire, refusal, bogus = true)
 }
 
 /*
