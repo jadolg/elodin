@@ -913,6 +913,7 @@ dnssec:
   enabled: true
   max_nsec3_iterations: 100
   max_chain_walks: 0     # 0 is server.workers less a reserved quarter
+  max_connection_walks: 0 # the same, from server.max_connections
   trust_anchors: []      # empty uses the built-in root keys
 ```
 
@@ -966,15 +967,16 @@ walking, so a flood is answered rather than absorbed. That is the trade — work
 starvation for upstream volume, degraded rather than down — and an operator who
 would rather cap the volume sets a smaller number here.
 
-There are two of these bounds, and this setting is the one for the shared handler
-pool — UDP and DoH over HTTP/2. TCP, DoT and DoH over HTTP/1.1 answer on the
-connection's own thread, and those get a bound of their own, derived the same way
+There are two of these bounds, and `max_chain_walks` is the one for the shared
+handler pool — UDP and DoH over HTTP/2. TCP, DoT and DoH over HTTP/1.1 answer on
+the connection's own thread and get `max_connection_walks`, derived the same way
 from `server.max_connections` and counted separately, so a flood on one transport
-cannot spend the other's allowance. Separately because the two are sized by
-different things: a number right for sixteen workers would refuse ordinary stream
-traffic, and one right for 512 connections would bound the pool at nothing.
-`server.max_connections` is the knob for the second one; there is no third
-setting.
+cannot spend the other's allowance. Two numbers because the two are sized by
+different things: a figure right for sixteen workers would refuse ordinary stream
+traffic, and one right for 512 connections would bound the pool at nothing. The
+defaults differ accordingly — 12 against 16 workers, 384 against 512 connections
+— so lowering one does nothing for the other, and an operator capping the upstream
+volume a flood can provoke has to set both.
 
 What the bound costs while it binds is much more than the flood's own names, and
 it is worth reading before choosing a number. A cached apex is not a cached name

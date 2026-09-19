@@ -2,7 +2,6 @@ package server
 
 import "core:mem"
 import "core:sync"
-import "elodin:config"
 import "elodin:dns"
 import "elodin:dnssec"
 import "elodin:logx"
@@ -147,13 +146,9 @@ start_validator :: proc(s: ^Server) -> bool {
 			anchors = anchors,
 			max_nsec3_iterations = s.cfg.dnssec.max_nsec3_iterations,
 			max_chain_walks = s.cfg.dnssec.max_chain_walks,
-			/*
-			The connection transports get their own, derived from the threads
-			they actually have. Not a setting: what sizes it is
-			`server.max_connections`, which is already one, and a second knob
-			for the same quantity is a second thing to get wrong.
-			*/
-			max_connection_walks = config.derive_chain_walks(s.cfg.server.max_connections),
+			// The connection transports get their own, sized from the threads
+			// they actually have. See `Dnssec_Config.max_connection_walks`.
+			max_connection_walks = s.cfg.dnssec.max_connection_walks,
 		},
 	)
 	// The bound is named here because it is the number an operator watching

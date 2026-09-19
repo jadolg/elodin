@@ -384,6 +384,22 @@ Budget :: struct {
 	// Which set of threads this question is spending, and so which of
 	// `Validator.max_walks` bounds it. See `Walk_Pool`.
 	pool:          Walk_Pool,
+	/*
+	Set while work is being done that cannot change the verdict.
+
+	Only the address hints beside an answer, today. They are authenticated after
+	the verdict is settled and dropped rather than fatal when anything runs
+	short, so a walk of theirs that finds no slot has stopped nothing: the
+	client gets the answer it was getting, with the AD bit it had earned, one
+	round trip poorer. Counting that would have
+	`elodin_dnssec_queries_shed_total` move on a question that was answered
+	perfectly, which is the one thing the number must not do.
+
+	The slot is still asked for - a hint walk goes upstream like any other, and
+	that is what the bound is about - it is only the counting and the
+	`shed_walk` marker that are held back.
+	*/
+	best_effort:   bool,
 	// The hashing a denial proved with NSEC3 may spend, which no count of
 	// lookups or verifications bounds: see `MAX_NSEC3_ROUNDS_PER_QUERY`.
 	nsec3:         Nsec3_Budget,
@@ -698,6 +714,17 @@ Result :: struct {
 	// A short phrase for the log line and the extended DNS error.
 	reason:    string,
 	/*
+	Whether a chain walk of this question was turned away for want of a slot.
+
+	Carried as a fact rather than left for the caller to read off `reason`,
+	which is one string for a message that can hold several verdicts: a response
+	whose RRsets are partly shed and partly forged aggregates to the forgery,
+	and a caller matching the string would then be wrong about both. The caller
+	still decides what to do with it - a proven forgery is a forgery whatever
+	else happened - but it decides on the fact.
+	*/
+	shed:      bool,
+	/*
 	The RRsets the verdict actually rests on, as owner/type/class triples, in
 	the section each was read from.
 
@@ -908,7 +935,9 @@ validate :: proc(
 		}
 	}
 	if answerable > 0 {
-		return validate_answer(v, &budget, msg, qname, qtype, class, unix, now, allocator)
+		out := validate_answer(v, &budget, msg, qname, qtype, class, unix, now, allocator)
+		out.shed = budget.shed_walk
+		return out
 	}
 	/*
 	A question about RRSIG records themselves is the one case where an answer
@@ -919,7 +948,9 @@ validate :: proc(
 	if qtype == .RRSIG && len(msg.answer) > 0 {
 		return {status = .Insecure, reason = "nothing to authenticate"}
 	}
-	return validate_denial(v, &budget, msg, qname, qtype, class, unix, now, allocator)
+	denied := validate_denial(v, &budget, msg, qname, qtype, class, unix, now, allocator)
+	denied.shed = budget.shed_walk
+	return denied
 }
 
 /*
@@ -1558,6 +1589,12 @@ validated_hints :: proc(
 	if len(targets) == 0 {
 		return nil
 	}
+	// Everything below this line is a bonus for the client, not a part of the
+	// verdict - see `Budget.best_effort`. Restored rather than cleared, since
+	// nothing says a caller cannot already be inside such a stretch.
+	outer_best_effort := budget.best_effort
+	budget.best_effort = true
+	defer budget.best_effort = outer_best_effort
 
 	out := make([dynamic]Authenticated_Set, 0, 2 * len(targets), allocator)
 	seen := make([dynamic]dns.Question, 0, 2 * len(targets), allocator)
@@ -2961,10 +2998,14 @@ may_look_up :: proc(v: ^Validator, budget: ^Budget) -> bool {
 	// walk it goes on to try is refused too - a single question would move the
 	// counter five or ten times, and the number an operator reads against a
 	// SERVFAIL rise would be several times what happened.
-	if !budget.shed_walk {
-		sync.atomic_add(&v.shed, 1)
+	// Neither counted nor remembered for work that could not have changed the
+	// verdict; see `Budget.best_effort`.
+	if !budget.best_effort {
+		if !budget.shed_walk {
+			sync.atomic_add(&v.shed, 1)
+		}
+		budget.shed_walk = true
 	}
-	budget.shed_walk = true
 	return false
 }
 

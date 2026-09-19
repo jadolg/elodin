@@ -439,10 +439,11 @@ dnssec:
   # in the thirty a walk may take, not to cap what this resolver validates.
   #
   # This is the bound for UDP and DoH/2, which share the handler pool. TCP, DoT
-  # and DoH/1.1 answer on the connection's own thread and get a bound of their
-  # own, derived the same way from max_connections and counted apart, so a flood
-  # on one transport cannot spend the other's allowance. There is no third
-  # setting: max_connections sizes the second one.
+  # and DoH/1.1 answer on the connection's own thread and get
+  # max_connection_walks below, counted apart so a flood on one transport
+  # cannot spend the other's allowance. The two defaults differ by an order of
+  # magnitude because the thread counts do, so lowering one does nothing for
+  # the other.
   #
   # While it binds, every cold name is SERVFAIL — including names in unsigned
   # zones, since a zone cannot be known to be unsigned without the DS lookup
@@ -454,6 +455,13 @@ dnssec:
   # a walk also holds one racer job per candidate server, so raise
   # upstream_workers with the number of upstreams.
   # max_chain_walks: 0
+
+  # The same for TCP, DoT and DoH/1.1, which answer on the connection's own
+  # thread. 0 is server.max_connections less a reserved quarter — 384 at the
+  # default 512. Set this rather than cutting max_connections when what you want
+  # is less upstream volume: max_connections decides how many clients may
+  # connect at all, which is a price legitimate traffic pays for nothing.
+  # max_connection_walks: 0
 
 cookies:
   # Clients that send a DNS cookie get one back (RFC 7873). It costs one hash

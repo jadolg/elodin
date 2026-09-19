@@ -97,6 +97,30 @@ test_chain_walks_are_derived_at_load :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_connection_walks_are_derived_from_the_connection_limit :: proc(t: ^testing.T) {
+	// Sized from the threads the stream transports actually have, which is
+	// `max_connections` and not the handler pool - two numbers an order of
+	// magnitude apart, so one figure would be wrong at both ends.
+	cfg, err := load_string(
+		"upstream:\n  servers: [1.1.1.1]\nserver:\n  workers: 16\n  max_connections: 512\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, err == nil, "expected a clean load")
+	testing.expect_value(t, cfg.dnssec.max_chain_walks, derive_chain_walks(16))
+	testing.expect_value(t, cfg.dnssec.max_connection_walks, derive_chain_walks(512))
+
+	// And it is a setting, because `max_connections` is the wrong lever: it
+	// would cut how many clients may connect at all.
+	set, serr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  max_connection_walks: 24\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, serr == nil, "expected a clean load")
+	testing.expect_value(t, set.dnssec.max_connection_walks, 24)
+	free_all(context.temp_allocator)
+}
+
+@(test)
 test_a_negative_chain_walk_bound_is_refused :: proc(t: ^testing.T) {
 	// Not read as one more way of asking for the default: the bound is a
 	// denial-of-service guard, so a number that cannot be one is a mistake to
@@ -106,6 +130,12 @@ test_a_negative_chain_walk_bound_is_refused :: proc(t: ^testing.T) {
 		context.temp_allocator,
 	)
 	testing.expect(t, err != nil, "a negative chain-walk bound should be refused")
+
+	_, cerr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  max_connection_walks: -1\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, cerr != nil, "a negative connection-walk bound should be refused")
 	free_all(context.temp_allocator)
 }
 

@@ -330,6 +330,24 @@ Dnssec_Config :: struct {
 	the upstream volume a flood can provoke, which the reservation does not.
 	*/
 	max_chain_walks:      int,
+	/*
+	The same, for the transports answered on a thread of their own: TCP, DoT and
+	HTTP/1.1.
+
+	A setting of its own because the two are sized by different things and the
+	numbers differ by an order of magnitude - zero derives it from
+	`server.max_connections` the same way `max_chain_walks` is derived from
+	`server.workers`, so the default is 384 against 512 connections where the
+	other is 12 against 16 workers.
+
+	It exists because `server.max_connections` is the wrong lever for the job an
+	operator would reach for it to do. Lowering `max_chain_walks` caps the
+	upstream volume a flood can provoke through the shared pool; without this,
+	the only way to cap the same thing on the stream transports was to cut how
+	many clients may connect at all, which is a price for legitimate traffic
+	that has nothing to do with DNSSEC.
+	*/
+	max_connection_walks: int,
 }
 
 Cookie_Config :: struct {
@@ -1112,8 +1130,10 @@ default_config :: proc() -> Config {
 	c.dnssec = Dnssec_Config {
 		enabled              = true,
 		max_nsec3_iterations = 100,
-		// Derived from `server.workers` at start-up; see the field.
+		// Derived from `server.workers` and `server.max_connections` at load;
+		// see the fields.
 		max_chain_walks      = 0,
+		max_connection_walks = 0,
 	}
 	c.cookies = Cookie_Config {
 		enabled  = true,

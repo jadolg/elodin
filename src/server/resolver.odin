@@ -2017,7 +2017,17 @@ resolve_query :: proc(
 		)
 		#partial switch result.status {
 		case .Bogus, .Indeterminate:
-			shed := result.reason == dnssec.WALKS_IN_FLIGHT
+			/*
+			The fact the validator carried, and only where the verdict is
+			undecided.
+
+			`Bogus` outranks `Indeterminate`, so a response holding both a shed
+			walk and a genuine forgery comes back as the forgery - which is what
+			it is, and is counted and logged as one. Shedding is the reading only
+			where nothing was proved against the answer, which is the case the
+			counter and the once-only line are for.
+			*/
+			shed := result.shed && result.status == .Indeterminate
 			/*
 			Everything but our own shedding is counted as `bogus`.
 
