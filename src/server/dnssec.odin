@@ -114,14 +114,67 @@ start_validator :: proc(s: ^Server) -> bool {
 		return false
 	}
 
+	/*
+	A number that leaves no reservation is the bound switched off, and #356 with
+	it: the walks are what hold the workers, so allowing as many walks as there
+	are workers allows a client to hold all of them.
+
+	Only for a figure somebody wrote. On a one-worker configuration the
+	derivation has nowhere to reserve from and returns one, and a server warning
+	about the number it chose for itself is a warning nobody can act on or
+	silence.
+
+	Said rather than refused or held down, which is this file's rule for a
+	configured number everywhere else: an operator who names a figure gets it. A
+	resolver that will not start, or one quietly running at a number nobody
+	chose, is worse than one that says what it is doing. The comparison is
+	against the handler pool because that is what the bound protects - see
+	`handle_query`'s `shared_worker`.
+	*/
+	if !s.cfg.server.sizing.derived_chain_walks && s.cfg.dnssec.max_chain_walks >= s.cfg.server.workers {
+		logx.warnf(
+			"dnssec: max_chain_walks %d leaves none of the %d workers reserved, so a flood of fresh names can hold them all; see issue #356",
+			s.cfg.dnssec.max_chain_walks,
+			s.cfg.server.workers,
+		)
+	}
+	// The same for the other pool, and said the same way. A bound that allows as
+	// many walks as there are connection threads is that bound switched off, and
+	// nothing else in the configuration would tell an operator so.
+	if !s.cfg.server.sizing.derived_connection_walks &&
+	   s.cfg.dnssec.max_connection_walks >= s.cfg.server.max_connections {
+		logx.warnf(
+			"dnssec: max_connection_walks %d leaves none of the %d connection threads reserved, so a flood of fresh names can hold them all; see issue #356",
+			s.cfg.dnssec.max_connection_walks,
+			s.cfg.server.max_connections,
+		)
+	}
+
 	s.validator = dnssec.make_validator(
 		validator_query,
 		s,
-		dnssec.Options{anchors = anchors, max_nsec3_iterations = s.cfg.dnssec.max_nsec3_iterations},
+		dnssec.Options {
+			anchors = anchors,
+			max_nsec3_iterations = s.cfg.dnssec.max_nsec3_iterations,
+			max_chain_walks = s.cfg.dnssec.max_chain_walks,
+			// The connection transports get their own, sized from the threads
+			// they actually have. See `Dnssec_Config.max_connection_walks`.
+			max_connection_walks = s.cfg.dnssec.max_connection_walks,
+		},
 	)
+	// The bound is named here because it is the number an operator watching
+	// `elodin_dnssec_queries_shed_total` rise is being told to raise, and
+	// `config.derive_chain_walks` usually picked it rather than the file. Read
+	// back off the validator rather than off the configuration: a validator
+	// built from a configuration that never went through `config.validate` -
+	// which is every one the tests assemble by hand - substitutes its own
+	// default, and a log line naming a number nothing is using is worse than no
+	// line at all.
 	logx.infof(
-		"dnssec: validating against %d trust anchor(s)",
+		"dnssec: validating against %d trust anchor(s), at most %d chain walks upstream at once on the handler pool and %d on connection threads",
 		len(anchors) if len(anchors) > 0 else len(dnssec.root_anchors()),
+		dnssec.chain_walk_limit(s.validator, .Shared),
+		dnssec.chain_walk_limit(s.validator, .Connection),
 	)
 	return true
 }
@@ -162,6 +215,29 @@ Runs on the handler thread that is already answering a client, so it borrows
 that request's arena and blocks on the same upstream group. Racing upstreams
 submit to their own pool, so there is no way for this to wait on a worker it is
 occupying.
+
+It is still a worker held for a round trip, and a chain walk makes one of these
+per label of a name the client chose. What stops a client choosing how many
+workers are held that way is `dnssec.max_chain_walks`, which
+`config.derive_chain_walks` sets to everything but a reserved quarter of the
+pool: that quarter cannot be inside a walk, so it turns over in a round trip
+rather than in thirty of them, whatever a flood is doing. Free of the walk
+rather than idle - a reserved worker may still be parked on its own upstream
+forward, which is not bounded here. A walk past the bound reads the caches and gives up where it would
+have called this, which the client sees as the SERVFAIL an unreachable authority
+produces.
+
+Not only the flood's own names, and the difference is worth knowing before
+setting the number: a walk needs a DS lookup at every label below the deepest
+zone it has cached, and it cannot call a zone unsigned without one either - so
+while every slot is held, what still answers is what the caches hold, and every
+other cold name is SERVFAIL, signed or not.
+
+Which is why only a query on a pool worker spends a slot. The bound is there to
+keep these workers free; a question answered on its own connection thread is
+bounded by `max_connections` instead and is never turned away. See
+`handle_query`'s `shared_worker`, `Validator.walks`, `dnssec.max_chain_walks`
+and issue #356.
 */
 @(private)
 validator_query :: proc(
@@ -287,6 +363,23 @@ otherwise push ordinary answers past the point where they need a retry over TCP.
 // Set once the first answer has lost its AD bit to a failed rebuild; see below.
 @(private)
 prune_failure_reported: bool
+
+/*
+And a third, for the verdict this server reached about itself.
+
+Same argument as the one above, one step further in. A shed walk is an
+`Indeterminate`, so it would share that flag - and the two are provoked by
+different things at different rates. A shed is the only one of the three whose
+rate a client chooses: under a flood it is every query, so sharing would have
+the first shed spend the `warn` that a genuinely unreachable parent needed, or
+the reverse. They are also the two an operator would act on differently, which
+is the test for whether a flag is worth splitting.
+
+Its line says what no other line here can: which setting was reached, and where
+the count lives. See `report_bogus`.
+*/
+@(private)
+chain_walk_shed_reported: bool
 
 @(private)
 present_response :: proc(
@@ -538,8 +631,11 @@ about.
 indeterminate_reported: bool
 
 @(private)
-report_bogus :: proc(q: dns.Question, client: string, result: dnssec.Result, from: string) {
+report_bogus :: proc(q: dns.Question, client: string, result: dnssec.Result, from: string, shed := false) {
 	reported := &bogus_reported if result.status == .Bogus else &indeterminate_reported
+	if shed {
+		reported = &chain_walk_shed_reported
+	}
 	say, first := report_once(reported, logx.enabled(.Debug))
 	if !say {
 		return
@@ -547,6 +643,21 @@ report_bogus :: proc(q: dns.Question, client: string, result: dnssec.Result, fro
 	format := "dnssec: %s %s from %s did not validate: %v (%s); answer came from %s"
 	if !first {
 		logx.debugf(format, dns.type_name(q.type), dns.name_trim_root(q.name), client, result.status, result.reason, from)
+		return
+	}
+	/*
+	The one verdict here that is about this server rather than about the answer,
+	so the line says so and names the setting - and leaves the upstream out of
+	it, since blaming a server that answered perfectly well for a lookup this
+	one declined to make would send an operator to the wrong place entirely.
+	*/
+	if shed {
+		logx.warnf(
+			"dnssec: %s %s from %s was not validated: this server was already walking as many chains of trust as dnssec.max_chain_walks and dnssec.max_connection_walks allow, so it stopped looking. Counted as elodin_dnssec_queries_shed_total; further ones are logged at debug level",
+			dns.type_name(q.type),
+			dns.name_trim_root(q.name),
+			client,
+		)
 		return
 	}
 	logx.warnf(format, dns.type_name(q.type), dns.name_trim_root(q.name), client, result.status, result.reason, from)
@@ -583,8 +694,28 @@ dnssec_failure_response :: proc(
 	case result.reason == dnssec.NSEC3_OVER_CEILING:
 		code = u16(EDE_UNSUPPORTED_NSEC3_ITERATIONS)
 	}
+	/*
+	The reason goes out as RFC 8914 extra text, except this one.
+
+	Every other reason here describes the answer or the zone, which is what the
+	client asked about. `WALKS_IN_FLIGHT` describes how busy this server is
+	right now, and that is a different thing to hand out: it is state one client
+	can read about every other client's traffic. An attacker running a slow
+	probe for any cold name beside their flood would be told exactly when the
+	slots saturate, which turns tuning the flood from guesswork into a closed
+	loop.
+
+	The code is unchanged - 22, the same an unreachable authority gets, which is
+	the truth here - and the operator loses nothing: the reason is in the log
+	line and the count is in `elodin_dnssec_queries_shed_total`. A client is
+	told the answer could not be established, which is all it can act on.
+	*/
+	text := result.reason
+	if result.reason == dnssec.WALKS_IN_FLIGHT {
+		text = ""
+	}
 	resp := dns.make_response(query, .Serv_Fail, allocator)
-	attach_extended_error(&resp, code, result.reason, allocator)
+	attach_extended_error(&resp, code, text, allocator)
 
 	encoded, _, err := dns.encode_message(resp, allocator, limit)
 	if err != .None {

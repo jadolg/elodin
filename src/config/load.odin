@@ -1435,6 +1435,8 @@ load_dnssec :: proc(l: ^Loader, cfg: ^Config) {
 	}
 	opt_bool(l, n, "enabled", &cfg.dnssec.enabled, "dnssec")
 	opt_int(l, n, "max_nsec3_iterations", &cfg.dnssec.max_nsec3_iterations, "dnssec")
+	opt_int(l, n, "max_chain_walks", &cfg.dnssec.max_chain_walks, "dnssec")
+	opt_int(l, n, "max_connection_walks", &cfg.dnssec.max_connection_walks, "dnssec")
 
 	if a := yaml.get(n, "trust_anchors"); !yaml.is_null(a) {
 		if list, ok := yaml.as_string_list(a, l.allocator); ok {
@@ -2357,6 +2359,25 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 		cfg.server.sizing.derived_upstream_workers = true
 	}
 	/*
+	And the chain-walk bound, here rather than at start-up for the reason above:
+	`--check` and the run that follows it have to agree, and an operator told to
+	raise a number has to be able to see what it currently is.
+
+	The worker count is settled by now, which is why it is derived after it. See
+	`derive_chain_walks`.
+	*/
+	if cfg.dnssec.max_chain_walks == 0 {
+		cfg.dnssec.max_chain_walks = derive_chain_walks(cfg.server.workers)
+		cfg.server.sizing.derived_chain_walks = true
+	}
+	// The connection transports have threads of their own and as many of them
+	// as `max_connections` allows, so their bound comes from that rather than
+	// from the pool. See `Dnssec_Config.max_connection_walks`.
+	if cfg.dnssec.max_connection_walks == 0 {
+		cfg.dnssec.max_connection_walks = derive_chain_walks(cfg.server.max_connections)
+		cfg.server.sizing.derived_connection_walks = true
+	}
+	/*
 	The UDP readers, sized the same way and reported the same way.
 
 	Refused rather than clamped, for the reason `max_udp_response` is: the
@@ -2551,6 +2572,18 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 
 	if cfg.dnssec.max_nsec3_iterations < 0 {
 		errorf(l, "dnssec.max_nsec3_iterations must not be negative")
+	}
+	// Zero derives it from `server.workers`. Negative is not "no limit" - the
+	// limit is a denial-of-service guard - so it is a mistake worth reporting
+	// rather than reading as one more way of asking for the default.
+	if cfg.dnssec.max_chain_walks < 0 {
+		errorf(l, "dnssec.max_chain_walks must not be negative; 0 derives it from server.workers")
+	}
+	if cfg.dnssec.max_connection_walks < 0 {
+		errorf(
+			l,
+			"dnssec.max_connection_walks must not be negative; 0 derives it from server.max_connections",
+		)
 	}
 	// Parsed here rather than at startup so `--check` reports a bad anchor
 	// instead of a resolver that comes up refusing every name.

@@ -1825,7 +1825,9 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 			return
 		}
 
-		response, _, ok := handle_query(s, query, proto, client, context.temp_allocator)
+		// TCP and DoT: this is the connection's own thread, so a slow answer
+		// here costs nobody but this client.
+		response, _, ok := handle_query(s, query, proto, client, context.temp_allocator, shared_worker = false)
 		if !ok || len(response) == 0 {
 			free_all(context.temp_allocator)
 			continue

@@ -59,6 +59,11 @@ Options :: struct {
 	// Iteration counts above this make a proof unusable rather than trusted.
 	max_nsec3_iterations: int,
 	max_cached_zones:     int,
+	// Chain walks that may be making upstream lookups at once, on a worker of
+	// the caller's shared pool and on a thread belonging to one connection.
+	// Zero takes `DEFAULT_MAX_CHAIN_WALKS`; see `Validator.walks`.
+	max_chain_walks:      int,
+	max_connection_walks: int,
 }
 
 Validator :: struct {
@@ -108,8 +113,92 @@ Validator :: struct {
 	collision costs is the DS lookup the slot was saving.
 	*/
 	non_cut_seed:         u32,
+	/*
+	Chain walks in flight, and the most there may be at once.
+
+	The walk is the one thing in this package that blocks the thread already
+	answering a client, and it blocks it once per label: `zone_trust` descends
+	from the apex asking a DS per step, and each step that misses both caches is
+	an upstream round trip taken in line. Thirty-two of those - what
+	`MAX_LOOKUPS_PER_QUERY` allows - is the better part of a second at ordinary
+	RTT, and a client choosing names whose *upper* labels are fresh pays that on
+	every question however often it asks. Nothing cached can help; the note on
+	`MAX_CACHED_NON_CUTS` says why, and #356 is the record of it.
+
+	So the bound is not on the walk but on how many of them may be doing this at
+	once - two bounds, one per `Walk_Pool`, because the shared handler pool and
+	the connection threads are sized by different things and a flood on one must
+	not spend the other's allowance. Past `max_chain_walks`, a walk runs against the caches alone and
+	answers `Indeterminate` where it would have gone upstream - the same verdict,
+	and the same extended error, that an upstream which did not answer produces.
+	The flood then holds a fixed number of threads *for a walk* rather than all of
+	them: the rest may still be busy with their own upstream forward, which
+	nothing here bounds, but they come back in a round trip instead of in the
+	thirty a walk may take. That is the difference between a resolver degraded
+	and one down.
+
+	A slot is taken at the first lookup that would go upstream, not on the way
+	into the walk, so a walk both caches can answer never asks for one and a
+	flood holding every slot cannot stop it. Once taken it is held until the
+	*question* is answered rather than until that walk ends - see
+	`Budget.keep_slot` - so a slot means "a question that has gone upstream for
+	a chain and is still being validated", which includes the verifying and
+	hashing between its walks. Deliberately: a question that has already spent
+	round trips must not be cut off halfway and have them thrown away, and what
+	it can spend after the first lookup is bounded by
+	`MAX_LOOKUPS_PER_QUERY`, `MAX_VERIFICATIONS_PER_QUERY` and
+	`MAX_NSEC3_ROUNDS_PER_QUERY` like everything else.
+
+	What such a flood *does* stop, and it is worth being exact because it is much
+	more than it sounds: any walk that needs even one round trip, which is very
+	nearly every cold name there is.
+
+	Two steps to that. A cached apex is not a cached name - a name below one
+	still costs a DS per label to rule out a cut, and only the non-cut memo makes
+	those free - so a hostname nobody has asked for before under a zone this
+	resolver knows well is refused.
+	`test_a_shed_walk_below_a_warm_apex_still_stops` pins that. And an *unsigned*
+	name is refused with it: `zone_step` cannot say `.Insecure` without the DS
+	lookup that proves there is no delegation, so a name that would have been
+	served insecure comes back SERVFAIL instead.
+	`test_a_shed_walk_cannot_tell_an_unsigned_zone_from_a_signed_one` pins that
+	one. So while every slot is held, what still answers is what both caches
+	hold, and nothing else.
+
+	That is why the bound is a reservation rather than a ceiling, and why it is
+	spent only by queries holding a worker somebody else is waiting for - see
+	`Budget.own_thread`. It is still the trade #356 asks for, the alternative
+	being every thread held and nothing answered at all, and it is why
+	`max_chain_walks` is an operator's number rather than only ours.
+	*/
+	walks:                [Walk_Pool]int,
+	max_walks:            [Walk_Pool]int,
+	// Questions in which a walk found no slot, for the operator who wants to
+	// know why DNSSEC started failing. One per question however many of its
+	// walks were turned away - see `may_look_up`. Read through `queries_shed`.
+	shed:                 u64,
 
 	allocator:            mem.Allocator,
+}
+
+/*
+Which set of threads a question is spending, and so which bound it is held to.
+
+Two, because a resolver has two and they are sized by different things. A
+question on the shared pool competes with every other question for a worker, and
+the pool is small; one answered on its own connection thread competes with the
+other connections, and there are `max_connections` of those. One number for both
+is wrong whichever way it is set - sized for the pool it refuses ordinary stream
+traffic, sized for the connections it bounds the pool at nothing.
+
+Counted apart rather than together for the same reason: a flood on one transport
+must not spend the other's allowance.
+*/
+Walk_Pool :: enum u8 {
+	// A worker of the server's handler pool: UDP and HTTP/2.
+	Shared,
+	// A thread belonging to one connection: TCP, DoT and HTTP/1.1.
+	Connection,
 }
 
 // One slot of `Validator.non_cuts`. An empty `name` is a free slot; a name is
@@ -244,10 +333,73 @@ Budget :: struct {
 	nothing older can be read as this walk's.
 	*/
 	walk_stopped:  string,
+	/*
+	Whether this walk holds one of `Validator.walks`.
+
+	Taken at the first lookup that would go upstream rather than on the way into
+	`zone_trust`, so a walk the caches can answer never asks for one - and kept
+	for the rest of the walk once taken, because a walk that has already spent a
+	round trip must be allowed to finish rather than stopped halfway, which
+	would spend the upstream traffic and get nothing back for it.
+
+	On the budget rather than on the validator because the slot belongs to this
+	walk. `zone_trust` gives it back on the way out, so a later walk in the same
+	query - a second signer, an address hint - asks for its own.
+	*/
+	holds_walk:    bool,
+	/*
+	Whether any walk of this query was turned away for want of a slot.
+
+	Sticky, where `holds_walk` is not, and read by `validate_rrset` before it
+	reports a set forged. A signature whose signer this server could not walk to
+	is skipped rather than tried, and a later walk in the same query can still
+	succeed - the flood ebbs, a slot frees - which would leave the set judged on
+	the signatures that were tried and called a forgery on the strength of one
+	that was not.
+
+	It costs the precision of the extended error on answers that fail anyway:
+	`Bogus` and `Indeterminate` are both SERVFAIL, so what changes is code 6
+	against code 22 and the words in the log. Refusing to accuse a zone of
+	forgery while this server is refusing itself lookups is worth that.
+	*/
+	shed_walk:     bool,
+	/*
+	Whether the slot outlives each walk, which is the caller saying it will give
+	it back itself.
+
+	`validate` sets this, because the verdict is the query's and not any one
+	walk's: one answer can need a walk per signer and another to the owner, and
+	a query whose first walk spent real round trips must not have its second
+	turned away and the traffic thrown out - the whole answer is SERVFAIL either
+	way. Holding it across the query costs no extra round trips, since
+	`MAX_LOOKUPS_PER_QUERY` bounds those whatever the slot does, and it makes the
+	slot mean what the bound is about: a handler thread inside a validation that
+	has gone upstream.
+
+	Left unset by a caller that walks on its own - the tests do - so each walk
+	there gives its slot back on the way out and nothing has to be released by
+	hand.
+	*/
+	keep_slot:     bool,
+	// Which set of threads this question is spending, and so which of
+	// `Validator.max_walks` bounds it. See `Walk_Pool`.
+	pool:          Walk_Pool,
 	// The hashing a denial proved with NSEC3 may spend, which no count of
 	// lookups or verifications bounds: see `MAX_NSEC3_ROUNDS_PER_QUERY`.
 	nsec3:         Nsec3_Budget,
 }
+
+/*
+Why a walk stopped when the server was already walking as many chains as it will.
+
+Shared rather than written twice, for the same reason `NSEC3_OVER_CEILING` is:
+the words reach the client as RFC 8914 extra text, beside code 22, which is what
+an upstream that did not answer gets. That is the honest report - this server
+stopped looking, so nothing about the zone was established - and it must not
+quietly become `DNSSEC Bogus`, which would accuse the zone of a forgery the
+resolver's own load shedding invented.
+*/
+WALKS_IN_FLIGHT :: "too many chains of trust being walked at once"
 
 /*
 Why a walk that came back `Indeterminate` stopped, in the words of the step that
@@ -453,6 +605,17 @@ left bounding one question is `MAX_LOOKUPS_PER_QUERY`, as before, and what would
 change it is not caching but not holding a handler thread for the walk.
 */
 
+/*
+Chain walks allowed upstream at once when the caller names no figure.
+
+The server derives its own from the handler pool - all of it but a reserved
+quarter, so some threads are always free to answer what needs no walk - and this
+is for every other caller, the tests among them. Eight is well past what a single
+thread can want, since a walk is entered and left on one thread and never nested,
+so nothing sequential ever meets it.
+*/
+DEFAULT_MAX_CHAIN_WALKS :: 8
+
 // How long a zone's keys, or the fact that a zone is unsigned, may be reused.
 // The record TTLs decide within these bounds.
 MIN_ZONE_TTL :: 60
@@ -492,6 +655,9 @@ make_validator :: proc(
 		v.max_nsec3_iterations = MAX_NSEC3_ITERATIONS_LIMIT
 	}
 	v.max_cached_zones = opts.max_cached_zones if opts.max_cached_zones > 0 else DEFAULT_MAX_CACHED_ZONES
+	v.max_walks[.Shared] = opts.max_chain_walks if opts.max_chain_walks > 0 else DEFAULT_MAX_CHAIN_WALKS
+	v.max_walks[.Connection] =
+		opts.max_connection_walks if opts.max_connection_walks > 0 else DEFAULT_MAX_CHAIN_WALKS
 	v.zones = make(map[string]^Zone_Entry, 64, allocator)
 	v.non_cuts = make([]Non_Cut, MAX_CACHED_NON_CUTS, allocator)
 	seed: [4]u8
@@ -531,6 +697,22 @@ Result :: struct {
 	status:    Status,
 	// A short phrase for the log line and the extended DNS error.
 	reason:    string,
+	/*
+	Whether this verdict *is* the shedding: a walk of this question was turned
+	away for want of a slot, and that is what the status and reason report.
+
+	Both halves matter, and the second is the one that is easy to lose. A
+	question can have a walk shed somewhere and then fail for a quite different
+	allowance - a verification budget spent, an NSEC3 count over the ceiling -
+	and telling a caller "this was shed" would have it counted as load shedding
+	and logged with words that contradict `reason`. So this is set only where
+	the two agree.
+
+	Carried as a fact rather than left for the caller to match on `reason`,
+	which is a string this package is free to reword and which one clobbered
+	assignment would silently change the meaning of.
+	*/
+	shed:      bool,
 	/*
 	The RRsets the verdict actually rests on, as owner/type/class triples, in
 	the section each was read from.
@@ -638,6 +820,17 @@ validate :: proc(
 	wire: []u8,
 	now: time.Time,
 	allocator := context.temp_allocator,
+	/*
+	False for a question answered on a thread of its own, which is every
+	transport but UDP and HTTP/2. It picks which of the two bounds applies - see
+	`Walk_Pool` - not whether one does: a connection thread is a finite resource
+	too, and a flood that holds every one of them is `max_connections` worth of
+	chain walks and no new connection accepted.
+
+	Defaulted to the shared reading, which is the smaller allowance, so a caller
+	that has not thought about it gets the tighter guard.
+	*/
+	shared_worker := true,
 ) -> Result {
 	msg, derr := dns.decode_message(wire, allocator)
 	if derr != .None {
@@ -646,6 +839,15 @@ validate :: proc(
 	class := msg.question[0].class if len(msg.question) > 0 else dns.Class.IN
 	unix := u32(time.to_unix_seconds(now))
 	budget := query_budget(v)
+	/*
+	The slot is this question's rather than each walk's - see `keep_slot` - so
+	the walks below hand it on to one another and it is given back here, once,
+	whichever of them took it. This also covers a lookup reached without a walk
+	at all, so a slot can never outlive the question that took it.
+	*/
+	budget.keep_slot = true
+	budget.pool = .Shared if shared_worker else .Connection
+	defer end_walk(v, &budget)
 
 	/*
 	REFUSED, SERVFAIL and the rest carry nothing to authenticate. Demanding a
@@ -722,7 +924,10 @@ validate :: proc(
 		}
 	}
 	if answerable > 0 {
-		return validate_answer(v, &budget, msg, qname, qtype, class, unix, now, allocator)
+		out := validate_answer(v, &budget, msg, qname, qtype, class, unix, now, allocator)
+		out.shed = shed_verdict(&budget, out)
+		count_shed(v, out)
+		return out
 	}
 	/*
 	A question about RRSIG records themselves is the one case where an answer
@@ -733,7 +938,10 @@ validate :: proc(
 	if qtype == .RRSIG && len(msg.answer) > 0 {
 		return {status = .Insecure, reason = "nothing to authenticate"}
 	}
-	return validate_denial(v, &budget, msg, qname, qtype, class, unix, now, allocator)
+	denied := validate_denial(v, &budget, msg, qname, qtype, class, unix, now, allocator)
+	denied.shed = shed_verdict(&budget, denied)
+	count_shed(v, denied)
+	return denied
 }
 
 /*
@@ -2027,6 +2235,7 @@ validate_rrset :: proc(
 	*/
 	unsupported := false
 	exhausted := false
+	skipped_for_shed := false
 	/*
 	One chain walk per distinct signer, not one per signature.
 
@@ -2049,6 +2258,10 @@ validate_rrset :: proc(
 		status:      Status,
 		keys:        []Dnskey,
 		established: string,
+		// Whether this walk was the one turned away for want of a slot, rather
+		// than stopped by anything about the zone. Read below, where a
+		// signature it would have judged is skipped.
+		shed:        bool,
 	}
 	walked := make([dynamic]Walked, 0, 4, allocator)
 
@@ -2070,15 +2283,20 @@ validate_rrset :: proc(
 		keys: []Dnskey
 		established: string
 		seen_walk := false
+		walk_shed := false
 		for w in walked {
 			if dns.name_equal_fold(w.signer, sig.signer) {
 				zone_status, keys, established = w.status, w.keys, w.established
+				walk_shed = w.shed
 				seen_walk = true
 				break
 			}
 		}
 		if !seen_walk {
 			zone_status, keys, established = zone_trust(v, budget, sig.signer, now, allocator)
+			// Exact for this walk: `zone_trust` clears the reason on the way in,
+			// so what is there afterwards is this walk's own.
+			walk_shed = budget.walk_stopped == WALKS_IN_FLIGHT
 			// The walk held up and still did not reach the zone this signature
 			// names; see `forget_unreached_non_cut`. The signer is the
 			// response's to choose rather than the client's, so what it can
@@ -2093,10 +2311,16 @@ validate_rrset :: proc(
 					status = zone_status,
 					keys = keys,
 					established = established,
+					shed = walk_shed,
 				},
 			)
 		}
 		if zone_status != .Secure || !dns.name_equal_fold(sig.signer, established) {
+			// A signature this server never looked at, because it refused
+			// itself the lookup that would have reached the signer. Remembered
+			// so the verdict below cannot call the set forged on the strength
+			// of one that was not tried; see that return.
+			skipped_for_shed ||= walk_shed
 			continue
 		}
 		/*
@@ -2189,6 +2413,34 @@ validate_rrset :: proc(
 	case .Bogus:
 		return .Bogus, "", "broken chain of trust", "", {}
 	case .Secure:
+	}
+
+	/*
+	The zone is signed, nothing verified - and this server turned one of its own
+	walks away to get here.
+
+	A signature whose signer could not be walked to is skipped above rather than
+	tried, so what is left to judge the set on is not the whole of what arrived.
+	The walk that stopped may even be the one that mattered: the signer's chain
+	is a prefix of the owner's, so a slot freeing in between is all it takes for
+	the owner walk below to succeed where the signer walk did not, and the set
+	is then called forged on the strength of a signature nobody looked at.
+	`Indeterminate` is the honest report - the same one every other allowance in
+	this file gives, for the same reason.
+
+	This walk, not this question. `Budget.shed_walk` is sticky across the whole
+	question, and reading it here would have a shed anywhere - an earlier RRset,
+	a wholly different name in a CNAME chain - excuse a set that was proved
+	forged on signatures every one of which was tried. That hides real forgeries
+	from `elodin_dnssec_answers_total` and from the log while a flood is on,
+	which is the attacker's own doing twice over. `skipped_for_shed` is set only
+	where a signature of *this* set went unjudged.
+
+	After the switch, so an `Insecure` owner still wins: an unsigned zone needs
+	no signature, and no walk of ours changes that.
+	*/
+	if skipped_for_shed {
+		return .Indeterminate, "", WALKS_IN_FLIGHT, "", {}
 	}
 
 	/*
@@ -2703,6 +2955,130 @@ verified_rrset :: proc(
 // Walking the chain
 // ---------------------------------------------------------------------------
 
+/*
+Take a slot for a lookup that is about to block, or report that there is none.
+
+Exact rather than optimistic. Adding first and backing off when the answer turns
+out to be no is a line shorter, but every loser inflates the count while it does
+so, and losers are what a flood is made of - so walks would be turned away with
+slots genuinely free, at exactly the moment the slots matter. The loop below
+retries only when somebody else changed the count in between, which is progress
+rather than contention.
+
+See `Validator.walks`.
+*/
+@(private)
+take_walk_slot :: proc(v: ^Validator, pool := Walk_Pool.Shared) -> bool {
+	for {
+		held := sync.atomic_load(&v.walks[pool])
+		if held >= v.max_walks[pool] {
+			return false
+		}
+		if _, swapped := sync.atomic_compare_exchange_weak(&v.walks[pool], held, held + 1); swapped {
+			return true
+		}
+	}
+}
+
+@(private)
+drop_walk_slot :: proc(v: ^Validator, pool := Walk_Pool.Shared) {
+	sync.atomic_sub(&v.walks[pool], 1)
+}
+
+/*
+May this walk go upstream, and if it has not asked before, take the slot that
+lets it?
+
+Counted where the answer is no rather than where the slot is refused, so
+`queries_shed` is walks that actually stopped: a walk both caches could answer is
+refused a slot under a flood and finishes anyway, and counting that would leave
+the number moving on a resolver working perfectly.
+*/
+@(private)
+may_look_up :: proc(v: ^Validator, budget: ^Budget) -> bool {
+	if budget.holds_walk {
+		return true
+	}
+	if take_walk_slot(v, budget.pool) {
+		budget.holds_walk = true
+		return true
+	}
+	// Once per query, not once per walk. A shed query holds no slot, so every
+	// walk it goes on to try is refused too - a single question would move the
+	// counter five or ten times, and the number an operator reads against a
+	// SERVFAIL rise would be several times what happened.
+	budget.shed_walk = true
+	return false
+}
+
+/*
+Whether this question's verdict is the shedding, rather than merely a question
+that had a walk shed somewhere along the way.
+
+Both are needed. `shed_walk` alone says a slot was refused, which can happen to a
+question that then answers perfectly or fails for something else entirely; the
+reason alone is a string, and one clobbered assignment would change what a
+caller concludes from it. Together they are exact, and they are read here once
+rather than by every caller that wants to know.
+*/
+@(private)
+shed_verdict :: proc(budget: ^Budget, result: Result) -> bool {
+	return budget.shed_walk && result.reason == WALKS_IN_FLIGHT
+}
+
+/*
+Count a question the shedding actually cost, once, when its verdict is in.
+
+Not where the slot is refused, which is several times for one question and says
+nothing about the outcome: a question can be refused at one signer's walk and
+answered `Secure` on the next signature, or have a bonus address hint refused
+after the answer is already settled. Both are questions this resolver answered
+perfectly, and a number that moved for them would be useless for the one thing
+an operator is told to do with it - read it beside a rise in SERVFAIL.
+
+So it counts what that rise is made of: a question left undecided *by* the
+shedding, which is what `Result.shed` already means - see `shed_verdict`.
+`Bogus` is excluded with `Secure`: the answer was proved forged, and the
+shedding is not what settled it.
+*/
+@(private)
+count_shed :: proc(v: ^Validator, result: Result) {
+	if result.shed && result.status == .Indeterminate {
+		sync.atomic_add(&v.shed, 1)
+	}
+}
+
+// Give back the slot this walk took, if it took one. Safe to call twice, which
+// is what lets `validate` hold the line for any path that walks without going
+// through `zone_trust`.
+@(private)
+end_walk :: proc(v: ^Validator, budget: ^Budget) {
+	if budget.holds_walk {
+		drop_walk_slot(v, budget.pool)
+		budget.holds_walk = false
+	}
+}
+
+// Walks this validator will have waiting on an upstream at once - the figure in
+// force, which is `DEFAULT_MAX_CHAIN_WALKS` when the caller named none. What a
+// server reports at start-up, so the log cannot name a number nothing is using.
+chain_walk_limit :: proc(v: ^Validator, pool := Walk_Pool.Shared) -> int {
+	return v.max_walks[pool] if v != nil else 0
+}
+
+/*
+Questions in which a chain walk had to stop because the server was already going
+upstream for as many as it will. Zero on a resolver that is not being flooded.
+
+Questions rather than walks, which is why it is not named for them: one question
+can want a walk per signer and another to the owner, and a question with no slot
+is refused at every one of them. Counting those would have a single shed question
+read as five or ten.
+*/
+queries_shed :: proc(v: ^Validator) -> u64 {
+	return sync.atomic_load(&v.shed) if v != nil else 0
+}
+
 @(private)
 Step :: enum u8 {
 	// The child is a signed zone in its own right.
@@ -2737,9 +3113,23 @@ zone_trust :: proc(
 	// Cleared on the way in, so that what a caller reads afterwards is this
 	// walk's own answer and not one left behind by an earlier proof.
 	budget.walk_stopped = ""
+	/*
+	The walk asks for a slot at its first upstream lookup and gives it back
+	here. One that never needs a lookup never takes one, so a flood holding
+	every slot cannot stop a chain both caches can answer; one that needs a
+	lookup it cannot make comes back `Indeterminate`, never insecure - a
+	downgrade is the one thing load shedding must not be able to produce.
+	*/
+	defer if !budget.keep_slot {
+		end_walk(v, budget)
+	}
+
 	root_status, root_keys := zone_keys(v, budget, ".", now, allocator)
 	if root_status != .Secure {
-		if root_status == .Indeterminate {
+		// Only where nothing more precise was written: `fetch_keys` says when
+		// it was this server's own shedding that stopped it, and overwriting
+		// that would send the client a code about the authority instead.
+		if root_status == .Indeterminate && budget.walk_stopped == "" {
 			budget.walk_stopped = "chain of trust unavailable"
 		}
 		return root_status, nil, "."
@@ -2861,6 +3251,9 @@ zone_step :: proc(
 		return .No_Cut, nil
 	}
 
+	if !may_look_up(v, budget) {
+		return walk_gave_up(budget, WALKS_IN_FLIGHT), nil
+	}
 	if !spend_lookup(budget) {
 		return walk_gave_up(budget, "lookup budget spent"), nil
 	}
@@ -2974,7 +3367,26 @@ zone_step :: proc(
 			if kstatus == .Bogus {
 				return .Bogus, nil
 			}
-			return walk_gave_up(budget, "chain of trust unavailable"), nil
+			/*
+			Only where nothing more precise was written, as at the root in
+			`zone_trust`. `fetch_keys` says when it was this server's own
+			shedding that stopped it, and overwriting that sends the client a
+			code about the authority - and, worse, hides the reason from
+			`resolve_query`, which reads it to decide whether the query was
+			shed: the answer would be counted as a forgery and logged at `warn`
+			once per query, which is the log amplification the shed path exists
+			to avoid.
+
+			Not reachable today, because `validate` holds one slot for the whole
+			question and `zone_step`'s own DS query always precedes this - so a
+			question that got here was never shed. `Budget.keep_slot` says a
+			caller may walk without that, and the tests do, so the guard is here
+			rather than an argument about why it is not needed.
+			*/
+			if budget.walk_stopped == "" {
+				budget.walk_stopped = "chain of trust unavailable"
+			}
+			return .Indeterminate, nil
 		}
 		cache_put(v, child, .Secure, child_keys, rrset_ttl(ds_records), now)
 		return .Secure, child_keys
@@ -3175,6 +3587,10 @@ fetch_keys :: proc(
 	keys: []Dnskey,
 	status: Status,
 ) {
+	if !may_look_up(v, budget) {
+		budget.walk_stopped = WALKS_IN_FLIGHT
+		return nil, .Indeterminate
+	}
 	if !spend_lookup(budget) {
 		return nil, .Indeterminate
 	}

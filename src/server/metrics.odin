@@ -6,6 +6,7 @@ import "core:strings"
 import "core:sync"
 import "core:time"
 import "elodin:cache"
+import "elodin:dnssec"
 import "elodin:filter"
 import "elodin:logx"
 import "elodin:metrics"
@@ -545,6 +546,21 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 	)
 	metrics.sample(&b, "elodin_dnssec_answers_total", st.secure, metrics.Label{"result", "secure"})
 	metrics.sample(&b, "elodin_dnssec_answers_total", st.bogus, metrics.Label{"result", "bogus"})
+	// The only aggregate evidence that a rise in SERVFAIL is this server shedding
+	// rather than an upstream going away - the more so because the log line for
+	// it is said once. What it cannot say is why the bound was reached: an
+	// attack and honest saturation are the same from in here, and a single slow
+	// upstream reaches it as readily as a flood. Emitted
+	// with validation off as well, like the two above it: a series that
+	// disappears is a dashboard that breaks, and `queries_shed` reads a nil
+	// validator as nought. See `Validator.walks` in src/dnssec.
+	metrics.scalar(
+		&b,
+		"elodin_dnssec_queries_shed_total",
+		.Counter,
+		"Questions whose chain-of-trust walk stopped short of an upstream, because as many were already waiting on one as this server allows at once. One per question, however many of its walks were turned away.",
+		dnssec.queries_shed(s.validator),
+	)
 
 	render_udp_metrics(&b, l)
 

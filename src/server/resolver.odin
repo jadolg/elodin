@@ -259,6 +259,20 @@ handle_query :: proc(
 	proto: Protocol,
 	client: string,
 	allocator := context.allocator,
+	/*
+	Whether this call is running on a worker of the shared pool.
+
+	True for UDP and for HTTP/2, which hand their work to `handler_pool`; false
+	for TCP, DoT and HTTP/1.1, which answer on the connection's own thread and
+	are bounded by `max_connections` instead. The only thing that reads it is
+	the DNSSEC chain-walk bound, which exists to keep pool workers free and has
+	no business turning away a query that holds a thread nobody is waiting for.
+	See `dnssec.Validator.walks`.
+
+	Defaulted to the pooled reading so that a caller which has not thought about
+	it gets the guard; the four that have say so.
+	*/
+	shared_worker := true,
 ) -> (
 	response: []u8,
 	outcome: Outcome,
@@ -366,7 +380,18 @@ handle_query :: proc(
 		log_query(s, client, proto, q, .Refused, "edns", started)
 		response, outcome, ok = out, .Refused, built
 	} else {
-		response, outcome, ok = resolve_query(s, query, msg, proto, client, limit, cookie, started, allocator)
+		response, outcome, ok = resolve_query(
+			s,
+			query,
+			msg,
+			proto,
+			client,
+			limit,
+			cookie,
+			started,
+			allocator,
+			shared_worker,
+		)
 	}
 	if ok {
 		/*
@@ -1017,6 +1042,9 @@ resolve_query :: proc(
 	cookie: Cookie_Request,
 	started: time.Time,
 	allocator: mem.Allocator,
+	// See `handle_query`: whether a worker of the shared pool is what this is
+	// holding.
+	shared_worker: bool,
 ) -> (
 	response: []u8,
 	outcome: Outcome,
@@ -2034,13 +2062,58 @@ resolve_query :: proc(
 	dns.set_id_in_place(resp, msg.id)
 
 	if validating {
-		result := dnssec.validate(s.validator, q.name, q.type, resp, time.now(), allocator)
+		result := dnssec.validate(
+			s.validator,
+			q.name,
+			q.type,
+			resp,
+			time.now(),
+			allocator,
+			shared_worker = shared_worker,
+		)
 		#partial switch result.status {
 		case .Bogus, .Indeterminate:
-			sync.atomic_add(&s.stats.bogus, 1)
+			/*
+			The fact the validator carried: this verdict *is* the shedding, not
+			merely a question that had a walk turned away somewhere.
+
+			`Result.shed` is set only where the status and the reason agree on
+			that, so a question shed in one place and failed for another
+			allowance - a verification budget, an NSEC3 count over the ceiling -
+			is not read as load shedding and logged with words its own reason
+			contradicts. `Bogus` outranks `Indeterminate` besides, so a response
+			holding both a shed walk and a proved forgery comes back as the
+			forgery, is counted as one and logged as one.
+
+			Proved is the word doing the work, and it is worth spelling out
+			because the sentence reads stronger than it is. A set whose every
+			signature was tried and failed is proved forged and stays `Bogus`
+			however much else in the question was shed. A set holding one
+			signature this server never looked at - its signer's walk turned
+			away - is not proved anything: that signature might have been the
+			genuine one, so `validate_rrset` answers `Indeterminate` for it and
+			the question follows. Refusing to accuse on evidence we declined to
+			gather is the point, not a gap in it.
+			*/
+			shed := result.shed && result.status == .Indeterminate
+			/*
+			Everything but our own shedding is counted as `bogus`.
+
+			The counter's two readings have always been folded together here -
+			see the note in `validate_rrset` - on the argument that the ones
+			folded in are upstream failures, which nobody chooses. This one is
+			chosen: a flood decides how often it happens, so leaving it in would
+			let an attacker drive a series operators read as "somebody is forging
+			answers" at whatever rate they like. `failed` still moves, because
+			the query did, and `elodin_dnssec_queries_shed_total` is the series
+			that says how often this was us.
+			*/
+			if !shed {
+				sync.atomic_add(&s.stats.bogus, 1)
+			}
 			sync.atomic_add(&s.stats.failed, 1)
 			from := answering_upstream(winner)
-			report_bogus(q, client, result, from)
+			report_bogus(q, client, result, from, shed)
 			out, built := dnssec_failure_response(msg, result, allocator, limit)
 			remember_bogus_verdict(s, verdict_key, msg, result, unproven_apex_ds, allocator)
 			log_query(s, client, proto, q, .Failed, fmt.tprintf("dnssec:%s", from), started)

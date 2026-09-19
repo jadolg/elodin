@@ -1,0 +1,593 @@
+package dnssec
+
+import "core:mem"
+import "core:sync"
+import "core:testing"
+import "core:thread"
+import "core:time"
+import "elodin:dns"
+
+/*
+Issue #356: the chain walk blocks the thread that is answering the client, and
+nothing bounded how many threads could be doing that at once.
+
+`zone_trust` descends from the apex asking a DS per label, and each step that
+misses both caches is an upstream round trip taken in line - up to
+`MAX_LOOKUPS_PER_QUERY` of them for one client question. #349's memo takes a
+*repeated* run down to one walk per name, but a client that varies a label near
+the apex makes every name below it fresh by construction and misses the memo the
+whole way down, however often it asks. No cache closes that; the note on
+`MAX_CACHED_NON_CUTS` has the argument, and a bound on the run itself was tried
+in #349 and reverted because deployed `ip6.arpa.` zones sit deeper than the walk
+an attacker needs.
+
+So what is bounded here is not the walk but the number of them in flight. The
+first test is the reproduction: without a bound, every thread that asks is a
+thread parked on the walk's first round trip at the same moment.
+
+The rest are the other half of the bargain, and the third of them is there
+because the second reads better than the truth. A walk turned away still reads
+its caches, so a chain both caches answer is unaffected - but a cached apex is
+not a cached name, and a hostname below one still costs a DS per label. Both
+shapes are pinned, so what a flood costs is written down rather than implied.
+
+Last, that being turned away is `Indeterminate` and never a downgrade to
+`Insecure`, which would make load shedding into a way of stripping a zone's
+signatures.
+*/
+
+/*
+An upstream that never answers, counting how many walks are waiting on it at
+once.
+
+Never, until the test says so: that is what makes the count below a fact rather
+than a race. A walk that takes a slot is still holding it when the last walker
+has been turned away, so exactly `max_chain_walks` of them reach this and every
+other one is shed - whatever order the threads happen to start in.
+*/
+@(private = "file")
+Slow_Upstream :: struct {
+	mu:       sync.Mutex,
+	in_fli:   int,
+	peak:     int,
+	calls:    int,
+	released: bool,
+}
+
+@(private = "file")
+slow_query :: proc(
+	ctx: rawptr,
+	name: string,
+	type: dns.Type,
+	allocator: mem.Allocator,
+) -> (
+	wire: []u8,
+	ok: bool,
+) {
+	u := cast(^Slow_Upstream)ctx
+	sync.mutex_lock(&u.mu)
+	u.in_fli += 1
+	u.calls += 1
+	if u.in_fli > u.peak {
+		u.peak = u.in_fli
+	}
+	sync.mutex_unlock(&u.mu)
+
+	for !sync.atomic_load(&u.released) {
+		time.sleep(time.Millisecond)
+	}
+
+	sync.mutex_lock(&u.mu)
+	u.in_fli -= 1
+	sync.mutex_unlock(&u.mu)
+	// Nothing came back, which is where a walk that reached the upstream and
+	// waited ends up. What this measures is the waiting, not the answer.
+	return nil, false
+}
+
+@(private = "file")
+Walker :: struct {
+	v:      ^Validator,
+	status: Status,
+	reason: string,
+	done:   bool,
+}
+
+@(private = "file")
+walk_once :: proc(w: ^Walker) {
+	budget := query_budget(w.v)
+	status, _, _ := zone_trust(
+		w.v,
+		&budget,
+		"a.b.c.example.com.",
+		time.unix(FIXTURE_TIME, 0),
+		context.temp_allocator,
+	)
+	w.status = status
+	w.reason = walk_reason(&budget)
+	free_all(context.temp_allocator)
+	sync.atomic_store(&w.done, true)
+}
+
+/*
+Eight clients ask at once, and the server will walk two chains upstream.
+
+Without the bound all eight are blocked on the upstream at the same moment -
+which on a real server is eight handler threads, each held for as many round
+trips as the question has labels, and the whole of #356. With it, two are, and
+the other six are told the chain could not be reached without having held
+anything. Unfixed, the six never finish while the upstream is silent, so the wait
+below runs out and says so.
+*/
+@(test)
+test_only_so_many_chain_walks_block_at_once :: proc(t: ^testing.T) {
+	SLOTS :: 2
+	WALKERS :: 8
+
+	up := Slow_Upstream{}
+	v := make_validator(slow_query, &up, Options{max_chain_walks = SLOTS})
+	defer destroy_validator(v)
+
+	walkers: [WALKERS]Walker
+	threads: [WALKERS]^thread.Thread
+	for i in 0 ..< WALKERS {
+		walkers[i].v = v
+		threads[i] = thread.create_and_start_with_poly_data(&walkers[i], walk_once)
+	}
+
+	// The walks that found no slot should come back while the upstream is still
+	// silent. Waiting for them is the measurement: unfixed, they are queued
+	// behind it instead and none of them does.
+	finished := 0
+	calls := 0
+	peak := 0
+	start := time.now()
+	for time.since(start) < 10 * time.Second {
+		finished = 0
+		for i in 0 ..< WALKERS {
+			if sync.atomic_load(&walkers[i].done) {
+				finished += 1
+			}
+		}
+		sync.mutex_lock(&up.mu)
+		peak = up.peak
+		calls = up.calls
+		sync.mutex_unlock(&up.mu)
+		/*
+		Both, not just the first. A walk that takes a slot has raised
+		`Validator.walks` before it reaches the upstream - there is a
+		`spend_lookup`, an encode and a call in between - so a loop that stopped
+		as soon as the losers were counted could read `calls` while a winner was
+		still on its way to the mutex, and fail on a loaded box for no reason.
+		The upstream is silent until this loop is done, so waiting for both
+		cannot deadlock on anything but the bug.
+		*/
+		if finished >= WALKERS - SLOTS && calls >= SLOTS {
+			break
+		}
+		time.sleep(time.Millisecond)
+	}
+
+	// Let the two that took a slot go, so the threads can be joined whatever the
+	// result above was.
+	sync.atomic_store(&up.released, true)
+	for th in threads {
+		thread.join(th)
+		thread.destroy(th)
+	}
+
+	testing.expectf(
+		t,
+		finished == WALKERS - SLOTS,
+		"%d of %d walks should have come back while the upstream was silent, %d did: the walk is unbounded and #356 is open",
+		WALKERS - SLOTS,
+		WALKERS,
+		finished,
+	)
+	testing.expectf(t, peak <= SLOTS, "at most %d walks should have been upstream at once, %d were", SLOTS, peak)
+	// And the ones turned away really were turned away, rather than queued
+	// behind the flood and let through a moment later.
+	testing.expectf(t, calls == SLOTS, "only the walks that took a slot should reach the upstream, %d did", calls)
+
+	shed := 0
+	for w in walkers {
+		testing.expect_value(t, w.status, Status.Indeterminate)
+		if w.reason == WALKS_IN_FLIGHT {
+			shed += 1
+		}
+	}
+	testing.expectf(t, shed == WALKERS - SLOTS, "%d walks should say so in their own words, %d did", WALKERS - SLOTS, shed)
+}
+
+/*
+A walk that needs no lookup is not affected by the bound at all.
+
+This is what keeps the bound from being a second denial of service, and it is
+why the slot is taken at the first upstream lookup rather than on the way into
+the walk: a question a warm cache answers must neither be refused while every
+slot is held nor take a slot other walks need - and must not move `queries_shed`,
+which an operator reads as the flood's own number.
+*/
+@(test)
+test_a_shed_walk_still_answers_from_the_cache :: proc(t: ^testing.T) {
+	up := Slow_Upstream{}
+	// One slot, and the test holds it for the whole of the walk below.
+	v := make_validator(slow_query, &up, Options{max_chain_walks = 1})
+	defer destroy_validator(v)
+
+	now := time.unix(FIXTURE_TIME, 0)
+	// A chain already in the cache, put there the way a first question would.
+	keys := []Dnskey{}
+	cache_put(v, ".", .Secure, keys, MAX_ZONE_TTL, now)
+	cache_put(v, "com.", .Secure, keys, MAX_ZONE_TTL, now)
+	cache_put(v, "example.com.", .Secure, keys, MAX_ZONE_TTL, now)
+
+	testing.expect(t, take_walk_slot(v), "the one slot should be free")
+	defer drop_walk_slot(v)
+
+	budget := query_budget(v)
+	status, _, established := zone_trust(v, &budget, "example.com.", now, context.temp_allocator)
+	testing.expect_value(t, status, Status.Secure)
+	testing.expect_value(t, established, "example.com.")
+
+	sync.mutex_lock(&up.mu)
+	calls := up.calls
+	sync.mutex_unlock(&up.mu)
+	testing.expectf(t, calls == 0, "a cached chain should ask nobody, it asked %d times", calls)
+	// The count, not the budget's flag: `zone_trust` clears that on the way out
+	// whether or not a slot was taken, so it reads false either way. One is the
+	// slot this test is holding itself, and a walk that took a second would
+	// have made it two.
+	testing.expect_value(t, sync.atomic_load(&v.walks[.Shared]), 1)
+	free_all(context.temp_allocator)
+}
+
+/*
+And a name *below* a warm apex is not a warm name: while every slot is held, it
+stops.
+
+The walk has to rule out a zone cut at every label, so `www.example.com.` costs
+a DS lookup even with `example.com.` cached and secure - only the non-cut memo
+makes that free, and a name nobody has asked for before is not in it. So a flood
+holding every slot does reach past its own names into ordinary traffic, which is
+the trade #356 asks for and is worth a test of its own rather than a sentence
+somebody has to believe.
+*/
+@(test)
+test_a_shed_walk_below_a_warm_apex_still_stops :: proc(t: ^testing.T) {
+	up := Slow_Upstream{}
+	v := make_validator(slow_query, &up, Options{max_chain_walks = 1})
+	defer destroy_validator(v)
+
+	now := time.unix(FIXTURE_TIME, 0)
+	keys := []Dnskey{}
+	cache_put(v, ".", .Secure, keys, MAX_ZONE_TTL, now)
+	cache_put(v, "com.", .Secure, keys, MAX_ZONE_TTL, now)
+	cache_put(v, "example.com.", .Secure, keys, MAX_ZONE_TTL, now)
+
+	testing.expect(t, take_walk_slot(v), "the one slot should be free")
+	defer drop_walk_slot(v)
+
+	budget := query_budget(v)
+	status, _, _ := zone_trust(v, &budget, "www.example.com.", now, context.temp_allocator)
+	testing.expect_value(t, status, Status.Indeterminate)
+	testing.expect_value(t, walk_reason(&budget), WALKS_IN_FLIGHT)
+
+	sync.mutex_lock(&up.mu)
+	calls := up.calls
+	sync.mutex_unlock(&up.mu)
+	testing.expectf(t, calls == 0, "a shed walk should reach no upstream, it reached one %d times", calls)
+	free_all(context.temp_allocator)
+}
+
+/*
+And a shed walk that cannot be answered from the cache says it could not reach
+the chain - it does not say the zone is unsigned.
+
+`Insecure` here would be load shedding stripping a zone's signatures, which is
+the attacker's goal rather than the defence's. `Bogus` would be almost as bad in
+the other direction: an accusation of forgery this server has no evidence for,
+and one that a resolver downstream may cache.
+*/
+@(test)
+test_a_shed_walk_is_never_a_downgrade :: proc(t: ^testing.T) {
+	up := Slow_Upstream{}
+	v := make_validator(slow_query, &up, Options{max_chain_walks = 1})
+	defer destroy_validator(v)
+
+	now := time.unix(FIXTURE_TIME, 0)
+	testing.expect(t, take_walk_slot(v), "the one slot should be free")
+	defer drop_walk_slot(v)
+
+	budget := query_budget(v)
+	status, _, _ := zone_trust(v, &budget, "nothing.cached.example.", now, context.temp_allocator)
+	testing.expect_value(t, status, Status.Indeterminate)
+	testing.expect_value(t, walk_reason(&budget), WALKS_IN_FLIGHT)
+
+	sync.mutex_lock(&up.mu)
+	calls := up.calls
+	sync.mutex_unlock(&up.mu)
+	testing.expectf(t, calls == 0, "a shed walk should reach no upstream, it reached one %d times", calls)
+	free_all(context.temp_allocator)
+}
+
+// Answers from the captured set, so the chains below are the real ones, and a
+// count of what was asked for.
+@(private = "file")
+Captured :: struct {
+	calls: int,
+}
+
+@(private = "file")
+captured_query :: proc(
+	ctx: rawptr,
+	name: string,
+	type: dns.Type,
+	allocator: mem.Allocator,
+) -> (
+	wire: []u8,
+	ok: bool,
+) {
+	if ctx != nil {
+		(cast(^Captured)ctx).calls += 1
+	}
+	for f in FIXTURES {
+		if f.type == type && dns.name_equal_fold(f.name, name) {
+			out, decoded := decode_hex(f.wire, allocator)
+			return out, decoded
+		}
+	}
+	return nil, false
+}
+
+/*
+A shed somewhere else in the question must not excuse a set that was proved
+forged.
+
+`validate_rrset` will not call a set forged when a signature of *that set* went
+unjudged because its signer's walk was turned away - which is right, and is what
+`skipped_for_shed` is for. What it must not do is read the question-wide
+`Budget.shed_walk`: a response can hold one RRset whose walk was shed and
+another whose signatures were every one of them tried against cached keys and
+every one of them failed. The second is a forgery, and excusing it would take
+real forgeries out of `elodin_dnssec_answers_total` and out of the log for
+exactly as long as a flood kept the slots full - the attacker's own doing,
+twice.
+
+So the marker is per walk, and the walk here is not this set's: the question is
+marked shed before the call, the chain this set names is warm, and the verdict
+is the forgery.
+
+The other half - a signature of this set skipped because its own walk was shed -
+has no unit test, and cannot have one in this process. The signer's chain is a
+prefix of the owner's, so a single-threaded run that sheds the signer walk sheds
+the owner walk too and returns before the guard; reaching it needs a slot to
+free between the two, which is a race by construction.
+*/
+@(test)
+test_a_shed_elsewhere_does_not_excuse_a_forgery :: proc(t: ^testing.T) {
+	seen := Captured{}
+	v := make_validator(captured_query, &seen, Options{max_chain_walks = 1})
+	defer destroy_validator(v)
+
+	now := time.unix(FIXTURE_TIME, 0)
+	unix := u32(FIXTURE_TIME)
+	budget := query_budget(v)
+
+	// A flood holds the only slot, and one walk of this question is turned away.
+	testing.expect(t, take_walk_slot(v), "the one slot should be free")
+	shed_status, _, _ := zone_trust(v, &budget, "cloudflare.com.", now, context.temp_allocator)
+	testing.expect_value(t, shed_status, Status.Indeterminate)
+	testing.expect_value(t, walk_reason(&budget), WALKS_IN_FLIGHT)
+	testing.expect(t, budget.shed_walk, "the question should be marked as having had a walk turned away")
+
+	// The flood ebbs, so the set below is judged against a chain that is reached.
+	drop_walk_slot(v)
+
+	records := []dns.Record {
+		{
+			name = "cloudflare.com.",
+			type = .A,
+			class = .IN,
+			ttl = 300,
+			data = dns.Rdata_Raw{data = {0xc0, 0xa8, 0x00, 0x01}},
+		},
+	}
+	sigs := []Rrsig {
+		{
+			type_covered = .A,
+			algorithm = ALG_ECDSAP256SHA256,
+			labels = 2,
+			original_ttl = 300,
+			inception = unix - 3600,
+			expiration = unix + 3600,
+			key_tag = 34505,
+			signer = "cloudflare.com.",
+			signature = make([]u8, 64, context.temp_allocator),
+		},
+	}
+
+	status, _, reason, _, _ := validate_rrset(
+		v,
+		&budget,
+		"cloudflare.com.",
+		.A,
+		.IN,
+		records,
+		sigs,
+		unix,
+		now,
+		context.temp_allocator,
+	)
+	testing.expect_value(t, status, Status.Bogus)
+	testing.expect_value(t, reason, "no valid signature")
+	free_all(context.temp_allocator)
+}
+
+/*
+And a shed walk cannot tell an unsigned zone from a signed one, so it refuses
+that too.
+
+The half of the blast radius that is easiest to miss, and the reason it is
+pinned against a real insecure delegation rather than an unknown name: `zone_step`
+reaches `.Insecure` only by asking `com.` for `reddit.com.`'s DS and being shown
+a signed proof that there is none. A walk with no slot cannot ask, so it has no
+way to say "this name is in an unsigned zone, forward the answer". It says
+`Indeterminate`, and the client gets SERVFAIL for a name that has nothing to do
+with DNSSEC at all. With the guard taken out, the walk below reaches `.Insecure`.
+
+Which makes the real cost of a full table "every cold name", not "every cold
+signed name" - the thing an operator sizing `dnssec.max_chain_walks` has to know,
+and the reason the bound reserves workers rather than capping them.
+*/
+@(test)
+test_a_shed_walk_cannot_tell_an_unsigned_zone_from_a_signed_one :: proc(t: ^testing.T) {
+	seen := Captured{}
+	v := make_validator(captured_query, &seen, Options{max_chain_walks = 1})
+	defer destroy_validator(v)
+
+	now := time.unix(FIXTURE_TIME, 0)
+	/*
+	The chain down to `com.` warmed the way a first question would, by asking
+	one. What is left uncached is the only step that matters here: whether
+	anything is delegated at `reddit.com.`
+	*/
+	warm := query_budget(v)
+	warm_status, _, _ := zone_trust(v, &warm, "cloudflare.com.", now, context.temp_allocator)
+	testing.expect_value(t, warm_status, Status.Secure)
+
+	testing.expect(t, take_walk_slot(v), "the one slot should be free")
+	defer drop_walk_slot(v)
+
+	before := seen.calls
+	budget := query_budget(v)
+	status, _, _ := zone_trust(v, &budget, "www.reddit.com.", now, context.temp_allocator)
+	// Not `.Insecure`, which is the answer that would have been forwarded.
+	testing.expect_value(t, status, Status.Indeterminate)
+	testing.expect_value(t, walk_reason(&budget), WALKS_IN_FLIGHT)
+	testing.expectf(
+		t,
+		seen.calls == before,
+		"a shed walk should ask nobody, it asked %d times",
+		seen.calls - before,
+	)
+	free_all(context.temp_allocator)
+}
+
+/*
+A question on a connection thread is held to its own bound, not the pool's.
+
+TCP, DoT and HTTP/1.1 answer on the connection's thread rather than on a worker
+of the shared pool, and there are `max_connections` of those against a handful of
+workers - so one number for both is wrong whichever way it is set. Sized for the
+pool it refuses ordinary stream traffic on a resolver nobody is attacking; left
+off altogether it leaves #356 open on every transport but two, since a flood that
+holds every connection thread in a walk is a flood that gets no new connection
+accepted.
+
+So the two are counted apart. Here the shared allowance is spent down to nothing
+and a question on a connection thread walks anyway.
+*/
+@(test)
+test_a_connection_thread_is_held_to_its_own_bound :: proc(t: ^testing.T) {
+	up := Slow_Upstream{}
+	v := make_validator(slow_query, &up, Options{max_chain_walks = 1, max_connection_walks = 1})
+	defer destroy_validator(v)
+
+	now := time.unix(FIXTURE_TIME, 0)
+	// Every slot of the shared pool taken, which is the flood at its worst.
+	testing.expect(t, take_walk_slot(v, .Shared), "the one shared slot should be free")
+	defer drop_walk_slot(v, .Shared)
+
+	// Released before the walk, so this reaches the upstream rather than
+	// waiting on it: what is on trial is whether it was allowed to ask at all.
+	sync.atomic_store(&up.released, true)
+
+	budget := query_budget(v)
+	budget.pool = .Connection
+	status, _, _ := zone_trust(v, &budget, "a.b.c.example.com.", now, context.temp_allocator)
+
+	sync.mutex_lock(&up.mu)
+	calls := up.calls
+	sync.mutex_unlock(&up.mu)
+	testing.expectf(t, calls > 0, "the walk should have reached the upstream, it asked %d times", calls)
+	// The upstream answered nothing, so the walk ends there - but it ends
+	// having asked, and saying so, rather than refused for want of a slot.
+	testing.expect_value(t, status, Status.Indeterminate)
+	testing.expect(t, walk_reason(&budget) != WALKS_IN_FLIGHT, "the shared bound should not have refused it")
+	free_all(context.temp_allocator)
+}
+
+/*
+And it is a bound, not an exemption: spend that one too and the walk stops.
+*/
+@(test)
+test_a_connection_thread_is_still_bounded :: proc(t: ^testing.T) {
+	up := Slow_Upstream{}
+	v := make_validator(slow_query, &up, Options{max_chain_walks = 1, max_connection_walks = 1})
+	defer destroy_validator(v)
+
+	now := time.unix(FIXTURE_TIME, 0)
+	testing.expect(t, take_walk_slot(v, .Connection), "the one connection slot should be free")
+	defer drop_walk_slot(v, .Connection)
+
+	budget := query_budget(v)
+	budget.pool = .Connection
+	status, _, _ := zone_trust(v, &budget, "a.b.c.example.com.", now, context.temp_allocator)
+	testing.expect_value(t, status, Status.Indeterminate)
+	testing.expect_value(t, walk_reason(&budget), WALKS_IN_FLIGHT)
+
+	sync.mutex_lock(&up.mu)
+	calls := up.calls
+	sync.mutex_unlock(&up.mu)
+	testing.expectf(t, calls == 0, "a shed walk should reach no upstream, it reached one %d times", calls)
+	free_all(context.temp_allocator)
+}
+
+/*
+The counter is questions the shedding cost, counted where the verdict is.
+
+Not where a slot is refused: one question asks for several, and a question can
+be refused at one signer's walk, answered `Secure` on the next signature, and
+have a bonus address hint refused after the verdict is already settled. All of
+those are questions this resolver answered, and a number that moved for them is
+useless for the one thing an operator is told to do with it - read it beside a
+rise in SERVFAIL. So it is counted once, in `validate`, for a question left
+undecided with a walk of its own turned away.
+*/
+@(test)
+test_the_counter_is_questions_the_shedding_cost :: proc(t: ^testing.T) {
+	seen := Captured{}
+	v := make_validator(captured_query, &seen, Options{max_chain_walks = 1})
+	defer destroy_validator(v)
+
+	now := time.unix(FIXTURE_TIME, 0)
+	answer: []u8
+	for f in FIXTURES {
+		if f.key == "reddit_a" {
+			decoded, ok := decode_hex(f.wire, context.temp_allocator)
+			testing.expect(t, ok, "the fixture should decode")
+			answer = decoded
+		}
+	}
+	testing.expect(t, len(answer) > 0, "the reddit fixture should be in the captured set")
+
+	// Answered without shedding first: an unsigned delegation, which is a
+	// question this resolver answers rather than refuses.
+	warm := validate(v, "www.reddit.com.", .A, answer, now)
+	testing.expect_value(t, warm.status, Status.Insecure)
+	testing.expect_value(t, queries_shed(v), u64(0))
+
+	// Now with every slot held. The chain is cached by the run above, so a
+	// fresh validator is what makes this a cold question again.
+	cold := make_validator(captured_query, &seen, Options{max_chain_walks = 1})
+	defer destroy_validator(cold)
+	testing.expect(t, take_walk_slot(cold), "the one slot should be free")
+	defer drop_walk_slot(cold)
+
+	out := validate(cold, "www.reddit.com.", .A, answer, now)
+	testing.expect_value(t, out.status, Status.Indeterminate)
+	testing.expect(t, out.shed, "the result should carry the fact that a walk was turned away")
+	testing.expect_value(t, queries_shed(cold), u64(1))
+	free_all(context.temp_allocator)
+}

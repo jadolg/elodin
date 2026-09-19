@@ -616,7 +616,9 @@ serve_doh_request :: proc(s: ^Server, conn: Conn, req: Http_Request_In, path: st
 		return send_http_error(conn, "doh", 429, "too many requests", req.keep_alive)
 	}
 
-	response, _, ok := handle_query(s, query, .DoH, client, context.temp_allocator)
+	// HTTP/1.1, which answers on the connection's own thread rather than on a
+	// worker of the shared pool.
+	response, _, ok := handle_query(s, query, .DoH, client, context.temp_allocator, shared_worker = false)
 	if !ok || len(response) == 0 {
 		return send_http_error(conn, "doh", 500, "no response", req.keep_alive)
 	}
