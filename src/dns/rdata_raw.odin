@@ -129,6 +129,10 @@ holds_pointer_byte :: proc "contextless" (rdata: []u8) -> bool {
 	return false
 }
 
+// No layout has more than two names in it, and the walk holds them on the stack.
+@(private)
+MAX_RAW_NAMES :: 2
+
 @(private)
 expand_rdata_names :: proc(
 	r: ^Reader,
@@ -140,42 +144,17 @@ expand_rdata_names :: proc(
 	ok: bool,
 ) {
 	msg := r.msg
-	// The buffer is taken before the walk is known to get anywhere, and an arena
-	// gives nothing back when it does not - the `delete` below is a no-op there.
-	// So it is charged first, and a record whose walk fails on its first byte
-	// pays for it and buys nothing.
-	//
-	// Reserved for every name the layout has, each of which may expand from a
-	// two-byte pointer to a whole `MAX_NAME_WIRE`, so the buffer cannot outgrow
-	// its block and strand the first one in the arena uncharged. Charged for
-	// only that part of it, and not for the RDATA it is also going to hold: the
-	// RDATA is already paid for in the wire bytes the record occupies, since
-	// every record's `end - start` comes out of the one message, while the names
-	// are what expand out of proportion to it.
-	//
-	// The difference matters beyond the arithmetic. RDLENGTH grows when a
-	// compressed name is written back out in full, so a charge counting it would
-	// rise every time this codebase re-encodes a message it decoded - and it
-	// re-encodes constantly, to add an OPT record or strip a DNSSEC one. A
-	// message would then decode, be rebuilt, and fail to decode, which is the
-	// thing `NAME_BUDGET` is flat to avoid. `layout.names` is a property of the
-	// type and does not move.
-	reserve := end - start + layout.names * MAX_NAME_WIRE
-	if charge_name(r, layout.names * MAX_NAME_WIRE) != .None {
+	if layout.names > MAX_RAW_NAMES {
 		return nil, false
 	}
-	buf := make([dynamic]u8, 0, reserve, allocator)
-	defer if !ok {
-		delete(buf)
-	}
 
+	// Walk to where the names start. Everything before them is carried through
+	// byte for byte, so its length is all that is needed here.
 	pos := start
 	if pos + layout.fixed > end {
 		return nil, false
 	}
-	append(&buf, ..msg[pos:pos + layout.fixed])
 	pos += layout.fixed
-
 	for _ in 0 ..< layout.strings {
 		if pos >= end {
 			return nil, false
@@ -184,12 +163,29 @@ expand_rdata_names :: proc(
 		if pos + 1 + n > end {
 			return nil, false
 		}
-		append(&buf, ..msg[pos:pos + 1 + n])
 		pos += 1 + n
 	}
+	head := pos
 
-	name_buf: [MAX_NAME_WIRE]u8
-	for _ in 0 ..< layout.names {
+	/*
+	Expand the names onto the stack before anything is taken from the allocator.
+
+	The blob is then made at what this record actually came to rather than at
+	what a record of its type might: a PX whose two names are both the root
+	expands four bytes into four, and reserving 510 for it would be half a
+	kilobyte of arena, charged to the budget, for an expansion that never
+	happened. A reply of such records is well formed and a thousand of them fit
+	in 20 KB, which is a long way under what the budget means to refuse.
+
+	Nothing is allocated for a walk that fails, either - a record whose RDATA
+	does not add up now costs the decoder nothing at all, where before it paid
+	for a buffer it never filled.
+	*/
+	wire: [MAX_RAW_NAMES][MAX_NAME_WIRE]u8
+	lengths: [MAX_RAW_NAMES]int
+	total := head - start
+
+	for i in 0 ..< layout.names {
 		// `decode_name` reads the whole message, which is the point - a pointer
 		// aims outside the record - but the name's own bytes have to lie inside
 		// it. `next` is the first byte after the name in the record being
@@ -201,26 +197,38 @@ expand_rdata_names :: proc(
 		defer delete(name, allocator)
 		// The expansion is thrown away once it has been written back out in
 		// wire form, but a decoder fed an arena does not get the bytes back, so
-		// it is charged like any other name. See `NAME_BUDGET`.
+		// it is charged like any other name. That charge covers the wire copy
+		// kept beside it too, which is never the longer of the two. See
+		// `NAME_BUDGET`.
 		if charge_name(r, len(name)) != .None {
 			return nil, false
 		}
 		if next > end {
 			return nil, false
 		}
-		n, eerr := encode_name(name, name_buf[:])
+		n, eerr := encode_name(name, wire[i][:])
 		if eerr != .None {
 			return nil, false
 		}
-		append(&buf, ..name_buf[:n])
+		lengths[i] = n
+		total += n
 		pos = next
 	}
 
-	append(&buf, ..msg[pos:end])
-	if len(buf) > 0xffff {
+	total += end - pos
+	if total > 0xffff {
 		return nil, false
 	}
-	return buf[:], true
+
+	buf := make([]u8, total, allocator)
+	copy(buf, msg[start:head])
+	at := head - start
+	for i in 0 ..< layout.names {
+		copy(buf[at:], wire[i][:lengths[i]])
+		at += lengths[i]
+	}
+	copy(buf[at:], msg[pos:end])
+	return buf, true
 }
 
 /*

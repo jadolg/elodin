@@ -44,13 +44,15 @@ what it writes, so the same names can come back in half the bytes. The entry
 would then be refused on every cache hit by a budget its own message had passed,
 which is a branch `resolve` documents as unreachable.
 
-640 KB is what a 64 KB reply may spend. A record whose owner is a pointer is 16
+640 KB is what one reading may spend. A record whose owner is a pointer is 16
 wire bytes, so a full-length reply crosses it at around 160 presentation
 characters of name per record - an RRset of four thousand records under one name
-that long, and nothing shorter. That is legal and no real server sends it: a name
-is normally printable and a few dozen characters, written out once for every
-record or two that carries it. Nothing smaller than a full-length reply can get
-near the figure at all.
+that long. Shorter replies reach it too, since what a name costs has nothing to
+do with the two bytes that name it: 650 records under one 255-octet name of
+unprintable octets is 10 KB of wire and the whole budget. Both are legal and
+neither is anything a real server sends - a name is normally printable and a few
+dozen characters, written out once for every record or two that carries it, and
+a reply of a few hundred records costs a few tens of kilobytes of names.
 */
 NAME_BUDGET :: 640 * 1024
 

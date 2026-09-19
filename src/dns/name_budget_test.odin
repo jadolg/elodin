@@ -96,11 +96,11 @@ pointer_px_answer :: proc() -> []u8 {
 /*
 An answer of NXT records whose RDATA holds a pointer byte but no walkable name.
 
-`decode_raw_rdata` takes the expansion buffer before it knows whether the walk
-will get anywhere, and an arena does not take it back when the walk fails on the
-first byte. That buffer is 255 bytes and more whatever the RDATA holds, and the
-record buying it is fourteen wire bytes, so it is charged like the names it was
-meant to hold.
+`decode_raw_rdata` used to take the expansion buffer before it knew whether the
+walk would get anywhere - 255 bytes and more whatever the RDATA held, for a
+record of fourteen wire bytes - and an arena does not take it back when the walk
+fails on the first byte. Nothing is taken until the walk has finished now, so
+these records cost what their bytes cost and no more.
 */
 @(private = "file")
 unwalkable_raw_answer :: proc() -> []u8 {
@@ -132,8 +132,8 @@ test_unwalkable_raw_rdata_stays_within_the_name_budget :: proc(t: ^testing.T) {
 	msg := unwalkable_raw_answer()
 	defer delete(msg)
 
-	used, err := decode_into_arena(t, msg)
-	testing.expect_value(t, err, Decode_Error.Name_Budget)
+	used, err := decode_into_arena(msg)
+	testing.expect_value(t, err, Decode_Error.None)
 	testing.expectf(
 		t,
 		used <= DECODE_CEILING * len(msg),
@@ -144,8 +144,11 @@ test_unwalkable_raw_rdata_stays_within_the_name_budget :: proc(t: ^testing.T) {
 }
 
 @(private = "file")
-decode_into_arena :: proc(t: ^testing.T, msg: []u8) -> (used: int, err: Decode_Error) {
-	backing := make([]u8, 48 << 20)
+decode_into_arena :: proc(msg: []u8) -> (used: int, err: Decode_Error) {
+	// Enough for the unbudgeted shapes these fixtures reach when the budget is
+	// taken out to check that they still do - 11.4 MB is the largest - and not
+	// the 48 MB it once was, with four of these running side by side.
+	backing := make([]u8, 16 << 20)
 	defer delete(backing)
 	arena: mem.Arena
 	mem.arena_init(&arena, backing)
@@ -177,7 +180,7 @@ test_pointer_mx_answer_stays_within_the_name_budget :: proc(t: ^testing.T) {
 	msg := pointer_mx_answer()
 	defer delete(msg)
 
-	used, err := decode_into_arena(t, msg)
+	used, err := decode_into_arena(msg)
 	testing.expect_value(t, err, Decode_Error.Name_Budget)
 	testing.expectf(
 		t,
@@ -193,7 +196,7 @@ test_pointer_px_rdata_stays_within_the_name_budget :: proc(t: ^testing.T) {
 	msg := pointer_px_answer()
 	defer delete(msg)
 
-	used, err := decode_into_arena(t, msg)
+	used, err := decode_into_arena(msg)
 	// The owners are cheap here, so it is the RDATA expansion that spends the
 	// budget; the record after it then fails on its own owner name, which is
 	// what refuses the message.
@@ -374,7 +377,7 @@ test_a_rebuilt_message_still_decodes :: proc(t: ^testing.T) {
 		append(&msg, 93, 184, 216, 34)
 	}
 
-	backing := make([]u8, 48 << 20)
+	backing := make([]u8, 16 << 20)
 	defer delete(backing)
 	arena: mem.Arena
 	mem.arena_init(&arena, backing)
@@ -395,6 +398,54 @@ test_a_rebuilt_message_still_decodes :: proc(t: ^testing.T) {
 		len(msg),
 		len(rebuilt),
 		again,
+	)
+}
+
+/*
+A record whose names do not expand is not charged as though they had.
+
+The expansion buffer used to be reserved - and charged - at what a record of the
+type might come to, `layout.names * MAX_NAME_WIRE`, whether or not a single name
+grew. A PX carries two, so every one of them cost 510 bytes of budget, and
+`holds_pointer_byte` is a byte scan: a preference field of 0xc000 is a legal
+number and enough to send the record down this path.
+
+A thousand of those fit in 20 KB, and the reply is well formed - both names are
+the root, nothing expands, and every byte comes out as it went in. It was
+refused at 1280 records and cost 37.8 times its own length in arena, which is a
+long way from the full-length bomb the budget exists for.
+*/
+@(test)
+test_a_record_whose_names_do_not_expand_is_barely_charged :: proc(t: ^testing.T) {
+	msg := make([dynamic]u8, 0, 65535)
+	defer delete(msg)
+	put_header(&msg, 0)
+	append(&msg, 1, 'x', 0)
+	put_u16(&msg, u16(Type.PX))
+	put_u16(&msg, u16(Class.IN))
+	count := 0
+	for len(msg) + 18 <= 30000 {
+		append(&msg, 0xc0, 0x0c)
+		put_u16(&msg, u16(Type.PX))
+		put_u16(&msg, u16(Class.IN))
+		append(&msg, 0, 0, 0x0e, 0x10)
+		put_u16(&msg, 4)
+		put_u16(&msg, 0xc000) // preference: legal, and looks like a pointer
+		append(&msg, 0, 0) // both names are the root
+		count += 1
+	}
+	msg[6] = u8(count >> 8)
+	msg[7] = u8(count)
+
+	used, err := decode_into_arena(msg[:])
+	testing.expect_value(t, err, Decode_Error.None)
+	testing.expectf(
+		t,
+		used <= 8 * len(msg),
+		"%d records that expand nothing cost %d bytes of arena for %d of wire",
+		count,
+		used,
+		len(msg),
 	)
 }
 
@@ -431,7 +482,7 @@ test_a_two_name_layout_does_not_outgrow_its_buffer :: proc(t: ^testing.T) {
 	append(&msg, 0xc0, 0x0c)
 	append(&msg, 0xc0, 0x0c)
 
-	used, err := decode_into_arena(t, msg[:])
+	used, err := decode_into_arena(msg[:])
 	testing.expect_value(t, err, Decode_Error.None)
 	testing.expectf(t, used < 5000, "one PX record cost %d bytes of arena", used)
 }
@@ -483,6 +534,6 @@ test_long_name_pointed_at_by_a_whole_rrset_still_decodes :: proc(t: ^testing.T) 
 	msg[6] = u8(count >> 8)
 	msg[7] = u8(count)
 
-	_, err := decode_into_arena(t, msg[:])
+	_, err := decode_into_arena(msg[:])
 	testing.expect_value(t, err, Decode_Error.None)
 }
