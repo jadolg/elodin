@@ -1267,10 +1267,37 @@ resolve_query :: proc(
 				serial  = hit.serial,
 				checked = generation,
 			}
-			if !hit.stale {
+			switch {
+			/*
+			A remembered `Bogus` verdict is served as the refusal it is and
+			never as an answer - the bytes are this server's own SERVFAIL. See
+			the store in the validating branch below.
+
+			An expired one is dropped rather than kept as the stale fallback. A
+			verdict is not data to cover an outage with, which is the reading
+			`serve_stale` is given where the upstream fails below: the client is
+			told SERVFAIL either way, and holding a minute-old refusal for a day
+			to say it would be the memory outliving the thing it remembered.
+			*/
+			case hit.bogus:
+				/*
+				And only while this request would have reached a verdict of its
+				own. `validating` is recomputed per query - a validator switched
+				off by a reload, a zone an operator has since routed or
+				anchored - and the entry carries no record of the rules it was
+				refused under, so serving it to a request that is not being
+				validated would be a verdict outliving the configuration that
+				reached it. Ignored rather than dropped: the query goes upstream
+				as a miss would, and the answer it brings back replaces this.
+				*/
+				if !hit.stale && validating {
+					return serve_bogus_verdict(s, stored, query, msg, q, proto, client, started)
+				}
+			case !hit.stale:
 				return serve_from_cache(s, stored, query, msg, q, proto, client, limit, validating, started, allocator)
+			case:
+				stale_hit = stored
 			}
-			stale_hit = stored
 		}
 	}
 
@@ -1983,34 +2010,38 @@ resolve_query :: proc(
 		case .Bogus, .Indeterminate:
 			sync.atomic_add(&s.stats.bogus, 1)
 			sync.atomic_add(&s.stats.failed, 1)
-			/*
-			Both lines name the upstream the refused answer came from.
-
-			A verdict here is a property of the answer and not of the name, so
-			the same question put to a different server can validate perfectly.
-			A group whose members disagree about a zone - one that cannot reach
-			it at all, one handing out a denial that proves nothing - is then a
-			server that fails some queries for that name and answers the rest,
-			and every other field on these two lines is identical across both.
-			Without the upstream there is nothing in the log to tell them apart
-			and the next step is a packet capture; with it, the counts per
-			server say which one to stop asking.
-
-			`client` is kept beside it. The pair is the point: one says whose
-			query went unanswered, the other says who is to blame for that, and
-			an operator reading either alone has half the story.
-			*/
 			from := answering_upstream(winner)
-			logx.warnf(
-				"dnssec: %s %s from %s did not validate: %v (%s); answer came from %s",
-				dns.type_name(q.type),
-				dns.name_trim_root(q.name),
-				client,
-				result.status,
-				result.reason,
-				from,
-			)
+			report_bogus(q, client, result, from)
 			out, built := dnssec_failure_response(msg, result, allocator, limit)
+			/*
+			The verdict is remembered, so the next client asking the same
+			question is not another exchange with the upstream.
+
+			Nothing was cached on this path before, and a verdict is the one
+			answer nobody ever stops asking for: a zone with a broken signature
+			refuses every query for it, and each refusal was a round trip to an
+			upstream that was only ever going to hand back the same unusable
+			answer. Whoever is asking decides how many of those there are, which
+			makes a name somebody controls and deliberately breaks the cheapest
+			way there is to spend this server's upstream budget - and RFC 4035
+			section 4.7 allows precisely this store to close it. The lifetime is
+			`cache.BOGUS_TTL` rather than anything the answer carried; see there
+			for why a minute.
+
+			Stored as the refusal itself, which is what the next client is owed
+			and what `serve_bogus_verdict` hands back. The answer that failed to
+			validate is not kept at all - the entry is this server's own
+			SERVFAIL, so there is nothing in the cache for a later change of
+			mind, a reload or a bug to serve as data.
+
+			`built` first, because a response that would not encode is not one to
+			remember; `cache.put` refuses a truncated one for the same reason.
+			*/
+			if built && s.cfg.cache.enabled {
+				if refusal, rerr := dns.decode_message(out, allocator); rerr == .None {
+					cache.put(s.answers, key, out, refusal, bogus = true)
+				}
+			}
 			log_query(s, client, proto, q, .Failed, fmt.tprintf("dnssec:%s", from), started)
 			return out, .Failed, built
 		case .Secure:
@@ -2667,6 +2698,47 @@ Cached_Answer :: struct {
 	// The rule sets the re-match is made against, and the number stamped on the
 	// entry when it comes back clean.
 	checked: u64,
+}
+
+/*
+Hand back a `Bogus` verdict this server reached earlier.
+
+The stored bytes are the SERVFAIL the refusal was answered with, so serving them
+again is the same two fixes a cached answer needs - the client's own transaction
+ID, and the question in the case it asked in - and nothing else. No AD bit to
+settle: `dns.make_response` builds a refusal with the bit clear and there is
+nothing here that could have set it.
+
+Counted and logged as the refusal it is rather than as a cache hit, because that
+is what the client got. `bogus=` and `failed=` move exactly as they do on the
+path that reached the verdict, so the counters go on saying how many queries were
+refused for failing to validate rather than how many upstream exchanges it took
+to refuse them - and the query log says `detail=dnssec:cache`, which is the same
+`dnssec:` prefix an operator greps for with the upstream replaced by the truth
+about this one: no server was asked.
+*/
+@(private)
+serve_bogus_verdict :: proc(
+	s: ^Server,
+	hit: Cached_Answer,
+	query: []u8,
+	msg: dns.Message,
+	q: dns.Question,
+	proto: Protocol,
+	client: string,
+	started: time.Time,
+) -> (
+	response: []u8,
+	outcome: Outcome,
+	ok: bool,
+) {
+	sync.atomic_add(&s.stats.bogus, 1)
+	sync.atomic_add(&s.stats.failed, 1)
+	wire := hit.wire
+	dns.set_id_in_place(wire, msg.id)
+	dns.copy_question_case(wire, query)
+	log_query(s, client, proto, q, .Failed, "dnssec:cache", started)
+	return wire, .Failed, true
 }
 
 /*

@@ -34,6 +34,14 @@ Entry :: struct {
 	*/
 	redirects:   bool,
 	/*
+	The entry is a `Bogus` verdict this server reached and not an answer it was
+	given: the bytes are its own SERVFAIL, and what they say is that the question
+	could not be answered rather than what the answer is. Kept for `BOGUS_TTL`
+	and never mistaken for data - `get` hands the flag back and the caller serves
+	the refusal again instead of the answer it does not have.
+	*/
+	bogus:       bool,
+	/*
 	What the caller had decided about this answer when it stored it, in whatever
 	numbering the caller keeps - see `put` and `get`. Zero for a caller that does
 	not keep one, which reads as "decided under nothing you would recognise" and
@@ -99,6 +107,9 @@ Hit :: struct {
 	refused: u8,
 	// Which entry the bytes came out of, for `note_checked`.
 	serial:  u64,
+	// The bytes are a stored `Bogus` verdict rather than an answer; see
+	// `Entry.bogus`. The caller serves them as the refusal they are.
+	bogus:   bool,
 }
 
 Stats :: struct {
@@ -158,6 +169,30 @@ stale data is for rather than of a deployment - so the setting stays one
 question rather than two, and this is the answer to the second.
 */
 MAX_STALE :: 24 * time.Hour
+
+/*
+How long a failed DNSSEC verdict is remembered. See `Entry.bogus`.
+
+Without it, a question whose answer does not validate costs an upstream exchange
+every time anybody asks it - a name with a broken signature is then the cheapest
+thing on the Internet to make this server do work for, and every one of those
+queries is also a line in the log. RFC 4035 section 4.7 allows a bogus answer to
+be cached with a short TTL for exactly that reason; Unbound does it under
+`val-bogus-ttl`, sixty seconds by default, and BIND caches the SERVFAIL itself
+under `servfail-ttl`.
+
+Short, because a verdict is not an answer. What produces most of them is an
+operator midway through a key rollover, and the resolver has to notice that the
+zone is working again within a minute rather than within the day `max_ttl`
+allows. A minute is also what makes the memory worth having: at any query rate
+worth defending against, it is the difference between one upstream exchange and
+hundreds of thousands.
+
+Deliberately not a configuration key, for the reason `MAX_STALE` is not: it is a
+property of what a verdict is good for rather than of a deployment, and an
+operator who does not want it cached at all turns the cache off.
+*/
+BOGUS_TTL :: 60
 
 /*
 What the cache may hold when the operator has not said.
@@ -324,6 +359,7 @@ get :: proc(
 	hit.serial = e.serial
 	hit.recheck = e.redirects && e.checked != checked_against
 	hit.refused = e.refused
+	hit.bogus = e.bogus
 
 	elapsed := u32(max(0, time.duration_seconds(time.diff(e.inserted, now))))
 	out := make([]u8, len(e.wire), allocator)
@@ -566,8 +602,21 @@ with the entry and handed back by `get` as `recheck` once the caller says its
 numbering has moved on. The cache does not read it: what it counts is a number
 the caller recognises, and a caller with nothing to say leaves it at zero, which
 `get` will always report as out of date rather than silently current.
+
+`bogus` is the caller saying the bytes are a refusal it reached itself rather
+than an answer somebody sent: a SERVFAIL, which is otherwise one of the
+transient failures above and refused. It is stored for `BOGUS_TTL` and comes
+back out of `get` flagged as what it is. See `Entry.bogus`.
 */
-put :: proc(c: ^Cache, key: string, wire: []u8, msg: dns.Message, checked: u64 = 0, refused: u8 = 0) -> bool {
+put :: proc(
+	c: ^Cache,
+	key: string,
+	wire: []u8,
+	msg: dns.Message,
+	checked: u64 = 0,
+	refused: u8 = 0,
+	bogus := false,
+) -> bool {
 	if c == nil || len(wire) < dns.HEADER_SIZE {
 		return false
 	}
@@ -576,10 +625,19 @@ put :: proc(c: ^Cache, key: string, wire: []u8, msg: dns.Message, checked: u64 =
 	}
 
 	rcode := dns.rcode_of(msg)
-	#partial switch rcode {
-	case .No_Error, .NX_Domain:
-	case:
-		return false
+	/*
+	A transient failure is not an answer to remember - except the one this
+	server reached itself, which is `bogus`: a SERVFAIL built here because the
+	answer did not validate, whose whole point is not to have to ask again. Its
+	lifetime is `BOGUS_TTL` and nothing the sender chose, which is what keeps a
+	verdict about somebody else's broken zone from being that zone's to extend.
+	*/
+	if !bogus {
+		#partial switch rcode {
+		case .No_Error, .NX_Domain:
+		case:
+			return false
+		}
 	}
 
 	/*
@@ -676,16 +734,24 @@ put :: proc(c: ^Cache, key: string, wire: []u8, msg: dns.Message, checked: u64 =
 	}
 
 	effective: u32
-	if rcode == .NX_Domain || len(msg.answer) == 0 {
-		effective = dns.negative_ttl(msg, c.negative_ttl)
-		if c.negative_ttl > 0 {
-			effective = min(effective, c.negative_ttl)
-		}
+	if bogus {
+		// Bounded by the ceiling like everything else here, and not raised by
+		// `min_ttl`: that floor is how long the shortest *answer* is good for,
+		// and stretching a verdict to meet it would hold a zone broken past the
+		// minute this is allowed to.
+		effective = min(u32(BOGUS_TTL), c.max_ttl)
 	} else {
-		v, has := dns.min_ttl(ttls)
-		effective = v if has else 0
+		if rcode == .NX_Domain || len(msg.answer) == 0 {
+			effective = dns.negative_ttl(msg, c.negative_ttl)
+			if c.negative_ttl > 0 {
+				effective = min(effective, c.negative_ttl)
+			}
+		} else {
+			v, has := dns.min_ttl(ttls)
+			effective = v if has else 0
+		}
+		effective = clamp(effective, c.min_ttl, c.max_ttl)
 	}
-	effective = clamp(effective, c.min_ttl, c.max_ttl)
 	if effective == 0 {
 		delete(offsets, c.allocator)
 		delete(ttls, c.allocator)
@@ -716,6 +782,7 @@ put :: proc(c: ^Cache, key: string, wire: []u8, msg: dns.Message, checked: u64 =
 	e.ttl_offsets = offsets
 	e.ttls = ttls
 	e.redirects = redirects(msg)
+	e.bogus = bogus
 	e.checked = checked
 	e.refused = refused
 	e.inserted = now
