@@ -434,9 +434,12 @@ dnssec:
   # reads the caches and answers SERVFAIL where it would have gone upstream,
   # which is what an upstream that did not answer already produces.
   #
-  # 0 is half of server.workers. Raise it if elodin_dnssec_walks_shed_total is
-  # moving on a resolver nobody is flooding: that is honest cache-miss load
-  # being turned into SERVFAIL, and the number is too small for this deployment.
+  # 0 is half of server.workers, held down to upstream_workers. Raise it if
+  # elodin_dnssec_walks_shed_total is moving on a resolver nobody is flooding:
+  # that is honest cache-miss load being refused, and the number is too small
+  # for this deployment. With strategy: race the bound covers handler threads
+  # only — a walk waiting on an upstream also holds one racer job per candidate
+  # server, so raise upstream_workers with the number of upstreams.
   # max_chain_walks: 0
 
 cookies:

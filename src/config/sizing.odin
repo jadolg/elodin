@@ -167,6 +167,33 @@ derive_upstream_workers :: proc(workers: int) -> int {
 	return max(workers / 2, 1)
 }
 
+/*
+Chain-of-trust walks that may be waiting on an upstream at once.
+
+Half the handler pool. The walk blocks the worker answering the client, once per
+label of a name the client chose, so without a bound a flood of fresh names
+holds every worker; half leaves the other half answering, which is the
+difference between a resolver degraded and one down. Half rather than a quarter
+because the walks past the bound are answered SERVFAIL, so this number is also
+the honest cache-miss load the resolver can validate at, and erring small costs
+real answers.
+
+Held down to the racer count as well, which only bites on a configuration that
+names one: a walk waiting on an upstream occupies a race job per candidate
+server, and the two derived numbers are the same figure anyway. It does not make
+the arithmetic exact - how many candidates a group has is not known here, and
+with `strategy: race` and three upstreams even one walk wants three jobs - so
+what it rules out is the mismatch nobody meant, `workers: 64` beside
+`upstream_workers: 2`. The rest is the operator's, and the README says so.
+
+At least one whatever the arithmetic says: a one-worker configuration still has
+to be able to walk a chain, since the bound is on walks at once rather than on
+walks.
+*/
+derive_chain_walks :: proc(workers, upstream_workers: int) -> int {
+	return max(min(workers / 2, upstream_workers), 1)
+}
+
 // What this process can see of the machine, at the moment it asks.
 probe_machine :: proc() -> (m: Machine) {
 	/*

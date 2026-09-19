@@ -2,7 +2,6 @@ package server
 
 import "core:mem"
 import "core:sync"
-import "elodin:config"
 import "elodin:dns"
 import "elodin:dnssec"
 import "elodin:logx"
@@ -121,37 +120,18 @@ start_validator :: proc(s: ^Server) -> bool {
 		dnssec.Options {
 			anchors = anchors,
 			max_nsec3_iterations = s.cfg.dnssec.max_nsec3_iterations,
-			max_chain_walks = configured_chain_walks(s.cfg),
+			max_chain_walks = s.cfg.dnssec.max_chain_walks,
 		},
 	)
+	// The bound is named here because it is the number an operator watching
+	// `elodin_dnssec_walks_shed_total` rise is being told to raise, and
+	// `config.derive_chain_walks` usually picked it rather than the file.
 	logx.infof(
-		"dnssec: validating against %d trust anchor(s)",
+		"dnssec: validating against %d trust anchor(s), at most %d chain walks upstream at once",
 		len(anchors) if len(anchors) > 0 else len(dnssec.root_anchors()),
+		s.cfg.dnssec.max_chain_walks,
 	)
 	return true
-}
-
-/*
-How many chain walks may be waiting on an upstream at once.
-
-Half the handler pool unless an operator named a figure. Half rather than all
-because the walk blocks the worker answering the client: a flood then holds half
-the pool and the other half keeps answering, which is the difference between a
-resolver degraded and one down. Half rather than a quarter because the walks
-past the bound are answered SERVFAIL, so the number is also the honest
-cache-miss load this server can validate at, and erring small costs real
-answers.
-
-At least one whatever the arithmetic says. A one-worker configuration still has
-to be able to walk a chain, and the bound is on walks at once rather than on
-walks.
-*/
-@(private)
-configured_chain_walks :: proc(cfg: ^config.Config) -> int {
-	if cfg.dnssec.max_chain_walks > 0 {
-		return cfg.dnssec.max_chain_walks
-	}
-	return max(1, cfg.server.workers / 2)
 }
 
 /*

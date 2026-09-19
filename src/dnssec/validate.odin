@@ -299,6 +299,22 @@ Budget :: struct {
 	query - a second signer, an address hint - asks for its own.
 	*/
 	holds_walk:    bool,
+	/*
+	Whether any walk of this query was turned away for want of a slot.
+
+	Sticky, where `holds_walk` is not, and read by `validate_rrset` before it
+	reports a set forged. A signature whose signer this server could not walk to
+	is skipped rather than tried, and a later walk in the same query can still
+	succeed - the flood ebbs, a slot frees - which would leave the set judged on
+	the signatures that were tried and called a forgery on the strength of one
+	that was not.
+
+	It costs the precision of the extended error on answers that fail anyway:
+	`Bogus` and `Indeterminate` are both SERVFAIL, so what changes is code 6
+	against code 22 and the words in the log. Refusing to accuse a zone of
+	forgery while this server is refusing itself lookups is worth that.
+	*/
+	shed_walk:     bool,
 	// The hashing a denial proved with NSEC3 may spend, which no count of
 	// lookups or verifications bounds: see `MAX_NSEC3_ROUNDS_PER_QUERY`.
 	nsec3:         Nsec3_Budget,
@@ -2275,6 +2291,26 @@ validate_rrset :: proc(
 	}
 
 	/*
+	The zone is signed, nothing verified - and this server turned one of its own
+	walks away to get here.
+
+	A signature whose signer could not be walked to is skipped above rather than
+	tried, so what is left to judge the set on is not the whole of what arrived.
+	The walk that stopped may even be the one that mattered: the signer's chain
+	is a prefix of the owner's, so a slot freeing in between is all it takes for
+	the owner walk below to succeed where the signer walk did not, and the set
+	is then called forged on the strength of a signature nobody looked at.
+	`Indeterminate` is the honest report - the same one every other allowance in
+	this file gives, for the same reason.
+
+	After the switch, so an `Insecure` owner still wins: an unsigned zone needs
+	no signature, and no walk of ours changes that.
+	*/
+	if budget.shed_walk {
+		return .Indeterminate, "", WALKS_IN_FLIGHT, "", {}
+	}
+
+	/*
 	Nothing here was checkable, and the zone it belongs to is signed with
 	something that was.
 
@@ -2834,6 +2870,7 @@ may_look_up :: proc(v: ^Validator, budget: ^Budget) -> bool {
 		budget.holds_walk = true
 		return true
 	}
+	budget.shed_walk = true
 	sync.atomic_add(&v.shed, 1)
 	return false
 }

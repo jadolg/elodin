@@ -139,6 +139,8 @@ test_only_so_many_chain_walks_block_at_once :: proc(t: ^testing.T) {
 	// silent. Waiting for them is the measurement: unfixed, they are queued
 	// behind it instead and none of them does.
 	finished := 0
+	calls := 0
+	peak := 0
 	start := time.now()
 	for time.since(start) < 10 * time.Second {
 		finished = 0
@@ -147,16 +149,24 @@ test_only_so_many_chain_walks_block_at_once :: proc(t: ^testing.T) {
 				finished += 1
 			}
 		}
-		if finished >= WALKERS - SLOTS {
+		sync.mutex_lock(&up.mu)
+		peak = up.peak
+		calls = up.calls
+		sync.mutex_unlock(&up.mu)
+		/*
+		Both, not just the first. A walk that takes a slot has raised
+		`Validator.walks` before it reaches the upstream - there is a
+		`spend_lookup`, an encode and a call in between - so a loop that stopped
+		as soon as the losers were counted could read `calls` while a winner was
+		still on its way to the mutex, and fail on a loaded box for no reason.
+		The upstream is silent until this loop is done, so waiting for both
+		cannot deadlock on anything but the bug.
+		*/
+		if finished >= WALKERS - SLOTS && calls >= SLOTS {
 			break
 		}
 		time.sleep(time.Millisecond)
 	}
-
-	sync.mutex_lock(&up.mu)
-	peak := up.peak
-	calls := up.calls
-	sync.mutex_unlock(&up.mu)
 
 	// Let the two that took a slot go, so the threads can be joined whatever the
 	// result above was.
@@ -298,5 +308,95 @@ test_a_shed_walk_is_never_a_downgrade :: proc(t: ^testing.T) {
 	calls := up.calls
 	sync.mutex_unlock(&up.mu)
 	testing.expectf(t, calls == 0, "a shed walk should reach no upstream, it reached one %d times", calls)
+	free_all(context.temp_allocator)
+}
+
+// Answers from the captured set, so the chain below is the real one.
+@(private = "file")
+captured_query :: proc(
+	ctx: rawptr,
+	name: string,
+	type: dns.Type,
+	allocator: mem.Allocator,
+) -> (
+	wire: []u8,
+	ok: bool,
+) {
+	for f in FIXTURES {
+		if f.type == type && dns.name_equal_fold(f.name, name) {
+			out, decoded := decode_hex(f.wire, allocator)
+			return out, decoded
+		}
+	}
+	return nil, false
+}
+
+/*
+A signature this server never looked at must not come back as a forgery.
+
+The one shape of this bound that could accuse a zone, and it arrives by the back
+door. `validate_rrset` walks to each signature's signer and skips the signature
+when the walk does not reach it, then settles what the failure *means* by
+walking to the owner - and the signer's chain is a prefix of the owner's, so a
+slot freeing in between is all it takes for the second walk to succeed where the
+first did not. Nothing verified, the zone is signed, and the answer is `Bogus`:
+EDE 6, "DNSSEC Bogus", for a set whose only signature was never tried.
+
+The interval is a race on a running server and is made explicit here - the walk
+is shed while the test holds the only slot, and the slot is given back before
+the set is judged, which is the same sequence with the timing taken out. The
+signature is a fabricated one so that nothing verifies and the tail is reached;
+what is on trial is the verdict, not the cryptography.
+*/
+@(test)
+test_a_walk_this_server_shed_is_not_called_a_forgery :: proc(t: ^testing.T) {
+	v := make_validator(captured_query, nil, Options{max_chain_walks = 1})
+	defer destroy_validator(v)
+
+	now := time.unix(FIXTURE_TIME, 0)
+	unix := u32(FIXTURE_TIME)
+	budget := query_budget(v)
+
+	// A flood holds the only slot, and this query's signer walk is turned away.
+	testing.expect(t, take_walk_slot(v), "the one slot should be free")
+	shed_status, _, _ := zone_trust(v, &budget, "cloudflare.com.", now, context.temp_allocator)
+	testing.expect_value(t, shed_status, Status.Indeterminate)
+	testing.expect_value(t, walk_reason(&budget), WALKS_IN_FLIGHT)
+	testing.expect(t, budget.shed_walk, "the budget should remember that a walk was turned away")
+
+	// The flood ebbs, so the walk to the owner below finds a slot and succeeds.
+	drop_walk_slot(v)
+
+	records := []dns.Record {
+		{name = "cloudflare.com.", type = .A, class = .IN, ttl = 300, data = dns.Rdata_Raw{data = {0xc0, 0xa8, 0x00, 0x01}}},
+	}
+	sigs := []Rrsig {
+		{
+			type_covered = .A,
+			algorithm = ALG_ECDSAP256SHA256,
+			labels = 2,
+			original_ttl = 300,
+			inception = unix - 3600,
+			expiration = unix + 3600,
+			key_tag = 34505,
+			signer = "cloudflare.com.",
+			signature = make([]u8, 64, context.temp_allocator),
+		},
+	}
+
+	status, _, reason, _, _ := validate_rrset(
+		v,
+		&budget,
+		"cloudflare.com.",
+		.A,
+		.IN,
+		records,
+		sigs,
+		unix,
+		now,
+		context.temp_allocator,
+	)
+	testing.expect_value(t, status, Status.Indeterminate)
+	testing.expect_value(t, reason, WALKS_IN_FLIGHT)
 	free_all(context.temp_allocator)
 }

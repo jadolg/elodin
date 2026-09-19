@@ -946,13 +946,22 @@ answers SERVFAIL where it would have gone upstream, with the same extended error
 an upstream that did not answer produces. It is never served as insecure: load
 shedding must not be a way to strip a zone's signatures.
 
-Zero, the default, is half of `server.workers` — a flood then costs half the pool
-and the other half keeps answering. What the bound costs while it binds is more
-than the flood's own names: a cached apex is not a cached name, so a hostname
-nobody has asked for before under a zone this resolver knows well is SERVFAIL
-too. `elodin_dnssec_walks_shed_total` counts the walks that stopped, and a
-resolver nobody is flooding should read zero — if it does not, honest cache-miss
-load is being turned into SERVFAIL and the number wants raising.
+Zero, the default, is half of `server.workers`, held down to `upstream_workers`
+— a flood then costs half the pool and the other half keeps answering. What the
+bound costs while it binds is more than the flood's own names: a cached apex is
+not a cached name, so a hostname nobody has asked for before under a zone this
+resolver knows well is SERVFAIL too. `elodin_dnssec_walks_shed_total` counts the
+walks that stopped, and a resolver nobody is flooding should read zero — if it
+does not, honest cache-miss load is being refused and the number wants raising.
+The startup log names the number in use.
+
+With `strategy: race` the half-the-pool figure is the handler pool only. A walk
+waiting on an upstream also holds one job per candidate server in the racer pool
+(`server.upstream_workers`), so a group of three upstreams turns each walk into
+three jobs, and the handler threads the bound was keeping free can still queue
+there. Raise `upstream_workers` with the number of upstreams if that matters
+more than the memory; `failover` submits one at a time and does not have this
+shape.
 
 A query also has a hashing allowance of its own, and above a ceiling of 255 —
 derived from that allowance, so a build that retunes it says its own number in

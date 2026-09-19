@@ -2358,6 +2358,17 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 		cfg.server.sizing.derived_upstream_workers = true
 	}
 	/*
+	And the chain-walk bound, here rather than at start-up for the reason above:
+	`--check` and the run that follows it have to agree, and an operator told to
+	raise a number has to be able to see what it currently is.
+
+	Both worker counts are settled by now, which is why it is derived after
+	them. See `derive_chain_walks`.
+	*/
+	if cfg.dnssec.max_chain_walks == 0 {
+		cfg.dnssec.max_chain_walks = derive_chain_walks(cfg.server.workers, cfg.server.upstream_workers)
+	}
+	/*
 	The UDP readers, sized the same way and reported the same way.
 
 	Refused rather than clamped, for the reason `max_udp_response` is: the
