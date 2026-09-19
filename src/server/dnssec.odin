@@ -144,7 +144,7 @@ start_validator :: proc(s: ^Server) -> bool {
 		},
 	)
 	// The bound is named here because it is the number an operator watching
-	// `elodin_dnssec_walks_shed_total` rise is being told to raise, and
+	// `elodin_dnssec_queries_shed_total` rise is being told to raise, and
 	// `config.derive_chain_walks` usually picked it rather than the file. Read
 	// back off the validator rather than off the configuration: a validator
 	// built from a configuration that never went through `config.validate` -
@@ -200,8 +200,10 @@ It is still a worker held for a round trip, and a chain walk makes one of these
 per label of a name the client chose. What stops a client choosing how many
 workers are held that way is `dnssec.max_chain_walks`, which
 `config.derive_chain_walks` sets to everything but a reserved quarter of the
-pool: that quarter is always free to answer what needs no walk, whatever a flood
-is doing. A walk past the bound reads the caches and gives up where it would
+pool: that quarter cannot be inside a walk, so it turns over in a round trip
+rather than in thirty of them, whatever a flood is doing. Free of the walk
+rather than idle - a reserved worker may still be parked on its own upstream
+forward, which is not bounded here. A walk past the bound reads the caches and gives up where it would
 have called this, which the client sees as the SERVFAIL an unreachable authority
 produces.
 
@@ -341,6 +343,12 @@ otherwise push ordinary answers past the point where they need a retry over TCP.
 // Set once the first answer has lost its AD bit to a failed rebuild; see below.
 @(private)
 prune_failure_reported: bool
+
+// Set once the first walk has been turned away for want of a slot. See the
+// branch in `resolve_query` that reads it: the count is
+// `elodin_dnssec_queries_shed_total`, and the line is said once.
+@(private)
+chain_walk_shed_reported: bool
 
 @(private)
 present_response :: proc(

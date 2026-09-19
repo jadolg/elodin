@@ -176,9 +176,19 @@ and the resolver stops answering anything at all (issue #356). "Worker" is the
 shared pool - UDP and HTTP/2 - which is why this is derived from `workers`: the
 stream transports answer on a thread per connection and are bounded by
 `max_connections`, and a walk there holds nothing anybody else is waiting for. What has to be
-guaranteed is that some workers are always free to answer - a cache hit, a name
-already validated, a question with no DNSSEC in it - and that is a *reservation*
-rather than a ceiling.
+guaranteed is that most of the pool keeps *turning over* - and that is a
+*reservation* rather than a ceiling.
+
+Turning over, not idle, and the difference is worth stating because the wrong
+reading oversells this. The reserved workers are free of the *walk*, not free of
+work: one may be parked on the query's own upstream forward, which takes no slot
+and is not bounded here. What the reservation buys is that at most
+`max_chain_walks` of them can be inside a chain walk, and a walk is up to
+`MAX_LOOKUPS_PER_QUERY` round trips against a forward's one - so the rest come
+back in a round trip rather than in a second, and the pool keeps draining its
+queue instead of standing still. Enough of a flood will still fill every worker
+and shed at `try_submit`; what it can no longer do is hold them for thirty round
+trips apiece, which is the whole of #356.
 
 Stated this way round on purpose. A ceiling of half the pool also caps honest
 throughput at half, and the walks past it are answered SERVFAIL: every

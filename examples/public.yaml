@@ -342,7 +342,7 @@ dnssec:
   # Chain walks that may be waiting on an upstream at once; 0 is server.workers
   # less a reserved quarter. The reservation is what stops a client choosing
   # names whose labels are all fresh from holding every worker on a DS lookup
-  # apiece. Watch elodin_dnssec_walks_shed_total — see examples/elodin.yaml.
+  # apiece. Watch elodin_dnssec_queries_shed_total — see examples/elodin.yaml.
   # max_chain_walks: 0
 
 cookies:

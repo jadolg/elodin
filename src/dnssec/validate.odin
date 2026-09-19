@@ -129,8 +129,11 @@ Validator :: struct {
 	however long it takes (`Budget.own_thread`). Past `max_chain_walks`, a walk runs against the caches alone and
 	answers `Indeterminate` where it would have gone upstream - the same verdict,
 	and the same extended error, that an upstream which did not answer produces.
-	The flood then costs a fixed number of threads rather than all of them, which
-	is the difference between a resolver degraded and one down.
+	The flood then holds a fixed number of threads *for a walk* rather than all of
+	them: the rest may still be busy with their own upstream forward, which
+	nothing here bounds, but they come back in a round trip instead of in the
+	thirty a walk may take. That is the difference between a resolver degraded
+	and one down.
 
 	A slot is taken at the first lookup that would go upstream, not on the way
 	into the walk, so a walk both caches can answer never asks for one and a
@@ -160,8 +163,9 @@ Validator :: struct {
 	*/
 	walks:                int,
 	max_chain_walks:      int,
-	// Walks that found no slot, for the operator who wants to know why DNSSEC
-	// started failing. Read through `walks_shed`.
+	// Questions in which a walk found no slot, for the operator who wants to
+	// know why DNSSEC started failing. One per question however many of its
+	// walks were turned away - see `may_look_up`. Read through `queries_shed`.
 	shed:                 u64,
 
 	allocator:            mem.Allocator,
@@ -2913,7 +2917,7 @@ May this walk go upstream, and if it has not asked before, take the slot that
 lets it?
 
 Counted where the answer is no rather than where the slot is refused, so
-`walks_shed` is walks that actually stopped: a walk both caches could answer is
+`queries_shed` is walks that actually stopped: a walk both caches could answer is
 refused a slot under a flood and finishes anyway, and counting that would leave
 the number moving on a resolver working perfectly.
 */
@@ -2955,9 +2959,16 @@ chain_walk_limit :: proc(v: ^Validator) -> int {
 	return v.max_chain_walks if v != nil else 0
 }
 
-// Chain walks that had to stop because the server was already going upstream for
-// as many as it will. Zero on a resolver that is not being flooded.
-walks_shed :: proc(v: ^Validator) -> u64 {
+/*
+Questions in which a chain walk had to stop because the server was already going
+upstream for as many as it will. Zero on a resolver that is not being flooded.
+
+Questions rather than walks, which is why it is not named for them: one question
+can want a walk per signer and another to the owner, and a question with no slot
+is refused at every one of them. Counting those would have a single shed question
+read as five or ten.
+*/
+queries_shed :: proc(v: ^Validator) -> u64 {
 	return sync.atomic_load(&v.shed) if v != nil else 0
 }
 

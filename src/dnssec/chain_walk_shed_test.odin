@@ -197,7 +197,7 @@ test_only_so_many_chain_walks_block_at_once :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expectf(t, shed == WALKERS - SLOTS, "%d walks should say so in their own words, %d did", WALKERS - SLOTS, shed)
-	testing.expect_value(t, walks_shed(v), u64(WALKERS - SLOTS))
+	testing.expect_value(t, queries_shed(v), u64(WALKERS - SLOTS))
 }
 
 /*
@@ -206,7 +206,7 @@ A walk that needs no lookup is not affected by the bound at all.
 This is what keeps the bound from being a second denial of service, and it is
 why the slot is taken at the first upstream lookup rather than on the way into
 the walk: a question a warm cache answers must neither be refused while every
-slot is held nor take a slot other walks need - and must not move `walks_shed`,
+slot is held nor take a slot other walks need - and must not move `queries_shed`,
 which an operator reads as the flood's own number.
 */
 @(test)
@@ -240,7 +240,7 @@ test_a_shed_walk_still_answers_from_the_cache :: proc(t: ^testing.T) {
 	// slot this test is holding itself, and a walk that took a second would
 	// have made it two.
 	testing.expect_value(t, sync.atomic_load(&v.walks), 1)
-	testing.expect_value(t, walks_shed(v), u64(0))
+	testing.expect_value(t, queries_shed(v), u64(0))
 	free_all(context.temp_allocator)
 }
 
@@ -275,7 +275,7 @@ test_a_shed_walk_below_a_warm_apex_still_stops :: proc(t: ^testing.T) {
 	testing.expect_value(t, status, Status.Indeterminate)
 	testing.expect_value(t, walk_reason(&budget), WALKS_IN_FLIGHT)
 	// This one is the flood's cost and belongs in the number an operator reads.
-	testing.expect_value(t, walks_shed(v), u64(1))
+	testing.expect_value(t, queries_shed(v), u64(1))
 
 	sync.mutex_lock(&up.mu)
 	calls := up.calls
@@ -315,7 +315,13 @@ test_a_shed_walk_is_never_a_downgrade :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
-// Answers from the captured set, so the chain below is the real one.
+// Answers from the captured set, so the chains below are the real ones, and a
+// count of what was asked for.
+@(private = "file")
+Captured :: struct {
+	calls: int,
+}
+
 @(private = "file")
 captured_query :: proc(
 	ctx: rawptr,
@@ -326,6 +332,9 @@ captured_query :: proc(
 	wire: []u8,
 	ok: bool,
 ) {
+	if ctx != nil {
+		(cast(^Captured)ctx).calls += 1
+	}
 	for f in FIXTURES {
 		if f.type == type && dns.name_equal_fold(f.name, name) {
 			out, decoded := decode_hex(f.wire, allocator)
@@ -409,11 +418,13 @@ test_a_walk_this_server_shed_is_not_called_a_forgery :: proc(t: ^testing.T) {
 And a shed walk cannot tell an unsigned zone from a signed one, so it refuses
 that too.
 
-The half of the blast radius that is easiest to miss. `zone_step` reaches
-`.Insecure` only by asking for the DS and reading a proof that there is no
-delegation, so a walk with no slot has no way to say "this name is in an
-unsigned zone, forward the answer". It says `Indeterminate`, and the client gets
-SERVFAIL for a name that has nothing to do with DNSSEC at all.
+The half of the blast radius that is easiest to miss, and the reason it is
+pinned against a real insecure delegation rather than an unknown name: `zone_step`
+reaches `.Insecure` only by asking `com.` for `reddit.com.`'s DS and being shown
+a signed proof that there is none. A walk with no slot cannot ask, so it has no
+way to say "this name is in an unsigned zone, forward the answer". It says
+`Indeterminate`, and the client gets SERVFAIL for a name that has nothing to do
+with DNSSEC at all. With the guard taken out, the walk below reaches `.Insecure`.
 
 Which makes the real cost of a full table "every cold name", not "every cold
 signed name" - the thing an operator sizing `dnssec.max_chain_walks` has to know,
@@ -421,30 +432,35 @@ and the reason the bound reserves workers rather than capping them.
 */
 @(test)
 test_a_shed_walk_cannot_tell_an_unsigned_zone_from_a_signed_one :: proc(t: ^testing.T) {
-	up := Slow_Upstream{}
-	v := make_validator(captured_query, nil, Options{max_chain_walks = 1})
+	seen := Captured{}
+	v := make_validator(captured_query, &seen, Options{max_chain_walks = 1})
 	defer destroy_validator(v)
 
 	now := time.unix(FIXTURE_TIME, 0)
-	// The chain above the name is known and signed; what is not known is
-	// whether anything is delegated below it, which is the DS lookup.
-	keys := []Dnskey{}
-	cache_put(v, ".", .Secure, keys, MAX_ZONE_TTL, now)
-	cache_put(v, "com.", .Secure, keys, MAX_ZONE_TTL, now)
+	/*
+	The chain down to `com.` warmed the way a first question would, by asking
+	one. What is left uncached is the only step that matters here: whether
+	anything is delegated at `reddit.com.`
+	*/
+	warm := query_budget(v)
+	warm_status, _, _ := zone_trust(v, &warm, "cloudflare.com.", now, context.temp_allocator)
+	testing.expect_value(t, warm_status, Status.Secure)
 
 	testing.expect(t, take_walk_slot(v), "the one slot should be free")
 	defer drop_walk_slot(v)
 
+	before := seen.calls
 	budget := query_budget(v)
-	status, _, _ := zone_trust(v, &budget, "unsigned.example.com.", now, context.temp_allocator)
+	status, _, _ := zone_trust(v, &budget, "www.reddit.com.", now, context.temp_allocator)
 	// Not `.Insecure`, which is the answer that would have been forwarded.
 	testing.expect_value(t, status, Status.Indeterminate)
 	testing.expect_value(t, walk_reason(&budget), WALKS_IN_FLIGHT)
-
-	sync.mutex_lock(&up.mu)
-	calls := up.calls
-	sync.mutex_unlock(&up.mu)
-	testing.expectf(t, calls == 0, "a shed walk should reach no upstream, it reached one %d times", calls)
+	testing.expectf(
+		t,
+		seen.calls == before,
+		"a shed walk should ask nobody, it asked %d times",
+		seen.calls - before,
+	)
 	free_all(context.temp_allocator)
 }
 
@@ -484,6 +500,6 @@ test_a_query_on_its_own_thread_is_never_shed :: proc(t: ^testing.T) {
 	// having asked, and saying so, rather than refused for want of a slot.
 	testing.expect_value(t, status, Status.Indeterminate)
 	testing.expect(t, walk_reason(&budget) != WALKS_IN_FLIGHT, "a query on its own thread should never be shed")
-	testing.expect_value(t, walks_shed(v), u64(0))
+	testing.expect_value(t, queries_shed(v), u64(0))
 	free_all(context.temp_allocator)
 }

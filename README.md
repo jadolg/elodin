@@ -947,7 +947,14 @@ an upstream that did not answer produces. It is never served as insecure: load
 shedding must not be a way to strip a zone's signatures.
 
 Zero, the default, is `server.workers` less a reserved quarter of them (at least
-two). It is a reservation rather than a ceiling on purpose: every cache-missing
+two). The reserved quarter is free of the *walk*, not idle — one may still be
+parked on the query's own upstream forward, which nothing here bounds — so what
+the reservation buys is that those workers come back in a round trip instead of
+in the thirty a walk may take, and the pool keeps draining its queue. Enough of a
+flood will still fill every worker; what it can no longer do is hold them for a
+walk apiece.
+
+It is a reservation rather than a ceiling on purpose: every cache-missing
 name that is not already known to be no zone cut needs a slot, so a resolver that
 is merely busy — a restart with real traffic pointed at it, where nearly every
 query is a cold walk — would refuse validated answers if the bound were set to
@@ -972,7 +979,7 @@ without asking for the DS and being shown there is none. So while every slot is
 held, what still answers is what the caches hold: every other cold name is
 SERVFAIL, signed or not.
 
-`elodin_dnssec_walks_shed_total` counts the queries that stopped, and a resolver
+`elodin_dnssec_queries_shed_total` counts the queries that stopped, and a resolver
 nobody is flooding should read zero — if it does not, honest cache-miss load is
 being refused and the number wants raising. `--check` and the startup log both
 name the number in use, and startup warns if it is large enough to leave no
@@ -2163,7 +2170,7 @@ as a warning at startup.
 | `elodin_rate_limited_total` | counter | queries the rate limiter withheld an answer from |
 | `elodin_rate_limit_slipped_total` | counter | those answered truncated instead, to send a real client to TCP |
 | `elodin_dnssec_answers_total{result}` | counter | `secure` and `bogus` |
-| `elodin_dnssec_walks_shed_total` | counter | chain-of-trust walks that stopped short of an upstream, because `dnssec.max_chain_walks` were already waiting on one. Zero on a resolver nobody is flooding; rising alongside SERVFAIL means the shedding is this server's, not an upstream going away — and if nobody is flooding it, the bound is too small |
+| `elodin_dnssec_queries_shed_total` | counter | chain-of-trust walks that stopped short of an upstream, because `dnssec.max_chain_walks` were already waiting on one. Zero on a resolver nobody is flooding; rising alongside SERVFAIL means the shedding is this server's, not an upstream going away — and if nobody is flooding it, the bound is too small |
 | `elodin_rebind_refused_total` | counter | answers withheld because a public name was pointed into private space |
 | `elodin_special_use_total` | counter | queries answered from the reserved-name table instead of being forwarded |
 | `elodin_cache_entries` / `_bytes` | gauge | what the cache holds, against `max_entries` and `max_bytes` |

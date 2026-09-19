@@ -317,10 +317,13 @@ Dnssec_Config :: struct {
 	for and are never turned away.
 
 	Zero, the default, is `server.workers` less a reserved quarter of them, so
-	some are always free to answer what needs no walk. It is exposed because the
+	that quarter cannot be held inside a walk - it turns over in a round trip
+	rather than in the thirty a walk may take. Free of the walk rather than idle:
+	a reserved worker may still be parked on the query's own upstream forward,
+	which nothing here bounds. It is exposed because the
 	cost of the number being too small is real - a resolver whose honest
 	cache-miss load is above it turns the surplus into SERVFAIL - and it is not a
-	number anybody here can know. `elodin_dnssec_walks_shed_total` is how an
+	number anybody here can know. `elodin_dnssec_queries_shed_total` is how an
 	operator finds out they need a bigger one, and a smaller one is how they cap
 	the upstream volume a flood can provoke, which the reservation does not.
 	*/

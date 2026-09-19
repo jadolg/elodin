@@ -2037,15 +2037,32 @@ resolve_query :: proc(
 			an operator reading either alone has half the story.
 			*/
 			from := answering_upstream(winner)
-			logx.warnf(
-				"dnssec: %s %s from %s did not validate: %v (%s); answer came from %s",
-				dns.type_name(q.type),
-				dns.name_trim_root(q.name),
-				client,
-				result.status,
-				result.reason,
-				from,
-			)
+			/*
+			Once, where the verdict is this server's own load shedding.
+
+			Every other reason here is a fact about one answer, and a line
+			apiece is what makes a group whose members disagree diagnosable. A
+			shed walk is not: it is the same fact about this server, repeated at
+			whatever rate a flood chooses, and `logx.write_line` takes a
+			process-global lock and flushes every line - so the cheap path #356
+			exists to provide would serialise every worker behind one mutex and
+			fill the disk with the attacker's own client string. Counted first
+			and logged once, which is what `report_refusal` does with the
+			connection limits and for the same reason: the metric keeps saying
+			so long after the one line has scrolled away.
+			*/
+			shed := result.reason == dnssec.WALKS_IN_FLIGHT
+			if !shed || !sync.atomic_exchange(&chain_walk_shed_reported, true) {
+				logx.warnf(
+					"dnssec: %s %s from %s did not validate: %v (%s); answer came from %s",
+					dns.type_name(q.type),
+					dns.name_trim_root(q.name),
+					client,
+					result.status,
+					result.reason,
+					from,
+				)
+			}
 			out, built := dnssec_failure_response(msg, result, allocator, limit)
 			log_query(s, client, proto, q, .Failed, fmt.tprintf("dnssec:%s", from), started)
 			return out, .Failed, built
