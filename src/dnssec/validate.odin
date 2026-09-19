@@ -1,5 +1,7 @@
 package dnssec
 
+import "core:crypto"
+import "core:hash"
 import "core:mem"
 import "core:slice"
 import "core:strings"
@@ -68,8 +70,54 @@ Validator :: struct {
 
 	mu:                   sync.Mutex,
 	zones:                map[string]^Zone_Entry,
+	/*
+	Names the chain walk found to be no zone cut, against when that stops being
+	true. Nothing but an expiry is kept: a non-cut has no keys, and the only
+	question asked of it is whether the walk may skip a DS lookup.
+
+	Kept apart from `zones` rather than stored beside them, because what may
+	enter the two is not the same. A name reaches `zones` by being delegated,
+	which is the parent operator's doing and slow; a name reaches this by being
+	descended through, which is the client's doing and as fast as it can send.
+	RFC 4470 lets a zone answer a name it does not hold with an NSEC minted for
+	the question - a record that says the name is there and carries no NS, which
+	is exactly a non-cut - so under a zone serving those, every name anyone asks
+	about lands here. One map would have that flood trip the overflow in
+	`cache_put`, which frees every zone in it, and the root's keys with them.
+
+	A table of fixed size, indexed by a hash of the name, rather than a map with
+	a policy for what to throw out. Every scheme for choosing a victim out of a
+	map walks it, and walking it on the insert path is the one thing a flood
+	must not make expensive - while a scheme cheap enough not to walk it ends up
+	throwing out whatever sits at the front, which under a flood is everything
+	worth keeping. Here a name simply owns its slot until another name hashes to
+	it, so what survives a flood is what keeps being asked for: a name looked up
+	again is put back, and each single-use name the flood inserts threatens one
+	slot in a thousand rather than the oldest thing in the map.
+	*/
+	non_cuts:             []Non_Cut,
+	/*
+	The offset basis `non_cut_slot` hashes with, drawn once at start-up.
+
+	FNV-1a is published and this table is direct-mapped, so with the standard
+	basis anyone could work out offline which names land on which slot and pick
+	query names that displace a zone's empty non-terminals on purpose, instead
+	of having to flood and hope. A seed nobody outside the process knows takes
+	that back to the flood. It is a weak keying of a non-cryptographic hash and
+	is meant as no more: nothing here is authenticated, and the worst a
+	collision costs is the DS lookup the slot was saving.
+	*/
+	non_cut_seed:         u32,
 
 	allocator:            mem.Allocator,
+}
+
+// One slot of `Validator.non_cuts`. An empty `name` is a free slot; a name is
+// owned by the table and released when the slot is reused.
+@(private)
+Non_Cut :: struct {
+	name:    string,
+	expires: time.Time,
 }
 
 @(private)
@@ -343,6 +391,68 @@ DEFAULT_MAX_NSEC3_ITERATIONS :: 100
 
 DEFAULT_MAX_CACHED_ZONES :: 4096
 
+/*
+Slots in the non-cut table.
+
+Smaller than the zone cache and fixed rather than configurable, because this
+holds what clients asked about rather than what the hierarchy is: it is sized to
+cover the empty non-terminals a resolver's own traffic keeps meeting, not to be
+a second answer cache. The whole table is allocated once - a few tens of
+kilobytes - and a name entering a slot another name holds takes it, which is the
+whole of the replacement policy.
+*/
+MAX_CACHED_NON_CUTS :: 1024
+
+/*
+How long a remembered non-cut may be believed.
+
+Shorter than `MAX_ZONE_TTL`, and deliberately not the denial's own ceiling. A
+zone entry going stale is a zone this server keeps checking against yesterday's
+keys, which the DNS has always bounded by the TTL the operator published. A table
+entry going stale is different in kind: it suppresses the very lookup that would
+notice. A delegation appearing where an empty non-terminal was leaves the walk
+stopping at the parent, and that goes wrong in both directions. Closed, which is
+the obvious one: the new zone's signatures come from a zone the walk never
+established, so they are refused. And open, which is not: the parent's own
+delegation NSEC covers every name inside the new child, so a forged denial for
+one of them can be proven against the parent's keys and served `.Secure`. That
+second one is the same exposure any resolver's negative DS cache carries in the
+same window, so it is standard rather than new - but it is the reason the
+ceiling here is worth having rather than a detail of it.
+
+The verdicts that rest on reaching a name give it back when they come out
+broken - `forget_unreached_non_cut` - so both directions close on the question
+after the first. This bounds the ones nobody asks twice.
+
+Five minutes does that without giving up what the table is for. What it exists
+to collapse is a run walked again and again - a flood, or ordinary repeated
+traffic - and that arrives inside seconds, not inside an hour. The floor is
+`MIN_ZONE_TTL` as everywhere else, so an operator who shortens a negative TTL
+below a minute ahead of a delegation change does not get less than that.
+*/
+MAX_NON_CUT_TTL :: 300
+
+/*
+What the memo does not do, written down so the next reader does not have to
+find out by measuring.
+
+It makes a run of non-cuts cost one walk per name rather than one per question,
+which is the whole of the issue's shape - a zone with a fixed run of empty
+non-terminals under it - and the whole of what legitimate traffic pays, the
+`ip6.arpa.` nibbles between a provider's zone and a customer's most of all. It
+does not bound the run. `zone_trust` descends from the apex, so a question whose
+labels nearest the apex are fresh has every name below them fresh too, and a
+client varying one of those misses the memo the whole way down however often it
+asks - and puts a single-use entry in for each name it walked while it is there.
+
+Nothing here can fix that, which is worth saying plainly. A bound on the run is
+the only thing that would, and there is no bound that separates the two cases: a
+customer's reverse zone can sit fifteen empty non-terminals below its provider's
+under `ip6.arpa.`, which is deeper than the walk an attacker needs. So what is
+left bounding one question is `MAX_LOOKUPS_PER_QUERY`, as before, and what would
+change it is not caching but not holding a handler thread for the walk.
+*/
+
 // How long a zone's keys, or the fact that a zone is unsigned, may be reused.
 // The record TTLs decide within these bounds.
 MIN_ZONE_TTL :: 60
@@ -383,6 +493,10 @@ make_validator :: proc(
 	}
 	v.max_cached_zones = opts.max_cached_zones if opts.max_cached_zones > 0 else DEFAULT_MAX_CACHED_ZONES
 	v.zones = make(map[string]^Zone_Entry, 64, allocator)
+	v.non_cuts = make([]Non_Cut, MAX_CACHED_NON_CUTS, allocator)
+	seed: [4]u8
+	crypto.rand_bytes(seed[:])
+	v.non_cut_seed = transmute(u32)seed
 	return v
 }
 
@@ -394,6 +508,8 @@ destroy_validator :: proc(v: ^Validator) {
 		free_entry(v, entry)
 	}
 	delete(v.zones)
+	clear_non_cuts(v)
+	delete(v.non_cuts, v.allocator)
 	free(v, v.allocator)
 }
 
@@ -1227,9 +1343,9 @@ with every later question through the same cache. A hint nothing verified -
 unsigned, or forged - costs one step more than either: `validate_rrset` settles
 forged against unsigned by walking to the *owner*, and the owner of a hint is a
 name below its zone rather than the zone itself, so that step is a DS query for
-a name that is no cut and that `zone_step` does not cache as one. Appending an
-unsigned address at a target the answer really names is therefore worth a lookup
-to whoever appends it, on every miss. A hint padded past the allowance is the one
+a name that is no cut. `zone_step` remembers those, so appending an unsigned
+address at a target the answer really names is worth a lookup to whoever appends
+it once per name rather than on every miss. A hint padded past the allowance is the one
 that costs nothing extra: the exhausted return comes before that walk.
 `MAX_HINT_TARGETS` bounds how many of these one response can ask for, and the
 query budget bounds what they may spend between them.
@@ -1749,6 +1865,11 @@ validate_denial :: proc(
 		return {status = .Indeterminate, reason = "verification budget spent"}
 	}
 	if len(nsecs) == 0 && len(nsec3s) == 0 {
+		// Nothing here spoke for the name, and one reason is that the walk
+		// never reached it: a delegation appearing at a name the table still
+		// calls no cut leaves the proof signed by a zone `established` is
+		// above. See `forget_unreached_non_cut`.
+		forget_unreached_non_cut(v, qname, established)
 		return {status = .Bogus, reason = "no denial of existence"}
 	}
 
@@ -1958,6 +2079,13 @@ validate_rrset :: proc(
 		}
 		if !seen_walk {
 			zone_status, keys, established = zone_trust(v, budget, sig.signer, now, allocator)
+			// The walk held up and still did not reach the zone this signature
+			// names; see `forget_unreached_non_cut`. The signer is the
+			// response's to choose rather than the client's, so what it can
+			// reach is a name on its own owner's ancestry.
+			if zone_status == .Secure {
+				forget_unreached_non_cut(v, sig.signer, established)
+			}
 			append(
 				&walked,
 				Walked {
@@ -2045,7 +2173,14 @@ validate_rrset :: proc(
 	}
 
 	missing := "signature missing" if len(sigs) == 0 else "no valid signature"
-	owner_status, _, _ := zone_trust(v, budget, owner, now, allocator)
+	owner_status, _, owner_zone := zone_trust(v, budget, owner, now, allocator)
+	// The walk held up and stopped above the owner, and nothing here verified:
+	// one reason is a delegation at a name the table still calls no cut, which
+	// for an *unsigned* one leaves this the only verdict that can notice. The
+	// denial and wildcard paths do the same; see `forget_unreached_non_cut`.
+	if owner_status == .Secure {
+		forget_unreached_non_cut(v, owner, owner_zone)
+	}
 	switch owner_status {
 	case .Insecure:
 		return .Insecure, "", "unsigned zone", "", {}
@@ -2312,6 +2447,7 @@ validate_wildcard_proof :: proc(
 	// it is not theirs to speak for - a hash of one landing in some span of the
 	// zone would say nothing at all.
 	if !name_in_zone(next_closer, established) {
+		forget_unreached_non_cut(v, owner, established)
 		return .Bogus, nil, "wildcard expansion not proven"
 	}
 	denial := denial_records_for(v, budget, seen, msg.authority, established, class, keys, unix, now, allocator)
@@ -2352,6 +2488,9 @@ validate_wildcard_proof :: proc(
 		logx.debugf("dnssec: the wildcard proof for %s was not read to the end: %s", dns.name_trim_root(owner), why)
 		return .Indeterminate, nil, why
 	}
+	// As on the denial path: a proof that speaks for nothing may be one the
+	// walk stopped above. See `forget_unreached_non_cut`.
+	forget_unreached_non_cut(v, owner, established)
 	return .Bogus, nil, "wildcard expansion not proven"
 }
 
@@ -2634,12 +2773,21 @@ zone_trust :: proc(
 			from a zone this walk never established - which is refused, so a
 			zone the rest of the internet validates comes back SERVFAIL.
 
-			The cost is one DS lookup per label, and what keeps a client from
-			choosing how many is `.Absent` below: only a name the zone really
-			holds is walked past, and the first name it does not hold ends the
-			walk. So the depth here is the zone's own, not the question's.
-			Caching non-cuts the way `cache_put` caches zones would take even
-			that back if a deep chain of real empty non-terminals ever shows.
+			The cost is one DS lookup per label, and how many there are is not
+			this server's to choose. `.Absent` below ends the walk at the first
+			name the zone does not hold, which for a zone denying the ordinary
+			way makes the depth the zone's own rather than the question's - but
+			a zone minting its denials under RFC 4470 never says a name is
+			absent, so every label of whatever was asked about comes back a
+			non-cut and the depth is the client's, up to `MAX_CHAIN_DEPTH`.
+
+			`zone_step` remembers non-cuts, which takes the cost of a run that
+			repeats down to one walk per name. It does not bound the run: the
+			walk descends from the apex, so a question whose *upper* labels are
+			fresh misses the memo the whole way down however many times it is
+			asked. What bounds that is `MAX_LOOKUPS_PER_QUERY` and nothing
+			finer - see the note on `MAX_CACHED_NON_CUTS` for why no bound on
+			the run itself survives contact with `ip6.arpa.`.
 			*/
 			continue
 		case .Absent:
@@ -2693,7 +2841,8 @@ zone_step :: proc(
 	step: Step,
 	keys: []Dnskey,
 ) {
-	if cached, found := cache_get(v, child, now, allocator); found {
+	cached, found, non_cut := cache_get(v, child, now, allocator)
+	if found {
 		switch cached.status {
 		case .Secure:
 			return .Secure, cached.keys
@@ -2704,6 +2853,12 @@ zone_step :: proc(
 			// as an absent delegation keeps the failure closed if that changes.
 			return .Bogus, nil
 		}
+	}
+	// A name already known to be no cut, which is the whole of this step: the
+	// walk wants to know whether to keep its keys and keep going, and that is
+	// the answer. See `Validator.non_cuts`.
+	if non_cut {
+		return .No_Cut, nil
 	}
 
 	if !spend_lookup(budget) {
@@ -2774,6 +2929,15 @@ zone_step :: proc(
 			if exhausted {
 				return walk_gave_up(budget, "verification budget spent"), nil
 			}
+			/*
+			The third way a delegation appearing at a remembered non-cut shows
+			up here, and the one that arrives with records rather than without:
+			the first name below the new cut is itself a signed zone, so its DS
+			is served and signed by the new zone, and no signature over it
+			names the parent the walk established. Same answer as the two
+			returns below - give the skipped name back to the lookup.
+			*/
+			forget_skipped_non_cut(v, parent, child)
 			return .Bogus, nil
 		}
 
@@ -2827,6 +2991,14 @@ zone_step :: proc(
 		return walk_gave_up(budget, "verification budget spent"), nil
 	}
 	if len(nsecs) == 0 && len(nsec3s) == 0 {
+		/*
+		Nothing to read, and the likeliest reason is the one worth acting on: a
+		delegation has appeared at a name the memo still calls no cut, so the
+		walk skipped it and this DS question landed inside the child zone. What
+		comes back is then signed by the child, `validated_denial_records`
+		drops it for not being the parent's, and both slices are empty.
+		*/
+		forget_skipped_non_cut(v, parent, child)
 		return .Bogus, nil
 	}
 
@@ -2853,8 +3025,37 @@ zone_step :: proc(
 		)
 		return walk_gave_up(budget, why), nil
 	}
-	if step == .Insecure {
+	if step == .Bogus {
+		forget_skipped_non_cut(v, parent, child)
+	}
+	switch step {
+	case .Insecure:
 		cache_put(v, child, .Insecure, nil, negative_ttl(msg), now)
+	case .No_Cut:
+		/*
+		Remembered for the denial's own negative TTL, the way an insecure
+		delegation is, and for the same reason: this cost the network a round
+		trip and the answer holds until the records it came from expire.
+
+		A non-cut is the expensive one. The walk has to keep going past it - the
+		cut may be below - so a run of them is a blocking DS lookup per label on
+		the thread already answering the client, and uncached every question
+		under the name pays the whole run again. That is issue #330: a zone with
+		twenty empty non-terminals turned each question into twenty sequential
+		upstream queries, and the same shape is what a legitimate deep hierarchy
+		costs every time somebody asks about it - `ip6.arpa.` puts a nibble
+		label between apexes, so a customer's reverse zone sits several
+		non-cuts below its provider's.
+
+		`.Absent` is not remembered, which is the other half of the issue's
+		suggestion and deliberately left out. It ends the walk rather than
+		continuing it, so it is one lookup rather than a run, and it is reached
+		only by names nobody holds - a set the client picks from freely. There
+		is nothing to win: the answer cache holds the NXDOMAIN, so the same
+		question does not come back here anyway.
+		*/
+		non_cut_remember(v, child, negative_ttl(msg), now)
+	case .Secure, .Absent, .Bogus, .Indeterminate:
 	}
 	return step, nil
 }
@@ -3160,7 +3361,7 @@ zone_keys :: proc(
 	status: Status,
 	keys: []Dnskey,
 ) {
-	if cached, found := cache_get(v, zone, now, allocator); found {
+	if cached, found, _ := cache_get(v, zone, now, allocator); found {
 		return cached.status, cached.keys
 	}
 
@@ -3196,11 +3397,24 @@ cache_get :: proc(
 ) -> (
 	entry: Zone_Entry,
 	found: bool,
+	/*
+	What the non-cut memo says about the same name, answered here rather than
+	through a call of its own so that one step of the walk takes the
+	validator's lock once.
+
+	Read only when the name is absent from the zones, which is narrower than
+	"when `found` is false": an entry that has expired but not yet been swept
+	shadows the memo too. That costs a lookup the memo would have saved and
+	nothing else, and it is not the invariant it looks like - the guard in
+	`non_cut_remember` declines only a *live* zone entry, so a name can sit in
+	both maps with the zone's copy expired.
+	*/
+	non_cut: bool,
 ) {
 	fold_buf: [dns.MAX_NAME_PRESENTATION]u8
 	key, key_ok := fold_into(zone, fold_buf[:])
 	if !key_ok {
-		return {}, false
+		return {}, false, false
 	}
 
 	sync.mutex_lock(&v.mu)
@@ -3208,10 +3422,11 @@ cache_get :: proc(
 
 	cached, in_map := v.zones[key]
 	if !in_map {
-		return {}, false
+		slot := v.non_cuts[non_cut_slot(v, key)]
+		return {}, false, slot.name == key && time.diff(slot.expires, now) <= 0
 	}
 	if time.diff(cached.expires, now) > 0 {
-		return {}, false
+		return {}, false, false
 	}
 	/*
 	The RDATA is copied, not referenced. A `Dnskey` is a handful of slices into
@@ -3238,7 +3453,149 @@ cache_get :: proc(
 		}
 		out.keys = copies[:]
 	}
-	return out, true
+	return out, true, false
+}
+
+/*
+A step that came back broken may be one the walk should never have reached.
+
+The memo says a name exists and is no cut. Existence is the half that can lapse,
+and a cut appearing is the half that can change: either way the walk skips the
+name on the memo's word and asks about one a label further down, where the
+answer settles nothing. An NSEC3 name error proves the closest encloser and the
+next closer, so the step below the next closer is neither matched nor covered; a
+delegation that has since appeared answers from inside the child zone, whose
+records are not the parent's and are dropped; and where the first name below the
+new cut is itself signed, the DS that arrives is signed by a zone the walk never
+established. All three read as broken.
+
+So a broken step gives the name above it back to the lookup. One name per step,
+which for a run of them is one question each before the walk gets past it - the
+memo sheds the run from the bottom up - and the ceiling on how long that can go
+on is `MAX_NON_CUT_TTL` rather than this. Forgetting a name the memo had right
+costs the one DS lookup it was saving.
+*/
+@(private)
+forget_skipped_non_cut :: proc(v: ^Validator, parent, child: string) {
+	// Nothing was skipped when the child sits directly under the zone the walk
+	// established, so there is no name between them to be wrong about.
+	if label_count(child) <= label_count(parent) + 1 {
+		return
+	}
+	non_cut_forget(v, name_drop_labels(child, 1))
+}
+
+/*
+Give back a name the walk was asked about and did not reach.
+
+The three forgets in `zone_step` all sit after its DS query, and a table hit
+returns before it - so when the name the memo holds is itself the one that
+became a zone, no lookup is made and nothing notices. Every verdict that rests
+on reaching that name then comes out broken, and asking again changes nothing,
+because the walk skips the name again without asking.
+
+So the verdicts that rest on it say so. `established` being a proper ancestor of
+the name is the whole of the test: the walk held up and still stopped short, and
+the memo is the only thing that makes it stop short. Being wrong costs the one
+DS lookup the entry was saving.
+*/
+@(private)
+forget_unreached_non_cut :: proc(v: ^Validator, name, established: string) {
+	if dns.name_equal_fold(name, established) || !name_in_zone(name, established) {
+		return
+	}
+	non_cut_forget(v, name)
+}
+
+// The slot a name owns. FNV-1a over the folded name, from this process's own
+// offset basis - see `Validator.non_cut_seed` for why the basis is not the
+// published one.
+@(private)
+non_cut_slot :: proc(v: ^Validator, key: string) -> int {
+	return int(hash.fnv32a(transmute([]u8)key, v.non_cut_seed) % u32(len(v.non_cuts)))
+}
+
+// Forget one name, for a caller that does not hold the lock.
+@(private)
+non_cut_forget :: proc(v: ^Validator, name: string) {
+	fold_buf: [dns.MAX_NAME_PRESENTATION]u8
+	key, key_ok := fold_into(name, fold_buf[:])
+	if !key_ok {
+		return
+	}
+	sync.mutex_lock(&v.mu)
+	defer sync.mutex_unlock(&v.mu)
+	non_cut_drop(v, key)
+}
+
+// Release the slot `key` would occupy, if it is the name sitting there. The
+// caller holds the lock.
+@(private)
+non_cut_drop :: proc(v: ^Validator, key: string) {
+	slot := &v.non_cuts[non_cut_slot(v, key)]
+	if slot.name != key {
+		return
+	}
+	delete(slot.name, v.allocator)
+	slot^ = {}
+}
+
+// Remember one, clamped so a denial naming no TTL still expires and one naming
+// a year is not believed for one. The name in the slot gives way, which is the
+// whole of the replacement policy; see `Validator.non_cuts`.
+@(private)
+non_cut_remember :: proc(v: ^Validator, name: string, ttl: u32, now: time.Time) {
+	fold_buf: [dns.MAX_NAME_PRESENTATION]u8
+	key, key_ok := fold_into(name, fold_buf[:])
+	if !key_ok {
+		return
+	}
+	lifetime := clamp(ttl, MIN_ZONE_TTL, MAX_NON_CUT_TTL)
+	expires := time.time_add(now, time.Duration(lifetime) * time.Second)
+
+	sync.mutex_lock(&v.mu)
+	defer sync.mutex_unlock(&v.mu)
+
+	/*
+	Not if the name is a zone. `cache_put` drops any memo entry as it settles
+	one, which covers a name remembered and then settled; this is the same race
+	arriving in the other order, and it is just as reachable - two walks both
+	missing the caches for one child, one upstream in the pool answering with
+	the DS and another with a stale denial of it.
+
+	Left unguarded the two hold the same name with their own lifetimes, and a
+	clamped negative TTL outlasting the DS TTL means that once the zone entry
+	expires the walk reads a live signed cut as no cut. Every signature that
+	zone makes is then refused, and no lookup can put it right because the memo
+	answers before the question is asked.
+	*/
+	if zone, settled := v.zones[key]; settled && time.diff(zone.expires, now) <= 0 {
+		return
+	}
+
+	slot := &v.non_cuts[non_cut_slot(v, key)]
+	if slot.name == key {
+		// Already ours; only the expiry moves.
+		slot.expires = expires
+		return
+	}
+	if slot.name != "" {
+		delete(slot.name, v.allocator)
+	}
+	slot.name = strings.clone(key, v.allocator)
+	slot.expires = expires
+}
+
+// Drop every name the table owns. Only `destroy_validator` wants this, and
+// nothing else can still be looking by then.
+@(private)
+clear_non_cuts :: proc(v: ^Validator) {
+	for &slot in v.non_cuts {
+		if slot.name != "" {
+			delete(slot.name, v.allocator)
+			slot = {}
+		}
+	}
 }
 
 // `now` is the same clock the lookups use rather than the wall clock, so an
@@ -3278,6 +3635,20 @@ cache_put :: proc(v: ^Validator, zone: string, status: Status, keys: []Dnskey, t
 
 	sync.mutex_lock(&v.mu)
 	defer sync.mutex_unlock(&v.mu)
+
+	/*
+	This name has just been settled as a zone, so anything the memo says about
+	it is answering an older question and must go.
+
+	`zone_step` reads the zones first, so a live entry here already wins - but
+	the two lifetimes are their own. A delegation appearing between two walks,
+	or two upstreams in a pool disagreeing about one, can leave both maps
+	holding the same name, and if the memo's clamped negative TTL outlasts the
+	zone's the walk goes back to treating a live signed cut as no cut once the
+	zone entry expires. That refuses the zone's own signatures, which is
+	SERVFAIL for every name in it until the memo ages out.
+	*/
+	non_cut_drop(v, key)
 
 	if old, exists := v.zones[key]; exists {
 		// Reuse the string the map is already keyed by. Re-inserting under the
@@ -3324,6 +3695,18 @@ sweep :: proc(v: ^Validator, now: time.Time = {}) -> (removed: int) {
 		delete_key(&v.zones, entry.zone)
 		free_entry(v, entry)
 		removed += 1
+	}
+
+	// The non-cuts go the same way but are not counted: `removed` is reported
+	// as expired zone keys - `sweep_validator`, and the line it feeds in
+	// `main.odin` - and a table slot holds no keys. Folding them in would have
+	// that number overstate key-cache churn to whoever is reading it to decide
+	// whether the zone cache is thrashing.
+	for &slot in v.non_cuts {
+		if slot.name != "" && time.diff(slot.expires, clock) > 0 {
+			delete(slot.name, v.allocator)
+			slot = {}
+		}
 	}
 	return
 }
