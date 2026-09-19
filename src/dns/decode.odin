@@ -11,6 +11,7 @@ Decode_Error :: enum u8 {
 	Loop_Detected,
 	Bad_Rdata,
 	Truncated_Header,
+	Name_Budget,
 }
 
 Encode_Error :: enum u8 {
@@ -24,10 +25,60 @@ Encode_Error :: enum u8 {
 	Bad_Rdata,
 }
 
+/*
+What one decode of a message may spend expanding its names into.
+
+Every name is cloned in escaped presentation form, so one 255-octet name of
+unprintable bytes costs 1004 bytes, and a two-byte compression pointer buys a
+fresh copy of the whole expansion. A record is only 16 wire bytes when its owner
+and its RDATA name are both pointers, so a reply built entirely of those reaches
+about 130 times its own length - 8.5 MB out of 64 KB - and the same message is
+decoded again for the cache, for the UDP fit and for the validator.
+
+A flat figure rather than a multiple of the message, for two reasons. It is the
+absolute one that matters: what threatens the box is the megabytes a full-length
+reply can reach, and a short message expanding to many times itself is many times
+nothing. And a multiple would not survive this codebase's own rewrites - a
+message is stripped of its RRSIGs and stored, and `encode_message` compresses
+what it writes, so the same names can come back in half the bytes. The entry
+would then be refused on every cache hit by a budget its own message had passed,
+which is a branch `resolve` documents as unreachable.
+
+640 KB is what one reading may spend. A record whose owner is a pointer is 16
+wire bytes, so a full-length reply crosses it at around 160 presentation
+characters of name per record - an RRset of four thousand records under one name
+that long. Shorter replies reach it too, since what a name costs has nothing to
+do with the two bytes that name it: 650 records under one 255-octet name of
+unprintable octets is 10 KB of wire and the whole budget. Both are legal and
+neither is anything a real server sends - a name is normally printable and a few
+dozen characters, written out once for every record or two that carries it, and
+a reply of a few hundred records costs a few tens of kilobytes of names.
+*/
+NAME_BUDGET :: 640 * 1024
+
 @(private)
 Reader :: struct {
-	msg: []u8,
-	pos: int,
+	msg:        []u8,
+	pos:        int,
+	// Presentation bytes this message's names have been expanded into so far,
+	// against `NAME_BUDGET`.
+	name_bytes: int,
+}
+
+/*
+Charge `n` presentation bytes to the message's expansion budget.
+
+Charged after the clone rather than before it, since what a name costs is not
+known until it is decoded, so a name overshoots the budget by at most
+`MAX_NAME_PRESENTATION` and nothing else is decoded once it is gone. RDATA
+expansion overshoots by that much per name in the layout, since it reads them
+one after another before anything checks again; its buffer is the one thing
+charged ahead of itself, because that one is known before it is taken.
+*/
+@(private)
+charge_name :: proc(r: ^Reader, n: int) -> Decode_Error {
+	r.name_bytes += n
+	return .Name_Budget if r.name_bytes > NAME_BUDGET else .None
 }
 
 @(private)
@@ -81,6 +132,17 @@ r_name :: proc(r: ^Reader, allocator: mem.Allocator) -> (name: string, err: Deco
 	name, next, err = decode_name(r.msg, r.pos, allocator)
 	if err != .None {
 		return
+	}
+	if err = charge_name(r, len(name)); err != .None {
+		// The one place a name is decoded and then not kept, so the one place
+		// that has to hand it back. An allocator that takes things back is not
+		// what this decoder is normally fed - a caller serving a query hands it
+		// an arena and drops the lot - and a decode that fails anywhere leaves
+		// everything before it unreachable for the same reason. That is the
+		// contract rather than this procedure's business; dropping a name it
+		// has in hand would be.
+		delete(name, allocator)
+		return "", err
 	}
 	r.pos = next
 	return
@@ -201,9 +263,33 @@ decode_record :: proc(r: ^Reader, allocator: mem.Allocator) -> (rec: Record, err
 		// odd records still survive a forward. Compressed names in it are still
 		// expanded where they can be: a type this decoder does model can fail on
 		// something else entirely - a trailing byte, a length that disagrees -
-		// and come through here with a perfectly good pointer inside it.
-		rec.data = decode_raw_rdata(r.msg, rec.type, rdata_start, rdata_end, allocator)
+		// and come through here with a perfectly good pointer inside it. Such a
+		// record charges its names to the budget twice, once for each attempt,
+		// which is the right count: the first attempt's clones are in the arena
+		// as surely as the second's.
+		rec.data = decode_raw_rdata(r, rec.type, rdata_start, rdata_end, allocator)
 		err = .None
+	}
+	/*
+	A spent budget fails the message, whichever path above noticed.
+
+	The raw path cannot say so itself: `decode_raw_rdata` never fails - a record
+	of a type this decoder does not model is kept as bytes whatever is wrong
+	with it - so when the budget stops it expanding a name it copies the RDATA
+	verbatim and says nothing. That leaves a live compression pointer in an
+	`Rdata_Raw`, which is the one thing `encode_message` refuses to write: the
+	message would decode here and then fail to be built again, taking
+	`fit_response` to an empty TC answer and `remove_edns_option` to no answer
+	at all, for a reply this server had read.
+
+	Asked after the fallback rather than before it so the modelled path lands
+	here too - its own refusal would otherwise be swallowed by the retry the
+	same way. Reachable only on a message's last record, since any record after
+	it fails on its own owner name, and that is exactly the record an upstream
+	would append.
+	*/
+	if r.name_bytes > NAME_BUDGET {
+		return {}, .Name_Budget
 	}
 	r.pos = rdata_end
 	return
@@ -328,7 +414,7 @@ decode_rdata :: proc(
 		return Rdata_OPT{options = opts[:]}, .None
 	}
 
-	return decode_raw_rdata(r.msg, type, start, end, allocator), .None
+	return decode_raw_rdata(r, type, start, end, allocator), .None
 }
 
 // Cheap header peek for paths that only need the ID or the QR bit and do not
