@@ -2028,6 +2028,16 @@ resolve_query :: proc(
 			contradicts. `Bogus` outranks `Indeterminate` besides, so a response
 			holding both a shed walk and a proved forgery comes back as the
 			forgery, is counted as one and logged as one.
+
+			Proved is the word doing the work, and it is worth spelling out
+			because the sentence reads stronger than it is. A set whose every
+			signature was tried and failed is proved forged and stays `Bogus`
+			however much else in the question was shed. A set holding one
+			signature this server never looked at - its signer's walk turned
+			away - is not proved anything: that signature might have been the
+			genuine one, so `validate_rrset` answers `Indeterminate` for it and
+			the question follows. Refusing to accuse on evidence we declined to
+			gather is the point, not a gap in it.
 			*/
 			shed := result.shed && result.status == .Indeterminate
 			/*
