@@ -2,6 +2,7 @@ package server
 
 import "core:mem"
 import "core:sync"
+import "elodin:config"
 import "elodin:dns"
 import "elodin:dnssec"
 import "elodin:logx"
@@ -119,6 +120,11 @@ start_validator :: proc(s: ^Server) -> bool {
 	it: the walks are what hold the workers, so allowing as many walks as there
 	are workers allows a client to hold all of them.
 
+	Only for a figure somebody wrote. On a one-worker configuration the
+	derivation has nowhere to reserve from and returns one, and a server warning
+	about the number it chose for itself is a warning nobody can act on or
+	silence.
+
 	Said rather than refused or held down, which is this file's rule for a
 	configured number everywhere else: an operator who names a figure gets it. A
 	resolver that will not start, or one quietly running at a number nobody
@@ -126,7 +132,7 @@ start_validator :: proc(s: ^Server) -> bool {
 	against the handler pool because that is what the bound protects - see
 	`handle_query`'s `shared_worker`.
 	*/
-	if s.cfg.dnssec.max_chain_walks >= s.cfg.server.workers {
+	if !s.cfg.server.sizing.derived_chain_walks && s.cfg.dnssec.max_chain_walks >= s.cfg.server.workers {
 		logx.warnf(
 			"dnssec: max_chain_walks %d leaves none of the %d workers reserved, so a flood of fresh names can hold them all; see issue #356",
 			s.cfg.dnssec.max_chain_walks,
@@ -141,6 +147,13 @@ start_validator :: proc(s: ^Server) -> bool {
 			anchors = anchors,
 			max_nsec3_iterations = s.cfg.dnssec.max_nsec3_iterations,
 			max_chain_walks = s.cfg.dnssec.max_chain_walks,
+			/*
+			The connection transports get their own, derived from the threads
+			they actually have. Not a setting: what sizes it is
+			`server.max_connections`, which is already one, and a second knob
+			for the same quantity is a second thing to get wrong.
+			*/
+			max_connection_walks = config.derive_chain_walks(s.cfg.server.max_connections),
 		},
 	)
 	// The bound is named here because it is the number an operator watching
@@ -152,9 +165,10 @@ start_validator :: proc(s: ^Server) -> bool {
 	// default, and a log line naming a number nothing is using is worse than no
 	// line at all.
 	logx.infof(
-		"dnssec: validating against %d trust anchor(s), at most %d chain walks upstream at once",
+		"dnssec: validating against %d trust anchor(s), at most %d chain walks upstream at once on the handler pool and %d on connection threads",
 		len(anchors) if len(anchors) > 0 else len(dnssec.root_anchors()),
-		dnssec.chain_walk_limit(s.validator),
+		dnssec.chain_walk_limit(s.validator, .Shared),
+		dnssec.chain_walk_limit(s.validator, .Connection),
 	)
 	return true
 }

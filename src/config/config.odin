@@ -311,10 +311,11 @@ Dnssec_Config :: struct {
 	unsigned ones included, since a zone cannot be known to be unsigned without
 	the DS lookup that shows it.
 
-	Counted for queries on the shared handler pool only, which is UDP and
-	HTTP/2. The others answer on the connection's own thread and are bounded by
-	`server.max_connections` instead, so they hold no worker anybody is waiting
-	for and are never turned away.
+	This is the bound for the shared handler pool, which is UDP and HTTP/2. The
+	connection transports have one of their own, derived the same way from
+	`server.max_connections` and counted apart, so a flood on one cannot spend
+	the other's allowance. Not a second setting: what sizes it is
+	`server.max_connections`, which already is one.
 
 	Zero, the default, is `server.workers` less a reserved quarter of them, so
 	that quarter cannot be held inside a walk - it turns over in a round trip

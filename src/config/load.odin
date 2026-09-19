@@ -2367,6 +2367,7 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	*/
 	if cfg.dnssec.max_chain_walks == 0 {
 		cfg.dnssec.max_chain_walks = derive_chain_walks(cfg.server.workers)
+		cfg.server.sizing.derived_chain_walks = true
 	}
 	/*
 	The UDP readers, sized the same way and reported the same way.

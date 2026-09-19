@@ -2017,7 +2017,22 @@ resolve_query :: proc(
 		)
 		#partial switch result.status {
 		case .Bogus, .Indeterminate:
-			sync.atomic_add(&s.stats.bogus, 1)
+			shed := result.reason == dnssec.WALKS_IN_FLIGHT
+			/*
+			Everything but our own shedding is counted as `bogus`.
+
+			The counter's two readings have always been folded together here -
+			see the note in `validate_rrset` - on the argument that the ones
+			folded in are upstream failures, which nobody chooses. This one is
+			chosen: a flood decides how often it happens, so leaving it in would
+			let an attacker drive a series operators read as "somebody is forging
+			answers" at whatever rate they like. `failed` still moves, because
+			the query did, and `elodin_dnssec_queries_shed_total` is the series
+			that says how often this was us.
+			*/
+			if !shed {
+				sync.atomic_add(&s.stats.bogus, 1)
+			}
 			sync.atomic_add(&s.stats.failed, 1)
 			/*
 			Both lines name the upstream the refused answer came from.
@@ -2038,21 +2053,23 @@ resolve_query :: proc(
 			*/
 			from := answering_upstream(winner)
 			/*
-			Once, where the verdict is this server's own load shedding.
+			Once at `warn`, then at `debug`, where the verdict is this server's
+			own load shedding - `report_once`, the same bargain
+			`report_refusal` strikes with the connection limits.
 
 			Every other reason here is a fact about one answer, and a line
 			apiece is what makes a group whose members disagree diagnosable. A
 			shed walk is not: it is the same fact about this server, repeated at
-			whatever rate a flood chooses, and `logx.write_line` takes a
-			process-global lock and flushes every line - so the cheap path #356
-			exists to provide would serialise every worker behind one mutex and
-			fill the disk with the attacker's own client string. Counted first
-			and logged once, which is what `report_refusal` does with the
-			connection limits and for the same reason: the metric keeps saying
-			so long after the one line has scrolled away.
+			whatever rate a flood chooses. `logx.write_line` takes a
+			process-global lock and flushes every line, so a line per shed query
+			would have the cheap path #356 exists to provide serialise every
+			worker behind one mutex and write the attacker's own client string
+			to disk as fast as they can send. Said once, counted always:
+			`elodin_dnssec_queries_shed_total` is what carries the rest, and
+			`debug` is where an operator asks about a later episode.
 			*/
-			shed := result.reason == dnssec.WALKS_IN_FLIGHT
-			if !shed || !sync.atomic_exchange(&chain_walk_shed_reported, true) {
+			say, first := report_once(&chain_walk_shed_reported, logx.enabled(.Debug))
+			if !shed {
 				logx.warnf(
 					"dnssec: %s %s from %s did not validate: %v (%s); answer came from %s",
 					dns.type_name(q.type),
@@ -2061,6 +2078,23 @@ resolve_query :: proc(
 					result.status,
 					result.reason,
 					from,
+				)
+			} else if first {
+				logx.warnf(
+					"dnssec: %s %s from %s did not validate: %v (%s); this server was already walking as many chains as dnssec.max_chain_walks allows, so it stopped looking. Counted as elodin_dnssec_queries_shed_total; further ones are logged at debug level",
+					dns.type_name(q.type),
+					dns.name_trim_root(q.name),
+					client,
+					result.status,
+					result.reason,
+				)
+			} else if say {
+				logx.debugf(
+					"dnssec: %s %s from %s was not validated: %s",
+					dns.type_name(q.type),
+					dns.name_trim_root(q.name),
+					client,
+					result.reason,
 				)
 			}
 			out, built := dnssec_failure_response(msg, result, allocator, limit)

@@ -966,10 +966,15 @@ walking, so a flood is answered rather than absorbed. That is the trade — work
 starvation for upstream volume, degraded rather than down — and an operator who
 would rather cap the volume sets a smaller number here.
 
-It applies to queries answered on a worker of the shared pool, which is UDP and
-DoH over HTTP/2. TCP, DoT and DoH over HTTP/1.1 answer on the connection's own
-thread and are bounded by `max_connections` instead, so a slow walk there delays
-that client and nobody else; they are never turned away for want of a slot.
+There are two of these bounds, and this setting is the one for the shared handler
+pool — UDP and DoH over HTTP/2. TCP, DoT and DoH over HTTP/1.1 answer on the
+connection's own thread, and those get a bound of their own, derived the same way
+from `server.max_connections` and counted separately, so a flood on one transport
+cannot spend the other's allowance. Separately because the two are sized by
+different things: a number right for sixteen workers would refuse ordinary stream
+traffic, and one right for 512 connections would bound the pool at nothing.
+`server.max_connections` is the knob for the second one; there is no third
+setting.
 
 What the bound costs while it binds is much more than the flood's own names, and
 it is worth reading before choosing a number. A cached apex is not a cached name
@@ -978,6 +983,13 @@ it is worth reading before choosing a number. A cached apex is not a cached name
 without asking for the DS and being shown there is none. So while every slot is
 held, what still answers is what the caches hold: every other cold name is
 SERVFAIL, signed or not.
+
+One thing shedding does not do is save the forward: the upstream answer is
+already in hand by the time validation runs, so what is saved is the chain walk's
+own DS and DNSKEY lookups — the amplification #356 is about — and not the
+client's own question. The answer is discarded rather than cached, too, so a
+legitimate cold name asked repeatedly during a flood is re-forwarded and shed
+again each time rather than settling.
 
 `elodin_dnssec_queries_shed_total` counts the queries that stopped, and a resolver
 nobody is flooding should read zero — if it does not, honest cache-miss load is

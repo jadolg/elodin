@@ -101,6 +101,7 @@ Sizing :: struct {
 	machine:                  Machine,
 	derived_workers:          bool,
 	derived_upstream_workers: bool,
+	derived_chain_walks:      bool,
 	derived_udp_readers:      bool,
 }
 
@@ -172,10 +173,12 @@ Handlers kept back from the chain walk.
 
 The chain walk blocks the worker answering the client, once per label of a name
 the client chose, so without a bound a flood of fresh names holds every worker
-and the resolver stops answering anything at all (issue #356). "Worker" is the
-shared pool - UDP and HTTP/2 - which is why this is derived from `workers`: the
-stream transports answer on a thread per connection and are bounded by
-`max_connections`, and a walk there holds nothing anybody else is waiting for. What has to be
+and the resolver stops answering anything at all (issue #356). This is called twice, with the size
+of each pool a query can be answered on: `workers` for the shared one, which is
+UDP and HTTP/2, and `max_connections` for the thread-per-connection transports.
+Two bounds rather than one because the numbers differ by an order of magnitude
+and a single figure is wrong at both ends - and counted apart so a flood on one
+transport cannot spend the other's allowance. What has to be
 guaranteed is that most of the pool keeps *turning over* - and that is a
 *reservation* rather than a ceiling.
 
@@ -232,8 +235,8 @@ trimming `upstream_workers` on one of those would have silently cut the chain
 walks with it. The racer interaction is in the README, where the number of
 upstreams is known.
 */
-derive_chain_walks :: proc(workers: int) -> int {
-	return max(workers - max(workers / RESERVED_HANDLERS_SHARE, MIN_RESERVED_HANDLERS), 1)
+derive_chain_walks :: proc(threads: int) -> int {
+	return max(threads - max(threads / RESERVED_HANDLERS_SHARE, MIN_RESERVED_HANDLERS), 1)
 }
 
 // What this process can see of the machine, at the moment it asks.
