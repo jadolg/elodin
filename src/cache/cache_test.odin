@@ -193,6 +193,17 @@ test_a_bogus_verdict_is_kept_for_its_own_minute :: proc(t: ^testing.T) {
 	_, _, found := get(c, key, context.temp_allocator)
 	testing.expect(t, found, "the verdict was stored and then not found")
 	testing.expect(t, e.bogus, "the entry went in as an answer rather than as a verdict")
+
+	// And the flag admits the refusal and nothing else: an answer handed in
+	// with it set would be pinned for the minute under none of the rules an
+	// answer is kept by.
+	answer_wire, answer_msg := build_answer("answer.example.", 300, context.temp_allocator)
+	ab: [KEY_MAX]u8
+	testing.expect(
+		t,
+		!put(c, key_for(ab[:], "answer.example."), answer_wire, answer_msg, bogus = true),
+		"an answer was stored as a verdict",
+	)
 	free_all(context.temp_allocator)
 }
 

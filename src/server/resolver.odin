@@ -1287,7 +1287,6 @@ resolve_query :: proc(
 		}
 	}
 
-
 	/*
 	RD=0 asks for whatever this server already knows, not for a fresh lookup -
 	RFC 1035 section 4.1.1. A fresh cache hit above already answered that without
@@ -1320,7 +1319,6 @@ resolve_query :: proc(
 		return out, .Refused, built
 	}
 
-
 	/*
 	And the verdict this question was refused under, if there is one.
 
@@ -1337,10 +1335,12 @@ resolve_query :: proc(
 
 	Only while this request would have reached a verdict of its own.
 	`validating` is recomputed per query - a validator switched off by a reload,
-	a zone an operator has since routed or anchored - and the entry carries no
-	record of the rules it was refused under, so serving it to a request that is
-	not being validated would be a verdict outliving the configuration that
-	reached it.
+	a zone since given an `upstream.zones` route, an anchor taken away from one
+	that has one (`served_locally` reads an anchor as the operator asking for
+	that zone to be validated, so adding one turns validation on rather than
+	off) - and the entry carries no record of the rules it was refused under, so
+	serving it to a request that is not being validated would be a verdict
+	outliving the configuration that reached it.
 
 	An expired one is passed over rather than lent out as the stale fallback. A
 	verdict is not data to cover an outage with, which is the reading

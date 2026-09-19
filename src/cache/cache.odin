@@ -635,8 +635,9 @@ the caller recognises, and a caller with nothing to say leaves it at zero, which
 
 `bogus` is the caller saying the bytes are a refusal it reached itself rather
 than an answer somebody sent: a SERVFAIL, which is otherwise one of the
-transient failures above and refused. It is stored for `BOGUS_TTL` and comes
-back out of `get` flagged as what it is. See `Entry.bogus`.
+transient failures above and refused, and which is all the flag admits - an
+answer handed in with it set is refused like any other message whose rcode does
+not belong. It is stored for `BOGUS_TTL`. See `Entry.bogus`.
 */
 put :: proc(
 	c: ^Cache,
@@ -662,7 +663,22 @@ put :: proc(
 	lifetime is `BOGUS_TTL` and nothing the sender chose, which is what keeps a
 	verdict about somebody else's broken zone from being that zone's to extend.
 	*/
-	if !bogus {
+	if bogus {
+		/*
+		And it really is the refusal it says it is.
+
+		The flag is the caller's word that these bytes are a verdict it reached
+		itself, and it turns off more than the rcode gate below: the lifetime
+		stops being read from the message, so neither `negative_ttl` nor the
+		`min_ttl` floor reaches the entry. Set over an answer, that would pin
+		the answer for `BOGUS_TTL` under none of the rules an answer is kept
+		by - so what the flag admits is the one rcode this cache would
+		otherwise never keep, and nothing else.
+		*/
+		if rcode != .Serv_Fail {
+			return false
+		}
+	} else {
 		#partial switch rcode {
 		case .No_Error, .NX_Domain:
 		case:

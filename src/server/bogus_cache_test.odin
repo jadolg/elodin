@@ -368,10 +368,10 @@ test_a_bogus_verdict_is_not_asked_of_the_upstream_twice :: proc(t: ^testing.T) {
 	And the verdict stops answering the moment this server stops validating.
 
 	`validating` is recomputed for every query - a validator switched off by a
-	reload, a zone since routed or anchored - and the entry carries no record of
-	the rules it was refused under. So the memory is ignored rather than served,
-	the question goes upstream as it would on a miss, and the answer that comes
-	back is the one the client gets.
+	reload, a zone since given a route, an anchor taken away from one that has
+	one - and the entry carries no record of the rules it was refused under. So
+	the memory is ignored rather than served, the question goes upstream as it
+	would on a miss, and the answer that comes back is the one the client gets.
 	*/
 	f.server.validator = nil
 	fourth, plain, served_plain := handle_query(&f.server, query, .UDP, "test", context.temp_allocator)
