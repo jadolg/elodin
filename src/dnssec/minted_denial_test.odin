@@ -320,7 +320,13 @@ dr_validator :: proc(calls: ^Dr_Calls) -> ^Validator {
 	}
 	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
 	anchors[0] = anchor
-	return make_validator(dr_query, calls, Options{anchors = anchors})
+	v := make_validator(dr_query, calls, Options{anchors = anchors})
+	// A fixed seed makes the hash table deterministic, so no pair of names
+	// these tests use lands on the same slot.  Without this, the random seed
+	// drawn at start-up can produce a collision that evicts a name mid-walk
+	// and changes the verdict from what the test asserts - see issue #362.
+	v.non_cut_seed = 0
+	return v
 }
 
 @(test)
@@ -689,6 +695,11 @@ test_a_delegation_at_a_remembered_name_heals_on_the_next_question :: proc(t: ^te
 		"while the memo holds the name the walk cannot reach the zone, so the answer is refused, got %v",
 		first.status,
 	)
+	testing.expect(
+		t,
+		!dr_remembered(v, DR_SUB_QNAME, now),
+		"the refused question should have given the name back",
+	)
 
 	second := validate(v, DR_SUB_QNAME, .A, dr_fixture("dr_sub_answer"), now)
 	testing.expectf(
@@ -731,6 +742,11 @@ test_a_denial_from_a_delegation_at_a_remembered_name_heals_too :: proc(t: ^testi
 		first.status == .Bogus,
 		"while the table holds the name the proof comes from a zone the walk did not reach, got %v",
 		first.status,
+	)
+	testing.expect(
+		t,
+		!dr_remembered(v, DR_SUB_QNAME, now),
+		"the refused question should have given the name back",
 	)
 
 	second := validate(v, DR_SUB_QNAME, .AAAA, dr_fixture("dr_sub_nodata"), now)
