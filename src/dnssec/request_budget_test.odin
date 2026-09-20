@@ -7,13 +7,13 @@ import "elodin:dns"
 
 /*
 Issue #354: the chain walk reads a reply per step into the request's arena, and
-`dns.NAME_BUDGET` bounded each of those readings on its own.
+each of those readings was bounded only on its own.
 
 The counter is the request's now, so a walk can run out of it - and what it
 reports then must be the truth, which is that this server stopped reading. The
 alternative is an accusation: a zone reported forged because the question it
-belongs to had already expanded its allowance of names, at a moment an attacker
-with a signed zone chooses by answering the chain expensively.
+belongs to had already taken its allowance, at a moment an attacker with a
+signed zone chooses by answering the chain expensively.
 */
 
 // A reply with a name in it, so that a counter already past its budget is
@@ -35,7 +35,7 @@ ordinary_reply :: proc(name: string, type: dns.Type) -> []u8 {
 
 @(private = "file")
 spent_counter :: proc() -> int {
-	return dns.REQUEST_NAME_BUDGET + 1
+	return dns.REQUEST_DECODE_BUDGET + 1
 }
 
 /*
@@ -45,12 +45,12 @@ A response this server had no allowance left to read is undecided, not forged.
 checked and found false. Nothing was checked here.
 */
 @(test)
-test_a_response_past_the_request_name_budget_is_not_called_a_forgery :: proc(t: ^testing.T) {
+test_a_response_past_the_request_budget_is_not_called_a_forgery :: proc(t: ^testing.T) {
 	up := Counting_Upstream{}
 	v := make_validator(counting_query, &up, Options{})
 	defer destroy_validator(v)
 
-	names := spent_counter()
+	spent := spent_counter()
 	result := validate(
 		v,
 		"www.example.com.",
@@ -58,10 +58,10 @@ test_a_response_past_the_request_name_budget_is_not_called_a_forgery :: proc(t: 
 		ordinary_reply("www.example.com.", .A),
 		time.unix(FIXTURE_TIME, 0),
 		context.temp_allocator,
-		names = &names,
+		spent = &spent,
 	)
 	testing.expect_value(t, result.status, Status.Indeterminate)
-	testing.expect_value(t, result.reason, NAMES_OVER_BUDGET)
+	testing.expect_value(t, result.reason, READING_OVER_BUDGET)
 	testing.expect_value(t, up.calls, 0)
 	free_all(context.temp_allocator)
 }
@@ -70,12 +70,12 @@ test_a_response_past_the_request_name_budget_is_not_called_a_forgery :: proc(t: 
 And neither is a step of the chain.
 
 The upstream answers the DS lookup perfectly well; the request simply has
-nothing left to expand the reply's names into. `zone_step` used to read any
+nothing left to read the reply into. `zone_step` used to read any
 decode failure as a broken delegation, which under this counter would report a
 forgery for every zone the walk reached after the allowance ran out.
 */
 @(test)
-test_a_chain_step_past_the_request_name_budget_stops_the_walk :: proc(t: ^testing.T) {
+test_a_chain_step_past_the_request_budget_stops_the_walk :: proc(t: ^testing.T) {
 	up := Answering_Upstream{}
 	v := make_validator(answering_query, &up, Options{})
 	defer destroy_validator(v)
@@ -83,13 +83,13 @@ test_a_chain_step_past_the_request_name_budget_stops_the_walk :: proc(t: ^testin
 	now := time.unix(FIXTURE_TIME, 0)
 	cache_put(v, ".", .Secure, []Dnskey{}, MAX_ZONE_TTL, now)
 
-	names := spent_counter()
+	spent := spent_counter()
 	budget := query_budget(v)
-	budget.names = &names
+	budget.spent = &spent
 	status, _, _ := zone_trust(v, &budget, "www.example.com.", now, context.temp_allocator)
 
 	testing.expect_value(t, status, Status.Indeterminate)
-	testing.expect_value(t, budget.walk_stopped, NAMES_OVER_BUDGET)
+	testing.expect_value(t, budget.walk_stopped, READING_OVER_BUDGET)
 	testing.expectf(t, up.calls > 0, "the walk stopped before it asked anybody anything")
 	free_all(context.temp_allocator)
 }
@@ -103,7 +103,7 @@ answer the parent never signed - and the step is `Bogus` for what it says rather
 than `Indeterminate` for what this server declined to read.
 */
 @(test)
-test_a_chain_step_within_the_request_name_budget_reads_the_reply :: proc(t: ^testing.T) {
+test_a_chain_step_within_the_request_budget_reads_the_reply :: proc(t: ^testing.T) {
 	up := Answering_Upstream{}
 	v := make_validator(answering_query, &up, Options{})
 	defer destroy_validator(v)
@@ -111,13 +111,13 @@ test_a_chain_step_within_the_request_name_budget_reads_the_reply :: proc(t: ^tes
 	now := time.unix(FIXTURE_TIME, 0)
 	cache_put(v, ".", .Secure, []Dnskey{}, MAX_ZONE_TTL, now)
 
-	names := 0
+	spent := 0
 	budget := query_budget(v)
-	budget.names = &names
+	budget.spent = &spent
 	status, _, _ := zone_trust(v, &budget, "www.example.com.", now, context.temp_allocator)
 
 	testing.expect_value(t, status, Status.Bogus)
-	testing.expectf(t, names > 0, "the walk read a reply and charged the request nothing")
+	testing.expectf(t, spent > 0, "the walk read a reply and charged the request nothing")
 	free_all(context.temp_allocator)
 }
 

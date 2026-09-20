@@ -13,15 +13,16 @@ Decode_Error :: enum u8 {
 	Truncated_Header,
 	Name_Budget,
 	/*
-	This request had already spent `REQUEST_NAME_BUDGET` elsewhere.
+	This request had already taken `REQUEST_DECODE_BUDGET` out of its arena.
 
-	Apart from `Name_Budget` because it is not a statement about the message: the
-	same bytes read on their own would have decoded, and what stopped them is
-	this server's own accounting across the readings before it. A reader deciding
-	whether a reply is malformed - the validator most of all, which would
-	otherwise report a forgery - has to be able to tell the two apart.
+	Apart from every other error here because it is not a statement about the
+	message: the same bytes read on their own would have decoded, and what
+	stopped them is this server's own accounting across the readings before it.
+	A reader deciding whether a reply is malformed - the validator most of all,
+	which would otherwise report a forgery - has to be able to tell the two
+	apart.
 	*/
-	Request_Name_Budget,
+	Request_Budget,
 }
 
 Encode_Error :: enum u8 {
@@ -67,50 +68,57 @@ a reply of a few hundred records costs a few tens of kilobytes of names.
 NAME_BUDGET :: 640 * 1024
 
 /*
-What one request may spend expanding names, across every message it reads.
+What one request may take out of its arena reading the messages it reads.
 
 `NAME_BUDGET` is per reading, and a request is not one reading. A single query
 reads the upstream's reply for the cache, reads it again when only the answer
 section will parse, reads it a third time in `fit_response` when it passes the
 client's limit, and the validator reads a reply of its own for every step of the
 chain - `dnssec.MAX_LOOKUPS_PER_QUERY` of them. Thirty-five readings, each with
-a budget of its own, is about 22 MB of names in one in-flight request, and all
-of it in the one arena that request is served from. Issue #354, measured at
-23,989,840 bytes of arena out of 5,503 bytes of wire, against 4,396,364 with the
-counter - the budget below, plus the record arrays of the readings that ran
-before it was spent.
+a budget of its own and none at all for what it allocates besides names, all
+into the one arena that request is served from. Issue #354, measured over those
+thirty-five readings:
 
-So the counter belongs to whoever owns the arena rather than to the `Reader`,
-and this is what it may reach. A reading passed no counter keeps `NAME_BUDGET`
-alone, which is every caller outside a request: the fuzz target, the bootstrap
-resolver, the tests.
+	names, five kilobytes of pointers at one 255-octet name   23,989,840 B
+	65,504 empty character-strings in one TXT record          36,686,720 B
+	5,957 minimal records in one message                      18,554,196 B
 
-Four megabytes, and it has to be several times the per-reading figure rather
-than equal to it. `decode_answer` reads the same reply twice on purpose - the
-whole message, then the answer section alone when the whole will not parse - and
-a budget the first reading can empty takes the second one with it, which refuses
-an answer this server had no opinion about. That pair is 1.25 MB with both
-readings spending everything they are allowed, `fit_response` makes it 1.9 MB,
-and what is left is the validator's lookups. Real traffic is nowhere near: a
-name is normally a few dozen printable characters, so a large reply costs a few
-tens of kilobytes of names and a whole request well under one megabyte.
+Every byte of it, rather than the names alone. Names are the largest expansion a
+message can ask for and the only one this decoder ever bounded, but they are not
+the only one: a `<character-string>` may be zero bytes long and is a 16-byte
+`string` either way, an EDNS option is four wire bytes and twenty-four in
+memory, and a record is eleven wire bytes and about ninety. Those are a fixed
+multiple of the message and so bounded per reading by the message's own
+length - which is exactly the thing this budget exists to stop being the bound,
+since the request chooses how many readings there are. One counter of what the
+decoder took is simpler than a counter per kind of expansion and is the figure
+that matters anyway: what threatens the box is the megabytes, whatever shape
+they arrived in.
+
+Eight megabytes. A heavy request of the ordinary kind is 1,356,752 bytes
+measured - a full-length answer read the three times the answer path reads one,
+plus a DNSKEY reply for each of the thirty-two steps a chain walk may take - so
+this is about six times the worst honest traffic. It has to be several times the
+per-reading figures rather than equal to them: `decode_answer` reads the same
+reply twice on purpose, the whole message and then the answer section alone when
+the whole will not parse, and a budget the first reading can empty takes the
+second one with it, which refuses an answer this server had no opinion about.
+A full-length reply built to spend everything a reading may is about 1.7 MB, so
+the three readings of the answer path come to 5 MB and the chain still has room.
 
 Against the pool rather than against one query is where the figure is worth
 checking: `config` derives 16 to 128 workers and charges each
 `WORKER_MEMORY_BYTES` of ordinary use, so a flood holding every worker inside a
-request of this shape is 64 MB of names on the small box the issue was filed
-from and several hundred on the widest pool - where 22 MB a request was gigabytes
-of it. Lowering this is a lever if that is still too much; what it costs is the
-headroom above, and what it must not go under is the pair plus the fit.
+request of this shape is 128 MB on the small box the issue was filed from, where
+the three lines above were gigabytes. Lowering this is the lever if that is
+still too much; what it costs is the headroom above, and what it must not go
+under is the answer path's three readings.
 
-What it does not bound is the rest of what a reading allocates - the record
-array and the RDATA copies, which stay a fixed multiple of each message read and
-are a per-reading multiple in exactly the way this budget no longer is. A record
-is eleven wire bytes and `Record` is about ninety, so thirty-five full-length
-replies are tens of megabytes of arrays whatever their names cost. That is the
-same shape as this issue and not the same bound; see `decode_answer`.
+A reading passed no counter keeps `NAME_BUDGET` alone and nothing else, which is
+every caller outside a request: the fuzz target, the bootstrap resolver, the
+tests.
 */
-REQUEST_NAME_BUDGET :: 4 * 1024 * 1024
+REQUEST_DECODE_BUDGET :: 8 * 1024 * 1024
 
 @(private)
 Reader :: struct {
@@ -120,8 +128,8 @@ Reader :: struct {
 	// against `NAME_BUDGET`.
 	name_bytes: int,
 	/*
-	The request's own counter, against `REQUEST_NAME_BUDGET`, or nil for a
-	reading nobody is counting.
+	What this request has taken out of the caller's allocator so far, against
+	`REQUEST_DECODE_BUDGET`, or nil for a reading nobody is counting.
 
 	Borrowed rather than owned: it outlives this decode and is charged by every
 	other reading the same request makes.
@@ -156,14 +164,37 @@ says something about what comes next: another reading of the same message has a
 fresh `NAME_BUDGET` and will fail again the moment it charges anything, and a
 caller offered the shorter reading as a second chance is better told there is no
 second chance. It is also the error that must not be read as a statement about
-the message - see `Request_Name_Budget`.
+the message - see `Request_Budget`.
 */
 @(private)
 budget_spent :: proc(r: ^Reader) -> Decode_Error {
-	if r.spent != nil && r.spent^ > REQUEST_NAME_BUDGET {
-		return .Request_Name_Budget
+	if r.spent != nil && r.spent^ > REQUEST_DECODE_BUDGET {
+		return .Request_Budget
 	}
 	return .Name_Budget if r.name_bytes > NAME_BUDGET else .None
+}
+
+/*
+Charge `n` bytes of the caller's allocator to the request, before taking them.
+
+Everything this decoder allocates that is not a name: the question and record
+arrays, the lists TXT and OPT hold, the RDATA it copies verbatim. Each of those
+is a size the wire states and the decoder reads before it allocates, so unlike a
+name it is charged ahead of itself and the reading is refused with nothing taken.
+
+Only against the request's budget. A single reading of a single message is
+already bounded in all of these by the message's own length - eleven wire bytes
+per record, one per character-string - which is what `NAME_BUDGET` exists
+because names are not. What was unbounded is the number of readings; see
+`REQUEST_DECODE_BUDGET`.
+*/
+@(private)
+charge_bytes :: proc(r: ^Reader, n: int) -> Decode_Error {
+	if r.spent == nil {
+		return .None
+	}
+	r.spent^ += n
+	return .Request_Budget if r.spent^ > REQUEST_DECODE_BUDGET else .None
 }
 
 @(private)
@@ -205,6 +236,7 @@ r_bytes :: proc(r: ^Reader, n: int, allocator: mem.Allocator) -> (v: []u8, err: 
 	if n < 0 || r.pos + n > len(r.msg) {
 		return nil, .Short_Buffer
 	}
+	charge_bytes(r, n) or_return
 	v = make([]u8, n, allocator)
 	copy(v, r.msg[r.pos:r.pos + n])
 	r.pos += n
@@ -247,12 +279,12 @@ Decode a complete DNS message.
 Every string and slice in the result is allocated from `allocator`; callers that
 serve a single query are expected to hand in an arena and drop it wholesale.
 
-`spent` is that caller's running total of what its request has expanded names
-into, against `REQUEST_NAME_BUDGET`. A caller serving one query from one arena
-passes the same counter to every reading it makes, so the names in the arena are
-bounded by the request rather than by the reading; one that leaves it out gets
-`NAME_BUDGET` for this reading and no count across readings, which is what every
-call site outside a request wants.
+`spent` is that caller's running total of what its request has taken out of
+`allocator`, against `REQUEST_DECODE_BUDGET`. A caller serving one query from
+one arena passes the same counter to every reading it makes, so what the arena
+holds is bounded by the request rather than by the reading; one that leaves it
+out gets `NAME_BUDGET` for this reading and no count across readings, which is
+what every call site outside a request wants.
 */
 decode_message :: proc(
 	msg: []u8,
@@ -278,10 +310,10 @@ strength of somebody's additional section.
 The section counts are still sanity-checked against the message's length before
 anything is allocated, so a caller that stops early is not a way around that.
 
-`spent` is the request's name counter, as in `decode_message`. This is the
-reading a caller falls back to when the whole message would not parse, so both
-readings charge the one counter and the arena holds what the request spent
-rather than twice what a reading may.
+`spent` is the request's counter, as in `decode_message`. This is the reading a
+caller falls back to when the whole message would not parse, so both readings
+charge the one counter and the arena holds what the request took rather than
+twice what a reading may.
 */
 decode_through_answer :: proc(
 	msg: []u8,
@@ -312,13 +344,13 @@ decode_sections :: proc(
 
 	Charging first and checking afterwards is how a name is paid for - what it
 	costs is not known until it is decoded - but a reading that starts with the
-	counter already gone would still expand a name to find that out, and a
-	record array to put it in, once per reading for every reading the request
-	has left. Refusing here keeps the overshoot to the one reading that crossed
-	the budget rather than to all of them.
+	counter already gone would still expand a name to find that out, once per
+	reading for every reading the request has left. Refusing here keeps the
+	overshoot to the one reading that crossed the budget rather than to all of
+	them.
 	*/
-	if spent != nil && spent^ > REQUEST_NAME_BUDGET {
-		return {}, .Request_Name_Budget
+	if spent != nil && spent^ > REQUEST_DECODE_BUDGET {
+		return {}, .Request_Budget
 	}
 	r := Reader{msg = msg, spent = spent}
 
@@ -338,6 +370,7 @@ decode_sections :: proc(
 	}
 
 	if qdcount > 0 {
+		charge_bytes(&r, size_of(Question) * int(qdcount)) or_return
 		qs := make([]Question, int(qdcount), allocator)
 		for i in 0 ..< int(qdcount) {
 			qs[i].name = r_name(&r, allocator) or_return
@@ -361,6 +394,7 @@ decode_records :: proc(r: ^Reader, count: int, allocator: mem.Allocator) -> (out
 	if count == 0 {
 		return nil, .None
 	}
+	charge_bytes(r, size_of(Record) * count) or_return
 	recs := make([]Record, count, allocator)
 	for i in 0 ..< count {
 		recs[i] = decode_record(r, allocator) or_return
@@ -505,6 +539,7 @@ decode_rdata :: proc(
 				return nil, .Bad_Rdata
 			}
 		}
+		charge_bytes(r, size_of(string) * count) or_return
 		parts := make([]string, count, allocator)
 		for i in 0 ..< count {
 			parts[i] = r_char_string(r, allocator) or_return
@@ -559,6 +594,7 @@ decode_rdata :: proc(
 				return nil, .Bad_Rdata
 			}
 		}
+		charge_bytes(r, size_of(EDNS_Option) * count) or_return
 		opts := make([]EDNS_Option, count, allocator)
 		for i in 0 ..< count {
 			opts[i].code = r_u16(r) or_return

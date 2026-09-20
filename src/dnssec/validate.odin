@@ -396,16 +396,17 @@ Budget :: struct {
 	// lookups or verifications bounds: see `MAX_NSEC3_ROUNDS_PER_QUERY`.
 	nsec3:         Nsec3_Budget,
 	/*
-	The request's running total of what its names have been expanded into,
-	against `dns.REQUEST_NAME_BUDGET`, or nil where nobody is counting.
+	The request's running total of what it has taken out of its arena reading
+	messages, against `dns.REQUEST_DECODE_BUDGET`, or nil where nobody is
+	counting.
 
 	The walk reads a reply of its own per step into the arena the request is
 	served from, up to `MAX_LOOKUPS_PER_QUERY` of them, and every one of those
-	readings used to get a fresh `dns.NAME_BUDGET`. Borrowed from the caller
-	that owns the arena, so what this walk spends is charged against what the
+	readings used to be bounded only by its own length. Borrowed from the caller
+	that owns the arena, so what this walk takes is charged against what the
 	rest of the request already has. See issue #354.
 	*/
-	names:         ^int,
+	spent:         ^int,
 }
 
 /*
@@ -421,15 +422,15 @@ resolver's own load shedding invented.
 WALKS_IN_FLIGHT :: "too many chains of trust being walked at once"
 
 /*
-Why a step stopped when the request had already spent what it may expand names
-into.
+Why a step stopped when the request had already taken what it may to read what
+it was sent.
 
-A reading refused for `dns.REQUEST_NAME_BUDGET` is this server declining to
-expand any more of what it was sent, so the step established nothing - the same
+A reading refused for `dns.REQUEST_DECODE_BUDGET` is this server declining to
+read any more of what it was sent, so the step established nothing - the same
 report an unanswered lookup gets, code 22, and deliberately not `Bogus`. The
 reply may be perfectly genuine; what ran out is ours. See issue #354.
 */
-NAMES_OVER_BUDGET :: "this query has spent what it may expand names into"
+READING_OVER_BUDGET :: "this query has taken as much as it may to read what it was sent"
 
 /*
 Why a walk that came back `Indeterminate` stopped, in the words of the step that
@@ -862,8 +863,8 @@ validate :: proc(
 	*/
 	shared_worker := true,
 	/*
-	The request's name-expansion counter, against `dns.REQUEST_NAME_BUDGET`,
-	from the caller that owns `allocator`.
+	What the request has taken out of `allocator` so far, against
+	`dns.REQUEST_DECODE_BUDGET`, from the caller that owns it.
 
 	This response is read here, the chain's replies are read a step at a time,
 	and all of it lands in the one arena - so the counter has to be the
@@ -871,20 +872,20 @@ validate :: proc(
 	Nil for a caller that is not counting, which is every test that validates a
 	captured message on its own. See issue #354.
 	*/
-	names: ^int = nil,
+	spent: ^int = nil,
 ) -> Result {
-	msg, derr := dns.decode_message(wire, allocator, names)
+	msg, derr := dns.decode_message(wire, allocator, spent)
 	if derr != .None {
 		/*
 		A reading this server refused itself is not a response it read and
 		found wanting. `Bogus` here would accuse the zone of a forgery on the
 		strength of our own accounting - and an attacker with a signed zone
-		gets to choose when that happens, by answering the chain with names
+		gets to choose when that happens, by answering the chain with replies
 		expensive enough to spend the request's allowance. `Indeterminate` is
 		what an unreachable authority gets, which is what this is.
 		*/
-		if derr == .Request_Name_Budget {
-			return {status = .Indeterminate, reason = NAMES_OVER_BUDGET}
+		if derr == .Request_Budget {
+			return {status = .Indeterminate, reason = READING_OVER_BUDGET}
 		}
 		return {status = .Bogus, reason = "unparseable response"}
 	}
@@ -899,7 +900,7 @@ validate :: proc(
 	*/
 	budget.keep_slot = true
 	budget.pool = .Shared if shared_worker else .Connection
-	budget.names = names
+	budget.spent = spent
 	defer end_walk(v, &budget)
 
 	/*
@@ -1088,9 +1089,9 @@ strip_unauthenticated :: proc(
 	result: Result,
 	allocator := context.temp_allocator,
 	limit := dns.MAX_MESSAGE,
-	// The request's name counter, as in `validate`: this is one more reading of
-	// the same response into the same arena. See issue #354.
-	names: ^int = nil,
+	// The request's counter, as in `validate`: this is one more reading of the
+	// same response into the same arena. See issue #354.
+	spent: ^int = nil,
 ) -> (
 	out: []u8,
 	ok: bool,
@@ -1098,7 +1099,7 @@ strip_unauthenticated :: proc(
 	if result.status != .Secure {
 		return wire, true
 	}
-	msg, derr := dns.decode_message(wire, allocator, names)
+	msg, derr := dns.decode_message(wire, allocator, spent)
 	if derr != .None {
 		return nil, false
 	}
@@ -3345,12 +3346,12 @@ zone_step :: proc(
 	if !ok {
 		return walk_gave_up(budget, "chain of trust unavailable"), nil
 	}
-	msg, derr := dns.decode_message(wire, allocator, budget.names)
+	msg, derr := dns.decode_message(wire, allocator, budget.spent)
 	if derr != .None {
 		// As in `validate`: a reply this request had no allowance left to read
 		// is a step that established nothing, not a delegation reported broken.
-		if derr == .Request_Name_Budget {
-			return walk_gave_up(budget, NAMES_OVER_BUDGET), nil
+		if derr == .Request_Budget {
+			return walk_gave_up(budget, READING_OVER_BUDGET), nil
 		}
 		return .Bogus, nil
 	}
@@ -3687,12 +3688,12 @@ fetch_keys :: proc(
 	if !ok {
 		return nil, .Indeterminate
 	}
-	msg, derr := dns.decode_message(wire, allocator, budget.names)
+	msg, derr := dns.decode_message(wire, allocator, budget.spent)
 	if derr != .None {
-		// And as in `zone_step`: the request's own name budget running out
-		// leaves this zone's keys unread rather than forged.
-		if derr == .Request_Name_Budget {
-			budget.walk_stopped = NAMES_OVER_BUDGET
+		// And as in `zone_step`: the request's own budget running out leaves
+		// this zone's keys unread rather than forged.
+		if derr == .Request_Budget {
+			budget.walk_stopped = READING_OVER_BUDGET
 			return nil, .Indeterminate
 		}
 		return nil, .Bogus

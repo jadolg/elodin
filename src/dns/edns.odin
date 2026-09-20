@@ -68,9 +68,9 @@ set_edns_option :: proc(
 	code: EDNS_Option_Code,
 	data: []u8,
 	allocator := context.allocator,
-	// The request's name-expansion counter, if this message belongs to one. The
-	// rebuild below reads it into the caller's arena like any other reading;
-	// see `REQUEST_NAME_BUDGET`.
+	// What the request has taken out of its arena so far, if this message
+	// belongs to one: the rebuild below reads it in like any other reading.
+	// See `REQUEST_DECODE_BUDGET`.
 	spent: ^int = nil,
 ) -> (
 	out: []u8,
@@ -94,9 +94,9 @@ ensure_edns_option :: proc(
 	data: []u8,
 	udp_size: u16,
 	allocator := context.allocator,
-	// The request's name-expansion counter, if this message belongs to one. The
-	// rebuild below reads it into the caller's arena like any other reading;
-	// see `REQUEST_NAME_BUDGET`.
+	// What the request has taken out of its arena so far, if this message
+	// belongs to one: the rebuild below reads it in like any other reading.
+	// See `REQUEST_DECODE_BUDGET`.
 	spent: ^int = nil,
 ) -> (
 	out: []u8,
@@ -142,9 +142,9 @@ ensure_opt :: proc(
 	msg: []u8,
 	udp_size: u16,
 	allocator := context.allocator,
-	// The request's name-expansion counter, if this message belongs to one. The
-	// rebuild below reads it into the caller's arena like any other reading;
-	// see `REQUEST_NAME_BUDGET`.
+	// What the request has taken out of its arena so far, if this message
+	// belongs to one: the rebuild below reads it in like any other reading.
+	// See `REQUEST_DECODE_BUDGET`.
 	spent: ^int = nil,
 ) -> (
 	out: []u8,
@@ -242,9 +242,9 @@ input.
 remove_opt :: proc(
 	msg: []u8,
 	allocator := context.allocator,
-	// The request's name-expansion counter, if this message belongs to one. The
-	// rebuild below reads it into the caller's arena like any other reading;
-	// see `REQUEST_NAME_BUDGET`.
+	// What the request has taken out of its arena so far, if this message
+	// belongs to one: the rebuild below reads it in like any other reading.
+	// See `REQUEST_DECODE_BUDGET`.
 	spent: ^int = nil,
 ) -> (
 	out: []u8,
@@ -331,9 +331,9 @@ remove_edns_option :: proc(
 	msg: []u8,
 	code: EDNS_Option_Code,
 	allocator := context.allocator,
-	// The request's name-expansion counter, if this message belongs to one. The
-	// rebuild below reads it into the caller's arena like any other reading;
-	// see `REQUEST_NAME_BUDGET`.
+	// What the request has taken out of its arena so far, if this message
+	// belongs to one: the rebuild below reads it in like any other reading.
+	// See `REQUEST_DECODE_BUDGET`.
 	spent: ^int = nil,
 ) -> (
 	out: []u8,
@@ -686,9 +686,9 @@ decoded and encoded again.
 strip_edns_options :: proc(
 	msg: []u8,
 	allocator := context.allocator,
-	// The request's name-expansion counter, if this message belongs to one. The
-	// rebuild below reads it into the caller's arena like any other reading;
-	// see `REQUEST_NAME_BUDGET`.
+	// What the request has taken out of its arena so far, if this message
+	// belongs to one: the rebuild below reads it in like any other reading.
+	// See `REQUEST_DECODE_BUDGET`.
 	spent: ^int = nil,
 ) -> (
 	out: []u8,

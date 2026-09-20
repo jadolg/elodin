@@ -5,19 +5,23 @@ import "core:testing"
 import "elodin:dns"
 
 /*
-Issue #354: a request reads far more than one message, and the name budget was
-per reading.
+Issue #354: a request reads far more than one message, and every budget the
+decoder had was per reading.
 
 `decode_answer` reads the upstream's reply for the cache and again for the
 answer section alone, `fit_response` reads it a third time when it passes the
 client's limit, and the validator reads a reply of its own for every step of the
 chain - about thirty-five readings, all into the one arena the request is served
-from. Each was entitled to `dns.NAME_BUDGET`, so five kilobytes of wire reached
-23 MB of names in a single in-flight request; against a pool of sixteen to a
-hundred and twenty-eight workers, a few dozen such queries are the box.
+from. Each got a fresh `dns.NAME_BUDGET` and nothing at all bounded what it
+allocated besides names, so five kilobytes of wire reached 23 MB of names and a
+full-length TXT record reached 37 MB of `string` headers, in a single in-flight
+request; against a pool of sixteen to a hundred and twenty-eight workers, a few
+dozen such queries are the box.
 
 The counter belongs to the request now. `handle_query` owns it and hands it to
-everything that reads into its arena, which is what these fixtures stand in for.
+everything that reads into its arena, which is what the readings below stand in
+for. What each shape costs is `dns/request_budget_test.odin`; what is measured
+here is that the request's own procedures charge the one counter.
 */
 
 // What one request can hold: two readings in `decode_answer`, one in
@@ -79,14 +83,14 @@ BOMB_QUESTION := []dns.Question{{name = "x.", type = .MX, class = .IN}}
 /*
 What the readings of one request may come to.
 
-The names are `dns.REQUEST_NAME_BUDGET` and nothing else. Everything else a
+The names are `dns.REQUEST_DECODE_BUDGET` and nothing else. Everything else a
 reading builds - the record array, the RDATA copies - is outside that budget and
 stays a fixed multiple of the message read, which twenty-four times over covers
 with room to spare.
 */
 @(private = "file")
 request_ceiling :: proc(msg_len: int) -> int {
-	return dns.REQUEST_NAME_BUDGET + READINGS * 24 * msg_len
+	return dns.REQUEST_DECODE_BUDGET + READINGS * 24 * msg_len
 }
 
 /*
@@ -107,13 +111,13 @@ test_the_readings_of_one_request_share_one_name_budget :: proc(t: ^testing.T) {
 	mem.arena_init(&arena, backing)
 	a := mem.arena_allocator(&arena)
 
-	names: int
+	spent: int
 	// Each call reads the whole message, fails, and reads the answer section
 	// again: two of the thirty-five, and `fit_response` is the last one.
 	for _ in 0 ..< (READINGS - 1) / 2 {
-		decode_answer(msg, true, &names, a)
+		decode_answer(msg, true, &spent, a)
 	}
-	fit_response(msg, 512, dns.Message{question = BOMB_QUESTION}, &names, a)
+	fit_response(msg, 512, dns.Message{question = BOMB_QUESTION}, &spent, a)
 
 	testing.expectf(
 		t,
@@ -128,17 +132,16 @@ test_the_readings_of_one_request_share_one_name_budget :: proc(t: ^testing.T) {
 	The overshoot is one reading's and not one per reading. A name is charged
 	after it is decoded, because that is when what it cost is known, so the
 	reading that crosses the budget pays for the name that told it - and for
-	the other names of the same RDATA layout, which are read one after
-	another
+	the other name of the same RDATA layout, which are read one after another
 	before anything checks again. Every reading after that one is refused
-	before it expands anything.
+	before it reads anything.
 	*/
 	testing.expectf(
 		t,
-		names <= dns.REQUEST_NAME_BUDGET + 2 * dns.MAX_NAME_PRESENTATION,
-		"the request expanded %d bytes of names, past the %d it may",
-		names,
-		dns.REQUEST_NAME_BUDGET,
+		spent <= dns.REQUEST_DECODE_BUDGET + 2 * dns.MAX_NAME_PRESENTATION,
+		"the request took %d bytes, past the %d it may",
+		spent,
+		dns.REQUEST_DECODE_BUDGET,
 	)
 }
 
@@ -165,8 +168,8 @@ test_an_expensive_first_reading_does_not_take_the_shorter_one_with_it :: proc(t:
 	arena: mem.Arena
 	mem.arena_init(&arena, backing)
 
-	names: int
-	out := decode_answer(msg, true, &names, mem.arena_allocator(&arena))
+	spent: int
+	out := decode_answer(msg, true, &spent, mem.arena_allocator(&arena))
 	testing.expect_value(t, out.full_err, dns.Decode_Error.Name_Budget)
 	testing.expect(t, out.partial, "the answer section should have read on its own")
 	testing.expect_value(t, len(out.msg.answer), 1)

@@ -53,8 +53,8 @@ Issue #298's shape - MX records whose owner and exchange are both two-byte
 pointers at one 255-octet name of unprintable octets - built onto the question
 the client asked, so the upstream's answer matches the query that went out.
 
-The point of it here is issue #354: the counter that bounds those expansions is
-the request's now rather than each reading's, and a reply that spends what a
+The point of it here is issue #354: what bounds those expansions is the
+request's counter now rather than each reading's, and a reply that spends what a
 single reading may spend is still a reply this server forwards. That is the
 failure mode a per-request budget invites - one made too tight refuses answers
 nobody had a quarrel with - and the only way to see it is through the whole
@@ -263,11 +263,14 @@ run_wire_cases :: proc(r: ^Runner) {
 	start_case(r, "wire: a reply that spends a reading's name budget is still forwarded")
 	{
 		/*
-		Issue #354: what one request may expand names into is now counted across
-		every reading it makes rather than per reading. A reply that spends what
-		a single reading is allowed is far under that, so it goes to the client
-		as it always did - byte for byte, since nothing here reads its answer
-		section and nothing rebuilds it.
+		Issue #354: what one request may take out of its arena is now counted
+		across every reading it makes rather than per reading. A reply that
+		spends what a single reading is allowed is far under that, so it goes to
+		the client as it always did - byte for byte, since nothing here reads
+		its answer section and nothing rebuilds it. The `manystrings` case above
+		is the same statement for the other end of the expansion: a full-length
+		TXT record of empty character-strings, which is a megabyte of `string`
+		headers a reading, has to survive the trip too.
 
 		Over TCP because it is several kilobytes, and without EDNS: the same
 		reply over UDP is `fit_response`'s problem, which `resolver.odin` argues

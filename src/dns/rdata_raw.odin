@@ -114,6 +114,14 @@ decode_raw_rdata :: proc(r: ^Reader, type: Type, start, end: int, allocator: mem
 		}
 	}
 
+	/*
+	Charged, and taken whatever the charge says. This procedure cannot fail -
+	RDATA nothing understands is kept as bytes, which is the whole of its job -
+	so a request with nothing left buys one more copy of one record's RDATA
+	here, and `decode_record` refuses the message on the check after it. The
+	same bounded overshoot a name over the budget has, and for the same reason.
+	*/
+	charge_bytes(r, end - start)
 	verbatim := make([]u8, end - start, allocator)
 	copy(verbatim, msg[start:end])
 	return Rdata_Raw{data = verbatim}
@@ -220,6 +228,9 @@ expand_rdata_names :: proc(
 		return nil, false
 	}
 
+	if charge_bytes(r, total) != .None {
+		return nil, false
+	}
 	buf := make([]u8, total, allocator)
 	copy(buf, msg[start:head])
 	at := head - start
