@@ -369,3 +369,93 @@ test_an_oversized_key_set_still_settles_the_name :: proc(t: ^testing.T) {
 	testing.expect(t, !still_remembered, "a name settled as a zone is no longer a remembered non-cut")
 	free_all(context.temp_allocator)
 }
+
+/*
+The default is the validator's, so nothing has to keep two numbers in step.
+
+`Options.max_cached_zones` is what the configuration passes, and the
+configuration's own default is zero rather than a figure of its own - see
+`Dnssec_Config.max_cached_zones`. That only holds if zero here means the
+built-in number.
+*/
+@(test)
+test_an_unset_zone_cache_bound_takes_the_default :: proc(t: ^testing.T) {
+	unset := make_validator(no_upstream, nil, Options{})
+	defer destroy_validator(unset)
+	testing.expect_value(t, unset.max_cached_zones, DEFAULT_MAX_CACHED_ZONES)
+
+	// And a figure somebody wrote is the figure they get.
+	named := make_validator(no_upstream, nil, Options{max_cached_zones = 64})
+	defer destroy_validator(named)
+	testing.expect_value(t, named.max_cached_zones, 64)
+
+	// A number that cannot be a bound is not one more way of asking for the
+	// default by accident - the loader refuses it - but the validator must not
+	// build a cache of zero entries out of one either.
+	negative := make_validator(no_upstream, nil, Options{max_cached_zones = -1})
+	defer destroy_validator(negative)
+	testing.expect_value(t, negative.max_cached_zones, DEFAULT_MAX_CACHED_ZONES)
+}
+
+/*
+A cache of one still works, and still holds the entry that is being used.
+
+The smallest bound is where an off-by-one in the eviction loop shows: at one,
+every insert has to evict before it stores, and a loop that ran one time too few
+would grow the cache while a loop that ran one too many would empty it and then
+store into nothing.
+*/
+@(test)
+test_a_cache_of_one_zone_holds_exactly_one :: proc(t: ^testing.T) {
+	v := make_validator(no_upstream, nil, Options{max_cached_zones = 1})
+	defer destroy_validator(v)
+
+	now := cache_now()
+	keys := []Dnskey{sized_key(4 + 256)}
+	for i in 0 ..< 8 {
+		cache_put(v, fmt.tprintf("z%d.example.", i), .Secure, keys, MAX_ZONE_TTL, now)
+		testing.expectf(t, len(v.zones) == 1, "after %d inserts the cache holds %d zones, not 1", i + 1, len(v.zones))
+	}
+
+	// The last one in is the one held, and it is readable.
+	entry, found, _ := cache_get(v, "z7.example.", now, context.temp_allocator)
+	testing.expect(t, found, "the most recent zone should be the one still cached")
+	if found {
+		testing.expectf(t, len(entry.keys) == 1, "the surviving entry holds %d keys", len(entry.keys))
+	}
+	_, stale, _ := cache_get(v, "z0.example.", now, context.temp_allocator)
+	testing.expect(t, !stale, "the first zone should have been evicted long ago")
+
+	// The list has to agree with the map at the extreme too.
+	count := 0
+	for e := v.lru_head; e != nil; e = e.next {
+		count += 1
+		if count > 4 {
+			break
+		}
+	}
+	testing.expectf(t, count == 1, "the eviction list holds %d entries against a map of 1", count)
+	free_all(context.temp_allocator)
+}
+
+// And the refusals are counted, because a zone that cannot be cached is walked
+// again on every question and nothing else would say so.
+@(test)
+test_a_refused_key_set_is_counted :: proc(t: ^testing.T) {
+	v := make_validator(no_upstream, nil, Options{})
+	defer destroy_validator(v)
+
+	testing.expect_value(t, oversized_key_sets(v), 0)
+
+	huge := make([dynamic]Dnskey, 0, MAX_KEYS_PER_ZONE, context.temp_allocator)
+	for _ in 0 ..< MAX_KEYS_PER_ZONE {
+		append(&huge, sized_key(4 + MAX_MODULUS_BYTES + MAX_EXPONENT_BYTES))
+	}
+	cache_put(v, "flood.example.", .Secure, huge[:], MAX_ZONE_TTL, cache_now())
+	testing.expect_value(t, oversized_key_sets(v), 1)
+
+	// An ordinary set does not touch it.
+	cache_put(v, "example.com.", .Secure, []Dnskey{sized_key(4 + 256)}, MAX_ZONE_TTL, cache_now())
+	testing.expect_value(t, oversized_key_sets(v), 1)
+	free_all(context.temp_allocator)
+}

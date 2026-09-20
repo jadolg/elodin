@@ -1054,9 +1054,11 @@ first query into a zone and not the ones after it.
 fact that an apex is unsigned. Zero, the default, is 4096, which covers the
 hierarchy a busy forwarder touches with room to spare; a household resolver never
 fills it. It is exposed because it is the one dial on how much memory validation
-may hold: a zone's keys are capped at 8 KB whatever it publishes, so the ceiling
-is that times this number, and a box that must keep validation inside a slice of
-its memory sets it here. Past the bound the coldest zone is dropped, one at a
+may hold: a zone's keys are capped at 8 KB whatever it publishes, and an entry
+costs about 11.5 KB at worst once the key structs and the name are counted, so
+the ceiling is that times this number — about 48 MB at the default. A box that
+must keep validation inside a slice of its memory sets it here; raising it above
+4096 logs the figure the new number implies. Past the bound the coldest zone is dropped, one at a
 time — so a number that is too small costs chain walks for the zones that fell
 out, and nothing else. There is no reason to raise it above the default unless
 the resolver genuinely sees more zones than that; the memory is the cost.
@@ -2233,6 +2235,7 @@ as a warning at startup.
 | `elodin_rate_limit_slipped_total` | counter | those answered truncated instead, to send a real client to TCP |
 | `elodin_dnssec_answers_total{result}` | counter | `secure` and `bogus` |
 | `elodin_dnssec_queries_shed_total` | counter | questions whose chain-of-trust walk stopped short of an upstream, because `dnssec.max_chain_walks` were already waiting on one; one per question. Rising alongside SERVFAIL means the shedding is this server's, not an upstream going away — but it cannot tell an attack from honest saturation, and a slow upstream reaches it too. See `dnssec.max_chain_walks` |
+| `elodin_dnssec_oversized_key_sets_total` | counter | DNSKEY sets the zone cache declined to store, being larger than the 8 KB one zone may hold. Not a fault: the answer still validated, and what is lost is the caching, so every question about such a zone walks the chain again. A rising figure is a zone that has published something extraordinary, or somebody making the point — see `dnssec.max_cached_zones` |
 | `elodin_rebind_refused_total` | counter | answers withheld because a public name was pointed into private space |
 | `elodin_special_use_total` | counter | queries answered from the reserved-name table instead of being forwarded |
 | `elodin_cache_entries` / `_bytes` | gauge | what the cache holds, against `max_entries` and `max_bytes` |

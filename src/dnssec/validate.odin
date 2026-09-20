@@ -194,6 +194,19 @@ Validator :: struct {
 	// know why DNSSEC started failing. One per question however many of its
 	// walks were turned away - see `may_look_up`. Read through `queries_shed`.
 	shed:                 u64,
+	/*
+	DNSKEY sets refused for size, for the operator who wants to know whether
+	anything is trying it. One per `cache_put` that declined to store, which is
+	one per chain walk that reached such a zone rather than one per zone.
+
+	Worth a number of its own rather than a log line: the path is reachable by
+	anyone who can get a zone of their own validated, so a line per refusal is
+	log amplification aimed at whoever reads the logs - the thing
+	`Validator.shed` is careful about too. Nothing here is a fault: a refused
+	set means the answer was still validated and the zone simply went uncached.
+	Read through `oversized_key_sets`.
+	*/
+	oversized:            u64,
 
 	allocator:            mem.Allocator,
 }
@@ -615,8 +628,32 @@ the zone's signatures still verify, so a zone with an unusual number of large
 keys would go SERVFAIL for as long as the entry lived, and go there quietly.
 Declining the entry costs that zone a chain walk per question - what any cold
 name costs - and costs everybody else nothing.
+
+This counts RDATA and nothing else, so it is not what an entry costs. See
+`MAX_CACHED_ZONE_BYTES` for the figure to size a machine against.
 */
 MAX_CACHED_ZONE_KEY_BYTES :: 8192
+
+/*
+What one entry costs at worst, which is the number to multiply by
+`max_cached_zones`.
+
+`MAX_CACHED_ZONE_KEY_BYTES` bounds the RDATA and the RDATA is not the whole of
+it: each key carries a `Dnskey` beside its bytes, and a zone may publish
+`MAX_KEYS_PER_ZONE` of them - 64 small keys fit under the byte cap as readily as
+three large ones - so the structs alone are three kilobytes on top. Then the
+entry itself, and the name it is keyed by.
+
+Written down because the cache's whole purpose here is to be sized by an
+operator, and a figure that leaves out a third of what it measures is worse than
+none. The map's own slot is not in it: what a `map` spends per key belongs to
+the runtime rather than to this, and it is small beside the rest.
+*/
+MAX_CACHED_ZONE_BYTES ::
+	MAX_CACHED_ZONE_KEY_BYTES +
+	MAX_KEYS_PER_ZONE * size_of(Dnskey) +
+	size_of(Zone_Entry) +
+	dns.MAX_NAME_PRESENTATION
 
 /*
 Slots in the non-cut table.
@@ -3181,6 +3218,11 @@ queries_shed :: proc(v: ^Validator) -> u64 {
 	return sync.atomic_load(&v.shed) if v != nil else 0
 }
 
+// DNSKEY sets the zone cache refused for size. See `Validator.oversized`.
+oversized_key_sets :: proc(v: ^Validator) -> u64 {
+	return sync.atomic_load(&v.oversized) if v != nil else 0
+}
+
 @(private)
 Step :: enum u8 {
 	// The child is a signed zone in its own right.
@@ -4238,6 +4280,7 @@ cache_put :: proc(v: ^Validator, zone: string, status: Status, keys: []Dnskey, t
 	been settled as a zone whatever the cache does with it.
 	*/
 	if oversized {
+		sync.atomic_add(&v.oversized, 1)
 		entry.zone = ""
 		free_entry(v, entry)
 		return

@@ -561,6 +561,19 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 		"Questions whose chain-of-trust walk stopped short of an upstream, because as many were already waiting on one as this server allows at once. One per question, however many of its walks were turned away.",
 		dnssec.queries_shed(s.validator),
 	)
+	// The other half of what a flood does to validation, and the only sign of
+	// it: a zone whose DNSKEY set is too large to cache is validated and then
+	// re-walked on every question about it. Not a fault - no answer is refused
+	// over this - so it is counted rather than logged, and a rising figure
+	// means either a zone that has published something extraordinary or
+	// somebody making the point. See issue #336.
+	metrics.scalar(
+		&b,
+		"elodin_dnssec_oversized_key_sets_total",
+		.Counter,
+		"DNSKEY sets the zone cache declined to store because they were larger than one zone may hold. The answer still validated; what is lost is the caching, so every question about such a zone walks the chain again.",
+		dnssec.oversized_key_sets(s.validator),
+	)
 
 	render_udp_metrics(&b, l)
 

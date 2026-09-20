@@ -150,6 +150,31 @@ start_validator :: proc(s: ^Server) -> bool {
 		)
 	}
 
+	/*
+	The memory the figure implies, said once at startup for anyone who raised it.
+
+	Only upward. A number below the default buys less memory and more chain
+	walks, which the setting's own documentation covers and an operator setting
+	it has already chosen; one above it buys memory on a machine this server
+	cannot see the size of, and `MAX_CACHED_ZONE_BYTES` is not a figure anybody
+	is going to work out from the README while editing a config file.
+
+	Said rather than refused or held down, which is this file's rule for a
+	configured number everywhere else - see the two warnings above. There is no
+	ceiling that is right for every machine, so refusing one would be this
+	server inventing a limit on the operator's own memory, and a resolver that
+	will not start is worse than one that says what it is doing.
+	*/
+	if s.cfg.dnssec.max_cached_zones > dnssec.DEFAULT_MAX_CACHED_ZONES {
+		logx.warnf(
+			"dnssec: max_cached_zones %d lets the zone cache reach about %d MB of keys, against %d MB at the default of %d",
+			s.cfg.dnssec.max_cached_zones,
+			(s.cfg.dnssec.max_cached_zones * dnssec.MAX_CACHED_ZONE_BYTES) / (1024 * 1024),
+			(dnssec.DEFAULT_MAX_CACHED_ZONES * dnssec.MAX_CACHED_ZONE_BYTES) / (1024 * 1024),
+			dnssec.DEFAULT_MAX_CACHED_ZONES,
+		)
+	}
+
 	s.validator = dnssec.make_validator(
 		validator_query,
 		s,
