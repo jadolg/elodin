@@ -263,6 +263,7 @@ main :: proc() {
 
 	section(&r, "dnssec validation")
 	run_dnssec_cases(&r)
+	run_dnssec_reverse_cases(&r)
 
 	section(&r, "dns cookies")
 	run_cookie_cases(&r)

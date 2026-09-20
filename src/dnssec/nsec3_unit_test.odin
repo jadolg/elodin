@@ -649,8 +649,8 @@ test_nsec3_hashing_is_bounded_across_one_question :: proc(t: ^testing.T) {
 		append(&records, record)
 	}
 
-	// Twenty-four labels: `MAX_CHAIN_DEPTH`, and every one of them an ancestor
-	// the closest-encloser walk has to hash.
+	// Twenty-four labels, every one of them an ancestor the closest-encloser
+	// walk has to hash.
 	deep := "a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p.q.r.s.t.u.v.w.example."
 	budget := Nsec3_Budget {
 		max_iterations = DEFAULT_MAX_NSEC3_ITERATIONS,

@@ -219,7 +219,15 @@ Zone_Entry :: struct {
 	expires: time.Time,
 }
 
-// A chain longer than this is not a real delegation hierarchy.
+/*
+Zone cuts one chain may have between the root and the name asked about.
+
+Cuts, not labels: a name with many labels is ordinary - `ip6.arpa.` puts one
+nibble in each, so a reverse name for an IPv6 address has thirty-four - while a
+delegation hierarchy this deep is not a shape anything in use has. Counting the
+question's labels here instead is issue #352, and cost this server every IPv6
+reverse lookup it was asked; `zone_trust` has the whole of it.
+*/
 MAX_CHAIN_DEPTH :: 24
 
 /*
@@ -3138,16 +3146,43 @@ zone_trust :: proc(
 	zone := "."
 	keys = root_keys
 	depth := label_count(name)
-	if depth > MAX_CHAIN_DEPTH {
-		budget.walk_stopped = "chain of trust unavailable"
-		return .Indeterminate, nil, "."
-	}
+	/*
+	Cuts found on the way down, against `MAX_CHAIN_DEPTH`, which was spent on
+	`label_count(name)` until issue #352.
+
+	A label is not a zone cut and a name is not a hierarchy. The reverse name of
+	an IPv6 address is a nibble per label - thirty-two of them under
+	`ip6.arpa.`, thirty-four in all - so every one of them was past a bound of
+	twenty-four before a single DS was asked for, and `Indeterminate` is
+	SERVFAIL. That is every IPv6 reverse lookup a resolver with validation on is
+	asked, which is what mail servers, `UseDNS` and every logging pipeline do.
+	IPv4 reverse names are six labels, so nothing in `in-addr.arpa.` ever showed
+	it.
+
+	Nothing about the walk's cost rested on that reading. The round trips are
+	`MAX_LOOKUPS_PER_QUERY`, the hashing a denial provokes is
+	`MAX_NSEC3_ROUNDS_PER_QUERY`, the signature checks are
+	`MAX_VERIFICATIONS_PER_QUERY`, and the loop below is bounded by the wire
+	format: a name is 255 octets and a label costs two of them, so nothing
+	reaches this with more than 127.
+
+	What the bound is left guarding is what it was written for - a delegation
+	hierarchy deeper than any that exists - and running out of it is
+	`Indeterminate` rather than `Insecure`, because an allowance of ours ending
+	is never this server saying a zone is unsigned.
+	*/
+	cuts := 0
 
 	for i in 1 ..= depth {
 		child := name_drop_labels(name, depth - i)
 		step, child_keys := zone_step(v, budget, zone, keys, child, now, allocator)
 		switch step {
 		case .Secure:
+			cuts += 1
+			if cuts > MAX_CHAIN_DEPTH {
+				budget.walk_stopped = "chain of trust unavailable"
+				return .Indeterminate, nil, "."
+			}
 			zone = child
 			keys = child_keys
 		case .No_Cut:
@@ -3169,7 +3204,8 @@ zone_trust :: proc(
 			way makes the depth the zone's own rather than the question's - but
 			a zone minting its denials under RFC 4470 never says a name is
 			absent, so every label of whatever was asked about comes back a
-			non-cut and the depth is the client's, up to `MAX_CHAIN_DEPTH`.
+			non-cut and the depth is the client's, up to the 127 labels the
+			wire format allows a name.
 
 			`zone_step` remembers non-cuts, which takes the cost of a run that
 			repeats down to one walk per name. It does not bound the run: the
