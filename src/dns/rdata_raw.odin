@@ -121,7 +121,7 @@ decode_raw_rdata :: proc(r: ^Reader, type: Type, start, end: int, allocator: mem
 	here, and `decode_record` refuses the message on the check after it. The
 	same bounded overshoot a name over the budget has, and for the same reason.
 	*/
-	charge_bytes(r, end - start)
+	_ = charge_bytes(r, end - start)
 	verbatim := make([]u8, end - start, allocator)
 	copy(verbatim, msg[start:end])
 	return Rdata_Raw{data = verbatim}
