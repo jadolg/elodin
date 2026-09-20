@@ -232,13 +232,51 @@ MAX_UDP_RECEIVE_BUFFER :: 1 << 30
 DEFAULT_UDP_RECEIVE_BUFFER :: 1 << 20
 
 Cache_Config :: struct {
-	enabled:      bool,
-	max_entries:  int,
-	max_bytes:    int,
-	min_ttl:      u32,
-	max_ttl:      u32,
-	negative_ttl: u32,
-	serve_stale:  bool,
+	enabled:       bool,
+	max_entries:   int,
+	max_bytes:     int,
+	min_ttl:       u32,
+	max_ttl:       u32,
+	negative_ttl:  u32,
+	serve_stale:   bool,
+	/*
+	How long a client waits for the refresh of an expired entry before it is
+	handed the expired bytes instead.
+
+	RFC 8767 section 5's client response timer, and the whole of what makes
+	`serve_stale` worth switching on. Without it the fallback is reached only
+	once `upstream.resolve` has given up on every server for every attempt -
+	`attempts` x servers x `timeout`, which is ten seconds with the defaults and
+	one upstream configured, twenty with two. A glibc stub gives up after five
+	(`RES_TIMEOUT`) and systemd-resolved sooner, so in the outage the setting
+	exists for - an upstream that is unreachable rather than answering - the
+	expired answer arrived after the client had already failed, and the feature
+	did nothing for the case an operator turns it on for (issue #164).
+
+	1.8 seconds is the figure section 5 recommends, and it is chosen against the
+	stub rather than against the upstream: it has to leave the answer a margin
+	to reach a resolver that gives up at five. Raising it buys more chances for
+	the refresh to answer this client itself; lowering it serves expired data
+	sooner and more often.
+
+	The refresh is not cancelled when the timer fires. It carries on under a
+	worker of the query pool and writes whatever it gets to the cache, so the
+	entry is refreshed even though this client was answered from it - which is
+	the other half of what section 5 asks for. One refresh per cache key is in
+	flight at a time, so a popular expired name does not put an upstream query
+	on the wire per client; see `server/refresh.odin`.
+
+	Zero turns the timer off and restores the behaviour this replaced: the
+	client waits out the whole upstream budget, and the expired entry is served
+	only once that has failed. Kept as an escape hatch for an operator who would
+	rather wait than be handed data known to be out of date, and because it is
+	what every release before this one did.
+
+	Read only while `serve_stale` is on. With nothing held for the name there is
+	no answer to cut the wait short for, and a timer that fired would leave the
+	client with nothing.
+	*/
+	stale_timeout: time.Duration,
 }
 
 Block_Response :: enum u8 {
@@ -1111,13 +1149,16 @@ default_config :: proc() -> Config {
 		idle_timeout = 30 * time.Second,
 	}
 	c.cache = Cache_Config {
-		enabled      = true,
-		max_entries  = 10000,
-		max_bytes    = 64 * 1024 * 1024,
-		min_ttl      = 0,
-		max_ttl      = 86400,
-		negative_ttl = 300,
-		serve_stale  = false,
+		enabled       = true,
+		max_entries   = 10000,
+		max_bytes     = 64 * 1024 * 1024,
+		min_ttl       = 0,
+		max_ttl       = 86400,
+		negative_ttl  = 300,
+		serve_stale   = false,
+		// RFC 8767 section 5's recommended client response timer. It costs
+		// nothing while `serve_stale` is off, which is the default.
+		stale_timeout = 1800 * time.Millisecond,
 	}
 	c.blocking = Blocking_Config {
 		enabled     = true,

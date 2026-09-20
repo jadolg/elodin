@@ -87,6 +87,21 @@ Mock :: struct {
 	// what an off-path forgery would have to do.
 	forge_cookie: bool,
 
+	/*
+	Set to stop answering anything, leaving the sockets open.
+
+	`mock_silent` says so up front, for a mock that was never going to answer.
+	This is the same thing decided part-way through a case: a mock that filled
+	the cache and then went away, which is the outage `cache.serve_stale`
+	exists for. Closing the sockets instead would not do it - a datagram to a
+	port nobody is listening on draws an ICMP refusal and the exchange fails at
+	once, which is the *fast* failure, not the blackhole.
+
+	Atomic because the serving threads are already running by the time a case
+	reaches for it; every other field here is written before `mock_start`.
+	*/
+	gone_silent: bool,
+
 	mu:          sync.Mutex,
 	udp_queries: int,
 	tcp_queries: int,
@@ -131,6 +146,11 @@ mock_silent :: proc(m: ^Mock) {
 	m.fallback = Mock_Rule {
 		behaviour = .Silent,
 	}
+}
+
+// Stop answering from here on, without closing anything. See `Mock.gone_silent`.
+mock_go_silent :: proc(m: ^Mock) {
+	sync.atomic_store(&m.gone_silent, true)
 }
 
 mock_delay_all :: proc(m: ^Mock, delay: time.Duration, payload: []u8) {
@@ -363,6 +383,11 @@ mock_stop :: proc(m: ^Mock) {
 
 @(private = "file")
 match_rule :: proc(m: ^Mock, query: []u8) -> Mock_Rule {
+	// Ahead of the rules and the fallback both: a mock that has gone silent
+	// answers nothing, whatever was scripted for the name.
+	if sync.atomic_load(&m.gone_silent) {
+		return Mock_Rule{behaviour = .Silent}
+	}
 	q, ok := dns.peek_question(query, context.temp_allocator)
 	if !ok {
 		return m.fallback

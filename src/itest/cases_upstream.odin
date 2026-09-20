@@ -14,7 +14,9 @@ query from the response alone.
 
 // A minimal A response for `name`, answering with the given address. Built by
 // hand so the assertion does not depend on the encoder under test.
-@(private = "file")
+//
+// Package-visible because the cache cases want the same thing: a canned payload
+// for a mock to hand back, whose TTL the case chose rather than the encoder.
 make_a_response :: proc(name: string, addr: [4]u8, ttl: u32, allocator := context.allocator) -> []u8 {
 	buf := make([dynamic]u8, 0, 64, allocator)
 	append(&buf, 0, 0) // id, patched by the mock

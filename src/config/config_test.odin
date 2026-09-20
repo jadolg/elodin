@@ -171,6 +171,57 @@ test_rewrite_ptr_opt_out :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+/*
+The client response timer, and the two readings of the figure that sets it.
+
+RFC 8767 section 5's recommendation is 1.8 seconds and that is where the default
+sits, because with `serve_stale` on the fallback is worth nothing unless it
+reaches the client before the client's own resolver gives up - five seconds for a
+glibc stub, sooner for systemd-resolved (issue #164). Zero is the escape hatch
+and is deliberately not an error: it restores what every release before this one
+did, which is to wait the whole upstream budget out. A negative figure is neither
+of those and is refused rather than read as a third meaning.
+*/
+@(test)
+test_cache_stale_timeout :: proc(t: ^testing.T) {
+	base, berr := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	testing.expect(t, berr == nil, "expected a clean load")
+	testing.expect_value(t, base.cache.stale_timeout, 1800 * time.Millisecond)
+
+	set, serr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\ncache:\n  serve_stale: true\n  stale_timeout: 500ms\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, serr == nil, "expected a clean load")
+	testing.expect_value(t, set.cache.stale_timeout, 500 * time.Millisecond)
+
+	// The figure the annotated reference carries, which is fractional: a parser
+	// that read it as one second would quietly halve the documented default.
+	doc, derr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\ncache:\n  stale_timeout: 1.8s\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, derr == nil, "expected a clean load")
+	testing.expect_value(t, doc.cache.stale_timeout, 1800 * time.Millisecond)
+
+	off, oerr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\ncache:\n  stale_timeout: 0s\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, oerr == nil, "0 is the escape hatch, not an error")
+	testing.expect_value(t, off.cache.stale_timeout, time.Duration(0))
+
+	_, nerr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\ncache:\n  stale_timeout: -1s\n",
+		context.temp_allocator,
+	)
+	e, has := nerr.?
+	if testing.expect(t, has, "a negative stale_timeout was accepted") {
+		testing.expect(t, strings.contains(e.messages[0], "cache.stale_timeout"))
+	}
+	free_all(context.temp_allocator)
+}
+
 @(test)
 test_defaults_applied :: proc(t: ^testing.T) {
 	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)

@@ -234,6 +234,14 @@ Server :: struct {
 	limiter:      ^Rate_Limiter,
 	handler_pool: ^pool.Pool,
 	race_pool:    ^pool.Pool,
+	/*
+	The expired entries being refreshed right now, one slot per cache key.
+
+	Only `cache.serve_stale` reaches it, and only through `refresh.odin`, which
+	is where the whole mechanism is argued. The zero value is no refresh in
+	flight, which is what a `Server` built as a literal wants.
+	*/
+	refreshes:    Refresh_Table,
 	stats:        Stats,
 	// When this process began serving. Not a setting and not a counter: the
 	// metrics endpoint reports uptime from it, and Prometheus's
@@ -1065,6 +1073,18 @@ resolve_query :: proc(
 	// See `handle_query`: whether a worker of the shared pool is what this is
 	// holding.
 	shared_worker: bool,
+	/*
+	Non-nil when this call *is* a detached refresh of an expired entry, rather
+	than a client's own query.
+
+	Two things turn on it, and both are about who owns the expired bytes. A
+	refresh does not start another one, which is what keeps `serve_stale` from
+	recursing a worker at a time; and where the upstream produces nothing, it
+	reports that here instead of reaching for the entry and counting a client
+	answer against it - the request that started the refresh is holding those
+	bytes and serves them itself. See `refresh.odin`.
+	*/
+	unanswered: ^bool = nil,
 ) -> (
 	response: []u8,
 	outcome: Outcome,
@@ -1408,6 +1428,73 @@ resolve_query :: proc(
 			}
 			return serve_bogus_verdict(s, remembered, query, msg, q, proto, client, started)
 		}
+	}
+
+	/*
+	And this is as far as a client waits on an expired entry's refresh.
+
+	Everything below goes to an upstream, and how long that takes is not this
+	client's to spend: `upstream.resolve` gives up only after `attempts` rounds
+	over every server, which with the defaults is ten seconds against one
+	blackholed upstream and twenty against two, while a glibc stub gives up at
+	five (`RES_TIMEOUT`) and systemd-resolved sooner. So the answer the whole
+	setting exists to produce arrived after the client had already failed, and
+	`serve_stale` bought nothing in the one outage it was turned on for - an
+	upstream that is unreachable rather than answering (issue #164).
+
+	RFC 8767 section 5 asks for the other shape, and this is it: the refresh
+	runs on a worker of its own and the client waits for it with a deadline,
+	`cache.stale_timeout`, after which the held bytes go out and the refresh
+	carries on into the cache without it. `refresh.odin` is where the mechanism
+	is set out, including why a query that finds a refresh already running for
+	this key does not queue behind it.
+
+	Placed here rather than at the cache lookup so that everything which can
+	answer without an upstream has already had its turn: a fresh hit, the RD=0
+	gate - which serves these same bytes for a different reason - and a Bogus
+	verdict. Each of those would otherwise have a refresh started for a query
+	that was never going to forward.
+
+	Nothing changes where the cache is not holding anything for this name, where
+	`cache.stale_timeout` is zero - the escape hatch, which is what every
+	release before this one did - or where there is no pool to run the refresh
+	on, which is a `Server` built as a literal. The fall-through is the ordinary
+	forwarding path, expired entry in hand, exactly as it was: the client waits
+	the upstream out and is served what it is holding only once that has failed.
+
+	Those three are the only ways out of this block. Every other reason
+	`start_refresh` declines - a refresh for this key already running, the
+	ceiling reached, the pool's backlog full or the pool shutting down - serves
+	the expired bytes here and now. Each of them says the same thing, which is
+	that this query is not the one to spend an upstream round trip on, and none
+	of them leaves the entry unrefreshed for longer than the refresh that is
+	already in flight or the load that is shedding them.
+	*/
+	if unanswered == nil &&
+	   stale_hit.wire != nil &&
+	   s.cfg.cache.stale_timeout > 0 &&
+	   s.handler_pool != nil {
+		if r := start_refresh(s, key, query, proto, client, limit, started); r != nil {
+			defer refresh_release(r)
+			if out, refreshed, taken := refresh_take(r, s.cfg.cache.stale_timeout, allocator);
+			   taken {
+				return out, refreshed, true
+			}
+		}
+		return serve_from_cache(
+			s,
+			stale_hit,
+			query,
+			msg,
+			q,
+			proto,
+			client,
+			limit,
+			validating,
+			started,
+			spent,
+			allocator,
+		)
 	}
 
 	// Validation needs the signatures, so the question goes out again with DO
@@ -2042,6 +2129,23 @@ resolve_query :: proc(
 		covering an outage. RFC 8767 section 5 leaves both open; neither is
 		decided here.
 		*/
+		if unanswered != nil {
+			/*
+			Unless this call is the detached refresh, which holds nothing and
+			has no client of its own. The request that started it is holding the
+			expired bytes and serves them itself, so saying so is the whole of
+			what is left to do here - and the counter and the query-log line go
+			with the answer that client actually gets, rather than being made
+			twice for one query. See `refresh.odin`.
+
+			The SERVFAIL below is still built: a waiter that is still there
+			reads `unanswered` before it reads these bytes, and one that has
+			already timed out throws them away with the rest of the refresh.
+			*/
+			unanswered^ = true
+			out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
+			return out, .Failed, built
+		}
 		if stale_hit.wire != nil {
 			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, spent, allocator)
 		}
