@@ -209,6 +209,9 @@ attach_cookie :: proc(
 	query: dns.Message,
 	limit: int,
 	advertise: u16,
+	// What the request has taken out of its arena reading messages, for the
+	// rebuild and the refit below. See `dns.REQUEST_DECODE_BUDGET`.
+	spent: ^int,
 	allocator: mem.Allocator,
 ) -> []u8 {
 	// Named as the two verdicts that earn a cookie rather than the ones that do
@@ -230,7 +233,7 @@ attach_cookie :: proc(
 	only one available on a transport where this server has no payload size to
 	report.
 	*/
-	out, ok := dns.ensure_edns_option(wire, .Cookie, cookie[:], advertise, allocator)
+	out, ok := dns.ensure_edns_option(wire, .Cookie, cookie[:], advertise, allocator, spent)
 	if !ok {
 		// Nothing to do but send the answer as it is; a client that gets no
 		// cookie back reads it as a server that does not do them.
@@ -280,7 +283,7 @@ attach_cookie :: proc(
 	this runs, and nothing here shortens one.
 	*/
 	if len(out) > limit {
-		return fit_response(wire, limit, query, allocator)
+		return fit_response(wire, limit, query, spent, allocator)
 	}
 	return out
 }

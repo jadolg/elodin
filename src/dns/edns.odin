@@ -68,11 +68,15 @@ set_edns_option :: proc(
 	code: EDNS_Option_Code,
 	data: []u8,
 	allocator := context.allocator,
+	// What the request has taken out of its arena so far, if this message
+	// belongs to one: the rebuild below reads it in like any other reading.
+	// See `REQUEST_DECODE_BUDGET`.
+	spent: ^int = nil,
 ) -> (
 	out: []u8,
 	ok: bool,
 ) {
-	return rewrite_edns_option(msg, u16(code), data, false, allocator)
+	return rewrite_edns_option(msg, u16(code), data, false, allocator, spent)
 }
 
 /*
@@ -90,11 +94,15 @@ ensure_edns_option :: proc(
 	data: []u8,
 	udp_size: u16,
 	allocator := context.allocator,
+	// What the request has taken out of its arena so far, if this message
+	// belongs to one: the rebuild below reads it in like any other reading.
+	// See `REQUEST_DECODE_BUDGET`.
+	spent: ^int = nil,
 ) -> (
 	out: []u8,
 	ok: bool,
 ) {
-	if out, ok = rewrite_edns_option(msg, u16(code), data, false, allocator); ok {
+	if out, ok = rewrite_edns_option(msg, u16(code), data, false, allocator, spent); ok {
 		return out, true
 	}
 
@@ -105,7 +113,7 @@ ensure_edns_option :: proc(
 		code = u16(code),
 		data = data,
 	}
-	return add_opt_record(msg, udp_size, options, allocator)
+	return add_opt_record(msg, udp_size, options, allocator, spent)
 }
 
 /*
@@ -134,6 +142,10 @@ ensure_opt :: proc(
 	msg: []u8,
 	udp_size: u16,
 	allocator := context.allocator,
+	// What the request has taken out of its arena so far, if this message
+	// belongs to one: the rebuild below reads it in like any other reading.
+	// See `REQUEST_DECODE_BUDGET`.
+	spent: ^int = nil,
 ) -> (
 	out: []u8,
 	ok: bool,
@@ -141,7 +153,7 @@ ensure_opt :: proc(
 	if _, has_opt := find_opt_span(msg); has_opt {
 		return msg, true
 	}
-	return add_opt_record(msg, udp_size, nil, allocator)
+	return add_opt_record(msg, udp_size, nil, allocator, spent)
 }
 
 /*
@@ -172,13 +184,14 @@ add_opt_record :: proc(
 	udp_size: u16,
 	options: []EDNS_Option,
 	allocator: mem.Allocator,
+	spent: ^int,
 ) -> (
 	out: []u8,
 	ok: bool,
 ) {
 	scratch := context.temp_allocator
 
-	m, derr := decode_message(msg, scratch)
+	m, derr := decode_message(msg, scratch, spent)
 	if derr != .None {
 		return nil, false
 	}
@@ -226,13 +239,23 @@ record - an upstream reply whose sections do not walk keeps whatever it arrived
 with, which is the reading every other writer in this file takes of the same
 input.
 */
-remove_opt :: proc(msg: []u8, allocator := context.allocator) -> (out: []u8, ok: bool) {
+remove_opt :: proc(
+	msg: []u8,
+	allocator := context.allocator,
+	// What the request has taken out of its arena so far, if this message
+	// belongs to one: the rebuild below reads it in like any other reading.
+	// See `REQUEST_DECODE_BUDGET`.
+	spent: ^int = nil,
+) -> (
+	out: []u8,
+	ok: bool,
+) {
 	span, has_opt := find_opt_span(msg)
 	if !has_opt {
 		return msg, true
 	}
 	if !span.last {
-		return rebuild_without_opt(msg, allocator)
+		return rebuild_without_opt(msg, allocator, spent)
 	}
 
 	/*
@@ -269,10 +292,10 @@ simply be cut - see `remove_opt`. Out of the temp arena, for the reason
 `rebuild_edns_option` gives.
 */
 @(private)
-rebuild_without_opt :: proc(msg: []u8, allocator: mem.Allocator) -> (out: []u8, ok: bool) {
+rebuild_without_opt :: proc(msg: []u8, allocator: mem.Allocator, spent: ^int) -> (out: []u8, ok: bool) {
 	scratch := context.temp_allocator
 
-	m, derr := decode_message(msg, scratch)
+	m, derr := decode_message(msg, scratch, spent)
 	if derr != .None {
 		return nil, false
 	}
@@ -308,11 +331,15 @@ remove_edns_option :: proc(
 	msg: []u8,
 	code: EDNS_Option_Code,
 	allocator := context.allocator,
+	// What the request has taken out of its arena so far, if this message
+	// belongs to one: the rebuild below reads it in like any other reading.
+	// See `REQUEST_DECODE_BUDGET`.
+	spent: ^int = nil,
 ) -> (
 	out: []u8,
 	ok: bool,
 ) {
-	return rewrite_edns_option(msg, u16(code), nil, true, allocator)
+	return rewrite_edns_option(msg, u16(code), nil, true, allocator, spent)
 }
 
 /*
@@ -502,6 +529,7 @@ rewrite_edns_option :: proc(
 	data: []u8,
 	remove: bool,
 	allocator: mem.Allocator,
+	spent: ^int,
 ) -> (
 	out: []u8,
 	ok: bool,
@@ -517,7 +545,7 @@ rewrite_edns_option :: proc(
 		return msg, true
 	}
 	if !span.last || site.dupes {
-		return rebuild_edns_option(msg, code, data, remove, allocator)
+		return rebuild_edns_option(msg, code, data, remove, allocator, spent)
 	}
 
 	cut_start := site.start if site.found else span.rd_end
@@ -575,13 +603,14 @@ rebuild_edns_option :: proc(
 	data: []u8,
 	remove: bool,
 	allocator: mem.Allocator,
+	spent: ^int,
 ) -> (
 	out: []u8,
 	ok: bool,
 ) {
 	scratch := context.temp_allocator
 
-	m, derr := decode_message(msg, scratch)
+	m, derr := decode_message(msg, scratch, spent)
 	if derr != .None {
 		return nil, false
 	}
@@ -654,13 +683,23 @@ is this client's answer alone.
 Fails only where a message whose OPT record is not the last one cannot be
 decoded and encoded again.
 */
-strip_edns_options :: proc(msg: []u8, allocator := context.allocator) -> (out: []u8, ok: bool) {
+strip_edns_options :: proc(
+	msg: []u8,
+	allocator := context.allocator,
+	// What the request has taken out of its arena so far, if this message
+	// belongs to one: the rebuild below reads it in like any other reading.
+	// See `REQUEST_DECODE_BUDGET`.
+	spent: ^int = nil,
+) -> (
+	out: []u8,
+	ok: bool,
+) {
 	span, has_opt := find_opt_span(msg)
 	if !has_opt {
 		return msg, true
 	}
 	if !span.last {
-		return rebuild_without_edns_options(msg, allocator)
+		return rebuild_without_edns_options(msg, allocator, spent)
 	}
 	// Nothing follows the record, so an empty list here is the whole message's
 	// answer and not just this record's. See above.
@@ -706,10 +745,10 @@ makes the two halves of a normalisation agree about how much of the message they
 cover.
 */
 @(private)
-rebuild_without_edns_options :: proc(msg: []u8, allocator: mem.Allocator) -> (out: []u8, ok: bool) {
+rebuild_without_edns_options :: proc(msg: []u8, allocator: mem.Allocator, spent: ^int) -> (out: []u8, ok: bool) {
 	scratch := context.temp_allocator
 
-	m, derr := decode_message(msg, scratch)
+	m, derr := decode_message(msg, scratch, spent)
 	if derr != .None {
 		return nil, false
 	}

@@ -369,6 +369,9 @@ parent_answers_apex_ds :: proc(
 	resp: []u8,
 	name: string,
 	reached: bool,
+	// The request's reading counter: this is another reading of a reply into
+	// the arena the request is served from. See `dns.REQUEST_DECODE_BUDGET`.
+	spent: ^int,
 	allocator: mem.Allocator,
 ) -> (
 	proved: bool,
@@ -384,7 +387,7 @@ parent_answers_apex_ds :: proc(
 	if rcode != .No_Error {
 		return false, false
 	}
-	msg, err := dns.decode_through_answer(resp, allocator)
+	msg, err := dns.decode_through_answer(resp, allocator, spent)
 	if err != .None {
 		return false, false
 	}

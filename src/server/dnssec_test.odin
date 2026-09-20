@@ -155,7 +155,7 @@ test_strip_removes_dnssec_records :: proc(t: ^testing.T) {
 	wire, _, err := dns.encode_message(signed_response(), context.temp_allocator)
 	testing.expect_value(t, err, dns.Encode_Error.None)
 
-	stripped := strip_dnssec_records(wire, client_query(false), .A, context.temp_allocator, dns.MAX_MESSAGE)
+	stripped := strip_dnssec_records(wire, client_query(false), .A, nil, context.temp_allocator, dns.MAX_MESSAGE)
 	msg, derr := dns.decode_message(stripped, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
 
@@ -175,7 +175,7 @@ test_strip_removes_dnssec_records :: proc(t: ^testing.T) {
 test_strip_keeps_records_that_were_asked_for :: proc(t: ^testing.T) {
 	// A client asking for RRSIG records wants RRSIG records.
 	wire, _, _ := dns.encode_message(signed_response(), context.temp_allocator)
-	stripped := strip_dnssec_records(wire, client_query(false), .RRSIG, context.temp_allocator, dns.MAX_MESSAGE)
+	stripped := strip_dnssec_records(wire, client_query(false), .RRSIG, nil, context.temp_allocator, dns.MAX_MESSAGE)
 
 	msg, derr := dns.decode_message(stripped, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
@@ -190,6 +190,7 @@ test_strip_omits_opt_for_a_client_without_edns :: proc(t: ^testing.T) {
 		wire,
 		client_query(false, with_edns = false),
 		.A,
+		nil,
 		context.temp_allocator,
 		dns.MAX_MESSAGE,
 	)
@@ -204,7 +205,7 @@ test_strip_omits_opt_for_a_client_without_edns :: proc(t: ^testing.T) {
 test_ad_bit_records_the_verdict :: proc(t: ^testing.T) {
 	// What goes into the cache says what was established, whoever asked.
 	wire, _, _ := dns.encode_message(signed_response(), context.temp_allocator)
-	secure := present_response(wire, client_query(false), .A, secure_verdict(), context.temp_allocator)
+	secure := present_response(wire, client_query(false), .A, secure_verdict(), nil, context.temp_allocator)
 	testing.expect(t, secure[3] & 0x20 != 0, "AD should record a secure verdict")
 
 	// Not secure: the bit must come off even though the upstream may have set it.
@@ -215,6 +216,7 @@ test_ad_bit_records_the_verdict :: proc(t: ^testing.T) {
 		client_query(true),
 		.A,
 		dnssec.Result{status = .Insecure},
+		nil,
 		context.temp_allocator,
 	)
 	testing.expect(t, insecure[3] & 0x20 == 0, "AD must not survive an unauthenticated answer")
@@ -253,12 +255,12 @@ test_cd_bit_is_not_echoed_back :: proc(t: ^testing.T) {
 	wire, _, _ := dns.encode_message(signed_response(), context.temp_allocator)
 	wire[3] |= 0x10
 
-	out := present_response(wire, client_query(true), .A, secure_verdict(), context.temp_allocator)
+	out := present_response(wire, client_query(true), .A, secure_verdict(), nil, context.temp_allocator)
 	testing.expect(t, out[3] & 0x10 == 0, "CD should be clear for a client that did not set it")
 
 	stripped_wire, _, _ := dns.encode_message(signed_response(), context.temp_allocator)
 	stripped_wire[3] |= 0x10
-	stripped := present_response(stripped_wire, client_query(false), .A, secure_verdict(), context.temp_allocator)
+	stripped := present_response(stripped_wire, client_query(false), .A, secure_verdict(), nil, context.temp_allocator)
 	testing.expect(t, stripped[3] & 0x10 == 0, "CD should be clear on a stripped answer too")
 	free_all(context.temp_allocator)
 }
@@ -325,7 +327,7 @@ test_ad_never_goes_out_over_records_the_verdict_missed :: proc(t: ^testing.T) {
 	wire, _, err := dns.encode_message(msg, context.temp_allocator)
 	testing.expect_value(t, err, dns.Encode_Error.None)
 
-	out := present_response(wire, client_query(true), .A, secure_verdict(), context.temp_allocator)
+	out := present_response(wire, client_query(true), .A, secure_verdict(), nil, context.temp_allocator)
 	testing.expect(t, out[3] & 0x20 != 0, "AD should record the secure verdict")
 
 	decoded, derr := dns.decode_message(out, context.temp_allocator)
@@ -382,7 +384,7 @@ test_a_pruned_answer_survives_the_strip_for_a_client_without_do :: proc(t: ^test
 	wire, _, err := dns.encode_message(msg, context.temp_allocator)
 	testing.expect_value(t, err, dns.Encode_Error.None)
 
-	out := present_response(wire, client_query(false), .A, secure_verdict(), context.temp_allocator)
+	out := present_response(wire, client_query(false), .A, secure_verdict(), nil, context.temp_allocator)
 	testing.expect(t, out[3] & 0x20 != 0, "AD should record the secure verdict")
 
 	decoded, derr := dns.decode_message(out, context.temp_allocator)
@@ -534,7 +536,7 @@ test_a_pruned_answer_is_still_cached_and_served :: proc(t: ^testing.T) {
 		answer = covered,
 	}
 
-	out := present_response(wire, aaaa_query(), .AAAA, verdict, context.temp_allocator)
+	out := present_response(wire, aaaa_query(), .AAAA, verdict, nil, context.temp_allocator)
 	decoded, derr := dns.decode_message(out, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
 
@@ -648,7 +650,7 @@ test_a_pruned_nxdomain_after_a_cname_falls_back_to_the_configured_negative_ttl :
 		answer = covered,
 	}
 
-	out := present_response(wire, aaaa_query(), .AAAA, verdict, context.temp_allocator)
+	out := present_response(wire, aaaa_query(), .AAAA, verdict, nil, context.temp_allocator)
 	decoded, derr := dns.decode_message(out, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
 	testing.expect_value(t, dns.rcode_of(decoded), dns.Rcode.NX_Domain)
