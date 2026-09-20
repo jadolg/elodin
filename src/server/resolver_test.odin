@@ -945,6 +945,114 @@ test_a_refresh_that_beats_the_timer_answers_the_client :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+/*
+And `cache.stale_timeout: 0` really is the escape hatch it is documented as.
+
+The setting promises an operator that zero restores what every release before
+the timer did: the client waits the whole upstream budget out and is served the
+expired entry only once that has failed. Everything else here asserts the timer
+firing, so without this the promise was held up by the loader parsing the figure
+and by nothing at all downstream of it - which is the half an operator actually
+relies on when they decide they would rather wait than be handed data known to
+be out of date.
+
+Asserted as the wait rather than as an absence, because the wait is the whole of
+what the setting buys. The upstream is the same blackholed socket the case above
+uses and the budget is one 400 ms attempt, so a client on the timer path would
+have been answered in a fraction of it; this one has to still be waiting when
+the attempt times out. The datagram count says the upstream was asked at all -
+it cannot tell the two paths apart, since either way exactly one query goes out,
+which is why the clock is what carries this.
+
+The worker pool is built and handed over, which is the point of the case: with
+no pool there is nothing to detach onto and the fall-through happens for a
+second reason, so a `Server` without one would pass this while proving nothing
+about the setting. Here the pool is there, unused, and the zero is the only
+thing keeping the refresh on this thread.
+*/
+@(test)
+test_a_zero_timer_waits_the_upstream_out :: proc(t: ^testing.T) {
+	hole, herr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, herr == nil, "cannot bind the blackholed upstream: %v", herr) {
+		return
+	}
+	defer net.close(hole)
+	bound, berr := net.bound_endpoint(hole)
+	if !testing.expectf(t, berr == nil, "cannot read the blackhole's port: %v", berr) {
+		return
+	}
+
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
+	defer cache.destroy(answers)
+	cfg: config.Config
+	s := stale_server(&cfg, answers, nil)
+	cfg.upstream.strategy = .Failover
+	cfg.upstream.attempts = 1
+	cfg.upstream.timeout = 400 * time.Millisecond
+	// The escape hatch, and the only thing under test.
+	cfg.cache.stale_timeout = 0
+	cfg.upstream.servers = blackhole_servers(bound.port)
+
+	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+		return
+	}
+	defer upstream.destroy_group(group)
+	s.group = group
+
+	workers := pool.make_pool(2)
+	joined := false
+	defer if !joined {
+		pool.destroy(workers)
+	}
+	s.handler_pool = workers
+
+	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
+		return
+	}
+
+	begun := time.now()
+	out, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	waited := time.since(begun)
+
+	if !testing.expect(t, ok, "the stale answer went unserved") {
+		return
+	}
+	testing.expect_value(t, outcome, Outcome.Cached)
+	/*
+	The attempt cannot come back before its own timeout: there is nothing at the
+	other end to answer it and nothing to refuse it, so `SO_RCVTIMEO` is what
+	ends it. A margin of a tenth for the clock, which still leaves this an order
+	of magnitude away from what the timer path would have measured.
+	*/
+	testing.expectf(
+		t,
+		waited >= 360 * time.Millisecond,
+		"the client waited %v, which is not the %v upstream budget this setting asks it to wait",
+		waited,
+		time.Duration(cfg.upstream.attempts) * cfg.upstream.timeout,
+	)
+
+	served, serr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, serr, dns.Decode_Error.None)
+	testing.expect_value(t, served.id, u16(0x4321))
+	if testing.expect(t, len(served.answer) == 1, "the stale answer carried no record") {
+		testing.expect_value(t, served.answer[0].ttl, u32(cache.STALE_TTL))
+	}
+	counters := stats_of(&s)
+	testing.expect_value(t, counters.cached, u64(1))
+	testing.expect_value(t, counters.failed, u64(0))
+	testing.expect_value(t, cache.stats(answers).stale, u64(1))
+
+	// Nothing was ever submitted, so this joins an idle pool; the count behind
+	// it is the one attempt this thread made for itself.
+	pool.destroy(workers)
+	joined = true
+	s.handler_pool = nil
+	testing.expect_value(t, drain_datagrams(hole), 1)
+	free_all(context.temp_allocator)
+}
+
 // One upstream, at a port on loopback, for the response-timer fixtures above.
 @(private = "file")
 blackhole_servers :: proc(port: int) -> []config.Upstream_Spec {
