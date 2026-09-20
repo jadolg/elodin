@@ -386,6 +386,24 @@ Dnssec_Config :: struct {
 	that has nothing to do with DNSSEC.
 	*/
 	max_connection_walks: int,
+	/*
+	Zones whose keys - or whose lack of them - may be remembered at once.
+
+	The chain of trust is walked per question, so without this every delegation
+	a client asks about would be re-established from the root; with it, an apex
+	is established once and reused until its TTL runs out. What sizes it is the
+	hierarchy this resolver's traffic actually touches, which for a busy
+	forwarder is thousands of zones and for a household is dozens.
+
+	Zero, the default, is `dnssec.DEFAULT_MAX_CACHED_ZONES`. Exposed because it
+	is the one dial on how much memory validation may hold: an entry is a zone
+	name and its keys, bounded at `dnssec.MAX_CACHED_ZONE_KEY_BYTES` apiece, so
+	the ceiling is that times this. A box with a gigabyte and a validator that
+	must not grow past a slice of it sets this; anyone else leaves it alone.
+	Past the bound the coldest zone is evicted rather than the cache emptied,
+	so a smaller number costs upstream lookups and nothing else (issue #336).
+	*/
+	max_cached_zones:     int,
 }
 
 Cookie_Config :: struct {
@@ -1175,6 +1193,8 @@ default_config :: proc() -> Config {
 		// see the fields.
 		max_chain_walks      = 0,
 		max_connection_walks = 0,
+		// Zero takes `dnssec.DEFAULT_MAX_CACHED_ZONES`; see the field.
+		max_cached_zones     = 0,
 	}
 	c.cookies = Cookie_Config {
 		enabled  = true,

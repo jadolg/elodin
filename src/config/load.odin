@@ -1438,6 +1438,7 @@ load_dnssec :: proc(l: ^Loader, cfg: ^Config) {
 	opt_int(l, n, "max_nsec3_iterations", &cfg.dnssec.max_nsec3_iterations, "dnssec")
 	opt_int(l, n, "max_chain_walks", &cfg.dnssec.max_chain_walks, "dnssec")
 	opt_int(l, n, "max_connection_walks", &cfg.dnssec.max_connection_walks, "dnssec")
+	opt_int(l, n, "max_cached_zones", &cfg.dnssec.max_cached_zones, "dnssec")
 
 	if a := yaml.get(n, "trust_anchors"); !yaml.is_null(a) {
 		if list, ok := yaml.as_string_list(a, l.allocator); ok {
@@ -2591,6 +2592,11 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 			l,
 			"dnssec.max_connection_walks must not be negative; 0 derives it from server.max_connections",
 		)
+	}
+	// And the same for the cache bound: zero is the default, negative is not a
+	// cache without a bound but a number nobody meant.
+	if cfg.dnssec.max_cached_zones < 0 {
+		errorf(l, "dnssec.max_cached_zones must not be negative; 0 uses the built-in default")
 	}
 	// Parsed here rather than at startup so `--check` reports a bad anchor
 	// instead of a resolver that comes up refusing every name.

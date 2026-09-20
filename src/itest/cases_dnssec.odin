@@ -417,4 +417,43 @@ run_dnssec_config_cases :: proc(r: ^Runner) {
 		check(r, strings.contains(output, "trust_anchors"), "the error does not name the setting: %q", output)
 	}
 	end_case(r)
+
+	// Issue #336: the zone-key cache had a bound only the source could set. It
+	// is the one dial on how much memory validation may hold, so a box whose
+	// memory the operator knows and this server does not needs to reach it.
+	start_case(r, "dnssec: --check accepts a zone-cache bound")
+	{
+		code, output := check_config(
+			r,
+			"dnssec-zone-cache-ok",
+			"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  enabled: true\n  max_cached_zones: 512\n",
+		)
+		check_eq_int(r, code, 0, "exit code")
+		check(
+			r,
+			!strings.contains(output, "max_cached_zones"),
+			"a valid zone-cache bound was complained about: %q",
+			output,
+		)
+	}
+	end_case(r)
+
+	// Negative is not a cache without a bound. Reading it as one more way of
+	// asking for the default would leave a typo running the cache unbounded.
+	start_case(r, "dnssec: --check rejects a negative zone-cache bound")
+	{
+		code, output := check_config(
+			r,
+			"dnssec-zone-cache-bad",
+			"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  enabled: true\n  max_cached_zones: -1\n",
+		)
+		check(r, code != 0, "a negative zone-cache bound exited 0")
+		check(
+			r,
+			strings.contains(output, "max_cached_zones"),
+			"the error does not name the setting: %q",
+			output,
+		)
+	}
+	end_case(r)
 }

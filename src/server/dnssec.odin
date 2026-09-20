@@ -160,6 +160,9 @@ start_validator :: proc(s: ^Server) -> bool {
 			// The connection transports get their own, sized from the threads
 			// they actually have. See `Dnssec_Config.max_connection_walks`.
 			max_connection_walks = s.cfg.dnssec.max_connection_walks,
+			// The one dial on how much memory validation may hold. Zero here
+			// takes the validator's own default, as everywhere else.
+			max_cached_zones     = s.cfg.dnssec.max_cached_zones,
 		},
 	)
 	// The bound is named here because it is the number an operator watching
