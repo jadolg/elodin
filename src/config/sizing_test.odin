@@ -404,3 +404,34 @@ test_pooled_upstream_connections_counts_every_route :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, pooled_upstream_connections(routed), 16 + 4 + 4)
 }
+
+/*
+Issue #336: the zone-key cache had a bound the configuration could not reach.
+
+`dnssec.Options.max_cached_zones` existed and nothing passed it, so the only
+number in use was the built-in one - on a box whose memory the operator knows
+and this server does not.
+*/
+@(test)
+test_the_zone_cache_bound_is_configurable :: proc(t: ^testing.T) {
+	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	testing.expect(t, err == nil, "expected a clean load")
+	// Zero here rather than a number of its own: the validator holds the
+	// default, so the two cannot drift apart.
+	testing.expect_value(t, cfg.dnssec.max_cached_zones, 0)
+
+	set, serr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  max_cached_zones: 512\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, serr == nil, "expected a clean load")
+	testing.expect_value(t, set.dnssec.max_cached_zones, 512)
+
+	// Negative is not a cache without a bound, it is a number nobody meant.
+	_, nerr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  max_cached_zones: -1\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, nerr != nil, "a negative zone-cache bound should be refused")
+	free_all(context.temp_allocator)
+}

@@ -76,6 +76,23 @@ Validator :: struct {
 	mu:                   sync.Mutex,
 	zones:                map[string]^Zone_Entry,
 	/*
+	`zones` in use order, most recent first, so a full cache knows what to drop.
+
+	This used to be emptied wholesale when it filled, on the reasoning that a
+	cache of zones fills slowly and refilling it costs a handful of queries.
+	Both halves are true of a resolver's own traffic and neither is true under a
+	client that picks the names: a flood of fresh delegations fills it as fast
+	as it can send, and what the flush throws out is the root and the TLDs that
+	every other client's walk starts from - so one client's names cost everyone
+	a re-walk from the top. Issue #336.
+
+	A list rather than a stamp compared across the map, because the choice is
+	made on the insert path: walking four thousand entries to find the coldest
+	is the one thing a flood must not be able to make expensive. What survives
+	here is what is being used, and the root is used by every walk there is.
+	*/
+	lru_head, lru_tail:   ^Zone_Entry,
+	/*
 	Names the chain walk found to be no zone cut, against when that stops being
 	true. Nothing but an expiry is kept: a non-cut has no keys, and the only
 	question asked of it is whether the walk may skip a DS lookup.
@@ -177,6 +194,19 @@ Validator :: struct {
 	// know why DNSSEC started failing. One per question however many of its
 	// walks were turned away - see `may_look_up`. Read through `queries_shed`.
 	shed:                 u64,
+	/*
+	DNSKEY sets refused for size, for the operator who wants to know whether
+	anything is trying it. One per `cache_put` that declined to store, which is
+	one per chain walk that reached such a zone rather than one per zone.
+
+	Worth a number of its own rather than a log line: the path is reachable by
+	anyone who can get a zone of their own validated, so a line per refusal is
+	log amplification aimed at whoever reads the logs - the thing
+	`Validator.shed` is careful about too. Nothing here is a fault: a refused
+	set means the answer was still validated and the zone simply went uncached.
+	Read through `oversized_key_sets`.
+	*/
+	oversized:            u64,
 
 	allocator:            mem.Allocator,
 }
@@ -213,10 +243,14 @@ Non_Cut :: struct {
 Zone_Entry :: struct {
 	// Owns the string the map is keyed by, so replacing an entry can hand the
 	// same allocation back to the map rather than leave one of them dangling.
-	zone:    string,
-	status:  Status,
-	keys:    []Dnskey,
-	expires: time.Time,
+	zone:       string,
+	status:     Status,
+	keys:       []Dnskey,
+	expires:    time.Time,
+	// This entry's place in the eviction order `Validator.lru_head` heads.
+	// Every removal from `zones` goes through `drop_zone`, so the list and the
+	// map cannot come to disagree about what is held.
+	prev, next: ^Zone_Entry,
 }
 
 /*
@@ -575,6 +609,57 @@ DEFAULT_MAX_NSEC3_ITERATIONS :: 100
 DEFAULT_MAX_CACHED_ZONES :: 4096
 
 /*
+Key bytes one zone may occupy in the cache.
+
+`max_cached_zones` bounds the entries and says nothing about their size, and the
+size is the zone's to choose: `fetch_keys` admits `MAX_KEYS_PER_ZONE` records
+and the RSA parser reads up to `MAX_MODULUS_BYTES` plus `MAX_EXPONENT_BYTES` of
+each, so one apex could hand this cache about 96 KB - times the entry bound,
+more memory than the machine. Issue #336.
+
+Eight kilobytes is past every apex anyone serves. The largest key in use is
+RSA-4096 at some 520 bytes of RDATA, and a zone mid-rollover publishes a KSK and
+two ZSKs; fifteen of those still fit. Only keys that survive `key_usable` are
+counted, since those are the only ones any signature check will look at.
+
+A zone past it is not cached rather than cached short. Truncating the set is the
+one thing that must not happen here: which keys were dropped decides which of
+the zone's signatures still verify, so a zone with an unusual number of large
+keys would go SERVFAIL for as long as the entry lived, and go there quietly.
+Declining the entry costs that zone a chain walk per question - what any cold
+name costs - and costs everybody else nothing.
+
+This counts RDATA and nothing else, so it is not what an entry costs. See
+`MAX_CACHED_ZONE_BYTES` for the figure to size a machine against.
+*/
+MAX_CACHED_ZONE_KEY_BYTES :: 8192
+
+/*
+What one entry costs at worst, which is the number to multiply by
+`max_cached_zones`.
+
+`MAX_CACHED_ZONE_KEY_BYTES` bounds the RDATA and the RDATA is not the whole of
+it: each key carries a `Dnskey` beside its bytes, and a zone may publish
+`MAX_KEYS_PER_ZONE` of them - 64 small keys fit under the byte cap as readily as
+three large ones - so the structs alone are three kilobytes on top. Then the
+entry itself, and the name it is keyed by, which is bounded by
+`dns.MAX_NAME_PRESENTATION` rather than by the couple of dozen bytes a real apex
+spells: presentation form escapes a byte as `\DDD`, so the worst name is four
+times the wire limit. It comes to about twelve kilobytes, and the RDATA the
+other constant bounds is two thirds of it.
+
+Written down because the cache's whole purpose here is to be sized by an
+operator, and a figure that leaves out a third of what it measures is worse than
+none. The map's own slot is not in it: what a `map` spends per key belongs to
+the runtime rather than to this, and it is small beside the rest.
+*/
+MAX_CACHED_ZONE_BYTES ::
+	MAX_CACHED_ZONE_KEY_BYTES +
+	MAX_KEYS_PER_ZONE * size_of(Dnskey) +
+	size_of(Zone_Entry) +
+	dns.MAX_NAME_PRESENTATION
+
+/*
 Slots in the non-cut table.
 
 Smaller than the zone cache and fixed rather than configurable, because this
@@ -705,6 +790,7 @@ destroy_validator :: proc(v: ^Validator) {
 		free_entry(v, entry)
 	}
 	delete(v.zones)
+	v.lru_head, v.lru_tail = nil, nil
 	clear_non_cuts(v)
 	delete(v.non_cuts, v.allocator)
 	free(v, v.allocator)
@@ -3136,6 +3222,11 @@ queries_shed :: proc(v: ^Validator) -> u64 {
 	return sync.atomic_load(&v.shed) if v != nil else 0
 }
 
+// DNSKEY sets the zone cache refused for size. See `Validator.oversized`.
+oversized_key_sets :: proc(v: ^Validator) -> u64 {
+	return sync.atomic_load(&v.oversized) if v != nil else 0
+}
+
 @(private)
 Step :: enum u8 {
 	// The child is a signed zone in its own right.
@@ -3940,6 +4031,10 @@ cache_get :: proc(
 	if time.diff(cached.expires, now) > 0 {
 		return {}, false, false
 	}
+	// A hit is what keeps an entry alive when the cache overflows. The root is
+	// read here at the start of every chain, which is what puts it out of reach
+	// of a flood of names nobody asks for twice.
+	zone_touch(v, cached)
 	/*
 	The RDATA is copied, not referenced. A `Dnskey` is a handful of slices into
 	memory this cache owns, and another thread may evict the entry the moment
@@ -4124,6 +4219,7 @@ cache_put :: proc(v: ^Validator, zone: string, status: Status, keys: []Dnskey, t
 	entry := new(Zone_Entry, v.allocator)
 	entry.status = status
 	entry.expires = time.time_add(now, time.Duration(lifetime) * time.Second)
+	oversized := false
 	if len(keys) > 0 {
 		// Appended rather than written by index: skipping a key that will not
 		// parse must shorten the set, not leave a zero-valued one sitting in it.
@@ -4132,7 +4228,24 @@ cache_put :: proc(v: ^Validator, zone: string, status: Status, keys: []Dnskey, t
 		// `validate_rrset` reads as insecure. A cache holding entries that
 		// quietly mean "treat this zone as unsigned" fails the wrong way.
 		owned := make([dynamic]Dnskey, 0, len(keys), v.allocator)
+		held := 0
 		for k in keys {
+			/*
+			Only keys that could sign something. `check_signature` and
+			`signature_worth_trying` both skip the rest - a key without the zone
+			bit, one revoked under RFC 5011, one whose protocol field is not 3 -
+			so copying them holds memory for keys nothing will ever read, and
+			lets a zone pad its own entry with records that need not be keys at
+			all. Filtered on the caller's copy, which carries the same bytes as
+			the copy below and so gives the same answer.
+			*/
+			if !key_usable(k) {
+				continue
+			}
+			if held + len(k.rdata) > MAX_CACHED_ZONE_KEY_BYTES {
+				oversized = true
+				break
+			}
 			rdata := make([]u8, len(k.rdata), v.allocator)
 			copy(rdata, k.rdata)
 			parsed, perr := parse_dnskey(rdata)
@@ -4140,6 +4253,7 @@ cache_put :: proc(v: ^Validator, zone: string, status: Status, keys: []Dnskey, t
 				delete(rdata, v.allocator)
 				continue
 			}
+			held += len(rdata)
 			append(&owned, parsed)
 		}
 		entry.keys = owned[:]
@@ -4162,26 +4276,93 @@ cache_put :: proc(v: ^Validator, zone: string, status: Status, keys: []Dnskey, t
 	*/
 	non_cut_drop(v, key)
 
+	/*
+	Past `MAX_CACHED_ZONE_KEY_BYTES` nothing is stored, and anything already
+	stored for the name is left where it is: it is a set this server did
+	validate, under its own lifetime, and dropping it would let an oversized
+	reply evict a good entry. The memo above still goes, because the name has
+	been settled as a zone whatever the cache does with it.
+	*/
+	if oversized {
+		sync.atomic_add(&v.oversized, 1)
+		entry.zone = ""
+		free_entry(v, entry)
+		return
+	}
+
 	if old, exists := v.zones[key]; exists {
 		// Reuse the string the map is already keyed by. Re-inserting under the
 		// caller's stack-backed `key` would leave the map holding a pointer
 		// into a frame that is about to go away.
 		entry.zone = old.zone
 		old.zone = ""
+		zone_unlink(v, old)
 		free_entry(v, old)
 		v.zones[entry.zone] = entry
+		zone_push_front(v, entry)
 		return
 	}
-	if len(v.zones) >= v.max_cached_zones {
-		// A flush is crude, but this cache holds zones rather than answers: it
-		// fills slowly, and refilling it costs a handful of queries.
-		for _, e in v.zones {
-			free_entry(v, e)
-		}
-		clear(&v.zones)
+	// The coldest entries, and only as many as it takes to make room. What the
+	// flush this replaced threw out was everyone else's root and TLD keys; see
+	// `Validator.lru_head`.
+	for len(v.zones) >= v.max_cached_zones && v.lru_tail != nil {
+		drop_zone(v, v.lru_tail)
 	}
 	entry.zone = strings.clone(key, v.allocator)
 	v.zones[entry.zone] = entry
+	zone_push_front(v, entry)
+}
+
+/*
+The eviction order. The caller holds the lock in every case.
+
+`drop_zone` is the only way an entry leaves `zones`: doing it by hand at each
+call site is how a list ends up pointing at something that has been freed, and
+the next overflow then evicts through a dangling pointer.
+*/
+@(private)
+drop_zone :: proc(v: ^Validator, e: ^Zone_Entry) {
+	zone_unlink(v, e)
+	// Before `free_entry`, which frees the string the map is keyed on.
+	delete_key(&v.zones, e.zone)
+	free_entry(v, e)
+}
+
+@(private)
+zone_push_front :: proc(v: ^Validator, e: ^Zone_Entry) {
+	e.prev = nil
+	e.next = v.lru_head
+	if v.lru_head != nil {
+		v.lru_head.prev = e
+	}
+	v.lru_head = e
+	if v.lru_tail == nil {
+		v.lru_tail = e
+	}
+}
+
+@(private)
+zone_unlink :: proc(v: ^Validator, e: ^Zone_Entry) {
+	if e.prev != nil {
+		e.prev.next = e.next
+	} else if v.lru_head == e {
+		v.lru_head = e.next
+	}
+	if e.next != nil {
+		e.next.prev = e.prev
+	} else if v.lru_tail == e {
+		v.lru_tail = e.prev
+	}
+	e.prev, e.next = nil, nil
+}
+
+@(private)
+zone_touch :: proc(v: ^Validator, e: ^Zone_Entry) {
+	if v.lru_head == e {
+		return
+	}
+	zone_unlink(v, e)
+	zone_push_front(v, e)
 }
 
 // Drop entries whose lifetime has run out. A zero `now` reads the wall clock;
@@ -4204,8 +4385,7 @@ sweep :: proc(v: ^Validator, now: time.Time = {}) -> (removed: int) {
 		}
 	}
 	for entry in expired {
-		delete_key(&v.zones, entry.zone)
-		free_entry(v, entry)
+		drop_zone(v, entry)
 		removed += 1
 	}
 

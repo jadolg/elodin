@@ -935,6 +935,7 @@ dnssec:
   max_nsec3_iterations: 100
   max_chain_walks: 0     # 0 is server.workers less a reserved quarter
   max_connection_walks: 0 # the same, from server.max_connections
+  max_cached_zones: 0    # 0 is 4096
   trust_anchors: []      # empty uses the built-in root keys
 ```
 
@@ -1038,16 +1039,37 @@ and have no racer job to take, so they are unaffected.
 
 A query also has a hashing allowance of its own, and above a ceiling of 255 —
 derived from that allowance, so a build that retunes it says its own number in
-the log line below — the allowance is what answers: the zones a higher ceiling admits are the ones whose
-proofs it cannot pay for, so a larger number buys SERVFAIL rather than more
-validation. A configuration carrying one is held down to 255 at startup, with a
-line in the log saying so, rather than refused — a resolver that will not come
-up is worse than either.
+the log line below — the allowance is what answers: the zones a higher ceiling
+admits are the ones whose proofs it cannot pay for, so a larger number buys
+SERVFAIL rather than more validation. A configuration carrying one is held down
+to 255 at startup, with a line in the log saying so, rather than refused — a
+resolver that will not come up is worse than either.
 
 Being a forwarder rather than a recursor, elodin fetches the material it
 validates against: every DS and DNSKEY down from the root, through the configured
 upstreams, with DO and CD set. Zone keys are cached, so the cost falls on the
 first query into a zone and not the ones after it.
+
+`max_cached_zones` is how many zones that cache holds — an apex's keys, or the
+fact that an apex is unsigned. Zero, the default, is 4096, which covers the
+hierarchy a busy forwarder touches with room to spare; a household resolver never
+fills it. It is exposed because it is the one dial on how much memory validation
+may hold: a zone's keys are capped at 8 KB of RDATA whatever it publishes, and
+an entry costs about 12 KB at worst once the key structs, the entry and the name
+are counted — so the ceiling is that times this number, about 48 MB at the
+default. A box that must keep validation inside a slice of its memory sets it
+here; raising it above 4096 logs the figure the new number implies. Past the
+bound the coldest zone is dropped, one at a time — so a number that is too small
+costs chain walks for the zones that fell out, and nothing else. There is no
+reason to raise it above the default unless the resolver genuinely sees more
+zones than that; the memory is the cost.
+
+What a flood of fresh delegations cannot do is take everybody else's keys with
+it. The root, the TLDs and whatever else is in steady use are read at the start of
+every walk, which keeps them at the warm end of the cache, while each single-use
+name the flood inserts displaces only the coldest thing there. Up to 0.18.0 the
+full cache was emptied wholesale instead, so 4096 names of one client's choosing
+cost every other client a re-walk from the root.
 
 | | |
 |---|---|
@@ -1057,7 +1079,7 @@ first query into a zone and not the ones after it.
 | denial of existence | NSEC and NSEC3, including closest-encloser proofs and opt-out |
 | wildcards | a wildcard answer must come with a proof that the name had nothing of its own |
 | unsigned zones | insecure: served, no AD bit |
-| bounds | 32 DS/DNSKEY lookups and 64 signature checks per question, 24 zone cuts of chain, 8 signatures per RRset, 64 keys per zone, 8 hint targets per answer, 100 NSEC3 iterations |
+| bounds | 32 DS/DNSKEY lookups and 64 signature checks per question, 24 zone cuts of chain, 8 signatures per RRset, 64 keys per zone and 8 KB of them cached, 8 hint targets per answer, 100 NSEC3 iterations |
 | a DS set naming nothing we can check | an insecure delegation, whether the algorithm is unimplemented here or refused by the host's crypto policy — RFC 6840 section 5.2 |
 | a DS set naming something we can check | that path has to hold up: a DNSKEY set it does not lead to is bogus, however many uncheckable DS records sit beside it |
 | bad signature, broken chain, missing proof | SERVFAIL, with an extended DNS error (RFC 8914) saying which |
@@ -2214,6 +2236,7 @@ as a warning at startup.
 | `elodin_rate_limit_slipped_total` | counter | those answered truncated instead, to send a real client to TCP |
 | `elodin_dnssec_answers_total{result}` | counter | `secure` and `bogus` |
 | `elodin_dnssec_queries_shed_total` | counter | questions whose chain-of-trust walk stopped short of an upstream, because `dnssec.max_chain_walks` were already waiting on one; one per question. Rising alongside SERVFAIL means the shedding is this server's, not an upstream going away — but it cannot tell an attack from honest saturation, and a slow upstream reaches it too. See `dnssec.max_chain_walks` |
+| `elodin_dnssec_oversized_key_sets_total` | counter | DNSKEY sets the zone cache declined to store, being larger than the 8 KB one zone may hold. Not a fault: the answer still validated, and what is lost is the caching, so every question about such a zone walks the chain again. A rising figure is a zone that has published something extraordinary, or somebody making the point — see `dnssec.max_cached_zones` |
 | `elodin_rebind_refused_total` | counter | answers withheld because a public name was pointed into private space |
 | `elodin_special_use_total` | counter | queries answered from the reserved-name table instead of being forwarded |
 | `elodin_cache_entries` / `_bytes` | gauge | what the cache holds, against `max_entries` and `max_bytes` |
