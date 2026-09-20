@@ -320,7 +320,61 @@ dr_validator :: proc(calls: ^Dr_Calls) -> ^Validator {
 	}
 	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
 	anchors[0] = anchor
-	return make_validator(dr_query, calls, Options{anchors = anchors})
+	v := make_validator(dr_query, calls, Options{anchors = anchors})
+	// A fixed seed makes the hash table deterministic, so no pair of names
+	// these tests use lands on the same slot.  Without this, the random seed
+	// drawn at start-up can produce a collision that evicts a name mid-walk
+	// and changes the verdict from what the test asserts - see issue #362.
+	//
+	// Seed 0 is chosen as the simplest constant basis; modulo 1024, the eight
+	// labels of DR_QNAME below the apex and DR_SUB_QNAME map to:
+	//   l8: 1002, l7: 587, l6: 771, l5: 748, l4: 438,
+	//   l3: 775,  l2: 11,  l1: 964, sub: 664.
+	// All nine slots are distinct.
+	v.non_cut_seed = 0
+	return v
+}
+
+@(test)
+test_dr_fixture_names_do_not_collide_in_non_cut_table :: proc(t: ^testing.T) {
+	/*
+	Issue #362: tests in this file assume that warming the run leaves the
+	walk with nothing to insert, which requires that DR_SUB_QNAME and the eight
+	labels of DR_QNAME never collide in the 1024-slot non_cuts table.
+	This test guards that invariant so any future name addition or change
+	that collides with the seed fails here directly rather than flaking CI.
+	*/
+	v := dr_validator(nil)
+	defer destroy_validator(v)
+
+	slots: [dynamic]int
+	defer delete(slots)
+
+	// The 8 labels below the apex:
+	for i in 1 ..= 8 {
+		name := name_drop_labels(DR_QNAME, 9 - i)
+		slot := non_cut_slot(v, name)
+		for existing in slots {
+			testing.expectf(
+				t,
+				existing != slot,
+				"hash collision in non_cut table: %s maps to existing slot %d",
+				name,
+				slot,
+			)
+		}
+		append(&slots, slot)
+	}
+
+	sub_slot := non_cut_slot(v, DR_SUB_QNAME)
+	for existing in slots {
+		testing.expectf(
+			t,
+			existing != sub_slot,
+			"hash collision in non_cut table: DR_SUB_QNAME maps to existing slot %d",
+			sub_slot,
+		)
+	}
 }
 
 @(test)
@@ -689,6 +743,11 @@ test_a_delegation_at_a_remembered_name_heals_on_the_next_question :: proc(t: ^te
 		"while the memo holds the name the walk cannot reach the zone, so the answer is refused, got %v",
 		first.status,
 	)
+	testing.expect(
+		t,
+		!dr_remembered(v, DR_SUB_QNAME, now),
+		"the refused question should have given the name back",
+	)
 
 	second := validate(v, DR_SUB_QNAME, .A, dr_fixture("dr_sub_answer"), now)
 	testing.expectf(
@@ -731,6 +790,11 @@ test_a_denial_from_a_delegation_at_a_remembered_name_heals_too :: proc(t: ^testi
 		first.status == .Bogus,
 		"while the table holds the name the proof comes from a zone the walk did not reach, got %v",
 		first.status,
+	)
+	testing.expect(
+		t,
+		!dr_remembered(v, DR_SUB_QNAME, now),
+		"the refused question should have given the name back",
 	)
 
 	second := validate(v, DR_SUB_QNAME, .AAAA, dr_fixture("dr_sub_nodata"), now)
