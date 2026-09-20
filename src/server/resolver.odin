@@ -285,7 +285,21 @@ handle_query :: proc(
 		return nil, .Failed, false
 	}
 
-	msg, derr := dns.decode_message(query, allocator)
+	/*
+	What this request may expand names into, across every message it reads.
+
+	Owned here because this is where the arena's life is: `allocator` is the
+	per-request scratch the caller drops once the answer is on the wire, and
+	every reading below - the client's query, the upstream's reply twice over,
+	the re-encode for the client's limit, and one per step of the validator's
+	chain walk - allocates into it. `dns.NAME_BUDGET` bounds one of those
+	readings and a request holds about thirty-five, so without this the bound is
+	the reading's and the arena's is thirty-five times larger. See
+	`dns.REQUEST_NAME_BUDGET` and issue #354.
+	*/
+	name_bytes: int
+
+	msg, derr := dns.decode_message(query, allocator, &name_bytes)
 	limit := response_limit(s, msg, proto)
 	advertise := advertised_udp_size(s, msg, proto)
 	if derr != .None {
@@ -389,6 +403,7 @@ handle_query :: proc(
 			limit,
 			cookie,
 			started,
+			&name_bytes,
 			allocator,
 			shared_worker,
 		)
@@ -409,13 +424,13 @@ handle_query :: proc(
 		upstream's on exactly two of these paths and this server's own on the
 		rest; see `match_client_opt`, where the difference is argued.
 		*/
-		response = match_client_opt(response, msg, advertise, limit, outcome, allocator)
-		response = attach_cookie(s.cookies, response, cookie, msg, limit, advertise, allocator)
+		response = match_client_opt(response, msg, advertise, limit, outcome, &name_bytes, allocator)
+		response = attach_cookie(s.cookies, response, cookie, msg, limit, advertise, &name_bytes, allocator)
 		// And this server's idle timeout, for a client on a connection that
 		// asked what it is. It writes into the same record the cookie does, so
 		// it sits behind that and ahead of everything below which measures the
 		// result; `attach_keepalive` argues the three conditions on it.
-		response = attach_keepalive(s, response, msg, proto, limit, advertise, allocator)
+		response = attach_keepalive(s, response, msg, proto, limit, advertise, &name_bytes, allocator)
 		/*
 		Last, so that nothing after it can put another number back.
 
@@ -643,6 +658,7 @@ match_client_opt :: proc(
 	advertise: u16,
 	limit: int,
 	outcome: Outcome,
+	names: ^int,
 	allocator: mem.Allocator,
 ) -> []u8 {
 	if len(wire) < dns.HEADER_SIZE {
@@ -650,7 +666,7 @@ match_client_opt :: proc(
 	}
 
 	if dns.edns_present(query) {
-		out, ok := dns.ensure_opt(wire, advertise, allocator)
+		out, ok := dns.ensure_opt(wire, advertise, allocator, names)
 		/*
 		A record that will not fit is a record not minted; see above.
 
@@ -667,8 +683,8 @@ match_client_opt :: proc(
 		// On both, so that an answer whose mint was abandoned is still answered
 		// in this server's own version if it turned out to have a record after
 		// all, and so that nothing is left resting on which of the two returned.
-		out = normalise_client_opt(out, query, outcome, allocator)
-		return fit_response(out, limit, query, allocator)
+		out = normalise_client_opt(out, query, outcome, names, allocator)
+		return fit_response(out, limit, query, names, allocator)
 	}
 
 	/*
@@ -693,15 +709,15 @@ match_client_opt :: proc(
 		// inside it is still this server's to own - the same normalisation the
 		// EDNS branch runs, on the one answer this branch does not strip the
 		// record from.
-		return fit_response(normalise_client_opt(wire, query, outcome, allocator), limit, query, allocator)
+		return fit_response(normalise_client_opt(wire, query, outcome, names, allocator), limit, query, names, allocator)
 	}
 
-	out, ok := dns.remove_opt(wire, allocator)
+	out, ok := dns.remove_opt(wire, allocator, names)
 	if !ok {
 		// The record stays after all, so its contents are owned as above.
-		out = normalise_client_opt(wire, query, outcome, allocator)
+		out = normalise_client_opt(wire, query, outcome, names, allocator)
 	}
-	return fit_response(out, limit, query, allocator)
+	return fit_response(out, limit, query, names, allocator)
 }
 
 /*
@@ -848,12 +864,13 @@ normalise_client_opt :: proc(
 	wire: []u8,
 	query: dns.Message,
 	outcome: Outcome,
+	names: ^int,
 	allocator: mem.Allocator,
 ) -> []u8 {
 	out := wire
 	switch outcome {
 	case .Forwarded, .Cached:
-		if stripped, ok := dns.strip_edns_options(wire, allocator); ok {
+		if stripped, ok := dns.strip_edns_options(wire, allocator, names); ok {
 			out = stripped
 		}
 	/*
@@ -1041,6 +1058,9 @@ resolve_query :: proc(
 	limit: int,
 	cookie: Cookie_Request,
 	started: time.Time,
+	// This request's name-expansion counter, owned by `handle_query`, which
+	// owns the arena everything here reads into. See `dns.REQUEST_NAME_BUDGET`.
+	names: ^int,
 	allocator: mem.Allocator,
 	// See `handle_query`: whether a worker of the shared pool is what this is
 	// holding.
@@ -1309,7 +1329,7 @@ resolve_query :: proc(
 				checked = generation,
 			}
 			if !hit.stale {
-				return serve_from_cache(s, stored, query, msg, q, proto, client, limit, validating, started, allocator)
+				return serve_from_cache(s, stored, query, msg, q, proto, client, limit, validating, started, names, allocator)
 			}
 			stale_hit = stored
 		}
@@ -1340,7 +1360,7 @@ resolve_query :: proc(
 	*/
 	if !msg.flags.rd {
 		if stale_hit.wire != nil {
-			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, allocator)
+			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, names, allocator)
 		}
 		out, built := dns.error_response(query, msg, .Refused, allocator, limit)
 		log_query(s, client, proto, q, .Refused, "rd", started)
@@ -1421,7 +1441,7 @@ resolve_query :: proc(
 	upstreams, which never carry a cookie of ours, whenever the first one was.
 	*/
 	if cookie.sent {
-		stripped, done := dns.remove_edns_option(forwarded, .Cookie, allocator)
+		stripped, done := dns.remove_edns_option(forwarded, .Cookie, allocator, names)
 		if !done {
 			/*
 			Failing closed. A query this server cannot take the cookie back out
@@ -1497,7 +1517,7 @@ resolve_query :: proc(
 	removal that reported success; see `edns_opt_readable`.
 	*/
 	if edns_option_sent(msg, .Client_Subnet) {
-		stripped, done := dns.remove_edns_option(forwarded, .Client_Subnet, allocator)
+		stripped, done := dns.remove_edns_option(forwarded, .Client_Subnet, allocator, names)
 		if !done {
 			/*
 			Failing closed, as the cookie above does, and for a reason that
@@ -1560,7 +1580,7 @@ resolve_query :: proc(
 	not this strip runs.
 	*/
 	if edns_option_sent(msg, .TCP_Keepalive) {
-		stripped, done := dns.remove_edns_option(forwarded, .TCP_Keepalive, allocator)
+		stripped, done := dns.remove_edns_option(forwarded, .TCP_Keepalive, allocator, names)
 		if !done {
 			/*
 			Failing closed, as both strips above do, and deliberately out of
@@ -1866,7 +1886,7 @@ resolve_query :: proc(
 		`settled` is the second half of the same reading, and it decides only
 		whether the route's answer is kept: see the store below.
 		*/
-		proved, settled := parent_answers_apex_ds(resp, q.name, uerr == .None, allocator)
+		proved, settled := parent_answers_apex_ds(resp, q.name, uerr == .None, names, allocator)
 		/*
 		And what it managed to say is remembered, for the next query rather than
 		for this one. Settled or not is the whole of it - no answer is kept, and
@@ -1985,11 +2005,11 @@ resolve_query :: proc(
 	each exchange is a new one on the wire (RFC 5452 section 9.2).
 	*/
 	if memoised_parent != nil {
-		route_proved, _ := parent_answers_apex_ds(resp, q.name, uerr == .None, allocator)
+		route_proved, _ := parent_answers_apex_ds(resp, q.name, uerr == .None, names, allocator)
 		if !route_proved {
 			dns.set_id_in_place(forwarded, dns.random_id())
 			again, second, perr := upstream.resolve_answerable(memoised_parent, forwarded, allocator)
-			proved, settled := parent_answers_apex_ds(again, q.name, perr == .None, allocator)
+			proved, settled := parent_answers_apex_ds(again, q.name, perr == .None, names, allocator)
 			remember_apex_ds_parent(s, q.name, perr == .None, settled)
 			/*
 			And whether what is served from here is kept turns on what the parent
@@ -2023,7 +2043,7 @@ resolve_query :: proc(
 		decided here.
 		*/
 		if stale_hit.wire != nil {
-			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, allocator)
+			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, names, allocator)
 		}
 		sync.atomic_add(&s.stats.failed, 1)
 		out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
@@ -2070,6 +2090,7 @@ resolve_query :: proc(
 			time.now(),
 			allocator,
 			shared_worker = shared_worker,
+			names = names,
 		)
 		#partial switch result.status {
 		case .Bogus, .Indeterminate:
@@ -2115,13 +2136,13 @@ resolve_query :: proc(
 			from := answering_upstream(winner)
 			report_bogus(q, client, result, from, shed)
 			out, built := dnssec_failure_response(msg, result, allocator, limit)
-			remember_bogus_verdict(s, verdict_key, msg, result, unproven_apex_ds, allocator)
+			remember_bogus_verdict(s, verdict_key, msg, result, unproven_apex_ds, names, allocator)
 			log_query(s, client, proto, q, .Failed, fmt.tprintf("dnssec:%s", from), started)
 			return out, .Failed, built
 		case .Secure:
 			sync.atomic_add(&s.stats.secure, 1)
 		}
-		resp = present_response(resp, msg, q.type, result, allocator)
+		resp = present_response(resp, msg, q.type, result, names, allocator)
 	}
 
 	/*
@@ -2204,7 +2225,7 @@ resolve_query :: proc(
 	walking := s.cfg.blocking.enabled && s.filters != nil
 	decoded: Decoded_Answer
 	if s.cfg.cache.enabled || walking || checking_rebind {
-		decoded = decode_answer(resp, walking || checking_rebind, allocator)
+		decoded = decode_answer(resp, walking || checking_rebind, names, allocator)
 	}
 
 	/*
@@ -2519,22 +2540,37 @@ the message. Measured, a 64 KB reply built to spend the budget costs 2,031,200
 bytes across the pair, against the 8,550,616 one reading of it reached before
 there was a budget at all.
 
-That is this procedure's figure and not the request's. The budget is per
-reading, and a request may hold many into the one arena: `fit_response` reads
-this wire again when it passes the client's limit, and the validator reads a
-reply of its own for each chain step, up to `dnssec.MAX_LOOKUPS_PER_QUERY` of
-them. A signed zone answering every step with a full-length name bomb therefore
-still reaches tens of megabytes in one request - far under the hundreds it
-reached before, and not the same thing as bounded. Issue #354 is the counter
-that would make it so. One budget across the pair was the other way to do it and
-costs more than it saves: a reply large enough for the first reading to spend
-most of the budget would lose the shorter reading as well, which is refusing an
-answer this server had no opinion about, and that is the thing the shorter
-reading exists to stop.
+That is this procedure's figure and not the request's, and the request has one
+of its own: `names` is `handle_query`'s counter against
+`dns.REQUEST_NAME_BUDGET`, which every reading the request makes charges - these
+two, `fit_response`'s when the answer passes the client's limit, and the
+validator's one per chain step, up to `dnssec.MAX_LOOKUPS_PER_QUERY` of them.
+Without it a signed zone answering every step with a full-length name bomb
+reached about 22 MB of names in one in-flight request, which is issue #354.
+
+One budget in place of the pair's two was the other way to do it and costs more
+than it saves: a reply large enough for the first reading to spend most of the
+budget would lose the shorter reading as well, which is refusing an answer this
+server had no opinion about, and that is the thing the shorter reading exists to
+stop. So both bounds are kept, and the request's is several times the reading's
+rather than equal to it - see `dns.REQUEST_NAME_BUDGET`.
+
+What neither bounds is the record arrays and the RDATA copies, which are a fixed
+multiple of each message read and so a per-reading multiple in the way the names
+no longer are. A reading that finds the request's budget already spent is
+refused before it allocates anything, which is what keeps that multiple from
+running the whole length of a chain walk.
 */
 @(private)
-decode_answer :: proc(resp: []u8, answer_section: bool, allocator: mem.Allocator) -> (out: Decoded_Answer) {
-	whole, err := dns.decode_message(resp, allocator)
+decode_answer :: proc(
+	resp: []u8,
+	answer_section: bool,
+	names: ^int,
+	allocator: mem.Allocator,
+) -> (
+	out: Decoded_Answer,
+) {
+	whole, err := dns.decode_message(resp, allocator, names)
 	if err == .None {
 		out.msg, out.full = whole, true
 		return out
@@ -2543,7 +2579,7 @@ decode_answer :: proc(resp: []u8, answer_section: bool, allocator: mem.Allocator
 	if !answer_section {
 		return out
 	}
-	answer, answer_err := dns.decode_through_answer(resp, allocator)
+	answer, answer_err := dns.decode_through_answer(resp, allocator, names)
 	if answer_err == .None {
 		out.msg, out.partial = answer, true
 	} else {
@@ -2860,6 +2896,7 @@ remember_bogus_verdict :: proc(
 	msg: dns.Message,
 	result: dnssec.Result,
 	unproven_apex_ds: bool,
+	names: ^int,
 	allocator: mem.Allocator,
 ) {
 	if !s.cfg.cache.enabled || result.status != .Bogus || unproven_apex_ds {
@@ -2879,7 +2916,7 @@ remember_bogus_verdict :: proc(
 	if !built {
 		return
 	}
-	refusal, derr := dns.decode_message(wire, allocator)
+	refusal, derr := dns.decode_message(wire, allocator, names)
 	if derr != .None {
 		return
 	}
@@ -2965,6 +3002,9 @@ serve_from_cache :: proc(
 	limit: int,
 	validating: bool,
 	started: time.Time,
+	// The request's name counter; the entry is decoded again here. See
+	// `dns.REQUEST_NAME_BUDGET`.
+	names: ^int,
 	allocator: mem.Allocator,
 ) -> (
 	response: []u8,
@@ -3031,7 +3071,7 @@ serve_from_cache :: proc(
 		// `cache.put` checks: `put` never decodes, it takes an already-decoded
 		// message and trusts it to describe the bytes beside it. A third store
 		// written without that guard would break this quietly.
-		if stored, derr := dns.decode_message(hit.wire, allocator); derr == .None {
+		if stored, derr := dns.decode_message(hit.wire, allocator, names); derr == .None {
 			if out, verdict := block_cloaked_answer(
 				s,
 				stored.answer,
@@ -3163,12 +3203,18 @@ record changes it first and fits second. See `match_client_opt`, which is where
 both happen, and issue #281.
 */
 @(private)
-fit_response :: proc(wire: []u8, limit: int, query: dns.Message, allocator: mem.Allocator) -> []u8 {
+fit_response :: proc(
+	wire: []u8,
+	limit: int,
+	query: dns.Message,
+	names: ^int,
+	allocator: mem.Allocator,
+) -> []u8 {
 	if len(wire) <= limit {
 		return wire
 	}
 	report_udp_ceiling(wire, limit, query)
-	if decoded, err := dns.decode_message(wire, allocator); err == .None {
+	if decoded, err := dns.decode_message(wire, allocator, names); err == .None {
 		if out, _, enc_err := dns.encode_message(decoded, allocator, limit); enc_err == .None {
 			return out
 		}
@@ -3193,6 +3239,13 @@ fit_response :: proc(wire: []u8, limit: int, query: dns.Message, allocator: mem.
 	which is the same answer one byte too large would get and costs the client a
 	round trip rather than an answer. That is the trade a budget is: the reply
 	has to be read to be cut down, and reading it is what was refused.
+
+	`dns.REQUEST_NAME_BUDGET` arrives here by the same road and gets the same
+	answer: a request that has already spent what it may expand names into
+	cannot read this reply either, whatever the reply itself costs. That is why
+	the request's figure is several times the reading's - the readings before
+	this one have to be able to spend theirs without taking the client's answer
+	down to a retry.
 
 	The client is told to ask again over TCP, where the address is proven and the
 	whole answer fits - and where the decode is not attempted at all, since the

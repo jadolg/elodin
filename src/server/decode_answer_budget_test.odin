@@ -66,7 +66,7 @@ budget_ceiling :: proc(msg_len: int) -> int {
 read_answer :: proc(msg: []u8, arena: ^mem.Arena) -> Decoded_Answer {
 	backing := make([]u8, 16 << 20)
 	mem.arena_init(arena, backing)
-	return decode_answer(msg, true, mem.arena_allocator(arena))
+	return decode_answer(msg, true, nil, mem.arena_allocator(arena))
 }
 
 @(private = "file")

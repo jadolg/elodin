@@ -387,6 +387,9 @@ present_response :: proc(
 	query: dns.Message,
 	qtype: dns.Type,
 	result: dnssec.Result,
+	// The request's name counter: both rebuilds below read this response again,
+	// into the same arena. See `dns.REQUEST_NAME_BUDGET`.
+	names: ^int,
 	allocator: mem.Allocator,
 ) -> []u8 {
 	out := wire
@@ -401,7 +404,7 @@ present_response :: proc(
 		outright would let a message we merely failed to re-encode take down a
 		name that validated perfectly well.
 		*/
-		if pruned, ok := dnssec.strip_unauthenticated(out, result, allocator, dns.MAX_MESSAGE); ok {
+		if pruned, ok := dnssec.strip_unauthenticated(out, result, allocator, dns.MAX_MESSAGE, names); ok {
 			out = pruned
 		} else {
 			/*
@@ -449,7 +452,7 @@ present_response :: proc(
 		buffer would then be all any later client could be given. Shrinking to
 		fit is `fit_response`'s job, once per client.
 		*/
-		out = strip_dnssec_records(out, query, qtype, allocator, dns.MAX_MESSAGE)
+		out = strip_dnssec_records(out, query, qtype, names, allocator, dns.MAX_MESSAGE)
 	}
 	/*
 	AD records the verdict, not the audience. This message may end up in the
@@ -535,10 +538,11 @@ strip_dnssec_records :: proc(
 	wire: []u8,
 	query: dns.Message,
 	qtype: dns.Type,
+	names: ^int,
 	allocator: mem.Allocator,
 	limit: int,
 ) -> []u8 {
-	msg, err := dns.decode_message(wire, allocator)
+	msg, err := dns.decode_message(wire, allocator, names)
 	if err != .None {
 		return wire
 	}

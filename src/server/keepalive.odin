@@ -112,6 +112,9 @@ attach_keepalive :: proc(
 	proto: Protocol,
 	limit: int,
 	advertise: u16,
+	// The request's name counter, for the rebuild the option may need. See
+	// `dns.REQUEST_NAME_BUDGET`.
+	names: ^int,
 	allocator: mem.Allocator,
 ) -> []u8 {
 	if proto != .TCP && proto != .DoT {
@@ -136,7 +139,7 @@ attach_keepalive :: proc(
 	caller - on these transports it is the client's own figure, which is the only
 	number available where this server has no datagram ceiling to state.
 	*/
-	out, ok := dns.ensure_edns_option(wire, .TCP_Keepalive, value[:], advertise, allocator)
+	out, ok := dns.ensure_edns_option(wire, .TCP_Keepalive, value[:], advertise, allocator, names)
 	if !ok || len(out) > limit {
 		return wire
 	}

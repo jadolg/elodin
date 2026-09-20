@@ -117,7 +117,7 @@ test_fit_response_never_exceeds_the_limit :: proc(t: ^testing.T) {
 		junk[i] = 0xff
 	}
 
-	out := fit_response(junk, config.DEFAULT_MAX_UDP_RESPONSE, query, context.temp_allocator)
+	out := fit_response(junk, config.DEFAULT_MAX_UDP_RESPONSE, query, nil, context.temp_allocator)
 	testing.expectf(
 		t,
 		len(out) <= config.DEFAULT_MAX_UDP_RESPONSE,
