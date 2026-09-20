@@ -18,12 +18,12 @@ long_wire_name :: proc() -> []u8 {
 	return out[:]
 }
 
-@(private = "file")
+@(private)
 put_header :: proc(buf: ^[dynamic]u8, ancount: u16) {
 	append(buf, 0x12, 0x34, 0x81, 0x80, 0, 1, u8(ancount >> 8), u8(ancount), 0, 0, 0, 0)
 }
 
-@(private = "file")
+@(private)
 put_u16 :: proc(buf: ^[dynamic]u8, v: u16) {
 	append(buf, u8(v >> 8), u8(v))
 }
@@ -143,7 +143,7 @@ test_unwalkable_raw_rdata_stays_within_the_name_budget :: proc(t: ^testing.T) {
 	)
 }
 
-@(private = "file")
+@(private)
 decode_into_arena :: proc(msg: []u8) -> (used: int, err: Decode_Error) {
 	// Enough for the unbudgeted shapes these fixtures reach when the budget is
 	// taken out to check that they still do - 11.4 MB is the largest - and not
@@ -167,12 +167,12 @@ arena holds, which is what is measured here. Twenty-four times over covers the
 shapes below, which cost a hundred and thirty times their own length and more
 with nothing bounding the names.
 
-It is not a ceiling on the decoder. Names are not its only expansion: a TXT
-record of 65 KB of zero-length character-strings decodes to 32 times its own
-length through the retained `[dynamic]string`, which this budget does not touch
-and issue #351 covers.
+Not a ceiling the budget alone holds. Names are not the decoder's only
+expansion - the lists TXT and OPT hold reach a multiple of their own through the
+element they keep, which `rdata_expansion_test.odin` measures - but the figure
+covers every shape either file builds.
 */
-@(private = "file")
+@(private)
 DECODE_CEILING :: 24
 
 @(test)

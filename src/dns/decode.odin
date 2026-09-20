@@ -353,15 +353,41 @@ decode_rdata :: proc(
 		return v, .None
 
 	case .TXT, .SPF:
-		parts := make([dynamic]string, 0, 2, allocator)
-		for r.pos < end {
-			s := r_char_string(r, allocator) or_return
-			append(&parts, s)
+		/*
+		Counted before anything is taken, so the list is allocated once at the
+		size the wire asks for.
+
+		These used to be collected into a `[dynamic]string` that started at two
+		and doubled, and a caller serving a query hands this decoder an arena,
+		which does not give back the buffers a doubling walks past. A
+		<character-string> may be zero bytes long, so one length byte buys a
+		16-byte `string` header - sixteen times its wire length on its own, and
+		thirty-two with the doubling behind it, which is more than the budget
+		above permits for the shapes it does bound. The count is on the wire
+		either way: follow the length bytes and stop at the RDATA's end. Issue
+		#351.
+
+		An element running past the RDATA is refused here rather than half way
+		through the read, which is the same refusal by a shorter route. The read
+		reached `.Short_Buffer` or the end-of-RDATA check below, and either way
+		`decode_record` keeps the record as raw bytes rather than rejecting the
+		message - which it still does.
+		*/
+		count := 0
+		for p := start; p < end; count += 1 {
+			p += 1 + int(r.msg[p])
+			if p > end {
+				return nil, .Bad_Rdata
+			}
+		}
+		parts := make([]string, count, allocator)
+		for i in 0 ..< count {
+			parts[i] = r_char_string(r, allocator) or_return
 		}
 		if r.pos != end {
 			return nil, .Bad_Rdata
 		}
-		return Rdata_TXT{strings = parts[:]}, .None
+		return Rdata_TXT{strings = parts}, .None
 
 	case .SRV:
 		v: Rdata_SRV
@@ -398,20 +424,26 @@ decode_rdata :: proc(
 		return v, .None
 
 	case .OPT:
-		opts := make([dynamic]EDNS_Option, 0, 2, allocator)
-		for r.pos + 4 <= end {
-			code := r_u16(r) or_return
-			olen := int(r_u16(r) or_return)
-			if r.pos + olen > end {
+		// Counted first, for the reason written at TXT above: an option is four
+		// wire bytes at its smallest and twenty-four in memory, which the
+		// doubling took to twelve times the wire.
+		count := 0
+		for p := start; p + 4 <= end; count += 1 {
+			p += 4 + (int(r.msg[p + 2]) << 8 | int(r.msg[p + 3]))
+			if p > end {
 				return nil, .Bad_Rdata
 			}
-			odata := r_bytes(r, olen, allocator) or_return
-			append(&opts, EDNS_Option{code = code, data = odata})
+		}
+		opts := make([]EDNS_Option, count, allocator)
+		for i in 0 ..< count {
+			opts[i].code = r_u16(r) or_return
+			olen := int(r_u16(r) or_return)
+			opts[i].data = r_bytes(r, olen, allocator) or_return
 		}
 		if r.pos != end {
 			return nil, .Bad_Rdata
 		}
-		return Rdata_OPT{options = opts[:]}, .None
+		return Rdata_OPT{options = opts}, .None
 	}
 
 	return decode_raw_rdata(r, type, start, end, allocator), .None

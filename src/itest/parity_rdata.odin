@@ -95,6 +95,13 @@ pm_rdata :: proc(r: ^Pg_Rand, qtype: u16, allocator: mem.Allocator) -> []u8 {
 		// empty one is legal and the one a length-prefix walker gets wrong.
 		pm_char_string(&buf, "")
 		pm_char_string(&buf, "v=parity1 shape=txt")
+		// A run of them, because the decoder now sizes its list from a count it
+		// takes off the wire before it reads anything (issue #351): a count that
+		// disagreed with the read by one would show up here as a record the
+		// upstream and elodin describe differently.
+		for _ in 0 ..< 64 {
+			pm_char_string(&buf, "")
+		}
 		long := make([]u8, 255, allocator)
 		for i in 0 ..< 255 {
 			long[i] = 'x'

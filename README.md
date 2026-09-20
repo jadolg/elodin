@@ -2611,10 +2611,11 @@ It runs in two modes, and they are not equally strong:
 - **Against a synthetic upstream**, the reference is the very message elodin was
   handed — a mock that answers any name and type deterministically from a zone
   built to hold the awkward constructs (a compressed name inside the RDATA of
-  every type that may carry one, character-strings empty and full-length, TTLs at
-  both ends of their range, unassigned types with opaque RDATA, answers too large
-  for a datagram, an OPT carrying a cookie and an NSID at once). Hermetic and
-  reproducible, so a divergence here is elodin's and nobody else's.
+  every type that may carry one, character-strings empty, full-length and in a
+  run long enough to catch a miscounted list, TTLs at both ends of their range,
+  unassigned types with opaque RDATA, answers too large for a datagram, an OPT
+  carrying a cookie and an NSID at once). Hermetic and reproducible, so a
+  divergence here is elodin's and nobody else's.
 - **Against a real resolver** (`--parity-upstream 1.1.1.1:53`), the reference is
   a second, byte-identical query put straight to it, retried over TCP if the
   datagram would not hold the answer. Weaker by construction — a real resolver

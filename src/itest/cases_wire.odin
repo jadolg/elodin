@@ -13,6 +13,38 @@ resolver produced reaches the client unaltered, including compression pointers,
 DNSSEC records and types the codec has no case for.
 */
 
+/*
+A TXT record whose RDATA is nothing but length bytes of zero.
+
+The shape from issue #351: a `<character-string>` may be zero bytes long, so one
+wire byte is one whole string, and 65,000 of them are well formed and legal.
+The decoder used to collect them into a doubling `[dynamic]string`, which under
+the arena a request is served from cost 32 times the record's own length; it
+counts them off the wire and allocates the list once now. What this checks is
+that counting them did not change what comes back - the record has to survive the
+trip byte for byte, and `fit_response` has to still be able to read it.
+*/
+@(private = "file")
+EMPTY_STRINGS_COUNT :: 65000
+
+@(private = "file")
+empty_character_strings_answer :: proc(name: string, allocator := context.allocator) -> []u8 {
+	strs := make([]string, EMPTY_STRINGS_COUNT, context.temp_allocator)
+	m := dns.Message {
+		question = []dns.Question{{name = name, type = .TXT, class = .IN}},
+		answer = []dns.Record {
+			{name = name, type = .TXT, class = .IN, ttl = 300, data = dns.Rdata_TXT{strings = strs}},
+		},
+	}
+	m.flags.qr = true
+	m.flags.ra = true
+	wire, truncated, err := dns.encode_message(m, allocator, dns.MAX_MESSAGE)
+	if err != .None || truncated {
+		return nil
+	}
+	return wire
+}
+
 @(private = "file")
 config_passthrough :: proc(udp_port, upstream_port: int) -> string {
 	return fmt.tprintf(
@@ -80,6 +112,17 @@ run_wire_cases :: proc(r: ^Runner) {
 	for f in FIXTURES {
 		mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
 	}
+	// Too large for any UDP reply, so the mock answers TC over UDP and serves
+	// the record itself when elodin comes back over TCP - the way an upstream
+	// with a big answer actually behaves.
+	empty_strings := empty_character_strings_answer("manystrings.wire.test.")
+	defer delete(empty_strings)
+	if empty_strings == nil {
+		skip_case(r, "wire", "cannot build the empty-character-string answer")
+		return
+	}
+	mock_truncate_udp(mock, "manystrings.wire.test.", u16(dns.Type.TXT), empty_strings)
+
 	if !mock_start(mock) {
 		skip_case(r, "wire", "cannot start the mock upstream")
 		return
@@ -270,6 +313,52 @@ run_wire_cases :: proc(r: ^Runner) {
 			h := parse_header(r, res.wire)
 			check(r, !h.tc, "TC set on a TCP reply")
 			check_eq_int(r, h.ancount, f.ancount, "answer count")
+		}
+	}
+	end_case(r)
+
+	start_case(r, fmt.tprintf("wire: a TXT record of %d empty character-strings survives over TCP", EMPTY_STRINGS_COUNT))
+	{
+		query := build_query("manystrings.wire.test.", u16(dns.Type.TXT))
+		res := query_tcp(udp_port, query)
+		if check(r, res.ok, "no response") {
+			msg, err := dns.decode_message(res.wire, context.temp_allocator)
+			if check(r, err == .None, "the response does not decode: %v", err) {
+				if check_eq_int(r, len(msg.answer), 1, "answer records") {
+					txt, is_txt := msg.answer[0].data.(dns.Rdata_TXT)
+					if check(r, is_txt, "the record came back as %v, not a TXT", msg.answer[0].data) {
+						check_eq_int(r, len(txt.strings), EMPTY_STRINGS_COUNT, "character-strings")
+						empty := true
+						for s in txt.strings {
+							if len(s) != 0 {
+								empty = false
+							}
+						}
+						check(r, empty, "a character-string came back with bytes in it")
+					}
+				}
+			}
+			// And byte for byte, since what the upstream sent is what a client
+			// asking a passthrough server has to get.
+			if check(r, len(res.wire) == len(empty_strings), "length: got %d, want %d", len(res.wire), len(empty_strings)) {
+				check(r, bytes_equal(res.wire[2:], empty_strings[2:]), "payload differs from what the upstream sent")
+			}
+		}
+	}
+	end_case(r)
+
+	start_case(r, "wire: the same record is truncated rather than refused for a 512-byte client")
+	{
+		// `fit_response` decodes the upstream's reply to cut it down, so this is
+		// the counting pass on the path a request actually takes.
+		query := build_query("manystrings.wire.test.", u16(dns.Type.TXT))
+		res := query_udp(udp_port, query)
+		if check(r, res.ok, "no response") {
+			h := parse_header(r, res.wire)
+			check(r, h.tc, "the TC bit was not set")
+			check(r, len(res.wire) <= 512, "response is %d bytes, over the 512 limit", len(res.wire))
+			check_eq_int(r, h.qdcount, 1, "question count in a truncated reply")
+			check_eq_int(r, h.rcode, 0, "rcode")
 		}
 	}
 	end_case(r)
