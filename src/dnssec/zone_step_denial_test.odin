@@ -118,7 +118,7 @@ test_a_denial_of_a_name_that_is_not_there_ends_the_walk :: proc(t: ^testing.T) {
 	testing.expect_value(t, nsec3_step, Step.Absent)
 
 	// And NSEC, where the same span answers for every name inside it, so the
-	// walk would otherwise keep going label by label to `MAX_CHAIN_DEPTH`.
+	// walk would otherwise keep going label by label to the bottom of the name.
 	nsecs := []Nsec_Rr {
 		nsec_rr_of("example.", "a.example.", {.NS, .SOA, .RRSIG, .NSEC, .DNSKEY}),
 		nsec_rr_of("a.example.", "z.example.", {.A, .RRSIG, .NSEC}),
@@ -331,12 +331,14 @@ test_a_step_that_matched_is_not_cut_short_by_someone_elses_allowance :: proc(t: 
 /*
 The deepest name a chain walk will follow still fits in one allowance.
 
-`MAX_CHAIN_DEPTH` is twenty-four labels, and every one of them is a name the
-walk hashes on the way down before the answer's own proof hashes any. The
-allowance is sized for that with room over, and the sizing is prose in
-`nsec3.odin` until something runs it: a change to the reuse, to what a proof
-scans, or to the charge itself moves the number, and the first anyone would
-otherwise hear of it is a deep name in a signed zone answering SERVFAIL.
+Every label of the question is a name the walk hashes on the way down, before
+the answer's own proof hashes any. What sets the floor is `ip6.arpa.`: a reverse
+name for an IPv6 address is a nibble per label, thirty-two of them under a
+two-label zone, and issue #352 is what happened when a bound was sized for
+something shorter. The allowance is sized for that with room over, and the
+sizing is prose in `nsec3.odin` until something runs it: a change to the reuse,
+to what a proof scans, or to the charge itself moves the number, and the first
+anyone would otherwise hear of it is a reverse lookup answering SERVFAIL.
 
 A hundred iterations, the ceiling this server ships, and a salt of the length
 zones really publish.
@@ -345,10 +347,10 @@ zones really publish.
 test_the_deepest_walk_this_server_follows_fits_in_one_allowance :: proc(t: ^testing.T) {
 	nodes := make([dynamic]Node, context.temp_allocator)
 	append(&nodes, Node{"example.", {.NS, .SOA, .RRSIG, .DNSKEY}})
-	// A chain of empty non-terminals twenty-odd labels deep, each a name the
-	// walk has to read a denial for.
+	// A run of empty non-terminals as deep as the nibbles under an IPv6 reverse
+	// zone's apex, each a name the walk has to read a denial for.
 	name := "example."
-	for i in 0 ..< 22 {
+	for i in 0 ..< 32 {
 		name = fmt.tprintf("n%d.%s", i, name)
 		append(&nodes, Node{name, {.A, .RRSIG}})
 	}

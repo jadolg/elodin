@@ -39,7 +39,7 @@ ALG_ED25519 = 15
 DIGEST_SHA256 = 2
 CLASS_IN = 1
 
-A, NS, SOA, CNAME, MX, TXT = 1, 2, 6, 5, 15, 16
+A, NS, SOA, CNAME, PTR, MX, TXT = 1, 2, 6, 5, 12, 15, 16
 AAAA, SRV, SVCB, HTTPS = 28, 33, 64, 65
 DNAME = 39
 DS, RRSIG, NSEC, DNSKEY, NSEC3 = 43, 46, 47, 48, 50
@@ -1140,6 +1140,70 @@ def deep_run_of_empty_non_terminals():
     # put the other.
     emit("dr_www_ds", "www." + sub.zone, "DS",
          message("www." + sub.zone, DS, [], deleg + [sign(deleg, zone)], rcode=3), rcode=3)
+
+
+@scenario
+def ipv6_reverse_name_error():
+    """Cover an NXDOMAIN for a full-length IPv6 reverse name (issue #352)."""
+    # A reverse name for an IPv6 address is one nibble per label: thirty-two of
+    # them under `ip6.arpa.`, thirty-four in all. The chain that answers one is
+    # ordinary in every other way - four zone cuts, and a run of empty
+    # non-terminals between `ip6.arpa.` and the zone that holds the address
+    # space - so nothing here is exotic. What it is, is long, which is the whole
+    # of the issue: `zone_trust` bounded the walk by the question's label count,
+    # so every name of this shape was refused before a single DS was asked for.
+    #
+    # `2001:4860:4860::8888`, which is what the issue measured against.
+    qname = ("8.8.8.8.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0."
+             "6.8.4.0.6.8.4.1.0.0.2.ip6.arpa.")
+    parts = labels_of(qname)
+    assert len(parts) == 34, len(parts)
+
+    def suffix(n):
+        """The last `n` labels of the question, as a name."""
+        return ".".join(parts[len(parts) - n:]) + "."
+
+    root = Key(".", "ip6rev-root")
+    arpa = Key("arpa.", "ip6rev-arpa")
+    ip6 = Key("ip6.arpa.", "ip6rev-ip6")
+    # The /32 the address sits in, which is where a real delegation ends up.
+    apex = Key(suffix(14), "ip6rev-apex")
+    assert apex.zone == "0.6.8.4.0.6.8.4.1.0.0.2.ip6.arpa.", apex.zone
+
+    print("// anchor: %s" % root.ds_text())
+    root_keys = [RR(".", DNSKEY, root.rdata)]
+    emit("r6_root_dnskey", ".", "DNSKEY",
+         message(".", DNSKEY, root_keys + [sign(root_keys, root)]))
+
+    for child, parent, tag in ((arpa, root, "arpa"), (ip6, arpa, "ip6"), (apex, ip6, "apex")):
+        ds_set = [RR(child.zone, DS, child.ds())]
+        emit("r6_ds_%s" % tag, child.zone, "DS",
+             message(child.zone, DS, ds_set + [sign(ds_set, parent)]))
+        keys = [RR(child.zone, DNSKEY, child.rdata)]
+        emit("r6_dnskey_%s" % tag, child.zone, "DNSKEY",
+             message(child.zone, DNSKEY, keys + [sign(keys, child)]))
+
+    # Every nibble between `ip6.arpa.` and the delegation is an empty
+    # non-terminal: the name exists, holds nothing, and is no zone cut - so the
+    # walk has to read a DS denial for each and keep going. The next name is the
+    # epsilon successor of RFC 4470 section 3.1, which denies nothing at all.
+    for n in range(3, 14):
+        name = suffix(n)
+        ent = [RR(name, NSEC, nsec_rdata("\x00." + name, [RRSIG, NSEC]))]
+        emit("r6_ds_ent%d" % n, name, "DS",
+             message(name, DS, [], ent + [sign(ent, ip6)]))
+
+    # Below the delegation nothing exists, and the zone says so with one NSEC:
+    # its span runs from the apex to the only other name in it, which covers
+    # every nibble under the apex and `*.<apex>` with them. That one record is
+    # what ends the walk - the first name below the apex is absent, so no zone
+    # cut can be hiding further down - and what proves the name error itself.
+    absent = [RR(apex.zone, NSEC,
+                 nsec_rdata("z." + apex.zone, [NS, SOA, RRSIG, NSEC, DNSKEY]))]
+    emit("r6_ds_below_apex", suffix(15), "DS",
+         message(suffix(15), DS, [], absent + [sign(absent, apex)], rcode=3), rcode=3)
+    emit("r6_nxdomain", qname, "PTR",
+         message(qname, PTR, [], absent + [sign(absent, apex)], rcode=3), rcode=3)
 
 
 if __name__ == "__main__":

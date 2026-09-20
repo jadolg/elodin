@@ -442,6 +442,24 @@ PARITY_LIVE_POOL := []string {
 	"_25._tcp.mail.ietf.org.",
 	"gmail.com.",
 	"nist.gov.",
+	/*
+	Two reverse names, one per address family: `8.8.8.8` and
+	`2001:4860:4860::8888`, the same host either way.
+
+	The second is here because of issue #352, which this run walks straight into
+	and which nothing else in this pool could: reverse space is a nibble per
+	label under `ip6.arpa.`, so the name is thirty-four labels where every other
+	name here is two or three, and the chain walk used to refuse it for that
+	alone. This run has validation on, so a question about it that comes back
+	SERVFAIL while the upstream answers is a divergence rather than something to
+	be reasoned about afterwards.
+
+	Both are delegated and signed, and both have answered the same thing for
+	years - which is what a live pool needs, the run being a comparison rather
+	than a lookup.
+	*/
+	"8.8.8.8.in-addr.arpa.",
+	"8.8.8.8.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.6.8.4.0.6.8.4.1.0.0.2.ip6.arpa.",
 }
 
 @(private = "file")
