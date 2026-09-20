@@ -1039,11 +1039,11 @@ and have no racer job to take, so they are unaffected.
 
 A query also has a hashing allowance of its own, and above a ceiling of 255 —
 derived from that allowance, so a build that retunes it says its own number in
-the log line below — the allowance is what answers: the zones a higher ceiling admits are the ones whose
-proofs it cannot pay for, so a larger number buys SERVFAIL rather than more
-validation. A configuration carrying one is held down to 255 at startup, with a
-line in the log saying so, rather than refused — a resolver that will not come
-up is worse than either.
+the log line below — the allowance is what answers: the zones a higher ceiling
+admits are the ones whose proofs it cannot pay for, so a larger number buys
+SERVFAIL rather than more validation. A configuration carrying one is held down
+to 255 at startup, with a line in the log saying so, rather than refused — a
+resolver that will not come up is worse than either.
 
 Being a forwarder rather than a recursor, elodin fetches the material it
 validates against: every DS and DNSKEY down from the root, through the configured
