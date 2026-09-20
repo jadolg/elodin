@@ -65,10 +65,17 @@ fail, which with a blackholed upstream is the full `attempts` x servers x
 while the clients they were started for are already being answered from the
 cache.
 
-64 is well past what the pool can usefully run at once; `refresh_ceiling` is
-the bound that actually binds on a small machine. This is the bound on the
-table, and it is a fixed array so that a `Server` built as a literal - which
-the tests do - needs nothing initialised.
+Which of the two bounds binds depends on the pool. `server.workers` derives to
+at most `MAX_DERIVED_WORKERS`, so on any machine that sized itself
+`refresh_ceiling` is the smaller figure and this never comes near - a 128-worker
+pool refreshes 32 names at once. It binds only where an operator has written a
+worker count of their own past 256, and there it is deliberately the harder
+ceiling of the two: a pool sized for a rack does not need a quarter of itself
+parked on upstreams that are not answering.
+
+A fixed array rather than a table that grows, so that a `Server` built as a
+literal - which the tests do - needs nothing initialised, and so that the memory
+is the same 512 bytes whatever the load. There is nothing here to exhaust.
 */
 @(private)
 REFRESH_SLOTS :: 64

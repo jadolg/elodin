@@ -709,7 +709,12 @@ test_one_refresh_covers_every_client_waiting_on_a_name :: proc(t: ^testing.T) {
 	defer upstream.destroy_group(group)
 	s.group = group
 	workers := pool.make_pool(4)
-	defer pool.destroy(workers)
+	// Joined in the middle of the case rather than at the end of it; the drain
+	// below says why. The flag is what keeps an early return from leaking it.
+	joined := false
+	defer if !joined {
+		pool.destroy(workers)
+	}
 	s.handler_pool = workers
 
 	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
@@ -730,6 +735,25 @@ test_one_refresh_covers_every_client_waiting_on_a_name :: proc(t: ^testing.T) {
 		testing.expect_value(t, outcome, Outcome.Cached)
 		testing.expectf(t, waited < 1 * time.Second, "query %d waited %v", i, waited)
 	}
+
+	/*
+	Joined before the count is taken, and the count is exact because of it.
+
+	The refresh sends from a pool worker, and nothing about a client having
+	been answered says that worker has reached its send: the four calls above
+	return when the timer fires, which is 100 ms into a two-second upstream
+	attempt the job is still sitting in. Counting then would be counting
+	against a scheduler - the assertion would be waiting for a datagram rather
+	than reading one, and a runner slow enough to lose that race would report a
+	missing refresh as a failure of the single-flight this case is about.
+
+	`pool.destroy` joins the worker, so the job has returned and its one attempt
+	is on the socket or was never going to be. That is a fact about this
+	process rather than a delay long enough to hope.
+	*/
+	pool.destroy(workers)
+	joined = true
+	s.handler_pool = nil
 
 	testing.expect_value(t, drain_datagrams(hole), 1)
 	free_all(context.temp_allocator)
@@ -937,11 +961,14 @@ blackhole_servers :: proc(port: int) -> []config.Upstream_Spec {
 /*
 How many datagrams are sitting in a socket nobody read.
 
-Exact rather than raced: the sends all happened before this is called, so a
-receive timeout only has to be long enough to distinguish "the buffer is empty"
-from "the kernel has not finished". `SO_RCVTIMEO` reads zero as no timeout at
-all, which on an empty socket is the one value that hangs - the same trap
-`mock_untouched` documents.
+Exact rather than raced, and it is the caller that makes it so: every thread
+that could still send has been joined before this is called, so the timeout
+below only has to separate "the buffer is empty" from "the kernel has not
+finished handing over what it already has". It is not a window for a send to
+arrive in - a caller that needed one would be asserting about a scheduler.
+
+`SO_RCVTIMEO` reads zero as no timeout at all, which on an empty socket is the
+one value that hangs - the same trap `mock_untouched` documents.
 */
 @(private = "file")
 drain_datagrams :: proc(socket: net.UDP_Socket) -> (count: int) {
