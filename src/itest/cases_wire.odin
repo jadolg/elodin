@@ -45,6 +45,67 @@ empty_character_strings_answer :: proc(name: string, allocator := context.alloca
 	return wire
 }
 
+
+/*
+A reply whose names cost a whole reading's budget, out of a few kilobytes.
+
+Issue #298's shape - MX records whose owner and exchange are both two-byte
+pointers at one 255-octet name of unprintable octets - built onto the question
+the client asked, so the upstream's answer matches the query that went out.
+
+The point of it here is issue #354: the counter that bounds those expansions is
+the request's now rather than each reading's, and a reply that spends what a
+single reading may spend is still a reply this server forwards. That is the
+failure mode a per-request budget invites - one made too tight refuses answers
+nobody had a quarrel with - and the only way to see it is through the whole
+server.
+*/
+@(private = "file")
+name_bomb_answer :: proc(query: []u8, allocator := context.allocator) -> []u8 {
+	long: [256]u8
+	at := 0
+	for l in ([]int{63, 63, 63, 61}) {
+		long[at] = u8(l)
+		at += 1
+		for _ in 0 ..< l {
+			long[at] = 0x01
+			at += 1
+		}
+	}
+	long[at] = 0
+	at += 1
+	// What it costs once escaped, read rather than written down.
+	owner, _, derr := dns.decode_name(long[:at], 0, context.temp_allocator)
+	if derr != .None {
+		return nil
+	}
+
+	out := make([dynamic]u8, 0, 8192, allocator)
+	append(&out, ..query)
+	out[2] |= 0x80 // QR
+	out[3] |= 0x80 // RA
+	// The first record's owner is the long name itself, written out here for
+	// every record after it to point at.
+	long_at := u16(len(out))
+	append(&out, ..long[:at])
+	append(&out, 0, u8(dns.Type.MX), 0, u8(dns.Class.IN))
+	append(&out, 0, 0, 0x0e, 0x10)
+	append(&out, 0, 4, 0, 10)
+	append(&out, 0xc0 | u8(long_at >> 8), u8(long_at))
+
+	count := 1
+	for count * 2 * len(owner) <= dns.NAME_BUDGET {
+		append(&out, 0xc0 | u8(long_at >> 8), u8(long_at))
+		append(&out, 0, u8(dns.Type.MX), 0, u8(dns.Class.IN))
+		append(&out, 0, 0, 0x0e, 0x10)
+		append(&out, 0, 4, 0, 10)
+		append(&out, 0xc0 | u8(long_at >> 8), u8(long_at))
+		count += 1
+	}
+	out[6], out[7] = u8(count >> 8), u8(count)
+	return out[:]
+}
+
 @(private = "file")
 config_passthrough :: proc(udp_port, upstream_port: int) -> string {
 	return fmt.tprintf(
@@ -123,6 +184,16 @@ run_wire_cases :: proc(r: ^Runner) {
 	}
 	mock_truncate_udp(mock, "manystrings.wire.test.", u16(dns.Type.TXT), empty_strings)
 
+	bomb_query := build_query("namebomb.wire.test.", u16(dns.Type.MX), id = 0x5151, allocator = context.allocator)
+	defer delete(bomb_query)
+	name_bomb := name_bomb_answer(bomb_query)
+	defer delete(name_bomb)
+	if name_bomb == nil {
+		skip_case(r, "wire", "cannot build the name-bomb answer")
+		return
+	}
+	mock_reply(mock, "namebomb.wire.test.", u16(dns.Type.MX), name_bomb)
+
 	if !mock_start(mock) {
 		skip_case(r, "wire", "cannot start the mock upstream")
 		return
@@ -188,6 +259,45 @@ run_wire_cases :: proc(r: ^Runner) {
 		}
 		end_case(r)
 	}
+
+	start_case(r, "wire: a reply that spends a reading's name budget is still forwarded")
+	{
+		/*
+		Issue #354: what one request may expand names into is now counted across
+		every reading it makes rather than per reading. A reply that spends what
+		a single reading is allowed is far under that, so it goes to the client
+		as it always did - byte for byte, since nothing here reads its answer
+		section and nothing rebuilds it.
+
+		Over TCP because it is several kilobytes, and without EDNS: the same
+		reply over UDP is `fit_response`'s problem, which `resolver.odin` argues
+		on its own.
+		*/
+		res := query_tcp(udp_port, bomb_query)
+		if check(r, res.ok, "no response to a reply that spends a name budget") {
+			h := parse_header(r, res.wire)
+			check(r, h.id == 0x5151, "transaction ID: got %04x, want 5151", h.id)
+			check_eq_int(r, h.rcode, 0, "rcode")
+			if check(
+				r,
+				len(res.wire) == len(name_bomb),
+				"length: got %d, want %d",
+				len(res.wire),
+				len(name_bomb),
+			) {
+				want := name_bomb
+				want[3] &~= 0x20
+				check(r, bytes_equal(res.wire[2:], want[2:]), "payload differs from what the upstream sent")
+			}
+		}
+
+		// And the server is still answering afterwards: the reply cost it a
+		// bounded amount of arena and nothing that outlives the request.
+		f := fixture("a")
+		after := query_udp(udp_port, from_hex(f.query))
+		check(r, after.ok, "the server stopped answering after a name bomb")
+	}
+	end_case(r)
 
 	start_case(r, "wire: DNSSEC records survive with the DO bit set")
 	{
