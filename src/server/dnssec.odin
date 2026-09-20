@@ -227,7 +227,7 @@ forward, which is not bounded here. A walk past the bound reads the caches and g
 have called this, which the client sees as the SERVFAIL an unreachable authority
 produces.
 
-Not only the flood's own spent, and the difference is worth knowing before
+Not only the flood's own names, and the difference is worth knowing before
 setting the number: a walk needs a DS lookup at every label below the deepest
 zone it has cached, and it cannot call a zone unsigned without one either - so
 while every slot is held, what still answers is what the caches hold, and every

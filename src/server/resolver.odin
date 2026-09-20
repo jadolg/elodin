@@ -214,7 +214,7 @@ Server :: struct {
 	*/
 	anchors:      []dnssec.Trust_Anchor,
 	// The zones of the operator's own trust anchors, root excluded, in canonical
-	// form. An anchor here is a deliberate request to validate the zone it spent,
+	// form. An anchor here is a deliberate request to validate the zone it names,
 	// which the locally-served bypass has to defer to; see `covered_by_local_anchor`.
 	// The strings are the anchors' own; only the slice belongs to this field.
 	anchor_zones: []string,
@@ -579,7 +579,7 @@ and whichever of the two filled it decided what the other one got:
 
 Fixed here rather than by keying the cache on EDNS presence, which would settle
 both halves too. That would double the entries for a name asked about from both
-sides - most spent, for a forwarder in front of a mixed LAN - and it would still
+sides - most names, for a forwarder in front of a mixed LAN - and it would still
 be storing an OPT record and handing it out, under a finer key. This costs work
 on the hits that need it instead, and only those: an answer that already agrees
 with the request is returned as it stands, which is every locally built one
