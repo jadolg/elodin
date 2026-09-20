@@ -12,6 +12,16 @@ Decode_Error :: enum u8 {
 	Bad_Rdata,
 	Truncated_Header,
 	Name_Budget,
+	/*
+	This request had already spent `REQUEST_NAME_BUDGET` elsewhere.
+
+	Apart from `Name_Budget` because it is not a statement about the message: the
+	same bytes read on their own would have decoded, and what stopped them is
+	this server's own accounting across the readings before it. A reader deciding
+	whether a reply is malformed - the validator most of all, which would
+	otherwise report a forgery - has to be able to tell the two apart.
+	*/
+	Request_Name_Budget,
 }
 
 Encode_Error :: enum u8 {
@@ -56,6 +66,52 @@ a reply of a few hundred records costs a few tens of kilobytes of names.
 */
 NAME_BUDGET :: 640 * 1024
 
+/*
+What one request may spend expanding names, across every message it reads.
+
+`NAME_BUDGET` is per reading, and a request is not one reading. A single query
+reads the upstream's reply for the cache, reads it again when only the answer
+section will parse, reads it a third time in `fit_response` when it passes the
+client's limit, and the validator reads a reply of its own for every step of the
+chain - `dnssec.MAX_LOOKUPS_PER_QUERY` of them. Thirty-five readings, each with
+a budget of its own, is about 22 MB of names in one in-flight request, and all
+of it in the one arena that request is served from. Issue #354, measured at
+23,989,840 bytes of arena out of 5,503 bytes of wire, against 4,396,364 with the
+counter - the budget below, plus the record arrays of the readings that ran
+before it was spent.
+
+So the counter belongs to whoever owns the arena rather than to the `Reader`,
+and this is what it may reach. A reading passed no counter keeps `NAME_BUDGET`
+alone, which is every caller outside a request: the fuzz target, the bootstrap
+resolver, the tests.
+
+Four megabytes, and it has to be several times the per-reading figure rather
+than equal to it. `decode_answer` reads the same reply twice on purpose - the
+whole message, then the answer section alone when the whole will not parse - and
+a budget the first reading can empty takes the second one with it, which refuses
+an answer this server had no opinion about. That pair is 1.25 MB with both
+readings spending everything they are allowed, `fit_response` makes it 1.9 MB,
+and what is left is the validator's lookups. Real traffic is nowhere near: a
+name is normally a few dozen printable characters, so a large reply costs a few
+tens of kilobytes of names and a whole request well under one megabyte.
+
+Against the pool rather than against one query is where the figure is worth
+checking: `config` derives 16 to 128 workers and charges each
+`WORKER_MEMORY_BYTES` of ordinary use, so a flood holding every worker inside a
+request of this shape is 64 MB of names on the small box the issue was filed
+from and several hundred on the widest pool - where 22 MB a request was gigabytes
+of it. Lowering this is a lever if that is still too much; what it costs is the
+headroom above, and what it must not go under is the pair plus the fit.
+
+What it does not bound is the rest of what a reading allocates - the record
+array and the RDATA copies, which stay a fixed multiple of each message read and
+are a per-reading multiple in exactly the way this budget no longer is. A record
+is eleven wire bytes and `Record` is about ninety, so thirty-five full-length
+replies are tens of megabytes of arrays whatever their names cost. That is the
+same shape as this issue and not the same bound; see `decode_answer`.
+*/
+REQUEST_NAME_BUDGET :: 4 * 1024 * 1024
+
 @(private)
 Reader :: struct {
 	msg:        []u8,
@@ -63,6 +119,14 @@ Reader :: struct {
 	// Presentation bytes this message's names have been expanded into so far,
 	// against `NAME_BUDGET`.
 	name_bytes: int,
+	/*
+	The request's own counter, against `REQUEST_NAME_BUDGET`, or nil for a
+	reading nobody is counting.
+
+	Borrowed rather than owned: it outlives this decode and is charged by every
+	other reading the same request makes.
+	*/
+	spent:      ^int,
 }
 
 /*
@@ -78,6 +142,27 @@ charged ahead of itself, because that one is known before it is taken.
 @(private)
 charge_name :: proc(r: ^Reader, n: int) -> Decode_Error {
 	r.name_bytes += n
+	if r.spent != nil {
+		r.spent^ += n
+	}
+	return budget_spent(r)
+}
+
+/*
+Which budget, if either, this reading has run past.
+
+The request's is reported first where both are gone, because it is the one that
+says something about what comes next: another reading of the same message has a
+fresh `NAME_BUDGET` and will fail again the moment it charges anything, and a
+caller offered the shorter reading as a second chance is better told there is no
+second chance. It is also the error that must not be read as a statement about
+the message - see `Request_Name_Budget`.
+*/
+@(private)
+budget_spent :: proc(r: ^Reader) -> Decode_Error {
+	if r.spent != nil && r.spent^ > REQUEST_NAME_BUDGET {
+		return .Request_Name_Budget
+	}
 	return .Name_Budget if r.name_bytes > NAME_BUDGET else .None
 }
 
@@ -161,9 +246,23 @@ Decode a complete DNS message.
 
 Every string and slice in the result is allocated from `allocator`; callers that
 serve a single query are expected to hand in an arena and drop it wholesale.
+
+`spent` is that caller's running total of what its request has expanded names
+into, against `REQUEST_NAME_BUDGET`. A caller serving one query from one arena
+passes the same counter to every reading it makes, so the names in the arena are
+bounded by the request rather than by the reading; one that leaves it out gets
+`NAME_BUDGET` for this reading and no count across readings, which is what every
+call site outside a request wants.
 */
-decode_message :: proc(msg: []u8, allocator := context.allocator) -> (m: Message, err: Decode_Error) {
-	return decode_sections(msg, false, allocator)
+decode_message :: proc(
+	msg: []u8,
+	allocator := context.allocator,
+	spent: ^int = nil,
+) -> (
+	m: Message,
+	err: Decode_Error,
+) {
+	return decode_sections(msg, false, spent, allocator)
 }
 
 /*
@@ -178,15 +277,28 @@ strength of somebody's additional section.
 
 The section counts are still sanity-checked against the message's length before
 anything is allocated, so a caller that stops early is not a way around that.
+
+`spent` is the request's name counter, as in `decode_message`. This is the
+reading a caller falls back to when the whole message would not parse, so both
+readings charge the one counter and the arena holds what the request spent
+rather than twice what a reading may.
 */
-decode_through_answer :: proc(msg: []u8, allocator := context.allocator) -> (m: Message, err: Decode_Error) {
-	return decode_sections(msg, true, allocator)
+decode_through_answer :: proc(
+	msg: []u8,
+	allocator := context.allocator,
+	spent: ^int = nil,
+) -> (
+	m: Message,
+	err: Decode_Error,
+) {
+	return decode_sections(msg, true, spent, allocator)
 }
 
 @(private)
 decode_sections :: proc(
 	msg: []u8,
 	answer_only: bool,
+	spent: ^int,
 	allocator := context.allocator,
 ) -> (
 	m: Message,
@@ -195,7 +307,20 @@ decode_sections :: proc(
 	if len(msg) < HEADER_SIZE {
 		return {}, .Truncated_Header
 	}
-	r := Reader{msg = msg}
+	/*
+	A request with nothing left to spend reads nothing at all.
+
+	Charging first and checking afterwards is how a name is paid for - what it
+	costs is not known until it is decoded - but a reading that starts with the
+	counter already gone would still expand a name to find that out, and a
+	record array to put it in, once per reading for every reading the request
+	has left. Refusing here keeps the overshoot to the one reading that crossed
+	the budget rather than to all of them.
+	*/
+	if spent != nil && spent^ > REQUEST_NAME_BUDGET {
+		return {}, .Request_Name_Budget
+	}
+	r := Reader{msg = msg, spent = spent}
 
 	m.id = r_u16(&r) or_return
 	m.flags = transmute(Flags)(r_u16(&r) or_return)
@@ -288,8 +413,8 @@ decode_record :: proc(r: ^Reader, allocator: mem.Allocator) -> (rec: Record, err
 	it fails on its own owner name, and that is exactly the record an upstream
 	would append.
 	*/
-	if r.name_bytes > NAME_BUDGET {
-		return {}, .Name_Budget
+	if err = budget_spent(r); err != .None {
+		return {}, err
 	}
 	r.pos = rdata_end
 	return
