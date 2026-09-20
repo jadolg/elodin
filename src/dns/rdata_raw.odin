@@ -228,6 +228,26 @@ expand_rdata_names :: proc(
 		return nil, false
 	}
 
+	/*
+	A walk that cannot be paid for gives up like any other walk that gets
+	nowhere, and the refusal surfaces elsewhere.
+
+	`false` here is not "this RDATA is malformed" - it is the same answer a
+	pointer into nonsense gives - so `decode_raw_rdata` does what it does for
+	those: it copies the RDATA verbatim, charges that copy, and reports no error
+	at all, because keeping RDATA nothing understands is its whole job. What
+	refuses the message is `decode_record`'s budget check on the way out, as
+	`Request_Budget`, which is the same error every other path over the budget
+	produces and is deliberately not an accusation about the record. See
+	`test_a_raw_expansion_the_request_cannot_pay_for_is_not_the_record_s_fault`.
+
+	The charge above stays spent although nothing was taken for it, and the
+	verbatim copy is then charged on top. An over-count in the safe direction,
+	and not one anything can read: the reading it happened in is refused three
+	lines later, and every reading after it is refused before it allocates
+	anything at all. Refunding it would be a second way to move the counter for
+	no gain.
+	*/
 	if charge_bytes(r, total) != .None {
 		return nil, false
 	}

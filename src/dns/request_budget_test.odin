@@ -369,3 +369,60 @@ test_a_heavy_but_ordinary_request_stays_well_inside_the_budget :: proc(t: ^testi
 		REQUEST_DECODE_BUDGET,
 	)
 }
+
+/*
+A raw RDATA expansion the request cannot pay for is the request's fault, not the
+record's.
+
+`expand_rdata_names` reports failure as "this walk got nowhere", which is the
+same answer a pointer into nonsense gets, and `decode_raw_rdata` answers it by
+copying the RDATA verbatim - it has no error to return, since keeping RDATA
+nothing understands is its whole job. So the budget's refusal has to surface
+somewhere else or it would read as a record this decoder merely could not
+expand: `decode_record` checks the budget after the fallback, and the message
+comes back `Request_Budget` like every other path.
+
+The fixture is a PX record - a type this decoder does not model, with a layout
+of two names - whose RDATA is two pointers at a 255-octet name. The counter is
+primed so that the walk's own buffer is the charge that crosses.
+*/
+@(test)
+test_a_raw_expansion_the_request_cannot_pay_for_is_not_the_record_s_fault :: proc(t: ^testing.T) {
+	name := long_name()
+	defer delete(name)
+
+	msg := make([dynamic]u8, 0, 512)
+	defer delete(msg)
+	put_header(&msg, 1)
+	// The question's own name is the long one, so the record below can point at
+	// offset 12 for both of its RDATA names.
+	append(&msg, ..name)
+	put_u16(&msg, u16(Type.PX))
+	put_u16(&msg, u16(Class.IN))
+	append(&msg, 0xc0, 0x0c)
+	put_u16(&msg, u16(Type.PX))
+	put_u16(&msg, u16(Class.IN))
+	append(&msg, 0, 0, 0x0e, 0x10)
+	put_u16(&msg, 6)
+	put_u16(&msg, 10) // preference
+	append(&msg, 0xc0, 0x0c)
+	append(&msg, 0xc0, 0x0c)
+
+	backing := make([]u8, 1 << 20)
+	defer delete(backing)
+	arena: mem.Arena
+	mem.arena_init(&arena, backing)
+	a := mem.arena_allocator(&arena)
+
+	// What the whole message costs a request that has room for it, which is
+	// also the control: this message is well formed and decodes.
+	whole := 0
+	_, err := decode_message(msg[:], a, &whole)
+	testing.expect_value(t, err, Decode_Error.None)
+
+	// Primed so the last charge of that sequence - the walk's buffer - is the
+	// one that crosses.
+	spent := REQUEST_DECODE_BUDGET - whole + 1
+	_, over := decode_message(msg[:], a, &spent)
+	testing.expect_value(t, over, Decode_Error.Request_Budget)
+}
