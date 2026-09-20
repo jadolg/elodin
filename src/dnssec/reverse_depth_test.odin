@@ -116,6 +116,9 @@ test_an_ipv6_reverse_walk_settles_on_the_deepest_cached_zone :: proc(t: ^testing
 	v := make_validator(counting_query, &up, Options{})
 	// A fixed seed makes the non-cut hash table deterministic so the 11
 	// non-cut names between ip6.arpa. and the apex do not collide.
+	// Modulo 1024 with seed 0, they map to slots:
+	//   589, 483, 669, 884, 674, 568, 372, 806, 544, 874, 294.
+	// All 11 slots are distinct.
 	v.non_cut_seed = 0
 	defer destroy_validator(v)
 
@@ -208,6 +211,8 @@ measures the walk rather than an allowance running out in front of it.
 test_the_longest_name_the_wire_allows_is_walked_to_the_end :: proc(t: ^testing.T) {
 	up := Counting_Upstream{}
 	v := make_validator(counting_query, &up, Options{})
+	// A fixed seed prevents random collisions among the 127 labels;
+	// with seed 0, all 127 suffixes map to distinct slots modulo 1024.
 	v.non_cut_seed = 0
 	defer destroy_validator(v)
 
