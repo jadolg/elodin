@@ -1118,3 +1118,237 @@ blocking: {{ enabled: false }}
 	}
 	end_case(r)
 }
+
+/*
+`cache.serve_stale` against an upstream that has gone away, which is the outage
+the setting exists for and the one it used not to cover.
+
+Issue #164: the expired entry was served only once `upstream.resolve` had given
+up on every server for every attempt. With the defaults that is ten seconds
+against one blackholed upstream and twenty against two, while a glibc stub
+resolver gives up after five (`RES_TIMEOUT`) and systemd-resolved sooner - so
+the fallback arrived after the client had already failed and the feature did
+nothing for the case an operator turns it on for.
+
+RFC 8767 section 5's client response timer is what these cases are about: the
+held bytes go out once `cache.stale_timeout` has run, and the refresh carries
+on without the client. The upstream here is silenced rather than stopped,
+because a stopped one is a closed port and a closed port answers ICMP - the
+fast failure that was always covered. One attempt and a five-second timeout, so
+the refresh is certainly still running while the second case runs and every
+datagram counted is a refresh of its own.
+*/
+run_serve_stale_cases :: proc(r: ^Runner) {
+	qname := "stale.example."
+	upstream_port := next_port(r)
+	mock := mock_make("stale", upstream_port)
+	// A one-second TTL, so the entry expires inside the case rather than the
+	// clock being what the case is about.
+	mock_synth_all(mock, {203, 0, 113, 9}, ttl = 1)
+	if !mock_start(mock) {
+		skip_case(r, "serve_stale", "cannot start the mock upstream")
+		return
+	}
+	defer mock_stop(mock)
+
+	udp_port := next_port(r)
+	config := fmt.tprintf(
+		`log: {{ level: warn }}
+listeners:
+  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
+  tcp: {{ enabled: false }}
+upstream:
+  timeout: 5s
+  attempts: 1
+  servers: ["127.0.0.1:%d"]
+cache:
+  enabled: true
+  max_entries: 100
+  serve_stale: true
+  stale_timeout: 300ms
+blocking: {{ enabled: false }}
+`,
+		udp_port,
+		upstream_port,
+	)
+
+	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
+	if !ok {
+		skip_case(r, "serve_stale", "server did not start")
+		return
+	}
+	defer stop_server(&srv)
+
+	start_case(r, "serve_stale: an expired entry is served before the upstream gives up")
+	{
+		first := query_udp(udp_port, build_query(qname, u16(dns.Type.A), id = 1))
+		if !check(r, first.ok, "no response to the query that filled the cache") {
+			end_case(r)
+			return
+		}
+		check_eq_str(r, first_stale_address(r, first.wire), "203.0.113.9", "the answer that was cached")
+
+		// Past the one-second TTL, so the entry is expired and `serve_stale` is
+		// all that is keeping it.
+		time.sleep(1200 * time.Millisecond)
+		mock_go_silent(mock)
+		mock_reset_counts(mock)
+
+		begun := time.tick_now()
+		res := query_udp(udp_port, build_query(qname, u16(dns.Type.A), id = 2))
+		waited := time.tick_since(begun)
+		if check(r, res.ok, "the expired entry was never served") {
+			check_eq_str(r, first_stale_address(r, res.wire), "203.0.113.9", "the expired answer")
+			ttl, has_ttl := min_answer_ttl(r, res.wire)
+			if check(r, has_ttl, "no TTL in the stale answer") {
+				// The short fixed TTL a stale answer goes out with, so the
+				// client comes back for a fresh one rather than holding this.
+				check(r, ttl <= 30, "the stale answer went out with a TTL of %d", ttl)
+			}
+			check(
+				r,
+				waited < 2 * time.Second,
+				"the client waited %v for an expired entry; the upstream budget is 5s",
+				waited,
+			)
+		}
+		// And the refresh really went out, rather than the entry being served
+		// without anything being asked of the upstream.
+		check(r, mock_total(mock) >= 1, "the refresh never reached the upstream")
+	}
+	end_case(r)
+
+	start_case(r, "serve_stale: a second client does not put a second refresh on the wire")
+	{
+		mock_reset_counts(mock)
+		begun := time.tick_now()
+		res := query_udp(udp_port, build_query(qname, u16(dns.Type.A), id = 3))
+		waited := time.tick_since(begun)
+		if check(r, res.ok, "the second client went unanswered") {
+			check_eq_str(r, first_stale_address(r, res.wire), "203.0.113.9", "the expired answer")
+			check(r, waited < 2 * time.Second, "the second client waited %v", waited)
+		}
+		check_eq_int(r, mock_total(mock), 0, "upstream queries while a refresh is already running")
+	}
+	end_case(r)
+}
+
+/*
+And the refresh the client stopped waiting for still renews the entry.
+
+The other half of RFC 8767 section 5, and the half a fast case cannot see: an
+answer that arrives after the timer has fired is stored rather than dropped, so
+the next client is served a fresh entry instead of the same expired bytes over
+again. Without it a slow upstream - one that answers, but later than the timer -
+would leave a name stale for the whole day the cache keeps it, every client
+answered from the entry and every refresh thrown away.
+
+What says which of the two happened is the upstream's own query count. A third
+query that finds the entry refreshed is a cache hit and asks nobody; one that
+finds it still expired starts another refresh, and the count goes up. Neither
+the address nor the TTL can tell them apart here - the mock answers the same
+bytes every time, and `cache.max_ttl` of 3 bounds the stale answer's 30-second
+TTL to the same figure as a fresh one's.
+
+The upstream answers 1.2 seconds after it is asked, against a 300 ms timer, so
+the client is certainly served from the entry and the refresh certainly succeeds
+behind it. The gap is what makes the middle assertion discriminating as well: a
+build without the timer waits the upstream out and answers in 1.2 seconds, which
+is not under the 700 ms allowed here.
+*/
+run_stale_refresh_cases :: proc(r: ^Runner) {
+	qname := "slow.example."
+	upstream_port := next_port(r)
+	mock := mock_make("stale-refresh", upstream_port)
+	mock_delay_all(
+		mock,
+		1200 * time.Millisecond,
+		make_a_response(qname, {203, 0, 113, 8}, 60, context.allocator),
+	)
+	if !mock_start(mock) {
+		skip_case(r, "serve_stale refresh", "cannot start the mock upstream")
+		return
+	}
+	defer mock_stop(mock)
+
+	udp_port := next_port(r)
+	config := fmt.tprintf(
+		`log: {{ level: warn }}
+listeners:
+  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
+  tcp: {{ enabled: false }}
+upstream:
+  timeout: 5s
+  attempts: 1
+  servers: ["127.0.0.1:%d"]
+cache:
+  enabled: true
+  max_entries: 100
+  max_ttl: 4
+  serve_stale: true
+  stale_timeout: 300ms
+blocking: {{ enabled: false }}
+`,
+		udp_port,
+		upstream_port,
+	)
+
+	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
+	if !ok {
+		skip_case(r, "serve_stale refresh", "server did not start")
+		return
+	}
+	defer stop_server(&srv)
+
+	start_case(r, "serve_stale: the refresh the client gave up on still lands in the cache")
+	{
+		first := query_udp(udp_port, build_query(qname, u16(dns.Type.A), id = 11))
+		if !check(r, first.ok, "no response to the query that filled the cache") {
+			end_case(r)
+			return
+		}
+		check_eq_str(r, first_stale_address(r, first.wire), "203.0.113.8", "the answer that was cached")
+
+		// Past `max_ttl`, which is what the entry was stored under.
+		time.sleep(4300 * time.Millisecond)
+		mock_reset_counts(mock)
+
+		begun := time.tick_now()
+		second := query_udp(udp_port, build_query(qname, u16(dns.Type.A), id = 12))
+		waited := time.tick_since(begun)
+		if !check(r, second.ok, "the expired entry was never served") {
+			end_case(r)
+			return
+		}
+		check(
+			r,
+			waited < 700 * time.Millisecond,
+			"the client waited %v rather than being served from the entry at the 300ms timer",
+			waited,
+		)
+		check_eq_int(r, mock_total(mock), 1, "upstream queries for the refresh")
+
+		// Long enough for a 1.2-second upstream to have answered and the
+		// refresh to have stored it, and well short of the four seconds the
+		// entry it stored is then good for.
+		time.sleep(2 * time.Second)
+
+		third := query_udp(udp_port, build_query(qname, u16(dns.Type.A), id = 13))
+		if check(r, third.ok, "no response after the refresh") {
+			check_eq_str(r, first_stale_address(r, third.wire), "203.0.113.8", "the refreshed answer")
+			check_eq_int(
+				r,
+				mock_total(mock),
+				1,
+				"upstream queries after the refresh; a second one means it was dropped",
+			)
+		}
+	}
+	end_case(r)
+}
+
+@(private = "file")
+first_stale_address :: proc(r: ^Runner, wire: []u8) -> string {
+	addrs := answer_addresses(r, wire)
+	return addrs[0] if len(addrs) > 0 else ""
+}
