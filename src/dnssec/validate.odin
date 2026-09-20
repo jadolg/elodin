@@ -642,7 +642,11 @@ What one entry costs at worst, which is the number to multiply by
 it: each key carries a `Dnskey` beside its bytes, and a zone may publish
 `MAX_KEYS_PER_ZONE` of them - 64 small keys fit under the byte cap as readily as
 three large ones - so the structs alone are three kilobytes on top. Then the
-entry itself, and the name it is keyed by.
+entry itself, and the name it is keyed by, which is bounded by
+`dns.MAX_NAME_PRESENTATION` rather than by the couple of dozen bytes a real apex
+spells: presentation form escapes a byte as `\DDD`, so the worst name is four
+times the wire limit. It comes to about twelve kilobytes, and the RDATA the
+other constant bounds is two thirds of it.
 
 Written down because the cache's whole purpose here is to be sized by an
 operator, and a figure that leaves out a third of what it measures is worse than

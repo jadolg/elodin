@@ -459,3 +459,39 @@ test_a_refused_key_set_is_counted :: proc(t: ^testing.T) {
 	testing.expect_value(t, oversized_key_sets(v), 1)
 	free_all(context.temp_allocator)
 }
+
+/*
+The figure the documentation quotes is the figure the constants add up to.
+
+`MAX_CACHED_ZONE_BYTES` is what an operator multiplies by `max_cached_zones`,
+and it is quoted in three places away from here: the startup warning, the
+README's sizing paragraph, and the constant's own note. It was quoted wrongly
+once already - as `MAX_CACHED_ZONE_KEY_BYTES` alone, which is the RDATA and not
+the entry - so the arithmetic is pinned rather than left to be re-derived by
+whoever next changes one of the parts.
+*/
+@(test)
+test_what_an_entry_costs_is_what_the_parts_come_to :: proc(t: ^testing.T) {
+	testing.expect_value(
+		t,
+		MAX_CACHED_ZONE_BYTES,
+		MAX_CACHED_ZONE_KEY_BYTES + MAX_KEYS_PER_ZONE * size_of(Dnskey) + size_of(Zone_Entry) + dns.MAX_NAME_PRESENTATION,
+	)
+
+	// The RDATA cap is the larger part of it but not the whole, which is the
+	// mistake the documentation made: a bound quoted as 8 KB understated the
+	// entry by a third.
+	testing.expect(
+		t,
+		MAX_CACHED_ZONE_BYTES > MAX_CACHED_ZONE_KEY_BYTES,
+		"an entry cannot cost no more than the keys it holds",
+	)
+
+	// "about twelve kilobytes", and "about 48 MB at the default" in the README.
+	// Bands rather than exact numbers: the point is that the prose is still
+	// true, not that these parts may never move.
+	kb := MAX_CACHED_ZONE_BYTES / 1024
+	testing.expectf(t, kb >= 11 && kb <= 13, "an entry is %d KB; the documentation says about twelve", kb)
+	mb := (DEFAULT_MAX_CACHED_ZONES * MAX_CACHED_ZONE_BYTES) / (1024 * 1024)
+	testing.expectf(t, mb >= 45 && mb <= 51, "the default cache ceiling is %d MB; the documentation says about 48", mb)
+}

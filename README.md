@@ -1054,14 +1054,15 @@ first query into a zone and not the ones after it.
 fact that an apex is unsigned. Zero, the default, is 4096, which covers the
 hierarchy a busy forwarder touches with room to spare; a household resolver never
 fills it. It is exposed because it is the one dial on how much memory validation
-may hold: a zone's keys are capped at 8 KB whatever it publishes, and an entry
-costs about 11.5 KB at worst once the key structs and the name are counted, so
-the ceiling is that times this number — about 48 MB at the default. A box that
-must keep validation inside a slice of its memory sets it here; raising it above
-4096 logs the figure the new number implies. Past the bound the coldest zone is dropped, one at a
-time — so a number that is too small costs chain walks for the zones that fell
-out, and nothing else. There is no reason to raise it above the default unless
-the resolver genuinely sees more zones than that; the memory is the cost.
+may hold: a zone's keys are capped at 8 KB of RDATA whatever it publishes, and
+an entry costs about 12 KB at worst once the key structs, the entry and the name
+are counted — so the ceiling is that times this number, about 48 MB at the
+default. A box that must keep validation inside a slice of its memory sets it
+here; raising it above 4096 logs the figure the new number implies. Past the
+bound the coldest zone is dropped, one at a time — so a number that is too small
+costs chain walks for the zones that fell out, and nothing else. There is no
+reason to raise it above the default unless the resolver genuinely sees more
+zones than that; the memory is the cost.
 
 What a flood of fresh delegations cannot do is take everybody else's keys with
 it. The root, the TLDs and whatever else is in steady use are read at the start of
