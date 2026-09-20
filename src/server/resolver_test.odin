@@ -7,6 +7,7 @@ import "core:time"
 import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:pool"
 import "elodin:upstream"
 
 /*
@@ -289,6 +290,11 @@ Stale_Exchange :: struct {
 	socket: net.UDP_Socket,
 	reply:  []u8,
 	got:    bool,
+	// How long to sit on the query before answering it. Zero answers at once,
+	// which is what every case but the response-timer ones wants; the others
+	// need an upstream that is slow rather than absent, so that the client
+	// gives up on it while it is still going to answer.
+	delay:  time.Duration,
 }
 
 /*
@@ -306,6 +312,9 @@ serve_one_stale :: proc(x: ^Stale_Exchange) {
 		return
 	}
 	x.got = true
+	if x.delay > 0 {
+		time.sleep(x.delay)
+	}
 
 	out: [4096]u8
 	copy(out[:], x.reply)
@@ -549,6 +558,402 @@ test_rd_zero_is_answered_from_a_stale_entry :: proc(t: ^testing.T) {
 		testing.expect_value(t, served.answer[0].ttl, u32(cache.STALE_TTL))
 	}
 	free_all(context.temp_allocator)
+}
+
+/*
+The client response timer, which is what `cache.serve_stale` is worth.
+
+Issue #164: the fallback used to be reached only once `upstream.resolve` had
+given up, which is `attempts` x servers x `timeout` - ten seconds with the
+defaults against one blackholed upstream, twenty against two - while a glibc
+stub gives up at five and systemd-resolved sooner. The expired answer therefore
+arrived after the client it was kept for had already failed, so the setting did
+nothing in the one outage an operator turns it on for.
+
+The upstream here is a socket that is bound and never read. That is the shape
+the issue is about and the one a closed port cannot stand in for: a datagram to
+a port nobody is listening on draws an ICMP refusal, and the exchange fails at
+once, which is the *fast* failure `serve_stale` already covered. Here nothing
+comes back and nothing is refused, so only the timeout ends the attempt.
+
+The budget below is two seconds and the timer is 150 ms, so the assertion has
+850 ms of slack in it - enough that a loaded runner cannot fail it without also
+being a second behind, and tight enough that the old behaviour cannot pass. Set
+`cache.stale_timeout` to 0 - the escape hatch, and what every release before
+this one did - and this case takes the whole two seconds and fails.
+*/
+@(test)
+test_a_stale_answer_does_not_wait_out_the_upstream_budget :: proc(t: ^testing.T) {
+	hole, herr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, herr == nil, "cannot bind the blackholed upstream: %v", herr) {
+		return
+	}
+	defer net.close(hole)
+	bound, berr := net.bound_endpoint(hole)
+	if !testing.expectf(t, berr == nil, "cannot read the blackhole's port: %v", berr) {
+		return
+	}
+
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
+	defer cache.destroy(answers)
+	cfg: config.Config
+	s := stale_server(&cfg, answers, nil)
+	cfg.upstream.strategy = .Failover
+	cfg.upstream.attempts = 2
+	cfg.upstream.timeout = 1 * time.Second
+	cfg.cache.stale_timeout = 150 * time.Millisecond
+	cfg.upstream.servers = blackhole_servers(bound.port)
+
+	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+		return
+	}
+	defer upstream.destroy_group(group)
+	s.group = group
+
+	/*
+	Declared last so that it is torn down first: `pool.destroy` joins the
+	refresh, which is still inside its two-second upstream budget when this
+	returns and which writes to the cache and the group when it comes out.
+	*/
+	workers := pool.make_pool(2)
+	defer pool.destroy(workers)
+	s.handler_pool = workers
+
+	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
+		return
+	}
+
+	begun := time.now()
+	out, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	waited := time.since(begun)
+
+	if !testing.expect(t, ok, "the stale answer went unserved") {
+		return
+	}
+	testing.expect_value(t, outcome, Outcome.Cached)
+	testing.expectf(
+		t,
+		waited < 1 * time.Second,
+		"the client waited %v for an expired entry it could have had at once; the upstream budget is %v",
+		waited,
+		time.Duration(cfg.upstream.attempts) * cfg.upstream.timeout,
+	)
+
+	served, serr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, serr, dns.Decode_Error.None)
+	testing.expect_value(t, served.id, u16(0x4321))
+	if testing.expect(t, len(served.answer) == 1, "the stale answer carried no record") {
+		testing.expect_value(t, served.answer[0].ttl, u32(cache.STALE_TTL))
+	}
+
+	// And the failure the refresh is still walking into is not the client's:
+	// it got an answer, so nothing is counted failed for it.
+	counters := stats_of(&s)
+	testing.expect_value(t, counters.cached, u64(1))
+	testing.expect_value(t, counters.failed, u64(0))
+	testing.expect_value(t, cache.stats(answers).stale, u64(1))
+	free_all(context.temp_allocator)
+}
+
+/*
+One refresh per name, however many clients ask for it.
+
+The stampede the response timer would otherwise create: every client that
+arrives while an expired entry is being refreshed would start a refresh of its
+own, so a popular name whose TTL has just run out puts one upstream query on the
+wire per client - against an upstream that is by assumption already in trouble.
+
+A second query is answered from the entry straight away rather than queued
+behind the refresh already running for it. That is deliberate and it is the
+lazier half of RFC 8767 section 5: the bytes that come back from a refresh carry
+the transaction ID and the question spelling of the one query it was started
+from, so a second client waiting on them would be waiting to be handed somebody
+else's answer with both patched back out of it.
+
+Counted at the upstream rather than at the resolver, because what is being
+asserted is that a query left this process once. The socket is never read while
+the case runs, so the datagrams that reached it are still in the receive buffer
+afterwards and can simply be counted. One attempt per refresh, so the count is
+the number of refreshes rather than a multiple of it.
+*/
+@(test)
+test_one_refresh_covers_every_client_waiting_on_a_name :: proc(t: ^testing.T) {
+	hole, herr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, herr == nil, "cannot bind the blackholed upstream: %v", herr) {
+		return
+	}
+	defer net.close(hole)
+	bound, berr := net.bound_endpoint(hole)
+	if !testing.expectf(t, berr == nil, "cannot read the blackhole's port: %v", berr) {
+		return
+	}
+
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
+	defer cache.destroy(answers)
+	cfg: config.Config
+	s := stale_server(&cfg, answers, nil)
+	cfg.upstream.strategy = .Failover
+	// One attempt, so every datagram counted below is a refresh of its own.
+	cfg.upstream.attempts = 1
+	// And long enough that the first refresh is certainly still running when the
+	// second query arrives.
+	cfg.upstream.timeout = 2 * time.Second
+	cfg.cache.stale_timeout = 100 * time.Millisecond
+	cfg.upstream.servers = blackhole_servers(bound.port)
+
+	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+		return
+	}
+	defer upstream.destroy_group(group)
+	s.group = group
+	workers := pool.make_pool(4)
+	defer pool.destroy(workers)
+	s.handler_pool = workers
+
+	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
+		return
+	}
+
+	for i in 0 ..< 4 {
+		begun := time.now()
+		_, outcome, ok := handle_query(
+			&s,
+			stale_query(true),
+			.UDP,
+			"127.0.0.1:5555",
+			context.temp_allocator,
+		)
+		waited := time.since(begun)
+		testing.expectf(t, ok, "query %d went unanswered", i)
+		testing.expect_value(t, outcome, Outcome.Cached)
+		testing.expectf(t, waited < 1 * time.Second, "query %d waited %v", i, waited)
+	}
+
+	testing.expect_value(t, drain_datagrams(hole), 1)
+	free_all(context.temp_allocator)
+}
+
+/*
+And the refresh the client stopped waiting for still renews the entry.
+
+The other half of RFC 8767 section 5, and the one a counter cannot show: the
+answer that arrives after the timer has fired is not thrown away, it is stored,
+so the next client is served a fresh entry rather than the same expired bytes
+over again. Without it a slow upstream - one that answers, but later than the
+timer - would leave a name stale for the whole of `MAX_STALE`, since every
+client would be answered from the entry and every refresh abandoned.
+
+The upstream here answers 400 ms after it is asked, against a 100 ms timer, so
+the client is certainly served from the entry and the refresh certainly
+succeeds. The two addresses differ, which is what says which of them the cache
+ended up holding.
+*/
+@(test)
+test_a_refresh_outlives_the_client_that_started_it :: proc(t: ^testing.T) {
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+		return
+	}
+	defer net.close(socket)
+	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+	bound, berr := net.bound_endpoint(socket)
+	if !testing.expectf(t, berr == nil, "cannot read the mock's port: %v", berr) {
+		return
+	}
+
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
+	defer cache.destroy(answers)
+	cfg: config.Config
+	s := stale_server(&cfg, answers, nil)
+	cfg.upstream.strategy = .Failover
+	cfg.upstream.attempts = 1
+	cfg.upstream.timeout = 5 * time.Second
+	cfg.cache.stale_timeout = 100 * time.Millisecond
+	cfg.upstream.servers = blackhole_servers(bound.port)
+
+	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+		return
+	}
+	defer upstream.destroy_group(group)
+	s.group = group
+	workers := pool.make_pool(2)
+	// Joined in the middle of the case rather than at the end of it, since the
+	// store this is about happens on the refresh's way out. The flag is what
+	// keeps an early return from leaking the pool all the same.
+	joined := false
+	defer if !joined {
+		pool.destroy(workers)
+	}
+	s.handler_pool = workers
+
+	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
+		return
+	}
+
+	x := Stale_Exchange {
+		socket = socket,
+		reply  = live_reply(),
+		delay  = 400 * time.Millisecond,
+	}
+	mock := thread.create_and_start_with_poly_data(&x, serve_one_stale)
+
+	out, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	if !testing.expect(t, ok, "the stale answer went unserved") {
+		return
+	}
+	testing.expect_value(t, outcome, Outcome.Cached)
+	served, derr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if testing.expect(t, len(served.answer) == 1, "the stale answer carried no record") {
+		a, is_a := served.answer[0].data.(dns.Rdata_A)
+		testing.expect(t, is_a, "the stale answer did not carry an A record")
+		testing.expectf(t, a.addr != LIVE_ADDR, "the client waited for the upstream after all")
+	}
+
+	thread.join(mock)
+	thread.destroy(mock)
+	testing.expect(t, x.got, "the refresh never reached the upstream")
+
+	// The refresh is joined rather than slept on: the store happens on its way
+	// out, so the pool going quiet is what says the entry is final.
+	pool.destroy(workers)
+	joined = true
+	s.handler_pool = nil
+
+	kb: [cache.KEY_MAX]u8
+	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
+	wire, hit, found := cache.get(answers, key, context.temp_allocator)
+	if !testing.expect(t, found, "the entry is gone") {
+		return
+	}
+	testing.expect(t, !hit.stale, "the entry is still the expired one; the refresh was dropped")
+	stored, cerr := dns.decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, cerr, dns.Decode_Error.None)
+	if testing.expect(t, len(stored.answer) == 1, "the stored answer carried no record") {
+		a, is_a := stored.answer[0].data.(dns.Rdata_A)
+		testing.expect(t, is_a, "the stored answer did not carry an A record")
+		testing.expectf(t, a.addr == LIVE_ADDR, "the cache still holds %v", a.addr)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+An upstream that answers inside the timer is still the one the client hears.
+
+The timer must not turn every expired entry into a stale answer. RFC 8767
+section 5 has the refresh answer the client whenever it can, and it usually can:
+an upstream that is up replies in milliseconds against a timer measured in
+hundreds of them, so the ordinary refresh of an expired name is a client served
+fresh data and a cache that renewed itself, with nothing stale involved.
+
+`test_a_live_upstream_beats_a_stale_entry` asserts the same thing on the path
+with no worker pool, where the refresh cannot be detached and the client waits
+for the upstream itself. This is the detached one.
+*/
+@(test)
+test_a_refresh_that_beats_the_timer_answers_the_client :: proc(t: ^testing.T) {
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+		return
+	}
+	defer net.close(socket)
+	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+	bound, berr := net.bound_endpoint(socket)
+	if !testing.expectf(t, berr == nil, "cannot read the mock's port: %v", berr) {
+		return
+	}
+
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
+	defer cache.destroy(answers)
+	cfg: config.Config
+	s := stale_server(&cfg, answers, nil)
+	cfg.upstream.strategy = .Failover
+	cfg.upstream.attempts = 1
+	cfg.upstream.timeout = 5 * time.Second
+	// Well past what a loopback exchange takes, so a case that goes wrong says
+	// the refresh was not reached rather than that the machine was busy.
+	cfg.cache.stale_timeout = 5 * time.Second
+	cfg.upstream.servers = blackhole_servers(bound.port)
+
+	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+		return
+	}
+	defer upstream.destroy_group(group)
+	s.group = group
+	workers := pool.make_pool(2)
+	defer pool.destroy(workers)
+	s.handler_pool = workers
+
+	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
+		return
+	}
+
+	x := Stale_Exchange {
+		socket = socket,
+		reply  = live_reply(),
+	}
+	mock := thread.create_and_start_with_poly_data(&x, serve_one_stale)
+	out, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	thread.join(mock)
+	thread.destroy(mock)
+
+	testing.expect(t, x.got, "the upstream was never asked, though it was up")
+	if !testing.expect(t, ok, "nothing came back at all") {
+		return
+	}
+	testing.expect_value(t, outcome, Outcome.Forwarded)
+
+	served, derr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+	// The client's own transaction ID, off a response the refresh built from a
+	// copy of the client's own query.
+	testing.expect_value(t, served.id, u16(0x4321))
+	if testing.expect(t, len(served.answer) == 1, "the answer carried no record") {
+		a, is_a := served.answer[0].data.(dns.Rdata_A)
+		testing.expect(t, is_a, "the answer did not carry an A record")
+		testing.expectf(t, a.addr == LIVE_ADDR, "the client was served %v, which is the expired entry", a.addr)
+	}
+	testing.expect_value(t, cache.stats(answers).stale, u64(0))
+	free_all(context.temp_allocator)
+}
+
+// One upstream, at a port on loopback, for the response-timer fixtures above.
+@(private = "file")
+blackhole_servers :: proc(port: int) -> []config.Upstream_Spec {
+	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
+	servers[0] = config.Upstream_Spec {
+		name    = "mock",
+		kind    = .UDP,
+		address = "127.0.0.1",
+		port    = port,
+	}
+	return servers
+}
+
+/*
+How many datagrams are sitting in a socket nobody read.
+
+Exact rather than raced: the sends all happened before this is called, so a
+receive timeout only has to be long enough to distinguish "the buffer is empty"
+from "the kernel has not finished". `SO_RCVTIMEO` reads zero as no timeout at
+all, which on an empty socket is the one value that hangs - the same trap
+`mock_untouched` documents.
+*/
+@(private = "file")
+drain_datagrams :: proc(socket: net.UDP_Socket) -> (count: int) {
+	_ = net.set_option(socket, .Receive_Timeout, 50 * time.Millisecond)
+	buf: [4096]u8
+	for {
+		n, _, err := net.recv_udp(socket, buf[:])
+		if err != nil || n == 0 {
+			return
+		}
+		count += 1
+	}
 }
 
 /*

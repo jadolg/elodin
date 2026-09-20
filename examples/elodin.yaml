@@ -342,11 +342,27 @@ cache:
   min_ttl: 0           # raise to hold short-lived answers longer
   max_ttl: 24h         # and the longest any client is told to hold one
   negative_ttl: 300    # cap for NXDOMAIN / NODATA
-  # An entry is kept for a day past its expiry, reached for only once the
-  # upstream has failed to answer - or straight away for an RD=0 query, which
-  # forbids the forwarding that would have refreshed it - and handed out with a
-  # 30-second TTL so the client comes back for a fresh one.
+  # An entry is kept for a day past its expiry, reached for once the refresh
+  # below has failed or run out of time - or straight away for an RD=0 query,
+  # which forbids the forwarding that would have refreshed it - and handed out
+  # with a 30-second TTL so the client comes back for a fresh one.
   serve_stale: false   # answer from an expired entry if the upstream is down
+  # How long a client waits for that refresh before it is handed the expired
+  # answer instead - RFC 8767 section 5's client response timer. It has to fire
+  # before the client's own resolver gives up, which for a glibc stub is five
+  # seconds, so it is measured against the stub and not against the upstream:
+  # without it the fallback waits out attempts x servers x upstream.timeout,
+  # which is ten seconds with the defaults and one upstream, and the answer
+  # arrives after the client has already failed.
+  #
+  # The refresh is not cancelled when the timer fires. It carries on and writes
+  # whatever it gets to the cache, so the entry is renewed even though this
+  # client was answered from it, and one refresh per name is in flight at a time
+  # however many clients are asking. 0 turns the timer off: the client waits the
+  # whole upstream budget out, which is what every release before this one did.
+  #
+  # Read only while serve_stale is on.
+  stale_timeout: 1.8s
 
 blocking:
   enabled: true

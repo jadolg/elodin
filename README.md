@@ -796,6 +796,7 @@ cache:
   max_ttl: 24h
   negative_ttl: 300      # cap for NXDOMAIN / NODATA (RFC 2308)
   serve_stale: false     # answer from an expired entry if the upstream is down
+  stale_timeout: 1.8s    # how long a client waits for the refresh first
 ```
 
 Answers are stored as untouched wire bytes plus the offsets of their TTL fields,
@@ -817,6 +818,26 @@ message it holds, a negative one for the SOA's figure capped by `negative_ttl`,
 while every record still goes out carrying its own TTL up to the ceiling. A TTL
 with its top bit set is taken as zero per RFC 2181 section 8, forwarded answers
 included, which leaves it uncacheable unless `min_ttl` raises it.
+
+`serve_stale` keeps an entry for a day past its expiry and answers from it when
+a fresh answer cannot be got. What decides *when* is `stale_timeout`, RFC 8767
+section 5's client response timer: the query goes to the upstream as a miss
+would, and if no answer has come back by then the expired copy goes out with a
+30-second TTL while the refresh carries on in the background and writes whatever
+it gets to the cache. One refresh per name is in flight at a time, so an expired
+name a hundred clients are asking for costs one upstream query rather than a
+hundred, and the clients that arrive while it is running are served the expired
+copy at once rather than queued behind it.
+
+The timer is measured against the client's own resolver, not against the
+upstream. Without it the fallback waits for `upstream.attempts` rounds over
+every server — ten seconds with the defaults and one upstream — by which time a
+glibc stub has given up at five and systemd-resolved sooner, so the expired
+answer arrived after the client had already failed. Setting it to `0` restores
+that: the client waits the whole upstream budget out. An upstream that *answers*
+— SERVFAIL included — has answered, and its reply is what the client gets;
+`serve_stale` covers an upstream that cannot be reached, not one this server
+refused.
 
 ### DNS-over-HTTPS
 
@@ -2197,7 +2218,7 @@ as a warning at startup.
 | `elodin_special_use_total` | counter | queries answered from the reserved-name table instead of being forwarded |
 | `elodin_cache_entries` / `_bytes` | gauge | what the cache holds, against `max_entries` and `max_bytes` |
 | `elodin_cache_hits_total` / `_misses_total` / `_evictions_total` | counter | how it is doing |
-| `elodin_cache_stale_total` | counter | expired answers served because no fresh one could be got |
+| `elodin_cache_stale_total` | counter | expired answers served because no fresh one could be got in time |
 | `elodin_cache_withheld_total` | counter | answers the cache handed over that were then refused rather than served |
 | `elodin_filter_rules{list}` | gauge | rules loaded, `block` and `allow` |
 | `elodin_upstream_queries_total{upstream}` | counter | queries sent to each upstream, by its configured name |

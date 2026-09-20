@@ -1295,6 +1295,7 @@ load_cache :: proc(l: ^Loader, cfg: ^Config) {
 	opt_u32(l, n, "max_ttl", &cfg.cache.max_ttl, "cache")
 	opt_u32(l, n, "negative_ttl", &cfg.cache.negative_ttl, "cache")
 	opt_bool(l, n, "serve_stale", &cfg.cache.serve_stale, "cache")
+	opt_duration(l, n, "stale_timeout", &cfg.cache.stale_timeout, "cache")
 }
 
 @(private)
@@ -2329,6 +2330,12 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	}
 	if cfg.cache.max_ttl < cfg.cache.min_ttl {
 		errorf(l, "cache.max_ttl must not be smaller than cache.min_ttl")
+	}
+	// Zero is the escape hatch - no client response timer, wait the upstream
+	// out - so it is not an error. Negative is not a longer wait and not a
+	// shorter one; it is a mistake worth reporting rather than a third reading.
+	if cfg.cache.stale_timeout < 0 {
+		errorf(l, "cache.stale_timeout must not be negative; 0 waits for the upstream instead")
 	}
 	if cfg.server.workers < 0 {
 		errorf(l, "server.workers must not be negative")
