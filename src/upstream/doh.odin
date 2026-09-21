@@ -119,10 +119,24 @@ exchange_doh_h1 :: proc(
 	response: []u8,
 	err: Error,
 ) {
+	/*
+	One deadline for both attempts, for the reason `exchange_pipelined` gives:
+	a retry that starts a clock of its own costs the caller twice the timeout
+	it was promised, with an upstream worker held for all of it. Widening which
+	failures reach the second attempt is what makes that reachable here.
+
+	A `Tick` rather than a `Time`, because it is a bound on waiting rather than
+	a moment anyone reads off a clock, and the wall clock steps.
+	*/
+	deadline := time.tick_add(time.tick_now(), timeout)
+
 	// Pooled connection first, then a fresh one; see exchange_pipelined for why a
 	// dead pooled connection must not count as an upstream failure.
-	last := Error.IO_Error
 	for attempt in 0 ..< 2 {
+		remaining := time.tick_diff(time.tick_now(), deadline)
+		if remaining <= 0 {
+			return nil, .Timeout
+		}
 		conn: Idle_Conn
 		reused := false
 		if attempt == 0 {
@@ -135,7 +149,9 @@ exchange_doh_h1 :: proc(
 				tls    = conn.tls,
 			}
 		} else {
-			s, oerr := open_stream(u.endpoint, u.tls_ctx, u.spec.hostname, timeout, u)
+			// `open_stream` puts this figure on the socket as well as on the
+			// dial, so it bounds the reads that follow too.
+			s, oerr := open_stream(u.endpoint, u.tls_ctx, u.spec.hostname, remaining, u)
 			if oerr != .None {
 				return nil, oerr
 			}
@@ -177,7 +193,7 @@ exchange_doh_h1 :: proc(
 		}
 
 		stream_close(&stream)
-		last = herr if herr != .None else .Bad_Response
+		last := herr if herr != .None else .Bad_Response
 		/*
 		A hang-up is retried whether this query found the connection or dialled
 		it, which is the shape `exchange_pipelined` settled on. Excluding the
@@ -188,11 +204,12 @@ exchange_doh_h1 :: proc(
 		a pooled connection is retried because it may simply be stale, and a
 		fresh one failing any other way has said what it has to say.
 		*/
-		if !reused && last != .Peer_Closed {
+		if attempt == 1 || (!reused && last != .Peer_Closed) {
 			return nil, last
 		}
 	}
-	return nil, last
+	// Unreachable: the second attempt always returns above.
+	return nil, .IO_Error
 }
 
 /*

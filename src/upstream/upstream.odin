@@ -98,6 +98,12 @@ Upstream :: struct {
 	// The shortest idle gap after which this upstream was found to have hung
 	// up, or zero while it never has; see `note_idle_death`. Under `mu`.
 	idle_died:    time.Duration,
+	// When that figure was last learned, so it can be forgotten and learned
+	// again; see `pipe_relearn_idle_locked`. Under `mu`.
+	idle_learned: time.Time,
+	// Consecutive exchanges that ended in `Peer_Closed` after the retry had
+	// also been hung up on; see `record_failure`. Under `mu`.
+	closed_run:   int,
 
 	// `conn_cond` and `connecting` make concurrent first callers share one
 	// handshake instead of each racing to open their own. Used by both shared
@@ -273,6 +279,7 @@ record_success :: proc(u: ^Upstream, elapsed: time.Duration) {
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
 	u.failures = 0
+	u.closed_run = 0
 	u.stats.queries += 1
 	u.stats.latency_ns_total += u64(elapsed)
 }
@@ -350,17 +357,39 @@ record_failure :: proc(u: ^Upstream, err: Error) {
 	often enough to park the preferred upstream roughly every two and a half
 	minutes, while it was answering 97% of what it was asked.
 
-	The trade, stated plainly: a server that closes every connection it accepts
-	is never parked, and costs each query a failover instead of being skipped
-	for ten seconds. That is the same bargain `note_unreadable_rcode` makes, and
-	the figure that names such a server is
-	`elodin_upstream_failure_kind_total{error="peer_closed"}` - which is why it
-	has a kind of its own. Health is still tripped by everything that says the
-	server is unreachable or silent: a failed dial, a failed handshake, a
-	timeout.
+	The trade, stated plainly: hang-ups cost a failover each instead of the
+	upstream being skipped for ten seconds, and only a sustained run of them
+	parks it - see the block below for where the exemption stops. That is the
+	same bargain `note_unreadable_rcode` makes, and the figure that names such a
+	server is `elodin_upstream_failure_kind_total{error="peer_closed"}` - which
+	is why it has a kind of its own. Health is still tripped at once by
+	everything that says the server is unreachable or silent: a failed dial, a
+	failed handshake, a timeout.
 	*/
 	if err == .Peer_Closed {
-		return
+		u.closed_run += 1
+		/*
+		Except when that is all the server ever does.
+
+		A run of these is no longer one recycled connection: what reaches this
+		line already had its retry on a connection of its own hung up on too,
+		so `FAILURE_THRESHOLD` of them in a row is a server closing everything
+		it accepts. Left exempt it would never be parked, and - because the
+		retry dials - it would be asked for two connections per query for as
+		long as it kept doing it, which is the opposite of kind to the peer
+		whose limit on connections started this.
+
+		So the exemption is for a run rather than forever, and past it these
+		count like any other failure: the upstream is parked `FAILURE_THRESHOLD`
+		further hang-ups later, and a single success anywhere in between clears
+		the run. A resolver recycling an idle connection never gets near it -
+		one hang-up costs a retry that works, and never reaches here at all.
+		*/
+		if u.closed_run < FAILURE_THRESHOLD {
+			return
+		}
+	} else {
+		u.closed_run = 0
 	}
 	u.failures += 1
 	if u.failures >= FAILURE_THRESHOLD {
@@ -661,6 +690,7 @@ close_idle :: proc(u: ^Upstream, all := false) -> (closed: int) {
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
 
+	pipe_relearn_idle_locked(u)
 	closed += close_pipe(u, all)
 
 	now := time.now()

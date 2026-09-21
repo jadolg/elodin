@@ -81,12 +81,22 @@ reader_fill :: proc(r: ^Buf_Reader) -> Error {
 	if err != .None {
 		return err
 	}
-	// Nothing read and no error is the peer having hung up. Named rather than
-	// folded into `IO_Error` because on a pooled connection it is routine and
-	// `record_failure` must not read it as an outage; `reader_to_end` wants it
-	// for the opposite reason, as the close that ends a body with no length.
+	/*
+	Nothing read and no error is the peer having closed.
+
+	`Peer_Closed` only when it closed without having said anything at all,
+	which on a pooled connection is routine - it is what `Connection:
+	keep-alive` costs when the server's idle timer is shorter than ours - and
+	is the one thing `record_failure` must not read as an outage. Once a byte
+	of the response has arrived the same close is a reply cut in half, which is
+	the server breaking and has to be counted as one; `r.buf` is per exchange,
+	so its being empty is exactly that question.
+
+	`reader_to_end` reaches here for the opposite reason, as the close that
+	ends a body with no length, and discards whichever of the two it gets.
+	*/
 	if n == 0 {
-		return .Peer_Closed
+		return .Peer_Closed if len(r.buf) == 0 else .IO_Error
 	}
 	append(&r.buf, ..chunk[:n])
 	return .None

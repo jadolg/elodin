@@ -195,12 +195,36 @@ http_mock_once :: proc(m: ^Http_Mock) {
 		return
 	}
 	defer net.close(client)
-	// The requests under test are a few hundred bytes, so one read has all of it.
-	buf: [4096]u8
-	_, _ = net.recv_tcp(client, buf[:])
+	drain_request(client)
 	_, _ = net.send_tcp(client, transmute([]u8)m.reply)
 	// Closing here is what ends a reply with no length information, which is how
 	// the truncated-body case below reaches its error path.
+}
+
+/*
+Read whatever the client has sent, before answering or hanging up.
+
+`close` on a socket with unread data in its receive buffer sends an RST rather
+than a FIN, and the two are different errors here: an RST is `IO_Error` where a
+FIN is `Peer_Closed`, which is the distinction half these tests are about. One
+`recv` does not drain it - `http_exchange` writes the headers and the body as
+separate sends, so the request arrives as two segments and the second is still
+in flight when the first is read.
+
+Bounded by a quiet period rather than by parsing the request, because some of
+the callers here dial the mock and send nothing at all: whatever shape the
+client is, a short silence means it has finished.
+*/
+@(private = "file")
+drain_request :: proc(client: net.TCP_Socket) {
+	_ = net.set_option(client, .Receive_Timeout, 50 * time.Millisecond)
+	buf: [4096]u8
+	for {
+		n, err := net.recv_tcp(client, buf[:])
+		if err != nil || n <= 0 {
+			return
+		}
+	}
 }
 
 /*
@@ -2202,10 +2226,10 @@ hangup_mock_loop :: proc(m: ^Hangup_Mock) {
 		sync.atomic_add(&m.conns, 1)
 		// Drained before closing, so the close is a FIN rather than the RST a
 		// socket with unread data sends. A hang-up is the orderly one; a reset
-		// is a different event and not the one under test.
+		// is a different event and not the one under test - see
+		// `drain_request` for why one `recv` is not a drain.
 		_ = net.set_option(client, .Receive_Timeout, 200 * time.Millisecond)
-		buf: [4096]u8
-		_, _ = net.recv_tcp(client, buf[:])
+		drain_request(client)
 		net.close(client)
 	}
 }
@@ -2282,5 +2306,108 @@ test_the_doh_query_that_dialled_is_retried :: proc(t: ^testing.T) {
 	_, err := exchange_doh_h1(u, wire, body, 2 * time.Second, context.temp_allocator)
 	testing.expectf(t, err == .Peer_Closed, "a hang-up was reported as %v", err)
 	testing.expect(t, sync.atomic_load(&m.conns) >= 2, "the query that dialled was not retried")
+	free_all(context.temp_allocator)
+}
+
+/*
+A reply cut in half is the server breaking, not a connection being recycled.
+
+`reader_fill` reaching EOF says the peer closed, and the two cases that reaches
+it are not the same thing: a close before a byte of the response arrived is the
+pooled connection the server had already finished with, and must not count
+towards health; a close partway through one is a reply that cannot be used,
+from a server that is answering badly. Folding the second into `Peer_Closed`
+would leave a resolver truncating every response retried forever and never
+parked.
+*/
+@(test)
+test_a_truncated_reply_is_not_a_hang_up :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+
+	// A status line, a length, and then the connection goes - so bytes did
+	// arrive and the body they promised did not.
+	resp, err, ok := exchange_against(
+		t,
+		"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\nhalf",
+		&track,
+	)
+	if !ok {
+		return
+	}
+	testing.expectf(t, err == .IO_Error, "a truncated reply was reported as %v", err)
+	testing.expect(t, resp.body == nil, "a failed exchange returned a body")
+
+	expect_caller_holds_nothing(t, &track, "truncated reply")
+	free_all(context.temp_allocator)
+}
+
+/*
+Both DoH attempts share one deadline.
+
+The retry above is what makes this reachable: each attempt used to be handed
+the whole of `upstream.timeout`, so a query that retried could cost twice what
+its caller was promised, with an upstream worker held for all of it - the
+compounding `exchange_pipelined` carries one deadline to prevent. Checked at
+the cheap end, where a query arriving with nothing left must not dial at all.
+*/
+@(test)
+test_a_doh_query_with_no_budget_left_does_not_dial :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen: %v", lerr) {
+		return
+	}
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the port: %v", berr) {
+		net.close(listener)
+		return
+	}
+	_ = net.set_option(listener, .Receive_Timeout, 200 * time.Millisecond)
+
+	m := Hangup_Mock {
+		listener = listener,
+	}
+	responder := thread.create_and_start_with_poly_data(&m, hangup_mock_loop)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(responder)
+		thread.destroy(responder)
+		net.close(listener)
+	}
+
+	u, uerr := make_upstream(
+		config.Upstream_Spec {
+			name = "spent",
+			kind = .TCP,
+			address = "127.0.0.1",
+			port = bound.port,
+			hostname = "doh.invalid",
+			path = "/dns-query",
+		},
+		8,
+		30 * time.Second,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot make the upstream: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+
+	query := dns.Message {
+		id       = 0x8484,
+		question = []dns.Question{{name = "example.com.", type = .A, class = .IN}},
+	}
+	query.flags.rd = true
+	wire, _, enc := dns.encode_message(query, context.temp_allocator)
+	if !testing.expectf(t, enc == .None, "cannot encode: %v", enc) {
+		return
+	}
+	body := make([]u8, len(wire), context.temp_allocator)
+	copy(body, wire)
+	dns.set_id_in_place(body, 0)
+
+	_, err := exchange_doh_h1(u, wire, body, 0, context.temp_allocator)
+	testing.expectf(t, err == .Timeout, "a query with no budget reported %v", err)
+	testing.expect_value(t, sync.atomic_load(&m.conns), 0)
 	free_all(context.temp_allocator)
 }

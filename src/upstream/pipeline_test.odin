@@ -1777,7 +1777,11 @@ recycle_mock_loop :: proc(m: ^Recycle_Mock) {
 		// The first connection answers `before` queries and hangs up; later
 		// ones stay put, which is what the retry has to find.
 		budget := m.before if n == 0 else max(int)
-		for i := 0; i < budget; i += 1 {
+		// The query is read before the hang-up rather than left in the receive
+		// buffer, because `close` with unread data sends an RST and an RST is
+		// `IO_Error` where a FIN is `Peer_Closed`. The connection being
+		// recycled is the orderly one, and it is the one under test.
+		for i := 0; ; i += 1 {
 			length_buf: [2]u8
 			if !recycle_read(m, client, length_buf[:]) {
 				break
@@ -1788,6 +1792,9 @@ recycle_mock_loop :: proc(m: ^Recycle_Mock) {
 			}
 			q := make([]u8, ln, context.temp_allocator)
 			if !recycle_read(m, client, q) {
+				break
+			}
+			if i >= budget {
 				break
 			}
 			out := make([]u8, 2 + ln, context.temp_allocator)
@@ -1910,20 +1917,60 @@ test_a_hang_up_is_counted_but_does_not_park_the_upstream :: proc(t: ^testing.T) 
 	}
 	defer destroy(u)
 
-	for _ in 0 ..< FAILURE_THRESHOLD + 2 {
-		record_failure(u, .Peer_Closed)
+	// Short of the run that says the server closes everything: each of these
+	// is one recycled connection, and a success clears the count between them.
+	for _ in 0 ..< 20 {
+		for _ in 0 ..< FAILURE_THRESHOLD - 1 {
+			record_failure(u, .Peer_Closed)
+		}
+		record_success(u, time.Millisecond)
 	}
 	testing.expect(t, healthy(u), "hang-ups parked an upstream that is still answering")
 
 	st := stats_of(u)
-	testing.expect_value(t, st.failures, u64(FAILURE_THRESHOLD + 2))
-	testing.expect_value(t, st.failure_kinds[.Peer_Closed], u64(FAILURE_THRESHOLD + 2))
+	testing.expect_value(t, st.failures, u64(20 * (FAILURE_THRESHOLD - 1)))
+	testing.expect_value(t, st.failure_kinds[.Peer_Closed], u64(20 * (FAILURE_THRESHOLD - 1)))
 
-	// And what does say the server is unreachable still parks it.
+	// And what does say the server is unreachable still parks it at once.
 	for _ in 0 ..< FAILURE_THRESHOLD {
 		record_failure(u, .Dial_Failed)
 	}
 	testing.expect(t, !healthy(u), "a run of failed dials left the upstream up")
+	free_all(context.temp_allocator)
+}
+
+/*
+A server that closes everything it accepts is parked after all.
+
+The exemption above is for a run, not forever. What reaches `record_failure` as
+`Peer_Closed` has already had its retry hung up on too, so a run of them is no
+longer a recycled connection but a server refusing to carry a query - and left
+exempt it would never be parked while being asked for two connections per query
+for as long as it kept it up, against the sort of peer that rate-limits exactly
+that.
+*/
+@(test)
+test_a_server_that_closes_everything_is_parked_eventually :: proc(t: ^testing.T) {
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "shutter", kind = .TCP, address = "127.0.0.1", port = 5353},
+		0,
+		time.Second,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot make the upstream: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+
+	// The first `FAILURE_THRESHOLD` are exempt and each one past them counts
+	// like any other failure, so the cooldown lands on the one after that -
+	// `2 * FAILURE_THRESHOLD - 1` in all, not at once and not never.
+	for _ in 0 ..< 2 * FAILURE_THRESHOLD - 2 {
+		record_failure(u, .Peer_Closed)
+	}
+	testing.expect(t, healthy(u), "a run of hang-ups parked the upstream too early")
+
+	record_failure(u, .Peer_Closed)
+	testing.expect(t, !healthy(u), "a server closing every connection was never parked")
 	free_all(context.temp_allocator)
 }
 
@@ -1934,6 +1981,21 @@ Neither public resolver advertises edns-tcp-keepalive, so being hung up on is
 the only way to learn the figure, and the shipped thirty seconds is longer than
 either of them keeps a connection.
 */
+/*
+The locked accessor, under the lock, as `close_pipe` and `get_pipe` take it.
+
+Here rather than beside `pipe_idle_ceiling_locked` because production has no
+use for an unlocked one: an accessor that takes `u.mu` a second time inside a
+sweep already holding it is the deadlock these tests exist under, and leaving
+one in the package for the tests' sake leaves it there to be reached for.
+*/
+@(private = "file")
+idle_ceiling :: proc(u: ^Upstream) -> time.Duration {
+	sync.mutex_lock(&u.mu)
+	defer sync.mutex_unlock(&u.mu)
+	return pipe_idle_ceiling_locked(u)
+}
+
 @(test)
 test_the_idle_ceiling_is_learned_from_being_hung_up_on :: proc(t: ^testing.T) {
 	u, uerr := make_upstream(
@@ -1946,25 +2008,25 @@ test_the_idle_ceiling_is_learned_from_being_hung_up_on :: proc(t: ^testing.T) {
 	}
 	defer destroy(u)
 
-	testing.expect_value(t, pipe_idle_ceiling(u), 30 * time.Second)
+	testing.expect_value(t, idle_ceiling(u), 30 * time.Second)
 
 	// Hung up on after 12s idle: reap at three quarters of that from now on.
 	note_idle_death(u, 12 * time.Second)
-	testing.expect_value(t, pipe_idle_ceiling(u), 9 * time.Second)
+	testing.expect_value(t, idle_ceiling(u), 9 * time.Second)
 
 	// A longer gap says nothing new - the peer was already known to hang up
 	// sooner than that.
 	note_idle_death(u, 20 * time.Second)
-	testing.expect_value(t, pipe_idle_ceiling(u), 9 * time.Second)
+	testing.expect_value(t, idle_ceiling(u), 9 * time.Second)
 
 	// A shorter one does.
 	note_idle_death(u, 8 * time.Second)
-	testing.expect_value(t, pipe_idle_ceiling(u), 6 * time.Second)
+	testing.expect_value(t, idle_ceiling(u), 6 * time.Second)
 
 	// Below the floor it is the peer refusing this connection rather than a
 	// timer, and following it would have the reaper outrunning the queries.
 	note_idle_death(u, 100 * time.Millisecond)
-	testing.expect_value(t, pipe_idle_ceiling(u), 6 * time.Second)
+	testing.expect_value(t, idle_ceiling(u), 6 * time.Second)
 
 	// The configured value is still a ceiling, never raised by what is learned.
 	v, verr := make_upstream(
@@ -1977,7 +2039,7 @@ test_the_idle_ceiling_is_learned_from_being_hung_up_on :: proc(t: ^testing.T) {
 	}
 	defer destroy(v)
 	note_idle_death(v, 20 * time.Second)
-	testing.expect_value(t, pipe_idle_ceiling(v), 3 * time.Second)
+	testing.expect_value(t, idle_ceiling(v), 3 * time.Second)
 	free_all(context.temp_allocator)
 }
 
@@ -2125,6 +2187,52 @@ test_a_timeout_does_not_teach_an_idle_ceiling :: proc(t: ^testing.T) {
 	_, e2 := exchange(u, wire, 200 * time.Millisecond, context.temp_allocator)
 	testing.expectf(t, e2 == .Timeout, "the silent server answered: %v", e2)
 
-	testing.expect_value(t, pipe_idle_ceiling(u), 30 * time.Second)
+	testing.expect_value(t, idle_ceiling(u), 30 * time.Second)
+	free_all(context.temp_allocator)
+}
+
+/*
+A learned idle timeout is forgotten so it can be learned again.
+
+What `note_idle_death` learns only ever comes down, so a hang-up that was
+nothing to do with an idle timer - a restart, a drain, a deploy - is remembered
+as if it were, and with the ceiling already low the gap it is observed at can
+take what is learned to `PIPE_IDLE_FLOOR`. Left there it would outlive the
+cause by the uptime of the process, dialling afresh for nearly every query on a
+quiet forwarder. `close_idle` drops it once it is `PIPE_IDLE_RELEARN` old.
+*/
+@(test)
+test_a_learned_idle_ceiling_is_forgotten_and_learned_again :: proc(t: ^testing.T) {
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "restarter", kind = .TCP, address = "127.0.0.1", port = 5353},
+		0,
+		30 * time.Second,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot make the upstream: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+
+	note_idle_death(u, 4 * time.Second)
+	testing.expect_value(t, idle_ceiling(u), 3 * time.Second)
+
+	// A sweep while it is still fresh leaves it alone; otherwise the figure
+	// would be thrown away before it was ever used.
+	_ = close_idle(u)
+	testing.expect_value(t, idle_ceiling(u), 3 * time.Second)
+
+	// Aged past the window, the way the maintenance loop would find it an hour
+	// on. Poked rather than waited for, which is the only part of this a test
+	// cannot have for real.
+	sync.mutex_lock(&u.mu)
+	u.idle_learned = time.time_add(u.idle_learned, -(PIPE_IDLE_RELEARN + time.Second))
+	sync.mutex_unlock(&u.mu)
+
+	_ = close_idle(u)
+	testing.expect_value(t, idle_ceiling(u), 30 * time.Second)
+
+	// And it learns again from there rather than being stuck at the old floor.
+	note_idle_death(u, 20 * time.Second)
+	testing.expect_value(t, idle_ceiling(u), 15 * time.Second)
 	free_all(context.temp_allocator)
 }

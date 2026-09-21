@@ -110,6 +110,25 @@ learned ceiling is held at. See `note_idle_death`.
 */
 PIPE_IDLE_FLOOR :: 2 * time.Second
 
+/*
+How long a learned idle timeout is trusted before it is forgotten and learned
+again.
+
+What `note_idle_death` learns only ever comes down and never back up, so a
+hang-up that had nothing to do with an idle timer - a server restarting, a load
+balancer draining, a deploy rolling - is remembered as if it did, for the life
+of the process. The gap it was observed at can be short: with the ceiling
+already down at a few seconds, a restart while the connection sat idle takes
+what is learned to `PIPE_IDLE_FLOOR`, and from then on nearly every query on a
+quiet forwarder dials afresh - against the upstream whose limit on how often a
+source may connect is what this was all written for.
+
+Forgetting it costs one dead query an hour per upstream, which the retry in
+`exchange_pipelined` makes invisible, and bounds the damage of a bad sample to
+an hour rather than to the uptime.
+*/
+PIPE_IDLE_RELEARN :: time.Hour
+
 @(private)
 Pipe_Waiter :: struct {
 	/*
@@ -264,6 +283,7 @@ note_idle_death :: proc(u: ^Upstream, idled: time.Duration) {
 	defer sync.mutex_unlock(&u.mu)
 	if u.idle_died == 0 || idled < u.idle_died {
 		u.idle_died = idled
+		u.idle_learned = time.now()
 		logx.debugf(
 			"upstream %s: hung up after %v idle, reaping its connection at %v from now on",
 			u.spec.name,
@@ -285,11 +305,27 @@ pipe_idle_ceiling_locked :: proc(u: ^Upstream) -> time.Duration {
 	return min(u.idle_timeout, learned)
 }
 
+/*
+Forget a learned idle timeout once it is `PIPE_IDLE_RELEARN` old.
+
+Called from `close_idle`, which every maintenance tick reaches for every
+upstream and which already holds `u.mu`. See `PIPE_IDLE_RELEARN` for why a
+figure that only ever comes down has to be allowed to go back up somehow.
+*/
 @(private)
-pipe_idle_ceiling :: proc(u: ^Upstream) -> time.Duration {
-	sync.mutex_lock(&u.mu)
-	defer sync.mutex_unlock(&u.mu)
-	return pipe_idle_ceiling_locked(u)
+pipe_relearn_idle_locked :: proc(u: ^Upstream) {
+	if u.idle_died == 0 {
+		return
+	}
+	if time.diff(u.idle_learned, time.now()) < PIPE_IDLE_RELEARN {
+		return
+	}
+	logx.debugf(
+		"upstream %s: forgetting the %v idle timeout learned of it, to learn it again",
+		u.spec.name,
+		u.idle_died,
+	)
+	u.idle_died = 0
 }
 
 @(private)

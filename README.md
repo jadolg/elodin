@@ -419,10 +419,12 @@ recycled is ordinary operation rather than an outage, and it is simply asked
 again on a connection of its own. Letting a run of those trip the cooldown took
 a server answering 97% of what it was asked out of service every couple of
 minutes, and sent every query in each of those windows to the fallback. What
-still parks an upstream is everything that says it is unreachable or silent: a
-dial that failed, a handshake that failed, a connection that went quiet until
-the timeout. The residual is that a server closing every connection it accepts
-is never parked and costs each query a failover instead;
+still parks an upstream at once is everything that says it is unreachable or
+silent: a dial that failed, a handshake that failed, a connection that went
+quiet until the timeout. The exemption is for a run rather than forever — a
+server whose second connection is hung up on too, over and over, is parked a
+few queries later than one that is simply unreachable, since otherwise it would
+be asked for two connections per query indefinitely.
 `elodin_upstream_failure_kind_total{error="peer_closed"}` is what names one.
 
 No resolver in practice advertises edns-tcp-keepalive (RFC 7828), so the only
@@ -431,7 +433,10 @@ remember it. `upstream.idle_timeout` is therefore a ceiling rather than the
 figure used: an upstream that hangs up after an idle gap has its connection
 reaped at three quarters of that gap from then on, so the next query dials
 instead of being handed something already gone. The learned value only ever
-comes down, and never below two seconds. A TLS handshake the peer
+comes down, and never below two seconds; it is forgotten after an hour and
+learned again, so a hang-up that was nothing to do with an idle timer — a
+restart, a drain, a deploy — is not remembered as one for the life of the
+process. A TLS handshake the peer
 resets partway through is retried once first, since some public resolvers do that
 to a fair share of fresh connections while the very next attempt goes through.
 Only a reset is retried.
@@ -459,8 +464,8 @@ What the kinds mean, on the transports where two of them used to look alike:
 | | |
 |---|---|
 | `Timeout` | nothing usable arrived inside `upstream.timeout`. On `tls://` and `https://` this now includes a session that handshook and then went quiet, which used to be reported as `IO_Error` |
-| `Peer_Closed` | the peer hung up without answering. Retried at once on a connection of this query's own — whether the connection was one it found already open or one it dialled itself — so what reaches the counter is a second hang-up as well. The one kind that does not count towards the failure cooldown |
-| `IO_Error` | the transport itself failed on an established session, which is neither of the two above |
+| `Peer_Closed` | the peer hung up *before a byte of the reply arrived*. Retried at once on a connection of this query's own — whether the connection was one it found already open or one it dialled itself — so what reaches the counter is a second hang-up as well. The one kind a single occurrence of which does not count towards the failure cooldown; a sustained run of them still does |
+| `IO_Error` | the transport itself failed on an established session, which is neither of the two above — including a reply that started arriving and was cut off, since that is a server answering badly rather than one recycling a connection |
 | `Bad_Response` | a reply arrived from the server we asked and was thrown away: it did not echo the question, or on `udp://`/`tcp://` it did not carry the DNS cookie the query went out with. On `udp://` this used to be indistinguishable from `Timeout`, since the loop passes over a datagram it will not accept and waits out the deadline |
 | `TLS_Failed`, `Verify_Failed` | the handshake. `Error` has nowhere to carry OpenSSL's reason, so the line above carries it instead — it is the whole diagnosis, and `TLS_Failed` on its own is not |
 
@@ -2300,7 +2305,7 @@ as a warning at startup.
 | `elodin_filter_rules{list}` | gauge | rules loaded, `block` and `allow` |
 | `elodin_upstream_queries_total{upstream}` | counter | queries sent to each upstream, by its configured name |
 | `elodin_upstream_failures_total{upstream}` | counter | exchanges that produced no usable answer |
-| `elodin_upstream_failure_kind_total{upstream,error}` | counter | the same exchanges, split by what went wrong: `timeout`, `io_error`, `peer_closed`, `bad_response`, `tls_failed`, `verify_failed`, `dial_failed`, `dial_reset`, `http_error`, `too_large`, `not_resolved`, `unhealthy`. `peer_closed` is the one kind that does not count towards the failure cooldown. Only the kinds that have happened; `sum by (upstream)` of this is the family above. The log says each kind once per process, so this is the only continuous account of *which* way an upstream is failing, and that is the half that decides what to do about it |
+| `elodin_upstream_failure_kind_total{upstream,error}` | counter | the same exchanges, split by what went wrong: `timeout`, `io_error`, `peer_closed`, `bad_response`, `tls_failed`, `verify_failed`, `dial_failed`, `dial_reset`, `http_error`, `too_large`, `not_resolved`, `unhealthy`. `peer_closed` on its own does not count towards the failure cooldown, though a sustained run of it does. Only the kinds that have happened; `sum by (upstream)` of this is the family above. The log says each kind once per process, so this is the only continuous account of *which* way an upstream is failing, and that is the half that decides what to do about it |
 | `elodin_upstream_latency_seconds_total{upstream}` | counter | cumulative round-trip time; divide by the query counter under `rate()` for the mean |
 | `elodin_upstream_up{upstream}` | gauge | 0 while an upstream is in its failure cooldown |
 | `elodin_upstream_unreadable_rcode_total{upstream}` | counter | replies from each upstream refused because their rcode is one a client would read as a different rcode — the extended half lives in the OPT record and a stub reads the header. Not counted as a failure above, on purpose: those bytes are forgeable, and a failure would park the group |
