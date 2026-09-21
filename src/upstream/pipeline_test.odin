@@ -1102,13 +1102,19 @@ test_waiting_for_a_dial_is_bounded_by_the_callers_own_timeout :: proc(t: ^testin
 	LEGS :: 4
 	BUDGET :: 400 * time.Millisecond
 	/*
-	Two dials' worth, which is the bound: a caller that breaks out of the
-	queue with a sliver of its deadline left still dials on the full timeout,
-	so one dial can follow another, but the caller behind *that* is past its
-	deadline and never starts a third. Four in a row, which is what this is
-	looking for, is twice this.
+	One dial's worth and a little, because every stage is handed the same
+	deadline: the caller that dials spends the budget, and the ones queued
+	behind it are past their own deadlines by the time it fails and never
+	start a second.
+
+	The window this sits in is worth naming, since a limit that catches
+	nothing is worse than no limit. Four callers dialling one after another,
+	which is what the queue used to cost, is four budgets. A single caller
+	coming out of the queue and dialling on the full timeout rather than on
+	what it had left - the narrower regression - is two. Measured, this lands
+	a little over one.
 	*/
-	LIMIT :: 3 * BUDGET
+	LIMIT :: 8 * BUDGET / 5
 
 	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
 	if lerr != nil {

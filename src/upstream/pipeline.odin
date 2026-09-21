@@ -194,10 +194,10 @@ pipe_state :: proc(c: ^Pipe_Conn, idle_timeout: time.Duration, limit: int) -> Pi
 }
 
 @(private)
-pipe_dead :: proc(c: ^Pipe_Conn) -> bool {
+pipe_dead :: proc(c: ^Pipe_Conn) -> (err: Error, dead: bool) {
 	sync.mutex_lock(&c.mu)
 	defer sync.mutex_unlock(&c.mu)
-	return c.dead
+	return c.err, c.dead
 }
 
 // Kill the connection and everyone still waiting on it. Called with `c.mu`.
@@ -389,7 +389,8 @@ exchange_pipelined :: proc(
 		return nil, gerr
 	}
 	response, err = pipe_query(u, c, query, deadline, allocator)
-	if err == .None || fresh || !pipe_dead(c) {
+	_, dead := pipe_dead(c)
+	if err == .None || fresh || !dead {
 		pipe_unref(c)
 		return response, err
 	}
@@ -771,6 +772,26 @@ pipe_write :: proc(c: ^Pipe_Conn, query: []u8) -> Error {
 
 	sync.mutex_lock(&c.wmu)
 	defer sync.mutex_unlock(&c.wmu)
+	/*
+	Whoever was ahead of this in the queue may have found the connection gone
+	while this one waited, and a write to a connection that is finished is a
+	write that can only fail.
+
+	It matters more than it looks. One message goes on the wire at a time, so
+	writers queue here, and the case that makes the queue long is a peer that
+	has stopped reading: the send buffer fills, each writer blocks until the
+	socket's send timeout, and they take their turns one after another. The
+	first of them kills the connection; this is what stops the rest from each
+	spending a timeout of their own discovering the same thing.
+
+	ponytail: the writers still serialize while the first one blocks, which is
+	the price of one connection carrying every query. Per-message send
+	deadlines would bound it if a peer that stops reading ever turns out to be
+	common enough to matter.
+	*/
+	if werr, dead := pipe_dead(c); dead {
+		return werr
+	}
 	if c.stream.tls != nil {
 		if _, werr := tlsx.write(c.stream.tls, framed); werr != .None {
 			return roundtrip_failure(werr)

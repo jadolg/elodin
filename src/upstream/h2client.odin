@@ -118,18 +118,19 @@ get_h2_conn :: proc(u: ^Upstream, timeout: time.Duration) -> (conn: ^h2.Client, 
 			sync.mutex_unlock(&u.mu)
 			return conn, true, .None
 		}
-		if !u.connecting {
-			break
-		}
 		// Bounded by this caller's own deadline, for the reason `get_pipe`
 		// gives: a dial against an upstream that is not answering takes the
 		// whole timeout and fails, and unbounded, the callers queued behind it
 		// dial one after another and the last returns at a multiple of the
-		// budget it was given.
+		// budget it was given. Above the break as well as the wait, since a
+		// caller that wakes to a finished dial goes on to start one of its own.
 		remaining := time.diff(time.now(), deadline)
 		if remaining <= 0 {
 			sync.mutex_unlock(&u.mu)
 			return nil, false, .Timeout
+		}
+		if !u.connecting {
+			break
 		}
 		sync.cond_wait_with_timeout(&u.conn_cond, &u.mu, remaining)
 	}
@@ -145,7 +146,12 @@ get_h2_conn :: proc(u: ^Upstream, timeout: time.Duration) -> (conn: ^h2.Client, 
 		close_h2_conn(stale, u.allocator)
 	}
 
-	stream, proto, derr := negotiate_https(u, timeout)
+	// What is left of this caller's deadline rather than the whole timeout, so
+	// the caller that came out of the queue does not add a full dial to what it
+	// already spent waiting for the one in front of it. `dial_pipe` splits the
+	// two for the same reason. Floored, so a caller that is only just inside
+	// its deadline still makes one bounded attempt.
+	stream, proto, derr := negotiate_https(u, max(time.diff(time.now(), deadline), time.Millisecond))
 
 	sync.mutex_lock(&u.mu)
 	u.connecting = false
@@ -158,6 +164,20 @@ get_h2_conn :: proc(u: ^Upstream, timeout: time.Duration) -> (conn: ^h2.Client, 
 	if proto != .H2 {
 		sync.cond_broadcast(&u.conn_cond)
 		sync.mutex_unlock(&u.mu)
+		/*
+		Back to the configured timeout before this goes in the pool.
+
+		The dial above was budgeted at what its caller had left, which may be a
+		sliver, and `open_stream` puts that figure on the socket. A pooled
+		connection carrying it would give every later request on it a deadline
+		belonging to the query that happened to open it - the same confusion
+		`Pipe_Conn.timeout` exists to avoid. The h2 branch below overrides both
+		already, for its own reasons.
+		*/
+		set_socket_timeouts(stream.socket, timeout)
+		if stream.tls != nil {
+			tlsx.set_timeouts(stream.tls, timeout, timeout)
+		}
 		put_idle(u, Idle_Conn{socket = stream.socket, tls = stream.tls})
 		return nil, false, .None
 	}
