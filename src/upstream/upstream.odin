@@ -95,6 +95,12 @@ Upstream :: struct {
 	// pipelined onto: `tcp` and `tls` throughout, and a `udp` upstream's retry
 	// of a truncated answer. See pipeline.odin.
 	pipe:       ^Pipe_Conn,
+	// Queries that connection may carry at once, from
+	// `PIPELINE_MAX_OUTSTANDING`. Per upstream rather than a constant read
+	// where it is used, so a test can reach the overflow path without the
+	// hundreds of threads the shipped figure would need - and so it has
+	// somewhere to come from should it ever be derived from the worker counts.
+	max_outstanding: int,
 
 	// Whether queries to this server carry a DNS cookie. The client half is
 	// fixed at construction; the server half is learned and lives under `mu`.
@@ -161,6 +167,7 @@ make_upstream :: proc(
 	u.max_idle = max(max_idle, 0)
 	u.idle_timeout = idle_timeout
 	u.idle = make([dynamic]Idle_Conn, 0, max(max_idle, 1), allocator)
+	u.max_outstanding = PIPELINE_MAX_OUTSTANDING
 	u.cookies = cookies
 	init_cookie(u)
 

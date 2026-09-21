@@ -44,17 +44,38 @@ and the caller's is put back on the answer before it is returned.
 /*
 How many queries may be outstanding on one connection at once.
 
-Not a throughput limit - a connection carrying 64 unanswered queries is one
-whose server has stopped answering, and the figure bounds what that costs
-rather than what a working one may do. At the bound a caller opens a private
-connection for its query instead of queueing behind them, so a stalled upstream
-slows callers down without shutting them out.
+A backstop, and deliberately not a throughput limit. Past it a caller dials a
+connection for its own query and closes it again afterwards, which is a fresh
+handshake per query and worse churn than the pool this replaced - so the figure
+has to sit above every number of callers the server can actually put in
+`exchange` at once, or the fix becomes the bug.
 
-Sized against the worker pools rather than at random: `upstream_workers` is
-what can be in `exchange` at once per upstream, and a default configuration
-sizes it well under this.
+That number is the handlers, not the racers: `resolve_sequential` - failover and
+round_robin, so the default - calls `exchange` on the handler thread itself, and
+only a race group hands the work to `upstream_workers`. `derive_workers` stops
+at `MAX_DERIVED_WORKERS`, 128, and brings half its count again in racers, so a
+derived configuration tops out near 192 callers per upstream. 256 clears that.
+
+Which leaves the bound doing what it was asked to do and nothing else: a server
+that has stopped answering cannot pile up waiters without limit, and one that
+is merely busy never reaches it. A hand-configured `server.workers` above this
+would, and would pay the churn; `Upstream.max_outstanding` is where that would
+be derived from the configuration if it ever needs to be.
 */
-PIPELINE_MAX_OUTSTANDING :: 64
+PIPELINE_MAX_OUTSTANDING :: 256
+
+/*
+Callers in a row that have to run out of time on a silent connection before it
+is treated as gone rather than slow. See the argument in `pipe_wait`: one lone
+timeout is what a slow name looks like on a quiet forwarder, and dialling on it
+would spend a new connection per slow name.
+
+Two, because the thing being told apart is "nothing at all, twice" from "one
+late answer", and a third would only delay the recovery. What it costs is one
+extra timeout before a connection that really has gone is replaced, against the
+fifteen minutes it used to cost.
+*/
+PIPE_SILENT_TIMEOUTS :: 2
 
 @(private)
 Pipe_Waiter :: struct {
@@ -100,6 +121,9 @@ Pipe_Conn :: struct {
 	// Messages read off this connection, for anyone at all. What a caller that
 	// timed out compares against its own `Pipe_Waiter.seen`.
 	replies:   u64,
+	// Callers in a row that ran out of time on a connection that had nothing
+	// to say to anybody. Back to zero the moment anything is read off it.
+	silent:    int,
 	/*
 	What this connection was dialled with, and the budget a message half read
 	is finished on.
@@ -154,7 +178,7 @@ pipe_unref :: proc(c: ^Pipe_Conn) {
 }
 
 @(private)
-pipe_state :: proc(c: ^Pipe_Conn, idle_timeout: time.Duration) -> Pipe_State {
+pipe_state :: proc(c: ^Pipe_Conn, idle_timeout: time.Duration, limit: int) -> Pipe_State {
 	sync.mutex_lock(&c.mu)
 	defer sync.mutex_unlock(&c.mu)
 	if c.dead {
@@ -163,7 +187,7 @@ pipe_state :: proc(c: ^Pipe_Conn, idle_timeout: time.Duration) -> Pipe_State {
 	if len(c.waiters) == 0 && time.diff(c.last, time.now()) >= idle_timeout {
 		return .Gone
 	}
-	if len(c.waiters) >= PIPELINE_MAX_OUTSTANDING {
+	if len(c.waiters) >= limit {
 		return .Full
 	}
 	return .Ready
@@ -261,8 +285,30 @@ get_pipe :: proc(
 ) {
 	sync.mutex_lock(&u.mu)
 	for {
+		/*
+		Ahead of everything below, and that is not belt and braces.
+
+		A dial against a blackholed upstream takes the whole timeout and fails.
+		Unbounded, the caller that was waiting for it then starts a dial of its
+		own with the next one waiting behind that, so a burst of N callers
+		dials N times end to end and the last of them returns at N times the
+		budget it was given - holding an upstream worker for all of it, long
+		past the point its own caller stopped waiting. Guarding only the wait
+		would leave the same queue one dial shorter, and guarding only the
+		shared dial would still spend a connect on every caller that came out
+		of the queue past its deadline and found the connection full.
+
+		A caller that breaks out with a sliver left dials on that sliver, since
+		`exchange_pipelined` hands every stage the same deadline: what it is
+		owed is its timeout, not one per stage it passes through.
+		*/
+		remaining := time.diff(time.now(), deadline)
+		if remaining <= 0 {
+			sync.mutex_unlock(&u.mu)
+			return nil, false, .Timeout
+		}
 		if u.pipe != nil {
-			switch pipe_state(u.pipe, u.idle_timeout) {
+			switch pipe_state(u.pipe, u.idle_timeout, u.max_outstanding) {
 			case .Ready:
 				c = u.pipe
 				pipe_ref(c)
@@ -277,27 +323,6 @@ get_pipe :: proc(
 				return c, true, err
 			case .Gone:
 			}
-		}
-		/*
-		Ahead of both the wait and the dial below, and that is not belt and
-		braces.
-
-		A dial against a blackholed upstream takes the whole timeout and fails.
-		Unbounded, the caller that was waiting for it then starts a dial of its
-		own with the next one waiting behind that, so a burst of N callers
-		dials N times end to end and the last of them returns at N times the
-		budget it was given - holding an upstream worker for all of it, long
-		past the point its own caller stopped waiting. Guarding only the wait
-		would leave the same queue one dial shorter.
-
-		A caller that breaks out with a sliver left dials on that sliver, since
-		`exchange_pipelined` hands every stage the same deadline: what it is
-		owed is its timeout, not one per stage it passes through.
-		*/
-		remaining := time.diff(time.now(), deadline)
-		if remaining <= 0 {
-			sync.mutex_unlock(&u.mu)
-			return nil, false, .Timeout
 		}
 		if !u.connecting {
 			break
@@ -376,6 +401,12 @@ exchange_pipelined :: proc(
 	this query's clock out has already had the time, so there is none to spend
 	again; the query after this one finds the connection dead and dials afresh,
 	which is what makes a server that vanished recoverable.
+
+	`get_pipe` would refuse the redial on the same deadline anyway, so what
+	this adds is the error: it reports what actually went wrong with this query
+	rather than the `Timeout` a refused redial would report, and
+	`elodin_upstream_failure_kind_total` is only worth reading if a reply that
+	could not be used is counted as one.
 	*/
 	if time.diff(time.now(), deadline) <= 0 {
 		pipe_unref(c)
@@ -480,7 +511,7 @@ pipe_take_id :: proc(c: ^Pipe_Conn) -> (id: u16, ok: bool) {
 			return id, true
 		}
 	}
-	// Unreachable under PIPELINE_MAX_OUTSTANDING, which is four orders of
+	// Unreachable under `Upstream.max_outstanding`, which is orders of
 	// magnitude below the number of IDs.
 	return 0, false
 }
@@ -516,16 +547,26 @@ pipe_wait :: proc(c: ^Pipe_Conn, w: ^Pipe_Waiter, id: u16, deadline: time.Time) 
 			c.last = time.now()
 			/*
 			Nobody is left on this connection and nothing came back on it for
-			anybody, so it is the connection that has stopped rather than one
-			answer that is late - and nothing else here would ever notice. A
-			peer that goes away without a FIN or an RST (a firewall dropping an
-			idle mapping, an upstream rebooting, a route moving) leaves the
-			writes succeeding into the send buffer and every read timing out,
-			and a read timeout deliberately does not kill the connection. The
-			idle reaper cannot help either: a connection under steady traffic
-			is never idle. Left alone, the upstream would sit wedged on one
-			useless socket until the kernel gave up on the unacked data, which
-			on Linux is about fifteen minutes.
+			anybody while this caller waited. Evidence the connection has
+			stopped rather than that one answer is late - and nothing else here
+			would ever notice. A peer that goes away without a FIN or an RST (a
+			firewall dropping an idle mapping, an upstream rebooting, a route
+			moving) leaves the writes succeeding into the send buffer and every
+			read timing out, and a read timeout deliberately does not kill the
+			connection. The idle reaper cannot help either: a connection under
+			steady traffic is never idle. Left alone, the upstream would sit
+			wedged on one useless socket until the kernel gave up on the
+			unacked data, which on Linux is about fifteen minutes.
+
+			Evidence rather than proof, which is why it is counted rather than
+			acted on. A forwarder with one query in flight at a time meets both
+			conditions on every lone timeout it ever has, so acting on the
+			first would dial a new connection for each slow name - a new
+			connection being the one thing the upstream this was all written
+			for rate-limits. Two in a row with nothing at all in between is a
+			connection that has stopped; one is a slow answer. The count goes
+			back to zero the moment anything is read, so the two cannot be
+			confused by distance in time.
 
 			Killing it puts back what the pooled path did on every failed round
 			trip: `exchange_pipelined` finds the connection dead and the next
@@ -536,14 +577,14 @@ pipe_wait :: proc(c: ^Pipe_Conn, w: ^Pipe_Waiter, id: u16, deadline: time.Time) 
 			this one query is this query's problem. And a caller still waiting
 			says the same about the future: an impatient caller must not take
 			down a connection whose answer to a patient one is still on its
-			way. Which leaves the case this is for - a connection with nobody
-			on it that has never produced anything - and the health cooldown is
-			what makes that state arrive: three failures park the upstream, the
-			waiters drain, and the last one out closes the door.
+			way.
 			*/
 			if c.replies == w.seen && len(c.waiters) == 0 {
-				pipe_kill(c, .Timeout)
-				sync.cond_broadcast(&c.cond)
+				c.silent += 1
+				if c.silent >= PIPE_SILENT_TIMEOUTS {
+					pipe_kill(c, .Timeout)
+					sync.cond_broadcast(&c.cond)
+				}
 			}
 			return .Timeout
 		}
@@ -625,6 +666,7 @@ pipe_deliver :: proc(c: ^Pipe_Conn, msg: []u8) {
 	// nobody's: what a waiter reads off this is whether the connection is
 	// still delivering, not whether it was delivered anything itself.
 	c.replies += 1
+	c.silent = 0
 
 	w, waiting := c.waiters[id]
 	if !waiting {
@@ -751,7 +793,7 @@ close_pipe :: proc(u: ^Upstream, all: bool) -> (closed: int) {
 	if u.pipe == nil {
 		return 0
 	}
-	if !all && pipe_state(u.pipe, u.idle_timeout) != .Gone {
+	if !all && pipe_state(u.pipe, u.idle_timeout, u.max_outstanding) != .Gone {
 		return 0
 	}
 	c := u.pipe

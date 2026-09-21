@@ -320,7 +320,12 @@ second connection - which under the shared path alone it never would.
 */
 @(test)
 test_a_full_connection_does_not_shut_callers_out :: proc(t: ^testing.T) {
-	LEGS :: PIPELINE_MAX_OUTSTANDING + 4
+	// The upstream's own figure rather than the shipped one, which sits above
+	// every number of callers the server can put in `exchange` at once and
+	// would need hundreds of threads to reach. What is under test is the
+	// branch, not the constant.
+	BOUND :: 8
+	LEGS :: BOUND + 4
 
 	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
 	if lerr != nil {
@@ -362,6 +367,7 @@ test_a_full_connection_does_not_shut_callers_out :: proc(t: ^testing.T) {
 		return
 	}
 	defer destroy(u)
+	u.max_outstanding = BOUND
 
 	legs := make([]Pipe_Leg, LEGS)
 	defer delete(legs)
@@ -385,8 +391,8 @@ test_a_full_connection_does_not_shut_callers_out :: proc(t: ^testing.T) {
 		t,
 		sync.atomic_load(&m.conns) >= 2,
 		"%d callers past the bound of %d all queued onto one connection",
-		LEGS - PIPELINE_MAX_OUTSTANDING,
-		PIPELINE_MAX_OUTSTANDING,
+		LEGS - BOUND,
+		BOUND,
 	)
 	for leg, i in legs {
 		testing.expectf(t, leg.err == .Timeout, "leg %d ended as %v, expected a timeout", i, leg.err)
@@ -745,17 +751,27 @@ test_a_connection_that_stopped_answering_is_dropped :: proc(t: ^testing.T) {
 	}
 	defer destroy(u)
 
-	// One query onto the connection that will never answer, then one after it.
-	// The second is the whole test: it has to reach the second connection.
-	wedged := Pipe_Leg {
-		u       = u,
-		name    = "wedged.invalid.",
-		id      = 0x3333,
-		timeout = 400 * time.Millisecond,
+	/*
+	Queries onto the connection that will never answer until it has been given
+	up on, then one after that.
+
+	`PIPE_SILENT_TIMEOUTS` of them, because one lone timeout is a slow answer
+	rather than a dead connection and this is deliberately not acted on until
+	it has happened twice with nothing in between. The query after them is the
+	whole test: it has to reach a second connection.
+	*/
+	wedged: [PIPE_SILENT_TIMEOUTS]Pipe_Leg
+	for i in 0 ..< PIPE_SILENT_TIMEOUTS {
+		wedged[i] = Pipe_Leg {
+			u       = u,
+			name    = "wedged.invalid.",
+			id      = 0x3333,
+			timeout = 400 * time.Millisecond,
+		}
+		th := thread.create_and_start_with_poly_data(&wedged[i], pipe_leg)
+		thread.join(th)
+		thread.destroy(th)
 	}
-	first := thread.create_and_start_with_poly_data(&wedged, pipe_leg)
-	thread.join(first)
-	thread.destroy(first)
 
 	after := Pipe_Leg {
 		u       = u,
@@ -767,7 +783,9 @@ test_a_connection_that_stopped_answering_is_dropped :: proc(t: ^testing.T) {
 	thread.join(second)
 	thread.destroy(second)
 
-	testing.expectf(t, wedged.err == .Timeout, "the query to the wedged connection ended as %v", wedged.err)
+	for leg, i in wedged {
+		testing.expectf(t, leg.err == .Timeout, "query %d to the wedged connection ended as %v", i, leg.err)
+	}
 	testing.expectf(t, after.err == .None, "the query after it failed: %v", after.err)
 	testing.expectf(t, after.own_question, "the query after it was answered somebody else's question")
 	testing.expectf(
@@ -1182,6 +1200,13 @@ the retry is for is a connection found dead *before* any time was spent on it,
 where the budget is still whole. `test_a_connection_that_stopped_answering_is_dropped`
 holds the other half - the next query dials afresh - and needs no budget at all
 to do it.
+
+Written against the property rather than against any one line that upholds it,
+and three do: `pipe_query` takes the deadline rather than minting one,
+`get_pipe` refuses to stage anything once it has passed, and
+`exchange_pipelined` returns ahead of the redial. Removing any one of them
+leaves the other two holding, and this test green - which is the point of
+stating it this way. It goes red when the last of them goes.
 */
 @(test)
 test_one_send_costs_one_timeout :: proc(t: ^testing.T) {
@@ -1249,7 +1274,24 @@ test_one_send_costs_one_timeout :: proc(t: ^testing.T) {
 		return
 	}
 
-	// On the established connection, which is now silent.
+	/*
+	On the established connection, which is now silent. All but the last of
+	these only count towards `PIPE_SILENT_TIMEOUTS`; the last is the one that
+	marks the connection dead, and so the only one that could go on to retry.
+	It is the one worth a clock.
+	*/
+	for _ in 0 ..< PIPE_SILENT_TIMEOUTS - 1 {
+		warming := Pipe_Leg {
+			u       = u,
+			name    = "quiet.invalid.",
+			id      = 0xaaaa,
+			timeout = BUDGET,
+		}
+		th := thread.create_and_start_with_poly_data(&warming, pipe_leg)
+		thread.join(th)
+		thread.destroy(th)
+	}
+
 	quiet := Pipe_Leg {
 		u       = u,
 		name    = "quiet.invalid.",
