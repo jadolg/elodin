@@ -2318,7 +2318,16 @@ A Grafana dashboard is in
 [`examples/grafana-dashboard.json`](examples/grafana-dashboard.json) — import it
 under **Dashboards → New → Import**. It asks for a Prometheus data source and
 picks up `job` and `instance` from `elodin_build_info`, so it works against one
-instance or a fleet without editing.
+instance or a fleet without editing. It covers every series on this page, which
+is worth a check when one is added: a metric nothing graphs is one an operator
+finds out about by reading the code.
+
+Two of its panels are there for failures that leave no other trace. *Replies the
+group could not use* is the only place an upstream that answers promptly with
+something unusable shows up at all, since it keeps a clean failure rate and an
+`up` of 1. *Upstream failures by kind* splits the failure rate by what went
+wrong, which the log states once per kind per process and so cannot be read as a
+rate.
 
 ## What is implemented
 
