@@ -1734,3 +1734,249 @@ test_a_write_that_sent_nothing_leaves_the_connection_alone :: proc(t: ^testing.T
 	testing.expectf(t, werr == .Timeout, "a write with no budget left reported %v", werr)
 	testing.expectf(t, !dead, "a write that put nothing on the wire took the connection down with it")
 }
+
+/*
+A server that recycles its connection costs nobody an answer.
+
+Every DNS-over-TCP server hangs up on a connection eventually - the two public
+resolvers this was written for do it inside fifteen seconds of idleness - so a
+query landing on one that has just been recycled is ordinary operation. The
+retry in `exchange_pipelined` is what makes it invisible, and it used to have a
+hole in it: a connection this query had dialled itself was the one case not
+retried, on the reading that a brand new connection failing means the server is
+broken. A peer that limits how often a source may connect refuses a new
+connection just as readily, and then the query that paid for the dial was the
+only one with no second chance.
+
+The mock answers one query, hangs up, and answers everything after that on the
+next connection. What is asserted is that nothing about this reached the
+caller or the upstream's health.
+*/
+@(private = "file")
+Recycle_Mock :: struct {
+	listener: net.TCP_Socket,
+	// Queries answered before the first connection is closed.
+	before:   int,
+	conns:    int,
+	served:   int,
+	stop:     bool,
+}
+
+@(private = "file")
+recycle_mock_loop :: proc(m: ^Recycle_Mock) {
+	for !sync.atomic_load(&m.stop) {
+		client, _, aerr := net.accept_tcp(m.listener)
+		if aerr != nil {
+			if aerr == .Timeout || aerr == .Would_Block {
+				continue
+			}
+			return
+		}
+		n := sync.atomic_add(&m.conns, 1)
+		_ = net.set_option(client, .Receive_Timeout, 200 * time.Millisecond)
+		// The first connection answers `before` queries and hangs up; later
+		// ones stay put, which is what the retry has to find.
+		budget := m.before if n == 0 else max(int)
+		for i := 0; i < budget; i += 1 {
+			length_buf: [2]u8
+			if !recycle_read(m, client, length_buf[:]) {
+				break
+			}
+			ln := int(length_buf[0]) << 8 | int(length_buf[1])
+			if ln < dns.HEADER_SIZE || ln > 4096 {
+				break
+			}
+			q := make([]u8, ln, context.temp_allocator)
+            if !recycle_read(m, client, q) {
+				break
+			}
+			out := make([]u8, 2 + ln, context.temp_allocator)
+			out[0], out[1] = length_buf[0], length_buf[1]
+			copy(out[2:], q)
+			out[4] |= 0x80
+			if _, werr := net.send_tcp(client, out); werr != nil {
+				break
+			}
+			sync.atomic_add(&m.served, 1)
+		}
+		net.close(client)
+		free_all(context.temp_allocator)
+	}
+}
+
+@(private = "file")
+recycle_read :: proc(m: ^Recycle_Mock, socket: net.TCP_Socket, buf: []u8) -> bool {
+	got := 0
+	for got < len(buf) {
+		if sync.atomic_load(&m.stop) {
+			return false
+		}
+		n, err := net.recv_tcp(socket, buf[got:])
+		if err == .Timeout || err == .Would_Block {
+			continue
+		}
+		if err != nil || n <= 0 {
+			return false
+		}
+		got += n
+	}
+	return true
+}
+
+@(test)
+test_a_recycled_connection_costs_no_answer_and_no_health :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen: %v", lerr) {
+		return
+	}
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the port: %v", berr) {
+		net.close(listener)
+		return
+	}
+	_ = net.set_option(listener, .Receive_Timeout, 200 * time.Millisecond)
+
+	m := Recycle_Mock {
+		listener = listener,
+		// Nothing at all on the first connection: accepted, then dropped. So
+		// the query that dialled it is the one that has to survive, which is
+		// the case the retry used to skip.
+		before   = 0,
+	}
+	responder := thread.create_and_start_with_poly_data(&m, recycle_mock_loop)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(responder)
+		thread.destroy(responder)
+		net.close(listener)
+	}
+
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "recycler", kind = .TCP, address = "127.0.0.1", port = bound.port},
+		8,
+		30 * time.Second,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot make the upstream: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+
+	query := dns.Message {
+		id       = 0x4242,
+		question = []dns.Question{{name = "example.com.", type = .A, class = .IN}},
+	}
+	query.flags.rd = true
+	wire, _, enc := dns.encode_message(query, context.temp_allocator)
+	if !testing.expectf(t, enc == .None, "cannot encode: %v", enc) {
+		return
+	}
+
+	// This query dials, is hung up on without an answer, and must still come
+	// back with one from the connection it dials next.
+	_, e1 := exchange(u, wire, 2 * time.Second, context.temp_allocator)
+	testing.expectf(t, e1 == .None, "the query that dialled was not retried: %v", e1)
+
+	// And the connection it settled on carries the ones after it.
+	_, e2 := exchange(u, wire, 2 * time.Second, context.temp_allocator)
+	testing.expectf(t, e2 == .None, "the exchange after the retry failed: %v", e2)
+
+	testing.expect(t, sync.atomic_load(&m.conns) >= 2, "the upstream never redialled")
+	// The point of the whole thing: the recycle is not an upstream failure, so
+	// it reaches neither the health counter nor the endpoint.
+	st := stats_of(u)
+	testing.expect_value(t, st.failures, 0)
+	testing.expect(t, healthy(u), "a recycled connection put the upstream in its cooldown")
+	free_all(context.temp_allocator)
+}
+
+/*
+A peer hanging up does not bench the server.
+
+`FAILURE_THRESHOLD` of these in a row used to park an upstream for `COOLDOWN`
+and send every query in that window somewhere else - an outage far larger than
+the one query that failed, on a server that was answering everything else. The
+count still reaches the endpoint, because a server that really does close every
+connection has to be nameable; what it no longer reaches is health.
+*/
+@(test)
+test_a_hang_up_is_counted_but_does_not_park_the_upstream :: proc(t: ^testing.T) {
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "closer", kind = .TCP, address = "127.0.0.1", port = 5353},
+		0,
+		time.Second,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot make the upstream: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+
+	for _ in 0 ..< FAILURE_THRESHOLD + 2 {
+		record_failure(u, .Peer_Closed)
+	}
+	testing.expect(t, healthy(u), "hang-ups parked an upstream that is still answering")
+
+	st := stats_of(u)
+	testing.expect_value(t, st.failures, u64(FAILURE_THRESHOLD + 2))
+	testing.expect_value(t, st.failure_kinds[.Peer_Closed], u64(FAILURE_THRESHOLD + 2))
+
+	// And what does say the server is unreachable still parks it.
+	for _ in 0 ..< FAILURE_THRESHOLD {
+		record_failure(u, .Dial_Failed)
+	}
+	testing.expect(t, !healthy(u), "a run of failed dials left the upstream up")
+	free_all(context.temp_allocator)
+}
+
+/*
+The idle ceiling comes down to what the peer will actually hold.
+
+Neither public resolver advertises edns-tcp-keepalive, so being hung up on is
+the only way to learn the figure, and the shipped thirty seconds is longer than
+either of them keeps a connection.
+*/
+@(test)
+test_the_idle_ceiling_is_learned_from_being_hung_up_on :: proc(t: ^testing.T) {
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "learner", kind = .TCP, address = "127.0.0.1", port = 5353},
+		0,
+		30 * time.Second,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot make the upstream: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+
+	testing.expect_value(t, pipe_idle_ceiling(u), 30 * time.Second)
+
+	// Hung up on after 12s idle: reap at three quarters of that from now on.
+	note_idle_death(u, 12 * time.Second)
+	testing.expect_value(t, pipe_idle_ceiling(u), 9 * time.Second)
+
+	// A longer gap says nothing new - the peer was already known to hang up
+	// sooner than that.
+	note_idle_death(u, 20 * time.Second)
+	testing.expect_value(t, pipe_idle_ceiling(u), 9 * time.Second)
+
+	// A shorter one does.
+	note_idle_death(u, 8 * time.Second)
+	testing.expect_value(t, pipe_idle_ceiling(u), 6 * time.Second)
+
+	// Below the floor it is the peer refusing this connection rather than a
+	// timer, and following it would have the reaper outrunning the queries.
+	note_idle_death(u, 100 * time.Millisecond)
+	testing.expect_value(t, pipe_idle_ceiling(u), 6 * time.Second)
+
+	// The configured value is still a ceiling, never raised by what is learned.
+	v, verr := make_upstream(
+		config.Upstream_Spec{name = "short", kind = .TCP, address = "127.0.0.1", port = 5353},
+		0,
+		3 * time.Second,
+	)
+	if !testing.expectf(t, verr == .None, "cannot make the upstream: %v", verr) {
+		return
+	}
+	defer destroy(v)
+	note_idle_death(v, 20 * time.Second)
+	testing.expect_value(t, pipe_idle_ceiling(v), 3 * time.Second)
+	free_all(context.temp_allocator)
+}

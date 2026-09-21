@@ -2703,7 +2703,7 @@
       "id": 36,
       "type": "timeseries",
       "title": "Upstream failures by kind",
-      "description": "What the failure rate beside this is made of. A timeout and a tls_failed against the same server are different problems with different fixes, and each kind is logged once per process, so this is the only continuous account of which way an upstream is failing. Only kinds that have happened appear. Empty against a server older than the release that added elodin_upstream_failure_kind_total.",
+      "description": "What the failure rate beside this is made of. A timeout and a tls_failed against the same server are different problems with different fixes, and each kind is logged once per process, so this is the only continuous account of which way an upstream is failing. Only kinds that have happened appear. peer_closed is a peer recycling a connection, which is retried and does not count towards the failure cooldown; a rate of it alone is not an upstream in trouble. Empty against a server older than the release that added elodin_upstream_failure_kind_total.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"

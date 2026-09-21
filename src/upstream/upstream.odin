@@ -22,6 +22,22 @@ Error :: enum u8 {
 	Dial_Reset,
 	Timeout,
 	IO_Error,
+	/*
+	The peer closed or reset a connection without answering on it.
+
+	Kept apart from `IO_Error` because it is not evidence the server is down,
+	and `record_failure` reads it that way. Every DNS-over-TCP peer recycles
+	connections - both of the public resolvers this was measured against close
+	an idle one inside fifteen seconds - so a query landing on one that has
+	just been recycled is ordinary operation, not an outage. Counting it
+	towards the health cooldown parks a server that is answering perfectly
+	well, and with it every query that would have gone there.
+
+	What still counts is everything that says the server itself is not
+	reachable or not answering: a dial that failed, a handshake that failed, a
+	connection that went quiet until the timeout.
+	*/
+	Peer_Closed,
 	Bad_Response,
 	TLS_Failed,
 	// The peer's certificate did not check out, as distinct from a handshake
@@ -79,6 +95,9 @@ Upstream :: struct {
 	idle:         [dynamic]Idle_Conn,
 	max_idle:     int,
 	idle_timeout: time.Duration,
+	// The shortest idle gap after which this upstream was found to have hung
+	// up, or zero while it never has; see `note_idle_death`. Under `mu`.
+	idle_died:    time.Duration,
 
 	// `conn_cond` and `connecting` make concurrent first callers share one
 	// handshake instead of each racing to open their own. Used by both shared
@@ -310,13 +329,40 @@ still on the `debug` line `exchange` writes for every one.
 record_failure :: proc(u: ^Upstream, err: Error) {
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
-	u.failures += 1
 	u.stats.queries += 1
 	u.stats.failures += 1
 	u.stats.failure_kinds[err] += 1
 	if note_failure_kind(u, err) {
 		logx.warnf("upstream %s (%v %s): %v", u.spec.name, u.spec.kind, u.spec.address, err)
 	}
+	/*
+	A recycled connection is not a reason to bench the server.
+
+	`Peer_Closed` is the peer hanging up without answering, and this query has
+	already been asked again on a connection of its own by the time it gets
+	here - so what reaches this line is a second connection closed as well, on
+	an upstream that may still be answering everything else. Every DNS-over-TCP
+	server recycles connections; letting that trip the cooldown takes a working
+	upstream out of service for `COOLDOWN` and sends every query in that window
+	somewhere else, which is a far larger outage than the one query that failed.
+
+	Measured on the instance this came from: three of these in a row happened
+	often enough to park the preferred upstream roughly every two and a half
+	minutes, while it was answering 97% of what it was asked.
+
+	The trade, stated plainly: a server that closes every connection it accepts
+	is never parked, and costs each query a failover instead of being skipped
+	for ten seconds. That is the same bargain `note_unreadable_rcode` makes, and
+	the figure that names such a server is
+	`elodin_upstream_failure_kind_total{error="peer_closed"}` - which is why it
+	has a kind of its own. Health is still tripped by everything that says the
+	server is unreachable or silent: a failed dial, a failed handshake, a
+	timeout.
+	*/
+	if err == .Peer_Closed {
+		return
+	}
+	u.failures += 1
 	if u.failures >= FAILURE_THRESHOLD {
 		u.down_until = time.time_add(time.now(), COOLDOWN)
 		// A server that stopped sending cookies is a server whose every reply is
@@ -434,6 +480,8 @@ error_label :: proc(e: Error) -> string {
 		return "timeout"
 	case .IO_Error:
 		return "io_error"
+	case .Peer_Closed:
+		return "peer_closed"
 	case .Bad_Response:
 		return "bad_response"
 	case .TLS_Failed:

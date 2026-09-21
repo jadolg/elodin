@@ -5,6 +5,7 @@ import "core:net"
 import "core:sync"
 import "core:time"
 import "elodin:dns"
+import "elodin:logx"
 import "elodin:tlsx"
 
 /*
@@ -102,6 +103,12 @@ deadline holds on for this rather than for `upstream.timeout`, which on a
 default configuration is five times as long.
 */
 PIPE_FRAMING_GRACE :: 1 * time.Second
+
+/*
+The shortest idle timeout this will believe of a peer, and the floor the
+learned ceiling is held at. See `note_idle_death`.
+*/
+PIPE_IDLE_FLOOR :: 2 * time.Second
 
 @(private)
 Pipe_Waiter :: struct {
@@ -208,6 +215,83 @@ pipe_unref :: proc(c: ^Pipe_Conn) -> (closed: bool) {
 	return true
 }
 
+/*
+How long this connection had been sitting unused when the caller took it.
+
+Zero while anything is in flight on it, because then it was not idle and
+whatever happens next says nothing about the peer's idle timeout. Read before
+the query goes out, since `pipe_query` moves `last` forward.
+*/
+@(private)
+pipe_idle_for :: proc(c: ^Pipe_Conn) -> time.Duration {
+	sync.mutex_lock(&c.mu)
+	defer sync.mutex_unlock(&c.mu)
+	if len(c.waiters) != 0 {
+		return 0
+	}
+	d := time.diff(c.last, time.now())
+	return d if d > 0 else 0
+}
+
+/*
+The shortest idle gap after which this upstream was found to have hung up.
+
+Neither of the public resolvers this was measured against advertises
+edns-tcp-keepalive (RFC 7828), which is the option that would simply state the
+figure, so the only way to know how long a peer will hold a connection is to
+be hung up on and remember it. Quad9 was measured closing an idle DoT
+connection between ten and fifteen seconds, Cloudflare between five and ten,
+against a shipped `upstream.idle_timeout` of thirty - so out of the box every
+gap longer than the peer's timeout lands a query on a connection that is
+already gone.
+
+Only gaps past `PIPE_IDLE_FLOOR` are believed. Below it a death is far more
+likely to be the peer refusing this particular connection than a timer, and
+taking the ceiling down there would have the reaper closing connections faster
+than they can be used.
+
+Deliberately one-way. A peer that shortens its timeout is followed; one that
+lengthens it is not, and holds a ceiling lower than it needs until the process
+restarts. The asymmetry is the cheap direction to be wrong in: too low costs a
+dial that would not have been needed, too high costs a query.
+*/
+@(private)
+note_idle_death :: proc(u: ^Upstream, idled: time.Duration) {
+	if idled < PIPE_IDLE_FLOOR {
+		return
+	}
+	sync.mutex_lock(&u.mu)
+	defer sync.mutex_unlock(&u.mu)
+	if u.idle_died == 0 || idled < u.idle_died {
+		u.idle_died = idled
+		logx.debugf(
+			"upstream %s: hung up after %v idle, reaping its connection at %v from now on",
+			u.spec.name,
+			idled,
+			pipe_idle_ceiling_locked(u),
+		)
+	}
+}
+
+// The caller holds `u.mu`.
+@(private)
+pipe_idle_ceiling_locked :: proc(u: ^Upstream) -> time.Duration {
+	if u.idle_died == 0 {
+		return u.idle_timeout
+	}
+	// Three quarters of the shortest gap that was hung up on, so the reaper
+	// gets there first rather than racing the peer for the same instant.
+	learned := max(u.idle_died - u.idle_died / 4, PIPE_IDLE_FLOOR)
+	return min(u.idle_timeout, learned)
+}
+
+@(private)
+pipe_idle_ceiling :: proc(u: ^Upstream) -> time.Duration {
+	sync.mutex_lock(&u.mu)
+	defer sync.mutex_unlock(&u.mu)
+	return pipe_idle_ceiling_locked(u)
+}
+
 @(private)
 pipe_state :: proc(c: ^Pipe_Conn, idle_timeout: time.Duration, limit: int) -> Pipe_State {
 	sync.mutex_lock(&c.mu)
@@ -301,8 +385,10 @@ concurrent first queries shares one handshake rather than each opening - and
 all but one of them discarding - a connection of its own. Which is the whole
 point here, so the losers wait on `u.conn_cond` and pick up the winner's.
 
-`fresh` says this caller's query is the first on the connection, so a failure
-on it is the upstream's and not a pooled connection going stale.
+`fresh` says this caller's query is the first on the connection. `close_idle`
+reads it; `exchange_pipelined` used to and no longer does, for the reason its
+own retry gives - a peer refuses a new connection as readily as it recycles an
+old one, so the query that paid for the dial needs the retry too.
 */
 @(private)
 get_pipe :: proc(
@@ -339,7 +425,7 @@ get_pipe :: proc(
 			return nil, false, .Timeout
 		}
 		if u.pipe != nil {
-			switch pipe_state(u.pipe, u.idle_timeout, u.max_outstanding) {
+			switch pipe_state(u.pipe, pipe_idle_ceiling_locked(u), u.max_outstanding) {
 			case .Ready:
 				c = u.pipe
 				pipe_ref(c)
@@ -424,13 +510,21 @@ exchange_pipelined :: proc(
 	*/
 	deadline := time.tick_add(time.tick_now(), timeout)
 
-	c, fresh, gerr := get_pipe(u, timeout, deadline)
+	c, _, gerr := get_pipe(u, timeout, deadline)
 	if gerr != .None {
 		return nil, gerr
 	}
+	idled := pipe_idle_for(c)
 	response, err = pipe_query(u, c, query, deadline, allocator)
 	_, dead := pipe_dead(c)
-	if err == .None || fresh || !dead {
+	if err == .None {
+		_ = pipe_unref(c)
+		return response, err
+	}
+	if dead && idled > 0 {
+		note_idle_death(u, idled)
+	}
+	if !dead {
 		_ = pipe_unref(c)
 		return response, err
 	}
@@ -442,6 +536,16 @@ exchange_pipelined :: proc(
 	this query's clock out has already had the time, so there is none to spend
 	again; the query after this one finds the connection dead and dials afresh,
 	which is what makes a server that vanished recoverable.
+
+	A connection this query dialled itself is retried too, where it used to be
+	the one case excluded. The reading behind excluding it was that a brand new
+	connection failing says the server is broken rather than that we picked up
+	a stale one - but a peer that limits how often a source may connect refuses
+	the new connection exactly as readily, and then the query that paid for the
+	dial was the only one with no second chance. On the instance this came
+	from, that was most of what the failure rate was made of: the shared
+	connection recycled every fourteen seconds or so, and whichever query had
+	to replace it wore the failure alone.
 
 	`get_pipe` would refuse the redial on the same deadline anyway, so what
 	this adds is the error: it reports what actually went wrong with this query
@@ -803,8 +907,11 @@ pipe_read_full :: proc(c: ^Pipe_Conn, buf: []u8, deadline: time.Tick) -> (n: int
 			if terr != .None {
 				return n, roundtrip_failure(terr)
 			}
+			// Nothing read and no error is the peer having closed: the same
+			// event `roundtrip_failure` names above, reached by the other
+			// route, and reported the same way so it is not read as an outage.
 			if got <= 0 {
-				return n, .IO_Error
+				return n, .Peer_Closed
 			}
 			n += got
 			continue
@@ -820,7 +927,7 @@ pipe_read_full :: proc(c: ^Pipe_Conn, buf: []u8, deadline: time.Tick) -> (n: int
 			return n, .IO_Error
 		}
 		if got <= 0 {
-			return n, .IO_Error
+			return n, .Peer_Closed
 		}
 		n += got
 	}
@@ -1003,7 +1110,7 @@ close_pipe :: proc(u: ^Upstream, all: bool) -> (closed: int) {
 	if u.pipe == nil {
 		return 0
 	}
-	if !all && pipe_state(u.pipe, u.idle_timeout, u.max_outstanding) != .Gone {
+	if !all && pipe_state(u.pipe, pipe_idle_ceiling(u), u.max_outstanding) != .Gone {
 		return 0
 	}
 	c := u.pipe
