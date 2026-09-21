@@ -51,7 +51,7 @@ exchange_doh_h2 :: proc(
 ) {
 	// A stale shared connection dying between get_h2_conn handing it out and
 	// this call reaching the server is retried once, on a fresh one; see
-	// exchange_tcp for why that must not count as an upstream failure.
+	// exchange_pipelined for why that must not count as an upstream failure.
 	for attempt in 0 ..< 2 {
 		conn, is_h2, cerr := get_h2_conn(u, timeout)
 		if cerr != .None {
@@ -116,7 +116,7 @@ exchange_doh_h1 :: proc(
 	response: []u8,
 	err: Error,
 ) {
-	// Pooled connection first, then a fresh one; see exchange_tcp for why a
+	// Pooled connection first, then a fresh one; see exchange_pipelined for why a
 	// dead pooled connection must not count as an upstream failure.
 	for attempt in 0 ..< 2 {
 		conn: Idle_Conn

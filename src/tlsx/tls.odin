@@ -809,6 +809,19 @@ set_read_timeout :: proc(conn: ^Conn, read: time.Duration) {
 	sync.atomic_store(&conn.read_timeout_ns, i64(read))
 }
 
+/*
+The same for writes, and the same reason in the other direction.
+
+For a caller whose writes are bounded by something the connection has no view
+on - a query's own deadline, where the read side is a shared connection's and
+belongs to whoever happens to be reading it. `set_timeouts` would need the
+reader's figure passed back in to leave it alone, and on a connection several
+callers read and write at once that figure is nobody's to know.
+*/
+set_write_timeout :: proc(conn: ^Conn, write: time.Duration) {
+	sync.atomic_store(&conn.write_timeout_ns, i64(write))
+}
+
 @(private)
 Op :: enum u8 {
 	Read,
