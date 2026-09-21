@@ -1370,12 +1370,19 @@ test_udp_answer_over_the_advertised_size_falls_back_to_tcp :: proc(t: ^testing.T
 A DoT upstream whose handshake is killed by the peer gets one more try.
 
 Some resolvers - Quad9, from some networks - reset a noticeable share of
-connections partway through the TLS handshake while the very next attempt
-succeeds. That is indistinguishable from a healthy server as far as the answers
-go, but three of those in a row park the upstream for the failure cooldown and
-push every query onto the fallback. So a handshake that died at the transport
-level is retried once on a fresh connection, the same way a pooled connection
-found dead is not counted against the server.
+connections partway through the TLS handshake. That is indistinguishable from a
+healthy server as far as the answers go, but three of those in a row park the
+upstream for the failure cooldown and push every query onto the fallback. So a
+handshake that died at the transport level is retried once on a fresh
+connection, the same way a pooled connection found dead is not counted against
+the server.
+
+Once, and no more. The retry recovers about a third of Quad9's resets rather
+than nearly all of them - 40 sequential dials to 9.9.9.9:853 had 30 connect
+first try, 5 on the retry and 5 not at all - and what is left is the group's to
+answer, not this procedure's. A ladder of pauses here was tried and reverted:
+no other resolver pauses to re-dial a peer that refused it, and `resolve_*`
+already gives the query another member at no cost, where a pause costs a worker.
 
 The mock resets its first connection and serves the second, so the query only
 comes back if the retry happened.

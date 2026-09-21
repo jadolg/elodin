@@ -411,9 +411,23 @@ listening yet.
 
 An upstream that fails three times in a row is skipped for ten seconds; if every
 upstream is in that state they are all tried anyway. A TLS handshake the peer
-resets partway through is retried once first, since some public resolvers do that
-to a fair share of fresh connections while the very next attempt goes through.
-Only a reset is retried.
+resets partway through is retried once first, since some public resolvers reset
+a fair share of fresh connections. Only a reset is retried.
+
+That retry recovers about a third of them, not nearly all. Measured against
+`9.9.9.9:853` — 40 sequential dials, one every 100ms, none held open — 30
+connected first try, 5 more on the immediate retry, and 5 did not connect at
+all; the same 40 to `1.1.1.1:853` were not reset once. The rate moves between
+runs, so read those as an order of magnitude rather than a constant.
+
+The remainder is left to the group rather than pursued here, which is what
+every other resolver does with a connection its upstream refused: Unbound
+doubles that server's RTO and prefers another, Knot Resolver hands the
+handshake failure to its server selection, CoreDNS rotates to the next
+upstream under one overall deadline, and Stubby backs the upstream off
+entirely. None of them pauses and re-dials the same peer. `failover` and
+`round_robin` already try the next member on the same query, so a reset costs
+that query another member rather than a wait.
 
 Each *kind* of failure an upstream produces is named once at `warn`, with the
 transport and address, and left to `debug` after that:
