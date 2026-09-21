@@ -72,6 +72,10 @@ Pipe_Waiter :: struct {
 	reply: []u8,
 	done:  bool,
 	err:   Error,
+	// `Pipe_Conn.replies` as it stood when this waiter registered, so a caller
+	// that runs out of time can tell "my reply never came" from "nothing at
+	// all is coming". See `pipe_wait`.
+	seen:  u64,
 }
 
 @(private)
@@ -93,6 +97,23 @@ Pipe_Conn :: struct {
 	next_id:   u16,
 	// When the last query on this connection finished, for the idle reaper.
 	last:      time.Time,
+	// Messages read off this connection, for anyone at all. What a caller that
+	// timed out compares against its own `Pipe_Waiter.seen`.
+	replies:   u64,
+	/*
+	What this connection was dialled with, and the budget a message half read
+	is finished on.
+
+	A caller's own deadline is the wrong bound there. Whoever is reading is a
+	caller like any other and may have a sliver of its deadline left - that is
+	the ordinary case for taking the reading on - but once the length prefix
+	has been consumed the framing is committed to finishing that message, and
+	giving up partway leaves the stream unreadable for everyone. So the bound
+	is the connection's rather than the reader's: how long a peer may take over
+	a message it has already started, which is the timeout the upstream is
+	configured with.
+	*/
+	timeout:   time.Duration,
 
 	refs:      int,
 	allocator: mem.Allocator,
@@ -194,6 +215,7 @@ dial_pipe :: proc(u: ^Upstream, timeout: time.Duration) -> (c: ^Pipe_Conn, err: 
 	c.next_id = dns.random_id()
 	c.waiters = make(map[u16]^Pipe_Waiter, 16, u.allocator)
 	c.last = time.now()
+	c.timeout = timeout
 	return c, .None
 }
 
@@ -210,6 +232,7 @@ on it is the upstream's and not a pooled connection going stale.
 */
 @(private)
 get_pipe :: proc(u: ^Upstream, timeout: time.Duration) -> (c: ^Pipe_Conn, fresh: bool, err: Error) {
+	deadline := time.time_add(time.now(), timeout)
 	sync.mutex_lock(&u.mu)
 	for {
 		if u.pipe != nil {
@@ -229,10 +252,32 @@ get_pipe :: proc(u: ^Upstream, timeout: time.Duration) -> (c: ^Pipe_Conn, fresh:
 			case .Gone:
 			}
 		}
+		/*
+		Ahead of both the wait and the dial below, and that is not belt and
+		braces.
+
+		A dial against a blackholed upstream takes the whole timeout and fails.
+		Unbounded, the caller that was waiting for it then starts a dial of its
+		own with the next one waiting behind that, so a burst of N callers
+		dials N times end to end and the last of them returns at N times the
+		budget it was given - holding an upstream worker for all of it, long
+		past the point its own caller stopped waiting. Guarding only the wait
+		would leave the same queue one dial shorter.
+
+		A caller that breaks out with a sliver left still dials on the full
+		timeout, so the worst case is two of them rather than one. That is the
+		dial plus the round trip the pooled path could already spend, and the
+		point here is the queue, not the sliver.
+		*/
+		remaining := time.diff(time.now(), deadline)
+		if remaining <= 0 {
+			sync.mutex_unlock(&u.mu)
+			return nil, false, .Timeout
+		}
 		if !u.connecting {
 			break
 		}
-		sync.cond_wait(&u.conn_cond, &u.mu)
+		sync.cond_wait_with_timeout(&u.conn_cond, &u.mu, remaining)
 	}
 
 	u.connecting = true
@@ -343,6 +388,7 @@ pipe_query :: proc(
 		return nil, .IO_Error
 	}
 	dns.set_id_in_place(asked, id)
+	w.seen = c.replies
 	c.waiters[id] = &w
 	sync.mutex_unlock(&c.mu)
 
@@ -426,6 +472,37 @@ pipe_wait :: proc(c: ^Pipe_Conn, w: ^Pipe_Waiter, id: u16, deadline: time.Time) 
 		if remaining <= 0 {
 			delete_key(&c.waiters, id)
 			c.last = time.now()
+			/*
+			Nobody is left on this connection and nothing came back on it for
+			anybody, so it is the connection that has stopped rather than one
+			answer that is late - and nothing else here would ever notice. A
+			peer that goes away without a FIN or an RST (a firewall dropping an
+			idle mapping, an upstream rebooting, a route moving) leaves the
+			writes succeeding into the send buffer and every read timing out,
+			and a read timeout deliberately does not kill the connection. The
+			idle reaper cannot help either: a connection under steady traffic
+			is never idle. Left alone, the upstream would sit wedged on one
+			useless socket until the kernel gave up on the unacked data, which
+			on Linux is about fifteen minutes.
+
+			Killing it puts back what the pooled path did on every failed round
+			trip: `exchange_pipelined` finds the connection dead and the next
+			query dials a fresh one.
+
+			Both conditions are load-bearing. A reply having arrived for
+			somebody says the connection is delivering, so a slow answer to
+			this one query is this query's problem. And a caller still waiting
+			says the same about the future: an impatient caller must not take
+			down a connection whose answer to a patient one is still on its
+			way. Which leaves the case this is for - a connection with nobody
+			on it that has never produced anything - and the health cooldown is
+			what makes that state arrive: three failures park the upstream, the
+			waiters drain, and the last one out closes the door.
+			*/
+			if c.replies == w.seen && len(c.waiters) == 0 {
+				pipe_kill(c, .Timeout)
+				sync.cond_broadcast(&c.cond)
+			}
 			return .Timeout
 		}
 		if c.reading {
@@ -454,13 +531,16 @@ Read one reply off the wire and hand it to its waiter.
 `.Timeout` means nothing arrived and nothing was consumed, so the connection is
 untouched. Every other error means the stream can no longer be read as a
 sequence of messages and the connection is finished.
+
+The two reads are bounded differently on purpose, and `Pipe_Conn.timeout` says
+why: until the length prefix is in, this caller is free to give up and hand the
+reading to somebody else; after it, the message has to be finished or the
+connection is no longer readable at all.
 */
 @(private)
 pipe_read_one :: proc(c: ^Pipe_Conn, budget: time.Duration) -> Error {
-	pipe_set_read_timeout(c, budget)
-
 	length_buf: [2]u8
-	n, rerr := pipe_read_full(c, length_buf[:])
+	n, rerr := pipe_read_full(c, length_buf[:], time.time_add(time.now(), budget))
 	if rerr != .None {
 		if rerr == .Timeout && n == 0 {
 			return .Timeout
@@ -476,7 +556,7 @@ pipe_read_one :: proc(c: ^Pipe_Conn, budget: time.Duration) -> Error {
 	// it is known whose it is, and the waiter it goes to may be on a thread
 	// whose arena this one has no business allocating from.
 	msg := make([]u8, length, c.allocator)
-	if _, merr := pipe_read_full(c, msg); merr != .None {
+	if _, merr := pipe_read_full(c, msg, time.time_add(time.now(), c.timeout)); merr != .None {
 		delete(msg, c.allocator)
 		return .IO_Error if merr == .Timeout else merr
 	}
@@ -489,6 +569,11 @@ pipe_deliver :: proc(c: ^Pipe_Conn, msg: []u8) {
 	id := u16(msg[0]) << 8 | u16(msg[1])
 	sync.mutex_lock(&c.mu)
 	defer sync.mutex_unlock(&c.mu)
+
+	// Counted before it is known whose this is, and counted even when it is
+	// nobody's: what a waiter reads off this is whether the connection is
+	// still delivering, not whether it was delivered anything itself.
+	c.replies += 1
 
 	w, waiting := c.waiters[id]
 	if !waiting {
@@ -513,9 +598,24 @@ pipe_deliver :: proc(c: ^Pipe_Conn, msg: []u8) {
 	w.done = true
 }
 
+/*
+Fill `buf`, or give up at `deadline`.
+
+The deadline is applied per turn of the loop rather than once at the top,
+because the timeout underneath is a socket option and bounds one `recv` rather
+than the sequence of them. Left at one setting, a peer dribbling a byte at a
+time just under it would keep this loop running past whatever deadline the
+caller computed - while holding the reading, so no other waiter could take the
+socket on either.
+*/
 @(private)
-pipe_read_full :: proc(c: ^Pipe_Conn, buf: []u8) -> (n: int, err: Error) {
+pipe_read_full :: proc(c: ^Pipe_Conn, buf: []u8, deadline: time.Time) -> (n: int, err: Error) {
 	for n < len(buf) {
+		remaining := time.diff(time.now(), deadline)
+		if remaining <= 0 {
+			return n, .Timeout
+		}
+		pipe_set_read_timeout(c, remaining)
 		if c.stream.tls != nil {
 			got, terr := tlsx.read(c.stream.tls, buf[n:])
 			if terr != .None {
@@ -548,10 +648,9 @@ pipe_read_full :: proc(c: ^Pipe_Conn, buf: []u8) -> (n: int, err: Error) {
 /*
 Bound the next read by what the caller doing it has left.
 
-Set per read rather than once at dial, because the caller reading is whichever
-one happened to find nobody else at it, and its deadline is its own. Without
-this a caller that took over the reading late would sit in a read sized by the
-socket's timeout and return past the deadline it was given.
+Set per read rather than once at dial, because what is left of a deadline is
+whatever the caller doing the reading has left, and that caller is whichever
+one happened to find nobody else at it.
 
 Never under a millisecond, and that is not rounding. `SO_RCVTIMEO` is a
 `timeval`, so core:net turns a duration under a microsecond into a zero one -

@@ -559,3 +559,548 @@ test_a_caller_that_gives_up_hands_on_the_reading :: proc(t: ^testing.T) {
 	testing.expectf(t, patient.own_question, "the patient caller was answered somebody else's question")
 	testing.expectf(t, took < LIMIT, "the patient caller waited %v for an answer that was on the wire at %v", took, DELAY)
 }
+
+/*
+A responder that wedges its first connection and answers normally on its
+second.
+
+The first connection is read from and never answered, and it is never closed
+either - the shape a NAT or a stateful firewall leaves behind when it evicts an
+idle mapping, or an upstream that reboots without getting a FIN out. Nothing on
+this side of the wire is told anything: the writes still succeed into the send
+buffer and the reads simply never come back.
+*/
+@(private = "file")
+Wedge_Mock :: struct {
+	listener: net.TCP_Socket,
+	conns:    int,
+	stop:     bool,
+	threads:  [dynamic]^thread.Thread,
+	mu:       sync.Mutex,
+}
+
+@(private = "file")
+Wedge_Conn :: struct {
+	mock:   ^Wedge_Mock,
+	socket: net.TCP_Socket,
+	// The first connection is the wedged one.
+	answer: bool,
+}
+
+@(private = "file")
+wedge_mock_loop :: proc(m: ^Wedge_Mock) {
+	for !sync.atomic_load(&m.stop) {
+		client, _, aerr := net.accept_tcp(m.listener)
+		if aerr != nil {
+			continue
+		}
+		n := sync.atomic_add(&m.conns, 1) + 1
+		_ = net.set_option(client, .Receive_Timeout, 50 * time.Millisecond)
+		conn := new(Wedge_Conn)
+		conn.mock = m
+		conn.socket = client
+		conn.answer = n > 1
+		t := thread.create_and_start_with_poly_data(conn, wedge_conn_loop)
+		sync.mutex_lock(&m.mu)
+		append(&m.threads, t)
+		sync.mutex_unlock(&m.mu)
+	}
+}
+
+@(private = "file")
+wedge_conn_loop :: proc(conn: ^Wedge_Conn) {
+	defer free(conn)
+	defer net.close(conn.socket)
+	for !sync.atomic_load(&conn.mock.stop) {
+		length_buf: [2]u8
+		if !wedge_read(conn, length_buf[:]) {
+			return
+		}
+		length := int(length_buf[0]) << 8 | int(length_buf[1])
+		if length < dns.HEADER_SIZE || length > dns.MAX_MESSAGE {
+			return
+		}
+		q := make([]u8, length, context.allocator)
+		defer delete(q)
+		if !wedge_read(conn, q) {
+			return
+		}
+		if !conn.answer {
+			// Read and dropped, with the connection left open.
+			continue
+		}
+		framed := make([]u8, 2 + len(q), context.allocator)
+		defer delete(framed)
+		framed[0] = length_buf[0]
+		framed[1] = length_buf[1]
+		copy(framed[2:], q)
+		framed[4] |= 0x80
+		if write_all_tcp(conn.socket, framed) != .None {
+			return
+		}
+	}
+}
+
+@(private = "file")
+wedge_read :: proc(conn: ^Wedge_Conn, buf: []u8) -> bool {
+	got := 0
+	for got < len(buf) {
+		if sync.atomic_load(&conn.mock.stop) {
+			return false
+		}
+		n, err := net.recv_tcp(conn.socket, buf[got:])
+		if err == .Timeout || err == .Would_Block {
+			continue
+		}
+		if err != nil || n <= 0 {
+			return false
+		}
+		got += n
+	}
+	return true
+}
+
+/*
+A connection that has stopped answering is dropped, not kept and reused.
+
+The pooled path this replaced recovered from it on the very next query: any
+failed round trip closed the socket, so the query after a silent upstream
+dialled a fresh connection and got an answer. A shared connection must not be
+torn down over one slow query - that would take every other query in flight
+with it - but it must still be torn down when it is the *connection* that has
+stopped, and the two are told apart by whether anything at all came back on it
+while this caller was waiting.
+
+Without that, nothing here ever closes the connection: the writes go on
+succeeding into the send buffer, every read times out, and the idle reaper
+cannot help because a connection under steady traffic is never idle. The
+upstream stays wedged on one useless socket until the kernel gives up on the
+unacked data, which on Linux is about fifteen minutes.
+*/
+@(test)
+test_a_connection_that_stopped_answering_is_dropped :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		net.close(listener)
+		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
+		return
+	}
+	_ = net.set_option(listener, .Receive_Timeout, 50 * time.Millisecond)
+
+	m := Wedge_Mock {
+		listener = listener,
+		threads  = make([dynamic]^thread.Thread, 0, 4),
+	}
+	acceptor := thread.create_and_start_with_poly_data(&m, wedge_mock_loop)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(acceptor)
+		thread.destroy(acceptor)
+		for th in m.threads {
+			thread.join(th)
+			thread.destroy(th)
+		}
+		delete(m.threads)
+		net.close(listener)
+	}
+
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "wedged", kind = .TCP, address = "127.0.0.1", port = bound.port},
+		8,
+		30 * time.Second,
+	)
+	if uerr != .None {
+		testing.expectf(t, false, "cannot make the upstream: %v", uerr)
+		return
+	}
+	defer destroy(u)
+
+	// One query onto the connection that will never answer, then one after it.
+	// The second is the whole test: it has to reach the second connection.
+	wedged := Pipe_Leg {
+		u       = u,
+		name    = "wedged.invalid.",
+		id      = 0x3333,
+		timeout = 400 * time.Millisecond,
+	}
+	first := thread.create_and_start_with_poly_data(&wedged, pipe_leg)
+	thread.join(first)
+	thread.destroy(first)
+
+	after := Pipe_Leg {
+		u       = u,
+		name    = "after.invalid.",
+		id      = 0x4444,
+		timeout = 2 * time.Second,
+	}
+	second := thread.create_and_start_with_poly_data(&after, pipe_leg)
+	thread.join(second)
+	thread.destroy(second)
+
+	testing.expectf(t, wedged.err == .Timeout, "the query to the wedged connection ended as %v", wedged.err)
+	testing.expectf(t, after.err == .None, "the query after it failed: %v", after.err)
+	testing.expectf(t, after.own_question, "the query after it was answered somebody else's question")
+	testing.expectf(
+		t,
+		sync.atomic_load(&m.conns) == 2,
+		"the responder saw %d connections, expected the wedged one to be dropped and a second dialled",
+		sync.atomic_load(&m.conns),
+	)
+}
+
+/*
+A responder that answers one query normally, then splits the next answer.
+
+The split is the point: the two-byte length prefix goes out well before the
+message it counts. A reader that picks up the prefix has committed the
+connection's framing to finishing that message, whatever it had left of its own
+deadline when it started.
+*/
+@(private = "file")
+Split_Mock :: struct {
+	listener:    net.TCP_Socket,
+	// After the warm-up: when the length prefix goes out, and when the body
+	// behind it follows.
+	prefix_at:   time.Duration,
+	body_at:     time.Duration,
+	stop:        bool,
+}
+
+@(private = "file")
+split_mock_loop :: proc(m: ^Split_Mock) {
+	client, _, aerr := net.accept_tcp(m.listener)
+	if aerr != nil {
+		return
+	}
+	defer net.close(client)
+	_ = net.set_option(client, .Receive_Timeout, 50 * time.Millisecond)
+
+	// The warm-up query, answered at once: it is what establishes the shared
+	// connection, so the connection is the one a later caller finds rather than
+	// one that caller dialled itself.
+	warm, warm_ok := split_read_query(m, client)
+	if !warm_ok {
+		return
+	}
+	defer delete(warm)
+	if !split_write(client, warm, whole = true, m = m) {
+		return
+	}
+
+	// Then the two pipelined queries. The second is the one answered.
+	first, first_ok := split_read_query(m, client)
+	if !first_ok {
+		return
+	}
+	defer delete(first)
+	second, second_ok := split_read_query(m, client)
+	if !second_ok {
+		return
+	}
+	defer delete(second)
+
+	start := time.now()
+	time.sleep(m.prefix_at)
+	prefix := [2]u8{u8(len(second) >> 8), u8(len(second))}
+	if write_all_tcp(client, prefix[:]) != .None {
+		return
+	}
+	// Measured from the start so the gap is the one configured rather than the
+	// sum of two sleeps.
+	time.sleep(m.body_at - time.diff(start, time.now()))
+	body := make([]u8, len(second), context.allocator)
+	defer delete(body)
+	copy(body, second)
+	body[2] |= 0x80
+	_ = write_all_tcp(client, body)
+
+	for !sync.atomic_load(&m.stop) {
+		time.sleep(10 * time.Millisecond)
+	}
+}
+
+@(private = "file")
+split_read_query :: proc(m: ^Split_Mock, client: net.TCP_Socket) -> (query: []u8, ok: bool) {
+	length_buf: [2]u8
+	if !split_read(m, client, length_buf[:]) {
+		return nil, false
+	}
+	length := int(length_buf[0]) << 8 | int(length_buf[1])
+	if length < dns.HEADER_SIZE || length > dns.MAX_MESSAGE {
+		return nil, false
+	}
+	query = make([]u8, length, context.allocator)
+	if !split_read(m, client, query) {
+		delete(query)
+		return nil, false
+	}
+	return query, true
+}
+
+@(private = "file")
+split_read :: proc(m: ^Split_Mock, client: net.TCP_Socket, buf: []u8) -> bool {
+	got := 0
+	for got < len(buf) {
+		if sync.atomic_load(&m.stop) {
+			return false
+		}
+		n, err := net.recv_tcp(client, buf[got:])
+		if err == .Timeout || err == .Would_Block {
+			continue
+		}
+		if err != nil || n <= 0 {
+			return false
+		}
+		got += n
+	}
+	return true
+}
+
+@(private = "file")
+split_write :: proc(client: net.TCP_Socket, query: []u8, whole: bool, m: ^Split_Mock) -> bool {
+	framed := make([]u8, 2 + len(query), context.allocator)
+	defer delete(framed)
+	framed[0] = u8(len(query) >> 8)
+	framed[1] = u8(len(query))
+	copy(framed[2:], query)
+	framed[4] |= 0x80
+	return write_all_tcp(client, framed) == .None
+}
+
+/*
+A message half read is finished on the connection's own budget, not the
+reader's.
+
+Whoever reads the socket is a caller like any other, and the ordinary case for
+taking the reading on is a waiter that woke with a sliver of its deadline left
+- which is exactly why the read timeout has a floor. Such a reader that catches
+the length prefix of an answer whose body is still arriving has committed the
+framing: it cannot stop there. Giving the body what is left of that caller's
+deadline is how one nearly-expired reader plus one answer split across segments
+tears down the shared connection and fails every query on it - the connection
+churn this is all meant to stop, arriving by another route.
+
+The warm-up query is not decoration: it is what makes the connection one the
+callers below found rather than one of them dialled, which is the ordinary
+state of a shared connection and the only state in which the budgets differ.
+*/
+@(test)
+test_a_half_read_message_is_finished_on_the_connections_budget :: proc(t: ^testing.T) {
+	PREFIX_AT :: 300 * time.Millisecond
+	BODY_AT :: 1200 * time.Millisecond
+	// Past PREFIX_AT, so this caller is in the body read when its own deadline
+	// arrives, and well under BODY_AT.
+	IMPATIENT :: 600 * time.Millisecond
+	PATIENT :: 6 * time.Second
+
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		net.close(listener)
+		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
+		return
+	}
+	_ = net.set_option(listener, .Receive_Timeout, 50 * time.Millisecond)
+
+	m := Split_Mock {
+		listener  = listener,
+		prefix_at = PREFIX_AT,
+		body_at   = BODY_AT,
+	}
+	responder := thread.create_and_start_with_poly_data(&m, split_mock_loop)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(responder)
+		thread.destroy(responder)
+		net.close(listener)
+	}
+
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "split", kind = .TCP, address = "127.0.0.1", port = bound.port},
+		8,
+		30 * time.Second,
+	)
+	if uerr != .None {
+		testing.expectf(t, false, "cannot make the upstream: %v", uerr)
+		return
+	}
+	defer destroy(u)
+
+	warm := Pipe_Leg {
+		u       = u,
+		name    = "warm.invalid.",
+		id      = 0x5555,
+		timeout = PATIENT,
+	}
+	warmup := thread.create_and_start_with_poly_data(&warm, pipe_leg)
+	thread.join(warmup)
+	thread.destroy(warmup)
+	if warm.err != .None {
+		testing.expectf(t, false, "the warm-up query failed: %v", warm.err)
+		return
+	}
+
+	quitter := Pipe_Leg {
+		u       = u,
+		name    = "quitter.invalid.",
+		id      = 0x6666,
+		timeout = IMPATIENT,
+	}
+	patient := Pipe_Leg {
+		u       = u,
+		name    = "patient.invalid.",
+		id      = 0x7777,
+		timeout = PATIENT,
+	}
+	first := thread.create_and_start_with_poly_data(&quitter, pipe_leg)
+	time.sleep(50 * time.Millisecond)
+	second := thread.create_and_start_with_poly_data(&patient, pipe_leg)
+	for th in ([]^thread.Thread{first, second}) {
+		thread.join(th)
+		thread.destroy(th)
+	}
+
+	testing.expectf(t, quitter.err == .Timeout, "the impatient caller ended as %v, expected a timeout", quitter.err)
+	testing.expectf(t, patient.err == .None, "the patient caller failed: %v", patient.err)
+	testing.expectf(t, patient.own_question, "the patient caller was answered somebody else's question")
+}
+
+/*
+A responder that accepts connections and never speaks, so a TLS handshake on
+one runs to its deadline.
+
+The blackhole a dial has to survive, made locally: the peer is there, the
+connect succeeds and the ClientHello goes out, and nothing comes back.
+*/
+@(private = "file")
+Mute_Mock :: struct {
+	listener: net.TCP_Socket,
+	stop:     bool,
+	held:     [dynamic]net.TCP_Socket,
+	mu:       sync.Mutex,
+}
+
+@(private = "file")
+mute_mock_loop :: proc(m: ^Mute_Mock) {
+	for !sync.atomic_load(&m.stop) {
+		client, _, aerr := net.accept_tcp(m.listener)
+		if aerr != nil {
+			continue
+		}
+		sync.mutex_lock(&m.mu)
+		append(&m.held, client)
+		sync.mutex_unlock(&m.mu)
+	}
+	sync.mutex_lock(&m.mu)
+	for s in m.held {
+		net.close(s)
+	}
+	sync.mutex_unlock(&m.mu)
+}
+
+/*
+A caller waiting for somebody else's dial is bounded by its own deadline.
+
+Sharing one connection means sharing one handshake, which is the whole point:
+a burst of concurrent first queries must not each open - and then all but one
+discard - a connection of its own. But a dial against a blackholed upstream
+takes the full timeout and fails, and the caller that was waiting for it must
+not then start a dial of its own with the next one waiting behind that. Four
+callers with a five second timeout would be twenty seconds, and each of them
+would be holding an upstream worker for four times the budget it was given.
+
+What this holds is the budget: every caller is back inside its own timeout,
+whatever the caller in front of it did.
+*/
+@(test)
+test_waiting_for_a_dial_is_bounded_by_the_callers_own_timeout :: proc(t: ^testing.T) {
+	LEGS :: 4
+	BUDGET :: 400 * time.Millisecond
+	/*
+	Two dials' worth, which is the bound: a caller that breaks out of the
+	queue with a sliver of its deadline left still dials on the full timeout,
+	so one dial can follow another, but the caller behind *that* is past its
+	deadline and never starts a third. Four in a row, which is what this is
+	looking for, is twice this.
+	*/
+	LIMIT :: 3 * BUDGET
+
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		net.close(listener)
+		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
+		return
+	}
+	_ = net.set_option(listener, .Receive_Timeout, 50 * time.Millisecond)
+
+	m := Mute_Mock {
+		listener = listener,
+		held     = make([dynamic]net.TCP_Socket, 0, LEGS),
+	}
+	acceptor := thread.create_and_start_with_poly_data(&m, mute_mock_loop)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(acceptor)
+		thread.destroy(acceptor)
+		delete(m.held)
+		net.close(listener)
+	}
+
+	// TLS, because a handshake is a dial with a read in it: a plain connect to
+	// a listener that is accepting returns at once, and what has to be bounded
+	// here is a dial that does not.
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "mute", kind = .TLS, address = "127.0.0.1", port = bound.port},
+		8,
+		30 * time.Second,
+	)
+	if uerr != .None {
+		testing.expectf(t, false, "cannot make the upstream: %v", uerr)
+		return
+	}
+	defer destroy(u)
+
+	legs: [LEGS]Pipe_Leg
+	threads: [LEGS]^thread.Thread
+	start := time.now()
+	for i in 0 ..< LEGS {
+		legs[i] = Pipe_Leg {
+			u       = u,
+			name    = "mute.invalid.",
+			id      = 0x8888,
+			timeout = BUDGET,
+		}
+		threads[i] = thread.create_and_start_with_poly_data(&legs[i], pipe_leg)
+	}
+	for th in threads {
+		thread.join(th)
+		thread.destroy(th)
+	}
+	took := time.diff(start, time.now())
+
+	for leg, i in legs {
+		testing.expectf(t, leg.err != .None, "leg %d was answered by a responder that never speaks", i)
+	}
+	testing.expectf(
+		t,
+		took < LIMIT,
+		"%d callers took %v against a budget of %v each; they dialled one after another",
+		LEGS,
+		took,
+		BUDGET,
+	)
+}
