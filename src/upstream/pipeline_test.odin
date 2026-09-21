@@ -981,7 +981,13 @@ header without its records.
 @(private = "file")
 half_read_case :: proc(t: ^testing.T, split_prefix: bool) {
 	PREFIX_AT :: 300 * time.Millisecond
-	BODY_AT :: 1200 * time.Millisecond
+	/*
+	Comfortably inside `PIPE_FRAMING_GRACE` of the prefix, since that grace is
+	what the reader gets once it has committed the framing with little of its
+	own deadline left. Past `IMPATIENT` all the same, which is what makes this
+	a body that arrives after its reader has given up.
+	*/
+	BODY_AT :: 900 * time.Millisecond
 	// Past PREFIX_AT, so this caller is in the body read when its own deadline
 	// arrives, and well under BODY_AT.
 	IMPATIENT :: 600 * time.Millisecond
@@ -1347,7 +1353,12 @@ does not.
 @(private = "file")
 Stall_Mock :: struct {
 	listener:  net.TCP_Socket,
-	// When the second byte of the length prefix follows the first.
+	// When the first byte of the length prefix goes out, measured from the
+	// query arriving. Late enough and the reader picks it up with little of
+	// its own deadline left, which is the case a budget for finishing the
+	// message has to be bounded against.
+	first_at:  time.Duration,
+	// When the second byte follows the first, or 0 for never.
 	second_at: time.Duration,
 	stop:      bool,
 }
@@ -1385,11 +1396,14 @@ stall_mock_loop :: proc(m: ^Stall_Mock) {
 	}
 	defer delete(next)
 	prefix := [2]u8{u8(len(next) >> 8), u8(len(next))}
+	time.sleep(m.first_at)
 	if write_all_tcp(client, prefix[:1]) != .None {
 		return
 	}
-	time.sleep(m.second_at)
-	_ = write_all_tcp(client, prefix[1:])
+	if m.second_at > 0 {
+		time.sleep(m.second_at)
+		_ = write_all_tcp(client, prefix[1:])
+	}
 
 	for !sync.atomic_load(&m.stop) {
 		time.sleep(10 * time.Millisecond)
@@ -1524,6 +1538,114 @@ test_a_half_read_message_gets_one_budget :: proc(t: ^testing.T) {
 		t,
 		took < LIMIT,
 		"a half-read message held the reader %v on a budget of %v; each read started a clock of its own",
+		took,
+		BUDGET,
+	)
+}
+
+
+/*
+A reader that took the socket on late is still back inside a bounded overrun.
+
+The budget for finishing a half-read message is the connection's rather than
+the reader's, and that is deliberate: a reader with a sliver of its deadline
+left must not abandon a message it has committed the framing to, because doing
+so costs every other caller on the connection its answer. But the connection's
+budget is the whole configured timeout, so granting it wholesale to a reader
+that is already at its deadline is how one `send` comes to cost two - which is
+the compounding `exchange_pipelined` gives every stage one deadline to prevent.
+
+Both are right, and neither is the rule. What a peer may spend finishing a
+message it has begun is not what a query may spend being answered: the first is
+a transmission on an established connection and the second is a resolution.
+`PIPE_FRAMING_GRACE` is the first of those, and the reader gets whichever of
+its own remaining time and that grace is larger - so a reader with time to
+spare overruns by nothing at all, and one at its deadline overruns by the
+grace rather than by a whole timeout.
+*/
+@(test)
+test_a_late_reader_overruns_by_the_grace_not_the_timeout :: proc(t: ^testing.T) {
+	BUDGET :: 2 * time.Second
+	// Most of the budget, so what is left when the reader commits the framing
+	// is well under the grace and the grace is what it gets.
+	FIRST_AT :: 3 * BUDGET / 4
+	/*
+	The overrun this permits is one grace on top of the budget. The regression
+	it is written against is a whole second budget - FIRST_AT + BUDGET, half a
+	second above this - which is what granting the connection's timeout to a
+	reader that is already out of time costs.
+	*/
+	LIMIT :: FIRST_AT + PIPE_FRAMING_GRACE + BUDGET / 4
+
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		net.close(listener)
+		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
+		return
+	}
+	_ = net.set_option(listener, .Receive_Timeout, 50 * time.Millisecond)
+
+	// One byte of a length, late, and nothing behind it ever.
+	m := Stall_Mock {
+		listener = listener,
+		first_at = FIRST_AT,
+	}
+	responder := thread.create_and_start_with_poly_data(&m, stall_mock_loop)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(responder)
+		thread.destroy(responder)
+		net.close(listener)
+	}
+
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "late", kind = .TCP, address = "127.0.0.1", port = bound.port},
+		8,
+		30 * time.Second,
+	)
+	if uerr != .None {
+		testing.expectf(t, false, "cannot make the upstream: %v", uerr)
+		return
+	}
+	defer destroy(u)
+
+	warm := Pipe_Leg {
+		u       = u,
+		name    = "warm.invalid.",
+		id      = 0xdddd,
+		timeout = BUDGET,
+	}
+	warmup := thread.create_and_start_with_poly_data(&warm, pipe_leg)
+	thread.join(warmup)
+	thread.destroy(warmup)
+	if warm.err != .None {
+		testing.expectf(t, false, "the warm-up query failed: %v", warm.err)
+		return
+	}
+
+	late := Pipe_Leg {
+		u       = u,
+		name    = "late.invalid.",
+		id      = 0xeeee,
+		timeout = BUDGET,
+	}
+	start := time.now()
+	th := thread.create_and_start_with_poly_data(&late, pipe_leg)
+	thread.join(th)
+	thread.destroy(th)
+	took := time.diff(start, time.now())
+
+	testing.expectf(t, late.err != .None, "a message that never arrived was answered")
+	testing.expectf(
+		t,
+		took < LIMIT,
+		"a reader that committed the framing with %v left held on for %v against a budget of %v",
+		BUDGET - FIRST_AT,
 		took,
 		BUDGET,
 	)

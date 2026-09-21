@@ -77,6 +77,32 @@ fifteen minutes it used to cost.
 */
 PIPE_SILENT_TIMEOUTS :: 2
 
+/*
+What a peer gets to finish a message it has already begun.
+
+Two review rounds argued opposite sides of one trade-off here, which is the
+sign that neither side was the rule. A reader with a sliver of its deadline
+left must not abandon a message it has committed the framing to - giving up
+partway leaves the stream unreadable and costs every other caller on the
+connection its answer - so the budget cannot be the reader's. But the
+connection's budget is the whole configured timeout, and handing that to a
+reader that is already out of time is how one `send` comes to cost two.
+
+The two are different quantities and conflating them is what produced both
+findings. What a peer may spend finishing a message is a transmission on an
+established connection, measured in round trips; what a query may spend being
+answered is a resolution, measured in seconds and set by the operator. This is
+the first of those, and `Pipe_Conn.timeout` remains the ceiling - the grace can
+never let a read outlast the connection's own budget.
+
+A second, because a DNS message is at most 64 KB and the peer has already sent
+its length, so a working one is finishing inside a round trip and this is two
+orders of magnitude of headroom. What it bounds is the overrun: a reader at its
+deadline holds on for this rather than for `upstream.timeout`, which on a
+default configuration is five times as long.
+*/
+PIPE_FRAMING_GRACE :: 1 * time.Second
+
 @(private)
 Pipe_Waiter :: struct {
 	/*
@@ -168,13 +194,14 @@ socket, and the reference every caller holds for the length of its query is
 what guarantees there is no such read.
 */
 @(private)
-pipe_unref :: proc(c: ^Pipe_Conn) {
+pipe_unref :: proc(c: ^Pipe_Conn) -> (closed: bool) {
 	if c == nil || sync.atomic_sub(&c.refs, 1) != 1 {
-		return
+		return false
 	}
 	stream_close(&c.stream)
 	delete(c.waiters)
 	free(c, c.allocator)
+	return true
 }
 
 @(private)
@@ -336,7 +363,7 @@ get_pipe :: proc(
 	sync.mutex_unlock(&u.mu)
 	// Only the upstream's own reference; a caller still on that connection
 	// holds its own and tears it down when it is finished with it.
-	pipe_unref(stale)
+	_ = pipe_unref(stale)
 
 	dialled, derr := dial_pipe(u, timeout, time.diff(time.now(), deadline))
 
@@ -391,7 +418,7 @@ exchange_pipelined :: proc(
 	response, err = pipe_query(u, c, query, deadline, allocator)
 	_, dead := pipe_dead(c)
 	if err == .None || fresh || !dead {
-		pipe_unref(c)
+		_ = pipe_unref(c)
 		return response, err
 	}
 	/*
@@ -410,19 +437,19 @@ exchange_pipelined :: proc(
 	could not be used is counted as one.
 	*/
 	if time.diff(time.now(), deadline) <= 0 {
-		pipe_unref(c)
+		_ = pipe_unref(c)
 		return nil, err
 	}
 
 	// Held until the redial is done, so `get_pipe` sees the dead connection it
 	// has to replace rather than an address something else has since reused.
 	retry, _, rerr := get_pipe(u, timeout, deadline)
-	pipe_unref(c)
+	_ = pipe_unref(c)
 	if rerr != .None {
 		return nil, rerr
 	}
 	response, err = pipe_query(u, retry, query, deadline, allocator)
-	pipe_unref(retry)
+	_ = pipe_unref(retry)
 	return response, err
 }
 
@@ -646,19 +673,29 @@ pipe_read_one :: proc(c: ^Pipe_Conn, budget: time.Duration) -> Error {
 	records is, and a reader that gave up holding one byte of a length would
 	leave the stream unreadable for everyone on it.
 	*/
-	if _, rerr := pipe_read_full(c, length_buf[:1], time.time_add(time.now(), budget)); rerr != .None {
+	mine := time.time_add(time.now(), budget)
+	if _, rerr := pipe_read_full(c, length_buf[:1], mine); rerr != .None {
 		return .Timeout if rerr == .Timeout else rerr
 	}
 	/*
 	One clock from here, shared by everything left of this message.
 
-	`Pipe_Conn.timeout` is what a peer may spend on a message it has already
-	started, and that is one message rather than one read. Started again for
-	each read, a peer that dribbles holds the reader for as many budgets as it
-	cares to split the message into - the compounding `exchange_pipelined`
-	hands every stage one deadline to prevent, a level further down.
+	One rather than one per read, because what it bounds is a message and not a
+	read: started afresh each time, a peer that dribbles holds the reader for
+	as many budgets as it cares to split the message into - the compounding
+	`exchange_pipelined` hands every stage one deadline to prevent, a level
+	further down.
+
+	Whichever of this reader's own remaining time and `PIPE_FRAMING_GRACE` is
+	longer, capped by the connection's budget. A reader with time to spare
+	finishes the message inside its own deadline and overruns by nothing; one
+	that took the socket on at the last moment overruns by the grace. See
+	`PIPE_FRAMING_GRACE` for why the two quantities are not the same.
 	*/
-	framing := time.time_add(time.now(), c.timeout)
+	framing := time.time_add(
+		time.now(),
+		min(max(time.diff(time.now(), mine), PIPE_FRAMING_GRACE), c.timeout),
+	)
 	if _, rerr := pipe_read_full(c, length_buf[1:], framing); rerr != .None {
 		return .IO_Error if rerr == .Timeout else rerr
 	}
@@ -807,20 +844,44 @@ pipe_write :: proc(c: ^Pipe_Conn, query: []u8) -> Error {
 	spending a timeout of their own discovering the same thing.
 
 	ponytail: the writers still serialize while the first one blocks, which is
-	the price of one connection carrying every query. Per-message send
-	deadlines would bound it if a peer that stops reading ever turns out to be
-	common enough to matter.
+	the price of one connection carrying every query. Per-caller send deadlines
+	would bound the wait for a turn if a peer that stops reading ever turns out
+	to be common enough to matter; what is bounded here is the turn itself.
 	*/
 	if werr, dead := pipe_dead(c); dead {
 		return werr
 	}
 	if c.stream.tls != nil {
+		// `tlsx.write` takes its deadline once per call rather than per
+		// syscall, so this is already bounded by the connection's budget.
 		if _, werr := tlsx.write(c.stream.tls, framed); werr != .None {
 			return roundtrip_failure(werr)
 		}
 		return .None
 	}
-	return write_all_tcp(c.stream.socket, framed)
+	/*
+	Bounded as a whole, not per `send`.
+
+	`SO_SNDTIMEO` bounds one call, so a peer accepting a few bytes at a time
+	restarts it on every turn of the loop and the write has no end - the same
+	thing `pipe_read_full` takes a deadline to avoid, on the way out. The
+	connection's budget rather than the caller's for the reason the grace
+	gives: a half-written message leaves the stream out of frame, so stopping
+	partway costs every caller on the connection rather than this one.
+	*/
+	deadline := time.time_add(time.now(), c.timeout)
+	sent := 0
+	for sent < len(framed) {
+		if time.diff(time.now(), deadline) <= 0 {
+			return .Timeout
+		}
+		n, werr := net.send_tcp(c.stream.socket, framed[sent:])
+		if werr != nil || n <= 0 {
+			return .IO_Error
+		}
+		sent += n
+	}
+	return .None
 }
 
 /*
@@ -841,6 +902,8 @@ close_pipe :: proc(u: ^Upstream, all: bool) -> (closed: int) {
 	}
 	c := u.pipe
 	u.pipe = nil
-	pipe_unref(c)
-	return 1
+	// What the caller counts is sockets closed, and a caller still in flight
+	// on this connection holds a reference that keeps it open a little longer.
+	// Reporting the drop as a close would have `close_idle` overstate by one.
+	return 1 if pipe_unref(c) else 0
 }

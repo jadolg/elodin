@@ -438,7 +438,7 @@ What the kinds mean, on the transports where two of them used to look alike:
 | | |
 |---|---|
 | `Timeout` | nothing usable arrived inside `upstream.timeout`. On `tls://` and `https://` this now includes a session that handshook and then went quiet, which used to be reported as `IO_Error` |
-| `IO_Error` | the peer closed or reset an established session. On a pooled connection that is routine and is retried on a fresh one without being counted; what reaches the counter is a *fresh* connection doing it |
+| `IO_Error` | the peer closed or reset an established session. On a connection that was already open - the shared pipelined one on `tcp://` and `tls://`, a pooled one on `https://` over HTTP/1.1 - that is routine and is retried on a fresh one without being counted; what reaches the counter is a *fresh* connection doing it |
 | `Bad_Response` | a reply arrived from the server we asked and was thrown away: it did not echo the question, or on `udp://`/`tcp://` it did not carry the DNS cookie the query went out with. On `udp://` this used to be indistinguishable from `Timeout`, since the loop passes over a datagram it will not accept and waits out the deadline |
 | `TLS_Failed`, `Verify_Failed` | the handshake. `Error` has nowhere to carry OpenSSL's reason, so the line above carries it instead — it is the whole diagnosis, and `TLS_Failed` on its own is not |
 
