@@ -415,6 +415,38 @@ resets partway through is retried once first, since some public resolvers do tha
 to a fair share of fresh connections while the very next attempt goes through.
 Only a reset is retried.
 
+Each *kind* of failure an upstream produces is named once at `warn`, with the
+transport and address, and left to `debug` after that:
+
+```
+level=warn msg="upstream quad9-dot (TLS 9.9.9.9): Timeout"
+level=warn msg="upstream quad9-dot: TLS handshake with \"dns.quad9.net\" failed: certificate has expired"
+```
+
+Once per kind rather than once per exchange because the failure worth naming is
+the one that never trips the cooldown. A member of a failover group that fails
+every few queries, with the rest of the group covering for it, zeroes its
+consecutive count on each success, so it is never parked and the warning above
+about parking never fires — the only trace it left was a `debug` line and a
+counter. Once per kind bounds the output at the size of the error list for the
+life of the process, whatever the query rate does; the count is
+`elodin_upstream_failures_total{upstream}`, and every individual failure is
+still a `debug` line with how long it took.
+
+What the kinds mean, on the transports where two of them used to look alike:
+
+| | |
+|---|---|
+| `Timeout` | nothing usable arrived inside `upstream.timeout`. On `tls://` and `https://` this now includes a session that handshook and then went quiet, which used to be reported as `IO_Error` |
+| `IO_Error` | the peer closed or reset an established session. On a pooled connection that is routine and is retried on a fresh one without being counted; what reaches the counter is a *fresh* connection doing it |
+| `Bad_Response` | a reply arrived from the server we asked and was thrown away: it did not echo the question, or on `udp://`/`tcp://` it did not carry the DNS cookie the query went out with. On `udp://` this used to be indistinguishable from `Timeout`, since the loop passes over a datagram it will not accept and waits out the deadline |
+| `TLS_Failed`, `Verify_Failed` | the handshake. `Error` has nowhere to carry OpenSSL's reason, so the line above carries it instead — it is the whole diagnosis, and `TLS_Failed` on its own is not |
+
+`Bad_Response` on a `udp://` or `tcp://` upstream is worth reading closely: it
+says this resolver is refusing answers that are arriving, not that the server is
+unreachable. An anycast resolver whose nodes do not share a DNS cookie secret
+does exactly that. `cookies.upstream: false` is the test, and the fix if it is.
+
 An upstream's rcode is the client's answer, with two exceptions.
 
 SERVFAIL and REFUSED are not answers about the name: RFC 2308 section 7.1 reads
