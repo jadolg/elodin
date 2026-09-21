@@ -95,14 +95,17 @@ exchange_doh_h2 :: proc(
 			if attempt == 0 {
 				continue
 			}
-			return nil, .IO_Error
+			// Both attempts hung up. Still the peer recycling rather than the
+			// upstream being down - a server sending GOAWAY under load does
+			// this - so it is reported as such and does not park it.
+			return nil, .Peer_Closed
 		case .Reset:
 			return nil, .HTTP_Error
 		case .Timeout:
 			return nil, .Timeout
 		}
 	}
-	return nil, .IO_Error
+	return nil, .Peer_Closed
 }
 
 @(private)
@@ -118,6 +121,7 @@ exchange_doh_h1 :: proc(
 ) {
 	// Pooled connection first, then a fresh one; see exchange_pipelined for why a
 	// dead pooled connection must not count as an upstream failure.
+	last := Error.IO_Error
 	for attempt in 0 ..< 2 {
 		conn: Idle_Conn
 		reused := false
@@ -173,11 +177,22 @@ exchange_doh_h1 :: proc(
 		}
 
 		stream_close(&stream)
-		if !reused {
-			return nil, herr if herr != .None else .Bad_Response
+		last = herr if herr != .None else .Bad_Response
+		/*
+		A hang-up is retried whether this query found the connection or dialled
+		it, which is the shape `exchange_pipelined` settled on. Excluding the
+		dial rested on a fresh connection failing meaning the server is broken,
+		and a peer that limits how often a source may connect refuses one just
+		as readily - leaving the query that paid for the dial as the only one
+		with no second chance. Everything else is still reported on the spot:
+		a pooled connection is retried because it may simply be stale, and a
+		fresh one failing any other way has said what it has to say.
+		*/
+		if !reused && last != .Peer_Closed {
+			return nil, last
 		}
 	}
-	return nil, .IO_Error
+	return nil, last
 }
 
 /*

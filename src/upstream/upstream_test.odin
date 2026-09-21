@@ -2150,3 +2150,137 @@ test_a_chain_lookup_keeps_the_reply_when_no_upstream_can_answer :: proc(t: ^test
 
 	free_all(context.temp_allocator)
 }
+
+/*
+A peer that hangs up is named as one, not filed under the transport.
+
+`reader_fill` reaching EOF is the peer having closed, which on a pooled
+connection is routine - it is what `Connection: keep-alive` costs when the
+server's idle timer is shorter than ours. Reported as `IO_Error` it was
+indistinguishable from the transport breaking, and three of them parked a
+server that was answering everything else.
+*/
+@(test)
+test_a_hang_up_is_not_filed_as_a_transport_error :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+
+	// Accepted, read, and closed without a byte of reply: the shape of a
+	// connection the server had already finished with.
+	resp, err, ok := exchange_against(t, "", &track)
+	if !ok {
+		return
+	}
+	testing.expectf(t, err == .Peer_Closed, "a hang-up was reported as %v", err)
+	testing.expect(t, resp.body == nil, "a failed exchange returned a body")
+
+	expect_caller_holds_nothing(t, &track, "hang-up")
+	free_all(context.temp_allocator)
+}
+
+/*
+A responder that accepts every connection and closes it without a word.
+
+The server a query meets when its connection was already finished with, and -
+on the second connection - the one that limits how often a source may connect.
+*/
+@(private = "file")
+Hangup_Mock :: struct {
+	listener: net.TCP_Socket,
+	conns:    int,
+	stop:     bool,
+}
+
+@(private = "file")
+hangup_mock_loop :: proc(m: ^Hangup_Mock) {
+	for !sync.atomic_load(&m.stop) {
+		client, _, aerr := net.accept_tcp(m.listener)
+		if aerr != nil {
+			continue
+		}
+		sync.atomic_add(&m.conns, 1)
+		// Drained before closing, so the close is a FIN rather than the RST a
+		// socket with unread data sends. A hang-up is the orderly one; a reset
+		// is a different event and not the one under test.
+		_ = net.set_option(client, .Receive_Timeout, 200 * time.Millisecond)
+		buf: [4096]u8
+		_, _ = net.recv_tcp(client, buf[:])
+		net.close(client)
+	}
+}
+
+/*
+The DoH query that dialled its own connection is retried too.
+
+`exchange_doh_h1` retried a connection it took from the pool and not one it had
+dialled, which is the exclusion `exchange_pipelined` carried until #372 showed
+what it cost: a peer that limits how often a source may connect refuses the new
+connection as readily as it recycles an old one, and the query that paid for
+the dial was the only one with no second chance. What the retry must not do is
+paper over the diagnosis, so the error the caller gets is still the hang-up.
+
+Driven straight at the HTTP/1.1 half with no `tls_ctx`, the way the tests
+around `http_exchange` are: what is under test is the retry and the kind, and
+a TLS handshake in front of them proves neither.
+*/
+@(test)
+test_the_doh_query_that_dialled_is_retried :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen: %v", lerr) {
+		return
+	}
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the port: %v", berr) {
+		net.close(listener)
+		return
+	}
+	_ = net.set_option(listener, .Receive_Timeout, 200 * time.Millisecond)
+
+	m := Hangup_Mock {
+		listener = listener,
+	}
+	responder := thread.create_and_start_with_poly_data(&m, hangup_mock_loop)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(responder)
+		thread.destroy(responder)
+		net.close(listener)
+	}
+
+	u, uerr := make_upstream(
+		config.Upstream_Spec {
+			name = "hangup",
+			kind = .TCP,
+			address = "127.0.0.1",
+			port = bound.port,
+			hostname = "doh.invalid",
+			path = "/dns-query",
+		},
+		8,
+		30 * time.Second,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot make the upstream: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+
+	query := dns.Message {
+		id       = 0x7373,
+		question = []dns.Question{{name = "example.com.", type = .A, class = .IN}},
+	}
+	query.flags.rd = true
+	wire, _, enc := dns.encode_message(query, context.temp_allocator)
+	if !testing.expectf(t, enc == .None, "cannot encode: %v", enc) {
+		return
+	}
+	body := make([]u8, len(wire), context.temp_allocator)
+	copy(body, wire)
+	dns.set_id_in_place(body, 0)
+
+	// The pool is empty, so this dials - and used to get one attempt for it.
+	_, err := exchange_doh_h1(u, wire, body, 2 * time.Second, context.temp_allocator)
+	testing.expectf(t, err == .Peer_Closed, "a hang-up was reported as %v", err)
+	testing.expect(t, sync.atomic_load(&m.conns) >= 2, "the query that dialled was not retried")
+	free_all(context.temp_allocator)
+}

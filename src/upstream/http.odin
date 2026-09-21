@@ -43,7 +43,7 @@ stream_read :: proc(s: ^Stream, buf: []u8) -> (n: int, err: Error) {
 stream_write :: proc(s: ^Stream, buf: []u8) -> Error {
 	if s.tls != nil {
 		if _, err := tlsx.write(s.tls, buf); err != .None {
-			return .IO_Error
+			return .Peer_Closed if err == .Closed else .IO_Error
 		}
 		return .None
 	}
@@ -81,8 +81,12 @@ reader_fill :: proc(r: ^Buf_Reader) -> Error {
 	if err != .None {
 		return err
 	}
+	// Nothing read and no error is the peer having hung up. Named rather than
+	// folded into `IO_Error` because on a pooled connection it is routine and
+	// `record_failure` must not read it as an outage; `reader_to_end` wants it
+	// for the opposite reason, as the close that ends a body with no length.
 	if n == 0 {
-		return .IO_Error
+		return .Peer_Closed
 	}
 	append(&r.buf, ..chunk[:n])
 	return .None
