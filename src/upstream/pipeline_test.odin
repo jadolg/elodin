@@ -1650,3 +1650,87 @@ test_a_late_reader_overruns_by_the_grace_not_the_timeout :: proc(t: ^testing.T) 
 		BUDGET,
 	)
 }
+
+/*
+A write that put nothing on the wire leaves the connection where it found it.
+
+The read path has said this from the start: a read that only ran out of time
+consumed nothing, so the stream is still in frame and what happened is one
+caller's timeout rather than everybody's failure. The write has to say the
+same, and for a sharper reason - the caller this bites is one that arrived with
+its deadline already gone, and the connection it would take down is one every
+other query in flight is using. A burst coming out of the dial queue is exactly
+that: `get_pipe` lets a caller through on a nanosecond, and the first of them
+to reach the write would destroy the connection that was just dialled for the
+rest of them, which is the churn this whole change exists to remove.
+
+Driven through the internals rather than through `exchange`, because what has
+to be observed is the connection's state and not the query's answer.
+*/
+@(test)
+test_a_write_that_sent_nothing_leaves_the_connection_alone :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
+		return
+	}
+	_ = net.set_option(listener, .Receive_Timeout, 50 * time.Millisecond)
+
+	// Nothing has to answer: the write is what is under test, and it never
+	// gets as far as needing a reply.
+	m := Mute_Mock {
+		listener = listener,
+		held     = make([dynamic]net.TCP_Socket, 0, 2),
+	}
+	acceptor := thread.create_and_start_with_poly_data(&m, mute_mock_loop)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(acceptor)
+		thread.destroy(acceptor)
+		delete(m.held)
+	}
+
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "spent", kind = .TCP, address = "127.0.0.1", port = bound.port},
+		8,
+		30 * time.Second,
+	)
+	if uerr != .None {
+		testing.expectf(t, false, "cannot make the upstream: %v", uerr)
+		return
+	}
+	defer destroy(u)
+
+	c, derr := dial_pipe(u, 5 * time.Second, 5 * time.Second)
+	if derr != .None {
+		testing.expectf(t, false, "cannot dial: %v", derr)
+		return
+	}
+	defer _ = pipe_unref(c)
+
+	query := dns.Message {
+		id       = 0x3c3c,
+		question = []dns.Question{{name = "spent.invalid.", type = .A, class = .IN}},
+	}
+	query.flags.rd = true
+	wire, _, enc := dns.encode_message(query, context.allocator)
+	if enc != .None {
+		testing.expectf(t, false, "cannot encode the query: %v", enc)
+		return
+	}
+	defer delete(wire)
+
+	// A deadline that has already passed, which is what a caller coming out of
+	// the dial queue on a sliver arrives with.
+	werr := pipe_write(c, wire, time.tick_now())
+	_, dead := pipe_dead(c)
+
+	testing.expectf(t, werr == .Timeout, "a write with no budget left reported %v", werr)
+	testing.expectf(t, !dead, "a write that put nothing on the wire took the connection down with it")
+}

@@ -604,9 +604,13 @@ pipe_wait :: proc(c: ^Pipe_Conn, w: ^Pipe_Waiter, id: u16, deadline: time.Tick) 
 			first would dial a new connection for each slow name - a new
 			connection being the one thing the upstream this was all written
 			for rate-limits. Two in a row with nothing at all in between is a
-			connection that has stopped; one is a slow answer. The count goes
-			back to zero the moment anything is read, so the two cannot be
-			confused by distance in time.
+			connection that has stopped; one is a slow answer.
+
+			"In a row" is all it means, though, and the count is cleared by a
+			reply arriving rather than by time passing: on a quiet forwarder
+			two unrelated slow names, however far apart, are two in a row and
+			cost one spurious handshake. Cheap enough to leave, and a timestamp
+			of the last reply rather than a bare count is what would fix it.
 
 			Killing it puts back what the pooled path did on every failed round
 			trip: `exchange_pipelined` finds the connection dead and the next
@@ -890,15 +894,25 @@ pipe_write :: proc(c: ^Pipe_Conn, query: []u8, deadline: time.Tick) -> Error {
 	if werr, dead := pipe_dead(c); dead {
 		return werr
 	}
-	err := pipe_write_framed(c, framed, deadline)
-	if err != .None {
+	sent, err := pipe_write_framed(c, framed, deadline)
+	if err != .None && sent > 0 {
 		/*
-		Killed here rather than by the caller, because `wmu` is still held.
+		Only when something went out, which is the rule the read path has
+		followed from the start: a transfer that moved nothing left the stream
+		in frame, so what happened is one caller's timeout and not everybody's
+		failure.
 
+		It bites hardest here. The caller that reaches this with no budget left
+		is one that came out of the dial queue on a sliver - `get_pipe` lets it
+		through on a nanosecond - and the connection it would take down is the
+		one just dialled for the burst behind it. Killing on a write that never
+		started would turn the queue into exactly the churn this change exists
+		to remove.
+
+		Killed here rather than by the caller, because `wmu` is still held.
 		`pipe_query` doing it would let one more writer take its turn in the
 		window between this returning and the kill landing, and spend a budget
-		of its own discovering the same thing. Which is what this check is for,
-		so it may as well hold.
+		of its own discovering the same thing.
 		*/
 		sync.mutex_lock(&c.mu)
 		pipe_kill(c, err)
@@ -909,7 +923,7 @@ pipe_write :: proc(c: ^Pipe_Conn, query: []u8, deadline: time.Tick) -> Error {
 }
 
 @(private)
-pipe_write_framed :: proc(c: ^Pipe_Conn, framed: []u8, deadline: time.Tick) -> Error {
+pipe_write_framed :: proc(c: ^Pipe_Conn, framed: []u8, deadline: time.Tick) -> (sent: int, err: Error) {
 	if c.stream.tls != nil {
 		// `tlsx.write` takes its deadline once per call rather than per
 		// syscall, so one call is already bounded; what it is bounded *by* is
@@ -918,10 +932,20 @@ pipe_write_framed :: proc(c: ^Pipe_Conn, framed: []u8, deadline: time.Tick) -> E
 			c.stream.tls,
 			min(max(time.tick_diff(time.tick_now(), deadline), PIPE_FRAMING_GRACE), c.timeout),
 		)
-		if _, werr := tlsx.write(c.stream.tls, framed); werr != .None {
-			return roundtrip_failure(werr)
+		/*
+		A failed `SSL_write` is reported as having sent something whatever it
+		wrote, and deliberately. OpenSSL may have put part of a record on the
+		wire before asking to be retried, and the session has to be handed the
+		same buffer again to finish it - so a write that failed partway leaves
+		the session in a state only a fresh one recovers from, whether or not
+		any plaintext was accepted. The plain socket below can tell the two
+		apart and does.
+		*/
+		n, werr := tlsx.write(c.stream.tls, framed)
+		if werr != .None {
+			return max(n, 1), roundtrip_failure(werr)
 		}
-		return .None
+		return n, .None
 	}
 	/*
 	Bounded as a whole rather than per `send`, and by this caller's deadline
@@ -935,7 +959,6 @@ pipe_write_framed :: proc(c: ^Pipe_Conn, framed: []u8, deadline: time.Tick) -> E
 	rule the reader follows and for the same reason.
 	*/
 	bound := deadline
-	sent := 0
 	for sent < len(framed) {
 		// Per send, because the loop's bound is nobody's until the socket is
 		// told it: `SO_SNDTIMEO` left at the connection's figure would let one
@@ -943,7 +966,7 @@ pipe_write_framed :: proc(c: ^Pipe_Conn, framed: []u8, deadline: time.Tick) -> E
 		// loop exists to close.
 		remaining := time.tick_diff(time.tick_now(), bound)
 		if remaining <= 0 {
-			return .Timeout
+			return sent, .Timeout
 		}
 		pipe_set_write_timeout(c, remaining)
 		n, werr := net.send_tcp(c.stream.socket, framed[sent:])
@@ -952,19 +975,19 @@ pipe_write_framed :: proc(c: ^Pipe_Conn, framed: []u8, deadline: time.Tick) -> E
 			// thing from the peer closing and is counted as such; see
 			// `pipe_read_full` for why Linux reports it as a would-block.
 			if werr == .Timeout || werr == .Would_Block {
-				return .Timeout
+				return sent, .Timeout
 			}
-			return .IO_Error
+			return sent, .IO_Error
 		}
 		if n <= 0 {
-			return .IO_Error
+			return sent, .IO_Error
 		}
 		if sent == 0 {
 			bound = pipe_framing_deadline(c, deadline)
 		}
 		sent += n
 	}
-	return .None
+	return sent, .None
 }
 
 /*
