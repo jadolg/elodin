@@ -369,6 +369,18 @@ test_a_full_connection_does_not_shut_callers_out :: proc(t: ^testing.T) {
 	defer destroy(u)
 	u.max_outstanding = BOUND
 
+	/*
+	The first wave fills the connection, and the rest go after it has settled.
+
+	`get_pipe` reads the outstanding count under `u.mu` but a caller does not
+	register until `pipe_query` takes `c.mu`, so the check and the reservation
+	are not one step: callers released together can all see room and all take
+	it. Harmless in itself - the overshoot is bounded by the number of callers,
+	which is what the figure was bounding - but it would make this test's
+	question ("did anyone past the bound get a connection of their own?") one
+	the code does not actually promise. Letting the first wave register first
+	asks the question the branch exists to answer instead of racing it.
+	*/
 	legs := make([]Pipe_Leg, LEGS)
 	defer delete(legs)
 	threads := make([]^thread.Thread, LEGS)
@@ -381,6 +393,9 @@ test_a_full_connection_does_not_shut_callers_out :: proc(t: ^testing.T) {
 			timeout = 700 * time.Millisecond,
 		}
 		threads[i] = thread.create_and_start_with_poly_data(&legs[i], pipe_leg)
+		if i == BOUND - 1 {
+			time.sleep(150 * time.Millisecond)
+		}
 	}
 	for th in threads {
 		thread.join(th)
@@ -1315,6 +1330,200 @@ test_one_send_costs_one_timeout :: proc(t: ^testing.T) {
 		t,
 		took < LIMIT,
 		"one send took %v against a timeout of %v; its stages each started a clock of their own",
+		took,
+		BUDGET,
+	)
+}
+
+/*
+A responder that answers one query, then sends a length a byte at a time and
+never the message behind it.
+
+The shape that tells one budget from two: the second byte arrives late enough
+to consume most of a budget and early enough to be inside it, so a reader that
+starts a fresh clock for what follows waits nearly twice as long as one that
+does not.
+*/
+@(private = "file")
+Stall_Mock :: struct {
+	listener:  net.TCP_Socket,
+	// When the second byte of the length prefix follows the first.
+	second_at: time.Duration,
+	stop:      bool,
+}
+
+@(private = "file")
+stall_mock_loop :: proc(m: ^Stall_Mock) {
+	client, _, aerr := net.accept_tcp(m.listener)
+	if aerr != nil {
+		return
+	}
+	defer net.close(client)
+	_ = net.set_option(client, .Receive_Timeout, 50 * time.Millisecond)
+
+	// The warm-up, answered whole: it is what establishes the shared
+	// connection and fixes the budget a half-read message is finished on.
+	warm, warm_ok := stall_read_query(m, client)
+	if !warm_ok {
+		return
+	}
+	defer delete(warm)
+	framed := make([]u8, 2 + len(warm), context.allocator)
+	defer delete(framed)
+	framed[0] = u8(len(warm) >> 8)
+	framed[1] = u8(len(warm))
+	copy(framed[2:], warm)
+	framed[4] |= 0x80
+	if write_all_tcp(client, framed) != .None {
+		return
+	}
+
+	// Then one length, in two pieces, with nothing behind it.
+	next, next_ok := stall_read_query(m, client)
+	if !next_ok {
+		return
+	}
+	defer delete(next)
+	prefix := [2]u8{u8(len(next) >> 8), u8(len(next))}
+	if write_all_tcp(client, prefix[:1]) != .None {
+		return
+	}
+	time.sleep(m.second_at)
+	_ = write_all_tcp(client, prefix[1:])
+
+	for !sync.atomic_load(&m.stop) {
+		time.sleep(10 * time.Millisecond)
+	}
+}
+
+@(private = "file")
+stall_read_query :: proc(m: ^Stall_Mock, client: net.TCP_Socket) -> (query: []u8, ok: bool) {
+	length_buf: [2]u8
+	if !stall_read(m, client, length_buf[:]) {
+		return nil, false
+	}
+	length := int(length_buf[0]) << 8 | int(length_buf[1])
+	if length < dns.HEADER_SIZE || length > dns.MAX_MESSAGE {
+		return nil, false
+	}
+	query = make([]u8, length, context.allocator)
+	if !stall_read(m, client, query) {
+		delete(query)
+		return nil, false
+	}
+	return query, true
+}
+
+@(private = "file")
+stall_read :: proc(m: ^Stall_Mock, client: net.TCP_Socket, buf: []u8) -> bool {
+	got := 0
+	for got < len(buf) {
+		if sync.atomic_load(&m.stop) {
+			return false
+		}
+		n, err := net.recv_tcp(client, buf[got:])
+		if err == .Timeout || err == .Would_Block {
+			continue
+		}
+		if err != nil || n <= 0 {
+			return false
+		}
+		got += n
+	}
+	return true
+}
+
+/*
+A message half read gets one budget, not one per read it takes.
+
+The connection's budget is what a peer may spend on a message it has already
+started - one message, so one clock. Started again for each read, a peer that
+dribbles can hold the reader for as many budgets as it cares to split the
+message into, which is the compounding `exchange_pipelined` gives every stage
+one deadline to prevent, arriving a level further down. The reader is past its
+own deadline throughout, holding a worker the caller above stopped waiting for.
+
+Two pieces is enough to show it and is the smallest case there is: a length
+byte, a pause most of a budget long, the second byte, and then nothing. One
+clock expires while the body is awaited; two carry on into a second budget.
+*/
+@(test)
+test_a_half_read_message_gets_one_budget :: proc(t: ^testing.T) {
+	BUDGET :: 600 * time.Millisecond
+	// Most of a budget, so the second byte lands well inside the first clock
+	// and leaves little of it for what follows.
+	SECOND_AT :: 400 * time.Millisecond
+	// One budget and a margin. Two clocks is SECOND_AT + BUDGET, a full
+	// quarter-second above this.
+	LIMIT :: 8 * BUDGET / 6
+
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		net.close(listener)
+		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
+		return
+	}
+	_ = net.set_option(listener, .Receive_Timeout, 50 * time.Millisecond)
+
+	m := Stall_Mock {
+		listener  = listener,
+		second_at = SECOND_AT,
+	}
+	responder := thread.create_and_start_with_poly_data(&m, stall_mock_loop)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(responder)
+		thread.destroy(responder)
+		net.close(listener)
+	}
+
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "stall", kind = .TCP, address = "127.0.0.1", port = bound.port},
+		8,
+		30 * time.Second,
+	)
+	if uerr != .None {
+		testing.expectf(t, false, "cannot make the upstream: %v", uerr)
+		return
+	}
+	defer destroy(u)
+
+	warm := Pipe_Leg {
+		u       = u,
+		name    = "warm.invalid.",
+		id      = 0xbbbb,
+		timeout = BUDGET,
+	}
+	warmup := thread.create_and_start_with_poly_data(&warm, pipe_leg)
+	thread.join(warmup)
+	thread.destroy(warmup)
+	if warm.err != .None {
+		testing.expectf(t, false, "the warm-up query failed: %v", warm.err)
+		return
+	}
+
+	stalled := Pipe_Leg {
+		u       = u,
+		name    = "stalled.invalid.",
+		id      = 0xcccc,
+		timeout = BUDGET,
+	}
+	start := time.now()
+	th := thread.create_and_start_with_poly_data(&stalled, pipe_leg)
+	thread.join(th)
+	thread.destroy(th)
+	took := time.diff(start, time.now())
+
+	testing.expectf(t, stalled.err != .None, "a message that never arrived was answered")
+	testing.expectf(
+		t,
+		took < LIMIT,
+		"a half-read message held the reader %v on a budget of %v; each read started a clock of its own",
 		took,
 		BUDGET,
 	)

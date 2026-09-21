@@ -579,6 +579,18 @@ pipe_wait :: proc(c: ^Pipe_Conn, w: ^Pipe_Waiter, id: u16, deadline: time.Time) 
 			says the same about the future: an impatient caller must not take
 			down a connection whose answer to a patient one is still on its
 			way.
+
+			ponytail: the second condition is also this check's ceiling, and it
+			bites hardest where pipelining is doing most - with queries in
+			flight at all times a new one almost always overlaps the one timing
+			out, so the count never advances and a wedged connection is not
+			caught here at all. It is still caught, a tier up and a few seconds
+			later: three failures park the upstream for the cooldown, the pause
+			drains the waiters, and the queries after it find the connection
+			with nobody on it. Widening this to notice silence across
+			overlapping callers - a timestamp of the last reply rather than a
+			count of lone timeouts - is what to do if that window ever shows up
+			as an outage rather than as a dip.
 			*/
 			if c.replies == w.seen && len(c.waiters) == 0 {
 				c.silent += 1
@@ -637,7 +649,17 @@ pipe_read_one :: proc(c: ^Pipe_Conn, budget: time.Duration) -> Error {
 	if _, rerr := pipe_read_full(c, length_buf[:1], time.time_add(time.now(), budget)); rerr != .None {
 		return .Timeout if rerr == .Timeout else rerr
 	}
-	if _, rerr := pipe_read_full(c, length_buf[1:], time.time_add(time.now(), c.timeout)); rerr != .None {
+	/*
+	One clock from here, shared by everything left of this message.
+
+	`Pipe_Conn.timeout` is what a peer may spend on a message it has already
+	started, and that is one message rather than one read. Started again for
+	each read, a peer that dribbles holds the reader for as many budgets as it
+	cares to split the message into - the compounding `exchange_pipelined`
+	hands every stage one deadline to prevent, a level further down.
+	*/
+	framing := time.time_add(time.now(), c.timeout)
+	if _, rerr := pipe_read_full(c, length_buf[1:], framing); rerr != .None {
 		return .IO_Error if rerr == .Timeout else rerr
 	}
 	length := int(length_buf[0]) << 8 | int(length_buf[1])
@@ -649,7 +671,7 @@ pipe_read_one :: proc(c: ^Pipe_Conn, budget: time.Duration) -> Error {
 	// it is known whose it is, and the waiter it goes to may be on a thread
 	// whose arena this one has no business allocating from.
 	msg := make([]u8, length, c.allocator)
-	if _, merr := pipe_read_full(c, msg, time.time_add(time.now(), c.timeout)); merr != .None {
+	if _, merr := pipe_read_full(c, msg, framing); merr != .None {
 		delete(msg, c.allocator)
 		return .IO_Error if merr == .Timeout else merr
 	}
