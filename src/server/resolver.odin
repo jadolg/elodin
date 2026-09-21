@@ -491,7 +491,7 @@ never the hole - 4096 is simply over an ordinary 1500-byte path MTU, which is
 the whole of what flag day was about, and a signed answer is the message most
 likely to be that large. The cost is a truncation and a TCP fetch for a DNSKEY
 set or a large RRset, and against a `udp://` upstream with no TCP service at all
-a failure: `exchange_tcp` cannot dial, and `record_failure` counts it. Three
+a failure: `exchange_pipelined` cannot dial, and `record_failure` counts it. Three
 *consecutive* ones park the server - `record_success` zeroes the count, so
 ordinary traffic in between clears it - and such an upstream is already failing
 every client that asks without EDNS, which is held to 512 by RFC 1035. That is

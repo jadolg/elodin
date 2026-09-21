@@ -80,7 +80,7 @@ exchange_udp :: proc(
 			// The datagram was larger than the room the query offered, so what
 			// arrived is a prefix of an answer. TCP is where the whole one is.
 			if recv_err == .Excess_Truncated {
-				return exchange_tcp(u, query, timeout, allocator)
+				return exchange_pipelined(u, query, timeout, allocator)
 			}
 			return nil, .Bad_Response if rejected else .Timeout
 		}
@@ -100,7 +100,7 @@ exchange_udp :: proc(
 
 		flags := transmute(dns.Flags)(u16(buf[2]) << 8 | u16(buf[3]))
 		if flags.tc {
-			return exchange_tcp(u, query, timeout, allocator)
+			return exchange_pipelined(u, query, timeout, allocator)
 		}
 		out := make([]u8, n, allocator)
 		copy(out, buf[:n])
@@ -120,99 +120,6 @@ addresses_equal :: proc(a, b: net.Address) -> bool {
 		return ok && x == y
 	}
 	return false
-}
-
-// Plain DNS over TCP, with the two-byte length prefix of RFC 1035 section 4.2.2.
-@(private)
-exchange_tcp :: proc(
-	u: ^Upstream,
-	query: []u8,
-	timeout: time.Duration,
-	allocator: mem.Allocator,
-) -> (
-	response: []u8,
-	err: Error,
-) {
-	/*
-	Try a pooled connection, then a fresh one.
-
-	A resolver closes connections its client has left idle, so a pooled one is
-	quite normally dead by the time it is picked up. That is not an upstream
-	failure and must not be reported as one: a handful of them would trip the
-	health cooldown and bench a server that is working.
-	*/
-	for attempt in 0 ..< 2 {
-		conn: Idle_Conn
-		reused := false
-		if attempt == 0 {
-			conn, reused = take_idle(u)
-		}
-		if !reused {
-			socket, derr := dial_tcp_timeout(u.endpoint, timeout)
-			if derr != .None {
-				return nil, derr
-			}
-			set_socket_timeouts(socket, timeout)
-			_ = net.set_option(socket, .TCP_Nodelay, true)
-			conn = Idle_Conn {
-				socket = socket,
-			}
-		}
-
-		response, err = tcp_roundtrip(u, conn.socket, query, allocator)
-		if err == .None {
-			put_idle(u, conn)
-			return response, .None
-		}
-		net.close(conn.socket)
-		if !reused {
-			return nil, err
-		}
-	}
-	return nil, .IO_Error
-}
-
-@(private)
-tcp_roundtrip :: proc(
-	u: ^Upstream,
-	socket: net.TCP_Socket,
-	query: []u8,
-	allocator: mem.Allocator,
-) -> (
-	response: []u8,
-	err: Error,
-) {
-	if len(query) > 0xffff {
-		return nil, .Too_Large
-	}
-	framed := make([]u8, 2 + len(query), context.temp_allocator)
-	framed[0] = u8(len(query) >> 8)
-	framed[1] = u8(len(query))
-	copy(framed[2:], query)
-
-	if write_all_tcp(socket, framed) != .None {
-		return nil, .IO_Error
-	}
-
-	length_buf: [2]u8
-	if read_full_tcp(socket, length_buf[:]) != .None {
-		return nil, .IO_Error
-	}
-	length := int(length_buf[0]) << 8 | int(length_buf[1])
-	if length < dns.HEADER_SIZE {
-		return nil, .Bad_Response
-	}
-
-	out := make([]u8, length, allocator)
-	if read_full_tcp(socket, out) != .None {
-		delete(out, allocator)
-		return nil, .IO_Error
-	}
-	if !response_accepted(u, query, out) {
-		delete(out, allocator)
-		return nil, .Bad_Response
-	}
-	return out, .None
 }
 
 @(private)
@@ -241,53 +148,6 @@ read_full_tcp :: proc(socket: net.TCP_Socket, buf: []u8) -> Error {
 	return .None
 }
 
-// Open a fresh DoT connection. Dialling, the handshake and the retry that
-// handshake gets are the HTTPS path's exactly, so they are shared with it.
-@(private)
-dial_dot :: proc(u: ^Upstream, timeout: time.Duration) -> (conn: Idle_Conn, err: Error) {
-	stream := open_stream(u.endpoint, u.tls_ctx, u.spec.hostname, timeout, u) or_return
-	return Idle_Conn{socket = stream.socket, tls = stream.tls}, .None
-}
-
-// DNS over TLS: the TCP framing above, carried inside a TLS session (RFC 7858).
-@(private)
-exchange_dot :: proc(
-	u: ^Upstream,
-	query: []u8,
-	timeout: time.Duration,
-	allocator: mem.Allocator,
-) -> (
-	response: []u8,
-	err: Error,
-) {
-	// Pooled connection first, then a fresh one; see exchange_tcp for why a
-	// dead pooled connection must not count as an upstream failure.
-	for attempt in 0 ..< 2 {
-		conn: Idle_Conn
-		reused := false
-		if attempt == 0 {
-			conn, reused = take_idle(u)
-		}
-		if !reused {
-			conn, err = dial_dot(u, timeout)
-			if err != .None {
-				return nil, err
-			}
-		}
-
-		response, err = tls_roundtrip(conn.tls, query, allocator)
-		if err == .None {
-			put_idle(u, conn)
-			return response, .None
-		}
-		tlsx.close(conn.tls)
-		if !reused {
-			return nil, err
-		}
-	}
-	return nil, .IO_Error
-}
-
 /*
 What a failed read or write on an established TLS session means above.
 
@@ -295,9 +155,9 @@ Kept apart from `IO_Error` because on a connection that handshook the two say
 opposite things about the peer. A server that accepted the query and then said
 nothing until the timeout is answering too slowly, or not answering this
 question at all; one that closed or reset is either recycling a connection or
-refusing to carry on. `exchange_dot` retries a pooled connection on either, so
-what reaches the counters is a fresh connection failing - where the distinction
-is the diagnosis.
+refusing to carry on. `exchange_pipelined` retries a shared connection found
+dead, so what reaches the counters is a fresh connection failing - where the
+distinction is the diagnosis.
 */
 @(private)
 roundtrip_failure :: proc(terr: tlsx.Error) -> Error {
@@ -306,39 +166,4 @@ roundtrip_failure :: proc(terr: tlsx.Error) -> Error {
 		return .Timeout
 	}
 	return .IO_Error
-}
-
-@(private)
-tls_roundtrip :: proc(conn: ^tlsx.Conn, query: []u8, allocator: mem.Allocator) -> (response: []u8, err: Error) {
-	if len(query) > 0xffff {
-		return nil, .Too_Large
-	}
-	framed := make([]u8, 2 + len(query), context.temp_allocator)
-	framed[0] = u8(len(query) >> 8)
-	framed[1] = u8(len(query))
-	copy(framed[2:], query)
-
-	if _, werr := tlsx.write(conn, framed); werr != .None {
-		return nil, roundtrip_failure(werr)
-	}
-
-	length_buf: [2]u8
-	if rerr := tlsx.read_full(conn, length_buf[:]); rerr != .None {
-		return nil, roundtrip_failure(rerr)
-	}
-	length := int(length_buf[0]) << 8 | int(length_buf[1])
-	if length < dns.HEADER_SIZE {
-		return nil, .Bad_Response
-	}
-
-	out := make([]u8, length, allocator)
-	if rerr := tlsx.read_full(conn, out); rerr != .None {
-		delete(out, allocator)
-		return nil, roundtrip_failure(rerr)
-	}
-	if !response_matches(query, out) {
-		delete(out, allocator)
-		return nil, .Bad_Response
-	}
-	return out, .None
 }

@@ -531,6 +531,12 @@ pool that is no longer a rounding error against the connection table. See
 `server.descriptors_wanted`, which is the only caller and the reason this is a
 figure rather than a comment.
 
+`tcp` and `tls` servers do not pool at all: they pipeline every query onto one
+connection each (RFC 7766 section 6.2, see upstream/pipeline.odin), so for them
+this counts up to `max_idle` where one is what is held. Left as it is because
+what the only caller wants is a ceiling on descriptors, and a ceiling that is
+generous for two of the four transports is still a ceiling.
+
 **Idle sockets only, which is not every socket this server holds upstream.** A
 connection checked out of a pool for a round trip is not in the pool, and one
 dialled when the pool is empty was never in it - so in-flight exchanges are

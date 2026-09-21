@@ -74,17 +74,27 @@ Upstream :: struct {
 	tls_ctx:      ^tlsx.Context,
 
 	mu:           sync.Mutex,
+	// HTTP/1.1 only, which is the one transport left that can do nothing but
+	// one request per connection at a time. See `pipe` below for the rest.
 	idle:         [dynamic]Idle_Conn,
 	max_idle:     int,
 	idle_timeout: time.Duration,
 
-	// HTTPS only. `proto` is set once ALPN has settled it and never changes
-	// back; `h2_cond` and `connecting` make concurrent first callers share one
-	// handshake instead of each racing to open their own.
-	proto:      Protocol,
-	h2_cond:    sync.Cond,
+	// `conn_cond` and `connecting` make concurrent first callers share one
+	// handshake instead of each racing to open their own. Used by both shared
+	// connections below, which no upstream has at once - `spec.kind` picks one.
+	conn_cond:  sync.Cond,
 	connecting: bool,
+
+	// HTTPS only. `proto` is set once ALPN has settled it and never changes
+	// back.
+	proto:      Protocol,
 	h2:         ^H2_Conn,
+
+	// The one connection everything this upstream sends over a stream is
+	// pipelined onto: `tcp` and `tls` throughout, and a `udp` upstream's retry
+	// of a truncated answer. See pipeline.odin.
+	pipe:       ^Pipe_Conn,
 
 	// Whether queries to this server carry a DNS cookie. The client half is
 	// fixed at construction; the server half is learned and lives under `mu`.
@@ -503,10 +513,8 @@ send :: proc(
 	switch u.spec.kind {
 	case .UDP:
 		return exchange_udp(u, query, timeout, allocator)
-	case .TCP:
-		return exchange_tcp(u, query, timeout, allocator)
-	case .TLS:
-		return exchange_dot(u, query, timeout, allocator)
+	case .TCP, .TLS:
+		return exchange_pipelined(u, query, timeout, allocator)
 	case .HTTPS:
 		return exchange_doh(u, query, timeout, allocator)
 	}
@@ -597,6 +605,8 @@ close_conn :: proc(conn: Idle_Conn) {
 close_idle :: proc(u: ^Upstream, all := false) -> (closed: int) {
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
+
+	closed += close_pipe(u, all)
 
 	now := time.now()
 	kept := make([dynamic]Idle_Conn, 0, len(u.idle), context.temp_allocator)

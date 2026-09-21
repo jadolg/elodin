@@ -381,7 +381,7 @@ upstream:
   strategy: failover               # failover | round_robin | race
   timeout: 5s
   attempts: 2
-  max_idle: 8                      # pooled connections per upstream
+  max_idle: 8                      # pooled connections per https/1.1 upstream
   idle_timeout: 30s
   bootstrap: [1.1.1.1, 9.9.9.9]    # resolves upstream hostnames
   servers:

@@ -12,12 +12,16 @@ import "elodin:tlsx"
 The shared HTTP/2 connection an HTTPS upstream uses once ALPN has shown it
 speaks h2.
 
-Unlike the HTTP/1.1 and DoT paths, which pool several connections each handling
-one request at a time, every concurrent DoH query against an h2 upstream
-multiplexes onto the *same* connection: h2.Client_request opens its own stream
-and blocks on it, while h2.client_serve — running on its own thread — reads
-frames for every stream at once. See src/h2/client.odin for that machinery;
-this file only wires it to a real socket and to `Upstream`'s lifecycle.
+Every concurrent DoH query against an h2 upstream multiplexes onto the *same*
+connection: h2.Client_request opens its own stream and blocks on it, while
+h2.client_serve — running on its own thread — reads frames for every stream at
+once. See src/h2/client.odin for that machinery; this file only wires it to a
+real socket and to `Upstream`'s lifecycle.
+
+pipeline.odin does the same for TCP and DoT, demultiplexing on the DNS message
+ID instead of a stream ID and without a thread of its own. The HTTP/1.1 path is
+the one left pooling a connection per request in flight, because HTTP/1.1 has
+no way to do anything else.
 */
 
 // How long the reader thread's blocking read waits before it gets a chance to
@@ -92,7 +96,7 @@ last one died.
 Only one caller dials at a time: a burst of concurrent first queries against a
 freshly started upstream shares a single handshake rather than each opening —
 and then discarding all but one of — a connection of its own. Callers that
-lose the race wait on `u.h2_cond` and pick up the winner's result.
+lose the race wait on `u.conn_cond` and pick up the winner's result.
 
 `ok` is false either when `err` is set or when the upstream turned out to
 speak HTTP/1.1; in the latter case the caller falls back to the pooled
@@ -116,7 +120,7 @@ get_h2_conn :: proc(u: ^Upstream, timeout: time.Duration) -> (conn: ^h2.Client, 
 		if !u.connecting {
 			break
 		}
-		sync.cond_wait(&u.h2_cond, &u.mu)
+		sync.cond_wait(&u.conn_cond, &u.mu)
 	}
 	u.connecting = true
 	// A dead connection, if any, is torn down below, outside the lock: it may
@@ -135,13 +139,13 @@ get_h2_conn :: proc(u: ^Upstream, timeout: time.Duration) -> (conn: ^h2.Client, 
 	sync.mutex_lock(&u.mu)
 	u.connecting = false
 	if derr != .None {
-		sync.cond_broadcast(&u.h2_cond)
+		sync.cond_broadcast(&u.conn_cond)
 		sync.mutex_unlock(&u.mu)
 		return nil, false, derr
 	}
 	u.proto = proto
 	if proto != .H2 {
-		sync.cond_broadcast(&u.h2_cond)
+		sync.cond_broadcast(&u.conn_cond)
 		sync.mutex_unlock(&u.mu)
 		put_idle(u, Idle_Conn{socket = stream.socket, tls = stream.tls})
 		return nil, false, .None
@@ -172,7 +176,7 @@ get_h2_conn :: proc(u: ^Upstream, timeout: time.Duration) -> (conn: ^h2.Client, 
 
 	h2.client_ref(hc.client)
 	conn = hc.client
-	sync.cond_broadcast(&u.h2_cond)
+	sync.cond_broadcast(&u.conn_cond)
 	sync.mutex_unlock(&u.mu)
 	return conn, true, .None
 }
