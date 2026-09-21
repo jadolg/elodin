@@ -488,7 +488,7 @@ open_stream :: proc(
 	tls_ctx: ^tlsx.Context,
 	hostname: string,
 	timeout: time.Duration,
-	name: string = "",
+	u: ^Upstream = nil,
 ) -> (
 	stream: Stream,
 	err: Error,
@@ -514,15 +514,24 @@ open_stream :: proc(
 		// OpenSSL keeps its reason on a per-thread queue, so it has to be read
 		// here rather than at the point the error surfaces.
 		detail := tlsx.describe_error(terr, context.temp_allocator)
-		if name == "" {
-			logx.debugf("TLS handshake with %q failed: %s", hostname, detail)
-		} else {
-			logx.debugf("upstream %s: TLS handshake with %q failed: %s", name, hostname, detail)
-		}
 		net.close(socket)
-		if terr != .Closed || attempt == 1 {
-			return {}, handshake_failure(terr)
+		if terr == .Closed && attempt == 0 {
+			logx.debugf("TLS handshake with %q failed: %s, retrying once", hostname, detail)
+			continue
 		}
+		ferr := handshake_failure(terr)
+		// Said once per upstream per kind, and at `debug` after that: the
+		// reason is the whole diagnosis of a failing DoT or DoH upstream and
+		// `Error` has nowhere to carry it, so an operator who never sees this
+		// line has `TLS_Failed` and nothing else to go on.
+		if first_failure_of_kind(u, ferr) {
+			logx.warnf("upstream %s: TLS handshake with %q failed: %s", u.spec.name, hostname, detail)
+		} else if u != nil {
+			logx.debugf("upstream %s: TLS handshake with %q failed: %s", u.spec.name, hostname, detail)
+		} else {
+			logx.debugf("TLS handshake with %q failed: %s", hostname, detail)
+		}
+		return {}, ferr
 	}
 	return {}, .TLS_Failed
 }

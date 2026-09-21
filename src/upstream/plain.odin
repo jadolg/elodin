@@ -61,6 +61,19 @@ exchange_udp :: proc(
 	buf := make([]u8, limit + 1, context.temp_allocator)
 	deadline := time.time_add(time.now(), timeout)
 
+	/*
+	Whether anything arrived from the server and was thrown away.
+
+	The loop below passes over a datagram it will not accept and waits for the
+	genuine reply, so a server whose every reply is being discarded - one that
+	stopped echoing our cookie, or a middlebox rewriting the question - leaves
+	exactly the same trace as one that never answered at all. That is the one
+	failure an operator cannot tell apart from the outside, and it is the one
+	where the fault is on this side of the wire. Reported as `Bad_Response`,
+	which is what the TCP path already calls a reply it rejects.
+	*/
+	rejected := false
+
 	for time.diff(deadline, time.now()) < 0 {
 		n, remote, recv_err := net.recv_udp(socket, buf)
 		if recv_err != nil {
@@ -69,7 +82,7 @@ exchange_udp :: proc(
 			if recv_err == .Excess_Truncated {
 				return exchange_tcp(u, query, timeout, allocator)
 			}
-			return nil, .Timeout
+			return nil, .Bad_Response if rejected else .Timeout
 		}
 		if n < dns.HEADER_SIZE {
 			continue
@@ -81,6 +94,7 @@ exchange_udp :: proc(
 		// A forged datagram is passed over rather than reported: the genuine
 		// reply may still be on its way, and the loop has until the deadline.
 		if !response_accepted(u, query, buf[:n]) {
+			rejected = true
 			continue
 		}
 
@@ -92,7 +106,7 @@ exchange_udp :: proc(
 		copy(out, buf[:n])
 		return out, .None
 	}
-	return nil, .Timeout
+	return nil, .Bad_Response if rejected else .Timeout
 }
 
 @(private)
@@ -231,7 +245,7 @@ read_full_tcp :: proc(socket: net.TCP_Socket, buf: []u8) -> Error {
 // handshake gets are the HTTPS path's exactly, so they are shared with it.
 @(private)
 dial_dot :: proc(u: ^Upstream, timeout: time.Duration) -> (conn: Idle_Conn, err: Error) {
-	stream := open_stream(u.endpoint, u.tls_ctx, u.spec.hostname, timeout, u.spec.name) or_return
+	stream := open_stream(u.endpoint, u.tls_ctx, u.spec.hostname, timeout, u) or_return
 	return Idle_Conn{socket = stream.socket, tls = stream.tls}, .None
 }
 
@@ -274,6 +288,26 @@ exchange_dot :: proc(
 	return nil, .IO_Error
 }
 
+/*
+What a failed read or write on an established TLS session means above.
+
+Kept apart from `IO_Error` because on a connection that handshook the two say
+opposite things about the peer. A server that accepted the query and then said
+nothing until the timeout is answering too slowly, or not answering this
+question at all; one that closed or reset is either recycling a connection or
+refusing to carry on. `exchange_dot` retries a pooled connection on either, so
+what reaches the counters is a fresh connection failing - where the distinction
+is the diagnosis.
+*/
+@(private)
+roundtrip_failure :: proc(terr: tlsx.Error) -> Error {
+	#partial switch terr {
+	case .Timeout:
+		return .Timeout
+	}
+	return .IO_Error
+}
+
 @(private)
 tls_roundtrip :: proc(conn: ^tlsx.Conn, query: []u8, allocator: mem.Allocator) -> (response: []u8, err: Error) {
 	if len(query) > 0xffff {
@@ -285,12 +319,12 @@ tls_roundtrip :: proc(conn: ^tlsx.Conn, query: []u8, allocator: mem.Allocator) -
 	copy(framed[2:], query)
 
 	if _, werr := tlsx.write(conn, framed); werr != .None {
-		return nil, .IO_Error
+		return nil, roundtrip_failure(werr)
 	}
 
 	length_buf: [2]u8
-	if tlsx.read_full(conn, length_buf[:]) != .None {
-		return nil, .IO_Error
+	if rerr := tlsx.read_full(conn, length_buf[:]); rerr != .None {
+		return nil, roundtrip_failure(rerr)
 	}
 	length := int(length_buf[0]) << 8 | int(length_buf[1])
 	if length < dns.HEADER_SIZE {
@@ -298,9 +332,9 @@ tls_roundtrip :: proc(conn: ^tlsx.Conn, query: []u8, allocator: mem.Allocator) -
 	}
 
 	out := make([]u8, length, allocator)
-	if tlsx.read_full(conn, out) != .None {
+	if rerr := tlsx.read_full(conn, out); rerr != .None {
 		delete(out, allocator)
-		return nil, .IO_Error
+		return nil, roundtrip_failure(rerr)
 	}
 	if !response_matches(query, out) {
 		delete(out, allocator)

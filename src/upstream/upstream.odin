@@ -95,6 +95,10 @@ Upstream :: struct {
 	// a dead server stops costing every query a full timeout.
 	failures:     u32,
 	down_until:   time.Time,
+	// Which kinds of failure this upstream has already been reported for, so
+	// each one is said once at `warn` and left to `debug` after that; see
+	// `record_failure`.
+	reported:     bit_set[Error],
 
 	stats:        Stats,
 	allocator:    mem.Allocator,
@@ -222,13 +226,64 @@ record_success :: proc(u: ^Upstream, elapsed: time.Duration) {
 	u.stats.latency_ns_total += u64(elapsed)
 }
 
+/*
+Whether this is the first failure of its kind for this upstream.
+
+`true` exactly once per upstream per member of `Error`, so a caller with
+something to say about a failure says it once however often the failure comes
+back. The caller holds `u.mu`; `first_failure_of_kind` is the same question
+asked from outside the lock.
+*/
 @(private)
-record_failure :: proc(u: ^Upstream) {
+note_failure_kind :: proc(u: ^Upstream, err: Error) -> bool {
+	if err in u.reported {
+		return false
+	}
+	u.reported += {err}
+	return true
+}
+
+/*
+The same, for the transports that know more about a failure than its kind.
+
+A TLS handshake carries a reason string that `Error` has no room for, and it is
+worth more than the enum is: "certificate has expired" and "no application
+protocol" are different problems that both arrive here as `TLS_Failed`. Asked
+where the reason is still in hand, so the one line this failure gets is the one
+with the reason on it and `record_failure` stays quiet about it afterwards.
+*/
+@(private)
+first_failure_of_kind :: proc(u: ^Upstream, err: Error) -> bool {
+	if u == nil {
+		return false
+	}
+	sync.mutex_lock(&u.mu)
+	defer sync.mutex_unlock(&u.mu)
+	return note_failure_kind(u, err)
+}
+
+/*
+Count one failed exchange, and say why the first time each kind happens.
+
+The `warn` is once per upstream per kind of failure rather than per exchange:
+an upstream that intermittently fails never reaches the threshold below, so
+before this the only trace it left was a `debug` line nobody has on and a
+counter nobody is scraping - which is how a member of a group can be failing
+every few queries, with the rest of the group covering for it, and nothing in
+the log says so. Once per kind bounds the output at the size of `Error` for
+the life of the process, whatever the query rate does, and a recurrence is
+still on the `debug` line `exchange` writes for every one.
+*/
+@(private)
+record_failure :: proc(u: ^Upstream, err: Error) {
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
 	u.failures += 1
 	u.stats.queries += 1
 	u.stats.failures += 1
+	if note_failure_kind(u, err) {
+		logx.warnf("upstream %s (%v %s): %v", u.spec.name, u.spec.kind, u.spec.address, err)
+	}
 	if u.failures >= FAILURE_THRESHOLD {
 		u.down_until = time.time_add(time.now(), COOLDOWN)
 		// A server that stopped sending cookies is a server whose every reply is
@@ -238,7 +293,13 @@ record_failure :: proc(u: ^Upstream) {
 		forget_cookie(u)
 	}
 	if u.failures == FAILURE_THRESHOLD {
-		logx.warnf("upstream %s: %d consecutive failures, pausing it for %v", u.spec.name, u.failures, COOLDOWN)
+		logx.warnf(
+			"upstream %s: %d consecutive failures (last: %v), pausing it for %v",
+			u.spec.name,
+			u.failures,
+			err,
+			COOLDOWN,
+		)
 	}
 }
 
@@ -357,7 +418,16 @@ exchange :: proc(
 	}
 
 	if err != .None {
-		record_failure(u)
+		record_failure(u, err)
+		logx.debugf(
+			"upstream %s (%v %s:%d) failed after %v: %v",
+			u.spec.name,
+			u.spec.kind,
+			u.spec.address,
+			u.spec.port,
+			time.diff(start, time.now()),
+			err,
+		)
 		return nil, err
 	}
 	record_success(u, time.diff(start, time.now()))
