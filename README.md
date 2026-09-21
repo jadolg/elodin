@@ -2278,6 +2278,7 @@ as a warning at startup.
 | `elodin_filter_rules{list}` | gauge | rules loaded, `block` and `allow` |
 | `elodin_upstream_queries_total{upstream}` | counter | queries sent to each upstream, by its configured name |
 | `elodin_upstream_failures_total{upstream}` | counter | exchanges that produced no usable answer |
+| `elodin_upstream_failure_kind_total{upstream,error}` | counter | the same exchanges, split by what went wrong: `timeout`, `io_error`, `bad_response`, `tls_failed`, `verify_failed`, `dial_failed`, `dial_reset`, `http_error`, `too_large`, `not_resolved`, `unhealthy`. Only the kinds that have happened; `sum by (upstream)` of this is the family above. The log says each kind once per process, so this is the only continuous account of *which* way an upstream is failing, and that is the half that decides what to do about it |
 | `elodin_upstream_latency_seconds_total{upstream}` | counter | cumulative round-trip time; divide by the query counter under `rate()` for the mean |
 | `elodin_upstream_up{upstream}` | gauge | 0 while an upstream is in its failure cooldown |
 | `elodin_upstream_unreadable_rcode_total{upstream}` | counter | replies from each upstream refused because their rcode is one a client would read as a different rcode — the extended half lives in the OPT record and a stub reads the header. Not counted as a failure above, on purpose: those bytes are forgeable, and a failure would park the group |

@@ -763,6 +763,7 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 		latency:    u64,
 		unreadable: u64,
 		swept:      u64,
+		kinds:      [upstream.Error]u64,
 		up:         bool,
 	}
 	all := make([dynamic]Series, 0, 8, context.temp_allocator)
@@ -780,6 +781,9 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 				all[i].latency += us.latency_ns_total
 				all[i].unreadable += us.unreadable_rcode
 				all[i].swept += us.swept_rcode
+				for n, e in us.failure_kinds {
+					all[i].kinds[e] += n
+				}
 				if live {
 					all[i].up = true
 				}
@@ -795,6 +799,7 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 					latency = us.latency_ns_total,
 					unreadable = us.unreadable_rcode,
 					swept = us.swept_rcode,
+					kinds = us.failure_kinds,
 					up = live,
 				},
 			)
@@ -813,6 +818,50 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 	metrics.family(b, "elodin_upstream_failures_total", .Counter, "Exchanges with each upstream that did not produce a usable answer.")
 	for u in all {
 		metrics.sample(b, "elodin_upstream_failures_total", u.failures, metrics.Label{"upstream", u.name})
+	}
+
+	/*
+	The family above, split by what went wrong.
+
+	`elodin_upstream_failures_total` says an upstream is failing and never
+	which way, and the log cannot fill that gap: each kind is warned about
+	once per process, so a window of it shows whichever kinds were new in that
+	window and nothing about how often any of them happen. An operator looking
+	at a failure rate needs the split to know what to do about it - a
+	`timeout` against a server is a different problem from a `tls_failed`, and
+	a `bad_response` is this resolver refusing answers that arrived.
+
+	Left as a second family rather than a label on the first, because adding a
+	label to a counter that is already being graphed splits every existing
+	series and breaks the panels and rules built on it. The two agree by
+	construction: `sum by (upstream) (elodin_upstream_failure_kind_total)`
+	is `elodin_upstream_failures_total`.
+
+	Only the kinds that have happened. A kind an upstream has never produced
+	is not a fact worth a series per upstream to state, and Prometheus is
+	content for one to appear the first time it does - the same reasoning that
+	keeps zeroes out of the label sets elsewhere on this page, rather than the
+	one that keeps counters on it.
+	*/
+	metrics.family(
+		b,
+		"elodin_upstream_failure_kind_total",
+		.Counter,
+		"Exchanges with each upstream that did not produce a usable answer, by what went wrong. Sums by upstream to elodin_upstream_failures_total.",
+	)
+	for u in all {
+		for n, e in u.kinds {
+			if n == 0 {
+				continue
+			}
+			metrics.sample(
+				b,
+				"elodin_upstream_failure_kind_total",
+				n,
+				metrics.Label{"upstream", u.name},
+				metrics.Label{"error", upstream.error_label(e)},
+			)
+		}
 	}
 
 	/*
