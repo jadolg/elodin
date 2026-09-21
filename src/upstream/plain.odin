@@ -151,11 +151,12 @@ read_full_tcp :: proc(socket: net.TCP_Socket, buf: []u8) -> Error {
 /*
 What a failed read or write on an established TLS session means above.
 
-Kept apart from `IO_Error` because on a connection that handshook the two say
-opposite things about the peer. A server that accepted the query and then said
-nothing until the timeout is answering too slowly, or not answering this
-question at all; one that closed or reset is either recycling a connection or
-refusing to carry on. `exchange_pipelined` retries a shared connection found
+Three different things about the peer, and the caller acts on each of them
+differently. A server that accepted the query and then said nothing until the
+timeout is answering too slowly, or not answering this question at all. One
+that closed or reset is recycling a connection, which every DNS-over-TCP server
+does and which `record_failure` refuses to read as an outage. Anything else is
+the transport itself. `exchange_pipelined` retries a shared connection found
 dead, so what reaches the counters is a fresh connection failing - where the
 distinction is the diagnosis.
 */
@@ -164,6 +165,8 @@ roundtrip_failure :: proc(terr: tlsx.Error) -> Error {
 	#partial switch terr {
 	case .Timeout:
 		return .Timeout
+	case .Closed:
+		return .Peer_Closed
 	}
 	return .IO_Error
 }

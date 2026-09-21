@@ -43,7 +43,7 @@ stream_read :: proc(s: ^Stream, buf: []u8) -> (n: int, err: Error) {
 stream_write :: proc(s: ^Stream, buf: []u8) -> Error {
 	if s.tls != nil {
 		if _, err := tlsx.write(s.tls, buf); err != .None {
-			return .IO_Error
+			return .Peer_Closed if err == .Closed else .IO_Error
 		}
 		return .None
 	}
@@ -81,8 +81,22 @@ reader_fill :: proc(r: ^Buf_Reader) -> Error {
 	if err != .None {
 		return err
 	}
+	/*
+	Nothing read and no error is the peer having closed.
+
+	`Peer_Closed` only when it closed without having said anything at all,
+	which on a pooled connection is routine - it is what `Connection:
+	keep-alive` costs when the server's idle timer is shorter than ours - and
+	is the one thing `record_failure` must not read as an outage. Once a byte
+	of the response has arrived the same close is a reply cut in half, which is
+	the server breaking and has to be counted as one; `r.buf` is per exchange,
+	so its being empty is exactly that question.
+
+	`reader_to_end` reaches here for the opposite reason, as the close that
+	ends a body with no length, and discards whichever of the two it gets.
+	*/
 	if n == 0 {
-		return .IO_Error
+		return .Peer_Closed if len(r.buf) == 0 else .IO_Error
 	}
 	append(&r.buf, ..chunk[:n])
 	return .None

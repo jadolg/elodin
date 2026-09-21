@@ -22,6 +22,22 @@ Error :: enum u8 {
 	Dial_Reset,
 	Timeout,
 	IO_Error,
+	/*
+	The peer closed or reset a connection without answering on it.
+
+	Kept apart from `IO_Error` because it is not evidence the server is down,
+	and `record_failure` reads it that way. Every DNS-over-TCP peer recycles
+	connections - both of the public resolvers this was measured against close
+	an idle one inside fifteen seconds - so a query landing on one that has
+	just been recycled is ordinary operation, not an outage. Counting it
+	towards the health cooldown parks a server that is answering perfectly
+	well, and with it every query that would have gone there.
+
+	What still counts is everything that says the server itself is not
+	reachable or not answering: a dial that failed, a handshake that failed, a
+	connection that went quiet until the timeout.
+	*/
+	Peer_Closed,
 	Bad_Response,
 	TLS_Failed,
 	// The peer's certificate did not check out, as distinct from a handshake
@@ -79,6 +95,15 @@ Upstream :: struct {
 	idle:         [dynamic]Idle_Conn,
 	max_idle:     int,
 	idle_timeout: time.Duration,
+	// The shortest idle gap after which this upstream was found to have hung
+	// up, or zero while it never has; see `note_idle_death`. Under `mu`.
+	idle_died:    time.Duration,
+	// When that figure was last learned, so it can be forgotten and learned
+	// again; see `pipe_relearn_idle_locked`. Under `mu`.
+	idle_learned: time.Time,
+	// Consecutive exchanges that ended in `Peer_Closed` after the retry had
+	// also been hung up on; see `record_failure`. Under `mu`.
+	closed_run:   int,
 
 	// `conn_cond` and `connecting` make concurrent first callers share one
 	// handshake instead of each racing to open their own. Used by both shared
@@ -254,6 +279,7 @@ record_success :: proc(u: ^Upstream, elapsed: time.Duration) {
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
 	u.failures = 0
+	u.closed_run = 0
 	u.stats.queries += 1
 	u.stats.latency_ns_total += u64(elapsed)
 }
@@ -310,13 +336,62 @@ still on the `debug` line `exchange` writes for every one.
 record_failure :: proc(u: ^Upstream, err: Error) {
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
-	u.failures += 1
 	u.stats.queries += 1
 	u.stats.failures += 1
 	u.stats.failure_kinds[err] += 1
 	if note_failure_kind(u, err) {
 		logx.warnf("upstream %s (%v %s): %v", u.spec.name, u.spec.kind, u.spec.address, err)
 	}
+	/*
+	A recycled connection is not a reason to bench the server.
+
+	`Peer_Closed` is the peer hanging up without answering, and this query has
+	already been asked again on a connection of its own by the time it gets
+	here - so what reaches this line is a second connection closed as well, on
+	an upstream that may still be answering everything else. Every DNS-over-TCP
+	server recycles connections; letting that trip the cooldown takes a working
+	upstream out of service for `COOLDOWN` and sends every query in that window
+	somewhere else, which is a far larger outage than the one query that failed.
+
+	Measured on the instance this came from: three of these in a row happened
+	often enough to park the preferred upstream roughly every two and a half
+	minutes, while it was answering 97% of what it was asked.
+
+	The trade, stated plainly: hang-ups cost a failover each instead of the
+	upstream being skipped for ten seconds, and only a sustained run of them
+	parks it - see the block below for where the exemption stops. That is the
+	same bargain `note_unreadable_rcode` makes, and the figure that names such a
+	server is `elodin_upstream_failure_kind_total{error="peer_closed"}` - which
+	is why it has a kind of its own. Health is still tripped at once by
+	everything that says the server is unreachable or silent: a failed dial, a
+	failed handshake, a timeout.
+	*/
+	if err == .Peer_Closed {
+		u.closed_run += 1
+		/*
+		Except when that is all the server ever does.
+
+		A run of these is no longer one recycled connection: what reaches this
+		line already had its retry on a connection of its own hung up on too,
+		so `FAILURE_THRESHOLD` of them in a row is a server closing everything
+		it accepts. Left exempt it would never be parked, and - because the
+		retry dials - it would be asked for two connections per query for as
+		long as it kept doing it, which is the opposite of kind to the peer
+		whose limit on connections started this.
+
+		So the exemption is for a run rather than forever: the first
+		`FAILURE_THRESHOLD - 1` are exempt and each one past them counts like any
+		other failure, so the upstream is parked on the `2 * FAILURE_THRESHOLD - 1`th
+		in a row, and a single success anywhere in between clears the run. A resolver recycling an idle connection never gets near it -
+		one hang-up costs a retry that works, and never reaches here at all.
+		*/
+		if u.closed_run < FAILURE_THRESHOLD {
+			return
+		}
+	} else {
+		u.closed_run = 0
+	}
+	u.failures += 1
 	if u.failures >= FAILURE_THRESHOLD {
 		u.down_until = time.time_add(time.now(), COOLDOWN)
 		// A server that stopped sending cookies is a server whose every reply is
@@ -434,6 +509,8 @@ error_label :: proc(e: Error) -> string {
 		return "timeout"
 	case .IO_Error:
 		return "io_error"
+	case .Peer_Closed:
+		return "peer_closed"
 	case .Bad_Response:
 		return "bad_response"
 	case .TLS_Failed:
@@ -613,6 +690,7 @@ close_idle :: proc(u: ^Upstream, all := false) -> (closed: int) {
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
 
+	pipe_relearn_idle_locked(u)
 	closed += close_pipe(u, all)
 
 	now := time.now()

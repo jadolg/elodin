@@ -49,16 +49,42 @@ exchange_doh_h2 :: proc(
 	response: []u8,
 	err: Error,
 ) {
+	/*
+	One deadline for both attempts and for the fallback, for the reason
+	`exchange_doh_h1` gives: a retry that starts a clock of its own costs the
+	caller twice the timeout it was promised. A peer sending GOAWAY late into
+	the first attempt is exactly the case that reaches the second.
+
+	The fallback carries what is left too, because the dial that discovered
+	HTTP/1.1 was made on this query's budget and spent part of it.
+	*/
+	deadline := time.tick_add(time.tick_now(), timeout)
+
 	// A stale shared connection dying between get_h2_conn handing it out and
 	// this call reaching the server is retried once, on a fresh one; see
 	// exchange_pipelined for why that must not count as an upstream failure.
 	for attempt in 0 ..< 2 {
-		conn, is_h2, cerr := get_h2_conn(u, timeout)
+		remaining := time.tick_diff(time.tick_now(), deadline)
+		if remaining <= 0 {
+			return nil, .Timeout
+		}
+		conn, is_h2, cerr := get_h2_conn(u, remaining)
 		if cerr != .None {
 			return nil, cerr
 		}
+		// What the dial and the wait in front of it left, rather than what
+		// this attempt started with: a caller queued behind somebody else's
+		// handshake has already spent part of its budget by the time it gets
+		// a connection.
+		remaining = time.tick_diff(time.tick_now(), deadline)
+		if remaining <= 0 {
+			if is_h2 {
+				h2.client_unref(conn)
+			}
+			return nil, .Timeout
+		}
 		if !is_h2 {
-			return exchange_doh_h1(u, query, body, timeout, allocator)
+			return exchange_doh_h1(u, query, body, remaining, allocator)
 		}
 
 		resp, herr := h2.client_request(
@@ -72,7 +98,7 @@ exchange_doh_h2 :: proc(
 				accept = "application/dns-message",
 				body = body,
 			},
-			timeout,
+			remaining,
 			allocator,
 		)
 		h2.client_unref(conn)
@@ -95,13 +121,17 @@ exchange_doh_h2 :: proc(
 			if attempt == 0 {
 				continue
 			}
-			return nil, .IO_Error
+			// Both attempts hung up. Still the peer recycling rather than the
+			// upstream being down - a server sending GOAWAY under load does
+			// this - so it is reported as such and does not park it.
+			return nil, .Peer_Closed
 		case .Reset:
 			return nil, .HTTP_Error
 		case .Timeout:
 			return nil, .Timeout
 		}
 	}
+	// Unreachable: the second attempt always returns above.
 	return nil, .IO_Error
 }
 
@@ -116,9 +146,24 @@ exchange_doh_h1 :: proc(
 	response: []u8,
 	err: Error,
 ) {
+	/*
+	One deadline for both attempts, for the reason `exchange_pipelined` gives:
+	a retry that starts a clock of its own costs the caller twice the timeout
+	it was promised, with an upstream worker held for all of it. Widening which
+	failures reach the second attempt is what makes that reachable here.
+
+	A `Tick` rather than a `Time`, because it is a bound on waiting rather than
+	a moment anyone reads off a clock, and the wall clock steps.
+	*/
+	deadline := time.tick_add(time.tick_now(), timeout)
+
 	// Pooled connection first, then a fresh one; see exchange_pipelined for why a
 	// dead pooled connection must not count as an upstream failure.
 	for attempt in 0 ..< 2 {
+		remaining := time.tick_diff(time.tick_now(), deadline)
+		if remaining <= 0 {
+			return nil, .Timeout
+		}
 		conn: Idle_Conn
 		reused := false
 		if attempt == 0 {
@@ -130,8 +175,25 @@ exchange_doh_h1 :: proc(
 				socket = conn.socket,
 				tls    = conn.tls,
 			}
+			/*
+			On this query's budget, not the one that opened it.
+
+			The deadlines a pooled connection carries are whatever the query
+			that dialled it had left - `open_stream` puts that figure on the
+			socket and `get_h2_conn` puts the configured timeout on one it
+			hands to the pool. Left alone, a connection opened with a sliver
+			would cut the next query short and one opened with the whole
+			timeout would hold a short query for all of it, which is the same
+			confusion `Pipe_Conn.timeout` exists to avoid.
+			*/
+			set_socket_timeouts(stream.socket, remaining)
+			if stream.tls != nil {
+				tlsx.set_timeouts(stream.tls, remaining, remaining)
+			}
 		} else {
-			s, oerr := open_stream(u.endpoint, u.tls_ctx, u.spec.hostname, timeout, u)
+			// `open_stream` puts this figure on the socket as well as on the
+			// dial, so it bounds the reads that follow too.
+			s, oerr := open_stream(u.endpoint, u.tls_ctx, u.spec.hostname, remaining, u)
 			if oerr != .None {
 				return nil, oerr
 			}
@@ -173,10 +235,22 @@ exchange_doh_h1 :: proc(
 		}
 
 		stream_close(&stream)
-		if !reused {
-			return nil, herr if herr != .None else .Bad_Response
+		last := herr if herr != .None else .Bad_Response
+		/*
+		A hang-up is retried whether this query found the connection or dialled
+		it, which is the shape `exchange_pipelined` settled on. Excluding the
+		dial rested on a fresh connection failing meaning the server is broken,
+		and a peer that limits how often a source may connect refuses one just
+		as readily - leaving the query that paid for the dial as the only one
+		with no second chance. Everything else is still reported on the spot:
+		a pooled connection is retried because it may simply be stale, and a
+		fresh one failing any other way has said what it has to say.
+		*/
+		if attempt == 1 || (!reused && last != .Peer_Closed) {
+			return nil, last
 		}
 	}
+	// Unreachable: the second attempt always returns above.
 	return nil, .IO_Error
 }
 
