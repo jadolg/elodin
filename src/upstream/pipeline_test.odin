@@ -1961,9 +1961,10 @@ test_a_server_that_closes_everything_is_parked_eventually :: proc(t: ^testing.T)
 	}
 	defer destroy(u)
 
-	// The first `FAILURE_THRESHOLD` are exempt and each one past them counts
-	// like any other failure, so the cooldown lands on the one after that -
-	// `2 * FAILURE_THRESHOLD - 1` in all, not at once and not never.
+	// The first `FAILURE_THRESHOLD - 1` are exempt and each one past them
+	// counts like any other failure, so the cooldown lands `FAILURE_THRESHOLD`
+	// after that - `2 * FAILURE_THRESHOLD - 1` in all, not at once and not
+	// never.
 	for _ in 0 ..< 2 * FAILURE_THRESHOLD - 2 {
 		record_failure(u, .Peer_Closed)
 	}
@@ -2234,5 +2235,136 @@ test_a_learned_idle_ceiling_is_forgotten_and_learned_again :: proc(t: ^testing.T
 	// And it learns again from there rather than being stuck at the old floor.
 	note_idle_death(u, 20 * time.Second)
 	testing.expect_value(t, idle_ceiling(u), 15 * time.Second)
+	free_all(context.temp_allocator)
+}
+
+/*
+A reply cut in half is not a hang-up on the pipelined path either.
+
+`pipe_read_full` reports EOF as `Peer_Closed` wherever it happens, and the
+first byte of the length prefix is the only place that means what the name
+says: from there on the message is committed and a close is a reply that
+cannot be used. Passed through, a server truncating every response was retried
+each time, exempt from the cooldown for a run, and taught `note_idle_death` an
+idle ceiling - all for an error that says nothing about connection reuse.
+
+The mock reads the whole query before answering, so the close is the orderly
+one: it promises a reply of the length it was asked about and sends half.
+*/
+@(private = "file")
+Truncate_Mock :: struct {
+	listener: net.TCP_Socket,
+	conns:    int,
+	stop:     bool,
+}
+
+@(private = "file")
+truncate_mock_loop :: proc(m: ^Truncate_Mock) {
+	for !sync.atomic_load(&m.stop) {
+		client, _, aerr := net.accept_tcp(m.listener)
+		if aerr != nil {
+			if aerr == .Timeout || aerr == .Would_Block {
+				continue
+			}
+			return
+		}
+		sync.atomic_add(&m.conns, 1)
+		_ = net.set_option(client, .Receive_Timeout, 200 * time.Millisecond)
+		truncate_serve(m, client)
+		net.close(client)
+		free_all(context.temp_allocator)
+	}
+}
+
+@(private = "file")
+truncate_serve :: proc(m: ^Truncate_Mock, client: net.TCP_Socket) {
+	length_buf: [2]u8
+	if !truncate_read(m, client, length_buf[:]) {
+		return
+	}
+	ln := int(length_buf[0]) << 8 | int(length_buf[1])
+	if ln < dns.HEADER_SIZE || ln > 4096 {
+		return
+	}
+	q := make([]u8, ln, context.temp_allocator)
+	if !truncate_read(m, client, q) {
+		return
+	}
+	// The length prefix of a whole reply, and half of the reply. Half rather
+	// than none, because none is the hang-up this is meant not to be.
+	half := min(max(ln / 2, dns.HEADER_SIZE), ln - 1)
+	out := make([]u8, 2 + half, context.temp_allocator)
+	out[0], out[1] = length_buf[0], length_buf[1]
+	copy(out[2:], q[:half])
+	out[4] |= 0x80
+	_, _ = net.send_tcp(client, out)
+}
+
+@(private = "file")
+truncate_read :: proc(m: ^Truncate_Mock, socket: net.TCP_Socket, buf: []u8) -> bool {
+	got := 0
+	for got < len(buf) {
+		if sync.atomic_load(&m.stop) {
+			return false
+		}
+		n, err := net.recv_tcp(socket, buf[got:])
+		if err == .Timeout || err == .Would_Block {
+			continue
+		}
+		if err != nil || n <= 0 {
+			return false
+		}
+		got += n
+	}
+	return true
+}
+
+@(test)
+test_a_truncated_pipelined_reply_is_not_a_hang_up :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen: %v", lerr) {
+		return
+	}
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the port: %v", berr) {
+		net.close(listener)
+		return
+	}
+	_ = net.set_option(listener, .Receive_Timeout, 200 * time.Millisecond)
+
+	m := Truncate_Mock {
+		listener = listener,
+	}
+	responder := thread.create_and_start_with_poly_data(&m, truncate_mock_loop)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(responder)
+		thread.destroy(responder)
+		net.close(listener)
+	}
+
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "truncator", kind = .TCP, address = "127.0.0.1", port = bound.port},
+		8,
+		30 * time.Second,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot make the upstream: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+
+	query := dns.Message {
+		id       = 0x5151,
+		question = []dns.Question{{name = "example.com.", type = .A, class = .IN}},
+	}
+	query.flags.rd = true
+	wire, _, enc := dns.encode_message(query, context.temp_allocator)
+	if !testing.expectf(t, enc == .None, "cannot encode: %v", enc) {
+		return
+	}
+
+	_, err := exchange(u, wire, 2 * time.Second, context.temp_allocator)
+	testing.expectf(t, err == .IO_Error, "a truncated reply was reported as %v", err)
+	testing.expect(t, sync.atomic_load(&m.conns) >= 1, "the upstream never connected")
 	free_all(context.temp_allocator)
 }

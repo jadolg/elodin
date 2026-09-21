@@ -2411,3 +2411,245 @@ test_a_doh_query_with_no_budget_left_does_not_dial :: proc(t: ^testing.T) {
 	testing.expect_value(t, sync.atomic_load(&m.conns), 0)
 	free_all(context.temp_allocator)
 }
+
+/*
+A responder that accepts one connection, reads whatever arrives on it and
+never answers. What the two tests below measure is how long a caller is held,
+so the mock's job is to be silent and stay put.
+*/
+@(private = "file")
+Stall_Mock :: struct {
+	listener: net.TCP_Socket,
+	conns:    int,
+	stop:     bool,
+}
+
+@(private = "file")
+stall_mock_loop :: proc(m: ^Stall_Mock) {
+	for !sync.atomic_load(&m.stop) {
+		client, _, aerr := net.accept_tcp(m.listener)
+		if aerr != nil {
+			if aerr == .Timeout || aerr == .Would_Block {
+				continue
+			}
+			return
+		}
+		sync.atomic_add(&m.conns, 1)
+		_ = net.set_option(client, .Receive_Timeout, 50 * time.Millisecond)
+		buf: [4096]u8
+		for !sync.atomic_load(&m.stop) {
+			n, rerr := net.recv_tcp(client, buf[:])
+			if rerr == .Timeout || rerr == .Would_Block {
+				continue
+			}
+			if rerr != nil || n <= 0 {
+				break
+			}
+		}
+		net.close(client)
+	}
+}
+
+/*
+A pooled DoH connection is used on this query's deadline, not the one that
+opened it.
+
+The deadlines a connection carries are whatever the query that dialled it had
+left: `open_stream` puts that figure on the socket, and `get_h2_conn` puts the
+configured timeout on a connection it discovers is HTTP/1.1 and hands to the
+pool. Taken back out and used as it was found, a connection opened with a whole
+timeout holds a query that has a fraction of one for all of it - and one opened
+with a sliver cuts a patient query short.
+
+Driven at the HTTP/1.1 half with a connection pooled by hand, because what is
+under test is the figure on the socket and a real first query would only be a
+slower way to put one there.
+*/
+@(test)
+test_a_pooled_doh_connection_takes_this_querys_deadline :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen: %v", lerr) {
+		return
+	}
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the port: %v", berr) {
+		net.close(listener)
+		return
+	}
+	_ = net.set_option(listener, .Receive_Timeout, 200 * time.Millisecond)
+
+	m := Stall_Mock {
+		listener = listener,
+	}
+	responder := thread.create_and_start_with_poly_data(&m, stall_mock_loop)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(responder)
+		thread.destroy(responder)
+		net.close(listener)
+	}
+
+	u, uerr := make_upstream(
+		config.Upstream_Spec {
+			name = "pooled",
+			kind = .TCP,
+			address = "127.0.0.1",
+			port = bound.port,
+			hostname = "doh.invalid",
+			path = "/dns-query",
+		},
+		8,
+		30 * time.Second,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot make the upstream: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+
+	// A connection left in the pool by a query that had five seconds.
+	socket, derr := dial_tcp_timeout(bound, time.Second)
+	if !testing.expectf(t, derr == .None, "cannot dial the mock: %v", derr) {
+		return
+	}
+	set_socket_timeouts(socket, 5 * time.Second)
+	put_idle(u, Idle_Conn{socket = socket})
+
+	query := dns.Message {
+		id       = 0x9595,
+		question = []dns.Question{{name = "example.com.", type = .A, class = .IN}},
+	}
+	query.flags.rd = true
+	wire, _, enc := dns.encode_message(query, context.temp_allocator)
+	if !testing.expectf(t, enc == .None, "cannot encode: %v", enc) {
+		return
+	}
+	body := make([]u8, len(wire), context.temp_allocator)
+	copy(body, wire)
+	dns.set_id_in_place(body, 0)
+
+	// Two hundred milliseconds, against a server that says nothing. Both
+	// attempts are inside one deadline, so the whole call is.
+	start := time.tick_now()
+	_, err := exchange_doh_h1(u, wire, body, 200 * time.Millisecond, context.temp_allocator)
+	spent := time.tick_since(start)
+	testing.expectf(t, err == .Timeout, "a silent server reported %v", err)
+	testing.expectf(
+		t,
+		spent < 2 * time.Second,
+		"the pooled connection held a 200ms query for %v",
+		spent,
+	)
+	free_all(context.temp_allocator)
+}
+
+/*
+Both DoH attempts share one deadline over HTTP/2 as well - including the
+fallback to HTTP/1.1.
+
+`exchange_doh_h1` was given one deadline for both of its attempts and
+`exchange_doh_h2` was not: each iteration handed `get_h2_conn` and
+`h2.client_request` the whole of `upstream.timeout`, so a peer sending GOAWAY
+late into the first attempt cost the caller twice what it was promised, with an
+upstream worker held for all of it.
+
+Measured at the fallback, which is the part of it a test can drive without an
+HTTP/2 server: the dial that discovers HTTP/1.1 is made on this query's budget,
+so what reaches `exchange_doh_h1` has to be what is left of it. The wait before
+that dial is a caller queued behind somebody else's handshake, which is
+`u.connecting` and the ordinary way to spend time in `get_h2_conn`.
+*/
+@(private = "file")
+Releaser :: struct {
+	u:     ^Upstream,
+	after: time.Duration,
+}
+
+@(private = "file")
+release_connecting :: proc(r: ^Releaser) {
+	time.sleep(r.after)
+	sync.mutex_lock(&r.u.mu)
+	r.u.connecting = false
+	sync.cond_broadcast(&r.u.conn_cond)
+	sync.mutex_unlock(&r.u.mu)
+}
+
+@(test)
+test_the_doh_h2_fallback_keeps_the_querys_deadline :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen: %v", lerr) {
+		return
+	}
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the port: %v", berr) {
+		net.close(listener)
+		return
+	}
+	_ = net.set_option(listener, .Receive_Timeout, 200 * time.Millisecond)
+
+	m := Stall_Mock {
+		listener = listener,
+	}
+	responder := thread.create_and_start_with_poly_data(&m, stall_mock_loop)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(responder)
+		thread.destroy(responder)
+		net.close(listener)
+	}
+
+	u, uerr := make_upstream(
+		config.Upstream_Spec {
+			name = "queued",
+			kind = .TCP,
+			address = "127.0.0.1",
+			port = bound.port,
+			hostname = "doh.invalid",
+			path = "/dns-query",
+		},
+		8,
+		30 * time.Second,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot make the upstream: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+
+	query := dns.Message {
+		id       = 0x9696,
+		question = []dns.Question{{name = "example.com.", type = .A, class = .IN}},
+	}
+	query.flags.rd = true
+	wire, _, enc := dns.encode_message(query, context.temp_allocator)
+	if !testing.expectf(t, enc == .None, "cannot encode: %v", enc) {
+		return
+	}
+	body := make([]u8, len(wire), context.temp_allocator)
+	copy(body, wire)
+	dns.set_id_in_place(body, 0)
+
+	// Half the budget spent waiting for a dial somebody else was making.
+	sync.mutex_lock(&u.mu)
+	u.connecting = true
+	sync.mutex_unlock(&u.mu)
+	r := Releaser {
+		u     = u,
+		after = 500 * time.Millisecond,
+	}
+	releaser := thread.create_and_start_with_poly_data(&r, release_connecting)
+	defer {
+		thread.join(releaser)
+		thread.destroy(releaser)
+	}
+
+	start := time.tick_now()
+	_, err := exchange_doh_h2(u, wire, body, time.Second, context.temp_allocator)
+	spent := time.tick_since(start)
+	testing.expectf(t, err == .Timeout, "a silent server reported %v", err)
+	testing.expectf(
+		t,
+		spent < 1250 * time.Millisecond,
+		"a one-second query cost %v: the fallback started a clock of its own",
+		spent,
+	)
+	free_all(context.temp_allocator)
+}

@@ -870,8 +870,21 @@ pipe_read_one :: proc(c: ^Pipe_Conn, budget: time.Duration) -> Error {
 	`PIPE_FRAMING_GRACE` for why the two quantities are not the same.
 	*/
 	framing := pipe_framing_deadline(c, mine)
+	/*
+	Everything from here is `IO_Error`, whatever killed the read.
+
+	A reply cut in half is not a hang-up, which is the distinction
+	`reader_fill` draws on the HTTP side: a close before a byte of the message
+	arrived is the peer recycling a connection it had finished with, and one
+	partway through the message is a reply that cannot be used, from a server
+	answering badly. Only the first byte above can be the former. Folded
+	together, a server truncating every reply would be retried each time and
+	held to the slower of the two ways to be parked, and `note_idle_death`
+	would learn an idle ceiling from it - for an error that says nothing about
+	connection reuse.
+	*/
 	if _, rerr := pipe_read_full(c, length_buf[1:], framing); rerr != .None {
-		return .IO_Error if rerr == .Timeout else rerr
+		return .IO_Error
 	}
 	length := int(length_buf[0]) << 8 | int(length_buf[1])
 	if length < dns.HEADER_SIZE {
@@ -884,7 +897,7 @@ pipe_read_one :: proc(c: ^Pipe_Conn, budget: time.Duration) -> Error {
 	msg := make([]u8, length, c.allocator)
 	if _, merr := pipe_read_full(c, msg, framing); merr != .None {
 		delete(msg, c.allocator)
-		return .IO_Error if merr == .Timeout else merr
+		return .IO_Error
 	}
 	pipe_deliver(c, msg)
 	return .None
