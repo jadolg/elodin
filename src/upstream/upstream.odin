@@ -114,6 +114,21 @@ Stats :: struct {
 	// Replies from this server that another member of its group answered
 	// instead; see `note_swept_rcode`.
 	swept_rcode:      u64,
+	/*
+	The same failures as `failures`, split by what went wrong.
+
+	`failures` alone says an upstream is failing and never which way, and the
+	log cannot fill the gap: a kind is warned about once per process, so an
+	operator reading a window of it sees whichever kinds happened to be new in
+	that window and nothing about the rate of any of them. Which kind
+	dominates is the whole diagnosis - a `Timeout` and a `TLS_Failed` against
+	the same server are different problems with different fixes - so it is
+	kept here, where a scrape can carry it continuously.
+
+	Indexed by `Error`, so it sums to `failures` by construction rather than
+	by a second call site remembering to keep the two in step.
+	*/
+	failure_kinds:    [Error]u64,
 }
 
 // After this many consecutive failures an upstream is skipped for COOLDOWN.
@@ -281,6 +296,7 @@ record_failure :: proc(u: ^Upstream, err: Error) {
 	u.failures += 1
 	u.stats.queries += 1
 	u.stats.failures += 1
+	u.stats.failure_kinds[err] += 1
 	if note_failure_kind(u, err) {
 		logx.warnf("upstream %s (%v %s): %v", u.spec.name, u.spec.kind, u.spec.address, err)
 	}
@@ -376,6 +392,45 @@ note_swept_rcode :: proc(u: ^Upstream) {
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
 	u.stats.swept_rcode += 1
+}
+
+/*
+What a kind of failure is called on the metrics endpoint.
+
+Spelled out rather than taken from `%v`, because these are label values an
+operator's dashboards and alerting rules match on. Deriving them from the enum
+would make renaming a member - an ordinary refactor with no outward meaning -
+silently rename a label and break every query using it, with nothing in this
+package to say so.
+*/
+error_label :: proc(e: Error) -> string {
+	switch e {
+	case .None:
+		return "none"
+	case .Not_Resolved:
+		return "not_resolved"
+	case .Dial_Failed:
+		return "dial_failed"
+	case .Dial_Reset:
+		return "dial_reset"
+	case .Timeout:
+		return "timeout"
+	case .IO_Error:
+		return "io_error"
+	case .Bad_Response:
+		return "bad_response"
+	case .TLS_Failed:
+		return "tls_failed"
+	case .Verify_Failed:
+		return "verify_failed"
+	case .HTTP_Error:
+		return "http_error"
+	case .Too_Large:
+		return "too_large"
+	case .Unhealthy:
+		return "unhealthy"
+	}
+	return "unknown"
 }
 
 stats_of :: proc(u: ^Upstream) -> Stats {

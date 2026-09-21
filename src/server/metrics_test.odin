@@ -1,12 +1,14 @@
 package server
 
 import "core:fmt"
+import "core:net"
 import "core:reflect"
 import "core:strings"
 import "core:testing"
 import "core:time"
 import "elodin:cache"
 import "elodin:config"
+import "elodin:dns"
 import "elodin:tlsx"
 import "elodin:upstream"
 
@@ -141,6 +143,90 @@ Two `# TYPE` lines for one metric name are a duplicate, and a scraper rejects
 the whole response over it rather than the line - so a page that is merely
 noisy in this respect is a page that reports nothing at all.
 */
+
+/*
+A failing upstream is published with what went wrong, not only that it failed.
+
+`elodin_upstream_failures_total` is a single number per upstream, and the log
+cannot stand in for the split: each kind is warned about once per process, so
+an operator reading a window of it sees whichever kinds were new in that
+window and nothing about how often any of them happen. Between a `timeout` and
+a `tls_failed` against the same server lie different problems and different
+fixes, so the scrape carries the breakdown.
+
+A real exchange rather than a hand-set counter, so the wiring from `exchange`
+through `record_failure` to the page is what is under test. The port is one
+the kernel has just handed back, so connecting to it is refused at once and
+nothing here waits for a timeout.
+*/
+@(test)
+test_a_failed_exchange_is_published_with_its_kind :: proc(t: ^testing.T) {
+	// A port nobody is listening on: bound to learn a free one, then dropped.
+	probe, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen on loopback: %v", lerr) {
+		return
+	}
+	bound, berr := net.bound_endpoint(probe)
+	net.close(probe)
+	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
+		return
+	}
+
+	u, uerr := upstream.make_upstream(
+		config.Upstream_Spec{name = "broken", kind = .TCP, address = "127.0.0.1", port = bound.port},
+		0,
+		time.Second,
+		context.allocator,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot build the upstream: %v", uerr) {
+		return
+	}
+	defer upstream.destroy(u)
+
+	query := dns.Message {
+		id       = 0x7a7a,
+		question = []dns.Question{{name = "example.com.", type = .A, class = .IN}},
+	}
+	query.flags.rd = true
+	wire, _, enc_err := dns.encode_message(query, context.temp_allocator)
+	if !testing.expectf(t, enc_err == .None, "cannot encode the query: %v", enc_err) {
+		return
+	}
+
+	_, xerr := upstream.exchange(u, wire, 500 * time.Millisecond, context.temp_allocator)
+	if !testing.expectf(t, xerr == .Dial_Failed, "expected a refused dial, got %v", xerr) {
+		return
+	}
+
+	servers := make([]^upstream.Upstream, 1, context.allocator)
+	defer delete(servers, context.allocator)
+	servers[0] = u
+	g := upstream.Group {
+		servers  = servers,
+		strategy = .Failover,
+		attempts = 1,
+	}
+
+	s, cfg := metrics_fixture(Stats{})
+	s.cfg = &cfg
+	s.group = &g
+	listeners: Listeners
+	page := render_metrics(&s, &listeners, context.temp_allocator)
+
+	expect_line(t, page, `elodin_upstream_failure_kind_total{upstream="broken",error="dial_failed"} 1`)
+	// The total it splits still reads the same, which is what lets the two be
+	// graphed together: the new family is a breakdown, not a second count.
+	expect_line(t, page, `elodin_upstream_failures_total{upstream="broken"} 1`)
+	// And a kind that did not happen is not stated at all, rather than stated
+	// as a zero for every member of the enum against every upstream.
+	testing.expect(
+		t,
+		!strings.contains(page, `error="timeout"`),
+		"a kind this upstream never produced was published anyway",
+	)
+
+	free_all(context.temp_allocator)
+}
 
 /*
 The upstream that sent an rcode no client could read is named in the scrape.
