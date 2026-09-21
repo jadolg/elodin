@@ -574,6 +574,14 @@ buffer and the reads simply never come back.
 Wedge_Mock :: struct {
 	listener: net.TCP_Socket,
 	conns:    int,
+	// Connections before this one are read from and never answered. 2 wedges
+	// the first and answers on every one after it.
+	answer_from: int,
+	// Queries this mock will answer in total, across every connection, or -1
+	// for as many as it is asked. 1 is a server that answers once and then
+	// stops for good, whatever it is dialled on.
+	budget:   int,
+	answered: int,
 	stop:     bool,
 	threads:  [dynamic]^thread.Thread,
 	mu:       sync.Mutex,
@@ -599,7 +607,7 @@ wedge_mock_loop :: proc(m: ^Wedge_Mock) {
 		conn := new(Wedge_Conn)
 		conn.mock = m
 		conn.socket = client
-		conn.answer = n > 1
+		conn.answer = n >= m.answer_from
 		t := thread.create_and_start_with_poly_data(conn, wedge_conn_loop)
 		sync.mutex_lock(&m.mu)
 		append(&m.threads, t)
@@ -625,7 +633,7 @@ wedge_conn_loop :: proc(conn: ^Wedge_Conn) {
 		if !wedge_read(conn, q) {
 			return
 		}
-		if !conn.answer {
+		if !conn.answer || !wedge_may_answer(conn.mock) {
 			// Read and dropped, with the connection left open.
 			continue
 		}
@@ -639,6 +647,21 @@ wedge_conn_loop :: proc(conn: ^Wedge_Conn) {
 			return
 		}
 	}
+}
+
+// Whether this mock has an answer left to give, under `Wedge_Mock.budget`.
+@(private = "file")
+wedge_may_answer :: proc(m: ^Wedge_Mock) -> bool {
+	sync.mutex_lock(&m.mu)
+	defer sync.mutex_unlock(&m.mu)
+	if m.budget < 0 {
+		return true
+	}
+	if m.answered >= m.budget {
+		return false
+	}
+	m.answered += 1
+	return true
 }
 
 @(private = "file")
@@ -693,8 +716,10 @@ test_a_connection_that_stopped_answering_is_dropped :: proc(t: ^testing.T) {
 	_ = net.set_option(listener, .Receive_Timeout, 50 * time.Millisecond)
 
 	m := Wedge_Mock {
-		listener = listener,
-		threads  = make([dynamic]^thread.Thread, 0, 4),
+		listener    = listener,
+		answer_from = 2,
+		budget      = -1,
+		threads     = make([dynamic]^thread.Thread, 0, 4),
 	}
 	acceptor := thread.create_and_start_with_poly_data(&m, wedge_mock_loop)
 	defer {
@@ -768,6 +793,15 @@ Split_Mock :: struct {
 	// behind it follows.
 	prefix_at:   time.Duration,
 	body_at:     time.Duration,
+	/*
+	Split the two-byte length prefix as well, one byte at each moment.
+
+	A server would not normally write it in two pieces, but a segment boundary
+	falling between the two bytes puts it on the wire that way, and the reader
+	cannot tell the difference. Worth its own case because one byte of a prefix
+	commits the framing exactly as a half-read body does.
+	*/
+	split_prefix: bool,
 	stop:        bool,
 }
 
@@ -807,12 +841,18 @@ split_mock_loop :: proc(m: ^Split_Mock) {
 	start := time.now()
 	time.sleep(m.prefix_at)
 	prefix := [2]u8{u8(len(second) >> 8), u8(len(second))}
-	if write_all_tcp(client, prefix[:]) != .None {
+	early := prefix[:1] if m.split_prefix else prefix[:]
+	if write_all_tcp(client, early) != .None {
 		return
 	}
 	// Measured from the start so the gap is the one configured rather than the
 	// sum of two sleeps.
 	time.sleep(m.body_at - time.diff(start, time.now()))
+	if m.split_prefix {
+		if write_all_tcp(client, prefix[1:]) != .None {
+			return
+		}
+	}
 	body := make([]u8, len(second), context.allocator)
 	defer delete(body)
 	copy(body, second)
@@ -891,6 +931,22 @@ state of a shared connection and the only state in which the budgets differ.
 */
 @(test)
 test_a_half_read_message_is_finished_on_the_connections_budget :: proc(t: ^testing.T) {
+	for split_prefix in ([]bool{false, true}) {
+		half_read_case(t, split_prefix)
+	}
+}
+
+/*
+One run of the above: `split_prefix` chooses whether what the impatient reader
+catches is the whole length prefix or the first byte of it.
+
+Both are the same rule and the same failure. The bound starts at the first byte
+consumed, not at the second: a reader holding one byte of a length it cannot
+read yet has committed the connection's framing just as surely as one holding a
+header without its records.
+*/
+@(private = "file")
+half_read_case :: proc(t: ^testing.T, split_prefix: bool) {
 	PREFIX_AT :: 300 * time.Millisecond
 	BODY_AT :: 1200 * time.Millisecond
 	// Past PREFIX_AT, so this caller is in the body read when its own deadline
@@ -912,9 +968,10 @@ test_a_half_read_message_is_finished_on_the_connections_budget :: proc(t: ^testi
 	_ = net.set_option(listener, .Receive_Timeout, 50 * time.Millisecond)
 
 	m := Split_Mock {
-		listener  = listener,
-		prefix_at = PREFIX_AT,
-		body_at   = BODY_AT,
+		listener     = listener,
+		prefix_at    = PREFIX_AT,
+		body_at      = BODY_AT,
+		split_prefix = split_prefix,
 	}
 	responder := thread.create_and_start_with_poly_data(&m, split_mock_loop)
 	defer {
@@ -969,9 +1026,10 @@ test_a_half_read_message_is_finished_on_the_connections_budget :: proc(t: ^testi
 		thread.destroy(th)
 	}
 
-	testing.expectf(t, quitter.err == .Timeout, "the impatient caller ended as %v, expected a timeout", quitter.err)
-	testing.expectf(t, patient.err == .None, "the patient caller failed: %v", patient.err)
-	testing.expectf(t, patient.own_question, "the patient caller was answered somebody else's question")
+	what := "a split length prefix" if split_prefix else "a body behind its prefix"
+	testing.expectf(t, quitter.err == .Timeout, "%s: the impatient caller ended as %v, expected a timeout", what, quitter.err)
+	testing.expectf(t, patient.err == .None, "%s: the patient caller failed: %v", what, patient.err)
+	testing.expectf(t, patient.own_question, "%s: the patient caller was answered somebody else's question", what)
 }
 
 /*
@@ -1100,6 +1158,115 @@ test_waiting_for_a_dial_is_bounded_by_the_callers_own_timeout :: proc(t: ^testin
 		took < LIMIT,
 		"%d callers took %v against a budget of %v each; they dialled one after another",
 		LEGS,
+		took,
+		BUDGET,
+	)
+}
+
+
+/*
+One `send` costs one timeout, not one per stage it happens to pass through.
+
+Waiting for somebody else's dial, dialling, asking, and then the retry of a
+connection found dead are four stages, and each one used to start its own clock
+from whatever it was handed. An upstream that answers once and then goes quiet
+walks a query through the worst of them: the query on the established
+connection runs out its timeout, that marks the connection dead - which is what
+makes a server that vanished recoverable at all - and the retry then dialled
+and asked again on a fresh budget. Twice the timeout for a query whose caller
+stopped waiting after one, with an upstream worker held for all of it and
+`attempts` above this ready to multiply it.
+
+The recovery does not depend on that retry and this does not remove it: what
+the retry is for is a connection found dead *before* any time was spent on it,
+where the budget is still whole. `test_a_connection_that_stopped_answering_is_dropped`
+holds the other half - the next query dials afresh - and needs no budget at all
+to do it.
+*/
+@(test)
+test_one_send_costs_one_timeout :: proc(t: ^testing.T) {
+	BUDGET :: 500 * time.Millisecond
+	// One timeout and room for scheduling; two is what this is looking for.
+	LIMIT :: 8 * BUDGET / 5
+
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		net.close(listener)
+		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
+		return
+	}
+	_ = net.set_option(listener, .Receive_Timeout, 50 * time.Millisecond)
+
+	// Answers on any connection, but only once: the first query establishes the
+	// shared connection and every query after it is met with silence, on that
+	// connection and on any the retry dials.
+	m := Wedge_Mock {
+		listener    = listener,
+		answer_from = 1,
+		budget      = 1,
+		threads     = make([dynamic]^thread.Thread, 0, 4),
+	}
+	acceptor := thread.create_and_start_with_poly_data(&m, wedge_mock_loop)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(acceptor)
+		thread.destroy(acceptor)
+		for th in m.threads {
+			thread.join(th)
+			thread.destroy(th)
+		}
+		delete(m.threads)
+		net.close(listener)
+	}
+
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "once", kind = .TCP, address = "127.0.0.1", port = bound.port},
+		8,
+		30 * time.Second,
+	)
+	if uerr != .None {
+		testing.expectf(t, false, "cannot make the upstream: %v", uerr)
+		return
+	}
+	defer destroy(u)
+
+	warm := Pipe_Leg {
+		u       = u,
+		name    = "warm.invalid.",
+		id      = 0x9999,
+		timeout = BUDGET,
+	}
+	warmup := thread.create_and_start_with_poly_data(&warm, pipe_leg)
+	thread.join(warmup)
+	thread.destroy(warmup)
+	if warm.err != .None {
+		testing.expectf(t, false, "the warm-up query failed: %v", warm.err)
+		return
+	}
+
+	// On the established connection, which is now silent.
+	quiet := Pipe_Leg {
+		u       = u,
+		name    = "quiet.invalid.",
+		id      = 0xaaaa,
+		timeout = BUDGET,
+	}
+	start := time.now()
+	second := thread.create_and_start_with_poly_data(&quiet, pipe_leg)
+	thread.join(second)
+	thread.destroy(second)
+	took := time.diff(start, time.now())
+
+	testing.expectf(t, quiet.err == .Timeout, "the query to the quiet connection ended as %v", quiet.err)
+	testing.expectf(
+		t,
+		took < LIMIT,
+		"one send took %v against a timeout of %v; its stages each started a clock of their own",
 		took,
 		BUDGET,
 	)

@@ -105,6 +105,7 @@ pool.
 */
 @(private)
 get_h2_conn :: proc(u: ^Upstream, timeout: time.Duration) -> (conn: ^h2.Client, ok: bool, err: Error) {
+	deadline := time.time_add(time.now(), timeout)
 	sync.mutex_lock(&u.mu)
 	for {
 		if u.proto == .H1 {
@@ -120,7 +121,17 @@ get_h2_conn :: proc(u: ^Upstream, timeout: time.Duration) -> (conn: ^h2.Client, 
 		if !u.connecting {
 			break
 		}
-		sync.cond_wait(&u.conn_cond, &u.mu)
+		// Bounded by this caller's own deadline, for the reason `get_pipe`
+		// gives: a dial against an upstream that is not answering takes the
+		// whole timeout and fails, and unbounded, the callers queued behind it
+		// dial one after another and the last returns at a multiple of the
+		// budget it was given.
+		remaining := time.diff(time.now(), deadline)
+		if remaining <= 0 {
+			sync.mutex_unlock(&u.mu)
+			return nil, false, .Timeout
+		}
+		sync.cond_wait_with_timeout(&u.conn_cond, &u.mu, remaining)
 	}
 	u.connecting = true
 	// A dead connection, if any, is torn down below, outside the lock: it may

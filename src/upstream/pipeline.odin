@@ -186,13 +186,32 @@ pipe_kill :: proc(c: ^Pipe_Conn, err: Error) {
 	c.err = err
 }
 
+/*
+Dial one connection.
+
+`timeout` is what this upstream is configured with and what the connection
+keeps - its socket timeouts, and the budget a message half read is finished on.
+`budget` is what this particular dial may spend, which is whatever the caller
+has left of its own deadline and so may be a good deal less. Kept apart because
+a caller dialling with a sliver left must not leave every later reader on that
+connection holding a sliver too.
+*/
 @(private)
-dial_pipe :: proc(u: ^Upstream, timeout: time.Duration) -> (c: ^Pipe_Conn, err: Error) {
+dial_pipe :: proc(u: ^Upstream, timeout, budget: time.Duration) -> (c: ^Pipe_Conn, err: Error) {
+	// A caller whose deadline went while it was getting here still makes one
+	// bounded attempt rather than handing a negative timeval to the socket.
+	spend := max(budget, time.Millisecond)
 	stream: Stream
 	if u.spec.kind == .TLS {
-		stream = open_stream(u.endpoint, u.tls_ctx, u.spec.hostname, timeout, u) or_return
+		stream = open_stream(u.endpoint, u.tls_ctx, u.spec.hostname, spend, u) or_return
+		// `open_stream` left the session on the dial's budget; what it carries
+		// from here is the connection's. Guarded the way h2client.odin guards
+		// it: a stream is only a TLS one when it was dialled through a context.
+		if stream.tls != nil {
+			tlsx.set_timeouts(stream.tls, timeout, timeout)
+		}
 	} else {
-		socket, derr := dial_tcp_timeout(u.endpoint, timeout)
+		socket, derr := dial_tcp_timeout(u.endpoint, spend)
 		if derr != .None {
 			return nil, derr
 		}
@@ -231,8 +250,15 @@ point here, so the losers wait on `u.conn_cond` and pick up the winner's.
 on it is the upstream's and not a pooled connection going stale.
 */
 @(private)
-get_pipe :: proc(u: ^Upstream, timeout: time.Duration) -> (c: ^Pipe_Conn, fresh: bool, err: Error) {
-	deadline := time.time_add(time.now(), timeout)
+get_pipe :: proc(
+	u: ^Upstream,
+	timeout: time.Duration,
+	deadline: time.Time,
+) -> (
+	c: ^Pipe_Conn,
+	fresh: bool,
+	err: Error,
+) {
 	sync.mutex_lock(&u.mu)
 	for {
 		if u.pipe != nil {
@@ -247,7 +273,7 @@ get_pipe :: proc(u: ^Upstream, timeout: time.Duration) -> (c: ^Pipe_Conn, fresh:
 				// it is closed again the moment this query is done with it.
 				// The shared one stays where it is for everyone else.
 				sync.mutex_unlock(&u.mu)
-				c, err = dial_pipe(u, timeout)
+				c, err = dial_pipe(u, timeout, time.diff(time.now(), deadline))
 				return c, true, err
 			case .Gone:
 			}
@@ -264,10 +290,9 @@ get_pipe :: proc(u: ^Upstream, timeout: time.Duration) -> (c: ^Pipe_Conn, fresh:
 		past the point its own caller stopped waiting. Guarding only the wait
 		would leave the same queue one dial shorter.
 
-		A caller that breaks out with a sliver left still dials on the full
-		timeout, so the worst case is two of them rather than one. That is the
-		dial plus the round trip the pooled path could already spend, and the
-		point here is the queue, not the sliver.
+		A caller that breaks out with a sliver left dials on that sliver, since
+		`exchange_pipelined` hands every stage the same deadline: what it is
+		owed is its timeout, not one per stage it passes through.
 		*/
 		remaining := time.diff(time.now(), deadline)
 		if remaining <= 0 {
@@ -288,7 +313,7 @@ get_pipe :: proc(u: ^Upstream, timeout: time.Duration) -> (c: ^Pipe_Conn, fresh:
 	// holds its own and tears it down when it is finished with it.
 	pipe_unref(stale)
 
-	dialled, derr := dial_pipe(u, timeout)
+	dialled, derr := dial_pipe(u, timeout, time.diff(time.now(), deadline))
 
 	sync.mutex_lock(&u.mu)
 	u.connecting = false
@@ -328,24 +353,43 @@ exchange_pipelined :: proc(
 	response: []u8,
 	err: Error,
 ) {
-	c, fresh, gerr := get_pipe(u, timeout)
+	// One deadline for the whole of this, handed to every stage. Waiting for
+	// somebody else's dial, dialling, asking and retrying each used to start a
+	// clock of its own, so a query could cost several times the timeout its
+	// caller was promised - with an upstream worker held for all of it.
+	deadline := time.time_add(time.now(), timeout)
+
+	c, fresh, gerr := get_pipe(u, timeout, deadline)
 	if gerr != .None {
 		return nil, gerr
 	}
-	response, err = pipe_query(u, c, query, timeout, allocator)
+	response, err = pipe_query(u, c, query, deadline, allocator)
 	if err == .None || fresh || !pipe_dead(c) {
 		pipe_unref(c)
 		return response, err
 	}
+	/*
+	The retry is for a connection found dead before this query spent anything
+	on it - a write that failed, or a read that came back closed - where the
+	budget is whole and the whole point is that a server recycling an idle
+	connection costs nobody an answer. A connection that went dead by running
+	this query's clock out has already had the time, so there is none to spend
+	again; the query after this one finds the connection dead and dials afresh,
+	which is what makes a server that vanished recoverable.
+	*/
+	if time.diff(time.now(), deadline) <= 0 {
+		pipe_unref(c)
+		return nil, err
+	}
 
 	// Held until the redial is done, so `get_pipe` sees the dead connection it
 	// has to replace rather than an address something else has since reused.
-	retry, _, rerr := get_pipe(u, timeout)
+	retry, _, rerr := get_pipe(u, timeout, deadline)
 	pipe_unref(c)
 	if rerr != .None {
 		return nil, rerr
 	}
-	response, err = pipe_query(u, retry, query, timeout, allocator)
+	response, err = pipe_query(u, retry, query, deadline, allocator)
 	pipe_unref(retry)
 	return response, err
 }
@@ -355,7 +399,7 @@ pipe_query :: proc(
 	u: ^Upstream,
 	c: ^Pipe_Conn,
 	query: []u8,
-	timeout: time.Duration,
+	deadline: time.Time,
 	allocator: mem.Allocator,
 ) -> (
 	response: []u8,
@@ -391,8 +435,6 @@ pipe_query :: proc(
 	w.seen = c.replies
 	c.waiters[id] = &w
 	sync.mutex_unlock(&c.mu)
-
-	deadline := time.time_add(time.now(), timeout)
 
 	if werr := pipe_write(c, asked); werr != .None {
 		sync.mutex_lock(&c.mu)
@@ -532,19 +574,28 @@ Read one reply off the wire and hand it to its waiter.
 untouched. Every other error means the stream can no longer be read as a
 sequence of messages and the connection is finished.
 
-The two reads are bounded differently on purpose, and `Pipe_Conn.timeout` says
-why: until the length prefix is in, this caller is free to give up and hand the
-reading to somebody else; after it, the message has to be finished or the
-connection is no longer readable at all.
+The reads are bounded differently on purpose, and `Pipe_Conn.timeout` says why:
+until a byte of the message has been taken, this caller is free to give up and
+hand the reading to somebody else; from the first byte on, the message has to
+be finished or the connection is no longer readable at all.
 */
 @(private)
 pipe_read_one :: proc(c: ^Pipe_Conn, budget: time.Duration) -> Error {
 	length_buf: [2]u8
-	n, rerr := pipe_read_full(c, length_buf[:], time.time_add(time.now(), budget))
-	if rerr != .None {
-		if rerr == .Timeout && n == 0 {
-			return .Timeout
-		}
+	/*
+	One byte on this caller's budget, because until a byte is taken the caller
+	owes the connection nothing and may hand the reading on.
+
+	A byte rather than the whole prefix: the bound starts where the framing is
+	committed, and that is the *first* byte consumed. A length prefix split by
+	a segment boundary is a message half read exactly as a header without its
+	records is, and a reader that gave up holding one byte of a length would
+	leave the stream unreadable for everyone on it.
+	*/
+	if _, rerr := pipe_read_full(c, length_buf[:1], time.time_add(time.now(), budget)); rerr != .None {
+		return .Timeout if rerr == .Timeout else rerr
+	}
+	if _, rerr := pipe_read_full(c, length_buf[1:], time.time_add(time.now(), c.timeout)); rerr != .None {
 		return .IO_Error if rerr == .Timeout else rerr
 	}
 	length := int(length_buf[0]) << 8 | int(length_buf[1])
