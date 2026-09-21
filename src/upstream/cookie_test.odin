@@ -282,7 +282,7 @@ test_upstream_cookie_forged_reply_is_ignored :: proc(t: ^testing.T) {
 	defer stop_cookie_mock(&m, u, worker)
 
 	_, err := exchange(u, edns_query("example.com."), 300 * time.Millisecond, context.temp_allocator)
-	testing.expectf(t, err == .Timeout, "a forged reply was accepted (%v)", err)
+	testing.expectf(t, err == .Bad_Response, "a forged reply was accepted (%v)", err)
 
 	// It really did answer; the reply was rejected rather than never sent.
 	sync.mutex_lock(&m.mu)
@@ -319,7 +319,7 @@ test_upstream_cookie_missing_from_reply_is_ignored :: proc(t: ^testing.T) {
 	testing.expectf(t, err == .None, "the first exchange failed: %v", err)
 
 	_, err2 := exchange(u, edns_query("example.org."), 300 * time.Millisecond, context.temp_allocator)
-	testing.expectf(t, err2 == .Timeout, "a reply with the cookie left off was accepted (%v)", err2)
+	testing.expectf(t, err2 == .Bad_Response, "a reply with the cookie left off was accepted (%v)", err2)
 
 	sync.mutex_lock(&m.mu)
 	seen := m.queries
@@ -343,7 +343,7 @@ test_upstream_cookie_illegal_length_is_ignored :: proc(t: ^testing.T) {
 	defer stop_cookie_mock(&m, u, worker)
 
 	_, err := exchange(u, edns_query("example.com."), 300 * time.Millisecond, context.temp_allocator)
-	testing.expectf(t, err == .Timeout, "a reply with an illegal cookie length was accepted (%v)", err)
+	testing.expectf(t, err == .Bad_Response, "a reply with an illegal cookie length was accepted (%v)", err)
 	free_all(context.temp_allocator)
 }
 

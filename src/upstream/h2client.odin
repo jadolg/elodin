@@ -75,7 +75,7 @@ handshake it would otherwise have to throw away and repeat.
 */
 @(private)
 negotiate_https :: proc(u: ^Upstream, timeout: time.Duration) -> (stream: Stream, proto: Protocol, err: Error) {
-	stream, err = open_stream(u.endpoint, u.tls_ctx, u.spec.hostname, timeout)
+	stream, err = open_stream(u.endpoint, u.tls_ctx, u.spec.hostname, timeout, u)
 	if err != .None {
 		return {}, .Unknown, err
 	}

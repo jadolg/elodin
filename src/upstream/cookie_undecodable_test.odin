@@ -570,7 +570,7 @@ test_upstream_cookie_undecodable_forgery_is_not_taken_as_an_answer :: proc(t: ^t
 	testing.expect(t, learned > 0, "no server cookie was learned, so nothing is owed and the test proves nothing")
 
 	response, err2 := exchange(u, probe_query(), 300 * time.Millisecond, context.temp_allocator)
-	testing.expectf(t, err2 == .Timeout, "an undecodable forgery was taken as the answer (%v)", err2)
+	testing.expectf(t, err2 == .Bad_Response, "an undecodable forgery was taken as the answer (%v)", err2)
 	testing.expect(t, response == nil, "the forged bytes were handed back")
 
 	// It really did answer; the datagram was passed over rather than never sent.

@@ -131,7 +131,7 @@ exchange_doh_h1 :: proc(
 				tls    = conn.tls,
 			}
 		} else {
-			s, oerr := open_stream(u.endpoint, u.tls_ctx, u.spec.hostname, timeout)
+			s, oerr := open_stream(u.endpoint, u.tls_ctx, u.spec.hostname, timeout, u)
 			if oerr != .None {
 				return nil, oerr
 			}
