@@ -131,7 +131,8 @@ exchange_doh_h2 :: proc(
 			return nil, .Timeout
 		}
 	}
-	return nil, .Peer_Closed
+	// Unreachable: the second attempt always returns above.
+	return nil, .IO_Error
 }
 
 @(private)

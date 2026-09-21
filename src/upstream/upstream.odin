@@ -379,10 +379,10 @@ record_failure :: proc(u: ^Upstream, err: Error) {
 		long as it kept doing it, which is the opposite of kind to the peer
 		whose limit on connections started this.
 
-		So the exemption is for a run rather than forever, and past it these
-		count like any other failure: the upstream is parked `FAILURE_THRESHOLD`
-		further hang-ups later, and a single success anywhere in between clears
-		the run. A resolver recycling an idle connection never gets near it -
+		So the exemption is for a run rather than forever: the first
+		`FAILURE_THRESHOLD - 1` are exempt and each one past them counts like any
+		other failure, so the upstream is parked on the `2 * FAILURE_THRESHOLD - 1`th
+		in a row, and a single success anywhere in between clears the run. A resolver recycling an idle connection never gets near it -
 		one hang-up costs a retry that works, and never reaches here at all.
 		*/
 		if u.closed_run < FAILURE_THRESHOLD {
