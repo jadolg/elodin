@@ -1787,7 +1787,7 @@ recycle_mock_loop :: proc(m: ^Recycle_Mock) {
 				break
 			}
 			q := make([]u8, ln, context.temp_allocator)
-            if !recycle_read(m, client, q) {
+			if !recycle_read(m, client, q) {
 				break
 			}
 			out := make([]u8, 2 + ln, context.temp_allocator)
@@ -1978,5 +1978,153 @@ test_the_idle_ceiling_is_learned_from_being_hung_up_on :: proc(t: ^testing.T) {
 	defer destroy(v)
 	note_idle_death(v, 20 * time.Second)
 	testing.expect_value(t, pipe_idle_ceiling(v), 3 * time.Second)
+	free_all(context.temp_allocator)
+}
+
+/*
+Grooming an upstream that has a connection must come back.
+
+`close_idle` holds `u.mu` for the whole sweep and `close_pipe` runs inside it,
+so everything `close_pipe` reaches has to be the `_locked` half. The idle
+ceiling is read there, and reading it through the unlocked accessor takes
+`u.mu` a second time - which on a mutex that is not reentrant is the
+maintenance loop wedged forever, holding the lock every query to this upstream
+also needs. Cheap to assert because the failure is a hang rather than a value:
+if this returns at all, the sweep did not take its own lock twice.
+*/
+@(test)
+test_grooming_a_live_connection_returns :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen: %v", lerr) {
+		return
+	}
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the port: %v", berr) {
+		net.close(listener)
+		return
+	}
+	_ = net.set_option(listener, .Receive_Timeout, 200 * time.Millisecond)
+
+	// Answers everything, so the sweep below finds a connection rather than
+	// the nil the deadlock hides behind.
+	m := Recycle_Mock {
+		listener = listener,
+		before   = max(int),
+	}
+	responder := thread.create_and_start_with_poly_data(&m, recycle_mock_loop)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(responder)
+		thread.destroy(responder)
+		net.close(listener)
+	}
+
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "groomed", kind = .TCP, address = "127.0.0.1", port = bound.port},
+		8,
+		30 * time.Second,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot make the upstream: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+
+	query := dns.Message {
+		id       = 0x5151,
+		question = []dns.Question{{name = "example.com.", type = .A, class = .IN}},
+	}
+	query.flags.rd = true
+	wire, _, enc := dns.encode_message(query, context.temp_allocator)
+	if !testing.expectf(t, enc == .None, "cannot encode: %v", enc) {
+		return
+	}
+	_, e := exchange(u, wire, 2 * time.Second, context.temp_allocator)
+	if !testing.expectf(t, e == .None, "the exchange failed: %v", e) {
+		return
+	}
+
+	// What the maintenance loop calls on every tick, for every upstream.
+	closed := close_idle(u)
+	testing.expectf(t, closed == 0, "a connection in use was swept: %v", closed)
+	free_all(context.temp_allocator)
+}
+
+/*
+A slow server does not teach an idle timeout.
+
+`note_idle_death` is the record of a peer *hanging up*, and what it learns is
+one-way, so every other way a connection can die ratchets the ceiling down for
+the life of the process and never back up. A timeout is the case to keep out:
+it says the peer took the query and went quiet, which is the opposite evidence
+- the connection was still there. Left in, two slow names on a quiet forwarder
+walk the ceiling down to `PIPE_IDLE_FLOOR` and the reaper then dials a fresh
+connection for almost every query, against the upstream whose limit on how
+often a source may connect is what this all started with.
+*/
+@(test)
+test_a_timeout_does_not_teach_an_idle_ceiling :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen: %v", lerr) {
+		return
+	}
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the port: %v", berr) {
+		net.close(listener)
+		return
+	}
+	_ = net.set_option(listener, .Receive_Timeout, 50 * time.Millisecond)
+
+	m := Silent_Mock {
+		listener = listener,
+		threads  = make([dynamic]^thread.Thread, 0, 2),
+	}
+	acceptor := thread.create_and_start_with_poly_data(&m, silent_mock_loop)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(acceptor)
+		thread.destroy(acceptor)
+		for th in m.threads {
+			thread.join(th)
+			thread.destroy(th)
+		}
+		delete(m.threads)
+		net.close(listener)
+	}
+
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "slowpoke", kind = .TCP, address = "127.0.0.1", port = bound.port},
+		8,
+		30 * time.Second,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot make the upstream: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+
+	query := dns.Message {
+		id       = 0x6262,
+		question = []dns.Question{{name = "example.com.", type = .A, class = .IN}},
+	}
+	query.flags.rd = true
+	wire, _, enc := dns.encode_message(query, context.temp_allocator)
+	if !testing.expectf(t, enc == .None, "cannot encode: %v", enc) {
+		return
+	}
+
+	// The first lone timeout only counts; it leaves the connection up, and
+	// moves `last` forward so the gap below is measured from here.
+	_, e1 := exchange(u, wire, 200 * time.Millisecond, context.temp_allocator)
+	testing.expectf(t, e1 == .Timeout, "the silent server answered: %v", e1)
+
+	// Past `PIPE_IDLE_FLOOR`, so this is a gap the ceiling would believe if a
+	// timeout were allowed to teach it.
+	time.sleep(PIPE_IDLE_FLOOR + 300 * time.Millisecond)
+
+	// `PIPE_SILENT_TIMEOUTS` reached: this one takes the connection down, on a
+	// timeout rather than a hang-up.
+	_, e2 := exchange(u, wire, 200 * time.Millisecond, context.temp_allocator)
+	testing.expectf(t, e2 == .Timeout, "the silent server answered: %v", e2)
+
+	testing.expect_value(t, pipe_idle_ceiling(u), 30 * time.Second)
 	free_all(context.temp_allocator)
 }

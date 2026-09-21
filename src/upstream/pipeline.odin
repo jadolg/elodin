@@ -385,10 +385,10 @@ concurrent first queries shares one handshake rather than each opening - and
 all but one of them discarding - a connection of its own. Which is the whole
 point here, so the losers wait on `u.conn_cond` and pick up the winner's.
 
-`fresh` says this caller's query is the first on the connection. `close_idle`
-reads it; `exchange_pipelined` used to and no longer does, for the reason its
-own retry gives - a peer refuses a new connection as readily as it recycles an
-old one, so the query that paid for the dial needs the retry too.
+Whether the connection was dialled here or found open is deliberately not
+reported. `exchange_pipelined` used to ask, and retried only what it had not
+dialled itself; a peer refuses a new connection as readily as it recycles an
+old one, so the query that paid for the dial needs the retry just as much.
 */
 @(private)
 get_pipe :: proc(
@@ -397,7 +397,6 @@ get_pipe :: proc(
 	deadline: time.Tick,
 ) -> (
 	c: ^Pipe_Conn,
-	fresh: bool,
 	err: Error,
 ) {
 	sync.mutex_lock(&u.mu)
@@ -422,7 +421,7 @@ get_pipe :: proc(
 		remaining := time.tick_diff(time.tick_now(), deadline)
 		if remaining <= 0 {
 			sync.mutex_unlock(&u.mu)
-			return nil, false, .Timeout
+			return nil, .Timeout
 		}
 		if u.pipe != nil {
 			switch pipe_state(u.pipe, pipe_idle_ceiling_locked(u), u.max_outstanding) {
@@ -430,14 +429,14 @@ get_pipe :: proc(
 				c = u.pipe
 				pipe_ref(c)
 				sync.mutex_unlock(&u.mu)
-				return c, false, .None
+				return c, .None
 			case .Full:
 				// A connection of this caller's own, left out of `u.pipe` so
 				// it is closed again the moment this query is done with it.
 				// The shared one stays where it is for everyone else.
 				sync.mutex_unlock(&u.mu)
 				c, err = dial_pipe(u, timeout, time.tick_diff(time.tick_now(), deadline))
-				return c, true, err
+				return c, err
 			case .Gone:
 			}
 		}
@@ -462,14 +461,14 @@ get_pipe :: proc(
 	if derr != .None {
 		sync.cond_broadcast(&u.conn_cond)
 		sync.mutex_unlock(&u.mu)
-		return nil, true, derr
+		return nil, derr
 	}
 	// This caller's, on top of the upstream's.
 	pipe_ref(dialled)
 	u.pipe = dialled
 	sync.cond_broadcast(&u.conn_cond)
 	sync.mutex_unlock(&u.mu)
-	return dialled, true, .None
+	return dialled, .None
 }
 
 /*
@@ -510,7 +509,7 @@ exchange_pipelined :: proc(
 	*/
 	deadline := time.tick_add(time.tick_now(), timeout)
 
-	c, _, gerr := get_pipe(u, timeout, deadline)
+	c, gerr := get_pipe(u, timeout, deadline)
 	if gerr != .None {
 		return nil, gerr
 	}
@@ -521,7 +520,13 @@ exchange_pipelined :: proc(
 		_ = pipe_unref(c)
 		return response, err
 	}
-	if dead && idled > 0 {
+	// Only a hang-up teaches the ceiling. A timeout is the opposite evidence -
+	// the peer took the query and went quiet, so the connection was still
+	// there - and `pipe_wait` kills the connection over a run of those. Since
+	// what is learned only ever comes down, letting a slow server in here
+	// would walk the ceiling to `PIPE_IDLE_FLOOR` and leave it there for the
+	// life of the process, dialling afresh for nearly every query.
+	if dead && idled > 0 && err == .Peer_Closed {
 		note_idle_death(u, idled)
 	}
 	if !dead {
@@ -560,7 +565,7 @@ exchange_pipelined :: proc(
 
 	// Held until the redial is done, so `get_pipe` sees the dead connection it
 	// has to replace rather than an address something else has since reused.
-	retry, _, rerr := get_pipe(u, timeout, deadline)
+	retry, rerr := get_pipe(u, timeout, deadline)
 	_ = pipe_unref(c)
 	if rerr != .None {
 		return nil, rerr
@@ -1110,7 +1115,7 @@ close_pipe :: proc(u: ^Upstream, all: bool) -> (closed: int) {
 	if u.pipe == nil {
 		return 0
 	}
-	if !all && pipe_state(u.pipe, pipe_idle_ceiling(u), u.max_outstanding) != .Gone {
+	if !all && pipe_state(u.pipe, pipe_idle_ceiling_locked(u), u.max_outstanding) != .Gone {
 		return 0
 	}
 	c := u.pipe
