@@ -402,9 +402,8 @@ resolve_insisting :: proc(
 		// member that recurses for most of the timeout and then says SERVFAIL
 		// has cost this query exactly what a member that said nothing did.
 		spent += time.tick_since(before)
-		if xerr != .None {
-			logx.debugf("upstream %s failed: %v", u.spec.name, xerr)
-		} else if acceptable(resp) {
+		// A failed exchange is left to `exchange`, which says why.
+		if xerr == .None && acceptable(resp) {
 			// Said here rather than above, because what makes a filtering
 			// member's block bypassed is another member *answering* - a second
 			// REFUSED from behind the same ACL bypasses nothing, and warning
@@ -424,7 +423,7 @@ resolve_insisting :: proc(
 			// where this is a no-op; it matters where one is not.
 			_ = delete(response, allocator)
 			return resp, u, .None
-		} else {
+		} else if xerr == .None {
 			_ = delete(resp, allocator)
 		}
 		if spent >= g.timeout {
@@ -719,7 +718,6 @@ resolve_sequential :: proc(
 			if unreachable != nil {
 				append(unreachable, u)
 			}
-			logx.debugf("upstream %s failed: %v", u.spec.name, xerr)
 		}
 	}
 	return nil, nil, last_err
