@@ -483,28 +483,6 @@ The same reset can also surface before the handshake starts: `dial_tcp_timeout`
 reports `Dial_Reset` when the peer closed before this side finished connecting,
 which is retried on the same terms.
 */
-/*
-How long to wait before each retry of a connection the peer reset.
-
-Quad9 resets a substantial share of fresh DoT connections, and this used to
-retry once, immediately, on the reading that "the very next attempt succeeds".
-Measured against 9.9.9.9:853 - 40 sequential dials, one every 100ms, none held
-open - that reading is about a third right: 30 connected first try, 5 more on
-an immediate retry, 3 more after 100ms, 1 more after 300ms, and 1 never
-connected. Cloudflare reset none of the same 40.
-
-So stopping at the immediate retry left about one dial in eight failing, which
-is what three in a row and the failure cooldown are made of. The pauses are
-what the remainder needs - whatever the peer is limiting, it is not clear in
-the microseconds an immediate retry takes - and a reset costs at most the sum
-below, only ever on the path where the connection was refused anyway.
-
-Bounded by the caller's timeout as well: a group configured with a short one
-would rather try the next upstream than spend its whole budget pausing here.
-*/
-@(private)
-RESET_BACKOFF :: [?]time.Duration{0, 100 * time.Millisecond, 300 * time.Millisecond}
-
 open_stream :: proc(
 	endpoint: net.Endpoint,
 	tls_ctx: ^tlsx.Context,
@@ -515,23 +493,10 @@ open_stream :: proc(
 	stream: Stream,
 	err: Error,
 ) {
-	backoff := RESET_BACKOFF
-	deadline := time.time_add(time.now(), timeout)
-	// Whether there is room to pause for `RESET_BACKOFF[i]` and still have
-	// time to dial afterwards.
-	affordable :: proc(deadline: time.Time, wait: time.Duration) -> bool {
-		return time.diff(time.now(), deadline) > wait
-	}
-
-	for attempt in 0 ..< len(RESET_BACKOFF) + 1 {
-		// The last pass through: nothing is retried after it.
-		last := attempt == len(RESET_BACKOFF)
-		if attempt > 0 {
-			time.sleep(backoff[attempt - 1])
-		}
+	for attempt in 0 ..< 2 {
 		socket, derr := dial_tcp_timeout(endpoint, timeout)
 		if derr != .None {
-			if derr != .Dial_Reset || last || !affordable(deadline, backoff[attempt]) {
+			if derr != .Dial_Reset || attempt == 1 {
 				return {}, derr
 			}
 			continue
@@ -550,8 +515,8 @@ open_stream :: proc(
 		// here rather than at the point the error surfaces.
 		detail := tlsx.describe_error(terr, context.temp_allocator)
 		net.close(socket)
-		if terr == .Closed && !last && affordable(deadline, backoff[attempt]) {
-			logx.debugf("TLS handshake with %q failed: %s, trying again", hostname, detail)
+		if terr == .Closed && attempt == 0 {
+			logx.debugf("TLS handshake with %q failed: %s, retrying once", hostname, detail)
 			continue
 		}
 		ferr := handshake_failure(terr)

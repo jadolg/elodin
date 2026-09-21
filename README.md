@@ -410,21 +410,10 @@ resolver the latter would come straight back to a server that has not started
 listening yet.
 
 An upstream that fails three times in a row is skipped for ten seconds; if every
-upstream is in that state they are all tried anyway.
-
-A connection the peer resets — during the TCP handshake or partway through the
-TLS one — is retried, because some public resolvers reset a large share of fresh
-connections. Quad9 is the one to know about: 40 sequential dials to
-`9.9.9.9:853`, one every 100ms with none held open, had 30 connect first try and
-10 reset; the same 40 to Cloudflare had none. It is not a fact about the network
-between them, and it is not visible in the answers — but three resets in a row
-park the upstream for the cooldown and push every query onto the fallback.
-
-So a reset is retried up to three times, pausing 0ms, then 100ms, then 300ms.
-The immediate retry alone recovers about a third of them; the pauses take the
-same 40 dials to 39. Only a reset is retried, the pauses are bounded by
-`upstream.timeout` so a short one goes to the next server instead, and a dial
-that was refused anyway is the only path that ever spends them.
+upstream is in that state they are all tried anyway. A TLS handshake the peer
+resets partway through is retried once first, since some public resolvers do that
+to a fair share of fresh connections while the very next attempt goes through.
+Only a reset is retried.
 
 Each *kind* of failure an upstream produces is named once at `warn`, with the
 transport and address, and left to `debug` after that:

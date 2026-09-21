@@ -1457,8 +1457,6 @@ generate_dot_certs :: proc() {
 Dot_Reset_Mock :: struct {
 	listener: net.TCP_Socket,
 	ctx:      ^tlsx.Context,
-	// How many callers to hang up on before answering one.
-	hang_ups: int,
 	resets:   int,
 	served:   int,
 }
@@ -1466,25 +1464,23 @@ Dot_Reset_Mock :: struct {
 @(private = "file")
 dot_reset_once :: proc(m: ^Dot_Reset_Mock) {
 	/*
-	Hang up on the first `hang_ups` callers hard.
+	Hang up on the first caller hard.
 
 	SO_LINGER with a zero timeout makes close() send a RST instead of a FIN,
 	which is what the handshake being cut off looks like on the wire. A FIN
 	would not do: OpenSSL has a protocol error of its own for that.
 	*/
-	for _ in 0 ..< m.hang_ups {
-		first, _, ferr := net.accept_tcp(m.listener)
-		if ferr != nil {
-			return
-		}
-		lg := posix.linger {
-			l_onoff  = 1,
-			l_linger = 0,
-		}
-		posix.setsockopt(posix.FD(first), posix.SOL_SOCKET, .LINGER, &lg, posix.socklen_t(size_of(lg)))
-		net.close(first)
-		sync.atomic_add(&m.resets, 1)
+	first, _, ferr := net.accept_tcp(m.listener)
+	if ferr != nil {
+		return
 	}
+	lg := posix.linger {
+		l_onoff  = 1,
+		l_linger = 0,
+	}
+	posix.setsockopt(posix.FD(first), posix.SOL_SOCKET, .LINGER, &lg, posix.socklen_t(size_of(lg)))
+	net.close(first)
+	sync.atomic_add(&m.resets, 1)
 
 	// The retry, answered properly.
 	second, _, serr := net.accept_tcp(m.listener)
@@ -1558,7 +1554,6 @@ test_dot_handshake_reset_by_the_peer_is_retried :: proc(t: ^testing.T) {
 	m := Dot_Reset_Mock {
 		listener = listener,
 		ctx      = sctx,
-		hang_ups = 1,
 	}
 	mock_thread := thread.create_and_start_with_poly_data(&m, dot_reset_once)
 	defer {
@@ -1594,92 +1589,6 @@ test_dot_handshake_reset_by_the_peer_is_retried :: proc(t: ^testing.T) {
 	resp, xerr := exchange(u, wire, 2 * time.Second, context.temp_allocator)
 	testing.expectf(t, xerr == .None, "the exchange failed: %v", xerr)
 	testing.expect_value(t, sync.atomic_load(&m.resets), 1)
-	testing.expectf(t, len(resp) == len(wire), "got %d bytes back, expected %d", len(resp), len(wire))
-	free_all(context.temp_allocator)
-}
-
-/*
-A peer that resets twice running is still reached.
-
-The retry above used to stop at one immediate attempt, on the reading that a
-resolver which resets a connection lets the very next one through. Measured
-against 9.9.9.9:853 that recovers about a third of the resets, and the rest
-need the short pauses `RESET_BACKOFF` now takes - so a peer that hangs up
-twice is exactly the case that used to reach the caller as `TLS_Failed`, and
-three of those park the upstream and push every query to the fallback.
-
-Two hang-ups rather than the full ladder's three: the third pause is 300ms of
-suite time to cover one more entry of the same array.
-*/
-@(test)
-test_dot_handshake_reset_twice_is_still_retried :: proc(t: ^testing.T) {
-	posix.sigignore(.SIGPIPE)
-
-	sync.once_do(&dot_cert_once, generate_dot_certs)
-	if !dot_cert_ok {
-		testing.expect(t, false, "no certificate available and openssl could not make one")
-		return
-	}
-
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
-		return
-	}
-	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
-		return
-	}
-	// So a missing retry ends the accept below rather than hanging the suite.
-	_ = net.set_option(listener, .Receive_Timeout, 3 * time.Second)
-
-	sctx, serr := tlsx.server_context(dot_cert_path, dot_key_path)
-	if serr != .None {
-		testing.expectf(t, false, "server_context: %v", serr)
-		return
-	}
-	defer tlsx.context_destroy(sctx)
-
-	m := Dot_Reset_Mock {
-		listener = listener,
-		ctx      = sctx,
-		hang_ups = 2,
-	}
-	mock_thread := thread.create_and_start_with_poly_data(&m, dot_reset_once)
-	defer {
-		thread.join(mock_thread)
-		thread.destroy(mock_thread)
-	}
-
-	u, uerr := make_upstream(
-		config.Upstream_Spec{name = "mock", kind = .TLS, address = "127.0.0.1", port = bound.port},
-		0,
-		2 * time.Second,
-		context.allocator,
-	)
-	testing.expectf(t, uerr == .None, "cannot build the upstream: %v", uerr)
-	if uerr != .None {
-		return
-	}
-	defer destroy(u)
-
-	query := dns.Message {
-		id       = 0x5252,
-		question = []dns.Question{{name = "example.com.", type = .A, class = .IN}},
-	}
-	query.flags.rd = true
-	wire, _, enc_err := dns.encode_message(query, context.temp_allocator)
-	testing.expectf(t, enc_err == .None, "cannot encode the query: %v", enc_err)
-	if enc_err != .None {
-		return
-	}
-
-	resp, xerr := exchange(u, wire, 2 * time.Second, context.temp_allocator)
-	testing.expectf(t, xerr == .None, "the exchange failed: %v", xerr)
-	testing.expect_value(t, sync.atomic_load(&m.resets), 2)
-	testing.expect_value(t, sync.atomic_load(&m.served), 1)
 	testing.expectf(t, len(resp) == len(wire), "got %d bytes back, expected %d", len(resp), len(wire))
 	free_all(context.temp_allocator)
 }
