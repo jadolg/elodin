@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:net"
 import "core:strings"
 import "core:sync"
+import "core:thread"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
@@ -29,9 +30,11 @@ Listeners :: struct {
 	tcp_socket:     net.TCP_Socket,
 	dot_socket:     net.TCP_Socket,
 	doh_socket:     net.TCP_Socket,
-	// The Prometheus endpoint, which is not a DNS listener but is a socket with
-	// the same lifetime: opened by `start_listeners`, closed by
-	// `stop_listeners`, and its loop joined with the rest.
+	/*
+	The Prometheus endpoint. Opened by `start_listeners`, but deliberately
+	outlives `stop_listeners`: it is stopped on its own, by `stop_metrics`,
+	after the pools have drained. See the note there for why.
+	*/
 	metrics_socket: net.TCP_Socket,
 	tcp_open:       bool,
 	dot_open:       bool,
@@ -52,6 +55,9 @@ Listeners :: struct {
 	tls_mu:         sync.RW_Mutex,
 	conns:          Conn_Manager,
 	stop:           bool,
+	// The metrics loop's own stop flag, checked instead of `stop` above and
+	// set by `stop_metrics` rather than `stop_listeners`. See `metrics_socket`.
+	metrics_stop:   bool,
 	/*
 	What the read and accept loops were given, held here rather than by the
 	loops themselves.
@@ -68,6 +74,10 @@ Listeners :: struct {
 	*/
 	stream_loop_ctx:  [dynamic]^Stream_Context,
 	metrics_loop_ctx: ^Metrics_Context,
+	// Not routed through `conns` like every other loop: `conn_manager_shutdown`
+	// joins that list in order and this one must outlive the join, not sit in
+	// the middle of it. See `stop_metrics`.
+	metrics_thread:   ^thread.Thread,
 }
 
 /*
@@ -204,12 +214,41 @@ stop_listeners :: proc(l: ^Listeners) {
 	if l.doh_open {
 		net.close(l.doh_socket)
 	}
-	if l.metrics_open {
-		net.close(l.metrics_socket)
-	}
+	// Metrics is not here; see `stop_metrics`.
 	conn_manager_shutdown(&l.conns)
 	tlsx.context_destroy(l.dot_ctx)
 	tlsx.context_destroy(l.doh_ctx)
+}
+
+/*
+Stop the metrics endpoint, once the slow part of shutdown is over.
+
+Separate from `stop_listeners` and called right after it rather than as part of
+the same sweep, so a scrape lands throughout `conn_manager_shutdown` instead of
+finding the port already closed. That join is where shutdown actually spends
+its time: it joins client connections one at a time with no overall deadline,
+and a DoT or DoH one can hold out for `server.client_timeout`. An operator
+watching `elodin_connections_active` fall to zero during that stretch is
+watching the shutdown succeed; one watching a gap where the endpoint used to be
+cannot tell a slow stop from a stuck one.
+
+Called before either `pool.destroy`, not after both - unlike everything else
+this endpoint reads, `handler_pool` and `race_pool` are not freed by a defer
+later in `run`, they are freed by `pool.destroy` itself, right here, and
+`render_pool_metrics` takes no lock on the way in. Keeping the endpoint open
+across that call would be reading through a free the moment it landed.
+*/
+stop_metrics :: proc(l: ^Listeners) {
+	if !l.metrics_open {
+		return
+	}
+	sync.atomic_store(&l.metrics_stop, true)
+	net.close(l.metrics_socket)
+	if l.metrics_thread != nil {
+		thread.join(l.metrics_thread)
+		thread.destroy(l.metrics_thread)
+		l.metrics_thread = nil
+	}
 }
 
 /*

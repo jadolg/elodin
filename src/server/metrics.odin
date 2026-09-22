@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:net"
 import "core:strings"
 import "core:sync"
+import "core:thread"
 import "core:time"
 import "elodin:cache"
 import "elodin:dnssec"
@@ -38,6 +39,12 @@ The cost of that last point is that two scrapers arrive one after the other
 rather than at once. A scrape is a few hundred microseconds of formatting, and
 the alternative - a thread per scraper - is the resource this endpoint is meant
 not to spend.
+
+Its own thread, and its own stop flag, rather than one more entry in `Listeners.conns`.
+Shutdown closes the DNS listeners and then waits out every client connection
+and both worker pools before this endpoint is told to stop - see `stop_metrics`
+in listeners.odin - so a scrape during that wait sees the drain in progress
+instead of a closed port.
 */
 
 /*
@@ -160,13 +167,18 @@ start_metrics :: proc(s: ^Server, l: ^Listeners) -> bool {
 	ctx := new(Metrics_Context)
 	ctx.server = s
 	ctx.listeners = l
-	if conn_spawn(&l.conns, ctx, metrics_accept_loop, counted = false) != .Started {
+	// Not `conn_spawn`: that thread would sit in `l.conns` and be joined by
+	// `conn_manager_shutdown` along with every client connection, which is
+	// exactly the wait this loop is meant to survive. See `stop_metrics`.
+	t := thread.create_and_start_with_data(ctx, metrics_accept_loop)
+	if t == nil {
 		logx.errorf("metrics: cannot start the accept loop")
 		// Nothing was ever handed it, so it is ours to release.
 		free(ctx)
 		return false
 	}
 	l.metrics_loop_ctx = ctx
+	l.metrics_thread = t
 
 	logx.infof("serving metrics on %s:%d%s", cfg.address, cfg.port, cfg.path)
 	/*
@@ -193,11 +205,12 @@ metrics_accept_loop :: proc(data: rawptr) {
 	ctx := cast(^Metrics_Context)data
 	l := ctx.listeners
 
-	// As in the DNS accept loops.
+	// `metrics_stop` rather than `stop`: this loop outlives the DNS listeners
+	// and the pool drain that follows them. See `stop_metrics`.
 	run: Accept_Run
-	for !sync.atomic_load(&l.stop) {
+	for !sync.atomic_load(&l.metrics_stop) {
 		client_socket, client, err := net.accept_tcp(l.metrics_socket)
-		if err != nil && sync.atomic_load(&l.stop) {
+		if err != nil && sync.atomic_load(&l.metrics_stop) {
 			break
 		}
 		/*

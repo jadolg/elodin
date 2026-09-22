@@ -798,9 +798,23 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	The pools are handled here rather than at the point they are created, where
 	a `defer` of their own would put them last in the unwind and hand every
 	draining job a set of freed dependencies.
+
+	Metrics is stopped here too, right after `stop_listeners` and before
+	either pool is touched - not merged into `stop_listeners` and not left
+	running past it. `stop_listeners` is the slow, client-facing part: a DoT or
+	DoH connection can hold out for `server.client_timeout`, its thread joined
+	one at a time along with everyone else's, and an operator scraping through
+	that wait wants to see it happening rather than find the port already
+	closed. `pool.destroy` is a different hazard rather than a smaller version
+	of the same one: it frees the pool it joins, and `render_pool_metrics`
+	reads `handler_pool`/`race_pool` with no lock of its own, on the assumption
+	that nothing frees them while the endpoint can still be reached. Stopping
+	metrics before either `pool.destroy` call keeps that assumption true. See
+	`stop_metrics`.
 	*/
 	defer {
 		server.stop_listeners(&listeners)
+		server.stop_metrics(&listeners)
 		pool.destroy(handler_pool)
 		pool.destroy(race_pool)
 		server.destroy_listeners(&listeners)
