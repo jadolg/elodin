@@ -570,7 +570,8 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	s.send_window = c.peer_initial_window
 	s.header_block = make([dynamic]u8, 0, len(block), c.allocator)
 	if !refused {
-		s.body = make([dynamic]u8, 0, 512, c.allocator)
+		// Nothing allocated until DATA arrives, where `handle_data` charges it.
+		s.body = make([dynamic]u8, 0, 0, c.allocator)
 	}
 	append(&s.header_block, ..block)
 	s.end_stream = h.flags & FLAG_END_STREAM != 0
@@ -1012,8 +1013,17 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		// buffered first. Over the connection's share rather than the stream's,
 		// nothing of it reached a handler, so the client may retry it (RFC 9113
 		// 8.7).
-		oversized := len(s.body) + len(data) > MAX_BODY
-		if oversized || c.request_bytes + len(data) > MAX_CONN_REQUEST {
+		//
+		// Charged by capacity, not length: left to `append`, a 64 KiB body in
+		// 16 KiB frames grows a 116 KiB buffer. Grown here instead, doubling but
+		// never past MAX_BODY, so what is charged is what is allocated.
+		need := len(s.body) + len(data)
+		oversized := need > MAX_BODY
+		grow := 0
+		if need > cap(s.body) {
+			grow = min(max(need, 2 * cap(s.body)), MAX_BODY) - cap(s.body)
+		}
+		if oversized || c.request_bytes + grow > MAX_CONN_REQUEST {
 			sync.mutex_unlock(&c.mu)
 			sent := rst_stream(c, h.stream_id, oversized ? .Enhance_Your_Calm : .Refused_Stream)
 			// The stream is over. Without this it would hold its body, its parked
@@ -1028,9 +1038,10 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 			*/
 			return sent && give_connection_credit(c, len(payload))
 		}
+		reserve(&s.body, cap(s.body) + grow)
 		append(&s.body, ..data)
-		s.charged += len(data)
-		c.request_bytes += len(data)
+		s.charged += grow
+		c.request_bytes += grow
 	}
 	sync.mutex_unlock(&c.mu)
 
@@ -1140,8 +1151,9 @@ MAX_CONCURRENT streams each parked at MAX_BODY pinned 8 MiB a connection
 (#303), and a long :path on each does as much without any body. Charged as the
 fields are decoded and the body buffered, released only when the stream is
 destroyed, so a request handed to a handler still counts until it is answered.
-Two maximal requests at once, where real DoH queries are a few hundred bytes. A stream that would take the connection past it is refused with
-REFUSED_STREAM, which a client may retry (RFC 9113 8.7).
+Two maximal requests at once, where real DoH queries are a few hundred bytes. A
+stream that would take the connection past it is refused with REFUSED_STREAM,
+which a client may retry (RFC 9113 8.7).
 */
 MAX_CONN_REQUEST :: 2 * (MAX_BODY + MAX_HEADER_LIST)
 

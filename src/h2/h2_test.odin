@@ -332,17 +332,27 @@ test_parked_bodies_are_bounded_per_connection :: proc(t: ^testing.T) {
 	c := make_conn(IO{user = &log, read = no_read, write = request_log_write}, ignore_request, nil, allocator)
 
 	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
-	body := make([]u8, MAX_BODY, context.temp_allocator)
+	// In frames of the size a peer may send by default, so each body grows its
+	// buffer the way a real one does.
+	frame := make([]u8, DEFAULT_MAX_FRAME, context.temp_allocator)
 	for n in 0 ..< MAX_CONCURRENT {
 		id := u32(2 * n + 1)
 		handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block)
-		ok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = id}, body)
-		testing.expect(t, ok, "handle_data failed")
+		for _ in 0 ..< MAX_BODY / DEFAULT_MAX_FRAME {
+			// A peer stops sending on a stream once it is refused.
+			if _, open := c.streams[id]; !open {
+				break
+			}
+			ok := handle_data(c, Frame_Header{length = len(frame), type = .Data, stream_id = id}, frame)
+			testing.expect(t, ok, "handle_data failed")
+		}
 	}
 
 	held := 0
 	for _, s in c.streams {
-		held += len(s.body)
+		// What is allocated, not what is used: a buffer grown by doubling holds
+		// more than its length.
+		held += cap(s.body)
 		// A parked stream's decoded header block is not held beside its body.
 		testing.expect_value(t, cap(s.header_block), 0)
 	}
@@ -400,7 +410,7 @@ test_parked_fields_are_bounded_per_connection :: proc(t: ^testing.T) {
 	for _, s in c.streams {
 		held += cap(s.header_block)
 		if s.pending != nil {
-			held += len(s.pending.path) + len(s.pending.method) + len(s.pending.authority) + len(s.pending.scheme)
+			held += len(s.pending.path) + len(s.pending.method) + len(s.pending.authority) + len(s.pending.scheme) + len(s.pending.content_type) + len(s.pending.accept)
 		}
 	}
 	testing.expectf(t, held <= MAX_CONN_REQUEST, "one connection holds %d bytes of parked fields, over %d", held, MAX_CONN_REQUEST)
@@ -438,7 +448,9 @@ test_answered_request_gives_its_charge_back :: proc(t: ^testing.T) {
 	ok := handle_data(c, Frame_Header{length = len(body), type = .Data, flags = FLAG_END_STREAM, stream_id = 1}, body)
 	testing.expect(t, ok, "handle_data failed")
 	testing.expect(t, c.request_bytes > MAX_BODY, "a dispatched request is no longer charged")
-	if s, found := c.streams[1]; found {
+	s, found := c.streams[1]
+	testing.expect(t, found, "the dispatched stream was retired before it was answered")
+	if found {
 		testing.expect(t, cap(s.body) == 0, "the stream still holds a body it handed over")
 	}
 
