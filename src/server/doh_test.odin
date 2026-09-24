@@ -1670,3 +1670,94 @@ test_doh_reader_gives_up_on_a_drip_fed_request :: proc(t: ^testing.T) {
 		DOH_DRIP_INTERVAL,
 	)
 }
+
+@(private = "file")
+Wrong_Path_Peer :: struct {
+	socket: net.TCP_Socket,
+	stop:   bool,
+}
+
+// Asks for a path this server does not serve every 40ms - well inside the idle
+// wait the case below sets - until told to stop or the server hangs up.
+@(private = "file")
+ask_the_wrong_path :: proc(p: ^Wrong_Path_Peer) {
+	request := transmute([]u8)string("GET /not-served HTTP/1.1\r\nHost: dns.example\r\n\r\n")
+	for !sync.atomic_load(&p.stop) {
+		n, err := net.send_tcp(p.socket, request)
+		if err != nil || n <= 0 {
+			return
+		}
+		time.sleep(40 * time.Millisecond)
+	}
+}
+
+/*
+A connection that never asks a question is not kept for as long as it likes (#344).
+
+A 404 honours the client's keep-alive and is charged to nothing, since the budget
+is denominated in questions. So a peer asking for the wrong path once inside every
+idle wait held a connection, a thread and one of `max_connections` forever, and
+the rate limiter never saw it. It is let go once twice `client_timeout` passes
+with no question asked - see `doh_question_overdue`.
+
+The peer here keeps asking for three seconds; the server must hang up long before
+that, rather than when the peer stops.
+*/
+@(test)
+test_doh_lets_go_of_a_connection_that_asks_nothing :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the bound port: %v", berr)
+		return
+	}
+	client, derr := net.dial_tcp_from_endpoint(bound)
+	if derr != nil {
+		testing.expectf(t, false, "cannot dial the listener: %v", derr)
+		return
+	}
+	defer net.close(client)
+	accepted, _, aerr := net.accept_tcp(listener)
+	if aerr != nil {
+		testing.expectf(t, false, "nothing connected: %v", aerr)
+		return
+	}
+	defer net.close(accepted)
+
+	peer := Wrong_Path_Peer {
+		socket = client,
+	}
+	asker := thread.create_and_start_with_poly_data(&peer, ask_the_wrong_path)
+	// Only there to end the case when the server never hangs up, which is the bug.
+	stopper := thread.create_and_start_with_poly_data(&peer, proc(p: ^Wrong_Path_Peer) {
+		start := time.tick_now()
+		for !sync.atomic_load(&p.stop) && time.tick_since(start) < 3 * time.Second {
+			time.sleep(10 * time.Millisecond)
+		}
+		sync.atomic_store(&p.stop, true)
+		net.shutdown(p.socket, .Both)
+	})
+
+	cfg := config.default_config()
+	cfg.server.client_timeout = 150 * time.Millisecond
+	s := Server {
+		cfg = &cfg,
+	}
+	start := time.tick_now()
+	serve_doh(&s, Conn{socket = accepted}, "test")
+	held := time.tick_since(start)
+
+	sync.atomic_store(&peer.stop, true)
+	thread.join(asker)
+	thread.destroy(asker)
+	thread.join(stopper)
+	thread.destroy(stopper)
+
+	testing.expectf(t, held < time.Second, "a connection that asked nothing was held for %v", held)
+	free_all(context.temp_allocator)
+}

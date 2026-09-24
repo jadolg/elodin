@@ -143,6 +143,8 @@ Result :: struct {
 	dropped: u64,
 	// Requests that reached the pool, the job occupying it not counted.
 	queued:  int,
+	// Whether the request counted as a question for `doh_question_overdue`.
+	asked:   bool,
 }
 
 // Who the scripted peer is, for the rate limiter: a test that has to spend the
@@ -220,7 +222,12 @@ serve_one :: proc(
 	h2.conn_unref(hc)
 	pool.destroy(handler_pool)
 
-	return Result{output = script.output, dropped = sync.atomic_load(&s.stats.dropped), queued = queued}
+	return Result {
+		output = script.output,
+		dropped = sync.atomic_load(&s.stats.dropped),
+		queued = queued,
+		asked = ctx.last_question != (time.Tick{}),
+	}
 }
 
 /*
@@ -480,4 +487,70 @@ test_doh2_rate_limit_charges_only_well_formed_queries :: proc(t: ^testing.T) {
 
 	limited, _, _ := rate_limit_stats(limiter)
 	testing.expect_value(t, limited, u64(0))
+}
+
+/*
+A connection that has asked nothing for too long gets no further frame read (#344).
+
+`h2_begin` is where every frame starts, so it is where the bound is applied: the
+budget it hands the read is already spent, which is what ends `h2.serve`. Before,
+each frame got a fresh budget whatever came before it, and a peer completing a
+SETTINGS or a PING inside every idle wait held its connection forever while
+nothing charged it.
+*/
+@(test)
+test_doh2_stops_reading_a_connection_that_asks_nothing :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	cfg.server.client_timeout = 100 * time.Millisecond
+	s := Server {
+		cfg = &cfg,
+	}
+
+	ctx := H2_Context {
+		server        = &s,
+		last_question = time.tick_add(time.tick_now(), -time.Second),
+	}
+	h2_begin(&ctx)
+	testing.expect(
+		t,
+		ctx.budget.deadline != (time.Tick{}) && time.tick_diff(time.tick_now(), ctx.budget.deadline) <= 0,
+		"a frame was given time on a connection that has asked nothing for ten client_timeouts",
+	)
+
+	// And a connection that has just asked is read as before: the idle wait,
+	// and no deadline until the frame's first byte starts one.
+	ctx.last_question = time.tick_now()
+	h2_begin(&ctx)
+	testing.expect_value(t, ctx.budget.idle, cfg.server.client_timeout)
+	testing.expect_value(t, ctx.budget.deadline, time.Tick{})
+}
+
+/*
+Only a question keeps an h2 connection, where the limiter can charge for one.
+
+A request for another path costs the peer nothing - see
+`test_doh2_rate_limit_charges_only_queries` - so it must not buy more time on the
+connection either, or the 404 is the free way to hold one.
+*/
+@(test)
+test_doh2_only_a_question_keeps_the_connection :: proc(t: ^testing.T) {
+	// See the note in the first test.
+	context.allocator = runtime.heap_allocator()
+
+	cfg := config.default_config()
+	cfg.listeners.doh.path = "/dns-query"
+	cfg.server.max_pending = 8
+	cfg.cache.enabled = false
+	cfg.blocking.enabled = false
+
+	limiter := make_rate_limiter(100, 0)
+	defer destroy_rate_limiter(limiter)
+
+	scanned := serve_one(&cfg, "/not-the-endpoint", "not found", occupy = false, limiter = limiter)
+	defer delete(scanned.output)
+	testing.expect(t, !scanned.asked, "a request for another path counted as a question")
+
+	queried := serve_one(&cfg, "/dns-query?dns=AAAAAAAAAAAAAAAA", "", occupy = false, limiter = limiter)
+	defer delete(queried.output)
+	testing.expect(t, queried.asked, "a query did not count as a question")
 }

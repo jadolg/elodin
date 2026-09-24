@@ -30,14 +30,14 @@ joining a backlog it would sit out. See `h2_handler`.
 
 @(private)
 H2_Context :: struct {
-	server: ^Server,
-	conn:   ^tlsx.Conn,
-	client: string,
+	server:        ^Server,
+	conn:          ^tlsx.Conn,
+	client:        string,
 	// The endpoint `client` was formatted from, which is what the rate limiter
 	// needs: a prefix cannot be hashed back out of the printed form. See `Conn`,
 	// where the other stream transports carry the same thing.
-	peer:   net.Endpoint,
-	path:   string,
+	peer:          net.Endpoint,
+	path:          string,
 	/*
 	What the frame being read may take, reset by `h2_begin` where each one starts.
 
@@ -49,30 +49,16 @@ H2_Context :: struct {
 	never waited out at all, which before any stream exists - over the preface, or
 	a frame header - held a connection and a thread with no request ever made.
 
-	It is what one frame may take and not what one connection may, and those come
-	apart here. A peer that keeps completing frames keeps its connection, as a
-	client that keeps completing DNS messages keeps its own - but a DNS message is
-	charged to `stream_rate_check` and a frame is not: `h2_charged` bills the
-	limiter for requests, and SETTINGS, PING and an unknown type are none of them
-	one. A peer sending the first byte of a frame header late in the idle wait and
-	the other eight inside the deadline that byte starts completes nine bytes per
-	two `client_timeout`s, forever, and holds a connection, a thread and one of
-	`max_connections` while nothing bills it.
-
-	Both HTTP endpoints have that gap rather than this one alone: over HTTP/1.1
-	`serve_doh_request` answers a request for another path 404 and honours the
-	client's keep-alive, and `stream_rate_check` is below that return, so a peer
-	asking for the wrong path once per `client_timeout` holds a connection for
-	nothing too. Only the length-prefixed transports charge everything they keep a
-	connection for.
-
-	So it is a bound on how long a connection may live with no request on it, which
-	is a policy every transport wants one answer to and a browser holding an idle
-	DoH connection for minutes is the reason it is not an obvious one. Not this
-	budget's to decide; what this budget ends is the trickle inside a frame, which
-	is the defect it was written for.
+	It is what one frame may take and not what one connection may. A peer that
+	keeps completing frames would keep its connection, and a frame is not charged
+	to `stream_rate_check` the way a DNS message is: SETTINGS, PING and an unknown
+	type are no request at all. How long a connection may go without asking a
+	question is `last_question`'s bound, and `doh_question_overdue` says why.
 	*/
-	budget: Read_Budget,
+	budget:        Read_Budget,
+	// When this connection last asked a question - or opened, before it has - for
+	// `doh_question_overdue`. Only the reader thread touches it.
+	last_question: time.Tick,
 }
 
 @(private)
@@ -98,8 +84,14 @@ H2_Job :: struct {
 @(private)
 h2_begin :: proc(user: rawptr) {
 	ctx := cast(^H2_Context)user
+	now := time.tick_now()
 	ctx.budget = Read_Budget {
 		idle = ctx.server.cfg.server.client_timeout,
+	}
+	// A deadline that has already passed is a budget with nothing left, so the
+	// read this begins fails and `h2.serve` ends the connection.
+	if doh_question_overdue(ctx.server, ctx.last_question, now) {
+		ctx.budget.deadline = now
 	}
 }
 
@@ -119,11 +111,12 @@ h2_write :: proc(user: rawptr, buf: []u8) -> bool {
 @(private)
 serve_doh2 :: proc(s: ^Server, conn: ^tlsx.Conn, client: string, peer: net.Endpoint) {
 	ctx := H2_Context {
-		server = s,
-		conn   = conn,
-		client = client,
-		peer   = peer,
-		path   = s.cfg.listeners.doh.path,
+		server        = s,
+		conn          = conn,
+		client        = client,
+		peer          = peer,
+		path          = s.cfg.listeners.doh.path,
+		last_question = time.tick_now(),
 	}
 
 	io := h2.IO {
@@ -166,9 +159,19 @@ h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	base64 decode per request, on the connection's reader thread, for an answer
 	nothing then reads.
 	*/
+	/*
+	A question is also what keeps the connection - see `doh_question_overdue` -
+	and with no limiter every request counts as one. Nothing is charged for
+	anything then, so a 404 holds a connection no more cheaply than a query does,
+	and telling them apart would be the base64 decode the note above avoids.
+	*/
+	asked := ctx.server.limiter == nil || h2_charged(ctx, req)
+	if asked {
+		ctx.last_question = time.tick_now()
+	}
 	if ctx.server.limiter != nil &&
-	   h2_charged(ctx, req) &&
-	   !stream_rate_check(ctx.server.limiter, ctx.peer, time.tick_now()) {
+	   asked &&
+	   !stream_rate_check(ctx.server.limiter, ctx.peer, ctx.last_question) {
 		h2_rate_limited(ctx, hc, req)
 		return
 	}

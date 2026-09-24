@@ -493,7 +493,12 @@ serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 	}
 	defer delete(r.buf)
 
+	last_question := time.tick_now()
 	for {
+		if doh_question_overdue(s, last_question, time.tick_now()) {
+			free_all(context.temp_allocator)
+			return
+		}
 		// Per request, so a connection kept alive between requests waits the whole
 		// of `client_timeout` for the next one to start and the request that then
 		// starts gets the whole of it too.
@@ -523,7 +528,7 @@ serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 		http_compact(&r)
 
 		keep_alive := req.keep_alive
-		handled := serve_doh_request(s, conn, req, path, client)
+		handled := serve_doh_request(s, conn, req, path, client, &last_question)
 		free_all(context.temp_allocator)
 		if !handled || !keep_alive {
 			return
@@ -531,8 +536,53 @@ serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 	}
 }
 
+/*
+Whether a DoH connection, over either HTTP version, has gone too long without
+asking a question to be kept any longer (#344).
+
+The per-message budget bounds how long one request or one frame may take, and not
+how long a connection may live, and over HTTP those come apart. A request for
+another path is answered 404 and keeps its connection, and an h2 SETTINGS or PING
+is read and the loop goes round again - and none of them is charged to
+`stream_rate_check`, which bills questions. A peer sending one inside every idle
+wait held a connection, a thread and one of `max_connections` forever for nothing.
+The length-prefixed transports never had the gap: a TCP or DoT client keeps its
+connection only by completing DNS messages, and every one is charged.
+
+So this is that rule, put in terms HTTP can keep: a connection must ask a question
+- the thing the limiter charges - within twice `client_timeout`, or it is let go.
+Twice because that is the longest a TCP client may go between messages it is
+charged for: the idle wait for the next one to start, and the deadline that start
+begins. A browser asking questions is never near it, and one holding an idle DoH
+connection with nothing on it is closed by the idle wait long before it, as it
+always was. What it ends is a connection kept alive only by requests that cost the
+peer nothing.
+
+Checked where each request or frame is about to be read, so a connection is held
+past the figure by at most the one read it was waiting on - which the per-message
+budget bounds - and never indefinitely.
+
+A non-positive `client_timeout` is no idle wait at all, which is an operator
+choosing to keep connections for as long as they last, and this does not second
+guess it.
+*/
 @(private)
-serve_doh_request :: proc(s: ^Server, conn: Conn, req: Http_Request_In, path: string, client: string) -> bool {
+doh_question_overdue :: proc(s: ^Server, last_question: time.Tick, now: time.Tick) -> bool {
+	limit := s.cfg.server.client_timeout
+	return limit > 0 && time.tick_diff(last_question, now) > 2 * limit
+}
+
+@(private)
+serve_doh_request :: proc(
+	s: ^Server,
+	conn: Conn,
+	req: Http_Request_In,
+	path: string,
+	client: string,
+	// Set where the request is charged, which is what makes it a question. See
+	// `doh_question_overdue`.
+	last_question: ^time.Tick,
+) -> bool {
 	mc_path := s.cfg.listeners.doh.mobileconfig_path
 	if mc_path != "" && req.path == mc_path {
 		return serve_doh_mobileconfig(s, conn, req)
@@ -611,7 +661,8 @@ serve_doh_request :: proc(s: ^Server, conn: Conn, req: Http_Request_In, path: st
 	`client_timeout` between requests and by `max_connections` across them. A
 	flooder occupies the same one slot either way.
 	*/
-	if !stream_rate_check(s.limiter, conn.peer, time.tick_now()) {
+	last_question^ = time.tick_now()
+	if !stream_rate_check(s.limiter, conn.peer, last_question^) {
 		report_rate_limited(client, .DoH, !req.keep_alive)
 		return send_http_error(conn, "doh", 429, "too many requests", req.keep_alive)
 	}
