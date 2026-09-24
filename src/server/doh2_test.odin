@@ -145,6 +145,8 @@ Result :: struct {
 	queued:  int,
 	// Whether the request counted as a question for `doh_question_overdue`.
 	asked:   bool,
+	// Questions still counted as awaiting an answer once every handler is done.
+	pending: int,
 }
 
 // Who the scripted peer is, for the rate limiter: a test that has to spend the
@@ -227,6 +229,7 @@ serve_one :: proc(
 		dropped = sync.atomic_load(&s.stats.dropped),
 		queued = queued,
 		asked = ctx.last_question != (time.Tick{}),
+		pending = ctx.pending,
 	}
 }
 
@@ -523,6 +526,13 @@ test_doh2_stops_reading_a_connection_that_asks_nothing :: proc(t: ^testing.T) {
 	h2_begin(&ctx)
 	testing.expect_value(t, ctx.budget.idle, cfg.server.client_timeout)
 	testing.expect_value(t, ctx.budget.deadline, time.Tick{})
+
+	// Nor is one waiting on an answer, however long ago it asked: a slow
+	// upstream is not the connection asking nothing.
+	ctx.last_question = time.tick_add(time.tick_now(), -time.Second)
+	ctx.pending = 1
+	h2_begin(&ctx)
+	testing.expect_value(t, ctx.budget.deadline, time.Tick{})
 }
 
 /*
@@ -553,4 +563,6 @@ test_doh2_only_a_question_keeps_the_connection :: proc(t: ^testing.T) {
 	queried := serve_one(&cfg, "/dns-query?dns=AAAAAAAAAAAAAAAA", "", occupy = false, limiter = limiter)
 	defer delete(queried.output)
 	testing.expect(t, queried.asked, "a query did not count as a question")
+	// Left counted, the connection could never again be let go.
+	testing.expect_value(t, queried.pending, 0)
 }

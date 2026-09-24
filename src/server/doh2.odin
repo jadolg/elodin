@@ -56,9 +56,16 @@ H2_Context :: struct {
 	question is `last_question`'s bound, and `doh_question_overdue` says why.
 	*/
 	budget:        Read_Budget,
-	// When this connection last asked a question - or opened, before it has - for
-	// `doh_question_overdue`. Only the reader thread touches it.
+	/*
+	When this connection last asked a question or had one answered - or opened,
+	before it has - for `doh_question_overdue`. Stamped once more when the answer
+	is written, as over HTTP/1.1: the time a question takes is not time the
+	connection asked nothing. A pool worker writes it too, hence atomic.
+	*/
 	last_question: time.Tick,
+	// Questions handed to the pool and not yet answered. A connection waiting on
+	// one is not asking nothing, however slow the upstream.
+	pending:       int,
 }
 
 @(private)
@@ -76,6 +83,8 @@ H2_Job :: struct {
 	`handle_query`'s `shared_worker`.
 	*/
 	on_pool:   bool,
+	// Counted in `H2_Context.pending`, and stamps `last_question` once answered.
+	asked:     bool,
 }
 
 // Called by `h2.read_exact` where the preface, a frame header or a frame payload
@@ -90,7 +99,9 @@ h2_begin :: proc(user: rawptr) {
 	}
 	// A deadline that has already passed is a budget with nothing left, so the
 	// read this begins fails and `h2.serve` ends the connection.
-	if doh_question_overdue(ctx.server, ctx.last_question, now) {
+	// `pending` first: the worker stamps before it lets go of it.
+	if sync.atomic_load(&ctx.pending) == 0 &&
+	   doh_question_overdue(ctx.server, {sync.atomic_load(&ctx.last_question._nsec)}, now) {
 		ctx.budget.deadline = now
 	}
 }
@@ -165,13 +176,12 @@ h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	anything then, so a 404 holds a connection no more cheaply than a query does,
 	and telling them apart would be the base64 decode the note above avoids.
 	*/
+	now := time.tick_now()
 	asked := ctx.server.limiter == nil || h2_charged(ctx, req)
 	if asked {
-		ctx.last_question = time.tick_now()
+		sync.atomic_store(&ctx.last_question._nsec, now._nsec)
 	}
-	if ctx.server.limiter != nil &&
-	   asked &&
-	   !stream_rate_check(ctx.server.limiter, ctx.peer, ctx.last_question) {
+	if ctx.server.limiter != nil && asked && !stream_rate_check(ctx.server.limiter, ctx.peer, now) {
 		h2_rate_limited(ctx, hc, req)
 		return
 	}
@@ -183,6 +193,10 @@ h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	// Cleared again in the `.Stopped` arm below, which is the one path that
 	// answers without a pool worker.
 	job.on_pool = true
+	job.asked = asked
+	if asked {
+		sync.atomic_add(&ctx.pending, 1)
+	}
 
 	// The job outlives this call, so it needs its own reference; the pool may
 	// still be running it after the reader thread has gone.
@@ -209,6 +223,9 @@ h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	) {
 	case .Accepted:
 	case .Full:
+		if asked {
+			sync.atomic_sub(&ctx.pending, 1)
+		}
 		h2.conn_unref(hc)
 		free(job)
 		h2_shed(ctx, hc, req)
@@ -327,6 +344,11 @@ h2_answer :: proc(data: rawptr) {
 	req := job.req
 	ctx := job.ctx
 	defer {
+		// Before the reference goes: `ctx` lives only as long as the connection.
+		if job.asked {
+			sync.atomic_store(&ctx.last_question._nsec, time.tick_now()._nsec)
+			sync.atomic_sub(&ctx.pending, 1)
+		}
 		h2.request_destroy(hc, req)
 		h2.conn_unref(hc)
 		free(job)
