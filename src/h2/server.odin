@@ -146,6 +146,8 @@ Conn :: struct {
 	tolerance on - into an unbounded run of extra writes; see `handle_data`.
 	*/
 	closed_stream_rst_budget: int,
+	// Request body bytes held by this connection's streams; see MAX_CONN_BODY.
+	body_bytes:               int,
 
 	allocator:           mem.Allocator,
 	// Scratch for a header block spanning CONTINUATION frames.
@@ -207,6 +209,7 @@ stream_destroy :: proc(c: ^Conn, s: ^Stream) {
 	// by whoever answered it.
 	request_destroy(c, s.pending)
 	delete(s.header_block)
+	c.body_bytes -= len(s.body)
 	delete(s.body)
 	free(s, c.allocator)
 }
@@ -987,10 +990,13 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	}
 	if found && !already_ended {
 		// Checked before appending, so an oversized body is refused rather than
-		// buffered first.
-		if len(s.body) + len(data) > MAX_BODY {
+		// buffered first. Over the connection's share rather than the stream's,
+		// nothing of it reached a handler, so the client may retry it (RFC 9113
+		// 8.7).
+		oversized := len(s.body) + len(data) > MAX_BODY
+		if oversized || c.body_bytes + len(data) > MAX_CONN_BODY {
 			sync.mutex_unlock(&c.mu)
-			sent := rst_stream(c, h.stream_id, .Enhance_Your_Calm)
+			sent := rst_stream(c, h.stream_id, oversized ? .Enhance_Your_Calm : .Refused_Stream)
 			// The stream is over. Without this it would hold its body, its parked
 			// request and one of MAX_CONCURRENT slots until the connection went.
 			close_stream(c, h.stream_id)
@@ -1004,6 +1010,7 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 			return sent && give_connection_credit(c, len(payload))
 		}
 		append(&s.body, ..data)
+		c.body_bytes += len(data)
 	}
 	sync.mutex_unlock(&c.mu)
 
@@ -1102,6 +1109,18 @@ request_destroy :: proc(c: ^Conn, req: ^Request) {
 }
 
 MAX_BODY :: 64 * 1024
+/*
+Request body bytes one connection may hold across all its streams at once.
+
+MAX_BODY alone bounds a stream, not a connection: credit goes straight back on
+every DATA frame, and receive windows are not enforced against a peer anyway, so
+MAX_CONCURRENT streams each parked at MAX_BODY pinned 8 MiB a connection
+(#303). Charged as bytes are buffered and released only when the stream is
+destroyed, so a body handed to a handler still counts until it is answered.
+Twice MAX_BODY: two maximal DoH queries at once, where real ones are a few
+hundred bytes.
+*/
+MAX_CONN_BODY :: 2 * MAX_BODY
 
 // Hand back connection-level receive window for bytes that have been read off
 // the wire, whatever became of the stream they belonged to.

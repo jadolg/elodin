@@ -315,6 +315,61 @@ test_oversized_body_drops_the_stream :: proc(t: ^testing.T) {
 }
 
 /*
+#303: MAX_BODY bounded a stream, not a connection. Every stream opened up to
+MAX_CONCURRENT and parked at MAX_BODY without END_STREAM, the credit for
+each frame handed straight back, and one connection held 8 MiB of bodies. Counted
+from the streams themselves rather than from `body_bytes`, so the test measures
+what is held and not the bookkeeping that is meant to bound it.
+*/
+@(test)
+test_parked_bodies_are_bounded_per_connection :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 1024, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	body := make([]u8, MAX_BODY, context.temp_allocator)
+	for n in 0 ..< MAX_CONCURRENT {
+		id := u32(2 * n + 1)
+		handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block)
+		ok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = id}, body)
+		testing.expect(t, ok, "handle_data failed")
+	}
+
+	held := 0
+	for _, s in c.streams {
+		held += len(s.body)
+	}
+	testing.expectf(t, held <= MAX_CONN_BODY, "one connection holds %d body bytes, over %d", held, MAX_CONN_BODY)
+
+	// Refused as safe to retry, since none of them reached a handler.
+	refused := 0
+	for f in log.frames {
+		if f.type == .Rst_Stream {
+			refused += 1
+		}
+	}
+	testing.expect_value(t, refused, MAX_CONCURRENT - MAX_CONN_BODY / MAX_BODY)
+
+	// Released with the streams, or the connection is starved for good.
+	for id in 0 ..< 2 * MAX_CONCURRENT {
+		close_stream(c, u32(id))
+	}
+	testing.expect_value(t, c.body_bytes, 0)
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "parked bodies")
+}
+
+/*
 RFC 9113 6.1: DATA is only ever sent on a stream, never on the connection
 control stream, so one arriving with stream_id 0 is a connection error of
 type PROTOCOL_ERROR. `handle_headers` already checks this; `handle_data` did
