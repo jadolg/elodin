@@ -1362,10 +1362,7 @@ resolve_query :: proc(
 				checked = generation,
 			}
 			if !hit.stale {
-				if ede != nil {
-					ede^ = stored.ede
-				}
-				return serve_from_cache(s, stored, query, msg, q, proto, client, limit, validating, started, spent, allocator)
+				return serve_from_cache(s, stored, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
 			}
 			stale_hit = stored
 		}
@@ -1396,10 +1393,7 @@ resolve_query :: proc(
 	*/
 	if !msg.flags.rd {
 		if stale_hit.wire != nil {
-			if ede != nil {
-				ede^ = stale_hit.ede
-			}
-			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, spent, allocator)
+			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
 		}
 		out, built := dns.error_response(query, msg, .Refused, allocator, limit)
 		log_query(s, client, proto, q, .Refused, "rd", started)
@@ -1495,8 +1489,11 @@ resolve_query :: proc(
 	   s.handler_pool != nil {
 		if r := start_refresh(s, key, query, proto, client, limit, started); r != nil {
 			defer refresh_release(r)
-			if out, refreshed, taken := refresh_take(r, s.cfg.cache.stale_timeout, allocator);
+			if out, refreshed, code, taken := refresh_take(r, s.cfg.cache.stale_timeout, allocator);
 			   taken {
+				if ede != nil {
+					ede^ = code
+				}
 				return out, refreshed, true
 			}
 		}
@@ -1513,6 +1510,7 @@ resolve_query :: proc(
 			started,
 			spent,
 			allocator,
+			ede,
 		)
 	}
 
@@ -2166,10 +2164,7 @@ resolve_query :: proc(
 			return out, .Failed, built
 		}
 		if stale_hit.wire != nil {
-			if ede != nil {
-				ede^ = stale_hit.ede
-			}
-			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, spent, allocator)
+			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
 		}
 		sync.atomic_add(&s.stats.failed, 1)
 		out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
@@ -3141,6 +3136,8 @@ serve_from_cache :: proc(
 	// `dns.REQUEST_DECODE_BUDGET`.
 	spent: ^int,
 	allocator: mem.Allocator,
+	// Where the entry's extended error is handed back; see `resolve_query`.
+	ede: ^u16 = nil,
 ) -> (
 	response: []u8,
 	outcome: Outcome,
@@ -3278,6 +3275,11 @@ serve_from_cache :: proc(
 	// The stored answer carries the verdict; whether this client gets to hear it
 	// is a separate question.
 	settle_ad_bit(wire, msg, validating)
+	// And the extended error that goes with the verdict, under the same
+	// condition: one reached while validating is not this request's to repeat.
+	if ede != nil && validating {
+		ede^ = hit.ede
+	}
 	if hit.stale {
 		cache.note_stale_served(s.answers)
 	}

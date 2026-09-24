@@ -10,6 +10,7 @@ import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:dnssec"
+import "elodin:pool"
 import "elodin:upstream"
 
 /*
@@ -85,6 +86,8 @@ C_FIXTURES := []C_Fixture {
 Ceiling_Mock :: struct {
 	socket: net.UDP_Socket,
 	stop:   bool,
+	// Reads queries and answers none, for the upstream being down.
+	silent: bool,
 }
 
 @(private = "file")
@@ -96,7 +99,7 @@ ceiling_mock_serve :: proc(m: ^Ceiling_Mock) {
 			continue
 		}
 		query, derr := dns.decode_message(buf[:n], context.temp_allocator)
-		if derr != .None || len(query.question) != 1 {
+		if derr != .None || len(query.question) != 1 || sync.atomic_load(&m.silent) {
 			continue
 		}
 		for f in C_FIXTURES {
@@ -173,7 +176,7 @@ test_an_answer_insecure_over_the_iteration_ceiling_carries_ede_27 :: proc(t: ^te
 	defer upstream.destroy_group(g)
 	// A negative TTL to fall back on: the fixture's NXDOMAIN carries no SOA, and
 	// without one it would not be kept at all.
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, negative_ttl = 300})
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, negative_ttl = 300, serve_stale = true})
 	defer cache.destroy(answers)
 	s := Server {
 		cfg     = &cfg,
@@ -218,6 +221,41 @@ test_an_answer_insecure_over_the_iteration_ceiling_carries_ede_27 :: proc(t: ^te
 	testing.expect_value(t, again, Outcome.Cached)
 	code, found = ceiling_ede_of(t, second)
 	testing.expect(t, found, "the cached answer lost its extended error")
+	testing.expect_value(t, code, u16(EDE_UNSUPPORTED_NSEC3_ITERATIONS))
+
+	/*
+	And once the entry has expired, through both ways `cache.stale_timeout`
+	answers: the refresh arriving in time, and the expired bytes when it does
+	not. Declared last so it is torn down first: `pool.destroy` joins a refresh
+	still waiting on the silent upstream.
+	*/
+	cfg.cache.serve_stale = true
+	cfg.cache.stale_timeout = 2 * time.Second
+	workers := pool.make_pool(2)
+	defer pool.destroy(workers)
+	s.handler_pool = workers
+	expire :: proc(answers: ^cache.Cache) {
+		for _, e in answers.entries {
+			e.expires = time.time_add(time.now(), -1 * time.Second)
+		}
+	}
+
+	expire(answers)
+	refreshed, refreshed_outcome, served_refresh := handle_query(&s, wire, .UDP, "test", context.temp_allocator)
+	testing.expect(t, served_refresh, "no response for the refreshed query")
+	testing.expect_value(t, refreshed_outcome, Outcome.Forwarded)
+	code, found = ceiling_ede_of(t, refreshed)
+	testing.expect(t, found, "the refreshed answer lost its extended error")
+	testing.expect_value(t, code, u16(EDE_UNSUPPORTED_NSEC3_ITERATIONS))
+
+	expire(answers)
+	sync.atomic_store(&mock.silent, true)
+	cfg.cache.stale_timeout = 100 * time.Millisecond
+	stale, stale_outcome, served_stale := handle_query(&s, wire, .UDP, "test", context.temp_allocator)
+	testing.expect(t, served_stale, "no response for the stale query")
+	testing.expect_value(t, stale_outcome, Outcome.Cached)
+	code, found = ceiling_ede_of(t, stale)
+	testing.expect(t, found, "the stale answer lost its extended error")
 	testing.expect_value(t, code, u16(EDE_UNSUPPORTED_NSEC3_ITERATIONS))
 }
 

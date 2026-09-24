@@ -247,7 +247,10 @@ publishing one.
 A budget built without the ceiling (`max_iterations` of zero, which
 `make_validator` never hands out) refuses every record asking for any
 iterations. `query_budget` counts on that failing closed, so such a budget is
-never read as all over the ceiling.
+never read as all over the ceiling. Zero only: a negative ceiling, which only a
+test sets, is one below every record, and reading it as such is what lets
+`test_a_wildcard_proof_past_the_ceiling_is_refused` put a zero-iteration zone
+past it.
 
 What it leaves open is the price of the verdict, and it is not small. Nothing
 in a set past the ceiling is hashed, so nothing checks which names its records
@@ -269,7 +272,7 @@ before the ceiling is asked, so it cannot make a set refused.
 */
 @(private)
 nsec3_all_over_ceiling :: proc(nsecs: []Nsec_Rr, n3s: []Nsec3_Rr, budget: ^Nsec3_Budget) -> bool {
-	if len(nsecs) > 0 || budget.max_iterations <= 0 {
+	if len(nsecs) > 0 || budget.max_iterations == 0 {
 		return false
 	}
 	refused := false
