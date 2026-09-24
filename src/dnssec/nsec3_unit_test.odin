@@ -214,8 +214,11 @@ test_nsec3_iteration_ceiling_refuses_the_hash :: proc(t: ^testing.T) {
 	/*
 	The iteration count is the zone's to choose and the work is ours, so an
 	absurd one is a denial-of-service lever. Refusing to compute the hash makes
-	every proof built on that record fail, which downgrades the answer to
-	insecure rather than letting it through - and never spends the CPU.
+	every proof built on that record fail, and never spends the CPU. What the
+	answer becomes is the caller's to say: a denial with nothing readable in it
+	is insecure (`nsec3_all_over_ceiling`), and one with readable records beside
+	the refused ones is decided by those. Issue #331 found this comment claiming
+	the first while the code said `Bogus`.
 	*/
 	rr := n3(H_EXAMPLE, H_NS1, {.NS, .SOA}).rr
 	out: [20]u8
@@ -228,6 +231,7 @@ test_nsec3_iteration_ceiling_refuses_the_hash :: proc(t: ^testing.T) {
 		record.rr.iterations = 5000
 	}
 	testing.expect_value(t, nsec3_proves_name_error(zone, "nx.example.", "example.", budget_at(150)), Proof.Failed)
+	testing.expect(t, nsec3_all_over_ceiling(nil, zone, budget_at(150)), "and that is what makes the denial insecure")
 	free_all(context.temp_allocator)
 }
 
