@@ -1206,7 +1206,6 @@ def ipv6_reverse_name_error():
          message(qname, PTR, [], absent + [sign(absent, apex)], rcode=3), rcode=3)
 
 
-
 @scenario
 def nsec3_signed_cut_below_ceiling():
     """Cover a signed child under an empty non-terminal of a zone past the ceiling."""

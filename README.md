@@ -1008,18 +1008,19 @@ resolving rather than merely going unverified.
 
 `max_nsec3_iterations` is the most hashing a single NSEC3 record may ask for. A
 record above it is not computed. A denial made only of such records is insecure,
-so the NXDOMAIN or NODATA, or a wildcard answer resting on it, is served without
-the AD bit — what RFC 5155 section 10.3 asks and what Unbound, BIND and Knot do
-past their own ceilings. The zone's signed records still validate, and an
-unsigned answer inside it is still refused: this server cannot tell an unsigned
-delegation it could not read from a forgery, so a name below one comes back
-SERVFAIL with extended error 27, as it did before. Where readable records sit
-beside refused ones, as in a zone changing its parameters, the readable ones
-decide; if they prove nothing the name comes back SERVFAIL with extended error
-27, because the work this server declined may have held the proof. RFC 9276 asks
-zones for zero and the zones still publishing NSEC3 use single digits, so this
-is a guard against a zone that has picked a number nobody should, rather than a
-setting to tune.
+so the NXDOMAIN or NODATA is served without the AD bit — what RFC 5155 section
+10.3 asks and what Unbound, BIND and Knot do past their own ceilings. The zone's
+signed records still validate, and an unsigned answer inside it is still
+refused: this server cannot tell an unsigned delegation it could not read from a
+forgery, so a name below one comes back SERVFAIL with extended error 27, as it
+did before. The cost is that anyone on the path can make a name in such a zone
+look absent; what it cannot do is have a forged record served, a wildcard
+included, which stays SERVFAIL. Where readable records sit beside refused ones,
+as in a zone changing its parameters, the readable ones decide; if they prove
+nothing the name comes back SERVFAIL with extended error 27, because the work
+this server declined may have held the proof. RFC 9276 asks zones for zero and
+the zones still publishing NSEC3 use single digits, so this is a guard against a
+zone that has picked a number nobody should, rather than a setting to tune.
 
 `max_chain_walks` is how many chain-of-trust walks may be waiting on an upstream
 at once. Establishing the zone an answer was signed by means one DS lookup per

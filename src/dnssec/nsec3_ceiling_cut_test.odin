@@ -154,3 +154,41 @@ test_a_signed_cut_below_the_ceiling_is_judged_on_its_own_keys :: proc(t: ^testin
 	testing.expectf(t, forged.status == .Bogus, "a forgery below a signed cut is bogus, got %v (%q)", forged.status, forged.reason)
 	free_all(context.temp_allocator)
 }
+
+// The child's DNSKEY question answered with the parent's key set, which no DS
+// the parent signed for the child can match.
+@(private = "file")
+c3_wrong_child_keys :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
+	if type == .DNSKEY && dns.name_equal_fold(name, "s.e.c3test.") {
+		for f in C3_FIXTURES {
+			if f.key == "c3_dnskey" {
+				return decode_hex(f.wire, allocator)
+			}
+		}
+	}
+	return c3_query(ctx, name, type, allocator)
+}
+
+/*
+A signed cut below the ceiling step whose keys do not hold up is a broken
+chain, not the ceiling's doing.
+
+The parent signed the DS, so from that DS down the walk is reading a zone it
+established, and a key set that DS does not match is `Bogus` there - the same
+as it would be with no ceiling step above. Letting go of the flag only once the
+step succeeded left this reported as `Indeterminate` with extended error 27,
+telling whoever debugs a forged or broken key set to look at iteration counts.
+*/
+@(test)
+test_a_broken_signed_cut_below_the_ceiling_is_bogus :: proc(t: ^testing.T) {
+	anchor, parsed := parse_trust_anchor(C3_ANCHOR, context.temp_allocator)
+	testing.expect(t, parsed, "the anchor should parse")
+	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
+	anchors[0] = anchor
+
+	v := make_validator(c3_wrong_child_keys, nil, Options{anchors = anchors, max_nsec3_iterations = 5})
+	defer destroy_validator(v)
+	result := validate(v, "s.e.c3test.", .A, c3_wire("c3_answer"), time.unix(FIXTURE_TIME, 0))
+	testing.expectf(t, result.status == .Bogus, "a key set the signed DS does not match is bogus, got %v (%q)", result.status, result.reason)
+	free_all(context.temp_allocator)
+}

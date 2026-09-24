@@ -2913,14 +2913,17 @@ validate_wildcard_proof :: proc(
 	/*
 	As above: hashing we declined is not a cover we looked for and failed to
 	find, and what this counts is what this proof was refused rather than what
-	the question has spent. A proof with nothing readable in it is insecure, as
-	the denial path has it; otherwise both answers are SERVFAIL to the client,
-	and the difference is the extended error the answer carries and the reason
-	written beside it.
+	the question has spent. Both answers are SERVFAIL to the client, and the
+	difference is the extended error the answer carries and the reason written
+	beside it.
+
+	Not `Insecure` when nothing here was readable, unlike a denial past the
+	ceiling. A denial served unproven can make a name look absent; a wildcard
+	served unproven is a record the zone really signed, handed out for a name
+	that may have records of its own - `*.example.` answering for `www.example.`
+	on the word of any NSEC3 record the zone ever published, since nothing
+	checks which name it covers. That is a substitution, and it stays refused.
 	*/
-	if nsec3_all_over_ceiling(denial.nsecs, denial.nsec3s, &budget.nsec3) {
-		return .Insecure, nil, NSEC3_OVER_CEILING
-	}
 	if declined, why := nsec3_declined(&budget.nsec3, before); declined {
 		logx.debugf("dnssec: the wildcard proof for %s was not read to the end: %s", dns.name_trim_root(owner), why)
 		return .Indeterminate, nil, why
@@ -3564,6 +3567,10 @@ zone_step :: proc(
 			forget_skipped_non_cut(v, parent, child)
 			return .Bogus, nil
 		}
+		// A DS the parent signed, so whatever the walk kept keys past above
+		// here, what follows is judged against a zone it did read - a key set
+		// that fails it included. See `Budget.walk_past_ceiling`.
+		budget.walk_past_ceiling = false
 
 		set := make([dynamic]Ds, 0, len(ds_records), allocator)
 		usable := false

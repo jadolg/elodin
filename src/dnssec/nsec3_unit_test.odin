@@ -262,6 +262,14 @@ test_nsec3_unknown_hash_algorithm_is_refused :: proc(t: ^testing.T) {
 	append(&mixed, unknown)
 	_, matched := nsec3_matching(mixed[:], "a.example.", budget_at(A_ITERATIONS))
 	testing.expect(t, !matched, "a record naming an unknown hash must not borrow the digest of the one before it")
+
+	// Nor is it one the ceiling refused, so it cannot make a denial insecure:
+	// that reading is for the zone's iteration count, and the ceiling never
+	// looked at these. Issue #331.
+	for &record in zone {
+		record.rr.iterations = 5000
+	}
+	testing.expect(t, !nsec3_all_over_ceiling(nil, zone, budget_at(150)), "records ignored for their algorithm are not over the ceiling")
 	free_all(context.temp_allocator)
 }
 

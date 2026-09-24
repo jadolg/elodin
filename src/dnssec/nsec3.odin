@@ -241,29 +241,42 @@ readable record beside refused ones is a chain this server can check - a zone
 mid-rollover, or an old record replayed beside a current one - and letting a
 refused record decide would let anyone holding one signed record of an old,
 expensive chain turn a denial the readable chain contradicts into an insecure
-answer. Which leaves the one thing nobody can close: a sender replaying only
-the old chain, while its signatures last, gets its denials served insecure - a
-name made to look absent, though never a forged record served for one. And
-not only in that zone: the walk reads the same records to find the cuts below
-it, so a cold cache can be walked past a signed child's DS and the child's names
-made to look absent too. That needs a parent that published an iteration count
-nobody should, recently enough for its signatures to hold, and it is less than
-Unbound concedes for the same zone - there the child is read as unsigned and
-anything in it can be forged.
+answer.
 
-An NSEC record is readable too, so a denial carrying one is never this.
+What it leaves open is the price of the verdict, and it is not small. Nothing
+in a set past the ceiling is hashed, so nothing checks which names its records
+cover: any on-path sender holding any record of the zone's chain - current, or
+an old one replayed while its signatures last - can have any name in the zone
+served as absent, with a negative TTL off an SOA nobody verified. And not only
+in that zone: the walk reads the same records to find the cuts below it, so a
+cold cache can be walked past a signed child's DS and the child's names made to
+look absent too. What it never does is serve a forged record: signed data still
+verifies, an unsigned answer under such a step is refused, and a wildcard is
+not served on such a proof. That is less than Unbound concedes for the same
+zone, where the child is read as unsigned and anything in it can be forged -
+and it is what RFC 5155 section 10.3 asks of a zone that chose an iteration
+count nobody should.
+
+An NSEC record is readable too, so a denial carrying one is never this. A
+record naming a hash other than SHA-1 is neither: `nsec3_hash_with` ignores it
+before the ceiling is asked, so it cannot make a set refused.
 */
 @(private)
 nsec3_all_over_ceiling :: proc(nsecs: []Nsec_Rr, n3s: []Nsec3_Rr, budget: ^Nsec3_Budget) -> bool {
 	if len(nsecs) > 0 {
 		return false
 	}
+	refused := false
 	for n in n3s {
+		if n.rr.hash_algorithm != NSEC3_HASH_SHA1 {
+			continue
+		}
 		if int(n.rr.iterations) <= budget.max_iterations {
 			return false
 		}
+		refused = true
 	}
-	return len(n3s) > 0
+	return refused
 }
 
 // SHA-1 compresses 64-byte blocks and appends a one-byte pad and an eight-byte
