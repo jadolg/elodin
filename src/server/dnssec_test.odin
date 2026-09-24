@@ -722,6 +722,8 @@ Ad_Case :: struct {
 	name:      string,
 	validator: bool,
 	cd:        bool,
+	// The CD bit on the answer as the upstream sent it.
+	stored_cd: bool,
 }
 
 @(private = "file")
@@ -729,6 +731,7 @@ serve_cached_with_ad :: proc(t: ^testing.T, c: Ad_Case) -> (response: []u8, ok: 
 	// The answer as an upstream sent it, AD set. Nothing here established that.
 	stored := signed_response()
 	stored.flags.ad = true
+	stored.flags.cd = c.stored_cd
 	wire, _, enc := dns.encode_message(stored, context.temp_allocator)
 	testing.expect_value(t, enc, dns.Encode_Error.None)
 
@@ -985,4 +988,31 @@ test_unvalidated_answer_is_not_cached_with_ad :: proc(t: ^testing.T) {
 		)
 	}
 	free_all(context.temp_allocator)
+}
+
+/*
+CD comes back the way the client wrote it, whatever the upstream's copy says.
+
+RFC 4035 section 3.2.2 has a responder copy CD from the query, and the answer an
+upstream hands over is its echo of the question this server put - or not an
+echo at all: OpenDNS clears CD on every answer, so a client that set it behind
+that upstream was told checking had been left on. The validated path already
+put the client's bit back; an answer served without validating, which is every
+answer to a CD query, went out with the upstream's. Found by the live parity run
+against 208.67.222.222.
+*/
+@(test)
+test_cd_bit_echoes_the_client_not_the_upstream :: proc(t: ^testing.T) {
+	cases := []Ad_Case {
+		{name = "client set cd, upstream dropped it, no validator", validator = false, cd = true},
+		{name = "client set cd, upstream dropped it, validator on", validator = true, cd = true},
+		{name = "client left cd clear, upstream set it", validator = false, cd = false, stored_cd = true},
+	}
+	for c in cases {
+		out, ok := serve_cached_with_ad(t, c)
+		if !ok || len(out) < dns.HEADER_SIZE {
+			continue
+		}
+		testing.expectf(t, (out[3] & 0x10 != 0) == c.cd, "%s: cd is %v, the client asked with %v", c.name, out[3] & 0x10 != 0, c.cd)
+	}
 }
