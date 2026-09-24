@@ -285,9 +285,8 @@ test_ede_27_is_only_for_the_ceilings_insecure_answers :: proc(t: ^testing.T) {
 
 /*
 And through a CNAME rewrite, whose answer is rebuilt around the alias (issue
-#320). Two links, so that both ways the code reaches the chain are held to it:
-the last one is forwarded, and carries the code beside its bytes, and the first
-is a chain this server built, and carries it in its own OPT record.
+#320). Two links, so the code has to survive a walk through the rules before
+the forwarded target, which carries it beside its bytes rather than in them.
 */
 @(test)
 test_a_cname_rewrite_to_an_answer_over_the_ceiling_keeps_ede_27 :: proc(t: ^testing.T) {

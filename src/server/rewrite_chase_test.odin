@@ -2,6 +2,7 @@ package server
 
 import "core:fmt"
 import "core:testing"
+import "core:time"
 import "elodin:config"
 import "elodin:dns"
 
@@ -223,6 +224,51 @@ test_a_cname_rewrite_to_a_refused_target_is_the_alias_alone :: proc(t: ^testing.
 		return
 	}
 	testing.expect_value(t, dns.Rcode(resp.flags.rcode), dns.Rcode.No_Error)
+	testing.expect_value(t, len(resp.answer), 1)
+}
+
+// A target answered but not readable back - the request's decode budget spent -
+// is SERVFAIL behind the alias, not the bare alias a stub reads as not found.
+@(test)
+test_a_chased_target_that_cannot_be_read_back_is_servfail :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.cache.enabled = false
+	cfg.rewrites = chase_rules()
+	s := Server {
+		cfg = &cfg,
+	}
+	questions := make([]dns.Question, 1, context.temp_allocator)
+	questions[0] = dns.Question{name = "old.lan.", type = .A, class = .IN}
+	msg := dns.Message{id = 0x3201, question = questions}
+	msg.flags.rd = true
+
+	plain, matched, alias := apply_rewrite(&s, msg, questions[0], context.temp_allocator, 512)
+	cname, is_alias := alias.?
+	if !testing.expect(t, matched && is_alias, "old.lan. should be answered by its alias") {
+		return
+	}
+	spent := dns.REQUEST_DECODE_BUDGET + 1
+	out, _ := chase_rewrite_alias(
+		&s,
+		plain,
+		cname,
+		msg,
+		.UDP,
+		"127.0.0.1:5555",
+		512,
+		Cookie_Request{},
+		time.now(),
+		&spent,
+		context.temp_allocator,
+		false,
+	)
+	resp, derr := dns.decode_message(out, context.temp_allocator)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
+	testing.expect_value(t, dns.Rcode(resp.flags.rcode), dns.Rcode.Serv_Fail)
 	testing.expect_value(t, len(resp.answer), 1)
 }
 

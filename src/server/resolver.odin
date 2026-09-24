@@ -3890,9 +3890,10 @@ chase_rewrite_alias :: proc(
 
 	walk: for {
 		target := chain[len(chain) - 1].data.(dns.Rdata_Name).name
-		if len(chain) >= MAX_REWRITE_CHASE || dns.name_equal_fold(target, q.name) {
+		if len(chain) >= MAX_REWRITE_CHASE {
 			break walk
 		}
+		// The first link is owned by the question's name, so this covers it.
 		for rec in chain {
 			if dns.name_equal_fold(target, rec.name) {
 				break walk
@@ -3923,7 +3924,8 @@ chase_rewrite_alias :: proc(
 			)
 			// A refusal counts nowhere in that family, the RD gate's included,
 			// and nor does a special-use name, so the chain either leaves as the
-			// answer is counted as the rewrite it is.
+			// answer is counted as the rewrite it is. A block list answering
+			// `refused` is `.Blocked` and counted as blocked, alias alone or not.
 			counted = outcome != .Refused && outcome != .Local
 			if !answered || outcome == .Refused {
 				break walk
@@ -3933,7 +3935,12 @@ chase_rewrite_alias :: proc(
 			continue walk
 		}
 		got, derr := dns.decode_message(out, allocator, spent)
-		if derr == .None && dns.Rcode(got.flags.rcode) != .Refused {
+		if derr != .None {
+			// The target was answered and this server could not read the answer
+			// back - the request's decode budget, in practice. SERVFAIL, not the
+			// bare alias: that is the not-found this procedure exists to prevent.
+			rest.flags.rcode = u8(dns.Rcode.Serv_Fail)
+		} else if dns.Rcode(got.flags.rcode) != .Refused {
 			rest = got
 		}
 		break walk
