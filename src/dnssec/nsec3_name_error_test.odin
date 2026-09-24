@@ -260,12 +260,12 @@ test_the_configured_iteration_ceiling_reaches_the_proof :: proc(t: ^testing.T) {
 	// hashing was done.
 	testing.expect_value(t, budget.nsec3.spent, 0)
 	testing.expect_value(t, budget.nsec3.rounds, 0)
-	// And nothing it stepped through is remembered as an insecure zone: a denial
-	// past the ceiling cannot tell a delegation from a name nobody holds, so
-	// remembering it is one cache entry per name a client makes up.
+	// And nothing it stepped through is remembered, as a zone or as a non-cut:
+	// a denial past the ceiling cannot tell a delegation from a name nobody
+	// holds, so remembering it is one entry per name a client makes up.
 	for name in ([]string{"deep.n3test.", N3_QNAME}) {
-		_, cached, _ := cache_get(strict, name, time.unix(FIXTURE_TIME, 0), context.temp_allocator)
-		testing.expectf(t, !cached, "%s should not be cached from a denial past the ceiling", name)
+		_, cached, non_cut := cache_get(strict, name, time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+		testing.expectf(t, !cached && !non_cut, "%s should not be remembered from a denial past the ceiling", name)
 	}
 
 	// The walk above answered before the denial was read, so the denial's own
@@ -342,5 +342,48 @@ test_a_walk_that_ran_out_of_lookups_does_not_blame_the_hashing :: proc(t: ^testi
 	testing.expect_value(t, result.reason, "lookup budget spent")
 	testing.expect_value(t, budget.nsec3.over_ceiling, 0)
 	testing.expect_value(t, budget.nsec3.spent, 0)
+	free_all(context.temp_allocator)
+}
+
+/*
+An unsigned answer inside a zone past the ceiling is not served.
+
+The walk that checks an unsigned answer runs down every label of its owner, and
+the DS denial at each one is past the ceiling here. Reading those steps as
+insecure made every name in the zone unsigned to the walk, and a forged A
+record for any of them - no signature needed - came back `Insecure` and was
+served. On main it was SERVFAIL, and that is what it has to stay: this server
+cannot tell a forgery from an unsigned delegation it could not read, so it
+says so rather than guessing either way.
+*/
+@(test)
+test_a_forged_unsigned_answer_past_the_ceiling_is_not_served :: proc(t: ^testing.T) {
+	anchor, parsed := parse_trust_anchor(N3_ANCHOR, context.temp_allocator)
+	testing.expect(t, parsed, "the anchor should parse")
+	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
+	anchors[0] = anchor
+
+	msg, err := dns.decode_message(n3_reply(), context.temp_allocator)
+	testing.expect(t, err == .None, "the fixture should decode")
+	dns.set_rcode(&msg, .No_Error)
+	msg.authority = nil
+	answer := make([]dns.Record, 1, context.temp_allocator)
+	answer[0] = dns.Record{name = N3_QNAME, type = .A, class = .IN, ttl = 60, data = dns.Rdata_A{addr = {203, 0, 113, 66}}}
+	msg.answer = answer
+	wire, _, encode_err := dns.encode_message(msg, context.temp_allocator)
+	testing.expect_value(t, encode_err, dns.Encode_Error.None)
+
+	strict := make_validator(n3_query, nil, Options{anchors = anchors, max_nsec3_iterations = 5})
+	defer destroy_validator(strict)
+	result := validate(strict, N3_QNAME, .A, wire, time.unix(FIXTURE_TIME, 0))
+	testing.expectf(t, result.status == .Indeterminate, "a forged unsigned answer must not be served, got %v (%q)", result.status, result.reason)
+	testing.expect_value(t, result.reason, NSEC3_OVER_CEILING)
+
+	// The control: at the shipped ceiling the walk reads the denials, the name
+	// is in a signed zone, and an unsigned answer for it is a forgery.
+	ordinary := n3_validator()
+	defer destroy_validator(ordinary)
+	held := validate(ordinary, N3_QNAME, .A, wire, time.unix(FIXTURE_TIME, 0))
+	testing.expectf(t, held.status == .Bogus, "got %v (%q)", held.status, held.reason)
 	free_all(context.temp_allocator)
 }

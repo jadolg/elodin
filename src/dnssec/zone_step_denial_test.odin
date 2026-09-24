@@ -429,20 +429,25 @@ test_a_chain_above_the_ceiling_does_not_stop_the_one_beside_it :: proc(t: ^testi
 }
 
 /*
-A DS denial this server could read none of for its iteration count leaves the
-child insecure, not the walk undecided.
+A DS denial this server could read none of for its iteration count keeps the
+walk going on the parent's keys, rather than leaving it undecided.
 
 Every record above the ceiling is refused, and that refusal is a policy: no
-question will ever read them. RFC 5155 section 10.3 has such a zone treated as
-insecure, and Unbound, BIND and Knot all do, so reading it as `Indeterminate`
-made every name below a parent over the ceiling - unsigned delegations included
-- SERVFAIL here and nowhere else. Issue #331.
+question will ever read them. Reading it as `Indeterminate` made every name
+below a parent over the ceiling SERVFAIL here and nowhere else. Issue #331.
+
+Not `.Insecure` either, which is the other easy answer and a hole: the walk
+runs over every label of every owner it checks, so an insecure step makes every
+name in the zone unsigned, and an unsigned answer forged for any of them is
+served. `.No_Cut` keeps the parent's keys, so what is signed still has to
+verify; `test_a_forged_unsigned_answer_past_the_ceiling_is_not_served` is the
+other half.
 
 The allowance is the other refusal and keeps its answer: a record it turned away
 is one this server would have read a moment earlier, so nothing is decided.
 */
 @(test)
-test_a_ds_denial_above_the_ceiling_is_insecure :: proc(t: ^testing.T) {
+test_a_ds_denial_above_the_ceiling_keeps_the_parents_keys :: proc(t: ^testing.T) {
 	nodes := []Node {
 		{"example.", {.NS, .SOA, .RRSIG, .DNSKEY}},
 		{"a.example.", {.A, .RRSIG}},
@@ -454,7 +459,7 @@ test_a_ds_denial_above_the_ceiling_is_insecure :: proc(t: ^testing.T) {
 		max_iterations = 100,
 	}
 	step, cut_short := denial_step(nil, chain, "sub.example.", "example.", &budget)
-	testing.expect_value(t, step, Step.Insecure)
+	testing.expect_value(t, step, Step.No_Cut)
 	testing.expect(t, !cut_short, "a chain refused for its iterations is not a reading this server stopped short of")
 	testing.expect_value(t, budget.rounds, 0)
 
@@ -465,7 +470,7 @@ test_a_ds_denial_above_the_ceiling_is_insecure :: proc(t: ^testing.T) {
 	}
 	step, cut_short = denial_step(nil, chain, "sub.example.", "example.", &starved)
 	testing.expect(t, cut_short, "a reading the allowance stopped is not a finding")
-	testing.expect(t, step != .Insecure, "and must not be served as insecure")
+	testing.expect(t, step != .Insecure && step != .No_Cut, "and must decide nothing")
 	free_all(context.temp_allocator)
 }
 
@@ -478,9 +483,9 @@ chain above the ceiling can put it beside that denial, and if a refusal anywhere
 in the set were enough, the child would be read as insecure and everything in it
 served on the attacker's word. Only a set with nothing readable in it is.
 
-That is what a mixed set decides, not a bar to the attacker: one who drops the
-readable records and sends the old one alone is the case
-`nsec3_all_over_ceiling` records as left open.
+That is what a mixed set decides. One who drops the readable records and sends
+the old one alone gets a step that keeps the parent's keys, not an insecure
+child - see `test_a_ds_denial_above_the_ceiling_keeps_the_parents_keys`.
 */
 @(test)
 test_a_refused_record_does_not_downgrade_a_readable_denial :: proc(t: ^testing.T) {

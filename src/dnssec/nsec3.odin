@@ -229,10 +229,12 @@ nsec3_declined :: proc(budget: ^Nsec3_Budget, before: Nsec3_Refusals) -> (declin
 /*
 Is every record here one the ceiling refuses?
 
-Then the zone is insecure to this server, which is what RFC 5155 section 10.3
-asks, what RFC 9276 section 3.2 allows, and what Unbound, BIND and Knot do: its
-denials are not read, so nothing under it can be proven, and serving it without
-the AD bit is the answer it gets everywhere else. Issue #331.
+Then the denial is insecure to this server, which is what RFC 5155 section 10.3
+asks, what RFC 9276 section 3.2 allows, and what Unbound, BIND and Knot do: it
+is not read, so it cannot be proven, and serving it without the AD bit is the
+answer it gets everywhere else. Issue #331. The chain walk reads the same
+thing differently - as a step that keeps the parent's keys, never as an
+unsigned child - and `Budget.walk_past_ceiling` says why.
 
 Every record rather than any, and that is the difference that matters. A
 readable record beside refused ones is a chain this server can check - a zone
@@ -240,12 +242,18 @@ mid-rollover, or an old record replayed beside a current one - and letting a
 refused record decide would let anyone holding one signed record of an old,
 expensive chain turn a denial the readable chain contradicts into an insecure
 answer. Which leaves the one thing nobody can close: a sender replaying only
-the old chain, while its signatures last, gets the zone read as insecure. That
+the old chain, while its signatures last, gets its denials served insecure - a
+name made to look absent, though never a forged record served for one. That
 needs a zone that published an iteration count nobody should, and it is the
 price every resolver doing this pays.
+
+An NSEC record is readable too, so a denial carrying one is never this.
 */
 @(private)
-nsec3_all_over_ceiling :: proc(n3s: []Nsec3_Rr, budget: ^Nsec3_Budget) -> bool {
+nsec3_all_over_ceiling :: proc(nsecs: []Nsec_Rr, n3s: []Nsec3_Rr, budget: ^Nsec3_Budget) -> bool {
+	if len(nsecs) > 0 {
+		return false
+	}
 	for n in n3s {
 		if int(n.rr.iterations) <= budget.max_iterations {
 			return false
@@ -303,7 +311,9 @@ to say about them is the same: a proof built on a hash this server declined to
 compute failed for a reason of ours, and reporting it as `Bogus` would tell the
 client its answer was forged over a number the zone chose. They report
 `Indeterminate` and name which refusal it was, which is what reaches the client
-as an extended error and an operator as the reason beside the query.
+as an extended error and an operator as the reason beside the query - unless
+every record was over the ceiling, which `nsec3_all_over_ceiling` makes
+`Insecure`.
 */
 @(private)
 nsec3_hash_with :: proc(rr: Nsec3, name: string, out: []u8, budget: ^Nsec3_Budget) -> bool {
