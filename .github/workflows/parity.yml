@@ -93,7 +93,10 @@ jobs:
           - 94.140.14.140:53 # AdGuard, unfiltered
           - 208.67.222.222:53 # OpenDNS
           - 185.222.222.222:53 # DNS.SB
-          - 76.76.2.11:53 # Control D, unfiltered
+          # Control D (76.76.2.11) is in PARITY_RESOLVERS for a run by hand and
+          # not here: it rate-limits a run this size, answering the reference
+          # REFUSED and dropping the chain walk's lookups, so its report would
+          # be red every night for its own reasons.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
