@@ -2053,11 +2053,11 @@ everything else, the block lists included.
 A CNAME is followed: the answer carries the target's records after the alias,
 looked up as though the client had asked for the target by name — another
 rewrite, the block lists, the cache, then the upstream — since glibc and musl
-report a name whose answer is a bare CNAME as not found. A chain is followed
-through at most 8 rewrites, so a loop ends at 9 aliases, and a query with RD
+report a name whose answer is a bare CNAME as not found. A chain stops at the
+first name it has already passed through, or after 8 aliases, and a query with RD
 clear gets the target's records only where this server has them without asking
-an upstream. A refused target leaves the alias alone as the answer. The
-query log shows the target's lookup as a line of its own, and the metrics count
+an upstream. A refused target leaves the alias alone as the answer. A target
+that is no rewrite shows in the query log as a line of its own, and the metrics count
 the query once, by the target's outcome.
 
 #### Other record types

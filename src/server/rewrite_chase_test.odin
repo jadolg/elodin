@@ -1,5 +1,6 @@
 package server
 
+import "core:fmt"
 import "core:testing"
 import "elodin:config"
 import "elodin:dns"
@@ -76,6 +77,7 @@ chase_ask :: proc(
 	rd := true,
 	block := config.Block_Response.NX_Domain,
 	rewritten: ^u64 = nil,
+	rules: []config.Rewrite = nil,
 ) -> (
 	resp: dns.Message,
 	ok: bool,
@@ -86,7 +88,7 @@ chase_ask :: proc(
 	cfg.cache.enabled = false
 	cfg.blocking.enabled = false
 	cfg.blocking.response = block
-	cfg.rewrites = chase_rules()
+	cfg.rewrites = rules if rules != nil else chase_rules()
 	s := Server {
 		cfg = cfg,
 	}
@@ -164,21 +166,36 @@ test_a_cname_question_is_answered_by_the_alias_alone :: proc(t: ^testing.T) {
 	}
 }
 
-// A rewrite loop ends, and ends with an answer rather than a worker lost to it.
+// A rewrite loop ends at the first name it comes back to, with each alias once:
+// RFC 2181 section 5 has no RRset repeat a record.
 @(test)
-test_a_rewrite_loop_is_chased_a_bounded_number_of_times :: proc(t: ^testing.T) {
+test_a_rewrite_loop_ends_where_it_comes_back :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	resp, ok := chase_ask(t, "ping.lan.", .A)
 	if !ok {
 		return
 	}
-	testing.expectf(
-		t,
-		len(resp.answer) == MAX_REWRITE_CHASE + 1,
-		"want %d CNAMEs, got %d records",
-		MAX_REWRITE_CHASE + 1,
-		len(resp.answer),
-	)
+	testing.expect_value(t, dns.Rcode(resp.flags.rcode), dns.Rcode.No_Error)
+	testing.expectf(t, len(resp.answer) == 2, "want ping->pong and pong->ping, got %d records", len(resp.answer))
+}
+
+// And a chain of distinct names ends at the bound, however many rules it has.
+@(test)
+test_a_long_rewrite_chain_stops_at_the_bound :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	rules := make([]config.Rewrite, MAX_REWRITE_CHASE + 2, context.temp_allocator)
+	for i in 0 ..< len(rules) {
+		rules[i] = config.Rewrite {
+			domain  = fmt.aprintf("c%d.lan.", i, allocator = context.temp_allocator),
+			answers = one_answer({kind = .CNAME, name = fmt.aprintf("c%d.lan.", i + 1, allocator = context.temp_allocator)}),
+			ttl     = 60,
+		}
+	}
+	resp, ok := chase_ask(t, "c0.lan.", .A, rules = rules)
+	if !ok {
+		return
+	}
+	testing.expect_value(t, len(resp.answer), MAX_REWRITE_CHASE)
 }
 
 // RD=0 asks for nothing to be looked up elsewhere, and a target that is no rule

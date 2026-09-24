@@ -1097,8 +1097,6 @@ resolve_query :: proc(
 	it; see `ceiling_ede`.
 	*/
 	ede: ^u16 = nil,
-	// How many CNAME rewrites led here. See `chase_rewrite_alias`.
-	chased := 0,
 ) -> (
 	response: []u8,
 	outcome: Outcome,
@@ -1155,7 +1153,9 @@ resolve_query :: proc(
 
 	if out, matched, alias := apply_rewrite(s, msg, q, allocator, limit); matched {
 		counted := false
-		if cname, is_alias := alias.?; is_alias {
+		// Not in a detached refresh, whose answer is neither served nor - being
+		// a rewrite - stored, and which must not start another one.
+		if cname, is_alias := alias.?; is_alias && unanswered == nil {
 			out, counted = chase_rewrite_alias(
 				s,
 				out,
@@ -1169,7 +1169,6 @@ resolve_query :: proc(
 				spent,
 				allocator,
 				shared_worker,
-				chased,
 			)
 		}
 		if !counted {
@@ -3584,10 +3583,11 @@ synth_soa_for_zone :: proc(zone: string, ttl: u32, allocator: mem.Allocator) -> 
 }
 
 /*
-How many CNAME rewrites one query follows before answering with the chain as it
-stands. Unbound's restart limit is the same number; a real chain of local names
-is two or three long, and anything longer is a loop the loader could not see -
-wildcards make that undecidable - that must end without taking a worker with it.
+The longest chain of CNAME rewrites one answer carries. A loop ends sooner, at
+the first name the chain has already passed through; this is the bound on a
+long chain of distinct names, where a real one is two or three long. Unbound's
+hard-coded restart limit was the same number until its `max-query-restarts`
+made it 11 by default.
 */
 MAX_REWRITE_CHASE :: 8
 
@@ -3829,21 +3829,28 @@ RFC 1034 section 4.3.2 step 3.a has a server that meets an alias restart the
 lookup at the canonical name and put what it finds there in the same answer,
 and the stubs most programs link against depend on it: glibc's `getanswer_r`
 and musl both give up on an A answer that holds nothing but a CNAME. So the
-target is put through `resolve_query` as a question of its own, with the
-client's flags - another rewrite, the block lists, the special-use names, the
-cache and the upstreams all get their say on it, exactly as they would had the
-client asked for it by name, which is what dnsmasq's `--cname` and AdGuard
-Home's rewrites do too.
+chain is walked through the rules for as long as they keep answering with an
+alias, and the first name that is not one is answered as a question of its
+own: out of its rule if it has one, and otherwise through `resolve_query` with
+the client's flags - the block lists, the special-use names, the cache and the
+upstreams all get their say on it, exactly as they would had the client asked
+for it by name, which is what dnsmasq's `--cname` and AdGuard Home's rewrites
+do too. Once, however long the chain: that is what keeps one query to one
+upstream fetch, one decode of what comes back, and one count.
 
-The alias alone is still the answer where there is nothing to restart: a
-question for the CNAME itself or for ANY, which the alias matches; a chain
-`MAX_REWRITE_CHASE` long; and a target that is refused, whether by this server
-- RD=0 for a name that is no rule of ours, a block list answering `refused` - or
-by an upstream's ACL. The refusal is about the target, and the alias the client
-did ask about is answerable. Anything else the
-target produces is the answer, rcode included (RFC 6604 section 2.1: the rcode
-speaks for the last name in the chain), with its authority section for the SOA
-a denial is cached by. Never AD: the alias is this server's own and unsigned.
+The chain alone is the answer where there is nothing more to find: a question
+for the CNAME itself or for ANY, which the alias matches; a name the chain has
+already passed through, which is a loop, or a chain `MAX_REWRITE_CHASE` long;
+and a target that is refused, whether by this server - RD=0 for a name that is
+no rule of ours, a block list answering `refused` - or by an upstream's ACL.
+The refusal is about the target, and the aliases the client did ask about are
+answerable. Anything else the target produces is the answer, rcode included
+(RFC 6604 section 2.1: the rcode speaks for the last name in the chain), with
+its authority section for the SOA a denial is cached by. Never AD: the aliases
+are this server's own and unsigned.
+
+No additional section, as `apply_rewrite` has none: the target's glue is the
+upstream's reply to a question the client did not ask.
 */
 @(private)
 chase_rewrite_alias :: proc(
@@ -3859,7 +3866,6 @@ chase_rewrite_alias :: proc(
 	spent: ^int,
 	allocator: mem.Allocator,
 	shared_worker: bool,
-	chased: int,
 ) -> (
 	response: []u8,
 	// Whether the target's lookup counted this query under its own outcome, as
@@ -3869,50 +3875,73 @@ chase_rewrite_alias :: proc(
 	counted: bool,
 ) {
 	q := msg.question[0]
-	target, is_name := alias.data.(dns.Rdata_Name)
-	if !is_name || q.type == .CNAME || q.type == .ANY || chased >= MAX_REWRITE_CHASE {
-		return plain, counted
+	if q.type == .CNAME || q.type == .ANY {
+		return plain, false
 	}
 
+	chain := make([dynamic]dns.Record, 0, 4, allocator)
+	append(&chain, alias)
 	questions := make([]dns.Question, 1, allocator)
-	questions[0] = dns.Question{name = target.name, type = q.type, class = q.class}
 	next := msg
 	next.question = questions
-	wire, _, enc := dns.encode_message(next, allocator)
-	if enc != .None {
-		return plain, counted
-	}
+	rest: dns.Message
+	outcome := Outcome.Rewritten
 	code: u16
-	out, outcome, ok := resolve_query(
-		s,
-		wire,
-		next,
-		proto,
-		client,
-		limit,
-		cookie,
-		started,
-		spent,
-		allocator,
-		shared_worker,
-		ede = &code,
-		chased = chased + 1,
-	)
-	// A refusal counts nowhere in that family, the RD gate's included, and nor
-	// does a special-use name, so the alias either leaves as the answer is
-	// counted as the rewrite it is.
-	counted = outcome != .Refused && outcome != .Local
-	if !ok || outcome == .Refused {
-		return plain, counted
-	}
-	rest, derr := dns.decode_message(out, allocator, spent)
-	if derr != .None || dns.Rcode(rest.flags.rcode) == .Refused {
-		return plain, counted
+
+	walk: for {
+		target := chain[len(chain) - 1].data.(dns.Rdata_Name).name
+		if len(chain) >= MAX_REWRITE_CHASE || dns.name_equal_fold(target, q.name) {
+			break walk
+		}
+		for rec in chain {
+			if dns.name_equal_fold(target, rec.name) {
+				break walk
+			}
+		}
+		questions[0] = dns.Question{name = target, type = q.type, class = q.class}
+
+		out, matched, more := apply_rewrite(s, next, questions[0], allocator, limit)
+		if !matched {
+			wire, _, enc := dns.encode_message(next, allocator)
+			if enc != .None {
+				break walk
+			}
+			answered: bool
+			out, outcome, answered = resolve_query(
+				s,
+				wire,
+				next,
+				proto,
+				client,
+				limit,
+				cookie,
+				started,
+				spent,
+				allocator,
+				shared_worker,
+				ede = &code,
+			)
+			// A refusal counts nowhere in that family, the RD gate's included,
+			// and nor does a special-use name, so the chain either leaves as the
+			// answer is counted as the rewrite it is.
+			counted = outcome != .Refused && outcome != .Local
+			if !answered || outcome == .Refused {
+				break walk
+			}
+		} else if next_alias, is_alias := more.?; is_alias {
+			append(&chain, next_alias)
+			continue walk
+		}
+		got, derr := dns.decode_message(out, allocator, spent)
+		if derr == .None && dns.Rcode(got.flags.rcode) != .Refused {
+			rest = got
+		}
+		break walk
 	}
 
-	answers := make([]dns.Record, len(rest.answer) + 1, allocator)
-	answers[0] = alias
-	copy(answers[1:], rest.answer)
+	answers := make([]dns.Record, len(chain) + len(rest.answer), allocator)
+	copy(answers, chain[:])
+	copy(answers[len(chain):], rest.answer)
 	resp := dns.make_response(msg, dns.Rcode(rest.flags.rcode), allocator)
 	resp.answer = answers
 	resp.authority = rest.authority
@@ -3931,11 +3960,11 @@ chase_rewrite_alias :: proc(
 	} else if own, has := dns.find_opt(rest); has && len(resp.additional) == 1 {
 		resp.additional[0].data = own.data
 	}
-	chain, _, err := dns.encode_message(resp, allocator, limit)
+	wire, _, err := dns.encode_message(resp, allocator, limit)
 	if err != .None {
 		return plain, counted
 	}
-	return chain, counted
+	return wire, counted
 }
 
 /*
