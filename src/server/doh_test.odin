@@ -10,6 +10,7 @@ import "core:thread"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:upstream"
 
 /*
 The DoH reader hands back views into a buffer it goes on appending to.
@@ -1760,4 +1761,144 @@ test_doh_lets_go_of_a_connection_that_asks_nothing :: proc(t: ^testing.T) {
 
 	testing.expectf(t, held < time.Second, "a connection that asked nothing was held for %v", held)
 	free_all(context.temp_allocator)
+}
+
+/*
+The time a question takes to answer is not time the connection asked nothing (#344).
+
+A TCP client's idle wait starts once its answer is written, and so does the
+window `doh_question_overdue` gives an HTTP/1.1 connection. Stamped where the
+question was charged instead, an upstream slower than twice `client_timeout` - two
+unreachable servers at the defaults - ended the connection as soon as the answer
+went out, under the `Connection: keep-alive` that answer had just promised, and a
+request the client had already sent was lost with it.
+
+The upstream here never answers, and gives up after 400ms against a 100ms
+`client_timeout`. The 404 pipelined behind the query must still be answered.
+*/
+@(test)
+test_doh_a_slow_answer_does_not_count_against_the_connection :: proc(t: ^testing.T) {
+	upstream_socket, userr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, userr == nil, "cannot bind the mock upstream: %v", userr) {
+		return
+	}
+	defer net.close(upstream_socket)
+	upstream_bound, ubound_err := net.bound_endpoint(upstream_socket)
+	if !testing.expectf(t, ubound_err == nil, "cannot read the mock's port: %v", ubound_err) {
+		return
+	}
+
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.blocking.enabled = false
+	cfg.cache.enabled = false
+	cfg.listeners.doh.path = "/dns-query"
+	cfg.server.client_timeout = 100 * time.Millisecond
+	cfg.upstream.strategy = .Failover
+	cfg.upstream.attempts = 1
+	cfg.upstream.timeout = 400 * time.Millisecond
+	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
+	servers[0] = config.Upstream_Spec {
+		name    = "mock",
+		kind    = .UDP,
+		address = "127.0.0.1",
+		port    = upstream_bound.port,
+	}
+	cfg.upstream.servers = servers
+	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+		return
+	}
+	defer upstream.destroy_group(group)
+	s := Server {
+		cfg   = &cfg,
+		group = group,
+	}
+
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen on loopback: %v", lerr) {
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the bound port: %v", berr) {
+		return
+	}
+	client, derr := net.dial_tcp_from_endpoint(bound)
+	if !testing.expectf(t, derr == nil, "cannot dial the listener: %v", derr) {
+		return
+	}
+	defer net.close(client)
+
+	questions := make([]dns.Question, 1, context.temp_allocator)
+	questions[0] = dns.Question {
+		name  = "slow.example.",
+		type  = .A,
+		class = .IN,
+	}
+	msg := dns.Message {
+		id       = 0x5150,
+		question = questions,
+	}
+	msg.flags.rd = true
+	query, _, qerr := dns.encode_message(msg, context.temp_allocator)
+	if !testing.expect_value(t, qerr, dns.Encode_Error.None) {
+		return
+	}
+	req := strings.builder_make(context.temp_allocator)
+	strings.write_string(&req, "POST /dns-query HTTP/1.1\r\nHost: dns.example\r\n")
+	strings.write_string(&req, "Content-Type: application/dns-message\r\nContent-Length: ")
+	strings.write_int(&req, len(query))
+	strings.write_string(&req, "\r\n\r\n")
+	strings.write_bytes(&req, query)
+	strings.write_string(&req, "GET /not-served HTTP/1.1\r\nHost: dns.example\r\n\r\n")
+	if !send_all(t, client, strings.to_string(req)) {
+		return
+	}
+	// What ends `serve_doh` once both are answered.
+	net.shutdown(client, .Send)
+
+	accepted, _, aerr := net.accept_tcp(listener)
+	if !testing.expectf(t, aerr == nil, "nothing connected: %v", aerr) {
+		return
+	}
+	defer net.close(accepted)
+	serve_doh(&s, Conn{socket = accepted}, "test")
+
+	_ = net.set_option(client, .Receive_Timeout, 500 * time.Millisecond)
+	answers := strings.builder_make(context.temp_allocator)
+	for {
+		chunk: [4096]u8
+		n, rerr := net.recv_tcp(client, chunk[:])
+		if rerr != nil || n <= 0 {
+			break
+		}
+		strings.write_bytes(&answers, chunk[:n])
+	}
+	got := strings.to_string(answers)
+	testing.expectf(t, strings.contains(got, "HTTP/1.1 200"), "the query went unanswered: %q", got)
+	testing.expectf(
+		t,
+		strings.contains(got, "HTTP/1.1 404"),
+		"the request behind a slow answer was dropped with its connection: %q",
+		got,
+	)
+	free_all(context.temp_allocator)
+}
+
+// A `client_timeout` meant as "forever" is not one doubled past the end of the
+// range into a bound every connection is already over.
+@(test)
+test_doh_a_timeout_near_the_range_limit_keeps_connections :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	cfg.server.client_timeout = 10000 * 7 * 24 * time.Hour
+	s := Server {
+		cfg = &cfg,
+	}
+	now := time.tick_now()
+	testing.expect(
+		t,
+		!doh_question_overdue(&s, time.tick_add(now, -time.Second), now),
+		"a connection one second old was overdue",
+	)
 }

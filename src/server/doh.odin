@@ -528,8 +528,15 @@ serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 		http_compact(&r)
 
 		keep_alive := req.keep_alive
-		handled := serve_doh_request(s, conn, req, path, client, &last_question)
+		asked := false
+		handled := serve_doh_request(s, conn, req, path, client, &asked)
 		free_all(context.temp_allocator)
+		// Once it is answered rather than when it was charged, as a TCP client's
+		// idle wait starts once its answer is written: the time the question takes
+		// is not time the connection asked nothing.
+		if asked {
+			last_question = time.tick_now()
+		}
 		if !handled || !keep_alive {
 			return
 		}
@@ -569,7 +576,10 @@ guess it.
 @(private)
 doh_question_overdue :: proc(s: ^Server, last_question: time.Tick, now: time.Tick) -> bool {
 	limit := s.cfg.server.client_timeout
-	return limit > 0 && time.tick_diff(last_question, now) > 2 * limit
+	// Less the limit rather than against twice it, which overflows for a
+	// `client_timeout` past 146 years - an operator's "forever" - into a
+	// negative bound that closes every connection before its first request.
+	return limit > 0 && time.tick_diff(last_question, now) - limit > limit
 }
 
 @(private)
@@ -581,7 +591,7 @@ serve_doh_request :: proc(
 	client: string,
 	// Set where the request is charged, which is what makes it a question. See
 	// `doh_question_overdue`.
-	last_question: ^time.Tick,
+	asked: ^bool,
 ) -> bool {
 	mc_path := s.cfg.listeners.doh.mobileconfig_path
 	if mc_path != "" && req.path == mc_path {
@@ -661,8 +671,8 @@ serve_doh_request :: proc(
 	`client_timeout` between requests and by `max_connections` across them. A
 	flooder occupies the same one slot either way.
 	*/
-	last_question^ = time.tick_now()
-	if !stream_rate_check(s.limiter, conn.peer, last_question^) {
+	asked^ = true
+	if !stream_rate_check(s.limiter, conn.peer, time.tick_now()) {
 		report_rate_limited(client, .DoH, !req.keep_alive)
 		return send_http_error(conn, "doh", 429, "too many requests", req.keep_alive)
 	}
