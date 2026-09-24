@@ -93,7 +93,6 @@ H2_Job :: struct {
 @(private)
 h2_begin :: proc(user: rawptr, starts_frame: bool) {
 	ctx := cast(^H2_Context)user
-	now := time.tick_now()
 	ctx.budget = Read_Budget {
 		idle = ctx.server.cfg.server.client_timeout,
 	}
@@ -102,9 +101,11 @@ h2_begin :: proc(user: rawptr, starts_frame: bool) {
 	// frame starts: a payload whose header is already read may be the question
 	// that would have kept the connection, and cutting it there loses it.
 	// `pending` first: the worker stamps before it lets go of it.
-	if starts_frame &&
-	   sync.atomic_load(&ctx.pending) == 0 &&
-	   doh_question_overdue(ctx.server, {sync.atomic_load(&ctx.last_question._nsec)}, now) {
+	if !starts_frame || sync.atomic_load(&ctx.pending) != 0 {
+		return
+	}
+	now := time.tick_now()
+	if doh_question_overdue(ctx.server, {sync.atomic_load(&ctx.last_question._nsec)}, now) {
 		ctx.budget.deadline = now
 	}
 }
@@ -172,8 +173,7 @@ h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	decoding a GET's `dns` parameter, and with the budget switched off that is a
 	base64 decode per request, on the connection's reader thread, for an answer
 	nothing then reads.
-	*/
-	/*
+
 	A question is also what keeps the connection - see `doh_question_overdue` -
 	and with no limiter every request counts as one. Nothing is charged for
 	anything then, so a 404 holds a connection no more cheaply than a query does,

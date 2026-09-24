@@ -1862,8 +1862,9 @@ test_doh_a_slow_answer_does_not_count_against_the_connection :: proc(t: ^testing
 	if !testing.expectf(t, aerr == nil, "nothing connected: %v", aerr) {
 		return
 	}
-	defer net.close(accepted)
 	serve_doh(&s, Conn{socket = accepted}, "test")
+	// Closed now so the read below ends at EOF, not at its timeout.
+	net.close(accepted)
 
 	_ = net.set_option(client, .Receive_Timeout, 500 * time.Millisecond)
 	answers := strings.builder_make(context.temp_allocator)
