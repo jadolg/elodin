@@ -1151,8 +1151,29 @@ resolve_query :: proc(
 		return out, .Refused, built
 	}
 
-	if out, matched := apply_rewrite(s, msg, q, allocator, limit); matched {
-		sync.atomic_add(&s.stats.rewritten, 1)
+	if out, matched, alias := apply_rewrite(s, msg, q, allocator, limit); matched {
+		counted := false
+		// Not in a detached refresh, whose answer is neither served nor - being
+		// a rewrite - stored, and which must not start another one.
+		if cname, is_alias := alias.?; is_alias && unanswered == nil {
+			out, counted = chase_rewrite_alias(
+				s,
+				out,
+				cname,
+				msg,
+				proto,
+				client,
+				limit,
+				cookie,
+				started,
+				spent,
+				allocator,
+				shared_worker,
+			)
+		}
+		if !counted {
+			sync.atomic_add(&s.stats.rewritten, 1)
+		}
 		log_query(s, client, proto, q, .Rewritten, "rewrite", started)
 		return out, .Rewritten, true
 	}
@@ -3561,6 +3582,15 @@ synth_soa_for_zone :: proc(zone: string, ttl: u32, allocator: mem.Allocator) -> 
 	return recs
 }
 
+/*
+The longest chain of CNAME rewrites one answer carries. A loop ends sooner, at
+the first name the chain has already passed through; this is the bound on a
+long chain of distinct names, where a real one is two or three long. Unbound's
+hard-coded restart limit was the same number until its `max-query-restarts`
+made it 11 by default.
+*/
+MAX_REWRITE_CHASE :: 8
+
 @(private)
 apply_rewrite :: proc(
 	s: ^Server,
@@ -3571,6 +3601,9 @@ apply_rewrite :: proc(
 ) -> (
 	response: []u8,
 	matched: bool,
+	// The CNAME the answer consists of, when it is one, for the caller to
+	// restart the lookup at. See `chase_rewrite_alias`.
+	alias: Maybe(dns.Record),
 ) {
 	/*
 	The rules are walked rather than the first match taken, because a rule that
@@ -3602,7 +3635,7 @@ apply_rewrite :: proc(
 	search: for {
 		i, found := find_rewrite_index(s.cfg.rewrites, q.name, from)
 		if !found {
-			return nil, false
+			return nil, false, nil
 		}
 		rule := s.cfg.rewrites[i]
 
@@ -3634,7 +3667,7 @@ apply_rewrite :: proc(
 					)
 				}
 			case .CNAME:
-				// A CNAME answers every type; the client follows it from here.
+				// A CNAME answers every type; `chase_rewrite_alias` follows it.
 				append(
 					&answers,
 					dns.Record {
@@ -3704,7 +3737,7 @@ apply_rewrite :: proc(
 		*/
 
 		if blocked {
-			return build_block_response(s, query, q, allocator, limit), true
+			return build_block_response(s, query, q, allocator, limit), true, nil
 		}
 
 		/*
@@ -3779,10 +3812,167 @@ apply_rewrite :: proc(
 		}
 		out, _, err := dns.encode_message(resp, allocator, limit)
 		if err != .None {
-			return nil, false
+			return nil, false, nil
 		}
-		return out, true
+		if rule_holds_alias(rule) {
+			alias = answers[0]
+		}
+		return out, true, alias
 	}
+}
+
+/*
+The rest of the answer to a question a CNAME rewrite answered, from the name it
+points at (issue #320).
+
+RFC 1034 section 4.3.2 step 3.a has a server that meets an alias restart the
+lookup at the canonical name and put what it finds there in the same answer,
+and the stubs most programs link against depend on it: glibc's `getanswer_r`
+and musl both give up on an A answer that holds nothing but a CNAME. So the
+chain is walked through the rules for as long as they keep answering with an
+alias, and the first name that is not one is answered as a question of its
+own: out of its rule if it has one, and otherwise through `resolve_query` with
+the client's flags - the block lists, the special-use names, the cache and the
+upstreams all get their say on it, exactly as they would had the client asked
+for it by name, which is what dnsmasq's `--cname` and AdGuard Home's rewrites
+do too. Once, however long the chain: that is what keeps one query to one
+upstream fetch, one decode of what comes back, and one count.
+
+The chain alone is the answer where there is nothing more to find: a question
+for the CNAME itself or for ANY, which the alias matches; a name the chain has
+already passed through, which is a loop, or a chain `MAX_REWRITE_CHASE` long;
+and a target that is refused, whether by this server - RD=0 for a name that is
+no rule of ours, a block list answering `refused` - or by an upstream's ACL.
+The refusal is about the target, and the aliases the client did ask about are
+answerable. Anything else the target produces is the answer, rcode included
+(RFC 6604 section 2.1: the rcode speaks for the last name in the chain), with
+its authority section for the SOA a denial is cached by. Never AD: the aliases
+are this server's own and unsigned.
+
+No additional section, as `apply_rewrite` has none: the target's glue is the
+upstream's reply to a question the client did not ask.
+*/
+@(private)
+chase_rewrite_alias :: proc(
+	s: ^Server,
+	plain: []u8,
+	alias: dns.Record,
+	msg: dns.Message,
+	proto: Protocol,
+	client: string,
+	limit: int,
+	cookie: Cookie_Request,
+	started: time.Time,
+	spent: ^int,
+	allocator: mem.Allocator,
+	shared_worker: bool,
+) -> (
+	response: []u8,
+	// Whether the target's lookup counted this query under its own outcome, as
+	// a question for the target by name would have been; the caller counts it
+	// as rewritten only when not, so that one query is one answer in
+	// `elodin_answers_total` however long the chain.
+	counted: bool,
+) {
+	q := msg.question[0]
+	if q.type == .CNAME || q.type == .ANY {
+		return plain, false
+	}
+
+	chain := make([dynamic]dns.Record, 0, 4, allocator)
+	append(&chain, alias)
+	questions := make([]dns.Question, 1, allocator)
+	next := msg
+	next.question = questions
+	rest: dns.Message
+	outcome := Outcome.Rewritten
+	code: u16
+
+	walk: for {
+		target := chain[len(chain) - 1].data.(dns.Rdata_Name).name
+		if len(chain) >= MAX_REWRITE_CHASE {
+			break walk
+		}
+		// The first link is owned by the question's name, so this covers it.
+		for rec in chain {
+			if dns.name_equal_fold(target, rec.name) {
+				break walk
+			}
+		}
+		questions[0] = dns.Question{name = target, type = q.type, class = q.class}
+
+		out, matched, more := apply_rewrite(s, next, questions[0], allocator, limit)
+		if !matched {
+			wire, _, enc := dns.encode_message(next, allocator)
+			if enc != .None {
+				break walk
+			}
+			out, outcome, _ = resolve_query(
+				s,
+				wire,
+				next,
+				proto,
+				client,
+				limit,
+				cookie,
+				started,
+				spent,
+				allocator,
+				shared_worker,
+				ede = &code,
+			)
+			// A refusal counts nowhere in that family, the RD gate's included,
+			// and nor does a special-use name, so the chain either leaves as the
+			// answer is counted as the rewrite it is. A block list answering
+			// `refused` is `.Blocked` and counted as blocked, alias alone or not.
+			counted = outcome != .Refused && outcome != .Local
+			// Unanswered leaves `out` nil, which the decode below turns into
+			// SERVFAIL rather than the bare alias.
+			if outcome == .Refused {
+				break walk
+			}
+		} else if next_alias, is_alias := more.?; is_alias {
+			append(&chain, next_alias)
+			continue walk
+		}
+		got, derr := dns.decode_message(out, allocator, spent)
+		if derr != .None {
+			// The target was answered and this server could not read the answer
+			// back - the request's decode budget, in practice. SERVFAIL, not the
+			// bare alias: that is the not-found this procedure exists to prevent.
+			rest.flags.rcode = u8(dns.Rcode.Serv_Fail)
+		} else if dns.Rcode(got.flags.rcode) != .Refused {
+			rest = got
+		}
+		break walk
+	}
+
+	answers := make([]dns.Record, len(chain) + len(rest.answer), allocator)
+	copy(answers, chain[:])
+	copy(answers[len(chain):], rest.answer)
+	resp := dns.make_response(msg, dns.Rcode(rest.flags.rcode), allocator)
+	resp.answer = answers
+	resp.authority = rest.authority
+	resp.flags.tc = rest.flags.tc
+	/*
+	And the target's extended error, which the rebuild would otherwise drop
+	(RFC 9276 section 3.2's code 27 among them). A forwarded or cached answer's
+	OPT record is the upstream's, so only the code this server chose about it
+	goes on - `attach_answer_ede` never sees a `.Rewritten` answer. Anything
+	else built its OPT record here, and what it says is this server's own.
+	*/
+	if outcome == .Forwarded || outcome == .Cached {
+		if code != 0 {
+			attach_extended_error(&resp, code, "", allocator)
+		}
+	} else if own, has := dns.find_opt(rest); has && len(resp.additional) == 1 {
+		resp.additional[0].data = own.data
+	}
+	wire, _, err := dns.encode_message(resp, allocator, limit)
+	if err != .None {
+		return plain, counted
+	}
+	return wire, counted
 }
 
 /*

@@ -2050,6 +2050,17 @@ Wildcards match subdomains only, so `*.lan` covers `host.lan` but not `lan`. An
 optional `ttl` sets what the answer carries. Rewrites are matched before
 everything else, the block lists included.
 
+A CNAME is followed: the answer carries the target's records after the alias,
+looked up as though the client had asked for the target by name — another
+rewrite, the block lists, the cache, then the upstream — since glibc and musl
+report a name whose answer is a bare CNAME as not found. A chain stops at the
+first name it has already passed through, or after 8 aliases, and a query with RD
+clear gets the target's records only where this server has them without asking
+an upstream. A refused target leaves the alias alone as the answer. A target
+that is no rewrite shows in the query log as a line of its own, and the metrics count
+the query once, by the target's outcome - or as rewritten, where the target was
+refused or is a special-use name.
+
 #### Other record types
 
 An answer may also be written as a type and that type's RDATA, spelled the way a
