@@ -606,7 +606,7 @@ pc_section :: proc(
 /*
 A record the upstream sent and elodin did not.
 
-Allowed in exactly five situations, and none of them is "the record looked
+Allowed in exactly six situations, and none of them is "the record looked
 unimportant". Their order is not arbitrary: each names a cause, except the last,
 which names a consequence and so goes last - see the note on it.
 */
@@ -719,9 +719,33 @@ pc_missing :: proc(
 	}
 
 	/*
+	The zone's serial moved between the two fetches.
+
+	The same two-fetches argument again, for a zone that is edited rather than
+	signed on the fly: `com.` bumps its serial every few minutes, and a copy
+	this server cached a moment ago carries the serial before the bump. Seen as
+	`github.com. DS` with no EDNS, about once in ten live runs.
+
+	Only the serial may differ. The owner, both names and the four timers are
+	what a client reads the negative ttl from (RFC 2308 section 5), and a SOA
+	whose timers moved is still a difference.
+	*/
+	if policy.mode == .Live && rec.type == 6 && pc_serial_moved(rec, el_recs) {
+		pc_add(
+			c,
+			kind,
+			what,
+			pw_rr_key(rec, c.allocator),
+			"-",
+			"the reference and this answer are two separate fetches, and the zone's serial moved in between",
+		)
+		return
+	}
+
+	/*
 	Cut to fit a datagram from the additional section, where no TC bit says so.
 
-	Last of the five, because the others name a cause and this one names a
+	Last of the six, because the others name a cause and this one names a
 	consequence. A DNSSEC record a client did not ask for was gone before the
 	answer was ever fitted into a datagram, and an answer near the ceiling
 	would otherwise tally it here - `parity_tally` groups by reason, and a
@@ -1012,6 +1036,35 @@ pc_signed_again :: proc(rec: Pw_RR, el_recs: []Pw_RR) -> bool {
 			continue
 		}
 		if pc_same_signed_set(rec.rdata, e.rdata) {
+			return true
+		}
+	}
+	return false
+}
+
+// Whether elodin's section has this SOA with only the serial changed: RFC 1035
+// section 3.3.13 lays it out as two names, then serial and four timers.
+@(private = "file")
+pc_serial_moved :: proc(rec: Pw_RR, el_recs: []Pw_RR) -> bool {
+	a := rec.rdata
+	a_mname, a_ok := pc_name_end(a, 0)
+	a_end, a_ok2 := pc_name_end(a, a_mname)
+	if !a_ok || !a_ok2 || len(a) != a_end + 20 {
+		return false
+	}
+	for e in el_recs {
+		b := e.rdata
+		if e.type != rec.type || e.class != rec.class || len(b) != len(a) {
+			continue
+		}
+		if !pc_name_equal_fold(e.name, rec.name) {
+			continue
+		}
+		b_mname, b_ok := pc_name_end(b, 0)
+		if !b_ok || b_mname != a_mname {
+			continue
+		}
+		if pc_name_equal_fold(a[:a_end], b[:a_end]) && pc_bytes_equal(a[a_end + 4:], b[a_end + 4:]) {
 			return true
 		}
 	}
