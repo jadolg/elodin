@@ -3629,7 +3629,17 @@ zone_step :: proc(
 	}
 	switch step {
 	case .Insecure:
-		cache_put(v, child, .Insecure, nil, negative_ttl(msg), now)
+		/*
+		Not remembered when the ceiling is what made it insecure. Such a denial
+		cannot tell an unsigned delegation from a name nobody holds, so every
+		name a client makes up under the parent arrives here, and remembering
+		each would let a random-subdomain flood push real zones out of the
+		cache - the reason `.Absent` is not remembered either. The answer cache
+		still holds the answer, so a repeated question does not come back here.
+		*/
+		if len(nsecs) > 0 || !nsec3_all_over_ceiling(nsec3s, &budget.nsec3) {
+			cache_put(v, child, .Insecure, nil, negative_ttl(msg), now)
+		}
 	case .No_Cut:
 		/*
 		Remembered for the denial's own negative TTL, the way an insecure
@@ -3700,6 +3710,9 @@ denial_step :: proc(
 	}
 	if len(nsec3s) > 0 {
 		if len(nsecs) == 0 && nsec3_all_over_ceiling(nsec3s, nsec3_budget) {
+			// Said, because the verdict a client's question then carries is
+			// "unsigned zone", which names none of this.
+			logx.debugf("dnssec: the ds denial for %s is past the nsec3 iteration ceiling; the child is insecure", dns.name_trim_root(child))
 			return .Insecure, false
 		}
 		before := nsec3_refusals(nsec3_budget)

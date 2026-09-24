@@ -225,3 +225,25 @@ test_wildcard_answer_without_next_closer_cover_is_bogus :: proc(t: ^testing.T) {
 	)
 	free_all(context.temp_allocator)
 }
+
+/*
+A wildcard proof made only of records past the ceiling leaves the answer
+insecure, as a denial made of them does. Issue #331.
+
+This zone hashes zero times, so the ceiling is set below zero to have something
+to refuse, and the owner is remembered as a non-cut so that the walk ends at the
+apex rather than answering from the DS denial first.
+*/
+@(test)
+test_a_wildcard_proof_past_the_ceiling_is_insecure :: proc(t: ^testing.T) {
+	v := wildcard_validator()
+	testing.expect(t, v != nil, "the anchor should parse")
+	defer destroy_validator(v)
+	v.max_nsec3_iterations = -1
+	non_cut_remember(v, "sub.wildcardtest.", MAX_ZONE_TTL, time.unix(FIXTURE_TIME, 0))
+
+	result := validate(v, "sub.wildcardtest.", .A, wildcard_fixture("wc_wildcard_answer"), time.unix(FIXTURE_TIME, 0))
+	testing.expectf(t, result.status == .Insecure, "got %v (%q)", result.status, result.reason)
+	testing.expect_value(t, result.reason, NSEC3_OVER_CEILING)
+	free_all(context.temp_allocator)
+}

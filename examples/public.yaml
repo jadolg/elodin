@@ -336,7 +336,7 @@ dnssec:
   # above both return the records it needs.
   enabled: true
   # Hashing one NSEC3 record may ask for; a record above it is not computed, so
-  # a zone whose denials are all above it is served insecure rather than being
+  # a denial made only of such records is served insecure rather than being
   # work we do, as Unbound and BIND do past their own ceilings. RFC 9276 asks
   # zones for zero. A larger number is held down to 255 — see examples/elodin.yaml.
   max_nsec3_iterations: 100

@@ -260,6 +260,27 @@ test_the_configured_iteration_ceiling_reaches_the_proof :: proc(t: ^testing.T) {
 	// hashing was done.
 	testing.expect_value(t, budget.nsec3.spent, 0)
 	testing.expect_value(t, budget.nsec3.rounds, 0)
+	// And nothing it stepped through is remembered as an insecure zone: a denial
+	// past the ceiling cannot tell a delegation from a name nobody holds, so
+	// remembering it is one cache entry per name a client makes up.
+	for name in ([]string{"deep.n3test.", N3_QNAME}) {
+		_, cached, _ := cache_get(strict, name, time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+		testing.expectf(t, !cached, "%s should not be cached from a denial past the ceiling", name)
+	}
+
+	// The walk above answered before the denial was read, so the denial's own
+	// verdict needs a walk that ends at the apex: the names below it already
+	// remembered as non-cuts, the way an earlier walk would leave them.
+	unwalked := make_validator(n3_query, nil, Options{anchors = anchors, max_nsec3_iterations = 5})
+	defer destroy_validator(unwalked)
+	non_cut_remember(unwalked, "deep.n3test.", MAX_ZONE_TTL, time.unix(FIXTURE_TIME, 0))
+	non_cut_remember(unwalked, N3_QNAME, MAX_ZONE_TTL, time.unix(FIXTURE_TIME, 0))
+	read := query_budget(unwalked)
+	denied := validate_denial(unwalked, &read, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	testing.expectf(t, denied.status == .Insecure, "a denial past the ceiling is insecure, got %v (%q)", denied.status, denied.reason)
+	testing.expect_value(t, denied.reason, NSEC3_OVER_CEILING)
+	testing.expect(t, read.nsec3.over_ceiling > 0, "the configured ceiling should have refused these records")
+	testing.expect_value(t, read.nsec3.rounds, 0)
 
 	// And the same records under the shipped ceiling, which is the control: the
 	// zone is fine, the number was the whole of the difference.

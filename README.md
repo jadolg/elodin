@@ -1007,9 +1007,11 @@ or captive-portal resolver — against which every signed zone would otherwise s
 resolving rather than merely going unverified.
 
 `max_nsec3_iterations` is the most hashing a single NSEC3 record may ask for.
-A record above it is not computed. A denial made only of such records leaves the
-zone insecure, so its names are served without the AD bit — what RFC 5155
-section 10.3 asks and what Unbound, BIND and Knot do past their own ceilings. Where readable records sit beside refused ones, as
+A record above it is not computed. A denial made only of such records is
+insecure, so the denial, a wildcard answer resting on it and every name below a
+delegation it speaks for are served without the AD bit — what RFC 5155 section
+10.3 asks and what Unbound, BIND and Knot do past their own ceilings. The zone's
+signed records still validate. Where readable records sit beside refused ones, as
 in a zone changing its parameters, the readable ones decide; if they prove
 nothing the name comes back SERVFAIL with extended error 27, because the work
 this server declined may have held the proof. RFC 9276 asks zones for zero and

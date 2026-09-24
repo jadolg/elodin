@@ -477,6 +477,10 @@ DS answer denying it is a forgery. Anyone holding one signed record of an old
 chain above the ceiling can put it beside that denial, and if a refusal anywhere
 in the set were enough, the child would be read as insecure and everything in it
 served on the attacker's word. Only a set with nothing readable in it is.
+
+That is what a mixed set decides, not a bar to the attacker: one who drops the
+readable records and sends the old one alone is the case
+`nsec3_all_over_ceiling` records as left open.
 */
 @(test)
 test_a_refused_record_does_not_downgrade_a_readable_denial :: proc(t: ^testing.T) {
