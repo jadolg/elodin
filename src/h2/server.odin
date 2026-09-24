@@ -116,6 +116,8 @@ Stream :: struct {
 	has to close it there and then or nothing ever will.
 	*/
 	dispatched:   bool,
+	// What this stream has added to Conn.request_bytes, given back when it goes.
+	charged:      int,
 }
 
 Conn :: struct {
@@ -146,6 +148,8 @@ Conn :: struct {
 	tolerance on - into an unbounded run of extra writes; see `handle_data`.
 	*/
 	closed_stream_rst_budget: int,
+	// Request bytes held by this connection's streams; see MAX_CONN_REQUEST.
+	request_bytes:            int,
 
 	allocator:           mem.Allocator,
 	// Scratch for a header block spanning CONTINUATION frames.
@@ -207,6 +211,7 @@ stream_destroy :: proc(c: ^Conn, s: ^Stream) {
 	// by whoever answered it.
 	request_destroy(c, s.pending)
 	delete(s.header_block)
+	c.request_bytes -= s.charged
 	delete(s.body)
 	free(s, c.allocator)
 }
@@ -564,9 +569,8 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	s.refused = refused
 	s.send_window = c.peer_initial_window
 	s.header_block = make([dynamic]u8, 0, len(block), c.allocator)
-	if !refused {
-		s.body = make([dynamic]u8, 0, 512, c.allocator)
-	}
+	// Nothing allocated until DATA arrives, where `handle_data` charges it.
+	s.body = make([dynamic]u8, 0, 0, c.allocator)
 	append(&s.header_block, ..block)
 	s.end_stream = h.flags & FLAG_END_STREAM != 0
 	c.streams[h.stream_id] = s
@@ -828,8 +832,10 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 		goaway(c, .Compression_Error)
 		return false
 	}
-	// The block is decoded; keep only the fields.
-	clear(&s.header_block)
+	// The block is decoded; keep only the fields. Freed rather than cleared, or
+	// a stream parked for its body keeps up to MAX_HEADER_LIST of buffer (#303).
+	delete(s.header_block)
+	s.header_block = nil
 
 	// A refused stream has had its HPACK side effects applied by the decode
 	// above, which is the whole reason it was carried this far. Reset it and let
@@ -891,10 +897,25 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 	}
 	delete(headers, c.allocator)
 
+	// Charged like body bytes: a stream parked for its body holds its fields as
+	// long as it holds the body, and a :path near MAX_HEADER_LIST on every
+	// stream pins as much as the bodies MAX_CONN_REQUEST exists to bound.
+	fields := len(req.method) + len(req.path) + len(req.authority) + len(req.scheme) + len(req.content_type) + len(req.accept)
 	sync.mutex_lock(&c.mu)
-	s.state = .Half_Closed_Remote if s.end_stream else .Open
+	over := c.request_bytes + fields > MAX_CONN_REQUEST
+	if !over {
+		s.charged = fields
+		c.request_bytes += fields
+		s.state = .Half_Closed_Remote if s.end_stream else .Open
+	}
 	complete := s.end_stream
 	sync.mutex_unlock(&c.mu)
+	if over {
+		request_destroy(c, req)
+		sent := rst_stream(c, s.id, .Refused_Stream)
+		close_stream(c, s.id)
+		return sent
+	}
 
 	if !complete {
 		// Park the request until the body arrives.
@@ -987,10 +1008,22 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	}
 	if found && !already_ended {
 		// Checked before appending, so an oversized body is refused rather than
-		// buffered first.
-		if len(s.body) + len(data) > MAX_BODY {
+		// buffered first. Over the connection's share rather than the stream's,
+		// nothing of it reached a handler, so the client may retry it (RFC 9113
+		// 8.7).
+		//
+		// Charged by capacity, not length: left to `append`, a 64 KiB body in
+		// 16 KiB frames grows a 116 KiB buffer. Grown here instead, doubling but
+		// never past MAX_BODY, so what is charged is what is allocated.
+		need := len(s.body) + len(data)
+		oversized := need > MAX_BODY
+		grow := 0
+		if need > cap(s.body) {
+			grow = min(max(need, 2 * cap(s.body)), MAX_BODY) - cap(s.body)
+		}
+		if oversized || c.request_bytes + grow > MAX_CONN_REQUEST {
 			sync.mutex_unlock(&c.mu)
-			sent := rst_stream(c, h.stream_id, .Enhance_Your_Calm)
+			sent := rst_stream(c, h.stream_id, oversized ? .Enhance_Your_Calm : .Refused_Stream)
 			// The stream is over. Without this it would hold its body, its parked
 			// request and one of MAX_CONCURRENT slots until the connection went.
 			close_stream(c, h.stream_id)
@@ -1003,7 +1036,10 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 			*/
 			return sent && give_connection_credit(c, len(payload))
 		}
+		reserve(&s.body, cap(s.body) + grow)
 		append(&s.body, ..data)
+		s.charged += grow
+		c.request_bytes += grow
 	}
 	sync.mutex_unlock(&c.mu)
 
@@ -1069,10 +1105,11 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 
 @(private)
 dispatch :: proc(c: ^Conn, s: ^Stream, req: ^Request) -> bool {
+	// Handed over rather than copied, so it is held once; the stream keeps the
+	// charge until it goes. Both use c.allocator.
 	if len(s.body) > 0 {
-		body := make([]u8, len(s.body), c.allocator)
-		copy(body, s.body[:])
-		req.body = body
+		req.body = s.body[:]
+		s.body = nil
 	}
 	// Marked before the handler runs, not after: it may answer inline and retire
 	// the stream, and a reset arriving for an answered stream must not be read
@@ -1102,6 +1139,21 @@ request_destroy :: proc(c: ^Conn, req: ^Request) {
 }
 
 MAX_BODY :: 64 * 1024
+/*
+Request bytes - decoded header fields and body - one connection may hold across
+all its streams at once.
+
+MAX_BODY alone bounds a stream, not a connection: credit goes straight back on
+every DATA frame, and receive windows are not enforced against a peer anyway, so
+MAX_CONCURRENT streams each parked at MAX_BODY pinned 8 MiB a connection
+(#303), and a long :path on each does as much without any body. Charged as the
+fields are decoded and the body buffered, released only when the stream is
+destroyed, so a request handed to a handler still counts until it is answered.
+Two maximal requests at once, where real DoH queries are a few hundred bytes. A
+stream that would take the connection past it is refused with REFUSED_STREAM,
+which a client may retry (RFC 9113 8.7).
+*/
+MAX_CONN_REQUEST :: 2 * (MAX_BODY + MAX_HEADER_LIST)
 
 // Hand back connection-level receive window for bytes that have been read off
 // the wire, whatever became of the stream they belonged to.
