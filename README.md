@@ -2058,7 +2058,8 @@ first name it has already passed through, or after 8 aliases, and a query with R
 clear gets the target's records only where this server has them without asking
 an upstream. A refused target leaves the alias alone as the answer. A target
 that is no rewrite shows in the query log as a line of its own, and the metrics count
-the query once, by the target's outcome.
+the query once, by the target's outcome - or as rewritten, where the target was
+refused or is a special-use name.
 
 #### Other record types
 

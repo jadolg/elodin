@@ -3907,8 +3907,7 @@ chase_rewrite_alias :: proc(
 			if enc != .None {
 				break walk
 			}
-			answered: bool
-			out, outcome, answered = resolve_query(
+			out, outcome, _ = resolve_query(
 				s,
 				wire,
 				next,
@@ -3927,7 +3926,9 @@ chase_rewrite_alias :: proc(
 			// answer is counted as the rewrite it is. A block list answering
 			// `refused` is `.Blocked` and counted as blocked, alias alone or not.
 			counted = outcome != .Refused && outcome != .Local
-			if !answered || outcome == .Refused {
+			// Unanswered leaves `out` nil, which the decode below turns into
+			// SERVFAIL rather than the bare alias.
+			if outcome == .Refused {
 				break walk
 			}
 		} else if next_alias, is_alias := more.?; is_alias {
