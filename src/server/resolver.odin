@@ -390,6 +390,7 @@ handle_query :: proc(
 	are - BADVERS answers leaving a server with nothing in the query log to
 	account for them are answers an operator has no way to trace back to here.
 	*/
+	ede: u16
 	if dns.edns_version(msg) > 0 {
 		out, built := dns.error_response(query, msg, .Bad_Vers, allocator, limit)
 		// This gate runs before the question count is checked, so there may be no
@@ -414,6 +415,7 @@ handle_query :: proc(
 			&spent,
 			allocator,
 			shared_worker,
+			ede = &ede,
 		)
 	}
 	if ok {
@@ -439,6 +441,9 @@ handle_query :: proc(
 		// it sits behind that and ahead of everything below which measures the
 		// result; `attach_keepalive` argues the three conditions on it.
 		response = attach_keepalive(s, response, msg, proto, limit, advertise, &spent, allocator)
+		// And the extended error this server chose about the answer, behind the
+		// same two for the same reason. See `attach_answer_ede`.
+		response = attach_answer_ede(response, msg, outcome, ede, limit, advertise, &spent, allocator)
 		/*
 		Last, so that nothing after it can put another number back.
 
@@ -1085,6 +1090,13 @@ resolve_query :: proc(
 	bytes and serves them itself. See `refresh.odin`.
 	*/
 	unanswered: ^bool = nil,
+	/*
+	Where the extended error an answer is served with is written, for
+	`handle_query` to attach once the answer's OPT record is this server's own.
+	Only an answer served as it arrived - forwarded, or out of the cache - sets
+	it; see `ceiling_ede`.
+	*/
+	ede: ^u16 = nil,
 ) -> (
 	response: []u8,
 	outcome: Outcome,
@@ -1345,10 +1357,14 @@ resolve_query :: proc(
 				stale   = hit.stale,
 				recheck = hit.recheck,
 				refused = hit.refused,
+				ede     = hit.ede,
 				serial  = hit.serial,
 				checked = generation,
 			}
 			if !hit.stale {
+				if ede != nil {
+					ede^ = stored.ede
+				}
 				return serve_from_cache(s, stored, query, msg, q, proto, client, limit, validating, started, spent, allocator)
 			}
 			stale_hit = stored
@@ -1380,6 +1396,9 @@ resolve_query :: proc(
 	*/
 	if !msg.flags.rd {
 		if stale_hit.wire != nil {
+			if ede != nil {
+				ede^ = stale_hit.ede
+			}
 			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, spent, allocator)
 		}
 		out, built := dns.error_response(query, msg, .Refused, allocator, limit)
@@ -2147,6 +2166,9 @@ resolve_query :: proc(
 			return out, .Failed, built
 		}
 		if stale_hit.wire != nil {
+			if ede != nil {
+				ede^ = stale_hit.ede
+			}
 			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, spent, allocator)
 		}
 		sync.atomic_add(&s.stats.failed, 1)
@@ -2185,6 +2207,7 @@ resolve_query :: proc(
 	// on a DoH upstream is zero. The client is waiting on its own.
 	dns.set_id_in_place(resp, msg.id)
 
+	answer_ede: u16
 	if validating {
 		result := dnssec.validate(
 			s.validator,
@@ -2247,6 +2270,10 @@ resolve_query :: proc(
 			sync.atomic_add(&s.stats.secure, 1)
 		}
 		resp = present_response(resp, msg, q.type, result, spent, allocator)
+		answer_ede = ceiling_ede(result)
+		if ede != nil {
+			ede^ = answer_ede
+		}
 	}
 
 	/*
@@ -2538,7 +2565,7 @@ resolve_query :: proc(
 			   decoded.full &&
 			   !unproven_apex_ds &&
 			   cloak_verdict_worth_keeping(verdict) {
-				cache.put(s.answers, key, resp, decoded.msg, generation, u8(verdict))
+				cache.put(s.answers, key, resp, decoded.msg, generation, u8(verdict), ede = answer_ede)
 			}
 			return out, cloak_outcome(verdict), true
 		}
@@ -2573,7 +2600,7 @@ resolve_query :: proc(
 	willing to speak stores what it said.
 	*/
 	if s.cfg.cache.enabled && decoded.full && !unproven_apex_ds {
-		cache.put(s.answers, key, resp, decoded.msg, generation)
+		cache.put(s.answers, key, resp, decoded.msg, generation, ede = answer_ede)
 	}
 
 	sync.atomic_add(&s.stats.forwarded, 1)
@@ -2914,6 +2941,8 @@ Cached_Answer :: struct {
 	// The rule sets the re-match is made against, and the number stamped on the
 	// entry when it comes back clean.
 	checked: u64,
+	// The extended error the entry is served with; see `cache.Entry.ede`.
+	ede:     u16,
 }
 
 /*

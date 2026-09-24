@@ -72,6 +72,17 @@ Entry :: struct {
 	*/
 	refused:     u8,
 	/*
+	An RFC 8914 extended error the answer goes out with, or zero.
+
+	Kept beside the bytes rather than in them because the OPT record in a
+	stored answer is the upstream's and is emptied on the way out, which is
+	what keeps an upstream's options from reaching a client. A code this
+	server chose about the answer - that it was served insecure because a
+	zone's NSEC3 iteration count is past the ceiling - is ours, and a hit
+	has to say it as the answer that filled the entry did.
+	*/
+	ede:         u16,
+	/*
 	Which entry this is, counted up once per insert and never reused.
 
 	`note_checked` writes to an entry a caller read some microseconds earlier, and
@@ -109,6 +120,8 @@ Hit :: struct {
 	definition, which is what `recheck` says.
 	*/
 	refused: u8,
+	// The entry's extended error; see `Entry.ede`.
+	ede:     u16,
 	// Which entry the bytes came out of, for `note_checked`.
 	serial:  u64,
 }
@@ -386,6 +399,7 @@ get :: proc(
 	hit.serial = e.serial
 	hit.recheck = e.redirects && e.checked != checked_against
 	hit.refused = e.refused
+	hit.ede = e.ede
 
 	elapsed := u32(max(0, time.duration_seconds(time.diff(e.inserted, now))))
 	out := make([]u8, len(e.wire), allocator)
@@ -647,6 +661,7 @@ put :: proc(
 	checked: u64 = 0,
 	refused: u8 = 0,
 	bogus := false,
+	ede: u16 = 0,
 ) -> bool {
 	if c == nil || len(wire) < dns.HEADER_SIZE {
 		return false
@@ -831,6 +846,7 @@ put :: proc(
 	e.bogus = bogus
 	e.checked = checked
 	e.refused = refused
+	e.ede = ede
 	e.inserted = now
 	e.expires = time.time_add(now, time.Duration(effective) * time.Second)
 
