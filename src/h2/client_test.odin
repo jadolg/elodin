@@ -1913,3 +1913,74 @@ test_client_empty_continuation_flood_is_refused :: proc(t: ^testing.T) {
 		testing.expectf(t, false, "%d bytes leaked at %v", entry.size, entry.location)
 	}
 }
+
+@(private = "file")
+Client_Header_Log :: struct {
+	block: [dynamic]u8,
+}
+
+// Keeps the header block of the first HEADERS frame the client writes.
+@(private = "file")
+client_log_headers :: proc(user: rawptr, buf: []u8) -> bool {
+	log := cast(^Client_Header_Log)user
+	pos := 0
+	if len(buf) >= len(PREFACE) && string(buf[:len(PREFACE)]) == PREFACE {
+		pos = len(PREFACE)
+	}
+	for pos + FRAME_HEADER_SIZE <= len(buf) {
+		h, ok := parse_frame_header(buf[pos:])
+		if !ok || pos + FRAME_HEADER_SIZE + h.length > len(buf) {
+			break
+		}
+		if h.type == .Headers && len(log.block) == 0 {
+			append(&log.block, ..buf[pos + FRAME_HEADER_SIZE:pos + FRAME_HEADER_SIZE + h.length])
+		}
+		pos += FRAME_HEADER_SIZE + h.length
+	}
+	return true
+}
+
+/*
+A request with a body says how long the body is.
+
+RFC 9113 section 8.1.1 does not require `content-length` on HTTP/2, and most DoH
+servers take a POST without it - but Cloudflare's does not: `cloudflare-dns.com`
+and `1.1.1.1` answer HTTP 400 to every one, so an upstream configured there
+failed every query with `HTTP_Error`. RFC 8484 section 4.1's own example POST
+carries the header. Found by the live parity run with a DoH upstream.
+*/
+@(test)
+test_client_request_sends_content_length :: proc(t: ^testing.T) {
+	log := Client_Header_Log {
+		block = make([dynamic]u8, 0, 128, context.temp_allocator),
+	}
+	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_headers})
+	defer client_unref(c)
+
+	body := []u8{0xde, 0xad, 0xbe, 0xef, 0x00}
+	_, _ = client_request(
+		c,
+		Client_Request {
+			method = "POST",
+			scheme = "https",
+			authority = "mock.invalid",
+			path = "/dns-query",
+			content_type = "application/dns-message",
+			body = body,
+		},
+		10 * time.Millisecond,
+	)
+
+	table: Dynamic_Table
+	dynamic_table_init(&table, 4096, context.temp_allocator)
+	headers, err := decode(&table, log.block[:], context.temp_allocator)
+	testing.expectf(t, err == .None, "the request's header block does not decode: %v", err)
+	length := ""
+	for f in headers {
+		if f.name == "content-length" {
+			length = f.value
+		}
+	}
+	testing.expectf(t, length == "5", "content-length is %q, not the body's 5 bytes", length)
+	free_all(context.temp_allocator)
+}
