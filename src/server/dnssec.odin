@@ -519,9 +519,19 @@ whatever the upstream put in that bit is its claim rather than ours. Forwarding
 it would lend our name to an assertion nothing here checked, which RFC 4035
 section 3.2.2 asks a resolver never to do; on a plain UDP upstream, or one
 reached over a connection nobody authenticated, that claim is anyone's to make.
+
+CD is settled here too, for the same reason and on the same every-answer path:
+it is the client's bit to have echoed (RFC 4035 section 3.2.2), not the
+upstream's. An upstream's copy echoes the question this server put, which
+carries CD when we validate - and some upstreams echo nothing at all: OpenDNS
+clears CD on every answer. The validated path puts the client's bit back in
+`present_response`, but an answer to a CD query is never validated and so never
+passed through there, and a cached one carries whatever the query that filled
+the entry was answered with.
 */
 @(private)
 settle_ad_bit :: proc(wire: []u8, query: dns.Message, validated: bool) {
+	set_cd_bit(wire, query.flags.cd)
 	if validated {
 		apply_ad_policy(wire, query)
 		return
