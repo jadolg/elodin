@@ -116,6 +116,8 @@ Stream :: struct {
 	has to close it there and then or nothing ever will.
 	*/
 	dispatched:   bool,
+	// What this stream has added to Conn.request_bytes, given back when it goes.
+	charged:      int,
 }
 
 Conn :: struct {
@@ -146,8 +148,8 @@ Conn :: struct {
 	tolerance on - into an unbounded run of extra writes; see `handle_data`.
 	*/
 	closed_stream_rst_budget: int,
-	// Request body bytes held by this connection's streams; see MAX_CONN_BODY.
-	body_bytes:               int,
+	// Request bytes held by this connection's streams; see MAX_CONN_REQUEST.
+	request_bytes:            int,
 
 	allocator:           mem.Allocator,
 	// Scratch for a header block spanning CONTINUATION frames.
@@ -209,7 +211,7 @@ stream_destroy :: proc(c: ^Conn, s: ^Stream) {
 	// by whoever answered it.
 	request_destroy(c, s.pending)
 	delete(s.header_block)
-	c.body_bytes -= len(s.body)
+	c.request_bytes -= s.charged
 	delete(s.body)
 	free(s, c.allocator)
 }
@@ -831,8 +833,10 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 		goaway(c, .Compression_Error)
 		return false
 	}
-	// The block is decoded; keep only the fields.
-	clear(&s.header_block)
+	// The block is decoded; keep only the fields. Freed rather than cleared, or
+	// a stream parked for its body keeps up to MAX_HEADER_LIST of buffer (#303).
+	delete(s.header_block)
+	s.header_block = nil
 
 	// A refused stream has had its HPACK side effects applied by the decode
 	// above, which is the whole reason it was carried this far. Reset it and let
@@ -894,10 +898,25 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 	}
 	delete(headers, c.allocator)
 
+	// Charged like body bytes: a stream parked for its body holds its fields as
+	// long as it holds the body, and a :path near MAX_HEADER_LIST on every
+	// stream pins as much as the bodies MAX_CONN_REQUEST exists to bound.
+	fields := len(req.method) + len(req.path) + len(req.authority) + len(req.scheme) + len(req.content_type) + len(req.accept)
 	sync.mutex_lock(&c.mu)
-	s.state = .Half_Closed_Remote if s.end_stream else .Open
+	over := c.request_bytes + fields > MAX_CONN_REQUEST
+	if !over {
+		s.charged = fields
+		c.request_bytes += fields
+		s.state = .Half_Closed_Remote if s.end_stream else .Open
+	}
 	complete := s.end_stream
 	sync.mutex_unlock(&c.mu)
+	if over {
+		request_destroy(c, req)
+		sent := rst_stream(c, s.id, .Refused_Stream)
+		close_stream(c, s.id)
+		return sent
+	}
 
 	if !complete {
 		// Park the request until the body arrives.
@@ -994,7 +1013,7 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		// nothing of it reached a handler, so the client may retry it (RFC 9113
 		// 8.7).
 		oversized := len(s.body) + len(data) > MAX_BODY
-		if oversized || c.body_bytes + len(data) > MAX_CONN_BODY {
+		if oversized || c.request_bytes + len(data) > MAX_CONN_REQUEST {
 			sync.mutex_unlock(&c.mu)
 			sent := rst_stream(c, h.stream_id, oversized ? .Enhance_Your_Calm : .Refused_Stream)
 			// The stream is over. Without this it would hold its body, its parked
@@ -1010,7 +1029,8 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 			return sent && give_connection_credit(c, len(payload))
 		}
 		append(&s.body, ..data)
-		c.body_bytes += len(data)
+		s.charged += len(data)
+		c.request_bytes += len(data)
 	}
 	sync.mutex_unlock(&c.mu)
 
@@ -1076,10 +1096,11 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 
 @(private)
 dispatch :: proc(c: ^Conn, s: ^Stream, req: ^Request) -> bool {
+	// Handed over rather than copied, so it is held once; the stream keeps the
+	// charge until it goes. Both use c.allocator.
 	if len(s.body) > 0 {
-		body := make([]u8, len(s.body), c.allocator)
-		copy(body, s.body[:])
-		req.body = body
+		req.body = s.body[:]
+		s.body = nil
 	}
 	// Marked before the handler runs, not after: it may answer inline and retire
 	// the stream, and a reset arriving for an answered stream must not be read
@@ -1110,17 +1131,19 @@ request_destroy :: proc(c: ^Conn, req: ^Request) {
 
 MAX_BODY :: 64 * 1024
 /*
-Request body bytes one connection may hold across all its streams at once.
+Request bytes - decoded header fields and body - one connection may hold across
+all its streams at once.
 
 MAX_BODY alone bounds a stream, not a connection: credit goes straight back on
 every DATA frame, and receive windows are not enforced against a peer anyway, so
 MAX_CONCURRENT streams each parked at MAX_BODY pinned 8 MiB a connection
-(#303). Charged as bytes are buffered and released only when the stream is
-destroyed, so a body handed to a handler still counts until it is answered.
-Twice MAX_BODY: two maximal DoH queries at once, where real ones are a few
-hundred bytes.
+(#303), and a long :path on each does as much without any body. Charged as the
+fields are decoded and the body buffered, released only when the stream is
+destroyed, so a request handed to a handler still counts until it is answered.
+Two maximal requests at once, where real DoH queries are a few hundred bytes. A stream that would take the connection past it is refused with
+REFUSED_STREAM, which a client may retry (RFC 9113 8.7).
 */
-MAX_CONN_BODY :: 2 * MAX_BODY
+MAX_CONN_REQUEST :: 2 * (MAX_BODY + MAX_HEADER_LIST)
 
 // Hand back connection-level receive window for bytes that have been read off
 // the wire, whatever became of the stream they belonged to.

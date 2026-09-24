@@ -318,7 +318,7 @@ test_oversized_body_drops_the_stream :: proc(t: ^testing.T) {
 #303: MAX_BODY bounded a stream, not a connection. Every stream opened up to
 MAX_CONCURRENT and parked at MAX_BODY without END_STREAM, the credit for
 each frame handed straight back, and one connection held 8 MiB of bodies. Counted
-from the streams themselves rather than from `body_bytes`, so the test measures
+from the streams themselves rather than from `request_bytes`, so the test measures
 what is held and not the bookkeeping that is meant to bound it.
 */
 @(test)
@@ -328,10 +328,8 @@ test_parked_bodies_are_bounded_per_connection :: proc(t: ^testing.T) {
 	defer mem.tracking_allocator_destroy(&track)
 	allocator := mem.tracking_allocator(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 1024, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+	log: Request_Log
+	c := make_conn(IO{user = &log, read = no_read, write = request_log_write}, ignore_request, nil, allocator)
 
 	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
 	body := make([]u8, MAX_BODY, context.temp_allocator)
@@ -345,28 +343,111 @@ test_parked_bodies_are_bounded_per_connection :: proc(t: ^testing.T) {
 	held := 0
 	for _, s in c.streams {
 		held += len(s.body)
+		// A parked stream's decoded header block is not held beside its body.
+		testing.expect_value(t, cap(s.header_block), 0)
 	}
-	testing.expectf(t, held <= MAX_CONN_BODY, "one connection holds %d body bytes, over %d", held, MAX_CONN_BODY)
+	testing.expectf(t, held <= MAX_CONN_REQUEST, "one connection holds %d body bytes, over %d", held, MAX_CONN_REQUEST)
 
 	// Refused as safe to retry, since none of them reached a handler.
-	refused := 0
-	for f in log.frames {
-		if f.type == .Rst_Stream {
-			refused += 1
-		}
-	}
-	testing.expect_value(t, refused, MAX_CONCURRENT - MAX_CONN_BODY / MAX_BODY)
+	// Two maximal bodies fit beside their small fields; a third would not.
+	testing.expect_value(t, log.rsts, MAX_CONCURRENT - 2)
+	testing.expect_value(t, log.rst_code, Error_Code.Refused_Stream)
 
 	// Released with the streams, or the connection is starved for good.
 	for id in 0 ..< 2 * MAX_CONCURRENT {
 		close_stream(c, u32(id))
 	}
-	testing.expect_value(t, c.body_bytes, 0)
+	testing.expect_value(t, c.request_bytes, 0)
 
-	delete(log.frames)
 	conn_unref(c)
 	free_all(context.temp_allocator)
 	expect_no_leaks(t, &track, "parked bodies")
+}
+
+/*
+The same hold as the one above, without a byte of body: a :path near
+MAX_HEADER_LIST on every stream, parked for a body that never comes. The header
+block itself is freed once decoded; the fields are what is left, and they are
+charged against the same bound.
+*/
+@(test)
+test_parked_fields_are_bounded_per_connection :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log: Request_Log
+	c := make_conn(IO{user = &log, read = no_read, write = request_log_write}, ignore_request, nil, allocator)
+
+	path := make([]u8, 30_000, context.temp_allocator)
+	path[0] = '/'
+	for i in 1 ..< len(path) {
+		path[i] = 'a'
+	}
+	block := make([dynamic]u8, 0, len(path) + 64, context.temp_allocator)
+	encode_header(&block, ":method", "POST")
+	encode_header(&block, ":scheme", "https")
+	encode_header(&block, ":authority", "example.com")
+	encode_header(&block, ":path", string(path))
+	for n in 0 ..< MAX_CONCURRENT {
+		id := u32(2 * n + 1)
+		ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block[:])
+		testing.expect(t, ok, "handle_headers failed")
+	}
+
+	held := 0
+	for _, s in c.streams {
+		held += cap(s.header_block)
+		if s.pending != nil {
+			held += len(s.pending.path) + len(s.pending.method) + len(s.pending.authority) + len(s.pending.scheme)
+		}
+	}
+	testing.expectf(t, held <= MAX_CONN_REQUEST, "one connection holds %d bytes of parked fields, over %d", held, MAX_CONN_REQUEST)
+	testing.expect_value(t, log.rsts, MAX_CONCURRENT - len(c.streams))
+	testing.expect_value(t, log.rst_code, Error_Code.Refused_Stream)
+
+	for id in 0 ..< 2 * MAX_CONCURRENT {
+		close_stream(c, u32(id))
+	}
+	testing.expect_value(t, c.request_bytes, 0)
+
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "parked fields")
+}
+
+/*
+A dispatched request keeps its charge until `respond` retires the stream, and
+gives it back then; otherwise two answered POSTs would leave the connection
+refusing every one after. The body is handed to the handler rather than copied,
+and the handler frees it, which the leak check holds to exactly once.
+*/
+@(test)
+test_answered_request_gives_its_charge_back :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	c := make_conn(IO{read = no_read, write = discard_write}, destroying_handler, nil, allocator)
+
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+	body := make([]u8, MAX_BODY, context.temp_allocator)
+	ok := handle_data(c, Frame_Header{length = len(body), type = .Data, flags = FLAG_END_STREAM, stream_id = 1}, body)
+	testing.expect(t, ok, "handle_data failed")
+	testing.expect(t, c.request_bytes > MAX_BODY, "a dispatched request is no longer charged")
+	if s, found := c.streams[1]; found {
+		testing.expect(t, cap(s.body) == 0, "the stream still holds a body it handed over")
+	}
+
+	respond(c, 1, Response{status = 200, content_type = "application/dns-message", body = []u8{1, 2, 3, 4}})
+	testing.expect_value(t, c.request_bytes, 0)
+
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "answered request")
 }
 
 /*
