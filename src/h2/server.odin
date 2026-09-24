@@ -31,6 +31,11 @@ never given up on, which on a DoH server is a connection and a thread held for
 nothing before any stream exists. Optional: a transport with nothing to bound
 leaves it nil.
 
+`starts_frame` is false for a frame's payload, which is the rest of a frame whose
+header has already been read, and true for everything else: a transport that
+decides to stop reading should decide it where a frame starts, not between the
+halves of one it has already begun to take.
+
 Both halves of this package call it, though only the server has a transport that
 sets one today. A hook that fired on one path and not the other would hand a
 client transport that set it a bound it never got, which is the failure it exists
@@ -40,7 +45,7 @@ IO :: struct {
 	user:  rawptr,
 	read:  proc(user: rawptr, buf: []u8) -> (n: int, ok: bool),
 	write: proc(user: rawptr, buf: []u8) -> bool,
-	begin: proc(user: rawptr),
+	begin: proc(user: rawptr, starts_frame: bool),
 }
 
 Request :: struct {
@@ -267,7 +272,7 @@ serve :: proc(c: ^Conn) {
 		payload: []u8
 		if h.length > 0 {
 			payload = make([]u8, h.length, context.temp_allocator)
-			if !read_exact(c, payload) {
+			if !read_exact(c, payload, starts_frame = false) {
 				return
 			}
 		}
@@ -295,11 +300,11 @@ read_preface :: proc(c: ^Conn) -> bool {
 }
 
 @(private)
-read_exact :: proc(c: ^Conn, buf: []u8) -> bool {
+read_exact :: proc(c: ^Conn, buf: []u8, starts_frame := true) -> bool {
 	// One whole thing off the wire starts here: everything this package reads it
 	// reads through this, so this is the one place that has to say so. See `IO`.
 	if c.io.begin != nil {
-		c.io.begin(c.io.user)
+		c.io.begin(c.io.user, starts_frame)
 	}
 	got := 0
 	for got < len(buf) {
