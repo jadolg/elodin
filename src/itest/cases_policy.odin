@@ -330,6 +330,7 @@ rewrites:
   - {{ domain: "*.lab", answers: [10.0.0.1, "fd00::1"] }}
   - {{ domain: old.example.org, answer: new.example.org }}
   - {{ domain: telemetry.example.org, answer: block }}
+  - {{ domain: cloak.example.org, answer: telemetry.example.org }}
   - {{ domain: www.example.org, answer: 203.0.113.9 }}
   - {{ domain: shadowed.lab, answer: 192.168.1.70 }}
   - {{ domain: sink.example.org, answers: [block, 192.168.1.60] }}
@@ -394,11 +395,29 @@ rewrites:
 	}
 	end_case(r)
 
-	start_case(r, "rewrite: a name answer becomes a CNAME")
+	// With the target's own address behind it, from the upstream: glibc and musl
+	// report a name whose A answer is a bare CNAME as not found (issue #320).
+	start_case(r, "rewrite: a name answer becomes a CNAME, followed to the target")
 	{
 		res := query_udp(udp_port, build_query("old.example.org.", u16(dns.Type.A)))
 		if check(r, res.ok, "no response") {
 			check_eq_str(r, first_cname_or_name(r, res.wire), "new.example.org.", "CNAME target")
+			addrs := answer_addresses(r, res.wire)
+			if check(r, len(addrs) == 1, "expected the target's address after the CNAME, got %d", len(addrs)) {
+				check_eq_str(r, addrs[0], "203.0.113.1", "target address")
+			}
+		}
+	}
+	end_case(r)
+
+	// The target is put to the same rules a question for it by name would be.
+	start_case(r, "rewrite: a CNAME to a sunk name is sunk")
+	{
+		res := query_udp(udp_port, build_query("cloak.example.org.", u16(dns.Type.A)))
+		if check(r, res.ok, "no response") {
+			h := parse_header(r, res.wire)
+			check(r, h.rcode == int(dns.Rcode.NX_Domain), "rcode %d, want NXDOMAIN", h.rcode)
+			check_eq_str(r, first_cname_or_name(r, res.wire), "telemetry.example.org.", "CNAME target")
 		}
 	}
 	end_case(r)

@@ -1097,6 +1097,8 @@ resolve_query :: proc(
 	it; see `ceiling_ede`.
 	*/
 	ede: ^u16 = nil,
+	// How many CNAME rewrites led here. See `chase_rewrite_alias`.
+	chased := 0,
 ) -> (
 	response: []u8,
 	outcome: Outcome,
@@ -1151,7 +1153,24 @@ resolve_query :: proc(
 		return out, .Refused, built
 	}
 
-	if out, matched := apply_rewrite(s, msg, q, allocator, limit); matched {
+	if out, matched, alias := apply_rewrite(s, msg, q, allocator, limit); matched {
+		if cname, is_alias := alias.?; is_alias {
+			out = chase_rewrite_alias(
+				s,
+				out,
+				cname,
+				msg,
+				proto,
+				client,
+				limit,
+				cookie,
+				started,
+				spent,
+				allocator,
+				shared_worker,
+				chased,
+			)
+		}
 		sync.atomic_add(&s.stats.rewritten, 1)
 		log_query(s, client, proto, q, .Rewritten, "rewrite", started)
 		return out, .Rewritten, true
@@ -3561,6 +3580,14 @@ synth_soa_for_zone :: proc(zone: string, ttl: u32, allocator: mem.Allocator) -> 
 	return recs
 }
 
+/*
+How many CNAME rewrites one query follows before answering with the chain as it
+stands. Unbound's restart limit is the same number; a real chain of local names
+is two or three long, and anything longer is a loop the loader could not see -
+wildcards make that undecidable - that must end without taking a worker with it.
+*/
+MAX_REWRITE_CHASE :: 8
+
 @(private)
 apply_rewrite :: proc(
 	s: ^Server,
@@ -3571,6 +3598,9 @@ apply_rewrite :: proc(
 ) -> (
 	response: []u8,
 	matched: bool,
+	// The CNAME the answer consists of, when it is one, for the caller to
+	// restart the lookup at. See `chase_rewrite_alias`.
+	alias: Maybe(dns.Record),
 ) {
 	/*
 	The rules are walked rather than the first match taken, because a rule that
@@ -3602,7 +3632,7 @@ apply_rewrite :: proc(
 	search: for {
 		i, found := find_rewrite_index(s.cfg.rewrites, q.name, from)
 		if !found {
-			return nil, false
+			return nil, false, nil
 		}
 		rule := s.cfg.rewrites[i]
 
@@ -3634,7 +3664,7 @@ apply_rewrite :: proc(
 					)
 				}
 			case .CNAME:
-				// A CNAME answers every type; the client follows it from here.
+				// A CNAME answers every type; `chase_rewrite_alias` follows it.
 				append(
 					&answers,
 					dns.Record {
@@ -3704,7 +3734,7 @@ apply_rewrite :: proc(
 		*/
 
 		if blocked {
-			return build_block_response(s, query, q, allocator, limit), true
+			return build_block_response(s, query, q, allocator, limit), true, nil
 		}
 
 		/*
@@ -3779,10 +3809,102 @@ apply_rewrite :: proc(
 		}
 		out, _, err := dns.encode_message(resp, allocator, limit)
 		if err != .None {
-			return nil, false
+			return nil, false, nil
 		}
-		return out, true
+		if rule_holds_alias(rule) {
+			alias = answers[0]
+		}
+		return out, true, alias
 	}
+}
+
+/*
+The rest of the answer to a question a CNAME rewrite answered, from the name it
+points at (issue #320).
+
+RFC 1034 section 4.3.2 step 3.a has a server that meets an alias restart the
+lookup at the canonical name and put what it finds there in the same answer,
+and the stubs most programs link against depend on it: glibc's `getanswer_r`
+and musl both give up on an A answer that holds nothing but a CNAME. So the
+target is put through `resolve_query` as a question of its own, with the
+client's flags - another rewrite, the block lists, the special-use names, the
+cache and the upstreams all get their say on it, exactly as they would had the
+client asked for it by name, which is what dnsmasq's `--cname` and AdGuard
+Home's rewrites do too.
+
+The alias alone is still the answer where there is nothing to restart: a
+question for the CNAME itself or for ANY, which the alias matches; a chain
+`MAX_REWRITE_CHASE` long; and a target the server declines to look up, which
+is what RD=0 gets for a name that is no rule of ours - the refusal is about the
+target, and the alias the client did ask about is answerable. Anything else the
+target produces is the answer, rcode included (RFC 6604 section 2.1: the rcode
+speaks for the last name in the chain), with its authority section for the SOA
+a denial is cached by. Never AD: the alias is this server's own and unsigned.
+*/
+@(private)
+chase_rewrite_alias :: proc(
+	s: ^Server,
+	plain: []u8,
+	alias: dns.Record,
+	msg: dns.Message,
+	proto: Protocol,
+	client: string,
+	limit: int,
+	cookie: Cookie_Request,
+	started: time.Time,
+	spent: ^int,
+	allocator: mem.Allocator,
+	shared_worker: bool,
+	chased: int,
+) -> []u8 {
+	q := msg.question[0]
+	target, is_name := alias.data.(dns.Rdata_Name)
+	if !is_name || q.type == .CNAME || q.type == .ANY || chased >= MAX_REWRITE_CHASE {
+		return plain
+	}
+
+	questions := make([]dns.Question, 1, allocator)
+	questions[0] = dns.Question{name = target.name, type = q.type, class = q.class}
+	next := msg
+	next.question = questions
+	wire, _, enc := dns.encode_message(next, allocator)
+	if enc != .None {
+		return plain
+	}
+	out, outcome, ok := resolve_query(
+		s,
+		wire,
+		next,
+		proto,
+		client,
+		limit,
+		cookie,
+		started,
+		spent,
+		allocator,
+		shared_worker,
+		chased = chased + 1,
+	)
+	if !ok || outcome == .Refused {
+		return plain
+	}
+	rest, derr := dns.decode_message(out, allocator, spent)
+	if derr != .None {
+		return plain
+	}
+
+	answers := make([]dns.Record, len(rest.answer) + 1, allocator)
+	answers[0] = alias
+	copy(answers[1:], rest.answer)
+	resp := dns.make_response(msg, dns.Rcode(rest.flags.rcode), allocator)
+	resp.answer = answers
+	resp.authority = rest.authority
+	resp.flags.tc = rest.flags.tc
+	chain, _, err := dns.encode_message(resp, allocator, limit)
+	if err != .None {
+		return plain
+	}
+	return chain
 }
 
 /*
