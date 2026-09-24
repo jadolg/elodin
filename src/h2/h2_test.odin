@@ -414,7 +414,10 @@ test_parked_fields_are_bounded_per_connection :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expectf(t, held <= MAX_CONN_REQUEST, "one connection holds %d bytes of parked fields, over %d", held, MAX_CONN_REQUEST)
-	testing.expect_value(t, log.rsts, MAX_CONCURRENT - len(c.streams))
+	// As many as fit and no fewer, or a bound that refused everything would pass.
+	per_stream := len("POST") + len("https") + len("example.com") + len(path)
+	testing.expect_value(t, len(c.streams), MAX_CONN_REQUEST / per_stream)
+	testing.expect_value(t, log.rsts, MAX_CONCURRENT - MAX_CONN_REQUEST / per_stream)
 	testing.expect_value(t, log.rst_code, Error_Code.Refused_Stream)
 
 	for id in 0 ..< 2 * MAX_CONCURRENT {

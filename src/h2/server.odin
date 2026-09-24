@@ -569,10 +569,8 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	s.refused = refused
 	s.send_window = c.peer_initial_window
 	s.header_block = make([dynamic]u8, 0, len(block), c.allocator)
-	if !refused {
-		// Nothing allocated until DATA arrives, where `handle_data` charges it.
-		s.body = make([dynamic]u8, 0, 0, c.allocator)
-	}
+	// Nothing allocated until DATA arrives, where `handle_data` charges it.
+	s.body = make([dynamic]u8, 0, 0, c.allocator)
 	append(&s.header_block, ..block)
 	s.end_stream = h.flags & FLAG_END_STREAM != 0
 	c.streams[h.stream_id] = s
