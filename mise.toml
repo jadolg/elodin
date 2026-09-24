@@ -145,12 +145,13 @@ description = "Compare elodin's answers against its upstream's, field by field"
 depends = ["build", "prepare"]
 run = [
   "odin build src/itest -collection:elodin=src -out:bin/itest -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES",
-  "./bin/itest --parity --parity-runs 2000",
+  "./bin/itest --parity --parity-scenario all --parity-runs 2000",
 ]
 
-# The seeds that have found something, replayed once each. A divergence that was
-# found stays found, the same way `fuzz-regression` keeps a crash found. Fast
-# enough to gate a pull request.
+# The seeds that have found something, replayed once each under every scenario.
+# A divergence that was found stays found, the same way `fuzz-regression` keeps a
+# crash found, and a seed found under one configuration is awkward traffic for
+# all of them. Fast enough to gate a pull request.
 [tasks.parity-regression]
 description = "Replay the parity seeds that once diverged"
 depends = ["build", "prepare"]
@@ -160,7 +161,7 @@ status=0
 while read -r seed _; do
   case "$seed" in ''|'#'*) continue ;; esac
   echo "parity seed $seed"
-  ./bin/itest --parity --parity-seed "$seed" --parity-runs 400 || status=1
+  ./bin/itest --parity --parity-scenario all --parity-seed "$seed" --parity-runs 400 || status=1
 done < testdata/parity-seeds
 exit $status
 """

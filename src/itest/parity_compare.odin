@@ -71,7 +71,38 @@ Parity_Policy :: struct {
 	transport: Parity_Transport,
 	// What the client advertised it could receive, or 512 with no EDNS.
 	client_udp_limit: int,
+	/*
+	`cookies.enabled`: this server hands a cookie to a client that sends one.
+
+	Decides two things. With it on, a client's own eight bytes have to come back
+	at the front of the cookie it is handed (RFC 7873 section 5.2.2), or the
+	client throws the answer away. With it off this server mints none, so a
+	cookie on the answer can only be the upstream's.
+	*/
+	client_cookies: bool,
+	/*
+	The cache is on, and so a ttl may be less than the upstream's.
+
+	Two ways, and both are bounded rather than waved through. An answer served
+	from the cache has been counting down since it was stored, by at most
+	`cache_age` seconds - which the caller knows, because it stored the
+	reference at the same moment. And `cache.max_ttl` caps what a client is
+	told to hold a record for (`cache.put` in src/cache/cache.odin).
+
+	`cache.negative_ttl` is not in it. It bounds how long the entry lives here
+	and is never written into the answer, so the SOA of a denial comes back as
+	the upstream sent it, counted down like any other record.
+	*/
+	cache:     bool,
+	cache_age: u32,
 }
+
+// What a server cookie costs an answer: four bytes of option header and the
+// eight-byte client half with a sixteen-byte server half behind it.
+PC_COOKIE_OPTION :: 4 + 24
+
+// The shipped `cache.max_ttl`, which no scenario moves.
+PARITY_CACHE_MAX_TTL :: 86400
 
 // The smallest an OPT record can be on the wire: a root owner name, the type,
 // the class carrying the payload size, the four TTL bytes and an empty RDATA.
@@ -384,6 +415,29 @@ pc_header :: proc(
 
 	pc_tc(c, up, el, policy, first_dropped)
 	pc_ad(c, q, up, el, policy)
+
+	/*
+	A datagram larger than the client can take.
+
+	Not parity - the upstream's answer is as large as it likes - and not
+	something any allowance above would notice either: every one of them
+	excuses an answer for being *smaller* than the upstream's, and an answer
+	that arrived whole in one oversized datagram agrees with the upstream in
+	every record. RFC 6891 section 6.2.3 holds a responder to the requestor's
+	payload size, and `response_limit` floors it further at
+	`server.max_udp_response`; a datagram past either is one the client's
+	buffer, or the path to it, drops.
+	*/
+	if policy.transport == .UDP && el.size > policy.client_udp_limit {
+		pc_add(
+			c,
+			.Header,
+			"a udp answer larger than this client's limit",
+			fmt.aprintf("%d at most", policy.client_udp_limit, allocator = c.allocator),
+			fmt.aprintf("%d", el.size, allocator = c.allocator),
+			"",
+		)
+	}
 }
 
 /*
@@ -479,7 +533,16 @@ pc_ad :: proc(c: ^Parity_Compare, q: Parity_Query, up, el: Pw_Msg, policy: Parit
 		return
 	}
 	reason := "validation is off, so this server has authenticated nothing and may not say it has"
-	if policy.dnssec_validation {
+	if policy.dnssec_validation && q.cd {
+		/*
+		The client disabled checking, so this server validated nothing and
+		has no verdict to put in the bit; the upstream's AD is its own claim
+		(`settle_ad_bit` in src/server/dnssec.odin). A resolver that sets AD
+		under CD anyway - AdGuard's does, for data it validated earlier - is
+		entitled to, and so is one that does not.
+		*/
+		reason = "the client set cd, so this server validated nothing and has no verdict of its own to put in the bit (RFC 4035 section 3.2.2)"
+	} else if policy.dnssec_validation {
 		if q.do_bit || q.ad {
 			pc_add(c, .Header, "ad (authenticated data)", "1", "0", "")
 			return
@@ -577,13 +640,25 @@ pc_section :: proc(
 			continue
 		}
 		taken[matched] = true
+		reason := "the answer was re-encoded and the name compressed against an earlier one, which RFC 1035 section 4.1.4 matches without regard to case, so the earlier spelling is the one written"
+		/*
+		Served from the cache, the reference is the reply to whichever query
+		filled the entry, spelled the way that query spelled its question -
+		and the mock writes its names as pointers at the question. The cached
+		copy has this client's question written over it, so the same pointers
+		now spell this client's case: what the upstream would have sent had it
+		been asked this way, which is the reverse of a name being lost.
+		*/
+		if policy.cache_age > 0 {
+			reason = "served from a cache entry another query filled; the names that point at the question follow this client's spelling of it, and names compare without regard to case (RFC 4343)"
+		}
 		pc_add(
 			c,
 			kind,
 			fmt.aprintf("a name in the %s section came back in a different case", name, allocator = c.allocator),
 			pw_rr_key(u.rec, c.allocator),
 			pw_rr_key(el_recs[matched], c.allocator),
-			"the answer was re-encoded and the name compressed against an earlier one, which RFC 1035 section 4.1.4 matches without regard to case, so the earlier spelling is the one written",
+			reason,
 		)
 		pc_ttl(c, kind, name, u.rec, el_recs[matched], policy)
 	}
@@ -1004,7 +1079,9 @@ pc_added_record_allowance :: proc(
 	rec: Pw_RR,
 	policy: Parity_Policy,
 ) -> string {
-	if policy.mode != .Live {
+	// Without validation this server forwards the client's DO as it was, so
+	// the proof it would have asked for is not a reason for anything.
+	if policy.mode != .Live || !policy.dnssec_validation {
 		return ""
 	}
 	if pc_dnssec_type(rec.type) {
@@ -1167,7 +1244,9 @@ pc_ttl :: proc(
 		return
 	}
 	reason := ""
-	if !policy.ttl_exact {
+	if policy.cache {
+		reason = pc_cached_ttl(u, e, policy)
+	} else if !policy.ttl_exact {
 		// See `Parity_Policy.ttl_exact`.
 		reason = "the reference and this answer are two separate fetches, so their ttls have been counting down since two different moments"
 	}
@@ -1184,6 +1263,27 @@ pc_ttl :: proc(
 		fmt.aprintf("%d", e.ttl, allocator = c.allocator),
 		reason,
 	)
+}
+
+/*
+Why a ttl the cache had its hands on may differ from the upstream's, or empty
+where it may not.
+
+The ceiling is the upstream's ttl capped by `cache.max_ttl`, which the cache
+writes into what it stores. Below that, an answer served from the cache may be
+up to `cache_age` seconds lower, and never higher. So a ttl that grew, or one
+that fell further than the entry has existed, is still a finding.
+*/
+@(private = "file")
+pc_cached_ttl :: proc(u, e: Pw_RR, policy: Parity_Policy) -> string {
+	ceiling := min(u.ttl, PARITY_CACHE_MAX_TTL)
+	if e.ttl > ceiling || e.ttl + policy.cache_age < ceiling {
+		return ""
+	}
+	if e.ttl == ceiling {
+		return "cache.max_ttl caps how long a client is told to hold a record"
+	}
+	return "served from the cache, which counts a ttl down by the time the entry has been held"
 }
 
 // --- edns ------------------------------------------------------------------
@@ -1266,6 +1366,82 @@ pc_edns :: proc(
 	// not a copy of what the upstream said it could, so it is not compared.
 	pc_opt_flags(c, q, el)
 	pc_opt_contents(c, q, up, el, policy)
+	pc_client_cookie(c, q, el, policy)
+}
+
+/*
+The cookie a client is handed, held to the client's side of the exchange.
+
+Not parity: the upstream's cookie belongs to the other hop and `pc_opt_contents`
+is what keeps it from crossing. This is the half nothing else checks - that a
+client which sent a cookie gets its own eight bytes back at the front of one
+(RFC 7873 section 5.2.2), since a cookie with any other client half is one the
+client discards along with the answer it came on. With cookies off there is no
+cookie to hand out, and one on the answer is a leak `pc_client_mintable` already
+reports.
+*/
+@(private = "file")
+pc_client_cookie :: proc(c: ^Parity_Compare, q: Parity_Query, el: Pw_Msg, policy: Parity_Policy) {
+	if !policy.client_cookies {
+		// `pc_opt_contents` catches the upstream's cookie crossing, but only
+		// where the upstream sent one - and with `cookies.upstream` off too it
+		// has none to send. A cookie here is then this server minting one it
+		// was configured not to.
+		if got, found := pw_find_option(el, 10); found {
+			pc_add(c, .Edns, "a cookie on the answer with cookies off", "-", pc_hex(got, c.allocator), "")
+		}
+		return
+	}
+	sent: []u8
+	for o in q.options {
+		if o.code == 10 {
+			sent = o.data
+		}
+	}
+	if len(sent) < 8 {
+		return
+	}
+	got, found := pw_find_option(el, 10)
+	if !found {
+		/*
+		The one answer a cookie is left off: a datagram without room for the
+		twenty-eight bytes it adds (`attach_cookie`, and
+		src/server/cookie_fit_test.odin for the argument). Either the answer
+		fitted and goes whole rather than cut for the cookie, or it was already
+		cut for its own size and the client is on its way to TCP, where it gets
+		one. Held to that - over UDP, and a cookie that genuinely would not have
+		fitted in what was written.
+		*/
+		if policy.transport == .UDP && el.size + PC_COOKIE_OPTION > policy.client_udp_limit {
+			pc_add(
+				c,
+				.Edns,
+				fmt.aprintf(
+					"no cookie: %d bytes written, the cookie costs %d, and this client's limit is %d",
+					el.size,
+					PC_COOKIE_OPTION,
+					policy.client_udp_limit,
+					allocator = c.allocator,
+				),
+				pc_hex(sent[:8], c.allocator),
+				"-",
+				"the cookie did not fit the client's datagram behind what was written, so it was left off rather than records dropped for it",
+			)
+			return
+		}
+		pc_add(c, .Edns, "no cookie for a client that sent one", pc_hex(sent[:8], c.allocator), "-", "")
+		return
+	}
+	if len(got) < 16 || len(got) > 40 || !pc_bytes_equal(got[:8], sent[:8]) {
+		pc_add(
+			c,
+			.Edns,
+			"the cookie does not carry the client's own eight bytes at its front",
+			pc_hex(sent[:8], c.allocator),
+			pc_hex(got, c.allocator),
+			"",
+		)
+	}
 }
 
 @(private = "file")
@@ -1346,7 +1522,7 @@ pc_opt_contents :: proc(c: ^Parity_Compare, q: Parity_Query, up, el: Pw_Msg, pol
 			same bytes on both sides says nothing - the same coincidence padding
 			has, arrived at from the other direction. In the mock mode the
 			upstream's value is not a coincidence at all: `pm_opt` states one
-			second where `parity_config` pins ten, so the two can only agree if
+			second where `parity_scenario_config` pins ten, so the two can only agree if
 			one of them is the other. That is the only reading under which this
 			option can be caught crossing on a transport where elodin mints one
 			of its own, and it is free.
@@ -1429,7 +1605,7 @@ which is where a leak would have to show up.
 pc_client_mintable :: proc(code: u16, q: Parity_Query, policy: Parity_Policy) -> bool {
 	switch code {
 	case 10: // COOKIE, issued to this client (src/server/cookie.odin)
-		return true
+		return policy.client_cookies
 	case 11:
 		/*
 		edns-tcp-keepalive, this connection's idle timeout
@@ -1446,7 +1622,7 @@ pc_client_mintable :: proc(code: u16, q: Parity_Query, policy: Parity_Policy) ->
 		// Padding, sized for this client's transport (src/dns/padding.odin):
 		// the encrypted transports, and only for a client that padded its own
 		// query (RFC 7830 section 4, RFC 8467 section 5).
-		if policy.transport != .DoT && policy.transport != .DoH {
+		if policy.transport != .DoT && !pg_is_doh(policy.transport) {
 			return false
 		}
 		return pc_query_sent_option(q, 12)
@@ -1581,7 +1757,7 @@ pc_hex :: proc(b: []u8, allocator: mem.Allocator) -> string {
 	return strings.to_string(sb)
 }
 
-@(private = "file")
+@(private)
 pc_rcode_text :: proc(rcode: u16, allocator: mem.Allocator) -> string {
 	switch rcode {
 	case 0:

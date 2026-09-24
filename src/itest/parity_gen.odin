@@ -51,7 +51,19 @@ Parity_Transport :: enum u8 {
 	UDP,
 	TCP,
 	DoT,
+	// DoH over HTTP/1.1, the query POSTed.
 	DoH,
+	// DoH over HTTP/1.1, the query base64url in the URL (RFC 8484 section 4.1).
+	DoH_GET,
+	// DoH over HTTP/2, which is a different listener path in this server
+	// (src/server/doh2.odin) from the HTTP/1.1 one.
+	DoH2,
+}
+
+// Whether a transport is one of the DoH ones, which share every rule about
+// what an answer may carry.
+pg_is_doh :: proc(t: Parity_Transport) -> bool {
+	return t == .DoH || t == .DoH_GET || t == .DoH2
 }
 
 pg_transport_name :: proc(t: Parity_Transport) -> string {
@@ -64,6 +76,10 @@ pg_transport_name :: proc(t: Parity_Transport) -> string {
 		return "dot"
 	case .DoH:
 		return "doh"
+	case .DoH_GET:
+		return "doh-get"
+	case .DoH2:
+		return "doh2"
 	}
 	return "?"
 }

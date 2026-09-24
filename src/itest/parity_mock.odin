@@ -383,7 +383,7 @@ pm_opt :: proc(query: []u8, r: ^Pg_Rand, shape: int, allocator: mem.Allocator) -
 	client and must not reach it - `dns.strip_edns_options` is what stops it, on
 	every transport and whether or not elodin writes one of its own.
 
-	One second, where `parity_config` pins elodin's own timeout at ten. On the
+	One second, where `parity_scenario_config` pins elodin's own timeout at ten. On the
 	answers elodin writes no keepalive into, the option's presence is the
 	finding and the value is beside the point; on the two transports where it
 	writes one, the value is the whole of what is left to read, and this is what

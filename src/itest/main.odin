@@ -27,6 +27,7 @@ USAGE :: `elodin integration tests
 usage:
   itest [-v] [--binary <path>] [--keep] [--graceful-stop]
   itest --parity [--parity-runs <n>] [--parity-seed <n>] [--parity-upstream <host:port>]
+               [--parity-scenario <name|all>]
 
 options:
   -v, --verbose       print each case as it runs
@@ -44,6 +45,10 @@ parity (see cases_parity.odin):
       --parity-upstream <host:port>
                           compare against this resolver rather than against a
                           synthetic upstream. Needs the network
+      --parity-scenario <name|all>
+                          the configuration to compare under (default
+                          baseline, or live with --parity-upstream); all runs
+                          every one of the mode's. Listed in parity_scenario.odin
       --parity-explain    print every difference, the allowed ones included
 `
 
@@ -58,7 +63,8 @@ main :: proc() {
 	graceful_stop := false
 	parity := false
 	parity_opts := Parity_Options {
-		runs = 500,
+		runs     = 500,
+		scenario = "baseline",
 	}
 
 	args := os.args[1:]
@@ -92,6 +98,9 @@ main :: proc() {
 		case "--parity-upstream":
 			i += 1
 			parity_opts.upstream = str_arg(args, i, "--parity-upstream")
+		case "--parity-scenario":
+			i += 1
+			parity_opts.scenario = str_arg(args, i, "--parity-scenario")
 		case "--binary":
 			if i + 1 >= len(args) {
 				fmt.eprintln("itest: --binary needs a path")
