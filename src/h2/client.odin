@@ -1,6 +1,7 @@
 package h2
 
 import "core:mem"
+import "core:strconv"
 import "core:sync"
 import "core:time"
 
@@ -785,6 +786,15 @@ client_request :: proc(
 	}
 	if req.accept != "" {
 		encode_header(&block, "accept", req.accept)
+	}
+	/*
+	Optional in HTTP/2 (RFC 9113 section 8.1.1), and sent anyway: Cloudflare's
+	DoH endpoint answers 400 to a POST without it, which made it unusable as an
+	upstream. RFC 8484's own example POST carries it.
+	*/
+	if len(req.body) > 0 {
+		digits: [20]u8
+		encode_header(&block, "content-length", strconv.write_int(digits[:], i64(len(req.body)), 10))
 	}
 	end_stream: u8 = FLAG_END_STREAM if len(req.body) == 0 else 0
 
