@@ -1206,6 +1206,52 @@ def ipv6_reverse_name_error():
          message(qname, PTR, [], absent + [sign(absent, apex)], rcode=3), rcode=3)
 
 
+
+@scenario
+def nsec3_signed_cut_below_ceiling():
+    """Cover a signed child under an empty non-terminal of a zone past the ceiling."""
+    # Issue #331. The walk cannot read `e.c3test.`'s DS denial once the ceiling
+    # is below twelve, so it keeps the parent's keys past it - and must stop
+    # holding that against anything once `s.e.c3test.` turns out to be a DS the
+    # parent signed. The child's own signed answer and an unsigned one forged
+    # for the same name are the two things that say whether it did.
+    root = Key(".", "c3cut-root")
+    zone = Key("c3test.", "c3cut-zone")
+    child = Key("s.e.c3test.", "c3cut-child")
+
+    root_keys = [RR(".", DNSKEY, root.rdata)]
+    print("// anchor: %s" % root.ds_text())
+    emit("c3_root_dnskey", ".", "DNSKEY",
+         message(".", DNSKEY, root_keys + [sign(root_keys, root)]))
+    ds_set = [RR(zone.zone, DS, zone.ds())]
+    emit("c3_ds", zone.zone, "DS", message(zone.zone, DS, ds_set + [sign(ds_set, root)]))
+    keys = [RR(zone.zone, DNSKEY, zone.rdata)]
+    emit("c3_dnskey", zone.zone, "DNSKEY", message(zone.zone, DNSKEY, keys + [sign(keys, zone)]))
+
+    chain = nsec3_chain(
+        "c3test.",
+        [
+            ("c3test.", [NS, SOA, RRSIG, DNSKEY, NSEC3PARAM]),
+            ("e.c3test.", []),
+            ("s.e.c3test.", [NS, DS, RRSIG]),
+        ],
+        bytes.fromhex("0e0f"),
+        12,
+    )
+    ent = chain["e.c3test."]
+    emit("c3_ent_ds", "e.c3test.", "DS",
+         message("e.c3test.", DS, [], [ent, sign([ent], zone)]))
+
+    child_ds = [RR(child.zone, DS, child.ds())]
+    emit("c3_child_ds", child.zone, "DS",
+         message(child.zone, DS, child_ds + [sign(child_ds, zone)]))
+    child_keys = [RR(child.zone, DNSKEY, child.rdata)]
+    emit("c3_child_dnskey", child.zone, "DNSKEY",
+         message(child.zone, DNSKEY, child_keys + [sign(child_keys, child)]))
+    answer = [a_rr(child.zone, "192.0.2.53")]
+    emit("c3_answer", child.zone, "A", message(child.zone, A, answer + [sign(answer, child)]))
+
+
 if __name__ == "__main__":
     wanted = sys.argv[1:] or list(SCENARIOS)
     for name in wanted:

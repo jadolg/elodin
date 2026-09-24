@@ -387,3 +387,35 @@ test_a_forged_unsigned_answer_past_the_ceiling_is_not_served :: proc(t: ^testing
 	testing.expectf(t, held.status == .Bogus, "got %v (%q)", held.status, held.reason)
 	free_all(context.temp_allocator)
 }
+
+/*
+An unsigned denial inside a zone past the ceiling is not called forged either.
+
+An unsigned delegation's own NXDOMAIN or NODATA carries no NSEC3 records, and
+the walk past a DS denial it could not read ends on the parent's keys, which
+sign nothing here. That is the same undecided case as the unsigned answer above,
+and it gets the same answer: `Indeterminate` with the ceiling named, as on main,
+rather than `Bogus` - extended error 6 and a forgery logged over our refusal.
+*/
+@(test)
+test_an_unsigned_denial_past_the_ceiling_is_not_called_forged :: proc(t: ^testing.T) {
+	anchor, parsed := parse_trust_anchor(N3_ANCHOR, context.temp_allocator)
+	testing.expect(t, parsed, "the anchor should parse")
+	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
+	anchors[0] = anchor
+	for rc in ([]dns.Rcode{.No_Error, .NX_Domain}) {
+		msg, err := dns.decode_message(n3_reply(), context.temp_allocator)
+		testing.expect(t, err == .None, "the fixture should decode")
+		dns.set_rcode(&msg, rc)
+		msg.authority = nil
+		msg.answer = nil
+		wire, _, encode_err := dns.encode_message(msg, context.temp_allocator)
+		testing.expect_value(t, encode_err, dns.Encode_Error.None)
+		strict := make_validator(n3_query, nil, Options{anchors = anchors, max_nsec3_iterations = 5})
+		result := validate(strict, N3_QNAME, .A, wire, time.unix(FIXTURE_TIME, 0))
+		testing.expectf(t, result.status == .Indeterminate, "rcode %v: got %v (%q)", rc, result.status, result.reason)
+		testing.expect_value(t, result.reason, NSEC3_OVER_CEILING)
+		destroy_validator(strict)
+	}
+	free_all(context.temp_allocator)
+}

@@ -243,9 +243,13 @@ refused record decide would let anyone holding one signed record of an old,
 expensive chain turn a denial the readable chain contradicts into an insecure
 answer. Which leaves the one thing nobody can close: a sender replaying only
 the old chain, while its signatures last, gets its denials served insecure - a
-name made to look absent, though never a forged record served for one. That
-needs a zone that published an iteration count nobody should, and it is the
-price every resolver doing this pays.
+name made to look absent, though never a forged record served for one. And
+not only in that zone: the walk reads the same records to find the cuts below
+it, so a cold cache can be walked past a signed child's DS and the child's names
+made to look absent too. That needs a parent that published an iteration count
+nobody should, recently enough for its signatures to hold, and it is less than
+Unbound concedes for the same zone - there the child is read as unsigned and
+anything in it can be forged.
 
 An NSEC record is readable too, so a denial carrying one is never this.
 */

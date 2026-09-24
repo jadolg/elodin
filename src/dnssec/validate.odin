@@ -386,7 +386,8 @@ Budget :: struct {
 	broken step below be judged as if the parent had been read - calling the
 	first insecure is a forgery served, calling either bogus accuses the zone
 	of our refusal. Both are `Indeterminate` with the ceiling named instead,
-	which is what they were before. Cleared with `walk_stopped`.
+	which is what they were before. The same goes for a denial that proves
+	nothing. Cleared with `walk_stopped`, and at a signed cut below the step.
 	*/
 	walk_past_ceiling: bool,
 	/*
@@ -2235,6 +2236,12 @@ validate_denial :: proc(
 		// calls no cut leaves the proof signed by a zone `established` is
 		// above. See `forget_unreached_non_cut`.
 		forget_unreached_non_cut(v, qname, established)
+		// Or the walk kept a parent's keys past a DS denial it could not read,
+		// and this is an unsigned delegation's own answer. See
+		// `Budget.walk_past_ceiling`.
+		if budget.walk_past_ceiling {
+			return {status = .Indeterminate, reason = NSEC3_OVER_CEILING}
+		}
 		return {status = .Bogus, reason = "no denial of existence"}
 	}
 
@@ -2294,6 +2301,9 @@ validate_denial :: proc(
 	case .Opt_Out:
 		return {status = .Insecure, reason = "opt-out span"}
 	case .Failed:
+		if budget.walk_past_ceiling {
+			return {status = .Indeterminate, reason = NSEC3_OVER_CEILING}
+		}
 		return {status = .Bogus, reason = "denial of existence not proven"}
 	}
 	return {status = .Bogus, reason = "denial of existence not proven"}
@@ -2578,11 +2588,6 @@ validate_rrset :: proc(
 		return .Bogus, "", "broken chain of trust", "", {}
 	case .Secure:
 	}
-	// Unsigned, below a DS denial nobody could read: an unsigned delegation or
-	// a forgery, and nothing here says which. See `Budget.walk_past_ceiling`.
-	if budget.walk_past_ceiling {
-		return .Indeterminate, "", NSEC3_OVER_CEILING, "", {}
-	}
 
 	/*
 	The zone is signed, nothing verified - and this server turned one of its own
@@ -2610,6 +2615,13 @@ validate_rrset :: proc(
 	*/
 	if skipped_for_shed {
 		return .Indeterminate, "", WALKS_IN_FLIGHT, "", {}
+	}
+	// Unsigned, below a DS denial nobody could read: an unsigned delegation or
+	// a forgery, and nothing here says which. See `Budget.walk_past_ceiling`.
+	// After the shed check, so a signature that went untried is still counted
+	// as shed rather than blamed on the zone.
+	if budget.walk_past_ceiling {
+		return .Indeterminate, "", NSEC3_OVER_CEILING, "", {}
 	}
 
 	/*
@@ -3356,6 +3368,9 @@ zone_trust :: proc(
 			}
 			zone = child
 			keys = child_keys
+			// A DS the parent signed: whatever the walk kept keys past above
+			// this, what is below is judged against a zone it did read.
+			budget.walk_past_ceiling = false
 		case .No_Cut:
 			/*
 			Not a cut, so the walk keeps its keys and keeps going.
