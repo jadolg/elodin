@@ -2744,6 +2744,22 @@ It runs in two modes, and they are not equally strong:
   it is used as a reference at all, and a difference has to survive asking the
   whole question again. What it buys is answers no mock would think to serve.
 
+Each mode runs under **scenarios** (`--parity-scenario <name|all>`, listed in
+`src/itest/parity_scenario.odin`), because a pipe with the cache off and one
+plain-UDP upstream is not the pipe a resolver in service is. Each scenario moves
+several levers at once: the upstream's transport (UDP, TCP, DoT, DoH), the
+strategy (failover, race, round robin) and a zone routed elsewhere, the cache,
+cookies off or required, the UDP ceiling at 512, 1232 and 4096, and block rules
+on a name and on a CNAME target with an allow rule inside them. Clients ask over
+UDP, TCP, DoT and DoH as POST, GET and HTTP/2. What a scenario answers for
+itself is checked rather than skipped: a blocked name has to get the configured
+block response without the upstream being asked, a `cookies.require` client has
+to get BADCOOKIE and a cookie carrying its own half before its query is held to
+parity, a route has to reach its own upstream and nothing else, and a cached
+answer's TTLs may have counted down by no more than the entry's age. Live
+scenarios add validation and the cache both off, and the upstream reached over
+DoT or DoH at the resolver's own name.
+
 Both are built on their own wire walker (`src/itest/parity_wire.odin`) which does
 not import `elodin:dns`, for the reason the fixtures give: a comparator built on
 the codec under test loses a record identically on both sides and reports
@@ -2771,10 +2787,11 @@ reproducing it against the synthetic upstream where the answer is either a bug o
 is not.
 
 ```
-mise run parity                                   # 2000 queries, synthetic upstream
+mise run parity                                   # 2000 queries per scenario, synthetic upstream
 ./bin/itest --parity --parity-seed 1 -v           # reproduce one run
+./bin/itest --parity --parity-scenario cache      # one scenario; `all` for every one
 ./bin/itest --parity --parity-explain             # print the allowed differences too
-./bin/itest --parity --parity-upstream 1.1.1.1:53 # against a real resolver
+./bin/itest --parity --parity-upstream 1.1.1.1:53 --parity-scenario all # against a real resolver
 ```
 
 **Against live DNS**, because none of the layers above can prove the absence of

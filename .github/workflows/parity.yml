@@ -52,6 +52,7 @@ jobs:
       - name: Compare against the synthetic upstream
         run: |
           ./bin/itest --parity \
+            --parity-scenario all \
             --parity-runs "${{ inputs.runs || '20000' }}" \
             --parity-seed "${{ inputs.seed || '0' }}" \
             -v
@@ -81,10 +82,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Each runs every live scenario, the DoT and DoH ones at the names
+        # PARITY_RESOLVERS in src/itest/parity_scenario.odin gives it. More than
+        # the big three, because resolvers disagree about awkward zones and a
+        # forwarder is put in front of all of them.
         resolver:
           - 1.1.1.1:53
           - 8.8.8.8:53
           - 9.9.9.9:53
+          - 94.140.14.140:53 # AdGuard, unfiltered
+          - 208.67.222.222:53 # OpenDNS
+          - 185.222.222.222:53 # DNS.SB
+          - 76.76.2.11:53 # Control D, unfiltered
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -126,6 +135,7 @@ jobs:
         run: |
           ./bin/itest --parity \
             --parity-upstream "${{ matrix.resolver }}" \
+            --parity-scenario all \
             --parity-runs 2000 \
             --parity-seed "${{ inputs.seed || '0' }}" \
             -v

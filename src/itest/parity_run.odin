@@ -36,8 +36,34 @@ parity_ask_elodin :: proc(srv: ^Server, q: Parity_Query) -> (answer: []u8, ok: b
 			return nil, false
 		}
 		return res.body, true
+	case .DoH_GET:
+		res := doh_get(srv.doh_port, "/dns-query", q.wire, context.temp_allocator)
+		if !res.ok || res.status != 200 || len(res.body) < 12 {
+			return nil, false
+		}
+		return res.body, true
+	case .DoH2:
+		return parity_ask_h2(srv.doh_port, q.wire)
 	}
 	return nil, false
+}
+
+// One query POSTed over a connection of its own that negotiated HTTP/2.
+@(private = "file")
+parity_ask_h2 :: proc(port: int, query: []u8) -> (answer: []u8, ok: bool) {
+	c, connected := h2_connect(port)
+	if !connected {
+		return nil, false
+	}
+	defer h2_close(c)
+	if !h2_send_request(c, 1, "POST", "/dns-query", query) || !h2_collect(c, []u32{1}) {
+		return nil, false
+	}
+	res, found := h2_stream(c, 1)
+	if !found || res.status != 200 || len(res.body) < 12 {
+		return nil, false
+	}
+	return res.body, true
 }
 
 /*
@@ -188,14 +214,14 @@ Only meaningful over UDP; every other transport carries a length prefix and has
 no such ceiling.
 */
 @(private)
-parity_client_limit :: proc(q: Parity_Query) -> int {
+parity_client_limit :: proc(q: Parity_Query, ceiling := PARITY_MAX_UDP_RESPONSE) -> int {
 	if q.transport != .UDP {
 		return 65535
 	}
 	if !q.edns {
 		return 512
 	}
-	return min(max(int(q.udp_size), 512), PARITY_MAX_UDP_RESPONSE)
+	return min(max(int(q.udp_size), 512), ceiling)
 }
 
 /*
@@ -421,6 +447,7 @@ parity_report :: proc(r: ^Runner, opts: Parity_Options, stats: Parity_Stats) {
 	fmt.printfln("    answered here %d", stats.local)
 	fmt.printfln("    unanswered    %d", stats.unanswered)
 	fmt.printfln("    skipped       %d", stats.skipped)
+	fmt.printfln("    blocked       %d", stats.blocked)
 	fmt.printfln("    split upstream %d", stats.upstream_split)
 	fmt.printfln("    diverged      %d", stats.failures)
 	fmt.printf("    transports    ")

@@ -34,6 +34,13 @@ Doh2_Mock :: struct {
 	mu:        sync.Mutex,
 	h2_hits:   int,
 	h1_hits:   int,
+
+	// Answer from the parity check's synthetic zone rather than with
+	// `payload`, and keep the last reply for it to compare against - the same
+	// pair `Mock.last_reply` and `Mock.replies` are for the plain mock.
+	parity:     bool,
+	last_reply: []u8,
+	replies:    int,
 }
 
 doh2_mock_make :: proc(port: int, path: string, payload: []u8) -> ^Doh2_Mock {
@@ -86,8 +93,29 @@ doh2_mock_stop :: proc(m: ^Doh2_Mock) {
 		delete(pending)
 	}
 	delete(m.threads)
+	if m.last_reply != nil {
+		delete(m.last_reply)
+	}
 	tlsx.context_destroy(m.tls_ctx)
 	free(m)
+}
+
+// A copy of the last reply, and how many have gone out since the last reset.
+doh2_mock_last_reply :: proc(m: ^Doh2_Mock, allocator := context.temp_allocator) -> (reply: []u8, count: int) {
+	sync.mutex_lock(&m.mu)
+	defer sync.mutex_unlock(&m.mu)
+	if m.last_reply == nil {
+		return nil, m.replies
+	}
+	out := make([]u8, len(m.last_reply), allocator)
+	copy(out, m.last_reply)
+	return out, m.replies
+}
+
+doh2_mock_reset_replies :: proc(m: ^Doh2_Mock) {
+	sync.mutex_lock(&m.mu)
+	defer sync.mutex_unlock(&m.mu)
+	m.replies = 0
 }
 
 // Connections handled over h2 and over HTTP/1.1, so a test can tell which
@@ -204,7 +232,7 @@ doh2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	m.h2_hits += 1
 	sync.mutex_unlock(&m.mu)
 
-	body := doh2_reply_body(m, req.body[0], req.body[1], context.temp_allocator)
+	body := doh2_reply_body(m, req.body, context.temp_allocator)
 	h2.respond(hc, req.stream_id, h2.Response{status = 200, content_type = "application/dns-message", body = body})
 }
 
@@ -286,7 +314,7 @@ doh2_serve_http1 :: proc(conn: ^Doh2_Conn) {
 	m.h1_hits += 1
 	sync.mutex_unlock(&m.mu)
 
-	reply := doh2_reply_body(m, body[0], body[1], context.temp_allocator)
+	reply := doh2_reply_body(m, body[:content_length], context.temp_allocator)
 	b := strings.builder_make(context.temp_allocator)
 	strings.write_string(&b, "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: ")
 	strings.write_int(&b, len(reply))
@@ -312,13 +340,26 @@ doh2_serve_http1 :: proc(conn: ^Doh2_Conn) {
 }
 
 // A copy of the mock's canned payload with the transaction ID patched to
-// match the query that asked for it.
+// match the query that asked for it - or, for a parity mock, the synthetic
+// zone's answer, whole: DoH has no datagram to truncate for.
 @(private = "file")
-doh2_reply_body :: proc(m: ^Doh2_Mock, id_hi, id_lo: u8, allocator := context.allocator) -> []u8 {
+doh2_reply_body :: proc(m: ^Doh2_Mock, query: []u8, allocator := context.allocator) -> []u8 {
+	if m.parity {
+		out := parity_synth_reply(query, true, allocator)
+		sync.mutex_lock(&m.mu)
+		defer sync.mutex_unlock(&m.mu)
+		if m.last_reply != nil {
+			delete(m.last_reply)
+		}
+		m.last_reply = make([]u8, len(out))
+		copy(m.last_reply, out)
+		m.replies += 1
+		return out
+	}
 	out := make([]u8, len(m.payload), allocator)
 	copy(out, m.payload)
 	if len(out) >= 2 {
-		out[0], out[1] = id_hi, id_lo
+		out[0], out[1] = query[0], query[1]
 	}
 	return out
 }
