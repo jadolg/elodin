@@ -214,8 +214,11 @@ test_nsec3_iteration_ceiling_refuses_the_hash :: proc(t: ^testing.T) {
 	/*
 	The iteration count is the zone's to choose and the work is ours, so an
 	absurd one is a denial-of-service lever. Refusing to compute the hash makes
-	every proof built on that record fail, which downgrades the answer to
-	insecure rather than letting it through - and never spends the CPU.
+	every proof built on that record fail, and never spends the CPU. What the
+	answer becomes is the caller's to say: a denial with nothing readable in it
+	is insecure (`nsec3_all_over_ceiling`), and one with readable records beside
+	the refused ones is decided by those. Issue #331 found this comment claiming
+	the first while the code said `Bogus`.
 	*/
 	rr := n3(H_EXAMPLE, H_NS1, {.NS, .SOA}).rr
 	out: [20]u8
@@ -228,6 +231,7 @@ test_nsec3_iteration_ceiling_refuses_the_hash :: proc(t: ^testing.T) {
 		record.rr.iterations = 5000
 	}
 	testing.expect_value(t, nsec3_proves_name_error(zone, "nx.example.", "example.", budget_at(150)), Proof.Failed)
+	testing.expect(t, nsec3_all_over_ceiling(nil, zone, budget_at(150)), "and that is what makes the denial insecure")
 	free_all(context.temp_allocator)
 }
 
@@ -262,6 +266,22 @@ test_nsec3_unknown_hash_algorithm_is_refused :: proc(t: ^testing.T) {
 	append(&mixed, unknown)
 	_, matched := nsec3_matching(mixed[:], "a.example.", budget_at(A_ITERATIONS))
 	testing.expect(t, !matched, "a record naming an unknown hash must not borrow the digest of the one before it")
+
+	// Nor is it one the ceiling refused, so it cannot make a denial insecure:
+	// that reading is for the zone's iteration count, and the ceiling never
+	// looked at these. Issue #331.
+	for &record in zone {
+		record.rr.iterations = 5000
+	}
+	testing.expect(t, !nsec3_all_over_ceiling(nil, zone, budget_at(150)), "records ignored for their algorithm are not over the ceiling")
+
+	// And a budget built without the ceiling fails closed rather than calling
+	// every SHA-1 denial insecure. See `query_budget`.
+	for &record in zone {
+		record.rr.hash_algorithm = NSEC3_HASH_SHA1
+	}
+	testing.expect(t, nsec3_all_over_ceiling(nil, zone, budget_at(150)), "the control: these are over a real ceiling")
+	testing.expect(t, !nsec3_all_over_ceiling(nil, zone, budget_at(0)), "a budget with no ceiling set must not downgrade a denial")
 	free_all(context.temp_allocator)
 }
 

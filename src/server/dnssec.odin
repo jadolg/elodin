@@ -756,6 +756,59 @@ dnssec_failure_response :: proc(
 	return encoded, true
 }
 
+/*
+The extended error an answer that is served goes out with, or zero.
+
+One reason has one: a denial served insecure because every NSEC3 record in it
+asks for more hashing than `dnssec.max_nsec3_iterations` allows. RFC 9276
+section 3.2 asks a resolver answering insecure or SERVFAIL over such a record to
+say so with code 27, and the SERVFAIL half is `dnssec_failure_response`. Without
+it the answer is indistinguishable from one out of an unsigned zone, and whoever
+is wondering why a signed zone lost its AD bit has nothing to go on.
+*/
+@(private)
+ceiling_ede :: proc(result: dnssec.Result) -> u16 {
+	if result.status == .Insecure && result.reason == dnssec.NSEC3_OVER_CEILING {
+		return u16(EDE_UNSUPPORTED_NSEC3_ITERATIONS)
+	}
+	return 0
+}
+
+/*
+Write `code` into the answer's OPT record, for a client that sent one.
+
+Only on an answer served as it arrived. Everything else is built here and
+carries whatever error it was built with - a SERVFAIL its verdict's, a block its
+own - and `normalise_client_opt` has already emptied the record of a forwarded
+or cached answer, so what goes in is the only option in it that says anything
+about the answer. No extra text: the code says it, and a cache hit has no
+validator's reason to hand back.
+
+An answer the option would push past `limit` goes without it, as a keepalive
+does: the answer is the thing the client asked for.
+*/
+@(private)
+attach_answer_ede :: proc(
+	wire: []u8,
+	query: dns.Message,
+	outcome: Outcome,
+	code: u16,
+	limit: int,
+	advertise: u16,
+	spent: ^int,
+	allocator: mem.Allocator,
+) -> []u8 {
+	if code == 0 || (outcome != .Forwarded && outcome != .Cached) || !dns.edns_present(query) {
+		return wire
+	}
+	value := [2]u8{u8(code >> 8), u8(code)}
+	out, ok := dns.ensure_edns_option(wire, .Ext_Error, value[:], advertise, allocator, spent)
+	if !ok || len(out) > limit {
+		return wire
+	}
+	return out
+}
+
 @(private)
 attach_extended_error :: proc(resp: ^dns.Message, code: u16, text: string, allocator: mem.Allocator) {
 	for &rec in resp.additional {

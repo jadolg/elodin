@@ -433,10 +433,10 @@ dnssec:
   # trust_anchors:
   #   - ". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"
 
-  # NSEC3 records asking for more hashing than this are not computed, so a name
-  # whose proof needs one comes back SERVFAIL — or, where what is left of the
-  # proof is an opt-out span, served without the AD bit — rather than handing
-  # the resolver an arbitrary amount of work. RFC 9276 asks zones for zero. A
+  # NSEC3 records asking for more hashing than this are not computed, so a
+  # denial made only of them is served insecure, without the AD bit, as
+  # Unbound and BIND do past their own ceilings, rather than handing the
+  # resolver an arbitrary amount of work. RFC 9276 asks zones for zero. A
   # query has a hashing allowance of its own, and above 255 that allowance answers
   # instead — the zones a higher ceiling admits are the ones whose proofs it
   # cannot pay for — so a larger number here is held down at startup, with a

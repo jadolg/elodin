@@ -340,7 +340,7 @@ sizing is prose in `nsec3.odin` until something runs it: a change to the reuse,
 to what a proof scans, or to the charge itself moves the number, and the first
 anyone would otherwise hear of it is a reverse lookup answering SERVFAIL.
 
-A hundred iterations, the ceiling this server ships, and a salt of the length
+The ceiling this server ships, and a salt of the length
 zones really publish.
 */
 @(test)
@@ -354,11 +354,11 @@ test_the_deepest_walk_this_server_follows_fits_in_one_allowance :: proc(t: ^test
 		name = fmt.tprintf("n%d.%s", i, name)
 		append(&nodes, Node{name, {.A, .RRSIG}})
 	}
-	zone := nsec3_zone(nodes[:], []u8{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}, 100)
+	zone := nsec3_zone(nodes[:], []u8{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}, DEFAULT_MAX_NSEC3_ITERATIONS)
 	testing.expect(t, len(zone) == len(nodes), "the chain should build")
 
 	budget := Nsec3_Budget {
-		max_iterations = 100,
+		max_iterations = DEFAULT_MAX_NSEC3_ITERATIONS,
 	}
 	// Every step of the walk, then the denial of a name under the deepest one.
 	for node in nodes[1:] {
@@ -425,5 +425,84 @@ test_a_chain_above_the_ceiling_does_not_stop_the_one_beside_it :: proc(t: ^testi
 	testing.expect(t, !cut_short, "a chain refused for its iterations is not a reading this server stopped short of")
 	testing.expect(t, budget.over_ceiling > 0, "the old chain should have been refused, or this proves nothing")
 	testing.expect_value(t, budget.spent, 0)
+	free_all(context.temp_allocator)
+}
+
+/*
+A DS denial this server could read none of for its iteration count keeps the
+walk going on the parent's keys, rather than leaving it undecided.
+
+Every record above the ceiling is refused, and that refusal is a policy: no
+question will ever read them. Reading it as `Indeterminate` made every name
+below a parent over the ceiling SERVFAIL here and nowhere else. Issue #331.
+
+Not `.Insecure` either, which is the other easy answer and a hole: the walk
+runs over every label of every owner it checks, so an insecure step makes every
+name in the zone unsigned, and an unsigned answer forged for any of them is
+served. `.No_Cut` keeps the parent's keys, so what is signed still has to
+verify; `test_a_forged_unsigned_answer_past_the_ceiling_is_not_served` is the
+other half.
+
+The allowance is the other refusal and keeps its answer: a record it turned away
+is one this server would have read a moment earlier, so nothing is decided.
+*/
+@(test)
+test_a_ds_denial_above_the_ceiling_keeps_the_parents_keys :: proc(t: ^testing.T) {
+	nodes := []Node {
+		{"example.", {.NS, .SOA, .RRSIG, .DNSKEY}},
+		{"a.example.", {.A, .RRSIG}},
+	}
+	chain := nsec3_zone(nodes, []u8{0x0c, 0x0d}, 150)
+	testing.expect(t, len(chain) == 2, "the chain should build")
+
+	budget := Nsec3_Budget {
+		max_iterations = 100,
+	}
+	step, cut_short := denial_step(nil, chain, "sub.example.", "example.", &budget)
+	testing.expect_value(t, step, Step.No_Cut)
+	testing.expect(t, !cut_short, "a chain refused for its iterations is not a reading this server stopped short of")
+	testing.expect_value(t, budget.rounds, 0)
+
+	// Readable, but the allowance is gone: undecided, as before.
+	starved := Nsec3_Budget {
+		max_iterations = 150,
+		rounds         = MAX_NSEC3_ROUNDS_PER_QUERY,
+	}
+	step, cut_short = denial_step(nil, chain, "sub.example.", "example.", &starved)
+	testing.expect(t, cut_short, "a reading the allowance stopped is not a finding")
+	testing.expect(t, step != .Insecure && step != .No_Cut, "and must decide nothing")
+	free_all(context.temp_allocator)
+}
+
+/*
+A refused record beside a readable one decides nothing.
+
+`sub.example.` is a signed delegation - the readable chain says NS and DS - so a
+DS answer denying it is a forgery. Anyone holding one signed record of an old
+chain above the ceiling can put it beside that denial, and if a refusal anywhere
+in the set were enough, the child would be read as insecure and everything in it
+served on the attacker's word. Only a set with nothing readable in it is.
+
+That is what a mixed set decides. One who drops the readable records and sends
+the old one alone gets a step that keeps the parent's keys, not an insecure
+child - see `test_a_ds_denial_above_the_ceiling_keeps_the_parents_keys`.
+*/
+@(test)
+test_a_refused_record_does_not_downgrade_a_readable_denial :: proc(t: ^testing.T) {
+	nodes := []Node {
+		{"example.", {.NS, .SOA, .RRSIG, .DNSKEY}},
+		{"sub.example.", {.NS, .DS, .RRSIG}},
+	}
+	usable := nsec3_zone(nodes, []u8{0x0a, 0x0b}, 0)
+	leaving := nsec3_zone(nodes, []u8{0x0c, 0x0d}, 5000)
+	both := make([dynamic]Nsec3_Rr, context.temp_allocator)
+	append(&both, leaving[0])
+	append(&both, ..usable)
+
+	budget := Nsec3_Budget {
+		max_iterations = 100,
+	}
+	step, _ := denial_step(nil, both[:], "sub.example.", "example.", &budget)
+	testing.expect_value(t, step, Step.Bogus)
 	free_all(context.temp_allocator)
 }

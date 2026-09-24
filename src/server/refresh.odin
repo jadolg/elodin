@@ -132,6 +132,9 @@ Refresh :: struct {
 	response:   []u8,
 	outcome:    Outcome,
 	ok:         bool,
+	// The answer's extended error, which its bytes cannot carry; see
+	// `cache.Entry.ede`.
+	ede:        u16,
 	/*
 	Whether the upstream produced nothing at all, which is the one failure the
 	expired entry covers.
@@ -312,6 +315,7 @@ refresh_take :: proc(
 ) -> (
 	response: []u8,
 	outcome: Outcome,
+	ede: u16,
 	taken: bool,
 ) {
 	sync.mutex_lock(&r.mu)
@@ -321,17 +325,17 @@ refresh_take :: proc(
 		finished = sync.sema_wait_with_timeout(&r.sema, timeout)
 	}
 	if !finished {
-		return nil, .Failed, false
+		return nil, .Failed, 0, false
 	}
 
 	sync.mutex_lock(&r.mu)
 	defer sync.mutex_unlock(&r.mu)
 	if !r.ok || r.unanswered || len(r.response) == 0 {
-		return nil, .Failed, false
+		return nil, .Failed, 0, false
 	}
 	out := make([]u8, len(r.response), allocator)
 	copy(out, r.response)
-	return out, r.outcome, true
+	return out, r.outcome, r.ede, true
 }
 
 @(private)
@@ -372,6 +376,7 @@ refresh_job :: proc(data: rawptr) {
 	cookie := inspect_cookie(s.cookies, msg, r.client)
 
 	unanswered: bool
+	ede: u16
 	resp, outcome, ok := resolve_query(
 		s,
 		r.query,
@@ -385,6 +390,7 @@ refresh_job :: proc(data: rawptr) {
 		context.temp_allocator,
 		true,
 		&unanswered,
+		&ede,
 	)
 
 	heap: []u8
@@ -397,6 +403,7 @@ refresh_job :: proc(data: rawptr) {
 	r.outcome = outcome
 	r.ok = ok
 	r.unanswered = unanswered
+	r.ede = ede
 	sync.mutex_unlock(&r.mu)
 }
 

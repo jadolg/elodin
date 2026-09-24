@@ -376,6 +376,21 @@ Budget :: struct {
 	*/
 	walk_stopped:  string,
 	/*
+	This walk kept a parent's keys past a DS denial it could not read, because
+	every NSEC3 record in it was above the iteration ceiling (issue #331).
+
+	Such a step cannot tell a name that is not a cut from an unsigned
+	delegation, so the walk carries on as though it were not one: signed data
+	below still has to verify, and a denial of the name itself is what gets
+	served insecure. What it must not do is let an *unsigned* answer or a
+	broken step below be judged as if the parent had been read - calling the
+	first insecure is a forgery served, calling either bogus accuses the zone
+	of our refusal. Both are `Indeterminate` with the ceiling named instead,
+	which is what they were before. The same goes for a denial that proves
+	nothing. Cleared with `walk_stopped`, and at a signed cut below the step.
+	*/
+	walk_past_ceiling: bool,
+	/*
 	Whether this walk holds one of `Validator.walks`.
 
 	Taken at the first lookup that would go upstream rather than on the way into
@@ -2221,6 +2236,12 @@ validate_denial :: proc(
 		// calls no cut leaves the proof signed by a zone `established` is
 		// above. See `forget_unreached_non_cut`.
 		forget_unreached_non_cut(v, qname, established)
+		// Or the walk kept a parent's keys past a DS denial it could not read,
+		// and this is an unsigned delegation's own answer. See
+		// `Budget.walk_past_ceiling`.
+		if budget.walk_past_ceiling {
+			return {status = .Indeterminate, reason = NSEC3_OVER_CEILING}
+		}
 		return {status = .Bogus, reason = "no denial of existence"}
 	}
 
@@ -2262,6 +2283,13 @@ validate_denial :: proc(
 	// SHA-1 rounds from verifications, and both of those from a zone asking for
 	// more iterations than this server computes - which is the whole point of
 	// saying `Indeterminate` rather than `Bogus`.
+	//
+	// Except where nothing here was readable at all: that is the zone's number
+	// deciding, not a proof we stopped short of, and it is insecure. See
+	// `nsec3_all_over_ceiling`.
+	if proof == .Failed && nsec3_all_over_ceiling(nsecs, nsec3s, &budget.nsec3) {
+		return {status = .Insecure, reason = NSEC3_OVER_CEILING}
+	}
 	if declined, why := nsec3_declined(&budget.nsec3, before); proof == .Failed && declined {
 		logx.debugf("dnssec: the denial of %s was not read to the end: %s", dns.name_trim_root(qname), why)
 		return {status = .Indeterminate, reason = why}
@@ -2273,6 +2301,9 @@ validate_denial :: proc(
 	case .Opt_Out:
 		return {status = .Insecure, reason = "opt-out span"}
 	case .Failed:
+		if budget.walk_past_ceiling {
+			return {status = .Indeterminate, reason = NSEC3_OVER_CEILING}
+		}
 		return {status = .Bogus, reason = "denial of existence not proven"}
 	}
 	return {status = .Bogus, reason = "denial of existence not proven"}
@@ -2585,6 +2616,13 @@ validate_rrset :: proc(
 	if skipped_for_shed {
 		return .Indeterminate, "", WALKS_IN_FLIGHT, "", {}
 	}
+	// Unsigned, below a DS denial nobody could read: an unsigned delegation or
+	// a forgery, and nothing here says which. See `Budget.walk_past_ceiling`.
+	// After the shed check, so a signature that went untried is still counted
+	// as shed rather than blamed on the zone.
+	if budget.walk_past_ceiling {
+		return .Indeterminate, "", NSEC3_OVER_CEILING, "", {}
+	}
 
 	/*
 	Nothing here was checkable, and the zone it belongs to is signed with
@@ -2878,6 +2916,13 @@ validate_wildcard_proof :: proc(
 	the question has spent. Both answers are SERVFAIL to the client, and the
 	difference is the extended error the answer carries and the reason written
 	beside it.
+
+	Not `Insecure` when nothing here was readable, unlike a denial past the
+	ceiling. A denial served unproven can make a name look absent; a wildcard
+	served unproven is a record the zone really signed, handed out for a name
+	that may have records of its own - `*.example.` answering for `www.example.`
+	on the word of any NSEC3 record the zone ever published, since nothing
+	checks which name it covers. That is a substitution, and it stays refused.
 	*/
 	if declined, why := nsec3_declined(&budget.nsec3, before); declined {
 		logx.debugf("dnssec: the wildcard proof for %s was not read to the end: %s", dns.name_trim_root(owner), why)
@@ -3261,6 +3306,7 @@ zone_trust :: proc(
 	// Cleared on the way in, so that what a caller reads afterwards is this
 	// walk's own answer and not one left behind by an earlier proof.
 	budget.walk_stopped = ""
+	budget.walk_past_ceiling = false
 	/*
 	The walk asks for a slot at its first upstream lookup and gives it back
 	here. One that never needs a lookup never takes one, so a flood holding
@@ -3325,6 +3371,9 @@ zone_trust :: proc(
 			}
 			zone = child
 			keys = child_keys
+			// A DS the parent signed: whatever the walk kept keys past above
+			// this, what is below is judged against a zone it did read.
+			budget.walk_past_ceiling = false
 		case .No_Cut:
 			/*
 			Not a cut, so the walk keeps its keys and keeps going.
@@ -3375,6 +3424,10 @@ zone_trust :: proc(
 		case .Insecure:
 			return .Insecure, nil, child
 		case .Bogus:
+			if budget.walk_past_ceiling {
+				budget.walk_stopped = NSEC3_OVER_CEILING
+				return .Indeterminate, nil, child
+			}
 			return .Bogus, nil, child
 		case .Indeterminate:
 			return .Indeterminate, nil, child
@@ -3514,6 +3567,10 @@ zone_step :: proc(
 			forget_skipped_non_cut(v, parent, child)
 			return .Bogus, nil
 		}
+		// A DS the parent signed, so whatever the walk kept keys past above
+		// here, what follows is judged against a zone it did read - a key set
+		// that fails it included. See `Budget.walk_past_ceiling`.
+		budget.walk_past_ceiling = false
 
 		set := make([dynamic]Ds, 0, len(ds_records), allocator)
 		usable := false
@@ -3618,6 +3675,26 @@ zone_step :: proc(
 		)
 		return walk_gave_up(budget, why), nil
 	}
+	/*
+	A denial nothing in which could be read, for its iteration count: the walk
+	keeps the parent's keys and says it did. See `Budget.walk_past_ceiling`.
+
+	The rcode decides between going on and stopping. It is unsigned, but the
+	only thing trusting it can do is end the walk early on the parent's keys,
+	which leaves signed data below to verify against the wrong zone and fail -
+	a SERVFAIL, which a sender able to forge an rcode could have had anyway.
+	Going on past a name the reply says is absent would cost a DS lookup per
+	label of whatever a client makes up.
+
+	Neither is remembered: such a denial cannot tell a non-cut from a name
+	nobody holds, so every name a client invents under the parent arrives
+	here, and remembering each would let a random-subdomain flood push
+	everything else out of the memo.
+	*/
+	if nsec3_all_over_ceiling(nsecs, nsec3s, &budget.nsec3) {
+		budget.walk_past_ceiling = true
+		return (.Absent if dns.rcode_of(msg) == .NX_Domain else .No_Cut), nil
+	}
 	if step == .Bogus {
 		forget_skipped_non_cut(v, parent, child)
 	}
@@ -3693,6 +3770,17 @@ denial_step :: proc(
 		}
 	}
 	if len(nsec3s) > 0 {
+		if nsec3_all_over_ceiling(nsecs, nsec3s, nsec3_budget) {
+			/*
+			Not `.Insecure`: that would make every name in the zone unsigned to
+			the walk, and an unsigned answer forged for any of them would be
+			served. The parent's keys are kept instead, so what is signed below
+			still has to verify - see `Budget.walk_past_ceiling` for what an
+			unsigned answer under this gets.
+			*/
+			logx.debugf("dnssec: the ds denial for %s is past the nsec3 iteration ceiling; keeping the parent's keys", dns.name_trim_root(child))
+			return .No_Cut, false
+		}
 		before := nsec3_refusals(nsec3_budget)
 		// A proof that found what it was looking for is a proof that hashed:
 		// nothing refused can return `Proven`, so this one needs no caveat.

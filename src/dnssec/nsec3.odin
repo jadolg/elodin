@@ -226,6 +226,68 @@ nsec3_declined :: proc(budget: ^Nsec3_Budget, before: Nsec3_Refusals) -> (declin
 	return false, ""
 }
 
+/*
+Is every record here one the ceiling refuses?
+
+Then the denial is insecure to this server, which is what RFC 5155 section 10.3
+asks, what RFC 9276 section 3.2 allows, and what Unbound, BIND and Knot do: it
+is not read, so it cannot be proven, and serving it without the AD bit is the
+answer it gets everywhere else. Issue #331. The chain walk reads the same
+thing differently - as a step that keeps the parent's keys, never as an
+unsigned child - and `Budget.walk_past_ceiling` says why.
+
+Every record rather than any. A readable record beside refused ones is a chain
+this server can check - a zone mid-rollover - and the readable chain decides an
+honest answer. It is not a defence against a sender: one holding a signed
+record of an old, expensive chain drops the readable records and sends the old
+one alone, which is every record. So a zone that left a chain past the ceiling
+is exposed as below until those old signatures expire, not only a zone still
+publishing one.
+
+A budget built without the ceiling (`max_iterations` of zero, which
+`make_validator` never hands out) refuses every record asking for any
+iterations. `query_budget` counts on that failing closed, so such a budget is
+never read as all over the ceiling. Zero only: a negative ceiling, which only a
+test sets, is one below every record, and reading it as such is what lets
+`test_a_wildcard_proof_past_the_ceiling_is_refused` put a zero-iteration zone
+past it.
+
+What it leaves open is the price of the verdict, and it is not small. Nothing
+in a set past the ceiling is hashed, so nothing checks which names its records
+cover: any on-path sender holding any record of the zone's chain - current, or
+an old one replayed while its signatures last - can have any name in the zone
+served as absent, with a negative TTL off an SOA nobody verified. And not only
+in that zone: the walk reads the same records to find the cuts below it, so a
+cold cache can be walked past a signed child's DS and the child's names made to
+look absent too. What it never does is serve a forged record: signed data still
+verifies, an unsigned answer under such a step is refused, and a wildcard is
+not served on such a proof. That is less than Unbound concedes for the same
+zone, where the child is read as unsigned and anything in it can be forged -
+and it is what RFC 5155 section 10.3 asks of a zone that chose an iteration
+count nobody should.
+
+An NSEC record is readable too, so a denial carrying one is never this. A
+record naming a hash other than SHA-1 is neither: `nsec3_hash_with` ignores it
+before the ceiling is asked, so it cannot make a set refused.
+*/
+@(private)
+nsec3_all_over_ceiling :: proc(nsecs: []Nsec_Rr, n3s: []Nsec3_Rr, budget: ^Nsec3_Budget) -> bool {
+	if len(nsecs) > 0 || budget.max_iterations == 0 {
+		return false
+	}
+	refused := false
+	for n in n3s {
+		if n.rr.hash_algorithm != NSEC3_HASH_SHA1 {
+			continue
+		}
+		if int(n.rr.iterations) <= budget.max_iterations {
+			return false
+		}
+		refused = true
+	}
+	return refused
+}
+
 // SHA-1 compresses 64-byte blocks and appends a one-byte pad and an eight-byte
 // length, so an input of `n` bytes is this many of them.
 @(private)
@@ -275,7 +337,9 @@ to say about them is the same: a proof built on a hash this server declined to
 compute failed for a reason of ours, and reporting it as `Bogus` would tell the
 client its answer was forged over a number the zone chose. They report
 `Indeterminate` and name which refusal it was, which is what reaches the client
-as an extended error and an operator as the reason beside the query.
+as an extended error and an operator as the reason beside the query - unless
+every record was over the ceiling, which `nsec3_all_over_ceiling` makes
+`Insecure`.
 */
 @(private)
 nsec3_hash_with :: proc(rr: Nsec3, name: string, out: []u8, budget: ^Nsec3_Budget) -> bool {
