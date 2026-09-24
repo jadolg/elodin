@@ -1014,11 +1014,13 @@ signed records still validate, and an unsigned answer inside it is still
 refused: this server cannot tell an unsigned delegation it could not read from a
 forgery, so a name below one comes back SERVFAIL with extended error 27, as it
 did before. The cost is that anyone on the path can make a name in such a zone
-look absent; what it cannot do is have a forged record served, a wildcard
-included, which stays SERVFAIL. Where readable records sit beside refused ones,
-as in a zone changing its parameters, the readable ones decide; if they prove
-nothing the name comes back SERVFAIL with extended error 27, because the work
-this server declined may have held the proof. RFC 9276 asks zones for zero and
+look absent — and in a zone that has moved off such a chain, for as long as the
+old chain's signatures last, by replaying its records alone. What it cannot do
+is have a forged record served, a wildcard included, which stays SERVFAIL. Where
+readable records sit beside refused ones, as in a zone changing its parameters,
+the readable ones decide; if they prove nothing the name comes back SERVFAIL
+with extended error 27, because the work this server declined may have held the
+proof. RFC 9276 asks zones for zero and
 the zones still publishing NSEC3 use single digits, so this is a guard against a
 zone that has picked a number nobody should, rather than a setting to tune.
 

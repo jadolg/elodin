@@ -270,6 +270,14 @@ test_nsec3_unknown_hash_algorithm_is_refused :: proc(t: ^testing.T) {
 		record.rr.iterations = 5000
 	}
 	testing.expect(t, !nsec3_all_over_ceiling(nil, zone, budget_at(150)), "records ignored for their algorithm are not over the ceiling")
+
+	// And a budget built without the ceiling fails closed rather than calling
+	// every SHA-1 denial insecure. See `query_budget`.
+	for &record in zone {
+		record.rr.hash_algorithm = NSEC3_HASH_SHA1
+	}
+	testing.expect(t, nsec3_all_over_ceiling(nil, zone, budget_at(150)), "the control: these are over a real ceiling")
+	testing.expect(t, !nsec3_all_over_ceiling(nil, zone, budget_at(0)), "a budget with no ceiling set must not downgrade a denial")
 	free_all(context.temp_allocator)
 }
 

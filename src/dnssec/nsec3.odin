@@ -236,12 +236,18 @@ answer it gets everywhere else. Issue #331. The chain walk reads the same
 thing differently - as a step that keeps the parent's keys, never as an
 unsigned child - and `Budget.walk_past_ceiling` says why.
 
-Every record rather than any, and that is the difference that matters. A
-readable record beside refused ones is a chain this server can check - a zone
-mid-rollover, or an old record replayed beside a current one - and letting a
-refused record decide would let anyone holding one signed record of an old,
-expensive chain turn a denial the readable chain contradicts into an insecure
-answer.
+Every record rather than any. A readable record beside refused ones is a chain
+this server can check - a zone mid-rollover - and the readable chain decides an
+honest answer. It is not a defence against a sender: one holding a signed
+record of an old, expensive chain drops the readable records and sends the old
+one alone, which is every record. So a zone that left a chain past the ceiling
+is exposed as below until those old signatures expire, not only a zone still
+publishing one.
+
+A budget built without the ceiling (`max_iterations` of zero, which
+`make_validator` never hands out) refuses every record asking for any
+iterations. `query_budget` counts on that failing closed, so such a budget is
+never read as all over the ceiling.
 
 What it leaves open is the price of the verdict, and it is not small. Nothing
 in a set past the ceiling is hashed, so nothing checks which names its records
@@ -263,7 +269,7 @@ before the ceiling is asked, so it cannot make a set refused.
 */
 @(private)
 nsec3_all_over_ceiling :: proc(nsecs: []Nsec_Rr, n3s: []Nsec3_Rr, budget: ^Nsec3_Budget) -> bool {
-	if len(nsecs) > 0 {
+	if len(nsecs) > 0 || budget.max_iterations <= 0 {
 		return false
 	}
 	refused := false
