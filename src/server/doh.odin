@@ -495,8 +495,8 @@ serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 
 	last_question := time.tick_now()
 	for {
+		// Nothing to free: the round before this one reset the arena on its way out.
 		if doh_question_overdue(s, last_question, time.tick_now()) {
-			free_all(context.temp_allocator)
 			return
 		}
 		// Per request, so a connection kept alive between requests waits the whole

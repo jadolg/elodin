@@ -147,6 +147,9 @@ Result :: struct {
 	asked:   bool,
 	// Questions still counted as awaiting an answer once every handler is done.
 	pending: int,
+	// Whether `last_question` was stamped after the gate opened, which with
+	// `occupy` only the answer can have done.
+	stamped_after_gate: bool,
 }
 
 // Who the scripted peer is, for the rate limiter: a test that has to spend the
@@ -219,6 +222,7 @@ serve_one :: proc(
 		queued -= 1
 	}
 
+	opened := time.tick_now()
 	sync.atomic_store(&gate.open, true)
 	h2.conn_wait_idle(hc)
 	h2.conn_unref(hc)
@@ -230,6 +234,7 @@ serve_one :: proc(
 		queued = queued,
 		asked = ctx.last_question != (time.Tick{}),
 		pending = ctx.pending,
+		stamped_after_gate = time.tick_diff(opened, ctx.last_question) > 0,
 	}
 }
 
@@ -513,17 +518,22 @@ test_doh2_stops_reading_a_connection_that_asks_nothing :: proc(t: ^testing.T) {
 		server        = &s,
 		last_question = time.tick_add(time.tick_now(), -time.Second),
 	}
-	h2_begin(&ctx)
+	h2_begin(&ctx, true)
 	testing.expect(
 		t,
 		ctx.budget.deadline != (time.Tick{}) && time.tick_diff(time.tick_now(), ctx.budget.deadline) <= 0,
 		"a frame was given time on a connection that has asked nothing for ten client_timeouts",
 	)
 
+	// Not between a frame's header and its payload, though: that payload may be
+	// the question that keeps the connection.
+	h2_begin(&ctx, false)
+	testing.expect_value(t, ctx.budget.deadline, time.Tick{})
+
 	// And a connection that has just asked is read as before: the idle wait,
 	// and no deadline until the frame's first byte starts one.
 	ctx.last_question = time.tick_now()
-	h2_begin(&ctx)
+	h2_begin(&ctx, true)
 	testing.expect_value(t, ctx.budget.idle, cfg.server.client_timeout)
 	testing.expect_value(t, ctx.budget.deadline, time.Tick{})
 
@@ -531,7 +541,7 @@ test_doh2_stops_reading_a_connection_that_asks_nothing :: proc(t: ^testing.T) {
 	// upstream is not the connection asking nothing.
 	ctx.last_question = time.tick_add(time.tick_now(), -time.Second)
 	ctx.pending = 1
-	h2_begin(&ctx)
+	h2_begin(&ctx, true)
 	testing.expect_value(t, ctx.budget.deadline, time.Tick{})
 }
 
@@ -560,9 +570,12 @@ test_doh2_only_a_question_keeps_the_connection :: proc(t: ^testing.T) {
 	defer delete(scanned.output)
 	testing.expect(t, !scanned.asked, "a request for another path counted as a question")
 
-	queried := serve_one(&cfg, "/dns-query?dns=AAAAAAAAAAAAAAAA", "", occupy = false, limiter = limiter)
+	// Held behind a busy worker, so the answer comes well after the question.
+	queried := serve_one(&cfg, "/dns-query?dns=AAAAAAAAAAAAAAAA", "", occupy = true, limiter = limiter)
 	defer delete(queried.output)
 	testing.expect(t, queried.asked, "a query did not count as a question")
 	// Left counted, the connection could never again be let go.
 	testing.expect_value(t, queried.pending, 0)
+	// As over HTTP/1.1: the time a question takes is not time spent asking nothing.
+	testing.expect(t, queried.stamped_after_gate, "the answer did not restart the connection's window")
 }

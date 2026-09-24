@@ -206,7 +206,7 @@ client_serve :: proc(c: ^Client) {
 		payload: []u8
 		if h.length > 0 {
 			payload = make([]u8, h.length, context.temp_allocator)
-			if !client_read_exact(c, payload) {
+			if !client_read_exact(c, payload, starts_frame = false) {
 				return
 			}
 		}
@@ -226,11 +226,11 @@ client_serve :: proc(c: ^Client) {
 }
 
 @(private)
-client_read_exact :: proc(c: ^Client, buf: []u8) -> bool {
+client_read_exact :: proc(c: ^Client, buf: []u8, starts_frame := true) -> bool {
 	// One whole thing off the wire starts here, as it does in `read_exact` on the
 	// server side, and for the same reason. See `IO`.
 	if c.io.begin != nil {
-		c.io.begin(c.io.user)
+		c.io.begin(c.io.user, starts_frame)
 	}
 	got := 0
 	for got < len(buf) {

@@ -91,16 +91,19 @@ H2_Job :: struct {
 // starts; `h2_read` then spends this budget across however many reads the peer
 // splits that into.
 @(private)
-h2_begin :: proc(user: rawptr) {
+h2_begin :: proc(user: rawptr, starts_frame: bool) {
 	ctx := cast(^H2_Context)user
 	now := time.tick_now()
 	ctx.budget = Read_Budget {
 		idle = ctx.server.cfg.server.client_timeout,
 	}
 	// A deadline that has already passed is a budget with nothing left, so the
-	// read this begins fails and `h2.serve` ends the connection.
+	// read this begins fails and `h2.serve` ends the connection. Only where a
+	// frame starts: a payload whose header is already read may be the question
+	// that would have kept the connection, and cutting it there loses it.
 	// `pending` first: the worker stamps before it lets go of it.
-	if sync.atomic_load(&ctx.pending) == 0 &&
+	if starts_frame &&
+	   sync.atomic_load(&ctx.pending) == 0 &&
 	   doh_question_overdue(ctx.server, {sync.atomic_load(&ctx.last_question._nsec)}, now) {
 		ctx.budget.deadline = now
 	}
