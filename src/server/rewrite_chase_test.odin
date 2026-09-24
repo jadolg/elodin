@@ -28,7 +28,7 @@ one_answer :: proc(a: config.Rewrite_Answer) -> []config.Rewrite_Answer {
 
 @(private = "file")
 chase_rules :: proc() -> []config.Rewrite {
-	rules := make([]config.Rewrite, 5, context.temp_allocator)
+	rules := make([]config.Rewrite, 7, context.temp_allocator)
 	rules[0] = config.Rewrite {
 		domain  = "old.lan.",
 		answers = one_answer({kind = .CNAME, name = "nas.lan."}),
@@ -55,16 +55,37 @@ chase_rules :: proc() -> []config.Rewrite {
 		answers = one_answer({kind = .CNAME, name = "target.example.com."}),
 		ttl     = 60,
 	}
+	rules[5] = config.Rewrite {
+		domain  = "refused.lan.",
+		answers = one_answer({kind = .CNAME, name = "sunk.lan."}),
+		ttl     = 60,
+	}
+	rules[6] = config.Rewrite {
+		domain  = "sunk.lan.",
+		answers = one_answer({kind = .Block}),
+		ttl     = 60,
+	}
 	return rules
 }
 
 @(private = "file")
-chase_ask :: proc(t: ^testing.T, name: string, type: dns.Type, rd := true) -> (resp: dns.Message, ok: bool) {
+chase_ask :: proc(
+	t: ^testing.T,
+	name: string,
+	type: dns.Type,
+	rd := true,
+	block := config.Block_Response.NX_Domain,
+	rewritten: ^u64 = nil,
+) -> (
+	resp: dns.Message,
+	ok: bool,
+) {
 	cfg := new(config.Config, context.temp_allocator)
 	cfg^ = config.default_config()
 	cfg.log.queries = false
 	cfg.cache.enabled = false
 	cfg.blocking.enabled = false
+	cfg.blocking.response = block
 	cfg.rewrites = chase_rules()
 	s := Server {
 		cfg = cfg,
@@ -78,6 +99,9 @@ chase_ask :: proc(t: ^testing.T, name: string, type: dns.Type, rd := true) -> (r
 	testing.expect_value(t, enc, dns.Encode_Error.None)
 
 	out, outcome, answered := handle_query(&s, wire, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	if rewritten != nil {
+		rewritten^ = s.stats.rewritten
+	}
 	if !testing.expect(t, answered, "the rewrite went unanswered") {
 		return {}, false
 	}
@@ -169,4 +193,36 @@ test_a_cname_rewrite_without_recursion_desired_is_the_alias_alone :: proc(t: ^te
 	}
 	testing.expect_value(t, dns.Rcode(resp.flags.rcode), dns.Rcode.No_Error)
 	testing.expect_value(t, len(resp.answer), 1)
+}
+
+// Whoever refuses the target - this server's policy, or an upstream's ACL - is
+// refusing the target and not the alias, which is answerable: the client gets
+// the alias and meets the refusal only if it asks for the target itself.
+@(test)
+test_a_cname_rewrite_to_a_refused_target_is_the_alias_alone :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	resp, ok := chase_ask(t, "refused.lan.", .A, block = .Refused)
+	if !ok {
+		return
+	}
+	testing.expect_value(t, dns.Rcode(resp.flags.rcode), dns.Rcode.No_Error)
+	testing.expect_value(t, len(resp.answer), 1)
+}
+
+// One query is one answer in `elodin_answers_total`, however many links it
+// took: a chain of rewrites is one rewrite, and an alias left alone by a
+// refusal - which counts nowhere - is still counted as one.
+@(test)
+test_a_chased_rewrite_is_counted_once :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	cases := []struct {
+		name: string,
+		rd:   bool,
+	}{{"old.lan.", true}, {"ping.lan.", true}, {"ext.lan.", false}}
+	for c in cases {
+		rewritten: u64
+		if _, ok := chase_ask(t, c.name, .A, rd = c.rd, rewritten = &rewritten); ok {
+			testing.expectf(t, rewritten == 1, "%s: counted %d times", c.name, rewritten)
+		}
+	}
 }

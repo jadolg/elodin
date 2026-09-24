@@ -1154,8 +1154,9 @@ resolve_query :: proc(
 	}
 
 	if out, matched, alias := apply_rewrite(s, msg, q, allocator, limit); matched {
+		counted := false
 		if cname, is_alias := alias.?; is_alias {
-			out = chase_rewrite_alias(
+			out, counted = chase_rewrite_alias(
 				s,
 				out,
 				cname,
@@ -1171,7 +1172,9 @@ resolve_query :: proc(
 				chased,
 			)
 		}
-		sync.atomic_add(&s.stats.rewritten, 1)
+		if !counted {
+			sync.atomic_add(&s.stats.rewritten, 1)
+		}
 		log_query(s, client, proto, q, .Rewritten, "rewrite", started)
 		return out, .Rewritten, true
 	}
@@ -3834,9 +3837,10 @@ Home's rewrites do too.
 
 The alias alone is still the answer where there is nothing to restart: a
 question for the CNAME itself or for ANY, which the alias matches; a chain
-`MAX_REWRITE_CHASE` long; and a target the server declines to look up, which
-is what RD=0 gets for a name that is no rule of ours - the refusal is about the
-target, and the alias the client did ask about is answerable. Anything else the
+`MAX_REWRITE_CHASE` long; and a target that is refused, whether by this server
+- RD=0 for a name that is no rule of ours, a block list answering `refused` - or
+by an upstream's ACL. The refusal is about the target, and the alias the client
+did ask about is answerable. Anything else the
 target produces is the answer, rcode included (RFC 6604 section 2.1: the rcode
 speaks for the last name in the chain), with its authority section for the SOA
 a denial is cached by. Never AD: the alias is this server's own and unsigned.
@@ -3856,11 +3860,18 @@ chase_rewrite_alias :: proc(
 	allocator: mem.Allocator,
 	shared_worker: bool,
 	chased: int,
-) -> []u8 {
+) -> (
+	response: []u8,
+	// Whether the target's lookup counted this query under its own outcome, as
+	// a question for the target by name would have been; the caller counts it
+	// as rewritten only when not, so that one query is one answer in
+	// `elodin_answers_total` however long the chain.
+	counted: bool,
+) {
 	q := msg.question[0]
 	target, is_name := alias.data.(dns.Rdata_Name)
 	if !is_name || q.type == .CNAME || q.type == .ANY || chased >= MAX_REWRITE_CHASE {
-		return plain
+		return plain, counted
 	}
 
 	questions := make([]dns.Question, 1, allocator)
@@ -3869,8 +3880,9 @@ chase_rewrite_alias :: proc(
 	next.question = questions
 	wire, _, enc := dns.encode_message(next, allocator)
 	if enc != .None {
-		return plain
+		return plain, counted
 	}
+	code: u16
 	out, outcome, ok := resolve_query(
 		s,
 		wire,
@@ -3883,14 +3895,19 @@ chase_rewrite_alias :: proc(
 		spent,
 		allocator,
 		shared_worker,
+		ede = &code,
 		chased = chased + 1,
 	)
+	// A refusal counts nowhere in that family, the RD gate's included, and nor
+	// does a special-use name, so the alias either leaves as the answer is
+	// counted as the rewrite it is.
+	counted = outcome != .Refused && outcome != .Local
 	if !ok || outcome == .Refused {
-		return plain
+		return plain, counted
 	}
 	rest, derr := dns.decode_message(out, allocator, spent)
-	if derr != .None {
-		return plain
+	if derr != .None || dns.Rcode(rest.flags.rcode) == .Refused {
+		return plain, counted
 	}
 
 	answers := make([]dns.Record, len(rest.answer) + 1, allocator)
@@ -3900,11 +3917,25 @@ chase_rewrite_alias :: proc(
 	resp.answer = answers
 	resp.authority = rest.authority
 	resp.flags.tc = rest.flags.tc
+	/*
+	And the target's extended error, which the rebuild would otherwise drop
+	(RFC 9276 section 3.2's code 27 among them). A forwarded or cached answer's
+	OPT record is the upstream's, so only the code this server chose about it
+	goes on - `attach_answer_ede` never sees a `.Rewritten` answer. Anything
+	else built its OPT record here, and what it says is this server's own.
+	*/
+	if outcome == .Forwarded || outcome == .Cached {
+		if code != 0 {
+			attach_extended_error(&resp, code, "", allocator)
+		}
+	} else if own, has := dns.find_opt(rest); has && len(resp.additional) == 1 {
+		resp.additional[0].data = own.data
+	}
 	chain, _, err := dns.encode_message(resp, allocator, limit)
 	if err != .None {
-		return plain
+		return plain, counted
 	}
-	return chain
+	return chain, counted
 }
 
 /*

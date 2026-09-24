@@ -141,6 +141,11 @@ worries about, and because it is a property of where the two checks sit rather
 than of anything either of them does - a rewrite moved after the forwarding path
 would quietly acquire the problem.
 
+A CNAME rewrite is the one way a rewrite reaches this. Its target is looked up
+as a question of its own (`chase_rewrite_alias`), and a target that is no rule
+of ours is forwarded like any other name and checked like one - against
+`rebind.allow_domains` by the target's name, since that is the question asked.
+
 What does need an exemption is split horizon: a site whose upstream is its own
 internal server, resolving `nas.corp.example` to an RFC 1918 address through the
 public name space. `rebind.allow_domains` is the list of zones that may do it,
