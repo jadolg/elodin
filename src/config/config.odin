@@ -332,9 +332,9 @@ Dnssec_Config :: struct {
 	IANA publishes, which are compiled in.
 	*/
 	trust_anchors:        []string,
-	// NSEC3 records asking for more iterations than this are treated as
-	// unusable, which makes the zone insecure rather than letting it set the
-	// validator an arbitrary amount of work (RFC 9276).
+	// NSEC3 records asking for more iterations than this are not computed. A
+	// denial made only of such records leaves the zone insecure rather than
+	// letting it set the validator an arbitrary amount of work (RFC 9276).
 	max_nsec3_iterations: int,
 	/*
 	Chain-of-trust walks that may be waiting on an upstream at once.

@@ -2262,6 +2262,9 @@ validate_denial :: proc(
 	// SHA-1 rounds from verifications, and both of those from a zone asking for
 	// more iterations than this server computes - which is the whole point of
 	// saying `Indeterminate` rather than `Bogus`.
+	if proof == .Failed && len(nsecs) == 0 && nsec3_all_over_ceiling(nsec3s, &budget.nsec3) {
+		return {status = .Insecure, reason = NSEC3_OVER_CEILING}
+	}
 	if declined, why := nsec3_declined(&budget.nsec3, before); proof == .Failed && declined {
 		logx.debugf("dnssec: the denial of %s was not read to the end: %s", dns.name_trim_root(qname), why)
 		return {status = .Indeterminate, reason = why}
@@ -2879,6 +2882,9 @@ validate_wildcard_proof :: proc(
 	difference is the extended error the answer carries and the reason written
 	beside it.
 	*/
+	if len(denial.nsecs) == 0 && nsec3_all_over_ceiling(denial.nsec3s, &budget.nsec3) {
+		return .Insecure, nil, NSEC3_OVER_CEILING
+	}
 	if declined, why := nsec3_declined(&budget.nsec3, before); declined {
 		logx.debugf("dnssec: the wildcard proof for %s was not read to the end: %s", dns.name_trim_root(owner), why)
 		return .Indeterminate, nil, why
@@ -3693,6 +3699,9 @@ denial_step :: proc(
 		}
 	}
 	if len(nsec3s) > 0 {
+		if len(nsecs) == 0 && nsec3_all_over_ceiling(nsec3s, nsec3_budget) {
+			return .Insecure, false
+		}
 		before := nsec3_refusals(nsec3_budget)
 		// A proof that found what it was looking for is a proof that hashed:
 		// nothing refused can return `Proven`, so this one needs no caveat.

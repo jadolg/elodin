@@ -235,8 +235,9 @@ the failure if a link is dropped is quiet: hashing at a ceiling nobody chose,
 which is more work than the operator asked for and no diagnostic anywhere.
 
 `n3test.` hashes twelve times, so a validator told to accept five has something
-to refuse, and the verdict says which refusal it was rather than calling the
-zone's own number a forgery.
+to refuse, and what it refuses leaves the zone insecure - served without the AD
+bit, as RFC 5155 section 10.3 and RFC 9276 section 3.2 have it and as Unbound,
+BIND and Knot do - rather than SERVFAIL for every name under it. Issue #331.
 */
 @(test)
 test_the_configured_iteration_ceiling_reaches_the_proof :: proc(t: ^testing.T) {
@@ -252,15 +253,11 @@ test_the_configured_iteration_ceiling_reaches_the_proof :: proc(t: ^testing.T) {
 	defer destroy_validator(strict)
 	budget := query_budget(strict)
 	result := validate_denial(strict, &budget, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
-	testing.expect_value(t, result.status, Status.Indeterminate)
+	testing.expectf(t, result.status == .Insecure, "a zone past the ceiling is insecure, got %v (%q)", result.status, result.reason)
 	// The walk down to the name reads these same records, so it is the first
-	// thing the ceiling refuses - and it says which refusal that was rather
-	// than reporting a chain it could not reach, which is what carries RFC
-	// 8914's code for this to the client instead of "no reachable authority".
-	// The meter is the rest of the journey: the configured number reached a
-	// record and turned it away, and no hashing was done in the process.
-	testing.expect_value(t, result.reason, NSEC3_OVER_CEILING)
-	testing.expect(t, budget.nsec3.over_ceiling > 0, "the configured ceiling should have refused these records")
+	// thing the ceiling refuses. The meter is the rest of the journey: the
+	// configured number reached the records and turned them away before any
+	// hashing was done.
 	testing.expect_value(t, budget.nsec3.spent, 0)
 	testing.expect_value(t, budget.nsec3.rounds, 0)
 

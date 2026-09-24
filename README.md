@@ -1007,16 +1007,14 @@ or captive-portal resolver — against which every signed zone would otherwise s
 resolving rather than merely going unverified.
 
 `max_nsec3_iterations` is the most hashing a single NSEC3 record may ask for.
-A record above it is not computed, so what a proof rests on is whatever records
-are left. Usually there are none that answer and the name comes back SERVFAIL —
-not because the records are wrong, which is what this server means by bogus, but
-because it declined the work, and the extended error on the answer says so. Where
-the records that remain amount to an opt-out span, the answer is served without
-the AD bit instead, which is what RFC 9276 asks for a zone whose iteration count
-nobody should be publishing. RFC 9276 asks
-zones for zero and the zones still publishing NSEC3 use single digits, so this
-is a guard against a zone that has picked a number nobody should, rather than a
-setting to tune.
+A record above it is not computed. A denial made only of such records leaves the
+zone insecure, so its names are served without the AD bit — what RFC 5155
+section 10.3 asks and what Unbound, BIND and Knot do past their own ceilings. Where readable records sit beside refused ones, as
+in a zone changing its parameters, the readable ones decide; if they prove
+nothing the name comes back SERVFAIL with extended error 27, because the work
+this server declined may have held the proof. RFC 9276 asks zones for zero and
+the zones still publishing NSEC3 use single digits, so this is a guard against a
+zone that has picked a number nobody should, rather than a setting to tune.
 
 `max_chain_walks` is how many chain-of-trust walks may be waiting on an upstream
 at once. Establishing the zone an answer was signed by means one DS lookup per

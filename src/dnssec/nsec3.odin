@@ -226,6 +226,34 @@ nsec3_declined :: proc(budget: ^Nsec3_Budget, before: Nsec3_Refusals) -> (declin
 	return false, ""
 }
 
+/*
+Is every record here one the ceiling refuses?
+
+Then the zone is insecure to this server, which is what RFC 5155 section 10.3
+asks, what RFC 9276 section 3.2 allows, and what Unbound, BIND and Knot do: its
+denials are not read, so nothing under it can be proven, and serving it without
+the AD bit is the answer it gets everywhere else. Issue #331.
+
+Every record rather than any, and that is the difference that matters. A
+readable record beside refused ones is a chain this server can check - a zone
+mid-rollover, or an old record replayed beside a current one - and letting a
+refused record decide would let anyone holding one signed record of an old,
+expensive chain turn a denial the readable chain contradicts into an insecure
+answer. Which leaves the one thing nobody can close: a sender replaying only
+the old chain, while its signatures last, gets the zone read as insecure. That
+needs a zone that published an iteration count nobody should, and it is the
+price every resolver doing this pays.
+*/
+@(private)
+nsec3_all_over_ceiling :: proc(n3s: []Nsec3_Rr, budget: ^Nsec3_Budget) -> bool {
+	for n in n3s {
+		if int(n.rr.iterations) <= budget.max_iterations {
+			return false
+		}
+	}
+	return len(n3s) > 0
+}
+
 // SHA-1 compresses 64-byte blocks and appends a one-byte pad and an eight-byte
 // length, so an input of `n` bytes is this many of them.
 @(private)
