@@ -75,13 +75,14 @@ MAX_CONCURRENT :: 128
 MAX_CLOSED_STREAM_RST :: 16
 /*
 PINGs, non-ACK SETTINGS and stream errors (a malformed or refused request) a
-peer may cause per second, each of which draws a frame back. Writes here are synchronous, so there is no outbound queue for a
-flood to grow (the actual CVE-2019-9512 / 9515); this only stops a peer
-turning a connection slot into a 1:1 echo for as long as it keeps sending.
-(Go's net/http2 bounds the queue instead, at 10000 unwritten control frames,
-which a peer that reads its replies never reaches.) A real client sends a
-handful per connection, and never a malformed request or one past the
-MAX_CONCURRENT it was told, so 100 a second leaves ample room.
+peer may cause per second, each of which draws a frame back. Writes here are
+synchronous, so there is no outbound queue for a flood to grow (the actual
+CVE-2019-9512 / 9515); this only stops a peer turning a connection slot into a
+1:1 echo for as long as it keeps sending. (Go's net/http2 bounds the queue
+instead, at 10000 unwritten control frames, which a peer that reads its replies
+never reaches.) A real client sends a handful per connection, and never a
+malformed request or one past the MAX_CONCURRENT it was told (see
+peer_over_limit), so 100 a second leaves ample room.
 */
 MAX_CONTROL_FRAMES_PER_SECOND :: 100
 /*
@@ -94,9 +95,10 @@ off, short enough that a deliberate one cannot accumulate workers.
 */
 DEFAULT_WRITE_TIMEOUT :: 10 * time.Second
 // Advertised receive window. Generous, so a client streaming request bodies is
-// never throttled by us; DoH bodies are tiny anyway. Larger than MAX_BODY, so a
-// stream is reset before it could use up its own window and is never given
-// more: only the connection window needs replenishing.
+// never throttled by us; DoH bodies are tiny anyway. Larger than MAX_BODY, which
+// counts padding too (Stream.received), so a stream is reset before it could use
+// up its own window and is never given more: only the connection window needs
+// replenishing.
 RECV_WINDOW :: 1 << 20
 // Connection credit is owed until this much has built up, so a peer sending
 // 1-byte DATA frames does not draw a WINDOW_UPDATE back for each one. Far
@@ -135,6 +137,9 @@ Stream :: struct {
 	dispatched:   bool,
 	// What this stream has added to Conn.request_bytes, given back when it goes.
 	charged:      int,
+	// DATA payload taken on this stream, padding included: what it has spent of
+	// its flow-control window, and what MAX_BODY holds it to. See RECV_WINDOW.
+	received:     int,
 }
 
 Conn :: struct {
@@ -469,6 +474,30 @@ control_frame_allowed :: proc(c: ^Conn) -> bool {
 	}
 	c.control_frames += 1
 	return c.control_frames <= MAX_CONTROL_FRAMES_PER_SECOND
+}
+
+/*
+Whether the peer has more than MAX_CONCURRENT streams open by its own count.
+
+A stream it has reset, or whose END_STREAM this end has sent, still holds its
+slot here until its handler lets go, but the peer is right to count it closed
+and open another. A refusal for that is ours, not the peer's, so only one past
+the limit by the peer's reckoning spends the control budget. Keeping a slot
+held that way takes a dispatched query, which `stream_rate_check` already
+bounds. Only called on the refused path, so the walk is over MAX_CONCURRENT
+streams at most once per refusal.
+*/
+@(private)
+peer_over_limit :: proc(c: ^Conn) -> bool {
+	sync.mutex_lock(&c.mu)
+	defer sync.mutex_unlock(&c.mu)
+	open := 0
+	for _, s in c.streams {
+		if s.state != .Closed {
+			open += 1
+		}
+	}
+	return open > MAX_CONCURRENT
 }
 
 @(private)
@@ -881,7 +910,12 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 	// it go without ever handing it to a handler.
 	if s.refused {
 		free_headers(headers, c.allocator)
-		sent := stream_error(c, s.id, .Refused_Stream)
+		sent: bool
+		if peer_over_limit(c) {
+			sent = stream_error(c, s.id, .Refused_Stream)
+		} else {
+			sent = rst_stream(c, s.id, .Refused_Stream)
+		}
 		close_stream(c, s.id)
 		return sent
 	}
@@ -1055,14 +1089,17 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		// 16 KiB frames grows a 116 KiB buffer. Grown here instead, doubling but
 		// never past MAX_BODY, so what is charged is what is allocated.
 		need := len(s.body) + len(data)
-		oversized := need > MAX_BODY
+		s.received += len(payload)
+		oversized := s.received > MAX_BODY
 		grow := 0
 		if need > cap(s.body) {
 			grow = min(max(need, 2 * cap(s.body)), MAX_BODY) - cap(s.body)
 		}
 		if oversized || c.request_bytes + grow > MAX_CONN_REQUEST {
 			sync.mutex_unlock(&c.mu)
-			sent := rst_stream(c, h.stream_id, oversized ? .Enhance_Your_Calm : .Refused_Stream)
+			// No handler behind this reset either, so it is budgeted like a refused
+			// HEADERS: see stream_error.
+			sent := stream_error(c, h.stream_id, oversized ? .Enhance_Your_Calm : .Refused_Stream)
 			// The stream is over. Without this it would hold its body, its parked
 			// request and one of MAX_CONCURRENT slots until the connection went.
 			close_stream(c, h.stream_id)
@@ -1071,7 +1108,7 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 			came off it and count against a receive window every stream shares,
 			and nothing replenishes that on its own - so refusing the body
 			without returning the credit costs the connection that much room for
-			good. The stream-level update is rightly skipped; that stream is gone.
+			good.
 			*/
 			return sent && give_connection_credit(c, len(payload))
 		}
@@ -1174,8 +1211,8 @@ MAX_BODY :: 64 * 1024
 Request bytes - decoded header fields and body - one connection may hold across
 all its streams at once.
 
-MAX_BODY alone bounds a stream, not a connection: credit goes straight back on
-every DATA frame, and receive windows are not enforced against a peer anyway, so
+MAX_BODY alone bounds a stream, not a connection: connection credit goes back
+as DATA arrives, and receive windows are not enforced against a peer anyway, so
 MAX_CONCURRENT streams each parked at MAX_BODY pinned 8 MiB a connection
 (#303), and a long :path on each does as much without any body. Charged as the
 fields are decoded and the body buffered, released only when the stream is
@@ -1248,6 +1285,10 @@ respond :: proc(c: ^Conn, stream_id: u32, resp: Response) -> bool {
 	sync.mutex_lock(&c.mu)
 	s, found := c.streams[stream_id]
 	cancelled := found && s.cancelled
+	if found && len(resp.body) == 0 {
+		// Its END_STREAM rides on the HEADERS below; see peer_over_limit.
+		s.state = .Closed
+	}
 	sync.mutex_unlock(&c.mu)
 	if cancelled {
 		close_stream(c, stream_id)
@@ -1313,6 +1354,10 @@ write_body :: proc(c: ^Conn, stream_id: u32, body: []u8) -> bool {
 				chunk = available
 				c.send_window -= chunk
 				s.send_window -= chunk
+				if chunk == remaining {
+					// This chunk carries END_STREAM; see peer_over_limit.
+					s.state = .Closed
+				}
 				break
 			}
 			/*

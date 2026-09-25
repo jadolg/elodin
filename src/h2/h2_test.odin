@@ -337,6 +337,8 @@ test_parked_bodies_are_bounded_per_connection :: proc(t: ^testing.T) {
 	frame := make([]u8, DEFAULT_MAX_FRAME, context.temp_allocator)
 	for n in 0 ..< MAX_CONCURRENT {
 		id := u32(2 * n + 1)
+		// About the body bound, not the stream-error budget it would spend.
+		c.control_frames = 0
 		handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block)
 		for _ in 0 ..< MAX_BODY / DEFAULT_MAX_FRAME {
 			// A peer stops sending on a stream once it is refused.
@@ -938,10 +940,9 @@ test_data_frame_cannot_touch_a_closed_stream :: proc(t: ^testing.T) {
 	dispatching, so the DATA below is the first frame to see this stream and
 	`already_ended` (server.odin) is false for it - it still takes the append
 	path all the way to the WINDOW_UPDATE write the hook rides in on (made due
-	below). HEADERS
-	with END_STREAM would dispatch immediately and leave nothing for this DATA
-	to reach but the now-`already_ended` short-circuit, which returns before
-	ever writing a WINDOW_UPDATE.
+	below). HEADERS with END_STREAM would dispatch immediately and leave nothing
+	for this DATA to reach but the now-`already_ended` short-circuit, which
+	returns before ever writing a WINDOW_UPDATE.
 	*/
 	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
 	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
@@ -1556,6 +1557,8 @@ test_write_body_deadline_marks_the_stream_cancelled :: proc(t: ^testing.T) {
 @(private = "file")
 Frame_Log :: struct {
 	frames: [dynamic]Frame_Header,
+	// Sum of the connection WINDOW_UPDATE increments written.
+	credit: int,
 }
 
 @(private = "file")
@@ -1571,6 +1574,9 @@ log_write :: proc(user: rawptr, buf: []u8) -> bool {
 			break
 		}
 		append(&log.frames, h)
+		if h.type == .Window_Update && h.stream_id == 0 && h.length == 4 && pos + FRAME_HEADER_SIZE + 4 <= len(buf) {
+			log.credit += int(read_u32(buf[pos + FRAME_HEADER_SIZE:]))
+		}
 		pos += FRAME_HEADER_SIZE + h.length
 	}
 	return true
@@ -2511,8 +2517,10 @@ test_tiny_data_frames_are_not_reflected :: proc(t: ^testing.T) {
 
 	clear(&log.frames)
 	body := []u8{'x'}
+	// Past one batch, so the credit is seen to come back and not just to stop.
+	frames := CREDIT_BATCH + 1000
 	sent := 0
-	for _ in 0 ..< 1000 {
+	for _ in 0 ..< frames {
 		if !handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body) {
 			break
 		}
@@ -2523,6 +2531,8 @@ test_tiny_data_frames_are_not_reflected :: proc(t: ^testing.T) {
 		written += FRAME_HEADER_SIZE + f.length
 	}
 	testing.expectf(t, written * 10 < sent, "%d bytes of 1-byte DATA frames drew %d bytes back", sent, written)
+	testing.expectf(t, log.credit >= CREDIT_BATCH, "%d bytes read, only %d of credit returned", frames, log.credit)
+	testing.expectf(t, log.credit + c.credit_owed == frames, "%d bytes read, %d returned and %d owed", frames, log.credit, c.credit_owed)
 
 	delete(log.frames)
 	conn_unref(c)
@@ -2590,4 +2600,127 @@ test_malformed_headers_flood_is_refused :: proc(t: ^testing.T) {
 @(test)
 test_refused_stream_flood_is_refused :: proc(t: ^testing.T) {
 	expect_headers_flood_refused(t, true, "refused stream flood")
+}
+
+/*
+A body refused over MAX_CONN_REQUEST draws a RST_STREAM with no handler behind
+it, like a refused HEADERS. A peer holding the connection one byte short of the
+bound can open a stream and send one byte of DATA, over and over, so it spends
+the same budget.
+*/
+@(test)
+test_refused_body_spends_the_control_budget :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+	testing.expect(t, ok, "handle_headers failed")
+
+	c.control_window = time.tick_add(time.tick_now(), time.Hour)
+	c.control_frames = MAX_CONTROL_FRAMES_PER_SECOND
+	c.request_bytes = MAX_CONN_REQUEST
+	body := []u8{'x'}
+	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect(t, !dok, "a body refused past the budget drew a reset and kept the connection")
+	saw_goaway := false
+	for f in log.frames {
+		saw_goaway ||= f.type == .Goaway
+		testing.expect(t, f.type != .Rst_Stream, "a body refused past the budget still drew a RST_STREAM")
+	}
+	testing.expect(t, saw_goaway, "a body refused past the budget was dropped without a GOAWAY")
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "refused body budget")
+}
+
+/*
+A stream the peer has reset stays in the table while its handler runs, so a
+client that cancels a full set of slow queries and opens replacements is
+refused. That is this end's count, not the client's fault: the refusals are
+still sent, but must not spend the budget and cost the connection.
+*/
+@(test)
+test_refusals_for_reset_streams_do_not_spend_the_budget :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, destroying_handler, nil, allocator)
+	c.control_window = time.tick_add(time.tick_now(), time.Hour)
+
+	// Dispatched to a handler that never answers, then reset by the peer.
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	rst := []u8{0, 0, 0, 8} // CANCEL
+	id := u32(1)
+	for _ in 0 ..< MAX_CONCURRENT {
+		h := Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = id}
+		testing.expect(t, handle_headers(c, h, block), "handle_headers failed")
+		handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = id}, rst)
+		id += 2
+	}
+	testing.expect_value(t, len(c.streams), MAX_CONCURRENT)
+
+	clear(&log.frames)
+	refused := 0
+	for _ in 0 ..< 2 * MAX_CONTROL_FRAMES_PER_SECOND {
+		h := Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = id}
+		if !handle_headers(c, h, block) {
+			break
+		}
+		refused += 1
+		id += 2
+	}
+	testing.expect_value(t, refused, 2 * MAX_CONTROL_FRAMES_PER_SECOND)
+	for f in log.frames {
+		testing.expect(t, f.type != .Goaway, "a client within the limit by its own count was sent GOAWAY")
+	}
+
+	for sid := u32(1); sid < id; sid += 2 {
+		close_stream(c, sid)
+	}
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "reset stream refusals")
+}
+
+/*
+With no stream-level WINDOW_UPDATE, a stream's window is only ever spent, so
+the bound has to be on what spends it: padding included. Otherwise a peer
+padding every frame runs the 1 MiB window dry with a body still under
+MAX_BODY, and the stream stalls for good instead of being reset.
+*/
+@(test)
+test_padding_counts_toward_the_body_bound :: proc(t: ^testing.T) {
+	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil)
+	defer conn_unref(c)
+
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+	testing.expect(t, ok, "handle_headers failed")
+
+	// One byte of body in 257 bytes of window, each.
+	frame := make([]u8, 257, context.temp_allocator)
+	frame[0] = 255
+	spent := 0
+	for spent <= MAX_BODY {
+		handle_data(c, Frame_Header{length = len(frame), type = .Data, flags = FLAG_PADDED, stream_id = 1}, frame)
+		spent += len(frame)
+	}
+	_, open := c.streams[1]
+	testing.expectf(t, !open, "a stream that spent %d bytes of its window, over MAX_BODY, was left open", spent)
+	free_all(context.temp_allocator)
 }
