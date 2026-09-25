@@ -153,3 +153,18 @@ test_stats_counted :: proc(t: ^testing.T) {
 	testing.expect_value(t, s.queries, u64(3))
 	testing.expect_value(t, s.blocked, u64(2))
 }
+
+@(test)
+test_a_query_name_matches_whatever_bytes_its_labels_hold :: proc(t: ^testing.T) {
+	// Rules refuse `/` and whitespace (see parse_test.odin); a query name is not
+	// a rule, and `/` reaches here unescaped. Its zone's rules still apply (#398).
+	block, allow := build("||ads.example^\n@@||ok.ads.example^\n", .Adblock)
+	e := engine_make()
+	defer engine_destroy(e)
+	engine_swap(e, block, allow)
+
+	testing.expect_value(t, engine_match(e, "x/.ads.example."), Decision.Blocked)
+	testing.expect_value(t, engine_match(e, "a/b.ads.example."), Decision.Blocked)
+	testing.expect_value(t, engine_match(e, "x/.ok.ads.example."), Decision.Allowed)
+	testing.expect_value(t, engine_match(e, "x/.other.example."), Decision.None)
+}

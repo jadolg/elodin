@@ -40,3 +40,7 @@
 # keep every one of them from reaching the client.
 7
 11
+
+# A slash in a label under a blocked zone (#398): presentation form leaves `/`
+# unescaped, and the matcher refused the name instead of walking its parents.
+1790351003840249874
