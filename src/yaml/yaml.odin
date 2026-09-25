@@ -30,9 +30,11 @@ string-typed key it is accepted as written.
 
 Document markers are skipped rather than acted on: `scan_lines` drops any line
 that is exactly `---` or `...`, so a file holding several documents is read as
-one, with later documents merged over the first rather than rejected. That is
-the one case where the reading differs from YAML's without saying so, and it is
-kept because a leading `---` is common and harmless in a single-document file.
+one. A key a later document repeats at the top level is refused as a duplicate,
+like any other key written twice; keys it does not repeat are added to the
+first document's rather than rejected. That is the one case where the reading
+differs from YAML's without saying so, and it is kept because a leading `---`
+is common and harmless in a single-document file.
 
 A parser this size is the right trade for one configuration file, but "it
 parsed" is not "it means what YAML says it means" for the three above.
@@ -381,6 +383,11 @@ parse_mapping :: proc(p: ^Parser, indent: int) -> ^Node {
 		if kerr {
 			return fail(p, line.num, "malformed key")
 		}
+		// Refused rather than last-one-wins, which would drop the first in
+		// silence: a setting the operator can see in the file doing nothing.
+		if key in node.fields {
+			return fail(p, line.num, strings.concatenate({"duplicate key \"", key, "\": a mapping names each key once"}, p.allocator))
+		}
 		rest := strings.trim_space(line.text[colon + 1:])
 		p.pos += 1
 
@@ -388,9 +395,7 @@ parse_mapping :: proc(p: ^Parser, indent: int) -> ^Node {
 		if _, has := p.err.?; has {
 			return node
 		}
-		if key not_in node.fields {
-			append(&node.keys, key)
-		}
+		append(&node.keys, key)
 		node.fields[key] = child
 	}
 	return node
@@ -662,9 +667,13 @@ parse_flow :: proc(p: ^Parser, text: string, line_num: int) -> (node: ^Node, con
 				return nil, 0, false
 			}
 			val_text := strings.trim_space(item[colon + 1:])
-			if key not_in node.fields {
-				append(&node.keys, key)
+			// As in `parse_mapping`. `fail` keeps the first message, so this one
+			// is what the caller's "malformed flow collection" gives way to.
+			if key in node.fields {
+				fail(p, line_num, strings.concatenate({"duplicate key \"", key, "\": a mapping names each key once"}, p.allocator))
+				return nil, 0, false
 			}
+			append(&node.keys, key)
 
 			// A flow map's value may itself be a flow collection, as in
 			// `{answers: [a, b]}`.

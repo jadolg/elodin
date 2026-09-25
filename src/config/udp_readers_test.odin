@@ -152,16 +152,21 @@ test_udp_receive_buffer_is_a_size :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
-// Neither key is read for the transports it says nothing about: they are
+// Neither key means anything for the transports it says nothing about: they are
 // properties of a socket that reads datagrams, and a stream listener has none.
+// So under one they are refused like any other key nobody reads, rather than
+// sitting in the file looking like a setting.
 @(test)
 test_reader_settings_are_udp_only :: proc(t: ^testing.T) {
-	cfg, err := load_string(
+	_, err := load_string(
 		"upstream:\n  servers: [1.1.1.1]\nlisteners:\n  tcp:\n    readers: 4\n    receive_buffer: 4MiB\n",
 		context.temp_allocator,
 	)
-	testing.expect(t, err == nil, "expected a clean load")
-	testing.expect_value(t, cfg.listeners.tcp.readers, 0)
-	testing.expect_value(t, cfg.listeners.tcp.receive_buffer, 0)
+	e, has := err.?
+	if testing.expect(t, has, "reader settings under a stream listener were accepted") {
+		testing.expect_value(t, len(e.messages), 2)
+		testing.expect_value(t, e.messages[0], "listeners.tcp.readers: unknown key")
+		testing.expect_value(t, e.messages[1], "listeners.tcp.receive_buffer: unknown key")
+	}
 	free_all(context.temp_allocator)
 }

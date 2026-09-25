@@ -215,6 +215,11 @@ test_routes_do_not_nest :: proc(t: ^testing.T) {
 		"      servers: [10.0.0.1]\n      zones:\n        - domains: [dev.corp.example]\n          servers: [10.0.0.2]\n",
 		"routes do not nest",
 	)
+	expect_one_error(
+		t,
+		"upstream:\n  servers: [1.1.1.1]\n  zones:\n    - domains: [corp.example]\n      servers: [10.0.0.1]\n      zones:\n",
+		"routes do not nest",
+	)
 }
 
 // The two ways to write the section itself wrong: a mapping where a list
