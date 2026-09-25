@@ -250,10 +250,40 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 		target = allow
 		line = line[2:]
 	}
-	// Modifiers ($third-party, $important, ...) do not change which name is
-	// matched, and the ones that would are not expressible in DNS anyway.
+	/*
+	`$important` and `$third-party` do not change which name is matched and are
+	dropped; `$badfilter` cancels the rule it names. Any other modifier narrows
+	the rule - to a query type, a client, a site it is loaded from - or makes it
+	something other than a block (`$elemhide`, `$removeparam`, `$csp`, ...), and
+	dropping it would widen the rule to every query, so the rule is skipped. That
+	is what AdGuard Home does with a modifier its DNS engine cannot honour.
+	*/
+	badfilter := false
 	if idx := strings.index_byte(line, '$'); idx >= 0 {
+		modifiers := line[idx + 1:]
 		line = line[:idx]
+		// `$$` and `$@$` open an HTML filtering rule, not a modifier list.
+		if strings.has_prefix(modifiers, "$") || strings.has_prefix(modifiers, "@$") {
+			return 0
+		}
+		for m in strings.split_iterator(&modifiers, ",") {
+			name := strings.trim_space(m)
+			if eq := strings.index_byte(name, '='); eq >= 0 {
+				name = name[:eq]
+			}
+			switch name {
+			case "badfilter":
+				badfilter = true
+			// `3p` is uBlock Origin's and AdGuard's short form of `third-party`.
+			case "important", "third-party", "3p", "":
+			case:
+				return 0
+			}
+		}
+	}
+	// `##`, `#@#`, `#$#`, `#?#`: cosmetic rules, naming the site they apply on.
+	if strings.contains(line, "#") {
+		return 0
 	}
 
 	flags := Rule_Flags{.Apex, .Subdomains}
@@ -275,6 +305,10 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 	}
 	// Regex rules and path-scoped rules cannot be answered at the DNS layer.
 	if line[0] == '/' || strings.contains(line, "*") || strings.contains(line, "/") {
+		return 0
+	}
+	if badfilter {
+		set_cancel(target, line, flags)
 		return 0
 	}
 	set_add(target, line, flags)

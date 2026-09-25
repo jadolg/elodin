@@ -30,18 +30,6 @@ build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool) -> (block, a
 	block = filter.set_make()
 	allow = filter.set_make()
 
-	for rule in cfg.blocking.rules {
-		filter.parse_rule(block, allow, rule)
-	}
-	for rule in cfg.blocking.allow_rules {
-		// Entries here are allow rules whether or not they carry the @@ prefix.
-		text := rule
-		if !strings.has_prefix(text, "@@") {
-			text = fmt.tprintf("@@%s", text)
-		}
-		filter.parse_rule(block, allow, text)
-	}
-
 	for list in cfg.blocking.lists {
 		load_one_list(cfg, list, block, allow, allow_network, false)
 	}
@@ -49,8 +37,38 @@ build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool) -> (block, a
 		load_one_list(cfg, list, block, allow, allow_network, true)
 	}
 
+	// A list's `$badfilter` takes back rules lists carry, not the operator's
+	// own: forget them before those are added. The operator's `$badfilter`
+	// still cancels what the lists added.
+	clear(&block.cancelled)
+	clear(&allow.cancelled)
+	for rule in cfg.blocking.rules {
+		if filter.parse_rule(block, allow, rule) == 0 {
+			warn_rule_adds_nothing(rule)
+		}
+	}
+	for rule in cfg.blocking.allow_rules {
+		// Entries here are allow rules whether or not they carry the @@ prefix.
+		text := rule
+		if !strings.has_prefix(text, "@@") {
+			text = fmt.tprintf("@@%s", text)
+		}
+		if filter.parse_rule(block, allow, text) == 0 {
+			warn_rule_adds_nothing(rule)
+		}
+	}
+
 	logx.infof("filter: %d block rules, %d allow rules", block.count, allow.count)
 	return
+}
+
+// A list skipping what it cannot honour is routine; the operator's own rule
+// doing nothing is worth a word, since one that did block may now be skipped.
+@(private)
+warn_rule_adds_nothing :: proc(rule: string) {
+	if !strings.contains(rule, "badfilter") {
+		logx.warnf("blocking rule %q adds nothing: it carries a modifier DNS cannot honour, is cosmetic, or names no domain", rule)
+	}
 }
 
 @(private)
