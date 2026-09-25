@@ -104,13 +104,15 @@ accepted and ignored, which is the bug this exists to close.
 A value or a list where the mapping belongs is refused as well: it has no keys
 to check, and every `opt_*` reads nothing from it, so `rebind: true` would
 otherwise leave rebind protection off without a word. Empty (`rebind:`) is
-still the section left at its defaults.
+still the section left at its defaults. That refusal answers false, so a list
+entry in the wrong shape can be skipped rather than also reported as missing
+every key it was meant to hold.
 */
 @(private)
-check_keys :: proc(l: ^Loader, n: ^yaml.Node, path: string, known: ..string) {
+check_keys :: proc(l: ^Loader, n: ^yaml.Node, path: string, known: ..string) -> bool {
 	if !yaml.is_null(n) && n.kind != .Mapping {
 		errorf(l, "%s: expected a mapping of settings, not a single value or a list", "the file" if path == "" else path)
-		return
+		return false
 	}
 	keys: for k in yaml.keys(n) {
 		for want in known {
@@ -124,6 +126,7 @@ check_keys :: proc(l: ^Loader, n: ^yaml.Node, path: string, known: ..string) {
 			errorf(l, "%s.%s: unknown key", path, k)
 		}
 	}
+	return true
 }
 
 @(private)
@@ -817,7 +820,9 @@ load_upstream_zones :: proc(l: ^Loader, cfg: ^Config, n: ^yaml.Node) {
 			"domains",
 			"servers",
 		)
-		if !yaml.is_null(yaml.get(entry, "zones")) {
+		// Present at all, not merely non-empty: `zones:` with nothing after it is
+		// listed above, so reading past it here would accept a key nobody reads.
+		if yaml.get(entry, "zones") != nil {
 			errorf(l, "%s.zones: routes do not nest; write another entry in upstream.zones instead", path)
 			continue
 		}
@@ -1219,7 +1224,9 @@ load_upstream_spec :: proc(
 		}
 		return parse_upstream_shorthand(l, s, path, default_bootstrap)
 	}
-	check_keys(l, n, path, "name", "address", "hostname", "url", "port", "verify", "bootstrap", "type")
+	if !check_keys(l, n, path, "name", "address", "hostname", "url", "port", "verify", "bootstrap", "type") {
+		return {}, false
+	}
 
 	opt_string(l, n, "name", &spec.name, path)
 	opt_string(l, n, "address", &spec.address, path)
@@ -1505,7 +1512,9 @@ load_block_lists :: proc(l: ^Loader, n: ^yaml.Node, path: string) -> []Block_Lis
 			continue
 		}
 		item_path := fmt.tprintf("%s[%d]", path, i)
-		check_keys(l, e, item_path, "name", "url", "file", "enabled", "format")
+		if !check_keys(l, e, item_path, "name", "url", "file", "enabled", "format") {
+			continue
+		}
 		opt_string(l, e, "name", &bl.name, item_path)
 		opt_string(l, e, "url", &bl.url, item_path)
 		opt_string(l, e, "file", &bl.file, item_path)
@@ -1748,7 +1757,9 @@ load_rewrites :: proc(l: ^Loader, cfg: ^Config) {
 			ttl = 300,
 			ptr = true,
 		}
-		check_keys(l, e, path, "domain", "ttl", "ptr", "answer", "answers")
+		if !check_keys(l, e, path, "domain", "ttl", "ptr", "answer", "answers") {
+			continue
+		}
 		domain := ""
 		opt_string(l, e, "domain", &domain, path)
 		if domain == "" {

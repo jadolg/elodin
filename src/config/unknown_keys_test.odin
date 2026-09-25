@@ -114,18 +114,42 @@ test_misshapen_sections_are_refused :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+// A list entry in the wrong shape is said to be that once, not also reported as
+// missing every key it was meant to hold.
+@(test)
+test_a_misshapen_entry_is_one_error :: proc(t: ^testing.T) {
+	for src in ([]string {
+			"upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - nas.home\n",
+			"upstream:\n  servers: [1.1.1.1]\nblocking:\n  lists:\n    - [a, b]\n",
+			"upstream:\n  servers:\n    - 1.1.1.1\n    - [9.9.9.9]\n",
+		}) {
+		_, err := load_string(src, context.temp_allocator)
+		e, _ := err.?
+		testing.expectf(
+			t,
+			len(e.messages) == 1 && strings.contains(e.messages[0], "expected a mapping"),
+			"%q: %v",
+			src,
+			e.messages,
+		)
+	}
+	free_all(context.temp_allocator)
+}
+
 // Every shipped example still loads: each key in them is one the loader reads.
 @(test)
 test_examples_load :: proc(t: ^testing.T) {
 	paths, _ := filepath.glob("examples/*.yaml", context.temp_allocator)
 	testing.expect(t, len(paths) > 0, "no examples found; run from the repository root")
 	for p in paths {
-		// Only this check's refusals: an example naming a certificate that is not
-		// on this machine is refused for that, and rightly.
+		// Any refusal but a missing file: an example naming a certificate that is
+		// not on this machine is refused for that, and rightly. Matching only
+		// "unknown key" would let a duplicate key (a parse error) or a section in
+		// the wrong shape through.
 		_, err := load_file(p, context.temp_allocator)
 		e, _ := err.?
 		for m in e.messages {
-			testing.expectf(t, !strings.contains(m, "unknown key"), "%s: %s", p, m)
+			testing.expectf(t, strings.has_suffix(m, "does not exist"), "%s: %s", p, m)
 		}
 	}
 }
