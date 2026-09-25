@@ -402,6 +402,8 @@ test_parked_fields_are_bounded_per_connection :: proc(t: ^testing.T) {
 	encode_header(&block, ":path", string(path))
 	for n in 0 ..< MAX_CONCURRENT {
 		id := u32(2 * n + 1)
+		// About the fields bound, not the stream-error budget it would spend.
+		c.control_frames = 0
 		ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block[:])
 		testing.expect(t, ok, "handle_headers failed")
 	}
@@ -618,6 +620,8 @@ test_data_on_a_closed_stream_is_answered_with_stream_closed :: proc(t: ^testing.
 	testing.expect(t, !still_open, "an orphaned reset stream was not retired")
 
 	clear(&log.frames)
+	// One byte short of a batch, so the refused frame's credit is due on the wire.
+	c.credit_owed = CREDIT_BATCH - 1
 	body := []u8{'x'}
 	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
 	testing.expect(t, dok, "DATA on a closed stream should be a stream error, not a connection error")
@@ -673,6 +677,8 @@ test_data_on_a_closed_stream_stops_drawing_rst_once_the_budget_is_spent :: proc(
 	testing.expect_value(t, c.closed_stream_rst_budget, 0)
 
 	clear(&log.frames)
+	// One byte short of a batch, so the refused frame's credit is due on the wire.
+	c.credit_owed = CREDIT_BATCH - 1
 	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
 	testing.expect(t, dok, "DATA on a closed stream should still be tolerated once the budget is spent")
 
@@ -725,6 +731,8 @@ test_data_after_end_stream_is_refused :: proc(t: ^testing.T) {
 	testing.expect(t, ok, "handle_headers failed")
 
 	clear(&log.frames)
+	// One byte short of a batch, so the refused frame's credit is due on the wire.
+	c.credit_owed = CREDIT_BATCH - 1
 	body := []u8{'x'}
 	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
 	testing.expect(t, dok, "DATA after END_STREAM should be a stream error, not a connection error")
@@ -808,6 +816,8 @@ test_data_on_a_peer_reset_stream_is_refused :: proc(t: ^testing.T) {
 	}
 
 	clear(&log.frames)
+	// One byte short of a batch, so the refused frame's credit is due on the wire.
+	c.credit_owed = CREDIT_BATCH - 1
 	body := []u8{'x'}
 	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
 	testing.expect(t, dok, "DATA on a peer-reset stream should be a stream error, not a connection error")
@@ -927,7 +937,8 @@ test_data_frame_cannot_touch_a_closed_stream :: proc(t: ^testing.T) {
 	No END_STREAM on the HEADERS: the request parks on the stream rather than
 	dispatching, so the DATA below is the first frame to see this stream and
 	`already_ended` (server.odin) is false for it - it still takes the append
-	path all the way to the WINDOW_UPDATE write the hook rides in on. HEADERS
+	path all the way to the WINDOW_UPDATE write the hook rides in on (made due
+	below). HEADERS
 	with END_STREAM would dispatch immediately and leave nothing for this DATA
 	to reach but the now-`already_ended` short-circuit, which returns before
 	ever writing a WINDOW_UPDATE.
@@ -937,6 +948,8 @@ test_data_frame_cannot_touch_a_closed_stream :: proc(t: ^testing.T) {
 	testing.expect(t, ok, "handle_headers failed")
 
 	hook.armed = true
+	// One byte short of a batch, so this DATA's credit is written.
+	c.credit_owed = CREDIT_BATCH - 1
 	body := []u8{'x'}
 	handle_data(c, Frame_Header{length = len(body), type = .Data, flags = FLAG_END_STREAM, stream_id = 1}, body)
 
@@ -1917,6 +1930,8 @@ test_data_on_a_refused_stream_returns_connection_credit :: proc(t: ^testing.T) {
 	testing.expect(t, !held, "a refused stream was left in the table")
 
 	clear(&log.frames)
+	// One byte short of a batch, so the refused frame's credit is due on the wire.
+	c.credit_owed = CREDIT_BATCH - 1
 	body := []u8{1, 2, 3, 4}
 	ok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = refused_id}, body)
 	testing.expect(t, ok, "DATA on a refused stream was not handled gracefully")
@@ -2469,4 +2484,110 @@ test_control_frame_budget_refills_each_second :: proc(t: ^testing.T) {
 	testing.expect(t, handle_frame(c, ping, payload), "the budget did not refill after a second")
 	testing.expect_value(t, c.control_frames, 1)
 	free_all(context.temp_allocator)
+}
+
+/*
+Each 1-byte DATA frame on an open stream used to draw a connection and a
+stream WINDOW_UPDATE back: 26 bytes out for 10 in, for as long as the peer
+kept sending. Credit is now owed until there is enough of it to be worth a
+frame, and the stream-level update was never needed: MAX_BODY resets a stream
+long before it could use up the RECV_WINDOW it was given.
+*/
+@(test)
+test_tiny_data_frames_are_not_reflected :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+	testing.expect(t, ok, "handle_headers failed")
+
+	clear(&log.frames)
+	body := []u8{'x'}
+	sent := 0
+	for _ in 0 ..< 1000 {
+		if !handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body) {
+			break
+		}
+		sent += FRAME_HEADER_SIZE + len(body)
+	}
+	written := 0
+	for f in log.frames {
+		written += FRAME_HEADER_SIZE + f.length
+	}
+	testing.expectf(t, written * 10 < sent, "%d bytes of 1-byte DATA frames drew %d bytes back", sent, written)
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "tiny data frames")
+}
+
+/*
+A malformed or refused request is a stream error, answered with RST_STREAM
+while the connection carries on. That is the CVE-2019-9514 shape: a peer
+sending nothing but bad HEADERS draws a reset for each. They share the
+control-frame budget, so the connection is dropped once it is spent.
+*/
+@(private = "file")
+expect_headers_flood_refused :: proc(t: ^testing.T, refuse: bool, what: string) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+	c.control_window = time.tick_add(time.tick_now(), time.Hour)
+	first := u32(1)
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	if refuse {
+		fill_concurrency(c, allocator)
+		first = u32(1 + 2 * MAX_CONCURRENT)
+	} else {
+		// A lone literal field with no pseudo-headers at all.
+		block = []u8{0x40, 0x01, 'x', 0x01, 'y'}
+	}
+
+	sent := 0
+	refused := false
+	for id := first; sent < 1000; id += 2 {
+		sent += 1
+		h := Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = id}
+		if !handle_headers(c, h, block) {
+			refused = true
+			break
+		}
+	}
+	testing.expectf(t, refused, "%s: %d streams were all reset and the connection kept", what, sent)
+	testing.expectf(t, sent == MAX_CONTROL_FRAMES_PER_SECOND + 1, "%s: refused at stream %d, not the first one over the budget", what, sent)
+	saw_goaway := false
+	for f in log.frames {
+		saw_goaway ||= f.type == .Goaway
+	}
+	testing.expectf(t, saw_goaway, "%s: the flood was dropped without a GOAWAY", what)
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, what)
+}
+
+@(test)
+test_malformed_headers_flood_is_refused :: proc(t: ^testing.T) {
+	expect_headers_flood_refused(t, false, "malformed headers flood")
+}
+
+@(test)
+test_refused_stream_flood_is_refused :: proc(t: ^testing.T) {
+	expect_headers_flood_refused(t, true, "refused stream flood")
 }

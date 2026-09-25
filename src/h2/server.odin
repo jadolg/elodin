@@ -74,13 +74,14 @@ MAX_CONCURRENT :: 128
 // See Conn.closed_stream_rst_budget.
 MAX_CLOSED_STREAM_RST :: 16
 /*
-PINGs and non-ACK SETTINGS a peer may send per second, each of which draws a
-frame back. Writes here are synchronous, so there is no outbound queue for a
+PINGs, non-ACK SETTINGS and stream errors (a malformed or refused request) a
+peer may cause per second, each of which draws a frame back. Writes here are synchronous, so there is no outbound queue for a
 flood to grow (the actual CVE-2019-9512 / 9515); this only stops a peer
 turning a connection slot into a 1:1 echo for as long as it keeps sending.
 (Go's net/http2 bounds the queue instead, at 10000 unwritten control frames,
 which a peer that reads its replies never reaches.) A real client sends a
-handful per connection, so 100 a second leaves ample room.
+handful per connection, and never a malformed request or one past the
+MAX_CONCURRENT it was told, so 100 a second leaves ample room.
 */
 MAX_CONTROL_FRAMES_PER_SECOND :: 100
 /*
@@ -93,8 +94,14 @@ off, short enough that a deliberate one cannot accumulate workers.
 */
 DEFAULT_WRITE_TIMEOUT :: 10 * time.Second
 // Advertised receive window. Generous, so a client streaming request bodies is
-// never throttled by us; DoH bodies are tiny anyway.
+// never throttled by us; DoH bodies are tiny anyway. Larger than MAX_BODY, so a
+// stream is reset before it could use up its own window and is never given
+// more: only the connection window needs replenishing.
 RECV_WINDOW :: 1 << 20
+// Connection credit is owed until this much has built up, so a peer sending
+// 1-byte DATA frames does not draw a WINDOW_UPDATE back for each one. Far
+// below RECV_WINDOW, so the peer never waits on it.
+CREDIT_BATCH :: 16 * 1024
 
 Stream_State :: enum u8 {
 	Open,
@@ -173,6 +180,8 @@ Conn :: struct {
 	// MAX_CONTROL_FRAMES_PER_SECOND. Reader thread only.
 	control_frames:      int,
 	control_window:      time.Tick,
+	// Connection credit not yet returned; see CREDIT_BATCH. Reader thread only.
+	credit_owed:         int,
 }
 
 make_conn :: proc(io: IO, handler: Handler, user: rawptr, allocator := context.allocator) -> ^Conn {
@@ -872,7 +881,7 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 	// it go without ever handing it to a handler.
 	if s.refused {
 		free_headers(headers, c.allocator)
-		sent := rst_stream(c, s.id, .Refused_Stream)
+		sent := stream_error(c, s.id, .Refused_Stream)
 		close_stream(c, s.id)
 		return sent
 	}
@@ -888,7 +897,7 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 	*/
 	if request_is_malformed(headers) {
 		free_headers(headers, c.allocator)
-		sent := rst_stream(c, s.id, .Protocol_Error)
+		sent := stream_error(c, s.id, .Protocol_Error)
 		close_stream(c, s.id)
 		return sent
 	}
@@ -942,7 +951,7 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 	sync.mutex_unlock(&c.mu)
 	if over {
 		request_destroy(c, req)
-		sent := rst_stream(c, s.id, .Refused_Stream)
+		sent := stream_error(c, s.id, .Refused_Stream)
 		close_stream(c, s.id)
 		return sent
 	}
@@ -1086,18 +1095,10 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		return sent && give_connection_credit(c, len(payload))
 	}
 
-	// Give the credit straight back; we buffer whole requests anyway.
-	if len(payload) > 0 {
-		out := make([dynamic]u8, 0, 26, context.temp_allocator)
-		write_frame_header(&out, 4, .Window_Update, 0, 0)
-		append_u32(&out, u32(len(payload)))
-		if found && h.flags & FLAG_END_STREAM == 0 {
-			write_frame_header(&out, 4, .Window_Update, 0, h.stream_id)
-			append_u32(&out, u32(len(payload)))
-		}
-		if !write_all(c, out[:]) {
-			return false
-		}
+	// Give the credit back; we buffer whole requests anyway. The stream's own
+	// window needs none: see RECV_WINDOW.
+	if !give_connection_credit(c, len(payload)) {
+		return false
 	}
 
 	if !found || h.flags & FLAG_END_STREAM == 0 {
@@ -1189,13 +1190,26 @@ MAX_CONN_REQUEST :: 2 * (MAX_BODY + MAX_HEADER_LIST)
 // the wire, whatever became of the stream they belonged to.
 @(private)
 give_connection_credit :: proc(c: ^Conn, n: int) -> bool {
-	if n <= 0 {
+	c.credit_owed += n
+	if c.credit_owed < CREDIT_BATCH {
 		return true
 	}
 	out := make([dynamic]u8, 0, 13, context.temp_allocator)
 	write_frame_header(&out, 4, .Window_Update, 0, 0)
-	append_u32(&out, u32(n))
+	append_u32(&out, u32(c.credit_owed))
+	c.credit_owed = 0
 	return write_all(c, out[:])
+}
+
+// A RST_STREAM the peer drew without a handler behind it, charged against
+// MAX_CONTROL_FRAMES_PER_SECOND like a PING.
+@(private)
+stream_error :: proc(c: ^Conn, stream_id: u32, code: Error_Code) -> bool {
+	if !control_frame_allowed(c) {
+		goaway(c, .Enhance_Your_Calm)
+		return false
+	}
+	return rst_stream(c, stream_id, code)
 }
 
 @(private)
