@@ -2643,13 +2643,15 @@ test_refused_body_spends_the_control_budget :: proc(t: ^testing.T) {
 }
 
 /*
-A stream the peer has reset stays in the table while its handler runs, so a
-client that cancels a full set of slow queries and opens replacements is
-refused. That is this end's count, not the client's fault: the refusals are
-still sent, but must not spend the budget and cost the connection.
+A stream the peer has reset stays in the table while its handler runs, but the
+peer is right to count it closed. A client that cancels a full set of slow
+queries and opens replacements is within the limit it was told, so it is
+served, not refused. Past MAX_HELD_STREAMS the refusals are charged like any
+other, or a peer keeping reset queries running would draw a free RST_STREAM
+per HEADERS.
 */
 @(test)
-test_refusals_for_reset_streams_do_not_spend_the_budget :: proc(t: ^testing.T) {
+test_reset_streams_free_their_slot_for_the_peer :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
 	mem.tracking_allocator_init(&track, context.allocator)
 	defer mem.tracking_allocator_destroy(&track)
@@ -2665,46 +2667,63 @@ test_refusals_for_reset_streams_do_not_spend_the_budget :: proc(t: ^testing.T) {
 	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
 	rst := []u8{0, 0, 0, 8} // CANCEL
 	id := u32(1)
+	open :: proc(c: ^Conn, id: ^u32, block: []u8) -> bool {
+		h := Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = id^}
+		id^ += 2
+		return handle_headers(c, h, block)
+	}
 	for _ in 0 ..< MAX_CONCURRENT {
-		h := Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = id}
-		testing.expect(t, handle_headers(c, h, block), "handle_headers failed")
-		handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = id}, rst)
-		id += 2
+		sid := id
+		testing.expect(t, open(c, &id, block), "handle_headers failed")
+		handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = sid}, rst)
 	}
 	testing.expect_value(t, len(c.streams), MAX_CONCURRENT)
+	testing.expect_value(t, c.closed_held, MAX_CONCURRENT)
 
 	clear(&log.frames)
+	for _ in 0 ..< MAX_CONCURRENT {
+		sid := id
+		testing.expect(t, open(c, &id, block), "handle_headers failed")
+		handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = sid}, rst)
+	}
+	testing.expect_value(t, len(c.streams), MAX_HELD_STREAMS)
+	for f in log.frames {
+		testing.expect(t, f.type != .Rst_Stream, "a client within the limit by its own count was refused")
+	}
+
+	// Nothing is open by the peer's count now; only the held cap refuses.
 	refused := 0
-	for _ in 0 ..< 2 * MAX_CONTROL_FRAMES_PER_SECOND {
-		h := Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = id}
-		if !handle_headers(c, h, block) {
+	for refused < 1000 {
+		refused += 1
+		if !open(c, &id, block) {
 			break
 		}
-		refused += 1
-		id += 2
 	}
-	testing.expect_value(t, refused, 2 * MAX_CONTROL_FRAMES_PER_SECOND)
+	testing.expect_value(t, refused, MAX_CONTROL_FRAMES_PER_SECOND + 1)
+	saw_goaway := false
 	for f in log.frames {
-		testing.expect(t, f.type != .Goaway, "a client within the limit by its own count was sent GOAWAY")
+		saw_goaway ||= f.type == .Goaway
 	}
+	testing.expect(t, saw_goaway, "refusals past MAX_HELD_STREAMS were never charged")
 
 	for sid := u32(1); sid < id; sid += 2 {
 		close_stream(c, sid)
 	}
+	testing.expect_value(t, c.closed_held, 0)
 	delete(log.frames)
 	conn_unref(c)
 	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "reset stream refusals")
+	expect_no_leaks(t, &track, "reset stream slots")
 }
 
 /*
-With no stream-level WINDOW_UPDATE, a stream's window is only ever spent, so
-the bound has to be on what spends it: padding included. Otherwise a peer
-padding every frame runs the 1 MiB window dry with a body still under
-MAX_BODY, and the stream stalls for good instead of being reset.
+With no stream-level WINDOW_UPDATE, a stream's window is only ever spent, and
+padding spends it without growing the body. A padded body under MAX_BODY is
+still a body and is kept; a stream that has spent half its window is reset
+rather than left to run it dry and stall for good.
 */
 @(test)
-test_padding_counts_toward_the_body_bound :: proc(t: ^testing.T) {
+test_padding_cannot_stall_a_stream :: proc(t: ^testing.T) {
 	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil)
 	defer conn_unref(c)
 
@@ -2716,11 +2735,19 @@ test_padding_counts_toward_the_body_bound :: proc(t: ^testing.T) {
 	frame := make([]u8, 257, context.temp_allocator)
 	frame[0] = 255
 	spent := 0
-	for spent <= MAX_BODY {
+	send :: proc(c: ^Conn, frame: []u8, spent: ^int) {
 		handle_data(c, Frame_Header{length = len(frame), type = .Data, flags = FLAG_PADDED, stream_id = 1}, frame)
-		spent += len(frame)
+		spent^ += len(frame)
+	}
+	for spent <= MAX_BODY {
+		send(c, frame, &spent)
 	}
 	_, open := c.streams[1]
-	testing.expectf(t, !open, "a stream that spent %d bytes of its window, over MAX_BODY, was left open", spent)
+	testing.expectf(t, open, "a %d-byte body padded past MAX_BODY was refused", spent / len(frame))
+	for spent <= RECV_WINDOW / 2 {
+		send(c, frame, &spent)
+	}
+	_, open = c.streams[1]
+	testing.expectf(t, !open, "a stream that spent %d bytes of its window was left open", spent)
 	free_all(context.temp_allocator)
 }
