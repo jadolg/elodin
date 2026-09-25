@@ -387,6 +387,7 @@ test_a_rule_narrowed_by_a_modifier_is_not_widened :: proc(t: ^testing.T) {
 	// Modifiers that do not narrow which queries are blocked keep the rule.
 	testing.expect_value(t, matches("||wide.example^$important\n", .Adblock, "wide.example."), Decision.Blocked)
 	testing.expect_value(t, matches("||wide.example^$third-party\n", .Adblock, "wide.example."), Decision.Blocked)
+	testing.expect_value(t, matches("||wide.example^$3p\n", .Adblock, "wide.example."), Decision.Blocked)
 }
 
 @(test)

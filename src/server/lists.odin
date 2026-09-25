@@ -43,7 +43,9 @@ build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool) -> (block, a
 	clear(&block.cancelled)
 	clear(&allow.cancelled)
 	for rule in cfg.blocking.rules {
-		filter.parse_rule(block, allow, rule)
+		if filter.parse_rule(block, allow, rule) == 0 {
+			warn_rule_adds_nothing(rule)
+		}
 	}
 	for rule in cfg.blocking.allow_rules {
 		// Entries here are allow rules whether or not they carry the @@ prefix.
@@ -51,11 +53,22 @@ build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool) -> (block, a
 		if !strings.has_prefix(text, "@@") {
 			text = fmt.tprintf("@@%s", text)
 		}
-		filter.parse_rule(block, allow, text)
+		if filter.parse_rule(block, allow, text) == 0 {
+			warn_rule_adds_nothing(rule)
+		}
 	}
 
 	logx.infof("filter: %d block rules, %d allow rules", block.count, allow.count)
 	return
+}
+
+// A list skipping what it cannot honour is routine; the operator's own rule
+// doing nothing is worth a word, since one that did block may now be skipped.
+@(private)
+warn_rule_adds_nothing :: proc(rule: string) {
+	if !strings.contains(rule, "badfilter") {
+		logx.warnf("blocking rule %q adds nothing: it carries a modifier DNS cannot honour, is cosmetic, or names no domain", rule)
+	}
 }
 
 @(private)

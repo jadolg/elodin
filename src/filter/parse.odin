@@ -274,7 +274,8 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 			switch name {
 			case "badfilter":
 				badfilter = true
-			case "important", "third-party", "":
+			// `3p` is uBlock Origin's and AdGuard's short form of `third-party`.
+			case "important", "third-party", "3p", "":
 			case:
 				return 0
 			}
