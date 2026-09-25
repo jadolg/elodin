@@ -209,7 +209,7 @@ Conn :: struct {
 	// Connection credit not yet returned; see CREDIT_BATCH. Reader thread only.
 	credit_owed:         int,
 	// Streams in `streams` marked Closed, which the peer no longer counts; see
-	// MAX_HELD_STREAMS and mark_closed.
+	// MAX_HELD_STREAMS and set_state.
 	closed_held:         int,
 }
 
@@ -453,7 +453,7 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		orphaned := false
 		if s, found := c.streams[h.stream_id]; found {
 			s.cancelled = true
-			mark_closed(c, s)
+			set_state(c, s, .Closed)
 			// Nobody is coming for this one. See `Stream.dispatched`.
 			orphaned = !s.dispatched
 			// Wakes a handler parked in write_body's no-credit wait; without this
@@ -505,13 +505,22 @@ spend_control_budget :: proc(c: ^Conn) -> bool {
 	return true
 }
 
-// Marks a stream the peer no longer counts as open. Caller holds c.mu.
+/*
+Every change to a stream's state once it is in the table goes through here, so
+Conn.closed_held stays the number of held streams marked Closed. Closed is
+terminal (RFC 9113 5.1): a write that would reopen one is dropped rather than
+left to undercount, which would loosen admission for the rest of the
+connection. Caller holds c.mu.
+*/
 @(private)
-mark_closed :: proc(c: ^Conn, s: ^Stream) {
-	if s.state != .Closed {
-		s.state = .Closed
+set_state :: proc(c: ^Conn, s: ^Stream, state: Stream_State) {
+	if s.state == .Closed {
+		return
+	}
+	if state == .Closed {
 		c.closed_held += 1
 	}
+	s.state = state
 }
 
 @(private)
@@ -989,7 +998,7 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 	if !over {
 		s.charged = fields
 		c.request_bytes += fields
-		s.state = .Half_Closed_Remote if s.end_stream else .Open
+		set_state(c, s, .Half_Closed_Remote if s.end_stream else .Open)
 	}
 	complete := s.end_stream
 	sync.mutex_unlock(&c.mu)
@@ -1086,7 +1095,7 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	if already_ended {
 		s.cancelled = true
 		// Reset below, so over for the peer too; see MAX_HELD_STREAMS.
-		mark_closed(c, s)
+		set_state(c, s, .Closed)
 		// Wakes a handler parked in write_body's no-credit wait; without this it
 		// sleeps out the full write_timeout on a stream already known dead.
 		sync.cond_broadcast(&c.cond)
@@ -1171,7 +1180,7 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		sync.mutex_unlock(&c.mu)
 		return true
 	}
-	live.state = .Half_Closed_Remote
+	set_state(c, live, .Half_Closed_Remote)
 	req := live.pending
 	live.pending = nil
 	sync.mutex_unlock(&c.mu)
@@ -1302,7 +1311,7 @@ respond :: proc(c: ^Conn, stream_id: u32, resp: Response) -> bool {
 	cancelled := found && s.cancelled
 	if found && len(resp.body) == 0 {
 		// Its END_STREAM rides on the HEADERS below; see MAX_HELD_STREAMS.
-		mark_closed(c, s)
+		set_state(c, s, .Closed)
 	}
 	sync.mutex_unlock(&c.mu)
 	if cancelled {
@@ -1371,7 +1380,7 @@ write_body :: proc(c: ^Conn, stream_id: u32, body: []u8) -> bool {
 				s.send_window -= chunk
 				if chunk == remaining {
 					// This chunk carries END_STREAM; see MAX_HELD_STREAMS.
-					mark_closed(c, s)
+					set_state(c, s, .Closed)
 				}
 				break
 			}
@@ -1390,7 +1399,7 @@ write_body :: proc(c: ^Conn, stream_id: u32, body: []u8) -> bool {
 				// and respond's close_stream must find a stream already known
 				// dead, not send a second RST_STREAM onto one this end just reset.
 				s.cancelled = true
-				mark_closed(c, s)
+				set_state(c, s, .Closed)
 				sync.cond_broadcast(&c.cond)
 				sync.mutex_unlock(&c.mu)
 				rst_stream(c, stream_id, .Cancel)

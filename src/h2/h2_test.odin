@@ -2691,8 +2691,12 @@ rather than left to run it dry and stall for good.
 */
 @(test)
 test_padding_cannot_stall_a_stream :: proc(t: ^testing.T) {
-	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil)
-	defer conn_unref(c)
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil, allocator)
 
 	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
 	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
@@ -2717,6 +2721,9 @@ test_padding_cannot_stall_a_stream :: proc(t: ^testing.T) {
 	_, open = c.streams[1]
 	testing.expectf(t, !open, "a stream that spent %d bytes of its window was left open", spent)
 	free_all(context.temp_allocator)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "padded stream")
 }
 
 /*
@@ -2755,4 +2762,24 @@ test_data_after_end_stream_spends_the_control_budget :: proc(t: ^testing.T) {
 	conn_unref(c)
 	free_all(context.temp_allocator)
 	expect_no_leaks(t, &track, "data after end stream budget")
+}
+
+/*
+Closed is terminal, and closed_held counts it: a state write that reopened a
+Closed stream would leave the count one high after close_stream, and every
+later admission on the connection one stream looser.
+*/
+@(test)
+test_a_closed_stream_stays_closed :: proc(t: ^testing.T) {
+	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil)
+	defer conn_unref(c)
+	s := new(Stream)
+	defer free(s)
+
+	set_state(c, s, .Closed)
+	set_state(c, s, .Closed)
+	testing.expect_value(t, c.closed_held, 1)
+	set_state(c, s, .Half_Closed_Remote)
+	testing.expect_value(t, s.state, Stream_State.Closed)
+	testing.expect_value(t, c.closed_held, 1)
 }
