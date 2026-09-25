@@ -39,6 +39,9 @@ MAX_NORMALISED :: 1024
 
 Set :: struct {
 	rules:     map[string]Rule_Flags,
+	// What `$badfilter` rules have taken back, kept so a rule arriving later -
+	// further down the list, or from the next one - is cancelled too.
+	cancelled: map[string]Rule_Flags,
 	arena:     virtual.Arena,
 	allocator: mem.Allocator,
 	count:     int,
@@ -82,6 +85,7 @@ set_make :: proc() -> ^Set {
 	}
 	s.allocator = virtual.arena_allocator(&s.arena)
 	s.rules = make(map[string]Rule_Flags, 1024, s.allocator)
+	s.cancelled = make(map[string]Rule_Flags, s.allocator)
 	return s
 }
 
@@ -105,12 +109,45 @@ set_add :: proc(s: ^Set, domain: string, flags: Rule_Flags) {
 	if !ok || key == "" {
 		return
 	}
-	if existing, found := s.rules[key]; found {
-		s.rules[key] = existing + flags
+	add := flags - s.cancelled[key]
+	if add == {} {
 		return
 	}
-	s.rules[strings.clone(key, s.allocator)] = flags
+	if existing, found := s.rules[key]; found {
+		s.rules[key] = existing + add
+		return
+	}
+	s.rules[strings.clone(key, s.allocator)] = add
 	s.count += 1
+}
+
+/*
+Take back what a rule for `domain` with `flags` would add, whether that rule is
+already in the set or arrives after this.
+
+ponytail: rules are stored merged per name, so this cancels the coverage rather
+than one rule's text - `||x^$badfilter` also lifts a hosts entry for `x`, where
+AdGuard would lift only `||x^`. Keep rule texts per name if that ever matters.
+*/
+set_cancel :: proc(s: ^Set, domain: string, flags: Rule_Flags) {
+	buf: [MAX_NORMALISED]u8
+	key, ok := normalise(domain, buf[:])
+	if !ok || key == "" {
+		return
+	}
+	if existing, found := s.cancelled[key]; found {
+		s.cancelled[key] = existing + flags
+	} else {
+		s.cancelled[strings.clone(key, s.allocator)] = flags
+	}
+	if existing, found := s.rules[key]; found {
+		if rest := existing - flags; rest != {} {
+			s.rules[key] = rest
+		} else {
+			delete_key(&s.rules, key)
+			s.count -= 1
+		}
+	}
 }
 
 set_lookup :: proc(s: ^Set, normalised: string) -> bool {

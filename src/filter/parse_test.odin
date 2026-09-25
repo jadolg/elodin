@@ -327,3 +327,70 @@ test_set_add_merges_the_flags_of_a_repeated_name :: proc(t: ^testing.T) {
 	set_add(s, "", {.Apex})
 	testing.expect_value(t, s.count, 1)
 }
+
+@(test)
+test_a_badfilter_rule_cancels_the_rule_it_names :: proc(t: ^testing.T) {
+	/*
+	`$badfilter` is a list author saying "not this one", most often about a rule
+	some other list carries. The AdGuard DNS filter cancels `||pl.ua^` that way,
+	and pl.ua is a public suffix: read as a plain block, it took every name under
+	it off the air. It cancels its rule whichever comes first, and across lists,
+	since the lists share one set.
+	*/
+	block, allow := set_make(), set_make()
+	defer set_destroy(block)
+	defer set_destroy(allow)
+	parse_list(block, allow, "||pl.ua^$badfilter\n||linksprf.com^\n@@||ok.example^$badfilter\n", .Adblock)
+	parse_list(block, allow, "||pl.ua^\n||kept.example^\n||linksprf.com^$badfilter\n@@||ok.example^\n", .Adblock)
+	testing.expect_value(t, block.count, 1)
+	testing.expect_value(t, allow.count, 0)
+	testing.expect(t, !set_lookup(block, "www.pl.ua"), "a cancelled rule blocks nothing under it")
+	testing.expect(t, !set_lookup(block, "pl.ua"), "nor the name itself")
+	testing.expect(t, !set_lookup(block, "linksprf.com"), "cancelled when the rule came first, too")
+	testing.expect(t, !set_lookup(allow, "ok.example"), "an allow rule can be cancelled as well")
+	testing.expect(t, set_lookup(block, "kept.example"), "a rule nobody cancelled still blocks")
+
+	// On its own, with nothing to cancel, it blocks nothing either.
+	testing.expect_value(t, matches("wykop.pl$badfilter\n", .Adblock, "wykop.pl."), Decision.None)
+}
+
+@(test)
+test_a_rule_narrowed_by_a_modifier_is_not_widened :: proc(t: ^testing.T) {
+	/*
+	These modifiers narrow a rule to one query type, one client, or turn it into
+	something that is not a block at all. Dropping the modifier and keeping the
+	rule would block every type for every client, so the rule is skipped - what
+	AdGuard Home does with a modifier its DNS engine cannot honour.
+	*/
+	narrowed := []string {
+		"||narrow.example^$dnstype=AAAA",
+		"||narrow.example^$dnstype=~A",
+		"||narrow.example^$important,client=192.168.1.5",
+		"||narrow.example^$ctag=device_phone",
+		"||narrow.example^$denyallow=ok.narrow.example",
+		"||narrow.example^$dnsrewrite=10.0.0.1",
+		"@@||narrow.example^$client=10.0.0.1",
+	}
+	for rule in narrowed {
+		testing.expectf(t, matches(rule, .Adblock, "narrow.example.") == .None, "%q matched", rule)
+	}
+	// Modifiers that do not narrow which queries are blocked keep the rule.
+	testing.expect_value(t, matches("||wide.example^$important\n", .Adblock, "wide.example."), Decision.Blocked)
+	testing.expect_value(t, matches("||wide.example^$third-party\n", .Adblock, "wide.example."), Decision.Blocked)
+}
+
+@(test)
+test_a_cosmetic_rule_blocks_nothing :: proc(t: ^testing.T) {
+	// HTML and CSS filtering rules name the site they apply on, not one to block.
+	cosmetic := []string {
+		`example.com$$script[tag-content="ads"]`,
+		`example.com$@$script[tag-content="ads"]`,
+		"example.com##.banner",
+		"example.com#@#.banner",
+		"example.com#$#body { color: red }",
+		"example.com#?#div:has(> a)",
+	}
+	for rule in cosmetic {
+		testing.expectf(t, matches(rule, .Adblock, "example.com.") == .None, "%q matched", rule)
+	}
+}

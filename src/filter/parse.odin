@@ -250,10 +250,36 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 		target = allow
 		line = line[2:]
 	}
-	// Modifiers ($third-party, $important, ...) do not change which name is
-	// matched, and the ones that would are not expressible in DNS anyway.
+	/*
+	Most modifiers ($third-party, $important, ...) do not change which name is
+	matched and are dropped. The ones that narrow a rule to a query type or a
+	client, or make it something other than a block, would be widened by that,
+	so their rule is skipped; `$badfilter` cancels the rule it names.
+	*/
+	badfilter := false
 	if idx := strings.index_byte(line, '$'); idx >= 0 {
+		modifiers := line[idx + 1:]
 		line = line[:idx]
+		// `$$` and `$@$` open an HTML filtering rule, not a modifier list.
+		if strings.has_prefix(modifiers, "$") || strings.has_prefix(modifiers, "@$") {
+			return 0
+		}
+		for m in strings.split_iterator(&modifiers, ",") {
+			name := strings.trim_space(m)
+			if eq := strings.index_byte(name, '='); eq >= 0 {
+				name = name[:eq]
+			}
+			switch name {
+			case "badfilter":
+				badfilter = true
+			case "dnstype", "client", "ctag", "denyallow", "dnsrewrite":
+				return 0
+			}
+		}
+	}
+	// `##`, `#@#`, `#$#`, `#?#`: cosmetic rules, naming the site they apply on.
+	if strings.contains(line, "#") {
+		return 0
 	}
 
 	flags := Rule_Flags{.Apex, .Subdomains}
@@ -275,6 +301,10 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 	}
 	// Regex rules and path-scoped rules cannot be answered at the DNS layer.
 	if line[0] == '/' || strings.contains(line, "*") || strings.contains(line, "/") {
+		return 0
+	}
+	if badfilter {
+		set_cancel(target, line, flags)
 		return 0
 	}
 	set_add(target, line, flags)

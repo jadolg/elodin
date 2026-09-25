@@ -271,6 +271,19 @@ inside the first, so the exception has to beat the rule it is an exception to.
 PARITY_BLOCKED :: []string{"www.parity.test.", "alias.parity.test."}
 PARITY_ALLOWED :: "safe.www.parity.test."
 
+/*
+Rules on pool names that must block nothing, so their answers are held to the
+upstream's like any other. Each names a rule a list really carries - one
+cancelled by `$badfilter`, one narrowed to a type or a client - which read as a
+plain block used to take the name off the air (#319).
+*/
+PARITY_NOT_BLOCKING :: []string {
+	"||deep.nested.parity.test^",
+	"||deep.nested.parity.test^$badfilter",
+	"||a.parity.test^$dnstype=AAAA",
+	"||xn--bcher-kva.parity.test^$client=192.0.2.1",
+}
+
 // The blocking scenario's pool: the usual one, and the allowed name inside the
 // blocked one, so the exception is asked about by name.
 PARITY_BLOCKING_POOL := []string {
@@ -403,6 +416,9 @@ parity_scenario_config :: proc(
 		strings.write_string(&sb, "\nblocking:\n  enabled: true\n  response: nxdomain\n  block_ttl: 60\n  rules:\n")
 		for name in PARITY_BLOCKED {
 			fmt.sbprintf(&sb, "    - \"||%s^\"\n", strings.trim_suffix(name, "."))
+		}
+		for rule in PARITY_NOT_BLOCKING {
+			fmt.sbprintf(&sb, "    - \"%s\"\n", rule)
 		}
 		fmt.sbprintf(&sb, "  allow:\n    - \"||%s^\"\n", strings.trim_suffix(PARITY_ALLOWED, "."))
 	} else {

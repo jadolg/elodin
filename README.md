@@ -811,8 +811,11 @@ Hosts entries are exact because hosts-format lists spell out every subdomain the
 mean; bare domains and `||` rules cover subtrees, which is how AdGuard Home reads
 the same files. Allow rules always win. The `address=/…/` and `server=/…/` forms
 are dnsmasq's, accepted because they turn up in lists that are otherwise adblock
-syntax; a `$` modifier is dropped and the rest of the rule kept, and a rule that
-cannot be expressed as a domain is skipped rather than failing its list.
+syntax. A `$` modifier is dropped and the rest of the rule kept, except that
+`$badfilter` cancels the rule it names, from whichever list, and a rule narrowed
+by `$dnstype`, `$client`, `$ctag`, `$denyallow` or `$dnsrewrite` is skipped
+rather than widened to every query; so are cosmetic rules (`##`, `$$`), and any
+rule that cannot be expressed as a domain, rather than failing its list.
 Downloaded lists are cached under `cache_dir`, and a refresh that fails falls
 back to the cached copy, so a network outage cannot silently turn blocking off.
 
