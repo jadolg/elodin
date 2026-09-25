@@ -506,6 +506,15 @@ control_budget_spend :: proc(b: ^Control_Budget) -> bool {
 	return b.frames <= MAX_CONTROL_FRAMES_PER_SECOND
 }
 
+// Gives one frame of this second's budget back, for work the peer did that this
+// end asked for.
+@(private)
+control_budget_refund :: proc(b: ^Control_Budget) {
+	if b.frames > 0 {
+		b.frames -= 1
+	}
+}
+
 // Charges one frame against MAX_CONTROL_FRAMES_PER_SECOND. Past it, the peer is
 // sent GOAWAY(ENHANCE_YOUR_CALM) and false says to drop the connection.
 @(private)
@@ -1264,15 +1273,24 @@ MAX_CONN_REQUEST :: 2 * (MAX_BODY + MAX_HEADER_LIST)
 // CREDIT_BATCH has built up.
 @(private)
 give_connection_credit :: proc(c: ^Conn, n: int) -> bool {
-	c.credit_owed += n
-	if c.credit_owed < CREDIT_BATCH {
-		return true
+	frame := owe_connection_credit(&c.credit_owed, n)
+	return frame == nil || write_all(c, frame)
+}
+
+// Adds `n` to `owed` and, once CREDIT_BATCH has built up, returns the
+// connection WINDOW_UPDATE that pays it all back; nil until then. Server and
+// client alike.
+@(private)
+owe_connection_credit :: proc(owed: ^int, n: int) -> []u8 {
+	owed^ += n
+	if owed^ < CREDIT_BATCH {
+		return nil
 	}
 	out := make([dynamic]u8, 0, 13, context.temp_allocator)
 	write_frame_header(&out, 4, .Window_Update, 0, 0)
-	append_u32(&out, u32(c.credit_owed))
-	c.credit_owed = 0
-	return write_all(c, out[:])
+	append_u32(&out, u32(owed^))
+	owed^ = 0
+	return out[:]
 }
 
 // A RST_STREAM the peer drew without a handler behind it, charged against

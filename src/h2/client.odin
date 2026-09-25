@@ -595,10 +595,23 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 		s.rst_sent = true
 	}
 	if found && !already_ended {
+		first := s.status == 0
 		for f in headers {
 			if f.name == ":status" {
 				s.status = parse_status(f.value)
 			}
+		}
+		/*
+		An upstream may PING about as often as it answers - keepalive, or
+		probing bandwidth - and one busy pooled connection answers far more
+		than MAX_CONTROL_FRAMES_PER_SECOND queries, so a flat budget would drop
+		every query in flight on it. Each response to a request of ours earns
+		one frame back instead: an upstream is held to our own query rate plus
+		the budget, never to a rate it can raise by itself. Once per stream,
+		and a stream id is only ever ours to open.
+		*/
+		if first && s.status != 0 {
+			control_budget_refund(&c.control)
 		}
 		if s.end_stream {
 			s.done = true
@@ -741,15 +754,8 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 // up.
 @(private)
 client_give_connection_credit :: proc(c: ^Client, n: int) -> bool {
-	c.credit_owed += n
-	if c.credit_owed < CREDIT_BATCH {
-		return true
-	}
-	out := make([dynamic]u8, 0, 13, context.temp_allocator)
-	write_frame_header(&out, 4, .Window_Update, 0, 0)
-	append_u32(&out, u32(c.credit_owed))
-	c.credit_owed = 0
-	return client_write_all(c, out[:])
+	frame := owe_connection_credit(&c.credit_owed, n)
+	return frame == nil || client_write_all(c, frame)
 }
 
 @(private)

@@ -938,7 +938,9 @@ test_data_frame_cannot_touch_an_abandoned_stream :: proc(t: ^testing.T) {
 Client_Frame_Log :: struct {
 	frames: [dynamic]Frame_Header,
 	// Sum of the connection WINDOW_UPDATE increments written.
-	credit: int,
+	credit:      int,
+	// Error code of the last GOAWAY written.
+	goaway_code: Error_Code,
 }
 
 @(private = "file")
@@ -960,6 +962,9 @@ client_log_write :: proc(user: rawptr, buf: []u8) -> bool {
 		append(&log.frames, h)
 		if h.type == .Window_Update && h.stream_id == 0 && pos + FRAME_HEADER_SIZE + 4 <= len(buf) {
 			log.credit += int(read_u32(buf[pos + FRAME_HEADER_SIZE:]))
+		}
+		if h.type == .Goaway && pos + FRAME_HEADER_SIZE + 8 <= len(buf) {
+			log.goaway_code = Error_Code(read_u32(buf[pos + FRAME_HEADER_SIZE + 4:]))
 		}
 		pos += FRAME_HEADER_SIZE + h.length
 	}
@@ -2033,6 +2038,7 @@ expect_client_control_flood_refused :: proc(t: ^testing.T, h: Frame_Header, payl
 		saw_goaway ||= f.type == .Goaway
 	}
 	testing.expectf(t, saw_goaway, "%s: the flood was dropped without a GOAWAY", what)
+	testing.expectf(t, log.goaway_code == .Enhance_Your_Calm, "%s: GOAWAY said %v, not ENHANCE_YOUR_CALM", what, log.goaway_code)
 
 	delete(log.frames)
 	client_unref(c)
@@ -2050,6 +2056,29 @@ test_client_ping_flood_is_refused :: proc(t: ^testing.T) {
 @(test)
 test_client_settings_flood_is_refused :: proc(t: ^testing.T) {
 	expect_client_control_flood_refused(t, Frame_Header{type = .Settings}, nil, "client settings flood")
+}
+
+// The server's test_control_frame_budget_refills_each_second, for the client:
+// ACKs draw nothing back so are not charged, and a spent budget comes back.
+@(test)
+test_client_control_budget_refills_each_second :: proc(t: ^testing.T) {
+	c := client_make(IO{read = hook_read_nothing, write = client_log_write})
+	defer client_unref(c)
+	ping := Frame_Header{length = 8, type = .Ping}
+	payload := make([]u8, 8, context.temp_allocator)
+
+	for _ in 0 ..< MAX_CONTROL_FRAMES_PER_SECOND {
+		testing.expect(t, client_handle_frame(c, ping, payload), "a PING within the budget was refused")
+	}
+	ack := Frame_Header{length = 8, type = .Ping, flags = FLAG_ACK}
+	testing.expect(t, client_handle_frame(c, ack, payload), "a PING ACK was charged against the budget")
+	settings_ack := Frame_Header{type = .Settings, flags = FLAG_ACK}
+	testing.expect(t, client_handle_frame(c, settings_ack, nil), "a SETTINGS ACK was charged against the budget")
+
+	c.control.window = time.tick_add(c.control.window, -time.Second)
+	testing.expect(t, client_handle_frame(c, ping, payload), "the budget did not refill after a second")
+	testing.expect_value(t, c.control.frames, 1)
+	free_all(context.temp_allocator)
 }
 
 /*
@@ -2149,5 +2178,102 @@ test_client_padding_cannot_stall_a_stream :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 	for _, entry in track.allocation_map {
 		testing.expectf(t, false, "client padded stream: %d bytes leaked at %v", entry.size, entry.location)
+	}
+}
+
+/*
+An upstream that PINGs once per answer is held to our own query rate, not to
+MAX_CONTROL_FRAMES_PER_SECOND: a busy pooled connection answers far more than
+that many queries a second, and dropping it would fail every one in flight.
+*/
+@(test)
+test_client_answers_earn_back_the_control_budget :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	c := client_make(IO{read = hook_read_nothing, write = client_log_write}, allocator)
+	c.control.window = time.tick_add(time.tick_now(), time.Hour)
+	block := make([dynamic]u8, 0, 16, context.temp_allocator)
+	encode_header(&block, ":status", "200")
+	ping := make([]u8, 8, context.temp_allocator)
+
+	answered := 0
+	for id := u32(1); answered < 4 * MAX_CONTROL_FRAMES_PER_SECOND; id += 2 {
+		s := new(Client_Stream, allocator)
+		s.id = id
+		s.send_window = c.peer_initial_window
+		s.body = make([dynamic]u8, 0, 8, allocator)
+		c.streams[id] = s
+		c.next_stream_id = id + 2
+
+		h := Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = id}
+		ok := client_handle_frame(c, h, block[:])
+		// A second HEADERS on the same stream earns nothing more.
+		ok = ok && client_handle_frame(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block[:])
+		ok = ok && client_handle_frame(c, Frame_Header{length = 8, type = .Ping}, ping)
+		client_stream_destroy(c, s)
+		delete_key(&c.streams, id)
+		if !ok {
+			break
+		}
+		answered += 1
+	}
+	testing.expect_value(t, answered, 4 * MAX_CONTROL_FRAMES_PER_SECOND)
+
+	// Two PINGs an answer is still one more than it earns, however many HEADERS
+	// the upstream sends: capped.
+	id := u32(2 * answered + 1)
+	doubled := 0
+	for doubled < 4 * MAX_CONTROL_FRAMES_PER_SECOND {
+		s := new(Client_Stream, allocator)
+		s.id = id
+		s.send_window = c.peer_initial_window
+		s.body = make([dynamic]u8, 0, 8, allocator)
+		c.streams[id] = s
+		c.next_stream_id = id + 2
+		ok := client_handle_frame(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block[:])
+		ok = ok && client_handle_frame(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = id}, block[:])
+		ok = ok && client_handle_frame(c, Frame_Header{length = 8, type = .Ping}, ping)
+		ok = ok && client_handle_frame(c, Frame_Header{length = 8, type = .Ping}, ping)
+		client_stream_destroy(c, s)
+		delete_key(&c.streams, id)
+		id += 2
+		if !ok {
+			break
+		}
+		doubled += 1
+	}
+	testing.expectf(t, doubled < 4 * MAX_CONTROL_FRAMES_PER_SECOND, "two PINGs per answer were never capped")
+	client_unref(c)
+	free_all(context.temp_allocator)
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "client earned budget: %d bytes leaked at %v", entry.size, entry.location)
+	}
+}
+
+@(test)
+test_client_pings_with_no_answers_are_capped :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	c := client_make(IO{read = hook_read_nothing, write = client_log_write}, allocator)
+	c.control.window = time.tick_add(time.tick_now(), time.Hour)
+	ping := make([]u8, 8, context.temp_allocator)
+
+	// Without answers the budget is flat again.
+	flooded := 0
+	for flooded < 1000 && client_handle_frame(c, Frame_Header{length = 8, type = .Ping}, ping) {
+		flooded += 1
+	}
+	testing.expect(t, flooded <= MAX_CONTROL_FRAMES_PER_SECOND, "PINGs with no answers behind them were not capped")
+
+	client_unref(c)
+	free_all(context.temp_allocator)
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "client earned budget: %d bytes leaked at %v", entry.size, entry.location)
 	}
 }
