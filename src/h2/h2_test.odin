@@ -2421,7 +2421,7 @@ it cares to keep sending. A connection past the per-second control-frame
 budget is told ENHANCE_YOUR_CALM and dropped instead.
 */
 @(private = "file")
-expect_control_flood_refused :: proc(t: ^testing.T, h: Frame_Header, payload: []u8, what: string) {
+expect_control_flood_refused :: proc(t: ^testing.T, h: Frame_Header, payload: []u8, what: string, fill := false) {
 	track: mem.Tracking_Allocator
 	mem.tracking_allocator_init(&track, context.allocator)
 	defer mem.tracking_allocator_destroy(&track)
@@ -2434,7 +2434,12 @@ expect_control_flood_refused :: proc(t: ^testing.T, h: Frame_Header, payload: []
 	// A window that opens in the future cannot roll over mid-burst, so a slow
 	// box cannot hand the flood a fresh budget and move the refusal.
 	c.control_window = time.tick_add(time.tick_now(), time.Hour)
+	if fill {
+		fill_concurrency(c, allocator)
+	}
 
+	// A HEADERS flood opens a new stream each time.
+	h := h
 	sent := 0
 	refused := false
 	for sent < 1000 {
@@ -2442,6 +2447,9 @@ expect_control_flood_refused :: proc(t: ^testing.T, h: Frame_Header, payload: []
 		if !handle_frame(c, h, payload) {
 			refused = true
 			break
+		}
+		if h.stream_id != 0 {
+			h.stream_id += 2
 		}
 	}
 	testing.expectf(t, refused, "%s: %d frames in a burst were all answered", what, sent)
@@ -2546,60 +2554,19 @@ while the connection carries on. That is the CVE-2019-9514 shape: a peer
 sending nothing but bad HEADERS draws a reset for each. They share the
 control-frame budget, so the connection is dropped once it is spent.
 */
-@(private = "file")
-expect_headers_flood_refused :: proc(t: ^testing.T, refuse: bool, what: string) {
-	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
-
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
-	c.control_window = time.tick_add(time.tick_now(), time.Hour)
-	first := u32(1)
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
-	if refuse {
-		fill_concurrency(c, allocator)
-		first = u32(1 + 2 * MAX_CONCURRENT)
-	} else {
-		// A lone literal field with no pseudo-headers at all.
-		block = []u8{0x40, 0x01, 'x', 0x01, 'y'}
-	}
-
-	sent := 0
-	refused := false
-	for id := first; sent < 1000; id += 2 {
-		sent += 1
-		h := Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = id}
-		if !handle_headers(c, h, block) {
-			refused = true
-			break
-		}
-	}
-	testing.expectf(t, refused, "%s: %d streams were all reset and the connection kept", what, sent)
-	testing.expectf(t, sent == MAX_CONTROL_FRAMES_PER_SECOND + 1, "%s: refused at stream %d, not the first one over the budget", what, sent)
-	saw_goaway := false
-	for f in log.frames {
-		saw_goaway ||= f.type == .Goaway
-	}
-	testing.expectf(t, saw_goaway, "%s: the flood was dropped without a GOAWAY", what)
-
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, what)
-}
-
 @(test)
 test_malformed_headers_flood_is_refused :: proc(t: ^testing.T) {
-	expect_headers_flood_refused(t, false, "malformed headers flood")
+	// A lone literal field with no pseudo-headers at all.
+	block := []u8{0x40, 0x01, 'x', 0x01, 'y'}
+	h := Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}
+	expect_control_flood_refused(t, h, block, "malformed headers flood")
 }
 
 @(test)
 test_refused_stream_flood_is_refused :: proc(t: ^testing.T) {
-	expect_headers_flood_refused(t, true, "refused stream flood")
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	h := Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1 + 2 * MAX_CONCURRENT}
+	expect_control_flood_refused(t, h, block, "refused stream flood", fill = true)
 }
 
 /*

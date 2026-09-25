@@ -1114,7 +1114,7 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 			// HEADERS: see stream_error.
 			sent := stream_error(c, h.stream_id, oversized ? .Enhance_Your_Calm : .Refused_Stream)
 			// The stream is over. Without this it would hold its body, its parked
-			// request and one of MAX_CONCURRENT slots until the connection went.
+			// request and one of MAX_HELD_STREAMS slots until the connection went.
 			close_stream(c, h.stream_id)
 			/*
 			The stream is finished with, but the connection is not. These bytes
