@@ -202,10 +202,8 @@ Conn :: struct {
 	// How long a response may wait for the peer to grant flow-control credit
 	// before the stream is given up on.
 	write_timeout:       time.Duration,
-	// Answered control frames and stream errors in the second starting at
-	// control_window; see MAX_CONTROL_FRAMES_PER_SECOND. Reader thread only.
-	control_frames:      int,
-	control_window:      time.Tick,
+	// Answered control frames and stream errors; see Control_Budget.
+	control:             Control_Budget,
 	// Connection credit not yet returned; see CREDIT_BATCH. Reader thread only.
 	credit_owed:         int,
 	// Streams in `streams` marked Closed, which the peer no longer counts; see
@@ -487,18 +485,53 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	return true
 }
 
+/*
+Frames a peer drew out of this end, held to MAX_CONTROL_FRAMES_PER_SECOND plus
+whatever it has earned: `frames` counts the second starting at `window`, and
+`earned` is frames paid for by work this end asked for (the client's answers;
+the server earns nothing). One per connection; reader thread only.
+
+`earned` is not reset with the window. A PING may trail the answer that paid
+for it by any lag, across a second boundary, and a busy pooled connection
+answers far more than the budget a second, so credit that expired with the
+window would drop exactly that connection. It is not capped either: it only
+grows by answering this end's own requests, one frame each, so what a peer can
+bank is a 1:1 echo of queries already sent, never a rate it raises itself.
+*/
+Control_Budget :: struct {
+	frames: int,
+	window: time.Tick,
+	earned: int,
+}
+
+// Charges one frame; false once this second's budget is spent.
+@(private)
+control_budget_spend :: proc(b: ^Control_Budget) -> bool {
+	if b.earned > 0 {
+		b.earned -= 1
+		return true
+	}
+	now := time.tick_now()
+	// A zero window is long past, so the first frame opens one.
+	if time.tick_diff(b.window, now) >= time.Second {
+		b.window = now
+		b.frames = 0
+	}
+	b.frames += 1
+	return b.frames <= MAX_CONTROL_FRAMES_PER_SECOND
+}
+
+// Credits one frame, for work the peer did that this end asked for.
+@(private)
+control_budget_refund :: proc(b: ^Control_Budget) {
+	b.earned += 1
+}
+
 // Charges one frame against MAX_CONTROL_FRAMES_PER_SECOND. Past it, the peer is
 // sent GOAWAY(ENHANCE_YOUR_CALM) and false says to drop the connection.
 @(private)
 spend_control_budget :: proc(c: ^Conn) -> bool {
-	now := time.tick_now()
-	// A zero control_window is long past, so the first frame opens a window.
-	if time.tick_diff(c.control_window, now) >= time.Second {
-		c.control_window = now
-		c.control_frames = 0
-	}
-	c.control_frames += 1
-	if c.control_frames > MAX_CONTROL_FRAMES_PER_SECOND {
+	if !control_budget_spend(&c.control) {
 		goaway(c, .Enhance_Your_Calm)
 		return false
 	}
@@ -1252,15 +1285,24 @@ MAX_CONN_REQUEST :: 2 * (MAX_BODY + MAX_HEADER_LIST)
 // CREDIT_BATCH has built up.
 @(private)
 give_connection_credit :: proc(c: ^Conn, n: int) -> bool {
-	c.credit_owed += n
-	if c.credit_owed < CREDIT_BATCH {
-		return true
+	frame := owe_connection_credit(&c.credit_owed, n)
+	return frame == nil || write_all(c, frame)
+}
+
+// Adds `n` to `owed` and, once CREDIT_BATCH has built up, returns the
+// connection WINDOW_UPDATE that pays it all back; nil until then. Server and
+// client alike.
+@(private)
+owe_connection_credit :: proc(owed: ^int, n: int) -> []u8 {
+	owed^ += n
+	if owed^ < CREDIT_BATCH {
+		return nil
 	}
 	out := make([dynamic]u8, 0, 13, context.temp_allocator)
 	write_frame_header(&out, 4, .Window_Update, 0, 0)
-	append_u32(&out, u32(c.credit_owed))
-	c.credit_owed = 0
-	return write_all(c, out[:])
+	append_u32(&out, u32(owed^))
+	owed^ = 0
+	return out[:]
 }
 
 // A RST_STREAM the peer drew without a handler behind it, charged against

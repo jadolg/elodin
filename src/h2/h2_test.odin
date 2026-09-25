@@ -338,7 +338,7 @@ test_parked_bodies_are_bounded_per_connection :: proc(t: ^testing.T) {
 	for n in 0 ..< MAX_CONCURRENT {
 		id := u32(2 * n + 1)
 		// About the body bound, not the stream-error budget it would spend.
-		c.control_frames = 0
+		c.control.frames = 0
 		handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block)
 		for _ in 0 ..< MAX_BODY / DEFAULT_MAX_FRAME {
 			// A peer stops sending on a stream once it is refused.
@@ -405,7 +405,7 @@ test_parked_fields_are_bounded_per_connection :: proc(t: ^testing.T) {
 	for n in 0 ..< MAX_CONCURRENT {
 		id := u32(2 * n + 1)
 		// About the fields bound, not the stream-error budget it would spend.
-		c.control_frames = 0
+		c.control.frames = 0
 		ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block[:])
 		testing.expect(t, ok, "handle_headers failed")
 	}
@@ -2433,7 +2433,7 @@ expect_control_flood_refused :: proc(t: ^testing.T, h: Frame_Header, payload: []
 	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
 	// A window that opens in the future cannot roll over mid-burst, so a slow
 	// box cannot hand the flood a fresh budget and move the refusal.
-	c.control_window = time.tick_add(time.tick_now(), time.Hour)
+	c.control.window = time.tick_add(time.tick_now(), time.Hour)
 	if fill {
 		fill_concurrency(c, allocator)
 	}
@@ -2494,9 +2494,9 @@ test_control_frame_budget_refills_each_second :: proc(t: ^testing.T) {
 	ack := Frame_Header{length = 8, type = .Ping, flags = FLAG_ACK}
 	testing.expect(t, handle_frame(c, ack, payload), "a PING ACK was charged against the budget")
 
-	c.control_window = time.tick_add(c.control_window, -time.Second)
+	c.control.window = time.tick_add(c.control.window, -time.Second)
 	testing.expect(t, handle_frame(c, ping, payload), "the budget did not refill after a second")
-	testing.expect_value(t, c.control_frames, 1)
+	testing.expect_value(t, c.control.frames, 1)
 	free_all(context.temp_allocator)
 }
 
@@ -2590,8 +2590,8 @@ test_refused_body_spends_the_control_budget :: proc(t: ^testing.T) {
 	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 	testing.expect(t, ok, "handle_headers failed")
 
-	c.control_window = time.tick_add(time.tick_now(), time.Hour)
-	c.control_frames = MAX_CONTROL_FRAMES_PER_SECOND
+	c.control.window = time.tick_add(time.tick_now(), time.Hour)
+	c.control.frames = MAX_CONTROL_FRAMES_PER_SECOND
 	c.request_bytes = MAX_CONN_REQUEST
 	body := []u8{'x'}
 	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
@@ -2628,7 +2628,7 @@ test_reset_streams_free_their_slot_for_the_peer :: proc(t: ^testing.T) {
 		frames = make([dynamic]Frame_Header, 0, 8, allocator),
 	}
 	c := make_conn(IO{user = &log, read = no_read, write = log_write}, destroying_handler, nil, allocator)
-	c.control_window = time.tick_add(time.tick_now(), time.Hour)
+	c.control.window = time.tick_add(time.tick_now(), time.Hour)
 
 	// Dispatched to a handler that never answers, then reset by the peer.
 	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
@@ -2746,8 +2746,8 @@ test_data_after_end_stream_spends_the_control_budget :: proc(t: ^testing.T) {
 	h := Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}
 	testing.expect(t, handle_headers(c, h, block), "handle_headers failed")
 
-	c.control_window = time.tick_add(time.tick_now(), time.Hour)
-	c.control_frames = MAX_CONTROL_FRAMES_PER_SECOND
+	c.control.window = time.tick_add(time.tick_now(), time.Hour)
+	c.control.frames = MAX_CONTROL_FRAMES_PER_SECOND
 	body := []u8{'x'}
 	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
 	testing.expect(t, !dok, "DATA after END_STREAM past the budget drew a reset and kept the connection")

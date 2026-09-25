@@ -45,6 +45,10 @@ Client :: struct {
 	continuation_on:     u32,
 	// How many CONTINUATION frames have arrived for the block currently open.
 	continuation_frames: int,
+	// PINGs and SETTINGS answered; see Control_Budget. Reader thread only.
+	control:             Control_Budget,
+	// Connection credit not yet returned; see CREDIT_BATCH. Reader thread only.
+	credit_owed:         int,
 
 	allocator: mem.Allocator,
 }
@@ -70,6 +74,12 @@ Client_Stream :: struct {
 	an otherwise-successful response finishing must not turn into one.
 	*/
 	rst_sent:    bool,
+	// DATA payload taken on this stream, padding included: what it has spent of
+	// its flow-control window. See CLIENT_RECV_WINDOW.
+	received:    int,
+	// Whether this stream's answer has refunded its control frame; see
+	// client_finish_headers. Not `status != 0`: a malformed :status reads as 0.
+	refunded:    bool,
 }
 
 Client_Request :: struct {
@@ -99,7 +109,11 @@ Client_Error :: enum u8 {
 
 // Advertised receive window: generous, so we are never the reason a DoH
 // response stalls. Answers are tiny; this covers many of them arriving at
-// once across every multiplexed stream.
+// once across every multiplexed stream. Well past CLIENT_MAX_BODY, so a stream
+// is never given more than this and only the connection window needs
+// replenishing. Padding spends the window without growing the body, so a
+// stream is also reset once half the window has gone (Client_Stream.received),
+// rather than left to stall with none.
 CLIENT_RECV_WINDOW :: 1 << 20
 // Bound on one response body. The h2 package does not depend on the dns
 // package, so DNS's own message size limit is restated here.
@@ -285,6 +299,11 @@ client_send_preface :: proc(c: ^Client) -> bool {
 
 @(private)
 client_handle_frame :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
+	// The server's rule, for the same reason: see MAX_CONTROL_FRAMES_PER_SECOND.
+	if (h.type == .Ping || h.type == .Settings) && h.flags & FLAG_ACK == 0 && !control_budget_spend(&c.control) {
+		client_goaway(c, .Enhance_Your_Calm)
+		return false
+	}
 	#partial switch h.type {
 	case .Settings:
 		return client_handle_settings(c, h, payload)
@@ -584,6 +603,19 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 				s.status = parse_status(f.value)
 			}
 		}
+		/*
+		An upstream may PING about as often as it answers - keepalive, or
+		probing bandwidth - and one busy pooled connection answers far more
+		than MAX_CONTROL_FRAMES_PER_SECOND queries, so a flat budget would drop
+		every query in flight on it. Each response to a request of ours earns
+		one frame back instead: an upstream is held to our own query rate plus
+		the budget, never to a rate it can raise by itself. Once per stream,
+		and a stream id is only ever ours to open.
+		*/
+		if !s.refunded {
+			s.refunded = true
+			control_budget_refund(&c.control)
+		}
 		if s.end_stream {
 			s.done = true
 			sync.cond_broadcast(&c.cond)
@@ -654,7 +686,9 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 	}
 	oversized := false
 	if found && !already_ended {
-		if len(s.body) + len(data) > CLIENT_MAX_BODY {
+		s.received += len(payload)
+		// The second bound is on the window, not the body: see CLIENT_RECV_WINDOW.
+		if len(s.body) + len(data) > CLIENT_MAX_BODY || s.received > CLIENT_RECV_WINDOW / 2 {
 			oversized = true
 			s.reset = true
 		} else {
@@ -688,18 +722,10 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 		return sent && client_give_connection_credit(c, len(payload))
 	}
 
-	// Give the credit straight back; we buffer whole responses anyway.
-	if len(payload) > 0 {
-		out := make([dynamic]u8, 0, 26, context.temp_allocator)
-		write_frame_header(&out, 4, .Window_Update, 0, 0)
-		append_u32(&out, u32(len(payload)))
-		if found && h.flags & FLAG_END_STREAM == 0 {
-			write_frame_header(&out, 4, .Window_Update, 0, h.stream_id)
-			append_u32(&out, u32(len(payload)))
-		}
-		if !client_write_all(c, out[:]) {
-			return false
-		}
+	// Give the credit back; we buffer whole responses anyway. The stream's own
+	// window needs none: see CLIENT_RECV_WINDOW.
+	if !client_give_connection_credit(c, len(payload)) {
+		return false
 	}
 
 	if !found || h.flags & FLAG_END_STREAM == 0 {
@@ -726,17 +752,13 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 	return true
 }
 
-// Hand back connection-level receive window for bytes already read, whatever
-// became of the stream they belonged to.
+// Owe connection-level receive window for bytes already read, whatever became
+// of the stream they belonged to, and hand it back once CREDIT_BATCH has built
+// up.
 @(private)
 client_give_connection_credit :: proc(c: ^Client, n: int) -> bool {
-	if n <= 0 {
-		return true
-	}
-	out := make([dynamic]u8, 0, 13, context.temp_allocator)
-	write_frame_header(&out, 4, .Window_Update, 0, 0)
-	append_u32(&out, u32(n))
-	return client_write_all(c, out[:])
+	frame := owe_connection_credit(&c.credit_owed, n)
+	return frame == nil || client_write_all(c, frame)
 }
 
 @(private)
