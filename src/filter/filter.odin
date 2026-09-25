@@ -280,9 +280,9 @@ engine_stats :: proc(e: ^Engine) -> Stats {
 
 /*
 Lowercase and drop a trailing dot. A `rule` with whitespace or a slash in it is
-a mis-split line, not a domain, and is refused. A query name is not refused:
-a label may hold any byte, and presentation form leaves `/` unescaped, so
-`x/.ads.example.` is a real name under a blocked zone (#398).
+a mis-split line, not a domain, and is refused. A query name is not: it comes
+in presentation form, which escapes whitespace as `\DDD` but leaves `/` as it
+is, so `x/.ads.example.` is a real name under a blocked zone (#398).
 */
 @(private)
 normalise :: proc(name: string, buf: []u8, rule := true) -> (out: string, ok: bool) {

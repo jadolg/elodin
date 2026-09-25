@@ -52,7 +52,9 @@ test_a_query_with_a_slash_in_a_label_is_matched_against_the_lists :: proc(t: ^te
 		wire, _, err := dns.encode_message(dns.Message{id = 0x3980, question = questions}, context.temp_allocator)
 		testing.expect_value(t, err, dns.Encode_Error.None)
 		msg, derr := dns.decode_message(wire, context.temp_allocator)
-		testing.expect_value(t, derr, dns.Decode_Error.None)
+		if !testing.expect_value(t, derr, dns.Decode_Error.None) || !testing.expect_value(t, len(msg.question), 1) {
+			continue
+		}
 		// The premise: what the resolver matches is the name with its slash.
 		testing.expect_value(t, msg.question[0].name, name)
 		testing.expectf(t, filter.engine_match(engine, msg.question[0].name) == .Blocked, "%s was not blocked", name)
