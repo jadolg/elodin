@@ -251,10 +251,12 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 		line = line[2:]
 	}
 	/*
-	Most modifiers ($third-party, $important, ...) do not change which name is
-	matched and are dropped. The ones that narrow a rule to a query type or a
-	client, or make it something other than a block, would be widened by that,
-	so their rule is skipped; `$badfilter` cancels the rule it names.
+	`$important` and `$third-party` do not change which name is matched and are
+	dropped; `$badfilter` cancels the rule it names. Any other modifier narrows
+	the rule - to a query type, a client, a site it is loaded from - or makes it
+	something other than a block (`$elemhide`, `$removeparam`, `$csp`, ...), and
+	dropping it would widen the rule to every query, so the rule is skipped. That
+	is what AdGuard Home does with a modifier its DNS engine cannot honour.
 	*/
 	badfilter := false
 	if idx := strings.index_byte(line, '$'); idx >= 0 {
@@ -272,7 +274,8 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 			switch name {
 			case "badfilter":
 				badfilter = true
-			case "dnstype", "client", "ctag", "denyallow", "dnsrewrite":
+			case "important", "third-party", "":
+			case:
 				return 0
 			}
 		}

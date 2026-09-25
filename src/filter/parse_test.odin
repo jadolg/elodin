@@ -370,6 +370,16 @@ test_a_rule_narrowed_by_a_modifier_is_not_widened :: proc(t: ^testing.T) {
 		"||narrow.example^$denyallow=ok.narrow.example",
 		"||narrow.example^$dnsrewrite=10.0.0.1",
 		"@@||narrow.example^$client=10.0.0.1",
+		// Narrowed to requests made from one site, or to one request type.
+		"||narrow.example^$domain=news.example",
+		"||narrow.example^$script,third-party",
+		// Not blocks at all: a URL rewrite, a CSP header, a cosmetic exception.
+		"||narrow.example^$removeparam=utm_source",
+		"||narrow.example^$csp=script-src 'self'",
+		"@@||narrow.example^$elemhide",
+		"@@||narrow.example^$generichide",
+		// An unknown modifier is not known to leave the rule as wide as it looks.
+		"||narrow.example^$IMPORTANT",
 	}
 	for rule in narrowed {
 		testing.expectf(t, matches(rule, .Adblock, "narrow.example.") == .None, "%q matched", rule)

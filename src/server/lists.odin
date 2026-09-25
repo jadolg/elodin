@@ -30,6 +30,18 @@ build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool) -> (block, a
 	block = filter.set_make()
 	allow = filter.set_make()
 
+	for list in cfg.blocking.lists {
+		load_one_list(cfg, list, block, allow, allow_network, false)
+	}
+	for list in cfg.blocking.allow_lists {
+		load_one_list(cfg, list, block, allow, allow_network, true)
+	}
+
+	// A list's `$badfilter` takes back rules lists carry, not the operator's
+	// own: forget them before those are added. The operator's `$badfilter`
+	// still cancels what the lists added.
+	clear(&block.cancelled)
+	clear(&allow.cancelled)
 	for rule in cfg.blocking.rules {
 		filter.parse_rule(block, allow, rule)
 	}
@@ -40,13 +52,6 @@ build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool) -> (block, a
 			text = fmt.tprintf("@@%s", text)
 		}
 		filter.parse_rule(block, allow, text)
-	}
-
-	for list in cfg.blocking.lists {
-		load_one_list(cfg, list, block, allow, allow_network, false)
-	}
-	for list in cfg.blocking.allow_lists {
-		load_one_list(cfg, list, block, allow, allow_network, true)
 	}
 
 	logx.infof("filter: %d block rules, %d allow rules", block.count, allow.count)
