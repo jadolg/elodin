@@ -51,6 +51,23 @@ load_string :: proc(src: string, allocator := context.allocator) -> (cfg: Config
 	}
 	cfg = default_config()
 
+	check_keys(
+		&l,
+		root,
+		"",
+		"log",
+		"server",
+		"listeners",
+		"upstream",
+		"cache",
+		"blocking",
+		"dnssec",
+		"cookies",
+		"rebind",
+		"special_use",
+		"metrics",
+		"rewrites",
+	)
 	load_log(&l, &cfg)
 	load_server(&l, &cfg)
 	load_listeners(&l, &cfg)
@@ -70,6 +87,34 @@ load_string :: proc(src: string, allocator := context.allocator) -> (cfg: Config
 	}
 	delete(l.errors)
 	return cfg, nil
+}
+
+/*
+Refuse every key of `n` that the caller does not read.
+
+The loader asks for the keys it knows by name, so without this a misspelt one -
+`rebind.enable`, `responses_per_second` written singular - passes `--check`
+and leaves the default in force, which for a security setting is the opposite
+of what was written. dnsmasq, Unbound and BIND all refuse to start over one.
+
+`known` is the whole list the caller reads from this mapping, and has to stay
+that: a key read and not listed is refused, and a key listed and not read is
+accepted and ignored, which is the bug this exists to close.
+*/
+@(private)
+check_keys :: proc(l: ^Loader, n: ^yaml.Node, path: string, known: ..string) {
+	keys: for k in yaml.keys(n) {
+		for want in known {
+			if k == want {
+				continue keys
+			}
+		}
+		if path == "" {
+			errorf(l, "%s: unknown key", k)
+		} else {
+			errorf(l, "%s.%s: unknown key", path, k)
+		}
+	}
 }
 
 @(private)
@@ -168,6 +213,7 @@ load_log :: proc(l: ^Loader, cfg: ^Config) {
 	if n == nil {
 		return
 	}
+	check_keys(l, n, "log", "level", "queries", "file")
 	if s, ok := yaml.as_string(yaml.get(n, "level")); ok {
 		switch strings.to_lower(s, l.allocator) {
 		case "debug":
@@ -192,6 +238,22 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 	if n == nil {
 		return
 	}
+	check_keys(
+		l,
+		n,
+		"server",
+		"workers",
+		"upstream_workers",
+		"max_connections",
+		"max_connections_per_prefix",
+		"max_pending",
+		"max_udp_response",
+		"client_timeout",
+		"user",
+		"group",
+		"allow_from",
+		"rate_limit",
+	)
 	opt_int(l, n, "workers", &cfg.server.workers, "server")
 	opt_int(l, n, "upstream_workers", &cfg.server.upstream_workers, "server")
 	opt_int(l, n, "max_connections", &cfg.server.max_connections, "server")
@@ -206,6 +268,16 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 	load_allow_from(l, n, cfg)
 
 	if rl := yaml.get(n, "rate_limit"); rl != nil {
+		check_keys(
+			l,
+			rl,
+			"server.rate_limit",
+			"enabled",
+			"responses_per_second",
+			"response_size_estimate",
+			"slip",
+			"overrides",
+		)
 		opt_bool(l, rl, "enabled", &cfg.server.rate_limit.enabled, "server.rate_limit")
 		opt_int(l, rl, "responses_per_second", &cfg.server.rate_limit.responses_per_second, "server.rate_limit")
 		// A size, like `max_udp_response` it is denominated against, so "1232"
@@ -372,6 +444,7 @@ load_rate_limit_overrides :: proc(l: ^Loader, rl: ^yaml.Node, cfg: ^Config) {
 			)
 			continue
 		}
+		check_keys(l, e, path, "prefix", "responses_per_second", "slip")
 		text := ""
 		/*
 		`opt_string` has already said its piece when the key is there and is
@@ -550,6 +623,16 @@ load_listener :: proc(l: ^Loader, parent: ^yaml.Node, key: string, dst: ^Listene
 		return
 	}
 	path := fmt.tprintf("listeners.%s", key)
+	switch key {
+	case "udp":
+		check_keys(l, n, path, "enabled", "address", "port", "readers", "receive_buffer")
+	case "tcp":
+		check_keys(l, n, path, "enabled", "address", "port")
+	case "dot":
+		check_keys(l, n, path, "enabled", "address", "port", "cert_file", "key_file")
+	case "doh":
+		check_keys(l, n, path, "enabled", "address", "port", "cert_file", "key_file", "path", "mobileconfig_path")
+	}
 	opt_bool(l, n, "enabled", &dst.enabled, path)
 	opt_string(l, n, "address", &dst.address, path)
 	opt_int(l, n, "port", &dst.port, path)
@@ -575,6 +658,7 @@ load_listeners :: proc(l: ^Loader, cfg: ^Config) {
 	if n == nil {
 		return
 	}
+	check_keys(l, n, "listeners", "udp", "tcp", "dot", "doh")
 	load_listener(l, n, "udp", &cfg.listeners.udp, false)
 	load_listener(l, n, "tcp", &cfg.listeners.tcp, false)
 	load_listener(l, n, "dot", &cfg.listeners.dot, true)
@@ -608,6 +692,19 @@ load_upstream :: proc(l: ^Loader, cfg: ^Config) {
 	if n == nil {
 		return
 	}
+	check_keys(
+		l,
+		n,
+		"upstream",
+		"strategy",
+		"timeout",
+		"attempts",
+		"max_idle",
+		"idle_timeout",
+		"bootstrap",
+		"servers",
+		"zones",
+	)
 	load_strategy(l, n, &cfg.upstream.strategy, "upstream")
 	opt_duration(l, n, "timeout", &cfg.upstream.timeout, "upstream")
 	opt_int(l, n, "attempts", &cfg.upstream.attempts, "upstream")
@@ -693,6 +790,19 @@ load_upstream_zones :: proc(l: ^Loader, cfg: ^Config, n: ^yaml.Node) {
 			errorf(l, "%s.zones: routes do not nest; write another entry in upstream.zones instead", path)
 			continue
 		}
+		check_keys(
+			l,
+			entry,
+			path,
+			"strategy",
+			"timeout",
+			"attempts",
+			"max_idle",
+			"idle_timeout",
+			"bootstrap",
+			"domains",
+			"servers",
+		)
 
 		route: Zone_Route
 		route.upstream = cfg.upstream
@@ -1085,6 +1195,7 @@ load_upstream_spec :: proc(
 		}
 		return parse_upstream_shorthand(l, s, path, default_bootstrap)
 	}
+	check_keys(l, n, path, "name", "address", "hostname", "url", "port", "verify", "bootstrap", "type")
 
 	opt_string(l, n, "name", &spec.name, path)
 	opt_string(l, n, "address", &spec.address, path)
@@ -1288,6 +1399,19 @@ load_cache :: proc(l: ^Loader, cfg: ^Config) {
 	if n == nil {
 		return
 	}
+	check_keys(
+		l,
+		n,
+		"cache",
+		"enabled",
+		"max_entries",
+		"max_bytes",
+		"min_ttl",
+		"max_ttl",
+		"negative_ttl",
+		"serve_stale",
+		"stale_timeout",
+	)
 	opt_bool(l, n, "enabled", &cfg.cache.enabled, "cache")
 	opt_int(l, n, "max_entries", &cfg.cache.max_entries, "cache")
 	opt_bytes(l, n, "max_bytes", &cfg.cache.max_bytes, "cache")
@@ -1345,6 +1469,7 @@ load_block_lists :: proc(l: ^Loader, n: ^yaml.Node, path: string) -> []Block_Lis
 			continue
 		}
 		item_path := fmt.tprintf("%s[%d]", path, i)
+		check_keys(l, e, item_path, "name", "url", "file", "enabled", "format")
 		opt_string(l, e, "name", &bl.name, item_path)
 		opt_string(l, e, "url", &bl.url, item_path)
 		opt_string(l, e, "file", &bl.file, item_path)
@@ -1381,6 +1506,22 @@ load_blocking :: proc(l: ^Loader, cfg: ^Config) {
 	if n == nil {
 		return
 	}
+	check_keys(
+		l,
+		n,
+		"blocking",
+		"enabled",
+		"block_ttl",
+		"refresh",
+		"cache_dir",
+		"response",
+		"custom_ipv4",
+		"custom_ipv6",
+		"lists",
+		"allowlists",
+		"rules",
+		"allow",
+	)
 	opt_bool(l, n, "enabled", &cfg.blocking.enabled, "blocking")
 	opt_u32(l, n, "block_ttl", &cfg.blocking.block_ttl, "blocking")
 	opt_duration(l, n, "refresh", &cfg.blocking.refresh, "blocking")
@@ -1434,6 +1575,17 @@ load_dnssec :: proc(l: ^Loader, cfg: ^Config) {
 	if n == nil {
 		return
 	}
+	check_keys(
+		l,
+		n,
+		"dnssec",
+		"enabled",
+		"max_nsec3_iterations",
+		"max_chain_walks",
+		"max_connection_walks",
+		"max_cached_zones",
+		"trust_anchors",
+	)
 	opt_bool(l, n, "enabled", &cfg.dnssec.enabled, "dnssec")
 	opt_int(l, n, "max_nsec3_iterations", &cfg.dnssec.max_nsec3_iterations, "dnssec")
 	opt_int(l, n, "max_chain_walks", &cfg.dnssec.max_chain_walks, "dnssec")
@@ -1455,6 +1607,7 @@ load_cookies :: proc(l: ^Loader, cfg: ^Config) {
 	if n == nil {
 		return
 	}
+	check_keys(l, n, "cookies", "enabled", "require", "upstream", "secret")
 	opt_bool(l, n, "enabled", &cfg.cookies.enabled, "cookies")
 	opt_bool(l, n, "require", &cfg.cookies.require, "cookies")
 	opt_bool(l, n, "upstream", &cfg.cookies.upstream, "cookies")
@@ -1476,6 +1629,7 @@ load_rebind :: proc(l: ^Loader, cfg: ^Config) {
 	if n == nil {
 		return
 	}
+	check_keys(l, n, "rebind", "enabled", "allow_loopback", "allow_domains")
 	opt_bool(l, n, "enabled", &cfg.rebind.enabled, "rebind")
 	opt_bool(l, n, "allow_loopback", &cfg.rebind.allow_loopback, "rebind")
 
@@ -1516,6 +1670,7 @@ load_special_use :: proc(l: ^Loader, cfg: ^Config) {
 	if n == nil {
 		return
 	}
+	check_keys(l, n, "special_use", "enabled", "onion", "local", "test", "home_arpa")
 	opt_bool(l, n, "enabled", &cfg.special_use.enabled, "special_use")
 	opt_bool(l, n, "onion", &cfg.special_use.onion, "special_use")
 	opt_bool(l, n, "local", &cfg.special_use.local, "special_use")
@@ -1529,6 +1684,7 @@ load_metrics :: proc(l: ^Loader, cfg: ^Config) {
 	if n == nil {
 		return
 	}
+	check_keys(l, n, "metrics", "enabled", "address", "port", "path")
 	opt_bool(l, n, "enabled", &cfg.metrics.enabled, "metrics")
 	opt_string(l, n, "address", &cfg.metrics.address, "metrics")
 	opt_int(l, n, "port", &cfg.metrics.port, "metrics")
@@ -1549,6 +1705,7 @@ load_rewrites :: proc(l: ^Loader, cfg: ^Config) {
 			ttl = 300,
 			ptr = true,
 		}
+		check_keys(l, e, path, "domain", "ttl", "ptr", "answer", "answers")
 		domain := ""
 		opt_string(l, e, "domain", &domain, path)
 		if domain == "" {
