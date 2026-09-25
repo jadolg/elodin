@@ -248,7 +248,7 @@ Pi-hole and AdGuard treat their allowlists.
 */
 engine_match :: proc(e: ^Engine, name: string) -> Decision {
 	buf: [MAX_NORMALISED]u8
-	key, ok := normalise(name, buf[:])
+	key, ok := normalise(name, buf[:], rule = false)
 	if !ok {
 		return .None
 	}
@@ -278,9 +278,14 @@ engine_stats :: proc(e: ^Engine) -> Stats {
 	}
 }
 
-// Lowercase, drop a trailing dot, and reject anything that cannot be a domain.
+/*
+Lowercase and drop a trailing dot. A `rule` with whitespace or a slash in it is
+a mis-split line, not a domain, and is refused. A query name is not: it comes
+in presentation form, which escapes whitespace as `\DDD` but leaves `/` as it
+is, so `x/.ads.example.` is a real name under a blocked zone (#398).
+*/
 @(private)
-normalise :: proc(name: string, buf: []u8) -> (out: string, ok: bool) {
+normalise :: proc(name: string, buf: []u8, rule := true) -> (out: string, ok: bool) {
 	s := name
 	if len(s) > 0 && s[len(s) - 1] == '.' {
 		s = s[:len(s) - 1]
@@ -293,7 +298,7 @@ normalise :: proc(name: string, buf: []u8) -> (out: string, ok: bool) {
 		if c >= 'A' && c <= 'Z' {
 			c += 32
 		}
-		if c == ' ' || c == '\t' || c == '/' {
+		if rule && (c == ' ' || c == '\t' || c == '/') {
 			return "", false
 		}
 		buf[i] = c
