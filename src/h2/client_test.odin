@@ -2003,6 +2003,21 @@ test_client_request_sends_content_length :: proc(t: ^testing.T) {
 }
 
 /*
+A stream this end opened as `id`, with its body and window as client_request
+would leave them.
+*/
+@(private = "file")
+open_test_stream :: proc(c: ^Client, id: u32, allocator: mem.Allocator) -> ^Client_Stream {
+	s := new(Client_Stream, allocator)
+	s.id = id
+	s.send_window = c.peer_initial_window
+	s.body = make([dynamic]u8, 0, 8, allocator)
+	c.streams[id] = s
+	c.next_stream_id = id + 2
+	return s
+}
+
+/*
 The client side of #308: each PING and non-ACK SETTINGS from an upstream draws
 a frame back, so one that sends nothing else keeps a pooled connection's
 reader echoing for as long as it likes. Past the per-second budget the
@@ -2098,12 +2113,7 @@ test_client_tiny_data_frames_are_not_reflected :: proc(t: ^testing.T) {
 		frames = make([dynamic]Frame_Header, 0, 8, allocator),
 	}
 	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
-	s := new(Client_Stream, allocator)
-	s.id = 1
-	s.send_window = c.peer_initial_window
-	s.body = make([dynamic]u8, 0, 8, allocator)
-	c.streams[1] = s
-	c.next_stream_id = 3
+	open_test_stream(c, 1, allocator)
 
 	clear(&log.frames)
 	// The preface's own window grant is not this test's credit.
@@ -2148,27 +2158,22 @@ test_client_padding_cannot_stall_a_stream :: proc(t: ^testing.T) {
 	allocator := mem.tracking_allocator(&track)
 
 	c := client_make(IO{read = hook_read_nothing, write = client_log_write}, allocator)
-	s := new(Client_Stream, allocator)
-	s.id = 1
-	s.send_window = c.peer_initial_window
-	s.body = make([dynamic]u8, 0, 8, allocator)
-	c.streams[1] = s
-	c.next_stream_id = 3
+	s := open_test_stream(c, 1, allocator)
 
 	// One byte of body in 257 bytes of window, each.
 	frame := make([]u8, 257, context.temp_allocator)
 	frame[0] = 255
 	spent := 0
-	send :: proc(c: ^Client, frame: []u8, spent: ^int) {
-		client_handle_data(c, Frame_Header{length = len(frame), type = .Data, flags = FLAG_PADDED, stream_id = 1}, frame)
+	send :: proc(c: ^Client, frame: []u8, spent: ^int) -> bool {
 		spent^ += len(frame)
+		return client_handle_data(c, Frame_Header{length = len(frame), type = .Data, flags = FLAG_PADDED, stream_id = 1}, frame)
 	}
 	for spent <= CLIENT_MAX_BODY {
-		send(c, frame, &spent)
+		testing.expect(t, send(c, frame, &spent), "a padded DATA frame was a connection error")
 	}
 	testing.expectf(t, !s.reset, "a %d-byte response padded past CLIENT_MAX_BODY was refused", len(s.body))
 	for spent <= CLIENT_RECV_WINDOW / 2 {
-		send(c, frame, &spent)
+		testing.expect(t, send(c, frame, &spent), "a padded DATA frame was a connection error")
 	}
 	testing.expectf(t, s.reset, "a stream that spent %d bytes of its window was left open", spent)
 
@@ -2201,12 +2206,7 @@ test_client_answers_earn_back_the_control_budget :: proc(t: ^testing.T) {
 
 	answered := 0
 	for id := u32(1); answered < 4 * MAX_CONTROL_FRAMES_PER_SECOND; id += 2 {
-		s := new(Client_Stream, allocator)
-		s.id = id
-		s.send_window = c.peer_initial_window
-		s.body = make([dynamic]u8, 0, 8, allocator)
-		c.streams[id] = s
-		c.next_stream_id = id + 2
+		s := open_test_stream(c, id, allocator)
 
 		h := Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = id}
 		ok := client_handle_frame(c, h, block[:])
@@ -2227,12 +2227,7 @@ test_client_answers_earn_back_the_control_budget :: proc(t: ^testing.T) {
 	id := u32(2 * answered + 1)
 	doubled := 0
 	for doubled < 4 * MAX_CONTROL_FRAMES_PER_SECOND {
-		s := new(Client_Stream, allocator)
-		s.id = id
-		s.send_window = c.peer_initial_window
-		s.body = make([dynamic]u8, 0, 8, allocator)
-		c.streams[id] = s
-		c.next_stream_id = id + 2
+		s := open_test_stream(c, id, allocator)
 		ok := client_handle_frame(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block[:])
 		ok = ok && client_handle_frame(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = id}, block[:])
 		ok = ok && client_handle_frame(c, Frame_Header{length = 8, type = .Ping}, ping)
@@ -2268,12 +2263,7 @@ test_client_one_stream_earns_one_frame :: proc(t: ^testing.T) {
 	c := client_make(IO{read = hook_read_nothing, write = client_log_write}, allocator)
 	c.control.window = time.tick_add(time.tick_now(), time.Hour)
 	c.control.frames = MAX_CONTROL_FRAMES_PER_SECOND
-	s := new(Client_Stream, allocator)
-	s.id = 1
-	s.send_window = c.peer_initial_window
-	s.body = make([dynamic]u8, 0, 8, allocator)
-	c.streams[1] = s
-	c.next_stream_id = 3
+	s := open_test_stream(c, 1, allocator)
 
 	good := make([dynamic]u8, 0, 16, context.temp_allocator)
 	encode_header(&good, ":status", "200")
@@ -2319,16 +2309,15 @@ test_client_answers_before_pings_still_earn :: proc(t: ^testing.T) {
 
 	ANSWERS :: 2 * MAX_CONTROL_FRAMES_PER_SECOND
 	for id := u32(1); id < 2 * ANSWERS; id += 2 {
-		s := new(Client_Stream, allocator)
-		s.id = id
-		s.body = make([dynamic]u8, 0, 8, allocator)
-		c.streams[id] = s
-		c.next_stream_id = id + 2
+		s := open_test_stream(c, id, allocator)
 		h := Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = id}
 		testing.expect(t, client_handle_frame(c, h, block[:]), "an answer was refused")
 		client_stream_destroy(c, s)
 		delete_key(&c.streams, id)
 	}
+	// The PINGs trail their answers into the next second: what was earned must
+	// not expire with the window it was earned in.
+	c.control.window = time.tick_add(time.tick_now(), -2 * time.Second)
 	pinged := 0
 	for pinged < 1000 && client_handle_frame(c, Frame_Header{length = 8, type = .Ping}, ping) {
 		pinged += 1

@@ -485,40 +485,46 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	return true
 }
 
-// Frames a peer drew out of this end in the second starting at `window`, held to
-// MAX_CONTROL_FRAMES_PER_SECOND. One per connection, server and client alike;
-// touched by the reader thread only.
+/*
+Frames a peer drew out of this end, held to MAX_CONTROL_FRAMES_PER_SECOND plus
+whatever it has earned: `frames` counts the second starting at `window`, and
+`earned` is frames paid for by work this end asked for (the client's answers;
+the server earns nothing). One per connection; reader thread only.
+
+`earned` is not reset with the window. A PING may trail the answer that paid
+for it by any lag, across a second boundary, and a busy pooled connection
+answers far more than the budget a second, so credit that expired with the
+window would drop exactly that connection. It is not capped either: it only
+grows by answering this end's own requests, one frame each, so what a peer can
+bank is a 1:1 echo of queries already sent, never a rate it raises itself.
+*/
 Control_Budget :: struct {
 	frames: int,
 	window: time.Tick,
+	earned: int,
 }
 
-// Opens a fresh second once the current one is over.
+// Charges one frame; false once this second's budget is spent.
 @(private)
-control_budget_roll :: proc(b: ^Control_Budget) {
+control_budget_spend :: proc(b: ^Control_Budget) -> bool {
+	if b.earned > 0 {
+		b.earned -= 1
+		return true
+	}
 	now := time.tick_now()
 	// A zero window is long past, so the first frame opens one.
 	if time.tick_diff(b.window, now) >= time.Second {
 		b.window = now
 		b.frames = 0
 	}
-}
-
-// Charges one frame; false once this second's budget is spent.
-@(private)
-control_budget_spend :: proc(b: ^Control_Budget) -> bool {
-	control_budget_roll(b)
 	b.frames += 1
 	return b.frames <= MAX_CONTROL_FRAMES_PER_SECOND
 }
 
-// Gives one frame of this second's budget back, for work the peer did that this
-// end asked for. Banked below zero if nothing is spent yet, so the order the
-// work and the frames arrive in within a second does not matter.
+// Credits one frame, for work the peer did that this end asked for.
 @(private)
 control_budget_refund :: proc(b: ^Control_Budget) {
-	control_budget_roll(b)
-	b.frames -= 1
+	b.earned += 1
 }
 
 // Charges one frame against MAX_CONTROL_FRAMES_PER_SECOND. Past it, the peer is
