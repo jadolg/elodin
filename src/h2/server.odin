@@ -78,8 +78,9 @@ PINGs and non-ACK SETTINGS a peer may send per second, each of which draws a
 frame back. Writes here are synchronous, so there is no outbound queue for a
 flood to grow (the actual CVE-2019-9512 / 9515); this only stops a peer
 turning a connection slot into a 1:1 echo for as long as it keeps sending.
-Go's net/http2 tolerates about as many outstanding. A real client sends a
-handful per connection.
+(Go's net/http2 bounds the queue instead, at 10000 unwritten control frames,
+which a peer that reads its replies never reaches.) A real client sends a
+handful per connection, so 100 a second leaves ample room.
 */
 MAX_CONTROL_FRAMES_PER_SECOND :: 100
 /*
@@ -452,7 +453,8 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 @(private)
 control_frame_allowed :: proc(c: ^Conn) -> bool {
 	now := time.tick_now()
-	if c.control_frames == 0 || time.tick_diff(c.control_window, now) >= time.Second {
+	// A zero control_window is long past, so the first frame opens a window.
+	if time.tick_diff(c.control_window, now) >= time.Second {
 		c.control_window = now
 		c.control_frames = 0
 	}

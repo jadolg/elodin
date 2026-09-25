@@ -2410,6 +2410,9 @@ expect_control_flood_refused :: proc(t: ^testing.T, h: Frame_Header, payload: []
 		frames = make([dynamic]Frame_Header, 0, 8, allocator),
 	}
 	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+	// A window that opens in the future cannot roll over mid-burst, so a slow
+	// box cannot hand the flood a fresh budget and move the refusal.
+	c.control_window = time.tick_add(time.tick_now(), time.Hour)
 
 	sent := 0
 	refused := false
