@@ -74,6 +74,16 @@ MAX_CONCURRENT :: 128
 // See Conn.closed_stream_rst_budget.
 MAX_CLOSED_STREAM_RST :: 16
 /*
+PINGs and non-ACK SETTINGS a peer may send per second, each of which draws a
+frame back. Writes here are synchronous, so there is no outbound queue for a
+flood to grow (the actual CVE-2019-9512 / 9515); this only stops a peer
+turning a connection slot into a 1:1 echo for as long as it keeps sending.
+(Go's net/http2 bounds the queue instead, at 10000 unwritten control frames,
+which a peer that reads its replies never reaches.) A real client sends a
+handful per connection, so 100 a second leaves ample room.
+*/
+MAX_CONTROL_FRAMES_PER_SECOND :: 100
+/*
 How long a response may wait for the peer to open its flow-control window.
 
 A client that advertises a zero window and then goes quiet is otherwise
@@ -159,6 +169,10 @@ Conn :: struct {
 	// How long a response may wait for the peer to grant flow-control credit
 	// before the stream is given up on.
 	write_timeout:       time.Duration,
+	// Answered control frames in the second starting at control_window; see
+	// MAX_CONTROL_FRAMES_PER_SECOND. Reader thread only.
+	control_frames:      int,
+	control_window:      time.Tick,
 }
 
 make_conn :: proc(io: IO, handler: Handler, user: rawptr, allocator := context.allocator) -> ^Conn {
@@ -360,6 +374,10 @@ send_initial_settings :: proc(c: ^Conn) -> bool {
 
 @(private)
 handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
+	if (h.type == .Ping || h.type == .Settings) && h.flags & FLAG_ACK == 0 && !control_frame_allowed(c) {
+		goaway(c, .Enhance_Your_Calm)
+		return false
+	}
 	#partial switch h.type {
 	case .Settings:
 		return handle_settings(c, h, payload)
@@ -430,6 +448,18 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	}
 	// Unknown frame types must be ignored (RFC 9113 section 4.1).
 	return true
+}
+
+@(private)
+control_frame_allowed :: proc(c: ^Conn) -> bool {
+	now := time.tick_now()
+	// A zero control_window is long past, so the first frame opens a window.
+	if time.tick_diff(c.control_window, now) >= time.Second {
+		c.control_window = now
+		c.control_frames = 0
+	}
+	c.control_frames += 1
+	return c.control_frames <= MAX_CONTROL_FRAMES_PER_SECOND
 }
 
 @(private)
