@@ -769,15 +769,18 @@ leaves a setting the operator can see in the file doing nothing.
 */
 @(test)
 test_duplicate_keys_are_refused :: proc(t: ^testing.T) {
-	for src in ([]string {
-			"rebind:\n  enabled: true\nrebind:\n  allow_loopback: true\n",
-			"rebind:\n  enabled: true\n  enabled: false\n",
-			"- name: a\n  name: b\n",
-			"x: {a: 1, a: 2}\n",
+	for c in ([][2]string {
+			{"rebind:\n  enabled: true\nrebind:\n  allow_loopback: true\n", "duplicate key \"rebind\""},
+			{"rebind:\n  enabled: true\n  enabled: false\n", "duplicate key \"enabled\""},
+			{"- name: a\n  name: b\n", "duplicate key \"name\""},
+			{"x: {a: 1, a: 2}\n", "duplicate key \"a\""},
+			// Document markers are skipped, so a second document repeating a
+			// section is the same mapping naming it twice.
+			{"rebind:\n  enabled: true\n---\nrebind:\n  enabled: false\n", "duplicate key \"rebind\""},
 		}) {
-		_, err := parse(src, context.temp_allocator)
+		_, err := parse(c[0], context.temp_allocator)
 		e, has := err.?
-		testing.expectf(t, has && strings.contains(e.msg, "duplicate key"), "%q: %v", src, err)
+		testing.expectf(t, has && strings.contains(e.msg, c[1]), "%q: %v", c[0], err)
 	}
 	free_all(context.temp_allocator)
 }

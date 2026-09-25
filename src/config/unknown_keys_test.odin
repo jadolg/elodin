@@ -86,9 +86,20 @@ test_misshapen_sections_are_refused :: proc(t: ^testing.T) {
 		{"cookies: [require]\n", "cookies: expected"},
 		{"rewrites:\n  domain: nas.home\n  answer: 192.168.1.50\n", "rewrites: expected"},
 		{"blocking:\n  lists: https://example.com/hosts\n", "blocking.lists: expected"},
+		{"blocking:\n  lists:\n    -\n", "blocking.lists[0]: needs either a url or a file"},
+		{"upstream:\n  servers:\n    address: 10.0.0.1\n", "upstream.servers: expected"},
+		{
+			"upstream:\n  servers: [1.1.1.1]\n  zones:\n    - domains: [corp.example]\n      servers:\n        address: 10.0.0.1\n",
+			"upstream.zones[0].servers: expected",
+		},
 	}
 	for c in cases {
-		src := strings.concatenate({"upstream:\n  servers: [1.1.1.1]\n", c[0]}, context.temp_allocator)
+		// A case about `upstream` writes the section itself: a second one would
+		// be refused as a duplicate key before the loader saw either.
+		src := c[0]
+		if !strings.has_prefix(src, "upstream:") {
+			src = strings.concatenate({"upstream:\n  servers: [1.1.1.1]\n", c[0]}, context.temp_allocator)
+		}
 		_, err := load_string(src, context.temp_allocator)
 		e, has := err.?
 		found := false

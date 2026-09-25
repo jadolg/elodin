@@ -728,6 +728,11 @@ load_upstream :: proc(l: ^Loader, cfg: ^Config) {
 		}
 	}
 
+	// As in `load_block_lists`: `items` answers nil for one server written
+	// without its "-", which would be reported as no server at all.
+	if s := yaml.get(n, "servers"); !yaml.is_null(s) && s.kind != .Sequence {
+		errorf(l, "upstream.servers: expected a list of servers, with a \"-\" in front of each one")
+	}
 	if servers := yaml.items(yaml.get(n, "servers")); len(servers) > 0 {
 		out := make([dynamic]Upstream_Spec, 0, len(servers), l.allocator)
 		for sn, i in servers {
@@ -837,6 +842,12 @@ load_upstream_zones :: proc(l: ^Loader, cfg: ^Config, n: ^yaml.Node) {
 
 		route.domains = load_route_domains(l, entry, path, i, &claimed)
 
+		// Refused outright, as above, rather than appended to be reported by
+		// `validate` as a route with no servers.
+		if s := yaml.get(entry, "servers"); !yaml.is_null(s) && s.kind != .Sequence {
+			errorf(l, "%s.servers: expected a list of servers, with a \"-\" in front of each one", path)
+			continue
+		}
 		if servers := yaml.items(yaml.get(entry, "servers")); len(servers) > 0 {
 			out := make([dynamic]Upstream_Spec, 0, len(servers), l.allocator)
 			for sn, j in servers {
@@ -1476,8 +1487,14 @@ load_block_lists :: proc(l: ^Loader, n: ^yaml.Node, path: string) -> []Block_Lis
 		bl := Block_List {
 			enabled = true,
 		}
-		if e != nil && e.kind == .Scalar {
+		if e == nil || e.kind == .Scalar {
 			s, _ := yaml.as_string(e)
+			// A bare `-` or `- ""` names nothing to read, and would otherwise be
+			// counted as a list by `--check` and load no rules at startup.
+			if s == "" {
+				errorf(l, "%s[%d]: needs either a url or a file", path, i)
+				continue
+			}
 			if strings.has_prefix(s, "http://") || strings.has_prefix(s, "https://") {
 				bl.url = s
 			} else {
