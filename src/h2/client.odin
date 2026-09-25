@@ -612,7 +612,7 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 		the budget, never to a rate it can raise by itself. Once per stream,
 		and a stream id is only ever ours to open.
 		*/
-		if !s.refunded && s.status != 0 {
+		if !s.refunded {
 			s.refunded = true
 			control_budget_refund(&c.control)
 		}

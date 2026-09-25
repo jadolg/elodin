@@ -936,7 +936,7 @@ test_data_frame_cannot_touch_an_abandoned_stream :: proc(t: ^testing.T) {
 
 @(private = "file")
 Client_Frame_Log :: struct {
-	frames: [dynamic]Frame_Header,
+	frames:      [dynamic]Frame_Header,
 	// Sum of the connection WINDOW_UPDATE increments written.
 	credit:      int,
 	// Error code of the last GOAWAY written.
