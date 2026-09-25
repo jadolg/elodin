@@ -912,6 +912,9 @@ test_data_frame_cannot_touch_an_abandoned_stream :: proc(t: ^testing.T) {
 	s.body = make([dynamic]u8, 0, 8, allocator)
 	c.streams[1] = s
 
+	// One byte short of a batch, so this DATA's credit is written: the write
+	// the hook rides in on.
+	c.credit_owed = CREDIT_BATCH - 1
 	hook.armed = true
 	payload := []u8{'o', 'k'}
 	client_handle_data(c, Frame_Header{length = len(payload), type = .Data, flags = FLAG_END_STREAM, stream_id = 1}, payload)
@@ -934,6 +937,8 @@ test_data_frame_cannot_touch_an_abandoned_stream :: proc(t: ^testing.T) {
 @(private = "file")
 Client_Frame_Log :: struct {
 	frames: [dynamic]Frame_Header,
+	// Sum of the connection WINDOW_UPDATE increments written.
+	credit: int,
 }
 
 @(private = "file")
@@ -953,6 +958,9 @@ client_log_write :: proc(user: rawptr, buf: []u8) -> bool {
 			break
 		}
 		append(&log.frames, h)
+		if h.type == .Window_Update && h.stream_id == 0 && pos + FRAME_HEADER_SIZE + 4 <= len(buf) {
+			log.credit += int(read_u32(buf[pos + FRAME_HEADER_SIZE:]))
+		}
 		pos += FRAME_HEADER_SIZE + h.length
 	}
 	return true
@@ -1212,6 +1220,8 @@ test_client_data_after_end_stream_is_refused :: proc(t: ^testing.T) {
 	c.streams[1] = s
 
 	clear(&log.frames)
+	// One byte short of a batch, so the refused frame's credit is due on the wire.
+	c.credit_owed = CREDIT_BATCH - 1
 	body := []u8{'x'}
 	ok := client_handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
 	testing.expect(t, ok, "DATA after END_STREAM should be a stream error, not a connection error")
@@ -1278,6 +1288,8 @@ test_client_data_on_a_peer_reset_stream_is_refused :: proc(t: ^testing.T) {
 	c.streams[1] = s
 
 	clear(&log.frames)
+	// One byte short of a batch, so the refused frame's credit is due on the wire.
+	c.credit_owed = CREDIT_BATCH - 1
 	body := []u8{'x'}
 	ok := client_handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
 	testing.expect(t, ok, "DATA on a peer-reset stream should be a stream error, not a connection error")
@@ -1983,4 +1995,159 @@ test_client_request_sends_content_length :: proc(t: ^testing.T) {
 	}
 	testing.expectf(t, length == "5", "content-length is %q, not the body's 5 bytes", length)
 	free_all(context.temp_allocator)
+}
+
+/*
+The client side of #308: each PING and non-ACK SETTINGS from an upstream draws
+a frame back, so one that sends nothing else keeps a pooled connection's
+reader echoing for as long as it likes. Past the per-second budget the
+connection is told ENHANCE_YOUR_CALM and dropped.
+*/
+@(private = "file")
+expect_client_control_flood_refused :: proc(t: ^testing.T, h: Frame_Header, payload: []u8, what: string) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Client_Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+	// A window that opens in the future cannot roll over mid-burst.
+	c.control.window = time.tick_add(time.tick_now(), time.Hour)
+
+	sent := 0
+	refused := false
+	for sent < 1000 {
+		sent += 1
+		if !client_handle_frame(c, h, payload) {
+			refused = true
+			break
+		}
+	}
+	testing.expectf(t, refused, "%s: %d frames in a burst were all answered", what, sent)
+	testing.expectf(t, sent == MAX_CONTROL_FRAMES_PER_SECOND + 1, "%s: refused at frame %d, not the first one over the budget", what, sent)
+	saw_goaway := false
+	for f in log.frames {
+		saw_goaway ||= f.type == .Goaway
+	}
+	testing.expectf(t, saw_goaway, "%s: the flood was dropped without a GOAWAY", what)
+
+	delete(log.frames)
+	client_unref(c)
+	free_all(context.temp_allocator)
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%s: %d bytes leaked at %v", what, entry.size, entry.location)
+	}
+}
+
+@(test)
+test_client_ping_flood_is_refused :: proc(t: ^testing.T) {
+	expect_client_control_flood_refused(t, Frame_Header{length = 8, type = .Ping}, make([]u8, 8, context.temp_allocator), "client ping flood")
+}
+
+@(test)
+test_client_settings_flood_is_refused :: proc(t: ^testing.T) {
+	expect_client_control_flood_refused(t, Frame_Header{type = .Settings}, nil, "client settings flood")
+}
+
+/*
+The client side of #393: each 1-byte DATA frame on an open stream drew a
+connection and a stream WINDOW_UPDATE back, 26 bytes out for 10 in. Credit is
+now owed until a batch of it is due, and every byte of it is still returned or
+owed.
+*/
+@(test)
+test_client_tiny_data_frames_are_not_reflected :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Client_Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+	s := new(Client_Stream, allocator)
+	s.id = 1
+	s.send_window = c.peer_initial_window
+	s.body = make([dynamic]u8, 0, 8, allocator)
+	c.streams[1] = s
+	c.next_stream_id = 3
+
+	clear(&log.frames)
+	// The preface's own window grant is not this test's credit.
+	log.credit = 0
+	body := []u8{'x'}
+	sent := 0
+	frames := 0
+	for frames < CREDIT_BATCH + 1000 {
+		if !client_handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body) {
+			break
+		}
+		frames += 1
+		sent += FRAME_HEADER_SIZE + len(body)
+	}
+	written := 0
+	for f in log.frames {
+		written += FRAME_HEADER_SIZE + f.length
+	}
+	testing.expectf(t, written * 10 < sent, "%d bytes of 1-byte DATA frames drew %d bytes back", sent, written)
+	testing.expectf(t, log.credit >= CREDIT_BATCH, "%d bytes read, only %d of credit returned", frames, log.credit)
+	testing.expectf(t, log.credit + c.credit_owed == frames, "%d bytes read, %d returned and %d owed", frames, log.credit, c.credit_owed)
+
+	delete(log.frames)
+	client_unref(c)
+	free_all(context.temp_allocator)
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "client tiny data frames: %d bytes leaked at %v", entry.size, entry.location)
+	}
+}
+
+/*
+With no stream-level WINDOW_UPDATE, a stream's window is only ever spent, and
+padding spends it without growing the body. A padded response under
+CLIENT_MAX_BODY is kept; a stream that has spent half its window is reset
+rather than left to run it dry and stall its caller until the timeout.
+*/
+@(test)
+test_client_padding_cannot_stall_a_stream :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	c := client_make(IO{read = hook_read_nothing, write = client_log_write}, allocator)
+	s := new(Client_Stream, allocator)
+	s.id = 1
+	s.send_window = c.peer_initial_window
+	s.body = make([dynamic]u8, 0, 8, allocator)
+	c.streams[1] = s
+	c.next_stream_id = 3
+
+	// One byte of body in 257 bytes of window, each.
+	frame := make([]u8, 257, context.temp_allocator)
+	frame[0] = 255
+	spent := 0
+	send :: proc(c: ^Client, frame: []u8, spent: ^int) {
+		client_handle_data(c, Frame_Header{length = len(frame), type = .Data, flags = FLAG_PADDED, stream_id = 1}, frame)
+		spent^ += len(frame)
+	}
+	for spent <= CLIENT_MAX_BODY {
+		send(c, frame, &spent)
+	}
+	testing.expectf(t, !s.reset, "a %d-byte response padded past CLIENT_MAX_BODY was refused", len(s.body))
+	for spent <= CLIENT_RECV_WINDOW / 2 {
+		send(c, frame, &spent)
+	}
+	testing.expectf(t, s.reset, "a stream that spent %d bytes of its window was left open", spent)
+
+	client_stream_destroy(c, s)
+	delete_key(&c.streams, u32(1))
+	client_unref(c)
+	free_all(context.temp_allocator)
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "client padded stream: %d bytes leaked at %v", entry.size, entry.location)
+	}
 }

@@ -202,10 +202,8 @@ Conn :: struct {
 	// How long a response may wait for the peer to grant flow-control credit
 	// before the stream is given up on.
 	write_timeout:       time.Duration,
-	// Answered control frames and stream errors in the second starting at
-	// control_window; see MAX_CONTROL_FRAMES_PER_SECOND. Reader thread only.
-	control_frames:      int,
-	control_window:      time.Tick,
+	// Answered control frames and stream errors; see Control_Budget.
+	control:             Control_Budget,
 	// Connection credit not yet returned; see CREDIT_BATCH. Reader thread only.
 	credit_owed:         int,
 	// Streams in `streams` marked Closed, which the peer no longer counts; see
@@ -487,18 +485,32 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	return true
 }
 
+// Frames a peer drew out of this end in the second starting at `window`, held to
+// MAX_CONTROL_FRAMES_PER_SECOND. One per connection, server and client alike;
+// touched by the reader thread only.
+Control_Budget :: struct {
+	frames: int,
+	window: time.Tick,
+}
+
+// Charges one frame; false once this second's budget is spent.
+@(private)
+control_budget_spend :: proc(b: ^Control_Budget) -> bool {
+	now := time.tick_now()
+	// A zero window is long past, so the first frame opens one.
+	if time.tick_diff(b.window, now) >= time.Second {
+		b.window = now
+		b.frames = 0
+	}
+	b.frames += 1
+	return b.frames <= MAX_CONTROL_FRAMES_PER_SECOND
+}
+
 // Charges one frame against MAX_CONTROL_FRAMES_PER_SECOND. Past it, the peer is
 // sent GOAWAY(ENHANCE_YOUR_CALM) and false says to drop the connection.
 @(private)
 spend_control_budget :: proc(c: ^Conn) -> bool {
-	now := time.tick_now()
-	// A zero control_window is long past, so the first frame opens a window.
-	if time.tick_diff(c.control_window, now) >= time.Second {
-		c.control_window = now
-		c.control_frames = 0
-	}
-	c.control_frames += 1
-	if c.control_frames > MAX_CONTROL_FRAMES_PER_SECOND {
+	if !control_budget_spend(&c.control) {
 		goaway(c, .Enhance_Your_Calm)
 		return false
 	}
