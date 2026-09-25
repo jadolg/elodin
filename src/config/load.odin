@@ -100,9 +100,18 @@ of what was written. dnsmasq, Unbound and BIND all refuse to start over one.
 `known` is the whole list the caller reads from this mapping, and has to stay
 that: a key read and not listed is refused, and a key listed and not read is
 accepted and ignored, which is the bug this exists to close.
+
+A value or a list where the mapping belongs is refused as well: it has no keys
+to check, and every `opt_*` reads nothing from it, so `rebind: true` would
+otherwise leave rebind protection off without a word. Empty (`rebind:`) is
+still the section left at its defaults.
 */
 @(private)
 check_keys :: proc(l: ^Loader, n: ^yaml.Node, path: string, known: ..string) {
+	if !yaml.is_null(n) && n.kind != .Mapping {
+		errorf(l, "%s: expected a mapping of settings, not a single value or a list", "the file" if path == "" else path)
+		return
+	}
 	keys: for k in yaml.keys(n) {
 		for want in known {
 			if k == want {
@@ -786,14 +795,14 @@ load_upstream_zones :: proc(l: ^Loader, cfg: ^Config, n: ^yaml.Node) {
 			errorf(l, "%s: expected a mapping with domains and servers", path)
 			continue
 		}
-		if !yaml.is_null(yaml.get(entry, "zones")) {
-			errorf(l, "%s.zones: routes do not nest; write another entry in upstream.zones instead", path)
-			continue
-		}
+		// `zones` is listed so that it gets its own refusal below rather than
+		// "unknown key", and checked first so the rest of the entry's typos are
+		// reported in the same run.
 		check_keys(
 			l,
 			entry,
 			path,
+			"zones",
 			"strategy",
 			"timeout",
 			"attempts",
@@ -803,6 +812,10 @@ load_upstream_zones :: proc(l: ^Loader, cfg: ^Config, n: ^yaml.Node) {
 			"domains",
 			"servers",
 		)
+		if !yaml.is_null(yaml.get(entry, "zones")) {
+			errorf(l, "%s.zones: routes do not nest; write another entry in upstream.zones instead", path)
+			continue
+		}
 
 		route: Zone_Route
 		route.upstream = cfg.upstream
@@ -1448,6 +1461,12 @@ parse_v6 :: proc(l: ^Loader, s: string, path: string, dst: ^[16]u8) {
 
 @(private)
 load_block_lists :: proc(l: ^Loader, n: ^yaml.Node, path: string) -> []Block_List {
+	// `items` answers nil for a single value or a mapping, which would read
+	// `lists: https://...` as no lists at all.
+	if !yaml.is_null(n) && n.kind != .Sequence {
+		errorf(l, "%s: expected a list, with a \"-\" in front of each entry", path)
+		return nil
+	}
 	entries := yaml.items(n)
 	if len(entries) == 0 {
 		return nil
@@ -1693,7 +1712,14 @@ load_metrics :: proc(l: ^Loader, cfg: ^Config) {
 
 @(private)
 load_rewrites :: proc(l: ^Loader, cfg: ^Config) {
-	entries := yaml.items(yaml.get(l.root, "rewrites"))
+	rn := yaml.get(l.root, "rewrites")
+	// As in `load_block_lists`: one rule written without its "-" is a mapping,
+	// and `items` would read it as no rules at all.
+	if !yaml.is_null(rn) && rn.kind != .Sequence {
+		errorf(l, "rewrites: expected a list of rules, with a \"-\" in front of each one")
+		return
+	}
+	entries := yaml.items(rn)
 	if len(entries) == 0 {
 		return
 	}

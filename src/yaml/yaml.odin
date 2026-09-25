@@ -381,6 +381,11 @@ parse_mapping :: proc(p: ^Parser, indent: int) -> ^Node {
 		if kerr {
 			return fail(p, line.num, "malformed key")
 		}
+		// Refused rather than last-one-wins, which would drop the first in
+		// silence: a setting the operator can see in the file doing nothing.
+		if key in node.fields {
+			return fail(p, line.num, "duplicate key: a mapping names each key once")
+		}
 		rest := strings.trim_space(line.text[colon + 1:])
 		p.pos += 1
 
@@ -388,9 +393,7 @@ parse_mapping :: proc(p: ^Parser, indent: int) -> ^Node {
 		if _, has := p.err.?; has {
 			return node
 		}
-		if key not_in node.fields {
-			append(&node.keys, key)
-		}
+		append(&node.keys, key)
 		node.fields[key] = child
 	}
 	return node
@@ -662,9 +665,13 @@ parse_flow :: proc(p: ^Parser, text: string, line_num: int) -> (node: ^Node, con
 				return nil, 0, false
 			}
 			val_text := strings.trim_space(item[colon + 1:])
-			if key not_in node.fields {
-				append(&node.keys, key)
+			// As in `parse_mapping`. `fail` keeps the first message, so this one
+			// is what the caller's "malformed flow collection" gives way to.
+			if key in node.fields {
+				fail(p, line_num, "duplicate key: a mapping names each key once")
+				return nil, 0, false
 			}
+			append(&node.keys, key)
 
 			// A flow map's value may itself be a flow collection, as in
 			// `{answers: [a, b]}`.

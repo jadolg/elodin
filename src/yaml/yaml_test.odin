@@ -759,3 +759,25 @@ test_deep_block_nesting_rejected :: proc(t: ^testing.T) {
 	}
 	free_all(context.temp_allocator)
 }
+
+/*
+A key written twice in one mapping is refused rather than the last one winning.
+
+Kept, the first is thrown away with nothing to say so: a second `rebind:` block
+added lower down a config file, or `enabled: true` followed by `enabled: false`,
+leaves a setting the operator can see in the file doing nothing.
+*/
+@(test)
+test_duplicate_keys_are_refused :: proc(t: ^testing.T) {
+	for src in ([]string {
+			"rebind:\n  enabled: true\nrebind:\n  allow_loopback: true\n",
+			"rebind:\n  enabled: true\n  enabled: false\n",
+			"- name: a\n  name: b\n",
+			"x: {a: 1, a: 2}\n",
+		}) {
+		_, err := parse(src, context.temp_allocator)
+		e, has := err.?
+		testing.expectf(t, has && strings.contains(e.msg, "duplicate key"), "%q: %v", src, err)
+	}
+	free_all(context.temp_allocator)
+}
