@@ -2392,3 +2392,78 @@ test_conformant_requests_are_served :: proc(t: ^testing.T) {
 
 	expect_no_leaks(t, &track, "conformant requests")
 }
+
+/*
+CVE-2019-9512 / CVE-2019-9515 shape: each PING and each non-ACK SETTINGS draws
+a frame back, so a peer that sends nothing else gets a 1:1 echo for as long as
+it cares to keep sending. A connection past the per-second control-frame
+budget is told ENHANCE_YOUR_CALM and dropped instead.
+*/
+@(private = "file")
+expect_control_flood_refused :: proc(t: ^testing.T, h: Frame_Header, payload: []u8, what: string) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+
+	sent := 0
+	refused := false
+	for sent < 1000 {
+		sent += 1
+		if !handle_frame(c, h, payload) {
+			refused = true
+			break
+		}
+	}
+	testing.expectf(t, refused, "%s: %d frames in a burst were all answered", what, sent)
+	testing.expectf(t, sent == MAX_CONTROL_FRAMES_PER_SECOND + 1, "%s: refused at frame %d, not the first one over the budget", what, sent)
+	saw_goaway := false
+	for f in log.frames {
+		saw_goaway ||= f.type == .Goaway
+	}
+	testing.expectf(t, saw_goaway, "%s: the flood was dropped without a GOAWAY", what)
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, what)
+}
+
+@(test)
+test_ping_flood_is_refused :: proc(t: ^testing.T) {
+	expect_control_flood_refused(t, Frame_Header{length = 8, type = .Ping}, make([]u8, 8, context.temp_allocator), "ping flood")
+}
+
+@(test)
+test_settings_flood_is_refused :: proc(t: ^testing.T) {
+	expect_control_flood_refused(t, Frame_Header{type = .Settings}, nil, "settings flood")
+}
+
+/*
+The budget is per second, not per connection: a long-lived DoH connection
+kept alive by PINGs must not run out of it. ACKs draw nothing back, so they
+are not charged.
+*/
+@(test)
+test_control_frame_budget_refills_each_second :: proc(t: ^testing.T) {
+	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil)
+	defer conn_unref(c)
+	ping := Frame_Header{length = 8, type = .Ping}
+	payload := make([]u8, 8, context.temp_allocator)
+
+	for _ in 0 ..< MAX_CONTROL_FRAMES_PER_SECOND {
+		testing.expect(t, handle_frame(c, ping, payload), "a PING within the budget was refused")
+	}
+	ack := Frame_Header{length = 8, type = .Ping, flags = FLAG_ACK}
+	testing.expect(t, handle_frame(c, ack, payload), "a PING ACK was charged against the budget")
+
+	c.control_window = time.tick_add(c.control_window, -time.Second)
+	testing.expect(t, handle_frame(c, ping, payload), "the budget did not refill after a second")
+	testing.expect_value(t, c.control_frames, 1)
+	free_all(context.temp_allocator)
+}
