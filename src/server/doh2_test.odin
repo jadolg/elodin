@@ -243,7 +243,7 @@ DoH over HTTP/2 must shed against `max_pending` like every other queued query.
 
 It is the only transport that hands its work to the shared worker pool instead
 of answering on its own connection thread, so it is the one that can fill that
-pool - up to `max_connections` x `MAX_CONCURRENT` streams - while the operator's
+pool - up to `max_connections` x `MAX_HELD_STREAMS` streams - while the operator's
 backlog limit sheds UDP at a few hundred.
 
 The query is a bare DNS header with no question, which the endpoint answers

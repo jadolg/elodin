@@ -211,7 +211,7 @@ h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	This is the only transport that hands its work to the pool - the others
 	answer on their own connection thread, so `max_connections` is what bounds
 	them. Without this the operator's backlog limit sheds UDP at a few hundred
-	while HTTP/2 queues up to `max_connections` x `MAX_CONCURRENT` streams, each
+	while HTTP/2 queues up to `max_connections` x `MAX_HELD_STREAMS` streams, each
 	holding its buffered body, in front of it.
 
 	`try_submit` rather than `pending` and then `submit`: there is a reader

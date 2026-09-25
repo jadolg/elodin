@@ -2751,3 +2751,41 @@ test_padding_cannot_stall_a_stream :: proc(t: ^testing.T) {
 	testing.expectf(t, !open, "a stream that spent %d bytes of its window was left open", spent)
 	free_all(context.temp_allocator)
 }
+
+/*
+DATA after END_STREAM frees the stream's slot for the peer (it is reset), so a
+peer can open a replacement and do it again: its RST_STREAM spends the same
+budget as any other stream error.
+*/
+@(test)
+test_data_after_end_stream_spends_the_control_budget :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, destroying_handler, nil, allocator)
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	h := Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}
+	testing.expect(t, handle_headers(c, h, block), "handle_headers failed")
+
+	c.control_window = time.tick_add(time.tick_now(), time.Hour)
+	c.control_frames = MAX_CONTROL_FRAMES_PER_SECOND
+	body := []u8{'x'}
+	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect(t, !dok, "DATA after END_STREAM past the budget drew a reset and kept the connection")
+	saw_goaway := false
+	for f in log.frames {
+		saw_goaway ||= f.type == .Goaway
+		testing.expect(t, f.type != .Rst_Stream, "DATA after END_STREAM past the budget still drew a RST_STREAM")
+	}
+	testing.expect(t, saw_goaway, "DATA after END_STREAM past the budget was dropped without a GOAWAY")
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "data after end stream budget")
+}

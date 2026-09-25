@@ -202,8 +202,8 @@ Conn :: struct {
 	// How long a response may wait for the peer to grant flow-control credit
 	// before the stream is given up on.
 	write_timeout:       time.Duration,
-	// Answered control frames in the second starting at control_window; see
-	// MAX_CONTROL_FRAMES_PER_SECOND. Reader thread only.
+	// Answered control frames and stream errors in the second starting at
+	// control_window; see MAX_CONTROL_FRAMES_PER_SECOND. Reader thread only.
 	control_frames:      int,
 	control_window:      time.Tick,
 	// Connection credit not yet returned; see CREDIT_BATCH. Reader thread only.
@@ -1135,7 +1135,9 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	if already_ended {
 		sent := true
 		if need_rst {
-			sent = rst_stream(c, h.stream_id, .Stream_Closed)
+			// Budgeted: the stream was just marked closed above, so the peer may open
+			// a replacement at once and repeat this for a reset per HEADERS.
+			sent = stream_error(c, h.stream_id, .Stream_Closed)
 		}
 		return sent && give_connection_credit(c, len(payload))
 	}
@@ -1236,8 +1238,9 @@ which a client may retry (RFC 9113 8.7).
 */
 MAX_CONN_REQUEST :: 2 * (MAX_BODY + MAX_HEADER_LIST)
 
-// Hand back connection-level receive window for bytes that have been read off
-// the wire, whatever became of the stream they belonged to.
+// Owe connection-level receive window for bytes that have been read off the
+// wire, whatever became of the stream they belonged to, and hand it back once
+// CREDIT_BATCH has built up.
 @(private)
 give_connection_credit :: proc(c: ^Conn, n: int) -> bool {
 	c.credit_owed += n
