@@ -77,6 +77,9 @@ Client_Stream :: struct {
 	// DATA payload taken on this stream, padding included: what it has spent of
 	// its flow-control window. See CLIENT_RECV_WINDOW.
 	received:    int,
+	// Whether this stream's answer has refunded its control frame; see
+	// client_finish_headers. Not `status != 0`: a malformed :status reads as 0.
+	refunded:    bool,
 }
 
 Client_Request :: struct {
@@ -595,7 +598,6 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 		s.rst_sent = true
 	}
 	if found && !already_ended {
-		first := s.status == 0
 		for f in headers {
 			if f.name == ":status" {
 				s.status = parse_status(f.value)
@@ -610,7 +612,8 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 		the budget, never to a rate it can raise by itself. Once per stream,
 		and a stream id is only ever ours to open.
 		*/
-		if first && s.status != 0 {
+		if !s.refunded && s.status != 0 {
+			s.refunded = true
 			control_budget_refund(&c.control)
 		}
 		if s.end_stream {

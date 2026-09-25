@@ -2253,8 +2253,13 @@ test_client_answers_earn_back_the_control_budget :: proc(t: ^testing.T) {
 	}
 }
 
+/*
+One stream earns one frame back, however its status comes and goes: a :status
+that is not three digits reads as 0, and must not make a later valid one look
+like the stream's first answer.
+*/
 @(test)
-test_client_pings_with_no_answers_are_capped :: proc(t: ^testing.T) {
+test_client_one_stream_earns_one_frame :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
 	mem.tracking_allocator_init(&track, context.allocator)
 	defer mem.tracking_allocator_destroy(&track)
@@ -2262,18 +2267,77 @@ test_client_pings_with_no_answers_are_capped :: proc(t: ^testing.T) {
 
 	c := client_make(IO{read = hook_read_nothing, write = client_log_write}, allocator)
 	c.control.window = time.tick_add(time.tick_now(), time.Hour)
+	c.control.frames = MAX_CONTROL_FRAMES_PER_SECOND
+	s := new(Client_Stream, allocator)
+	s.id = 1
+	s.send_window = c.peer_initial_window
+	s.body = make([dynamic]u8, 0, 8, allocator)
+	c.streams[1] = s
+	c.next_stream_id = 3
+
+	good := make([dynamic]u8, 0, 16, context.temp_allocator)
+	encode_header(&good, ":status", "200")
+	bad := make([dynamic]u8, 0, 16, context.temp_allocator)
+	encode_header(&bad, ":status", "x")
 	ping := make([]u8, 8, context.temp_allocator)
 
-	// Without answers the budget is flat again.
-	flooded := 0
-	for flooded < 1000 && client_handle_frame(c, Frame_Header{length = 8, type = .Ping}, ping) {
-		flooded += 1
+	answered := 0
+	for answered < 1000 {
+		ok := client_handle_frame(c, Frame_Header{length = len(good), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, good[:])
+		ok = ok && client_handle_frame(c, Frame_Header{length = len(bad), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, bad[:])
+		ok = ok && client_handle_frame(c, Frame_Header{length = 8, type = .Ping}, ping)
+		if !ok {
+			break
+		}
+		answered += 1
 	}
-	testing.expect(t, flooded <= MAX_CONTROL_FRAMES_PER_SECOND, "PINGs with no answers behind them were not capped")
+	testing.expectf(t, answered == 1, "one stream earned %d PINGs back, not 1", answered)
+
+	client_stream_destroy(c, s)
+	delete_key(&c.streams, u32(1))
+	client_unref(c)
+	free_all(context.temp_allocator)
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "client one stream: %d bytes leaked at %v", entry.size, entry.location)
+	}
+}
+
+// The order answers and PINGs arrive in does not matter: answers that come
+// first still earn their frames for the PINGs after them.
+@(test)
+test_client_answers_before_pings_still_earn :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	c := client_make(IO{read = hook_read_nothing, write = client_log_write}, allocator)
+	c.control.window = time.tick_add(time.tick_now(), time.Hour)
+	block := make([dynamic]u8, 0, 16, context.temp_allocator)
+	encode_header(&block, ":status", "200")
+	ping := make([]u8, 8, context.temp_allocator)
+
+	ANSWERS :: 2 * MAX_CONTROL_FRAMES_PER_SECOND
+	for id := u32(1); id < 2 * ANSWERS; id += 2 {
+		s := new(Client_Stream, allocator)
+		s.id = id
+		s.body = make([dynamic]u8, 0, 8, allocator)
+		c.streams[id] = s
+		c.next_stream_id = id + 2
+		h := Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = id}
+		testing.expect(t, client_handle_frame(c, h, block[:]), "an answer was refused")
+		client_stream_destroy(c, s)
+		delete_key(&c.streams, id)
+	}
+	pinged := 0
+	for pinged < 1000 && client_handle_frame(c, Frame_Header{length = 8, type = .Ping}, ping) {
+		pinged += 1
+	}
+	testing.expect_value(t, pinged, ANSWERS + MAX_CONTROL_FRAMES_PER_SECOND)
 
 	client_unref(c)
 	free_all(context.temp_allocator)
 	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "client earned budget: %d bytes leaked at %v", entry.size, entry.location)
+		testing.expectf(t, false, "client answers first: %d bytes leaked at %v", entry.size, entry.location)
 	}
 }

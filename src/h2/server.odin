@@ -493,26 +493,32 @@ Control_Budget :: struct {
 	window: time.Tick,
 }
 
-// Charges one frame; false once this second's budget is spent.
+// Opens a fresh second once the current one is over.
 @(private)
-control_budget_spend :: proc(b: ^Control_Budget) -> bool {
+control_budget_roll :: proc(b: ^Control_Budget) {
 	now := time.tick_now()
 	// A zero window is long past, so the first frame opens one.
 	if time.tick_diff(b.window, now) >= time.Second {
 		b.window = now
 		b.frames = 0
 	}
+}
+
+// Charges one frame; false once this second's budget is spent.
+@(private)
+control_budget_spend :: proc(b: ^Control_Budget) -> bool {
+	control_budget_roll(b)
 	b.frames += 1
 	return b.frames <= MAX_CONTROL_FRAMES_PER_SECOND
 }
 
 // Gives one frame of this second's budget back, for work the peer did that this
-// end asked for.
+// end asked for. Banked below zero if nothing is spent yet, so the order the
+// work and the frames arrive in within a second does not matter.
 @(private)
 control_budget_refund :: proc(b: ^Control_Budget) {
-	if b.frames > 0 {
-		b.frames -= 1
-	}
+	control_budget_roll(b)
+	b.frames -= 1
 }
 
 // Charges one frame against MAX_CONTROL_FRAMES_PER_SECOND. Past it, the peer is
