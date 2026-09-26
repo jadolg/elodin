@@ -280,6 +280,20 @@ test_normalise_refuses_what_cannot_be_a_domain :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_a_query_name_with_a_slash_is_still_matched :: proc(t: ^testing.T) {
+	/*
+	A label may carry any octet, and presentation form leaves `/` unescaped. A
+	slash marks a mis-split rule, not a query name: refusing it at match time let
+	`a/b.ads.example.com.` past a block on its parent and stripped an allowed name
+	of its exception.
+	*/
+	src := "||ads.example.com^\n@@||safe.ads.example.com^\n"
+	testing.expect_value(t, matches(src, .Adblock, "a/b.ads.example.com."), Decision.Blocked)
+	testing.expect_value(t, matches(src, .Adblock, "/.safe.ads.example.com."), Decision.Allowed)
+	testing.expect_value(t, matches("ads.example.com/path\n", .Domains, "ads.example.com."), Decision.None)
+}
+
+@(test)
 test_set_lookup_walks_the_parents_for_subdomain_rules :: proc(t: ^testing.T) {
 	/*
 	The lookup costs one probe per label rather than one per rule, which is what
