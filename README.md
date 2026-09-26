@@ -2267,8 +2267,9 @@ the CGNAT zones it numbers from (`64.100.in-addr.arpa` through
 `127.100.in-addr.arpa`) to it, or its peers' reverse names are NXDOMAIN here.
 Not `100.in-addr.arpa` as a whole: the rest of it is public, signed address
 space, and a route takes every name under it out of DNSSEC validation.
-`private_reverse: false` sends them all back to `upstream.servers` as
-before. These answers log as `outcome=local detail=private-reverse` and are left
+`private_reverse: false` (or `enabled: false`) sends them all back to
+`upstream.servers`, as before except that forwarded CGNAT reverse answers are
+now served unvalidated like the other private ranges. These answers log as `outcome=local detail=private-reverse` and are left
 out of the `special_use` counter below, which every LAN PTR would otherwise
 drown.
 
