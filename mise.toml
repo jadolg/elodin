@@ -117,19 +117,23 @@ description = "Replay the committed fuzz corpus through each target once"
 depends = ["fuzz"]
 run = """
 # A .max_len is only used nightly, so check here that each one names a target
-# and parses, or a typo'd name or a bad line fuzzes at the default unnoticed; and
-# start its target with it and no corpus, so a target that refuses the cap at
-# start-up (one feeding a socket, past MAX_FEED) fails here too.
+# and parses, or a typo'd name or a bad line fuzzes at the default unnoticed.
 for f in testdata/fuzz-corpus/*.max_len; do
   [ -e "$f" ] || continue
   t=$(basename "$f" .max_len)
-  [ -d "src/fuzz/$t" ] || { echo "$f: no fuzz target by that name" >&2; exit 1; }
-  len=$(scripts/fuzz-max-len.sh "$t") || exit 1
-  [ ! -x "bin/fuzz_$t" ] || ASAN_OPTIONS=detect_leaks=0 ./bin/fuzz_$t $len -runs=0 >/dev/null 2>&1 || { echo "$f: bin/fuzz_$t refuses $len" >&2; exit 1; }
+  { [ -d "src/fuzz/$t" ] && [ "$t" != harness ]; } || { echo "$f: no fuzz target by that name" >&2; exit 1; }
+  scripts/fuzz-max-len.sh "$t" >/dev/null || exit 1
 done
-# No -max_len on the replay: it truncates corpus files longer than the cap, and a
-# reproducer cut short no longer reproduces.
 for t in ${FUZZ_TARGETS:-$(cd src/fuzz && ls -d */ | tr -d / | grep -vx harness)}; do
+  # Start a target with its cap and no corpus, so one that refuses it at start-up
+  # (one feeding a socket, past MAX_FEED) fails here too. Only the targets just
+  # built, so a stale binary never answers for the source.
+  len=$(scripts/fuzz-max-len.sh "$t") || exit 1
+  if [ -n "$len" ] && ! out=$(ASAN_OPTIONS=detect_leaks=0 ./bin/fuzz_$t $len -runs=0 2>&1); then
+    printf '%s\\n' "$out" >&2; echo "bin/fuzz_$t fails to start with $len" >&2; exit 1
+  fi
+  # No -max_len on the replay: it truncates corpus files longer than the cap, and a
+  # reproducer cut short no longer reproduces.
   ASAN_OPTIONS=detect_leaks=0 ./bin/fuzz_$t -runs=0 testdata/fuzz-corpus/$t || exit 1
 done
 """

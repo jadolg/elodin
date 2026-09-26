@@ -3,8 +3,8 @@
 # default cap: 4 KB, or the largest seed input if that is longer.
 #
 # A target that needs longer inputs says so in testdata/fuzz-corpus/<target>.max_len,
-# next to its dict: `#` lines say why it needs it, and the one other line is the
-# cap, a bare number. Any other line, a second number, or 0 (libFuzzer's "use the
+# next to its dict: `#` lines say why it needs it, empty lines are skipped, and the
+# one other line is the cap, a bare number. Any other line, a second number, or 0 (libFuzzer's "use the
 # default") is an error rather than a quiet fall back to the default. Nine digits
 # at most, as libFuzzer reads the flag into an int and an overflow wraps.
 #
@@ -15,7 +15,7 @@ cd "$(dirname "$0")/.."
 
 f=testdata/fuzz-corpus/$1.max_len
 [ -f "$f" ] || exit 0
-len=$(grep -v '^#' "$f" || true)
+len=$(grep -v -e '^#' -e '^$' "$f" || true)
 if ! [[ $len =~ ^[1-9][0-9]{0,8}$ ]]; then
   echo "::error file=$f::needs exactly one line that is not a # comment, a bare number above 0" >&2
   exit 1
