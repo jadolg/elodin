@@ -35,9 +35,11 @@ in an outage is every pool worker held twice as long.
 A follower that cannot use what the leader landed with forwards on its own, which
 is what every query did before this - except where the leader stored a verdict
 (a Bogus refusal, a cloaking refusal worth keeping), when it reads that verdict
-straight out of the cache and is refused from it. The cloaking one is a counted
-lookup, so that follower's query shows as a miss and then a hit; the Bogus one
-is a probe, as it is on the way in, and counts nothing. A follower whose
+straight out of the cache and is refused from it - or, for a cloaking refusal a
+list reload lifted during the wait, answered from it. The cloaking lookup is a
+counted one, so that follower's query shows as a miss and then a hit, or as two
+misses where the entry was evicted in between; the Bogus one is a probe, as it
+is on the way in, and counts nothing. A follower whose
 patience ran out forwards on its own too, and so does one that finds the
 verdict already evicted - outside the table, since it is past its turn to join
 one, which on a cache under that much pressure costs a burst its coalescing.

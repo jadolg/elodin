@@ -1907,14 +1907,21 @@ resolve_query :: proc(
 			cloaking refusal under the question's own key, which `serve_from_cache`
 			refuses from the entry - against the rule sets as they stand after the
 			wait, so a reload during it re-walks the chain - or a Bogus one under
-			its verdict key, read under the same condition as the lookup above.
-			Evicted already, and this query forwards on its own.
+			its verdict key. Evicted or expired already, and this query forwards
+			on its own.
 			*/
 			#partial switch landed_with.stored {
 			case .Cloak:
-				if stored, found := stored_answer(s, key, rules_generation(s), allocator); found && !stored.stale {
-					sync.atomic_add(&s.stats.coalesced, 1)
-					return serve_from_cache(
+				stored, found := stored_answer(s, key, rules_generation(s), allocator)
+				if found && stored.stale {
+					// Expired already: the fallback for this query's own forward.
+					stale_hit = stored
+				} else if found {
+					// Counted here only where the entry is refused or unreadable:
+					// served, `serve_from_cache` counts it as the coalesced answer
+					// its log line then says it is.
+					stored.coalesced = true
+					out, served, built := serve_from_cache(
 						s,
 						stored,
 						query,
@@ -1929,11 +1936,15 @@ resolve_query :: proc(
 						allocator,
 						ede,
 					)
+					if served != .Cached {
+						sync.atomic_add(&s.stats.coalesced, 1)
+					}
+					return out, served, built
 				}
 			case .Bogus:
-				if !validating {
-					break
-				}
+				// Not gated on `validating`: the leader reached this verdict for
+				// the same key, and this query's own rewrite failing is no reason
+				// to forward what was just proved Bogus.
 				if remembered, found := stored_verdict(s, verdict_key, allocator); found {
 					sync.atomic_add(&s.stats.coalesced, 1)
 					return serve_bogus_verdict(s, remembered, query, msg, q, proto, client, started)
