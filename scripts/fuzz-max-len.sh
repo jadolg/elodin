@@ -7,9 +7,10 @@
 # targets reached 5.6 KB and 17 KB of their 64 KB - so a target that declares
 # long inputs are what it needs is given them from the first run.
 #
-# A target that needs longer inputs says so in testdata/fuzz-corpus/<target>.max_len,
-# next to its dict: `#` lines say why it needs it, empty lines are skipped, and the
-# one other line is the cap, a bare number. Any other line, a second number, or
+# A target that needs longer inputs says so in
+# testdata/fuzz-corpus/<target>.max_len, next to its dict: `#` lines say why it
+# needs it, empty lines are skipped, and the one other line is the cap, a bare
+# number. Any other line, a second number, or
 # 0 (libFuzzer's "use the default") is an error rather than a quiet fall back to
 # the default. Nine digits at most, as libFuzzer reads the flag into an int and
 # an overflow wraps.
