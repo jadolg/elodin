@@ -1,0 +1,7 @@
+GET /dns-query?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE HTTP/1.1
+Host: a
+
+GET /dns-query?x=1&dns=AA HTTP/1.1
+Host: a
+Connection: close
+

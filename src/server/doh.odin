@@ -467,6 +467,39 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 	return req, 0, true
 }
 
+/*
+Read requests off `conn` the way `serve_doh` does, and answer none of them.
+
+For the fuzz target, which lives in a package of its own and cannot reach the
+reader: every request line, header loop and body this server would read, one
+after another as a client pipelining them sends them, with the `dns` parameter
+of each decoded as a GET would. Nothing else calls it.
+*/
+fuzz_http_requests :: proc(conn: Conn) {
+	r := Http_Reader {
+		conn = conn,
+		buf  = make([dynamic]u8, 0, HTTP_BUF_SIZE),
+	}
+	defer delete(r.buf)
+	for {
+		req, _, ok := read_http_request(&r)
+		if !ok {
+			return
+		}
+		http_compact(&r)
+		if param, found := query_param(req.query, "dns"); found {
+			_, _ = decode_dns_param(param)
+		}
+		// As `serve_doh` does between requests, so nothing the next one reads can
+		// lean on this one's scratch.
+		free_all(context.temp_allocator)
+		// And, as there, nothing is read past a request that ends the connection.
+		if !req.keep_alive {
+			return
+		}
+	}
+}
+
 @(private)
 serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 	path := s.cfg.listeners.doh.path

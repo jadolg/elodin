@@ -1,0 +1,4 @@
+# comment
+127.0.0.1 localhost
+0.0.0.0 ads.example tracker.example
+::1 ip6-localhost
