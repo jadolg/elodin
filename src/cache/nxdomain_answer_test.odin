@@ -16,8 +16,8 @@ shape stopped one layer out, which is the layer that decides whether one packet
 takes a name down for every client or only for the one that asked.
 
 Cached, it is much the worse of the two. The lifetime for a name error is read
-from the SOA beside it, a positive answer never carried one, and the fallback is
-`negative_ttl` - so a five-minute authenticated absence, by default, for a name
+from the SOA beside it, and the zone's own SOA pasted beside the records is up to
+`negative_ttl` - five minutes by default - of authenticated absence for a name
 whose records were in the packet.
 */
 
@@ -169,8 +169,9 @@ test_nxdomain_after_a_cname_is_cached_for_an_rrsig_question :: proc(t: ^testing.
 	}
 	m := dns.Message {
 		id       = 0x3334,
-		question = []dns.Question{{name = "www.example.com.", type = .RRSIG, class = .IN}},
-		answer   = answer,
+		question  = []dns.Question{{name = "www.example.com.", type = .RRSIG, class = .IN}},
+		answer    = answer,
+		authority = nx_target_soa("example.net."),
 	}
 	m.flags.qr = true
 	m.flags.ra = true
@@ -210,8 +211,9 @@ test_nxdomain_over_a_dname_above_the_queried_name_is_cached :: proc(t: ^testing.
 	}
 	m := dns.Message {
 		id       = 0x3335,
-		question = []dns.Question{{name = "a.sub.example.com.", type = .DNAME, class = .IN}},
-		answer   = answer,
+		question  = []dns.Question{{name = "a.sub.example.com.", type = .DNAME, class = .IN}},
+		answer    = answer,
+		authority = nx_target_soa("example.net."),
 	}
 	m.flags.qr = true
 	m.flags.ra = true
@@ -251,9 +253,10 @@ test_nxdomain_over_a_cname_in_another_class_is_not_cached :: proc(t: ^testing.T)
 		data  = dns.Rdata_Name{name = "target.example.net."},
 	}
 	m := dns.Message {
-		id       = 0x3336,
-		question = []dns.Question{{name = "www.example.com.", type = .A, class = .IN}},
-		answer   = answer,
+		id        = 0x3336,
+		question  = []dns.Question{{name = "www.example.com.", type = .A, class = .IN}},
+		answer    = answer,
+		authority = nx_target_soa("example.com."),
 	}
 	m.flags.qr = true
 	m.flags.ra = true
@@ -273,4 +276,19 @@ test_nxdomain_over_a_cname_in_another_class_is_not_cached :: proc(t: ^testing.T)
 @(private = "file")
 key_for_nx :: proc(buf: []u8, name: string) -> string {
 	return make_key(buf, name, .A, .IN, false)
+}
+
+// The SOA of the zone a redirection led into, which is what a real name error
+// at the end of the chain carries (RFC 2308 section 2.1) and what the cache
+// reads its lifetime from.
+nx_target_soa :: proc(zone: string) -> []dns.Record {
+	soa := make([]dns.Record, 1, context.temp_allocator)
+	soa[0] = dns.Record {
+		name = zone,
+		type = .SOA,
+		class = .IN,
+		ttl = 3600,
+		data = dns.Rdata_SOA{ns = "ns.example.net.", mbox = "hostmaster.example.net.", serial = 1, minimum = 600},
+	}
+	return soa
 }

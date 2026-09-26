@@ -778,3 +778,75 @@ test_a_verdict_does_not_land_on_an_answer_that_replaced_the_one_it_was_reached_o
 	testing.expect(t, after.recheck, "a verdict reached on bytes that are gone cleared the answer that replaced them")
 	free_all(context.temp_allocator)
 }
+
+/*
+A denial with no SOA is not remembered (RFC 2308 section 5): there is nothing
+in it to say how long it holds, and the fallback would make one upstream that
+stumbled - an empty NOERROR from a rate-limited server, or a referral from one
+that did not recurse - the answer every client gets for `negative_ttl`.
+*/
+@(test)
+test_a_denial_without_a_soa_is_not_cached :: proc(t: ^testing.T) {
+	// A `min_ttl` floor, which would otherwise lift the zero lifetime a denial
+	// without a SOA has into one worth storing.
+	c := make_cache(Options{max_entries = 8, max_ttl = 86400, min_ttl = 60, negative_ttl = 300})
+	defer destroy(c)
+	kb: [KEY_MAX]u8
+
+	// NOERROR, empty answer, empty authority.
+	nodata := dns.Message{id = 1, question = []dns.Question{{name = "nodata.example.test.", type = .A, class = .IN}}}
+	nodata.flags.qr = true
+	nodata.flags.ra = true
+	w1, _, _ := dns.encode_message(nodata, context.temp_allocator)
+	m1, _ := dns.decode_message(w1, context.temp_allocator)
+	testing.expect(t, !put(c, key_for(kb[:], "nodata.example.test."), w1, m1), "a NODATA without a SOA was cached")
+
+	// NXDOMAIN, empty authority.
+	nx := nodata
+	nx.question = []dns.Question{{name = "nx.example.test.", type = .A, class = .IN}}
+	dns.set_rcode(&nx, .NX_Domain)
+	w2, _, _ := dns.encode_message(nx, context.temp_allocator)
+	m2, _ := dns.decode_message(w2, context.temp_allocator)
+	testing.expect(t, !put(c, key_for(kb[:], "nx.example.test."), w2, m2), "an NXDOMAIN without a SOA was cached")
+
+	// A referral: NOERROR, RA=0, NS in authority, no SOA.
+	ref := dns.Message {
+		id        = 3,
+		question  = []dns.Question{{name = "referral.example.test.", type = .A, class = .IN}},
+		authority = []dns.Record{{name = "example.test.", type = .NS, class = .IN, ttl = 3600, data = dns.Rdata_Name{"ns1.example.test."}}},
+	}
+	ref.flags.qr = true
+	w3, _, _ := dns.encode_message(ref, context.temp_allocator)
+	m3, _ := dns.decode_message(w3, context.temp_allocator)
+	testing.expect(t, !put(c, key_for(kb[:], "referral.example.test."), w3, m3), "a referral was cached as NODATA")
+
+	testing.expect_value(t, len_entries(c), 0)
+
+	// The control: the same NODATA with a SOA beside it is kept, so the three
+	// refusals above are the missing SOA and not something else about them.
+	nodata.authority = nx_target_soa("example.test.")
+	w4, _, _ := dns.encode_message(nodata, context.temp_allocator)
+	m4, _ := dns.decode_message(w4, context.temp_allocator)
+	testing.expect(t, put(c, key_for(kb[:], "nodata.example.test."), w4, m4), "a NODATA with a SOA was not cached")
+	free_all(context.temp_allocator)
+}
+
+// A SOA TTL with its top bit set is zero (RFC 2181 section 8), so the denial it
+// sits beside has no lifetime and is not kept - not `negative_ttl`'s worth.
+@(test)
+test_a_denial_whose_soa_ttl_has_the_top_bit_set_is_not_cached :: proc(t: ^testing.T) {
+	c := make_cache(Options{max_entries = 8, max_ttl = 86400, negative_ttl = 300})
+	defer destroy(c)
+	kb: [KEY_MAX]u8
+
+	nx := dns.Message{id = 1, question = []dns.Question{{name = "nx.example.test.", type = .A, class = .IN}}}
+	nx.flags.qr = true
+	nx.flags.ra = true
+	dns.set_rcode(&nx, .NX_Domain)
+	nx.authority = nx_target_soa("example.test.")
+	nx.authority[0].ttl = 0x8000_0e10
+	w, _, _ := dns.encode_message(nx, context.temp_allocator)
+	m, _ := dns.decode_message(w, context.temp_allocator)
+	testing.expect(t, !put(c, key_for(kb[:], "nx.example.test."), w, m), "a denial with a top-bit SOA TTL was cached")
+	free_all(context.temp_allocator)
+}

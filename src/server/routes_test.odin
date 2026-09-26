@@ -201,7 +201,12 @@ the test would read as the upstream never having answered.
 route_reply_nodata :: proc(name: string, type: dns.Type, rcode := dns.Rcode.No_Error) -> []u8 {
 	question := make([]dns.Question, 1, context.temp_allocator)
 	question[0] = dns.Question{name = name, type = type, class = .IN}
-	msg := dns.Message{question = question}
+	// The SOA a real denial carries (RFC 2308 section 3), without which the
+	// cache would not keep it at all.
+	msg := dns.Message {
+		question  = question,
+		authority = synth_soa_for_zone(name, 300, context.temp_allocator),
+	}
 	msg.flags.qr = true
 	msg.flags.rd = true
 	msg.flags.ra = true

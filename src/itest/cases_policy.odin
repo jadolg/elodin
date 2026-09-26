@@ -712,8 +712,10 @@ run_cache_cases :: proc(r: ^Runner) {
 	upstream_port := next_port(r)
 	mock := mock_make("cache", upstream_port)
 	mock_reply(mock, fix.qname, fix.qtype, from_hex(fix.response, context.allocator))
-	mock_reply(mock, "nx.example.com.", u16(dns.Type.A), nil)
-	mock_reply(mock, POISONED_NAME, u16(dns.Type.A), nxdomain_with_data(POISONED_NAME))
+	mock_reply(mock, "nx.example.com.", u16(dns.Type.A), denial_reply("nx.example.com.", .No_Error, data = false))
+	mock_reply(mock, POISONED_NAME, u16(dns.Type.A), denial_reply(POISONED_NAME, .NX_Domain, data = true))
+	mock_reply(mock, "nosoa.example.com.", u16(dns.Type.A), nil)
+	mock_reply(mock, "referral.example.com.", u16(dns.Type.A), referral_reply("referral.example.com."))
 	// Any other question (the AAAA case below) gets a matching synthesised
 	// answer rather than a canned one for the wrong name.
 	mock_synth_all(mock, {203, 0, 113, 2})
@@ -735,6 +737,7 @@ upstream:
 cache:
   enabled: true
   max_entries: 100
+  min_ttl: 30
   negative_ttl: 60
 blocking: {{ enabled: false }}
 `,
@@ -819,6 +822,28 @@ blocking: {{ enabled: false }}
 	}
 	end_case(r)
 
+	start_case(r, "cache: a denial without a SOA is not cached")
+	{
+		// RFC 2308 section 5, issue #310: nothing in it says how long it holds,
+		// so one upstream that stumbled - an empty NOERROR, or a referral from
+		// a server that did not recurse - is not every client's answer for
+		// `negative_ttl`. Asked twice, the upstream has to hear both. The
+		// server's `min_ttl` is what makes this reach the guard: without it
+		// the zero lifetime a SOA-less denial has would refuse it anyway.
+		for name, i in ([]string{"nosoa.example.com.", "referral.example.com."}) {
+			mock_reset_counts(mock)
+			first := query_udp(udp_port, build_query(name, u16(dns.Type.A), id = u16(20 + 2 * i)))
+			if !check(r, first.ok, "no response to the first query for %s", name) {
+				continue
+			}
+			h := parse_header(r, first.wire)
+			check(r, h.rcode == int(dns.Rcode.No_Error) && h.ancount == 0, "%s: want the empty NOERROR the mock sent", name)
+			_ = query_udp(udp_port, build_query(name, u16(dns.Type.A), id = u16(21 + 2 * i)))
+			check_eq_int(r, mock_total(mock), 2, fmt.tprintf("upstream queries for %s asked twice", name))
+		}
+	}
+	end_case(r)
+
 	start_case(r, "cache: A and AAAA are separate entries")
 	{
 		mock_reset_counts(mock)
@@ -839,10 +864,10 @@ blocking: {{ enabled: false }}
 		`src/dnssec` refuses it outright where validation is on. This case is
 		the layer under that - validation is off here, as it is for every
 		case in this file - and what it asserts is the part that decides how
-		far one packet reaches: the negative lifetime comes from an SOA, a
-		positive answer never carried one, so the fallback is `negative_ttl`
-		and a single spoofed datagram would otherwise take the name away from
-		every client for a minute. Asked twice, the upstream has to hear both.
+		far one packet reaches: the negative lifetime comes from the SOA
+		beside it, capped at `negative_ttl`, and a single spoofed datagram
+		would otherwise take the name away from every client for a minute.
+		Asked twice, the upstream has to hear both.
 		*/
 		mock_reset_counts(mock)
 		first := query_udp(udp_port, build_query(POISONED_NAME, u16(dns.Type.A), id = 10))
@@ -979,29 +1004,47 @@ has_opt_record :: proc(r: ^Runner, wire: []u8) -> bool {
 POISONED_NAME :: "poisoned.example.com."
 
 /*
-The canned reply for it, built once and left on the heap.
+A canned denial with the zone's SOA beside it - a NODATA, or an NXDOMAIN over an
+A record at the denied name when `data` is set - built once and left on the heap.
 
 The mock keeps the slice for the whole run and `end_case` empties the temp arena
 long before the case that asks for it, which is why every other canned payload
 in the suite is allocated the same way.
 */
 @(private = "file")
-nxdomain_with_data :: proc(name: string) -> []u8 {
-	answer := make([]dns.Record, 1, context.temp_allocator)
-	answer[0] = dns.Record {
-		name  = name,
-		type  = .A,
-		class = .IN,
-		ttl   = 300,
-		data  = dns.Rdata_A{addr = {203, 0, 113, 9}},
+denial_reply :: proc(name: string, rcode: dns.Rcode, data: bool) -> []u8 {
+	answer := make([]dns.Record, 1 if data else 0, context.temp_allocator)
+	if data {
+		answer[0] = dns.Record {
+			name  = name,
+			type  = .A,
+			class = .IN,
+			ttl   = 300,
+			data  = dns.Rdata_A{addr = {203, 0, 113, 9}},
+		}
 	}
 	question := make([]dns.Question, 1, context.temp_allocator)
 	question[0] = dns.Question{name = name, type = .A, class = .IN}
-	msg := dns.Message{question = question, answer = answer}
+	// The zone's SOA beside it, as the genuine denial the attacker could lift
+	// it from carries: without one the cache would turn the reply away for
+	// that alone, and the case would pass without the data ever being read.
+	authority := make([]dns.Record, 1, context.temp_allocator)
+	authority[0] = dns.Record {
+		name = "example.com.",
+		type = .SOA,
+		class = .IN,
+		ttl = 3600,
+		data = dns.Rdata_SOA{ns = "ns.example.com.", mbox = "hostmaster.example.com.", serial = 1, minimum = 600},
+	}
+	msg := dns.Message {
+		question  = question,
+		answer    = answer,
+		authority = authority,
+	}
 	msg.flags.qr = true
 	msg.flags.rd = true
 	msg.flags.ra = true
-	msg.flags.rcode = u8(dns.Rcode.NX_Domain)
+	msg.flags.rcode = u8(rcode)
 	wire, _, err := dns.encode_message(msg, context.allocator)
 	if err != .None {
 		return nil
@@ -1370,4 +1413,30 @@ blocking: {{ enabled: false }}
 first_stale_address :: proc(r: ^Runner, wire: []u8) -> string {
 	addrs := answer_addresses(r, wire)
 	return addrs[0] if len(addrs) > 0 else ""
+}
+
+// A referral: NOERROR, RA clear, the zone's NS in authority and no SOA - what a
+// server that does not recurse sends for a name below a cut.
+@(private = "file")
+referral_reply :: proc(name: string) -> []u8 {
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question{name = name, type = .A, class = .IN}
+	authority := make([]dns.Record, 1, context.temp_allocator)
+	authority[0] = dns.Record {
+		name  = "example.com.",
+		type  = .NS,
+		class = .IN,
+		ttl   = 3600,
+		data  = dns.Rdata_Name{name = "ns1.example.com."},
+	}
+	msg := dns.Message {
+		question  = question,
+		authority = authority,
+	}
+	msg.flags.qr = true
+	wire, _, err := dns.encode_message(msg, context.allocator)
+	if err != .None {
+		return nil
+	}
+	return wire
 }

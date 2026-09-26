@@ -749,7 +749,7 @@ Where the parent said nothing — no reply, SERVFAIL, REFUSED, a NOERROR with th
 wrong thing in it, or its group already in that cooldown — the route's answer
 goes to the client and is not cached. It stood in for a fact nothing
 established, and keeping it would hold the very broken chain this carve-out
-exists to prevent over the zone for [`cache.negative_ttl`](#cache) after a
+exists to prevent over the zone for up to [`cache.negative_ttl`](#cache) after a
 single lost round trip. The next query asks again. An answer the route gave
 because the parent *did* say something — NXDOMAIN, or a DS record — is cached
 like any other, that statement about the public tree holding until the public
@@ -879,7 +879,8 @@ well as how long the entry is kept; it does not touch the answers elodin writes
 itself, which carry `blocking.block_ttl` or a rewrite's own `ttl`. `min_ttl` is a
 floor on the copies served from an entry. Neither is a promise that a client
 drops a record when this cache does: an entry lives for the smallest TTL in the
-message it holds, a negative one for the SOA's figure capped by `negative_ttl`,
+message it holds, a negative one for the SOA's figure capped by `negative_ttl`
+(a denial with no SOA is not kept at all, per RFC 2308 section 5),
 while every record still goes out carrying its own TTL up to the ceiling. A TTL
 with its top bit set is taken as zero per RFC 2181 section 8, forwarded answers
 included, which leaves it uncacheable unless `min_ttl` raises it.

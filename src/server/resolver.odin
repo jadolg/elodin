@@ -2532,8 +2532,8 @@ resolve_query :: proc(
 			description of the wire beside it - what the rcode means, whether
 			the answer redirects, how long any of it is good for - and a reading
 			that stopped after the answer section has no authority section, so a
-			denial arrives with no SOA in it and is given the fallback lifetime
-			rather than the one its own zone set. Nothing further on notices the
+			denial arrives with no SOA in it and is turned away, while an answer
+			is kept on a reading of half of it. Nothing further on notices the
 			disagreement: `scan_ttl_offsets` is far more forgiving than the
 			decoder - it follows no compression pointers and bounds no name - so
 			it succeeds on the real wire and the entry goes in looking sound.
@@ -2599,8 +2599,8 @@ resolve_query :: proc(
 	prevent. `home.arpa.` is the case: the router the route points at answers its
 	own apex `DS` with an unsigned NODATA, which is exactly the broken chain issue
 	#227 is about, and kept here it is served to every validating client below for
-	`cache.negative_ttl` - five minutes by default, and the router's own SOA figure
-	when the operator set that to zero - with `arpa.` answering perfectly well the
+	the router's own SOA figure capped by `cache.negative_ttl` - up to five minutes
+	by default - with `arpa.` answering perfectly well the
 	whole time and the proof one query away. The cause was one lost exchange or a
 	ten-second cooldown; the consequence must not outlive it.
 

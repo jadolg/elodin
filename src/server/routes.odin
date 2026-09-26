@@ -81,11 +81,12 @@ RRset. The first of those keeps nothing - `parent_answers_apex_ds` leaves it
 unsettled, so `resolve_query` serves the route's answer and stores none of it,
 and the next query is free to reach the member that can prove the delegation.
 The other two are settled by design, being statements about the public tree, so
-the route's answer does go into the entry and stands for `cache.negative_ttl`
-while another member of the same group was publishing the proof all along - one
-upstream answering NXDOMAIN for an empty non-terminal that its neighbour answers
-NODATA for, against RFC 8020, is how that actually arises. That is the worst
-this carve-out can do to the cache, and it is the behaviour the zone had before
+the route's answer does go into the entry - if it carries a SOA, for that SOA's
+figure capped by `cache.negative_ttl` - while another member of the same group
+was publishing the proof all along - one upstream answering NXDOMAIN for an
+empty non-terminal that its neighbour answers NODATA for, against RFC 8020, is
+how that actually arises. That is the worst this carve-out can do to the cache,
+and it is the behaviour the zone had before
 the carve-out existed: an unsigned NODATA for the apex `DS`, served for the
 entry's lifetime.
 */

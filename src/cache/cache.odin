@@ -715,9 +715,9 @@ put :: proc(
 	refuses that outright now, which is where the harm is actually closed; this
 	is the same shape stopped one layer further out, on the paths no validator
 	runs on. Cached, it is far worse than forwarded: the negative branch below
-	reads the lifetime from an SOA, a positive answer never carried one, and the
-	fallback is `negative_ttl` - five minutes by default of every client asking
-	that question being told the name does not exist, from one packet.
+	reads the lifetime from an SOA, and the one the zone's own denials carry
+	would do - up to `negative_ttl`, five minutes by default, of every client
+	asking that question being told the name does not exist, from one packet.
 
 	Refused rather than repaired. Which half of the contradiction the sender
 	meant is not knowable here, and the entry has to be one or the other to be
@@ -766,6 +766,31 @@ put :: proc(
 		}
 	}
 
+	/*
+	A denial without a SOA is not an answer to remember either.
+
+	RFC 2308 section 5: "Negative responses without SOA records SHOULD NOT be
+	cached". The SOA is the only thing in a denial that says how long it holds,
+	and without one every client is told the name is empty because one
+	upstream stumbled once: a rate-limited authoritative, a middlebox, or a
+	server that did not recurse and answered with a referral, whose NS records
+	in the authority section this cache would otherwise serve as a NODATA.
+	dnsmasq and BIND remember nothing without the SOA; neither does this.
+
+	Refused here rather than left to the zero lifetime below, which `min_ttl`
+	would lift into a stored entry - and this is what used to happen with
+	`negative_ttl` standing in for the SOA, for five minutes by default.
+	*/
+	negative := !bogus && (rcode == .NX_Domain || len(msg.answer) == 0)
+	soa_ttl: u32
+	if negative {
+		has_soa: bool
+		soa_ttl, has_soa = dns.negative_ttl(msg)
+		if !has_soa {
+			return false
+		}
+	}
+
 	offsets, scan_ok := dns.scan_ttl_offsets(wire, c.allocator)
 	if !scan_ok {
 		return false
@@ -802,8 +827,8 @@ put :: proc(
 		// minute this is allowed to.
 		effective = min(u32(BOGUS_TTL), c.max_ttl)
 	} else {
-		if rcode == .NX_Domain || len(msg.answer) == 0 {
-			effective = dns.negative_ttl(msg, c.negative_ttl)
+		if negative {
+			effective = soa_ttl
 			if c.negative_ttl > 0 {
 				effective = min(effective, c.negative_ttl)
 			}
