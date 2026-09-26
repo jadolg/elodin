@@ -37,11 +37,26 @@ parity_name_under :: proc(name: []u8, zone: string) -> bool {
 	return false
 }
 
-// Whether the blocking scenario's rules cover `name`: under a blocked zone and
-// not under the allowed one inside it.
+// Whether `name` (wire form) is strictly below `zone`: under it, and not it.
+parity_name_below :: proc(name: []u8, zone: string) -> bool {
+	if len(name) == 0 {
+		return false
+	}
+	n := int(name[0])
+	if n == 0 || n & 0xc0 != 0 || 1 + n >= len(name) {
+		return false
+	}
+	return parity_name_under(name[1 + n:], zone)
+}
+
+// Whether the blocking scenario's rules cover `name`: under a blocked zone, or
+// below the subtree-only one, and not under the allowed one inside them.
 parity_blocked_name :: proc(name: []u8) -> bool {
 	if parity_name_under(name, PARITY_ALLOWED) {
 		return false
+	}
+	if parity_name_below(name, PARITY_BLOCKED_SUBTREE) {
+		return true
 	}
 	for zone in PARITY_BLOCKED {
 		if parity_name_under(name, zone) {

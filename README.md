@@ -819,6 +819,7 @@ blocking:
 | `\|\|ads.foo.com^`         | `ads.foo.com` and its subdomains |
 | `\|ads.foo.com`            | `ads.foo.com` exactly            |
 | `*.foo.com`                | subdomains of `foo.com` only     |
+| `\|\|*.foo.com^`           | subdomains of `foo.com` only     |
 | `address=/foo.com/0.0.0.0` | `foo.com` and its subdomains     |
 | `@@\|\|safe.foo.com^`      | never blocked                    |
 

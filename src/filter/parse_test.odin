@@ -214,6 +214,26 @@ test_a_domain_wildcard_prefix_covers_only_what_is_under_it :: proc(t: ^testing.T
 }
 
 @(test)
+test_an_anchored_wildcard_prefix_covers_only_what_is_under_it :: proc(t: ^testing.T) {
+	/*
+	`||*.example^` is how the AdGuard DNS filter writes "every host under
+	example, not example itself" (#323). The `*.` sits after the anchor, so it
+	has to be read there too, or the wildcard check drops the rule.
+	*/
+	src := "||*.exaapi.com^\n"
+	testing.expect_value(t, matches(src, .Adblock, "x.exaapi.com."), Decision.Blocked)
+	testing.expect_value(t, matches(src, .Adblock, "deep.x.exaapi.com."), Decision.Blocked)
+	testing.expect_value(t, matches(src, .Adblock, "exaapi.com."), Decision.None)
+	testing.expect_value(t, matches(src, .Adblock, "xexaapi.com."), Decision.None)
+	testing.expect_value(t, matches("@@||*.ok.example^\n", .Adblock, "a.ok.example."), Decision.Allowed)
+	// A second wildcard is still a pattern DNS cannot express.
+	testing.expect_value(t, matches("||*.*.exaapi.com^\n", .Adblock, "a.b.exaapi.com."), Decision.None)
+	// `$badfilter` cancels it in either spelling of the same rule.
+	testing.expect_value(t, matches("||*.exaapi.com^\n||*.exaapi.com^$badfilter\n", .Adblock, "x.exaapi.com."), Decision.None)
+	testing.expect_value(t, matches("*.exaapi.com\n||*.exaapi.com^$badfilter\n", .Adblock, "x.exaapi.com."), Decision.None)
+}
+
+@(test)
 test_a_domain_list_still_understands_an_adblock_entry :: proc(t: ^testing.T) {
 	// Mixed lists are common enough that the domain parser hands these over
 	// rather than dropping them.
