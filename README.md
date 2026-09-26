@@ -404,6 +404,12 @@ upstream:
 
 `race` multiplies upstream traffic by the number of servers.
 
+However many servers and `attempts` there are, a query waits at most about two
+`timeout`s on them (`race`: one) before it gives up with SERVFAIL. A dead first
+server still hands over to the second inside the query, which is asked with its
+full `timeout`; a third is left for the next query, by which time the dead ones
+are on their way to the cooldown below.
+
 `bootstrap` matters: elodin resolves upstream hostnames itself rather than
 through the system resolver, since on a machine where elodin *is* the system
 resolver the latter would come straight back to a server that has not started
@@ -896,8 +902,8 @@ hundred, and the clients that arrive while it is running are served the expired
 copy at once rather than queued behind it.
 
 The timer is measured against the client's own resolver, not against the
-upstream. Without it the fallback waits for `upstream.attempts` rounds over
-every server — ten seconds with the defaults and one upstream — by which time a
+upstream. Without it the fallback waits out the upstream budget of two
+`upstream.timeout`s — ten seconds with the defaults — by which time a
 glibc stub has given up at five and systemd-resolved sooner, so the expired
 answer arrived after the client had already failed. Setting it to `0` restores
 that: the client waits the whole upstream budget out. An upstream that *answers*

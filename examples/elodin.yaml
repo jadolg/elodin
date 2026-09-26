@@ -351,8 +351,8 @@ cache:
   # answer instead - RFC 8767 section 5's client response timer. It has to fire
   # before the client's own resolver gives up, which for a glibc stub is five
   # seconds, so it is measured against the stub and not against the upstream:
-  # without it the fallback waits out attempts x servers x upstream.timeout,
-  # which is ten seconds with the defaults and one upstream, and the answer
+  # without it the fallback waits out two upstream.timeouts, which is ten
+  # seconds with the defaults, and the answer
   # arrives after the client has already failed.
   #
   # The refresh is not cancelled when the timer fires. It carries on and writes

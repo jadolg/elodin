@@ -60,8 +60,8 @@ Refreshes that may be in flight at once, for the whole server.
 A ceiling rather than a table that grows, because what decides how many
 distinct expired names are being asked for at once is whoever is asking. Each
 refresh holds a worker of the query pool for as long as the upstream takes to
-fail, which with a blackholed upstream is the full `attempts` x servers x
-`timeout` - so an unbounded number of them is the query pool spent on refreshes
+fail, which with a blackholed upstream is the group's whole budget of two
+`timeout`s - so an unbounded number of them is the query pool spent on refreshes
 while the clients they were started for are already being answered from the
 cache.
 
@@ -154,8 +154,8 @@ How many refreshes this server will run at once.
 
 A quarter of the query pool, and the figure is about a burst rather than a
 steady state. A refresh holds a worker for as long as the upstream takes to
-fail, which against a blackholed one is the whole `attempts` x servers x
-`timeout`; the client that started it holds a second worker for up to
+fail, which against a blackholed one is the group's whole budget of two
+`timeout`s; the client that started it holds a second worker for up to
 `cache.stale_timeout`. So a burst of queries for that many distinct expired
 names at once costs twice the ceiling in workers, and a quarter leaves half the
 pool for the clients that are not waiting on any of this.

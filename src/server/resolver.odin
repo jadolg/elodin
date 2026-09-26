@@ -1468,10 +1468,10 @@ resolve_query :: proc(
 	And this is as far as a client waits on an expired entry's refresh.
 
 	Everything below goes to an upstream, and how long that takes is not this
-	client's to spend: `upstream.resolve` gives up only after `attempts` rounds
-	over every server, which with the defaults is ten seconds against one
-	blackholed upstream and twenty against two, while a glibc stub gives up at
-	five (`RES_TIMEOUT`) and systemd-resolved sooner. So the answer the whole
+	client's to spend: `upstream.resolve` gives up only once it has waited two
+	timeouts, which with the defaults is ten seconds against blackholed
+	upstreams, while a glibc stub gives up at five (`RES_TIMEOUT`) and
+	systemd-resolved sooner. So the answer the whole
 	setting exists to produce arrived after the client had already failed, and
 	`serve_stale` bought nothing in the one outage it was turned on for - an
 	upstream that is unreachable rather than answering (issue #164).
@@ -1870,7 +1870,7 @@ resolve_query :: proc(
 	Unless that group is parked, in which case the apex `DS` skips it.
 
 	`group_reachable` argues it: a group whose every upstream sits in its failure
-	cooldown still costs `attempts` rounds over every server before returning, so
+	cooldown still costs its budget of two timeouts before returning, so
 	with the default five-second timeout an upstream that has gone away is ten
 	seconds of waiting before the route is asked in its place. A validating stub
 	gives up in two to five, so the deployment the carve-out protects - an

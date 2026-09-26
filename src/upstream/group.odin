@@ -198,8 +198,9 @@ whose rcode the client can read - and everything else about the sweep is common
 to both, so it is written once here.
 
 Transport failures are deliberately not retried: `resolve` has already exhausted
-them, every server for `attempts` rounds. What it leaves unretried is the reply
-that did arrive and was no use, so that is what this asks again.
+them, every server for `attempts` rounds within its budget of two timeouts.
+What it leaves unretried is the reply that did arrive and was no use, so that
+is what this asks again.
 */
 @(private)
 resolve_insisting :: proc(
@@ -701,6 +702,33 @@ resolve_sequential :: proc(
 ) {
 	last_err := Error.Unhealthy
 
+	/*
+	Two timeouts of waiting per query, however many members and attempts there
+	are (issue #327). Without it this is `attempts` rounds over every member at
+	the full timeout each - twenty seconds as elodin ships, with two members
+	black-holing a name - holding one of a bounded set of query workers for four
+	times what a stub waits, so a client repeating such names empties the pool.
+	dnsmasq and Unbound bound a forward near one query timeout.
+
+	Two rather than one so that failover still happens inside the query: a dead
+	first member costs its timeout, and the second is asked with its own. The
+	rules are the sweep's in `resolve_insisting`, for its reasons. Checked after
+	each exchange, so the one that crosses the line finishes and the worst wait
+	is three timeouts rather than two. Every exchange is charged what it took,
+	on the tick clock so an NTP step cannot take the bound away; a failure that
+	cost nothing (an upstream whose hostname did not resolve) is simply passed
+	over, and a later round still gives a group that fails fast its retry. The
+	member's own timeout is never shortened to fit, since `exchange` counts a
+	timeout against the member and one cut short would park a spare for being
+	asked impatiently.
+
+	What it costs: a live member behind two dead ones is not reached until they
+	park, three queries later, as with the sweep. `strategy: race` is the
+	answer for a group that must not wait on a dead member at all.
+	*/
+	budget := 2 * g.timeout
+	spent: time.Duration
+
 	for round in 0 ..< g.attempts {
 		// The first pass skips upstreams in cooldown; a later pass takes them
 		// anyway, so a total outage still gets one honest try per server.
@@ -710,13 +738,19 @@ resolve_sequential :: proc(
 			if skip_unhealthy && !healthy(u) {
 				continue
 			}
+			before := time.tick_now()
 			resp, xerr := exchange(u, query, g.timeout, allocator)
 			if xerr == .None {
 				return resp, u, .None
 			}
+			spent += time.tick_since(before)
 			last_err = xerr
 			if unreachable != nil {
 				append(unreachable, u)
+			}
+			if spent >= budget {
+				logx.debugf("this query has waited %v on its upstreams, leaving the rest of the group unasked", spent)
+				return nil, nil, last_err
 			}
 		}
 	}

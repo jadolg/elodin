@@ -438,7 +438,7 @@ The price is worth stating in full, because it is paid by the client rather than
 by this server. `healthy` goes true again the moment the cooldown elapses, so
 against an uplink that blackholes packets - no ICMP, nothing to fail fast on -
 the first apex `DS` after each expiry runs the group to the end of its budget,
-`attempts` rounds over every server, twenty seconds at the defaults. A
+two timeouts, ten seconds at the defaults. A
 validating stub gives up in two to five and SERVFAILs the zone for that round,
 so what recovers in ten seconds is this server's willingness to try, not
 necessarily the client's answer. Bounding it means a deadline of this question's
@@ -508,7 +508,7 @@ that is not a rounding error (issue #243):
     group only while every member is parked, and `healthy` goes true again the
     moment `COOLDOWN` elapses however many failures stand against the server, so
     the first apex `DS` after each expiry runs the group to the end of its budget
-    - `attempts` rounds over every server, twenty seconds at the defaults. A
+    - two timeouts, ten seconds at the defaults. A
     validating stub gives up in two to five, so it SERVFAILs the apex `DS` and
     with it every name in a zone whose own authority is answering in
     milliseconds, once per cooldown cycle.
