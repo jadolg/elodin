@@ -53,7 +53,7 @@ mise run itest            # integration tests against the built binary
 mise run leakcheck        # the same suite under AddressSanitizer
 mise run verify           # check + test + itest
 mise run check            # type-check with -vet -strict-style
-mise run fuzz             # build the dns, h2 and yaml libFuzzer targets
+mise run fuzz             # build the libFuzzer targets in src/fuzz
 mise run fuzz-regression  # replay the committed corpus through each of them
 mise run certs            # self-signed certificate for local DoT/DoH testing
 mise run bench            # throughput, latency, CPU and memory (see bench/README.md)
@@ -2703,12 +2703,18 @@ which is how the certificate reload was found to be freeing a context a
 connection was still about to read. It is not part of `mise run verify`, which is
 the fast local gate; CI runs it on every change.
 
-**Fuzzing** covers the three parsers that read bytes somebody else chose: the DNS
-wire codec (`dns.decode_message`, plus `dns.truncated_response`, which the UDP
-read loop reaches for a rate-limited query without decoding it first), the HPACK
-decoder, and the YAML parser, which reads the configuration file. The blocklist
-formats are not covered: a downloaded list goes to `filter.parse_list` rather
-than through the YAML parser, and has no target of its own. Odin has no
+**Fuzzing** covers the parsers that read bytes somebody else chose, one
+libFuzzer target each under `src/fuzz/`: the DNS wire codec (`dns`:
+`dns.decode_message`, plus `dns.truncated_response`, which the UDP read loop
+reaches for a rate-limited query without decoding it first), the HPACK decoder
+(`h2`), the YAML parser that reads the configuration file (`yaml`), the HTTP/1.1
+response reader that list hosts and DoH upstreams write into (`http`), the
+blocklist formats (`list`), the DNSSEC RDATA parsers and the DER that signature
+checking builds out of an upstream's keys and signatures (`dnssec`), the h2 frame
+layer and stream state machine on both the server and client side (`h2conn`),
+and the HTTP/1.1 request parser DoH clients write into (`doh`). The two HTTP
+readers take a socket, so their targets hand them one end of a socket pair the
+input has been written into. Odin has no
 `-fsanitize=fuzzer`, so
 `mise run fuzz` emits LLVM IR per target and has clang instrument and link it
 into a libFuzzer binary at `bin/fuzz_*`, with ASan on and bounds checks still in.

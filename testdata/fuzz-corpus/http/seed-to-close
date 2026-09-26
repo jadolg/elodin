@@ -1,0 +1,4 @@
+HTTP/1.0 200 OK
+Connection: close
+
+0.0.0.0 ads.example

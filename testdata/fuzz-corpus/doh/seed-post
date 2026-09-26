@@ -1,0 +1,6 @@
+POST /dns-query HTTP/1.1
+Host: dns.example
+Content-Type: application/dns-message
+Content-Length: 4
+
+abcd

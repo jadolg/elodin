@@ -1,7 +1,7 @@
 name: Fuzz
 
 # A per-PR run is the wrong shape for fuzzing: too slow to gate a merge on,
-# and a few minutes on three targets finds little that a longer, unattended
+# and a few minutes per target finds little that a longer, unattended
 # run would not. This runs on a schedule instead, with a corpus that persists
 # across runs via actions/cache — restore-keys picks up the most recent
 # corpus for a target so coverage compounds night over night rather than
@@ -18,10 +18,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [dns, h2, yaml]
+        target: [dns, h2, yaml, http, list, dnssec, h2conn, doh]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Install OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
       - uses: jdx/mise-action@v4
         with:
           install: true

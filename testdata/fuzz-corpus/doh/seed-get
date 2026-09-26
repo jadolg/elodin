@@ -1,0 +1,4 @@
+GET /dns-query?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE HTTP/1.1
+Host: dns.example
+Accept: application/dns-message
+
