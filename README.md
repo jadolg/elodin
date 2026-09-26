@@ -749,7 +749,7 @@ Where the parent said nothing — no reply, SERVFAIL, REFUSED, a NOERROR with th
 wrong thing in it, or its group already in that cooldown — the route's answer
 goes to the client and is not cached. It stood in for a fact nothing
 established, and keeping it would hold the very broken chain this carve-out
-exists to prevent over the zone for [`cache.negative_ttl`](#cache) after a
+exists to prevent over the zone for up to [`cache.negative_ttl`](#cache) after a
 single lost round trip. The next query asks again. An answer the route gave
 because the parent *did* say something — NXDOMAIN, or a DS record — is cached
 like any other, that statement about the public tree holding until the public
