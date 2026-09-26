@@ -117,7 +117,9 @@ description = "Replay the committed fuzz corpus through each target once"
 depends = ["fuzz"]
 run = """
 for t in ${FUZZ_TARGETS:-$(cd src/fuzz && ls -d */ | tr -d / | grep -vx harness)}; do
-  ASAN_OPTIONS=detect_leaks=0 ./bin/fuzz_$t -runs=0 testdata/fuzz-corpus/$t || exit 1
+  # Checked here as well as used nightly, so a malformed .max_len fails its PR.
+  len=$(scripts/fuzz-max-len.sh $t) || exit 1
+  ASAN_OPTIONS=detect_leaks=0 ./bin/fuzz_$t -runs=0 $len testdata/fuzz-corpus/$t || exit 1
 done
 """
 

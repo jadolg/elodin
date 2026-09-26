@@ -2756,8 +2756,9 @@ open-ended, so `.github/workflows/fuzz.yml` does it nightly
 against a corpus cached between runs, and `workflow_dispatch` runs it on demand
 after a parser is touched. A target that needs inputs longer than libFuzzer's
 default 4 KB puts the cap in `testdata/fuzz-corpus/<target>.max_len`, next to
-its optional `.dict`: one line that is a bare number, and `#` lines for why. What
-CI runs on every change is
+its optional `.dict`: one line that is a bare number, and only `#` lines for why
+(`scripts/fuzz-max-len.sh` reads it, and refuses anything else). What CI runs on
+every change is
 `mise run fuzz-regression`, which replays `testdata/fuzz-corpus/` through each
 target once and generates nothing new, so a crash fuzzing has already found stays
 found.
