@@ -13,12 +13,27 @@ on:
   workflow_dispatch: {}
 
 jobs:
+  # The matrix is every directory under src/fuzz but the shared harness, the
+  # same listing `mise run fuzz` builds from, so a new target is fuzzed nightly
+  # without anyone having to add it here.
+  targets:
+    runs-on: ubuntu-latest
+    outputs:
+      list: ${{ steps.list.outputs.list }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: list
+        run: |
+          list=$(cd src/fuzz && ls -d */ | tr -d / | grep -vx harness | jq -Rsc 'split("\n") | map(select(. != ""))')
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+
   fuzz:
     name: Fuzz (${{ matrix.target }})
+    needs: targets
     strategy:
       fail-fast: false
       matrix:
-        target: [dns, h2, yaml, http, list, dnssec, h2conn, doh]
+        target: ${{ fromJSON(needs.targets.outputs.list) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
