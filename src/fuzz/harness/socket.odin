@@ -31,9 +31,10 @@ feed :: proc(data: []u8) -> (read_end: net.TCP_Socket, peer: net.TCP_Socket, ok:
 	// than blocking a send nobody is reading, which libFuzzer would report as a
 	// timeout in the parser.
 	posix.fcntl(pair[1], .SETFL, c.int(posix.O_NONBLOCK))
+	want := min(len(data), MAX_FEED)
 	sent := 0
-	for sent < min(len(data), MAX_FEED) {
-		n := posix.send(pair[1], raw_data(data[sent:]), uint(min(len(data), MAX_FEED) - sent), {})
+	for sent < want {
+		n := posix.send(pair[1], raw_data(data[sent:]), uint(want - sent), {})
 		if n <= 0 {
 			break
 		}

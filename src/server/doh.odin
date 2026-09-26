@@ -493,6 +493,10 @@ fuzz_http_requests :: proc(conn: Conn) {
 		// As `serve_doh` does between requests, so nothing the next one reads can
 		// lean on this one's scratch.
 		free_all(context.temp_allocator)
+		// And, as there, nothing is read past a request that ends the connection.
+		if !req.keep_alive {
+			return
+		}
 	}
 }
 

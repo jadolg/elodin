@@ -46,7 +46,13 @@ fuzz_one :: proc "c" (data: [^]u8, size: uint) -> i32 {
 		stream := upstream.Stream {
 			socket = socket,
 		}
-		_, _ = upstream.http_exchange(&stream, upstream.Http_Request{method = "GET", path = "/", host = "fuzz"})
+		// The body on the tracked heap too, as a real caller's allocator frees:
+		// `read_chunked` grows it chunk by chunk and deletes it on every error.
+		_, _ = upstream.http_exchange(
+			&stream,
+			upstream.Http_Request{method = "GET", path = "/", host = "fuzz"},
+			context.temp_allocator,
+		)
 	}
 	return 0
 }
