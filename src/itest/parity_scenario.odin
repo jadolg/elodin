@@ -292,8 +292,9 @@ PARITY_NOT_BLOCKING :: []string {
 	"||xn--bcher-kva.parity.test^$client=192.0.2.1",
 }
 
-// The blocking scenario's pool: the usual one, and the allowed name inside the
-// blocked one, so the exception is asked about by name.
+// The blocking scenario's pool: the usual one, the allowed name inside the
+// blocked one, so the exception is asked about by name, and the subtree-only
+// zone itself, so its apex is asked about too.
 PARITY_BLOCKING_POOL := []string {
 	"parity.test.",
 	"www.parity.test.",
