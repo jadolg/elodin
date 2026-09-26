@@ -343,12 +343,13 @@ resolve_insisting :: proc(
 
 	Waiting, and not attempts, because the two are not the same thing at all.
 	`exchange` refuses an upstream whose hostname it cannot resolve before it
-	sends anything - no bootstrap servers, or a bootstrap resolver that is down
-	- and that costs nothing and records no failure, so such a member never
-	parks and is in the way of every sweep for as long as it is configured.
-	Counting attempts would stop there every time and never reach the member
-	behind it, which is issue #309's own failure and one that does not heal. A
-	failure that cost no time is simply passed over.
+	sends anything. With no bootstrap servers that costs nothing, and counting
+	attempts would stop there on every sweep until the member parked and never
+	reach the member behind it, which is issue #309's own failure. A failure
+	that cost no time is simply passed over. With a bootstrap resolver that is
+	down it costs seconds, and is charged like any other wait; `exchange`
+	records it as a failure, so the member parks like a dead one rather than
+	spending the budget on every query (issue #327).
 
 	Nor by dividing the timeout between the members, which was tried and taken
 	back out: `exchange` counts a timeout as a failure, so a member cut off by a
@@ -401,12 +402,8 @@ resolve_insisting :: proc(
 		// Charged whatever the exchange did, because what is being bounded is
 		// the client's wait and an upstream can spend the time either way: a
 		// member that recurses for most of the timeout and then says SERVFAIL
-		// has cost this query exactly what a member that said nothing did. An
-		// unresolved hostname excepted, for the reason `resolve_sequential`
-		// gives.
-		if xerr != .Not_Resolved {
-			spent += time.tick_since(before)
-		}
+		// has cost this query exactly what a member that said nothing did.
+		spent += time.tick_since(before)
 		// A failed exchange is left to `exchange`, which says why.
 		if xerr == .None && acceptable(resp) {
 			// Said here rather than above, because what makes a filtering
@@ -719,12 +716,19 @@ resolve_sequential :: proc(
 	rules are the sweep's in `resolve_insisting`, for its reasons. Checked after
 	each exchange, so the one that crosses the line finishes and the worst wait
 	is three timeouts rather than two. Every exchange is charged what it took,
-	on the tick clock so an NTP step cannot take the bound away; an upstream
-	whose hostname did not resolve is passed over uncharged (see below), and a
-	later round still gives a group that fails fast its retry. The
+	on the tick clock so an NTP step cannot take the bound away, and a later
+	round still gives a group that fails fast its retry. The
 	member's own timeout is never shortened to fit, since `exchange` counts a
 	timeout against the member and one cut short would park a spare for being
 	asked impatiently.
+
+	The invariant, which the two halves of this depend on each other for: every
+	wait is charged, and every failure that costs waiting counts towards
+	parking the member. Charging alone would let a member that never parks -
+	an upstream whose bootstrap resolver has gone quiet, before `exchange`
+	recorded that failure - spend the budget on every query and keep the live
+	members behind it unasked for good; not charging it would leave the wait
+	unbounded again. With both, it costs what a dead member costs.
 
 	What it costs: a live member behind two dead ones is not reached until they
 	park, three queries later, as with the sweep. `strategy: race` is the
@@ -732,8 +736,11 @@ resolve_sequential :: proc(
 	*/
 	budget := 2 * g.timeout
 	spent: time.Duration
+	// The round, from 1, in which this query asked each member; 0 for not yet.
+	asked := make([]int, len(g.servers), allocator)
+	defer delete(asked, allocator)
 
-	for round in 0 ..< g.attempts {
+	for round in 1 ..= g.attempts {
 		/*
 		The first round skips upstreams in cooldown; a later one takes them
 		anyway, so a total outage still gets an honest try - and takes them
@@ -741,27 +748,38 @@ resolve_sequential :: proc(
 		the budget that order decides who is asked at all: one member gone quiet
 		and one parked that has come back would otherwise spend the second
 		timeout on the quiet one again and never reach the other.
+
+		By what this query asked, not by `healthy` read again: the quiet member
+		may have parked on this query's own timeout, or the parked one come out
+		of its cooldown meanwhile, and either would put them in the wrong pass.
 		*/
-		for pass in 0 ..< (1 if round == 0 else 2) {
+		for pass in 0 ..< (1 if round == 1 else 2) {
 			for offset in 0 ..< len(g.servers) {
-				u := g.servers[(start + offset) % len(g.servers)]
-				parked := !healthy(u)
-				if round == 0 && parked || round > 0 && parked != (pass == 0) {
+				i := (start + offset) % len(g.servers)
+				u := g.servers[i]
+				skip: bool
+				if pass == 0 {
+					// Members this query has not asked yet; in the first round
+					// only those out of their cooldown.
+					skip = asked[i] != 0 || round == 1 && !healthy(u)
+				} else {
+					// Then those it asked in an earlier round, asked again.
+					skip = asked[i] == round
+				}
+				if skip {
 					continue
 				}
+				asked[i] = round
 				before := time.tick_now()
 				resp, xerr := exchange(u, query, g.timeout, allocator)
 				if xerr == .None {
 					return resp, u, .None
 				}
-				// A hostname that did not resolve is not charged even when the
-				// bootstrap took time to say so: `exchange` records no failure
-				// for it, so the member never parks, and charging it would let a
-				// down bootstrap resolver spend the budget on every query and
-				// keep the live members behind it unasked.
-				if xerr != .Not_Resolved {
-					spent += time.tick_since(before)
-				}
+				// Charged whatever it was, a hostname the bootstrap took seconds
+				// to fail on included; `exchange` records that failure like any
+				// other, so such a member parks rather than taking the budget on
+				// every query.
+				spent += time.tick_since(before)
 				last_err = xerr
 				if unreachable != nil {
 					append(unreachable, u)
