@@ -26,6 +26,29 @@ MAX_HEADER_BYTES :: 16 * 1024
 MAX_DOH_BODY :: 64 * 1024
 
 /*
+Whether a POST's Content-Type names the DoH media type, for both HTTP/1.1 and
+HTTP/2.
+
+RFC 9110 8.3.1: the type and subtype are case-insensitive, and parameters follow
+a `;`. So it is the media type before any parameters, compared whole and without
+regard to case - not a prefix, which let `application/dns-messageZZZZ` through,
+and not a case-sensitive one, which refused `Application/DNS-Message`. The fold is
+ASCII only: `strings.equal_fold` folds Unicode, and would take the long s (U+017F)
+in `application/dns-mes\u017fage` for an `s`. A missing Content-Type is accepted
+as before.
+*/
+doh_content_type_ok :: proc(value: string) -> bool {
+	if value == "" {
+		return true
+	}
+	media := value
+	if semi := strings.index_byte(media, ';'); semi >= 0 {
+		media = media[:semi]
+	}
+	return dns.name_equal_fold(trim_ows(media), DOH_CONTENT_TYPE)
+}
+
+/*
 How much of a refused request `http_linger` reads and throws away before the
 connection closes on it, how long it waits for any one read, and how long the
 whole of it may take.
@@ -372,6 +395,7 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 	// Counted rather than flagged off `req.host`: an empty Host is a field the
 	// client sent, and a second one has to be told from it.
 	hosts := 0
+	content_types := 0
 	for {
 		header := http_line(r) or_return
 		if header == "" {
@@ -423,7 +447,17 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 				req.keep_alive = false
 			}
 		case strings.equal_fold(name, "content-type"):
-			req.content_type = hold(value)
+			// RFC 9110 5.3: a singleton field, and the loop keeps the last of a
+			// repeat while a hop in front may judge the first. So a repeat is a
+			// 400, as Host's is, rather than a media type picked for the check.
+			content_types += 1
+			if content_types > 1 {
+				return {}, 400, false
+			}
+			// Only OWS off it, as Host's: `value` has been through
+			// `strings.trim_space`, which would make a type ending in a
+			// non-breaking space into this one.
+			req.content_type = hold(trim_ows(header[colon + 1:]))
 		case strings.equal_fold(name, "host"):
 			/*
 			RFC 9112 3.2: a request carrying more than one Host is a 400, whether
@@ -637,7 +671,7 @@ serve_doh_request :: proc(
 	query: []u8
 	switch {
 	case req.method == "POST":
-		if req.content_type != "" && !strings.has_prefix(req.content_type, DOH_CONTENT_TYPE) {
+		if !doh_content_type_ok(req.content_type) {
 			return send_http_error(conn, "doh", 415, "unsupported media type", req.keep_alive)
 		}
 		query = req.body

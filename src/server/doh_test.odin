@@ -1,5 +1,6 @@
 package server
 
+import "core:fmt"
 import "core:mem"
 import "core:mem/virtual"
 import "core:net"
@@ -10,6 +11,7 @@ import "core:thread"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:h2"
 import "elodin:upstream"
 
 /*
@@ -1051,7 +1053,7 @@ test_content_length_is_strict_decimal :: proc(t: ^testing.T) {
 		5.1). Skipped rather than refused, each leaves the body unread and the
 		next request starting in the middle of it.
 		*/
-		{"Content-Length: 4 \r\n", "abcd", false, "a non-breaking space after the digits"},
+		{"Content-Length: 4\u00a0\r\n", "abcd", false, "a non-breaking space after the digits"},
 		{"X-Fold: one\r\n Content-Length: 4\r\n", "abcd", false, "a folded continuation line"},
 		{"Content-Length : 4\r\n", "abcd", false, "space before the colon"},
 		{"Content-Length\t: 4\r\n", "abcd", false, "a tab before the colon"},
@@ -1902,4 +1904,107 @@ test_doh_a_timeout_near_the_range_limit_keeps_connections :: proc(t: ^testing.T)
 		!doh_question_overdue(&s, time.tick_add(now, -time.Second), now),
 		"a connection one second old was overdue",
 	)
+}
+
+/*
+A POST's Content-Type is judged by its media type, whole and without regard to
+ASCII case (RFC 9110 8.3.1), on the HTTP/2 path and so through the predicate the
+HTTP/1.1 path shares. A prefix match let `application/dns-message-bogus` in and
+a case-sensitive one turned `Application/DNS-Message` away (#304); a Unicode fold
+would take the long s (U+017F) for an `s`.
+*/
+@(test)
+test_doh_content_type_is_the_media_type_folded :: proc(t: ^testing.T) {
+	Case :: struct {
+		content_type: string,
+		accepted:     bool,
+	}
+	CASES := []Case {
+		{"", true},
+		{"application/dns-message", true},
+		{"Application/DNS-Message", true},
+		{"APPLICATION/DNS-MESSAGE", true},
+		{"application/dns-message; charset=utf-8", true},
+		{"application/dns-message ;q=1", true},
+		{"application/dns-message-bogus", false},
+		{"application/dns-messageZZZZ", false},
+		{"application/dns-message2", false},
+		{"application/dns-mes\u017fage", false},
+		{"application/dns", false},
+		{"application/dns-messag", false},
+		{"text/plain", false},
+		{";application/dns-message", false},
+	}
+	body := make([]u8, dns.HEADER_SIZE, context.temp_allocator)
+	for c in CASES {
+		req := h2.Request {
+			method       = "POST",
+			path         = "/dns-query",
+			content_type = c.content_type,
+			body         = body,
+		}
+		_, status, _, ok := h2_query_message(&req)
+		testing.expectf(t, ok == c.accepted, "%q: accepted %v, want %v", c.content_type, ok, c.accepted)
+		if !c.accepted {
+			testing.expectf(t, status == 415, "%q: status %d, want 415", c.content_type, status)
+		}
+	}
+}
+
+// A repeated Content-Type is a 400 on HTTP/1.1: the reader kept the last of the
+// two, and a hop in front may have judged the first.
+// An empty first one counts too: the counter is not the stored value.
+@(test)
+test_doh_repeated_content_type_is_refused :: proc(t: ^testing.T) {
+	for first in ([]string{"text/plain", ""}) {
+		raw := fmt.tprintf(
+			"POST /dns-query HTTP/1.1\r\nHost: dns.example\r\nContent-Type: %s\r\nContent-Type: application/dns-message\r\nContent-Length: 4\r\n\r\nabcd",
+			first,
+		)
+		_, status, parsed, ok := read_request_over_loopback(t, raw, "a repeated Content-Type")
+		if !ok {
+			return
+		}
+		testing.expectf(t, !parsed, "a repeated Content-Type after %q was accepted", first)
+		testing.expect_value(t, status, 400)
+		free_all(context.temp_allocator)
+	}
+}
+
+/*
+The HTTP/1.1 reader hands the predicate the Content-Type with only OWS off it.
+`strings.trim_space` also takes a non-breaking space, a vertical tab or a form
+feed off the end - none of them OWS - and a type a front end judged with one
+of those on it became `application/dns-message` here, while HTTP/2 kept the
+character and refused it.
+*/
+@(test)
+test_doh_content_type_keeps_what_is_not_ows :: proc(t: ^testing.T) {
+	Case :: struct {
+		value:    string,
+		accepted: bool,
+	}
+	CASES := []Case {
+		{"application/dns-message", true},
+		{"\tApplication/DNS-Message \t", true},
+		{"application/dns-message\u00a0", false},
+		{"\u00a0application/dns-message", false},
+		{"application/dns-message\x0b", false},
+		{"application/dns-message\x0c", false},
+	}
+	for c in CASES {
+		raw := fmt.tprintf(
+			"POST /dns-query HTTP/1.1\r\nHost: dns.example\r\nContent-Type: %s\r\nContent-Length: 4\r\n\r\nabcd",
+			c.value,
+		)
+		req, _, parsed, ok := read_request_over_loopback(t, raw, c.value)
+		if !ok {
+			return
+		}
+		if testing.expectf(t, parsed, "%q: the request was not read", c.value) {
+			got := doh_content_type_ok(req.content_type)
+			testing.expectf(t, got == c.accepted, "%q: read as %q, accepted %v, want %v", c.value, req.content_type, got, c.accepted)
+		}
+		free_all(context.temp_allocator)
+	}
 }

@@ -782,6 +782,7 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 	have_method, have_scheme, have_path, have_authority: bool
 	// Set by the first ordinary field, which is where the pseudo-headers end.
 	seen_regular: bool
+	have_content_type: bool
 
 	for f in headers {
 		if len(f.name) == 0 || !field_value_is_valid(f.value) {
@@ -845,6 +846,18 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 			if f.value != "trailers" {
 				return true
 			}
+		case "content-type":
+			/*
+			RFC 9110 5.3: a singleton field, and a recipient may treat a repeat
+			as an error. The `:path` argument above applies: `take` keeps the
+			first non-empty value, a hop in front may have judged another, and
+			the media type is what decides whether the body is taken for a DNS
+			message. Counted here, so an empty first one is a repeat too.
+			*/
+			if have_content_type {
+				return true
+			}
+			have_content_type = true
 		}
 	}
 

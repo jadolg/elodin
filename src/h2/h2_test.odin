@@ -2116,6 +2116,29 @@ test_malformed_requests_are_reset :: proc(t: ^testing.T) {
 				{"te", "gzip"},
 			},
 		},
+		// RFC 9110 5.3: Content-Type is a singleton.
+		{
+			"repeated content-type",
+			{
+				{":method", "POST"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+				{"content-type", "text/plain"},
+				{"content-type", "application/dns-message"},
+			},
+		},
+		{
+			"repeated content-type, the first empty",
+			{
+				{":method", "POST"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+				{"content-type", ""},
+				{"content-type", "text/plain"},
+			},
+		},
 		// 8.2.1: field names are lowercase, and are tokens.
 		{
 			"uppercase field name",

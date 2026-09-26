@@ -151,6 +151,36 @@ run_transport_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	start_case(r, "doh: Content-Type is the media type, whole and folded (#304)")
+	{
+		for c in DOH_CONTENT_TYPE_CASES {
+			req := build_http_request("POST", "/dns-query", c.content_type, query)
+			res := doh_raw(doh_port, string(req))
+			if check(r, res.ok, "%q: no HTTP response", c.content_type) {
+				check_eq_int(r, res.status, c.status, c.content_type)
+			}
+		}
+	}
+	end_case(r)
+
+	// The loop keeps the last of a repeat while a hop in front may judge the
+	// first, so a second Content-Type is refused rather than picked from.
+	start_case(r, "doh: a repeated Content-Type is a 400")
+	{
+		res := doh_raw(
+			doh_port,
+			fmt.tprintf(
+				"POST /dns-query HTTP/1.1\r\nHost: elodin.local\r\nContent-Type: text/plain\r\nContent-Type: application/dns-message\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+				len(query),
+				string(query),
+			),
+		)
+		if check(r, res.ok, "no HTTP response") {
+			check_eq_int(r, res.status, 400, "status")
+		}
+	}
+	end_case(r)
+
 	start_case(r, "doh: GET with unpadded base64url")
 	{
 		res := doh_get(doh_port, "/dns-query", query)
@@ -718,4 +748,31 @@ run_transport_cases :: proc(r: ^Runner) {
 		}
 	}
 	end_case(r)
+}
+
+/*
+POST Content-Types and the status each earns, over HTTP/1.1 and HTTP/2 alike.
+RFC 9110 8.3.1: the media type is case-insensitive and parameters follow a `;`;
+anything else naming another type is a 415. The long s (U+017F) folds to `s`
+under Unicode rules, which HTTP's ASCII case-insensitivity does not include,
+and a non-breaking space is not OWS, so it is part of the value.
+*/
+DOH_CONTENT_TYPE_CASES := [?]struct {
+	content_type: string,
+	status:       int,
+}{
+	{"application/dns-message", 200},
+	{"Application/DNS-Message", 200},
+	{"APPLICATION/DNS-MESSAGE", 200},
+	{"application/dns-message; charset=utf-8", 200},
+	{"application/dns-message ;q=1", 200},
+	{"application/dns-message-bogus", 415},
+	{"application/dns-messageZZZZ", 415},
+	{"application/dns-message2", 415},
+	{"application/dns-mes\u017fage", 415},
+	{"application/dns", 415},
+	{"application/dns-messag", 415},
+	{"text/plain", 415},
+	{";application/dns-message", 415},
+	{"application/dns-message\u00a0", 415},
 }

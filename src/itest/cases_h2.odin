@@ -160,6 +160,23 @@ run_h2_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	start_case(r, "h2: Content-Type is the media type, whole and folded (#304)")
+	{
+		for c in DOH_CONTENT_TYPE_CASES {
+			hc, cok := h2_connect(doh_port)
+			if !check(r, cok, "cannot open an h2 connection") {
+				break
+			}
+			check(r, h2_send_request(hc, 1, "POST", "/dns-query", query, content_type = c.content_type), "cannot send")
+			if check(r, h2_collect(hc, []u32{1}), "%q: stream 1 never completed", c.content_type) {
+				res, _ := h2_stream(hc, 1)
+				check_eq_int(r, res.status, c.status, c.content_type)
+			}
+			h2_close(hc)
+		}
+	}
+	end_case(r)
+
 	start_case(r, "h2: a header block split across CONTINUATION is accepted")
 	{
 		c, cok := h2_connect(doh_port)
@@ -373,6 +390,8 @@ run_h2_cases :: proc(r: ^Runner) {
 			{"transfer-encoding", {"transfer-encoding", "chunked"}},
 			{"connection", {"connection", "keep-alive"}},
 			{"te other than trailers", {"te", "gzip"}},
+			// A second one after the one every POST carries (#304).
+			{"a repeated content-type", {"content-type", "application/dns-message"}},
 			{"an uppercase field name", {"X-Smuggled", "1"}},
 		}
 		for tc in cases {
