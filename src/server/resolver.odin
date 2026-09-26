@@ -181,6 +181,13 @@ Stats :: struct {
 	wrong"; this is one specific answer to it, in a figure small enough to see.
 	*/
 	unreadable_rcode: u64,
+	/*
+	Answers counted in `cached` that the cache never held: an identical query
+	in flight forwarded them a moment before (see `inflight.odin`). They are
+	cache misses, so without this `cached` climbs past `cache_hits` with nothing
+	to account for the gap.
+	*/
+	coalesced:        u64,
 }
 
 Server :: struct {
@@ -1101,6 +1108,9 @@ resolve_query :: proc(
 	it; see `ceiling_ede`.
 	*/
 	ede: ^u16 = nil,
+	// Set on the second pass of a follower whose flight landed with nothing to
+	// share, so it does not start over again. See `inflight.odin`.
+	rejoined := false,
 ) -> (
 	response: []u8,
 	outcome: Outcome,
@@ -1552,7 +1562,7 @@ resolve_query :: proc(
 			flight = joined
 		} else if joined != nil {
 			patience := flight_patience(route_group(s, q.name, q.type))
-			answer, shared_ede, failed, _ := flight_follow(s, joined, patience, allocator)
+			answer, shared_ede, failed, landed := flight_follow(s, joined, patience, allocator)
 			if answer != nil {
 				shared := Cached_Answer {
 					wire      = answer,
@@ -1563,16 +1573,27 @@ resolve_query :: proc(
 				}
 				return serve_from_cache(s, shared, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
 			}
-			// The upstream gave the leader nothing, and would give this query
+			if landed && !rejoined {
+				return resolve_query(
+					s,
+					query,
+					msg,
+					proto,
+					client,
+					limit,
+					cookie,
+					started,
+					spent,
+					allocator,
+					shared_worker,
+					rejoined = true,
+					ede = ede,
+				)
+			}
+			// The upstream gave two leaders nothing, and would give this query
 			// the same: the failure branch below, without the wait.
 			if failed {
-				if stale_hit.wire != nil {
-					return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
-				}
-				sync.atomic_add(&s.stats.failed, 1)
-				out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
-				log_query(s, client, proto, q, .Failed, "upstream", started)
-				return out, .Failed, built
+				return upstream_failed(s, stale_hit, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
 			}
 		}
 	}
@@ -2232,13 +2253,7 @@ resolve_query :: proc(
 			out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
 			return out, .Failed, built
 		}
-		if stale_hit.wire != nil {
-			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
-		}
-		sync.atomic_add(&s.stats.failed, 1)
-		out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
-		log_query(s, client, proto, q, .Failed, "upstream", started)
-		return out, .Failed, built
+		return upstream_failed(s, stale_hit, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
 	}
 
 	/*
@@ -2666,10 +2681,21 @@ resolve_query :: proc(
 	if s.cfg.cache.enabled && decoded.full && !unproven_apex_ds {
 		cache.put(s.answers, key, resp, decoded.msg, generation, ede = answer_ede)
 	}
-	// What was just stored, or would have been: `settle_ad_bit` below writes
-	// into the leader's own copy, and each follower settles its own.
+	/*
+	What was just stored, or would have been, handed over and landed before
+	`settle_ad_bit` below writes into it - each follower settles its own copy.
+
+	Not a FORMERR. That rcode is the upstream reading this message, which carries
+	more than the key does - records of the client's own in a section a query
+	leaves empty, which an upstream may refuse as malformed - so a follower
+	forwards its own question rather than take a refusal of one it did not send.
+	*/
 	if flight != nil {
-		flight_share(s, flight, dns.clone_message_bytes(resp, allocator), answer_ede)
+		if dns.peek_rcode(resp) != .Form_Err {
+			flight_share(s, flight, resp, answer_ede)
+		}
+		flight_land(s, flight)
+		flight = nil
 	}
 
 	sync.atomic_add(&s.stats.forwarded, 1)
@@ -2684,6 +2710,37 @@ resolve_query :: proc(
 	settle_ad_bit(resp, msg, validating)
 	log_query(s, client, proto, q, .Forwarded, answering_upstream(winner), started)
 	return resp, .Forwarded, true
+}
+
+// No answer from the upstream at all: the expired entry if one is held, SERVFAIL
+// if not. Shared by the exchange that failed and the followers of one.
+@(private)
+upstream_failed :: proc(
+	s: ^Server,
+	stale_hit: Cached_Answer,
+	query: []u8,
+	msg: dns.Message,
+	q: dns.Question,
+	proto: Protocol,
+	client: string,
+	limit: int,
+	validating: bool,
+	started: time.Time,
+	spent: ^int,
+	allocator: mem.Allocator,
+	ede: ^u16,
+) -> (
+	[]u8,
+	Outcome,
+	bool,
+) {
+	if stale_hit.wire != nil {
+		return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
+	}
+	sync.atomic_add(&s.stats.failed, 1)
+	out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
+	log_query(s, client, proto, q, .Failed, "upstream", started)
+	return out, .Failed, built
 }
 
 /*
@@ -3361,6 +3418,9 @@ serve_from_cache :: proc(
 		cache.note_stale_served(s.answers)
 	}
 	sync.atomic_add(&s.stats.cached, 1)
+	if hit.coalesced {
+		sync.atomic_add(&s.stats.coalesced, 1)
+	}
 	// Over this client's limit where the entry was stored for a client with a
 	// larger buffer, and left that way: `handle_query` fits it once
 	// `match_client_opt` has settled the OPT record, for the reason the

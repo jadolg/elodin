@@ -38,6 +38,10 @@ Mock :: struct {
 	srv:      ^Server,
 	// Never answer: the upstream is down for the leader and its followers.
 	silent:   bool,
+	// Lose the first query only, as a datagram on a bad path is lost.
+	drop_first: bool,
+	// The rcode the first query is answered with; every later one is NOERROR.
+	first:    dns.Rcode,
 	queries:  int,
 }
 
@@ -78,16 +82,16 @@ serve_mock :: proc(m: ^Mock) {
 				time.sleep(time.Millisecond)
 			}
 		}
-		if m.silent {
+		if m.silent || (m.drop_first && m.queries == 1) {
 			continue
 		}
-		reply := coalesce_reply(buf[0], buf[1], m.ttl)
+		reply := coalesce_reply(buf[0], buf[1], m.ttl, m.first if m.queries == 1 else .No_Error)
 		_, _ = net.send_udp(m.socket, reply, remote)
 	}
 }
 
 @(private = "file")
-coalesce_reply :: proc(hi, lo: u8, ttl: u32) -> []u8 {
+coalesce_reply :: proc(hi, lo: u8, ttl: u32, rcode: dns.Rcode) -> []u8 {
 	answer := make([]dns.Record, 1, context.temp_allocator)
 	answer[0] = dns.Record {
 		name  = QNAME,
@@ -106,6 +110,10 @@ coalesce_reply :: proc(hi, lo: u8, ttl: u32) -> []u8 {
 	msg.flags.qr = true
 	msg.flags.rd = true
 	msg.flags.ra = true
+	msg.flags.rcode = u8(rcode)
+	if rcode != .No_Error {
+		msg.answer = nil
+	}
 	wire, _, _ := dns.encode_message(msg, context.temp_allocator)
 	return wire
 }
@@ -159,6 +167,8 @@ run_burst :: proc(
 	ttl: u32 = 300,
 	silent := false,
 	timeout := 4 * time.Second,
+	first := dns.Rcode.No_Error,
+	drop_first := false,
 ) -> int {
 	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
 	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
@@ -205,6 +215,8 @@ run_burst :: proc(
 		hold_for = CLIENTS - 1,
 		srv      = &srv,
 		silent   = silent,
+		first    = first,
+		drop_first = drop_first,
 	}
 	mock := thread.create_and_start_with_poly_data(&m, serve_mock)
 	threads: [CLIENTS]^thread.Thread
@@ -251,18 +263,61 @@ test_an_uncacheable_answer_is_shared_with_the_queries_waiting_on_it :: proc(t: ^
 }
 
 /*
-And an upstream that gave the leader nothing is not asked again by every query
-that was waiting on it: each would wait out the same timeout for the same
-nothing, holding a worker twice as long as the leader did.
+An upstream that gave the leader nothing is asked once more, by one of the
+followers on behalf of the rest, and then not again: every follower waiting out
+the same timeout for the same nothing would hold a worker twice as long as the
+leader did.
 */
 @(test)
-test_followers_of_a_failed_exchange_do_not_ask_again :: proc(t: ^testing.T) {
+test_followers_of_a_failed_exchange_ask_once_more_and_no_further :: proc(t: ^testing.T) {
 	clients: [CLIENTS]Client
 	queries := run_burst(t, &clients, silent = true, timeout = 1 * time.Second)
-	testing.expectf(t, queries == 1, "the upstream saw %d queries for %d identical clients, want 1", queries, CLIENTS)
+	testing.expectf(t, queries == 2, "the upstream saw %d queries for %d identical clients, want 2", queries, CLIENTS)
 	for c, i in clients {
 		testing.expectf(t, c.ok && c.rcode == .Serv_Fail, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)
 	}
+}
+
+/*
+Once more because the leader's failure may have been the leader's alone - one
+lost datagram, or a message the upstream would not read - and that must not be
+every waiting client's SERVFAIL.
+*/
+@(test)
+test_a_leader_whose_query_was_lost_does_not_fail_its_followers :: proc(t: ^testing.T) {
+	clients: [CLIENTS]Client
+	queries := run_burst(t, &clients, drop_first = true, timeout = 1 * time.Second)
+	testing.expectf(t, queries == 2, "the upstream saw %d queries for %d identical clients, want 2", queries, CLIENTS)
+	failed, answered := 0, 0
+	for c in clients {
+		if c.ok && c.rcode == .Serv_Fail {
+			failed += 1
+		} else if c.ok && c.rcode == .No_Error && c.addr == {192, 0, 2, 7} {
+			answered += 1
+		}
+	}
+	testing.expectf(t, failed == 1 && answered == CLIENTS - 1, "%d clients failed and %d were answered, want 1 and %d", failed, answered, CLIENTS - 1)
+}
+
+/*
+But not a FORMERR. That rcode is the upstream reading the leader's message, and
+the message carries more than the key does - a client's own records in a section
+a query leaves empty, which some upstreams answer FORMERR - so a follower that
+asked well formed is not handed the refusal of a query it did not send.
+*/
+@(test)
+test_a_formerr_to_the_leader_is_not_shared :: proc(t: ^testing.T) {
+	clients: [CLIENTS]Client
+	run_burst(t, &clients, first = .Form_Err)
+	refused, answered := 0, 0
+	for c in clients {
+		if c.ok && c.rcode == .Form_Err {
+			refused += 1
+		} else if c.ok && c.rcode == .No_Error && c.addr == {192, 0, 2, 7} {
+			answered += 1
+		}
+	}
+	testing.expectf(t, refused == 1 && answered == CLIENTS - 1, "%d clients got the leader's FORMERR and %d an answer, want 1 and %d", refused, answered, CLIENTS - 1)
 }
 
 // A follower whose leader never lands stops waiting at its patience, and the

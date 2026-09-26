@@ -18,16 +18,18 @@ else - which is also why an answer the cache declines to keep (a zero TTL, a
 routed apex `DS` nobody proved) is shared: it is the same answer to the same
 question, produced for a query that was waiting alongside this one.
 
-What a follower does when the leader lands without an answer turns on why:
-
-  - the upstream produced nothing at all, which is the failure asking again
-    would only repeat - the follower takes its expired entry if it holds one and
-    SERVFAIL if it does not, as the leader did;
-  - the leader refused what came back (a Bogus verdict, a rebinding or cloaking
-    refusal, an unreadable reply), or the follower ran out of patience - it
-    forwards on its own, which is what every query did before this. The
-    refusals that are remembered are then found in the cache by later queries,
-    and none of them is a thing to spend care on sharing.
+What a follower does when the leader lands without an answer - the upstream
+produced nothing, the leader refused what came back (a Bogus verdict, a
+rebinding or cloaking refusal, an unreadable reply), or the upstream answered
+FORMERR to the leader's message - is start over once: back to the cache, where a
+refusal the leader remembered is now found, and back to this table, where one of
+the followers leads the next exchange and the rest wait on it. Once, because
+what the leader got may be about the leader alone - its datagram lost, or its
+message carrying records of the client's own that the upstream would not read -
+and a second exchange settles that; a second failure is the upstream's, and the
+follower takes its expired entry or SERVFAIL, or forwards its own question after
+a refusal, which is what every query did before this. A follower that runs out
+of patience forwards on its own too.
 
 The leader waits for its followers to take their copies before it lets go, which
 is what lets the `Flight` live in its stack frame and the answer in its arena:
@@ -70,6 +72,8 @@ Flight :: struct {
 	ede:      u16,
 	// The upstream produced nothing at all.
 	failed:   bool,
+	// Where this flight sits in the table, so landing need not look for it.
+	slot:     int,
 }
 
 /*
@@ -112,7 +116,8 @@ flight_join :: proc(s: ^Server, key: string, own: ^Flight) -> (flight: ^Flight, 
 		return nil, false
 	}
 	own^ = Flight {
-		key = key,
+		key  = key,
+		slot = free_slot,
 	}
 	s.inflight.slots[free_slot] = own
 	return own, true
@@ -137,7 +142,6 @@ flight_follow :: proc(
 	landed: bool,
 ) {
 	sync.mutex_lock(&s.inflight.mu)
-	defer sync.mutex_unlock(&s.inflight.mu)
 	start := time.tick_now()
 	for !f.landed {
 		left := patience - time.tick_since(start)
@@ -146,22 +150,31 @@ flight_follow :: proc(
 		}
 		_ = sync.cond_wait_with_timeout(&f.cond, &s.inflight.mu, left)
 	}
-	if f.landed && f.answer != nil {
-		answer = make([]u8, len(f.answer), allocator)
-		copy(answer, f.answer)
-	}
+	shared := f.answer if f.landed else nil
 	ede, failed, landed = f.ede, f.failed, f.landed
+	sync.mutex_unlock(&s.inflight.mu)
+
+	// Copied outside the lock, which every miss on the server takes: the bytes
+	// cannot change while this follower is still counted, since the leader waits
+	// for the count to reach zero before it lets them go.
+	if shared != nil {
+		answer = make([]u8, len(shared), allocator)
+		copy(answer, shared)
+	}
+
+	sync.mutex_lock(&s.inflight.mu)
 	f.waiters -= 1
 	// The leader may be waiting for this one to leave.
 	sync.cond_broadcast(&f.cond)
+	sync.mutex_unlock(&s.inflight.mu)
 	return
 }
 
 /*
 Offer the answer this leader is about to serve to whoever is waiting.
 
-`answer` must stay as it is until the leader lands - a clone, where the leader
-goes on to write into its own copy.
+`answer` must stay as it is until the leader lands, so the leader lands before
+it writes into it again.
 */
 @(private)
 flight_share :: proc(s: ^Server, f: ^Flight, answer: []u8, ede: u16) {
@@ -185,12 +198,7 @@ has taken its copy - the flight and the answer both belong to the caller's frame
 flight_land :: proc(s: ^Server, f: ^Flight) {
 	sync.mutex_lock(&s.inflight.mu)
 	defer sync.mutex_unlock(&s.inflight.mu)
-	for &slot in s.inflight.slots {
-		if slot == f {
-			slot = nil
-			break
-		}
-	}
+	s.inflight.slots[f.slot] = nil
 	f.landed = true
 	sync.cond_broadcast(&f.cond)
 	for f.waiters > 0 {
