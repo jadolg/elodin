@@ -10,6 +10,7 @@ import "core:thread"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:h2"
 import "elodin:upstream"
 
 /*
@@ -1902,4 +1903,62 @@ test_doh_a_timeout_near_the_range_limit_keeps_connections :: proc(t: ^testing.T)
 		!doh_question_overdue(&s, time.tick_add(now, -time.Second), now),
 		"a connection one second old was overdue",
 	)
+}
+
+/*
+A POST's Content-Type is judged by its media type, whole and without regard to
+ASCII case (RFC 9110 8.3.1), on the HTTP/2 path and so through the predicate the
+HTTP/1.1 path shares. A prefix match let `application/dns-message-bogus` in and
+a case-sensitive one turned `Application/DNS-Message` away (#304); a Unicode fold
+would take the long s (U+017F) for an `s`.
+*/
+@(test)
+test_doh_content_type_is_the_media_type_folded :: proc(t: ^testing.T) {
+	Case :: struct {
+		content_type: string,
+		accepted:     bool,
+	}
+	CASES := []Case {
+		{"", true},
+		{"application/dns-message", true},
+		{"Application/DNS-Message", true},
+		{"APPLICATION/DNS-MESSAGE", true},
+		{"application/dns-message; charset=utf-8", true},
+		{"application/dns-message ;q=1", true},
+		{"application/dns-message-bogus", false},
+		{"application/dns-messageZZZZ", false},
+		{"application/dns-message2", false},
+		{"application/dns-mesſage", false},
+		{"application/dns", false},
+		{"application/dns-messag", false},
+		{"text/plain", false},
+		{";application/dns-message", false},
+	}
+	body := make([]u8, dns.HEADER_SIZE, context.temp_allocator)
+	for c in CASES {
+		req := h2.Request {
+			method       = "POST",
+			path         = "/dns-query",
+			content_type = c.content_type,
+			body         = body,
+		}
+		_, status, _, ok := h2_query_message(&req)
+		testing.expectf(t, ok == c.accepted, "%q: accepted %v, want %v", c.content_type, ok, c.accepted)
+		if !c.accepted {
+			testing.expectf(t, status == 415, "%q: status %d, want 415", c.content_type, status)
+		}
+	}
+}
+
+// A repeated Content-Type is a 400 on HTTP/1.1: the reader kept the last of the
+// two, and a hop in front may have judged the first.
+@(test)
+test_doh_repeated_content_type_is_refused :: proc(t: ^testing.T) {
+	raw := "POST /dns-query HTTP/1.1\r\nHost: dns.example\r\nContent-Type: text/plain\r\nContent-Type: application/dns-message\r\nContent-Length: 4\r\n\r\nabcd"
+	_, status, parsed, ok := read_request_over_loopback(t, raw, "a repeated Content-Type")
+	if !ok {
+		return
+	}
+	testing.expect(t, !parsed, "a repeated Content-Type was accepted")
+	testing.expect_value(t, status, 400)
 }

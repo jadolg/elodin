@@ -417,7 +417,7 @@ h2_query_message :: proc(
 	_, query := h2_split_path(req.path)
 	switch req.method {
 	case "POST":
-		if req.content_type != "" && !strings.has_prefix(req.content_type, DOH_CONTENT_TYPE) {
+		if !doh_content_type_ok(req.content_type) {
 			return nil, 415, "unsupported media type", false
 		}
 		message = req.body
