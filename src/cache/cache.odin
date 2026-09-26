@@ -771,18 +771,21 @@ put :: proc(
 
 	RFC 2308 section 5: "Negative responses without SOA records SHOULD NOT be
 	cached". The SOA is the only thing in a denial that says how long it holds,
-	and without one the lifetime would be `negative_ttl` - five minutes by
-	default of every client told the name is empty because one upstream
-	stumbled once: a rate-limited authoritative, a middlebox, or a server that
-	did not recurse and answered with a referral, whose NS records in the
-	authority section this cache would otherwise serve as a NODATA. dnsmasq
-	and BIND remember nothing without the SOA; neither does this.
+	and without one every client is told the name is empty because one
+	upstream stumbled once: a rate-limited authoritative, a middlebox, or a
+	server that did not recurse and answered with a referral, whose NS records
+	in the authority section this cache would otherwise serve as a NODATA.
+	dnsmasq and BIND remember nothing without the SOA; neither does this.
+
+	Refused here rather than left to the zero lifetime below, which `min_ttl`
+	would lift into a stored entry - and this is what used to happen with
+	`negative_ttl` standing in for the SOA, for five minutes by default.
 	*/
 	negative := !bogus && (rcode == .NX_Domain || len(msg.answer) == 0)
 	soa_ttl: u32
 	if negative {
 		has_soa: bool
-		soa_ttl, has_soa = dns.negative_ttl(msg, 0)
+		soa_ttl, has_soa = dns.negative_ttl(msg)
 		if !has_soa {
 			return false
 		}

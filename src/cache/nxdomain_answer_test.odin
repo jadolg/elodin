@@ -281,7 +281,6 @@ key_for_nx :: proc(buf: []u8, name: string) -> string {
 // The SOA of the zone a redirection led into, which is what a real name error
 // at the end of the chain carries (RFC 2308 section 2.1) and what the cache
 // reads its lifetime from.
-@(private = "file")
 nx_target_soa :: proc(zone: string) -> []dns.Record {
 	soa := make([]dns.Record, 1, context.temp_allocator)
 	soa[0] = dns.Record {

@@ -4724,8 +4724,8 @@ rrset_ttl :: proc(records: []dns.Record) -> u32 {
 
 @(private)
 negative_ttl :: proc(msg: dns.Message) -> u32 {
-	ttl, _ := dns.negative_ttl(msg, MIN_ZONE_TTL)
-	return ttl
+	ttl, has_soa := dns.negative_ttl(msg)
+	return ttl if has_soa else MIN_ZONE_TTL
 }
 
 @(private)

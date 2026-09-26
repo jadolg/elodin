@@ -787,7 +787,9 @@ that did not recurse - the answer every client gets for `negative_ttl`.
 */
 @(test)
 test_a_denial_without_a_soa_is_not_cached :: proc(t: ^testing.T) {
-	c := make_cache(Options{max_entries = 8, max_ttl = 86400, negative_ttl = 300})
+	// A `min_ttl` floor, which would otherwise lift the zero lifetime a denial
+	// without a SOA has into one worth storing.
+	c := make_cache(Options{max_entries = 8, max_ttl = 86400, min_ttl = 60, negative_ttl = 300})
 	defer destroy(c)
 	kb: [KEY_MAX]u8
 
@@ -822,15 +824,7 @@ test_a_denial_without_a_soa_is_not_cached :: proc(t: ^testing.T) {
 
 	// The control: the same NODATA with a SOA beside it is kept, so the three
 	// refusals above are the missing SOA and not something else about them.
-	nodata.authority = []dns.Record {
-		{
-			name = "example.test.",
-			type = .SOA,
-			class = .IN,
-			ttl = 3600,
-			data = dns.Rdata_SOA{ns = "ns1.example.test.", mbox = "hostmaster.example.test.", serial = 1, minimum = 60},
-		},
-	}
+	nodata.authority = nx_target_soa("example.test.")
 	w4, _, _ := dns.encode_message(nodata, context.temp_allocator)
 	m4, _ := dns.decode_message(w4, context.temp_allocator)
 	testing.expect(t, put(c, key_for(kb[:], "nodata.example.test."), w4, m4), "a NODATA with a SOA was not cached")

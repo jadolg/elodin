@@ -568,7 +568,9 @@ test_a_pruned_answer_is_still_cached_and_served :: proc(t: ^testing.T) {
 		answerless.answer = nil
 		empty, _, eerr := dns.encode_message(answerless, context.temp_allocator)
 		testing.expect_value(t, eerr, dns.Encode_Error.None)
-		other := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, negative_ttl = 0})
+		// A `min_ttl` floor, so the refusal is the missing SOA and not the zero
+		// lifetime that floor would otherwise lift.
+		other := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, min_ttl = 60, negative_ttl = 300})
 		defer cache.destroy(other)
 		testing.expect(
 			t,
@@ -659,9 +661,9 @@ test_a_pruned_nxdomain_after_a_cname_is_not_cached :: proc(t: ^testing.T) {
 	key_buf: [cache.KEY_MAX]u8
 	key := cache.make_key(key_buf[:], "www.example.com.", .AAAA, .IN, true, false)
 
-	// Not even with a fallback configured: there is nothing left in it to read
-	// a lifetime from.
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, negative_ttl = 300})
+	// Not even with a `min_ttl` floor to lift it: there is nothing left in it
+	// to read a lifetime from.
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, min_ttl = 60, negative_ttl = 300})
 	defer cache.destroy(answers)
 	testing.expect(
 		t,
