@@ -194,15 +194,7 @@ get_h2_conn :: proc(u: ^Upstream, timeout: time.Duration) -> (conn: ^h2.Client, 
 		tlsx.set_timeouts(stream.tls, H2_POLL_INTERVAL, timeout)
 	}
 
-	hc := new(H2_Conn, u.allocator)
-	hc.stream = stream
-	io := h2.IO {
-		user  = hc,
-		read  = h2_io_read,
-		write = h2_io_write,
-	}
-	hc.client = h2.client_make(io, u.allocator)
-	hc.thread = thread.create_and_start_with_poly_data(hc.client, h2.client_serve)
+	hc := start_h2_conn(stream, u.allocator)
 	u.h2 = hc
 
 	h2.client_ref(hc.client)
@@ -210,6 +202,16 @@ get_h2_conn :: proc(u: ^Upstream, timeout: time.Duration) -> (conn: ^h2.Client, 
 	sync.cond_broadcast(&u.conn_cond)
 	sync.mutex_unlock(&u.mu)
 	return conn, true, .None
+}
+
+// Wrap a negotiated stream in an h2 client and start its reader thread.
+@(private)
+start_h2_conn :: proc(stream: Stream, allocator: mem.Allocator) -> ^H2_Conn {
+	hc := new(H2_Conn, allocator)
+	hc.stream = stream
+	hc.client = h2.client_make(h2.IO{user = hc, read = h2_io_read, write = h2_io_write}, allocator)
+	hc.thread = thread.create_and_start_with_poly_data(hc.client, h2.client_serve)
+	return hc
 }
 
 @(private)

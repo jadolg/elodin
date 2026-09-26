@@ -27,15 +27,21 @@ response's headers may still arrive split, and that direction is handled.
 Client :: struct {
 	io: IO,
 
-	mu:     sync.Mutex,
-	cond:   sync.Cond,
-	refs:   int,
-	closed: bool,
+	mu:        sync.Mutex,
+	cond:      sync.Cond,
+	// Requests waiting for a stream slot, apart from `cond` so that every
+	// frame answering some other stream does not wake the whole queue.
+	slot_cond: sync.Cond,
+	refs:      int,
+	closed:    bool,
 
 	next_stream_id:      u32,
 	peer_max_frame:      int,
 	peer_initial_window: int,
 	send_window:         int,
+	// SETTINGS_MAX_CONCURRENT_STREAMS; unlimited until the peer says (RFC 9113
+	// 6.5.2). `client_request` waits for a slot rather than go past it.
+	peer_max_streams:    int,
 
 	decoder:             Dynamic_Table,
 	streams:             map[u32]^Client_Stream,
@@ -61,8 +67,10 @@ Client_Stream :: struct {
 	// Set once the response is complete (headers with END_STREAM, or the DATA
 	// frame that carries it).
 	done:        bool,
-	// Set when the peer resets the stream.
+	// Set when the peer resets the stream; `refused` when it did so with
+	// REFUSED_STREAM, which says the request was never processed.
 	reset:       bool,
+	refused:     bool,
 	send_window: int,
 	/*
 	Set once a stream-error RST_STREAM has answered a frame that arrived after
@@ -104,6 +112,9 @@ Client_Error :: enum u8 {
 	Closed,
 	// The peer reset our stream.
 	Reset,
+	// The peer reset it with REFUSED_STREAM: not processed, and safe to ask
+	// again (RFC 9113 8.7).
+	Refused,
 	Timeout,
 }
 
@@ -128,6 +139,7 @@ client_make :: proc(io: IO, allocator := context.allocator) -> ^Client {
 	c.peer_max_frame = DEFAULT_MAX_FRAME
 	c.peer_initial_window = DEFAULT_WINDOW
 	c.send_window = DEFAULT_WINDOW
+	c.peer_max_streams = max(int)
 	c.streams = make(map[u32]^Client_Stream, 16, allocator)
 	c.header_scratch = make([dynamic]u8, 0, 256, allocator)
 	dynamic_table_init(&c.decoder, DEFAULT_HEADER_TABLE_SIZE, allocator)
@@ -196,6 +208,7 @@ client_serve :: proc(c: ^Client) {
 		sync.mutex_lock(&c.mu)
 		c.closed = true
 		sync.cond_broadcast(&c.cond)
+		sync.cond_broadcast(&c.slot_cond)
 		sync.mutex_unlock(&c.mu)
 	}
 
@@ -341,6 +354,7 @@ client_handle_frame :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool 
 		sync.mutex_lock(&c.mu)
 		if s, found := c.streams[h.stream_id]; found {
 			s.reset = true
+			s.refused = Error_Code(read_u32(payload)) == .Refused_Stream
 			sync.cond_broadcast(&c.cond)
 		}
 		sync.mutex_unlock(&c.mu)
@@ -384,6 +398,10 @@ client_handle_settings :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bo
 				return false
 			}
 			c.peer_max_frame = int(value)
+		case .Max_Concurrent_Streams:
+			c.peer_max_streams = int(value)
+			// A raised limit lets a waiting request in.
+			sync.cond_broadcast(&c.slot_cond)
 		case .Initial_Window_Size:
 			if value > MAX_WINDOW {
 				sync.mutex_unlock(&c.mu)
@@ -819,8 +837,43 @@ client_request :: proc(
 		encode_header(&block, "content-length", strconv.write_int(digits[:], i64(len(req.body)), 10))
 	}
 	end_stream: u8 = FLAG_END_STREAM if len(req.body) == 0 else 0
+	// A `Tick`, not a `Time`: this bounds waiting, and the wall clock steps.
+	deadline := time.tick_add(time.tick_now(), timeout)
 
 	sync.mutex_lock(&c.mu)
+	/*
+	RFC 9113 5.1.2: no more open streams than the peer allows. Every query to
+	this upstream shares the one connection, so past the limit a request waits
+	for a slot - on its own deadline - rather than have the peer refuse it.
+	Streams still in the table count, done or not: one is only freed by its
+	caller's cleanup below, and waiting that little longer is the safe side.
+	*/
+	for len(c.streams) >= c.peer_max_streams && !c.closed {
+		/*
+		A limit of zero with nothing open frees no slot: only another SETTINGS
+		would, and nothing says one is coming. Give the connection up, as on id
+		exhaustion below, so the next request dials afresh instead of every
+		query waiting out its timeout here.
+
+		The trade, settled so it is not reargued: RFC 9113 6.5.2 says zero
+		SHOULD NOT be special, and in the same paragraph that a server should
+		only advertise it briefly and close a connection it wants no requests
+		on. What a brief zero costs here is one handshake; what waiting costs is
+		every query's whole timeout, charged to the upstream as silence. Zero
+		with streams still open is not special: those free slots as usual.
+		*/
+		if len(c.streams) == 0 {
+			c.closed = true
+			sync.cond_broadcast(&c.slot_cond)
+			break
+		}
+		remaining := time.tick_diff(time.tick_now(), deadline)
+		if remaining <= 0 {
+			sync.mutex_unlock(&c.mu)
+			return {}, .Timeout
+		}
+		sync.cond_wait_with_timeout(&c.slot_cond, &c.mu, remaining)
+	}
 	if c.closed {
 		sync.mutex_unlock(&c.mu)
 		return {}, .Closed
@@ -837,6 +890,7 @@ client_request :: proc(
 	if c.next_stream_id > 0x7fff_ffff {
 		c.closed = true
 		sync.cond_broadcast(&c.cond)
+		sync.cond_broadcast(&c.slot_cond)
 		sync.mutex_unlock(&c.mu)
 		return {}, .Closed
 	}
@@ -876,20 +930,29 @@ client_request :: proc(
 		sync.mutex_lock(&c.mu)
 		delete_key(&c.streams, stream_id)
 		client_stream_destroy(c, s)
+		// One slot is free: wake one request waiting on the peer's stream
+		// limit, not the whole queue to fight over it. Whoever wakes rechecks
+		// the table before its deadline, so the wake is never spent without
+		// the slot being taken. Only a table that was at the limit can have
+		// one waiting.
+		if len(c.streams) + 1 >= c.peer_max_streams {
+			sync.cond_signal(&c.slot_cond)
+		}
 		sync.mutex_unlock(&c.mu)
 		client_unref(c)
 	}
-
-	deadline := time.time_add(time.now(), timeout)
 
 	if !sent || (len(req.body) > 0 && !client_send_body(c, s, req.body, deadline)) {
 		sync.mutex_lock(&c.mu)
 		dead := c.closed
 		reset := s.reset
+		refused := s.refused
 		sync.mutex_unlock(&c.mu)
 		switch {
 		case dead:
 			return {}, .Closed
+		case refused:
+			return {}, .Refused
 		case reset:
 			return {}, .Reset
 		case:
@@ -899,7 +962,7 @@ client_request :: proc(
 
 	sync.mutex_lock(&c.mu)
 	for !s.done && !s.reset && !c.closed {
-		remaining := time.diff(time.now(), deadline)
+		remaining := time.tick_diff(time.tick_now(), deadline)
 		if remaining <= 0 {
 			sync.mutex_unlock(&c.mu)
 			client_rst_stream(c, stream_id, .Cancel)
@@ -909,9 +972,12 @@ client_request :: proc(
 	}
 
 	switch {
-	case s.reset:
+	// A reset after a complete response is the peer ending the upload early
+	// (RFC 9113 8.1), and the client MUST NOT discard that response.
+	case s.reset && !s.done:
+		refused := s.refused
 		sync.mutex_unlock(&c.mu)
-		return {}, .Reset
+		return {}, .Refused if refused else .Reset
 	case c.closed && !s.done:
 		sync.mutex_unlock(&c.mu)
 		return {}, .Closed
@@ -929,7 +995,7 @@ client_request :: proc(
 // additionally by the caller's deadline since nothing else here would notice
 // a peer that simply never grants window.
 @(private)
-client_send_body :: proc(c: ^Client, s: ^Client_Stream, body: []u8, deadline: time.Time) -> bool {
+client_send_body :: proc(c: ^Client, s: ^Client_Stream, body: []u8, deadline: time.Tick) -> bool {
 	sent := 0
 	for sent < len(body) {
 		remaining := len(body) - sent
@@ -983,7 +1049,7 @@ client_send_body :: proc(c: ^Client, s: ^Client_Stream, body: []u8, deadline: ti
 				s.send_window -= chunk
 				break
 			}
-			left := time.diff(time.now(), deadline)
+			left := time.tick_diff(time.tick_now(), deadline)
 			if left <= 0 {
 				// Marked before the write, same as the s.done branch above: DATA
 				// the peer already had in flight must find this stream already

@@ -63,6 +63,8 @@ exchange_doh_h2 :: proc(
 	// A stale shared connection dying between get_h2_conn handing it out and
 	// this call reaching the server is retried once, on a fresh one; see
 	// exchange_pipelined for why that must not count as an upstream failure.
+	// A refused stream is retried once too, on whatever get_h2_conn hands out
+	// next - usually the same, still healthy, connection.
 	for attempt in 0 ..< 2 {
 		remaining := time.tick_diff(time.tick_now(), deadline)
 		if remaining <= 0 {
@@ -117,13 +119,21 @@ exchange_doh_h2 :: proc(
 				return nil, .Bad_Response
 			}
 			return resp.body, .None
-		case .Closed:
+		case .Closed, .Refused:
+			/*
+			REFUSED_STREAM is a server at its stream limit saying it never
+			processed the request (RFC 9113 8.7), so it is asked again the same
+			way. The client already keeps under the advertised limit, so this
+			mostly catches streams opened before the peer's SETTINGS arrived,
+			or a limit the peer lowered with streams already open.
+			*/
 			if attempt == 0 {
 				continue
 			}
-			// Both attempts hung up. Still the peer recycling rather than the
-			// upstream being down - a server sending GOAWAY under load does
-			// this - so it is reported as such and does not park it.
+			// Both attempts hung up or were turned away. Still the peer under
+			// load rather than the upstream being down - a server sending GOAWAY
+			// or refusing streams does this - so it is reported as such and does
+			// not park it.
 			return nil, .Peer_Closed
 		case .Reset:
 			return nil, .HTTP_Error

@@ -329,6 +329,14 @@ test_wait_for_frame_type :: proc(socket: net.TCP_Socket, want: Frame_Type) -> (h
 
 @(test)
 test_client_request_reset_by_peer :: proc(t: ^testing.T) {
+	// REFUSED_STREAM says the request was never processed, so it has its own
+	// error the caller may retry on; any other code is a plain reset.
+	expect_client_reset_as(t, .Refused_Stream, .Refused)
+	expect_client_reset_as(t, .Cancel, .Reset)
+}
+
+@(private = "file")
+expect_client_reset_as :: proc(t: ^testing.T, code: Error_Code, want: Client_Error) {
 	listener, bound, lok := test_listen(t)
 	if !lok {
 		return
@@ -336,6 +344,7 @@ test_client_request_reset_by_peer :: proc(t: ^testing.T) {
 
 	Script :: struct {
 		listener: net.TCP_Socket,
+		code:     Error_Code,
 	}
 	run_script :: proc(s: ^Script) {
 		client, _, err := net.accept_tcp(s.listener)
@@ -354,10 +363,10 @@ test_client_request_reset_by_peer :: proc(t: ^testing.T) {
 		}
 		out := make([dynamic]u8, 0, 13, context.temp_allocator)
 		write_frame_header(&out, 4, .Rst_Stream, 0, 1)
-		append_u32(&out, u32(Error_Code.Refused_Stream))
+		append_u32(&out, u32(s.code))
 		_ = test_send(client, out[:])
 	}
-	srv := Script{listener = listener}
+	srv := Script{listener = listener, code = code}
 	server_thread := thread.create_and_start_with_poly_data(&srv, run_script)
 	defer {
 		thread.join(server_thread)
@@ -379,7 +388,7 @@ test_client_request_reset_by_peer :: proc(t: ^testing.T) {
 		Client_Request{method = "GET", scheme = "https", authority = "mock.invalid", path = "/dns-query"},
 		2 * time.Second,
 	)
-	testing.expect_value(t, err, Client_Error.Reset)
+	testing.expect_value(t, err, want)
 	free_all(context.temp_allocator)
 }
 
@@ -1507,7 +1516,7 @@ test_client_send_body_stops_once_the_stream_is_reset_by_us :: proc(t: ^testing.T
 
 	clear(&log.frames)
 	body := []u8{1, 2, 3, 4}
-	sent := client_send_body(c, s, body, time.time_add(time.now(), time.Second))
+	sent := client_send_body(c, s, body, time.tick_add(time.tick_now(), time.Second))
 	testing.expect(t, !sent, "client_send_body wrote a body on a stream this connection had already reset")
 	for f in log.frames {
 		testing.expectf(t, f.type != .Data, "a DATA frame was written on a stream this connection had already reset")
@@ -1554,7 +1563,7 @@ test_client_send_body_stops_successfully_on_an_early_response :: proc(t: ^testin
 
 	clear(&log.frames)
 	body := []u8{1, 2, 3, 4}
-	sent := client_send_body(c, s, body, time.time_add(time.now(), time.Second))
+	sent := client_send_body(c, s, body, time.tick_add(time.tick_now(), time.Second))
 	testing.expect(t, sent, "an early response should stop the upload successfully, not report it as a failure")
 	saw_rst := false
 	for f in log.frames {
@@ -1611,7 +1620,7 @@ test_client_send_body_does_not_double_rst_a_stream_already_reset_by_us :: proc(t
 
 	clear(&log.frames)
 	body := []u8{1, 2, 3, 4}
-	sent := client_send_body(c, s, body, time.time_add(time.now(), time.Second))
+	sent := client_send_body(c, s, body, time.tick_add(time.tick_now(), time.Second))
 	testing.expect(t, sent, "an early response should stop the upload successfully")
 	for f in log.frames {
 		testing.expectf(t, f.type != .Rst_Stream, "a second RST_STREAM was sent on a stream already reset by this connection")
@@ -1657,7 +1666,7 @@ test_client_send_body_resets_the_stream_on_a_flow_control_timeout :: proc(t: ^te
 
 	clear(&log.frames)
 	body := []u8{1, 2, 3, 4}
-	sent := client_send_body(c, s, body, time.time_add(time.now(), -time.Second))
+	sent := client_send_body(c, s, body, time.tick_add(time.tick_now(), -time.Second))
 	testing.expect(t, !sent, "client_send_body should give up once the deadline has passed")
 
 	saw_rst := false
@@ -1747,7 +1756,7 @@ test_client_send_body_early_response_rst_suppresses_a_later_one :: proc(t: ^test
 
 	clear(&log.frames)
 	body := []u8{1, 2, 3, 4}
-	sent := client_send_body(c, s, body, time.time_add(time.now(), time.Second))
+	sent := client_send_body(c, s, body, time.tick_add(time.tick_now(), time.Second))
 	testing.expect(t, sent, "an early response should stop the upload successfully")
 	testing.expect(t, s.rst_sent, "client_send_body's own RST(NO_ERROR) did not mark the stream rst_sent")
 
@@ -1800,7 +1809,7 @@ test_client_send_body_flow_control_timeout_rst_is_not_forgotten :: proc(t: ^test
 
 	clear(&log.frames)
 	body := []u8{1, 2, 3, 4}
-	sent := client_send_body(c, s, body, time.time_add(time.now(), -time.Second))
+	sent := client_send_body(c, s, body, time.tick_add(time.tick_now(), -time.Second))
 	testing.expect(t, !sent, "client_send_body should give up once the deadline has passed")
 	testing.expect(t, s.rst_sent, "the flow-control timeout's own RST(.Cancel) did not mark the stream rst_sent")
 
@@ -2329,4 +2338,273 @@ test_client_answers_before_pings_still_earn :: proc(t: ^testing.T) {
 	for _, entry in track.allocation_map {
 		testing.expectf(t, false, "client answers first: %d bytes leaked at %v", entry.size, entry.location)
 	}
+}
+
+@(private = "file")
+Limit_Request :: struct {
+	c:   ^Client,
+	err: Client_Error,
+}
+
+@(private = "file")
+limit_request_run :: proc(r: ^Limit_Request) {
+	req := Client_Request {
+		method    = "GET",
+		scheme    = "https",
+		authority = "mock.invalid",
+		path      = "/dns-query",
+	}
+	_, r.err = client_request(r.c, req, 5 * time.Second)
+}
+
+// How many HEADERS the client has written, and the stream id of the last.
+@(private = "file")
+limit_opened :: proc(c: ^Client, log: ^Client_Frame_Log) -> (n: int, last: u32) {
+	sync.mutex_lock(&c.mu)
+	defer sync.mutex_unlock(&c.mu)
+	for f in log.frames {
+		if f.type == .Headers {
+			n += 1
+			last = f.stream_id
+		}
+	}
+	return
+}
+
+// Waits for the client to have written `want` HEADERS, for up to two seconds.
+@(private = "file")
+limit_wait_opened :: proc(c: ^Client, log: ^Client_Frame_Log, want: int) -> (last: u32, ok: bool) {
+	for _ in 0 ..< 400 {
+		n, id := limit_opened(c, log)
+		if n >= want {
+			return id, true
+		}
+		time.sleep(5 * time.Millisecond)
+	}
+	return 0, false
+}
+
+// Finishes a stream as a response with END_STREAM would.
+@(private = "file")
+limit_answer :: proc(c: ^Client, id: u32) {
+	sync.mutex_lock(&c.mu)
+	defer sync.mutex_unlock(&c.mu)
+	if s, found := c.streams[id]; found {
+		s.status = 200
+		s.done = true
+		sync.cond_broadcast(&c.cond)
+	}
+}
+
+/*
+RFC 9113 5.1.2: a client must not open more streams than the peer's
+SETTINGS_MAX_CONCURRENT_STREAMS. Every worker shares one connection to a DoH
+upstream, and a peer holding its limit refuses the stream over it with
+RST_STREAM(REFUSED_STREAM) - a failed query, charged to an upstream that is
+working fine (#326). The request past the limit has to wait for a slot.
+*/
+@(test)
+test_client_waits_for_a_stream_slot_under_the_peers_limit :: proc(t: ^testing.T) {
+	log := Client_Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 16),
+	}
+	defer delete(log.frames)
+	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write})
+	defer client_unref(c)
+
+	one := []u8{0, u8(Setting.Max_Concurrent_Streams), 0, 0, 0, 1}
+	testing.expect(t, client_handle_settings(c, Frame_Header{length = len(one), type = .Settings}, one))
+
+	reqs := [2]Limit_Request{{c = c}, {c = c}}
+	threads: [2]^thread.Thread
+	for &r, i in reqs {
+		threads[i] = thread.create_and_start_with_poly_data(&r, limit_request_run)
+	}
+
+	first, ok := limit_wait_opened(c, &log, 1)
+	testing.expect(t, ok, "no request opened a stream")
+	// Long enough for the second request to have opened one too, had it not waited.
+	time.sleep(200 * time.Millisecond)
+	opened, _ := limit_opened(c, &log)
+	testing.expect_value(t, opened, 1)
+
+	limit_answer(c, first)
+	second, ok2 := limit_wait_opened(c, &log, 2)
+	testing.expect(t, ok2, "the waiting request never opened its stream once a slot freed")
+	testing.expect(t, second != first, "the second request reused the first one's stream")
+	limit_answer(c, second)
+
+	for th in threads {
+		thread.join(th)
+		thread.destroy(th)
+	}
+	for r in reqs {
+		testing.expect_value(t, r.err, Client_Error.None)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+The wait for a slot has two ways out besides a slot freeing: the request's own
+deadline, and the connection dying. Neither may open a stream.
+*/
+@(test)
+test_client_wait_for_a_stream_slot_ends_on_deadline_or_close :: proc(t: ^testing.T) {
+	log := Client_Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 16),
+	}
+	defer delete(log.frames)
+	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write})
+	defer client_unref(c)
+
+	// One slot, held by a stream that is never answered.
+	one := []u8{0, u8(Setting.Max_Concurrent_Streams), 0, 0, 0, 1}
+	testing.expect(t, client_handle_settings(c, Frame_Header{length = len(one), type = .Settings}, one))
+	held := open_test_stream(c, 1, context.allocator)
+	defer {
+		delete_key(&c.streams, u32(1))
+		client_stream_destroy(c, held)
+	}
+
+	req := Client_Request {
+		method    = "GET",
+		scheme    = "https",
+		authority = "mock.invalid",
+		path      = "/dns-query",
+	}
+	start := time.tick_now()
+	_, err := client_request(c, req, 100 * time.Millisecond)
+	testing.expect_value(t, err, Client_Error.Timeout)
+	testing.expect(t, time.tick_since(start) < 2 * time.Second, "the wait outlived the request's deadline")
+
+	r := Limit_Request {
+		c = c,
+	}
+	th := thread.create_and_start_with_poly_data(&r, limit_request_run)
+	time.sleep(100 * time.Millisecond)
+	start = time.tick_now()
+	// What client_serve does on its way out.
+	sync.mutex_lock(&c.mu)
+	c.closed = true
+	sync.cond_broadcast(&c.cond)
+	sync.cond_broadcast(&c.slot_cond)
+	sync.mutex_unlock(&c.mu)
+	thread.join(th)
+	thread.destroy(th)
+	testing.expect_value(t, r.err, Client_Error.Closed)
+	testing.expect(t, time.tick_since(start) < 2 * time.Second, "a closed connection did not end the wait")
+
+	opened, _ := limit_opened(c, &log)
+	testing.expect_value(t, opened, 0)
+	free_all(context.temp_allocator)
+}
+
+/*
+A limit of zero with nothing open is a connection that will take no request
+until the peer sends another SETTINGS, and nothing says it will. Waiting on it
+costs every query its whole timeout - charged to the upstream as silence - and
+`get_h2_conn` hands the same connection out again after the cooldown. It is
+given up on at once instead, so the next query dials a fresh one.
+*/
+@(test)
+test_client_a_zero_stream_limit_with_nothing_open_closes_the_connection :: proc(t: ^testing.T) {
+	log := Client_Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 16),
+	}
+	defer delete(log.frames)
+	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write})
+	defer client_unref(c)
+
+	zero := []u8{0, u8(Setting.Max_Concurrent_Streams), 0, 0, 0, 0}
+	testing.expect(t, client_handle_settings(c, Frame_Header{length = len(zero), type = .Settings}, zero))
+
+	start := time.tick_now()
+	_, err := client_request(
+		c,
+		Client_Request{method = "GET", scheme = "https", authority = "mock.invalid", path = "/dns-query"},
+		2 * time.Second,
+	)
+	testing.expect_value(t, err, Client_Error.Closed)
+	testing.expect(t, time.tick_since(start) < 500 * time.Millisecond, "the request waited on a connection that takes none")
+	testing.expect(t, client_closed(c), "the connection was left open for the next request to wait on")
+	opened, _ := limit_opened(c, &log)
+	testing.expect_value(t, opened, 0)
+	free_all(context.temp_allocator)
+}
+
+/*
+RFC 9113 8.1: a server may answer in full and then RST_STREAM(NO_ERROR) the
+upload, and the client MUST NOT discard that response. When the reset lands
+before the waiter looks, the complete response still wins.
+*/
+@(test)
+test_client_keeps_a_complete_response_reset_after_it_finished :: proc(t: ^testing.T) {
+	log := Client_Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 16),
+	}
+	defer delete(log.frames)
+	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write})
+	defer client_unref(c)
+
+	r := Limit_Request {
+		c = c,
+	}
+	th := thread.create_and_start_with_poly_data(&r, limit_request_run)
+	id, ok := limit_wait_opened(c, &log, 1)
+	testing.expect(t, ok, "the request never opened a stream")
+	sync.mutex_lock(&c.mu)
+	if s, found := c.streams[id]; found {
+		s.status = 200
+		s.done = true
+		s.reset = true
+		sync.cond_broadcast(&c.cond)
+	}
+	sync.mutex_unlock(&c.mu)
+	thread.join(th)
+	thread.destroy(th)
+	testing.expect_value(t, r.err, Client_Error.None)
+	free_all(context.temp_allocator)
+}
+
+/*
+A SETTINGS that raises the limit frees a slot as surely as a stream leaving,
+and the request waiting on it must be let in then - not left until the held
+stream is answered, or until its own deadline.
+*/
+@(test)
+test_client_a_raised_stream_limit_lets_a_waiting_request_in :: proc(t: ^testing.T) {
+	log := Client_Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 16),
+	}
+	defer delete(log.frames)
+	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write})
+	defer client_unref(c)
+
+	// One slot, held by a stream that is never answered.
+	one := []u8{0, u8(Setting.Max_Concurrent_Streams), 0, 0, 0, 1}
+	testing.expect(t, client_handle_settings(c, Frame_Header{length = len(one), type = .Settings}, one))
+	held := open_test_stream(c, 1, context.allocator)
+	defer {
+		delete_key(&c.streams, u32(1))
+		client_stream_destroy(c, held)
+	}
+
+	r := Limit_Request {
+		c = c,
+	}
+	th := thread.create_and_start_with_poly_data(&r, limit_request_run)
+	time.sleep(100 * time.Millisecond)
+	opened, _ := limit_opened(c, &log)
+	testing.expect_value(t, opened, 0)
+
+	two := []u8{0, u8(Setting.Max_Concurrent_Streams), 0, 0, 0, 2}
+	testing.expect(t, client_handle_settings(c, Frame_Header{length = len(two), type = .Settings}, two))
+	id, ok := limit_wait_opened(c, &log, 1)
+	testing.expect(t, ok, "the raised limit did not let the waiting request in")
+	limit_answer(c, id)
+
+	thread.join(th)
+	thread.destroy(th)
+	testing.expect_value(t, r.err, Client_Error.None)
+	free_all(context.temp_allocator)
 }
