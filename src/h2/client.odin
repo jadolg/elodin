@@ -36,6 +36,9 @@ Client :: struct {
 	peer_max_frame:      int,
 	peer_initial_window: int,
 	send_window:         int,
+	// SETTINGS_MAX_CONCURRENT_STREAMS; unlimited until the peer says (RFC 9113
+	// 6.5.2). `client_request` waits for a slot rather than go past it.
+	peer_max_streams:    int,
 
 	decoder:             Dynamic_Table,
 	streams:             map[u32]^Client_Stream,
@@ -61,8 +64,10 @@ Client_Stream :: struct {
 	// Set once the response is complete (headers with END_STREAM, or the DATA
 	// frame that carries it).
 	done:        bool,
-	// Set when the peer resets the stream.
+	// Set when the peer resets the stream; `refused` when it did so with
+	// REFUSED_STREAM, which says the request was never processed.
 	reset:       bool,
+	refused:     bool,
 	send_window: int,
 	/*
 	Set once a stream-error RST_STREAM has answered a frame that arrived after
@@ -104,6 +109,9 @@ Client_Error :: enum u8 {
 	Closed,
 	// The peer reset our stream.
 	Reset,
+	// The peer reset it with REFUSED_STREAM: not processed, and safe to ask
+	// again (RFC 9113 8.7).
+	Refused,
 	Timeout,
 }
 
@@ -128,6 +136,7 @@ client_make :: proc(io: IO, allocator := context.allocator) -> ^Client {
 	c.peer_max_frame = DEFAULT_MAX_FRAME
 	c.peer_initial_window = DEFAULT_WINDOW
 	c.send_window = DEFAULT_WINDOW
+	c.peer_max_streams = max(int)
 	c.streams = make(map[u32]^Client_Stream, 16, allocator)
 	c.header_scratch = make([dynamic]u8, 0, 256, allocator)
 	dynamic_table_init(&c.decoder, DEFAULT_HEADER_TABLE_SIZE, allocator)
@@ -341,6 +350,7 @@ client_handle_frame :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool 
 		sync.mutex_lock(&c.mu)
 		if s, found := c.streams[h.stream_id]; found {
 			s.reset = true
+			s.refused = Error_Code(read_u32(payload)) == .Refused_Stream
 			sync.cond_broadcast(&c.cond)
 		}
 		sync.mutex_unlock(&c.mu)
@@ -384,6 +394,10 @@ client_handle_settings :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bo
 				return false
 			}
 			c.peer_max_frame = int(value)
+		case .Max_Concurrent_Streams:
+			c.peer_max_streams = int(value)
+			// A raised limit lets a waiting request in.
+			sync.cond_broadcast(&c.cond)
 		case .Initial_Window_Size:
 			if value > MAX_WINDOW {
 				sync.mutex_unlock(&c.mu)
@@ -819,8 +833,24 @@ client_request :: proc(
 		encode_header(&block, "content-length", strconv.write_int(digits[:], i64(len(req.body)), 10))
 	}
 	end_stream: u8 = FLAG_END_STREAM if len(req.body) == 0 else 0
+	deadline := time.time_add(time.now(), timeout)
 
 	sync.mutex_lock(&c.mu)
+	/*
+	RFC 9113 5.1.2: no more open streams than the peer allows. Every query to
+	this upstream shares the one connection, so past the limit a request waits
+	for a slot - on its own deadline - rather than have the peer refuse it.
+	Streams still in the table count, done or not: one is only freed by its
+	caller's cleanup below, and waiting that little longer is the safe side.
+	*/
+	for len(c.streams) >= c.peer_max_streams && !c.closed {
+		remaining := time.diff(time.now(), deadline)
+		if remaining <= 0 {
+			sync.mutex_unlock(&c.mu)
+			return {}, .Timeout
+		}
+		sync.cond_wait_with_timeout(&c.cond, &c.mu, remaining)
+	}
 	if c.closed {
 		sync.mutex_unlock(&c.mu)
 		return {}, .Closed
@@ -876,20 +906,23 @@ client_request :: proc(
 		sync.mutex_lock(&c.mu)
 		delete_key(&c.streams, stream_id)
 		client_stream_destroy(c, s)
+		// A slot is free: wake a request waiting on the peer's stream limit.
+		sync.cond_broadcast(&c.cond)
 		sync.mutex_unlock(&c.mu)
 		client_unref(c)
 	}
-
-	deadline := time.time_add(time.now(), timeout)
 
 	if !sent || (len(req.body) > 0 && !client_send_body(c, s, req.body, deadline)) {
 		sync.mutex_lock(&c.mu)
 		dead := c.closed
 		reset := s.reset
+		refused := s.refused
 		sync.mutex_unlock(&c.mu)
 		switch {
 		case dead:
 			return {}, .Closed
+		case refused:
+			return {}, .Refused
 		case reset:
 			return {}, .Reset
 		case:
@@ -910,8 +943,9 @@ client_request :: proc(
 
 	switch {
 	case s.reset:
+		refused := s.refused
 		sync.mutex_unlock(&c.mu)
-		return {}, .Reset
+		return {}, .Refused if refused else .Reset
 	case c.closed && !s.done:
 		sync.mutex_unlock(&c.mu)
 		return {}, .Closed

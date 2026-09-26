@@ -117,13 +117,19 @@ exchange_doh_h2 :: proc(
 				return nil, .Bad_Response
 			}
 			return resp.body, .None
-		case .Closed:
+		case .Closed, .Refused:
+			/*
+			REFUSED_STREAM is a server at its stream limit saying it never
+			processed the request (RFC 9113 8.7), so it is asked again the same
+			way; the client waits for a slot under that limit this time.
+			*/
 			if attempt == 0 {
 				continue
 			}
-			// Both attempts hung up. Still the peer recycling rather than the
-			// upstream being down - a server sending GOAWAY under load does
-			// this - so it is reported as such and does not park it.
+			// Both attempts hung up or were turned away. Still the peer under
+			// load rather than the upstream being down - a server sending GOAWAY
+			// or refusing streams does this - so it is reported as such and does
+			// not park it.
 			return nil, .Peer_Closed
 		case .Reset:
 			return nil, .HTTP_Error

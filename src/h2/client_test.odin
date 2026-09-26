@@ -329,6 +329,14 @@ test_wait_for_frame_type :: proc(socket: net.TCP_Socket, want: Frame_Type) -> (h
 
 @(test)
 test_client_request_reset_by_peer :: proc(t: ^testing.T) {
+	// REFUSED_STREAM says the request was never processed, so it has its own
+	// error the caller may retry on; any other code is a plain reset.
+	expect_client_reset_as(t, .Refused_Stream, .Refused)
+	expect_client_reset_as(t, .Cancel, .Reset)
+}
+
+@(private = "file")
+expect_client_reset_as :: proc(t: ^testing.T, code: Error_Code, want: Client_Error) {
 	listener, bound, lok := test_listen(t)
 	if !lok {
 		return
@@ -336,6 +344,7 @@ test_client_request_reset_by_peer :: proc(t: ^testing.T) {
 
 	Script :: struct {
 		listener: net.TCP_Socket,
+		code:     Error_Code,
 	}
 	run_script :: proc(s: ^Script) {
 		client, _, err := net.accept_tcp(s.listener)
@@ -354,10 +363,10 @@ test_client_request_reset_by_peer :: proc(t: ^testing.T) {
 		}
 		out := make([dynamic]u8, 0, 13, context.temp_allocator)
 		write_frame_header(&out, 4, .Rst_Stream, 0, 1)
-		append_u32(&out, u32(Error_Code.Refused_Stream))
+		append_u32(&out, u32(s.code))
 		_ = test_send(client, out[:])
 	}
-	srv := Script{listener = listener}
+	srv := Script{listener = listener, code = code}
 	server_thread := thread.create_and_start_with_poly_data(&srv, run_script)
 	defer {
 		thread.join(server_thread)
@@ -379,7 +388,7 @@ test_client_request_reset_by_peer :: proc(t: ^testing.T) {
 		Client_Request{method = "GET", scheme = "https", authority = "mock.invalid", path = "/dns-query"},
 		2 * time.Second,
 	)
-	testing.expect_value(t, err, Client_Error.Reset)
+	testing.expect_value(t, err, want)
 	free_all(context.temp_allocator)
 }
 
@@ -2329,4 +2338,108 @@ test_client_answers_before_pings_still_earn :: proc(t: ^testing.T) {
 	for _, entry in track.allocation_map {
 		testing.expectf(t, false, "client answers first: %d bytes leaked at %v", entry.size, entry.location)
 	}
+}
+
+@(private = "file")
+Limit_Request :: struct {
+	c:   ^Client,
+	err: Client_Error,
+}
+
+@(private = "file")
+limit_request_run :: proc(r: ^Limit_Request) {
+	req := Client_Request {
+		method    = "GET",
+		scheme    = "https",
+		authority = "mock.invalid",
+		path      = "/dns-query",
+	}
+	_, r.err = client_request(r.c, req, 5 * time.Second)
+}
+
+// How many HEADERS the client has written, and the stream id of the last.
+@(private = "file")
+limit_opened :: proc(c: ^Client, log: ^Client_Frame_Log) -> (n: int, last: u32) {
+	sync.mutex_lock(&c.mu)
+	defer sync.mutex_unlock(&c.mu)
+	for f in log.frames {
+		if f.type == .Headers {
+			n += 1
+			last = f.stream_id
+		}
+	}
+	return
+}
+
+// Waits for the client to have written `want` HEADERS, for up to two seconds.
+@(private = "file")
+limit_wait_opened :: proc(c: ^Client, log: ^Client_Frame_Log, want: int) -> (last: u32, ok: bool) {
+	for _ in 0 ..< 400 {
+		n, id := limit_opened(c, log)
+		if n >= want {
+			return id, true
+		}
+		time.sleep(5 * time.Millisecond)
+	}
+	return 0, false
+}
+
+// Finishes a stream as a response with END_STREAM would.
+@(private = "file")
+limit_answer :: proc(c: ^Client, id: u32) {
+	sync.mutex_lock(&c.mu)
+	defer sync.mutex_unlock(&c.mu)
+	if s, found := c.streams[id]; found {
+		s.status = 200
+		s.done = true
+		sync.cond_broadcast(&c.cond)
+	}
+}
+
+/*
+RFC 9113 5.1.2: a client must not open more streams than the peer's
+SETTINGS_MAX_CONCURRENT_STREAMS. Every worker shares one connection to a DoH
+upstream, and a peer holding its limit refuses the stream over it with
+RST_STREAM(REFUSED_STREAM) - a failed query, charged to an upstream that is
+working fine (#326). The request past the limit has to wait for a slot.
+*/
+@(test)
+test_client_waits_for_a_stream_slot_under_the_peers_limit :: proc(t: ^testing.T) {
+	log := Client_Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 16),
+	}
+	defer delete(log.frames)
+	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write})
+	defer client_unref(c)
+
+	one := []u8{0, u8(Setting.Max_Concurrent_Streams), 0, 0, 0, 1}
+	testing.expect(t, client_handle_settings(c, Frame_Header{length = len(one), type = .Settings}, one))
+
+	reqs := [2]Limit_Request{{c = c}, {c = c}}
+	threads: [2]^thread.Thread
+	for &r, i in reqs {
+		threads[i] = thread.create_and_start_with_poly_data(&r, limit_request_run)
+	}
+
+	first, ok := limit_wait_opened(c, &log, 1)
+	testing.expect(t, ok, "no request opened a stream")
+	// Long enough for the second request to have opened one too, had it not waited.
+	time.sleep(200 * time.Millisecond)
+	opened, _ := limit_opened(c, &log)
+	testing.expect_value(t, opened, 1)
+
+	limit_answer(c, first)
+	second, ok2 := limit_wait_opened(c, &log, 2)
+	testing.expect(t, ok2, "the waiting request never opened its stream once a slot freed")
+	testing.expect(t, second != first, "the second request reused the first one's stream")
+	limit_answer(c, second)
+
+	for th in threads {
+		thread.join(th)
+		thread.destroy(th)
+	}
+	for r in reqs {
+		testing.expect_value(t, r.err, Client_Error.None)
+	}
+	free_all(context.temp_allocator)
 }
