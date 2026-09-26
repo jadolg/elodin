@@ -182,10 +182,10 @@ Stats :: struct {
 	*/
 	unreadable_rcode: u64,
 	/*
-	Answers counted in `cached` that the cache never held: an identical query
-	in flight forwarded them a moment before (see `inflight.odin`). They are
-	cache misses, so without this `cached` climbs past `cache_hits` with nothing
-	to account for the gap.
+	Queries given an identical in-flight query's outcome rather than their own
+	(see `inflight.odin`): its answer, counted in `cached` although the cache
+	never held it - so without this `cached` climbs past `cache_hits` with
+	nothing to account for the gap - or its failure, counted in `failed`.
 	*/
 	coalesced:        u64,
 }
@@ -1549,94 +1549,6 @@ resolve_query :: proc(
 		)
 	}
 
-	/*
-	One upstream exchange for every identical question in flight at once, which
-	`inflight.odin` argues. Not for a detached refresh, which `refresh.odin`
-	already runs one to a key.
-	*/
-	own_flight: Flight
-	flight: ^Flight
-	if unanswered == nil {
-		ceiling := follower_ceiling(s)
-		joined, leading, counted := flight_join(s, key, &own_flight, shared_worker, ceiling)
-		if leading {
-			flight = joined
-		} else if joined != nil {
-			patience := flight_patience(route_group(s, q.name, q.type))
-			landed_with, landed := flight_follow(s, joined, patience, allocator, counted)
-			if landed_with.answer != nil {
-				shared := Cached_Answer {
-					wire      = landed_with.answer,
-					key       = key,
-					checked   = generation,
-					ede       = landed_with.ede,
-					coalesced = true,
-				}
-				return serve_from_cache(
-					s,
-					shared,
-					query,
-					msg,
-					q,
-					proto,
-					client,
-					limit,
-					validating,
-					started,
-					spent,
-					allocator,
-					ede,
-				)
-			}
-			/*
-			The upstream gave the leader nothing after every attempt, and would
-			give this query the same: the failure branch below, without the wait.
-			Only where the leader's message was the one this query would send.
-			*/
-			if landed_with.failed && landed_with.canonical {
-				sync.atomic_add(&s.stats.coalesced, 1)
-				return upstream_failed(
-					s,
-					stale_hit,
-					query,
-					msg,
-					q,
-					proto,
-					client,
-					limit,
-					validating,
-					started,
-					spent,
-					allocator,
-					ede,
-					"upstream-coalesced",
-				)
-			}
-			// Starting over can change something: the leader's message was its
-			// own, or it stored a verdict the cache now answers with.
-			if landed && !rejoined && (!landed_with.canonical || landed_with.stored) {
-				return resolve_query(
-					s,
-					query,
-					msg,
-					proto,
-					client,
-					limit,
-					cookie,
-					started,
-					spent,
-					allocator,
-					shared_worker,
-					ede = ede,
-					rejoined = true,
-				)
-			}
-		}
-	}
-	defer if flight != nil {
-		flight_land(s, flight)
-	}
-
 	// Validation needs the signatures, so the question goes out again with DO
 	// and CD set rather than as the client wrote it.
 	forwarded := query
@@ -1941,10 +1853,103 @@ resolve_query :: proc(
 		forwarded,
 		u16(clamp(int(dns.peek_udp_size(forwarded)), dns.MAX_UDP_SIZE, UPSTREAM_UDP_SIZE)),
 	)
-	// Judged here, where the outgoing message has taken its final shape - the
-	// DNSSEC rewrite included, which is what `validating` still being set says.
-	if flight != nil {
-		flight.canonical = canonical(msg, query, rewritten = validating)
+
+	/*
+	One upstream exchange for every identical question in flight at once, which
+	`inflight.odin` argues. Not for a detached refresh, which `refresh.odin`
+	already runs one to a key.
+
+	Here, where the outgoing message has taken its final shape, because what a
+	follower may be handed turns on whether its message and the leader's are the
+	same bytes - see `canonical`. `validating` still being set says the DNSSEC
+	rewrite ran.
+	*/
+	own_flight: Flight
+	flight: ^Flight
+	if unanswered == nil {
+		ceiling := follower_ceiling(s)
+		joined, counted := flight_join(s, key, &own_flight, shared_worker, ceiling)
+		plain := canonical(msg, forwarded, validating, allocator)
+		if joined == &own_flight {
+			flight = joined
+			flight.canonical = plain
+		} else if joined != nil {
+			patience := flight_patience(route_group(s, q.name, q.type))
+			landed_with, landed := flight_follow(s, joined, patience, allocator, counted)
+			same := plain && landed_with.canonical
+			// A NOERROR or NXDOMAIN is shared as the cache shares it; any other
+			// rcode may be about the leader's own bytes, unless they were these.
+			if landed_with.answer != nil {
+				rcode := dns.peek_rcode(landed_with.answer)
+				if same || rcode == .No_Error || rcode == .NX_Domain {
+					shared := Cached_Answer {
+						wire      = landed_with.answer,
+						ede       = landed_with.ede,
+						coalesced = true,
+					}
+					return serve_from_cache(
+						s,
+						shared,
+						query,
+						msg,
+						q,
+						proto,
+						client,
+						limit,
+						validating,
+						started,
+						spent,
+						allocator,
+						ede,
+					)
+				}
+			}
+			/*
+			The upstream gave the leader nothing after every attempt, and would
+			give this query the same - its message is the same bytes - so the
+			failure branch below, without the wait.
+			*/
+			if landed_with.failed && same {
+				sync.atomic_add(&s.stats.coalesced, 1)
+				return upstream_failed(
+					s,
+					stale_hit,
+					query,
+					msg,
+					q,
+					proto,
+					client,
+					limit,
+					validating,
+					started,
+					spent,
+					allocator,
+					ede,
+					"upstream-coalesced",
+				)
+			}
+			// The leader stored a verdict, which the cache now answers with.
+			if landed && !rejoined && landed_with.stored {
+				return resolve_query(
+					s,
+					query,
+					msg,
+					proto,
+					client,
+					limit,
+					cookie,
+					started,
+					spent,
+					allocator,
+					shared_worker,
+					ede = ede,
+					rejoined = true,
+				)
+			}
+		}
+	}
+	defer if flight != nil {
+		flight_land(s, flight)
 	}
 
 	/*
@@ -2744,19 +2749,11 @@ resolve_query :: proc(
 	}
 	/*
 	What was just stored, or would have been, handed over and landed before
-	`settle_ad_bit` below writes into it - each follower settles its own copy.
-
-	From a leader that was not `canonical`, only an answer: a NOERROR or an
-	NXDOMAIN, the rcodes the cache itself keeps. Anything else - a FORMERR, a
-	REFUSED, a SERVFAIL - may be the upstream reading bytes of the client's own
-	that the key does not carry, so a follower starts over rather than take a
-	refusal of a message it did not send.
+	`settle_ad_bit` below writes into it - each follower settles its own copy,
+	and decides for itself whether the rcode is one it may take.
 	*/
 	if flight != nil {
-		rcode := dns.peek_rcode(resp)
-		if flight.canonical || rcode == .No_Error || rcode == .NX_Domain {
-			flight.answer, flight.ede = resp, answer_ede
-		}
+		flight.answer, flight.ede = resp, answer_ede
 		flight_land(s, flight)
 		flight = nil
 	}

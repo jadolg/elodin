@@ -20,28 +20,23 @@ else - which is also why an answer the cache declines to keep (a zero TTL, a
 routed apex `DS` nobody proved) is shared: it is the same answer to the same
 question, produced for a query that was waiting alongside this one.
 
-What else the leader lands with is shared only when it is about the question
-rather than about the leader's own message, and that turns on whether the leader
-was `canonical`: whether what it sent upstream is, byte for byte bar the ID, what
-any follower would have sent. Then a failure after `upstream.attempts` rounds
-over every server - where a lost datagram is retried - is the upstream's, and
-its followers take the expired entry or SERVFAIL as the leader did, rather than
-each wait a second full exchange for the same nothing, which in an outage is
-every pool worker held twice as long. A FORMERR from it is an answer like any
-other. A leader that was not canonical - no OPT record, a smaller payload size, an
-option of the client's own forwarded, records beside the question - may have
-failed over its own bytes, so its followers start over instead.
+A NOERROR or NXDOMAIN answer is shared with every follower, which is what the
+cache does with one. What else the leader lands with - any other rcode, or the
+upstream giving it nothing after `upstream.attempts` rounds over every server,
+where a lost datagram is retried - is shared only between queries that are both
+`canonical`: whose outgoing messages are the same bytes bar the ID, so that what
+came back is about the question rather than about one client's message. A
+follower given a failure takes the expired entry or SERVFAIL as the leader did,
+rather than wait a second full exchange for the same nothing, which in an outage
+is every pool worker held twice as long.
 
-Starting over is once, and it is back to the start: to the cache, and to this
-table, where one of them leads the next exchange for the rest. It is also what a
-follower does when the leader stored a verdict - a Bogus refusal, a cloaking
-refusal worth keeping - since the cache now holds the answer to give it. A
-refusal nothing remembers (a rebinding refusal, an unreadable reply) would only
-be reached again, so a follower of one forwards on its own at once, which is what
-every query did before this; so does one whose patience ran out, and one landing
-with nothing on its second pass. A cache miss counted on the first pass is
-counted again on the second, which leaves `cache_misses` a little ahead of the
-queries behind it - the one accounting gap here, on the rare path.
+A follower that cannot use what the leader landed with forwards on its own, which
+is what every query did before this - except where the leader stored a verdict
+(a Bogus refusal, a cloaking refusal worth keeping), when it goes back once to the
+start and finds that verdict in the cache. A cache miss counted on the first pass
+is counted again on the second, which leaves `cache_misses` a little ahead of the
+queries behind it - the one accounting gap here, on the rare path. So does a
+follower whose patience ran out.
 
 The leader waits for its followers to take their copies before it lets go, which
 is what lets the `Flight` live in its stack frame and the answer in its arena:
@@ -72,27 +67,17 @@ Inflight_Table :: struct {
 }
 
 /*
-The flight, and what its leader landed with.
+What a leader lands with, and a follower is handed.
 
-The result fields are the leader's alone until it lands: it writes them without
-the lock, and a follower reads them only once it has seen `landed` under the
-lock `flight_land` set it under.
+Written by the leader without the lock, into its own flight: a follower reads it
+only once it has seen `landed` under the lock `flight_land` set it under.
 */
 @(private)
-Flight :: struct {
-	// The leader's own key, which outlives the flight: the leader lands before
-	// its frame goes.
-	key:       string,
-	cond:      sync.Cond,
-	waiters:   int,
-	landed:    bool,
-	// Where this flight sits in the table, so landing need not look for it.
-	slot:      int,
-	// The leader's message is the one any follower would have sent; see
-	// `canonical`.
+Landing :: struct {
+	// The leader's message is `canonical`.
 	canonical: bool,
-	// The answer as the cache would have stored it, in the leader's arena. Nil
-	// when the leader forwarded nothing it could share.
+	// The answer as the cache would have stored it, in the leader's arena, or in
+	// the follower's once copied. Nil when the leader forwarded nothing.
 	answer:    []u8,
 	ede:       u16,
 	// The upstream produced nothing at all.
@@ -101,61 +86,48 @@ Flight :: struct {
 	stored:    bool,
 }
 
-/*
-Whether what this query sends upstream is what any identical one would.
-
-The forwarding path makes most of the outgoing message this server's own - the
-ID, the extended rcode, the cookie, subnet and keepalive options - and clamps
-the payload size to `UPSTREAM_UDP_SIZE`; the DNSSEC rewrite, where `rewritten`
-says it ran, goes further and writes the whole OPT record but its options. What
-is left is the client's, and canonical is none of it: records beside the
-question, an EDNS option that is forwarded (Padding excepted, being zeros that
-say nothing to anybody), the header's Z bit, and - where the OPT record is still
-the client's - its Z flags, a payload size below the clamp or no OPT record at
-all, the last two turning a mid-sized answer into a truncated one retried over
-TCP.
-*/
 @(private)
-canonical :: proc(msg: dns.Message, query: []u8, rewritten: bool) -> bool {
-	if len(msg.answer) > 0 || len(msg.authority) > 0 || msg.flags.z {
-		return false
-	}
-	opt: dns.Record
-	has_opt := false
-	for rec in msg.additional {
-		if rec.type != .OPT || has_opt {
-			return false
-		}
-		opt, has_opt = rec, true
-	}
-	if !rewritten {
-		// The low fifteen bits of the OPT TTL beneath DO are its Z flags.
-		if !has_opt || dns.peek_udp_size(query) < UPSTREAM_UDP_SIZE || opt.ttl & 0x7fff != 0 {
-			return false
-		}
-	}
-	if data, is_opt := opt.data.(dns.Rdata_OPT); has_opt && is_opt {
-		for o in data.options {
-			#partial switch dns.EDNS_Option_Code(o.code) {
-			case .Cookie, .Client_Subnet, .TCP_Keepalive, .Padding:
-			case:
-				return false
-			}
-		}
-	}
-	return true
+Flight :: struct {
+	// The leader's own key, which outlives the flight: the leader lands before
+	// its frame goes.
+	key:           string,
+	cond:          sync.Cond,
+	waiters:       int,
+	landed:        bool,
+	// Where this flight sits in the table, so landing need not look for it.
+	slot:          int,
+	using landing: Landing,
 }
 
 /*
-What a follower is handed once its leader lands. See `Flight` for each field.
+Whether this query's outgoing message is the one this server would build for
+its key and nothing else: the question, RD, the client's AD, CD, and an OPT
+record at `UPSTREAM_UDP_SIZE` carrying DO and no options.
+
+Compared as bytes, bar the ID, with a message built here, rather than by
+inspecting the fields that can differ: everything the forwarding path leaves as
+the client wrote it - records beside the question, EDNS options, header bits,
+OPT flags, a payload size below the clamp, no OPT at all, bytes past the last
+record - is then a difference without having to be named. `validating` says the
+DNSSEC rewrite ran, which sets CD and DO whatever the client asked.
 */
 @(private)
-Landing :: struct {
-	answer:    []u8,
-	ede:       u16,
-	canonical: bool,
-	failed:    bool,
-	stored:    bool,
+canonical :: proc(msg: dns.Message, forwarded: []u8, validating: bool, allocator: mem.Allocator) -> bool {
+	if len(msg.question) != 1 || len(forwarded) < dns.HEADER_SIZE {
+		return false
+	}
+	ref := dns.Message {
+		question   = msg.question,
+		additional = []dns.Record{dns.make_opt(UPSTREAM_UDP_SIZE, validating || dns.edns_do(msg))},
+	}
+	ref.flags.rd = true
+	ref.flags.ad = msg.flags.ad
+	ref.flags.cd = validating || msg.flags.cd
+	wire, _, err := dns.encode_message(ref, allocator)
+	if err != .None || len(wire) != len(forwarded) {
+		return false
+	}
+	return string(wire[2:]) == string(forwarded[2:])
 }
 
 /*
@@ -197,11 +169,10 @@ flight_patience :: proc(g: ^upstream.Group) -> time.Duration {
 /*
 Join the flight for `key`, leading it if there is none.
 
-`leading` true: the caller owns `flight` and must `flight_land` it. `leading`
-false with a flight: the caller is a follower and must `flight_follow` it,
-passing back `counted`. Nil: the table is full, or `shared` and the followers on
-the shared pool are at `ceiling` (zero is none), and the caller forwards on its
-own.
+`own` back: the caller leads, and must `flight_land` it. Another flight: the
+caller follows, and must `flight_follow` it, passing back `counted`. Nil: the
+table is full, or `shared` and the followers on the shared pool are at `ceiling`
+(zero is none), and the caller forwards on its own.
 */
 @(private)
 flight_join :: proc(
@@ -212,7 +183,6 @@ flight_join :: proc(
 	ceiling := 0,
 ) -> (
 	flight: ^Flight,
-	leading: bool,
 	counted: bool,
 ) {
 	sync.mutex_lock(&s.inflight.mu)
@@ -226,24 +196,24 @@ flight_join :: proc(
 		} else if f.key == key {
 			if shared && ceiling > 0 {
 				if s.inflight.followers >= ceiling {
-					return nil, false, false
+					return nil, false
 				}
 				s.inflight.followers += 1
 				counted = true
 			}
 			f.waiters += 1
-			return f, false, counted
+			return f, counted
 		}
 	}
 	if free_slot < 0 {
-		return nil, false, false
+		return nil, false
 	}
 	own^ = Flight {
 		key  = key,
 		slot = free_slot,
 	}
 	s.inflight.slots[free_slot] = own
-	return own, true, false
+	return own, false
 }
 
 /*
@@ -275,8 +245,7 @@ flight_follow :: proc(
 	}
 	landed = f.landed
 	if landed {
-		result.canonical, result.answer, result.ede = f.canonical, f.answer, f.ede
-		result.failed, result.stored = f.failed, f.stored
+		result = f.landing
 	}
 	sync.mutex_unlock(&s.inflight.mu)
 
