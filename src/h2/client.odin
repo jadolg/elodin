@@ -837,7 +837,8 @@ client_request :: proc(
 		encode_header(&block, "content-length", strconv.write_int(digits[:], i64(len(req.body)), 10))
 	}
 	end_stream: u8 = FLAG_END_STREAM if len(req.body) == 0 else 0
-	deadline := time.time_add(time.now(), timeout)
+	// A `Tick`, not a `Time`: this bounds waiting, and the wall clock steps.
+	deadline := time.tick_add(time.tick_now(), timeout)
 
 	sync.mutex_lock(&c.mu)
 	/*
@@ -866,7 +867,7 @@ client_request :: proc(
 			sync.cond_broadcast(&c.slot_cond)
 			break
 		}
-		remaining := time.diff(time.now(), deadline)
+		remaining := time.tick_diff(time.tick_now(), deadline)
 		if remaining <= 0 {
 			sync.mutex_unlock(&c.mu)
 			return {}, .Timeout
@@ -929,10 +930,13 @@ client_request :: proc(
 		sync.mutex_lock(&c.mu)
 		delete_key(&c.streams, stream_id)
 		client_stream_destroy(c, s)
-		// A slot is free: wake a request waiting on the peer's stream limit.
-		// Only a table that was at the limit can have one waiting.
+		// One slot is free: wake one request waiting on the peer's stream
+		// limit, not the whole queue to fight over it. Whoever wakes rechecks
+		// the table before its deadline, so the wake is never spent without
+		// the slot being taken. Only a table that was at the limit can have
+		// one waiting.
 		if len(c.streams) + 1 >= c.peer_max_streams {
-			sync.cond_broadcast(&c.slot_cond)
+			sync.cond_signal(&c.slot_cond)
 		}
 		sync.mutex_unlock(&c.mu)
 		client_unref(c)
@@ -958,7 +962,7 @@ client_request :: proc(
 
 	sync.mutex_lock(&c.mu)
 	for !s.done && !s.reset && !c.closed {
-		remaining := time.diff(time.now(), deadline)
+		remaining := time.tick_diff(time.tick_now(), deadline)
 		if remaining <= 0 {
 			sync.mutex_unlock(&c.mu)
 			client_rst_stream(c, stream_id, .Cancel)
@@ -991,7 +995,7 @@ client_request :: proc(
 // additionally by the caller's deadline since nothing else here would notice
 // a peer that simply never grants window.
 @(private)
-client_send_body :: proc(c: ^Client, s: ^Client_Stream, body: []u8, deadline: time.Time) -> bool {
+client_send_body :: proc(c: ^Client, s: ^Client_Stream, body: []u8, deadline: time.Tick) -> bool {
 	sent := 0
 	for sent < len(body) {
 		remaining := len(body) - sent
@@ -1045,7 +1049,7 @@ client_send_body :: proc(c: ^Client, s: ^Client_Stream, body: []u8, deadline: ti
 				s.send_window -= chunk
 				break
 			}
-			left := time.diff(time.now(), deadline)
+			left := time.tick_diff(time.tick_now(), deadline)
 			if left <= 0 {
 				// Marked before the write, same as the s.done branch above: DATA
 				// the peer already had in flight must find this stream already

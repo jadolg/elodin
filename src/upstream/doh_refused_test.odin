@@ -138,12 +138,7 @@ exchange_with_refusals :: proc(t: ^testing.T, refuse: int) -> (err: Error, heade
 	}
 	// What `get_h2_conn` builds once ALPN says h2, minus the TLS.
 	_ = net.set_option(socket, .Receive_Timeout, 100 * time.Millisecond)
-	hc := new(H2_Conn, u.allocator)
-	hc.stream = Stream {
-		socket = socket,
-	}
-	hc.client = h2.client_make(h2.IO{user = hc, read = h2_io_read, write = h2_io_write}, u.allocator)
-	hc.thread = thread.create_and_start_with_poly_data(hc.client, h2.client_serve)
+	hc := start_h2_conn(Stream{socket = socket}, u.allocator)
 	sync.mutex_lock(&u.mu)
 	u.proto = .H2
 	u.h2 = hc

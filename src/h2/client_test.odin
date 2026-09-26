@@ -1516,7 +1516,7 @@ test_client_send_body_stops_once_the_stream_is_reset_by_us :: proc(t: ^testing.T
 
 	clear(&log.frames)
 	body := []u8{1, 2, 3, 4}
-	sent := client_send_body(c, s, body, time.time_add(time.now(), time.Second))
+	sent := client_send_body(c, s, body, time.tick_add(time.tick_now(), time.Second))
 	testing.expect(t, !sent, "client_send_body wrote a body on a stream this connection had already reset")
 	for f in log.frames {
 		testing.expectf(t, f.type != .Data, "a DATA frame was written on a stream this connection had already reset")
@@ -1563,7 +1563,7 @@ test_client_send_body_stops_successfully_on_an_early_response :: proc(t: ^testin
 
 	clear(&log.frames)
 	body := []u8{1, 2, 3, 4}
-	sent := client_send_body(c, s, body, time.time_add(time.now(), time.Second))
+	sent := client_send_body(c, s, body, time.tick_add(time.tick_now(), time.Second))
 	testing.expect(t, sent, "an early response should stop the upload successfully, not report it as a failure")
 	saw_rst := false
 	for f in log.frames {
@@ -1620,7 +1620,7 @@ test_client_send_body_does_not_double_rst_a_stream_already_reset_by_us :: proc(t
 
 	clear(&log.frames)
 	body := []u8{1, 2, 3, 4}
-	sent := client_send_body(c, s, body, time.time_add(time.now(), time.Second))
+	sent := client_send_body(c, s, body, time.tick_add(time.tick_now(), time.Second))
 	testing.expect(t, sent, "an early response should stop the upload successfully")
 	for f in log.frames {
 		testing.expectf(t, f.type != .Rst_Stream, "a second RST_STREAM was sent on a stream already reset by this connection")
@@ -1666,7 +1666,7 @@ test_client_send_body_resets_the_stream_on_a_flow_control_timeout :: proc(t: ^te
 
 	clear(&log.frames)
 	body := []u8{1, 2, 3, 4}
-	sent := client_send_body(c, s, body, time.time_add(time.now(), -time.Second))
+	sent := client_send_body(c, s, body, time.tick_add(time.tick_now(), -time.Second))
 	testing.expect(t, !sent, "client_send_body should give up once the deadline has passed")
 
 	saw_rst := false
@@ -1756,7 +1756,7 @@ test_client_send_body_early_response_rst_suppresses_a_later_one :: proc(t: ^test
 
 	clear(&log.frames)
 	body := []u8{1, 2, 3, 4}
-	sent := client_send_body(c, s, body, time.time_add(time.now(), time.Second))
+	sent := client_send_body(c, s, body, time.tick_add(time.tick_now(), time.Second))
 	testing.expect(t, sent, "an early response should stop the upload successfully")
 	testing.expect(t, s.rst_sent, "client_send_body's own RST(NO_ERROR) did not mark the stream rst_sent")
 
@@ -1809,7 +1809,7 @@ test_client_send_body_flow_control_timeout_rst_is_not_forgotten :: proc(t: ^test
 
 	clear(&log.frames)
 	body := []u8{1, 2, 3, 4}
-	sent := client_send_body(c, s, body, time.time_add(time.now(), -time.Second))
+	sent := client_send_body(c, s, body, time.tick_add(time.tick_now(), -time.Second))
 	testing.expect(t, !sent, "client_send_body should give up once the deadline has passed")
 	testing.expect(t, s.rst_sent, "the flow-control timeout's own RST(.Cancel) did not mark the stream rst_sent")
 
@@ -2560,6 +2560,49 @@ test_client_keeps_a_complete_response_reset_after_it_finished :: proc(t: ^testin
 		sync.cond_broadcast(&c.cond)
 	}
 	sync.mutex_unlock(&c.mu)
+	thread.join(th)
+	thread.destroy(th)
+	testing.expect_value(t, r.err, Client_Error.None)
+	free_all(context.temp_allocator)
+}
+
+/*
+A SETTINGS that raises the limit frees a slot as surely as a stream leaving,
+and the request waiting on it must be let in then - not left until the held
+stream is answered, or until its own deadline.
+*/
+@(test)
+test_client_a_raised_stream_limit_lets_a_waiting_request_in :: proc(t: ^testing.T) {
+	log := Client_Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 16),
+	}
+	defer delete(log.frames)
+	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write})
+	defer client_unref(c)
+
+	// One slot, held by a stream that is never answered.
+	one := []u8{0, u8(Setting.Max_Concurrent_Streams), 0, 0, 0, 1}
+	testing.expect(t, client_handle_settings(c, Frame_Header{length = len(one), type = .Settings}, one))
+	held := open_test_stream(c, 1, context.allocator)
+	defer {
+		delete_key(&c.streams, u32(1))
+		client_stream_destroy(c, held)
+	}
+
+	r := Limit_Request {
+		c = c,
+	}
+	th := thread.create_and_start_with_poly_data(&r, limit_request_run)
+	time.sleep(100 * time.Millisecond)
+	opened, _ := limit_opened(c, &log)
+	testing.expect_value(t, opened, 0)
+
+	two := []u8{0, u8(Setting.Max_Concurrent_Streams), 0, 0, 0, 2}
+	testing.expect(t, client_handle_settings(c, Frame_Header{length = len(two), type = .Settings}, two))
+	id, ok := limit_wait_opened(c, &log, 1)
+	testing.expect(t, ok, "the raised limit did not let the waiting request in")
+	limit_answer(c, id)
+
 	thread.join(th)
 	thread.destroy(th)
 	testing.expect_value(t, r.err, Client_Error.None)
