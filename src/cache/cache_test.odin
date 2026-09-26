@@ -819,5 +819,20 @@ test_a_denial_without_a_soa_is_not_cached :: proc(t: ^testing.T) {
 	testing.expect(t, !put(c, key_for(kb[:], "referral.example.test."), w3, m3), "a referral was cached as NODATA")
 
 	testing.expect_value(t, len_entries(c), 0)
+
+	// The control: the same NODATA with a SOA beside it is kept, so the three
+	// refusals above are the missing SOA and not something else about them.
+	nodata.authority = []dns.Record {
+		{
+			name = "example.test.",
+			type = .SOA,
+			class = .IN,
+			ttl = 3600,
+			data = dns.Rdata_SOA{ns = "ns1.example.test.", mbox = "hostmaster.example.test.", serial = 1, minimum = 60},
+		},
+	}
+	w4, _, _ := dns.encode_message(nodata, context.temp_allocator)
+	m4, _ := dns.decode_message(w4, context.temp_allocator)
+	testing.expect(t, put(c, key_for(kb[:], "nodata.example.test."), w4, m4), "a NODATA with a SOA was not cached")
 	free_all(context.temp_allocator)
 }

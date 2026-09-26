@@ -712,8 +712,8 @@ run_cache_cases :: proc(r: ^Runner) {
 	upstream_port := next_port(r)
 	mock := mock_make("cache", upstream_port)
 	mock_reply(mock, fix.qname, fix.qtype, from_hex(fix.response, context.allocator))
-	mock_reply(mock, "nx.example.com.", u16(dns.Type.A), nxdomain_reply("nx.example.com.", data = false))
-	mock_reply(mock, POISONED_NAME, u16(dns.Type.A), nxdomain_reply(POISONED_NAME, data = true))
+	mock_reply(mock, "nx.example.com.", u16(dns.Type.A), denial_reply("nx.example.com.", .No_Error, data = false))
+	mock_reply(mock, POISONED_NAME, u16(dns.Type.A), denial_reply(POISONED_NAME, .NX_Domain, data = true))
 	mock_reply(mock, "nosoa.example.com.", u16(dns.Type.A), nil)
 	mock_reply(mock, "referral.example.com.", u16(dns.Type.A), referral_reply("referral.example.com."))
 	// Any other question (the AAAA case below) gets a matching synthesised
@@ -1001,15 +1001,15 @@ has_opt_record :: proc(r: ^Runner, wire: []u8) -> bool {
 POISONED_NAME :: "poisoned.example.com."
 
 /*
-The canned NXDOMAIN, over an A record at the denied name when `data` is set,
-built once and left on the heap.
+A canned denial with the zone's SOA beside it - a NODATA, or an NXDOMAIN over an
+A record at the denied name when `data` is set - built once and left on the heap.
 
 The mock keeps the slice for the whole run and `end_case` empties the temp arena
 long before the case that asks for it, which is why every other canned payload
 in the suite is allocated the same way.
 */
 @(private = "file")
-nxdomain_reply :: proc(name: string, data: bool) -> []u8 {
+denial_reply :: proc(name: string, rcode: dns.Rcode, data: bool) -> []u8 {
 	answer := make([]dns.Record, 1 if data else 0, context.temp_allocator)
 	if data {
 		answer[0] = dns.Record {
@@ -1041,7 +1041,7 @@ nxdomain_reply :: proc(name: string, data: bool) -> []u8 {
 	msg.flags.qr = true
 	msg.flags.rd = true
 	msg.flags.ra = true
-	msg.flags.rcode = u8(dns.Rcode.NX_Domain)
+	msg.flags.rcode = u8(rcode)
 	wire, _, err := dns.encode_message(msg, context.allocator)
 	if err != .None {
 		return nil

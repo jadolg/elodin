@@ -2532,8 +2532,8 @@ resolve_query :: proc(
 			description of the wire beside it - what the rcode means, whether
 			the answer redirects, how long any of it is good for - and a reading
 			that stopped after the answer section has no authority section, so a
-			denial arrives with no SOA in it and is given the fallback lifetime
-			rather than the one its own zone set. Nothing further on notices the
+			denial arrives with no SOA in it and is turned away, while an answer
+			is kept on a reading of half of it. Nothing further on notices the
 			disagreement: `scan_ttl_offsets` is far more forgiving than the
 			decoder - it follows no compression pointers and bounds no name - so
 			it succeeds on the real wire and the entry goes in looking sound.

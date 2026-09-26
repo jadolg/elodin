@@ -2326,8 +2326,9 @@ records that are already here - no walk, no lookup, no chance of turning a
 question about a TTL into an upstream query. A sender padding the SOA with
 signatures does not buy a fixed allowance of its own, though: it draws on the
 query-wide `MAX_VERIFICATIONS_PER_QUERY`, which the denial's own proof has just
-been spending. Running it out here drops the SOA - the denial stays proven and
-loses only its negative TTL - and says so at debug rather than passing for a
+been spending. Running it out here drops the SOA - the denial stays proven but
+loses its negative TTL, and with it its place in the server's cache, which keeps
+no denial without a SOA - and says so at debug rather than passing for a
 signature that failed.
 
 One owner name is looked at, and it is the apex of that zone: RFC 2308 puts the
@@ -4723,7 +4724,8 @@ rrset_ttl :: proc(records: []dns.Record) -> u32 {
 
 @(private)
 negative_ttl :: proc(msg: dns.Message) -> u32 {
-	return dns.negative_ttl(msg, MIN_ZONE_TTL)
+	ttl, _ := dns.negative_ttl(msg, MIN_ZONE_TTL)
+	return ttl
 }
 
 @(private)

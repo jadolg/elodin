@@ -555,14 +555,15 @@ min_ttl :: proc(ttls: []u32) -> (v: u32, ok: bool) {
 }
 
 // TTL to cache a negative answer for: the SOA MINIMUM capped by the SOA TTL
-// (RFC 2308). Falls back to `fallback` when no SOA is present.
-negative_ttl :: proc(m: Message, fallback: u32) -> u32 {
+// (RFC 2308). Falls back to `fallback`, with `has_soa` false, when no SOA is
+// present.
+negative_ttl :: proc(m: Message, fallback: u32) -> (ttl: u32, has_soa: bool) {
 	for rec in m.authority {
 		if soa, is_soa := rec.data.(Rdata_SOA); is_soa {
-			return min(soa.minimum, rec.ttl)
+			return min(soa.minimum, rec.ttl), true
 		}
 	}
-	return fallback
+	return fallback, false
 }
 
 set_rcode :: proc(m: ^Message, rcode: Rcode) {

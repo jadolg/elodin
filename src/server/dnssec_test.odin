@@ -506,10 +506,9 @@ is held for the shortest TTL among the records that are left. The other branch
 reads the SOA, which is exactly what the prune took away.
 
 Worth pinning because it comes out right by which branch the message falls into
-rather than by anything the prune does on purpose. The cache here is built with
-`negative_ttl` 0 to make that visible: had this entry taken the negative branch
-there would be no SOA left to read and no fallback to stand in for it, and
-`cache.put` would have refused it. An answer shape that quietly stopped being
+rather than by anything the prune does on purpose: had this entry taken the
+negative branch there would be no SOA left to read, and `cache.put` refuses a
+denial without one. An answer shape that quietly stopped being
 cacheable would send every AAAA lookup for a CNAME'd name upstream, every time,
 with nothing to connect it to this change.
 

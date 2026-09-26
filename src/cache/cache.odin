@@ -778,14 +778,11 @@ put :: proc(
 	authority section this cache would otherwise serve as a NODATA. dnsmasq
 	and BIND remember nothing without the SOA; neither does this.
 	*/
-	if !bogus && (rcode == .NX_Domain || len(msg.answer) == 0) {
-		has_soa := false
-		for rec in msg.authority {
-			if _, is_soa := rec.data.(dns.Rdata_SOA); is_soa {
-				has_soa = true
-				break
-			}
-		}
+	negative := !bogus && (rcode == .NX_Domain || len(msg.answer) == 0)
+	soa_ttl: u32
+	if negative {
+		has_soa: bool
+		soa_ttl, has_soa = dns.negative_ttl(msg, 0)
 		if !has_soa {
 			return false
 		}
@@ -827,8 +824,8 @@ put :: proc(
 		// minute this is allowed to.
 		effective = min(u32(BOGUS_TTL), c.max_ttl)
 	} else {
-		if rcode == .NX_Domain || len(msg.answer) == 0 {
-			effective = dns.negative_ttl(msg, c.negative_ttl)
+		if negative {
+			effective = soa_ttl
 			if c.negative_ttl > 0 {
 				effective = min(effective, c.negative_ttl)
 			}
