@@ -776,6 +776,16 @@ test_a_route_apex_ds_under_a_private_reverse_zone_is_answered_here :: proc(t: ^t
 	testing.expect_value(t, kind, Special_Use.None)
 	_, kind = special_use_zone(&s, "10.in-addr.arpa.", .DS)
 	testing.expect_value(t, kind, Special_Use.None)
+
+	// An anchor at the route's own apex says nothing about its parent, which is
+	// still this empty zone, so the DS stays here. An anchor over the parent
+	// means the operator has real data there, and the table stands down.
+	s.anchor_zones = []string{"1.168.192.in-addr.arpa."}
+	_, kind = special_use_zone(&s, "1.168.192.in-addr.arpa.", .DS)
+	testing.expect_value(t, kind, Special_Use.Empty_Nonterminal)
+	s.anchor_zones = []string{"168.192.in-addr.arpa."}
+	_, kind = special_use_zone(&s, "1.168.192.in-addr.arpa.", .DS)
+	testing.expect_value(t, kind, Special_Use.None)
 }
 
 /*

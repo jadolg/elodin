@@ -370,9 +370,10 @@ Special_Use :: enum u8 {
 	// as RFC 6303 section 3 asks; the argument for why `home.arpa.` is not
 	// simply `Nonexistent` is above.
 	Empty_Zone,
-	// NODATA: a name inside an empty zone with a route or anchor below it. The
-	// zone down there exists, so this name does too, and a name error for it
-	// would deny the routed zone to an RFC 8020 cache.
+	// NODATA: a name inside an empty zone with a route, anchor or rewrite below
+	// it. The zone down there exists, so this name does too, and a name error
+	// for it would deny the routed zone to an RFC 8020 cache. Also the `DS` at a
+	// route's apex whose parent is the empty zone.
 	Empty_Nonterminal,
 }
 
@@ -400,13 +401,14 @@ queried name's parent, which for `a.b.onion.` is `b.onion.`, a zone nobody has
 ever been authoritative for. Same label-boundary, case-folding test as
 everything else in this file, so `notlocalhost.` is not inside `localhost.`.
 
-`type` is here for one question only, and it is a question about an empty
-zone's apex: the `DS` at `home.arpa.` has to be forwarded rather than answered,
-RFC 8375 section 4 item 4.B being explicit that this one query escapes the
-table, and the private reverse zones' apex `DS` goes out for the same reason.
-Nothing else in here looks at the type, which is why the caller's `.None` means "forward it"
-rather than "no such zone" - for that one question the zone is in the table and
-the answer still is not.
+`type` is here for `DS` only. The `DS` at an empty zone's apex has to be
+forwarded rather than answered: RFC 8375 section 4 item 4.B is explicit that
+this one query escapes the table for `home.arpa.`, and the private reverse
+zones' apex `DS` goes out for the same reason. That is why the caller's `.None`
+means "forward it" rather than "no such zone" - for that one question the zone
+is in the table and the answer still is not. The other way round, the `DS` at a
+route's apex inside a private reverse zone is answered here, its parent being
+this empty zone.
 */
 @(private)
 special_use_zone :: proc(
@@ -460,15 +462,22 @@ special_use_zone :: proc(
 	// above and is not this one's to answer.
 	if s.cfg.special_use.private_reverse {
 		z, found := locally_served_zone(name)
-		if found && z != "home.arpa." && !covered_by_local_anchor(s, name) {
+		if found && z != "home.arpa." {
 			at_apex := dns.name_equal_fold(name, z)
 			// A route's apex `DS` is its parent's to answer (`route_group`), and
 			// inside this zone the parent is this empty zone: NODATA here, where
 			// forwarding it would name the routed subnet to `upstream.servers`.
-			if type == .DS && !at_apex && is_route_apex(s, name) && !is_zone_routed(s, dns.name_parent(name)) {
+			// Judged on the parent, so an anchor at the route's own apex does not
+			// send it out; one over the parent does.
+			parent := dns.name_parent(name)
+			if type == .DS &&
+			   !at_apex &&
+			   is_route_apex(s, name) &&
+			   !is_zone_routed(s, parent) &&
+			   !covered_by_local_anchor(s, parent) {
 				return z, .Empty_Nonterminal
 			}
-			if !is_zone_routed(s, name) {
+			if !is_zone_routed(s, name) && !covered_by_local_anchor(s, name) {
 				// Every one of these is delegated to AS112 without a DS, and the
 				// signed proof of that lives in the parent - the apex `DS` goes
 				// out for the reason `home.arpa.`'s does.

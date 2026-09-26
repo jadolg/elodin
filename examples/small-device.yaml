@@ -156,11 +156,13 @@ upstream:
   # from the rebinding guard below, since answering with 192.168.1.x is the
   # whole job. `--check` says both out loud.
   #
-  # The reverse zone goes there too, so `nslookup 192.168.1.20` gets the lease's
-  # name back. Without it, `special_use.private_reverse` answers it NXDOMAIN
-  # here; with it, the route wins. Match it to your LAN's range.
+  # LAN PTRs are answered NXDOMAIN here by `special_use.private_reverse`. To
+  # get lease names back from `nslookup 192.168.1.20`, add your reverse zone
+  # (168.192.in-addr.arpa) to `domains` - but only with `bogus-priv` set in
+  # dnsmasq, or a PTR it has no lease for is forwarded back to elodin and
+  # routed to dnsmasq again.
   zones:
-    - domains: [home.arpa, 168.192.in-addr.arpa]
+    - domains: [home.arpa]
       servers: ["127.0.0.1:5353"]
 
 cache:

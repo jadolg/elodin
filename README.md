@@ -2261,7 +2261,10 @@ If your router answers PTRs for its DHCP leases, route the zone to it —
 `upstream.zones: [{domains: [168.192.in-addr.arpa], servers: [192.168.1.1]}]` —
 and those names go there instead: a route over a name wins over this key, and so
 does a [trust anchor](#dnssec) you configured over the zone while `dnssec.enabled`
-is on. `private_reverse: false` sends them all back to `upstream.servers` as
+is on. The same goes for a VPN that numbers its peers from CGNAT space and
+answers their PTRs — Tailscale's MagicDNS at `100.100.100.100`, say: route
+`100.in-addr.arpa` to it, or its peers' reverse names are NXDOMAIN here.
+`private_reverse: false` sends them all back to `upstream.servers` as
 before. These answers log as `outcome=local detail=private-reverse` and are left
 out of the `special_use` counter below, which every LAN PTR would otherwise
 drown.
