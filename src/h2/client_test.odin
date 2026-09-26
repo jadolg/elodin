@@ -2530,3 +2530,37 @@ test_client_a_zero_stream_limit_with_nothing_open_closes_the_connection :: proc(
 	testing.expect_value(t, opened, 0)
 	free_all(context.temp_allocator)
 }
+
+/*
+RFC 9113 8.1: a server may answer in full and then RST_STREAM(NO_ERROR) the
+upload, and the client MUST NOT discard that response. When the reset lands
+before the waiter looks, the complete response still wins.
+*/
+@(test)
+test_client_keeps_a_complete_response_reset_after_it_finished :: proc(t: ^testing.T) {
+	log := Client_Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 16),
+	}
+	defer delete(log.frames)
+	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write})
+	defer client_unref(c)
+
+	r := Limit_Request {
+		c = c,
+	}
+	th := thread.create_and_start_with_poly_data(&r, limit_request_run)
+	id, ok := limit_wait_opened(c, &log, 1)
+	testing.expect(t, ok, "the request never opened a stream")
+	sync.mutex_lock(&c.mu)
+	if s, found := c.streams[id]; found {
+		s.status = 200
+		s.done = true
+		s.reset = true
+		sync.cond_broadcast(&c.cond)
+	}
+	sync.mutex_unlock(&c.mu)
+	thread.join(th)
+	thread.destroy(th)
+	testing.expect_value(t, r.err, Client_Error.None)
+	free_all(context.temp_allocator)
+}

@@ -844,10 +844,19 @@ client_request :: proc(
 	caller's cleanup below, and waiting that little longer is the safe side.
 	*/
 	for len(c.streams) >= c.peer_max_streams && !c.closed {
-		// A limit of zero with nothing open frees no slot: only another
-		// SETTINGS would, and nothing says one is coming. Give the connection
-		// up, as on id exhaustion below, so the next request dials afresh
-		// instead of every query waiting out its timeout here.
+		/*
+		A limit of zero with nothing open frees no slot: only another SETTINGS
+		would, and nothing says one is coming. Give the connection up, as on id
+		exhaustion below, so the next request dials afresh instead of every
+		query waiting out its timeout here.
+
+		The trade, settled so it is not reargued: RFC 9113 6.5.2 says zero
+		SHOULD NOT be special, and in the same paragraph that a server should
+		only advertise it briefly and close a connection it wants no requests
+		on. What a brief zero costs here is one handshake; what waiting costs is
+		every query's whole timeout, charged to the upstream as silence. Zero
+		with streams still open is not special: those free slots as usual.
+		*/
 		if len(c.streams) == 0 {
 			c.closed = true
 			sync.cond_broadcast(&c.cond)
@@ -955,7 +964,9 @@ client_request :: proc(
 	}
 
 	switch {
-	case s.reset:
+	// A reset after a complete response is the peer ending the upload early
+	// (RFC 9113 8.1), and the client MUST NOT discard that response.
+	case s.reset && !s.done:
 		refused := s.refused
 		sync.mutex_unlock(&c.mu)
 		return {}, .Refused if refused else .Reset
