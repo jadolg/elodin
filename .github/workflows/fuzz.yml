@@ -72,8 +72,14 @@ jobs:
           [ -f "$dict" ] || dict=""
           # A target that needs inputs past libFuzzer's default 4 KB cap says so
           # in <target>.max_len, next to its dict: the one line that is a bare
-          # number is the cap, and `#` lines say why it needs it.
-          len=$(grep -sxE '[0-9]+' testdata/fuzz-corpus/${{ matrix.target }}.max_len || true)
+          # number is the cap, and `#` lines say why it needs it. A file without
+          # exactly one such line fails here rather than fuzzing at the default.
+          len=""
+          f=testdata/fuzz-corpus/${{ matrix.target }}.max_len
+          if [ -f "$f" ]; then
+            len=$(grep -xE '[0-9]+' "$f" || true)
+            [[ $len =~ ^[0-9]+$ ]] || { echo "::error file=$f::needs exactly one line that is a bare number"; exit 1; }
+          fi
           ASAN_OPTIONS=detect_leaks=0 ./bin/fuzz_${{ matrix.target }} \
             ${dict:+-dict=$dict} \
             ${len:+-max_len=$len} \
