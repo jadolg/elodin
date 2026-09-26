@@ -1108,9 +1108,6 @@ resolve_query :: proc(
 	it; see `ceiling_ede`.
 	*/
 	ede: ^u16 = nil,
-	// Set on the second pass of a follower whose flight landed with nothing to
-	// share, so it does not start over again. See `inflight.odin`.
-	rejoined := false,
 ) -> (
 	response: []u8,
 	outcome: Outcome,
@@ -1384,23 +1381,11 @@ resolve_query :: proc(
 	*/
 	stale_hit: Cached_Answer
 
-	if s.cfg.cache.enabled {
-		if wire, hit, found := cache.get(s.answers, key, allocator, checked_against = generation); found {
-			stored := Cached_Answer {
-				wire    = wire,
-				key     = key,
-				stale   = hit.stale,
-				recheck = hit.recheck,
-				refused = hit.refused,
-				ede     = hit.ede,
-				serial  = hit.serial,
-				checked = generation,
-			}
-			if !hit.stale {
-				return serve_from_cache(s, stored, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
-			}
-			stale_hit = stored
+	if stored, found := stored_answer(s, key, generation, allocator); found {
+		if !stored.stale {
+			return serve_from_cache(s, stored, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
 		}
+		stale_hit = stored
 	}
 
 	/*
@@ -1466,14 +1451,8 @@ resolve_query :: proc(
 	gives a verdict no stale window for that reason, so this asks a question the
 	cache has already answered - and asks it anyway rather than resting on it.
 	*/
-	if validating && s.cfg.cache.enabled {
-		if wire, hit, found := cache.get(s.answers, verdict_key, allocator, probe = true);
-		   found && !hit.stale {
-			remembered := Cached_Answer {
-				wire   = wire,
-				key    = verdict_key,
-				serial = hit.serial,
-			}
+	if validating {
+		if remembered, found := stored_verdict(s, verdict_key, allocator); found {
 			return serve_bogus_verdict(s, remembered, query, msg, q, proto, client, started)
 		}
 	}
@@ -1926,23 +1905,36 @@ resolve_query :: proc(
 					"upstream-coalesced",
 				)
 			}
-			// The leader stored a verdict, which the cache now answers with.
-			if landed && !rejoined && landed_with.stored {
-				return resolve_query(
-					s,
-					query,
-					msg,
-					proto,
-					client,
-					limit,
-					cookie,
-					started,
-					spent,
-					allocator,
-					shared_worker,
-					ede = ede,
-					rejoined = true,
-				)
+			/*
+			The leader stored a verdict, which the cache now answers with: a
+			cloaking refusal under the question's own key, which `serve_from_cache`
+			refuses from the entry, or a Bogus one under its verdict key, read
+			under the same condition as the lookup above. Neither there - evicted,
+			or behind a reload - and this query forwards on its own.
+			*/
+			if landed && landed_with.stored {
+				if stored, found := stored_answer(s, key, generation, allocator); found && !stored.stale {
+					return serve_from_cache(
+						s,
+						stored,
+						query,
+						msg,
+						q,
+						proto,
+						client,
+						limit,
+						validating,
+						started,
+						spent,
+						allocator,
+						ede,
+					)
+				}
+				if validating {
+					if remembered, found := stored_verdict(s, verdict_key, allocator); found {
+						return serve_bogus_verdict(s, remembered, query, msg, q, proto, client, started)
+					}
+				}
 			}
 		}
 	}
@@ -2768,6 +2760,58 @@ resolve_query :: proc(
 	settle_ad_bit(resp, msg, validating)
 	log_query(s, client, proto, q, .Forwarded, answering_upstream(winner), started)
 	return resp, .Forwarded, true
+}
+
+// The entry under `key`, fresh or expired, as the answer path reads it.
+@(private)
+stored_answer :: proc(
+	s: ^Server,
+	key: string,
+	generation: u64,
+	allocator: mem.Allocator,
+) -> (
+	stored: Cached_Answer,
+	found: bool,
+) {
+	if !s.cfg.cache.enabled {
+		return
+	}
+	wire, hit, got := cache.get(s.answers, key, allocator, checked_against = generation)
+	if !got {
+		return
+	}
+	stored = Cached_Answer {
+		wire    = wire,
+		key     = key,
+		stale   = hit.stale,
+		recheck = hit.recheck,
+		refused = hit.refused,
+		ede     = hit.ede,
+		serial  = hit.serial,
+		checked = generation,
+	}
+	return stored, true
+}
+
+// A live Bogus verdict under `verdict_key`, looked up as a `probe` - see where
+// `resolve_query` first asks for one.
+@(private)
+stored_verdict :: proc(
+	s: ^Server,
+	verdict_key: string,
+	allocator: mem.Allocator,
+) -> (
+	remembered: Cached_Answer,
+	found: bool,
+) {
+	if !s.cfg.cache.enabled {
+		return
+	}
+	wire, hit, got := cache.get(s.answers, verdict_key, allocator, probe = true)
+	if !got || hit.stale {
+		return
+	}
+	return Cached_Answer{wire = wire, key = verdict_key, serial = hit.serial}, true
 }
 
 // No answer from the upstream at all: the expired entry if one is held, SERVFAIL

@@ -34,11 +34,10 @@ in an outage is every pool worker held twice as long.
 
 A follower that cannot use what the leader landed with forwards on its own, which
 is what every query did before this - except where the leader stored a verdict
-(a Bogus refusal, a cloaking refusal worth keeping), when it goes back once to the
-start and finds that verdict in the cache. A cache miss counted on the first pass
-is counted again on the second, which leaves `cache_misses` a little ahead of the
-queries behind it - the one accounting gap here, on the rare path. So does a
-follower whose patience ran out.
+(a Bogus refusal, a cloaking refusal worth keeping), when it reads that verdict
+straight out of the cache and is refused from it. The cloaking one is a counted
+lookup, so that follower's query shows as a miss and then a hit. A follower
+whose patience ran out forwards on its own too.
 
 The leader waits for its followers to take their copies before it lets go, which
 is what lets the `Flight` live in its stack frame and the answer in its arena:
