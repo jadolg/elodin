@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@v7
       - id: list
         run: |
-          list=$(cd src/fuzz && ls -d */ | tr -d / | grep -vx harness | jq -Rsc 'split("\n") | map(select(. != ""))')
+          list=$(cd src/fuzz && ls -d */ | tr -d / | grep -vx harness | jq -Rnc '[inputs]')
           echo "list=$list" >> "$GITHUB_OUTPUT"
 
   fuzz:
