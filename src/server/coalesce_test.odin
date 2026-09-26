@@ -9,6 +9,8 @@ import "core:time"
 import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:dnssec"
+import "elodin:filter"
 import "elodin:upstream"
 
 /*
@@ -42,7 +44,29 @@ Mock :: struct {
 	drop_first: bool,
 	// The rcode the first query is answered with; every later one is NOERROR.
 	first:      dns.Rcode,
+	// Answer the question with a CNAME into `TRACKER` rather than an address.
+	cloak:      bool,
+	// Answer any other question - a chain lookup - with an empty NOERROR,
+	// uncounted: a zone that published no keys, which is a Bogus verdict.
+	others:     bool,
 	queries:    int,
+	lookups:    int,
+}
+
+@(private = "file")
+TRACKER :: "tracker.evil.test."
+
+// Whether this query is the client's question rather than one of the
+// validator's own.
+@(private = "file")
+asks_qname :: proc(query: []u8) -> bool {
+	want: [dns.MAX_NAME_WIRE + 4]u8
+	n, err := dns.encode_name(QNAME, want[:])
+	if err != .None {
+		return false
+	}
+	want[n], want[n + 1], want[n + 2], want[n + 3] = 0, u8(dns.Type.A), 0, u8(dns.Class.IN)
+	return len(query) >= dns.HEADER_SIZE + n + 4 && string(query[dns.HEADER_SIZE:][:n + 4]) == string(want[:n + 4])
 }
 
 @(private = "file")
@@ -80,6 +104,13 @@ serve_mock :: proc(m: ^Mock) {
 		if err != nil || n < dns.HEADER_SIZE {
 			return
 		}
+		if m.others && !asks_qname(buf[:n]) {
+			m.lookups += 1
+			buf[2] |= 0x80 // QR
+			buf[3] |= 0x80 // RA
+			_, _ = net.send_udp(m.socket, buf[:n], remote)
+			continue
+		}
 		m.queries += 1
 		if m.queries == 1 {
 			// Quiet for longer than the leader can take to give up, so a
@@ -97,20 +128,36 @@ serve_mock :: proc(m: ^Mock) {
 		if m.silent || (m.drop_first && m.queries == 1) {
 			continue
 		}
-		reply := coalesce_reply(buf[0], buf[1], m.ttl, m.first if m.queries == 1 else .No_Error)
+		reply := coalesce_reply(buf[0], buf[1], m.ttl, m.first if m.queries == 1 else .No_Error, m.cloak)
 		_, _ = net.send_udp(m.socket, reply, remote)
 	}
 }
 
 @(private = "file")
-coalesce_reply :: proc(hi, lo: u8, ttl: u32, rcode: dns.Rcode) -> []u8 {
-	answer := make([]dns.Record, 1, context.temp_allocator)
+coalesce_reply :: proc(hi, lo: u8, ttl: u32, rcode: dns.Rcode, cloak := false) -> []u8 {
+	answer := make([]dns.Record, 2 if cloak else 1, context.temp_allocator)
 	answer[0] = dns.Record {
 		name  = QNAME,
 		type  = .A,
 		class = .IN,
 		ttl   = ttl,
 		data  = dns.Rdata_A{addr = {192, 0, 2, 7}},
+	}
+	if cloak {
+		answer[0] = dns.Record {
+			name  = QNAME,
+			type  = .CNAME,
+			class = .IN,
+			ttl   = ttl,
+			data  = dns.Rdata_Name{name = TRACKER},
+		}
+		answer[1] = dns.Record {
+			name  = TRACKER,
+			type  = .A,
+			class = .IN,
+			ttl   = ttl,
+			data  = dns.Rdata_A{addr = {192, 0, 2, 7}},
+		}
 	}
 	question := make([]dns.Question, 1, context.temp_allocator)
 	question[0] = dns.Question{name = QNAME, type = .A, class = .IN}
@@ -132,14 +179,15 @@ coalesce_reply :: proc(hi, lo: u8, ttl: u32, rcode: dns.Rcode) -> []u8 {
 
 @(private = "file")
 Client :: struct {
-	srv:   ^Server,
-	id:    u16,
+	srv:     ^Server,
+	id:      u16,
 	// Ask with an OPT record at `UPSTREAM_UDP_SIZE`, or without one as an old
 	// stub does, which is a different message to the upstream.
-	edns:  bool,
-	rcode: dns.Rcode,
-	addr:  [4]u8,
-	ok:    bool,
+	edns:    bool,
+	rcode:   dns.Rcode,
+	addr:    [4]u8,
+	outcome: Outcome,
+	ok:      bool,
 }
 
 @(private = "file")
@@ -158,7 +206,8 @@ ask :: proc(c: ^Client) {
 		msg.additional = additional
 	}
 	query, _, _ := dns.encode_message(msg, context.temp_allocator)
-	out, _, served := handle_query(c.srv, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, served := handle_query(c.srv, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	c.outcome = outcome
 	if !served {
 		return
 	}
@@ -195,6 +244,19 @@ run_burst :: proc(
 	// follow it, so the leader's message is not theirs.
 	mixed := false,
 	cache_on := true,
+	// A real validator, which the mock's empty key sets turn into a Bogus
+	// verdict for the unsigned answer.
+	validating := false,
+	// Blocking on, with `TRACKER` listed and the answer a CNAME into it.
+	cloak := false,
+	// How many of the validator's own lookups reached the mock.
+	lookups: ^int = nil,
+	// How many followers the mock holds the first query for, and how many
+	// clients ask at all.
+	hold_for := CLIENTS - 1,
+	clients_asking := CLIENTS,
+	// The cache's counters once the burst is over.
+	cache_stats: ^cache.Stats = nil,
 	// The server's counters once the burst is over.
 	stats: ^Stats = nil,
 ) -> int {
@@ -211,9 +273,9 @@ run_burst :: proc(
 
 	cfg := config.default_config()
 	cfg.log.queries = false
-	cfg.blocking.enabled = false
+	cfg.blocking.enabled = cloak
 	cfg.cache.enabled = cache_on
-	cfg.dnssec.enabled = false
+	cfg.dnssec.enabled = validating
 	cfg.upstream.strategy = .Failover
 	cfg.upstream.attempts = attempts
 	cfg.upstream.timeout = timeout
@@ -237,19 +299,38 @@ run_burst :: proc(
 		group   = group,
 		answers = answers,
 	}
+	if validating {
+		srv.validator = dnssec.make_validator(validator_query, &srv, dnssec.Options{})
+	}
+	defer if srv.validator != nil {
+		dnssec.destroy_validator(srv.validator)
+	}
+	engine: ^filter.Engine
+	if cloak {
+		engine = filter.engine_make()
+		block := filter.set_make()
+		filter.set_add(block, "tracker.evil.test", {.Apex, .Subdomains})
+		filter.engine_swap(engine, block, filter.set_make())
+		srv.filters = engine
+	}
+	defer if engine != nil {
+		filter.engine_destroy(engine)
+	}
 
 	m := Mock {
 		socket     = socket,
 		ttl        = ttl,
-		hold_for   = CLIENTS - 1,
+		hold_for   = hold_for,
 		srv        = &srv,
 		silent     = silent,
 		first      = first,
 		drop_first = drop_first,
+		cloak      = cloak,
+		others     = validating,
 	}
 	mock := thread.create_and_start_with_poly_data(&m, serve_mock)
 	threads: [CLIENTS]^thread.Thread
-	for i in 0 ..< CLIENTS {
+	for i in 0 ..< clients_asking {
 		clients[i] = Client {
 			srv  = &srv,
 			id   = u16(0x1000 + i),
@@ -264,7 +345,7 @@ run_burst :: proc(
 			time.sleep(time.Millisecond)
 		}
 	}
-	for th in threads {
+	for th in threads[:clients_asking] {
 		thread.join(th)
 		thread.destroy(th)
 	}
@@ -272,6 +353,12 @@ run_burst :: proc(
 	thread.destroy(mock)
 	if stats != nil {
 		stats^ = srv.stats
+	}
+	if lookups != nil {
+		lookups^ = m.lookups
+	}
+	if cache_stats != nil {
+		cache_stats^ = cache.stats(answers)
 	}
 	return m.queries
 }
@@ -534,4 +621,53 @@ test_with_the_cache_off_only_identical_messages_share_an_answer :: proc(t: ^test
 	for c, i in apart {
 		testing.expectf(t, c.ok && c.addr == {192, 0, 2, 7}, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)
 	}
+}
+
+/*
+Issue #425. A leader that stored a verdict leaves its followers to find it in the
+cache: each is refused from the verdict, and none of them asks the upstream or
+walks the chain again.
+*/
+@(test)
+test_followers_of_a_bogus_leader_are_refused_from_its_verdict :: proc(t: ^testing.T) {
+	// What one query's walk costs, so the burst can be held to it.
+	single: [CLIENTS]Client
+	one_walk: int
+	run_burst(t, &single, validating = true, lookups = &one_walk, hold_for = 0, clients_asking = 1)
+	testing.expectf(t, single[0].ok && single[0].rcode == .Serv_Fail, "a lone query: ok=%v rcode=%v", single[0].ok, single[0].rcode)
+	testing.expect(t, one_walk > 0, "the validator never asked for the chain, so the answer was not validated")
+
+	clients: [CLIENTS]Client
+	walked: int
+	st: Stats
+	cs: cache.Stats
+	queries := run_burst(t, &clients, validating = true, lookups = &walked, stats = &st, cache_stats = &cs)
+	testing.expectf(t, queries == 1, "the upstream saw the question %d times for %d clients, want 1", queries, CLIENTS)
+	testing.expectf(t, walked == one_walk, "the chain was asked for %d times, want one walk's %d", walked, one_walk)
+	for c, i in clients {
+		testing.expectf(t, c.ok && c.rcode == .Serv_Fail, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)
+	}
+	// One miss a client, taken on the way in; the verdict is read as a probe,
+	// which counts nothing, and the followers are what was coalesced.
+	testing.expect_value(t, cs.misses, u64(CLIENTS))
+	testing.expect_value(t, cs.hits, u64(0))
+	testing.expect_value(t, st.coalesced, u64(CLIENTS - 1))
+}
+
+@(test)
+test_followers_of_a_cloaked_leader_are_blocked_from_its_verdict :: proc(t: ^testing.T) {
+	clients: [CLIENTS]Client
+	st: Stats
+	cs: cache.Stats
+	queries := run_burst(t, &clients, cloak = true, stats = &st, cache_stats = &cs)
+	testing.expectf(t, queries == 1, "the upstream saw the question %d times for %d clients, want 1", queries, CLIENTS)
+	for c, i in clients {
+		testing.expectf(t, c.ok && c.outcome == .Blocked, "client %d: ok=%v outcome=%v", i, c.ok, c.outcome)
+	}
+	// A miss each on the way in, and a counted hit - then withheld - for each
+	// follower that read the refusal.
+	testing.expect_value(t, cs.misses, u64(CLIENTS))
+	testing.expect_value(t, cs.hits, u64(CLIENTS - 1))
+	testing.expect_value(t, cs.withheld, u64(CLIENTS - 1))
+	testing.expect_value(t, st.coalesced, u64(CLIENTS - 1))
 }

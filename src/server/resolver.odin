@@ -1108,9 +1108,6 @@ resolve_query :: proc(
 	it; see `ceiling_ede`.
 	*/
 	ede: ^u16 = nil,
-	// Set on the second pass of a follower whose flight landed with nothing to
-	// share, so it does not start over again. See `inflight.odin`.
-	rejoined := false,
 ) -> (
 	response: []u8,
 	outcome: Outcome,
@@ -1364,10 +1361,7 @@ resolve_query :: proc(
 	`reload_filters` runs only under that flag - so the number would sit at zero
 	and match every entry's stamp for the life of the process.
 	*/
-	generation: u64
-	if s.cfg.cache.enabled && s.cfg.blocking.enabled && s.filters != nil {
-		generation = filter.engine_generation(s.filters)
-	}
+	generation := rules_generation(s)
 
 	/*
 	An expired entry that `serve_stale` kept, held back rather than served.
@@ -1384,23 +1378,11 @@ resolve_query :: proc(
 	*/
 	stale_hit: Cached_Answer
 
-	if s.cfg.cache.enabled {
-		if wire, hit, found := cache.get(s.answers, key, allocator, checked_against = generation); found {
-			stored := Cached_Answer {
-				wire    = wire,
-				key     = key,
-				stale   = hit.stale,
-				recheck = hit.recheck,
-				refused = hit.refused,
-				ede     = hit.ede,
-				serial  = hit.serial,
-				checked = generation,
-			}
-			if !hit.stale {
-				return serve_from_cache(s, stored, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
-			}
-			stale_hit = stored
+	if stored, found := stored_answer(s, key, generation, allocator); found {
+		if !stored.stale {
+			return serve_from_cache(s, stored, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
 		}
+		stale_hit = stored
 	}
 
 	/*
@@ -1466,14 +1448,8 @@ resolve_query :: proc(
 	gives a verdict no stale window for that reason, so this asks a question the
 	cache has already answered - and asks it anyway rather than resting on it.
 	*/
-	if validating && s.cfg.cache.enabled {
-		if wire, hit, found := cache.get(s.answers, verdict_key, allocator, probe = true);
-		   found && !hit.stale {
-			remembered := Cached_Answer {
-				wire   = wire,
-				key    = verdict_key,
-				serial = hit.serial,
-			}
+	if validating {
+		if remembered, found := stored_verdict(s, verdict_key, allocator); found {
 			return serve_bogus_verdict(s, remembered, query, msg, q, proto, client, started)
 		}
 	}
@@ -1873,7 +1849,7 @@ resolve_query :: proc(
 			flight.forwarded = forwarded
 		} else if joined != nil {
 			patience := flight_patience(route_group(s, q.name, q.type))
-			landed_with, landed, same := flight_follow(s, joined, patience, allocator, counted, forwarded)
+			landed_with, _, same := flight_follow(s, joined, patience, allocator, counted, forwarded)
 			// A NOERROR or NXDOMAIN is shared as the cache shares it - so not with
 			// the cache off, where nothing is shared between two messages - and any
 			// other rcode may be about the leader's own bytes, unless they were these.
@@ -1926,23 +1902,53 @@ resolve_query :: proc(
 					"upstream-coalesced",
 				)
 			}
-			// The leader stored a verdict, which the cache now answers with.
-			if landed && !rejoined && landed_with.stored {
-				return resolve_query(
-					s,
-					query,
-					msg,
-					proto,
-					client,
-					limit,
-					cookie,
-					started,
-					spent,
-					allocator,
-					shared_worker,
-					ede = ede,
-					rejoined = true,
-				)
+			/*
+			The leader stored a verdict, which the cache now answers with: a
+			cloaking refusal under the question's own key, which `serve_from_cache`
+			refuses from the entry - against the rule sets as they stand after the
+			wait, so a reload during it re-walks the chain - or a Bogus one under
+			its verdict key. Evicted or expired already, and this query forwards
+			on its own.
+			*/
+			#partial switch landed_with.stored {
+			case .Cloak:
+				stored, found := stored_answer(s, key, rules_generation(s), allocator)
+				if found && stored.stale {
+					// Expired already: the fallback for this query's own forward.
+					stale_hit = stored
+				} else if found {
+					// Counted here only where the entry is refused or unreadable:
+					// served, `serve_from_cache` counts it as the coalesced answer
+					// its log line then says it is.
+					stored.coalesced = true
+					out, served, built := serve_from_cache(
+						s,
+						stored,
+						query,
+						msg,
+						q,
+						proto,
+						client,
+						limit,
+						validating,
+						started,
+						spent,
+						allocator,
+						ede,
+					)
+					if served != .Cached {
+						sync.atomic_add(&s.stats.coalesced, 1)
+					}
+					return out, served, built
+				}
+			case .Bogus:
+				// Not gated on `validating`: the leader reached this verdict for
+				// the same key, and this query's own rewrite failing is no reason
+				// to forward what was just proved Bogus.
+				if remembered, found := stored_verdict(s, verdict_key, allocator); found {
+					sync.atomic_add(&s.stats.coalesced, 1)
+					return serve_bogus_verdict(s, remembered, query, msg, q, proto, client, started)
+				}
 			}
 		}
 	}
@@ -2402,7 +2408,7 @@ resolve_query :: proc(
 			out, built := dnssec_failure_response(msg, result, allocator, limit)
 			if remember_bogus_verdict(s, verdict_key, msg, result, unproven_apex_ds, spent, allocator) &&
 			   flight != nil {
-				flight.stored = true
+				flight.stored = .Bogus
 			}
 			log_query(s, client, proto, q, .Failed, fmt.tprintf("dnssec:%s", from), started)
 			return out, .Failed, built
@@ -2706,8 +2712,8 @@ resolve_query :: proc(
 			   !unproven_apex_ds &&
 			   cloak_verdict_worth_keeping(verdict) {
 				kept := cache.put(s.answers, key, resp, decoded.msg, generation, u8(verdict), ede = answer_ede)
-				if flight != nil {
-					flight.stored = kept
+				if flight != nil && kept {
+					flight.stored = .Cloak
 				}
 			}
 			return out, cloak_outcome(verdict), true
@@ -2768,6 +2774,70 @@ resolve_query :: proc(
 	settle_ad_bit(resp, msg, validating)
 	log_query(s, client, proto, q, .Forwarded, answering_upstream(winner), started)
 	return resp, .Forwarded, true
+}
+
+/*
+Which rule sets an answer is matched against, read only where both halves are on
+- see where `resolve_query` first takes it.
+*/
+@(private)
+rules_generation :: proc(s: ^Server) -> u64 {
+	if s.cfg.cache.enabled && s.cfg.blocking.enabled && s.filters != nil {
+		return filter.engine_generation(s.filters)
+	}
+	return 0
+}
+
+// The entry under `key`, fresh or expired, as the answer path reads it.
+@(private)
+stored_answer :: proc(
+	s: ^Server,
+	key: string,
+	generation: u64,
+	allocator: mem.Allocator,
+) -> (
+	stored: Cached_Answer,
+	found: bool,
+) {
+	if !s.cfg.cache.enabled {
+		return
+	}
+	wire, hit, got := cache.get(s.answers, key, allocator, checked_against = generation)
+	if !got {
+		return
+	}
+	stored = Cached_Answer {
+		wire    = wire,
+		key     = key,
+		stale   = hit.stale,
+		recheck = hit.recheck,
+		refused = hit.refused,
+		ede     = hit.ede,
+		serial  = hit.serial,
+		checked = generation,
+	}
+	return stored, true
+}
+
+// A live Bogus verdict under `verdict_key`, looked up as a `probe` - see where
+// `resolve_query` first asks for one.
+@(private)
+stored_verdict :: proc(
+	s: ^Server,
+	verdict_key: string,
+	allocator: mem.Allocator,
+) -> (
+	remembered: Cached_Answer,
+	found: bool,
+) {
+	if !s.cfg.cache.enabled {
+		return
+	}
+	wire, hit, got := cache.get(s.answers, verdict_key, allocator, probe = true)
+	if !got || hit.stale {
+		return
+	}
+	return Cached_Answer{wire = wire, key = verdict_key, serial = hit.serial}, true
 }
 
 // No answer from the upstream at all: the expired entry if one is held, SERVFAIL

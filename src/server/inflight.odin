@@ -34,11 +34,15 @@ in an outage is every pool worker held twice as long.
 
 A follower that cannot use what the leader landed with forwards on its own, which
 is what every query did before this - except where the leader stored a verdict
-(a Bogus refusal, a cloaking refusal worth keeping), when it goes back once to the
-start and finds that verdict in the cache. A cache miss counted on the first pass
-is counted again on the second, which leaves `cache_misses` a little ahead of the
-queries behind it - the one accounting gap here, on the rare path. So does a
-follower whose patience ran out.
+(a Bogus refusal, a cloaking refusal worth keeping), when it reads that verdict
+straight out of the cache and is refused from it - or, for a cloaking refusal a
+list reload lifted during the wait, answered from it. The cloaking lookup is a
+counted one, so that follower's query shows as a miss and then a hit, or as two
+misses where the entry was evicted in between; the Bogus one is a probe, as it
+is on the way in, and counts nothing. A follower whose
+patience ran out forwards on its own too, and so does one that finds the
+verdict already evicted - outside the table, since it is past its turn to join
+one, which on a cache under that much pressure costs a burst its coalescing.
 
 The leader waits for its followers to take their copies before it lets go, which
 is what lets the `Flight` live in its stack frame and the answer in its arena:
@@ -85,8 +89,9 @@ Landing :: struct {
 	ede:       u16,
 	// The upstream produced nothing at all.
 	failed:    bool,
-	// The leader stored a verdict a follower starting over will find.
-	stored:    bool,
+	// Which verdict the leader stored, for a follower to read straight out of
+	// the cache.
+	stored:    Stored_Verdict,
 }
 
 @(private)
@@ -100,6 +105,15 @@ Flight :: struct {
 	// Where this flight sits in the table, so landing need not look for it.
 	slot:          int,
 	using landing: Landing,
+}
+
+@(private)
+Stored_Verdict :: enum u8 {
+	None,
+	// A cloaking refusal, under the question's own key.
+	Cloak,
+	// A Bogus refusal, under the question's verdict key.
+	Bogus,
 }
 
 /*

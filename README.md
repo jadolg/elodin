@@ -910,11 +910,16 @@ upstream giving nothing after every attempt on every server, in which case they
 get the expired copy or SERVFAIL. Under DNSSEC validation, whose rewrite writes
 the whole OPT record, most messages are identical. Without it, the payload size
 and the OPT flags stay the client's, so only clients that ask alike match.
-Different spellings of the name, or different EDNS options, never do. The other
-waiting queries ask for themselves, as does any query that arrives when a
+Different spellings of the name, or different EDNS options, never do. If the
+first query cached a refusal instead, a DNSSEC failure or a CNAME into a blocked
+name, the waiting queries are refused from it without asking. The exceptions are
+a list reload during the wait that lifted the listing, in which case the
+answer is served, and an entry evicted in the meantime, in which case they ask. The other waiting
+queries ask for themselves, as does any query that arrives when a
 quarter of the query pool is already waiting like this. "Identical" means the
-same cache key. The queries given the first one's outcome count in
-`elodin_answers_coalesced_total`, and those that asked for themselves do not. The query log
+same cache key. The queries given the first one's outcome, or refused
+from its cached refusal, count in `elodin_answers_coalesced_total`, and those
+that asked for themselves do not. The query log
 shows a shared answer as `outcome=cached detail=coalesced` and a shared failure
 as `outcome=failed detail=upstream-coalesced`, or as `detail=stale` where an
 expired copy was served instead.
@@ -2341,7 +2346,7 @@ as a warning at startup.
 | `elodin_uptime_seconds` | gauge | seconds since this process finished starting |
 | `elodin_queries_total` | counter | queries accepted, whatever became of them |
 | `elodin_answers_total{outcome}` | counter | `forwarded`, `cached`, `blocked`, `rewritten`, `failed` |
-| `elodin_answers_coalesced_total` | counter | queries that waited for an identical one already in flight instead of asking the upstream: its answer, counted as `cached` although the cache never held it (`detail=coalesced`), or its failure, counted as `failed` (`detail=upstream-coalesced`) or, where an expired copy was served, as a stale `cached` |
+| `elodin_answers_coalesced_total` | counter | queries that waited for an identical one already in flight instead of asking the upstream: its answer, counted as `cached` although the cache never held it (`detail=coalesced`), its failure, counted as `failed` (`detail=upstream-coalesced`) or, where an expired copy was served, as a stale `cached`, or the refusal it cached, logged as that refusal (`detail=dnssec:cache`, or the block detail) |
 | `elodin_queries_dropped_total` | counter | turned away before any work: the backlog was full, or the source could not be answered |
 | `elodin_queries_refused_total` | counter | turned away by `server.allow_from` |
 | `elodin_connections_refused_total` | counter | refused for want of a slot: `server.max_connections` full, or the client's prefix already holding its share |
