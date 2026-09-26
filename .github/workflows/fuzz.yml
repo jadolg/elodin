@@ -70,15 +70,11 @@ jobs:
           mkdir -p crashes
           dict=testdata/fuzz-corpus/${{ matrix.target }}.dict
           [ -f "$dict" ] || dict=""
-          # The HTTP readers take a read of 4 KB (doh) or 8 KB (http) at a time,
-          # and the harness has the whole input queued before the first one. At
-          # libFuzzer's default 4 KB cap every input is a single read, and the
-          # refill, growth and header-size paths are never reached.
-          len=""
-          case "${{ matrix.target }}" in http|doh) len=65536 ;; esac
+          # A target's larger input cap, if it has one; see the script.
+          len=$(scripts/fuzz-max-len.sh ${{ matrix.target }})
           ASAN_OPTIONS=detect_leaks=0 ./bin/fuzz_${{ matrix.target }} \
             ${dict:+-dict=$dict} \
-            ${len:+-max_len=$len} \
+            $len \
             -max_total_time=1200 \
             -artifact_prefix=crashes/ \
             corpus/${{ matrix.target }}
