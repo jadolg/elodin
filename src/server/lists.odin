@@ -67,7 +67,7 @@ build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool) -> (block, a
 @(private)
 warn_rule_adds_nothing :: proc(rule: string) {
 	if !strings.contains(rule, "badfilter") {
-		logx.warnf("blocking rule %q adds nothing: it carries a modifier DNS cannot honour, is cosmetic, or names no domain", rule)
+		logx.warnf("blocking rule %q adds nothing: it carries a modifier DNS cannot honour, is cosmetic, names no domain, a $badfilter cancels it, or its name is not ASCII (write an international name in punycode, xn--...)", rule)
 	}
 }
 

@@ -100,20 +100,21 @@ set_destroy :: proc(s: ^Set) {
 }
 
 /*
-Add a rule for `domain`.
+Add a rule for `domain`, reporting whether it covers anything.
 
 `domain` is taken as written by the list author; it is lowercased and stripped
-of any trailing dot before being stored.
+of any trailing dot before being stored. A name no query can spell is refused,
+and so is a rule a `$badfilter` has wholly cancelled.
 */
 set_add :: proc(s: ^Set, domain: string, flags: Rule_Flags) -> (stored: bool) {
 	buf: [MAX_NORMALISED]u8
 	key, ok := rule_key(domain, buf[:])
-	if !ok || key == "" {
+	if !ok {
 		return false
 	}
 	add := flags - s.cancelled[key]
 	if add == {} {
-		return true
+		return false
 	}
 	if existing, found := s.rules[key]; found {
 		s.rules[key] = existing + add
@@ -136,7 +137,7 @@ rule written the same way. Keep rule texts per name if that ever matters.
 set_cancel :: proc(s: ^Set, domain: string, flags: Rule_Flags) {
 	buf: [MAX_NORMALISED]u8
 	key, ok := rule_key(domain, buf[:])
-	if !ok || key == "" {
+	if !ok {
 		return
 	}
 	if existing, found := s.cancelled[key]; found {
@@ -251,7 +252,7 @@ Pi-hole and AdGuard treat their allowlists.
 */
 engine_match :: proc(e: ^Engine, name: string) -> Decision {
 	buf: [MAX_NORMALISED]u8
-	key, ok, _ := normalise(name, buf[:])
+	key, ok := normalise(name, buf[:])
 	if !ok {
 		return .None
 	}
@@ -281,34 +282,34 @@ engine_stats :: proc(e: ^Engine) -> Stats {
 	}
 }
 
-// A query spells any byte `dns.needs_escape` flags as \DDD, so a rule holding
-// one raw can never match; and a slash marks a line the parser mis-split.
+// A query spells a control or non-ASCII byte as \DDD, so a rule holding one raw
+// can never match; and a slash marks a line the parser mis-split.
 @(private)
 rule_key :: proc(domain: string, buf: []u8) -> (key: string, ok: bool) {
-	valid: bool
-	key, ok, valid = normalise(domain, buf)
-	return key, ok && valid
+	key, ok = normalise(domain, buf)
+	for c in transmute([]u8)key {
+		if c == '/' || (c != '.' && c != '\\' && dns.needs_escape(c)) {
+			return "", false
+		}
+	}
+	return
 }
 
 @(private)
-normalise :: proc(name: string, buf: []u8) -> (out: string, ok: bool, rule_safe: bool) {
+normalise :: proc(name: string, buf: []u8) -> (out: string, ok: bool) {
 	s := name
 	if len(s) > 0 && s[len(s) - 1] == '.' {
 		s = s[:len(s) - 1]
 	}
 	if len(s) == 0 || len(s) > len(buf) {
-		return "", false, false
+		return "", false
 	}
-	rule_safe = true
 	for i in 0 ..< len(s) {
 		c := s[i]
 		if c >= 'A' && c <= 'Z' {
 			c += 32
 		}
-		if c == '/' || (c != '.' && dns.needs_escape(c)) {
-			rule_safe = false
-		}
 		buf[i] = c
 	}
-	return string(buf[:len(s)]), true, rule_safe
+	return string(buf[:len(s)]), true
 }

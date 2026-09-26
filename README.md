@@ -767,11 +767,9 @@ so the route would sit in the file looking like the fix while every name went on
 getting the table's NXDOMAIN. Turn the key off in the same edit.
 
 > **Coming from dnsmasq:** `server=/corp.example/10.0.0.1` in `blocking.rules`
-> does not route that zone — it *blocks* it, that form meaning a blackhole in the
-> downloaded lists the parser was written for. In `blocking.allow` it is
-> discarded entirely, which looks exactly like the route not working. `--check`
-> warns about either written by hand. Routing lives under `upstream.zones` and
-> nowhere else.
+> or `blocking.allow` does not route that zone — it is discarded, which looks
+> exactly like the route not working. `--check` warns about either written by
+> hand. Routing lives under `upstream.zones` and nowhere else.
 
 ### Sink lists
 
@@ -811,7 +809,8 @@ Hosts entries are exact because hosts-format lists spell out every subdomain the
 mean; bare domains and `||` rules cover subtrees, which is how AdGuard Home reads
 the same files. Allow rules always win. The `address=/…/` and `server=/…/` forms
 are dnsmasq's, accepted because they turn up in lists that are otherwise adblock
-syntax. `$important` and `$third-party` (`$3p`) are dropped and the rest of the
+syntax; a `server=/…/` line that names a server forwards rather than blocks in
+dnsmasq, so it is skipped. `$important` and `$third-party` (`$3p`) are dropped and the rest of the
 rule kept. `$badfilter` cancels the rule it names in any list, though a list's
 cannot cancel `blocking.rules` or `blocking.allow`. A rule with any other
 modifier (`$dnstype`, `$client`, `$domain`, `$elemhide`, `$removeparam`, ...) is

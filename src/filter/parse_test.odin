@@ -243,11 +243,11 @@ test_normalise_folds_case_and_the_trailing_dot :: proc(t: ^testing.T) {
 	// A query arrives in wire-presentation form with the root dot on the end;
 	// a list is written without it. Both have to land on the same key.
 	buf: [MAX_NORMALISED]u8
-	out, ok, _ := normalise("Ads.Example.COM.", buf[:])
+	out, ok := normalise("Ads.Example.COM.", buf[:])
 	testing.expect(t, ok, "an ordinary name should normalise")
 	testing.expect_value(t, out, "ads.example.com")
 
-	plain, plain_ok, _ := normalise("ads.example.com", buf[:])
+	plain, plain_ok := normalise("ads.example.com", buf[:])
 	testing.expect(t, plain_ok, "and so should the same name without the dot")
 	testing.expect_value(t, plain, "ads.example.com")
 }
@@ -256,19 +256,19 @@ test_normalise_folds_case_and_the_trailing_dot :: proc(t: ^testing.T) {
 test_normalise_refuses_what_cannot_be_a_domain :: proc(t: ^testing.T) {
 	buf: [MAX_NORMALISED]u8
 	for bad in ([]string{"", "."}) {
-		_, ok, _ := normalise(bad, buf[:])
+		_, ok := normalise(bad, buf[:])
 		testing.expectf(t, !ok, "%q should not normalise", bad)
 	}
 
 	// A name too long for the buffer is refused rather than truncated: a
 	// truncated key would be a different name, and could be one that matters.
 	long := strings.repeat("a", MAX_NORMALISED + 1, context.temp_allocator)
-	_, too_long, _ := normalise(long, buf[:])
+	_, too_long := normalise(long, buf[:])
 	testing.expect(t, !too_long, "a name past the buffer should be refused")
 
 	// Exactly the buffer's width still fits.
 	exact := strings.repeat("a", MAX_NORMALISED, context.temp_allocator)
-	_, fits, _ := normalise(exact, buf[:])
+	_, fits := normalise(exact, buf[:])
 	testing.expect(t, fits, "a name exactly the buffer's width fits")
 	free_all(context.temp_allocator)
 }
@@ -290,13 +290,14 @@ test_a_query_name_with_a_slash_is_still_matched :: proc(t: ^testing.T) {
 test_a_rule_that_cannot_be_a_domain_is_refused :: proc(t: ^testing.T) {
 	/*
 	Whitespace and a slash are the marks of a line the parser has mis-split - a
-	whole hosts line taken as a name, or a URL rule that got this far. Refusing
+	whole hosts line taken as a name, or a URL rule that got this far. A raw
+	control or non-ASCII byte is one a query always spells as \DDD. Refusing
 	them keeps such a thing from being stored as a rule that then never matches
 	anything, and keeps the counts honest.
 	*/
 	s := set_make()
 	defer set_destroy(s)
-	for bad in ([]string{"ads example", "ads\texample", "example.com/path", "0.0.0.0 ads.example", "b\u00fccher.de", "a\\b.example", "a\x01b.example"}) {
+	for bad in ([]string{"ads example", "ads\texample", "example.com/path", "0.0.0.0 ads.example", "b\u00fccher.de", "a\x01b.example"}) {
 		testing.expectf(t, !set_add(s, bad, {.Apex}), "%q should not be added", bad)
 		set_cancel(s, bad, {.Apex})
 	}
@@ -304,10 +305,35 @@ test_a_rule_that_cannot_be_a_domain_is_refused :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(s.cancelled), 0)
 
 	// A query spells these bytes as \DDD, so a rule holding one raw never matches.
-	block, allow := parsed("0.0.0.0 b\u00fccher.de a\\b.example ok.example\n", .Hosts)
+	block, allow := parsed("0.0.0.0 b\u00fccher.de a\x01b.example ok.example\n", .Hosts)
 	defer set_destroy(block)
 	defer set_destroy(allow)
 	testing.expect_value(t, block.count, 1)
+}
+
+@(test)
+test_a_rule_written_as_a_query_spells_it_matches :: proc(t: ^testing.T) {
+	// `\` is how presentation form escapes a byte, so a rule written that way is
+	// the one that can match.
+	testing.expect_value(t, matches("a\\032b.example\n", .Domains, "a\\032b.example."), Decision.Blocked)
+}
+
+@(test)
+test_a_rule_a_badfilter_cancelled_is_not_stored :: proc(t: ^testing.T) {
+	s := set_make()
+	defer set_destroy(s)
+	set_cancel(s, "x.example", {.Apex, .Subdomains})
+	testing.expect(t, !set_add(s, "x.example", {.Apex, .Subdomains}), "a fully cancelled rule adds nothing")
+	set_cancel(s, "y.example", {.Apex})
+	testing.expect(t, set_add(s, "y.example", {.Apex, .Subdomains}), "what the cancel left is stored")
+}
+
+@(test)
+test_a_dnsmasq_server_line_with_an_upstream_forwards_rather_than_blocks :: proc(t: ^testing.T) {
+	// `server=/d/1.2.3.4` sends d to that server; only `server=/d/` keeps it local.
+	testing.expect_value(t, matches("server=/corp.example/10.0.0.1\n", .Adblock, "corp.example."), Decision.None)
+	testing.expect_value(t, matches("server=/ads.example/\n", .Adblock, "ads.example."), Decision.Blocked)
+	testing.expect_value(t, matches("address=/ads.example/0.0.0.0\n", .Adblock, "ads.example."), Decision.Blocked)
 }
 
 @(test)

@@ -240,6 +240,10 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 		if slash <= 0 {
 			return 0
 		}
+		// `server=/d/1.2.3.4` forwards d to that server; only `server=/d/` keeps it local.
+		if strings.has_prefix(line, "server=") && body[slash + 1:] != "" {
+			return 0
+		}
 		return int(set_add(block, body[:slash], {.Apex, .Subdomains}))
 	}
 

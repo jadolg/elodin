@@ -270,18 +270,14 @@ Inline `blocking.rules` entries written in the shape of a dnsmasq route.
 
 `server=/corp.example/10.0.0.1` is dnsmasq for "send this zone to that server",
 and it is the exact string an operator migrating from dnsmasq reaches for when
-they want `upstream.zones`. Pasted into `blocking.rules` it does the opposite:
-`parse_adblock_line` reads the form, discards the target and adds the domain to
-the *block* set with `{.Apex, .Subdomains}`, so the zone the operator meant to
-route is blackholed instead. That is right where the form actually turns up -
-in a downloaded list of otherwise adblock syntax, where it does mean a
-blackhole - and wrong here, so the warning is scoped to rules written by hand in
-the configuration file rather than to anything a list contains.
+they want `upstream.zones`. Pasted into `blocking.rules` it does nothing:
+`parse_adblock_line` skips a `server=` line that names a server, because only
+`server=/d/` - no server, so dnsmasq answers d locally - means a blackhole in a
+downloaded list. So the zone the operator meant to route goes on being resolved
+by `upstream.servers`, which looks exactly like the route not working.
 
-It fails closed and the query log says `outcome=blocked detail=list`, so it is
-diagnosable. It is still worth one line at startup, because "I configured the
-route and now the zone answers NXDOMAIN" is a long way from "the rule you wrote
-is a block rule".
+That is silent at startup apart from the generic "adds nothing" line, and a
+long way from "the rule you wrote is not a route", so it is worth its own line.
 */
 route_shaped_rules :: proc(cfg: ^config.Config, allocator := context.allocator) -> []string {
 	out := make([dynamic]string, 0, 0, allocator)
@@ -376,24 +372,17 @@ route_implication_warning :: proc(
 One line per rule found, worded for both lists.
 
 `blocking.allow` (`cfg.blocking.allow_rules`) is scanned as well as
-`blocking.rules`, and the form does a different nothing in each. In
-`blocking.rules` it blackholes the zone, as above. In `blocking.allow` it does
-not exempt it either: `build_filter_sets` prefixes those entries with `@@`
-before parsing them, which puts the string past `parse_adblock_line`'s dnsmasq
-branch and into the generic one, where the `/` still in it is read as a
-path-scoped rule and the whole entry is discarded. So the rule adds nothing to
-either set and the zone goes on being resolved by `upstream.servers`, which
-looks exactly like the route not working.
-
-The warning therefore says what the rule is and what it is not, and leaves what
-it does to the list it is in - claiming either "blocks that domain" or "exempts
-that domain" would be untrue of one of the two files. Both lists are named by
-the key an operator writes rather than by the field they land in, so the line
-can be searched for in the file it is about.
+`blocking.rules`. There `build_filter_sets` prefixes the entry with `@@` before
+parsing it, which puts the string past `parse_adblock_line`'s dnsmasq branch and
+into the generic one, where the `/` still in it is refused by `set_add`. Either
+way the rule adds nothing and the zone goes on being resolved by
+`upstream.servers`. Both lists are named by the key an operator writes rather
+than by the field they land in, so the line can be searched for in the file it
+is about.
 */
 route_rule_warning :: proc(rule: string, allocator := context.allocator) -> string {
 	return fmt.aprintf(
-		"blocking rule %q is a list rule, not a route: it does not send the zone anywhere - under blocking.rules that form blackholes the zone, and under blocking.allow it is discarded; to send a zone to its own server use upstream.zones",
+		"blocking rule %q is a list rule, not a route: it does not send the zone anywhere; to send a zone to its own server use upstream.zones",
 		strings.trim_space(rule),
 		allocator = allocator,
 	)
