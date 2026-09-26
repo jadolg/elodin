@@ -6,9 +6,9 @@ import "core:sys/posix"
 
 /*
 The largest input `feed` takes, so the write below can never fill the socket
-buffer and block with nobody reading the other end. The `-max_len` the HTTP
-targets' `.max_len` files give them, so an input can span several of their
-reads, and well under what a Unix socket buffers.
+buffer and block with nobody reading the other end. It equals the `-max_len`
+in the HTTP targets' `.max_len` files, so an input can span several of their
+reads, and is well under what a Unix socket buffers.
 */
 MAX_FEED :: 64 * 1024
 
