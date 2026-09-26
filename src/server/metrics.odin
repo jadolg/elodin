@@ -373,8 +373,9 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 	local zone is not among these either; the difference is the `dropped` and
 	`refused` counters below. Of the local answers only the reserved-name table
 	is counted at all, in `elodin_special_use_total` below - a stopped `.onion`
-	query being the one an operator watches for - while the CHAOS replies and the
-	DDR probe are answered here and counted nowhere.
+	query being the one an operator watches for - while the CHAOS replies, the
+	DDR probe and the private reverse zones are answered here and counted
+	nowhere, the last because every LAN PTR lands there.
 
 	An answer withheld by the rebinding guard is in none of these either, though
 	the query log calls it `outcome=blocked`. `blocked` here is what the sink

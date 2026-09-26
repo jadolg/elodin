@@ -1290,8 +1290,15 @@ resolve_query :: proc(
 	*/
 	if zone, kind := special_use_zone(s, q.name, q.type); kind != .None {
 		out := answer_special_use(msg, q, zone, kind, allocator, limit)
-		sync.atomic_add(&s.stats.special_use, 1)
-		log_query(s, client, proto, q, .Local, "special-use", started)
+		// A private reverse zone is not counted: every LAN PTR lands there, and
+		// folded in it would drown the `.onion` and `localhost.` signal the
+		// counter exists for. The query log still tells them apart.
+		if kind != .Empty_Nonterminal && (kind != .Empty_Zone || zone == "home.arpa.") {
+			sync.atomic_add(&s.stats.special_use, 1)
+			log_query(s, client, proto, q, .Local, "special-use", started)
+		} else {
+			log_query(s, client, proto, q, .Local, "private-reverse", started)
+		}
 		return out, .Local, true
 	}
 

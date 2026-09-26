@@ -656,6 +656,63 @@ test_private_reverse_stands_down_where_it_must :: proc(t: ^testing.T) {
 }
 
 /*
+A name between a private reverse zone's apex and a route or anchor below it is an
+empty non-terminal: the routed zone exists, so its ancestors do too, and a name
+error for one of them tells an RFC 8020 cache the routed zone is gone as well.
+NODATA with the zone's SOA, and still nothing forwarded. A sibling that is above
+nothing stays NXDOMAIN.
+*/
+@(test)
+test_private_reverse_name_above_a_route_is_nodata :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	domains := []string{"1.0.10.in-addr.arpa."}
+	routes := []Zone_Route{{domains = domains}}
+	anchors := []string{"1.2.3.d.f.ip6.arpa."}
+	s := Server {
+		cfg          = &cfg,
+		routes       = routes,
+		anchor_zones = anchors,
+	}
+	cases := []struct {
+		name: string,
+		want: dns.Rcode,
+		apex: string,
+	} {
+		{"0.10.in-addr.arpa.", .No_Error, "10.in-addr.arpa."},
+		{"0.10.IN-ADDR.ARPA.", .No_Error, "10.in-addr.arpa."},
+		{"2.10.in-addr.arpa.", .NX_Domain, "10.in-addr.arpa."},
+		{"3.d.f.ip6.arpa.", .No_Error, "d.f.ip6.arpa."},
+		{"2.3.d.f.ip6.arpa.", .No_Error, "d.f.ip6.arpa."},
+		{"4.d.f.ip6.arpa.", .NX_Domain, "d.f.ip6.arpa."},
+	}
+	for c in cases {
+		zone, kind := special_use_zone(&s, c.name, .PTR)
+		testing.expectf(t, kind != .None, "%s was not answered here", c.name)
+		testing.expect_value(t, zone, c.apex)
+		questions := make([]dns.Question, 1, context.temp_allocator)
+		questions[0] = dns.Question {
+			name  = c.name,
+			type  = .PTR,
+			class = .IN,
+		}
+		query := dns.Message {
+			id       = 7,
+			question = questions,
+		}
+		wire := answer_special_use(query, questions[0], zone, kind, context.temp_allocator, 512)
+		resp, err := dns.decode_message(wire, context.temp_allocator)
+		testing.expect_value(t, err, dns.Decode_Error.None)
+		testing.expectf(t, dns.Rcode(resp.flags.rcode) == c.want, "%s: rcode %v, want %v", c.name, dns.Rcode(resp.flags.rcode), c.want)
+		testing.expect_value(t, len(resp.answer), 0)
+		if testing.expect_value(t, len(resp.authority), 1) {
+			// Folded: the encoder compresses the owner against the question name.
+			testing.expectf(t, dns.name_equal_fold(resp.authority[0].name, c.apex), "%s: SOA at %s", c.name, resp.authority[0].name)
+		}
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
 The upstream that really can answer a `.onion` name.
 
 RFC 7686 section 2 puts its instruction to caching servers on those "not
@@ -930,6 +987,24 @@ test_the_special_use_counter_counts_only_what_the_table_answered :: proc(t: ^tes
 			name,
 			s.stats.special_use,
 		)
+	}
+
+	// A private reverse name is answered here too, and deliberately left out of
+	// the count: every LAN PTR lands there and would drown the `.onion` signal.
+	{
+		name := "1.1.168.192.in-addr.arpa."
+		cfg := config.default_config()
+		s, x, built := leak_server(t, &cfg, name, .PTR)
+		if !built {
+			return
+		}
+		x_socket := x.socket
+		defer net.close(x_socket)
+		defer upstream.destroy_group(s.group)
+
+		_, outcome, _ := handle_query(&s, leak_query(name, .PTR), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		testing.expectf(t, outcome == .Local, "%s came back as %v rather than local", name, outcome)
+		testing.expectf(t, s.stats.special_use == 0, "%s left the counter at %d, want 0", name, s.stats.special_use)
 	}
 
 	/*

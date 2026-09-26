@@ -186,6 +186,11 @@ answers at once.
 */
 @(private)
 locally_served_zone :: proc(name: string) -> (zone: string, found: bool) {
+	// Every entry is under `arpa.`, and `special_use_zone` asks this for every
+	// query: one compare turns the forward names away before the full scan.
+	if !name_below(name, "arpa.") {
+		return "", false
+	}
 	for z in LOCALLY_SERVED_ZONES {
 		if name_at_or_below(name, z) {
 			return z, true
@@ -365,6 +370,10 @@ Special_Use :: enum u8 {
 	// as RFC 6303 section 3 asks; the argument for why `home.arpa.` is not
 	// simply `Nonexistent` is above.
 	Empty_Zone,
+	// NODATA: a name inside an empty zone with a route or anchor below it. The
+	// zone down there exists, so this name does too, and a name error for it
+	// would deny the routed zone to an RFC 8020 cache.
+	Empty_Nonterminal,
 }
 
 /*
@@ -458,10 +467,32 @@ special_use_zone :: proc(
 			if type == .DS && dns.name_equal_fold(name, z) {
 				return "", .None
 			}
+			if !dns.name_equal_fold(name, z) && has_zone_below(s, name) {
+				return z, .Empty_Nonterminal
+			}
 			return z, .Empty_Zone
 		}
 	}
 	return "", .None
+}
+
+// Whether a route or an anchor sits strictly below `name`, making it an empty
+// non-terminal rather than a name that does not exist.
+@(private)
+has_zone_below :: proc(s: ^Server, name: string) -> bool {
+	for route in s.routes {
+		for domain in route.domains {
+			if name_below(domain, name) {
+				return true
+			}
+		}
+	}
+	for zone in s.anchor_zones {
+		if name_below(zone, name) {
+			return true
+		}
+	}
+	return false
 }
 
 /*
@@ -604,6 +635,8 @@ answer_special_use :: proc(
 		}
 	case .Nonexistent:
 		rcode = .NX_Domain
+	case .Empty_Nonterminal:
+	// NODATA whatever the type; the SOA below goes at the zone's apex.
 	case .Empty_Zone:
 		// RFC 6303 section 3, which RFC 8375 section 4 item 4.B asks for by
 		// name: a name error for anything inside the zone, and at the zone name

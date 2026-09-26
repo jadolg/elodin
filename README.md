@@ -777,7 +777,9 @@ zone from a public signed one.
 A route into a zone [`special_use`](#reserved-names) already answers is refused
 at load: those names are answered from the table before anything is forwarded,
 so the route would sit in the file looking like the fix while every name went on
-getting the table's NXDOMAIN. Turn the key off in the same edit.
+getting the table's NXDOMAIN. Turn the key off in the same edit. The one
+exception is `special_use.private_reverse`, which stands down for a routed name
+instead, so a route is how a reverse zone reaches your router.
 
 > **Coming from dnsmasq:** `server=/corp.example/10.0.0.1` in `blocking.rules`
 > or `blocking.allow` does not route that zone — it is discarded, which looks
@@ -2258,8 +2260,11 @@ same reason `home.arpa DS` does.
 If your router answers PTRs for its DHCP leases, route the zone to it —
 `upstream.zones: [{domains: [168.192.in-addr.arpa], servers: [192.168.1.1]}]` —
 and those names go there instead: a route over a name wins over this key, and so
-does a [trust anchor](#dnssec) you configured over the zone. `private_reverse:
-false` sends them all back to `upstream.servers` as before.
+does a [trust anchor](#dnssec) you configured over the zone while `dnssec.enabled`
+is on. `private_reverse: false` sends them all back to `upstream.servers` as
+before. These answers log as `outcome=local detail=private-reverse` and are left
+out of the `special_use` counter below, which every LAN PTR would otherwise
+drown.
 
 `.onion` is the one this exists for: the query is the disclosure, since
 forwarding it tells the upstream operator — and anyone on the path to a plain-UDP
