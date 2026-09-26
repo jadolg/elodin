@@ -460,26 +460,53 @@ special_use_zone :: proc(
 	// above and is not this one's to answer.
 	if s.cfg.special_use.private_reverse {
 		z, found := locally_served_zone(name)
-		if found && z != "home.arpa." && !is_zone_routed(s, name) && !covered_by_local_anchor(s, name) {
-			// Every one of these is delegated to AS112 without a DS, and the
-			// signed proof of that lives in the parent - the apex `DS` goes out
-			// for the reason `home.arpa.`'s does.
-			if type == .DS && dns.name_equal_fold(name, z) {
-				return "", .None
-			}
-			if !dns.name_equal_fold(name, z) && has_zone_below(s, name) {
+		if found && z != "home.arpa." && !covered_by_local_anchor(s, name) {
+			at_apex := dns.name_equal_fold(name, z)
+			// A route's apex `DS` is its parent's to answer (`route_group`), and
+			// inside this zone the parent is this empty zone: NODATA here, where
+			// forwarding it would name the routed subnet to `upstream.servers`.
+			if type == .DS && !at_apex && is_route_apex(s, name) && !is_zone_routed(s, dns.name_parent(name)) {
 				return z, .Empty_Nonterminal
 			}
-			return z, .Empty_Zone
+			if !is_zone_routed(s, name) {
+				// Every one of these is delegated to AS112 without a DS, and the
+				// signed proof of that lives in the parent - the apex `DS` goes
+				// out for the reason `home.arpa.`'s does.
+				if type == .DS && at_apex {
+					return "", .None
+				}
+				if !at_apex && has_zone_below(s, name) {
+					return z, .Empty_Nonterminal
+				}
+				return z, .Empty_Zone
+			}
 		}
 	}
 	return "", .None
 }
 
-// Whether a route or an anchor sits strictly below `name`, making it an empty
-// non-terminal rather than a name that does not exist.
+// Whether a route, an anchor or a rewrite puts a name strictly below `name`,
+// making it an empty non-terminal rather than a name that does not exist. A
+// rewrite counts by its own domain and by the PTR `reverse.odin` synthesises
+// from its address; erring wide only turns an NXDOMAIN into a NODATA.
 @(private)
 has_zone_below :: proc(s: ^Server, name: string) -> bool {
+	for r in s.cfg.rewrites {
+		// "*.x." is held as "x." and answers below it, so "x." is above a name.
+		if name_below(r.domain, name) || (r.wildcard && dns.name_equal_fold(r.domain, name)) {
+			return true
+		}
+		if r.wildcard || !r.ptr {
+			continue
+		}
+		for a in r.answers {
+			local := (a.kind == .A && address_is_local_v4(a.v4)) || (a.kind == .AAAA && address_is_local_v6(a.v6))
+			buf: [80]u8
+			if local && name_below(reverse_name_of(a, buf[:]), name) {
+				return true
+			}
+		}
+	}
 	for route in s.routes {
 		for domain in route.domains {
 			if name_below(domain, name) {

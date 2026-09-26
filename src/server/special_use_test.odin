@@ -713,6 +713,72 @@ test_private_reverse_name_above_a_route_is_nodata :: proc(t: ^testing.T) {
 }
 
 /*
+A rewrite puts names in a private reverse zone too: the PTR `reverse.odin`
+synthesises from `nas.home -> 192.168.1.50`, and a rule written against a
+reverse name outright. Their ancestors are empty non-terminals for the same
+reason a route's are, or this server would deny `1.168.192.in-addr.arpa.` while
+answering `50.1.168.192.in-addr.arpa.` below it.
+*/
+@(test)
+test_private_reverse_name_above_a_rewrite_is_nodata :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	nas := []config.Rewrite_Answer{{kind = .A, v4 = {192, 168, 1, 50}}}
+	nas6 := []config.Rewrite_Answer{{kind = .AAAA, v6 = {0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x50}}}
+	named := []config.Rewrite_Answer{{kind = .CNAME, name = "printer.home."}}
+	rules := []config.Rewrite {
+		{domain = "nas.home.", answers = nas, ptr = true},
+		{domain = "nas6.home.", answers = nas6, ptr = true},
+		{domain = "7.3.168.192.in-addr.arpa.", answers = named},
+	}
+	cfg.rewrites = rules
+	s := Server {
+		cfg = &cfg,
+	}
+	cases := []struct {
+		name: string,
+		want: Special_Use,
+	} {
+		{"1.168.192.in-addr.arpa.", .Empty_Nonterminal},
+		{"3.168.192.in-addr.arpa.", .Empty_Nonterminal},
+		{"2.168.192.in-addr.arpa.", .Empty_Zone},
+		{"0.0.d.f.ip6.arpa.", .Empty_Nonterminal},
+		{"5.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.d.f.ip6.arpa.", .Empty_Nonterminal},
+		{"1.0.d.f.ip6.arpa.", .Empty_Zone},
+	}
+	for c in cases {
+		_, kind := special_use_zone(&s, c.name, .PTR)
+		testing.expectf(t, kind == c.want, "%s: %v, want %v", c.name, kind, c.want)
+	}
+}
+
+/*
+A routed zone's apex `DS` is asked of whoever answers its parent. Under a private
+reverse zone that is this server's empty zone, so the question is answered here
+as NODATA - forwarded, it would name the routed subnet to `upstream.servers`.
+A route at the reverse zone's own apex still sends its `DS` out, its parent
+being public.
+*/
+@(test)
+test_a_route_apex_ds_under_a_private_reverse_zone_is_answered_here :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	domains := []string{"1.168.192.in-addr.arpa.", "10.in-addr.arpa."}
+	routes := []Zone_Route{{domains = domains}}
+	s := Server {
+		cfg    = &cfg,
+		routes = routes,
+	}
+	zone, kind := special_use_zone(&s, "1.168.192.in-addr.arpa.", .DS)
+	testing.expect_value(t, kind, Special_Use.Empty_Nonterminal)
+	testing.expect_value(t, zone, "168.192.in-addr.arpa.")
+	_, kind = special_use_zone(&s, "1.168.192.in-addr.arpa.", .PTR)
+	testing.expect_value(t, kind, Special_Use.None)
+	_, kind = special_use_zone(&s, "5.1.168.192.in-addr.arpa.", .DS)
+	testing.expect_value(t, kind, Special_Use.None)
+	_, kind = special_use_zone(&s, "10.in-addr.arpa.", .DS)
+	testing.expect_value(t, kind, Special_Use.None)
+}
+
+/*
 The upstream that really can answer a `.onion` name.
 
 RFC 7686 section 2 puts its instruction to caching servers on those "not
