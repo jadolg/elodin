@@ -179,11 +179,11 @@ coalesce_reply :: proc(hi, lo: u8, ttl: u32, rcode: dns.Rcode, cloak := false) -
 
 @(private = "file")
 Client :: struct {
-	srv:   ^Server,
-	id:    u16,
+	srv:     ^Server,
+	id:      u16,
 	// Ask with an OPT record at `UPSTREAM_UDP_SIZE`, or without one as an old
 	// stub does, which is a different message to the upstream.
-	edns:  bool,
+	edns:    bool,
 	rcode:   dns.Rcode,
 	addr:    [4]u8,
 	outcome: Outcome,
@@ -255,6 +255,8 @@ run_burst :: proc(
 	// clients ask at all.
 	hold_for := CLIENTS - 1,
 	clients_asking := CLIENTS,
+	// The cache's counters once the burst is over.
+	cache_stats: ^cache.Stats = nil,
 	// The server's counters once the burst is over.
 	stats: ^Stats = nil,
 ) -> int {
@@ -354,6 +356,9 @@ run_burst :: proc(
 	}
 	if lookups != nil {
 		lookups^ = m.lookups
+	}
+	if cache_stats != nil {
+		cache_stats^ = cache.stats(answers)
 	}
 	return m.queries
 }
@@ -634,20 +639,35 @@ test_followers_of_a_bogus_leader_are_refused_from_its_verdict :: proc(t: ^testin
 
 	clients: [CLIENTS]Client
 	walked: int
-	queries := run_burst(t, &clients, validating = true, lookups = &walked)
+	st: Stats
+	cs: cache.Stats
+	queries := run_burst(t, &clients, validating = true, lookups = &walked, stats = &st, cache_stats = &cs)
 	testing.expectf(t, queries == 1, "the upstream saw the question %d times for %d clients, want 1", queries, CLIENTS)
 	testing.expectf(t, walked == one_walk, "the chain was asked for %d times, want one walk's %d", walked, one_walk)
 	for c, i in clients {
 		testing.expectf(t, c.ok && c.rcode == .Serv_Fail, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)
 	}
+	// One miss a client, taken on the way in; the verdict is read as a probe,
+	// which counts nothing, and the followers are what was coalesced.
+	testing.expect_value(t, cs.misses, u64(CLIENTS))
+	testing.expect_value(t, cs.hits, u64(0))
+	testing.expect_value(t, st.coalesced, u64(CLIENTS - 1))
 }
 
 @(test)
 test_followers_of_a_cloaked_leader_are_blocked_from_its_verdict :: proc(t: ^testing.T) {
 	clients: [CLIENTS]Client
-	queries := run_burst(t, &clients, cloak = true)
+	st: Stats
+	cs: cache.Stats
+	queries := run_burst(t, &clients, cloak = true, stats = &st, cache_stats = &cs)
 	testing.expectf(t, queries == 1, "the upstream saw the question %d times for %d clients, want 1", queries, CLIENTS)
 	for c, i in clients {
 		testing.expectf(t, c.ok && c.outcome == .Blocked, "client %d: ok=%v outcome=%v", i, c.ok, c.outcome)
 	}
+	// A miss each on the way in, and a counted hit - then withheld - for each
+	// follower that read the refusal.
+	testing.expect_value(t, cs.misses, u64(CLIENTS))
+	testing.expect_value(t, cs.hits, u64(CLIENTS - 1))
+	testing.expect_value(t, cs.withheld, u64(CLIENTS - 1))
+	testing.expect_value(t, st.coalesced, u64(CLIENTS - 1))
 }

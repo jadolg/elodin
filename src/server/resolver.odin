@@ -1361,10 +1361,7 @@ resolve_query :: proc(
 	`reload_filters` runs only under that flag - so the number would sit at zero
 	and match every entry's stamp for the life of the process.
 	*/
-	generation: u64
-	if s.cfg.cache.enabled && s.cfg.blocking.enabled && s.filters != nil {
-		generation = filter.engine_generation(s.filters)
-	}
+	generation := rules_generation(s)
 
 	/*
 	An expired entry that `serve_stale` kept, held back rather than served.
@@ -1852,7 +1849,7 @@ resolve_query :: proc(
 			flight.forwarded = forwarded
 		} else if joined != nil {
 			patience := flight_patience(route_group(s, q.name, q.type))
-			landed_with, landed, same := flight_follow(s, joined, patience, allocator, counted, forwarded)
+			landed_with, _, same := flight_follow(s, joined, patience, allocator, counted, forwarded)
 			// A NOERROR or NXDOMAIN is shared as the cache shares it - so not with
 			// the cache off, where nothing is shared between two messages - and any
 			// other rcode may be about the leader's own bytes, unless they were these.
@@ -1908,12 +1905,15 @@ resolve_query :: proc(
 			/*
 			The leader stored a verdict, which the cache now answers with: a
 			cloaking refusal under the question's own key, which `serve_from_cache`
-			refuses from the entry, or a Bogus one under its verdict key, read
-			under the same condition as the lookup above. Neither there - evicted,
-			or behind a reload - and this query forwards on its own.
+			refuses from the entry - against the rule sets as they stand after the
+			wait, so a reload during it re-walks the chain - or a Bogus one under
+			its verdict key, read under the same condition as the lookup above.
+			Evicted already, and this query forwards on its own.
 			*/
-			if landed && landed_with.stored {
-				if stored, found := stored_answer(s, key, generation, allocator); found && !stored.stale {
+			#partial switch landed_with.stored {
+			case .Cloak:
+				if stored, found := stored_answer(s, key, rules_generation(s), allocator); found && !stored.stale {
+					sync.atomic_add(&s.stats.coalesced, 1)
 					return serve_from_cache(
 						s,
 						stored,
@@ -1930,10 +1930,13 @@ resolve_query :: proc(
 						ede,
 					)
 				}
-				if validating {
-					if remembered, found := stored_verdict(s, verdict_key, allocator); found {
-						return serve_bogus_verdict(s, remembered, query, msg, q, proto, client, started)
-					}
+			case .Bogus:
+				if !validating {
+					break
+				}
+				if remembered, found := stored_verdict(s, verdict_key, allocator); found {
+					sync.atomic_add(&s.stats.coalesced, 1)
+					return serve_bogus_verdict(s, remembered, query, msg, q, proto, client, started)
 				}
 			}
 		}
@@ -2394,7 +2397,7 @@ resolve_query :: proc(
 			out, built := dnssec_failure_response(msg, result, allocator, limit)
 			if remember_bogus_verdict(s, verdict_key, msg, result, unproven_apex_ds, spent, allocator) &&
 			   flight != nil {
-				flight.stored = true
+				flight.stored = .Bogus
 			}
 			log_query(s, client, proto, q, .Failed, fmt.tprintf("dnssec:%s", from), started)
 			return out, .Failed, built
@@ -2698,8 +2701,8 @@ resolve_query :: proc(
 			   !unproven_apex_ds &&
 			   cloak_verdict_worth_keeping(verdict) {
 				kept := cache.put(s.answers, key, resp, decoded.msg, generation, u8(verdict), ede = answer_ede)
-				if flight != nil {
-					flight.stored = kept
+				if flight != nil && kept {
+					flight.stored = .Cloak
 				}
 			}
 			return out, cloak_outcome(verdict), true
@@ -2760,6 +2763,18 @@ resolve_query :: proc(
 	settle_ad_bit(resp, msg, validating)
 	log_query(s, client, proto, q, .Forwarded, answering_upstream(winner), started)
 	return resp, .Forwarded, true
+}
+
+/*
+Which rule sets an answer is matched against, read only where both halves are on
+- see where `resolve_query` first takes it.
+*/
+@(private)
+rules_generation :: proc(s: ^Server) -> u64 {
+	if s.cfg.cache.enabled && s.cfg.blocking.enabled && s.filters != nil {
+		return filter.engine_generation(s.filters)
+	}
+	return 0
 }
 
 // The entry under `key`, fresh or expired, as the answer path reads it.

@@ -910,11 +910,14 @@ upstream giving nothing after every attempt on every server, in which case they
 get the expired copy or SERVFAIL. Under DNSSEC validation, whose rewrite writes
 the whole OPT record, most messages are identical. Without it, the payload size
 and the OPT flags stay the client's, so only clients that ask alike match.
-Different spellings of the name, or different EDNS options, never do. The other
-waiting queries ask for themselves, as does any query that arrives when a
+Different spellings of the name, or different EDNS options, never do. If the
+first query cached a refusal instead, a DNSSEC failure or a CNAME into a blocked
+name, the waiting queries are refused from it without asking. The other waiting
+queries ask for themselves, as does any query that arrives when a
 quarter of the query pool is already waiting like this. "Identical" means the
-same cache key. The queries given the first one's outcome count in
-`elodin_answers_coalesced_total`, and those that asked for themselves do not. The query log
+same cache key. The queries given the first one's outcome, or refused
+from its cached refusal, count in `elodin_answers_coalesced_total`, and those
+that asked for themselves do not. The query log
 shows a shared answer as `outcome=cached detail=coalesced` and a shared failure
 as `outcome=failed detail=upstream-coalesced`, or as `detail=stale` where an
 expired copy was served instead.
