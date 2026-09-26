@@ -737,8 +737,8 @@ resolve_sequential :: proc(
 	budget := 2 * g.timeout
 	spent: time.Duration
 	// The round, from 1, in which this query asked each member; 0 for not yet.
-	asked := make([]int, len(g.servers), allocator)
-	defer delete(asked, allocator)
+	// Scratch, like `resolve_race`'s candidates: the caller resets the arena.
+	asked := make([]int, len(g.servers), context.temp_allocator)
 
 	for round in 1 ..= g.attempts {
 		/*

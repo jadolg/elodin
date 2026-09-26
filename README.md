@@ -421,7 +421,8 @@ resolver the latter would come straight back to a server that has not started
 listening yet.
 
 An upstream that fails three times in a row is skipped for ten seconds; if every
-upstream is in that state they are all tried anyway. One kind of failure is
+upstream is in that state they are tried anyway, as many as the two-`timeout`
+budget above leaves room for. One kind of failure is
 exempt: a peer that hangs up without answering. Every DNS-over-TCP server
 recycles its connections — of the two public resolvers this was measured
 against, one closes an idle one after ten to fifteen seconds and the other

@@ -410,9 +410,9 @@ Whether any upstream in `g` is out of its failure cooldown.
 
 Asked about both groups before an apex `DS` is sent to the parent's, and nowhere
 else. `resolve_sequential` spends the group's whole budget on a group that is
-entirely parked - round 0 skips the unhealthy servers, round 1 tries them anyway
+entirely parked - round 1 skips the unhealthy servers, round 2 tries them anyway
 - so with the default `timeout: 5s` and `attempts: 2` a public upstream that has
-gone away costs ten seconds or more before the route is asked in its place. A
+gone away costs up to ten seconds before the route is asked in its place. A
 validating stub gives up in two to five, so the deployment `apex_ds_off_route`
 describes - an internal authority behind a poor path out - would still see the
 zone fail, having waited for an upstream this server already knows is down.
