@@ -27,10 +27,13 @@ response's headers may still arrive split, and that direction is handled.
 Client :: struct {
 	io: IO,
 
-	mu:     sync.Mutex,
-	cond:   sync.Cond,
-	refs:   int,
-	closed: bool,
+	mu:        sync.Mutex,
+	cond:      sync.Cond,
+	// Requests waiting for a stream slot, apart from `cond` so that every
+	// frame answering some other stream does not wake the whole queue.
+	slot_cond: sync.Cond,
+	refs:      int,
+	closed:    bool,
 
 	next_stream_id:      u32,
 	peer_max_frame:      int,
@@ -205,6 +208,7 @@ client_serve :: proc(c: ^Client) {
 		sync.mutex_lock(&c.mu)
 		c.closed = true
 		sync.cond_broadcast(&c.cond)
+		sync.cond_broadcast(&c.slot_cond)
 		sync.mutex_unlock(&c.mu)
 	}
 
@@ -397,7 +401,7 @@ client_handle_settings :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bo
 		case .Max_Concurrent_Streams:
 			c.peer_max_streams = int(value)
 			// A raised limit lets a waiting request in.
-			sync.cond_broadcast(&c.cond)
+			sync.cond_broadcast(&c.slot_cond)
 		case .Initial_Window_Size:
 			if value > MAX_WINDOW {
 				sync.mutex_unlock(&c.mu)
@@ -859,7 +863,7 @@ client_request :: proc(
 		*/
 		if len(c.streams) == 0 {
 			c.closed = true
-			sync.cond_broadcast(&c.cond)
+			sync.cond_broadcast(&c.slot_cond)
 			break
 		}
 		remaining := time.diff(time.now(), deadline)
@@ -867,7 +871,7 @@ client_request :: proc(
 			sync.mutex_unlock(&c.mu)
 			return {}, .Timeout
 		}
-		sync.cond_wait_with_timeout(&c.cond, &c.mu, remaining)
+		sync.cond_wait_with_timeout(&c.slot_cond, &c.mu, remaining)
 	}
 	if c.closed {
 		sync.mutex_unlock(&c.mu)
@@ -885,6 +889,7 @@ client_request :: proc(
 	if c.next_stream_id > 0x7fff_ffff {
 		c.closed = true
 		sync.cond_broadcast(&c.cond)
+		sync.cond_broadcast(&c.slot_cond)
 		sync.mutex_unlock(&c.mu)
 		return {}, .Closed
 	}
@@ -925,10 +930,9 @@ client_request :: proc(
 		delete_key(&c.streams, stream_id)
 		client_stream_destroy(c, s)
 		// A slot is free: wake a request waiting on the peer's stream limit.
-		// Only a table that was at the limit can have one waiting; otherwise
-		// this would wake every in-flight request once more per response.
+		// Only a table that was at the limit can have one waiting.
 		if len(c.streams) + 1 >= c.peer_max_streams {
-			sync.cond_broadcast(&c.cond)
+			sync.cond_broadcast(&c.slot_cond)
 		}
 		sync.mutex_unlock(&c.mu)
 		client_unref(c)

@@ -28,19 +28,6 @@ Refusing_Peer :: struct {
 }
 
 @(private = "file")
-peer_recv :: proc(socket: net.TCP_Socket, buf: []u8) -> bool {
-	got := 0
-	for got < len(buf) {
-		n, err := net.recv_tcp(socket, buf[got:])
-		if err != nil || n <= 0 {
-			return false
-		}
-		got += n
-	}
-	return true
-}
-
-@(private = "file")
 peer_send :: proc(socket: net.TCP_Socket, out: [dynamic]u8) {
 	_, _ = net.send_tcp(socket, out[:])
 }
@@ -55,7 +42,7 @@ refusing_peer_run :: proc(p: ^Refusing_Peer) {
 	_ = net.set_option(client, .Receive_Timeout, 3 * time.Second)
 
 	preface: [len(h2.PREFACE)]u8
-	if !peer_recv(client, preface[:]) {
+	if read_full_tcp(client, preface[:]) != .None {
 		return
 	}
 	out := make([dynamic]u8, 0, 64, context.temp_allocator)
@@ -66,7 +53,7 @@ refusing_peer_run :: proc(p: ^Refusing_Peer) {
 	defer delete(refused)
 	for {
 		hdr: [h2.FRAME_HEADER_SIZE]u8
-		if !peer_recv(client, hdr[:]) {
+		if read_full_tcp(client, hdr[:]) != .None {
 			return
 		}
 		h, ok := h2.parse_frame_header(hdr[:])
@@ -74,7 +61,7 @@ refusing_peer_run :: proc(p: ^Refusing_Peer) {
 			return
 		}
 		payload := make([]u8, h.length, context.temp_allocator)
-		if !peer_recv(client, payload) {
+		if read_full_tcp(client, payload) != .None {
 			return
 		}
 		#partial switch h.type {

@@ -2487,6 +2487,7 @@ test_client_wait_for_a_stream_slot_ends_on_deadline_or_close :: proc(t: ^testing
 	sync.mutex_lock(&c.mu)
 	c.closed = true
 	sync.cond_broadcast(&c.cond)
+	sync.cond_broadcast(&c.slot_cond)
 	sync.mutex_unlock(&c.mu)
 	thread.join(th)
 	thread.destroy(th)
