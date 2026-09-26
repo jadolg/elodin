@@ -106,30 +106,56 @@ Whether what this query sends upstream is what any identical one would.
 
 The forwarding path makes most of the outgoing message this server's own - the
 ID, the extended rcode, the cookie, subnet and keepalive options - and clamps
-the payload size to `UPSTREAM_UDP_SIZE`. What it leaves is the client's: records
-beside the question, every other EDNS option, and a payload size below the
-clamp, or no OPT record at all, either of which turns a mid-sized answer into a
-truncated one retried over TCP. So canonical is none of those.
+the payload size to `UPSTREAM_UDP_SIZE`; the DNSSEC rewrite, where `rewritten`
+says it ran, goes further and writes the whole OPT record but its options. What
+is left is the client's, and canonical is none of it: records beside the
+question, an EDNS option that is forwarded (Padding excepted, being zeros that
+say nothing to anybody), the header's Z bit, and - where the OPT record is still
+the client's - its Z flags, a payload size below the clamp or no OPT record at
+all, the last two turning a mid-sized answer into a truncated one retried over
+TCP.
 */
 @(private)
-canonical :: proc(msg: dns.Message, query: []u8) -> bool {
-	if len(msg.answer) > 0 || len(msg.authority) > 0 || len(msg.additional) != 1 {
+canonical :: proc(msg: dns.Message, query: []u8, rewritten: bool) -> bool {
+	if len(msg.answer) > 0 || len(msg.authority) > 0 || msg.flags.z {
 		return false
 	}
-	opt := msg.additional[0]
-	if opt.type != .OPT || dns.peek_udp_size(query) < UPSTREAM_UDP_SIZE {
-		return false
+	opt: dns.Record
+	has_opt := false
+	for rec in msg.additional {
+		if rec.type != .OPT || has_opt {
+			return false
+		}
+		opt, has_opt = rec, true
 	}
-	if data, is_opt := opt.data.(dns.Rdata_OPT); is_opt {
+	if !rewritten {
+		// The low fifteen bits of the OPT TTL beneath DO are its Z flags.
+		if !has_opt || dns.peek_udp_size(query) < UPSTREAM_UDP_SIZE || opt.ttl & 0x7fff != 0 {
+			return false
+		}
+	}
+	if data, is_opt := opt.data.(dns.Rdata_OPT); has_opt && is_opt {
 		for o in data.options {
 			#partial switch dns.EDNS_Option_Code(o.code) {
-			case .Cookie, .Client_Subnet, .TCP_Keepalive:
+			case .Cookie, .Client_Subnet, .TCP_Keepalive, .Padding:
 			case:
 				return false
 			}
 		}
 	}
 	return true
+}
+
+/*
+What a follower is handed once its leader lands. See `Flight` for each field.
+*/
+@(private)
+Landing :: struct {
+	answer:    []u8,
+	ede:       u16,
+	canonical: bool,
+	failed:    bool,
+	stored:    bool,
 }
 
 /*
@@ -235,7 +261,7 @@ flight_follow :: proc(
 	allocator: mem.Allocator,
 	counted := false,
 ) -> (
-	result: Flight,
+	result: Landing,
 	landed: bool,
 ) {
 	sync.mutex_lock(&s.inflight.mu)

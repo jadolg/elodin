@@ -1561,7 +1561,6 @@ resolve_query :: proc(
 		joined, leading, counted := flight_join(s, key, &own_flight, shared_worker, ceiling)
 		if leading {
 			flight = joined
-			flight.canonical = canonical(msg, query)
 		} else if joined != nil {
 			patience := flight_patience(route_group(s, q.name, q.type))
 			landed_with, landed := flight_follow(s, joined, patience, allocator, counted)
@@ -1592,10 +1591,10 @@ resolve_query :: proc(
 			/*
 			The upstream gave the leader nothing after every attempt, and would
 			give this query the same: the failure branch below, without the wait.
-			Only where the leader's message was this one's, or on a second pass,
-			where it is two failures in a row.
+			Only where the leader's message was the one this query would send.
 			*/
-			if landed_with.failed && (landed_with.canonical || rejoined) {
+			if landed_with.failed && landed_with.canonical {
+				sync.atomic_add(&s.stats.coalesced, 1)
 				return upstream_failed(
 					s,
 					stale_hit,
@@ -1942,6 +1941,11 @@ resolve_query :: proc(
 		forwarded,
 		u16(clamp(int(dns.peek_udp_size(forwarded)), dns.MAX_UDP_SIZE, UPSTREAM_UDP_SIZE)),
 	)
+	// Judged here, where the outgoing message has taken its final shape - the
+	// DNSSEC rewrite included, which is what `validating` still being set says.
+	if flight != nil {
+		flight.canonical = canonical(msg, query, rewritten = validating)
+	}
 
 	/*
 	Down the zone's own route when it has one, and to the default group when it
@@ -2742,14 +2746,15 @@ resolve_query :: proc(
 	What was just stored, or would have been, handed over and landed before
 	`settle_ad_bit` below writes into it - each follower settles its own copy.
 
-	Not a FORMERR, unless the leader was canonical. That rcode is the upstream
-	reading this message, and a message that is not `canonical` carries more than
-	the key does - an EDNS option of the client's own, records beside the
-	question - so a follower starts over rather than take a refusal of bytes it
-	did not send.
+	From a leader that was not `canonical`, only an answer: a NOERROR or an
+	NXDOMAIN, the rcodes the cache itself keeps. Anything else - a FORMERR, a
+	REFUSED, a SERVFAIL - may be the upstream reading bytes of the client's own
+	that the key does not carry, so a follower starts over rather than take a
+	refusal of a message it did not send.
 	*/
 	if flight != nil {
-		if flight.canonical || dns.peek_rcode(resp) != .Form_Err {
+		rcode := dns.peek_rcode(resp)
+		if flight.canonical || rcode == .No_Error || rcode == .NX_Domain {
 			flight.answer, flight.ede = resp, answer_ede
 		}
 		flight_land(s, flight)

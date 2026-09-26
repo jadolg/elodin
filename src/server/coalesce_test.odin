@@ -335,15 +335,16 @@ test_followers_of_a_non_canonical_leader_start_over :: proc(t: ^testing.T) {
 }
 
 /*
-And a FORMERR is shared or not on the same terms. From a leader that asked as a
-follower would have, it is the upstream's word on the question; from one that
-did not, it may be a refusal of bytes no follower sent.
+And an rcode is shared or not on the same terms. From a leader that asked as a
+follower would have, a FORMERR or a REFUSED is the upstream's word on the
+question; from one that did not, it may be a refusal of bytes no follower sent,
+and only the rcodes the cache itself keeps are handed on.
 */
 @(test)
-test_a_formerr_is_shared_only_from_a_canonical_leader :: proc(t: ^testing.T) {
-	count :: proc(clients: [CLIENTS]Client) -> (refused, answered: int) {
+test_a_refusal_is_shared_only_from_a_canonical_leader :: proc(t: ^testing.T) {
+	count :: proc(clients: [CLIENTS]Client, rcode: dns.Rcode) -> (refused, answered: int) {
 		for c in clients {
-			if c.ok && c.rcode == .Form_Err {
+			if c.ok && c.rcode == rcode {
 				refused += 1
 			} else if c.ok && c.rcode == .No_Error && c.addr == {192, 0, 2, 7} {
 				answered += 1
@@ -352,14 +353,16 @@ test_a_formerr_is_shared_only_from_a_canonical_leader :: proc(t: ^testing.T) {
 		return
 	}
 
-	own: [CLIENTS]Client
-	run_burst(t, &own, first = .Form_Err, edns = false)
-	refused, answered := count(own)
-	testing.expectf(t, refused == 1 && answered == CLIENTS - 1, "without EDNS, %d clients got the leader's FORMERR and %d an answer, want 1 and %d", refused, answered, CLIENTS - 1)
+	for rcode in ([]dns.Rcode{.Form_Err, .Refused}) {
+		own: [CLIENTS]Client
+		run_burst(t, &own, first = rcode, edns = false)
+		refused, answered := count(own, rcode)
+		testing.expectf(t, refused == 1 && answered == CLIENTS - 1, "%v without EDNS: %d clients got the leader's refusal and %d an answer, want 1 and %d", rcode, refused, answered, CLIENTS - 1)
+	}
 
 	shared: [CLIENTS]Client
 	queries := run_burst(t, &shared, first = .Form_Err)
-	refused, answered = count(shared)
+	refused, _ := count(shared, .Form_Err)
 	testing.expectf(t, queries == 1 && refused == CLIENTS, "with EDNS, %d queries and %d FORMERRs, want 1 and %d", queries, refused, CLIENTS)
 }
 
@@ -411,7 +414,7 @@ that are stripped.
 */
 @(test)
 test_canonical_is_what_any_identical_query_would_send :: proc(t: ^testing.T) {
-	check :: proc(t: ^testing.T, msg: dns.Message, want: bool, what: string) {
+	check :: proc(t: ^testing.T, msg: dns.Message, want: bool, what: string, rewritten := false) {
 		wire, _, err := dns.encode_message(msg, context.temp_allocator)
 		if !testing.expectf(t, err == .None, "%s: cannot encode: %v", what, err) {
 			return
@@ -420,7 +423,7 @@ test_canonical_is_what_any_identical_query_would_send :: proc(t: ^testing.T) {
 		if !testing.expectf(t, derr == .None, "%s: cannot decode: %v", what, derr) {
 			return
 		}
-		testing.expectf(t, canonical(decoded, wire) == want, "%s: canonical is %v, want %v", what, !want, want)
+		testing.expectf(t, canonical(decoded, wire, rewritten) == want, "%s: canonical is %v, want %v", what, !want, want)
 	}
 	with_opt :: proc(size: u16, codes: ..dns.EDNS_Option_Code) -> []dns.Record {
 		opt := dns.make_opt(size, false)
@@ -440,6 +443,14 @@ test_canonical_is_what_any_identical_query_would_send :: proc(t: ^testing.T) {
 	check(t, dns.Message{question = question, additional = with_opt(4096)}, true, "OPT above the clamp")
 	check(t, dns.Message{question = question, additional = with_opt(UPSTREAM_UDP_SIZE, .Cookie, .Client_Subnet)}, true, "stripped options")
 	check(t, dns.Message{question = question}, false, "no OPT")
+	check(t, dns.Message{question = question}, true, "no OPT, rewritten for DNSSEC", rewritten = true)
+	check(t, dns.Message{question = question, additional = with_opt(512)}, true, "OPT at 512, rewritten", rewritten = true)
+	check(t, dns.Message{question = question, additional = with_opt(UPSTREAM_UDP_SIZE, .Padding)}, true, "padding")
+	z := dns.Message{question = question, additional = with_opt(UPSTREAM_UDP_SIZE)}
+	z.flags.z = true
+	check(t, z, false, "the header Z bit")
+	check(t, dns.Message{question = question, additional = []dns.Record{record[0], with_opt(UPSTREAM_UDP_SIZE)[0]}}, false, "a record beside OPT")
+	check(t, dns.Message{question = question, additional = with_opt(UPSTREAM_UDP_SIZE, .NSID)}, false, "a forwarded option, rewritten", rewritten = true)
 	check(t, dns.Message{question = question, additional = with_opt(512)}, false, "OPT at 512")
 	check(t, dns.Message{question = question, additional = with_opt(UPSTREAM_UDP_SIZE, .NSID)}, false, "an option that is forwarded")
 	check(t, dns.Message{question = question, answer = record, additional = with_opt(UPSTREAM_UDP_SIZE)}, false, "an answer record")
