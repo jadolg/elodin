@@ -754,7 +754,8 @@ run_transport_cases :: proc(r: ^Runner) {
 POST Content-Types and the status each earns, over HTTP/1.1 and HTTP/2 alike.
 RFC 9110 8.3.1: the media type is case-insensitive and parameters follow a `;`;
 anything else naming another type is a 415. The long s (U+017F) folds to `s`
-under Unicode rules, which HTTP's ASCII case-insensitivity does not include.
+under Unicode rules, which HTTP's ASCII case-insensitivity does not include,
+and a non-breaking space is not OWS, so it is part of the value.
 */
 DOH_CONTENT_TYPE_CASES := [?]struct {
 	content_type: string,
@@ -772,4 +773,6 @@ DOH_CONTENT_TYPE_CASES := [?]struct {
 	{"application/dns", 415},
 	{"application/dns-messag", 415},
 	{"text/plain", 415},
+	{";application/dns-message", 415},
+	{"application/dns-message\u00a0", 415},
 }

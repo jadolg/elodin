@@ -45,7 +45,7 @@ doh_content_type_ok :: proc(value: string) -> bool {
 	if semi := strings.index_byte(media, ';'); semi >= 0 {
 		media = media[:semi]
 	}
-	return dns.name_equal_fold(strings.trim(media, " \t"), DOH_CONTENT_TYPE)
+	return dns.name_equal_fold(trim_ows(media), DOH_CONTENT_TYPE)
 }
 
 /*
@@ -454,7 +454,10 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 			if content_types > 1 {
 				return {}, 400, false
 			}
-			req.content_type = hold(value)
+			// Only OWS off it, as Host's: `value` has been through
+			// `strings.trim_space`, which would make a type ending in a
+			// non-breaking space into this one.
+			req.content_type = hold(trim_ows(header[colon + 1:]))
 		case strings.equal_fold(name, "host"):
 			/*
 			RFC 9112 3.2: a request carrying more than one Host is a 400, whether

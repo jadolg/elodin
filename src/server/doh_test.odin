@@ -1,5 +1,6 @@
 package server
 
+import "core:fmt"
 import "core:mem"
 import "core:mem/virtual"
 import "core:net"
@@ -1961,4 +1962,42 @@ test_doh_repeated_content_type_is_refused :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, !parsed, "a repeated Content-Type was accepted")
 	testing.expect_value(t, status, 400)
+}
+
+/*
+The HTTP/1.1 reader hands the predicate the Content-Type with only OWS off it.
+`strings.trim_space` also takes a non-breaking space, a vertical tab or a form
+feed off the end - none of them OWS - and a type a front end judged with one
+of those on it became `application/dns-message` here, while HTTP/2 kept the
+character and refused it.
+*/
+@(test)
+test_doh_content_type_keeps_what_is_not_ows :: proc(t: ^testing.T) {
+	Case :: struct {
+		value:    string,
+		accepted: bool,
+	}
+	CASES := []Case {
+		{"application/dns-message", true},
+		{"\tApplication/DNS-Message \t", true},
+		{"application/dns-message ", false},
+		{" application/dns-message", false},
+		{"application/dns-message\x0b", false},
+		{"application/dns-message\x0c", false},
+	}
+	for c in CASES {
+		raw := fmt.tprintf(
+			"POST /dns-query HTTP/1.1\r\nHost: dns.example\r\nContent-Type: %s\r\nContent-Length: 4\r\n\r\nabcd",
+			c.value,
+		)
+		req, _, parsed, ok := read_request_over_loopback(t, raw, c.value)
+		if !ok {
+			return
+		}
+		if testing.expectf(t, parsed, "%q: the request was not read", c.value) {
+			got := doh_content_type_ok(req.content_type)
+			testing.expectf(t, got == c.accepted, "%q: read as %q, accepted %v, want %v", c.value, req.content_type, got, c.accepted)
+		}
+		free_all(context.temp_allocator)
+	}
 }
