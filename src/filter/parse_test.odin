@@ -226,11 +226,17 @@ test_an_anchored_wildcard_prefix_covers_only_what_is_under_it :: proc(t: ^testin
 	testing.expect_value(t, matches(src, .Adblock, "exaapi.com."), Decision.None)
 	testing.expect_value(t, matches(src, .Adblock, "xexaapi.com."), Decision.None)
 	testing.expect_value(t, matches("@@||*.ok.example^\n", .Adblock, "a.ok.example."), Decision.Allowed)
+	// The exception is subtree-only too, so it leaves a block on the apex standing.
+	testing.expect_value(t, matches("||ok.example^\n@@||*.ok.example^\n", .Adblock, "ok.example."), Decision.Blocked)
 	// A second wildcard is still a pattern DNS cannot express.
 	testing.expect_value(t, matches("||*.*.exaapi.com^\n", .Adblock, "a.b.exaapi.com."), Decision.None)
 	// `$badfilter` cancels it in either spelling of the same rule.
 	testing.expect_value(t, matches("||*.exaapi.com^\n||*.exaapi.com^$badfilter\n", .Adblock, "x.exaapi.com."), Decision.None)
 	testing.expect_value(t, matches("*.exaapi.com\n||*.exaapi.com^$badfilter\n", .Adblock, "x.exaapi.com."), Decision.None)
+	// The trade-off `set_cancel` names: against a `||x^` it narrows the rule to its apex.
+	narrowed := "||exaapi.com^\n||*.exaapi.com^$badfilter\n"
+	testing.expect_value(t, matches(narrowed, .Adblock, "exaapi.com."), Decision.Blocked)
+	testing.expect_value(t, matches(narrowed, .Adblock, "x.exaapi.com."), Decision.None)
 }
 
 @(test)

@@ -830,7 +830,8 @@ are dnsmasq's, accepted because they turn up in lists that are otherwise adblock
 syntax; a `server=/…/` line that names a server forwards rather than blocks in
 dnsmasq, so it is skipped. `$important` and `$third-party` (`$3p`) are dropped and the rest of the
 rule kept, so an `@@` exception beats a `$important` block here, where in
-AdGuard Home the `$important` block would win. `$badfilter` cancels the rule it names in any list, though a list's
+AdGuard Home the `$important` block would win. `$badfilter` cancels what the rule it names covers in any list, whichever rule
+gave it - so `||*.x^$badfilter` leaves a `||x^` blocking `x` alone - though a list's
 cannot cancel `blocking.rules` or `blocking.allow`. A rule with any other
 modifier (`$dnstype`, `$client`, `$domain`, `$elemhide`, `$removeparam`, ...) is
 skipped rather than widened to every query. So are cosmetic rules (`##`, `$$`)

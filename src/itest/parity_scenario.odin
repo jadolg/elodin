@@ -277,7 +277,7 @@ AdGuard DNS filter writes its subtree rules this way, and they used to be
 dropped as wildcards (#323). The zone and a name under it are both in the pool,
 so a rule read as the plain `||zone^` shows up as much as one not read at all.
 */
-PARITY_BLOCKED_SUBTREE :: "four.five.parity.test."
+PARITY_BLOCKED_SUBTREE :: "subtree.parity.test."
 
 /*
 Rules on pool names that must block nothing, so their answers are held to the
@@ -294,7 +294,7 @@ PARITY_NOT_BLOCKING :: []string {
 
 // The blocking scenario's pool: the usual one, the allowed name inside the
 // blocked one, so the exception is asked about by name, and the subtree-only
-// zone itself, so its apex is asked about too.
+// zone and a name under it, so both sides of its apex are asked about.
 PARITY_BLOCKING_POOL := []string {
 	"parity.test.",
 	"www.parity.test.",
@@ -303,8 +303,9 @@ PARITY_BLOCKING_POOL := []string {
 	"a.parity.test.",
 	"_dns.resolver.parity.test.",
 	"xn--bcher-kva.parity.test.",
-	"four.five.parity.test.",
 	"one.two.three.four.five.parity.test.",
+	"subtree.parity.test.",
+	"in.subtree.parity.test.",
 }
 
 /*
