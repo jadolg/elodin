@@ -1129,6 +1129,7 @@ test_stats_of_carries_every_counter :: proc(t: ^testing.T) {
 		// carried by the same snapshot, and dropped by it just as silently.
 		accept_backoff = 16,
 		unreadable_rcode = 17,
+		coalesced = 18,
 	}
 	s := Server {
 		stats = want,

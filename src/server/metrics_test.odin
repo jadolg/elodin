@@ -77,6 +77,7 @@ test_every_counter_reaches_the_endpoint :: proc(t: ^testing.T) {
 			special_use = 15,
 			accept_backoff = 16,
 			unreadable_rcode = 17,
+			coalesced = 18,
 		},
 	)
 
@@ -96,6 +97,7 @@ test_every_counter_reaches_the_endpoint :: proc(t: ^testing.T) {
 	expect_line(t, page, `elodin_dnssec_answers_total{result="bogus"} 13`)
 	expect_line(t, page, "elodin_rebind_refused_total 14")
 	expect_line(t, page, "elodin_special_use_total 15")
+	expect_line(t, page, "elodin_answers_coalesced_total 18")
 	/*
 	`unreadable_rcode` is the one counter whose series is not here, and
 	deliberately: it is published per upstream, because "which of the group is

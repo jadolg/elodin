@@ -30,19 +30,19 @@ HOLD_LIMIT :: 2 * time.Second
 
 @(private = "file")
 Mock :: struct {
-	socket:   net.UDP_Socket,
-	ttl:      u32,
+	socket:     net.UDP_Socket,
+	ttl:        u32,
 	// Hold the first query until this many followers are waiting on it, read
 	// from the server's own table, so no client can arrive after the answer.
-	hold_for: int,
-	srv:      ^Server,
+	hold_for:   int,
+	srv:        ^Server,
 	// Never answer: the upstream is down for the leader and its followers.
-	silent:   bool,
+	silent:     bool,
 	// Lose the first query only, as a datagram on a bad path is lost.
 	drop_first: bool,
 	// The rcode the first query is answered with; every later one is NOERROR.
-	first:    dns.Rcode,
-	queries:  int,
+	first:      dns.Rcode,
+	queries:    int,
 }
 
 @(private = "file")
@@ -169,6 +169,9 @@ run_burst :: proc(
 	timeout := 4 * time.Second,
 	first := dns.Rcode.No_Error,
 	drop_first := false,
+	attempts := 1,
+	// The server's counters once the burst is over.
+	stats: ^Stats = nil,
 ) -> int {
 	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
 	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
@@ -186,7 +189,7 @@ run_burst :: proc(
 	cfg.blocking.enabled = false
 	cfg.dnssec.enabled = false
 	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
+	cfg.upstream.attempts = attempts
 	cfg.upstream.timeout = timeout
 	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
 	servers[0] = config.Upstream_Spec {
@@ -210,12 +213,12 @@ run_burst :: proc(
 	}
 
 	m := Mock {
-		socket   = socket,
-		ttl      = ttl,
-		hold_for = CLIENTS - 1,
-		srv      = &srv,
-		silent   = silent,
-		first    = first,
+		socket     = socket,
+		ttl        = ttl,
+		hold_for   = CLIENTS - 1,
+		srv        = &srv,
+		silent     = silent,
+		first      = first,
 		drop_first = drop_first,
 	}
 	mock := thread.create_and_start_with_poly_data(&m, serve_mock)
@@ -233,18 +236,25 @@ run_burst :: proc(
 	}
 	thread.join(mock)
 	thread.destroy(mock)
+	if stats != nil {
+		stats^ = srv.stats
+	}
 	return m.queries
 }
 
 @(test)
 test_identical_inflight_queries_are_one_upstream_exchange :: proc(t: ^testing.T) {
 	clients: [CLIENTS]Client
-	queries := run_burst(t, &clients)
+	st: Stats
+	queries := run_burst(t, &clients, stats = &st)
 	testing.expectf(t, queries == 1, "the upstream saw %d queries for %d identical clients, want 1", queries, CLIENTS)
 	for c, i in clients {
 		testing.expectf(t, c.ok && c.rcode == .No_Error, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)
 		testing.expectf(t, c.addr == {192, 0, 2, 7}, "client %d was answered %v", i, c.addr)
 	}
+	// The followers are counted as coalesced, and nobody else is.
+	testing.expect_value(t, st.coalesced, u64(CLIENTS - 1))
+	testing.expect_value(t, st.forwarded, u64(1))
 }
 
 /*
@@ -263,40 +273,34 @@ test_an_uncacheable_answer_is_shared_with_the_queries_waiting_on_it :: proc(t: ^
 }
 
 /*
-An upstream that gave the leader nothing is asked once more, by one of the
-followers on behalf of the rest, and then not again: every follower waiting out
-the same timeout for the same nothing would hold a worker twice as long as the
-leader did.
+And an upstream that gave the leader nothing is not asked again by every query
+that was waiting on it: the group has already tried every server for every
+attempt, and each follower would wait out the same timeout for the same nothing,
+holding a worker twice as long as the leader did.
 */
 @(test)
-test_followers_of_a_failed_exchange_ask_once_more_and_no_further :: proc(t: ^testing.T) {
+test_followers_of_a_failed_exchange_do_not_ask_again :: proc(t: ^testing.T) {
 	clients: [CLIENTS]Client
-	queries := run_burst(t, &clients, silent = true, timeout = 1 * time.Second)
-	testing.expectf(t, queries == 2, "the upstream saw %d queries for %d identical clients, want 2", queries, CLIENTS)
+	queries := run_burst(t, &clients, silent = true, timeout = 3 * time.Second)
+	testing.expectf(t, queries == 1, "the upstream saw %d queries for %d identical clients, want 1", queries, CLIENTS)
 	for c, i in clients {
 		testing.expectf(t, c.ok && c.rcode == .Serv_Fail, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)
 	}
 }
 
 /*
-Once more because the leader's failure may have been the leader's alone - one
-lost datagram, or a message the upstream would not read - and that must not be
-every waiting client's SERVFAIL.
+A lost datagram is the group's to retry, and the followers are answered by the
+retry: nothing about sharing the leader's exchange makes one lost packet every
+waiting client's SERVFAIL.
 */
 @(test)
-test_a_leader_whose_query_was_lost_does_not_fail_its_followers :: proc(t: ^testing.T) {
+test_a_lost_datagram_is_retried_for_the_followers_too :: proc(t: ^testing.T) {
 	clients: [CLIENTS]Client
-	queries := run_burst(t, &clients, drop_first = true, timeout = 1 * time.Second)
+	queries := run_burst(t, &clients, drop_first = true, timeout = 1 * time.Second, attempts = 2)
 	testing.expectf(t, queries == 2, "the upstream saw %d queries for %d identical clients, want 2", queries, CLIENTS)
-	failed, answered := 0, 0
-	for c in clients {
-		if c.ok && c.rcode == .Serv_Fail {
-			failed += 1
-		} else if c.ok && c.rcode == .No_Error && c.addr == {192, 0, 2, 7} {
-			answered += 1
-		}
+	for c, i in clients {
+		testing.expectf(t, c.ok && c.addr == {192, 0, 2, 7}, "client %d: ok=%v rcode=%v answer %v", i, c.ok, c.rcode, c.addr)
 	}
-	testing.expectf(t, failed == 1 && answered == CLIENTS - 1, "%d clients failed and %d were answered, want 1 and %d", failed, answered, CLIENTS - 1)
 }
 
 /*
@@ -359,4 +363,51 @@ test_a_full_flight_table_forwards_without_joining :: proc(t: ^testing.T) {
 	for i in 0 ..< INFLIGHT_SLOTS {
 		flight_land(&s, &flights[i])
 	}
+}
+
+/*
+A client's own records beside the question make the message its own: an upstream
+that refuses or drops it has said something about those bytes, not about the
+question every identical query waiting on it asked.
+*/
+@(test)
+test_only_a_plain_question_is_coalesced :: proc(t: ^testing.T) {
+	question := []dns.Question{{name = QNAME, type = .A, class = .IN}}
+	record := []dns.Record{{name = QNAME, type = .A, class = .IN, data = dns.Rdata_A{addr = {192, 0, 2, 1}}}}
+	opt := []dns.Record{dns.make_opt(1232, false)}
+	testing.expect(t, coalescable(dns.Message{question = question}), "a bare question was not coalescable")
+	testing.expect(t, coalescable(dns.Message{question = question, additional = opt}), "a question with OPT was not coalescable")
+	testing.expect(t, !coalescable(dns.Message{question = question, answer = record}), "an answer record was coalesced")
+	testing.expect(t, !coalescable(dns.Message{question = question, authority = record}), "an authority record was coalesced")
+	testing.expect(t, !coalescable(dns.Message{question = question, additional = record}), "a non-OPT additional was coalesced")
+}
+
+// Followers on the shared pool stop at the ceiling, and the count comes back
+// down as they leave.
+@(test)
+test_followers_on_the_shared_pool_stop_at_the_ceiling :: proc(t: ^testing.T) {
+	s: Server
+	lead: Flight
+	_, leading := flight_join(&s, "k", &lead, shared = true, ceiling = 2)
+	testing.expect(t, leading, "the first query did not lead")
+	a, b, c: Flight
+	fa, _ := flight_join(&s, "k", &a, shared = true, ceiling = 2)
+	fb, _ := flight_join(&s, "k", &b, shared = true, ceiling = 2)
+	fc, _ := flight_join(&s, "k", &c, shared = true, ceiling = 2)
+	testing.expect(t, fa == &lead && fb == &lead, "a follower under the ceiling was turned away")
+	testing.expect(t, fc == nil, "a follower past the ceiling was let in")
+	// A connection's own thread is not the pool's to protect.
+	d: Flight
+	fd, _ := flight_join(&s, "k", &d, shared = false, ceiling = 2)
+	testing.expect(t, fd == &lead, "a follower off the shared pool was turned away")
+
+	_, _, _, _ = flight_follow(&s, fa, 0, context.temp_allocator, true, 2)
+	testing.expect_value(t, s.inflight.followers, 1)
+	fe, _ := flight_join(&s, "k", &c, shared = true, ceiling = 2)
+	testing.expect(t, fe == &lead, "the slot a follower left was not free again")
+	_, _, _, _ = flight_follow(&s, fb, 0, context.temp_allocator, true, 2)
+	_, _, _, _ = flight_follow(&s, fe, 0, context.temp_allocator, true, 2)
+	_, _, _, _ = flight_follow(&s, fd, 0, context.temp_allocator)
+	testing.expect_value(t, s.inflight.followers, 0)
+	flight_land(&s, &lead)
 }

@@ -3,6 +3,8 @@ package server
 import "core:mem"
 import "core:sync"
 import "core:time"
+import "elodin:dns"
+import "elodin:pool"
 import "elodin:upstream"
 
 /*
@@ -18,18 +20,29 @@ else - which is also why an answer the cache declines to keep (a zero TTL, a
 routed apex `DS` nobody proved) is shared: it is the same answer to the same
 question, produced for a query that was waiting alongside this one.
 
-What a follower does when the leader lands without an answer - the upstream
-produced nothing, the leader refused what came back (a Bogus verdict, a
-rebinding or cloaking refusal, an unreadable reply), or the upstream answered
-FORMERR to the leader's message - is start over once: back to the cache, where a
-refusal the leader remembered is now found, and back to this table, where one of
-the followers leads the next exchange and the rest wait on it. Once, because
-what the leader got may be about the leader alone - its datagram lost, or its
-message carrying records of the client's own that the upstream would not read -
-and a second exchange settles that; a second failure is the upstream's, and the
-follower takes its expired entry or SERVFAIL, or forwards its own question after
-a refusal, which is what every query did before this. A follower that runs out
-of patience forwards on its own too.
+Only a query shaped like a question leads or follows: nothing in the answer or
+authority sections and nothing in the additional one but its OPT record - see
+`coalescable`. Every other part of the message the upstream reads is this
+server's own by then (the ID, the payload size, the options it strips), so the
+exchange a leader makes is the one any follower would have made, and what comes
+back from it is about the question rather than about one client's bytes.
+
+That is what lets a failure be shared. A leader the upstream gave nothing - after
+`upstream.attempts` rounds over every server, which is where a lost datagram is
+retried - leaves its followers the expired entry or SERVFAIL, as it has itself:
+the same exchange again would cost each of them a second full wait for the same
+nothing, which in an outage is every pool worker held twice as long.
+
+A leader that got an answer it could not share - a Bogus verdict, a rebinding or
+cloaking refusal, an unreadable reply, a FORMERR - sends its followers back once
+to the start: to the cache, where a refusal the leader remembered is now found,
+and to this table, where one of them leads the next exchange for the rest.
+After a second such landing, or when patience runs out, a follower forwards on
+its own, which is what every query did before this.
+
+A cache lookup counted as a miss is counted again on that second pass, which
+leaves `cache_misses` a little ahead of the queries behind it after a refusal.
+That is the one accounting gap here, and it is the rare path's.
 
 The leader waits for its followers to take their copies before it lets go, which
 is what lets the `Flight` live in its stack frame and the answer in its arena:
@@ -53,8 +66,46 @@ INFLIGHT_SLOTS :: 256
 
 @(private)
 Inflight_Table :: struct {
-	mu:    sync.Mutex,
-	slots: [INFLIGHT_SLOTS]^Flight,
+	mu:        sync.Mutex,
+	slots:     [INFLIGHT_SLOTS]^Flight,
+	// Followers waiting on a worker of the shared pool; see `follower_ceiling`.
+	followers: int,
+}
+
+/*
+Whether this query may lead or follow a flight: nothing in it that the upstream
+reads beyond the question and an OPT record. A client's own records in the
+answer, authority or additional sections are forwarded as they stand, and an
+upstream may refuse or drop such a message - which must be that client's
+failure alone, not the answer every identical question waiting on it is given.
+*/
+@(private)
+coalescable :: proc(msg: dns.Message) -> bool {
+	if len(msg.answer) > 0 || len(msg.authority) > 0 || len(msg.additional) > 1 {
+		return false
+	}
+	return len(msg.additional) == 0 || msg.additional[0].type == .OPT
+}
+
+/*
+How many followers may wait on workers of the shared pool at once: a quarter,
+the same share `refresh_ceiling` gives the stale refreshes.
+
+A follower holds its worker for as long as the leader takes, and a leader
+validating a slow chain holds one of `dnssec.max_chain_walks` - so without a
+ceiling, one flood of a single cold signed name would park every worker behind
+one walk, which is the exhaustion that bound exists to prevent (issue #356).
+Past the ceiling a query forwards on its own and meets that bound like any
+other. Queries on a connection's own thread are bounded by `max_connections`
+instead, and are not counted. No pool - a `Server` built as a literal - is no
+ceiling.
+*/
+@(private)
+follower_ceiling :: proc(s: ^Server) -> int {
+	if s.handler_pool == nil {
+		return 0
+	}
+	return max(pool.worker_count(s.handler_pool) / 4, 1)
 }
 
 // Every field is guarded by `Inflight_Table.mu`.
@@ -62,43 +113,54 @@ Inflight_Table :: struct {
 Flight :: struct {
 	// The leader's own key, which outlives the flight: the leader lands before
 	// its frame goes.
-	key:      string,
-	cond:     sync.Cond,
-	waiters:  int,
-	landed:   bool,
+	key:     string,
+	cond:    sync.Cond,
+	waiters: int,
+	landed:  bool,
 	// The answer as the cache would have stored it, in the leader's arena. Nil
 	// when the leader forwarded nothing it could share.
-	answer:   []u8,
-	ede:      u16,
+	answer:  []u8,
+	ede:     u16,
 	// The upstream produced nothing at all.
-	failed:   bool,
+	failed:  bool,
 	// Where this flight sits in the table, so landing need not look for it.
-	slot:     int,
+	slot:    int,
 }
 
 /*
 How long a follower waits before it forwards on its own: what the leader's
-exchange can take, every server for every attempt plus the readable-rcode
-sweep's two timeouts. A leader past that is validating a long chain or stuck,
-and either way this query is no worse off asking for itself.
+exchange can take, every server for every attempt - twice, for a UDP reply that
+comes back truncated and is asked again over TCP with a timeout of its own - plus
+the readable-rcode sweep's two timeouts. A leader past that is validating a long
+chain or stuck, and either way this query is no worse off asking for itself.
 */
 @(private)
 flight_patience :: proc(g: ^upstream.Group) -> time.Duration {
 	if g == nil {
 		return 0
 	}
-	return time.Duration(g.attempts * len(g.servers) + 2) * g.timeout
+	return time.Duration(2 * g.attempts * len(g.servers) + 2) * g.timeout
 }
 
 /*
 Join the flight for `key`, leading it if there is none.
 
 `leading` true: the caller owns `flight` and must `flight_land` it. `leading`
-false with a flight: the caller is a follower and must `flight_follow` it. Nil:
-the table is full, and the caller forwards on its own.
+false with a flight: the caller is a follower and must `flight_follow` it, with
+the same `shared`. Nil: the table is full, or `shared` and the followers on the
+shared pool are at `ceiling` (zero is none), and the caller forwards on its own.
 */
 @(private)
-flight_join :: proc(s: ^Server, key: string, own: ^Flight) -> (flight: ^Flight, leading: bool) {
+flight_join :: proc(
+	s: ^Server,
+	key: string,
+	own: ^Flight,
+	shared := false,
+	ceiling := 0,
+) -> (
+	flight: ^Flight,
+	leading: bool,
+) {
 	sync.mutex_lock(&s.inflight.mu)
 	defer sync.mutex_unlock(&s.inflight.mu)
 	free_slot := -1
@@ -108,6 +170,12 @@ flight_join :: proc(s: ^Server, key: string, own: ^Flight) -> (flight: ^Flight, 
 				free_slot = i
 			}
 		} else if f.key == key {
+			if shared && ceiling > 0 {
+				if s.inflight.followers >= ceiling {
+					return nil, false
+				}
+				s.inflight.followers += 1
+			}
 			f.waiters += 1
 			return f, false
 		}
@@ -135,6 +203,9 @@ flight_follow :: proc(
 	f: ^Flight,
 	patience: time.Duration,
 	allocator: mem.Allocator,
+	// As given to `flight_join`, so the follower comes off the count it went on.
+	shared := false,
+	ceiling := 0,
 ) -> (
 	answer: []u8,
 	ede: u16,
@@ -150,19 +221,22 @@ flight_follow :: proc(
 		}
 		_ = sync.cond_wait_with_timeout(&f.cond, &s.inflight.mu, left)
 	}
-	shared := f.answer if f.landed else nil
+	landed_with := f.answer if f.landed else nil
 	ede, failed, landed = f.ede, f.failed, f.landed
 	sync.mutex_unlock(&s.inflight.mu)
 
 	// Copied outside the lock, which every miss on the server takes: the bytes
 	// cannot change while this follower is still counted, since the leader waits
 	// for the count to reach zero before it lets them go.
-	if shared != nil {
-		answer = make([]u8, len(shared), allocator)
-		copy(answer, shared)
+	if landed_with != nil {
+		answer = make([]u8, len(landed_with), allocator)
+		copy(answer, landed_with)
 	}
 
 	sync.mutex_lock(&s.inflight.mu)
+	if shared && ceiling > 0 {
+		s.inflight.followers -= 1
+	}
 	f.waiters -= 1
 	// The leader may be waiting for this one to leave.
 	sync.cond_broadcast(&f.cond)

@@ -283,7 +283,8 @@ Statistics go to the log every five minutes as `msg=stats`: `queries`,
 `handshakes`, `limited`,
 `truncated`, `secure`, `bogus`,
 `rebind` and `special_use`, plus `cache_entries`, `cache_bytes`, `cache_hits`,
-`cache_withheld`, `cache_misses`, `cache_stale` and `cache_evictions`.
+`cache_withheld`, `cache_misses`, `cache_stale` and `cache_evictions`, then
+`unreadable_rcode` and `coalesced`.
 `log.queries` adds one `msg=query` line per query. The source address and the
 port it sent from are two fields, `client` and `port`, so selecting on a client
 is a match on `client` alone rather than a prefix of an address joined to an
@@ -884,6 +885,16 @@ message it holds, a negative one for the SOA's figure capped by `negative_ttl`
 while every record still goes out carrying its own TTL up to the ceiling. A TTL
 with its top bit set is taken as zero per RFC 2181 section 8, forwarded answers
 included, which leaves it uncacheable unless `min_ttl` raises it.
+
+Identical questions that miss the cache while the first is still out are sent
+to the upstream once. The first query forwards and the rest wait for it. They are
+then served its answer as though they had found it cached, even an answer the
+cache will not keep, such as one with a zero TTL. If the upstream gave the first
+query nothing after every attempt on every server, they get the expired copy or
+SERVFAIL, just as it did. "Identical" means the same cache key, and only for a
+query that carries nothing beside its question and OPT record. A query that
+arrives when a quarter of the query pool is already waiting like this forwards
+on its own. These answers are counted in `elodin_answers_coalesced_total`.
 
 `serve_stale` keeps an entry for a day past its expiry and answers from it when
 a fresh answer cannot be got. What decides *when* is `stale_timeout`, RFC 8767
@@ -2307,6 +2318,7 @@ as a warning at startup.
 | `elodin_uptime_seconds` | gauge | seconds since this process finished starting |
 | `elodin_queries_total` | counter | queries accepted, whatever became of them |
 | `elodin_answers_total{outcome}` | counter | `forwarded`, `cached`, `blocked`, `rewritten`, `failed` |
+| `elodin_answers_coalesced_total` | counter | the `cached` answers the cache never held: an identical query already in flight forwarded them a moment before, and these queries waited for it rather than asking again. Logged as `outcome=cached detail=coalesced` |
 | `elodin_queries_dropped_total` | counter | turned away before any work: the backlog was full, or the source could not be answered |
 | `elodin_queries_refused_total` | counter | turned away by `server.allow_from` |
 | `elodin_connections_refused_total` | counter | refused for want of a slot: `server.max_connections` full, or the client's prefix already holding its share |

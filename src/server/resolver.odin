@@ -1556,13 +1556,20 @@ resolve_query :: proc(
 	*/
 	own_flight: Flight
 	flight: ^Flight
-	if unanswered == nil {
-		joined, leading := flight_join(s, key, &own_flight)
+	if unanswered == nil && coalescable(msg) {
+		ceiling := follower_ceiling(s)
+		joined, leading := flight_join(s, key, &own_flight, shared_worker, ceiling)
 		if leading {
 			flight = joined
 		} else if joined != nil {
-			patience := flight_patience(route_group(s, q.name, q.type))
-			answer, shared_ede, failed, landed := flight_follow(s, joined, patience, allocator)
+			answer, shared_ede, failed, landed := flight_follow(
+				s,
+				joined,
+				flight_patience(route_group(s, q.name, q.type)),
+				allocator,
+				shared_worker,
+				ceiling,
+			)
 			if answer != nil {
 				shared := Cached_Answer {
 					wire      = answer,
@@ -1571,7 +1578,40 @@ resolve_query :: proc(
 					ede       = shared_ede,
 					coalesced = true,
 				}
-				return serve_from_cache(s, shared, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
+				return serve_from_cache(
+					s,
+					shared,
+					query,
+					msg,
+					q,
+					proto,
+					client,
+					limit,
+					validating,
+					started,
+					spent,
+					allocator,
+					ede,
+				)
+			}
+			// The upstream gave the leader nothing after every attempt, and would
+			// give this query the same: the failure branch below, without the wait.
+			if failed {
+				return upstream_failed(
+					s,
+					stale_hit,
+					query,
+					msg,
+					q,
+					proto,
+					client,
+					limit,
+					validating,
+					started,
+					spent,
+					allocator,
+					ede,
+				)
 			}
 			if landed && !rejoined {
 				return resolve_query(
@@ -1586,14 +1626,9 @@ resolve_query :: proc(
 					spent,
 					allocator,
 					shared_worker,
-					rejoined = true,
 					ede = ede,
+					rejoined = true,
 				)
-			}
-			// The upstream gave two leaders nothing, and would give this query
-			// the same: the failure branch below, without the wait.
-			if failed {
-				return upstream_failed(s, stale_hit, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
 			}
 		}
 	}
@@ -2253,7 +2288,21 @@ resolve_query :: proc(
 			out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
 			return out, .Failed, built
 		}
-		return upstream_failed(s, stale_hit, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
+		return upstream_failed(
+			s,
+			stale_hit,
+			query,
+			msg,
+			q,
+			proto,
+			client,
+			limit,
+			validating,
+			started,
+			spent,
+			allocator,
+			ede,
+		)
 	}
 
 	/*
@@ -3052,25 +3101,25 @@ bytes came out of - needs all seven at once.
 @(private)
 Cached_Answer :: struct {
 	// The stored response, already copied into this request's arena.
-	wire:    []u8,
+	wire:      []u8,
 	// What the entry is stored under, and which entry it was, so the stamp goes
 	// back on the answer that was looked at rather than on whatever has replaced
 	// it since.
-	key:     string,
-	serial:  u64,
-	stale:   bool,
-	recheck: bool,
+	key:       string,
+	serial:    u64,
+	stale:     bool,
+	recheck:   bool,
 	// What the last walk decided, as a `Cloak_Verdict`, when `recheck` says that
 	// decision is current. Stored as the byte the cache keeps rather than the
 	// enum, which is the caller's type and not the cache's.
-	refused: u8,
+	refused:   u8,
 	// The rule sets the re-match is made against, and the number stamped on the
 	// entry when it comes back clean.
-	checked: u64,
+	checked:   u64,
 	// The extended error the entry is served with; see `cache.Entry.ede`.
-	ede:     u16,
+	ede:       u16,
 	// Not from the cache at all but the answer an identical query in flight
-	// just forwarded; see `inflight.odin`. Only the query log tells the two apart.
+	// just forwarded; see `inflight.odin`.
 	coalesced: bool,
 }
 
@@ -4340,5 +4389,6 @@ stats_of :: proc(s: ^Server) -> Stats {
 		rebind = sync.atomic_load(&s.stats.rebind),
 		special_use = sync.atomic_load(&s.stats.special_use),
 		unreadable_rcode = sync.atomic_load(&s.stats.unreadable_rcode),
+		coalesced = sync.atomic_load(&s.stats.coalesced),
 	}
 }
