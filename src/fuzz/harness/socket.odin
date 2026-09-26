@@ -1,5 +1,6 @@
 package harness
 
+import "core:c"
 import "core:net"
 import "core:sys/posix"
 
@@ -26,6 +27,10 @@ feed :: proc(data: []u8) -> (read_end: net.TCP_Socket, peer: net.TCP_Socket, ok:
 	if posix.socketpair(.UNIX, .STREAM, .IP, &pair) != .OK {
 		return
 	}
+	// Non-blocking, so a socket buffer smaller than the input truncates it rather
+	// than blocking a send nobody is reading, which libFuzzer would report as a
+	// timeout in the parser.
+	posix.fcntl(pair[1], .SETFL, c.int(posix.O_NONBLOCK))
 	sent := 0
 	for sent < min(len(data), MAX_FEED) {
 		n := posix.send(pair[1], raw_data(data[sent:]), uint(min(len(data), MAX_FEED) - sent), {})

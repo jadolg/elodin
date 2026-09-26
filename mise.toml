@@ -87,6 +87,13 @@ run = "odin check src/main -collection:elodin=src -vet -strict-style"
 # libFuzzer binary. Build only — running is open-ended, so it is not part of
 # `verify` and has no fixed exit condition to script here.
 #
+# `-sanitize:address` goes to odin, not only to clang: clang's ASan pass only
+# instruments functions carrying the `sanitize_address` attribute, which a C
+# front end adds and IR from odin does not. Without it ASan saw nothing but the
+# libc calls, and a load from freed memory in Odin code replayed clean.
+# `-Wno-backend-plugin` quiets clang noting, once per module, that it is
+# already instrumented.
+#
 # Every directory under src/fuzz but the shared harness is a target, so a new one
 # is built and replayed without being listed here. FUZZ_TARGETS narrows it to the
 # ones named, which is how the nightly job builds only the target it runs.
@@ -94,10 +101,10 @@ run = "odin check src/main -collection:elodin=src -vet -strict-style"
 description = "Build every fuzz target in src/fuzz (bin/fuzz_*)"
 depends = ["prepare"]
 run = """
-for t in ${FUZZ_TARGETS:-$(ls src/fuzz | grep -vx harness)}; do
+for t in ${FUZZ_TARGETS:-$(cd src/fuzz && ls -d */ | tr -d / | grep -vx harness)}; do
   rm -rf bin/fuzz-ir/$t && mkdir -p bin/fuzz-ir/$t &&
-  odin build src/fuzz/$t -collection:elodin=src -build-mode:llvm-ir -no-entry-point -out:bin/fuzz-ir/$t/ $ELODIN_DEFINES &&
-  clang -fsanitize=fuzzer,address -Wno-override-module -o bin/fuzz_$t bin/fuzz-ir/$t/*.ll $ELODIN_LDFLAGS -lssl -lcrypto -lm || exit 1
+  odin build src/fuzz/$t -collection:elodin=src -build-mode:llvm-ir -no-entry-point -sanitize:address -out:bin/fuzz-ir/$t/ $ELODIN_DEFINES &&
+  clang -fsanitize=fuzzer,address -Wno-override-module -Wno-backend-plugin -o bin/fuzz_$t bin/fuzz-ir/$t/*.ll $ELODIN_LDFLAGS -lssl -lcrypto -lm || exit 1
 done
 """
 
@@ -109,7 +116,7 @@ done
 description = "Replay the committed fuzz corpus through each target once"
 depends = ["fuzz"]
 run = """
-for t in ${FUZZ_TARGETS:-$(ls src/fuzz | grep -vx harness)}; do
+for t in ${FUZZ_TARGETS:-$(cd src/fuzz && ls -d */ | tr -d / | grep -vx harness)}; do
   ASAN_OPTIONS=detect_leaks=0 ./bin/fuzz_$t -runs=0 testdata/fuzz-corpus/$t || exit 1
 done
 """
