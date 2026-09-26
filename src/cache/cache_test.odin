@@ -830,3 +830,23 @@ test_a_denial_without_a_soa_is_not_cached :: proc(t: ^testing.T) {
 	testing.expect(t, put(c, key_for(kb[:], "nodata.example.test."), w4, m4), "a NODATA with a SOA was not cached")
 	free_all(context.temp_allocator)
 }
+
+// A SOA TTL with its top bit set is zero (RFC 2181 section 8), so the denial it
+// sits beside has no lifetime and is not kept - not `negative_ttl`'s worth.
+@(test)
+test_a_denial_whose_soa_ttl_has_the_top_bit_set_is_not_cached :: proc(t: ^testing.T) {
+	c := make_cache(Options{max_entries = 8, max_ttl = 86400, negative_ttl = 300})
+	defer destroy(c)
+	kb: [KEY_MAX]u8
+
+	nx := dns.Message{id = 1, question = []dns.Question{{name = "nx.example.test.", type = .A, class = .IN}}}
+	nx.flags.qr = true
+	nx.flags.ra = true
+	dns.set_rcode(&nx, .NX_Domain)
+	nx.authority = nx_target_soa("example.test.")
+	nx.authority[0].ttl = 0x8000_0e10
+	w, _, _ := dns.encode_message(nx, context.temp_allocator)
+	m, _ := dns.decode_message(w, context.temp_allocator)
+	testing.expect(t, !put(c, key_for(kb[:], "nx.example.test."), w, m), "a denial with a top-bit SOA TTL was cached")
+	free_all(context.temp_allocator)
+}

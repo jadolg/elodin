@@ -737,6 +737,7 @@ upstream:
 cache:
   enabled: true
   max_entries: 100
+  min_ttl: 30
   negative_ttl: 60
 blocking: {{ enabled: false }}
 `,
@@ -826,7 +827,9 @@ blocking: {{ enabled: false }}
 		// RFC 2308 section 5, issue #310: nothing in it says how long it holds,
 		// so one upstream that stumbled - an empty NOERROR, or a referral from
 		// a server that did not recurse - is not every client's answer for
-		// `negative_ttl`. Asked twice, the upstream has to hear both.
+		// `negative_ttl`. Asked twice, the upstream has to hear both. The
+		// server's `min_ttl` is what makes this reach the guard: without it
+		// the zero lifetime a SOA-less denial has would refuse it anyway.
 		for name, i in ([]string{"nosoa.example.com.", "referral.example.com."}) {
 			mock_reset_counts(mock)
 			first := query_udp(udp_port, build_query(name, u16(dns.Type.A), id = u16(20 + 2 * i)))
