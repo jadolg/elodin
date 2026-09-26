@@ -688,14 +688,22 @@ test_a_synthesised_name_is_nodata_for_other_types :: proc(t: ^testing.T) {
 }
 
 /*
-An address no rule names is still the upstream's to answer for, which with no
-upstream configured and RD=0 is a refusal rather than a made-up name.
+An address no rule names gets no made-up name. With `special_use.private_reverse`
+off it is the upstream's to answer for, which with no upstream configured and
+RD=0 is a refusal; with the key on - the default - it is the empty zone's
+NXDOMAIN, still with nothing invented in it.
 */
 @(test)
 test_an_unnamed_private_address_is_not_answered_here :: proc(t: ^testing.T) {
 	cfg := reverse_test_server(sample_rules())
 
-	_, outcome, _ := ask(&cfg, "51.1.168.192.in-addr.arpa.", .PTR)
+	resp, outcome, _ := ask(&cfg, "51.1.168.192.in-addr.arpa.", .PTR)
+	testing.expect_value(t, outcome, Outcome.Local)
+	testing.expect_value(t, resp.flags.rcode, u8(dns.Rcode.NX_Domain))
+	testing.expect_value(t, len(resp.answer), 0)
+
+	cfg.special_use.private_reverse = false
+	_, outcome, _ = ask(&cfg, "51.1.168.192.in-addr.arpa.", .PTR)
 	testing.expect_value(t, outcome, Outcome.Refused)
 
 	free_all(context.temp_allocator)

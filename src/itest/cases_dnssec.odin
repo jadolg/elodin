@@ -54,7 +54,16 @@ run_dnssec_cases :: proc(r: ^Runner) {
 	defer mock_stop(mock)
 
 	udp_port := next_port(r)
-	srv, ok := start_server(r, Server_Options{config = dnssec_config(r, udp_port, upstream_port), udp_port = udp_port})
+	// `private_reverse` off: the private reverse cases below are about what the
+	// validator does with a forwarded answer, and with the key on - the
+	// default - those names are answered here and never reach it.
+	srv, ok := start_server(
+		r,
+		Server_Options {
+			config = dnssec_config(r, udp_port, upstream_port, "special_use: {private_reverse: false}\n"),
+			udp_port = udp_port,
+		},
+	)
 	if !ok {
 		return
 	}
@@ -240,6 +249,7 @@ dnssec:
   trust_anchors:
     - ". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"
     - "168.192.in-addr.arpa. IN DS 12345 8 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
+special_use: {{private_reverse: false}}
 `,
 			anchored_port,
 			upstream_port,

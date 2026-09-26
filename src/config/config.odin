@@ -1062,13 +1062,27 @@ prove the name exists should not be told by this server that it does not. And
 the `DS` at that apex is forwarded even with the key on, since the proof that
 the delegation carries no DS lives in `arpa.` and a validating client below here
 needs it to conclude insecure rather than broken.
+
+`private_reverse` is the reverse-side sibling, and on (issue #321): the RFC 6303
+and RFC 7793 reverse zones for private, CGNAT, loopback and link-local space are
+served here as empty zones, the way Unbound's default `local-zone`s, BIND's
+`empty-zones-enable` and dnsmasq's `--bogus-priv` serve them. Forwarded, every
+LAN PTR tells a public upstream which private addressing the client's network
+uses, and fetches AS112's NXDOMAIN for it. It can default on where `home_arpa`
+cannot because the network whose router answers those PTRs has a way to say so
+that outranks the key rather than fighting it: an `upstream.zones` route over
+the zone (or over any name in it) is sent to the route, and so is a zone the
+operator anchored in `dnssec.trust_anchors`. Off hands every one of those names
+back to `upstream.servers`, as before. Same `DS` carve-out at each apex, for
+the same reason.
 */
 Special_Use_Config :: struct {
-	enabled:   bool,
-	onion:     bool,
-	local:     bool,
-	test:      bool,
-	home_arpa: bool,
+	enabled:         bool,
+	onion:           bool,
+	local:           bool,
+	test:            bool,
+	home_arpa:       bool,
+	private_reverse: bool,
 }
 
 Config :: struct {
@@ -1221,6 +1235,9 @@ default_config :: proc() -> Config {
 		local     = false,
 		test      = false,
 		home_arpa = false,
+		// On. See the field comment: a router that answers these has a route,
+		// which wins, and everything else was fetching AS112's NXDOMAIN.
+		private_reverse = true,
 	}
 	c.metrics = Metrics_Config {
 		enabled = false,

@@ -2233,6 +2233,7 @@ special_use:
   local: false     # local.  (RFC 6762 section 22)
   test: false      # test.   (RFC 6761 section 6.2)
   home_arpa: false # home.arpa. (RFC 8375 sections 3 and 4)
+  private_reverse: true # private reverse zones (RFC 6303, RFC 7793)
 ```
 
 Three names are answered here rather than asked about, whatever
@@ -2243,6 +2244,22 @@ Three names are answered here rather than asked about, whatever
 | `localhost.` and below | 127.0.0.1 for A, `::1` for AAAA, NODATA otherwise | RFC 6761 6.3. The only answer it is allowed to have |
 | `onion.` and below | NXDOMAIN | RFC 7686 2, unless the upstream is Tor-aware |
 | `invalid.` and below | NXDOMAIN | RFC 6761 6.4. It cannot exist |
+
+**`private_reverse` is on by default.** The reverse zones for RFC 1918 private
+space, CGNAT (100.64/10), loopback, `0/8`, IPv4 link-local, IPv6 unique-local
+(`fd00::/8`) and IPv6 link-local are served here as empty zones (RFC 6303
+section 3): `1.1.168.192.in-addr.arpa` is NXDOMAIN, `168.192.in-addr.arpa`
+itself NODATA with its own SOA and NS. Forwarded, every LAN PTR from every client
+tells the upstream which private addressing your network uses, and fetches the
+AS112 blackhole servers' NXDOMAIN for it. Unbound, BIND and Pi-hole all answer
+these locally by default. Only each zone's apex `DS` still goes out, for the
+same reason `home.arpa DS` does.
+
+If your router answers PTRs for its DHCP leases, route the zone to it —
+`upstream.zones: [{domains: [168.192.in-addr.arpa], servers: [192.168.1.1]}]` —
+and those names go there instead: a route over a name wins over this key, and so
+does a [trust anchor](#dnssec) you configured over the zone. `private_reverse:
+false` sends them all back to `upstream.servers` as before.
 
 `.onion` is the one this exists for: the query is the disclosure, since
 forwarding it tells the upstream operator — and anyone on the path to a plain-UDP

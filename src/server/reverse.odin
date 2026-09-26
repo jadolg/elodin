@@ -344,7 +344,8 @@ rule_hands_out :: proc(r: config.Rewrite, want: config.Rewrite_Answer) -> bool {
 The addresses a host on this network can hold, and the only ones a rewrite may
 be reversed into. RFC 1918, RFC 3927 link-local, RFC 4193 unique-local and RFC
 4291 IPv6 link-local - the private subset of `LOCALLY_SERVED_ZONES`, minus
-loopback and `0.0.0.0`, for the reason in the file comment.
+loopback and `0.0.0.0`, for the reason in the file comment, and minus the CGNAT
+zones, whose addresses are the ISP's rather than this network's.
 */
 @(private)
 address_is_local_v4 :: proc(a: [4]u8) -> bool {

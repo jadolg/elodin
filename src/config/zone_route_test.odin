@@ -287,6 +287,15 @@ test_a_route_under_an_enabled_special_use_zone_is_refused :: proc(t: ^testing.T)
 	)
 	testing.expect(t, err == nil, "a route under a table nothing consults was refused")
 	testing.expect_value(t, len(cfg.upstream.zones), 1)
+	// `private_reverse` is on by default and is not in the list: a route under
+	// one of its reverse zones is how a router's PTRs are reached, and the table
+	// stands down for it. Refusing it would leave that network no way back.
+	routed, rerr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\n  zones:\n    - domains: [168.192.in-addr.arpa]\n      servers: [192.168.1.1]\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, rerr == nil, "a route under a private reverse zone was refused")
+	testing.expect_value(t, len(routed.upstream.zones), 1)
 	free_all(context.temp_allocator)
 }
 

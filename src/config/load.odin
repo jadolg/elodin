@@ -1127,6 +1127,11 @@ check_route_reachable :: proc(l: ^Loader, cfg: ^Config, route: Zone_Route) {
 
 	`localhost.` and `invalid.` have no key of their own: with the table on at
 	all they are answered there, which is what RFC 6761 asks for.
+
+	`special_use.private_reverse` is deliberately absent: `special_use_zone`
+	stands its empty zones down for a routed name, so a route under one of those
+	reverse zones is the way to send it to a router, not a route that never
+	fires.
 	*/
 	table := [?]Shadow {
 		{"localhost.", true, "special_use.enabled answers localhost. here (RFC 6761)"},
@@ -1715,12 +1720,13 @@ load_special_use :: proc(l: ^Loader, cfg: ^Config) {
 	if n == nil {
 		return
 	}
-	check_keys(l, n, "special_use", "enabled", "onion", "local", "test", "home_arpa")
+	check_keys(l, n, "special_use", "enabled", "onion", "local", "test", "home_arpa", "private_reverse")
 	opt_bool(l, n, "enabled", &cfg.special_use.enabled, "special_use")
 	opt_bool(l, n, "onion", &cfg.special_use.onion, "special_use")
 	opt_bool(l, n, "local", &cfg.special_use.local, "special_use")
 	opt_bool(l, n, "test", &cfg.special_use.test, "special_use")
 	opt_bool(l, n, "home_arpa", &cfg.special_use.home_arpa, "special_use")
+	opt_bool(l, n, "private_reverse", &cfg.special_use.private_reverse, "special_use")
 }
 
 @(private)

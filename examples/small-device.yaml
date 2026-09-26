@@ -155,8 +155,12 @@ upstream:
   # zone has no signed delegation from the public parent, and they are exempt
   # from the rebinding guard below, since answering with 192.168.1.x is the
   # whole job. `--check` says both out loud.
+  #
+  # The reverse zone goes there too, so `nslookup 192.168.1.20` gets the lease's
+  # name back. Without it, `special_use.private_reverse` answers it NXDOMAIN
+  # here; with it, the route wins. Match it to your LAN's range.
   zones:
-    - domains: [home.arpa]
+    - domains: [home.arpa, 168.192.in-addr.arpa]
       servers: ["127.0.0.1:5353"]
 
 cache:

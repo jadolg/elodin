@@ -182,6 +182,31 @@ run_special_use_answered_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	start_case(r, "special_use: private reverse names are NXDOMAIN with an SOA at the RFC 6303 zone")
+	{
+		// Issue #321's reproduction: a LAN PTR from every client used to reach
+		// the upstream, naming the network's private addressing to it.
+		cases := []struct {
+			name: string,
+			apex: string,
+		} {
+			{name = "1.1.168.192.in-addr.arpa.", apex = "168.192.in-addr.arpa."},
+			{name = "1.0.0.127.in-addr.arpa.", apex = "127.in-addr.arpa."},
+			{name = "1.0.0.10.in-addr.arpa.", apex = "10.in-addr.arpa."},
+			{name = "1.1.64.100.in-addr.arpa.", apex = "64.100.in-addr.arpa."},
+		}
+		for c in cases {
+			res := query_udp(udp_port, build_query(c.name, u16(dns.Type.PTR)))
+			if check(r, res.ok, "no response for %s", c.name) {
+				h := parse_header(r, res.wire)
+				check(r, h.rcode == int(dns.Rcode.NX_Domain), "%s: rcode %d, want NXDOMAIN", c.name, h.rcode)
+				check_eq_int(r, h.ancount, 0, "answers handed to the client")
+				check_eq_str(r, authority_soa_owner(r, res.wire), c.apex, "SOA owner")
+			}
+		}
+	}
+	end_case(r)
+
 	start_case(r, "special_use: none of that reached the upstream")
 	{
 		check_eq_int(r, mock_total(mock) - before, 0, "queries the upstream was sent")

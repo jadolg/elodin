@@ -30,12 +30,18 @@ rather than refusing it. The 172.16/12 block is sixteen /16 reverse zones - one
 per second octet, 16 through 31 - listed out so the set is plainly what it
 claims to be.
 
-This is the private/link-local/loopback subset of RFC 6303, which is what
-breaks a LAN reverse lookup. The rest of that document's list is left out on
-purpose: the TEST-NET reverse zones and the IPv6 loopback/unspecified zones are
-not names a running network resolves, and CGNAT space (100.64/10, RFC 6598,
-added after RFC 6303) is delegated in the public tree rather than served
-locally. None of them are the failure this addresses.
+This is the private/link-local/loopback subset of RFC 6303, plus the CGNAT
+reverse zones RFC 7793 added to the same registry (100.64/10, sixty-four /16
+zones, 64 through 127): shared address space an ISP numbers its customers'
+routers from, delegated to the same AS112 blackhole servers as RFC 1918 and
+signed by nobody. The rest of RFC 6303's list is left out on purpose: the
+TEST-NET reverse zones and the IPv6 loopback/unspecified zones are not names a
+running network resolves, and a PTR for one names no network's own addressing.
+
+`special_use.private_reverse`, on by default, also answers these reverse zones
+here as RFC 6303 section 3 empty zones rather than forwarding them (issue #321):
+see `special_use_zone`. `home.arpa.` is the one entry that key leaves alone - it
+has `special_use.home_arpa` of its own, below.
 
 `home.arpa.` is the one forward name in the list, and what goes wrong there is
 not what goes wrong above it. `arpa.` does delegate it: RFC 8375 section 7 had
@@ -131,6 +137,24 @@ LOCALLY_SERVED_ZONES := [?]string {
 	"9.e.f.ip6.arpa.",
 	"a.e.f.ip6.arpa.",
 	"b.e.f.ip6.arpa.",
+	// RFC 6598 shared address space (100.64/10), added to the RFC 6303 registry
+	// by RFC 7793: one /16 reverse zone per second octet, 64 through 127.
+	"64.100.in-addr.arpa.", "65.100.in-addr.arpa.", "66.100.in-addr.arpa.", "67.100.in-addr.arpa.",
+	"68.100.in-addr.arpa.", "69.100.in-addr.arpa.", "70.100.in-addr.arpa.", "71.100.in-addr.arpa.",
+	"72.100.in-addr.arpa.", "73.100.in-addr.arpa.", "74.100.in-addr.arpa.", "75.100.in-addr.arpa.",
+	"76.100.in-addr.arpa.", "77.100.in-addr.arpa.", "78.100.in-addr.arpa.", "79.100.in-addr.arpa.",
+	"80.100.in-addr.arpa.", "81.100.in-addr.arpa.", "82.100.in-addr.arpa.", "83.100.in-addr.arpa.",
+	"84.100.in-addr.arpa.", "85.100.in-addr.arpa.", "86.100.in-addr.arpa.", "87.100.in-addr.arpa.",
+	"88.100.in-addr.arpa.", "89.100.in-addr.arpa.", "90.100.in-addr.arpa.", "91.100.in-addr.arpa.",
+	"92.100.in-addr.arpa.", "93.100.in-addr.arpa.", "94.100.in-addr.arpa.", "95.100.in-addr.arpa.",
+	"96.100.in-addr.arpa.", "97.100.in-addr.arpa.", "98.100.in-addr.arpa.", "99.100.in-addr.arpa.",
+	"100.100.in-addr.arpa.", "101.100.in-addr.arpa.", "102.100.in-addr.arpa.", "103.100.in-addr.arpa.",
+	"104.100.in-addr.arpa.", "105.100.in-addr.arpa.", "106.100.in-addr.arpa.", "107.100.in-addr.arpa.",
+	"108.100.in-addr.arpa.", "109.100.in-addr.arpa.", "110.100.in-addr.arpa.", "111.100.in-addr.arpa.",
+	"112.100.in-addr.arpa.", "113.100.in-addr.arpa.", "114.100.in-addr.arpa.", "115.100.in-addr.arpa.",
+	"116.100.in-addr.arpa.", "117.100.in-addr.arpa.", "118.100.in-addr.arpa.", "119.100.in-addr.arpa.",
+	"120.100.in-addr.arpa.", "121.100.in-addr.arpa.", "122.100.in-addr.arpa.", "123.100.in-addr.arpa.",
+	"124.100.in-addr.arpa.", "125.100.in-addr.arpa.", "126.100.in-addr.arpa.", "127.100.in-addr.arpa.",
 	// RFC 8375's forward zone for a home network's own names.
 	"home.arpa.",
 }
@@ -337,8 +361,9 @@ Special_Use :: enum u8 {
 	Nonexistent,
 	// Served as an empty zone: the name does exist, and its parent says so in
 	// public, so the apex answers SOA, NS and NODATA by type and only the names
-	// inside the zone are errors. `home.arpa.` is the only one, and the argument
-	// for why it is not simply `Nonexistent` is above.
+	// inside the zone are errors. `home.arpa.` and the private reverse zones,
+	// as RFC 6303 section 3 asks; the argument for why `home.arpa.` is not
+	// simply `Nonexistent` is above.
 	Empty_Zone,
 }
 
@@ -366,10 +391,11 @@ queried name's parent, which for `a.b.onion.` is `b.onion.`, a zone nobody has
 ever been authoritative for. Same label-boundary, case-folding test as
 everything else in this file, so `notlocalhost.` is not inside `localhost.`.
 
-`type` is here for one question only, and it is a question about `home.arpa.`:
-the `DS` at that apex has to be forwarded rather than answered, RFC 8375 section
-4 item 4.B being explicit that this one query escapes the table. Nothing else in
-here looks at the type, which is why the caller's `.None` means "forward it"
+`type` is here for one question only, and it is a question about an empty
+zone's apex: the `DS` at `home.arpa.` has to be forwarded rather than answered,
+RFC 8375 section 4 item 4.B being explicit that this one query escapes the
+table, and the private reverse zones' apex `DS` goes out for the same reason.
+Nothing else in here looks at the type, which is why the caller's `.None` means "forward it"
 rather than "no such zone" - for that one question the zone is in the table and
 the answer still is not.
 */
@@ -417,6 +443,23 @@ special_use_zone :: proc(
 			return "", .None
 		}
 		return "home.arpa.", .Empty_Zone
+	}
+	// The RFC 6303 reverse zones (issue #321). Not in `config.check_route_reachable`'s
+	// copy, because a route is exactly what stands this down: a router answering
+	// its LAN's PTRs is reached by routing the zone to it, and an operator who
+	// anchored the zone has real, signed data there. `home.arpa.` has its own key
+	// above and is not this one's to answer.
+	if s.cfg.special_use.private_reverse {
+		z, found := locally_served_zone(name)
+		if found && z != "home.arpa." && !is_zone_routed(s, name) && !covered_by_local_anchor(s, name) {
+			// Every one of these is delegated to AS112 without a DS, and the
+			// signed proof of that lives in the parent - the apex `DS` goes out
+			// for the reason `home.arpa.`'s does.
+			if type == .DS && dns.name_equal_fold(name, z) {
+				return "", .None
+			}
+			return z, .Empty_Zone
+		}
 	}
 	return "", .None
 }
@@ -502,10 +545,10 @@ made-up record of some other type, because this server has no zone to invent
 one from. An MX or a TXT for `localhost.` is a question with a real answer of
 "there is none", and NODATA is how that is spelled.
 
-`home.arpa.` gets the empty zone RFC 6303 section 3 describes, it being the one
-name here whose parent publishes a signed proof that it exists: NODATA at the
-apex, its SOA and its NS for the types that ask for those, and NXDOMAIN for the
-names inside the zone. The rest get NXDOMAIN throughout, apex included, having
+`home.arpa.` and the private reverse zones get the empty zone RFC 6303 section
+3 describes - the shape that RFC asks for, and for `home.arpa.` the one its
+signed delegation in `arpa.` requires: NODATA at the apex, its SOA and its NS
+for the types that ask for those, and NXDOMAIN for the names inside the zone. The rest get NXDOMAIN throughout, apex included, having
 no parent that says otherwise.
 
 Every shape that carries no answer carries a synthesised SOA in the authority

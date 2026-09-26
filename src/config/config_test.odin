@@ -336,9 +336,12 @@ test_special_use_defaults_and_overrides :: proc(t: ^testing.T) {
 	// Off for the same reason, and with the leak that costs written down in the
 	// type: a router authoritative for the zone needs the query forwarded.
 	testing.expect(t, !cfg.special_use.home_arpa, "home.arpa. should be forwarded by default")
+	// On (issue #321): a router answering its LAN's PTRs is reached by a route,
+	// which wins over the key, so the default can stop the leak.
+	testing.expect(t, cfg.special_use.private_reverse, "the RFC 6303 reverse zones should be answered locally by default")
 
 	src :=
-		"upstream:\n  servers: [1.1.1.1]\nspecial_use:\n  onion: false\n  local: true\n  test: true\n  home_arpa: true\n"
+		"upstream:\n  servers: [1.1.1.1]\nspecial_use:\n  onion: false\n  local: true\n  test: true\n  home_arpa: true\n  private_reverse: false\n"
 	tuned, terr := load_string(src, context.temp_allocator)
 	testing.expect(t, terr == nil, "expected a clean load")
 	testing.expect(t, tuned.special_use.enabled, "special_use.enabled should survive the other four being set")
@@ -346,6 +349,7 @@ test_special_use_defaults_and_overrides :: proc(t: ^testing.T) {
 	testing.expect(t, tuned.special_use.local, "special_use.local: true should be honoured")
 	testing.expect(t, tuned.special_use.test, "special_use.test: true should be honoured")
 	testing.expect(t, tuned.special_use.home_arpa, "special_use.home_arpa: true should be honoured")
+	testing.expect(t, !tuned.special_use.private_reverse, "special_use.private_reverse: false should be honoured")
 
 	off, oerr := load_string(
 		"upstream:\n  servers: [1.1.1.1]\nspecial_use:\n  enabled: false\n",
