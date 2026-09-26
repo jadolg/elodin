@@ -254,14 +254,8 @@ test_normalise_folds_case_and_the_trailing_dot :: proc(t: ^testing.T) {
 
 @(test)
 test_normalise_refuses_what_cannot_be_a_domain :: proc(t: ^testing.T) {
-	/*
-	Whitespace and a slash are the marks of a line the parser has mis-split - a
-	whole hosts line taken as a name, or a URL rule that got this far. Refusing
-	them keeps such a thing from being stored as a rule that then never matches
-	anything, and keeps the counts honest.
-	*/
 	buf: [MAX_NORMALISED]u8
-	for bad in ([]string{"", ".", "ads example", "ads\texample", "example.com/path", "0.0.0.0 ads.example"}) {
+	for bad in ([]string{"", "."}) {
 		_, ok := normalise(bad, buf[:])
 		testing.expectf(t, !ok, "%q should not normalise", bad)
 	}
@@ -277,6 +271,84 @@ test_normalise_refuses_what_cannot_be_a_domain :: proc(t: ^testing.T) {
 	_, fits := normalise(exact, buf[:])
 	testing.expect(t, fits, "a name exactly the buffer's width fits")
 	free_all(context.temp_allocator)
+}
+
+@(test)
+test_a_query_name_with_a_slash_is_still_matched :: proc(t: ^testing.T) {
+	/*
+	A label may carry any octet, and presentation form leaves `/` unescaped. A
+	slash marks a mis-split rule, not a query name: refusing it at match time let
+	`a/b.ads.example.com.` past a block on its parent and stripped an allowed name
+	of its exception.
+	*/
+	src := "||ads.example.com^\n@@||safe.ads.example.com^\n"
+	testing.expect_value(t, matches(src, .Adblock, "a/b.ads.example.com."), Decision.Blocked)
+	testing.expect_value(t, matches(src, .Adblock, "/.safe.ads.example.com."), Decision.Allowed)
+}
+
+@(test)
+test_a_rule_that_cannot_be_a_domain_is_refused :: proc(t: ^testing.T) {
+	/*
+	Whitespace and a slash are the marks of a line the parser has mis-split - a
+	whole hosts line taken as a name, or a URL rule that got this far. A raw
+	control or non-ASCII byte is one a query always spells as \DDD. Refusing
+	them keeps such a thing from being stored as a rule that then never matches
+	anything, and keeps the counts honest.
+	*/
+	s := set_make()
+	defer set_destroy(s)
+	for bad in ([]string{"ads example", "ads\texample", "example.com/path", "0.0.0.0 ads.example", "b\u00fccher.de", "a\x01b.example"}) {
+		testing.expectf(t, !set_add(s, bad, {.Apex}), "%q should not be added", bad)
+		set_cancel(s, bad, {.Apex})
+	}
+	testing.expect_value(t, s.count, 0)
+	testing.expect_value(t, len(s.cancelled), 0)
+
+	// A query spells these bytes as \DDD, so a rule holding one raw never matches.
+	block, allow := parsed("0.0.0.0 b\u00fccher.de a\x01b.example ok.example\n", .Hosts)
+	defer set_destroy(block)
+	defer set_destroy(allow)
+	testing.expect_value(t, block.count, 1)
+}
+
+@(test)
+test_a_rule_written_as_a_query_spells_it_matches :: proc(t: ^testing.T) {
+	// `\` is how presentation form escapes a byte, so a rule written that way is
+	// the one that can match.
+	testing.expect_value(t, matches("a\\032b.example\n", .Domains, "a\\032b.example."), Decision.Blocked)
+}
+
+@(test)
+test_a_rule_a_badfilter_cancelled_is_not_stored :: proc(t: ^testing.T) {
+	s := set_make()
+	defer set_destroy(s)
+	set_cancel(s, "x.example", {.Apex, .Subdomains})
+	testing.expect(t, !set_add(s, "x.example", {.Apex, .Subdomains}), "a fully cancelled rule adds nothing")
+	set_cancel(s, "y.example", {.Apex})
+	testing.expect(t, set_add(s, "y.example", {.Apex, .Subdomains}), "what the cancel left is stored")
+}
+
+@(test)
+test_a_dnsmasq_server_line_with_an_upstream_forwards_rather_than_blocks :: proc(t: ^testing.T) {
+	// `server=/d/1.2.3.4` sends d to that server; only `server=/d/` keeps it local.
+	testing.expect_value(t, matches("server=/corp.example/10.0.0.1\n", .Adblock, "corp.example."), Decision.None)
+	testing.expect_value(t, matches("server=/ads.example/\n", .Adblock, "ads.example."), Decision.Blocked)
+	testing.expect_value(t, matches("address=/ads.example/0.0.0.0\n", .Adblock, "ads.example."), Decision.Blocked)
+	// The server is only what follows the last slash; every name before it is covered.
+	testing.expect_value(t, matches("server=/ads.example/tracker.example/\n", .Adblock, "tracker.example."), Decision.Blocked)
+	testing.expect_value(t, matches("server=/ads.example/tracker.example/\n", .Adblock, "ads.example."), Decision.Blocked)
+	testing.expect_value(t, matches("server=/a.example/b.example/10.0.0.1\n", .Adblock, "b.example."), Decision.None)
+	testing.expect_value(t, matches("address=/a.example/b.example/0.0.0.0\n", .Adblock, "b.example."), Decision.Blocked)
+}
+
+@(test)
+test_a_refused_rule_is_not_counted_as_loaded :: proc(t: ^testing.T) {
+	block, allow := set_make(), set_make()
+	defer set_destroy(block)
+	defer set_destroy(allow)
+	added := parse_list(block, allow, "0.0.0.0 example.com/path b\u00fccher.de ok.example\n", .Hosts)
+	testing.expect_value(t, added, 1)
+	testing.expect_value(t, added, block.count)
 }
 
 @(test)
