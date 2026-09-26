@@ -181,6 +181,13 @@ Stats :: struct {
 	wrong"; this is one specific answer to it, in a figure small enough to see.
 	*/
 	unreadable_rcode: u64,
+	/*
+	Queries given an identical in-flight query's outcome rather than their own
+	(see `inflight.odin`): its answer, counted in `cached` although the cache
+	never held it - so without this `cached` climbs past `cache_hits` with
+	nothing to account for the gap - or its failure, counted in `failed`.
+	*/
+	coalesced:        u64,
 }
 
 Server :: struct {
@@ -242,6 +249,10 @@ Server :: struct {
 	flight, which is what a `Server` built as a literal wants.
 	*/
 	refreshes:    Refresh_Table,
+	// The questions being forwarded right now, so an identical one waits for
+	// the answer instead of asking again. See `inflight.odin`; the zero value is
+	// nothing in flight.
+	inflight:     Inflight_Table,
 	stats:        Stats,
 	// When this process began serving. Not a setting and not a counter: the
 	// metrics endpoint reports uptime from it, and Prometheus's
@@ -1097,6 +1108,9 @@ resolve_query :: proc(
 	it; see `ceiling_ede`.
 	*/
 	ede: ^u16 = nil,
+	// Set on the second pass of a follower whose flight landed with nothing to
+	// share, so it does not start over again. See `inflight.odin`.
+	rejoined := false,
 ) -> (
 	response: []u8,
 	outcome: Outcome,
@@ -1841,6 +1855,102 @@ resolve_query :: proc(
 	)
 
 	/*
+	One upstream exchange for every identical question in flight at once, which
+	`inflight.odin` argues. Not for a detached refresh, which `refresh.odin`
+	already runs one to a key.
+
+	Here, where the outgoing message has taken its final shape, because what a
+	follower may be handed turns on whether its message and the leader's are the
+	same bytes.
+	*/
+	own_flight: Flight
+	flight: ^Flight
+	if unanswered == nil {
+		ceiling := follower_ceiling(s)
+		joined, counted := flight_join(s, key, &own_flight, shared_worker, ceiling)
+		if joined == &own_flight {
+			flight = joined
+			flight.forwarded = forwarded
+		} else if joined != nil {
+			patience := flight_patience(route_group(s, q.name, q.type))
+			landed_with, landed, same := flight_follow(s, joined, patience, allocator, counted, forwarded)
+			// A NOERROR or NXDOMAIN is shared as the cache shares it - so not with
+			// the cache off, where nothing is shared between two messages - and any
+			// other rcode may be about the leader's own bytes, unless they were these.
+			if landed_with.answer != nil {
+				rcode := dns.peek_rcode(landed_with.answer)
+				if same || (s.cfg.cache.enabled && (rcode == .No_Error || rcode == .NX_Domain)) {
+					shared := Cached_Answer {
+						wire      = landed_with.answer,
+						ede       = landed_with.ede,
+						coalesced = true,
+					}
+					return serve_from_cache(
+						s,
+						shared,
+						query,
+						msg,
+						q,
+						proto,
+						client,
+						limit,
+						validating,
+						started,
+						spent,
+						allocator,
+						ede,
+					)
+				}
+			}
+			/*
+			The upstream gave the leader nothing after every attempt, and would
+			give this query the same - its message is the same bytes - so the
+			failure branch below, without the wait.
+			*/
+			if landed_with.failed && same {
+				sync.atomic_add(&s.stats.coalesced, 1)
+				return upstream_failed(
+					s,
+					stale_hit,
+					query,
+					msg,
+					q,
+					proto,
+					client,
+					limit,
+					validating,
+					started,
+					spent,
+					allocator,
+					ede,
+					"upstream-coalesced",
+				)
+			}
+			// The leader stored a verdict, which the cache now answers with.
+			if landed && !rejoined && landed_with.stored {
+				return resolve_query(
+					s,
+					query,
+					msg,
+					proto,
+					client,
+					limit,
+					cookie,
+					started,
+					spent,
+					allocator,
+					shared_worker,
+					ede = ede,
+					rejoined = true,
+				)
+			}
+		}
+	}
+	defer if flight != nil {
+		flight_land(s, flight)
+	}
+
+	/*
 	Down the zone's own route when it has one, and to the default group when it
 	does not. The client's question is the only thing that follows a route: the
 	chain lookups the validator makes go to the default group whatever the name,
@@ -2156,6 +2266,9 @@ resolve_query :: proc(
 	}
 	if uerr != .None {
 		logx.debugf("query %s %s from %s failed: %v", dns.type_name(q.type), q.name, client, uerr)
+		if flight != nil {
+			flight.failed = true
+		}
 		/*
 		The condition `cache.serve_stale` was always documented by: the refresh
 		was attempted, and there is nothing to answer with but what expired.
@@ -2184,13 +2297,21 @@ resolve_query :: proc(
 			out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
 			return out, .Failed, built
 		}
-		if stale_hit.wire != nil {
-			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
-		}
-		sync.atomic_add(&s.stats.failed, 1)
-		out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
-		log_query(s, client, proto, q, .Failed, "upstream", started)
-		return out, .Failed, built
+		return upstream_failed(
+			s,
+			stale_hit,
+			query,
+			msg,
+			q,
+			proto,
+			client,
+			limit,
+			validating,
+			started,
+			spent,
+			allocator,
+			ede,
+		)
 	}
 
 	/*
@@ -2279,7 +2400,10 @@ resolve_query :: proc(
 			from := answering_upstream(winner)
 			report_bogus(q, client, result, from, shed)
 			out, built := dnssec_failure_response(msg, result, allocator, limit)
-			remember_bogus_verdict(s, verdict_key, msg, result, unproven_apex_ds, spent, allocator)
+			if remember_bogus_verdict(s, verdict_key, msg, result, unproven_apex_ds, spent, allocator) &&
+			   flight != nil {
+				flight.stored = true
+			}
 			log_query(s, client, proto, q, .Failed, fmt.tprintf("dnssec:%s", from), started)
 			return out, .Failed, built
 		case .Secure:
@@ -2581,7 +2705,10 @@ resolve_query :: proc(
 			   decoded.full &&
 			   !unproven_apex_ds &&
 			   cloak_verdict_worth_keeping(verdict) {
-				cache.put(s.answers, key, resp, decoded.msg, generation, u8(verdict), ede = answer_ede)
+				kept := cache.put(s.answers, key, resp, decoded.msg, generation, u8(verdict), ede = answer_ede)
+				if flight != nil {
+					flight.stored = kept
+				}
 			}
 			return out, cloak_outcome(verdict), true
 		}
@@ -2618,6 +2745,16 @@ resolve_query :: proc(
 	if s.cfg.cache.enabled && decoded.full && !unproven_apex_ds {
 		cache.put(s.answers, key, resp, decoded.msg, generation, ede = answer_ede)
 	}
+	/*
+	What was just stored, or would have been, handed over and landed before
+	`settle_ad_bit` below writes into it - each follower settles its own copy,
+	and decides for itself whether the rcode is one it may take.
+	*/
+	if flight != nil {
+		flight.answer, flight.ede = resp, answer_ede
+		flight_land(s, flight)
+		flight = nil
+	}
 
 	sync.atomic_add(&s.stats.forwarded, 1)
 	/*
@@ -2631,6 +2768,39 @@ resolve_query :: proc(
 	settle_ad_bit(resp, msg, validating)
 	log_query(s, client, proto, q, .Forwarded, answering_upstream(winner), started)
 	return resp, .Forwarded, true
+}
+
+// No answer from the upstream at all: the expired entry if one is held, SERVFAIL
+// if not. Shared by the exchange that failed and the followers of one.
+@(private)
+upstream_failed :: proc(
+	s: ^Server,
+	stale_hit: Cached_Answer,
+	query: []u8,
+	msg: dns.Message,
+	q: dns.Question,
+	proto: Protocol,
+	client: string,
+	limit: int,
+	validating: bool,
+	started: time.Time,
+	spent: ^int,
+	allocator: mem.Allocator,
+	ede: ^u16,
+	// The query-log detail, which says whether this query asked at all.
+	detail := "upstream",
+) -> (
+	[]u8,
+	Outcome,
+	bool,
+) {
+	if stale_hit.wire != nil {
+		return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
+	}
+	sync.atomic_add(&s.stats.failed, 1)
+	out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
+	log_query(s, client, proto, q, .Failed, detail, started)
+	return out, .Failed, built
 }
 
 /*
@@ -2942,23 +3112,26 @@ bytes came out of - needs all seven at once.
 @(private)
 Cached_Answer :: struct {
 	// The stored response, already copied into this request's arena.
-	wire:    []u8,
+	wire:      []u8,
 	// What the entry is stored under, and which entry it was, so the stamp goes
 	// back on the answer that was looked at rather than on whatever has replaced
 	// it since.
-	key:     string,
-	serial:  u64,
-	stale:   bool,
-	recheck: bool,
+	key:       string,
+	serial:    u64,
+	stale:     bool,
+	recheck:   bool,
 	// What the last walk decided, as a `Cloak_Verdict`, when `recheck` says that
 	// decision is current. Stored as the byte the cache keeps rather than the
 	// enum, which is the caller's type and not the cache's.
-	refused: u8,
+	refused:   u8,
 	// The rule sets the re-match is made against, and the number stamped on the
 	// entry when it comes back clean.
-	checked: u64,
+	checked:   u64,
 	// The extended error the entry is served with; see `cache.Entry.ede`.
-	ede:     u16,
+	ede:       u16,
+	// Not from the cache at all but the answer an identical query in flight
+	// just forwarded; see `inflight.odin`.
+	coalesced: bool,
 }
 
 /*
@@ -3049,6 +3222,8 @@ remember_bogus_verdict :: proc(
 	unproven_apex_ds: bool,
 	spent: ^int,
 	allocator: mem.Allocator,
+) -> (
+	stored: bool,
 ) {
 	if !s.cfg.cache.enabled || result.status != .Bogus || unproven_apex_ds {
 		return
@@ -3071,7 +3246,7 @@ remember_bogus_verdict :: proc(
 	if derr != .None {
 		return
 	}
-	cache.put(s.answers, verdict_key, wire, refusal, bogus = true)
+	return cache.put(s.answers, verdict_key, wire, refusal, bogus = true)
 }
 
 /*
@@ -3305,11 +3480,15 @@ serve_from_cache :: proc(
 		cache.note_stale_served(s.answers)
 	}
 	sync.atomic_add(&s.stats.cached, 1)
+	if hit.coalesced {
+		sync.atomic_add(&s.stats.coalesced, 1)
+	}
 	// Over this client's limit where the entry was stored for a client with a
 	// larger buffer, and left that way: `handle_query` fits it once
 	// `match_client_opt` has settled the OPT record, for the reason the
 	// forwarded path gives.
-	log_query(s, client, proto, q, .Cached, "stale" if hit.stale else "cache", started)
+	detail := "stale" if hit.stale else "coalesced" if hit.coalesced else "cache"
+	log_query(s, client, proto, q, .Cached, detail, started)
 	return wire, .Cached, true
 }
 
@@ -4223,5 +4402,6 @@ stats_of :: proc(s: ^Server) -> Stats {
 		rebind = sync.atomic_load(&s.stats.rebind),
 		special_use = sync.atomic_load(&s.stats.special_use),
 		unreadable_rcode = sync.atomic_load(&s.stats.unreadable_rcode),
+		coalesced = sync.atomic_load(&s.stats.coalesced),
 	}
 }

@@ -73,7 +73,7 @@ stats_line :: proc(
 	limited, slipped, conn_limited: u64,
 ) -> string {
 	return fmt.tprintf(
-		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d rewritten=%d dropped=%d refused=%d conn_refused=%d conn_rate_limited=%d conn_failed=%d accept_backoff=%d handshakes=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d special_use=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d unreadable_rcode=%d",
+		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d rewritten=%d dropped=%d refused=%d conn_refused=%d conn_rate_limited=%d conn_failed=%d accept_backoff=%d handshakes=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d special_use=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d unreadable_rcode=%d coalesced=%d",
 		st.queries,
 		st.blocked,
 		st.cached,
@@ -119,6 +119,7 @@ stats_line :: proc(
 		// rather than names is not something this line owes anything to, but an
 		// operator's eye reading the same line every day is.
 		st.unreadable_rcode,
+		st.coalesced,
 	)
 }
 
@@ -390,6 +391,13 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 	metrics.sample(&b, "elodin_answers_total", st.blocked, metrics.Label{"outcome", "blocked"})
 	metrics.sample(&b, "elodin_answers_total", st.rewritten, metrics.Label{"outcome", "rewritten"})
 	metrics.sample(&b, "elodin_answers_total", st.failed, metrics.Label{"outcome", "failed"})
+	metrics.scalar(
+		&b,
+		"elodin_answers_coalesced_total",
+		.Counter,
+		"Queries given an identical in-flight query's upstream outcome rather than asking again - its answer, counted as cached, or its failure, counted as failed or, where an expired copy was served, as a stale cached answer.",
+		st.coalesced,
+	)
 
 	metrics.scalar(
 		&b,

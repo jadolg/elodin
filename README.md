@@ -283,7 +283,8 @@ Statistics go to the log every five minutes as `msg=stats`: `queries`,
 `handshakes`, `limited`,
 `truncated`, `secure`, `bogus`,
 `rebind` and `special_use`, plus `cache_entries`, `cache_bytes`, `cache_hits`,
-`cache_withheld`, `cache_misses`, `cache_stale` and `cache_evictions`.
+`cache_withheld`, `cache_misses`, `cache_stale` and `cache_evictions`, then
+`unreadable_rcode` and `coalesced`.
 `log.queries` adds one `msg=query` line per query. The source address and the
 port it sent from are two fields, `client` and `port`, so selecting on a client
 is a match on `client` alone rather than a prefix of an address joined to an
@@ -896,6 +897,27 @@ message it holds, a negative one for the SOA's figure capped by `negative_ttl`
 while every record still goes out carrying its own TTL up to the ceiling. A TTL
 with its top bit set is taken as zero per RFC 2181 section 8, forwarded answers
 included, which leaves it uncacheable unless `min_ttl` raises it.
+
+Identical questions that miss the cache while the first is still out are sent
+to the upstream once. The first query forwards and the rest wait for it. A
+NOERROR or NXDOMAIN answer is then served to them as though found in the cache,
+including one the cache will not keep, such as one with a zero TTL. Its TTLs are
+the ones the upstream sent, and `min_ttl` does not raise them. With the cache off,
+such an answer is shared only as below. Any other
+outcome goes only to queries whose message to the upstream was byte for byte
+the first one's, apart from the ID. That covers any other rcode, and the
+upstream giving nothing after every attempt on every server, in which case they
+get the expired copy or SERVFAIL. Under DNSSEC validation, whose rewrite writes
+the whole OPT record, most messages are identical. Without it, the payload size
+and the OPT flags stay the client's, so only clients that ask alike match.
+Different spellings of the name, or different EDNS options, never do. The other
+waiting queries ask for themselves, as does any query that arrives when a
+quarter of the query pool is already waiting like this. "Identical" means the
+same cache key. The queries given the first one's outcome count in
+`elodin_answers_coalesced_total`, and those that asked for themselves do not. The query log
+shows a shared answer as `outcome=cached detail=coalesced` and a shared failure
+as `outcome=failed detail=upstream-coalesced`, or as `detail=stale` where an
+expired copy was served instead.
 
 `serve_stale` keeps an entry for a day past its expiry and answers from it when
 a fresh answer cannot be got. What decides *when* is `stale_timeout`, RFC 8767
@@ -2319,6 +2341,7 @@ as a warning at startup.
 | `elodin_uptime_seconds` | gauge | seconds since this process finished starting |
 | `elodin_queries_total` | counter | queries accepted, whatever became of them |
 | `elodin_answers_total{outcome}` | counter | `forwarded`, `cached`, `blocked`, `rewritten`, `failed` |
+| `elodin_answers_coalesced_total` | counter | queries that waited for an identical one already in flight instead of asking the upstream: its answer, counted as `cached` although the cache never held it (`detail=coalesced`), or its failure, counted as `failed` (`detail=upstream-coalesced`) or, where an expired copy was served, as a stale `cached` |
 | `elodin_queries_dropped_total` | counter | turned away before any work: the backlog was full, or the source could not be answered |
 | `elodin_queries_refused_total` | counter | turned away by `server.allow_from` |
 | `elodin_connections_refused_total` | counter | refused for want of a slot: `server.max_connections` full, or the client's prefix already holding its share |
