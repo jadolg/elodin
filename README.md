@@ -2760,9 +2760,9 @@ default cap (4 KB, or its largest seed if longer) puts the cap in
 that is a bare number, and only `#` lines for why, or empty ones
 (`scripts/fuzz-max-len.sh` reads it, and refuses anything else). Such a target
 also runs with `-len_control=0`, so it gets inputs up to the cap from the start
-rather than after libFuzzer's slow ramp towards it. A target that feeds its input through a
-socket refuses a cap past `harness.MAX_FEED` at start-up, since `feed` cuts
-anything longer. What CI runs on every change is
+rather than after libFuzzer's slow ramp towards it. A target that feeds its
+input through a socket refuses a cap past `harness.MAX_FEED` at start-up, since
+`feed` cuts anything longer. What CI runs on every change is
 `mise run fuzz-regression`, which replays `testdata/fuzz-corpus/` through each
 target once and generates nothing new, so a crash fuzzing has already found stays
 found.

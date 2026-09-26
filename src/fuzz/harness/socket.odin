@@ -36,12 +36,13 @@ check_max_len :: proc(args: []cstring) {
 		// Bare digits only, nine at most, as `scripts/fuzz-max-len.sh` writes them:
 		// `parse_int` skips `_` and wraps on overflow where libFuzzer stops at the
 		// first non-digit and truncates to an int, so anything else can read small
-		// here and large there.
+		// here and large there. 0 is libFuzzer's "use the default", which grows to
+		// the largest seed and can pass MAX_FEED, so it is refused as well.
 		n, ok := strconv.parse_int(value, 10)
-		if !ok || len(value) > 9 || strings.trim_left(value, "0123456789") != "" || n > MAX_FEED {
+		if !ok || len(value) > 9 || strings.trim_left(value, "0123456789") != "" || n == 0 || n > MAX_FEED {
 			// Straight to fd 2: built without an entry point, a target never runs
 			// the start-up code that would set up `os.stderr`.
-			msg := fmt.tprintfln("-max_len=%s: a target that feeds a socket takes at most MAX_FEED (%d), and feed cuts anything longer", value, MAX_FEED)
+			msg := fmt.tprintfln("-max_len=%s: a target that feeds a socket takes bare digits from 1 to MAX_FEED (%d), and feed cuts anything longer", value, MAX_FEED)
 			posix.write(posix.STDERR_FILENO, raw_data(msg), len(msg))
 			posix.exit(1)
 		}
