@@ -294,6 +294,10 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 
 	flags := Rule_Flags{.Apex, .Subdomains}
 	switch {
+	case strings.has_prefix(line, "||*."):
+		// The AdGuard DNS filter's spelling of `*.example`: the subtree only.
+		line = line[4:]
+		flags = {.Subdomains}
 	case strings.has_prefix(line, "||"):
 		line = line[2:]
 	case strings.has_prefix(line, "|"):

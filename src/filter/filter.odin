@@ -129,7 +129,8 @@ already in the set or arrives after this.
 
 ponytail: rules are stored merged per name, so this cancels the coverage rather
 than one rule's text - `||x^$badfilter` also lifts a hosts entry for `x`, and
-`||x^$important,badfilter` lifts a plain `||x^`, where AdGuard would lift only the
+`||x^$important,badfilter` lifts a plain `||x^`, and `*.x$badfilter` (or
+`||*.x^$badfilter`) narrows a `||x^` to its apex, where AdGuard would lift only the
 rule written the same way. Keep rule texts per name if that ever matters.
 */
 set_cancel :: proc(s: ^Set, domain: string, flags: Rule_Flags) {

@@ -272,6 +272,14 @@ PARITY_BLOCKED :: []string{"www.parity.test.", "alias.parity.test."}
 PARITY_ALLOWED :: "safe.www.parity.test."
 
 /*
+A `||*.zone^` rule: every name under the zone, and not the zone itself. The
+AdGuard DNS filter writes its subtree rules this way, and they used to be
+dropped as wildcards (#323). The zone and a name under it are both in the pool,
+so a rule read as the plain `||zone^` shows up as much as one not read at all.
+*/
+PARITY_BLOCKED_SUBTREE :: "subtree.parity.test."
+
+/*
 Rules on pool names that must block nothing, so their answers are held to the
 upstream's like any other. Each names a rule a list really carries - one
 cancelled by `$badfilter`, one narrowed to a type or a client - which read as a
@@ -284,8 +292,9 @@ PARITY_NOT_BLOCKING :: []string {
 	"||xn--bcher-kva.parity.test^$client=192.0.2.1",
 }
 
-// The blocking scenario's pool: the usual one, and the allowed name inside the
-// blocked one, so the exception is asked about by name.
+// The blocking scenario's pool: the usual one, the allowed name inside the
+// blocked one, so the exception is asked about by name, and the subtree-only
+// zone and a name under it, so both sides of its apex are asked about.
 PARITY_BLOCKING_POOL := []string {
 	"parity.test.",
 	"www.parity.test.",
@@ -295,6 +304,8 @@ PARITY_BLOCKING_POOL := []string {
 	"_dns.resolver.parity.test.",
 	"xn--bcher-kva.parity.test.",
 	"one.two.three.four.five.parity.test.",
+	"subtree.parity.test.",
+	"in.subtree.parity.test.",
 }
 
 /*
@@ -417,6 +428,7 @@ parity_scenario_config :: proc(
 		for name in PARITY_BLOCKED {
 			fmt.sbprintf(&sb, "    - \"||%s^\"\n", strings.trim_suffix(name, "."))
 		}
+		fmt.sbprintf(&sb, "    - \"||*.%s^\"\n", strings.trim_suffix(PARITY_BLOCKED_SUBTREE, "."))
 		for rule in PARITY_NOT_BLOCKING {
 			fmt.sbprintf(&sb, "    - \"%s\"\n", rule)
 		}
