@@ -395,7 +395,7 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 		&b,
 		"elodin_answers_coalesced_total",
 		.Counter,
-		"Queries given an identical in-flight query's upstream outcome - its answer, counted as cached, or its failure, counted as failed - rather than asking again.",
+		"Queries given an identical in-flight query's upstream outcome rather than asking again - its answer, counted as cached, or its failure, counted as failed or, where an expired copy was served, as a stale cached answer.",
 		st.coalesced,
 	)
 

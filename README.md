@@ -889,16 +889,20 @@ included, which leaves it uncacheable unless `min_ttl` raises it.
 Identical questions that miss the cache while the first is still out are sent
 to the upstream once. The first query forwards and the rest wait for it. A
 NOERROR or NXDOMAIN answer is then served to them as though found in the cache,
-including one the cache will not keep, such as one with a zero TTL. Any other
+including one the cache will not keep, such as one with a zero TTL. Its TTLs are
+the ones the upstream sent, and `min_ttl` does not raise them. With the cache off,
+such an answer is shared only as below. Any other
 outcome goes only to queries whose message to the upstream was byte for byte
 the first one's, apart from the ID. That covers any other rcode, and the
 upstream giving nothing after every attempt on every server, in which case they
-get the expired copy or SERVFAIL. Most messages are identical, because elodin
-writes the ID, the payload size and the OPT record's flags itself. Different
-spellings of the name, or different EDNS options, are not. The other waiting
-queries ask for themselves, as does any query that arrives when a quarter of the
-query pool is already waiting like this. "Identical" means the same cache key.
-All of these queries count in `elodin_answers_coalesced_total`. The query log
+get the expired copy or SERVFAIL. Under DNSSEC validation, whose rewrite writes
+the whole OPT record, most messages are identical. Without it, the payload size
+and the OPT flags stay the client's, so only clients that ask alike match.
+Different spellings of the name, or different EDNS options, never do. The other
+waiting queries ask for themselves, as does any query that arrives when a
+quarter of the query pool is already waiting like this. "Identical" means the
+same cache key. The queries given the first one's outcome count in
+`elodin_answers_coalesced_total`, and those that asked for themselves do not. The query log
 shows a shared answer as `outcome=cached detail=coalesced` and a shared failure
 as `outcome=failed detail=upstream-coalesced`, or as `detail=stale` where an
 expired copy was served instead.

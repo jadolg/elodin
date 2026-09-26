@@ -134,8 +134,8 @@ coalesce_reply :: proc(hi, lo: u8, ttl: u32, rcode: dns.Rcode) -> []u8 {
 Client :: struct {
 	srv:   ^Server,
 	id:    u16,
-	// Ask with an OPT record at `UPSTREAM_UDP_SIZE`, which is what makes the
-	// message `canonical`; without one it is an old stub's.
+	// Ask with an OPT record at `UPSTREAM_UDP_SIZE`, or without one as an old
+	// stub does, which is a different message to the upstream.
 	edns:  bool,
 	rcode: dns.Rcode,
 	addr:  [4]u8,
@@ -194,6 +194,7 @@ run_burst :: proc(
 	// Client 0 asks as `edns` says and leads; the rest ask the other way and
 	// follow it, so the leader's message is not theirs.
 	mixed := false,
+	cache_on := true,
 	// The server's counters once the burst is over.
 	stats: ^Stats = nil,
 ) -> int {
@@ -211,6 +212,7 @@ run_burst :: proc(
 	cfg := config.default_config()
 	cfg.log.queries = false
 	cfg.blocking.enabled = false
+	cfg.cache.enabled = cache_on
 	cfg.dnssec.enabled = false
 	cfg.upstream.strategy = .Failover
 	cfg.upstream.attempts = attempts
@@ -514,4 +516,22 @@ test_followers_on_the_shared_pool_stop_at_the_ceiling :: proc(t: ^testing.T) {
 	_, _, _ = flight_follow(&s, fd, 0, context.temp_allocator, cd)
 	testing.expect_value(t, s.inflight.followers, 0)
 	flight_land(&s, &lead)
+}
+
+/*
+With the cache off, nothing was ever shared between two clients' messages, and
+coalescing does not start: only a follower whose message was the leader's takes
+its answer.
+*/
+@(test)
+test_with_the_cache_off_only_identical_messages_share_an_answer :: proc(t: ^testing.T) {
+	alike: [CLIENTS]Client
+	queries := run_burst(t, &alike, cache_on = false)
+	testing.expectf(t, queries == 1, "identical: the upstream saw %d queries, want 1", queries)
+	apart: [CLIENTS]Client
+	queries = run_burst(t, &apart, cache_on = false, mixed = true)
+	testing.expectf(t, queries == CLIENTS, "different: the upstream saw %d queries, want %d", queries, CLIENTS)
+	for c, i in apart {
+		testing.expectf(t, c.ok && c.addr == {192, 0, 2, 7}, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)
+	}
 }

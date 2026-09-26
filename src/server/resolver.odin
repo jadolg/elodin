@@ -1874,11 +1874,12 @@ resolve_query :: proc(
 		} else if joined != nil {
 			patience := flight_patience(route_group(s, q.name, q.type))
 			landed_with, landed, same := flight_follow(s, joined, patience, allocator, counted, forwarded)
-			// A NOERROR or NXDOMAIN is shared as the cache shares it; any other
-			// rcode may be about the leader's own bytes, unless they were these.
+			// A NOERROR or NXDOMAIN is shared as the cache shares it - so not with
+			// the cache off, where nothing is shared between two messages - and any
+			// other rcode may be about the leader's own bytes, unless they were these.
 			if landed_with.answer != nil {
 				rcode := dns.peek_rcode(landed_with.answer)
-				if same || rcode == .No_Error || rcode == .NX_Domain {
+				if same || (s.cfg.cache.enabled && (rcode == .No_Error || rcode == .NX_Domain)) {
 					shared := Cached_Answer {
 						wire      = landed_with.answer,
 						ede       = landed_with.ede,

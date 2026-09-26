@@ -12,22 +12,23 @@ Identical questions in flight at once go to the upstream once (issue #311).
 The first query to miss the cache for a key leads: it registers a `Flight` here
 and forwards as it always did. A query that misses for the same key while the
 leader is still out follows: it waits for the leader to land and is served the
-leader's answer through `serve_from_cache`, exactly as it would have been had it
-arrived a moment later and found that answer stored. The key is the cache's own,
+leader's answer through `serve_from_cache`, as it would have been had it arrived
+a moment later and found that answer stored - bar `cache.min_ttl`, which is
+applied to a stored copy on the way out and so not to this one. The key is the cache's own,
 so anything the cache would share between two clients this shares, and nothing
 else - which is also why an answer the cache declines to keep (a zero TTL, a
 routed apex `DS` nobody proved) is shared: it is the same answer to the same
 question, produced for a query that was waiting alongside this one.
 
 A NOERROR or NXDOMAIN answer is shared with every follower, which is what the
-cache does with one. What else the leader lands with - any other rcode, or the
+cache does with one - and so, with the cache off, only as the rest below is. What else the leader lands with - any other rcode, or the
 upstream giving it nothing after `upstream.attempts` rounds over every server,
 where a lost datagram is retried - is shared only with a follower whose outgoing
 message is the leader's, byte for byte bar the ID, so that what came back is
-about that message rather than about one client's spelling of it. That is most
-of them: the forwarding path makes the ID, the extended rcode, the payload size
-and three options this server's own, and the DNSSEC rewrite writes the whole OPT
-record. A follower given a failure takes the expired entry or SERVFAIL as the
+about that message rather than about one client's spelling of it. Under the
+DNSSEC rewrite, which writes the whole OPT record, that is most of them; without
+it the payload size and the OPT flags stay the client's, so it is the clients
+that ask alike. A follower given a failure takes the expired entry or SERVFAIL as the
 leader did, rather than wait a second full exchange for the same nothing, which
 in an outage is every pool worker held twice as long.
 
