@@ -673,6 +673,13 @@ special_use:
   local: false
   test: false
   home_arpa: false
+  # The reverse zones for private, CGNAT, loopback and link-local space
+  # (RFC 6303, RFC 7793), served here as empty zones so a LAN PTR never tells
+  # the upstream what addressing your network uses. On by default. A router
+  # that answers PTRs for its DHCP leases wants an upstream.zones route for its
+  # reverse zone (168.192.in-addr.arpa, say), which wins over this key; false
+  # forwards them all, as before.
+  private_reverse: true
 
 # Prometheus. Off by default: a resolver that opens a port nobody asked for has
 # widened your exposure on your behalf.

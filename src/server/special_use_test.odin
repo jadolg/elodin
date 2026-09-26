@@ -294,6 +294,40 @@ test_special_use_names_are_not_sent_to_the_upstream :: proc(t: ^testing.T) {
 			soa = "home.arpa.",
 			home_arpa = true,
 		},
+		// RFC 6303 section 3, on by default (issue #321): the reverse trees for
+		// private, loopback and link-local space are empty zones served here, so
+		// a LAN PTR never tells the upstream what addressing the network uses.
+		// The first three are the issue's reproduction.
+		{name = "1.1.168.192.in-addr.arpa.", type = .PTR, want = .Nx_Domain, soa = "168.192.in-addr.arpa."},
+		{name = "1.0.0.127.in-addr.arpa.", type = .PTR, want = .Nx_Domain, soa = "127.in-addr.arpa."},
+		{name = "1.0.0.10.in-addr.arpa.", type = .PTR, want = .Nx_Domain, soa = "10.in-addr.arpa."},
+		{name = "9.9.31.172.in-addr.arpa.", type = .PTR, want = .Nx_Domain, soa = "31.172.in-addr.arpa."},
+		{name = "1.1.254.169.in-addr.arpa.", type = .PTR, want = .Nx_Domain, soa = "254.169.in-addr.arpa."},
+		{name = "0.0.0.0.in-addr.arpa.", type = .PTR, want = .Nx_Domain, soa = "0.in-addr.arpa."},
+		// RFC 7793: the CGNAT reverse zones, 100.64/10, both ends.
+		{name = "1.1.64.100.in-addr.arpa.", type = .PTR, want = .Nx_Domain, soa = "64.100.in-addr.arpa."},
+		{name = "1.1.127.100.in-addr.arpa.", type = .PTR, want = .Nx_Domain, soa = "127.100.in-addr.arpa."},
+		{
+			name = "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.d.f.ip6.arpa.",
+			type = .PTR,
+			want = .Nx_Domain,
+			soa = "d.f.ip6.arpa.",
+		},
+		{
+			name = "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.e.f.ip6.arpa.",
+			type = .PTR,
+			want = .Nx_Domain,
+			soa = "8.e.f.ip6.arpa.",
+		},
+		// Case folding: a client's spelling does not get it past the table.
+		{name = "1.1.168.192.IN-ADDR.ARPA.", type = .PTR, want = .Nx_Domain, soa = "168.192.in-addr.arpa."},
+		// The apex is the zone, and the zone exists - AS112 serves it - so the
+		// apex answers its SOA, its NS and NODATA rather than a name error.
+		{name = "168.192.in-addr.arpa.", type = .PTR, want = .No_Data, soa = "168.192.in-addr.arpa."},
+		{name = "168.192.in-addr.arpa.", type = .SOA, want = .Zone_Soa},
+		{name = "10.in-addr.arpa.", type = .NS, want = .Zone_Ns},
+		// A DS below the apex is a name error like anything else inside.
+		{name = "1.168.192.in-addr.arpa.", type = .DS, want = .Nx_Domain, soa = "168.192.in-addr.arpa."},
 	}
 
 	for c in cases {
@@ -506,6 +540,252 @@ test_the_home_arpa_apex_ds_is_still_forwarded :: proc(t: ^testing.T) {
 		)
 		free_all(context.temp_allocator)
 	}
+}
+
+/*
+What still reaches `upstream.servers` with `special_use.private_reverse` on, and
+why each one has to (issue #321).
+
+The apex `DS` of each reverse zone, for the reason `home.arpa.`'s goes: the
+signed proof that AS112's delegation carries no DS lives in the parent. A route
+over the zone, or over any name in it, because that is how an operator whose
+router answers its LAN's PTRs sends them there - the key cannot be allowed to
+swallow the one configuration that says where the answer is. An anchor over the
+zone, because that operator has real, signed data there. The key turned off,
+because that is what it is for. And `home.arpa.`, which has a key of its own
+and must not be answered by this one.
+
+Each forwarded case is paired with a sibling name the same configuration still
+answers here, so a change that turned the whole key off would fail as well as
+one that forgot a carve-out.
+*/
+@(test)
+test_private_reverse_stands_down_where_it_must :: proc(t: ^testing.T) {
+	Case :: struct {
+		what:     string,
+		name:     string,
+		type:     dns.Type,
+		key_off:  bool,
+		route:    string,
+		anchor:   string,
+		// A name the same configuration must still answer from the table.
+		answered: string,
+	}
+	cases := []Case {
+		{what = "the apex DS", name = "168.192.in-addr.arpa.", type = .DS, answered = "1.1.168.192.in-addr.arpa."},
+		{what = "the apex DS, CGNAT", name = "64.100.in-addr.arpa.", type = .DS, answered = "64.100.in-addr.arpa."},
+		{
+			what = "a routed zone",
+			name = "1.1.168.192.in-addr.arpa.",
+			type = .PTR,
+			route = "168.192.in-addr.arpa.",
+			answered = "1.0.0.10.in-addr.arpa.",
+		},
+		{
+			what = "a route below the zone",
+			name = "5.1.168.192.in-addr.arpa.",
+			type = .PTR,
+			route = "1.168.192.in-addr.arpa.",
+			answered = "5.2.168.192.in-addr.arpa.",
+		},
+		{
+			what = "a route above the zone",
+			name = "1.1.168.192.in-addr.arpa.",
+			type = .PTR,
+			route = "192.in-addr.arpa.",
+			answered = "1.0.0.10.in-addr.arpa.",
+		},
+		{
+			what = "an anchored zone",
+			name = "1.1.168.192.in-addr.arpa.",
+			type = .PTR,
+			anchor = "168.192.in-addr.arpa.",
+			answered = "1.0.0.10.in-addr.arpa.",
+		},
+		{what = "the key off", name = "1.1.168.192.in-addr.arpa.", type = .PTR, key_off = true},
+		{what = "home.arpa.", name = "printer.home.arpa.", type = .A, answered = "1.1.168.192.in-addr.arpa."},
+	}
+
+	for c in cases {
+		for pass in 0 ..< 2 {
+			name := c.name if pass == 0 else c.answered
+			if name == "" {
+				continue
+			}
+			type := c.type if pass == 0 else dns.Type.PTR
+			cfg := config.default_config()
+			cfg.special_use.private_reverse = !c.key_off
+			s, x, built := leak_server(t, &cfg, name, type)
+			if !built {
+				return
+			}
+			x_socket := x.socket
+			defer net.close(x_socket)
+			defer upstream.destroy_group(s.group)
+			if c.route != "" {
+				routes := make([]Zone_Route, 1, context.temp_allocator)
+				domains := make([]string, 1, context.temp_allocator)
+				domains[0] = c.route
+				routes[0] = Zone_Route {
+					domains = domains,
+					group   = s.group,
+				}
+				s.routes = routes
+			}
+			if c.anchor != "" {
+				anchors := make([]string, 1, context.temp_allocator)
+				anchors[0] = c.anchor
+				s.anchor_zones = anchors
+			}
+
+			if pass == 0 {
+				mock := thread.create_and_start_with_poly_data(x, serve_leak)
+				_, outcome, _ := handle_query(&s, leak_query(name, type), .UDP, "127.0.0.1:5555", context.temp_allocator)
+				thread.join(mock)
+				thread.destroy(mock)
+				testing.expectf(t, x.asked, "%s: %s %v was answered from the table", c.what, name, type)
+				testing.expectf(t, outcome == .Forwarded, "%s: %s came back as %v", c.what, name, outcome)
+			} else {
+				_, outcome, _ := handle_query(&s, leak_query(name, type), .UDP, "127.0.0.1:5555", context.temp_allocator)
+				testing.expectf(t, nothing_reached(x), "%s: the sibling %s was sent to the upstream", c.what, name)
+				testing.expectf(t, outcome == .Local, "%s: the sibling %s came back as %v", c.what, name, outcome)
+			}
+		}
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+A name between a private reverse zone's apex and a route or anchor below it is an
+empty non-terminal: the routed zone exists, so its ancestors do too, and a name
+error for one of them tells an RFC 8020 cache the routed zone is gone as well.
+NODATA with the zone's SOA, and still nothing forwarded. A sibling that is above
+nothing stays NXDOMAIN.
+*/
+@(test)
+test_private_reverse_name_above_a_route_is_nodata :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	domains := []string{"1.0.10.in-addr.arpa."}
+	routes := []Zone_Route{{domains = domains}}
+	anchors := []string{"1.2.3.d.f.ip6.arpa."}
+	s := Server {
+		cfg          = &cfg,
+		routes       = routes,
+		anchor_zones = anchors,
+	}
+	cases := []struct {
+		name: string,
+		want: dns.Rcode,
+		apex: string,
+	} {
+		{"0.10.in-addr.arpa.", .No_Error, "10.in-addr.arpa."},
+		{"0.10.IN-ADDR.ARPA.", .No_Error, "10.in-addr.arpa."},
+		{"2.10.in-addr.arpa.", .NX_Domain, "10.in-addr.arpa."},
+		{"3.d.f.ip6.arpa.", .No_Error, "d.f.ip6.arpa."},
+		{"2.3.d.f.ip6.arpa.", .No_Error, "d.f.ip6.arpa."},
+		{"4.d.f.ip6.arpa.", .NX_Domain, "d.f.ip6.arpa."},
+	}
+	for c in cases {
+		zone, kind := special_use_zone(&s, c.name, .PTR)
+		testing.expectf(t, kind != .None, "%s was not answered here", c.name)
+		testing.expect_value(t, zone, c.apex)
+		questions := make([]dns.Question, 1, context.temp_allocator)
+		questions[0] = dns.Question {
+			name  = c.name,
+			type  = .PTR,
+			class = .IN,
+		}
+		query := dns.Message {
+			id       = 7,
+			question = questions,
+		}
+		wire := answer_special_use(query, questions[0], zone, kind, context.temp_allocator, 512)
+		resp, err := dns.decode_message(wire, context.temp_allocator)
+		testing.expect_value(t, err, dns.Decode_Error.None)
+		testing.expectf(t, dns.Rcode(resp.flags.rcode) == c.want, "%s: rcode %v, want %v", c.name, dns.Rcode(resp.flags.rcode), c.want)
+		testing.expect_value(t, len(resp.answer), 0)
+		if testing.expect_value(t, len(resp.authority), 1) {
+			// Folded: the encoder compresses the owner against the question name.
+			testing.expectf(t, dns.name_equal_fold(resp.authority[0].name, c.apex), "%s: SOA at %s", c.name, resp.authority[0].name)
+		}
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+A rewrite puts names in a private reverse zone too: the PTR `reverse.odin`
+synthesises from `nas.home -> 192.168.1.50`, and a rule written against a
+reverse name outright. Their ancestors are empty non-terminals for the same
+reason a route's are, or this server would deny `1.168.192.in-addr.arpa.` while
+answering `50.1.168.192.in-addr.arpa.` below it.
+*/
+@(test)
+test_private_reverse_name_above_a_rewrite_is_nodata :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	nas := []config.Rewrite_Answer{{kind = .A, v4 = {192, 168, 1, 50}}}
+	nas6 := []config.Rewrite_Answer{{kind = .AAAA, v6 = {0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x50}}}
+	named := []config.Rewrite_Answer{{kind = .CNAME, name = "printer.home."}}
+	rules := []config.Rewrite {
+		{domain = "nas.home.", answers = nas, ptr = true},
+		{domain = "nas6.home.", answers = nas6, ptr = true},
+		{domain = "7.3.168.192.in-addr.arpa.", answers = named},
+	}
+	cfg.rewrites = rules
+	s := Server {
+		cfg = &cfg,
+	}
+	cases := []struct {
+		name: string,
+		want: Special_Use,
+	} {
+		{"1.168.192.in-addr.arpa.", .Empty_Nonterminal},
+		{"3.168.192.in-addr.arpa.", .Empty_Nonterminal},
+		{"2.168.192.in-addr.arpa.", .Empty_Zone},
+		{"0.0.d.f.ip6.arpa.", .Empty_Nonterminal},
+		{"5.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.d.f.ip6.arpa.", .Empty_Nonterminal},
+		{"1.0.d.f.ip6.arpa.", .Empty_Zone},
+	}
+	for c in cases {
+		_, kind := special_use_zone(&s, c.name, .PTR)
+		testing.expectf(t, kind == c.want, "%s: %v, want %v", c.name, kind, c.want)
+	}
+}
+
+/*
+A routed zone's apex `DS` is asked of whoever answers its parent. Under a private
+reverse zone that is this server's empty zone, so the question is answered here
+as NODATA - forwarded, it would name the routed subnet to `upstream.servers`.
+A route at the reverse zone's own apex still sends its `DS` out, its parent
+being public.
+*/
+@(test)
+test_a_route_apex_ds_under_a_private_reverse_zone_is_answered_here :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	domains := []string{"1.168.192.in-addr.arpa.", "10.in-addr.arpa."}
+	routes := []Zone_Route{{domains = domains}}
+	s := Server {
+		cfg    = &cfg,
+		routes = routes,
+	}
+	zone, kind := special_use_zone(&s, "1.168.192.in-addr.arpa.", .DS)
+	testing.expect_value(t, kind, Special_Use.Empty_Nonterminal)
+	testing.expect_value(t, zone, "168.192.in-addr.arpa.")
+	_, kind = special_use_zone(&s, "1.168.192.in-addr.arpa.", .PTR)
+	testing.expect_value(t, kind, Special_Use.None)
+	_, kind = special_use_zone(&s, "5.1.168.192.in-addr.arpa.", .DS)
+	testing.expect_value(t, kind, Special_Use.None)
+	_, kind = special_use_zone(&s, "10.in-addr.arpa.", .DS)
+	testing.expect_value(t, kind, Special_Use.None)
+
+	// An anchor at the route's own apex says nothing about its parent, which is
+	// still this empty zone, so the DS stays here. An anchor over the parent
+	// means the operator has real data there, and the table stands down.
+	s.anchor_zones = []string{"1.168.192.in-addr.arpa."}
+	_, kind = special_use_zone(&s, "1.168.192.in-addr.arpa.", .DS)
+	testing.expect_value(t, kind, Special_Use.Empty_Nonterminal)
+	s.anchor_zones = []string{"168.192.in-addr.arpa."}
+	_, kind = special_use_zone(&s, "1.168.192.in-addr.arpa.", .DS)
+	testing.expect_value(t, kind, Special_Use.None)
 }
 
 /*
@@ -783,6 +1063,24 @@ test_the_special_use_counter_counts_only_what_the_table_answered :: proc(t: ^tes
 			name,
 			s.stats.special_use,
 		)
+	}
+
+	// A private reverse name is answered here too, and deliberately left out of
+	// the count: every LAN PTR lands there and would drown the `.onion` signal.
+	{
+		name := "1.1.168.192.in-addr.arpa."
+		cfg := config.default_config()
+		s, x, built := leak_server(t, &cfg, name, .PTR)
+		if !built {
+			return
+		}
+		x_socket := x.socket
+		defer net.close(x_socket)
+		defer upstream.destroy_group(s.group)
+
+		_, outcome, _ := handle_query(&s, leak_query(name, .PTR), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		testing.expectf(t, outcome == .Local, "%s came back as %v rather than local", name, outcome)
+		testing.expectf(t, s.stats.special_use == 0, "%s left the counter at %d, want 0", name, s.stats.special_use)
 	}
 
 	/*

@@ -777,7 +777,9 @@ zone from a public signed one.
 A route into a zone [`special_use`](#reserved-names) already answers is refused
 at load: those names are answered from the table before anything is forwarded,
 so the route would sit in the file looking like the fix while every name went on
-getting the table's NXDOMAIN. Turn the key off in the same edit.
+getting the table's NXDOMAIN. Turn the key off in the same edit. The one
+exception is `special_use.private_reverse`, which stands down for a routed name
+instead, so a route is how a reverse zone reaches your router.
 
 > **Coming from dnsmasq:** `server=/corp.example/10.0.0.1` in `blocking.rules`
 > or `blocking.allow` does not route that zone — it is discarded, which looks
@@ -2233,6 +2235,7 @@ special_use:
   local: false     # local.  (RFC 6762 section 22)
   test: false      # test.   (RFC 6761 section 6.2)
   home_arpa: false # home.arpa. (RFC 8375 sections 3 and 4)
+  private_reverse: true # private reverse zones (RFC 6303, RFC 7793)
 ```
 
 Three names are answered here rather than asked about, whatever
@@ -2243,6 +2246,32 @@ Three names are answered here rather than asked about, whatever
 | `localhost.` and below | 127.0.0.1 for A, `::1` for AAAA, NODATA otherwise | RFC 6761 6.3. The only answer it is allowed to have |
 | `onion.` and below | NXDOMAIN | RFC 7686 2, unless the upstream is Tor-aware |
 | `invalid.` and below | NXDOMAIN | RFC 6761 6.4. It cannot exist |
+
+**`private_reverse` is on by default.** The reverse zones for RFC 1918 private
+space, CGNAT (100.64/10), loopback, `0/8`, IPv4 link-local, IPv6 unique-local
+(`fd00::/8`) and IPv6 link-local are served here as empty zones (RFC 6303
+section 3): `1.1.168.192.in-addr.arpa` is NXDOMAIN, `168.192.in-addr.arpa`
+itself NODATA with its own SOA and NS. Forwarded, every LAN PTR from every client
+tells the upstream which private addressing your network uses, and fetches the
+AS112 blackhole servers' NXDOMAIN for it. Unbound, BIND and Pi-hole all answer
+these locally by default. Only each zone's apex `DS` still goes out, for the
+same reason `home.arpa DS` does.
+
+If your router answers PTRs for its DHCP leases, route the zone to it —
+`upstream.zones: [{domains: [168.192.in-addr.arpa], servers: [192.168.1.1]}]` —
+and those names go there instead: a route over a name wins over this key, and so
+does a [trust anchor](#dnssec) you configured over the zone while `dnssec.enabled`
+is on. The same goes for a VPN that numbers its peers from CGNAT space and
+answers their PTRs — Tailscale's MagicDNS at `100.100.100.100`, say: route
+the CGNAT zones it numbers from (`64.100.in-addr.arpa` through
+`127.100.in-addr.arpa`) to it, or its peers' reverse names are NXDOMAIN here.
+Not `100.in-addr.arpa` as a whole: the rest of it is public, signed address
+space, and a route takes every name under it out of DNSSEC validation.
+`private_reverse: false` (or `enabled: false`) sends them all back to
+`upstream.servers`, as before except that forwarded CGNAT reverse answers are
+now served unvalidated like the other private ranges. These answers log as `outcome=local detail=private-reverse` and are left
+out of the `special_use` counter below, which every LAN PTR would otherwise
+drown.
 
 `.onion` is the one this exists for: the query is the disclosure, since
 forwarding it tells the upstream operator — and anyone on the path to a plain-UDP

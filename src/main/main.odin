@@ -617,7 +617,7 @@ main :: proc() {
 
 	switch {
 	case !cfg.special_use.enabled:
-		logx.warnf("special_use.enabled is off: localhost., onion. and invalid. are forwarded to the upstream")
+		logx.warnf("special_use.enabled is off: localhost., onion., invalid. and the private reverse zones are forwarded to the upstream")
 		// The second half of what this key now does. `special_use_deferred` fires
 		// on this key as well as on `onion`, so an operator who set it for a
 		// reason having nothing to do with tor - wanting their own hosts file to

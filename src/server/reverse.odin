@@ -1,6 +1,7 @@
 package server
 
 import "core:mem"
+import "core:strconv"
 import "elodin:config"
 import "elodin:dns"
 
@@ -344,7 +345,8 @@ rule_hands_out :: proc(r: config.Rewrite, want: config.Rewrite_Answer) -> bool {
 The addresses a host on this network can hold, and the only ones a rewrite may
 be reversed into. RFC 1918, RFC 3927 link-local, RFC 4193 unique-local and RFC
 4291 IPv6 link-local - the private subset of `LOCALLY_SERVED_ZONES`, minus
-loopback and `0.0.0.0`, for the reason in the file comment.
+loopback and `0.0.0.0`, for the reason in the file comment, and minus the CGNAT
+zones, whose addresses are the ISP's rather than this network's.
 */
 @(private)
 address_is_local_v4 :: proc(a: [4]u8) -> bool {
@@ -373,6 +375,38 @@ V4_REVERSE_SUFFIX :: "in-addr.arpa."
 
 @(private)
 V6_REVERSE_SUFFIX :: "ip6.arpa."
+
+/*
+192.168.1.50 -> "50.1.168.192.in-addr.arpa.", the inverse of the parsers below,
+for an A or AAAA answer; "" for any other kind. Written into `buf` so the query
+path allocates nothing - 80 bytes holds the longest, an IPv6 name at 73.
+*/
+@(private)
+reverse_name_of :: proc(a: config.Rewrite_Answer, buf: []u8) -> string {
+	hex := "0123456789abcdef"
+	n := 0
+	#partial switch a.kind {
+	case .A:
+		for i := 3; i >= 0; i -= 1 {
+			n += len(strconv.write_uint(buf[n:], u64(a.v4[i]), 10))
+			buf[n] = '.'
+			n += 1
+		}
+		n += copy(buf[n:], V4_REVERSE_SUFFIX)
+	case .AAAA:
+		for i := 15; i >= 0; i -= 1 {
+			buf[n] = hex[a.v6[i] & 0xf]
+			buf[n + 1] = '.'
+			buf[n + 2] = hex[a.v6[i] >> 4]
+			buf[n + 3] = '.'
+			n += 4
+		}
+		n += copy(buf[n:], V6_REVERSE_SUFFIX)
+	case:
+		return ""
+	}
+	return string(buf[:n])
+}
 
 /*
 "50.1.168.192.in-addr.arpa." -> 192.168.1.50.

@@ -323,6 +323,9 @@ upstream:
   servers: ["127.0.0.1:%d"]
 cache: {{ enabled: false }}
 blocking: {{ enabled: true, response: nxdomain }}
+# Off, so the "gets no PTR" cases below can prove a reverse name is forwarded
+# rather than invented; with the key on it would be the empty zone's NXDOMAIN.
+special_use: {{ private_reverse: false }}
 rewrites:
   - {{ domain: nas.home, answer: 192.168.1.50, ttl: 111 }}
   - {{ domain: nas6.home, answer: "fd00::50" }}
