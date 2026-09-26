@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Print the -max_len flag for fuzz target $1, or nothing if it keeps libFuzzer's
-# default 4 KB cap.
+# default cap: 4 KB, or the largest seed input if that is longer.
 #
 # A target that needs longer inputs says so in testdata/fuzz-corpus/<target>.max_len,
 # next to its dict: `#` lines say why it needs it, and the one other line is the
@@ -8,9 +8,10 @@
 # default") is an error rather than a quiet fall back to the default. Nine digits
 # at most, as libFuzzer reads the flag into an int and an overflow wraps.
 #
-# The nightly fuzz job reads the cap through this, and `fuzz-regression` runs it
-# for every target, so a malformed file fails on the PR that adds it.
+# The nightly fuzz job reads the cap through this, and `fuzz-regression` checks
+# every file, so a malformed file fails on the PR that adds it.
 set -euo pipefail
+cd "$(dirname "$0")/.."
 
 f=testdata/fuzz-corpus/$1.max_len
 [ -f "$f" ] || exit 0

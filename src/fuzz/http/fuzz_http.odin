@@ -56,3 +56,11 @@ fuzz_one :: proc "c" (data: [^]u8, size: uint) -> i32 {
 	}
 	return 0
 }
+
+// libFuzzer's start-up hook: see `harness.check_max_len`.
+@(export, link_name = "LLVMFuzzerInitialize")
+fuzz_init :: proc "c" (argc: ^i32, argv: ^[^]cstring) -> i32 {
+	context = runtime.default_context()
+	harness.check_max_len(argv^[:argc^])
+	return 0
+}
