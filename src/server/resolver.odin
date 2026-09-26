@@ -1861,22 +1861,19 @@ resolve_query :: proc(
 
 	Here, where the outgoing message has taken its final shape, because what a
 	follower may be handed turns on whether its message and the leader's are the
-	same bytes - see `canonical`. `validating` still being set says the DNSSEC
-	rewrite ran.
+	same bytes.
 	*/
 	own_flight: Flight
 	flight: ^Flight
 	if unanswered == nil {
 		ceiling := follower_ceiling(s)
 		joined, counted := flight_join(s, key, &own_flight, shared_worker, ceiling)
-		plain := canonical(msg, forwarded, validating, allocator)
 		if joined == &own_flight {
 			flight = joined
-			flight.canonical = plain
+			flight.forwarded = forwarded
 		} else if joined != nil {
 			patience := flight_patience(route_group(s, q.name, q.type))
-			landed_with, landed := flight_follow(s, joined, patience, allocator, counted)
-			same := plain && landed_with.canonical
+			landed_with, landed, same := flight_follow(s, joined, patience, allocator, counted, forwarded)
 			// A NOERROR or NXDOMAIN is shared as the cache shares it; any other
 			// rcode may be about the leader's own bytes, unless they were these.
 			if landed_with.answer != nil {
@@ -2707,9 +2704,9 @@ resolve_query :: proc(
 			   decoded.full &&
 			   !unproven_apex_ds &&
 			   cloak_verdict_worth_keeping(verdict) {
-				cache.put(s.answers, key, resp, decoded.msg, generation, u8(verdict), ede = answer_ede)
+				kept := cache.put(s.answers, key, resp, decoded.msg, generation, u8(verdict), ede = answer_ede)
 				if flight != nil {
-					flight.stored = true
+					flight.stored = kept
 				}
 			}
 			return out, cloak_outcome(verdict), true
@@ -3248,8 +3245,7 @@ remember_bogus_verdict :: proc(
 	if derr != .None {
 		return
 	}
-	cache.put(s.answers, verdict_key, wire, refusal, bogus = true)
-	return true
+	return cache.put(s.answers, verdict_key, wire, refusal, bogus = true)
 }
 
 /*

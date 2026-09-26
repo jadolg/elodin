@@ -191,7 +191,8 @@ run_burst :: proc(
 	drop_first := false,
 	attempts := 1,
 	edns := true,
-	// Client 0 asks with EDNS and leads; the rest ask without and follow it.
+	// Client 0 asks as `edns` says and leads; the rest ask the other way and
+	// follow it, so the leader's message is not theirs.
 	mixed := false,
 	// The server's counters once the burst is over.
 	stats: ^Stats = nil,
@@ -250,7 +251,7 @@ run_burst :: proc(
 		clients[i] = Client {
 			srv  = &srv,
 			id   = u16(0x1000 + i),
-			edns = edns if !mixed else i == 0,
+			edns = edns if !mixed || i == 0 else !edns,
 		}
 		threads[i] = thread.create_and_start_with_poly_data(&clients[i], ask)
 		// Let the leader register before anybody else asks.
@@ -335,14 +336,14 @@ test_a_lost_datagram_is_retried_for_the_followers_too :: proc(t: ^testing.T) {
 }
 
 /*
-A leader whose message was its own - an old stub's, with no OPT record - may have
-failed over those bytes rather than the question, so its followers ask for
+A leader whose message was not theirs - an old stub's, with no OPT record - may
+have failed over those bytes rather than the question, so its followers ask for
 themselves rather than take its failure.
 */
 @(test)
-test_followers_of_a_non_canonical_leader_ask_for_themselves :: proc(t: ^testing.T) {
+test_followers_of_another_message_ask_for_themselves :: proc(t: ^testing.T) {
 	clients: [CLIENTS]Client
-	queries := run_burst(t, &clients, drop_first = true, timeout = 1 * time.Second, edns = false)
+	queries := run_burst(t, &clients, drop_first = true, timeout = 1 * time.Second, edns = false, mixed = true)
 	testing.expectf(t, queries == CLIENTS, "the upstream saw %d queries for %d clients, want %d", queries, CLIENTS, CLIENTS)
 	failed, answered := 0, 0
 	for c in clients {
@@ -356,11 +357,11 @@ test_followers_of_a_non_canonical_leader_ask_for_themselves :: proc(t: ^testing.
 }
 
 /*
-And the other way round: a canonical leader's failure or FORMERR is the upstream
-reading the canonical message, which the followers' own messages are not.
+And the other way round: an EDNS leader's failure or FORMERR is the upstream
+reading its message, which the followers' own, without EDNS, are not.
 */
 @(test)
-test_a_canonical_leaders_failure_is_not_handed_to_other_messages :: proc(t: ^testing.T) {
+test_a_leaders_failure_is_not_handed_to_other_messages :: proc(t: ^testing.T) {
 	down: [CLIENTS]Client
 	queries := run_burst(t, &down, silent = true, timeout = 1 * time.Second, mixed = true)
 	testing.expectf(t, queries == CLIENTS, "down: the upstream saw %d queries, want %d", queries, CLIENTS)
@@ -374,13 +375,13 @@ test_a_canonical_leaders_failure_is_not_handed_to_other_messages :: proc(t: ^tes
 }
 
 /*
-And an rcode is shared or not on the same terms. From a leader that asked as a
-follower would have, a FORMERR or a REFUSED is the upstream's word on the
-question; from one that did not, it may be a refusal of bytes no follower sent,
-and only the rcodes the cache itself keeps are handed on.
+And an rcode is shared or not on the same terms. From a leader whose message was
+the follower's, a FORMERR or a REFUSED is the upstream's word on that message;
+from one whose was not, it may be a refusal of bytes no follower sent, and only
+the rcodes the cache itself keeps are handed on.
 */
 @(test)
-test_a_refusal_is_shared_only_from_a_canonical_leader :: proc(t: ^testing.T) {
+test_a_refusal_is_shared_only_between_identical_messages :: proc(t: ^testing.T) {
 	count :: proc(clients: [CLIENTS]Client, rcode: dns.Rcode) -> (refused, answered: int) {
 		for c in clients {
 			if c.ok && c.rcode == rcode {
@@ -394,7 +395,7 @@ test_a_refusal_is_shared_only_from_a_canonical_leader :: proc(t: ^testing.T) {
 
 	for rcode in ([]dns.Rcode{.Form_Err, .Refused}) {
 		own: [CLIENTS]Client
-		run_burst(t, &own, first = rcode, edns = false)
+		run_burst(t, &own, first = rcode, edns = false, mixed = true)
 		refused, answered := count(own, rcode)
 		testing.expectf(t, refused == 1 && answered == CLIENTS - 1, "%v without EDNS: %d clients got the leader's refusal and %d an answer, want 1 and %d", rcode, refused, answered, CLIENTS - 1)
 	}
@@ -418,7 +419,7 @@ test_a_follower_stops_waiting_at_its_patience :: proc(t: ^testing.T) {
 	testing.expect(t, joined == &lead, "the second query did not follow")
 
 	start := time.tick_now()
-	result, landed := flight_follow(&s, joined, 50 * time.Millisecond, context.temp_allocator)
+	result, landed, _ := flight_follow(&s, joined, 50 * time.Millisecond, context.temp_allocator)
 	waited := time.tick_since(start)
 	testing.expect(t, !landed && !result.failed && result.answer == nil, "a flight that never landed was read as landed")
 	testing.expectf(t, waited >= 50 * time.Millisecond && waited < 2 * time.Second, "waited %v for 50ms of patience", waited)
@@ -447,87 +448,42 @@ test_a_full_flight_table_forwards_without_joining :: proc(t: ^testing.T) {
 }
 
 /*
-Canonical is the outgoing message being the one this server would build for the
-key: anything of the client's that survives to the wire is a difference.
+A follower is told whether its outgoing message was the leader's, bar the ID -
+which is what decides whether anything but an answer is handed to it - and the
+spelling of the name, or a header bit the key does not carry, is a difference.
 */
 @(test)
-test_canonical_is_what_any_identical_query_would_send :: proc(t: ^testing.T) {
-	check :: proc(t: ^testing.T, msg: dns.Message, want: bool, what: string, validating := false, trailing := false) {
-		wire, _, err := dns.encode_message(msg, context.temp_allocator)
-		if !testing.expectf(t, err == .None, "%s: cannot encode: %v", what, err) {
-			return
-		}
-		if trailing {
-			grown := make([]u8, len(wire) + 1, context.temp_allocator)
-			copy(grown, wire)
-			wire = grown
-		}
-		decoded, derr := dns.decode_message(wire, context.temp_allocator)
-		if !testing.expectf(t, derr == .None, "%s: cannot decode: %v", what, derr) {
-			return
-		}
-		// As the forwarding path shapes it: the rewrite where it runs, then the
-		// clamp every query gets.
-		forwarded := dns.clone_message_bytes(wire, context.temp_allocator)
-		if validating {
-			forwarded, _ = dnssec_upstream_query(decoded, context.temp_allocator)
-		}
-		_ = dns.set_edns_udp_size(
-			forwarded,
-			u16(clamp(int(dns.peek_udp_size(forwarded)), dns.MAX_UDP_SIZE, UPSTREAM_UDP_SIZE)),
-		)
-		got := canonical(decoded, forwarded, validating, context.temp_allocator)
-		testing.expectf(t, got == want, "%s: canonical is %v, want %v", what, got, want)
-	}
-	with_opt :: proc(size: u16, codes: ..dns.EDNS_Option_Code) -> []dns.Record {
-		opt := dns.make_opt(size, false)
-		options := make([]dns.EDNS_Option, len(codes), context.temp_allocator)
-		for c, i in codes {
-			options[i] = dns.EDNS_Option{code = u16(c), data = []u8{1, 2, 3, 4, 5, 6, 7, 8}}
-		}
-		opt.data = dns.Rdata_OPT{options = options}
-		out := make([]dns.Record, 1, context.temp_allocator)
-		out[0] = opt
-		return out
-	}
-	ask :: proc(additional: []dns.Record = nil) -> dns.Message {
+test_a_follower_is_told_whether_its_message_was_the_leaders :: proc(t: ^testing.T) {
+	message :: proc(id: u16, name: string, ad := false) -> []u8 {
 		msg := dns.Message {
-			question   = []dns.Question{{name = QNAME, type = .A, class = .IN}},
-			additional = additional,
+			id         = id,
+			question   = []dns.Question{{name = name, type = .A, class = .IN}},
+			additional = []dns.Record{dns.make_opt(UPSTREAM_UDP_SIZE, false)},
 		}
 		msg.flags.rd = true
-		return msg
+		msg.flags.ad = ad
+		wire, _, _ := dns.encode_message(msg, context.temp_allocator)
+		return wire
 	}
-	record := []dns.Record{{name = QNAME, type = .A, class = .IN, data = dns.Rdata_A{addr = {192, 0, 2, 1}}}}
-
-	check(t, ask(with_opt(UPSTREAM_UDP_SIZE)), true, "OPT at the clamp")
-	check(t, ask(with_opt(4096)), true, "OPT above the clamp")
-	check(t, ask(), false, "no OPT")
-	check(t, ask(), true, "no OPT, rewritten for DNSSEC", validating = true)
-	check(t, ask(with_opt(512)), false, "OPT at 512")
-	check(t, ask(with_opt(512)), true, "OPT at 512, rewritten", validating = true)
-	check(t, ask(with_opt(UPSTREAM_UDP_SIZE, .NSID)), false, "a forwarded option")
-	check(t, ask(with_opt(UPSTREAM_UDP_SIZE, .NSID)), false, "a forwarded option, rewritten", validating = true)
-	check(t, ask(with_opt(UPSTREAM_UDP_SIZE, .Padding)), false, "padding")
-	check(t, ask(with_opt(UPSTREAM_UDP_SIZE)), false, "bytes past the last record", trailing = true)
-
-	answer := ask(with_opt(UPSTREAM_UDP_SIZE))
-	answer.answer = record
-	check(t, answer, false, "an answer record")
-	beside := ask([]dns.Record{record[0], with_opt(UPSTREAM_UDP_SIZE)[0]})
-	check(t, beside, false, "a record beside OPT")
-	for bit in 0 ..< 3 {
-		flagged := ask(with_opt(UPSTREAM_UDP_SIZE))
-		switch bit {
-		case 0: flagged.flags.z = true
-		case 1: flagged.flags.tc = true
-		case 2: flagged.flags.aa = true
-		}
-		check(t, flagged, false, "a header bit")
+	follow :: proc(leader, follower: []u8) -> bool {
+		s: Server
+		lead: Flight
+		_, _ = flight_join(&s, "k", &lead)
+		lead.forwarded = leader
+		other: Flight
+		joined, _ := flight_join(&s, "k", &other)
+		// Landed from another thread, which is what a follower waits for.
+		landing := thread.create_and_start_with_poly_data2(&s, &lead, flight_land)
+		_, landed, same := flight_follow(&s, joined, 5 * time.Second, context.temp_allocator, false, follower)
+		thread.join(landing)
+		thread.destroy(landing)
+		return landed && same
 	}
-	ad := ask(with_opt(UPSTREAM_UDP_SIZE))
-	ad.flags.ad = true
-	check(t, ad, true, "AD, which is part of the key's reading")
+	leader := message(1, QNAME)
+	testing.expect(t, follow(leader, message(2, QNAME)), "the same message under another ID was not the same")
+	testing.expect(t, !follow(leader, message(1, "Slow.Example.Test.")), "another spelling of the name was the same")
+	testing.expect(t, !follow(leader, message(1, QNAME, ad = true)), "another AD bit was the same")
+	testing.expect(t, !follow(leader, nil), "no message was the same")
 }
 
 // Followers on the shared pool stop at the ceiling, and the count comes back
@@ -549,13 +505,13 @@ test_followers_on_the_shared_pool_stop_at_the_ceiling :: proc(t: ^testing.T) {
 	fd, cd := flight_join(&s, "k", &d, shared = false, ceiling = 2)
 	testing.expect(t, fd == &lead && !cd, "a follower off the shared pool was turned away or counted")
 
-	_, _ = flight_follow(&s, fa, 0, context.temp_allocator, ca)
+	_, _, _ = flight_follow(&s, fa, 0, context.temp_allocator, ca)
 	testing.expect_value(t, s.inflight.followers, 1)
 	fe, ce := flight_join(&s, "k", &c, shared = true, ceiling = 2)
 	testing.expect(t, fe == &lead, "the slot a follower left was not free again")
-	_, _ = flight_follow(&s, fb, 0, context.temp_allocator, cb)
-	_, _ = flight_follow(&s, fe, 0, context.temp_allocator, ce)
-	_, _ = flight_follow(&s, fd, 0, context.temp_allocator, cd)
+	_, _, _ = flight_follow(&s, fb, 0, context.temp_allocator, cb)
+	_, _, _ = flight_follow(&s, fe, 0, context.temp_allocator, ce)
+	_, _, _ = flight_follow(&s, fd, 0, context.temp_allocator, cd)
 	testing.expect_value(t, s.inflight.followers, 0)
 	flight_land(&s, &lead)
 }

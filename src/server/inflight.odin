@@ -3,7 +3,6 @@ package server
 import "core:mem"
 import "core:sync"
 import "core:time"
-import "elodin:dns"
 import "elodin:pool"
 import "elodin:upstream"
 
@@ -23,12 +22,14 @@ question, produced for a query that was waiting alongside this one.
 A NOERROR or NXDOMAIN answer is shared with every follower, which is what the
 cache does with one. What else the leader lands with - any other rcode, or the
 upstream giving it nothing after `upstream.attempts` rounds over every server,
-where a lost datagram is retried - is shared only between queries that are both
-`canonical`: whose outgoing messages are the same bytes bar the ID, so that what
-came back is about the question rather than about one client's message. A
-follower given a failure takes the expired entry or SERVFAIL as the leader did,
-rather than wait a second full exchange for the same nothing, which in an outage
-is every pool worker held twice as long.
+where a lost datagram is retried - is shared only with a follower whose outgoing
+message is the leader's, byte for byte bar the ID, so that what came back is
+about that message rather than about one client's spelling of it. That is most
+of them: the forwarding path makes the ID, the extended rcode, the payload size
+and three options this server's own, and the DNSSEC rewrite writes the whole OPT
+record. A follower given a failure takes the expired entry or SERVFAIL as the
+leader did, rather than wait a second full exchange for the same nothing, which
+in an outage is every pool worker held twice as long.
 
 A follower that cannot use what the leader landed with forwards on its own, which
 is what every query did before this - except where the leader stored a verdict
@@ -74,8 +75,9 @@ only once it has seen `landed` under the lock `flight_land` set it under.
 */
 @(private)
 Landing :: struct {
-	// The leader's message is `canonical`.
-	canonical: bool,
+	// What the leader sent upstream, in its arena, for a follower to hold its
+	// own against.
+	forwarded: []u8,
 	// The answer as the cache would have stored it, in the leader's arena, or in
 	// the follower's once copied. Nil when the leader forwarded nothing.
 	answer:    []u8,
@@ -97,37 +99,6 @@ Flight :: struct {
 	// Where this flight sits in the table, so landing need not look for it.
 	slot:          int,
 	using landing: Landing,
-}
-
-/*
-Whether this query's outgoing message is the one this server would build for
-its key and nothing else: the question, RD, the client's AD, CD, and an OPT
-record at `UPSTREAM_UDP_SIZE` carrying DO and no options.
-
-Compared as bytes, bar the ID, with a message built here, rather than by
-inspecting the fields that can differ: everything the forwarding path leaves as
-the client wrote it - records beside the question, EDNS options, header bits,
-OPT flags, a payload size below the clamp, no OPT at all, bytes past the last
-record - is then a difference without having to be named. `validating` says the
-DNSSEC rewrite ran, which sets CD and DO whatever the client asked.
-*/
-@(private)
-canonical :: proc(msg: dns.Message, forwarded: []u8, validating: bool, allocator: mem.Allocator) -> bool {
-	if len(msg.question) != 1 || len(forwarded) < dns.HEADER_SIZE {
-		return false
-	}
-	ref := dns.Message {
-		question   = msg.question,
-		additional = []dns.Record{dns.make_opt(UPSTREAM_UDP_SIZE, validating || dns.edns_do(msg))},
-	}
-	ref.flags.rd = true
-	ref.flags.ad = msg.flags.ad
-	ref.flags.cd = validating || msg.flags.cd
-	wire, _, err := dns.encode_message(ref, allocator)
-	if err != .None || len(wire) != len(forwarded) {
-		return false
-	}
-	return string(wire[2:]) == string(forwarded[2:])
 }
 
 /*
@@ -220,8 +191,10 @@ flight_join :: proc(
 Wait for the leader, and take a copy of what it landed with.
 
 `landed` false means patience ran out first, and the rest of the result is then
-empty. The answer is copied into this request's arena, since the leader's goes
-the moment the last follower leaves.
+empty. `same` says `forwarded`, this follower's outgoing message, is the
+leader's bar the ID. The answer is copied into this request's arena, and the
+comparison made, before this follower leaves: the leader's bytes go the moment
+the last follower does.
 */
 @(private)
 flight_follow :: proc(
@@ -230,9 +203,11 @@ flight_follow :: proc(
 	patience: time.Duration,
 	allocator: mem.Allocator,
 	counted := false,
+	forwarded: []u8 = nil,
 ) -> (
 	result: Landing,
 	landed: bool,
+	same: bool,
 ) {
 	sync.mutex_lock(&s.inflight.mu)
 	start := time.tick_now()
@@ -257,6 +232,12 @@ flight_follow :: proc(
 		copy(copied, result.answer)
 		result.answer = copied
 	}
+	leader := result.forwarded
+	same =
+		len(leader) >= 2 &&
+		len(leader) == len(forwarded) &&
+		string(leader[2:]) == string(forwarded[2:])
+	result.forwarded = nil
 
 	sync.mutex_lock(&s.inflight.mu)
 	if counted {

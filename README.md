@@ -890,16 +890,18 @@ Identical questions that miss the cache while the first is still out are sent
 to the upstream once. The first query forwards and the rest wait for it. A
 NOERROR or NXDOMAIN answer is then served to them as though found in the cache,
 including one the cache will not keep, such as one with a zero TTL. Any other
-outcome goes only to queries whose message to the upstream is byte for byte the
-first one's. That means any other rcode, or the upstream giving nothing after
-every attempt on every server, in which case they get the expired copy or
-SERVFAIL. An identical message means the question with an OPT record at the full
-payload size and nothing else of the client's. The DNSSEC rewrite gives every
-query it handles such an OPT record. Other waiting queries ask for themselves,
-as does any query that arrives when a quarter of the query pool is already
-waiting like this. "Identical" means the same cache key. The query log shows these
-queries as `outcome=cached detail=coalesced`, or `outcome=failed
-detail=upstream-coalesced`, and both count in `elodin_answers_coalesced_total`.
+outcome goes only to queries whose message to the upstream was byte for byte
+the first one's, apart from the ID. That covers any other rcode, and the
+upstream giving nothing after every attempt on every server, in which case they
+get the expired copy or SERVFAIL. Most messages are identical, because elodin
+writes the ID, the payload size and the OPT record's flags itself. Different
+spellings of the name, or different EDNS options, are not. The other waiting
+queries ask for themselves, as does any query that arrives when a quarter of the
+query pool is already waiting like this. "Identical" means the same cache key.
+All of these queries count in `elodin_answers_coalesced_total`. The query log
+shows a shared answer as `outcome=cached detail=coalesced` and a shared failure
+as `outcome=failed detail=upstream-coalesced`, or as `detail=stale` where an
+expired copy was served instead.
 
 `serve_stale` keeps an entry for a day past its expiry and answers from it when
 a fresh answer cannot be got. What decides *when* is `stale_timeout`, RFC 8767
@@ -2323,7 +2325,7 @@ as a warning at startup.
 | `elodin_uptime_seconds` | gauge | seconds since this process finished starting |
 | `elodin_queries_total` | counter | queries accepted, whatever became of them |
 | `elodin_answers_total{outcome}` | counter | `forwarded`, `cached`, `blocked`, `rewritten`, `failed` |
-| `elodin_answers_coalesced_total` | counter | queries that waited for an identical one already in flight instead of asking the upstream: its answer, counted as `cached` although the cache never held it (`detail=coalesced`), or its failure, counted as `failed` (`detail=upstream-coalesced`) |
+| `elodin_answers_coalesced_total` | counter | queries that waited for an identical one already in flight instead of asking the upstream: its answer, counted as `cached` although the cache never held it (`detail=coalesced`), or its failure, counted as `failed` (`detail=upstream-coalesced`) or, where an expired copy was served, as a stale `cached` |
 | `elodin_queries_dropped_total` | counter | turned away before any work: the backlog was full, or the source could not be answered |
 | `elodin_queries_refused_total` | counter | turned away by `server.allow_from` |
 | `elodin_connections_refused_total` | counter | refused for want of a slot: `server.max_connections` full, or the client's prefix already holding its share |
