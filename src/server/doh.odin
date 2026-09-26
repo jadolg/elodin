@@ -490,6 +490,9 @@ fuzz_http_requests :: proc(conn: Conn) {
 		if param, found := query_param(req.query, "dns"); found {
 			_, _ = decode_dns_param(param)
 		}
+		// As `serve_doh` does between requests, so nothing the next one reads can
+		// lean on this one's scratch.
+		free_all(context.temp_allocator)
 	}
 }
 

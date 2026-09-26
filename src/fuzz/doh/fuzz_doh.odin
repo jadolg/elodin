@@ -1,5 +1,6 @@
 package fuzz_doh
 
+import "base:runtime"
 import "elodin:fuzz/harness"
 import "elodin:server"
 
@@ -21,6 +22,11 @@ fuzz_one :: proc "c" (data: [^]u8, size: uint) -> i32 {
 	}
 	defer harness.unfeed(socket, peer)
 
+	// The reader's buffer on the heap, as it is in `serve_doh`, rather than the
+	// harness's arena, which never frees: a view into it held across a read that
+	// grows it, or a compaction that shrinks it, is a use after free ASan can only
+	// see where there is a free. The wrapper deletes the buffer itself.
+	context.allocator = runtime.heap_allocator()
 	server.fuzz_http_requests(server.Conn{socket = socket})
 	return 0
 }

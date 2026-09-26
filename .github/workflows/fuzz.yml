@@ -30,6 +30,8 @@ jobs:
           cache: true
 
       - run: mise run fuzz
+        env:
+          FUZZ_TARGETS: ${{ matrix.target }}
 
       # Cache key is unique per run so the save step always writes a new
       # entry; restore-keys then matches on the target-scoped prefix to pick
@@ -53,8 +55,15 @@ jobs:
           mkdir -p crashes
           dict=testdata/fuzz-corpus/${{ matrix.target }}.dict
           [ -f "$dict" ] || dict=""
+          # The HTTP readers take a read of 4 KB (doh) or 8 KB (http) at a time,
+          # and the harness has the whole input queued before the first one. At
+          # libFuzzer's default 4 KB cap every input is a single read, and the
+          # refill, growth and header-size paths are never reached.
+          len=""
+          case "${{ matrix.target }}" in http|doh) len=65536 ;; esac
           ASAN_OPTIONS=detect_leaks=0 ./bin/fuzz_${{ matrix.target }} \
             ${dict:+-dict=$dict} \
+            ${len:+-max_len=$len} \
             -max_total_time=1200 \
             -artifact_prefix=crashes/ \
             corpus/${{ matrix.target }}

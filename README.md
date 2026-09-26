@@ -2714,11 +2714,10 @@ checking builds out of an upstream's keys and signatures (`dnssec`), the h2 fram
 layer and stream state machine on both the server and client side (`h2conn`),
 and the HTTP/1.1 request parser DoH clients write into (`doh`). The two HTTP
 readers take a socket, so their targets hand them one end of a socket pair the
-input has been written into. Odin has no
-`-fsanitize=fuzzer`, so
-`mise run fuzz` emits LLVM IR per target and has clang instrument and link it
-into a libFuzzer binary at `bin/fuzz_*`, with ASan on and bounds checks still in.
-Running one is open-ended, so `.github/workflows/fuzz.yml` does it nightly
+input has been written into. Odin has no `-fsanitize=fuzzer`, so `mise run fuzz`
+emits LLVM IR per target and has clang instrument and link it into a libFuzzer
+binary at `bin/fuzz_*`, with ASan on and bounds checks still in. Running one is
+open-ended, so `.github/workflows/fuzz.yml` does it nightly
 against a corpus cached between runs, and `workflow_dispatch` runs it on demand
 after a parser is touched. What CI runs on every change is
 `mise run fuzz-regression`, which replays `testdata/fuzz-corpus/` through each

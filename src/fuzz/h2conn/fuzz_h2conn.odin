@@ -78,8 +78,11 @@ discard :: proc(user: rawptr, buf: []u8) -> bool {
 	return true
 }
 
-// Answered inline with a body, so the write path and its flow control are driven
-// by whatever the input granted.
+// Answered inline with a body, so the write path is driven by whatever window
+// the input granted before the request. Inline means no WINDOW_UPDATE can arrive
+// mid-response, so a response that runs out of window is given up on at once:
+// the wait-and-resume path in `write_body` needs a handler thread, and is not
+// reached here.
 answer :: proc(c: ^h2.Conn, req: ^h2.Request) {
 	body: [100]u8
 	h2.respond(c, req.stream_id, h2.Response{status = 200, body = body[:]})

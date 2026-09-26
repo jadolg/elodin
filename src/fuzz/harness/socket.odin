@@ -5,8 +5,9 @@ import "core:sys/posix"
 
 /*
 The largest input `feed` takes, so the write below can never fill the socket
-buffer and block with nobody reading the other end. A few times libFuzzer's
-default `-max_len`, and well under what a Unix socket buffers.
+buffer and block with nobody reading the other end. The `-max_len` fuzz.yml
+gives the HTTP targets, so an input can span several of their reads, and well
+under what a Unix socket buffers.
 */
 MAX_FEED :: 64 * 1024
 
