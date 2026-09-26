@@ -242,6 +242,10 @@ Server :: struct {
 	flight, which is what a `Server` built as a literal wants.
 	*/
 	refreshes:    Refresh_Table,
+	// The questions being forwarded right now, so an identical one waits for
+	// the answer instead of asking again. See `inflight.odin`; the zero value is
+	// nothing in flight.
+	inflight:     Inflight_Table,
 	stats:        Stats,
 	// When this process began serving. Not a setting and not a counter: the
 	// metrics endpoint reports uptime from it, and Prometheus's
@@ -1535,6 +1539,47 @@ resolve_query :: proc(
 		)
 	}
 
+	/*
+	One upstream exchange for every identical question in flight at once, which
+	`inflight.odin` argues. Not for a detached refresh, which `refresh.odin`
+	already runs one to a key.
+	*/
+	own_flight: Flight
+	flight: ^Flight
+	if unanswered == nil {
+		joined, leading := flight_join(s, key, &own_flight)
+		if leading {
+			flight = joined
+		} else if joined != nil {
+			patience := flight_patience(route_group(s, q.name, q.type))
+			answer, shared_ede, failed, _ := flight_follow(s, joined, patience, allocator)
+			if answer != nil {
+				shared := Cached_Answer {
+					wire      = answer,
+					key       = key,
+					checked   = generation,
+					ede       = shared_ede,
+					coalesced = true,
+				}
+				return serve_from_cache(s, shared, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
+			}
+			// The upstream gave the leader nothing, and would give this query
+			// the same: the failure branch below, without the wait.
+			if failed {
+				if stale_hit.wire != nil {
+					return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
+				}
+				sync.atomic_add(&s.stats.failed, 1)
+				out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
+				log_query(s, client, proto, q, .Failed, "upstream", started)
+				return out, .Failed, built
+			}
+		}
+	}
+	defer if flight != nil {
+		flight_land(s, flight)
+	}
+
 	// Validation needs the signatures, so the question goes out again with DO
 	// and CD set rather than as the client wrote it.
 	forwarded := query
@@ -2156,6 +2201,9 @@ resolve_query :: proc(
 	}
 	if uerr != .None {
 		logx.debugf("query %s %s from %s failed: %v", dns.type_name(q.type), q.name, client, uerr)
+		if flight != nil {
+			flight_failed(s, flight)
+		}
 		/*
 		The condition `cache.serve_stale` was always documented by: the refresh
 		was attempted, and there is nothing to answer with but what expired.
@@ -2618,6 +2666,11 @@ resolve_query :: proc(
 	if s.cfg.cache.enabled && decoded.full && !unproven_apex_ds {
 		cache.put(s.answers, key, resp, decoded.msg, generation, ede = answer_ede)
 	}
+	// What was just stored, or would have been: `settle_ad_bit` below writes
+	// into the leader's own copy, and each follower settles its own.
+	if flight != nil {
+		flight_share(s, flight, dns.clone_message_bytes(resp, allocator), answer_ede)
+	}
 
 	sync.atomic_add(&s.stats.forwarded, 1)
 	/*
@@ -2959,6 +3012,9 @@ Cached_Answer :: struct {
 	checked: u64,
 	// The extended error the entry is served with; see `cache.Entry.ede`.
 	ede:     u16,
+	// Not from the cache at all but the answer an identical query in flight
+	// just forwarded; see `inflight.odin`. Only the query log tells the two apart.
+	coalesced: bool,
 }
 
 /*
@@ -3309,7 +3365,8 @@ serve_from_cache :: proc(
 	// larger buffer, and left that way: `handle_query` fits it once
 	// `match_client_opt` has settled the OPT record, for the reason the
 	// forwarded path gives.
-	log_query(s, client, proto, q, .Cached, "stale" if hit.stale else "cache", started)
+	detail := "stale" if hit.stale else "coalesced" if hit.coalesced else "cache"
+	log_query(s, client, proto, q, .Cached, detail, started)
 	return wire, .Cached, true
 }
 
