@@ -844,6 +844,15 @@ client_request :: proc(
 	caller's cleanup below, and waiting that little longer is the safe side.
 	*/
 	for len(c.streams) >= c.peer_max_streams && !c.closed {
+		// A limit of zero with nothing open frees no slot: only another
+		// SETTINGS would, and nothing says one is coming. Give the connection
+		// up, as on id exhaustion below, so the next request dials afresh
+		// instead of every query waiting out its timeout here.
+		if len(c.streams) == 0 {
+			c.closed = true
+			sync.cond_broadcast(&c.cond)
+			break
+		}
 		remaining := time.diff(time.now(), deadline)
 		if remaining <= 0 {
 			sync.mutex_unlock(&c.mu)
@@ -907,7 +916,11 @@ client_request :: proc(
 		delete_key(&c.streams, stream_id)
 		client_stream_destroy(c, s)
 		// A slot is free: wake a request waiting on the peer's stream limit.
-		sync.cond_broadcast(&c.cond)
+		// Only a table that was at the limit can have one waiting; otherwise
+		// this would wake every in-flight request once more per response.
+		if len(c.streams) + 1 >= c.peer_max_streams {
+			sync.cond_broadcast(&c.cond)
+		}
 		sync.mutex_unlock(&c.mu)
 		client_unref(c)
 	}

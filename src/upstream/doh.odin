@@ -63,6 +63,8 @@ exchange_doh_h2 :: proc(
 	// A stale shared connection dying between get_h2_conn handing it out and
 	// this call reaching the server is retried once, on a fresh one; see
 	// exchange_pipelined for why that must not count as an upstream failure.
+	// A refused stream is retried once too, on whatever get_h2_conn hands out
+	// next - usually the same, still healthy, connection.
 	for attempt in 0 ..< 2 {
 		remaining := time.tick_diff(time.tick_now(), deadline)
 		if remaining <= 0 {
@@ -121,7 +123,9 @@ exchange_doh_h2 :: proc(
 			/*
 			REFUSED_STREAM is a server at its stream limit saying it never
 			processed the request (RFC 9113 8.7), so it is asked again the same
-			way; the client waits for a slot under that limit this time.
+			way. The client already keeps under the advertised limit, so this
+			mostly catches streams opened before the peer's SETTINGS arrived,
+			or a limit the peer lowered with streams already open.
 			*/
 			if attempt == 0 {
 				continue

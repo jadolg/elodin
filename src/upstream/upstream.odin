@@ -348,7 +348,10 @@ record_failure :: proc(u: ^Upstream, err: Error) {
 	`Peer_Closed` is the peer hanging up without answering, and this query has
 	already been asked again on a connection of its own by the time it gets
 	here - so what reaches this line is a second connection closed as well, on
-	an upstream that may still be answering everything else. Every DNS-over-TCP
+	an upstream that may still be answering everything else. (A DoH stream the
+	peer refused twice lands here too, retried on the same connection rather
+	than a fresh one: a server at its stream limit, which is load, not an
+	outage - see `exchange_doh_h2`.) Every DNS-over-TCP
 	server recycles connections; letting that trip the cooldown takes a working
 	upstream out of service for `COOLDOWN` and sends every query in that window
 	somewhere else, which is a far larger outage than the one query that failed.

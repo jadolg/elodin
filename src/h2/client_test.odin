@@ -2443,3 +2443,90 @@ test_client_waits_for_a_stream_slot_under_the_peers_limit :: proc(t: ^testing.T)
 	}
 	free_all(context.temp_allocator)
 }
+
+/*
+The wait for a slot has two ways out besides a slot freeing: the request's own
+deadline, and the connection dying. Neither may open a stream.
+*/
+@(test)
+test_client_wait_for_a_stream_slot_ends_on_deadline_or_close :: proc(t: ^testing.T) {
+	log := Client_Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 16),
+	}
+	defer delete(log.frames)
+	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write})
+	defer client_unref(c)
+
+	// One slot, held by a stream that is never answered.
+	one := []u8{0, u8(Setting.Max_Concurrent_Streams), 0, 0, 0, 1}
+	testing.expect(t, client_handle_settings(c, Frame_Header{length = len(one), type = .Settings}, one))
+	held := open_test_stream(c, 1, context.allocator)
+	defer {
+		delete_key(&c.streams, u32(1))
+		client_stream_destroy(c, held)
+	}
+
+	req := Client_Request {
+		method    = "GET",
+		scheme    = "https",
+		authority = "mock.invalid",
+		path      = "/dns-query",
+	}
+	start := time.tick_now()
+	_, err := client_request(c, req, 100 * time.Millisecond)
+	testing.expect_value(t, err, Client_Error.Timeout)
+	testing.expect(t, time.tick_since(start) < 2 * time.Second, "the wait outlived the request's deadline")
+
+	r := Limit_Request {
+		c = c,
+	}
+	th := thread.create_and_start_with_poly_data(&r, limit_request_run)
+	time.sleep(100 * time.Millisecond)
+	start = time.tick_now()
+	// What client_serve does on its way out.
+	sync.mutex_lock(&c.mu)
+	c.closed = true
+	sync.cond_broadcast(&c.cond)
+	sync.mutex_unlock(&c.mu)
+	thread.join(th)
+	thread.destroy(th)
+	testing.expect_value(t, r.err, Client_Error.Closed)
+	testing.expect(t, time.tick_since(start) < 2 * time.Second, "a closed connection did not end the wait")
+
+	opened, _ := limit_opened(c, &log)
+	testing.expect_value(t, opened, 0)
+	free_all(context.temp_allocator)
+}
+
+/*
+A limit of zero with nothing open is a connection that will take no request
+until the peer sends another SETTINGS, and nothing says it will. Waiting on it
+costs every query its whole timeout - charged to the upstream as silence - and
+`get_h2_conn` hands the same connection out again after the cooldown. It is
+given up on at once instead, so the next query dials a fresh one.
+*/
+@(test)
+test_client_a_zero_stream_limit_with_nothing_open_closes_the_connection :: proc(t: ^testing.T) {
+	log := Client_Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 16),
+	}
+	defer delete(log.frames)
+	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write})
+	defer client_unref(c)
+
+	zero := []u8{0, u8(Setting.Max_Concurrent_Streams), 0, 0, 0, 0}
+	testing.expect(t, client_handle_settings(c, Frame_Header{length = len(zero), type = .Settings}, zero))
+
+	start := time.tick_now()
+	_, err := client_request(
+		c,
+		Client_Request{method = "GET", scheme = "https", authority = "mock.invalid", path = "/dns-query"},
+		2 * time.Second,
+	)
+	testing.expect_value(t, err, Client_Error.Closed)
+	testing.expect(t, time.tick_since(start) < 500 * time.Millisecond, "the request waited on a connection that takes none")
+	testing.expect(t, client_closed(c), "the connection was left open for the next request to wait on")
+	opened, _ := limit_opened(c, &log)
+	testing.expect_value(t, opened, 0)
+	free_all(context.temp_allocator)
+}
