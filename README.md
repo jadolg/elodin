@@ -404,13 +404,25 @@ upstream:
 
 `race` multiplies upstream traffic by the number of servers.
 
+However many servers and `attempts` there are, a query waits at most about two
+`timeout`s on them (`race`: one) before it gives up with SERVFAIL. A dead first
+server still hands over to the second inside the query, which is asked with its
+full `timeout`; a third is left for the next query, by which time the dead ones
+are on their way to the cooldown below. A reply that did arrive but says
+SERVFAIL or REFUSED sends the query on to the rest of the group, which has a
+`timeout` of its own to spend on top. One exchange is never cut short, so one
+that runs long - a hostname upstream whose `bootstrap` resolvers have gone
+quiet, three seconds a lookup - can carry a query past the figure; such a
+server counts that as a failure and is benched like a dead one.
+
 `bootstrap` matters: elodin resolves upstream hostnames itself rather than
 through the system resolver, since on a machine where elodin *is* the system
 resolver the latter would come straight back to a server that has not started
 listening yet.
 
 An upstream that fails three times in a row is skipped for ten seconds; if every
-upstream is in that state they are all tried anyway. One kind of failure is
+upstream is in that state they are tried anyway, as many as the two-`timeout`
+budget above leaves room for. One kind of failure is
 exempt: a peer that hangs up without answering. Every DNS-over-TCP server
 recycles its connections — of the two public resolvers this was measured
 against, one closes an idle one after ten to fifteen seconds and the other
@@ -896,8 +908,8 @@ hundred, and the clients that arrive while it is running are served the expired
 copy at once rather than queued behind it.
 
 The timer is measured against the client's own resolver, not against the
-upstream. Without it the fallback waits for `upstream.attempts` rounds over
-every server — ten seconds with the defaults and one upstream — by which time a
+upstream. Without it the fallback waits out the upstream budget of two
+`upstream.timeout`s — ten seconds with the defaults — by which time a
 glibc stub has given up at five and systemd-resolved sooner, so the expired
 answer arrived after the client had already failed. Setting it to `0` restores
 that: the client waits the whole upstream budget out. An upstream that *answers*

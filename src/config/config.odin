@@ -245,9 +245,8 @@ Cache_Config :: struct {
 
 	RFC 8767 section 5's client response timer, and the whole of what makes
 	`serve_stale` worth switching on. Without it the fallback is reached only
-	once `upstream.resolve` has given up on every server for every attempt -
-	`attempts` x servers x `timeout`, which is ten seconds with the defaults and
-	one upstream configured, twenty with two. A glibc stub gives up after five
+	once `upstream.resolve` has waited out its budget of two `timeout`s, which
+	is ten seconds with the defaults. A glibc stub gives up after five
 	(`RES_TIMEOUT`) and systemd-resolved sooner, so in the outage the setting
 	exists for - an upstream that is unreachable rather than answering - the
 	expired answer arrived after the client had already failed, and the feature

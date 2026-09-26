@@ -1200,8 +1200,8 @@ A parent group already parked by its own failures is not waited on.
 
 The apex `DS` is asked of the parent first and of the route second, which on a
 network whose path out is down means the route is only reached after the parent
-group has spent `attempts` rounds over every server it has. With the default
-five-second timeout that is ten seconds or more, and a validating stub gives up
+group has spent its budget of two timeouts. With the default five-second
+timeout that is ten seconds, and a validating stub gives up
 in two to five - so the deployment the carve-out was written for would watch the
 zone fail anyway, having waited on an upstream this server already knew was down.
 

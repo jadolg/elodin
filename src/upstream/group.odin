@@ -198,8 +198,9 @@ whose rcode the client can read - and everything else about the sweep is common
 to both, so it is written once here.
 
 Transport failures are deliberately not retried: `resolve` has already exhausted
-them, every server for `attempts` rounds. What it leaves unretried is the reply
-that did arrive and was no use, so that is what this asks again.
+them, every server for `attempts` rounds within its budget of two timeouts.
+What it leaves unretried is the reply that did arrive and was no use, so that
+is what this asks again.
 */
 @(private)
 resolve_insisting :: proc(
@@ -342,12 +343,13 @@ resolve_insisting :: proc(
 
 	Waiting, and not attempts, because the two are not the same thing at all.
 	`exchange` refuses an upstream whose hostname it cannot resolve before it
-	sends anything - no bootstrap servers, or a bootstrap resolver that is down
-	- and that costs nothing and records no failure, so such a member never
-	parks and is in the way of every sweep for as long as it is configured.
-	Counting attempts would stop there every time and never reach the member
-	behind it, which is issue #309's own failure and one that does not heal. A
-	failure that cost no time is simply passed over.
+	sends anything. With no bootstrap servers that costs nothing, and counting
+	attempts would stop there on every sweep until the member parked and never
+	reach the member behind it, which is issue #309's own failure. A failure
+	that cost no time is simply passed over. With a bootstrap resolver that is
+	down it costs seconds, and is charged like any other wait; `exchange`
+	records it as a failure, so the member parks like a dead one rather than
+	spending the budget on every query (issue #327).
 
 	Nor by dividing the timeout between the members, which was tried and taken
 	back out: `exchange` counts a timeout as a failure, so a member cut off by a
@@ -701,22 +703,91 @@ resolve_sequential :: proc(
 ) {
 	last_err := Error.Unhealthy
 
-	for round in 0 ..< g.attempts {
-		// The first pass skips upstreams in cooldown; a later pass takes them
-		// anyway, so a total outage still gets one honest try per server.
-		skip_unhealthy := round == 0
-		for offset in 0 ..< len(g.servers) {
-			u := g.servers[(start + offset) % len(g.servers)]
-			if skip_unhealthy && !healthy(u) {
-				continue
-			}
-			resp, xerr := exchange(u, query, g.timeout, allocator)
-			if xerr == .None {
-				return resp, u, .None
-			}
-			last_err = xerr
-			if unreachable != nil {
-				append(unreachable, u)
+	/*
+	Two timeouts of waiting per query, however many members and attempts there
+	are (issue #327). Without it this is `attempts` rounds over every member at
+	the full timeout each - twenty seconds as elodin ships, with two members
+	black-holing a name - holding one of a bounded set of query workers for four
+	times what a stub waits, so a client repeating such names empties the pool.
+	dnsmasq and Unbound bound a forward near one query timeout.
+
+	Two rather than one so that failover still happens inside the query: a dead
+	first member costs its timeout, and the second is asked with its own. The
+	rules are the sweep's in `resolve_insisting`, for its reasons. Checked after
+	each exchange, so the one that crosses the line finishes and the worst wait
+	is three timeouts rather than two. Every exchange is charged what it took,
+	on the tick clock so an NTP step cannot take the bound away, and a later
+	round still gives a group that fails fast its retry. The
+	member's own timeout is never shortened to fit, since `exchange` counts a
+	timeout against the member and one cut short would park a spare for being
+	asked impatiently.
+
+	The invariant, which the two halves of this depend on each other for: every
+	wait is charged, and every failure that costs waiting counts towards
+	parking the member. Charging alone would let a member that never parks -
+	an upstream whose bootstrap resolver has gone quiet, before `exchange`
+	recorded that failure - spend the budget on every query and keep the live
+	members behind it unasked for good; not charging it would leave the wait
+	unbounded again. With both, it costs what a dead member costs.
+
+	What it costs: a live member behind two dead ones is not reached until they
+	park, three queries later, as with the sweep. `strategy: race` is the
+	answer for a group that must not wait on a dead member at all.
+	*/
+	budget := 2 * g.timeout
+	spent: time.Duration
+	// The round, from 1, in which this query asked each member; 0 for not yet.
+	// Scratch, like `resolve_race`'s candidates: the caller resets the arena.
+	asked := make([]int, len(g.servers), context.temp_allocator)
+
+	for round in 1 ..= g.attempts {
+		/*
+		The first round skips upstreams in cooldown; a later one takes them
+		anyway, so a total outage still gets an honest try - and takes them
+		first, before asking again a member this query has just seen fail. Under
+		the budget that order decides who is asked at all: one member gone quiet
+		and one parked that has come back would otherwise spend the second
+		timeout on the quiet one again and never reach the other.
+
+		By what this query asked, not by `healthy` read again: the quiet member
+		may have parked on this query's own timeout, or the parked one come out
+		of its cooldown meanwhile, and either would put them in the wrong pass.
+		*/
+		for pass in 0 ..< (1 if round == 1 else 2) {
+			for offset in 0 ..< len(g.servers) {
+				i := (start + offset) % len(g.servers)
+				u := g.servers[i]
+				skip: bool
+				if pass == 0 {
+					// Members this query has not asked yet; in the first round
+					// only those out of their cooldown.
+					skip = asked[i] != 0 || round == 1 && !healthy(u)
+				} else {
+					// Then those it asked in an earlier round, asked again.
+					skip = asked[i] == round
+				}
+				if skip {
+					continue
+				}
+				asked[i] = round
+				before := time.tick_now()
+				resp, xerr := exchange(u, query, g.timeout, allocator)
+				if xerr == .None {
+					return resp, u, .None
+				}
+				// Charged whatever it was, a hostname the bootstrap took seconds
+				// to fail on included; `exchange` records that failure like any
+				// other, so such a member parks rather than taking the budget on
+				// every query.
+				spent += time.tick_since(before)
+				last_err = xerr
+				if unreachable != nil {
+					append(unreachable, u)
+				}
+				if spent >= budget {
+					logx.debugf("this query has waited %v on its upstreams, leaving the rest of the group unasked", spent)
+					return nil, nil, last_err
+				}
 			}
 		}
 	}

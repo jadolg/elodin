@@ -520,6 +520,74 @@ blocking: {{ enabled: false }}
 			}
 		}
 	}
+
+	/*
+	--- a query's wait on black-holed upstreams is bounded ---
+
+	Issue #327: failover used to run `attempts` rounds over every member at the
+	full timeout each, here 2 x 3 x 500ms = 3s for one query, holding a worker
+	throughout. It now gives up once two timeouts have been waited, and the
+	third member is never asked.
+	*/
+	{
+		ports: [3]int
+		holes: [3]^Mock
+		started_all := true
+		for i in 0 ..< 3 {
+			ports[i] = next_port(r)
+			holes[i] = mock_make(fmt.tprintf("hole%d", i + 1), ports[i])
+			mock_silent(holes[i])
+			started_all = mock_start(holes[i]) && started_all
+		}
+		defer for m in holes {
+			mock_stop(m)
+		}
+		if !started_all {
+			skip_case(r, "upstream: bounded wait", "cannot start the mocks")
+		} else {
+			udp_port := next_port(r)
+			config := fmt.tprintf(
+				`log: {{ level: warn }}
+listeners:
+  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
+  tcp: {{ enabled: false }}
+upstream:
+  strategy: failover
+  timeout: 500ms
+  attempts: 2
+  servers: ["127.0.0.1:%d", "127.0.0.1:%d", "127.0.0.1:%d"]
+cache: {{ enabled: false }}
+blocking: {{ enabled: false }}
+`,
+				udp_port,
+				ports[0],
+				ports[1],
+				ports[2],
+			)
+			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
+			if ok {
+				start_case(r, "upstream: a query waits out two timeouts on black-holed upstreams, not every one twice")
+				{
+					for m in holes {
+						mock_reset_counts(m)
+					}
+					started := time.tick_now()
+					res := query_udp(udp_port, build_query("hole.example.test.", u16(dns.Type.A)))
+					spent := time.tick_since(started)
+					if check(r, res.ok, "no response") {
+						h := parse_header(r, res.wire)
+						check(r, h.rcode == int(dns.Rcode.Serv_Fail), "rcode %d, want SERVFAIL", h.rcode)
+					}
+					check(r, spent < 1600 * time.Millisecond, "the query took %v, where two timeouts are 1s", spent)
+					check_eq_int(r, mock_total(holes[2]), 0, "queries reaching the third upstream")
+				}
+				end_case(r)
+				stop_server(&srv)
+			} else {
+				skip_case(r, "upstream: bounded wait", "server did not start")
+			}
+		}
+	}
 }
 
 // A TCP-only server cannot be probed over UDP, so readiness is established by
