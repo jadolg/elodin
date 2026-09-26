@@ -225,6 +225,9 @@ test_an_anchored_wildcard_prefix_covers_only_what_is_under_it :: proc(t: ^testin
 	testing.expect_value(t, matches(src, .Adblock, "deep.x.exaapi.com."), Decision.Blocked)
 	testing.expect_value(t, matches(src, .Adblock, "exaapi.com."), Decision.None)
 	testing.expect_value(t, matches(src, .Adblock, "xexaapi.com."), Decision.None)
+	// A domains list hands the line to the adblock parser, and reads it the same.
+	testing.expect_value(t, matches(src, .Domains, "x.exaapi.com."), Decision.Blocked)
+	testing.expect_value(t, matches(src, .Domains, "exaapi.com."), Decision.None)
 	testing.expect_value(t, matches("@@||*.ok.example^\n", .Adblock, "a.ok.example."), Decision.Allowed)
 	// The exception is subtree-only too, so it leaves a block on the apex standing.
 	testing.expect_value(t, matches("||ok.example^\n@@||*.ok.example^\n", .Adblock, "ok.example."), Decision.Blocked)
