@@ -254,14 +254,8 @@ test_normalise_folds_case_and_the_trailing_dot :: proc(t: ^testing.T) {
 
 @(test)
 test_normalise_refuses_what_cannot_be_a_domain :: proc(t: ^testing.T) {
-	/*
-	Whitespace and a slash are the marks of a line the parser has mis-split - a
-	whole hosts line taken as a name, or a URL rule that got this far. Refusing
-	them keeps such a thing from being stored as a rule that then never matches
-	anything, and keeps the counts honest.
-	*/
 	buf: [MAX_NORMALISED]u8
-	for bad in ([]string{"", ".", "ads example", "ads\texample", "example.com/path", "0.0.0.0 ads.example"}) {
+	for bad in ([]string{"", "."}) {
 		_, ok := normalise(bad, buf[:])
 		testing.expectf(t, !ok, "%q should not normalise", bad)
 	}
@@ -290,7 +284,24 @@ test_a_query_name_with_a_slash_is_still_matched :: proc(t: ^testing.T) {
 	src := "||ads.example.com^\n@@||safe.ads.example.com^\n"
 	testing.expect_value(t, matches(src, .Adblock, "a/b.ads.example.com."), Decision.Blocked)
 	testing.expect_value(t, matches(src, .Adblock, "/.safe.ads.example.com."), Decision.Allowed)
-	testing.expect_value(t, matches("ads.example.com/path\n", .Domains, "ads.example.com."), Decision.None)
+}
+
+@(test)
+test_a_rule_that_cannot_be_a_domain_is_refused :: proc(t: ^testing.T) {
+	/*
+	Whitespace and a slash are the marks of a line the parser has mis-split - a
+	whole hosts line taken as a name, or a URL rule that got this far. Refusing
+	them keeps such a thing from being stored as a rule that then never matches
+	anything, and keeps the counts honest.
+	*/
+	s := set_make()
+	defer set_destroy(s)
+	for bad in ([]string{"ads example", "ads\texample", "example.com/path", "0.0.0.0 ads.example"}) {
+		set_add(s, bad, {.Apex})
+		set_cancel(s, bad, {.Apex})
+	}
+	testing.expect_value(t, s.count, 0)
+	testing.expect_value(t, len(s.cancelled), 0)
 }
 
 @(test)

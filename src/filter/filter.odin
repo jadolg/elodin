@@ -105,7 +105,7 @@ of any trailing dot before being stored.
 */
 set_add :: proc(s: ^Set, domain: string, flags: Rule_Flags) {
 	buf: [MAX_NORMALISED]u8
-	key, ok := normalise(domain, buf[:])
+	key, ok := rule_key(domain, buf[:])
 	if !ok || key == "" {
 		return
 	}
@@ -132,7 +132,7 @@ rule written the same way. Keep rule texts per name if that ever matters.
 */
 set_cancel :: proc(s: ^Set, domain: string, flags: Rule_Flags) {
 	buf: [MAX_NORMALISED]u8
-	key, ok := normalise(domain, buf[:])
+	key, ok := rule_key(domain, buf[:])
 	if !ok || key == "" {
 		return
 	}
@@ -248,7 +248,7 @@ Pi-hole and AdGuard treat their allowlists.
 */
 engine_match :: proc(e: ^Engine, name: string) -> Decision {
 	buf: [MAX_NORMALISED]u8
-	key, ok := normalise(name, buf[:], query = true)
+	key, ok := normalise(name, buf[:])
 	if !ok {
 		return .None
 	}
@@ -278,11 +278,18 @@ engine_stats :: proc(e: ^Engine) -> Stats {
 	}
 }
 
-// Lowercase, drop a trailing dot, and reject anything that cannot be a domain.
-// A query name may carry any octet and presentation form leaves `/` unescaped,
-// so only a rule is refused for one.
+// Whitespace or a slash marks a line the parser mis-split. Only a rule is refused
+// for one: a query label may carry any octet, and presentation form leaves `/`
+// unescaped.
 @(private)
-normalise :: proc(name: string, buf: []u8, query := false) -> (out: string, ok: bool) {
+rule_key :: proc(domain: string, buf: []u8) -> (key: string, ok: bool) {
+	key, ok = normalise(domain, buf)
+	return key, ok && !strings.contains_any(key, " \t/")
+}
+
+// Lowercase and drop a trailing dot; refuse an empty name or one past `buf`.
+@(private)
+normalise :: proc(name: string, buf: []u8) -> (out: string, ok: bool) {
 	s := name
 	if len(s) > 0 && s[len(s) - 1] == '.' {
 		s = s[:len(s) - 1]
@@ -294,9 +301,6 @@ normalise :: proc(name: string, buf: []u8, query := false) -> (out: string, ok: 
 		c := s[i]
 		if c >= 'A' && c <= 'Z' {
 			c += 32
-		}
-		if !query && (c == ' ' || c == '\t' || c == '/') {
-			return "", false
 		}
 		buf[i] = c
 	}
