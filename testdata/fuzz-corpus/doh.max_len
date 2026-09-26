@@ -1,0 +1,5 @@
+# This reader takes 4 KB per read, and the harness queues the whole input
+# before the first one. At libFuzzer's default 4 KB cap every input is a single
+# read, so the refill, buffer-growth and header-size paths are never reached.
+# Matches MAX_FEED in src/fuzz/harness/socket.odin.
+65536
