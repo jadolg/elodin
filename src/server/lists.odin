@@ -66,8 +66,9 @@ build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool) -> (block, a
 // doing nothing is worth a word, since one that did block may now be skipped.
 @(private)
 warn_rule_adds_nothing :: proc(rule: string) {
-	if !strings.contains(rule, "badfilter") {
-		logx.warnf("blocking rule %q adds nothing: it carries a modifier DNS cannot honour, is cosmetic, names no domain, a $badfilter cancels it, or its name is not ASCII (write an international name in punycode, xn--...)", rule)
+	// A dnsmasq route has its own warning at startup.
+	if !strings.contains(rule, "badfilter") && !strings.has_prefix(strings.trim_space(rule), "server=/") {
+		logx.warnf("blocking rule %q adds nothing: it carries a modifier DNS cannot honour, is cosmetic, is a regex, wildcard or path rule, names no domain, a $badfilter cancels it, or its name is not ASCII (write an international name in punycode, xn--...)", rule)
 	}
 }
 

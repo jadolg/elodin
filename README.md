@@ -768,8 +768,10 @@ getting the table's NXDOMAIN. Turn the key off in the same edit.
 
 > **Coming from dnsmasq:** `server=/corp.example/10.0.0.1` in `blocking.rules`
 > or `blocking.allow` does not route that zone — it is discarded, which looks
-> exactly like the route not working. `--check` warns about either written by
-> hand. Routing lives under `upstream.zones` and nowhere else.
+> exactly like the route not working. Written without a server,
+> `server=/corp.example/` in `blocking.rules` *blocks* the zone. `--check` warns
+> about either written by hand. Routing lives under `upstream.zones` and nowhere
+> else.
 
 ### Sink lists
 

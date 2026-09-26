@@ -5,8 +5,6 @@ import "core:mem/virtual"
 import "core:strings"
 import "core:sync"
 
-import "elodin:dns"
-
 /*
 Domain matching for sink lists.
 
@@ -100,7 +98,7 @@ set_destroy :: proc(s: ^Set) {
 }
 
 /*
-Add a rule for `domain`, reporting whether it covers anything.
+Add a rule for `domain`, reporting whether the set now covers it.
 
 `domain` is taken as written by the list author; it is lowercased and stripped
 of any trailing dot before being stored. A name no query can spell is refused,
@@ -288,7 +286,7 @@ engine_stats :: proc(e: ^Engine) -> Stats {
 rule_key :: proc(domain: string, buf: []u8) -> (key: string, ok: bool) {
 	key, ok = normalise(domain, buf)
 	for c in transmute([]u8)key {
-		if c == '/' || (c != '.' && c != '\\' && dns.needs_escape(c)) {
+		if c == '/' || c <= 0x20 || c >= 0x7f {
 			return "", false
 		}
 	}

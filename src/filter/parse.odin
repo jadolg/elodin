@@ -236,7 +236,7 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 	// dnsmasq syntax that shows up in mixed lists.
 	if strings.has_prefix(line, "address=/") || strings.has_prefix(line, "server=/") {
 		body := line[strings.index_byte(line, '/') + 1:]
-		slash := strings.index_byte(body, '/')
+		slash := strings.last_index_byte(body, '/')
 		if slash <= 0 {
 			return 0
 		}
@@ -244,7 +244,11 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 		if strings.has_prefix(line, "server=") && body[slash + 1:] != "" {
 			return 0
 		}
-		return int(set_add(block, body[:slash], {.Apex, .Subdomains}))
+		domains := body[:slash]
+		for domain in strings.split_iterator(&domains, "/") {
+			added += int(set_add(block, domain, {.Apex, .Subdomains}))
+		}
+		return
 	}
 
 	target := block
@@ -305,8 +309,9 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 	if line == "" {
 		return 0
 	}
-	// A wildcard cannot be answered at the DNS layer; set_add refuses a regex or path rule.
-	if strings.contains(line, "*") {
+	// Regex and wildcard rules cannot be answered at the DNS layer; set_add
+	// refuses a path rule.
+	if line[0] == '/' || strings.contains(line, "*") {
 		return 0
 	}
 	if badfilter {

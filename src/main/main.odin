@@ -274,10 +274,11 @@ they want `upstream.zones`. Pasted into `blocking.rules` it does nothing:
 `parse_adblock_line` skips a `server=` line that names a server, because only
 `server=/d/` - no server, so dnsmasq answers d locally - means a blackhole in a
 downloaded list. So the zone the operator meant to route goes on being resolved
-by `upstream.servers`, which looks exactly like the route not working.
+by `upstream.servers`, which looks exactly like the route not working. Written
+without a server, it blackholes the zone instead.
 
-That is silent at startup apart from the generic "adds nothing" line, and a
-long way from "the rule you wrote is not a route", so it is worth its own line.
+Neither is what the operator meant, and both are a long way from "the rule you
+wrote is not a route", so it is worth its own line.
 */
 route_shaped_rules :: proc(cfg: ^config.Config, allocator := context.allocator) -> []string {
 	out := make([dynamic]string, 0, 0, allocator)
@@ -374,15 +375,15 @@ One line per rule found, worded for both lists.
 `blocking.allow` (`cfg.blocking.allow_rules`) is scanned as well as
 `blocking.rules`. There `build_filter_sets` prefixes the entry with `@@` before
 parsing it, which puts the string past `parse_adblock_line`'s dnsmasq branch and
-into the generic one, where the `/` still in it is refused by `set_add`. Either
-way the rule adds nothing and the zone goes on being resolved by
-`upstream.servers`. Both lists are named by the key an operator writes rather
+into the generic one, where the `/` still in it is refused by `set_add`. So under
+`blocking.allow` the rule adds nothing, and under `blocking.rules` it adds
+nothing or blackholes the zone, as above. Both lists are named by the key an operator writes rather
 than by the field they land in, so the line can be searched for in the file it
 is about.
 */
 route_rule_warning :: proc(rule: string, allocator := context.allocator) -> string {
 	return fmt.aprintf(
-		"blocking rule %q is a list rule, not a route: it does not send the zone anywhere; to send a zone to its own server use upstream.zones",
+		"blocking rule %q is a list rule, not a route: it does not send the zone anywhere - under blocking.rules it is discarded if it names a server and blackholes the zone if not, and under blocking.allow it is discarded; to send a zone to its own server use upstream.zones",
 		strings.trim_space(rule),
 		allocator = allocator,
 	)

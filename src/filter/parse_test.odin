@@ -334,6 +334,11 @@ test_a_dnsmasq_server_line_with_an_upstream_forwards_rather_than_blocks :: proc(
 	testing.expect_value(t, matches("server=/corp.example/10.0.0.1\n", .Adblock, "corp.example."), Decision.None)
 	testing.expect_value(t, matches("server=/ads.example/\n", .Adblock, "ads.example."), Decision.Blocked)
 	testing.expect_value(t, matches("address=/ads.example/0.0.0.0\n", .Adblock, "ads.example."), Decision.Blocked)
+	// The server is only what follows the last slash; every name before it is covered.
+	testing.expect_value(t, matches("server=/ads.example/tracker.example/\n", .Adblock, "tracker.example."), Decision.Blocked)
+	testing.expect_value(t, matches("server=/ads.example/tracker.example/\n", .Adblock, "ads.example."), Decision.Blocked)
+	testing.expect_value(t, matches("server=/a.example/b.example/10.0.0.1\n", .Adblock, "b.example."), Decision.None)
+	testing.expect_value(t, matches("address=/a.example/b.example/0.0.0.0\n", .Adblock, "b.example."), Decision.Blocked)
 }
 
 @(test)
