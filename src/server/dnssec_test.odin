@@ -561,8 +561,8 @@ test_a_pruned_answer_is_still_cached_and_served :: proc(t: ^testing.T) {
 	/*
 	The other side of that, so the reason it worked is on the record rather than
 	inferred. Take the CNAME out as well and the same message falls into the
-	negative branch, where there is now no SOA to read a lifetime from and no
-	`negative_ttl` behind it - and the cache turns the entry away.
+	negative branch, where there is now no SOA to read a lifetime from - and
+	the cache turns the entry away, as it does any denial without one.
 	*/
 	{
 		answerless := decoded
@@ -617,8 +617,9 @@ A CNAME pointing at a name that does not exist comes back NXDOMAIN with the
 CNAME still in the answer section, and `cache.put` reads the rcode first: the
 negative branch is taken whatever the answer holds. The prune has just removed
 the SOA that branch reads - it belongs to the target's zone, which the validator
-never established - so the lifetime falls back to `cache.negative_ttl`, and to
-nothing at all where an operator has set that to zero.
+never established - and a denial without a SOA is not kept at all (RFC 2308
+section 5), whatever `cache.negative_ttl` says. Every repeat of this question
+then goes upstream.
 
 Pinned as the cost it is, not as a property worth having. It is what this prune
 leaves behind until the denial at a CNAME target is validated properly.
@@ -632,7 +633,7 @@ becomes reachable again the moment #186 lands and the denial at the target's zon
 is genuinely checked.
 */
 @(test)
-test_a_pruned_nxdomain_after_a_cname_falls_back_to_the_configured_negative_ttl :: proc(t: ^testing.T) {
+test_a_pruned_nxdomain_after_a_cname_is_not_cached :: proc(t: ^testing.T) {
 	msg := cname_nodata_response()
 	msg.flags.rcode = u8(dns.Rcode.NX_Domain)
 	wire, _, err := dns.encode_message(msg, context.temp_allocator)
@@ -659,20 +660,14 @@ test_a_pruned_nxdomain_after_a_cname_falls_back_to_the_configured_negative_ttl :
 	key_buf: [cache.KEY_MAX]u8
 	key := cache.make_key(key_buf[:], "www.example.com.", .AAAA, .IN, true, false)
 
-	// With a fallback configured the entry is kept - for that number, not for
-	// the one the zone's SOA asked for.
-	configured := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, negative_ttl = 300})
-	defer cache.destroy(configured)
-	testing.expect(t, cache.put(configured, key, out, decoded), "a pruned NXDOMAIN should still be cacheable")
-
-	// With none, there is nothing left to read a lifetime from and the entry is
-	// turned away. Every repeat of this question then goes upstream.
-	none := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, negative_ttl = 0})
-	defer cache.destroy(none)
+	// Not even with a fallback configured: there is nothing left in it to read
+	// a lifetime from.
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, negative_ttl = 300})
+	defer cache.destroy(answers)
 	testing.expect(
 		t,
-		!cache.put(none, key, out, decoded),
-		"cache.put found a lifetime for a pruned NXDOMAIN, so the comment above is out of date",
+		!cache.put(answers, key, out, decoded),
+		"cache.put kept a pruned NXDOMAIN, so the comment above is out of date",
 	)
 	free_all(context.temp_allocator)
 }

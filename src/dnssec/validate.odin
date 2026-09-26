@@ -1151,14 +1151,13 @@ zone, which nothing here ever established. So out it goes with the rest, SOA
 included, and a downstream resolver falls back to its own idea of how long to
 remember the absence.
 
-Our own cache falls back with it, and only on the NXDOMAIN half. `cache.put`
-picks its lifetime on `rcode == .NX_Domain || len(msg.answer) == 0`, so the
-NODATA one keeps its CNAME in the answer section and is held for the shortest
-TTL still there; the NXDOMAIN one takes the negative branch whatever its answer
-section holds, finds no SOA to read, and is held for `cache.negative_ttl`
-instead - longer than a zone asking for less would like, and not at all where an
-operator has set that to zero. Both are the same missing chain walk, and are
-fixed by the same one.
+Our own cache pays for it, and only on the NXDOMAIN half. `cache.put` picks
+its lifetime on `rcode == .NX_Domain || len(msg.answer) == 0`, so the NODATA one
+keeps its CNAME in the answer section and is held for the shortest TTL still
+there; the NXDOMAIN one takes the negative branch whatever its answer section
+holds, finds no SOA to read, and is not kept at all (RFC 2308 section 5), so
+every repeat goes upstream. Both are the same missing chain walk, and are fixed
+by the same one.
 
 The rcode is the part of this no prune can reach. AD covers the records in those
 two sections, and this makes it honest about them; it says nothing about the
@@ -3094,10 +3093,9 @@ verified_rrset :: proc(
 		if !spend_verification(budget) {
 			/*
 			Said out loud. Running out here drops the RRset, and a dropped SOA
-			takes the denial's negative TTL with it silently - `cache.put` falls
-			back to `cache.negative_ttl`, and with that at zero the answer is not
-			cached at all, so the same question goes upstream every time with
-			nothing anywhere saying why.
+			takes the denial's negative TTL with it silently - `cache.put` does
+			not keep a denial without a SOA, so the same question goes upstream
+			every time with nothing anywhere saying why.
 			*/
 			logx.debugf(
 				"dnssec: %s %s ran out of verifications before a signature held; the set is dropped",

@@ -1031,8 +1031,11 @@ def nsec3_name_error():
         authority += [record, sign([record], zone)]
 
     # The reply under test, and the DS denial the walk reads on its way to it.
+    # The name error carries the apex SOA a real one does, which is where a
+    # cache reads its negative lifetime from (RFC 2308 section 5).
+    soa = [soa_rr(zone.zone)]
     emit("n3_nx", "nx.deep.n3test.", "A",
-         message("nx.deep.n3test.", A, [], authority, rcode=3), rcode=3)
+         message("nx.deep.n3test.", A, [], soa + [sign(soa, zone)] + authority, rcode=3), rcode=3)
     emit("n3_deep_ds", "deep.n3test.", "DS",
          message("deep.n3test.", DS, [], authority, rcode=3), rcode=3)
 

@@ -715,9 +715,9 @@ put :: proc(
 	refuses that outright now, which is where the harm is actually closed; this
 	is the same shape stopped one layer further out, on the paths no validator
 	runs on. Cached, it is far worse than forwarded: the negative branch below
-	reads the lifetime from an SOA, a positive answer never carried one, and the
-	fallback is `negative_ttl` - five minutes by default of every client asking
-	that question being told the name does not exist, from one packet.
+	reads the lifetime from an SOA, and the one the zone's own denials carry
+	would do - up to `negative_ttl`, five minutes by default, of every client
+	asking that question being told the name does not exist, from one packet.
 
 	Refused rather than repaired. Which half of the contradiction the sender
 	meant is not knowable here, and the entry has to be one or the other to be
@@ -763,6 +763,31 @@ put :: proc(
 			case:
 				return false
 			}
+		}
+	}
+
+	/*
+	A denial without a SOA is not an answer to remember either.
+
+	RFC 2308 section 5: "Negative responses without SOA records SHOULD NOT be
+	cached". The SOA is the only thing in a denial that says how long it holds,
+	and without one the lifetime would be `negative_ttl` - five minutes by
+	default of every client told the name is empty because one upstream
+	stumbled once: a rate-limited authoritative, a middlebox, or a server that
+	did not recurse and answered with a referral, whose NS records in the
+	authority section this cache would otherwise serve as a NODATA. dnsmasq
+	and BIND remember nothing without the SOA; neither does this.
+	*/
+	if !bogus && (rcode == .NX_Domain || len(msg.answer) == 0) {
+		has_soa := false
+		for rec in msg.authority {
+			if _, is_soa := rec.data.(dns.Rdata_SOA); is_soa {
+				has_soa = true
+				break
+			}
+		}
+		if !has_soa {
+			return false
 		}
 	}
 
