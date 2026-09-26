@@ -401,8 +401,12 @@ resolve_insisting :: proc(
 		// Charged whatever the exchange did, because what is being bounded is
 		// the client's wait and an upstream can spend the time either way: a
 		// member that recurses for most of the timeout and then says SERVFAIL
-		// has cost this query exactly what a member that said nothing did.
-		spent += time.tick_since(before)
+		// has cost this query exactly what a member that said nothing did. An
+		// unresolved hostname excepted, for the reason `resolve_sequential`
+		// gives.
+		if xerr != .Not_Resolved {
+			spent += time.tick_since(before)
+		}
 		// A failed exchange is left to `exchange`, which says why.
 		if xerr == .None && acceptable(resp) {
 			// Said here rather than above, because what makes a filtering
@@ -715,9 +719,9 @@ resolve_sequential :: proc(
 	rules are the sweep's in `resolve_insisting`, for its reasons. Checked after
 	each exchange, so the one that crosses the line finishes and the worst wait
 	is three timeouts rather than two. Every exchange is charged what it took,
-	on the tick clock so an NTP step cannot take the bound away; a failure that
-	cost nothing (an upstream whose hostname did not resolve) is simply passed
-	over, and a later round still gives a group that fails fast its retry. The
+	on the tick clock so an NTP step cannot take the bound away; an upstream
+	whose hostname did not resolve is passed over uncharged (see below), and a
+	later round still gives a group that fails fast its retry. The
 	member's own timeout is never shortened to fit, since `exchange` counts a
 	timeout against the member and one cut short would park a spare for being
 	asked impatiently.
@@ -730,27 +734,42 @@ resolve_sequential :: proc(
 	spent: time.Duration
 
 	for round in 0 ..< g.attempts {
-		// The first pass skips upstreams in cooldown; a later pass takes them
-		// anyway, so a total outage still gets one honest try per server.
-		skip_unhealthy := round == 0
-		for offset in 0 ..< len(g.servers) {
-			u := g.servers[(start + offset) % len(g.servers)]
-			if skip_unhealthy && !healthy(u) {
-				continue
-			}
-			before := time.tick_now()
-			resp, xerr := exchange(u, query, g.timeout, allocator)
-			if xerr == .None {
-				return resp, u, .None
-			}
-			spent += time.tick_since(before)
-			last_err = xerr
-			if unreachable != nil {
-				append(unreachable, u)
-			}
-			if spent >= budget {
-				logx.debugf("this query has waited %v on its upstreams, leaving the rest of the group unasked", spent)
-				return nil, nil, last_err
+		/*
+		The first round skips upstreams in cooldown; a later one takes them
+		anyway, so a total outage still gets an honest try - and takes them
+		first, before asking again a member this query has just seen fail. Under
+		the budget that order decides who is asked at all: one member gone quiet
+		and one parked that has come back would otherwise spend the second
+		timeout on the quiet one again and never reach the other.
+		*/
+		for pass in 0 ..< (1 if round == 0 else 2) {
+			for offset in 0 ..< len(g.servers) {
+				u := g.servers[(start + offset) % len(g.servers)]
+				parked := !healthy(u)
+				if round == 0 && parked || round > 0 && parked != (pass == 0) {
+					continue
+				}
+				before := time.tick_now()
+				resp, xerr := exchange(u, query, g.timeout, allocator)
+				if xerr == .None {
+					return resp, u, .None
+				}
+				// A hostname that did not resolve is not charged even when the
+				// bootstrap took time to say so: `exchange` records no failure
+				// for it, so the member never parks, and charging it would let a
+				// down bootstrap resolver spend the budget on every query and
+				// keep the live members behind it unasked.
+				if xerr != .Not_Resolved {
+					spent += time.tick_since(before)
+				}
+				last_err = xerr
+				if unreachable != nil {
+					append(unreachable, u)
+				}
+				if spent >= budget {
+					logx.debugf("this query has waited %v on its upstreams, leaving the rest of the group unasked", spent)
+					return nil, nil, last_err
+				}
 			}
 		}
 	}

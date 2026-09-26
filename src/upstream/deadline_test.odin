@@ -1,5 +1,6 @@
 package upstream
 
+import "core:fmt"
 import "core:net"
 import "core:sync"
 import "core:testing"
@@ -29,6 +30,8 @@ Echo_Mock :: struct {
 	stop:   bool,
 	mute:   bool,
 	delay:  time.Duration,
+	// The header rcode of the echo, NOERROR unless set.
+	rcode:  u8,
 	hits:   int,
 }
 
@@ -48,7 +51,7 @@ echo_mock_loop :: proc(m: ^Echo_Mock) {
 			time.sleep(m.delay)
 		}
 		buf[2] |= 0x80
-		buf[3] |= 0x80
+		buf[3] = 0x80 | (buf[3] & 0x70) | (m.rcode & 0xf)
 		_, _ = net.send_udp(m.socket, buf[:n], client)
 	}
 }
@@ -230,5 +233,151 @@ test_members_that_fail_for_free_do_not_spend_the_budget :: proc(t: ^testing.T) {
 	defer delete(resp, context.allocator)
 	testing.expect_value(t, err, Error.None)
 	testing.expect(t, winner == su, "the live member behind the free failures and one dead member was not reached")
+	free_all(context.temp_allocator)
+}
+
+/*
+And a hostname that fails to resolve is passed over even when finding that out
+took time. With a bootstrap resolver that is slow to say nothing - here more
+than the whole budget - `exchange` still records no failure, so the member
+never parks, and charging its wait would spend the budget on it for every query
+and leave the live member behind it unasked for as long as the bootstrap stays
+down.
+*/
+@(test)
+test_a_slow_unresolvable_member_does_not_spend_the_budget :: proc(t: ^testing.T) {
+	// Echoes the bootstrap query back with no answer, after longer than the
+	// budget for the A and AAAA lookups together.
+	boot, live: Echo_Mock
+	boot.delay = DEADLINE_TIMEOUT * 3 / 2
+	bu, bw, bok := start_echo_mock(t, &boot, "bootstrap")
+	if !bok {
+		return
+	}
+	defer stop_echo_mock(&boot, bu, bw)
+	lu, lw, lok := start_echo_mock(t, &live, "live")
+	if !lok {
+		return
+	}
+	defer stop_echo_mock(&live, lu, lw)
+
+	bootstrap := []string{fmt.tprintf("127.0.0.1:%d", bu.endpoint.port)}
+	stuck, uerr := make_upstream(
+		config.Upstream_Spec{name = "unresolvable", kind = .UDP, address = "slow-bootstrap.example.test", port = 53, bootstrap = bootstrap},
+		0,
+		DEADLINE_TIMEOUT,
+		context.allocator,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot build the unresolvable upstream: %v", uerr) {
+		return
+	}
+	defer destroy(stuck)
+
+	servers := []^Upstream{stuck, lu}
+	g := Group {
+		servers   = servers,
+		strategy  = .Failover,
+		timeout   = DEADLINE_TIMEOUT,
+		attempts  = 1,
+		allocator = context.allocator,
+	}
+	resp, winner, err := resolve(&g, deadline_query(), context.allocator)
+	defer delete(resp, context.allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expect(t, winner == lu, "the live member behind a slow unresolvable one was not reached")
+	free_all(context.temp_allocator)
+}
+
+/*
+A later round asks a parked member before asking again one this query has just
+seen fail. With two timeouts to spend, the order is who gets asked: one member
+gone quiet and a parked one that has come back would otherwise spend the second
+timeout on the quiet one again, and the client would get SERVFAIL from a group
+holding a live member.
+*/
+@(test)
+test_a_retry_round_asks_a_parked_member_before_a_failed_one :: proc(t: ^testing.T) {
+	quiet, back: Echo_Mock
+	quiet.mute = true
+	qu, qw, qok := start_echo_mock(t, &quiet, "quiet")
+	if !qok {
+		return
+	}
+	defer stop_echo_mock(&quiet, qu, qw)
+	bu, bw, bok := start_echo_mock(t, &back, "back")
+	if !bok {
+		return
+	}
+	defer stop_echo_mock(&back, bu, bw)
+	// Parked by what it did a moment ago, and answering again now.
+	bu.failures = FAILURE_THRESHOLD
+	bu.down_until = time.time_add(time.now(), COOLDOWN)
+
+	servers := []^Upstream{qu, bu}
+	g := Group {
+		servers   = servers,
+		strategy  = .Failover,
+		timeout   = DEADLINE_TIMEOUT,
+		attempts  = 2,
+		allocator = context.allocator,
+	}
+	resp, winner, err := resolve(&g, deadline_query(), context.allocator)
+	defer delete(resp, context.allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expect(t, winner == bu, "the parked member that came back was not asked")
+	testing.expect_value(t, sync.atomic_load(&quiet.hits), 1)
+	free_all(context.temp_allocator)
+}
+
+/*
+The sweep passes a slow unresolvable member over uncharged as well: its one
+timeout would otherwise go on the bootstrap's silence on every query, and the
+member behind that could answer is never reached.
+*/
+@(test)
+test_the_sweep_does_not_charge_a_slow_unresolvable_member :: proc(t: ^testing.T) {
+	boot, refusing, live: Echo_Mock
+	boot.delay = DEADLINE_TIMEOUT * 3 / 2
+	refusing.rcode = u8(dns.Rcode.Refused)
+	bu, bw, bok := start_echo_mock(t, &boot, "bootstrap")
+	if !bok {
+		return
+	}
+	defer stop_echo_mock(&boot, bu, bw)
+	ru, rw, rok := start_echo_mock(t, &refusing, "refusing")
+	if !rok {
+		return
+	}
+	defer stop_echo_mock(&refusing, ru, rw)
+	lu, lw, lok := start_echo_mock(t, &live, "live")
+	if !lok {
+		return
+	}
+	defer stop_echo_mock(&live, lu, lw)
+
+	bootstrap := []string{fmt.tprintf("127.0.0.1:%d", bu.endpoint.port)}
+	stuck, uerr := make_upstream(
+		config.Upstream_Spec{name = "unresolvable", kind = .UDP, address = "slow-bootstrap.example.test", port = 53, bootstrap = bootstrap},
+		0,
+		DEADLINE_TIMEOUT,
+		context.allocator,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot build the unresolvable upstream: %v", uerr) {
+		return
+	}
+	defer destroy(stuck)
+
+	servers := []^Upstream{ru, stuck, lu}
+	g := Group {
+		servers   = servers,
+		strategy  = .Failover,
+		timeout   = DEADLINE_TIMEOUT,
+		attempts  = 1,
+		allocator = context.allocator,
+	}
+	resp, winner, err := resolve_readable(&g, deadline_query(), context.allocator)
+	defer delete(resp, context.allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expect(t, winner == lu, "the sweep did not reach the live member behind a slow unresolvable one")
 	free_all(context.temp_allocator)
 }

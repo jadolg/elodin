@@ -408,7 +408,9 @@ However many servers and `attempts` there are, a query waits at most about two
 `timeout`s on them (`race`: one) before it gives up with SERVFAIL. A dead first
 server still hands over to the second inside the query, which is asked with its
 full `timeout`; a third is left for the next query, by which time the dead ones
-are on their way to the cooldown below.
+are on their way to the cooldown below. A reply that did arrive but says
+SERVFAIL or REFUSED sends the query on to the rest of the group, which has a
+`timeout` of its own to spend on top.
 
 `bootstrap` matters: elodin resolves upstream hostnames itself rather than
 through the system resolver, since on a machine where elodin *is* the system
