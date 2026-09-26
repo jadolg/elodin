@@ -2263,7 +2263,10 @@ and those names go there instead: a route over a name wins over this key, and so
 does a [trust anchor](#dnssec) you configured over the zone while `dnssec.enabled`
 is on. The same goes for a VPN that numbers its peers from CGNAT space and
 answers their PTRs — Tailscale's MagicDNS at `100.100.100.100`, say: route
-`100.in-addr.arpa` to it, or its peers' reverse names are NXDOMAIN here.
+the CGNAT zones it numbers from (`64.100.in-addr.arpa` through
+`127.100.in-addr.arpa`) to it, or its peers' reverse names are NXDOMAIN here.
+Not `100.in-addr.arpa` as a whole: the rest of it is public, signed address
+space, and a route takes every name under it out of DNSSEC validation.
 `private_reverse: false` sends them all back to `upstream.servers` as
 before. These answers log as `outcome=local detail=private-reverse` and are left
 out of the `special_use` counter below, which every LAN PTR would otherwise

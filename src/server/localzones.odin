@@ -41,7 +41,12 @@ running network resolves, and a PTR for one names no network's own addressing.
 `special_use.private_reverse`, on by default, also answers these reverse zones
 here as RFC 6303 section 3 empty zones rather than forwarding them (issue #321):
 see `special_use_zone`. `home.arpa.` is the one entry that key leaves alone - it
-has `special_use.home_arpa` of its own, below.
+has `special_use.home_arpa` of its own, below. `127.`, `0.` and the fe80::/10
+zones are not delegated in the public tree, whose signed parents deny them, so
+a client validating for itself sees this server's empty zone contradict that
+denial. RFC 6303 lists them anyway and BIND and Unbound serve them the same
+way; a fe80:: PTR can carry an interface's hardware address, which is the
+stronger reason not to forward it.
 
 `home.arpa.` is the one forward name in the list, and what goes wrong there is
 not what goes wrong above it. `arpa.` does delegate it: RFC 8375 section 7 had
@@ -469,12 +474,11 @@ special_use_zone :: proc(
 			// forwarding it would name the routed subnet to `upstream.servers`.
 			// Judged on the parent, so an anchor at the route's own apex does not
 			// send it out; one over the parent does.
-			parent := dns.name_parent(name)
 			if type == .DS &&
 			   !at_apex &&
 			   is_route_apex(s, name) &&
-			   !is_zone_routed(s, parent) &&
-			   !covered_by_local_anchor(s, parent) {
+			   !is_zone_routed(s, dns.name_parent(name)) &&
+			   !covered_by_local_anchor(s, dns.name_parent(name)) {
 				return z, .Empty_Nonterminal
 			}
 			if !is_zone_routed(s, name) && !covered_by_local_anchor(s, name) {

@@ -211,6 +211,7 @@ run_special_use_answered_cases :: proc(r: ^Runner) {
 	{
 		check_eq_int(r, mock_total(mock) - before, 0, "queries the upstream was sent")
 		check(r, log_contains(&srv, "outcome=local detail=special-use"), "no special-use line in the query log")
+		check(r, log_contains(&srv, "outcome=local detail=private-reverse"), "no private-reverse line in the query log")
 	}
 	end_case(r)
 }
