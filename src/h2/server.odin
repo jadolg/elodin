@@ -850,8 +850,9 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 			/*
 			RFC 9110 5.3: a singleton field, and a recipient may treat a repeat
 			as an error. The `:path` argument above applies: `take` keeps the
-			first, a hop in front may have judged the second, and the media type
-			is what decides whether the body is taken for a DNS message.
+			first non-empty value, a hop in front may have judged another, and
+			the media type is what decides whether the body is taken for a DNS
+			message. Counted here, so an empty first one is a repeat too.
 			*/
 			if have_content_type {
 				return true

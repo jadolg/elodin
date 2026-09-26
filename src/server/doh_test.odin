@@ -1053,7 +1053,7 @@ test_content_length_is_strict_decimal :: proc(t: ^testing.T) {
 		5.1). Skipped rather than refused, each leaves the body unread and the
 		next request starting in the middle of it.
 		*/
-		{"Content-Length: 4 \r\n", "abcd", false, "a non-breaking space after the digits"},
+		{"Content-Length: 4\u00a0\r\n", "abcd", false, "a non-breaking space after the digits"},
 		{"X-Fold: one\r\n Content-Length: 4\r\n", "abcd", false, "a folded continuation line"},
 		{"Content-Length : 4\r\n", "abcd", false, "space before the colon"},
 		{"Content-Length\t: 4\r\n", "abcd", false, "a tab before the colon"},
@@ -1929,7 +1929,7 @@ test_doh_content_type_is_the_media_type_folded :: proc(t: ^testing.T) {
 		{"application/dns-message-bogus", false},
 		{"application/dns-messageZZZZ", false},
 		{"application/dns-message2", false},
-		{"application/dns-mesſage", false},
+		{"application/dns-mes\u017fage", false},
 		{"application/dns", false},
 		{"application/dns-messag", false},
 		{"text/plain", false},
@@ -1953,15 +1953,22 @@ test_doh_content_type_is_the_media_type_folded :: proc(t: ^testing.T) {
 
 // A repeated Content-Type is a 400 on HTTP/1.1: the reader kept the last of the
 // two, and a hop in front may have judged the first.
+// An empty first one counts too: the counter is not the stored value.
 @(test)
 test_doh_repeated_content_type_is_refused :: proc(t: ^testing.T) {
-	raw := "POST /dns-query HTTP/1.1\r\nHost: dns.example\r\nContent-Type: text/plain\r\nContent-Type: application/dns-message\r\nContent-Length: 4\r\n\r\nabcd"
-	_, status, parsed, ok := read_request_over_loopback(t, raw, "a repeated Content-Type")
-	if !ok {
-		return
+	for first in ([]string{"text/plain", ""}) {
+		raw := fmt.tprintf(
+			"POST /dns-query HTTP/1.1\r\nHost: dns.example\r\nContent-Type: %s\r\nContent-Type: application/dns-message\r\nContent-Length: 4\r\n\r\nabcd",
+			first,
+		)
+		_, status, parsed, ok := read_request_over_loopback(t, raw, "a repeated Content-Type")
+		if !ok {
+			return
+		}
+		testing.expectf(t, !parsed, "a repeated Content-Type after %q was accepted", first)
+		testing.expect_value(t, status, 400)
+		free_all(context.temp_allocator)
 	}
-	testing.expect(t, !parsed, "a repeated Content-Type was accepted")
-	testing.expect_value(t, status, 400)
 }
 
 /*
@@ -1980,8 +1987,8 @@ test_doh_content_type_keeps_what_is_not_ows :: proc(t: ^testing.T) {
 	CASES := []Case {
 		{"application/dns-message", true},
 		{"\tApplication/DNS-Message \t", true},
-		{"application/dns-message ", false},
-		{" application/dns-message", false},
+		{"application/dns-message\u00a0", false},
+		{"\u00a0application/dns-message", false},
 		{"application/dns-message\x0b", false},
 		{"application/dns-message\x0c", false},
 	}

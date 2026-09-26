@@ -2128,6 +2128,17 @@ test_malformed_requests_are_reset :: proc(t: ^testing.T) {
 				{"content-type", "application/dns-message"},
 			},
 		},
+		{
+			"repeated content-type, the first empty",
+			{
+				{":method", "POST"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+				{"content-type", ""},
+				{"content-type", "text/plain"},
+			},
+		},
 		// 8.2.1: field names are lowercase, and are tokens.
 		{
 			"uppercase field name",
