@@ -1556,26 +1556,21 @@ resolve_query :: proc(
 	*/
 	own_flight: Flight
 	flight: ^Flight
-	if unanswered == nil && coalescable(msg) {
+	if unanswered == nil {
 		ceiling := follower_ceiling(s)
-		joined, leading := flight_join(s, key, &own_flight, shared_worker, ceiling)
+		joined, leading, counted := flight_join(s, key, &own_flight, shared_worker, ceiling)
 		if leading {
 			flight = joined
+			flight.canonical = canonical(msg, query)
 		} else if joined != nil {
-			answer, shared_ede, failed, landed := flight_follow(
-				s,
-				joined,
-				flight_patience(route_group(s, q.name, q.type)),
-				allocator,
-				shared_worker,
-				ceiling,
-			)
-			if answer != nil {
+			patience := flight_patience(route_group(s, q.name, q.type))
+			landed_with, landed := flight_follow(s, joined, patience, allocator, counted)
+			if landed_with.answer != nil {
 				shared := Cached_Answer {
-					wire      = answer,
+					wire      = landed_with.answer,
 					key       = key,
 					checked   = generation,
-					ede       = shared_ede,
+					ede       = landed_with.ede,
 					coalesced = true,
 				}
 				return serve_from_cache(
@@ -1594,9 +1589,13 @@ resolve_query :: proc(
 					ede,
 				)
 			}
-			// The upstream gave the leader nothing after every attempt, and would
-			// give this query the same: the failure branch below, without the wait.
-			if failed {
+			/*
+			The upstream gave the leader nothing after every attempt, and would
+			give this query the same: the failure branch below, without the wait.
+			Only where the leader's message was this one's, or on a second pass,
+			where it is two failures in a row.
+			*/
+			if landed_with.failed && (landed_with.canonical || rejoined) {
 				return upstream_failed(
 					s,
 					stale_hit,
@@ -1611,9 +1610,12 @@ resolve_query :: proc(
 					spent,
 					allocator,
 					ede,
+					"upstream-coalesced",
 				)
 			}
-			if landed && !rejoined {
+			// Starting over can change something: the leader's message was its
+			// own, or it stored a verdict the cache now answers with.
+			if landed && !rejoined && (!landed_with.canonical || landed_with.stored) {
 				return resolve_query(
 					s,
 					query,
@@ -2258,7 +2260,7 @@ resolve_query :: proc(
 	if uerr != .None {
 		logx.debugf("query %s %s from %s failed: %v", dns.type_name(q.type), q.name, client, uerr)
 		if flight != nil {
-			flight_failed(s, flight)
+			flight.failed = true
 		}
 		/*
 		The condition `cache.serve_stale` was always documented by: the refresh
@@ -2391,7 +2393,10 @@ resolve_query :: proc(
 			from := answering_upstream(winner)
 			report_bogus(q, client, result, from, shed)
 			out, built := dnssec_failure_response(msg, result, allocator, limit)
-			remember_bogus_verdict(s, verdict_key, msg, result, unproven_apex_ds, spent, allocator)
+			if remember_bogus_verdict(s, verdict_key, msg, result, unproven_apex_ds, spent, allocator) &&
+			   flight != nil {
+				flight.stored = true
+			}
 			log_query(s, client, proto, q, .Failed, fmt.tprintf("dnssec:%s", from), started)
 			return out, .Failed, built
 		case .Secure:
@@ -2694,6 +2699,9 @@ resolve_query :: proc(
 			   !unproven_apex_ds &&
 			   cloak_verdict_worth_keeping(verdict) {
 				cache.put(s.answers, key, resp, decoded.msg, generation, u8(verdict), ede = answer_ede)
+				if flight != nil {
+					flight.stored = true
+				}
 			}
 			return out, cloak_outcome(verdict), true
 		}
@@ -2734,14 +2742,15 @@ resolve_query :: proc(
 	What was just stored, or would have been, handed over and landed before
 	`settle_ad_bit` below writes into it - each follower settles its own copy.
 
-	Not a FORMERR. That rcode is the upstream reading this message, which carries
-	more than the key does - records of the client's own in a section a query
-	leaves empty, which an upstream may refuse as malformed - so a follower
-	forwards its own question rather than take a refusal of one it did not send.
+	Not a FORMERR, unless the leader was canonical. That rcode is the upstream
+	reading this message, and a message that is not `canonical` carries more than
+	the key does - an EDNS option of the client's own, records beside the
+	question - so a follower starts over rather than take a refusal of bytes it
+	did not send.
 	*/
 	if flight != nil {
-		if dns.peek_rcode(resp) != .Form_Err {
-			flight_share(s, flight, resp, answer_ede)
+		if flight.canonical || dns.peek_rcode(resp) != .Form_Err {
+			flight.answer, flight.ede = resp, answer_ede
 		}
 		flight_land(s, flight)
 		flight = nil
@@ -2778,6 +2787,8 @@ upstream_failed :: proc(
 	spent: ^int,
 	allocator: mem.Allocator,
 	ede: ^u16,
+	// The query-log detail, which says whether this query asked at all.
+	detail := "upstream",
 ) -> (
 	[]u8,
 	Outcome,
@@ -2788,7 +2799,7 @@ upstream_failed :: proc(
 	}
 	sync.atomic_add(&s.stats.failed, 1)
 	out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
-	log_query(s, client, proto, q, .Failed, "upstream", started)
+	log_query(s, client, proto, q, .Failed, detail, started)
 	return out, .Failed, built
 }
 
@@ -3211,6 +3222,8 @@ remember_bogus_verdict :: proc(
 	unproven_apex_ds: bool,
 	spent: ^int,
 	allocator: mem.Allocator,
+) -> (
+	stored: bool,
 ) {
 	if !s.cfg.cache.enabled || result.status != .Bogus || unproven_apex_ds {
 		return
@@ -3234,6 +3247,7 @@ remember_bogus_verdict :: proc(
 		return
 	}
 	cache.put(s.answers, verdict_key, wire, refusal, bogus = true)
+	return true
 }
 
 /*

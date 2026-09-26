@@ -122,6 +122,9 @@ coalesce_reply :: proc(hi, lo: u8, ttl: u32, rcode: dns.Rcode) -> []u8 {
 Client :: struct {
 	srv:   ^Server,
 	id:    u16,
+	// Ask with an OPT record at `UPSTREAM_UDP_SIZE`, which is what makes the
+	// message `canonical`; without one it is an old stub's.
+	edns:  bool,
 	rcode: dns.Rcode,
 	addr:  [4]u8,
 	ok:    bool,
@@ -137,6 +140,11 @@ ask :: proc(c: ^Client) {
 		question = question,
 	}
 	msg.flags.rd = true
+	if c.edns {
+		additional := make([]dns.Record, 1, context.temp_allocator)
+		additional[0] = dns.make_opt(UPSTREAM_UDP_SIZE, false)
+		msg.additional = additional
+	}
 	query, _, _ := dns.encode_message(msg, context.temp_allocator)
 	out, _, served := handle_query(c.srv, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
 	if !served {
@@ -170,6 +178,7 @@ run_burst :: proc(
 	first := dns.Rcode.No_Error,
 	drop_first := false,
 	attempts := 1,
+	edns := true,
 	// The server's counters once the burst is over.
 	stats: ^Stats = nil,
 ) -> int {
@@ -225,8 +234,9 @@ run_burst :: proc(
 	threads: [CLIENTS]^thread.Thread
 	for i in 0 ..< CLIENTS {
 		clients[i] = Client {
-			srv = &srv,
-			id  = u16(0x1000 + i),
+			srv  = &srv,
+			id   = u16(0x1000 + i),
+			edns = edns,
 		}
 		threads[i] = thread.create_and_start_with_poly_data(&clients[i], ask)
 	}
@@ -304,24 +314,53 @@ test_a_lost_datagram_is_retried_for_the_followers_too :: proc(t: ^testing.T) {
 }
 
 /*
-But not a FORMERR. That rcode is the upstream reading the leader's message, and
-the message carries more than the key does - a client's own records in a section
-a query leaves empty, which some upstreams answer FORMERR - so a follower that
-asked well formed is not handed the refusal of a query it did not send.
+A leader whose message was its own - an old stub's, with no OPT record - may have
+failed over those bytes rather than the question, so its followers start over,
+and one of them asks again for the rest.
 */
 @(test)
-test_a_formerr_to_the_leader_is_not_shared :: proc(t: ^testing.T) {
+test_followers_of_a_non_canonical_leader_start_over :: proc(t: ^testing.T) {
 	clients: [CLIENTS]Client
-	run_burst(t, &clients, first = .Form_Err)
-	refused, answered := 0, 0
+	queries := run_burst(t, &clients, drop_first = true, timeout = 1 * time.Second, edns = false)
+	testing.expectf(t, queries == 2, "the upstream saw %d queries for %d identical clients, want 2", queries, CLIENTS)
+	failed, answered := 0, 0
 	for c in clients {
-		if c.ok && c.rcode == .Form_Err {
-			refused += 1
+		if c.ok && c.rcode == .Serv_Fail {
+			failed += 1
 		} else if c.ok && c.rcode == .No_Error && c.addr == {192, 0, 2, 7} {
 			answered += 1
 		}
 	}
-	testing.expectf(t, refused == 1 && answered == CLIENTS - 1, "%d clients got the leader's FORMERR and %d an answer, want 1 and %d", refused, answered, CLIENTS - 1)
+	testing.expectf(t, failed == 1 && answered == CLIENTS - 1, "%d clients failed and %d were answered, want 1 and %d", failed, answered, CLIENTS - 1)
+}
+
+/*
+And a FORMERR is shared or not on the same terms. From a leader that asked as a
+follower would have, it is the upstream's word on the question; from one that
+did not, it may be a refusal of bytes no follower sent.
+*/
+@(test)
+test_a_formerr_is_shared_only_from_a_canonical_leader :: proc(t: ^testing.T) {
+	count :: proc(clients: [CLIENTS]Client) -> (refused, answered: int) {
+		for c in clients {
+			if c.ok && c.rcode == .Form_Err {
+				refused += 1
+			} else if c.ok && c.rcode == .No_Error && c.addr == {192, 0, 2, 7} {
+				answered += 1
+			}
+		}
+		return
+	}
+
+	own: [CLIENTS]Client
+	run_burst(t, &own, first = .Form_Err, edns = false)
+	refused, answered := count(own)
+	testing.expectf(t, refused == 1 && answered == CLIENTS - 1, "without EDNS, %d clients got the leader's FORMERR and %d an answer, want 1 and %d", refused, answered, CLIENTS - 1)
+
+	shared: [CLIENTS]Client
+	queries := run_burst(t, &shared, first = .Form_Err)
+	refused, answered = count(shared)
+	testing.expectf(t, queries == 1 && refused == CLIENTS, "with EDNS, %d queries and %d FORMERRs, want 1 and %d", queries, refused, CLIENTS)
 }
 
 // A follower whose leader never lands stops waiting at its patience, and the
@@ -330,16 +369,16 @@ test_a_formerr_to_the_leader_is_not_shared :: proc(t: ^testing.T) {
 test_a_follower_stops_waiting_at_its_patience :: proc(t: ^testing.T) {
 	s: Server
 	lead: Flight
-	f, leading := flight_join(&s, "k", &lead)
+	f, leading, _ := flight_join(&s, "k", &lead)
 	testing.expect(t, f == &lead && leading, "the first query did not lead")
 	other: Flight
-	joined, second_leads := flight_join(&s, "k", &other)
+	joined, second_leads, _ := flight_join(&s, "k", &other)
 	testing.expect(t, joined == &lead && !second_leads, "the second query did not follow")
 
 	start := time.tick_now()
-	answer, _, failed, landed := flight_follow(&s, joined, 50 * time.Millisecond, context.temp_allocator)
+	result, landed := flight_follow(&s, joined, 50 * time.Millisecond, context.temp_allocator)
 	waited := time.tick_since(start)
-	testing.expect(t, !landed && !failed && answer == nil, "a flight that never landed was read as landed")
+	testing.expect(t, !landed && !result.failed && result.answer == nil, "a flight that never landed was read as landed")
 	testing.expectf(t, waited >= 50 * time.Millisecond && waited < 2 * time.Second, "waited %v for 50ms of patience", waited)
 	testing.expect_value(t, lead.waiters, 0)
 	flight_land(&s, &lead)
@@ -354,11 +393,11 @@ test_a_full_flight_table_forwards_without_joining :: proc(t: ^testing.T) {
 	keys: [INFLIGHT_SLOTS]string
 	for i in 0 ..< INFLIGHT_SLOTS {
 		keys[i] = fmt.tprintf("k%d", i)
-		_, leading := flight_join(&s, keys[i], &flights[i])
+		_, leading, _ := flight_join(&s, keys[i], &flights[i])
 		testing.expect(t, leading, "a free slot was not taken")
 	}
 	extra: Flight
-	f, leading := flight_join(&s, "one more", &extra)
+	f, leading, _ := flight_join(&s, "one more", &extra)
 	testing.expect(t, f == nil && !leading, "a full table handed out a flight")
 	for i in 0 ..< INFLIGHT_SLOTS {
 		flight_land(&s, &flights[i])
@@ -366,20 +405,45 @@ test_a_full_flight_table_forwards_without_joining :: proc(t: ^testing.T) {
 }
 
 /*
-A client's own records beside the question make the message its own: an upstream
-that refuses or drops it has said something about those bytes, not about the
-question every identical query waiting on it asked.
+Canonical is what the forwarding path leaves of the client's own: nothing beside
+the question, an OPT record at the full payload size, and no option but the three
+that are stripped.
 */
 @(test)
-test_only_a_plain_question_is_coalesced :: proc(t: ^testing.T) {
+test_canonical_is_what_any_identical_query_would_send :: proc(t: ^testing.T) {
+	check :: proc(t: ^testing.T, msg: dns.Message, want: bool, what: string) {
+		wire, _, err := dns.encode_message(msg, context.temp_allocator)
+		if !testing.expectf(t, err == .None, "%s: cannot encode: %v", what, err) {
+			return
+		}
+		decoded, derr := dns.decode_message(wire, context.temp_allocator)
+		if !testing.expectf(t, derr == .None, "%s: cannot decode: %v", what, derr) {
+			return
+		}
+		testing.expectf(t, canonical(decoded, wire) == want, "%s: canonical is %v, want %v", what, !want, want)
+	}
+	with_opt :: proc(size: u16, codes: ..dns.EDNS_Option_Code) -> []dns.Record {
+		opt := dns.make_opt(size, false)
+		options := make([]dns.EDNS_Option, len(codes), context.temp_allocator)
+		for c, i in codes {
+			options[i] = dns.EDNS_Option{code = u16(c), data = []u8{1, 2, 3, 4, 5, 6, 7, 8}}
+		}
+		opt.data = dns.Rdata_OPT{options = options}
+		out := make([]dns.Record, 1, context.temp_allocator)
+		out[0] = opt
+		return out
+	}
 	question := []dns.Question{{name = QNAME, type = .A, class = .IN}}
 	record := []dns.Record{{name = QNAME, type = .A, class = .IN, data = dns.Rdata_A{addr = {192, 0, 2, 1}}}}
-	opt := []dns.Record{dns.make_opt(1232, false)}
-	testing.expect(t, coalescable(dns.Message{question = question}), "a bare question was not coalescable")
-	testing.expect(t, coalescable(dns.Message{question = question, additional = opt}), "a question with OPT was not coalescable")
-	testing.expect(t, !coalescable(dns.Message{question = question, answer = record}), "an answer record was coalesced")
-	testing.expect(t, !coalescable(dns.Message{question = question, authority = record}), "an authority record was coalesced")
-	testing.expect(t, !coalescable(dns.Message{question = question, additional = record}), "a non-OPT additional was coalesced")
+
+	check(t, dns.Message{question = question, additional = with_opt(UPSTREAM_UDP_SIZE)}, true, "OPT at the clamp")
+	check(t, dns.Message{question = question, additional = with_opt(4096)}, true, "OPT above the clamp")
+	check(t, dns.Message{question = question, additional = with_opt(UPSTREAM_UDP_SIZE, .Cookie, .Client_Subnet)}, true, "stripped options")
+	check(t, dns.Message{question = question}, false, "no OPT")
+	check(t, dns.Message{question = question, additional = with_opt(512)}, false, "OPT at 512")
+	check(t, dns.Message{question = question, additional = with_opt(UPSTREAM_UDP_SIZE, .NSID)}, false, "an option that is forwarded")
+	check(t, dns.Message{question = question, answer = record, additional = with_opt(UPSTREAM_UDP_SIZE)}, false, "an answer record")
+	check(t, dns.Message{question = question, authority = record, additional = with_opt(UPSTREAM_UDP_SIZE)}, false, "an authority record")
 }
 
 // Followers on the shared pool stop at the ceiling, and the count comes back
@@ -388,26 +452,26 @@ test_only_a_plain_question_is_coalesced :: proc(t: ^testing.T) {
 test_followers_on_the_shared_pool_stop_at_the_ceiling :: proc(t: ^testing.T) {
 	s: Server
 	lead: Flight
-	_, leading := flight_join(&s, "k", &lead, shared = true, ceiling = 2)
+	_, leading, _ := flight_join(&s, "k", &lead, shared = true, ceiling = 2)
 	testing.expect(t, leading, "the first query did not lead")
 	a, b, c: Flight
-	fa, _ := flight_join(&s, "k", &a, shared = true, ceiling = 2)
-	fb, _ := flight_join(&s, "k", &b, shared = true, ceiling = 2)
-	fc, _ := flight_join(&s, "k", &c, shared = true, ceiling = 2)
+	fa, _, ca := flight_join(&s, "k", &a, shared = true, ceiling = 2)
+	fb, _, cb := flight_join(&s, "k", &b, shared = true, ceiling = 2)
+	fc, _, _ := flight_join(&s, "k", &c, shared = true, ceiling = 2)
 	testing.expect(t, fa == &lead && fb == &lead, "a follower under the ceiling was turned away")
 	testing.expect(t, fc == nil, "a follower past the ceiling was let in")
 	// A connection's own thread is not the pool's to protect.
 	d: Flight
-	fd, _ := flight_join(&s, "k", &d, shared = false, ceiling = 2)
-	testing.expect(t, fd == &lead, "a follower off the shared pool was turned away")
+	fd, _, cd := flight_join(&s, "k", &d, shared = false, ceiling = 2)
+	testing.expect(t, fd == &lead && !cd, "a follower off the shared pool was turned away or counted")
 
-	_, _, _, _ = flight_follow(&s, fa, 0, context.temp_allocator, true, 2)
+	_, _ = flight_follow(&s, fa, 0, context.temp_allocator, ca)
 	testing.expect_value(t, s.inflight.followers, 1)
-	fe, _ := flight_join(&s, "k", &c, shared = true, ceiling = 2)
+	fe, _, ce := flight_join(&s, "k", &c, shared = true, ceiling = 2)
 	testing.expect(t, fe == &lead, "the slot a follower left was not free again")
-	_, _, _, _ = flight_follow(&s, fb, 0, context.temp_allocator, true, 2)
-	_, _, _, _ = flight_follow(&s, fe, 0, context.temp_allocator, true, 2)
-	_, _, _, _ = flight_follow(&s, fd, 0, context.temp_allocator)
+	_, _ = flight_follow(&s, fb, 0, context.temp_allocator, cb)
+	_, _ = flight_follow(&s, fe, 0, context.temp_allocator, ce)
+	_, _ = flight_follow(&s, fd, 0, context.temp_allocator, cd)
 	testing.expect_value(t, s.inflight.followers, 0)
 	flight_land(&s, &lead)
 }

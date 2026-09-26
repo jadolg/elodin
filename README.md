@@ -891,8 +891,10 @@ to the upstream once. The first query forwards and the rest wait for it. They ar
 then served its answer as though they had found it cached, even an answer the
 cache will not keep, such as one with a zero TTL. If the upstream gave the first
 query nothing after every attempt on every server, they get the expired copy or
-SERVFAIL, just as it did. "Identical" means the same cache key, and only for a
-query that carries nothing beside its question and OPT record. A query that
+SERVFAIL, just as it did. That applies only when the first query asked exactly as
+any of them would have: an OPT record at the full payload size, and nothing
+beside the question that elodin forwards as the client wrote it. Otherwise one
+of them asks again for the rest. "Identical" means the same cache key. A query that
 arrives when a quarter of the query pool is already waiting like this forwards
 on its own. These answers are counted in `elodin_answers_coalesced_total`.
 
