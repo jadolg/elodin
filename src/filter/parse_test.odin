@@ -243,11 +243,11 @@ test_normalise_folds_case_and_the_trailing_dot :: proc(t: ^testing.T) {
 	// A query arrives in wire-presentation form with the root dot on the end;
 	// a list is written without it. Both have to land on the same key.
 	buf: [MAX_NORMALISED]u8
-	out, ok := normalise("Ads.Example.COM.", buf[:])
+	out, ok, _ := normalise("Ads.Example.COM.", buf[:])
 	testing.expect(t, ok, "an ordinary name should normalise")
 	testing.expect_value(t, out, "ads.example.com")
 
-	plain, plain_ok := normalise("ads.example.com", buf[:])
+	plain, plain_ok, _ := normalise("ads.example.com", buf[:])
 	testing.expect(t, plain_ok, "and so should the same name without the dot")
 	testing.expect_value(t, plain, "ads.example.com")
 }
@@ -256,19 +256,19 @@ test_normalise_folds_case_and_the_trailing_dot :: proc(t: ^testing.T) {
 test_normalise_refuses_what_cannot_be_a_domain :: proc(t: ^testing.T) {
 	buf: [MAX_NORMALISED]u8
 	for bad in ([]string{"", "."}) {
-		_, ok := normalise(bad, buf[:])
+		_, ok, _ := normalise(bad, buf[:])
 		testing.expectf(t, !ok, "%q should not normalise", bad)
 	}
 
 	// A name too long for the buffer is refused rather than truncated: a
 	// truncated key would be a different name, and could be one that matters.
 	long := strings.repeat("a", MAX_NORMALISED + 1, context.temp_allocator)
-	_, too_long := normalise(long, buf[:])
+	_, too_long, _ := normalise(long, buf[:])
 	testing.expect(t, !too_long, "a name past the buffer should be refused")
 
 	// Exactly the buffer's width still fits.
 	exact := strings.repeat("a", MAX_NORMALISED, context.temp_allocator)
-	_, fits := normalise(exact, buf[:])
+	_, fits, _ := normalise(exact, buf[:])
 	testing.expect(t, fits, "a name exactly the buffer's width fits")
 	free_all(context.temp_allocator)
 }
@@ -296,12 +296,28 @@ test_a_rule_that_cannot_be_a_domain_is_refused :: proc(t: ^testing.T) {
 	*/
 	s := set_make()
 	defer set_destroy(s)
-	for bad in ([]string{"ads example", "ads\texample", "example.com/path", "0.0.0.0 ads.example"}) {
-		set_add(s, bad, {.Apex})
+	for bad in ([]string{"ads example", "ads\texample", "example.com/path", "0.0.0.0 ads.example", "b\u00fccher.de", "a\\b.example", "a\x01b.example"}) {
+		testing.expectf(t, !set_add(s, bad, {.Apex}), "%q should not be added", bad)
 		set_cancel(s, bad, {.Apex})
 	}
 	testing.expect_value(t, s.count, 0)
 	testing.expect_value(t, len(s.cancelled), 0)
+
+	// A query spells these bytes as \DDD, so a rule holding one raw never matches.
+	block, allow := parsed("0.0.0.0 b\u00fccher.de a\\b.example ok.example\n", .Hosts)
+	defer set_destroy(block)
+	defer set_destroy(allow)
+	testing.expect_value(t, block.count, 1)
+}
+
+@(test)
+test_a_refused_rule_is_not_counted_as_loaded :: proc(t: ^testing.T) {
+	block, allow := set_make(), set_make()
+	defer set_destroy(block)
+	defer set_destroy(allow)
+	added := parse_list(block, allow, "0.0.0.0 example.com/path b\u00fccher.de ok.example\n", .Hosts)
+	testing.expect_value(t, added, 1)
+	testing.expect_value(t, added, block.count)
 }
 
 @(test)

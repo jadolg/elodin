@@ -193,8 +193,9 @@ parse_hosts_line :: proc(block: ^Set, raw: string) -> (added: int) {
 		if host == "" || is_housekeeping_name(host) {
 			continue
 		}
-		set_add(block, host, {.Apex})
-		added += 1
+		if set_add(block, host, {.Apex}) {
+			added += 1
+		}
 	}
 	return
 }
@@ -219,11 +220,10 @@ parse_domain_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 		flags = {.Subdomains}
 		line = line[2:]
 	}
-	if line == "" || strings.contains(line, "*") || strings.contains(line, "/") {
+	if line == "" || strings.contains(line, "*") {
 		return 0
 	}
-	set_add(target, line, flags)
-	return 1
+	return int(set_add(target, line, flags))
 }
 
 @(private)
@@ -240,9 +240,7 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 		if slash <= 0 {
 			return 0
 		}
-		domain := body[:slash]
-		set_add(block, domain, {.Apex, .Subdomains})
-		return 1
+		return int(set_add(block, body[:slash], {.Apex, .Subdomains}))
 	}
 
 	target := block
@@ -303,14 +301,13 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 	if line == "" {
 		return 0
 	}
-	// Regex rules and path-scoped rules cannot be answered at the DNS layer.
-	if line[0] == '/' || strings.contains(line, "*") || strings.contains(line, "/") {
+	// A wildcard cannot be answered at the DNS layer; set_add refuses a regex or path rule.
+	if strings.contains(line, "*") {
 		return 0
 	}
 	if badfilter {
 		set_cancel(target, line, flags)
 		return 0
 	}
-	set_add(target, line, flags)
-	return 1
+	return int(set_add(target, line, flags))
 }

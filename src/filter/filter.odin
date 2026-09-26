@@ -5,6 +5,8 @@ import "core:mem/virtual"
 import "core:strings"
 import "core:sync"
 
+import "elodin:dns"
+
 /*
 Domain matching for sink lists.
 
@@ -103,22 +105,23 @@ Add a rule for `domain`.
 `domain` is taken as written by the list author; it is lowercased and stripped
 of any trailing dot before being stored.
 */
-set_add :: proc(s: ^Set, domain: string, flags: Rule_Flags) {
+set_add :: proc(s: ^Set, domain: string, flags: Rule_Flags) -> (stored: bool) {
 	buf: [MAX_NORMALISED]u8
 	key, ok := rule_key(domain, buf[:])
 	if !ok || key == "" {
-		return
+		return false
 	}
 	add := flags - s.cancelled[key]
 	if add == {} {
-		return
+		return true
 	}
 	if existing, found := s.rules[key]; found {
 		s.rules[key] = existing + add
-		return
+		return true
 	}
 	s.rules[strings.clone(key, s.allocator)] = add
 	s.count += 1
+	return true
 }
 
 /*
@@ -248,7 +251,7 @@ Pi-hole and AdGuard treat their allowlists.
 */
 engine_match :: proc(e: ^Engine, name: string) -> Decision {
 	buf: [MAX_NORMALISED]u8
-	key, ok := normalise(name, buf[:])
+	key, ok, _ := normalise(name, buf[:])
 	if !ok {
 		return .None
 	}
@@ -278,31 +281,34 @@ engine_stats :: proc(e: ^Engine) -> Stats {
 	}
 }
 
-// Whitespace or a slash marks a line the parser mis-split. Only a rule is refused
-// for one: a query label may carry any octet, and presentation form leaves `/`
-// unescaped.
+// A query spells any byte `dns.needs_escape` flags as \DDD, so a rule holding
+// one raw can never match; and a slash marks a line the parser mis-split.
 @(private)
 rule_key :: proc(domain: string, buf: []u8) -> (key: string, ok: bool) {
-	key, ok = normalise(domain, buf)
-	return key, ok && !strings.contains_any(key, " \t/")
+	valid: bool
+	key, ok, valid = normalise(domain, buf)
+	return key, ok && valid
 }
 
-// Lowercase and drop a trailing dot; refuse an empty name or one past `buf`.
 @(private)
-normalise :: proc(name: string, buf: []u8) -> (out: string, ok: bool) {
+normalise :: proc(name: string, buf: []u8) -> (out: string, ok: bool, rule_safe: bool) {
 	s := name
 	if len(s) > 0 && s[len(s) - 1] == '.' {
 		s = s[:len(s) - 1]
 	}
 	if len(s) == 0 || len(s) > len(buf) {
-		return "", false
+		return "", false, false
 	}
+	rule_safe = true
 	for i in 0 ..< len(s) {
 		c := s[i]
 		if c >= 'A' && c <= 'Z' {
 			c += 32
 		}
+		if c == '/' || (c != '.' && dns.needs_escape(c)) {
+			rule_safe = false
+		}
 		buf[i] = c
 	}
-	return string(buf[:len(s)]), true
+	return string(buf[:len(s)]), true, rule_safe
 }

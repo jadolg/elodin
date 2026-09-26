@@ -10,7 +10,6 @@ import "core:strings"
 // Worst case: 255 wire bytes, each rendered as a 4-character escape.
 MAX_NAME_PRESENTATION :: MAX_NAME_WIRE * 4
 
-@(private)
 needs_escape :: proc "contextless" (c: u8) -> bool {
 	return c <= 0x20 || c >= 0x7f || c == '.' || c == '\\'
 }
