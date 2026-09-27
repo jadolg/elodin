@@ -25,65 +25,14 @@ RFC 6761 and RFC 7686 answered here instead of forwarded.
 
 ## Known limitations
 
-- DNSSEC validation is on by default, and where a distribution's crypto policy
-  forbids SHA-1 signatures the two RSA/SHA-1 algorithms degrade to insecure
-  delegations rather than validating. Start-up says so, and refuses to start
-  outright if the policy leaves no trust anchor followable; see
-  [DNSSEC](dnssec.md#dnssec).
-- [Rebinding protection](rebinding.md#dns-rebinding-protection) runs only for A, AAAA, ANY,
-  SVCB and HTTPS questions — the ones a browser can be made to ask. Addresses in
-  the additional section are left alone unless the answer carried an SVCB or
-  HTTPS record.
-- **Connection-oriented transports get a thread per connection**, capped for TCP,
-  DoT and DoH together by `server.max_connections` and per client prefix by
-  `server.max_connections_per_prefix`. That suits clients that hold a connection
-  open and pipeline over it, not tens of thousands of concurrent connections. UDP
-  is the exception: a reader thread per usable CPU, to eight, and no per-client
-  state.
-- **Past what the UDP readers can drain, the kernel decides who is served.**
-  Datagrams that overflow a receive queue are dropped by the socket, so no budget
-  in this server applies to them; `listeners.udp.readers` raises the rate at which
-  that starts and does not remove it. A publicly reachable instance wants a packet
-  filter in front of it. See [how fast datagrams can be
-  read](connections.md#how-fast-datagrams-can-be-read) for the measured figure.
-- **The bound on TLS handshakes is per prefix, and a refusal is cheap rather than
-  free.** Opening a connection is charged to
-  `server.rate_limit.responses_per_second`, which held a 32-worker flood to 462
-  handshakes a second and 0.29 of four cores against 6,032 and 1.25 uncharged. But
-  it is keyed on the /24 and /64 like every other budget here, so an actor with
-  addresses in several prefixes has several copies of it, and the flood's *dial*
-  rate rose four times once being refused was cheap — the DoT bystander in that run
-  recovers to 88% of its queries answered where the quiet baseline is 98%. A UDP
-  bystander is untouched either way, which the same report measures. A publicly
-  reachable instance wants a per-source connection rate limit in front of it: see
-  [a connection rate limit in front](public-resolver.md#a-connection-rate-limit-in-front), and
-  `bench/results/2026-09-04-handshake-budget.md` for the figures.
-- **Upstream I/O is synchronous**, so concurrency is bounded by thread count
-  rather than by in-flight queries. The h2 upstream client multiplexes onto one
-  connection, but a worker is still held for the round trip. Async upstream I/O
-  would lift this and the connection item above; the UDP half of it is done, the
-  readers being behind `SO_REUSEPORT` since #233.
-- **DNS cookies do not cover every query.** Only queries that already carry an
-  OPT record are given one upstream, so a non-EDNS client behind elodin gets no
-  cookie protection unless DNSSEC validation is on — which it is by default.
-  Cookie secrets are drawn once at startup and never rotated: restarting costs
-  each client and each upstream one extra round trip.
-- **elodin does not advertise its own DoT or DoH endpoints over DDR.**
-  `resolver.arpa` is answered NODATA rather than forwarded, which keeps clients
-  here, but nothing designates its encrypted listeners automatically: point
-  clients at them by configuration, by the [Apple
-  profile](doh.md#apple-devices-ios-ipados-macos), or by a `rewrites` rule.
-- **EDNS Client Subnet is not implemented, and a client's option is dropped on
-  the way upstream** (RFC 7871). Forwarding one is only correct alongside the
-  per-network caching of section 7.3, which this cache does not do — its key is
-  the question plus the DO and CD bits — so a subnet a client named would steer
-  the answer every other client behind elodin is then given, and would tell a
-  public upstream where that client claims to be. Nothing is sent in its place,
-  and there is no setting to turn forwarding back on, because there is nowhere
-  honest to file the answers yet.
-- No per-client rules, no query log database, no web or API surface. Statistics
-  go to the log every five minutes, and to a Prometheus endpoint when
-  [`metrics.enabled`](metrics.md#metrics) is set — counters only.
-- Configuration is read once at startup, with one exception: `SIGHUP` reloads the
-  DoT/DoH certificates. Listener addresses, the upstream set and blocking need a
-  restart.
+- Where the host's crypto policy forbids SHA-1, zones signed only with RSA/SHA-1 (algorithms 5 and 7) validate as insecure delegations; see [DNSSEC](dnssec.md#watch-out).
+- [Rebinding protection](rebinding.md#dns-rebinding-protection) covers A, AAAA, ANY, SVCB and HTTPS questions only.
+- TCP, DoT and DoH use a thread per connection, capped by `server.max_connections` and per prefix by `server.max_connections_per_prefix` (UDP uses reader threads and holds no per-client state); see [sizing](sizing.md#transports).
+- Past what the UDP readers can drain, the kernel drops datagrams before any budget sees them; see [how fast datagrams can be read](connections.md#how-fast-datagrams-can-be-read).
+- The handshake bound is per /24 and /64, and a refusal is cheap rather than free; see [a connection rate limit in front](public-resolver.md#a-connection-rate-limit-in-front).
+- Upstream I/O is synchronous: a worker is held for each round trip; see [sizing](sizing.md#sizing).
+- Upstream cookies go only on queries that carry an OPT record, so a non-EDNS client gets none unless DNSSEC validation is on (the default); cookie secrets are never rotated, so a restart costs each peer one round trip. See [DNS cookies](edns.md#dns-cookies).
+- elodin does not advertise its own DoT/DoH over DDR: `resolver.arpa` is answered NODATA ([resolver.arpa](dnssec.md#resolverarpa)). Point clients at the encrypted listeners by configuration, the [Apple profile](doh.md#apple-devices-ios-ipados-macos), or a `rewrites` rule.
+- EDNS Client Subnet is not implemented: a client's option is dropped upstream and cannot be forwarded, since the cache is not keyed per network (RFC 7871 section 7.3).
+- No per-client rules, query log database, or web/API surface; statistics go to the [log](logging.md#stats) and [metrics](metrics.md#metrics).
+- Configuration is read once at startup; only `SIGHUP` reloads, and only the DoT/DoH certificates ([signals](install.md#signals)).

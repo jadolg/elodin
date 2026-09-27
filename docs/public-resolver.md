@@ -1,84 +1,146 @@
 # Running a public resolver
 
-`allow_from: []` (see [Who may ask](access-control.md#who-may-ask)) is the one setting that turns
-this from a LAN resolver into one anybody can reach, and every default elodin
-ships is sized for a household rather than for that. This is the checklist for
-the difference and the figures behind it, rather than a repeat of them —
-[`examples/public.yaml`](../examples/public.yaml) is the configuration that
-already makes these choices.
+`allow_from: []` (see [Who may ask](access-control.md#who-may-ask)) opens the
+resolver to anybody, and every default elodin ships is sized for a household.
+[`examples/public.yaml`](../examples/public.yaml) is a configuration that already
+makes the choices below. The measured figures behind every bound in these docs
+live on this page; each names its report under `bench/results/`.
 
-**What has to be in front of it, because nothing behind it can be:**
+## Checklist
+
+**Put in front of it:**
 
 - A packet filter, or upstream scrubbing, for the datagram rate. Past what the
-  UDP readers can drain, the kernel's own receive queue decides who is served,
-  not the limiter — see [how fast datagrams can be
-  read](connections.md#how-fast-datagrams-can-be-read). Measured on a 4-core aarch64 VM: one
-  reader drains 2.3 million datagrams a second, and a flood of two million a
-  second still cost the queue 4% of arrivals with that reader nowhere near
-  saturated. Scale the figure to your own cores, and watch
-  `elodin_udp_receive_drops_total` to see whether your instance is anywhere
-  near it.
-- A per-source connection rate limit. Nothing bounds how many TLS handshakes a
-  source can *start*, only how many connections it can *hold* at once — see
-  [a connection rate limit in front](#a-connection-rate-limit-in-front) for the
-  nftables rule and the figures behind it.
+  UDP readers can drain, the kernel's receive queue decides who is served, not the
+  limiter — see [how fast datagrams can be
+  read](connections.md#how-fast-datagrams-can-be-read) and the
+  [drain-rate figures](#datagrams-the-readers-can-drain).
+- A per-source connection rate limit: see [a connection rate limit in
+  front](#a-connection-rate-limit-in-front).
 
-**What to tune in the kernel:**
+**Tune in the kernel:**
 
-- `net.core.rmem_max` — 208 KiB on a machine nobody has tuned, which clamps
-  `listeners.udp.receive_buffer` regardless of what is configured. Raise the
-  sysctl if you raise the setting; the startup line reports what was actually
-  granted.
-- `listeners.udp.readers` against your core count. Left at `0` it derives one
-  reader per usable CPU, up to eight, which `--check` prints.
+- `net.core.rmem_max` — 208 KiB untuned, which clamps
+  `listeners.udp.receive_buffer`. Raise it if you raise the setting; the startup
+  line reports what was granted.
+- `listeners.udp.readers` against your core count. `0` derives one reader per
+  usable CPU, up to eight, which `--check` prints.
 - The descriptor limit, if you raise `server.max_connections`. Every held
-  connection is a descriptor, and `RLIMIT_NOFILE` is the one bound on this
-  server that is not in its configuration file — systemd leaves the soft limit
-  at 1024 unless a unit says otherwise, which the shipped one does
-  (`LimitNOFILE=8192`). Raise the table past it and the listener stops
-  accepting rather than the table filling: accepts fail, the loop waits between
-  attempts, and `elodin_accept_backoffs_total` climbs while it does. Startup warns when the limit cannot cover the
-  table and says nothing when it can — `--check` does not, because it would be
-  reading its own process's limit rather than the service's.
+  connection is a descriptor. systemd leaves the soft limit at 1024 unless the
+  unit says otherwise; the shipped unit sets `LimitNOFILE=8192`. Past `RLIMIT_NOFILE`,
+  accepts fail and the listener waits between attempts: `elodin_accept_backoffs_total`
+  climbs. Startup warns when the limit cannot cover the table; `--check` does not,
+  since it would read its own process's limit, not the service's.
 
-**What elodin bounds on its own,** measured and holding for an hour of
-flooding (`bench/results/2026-09-03-soak-one-hour.md`):
+## What elodin bounds on its own
 
 - The response budget: 500 responses/s per /24 or /64 by default, so at most
-  about 0.58 MB/s aimed at one victim ([rate limiting](rate-limiting.md#rate-limiting)).
+  about 0.6 MB/s of 1232-byte answers aimed at one victim, plus the slip's 62
+  small truncated replies a second ([rate
+  limiting](rate-limiting.md#rate-limiting)).
 - A per-prefix share of the connection table ([how many connections one client
   may hold](connections.md#how-many-connections-one-client-may-hold)).
-- Steady state under a 20,000 q/s flood held for an hour: 74–75 MB resident,
-  103 threads, the cache pinned at `max_entries` after turning over 187 times,
-  and the connection table lending and reclaiming a slot 174,176 times without
-  leaking one or refusing one. Nothing measured there drifts with uptime.
+- Opening a connection, charged to a per-prefix budget of its own.
 
-**What it does not bound:** a packet flood above the readers' drain rate, or a
-handshake flood — the accept refuses both, but a refusal is cheap rather than
-free, and a source paying nothing to dial again simply dials faster. That gap
-is what the packet filter and the connection rate limit above are for; none of
-this is a defence on its own, and the sections it links to say so again where
-the figures are.
+It does **not** bound a packet flood above the readers' drain rate, or how often
+a source may be *refused*. A refusal is cheap, not free, and a source that pays
+nothing to dial again dials faster. That is what the packet filter and the
+connection rate limit are for.
+
+All figures below were measured on a 4-core aarch64 VM with 7 GB of RAM, with the
+limiter at its shipped defaults unless stated. Scale them to your own machine;
+each report names the command that re-takes it (most are `go run ./cmd/rrlexp`
+in `bench/`, which `mise run bench` does not run; see
+[`bench/README.md`](../bench/README.md)).
+
+### Datagrams the readers can drain
+
+`bench/results/2026-09-03-udp-readers.md`, with the server confined to two CPUs:
+
+- One reader drains 2.3 million datagrams a second, about 400 ns of one core each.
+- Under a flood of two million a second the kernel still dropped 4% of arrivals
+  (918,000 datagrams in ten seconds) with that reader not saturated. Those reached
+  no budget, no counter and no client.
+- The limiter held the flood to its budget, and a client in an unrelated /24 was
+  answered 98% of the time.
+- A second reader showed no speed-up there: the load generator shares the machine
+  and pays for loopback delivery, so a second box or a real NIC is needed to
+  measure the scaling. `elodin_udp_receive_drops_total` shows whether your own
+  instance is near the ceiling.
+
+### Truncated answers (`slip`)
+
+`bench/results/2026-09-03-rate-limit-bystander.md` (uncharged) and
+`2026-09-03-slip-budget.md` (with the slip's own budget), under a two-million
+datagram/s flood of one cached name:
+
+| | truncated/s | MB/s at the named address | bystander in another /24 answered |
+|---|---:|---:|---:|
+| slip uncharged | 497,131 | 18.97 | 55% |
+| slip budget (62/s) | 58 | 0.54 | 99% |
+| `slip: 0` | 0 | 0.53 | 99% |
+
+The cost: under this flood, about 40 times the budget, a client *inside* the
+flooded /24 gets its invitation to TCP about once in 500 queries instead of half
+the time. At a busy NAT's rate, around twice the budget, the 62 a second still
+land, and one that lands moves the client to TCP for good.
+
+### Handshake floods
+
+`bench/results/2026-09-04-handshake-budget.md` (before and after charging
+connections) and `2026-09-03-handshake-floods.md` (the load): 32 workers dialling,
+completing a DoT handshake and hanging up, beside a DoT client holding one
+connection at 50 q/s in another /24.
+
+| | handshakes/s | dials/s | server CPU (of 4 cores) | DoT bystander answered |
+|---|---:|---:|---:|---:|
+| quiet baseline | — | — | — | 98% |
+| connections uncharged | 6,032 | 6,032 | 1.25 | 82% |
+| connections charged | 462 | 25,129 | 0.29 | 88% |
+
+- Uncharged, `conn_refused` and `elodin_rate_limited_total` both read zero: the
+  shipped table is never reached and the flood asks nothing.
+- The dial rate rises fourfold once being refused is cheap; that remaining cost is
+  why the bystander does not return to the baseline.
+- A client opening one connection per query during the flood was answered 100%
+  both before and after.
+
+### Connection table share
+
+`bench/results/2026-09-03-connection-table-share.md`: one client opening 96 idle
+TCP connections against `max_connections: 64`, and a victim in another /24
+opening a connection per query.
+
+| share | held by the one client | victim answered |
+|---|---:|---:|
+| none | 64 | 0% (0/400) |
+| 32 | 32 | 100% (235/235) |
+
+With the share, a normal client holding one connection beside a 20,000 q/s UDP
+flood from the holder's /24 was answered 100%. UDP clients are unaffected by a
+full table either way.
+
+### One-hour soak
+
+`bench/results/2026-09-03-soak-one-hour.md`, a 20,000 q/s flood held for an hour:
+74–75 MB resident, 103 threads, the cache pinned at `max_entries` after turning
+over about 187 times, and the connection table lending and reclaiming a slot
+174,176 times without leaking or refusing one. Nothing measured drifts with
+uptime.
 
 ## A connection rate limit in front
 
-If this resolver is reachable from the internet, put a per-source limit on *new
-connections* in front of it — in nftables or iptables on the same host, or in
-whatever terminates TLS if something else does. Not instead of the [arrival
+If the resolver is reachable from the internet, limit *new connections* per
+source in front of it — in nftables or iptables on the same host, or in whatever
+terminates TLS. This is as well as the [arrival
 budget](rate-limiting.md#rate-limiting) and the [per-client
-share](connections.md#how-many-connections-one-client-may-hold); as well as them.
+share](connections.md#how-many-connections-one-client-may-hold), not instead.
 
-The reason is arithmetic. Everything elodin bounds, it bounds per /24 and per /64,
-because that is the granularity an attacker picks addresses within. An actor with
-addresses in *n* prefixes therefore has *n* copies of every figure here, and on
-IPv6 a routine allocation from a hosting provider or a tunnel broker is a /48 —
-65,536 /64s. And a refusal, though far cheaper than the handshake it refuses, is
-not free: with the arrival budget in place a flood of 32 dialers went from 6,032
-handshakes a second to 462, and from 1.25 of four cores to 0.29, but its *dial*
-rate rose from 6,032 to 25,129 a second because being refused had become cheap.
-The DoT bystander in that run went from 82% of its queries answered to 88%, where
-the quiet baseline is 98%. A packet filter is the only place that stops a peer
-from making this server refuse it.
+Every bound elodin keeps is per /24 and per /64, so an actor with addresses in
+*n* prefixes has *n* copies of it; on IPv6 a routine /48 is 65,536 /64s. And
+refusing a connection still costs the server (see the [handshake
+figures](#handshake-floods)). A packet filter is the only place that stops a peer
+from making the server refuse it.
 
 ```
 # nftables: at most 10 new DNS connections a second per /24 and per /64,
@@ -108,22 +170,12 @@ table inet filter {
 }
 ```
 
-Trim the port list to the listeners you actually expose — 853 for DoT, 443 for
-DoH, 53 for TCP — and check it with `nft --check --file` before loading it, since
-a rule in the `input` hook that is wrong about its ports can lock you out of the
-host.
-
-Size it above what your clients do and below what a flood does: a stub resolver
-opens one connection and keeps it, and even a large NAT reconnecting every device
-at once is a burst rather than a rate. Ten a second per prefix is generous for
-anything legitimate and two to three orders of magnitude under what a single host
-can offer. On a private network, remember that every device on `192.168.1.0/24` is
-one source to a rule like this, exactly as it is one client to
-`responses_per_second` — size the burst for the whole LAN, or leave this to the
-in-server budget, which is what a resolver that is not reachable from outside
-wants anyway.
-
-The figures behind this are in `bench/results/2026-09-04-handshake-budget.md` and
-`2026-09-03-handshake-floods.md`; `2026-09-03-udp-readers.md` reaches the same
-conclusion about datagram floods, where the equivalent advice is
-[`listeners.udp.readers`](connections.md#how-fast-datagrams-can-be-read) plus a filter.
+- Trim the port list to the listeners you expose: 853 DoT, 443 DoH, 53 TCP.
+- Check it with `nft --check --file` before loading: a wrong rule in the `input`
+  hook can lock you out of the host.
+- Size it above what clients do and below what a flood does. A stub opens one
+  connection and keeps it, and a NAT reconnecting every device at once is a burst,
+  not a rate. Ten a second per prefix is generous for anything legitimate.
+- On a private network every device on `192.168.1.0/24` is one source to this
+  rule, as it is to `responses_per_second`. Size the burst for the whole LAN, or
+  leave it to the in-server budget.

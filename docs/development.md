@@ -7,11 +7,10 @@
 - OpenSSL 3.x with headers (`openssl-devel` / `libssl-dev`) for DoT, DoH and the
   DNSSEC signature checks
 
-Odin shells out to `clang` as its linker driver, so mise pins that too. The
-pinned build defaults to conda's own sysroot, so the tasks pass `--sysroot=/
--B/usr/bin` (`ELODIN_LDFLAGS` in `mise.toml`) to send the linker back to the
-system OpenSSL; drop the `clang` pin from `[tools]` and those flags become
-unnecessary.
+Odin uses `clang` as its linker driver, so mise pins that too. The pinned clang
+defaults to conda's sysroot, so the tasks pass `--sysroot=/ -B/usr/bin`
+(`ELODIN_LDFLAGS` in `mise.toml`) to link against the system OpenSSL. Drop the
+`clang` pin from `[tools]` and those flags are no longer needed.
 
 ```sh
 mise trust
@@ -65,46 +64,45 @@ examples/      the annotated reference configuration, one per deployment (local-
 packaging/     systemd unit and the .deb build script
 ```
 
-Two worker pools run underneath: one answering queries, one dedicated to racing
-upstreams. They are separate on purpose — a race job is submitted *by* a query
-handler and waited on by it, so one pool could deadlock once every worker was
-blocked on jobs nobody was left to run.
+There are two worker pools: one answers queries, one races upstreams. A race job
+is submitted and waited on by a query handler, so a single pool could deadlock
+with every worker waiting on jobs no worker is free to run.
 
 ## Testing
 
-`mise run verify` runs the first two layers. A third watches what those two do to
-memory, fuzzing runs on its own schedule, and `mise run bench` measures rather
-than asserts.
+`mise run verify` runs the type check, unit and integration tests. Leak checking
+and fuzz regression run in CI; `mise run bench` measures rather than asserts.
 
-**Unit tests** (`mise run test`) cover the message codec — round trips for every
-modelled RDATA type, compression, truncation, EDNS, pointer loops, hostile record
-counts — plus the YAML parser, configuration loading, list parsing and matching,
-the cache, and the HTTP/2 codec, whose HPACK cases run the worked examples from
-RFC 7541 appendix C so the codec is checked against the specification's own
-vectors rather than against itself. They run per package, so a failure names one.
-Much of `tlsx`, `upstream`, `h2` and `server` is the suite grown around bugs
-found some other way that had to stay found.
+**Unit tests** (`mise run test`) run per package, so a failure names one. They
+cover:
 
-The DNSSEC cases work from real signed traffic captured from a public resolver
-(`src/dnssec/fixtures_test.odin`): the root and `com` with RSA/SHA-256,
-`example.com` and `www.cloudflare.com` with ECDSA P-256, `ed25519.nl` with
-Ed25519, a real NSEC denial from the root, a real NSEC3 denial from `com`, and a
-real unsigned delegation. The validator walks those chains the whole distance,
-and the same fixtures are then tampered with — a flipped address byte, a stripped
-signature, a corrupted DS digest, a mismatched anchor, a clock a year later — and
-every one has to come back bogus. Signatures expire, so the tests pin the moment
-they are judged against rather than reading the clock. Three cases hold specific
-attacks down: a DNSKEY set signed by a key sharing the attested key's tag, an
-injected RRSIG naming the zone a denial is checked against, and a response built
-to make one question cost as many upstream lookups as possible — each checked
-against the code as it stood before its fix, so they are known to fail when the
-property they guard does.
+- the message codec: round trips for every modelled RDATA type, compression,
+  truncation, EDNS, pointer loops, hostile record counts
+- the YAML parser, configuration loading, list parsing and matching, the cache
+- the HTTP/2 codec; the HPACK cases use the worked examples in RFC 7541
+  appendix C, so the codec is checked against the specification, not itself
+- regression tests in `tlsx`, `upstream`, `h2` and `server` for bugs found by
+  other means
+
+The DNSSEC cases use real signed traffic captured from a public resolver
+(`src/dnssec/fixtures_test.odin`): the root and `com` (RSA/SHA-256),
+`example.com` and `www.cloudflare.com` (ECDSA P-256), `ed25519.nl` (Ed25519), an
+NSEC denial from the root, an NSEC3 denial from `com`, and an unsigned
+delegation. The validator walks each chain in full. The same fixtures are then
+tampered with (a flipped address byte, a stripped signature, a corrupted DS
+digest, a mismatched anchor, a clock a year later) and each must come back
+bogus. The tests pin the validation time, since the signatures expire. Three
+cases cover specific attacks, each confirmed to fail against the code before its
+fix:
+
+- a DNSKEY set signed by a key sharing the attested key's tag
+- an injected RRSIG naming the zone a denial is checked against
+- a response built to maximise upstream lookups for one question
 
 **Integration tests** (`mise run itest`) start the built binary as a separate
-process against scripted mock upstreams, so what is exercised is the artefact
-that ships rather than the library it was compiled from. The suite is hermetic:
-no public resolver is contacted, ports come from a private range, and the
-certificate for the TLS cases is generated by the suite itself.
+process against scripted mock upstreams, so they test what ships. The suite is
+hermetic: no public resolver is contacted, ports come from a private range, and
+the suite generates its own TLS certificate.
 
 ```
 mise run itest              # summary
@@ -113,162 +111,156 @@ mise run itest              # summary
 ./bin/itest --binary <path> # test a specific build
 ```
 
-It covers the command line and `--check`, orderly shutdown, that every line of a
-real run parses as logfmt, the wire format (captured fixtures replayed and
-compared byte for byte, EDNS forwarding, 0x20 case preservation, truncation,
-FORMERR/NOTIMP handling), forwarded transaction ids per RFC 5452, `allow_from`,
-the UDP answer-size ceiling, every listener including DoH over both HTTP versions
-and the Apple profile end to end, h2 upstreams, blocking and rewrites in every
-mode — the new record types from their zone-file form, additive rules falling
-through, and the PTR synthesis in both families with each of the cases that gets
-none — rate limiting on every budget, including the share of the connection table
-one client may hold and the rate at which it may open them, the rebinding guard on
-and off, the cache,
-all three upstream strategies with health cooldown and pooling, per-domain
-routes including nested ones and an anchor that puts validation back, blocklist
-downloads and their cache directory, DNSSEC refusal and the CD bypass, the
-reserved-name table with each key, cookies in both directions, certificate
-reload over `SIGHUP`, and the metrics endpoint.
+It covers:
+
+- the command line and `--check`, orderly shutdown, and that every log line of a
+  real run parses as logfmt
+- the wire format: captured fixtures replayed and compared byte for byte, EDNS
+  forwarding, 0x20 case preservation, truncation, FORMERR/NOTIMP handling;
+  forwarded transaction ids per RFC 5452
+- `allow_from` and the UDP answer-size ceiling
+- every listener, including DoH over both HTTP versions and the Apple profile
+  end to end; h2 upstreams
+- blocking and rewrites in every mode: the new record types from their zone-file
+  form, additive rules falling through, PTR synthesis in both families and each
+  case that gets none
+- rate limiting on every budget, including the per-client connection-table share
+  and connection-open rate
+- the rebinding guard on and off, the cache
+- all three upstream strategies with health cooldown and pooling; per-domain
+  routes, including nested ones and an anchor that restores validation
+- blocklist downloads and their cache directory
+- DNSSEC refusal and the CD bypass, the reserved-name table with each key,
+  cookies in both directions
+- certificate reload over `SIGHUP`, the metrics endpoint
 
 `src/itest/fixtures.odin` holds real DNS responses captured from a public
-resolver, including compression pointers, DNSSEC records and types the codec does
-not model. The mock replays them verbatim and the suite compares the bytes the
-client receives against the bytes the upstream sent — generating the fixtures
-with elodin's own encoder would let a codec bug agree with itself and still pass.
+resolver, including compression pointers, DNSSEC records and types the codec
+does not model. The mock replays them verbatim and the suite compares the bytes
+the client receives with the bytes the upstream sent. Fixtures generated with
+elodin's own encoder would let a codec bug agree with itself.
 
-**Memory** is checked in two places, because no one place can see all of it.
-`odin test` wraps every test in a tracking allocator, and
-`ODIN_TEST_FAIL_ON_BAD_MEMORY` — set for `mise run test` — turns what it finds
-into a failing test rather than a warning line among the passes. That catches a
-procedure which keeps what it was lent, and nothing else: nearly every allocation
-on the query path comes from a per-request arena that is reset whole, so a leak
-there is invisible by construction, and the memory that is *not* arena-backed
-belongs to the running server rather than to any procedure a test calls.
+**Memory** is checked in two places:
 
-So `mise run leakcheck` builds the binary with `-sanitize:address` and runs the
-integration suite against it, asking each server to exit rather than killing it —
-a sanitizer reports on its way out, and a killed process never gets there. This
-is the layer that reaches the configuration, the listeners' TLS contexts, and the
-answers a race worker allocates on the heap because it may outlive the caller's
-arena; every one of those has leaked at some point, and none is reachable from a
-unit test. Being ASan rather than LSan alone, it also catches a use-after-free —
-which is how the certificate reload was found to be freeing a context a
-connection was still about to read. It is not part of `mise run verify`, which is
-the fast local gate; CI runs it on every change.
+- `odin test` wraps each test in a tracking allocator, and
+  `ODIN_TEST_FAIL_ON_BAD_MEMORY` (set by `mise run test`) makes a finding fail
+  the test. This only catches a procedure that keeps memory it was lent: the
+  query path allocates from a per-request arena reset whole, and the rest
+  belongs to the running server, not to anything a unit test calls.
+- `mise run leakcheck` builds the binary with `-sanitize:address` and runs the
+  integration suite against it, asking each server to exit rather than killing
+  it, since ASan reports on exit. This reaches the configuration, the listeners'
+  TLS contexts, and the answers a race worker allocates on the heap because they
+  may outlive the caller's arena. Being ASan, it also catches use-after-free. It
+  is not part of `mise run verify`; CI runs it on every change.
 
-**Fuzzing** covers the parsers that read bytes somebody else chose, one
-libFuzzer target each under `src/fuzz/`: the DNS wire codec (`dns`:
-`dns.decode_message`, plus `dns.truncated_response`, which the UDP read loop
-reaches for a rate-limited query without decoding it first), the HPACK decoder
-(`h2`), the YAML parser that reads the configuration file (`yaml`), the HTTP/1.1
-response reader that list hosts and DoH upstreams write into (`http`), the
-blocklist formats (`list`), the DNSSEC RDATA parsers and the DER that signature
-checking builds out of an upstream's keys and signatures (`dnssec`), the h2 frame
-layer and stream state machine on both the server and client side (`h2conn`),
-and the HTTP/1.1 request parser DoH clients write into (`doh`). The two HTTP
-readers take a socket, so their targets hand them one end of a socket pair the
-input has been written into. Odin has no `-fsanitize=fuzzer`, so `mise run fuzz`
-emits LLVM IR per target and has clang instrument and link it into a libFuzzer
-binary at `bin/fuzz_*`, with ASan on and bounds checks still in. Running one is
-open-ended, so `.github/workflows/fuzz.yml` does it nightly
-against a corpus cached between runs, and `workflow_dispatch` runs it on demand
-after a parser is touched. A target that needs inputs longer than libFuzzer's
-default cap (4 KB, or its largest seed if longer) puts the cap in
-`testdata/fuzz-corpus/<target>.max_len`, next to its optional `.dict`: one line
-that is a bare number, and only `#` lines for why, or empty ones
-(`scripts/fuzz-max-len.sh` reads it, and refuses anything else). Such a target
-also runs with `-len_control=0`, so it gets inputs up to the cap from the start
-rather than after libFuzzer's slow ramp towards it. A target that feeds its
-input through a socket refuses a cap past `harness.MAX_FEED` at start-up, since
-`feed` cuts anything longer. What CI runs on every change is
-`mise run fuzz-regression`, which replays `testdata/fuzz-corpus/` through each
-target once and generates nothing new, so a crash fuzzing has already found stays
-found.
+**Fuzzing** covers the parsers that read untrusted bytes, one libFuzzer target
+each under `src/fuzz/`:
 
-**Parity with the upstream** (`mise run parity`) asks the one question none of
-the layers above asks: not whether a particular answer is right, but whether
-*anything at all* is lost between the two sides of the resolver. A forwarding
-resolver is a pipe, and a fixed case can only check the parts of the pipe
-somebody thought to check.
+| target | parser |
+|---|---|
+| `dns` | `dns.decode_message`, and `dns.truncated_response`, which the UDP read loop calls on a rate-limited query without decoding it |
+| `h2` | the HPACK decoder |
+| `yaml` | the configuration file parser |
+| `http` | the HTTP/1.1 response reader used for list downloads and DoH upstreams |
+| `list` | the blocklist formats |
+| `dnssec` | the DNSSEC RDATA parsers and the DER built from an upstream's keys and signatures |
+| `h2conn` | the h2 frame layer and stream state machine, server and client side |
+| `doh` | the HTTP/1.1 request parser DoH clients write into |
 
-So a seeded generator makes queries nobody wrote down — types the codec has no
-structure for, EDNS options it does not recognise, names holding bytes a hostname
-never holds, the 0x20 case randomisation a stub uses, every transport — and every
-field of every answer is held against the upstream's: the full twelve-bit rcode
-with the extended half reassembled, each header flag, and each section as a
-multiset of records with the names inside RDATA expanded. Every place elodin is
-entitled to differ is written down in `src/itest/parity_compare.odin` with the
-reason and the citation, and a difference not on that list fails the run. That is
-the point of the file: a divergence nobody can name is a divergence nobody
-decided on.
+The two HTTP readers take a socket, so their targets feed them one end of a
+socket pair holding the input.
 
-The OPT record is the exception, and it is checked the other way round. RFC 6891
-section 6.1.1 forbids caching or forwarding one, so the record a client reads is
-this server's own statement rather than a copy — see `normalise_client_opt` in
-`src/server/resolver.odin`. There the test is that *nothing* of the upstream's
-crossed: an option of theirs reaching a client is the failure, the DO bit has to
-echo the query rather than the answer, and the reserved flag bits have to be
-zero.
+Odin has no `-fsanitize=fuzzer`, so `mise run fuzz` emits LLVM IR per target and
+has clang instrument and link it into `bin/fuzz_*`, with ASan on and bounds
+checks kept.
 
-It runs in two modes, and they are not equally strong:
+- `.github/workflows/fuzz.yml` fuzzes nightly against a corpus cached between
+  runs; `workflow_dispatch` runs it on demand after a parser changes.
+- `mise run fuzz-regression`, run by CI on every change, replays
+  `testdata/fuzz-corpus/` through each target once without generating anything,
+  so a found crash stays found.
+- A target needing inputs longer than libFuzzer's default cap (4 KB, or its
+  largest seed if longer) puts the cap in
+  `testdata/fuzz-corpus/<target>.max_len`, next to its optional `.dict`: one
+  line holding a bare number, plus only `#` comment lines or empty lines.
+  `scripts/fuzz-max-len.sh` reads it and refuses anything else. Such a target
+  also runs with `-len_control=0`, so it gets inputs up to the cap from the
+  start.
+- A target that feeds its input through a socket refuses a cap above
+  `harness.MAX_FEED` at start-up, since `feed` truncates anything longer.
 
-- **Against a synthetic upstream**, the reference is the very message elodin was
-  handed — a mock that answers any name and type deterministically from a zone
-  built to hold the awkward constructs (a compressed name inside the RDATA of
-  every type that may carry one, character-strings empty, full-length and in a
-  run long enough to catch a miscounted list, TTLs at both ends of their range,
-  unassigned types with opaque RDATA, answers too large for a datagram, an OPT
-  carrying a cookie and an NSID at once). Hermetic and reproducible, so a
-  divergence here is elodin's and nobody else's.
-- **Against a real resolver** (`--parity-upstream 1.1.1.1:53`), the reference is
-  a second, byte-identical query put straight to it, retried over TCP if the
-  datagram would not hold the answer. Weaker by construction — a real resolver
-  rotates RRsets, expires TTLs between two datagrams and answers from whichever
-  anycast node took the query — so a name has to answer the same way twice before
-  it is used as a reference at all, and a difference has to survive asking the
-  whole question again. What it buys is answers no mock would think to serve.
+**Parity with the upstream** (`mise run parity`) checks that nothing is lost
+between the two sides of the resolver, rather than whether a given answer is
+right. A seeded generator makes queries nobody wrote a case for: types the codec
+has no structure for, unknown EDNS options, names with bytes a hostname never
+holds, 0x20 case randomisation, every transport. Every field of every answer is
+compared with the upstream's: the full twelve-bit rcode with the extended half
+reassembled, each header flag, and each section as a multiset of records with
+names inside RDATA expanded. Every allowed difference is listed in
+`src/itest/parity_compare.odin` with its reason and citation; any other
+difference fails the run.
 
-Each mode runs under **scenarios** (`--parity-scenario <name|all>`, listed in
-`src/itest/parity_scenario.odin`), because a pipe with the cache off and one
-plain-UDP upstream is not the pipe a resolver in service is. Each scenario moves
-several levers at once: the upstream's transport (UDP, TCP, DoT, DoH), the
-strategy (failover, race, round robin) and a zone routed elsewhere, the cache,
-cookies off or required, the UDP ceiling at 512, 1232 and 4096, and block rules
-on a name and on a CNAME target with an allow rule inside them. Clients ask over
-UDP, TCP, DoT and DoH as POST, GET and HTTP/2. What a scenario answers for
-itself is checked rather than skipped: a blocked name has to get the configured
-block response without the upstream being asked, a `cookies.require` client has
-to get BADCOOKIE and a cookie carrying its own half before its query is held to
-parity, a route has to reach its own upstream and nothing else, and a cached
-answer's TTLs may have counted down by no more than the entry's age. Live
-scenarios add validation and the cache both off, and the upstream reached over
-DoT or DoH at the resolver's own name.
+The OPT record is checked the other way round. RFC 6891 section 6.1.1 forbids
+forwarding or caching it, so elodin writes its own (`normalise_client_opt` in
+`src/server/resolver.odin`). The check is that nothing of the upstream's
+crossed: none of its options reach the client, the DO bit echoes the query, not
+the answer, and the reserved flag bits are zero.
 
-Both are built on their own wire walker (`src/itest/parity_wire.odin`) which does
-not import `elodin:dns`, for the reason the fixtures give: a comparator built on
-the codec under test loses a record identically on both sides and reports
-agreement.
+There are two modes, of different strength:
 
-Every query of a run comes from one 64-bit seed, printed on the way past and
-repeated in any failure, so `--parity-seed` reproduces a nightly run on a laptop.
-`mise run parity` runs the synthetic mode; the live one has no task, since
-one that reaches a public resolver is not one to put behind a bare `mise run`:
-run `./bin/itest --parity --parity-upstream <host:port>` yourself. `.github/workflows/parity.yml` runs both nightly against a fresh
-seed;
-`mise run parity-regression` replays the seeds in `testdata/parity-seeds` — the
-ones that have found something — on every pull request, the same division as
-fuzzing.
+- **Synthetic upstream**: the reference is the exact message elodin received,
+  from a mock that answers any name and type deterministically from a zone of
+  awkward constructs (a compressed name inside the RDATA of every type that may
+  carry one; character-strings empty, full-length and in long runs; TTLs at both
+  ends of their range; unassigned types with opaque RDATA; answers too large for
+  a datagram; an OPT carrying a cookie and an NSID). Hermetic and reproducible,
+  so any divergence is elodin's.
+- **Real resolver** (`--parity-upstream 1.1.1.1:53`): the reference is a second,
+  byte-identical query sent straight to it, retried over TCP if truncated. A
+  real resolver rotates RRsets, expires TTLs and answers from different anycast
+  nodes, so a name must answer the same way twice before it is used, and a
+  difference must survive re-asking. It finds answers no mock would serve.
 
-The two nightly jobs are not both gates, and the difference is deliberate. The
-synthetic-upstream job fails the run: its reference is exact, so a divergence is
-a bug. The live job only reports, because its reference is a resolver nobody here
-controls — two queries to one anycast address can be answered by nodes holding
-different copies, and elodin's own cache can answer without asking anyone at all.
-That residual measures at about one query in two hundred; it is not something a
-commit can fix, and a job that goes red that often for reasons nobody can act on
-is one people stop reading. A finding there is followed up by hand, usually by
-reproducing it against the synthetic upstream where the answer is either a bug or
-is not.
+**Scenarios** (`--parity-scenario <name|all>`, listed in
+`src/itest/parity_scenario.odin`) run each mode against configurations closer to
+a resolver in service. Each moves several levers at once:
+
+- the upstream transport (UDP, TCP, DoT, DoH)
+- the strategy (failover, race, round robin) and a zone routed elsewhere
+- the cache; cookies off or required
+- the UDP ceiling at 512, 1232 and 4096
+- block rules on a name and on a CNAME target, with an allow rule inside them
+- clients over UDP, TCP, DoT, and DoH as POST, GET and HTTP/2
+- live only: validation and the cache both off, and the upstream reached over
+  DoT or DoH at the resolver's own name
+
+What a scenario answers itself is checked, not skipped: a blocked name gets the
+configured block response without asking the upstream; a `cookies.require`
+client gets BADCOOKIE and a cookie with its own half before its query is held to
+parity; a route reaches its own upstream and nothing else; a cached answer's
+TTLs have counted down by no more than the entry's age.
+
+Both modes use their own wire walker (`src/itest/parity_wire.odin`), which does
+not import `elodin:dns`: a comparator built on the codec under test would lose a
+record identically on both sides and report agreement.
+
+**Seeds**: every query in a run derives from one 64-bit seed, printed during the
+run and in any failure, so `--parity-seed` reproduces a nightly run locally.
+`mise run parity-regression` replays the seeds in `testdata/parity-seeds` (those
+that have found something) on every pull request.
+
+**Nightly**: `.github/workflows/parity.yml` runs both modes nightly with a fresh
+seed.
+
+- The synthetic job is a gate: its reference is exact, so a divergence is a bug.
+- The live job only reports: two queries to one anycast address can hit nodes
+  with different data, and elodin's cache can answer without asking. That noise
+  runs at about one query in two hundred. Findings are followed up by hand,
+  usually by reproducing them against the synthetic upstream.
+
+The live mode has no mise task, so a bare `mise run` never reaches a public
+resolver; run `./bin/itest --parity --parity-upstream <host:port>` yourself.
 
 ```
 mise run parity                                   # 2000 queries per scenario, synthetic upstream
@@ -278,27 +270,25 @@ mise run parity                                   # 2000 queries per scenario, s
 ./bin/itest --parity --parity-upstream 1.1.1.1:53 --parity-scenario all # against a real resolver
 ```
 
-**Against live DNS**, because none of the layers above can prove the absence of
-false failures: they work from fixtures and generated input, so they can show
-that a forged answer is refused and cannot show that validation leaves working
-names working — a validator that refused everything would pass the entire suite.
-From `bench/`, `go run ./cmd/bench -survey 9.9.9.9:53` asks every name in
-`bench/domains.txt` through elodin with validation on, asks a reference
-validating resolver the same thing, and compares the rcode and the AD bit: the
-deliberately broken zones in that list have to be refused and everything else has
-to resolve. Names served without the AD bit are the SHA-1 downgrade described
-under [DNSSEC](dnssec.md#dnssec) — a fact about the host's crypto policy rather than about
-the zone.
+**Against live DNS**: the layers above show that forged answers are refused, but
+not that working names keep working; a validator refusing everything would pass
+them. From `bench/`, `go run ./cmd/bench -survey 9.9.9.9:53` resolves every name
+in `bench/domains.txt` through elodin with validation on and through a reference
+validating resolver, and compares rcode and AD bit. The deliberately broken
+zones in the list must be refused and everything else must resolve. Names served
+without the AD bit are the SHA-1 downgrade described under
+[DNSSEC](dnssec.md#dnssec), a property of the host's crypto policy, not the
+zone.
 
-Interoperability with a foreign HTTP/2 implementation is checked by hand with
-curl, which uses nghttp2: `curl --http2 -k -H 'content-type:
-application/dns-message' --data-binary @query.bin
-https://127.0.0.1:443/dns-query`.
+**HTTP/2 interop** with a foreign implementation (curl, via nghttp2) is checked
+by hand: `curl --http2 -k -H 'content-type: application/dns-message'
+--data-binary @query.bin https://127.0.0.1:443/dns-query`.
 
-CI (`.github/workflows/ci.yml`) runs on every pull request and every push to
-`main`: `mise run check` once, `mise run test` and `mise run itest` on both
-architectures, `mise run fuzz-regression`, `mise run parity-regression` and
-`mise run leakcheck` once, `mise run build` on both, and —
-on both — a `mise run deb` that is then installed on the runner, asked to resolve
-a handful of names through the takeover it just performed, and removed again with
-a check that the runner got its own resolver back.
+**CI** (`.github/workflows/ci.yml`) runs on every pull request and every push to
+`main`:
+
+- once: `mise run check`, `fuzz-regression`, `parity-regression`, `leakcheck`
+- on both architectures: `mise run test`, `itest`, `build`, and `mise run deb`,
+  whose package is installed on the runner, made to resolve a handful of names
+  through the resolver takeover it performs, then removed, checking the runner
+  gets its own resolver back

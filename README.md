@@ -24,51 +24,26 @@ Pi-hole and AdGuard Home, minus the web interface. One binary, one YAML file.
 - A Prometheus endpoint, off by default
 - Ships as a systemd service or a `.deb`, with optional system-resolver takeover
 
-[`examples/elodin.yaml`](examples/elodin.yaml) is the
-annotated configuration reference, and [`examples/`](examples/) carries a
-configuration per deployment — see [Example configurations](docs/examples.md).
-Everything else is under [`docs/`](docs/).
+## Installing
 
-## Quick start
-
-You need [mise](https://mise.jdx.dev), which pins the toolchain, and OpenSSL 3.x
-with headers (`openssl-devel` / `libssl-dev`).
+On Debian and Ubuntu, amd64 or arm64, install from the apt repository:
 
 ```sh
-mise trust && mise install
-mise run build            # bin/elodin
-mise run test             # unit tests
+sudo install -d -m755 /etc/apt/keyrings
+curl -fsSL https://deb.akiel.dev/gpg.pub.key | gpg --dearmor | sudo tee /etc/apt/keyrings/akiel.gpg > /dev/null
+echo 'deb [signed-by=/etc/apt/keyrings/akiel.gpg] https://deb.akiel.dev/ all main' | sudo tee /etc/apt/sources.list.d/akiel.list
+sudo apt update && sudo apt install elodin
 ```
 
-[Developing elodin](docs/development.md) has the rest of the tasks, the layout of
-the source and how it is tested.
+The package runs elodin as a systemd service and offers to take over as the
+system resolver. [Installing and running](docs/install.md) covers that, a
+release `.deb` or tarball, the unit for a source build, and dropping privileges.
 
-## Running
+## Configuring
 
-```sh
-mise run run                                            # port 5354, unprivileged
-./bin/elodin --config examples/elodin.yaml              # the real thing
-./bin/elodin --config examples/elodin.yaml --check      # validate and exit
-./bin/elodin --config examples/elodin.yaml --no-fetch   # skip list downloads
-```
-
-`mise run run` uses `examples/dev.yaml`, which listens on 5354 and caches under
-`.cache/` so it runs as an ordinary user. `examples/elodin.yaml` binds port 53
-and caches under `/var/cache/elodin`. Give it the one privilege it needs rather
-than starting it as root:
-
-```sh
-sudo setcap 'cap_net_bind_service=+ep' ./bin/elodin
-```
-
-Starting as root works too, but then set `server.user` — see
-[Privileges](docs/install.md#privileges). If the port is already taken it is usually the system
-resolver (`sudo systemctl stop systemd-resolved`); elodin says as much when a
-bind fails. A cache directory it cannot write is a warning, not an error: the
-lists still apply, they just have to be fetched again next start.
-
-The listeners bind `0.0.0.0`, but only the local networks are served by default
-— see [Who may ask](docs/access-control.md#who-may-ask). A minimal configuration:
+The configuration is `/etc/elodin/elodin.yaml`, and the installed copy is
+[`examples/elodin.yaml`](examples/elodin.yaml): every setting, with its default
+and why. A minimal one:
 
 ```yaml
 upstream:
@@ -79,15 +54,44 @@ blocking:
     - https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
 ```
 
+The listeners bind `0.0.0.0`, but only local networks are answered by default —
+see [Who may ask](docs/access-control.md#who-may-ask). [`examples/`](examples/)
+has a configuration per deployment (loopback, LAN, small device, public,
+container); [Example configurations](docs/examples.md) says what each changes.
+`elodin --config <file> --check` validates a file and prints what it derived.
 
-To install it as a systemd service or from a `.deb` — which can also take over
-as the system resolver — see [Installing and running](docs/install.md).
+## Building from source
+
+You need [mise](https://mise.jdx.dev), which pins the toolchain, and OpenSSL 3.x
+with headers (`openssl-devel` / `libssl-dev`).
+
+```sh
+mise trust && mise install
+mise run build                                          # bin/elodin
+mise run run                                            # port 5354, unprivileged, examples/dev.yaml
+./bin/elodin --config examples/elodin.yaml --check      # validate and exit
+./bin/elodin --config examples/elodin.yaml --no-fetch   # run, skipping list downloads
+```
+
+`examples/elodin.yaml` binds port 53 and caches under `/var/cache/elodin`. Give
+the binary the one privilege it needs rather than starting it as root:
+
+```sh
+sudo setcap 'cap_net_bind_service=+ep' ./bin/elodin
+```
+
+Starting as root works too, but then set `server.user` — see
+[Privileges](docs/install.md#privileges). If the port is taken it is usually the
+system resolver (`sudo systemctl stop systemd-resolved`); elodin says as much
+when a bind fails. A cache directory it cannot write is a warning, not an error:
+the lists still apply, and are fetched again next start. [Developing elodin](docs/development.md) has the rest of the
+tasks, the layout of the source and how it is tested.
 
 ## Documentation
 
 | page | what it covers |
 |---|---|
-| [Installing and running](docs/install.md) | the systemd unit, the `.deb` and resolver takeover, dropping privileges, signals |
+| [Installing and running](docs/install.md) | the apt repository, the `.deb` and resolver takeover, the systemd unit, dropping privileges, signals |
 | [Example configurations](docs/examples.md) | which settings a loopback, LAN, small-device, public or container deployment changes, and why |
 | [Logs](docs/logging.md) | the logfmt format, the stats line, the query log |
 | [Upstreams](docs/upstreams.md) | strategies, timeouts, failover, bootstrap, and per-domain routes |
