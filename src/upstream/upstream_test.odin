@@ -186,6 +186,9 @@ accept timeouts and stop flags a long-running loop would want.
 Http_Mock :: struct {
 	listener: net.TCP_Socket,
 	reply:    string,
+	// Keep the connection open after the reply, until the client closes it or
+	// three seconds pass, as a server holding a kept-alive connection does.
+	hold:     bool,
 }
 
 @(private = "file")
@@ -197,6 +200,16 @@ http_mock_once :: proc(m: ^Http_Mock) {
 	defer net.close(client)
 	drain_request(client)
 	_, _ = net.send_tcp(client, transmute([]u8)m.reply)
+	if m.hold {
+		_ = net.set_option(client, .Receive_Timeout, 3 * time.Second)
+		buf: [512]u8
+		for {
+			n, rerr := net.recv_tcp(client, buf[:])
+			if rerr != nil || n <= 0 {
+				break
+			}
+		}
+	}
 	// Closing here is what ends a reply with no length information, which is how
 	// the truncated-body case below reaches its error path.
 }
@@ -239,6 +252,7 @@ exchange_against :: proc(
 	t: ^testing.T,
 	reply: string,
 	track: ^mem.Tracking_Allocator,
+	hold := false,
 ) -> (
 	resp: Http_Response,
 	err: Error,
@@ -259,6 +273,7 @@ exchange_against :: proc(
 	m := Http_Mock {
 		listener = listener,
 		reply    = reply,
+		hold     = hold,
 	}
 	server := thread.create_and_start_with_poly_data(&m, http_mock_once)
 	defer {
@@ -2916,4 +2931,142 @@ test_http_response_malformed_framing_is_refused :: proc(t: ^testing.T) {
 		mem.tracking_allocator_destroy(&track)
 		free_all(context.temp_allocator)
 	}
+}
+
+/*
+A response's status can say where its body ends (RFC 9112 6.3): a 1xx, 204 or
+304 has none, whatever its fields say, and a 1xx is followed by the response
+the request is waiting for (RFC 9110 15.2). Read by fields alone, all three fell
+to the read-to-end path (#442): a 204 on a kept-alive connection waited for a
+close that never came, and a CDN's `103 Early Hints` swallowed the 200 behind it
+as its body and was then turned down for not being a 200.
+
+The mock holds the connection open after replying, as a server that means to
+keep it does, so reading past the end shows up as time spent. A 101 is refused:
+this client never asks to switch protocols. Interim responses are counted
+against the field limit, or a peer could send them forever.
+*/
+@(test)
+test_http_bodyless_statuses_end_at_the_fields :: proc(t: ^testing.T) {
+	Case :: struct {
+		reply:      string,
+		refused:    bool,
+		status:     int,
+		body:       string,
+		keep_alive: bool,
+	}
+	OK :: "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+	CASES := []Case {
+		{"HTTP/1.1 204 No Content\r\n\r\n", false, 204, "", true},
+		{"HTTP/1.1 304 Not Modified\r\nETag: \"x\"\r\n\r\n", false, 304, "", true},
+		// A 304 may carry the Content-Length of the representation it stands for.
+		{"HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\n", false, 304, "", true},
+		// A 204 carries no framing fields (RFC 9110 8.6, 6.1). One that does may
+		// have sent the body it framed, so the connection goes no further.
+		{"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n", false, 204, "", false},
+		{"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n", false, 204, "", false},
+		{"HTTP/1.1 103 Early Hints\r\nLink: </a>; rel=preload\r\n\r\n" + OK, false, 200, "ok", true},
+		{"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 102 Processing\r\n\r\n" + OK, false, 200, "ok", true},
+		// A close announced on an interim response still holds: keeping it costs
+		// a dial at most, and ignoring it pools a socket the server will drop.
+		{"HTTP/1.1 103 Early Hints\r\nConnection: close\r\n\r\n" + OK, false, 200, "ok", false},
+		{"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok", false, 200, "ok", false},
+		{"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\n\r\n" + OK, true, 0, "", false},
+		// Not a status at all (RFC 9110 15), so not an interim one to pass over.
+		{"HTTP/1.1 099 Weird\r\n\r\n" + OK, true, 0, "", false},
+		{"HTTP/1.1 000 Zero\r\n\r\n" + OK, true, 0, "", false},
+		{"HTTP/1.1 600 Past\r\nContent-Length: 2\r\n\r\nok", true, 0, "", false},
+		{"HTTP/1.1 103 Early Hints\r\n folded\r\n\r\n" + OK, true, 0, "", false},
+		// A 1xx carries no framing fields (RFC 9110 8.6, RFC 9112 6.1). Passed
+		// over, what one framed was read as the answer - here a 200 of the
+		// peer's choosing - and the real one left for the next query to find.
+		{"HTTP/1.1 103 Early Hints\r\nContent-Length: 42\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nfake" + OK, true, 0, "", false},
+		{"HTTP/1.1 100 Continue\r\nTransfer-Encoding: chunked\r\n\r\n" + OK, true, 0, "", false},
+		{"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1x 200 OK\r\n\r\n", true, 0, "", false},
+	}
+	for c in CASES {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		start := time.tick_now()
+		resp, err, ok := exchange_against(t, c.reply, &track, hold = true)
+		spent := time.tick_since(start)
+		if ok {
+			// The mock holds for three seconds, so reading past the end costs that.
+			testing.expectf(t, spent < 2 * time.Second, "%q took %v: read past the end of the response", c.reply, spent)
+			if c.refused {
+				testing.expectf(t, err == .HTTP_Error, "%q got %v, status %d", c.reply, err, resp.status)
+			} else {
+				testing.expectf(t, err == .None, "%q failed: %v", c.reply, err)
+				testing.expectf(t, resp.status == c.status, "%q: status %d, want %d", c.reply, resp.status, c.status)
+				testing.expectf(t, string(resp.body) == c.body, "%q: body %q, want %q", c.reply, string(resp.body), c.body)
+				testing.expectf(t, resp.keep_alive == c.keep_alive, "%q: keep-alive %v, want %v", c.reply, resp.keep_alive, c.keep_alive)
+			}
+			delete(resp.body, mem.tracking_allocator(&track))
+			expect_caller_holds_nothing(t, &track, c.reply)
+		}
+		mem.tracking_allocator_destroy(&track)
+		free_all(context.temp_allocator)
+	}
+
+	// An interim response's Location is not the answer's.
+	{
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		defer mem.tracking_allocator_destroy(&track)
+		reply := "HTTP/1.1 103 Early Hints\r\nLocation: http://interim.invalid/\r\n\r\n" + OK
+		resp, err, ok := exchange_against(t, reply, &track, hold = true)
+		if ok {
+			testing.expectf(t, err == .None, "a 103 with a Location failed: %v", err)
+			testing.expectf(t, resp.location == "", "the 103's Location reached the answer: %q", resp.location)
+			delete(resp.body, mem.tracking_allocator(&track))
+			expect_caller_holds_nothing(t, &track, "interim Location")
+		}
+		free_all(context.temp_allocator)
+	}
+
+	/*
+	Interim responses draw on the final response's field budget, on purpose:
+	the reader keeps every line of the exchange, so a budget each would let a
+	run of them hold a hundred times as much. 103 with 60 fields costs 61, and
+	a 200 with 40 more is one over.
+	*/
+	{
+		b := strings.builder_make(context.temp_allocator)
+		strings.write_string(&b, "HTTP/1.1 103 Early Hints\r\n")
+		for _ in 0 ..< 60 {
+			strings.write_string(&b, "Link: </a>; rel=preload\r\n")
+		}
+		strings.write_string(&b, "\r\nHTTP/1.1 200 OK\r\n")
+		for _ in 0 ..< 39 {
+			strings.write_string(&b, "X: y\r\n")
+		}
+		strings.write_string(&b, "Content-Length: 2\r\n\r\nok")
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		defer mem.tracking_allocator_destroy(&track)
+		resp, err, ok := exchange_against(t, strings.to_string(b), &track, hold = true)
+		if ok {
+			testing.expectf(t, err == .HTTP_Error, "a 103 and a 200 over the shared budget got %v, status %d", err, resp.status)
+			delete(resp.body, mem.tracking_allocator(&track))
+			expect_caller_holds_nothing(t, &track, "shared budget")
+		}
+		free_all(context.temp_allocator)
+	}
+
+	// Endless interim responses run into the field limit rather than forever.
+	b := strings.builder_make(context.temp_allocator)
+	for _ in 0 ..= MAX_HTTP_HEADERS {
+		strings.write_string(&b, "HTTP/1.1 100 Continue\r\n\r\n")
+	}
+	strings.write_string(&b, OK)
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	resp, err, ok := exchange_against(t, strings.to_string(b), &track, hold = true)
+	if ok {
+		testing.expectf(t, err == .HTTP_Error, "%d interim responses got %v, status %d", MAX_HTTP_HEADERS + 1, err, resp.status)
+		delete(resp.body, mem.tracking_allocator(&track))
+		expect_caller_holds_nothing(t, &track, "endless interims")
+	}
+	free_all(context.temp_allocator)
 }
