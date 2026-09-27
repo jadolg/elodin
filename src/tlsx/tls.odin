@@ -901,10 +901,11 @@ wait_ready :: proc(conn: ^Conn, events: posix.Poll_Event, timeout: time.Duration
 			if remaining <= 0 {
 				return false
 			}
-			ms = c.int(time.duration_milliseconds(remaining))
-			if ms <= 0 {
-				ms = 1
-			}
+			// Rounded up, so `poll` never gives up before the deadline: rounded
+			// down, a wait ended with a fraction of a millisecond still to run,
+			// and a caller holding a deadline of its own found budget left
+			// over and spent it on a retry that could not finish (#445).
+			ms = c.int((remaining + time.Millisecond - 1) / time.Millisecond)
 		}
 		fds := [1]posix.pollfd{{fd = posix.FD(socket_fd(conn.socket)), events = events}}
 		ret := posix.poll(raw_data(fds[:]), 1, ms)

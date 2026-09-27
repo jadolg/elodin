@@ -1006,7 +1006,7 @@ ordinary: it is a waiter that woke a hair before its own expiry.
 // reason: `SO_SNDTIMEO` is a `timeval` too.
 @(private)
 pipe_set_write_timeout :: proc(c: ^Pipe_Conn, d: time.Duration) {
-	_ = net.set_option(c.stream.socket, .Send_Timeout, max(d, time.Millisecond))
+	stream_set_write_timeout(&c.stream, d)
 }
 
 @(private)

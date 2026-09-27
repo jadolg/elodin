@@ -185,27 +185,10 @@ exchange_doh_h1 :: proc(
 				socket = conn.socket,
 				tls    = conn.tls,
 			}
-			/*
-			On this query's budget, not the one that opened it.
-
-			The deadlines a pooled connection carries are whatever the query
-			that dialled it had left - `open_stream` puts that figure on the
-			socket and `get_h2_conn` puts the configured timeout on one it
-			hands to the pool. Left alone, a connection opened with a sliver
-			would cut the next query short and one opened with the whole
-			timeout would hold a short query for all of it, which is the same
-			confusion `Pipe_Conn.timeout` exists to avoid. This bounds the
-			request's write; the reads are held to the deadline one by one in
-			`reader_fill`.
-			*/
-			set_socket_timeouts(stream.socket, remaining)
-			if stream.tls != nil {
-				tlsx.set_timeouts(stream.tls, remaining, remaining)
-			}
+			// The timeouts it carries are whatever the query that dialled it
+			// had; `http_exchange` replaces them with this query's deadline
+			// before every write and read.
 		} else {
-			// `open_stream` puts this figure on the socket as well as on the
-			// dial, so it bounds the write that follows; `reader_fill` holds
-			// the reads to the deadline.
 			s, oerr := open_stream(u.endpoint, u.tls_ctx, u.spec.hostname, remaining, u)
 			if oerr != .None {
 				return nil, oerr

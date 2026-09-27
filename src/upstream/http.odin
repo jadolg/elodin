@@ -48,15 +48,15 @@ stream_read :: proc(s: ^Stream, buf: []u8) -> (n: int, err: Error) {
 }
 
 /*
-`deadline`, when set, bounds the write: on TLS the whole call waits for what is
-left of it, as `tlsx.write` holds a call to one timeout. On a plain socket it is
+`deadline`, when set, bounds the write, and `idle` any one write under it, as
+`reader_fill` does for reads: on TLS the whole call waits for what is left, as
+`tlsx.write` holds a call to one timeout. On a plain socket it is
 the timeout on each `send` - core:net retries a short one with a fresh wait - so
 it bounds only a write that fits the socket buffer, which is what the plain-HTTP
 caller sends: a list download's GET. DoH is HTTPS only.
 */
-stream_write :: proc(s: ^Stream, buf: []u8, deadline := time.Tick{}) -> Error {
-	if deadline != {} {
-		wait := time.tick_diff(time.tick_now(), deadline)
+stream_write :: proc(s: ^Stream, buf: []u8, deadline := time.Tick{}, idle := time.Duration(0)) -> Error {
+	if wait, bounded := next_wait(deadline, idle); bounded {
 		if wait <= 0 {
 			return .Timeout
 		}
@@ -137,16 +137,9 @@ reader_fill :: proc(r: ^Buf_Reader) -> Error {
 	field limit and the body limit let it (#445). So each read waits for what
 	is left of the deadline at most.
 	*/
-	if r.deadline != {} || r.idle > 0 {
-		wait := r.idle
-		if r.deadline != {} {
-			left := time.tick_diff(time.tick_now(), r.deadline)
-			if left <= 0 {
-				return .Timeout
-			}
-			if wait == 0 || left < wait {
-				wait = left
-			}
+	if wait, bounded := next_wait(r.deadline, r.idle); bounded {
+		if wait <= 0 {
+			return .Timeout
 		}
 		stream_set_read_timeout(r.stream, wait)
 	}
@@ -175,6 +168,23 @@ reader_fill :: proc(r: ^Buf_Reader) -> Error {
 	}
 	append(&r.buf, ..chunk[:n])
 	return .None
+}
+
+/*
+How long the next read or write may wait: what is left of `deadline`, or `idle`
+if that is shorter. `bounded` is false with neither set, and the timeouts
+already on the socket apply; a `wait` of zero or less is the deadline passed.
+*/
+@(private)
+next_wait :: proc(deadline: time.Tick, idle: time.Duration) -> (wait: time.Duration, bounded: bool) {
+	if deadline == {} {
+		return idle, idle > 0
+	}
+	left := time.tick_diff(time.tick_now(), deadline)
+	if idle > 0 && idle < left {
+		return idle, true
+	}
+	return left, true
 }
 
 /*
@@ -314,7 +324,7 @@ The returned body is allocated from `allocator`; everything else borrows from
 scratch memory and must be copied if it needs to outlive the call.
 
 `deadline`, when set, bounds the request's writes and the reading of the whole
-response, and `idle` any one read under it; see `stream_write` and
+response, and `idle` any one read or write under it; see `stream_write` and
 `reader_fill`. Without one, only the timeouts already on
 the stream apply, and those are per read.
 */
@@ -356,9 +366,9 @@ http_exchange :: proc(
 	}
 	strings.write_string(&b, "\r\n")
 
-	stream_write(stream, transmute([]u8)strings.to_string(b), deadline) or_return
+	stream_write(stream, transmute([]u8)strings.to_string(b), deadline, idle) or_return
 	if len(req.body) > 0 {
-		stream_write(stream, req.body, deadline) or_return
+		stream_write(stream, req.body, deadline, idle) or_return
 	}
 
 	r := Buf_Reader {
