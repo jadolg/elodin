@@ -465,7 +465,7 @@ The figure the documentation quotes is the figure the constants add up to.
 
 `MAX_CACHED_ZONE_BYTES` is what an operator multiplies by `max_cached_zones`,
 and it is quoted in three places away from here: the startup warning, the
-README's sizing paragraph, and the constant's own note. It was quoted wrongly
+`max_cached_zones` paragraph of docs/dnssec.md, and the constant's own note. It was quoted wrongly
 once already - as `MAX_CACHED_ZONE_KEY_BYTES` alone, which is the RDATA and not
 the entry - so the arithmetic is pinned rather than left to be re-derived by
 whoever next changes one of the parts.
@@ -487,7 +487,7 @@ test_what_an_entry_costs_is_what_the_parts_come_to :: proc(t: ^testing.T) {
 		"an entry cannot cost no more than the keys it holds",
 	)
 
-	// "about twelve kilobytes", and "about 48 MB at the default" in the README.
+	// "about twelve kilobytes", and "about 48 MB at the default" in docs/dnssec.md.
 	// Bands rather than exact numbers: the point is that the prose is still
 	// true, not that these parts may never move.
 	kb := MAX_CACHED_ZONE_BYTES / 1024

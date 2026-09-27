@@ -160,7 +160,7 @@ server:
   # And note what none of it can do: every budget here is per /24 and per /64, so
   # an actor with addresses in several prefixes has several copies of each. If this
   # instance is reachable from the internet, put a per-source limit on new
-  # connections in front of it as well - the README has an nftables rule.
+  # connections in front of it as well - docs/public-resolver.md has an nftables rule.
   #
   # The figures are defaults rather than the only answer. A /24 is a household
   # here and thousands of subscribers behind a carrier NAT on the internet, so a
@@ -245,7 +245,7 @@ upstream:
   strategy: failover
   timeout: 5s
   attempts: 2
-  max_idle: 8          # pooled connections per upstream (TCP/DoT/DoH)
+  max_idle: 8          # pooled idle connections per DoH (HTTP/1.1) upstream
   idle_timeout: 30s
 
   # Used to resolve upstream hostnames without going through the system
@@ -323,8 +323,9 @@ upstream:
   # that breaks the chain instead of completing it.
   #
   # Careful if you are coming from dnsmasq: server=/corp.example/10.0.0.1 under
-  # blocking.rules blocks that zone rather than routing it, the form being one
-  # that turns up in blocklists. Routing lives here and nowhere else.
+  # blocking.rules is discarded rather than routing the zone, and
+  # server=/corp.example/ with no server blocks it - the form being one that
+  # turns up in blocklists. Routing lives here and nowhere else.
   # zones:
   #   - domains: [corp.example]
   #     servers: [10.0.0.1]
@@ -492,8 +493,8 @@ cookies:
   # someone else's address, at the price of one extra round trip for every new
   # client. Meant for use while an attack is actually under way. Queries with no
   # cookie, and queries over TCP, DoT or DoH, are unaffected. Needs `enabled`:
-  # what it demands is a cookie this server issued, so the two together are
-  # refused at startup rather than left looking like a protection that is on.
+  # what it demands is a cookie this server issued, so `require` without
+  # `enabled` is refused at startup rather than left looking like a protection that is on.
   require: false
 
   # The same mechanism pointed the other way: elodin presents a cookie of its
@@ -571,7 +572,7 @@ rebind:
 #
 # One thing to watch: a name you sink by pointing it at a host on your LAN would
 # take that host's reverse with it. `ptr: false` on that rule keeps the forward
-# answer and leaves the address alone. See "Reverse lookups" in the README.
+# answer and leaves the address alone. See "Reverse lookups" in docs/rewrites.md.
 # rewrites:
 #   - domain: nas.home
 #     answer: 192.168.1.50
@@ -686,7 +687,7 @@ special_use:
 #
 # Everything it publishes is a counter the resolver keeps anyway for the
 # `msg=stats` log line, read at scrape time, so this costs nothing per query
-# either way. See the README for what is on the page.
+# either way. See docs/metrics.md for what is on the page.
 metrics:
   enabled: false
 

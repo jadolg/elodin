@@ -1191,7 +1191,7 @@ datagrams to an IPv4 destination under such a bind. `core:net` reports the
 sixteen bytes as they arrived and nothing between the socket and here normalises
 them, so a judgement that needs the address a client actually has asks for it
 through this. A deployment `config.source_allowed` goes out of its way to support
-(see `config.address_bytes`, and the `allow_from` section of the README) is one
+(see `config.address_bytes`, and docs/access-control.md) is one
 every other judgement about a source has to be able to make too: whether it is
 loopback, and which prefix's budget it spends.
 

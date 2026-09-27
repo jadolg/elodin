@@ -52,7 +52,7 @@ MAX_DERIVED_WORKERS :: 128
 /*
 Memory charged to each thread when checking the derivation against RAM.
 
-Measured resident cost is ~0.26 MB per worker (README, "Resource use"), nearly
+Measured resident cost is ~0.26 MB per worker (`mise run bench`), nearly
 all of it the scratch arena; this rounds up to cover the stack pages a query
 touches and the allocator's own per-thread retention.
 */
@@ -233,7 +233,7 @@ candidate count is not known here, so it is too loose for a group of three
 upstreams and, worse, it binds on the strategies that use no racer at all.
 `failover` and `round_robin` resolve on the calling thread, so an operator
 trimming `upstream_workers` on one of those would have silently cut the chain
-walks with it. The racer interaction is in the README, where the number of
+walks with it. The racer interaction is in docs/dnssec.md, where the number of
 upstreams is known.
 */
 derive_chain_walks :: proc(threads: int) -> int {

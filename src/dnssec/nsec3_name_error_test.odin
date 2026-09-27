@@ -300,7 +300,7 @@ The number three operator-facing documents write down.
 
 `MAX_NSEC3_ITERATIONS_LIMIT` is derived from the hashing allowance, and the
 allowance is a measurement that a faster box or a different charge could move.
-The README, `examples/elodin.yaml` and `examples/public.yaml` all name 255 in
+`docs/dnssec.md`, `examples/elodin.yaml` and `examples/public.yaml` all name 255 in
 prose, where nothing recomputes. This is what tells whoever retunes the
 allowance that those three want editing.
 */

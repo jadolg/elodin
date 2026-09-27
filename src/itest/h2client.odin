@@ -15,7 +15,7 @@ Frames are built by hand so the server's framing is checked against something
 other than itself. Request headers are HPACK literals, optionally Huffman
 coded, which exercises the server's decoder on both paths. Response headers go
 through the h2 package's decoder — interoperability with a foreign HPACK
-implementation is covered separately by the curl-based checks in the README.
+implementation is covered separately by the curl-based checks in docs/development.md.
 */
 
 H2_Stream_Result :: struct {

@@ -1,7 +1,7 @@
 # elodin benchmark
 
-The harness behind the README's *Capacity* and *Resource use* sections. It
-exists so those numbers can be re-taken rather than trusted: every figure in
+The harness behind the figures in [`docs/`](../docs/) and the committed runs
+under `results/`. It exists so those numbers can be re-taken rather than trusted: every figure in
 them comes out of `mise run bench`, and a claim that cannot be reproduced by
 running it is a claim to delete.
 
