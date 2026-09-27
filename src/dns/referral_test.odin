@@ -182,6 +182,7 @@ test_peek_referral_bounds_the_alias_branch :: proc(t: ^testing.T) {
 	testing.expect(t, peek_referral(wire(to_sub, crowded[:MAX_ALIAS_REFERRAL_RECORDS])), "an authority at the limit is read")
 	testing.expect(t, !peek_referral(wire(to_sub, crowded)), "an authority past the limit is left as an answer")
 	testing.expect(t, !peek_referral(wire(to_sub, delegation, qtype = .CNAME)), "a CNAME asked for is the answer")
+	testing.expect(t, !peek_referral(wire(to_sub, delegation, qtype = .ANY)), "a CNAME answering ANY is the answer")
 
 	full := wire(to_sub, delegation)
 	for n in 0 ..< len(full) {

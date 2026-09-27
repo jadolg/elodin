@@ -437,10 +437,13 @@ peek_referral :: proc(msg: []u8) -> bool {
 	qdcount := int(u16(msg[4]) << 8 | u16(msg[5]))
 	ancount := int(u16(msg[6]) << 8 | u16(msg[7]))
 	nscount := int(u16(msg[8]) << 8 | u16(msg[9]))
-	if nscount == 0 || (ancount == 0 && msg[2] & 0x04 != 0) {
+	// A header rcode other than zero composes to something other than NOERROR
+	// whatever the OPT record adds, so only a zero one needs the walk below.
+	if nscount == 0 || msg[3] & 0x0f != 0 || (ancount == 0 && msg[2] & 0x04 != 0) {
 		return false
 	}
-	if ancount > MAX_ALIAS_REFERRAL_RECORDS || (ancount > 0 && nscount > MAX_ALIAS_REFERRAL_RECORDS) {
+	// The alias branch reads one question, and decodes nothing for any other.
+	if ancount > 0 && (qdcount != 1 || ancount > MAX_ALIAS_REFERRAL_RECORDS || nscount > MAX_ALIAS_REFERRAL_RECORDS) {
 		return false
 	}
 
@@ -457,19 +460,16 @@ peek_referral :: proc(msg: []u8) -> bool {
 	}
 	// The answer first: an ordinary answer's first record ends this here.
 	for _ in 0 ..< ancount {
-		next, ok := skip_name(msg, pos)
-		if !ok || next + 10 > len(msg) {
+		type, next, ok := skip_record(msg, pos)
+		if !ok {
 			return false
 		}
-		#partial switch Type(u16(msg[next]) << 8 | u16(msg[next + 1])) {
+		#partial switch type {
 		case .CNAME, .DNAME, .RRSIG:
 		case:
 			return false
 		}
-		pos = next + 10 + int(u16(msg[next + 8]) << 8 | u16(msg[next + 9]))
-		if pos > len(msg) {
-			return false
-		}
+		pos = next
 	}
 	// The rcode after the counts and the answer: composing it walks the whole
 	// message for the OPT record.
@@ -479,25 +479,36 @@ peek_referral :: proc(msg: []u8) -> bool {
 	ns := false
 	authority_at := pos
 	for _ in 0 ..< nscount {
-		next, ok := skip_name(msg, pos)
-		if !ok || next + 10 > len(msg) {
+		type, next, ok := skip_record(msg, pos)
+		if !ok {
 			return false
 		}
-		#partial switch Type(u16(msg[next]) << 8 | u16(msg[next + 1])) {
+		#partial switch type {
 		case .SOA:
 			return false
 		case .NS:
 			ns = true
 		}
-		pos = next + 10 + int(u16(msg[next + 8]) << 8 | u16(msg[next + 9]))
-		if pos > len(msg) {
-			return false
-		}
+		pos = next
 	}
 	if !ns || ancount == 0 {
 		return ns
 	}
 	return referred_past_alias(msg, authority_at, nscount)
+}
+
+// The resource record at `pos`: its type, and where the one after it starts.
+@(private)
+skip_record :: proc(msg: []u8, pos: int) -> (type: Type, next: int, ok: bool) {
+	fixed, named := skip_name(msg, pos)
+	if !named || fixed + 10 > len(msg) {
+		return
+	}
+	next = fixed + 10 + int(u16(msg[fixed + 8]) << 8 | u16(msg[fixed + 9]))
+	if next > len(msg) {
+		return
+	}
+	return Type(u16(msg[fixed]) << 8 | u16(msg[fixed + 1])), next, true
 }
 
 // The most answer or authority records `peek_referral` follows a chain through:
@@ -516,9 +527,11 @@ referred_past_alias :: proc(msg: []u8, authority_at, nscount: int) -> bool {
 	if err != .None || len(decoded.question) != 1 {
 		return false
 	}
-	// A CNAME asked for is the data, not a step towards it.
+	// A CNAME asked for is the data, not a step towards it - and so is one
+	// answering ANY, which matches it and is not followed (RFC 1034 section
+	// 4.3.2, step 3a).
 	#partial switch decoded.question[0].type {
-	case .CNAME, .DNAME, .RRSIG:
+	case .CNAME, .DNAME, .RRSIG, .ANY:
 		return false
 	}
 	asked := decoded.question[0].name
@@ -543,14 +556,14 @@ referred_past_alias :: proc(msg: []u8, authority_at, nscount: int) -> bool {
 	}
 	pos := authority_at
 	for _ in 0 ..< nscount {
-		next, _ := skip_name(msg, pos)
-		if Type(u16(msg[next]) << 8 | u16(msg[next + 1])) == .NS {
+		type, next, _ := skip_record(msg, pos)
+		if type == .NS {
 			zone, _, nerr := decode_name(msg, pos, context.temp_allocator)
 			if nerr == .None && name_at_or_below(target, zone) && !name_at_or_below(asked, zone) {
 				return true
 			}
 		}
-		pos = next + 10 + int(u16(msg[next + 8]) << 8 | u16(msg[next + 9]))
+		pos = next
 	}
 	return false
 }

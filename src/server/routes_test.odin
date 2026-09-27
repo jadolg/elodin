@@ -966,7 +966,6 @@ test_a_referral_nobody_does_better_than_is_a_servfail :: proc(t: ^testing.T) {
 		{"a CNAME out of the zone", route_reply_alias("below.example.", "ghs.googlehosted.com.", "below.example."), false},
 	}
 	for c in cases {
-		referral := c.referral
 		socket, berr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
 		if !testing.expectf(t, berr == nil, "cannot bind the mock: %v", berr) {
 			return
@@ -1002,7 +1001,7 @@ test_a_referral_nobody_does_better_than_is_a_servfail :: proc(t: ^testing.T) {
 		testing.expect(t, mock.asked, "the upstream was not asked")
 		decoded, derr := dns.decode_message(out, context.temp_allocator)
 		testing.expect_value(t, derr, dns.Decode_Error.None)
-		if referral {
+		if c.referral {
 			testing.expectf(t, dns.Rcode(decoded.flags.rcode) == .Serv_Fail, "%s: rcode %v, want SERVFAIL", c.what, dns.Rcode(decoded.flags.rcode))
 			testing.expectf(t, len(decoded.answer) + len(decoded.authority) == 0, "%s: the referral reached the client", c.what)
 		} else {
