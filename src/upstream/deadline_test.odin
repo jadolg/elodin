@@ -566,3 +566,73 @@ test_the_calls_of_one_question_share_its_deadline :: proc(t: ^testing.T) {
 	testing.expect_value(t, ups[0].failures, failures)
 	free_all(context.temp_allocator)
 }
+
+// Reads one query and answers nothing, but sends a datagram of junk to the
+// asker from a socket of its own at `at` after it arrived: a stray, or a
+// forgery, that the exchange must pass over.
+@(private = "file")
+Stray_Mock :: struct {
+	socket: net.UDP_Socket,
+	stray:  net.UDP_Socket,
+	at:     time.Duration,
+}
+
+@(private = "file")
+stray_mock_serve :: proc(m: ^Stray_Mock) {
+	buf: [512]u8
+	n, client, err := net.recv_udp(m.socket, buf[:])
+	if err != nil || n < dns.HEADER_SIZE {
+		return
+	}
+	time.sleep(m.at)
+	_, _ = net.send_udp(m.stray, buf[:n], client)
+}
+
+/*
+One UDP exchange waits its timeout, however many datagrams arrive that it
+throws away. Each receive used to be armed with the whole timeout and the
+deadline read only between them, so a stray landing just before the timeout
+bought another whole one: an off-path sender could double every exchange, and
+with it the one a question's deadline lets cross the line (issues #446, #376).
+*/
+@(test)
+test_a_stray_datagram_does_not_extend_a_udp_exchange :: proc(t: ^testing.T) {
+	m: Stray_Mock
+	m.at = DEADLINE_TIMEOUT * 9 / 10
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, serr == nil, "cannot bind the mock: %v", serr) {
+		return
+	}
+	m.socket = socket
+	defer net.close(socket)
+	_ = net.set_option(socket, .Receive_Timeout, 10 * DEADLINE_TIMEOUT)
+	stray, sterr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, sterr == nil, "cannot bind the stray sender: %v", sterr) {
+		return
+	}
+	m.stray = stray
+	defer net.close(stray)
+	bound, _ := net.bound_endpoint(socket)
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "stray", kind = .UDP, address = "127.0.0.1", port = bound.port},
+		0,
+		DEADLINE_TIMEOUT,
+		context.allocator,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot build the upstream: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+	worker := thread.create_and_start_with_poly_data(&m, stray_mock_serve)
+
+	started := time.tick_now()
+	resp, xerr := exchange(u, deadline_query(), DEADLINE_TIMEOUT, context.allocator)
+	spent := time.tick_since(started)
+	thread.join(worker)
+	thread.destroy(worker)
+	delete(resp, context.allocator)
+
+	testing.expect_value(t, xerr, Error.Timeout)
+	testing.expectf(t, spent < DEADLINE_TIMEOUT * 3 / 2, "the exchange waited %v, where its timeout is %v", spent, DEADLINE_TIMEOUT)
+	free_all(context.temp_allocator)
+}

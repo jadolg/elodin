@@ -59,7 +59,7 @@ exchange_udp :: proc(
 	*/
 	limit := clamp(int(dns.peek_udp_size(query)), dns.MAX_UDP_SIZE, dns.MAX_MESSAGE)
 	buf := make([]u8, limit + 1, context.temp_allocator)
-	deadline := time.time_add(time.now(), timeout)
+	deadline := time.tick_add(time.tick_now(), timeout)
 
 	/*
 	Whether anything arrived from the server and was thrown away.
@@ -74,7 +74,20 @@ exchange_udp :: proc(
 	*/
 	rejected := false
 
-	for time.diff(deadline, time.now()) < 0 {
+	for {
+		/*
+		Each receive is armed with what is left, not the whole timeout: the
+		socket's timeout restarts with every call, so a datagram passed over
+		below - a stray, a forgery - landing just before it ran out bought
+		another whole one, and an off-path sender could double any exchange
+		(issue #446). Never zero, which `SO_RCVTIMEO` reads as no timeout at
+		all. On the tick clock, which an NTP step cannot move.
+		*/
+		left := time.tick_diff(time.tick_now(), deadline)
+		if left <= 0 {
+			break
+		}
+		_ = net.set_option(socket, .Receive_Timeout, max(left, time.Millisecond))
 		n, remote, recv_err := net.recv_udp(socket, buf)
 		if recv_err != nil {
 			// The datagram was larger than the room the query offered, so what
