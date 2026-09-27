@@ -220,6 +220,7 @@ resolve_insisting :: proc(
 	unreachable: [dynamic]^Upstream
 	unreachable.allocator = context.temp_allocator
 
+	started := time.tick_now()
 	response, winner, err = resolve(g, query, allocator, &unreachable)
 	if err != .None || acceptable(response) {
 		return response, winner, err
@@ -315,18 +316,27 @@ resolve_insisting :: proc(
 	note_swept_rcode(winner)
 
 	/*
-	And the sweep has one `g.timeout` of waiting to spend, counted as it spends
-	it: every exchange costs what it took, answered or not, and once the total
-	reaches the budget the members after it are left alone. Answered or not,
-	because a member that recurses for most of the timeout and then says
-	SERVFAIL has cost this query what a member that said nothing did.
+	And the sweep has at most one `g.timeout` of waiting to spend, and never
+	more than what `resolve` left of the call's `query_budget` (issue #426): the
+	two are one budget, not one on top of the other. A group whose first member
+	is silent and whose second recurses for most of a timeout before saying
+	SERVFAIL hands the reply back near the end of the budget, and a fresh
+	timeout for the sweep then let a slow third and a silent fourth take the
+	query to four timeouts - the twenty seconds issue #327 was filed about.
+	What `resolve` took is read off the tick clock around the whole call rather
+	than added up by it, so every wait in it counts, answered exchanges and
+	failures that cost nothing included.
 
-	The budget is checked after each exchange rather than partway through one,
-	so the exchange that crosses it is allowed to finish and the sweep's worst
-	wait is two timeouts rather than one: one spent getting to the line, one for
-	the exchange that stepped over it. Checking it first changes nothing - a
-	member under the line is asked either way, and it is the asking that
-	overshoots. What it rules out is the third and the fourth.
+	Counted as it is spent: every exchange costs what it took, answered or not,
+	and once the total reaches the budget the members after it are left alone.
+	Answered or not, because a member that recurses for most of the timeout and
+	then says SERVFAIL has cost this query what a member that said nothing did.
+
+	The budget is checked before each exchange, and since an exchange runs to
+	its own timeout the one that crosses the line is allowed to finish. So the
+	call's worst wait is three timeouts, `resolve_sequential`'s own: two spent
+	getting to the line, one for the exchange that stepped over it. The sweep
+	cannot add a fourth, because an exchange only starts under the line.
 
 	On the tick clock, not the wall clock. `time.now` is `CLOCK_REALTIME`, and
 	an NTP step backwards between two readings of it - routine enough on the
@@ -366,8 +376,13 @@ resolve_insisting :: proc(
 	expiry one query pays for it again, which is the arrangement every other
 	part of this file already makes.
 	*/
+	budget := min(g.timeout, query_budget(g) - time.tick_since(started))
 	spent: time.Duration
 	for u in g.servers {
+		if spent >= budget {
+			logx.debugf("this query has waited %v on its upstreams, leaving the rest of the group unswept", time.tick_since(started))
+			break
+		}
 		if u == winner {
 			continue
 		}
@@ -427,10 +442,6 @@ resolve_insisting :: proc(
 			return resp, u, .None
 		} else if xerr == .None {
 			_ = delete(resp, allocator)
-		}
-		if spent >= g.timeout {
-			logx.debugf("the sweep for this query has waited %v, leaving the rest of the group unasked", spent)
-			break
 		}
 	}
 
@@ -689,6 +700,13 @@ extended_error_within :: proc(response: []u8, first, last: u16) -> bool {
 	return first <= info && info <= last
 }
 
+// The waiting one `resolve_insisting` call may do, `resolve` and its sweep
+// together; `resolve_sequential` says why it is two timeouts.
+@(private)
+query_budget :: proc(g: ^Group) -> time.Duration {
+	return 2 * g.timeout
+}
+
 @(private)
 resolve_sequential :: proc(
 	g: ^Group,
@@ -734,7 +752,7 @@ resolve_sequential :: proc(
 	park, three queries later, as with the sweep. `strategy: race` is the
 	answer for a group that must not wait on a dead member at all.
 	*/
-	budget := 2 * g.timeout
+	budget := query_budget(g)
 	spent: time.Duration
 	// The round, from 1, in which this query asked each member; 0 for not yet.
 	// Scratch, like `resolve_race`'s candidates: the caller resets the arena.

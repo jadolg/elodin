@@ -1,6 +1,7 @@
 package upstream
 
 import "core:fmt"
+import "core:mem"
 import "core:net"
 import "core:sync"
 import "core:testing"
@@ -446,5 +447,65 @@ test_the_sweep_charges_a_slow_unresolvable_member_until_it_parks :: proc(t: ^tes
 	defer delete(resp, context.allocator)
 	testing.expect_value(t, err, Error.None)
 	testing.expect(t, winner == lu, "the sweep did not reach the live member once the slow one had parked")
+	free_all(context.temp_allocator)
+}
+
+/*
+The sweep spends what is left of the query's two timeouts, not a timeout of its
+own on top of them (issue #426). A is silent (one timeout); B recurses for half
+of one and says SERVFAIL, which `resolve` hands back at 1.5. What is left is half
+a timeout: C is asked, since it starts under the line, and its slow SERVFAIL
+(0.7) crosses it and ends the sweep at 2.2. D, silent, is never reached - with a
+fresh timeout for the sweep C's 0.7 left room for it, and the query waited 3.2.
+The issue's own group (B and C at 0.9) leaves C a margin of a tenth of a
+timeout, 20 ms here, which a loaded test run can eat; these keep 40 ms or more
+on every side of each judgement.
+*/
+@(test)
+test_the_sweep_spends_what_is_left_of_the_query_budget :: proc(t: ^testing.T) {
+	mocks: [4]Echo_Mock
+	mocks[0].mute = true
+	mocks[1].rcode = u8(dns.Rcode.Serv_Fail)
+	mocks[1].delay = DEADLINE_TIMEOUT * 5 / 10
+	mocks[2].rcode = u8(dns.Rcode.Serv_Fail)
+	mocks[2].delay = DEADLINE_TIMEOUT * 7 / 10
+	mocks[3].mute = true
+	ups: [4]^Upstream
+	workers: [4]^thread.Thread
+	for i in 0 ..< 4 {
+		ok: bool
+		ups[i], workers[i], ok = start_echo_mock(t, &mocks[i], fmt.tprintf("m%d", i))
+		if !ok {
+			return
+		}
+	}
+	defer for i in 0 ..< 4 {
+		stop_echo_mock(&mocks[i], ups[i], workers[i])
+	}
+
+	g := Group {
+		servers   = ups[:],
+		strategy  = .Failover,
+		timeout   = DEADLINE_TIMEOUT,
+		attempts  = 2,
+		allocator = context.allocator,
+	}
+	// Both callers, since both are the one sweep: a client's question and a
+	// chain lookup. Each call gets a budget of its own.
+	for insisting, i in ([]proc(_: ^Group, _: []u8, _: mem.Allocator) -> ([]u8, ^Upstream, Error){resolve_readable, resolve_answerable}) {
+		before := sync.atomic_load(&mocks[3].hits)
+		started := time.tick_now()
+		resp, winner, err := insisting(&g, deadline_query(), context.allocator)
+		spent := time.tick_since(started)
+		delete(resp, context.allocator)
+
+		testing.expect_value(t, err, Error.None)
+		testing.expectf(t, winner == ups[1], "call %d: the first SERVFAIL did not stand", i)
+		testing.expectf(t, sync.atomic_load(&mocks[2].hits) == i + 1, "call %d: the sweep did not ask the member under the line", i)
+		testing.expectf(t, sync.atomic_load(&mocks[3].hits) == before, "call %d: a fourth member was asked after the query's budget had gone", i)
+		// Under three timeouts, the design's worst case: two, and the exchange
+		// that crosses the line. A fresh budget for the sweep waited 3.2.
+		testing.expectf(t, spent < 3 * DEADLINE_TIMEOUT, "call %d: the query waited %v, where the budget is two timeouts of %v", i, spent, DEADLINE_TIMEOUT)
+	}
 	free_all(context.temp_allocator)
 }

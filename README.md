@@ -410,11 +410,11 @@ However many servers and `attempts` there are, a query waits at most about two
 server still hands over to the second inside the query, which is asked with its
 full `timeout`; a third is left for the next query, by which time the dead ones
 are on their way to the cooldown below. A reply that did arrive but says
-SERVFAIL or REFUSED sends the query on to the rest of the group, which has a
-`timeout` of its own to spend on top. One exchange is never cut short, so one
-that runs long - a hostname upstream whose `bootstrap` resolvers have gone
-quiet, three seconds a lookup - can carry a query past the figure; such a
-server counts that as a failure and is benched like a dead one.
+SERVFAIL or REFUSED sends the query on to the rest of the group, inside the
+same two `timeout`s rather than on top of them. One exchange is never cut
+short, so one that runs long - a hostname upstream whose `bootstrap` resolvers
+have gone quiet, three seconds a lookup - can carry a query past the figure;
+such a server counts that as a failure and is benched like a dead one.
 
 `bootstrap` matters: elodin resolves upstream hostnames itself rather than
 through the system resolver, since on a machine where elodin *is* the system
@@ -535,10 +535,11 @@ left alone and no other figure would name it.
 
 What the sweep costs is up to one extra exchange per remaining member of the
 group, and a bounded wait: the sweep counts what each exchange cost it and asks
-nobody else once that reaches one `upstream.timeout`. The exchange that crosses
-the line is allowed to finish, so the worst of it is two timeouts rather than
-one — what it rules out is the third and the fourth, however many spares a group
-has. A failure
+nobody else once that reaches one `upstream.timeout`, or whatever is left of the
+query's two once the first reply came back, whichever is less. The exchange that
+crosses the line is allowed to finish, so the worst of the whole query is three
+timeouts — what it rules out is the fourth and the fifth, however many spares a
+group has. A failure
 that cost nothing — a member whose hostname cannot be resolved, which never
 parks either — is passed over rather than stopping the sweep. A live spare
 standing behind one that swallows the whole timeout waits for that member to
