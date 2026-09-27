@@ -121,7 +121,8 @@ Stored_Verdict :: enum u8 {
 How many followers may wait on workers of the shared pool at once: a quarter,
 the same share `refresh_ceiling` gives the stale refreshes.
 
-A follower holds its worker for as long as the leader takes, and a leader
+A follower holds its worker for as long as the leader takes, up to its
+`flight_patience`, about four of its longest group's timeouts - and a leader
 validating a slow chain holds one of `dnssec.max_chain_walks` - so without a
 ceiling, one flood of a single cold signed name would park every worker behind
 one walk, which is the exhaustion that bound exists to prevent (issue #356).

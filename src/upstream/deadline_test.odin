@@ -588,6 +588,25 @@ stray_mock_serve :: proc(m: ^Stray_Mock) {
 	_, _ = net.send_udp(m.stray, buf[:n], client)
 }
 
+// Binds the mock and its stray sender, the stray landing at nine tenths of the
+// timeout. The caller closes both sockets.
+@(private = "file")
+stray_mock_bind :: proc(t: ^testing.T) -> (m: Stray_Mock, ok: bool) {
+	m.at = DEADLINE_TIMEOUT * 9 / 10
+	err: net.Network_Error
+	m.socket, err = net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, err == nil, "cannot bind the mock: %v", err) {
+		return
+	}
+	_ = net.set_option(m.socket, .Receive_Timeout, 10 * DEADLINE_TIMEOUT)
+	m.stray, err = net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, err == nil, "cannot bind the stray sender: %v", err) {
+		net.close(m.socket)
+		return
+	}
+	return m, true
+}
+
 /*
 One UDP exchange waits its timeout, however many datagrams arrive that it
 throws away. Each receive used to be armed with the whole timeout and the
@@ -597,22 +616,13 @@ with it the one a question's deadline lets cross the line (issues #446, #376).
 */
 @(test)
 test_a_stray_datagram_does_not_extend_a_udp_exchange :: proc(t: ^testing.T) {
-	m: Stray_Mock
-	m.at = DEADLINE_TIMEOUT * 9 / 10
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock: %v", serr) {
+	m, ok := stray_mock_bind(t)
+	if !ok {
 		return
 	}
-	m.socket = socket
-	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, 10 * DEADLINE_TIMEOUT)
-	stray, sterr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, sterr == nil, "cannot bind the stray sender: %v", sterr) {
-		return
-	}
-	m.stray = stray
-	defer net.close(stray)
-	bound, _ := net.bound_endpoint(socket)
+	defer net.close(m.socket)
+	defer net.close(m.stray)
+	bound, _ := net.bound_endpoint(m.socket)
 	u, uerr := make_upstream(
 		config.Upstream_Spec{name = "stray", kind = .UDP, address = "127.0.0.1", port = bound.port},
 		0,
@@ -641,22 +651,13 @@ test_a_stray_datagram_does_not_extend_a_udp_exchange :: proc(t: ^testing.T) {
 // exchange that needs it, so a stray must not stretch it either.
 @(test)
 test_a_stray_datagram_does_not_extend_a_bootstrap_query :: proc(t: ^testing.T) {
-	m: Stray_Mock
-	m.at = DEADLINE_TIMEOUT * 9 / 10
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock: %v", serr) {
+	m, bound_ok := stray_mock_bind(t)
+	if !bound_ok {
 		return
 	}
-	m.socket = socket
-	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, 10 * DEADLINE_TIMEOUT)
-	stray, sterr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, sterr == nil, "cannot bind the stray sender: %v", sterr) {
-		return
-	}
-	m.stray = stray
-	defer net.close(stray)
-	bound, _ := net.bound_endpoint(socket)
+	defer net.close(m.socket)
+	defer net.close(m.stray)
+	bound, _ := net.bound_endpoint(m.socket)
 	worker := thread.create_and_start_with_poly_data(&m, stray_mock_serve)
 
 	started := time.tick_now()
