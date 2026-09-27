@@ -2873,7 +2873,8 @@ not read some other way (#437 review).
   read as chunked alone and `keep-alive` + ` close` was pooled; a line with no
   colon at all is no field line either.
 - The version is `HTTP/<DIGIT>.<DIGIT>` (RFC 9112 2.3): `HTTP/1.1x` passed the
-  `HTTP/` prefix check and was pooled as 1.1.
+  `HTTP/` prefix check and was pooled as 1.1, and this client speaks no major
+  version but 1 - the server side answers others with a 505.
 */
 @(test)
 test_http_response_malformed_framing_is_refused :: proc(t: ^testing.T) {
@@ -2891,6 +2892,8 @@ test_http_response_malformed_framing_is_refused :: proc(t: ^testing.T) {
 		"HTTP/1.9junk 200 OK\r\nContent-Length: 5\r\n\r\nhello",
 		"HTTP/11 200 OK\r\nContent-Length: 5\r\n\r\nhello",
 		"HTTP/ 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+		"HTTP/2.0 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+		"HTTP/0.9 200 OK\r\nContent-Length: 5\r\n\r\nhello",
 	}
 	for reply in CASES {
 		track: mem.Tracking_Allocator

@@ -407,7 +407,7 @@ parse_content_length :: proc(value: string) -> (length: int, err: Error) {
 }
 
 /*
-The status line: `HTTP/<DIGIT>.<DIGIT> SP 3DIGIT`, then optionally a space and a
+The status line: `HTTP/1.<DIGIT> SP 3DIGIT`, then optionally a space and a
 reason phrase (RFC 9112 4), and whether its version is 1.0.
 
 Parsed with a detected base the code was rather more: `HTTP/1.1 0x1 OK` came back
@@ -422,8 +422,8 @@ parse_status :: proc(line: string) -> (status: int, http_1_0: bool, err: Error) 
 	if len(line) < V + 4 || !strings.has_prefix(line, "HTTP/") || line[V] != ' ' {
 		return 0, false, .HTTP_Error
 	}
-	major, dot, minor := line[5], line[6], line[7]
-	if major < '0' || major > '9' || dot != '.' || minor < '0' || minor > '9' {
+	// Major version 1 is the only one spoken on this wire (RFC 9112 2.3).
+	if line[5] != '1' || line[6] != '.' || line[7] < '0' || line[7] > '9' {
 		return 0, false, .HTTP_Error
 	}
 	// A reason phrase is optional, but if anything follows the code it is the
