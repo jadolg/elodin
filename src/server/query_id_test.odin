@@ -165,7 +165,7 @@ makes the answer indeterminate straight away, which is the quick way to reach
 the assertion: what went out on the wire before any of that happened.
 */
 @(private = "file")
-no_chain :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
+no_chain :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
 	return nil, false
 }
 

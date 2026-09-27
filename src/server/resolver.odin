@@ -1850,7 +1850,18 @@ resolve_query :: proc(
 	Here, where the outgoing message has taken its final shape, because what a
 	follower may be handed turns on whether its message and the leader's are the
 	same bytes.
+
+	The question's upstream deadline starts here, at its first exchange - its
+	own, or the leader's it waits on, which it is as much as the leader is - so
+	a follower that forwards after the leader landed with nothing it could use
+	asks with what that wait left of it, not with a fresh one. Every upstream
+	call after this spends it (issue #439): the forward, both groups of a routed
+	apex `DS`, and every lookup of the chain walk. Local, because nothing else
+	forwards for this question: a rewrite alias's target is chased, and returns,
+	before this point is reached, so its nested call starts its own. See
+	`question_span`.
 	*/
+	deadline := time.tick_add(time.tick_now(), question_span(s, q.name, q.type))
 	own_flight: Flight
 	flight: ^Flight
 	if unanswered == nil {
@@ -2092,9 +2103,9 @@ resolve_query :: proc(
 		all, SERVFAIL and REFUSED, where another member of the group is asked
 		instead (issue #309).
 		*/
-		resp, winner, uerr = upstream.resolve_answerable(asked, forwarded, allocator)
+		resp, winner, uerr = upstream.resolve_answerable(asked, forwarded, allocator, &deadline)
 	} else {
-		resp, winner, uerr = upstream.resolve_readable(asked, forwarded, allocator)
+		resp, winner, uerr = upstream.resolve_readable(asked, forwarded, allocator, &deadline)
 	}
 	/*
 	And back on the route unless the parent answered the one thing the parent was
@@ -2156,19 +2167,19 @@ resolve_query :: proc(
 			*/
 			if uerr == .None {
 				logx.debugf(
-					"query DS %s: the parent's group answered %s rather than proving the delegation carries no DS, so the route was asked instead",
+					"query DS %s: the parent's group answered %s rather than proving the delegation carries no DS, so the route is asked instead",
 					q.name,
 					rcode_text(dns.peek_rcode(resp)),
 				)
 			} else {
 				logx.debugf(
-					"query DS %s: the parent's group did not answer (%v), so the route was asked instead",
+					"query DS %s: the parent's group did not answer (%v), so the route is asked instead",
 					q.name,
 					uerr,
 				)
 			}
 			dns.set_id_in_place(forwarded, dns.random_id())
-			again, second, aerr := upstream.resolve_readable(own, forwarded, allocator)
+			again, second, aerr := upstream.resolve_readable(own, forwarded, allocator, &deadline)
 			/*
 			And the route's answer is the only one that can be served from here.
 
@@ -2202,8 +2213,9 @@ resolve_query :: proc(
 				unproven_apex_ds = !settled
 			} else {
 				logx.debugf(
-					"query DS %s: the route did not answer either (%v); the delegation is unestablished",
+					"query DS %s: the route %s (%v); the delegation is unestablished",
 					q.name,
+					"was not asked, the query's deadline having passed" if aerr == .Deadline else "did not answer either",
 					aerr,
 				)
 				uerr = aerr
@@ -2256,12 +2268,20 @@ resolve_query :: proc(
 
 	A fresh transaction ID for the same reason the second exchange draws one:
 	each exchange is a new one on the wire (RFC 5452 section 9.2).
+
+	On what the route left of the question's deadline (issue #439), like every
+	exchange after the first. A route that has gone silent without yet parking
+	spends all of it on its two rounds, and the parent is not reached: that is
+	two queries, since each charges the route twice, after which the route is
+	parked, the memory is passed over by the `group_reachable(own)` above, and
+	the parent is asked first with the whole deadline. Before, those two queries
+	were answered - at four timeouts, twenty seconds, long after the stub left.
 	*/
 	if memoised_parent != nil {
 		route_proved, _ := parent_answers_apex_ds(resp, q.name, uerr == .None, spent, allocator)
 		if !route_proved {
 			dns.set_id_in_place(forwarded, dns.random_id())
-			again, second, perr := upstream.resolve_answerable(memoised_parent, forwarded, allocator)
+			again, second, perr := upstream.resolve_answerable(memoised_parent, forwarded, allocator, &deadline)
 			proved, settled := parent_answers_apex_ds(again, q.name, perr == .None, spent, allocator)
 			remember_apex_ds_parent(s, q.name, perr == .None, settled)
 			/*
@@ -2373,6 +2393,7 @@ resolve_query :: proc(
 			allocator,
 			shared_worker = shared_worker,
 			spent = spent,
+			deadline = &deadline,
 		)
 		#partial switch result.status {
 		case .Bogus, .Indeterminate:

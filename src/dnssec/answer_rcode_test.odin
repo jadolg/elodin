@@ -50,7 +50,7 @@ rc_unhex :: proc(text: string, allocator := context.temp_allocator) -> []u8 {
 }
 
 @(private = "file")
-rc_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
+rc_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
 	for f in FIXTURES {
 		if f.type == type && dns.name_equal_fold(f.name, name) {
 			return rc_unhex(f.wire, allocator), true

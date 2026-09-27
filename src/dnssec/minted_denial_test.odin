@@ -276,6 +276,7 @@ dr_query :: proc(
 	name: string,
 	type: dns.Type,
 	allocator: mem.Allocator,
+	_: ^time.Tick,
 ) -> (
 	wire: []u8,
 	ok: bool,

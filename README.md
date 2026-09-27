@@ -406,8 +406,17 @@ upstream:
 `race` multiplies upstream traffic by the number of servers.
 
 However many servers and `attempts` there are, a query waits at most about two
-`timeout`s on them (`race`: one) before it gives up with SERVFAIL. A dead first
-server still hands over to the second inside the query, which is asked with its
+`timeout`s on its upstreams before it gives up with SERVFAIL (a `race` forward
+gives up after one, leaving the other for what follows it). That is the whole
+question's figure, not each lookup's: the DNSSEC chain lookups, both groups a
+routed apex `DS` asks, and a rewrite alias's target all spend the same deadline,
+counted from its first exchange, and a lookup that finds none left asks nobody.
+With routes of different `timeout`s the deadline is two of the longest among
+the groups the question can ask - its route, and the default group the chain
+walk asks - so a fast LAN route does not starve the chain walk behind it, and a
+slow route does not stretch the deadline of questions it never sees. A query
+waiting on an identical one already in flight spends the same deadline on that
+wait. A dead first server still hands over to the second inside the query, which is asked with its
 full `timeout`; a third is left for the next query, by which time the dead ones
 are on their way to the cooldown below. A reply that did arrive but says
 SERVFAIL or REFUSED sends the query on to the rest of the group, inside the

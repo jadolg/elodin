@@ -278,7 +278,7 @@ UF_FIXTURES := []Fixture{
 }
 
 @(private = "file")
-scenario_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
+scenario_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
 	fixtures := (^[]Fixture)(ctx)^
 	for f in fixtures {
 		if f.type == type && dns.name_equal_fold(f.name, name) {
@@ -467,7 +467,7 @@ Counting_Ctx :: struct {
 }
 
 @(private = "file")
-counting_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
+counting_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
 	counter := (^Counting_Ctx)(ctx)
 	if type == .DNSKEY && !dns.name_equal_fold(name, ".") {
 		counter.dnskey += 1

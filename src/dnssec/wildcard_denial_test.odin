@@ -436,7 +436,7 @@ reproducing - every test still passes, because the message is refused a step
 earlier for an unrelated reason.
 */
 @(private = "file")
-wc_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
+wc_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
 	for f in WC_FIXTURES {
 		if f.type == type && dns.name_equal_fold(f.name, name) {
 			return decode_hex(f.wire, allocator)
@@ -681,7 +681,7 @@ test_an_expanded_ds_or_soa_answer_is_not_secure_either :: proc(t: ^testing.T) {
 	// the attack are filed under that name and type. `wc_query` takes the
 	// first, so the order of the two decides whether what follows reproduces
 	// anything; see the comment on `wc_query`.
-	walked, answered := wc_query(nil, "nx.wctest.", .DS, context.temp_allocator)
+	walked, answered := wc_query(nil, "nx.wctest.", .DS, context.temp_allocator, nil)
 	testing.expect(
 		t,
 		answered && slice.equal(walked, wc_reply("wc_nx_ds")),

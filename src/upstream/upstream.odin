@@ -47,6 +47,12 @@ Error :: enum u8 {
 	HTTP_Error,
 	Too_Large,
 	Unhealthy,
+	/*
+	The client question this call was made for had no waiting left to give it,
+	so nobody was asked (issue #439). Not a statement about any upstream: no
+	exchange was made, and nothing is recorded against a member for it.
+	*/
+	Deadline,
 }
 
 @(private)
@@ -526,6 +532,8 @@ error_label :: proc(e: Error) -> string {
 		return "too_large"
 	case .Unhealthy:
 		return "unhealthy"
+	case .Deadline:
+		return "deadline"
 	}
 	return "unknown"
 }

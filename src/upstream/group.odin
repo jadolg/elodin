@@ -99,14 +99,31 @@ resolve :: proc(
 	winner: ^Upstream,
 	err: Error,
 ) {
+	return resolve_within(g, query, query_budget(g), allocator, unreachable)
+}
+
+// `resolve` on a budget of `budget`, which is `query_budget` or less: what a
+// client question has left of its deadline. See `resolve_insisting`.
+@(private)
+resolve_within :: proc(
+	g: ^Group,
+	query: []u8,
+	budget: time.Duration,
+	allocator: mem.Allocator,
+	unreachable: ^[dynamic]^Upstream,
+) -> (
+	response: []u8,
+	winner: ^Upstream,
+	err: Error,
+) {
 	switch g.strategy {
 	case .Race:
-		return resolve_race(g, query, allocator, unreachable)
+		return resolve_race(g, query, budget, allocator, unreachable)
 	case .Round_Robin:
 		start := int(sync.atomic_add(&g.cursor, 1) % u64(len(g.servers)))
-		return resolve_sequential(g, query, start, allocator, unreachable)
+		return resolve_sequential(g, query, start, budget, allocator, unreachable)
 	case .Failover:
-		return resolve_sequential(g, query, 0, allocator, unreachable)
+		return resolve_sequential(g, query, 0, budget, allocator, unreachable)
 	}
 	return nil, nil, .IO_Error
 }
@@ -132,12 +149,15 @@ resolve_answerable :: proc(
 	g: ^Group,
 	query: []u8,
 	allocator := context.allocator,
+	// The client question's deadline, set by the caller and shared by every
+	// call made for it; see `resolve_insisting`. Nil or zero for none.
+	deadline: ^time.Tick = nil,
 ) -> (
 	response: []u8,
 	winner: ^Upstream,
 	err: Error,
 ) {
-	return resolve_insisting(g, query, answerable, allocator)
+	return resolve_insisting(g, query, answerable, allocator, deadline)
 }
 
 /*
@@ -180,12 +200,15 @@ resolve_readable :: proc(
 	g: ^Group,
 	query: []u8,
 	allocator := context.allocator,
+	// The client question's deadline, set by the caller and shared by every
+	// call made for it; see `resolve_insisting`. Nil or zero for none.
+	deadline: ^time.Tick = nil,
 ) -> (
 	response: []u8,
 	winner: ^Upstream,
 	err: Error,
 ) {
-	return resolve_insisting(g, query, usable_rcode, allocator)
+	return resolve_insisting(g, query, usable_rcode, allocator, deadline)
 }
 
 /*
@@ -198,7 +221,8 @@ whose rcode the client can read - and everything else about the sweep is common
 to both, so it is written once here.
 
 Transport failures are deliberately not retried: `resolve` has already exhausted
-them, every server for `attempts` rounds within its budget of two timeouts.
+them, every server for `attempts` rounds within its budget: two timeouts, or
+what is left of the question's deadline if that is less.
 What it leaves unretried is the reply that did arrive and was no use, so that
 is what this asks again.
 */
@@ -208,11 +232,43 @@ resolve_insisting :: proc(
 	query: []u8,
 	acceptable: proc(response: []u8) -> bool,
 	allocator: mem.Allocator,
+	deadline: ^time.Tick,
 ) -> (
 	response: []u8,
 	winner: ^Upstream,
 	err: Error,
 ) {
+	/*
+	One budget per client question, not per call (issue #439). A question can
+	make several of these calls - a DNSSEC chain walk makes up to
+	`MAX_LOOKUPS_PER_QUERY`, an apex `DS` on a zone route asks two groups, a
+	rewrite alias forwards its target - and each used to wait up to
+	`query_budget` of its own, so a degraded group held a query worker for the
+	sum of them.
+
+	The caller owns the deadline and sets it; this only spends it. Every call
+	gets the lesser of its own `query_budget` and what is left, and a call that
+	finds none left asks nobody - no exchange, so no member is charged for it.
+	The rules within a call are unchanged - every exchange charged, a member's
+	own timeout never shortened, the exchange that crosses the line allowed to
+	finish - so a call started with any time left can overrun the deadline by
+	one timeout and no more, and a question's worst wait is its span plus one
+	timeout however many calls it makes - plus one more where that exchange is
+	a UDP reply retried over TCP, which takes a timeout of its own (issue #376).
+	Zero, or nil, is no deadline.
+
+	On the tick clock, for the reason `resolve_sequential` gives.
+	*/
+	budget := query_budget(g)
+	if deadline != nil && deadline^ != {} {
+		left := time.tick_diff(time.tick_now(), deadline^)
+		if left <= 0 {
+			logx.debugf("this query's upstream deadline has passed, not asking the group again for it")
+			return nil, nil, .Deadline
+		}
+		budget = min(budget, left)
+	}
+
 	// Scratch, on the request's own thread, whose arena the caller resets - and
 	// only ever as long as the group.
 	// No capacity asked for: the fast path is a first reply the caller can use,
@@ -221,7 +277,7 @@ resolve_insisting :: proc(
 	unreachable.allocator = context.temp_allocator
 
 	started := time.tick_now()
-	response, winner, err = resolve(g, query, allocator, &unreachable)
+	response, winner, err = resolve_within(g, query, budget, allocator, &unreachable)
 	if err != .None || acceptable(response) {
 		return response, winner, err
 	}
@@ -317,7 +373,7 @@ resolve_insisting :: proc(
 
 	/*
 	And the sweep has at most one `g.timeout` of waiting to spend, and never
-	more than what `resolve` left of the call's `query_budget` (issue #426): the
+	more than what `resolve` left of the call's budget (issue #426): the
 	two are one budget, not one on top of the other. A group whose first member
 	is silent and whose second recurses for most of a timeout before saying
 	SERVFAIL hands the reply back near the end of the budget, and a fresh
@@ -376,7 +432,7 @@ resolve_insisting :: proc(
 	expiry one query pays for it again, which is the arrangement every other
 	part of this file already makes.
 	*/
-	budget := min(g.timeout, query_budget(g) - time.tick_since(started))
+	budget = min(g.timeout, budget - time.tick_since(started))
 	spent: time.Duration
 	for u in g.servers {
 		if spent >= budget {
@@ -701,8 +757,8 @@ extended_error_within :: proc(response: []u8, first, last: u16) -> bool {
 }
 
 // The waiting one `resolve_insisting` call may do, `resolve` and its sweep
-// together; `resolve_sequential` says why it is two timeouts.
-@(private)
+// together; `resolve_sequential` says why it is two timeouts. Also what a
+// caller spans a question's deadline from.
 query_budget :: proc(g: ^Group) -> time.Duration {
 	return 2 * g.timeout
 }
@@ -712,6 +768,8 @@ resolve_sequential :: proc(
 	g: ^Group,
 	query: []u8,
 	start: int,
+	// `query_budget`, or what is left of a client question's deadline.
+	budget: time.Duration,
 	allocator: mem.Allocator,
 	unreachable: ^[dynamic]^Upstream = nil,
 ) -> (
@@ -752,7 +810,6 @@ resolve_sequential :: proc(
 	park, three queries later, as with the sweep. `strategy: race` is the
 	answer for a group that must not wait on a dead member at all.
 	*/
-	budget := query_budget(g)
 	spent: time.Duration
 	// The round, from 1, in which this query asked each member; 0 for not yet.
 	// Scratch, like `resolve_race`'s candidates: the caller resets the arena.
@@ -901,6 +958,13 @@ race_worker :: proc(data: rawptr) {
 resolve_race :: proc(
 	g: ^Group,
 	query: []u8,
+	/*
+	Passed on to the sequential fallback, and not a bound on the race's own
+	wait: a race started with any of it left waits its `g.timeout` out, the way
+	`resolve_sequential` lets the exchange that crosses the line finish. Waiting
+	less would send every member a query and throw the answers away.
+	*/
+	budget: time.Duration,
 	allocator: mem.Allocator,
 	unreachable: ^[dynamic]^Upstream = nil,
 ) -> (
@@ -955,7 +1019,7 @@ resolve_race :: proc(
 		submitted += 1
 	}
 	if submitted == 0 {
-		return resolve_sequential(g, query, 0, allocator, unreachable)
+		return resolve_sequential(g, query, 0, budget, allocator, unreachable)
 	}
 
 	if !sync.sema_wait_with_timeout(&st.sema, g.timeout) {

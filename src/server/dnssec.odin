@@ -2,6 +2,7 @@ package server
 
 import "core:mem"
 import "core:sync"
+import "core:time"
 import "elodin:dns"
 import "elodin:dnssec"
 import "elodin:logx"
@@ -273,6 +274,8 @@ validator_query :: proc(
 	name: string,
 	type: dns.Type,
 	allocator: mem.Allocator,
+	// The client question's, so the walk's lookups share its one budget.
+	deadline: ^time.Tick,
 ) -> (
 	wire: []u8,
 	ok: bool,
@@ -331,7 +334,7 @@ validator_query :: proc(
 	an operator who anchored it wants it checked against their anchor rather
 	than against whatever their router says about the public tree.
 	*/
-	response, _, uerr := upstream.resolve_answerable(s.group, asked, allocator)
+	response, _, uerr := upstream.resolve_answerable(s.group, asked, allocator, deadline)
 	if uerr != .None {
 		logx.debugf("dnssec: %s %s could not be fetched: %v", dns.type_name(type), name, uerr)
 		return nil, false

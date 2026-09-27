@@ -205,7 +205,7 @@ Tamper :: struct {
 // does not describe is a lookup the test did not mean to provoke, so it fails
 // rather than answering.
 @(private = "file")
-chain_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
+chain_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
 	tamper := Tamper{}
 	if ctx != nil {
 		tamper = (^Tamper)(ctx)^

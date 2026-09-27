@@ -170,7 +170,7 @@ kt_pad :: proc(wire: []u8, pad: Padding, allocator: mem.Allocator) -> []u8 {
 // out. A nil `ctx` serves the fixtures untouched, which is the baseline the
 // free-reject tests compare against.
 @(private = "file")
-kt_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
+kt_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
 	for f in FIXTURES {
 		if f.type != type || !dns.name_equal_fold(f.name, name) {
 			continue
@@ -473,7 +473,7 @@ test_duplicate_ds_records_do_not_multiply_the_dnskey_check :: proc(t: ^testing.T
 // reads it, so that a test can hand `fetch_keys` a DS set of its own.
 @(private = "file")
 kt_ds :: proc(t: ^testing.T, zone: string) -> (ds: Ds, ok: bool) {
-	wire, served := kt_query(nil, zone, .DS, context.temp_allocator)
+	wire, served := kt_query(nil, zone, .DS, context.temp_allocator, nil)
 	if !testing.expect(t, served, "the fixture set carries no DS for this zone") {
 		return {}, false
 	}

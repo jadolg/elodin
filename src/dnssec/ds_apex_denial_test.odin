@@ -164,7 +164,7 @@ DA_FIXTURES := []Fixture{
 }
 
 @(private = "file")
-da_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
+da_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
 	// The genuine DS and DNSKEY fixtures are listed before the denials, so the
 	// chain walk finds the delegation rather than the reply under test.
 	for f in DA_FIXTURES {

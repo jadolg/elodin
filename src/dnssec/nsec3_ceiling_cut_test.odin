@@ -99,7 +99,7 @@ C3_FIXTURES := []Fixture{
 }
 
 @(private = "file")
-c3_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
+c3_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
 	for f in C3_FIXTURES {
 		if f.type == type && dns.name_equal_fold(f.name, name) {
 			return decode_hex(f.wire, allocator)
@@ -158,7 +158,7 @@ test_a_signed_cut_below_the_ceiling_is_judged_on_its_own_keys :: proc(t: ^testin
 // The child's DNSKEY question answered with the parent's key set, which no DS
 // the parent signed for the child can match.
 @(private = "file")
-c3_wrong_child_keys :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
+c3_wrong_child_keys :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
 	if type == .DNSKEY && dns.name_equal_fold(name, "s.e.c3test.") {
 		for f in C3_FIXTURES {
 			if f.key == "c3_dnskey" {
@@ -166,7 +166,7 @@ c3_wrong_child_keys :: proc(ctx: rawptr, name: string, type: dns.Type, allocator
 			}
 		}
 	}
-	return c3_query(ctx, name, type, allocator)
+	return c3_query(ctx, name, type, allocator, nil)
 }
 
 /*

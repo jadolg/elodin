@@ -92,7 +92,7 @@ DNAME_FIXTURES := []Fixture{
 }
 
 @(private = "file")
-dname_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
+dname_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
 	for f in DNAME_FIXTURES {
 		if f.type == type && dns.name_equal_fold(f.name, name) {
 			out, decoded := decode_hex(f.wire, allocator)
