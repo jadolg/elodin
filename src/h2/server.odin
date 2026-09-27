@@ -94,6 +94,9 @@ max_pending, and their bytes by MAX_CONN_REQUEST.
 MAX_HELD_STREAMS :: 2 * MAX_CONCURRENT
 // See Conn.closed_stream_rst_budget.
 MAX_CLOSED_STREAM_RST :: 16
+// See Conn.reset_ids: the most resets it remembers that can land within a
+// moment - a full control window either side of the second rolling over.
+RESET_IDS :: 2 * MAX_CONTROL_FRAMES_PER_SECOND
 /*
 PINGs, non-ACK SETTINGS and stream errors (a malformed or refused request) a
 peer may cause per second, each of which draws a frame back. Writes here are
@@ -145,6 +148,10 @@ Stream :: struct {
 	// decoded to keep HPACK in step, then the stream is reset without being
 	// served. See `handle_headers`.
 	refused:      bool,
+	// A HEADERS block on a stream this end had already reset and forgotten -
+	// trailers sent before the reset reached the peer. Decoded like a refused
+	// one, then dropped without a reset of its own. See `handle_headers`.
+	discard:      bool,
 	send_window:  int,
 	// Request parked between its headers and the end of its body.
 	pending:      ^Request,
@@ -192,6 +199,32 @@ Conn :: struct {
 	tolerance on - into an unbounded run of extra writes; see `handle_data`.
 	*/
 	closed_stream_rst_budget: int,
+	/*
+	Streams this end reset and retired while the peer was still sending on
+	them, the oldest overwritten first; see `close_stream`. RFC 9113 5.1 has
+	frames that follow our own RST_STREAM ignored, since the peer may have sent
+	them before the reset reached it - and the stream is gone from `streams` by
+	then, so this is what still knows (#390).
+
+	Only those resets: one on a stream the peer had already ended or reset
+	leaves nothing legitimately in flight, and remembering it would let a peer
+	that drew one have its next header block taken quietly.
+
+	Every reset remembered goes through `stream_error`, which spends
+	MAX_CONTROL_FRAMES_PER_SECOND (the server's own budget has no `earned`
+	credit to stretch it). The window is fixed, so a full one either side of
+	it rolling over can land together; RESET_IDS holds both, so a slot lasts at
+	least a second at the fastest a peer can reset. In flight means sent before
+	our reset arrived - a round trip, which is well inside that on any link a
+	resolver serves. On one slower than a second, an id overwritten early has
+	DATA on it fall back to `closed_stream_rst_budget` and trailers on it to
+	the connection error every other reused id gets.
+
+	An id is struck off once the peer ends or resets the stream, or its
+	trailers arrive: nothing more can be in flight on it after that.
+	*/
+	reset_ids:                [RESET_IDS]u32,
+	reset_next:               int,
 	// Request bytes held by this connection's streams; see MAX_CONN_REQUEST.
 	request_bytes:            int,
 
@@ -462,6 +495,9 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 			// on, so broadcasting for one would only wake every other handler on
 			// the connection to recheck a state that has not changed for them.
 			sync.cond_broadcast(&c.cond)
+		} else {
+			// Over for the peer too, so nothing more is in flight on it.
+			was_reset_here(c, h.stream_id, forget = true)
 		}
 		sync.mutex_unlock(&c.mu)
 		if orphaned {
@@ -669,12 +705,26 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	}
 
 	sync.mutex_lock(&c.mu)
+	/*
+	An id at or below `last_stream_id` is already in use or closed, which is a
+	connection error - except on a stream this end reset and retired while the
+	peer was still sending (Conn.reset_ids). Trailers the peer sent before it
+	saw that reset are in flight, which RFC 9113 5.1 has ignored, not punished
+	(#390); but a header block always changes HPACK state, so it is carried and
+	decoded like a refused one, then dropped. Once: trailers end the stream, so
+	the id is struck off, and a second block is a connection error again.
+	*/
+	discard := false
 	if h.stream_id <= c.last_stream_id {
-		sync.mutex_unlock(&c.mu)
-		goaway(c, .Protocol_Error)
-		return false
+		// Trailers end the stream (RFC 9113 8.1); a block that does not is an id reused.
+		if !was_reset_here(c, h.stream_id, forget = true) || h.flags & FLAG_END_STREAM == 0 {
+			sync.mutex_unlock(&c.mu)
+			goaway(c, .Protocol_Error)
+			return false
+		}
+		discard = true
 	}
-	c.last_stream_id = h.stream_id
+	c.last_stream_id = max(c.last_stream_id, h.stream_id)
 
 	/*
 	A stream over the concurrency limit is refused, but not here. HPACK state is
@@ -693,6 +743,7 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	s.id = h.stream_id
 	s.state = .Open
 	s.refused = refused
+	s.discard = discard
 	s.send_window = c.peer_initial_window
 	s.header_block = make([dynamic]u8, 0, len(block), c.allocator)
 	// Nothing allocated until DATA arrives, where `handle_data` charges it.
@@ -1035,12 +1086,13 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 	s.header_block = nil
 
 	// A refused stream has had its HPACK side effects applied by the decode
-	// above, which is the whole reason it was carried this far. Reset it and let
-	// it go without ever handing it to a handler.
-	if s.refused {
+	// above, which is the whole reason it was carried this far. Reset it (a
+	// `discard` one already was) and let it go without ever handing it to a
+	// handler.
+	if s.refused || s.discard {
 		free_headers(headers, c.allocator)
-		sent := stream_error(c, s.id, .Refused_Stream)
-		close_stream(c, s.id)
+		sent := s.discard || stream_error(c, s.id, .Refused_Stream)
+		close_stream(c, s.id, peer_sending = !s.end_stream)
 		return sent
 	}
 
@@ -1056,7 +1108,7 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 	if request_is_malformed(headers) {
 		free_headers(headers, c.allocator)
 		sent := stream_error(c, s.id, .Protocol_Error)
-		close_stream(c, s.id)
+		close_stream(c, s.id, peer_sending = !s.end_stream)
 		return sent
 	}
 
@@ -1110,7 +1162,7 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 	if over {
 		request_destroy(c, req)
 		sent := stream_error(c, s.id, .Refused_Stream)
-		close_stream(c, s.id)
+		close_stream(c, s.id, peer_sending = !s.end_stream)
 		return sent
 	}
 
@@ -1167,8 +1219,16 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	an unbounded run of RST_STREAM writes out of this end. Once the budget is
 	spent, this falls back to the pre-existing behaviour: credit returned, no
 	RST, silently ignored.
+
+	A stream this end reset while the peer was still sending is not asked
+	about at all: RFC 9113 5.1 has frames that follow our own RST_STREAM
+	ignored, and these are the in-flight case, not a violation - a body behind
+	a refused HEADERS, or the rest of one over MAX_BODY (#390). See
+	Conn.reset_ids.
 	*/
-	send_closed_rst := !found && c.closed_stream_rst_budget > 0
+	// Ended by the peer, so nothing more is in flight on it; see handle_headers.
+	reset_here := !found && was_reset_here(c, h.stream_id, forget = h.flags & FLAG_END_STREAM != 0)
+	send_closed_rst := !found && !reset_here && c.closed_stream_rst_budget > 0
 	if send_closed_rst {
 		c.closed_stream_rst_budget -= 1
 	}
@@ -1229,7 +1289,7 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 			sent := stream_error(c, h.stream_id, oversized ? .Enhance_Your_Calm : .Refused_Stream)
 			// The stream is over. Without this it would hold its body, its parked
 			// request and one of MAX_HELD_STREAMS slots until the connection went.
-			close_stream(c, h.stream_id)
+			close_stream(c, h.stream_id, peer_sending = h.flags & FLAG_END_STREAM == 0)
 			/*
 			The stream is finished with, but the connection is not. These bytes
 			came off it and count against a receive window every stream shares,
@@ -1395,6 +1455,25 @@ rst_stream :: proc(c: ^Conn, stream_id: u32, code: Error_Code) -> bool {
 	return write_all(c, out[:])
 }
 
+// Whether `stream_id` is in Conn.reset_ids, struck off as well with `forget`.
+// Caller holds `c.mu`.
+@(private)
+was_reset_here :: proc(c: ^Conn, stream_id: u32, forget := false) -> bool {
+	// 0 marks an empty slot.
+	if stream_id == 0 {
+		return false
+	}
+	for &id in c.reset_ids {
+		if id == stream_id {
+			if forget {
+				id = 0
+			}
+			return true
+		}
+	}
+	return false
+}
+
 @(private)
 goaway :: proc(c: ^Conn, code: Error_Code) {
 	sync.mutex_lock(&c.mu)
@@ -1545,12 +1624,17 @@ writing into memory that has already gone back to the allocator. Nothing here
 does I/O or takes another lock, so holding `c.mu` across it costs nothing.
 */
 @(private)
-close_stream :: proc(c: ^Conn, stream_id: u32) {
+close_stream :: proc(c: ^Conn, stream_id: u32, peer_sending := false) {
 	sync.mutex_lock(&c.mu)
 	defer sync.mutex_unlock(&c.mu)
 	s, found := c.streams[stream_id]
 	if !found {
 		return
+	}
+	// Reset by this end with the peer still sending: see Conn.reset_ids.
+	if peer_sending {
+		c.reset_ids[c.reset_next] = stream_id
+		c.reset_next = (c.reset_next + 1) % len(c.reset_ids)
 	}
 	delete_key(&c.streams, stream_id)
 	if s.state == .Closed {
