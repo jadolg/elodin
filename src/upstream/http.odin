@@ -262,14 +262,14 @@ http_exchange :: proc(
 	}
 
 	status_line := reader_line(&r) or_return
-	resp.status = parse_status(status_line) or_return
+	http_1_0: bool
+	resp.status, http_1_0 = parse_status(status_line) or_return
 	// HTTP/1.0 closes unless it says otherwise (RFC 9112 9.3), and saying so is
 	// not worth honouring for one saved dial: only 1.1 and later are pooled.
-	resp.keep_alive = strings.has_prefix(status_line, "HTTP/1.") && !strings.has_prefix(status_line, "HTTP/1.0")
+	resp.keep_alive = !http_1_0
 
 	content_length := -1
 	chunked := false
-	transfer_encodings := 0
 	headers := 0
 	for {
 		line := reader_line(&r) or_return
@@ -282,7 +282,7 @@ http_exchange :: proc(
 		}
 		name, value, ok := split_header(line)
 		if !ok {
-			continue
+			return resp, .HTTP_Error
 		}
 		switch {
 		/*
@@ -312,8 +312,7 @@ http_exchange :: proc(
 			and RFC 9112 6.1 forbids chunked anywhere but last, or twice. Read
 			as a substring, `xchunked` took chunk framing out of a plain body.
 			*/
-			transfer_encodings += 1
-			if transfer_encodings > 1 || !dns.name_equal_fold(value, "chunked") {
+			if chunked || !dns.name_equal_fold(value, "chunked") {
 				return resp, .HTTP_Error
 			}
 			chunked = true
@@ -332,10 +331,17 @@ http_exchange :: proc(
 		}
 	}
 
-	// Both framings at once is what a smuggled response looks like (RFC 9112
-	// 6.3), and a hop in front may pick the other one.
-	if chunked && content_length >= 0 {
+	/*
+	RFC 9112 6.1: an HTTP/1.0 message with a Transfer-Encoding has faulty
+	framing. Alongside a Content-Length the chunks win (6.3), but where the
+	other framing would have ended is not a place to read another response
+	from, so the connection goes no further.
+	*/
+	if chunked && http_1_0 {
 		return resp, .HTTP_Error
+	}
+	if chunked && content_length >= 0 {
+		resp.keep_alive = false
 	}
 
 	switch {
@@ -401,40 +407,51 @@ parse_content_length :: proc(value: string) -> (length: int, err: Error) {
 }
 
 /*
-The status line, whose code is exactly three digits (RFC 9112 4).
+The status line: `HTTP/<DIGIT>.<DIGIT> SP 3DIGIT`, then optionally a space and a
+reason phrase (RFC 9112 4), and whether its version is 1.0.
 
-Parsed with a detected base it was rather more: `HTTP/1.1 0x1 OK` came back as
-1, `1_0` as 10. The three characters were also taken without asking what
+Parsed with a detected base the code was rather more: `HTTP/1.1 0x1 OK` came back
+as 1, `1_0` as 10. The three characters were also taken without asking what
 followed them, so `HTTP/1.1 2000 OK` - not a status line at all - read as 200.
+And with only the `HTTP/` prefix checked, `HTTP/1.1x` was a version, one this
+client went on to pool as 1.1 (#437).
 */
 @(private)
-parse_status :: proc(line: string) -> (status: int, err: Error) {
-	if !strings.has_prefix(line, "HTTP/") {
-		return 0, .HTTP_Error
+parse_status :: proc(line: string) -> (status: int, http_1_0: bool, err: Error) {
+	V :: len("HTTP/1.1")
+	if len(line) < V + 4 || !strings.has_prefix(line, "HTTP/") || line[V] != ' ' {
+		return 0, false, .HTTP_Error
 	}
-	space := strings.index_byte(line, ' ')
-	if space < 0 || space + 4 > len(line) {
-		return 0, .HTTP_Error
+	major, dot, minor := line[5], line[6], line[7]
+	if major < '0' || major > '9' || dot != '.' || minor < '0' || minor > '9' {
+		return 0, false, .HTTP_Error
 	}
 	// A reason phrase is optional, but if anything follows the code it is the
 	// space in front of one.
-	if len(line) > space + 4 && line[space + 4] != ' ' {
-		return 0, .HTTP_Error
+	if len(line) > V + 4 && line[V + 4] != ' ' {
+		return 0, false, .HTTP_Error
 	}
 	v := 0
-	for c in transmute([]u8)line[space + 1:space + 4] {
+	for c in transmute([]u8)line[V + 1:V + 4] {
 		if c < '0' || c > '9' {
-			return 0, .HTTP_Error
+			return 0, false, .HTTP_Error
 		}
 		v = v * 10 + int(c - '0')
 	}
-	return v, .None
+	return v, line[:V] == "HTTP/1.0", .None
 }
 
 @(private)
 split_header :: proc(line: string) -> (name, value: string, ok: bool) {
+	/*
+	A line starting with whitespace is obs-fold (RFC 9112 5.2), and whitespace
+	before the colon makes no field name (5.1). Skipped, either one hid a field
+	the unfolded or trimmed reading has: `Transfer-Encoding: chunked` then
+	` , gzip` framed a gzip body as chunks (#437). Refused by the caller, as is
+	a line with no name at all.
+	*/
 	idx := strings.index_byte(line, ':')
-	if idx <= 0 {
+	if idx <= 0 || line[0] == ' ' || line[0] == '\t' || line[idx - 1] == ' ' || line[idx - 1] == '\t' {
 		return "", "", false
 	}
 	// `OWS` off the value and nothing more (RFC 9110 5.6.3): `strings.trim_space`
@@ -511,7 +528,12 @@ read_chunked :: proc(r: ^Buf_Reader, allocator: mem.Allocator) -> (body: []u8, e
 		}
 		data := reader_exact(r, int(size)) or_return
 		append(&out, ..data)
-		reader_line(r) or_return
+		// The data ends in CRLF and nothing else (RFC 9112 7.1). Thrown away,
+		// the line let `helloEXTRA` read as `hello` on a connection kept for
+		// the next response (#437).
+		if tail := reader_line(r) or_return; tail != "" {
+			return nil, .HTTP_Error
+		}
 	}
 	return out[:], .None
 }

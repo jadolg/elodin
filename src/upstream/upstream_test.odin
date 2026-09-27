@@ -2737,6 +2737,8 @@ test_http_response_connection_is_a_list :: proc(t: ^testing.T) {
 		{"HTTP/1.1 200 OK\r\nConnection: close-later\r\n", true},
 		{"HTTP/1.1 200 OK\r\nConnection: ,\r\n", true},
 		{"HTTP/1.0 200 OK\r\n", false},
+		{"HTTP/1.0 200 OK\r\nConnection: keep-alive\r\n", false},
+		{"HTTP/1.9 200 OK\r\n", true},
 	}
 	for c in CASES {
 		track: mem.Tracking_Allocator
@@ -2746,6 +2748,7 @@ test_http_response_connection_is_a_list :: proc(t: ^testing.T) {
 			testing.expectf(t, err == .None, "%q: exchange failed: %v", c.head, err)
 			testing.expectf(t, resp.keep_alive == c.keep_alive, "%q: keep-alive %v, want %v", c.head, resp.keep_alive, c.keep_alive)
 			delete(resp.body, mem.tracking_allocator(&track))
+			expect_caller_holds_nothing(t, &track, c.head)
 		}
 		mem.tracking_allocator_destroy(&track)
 		free_all(context.temp_allocator)
@@ -2757,45 +2760,54 @@ The only transfer coding this client can read is `chunked` alone, and it asks fo
 no others (#437). Found as a substring, `chunked, gzip` was framed as chunks and
 the gzip body inside handed on as the answer, and `xchunked` read chunk framing
 out of a body with none. RFC 9112 6.1 makes `chunked` the final coding and
-forbids applying it twice; anything else is refused, as is a Transfer-Encoding
-alongside a Content-Length (RFC 9112 6.3), whose two framings a hop in front may
-pick between differently.
+forbids applying it twice; anything else is refused. So is any Transfer-Encoding
+on an HTTP/1.0 response, whose framing RFC 9112 6.1 calls faulty. Alongside a
+Content-Length the chunks win (RFC 9112 6.3), and the connection is not pooled:
+where the other framing would have left off is not a place to read the next
+response from.
 */
 @(test)
 test_http_transfer_encoding_is_exactly_chunked :: proc(t: ^testing.T) {
 	Case :: struct {
 		fields:  string,
 		refused: bool,
+		version: string,
+		pooled:  bool,
 	}
 	CHUNKS :: "5\r\nhello\r\n0\r\n\r\n"
 	CASES := []Case {
-		{"Transfer-Encoding: chunked\r\n", false},
-		{"Transfer-Encoding: CHUNKED\r\n", false},
-		{"Transfer-Encoding:  chunked\t\r\n", false},
-		{"Transfer-Encoding: chunked, gzip\r\n", true},
-		{"Transfer-Encoding: gzip, chunked\r\n", true},
-		{"Transfer-Encoding: xchunked\r\n", true},
-		{"Transfer-Encoding: chunkedx\r\n", true},
-		{"Transfer-Encoding: chunked, chunked\r\n", true},
-		{"Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n", true},
-		{"Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n", true},
-		{"Transfer-Encoding: identity\r\n", true},
-		{"Transfer-Encoding:\r\n", true},
-		{"Transfer-Encoding: chunked\r\nContent-Length: 5\r\n", true},
-		{"Content-Length: 5\r\nTransfer-Encoding: chunked\r\n", true},
+		{"Transfer-Encoding: chunked\r\n", false, "1.1", true},
+		{"Transfer-Encoding: CHUNKED\r\n", false, "1.1", true},
+		{"Transfer-Encoding:  chunked\t\r\n", false, "1.1", true},
+		{"Transfer-Encoding: chunked, gzip\r\n", true, "1.1", false},
+		{"Transfer-Encoding: gzip, chunked\r\n", true, "1.1", false},
+		{"Transfer-Encoding: xchunked\r\n", true, "1.1", false},
+		{"Transfer-Encoding: chunkedx\r\n", true, "1.1", false},
+		{"Transfer-Encoding: chunked, chunked\r\n", true, "1.1", false},
+		{"Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n", true, "1.1", false},
+		{"Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n", true, "1.1", false},
+		{"Transfer-Encoding: identity\r\n", true, "1.1", false},
+		{"Transfer-Encoding:\r\n", true, "1.1", false},
+		{"Transfer-Encoding: chunked\r\nContent-Length: 5\r\n", false, "1.1", false},
+		{"Content-Length: 99\r\nTransfer-Encoding: chunked\r\n", false, "1.1", false},
+		{"Transfer-Encoding: chunked\r\n", true, "1.0", false},
+		{"Transfer-Encoding: chunked\r\nContent-Length: 5\r\n", true, "1.0", false},
 	}
 	for c in CASES {
 		track: mem.Tracking_Allocator
 		mem.tracking_allocator_init(&track, context.allocator)
-		resp, err, ok := exchange_against(t, fmt.tprintf("HTTP/1.1 200 OK\r\n%s\r\n%s", c.fields, CHUNKS), &track)
+		reply := fmt.tprintf("HTTP/%s 200 OK\r\n%s\r\n%s", c.version, c.fields, CHUNKS)
+		resp, err, ok := exchange_against(t, reply, &track)
 		if ok {
 			if c.refused {
-				testing.expectf(t, err != .None, "%q was read, body %q", c.fields, string(resp.body))
+				testing.expectf(t, err == .HTTP_Error, "%q got %v, body %q", reply, err, string(resp.body))
 			} else {
-				testing.expectf(t, err == .None, "%q failed: %v", c.fields, err)
-				testing.expectf(t, string(resp.body) == "hello", "%q: body %q", c.fields, string(resp.body))
+				testing.expectf(t, err == .None, "%q failed: %v", reply, err)
+				testing.expectf(t, string(resp.body) == "hello", "%q: body %q", reply, string(resp.body))
+				testing.expectf(t, resp.keep_alive == c.pooled, "%q: keep-alive %v, want %v", reply, resp.keep_alive, c.pooled)
 			}
 			delete(resp.body, mem.tracking_allocator(&track))
+			expect_caller_holds_nothing(t, &track, reply)
 		}
 		mem.tracking_allocator_destroy(&track)
 		free_all(context.temp_allocator)
@@ -2836,12 +2848,58 @@ test_http_chunk_size_takes_bws_only_before_an_extension :: proc(t: ^testing.T) {
 		resp, err, ok := exchange_against(t, reply, &track)
 		if ok {
 			if c.refused {
-				testing.expectf(t, err != .None, "chunk size %q was read, body %q", c.size, string(resp.body))
+				testing.expectf(t, err == .HTTP_Error, "chunk size %q got %v, body %q", c.size, err, string(resp.body))
 			} else {
 				testing.expectf(t, err == .None, "chunk size %q failed: %v", c.size, err)
 				testing.expectf(t, string(resp.body) == "hello", "chunk size %q: body %q", c.size, string(resp.body))
 			}
 			delete(resp.body, mem.tracking_allocator(&track))
+			expect_caller_holds_nothing(t, &track, c.size)
+		}
+		mem.tracking_allocator_destroy(&track)
+		free_all(context.temp_allocator)
+	}
+}
+
+/*
+A response this client cannot frame the way the grammar writes it is refused,
+not read some other way (#437 review).
+
+- A chunk's data is followed by CRLF and nothing else (RFC 9112 7.1). The line
+  was read and thrown away, so `helloEXTRA` gave `hello` and the connection went
+  back to the pool.
+- A field line starting with whitespace is obs-fold (RFC 9112 5.2), and space
+  before the colon makes no field name (5.1). Skipped, `chunked` + ` , gzip`
+  read as chunked alone and `keep-alive` + ` close` was pooled; a line with no
+  colon at all is no field line either.
+- The version is `HTTP/<DIGIT>.<DIGIT>` (RFC 9112 2.3): `HTTP/1.1x` passed the
+  `HTTP/` prefix check and was pooled as 1.1.
+*/
+@(test)
+test_http_response_malformed_framing_is_refused :: proc(t: ^testing.T) {
+	CASES :: []string {
+		"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloEXTRA\r\n0\r\n\r\n",
+		"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello \r\n0\r\n\r\n",
+		"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n , gzip\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+		"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n close\r\nContent-Length: 5\r\n\r\nhello",
+		"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n\tclose\r\nContent-Length: 5\r\n\r\nhello",
+		"HTTP/1.1 200 OK\r\nTransfer-Encoding : chunked\r\nContent-Length: 5\r\n\r\nhello",
+		"HTTP/1.1 200 OK\r\nContent-Length\t: 5\r\n\r\nhello",
+		"HTTP/1.1 200 OK\r\nno colon here\r\nContent-Length: 5\r\n\r\nhello",
+		"HTTP/1.1 200 OK\r\n: 5\r\nContent-Length: 5\r\n\r\nhello",
+		"HTTP/1.1x 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+		"HTTP/1.9junk 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+		"HTTP/11 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+		"HTTP/ 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+	}
+	for reply in CASES {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		resp, err, ok := exchange_against(t, reply, &track)
+		if ok {
+			testing.expectf(t, err == .HTTP_Error, "%q got %v, body %q, keep-alive %v", reply, err, string(resp.body), resp.keep_alive)
+			delete(resp.body, mem.tracking_allocator(&track))
+			expect_caller_holds_nothing(t, &track, reply)
 		}
 		mem.tracking_allocator_destroy(&track)
 		free_all(context.temp_allocator)
