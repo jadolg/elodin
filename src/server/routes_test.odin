@@ -2677,10 +2677,12 @@ test_an_apex_ds_spends_one_budget_across_both_groups :: proc(t: ^testing.T) {
 }
 
 /*
-A question's deadline spans the longest budget of any group (issue #439), not
-the first one it asks: a LAN route with a short `timeout` would otherwise leave
-the chain walk behind it, which always asks the default group, a sliver of the
-time that group was given.
+A question's deadline spans the longest budget of the groups it can ask (issue
+#439), not the first one it asks: a LAN route with a short `timeout` would
+otherwise leave the chain walk behind it, which always asks the default group, a
+sliver of the time that group was given. And not of a group it cannot ask: a
+slow route stretching every public question's deadline would let a degraded
+default group hold each of them for that route's budget, lookup after lookup.
 */
 @(test)
 test_the_question_span_is_the_longest_group_budget :: proc(t: ^testing.T) {
@@ -2698,9 +2700,15 @@ test_the_question_span_is_the_longest_group_budget :: proc(t: ^testing.T) {
 		group  = group,
 		routes = []Zone_Route{{domains = []string{"lan."}, group = routed}},
 	}
-	testing.expect_value(t, question_span(&s), 10 * time.Second)
-	// And the other way round: a route slower than the default sets it.
+	// A question down the LAN route still has the default group's for its walk.
+	testing.expect_value(t, question_span(&s, "host.lan.", .A), 10 * time.Second)
+	testing.expect_value(t, question_span(&s, "example.com.", .A), 10 * time.Second)
+	// And the other way round: a route slower than the default sets it for its
+	// own questions, and for its apex `DS`, which asks it after the parent...
 	s.group, s.routes[0].group = routed, group
-	testing.expect_value(t, question_span(&s), 10 * time.Second)
+	testing.expect_value(t, question_span(&s, "host.lan.", .A), 10 * time.Second)
+	testing.expect_value(t, question_span(&s, "lan.", .DS), 10 * time.Second)
+	// ...and for nothing else: a public name never asks that route.
+	testing.expect_value(t, question_span(&s, "example.com.", .A), 400 * time.Millisecond)
 	free_all(context.temp_allocator)
 }

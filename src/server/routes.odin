@@ -97,24 +97,25 @@ Zone_Route :: struct {
 }
 
 /*
-How long one client question may spend waiting on upstreams, from its first
-exchange (issue #439): the longest `upstream.query_budget` of any group this
-server has, the default and every route.
+How long one client question for `name` may spend waiting on upstreams, from its
+first exchange (issue #439): the longest `upstream.query_budget` of the groups
+it can ask - where it goes, the zone's own route for an apex `DS`, and the
+default group, which every chain lookup asks.
 
 The longest rather than that of whichever group a question asks first, because
 one question can ask several: a LAN route's 200 ms forward would otherwise leave
-the chain walk behind it, which always asks the default group, a few hundred
-milliseconds for the public tree instead of the ten seconds that group was given.
+the chain walk behind it a few hundred milliseconds for the public tree instead
+of the ten seconds the default group was given. Only those groups, though: a
+slow route elsewhere in the table is no group this question can reach, and its
+budget would hand every public question a deadline long enough to wait on a
+degraded default group lookup after lookup, which is the wait #439 bounds.
 Where every group has the same `timeout` - the configuration nearly everybody
 runs - it is two of them, the figure #327 set for one group.
 */
-question_span :: proc(s: ^Server) -> (span: time.Duration) {
-	if s.group != nil {
-		span = upstream.query_budget(s.group)
-	}
-	for route in s.routes {
-		if route.group != nil {
-			span = max(span, upstream.query_budget(route.group))
+question_span :: proc(s: ^Server, name: string, type: dns.Type) -> (span: time.Duration) {
+	for g in ([]^upstream.Group{s.group, route_group(s, name, type), zone_route_group(s, name)}) {
+		if g != nil {
+			span = max(span, upstream.query_budget(g))
 		}
 	}
 	return

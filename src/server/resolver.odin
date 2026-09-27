@@ -1861,7 +1861,17 @@ resolve_query :: proc(
 	Here, where the outgoing message has taken its final shape, because what a
 	follower may be handed turns on whether its message and the leader's are the
 	same bytes.
+
+	The question's upstream deadline starts here, at its first exchange - its
+	own, or the leader's it waits on, which it is as much as the leader is - so
+	a follower that forwards after the leader landed with nothing it could use
+	asks with what that wait left of it, not with a fresh one. Unless an earlier
+	call already started it: a rewrite alias's target is forwarded by a call
+	nested inside the question's own. See `question_span`.
 	*/
+	if deadline^ == {} {
+		deadline^ = time.tick_add(time.tick_now(), question_span(s, q.name, q.type))
+	}
 	own_flight: Flight
 	flight: ^Flight
 	if unanswered == nil {
@@ -2073,14 +2083,6 @@ resolve_query :: proc(
 			asked = own
 			unproven_apex_ds = true
 		}
-	}
-	/*
-	The question's upstream deadline starts here, at its first exchange, unless
-	an earlier one already started it - a rewrite alias's target is forwarded
-	by a call nested inside the question's own. See `question_span`.
-	*/
-	if deadline^ == {} {
-		deadline^ = time.tick_add(time.tick_now(), question_span(s))
 	}
 	resp: []u8
 	winner: ^upstream.Upstream

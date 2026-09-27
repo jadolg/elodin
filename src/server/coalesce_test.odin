@@ -188,6 +188,8 @@ Client :: struct {
 	addr:    [4]u8,
 	outcome: Outcome,
 	ok:      bool,
+	// How long `handle_query` held this client.
+	took:    time.Duration,
 }
 
 @(private = "file")
@@ -206,7 +208,9 @@ ask :: proc(c: ^Client) {
 		msg.additional = additional
 	}
 	query, _, _ := dns.encode_message(msg, context.temp_allocator)
+	started := time.tick_now()
 	out, outcome, served := handle_query(c.srv, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	c.took = time.tick_since(started)
 	c.outcome = outcome
 	if !served {
 		return
@@ -443,6 +447,28 @@ test_followers_of_another_message_ask_for_themselves :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expectf(t, failed == 1 && answered == CLIENTS - 1, "%d clients failed and %d were answered, want 1 and %d", failed, answered, CLIENTS - 1)
+}
+
+/*
+A follower's wait on the leader is its question's first exchange, and spends its
+deadline (issue #439). One whose message was not the leader's forwards on its
+own once the leader lands with nothing - and used to do it on a fresh deadline,
+so against a silent upstream it waited the leader's two timeouts and then two
+more of its own. It now asks with what the wait left, which is at most the
+moment between the leader's arrival and its own, so it is done within one more
+timeout of the leader, the exchange that crosses the line.
+*/
+@(test)
+test_a_follower_forwards_on_what_its_wait_left_of_the_deadline :: proc(t: ^testing.T) {
+	TIMEOUT :: 400 * time.Millisecond
+	clients: [CLIENTS]Client
+	run_burst(t, &clients, silent = true, timeout = TIMEOUT, attempts = 2, mixed = true)
+	for c, i in clients {
+		testing.expectf(t, c.ok && c.rcode == .Serv_Fail, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)
+		// The leader's two timeouts and the one that crosses the line, with
+		// slack; a fresh deadline for the follower waited four.
+		testing.expectf(t, c.took < 7 * TIMEOUT / 2, "client %d waited %v, where its deadline is two timeouts of %v", i, c.took, TIMEOUT)
+	}
 }
 
 /*

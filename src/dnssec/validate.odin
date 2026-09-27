@@ -3526,7 +3526,8 @@ zone_step :: proc(
 	}
 	wire, ok := v.query(v.query_ctx, child, .DS, allocator, budget.deadline)
 	if !ok {
-		return walk_gave_up(budget, "chain of trust unavailable"), nil
+		// The deadline may have passed between the check above and the ask.
+		return walk_gave_up(budget, DEADLINE_PASSED if deadline_passed(budget) else "chain of trust unavailable"), nil
 	}
 	msg, derr := dns.decode_message(wire, allocator, budget.spent)
 	if derr != .None {
@@ -3907,6 +3908,9 @@ fetch_keys :: proc(
 	}
 	wire, ok := v.query(v.query_ctx, zone, .DNSKEY, allocator, budget.deadline)
 	if !ok {
+		if deadline_passed(budget) {
+			budget.walk_stopped = DEADLINE_PASSED
+		}
 		return nil, .Indeterminate
 	}
 	msg, derr := dns.decode_message(wire, allocator, budget.spent)
