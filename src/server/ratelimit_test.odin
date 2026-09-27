@@ -1444,7 +1444,11 @@ test_a_reply_to_the_unspecified_address_comes_home :: proc(t: ^testing.T) {
 			testing.expectf(t, false, "cannot set a receive timeout: %v", oerr)
 			return
 		}
-		bound, _ := net.bound_endpoint(rx)
+		bound, berr := net.bound_endpoint(rx)
+		if berr != nil {
+			testing.expectf(t, false, "cannot read the bound port: %v", berr)
+			return
+		}
 		tx, terr := net.make_unbound_udp_socket(net.family_from_address(loopback))
 		if terr != nil {
 			testing.expectf(t, false, "cannot make a sending socket: %v", terr)

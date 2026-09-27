@@ -51,9 +51,11 @@ Stats :: struct {
 	count of queries, which is what the log line's wording says of each one.
 
 	Counted apart from `dropped` because the two ask different questions of an
-	operator. A rising `dropped` is a server that cannot keep up; a rising
-	`refused` is a client that is not on the list - which is either the internet
-	finding an open port, or somebody's own subnet that nobody added.
+	operator. A rising `dropped` is a server that cannot keep up, or datagrams
+	from sources no answer could reach, which are dropped ahead of the list and
+	so never reach `refused`; a rising `refused` is a client that is not on the
+	list - which is either the internet finding an open port, or somebody's own
+	subnet that nobody added.
 	*/
 	refused:      u64,
 	/*

@@ -1344,7 +1344,10 @@ nothing else. Over UDP the datagram is dropped, a REFUSED to a datagram source
 being a reflection of its own; over TCP, DoT and DoH the connection is closed on
 accept, without a thread and without a TLS handshake, so the allow list cannot
 become a way to exhaust `max_connections`. Refusals are counted as `refused=` — a
-datagram each on UDP, a connection each on the stream transports.
+datagram each on UDP, a connection each on the stream transports. A UDP source
+that no reply could reach — port 0, this server's own endpoint, a multicast
+group, the limited broadcast, or `0.0.0.0`/`::` — is dropped ahead of the list
+and counted as `dropped=` instead, whatever the list says.
 
 A list in the file replaces the default rather than adding to it, so include
 loopback if you want it. Entries are CIDR networks in either family; a bare
