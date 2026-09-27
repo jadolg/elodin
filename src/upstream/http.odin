@@ -2,10 +2,10 @@ package upstream
 
 import "core:mem"
 import "core:net"
-import "core:strconv"
 import "core:strings"
 import "core:time"
 import "elodin:dns"
+import "elodin:h2"
 import "elodin:logx"
 import "elodin:tlsx"
 
@@ -263,10 +263,13 @@ http_exchange :: proc(
 
 	status_line := reader_line(&r) or_return
 	resp.status = parse_status(status_line) or_return
-	resp.keep_alive = true
+	// HTTP/1.0 closes unless it says otherwise (RFC 9112 9.3), and saying so is
+	// not worth honouring for one saved dial: only 1.1 and later are pooled.
+	resp.keep_alive = strings.has_prefix(status_line, "HTTP/1.") && !strings.has_prefix(status_line, "HTTP/1.0")
 
 	content_length := -1
 	chunked := false
+	transfer_encodings := 0
 	headers := 0
 	for {
 		line := reader_line(&r) or_return
@@ -302,9 +305,21 @@ http_exchange :: proc(
 			}
 			content_length = v
 		case dns.name_equal_fold(name, "transfer-encoding"):
-			chunked = strings.contains(strings.to_lower(value, context.temp_allocator), "chunked")
+			/*
+			`chunked` alone, once, or the response is refused (#437). This
+			client asks for no codings, so any other is one it cannot undo -
+			`chunked, gzip` framed as chunks handed the gzip on as the answer -
+			and RFC 9112 6.1 forbids chunked anywhere but last, or twice. Read
+			as a substring, `xchunked` took chunk framing out of a plain body.
+			*/
+			transfer_encodings += 1
+			if transfer_encodings > 1 || !dns.name_equal_fold(value, "chunked") {
+				return resp, .HTTP_Error
+			}
+			chunked = true
 		case dns.name_equal_fold(name, "connection"):
-			if dns.name_equal_fold(value, "close") {
+			// A list of options (RFC 9110 7.6.1): `keep-alive, close` closes.
+			if h2.list_has_token(value, "close") {
 				resp.keep_alive = false
 			}
 		case dns.name_equal_fold(name, "location"):
@@ -315,6 +330,12 @@ http_exchange :: proc(
 				resp.location = strings.clone(value, context.temp_allocator)
 			}
 		}
+	}
+
+	// Both framings at once is what a smuggled response looks like (RFC 9112
+	// 6.3), and a hop in front may pick the other one.
+	if chunked && content_length >= 0 {
+		return resp, .HTTP_Error
 	}
 
 	switch {
@@ -431,30 +452,41 @@ read_chunked :: proc(r: ^Buf_Reader, allocator: mem.Allocator) -> (body: []u8, e
 	}
 	for {
 		line := reader_line(r) or_return
-		// A chunk size may carry extensions after a ';'.
-		size_text := line
+		/*
+		`1*HEXDIG`, then optionally BWS and a `;` extension (RFC 9112 7.1.1).
+		The BWS is spaces and tabs and only in front of the `;`: trimmed off
+		both ends regardless, ` 5` and `5 ` were chunk sizes (#437).
+		*/
+		digits := line
 		if idx := strings.index_byte(line, ';'); idx >= 0 {
-			size_text = line[:idx]
+			digits = strings.trim_right(line[:idx], " \t")
 		}
 		/*
-		`strconv.parse_u64_of_base` has no overflow check: it wraps and still
-		reports success. A header longer than a u64 therefore parses as some
-		unrelated number — zero among them, which would be read as the end of
-		the body — so the length is settled here, where sixteen significant hex
-		digits is exactly what fits.
+		Parsed here rather than by `strconv.parse_u64_of_base`, which takes a
+		sign and skips `_` - so `+5` and `0_5` were five - and has no overflow
+		check: a size longer than a u64 wrapped to some unrelated number, zero
+		among them, which would be read as the end of the body. Sixteen
+		significant hex digits is exactly what fits.
 		*/
-		// BWS before a `;` is spaces and tabs (RFC 9112 7.1.1), not whatever
-		// `strings.trim_space` takes for whitespace.
-		digits := strings.trim(size_text, " \t")
 		for len(digits) > 1 && digits[0] == '0' {
 			digits = digits[1:]
 		}
 		if len(digits) == 0 || len(digits) > 16 {
 			return nil, .HTTP_Error
 		}
-		size, ok := strconv.parse_u64_of_base(digits, 16)
-		if !ok {
-			return nil, .HTTP_Error
+		size: u64
+		for i in 0 ..< len(digits) {
+			c := digits[i]
+			switch c {
+			case '0' ..= '9':
+				size = size << 4 | u64(c - '0')
+			case 'a' ..= 'f':
+				size = size << 4 | u64(c - 'a' + 10)
+			case 'A' ..= 'F':
+				size = size << 4 | u64(c - 'A' + 10)
+			case:
+				return nil, .HTTP_Error
+			}
 		}
 		if size == 0 {
 			// Trailers, then the final CRLF. Counted like the headers they are.

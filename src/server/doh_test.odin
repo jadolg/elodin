@@ -2101,3 +2101,37 @@ test_doh_lines_hold_no_bare_line_ends :: proc(t: ^testing.T) {
 		testing.expect(t, parsed, "a plain request was refused")
 	}
 }
+
+/*
+`Connection` is a list of options (RFC 9110 7.6.1), and a client that puts
+`close` anywhere in it wants no second request on this connection. Read as one
+token, `close, TE` was kept open until `client_timeout`, holding a thread for
+nothing (#437). An option that merely contains the letters is not `close`.
+*/
+@(test)
+test_doh_request_connection_is_a_list :: proc(t: ^testing.T) {
+	Case :: struct {
+		connection: string,
+		keep_alive: bool,
+	}
+	CASES := []Case {
+		{"Connection: close\r\n", false},
+		{"Connection: close, TE\r\n", false},
+		{"Connection: TE,close\r\n", false},
+		{"Connection: keep-alive ,\tCLOSE\r\n", false},
+		{"Connection: TE\r\nConnection: close\r\n", false},
+		{"Connection: closed\r\n", true},
+		{"Connection: xclose, TE\r\n", true},
+		{"Connection: ,\r\n", true},
+	}
+	for c in CASES {
+		raw := fmt.tprintf("GET /dns-query HTTP/1.1\r\nHost: dns.example\r\n%s\r\n", c.connection)
+		req, status, parsed, ok := read_request_over_loopback(t, raw, c.connection)
+		if !ok {
+			return
+		}
+		testing.expectf(t, parsed, "%q was refused with a %d", c.connection, status)
+		testing.expectf(t, req.keep_alive == c.keep_alive, "%q: keep_alive %v, want %v", c.connection, req.keep_alive, c.keep_alive)
+		free_all(context.temp_allocator)
+	}
+}

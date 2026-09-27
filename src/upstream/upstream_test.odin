@@ -2711,3 +2711,139 @@ test_http_chunk_size_keeps_what_is_not_bws :: proc(t: ^testing.T) {
 	delete(resp.body, mem.tracking_allocator(&track))
 	free_all(context.temp_allocator)
 }
+
+/*
+`Connection` is a list of options (RFC 9110 7.6.1), and `close` anywhere in it
+means the server will close after this response. Read as one token, `keep-alive,
+close` kept a connection the server was about to drop, so the next query on it
+failed as a transport error (#437). An option that merely contains the letters is
+not `close`. An HTTP/1.0 response keeps nothing unless it says so (RFC 9112
+9.3), and the pool assumed it did.
+*/
+@(test)
+test_http_response_connection_is_a_list :: proc(t: ^testing.T) {
+	Case :: struct {
+		head:       string,
+		keep_alive: bool,
+	}
+	CASES := []Case {
+		{"HTTP/1.1 200 OK\r\nConnection: keep-alive, close\r\n", false},
+		{"HTTP/1.1 200 OK\r\nConnection: close, TE\r\n", false},
+		{"HTTP/1.1 200 OK\r\nConnection: TE,close\r\n", false},
+		{"HTTP/1.1 200 OK\r\nConnection: foo ,\tClose ,\r\n", false},
+		{"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nConnection: close\r\n", false},
+		{"HTTP/1.1 200 OK\r\nConnection: closed\r\n", true},
+		{"HTTP/1.1 200 OK\r\nConnection: xclose, keep-alive\r\n", true},
+		{"HTTP/1.1 200 OK\r\nConnection: close-later\r\n", true},
+		{"HTTP/1.1 200 OK\r\nConnection: ,\r\n", true},
+		{"HTTP/1.0 200 OK\r\n", false},
+	}
+	for c in CASES {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		resp, err, ok := exchange_against(t, fmt.tprintf("%sContent-Length: 5\r\n\r\nhello", c.head), &track)
+		if ok {
+			testing.expectf(t, err == .None, "%q: exchange failed: %v", c.head, err)
+			testing.expectf(t, resp.keep_alive == c.keep_alive, "%q: keep-alive %v, want %v", c.head, resp.keep_alive, c.keep_alive)
+			delete(resp.body, mem.tracking_allocator(&track))
+		}
+		mem.tracking_allocator_destroy(&track)
+		free_all(context.temp_allocator)
+	}
+}
+
+/*
+The only transfer coding this client can read is `chunked` alone, and it asks for
+no others (#437). Found as a substring, `chunked, gzip` was framed as chunks and
+the gzip body inside handed on as the answer, and `xchunked` read chunk framing
+out of a body with none. RFC 9112 6.1 makes `chunked` the final coding and
+forbids applying it twice; anything else is refused, as is a Transfer-Encoding
+alongside a Content-Length (RFC 9112 6.3), whose two framings a hop in front may
+pick between differently.
+*/
+@(test)
+test_http_transfer_encoding_is_exactly_chunked :: proc(t: ^testing.T) {
+	Case :: struct {
+		fields:  string,
+		refused: bool,
+	}
+	CHUNKS :: "5\r\nhello\r\n0\r\n\r\n"
+	CASES := []Case {
+		{"Transfer-Encoding: chunked\r\n", false},
+		{"Transfer-Encoding: CHUNKED\r\n", false},
+		{"Transfer-Encoding:  chunked\t\r\n", false},
+		{"Transfer-Encoding: chunked, gzip\r\n", true},
+		{"Transfer-Encoding: gzip, chunked\r\n", true},
+		{"Transfer-Encoding: xchunked\r\n", true},
+		{"Transfer-Encoding: chunkedx\r\n", true},
+		{"Transfer-Encoding: chunked, chunked\r\n", true},
+		{"Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n", true},
+		{"Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n", true},
+		{"Transfer-Encoding: identity\r\n", true},
+		{"Transfer-Encoding:\r\n", true},
+		{"Transfer-Encoding: chunked\r\nContent-Length: 5\r\n", true},
+		{"Content-Length: 5\r\nTransfer-Encoding: chunked\r\n", true},
+	}
+	for c in CASES {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		resp, err, ok := exchange_against(t, fmt.tprintf("HTTP/1.1 200 OK\r\n%s\r\n%s", c.fields, CHUNKS), &track)
+		if ok {
+			if c.refused {
+				testing.expectf(t, err != .None, "%q was read, body %q", c.fields, string(resp.body))
+			} else {
+				testing.expectf(t, err == .None, "%q failed: %v", c.fields, err)
+				testing.expectf(t, string(resp.body) == "hello", "%q: body %q", c.fields, string(resp.body))
+			}
+			delete(resp.body, mem.tracking_allocator(&track))
+		}
+		mem.tracking_allocator_destroy(&track)
+		free_all(context.temp_allocator)
+	}
+}
+
+/*
+A chunk size is `1*HEXDIG`, and the only whitespace RFC 9112 7.1.1 allows near it
+is BWS before a `;` extension. Trimmed off both ends regardless, ` 5` and `5 `
+were read as five (#437), and so were `+5` and `0_5`, which `strconv` reads.
+*/
+@(test)
+test_http_chunk_size_takes_bws_only_before_an_extension :: proc(t: ^testing.T) {
+	Case :: struct {
+		size:    string,
+		refused: bool,
+	}
+	CASES := []Case {
+		{"5", false},
+		{"5;ext", false},
+		{"5 ;ext", false},
+		{"5\t; ext=1", false},
+		{" 5", true},
+		{"5 ", true},
+		{"\t5", true},
+		{"5\t", true},
+		{" 5;ext", true},
+		{"5 5", true},
+		// `strconv.parse_u64_of_base` takes a sign and skips `_`.
+		{"+5", true},
+		{"0_5", true},
+		{"_5", true},
+	}
+	for c in CASES {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		reply := fmt.tprintf("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n%s\r\nhello\r\n0\r\n\r\n", c.size)
+		resp, err, ok := exchange_against(t, reply, &track)
+		if ok {
+			if c.refused {
+				testing.expectf(t, err != .None, "chunk size %q was read, body %q", c.size, string(resp.body))
+			} else {
+				testing.expectf(t, err == .None, "chunk size %q failed: %v", c.size, err)
+				testing.expectf(t, string(resp.body) == "hello", "chunk size %q: body %q", c.size, string(resp.body))
+			}
+			delete(resp.body, mem.tracking_allocator(&track))
+		}
+		mem.tracking_allocator_destroy(&track)
+		free_all(context.temp_allocator)
+	}
+}
