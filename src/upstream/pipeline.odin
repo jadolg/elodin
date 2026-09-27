@@ -524,14 +524,18 @@ other query in flight with it.
 exchange_pipelined :: proc(
 	u: ^Upstream,
 	query: []u8,
+	// The upstream's own, which a connection this dials keeps.
 	timeout: time.Duration,
+	// This exchange's, which a UDP reply's retry has already spent part of.
+	deadline: time.Tick,
 	allocator: mem.Allocator,
 ) -> (
 	response: []u8,
 	err: Error,
 ) {
 	/*
-	One deadline for the whole of this, handed to every stage. Waiting for
+	One deadline for the whole of this, set by `exchange` and handed to every
+	stage. Waiting for
 	somebody else's dial, dialling, asking, writing and retrying each used to
 	start a clock of its own, so a query could cost several times the timeout
 	its caller was promised - with an upstream worker held for all of it.
@@ -543,8 +547,6 @@ exchange_pipelined :: proc(
 	timeout, and, through `pipe_framing_deadline`, a bound whose blast radius
 	is the shared connection rather than one query.
 	*/
-	deadline := time.tick_add(time.tick_now(), timeout)
-
 	c, gerr := get_pipe(u, timeout, deadline)
 	if gerr != .None {
 		return nil, gerr

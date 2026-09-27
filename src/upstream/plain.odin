@@ -18,6 +18,7 @@ exchange_udp :: proc(
 	u: ^Upstream,
 	query: []u8,
 	timeout: time.Duration,
+	deadline: time.Tick,
 	allocator: mem.Allocator,
 ) -> (
 	response: []u8,
@@ -59,7 +60,6 @@ exchange_udp :: proc(
 	*/
 	limit := clamp(int(dns.peek_udp_size(query)), dns.MAX_UDP_SIZE, dns.MAX_MESSAGE)
 	buf := make([]u8, limit + 1, context.temp_allocator)
-	deadline := time.tick_add(time.tick_now(), timeout)
 
 	/*
 	Whether anything arrived from the server and was thrown away.
@@ -80,7 +80,7 @@ exchange_udp :: proc(
 			// The datagram was larger than the room the query offered, so what
 			// arrived is a prefix of an answer. TCP is where the whole one is.
 			if recv_err == .Excess_Truncated {
-				return exchange_pipelined(u, query, timeout, allocator)
+				return exchange_pipelined(u, query, timeout, deadline, allocator)
 			}
 			return nil, .Bad_Response if rejected else .Timeout
 		}
@@ -99,8 +99,13 @@ exchange_udp :: proc(
 		}
 
 		flags := transmute(dns.Flags)(u16(buf[2]) << 8 | u16(buf[3]))
+		/*
+		On what is left of the exchange, not a timeout of its own (issues #376,
+		#449): a TC that arrives late leaves the retry little, and it fails as
+		the timeout it is, rather than one exchange costing two.
+		*/
 		if flags.tc {
-			return exchange_pipelined(u, query, timeout, allocator)
+			return exchange_pipelined(u, query, timeout, deadline, allocator)
 		}
 		out := make([]u8, n, allocator)
 		copy(out, buf[:n])

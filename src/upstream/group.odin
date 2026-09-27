@@ -253,9 +253,8 @@ resolve_insisting :: proc(
 	own timeout never shortened, the exchange that crosses the line allowed to
 	finish - so a call started with any time left can overrun the deadline by
 	one timeout and no more, and a question's worst wait is its span plus one
-	timeout however many calls it makes - plus one more where that exchange is
-	a UDP reply retried over TCP, which takes a timeout of its own (issue #376).
-	Zero, or nil, is no deadline.
+	timeout however many calls it makes: `exchange` holds itself to its timeout
+	whatever it does inside (issue #449). Zero, or nil, is no deadline.
 
 	On the tick clock, for the reason `resolve_sequential` gives.
 	*/

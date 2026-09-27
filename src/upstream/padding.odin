@@ -61,6 +61,7 @@ exchange_padded :: proc(
 	u: ^Upstream,
 	query: []u8,
 	timeout: time.Duration,
+	deadline: time.Tick,
 	allocator: mem.Allocator,
 ) -> (
 	response: []u8,
@@ -77,7 +78,7 @@ exchange_padded :: proc(
 		asked = query
 	}
 
-	response = send(u, asked, timeout, allocator) or_return
+	response = send(u, asked, timeout, deadline, allocator) or_return
 	return strip_padding(u, response, allocator)
 }
 

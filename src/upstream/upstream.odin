@@ -246,7 +246,12 @@ elodin *is* the system resolver, asking it to resolve its own upstream would
 deadlock at boot.
 */
 @(private)
-resolve_endpoint :: proc(u: ^Upstream) -> bool {
+resolve_endpoint :: proc(
+	u: ^Upstream,
+	// The exchange's, which the bootstrap queries spend; zero at startup, where
+	// each has `BOOTSTRAP_TIMEOUT` of its own.
+	deadline := time.Tick{},
+) -> bool {
 	if addr := net.parse_address(u.spec.address); addr != nil {
 		u.endpoint = net.Endpoint {
 			address = addr,
@@ -256,7 +261,7 @@ resolve_endpoint :: proc(u: ^Upstream) -> bool {
 		return true
 	}
 
-	addr, ok := bootstrap_resolve(u.spec.bootstrap, u.spec.address)
+	addr, ok := bootstrap_resolve(u.spec.bootstrap, u.spec.address, deadline)
 	if !ok {
 		logx.warnf("upstream %s: cannot resolve %q via bootstrap resolvers", u.spec.name, u.spec.address)
 		u.resolved = false
@@ -568,7 +573,18 @@ exchange :: proc(
 	for as long as the bootstrap stayed down (issue #327). With no bootstrap
 	servers to ask the refusal costs nothing, and is left unrecorded as before.
 	*/
-	if !u.resolved && !resolve_endpoint(u) {
+	/*
+	One deadline for the whole exchange, set before anything else and spent by
+	every stage: resolving the hostname, the cookie retry, a truncated reply's
+	retry over TCP. Each used to start a timeout of its own, so one exchange
+	could take several, and every bound above - a group's budget, a question's
+	deadline, a follower's patience - allows for one exchange crossing its line
+	on the promise that it takes one timeout (issue #449). A stage left with
+	nothing fails as a timeout, which it is: the upstream had the whole of it.
+	On the tick clock, which an NTP step cannot move.
+	*/
+	deadline := time.tick_add(time.tick_now(), timeout)
+	if !u.resolved && !resolve_endpoint(u, deadline) {
 		if len(u.spec.bootstrap) > 0 {
 			record_failure(u, .Not_Resolved)
 		}
@@ -581,11 +597,11 @@ exchange :: proc(
 	// left showing. `cookies_wanted` and `padding_wanted` name disjoint kinds.
 	switch {
 	case cookies_wanted(u):
-		response, err = exchange_with_cookie(u, query, timeout, allocator)
+		response, err = exchange_with_cookie(u, query, timeout, deadline, allocator)
 	case padding_wanted(u):
-		response, err = exchange_padded(u, query, timeout, allocator)
+		response, err = exchange_padded(u, query, timeout, deadline, allocator)
 	case:
-		response, err = send(u, query, timeout, allocator)
+		response, err = send(u, query, timeout, deadline, allocator)
 	}
 
 	if err != .None {
@@ -605,24 +621,36 @@ exchange :: proc(
 	return response, .None
 }
 
-// One round trip over whichever transport this upstream speaks.
+/*
+One round trip over whichever transport this upstream speaks, by `deadline`.
+
+`timeout` is the upstream's own, which a pipelined connection keeps for its
+life - a connection dialled by a query with little left must not be a short one
+for every query after it - and `deadline` is this exchange's. DoH reads only
+what is left: its connections take their budget per call.
+*/
 @(private)
 send :: proc(
 	u: ^Upstream,
 	query: []u8,
 	timeout: time.Duration,
+	deadline: time.Tick,
 	allocator: mem.Allocator,
 ) -> (
 	response: []u8,
 	err: Error,
 ) {
+	left := time.tick_diff(time.tick_now(), deadline)
+	if left <= 0 {
+		return nil, .Timeout
+	}
 	switch u.spec.kind {
 	case .UDP:
-		return exchange_udp(u, query, timeout, allocator)
+		return exchange_udp(u, query, timeout, deadline, allocator)
 	case .TCP, .TLS:
-		return exchange_pipelined(u, query, timeout, allocator)
+		return exchange_pipelined(u, query, timeout, deadline, allocator)
 	case .HTTPS:
-		return exchange_doh(u, query, timeout, allocator)
+		return exchange_doh(u, query, left, allocator)
 	}
 	return nil, .Bad_Response
 }

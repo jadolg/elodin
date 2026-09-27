@@ -38,7 +38,20 @@ Resolve `hostname` using `servers` (plain "IP" or "IP:port" strings).
 
 A and AAAA are tried in that order; the first usable address wins.
 */
-bootstrap_resolve :: proc(servers: []string, hostname: string) -> (addr: net.Address, ok: bool) {
+bootstrap_resolve :: proc(
+	servers: []string,
+	hostname: string,
+	/*
+	The exchange's, when an upstream's own hostname is being resolved on its
+	way to being asked: each query gets `BOOTSTRAP_TIMEOUT` or what is left,
+	whichever is less, and none starts once nothing is (issue #449). Zero, as
+	at startup and for list downloads, is no deadline.
+	*/
+	deadline := time.Tick{},
+) -> (
+	addr: net.Address,
+	ok: bool,
+) {
 	if literal := net.parse_address(hostname); literal != nil {
 		return literal, true
 	}
@@ -58,7 +71,15 @@ bootstrap_resolve :: proc(servers: []string, hostname: string) -> (addr: net.Add
 
 	for server in servers {
 		for qtype in ([]dns.Type{.A, .AAAA}) {
-			result, found := bootstrap_query(server, hostname, qtype)
+			timeout := BOOTSTRAP_TIMEOUT
+			if deadline != {} {
+				left := time.tick_diff(time.tick_now(), deadline)
+				if left <= 0 {
+					return nil, false
+				}
+				timeout = min(timeout, left)
+			}
+			result, found := bootstrap_query(server, hostname, qtype, timeout)
 			if !found {
 				continue
 			}

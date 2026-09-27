@@ -238,6 +238,8 @@ exchange_with_cookie :: proc(
 	u: ^Upstream,
 	query: []u8,
 	timeout: time.Duration,
+	// Shared by the retry, which is part of the same exchange (issue #449).
+	deadline: time.Tick,
 	allocator: mem.Allocator,
 ) -> (
 	response: []u8,
@@ -245,10 +247,10 @@ exchange_with_cookie :: proc(
 ) {
 	asked, attached := attach_cookie(u, query, context.temp_allocator)
 	if !attached {
-		return send(u, query, timeout, allocator)
+		return send(u, query, timeout, deadline, allocator)
 	}
 
-	response = send(u, asked, timeout, allocator) or_return
+	response = send(u, asked, timeout, deadline, allocator) or_return
 	learn_cookie(u, response)
 
 	if dns.peek_rcode(response) == .Bad_Cookie {
@@ -270,7 +272,7 @@ exchange_with_cookie :: proc(
 		// read back rather than one it is guaranteed to discard on the error.
 		delete(response, allocator)
 		response = nil
-		response = send(u, retry, timeout, allocator) or_return
+		response = send(u, retry, timeout, deadline, allocator) or_return
 		learn_cookie(u, response)
 		if dns.peek_rcode(response) == .Bad_Cookie {
 			logx.debugf("upstream %s: still BADCOOKIE after a fresh cookie", u.spec.name)
