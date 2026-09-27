@@ -380,7 +380,7 @@ resolve_insisting :: proc(
 	spent: time.Duration
 	for u in g.servers {
 		if spent >= budget {
-			logx.debugf("this query has waited %v on its upstreams, leaving the rest of the group unswept", query_budget(g) - budget + spent)
+			logx.debugf("this query has waited %v on its upstreams, leaving the rest of the group unswept", time.tick_since(started))
 			break
 		}
 		if u == winner {

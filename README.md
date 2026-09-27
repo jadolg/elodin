@@ -411,10 +411,10 @@ server still hands over to the second inside the query, which is asked with its
 full `timeout`; a third is left for the next query, by which time the dead ones
 are on their way to the cooldown below. A reply that did arrive but says
 SERVFAIL or REFUSED sends the query on to the rest of the group, inside the
-same two `timeout`s rather than on top of them. One exchange is never cut short, so one
-that runs long - a hostname upstream whose `bootstrap` resolvers have gone
-quiet, three seconds a lookup - can carry a query past the figure; such a
-server counts that as a failure and is benched like a dead one.
+same two `timeout`s rather than on top of them. One exchange is never cut
+short, so one that runs long - a hostname upstream whose `bootstrap` resolvers
+have gone quiet, three seconds a lookup - can carry a query past the figure;
+such a server counts that as a failure and is benched like a dead one.
 
 `bootstrap` matters: elodin resolves upstream hostnames itself rather than
 through the system resolver, since on a machine where elodin *is* the system
