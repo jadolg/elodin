@@ -423,6 +423,8 @@ SERVFAIL or REFUSED sends the query on to the rest of the group, inside the
 same two `timeout`s rather than on top of them. So does a referral - a server
 same two `timeout`s rather than on top of them. So does a referral - a server
 that does not recurse for the name answering with the NS of a zone and no SOA,
+same two `timeout`s rather than on top of them. So does a referral - a server
+that does not recurse for the name answering with the NS of a zone and no SOA,
 on its own or after a CNAME whose target that zone holds - and where no member
 does better the client gets SERVFAIL, not the empty NOERROR it would read as
 "no such record" (`outcome=failed detail=referral` in the query log). A

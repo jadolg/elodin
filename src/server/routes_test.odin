@@ -1013,6 +1013,75 @@ test_a_referral_nobody_does_better_than_is_a_servfail :: proc(t: ^testing.T) {
 }
 
 /*
+A referral past a CNAME into a zone routed elsewhere is handed on (issue #451).
+
+Routes `corp.` and `lab.corp.` to two authorities. The first holds
+`www.corp. CNAME host.lab.corp.` and delegates `lab.corp.`, so it answers with the
+alias beside the delegation's NS - all it has. A client that follows the CNAME
+asks `host.lab.corp.`, which this server sends to the second route, so the reply
+is the client's rather than a SERVFAIL. The control is
+`test_a_referral_nobody_does_better_than_is_a_servfail`, whose target comes back
+to the group that referred.
+*/
+@(test)
+test_a_referral_past_a_cname_into_another_route_is_handed_on :: proc(t: ^testing.T) {
+	socket, berr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, berr == nil, "cannot bind the mock: %v", berr) {
+		return
+	}
+	defer net.close(socket)
+	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+	bound, perr := net.bound_endpoint(socket)
+	if !testing.expectf(t, perr == nil, "cannot read the mock's port: %v", perr) {
+		return
+	}
+
+	// The second route's port is never answered: only its group matters.
+	lab_socket, lerr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, lerr == nil, "cannot bind the second mock: %v", lerr) {
+		return
+	}
+	defer net.close(lab_socket)
+	lab_bound, lperr := net.bound_endpoint(lab_socket)
+	if !testing.expectf(t, lperr == nil, "cannot read the second mock's port: %v", lperr) {
+		return
+	}
+
+	cfg := forwarding_config()
+	def := mock_group(t, cfg.upstream, lab_bound.port)
+	defer upstream.destroy_group(def)
+	corp := mock_group(t, cfg.upstream, bound.port)
+	defer upstream.destroy_group(corp)
+	lab := mock_group(t, cfg.upstream, lab_bound.port)
+	defer upstream.destroy_group(lab)
+	s := Server {
+		cfg    = &cfg,
+		group  = def,
+		routes = []Zone_Route{{domains = []string{"lab.corp."}, group = lab}, {domains = []string{"corp."}, group = corp}},
+	}
+
+	mock := Route_Mock {
+		socket = socket,
+		reply  = route_reply_alias("www.corp.", "host.lab.corp.", "lab.corp."),
+		want   = "www.corp.",
+	}
+	mock_thread := thread.create_and_start_with_poly_data(&mock, serve_route)
+	out, _, ok := handle_query(&s, route_query("www.corp."), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	thread.join(mock_thread)
+	thread.destroy(mock_thread)
+
+	if !testing.expect(t, ok, "nothing came back at all") {
+		return
+	}
+	testing.expect(t, mock.asked, "the first route was not asked")
+	decoded, derr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
+	testing.expect_value(t, len(decoded.answer), 1)
+	free_all(context.temp_allocator)
+}
+
+/*
 And a chain lookup handed one is a lookup that fetched nothing (issue #410).
 
 `resolve_answerable` sweeps past a referral but hands it back where no member

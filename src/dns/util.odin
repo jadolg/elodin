@@ -518,24 +518,33 @@ skip_record :: proc(msg: []u8, pos: int) -> (type: Type, next: int, ok: bool) {
 @(private)
 MAX_ALIAS_REFERRAL_RECORDS :: 32
 
-// The CNAME half of `peek_referral`: whether the authority's NS are for the
-// chain's target rather than for the name asked. `authority_at` is where the
-// authority section starts, which `peek_referral` has already walked.
+/*
+Where the CNAME chain in a reply's answer section ends: the name a client that
+follows it asks next. `aliased` is false where the chain goes nowhere - no CNAME
+from the question's name, a loop back to it, or a question whose CNAME is the
+data rather than a step (a CNAME, DNAME or RRSIG asked for, or ANY, which
+matches the CNAME and is not followed: RFC 1034 section 4.3.2, step 3a).
+
+For `resolve_query`, which asks it of a reply `peek_referral` has already called
+a referral past an alias, and so already bounded.
+*/
+peek_alias_target :: proc(msg: []u8) -> (target: string, aliased: bool) {
+	_, target, aliased = alias_chain(msg)
+	return
+}
+
 @(private)
-referred_past_alias :: proc(msg: []u8, authority_at, nscount: int) -> bool {
+alias_chain :: proc(msg: []u8) -> (asked, target: string, aliased: bool) {
 	decoded, err := decode_through_answer(msg, context.temp_allocator)
 	if err != .None || len(decoded.question) != 1 {
-		return false
+		return
 	}
-	// A CNAME asked for is the data, not a step towards it - and so is one
-	// answering ANY, which matches it and is not followed (RFC 1034 section
-	// 4.3.2, step 3a).
 	#partial switch decoded.question[0].type {
 	case .CNAME, .DNAME, .RRSIG, .ANY:
-		return false
+		return
 	}
-	asked := decoded.question[0].name
-	target := asked
+	asked = decoded.question[0].name
+	target = asked
 	// One step per answer record at most, so a loop in the chain ends.
 	for _ in decoded.answer {
 		moved := false
@@ -551,7 +560,16 @@ referred_past_alias :: proc(msg: []u8, authority_at, nscount: int) -> bool {
 			break
 		}
 	}
-	if name_equal_fold(target, asked) {
+	return asked, target, !name_equal_fold(target, asked)
+}
+
+// The CNAME half of `peek_referral`: whether the authority's NS are for the
+// chain's target rather than for the name asked. `authority_at` is where the
+// authority section starts, which `peek_referral` has already walked.
+@(private)
+referred_past_alias :: proc(msg: []u8, authority_at, nscount: int) -> bool {
+	asked, target, aliased := alias_chain(msg)
+	if !aliased {
 		return false
 	}
 	pos := authority_at

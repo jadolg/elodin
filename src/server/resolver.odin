@@ -3,6 +3,7 @@ package server
 import "core:fmt"
 import "core:mem"
 import "core:net"
+import "core:slice"
 import "core:sync"
 import "core:time"
 import "elodin:cache"
@@ -2317,6 +2318,33 @@ resolve_query :: proc(
 	stale fallback read it as the outage it is. See `dns.peek_referral`.
 	*/
 	referral := uerr == .None && dns.peek_referral(resp)
+	/*
+	Except a referral past a CNAME whose target this server sends somewhere
+	else. Routes `corp.` and `lab.corp.` to two authorities, and the first
+	answers `www.corp. CNAME host.lab.corp.` beside `lab.corp. NS`: that is all
+	it holds, and a client that follows the CNAME asks `host.lab.corp.` of the
+	second, which answers. Whether a group other than the one that referred
+	can answer the target is not known here, so the reply goes out as it did
+	before issue #451; where the target comes back to that same group - one
+	lame member of the default group, the shape the issue is about - the
+	group has already said it cannot, and the refusal stands.
+	*/
+	if referral {
+		if target, aliased := dns.peek_alias_target(resp); aliased {
+			back := route_group(s, target, q.type)
+			if back == nil || !slice.contains(back.servers, winner) {
+				logx.debugf(
+					"query %s %s from %s: upstream %s referred past a CNAME to %s, which is asked elsewhere; handing it on",
+					dns.type_name(q.type),
+					q.name,
+					client,
+					answering_upstream(winner),
+					target,
+				)
+				referral = false
+			}
+		}
+	}
 	if referral {
 		logx.debugf(
 			"query %s %s from %s: upstream %s answered with a referral rather than recursing",
