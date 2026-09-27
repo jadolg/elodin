@@ -94,9 +94,9 @@ max_pending, and their bytes by MAX_CONN_REQUEST.
 MAX_HELD_STREAMS :: 2 * MAX_CONCURRENT
 // See Conn.closed_stream_rst_budget.
 MAX_CLOSED_STREAM_RST :: 16
-// See Conn.reset_ids: more than a second of the resets it remembers.
-RESET_IDS :: MAX_CONCURRENT
-#assert(RESET_IDS > MAX_CONTROL_FRAMES_PER_SECOND)
+// See Conn.reset_ids: the most resets it remembers that can land within a
+// moment - a full control window either side of the second rolling over.
+RESET_IDS :: 2 * MAX_CONTROL_FRAMES_PER_SECOND
 /*
 PINGs, non-ACK SETTINGS and stream errors (a malformed or refused request) a
 peer may cause per second, each of which draws a frame back. Writes here are
@@ -212,11 +212,15 @@ Conn :: struct {
 
 	Every reset remembered goes through `stream_error`, which spends
 	MAX_CONTROL_FRAMES_PER_SECOND (the server's own budget has no `earned`
-	credit to stretch it), so RESET_IDS is more than a second of them. In
-	flight means sent before our reset arrived - a round trip, not a second -
-	so a slot is only ever overwritten long after it stopped mattering. Struck off again once the peer ends or resets the stream, or its
-	trailers arrive. An id that does fall out only falls back to
-	`closed_stream_rst_budget`.
+	credit to stretch it). The window is fixed, so a full one either side of
+	it rolling over can land together; RESET_IDS holds both. In flight means
+	sent before our reset arrived - a round trip - so a slot is only ever
+	overwritten once it has stopped mattering. If one is overwritten sooner,
+	DATA on it falls back to `closed_stream_rst_budget` and trailers on it to
+	the connection error every other reused id gets.
+
+	An id is struck off once the peer ends or resets the stream, or its
+	trailers arrive: nothing more can be in flight on it after that.
 	*/
 	reset_ids:                [RESET_IDS]u32,
 	reset_next:               int,
@@ -490,9 +494,9 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 			// on, so broadcasting for one would only wake every other handler on
 			// the connection to recheck a state that has not changed for them.
 			sync.cond_broadcast(&c.cond)
-		} else if slot, reset_here := reset_slot(c, h.stream_id); reset_here {
+		} else {
 			// Over for the peer too, so nothing more is in flight on it.
-			c.reset_ids[slot] = 0
+			was_reset_here(c, h.stream_id, forget = true)
 		}
 		sync.mutex_unlock(&c.mu)
 		if orphaned {
@@ -711,14 +715,12 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	*/
 	discard := false
 	if h.stream_id <= c.last_stream_id {
-		slot, reset_here := reset_slot(c, h.stream_id)
 		// Trailers end the stream (RFC 9113 8.1); a block that does not is an id reused.
-		if !reset_here || h.flags & FLAG_END_STREAM == 0 {
+		if !was_reset_here(c, h.stream_id, forget = true) || h.flags & FLAG_END_STREAM == 0 {
 			sync.mutex_unlock(&c.mu)
 			goaway(c, .Protocol_Error)
 			return false
 		}
-		c.reset_ids[slot] = 0
 		discard = true
 	}
 	c.last_stream_id = max(c.last_stream_id, h.stream_id)
@@ -1223,15 +1225,8 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	a refused HEADERS, or the rest of one over MAX_BODY (#390). See
 	Conn.reset_ids.
 	*/
-	reset_here := false
-	if !found {
-		slot: int
-		slot, reset_here = reset_slot(c, h.stream_id)
-		// The peer has ended it, so nothing more is in flight; see handle_headers.
-		if reset_here && h.flags & FLAG_END_STREAM != 0 {
-			c.reset_ids[slot] = 0
-		}
-	}
+	// Ended by the peer, so nothing more is in flight on it; see handle_headers.
+	reset_here := !found && was_reset_here(c, h.stream_id, forget = h.flags & FLAG_END_STREAM != 0)
 	send_closed_rst := !found && !reset_here && c.closed_stream_rst_budget > 0
 	if send_closed_rst {
 		c.closed_stream_rst_budget -= 1
@@ -1459,15 +1454,23 @@ rst_stream :: proc(c: ^Conn, stream_id: u32, code: Error_Code) -> bool {
 	return write_all(c, out[:])
 }
 
-// Where `stream_id` is in Conn.reset_ids, if it is. Caller holds `c.mu`.
+// Whether `stream_id` is in Conn.reset_ids, struck off as well with `forget`.
+// Caller holds `c.mu`.
 @(private)
-reset_slot :: proc(c: ^Conn, stream_id: u32) -> (int, bool) {
-	for id, i in c.reset_ids {
+was_reset_here :: proc(c: ^Conn, stream_id: u32, forget := false) -> bool {
+	// 0 marks an empty slot.
+	if stream_id == 0 {
+		return false
+	}
+	for &id in c.reset_ids {
 		if id == stream_id {
-			return i, true
+			if forget {
+				id = 0
+			}
+			return true
 		}
 	}
-	return 0, false
+	return false
 }
 
 @(private)
