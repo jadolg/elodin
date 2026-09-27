@@ -339,6 +339,16 @@ validator_query :: proc(
 		logx.debugf("dnssec: %s %s could not be fetched: %v", dns.type_name(type), name, uerr)
 		return nil, false
 	}
+	/*
+	And a referral, which `resolve_answerable` hands back where no member did
+	better, fetched nothing either (issue #410). Read as a reply, a `DS` one has
+	neither the DS nor a signed denial of it and a `DNSKEY` one no keys, and the
+	walk would call the chain forged - Bogus - rather than unavailable.
+	*/
+	if dns.peek_referral(response) {
+		logx.debugf("dnssec: %s %s could not be fetched: the group answered with a referral", dns.type_name(type), name)
+		return nil, false
+	}
 	return response, true
 }
 

@@ -410,13 +410,15 @@ not a NOERROR here. A message that cannot be walked is not a referral: what a
 decode would refuse is refused where it is decoded.
 */
 peek_referral :: proc(msg: []u8) -> bool {
-	if len(msg) < HEADER_SIZE || msg[2] & 0x04 != 0 || peek_rcode(msg) != .No_Error {
+	if len(msg) < HEADER_SIZE || msg[2] & 0x04 != 0 {
 		return false
 	}
 	qdcount := int(u16(msg[4]) << 8 | u16(msg[5]))
 	ancount := int(u16(msg[6]) << 8 | u16(msg[7]))
 	nscount := int(u16(msg[8]) << 8 | u16(msg[9]))
-	if ancount != 0 || nscount == 0 {
+	// The counts before the rcode: composing it walks the whole message for the
+	// OPT record, and every answer with records in it stops here without that.
+	if ancount != 0 || nscount == 0 || peek_rcode(msg) != .No_Error {
 		return false
 	}
 

@@ -2168,9 +2168,10 @@ resolve_query :: proc(
 			*/
 			if uerr == .None {
 				logx.debugf(
-					"query DS %s: the parent's group answered %s rather than proving the delegation carries no DS, so the route is asked instead",
+					"query DS %s: the parent's group answered %s%s rather than proving the delegation carries no DS, so the route is asked instead",
 					q.name,
 					rcode_text(dns.peek_rcode(resp)),
+					" (a referral)" if dns.peek_referral(resp) else "",
 				)
 			} else {
 				logx.debugf(

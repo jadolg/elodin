@@ -934,7 +934,10 @@ test_a_referral_nobody_does_better_than_is_a_servfail :: proc(t: ^testing.T) {
 		}
 		defer net.close(socket)
 		_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-		bound, _ := net.bound_endpoint(socket)
+		bound, perr := net.bound_endpoint(socket)
+		if !testing.expectf(t, perr == nil, "cannot read the mock's port: %v", perr) {
+			return
+		}
 
 		cfg := forwarding_config()
 		group := mock_group(t, cfg.upstream, bound.port)
@@ -968,6 +971,50 @@ test_a_referral_nobody_does_better_than_is_a_servfail :: proc(t: ^testing.T) {
 			testing.expect_value(t, len(decoded.answer), 1)
 		}
 	}
+	free_all(context.temp_allocator)
+}
+
+/*
+And a chain lookup handed one is a lookup that fetched nothing (issue #410).
+
+`resolve_answerable` sweeps past a referral but hands it back where no member
+does better. Handed to the walk, a `DS` referral carries neither the DS nor a
+signed denial of it and a `DNSKEY` one no keys, which the walk reads as a
+stripped proof - Bogus - rather than a chain it could not fetch.
+*/
+@(test)
+test_a_referral_is_no_chain_lookup :: proc(t: ^testing.T) {
+	socket, berr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, berr == nil, "cannot bind the mock: %v", berr) {
+		return
+	}
+	defer net.close(socket)
+	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+	bound, perr := net.bound_endpoint(socket)
+	if !testing.expectf(t, perr == nil, "cannot read the mock's port: %v", perr) {
+		return
+	}
+
+	cfg := forwarding_config()
+	group := mock_group(t, cfg.upstream, bound.port)
+	defer upstream.destroy_group(group)
+	s := Server {
+		cfg   = &cfg,
+		group = group,
+	}
+
+	mock := Route_Mock {
+		socket = socket,
+		reply  = route_reply_referral("below.example.", .DS),
+		want   = "below.example.",
+	}
+	mock_thread := thread.create_and_start_with_poly_data(&mock, serve_route)
+	_, ok := validator_query(&s, "below.example.", .DS, context.temp_allocator, nil)
+	thread.join(mock_thread)
+	thread.destroy(mock_thread)
+
+	testing.expect(t, mock.asked, "the upstream was not asked")
+	testing.expect(t, !ok, "a referral was handed to the chain walk as the DS lookup's reply")
 	free_all(context.temp_allocator)
 }
 

@@ -511,6 +511,8 @@ resolve_insisting :: proc(
 // same test `dnssec.answerable_rcode` makes, over the wire bytes this package
 // deals in rather than a decoded message - and not a referral, which is a
 // NOERROR that says only who else to ask (issue #410, `dns.peek_referral`).
+// `dnssec.answerable_rcode` does not make that second test: `validator_query`
+// refuses a referral this sweep could not get past before the walk reads it.
 @(private)
 answerable :: proc(response: []u8) -> bool {
 	#partial switch dns.peek_rcode(response) {

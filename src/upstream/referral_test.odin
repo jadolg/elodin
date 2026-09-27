@@ -66,27 +66,58 @@ echo_loop :: proc(m: ^Referral_Mock) {
 }
 
 @(private = "file")
-start_mock :: proc(t: ^testing.T, m: ^Referral_Mock, name: string, loop: proc(_: ^Referral_Mock)) -> (^Upstream, ^thread.Thread) {
+start_mock :: proc(
+	t: ^testing.T,
+	m: ^Referral_Mock,
+	name: string,
+	loop: proc(_: ^Referral_Mock),
+) -> (
+	^Upstream,
+	^thread.Thread,
+	bool,
+) {
 	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	testing.expectf(t, serr == nil, "bind: %v", serr)
+	if !testing.expectf(t, serr == nil, "bind: %v", serr) {
+		return nil, nil, false
+	}
 	m.socket = socket
 	set_socket_timeouts(socket, 50 * time.Millisecond)
-	bound, _ := net.bound_endpoint(socket)
+	bound, berr := net.bound_endpoint(socket)
+	if !testing.expectf(t, berr == nil, "cannot read the responder's port: %v", berr) {
+		net.close(socket)
+		return nil, nil, false
+	}
 	u, uerr := make_upstream(
 		config.Upstream_Spec{name = name, kind = .UDP, address = "127.0.0.1", port = bound.port},
 		0,
 		time.Second,
 		context.allocator,
 	)
-	testing.expectf(t, uerr == .None, "upstream: %v", uerr)
-	return u, thread.create_and_start_with_poly_data(m, loop)
+	if !testing.expectf(t, uerr == .None, "upstream: %v", uerr) {
+		net.close(socket)
+		return nil, nil, false
+	}
+	return u, thread.create_and_start_with_poly_data(m, loop), true
 }
 
 @(test)
 test_a_referral_is_not_taken_as_an_answer :: proc(t: ^testing.T) {
 	referrer, answerer: Referral_Mock
-	bad, bad_thread := start_mock(t, &referrer, "referrer", referral_loop)
-	good, good_thread := start_mock(t, &answerer, "answerer", echo_loop)
+	// Neither started means neither closed: a zero socket here is fd 0, which
+	// under `odin test` is another test's.
+	bad, bad_thread, bad_ok := start_mock(t, &referrer, "referrer", referral_loop)
+	if !bad_ok {
+		return
+	}
+	good, good_thread, good_ok := start_mock(t, &answerer, "answerer", echo_loop)
+	if !good_ok {
+		sync.atomic_store(&referrer.stop, true)
+		thread.join(bad_thread)
+		thread.destroy(bad_thread)
+		net.close(referrer.socket)
+		destroy(bad)
+		return
+	}
 	defer {
 		sync.atomic_store(&referrer.stop, true)
 		sync.atomic_store(&answerer.stop, true)
