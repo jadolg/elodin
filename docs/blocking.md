@@ -22,6 +22,12 @@ blocking:
   # allow: ["||googleadservices.com^"]   # an exception outranks every list
 ```
 
+Downloaded lists are cached under `cache_dir`. A refresh that fails falls back
+to the cached copy if there is one, so a network outage does not turn blocking
+off once a list has been fetched.
+
+## Rule syntax
+
 | syntax                     | matches                          |
 |----------------------------|----------------------------------|
 | `0.0.0.0 ads.foo.com`      | `ads.foo.com` exactly            |
@@ -33,35 +39,36 @@ blocking:
 | `address=/foo.com/0.0.0.0` | `foo.com` and its subdomains     |
 | `@@\|\|safe.foo.com^`      | never blocked                    |
 
-Hosts entries are exact because hosts-format lists spell out every subdomain they
-mean; bare domains and `||` rules cover subtrees, which is how AdGuard Home reads
-the same files. Allow rules always win. The `address=/…/` and `server=/…/` forms
-are dnsmasq's, accepted because they turn up in lists that are otherwise adblock
-syntax; a `server=/…/` line that names a server forwards rather than blocks in
-dnsmasq, so it is skipped. `$important` and `$third-party` (`$3p`) are dropped and the rest of the
-rule kept, so an `@@` exception beats a `$important` block here, where in
-AdGuard Home the `$important` block would win. `$badfilter` cancels what the rule it names covers in any list, whichever rule
-gave it - so `||*.x^$badfilter` narrows a `||x^` to blocking only `x` itself - though a list's
-cannot cancel `blocking.rules` or `blocking.allow`. A rule with any other
-modifier (`$dnstype`, `$client`, `$domain`, `$elemhide`, `$removeparam`, ...) is
-skipped rather than widened to every query. So are cosmetic rules (`##`, `$$`)
-and any rule that cannot be expressed as a domain; none of them fails its list.
-Downloaded lists are cached under `cache_dir`, and a refresh that fails falls
-back to the cached copy, so a network outage cannot silently turn blocking off.
+- Allow rules always win.
+- Hosts entries are exact, since hosts lists spell out every subdomain; bare
+  domains and `||` rules cover subtrees, as in AdGuard Home.
+- `address=/…/` (dnsmasq syntax) is accepted. A `server=/…/` line that names a
+  server is skipped, since dnsmasq forwards it rather than blocking.
+- `$important` and `$third-party` (`$3p`) are dropped and the rest of the rule
+  kept, so an `@@` exception beats a `$important` block (AdGuard Home does the
+  opposite).
+- `$badfilter` cancels what the named rule covers in any list, whichever rule
+  gave it: `||*.x^$badfilter` narrows a `||x^` to blocking only `x`. A list's
+  `$badfilter` cannot cancel `blocking.rules` or `blocking.allow`.
+- Skipped, without failing the list: any other modifier (`$dnstype`, `$client`,
+  `$domain`, `$elemhide`, `$removeparam`, ...), cosmetic rules (`##`, `$$`), and
+  any rule that is not expressible as a domain.
 
-**CNAME chains are matched too** — Pi-hole calls it deep CNAME inspection. The
-arrangement to catch is a tracker given a subdomain inside the site's own zone,
-`metrics.brand.example` CNAME `tracker.evil.example`, where the question is a
-first-party name no list can usefully carry. Every hop is matched, up to sixteen,
-logged as `outcome=blocked detail=cname` against `detail=list` for a question
-that was listed itself; an answer whose chain runs past the sixteenth name is
-withheld rather than served. An allow rule on the *question* exempts the whole
-answer — the escape hatch when a first-party name resolves through a listed CDN —
-while one matching a hop clears that hop and no other.
+## CNAME chains
 
-Four details name a withheld or failed answer that no list explains, and they are
-what to search the query log for when a site breaks and the lists do not account
-for it:
+Every hop of a CNAME chain is matched too (Pi-hole's deep CNAME inspection), up
+to sixteen names. That catches `metrics.brand.example` CNAME
+`tracker.evil.example`, a first-party name no list can carry.
+
+- The query log shows `outcome=blocked detail=cname` for a blocked hop, against
+  `detail=list` for a listed question.
+- An allow rule on the *question* exempts the whole answer, for a first-party
+  name that resolves through a listed CDN. One matching a hop clears that hop
+  only.
+
+## Details to search for when a site breaks
+
+These name a withheld or failed answer that no list explains:
 
 | detail | rcode | what happened |
 | --- | --- | --- |
@@ -70,9 +77,9 @@ for it:
 | `answer-unreadable` | SERVFAIL | the upstream's reply could not be parsed at all |
 | `cache-unreadable` | SERVFAIL | a stored answer could not be parsed on the way back out |
 
-The `-unreadable` ones answer SERVFAIL rather than `blocking.response`, since a
-record that will not parse is as likely an upstream having a bad day as an
-attack, and SERVFAIL is the only answer a stub will retry or fail over from.
-`answer-unreadable` is the one worth watching: it is a way for a name to stop
-resolving that appears only once blocking is on, since with blocking off nothing
-walks the answer and nothing needs to parse it.
+The `-unreadable` ones answer SERVFAIL, not `blocking.response`, because an
+unparseable record is as likely a faulty upstream as an attack, and SERVFAIL is
+the answer a stub retries or fails over from.
+
+**Watch `answer-unreadable`**: it only appears with blocking on, since with
+blocking off nothing parses the answer.

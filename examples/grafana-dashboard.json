@@ -1989,7 +1989,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "A miss costs an upstream round trip; a hit does not.",
+      "description": "A miss costs an upstream round trip; a hit does not. Coalesced queries shared the one upstream exchange an identical query was already making.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2100,6 +2100,21 @@
                 }
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "coalesced (waited on an identical query in flight)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#8e5ae0",
+                  "mode": "fixed"
+                }
+              }
+            ]
           }
         ]
       },
@@ -2173,6 +2188,18 @@
           "legendFormat": "stale lends",
           "range": true,
           "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(elodin_answers_coalesced_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "coalesced (waited on an identical query in flight)",
+          "range": true,
+          "instant": false,
+          "refId": "E"
         }
       ],
       "title": "Cache lookups",
