@@ -2872,6 +2872,9 @@ not read some other way (#437 review).
   before the colon makes no field name (5.1). Skipped, `chunked` + ` , gzip`
   read as chunked alone and `keep-alive` + ` close` was pooled; a line with no
   colon at all is no field line either.
+- A bare LF, a bare CR or a NUL inside a line (RFC 9112 2.2, RFC 9110 5.5):
+  `keep-alive\nConnection: close` was one value holding no `close` element,
+  where a peer taking the LF for a line end sent two fields.
 - The version is `HTTP/<DIGIT>.<DIGIT>` (RFC 9112 2.3): `HTTP/1.1x` passed the
   `HTTP/` prefix check and was pooled as 1.1, and this client speaks no major
   version but 1 - the server side answers others with a 505.
@@ -2894,6 +2897,12 @@ test_http_response_malformed_framing_is_refused :: proc(t: ^testing.T) {
 		"HTTP/ 200 OK\r\nContent-Length: 5\r\n\r\nhello",
 		"HTTP/2.0 200 OK\r\nContent-Length: 5\r\n\r\nhello",
 		"HTTP/0.9 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+		"HTTP/1.1 200 OK\r\nConnection: keep-alive\nConnection: close\r\nContent-Length: 5\r\n\r\nhello",
+		"HTTP/1.1 200 OK\r\nX: a\nTransfer-Encoding: chunked, gzip\r\nContent-Length: 5\r\n\r\nhello",
+		"HTTP/1.1 200 OK\r\nX: a\rConnection: close\r\nContent-Length: 5\r\n\r\nhello",
+		"HTTP/1.1 200 OK\r\nX: a\x00b\r\nContent-Length: 5\r\n\r\nhello",
+		"HTTP/1.1 200 O\nK\r\nContent-Length: 5\r\n\r\nhello",
+		"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\x00\r\nhello\r\n0\r\n\r\n",
 	}
 	for reply in CASES {
 		track: mem.Tracking_Allocator

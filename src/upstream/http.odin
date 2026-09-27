@@ -118,7 +118,19 @@ reader_line :: proc(r: ^Buf_Reader) -> (line: string, err: Error) {
 		if idx := index_crlf(r.buf[r.pos:]); idx >= 0 {
 			start := r.pos
 			r.pos += idx + 2
-			return string(r.buf[start:start + idx]), .None
+			line = string(r.buf[start:start + idx])
+			/*
+			A bare CR or LF, or a NUL, is refused (RFC 9112 2.2, RFC 9110 5.5),
+			as the server's `http_line` does (#432). Kept, `Connection:
+			keep-alive\nConnection: close` was one field with no `close` in it
+			where a peer taking the LF for a line end sent two (#437).
+			*/
+			for i in 0 ..< len(line) {
+				if line[i] == '\r' || line[i] == '\n' || line[i] == 0 {
+					return "", .HTTP_Error
+				}
+			}
+			return line, .None
 		}
 		if len(r.buf) - r.pos > 64 * 1024 {
 			return "", .HTTP_Error

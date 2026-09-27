@@ -947,7 +947,8 @@ is_token :: proc(s: string) -> bool {
 RFC 9110 5.6.1: whether the comma-separated list `value` holds `token`, compared
 without regard to ASCII case. `Connection: keep-alive, close` is a close, which
 a single-token compare missed (#437); each element loses its OWS and nothing
-more, and empty elements match nothing.
+more, and empty elements match nothing. For lists of tokens only, such as
+`Connection`: a comma inside a quoted-string is split on like any other.
 */
 list_has_token :: proc(value, token: string) -> bool {
 	rest := value
