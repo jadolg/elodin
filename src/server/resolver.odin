@@ -404,6 +404,7 @@ handle_query :: proc(
 	account for them are answers an operator has no way to trace back to here.
 	*/
 	ede: u16
+	deadline: time.Tick
 	if dns.edns_version(msg) > 0 {
 		out, built := dns.error_response(query, msg, .Bad_Vers, allocator, limit)
 		// This gate runs before the question count is checked, so there may be no
@@ -426,6 +427,7 @@ handle_query :: proc(
 			cookie,
 			started,
 			&spent,
+			&deadline,
 			allocator,
 			shared_worker,
 			ede = &ede,
@@ -1087,6 +1089,14 @@ resolve_query :: proc(
 	// What this request has taken out of its arena reading messages, owned by
 	// `handle_query`, which owns that arena. See `dns.REQUEST_DECODE_BUDGET`.
 	spent: ^int,
+	/*
+	The request's upstream deadline, owned by whoever owns the request, like
+	`spent`: zero until the first upstream call sets it, and spent by every call
+	after that - the forward, both groups of a routed apex `DS`, every lookup
+	of the chain walk, and a rewrite alias's target (issue #439). See
+	`upstream.resolve_insisting`.
+	*/
+	deadline: ^time.Tick,
 	allocator: mem.Allocator,
 	// See `handle_query`: whether a worker of the shared pool is what this is
 	// holding.
@@ -1180,6 +1190,7 @@ resolve_query :: proc(
 				cookie,
 				started,
 				spent,
+				deadline,
 				allocator,
 				shared_worker,
 			)
@@ -2092,9 +2103,9 @@ resolve_query :: proc(
 		all, SERVFAIL and REFUSED, where another member of the group is asked
 		instead (issue #309).
 		*/
-		resp, winner, uerr = upstream.resolve_answerable(asked, forwarded, allocator)
+		resp, winner, uerr = upstream.resolve_answerable(asked, forwarded, allocator, deadline)
 	} else {
-		resp, winner, uerr = upstream.resolve_readable(asked, forwarded, allocator)
+		resp, winner, uerr = upstream.resolve_readable(asked, forwarded, allocator, deadline)
 	}
 	/*
 	And back on the route unless the parent answered the one thing the parent was
@@ -2168,7 +2179,7 @@ resolve_query :: proc(
 				)
 			}
 			dns.set_id_in_place(forwarded, dns.random_id())
-			again, second, aerr := upstream.resolve_readable(own, forwarded, allocator)
+			again, second, aerr := upstream.resolve_readable(own, forwarded, allocator, deadline)
 			/*
 			And the route's answer is the only one that can be served from here.
 
@@ -2261,7 +2272,7 @@ resolve_query :: proc(
 		route_proved, _ := parent_answers_apex_ds(resp, q.name, uerr == .None, spent, allocator)
 		if !route_proved {
 			dns.set_id_in_place(forwarded, dns.random_id())
-			again, second, perr := upstream.resolve_answerable(memoised_parent, forwarded, allocator)
+			again, second, perr := upstream.resolve_answerable(memoised_parent, forwarded, allocator, deadline)
 			proved, settled := parent_answers_apex_ds(again, q.name, perr == .None, spent, allocator)
 			remember_apex_ds_parent(s, q.name, perr == .None, settled)
 			/*
@@ -2373,6 +2384,7 @@ resolve_query :: proc(
 			allocator,
 			shared_worker = shared_worker,
 			spent = spent,
+			deadline = deadline,
 		)
 		#partial switch result.status {
 		case .Bogus, .Indeterminate:
@@ -4125,6 +4137,8 @@ chase_rewrite_alias :: proc(
 	cookie: Cookie_Request,
 	started: time.Time,
 	spent: ^int,
+	// The request's, for the target's forward; see `resolve_query`.
+	deadline: ^time.Tick,
 	allocator: mem.Allocator,
 	shared_worker: bool,
 ) -> (
@@ -4178,6 +4192,7 @@ chase_rewrite_alias :: proc(
 				cookie,
 				started,
 				spent,
+				deadline,
 				allocator,
 				shared_worker,
 				ede = &code,

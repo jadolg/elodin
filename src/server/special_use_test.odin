@@ -848,7 +848,7 @@ SERVFAIL to the client, and the point is that the validator is never consulted
 about a name the operator handed over on purpose.
 */
 @(private = "file")
-tor_has_no_chain :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> ([]u8, bool) {
+tor_has_no_chain :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> ([]u8, bool) {
 	return nil, false
 }
 

@@ -41,7 +41,7 @@ unhex :: proc(text: string, allocator := context.temp_allocator) -> []u8 {
 // Answers from the captured set, standing in for the upstream the validator
 // would otherwise have to ask.
 @(private = "file")
-fixture_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
+fixture_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
 	for f in FIXTURES {
 		if f.type == type && dns.name_equal_fold(f.name, name) {
 			return unhex(f.wire, allocator), true
@@ -232,10 +232,10 @@ Counting_Ctx :: struct {
 }
 
 @(private = "file")
-counting_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> ([]u8, bool) {
+counting_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> ([]u8, bool) {
 	counter := cast(^Counting_Ctx)ctx
 	counter.queries += 1
-	return fixture_query(nil, name, type, allocator)
+	return fixture_query(nil, name, type, allocator, nil)
 }
 
 @(test)
@@ -688,7 +688,7 @@ Canned_Ctx :: struct {
 }
 
 @(private = "file")
-canned_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> ([]u8, bool) {
+canned_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> ([]u8, bool) {
 	canned := cast(^Canned_Ctx)ctx
 	return unhex(canned.wire, allocator), true
 }
@@ -850,8 +850,8 @@ test_forged_ds_breaks_the_chain :: proc(t: ^testing.T) {
 }
 
 @(private = "file")
-broken_ds_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> ([]u8, bool) {
-	wire, ok := fixture_query(ctx, name, type, allocator)
+broken_ds_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> ([]u8, bool) {
+	wire, ok := fixture_query(ctx, name, type, allocator, nil)
 	if !ok || type != .DS || !dns.name_equal_fold(name, "example.com.") {
 		return wire, ok
 	}
@@ -1108,7 +1108,7 @@ test_literal_wildcard_name_is_not_an_expansion :: proc(t: ^testing.T) {
 // Never answers. The zone cache is primed directly below, so a lookup reaching
 // here means the walk went somewhere the test did not intend.
 @(private = "file")
-no_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> ([]u8, bool) {
+no_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> ([]u8, bool) {
 	return nil, false
 }
 
@@ -1279,12 +1279,12 @@ failure_wire :: proc(name: string, type: dns.Type, rcode: dns.Rcode, allocator: 
 }
 
 @(private = "file")
-failing_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> ([]u8, bool) {
+failing_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> ([]u8, bool) {
 	fail := cast(^Failing_Lookup)ctx
 	if type == fail.type && dns.name_equal_fold(name, fail.name) {
 		return failure_wire(name, type, fail.rcode, allocator), true
 	}
-	return fixture_query(nil, name, type, allocator)
+	return fixture_query(nil, name, type, allocator, nil)
 }
 
 @(private = "file")

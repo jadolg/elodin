@@ -277,7 +277,7 @@ Sh_Calls :: struct {
 }
 
 @(private = "file")
-sh_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
+sh_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
 	calls := (^Sh_Calls)(ctx)
 	if calls != nil {
 		calls.lookups += 1
@@ -801,7 +801,7 @@ test_a_denial_keeps_no_hints :: proc(t: ^testing.T) {
 }
 
 @(private = "file")
-sh_denial_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
+sh_denial_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
 	for f in FIXTURES {
 		if f.type == type && dns.name_equal_fold(f.name, name) {
 			out, decoded := decode_hex(f.wire, allocator)

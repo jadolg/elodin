@@ -1,5 +1,6 @@
 package upstream
 
+import "base:runtime"
 import "core:fmt"
 import "core:mem"
 import "core:net"
@@ -9,6 +10,7 @@ import "core:thread"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:pool"
 
 /*
 A failover or round-robin query waits out a bounded budget, not every member for
@@ -492,10 +494,10 @@ test_the_sweep_spends_what_is_left_of_the_query_budget :: proc(t: ^testing.T) {
 	}
 	// Both callers, since both are the one sweep: a client's question and a
 	// chain lookup. Each call gets a budget of its own.
-	for insisting, i in ([]proc(_: ^Group, _: []u8, _: mem.Allocator) -> ([]u8, ^Upstream, Error){resolve_readable, resolve_answerable}) {
+	for insisting, i in ([]proc(_: ^Group, _: []u8, _: mem.Allocator, _: ^time.Tick) -> ([]u8, ^Upstream, Error){resolve_readable, resolve_answerable}) {
 		before := sync.atomic_load(&mocks[3].hits)
 		started := time.tick_now()
-		resp, winner, err := insisting(&g, deadline_query(), context.allocator)
+		resp, winner, err := insisting(&g, deadline_query(), context.allocator, nil)
 		spent := time.tick_since(started)
 		delete(resp, context.allocator)
 
@@ -507,5 +509,125 @@ test_the_sweep_spends_what_is_left_of_the_query_budget :: proc(t: ^testing.T) {
 		// that crosses the line. A fresh budget for the sweep waited 3.2.
 		testing.expectf(t, spent < 3 * DEADLINE_TIMEOUT, "call %d: the query waited %v, where the budget is two timeouts of %v", i, spent, DEADLINE_TIMEOUT)
 	}
+	free_all(context.temp_allocator)
+}
+
+/*
+The calls one client question makes share its deadline (issue #439). The first
+sets it, at its own group's two timeouts, and waits out the silent member and
+the one behind it; the second finds nothing left and asks nobody - neither the
+silent member, which would have cost another timeout, nor the one that answers.
+A member skipped that way is not charged a failure for it either: no exchange
+was made, and the question it was skipped for is the one that ran out.
+*/
+@(test)
+test_the_calls_of_one_question_share_its_deadline :: proc(t: ^testing.T) {
+	mocks: [2]Echo_Mock
+	mocks[0].mute = true
+	mocks[1].rcode = u8(dns.Rcode.Serv_Fail)
+	mocks[1].delay = DEADLINE_TIMEOUT * 9 / 10
+	ups: [2]^Upstream
+	workers: [2]^thread.Thread
+	for i in 0 ..< 2 {
+		ok: bool
+		ups[i], workers[i], ok = start_echo_mock(t, &mocks[i], fmt.tprintf("m%d", i))
+		if !ok {
+			return
+		}
+	}
+	defer for i in 0 ..< 2 {
+		stop_echo_mock(&mocks[i], ups[i], workers[i])
+	}
+	g := Group {
+		servers   = ups[:],
+		strategy  = .Failover,
+		timeout   = DEADLINE_TIMEOUT,
+		attempts  = 1,
+		allocator = context.allocator,
+	}
+
+	deadline: time.Tick
+	before := time.tick_now()
+	first, _, _ := resolve_answerable(&g, deadline_query(), context.allocator, &deadline)
+	delete(first, context.allocator)
+	set_at := time.tick_diff(before, deadline)
+	testing.expectf(
+		t,
+		set_at >= 2 * DEADLINE_TIMEOUT && set_at < 2 * DEADLINE_TIMEOUT + DEADLINE_TIMEOUT / 4,
+		"the first call set the deadline %v out, where its group's budget is %v",
+		set_at,
+		2 * DEADLINE_TIMEOUT,
+	)
+
+	// Past it now: the first member's timeout and the second's slow SERVFAIL.
+	for time.tick_diff(time.tick_now(), deadline) > 0 {
+		time.sleep(DEADLINE_TIMEOUT / 20)
+	}
+	hits := [2]int{sync.atomic_load(&mocks[0].hits), sync.atomic_load(&mocks[1].hits)}
+	failures := ups[0].failures
+	started := time.tick_now()
+	resp, winner, err := resolve_readable(&g, deadline_query(), context.allocator, &deadline)
+	spent := time.tick_since(started)
+	delete(resp, context.allocator)
+
+	testing.expect_value(t, err, Error.Deadline)
+	testing.expect(t, winner == nil, "a call past the deadline named a winner")
+	testing.expectf(t, spent < DEADLINE_TIMEOUT / 4, "a call past the deadline waited %v", spent)
+	testing.expect(t, sync.atomic_load(&mocks[0].hits) == hits[0] && sync.atomic_load(&mocks[1].hits) == hits[1], "a call past the deadline asked a member")
+	testing.expect_value(t, ups[0].failures, failures)
+	free_all(context.temp_allocator)
+}
+
+/*
+And a later call with some of the deadline left spends that and no more, however
+much its own group would have: a racing group's caller waits the remainder, not
+the timeout. The racers keep their whole timeout on threads of their own, so a
+member is judged on the timeout it was always judged on.
+*/
+@(test)
+test_a_race_waits_only_what_is_left_of_the_deadline :: proc(t: ^testing.T) {
+	mocks: [2]Echo_Mock
+	ups: [2]^Upstream
+	workers: [2]^thread.Thread
+	// Not `tprintf`: the racers outlive the `free_all` at the end.
+	names := [2]string{"r0", "r1"}
+	for i in 0 ..< 2 {
+		mocks[i].mute = true
+		ok: bool
+		ups[i], workers[i], ok = start_echo_mock(t, &mocks[i], names[i])
+		if !ok {
+			return
+		}
+	}
+	defer for i in 0 ..< 2 {
+		stop_echo_mock(&mocks[i], ups[i], workers[i])
+	}
+	racers := pool.make_pool(2)
+	// Declared after the mocks so it is torn down first: it joins the racers,
+	// which are still sitting out their timeout on the silent members.
+	defer pool.destroy(racers)
+	g := Group {
+		servers   = ups[:],
+		strategy  = .Race,
+		timeout   = DEADLINE_TIMEOUT,
+		attempts  = 1,
+		race_pool = racers,
+		allocator = context.allocator,
+	}
+
+	/*
+	On the heap, as a query worker's context is: the race's shared state is
+	freed by whichever racer lets go of it last, on a pool thread whose allocator
+	is the heap's, and the test runner's tracking allocator is not that.
+	*/
+	context.allocator = runtime.heap_allocator()
+	deadline := time.tick_add(time.tick_now(), DEADLINE_TIMEOUT / 4)
+	started := time.tick_now()
+	resp, _, err := resolve_readable(&g, deadline_query(), context.allocator, &deadline)
+	spent := time.tick_since(started)
+	delete(resp, context.allocator)
+
+	testing.expect(t, err != .None, "a race of silent members produced an answer")
+	testing.expectf(t, spent < DEADLINE_TIMEOUT * 3 / 4, "the race waited %v with %v of the deadline left", spent, DEADLINE_TIMEOUT / 4)
 	free_all(context.temp_allocator)
 }

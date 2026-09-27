@@ -359,3 +359,89 @@ test_a_cname_rewrite_to_an_answer_over_the_ceiling_keeps_ede_27 :: proc(t: ^test
 	testing.expect(t, found, "the chain lost its target's extended error")
 	testing.expect_value(t, code, u16(EDE_UNSUPPORTED_NSEC3_ITERATIONS))
 }
+
+/*
+The chain lookups a validating query makes spend what is left of the query's
+budget, not two timeouts each (issue #439).
+
+A silent member stands in front of one that serves the whole chain. The
+client's forward costs one timeout on the silent member before the second
+answers, and every DS and DNSKEY lookup after it used to be a call with a
+budget of its own - so each one waited out the silent member again until it
+parked, and the query was answered at three timeouts, with the stub long gone.
+The query's deadline is two timeouts from its first exchange, and the first
+lookup to meet the silent member spends what is left of it: the query ends
+there, SERVFAIL, at two.
+*/
+@(test)
+test_the_chain_lookups_spend_what_is_left_of_the_query_budget :: proc(t: ^testing.T) {
+	mock: Ceiling_Mock
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+		return
+	}
+	mock.socket = socket
+	defer net.close(socket)
+	_ = net.set_option(socket, .Receive_Timeout, 50 * time.Millisecond)
+	bound, _ := net.bound_endpoint(socket)
+	quiet, qerr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, qerr == nil, "cannot bind the silent upstream: %v", qerr) {
+		return
+	}
+	defer net.close(quiet)
+	quiet_bound, _ := net.bound_endpoint(quiet)
+
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.cache.enabled = false
+	cfg.dnssec.enabled = true
+	cfg.upstream.strategy = .Failover
+	cfg.upstream.attempts = 1
+	cfg.upstream.timeout = 200 * time.Millisecond
+	servers := make([]config.Upstream_Spec, 2, context.temp_allocator)
+	servers[0] = config.Upstream_Spec{name = "silent", kind = .UDP, address = "127.0.0.1", port = quiet_bound.port}
+	servers[1] = config.Upstream_Spec{name = "chain", kind = .UDP, address = "127.0.0.1", port = bound.port}
+	cfg.upstream.servers = servers
+
+	g, gerr := upstream.make_group(cfg.upstream, nil)
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+		return
+	}
+	defer upstream.destroy_group(g)
+	s := Server {
+		cfg   = &cfg,
+		group = g,
+	}
+	anchor, parsed := dnssec.parse_trust_anchor(C_ANCHOR, context.temp_allocator)
+	testing.expect(t, parsed, "the anchor should parse")
+	anchors := make([]dnssec.Trust_Anchor, 1, context.temp_allocator)
+	anchors[0] = anchor
+	s.validator = dnssec.make_validator(validator_query, &s, dnssec.Options{anchors = anchors, max_nsec3_iterations = 5})
+	defer dnssec.destroy_validator(s.validator)
+
+	worker := thread.create_and_start_with_poly_data(&mock, ceiling_mock_serve)
+	defer {
+		sync.atomic_store(&mock.stop, true)
+		thread.join(worker)
+		thread.destroy(worker)
+	}
+
+	query := dns.Message {
+		id       = 0x4390,
+		question = []dns.Question{{name = C_QNAME, type = .A, class = .IN}},
+	}
+	query.flags.rd = true
+	additional := make([]dns.Record, 1, context.temp_allocator)
+	additional[0] = dns.make_opt(1232, true)
+	query.additional = additional
+	wire, _, _ := dns.encode_message(query, context.temp_allocator)
+
+	started := time.tick_now()
+	_, _, served := handle_query(&s, wire, .UDP, "test", context.temp_allocator)
+	spent := time.tick_since(started)
+	testing.expect(t, served, "no response at all")
+	// Two timeouts and slack for a loaded runner; a budget per lookup waited
+	// three, one per lookup until the silent member parked.
+	testing.expectf(t, spent < 5 * cfg.upstream.timeout / 2, "the query waited %v, where its budget is two timeouts of %v", spent, cfg.upstream.timeout)
+	free_all(context.temp_allocator)
+}

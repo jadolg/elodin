@@ -104,7 +104,7 @@ N3_FIXTURES := []Fixture{
 }
 
 @(private = "file")
-n3_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
+n3_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
 	for f in N3_FIXTURES {
 		if f.type == type && dns.name_equal_fold(f.name, name) {
 			return decode_hex(f.wire, allocator)

@@ -46,7 +46,21 @@ Must ask with DO and CD set: the validator wants the signatures, and it wants
 the upstream's own opinion of them kept out of the way. `wire` is a complete DNS
 response allocated from `allocator`.
 */
-Query_Proc :: #type proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> (wire: []u8, ok: bool)
+/*
+`deadline` is the client question's own, passed through from `validate` for the
+query procedure to spend its upstream wait against (issue #439): every lookup a
+walk makes is part of the one question. Nil where the caller set none.
+*/
+Query_Proc :: #type proc(
+	ctx: rawptr,
+	name: string,
+	type: dns.Type,
+	allocator: mem.Allocator,
+	deadline: ^time.Tick,
+) -> (
+	wire: []u8,
+	ok: bool,
+)
 
 Trust_Anchor :: struct {
 	zone: string,
@@ -456,6 +470,9 @@ Budget :: struct {
 	rest of the request already has. See issue #354.
 	*/
 	spent:         ^int,
+	// The client question's upstream deadline, borrowed from the caller like
+	// `spent` and handed to every lookup. See `Query_Proc`.
+	deadline:      ^time.Tick,
 }
 
 /*
@@ -974,6 +991,8 @@ validate :: proc(
 	captured message on its own. See issue #354.
 	*/
 	spent: ^int = nil,
+	// The client question's upstream deadline, for the lookups; see `Query_Proc`.
+	deadline: ^time.Tick = nil,
 ) -> Result {
 	msg, derr := dns.decode_message(wire, allocator, spent)
 	if derr != .None {
@@ -1002,6 +1021,7 @@ validate :: proc(
 	budget.keep_slot = true
 	budget.pool = .Shared if shared_worker else .Connection
 	budget.spent = spent
+	budget.deadline = deadline
 	defer end_walk(v, &budget)
 
 	/*
@@ -3485,7 +3505,7 @@ zone_step :: proc(
 	if !spend_lookup(budget) {
 		return walk_gave_up(budget, "lookup budget spent"), nil
 	}
-	wire, ok := v.query(v.query_ctx, child, .DS, allocator)
+	wire, ok := v.query(v.query_ctx, child, .DS, allocator, budget.deadline)
 	if !ok {
 		return walk_gave_up(budget, "chain of trust unavailable"), nil
 	}
@@ -3862,7 +3882,7 @@ fetch_keys :: proc(
 	if !spend_lookup(budget) {
 		return nil, .Indeterminate
 	}
-	wire, ok := v.query(v.query_ctx, zone, .DNSKEY, allocator)
+	wire, ok := v.query(v.query_ctx, zone, .DNSKEY, allocator, budget.deadline)
 	if !ok {
 		return nil, .Indeterminate
 	}

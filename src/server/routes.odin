@@ -441,9 +441,11 @@ the first apex `DS` after each expiry runs the group to the end of its budget,
 two timeouts, ten seconds at the defaults. A
 validating stub gives up in two to five and SERVFAILs the zone for that round,
 so what recovers in ten seconds is this server's willingness to try, not
-necessarily the client's answer. Bounding it means a deadline of this question's
-own or asking both groups at once, neither of which belongs in the same change
-as the carve-out.
+necessarily the client's answer. The question's own deadline (issue #439) bounds
+the whole of it rather than making it quicker: the parent spends the two
+timeouts, and the route is asked only with whatever of them is left - none, in
+this case, so that round is a SERVFAIL at ten seconds rather than an answer
+after fifteen that the stub would never have read.
 */
 @(private)
 group_reachable :: proc(g: ^upstream.Group) -> bool {

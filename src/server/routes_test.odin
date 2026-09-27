@@ -2610,3 +2610,68 @@ test_two_upstreams_of_one_name_have_their_figures_added :: proc(t: ^testing.T) {
 	)
 	free_all(context.temp_allocator)
 }
+
+/*
+One client question, one budget, however many groups it asks (issue #439).
+
+An apex `DS` asks the parent's group and then the route's, and each of those
+used to be a call with two timeouts of its own to spend. So a parent whose two
+members are silent took the full two timeouts, and the route was then asked on
+a fresh budget - three at least, and four where the route was silent too, with
+a validating stub long gone. The query's deadline is set by the first group it
+asks, and the route is asked only while any of it is left: here none is, and
+the question is a SERVFAIL at two timeouts rather than an answer at three.
+
+The route is not served, so it is only read for having been asked after the
+call returns; had it been asked, it would have spent its own timeout.
+*/
+@(test)
+test_an_apex_ds_spends_one_budget_across_both_groups :: proc(t: ^testing.T) {
+	sockets: [3]net.UDP_Socket
+	ports: [3]int
+	for i in 0 ..< 3 {
+		socket, err := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+		if !testing.expectf(t, err == nil, "cannot bind mock %d: %v", i, err) {
+			return
+		}
+		sockets[i] = socket
+		bound, _ := net.bound_endpoint(socket)
+		ports[i] = bound.port
+	}
+	defer for socket in sockets {
+		net.close(socket)
+	}
+
+	cfg := forwarding_config()
+	cfg.upstream.timeout = 200 * time.Millisecond
+
+	// The parent: two members, neither of which answers.
+	group := mock_group_pair(t, cfg.upstream, ports[0], ports[1])
+	defer upstream.destroy_group(group)
+	routed := mock_group(t, cfg.upstream, ports[2])
+	defer upstream.destroy_group(routed)
+
+	s := Server {
+		cfg    = &cfg,
+		group  = group,
+		routes = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
+	}
+
+	started := time.tick_now()
+	out, _, ok := handle_query(&s, route_query("corp.example.", .DS), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	spent := time.tick_since(started)
+
+	if !testing.expect(t, ok, "nothing came back at all") {
+		return
+	}
+	testing.expect(t, route_mock_heard(sockets[0], "corp.example.") == 1, "the parent's first member was not asked")
+	testing.expect(t, route_mock_heard(sockets[1], "corp.example.") == 1, "the parent's second member was not asked")
+	testing.expect(t, route_mock_quiet(sockets[2], "corp.example."), "the route was asked after the query's budget had gone")
+	decoded, derr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.Serv_Fail)
+	// Two timeouts and slack for a loaded runner; a fresh budget for the route
+	// waited three.
+	testing.expectf(t, spent < 5 * cfg.upstream.timeout / 2, "the query waited %v, where its budget is two timeouts of %v", spent, cfg.upstream.timeout)
+	free_all(context.temp_allocator)
+}

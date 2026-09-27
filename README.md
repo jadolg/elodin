@@ -406,7 +406,11 @@ upstream:
 `race` multiplies upstream traffic by the number of servers.
 
 However many servers and `attempts` there are, a query waits at most about two
-`timeout`s on them (`race`: one) before it gives up with SERVFAIL. A dead first
+`timeout`s on them (`race`: one) before it gives up with SERVFAIL - and that is
+the whole question's figure, not each lookup's: the DNSSEC chain lookups, both
+groups a routed apex `DS` asks, and a rewrite alias's target all spend the same
+two `timeout`s, counted from the first upstream it asks, and a lookup that finds
+none left asks nobody. A dead first
 server still hands over to the second inside the query, which is asked with its
 full `timeout`; a third is left for the next query, by which time the dead ones
 are on their way to the cooldown below. A reply that did arrive but says

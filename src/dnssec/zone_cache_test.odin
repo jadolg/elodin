@@ -22,7 +22,7 @@ the top.
 // These tests never reach an upstream: what they exercise is the cache itself,
 // reached through `cache_put` and `cache_get` directly.
 @(private = "file")
-no_upstream :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
+no_upstream :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
 	return nil, false
 }
 
