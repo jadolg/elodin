@@ -535,10 +535,10 @@ exchange_pipelined :: proc(
 ) {
 	/*
 	One deadline for the whole of this, set by `exchange` and handed to every
-	stage. Waiting for
-	somebody else's dial, dialling, asking, writing and retrying each used to
-	start a clock of its own, so a query could cost several times the timeout
-	its caller was promised - with an upstream worker held for all of it.
+	stage. Waiting for somebody else's dial, dialling, asking, writing and
+	retrying each used to start a clock of its own, so a query could cost
+	several times the timeout its caller was promised - with an upstream worker
+	held for all of it.
 
 	A `Tick` rather than a `Time`, for the reason `tlsx.wait_ready` gives: this
 	is a bound on waiting rather than a moment anyone reads off a clock, and

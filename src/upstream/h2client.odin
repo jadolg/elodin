@@ -104,8 +104,19 @@ HTTP/1.1 path, and the connection this negotiated is already sitting in that
 pool.
 */
 @(private)
-get_h2_conn :: proc(u: ^Upstream, timeout: time.Duration) -> (conn: ^h2.Client, ok: bool, err: Error) {
-	deadline := time.time_add(time.now(), timeout)
+get_h2_conn :: proc(
+	u: ^Upstream,
+	// The upstream's own, which the connection keeps for its life, for the
+	// reason `Pipe_Conn.timeout` gives.
+	timeout: time.Duration,
+	// What this caller has left, which bounds the wait and the dial.
+	budget: time.Duration,
+) -> (
+	conn: ^h2.Client,
+	ok: bool,
+	err: Error,
+) {
+	deadline := time.time_add(time.now(), budget)
 	sync.mutex_lock(&u.mu)
 	for {
 		if u.proto == .H1 {

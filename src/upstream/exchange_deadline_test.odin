@@ -139,31 +139,15 @@ test_a_truncated_replys_tcp_retry_shares_the_exchange_timeout :: proc(t: ^testin
 	free_all(context.temp_allocator)
 }
 
-// Reads bootstrap queries and answers none.
-@(private = "file")
-silent_loop :: proc(m: ^Truncating_Mock) {
-	buf: [512]u8
-	for !sync.atomic_load(&m.stop) {
-		_, _, _ = net.recv_udp(m.udp, buf[:])
-	}
-}
-
 @(test)
 test_bootstrap_resolution_shares_the_exchange_timeout :: proc(t: ^testing.T) {
+	// Bound and never read: queries queue in the kernel and nothing answers.
 	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
 	if !testing.expectf(t, serr == nil, "cannot bind the bootstrap mock: %v", serr) {
 		return
 	}
-	set_socket_timeouts(socket, 50 * time.Millisecond)
+	defer net.close(socket)
 	bound, _ := net.bound_endpoint(socket)
-	m := Truncating_Mock{udp = socket}
-	worker := thread.create_and_start_with_poly_data(&m, silent_loop)
-	defer {
-		sync.atomic_store(&m.stop, true)
-		thread.join(worker)
-		thread.destroy(worker)
-		net.close(socket)
-	}
 
 	// Built with no bootstrap servers, so construction fails to resolve at once
 	// rather than waiting out the silent one; it is handed over afterwards, the
@@ -193,5 +177,42 @@ test_bootstrap_resolution_shares_the_exchange_timeout :: proc(t: ^testing.T) {
 	// for A and again for AAAA - before the exchange's timeout even began.
 	testing.expectf(t, spent < X_TIMEOUT * 5 / 4, "the exchange waited %v, where its timeout is %v", spent, X_TIMEOUT)
 	u.spec.bootstrap = nil
+	free_all(context.temp_allocator)
+}
+
+/*
+Sharing the exchange's timeout must not cost the rest of the bootstrap list: a
+dead first server given all that is left - three seconds for A out of the
+default five, and the rest for AAAA - leaves the second unasked, and a hostname
+that did not resolve at startup then never resolves while the first is down.
+Nothing answers here, so nothing reaches the package-global cache that other
+tests read; what is checked is that the second server was asked at all.
+*/
+@(test)
+test_a_dead_bootstrap_server_leaves_time_for_the_next :: proc(t: ^testing.T) {
+	first, ferr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, ferr == nil, "cannot bind the first bootstrap mock: %v", ferr) {
+		return
+	}
+	defer net.close(first)
+	second, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, serr == nil, "cannot bind the second bootstrap mock: %v", serr) {
+		return
+	}
+	defer net.close(second)
+	a, _ := net.bound_endpoint(first)
+	b, _ := net.bound_endpoint(second)
+	servers := []string {
+		net.endpoint_to_string(a, context.temp_allocator),
+		net.endpoint_to_string(b, context.temp_allocator),
+	}
+
+	_, ok := bootstrap_resolve(servers, "failover.example.test", time.tick_add(time.tick_now(), X_TIMEOUT))
+	testing.expect(t, !ok, "resolved with nothing answering")
+
+	set_socket_timeouts(second, 10 * time.Millisecond)
+	buf: [512]u8
+	n, _, _ := net.recv_udp(second, buf[:])
+	testing.expect(t, n > 0, "the second bootstrap server was never asked")
 	free_all(context.temp_allocator)
 }

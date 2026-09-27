@@ -566,14 +566,6 @@ exchange :: proc(
 	err: Error,
 ) {
 	/*
-	A hostname the bootstrap resolvers were asked about and did not resolve is a
-	failure like any other, recorded so it counts towards the cooldown. With a
-	bootstrap resolver gone quiet, finding that out takes seconds per query, and
-	a member that never parked would be asked - and waited on - by every query
-	for as long as the bootstrap stayed down (issue #327). With no bootstrap
-	servers to ask the refusal costs nothing, and is left unrecorded as before.
-	*/
-	/*
 	One deadline for the whole exchange, set before anything else and spent by
 	every stage: resolving the hostname, the cookie retry, a truncated reply's
 	retry over TCP. Each used to start a timeout of its own, so one exchange
@@ -584,6 +576,14 @@ exchange :: proc(
 	On the tick clock, which an NTP step cannot move.
 	*/
 	deadline := time.tick_add(time.tick_now(), timeout)
+	/*
+	A hostname the bootstrap resolvers were asked about and did not resolve is a
+	failure like any other, recorded so it counts towards the cooldown. With a
+	bootstrap resolver gone quiet, finding that out takes seconds per query, and
+	a member that never parked would be asked - and waited on - by every query
+	for as long as the bootstrap stayed down (issue #327). With no bootstrap
+	servers to ask the refusal costs nothing, and is left unrecorded as before.
+	*/
 	if !u.resolved && !resolve_endpoint(u, deadline) {
 		if len(u.spec.bootstrap) > 0 {
 			record_failure(u, .Not_Resolved)
@@ -624,10 +624,10 @@ exchange :: proc(
 /*
 One round trip over whichever transport this upstream speaks, by `deadline`.
 
-`timeout` is the upstream's own, which a pipelined connection keeps for its
-life - a connection dialled by a query with little left must not be a short one
-for every query after it - and `deadline` is this exchange's. DoH reads only
-what is left: its connections take their budget per call.
+`timeout` is the upstream's own, which a shared connection - pipelined or
+HTTP/2 - keeps for its life: a connection dialled by a query with little left
+must not be a short one for every query after it. `deadline` is this
+exchange's.
 */
 @(private)
 send :: proc(
@@ -640,8 +640,7 @@ send :: proc(
 	response: []u8,
 	err: Error,
 ) {
-	left := time.tick_diff(time.tick_now(), deadline)
-	if left <= 0 {
+	if time.tick_diff(time.tick_now(), deadline) <= 0 {
 		return nil, .Timeout
 	}
 	switch u.spec.kind {
@@ -650,7 +649,7 @@ send :: proc(
 	case .TCP, .TLS:
 		return exchange_pipelined(u, query, timeout, deadline, allocator)
 	case .HTTPS:
-		return exchange_doh(u, query, left, allocator)
+		return exchange_doh(u, query, timeout, deadline, allocator)
 	}
 	return nil, .Bad_Response
 }

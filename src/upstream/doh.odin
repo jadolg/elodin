@@ -23,6 +23,7 @@ exchange_doh :: proc(
 	u: ^Upstream,
 	query: []u8,
 	timeout: time.Duration,
+	deadline: time.Tick,
 	allocator: mem.Allocator,
 ) -> (
 	response: []u8,
@@ -35,7 +36,7 @@ exchange_doh :: proc(
 	copy(body, query)
 	dns.set_id_in_place(body, 0)
 
-	return exchange_doh_h2(u, query, body, timeout, allocator)
+	return exchange_doh_h2(u, query, body, timeout, allocator, deadline)
 }
 
 @(private)
@@ -43,8 +44,12 @@ exchange_doh_h2 :: proc(
 	u: ^Upstream,
 	query: []u8,
 	body: []u8,
+	// The upstream's own, which a shared connection this dials keeps.
 	timeout: time.Duration,
 	allocator: mem.Allocator,
+	// The exchange's, which bootstrap resolution may have spent part of; zero
+	// is `timeout` from now.
+	deadline := time.Tick{},
 ) -> (
 	response: []u8,
 	err: Error,
@@ -58,7 +63,10 @@ exchange_doh_h2 :: proc(
 	The fallback carries what is left too, because the dial that discovered
 	HTTP/1.1 was made on this query's budget and spent part of it.
 	*/
-	deadline := time.tick_add(time.tick_now(), timeout)
+	deadline := deadline
+	if deadline == {} {
+		deadline = time.tick_add(time.tick_now(), timeout)
+	}
 
 	// A stale shared connection dying between get_h2_conn handing it out and
 	// this call reaching the server is retried once, on a fresh one; see
@@ -70,7 +78,7 @@ exchange_doh_h2 :: proc(
 		if remaining <= 0 {
 			return nil, .Timeout
 		}
-		conn, is_h2, cerr := get_h2_conn(u, remaining)
+		conn, is_h2, cerr := get_h2_conn(u, timeout, remaining)
 		if cerr != .None {
 			return nil, cerr
 		}
