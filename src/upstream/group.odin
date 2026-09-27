@@ -189,6 +189,10 @@ forever, is never parked and every client query stopped at it while the member
 beside it held the answer. dnsmasq, Unbound and BIND all move to the next server
 on these two.
 
+And a referral, a NOERROR that says only who else to ask (issue #410,
+`dns.peek_referral`): a member that does not recurse for the name sends one,
+and a client handed it reads the empty answer as NODATA.
+
 The ordinary path is untouched: a usable reply returns from the first exchange
 and none of the sweep runs. Where no member of the group can manage one the
 first reply still comes back, rcode and all - which is what a group of one, the
@@ -662,7 +666,7 @@ POLICY_EDE_LAST :: 17
 /*
 Whether a reply is one the client's own question can be answered with.
 
-Two ways it is not, and `resolve_readable` argues both.
+Three ways it is not, and `resolve_readable` argues all three.
 
 An rcode of 16 or above, because the rcode a client reads off the header is then
 not the rcode the responder meant - the upper eight bits live in the OPT

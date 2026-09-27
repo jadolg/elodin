@@ -830,9 +830,10 @@ blocking: {{ enabled: false }}
 		// RFC 2308 section 5, issue #310: nothing in it says how long it holds,
 		// so one upstream that stumbled - an empty NOERROR, or a referral from
 		// a server that did not recurse - is not every client's answer for
-		// `negative_ttl`. Asked twice, the upstream has to hear both. The
-		// server's `min_ttl` is what makes this reach the guard: without it
-		// the zero lifetime a SOA-less denial has would refuse it anyway.
+		// `negative_ttl`. Asked twice, the upstream has to hear both. For the
+		// empty NOERROR, the server's `min_ttl` is what makes this reach the
+		// guard: without it the zero lifetime a SOA-less denial has would
+		// refuse it anyway.
 		//
 		// The referral is not passed on at all (issue #410): it is no answer,
 		// and a client would read the empty NOERROR as NODATA, so with no other

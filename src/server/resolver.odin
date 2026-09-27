@@ -2102,7 +2102,7 @@ resolve_query :: proc(
 		read the rcode it is given - see the guard below the exchanges - and
 		that the rcode is not one of the two which say nothing about the name at
 		all, SERVFAIL and REFUSED, where another member of the group is asked
-		instead (issue #309).
+		instead (issue #309) - as it is past a referral (issue #410).
 		*/
 		resp, winner, uerr = upstream.resolve_answerable(asked, forwarded, allocator, &deadline)
 	} else {
