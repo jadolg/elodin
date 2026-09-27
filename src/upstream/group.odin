@@ -253,9 +253,8 @@ resolve_insisting :: proc(
 	own timeout never shortened, the exchange that crosses the line allowed to
 	finish - so a call started with any time left can overrun the deadline by
 	one timeout and no more, and a question's worst wait is its span plus one
-	timeout however many calls it makes - plus one more where that exchange is
-	a UDP reply retried over TCP, which takes a timeout of its own (issue #376).
-	Zero, or nil, is no deadline.
+	timeout however many calls it makes: `exchange` holds itself to its timeout
+	whatever it does inside (issue #449). Zero, or nil, is no deadline.
 
 	On the tick clock, for the reason `resolve_sequential` gives.
 	*/
@@ -850,10 +849,10 @@ resolve_sequential :: proc(
 				if xerr == .None {
 					return resp, u, .None
 				}
-				// Charged whatever it was, a hostname the bootstrap took seconds
-				// to fail on included; `exchange` records that failure like any
-				// other, so such a member parks rather than taking the budget on
-				// every query.
+				// Charged whatever it was, a hostname the bootstrap spent the
+				// member's timeout failing on included; `exchange` records that
+				// failure like any other, so such a member parks rather than
+				// taking the budget on every query.
 				spent += time.tick_since(before)
 				last_err = xerr
 				if unreachable != nil {

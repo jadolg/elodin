@@ -246,7 +246,12 @@ elodin *is* the system resolver, asking it to resolve its own upstream would
 deadlock at boot.
 */
 @(private)
-resolve_endpoint :: proc(u: ^Upstream) -> bool {
+resolve_endpoint :: proc(
+	u: ^Upstream,
+	// The exchange's, which the bootstrap queries spend; zero at startup, where
+	// each has `BOOTSTRAP_TIMEOUT` of its own.
+	deadline := time.Tick{},
+) -> bool {
 	if addr := net.parse_address(u.spec.address); addr != nil {
 		u.endpoint = net.Endpoint {
 			address = addr,
@@ -256,7 +261,7 @@ resolve_endpoint :: proc(u: ^Upstream) -> bool {
 		return true
 	}
 
-	addr, ok := bootstrap_resolve(u.spec.bootstrap, u.spec.address)
+	addr, ok := bootstrap_resolve(u.spec.bootstrap, u.spec.address, deadline)
 	if !ok {
 		logx.warnf("upstream %s: cannot resolve %q via bootstrap resolvers", u.spec.name, u.spec.address)
 		u.resolved = false
@@ -339,7 +344,13 @@ the life of the process, whatever the query rate does, and a recurrence is
 still on the `debug` line `exchange` writes for every one.
 */
 @(private)
-record_failure :: proc(u: ^Upstream, err: Error) {
+record_failure :: proc(
+	u: ^Upstream,
+	err: Error,
+	// False for a failure that is counted but must not move the upstream
+	// towards the cooldown; see `exchange`.
+	charge := true,
+) {
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
 	u.stats.queries += 1
@@ -347,6 +358,9 @@ record_failure :: proc(u: ^Upstream, err: Error) {
 	u.stats.failure_kinds[err] += 1
 	if note_failure_kind(u, err) {
 		logx.warnf("upstream %s (%v %s): %v", u.spec.name, u.spec.kind, u.spec.address, err)
+	}
+	if !charge {
+		return
 	}
 	/*
 	A recycled connection is not a reason to bench the server.
@@ -561,14 +575,27 @@ exchange :: proc(
 	err: Error,
 ) {
 	/*
+	One deadline for the whole exchange, set before anything else and spent by
+	every stage: resolving the hostname, the cookie retry, a truncated reply's
+	retry over TCP. Each used to start a timeout of its own, so one exchange
+	could take several, and every bound above - a group's budget, a question's
+	deadline, a follower's patience - allows for one exchange crossing its line
+	on the promise that it takes one timeout (issue #449). A stage left with
+	nothing fails as a timeout, which it is: the upstream had the whole of it.
+	On the tick clock, which an NTP step cannot move.
+	*/
+	entered := time.tick_now()
+	deadline := time.tick_add(entered, timeout)
+	/*
 	A hostname the bootstrap resolvers were asked about and did not resolve is a
 	failure like any other, recorded so it counts towards the cooldown. With a
-	bootstrap resolver gone quiet, finding that out takes seconds per query, and
+	bootstrap resolver gone quiet, finding that out takes the timeout, and
 	a member that never parked would be asked - and waited on - by every query
 	for as long as the bootstrap stayed down (issue #327). With no bootstrap
 	servers to ask the refusal costs nothing, and is left unrecorded as before.
 	*/
-	if !u.resolved && !resolve_endpoint(u) {
+	resolving := !u.resolved
+	if resolving && !resolve_endpoint(u, deadline) {
 		if len(u.spec.bootstrap) > 0 {
 			record_failure(u, .Not_Resolved)
 		}
@@ -581,22 +608,32 @@ exchange :: proc(
 	// left showing. `cookies_wanted` and `padding_wanted` name disjoint kinds.
 	switch {
 	case cookies_wanted(u):
-		response, err = exchange_with_cookie(u, query, timeout, allocator)
+		response, err = exchange_with_cookie(u, query, timeout, deadline, allocator)
 	case padding_wanted(u):
-		response, err = exchange_padded(u, query, timeout, allocator)
+		response, err = exchange_padded(u, query, timeout, deadline, allocator)
 	case:
-		response, err = send(u, query, timeout, allocator)
+		response, err = send(u, query, timeout, deadline, allocator)
 	}
 
 	if err != .None {
-		record_failure(u, err)
+		/*
+		Except a timeout on the exchange that resolved the hostname: the
+		bootstrap servers spent part of the member's timeout, so the member was
+		not given the whole of it, and a member cut short must not be parked for
+		it - the rule `resolve_sequential` states. Once, since the address is
+		then held and every later exchange gives the member its whole timeout
+		and judges it on that. Still counted, so the figures show the query.
+		*/
+		record_failure(u, err, charge = !(resolving && err == .Timeout))
 		logx.debugf(
 			"upstream %s (%v %s:%d) failed after %v: %v",
 			u.spec.name,
 			u.spec.kind,
 			u.spec.address,
 			u.spec.port,
-			time.diff(start, time.now()),
+			// From entry rather than `start`: bootstrap resolution is part of
+			// what the exchange's timeout covers now.
+			time.tick_since(entered),
 			err,
 		)
 		return nil, err
@@ -605,24 +642,35 @@ exchange :: proc(
 	return response, .None
 }
 
-// One round trip over whichever transport this upstream speaks.
+/*
+One round trip over whichever transport this upstream speaks, by `deadline`.
+
+`timeout` is the upstream's own, which a shared connection - pipelined or
+HTTP/2 - keeps for its life: a connection dialled by a query with little left
+must not be a short one for every query after it. `deadline` is this
+exchange's.
+*/
 @(private)
 send :: proc(
 	u: ^Upstream,
 	query: []u8,
 	timeout: time.Duration,
+	deadline: time.Tick,
 	allocator: mem.Allocator,
 ) -> (
 	response: []u8,
 	err: Error,
 ) {
+	if time.tick_diff(time.tick_now(), deadline) <= 0 {
+		return nil, .Timeout
+	}
 	switch u.spec.kind {
 	case .UDP:
-		return exchange_udp(u, query, timeout, allocator)
+		return exchange_udp(u, query, timeout, deadline, allocator)
 	case .TCP, .TLS:
-		return exchange_pipelined(u, query, timeout, allocator)
+		return exchange_pipelined(u, query, timeout, deadline, allocator)
 	case .HTTPS:
-		return exchange_doh(u, query, timeout, allocator)
+		return exchange_doh(u, query, timeout, deadline, allocator)
 	}
 	return nil, .Bad_Response
 }

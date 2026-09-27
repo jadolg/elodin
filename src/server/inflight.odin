@@ -145,24 +145,19 @@ own upstream deadline, and one `span` more (issue #446).
 
 The deadline is armed before the join, and the leader's before this one's, so
 the leader has spent its upstream wait by then - all but the one exchange it may
-still finish, which is the `span` on top. That exchange may be a UDP reply that
-came back truncated and was asked again over TCP, a timeout each (issue #376),
-on the longest-timed of the question's groups, since the leader's last exchange
-may be a chain lookup on the default group rather than the route - two of that
-group's timeouts, which is what `span` is (`question_span`,
-`upstream.query_budget`). A leader past that is validating a long chain or
-stuck, and the follower gains nothing by waiting on: its own forward,
+still finish, and what it does after it, which is the `span` on top: two
+timeouts of the longest-timed of the question's groups (`question_span`,
+`upstream.query_budget`), since the leader's last exchange may be a chain lookup
+on the default group rather than the route. One is that exchange, which
+`upstream.exchange` holds to one timeout whatever it does inside - bootstrap
+resolution, a cookie retry, a truncated reply's retry over TCP (issue #449). The
+other is slack for the leader's own work after it, decoding, validating and
+storing, which no deadline covers. A leader past that is validating a long
+chain or stuck, and the follower gains nothing by waiting on: its own forward,
 once patience runs out, finds the deadline spent and asks nobody. The old
 figure - every server for every attempt, twice for a truncated reply, plus the
 sweep - was sized for a forward nothing bounded, and held a worker ten timeouts
 for a group of two.
-
-The invariant, so it is not widened one stage at a time: this covers the
-crossing exchange as `upstream.exchange` is documented to behave, a timeout and
-its TCP retry. Stages inside it that start a timeout of their own - bootstrap
-resolution, a cookie retry - can carry a leader further, and a follower then
-answers SERVFAIL a moment before the leader lands. That is fixed where it
-starts, by bounding the exchange itself (issue #449), not by guessing here.
 */
 @(private)
 flight_patience :: proc(deadline: time.Tick, span: time.Duration) -> time.Duration {

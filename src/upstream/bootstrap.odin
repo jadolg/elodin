@@ -38,7 +38,21 @@ Resolve `hostname` using `servers` (plain "IP" or "IP:port" strings).
 
 A and AAAA are tried in that order; the first usable address wins.
 */
-bootstrap_resolve :: proc(servers: []string, hostname: string) -> (addr: net.Address, ok: bool) {
+bootstrap_resolve :: proc(
+	servers: []string,
+	hostname: string,
+	/*
+	The exchange's, when an upstream's own hostname is being resolved on its
+	way to being asked: each server gets its share of what is left, each query
+	no more than `BOOTSTRAP_TIMEOUT` of it, and none starts once nothing is
+	(issue #449).
+	Zero, as at startup and for list downloads, is no deadline.
+	*/
+	deadline := time.Tick{},
+) -> (
+	addr: net.Address,
+	ok: bool,
+) {
 	if literal := net.parse_address(hostname); literal != nil {
 		return literal, true
 	}
@@ -56,9 +70,34 @@ bootstrap_resolve :: proc(servers: []string, hostname: string) -> (addr: net.Add
 		return nil, false
 	}
 
-	for server in servers {
+	for server, i in servers {
+		/*
+		Each server gets its share of what is left, so a dead first server
+		cannot spend the lot and leave the rest of the list unasked. Its A and
+		AAAA spend that share between them, rather than each being held to half
+		of it: a live server answers A with the whole share to do it in, and
+		one that has only AAAA for the name answers A at once and leaves AAAA
+		the rest. The last server gets all that is left.
+		*/
+		share_end := deadline
+		if deadline != {} {
+			now := time.tick_now()
+			left := time.tick_diff(now, deadline)
+			if left <= 0 {
+				return nil, false
+			}
+			share_end = time.tick_add(now, left / time.Duration(len(servers) - i))
+		}
 		for qtype in ([]dns.Type{.A, .AAAA}) {
-			result, found := bootstrap_query(server, hostname, qtype)
+			timeout := BOOTSTRAP_TIMEOUT
+			if deadline != {} {
+				left := time.tick_diff(time.tick_now(), share_end)
+				if left <= 0 {
+					break
+				}
+				timeout = min(timeout, left)
+			}
+			result, found := bootstrap_query(server, hostname, qtype, timeout)
 			if !found {
 				continue
 			}
