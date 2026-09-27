@@ -421,10 +421,12 @@ full `timeout`; a third is left for the next query, by which time the dead ones
 are on their way to the cooldown below. A reply that did arrive but says
 SERVFAIL or REFUSED sends the query on to the rest of the group, inside the
 same two `timeout`s rather than on top of them. One exchange with one server
-takes at most its `timeout`, whatever it does inside: resolving a hostname
-upstream through `bootstrap`, asking again with a fresh DNS cookie, retrying a
-truncated answer over TCP. A truncated answer that arrives late therefore leaves
-its TCP retry little time, and fails rather than doubling the wait.
+takes its `timeout`, whatever it does inside: resolving a hostname upstream
+through `bootstrap`, asking again with a fresh DNS cookie, retrying a truncated
+answer over TCP. A truncated answer that arrives late therefore leaves its TCP
+retry little time, and fails rather than doubling the wait. The one overrun
+left is a second's grace for a TCP, DoT or DoH server to finish a message it
+has already started sending, so the connection is not left mid-message.
 
 `bootstrap` matters: elodin resolves upstream hostnames itself rather than
 through the system resolver, since on a machine where elodin *is* the system

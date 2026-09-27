@@ -156,7 +156,7 @@ exchange_with_refusals :: proc(t: ^testing.T, refuse: int) -> (err: Error, heade
 	dns.set_id_in_place(body, 0)
 
 	resp: []u8
-	resp, err = exchange_doh_h2(u, wire, body, 3 * time.Second, context.temp_allocator)
+	resp, err = exchange_doh_h2(u, wire, body, 3 * time.Second, time.tick_add(time.tick_now(), 3 * time.Second), context.temp_allocator)
 	if err == .None {
 		testing.expect_value(t, u16(resp[0]) << 8 | u16(resp[1]), query.id)
 	}

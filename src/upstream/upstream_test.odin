@@ -2659,7 +2659,7 @@ test_the_doh_h2_fallback_keeps_the_querys_deadline :: proc(t: ^testing.T) {
 	}
 
 	start := time.tick_now()
-	_, err := exchange_doh_h2(u, wire, body, time.Second, context.temp_allocator)
+	_, err := exchange_doh_h2(u, wire, body, time.Second, time.tick_add(start, time.Second), context.temp_allocator)
 	spent := time.tick_since(start)
 	testing.expectf(t, err == .Timeout, "a silent server reported %v", err)
 	testing.expectf(

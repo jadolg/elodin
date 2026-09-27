@@ -584,7 +584,8 @@ exchange :: proc(
 	for as long as the bootstrap stayed down (issue #327). With no bootstrap
 	servers to ask the refusal costs nothing, and is left unrecorded as before.
 	*/
-	if !u.resolved && !resolve_endpoint(u, deadline) {
+	resolving := !u.resolved
+	if resolving && !resolve_endpoint(u, deadline) {
 		if len(u.spec.bootstrap) > 0 {
 			record_failure(u, .Not_Resolved)
 		}
@@ -605,7 +606,17 @@ exchange :: proc(
 	}
 
 	if err != .None {
-		record_failure(u, err)
+		/*
+		Except a timeout on the exchange that resolved the hostname: the
+		bootstrap servers spent part of the member's timeout, so the member was
+		not given the whole of it, and a member cut short must not be parked for
+		it - the rule `resolve_sequential` states. Once, since the address is
+		then held and every later exchange gives the member its whole timeout
+		and judges it on that.
+		*/
+		if !(resolving && err == .Timeout) {
+			record_failure(u, err)
+		}
 		logx.debugf(
 			"upstream %s (%v %s:%d) failed after %v: %v",
 			u.spec.name,

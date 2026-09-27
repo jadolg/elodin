@@ -127,7 +127,7 @@ test_a_truncated_replys_tcp_retry_shares_the_exchange_timeout :: proc(t: ^testin
 
 	// The TC arrived at 0.7 of the timeout, leaving 0.3 for a retry the server
 	// answers after 0.7: a retry on its own clock answered at 1.4.
-	testing.expectf(t, xerr != .None, "the retry was answered on a timeout of its own (%d bytes)", len(resp))
+	testing.expectf(t, xerr == .Timeout, "the retry ended %v, where it should time out (%d bytes)", xerr, len(resp))
 	testing.expectf(t, spent < X_TIMEOUT * 5 / 4, "the exchange waited %v, where its timeout is %v", spent, X_TIMEOUT)
 	// And the connection the retry dialled keeps the upstream's own timeout,
 	// not the sliver this exchange had left: it is every later query's too.
@@ -214,5 +214,47 @@ test_a_dead_bootstrap_server_leaves_time_for_the_next :: proc(t: ^testing.T) {
 	buf: [512]u8
 	n, _, _ := net.recv_udp(second, buf[:])
 	testing.expect(t, n > 0, "the second bootstrap server was never asked")
+	free_all(context.temp_allocator)
+}
+
+/*
+And the member is not charged a timeout on the exchange that resolved its
+hostname: the bootstrap servers spent part of its timeout, and a member cut
+short must not be parked for it. The next exchange, the address held, gives it
+the whole timeout and charges it as usual.
+
+Marked unresolved by hand over an address literal rather than resolved through
+a bootstrap mock: a successful lookup lands in the package-global bootstrap
+cache, which another test owns while it runs.
+*/
+@(test)
+test_the_exchange_that_resolved_a_member_does_not_charge_it_a_timeout :: proc(t: ^testing.T) {
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, serr == nil, "cannot bind the silent member: %v", serr) {
+		return
+	}
+	defer net.close(socket)
+	bound, _ := net.bound_endpoint(socket)
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "silent", kind = .UDP, address = "127.0.0.1", port = bound.port},
+		0,
+		X_TIMEOUT,
+		context.allocator,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot build the upstream: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+	u.resolved = false
+
+	query := dns.Message{id = 0x4492, question = []dns.Question{{name = "example.com.", type = .A, class = .IN}}}
+	wire, _, _ := dns.encode_message(query, context.temp_allocator)
+	_, first := exchange(u, wire, X_TIMEOUT, context.temp_allocator)
+	testing.expect_value(t, first, Error.Timeout)
+	testing.expect_value(t, u.failures, 0)
+
+	_, second := exchange(u, wire, X_TIMEOUT, context.temp_allocator)
+	testing.expect_value(t, second, Error.Timeout)
+	testing.expect_value(t, u.failures, 1)
 	free_all(context.temp_allocator)
 }

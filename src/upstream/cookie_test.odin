@@ -422,7 +422,7 @@ test_upstream_cookie_retry_shares_the_exchange_timeout :: proc(t: ^testing.T) {
 	started := time.tick_now()
 	_, err := exchange(u, edns_query("example.com."), TIMEOUT, context.temp_allocator)
 	spent := time.tick_since(started)
-	testing.expect(t, err != .None, "the retry was answered on a timeout of its own")
+	testing.expectf(t, err == .Timeout, "the retry ended %v, where it should time out", err)
 	testing.expectf(t, spent < TIMEOUT * 5 / 4, "the exchange waited %v, where its timeout is %v", spent, TIMEOUT)
 	free_all(context.temp_allocator)
 }
