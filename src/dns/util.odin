@@ -387,6 +387,66 @@ peek_udp_size :: proc(msg: []u8) -> u16 {
 }
 
 /*
+Whether a reply is a referral rather than an answer, read off the wire.
+
+RFC 2308 section 2.2, type 4: NOERROR, nothing in the answer section, and name
+servers in the authority section with no SOA beside them. That is a server
+saying "ask them", which is what an authority that does not recurse sends in
+reply to RD=1 (RFC 1034 section 4.3.1). It is not a NODATA - that is told apart,
+in the RFC's own words, by the SOA being there or the NS not being - and a
+client handed one reads "the name has no records of this type" (issue #410).
+
+The RA bit is not read. A server that clears it on answers it does give exists,
+and one that sets it over a referral has still not answered; what the reply
+holds is the whole test.
+
+The rcode is the composed one, so an extended rcode whose low nibble is zero is
+not a NOERROR here. A message that cannot be walked is not a referral: what a
+decode would refuse is refused where it is decoded.
+*/
+peek_referral :: proc(msg: []u8) -> bool {
+	if len(msg) < HEADER_SIZE || peek_rcode(msg) != .No_Error {
+		return false
+	}
+	qdcount := int(u16(msg[4]) << 8 | u16(msg[5]))
+	ancount := int(u16(msg[6]) << 8 | u16(msg[7]))
+	nscount := int(u16(msg[8]) << 8 | u16(msg[9]))
+	if ancount != 0 || nscount == 0 {
+		return false
+	}
+
+	pos := HEADER_SIZE
+	for _ in 0 ..< qdcount {
+		next, ok := skip_name(msg, pos)
+		if !ok {
+			return false
+		}
+		pos = next + 4
+		if pos > len(msg) {
+			return false
+		}
+	}
+	ns := false
+	for _ in 0 ..< nscount {
+		next, ok := skip_name(msg, pos)
+		if !ok || next + 10 > len(msg) {
+			return false
+		}
+		#partial switch Type(u16(msg[next]) << 8 | u16(msg[next + 1])) {
+		case .SOA:
+			return false
+		case .NS:
+			ns = true
+		}
+		pos = next + 10 + int(u16(msg[next + 8]) << 8 | u16(msg[next + 9]))
+		if pos > len(msg) {
+			return false
+		}
+	}
+	return ns
+}
+
+/*
 The largest TTL a message may carry.
 
 The field is 32 bits wide on the wire, but RFC 2181 section 8 narrows the value

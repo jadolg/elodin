@@ -297,6 +297,33 @@ route_reply_hijacked :: proc(name: string) -> []u8 {
 	return wire
 }
 
+/*
+A referral, which is what a server that does not recurse for the name sends to
+RD=1: NOERROR, RA clear, nothing in the answer and the NS of a zone in authority
+with no SOA beside it (RFC 2308 section 2.2, type 4; issue #410).
+*/
+@(private = "file")
+route_reply_referral :: proc(name: string, type: dns.Type) -> []u8 {
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question{name = name, type = type, class = .IN}
+	authority := make([]dns.Record, 1, context.temp_allocator)
+	authority[0] = dns.Record {
+		name  = name,
+		type  = .NS,
+		class = .IN,
+		ttl   = 3600,
+		data  = dns.Rdata_Name{name = "ns1.example."},
+	}
+	msg := dns.Message{question = question, authority = authority}
+	msg.flags.qr = true
+	msg.flags.rd = true
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	if err != .None {
+		return nil
+	}
+	return wire
+}
+
 // One UDP upstream on loopback, as `upstream.servers` would name it.
 @(private = "file")
 mock_group :: proc(t: ^testing.T, cfg: config.Upstream_Config, port: int) -> ^upstream.Group {
@@ -735,14 +762,17 @@ test_an_apex_ds_goes_back_on_the_route_unless_the_parent_proves_no_ds :: proc(t:
 		// NOERROR with an address in the answer, which is a hijacker rather than
 		// a parent: neither the DS nor the denial of one.
 		hijacked: bool,
+		// NOERROR over a referral, which is a parent's member that does not
+		// recurse: it says who to ask, not what the delegation holds.
+		referral: bool,
 		to_route: bool,
 		// What the client is handed, which is the last upstream to speak.
 		client:   dns.Rcode,
 	}
 	cases := []Case {
-		{"no such name", .NX_Domain, false, false, true, .No_Error},
-		{"a DS RRset", .No_Error, true, false, true, .No_Error},
-		{"no DS at the delegation", .No_Error, false, false, false, .No_Error},
+		{"no such name", .NX_Domain, false, false, false, true, .No_Error},
+		{"a DS RRset", .No_Error, true, false, false, true, .No_Error},
+		{"no DS at the delegation", .No_Error, false, false, false, false, .No_Error},
 		/*
 		SERVFAIL says nothing about the delegation, so the route answers it - the
 		reading `parent_answers_apex_ds` takes from
@@ -751,7 +781,7 @@ test_an_apex_ds_goes_back_on_the_route_unless_the_parent_proves_no_ds :: proc(t:
 		resolver that mangles every `DS` it meets, must not take an internal zone
 		down with it.
 		*/
-		{"SERVFAIL", .Serv_Fail, false, false, true, .No_Error},
+		{"SERVFAIL", .Serv_Fail, false, false, false, true, .No_Error},
 		/*
 		And the same reading of a rewritten NOERROR. A resolver that hijacks
 		NXDOMAIN answers the routed zone's apex `DS` with NOERROR and a
@@ -761,7 +791,13 @@ test_an_apex_ds_goes_back_on_the_route_unless_the_parent_proves_no_ds :: proc(t:
 		at the parent and hand a validating client a broken chain - this
 		carve-out's own failure, arriving through the query it sends out.
 		*/
-		{"a hijacked NOERROR", .No_Error, false, true, true, .No_Error},
+		{"a hijacked NOERROR", .No_Error, false, true, false, true, .No_Error},
+		/*
+		And a referral, which is an empty NOERROR too and was read as the proof
+		(issue #410): the parent's group kept the question, and the client was
+		handed "no DS here" from a server that had only said who to ask.
+		*/
+		{"a referral", .No_Error, false, false, true, true, .No_Error},
 	}
 
 	for c in cases {
@@ -798,6 +834,8 @@ test_an_apex_ds_goes_back_on_the_route_unless_the_parent_proves_no_ds :: proc(t:
 			parent_reply = route_reply_ds("corp.example.")
 		} else if c.hijacked {
 			parent_reply = route_reply_hijacked("corp.example.")
+		} else if c.referral {
+			parent_reply = route_reply_referral("corp.example.", .DS)
 		}
 		parent := Route_Mock {
 			socket = def_socket,
@@ -873,6 +911,61 @@ test_an_apex_ds_goes_back_on_the_route_unless_the_parent_proves_no_ds :: proc(t:
 				"the parent's answer reached the client for a zone the route answers (%s)",
 				c.what,
 			)
+		}
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+A referral that no member of the group does better than is a SERVFAIL, not the
+NODATA a client would read it as (issue #410).
+
+A group of one, so the sweep has nowhere to go and `upstream.resolve_readable`
+hands the referral back: what is under test is `resolve_query` refusing it. The
+A record the mock would otherwise be asked for is the control - the same
+fixture answering an address reaches the client as one.
+*/
+@(test)
+test_a_referral_nobody_does_better_than_is_a_servfail :: proc(t: ^testing.T) {
+	for referral in ([]bool{true, false}) {
+		socket, berr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+		if !testing.expectf(t, berr == nil, "cannot bind the mock: %v", berr) {
+			return
+		}
+		defer net.close(socket)
+		_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+		bound, _ := net.bound_endpoint(socket)
+
+		cfg := forwarding_config()
+		group := mock_group(t, cfg.upstream, bound.port)
+		defer upstream.destroy_group(group)
+		s := Server {
+			cfg   = &cfg,
+			group = group,
+		}
+
+		mock := Route_Mock {
+			socket = socket,
+			reply  = route_reply_referral("below.example.", .A) if referral else route_reply("below.example.", {192, 0, 2, 1}),
+			want   = "below.example.",
+		}
+		mock_thread := thread.create_and_start_with_poly_data(&mock, serve_route)
+		out, _, ok := handle_query(&s, route_query("below.example."), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		thread.join(mock_thread)
+		thread.destroy(mock_thread)
+
+		if !testing.expect(t, ok, "nothing came back at all") {
+			return
+		}
+		testing.expect(t, mock.asked, "the upstream was not asked")
+		decoded, derr := dns.decode_message(out, context.temp_allocator)
+		testing.expect_value(t, derr, dns.Decode_Error.None)
+		if referral {
+			testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.Serv_Fail)
+			testing.expect_value(t, len(decoded.authority), 0)
+		} else {
+			testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
+			testing.expect_value(t, len(decoded.answer), 1)
 		}
 	}
 	free_all(context.temp_allocator)

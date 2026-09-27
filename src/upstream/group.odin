@@ -508,11 +508,14 @@ resolve_insisting :: proc(
 
 // The two rcodes that say something about the name that was asked for. The
 // same test `dnssec.answerable_rcode` makes, over the wire bytes this package
-// deals in rather than a decoded message.
+// deals in rather than a decoded message - and not a referral, which is a
+// NOERROR that says only who else to ask (issue #410, `dns.peek_referral`).
 @(private)
 answerable :: proc(response: []u8) -> bool {
 	#partial switch dns.peek_rcode(response) {
-	case .No_Error, .NX_Domain:
+	case .No_Error:
+		return !dns.peek_referral(response)
+	case .NX_Domain:
 		return true
 	}
 	return false
@@ -681,12 +684,17 @@ this has no measurement of. A resolver that meets one is a second report and a
 line in this switch, not a guess made now.
 
 Every other rcode a stub can read is a statement about the name, or close enough
-to one, and stands as the client's answer.
+to one, and stands as the client's answer - except a NOERROR that is a referral
+(issue #410). A member that does not recurse for the name sends one, and the
+client would read it as NODATA; `resolve_query` refuses it where no member of
+the group does better.
 */
 @(private)
 usable_rcode :: proc(response: []u8) -> bool {
 	rcode := dns.peek_rcode(response)
 	#partial switch rcode {
+	case .No_Error:
+		return !dns.peek_referral(response)
 	case .Serv_Fail:
 		return extended_error_within(response, BOGUS_EDE_FIRST, BOGUS_EDE_LAST)
 	case .Refused:

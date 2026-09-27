@@ -2303,6 +2303,29 @@ resolve_query :: proc(
 			}
 		}
 	}
+	/*
+	And a referral is no answer at all (issue #410): a member that does not
+	recurse for the name said who else to ask, and a client handed that reads
+	NOERROR over an empty answer as "the name has no such record". The group
+	has already asked every other member it could (`upstream.resolve_readable`),
+	so what is left is the question failing - stale if there is anything, and
+	SERVFAIL otherwise - the way it fails when nobody answers. dnsmasq and
+	Unbound refuse a referral from a forwarder the same way.
+
+	Here rather than beside the rcode guard below, so the refresh path and the
+	stale fallback read it as the outage it is. See `dns.peek_referral`.
+	*/
+	referral := uerr == .None && dns.peek_referral(resp)
+	if referral {
+		logx.debugf(
+			"query %s %s from %s: upstream %s answered with a referral rather than recursing",
+			dns.type_name(q.type),
+			q.name,
+			client,
+			answering_upstream(winner),
+		)
+		uerr = .Not_Resolved
+	}
 	if uerr != .None {
 		logx.debugf("query %s %s from %s failed: %v", dns.type_name(q.type), q.name, client, uerr)
 		if flight != nil {
@@ -2350,6 +2373,7 @@ resolve_query :: proc(
 			spent,
 			allocator,
 			ede,
+			"referral" if referral else "upstream",
 		)
 	}
 
