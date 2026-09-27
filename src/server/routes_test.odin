@@ -324,6 +324,31 @@ route_reply_referral :: proc(name: string, type: dns.Type) -> []u8 {
 	return wire
 }
 
+/*
+A CNAME and nothing after it, with `zone`'s NS in authority and no SOA: the
+partial answer of an authority that does not recurse (issue #451). Where `zone`
+holds the CNAME's target it is a referral past the alias; where it is the
+alias's own zone it is an authority that answered all it holds.
+*/
+@(private = "file")
+route_reply_alias :: proc(name, target, zone: string) -> []u8 {
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question{name = name, type = .A, class = .IN}
+	answer := make([]dns.Record, 1, context.temp_allocator)
+	answer[0] = dns.Record{name = name, type = .CNAME, class = .IN, ttl = 60, data = dns.Rdata_Name{name = target}}
+	authority := make([]dns.Record, 1, context.temp_allocator)
+	authority[0] = dns.Record{name = zone, type = .NS, class = .IN, ttl = 3600, data = dns.Rdata_Name{name = "ns1.example."}}
+	msg := dns.Message{question = question, answer = answer, authority = authority}
+	msg.flags.qr = true
+	msg.flags.aa = true
+	msg.flags.rd = true
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	if err != .None {
+		return nil
+	}
+	return wire
+}
+
 // One UDP upstream on loopback, as `upstream.servers` would name it.
 @(private = "file")
 mock_group :: proc(t: ^testing.T, cfg: config.Upstream_Config, port: int) -> ^upstream.Group {
@@ -921,13 +946,27 @@ A referral that no member of the group does better than is a SERVFAIL, not the
 NODATA a client would read it as (issue #410).
 
 A group of one, so the sweep has nowhere to go and `upstream.resolve_readable`
-hands the referral back: what is under test is `resolve_query` refusing it. The
-A record the mock would otherwise be asked for is the control - the same
-fixture answering an address reaches the client as one.
+hands the referral back: what is under test is `resolve_query` refusing it. And
+the same after a CNAME whose target is delegated elsewhere (issue #451). The
+controls are the same fixture answering an address, and an authority's CNAME
+out of its own zone beside its own apex NS: each reaches the client as it was
+sent.
 */
 @(test)
 test_a_referral_nobody_does_better_than_is_a_servfail :: proc(t: ^testing.T) {
-	for referral in ([]bool{true, false}) {
+	Case :: struct {
+		what:     string,
+		reply:    []u8,
+		referral: bool,
+	}
+	cases := []Case {
+		{"a referral", route_reply_referral("below.example.", .A), true},
+		{"a referral past a CNAME", route_reply_alias("below.example.", "host.sub.below.example.", "sub.below.example."), true},
+		{"an address", route_reply("below.example.", {192, 0, 2, 1}), false},
+		{"a CNAME out of the zone", route_reply_alias("below.example.", "ghs.googlehosted.com.", "below.example."), false},
+	}
+	for c in cases {
+		referral := c.referral
 		socket, berr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
 		if !testing.expectf(t, berr == nil, "cannot bind the mock: %v", berr) {
 			return
@@ -949,7 +988,7 @@ test_a_referral_nobody_does_better_than_is_a_servfail :: proc(t: ^testing.T) {
 
 		mock := Route_Mock {
 			socket = socket,
-			reply  = route_reply_referral("below.example.", .A) if referral else route_reply("below.example.", {192, 0, 2, 1}),
+			reply  = c.reply,
 			want   = "below.example.",
 		}
 		mock_thread := thread.create_and_start_with_poly_data(&mock, serve_route)
@@ -964,11 +1003,11 @@ test_a_referral_nobody_does_better_than_is_a_servfail :: proc(t: ^testing.T) {
 		decoded, derr := dns.decode_message(out, context.temp_allocator)
 		testing.expect_value(t, derr, dns.Decode_Error.None)
 		if referral {
-			testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.Serv_Fail)
-			testing.expect_value(t, len(decoded.authority), 0)
+			testing.expectf(t, dns.Rcode(decoded.flags.rcode) == .Serv_Fail, "%s: rcode %v, want SERVFAIL", c.what, dns.Rcode(decoded.flags.rcode))
+			testing.expectf(t, len(decoded.answer) + len(decoded.authority) == 0, "%s: the referral reached the client", c.what)
 		} else {
-			testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
-			testing.expect_value(t, len(decoded.answer), 1)
+			testing.expectf(t, dns.Rcode(decoded.flags.rcode) == .No_Error, "%s: rcode %v, want NOERROR", c.what, dns.Rcode(decoded.flags.rcode))
+			testing.expectf(t, len(decoded.answer) == 1, "%s: %d answer records, want the one sent", c.what, len(decoded.answer))
 		}
 	}
 	free_all(context.temp_allocator)

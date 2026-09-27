@@ -396,29 +396,44 @@ reply to RD=1 (RFC 1034 section 4.3.1). It is not a NODATA - that is told apart,
 in the RFC's own words, by the SOA being there or the NS not being - and a
 client handed one reads "the name has no records of this type" (issue #410).
 
+And the same after a CNAME, which is RFC 2308 section 2.1's own REFERRAL
+RESPONSE example: `an.example. CNAME tripple.xx.` in the answer, `xx. NS` in
+authority, no SOA. The chain stops at a name the server does not hold, and a
+client handed it gets an alias and no address (issue #451). What makes it one
+is where the NS sit: at or above the chain's target and not above the name
+asked. An authority that includes its own apex NS beside a CNAME out of its
+zone - BIND does, for `mail.corp. CNAME ghs.googlehosted.com.` - has answered
+all it holds, and a stub that follows CNAMEs resolves that today; it is left
+alone. Only CNAME, DNAME and their RRSIGs may stand in the answer: anything
+else there is data, and the reply is an answer.
+
 The RA bit is not read. A server that clears it on answers it does give exists,
 and one that sets it over a referral has still not answered; what the reply
 holds is the whole test.
 
-The AA bit is. A referral is sent from above the cut, where the server is not
-the authority for the name asked (RFC 1035 section 4.1.1), so no server sets it
-on one; an authority that does set it over an empty answer with only its own NS
-beside it is sending a NODATA without the SOA, and that is its answer.
+The AA bit is, over an empty answer. A referral is sent from above the cut,
+where the server is not the authority for the name asked (RFC 1035 section
+4.1.1), so no server sets it on one; an authority that does set it over an
+empty answer with only its own NS beside it is sending a NODATA without the
+SOA, and that is its answer. Beside a CNAME it says nothing: the authority for
+the alias sets it, and the target is still somebody else's.
 
 The rcode is the composed one, so an extended rcode whose low nibble is zero is
 not a NOERROR here. A message that cannot be walked is not a referral: what a
 decode would refuse is refused where it is decoded.
+
+The walk allocates nothing. Only a reply already of the partial shape - every
+answer record an alias, NS and no SOA in authority - is decoded, into scratch,
+to follow the chain.
 */
 peek_referral :: proc(msg: []u8) -> bool {
-	if len(msg) < HEADER_SIZE || msg[2] & 0x04 != 0 {
+	if len(msg) < HEADER_SIZE {
 		return false
 	}
 	qdcount := int(u16(msg[4]) << 8 | u16(msg[5]))
 	ancount := int(u16(msg[6]) << 8 | u16(msg[7]))
 	nscount := int(u16(msg[8]) << 8 | u16(msg[9]))
-	// The counts before the rcode: composing it walks the whole message for the
-	// OPT record, and every answer with records in it stops here without that.
-	if ancount != 0 || nscount == 0 || peek_rcode(msg) != .No_Error {
+	if nscount == 0 || (ancount == 0 && msg[2] & 0x04 != 0) {
 		return false
 	}
 
@@ -432,6 +447,27 @@ peek_referral :: proc(msg: []u8) -> bool {
 		if pos > len(msg) {
 			return false
 		}
+	}
+	// The answer first: an ordinary answer's first record ends this here.
+	for _ in 0 ..< ancount {
+		next, ok := skip_name(msg, pos)
+		if !ok || next + 10 > len(msg) {
+			return false
+		}
+		#partial switch Type(u16(msg[next]) << 8 | u16(msg[next + 1])) {
+		case .CNAME, .DNAME, .RRSIG:
+		case:
+			return false
+		}
+		pos = next + 10 + int(u16(msg[next + 8]) << 8 | u16(msg[next + 9]))
+		if pos > len(msg) {
+			return false
+		}
+	}
+	// The rcode after the counts and the answer: composing it walks the whole
+	// message for the OPT record.
+	if peek_rcode(msg) != .No_Error {
+		return false
 	}
 	ns := false
 	for _ in 0 ..< nscount {
@@ -450,7 +486,46 @@ peek_referral :: proc(msg: []u8) -> bool {
 			return false
 		}
 	}
-	return ns
+	if !ns || ancount == 0 {
+		return ns
+	}
+	return referred_past_alias(msg)
+}
+
+// The CNAME half of `peek_referral`: whether the authority's NS are for the
+// chain's target rather than for the name asked.
+@(private)
+referred_past_alias :: proc(msg: []u8) -> bool {
+	decoded, err := decode_message(msg, context.temp_allocator)
+	if err != .None || len(decoded.question) != 1 {
+		return false
+	}
+	asked := decoded.question[0].name
+	target := asked
+	// One step per answer record at most, so a loop in the chain ends.
+	for _ in decoded.answer {
+		moved := false
+		for rec in decoded.answer {
+			alias, is_name := rec.data.(Rdata_Name)
+			if rec.type == .CNAME && is_name && name_equal_fold(rec.name, target) {
+				target = alias.name
+				moved = true
+				break
+			}
+		}
+		if !moved {
+			break
+		}
+	}
+	if name_equal_fold(target, asked) {
+		return false
+	}
+	for rec in decoded.authority {
+		if rec.type == .NS && name_at_or_below(target, rec.name) && !name_at_or_below(asked, rec.name) {
+			return true
+		}
+	}
+	return false
 }
 
 /*
