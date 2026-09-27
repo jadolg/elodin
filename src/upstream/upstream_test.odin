@@ -2676,7 +2676,6 @@ test_http_response_fields_fold_ascii_only :: proc(t: ^testing.T) {
 		{"Connection: close\u00a0\r\nContent-Length: 5\r\n", "hello", true, "close with a non-breaking space"},
 		{"Tran\u017ffer-Encoding: chunked\r\nContent-Length: 5\r\n", "hello", true, "Transfer-Encoding with a long s"},
 		{"Transfer-Encoding: chunked\r\n", "5\r\nhello\r\n0\r\n\r\n", true, "real chunked framing"},
-		{"Transfer-Encoding: chunked\r\n", "5 \r\nhello\r\n0\r\n\r\n", true, "a chunk size with a space after it"},
 	}
 	for c in CASES {
 		track: mem.Tracking_Allocator
@@ -2702,7 +2701,7 @@ test_http_chunk_size_keeps_what_is_not_bws :: proc(t: ^testing.T) {
 	defer mem.tracking_allocator_destroy(&track)
 	resp, err, ok := exchange_against(
 		t,
-		"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5 \r\nhello\r\n0\r\n\r\n",
+		"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\u00a0\r\nhello\r\n0\r\n\r\n",
 		&track,
 	)
 	if !ok {

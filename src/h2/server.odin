@@ -4,6 +4,7 @@ import "core:mem"
 import "core:strings"
 import "core:sync"
 import "core:time"
+import "elodin:dns"
 
 /*
 A server-side HTTP/2 connection, scoped to what a DoH endpoint needs.
@@ -905,15 +906,14 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 
 	And a scheme at all first: RFC 3986 3.1 writes it in ASCII letters, digits,
 	`+`, `-` and `.`, beginning with a letter. Anything else names no scheme and
-	would carry any `:path` past these checks as surely as an empty one did. It is
-	also what keeps `strings.equal_fold` to ASCII case: that procedure folds
-	Unicode, where the long s (U+017F) is an `s`, so `http\u017f` would otherwise
-	have read as https (#432).
+	would carry any `:path` past these checks as surely as an empty one did. And
+	folded in ASCII only: `strings.equal_fold` folds Unicode, where the long s
+	(U+017F) is an `s`, so `http\u017f` read as https (#432).
 	*/
 	if !scheme_is_valid(scheme) {
 		return true
 	}
-	if strings.equal_fold(scheme, "http") || strings.equal_fold(scheme, "https") {
+	if dns.name_equal_fold(scheme, "http") || dns.name_equal_fold(scheme, "https") {
 		if path == "*" {
 			return method != "OPTIONS"
 		}

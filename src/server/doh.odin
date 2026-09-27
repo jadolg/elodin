@@ -150,15 +150,35 @@ http_fill :: proc(r: ^Http_Reader) -> bool {
 	return true
 }
 
+/*
+One line, up to CRLF.
+
+A bare LF, a bare CR or a NUL before it refuses the request (#432). RFC 9112 2.2
+lets a recipient take a bare LF for a line end, so a hop in front may read
+`X: a\nTransfer-Encoding: chunked` as two fields where this one would read one,
+and frame the body by chunks where this one framed it by Content-Length. The
+same goes for the request line, and a bare CR or NUL is what some hops split on
+or cut at. Nothing that speaks DoH sends any of them, and HTTP/2 already refuses
+them in a value (`field_value_is_valid`).
+
+Every byte before the first CRLF is looked at on the pass that finds it, so a
+byte is judged once it has a successor to be read against.
+*/
 @(private)
 http_line :: proc(r: ^Http_Reader) -> (line: string, ok: bool) {
 	for {
 		region := r.buf[r.pos:]
 		for i in 0 ..< max(0, len(region) - 1) {
-			if region[i] == '\r' && region[i + 1] == '\n' {
+			switch region[i] {
+			case '\r':
+				if region[i + 1] != '\n' {
+					return "", false
+				}
 				start := r.pos
 				r.pos += i + 2
 				return string(r.buf[start:start + i]), true
+			case '\n', 0:
+				return "", false
 			}
 		}
 		if len(r.buf) > MAX_HEADER_BYTES {
@@ -244,8 +264,8 @@ problem.
 The limit is applied digit by digit rather than to the total, so there is
 nothing for an overlong value to wrap in on the way to being checked.
 
-`value` is the field value as it arrived. What may surround the digits is `OWS`
-- spaces and tabs, RFC 9110 5.6.3 - and that is all this takes off.
+What may surround the digits is `OWS` - spaces and tabs, RFC 9110 5.6.3 - and
+that is all this takes off, whether or not the caller already has.
 */
 @(private)
 parse_content_length :: proc(value: string) -> (length: int, ok: bool) {

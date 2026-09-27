@@ -2058,3 +2058,39 @@ test_doh_field_names_are_ascii_tokens :: proc(t: ^testing.T) {
 		free_all(context.temp_allocator)
 	}
 }
+
+/*
+A line ends at CRLF and nowhere else, and holds no bare LF, bare CR or NUL. RFC
+9112 2.2 lets a recipient take a bare LF for a line end, so a hop in front may
+read `X: a\nTransfer-Encoding: chunked` as two fields where this one read one -
+framing by chunks where elodin framed by Content-Length. A value holding one of
+these was already malformed over HTTP/2 (`field_value_is_valid`).
+*/
+@(test)
+test_doh_lines_hold_no_bare_line_ends :: proc(t: ^testing.T) {
+	Case :: struct {
+		raw:  string,
+		what: string,
+	}
+	BODY :: "Content-Type: application/dns-message\r\nContent-Length: 4\r\n\r\nabcd"
+	CASES := []Case {
+		{"POST /dns-query HTTP/1.1\r\nHost: dns.example\r\nX: a\nTransfer-Encoding: chunked\r\n" + BODY, "a bare LF in a value"},
+		{"POST /dns-query HTTP/1.1\r\nHost: dns.example\r\nX: a\rTransfer-Encoding: chunked\r\n" + BODY, "a bare CR in a value"},
+		{"POST /dns-query HTTP/1.1\r\nHost: dns.example\r\nX: a\x00b\r\n" + BODY, "a NUL in a value"},
+		{"POST /dns-query\nTransfer-Encoding:chunked HTTP/1.1\r\nHost: dns.example\r\n" + BODY, "a bare LF in the request line"},
+		{"POST /dns-query HTTP/1.1\r\nHost: dns.example\n\r\n" + BODY, "a bare LF before CRLF"},
+	}
+	for c in CASES {
+		_, _, parsed, ok := read_request_over_loopback(t, c.raw, c.what)
+		if !ok {
+			return
+		}
+		testing.expectf(t, !parsed, "%s was read as a request", c.what)
+		free_all(context.temp_allocator)
+	}
+	// And the ordinary request still is.
+	_, _, parsed, ok := read_request_over_loopback(t, "POST /dns-query HTTP/1.1\r\nHost: dns.example\r\n" + BODY, "a plain request")
+	if ok {
+		testing.expect(t, parsed, "a plain request was refused")
+	}
+}
