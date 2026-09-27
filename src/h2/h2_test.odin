@@ -650,11 +650,9 @@ test_data_on_a_closed_stream_is_answered_with_stream_closed :: proc(t: ^testing.
 /*
 Answering every one of these forever is its own amplification vector: a peer
 that keeps a closed stream id around and just keeps sending draws an
-RST_STREAM out of this end for each frame, for free. Each id draws one at
-most, since RFC 9113 5.1 has frames after our own RST_STREAM ignored, and
-`closed_stream_rst_budget` bounds the ids to `MAX_CLOSED_STREAM_RST` per
-connection; past it, this falls back to the credit-only behaviour the case had
-before this fix existed.
+RST_STREAM out of this end for each frame, for free. `closed_stream_rst_budget`
+bounds that to `MAX_CLOSED_STREAM_RST` per connection; past it, this falls
+back to the credit-only behaviour the case had before this fix existed.
 */
 @(test)
 test_data_on_a_closed_stream_stops_drawing_rst_once_the_budget_is_spent :: proc(t: ^testing.T) {
@@ -669,30 +667,21 @@ test_data_on_a_closed_stream_stops_drawing_rst_once_the_budget_is_spent :: proc(
 	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
 
 	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+	testing.expect(t, ok, "handle_headers failed")
 	rst := []u8{0, 0, 0, 8} // CANCEL
+	handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst)
+
 	body := []u8{'x'}
-	// Opened and reset by the peer, so gone; each takes two DATA, and only the
-	// first draws an RST_STREAM.
-	id: u32
-	for i in 0 ..= MAX_CLOSED_STREAM_RST {
-		id = u32(2 * i + 1)
-		ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block)
-		testing.expect(t, ok, "handle_headers failed")
-		handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = id}, rst)
-		if i == MAX_CLOSED_STREAM_RST {
-			break
-		}
-		for _ in 0 ..< 2 {
-			handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = id}, body)
-		}
-		testing.expect_value(t, count_rst(&log, id), 1)
+	for _ in 0 ..< MAX_CLOSED_STREAM_RST {
+		handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
 	}
 	testing.expect_value(t, c.closed_stream_rst_budget, 0)
 
 	clear(&log.frames)
 	// One byte short of a batch, so the refused frame's credit is due on the wire.
 	c.credit_owed = CREDIT_BATCH - 1
-	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = id}, body)
+	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
 	testing.expect(t, dok, "DATA on a closed stream should still be tolerated once the budget is spent")
 
 	saw_rst := false
@@ -773,41 +762,62 @@ test_data_in_flight_on_a_stream_this_end_reset_is_ignored :: proc(t: ^testing.T)
 }
 
 /*
-The commonest way into #390: HEADERS refused for want of room, with the
-request body already on the wire behind it. Every reset this end sends goes
-through `rst_stream`, so each is covered: refused, malformed, oversized.
+The commonest way into #390: HEADERS turned away, with the request body
+already on the wire behind it. Each way `finish_headers` turns one away:
+over the concurrency limit, out of room, malformed.
 */
 @(test)
 test_body_in_flight_behind_a_refused_headers_is_ignored :: proc(t: ^testing.T) {
-	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
-
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	Cause :: enum {
+		Concurrency,
+		Room,
+		Malformed,
 	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+	for cause in Cause {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		allocator := mem.tracking_allocator(&track)
 
-	// No room left for the request's fields: finish_headers refuses it.
-	c.request_bytes = MAX_CONN_REQUEST
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
-	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
-	c.request_bytes = 0
-	testing.expect_value(t, count_rst(&log, 1), 1)
+		log := Frame_Log {
+			frames = make([dynamic]Frame_Header, 0, 8, allocator),
+		}
+		c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
 
-	body := []u8{'x'}
-	for _ in 0 ..< 3 {
-		handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+		block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+		id := u32(1)
+		switch cause {
+		case .Concurrency:
+			// Parked for their bodies, so all still open.
+			for _ in 0 ..< MAX_CONCURRENT {
+				handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block)
+				id += 2
+			}
+		case .Room:
+			c.request_bytes = MAX_CONN_REQUEST
+		case .Malformed:
+			// :method GET, :scheme http, and no :path.
+			block = []u8{0x82, 0x86}
+		}
+		handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block)
+		if cause == .Room {
+			c.request_bytes = 0
+		}
+		testing.expectf(t, count_rst(&log, id) == 1, "%v: RST_STREAM frames for the refused HEADERS: %d, want 1", cause, count_rst(&log, id))
+
+		body := []u8{'x'}
+		for _ in 0 ..< 3 {
+			handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = id}, body)
+		}
+		handle_data(c, Frame_Header{length = len(body), type = .Data, flags = FLAG_END_STREAM, stream_id = id}, body)
+		testing.expectf(t, count_rst(&log, id) == 1, "%v: RST_STREAM frames after the body in flight: %d, want 1", cause, count_rst(&log, id))
+		testing.expectf(t, c.closed_stream_rst_budget == MAX_CLOSED_STREAM_RST, "%v: closed_stream_rst_budget %d, want %d", cause, c.closed_stream_rst_budget, MAX_CLOSED_STREAM_RST)
+
+		delete(log.frames)
+		conn_unref(c)
+		free_all(context.temp_allocator)
+		expect_no_leaks(t, &track, "body behind a refused headers")
+		mem.tracking_allocator_destroy(&track)
 	}
-	handle_data(c, Frame_Header{length = len(body), type = .Data, flags = FLAG_END_STREAM, stream_id = 1}, body)
-	testing.expect_value(t, count_rst(&log, 1), 1)
-	testing.expect_value(t, c.closed_stream_rst_budget, MAX_CLOSED_STREAM_RST)
-
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "body behind a refused headers")
 }
 
 /*
@@ -846,16 +856,47 @@ test_trailers_in_flight_on_a_stream_this_end_reset_are_decoded_and_ignored :: pr
 	testing.expect_value(t, c.last_stream_id, 1)
 	testing.expect_value(t, len(c.decoder.entries), 2)
 
-	// A peer resetting it first is no excuse: that is still a connection error.
-	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 3}, block)
-	rst := []u8{0, 0, 0, 8} // CANCEL
-	handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 3}, rst)
-	testing.expect(t, !handle_headers(c, Frame_Header{length = 1, type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 3}, []u8{0x82}), "HEADERS on a stream the peer reset was accepted")
+	// Trailers end the stream, so a second block on it cannot be in flight.
+	testing.expect(t, !handle_headers(c, Frame_Header{length = 1, type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, []u8{0x82}), "a second block on a stream this end reset was accepted")
 
 	delete(log.frames)
 	conn_unref(c)
 	free_all(context.temp_allocator)
 	expect_no_leaks(t, &track, "trailers on a reset stream")
+}
+
+/*
+A block on a stream is taken quietly only where the peer may still have been
+sending when this end reset it. A reset it drew by breaking the rules on a
+stream it had ended or reset itself - the STREAM_CLOSED for DATA after that -
+is not one: remembering those let a peer turn any stream into one that takes
+another header block for one DATA frame.
+*/
+@(test)
+test_headers_after_drawing_stream_closed_is_a_connection_error :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	body := []u8{'x'}
+	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+	rst := []u8{0, 0, 0, 8} // CANCEL
+	handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst)
+	handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect_value(t, count_rst(&log, 1), 1)
+	testing.expect(t, !handle_headers(c, Frame_Header{length = 1, type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, []u8{0x82}), "HEADERS on a stream the peer reset was accepted")
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "headers after stream closed")
 }
 
 /*
@@ -883,6 +924,42 @@ test_headers_on_a_reset_stream_still_being_answered_is_a_connection_error :: pro
 	ok := handle_headers(c, Frame_Header{length = 1, type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, []u8{0x82})
 	testing.expect(t, !ok, "HEADERS on a stream still being answered was accepted")
 	testing.expect(t, c.streams[1] == s, "the stream being answered was replaced")
+	free_all(context.temp_allocator)
+}
+
+/*
+Conn.reset_ids is a ring, and an id that falls out of it is answered as any
+closed stream is - one RST_STREAM(STREAM_CLOSED) from the budget - rather than
+ignored. Pins the size and the wrap: one id short of a full turn is still
+remembered.
+*/
+@(test)
+test_a_reset_id_pushed_out_of_the_ring_falls_back_to_the_budget :: proc(t: ^testing.T) {
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8),
+	}
+	defer delete(log.frames)
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, context.allocator)
+	defer conn_unref(c)
+
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	big := make([]u8, MAX_BODY + 1, context.temp_allocator)
+	open_and_overflow :: proc(c: ^Conn, id: u32, block, big: []u8) {
+		handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block)
+		handle_data(c, Frame_Header{length = len(big), type = .Data, stream_id = id}, big)
+	}
+	// Streams 1 and 3 first, then enough after them to push out 1 but not 3.
+	for i in 0 ..< MAX_CONCURRENT + 1 {
+		open_and_overflow(c, u32(2 * i + 1), block, big)
+		c.control = {}
+	}
+	clear(&log.frames)
+	body := []u8{'x'}
+	handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 3}, body)
+	testing.expect_value(t, count_rst(&log, 3), 0)
+	handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect_value(t, count_rst(&log, 1), 1)
+	testing.expect_value(t, c.closed_stream_rst_budget, MAX_CLOSED_STREAM_RST - 1)
 	free_all(context.temp_allocator)
 }
 
