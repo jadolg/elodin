@@ -212,7 +212,10 @@ MAX_HTTP_BODY :: 64 * 1024 * 1024
 
 /*
 How many header fields — or trailer fields, which are read by the same loop —
-one response may carry.
+one exchange may carry. Interim (1xx) responses draw on the same budget, each
+one costing a field on top of its own: the reader keeps every line it has read
+for the whole exchange, so a budget per response would let a run of interim
+responses hold a hundred times as much.
 
 `reader_line` bounds a line at 64 KB but says nothing about how many lines
 follow, so a peer sending short fields forever was answered for as long as it
@@ -382,6 +385,12 @@ http_exchange :: proc(
 		// No body, whatever the fields say (RFC 9112 6.3): read by them, a 204
 		// on a kept-alive connection waited for a close that never came (#442).
 		resp.body = nil
+		// A 204 may not frame a body (RFC 9110 8.6, 6.1); one that does may have
+		// sent it, and the next response would be read from inside it. A 304's
+		// Content-Length is its representation's, and nothing follows it.
+		if resp.status == 204 && (chunked || content_length >= 0) {
+			resp.keep_alive = false
+		}
 	case chunked:
 		resp.body = read_chunked(&r, allocator) or_return
 	case content_length == 0:
@@ -474,6 +483,11 @@ parse_status :: proc(line: string) -> (status: int, http_1_0: bool, err: Error) 
 			return 0, false, .HTTP_Error
 		}
 		v = v * 10 + int(c - '0')
+	}
+	// RFC 9110 15: a status is 100 to 599. Below that it is not even an interim
+	// response to pass over, which is what `099` was read as (#442).
+	if v < 100 || v > 599 {
+		return 0, false, .HTTP_Error
 	}
 	return v, line[:V] == "HTTP/1.0", .None
 }

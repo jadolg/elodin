@@ -2961,13 +2961,20 @@ test_http_bodyless_statuses_end_at_the_fields :: proc(t: ^testing.T) {
 		{"HTTP/1.1 304 Not Modified\r\nETag: \"x\"\r\n\r\n", false, 304, "", true},
 		// A 304 may carry the Content-Length of the representation it stands for.
 		{"HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\n", false, 304, "", true},
-		{"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n", false, 204, "", true},
+		// A 204 carries no framing fields (RFC 9110 8.6, 6.1). One that does may
+		// have sent the body it framed, so the connection goes no further.
+		{"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n", false, 204, "", false},
+		{"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n", false, 204, "", false},
 		{"HTTP/1.1 103 Early Hints\r\nLink: </a>; rel=preload\r\n\r\n" + OK, false, 200, "ok", true},
 		{"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 102 Processing\r\n\r\n" + OK, false, 200, "ok", true},
 		// An interim response's fields are its own, not the final one's.
 		{"HTTP/1.1 103 Early Hints\r\nConnection: close\r\n\r\n" + OK, false, 200, "ok", true},
 		{"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok", false, 200, "ok", false},
 		{"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\n\r\n" + OK, true, 0, "", false},
+		// Not a status at all (RFC 9110 15), so not an interim one to pass over.
+		{"HTTP/1.1 099 Weird\r\n\r\n" + OK, true, 0, "", false},
+		{"HTTP/1.1 000 Zero\r\n\r\n" + OK, true, 0, "", false},
+		{"HTTP/1.1 600 Past\r\nContent-Length: 2\r\n\r\nok", true, 0, "", false},
 		{"HTTP/1.1 103 Early Hints\r\n folded\r\n\r\n" + OK, true, 0, "", false},
 		{"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1x 200 OK\r\n\r\n", true, 0, "", false},
 	}
