@@ -3001,6 +3001,49 @@ test_http_bodyless_statuses_end_at_the_fields :: proc(t: ^testing.T) {
 		free_all(context.temp_allocator)
 	}
 
+	// An interim response's Location is not the answer's.
+	{
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		defer mem.tracking_allocator_destroy(&track)
+		reply := "HTTP/1.1 103 Early Hints\r\nLocation: http://interim.invalid/\r\n\r\n" + OK
+		resp, err, ok := exchange_against(t, reply, &track, hold = true)
+		if ok {
+			testing.expectf(t, err == .None, "a 103 with a Location failed: %v", err)
+			testing.expectf(t, resp.location == "", "the 103's Location reached the answer: %q", resp.location)
+			delete(resp.body, mem.tracking_allocator(&track))
+		}
+		free_all(context.temp_allocator)
+	}
+
+	/*
+	Interim responses draw on the final response's field budget, on purpose:
+	the reader keeps every line of the exchange, so a budget each would let a
+	run of them hold a hundred times as much. 103 with 60 fields costs 61, and
+	a 200 with 40 more is one over.
+	*/
+	{
+		b := strings.builder_make(context.temp_allocator)
+		strings.write_string(&b, "HTTP/1.1 103 Early Hints\r\n")
+		for _ in 0 ..< 60 {
+			strings.write_string(&b, "Link: </a>; rel=preload\r\n")
+		}
+		strings.write_string(&b, "\r\nHTTP/1.1 200 OK\r\n")
+		for _ in 0 ..< 39 {
+			strings.write_string(&b, "X: y\r\n")
+		}
+		strings.write_string(&b, "Content-Length: 2\r\n\r\nok")
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		defer mem.tracking_allocator_destroy(&track)
+		resp, err, ok := exchange_against(t, strings.to_string(b), &track, hold = true)
+		if ok {
+			testing.expectf(t, err == .HTTP_Error, "a 103 and a 200 over the shared budget got %v, status %d", err, resp.status)
+			delete(resp.body, mem.tracking_allocator(&track))
+		}
+		free_all(context.temp_allocator)
+	}
+
 	// Endless interim responses run into the field limit rather than forever.
 	b := strings.builder_make(context.temp_allocator)
 	for _ in 0 ..= MAX_HTTP_HEADERS {

@@ -212,10 +212,10 @@ MAX_HTTP_BODY :: 64 * 1024 * 1024
 
 /*
 How many header fields — or trailer fields, which are read by the same loop —
-one exchange may carry. Interim (1xx) responses draw on the same budget, each
-one costing a field on top of its own: the reader keeps every line it has read
-for the whole exchange, so a budget per response would let a run of interim
-responses hold a hundred times as much.
+one exchange may carry. Interim (1xx) responses draw on the headers' budget,
+each one costing a field on top of its own: the reader keeps every line it has
+read for the whole exchange, so a budget per response would let a run of interim
+responses hold a hundred times as much. Trailers have a budget of their own.
 
 `reader_line` bounds a line at 64 KB but says nothing about how many lines
 follow, so a peer sending short fields forever was answered for as long as it
@@ -292,7 +292,10 @@ http_exchange :: proc(
 		// HTTP/1.0 closes unless it says otherwise (RFC 9112 9.3), and saying so
 		// is not worth honouring for one saved dial: only 1.1 and later are pooled.
 		resp.keep_alive = !http_1_0
-		resp.location = ""
+		// A 101 is an answer to an upgrade this client never asks for.
+		if resp.status == 101 {
+			return resp, .HTTP_Error
+		}
 		content_length = -1
 		chunked = false
 		for {
@@ -349,14 +352,11 @@ http_exchange :: proc(
 				// Scratch, as the doc comment above promises: only the body is the
 				// caller's to free. Taking the first of a repeated header rather than
 				// the last also stops a server orphaning a string per copy.
-				if resp.location == "" {
+				// An interim response's Location is not the answer's.
+				if resp.location == "" && resp.status >= 200 {
 					resp.location = strings.clone(value, context.temp_allocator)
 				}
 			}
-		}
-		// A 101 is an answer to an upgrade this client never asks for.
-		if resp.status == 101 {
-			return resp, .HTTP_Error
 		}
 		if resp.status >= 200 {
 			break
@@ -384,7 +384,6 @@ http_exchange :: proc(
 	case resp.status == 204 || resp.status == 304:
 		// No body, whatever the fields say (RFC 9112 6.3): read by them, a 204
 		// on a kept-alive connection waited for a close that never came (#442).
-		resp.body = nil
 		// A 204 may not frame a body (RFC 9110 8.6, 6.1); one that does may have
 		// sent it, and the next response would be read from inside it. A 304's
 		// Content-Length is its representation's, and nothing follows it.
