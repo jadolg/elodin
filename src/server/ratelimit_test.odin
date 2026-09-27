@@ -1439,7 +1439,11 @@ test_a_reply_to_the_unspecified_address_comes_home :: proc(t: ^testing.T) {
 			return
 		}
 		defer net.close(rx)
-		_ = net.set_option(rx, .Receive_Timeout, time.Second)
+		// Without the timeout a datagram that never arrives hangs the run.
+		if oerr := net.set_option(rx, .Receive_Timeout, time.Second); oerr != nil {
+			testing.expectf(t, false, "cannot set a receive timeout: %v", oerr)
+			return
+		}
 		bound, _ := net.bound_endpoint(rx)
 		tx, terr := net.make_unbound_udp_socket(net.family_from_address(loopback))
 		if terr != nil {

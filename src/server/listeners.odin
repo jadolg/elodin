@@ -647,6 +647,16 @@ udp_loop :: proc(data: rawptr) {
 		}
 
 		/*
+		Ahead of the allow list, since a source nothing could answer is not a
+		client the operator forgot to list: charged to refused=, one would earn
+		the warning that says to add its network to server.allow_from.
+		*/
+		if !plausible_source(l, client) {
+			sync.atomic_add(&ctx.server.stats.dropped, 1)
+			continue
+		}
+
+		/*
 		Before the message is parsed, before the limiter and before the queue:
 		a source this server does not answer should cost a prefix compare and
 		nothing else.
@@ -667,11 +677,6 @@ udp_loop :: proc(data: rawptr) {
 		if !config.source_allowed(ctx.server.cfg.server.allow_from, client.address) {
 			sync.atomic_add(&ctx.server.stats.refused, 1)
 			report_refusal(client, .UDP)
-			continue
-		}
-
-		if !plausible_source(l, client) {
-			sync.atomic_add(&ctx.server.stats.dropped, 1)
 			continue
 		}
 
