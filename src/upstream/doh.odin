@@ -260,7 +260,13 @@ exchange_doh_h1 :: proc(
 		a pooled connection is retried because it may simply be stale, and a
 		fresh one failing any other way has said what it has to say.
 		*/
-		if attempt == 1 || (!reused && last != .Peer_Closed) {
+		/*
+		A timeout is the deadline spent - `reader_fill` holds every read to it -
+		so it is not retried: `tlsx` rounds the wait down to whole milliseconds
+		and gives up a fraction early, and the second attempt then dialled the
+		upstream with a sliver it could not use (#445).
+		*/
+		if attempt == 1 || last == .Timeout || (!reused && last != .Peer_Closed) {
 			return nil, last
 		}
 	}

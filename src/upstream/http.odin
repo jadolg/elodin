@@ -31,11 +31,8 @@ stream_read :: proc(s: ^Stream, buf: []u8) -> (n: int, err: Error) {
 		}
 		// A read that ran out of time is a timeout on either half, as in
 		// `pipe_read_full`: `IO_Error` says the peer broke, not that it was slow.
-		if terr == .Timeout {
-			return 0, .Timeout
-		}
 		if terr != .None {
-			return 0, .IO_Error
+			return 0, roundtrip_failure(terr)
 		}
 		return got, .None
 	}
@@ -63,28 +60,20 @@ stream_write :: proc(s: ^Stream, buf: []u8, deadline := time.Tick{}) -> Error {
 		if wait <= 0 {
 			return .Timeout
 		}
-		wait = max(wait, time.Millisecond)
-		if s.tls != nil {
-			tlsx.set_write_timeout(s.tls, wait)
-		} else {
-			_ = net.set_option(s.socket, .Send_Timeout, wait)
-		}
+		stream_set_write_timeout(s, wait)
 	}
 	if s.tls != nil {
 		if _, err := tlsx.write(s.tls, buf); err != .None {
-			#partial switch err {
-			case .Closed:
-				return .Peer_Closed
-			case .Timeout:
-				return .Timeout
-			}
-			return .IO_Error
+			return roundtrip_failure(err)
 		}
 		return .None
 	}
 	sent := 0
 	for sent < len(buf) {
 		n, err := net.send_tcp(s.socket, buf[sent:])
+		if err == .Timeout || err == .Would_Block {
+			return .Timeout
+		}
 		if err != nil || n <= 0 {
 			return .IO_Error
 		}
@@ -106,6 +95,16 @@ stream_set_read_timeout :: proc(s: ^Stream, timeout: time.Duration) {
 	_ = net.set_option(s.socket, .Receive_Timeout, bounded)
 }
 
+// The same for the next write.
+stream_set_write_timeout :: proc(s: ^Stream, timeout: time.Duration) {
+	bounded := max(timeout, time.Millisecond)
+	if s.tls != nil {
+		tlsx.set_write_timeout(s.tls, bounded)
+		return
+	}
+	_ = net.set_option(s.socket, .Send_Timeout, bounded)
+}
+
 stream_close :: proc(s: ^Stream) {
 	if s.tls != nil {
 		tlsx.close(s.tls)
@@ -120,9 +119,9 @@ Buf_Reader :: struct {
 	stream:   ^Stream,
 	buf:      [dynamic]u8,
 	pos:      int,
-	// When the whole exchange must be over, or zero for no bound beyond
-	// whatever is already on the socket; and, under it, how long any one read
-	// may wait (zero for as long as the deadline allows). See `reader_fill`.
+	// When the whole exchange must be over, and how long any one read may
+	// wait; either may be zero for no such bound, and with both zero the
+	// timeouts already on the socket apply. See `reader_fill`.
 	deadline: time.Tick,
 	idle:     time.Duration,
 	// The peer has closed: what `reader_to_end` waits for, and the only thing
@@ -138,13 +137,16 @@ reader_fill :: proc(r: ^Buf_Reader) -> Error {
 	field limit and the body limit let it (#445). So each read waits for what
 	is left of the deadline at most.
 	*/
-	if r.deadline != {} {
-		wait := time.tick_diff(time.tick_now(), r.deadline)
-		if wait <= 0 {
-			return .Timeout
-		}
-		if r.idle > 0 {
-			wait = min(wait, r.idle)
+	if r.deadline != {} || r.idle > 0 {
+		wait := r.idle
+		if r.deadline != {} {
+			left := time.tick_diff(time.tick_now(), r.deadline)
+			if left <= 0 {
+				return .Timeout
+			}
+			if wait == 0 || left < wait {
+				wait = left
+			}
 		}
 		stream_set_read_timeout(r.stream, wait)
 	}

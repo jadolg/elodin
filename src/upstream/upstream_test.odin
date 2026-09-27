@@ -2554,6 +2554,8 @@ test_a_pooled_doh_connection_takes_this_querys_deadline :: proc(t: ^testing.T) {
 		"the pooled connection held a 200ms query for %v",
 		spent,
 	)
+	// The timeout is the deadline spent, so nothing is left to redial with.
+	testing.expectf(t, sync.atomic_load(&m.conns) == 1, "a timed-out pooled query dialled again: %d connections", sync.atomic_load(&m.conns))
 	free_all(context.temp_allocator)
 }
 
@@ -3276,6 +3278,8 @@ Tls_Silent_Mock :: struct {
 // Completes the handshake, reads once, and says nothing for `hold`.
 @(private = "file")
 tls_silent_once :: proc(m: ^Tls_Silent_Mock) {
+	// So a test that returns before dialling ends the accept, not the suite.
+	_ = net.set_option(m.listener, .Receive_Timeout, 3 * time.Second)
 	client, _, err := net.accept_tcp(m.listener)
 	if err != nil {
 		return
@@ -3425,5 +3429,30 @@ test_a_peer_that_stops_reading_is_bounded_by_the_deadline :: proc(t: ^testing.T)
 	spent := time.tick_since(start)
 	testing.expectf(t, err == .Timeout, "a peer that stopped reading reported %v after %v", err, spent)
 	testing.expectf(t, spent < 1500 * time.Millisecond, "a 500ms deadline held the write for %v", spent)
+	free_all(context.temp_allocator)
+}
+
+// A read bound on its own, with no deadline over it, still bounds each read.
+@(test)
+test_an_idle_bound_holds_without_a_deadline :: proc(t: ^testing.T) {
+	m, server, port, ok := start_trickle(t, "HTTP/1.1 200 OK\r\n", "X: y\r\n", count = 1, interval = time.Second)
+	if !ok {
+		return
+	}
+	defer stop_trickle(m, server)
+	socket, derr := dial_tcp_timeout(net.Endpoint{address = net.IP4_Loopback, port = port}, time.Second)
+	if !testing.expectf(t, derr == .None, "cannot dial the mock: %v", derr) {
+		return
+	}
+	stream := Stream {
+		socket = socket,
+	}
+	defer stream_close(&stream)
+	set_socket_timeouts(socket, 3 * time.Second)
+	start := time.tick_now()
+	_, err := http_exchange(&stream, Http_Request{method = "GET", path = "/", host = "mock.invalid"}, context.temp_allocator, idle = 300 * time.Millisecond)
+	spent := time.tick_since(start)
+	testing.expectf(t, err == .Timeout, "a silent peer under a 300ms idle bound reported %v", err)
+	testing.expectf(t, spent < 900 * time.Millisecond, "a 300ms idle bound held for %v", spent)
 	free_all(context.temp_allocator)
 }
