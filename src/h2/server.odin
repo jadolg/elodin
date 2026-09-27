@@ -94,6 +94,9 @@ max_pending, and their bytes by MAX_CONN_REQUEST.
 MAX_HELD_STREAMS :: 2 * MAX_CONCURRENT
 // See Conn.closed_stream_rst_budget.
 MAX_CLOSED_STREAM_RST :: 16
+// See Conn.reset_ids: more than a second of the resets it remembers.
+RESET_IDS :: MAX_CONCURRENT
+#assert(RESET_IDS > MAX_CONTROL_FRAMES_PER_SECOND)
 /*
 PINGs, non-ACK SETTINGS and stream errors (a malformed or refused request) a
 peer may cause per second, each of which draws a frame back. Writes here are
@@ -209,11 +212,12 @@ Conn :: struct {
 
 	Every reset remembered goes through `stream_error`, which spends
 	MAX_CONTROL_FRAMES_PER_SECOND - a budget the server never earns back - so
-	this many is more than a second of them, far longer than frames take to
-	cross. An id that does fall out only falls back to
+	RESET_IDS is more than a second of them, far longer than frames take to
+	cross. Struck off again once the peer ends or resets the stream, or its
+	trailers arrive. An id that does fall out only falls back to
 	`closed_stream_rst_budget`.
 	*/
-	reset_ids:                [MAX_CONCURRENT]u32,
+	reset_ids:                [RESET_IDS]u32,
 	reset_next:               int,
 	// Request bytes held by this connection's streams; see MAX_CONN_REQUEST.
 	request_bytes:            int,
@@ -485,6 +489,9 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 			// on, so broadcasting for one would only wake every other handler on
 			// the connection to recheck a state that has not changed for them.
 			sync.cond_broadcast(&c.cond)
+		} else if slot, reset_here := reset_slot(c, h.stream_id); reset_here {
+			// Over for the peer too, so nothing more is in flight on it.
+			c.reset_ids[slot] = 0
 		}
 		sync.mutex_unlock(&c.mu)
 		if orphaned {
@@ -1214,7 +1221,15 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	a refused HEADERS, or the rest of one over MAX_BODY (#390). See
 	Conn.reset_ids.
 	*/
-	_, reset_here := reset_slot(c, h.stream_id)
+	reset_here := false
+	if !found {
+		slot: int
+		slot, reset_here = reset_slot(c, h.stream_id)
+		// The peer has ended it, so nothing more is in flight; see handle_headers.
+		if reset_here && h.flags & FLAG_END_STREAM != 0 {
+			c.reset_ids[slot] = 0
+		}
+	}
 	send_closed_rst := !found && !reset_here && c.closed_stream_rst_budget > 0
 	if send_closed_rst {
 		c.closed_stream_rst_budget -= 1

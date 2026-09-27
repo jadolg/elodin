@@ -900,6 +900,45 @@ test_headers_after_drawing_stream_closed_is_a_connection_error :: proc(t: ^testi
 }
 
 /*
+A remembered id takes a block only while the peer may still be sending on it.
+Once it ends the stream with END_STREAM, or resets it, nothing more can be in
+flight, and a block after that is a connection error like any other.
+*/
+@(test)
+test_a_reset_id_the_peer_then_ends_takes_no_header_block :: proc(t: ^testing.T) {
+	for end_with_rst in ([]bool{false, true}) {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		allocator := mem.tracking_allocator(&track)
+
+		log := Frame_Log {
+			frames = make([dynamic]Frame_Header, 0, 8, allocator),
+		}
+		c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+
+		block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+		c.request_bytes = MAX_CONN_REQUEST
+		handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+		c.request_bytes = 0
+		if end_with_rst {
+			rst := []u8{0, 0, 0, 8} // CANCEL
+			handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst)
+		} else {
+			body := []u8{'x'}
+			handle_data(c, Frame_Header{length = len(body), type = .Data, flags = FLAG_END_STREAM, stream_id = 1}, body)
+		}
+		ok := handle_headers(c, Frame_Header{length = 1, type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, []u8{0x82})
+		testing.expectf(t, !ok, "end_with_rst=%v: a header block after the peer ended the stream was accepted", end_with_rst)
+
+		delete(log.frames)
+		conn_unref(c)
+		free_all(context.temp_allocator)
+		expect_no_leaks(t, &track, "reset id the peer then ends")
+		mem.tracking_allocator_destroy(&track)
+	}
+}
+
+/*
 Only a stream this end reset and forgot takes a block quietly. One still in the
 table - here reset for DATA after END_STREAM, while its handler holds it - was
 already ended by the peer, so nothing on it can be in flight; and a placeholder
@@ -949,7 +988,7 @@ test_a_reset_id_pushed_out_of_the_ring_falls_back_to_the_budget :: proc(t: ^test
 		handle_data(c, Frame_Header{length = len(big), type = .Data, stream_id = id}, big)
 	}
 	// Streams 1 and 3 first, then enough after them to push out 1 but not 3.
-	for i in 0 ..< MAX_CONCURRENT + 1 {
+	for i in 0 ..< RESET_IDS + 1 {
 		open_and_overflow(c, u32(2 * i + 1), block, big)
 		c.control = {}
 	}
