@@ -2332,7 +2332,7 @@ resolve_query :: proc(
 	if referral {
 		if target, aliased := dns.peek_alias_target(resp); aliased {
 			back := route_group(s, target, q.type)
-			if back == nil || !slice.contains(back.servers, winner) {
+			if !slice.contains(back.servers, winner) {
 				logx.debugf(
 					"query %s %s from %s: upstream %s referred past a CNAME to %s, which is asked elsewhere; handing it on",
 					dns.type_name(q.type),
