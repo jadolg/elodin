@@ -416,8 +416,7 @@ the groups the question can ask - its route, and the default group the chain
 walk asks - so a fast LAN route does not starve the chain walk behind it, and a
 slow route does not stretch the deadline of questions it never sees. A query
 waiting on an identical one already in flight spends the same deadline on that
-wait. A dead first
-server still hands over to the second inside the query, which is asked with its
+wait. A dead first server still hands over to the second inside the query, which is asked with its
 full `timeout`; a third is left for the next query, by which time the dead ones
 are on their way to the cooldown below. A reply that did arrive but says
 SERVFAIL or REFUSED sends the query on to the rest of the group, inside the

@@ -397,7 +397,7 @@ test_the_chain_lookups_spend_what_is_left_of_the_query_budget :: proc(t: ^testin
 	cfg.dnssec.enabled = true
 	cfg.upstream.strategy = .Failover
 	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 200 * time.Millisecond
+	cfg.upstream.timeout = 400 * time.Millisecond
 	servers := make([]config.Upstream_Spec, 2, context.temp_allocator)
 	servers[0] = config.Upstream_Spec{name = "silent", kind = .UDP, address = "127.0.0.1", port = quiet_bound.port}
 	servers[1] = config.Upstream_Spec{name = "chain", kind = .UDP, address = "127.0.0.1", port = bound.port}

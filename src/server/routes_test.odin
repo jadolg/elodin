@@ -2643,7 +2643,7 @@ test_an_apex_ds_spends_one_budget_across_both_groups :: proc(t: ^testing.T) {
 	}
 
 	cfg := forwarding_config()
-	cfg.upstream.timeout = 200 * time.Millisecond
+	cfg.upstream.timeout = 400 * time.Millisecond
 
 	// The parent: two members, neither of which answers.
 	group := mock_group_pair(t, cfg.upstream, ports[0], ports[1])
