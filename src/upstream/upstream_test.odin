@@ -3300,8 +3300,8 @@ tls_silent_once :: proc(m: ^Tls_Silent_Mock) {
 }
 
 /*
-The deadline reads as a timeout over TLS as well. `tlsx` rounds what is left
-down to whole milliseconds for `poll`, so its read gives up a fraction early; a
+The deadline reads as a timeout over TLS as well. `tlsx` rounded what is left
+down to whole milliseconds for `poll`, so its read gave up a fraction early; a
 clock read after the fact found the deadline not yet passed and reported the
 peer as broken rather than slow (#445 review).
 */

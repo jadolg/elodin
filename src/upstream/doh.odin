@@ -244,10 +244,10 @@ exchange_doh_h1 :: proc(
 		fresh one failing any other way has said what it has to say.
 		*/
 		/*
-		A timeout is the deadline spent - `reader_fill` holds every read to it -
-		so it is not retried: `tlsx` rounds the wait down to whole milliseconds
-		and gives up a fraction early, and the second attempt then dialled the
-		upstream with a sliver it could not use (#445).
+		A timeout is the deadline spent - `http_exchange` holds every read and
+		write to it - so it is not retried. Said here rather than left to the
+		`remaining <= 0` check above, which a socket timeout firing a hair early
+		would slip past, dialling the upstream with a sliver it cannot use.
 		*/
 		if attempt == 1 || last == .Timeout || (!reused && last != .Peer_Closed) {
 			return nil, last
@@ -287,6 +287,11 @@ fetch_url :: proc(
 	have_origin := false
 
 	for _ in 0 ..< 5 {
+		// Before the lookup, so a spent budget does not start one. The lookup
+		// itself is bounded by the bootstrap resolver's own timeout.
+		if time.tick_diff(time.tick_now(), deadline) <= 0 {
+			return nil, .Timeout
+		}
 		scheme, host, path, port, host_only, purl_ok := split_http_url(current)
 		if !purl_ok {
 			return nil, .HTTP_Error
