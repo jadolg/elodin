@@ -459,7 +459,7 @@ Rate_Limiter :: struct {
 	against its own quiet 20.4 ms, under a flood taking this lock 27,499 times a
 	second. That is one rate on four cores and not a bound on what a much larger
 	accept rate would do; the answer to a much larger accept rate is the packet
-	filter the README asks for.
+	filter docs/public-resolver.md asks for.
 	*/
 	lock:      sync.Mutex,
 	allocator: mem.Allocator,
@@ -827,7 +827,7 @@ ask again over TCP, and the client is already there, so a client that acted on i
 would ask again on the connection it is holding - the same query, charged again -
 and one that did not would give up. Nor is there an address to protect: the
 handshake established where the client is, so the small answer would not be
-standing in for a large one aimed at somebody else. `slipped=` in the stats line
+standing in for a large one aimed at somebody else. `truncated=` in the stats line
 counts truncated answers that went out, and there are none from here.
 
 What the caller does with a `false` is stop serving: see `serve_dns_stream` for

@@ -36,7 +36,7 @@ RHEL crypto policy (`rh-allow-sha1-signatures = no`):
 | kisa.or.kr | 7 |
 
 So they come back served but unauthenticated rather than refused, which is the
-safe direction and is what the DNSSEC section of the README describes. It is
+safe direction and is what docs/dnssec.md describes. It is
 still a silent downgrade, and it is a fact about the machine rather than about
 the zone: the same names carry AD on a host whose OpenSSL will do SHA-1.
 

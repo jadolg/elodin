@@ -155,8 +155,8 @@ address it came from, so every one of these connections is a real client at a re
 address — which is why an in-server budget can bound it at all. It is also why the
 bound is per prefix and therefore multipliable: an actor with addresses in n
 prefixes has n of the figure, and on IPv6 a routine /48 is 65,536 /64s. Same
-granularity and same limitation as the response budget, and the reason the README
-tells a publicly reachable instance to put a per-source connection rate limit in
+granularity and same limitation as the response budget, and the reason the docs
+tell a publicly reachable instance to put a per-source connection rate limit in
 front of the resolver as well.
 
 **The baselines have run-to-run spread and the arms are read against the ones

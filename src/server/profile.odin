@@ -438,7 +438,7 @@ decides which hosts may be asked about, the port rule and the two normalisations
 decide how many ways each may be spelled, and the budget decides how fast. On an
 ordinary certificate those leave a working set of a handful, which fits here many
 times over. On a wildcard or address SAN they do not, and a sustained flood can
-push a device's entry out and refuse the re-signing; see the README, which says
+push a device's entry out and refuse the re-signing; see docs/doh.md, which says
 so.
 */
 @(private)

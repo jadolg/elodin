@@ -158,7 +158,7 @@ start_validator :: proc(s: ^Server) -> bool {
 	walks, which the setting's own documentation covers and an operator setting
 	it has already chosen; one above it buys memory on a machine this server
 	cannot see the size of, and `MAX_CACHED_ZONE_BYTES` is not a figure anybody
-	is going to work out from the README while editing a config file.
+	is going to work out from docs/dnssec.md while editing a config file.
 
 	Said rather than refused or held down, which is this file's rule for a
 	configured number everywhere else - see the two warnings above. There is no

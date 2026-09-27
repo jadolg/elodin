@@ -102,6 +102,7 @@ grep -q '^ExecStart=/usr/bin/elodin ' "$unit" || {
 
 install -Dm644 "$repo_root/examples/elodin.yaml" "$stage/etc/elodin/elodin.yaml"
 install -Dm644 "$repo_root/README.md" "$stage/usr/share/doc/elodin/README.md"
+install -Dm644 -t "$stage/usr/share/doc/elodin/docs" "$repo_root"/docs/*.md
 
 # `copyright` is the name dpkg, apt and every archive tool expect for the
 # licence, and the file Debian will not ship a package without. It is the

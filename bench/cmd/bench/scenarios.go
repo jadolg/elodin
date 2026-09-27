@@ -215,7 +215,7 @@ func (h *harness) runAll(filter string) (string, error) {
 	return sb.String(), nil
 }
 
-// workloads is the README's first Capacity table: what the server costs when
+// workloads is the first table of a run: what the server costs when
 // the answer comes from the cache, from a rule, and from the upstream.
 func (h *harness) workloads() (section, error) {
 	var sb strings.Builder
@@ -275,7 +275,7 @@ func (h *harness) workloads() (section, error) {
 	return section{title: "Workloads", body: sb.String()}, nil
 }
 
-// transports is the README's second table: every listener, each client holding
+// transports is the second table of a run: every listener, each client holding
 // its own connection, answering from the cache.
 func (h *harness) transports() (section, error) {
 	s, err := h.start(serverOpts{name: "transports", cache: true})
@@ -532,7 +532,7 @@ func (h *harness) shedding() (section, error) {
 	return section{title: "Past capacity", body: sb.String()}, nil
 }
 
-// loggingCost is the throughput `log.queries` costs, which the README warns
+// loggingCost is the throughput `log.queries` costs, which docs/sizing.md warns
 // about because it is also the one thing that writes to disk in steady state.
 func (h *harness) loggingCost() (section, error) {
 	var sb strings.Builder

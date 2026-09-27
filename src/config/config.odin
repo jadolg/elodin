@@ -784,7 +784,7 @@ prefix so the two agree about who a client is.
 Nor is any of it a defence against a botnet. Every budget here is per prefix, so an
 actor with addresses in n of them has n of every figure, and on IPv6 a routine /48
 is 65,536 /64s. A publicly reachable instance wants a per-source connection rate
-limit in front of it as well - see the README.
+limit in front of it as well - see docs/public-resolver.md.
 
 What the datagram figure is denominated in is `response_size_estimate`, which is
 the other half of what it means: the count bounds sendings, and an answer larger
@@ -961,7 +961,7 @@ split horizon: it is one line to enable, the failure it prevents is silent and
 the refusal it produces is loud - a `warn` naming the address and both settings
 that would allow it, a `rebind=` counter, a query-log line - and `allow_domains`
 exists so that even an operator who does run split horizon can turn it on and
-name the zones that are allowed to answer privately. The README recommends
+name the zones that are allowed to answer privately. docs/rebinding.md recommends
 enabling it, in exactly those terms.
 */
 Rebind_Config :: struct {

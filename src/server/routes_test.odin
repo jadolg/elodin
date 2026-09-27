@@ -654,8 +654,8 @@ Bogus, which is SERVFAIL for every name in the zone: the failure RFC 8375
 section 4 item 4.B carves the apex `DS` out of the MUST NOT to prevent, and the
 one `special_use_zone` and `validator_query` already carve out here.
 
-`home.arpa.` with `special_use.home_arpa` off is the exact configuration the
-README recommends for that deployment - the key on refuses a route for the zone
+`home.arpa.` with `special_use.home_arpa` off is the exact configuration
+docs/examples.md recommends for that deployment - the key on refuses a route for the zone
 at load - so it is the fixture, rather than the `corp.example.` the other cases
 use.
 

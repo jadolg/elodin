@@ -258,7 +258,7 @@ fires.
 `special_use_zone` runs in `resolve_query` before anything is forwarded, so with
 `special_use.home_arpa` on the names are answered from the table and the route
 below them is never consulted. The operator upgrading from the key to a route -
-which is exactly what the README sends them to do once their router does answer
+which is exactly what docs/reserved-names.md sends them to do once their router does answer
 the zone - would otherwise keep the key's NXDOMAIN and never see the router.
 
 The control is the same file with the key left at its default, where the route

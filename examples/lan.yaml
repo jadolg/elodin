@@ -77,8 +77,9 @@ server:
     # from the same 1,000 answers a second; a household asking a few dozen a
     # second never comes close, and an office floor with a hundred busy
     # machines might touch it at a peak. Work it out as devices times their
-    # peak rate, and remember the figure is charged twice over - once for
-    # datagrams and once for queries arriving on connections.
+    # peak rate, and remember the figure is granted three times over - once
+    # for datagrams, once for queries arriving on connections, and once for
+    # connections opened.
     #
     # What it still protects, on a network that trusts its clients: this box
     # answers UDP, and a UDP source address is written by whoever sent the

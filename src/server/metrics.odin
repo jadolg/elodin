@@ -56,7 +56,7 @@ procedure that returns it - `connection_limits_line`, `udp_readers_line`,
 a test can hold it, and so two wordings of one fact cannot drift apart. This line
 was the exception, and it is the one that drifted. `cache_withheld` was added to
 the endpoint and not to the line, which the comment beside it in `main` still
-records; `accept_backoff` was added to the struct, the endpoint, the README and
+records; `accept_backoff` was added to the struct, the endpoint, the docs and
 every hint that points an operator at this line, and not to the line.
 
 So it is here, beside `render` - which the endpoint's own guard test already
@@ -473,7 +473,7 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 	Not labelled per prefix, though the budget is kept per prefix. What a series
 	per /24 costs is cardinality an attacker chooses, on the one endpoint whose
 	whole design is that nothing reaching it decides how much work it is - see
-	the note on the metrics listener in the README. A rate on these two says the
+	the note on the metrics listener in docs/metrics.md. A rate on these two says the
 	same thing about whether it is happening, and the `debug` log says who.
 	*/
 	metrics.scalar(

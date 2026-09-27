@@ -1,5 +1,5 @@
-// Command bench runs the whole measurement matrix behind the README's Capacity
-// and Resource use sections and prints it as markdown.
+// Command bench runs the whole measurement matrix behind the figures in docs/
+// and bench/results/ and prints it as markdown.
 //
 // It owns everything the numbers depend on: it starts its own mock upstream at
 // a fixed delay, writes each configuration itself, starts the release binary,
