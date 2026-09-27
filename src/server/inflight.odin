@@ -140,14 +140,17 @@ follower_ceiling :: proc(s: ^Server) -> int {
 
 /*
 How long a follower waits before it forwards on its own: what is left of its
-own upstream deadline, and one timeout more (issue #446).
+own upstream deadline, and one `span` more (issue #446).
 
 The deadline is armed before the join, and the leader's before this one's, so
 the leader has spent its upstream wait by then - all but the one exchange it may
-still finish, which is the timeout on top: the longest of the question's groups,
-half its `span`, since the leader's last exchange may be a chain lookup on the
-default group rather than the route. A leader past that is validating a long
-chain or stuck, and the follower gains nothing by waiting on: its own forward,
+still finish, which is the `span` on top. That exchange may be a UDP reply that
+came back truncated and was asked again over TCP, a timeout each (issue #376),
+on the longest-timed of the question's groups, since the leader's last exchange
+may be a chain lookup on the default group rather than the route - two of that
+group's timeouts, which is what `span` is (`question_span`,
+`upstream.query_budget`). A leader past that is validating a long chain or
+stuck, and the follower gains nothing by waiting on: its own forward,
 once patience runs out, finds the deadline spent and asks nobody. The old
 figure - every server for every attempt, twice for a truncated reply, plus the
 sweep - was sized for a forward nothing bounded, and held a worker ten timeouts
@@ -155,7 +158,7 @@ for a group of two.
 */
 @(private)
 flight_patience :: proc(deadline: time.Tick, span: time.Duration) -> time.Duration {
-	return max(time.tick_diff(time.tick_now(), deadline), 0) + span / 2
+	return max(time.tick_diff(time.tick_now(), deadline), 0) + span
 }
 
 /*

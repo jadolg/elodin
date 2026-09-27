@@ -700,7 +700,7 @@ test_followers_of_a_cloaked_leader_are_blocked_from_its_verdict :: proc(t: ^test
 
 /*
 A follower waits on its leader for what is left of its own deadline and one
-timeout more, not for as long as the unbounded forward once took (issue #446).
+exchange more, not for as long as the unbounded forward once took (issue #446).
 
 Since #439 the deadline is armed before the join, so a leader still out past
 it and the one exchange it may finish is stuck on something other than its
@@ -767,9 +767,9 @@ test_a_follower_waits_no_longer_than_its_deadline_allows :: proc(t: ^testing.T) 
 	decoded, derr := dns.decode_message(out, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
 	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.Serv_Fail)
-	// Its two timeouts of deadline and one for the leader's crossing exchange,
+	// Its two timeouts of deadline and two for the leader's crossing exchange,
 	// with slack; the old patience waited ten.
-	testing.expectf(t, took < 5 * TIMEOUT, "the follower waited %v on a leader, where its deadline is %v", took, 2 * TIMEOUT)
+	testing.expectf(t, took < 6 * TIMEOUT, "the follower waited %v on a leader, where its deadline is %v", took, 2 * TIMEOUT)
 	// And it forwarded on nothing: the deadline was spent on the wait.
 	for socket in sockets {
 		testing.expect(t, mock_untouched(socket), "the follower asked an upstream after its deadline")
@@ -797,13 +797,14 @@ land_late :: proc(l: ^Late_Leader) {
 }
 
 /*
-And not shorter than that: a leader landing inside the one timeout past the
-deadline - the exchange that crossed the line, finishing - still serves its
-follower, which otherwise gives up at its deadline and has nobody left to ask.
+And not shorter than that: a leader landing inside the two timeouts past the
+deadline - the exchange that crossed the line, retried over TCP, finishing -
+still serves its follower, which otherwise gives up at its deadline and has
+nobody left to ask.
 */
 @(test)
 test_a_follower_still_takes_an_answer_landing_just_past_its_deadline :: proc(t: ^testing.T) {
-	TIMEOUT :: 200 * time.Millisecond
+	TIMEOUT :: 400 * time.Millisecond
 	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
 	if !testing.expectf(t, serr == nil, "cannot bind the mock: %v", serr) {
 		return
@@ -848,9 +849,10 @@ test_a_follower_still_takes_an_answer_landing_just_past_its_deadline :: proc(t: 
 	if joined, _ := flight_join(&srv, key, &leader); !testing.expect(t, joined == &leader, "the leader did not get the flight") {
 		return
 	}
-	// Half a timeout past the follower's deadline of two, give or take the
-	// moment between this and its join.
-	late := Late_Leader{srv = &srv, flight = &leader, answer = answer, at = time.tick_add(time.tick_now(), 5 * TIMEOUT / 2)}
+	// A timeout and a half past the follower's deadline of two - a UDP reply
+	// that crossed the line truncated and was asked again over TCP - give or
+	// take the moment between this and its join.
+	late := Late_Leader{srv = &srv, flight = &leader, answer = answer, at = time.tick_add(time.tick_now(), 7 * TIMEOUT / 2)}
 	lander := thread.create_and_start_with_poly_data(&late, land_late)
 
 	query_msg := dns.Message{id = 0x4462, question = questions}
