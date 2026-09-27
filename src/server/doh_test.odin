@@ -435,7 +435,14 @@ test_doh_answers_a_request_that_arrives_split :: proc(t: ^testing.T) {
 		return
 	}
 	time.sleep(200 * time.Millisecond)
-	if !send_all(t, client, "rved HTTP/1.1\r\nHost: dns.example\r\n\r\n") {
+	// And cut again between a CR and its LF: `http_line` refuses a bare CR, and
+	// a CR that is only the last byte read so far is not one (#432).
+	if !send_all(t, client, "rved HTTP/1.1\r\nHost: dns.example\r") {
+		net.shutdown(client, .Send)
+		return
+	}
+	time.sleep(200 * time.Millisecond)
+	if !send_all(t, client, "\n\r\n") {
 		net.shutdown(client, .Send)
 		return
 	}

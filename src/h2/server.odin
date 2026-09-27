@@ -939,7 +939,8 @@ is_token :: proc(s: string) -> bool {
 		}
 		return false
 	}
-	return true
+	// 1*tchar: nothing at all is not a token.
+	return len(s) > 0
 }
 
 /*
