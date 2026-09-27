@@ -492,7 +492,8 @@ resolve_insisting :: proc(
 				"upstream %s answered rcode %d%s, swept past it to %s",
 				winner.spec.name,
 				u16(dns.peek_rcode(response)),
-				" (a referral)" if dns.peek_referral(response) else "",
+				// Gated: arguments are evaluated whether or not the line is written.
+				" (a referral)" if logx.enabled(.Debug) && dns.peek_referral(response) else "",
 				u.spec.name,
 			)
 			// The first reply is superseded. It came from the caller's

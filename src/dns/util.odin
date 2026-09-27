@@ -423,8 +423,12 @@ not a NOERROR here. A message that cannot be walked is not a referral: what a
 decode would refuse is refused where it is decoded.
 
 The walk allocates nothing. Only a reply already of the partial shape - every
-answer record an alias, NS and no SOA in authority - is decoded, into scratch,
-to follow the chain.
+answer record an alias, NS and no SOA in authority - has its question, answer
+and NS owners decoded, into scratch, to follow the chain. And only one no larger
+than `MAX_ALIAS_REFERRAL_RECORDS` in either section: every judgement of a reply
+reads this, several times per reply and once per chain-walk step, and none of
+those readings is charged to the request's decode budget (issue #354). A reply
+past it is left as the answer it claims to be, which it was before issue #451.
 */
 peek_referral :: proc(msg: []u8) -> bool {
 	if len(msg) < HEADER_SIZE {
@@ -434,6 +438,9 @@ peek_referral :: proc(msg: []u8) -> bool {
 	ancount := int(u16(msg[6]) << 8 | u16(msg[7]))
 	nscount := int(u16(msg[8]) << 8 | u16(msg[9]))
 	if nscount == 0 || (ancount == 0 && msg[2] & 0x04 != 0) {
+		return false
+	}
+	if ancount > MAX_ALIAS_REFERRAL_RECORDS || (ancount > 0 && nscount > MAX_ALIAS_REFERRAL_RECORDS) {
 		return false
 	}
 
@@ -470,6 +477,7 @@ peek_referral :: proc(msg: []u8) -> bool {
 		return false
 	}
 	ns := false
+	authority_at := pos
 	for _ in 0 ..< nscount {
 		next, ok := skip_name(msg, pos)
 		if !ok || next + 10 > len(msg) {
@@ -489,15 +497,28 @@ peek_referral :: proc(msg: []u8) -> bool {
 	if !ns || ancount == 0 {
 		return ns
 	}
-	return referred_past_alias(msg)
+	return referred_past_alias(msg, authority_at, nscount)
 }
 
-// The CNAME half of `peek_referral`: whether the authority's NS are for the
-// chain's target rather than for the name asked.
+// The most answer or authority records `peek_referral` follows a chain through:
+// a chain as long as the validator follows (`dnssec.MAX_CNAME_CHAIN`), each link
+// beside its RRSIG. It bounds both the decode and the walk, which is quadratic
+// in the answer.
 @(private)
-referred_past_alias :: proc(msg: []u8) -> bool {
-	decoded, err := decode_message(msg, context.temp_allocator)
+MAX_ALIAS_REFERRAL_RECORDS :: 32
+
+// The CNAME half of `peek_referral`: whether the authority's NS are for the
+// chain's target rather than for the name asked. `authority_at` is where the
+// authority section starts, which `peek_referral` has already walked.
+@(private)
+referred_past_alias :: proc(msg: []u8, authority_at, nscount: int) -> bool {
+	decoded, err := decode_through_answer(msg, context.temp_allocator)
 	if err != .None || len(decoded.question) != 1 {
+		return false
+	}
+	// A CNAME asked for is the data, not a step towards it.
+	#partial switch decoded.question[0].type {
+	case .CNAME, .DNAME, .RRSIG:
 		return false
 	}
 	asked := decoded.question[0].name
@@ -520,10 +541,16 @@ referred_past_alias :: proc(msg: []u8) -> bool {
 	if name_equal_fold(target, asked) {
 		return false
 	}
-	for rec in decoded.authority {
-		if rec.type == .NS && name_at_or_below(target, rec.name) && !name_at_or_below(asked, rec.name) {
-			return true
+	pos := authority_at
+	for _ in 0 ..< nscount {
+		next, _ := skip_name(msg, pos)
+		if Type(u16(msg[next]) << 8 | u16(msg[next + 1])) == .NS {
+			zone, _, nerr := decode_name(msg, pos, context.temp_allocator)
+			if nerr == .None && name_at_or_below(target, zone) && !name_at_or_below(asked, zone) {
+				return true
+			}
 		}
+		pos = next + 10 + int(u16(msg[next + 8]) << 8 | u16(msg[next + 9]))
 	}
 	return false
 }

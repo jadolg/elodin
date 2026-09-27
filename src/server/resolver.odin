@@ -2171,7 +2171,7 @@ resolve_query :: proc(
 					"query DS %s: the parent's group answered %s%s rather than proving the delegation carries no DS, so the route is asked instead",
 					q.name,
 					rcode_text(dns.peek_rcode(resp)),
-					" (a referral)" if dns.peek_referral(resp) else "",
+					" (a referral)" if logx.enabled(.Debug) && dns.peek_referral(resp) else "",
 				)
 			} else {
 				logx.debugf(
@@ -2338,12 +2338,12 @@ resolve_query :: proc(
 		The condition `cache.serve_stale` was always documented by: the refresh
 		was attempted, and there is nothing to answer with but what expired.
 
-		Only a failure to get an answer at all counts. An upstream that answered
-		SERVFAIL answered, and a response this server refused to hand on -
-		because it did not validate - was refused deliberately; serving expired
-		data instead of either would be reaching past a verdict rather than
-		covering an outage. RFC 8767 section 5 leaves both open; neither is
-		decided here.
+		Only a failure to get an answer at all counts - a referral, above, being
+		none. An upstream that answered SERVFAIL answered, and a response this
+		server refused to hand on - because it did not validate - was refused
+		deliberately; serving expired data instead of either would be reaching
+		past a verdict rather than covering an outage. RFC 8767 section 5 leaves
+		both open; neither is decided here.
 		*/
 		if unanswered != nil {
 			/*

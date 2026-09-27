@@ -1,5 +1,6 @@
 package dns
 
+import "core:fmt"
 import "core:testing"
 
 /*
@@ -130,3 +131,61 @@ test_peek_referral_follows_a_cname_chain :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+
+/*
+The alias branch's bounds: a chain past `MAX_ALIAS_REFERRAL_RECORDS` records in
+either section is left as an answer rather than decoded, a CNAME that was asked
+for is the data, and a cut anywhere in the partial shape reads past nothing.
+*/
+@(test)
+test_peek_referral_bounds_the_alias_branch :: proc(t: ^testing.T) {
+	cname :: proc(owner, target: string) -> Record {
+		return Record{name = owner, type = .CNAME, class = .IN, ttl = 60, data = Rdata_Name{target}}
+	}
+	ns :: proc(zone: string) -> Record {
+		return Record{name = zone, type = .NS, class = .IN, ttl = 3600, data = Rdata_Name{"ns1.elsewhere."}}
+	}
+	wire :: proc(answer, authority: []Record, qtype := Type.A) -> []u8 {
+		msg := Message {
+			question  = []Question{{name = "www.corp.", type = qtype, class = .IN}},
+			answer    = answer,
+			authority = authority,
+		}
+		msg.flags.qr = true
+		out, _, err := encode_message(msg, context.temp_allocator)
+		assert(err == .None)
+		return out
+	}
+	delegation := []Record{ns("sub.corp.")}
+
+	// A chain of exactly the limit is followed; one record more is not.
+	names := make([]string, MAX_ALIAS_REFERRAL_RECORDS + 1, context.temp_allocator)
+	names[0] = "www.corp."
+	for i in 1 ..< len(names) - 1 {
+		names[i] = fmt.tprintf("l%d.corp.", i)
+	}
+	names[len(names) - 1] = "host.sub.corp."
+	links := make([]Record, len(names) - 1, context.temp_allocator)
+	for i in 0 ..< len(links) {
+		links[i] = cname(names[i], names[i + 1])
+	}
+	testing.expect(t, peek_referral(wire(links, delegation)), "a chain at the limit is a referral")
+	longer := make([]Record, len(links) + 1, context.temp_allocator)
+	copy(longer, links)
+	longer[len(links)] = cname("spare.corp.", "host.sub.corp.")
+	testing.expect(t, !peek_referral(wire(longer, delegation)), "a chain past the limit is left as an answer")
+	crowded := make([]Record, MAX_ALIAS_REFERRAL_RECORDS + 1, context.temp_allocator)
+	for &r in crowded {
+		r = ns("sub.corp.")
+	}
+	to_sub := []Record{cname("www.corp.", "host.sub.corp.")}
+	testing.expect(t, peek_referral(wire(to_sub, crowded[:MAX_ALIAS_REFERRAL_RECORDS])), "an authority at the limit is read")
+	testing.expect(t, !peek_referral(wire(to_sub, crowded)), "an authority past the limit is left as an answer")
+	testing.expect(t, !peek_referral(wire(to_sub, delegation, qtype = .CNAME)), "a CNAME asked for is the answer")
+
+	full := wire(to_sub, delegation)
+	for n in 0 ..< len(full) {
+		testing.expectf(t, !peek_referral(full[:n]), "cut at %d of %d read as a referral", n, len(full))
+	}
+	free_all(context.temp_allocator)
+}
