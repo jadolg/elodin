@@ -286,12 +286,17 @@ http_exchange :: proc(
 	content_length: int
 	chunked: bool
 	headers := 0
+	// A close announced by any response of the exchange, interim ones included,
+	// holds for the connection: keeping it costs a dial at most.
+	resp.keep_alive = true
 	for {
 		status_line := reader_line(&r) or_return
 		resp.status, http_1_0 = parse_status(status_line) or_return
 		// HTTP/1.0 closes unless it says otherwise (RFC 9112 9.3), and saying so
 		// is not worth honouring for one saved dial: only 1.1 and later are pooled.
-		resp.keep_alive = !http_1_0
+		if http_1_0 {
+			resp.keep_alive = false
+		}
 		// A 101 is an answer to an upgrade this client never asks for.
 		if resp.status == 101 {
 			return resp, .HTTP_Error
@@ -361,6 +366,14 @@ http_exchange :: proc(
 		if resp.status >= 200 {
 			break
 		}
+		/*
+		A 1xx may not frame a body (RFC 9110 8.6, RFC 9112 6.1). Passed over,
+		one that did had what it framed read as the answer - a 200 of the peer's
+		choosing - with the real one left on the connection for the next query.
+		*/
+		if chunked || content_length >= 0 {
+			return resp, .HTTP_Error
+		}
 		headers += 1
 		if headers > MAX_HTTP_HEADERS {
 			return resp, .HTTP_Error
@@ -386,7 +399,8 @@ http_exchange :: proc(
 		// on a kept-alive connection waited for a close that never came (#442).
 		// A 204 may not frame a body (RFC 9110 8.6, 6.1); one that does may have
 		// sent it, and the next response would be read from inside it. A 304's
-		// Content-Length is its representation's, and nothing follows it.
+		// framing fields describe its representation, and nothing follows it.
+		// No caller pools after a non-200 today; this is for the one that does.
 		if resp.status == 204 && (chunked || content_length >= 0) {
 			resp.keep_alive = false
 		}

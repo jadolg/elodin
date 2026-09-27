@@ -2967,8 +2967,9 @@ test_http_bodyless_statuses_end_at_the_fields :: proc(t: ^testing.T) {
 		{"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n", false, 204, "", false},
 		{"HTTP/1.1 103 Early Hints\r\nLink: </a>; rel=preload\r\n\r\n" + OK, false, 200, "ok", true},
 		{"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 102 Processing\r\n\r\n" + OK, false, 200, "ok", true},
-		// An interim response's fields are its own, not the final one's.
-		{"HTTP/1.1 103 Early Hints\r\nConnection: close\r\n\r\n" + OK, false, 200, "ok", true},
+		// A close announced on an interim response still holds: keeping it costs
+		// a dial at most, and ignoring it pools a socket the server will drop.
+		{"HTTP/1.1 103 Early Hints\r\nConnection: close\r\n\r\n" + OK, false, 200, "ok", false},
 		{"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok", false, 200, "ok", false},
 		{"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\n\r\n" + OK, true, 0, "", false},
 		// Not a status at all (RFC 9110 15), so not an interim one to pass over.
@@ -2976,6 +2977,11 @@ test_http_bodyless_statuses_end_at_the_fields :: proc(t: ^testing.T) {
 		{"HTTP/1.1 000 Zero\r\n\r\n" + OK, true, 0, "", false},
 		{"HTTP/1.1 600 Past\r\nContent-Length: 2\r\n\r\nok", true, 0, "", false},
 		{"HTTP/1.1 103 Early Hints\r\n folded\r\n\r\n" + OK, true, 0, "", false},
+		// A 1xx carries no framing fields (RFC 9110 8.6, RFC 9112 6.1). Passed
+		// over, what one framed was read as the answer - here a 200 of the
+		// peer's choosing - and the real one left for the next query to find.
+		{"HTTP/1.1 103 Early Hints\r\nContent-Length: 42\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nfake" + OK, true, 0, "", false},
+		{"HTTP/1.1 100 Continue\r\nTransfer-Encoding: chunked\r\n\r\n" + OK, true, 0, "", false},
 		{"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1x 200 OK\r\n\r\n", true, 0, "", false},
 	}
 	for c in CASES {
@@ -3012,6 +3018,7 @@ test_http_bodyless_statuses_end_at_the_fields :: proc(t: ^testing.T) {
 			testing.expectf(t, err == .None, "a 103 with a Location failed: %v", err)
 			testing.expectf(t, resp.location == "", "the 103's Location reached the answer: %q", resp.location)
 			delete(resp.body, mem.tracking_allocator(&track))
+			expect_caller_holds_nothing(t, &track, "interim Location")
 		}
 		free_all(context.temp_allocator)
 	}
@@ -3040,6 +3047,7 @@ test_http_bodyless_statuses_end_at_the_fields :: proc(t: ^testing.T) {
 		if ok {
 			testing.expectf(t, err == .HTTP_Error, "a 103 and a 200 over the shared budget got %v, status %d", err, resp.status)
 			delete(resp.body, mem.tracking_allocator(&track))
+			expect_caller_holds_nothing(t, &track, "shared budget")
 		}
 		free_all(context.temp_allocator)
 	}
@@ -3057,6 +3065,7 @@ test_http_bodyless_statuses_end_at_the_fields :: proc(t: ^testing.T) {
 	if ok {
 		testing.expectf(t, err == .HTTP_Error, "%d interim responses got %v, status %d", MAX_HTTP_HEADERS + 1, err, resp.status)
 		delete(resp.body, mem.tracking_allocator(&track))
+		expect_caller_holds_nothing(t, &track, "endless interims")
 	}
 	free_all(context.temp_allocator)
 }
