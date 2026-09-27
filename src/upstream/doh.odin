@@ -336,9 +336,7 @@ fetch_url :: proc(
 		if remaining <= 0 {
 			return nil, .Timeout
 		}
-		// Floored as `stream_set_read_timeout` is: a sliver left rounds to a
-		// zero timeval, which the socket reads as no timeout at all.
-		stream := open_stream(endpoint, tls_ctx, host_only, max(min(timeout, remaining), time.Millisecond)) or_return
+		stream := open_stream(endpoint, tls_ctx, host_only, min(timeout, remaining)) or_return
 		defer stream_close(&stream)
 
 		resp, herr := http_exchange(

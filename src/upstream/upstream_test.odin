@@ -3127,6 +3127,8 @@ start_trickle :: proc(
 		testing.expectf(t, false, "cannot read the mock's port: %v", berr)
 		return
 	}
+	// So a test that returns before dialling ends the accept, not the suite.
+	_ = net.set_option(listener, .Receive_Timeout, 3 * time.Second)
 	m = new(Trickle_Mock)
 	m^ = Trickle_Mock {
 		listener = listener,
@@ -3268,9 +3270,10 @@ test_an_unframed_body_cut_short_is_not_a_body :: proc(t: ^testing.T) {
 Tls_Silent_Mock :: struct {
 	listener: net.TCP_Socket,
 	ctx:      ^tlsx.Context,
+	hold:     time.Duration,
 }
 
-// Completes the handshake, reads the request, and says nothing for a second.
+// Completes the handshake, reads once, and says nothing for `hold`.
 @(private = "file")
 tls_silent_once :: proc(m: ^Tls_Silent_Mock) {
 	client, _, err := net.accept_tcp(m.listener)
@@ -3286,7 +3289,7 @@ tls_silent_once :: proc(m: ^Tls_Silent_Mock) {
 	}
 	buf: [4096]u8
 	_, _ = tlsx.read(conn, buf[:])
-	time.sleep(time.Second)
+	time.sleep(m.hold)
 	tlsx.close(conn)
 }
 
@@ -3331,6 +3334,7 @@ test_a_silent_tls_peer_is_a_timeout :: proc(t: ^testing.T) {
 	m := Tls_Silent_Mock {
 		listener = listener,
 		ctx      = sctx,
+		hold     = time.Second,
 	}
 	server := thread.create_and_start_with_poly_data(&m, tls_silent_once)
 	defer {
@@ -3353,5 +3357,73 @@ test_a_silent_tls_peer_is_a_timeout :: proc(t: ^testing.T) {
 	spent := time.tick_since(start)
 	testing.expectf(t, err == .Timeout, "a silent TLS peer reported %v after %v", err, spent)
 	testing.expectf(t, spent < 900 * time.Millisecond, "a 300ms deadline held for %v", spent)
+	free_all(context.temp_allocator)
+}
+
+/*
+The request's writes are held to the deadline too. The write timeout was what
+`open_stream` put on the connection, per call, so a peer that stopped reading
+held a large request body for that long whatever the deadline said.
+*/
+@(test)
+test_a_peer_that_stops_reading_is_bounded_by_the_deadline :: proc(t: ^testing.T) {
+	posix.sigignore(.SIGPIPE)
+	sync.once_do(&dot_cert_once, generate_dot_certs)
+	if !dot_cert_ok {
+		testing.expect(t, false, "no certificate available and openssl could not make one")
+		return
+	}
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
+		return
+	}
+	sctx, serr := tlsx.server_context(dot_cert_path, dot_key_path)
+	if serr != .None {
+		testing.expectf(t, false, "server_context: %v", serr)
+		return
+	}
+	defer tlsx.context_destroy(sctx)
+	cctx, cerr := tlsx.client_context(false, "", []string{"http/1.1"})
+	if cerr != .None {
+		testing.expectf(t, false, "client_context: %v", cerr)
+		return
+	}
+	defer tlsx.context_destroy(cctx)
+
+	m := Tls_Silent_Mock {
+		listener = listener,
+		ctx      = sctx,
+		hold     = 4 * time.Second,
+	}
+	server := thread.create_and_start_with_poly_data(&m, tls_silent_once)
+	defer {
+		thread.join(server)
+		thread.destroy(server)
+	}
+
+	stream, oerr := open_stream(bound, cctx, "doh.invalid", 3 * time.Second)
+	if !testing.expectf(t, oerr == .None, "cannot open the stream: %v", oerr) {
+		return
+	}
+	defer stream_close(&stream)
+	body := make([]u8, 16 * 1024 * 1024)
+	defer delete(body)
+	start := time.tick_now()
+	_, err := http_exchange(
+		&stream,
+		Http_Request{method = "POST", path = "/", host = "doh.invalid", body = body},
+		context.temp_allocator,
+		deadline = time.tick_add(time.tick_now(), 500 * time.Millisecond),
+	)
+	spent := time.tick_since(start)
+	testing.expectf(t, err == .Timeout, "a peer that stopped reading reported %v after %v", err, spent)
+	testing.expectf(t, spent < 1500 * time.Millisecond, "a 500ms deadline held the write for %v", spent)
 	free_all(context.temp_allocator)
 }

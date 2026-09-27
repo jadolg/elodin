@@ -50,10 +50,35 @@ stream_read :: proc(s: ^Stream, buf: []u8) -> (n: int, err: Error) {
 	return got, .None
 }
 
-stream_write :: proc(s: ^Stream, buf: []u8) -> Error {
+/*
+`deadline`, when set, bounds the write: on TLS the whole call waits for what is
+left of it, as `tlsx.write` holds a call to one timeout. On a plain socket it is
+the timeout on each `send` - core:net retries a short one with a fresh wait - so
+it bounds only a write that fits the socket buffer, which is what the plain-HTTP
+caller sends: a list download's GET. DoH is HTTPS only.
+*/
+stream_write :: proc(s: ^Stream, buf: []u8, deadline := time.Tick{}) -> Error {
+	if deadline != {} {
+		wait := time.tick_diff(time.tick_now(), deadline)
+		if wait <= 0 {
+			return .Timeout
+		}
+		wait = max(wait, time.Millisecond)
+		if s.tls != nil {
+			tlsx.set_write_timeout(s.tls, wait)
+		} else {
+			_ = net.set_option(s.socket, .Send_Timeout, wait)
+		}
+	}
 	if s.tls != nil {
 		if _, err := tlsx.write(s.tls, buf); err != .None {
-			return .Peer_Closed if err == .Closed else .IO_Error
+			#partial switch err {
+			case .Closed:
+				return .Peer_Closed
+			case .Timeout:
+				return .Timeout
+			}
+			return .IO_Error
 		}
 		return .None
 	}
@@ -286,8 +311,9 @@ Perform one request/response exchange on `stream`.
 The returned body is allocated from `allocator`; everything else borrows from
 scratch memory and must be copied if it needs to outlive the call.
 
-`deadline`, when set, bounds the reading of the whole response, and `idle` any
-one read under it; see `reader_fill`. Without one, only the timeouts already on
+`deadline`, when set, bounds the request's writes and the reading of the whole
+response, and `idle` any one read under it; see `stream_write` and
+`reader_fill`. Without one, only the timeouts already on
 the stream apply, and those are per read.
 */
 http_exchange :: proc(
@@ -328,9 +354,9 @@ http_exchange :: proc(
 	}
 	strings.write_string(&b, "\r\n")
 
-	stream_write(stream, transmute([]u8)strings.to_string(b)) or_return
+	stream_write(stream, transmute([]u8)strings.to_string(b), deadline) or_return
 	if len(req.body) > 0 {
-		stream_write(stream, req.body) or_return
+		stream_write(stream, req.body, deadline) or_return
 	}
 
 	r := Buf_Reader {
