@@ -485,9 +485,10 @@ resolve_insisting :: proc(
 			// name, and `%v` renders one of those as a placeholder - the same
 			// reading `unreadable_rcode_refusal` gives its own line.
 			logx.debugf(
-				"upstream %s answered rcode %d, swept past it to %s",
+				"upstream %s answered rcode %d%s, swept past it to %s",
 				winner.spec.name,
 				u16(dns.peek_rcode(response)),
+				" (a referral)" if dns.peek_referral(response) else "",
 				u.spec.name,
 			)
 			// The first reply is superseded. It came from the caller's

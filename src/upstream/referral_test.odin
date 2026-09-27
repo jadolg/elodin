@@ -124,6 +124,7 @@ test_a_referral_is_not_taken_as_an_answer :: proc(t: ^testing.T) {
 	testing.expect(t, winner == good, "resolve_answerable took the referral as answerable")
 	delete(resp, context.allocator)
 
+	testing.expect(t, sync.atomic_load(&referrer.hits) >= 2, "the referring member was not asked first each time")
 	testing.expect(t, sync.atomic_load(&answerer.hits) > 0, "the member that recurses was never asked")
 	free_all(context.temp_allocator)
 }

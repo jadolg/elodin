@@ -43,6 +43,9 @@ test_peek_referral_reads_the_authority_section :: proc(t: ^testing.T) {
 	testing.expect(t, !peek_referral(referral_wire(.No_Error, {a}, {ns})), "an answer beside NS is an answer")
 	testing.expect(t, !peek_referral(referral_wire(.NX_Domain, nil, {ns})), "NXDOMAIN is not a referral")
 	testing.expect(t, !peek_referral(referral_wire(.Serv_Fail, nil, {ns})), "SERVFAIL is not a referral")
+	authoritative := referral_wire(.No_Error, nil, {ns})
+	authoritative[2] |= 0x04
+	testing.expect(t, !peek_referral(authoritative), "AA set: an authority's SOA-less NODATA, not a referral")
 
 	// The composed rcode: BADVERS is 16, a zero low nibble under an OPT.
 	opt := make_opt(1232, false, 1)

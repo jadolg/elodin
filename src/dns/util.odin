@@ -400,12 +400,17 @@ The RA bit is not read. A server that clears it on answers it does give exists,
 and one that sets it over a referral has still not answered; what the reply
 holds is the whole test.
 
+The AA bit is. A referral is sent from above the cut, where the server is not
+the authority for the name asked (RFC 1035 section 4.1.1), so no server sets it
+on one; an authority that does set it over an empty answer with only its own NS
+beside it is sending a NODATA without the SOA, and that is its answer.
+
 The rcode is the composed one, so an extended rcode whose low nibble is zero is
 not a NOERROR here. A message that cannot be walked is not a referral: what a
 decode would refuse is refused where it is decoded.
 */
 peek_referral :: proc(msg: []u8) -> bool {
-	if len(msg) < HEADER_SIZE || peek_rcode(msg) != .No_Error {
+	if len(msg) < HEADER_SIZE || msg[2] & 0x04 != 0 || peek_rcode(msg) != .No_Error {
 		return false
 	}
 	qdcount := int(u16(msg[4]) << 8 | u16(msg[5]))

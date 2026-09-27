@@ -421,6 +421,7 @@ full `timeout`; a third is left for the next query, by which time the dead ones
 are on their way to the cooldown below. A reply that did arrive but says
 SERVFAIL or REFUSED sends the query on to the rest of the group, inside the
 same two `timeout`s rather than on top of them. So does a referral - a server
+same two `timeout`s rather than on top of them. So does a referral - a server
 that does not recurse for the name answering with the NS of a zone and no SOA,
 on its own or after a CNAME whose target that zone holds - and where no member
 does better the client gets SERVFAIL, not the empty NOERROR it would read as
