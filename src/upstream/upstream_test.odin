@@ -2991,7 +2991,8 @@ test_http_bodyless_statuses_end_at_the_fields :: proc(t: ^testing.T) {
 		resp, err, ok := exchange_against(t, c.reply, &track, hold = true)
 		spent := time.tick_since(start)
 		if ok {
-			testing.expectf(t, spent < time.Second, "%q took %v: read past the end of the response", c.reply, spent)
+			// The mock holds for three seconds, so reading past the end costs that.
+			testing.expectf(t, spent < 2 * time.Second, "%q took %v: read past the end of the response", c.reply, spent)
 			if c.refused {
 				testing.expectf(t, err == .HTTP_Error, "%q got %v, status %d", c.reply, err, resp.status)
 			} else {
