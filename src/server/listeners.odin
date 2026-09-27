@@ -1150,10 +1150,19 @@ every datagram from port 53 would refuse them too. What stops it is that neither
 end answers an answer - `handle_query` drops anything with QR set before it
 looks at the question - so the exchange is one datagram each way rather than a
 loop, and the rate limiter bounds even that.
+
+Nor can it be an address that is not one host's (#297): multicast, the limited
+broadcast, or the unspecified address. None of them is where a query comes from,
+and a reply to one is worse than wasted - on Linux a datagram sent to 0.0.0.0 or
+`::` is delivered to this host, on a port the spoofer chose, and one sent to a
+multicast group goes out on the default interface with no socket option needed.
+A subnet's directed broadcast is not refused here, since telling one apart needs
+the interfaces' netmasks: the kernel drops a datagram claiming one as a martian,
+and would refuse the reply anyway, as these sockets never set `SO_BROADCAST`.
 */
 @(private)
 plausible_source :: proc(l: ^Listeners, client: net.Endpoint) -> bool {
-	if client.port == 0 {
+	if client.port == 0 || !is_unicast(client.address) {
 		return false
 	}
 	bound := l.udp_bound
@@ -1240,6 +1249,26 @@ is_loopback :: proc(a: net.Address) -> bool {
 		return x[0] == 127
 	case net.IP6_Address:
 		return x == net.IP6_Loopback
+	}
+	return false
+}
+
+/*
+Whether an address could be one host's: not multicast (224.0.0.0/4, ff00::/8),
+not the limited broadcast, not unspecified. Mapped forms are judged as the IPv4
+address they carry, which is how the ACL and the limiter read them.
+
+The rest of 0.0.0.0/8 and all of 240.0.0.0/4 are left to the kernel: stacks with
+the unicast extensions route them, and the others drop them as martians before a
+socket sees them.
+*/
+@(private)
+is_unicast :: proc(a: net.Address) -> bool {
+	switch x in unmap_v4(a) {
+	case net.IP4_Address:
+		return x != net.IP4_Address{} && x[0] & 0xf0 != 224 && x != net.IP4_Address{255, 255, 255, 255}
+	case net.IP6_Address:
+		return x != net.IP6_Address{} && u16(x[0]) >> 8 != 0xff
 	}
 	return false
 }

@@ -1356,6 +1356,107 @@ test_implausible_sources_are_refused :: proc(t: ^testing.T) {
 }
 
 /*
+A source no unicast reply can be addressed to (#297).
+
+Multicast, the limited broadcast and the unspecified address are never the
+address of one host waiting for an answer, and with `allow_from: []` nothing
+before this check looks at the address at all. Refused on every port, in either
+spelling of an IPv4 address, whatever we are bound to.
+
+0.0.0.0 is the sharpest of them: on Linux a datagram sent to it is delivered to
+this host, so answering a query spoofed from 0.0.0.0 is this server sending to
+itself on a port of the spoofer's choosing.
+
+What stays plausible is asserted beside them, so a check that grew to swallow
+its neighbours fails here too: the edges of 224/4 and ff00::/8, the rest of
+0.0.0.0/8 and of 240/4 (unicast on stacks that have taken the unicast
+extensions, and dropped as martians by the kernel everywhere else), and ::1.
+*/
+@(test)
+test_non_unicast_sources_are_refused :: proc(t: ^testing.T) {
+	PORT :: 40000
+	binds := []Listeners {
+		{udp_bound = net.Endpoint{address = net.IP4_Any, port = 53}},
+		{udp_bound = net.Endpoint{address = net.IP6_Any, port = 53}},
+		{udp_bound = v4(192, 0, 2, 53, 53)},
+	}
+
+	Case :: struct {
+		client:    net.Endpoint,
+		plausible: bool,
+		what:      string,
+	}
+
+	CASES := []Case {
+		{v4(0, 0, 0, 0, PORT), false, "0.0.0.0"},
+		{mapped(0, 0, 0, 0, PORT), false, "::ffff:0.0.0.0"},
+		{net.Endpoint{address = net.IP6_Any, port = PORT}, false, "::"},
+		{v4(224, 0, 0, 1, PORT), false, "224.0.0.1, all hosts"},
+		{v4(224, 0, 0, 251, PORT), false, "224.0.0.251, mDNS"},
+		{v4(239, 255, 255, 255, PORT), false, "the top of 224/4"},
+		{mapped(239, 255, 255, 250, PORT), false, "239.255.255.250, mapped"},
+		{v4(255, 255, 255, 255, PORT), false, "the limited broadcast"},
+		{mapped(255, 255, 255, 255, PORT), false, "the limited broadcast, mapped"},
+		{net.Endpoint{address = v6_of({0xff02, 0, 0, 0, 0, 0, 0, 1}), port = PORT}, false, "ff02::1, all nodes"},
+		{net.Endpoint{address = v6_of({0xff05, 0, 0, 0, 0, 0, 0x1, 0x3}), port = PORT}, false, "ff05::1:3, all DHCP servers"},
+		{net.Endpoint{address = v6_of({0xff0e, 0, 0, 0, 0, 0, 0, 0xfb}), port = PORT}, false, "ff0e::fb, global scope"},
+		{net.Endpoint{address = v6_of({0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff}), port = PORT}, false, "the top of ff00::/8"},
+		// The neighbours, which are clients.
+		{v4(223, 255, 255, 255, PORT), true, "just below 224/4"},
+		{v4(240, 0, 0, 1, PORT), true, "240/4 past the multicast block"},
+		{v4(255, 255, 255, 254, PORT), true, "just below the limited broadcast"},
+		{v4(0, 0, 0, 1, PORT), true, "the rest of 0.0.0.0/8"},
+		{mapped(0, 0, 0, 1, PORT), true, "the rest of 0.0.0.0/8, mapped"},
+		{net.Endpoint{address = v6_of({0xfeff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff}), port = PORT}, true, "just below ff00::/8"},
+		{net.Endpoint{address = v6_of({0, 0, 0, 0, 0, 0, 0, 1}), port = PORT}, true, "::1 on a port of its own"},
+		{net.Endpoint{address = v6_of({0, 0, 0, 0, 0, 0, 0, 2}), port = PORT}, true, "::2 is not ::"},
+		// Not the mapping, so the IPv6 rule applies: `::e000:1` is not 224.0.0.1.
+		{net.Endpoint{address = v6_of({0, 0, 0, 0, 0, 0, 0xe000, 0x0001}), port = PORT}, true, "the compat form of 224.0.0.1"},
+	}
+
+	for &l in binds {
+		for c in CASES {
+			got := plausible_source(&l, c.client)
+			testing.expectf(t, got == c.plausible, "bound to %v: %s: plausible_source said %v", l.udp_bound, c.what, got)
+		}
+	}
+}
+
+/*
+The premise the unspecified-address half of the test above rests on: on Linux a
+datagram sent to 0.0.0.0 or `::` arrives at this host. A reply to a query
+spoofed from either is this server writing to one of its own ports.
+*/
+@(test)
+test_a_reply_to_the_unspecified_address_comes_home :: proc(t: ^testing.T) {
+	when ODIN_OS != .Linux {
+		return
+	}
+	check :: proc(t: ^testing.T, loopback, unspecified: net.Address) {
+		rx, err := net.make_bound_udp_socket(loopback, 0)
+		if err != nil {
+			log.infof("no socket on %v (%v), skipped", loopback, err)
+			return
+		}
+		defer net.close(rx)
+		_ = net.set_option(rx, .Receive_Timeout, time.Second)
+		bound, _ := net.bound_endpoint(rx)
+		tx, terr := net.make_unbound_udp_socket(net.family_from_address(loopback))
+		if terr != nil {
+			testing.expectf(t, false, "cannot make a sending socket: %v", terr)
+			return
+		}
+		defer net.close(tx)
+		_, serr := net.send_udp(tx, transmute([]u8)string("x"), net.Endpoint{address = unspecified, port = bound.port})
+		buf: [8]u8
+		n, _, rerr := net.recv_udp(rx, buf[:])
+		testing.expectf(t, serr == nil && rerr == nil && n == 1, "a datagram to %v did not arrive on %v: %v %v", unspecified, loopback, serr, rerr)
+	}
+	check(t, net.IP4_Loopback, net.IP4_Any)
+	check(t, net.IP6_Loopback, net.IP6_Any)
+}
+
+/*
 Under a wildcard bind, our own datagram to an IPv4 destination comes back mapped.
 
 `plausible_source`'s last line is there for exactly one case: bound to the
