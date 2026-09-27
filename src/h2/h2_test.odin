@@ -650,9 +650,11 @@ test_data_on_a_closed_stream_is_answered_with_stream_closed :: proc(t: ^testing.
 /*
 Answering every one of these forever is its own amplification vector: a peer
 that keeps a closed stream id around and just keeps sending draws an
-RST_STREAM out of this end for each frame, for free. `closed_stream_rst_budget`
-bounds that to `MAX_CLOSED_STREAM_RST` per connection; past it, this falls
-back to the credit-only behaviour the case had before this fix existed.
+RST_STREAM out of this end for each frame, for free. Each id draws one at
+most, since RFC 9113 5.1 has frames after our own RST_STREAM ignored, and
+`closed_stream_rst_budget` bounds the ids to `MAX_CLOSED_STREAM_RST` per
+connection; past it, this falls back to the credit-only behaviour the case had
+before this fix existed.
 */
 @(test)
 test_data_on_a_closed_stream_stops_drawing_rst_once_the_budget_is_spent :: proc(t: ^testing.T) {
@@ -667,21 +669,30 @@ test_data_on_a_closed_stream_stops_drawing_rst_once_the_budget_is_spent :: proc(
 	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
 
 	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
-	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
-	testing.expect(t, ok, "handle_headers failed")
 	rst := []u8{0, 0, 0, 8} // CANCEL
-	handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst)
-
 	body := []u8{'x'}
-	for _ in 0 ..< MAX_CLOSED_STREAM_RST {
-		handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	// Opened and reset by the peer, so gone; each takes two DATA, and only the
+	// first draws an RST_STREAM.
+	id: u32
+	for i in 0 ..= MAX_CLOSED_STREAM_RST {
+		id = u32(2 * i + 1)
+		ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block)
+		testing.expect(t, ok, "handle_headers failed")
+		handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = id}, rst)
+		if i == MAX_CLOSED_STREAM_RST {
+			break
+		}
+		for _ in 0 ..< 2 {
+			handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = id}, body)
+		}
+		testing.expect_value(t, count_rst(&log, id), 1)
 	}
 	testing.expect_value(t, c.closed_stream_rst_budget, 0)
 
 	clear(&log.frames)
 	// One byte short of a batch, so the refused frame's credit is due on the wire.
 	c.credit_owed = CREDIT_BATCH - 1
-	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = id}, body)
 	testing.expect(t, dok, "DATA on a closed stream should still be tolerated once the budget is spent")
 
 	saw_rst := false
@@ -701,6 +712,178 @@ test_data_on_a_closed_stream_stops_drawing_rst_once_the_budget_is_spent :: proc(
 	conn_unref(c)
 	free_all(context.temp_allocator)
 	expect_no_leaks(t, &track, "closed stream rst budget")
+}
+
+@(private = "file")
+count_rst :: proc(log: ^Frame_Log, stream_id: u32) -> int {
+	n := 0
+	for f in log.frames {
+		if f.type == .Rst_Stream && f.stream_id == stream_id {
+			n += 1
+		}
+	}
+	return n
+}
+
+/*
+RFC 9113 5.1 (closed): "An endpoint MUST ignore frames that it receives on
+closed streams after it has sent a RST_STREAM frame" - the peer may have sent
+them before it saw the reset. This end resets a stream for a body over
+MAX_BODY and forgets it at once, so the DATA still in flight behind it read as
+a closed-stream violation: an RST_STREAM(STREAM_CLOSED) each, and a slot of
+`closed_stream_rst_budget` each (#390). Sixteen of them left a well-behaved
+client with no budget for a real violation.
+*/
+@(test)
+test_data_in_flight_on_a_stream_this_end_reset_is_ignored :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+	body := make([]u8, MAX_BODY + 1, context.temp_allocator)
+	handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect_value(t, count_rst(&log, 1), 1)
+	_, still_open := c.streams[1]
+	testing.expect(t, !still_open, "an oversized stream was not retired")
+
+	clear(&log.frames)
+	log.credit = 0
+	owed := c.credit_owed
+	chunk := make([]u8, DEFAULT_MAX_FRAME, context.temp_allocator)
+	for _ in 0 ..< 4 {
+		ok := handle_data(c, Frame_Header{length = len(chunk), type = .Data, stream_id = 1}, chunk)
+		testing.expect(t, ok, "DATA in flight on a stream this end reset dropped the connection")
+	}
+	testing.expectf(t, count_rst(&log, 1) == 0, "RST_STREAM frames sent for in-flight DATA on a stream this end reset: %d, want 0", count_rst(&log, 1))
+	testing.expect_value(t, c.closed_stream_rst_budget, MAX_CLOSED_STREAM_RST)
+	testing.expectf(t, log.credit + c.credit_owed - owed == 4 * len(chunk), "connection credit returned: %d, want %d", log.credit + c.credit_owed - owed, 4 * len(chunk))
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "data in flight on a reset stream")
+}
+
+/*
+The commonest way into #390: HEADERS refused for want of room, with the
+request body already on the wire behind it. Every reset this end sends goes
+through `rst_stream`, so each is covered: refused, malformed, oversized.
+*/
+@(test)
+test_body_in_flight_behind_a_refused_headers_is_ignored :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+
+	// No room left for the request's fields: finish_headers refuses it.
+	c.request_bytes = MAX_CONN_REQUEST
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+	c.request_bytes = 0
+	testing.expect_value(t, count_rst(&log, 1), 1)
+
+	body := []u8{'x'}
+	for _ in 0 ..< 3 {
+		handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	}
+	handle_data(c, Frame_Header{length = len(body), type = .Data, flags = FLAG_END_STREAM, stream_id = 1}, body)
+	testing.expect_value(t, count_rst(&log, 1), 1)
+	testing.expect_value(t, c.closed_stream_rst_budget, MAX_CLOSED_STREAM_RST)
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "body behind a refused headers")
+}
+
+/*
+The same in-flight case with trailers instead of DATA: HEADERS on a stream id
+already used was a connection error outright, so trailers sent before the peer
+saw this end's reset took the whole connection down (#390). They are ignored
+now, but still decoded - here across a CONTINUATION - or the HPACK table
+falls out of step with the peer's and every block after them misdecodes.
+*/
+@(test)
+test_trailers_in_flight_on_a_stream_this_end_reset_are_decoded_and_ignored :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+	body := make([]u8, MAX_BODY + 1, context.temp_allocator)
+	handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect_value(t, count_rst(&log, 1), 1)
+	clear(&log.frames)
+
+	// x-t: 1, literal with incremental indexing: becomes dynamic index 62.
+	trailer := []u8{0x40, 0x03, 'x', '-', 't', 0x01, '1'}
+	ok := handle_headers(c, Frame_Header{length = 3, type = .Headers, flags = FLAG_END_STREAM, stream_id = 1}, trailer[:3])
+	ok = ok && handle_continuation(c, Frame_Header{length = len(trailer) - 3, type = .Continuation, flags = FLAG_END_HEADERS, stream_id = 1}, trailer[3:])
+	testing.expect(t, ok, "trailers in flight on a stream this end reset dropped the connection")
+	testing.expect_value(t, len(log.frames), 0)
+	testing.expect_value(t, len(c.streams), 0)
+	testing.expect_value(t, c.last_stream_id, 1)
+	testing.expect_value(t, len(c.decoder.entries), 2)
+
+	// A peer resetting it first is no excuse: that is still a connection error.
+	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 3}, block)
+	rst := []u8{0, 0, 0, 8} // CANCEL
+	handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 3}, rst)
+	testing.expect(t, !handle_headers(c, Frame_Header{length = 1, type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 3}, []u8{0x82}), "HEADERS on a stream the peer reset was accepted")
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "trailers on a reset stream")
+}
+
+/*
+Only a stream this end reset and forgot takes a block quietly. One still in the
+table - here reset for DATA after END_STREAM, while its handler holds it - was
+already ended by the peer, so nothing on it can be in flight; and a placeholder
+put in its place would overwrite the stream the handler is answering.
+*/
+@(test)
+test_headers_on_a_reset_stream_still_being_answered_is_a_connection_error :: proc(t: ^testing.T) {
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8),
+	}
+	defer delete(log.frames)
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, destroying_handler, nil, context.allocator)
+	defer conn_unref(c)
+
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, block)
+	body := []u8{'x'}
+	handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+	testing.expect_value(t, count_rst(&log, 1), 1)
+	s := c.streams[1]
+
+	ok := handle_headers(c, Frame_Header{length = 1, type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, []u8{0x82})
+	testing.expect(t, !ok, "HEADERS on a stream still being answered was accepted")
+	testing.expect(t, c.streams[1] == s, "the stream being answered was replaced")
+	free_all(context.temp_allocator)
 }
 
 /*
