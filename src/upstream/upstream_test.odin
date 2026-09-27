@@ -1866,7 +1866,7 @@ test_redirect_within_the_configured_scheme_is_followed :: proc(t: ^testing.T) {
 	origin_server := thread.create_and_start_with_poly_data(&origin_mock, http_mock_once)
 
 	url := fmt.tprintf("http://127.0.0.1:%d/list.txt", origin_bound.port)
-	body, ferr := fetch_url(url, nil, 5 * time.Second, context.temp_allocator)
+	body, ferr := fetch_url(url, nil, 5 * time.Second, 10 * time.Second, context.temp_allocator)
 
 	// Joined before the arena the replies live in is reset.
 	thread.join(origin_server)
@@ -3067,6 +3067,170 @@ test_http_bodyless_statuses_end_at_the_fields :: proc(t: ^testing.T) {
 		testing.expectf(t, err == .HTTP_Error, "%d interim responses got %v, status %d", MAX_HTTP_HEADERS + 1, err, resp.status)
 		delete(resp.body, mem.tracking_allocator(&track))
 		expect_caller_holds_nothing(t, &track, "endless interims")
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+Answers one connection with `head`, then one `line` every `interval`, `count`
+times or until the client goes away: a response that is always just about to
+arrive, so no single read ever waits long enough to time out.
+*/
+@(private = "file")
+Trickle_Mock :: struct {
+	listener: net.TCP_Socket,
+	head:     string,
+	line:     string,
+	count:    int,
+	interval: time.Duration,
+}
+
+@(private = "file")
+trickle_mock_once :: proc(m: ^Trickle_Mock) {
+	client, _, err := net.accept_tcp(m.listener)
+	if err != nil {
+		return
+	}
+	defer net.close(client)
+	drain_request(client)
+	if n, serr := net.send_tcp(client, transmute([]u8)m.head); serr != nil || n <= 0 {
+		return
+	}
+	for _ in 0 ..< m.count {
+		time.sleep(m.interval)
+		if n, serr := net.send_tcp(client, transmute([]u8)m.line); serr != nil || n <= 0 {
+			return
+		}
+	}
+}
+
+@(private = "file")
+start_trickle :: proc(
+	t: ^testing.T,
+	head, line: string,
+	count := 40,
+	interval := 100 * time.Millisecond,
+) -> (
+	m: ^Trickle_Mock,
+	server: ^thread.Thread,
+	port: int,
+	ok: bool,
+) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		net.close(listener)
+		testing.expectf(t, false, "cannot read the mock's port: %v", berr)
+		return
+	}
+	m = new(Trickle_Mock)
+	m^ = Trickle_Mock {
+		listener = listener,
+		head     = head,
+		line     = line,
+		count    = count,
+		interval = interval,
+	}
+	server = thread.create_and_start_with_poly_data(m, trickle_mock_once)
+	return m, server, bound.port, true
+}
+
+@(private = "file")
+stop_trickle :: proc(m: ^Trickle_Mock, server: ^thread.Thread) {
+	thread.join(server)
+	thread.destroy(server)
+	net.close(m.listener)
+	free(m)
+}
+
+/*
+A DoH query over HTTP/1.1 is bounded by its timeout as a whole, not per read
+(#445). The budget went onto the socket as a per-read timeout, so a server
+sending a header line every 100ms - each read well inside a 500ms timeout -
+held the query and its worker for as long as it cared to, up to the field limit
+and then through a chunked body a byte at a time.
+*/
+@(test)
+test_a_trickled_doh_response_is_bounded_by_the_query_timeout :: proc(t: ^testing.T) {
+	m, server, port, ok := start_trickle(t, "HTTP/1.1 200 OK\r\n", "X-Slow: 1\r\n")
+	if !ok {
+		return
+	}
+	defer stop_trickle(m, server)
+
+	u, uerr := make_upstream(
+		config.Upstream_Spec {
+			name = "trickle",
+			kind = .TCP,
+			address = "127.0.0.1",
+			port = port,
+			hostname = "doh.invalid",
+			path = "/dns-query",
+		},
+		8,
+		30 * time.Second,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot make the upstream: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+
+	query := dns.Message {
+		id       = 0x4450,
+		question = []dns.Question{{name = "example.com.", type = .A, class = .IN}},
+	}
+	query.flags.rd = true
+	wire, _, enc := dns.encode_message(query, context.temp_allocator)
+	if !testing.expectf(t, enc == .None, "cannot encode: %v", enc) {
+		return
+	}
+	body := make([]u8, len(wire), context.temp_allocator)
+	copy(body, wire)
+	dns.set_id_in_place(body, 0)
+
+	start := time.tick_now()
+	_, err := exchange_doh_h1(u, wire, body, 500 * time.Millisecond, context.temp_allocator)
+	spent := time.tick_since(start)
+	testing.expectf(t, err == .Timeout, "a trickled response reported %v", err)
+	testing.expectf(t, spent < 1500 * time.Millisecond, "a 500ms query was held for %v", spent)
+	free_all(context.temp_allocator)
+}
+
+/*
+The list download has the same bound, as a total over the whole fetch (#445):
+here a chunked body a byte at a time, each chunk well inside the one-second
+read timeout. And the read timeout still holds under a total that has plenty
+left, so a host that goes quiet is given up on at `timeout`, not at `total`.
+*/
+@(test)
+test_a_trickled_list_download_is_bounded_by_its_total :: proc(t: ^testing.T) {
+	{
+		m, server, port, ok := start_trickle(t, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", "1\r\nx\r\n")
+		if !ok {
+			return
+		}
+		start := time.tick_now()
+		body, err := fetch_url(fmt.tprintf("http://127.0.0.1:%d/list.txt", port), nil, time.Second, 500 * time.Millisecond, context.temp_allocator)
+		spent := time.tick_since(start)
+		stop_trickle(m, server)
+		testing.expectf(t, err == .Timeout, "a trickled body reported %v, %d bytes", err, len(body))
+		testing.expectf(t, spent < 1500 * time.Millisecond, "a 500ms fetch was held for %v", spent)
+	}
+	{
+		m, server, port, ok := start_trickle(t, "HTTP/1.1 200 OK\r\n", "X: y\r\n", count = 1, interval = 3 * time.Second)
+		if !ok {
+			return
+		}
+		start := time.tick_now()
+		body, err := fetch_url(fmt.tprintf("http://127.0.0.1:%d/list.txt", port), nil, 300 * time.Millisecond, 10 * time.Second, context.temp_allocator)
+		spent := time.tick_since(start)
+		stop_trickle(m, server)
+		testing.expectf(t, err != .None, "a silent host was answered, %d bytes", len(body))
+		testing.expectf(t, spent < 1500 * time.Millisecond, "a host silent past a 300ms read timeout held the fetch for %v", spent)
 	}
 	free_all(context.temp_allocator)
 }

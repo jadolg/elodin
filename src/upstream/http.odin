@@ -59,6 +59,15 @@ stream_write :: proc(s: ^Stream, buf: []u8) -> Error {
 	return .None
 }
 
+// How long the next read may wait, on whichever half the stream reads through.
+stream_set_read_timeout :: proc(s: ^Stream, timeout: time.Duration) {
+	if s.tls != nil {
+		tlsx.set_read_timeout(s.tls, timeout)
+		return
+	}
+	_ = net.set_option(s.socket, .Receive_Timeout, timeout)
+}
+
 stream_close :: proc(s: ^Stream) {
 	if s.tls != nil {
 		tlsx.close(s.tls)
@@ -70,16 +79,41 @@ stream_close :: proc(s: ^Stream) {
 
 @(private)
 Buf_Reader :: struct {
-	stream: ^Stream,
-	buf:    [dynamic]u8,
-	pos:    int,
+	stream:   ^Stream,
+	buf:      [dynamic]u8,
+	pos:      int,
+	// When the whole exchange must be over, or zero for no bound beyond
+	// whatever is already on the socket; and, under it, how long any one read
+	// may wait (zero for as long as the deadline allows). See `reader_fill`.
+	deadline: time.Tick,
+	idle:     time.Duration,
 }
 
 @(private)
 reader_fill :: proc(r: ^Buf_Reader) -> Error {
+	/*
+	A timeout per read bounds a silent peer and nothing else: a peer sending a
+	line just inside it, again and again, held the exchange for as long as the
+	field limit and the body limit let it (#445). So each read waits for what
+	is left of the deadline at most. Never less than a millisecond: a zero
+	`SO_RCVTIMEO` is no timeout at all.
+	*/
+	if r.deadline != {} {
+		wait := time.tick_diff(time.tick_now(), r.deadline)
+		if wait <= 0 {
+			return .Timeout
+		}
+		if r.idle > 0 {
+			wait = min(wait, r.idle)
+		}
+		stream_set_read_timeout(r.stream, max(wait, time.Millisecond))
+	}
 	chunk: [8192]u8
 	n, err := stream_read(r.stream, chunk[:])
 	if err != .None {
+		if r.deadline != {} && time.tick_diff(time.tick_now(), r.deadline) <= 0 {
+			return .Timeout
+		}
 		return err
 	}
 	/*
@@ -229,11 +263,17 @@ Perform one request/response exchange on `stream`.
 
 The returned body is allocated from `allocator`; everything else borrows from
 scratch memory and must be copied if it needs to outlive the call.
+
+`deadline`, when set, bounds the reading of the whole response, and `idle` any
+one read under it; see `reader_fill`. Without one, only the timeouts already on
+the stream apply, and those are per read.
 */
 http_exchange :: proc(
 	stream: ^Stream,
 	req: Http_Request,
 	allocator := context.allocator,
+	deadline := time.Tick{},
+	idle := time.Duration(0),
 ) -> (
 	resp: Http_Response,
 	err: Error,
@@ -272,8 +312,10 @@ http_exchange :: proc(
 	}
 
 	r := Buf_Reader {
-		stream = stream,
-		buf    = make([dynamic]u8, 0, 8192, context.temp_allocator),
+		stream   = stream,
+		buf      = make([dynamic]u8, 0, 8192, context.temp_allocator),
+		deadline = deadline,
+		idle     = idle,
 	}
 
 	/*

@@ -221,6 +221,7 @@ exchange_doh_h1 :: proc(
 				accept = "application/dns-message",
 			},
 			allocator,
+			deadline = deadline,
 		)
 
 		if herr == .None && resp.status == 200 && len(resp.body) >= dns.HEADER_SIZE {
@@ -269,16 +270,22 @@ Fetch a URL over HTTP or HTTPS, following redirects.
 
 Used to download blocklists. Kept here rather than in the filter package so the
 HTTP and TLS machinery has exactly one implementation.
+
+`timeout` bounds the dial and any one read; `total` bounds the whole fetch,
+redirects included. Per read alone, a host sending a line or a chunk just
+inside `timeout` held the fetch for as long as the body limit let it (#445).
 */
 fetch_url :: proc(
 	url: string,
 	bootstrap: []string,
 	timeout: time.Duration,
+	total: time.Duration,
 	allocator := context.allocator,
 ) -> (
 	body: []u8,
 	err: Error,
 ) {
+	deadline := time.tick_add(time.tick_now(), total)
 	current := url
 	// What the operator configured, which is what every later hop is judged
 	// against - rather than the hop before it, so a chain cannot walk itself
@@ -322,13 +329,19 @@ fetch_url :: proc(
 			tlsx.context_destroy(tls_ctx)
 		}
 
-		stream := open_stream(endpoint, tls_ctx, host_only, timeout) or_return
+		remaining := time.tick_diff(time.tick_now(), deadline)
+		if remaining <= 0 {
+			return nil, .Timeout
+		}
+		stream := open_stream(endpoint, tls_ctx, host_only, min(timeout, remaining)) or_return
 		defer stream_close(&stream)
 
 		resp, herr := http_exchange(
 			&stream,
 			Http_Request{method = "GET", path = path, host = host, accept = "text/plain, */*"},
 			allocator,
+			deadline = deadline,
+			idle = timeout,
 		)
 		if herr != .None {
 			return nil, herr

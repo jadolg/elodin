@@ -19,6 +19,13 @@ copy, so a network outage cannot silently turn blocking off.
 */
 
 FETCH_TIMEOUT :: 30 * time.Second
+/*
+The whole download, redirects included (#445): `FETCH_TIMEOUT` bounds one read,
+and a host sending a little just inside it could otherwise hold the refresh -
+and the maintenance thread it runs on - for as long as the body limit allows.
+Five minutes is a 64 MB list, the most `fetch_url` accepts, at under 2 Mbit/s.
+*/
+FETCH_DEADLINE :: 5 * time.Minute
 
 /*
 Build a fresh pair of rule sets from the configuration.
@@ -144,7 +151,7 @@ fetch_list :: proc(cfg: ^config.Config, list: config.Block_List, cache_path: str
 	}
 
 	logx.infof("list %s: downloading %s", list.name, list.url)
-	body, ferr := upstream.fetch_url(list.url, cfg.upstream.bootstrap, FETCH_TIMEOUT, context.allocator)
+	body, ferr := upstream.fetch_url(list.url, cfg.upstream.bootstrap, FETCH_TIMEOUT, FETCH_DEADLINE, context.allocator)
 	if ferr != .None {
 		logx.warnf("list %s: download failed (%v)", list.name, ferr)
 		return "", false
