@@ -211,9 +211,10 @@ Conn :: struct {
 	that drew one have its next header block taken quietly.
 
 	Every reset remembered goes through `stream_error`, which spends
-	MAX_CONTROL_FRAMES_PER_SECOND - a budget the server never earns back - so
-	RESET_IDS is more than a second of them, far longer than frames take to
-	cross. Struck off again once the peer ends or resets the stream, or its
+	MAX_CONTROL_FRAMES_PER_SECOND (the server's own budget has no `earned`
+	credit to stretch it), so RESET_IDS is more than a second of them. In
+	flight means sent before our reset arrived - a round trip, not a second -
+	so a slot is only ever overwritten long after it stopped mattering. Struck off again once the peer ends or resets the stream, or its
 	trailers arrive. An id that does fall out only falls back to
 	`closed_stream_rst_budget`.
 	*/
@@ -711,7 +712,8 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	discard := false
 	if h.stream_id <= c.last_stream_id {
 		slot, reset_here := reset_slot(c, h.stream_id)
-		if !reset_here {
+		// Trailers end the stream (RFC 9113 8.1); a block that does not is an id reused.
+		if !reset_here || h.flags & FLAG_END_STREAM == 0 {
 			sync.mutex_unlock(&c.mu)
 			goaway(c, .Protocol_Error)
 			return false

@@ -939,6 +939,36 @@ test_a_reset_id_the_peer_then_ends_takes_no_header_block :: proc(t: ^testing.T) 
 }
 
 /*
+Trailers carry END_STREAM (RFC 9113 8.1), so a block without it on a
+remembered id is not one in flight: it is a stream id reused, and still a
+connection error rather than a request dropped in silence.
+*/
+@(test)
+test_a_block_without_end_stream_on_a_reset_id_is_a_connection_error :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 8, allocator),
+	}
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	c.request_bytes = MAX_CONN_REQUEST
+	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+	c.request_bytes = 0
+	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+	testing.expect(t, !ok, "a block without END_STREAM on a reset id was taken as trailers")
+
+	delete(log.frames)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+	expect_no_leaks(t, &track, "block without end_stream on a reset id")
+}
+
+/*
 Only a stream this end reset and forgot takes a block quietly. One still in the
 table - here reset for DATA after END_STREAM, while its handler holds it - was
 already ended by the peer, so nothing on it can be in flight; and a placeholder
