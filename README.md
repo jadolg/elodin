@@ -424,9 +424,10 @@ same two `timeout`s rather than on top of them. One exchange with one server
 takes its `timeout`, whatever it does inside: resolving a hostname upstream
 through `bootstrap`, asking again with a fresh DNS cookie, retrying a truncated
 answer over TCP. A truncated answer that arrives late therefore leaves its TCP
-retry little time, and fails rather than doubling the wait. The one overrun
-left is a second's grace for a TCP or DoT server to finish a message it has
-already started sending, so the connection is not left mid-message.
+retry little time, and fails rather than doubling the wait. What overruns
+are left are about a second, and keep a shared connection sound: a TCP or DoT
+server finishing a message it has already started sending, and a dead DoH
+connection being torn down before the next is dialled.
 
 `bootstrap` matters: elodin resolves upstream hostnames itself rather than
 through the system resolver, since on a machine where elodin *is* the system

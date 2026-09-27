@@ -26,10 +26,12 @@ X_TIMEOUT :: 200 * time.Millisecond
 // its answer, and one that shares the timeout does not.
 @(private = "file")
 Truncating_Mock :: struct {
-	udp:      net.UDP_Socket,
-	listener: net.TCP_Socket,
-	delay:    time.Duration,
-	stop:     bool,
+	udp:       net.UDP_Socket,
+	listener:  net.TCP_Socket,
+	delay:     time.Duration,
+	// The TCP answer's own delay, when it differs.
+	tcp_delay: time.Duration,
+	stop:      bool,
 }
 
 @(private = "file")
@@ -62,7 +64,7 @@ truncating_tcp_once :: proc(m: ^Truncating_Mock) {
 	if n < dns.HEADER_SIZE || n > len(query) || read_full_tcp(client, query[:n]) != .None {
 		return
 	}
-	time.sleep(m.delay)
+	time.sleep(m.tcp_delay if m.tcp_delay > 0 else m.delay)
 	out: [2 + 512]u8
 	out[0], out[1] = length[0], length[1]
 	copy(out[2:], query[:n])
@@ -87,7 +89,10 @@ test_a_truncated_replys_tcp_retry_shares_the_exchange_timeout :: proc(t: ^testin
 	m := Truncating_Mock {
 		udp      = udp,
 		listener = listener,
-		delay    = X_TIMEOUT * 7 / 10,
+		// Early enough that the retry is always made, even on a loaded
+		// runner; the TCP answer too late for what is left.
+		delay     = X_TIMEOUT / 2,
+		tcp_delay = X_TIMEOUT * 7 / 10,
 	}
 	udp_thread := thread.create_and_start_with_poly_data(&m, truncating_udp_loop)
 	tcp_thread := thread.create_and_start_with_poly_data(&m, truncating_tcp_once)
@@ -125,8 +130,8 @@ test_a_truncated_replys_tcp_retry_shares_the_exchange_timeout :: proc(t: ^testin
 	resp, xerr := exchange(u, wire, X_TIMEOUT, context.temp_allocator)
 	spent := time.tick_since(started)
 
-	// The TC arrived at 0.7 of the timeout, leaving 0.3 for a retry the server
-	// answers after 0.7: a retry on its own clock answered at 1.4.
+	// The TC arrived at half the timeout, leaving half for a retry the server
+	// answers after 0.7: a retry on its own clock answered at 1.2.
 	testing.expectf(t, xerr == .Timeout, "the retry ended %v, where it should time out (%d bytes)", xerr, len(resp))
 	testing.expectf(t, spent < X_TIMEOUT * 5 / 4, "the exchange waited %v, where its timeout is %v", spent, X_TIMEOUT)
 	// And the connection the retry dialled keeps the upstream's own timeout,
@@ -135,7 +140,7 @@ test_a_truncated_replys_tcp_retry_shares_the_exchange_timeout :: proc(t: ^testin
 	c := u.pipe
 	kept := c.timeout if c != nil else 0
 	sync.mutex_unlock(&u.mu)
-	testing.expectf(t, c == nil || kept == X_TIMEOUT, "the retry's connection was dialled with %v, where the upstream's timeout is %v", kept, X_TIMEOUT)
+	testing.expectf(t, c != nil && kept == X_TIMEOUT, "the retry's connection was dialled with %v, where the upstream's timeout is %v", kept, X_TIMEOUT)
 	free_all(context.temp_allocator)
 }
 
@@ -286,6 +291,8 @@ test_the_exchange_that_resolved_a_member_does_not_charge_it_a_timeout :: proc(t:
 	_, first := exchange(u, wire, X_TIMEOUT, context.temp_allocator)
 	testing.expect_value(t, first, Error.Timeout)
 	testing.expect_value(t, u.failures, 0)
+	// Not charged, but still counted: the figures show the query.
+	testing.expect_value(t, u.stats.failure_kinds[.Timeout], 1)
 
 	_, second := exchange(u, wire, X_TIMEOUT, context.temp_allocator)
 	testing.expect_value(t, second, Error.Timeout)

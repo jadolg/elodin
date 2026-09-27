@@ -344,7 +344,13 @@ the life of the process, whatever the query rate does, and a recurrence is
 still on the `debug` line `exchange` writes for every one.
 */
 @(private)
-record_failure :: proc(u: ^Upstream, err: Error) {
+record_failure :: proc(
+	u: ^Upstream,
+	err: Error,
+	// False for a failure that is counted but must not move the upstream
+	// towards the cooldown; see `exchange`.
+	charge := true,
+) {
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
 	u.stats.queries += 1
@@ -352,6 +358,9 @@ record_failure :: proc(u: ^Upstream, err: Error) {
 	u.stats.failure_kinds[err] += 1
 	if note_failure_kind(u, err) {
 		logx.warnf("upstream %s (%v %s): %v", u.spec.name, u.spec.kind, u.spec.address, err)
+	}
+	if !charge {
+		return
 	}
 	/*
 	A recycled connection is not a reason to bench the server.
@@ -575,7 +584,8 @@ exchange :: proc(
 	nothing fails as a timeout, which it is: the upstream had the whole of it.
 	On the tick clock, which an NTP step cannot move.
 	*/
-	deadline := time.tick_add(time.tick_now(), timeout)
+	entered := time.tick_now()
+	deadline := time.tick_add(entered, timeout)
 	/*
 	A hostname the bootstrap resolvers were asked about and did not resolve is a
 	failure like any other, recorded so it counts towards the cooldown. With a
@@ -612,18 +622,18 @@ exchange :: proc(
 		not given the whole of it, and a member cut short must not be parked for
 		it - the rule `resolve_sequential` states. Once, since the address is
 		then held and every later exchange gives the member its whole timeout
-		and judges it on that.
+		and judges it on that. Still counted, so the figures show the query.
 		*/
-		if !(resolving && err == .Timeout) {
-			record_failure(u, err)
-		}
+		record_failure(u, err, charge = !(resolving && err == .Timeout))
 		logx.debugf(
 			"upstream %s (%v %s:%d) failed after %v: %v",
 			u.spec.name,
 			u.spec.kind,
 			u.spec.address,
 			u.spec.port,
-			time.diff(start, time.now()),
+			// From entry rather than `start`: bootstrap resolution is part of
+			// what the exchange's timeout covers now.
+			time.tick_since(entered),
 			err,
 		)
 		return nil, err
