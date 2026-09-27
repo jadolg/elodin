@@ -273,73 +273,94 @@ http_exchange :: proc(
 		buf    = make([dynamic]u8, 0, 8192, context.temp_allocator),
 	}
 
-	status_line := reader_line(&r) or_return
+	/*
+	Interim (1xx) responses come first and are passed over: their fields are
+	read under the same rules, then dropped, and the next status line is the
+	response's own (RFC 9110 15.2). Each one counts against the field limit,
+	or a peer could send them forever (#442).
+	*/
 	http_1_0: bool
-	resp.status, http_1_0 = parse_status(status_line) or_return
-	// HTTP/1.0 closes unless it says otherwise (RFC 9112 9.3), and saying so is
-	// not worth honouring for one saved dial: only 1.1 and later are pooled.
-	resp.keep_alive = !http_1_0
-
-	content_length := -1
-	chunked := false
+	content_length: int
+	chunked: bool
 	headers := 0
 	for {
-		line := reader_line(&r) or_return
-		if line == "" {
+		status_line := reader_line(&r) or_return
+		resp.status, http_1_0 = parse_status(status_line) or_return
+		// HTTP/1.0 closes unless it says otherwise (RFC 9112 9.3), and saying so
+		// is not worth honouring for one saved dial: only 1.1 and later are pooled.
+		resp.keep_alive = !http_1_0
+		resp.location = ""
+		content_length = -1
+		chunked = false
+		for {
+			line := reader_line(&r) or_return
+			if line == "" {
+				break
+			}
+			headers += 1
+			if headers > MAX_HTTP_HEADERS {
+				return resp, .HTTP_Error
+			}
+			name, value, ok := split_header(line)
+			if !ok {
+				return resp, .HTTP_Error
+			}
+			switch {
+			/*
+			Names and the `close` option compare without regard to ASCII case and no
+			other: `strings.equal_fold` folds Unicode, where the long s (U+017F) is
+			an `s`, so `Tran\u017ffer-Encoding` framed the body as chunked (#432).
+			*/
+			case dns.name_equal_fold(name, "content-length"):
+				// RFC 9112 6.3: more than one of these and the message is invalid,
+				// agreeing or not.
+				if content_length >= 0 {
+					return resp, .HTTP_Error
+				}
+				v, cl_err := parse_content_length(value)
+				// A value that is not a length is refused here rather than left to
+				// fall past the `== 0` and `> 0` cases below onto the read-to-end
+				// path, which is not what the peer asked for.
+				if cl_err != .None {
+					return resp, cl_err
+				}
+				content_length = v
+			case dns.name_equal_fold(name, "transfer-encoding"):
+				/*
+				`chunked` alone, once, or the response is refused (#437). This
+				client asks for no codings, so any other is one it cannot undo -
+				`chunked, gzip` framed as chunks handed the gzip on as the answer -
+				and RFC 9112 6.1 forbids chunked anywhere but last, or twice. Read
+				as a substring, `xchunked` took chunk framing out of a plain body.
+				*/
+				if chunked || !dns.name_equal_fold(value, "chunked") {
+					return resp, .HTTP_Error
+				}
+				chunked = true
+			case dns.name_equal_fold(name, "connection"):
+				// A list of options (RFC 9110 7.6.1): `keep-alive, close` closes.
+				if h2.list_has_token(value, "close") {
+					resp.keep_alive = false
+				}
+			case dns.name_equal_fold(name, "location"):
+				// Scratch, as the doc comment above promises: only the body is the
+				// caller's to free. Taking the first of a repeated header rather than
+				// the last also stops a server orphaning a string per copy.
+				if resp.location == "" {
+					resp.location = strings.clone(value, context.temp_allocator)
+				}
+			}
+		}
+		// A 101 is an answer to an upgrade this client never asks for.
+		if resp.status == 101 {
+			return resp, .HTTP_Error
+		}
+		if resp.status >= 200 {
 			break
 		}
 		headers += 1
 		if headers > MAX_HTTP_HEADERS {
 			return resp, .HTTP_Error
-		}
-		name, value, ok := split_header(line)
-		if !ok {
-			return resp, .HTTP_Error
-		}
-		switch {
-		/*
-		Names and the `close` option compare without regard to ASCII case and no
-		other: `strings.equal_fold` folds Unicode, where the long s (U+017F) is
-		an `s`, so `Tran\u017ffer-Encoding` framed the body as chunked (#432).
-		*/
-		case dns.name_equal_fold(name, "content-length"):
-			// RFC 9112 6.3: more than one of these and the message is invalid,
-			// agreeing or not.
-			if content_length >= 0 {
-				return resp, .HTTP_Error
-			}
-			v, cl_err := parse_content_length(value)
-			// A value that is not a length is refused here rather than left to
-			// fall past the `== 0` and `> 0` cases below onto the read-to-end
-			// path, which is not what the peer asked for.
-			if cl_err != .None {
-				return resp, cl_err
-			}
-			content_length = v
-		case dns.name_equal_fold(name, "transfer-encoding"):
-			/*
-			`chunked` alone, once, or the response is refused (#437). This
-			client asks for no codings, so any other is one it cannot undo -
-			`chunked, gzip` framed as chunks handed the gzip on as the answer -
-			and RFC 9112 6.1 forbids chunked anywhere but last, or twice. Read
-			as a substring, `xchunked` took chunk framing out of a plain body.
-			*/
-			if chunked || !dns.name_equal_fold(value, "chunked") {
-				return resp, .HTTP_Error
-			}
-			chunked = true
-		case dns.name_equal_fold(name, "connection"):
-			// A list of options (RFC 9110 7.6.1): `keep-alive, close` closes.
-			if h2.list_has_token(value, "close") {
-				resp.keep_alive = false
-			}
-		case dns.name_equal_fold(name, "location"):
-			// Scratch, as the doc comment above promises: only the body is the
-			// caller's to free. Taking the first of a repeated header rather than
-			// the last also stops a server orphaning a string per copy.
-			if resp.location == "" {
-				resp.location = strings.clone(value, context.temp_allocator)
-			}
 		}
 	}
 
@@ -357,6 +378,10 @@ http_exchange :: proc(
 	}
 
 	switch {
+	case resp.status == 204 || resp.status == 304:
+		// No body, whatever the fields say (RFC 9112 6.3): read by them, a 204
+		// on a kept-alive connection waited for a close that never came (#442).
+		resp.body = nil
 	case chunked:
 		resp.body = read_chunked(&r, allocator) or_return
 	case content_length == 0:
