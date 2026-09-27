@@ -45,8 +45,7 @@ Fetch one record set on the validator's behalf.
 Must ask with DO and CD set: the validator wants the signatures, and it wants
 the upstream's own opinion of them kept out of the way. `wire` is a complete DNS
 response allocated from `allocator`.
-*/
-/*
+
 `deadline` is the client question's own, passed through from `validate` for the
 query procedure to spend its upstream wait against (issue #439): every lookup a
 walk makes is part of the one question. Nil where the caller set none.
@@ -497,6 +496,23 @@ report an unanswered lookup gets, code 22, and deliberately not `Bogus`. The
 reply may be perfectly genuine; what ran out is ours. See issue #354.
 */
 READING_OVER_BUDGET :: "this query has taken as much as it may to read what it was sent"
+
+/*
+Why a step stopped when the client question had no upstream waiting left.
+
+The question's own deadline (issue #439), which the query procedure would refuse
+anyway without asking anybody - so said here, before a lookup is spent or a slot
+taken, in words that name this server's limit rather than "chain of trust
+unavailable", which reads as the upstream failing. The upstream did spend the
+time; what ran out is ours.
+*/
+DEADLINE_PASSED :: "this query has waited as long as it may on its upstreams"
+
+// Whether the question's deadline is set and has passed. See `DEADLINE_PASSED`.
+@(private)
+deadline_passed :: proc(budget: ^Budget) -> bool {
+	return budget.deadline != nil && budget.deadline^ != {} && time.tick_diff(time.tick_now(), budget.deadline^) <= 0
+}
 
 /*
 Why a walk that came back `Indeterminate` stopped, in the words of the step that
@@ -3499,6 +3515,9 @@ zone_step :: proc(
 		return .No_Cut, nil
 	}
 
+	if deadline_passed(budget) {
+		return walk_gave_up(budget, DEADLINE_PASSED), nil
+	}
 	if !may_look_up(v, budget) {
 		return walk_gave_up(budget, WALKS_IN_FLIGHT), nil
 	}
@@ -3875,6 +3894,10 @@ fetch_keys :: proc(
 	keys: []Dnskey,
 	status: Status,
 ) {
+	if deadline_passed(budget) {
+		budget.walk_stopped = DEADLINE_PASSED
+		return nil, .Indeterminate
+	}
 	if !may_look_up(v, budget) {
 		budget.walk_stopped = WALKS_IN_FLIGHT
 		return nil, .Indeterminate

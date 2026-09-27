@@ -267,6 +267,32 @@ test_zone_keys_are_cached :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+/*
+A question whose upstream deadline has passed makes no lookup, and says so in
+its own words rather than as the upstream failing (issue #439). The query
+procedure would refuse it anyway; asking here keeps the lookup and the slot
+unspent and the reason honest. A deadline still running changes nothing.
+*/
+@(test)
+test_a_walk_past_the_question_deadline_asks_nobody :: proc(t: ^testing.T) {
+	counter := Counting_Ctx{}
+	v := make_validator(counting_query, &counter, Options{})
+	defer destroy_validator(v)
+	f := fixture("example_a")
+
+	passed := time.tick_add(time.tick_now(), -time.Millisecond)
+	result := validate(v, "www.example.com.", .A, unhex(f.wire), fixture_now(), deadline = &passed)
+	testing.expect_value(t, result.status, Status.Indeterminate)
+	testing.expect_value(t, result.reason, DEADLINE_PASSED)
+	testing.expect_value(t, counter.queries, 0)
+
+	running := time.tick_add(time.tick_now(), time.Minute)
+	result = validate(v, "www.example.com.", .A, unhex(f.wire), fixture_now(), deadline = &running)
+	testing.expect_value(t, result.status, Status.Secure)
+	testing.expect(t, counter.queries > 0, "a walk inside its deadline asked nobody")
+	free_all(context.temp_allocator)
+}
+
 @(test)
 test_validates_ecdsa_answer :: proc(t: ^testing.T) {
 	v := test_validator()

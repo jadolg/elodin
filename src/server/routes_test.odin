@@ -2675,3 +2675,32 @@ test_an_apex_ds_spends_one_budget_across_both_groups :: proc(t: ^testing.T) {
 	testing.expectf(t, spent < 5 * cfg.upstream.timeout / 2, "the query waited %v, where its budget is two timeouts of %v", spent, cfg.upstream.timeout)
 	free_all(context.temp_allocator)
 }
+
+/*
+A question's deadline spans the longest budget of any group (issue #439), not
+the first one it asks: a LAN route with a short `timeout` would otherwise leave
+the chain walk behind it, which always asks the default group, a sliver of the
+time that group was given.
+*/
+@(test)
+test_the_question_span_is_the_longest_group_budget :: proc(t: ^testing.T) {
+	cfg := forwarding_config()
+	cfg.upstream.timeout = 5 * time.Second
+	group := mock_group(t, cfg.upstream, 9)
+	defer upstream.destroy_group(group)
+	lan := cfg
+	lan.upstream.timeout = 200 * time.Millisecond
+	routed := mock_group(t, lan.upstream, 9)
+	defer upstream.destroy_group(routed)
+
+	s := Server {
+		cfg    = &cfg,
+		group  = group,
+		routes = []Zone_Route{{domains = []string{"lan."}, group = routed}},
+	}
+	testing.expect_value(t, question_span(&s), 10 * time.Second)
+	// And the other way round: a route slower than the default sets it.
+	s.group, s.routes[0].group = routed, group
+	testing.expect_value(t, question_span(&s), 10 * time.Second)
+	free_all(context.temp_allocator)
+}

@@ -97,6 +97,30 @@ Zone_Route :: struct {
 }
 
 /*
+How long one client question may spend waiting on upstreams, from its first
+exchange (issue #439): the longest `upstream.query_budget` of any group this
+server has, the default and every route.
+
+The longest rather than that of whichever group a question asks first, because
+one question can ask several: a LAN route's 200 ms forward would otherwise leave
+the chain walk behind it, which always asks the default group, a few hundred
+milliseconds for the public tree instead of the ten seconds that group was given.
+Where every group has the same `timeout` - the configuration nearly everybody
+runs - it is two of them, the figure #327 set for one group.
+*/
+question_span :: proc(s: ^Server) -> (span: time.Duration) {
+	if s.group != nil {
+		span = upstream.query_budget(s.group)
+	}
+	for route in s.routes {
+		if route.group != nil {
+			span = max(span, upstream.query_budget(route.group))
+		}
+	}
+	return
+}
+
+/*
 The group that answers `name`: the longest route that claims it, or the default.
 
 Longest match, so `dev.corp.example.` can be routed away from `corp.example.`

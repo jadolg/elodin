@@ -149,8 +149,8 @@ resolve_answerable :: proc(
 	g: ^Group,
 	query: []u8,
 	allocator := context.allocator,
-	// The client question's deadline, shared by every call made for it; see
-	// `resolve_insisting`. Nil for a call with a budget of its own.
+	// The client question's deadline, set by the caller and shared by every
+	// call made for it; see `resolve_insisting`. Nil or zero for none.
 	deadline: ^time.Tick = nil,
 ) -> (
 	response: []u8,
@@ -200,8 +200,8 @@ resolve_readable :: proc(
 	g: ^Group,
 	query: []u8,
 	allocator := context.allocator,
-	// The client question's deadline, shared by every call made for it; see
-	// `resolve_insisting`. Nil for a call with a budget of its own.
+	// The client question's deadline, set by the caller and shared by every
+	// call made for it; see `resolve_insisting`. Nil or zero for none.
 	deadline: ^time.Tick = nil,
 ) -> (
 	response: []u8,
@@ -221,7 +221,8 @@ whose rcode the client can read - and everything else about the sweep is common
 to both, so it is written once here.
 
 Transport failures are deliberately not retried: `resolve` has already exhausted
-them, every server for `attempts` rounds within its budget of two timeouts.
+them, every server for `attempts` rounds within its budget: two timeouts, or
+what is left of the question's deadline if that is less.
 What it leaves unretried is the reply that did arrive and was no use, so that
 is what this asks again.
 */
@@ -245,28 +246,25 @@ resolve_insisting :: proc(
 	`query_budget` of its own, so a degraded group held a query worker for the
 	sum of them.
 
-	The first call sets the deadline, at its own `query_budget` from now: that
-	is the group whose timeout the operator set for this question, where one
-	taken from the default group would cut a route with a longer one short.
-	Every later call spends what is left, and a call that finds none asks
-	nobody. The rules within a call are unchanged - every exchange charged, a
-	member's own timeout never shortened - so the one exchange that crosses the
-	line still finishes, and the question's worst wait is three timeouts
-	however many calls it makes.
+	The caller owns the deadline and sets it; this only spends it. Every call
+	gets the lesser of its own `query_budget` and what is left, and a call that
+	finds none left asks nobody - no exchange, so no member is charged for it.
+	The rules within a call are unchanged - every exchange charged, a member's
+	own timeout never shortened, the exchange that crosses the line allowed to
+	finish - so a call started with any time left can overrun the deadline by
+	one timeout and no more, and a question's worst wait is its span plus one
+	timeout however many calls it makes. Zero, or nil, is no deadline.
 
 	On the tick clock, for the reason `resolve_sequential` gives.
 	*/
 	budget := query_budget(g)
-	if deadline != nil {
-		now := time.tick_now()
-		if deadline^ == {} {
-			deadline^ = time.tick_add(now, budget)
-		}
-		budget = min(budget, time.tick_diff(now, deadline^))
-		if budget <= 0 {
+	if deadline != nil && deadline^ != {} {
+		left := time.tick_diff(time.tick_now(), deadline^)
+		if left <= 0 {
 			logx.debugf("this query's upstream deadline has passed, not asking the group again for it")
 			return nil, nil, .Deadline
 		}
+		budget = min(budget, left)
 	}
 
 	// Scratch, on the request's own thread, whose arena the caller resets - and
@@ -757,8 +755,8 @@ extended_error_within :: proc(response: []u8, first, last: u16) -> bool {
 }
 
 // The waiting one `resolve_insisting` call may do, `resolve` and its sweep
-// together; `resolve_sequential` says why it is two timeouts.
-@(private)
+// together; `resolve_sequential` says why it is two timeouts. Also what a
+// caller spans a question's deadline from.
 query_budget :: proc(g: ^Group) -> time.Duration {
 	return 2 * g.timeout
 }
@@ -958,9 +956,12 @@ race_worker :: proc(data: rawptr) {
 resolve_race :: proc(
 	g: ^Group,
 	query: []u8,
-	// The caller's wait is the lesser of this and `g.timeout`. The racers keep
-	// their whole timeout, on threads of their own, so a member is never judged
-	// on the shorter wait.
+	/*
+	Passed on to the sequential fallback, and not a bound on the race's own
+	wait: a race started with any of it left waits its `g.timeout` out, the way
+	`resolve_sequential` lets the exchange that crosses the line finish. Waiting
+	less would send every member a query and throw the answers away.
+	*/
 	budget: time.Duration,
 	allocator: mem.Allocator,
 	unreachable: ^[dynamic]^Upstream = nil,
@@ -1019,7 +1020,7 @@ resolve_race :: proc(
 		return resolve_sequential(g, query, 0, budget, allocator, unreachable)
 	}
 
-	if !sync.sema_wait_with_timeout(&st.sema, min(g.timeout, budget)) {
+	if !sync.sema_wait_with_timeout(&st.sema, g.timeout) {
 		// Nobody answered in time. Workers still running will see `done` and
 		// throw their answers away rather than writing into a dead frame.
 		sync.mutex_lock(&st.mu)

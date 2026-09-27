@@ -1091,8 +1091,8 @@ resolve_query :: proc(
 	spent: ^int,
 	/*
 	The request's upstream deadline, owned by whoever owns the request, like
-	`spent`: zero until the first upstream call sets it, and spent by every call
-	after that - the forward, both groups of a routed apex `DS`, every lookup
+	`spent`: zero until the question's first forward sets it, and spent by every
+	upstream call - the forward, both groups of a routed apex `DS`, every lookup
 	of the chain walk, and a rewrite alias's target (issue #439). See
 	`upstream.resolve_insisting`.
 	*/
@@ -2074,6 +2074,14 @@ resolve_query :: proc(
 			unproven_apex_ds = true
 		}
 	}
+	/*
+	The question's upstream deadline starts here, at its first exchange, unless
+	an earlier one already started it - a rewrite alias's target is forwarded
+	by a call nested inside the question's own. See `question_span`.
+	*/
+	if deadline^ == {} {
+		deadline^ = time.tick_add(time.tick_now(), question_span(s))
+	}
 	resp: []u8
 	winner: ^upstream.Upstream
 	uerr: upstream.Error
@@ -2213,8 +2221,9 @@ resolve_query :: proc(
 				unproven_apex_ds = !settled
 			} else {
 				logx.debugf(
-					"query DS %s: the route did not answer either (%v); the delegation is unestablished",
+					"query DS %s: the route %s (%v); the delegation is unestablished",
 					q.name,
+					"was not asked, the query's deadline having passed" if aerr == .Deadline else "did not answer either",
 					aerr,
 				)
 				uerr = aerr
@@ -2267,6 +2276,14 @@ resolve_query :: proc(
 
 	A fresh transaction ID for the same reason the second exchange draws one:
 	each exchange is a new one on the wire (RFC 5452 section 9.2).
+
+	On what the route left of the question's deadline (issue #439), like every
+	exchange after the first. A route that has gone silent without yet parking
+	spends all of it on its two rounds, and the parent is not reached: that is
+	two queries, since each charges the route twice, after which the route is
+	parked, the memory is passed over by the `group_reachable(own)` above, and
+	the parent is asked first with the whole deadline. Before, those two queries
+	were answered - at four timeouts, twenty seconds, long after the stub left.
 	*/
 	if memoised_parent != nil {
 		route_proved, _ := parent_answers_apex_ds(resp, q.name, uerr == .None, spent, allocator)
