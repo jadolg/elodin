@@ -213,10 +213,11 @@ Conn :: struct {
 	Every reset remembered goes through `stream_error`, which spends
 	MAX_CONTROL_FRAMES_PER_SECOND (the server's own budget has no `earned`
 	credit to stretch it). The window is fixed, so a full one either side of
-	it rolling over can land together; RESET_IDS holds both. In flight means
-	sent before our reset arrived - a round trip - so a slot is only ever
-	overwritten once it has stopped mattering. If one is overwritten sooner,
-	DATA on it falls back to `closed_stream_rst_budget` and trailers on it to
+	it rolling over can land together; RESET_IDS holds both, so a slot lasts at
+	least a second at the fastest a peer can reset. In flight means sent before
+	our reset arrived - a round trip, which is well inside that on any link a
+	resolver serves. On one slower than a second, an id overwritten early has
+	DATA on it fall back to `closed_stream_rst_budget` and trailers on it to
 	the connection error every other reused id gets.
 
 	An id is struck off once the peer ends or resets the stream, or its
@@ -1091,7 +1092,7 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 	if s.refused || s.discard {
 		free_headers(headers, c.allocator)
 		sent := s.discard || stream_error(c, s.id, .Refused_Stream)
-		close_stream(c, s.id, peer_sending = !s.end_stream && !s.discard)
+		close_stream(c, s.id, peer_sending = !s.end_stream)
 		return sent
 	}
 
