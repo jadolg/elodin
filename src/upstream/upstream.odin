@@ -579,7 +579,7 @@ exchange :: proc(
 	/*
 	A hostname the bootstrap resolvers were asked about and did not resolve is a
 	failure like any other, recorded so it counts towards the cooldown. With a
-	bootstrap resolver gone quiet, finding that out takes seconds per query, and
+	bootstrap resolver gone quiet, finding that out takes the timeout, and
 	a member that never parked would be asked - and waited on - by every query
 	for as long as the bootstrap stayed down (issue #327). With no bootstrap
 	servers to ask the refusal costs nothing, and is left unrecorded as before.

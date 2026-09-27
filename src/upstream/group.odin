@@ -849,10 +849,10 @@ resolve_sequential :: proc(
 				if xerr == .None {
 					return resp, u, .None
 				}
-				// Charged whatever it was, a hostname the bootstrap took seconds
-				// to fail on included; `exchange` records that failure like any
-				// other, so such a member parks rather than taking the budget on
-				// every query.
+				// Charged whatever it was, a hostname the bootstrap spent the
+				// member's timeout failing on included; `exchange` records that
+				// failure like any other, so such a member parks rather than
+				// taking the budget on every query.
 				spent += time.tick_since(before)
 				last_err = xerr
 				if unreachable != nil {

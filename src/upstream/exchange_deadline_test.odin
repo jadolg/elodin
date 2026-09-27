@@ -218,6 +218,40 @@ test_a_dead_bootstrap_server_leaves_time_for_the_next :: proc(t: ^testing.T) {
 }
 
 /*
+A server's A query has that server's whole share to be answered in, rather than
+half of it with the other half held back for AAAA: a live bootstrap server
+slower than half its share otherwise never resolves the name, since every
+exchange repeats the same split. A silent server that spends its share on A is
+therefore asked nothing more; it is sent one query, not two.
+*/
+@(test)
+test_a_bootstrap_servers_a_query_has_its_whole_share :: proc(t: ^testing.T) {
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, serr == nil, "cannot bind the bootstrap mock: %v", serr) {
+		return
+	}
+	defer net.close(socket)
+	bound, _ := net.bound_endpoint(socket)
+	servers := []string{net.endpoint_to_string(bound, context.temp_allocator)}
+
+	_, ok := bootstrap_resolve(servers, "share.example.test", time.tick_add(time.tick_now(), X_TIMEOUT))
+	testing.expect(t, !ok, "resolved with nothing answering")
+
+	set_socket_timeouts(socket, 10 * time.Millisecond)
+	buf: [512]u8
+	asked := 0
+	for {
+		n, _, err := net.recv_udp(socket, buf[:])
+		if err != nil || n <= 0 {
+			break
+		}
+		asked += 1
+	}
+	testing.expect_value(t, asked, 1)
+	free_all(context.temp_allocator)
+}
+
+/*
 And the member is not charged a timeout on the exchange that resolved its
 hostname: the bootstrap servers spent part of its timeout, and a member cut
 short must not be parked for it. The next exchange, the address held, gives it

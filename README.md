@@ -425,8 +425,8 @@ takes its `timeout`, whatever it does inside: resolving a hostname upstream
 through `bootstrap`, asking again with a fresh DNS cookie, retrying a truncated
 answer over TCP. A truncated answer that arrives late therefore leaves its TCP
 retry little time, and fails rather than doubling the wait. The one overrun
-left is a second's grace for a TCP, DoT or DoH server to finish a message it
-has already started sending, so the connection is not left mid-message.
+left is a second's grace for a TCP or DoT server to finish a message it has
+already started sending, so the connection is not left mid-message.
 
 `bootstrap` matters: elodin resolves upstream hostnames itself rather than
 through the system resolver, since on a machine where elodin *is* the system
