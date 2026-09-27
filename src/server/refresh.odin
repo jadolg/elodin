@@ -377,9 +377,6 @@ refresh_job :: proc(data: rawptr) {
 
 	unanswered: bool
 	ede: u16
-	// Its own, like `spent`: a refresh is a question of its own on its own
-	// thread, and the client that started it is not waiting on this one.
-	deadline: time.Tick
 	resp, outcome, ok := resolve_query(
 		s,
 		r.query,
@@ -390,7 +387,6 @@ refresh_job :: proc(data: rawptr) {
 		cookie,
 		r.started,
 		&spent,
-		&deadline,
 		context.temp_allocator,
 		true,
 		&unanswered,

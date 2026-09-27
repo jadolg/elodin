@@ -261,7 +261,6 @@ test_a_chased_target_that_cannot_be_read_back_is_servfail :: proc(t: ^testing.T)
 		Cookie_Request{},
 		time.now(),
 		&spent,
-		nil,
 		context.temp_allocator,
 		false,
 	)
