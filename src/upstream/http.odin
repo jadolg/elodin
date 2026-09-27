@@ -29,6 +29,11 @@ stream_read :: proc(s: ^Stream, buf: []u8) -> (n: int, err: Error) {
 		if terr == .Closed {
 			return 0, .None
 		}
+		// A read that ran out of time is a timeout on either half, as in
+		// `pipe_read_full`: `IO_Error` says the peer broke, not that it was slow.
+		if terr == .Timeout {
+			return 0, .Timeout
+		}
 		if terr != .None {
 			return 0, .IO_Error
 		}
@@ -36,6 +41,10 @@ stream_read :: proc(s: ^Stream, buf: []u8) -> (n: int, err: Error) {
 	}
 	got, nerr := net.recv_tcp(s.socket, buf)
 	if nerr != nil {
+		// SO_RCVTIMEO expiring is EAGAIN, which core:net calls .Would_Block.
+		if nerr == .Timeout || nerr == .Would_Block {
+			return 0, .Timeout
+		}
 		return 0, .IO_Error
 	}
 	return got, .None
@@ -59,13 +68,17 @@ stream_write :: proc(s: ^Stream, buf: []u8) -> Error {
 	return .None
 }
 
-// How long the next read may wait, on whichever half the stream reads through.
+/*
+How long the next read may wait, on whichever half the stream reads through.
+Never less than a millisecond: a zero `SO_RCVTIMEO` is no timeout at all.
+*/
 stream_set_read_timeout :: proc(s: ^Stream, timeout: time.Duration) {
+	bounded := max(timeout, time.Millisecond)
 	if s.tls != nil {
-		tlsx.set_read_timeout(s.tls, timeout)
+		tlsx.set_read_timeout(s.tls, bounded)
 		return
 	}
-	_ = net.set_option(s.socket, .Receive_Timeout, timeout)
+	_ = net.set_option(s.socket, .Receive_Timeout, bounded)
 }
 
 stream_close :: proc(s: ^Stream) {
@@ -87,6 +100,9 @@ Buf_Reader :: struct {
 	// may wait (zero for as long as the deadline allows). See `reader_fill`.
 	deadline: time.Tick,
 	idle:     time.Duration,
+	// The peer has closed: what `reader_to_end` waits for, and the only thing
+	// that ends a body with no framing.
+	closed:   bool,
 }
 
 @(private)
@@ -95,8 +111,7 @@ reader_fill :: proc(r: ^Buf_Reader) -> Error {
 	A timeout per read bounds a silent peer and nothing else: a peer sending a
 	line just inside it, again and again, held the exchange for as long as the
 	field limit and the body limit let it (#445). So each read waits for what
-	is left of the deadline at most. Never less than a millisecond: a zero
-	`SO_RCVTIMEO` is no timeout at all.
+	is left of the deadline at most.
 	*/
 	if r.deadline != {} {
 		wait := time.tick_diff(time.tick_now(), r.deadline)
@@ -106,14 +121,11 @@ reader_fill :: proc(r: ^Buf_Reader) -> Error {
 		if r.idle > 0 {
 			wait = min(wait, r.idle)
 		}
-		stream_set_read_timeout(r.stream, max(wait, time.Millisecond))
+		stream_set_read_timeout(r.stream, wait)
 	}
 	chunk: [8192]u8
 	n, err := stream_read(r.stream, chunk[:])
 	if err != .None {
-		if r.deadline != {} && time.tick_diff(time.tick_now(), r.deadline) <= 0 {
-			return .Timeout
-		}
 		return err
 	}
 	/*
@@ -131,6 +143,7 @@ reader_fill :: proc(r: ^Buf_Reader) -> Error {
 	ends a body with no length, and discards whichever of the two it gets.
 	*/
 	if n == 0 {
+		r.closed = true
 		return .Peer_Closed if len(r.buf) == 0 else .IO_Error
 	}
 	append(&r.buf, ..chunk[:n])
@@ -216,8 +229,17 @@ reader_to_end :: proc(r: ^Buf_Reader, limit: int) -> (data: []u8, err: Error) {
 		if len(r.buf) - r.pos > limit {
 			return nil, .Too_Large
 		}
+		/*
+		The close is the end of the body, and nothing else is. Any failed read
+		ended it: a deadline or a read timeout cut it short and the part that
+		had arrived came back as the whole, with no error - for a list, a
+		partial copy written over the good cached one (#445).
+		*/
 		if ferr := reader_fill(r); ferr != .None {
-			break
+			if r.closed {
+				break
+			}
+			return nil, ferr
 		}
 	}
 	return r.buf[r.pos:], .None

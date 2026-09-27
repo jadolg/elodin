@@ -3221,7 +3221,7 @@ test_a_trickled_list_download_is_bounded_by_its_total :: proc(t: ^testing.T) {
 		testing.expectf(t, spent < 1500 * time.Millisecond, "a 500ms fetch was held for %v", spent)
 	}
 	{
-		m, server, port, ok := start_trickle(t, "HTTP/1.1 200 OK\r\n", "X: y\r\n", count = 1, interval = 3 * time.Second)
+		m, server, port, ok := start_trickle(t, "HTTP/1.1 200 OK\r\n", "X: y\r\n", count = 1, interval = time.Second)
 		if !ok {
 			return
 		}
@@ -3232,5 +3232,126 @@ test_a_trickled_list_download_is_bounded_by_its_total :: proc(t: ^testing.T) {
 		testing.expectf(t, err != .None, "a silent host was answered, %d bytes", len(body))
 		testing.expectf(t, spent < 1500 * time.Millisecond, "a host silent past a 300ms read timeout held the fetch for %v", spent)
 	}
+	free_all(context.temp_allocator)
+}
+
+/*
+A body with no framing ends when the peer closes, and nothing else ends it. Every
+failed read did: a deadline or a read timeout cut the body short and the part
+that had arrived came back as the whole of it, with no error - for a blocklist,
+a partial list written over the good cached one (#445 review).
+*/
+@(test)
+test_an_unframed_body_cut_short_is_not_a_body :: proc(t: ^testing.T) {
+	{
+		m, server, port, ok := start_trickle(t, "HTTP/1.1 200 OK\r\n\r\n", "0.0.0.0 ads.example\n")
+		if !ok {
+			return
+		}
+		body, err := fetch_url(fmt.tprintf("http://127.0.0.1:%d/list.txt", port), nil, time.Second, 500 * time.Millisecond, context.temp_allocator)
+		stop_trickle(m, server)
+		testing.expectf(t, err == .Timeout, "a body past the deadline reported %v with %d bytes", err, len(body))
+	}
+	{
+		m, server, port, ok := start_trickle(t, "HTTP/1.1 200 OK\r\n\r\n0.0.0.0 ads.example\n", "x", count = 1, interval = time.Second)
+		if !ok {
+			return
+		}
+		body, err := fetch_url(fmt.tprintf("http://127.0.0.1:%d/list.txt", port), nil, 300 * time.Millisecond, 10 * time.Second, context.temp_allocator)
+		stop_trickle(m, server)
+		testing.expectf(t, err == .Timeout, "a body that went quiet reported %v with %d bytes", err, len(body))
+	}
+	free_all(context.temp_allocator)
+}
+
+@(private = "file")
+Tls_Silent_Mock :: struct {
+	listener: net.TCP_Socket,
+	ctx:      ^tlsx.Context,
+}
+
+// Completes the handshake, reads the request, and says nothing for a second.
+@(private = "file")
+tls_silent_once :: proc(m: ^Tls_Silent_Mock) {
+	client, _, err := net.accept_tcp(m.listener)
+	if err != nil {
+		return
+	}
+	_ = net.set_option(client, .Receive_Timeout, 3 * time.Second)
+	_ = net.set_option(client, .Send_Timeout, 3 * time.Second)
+	conn, terr := tlsx.server_accept(m.ctx, client)
+	if terr != .None {
+		net.close(client)
+		return
+	}
+	buf: [4096]u8
+	_, _ = tlsx.read(conn, buf[:])
+	time.sleep(time.Second)
+	tlsx.close(conn)
+}
+
+/*
+The deadline reads as a timeout over TLS as well. `tlsx` rounds what is left
+down to whole milliseconds for `poll`, so its read gives up a fraction early; a
+clock read after the fact found the deadline not yet passed and reported the
+peer as broken rather than slow (#445 review).
+*/
+@(test)
+test_a_silent_tls_peer_is_a_timeout :: proc(t: ^testing.T) {
+	posix.sigignore(.SIGPIPE)
+	sync.once_do(&dot_cert_once, generate_dot_certs)
+	if !dot_cert_ok {
+		testing.expect(t, false, "no certificate available and openssl could not make one")
+		return
+	}
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
+		return
+	}
+	sctx, serr := tlsx.server_context(dot_cert_path, dot_key_path)
+	if serr != .None {
+		testing.expectf(t, false, "server_context: %v", serr)
+		return
+	}
+	defer tlsx.context_destroy(sctx)
+	cctx, cerr := tlsx.client_context(false, "", []string{"http/1.1"})
+	if cerr != .None {
+		testing.expectf(t, false, "client_context: %v", cerr)
+		return
+	}
+	defer tlsx.context_destroy(cctx)
+
+	m := Tls_Silent_Mock {
+		listener = listener,
+		ctx      = sctx,
+	}
+	server := thread.create_and_start_with_poly_data(&m, tls_silent_once)
+	defer {
+		thread.join(server)
+		thread.destroy(server)
+	}
+
+	stream, oerr := open_stream(bound, cctx, "doh.invalid", 2 * time.Second)
+	if !testing.expectf(t, oerr == .None, "cannot open the stream: %v", oerr) {
+		return
+	}
+	defer stream_close(&stream)
+	start := time.tick_now()
+	_, err := http_exchange(
+		&stream,
+		Http_Request{method = "GET", path = "/", host = "doh.invalid"},
+		context.temp_allocator,
+		deadline = time.tick_add(time.tick_now(), 300 * time.Millisecond),
+	)
+	spent := time.tick_since(start)
+	testing.expectf(t, err == .Timeout, "a silent TLS peer reported %v after %v", err, spent)
+	testing.expectf(t, spent < 900 * time.Millisecond, "a 300ms deadline held for %v", spent)
 	free_all(context.temp_allocator)
 }

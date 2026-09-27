@@ -194,7 +194,9 @@ exchange_doh_h1 :: proc(
 			hands to the pool. Left alone, a connection opened with a sliver
 			would cut the next query short and one opened with the whole
 			timeout would hold a short query for all of it, which is the same
-			confusion `Pipe_Conn.timeout` exists to avoid.
+			confusion `Pipe_Conn.timeout` exists to avoid. This bounds the
+			request's write; the reads are held to the deadline one by one in
+			`reader_fill`.
 			*/
 			set_socket_timeouts(stream.socket, remaining)
 			if stream.tls != nil {
@@ -202,7 +204,8 @@ exchange_doh_h1 :: proc(
 			}
 		} else {
 			// `open_stream` puts this figure on the socket as well as on the
-			// dial, so it bounds the reads that follow too.
+			// dial, so it bounds the write that follows; `reader_fill` holds
+			// the reads to the deadline.
 			s, oerr := open_stream(u.endpoint, u.tls_ctx, u.spec.hostname, remaining, u)
 			if oerr != .None {
 				return nil, oerr
@@ -333,7 +336,9 @@ fetch_url :: proc(
 		if remaining <= 0 {
 			return nil, .Timeout
 		}
-		stream := open_stream(endpoint, tls_ctx, host_only, min(timeout, remaining)) or_return
+		// Floored as `stream_set_read_timeout` is: a sliver left rounds to a
+		// zero timeval, which the socket reads as no timeout at all.
+		stream := open_stream(endpoint, tls_ctx, host_only, max(min(timeout, remaining), time.Millisecond)) or_return
 		defer stream_close(&stream)
 
 		resp, herr := http_exchange(
