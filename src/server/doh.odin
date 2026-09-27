@@ -4,6 +4,7 @@ import "core:encoding/base64"
 import "core:strings"
 import "core:time"
 import "elodin:dns"
+import "elodin:h2"
 import "elodin:logx"
 import "elodin:tlsx"
 
@@ -149,15 +150,35 @@ http_fill :: proc(r: ^Http_Reader) -> bool {
 	return true
 }
 
+/*
+One line, up to CRLF.
+
+A bare LF, a bare CR or a NUL before it refuses the request (#432). RFC 9112 2.2
+lets a recipient take a bare LF for a line end, so a hop in front may read
+`X: a\nTransfer-Encoding: chunked` as two fields where this one would read one,
+and frame the body by chunks where this one framed it by Content-Length. The
+same goes for the request line, and a bare CR or NUL is what some hops split on
+or cut at. Nothing that speaks DoH sends any of them, and HTTP/2 already refuses
+them in a value (`field_value_is_valid`).
+
+Every byte before the first CRLF is looked at on the pass that finds it, so a
+byte is judged once it has a successor to be read against.
+*/
 @(private)
 http_line :: proc(r: ^Http_Reader) -> (line: string, ok: bool) {
 	for {
 		region := r.buf[r.pos:]
 		for i in 0 ..< max(0, len(region) - 1) {
-			if region[i] == '\r' && region[i + 1] == '\n' {
+			switch region[i] {
+			case '\r':
+				if region[i + 1] != '\n' {
+					return "", false
+				}
 				start := r.pos
 				r.pos += i + 2
 				return string(r.buf[start:start + i]), true
+			case '\n', 0:
+				return "", false
 			}
 		}
 		if len(r.buf) > MAX_HEADER_BYTES {
@@ -243,8 +264,8 @@ problem.
 The limit is applied digit by digit rather than to the total, so there is
 nothing for an overlong value to wrap in on the way to being checked.
 
-`value` is the field value as it arrived. What may surround the digits is `OWS`
-- spaces and tabs, RFC 9110 5.6.3 - and that is all this takes off.
+What may surround the digits is `OWS` - spaces and tabs, RFC 9110 5.6.3 - and
+that is all this takes off, whether or not the caller already has.
 */
 @(private)
 parse_content_length :: proc(value: string) -> (length: int, ok: bool) {
@@ -424,29 +445,38 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 		if header[colon - 1] == ' ' || header[colon - 1] == '\t' {
 			return {}, 0, false
 		}
+		/*
+		And a name is a token (RFC 9110 5.1), compared without regard to ASCII
+		case and no other. `strings.equal_fold` folds Unicode, where the long s
+		(U+017F) is an `s`, so `Ho\u017ft` was counted as Host; and a name outside
+		the token grammar, once folded ASCII only, would be skipped here while a
+		hop that folds the other way reads `Tran\u017ffer-Encoding` as framing
+		(#432). Refused, as the two shapes above are.
+		*/
 		name := header[:colon]
-		value := strings.trim_space(header[colon + 1:])
+		if !h2.is_token(name) {
+			return {}, 0, false
+		}
+		// `OWS` off it and nothing more: see `trim_ows`.
+		value := trim_ows(header[colon + 1:])
 		switch {
-		case strings.equal_fold(name, "content-length"):
+		case dns.name_equal_fold(name, "content-length"):
 			// RFC 9112 6.3: a message with more than one of these is invalid,
 			// whether or not they agree, because the hop in front is entitled to
 			// resolve the pair differently from the way this one would.
 			if content_length >= 0 {
 				return {}, 0, false
 			}
-			// The field value as it arrived, not `value`: `strings.trim_space`
-			// takes a non-breaking space off the end, which is not OWS and not
-			// something a front end would overlook.
-			v, vok := parse_content_length(header[colon + 1:])
+			v, vok := parse_content_length(value)
 			if !vok {
 				return {}, 0, false
 			}
 			content_length = v
-		case strings.equal_fold(name, "connection"):
-			if strings.equal_fold(value, "close") {
+		case dns.name_equal_fold(name, "connection"):
+			if dns.name_equal_fold(value, "close") {
 				req.keep_alive = false
 			}
-		case strings.equal_fold(name, "content-type"):
+		case dns.name_equal_fold(name, "content-type"):
 			// RFC 9110 5.3: a singleton field, and the loop keeps the last of a
 			// repeat while a hop in front may judge the first. So a repeat is a
 			// 400, as Host's is, rather than a media type picked for the check.
@@ -454,11 +484,8 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 			if content_types > 1 {
 				return {}, 400, false
 			}
-			// Only OWS off it, as Host's: `value` has been through
-			// `strings.trim_space`, which would make a type ending in a
-			// non-breaking space into this one.
-			req.content_type = hold(trim_ows(header[colon + 1:]))
-		case strings.equal_fold(name, "host"):
+			req.content_type = hold(value)
+		case dns.name_equal_fold(name, "host"):
 			/*
 			RFC 9112 3.2: a request carrying more than one Host is a 400, whether
 			or not the two agree - the same argument a repeated Content-Length
@@ -471,14 +498,8 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 			if hosts > 1 {
 				return {}, 400, false
 			}
-			// The field value as it arrived with `OWS` off it, not `value`: the
-			// authority is the other field a front end routes by, so the argument
-			// `parse_content_length` is handed the raw value for holds here too -
-			// a `Host` a front end refuses for the non-breaking space on the end
-			// of it must not become a host this hop trimmed into a valid one and
-			// wrote into a .mobileconfig.
-			req.host = hold(trim_ows(header[colon + 1:]))
-		case strings.equal_fold(name, "transfer-encoding"):
+			req.host = hold(value)
+		case dns.name_equal_fold(name, "transfer-encoding"):
 			// Chunked request bodies are not accepted; DoH clients send a
 			// Content-Length.
 			return {}, 0, false

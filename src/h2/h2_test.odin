@@ -2284,6 +2284,26 @@ test_malformed_requests_are_reset :: proc(t: ^testing.T) {
 				{":path", "https://elsewhere.example/dns-query"},
 			},
 		},
+		// RFC 3986 3.1: a scheme is ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ),
+		// ASCII only. The long s (U+017F) folds to `s` under Unicode rules, so
+		// `http\u017f` was read as https, and any other spelling outside the
+		// grammar named no scheme at all and skipped the :path checks (#432).
+		{
+			"a :scheme with a long s",
+			{{":method", "GET"}, {":scheme", "http\u017f"}, {":authority", "dns.example"}, {":path", "/dns-query"}},
+		},
+		{
+			"a :scheme with a long s carrying an absolute-form :path",
+			{{":method", "GET"}, {":scheme", "http\u017f"}, {":authority", "dns.example"}, {":path", "https://elsewhere.example/"}},
+		},
+		{
+			"a :scheme that begins with a digit",
+			{{":method", "GET"}, {":scheme", "1https"}, {":authority", "dns.example"}, {":path", "dns-query"}},
+		},
+		{
+			"a :scheme with a colon",
+			{{":method", "GET"}, {":scheme", "https:"}, {":authority", "dns.example"}, {":path", "dns-query"}},
+		},
 		// 8.5: CONNECT carries an authority and nothing else.
 		{
 			"CONNECT with :scheme and :path",

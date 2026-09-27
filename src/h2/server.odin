@@ -4,6 +4,7 @@ import "core:mem"
 import "core:strings"
 import "core:sync"
 import "core:time"
+import "elodin:dns"
 
 /*
 A server-side HTTP/2 connection, scoped to what a DoH endpoint needs.
@@ -902,8 +903,17 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 	arrives, `HTTPS` names a scheme this specification is silent about and so
 	carried any `:path` past these checks, which is the empty-`:scheme` hole
 	again with a capital letter in place of nothing at all.
+
+	And a scheme at all first: RFC 3986 3.1 writes it in ASCII letters, digits,
+	`+`, `-` and `.`, beginning with a letter. Anything else names no scheme and
+	would carry any `:path` past these checks as surely as an empty one did. And
+	folded in ASCII only: `strings.equal_fold` folds Unicode, where the long s
+	(U+017F) is an `s`, so `http\u017f` read as https (#432).
 	*/
-	if strings.equal_fold(scheme, "http") || strings.equal_fold(scheme, "https") {
+	if !scheme_is_valid(scheme) {
+		return true
+	}
+	if dns.name_equal_fold(scheme, "http") || dns.name_equal_fold(scheme, "https") {
 		if path == "*" {
 			return method != "OPTIONS"
 		}
@@ -915,6 +925,25 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 }
 
 /*
+RFC 9110 5.6.2: a token, which is what a field name is on either version of the
+protocol. ASCII only, so a name outside it cannot be one a Unicode case fold in
+some other hop reads as a field this one knows by another spelling.
+*/
+is_token :: proc(s: string) -> bool {
+	for i in 0 ..< len(s) {
+		switch s[i] {
+		case 'a' ..= 'z', 'A' ..= 'Z', '0' ..= '9':
+			continue
+		case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+			continue
+		}
+		return false
+	}
+	// 1*tchar: nothing at all is not a token.
+	return len(s) > 0
+}
+
+/*
 RFC 9113 8.2.1: a field name is an RFC 9110 token, and lowercase. Uppercase is
 not folded on receipt but malformed, so that two hops cannot disagree about
 which of `Transfer-Encoding` and `transfer-encoding` they were sent.
@@ -922,15 +951,28 @@ which of `Transfer-Encoding` and `transfer-encoding` they were sent.
 @(private)
 field_name_is_valid :: proc(name: string) -> bool {
 	for i in 0 ..< len(name) {
-		switch name[i] {
-		case 'a' ..= 'z', '0' ..= '9':
+		if name[i] >= 'A' && name[i] <= 'Z' {
+			return false
+		}
+	}
+	return is_token(name)
+}
+
+// RFC 3986 3.1: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ).
+@(private)
+scheme_is_valid :: proc(scheme: string) -> bool {
+	for i in 0 ..< len(scheme) {
+		switch scheme[i] {
+		case 'a' ..= 'z', 'A' ..= 'Z':
 			continue
-		case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
-			continue
+		case '0' ..= '9', '+', '-', '.':
+			if i > 0 {
+				continue
+			}
 		}
 		return false
 	}
-	return true
+	return len(scheme) > 0
 }
 
 /*

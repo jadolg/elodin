@@ -435,7 +435,14 @@ test_doh_answers_a_request_that_arrives_split :: proc(t: ^testing.T) {
 		return
 	}
 	time.sleep(200 * time.Millisecond)
-	if !send_all(t, client, "rved HTTP/1.1\r\nHost: dns.example\r\n\r\n") {
+	// And cut again between a CR and its LF: `http_line` refuses a bare CR, and
+	// a CR that is only the last byte read so far is not one (#432).
+	if !send_all(t, client, "rved HTTP/1.1\r\nHost: dns.example\r") {
+		net.shutdown(client, .Send)
+		return
+	}
+	time.sleep(200 * time.Millisecond)
+	if !send_all(t, client, "\n\r\n") {
 		net.shutdown(client, .Send)
 		return
 	}
@@ -2006,5 +2013,91 @@ test_doh_content_type_keeps_what_is_not_ows :: proc(t: ^testing.T) {
 			testing.expectf(t, got == c.accepted, "%q: read as %q, accepted %v, want %v", c.value, req.content_type, got, c.accepted)
 		}
 		free_all(context.temp_allocator)
+	}
+}
+
+/*
+A field name is a token (RFC 9110 5.1), and names and the `close` option compare
+without regard to ASCII case only (#432). `strings.equal_fold` folds Unicode, so
+`Ho\u017ft` - the long s, U+017F - was counted as Host and `clo\u017fe` closed the
+connection, and a name outside the token grammar was read at all: a hop that
+folds the same way reads `Tran\u017ffer-Encoding` as chunked framing while this
+one, once it folds ASCII only, would not. So such a line is refused, and a value
+keeps whatever is not OWS.
+*/
+@(test)
+test_doh_field_names_are_ascii_tokens :: proc(t: ^testing.T) {
+	Case :: struct {
+		headers:    string, // between the request line and Content-Length
+		accepted:   bool,
+		keep_alive: bool,
+		host:       string,
+		what:       string,
+	}
+	CASES := []Case {
+		{"Host: dns.example\r\n", true, true, "dns.example", "a plain Host"},
+		{"HOST: dns.example\r\n", true, true, "dns.example", "an uppercase Host"},
+		{"Ho\u017ft: dns.example\r\n", false, false, "", "a Host spelled with a long s"},
+		{"Host: dns.example\r\nHo\u017ft: evil.example\r\n", false, false, "", "a long-s Host after a real one"},
+		{"Host: dns.example\r\nTran\u017ffer-Encoding: chunked\r\n", false, false, "", "Transfer-Encoding with a long s"},
+		{"Host: dns.example\r\nX(y): 1\r\n", false, false, "", "a name with a delimiter"},
+		{"Host: dns.example\r\nX-Caf\u00e9: 1\r\n", false, false, "", "a name with a non-ASCII letter"},
+		{"Host: dns.example\r\nConnection: close\r\n", true, false, "dns.example", "Connection: close"},
+		{"Host: dns.example\r\nConnection: CLOSE\r\n", true, false, "dns.example", "Connection: CLOSE"},
+		{"Host: dns.example\r\nConnection: clo\u017fe\r\n", true, true, "dns.example", "close spelled with a long s"},
+		{"Host: dns.example\r\nConnection: close\u00a0\r\n", true, true, "dns.example", "close with a non-breaking space"},
+		{"Host: dns.example\r\nConnection:\tclose \r\n", true, false, "dns.example", "close with OWS around it"},
+	}
+	for c in CASES {
+		raw := fmt.tprintf(
+			"POST /dns-query HTTP/1.1\r\n%sContent-Type: application/dns-message\r\nContent-Length: 4\r\n\r\nabcd",
+			c.headers,
+		)
+		req, _, parsed, ok := read_request_over_loopback(t, raw, c.what)
+		if !ok {
+			return
+		}
+		testing.expectf(t, parsed == c.accepted, "%s: read %v, want %v", c.what, parsed, c.accepted)
+		if parsed && c.accepted {
+			testing.expectf(t, req.keep_alive == c.keep_alive, "%s: keep-alive %v, want %v", c.what, req.keep_alive, c.keep_alive)
+			testing.expectf(t, req.host == c.host, "%s: host %q, want %q", c.what, req.host, c.host)
+		}
+		free_all(context.temp_allocator)
+	}
+}
+
+/*
+A line ends at CRLF and nowhere else, and holds no bare LF, bare CR or NUL. RFC
+9112 2.2 lets a recipient take a bare LF for a line end, so a hop in front may
+read `X: a\nTransfer-Encoding: chunked` as two fields where this one read one -
+framing by chunks where elodin framed by Content-Length. A value holding one of
+these was already malformed over HTTP/2 (`field_value_is_valid`).
+*/
+@(test)
+test_doh_lines_hold_no_bare_line_ends :: proc(t: ^testing.T) {
+	Case :: struct {
+		raw:  string,
+		what: string,
+	}
+	BODY :: "Content-Type: application/dns-message\r\nContent-Length: 4\r\n\r\nabcd"
+	CASES := []Case {
+		{"POST /dns-query HTTP/1.1\r\nHost: dns.example\r\nX: a\nTransfer-Encoding: chunked\r\n" + BODY, "a bare LF in a value"},
+		{"POST /dns-query HTTP/1.1\r\nHost: dns.example\r\nX: a\rTransfer-Encoding: chunked\r\n" + BODY, "a bare CR in a value"},
+		{"POST /dns-query HTTP/1.1\r\nHost: dns.example\r\nX: a\x00b\r\n" + BODY, "a NUL in a value"},
+		{"POST /dns-query\nTransfer-Encoding:chunked HTTP/1.1\r\nHost: dns.example\r\n" + BODY, "a bare LF in the request line"},
+		{"POST /dns-query HTTP/1.1\r\nHost: dns.example\n\r\n" + BODY, "a bare LF before CRLF"},
+	}
+	for c in CASES {
+		_, _, parsed, ok := read_request_over_loopback(t, c.raw, c.what)
+		if !ok {
+			return
+		}
+		testing.expectf(t, !parsed, "%s was read as a request", c.what)
+		free_all(context.temp_allocator)
+	}
+	// And the ordinary request still is.
+	_, _, parsed, ok := read_request_over_loopback(t, "POST /dns-query HTTP/1.1\r\nHost: dns.example\r\n" + BODY, "a plain request")
+	if ok {
+		testing.expect(t, parsed, "a plain request was refused")
 	}
 }

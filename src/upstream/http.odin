@@ -5,6 +5,7 @@ import "core:net"
 import "core:strconv"
 import "core:strings"
 import "core:time"
+import "elodin:dns"
 import "elodin:logx"
 import "elodin:tlsx"
 
@@ -281,7 +282,12 @@ http_exchange :: proc(
 			continue
 		}
 		switch {
-		case strings.equal_fold(name, "content-length"):
+		/*
+		Names and the `close` option compare without regard to ASCII case and no
+		other: `strings.equal_fold` folds Unicode, where the long s (U+017F) is
+		an `s`, so `Tran\u017ffer-Encoding` framed the body as chunked (#432).
+		*/
+		case dns.name_equal_fold(name, "content-length"):
 			// RFC 9112 6.3: more than one of these and the message is invalid,
 			// agreeing or not.
 			if content_length >= 0 {
@@ -295,18 +301,18 @@ http_exchange :: proc(
 				return resp, cl_err
 			}
 			content_length = v
-		case strings.equal_fold(name, "transfer-encoding"):
+		case dns.name_equal_fold(name, "transfer-encoding"):
 			chunked = strings.contains(strings.to_lower(value, context.temp_allocator), "chunked")
-		case strings.equal_fold(name, "connection"):
-			if strings.equal_fold(strings.trim_space(value), "close") {
+		case dns.name_equal_fold(name, "connection"):
+			if dns.name_equal_fold(value, "close") {
 				resp.keep_alive = false
 			}
-		case strings.equal_fold(name, "location"):
+		case dns.name_equal_fold(name, "location"):
 			// Scratch, as the doc comment above promises: only the body is the
 			// caller's to free. Taking the first of a repeated header rather than
 			// the last also stops a server orphaning a string per copy.
 			if resp.location == "" {
-				resp.location = strings.clone(strings.trim_space(value), context.temp_allocator)
+				resp.location = strings.clone(value, context.temp_allocator)
 			}
 		}
 	}
@@ -410,7 +416,9 @@ split_header :: proc(line: string) -> (name, value: string, ok: bool) {
 	if idx <= 0 {
 		return "", "", false
 	}
-	return line[:idx], strings.trim_space(line[idx + 1:]), true
+	// `OWS` off the value and nothing more (RFC 9110 5.6.3): `strings.trim_space`
+	// also takes a non-breaking space, which made `close\u00a0` a close.
+	return line[:idx], strings.trim(line[idx + 1:], " \t"), true
 }
 
 @(private)
@@ -435,7 +443,9 @@ read_chunked :: proc(r: ^Buf_Reader, allocator: mem.Allocator) -> (body: []u8, e
 		the body — so the length is settled here, where sixteen significant hex
 		digits is exactly what fits.
 		*/
-		digits := strings.trim_space(size_text)
+		// BWS before a `;` is spaces and tabs (RFC 9112 7.1.1), not whatever
+		// `strings.trim_space` takes for whitespace.
+		digits := strings.trim(size_text, " \t")
 		for len(digits) > 1 && digits[0] == '0' {
 			digits = digits[1:]
 		}
