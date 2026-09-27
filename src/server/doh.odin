@@ -473,7 +473,7 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 			}
 			content_length = v
 		case dns.name_equal_fold(name, "connection"):
-			if dns.name_equal_fold(value, "close") {
+			if h2.list_has_token(value, "close") {
 				req.keep_alive = false
 			}
 		case dns.name_equal_fold(name, "content-type"):

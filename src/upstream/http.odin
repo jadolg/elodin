@@ -2,10 +2,10 @@ package upstream
 
 import "core:mem"
 import "core:net"
-import "core:strconv"
 import "core:strings"
 import "core:time"
 import "elodin:dns"
+import "elodin:h2"
 import "elodin:logx"
 import "elodin:tlsx"
 
@@ -118,7 +118,19 @@ reader_line :: proc(r: ^Buf_Reader) -> (line: string, err: Error) {
 		if idx := index_crlf(r.buf[r.pos:]); idx >= 0 {
 			start := r.pos
 			r.pos += idx + 2
-			return string(r.buf[start:start + idx]), .None
+			line = string(r.buf[start:start + idx])
+			/*
+			A bare CR or LF, or a NUL, is refused (RFC 9112 2.2, RFC 9110 5.5),
+			as the server's `http_line` does (#432). Kept, `Connection:
+			keep-alive\nConnection: close` was one field with no `close` in it
+			where a peer taking the LF for a line end sent two (#437).
+			*/
+			for i in 0 ..< len(line) {
+				if line[i] == '\r' || line[i] == '\n' || line[i] == 0 {
+					return "", .HTTP_Error
+				}
+			}
+			return line, .None
 		}
 		if len(r.buf) - r.pos > 64 * 1024 {
 			return "", .HTTP_Error
@@ -262,8 +274,11 @@ http_exchange :: proc(
 	}
 
 	status_line := reader_line(&r) or_return
-	resp.status = parse_status(status_line) or_return
-	resp.keep_alive = true
+	http_1_0: bool
+	resp.status, http_1_0 = parse_status(status_line) or_return
+	// HTTP/1.0 closes unless it says otherwise (RFC 9112 9.3), and saying so is
+	// not worth honouring for one saved dial: only 1.1 and later are pooled.
+	resp.keep_alive = !http_1_0
 
 	content_length := -1
 	chunked := false
@@ -279,7 +294,7 @@ http_exchange :: proc(
 		}
 		name, value, ok := split_header(line)
 		if !ok {
-			continue
+			return resp, .HTTP_Error
 		}
 		switch {
 		/*
@@ -302,9 +317,20 @@ http_exchange :: proc(
 			}
 			content_length = v
 		case dns.name_equal_fold(name, "transfer-encoding"):
-			chunked = strings.contains(strings.to_lower(value, context.temp_allocator), "chunked")
+			/*
+			`chunked` alone, once, or the response is refused (#437). This
+			client asks for no codings, so any other is one it cannot undo -
+			`chunked, gzip` framed as chunks handed the gzip on as the answer -
+			and RFC 9112 6.1 forbids chunked anywhere but last, or twice. Read
+			as a substring, `xchunked` took chunk framing out of a plain body.
+			*/
+			if chunked || !dns.name_equal_fold(value, "chunked") {
+				return resp, .HTTP_Error
+			}
+			chunked = true
 		case dns.name_equal_fold(name, "connection"):
-			if dns.name_equal_fold(value, "close") {
+			// A list of options (RFC 9110 7.6.1): `keep-alive, close` closes.
+			if h2.list_has_token(value, "close") {
 				resp.keep_alive = false
 			}
 		case dns.name_equal_fold(name, "location"):
@@ -315,6 +341,19 @@ http_exchange :: proc(
 				resp.location = strings.clone(value, context.temp_allocator)
 			}
 		}
+	}
+
+	/*
+	RFC 9112 6.1: an HTTP/1.0 message with a Transfer-Encoding has faulty
+	framing. Alongside a Content-Length the chunks win (6.3), but where the
+	other framing would have ended is not a place to read another response
+	from, so the connection goes no further.
+	*/
+	if chunked && http_1_0 {
+		return resp, .HTTP_Error
+	}
+	if chunked && content_length >= 0 {
+		resp.keep_alive = false
 	}
 
 	switch {
@@ -380,40 +419,51 @@ parse_content_length :: proc(value: string) -> (length: int, err: Error) {
 }
 
 /*
-The status line, whose code is exactly three digits (RFC 9112 4).
+The status line: `HTTP/1.<DIGIT> SP 3DIGIT`, then optionally a space and a
+reason phrase (RFC 9112 4), and whether its version is 1.0.
 
-Parsed with a detected base it was rather more: `HTTP/1.1 0x1 OK` came back as
-1, `1_0` as 10. The three characters were also taken without asking what
+Parsed with a detected base the code was rather more: `HTTP/1.1 0x1 OK` came back
+as 1, `1_0` as 10. The three characters were also taken without asking what
 followed them, so `HTTP/1.1 2000 OK` - not a status line at all - read as 200.
+And with only the `HTTP/` prefix checked, `HTTP/1.1x` was a version, one this
+client went on to pool as 1.1 (#437).
 */
 @(private)
-parse_status :: proc(line: string) -> (status: int, err: Error) {
-	if !strings.has_prefix(line, "HTTP/") {
-		return 0, .HTTP_Error
+parse_status :: proc(line: string) -> (status: int, http_1_0: bool, err: Error) {
+	V :: len("HTTP/1.1")
+	if len(line) < V + 4 || !strings.has_prefix(line, "HTTP/") || line[V] != ' ' {
+		return 0, false, .HTTP_Error
 	}
-	space := strings.index_byte(line, ' ')
-	if space < 0 || space + 4 > len(line) {
-		return 0, .HTTP_Error
+	// Major version 1 is the only one spoken on this wire (RFC 9112 2.3).
+	if line[5] != '1' || line[6] != '.' || line[7] < '0' || line[7] > '9' {
+		return 0, false, .HTTP_Error
 	}
 	// A reason phrase is optional, but if anything follows the code it is the
 	// space in front of one.
-	if len(line) > space + 4 && line[space + 4] != ' ' {
-		return 0, .HTTP_Error
+	if len(line) > V + 4 && line[V + 4] != ' ' {
+		return 0, false, .HTTP_Error
 	}
 	v := 0
-	for c in transmute([]u8)line[space + 1:space + 4] {
+	for c in transmute([]u8)line[V + 1:V + 4] {
 		if c < '0' || c > '9' {
-			return 0, .HTTP_Error
+			return 0, false, .HTTP_Error
 		}
 		v = v * 10 + int(c - '0')
 	}
-	return v, .None
+	return v, line[:V] == "HTTP/1.0", .None
 }
 
 @(private)
 split_header :: proc(line: string) -> (name, value: string, ok: bool) {
+	/*
+	A line starting with whitespace is obs-fold (RFC 9112 5.2), and whitespace
+	before the colon makes no field name (5.1). Skipped, either one hid a field
+	the unfolded or trimmed reading has: `Transfer-Encoding: chunked` then
+	` , gzip` framed a gzip body as chunks (#437). Refused by the caller, as is
+	a line with no name at all.
+	*/
 	idx := strings.index_byte(line, ':')
-	if idx <= 0 {
+	if idx <= 0 || line[0] == ' ' || line[0] == '\t' || line[idx - 1] == ' ' || line[idx - 1] == '\t' {
 		return "", "", false
 	}
 	// `OWS` off the value and nothing more (RFC 9110 5.6.3): `strings.trim_space`
@@ -431,30 +481,41 @@ read_chunked :: proc(r: ^Buf_Reader, allocator: mem.Allocator) -> (body: []u8, e
 	}
 	for {
 		line := reader_line(r) or_return
-		// A chunk size may carry extensions after a ';'.
-		size_text := line
+		/*
+		`1*HEXDIG`, then optionally BWS and a `;` extension (RFC 9112 7.1.1).
+		The BWS is spaces and tabs and only in front of the `;`: trimmed off
+		both ends regardless, ` 5` and `5 ` were chunk sizes (#437).
+		*/
+		digits := line
 		if idx := strings.index_byte(line, ';'); idx >= 0 {
-			size_text = line[:idx]
+			digits = strings.trim_right(line[:idx], " \t")
 		}
 		/*
-		`strconv.parse_u64_of_base` has no overflow check: it wraps and still
-		reports success. A header longer than a u64 therefore parses as some
-		unrelated number — zero among them, which would be read as the end of
-		the body — so the length is settled here, where sixteen significant hex
-		digits is exactly what fits.
+		Parsed here rather than by `strconv.parse_u64_of_base`, which takes a
+		sign and skips `_` - so `+5` and `0_5` were five - and has no overflow
+		check: a size longer than a u64 wrapped to some unrelated number, zero
+		among them, which would be read as the end of the body. Sixteen
+		significant hex digits is exactly what fits.
 		*/
-		// BWS before a `;` is spaces and tabs (RFC 9112 7.1.1), not whatever
-		// `strings.trim_space` takes for whitespace.
-		digits := strings.trim(size_text, " \t")
 		for len(digits) > 1 && digits[0] == '0' {
 			digits = digits[1:]
 		}
 		if len(digits) == 0 || len(digits) > 16 {
 			return nil, .HTTP_Error
 		}
-		size, ok := strconv.parse_u64_of_base(digits, 16)
-		if !ok {
-			return nil, .HTTP_Error
+		size: u64
+		for i in 0 ..< len(digits) {
+			c := digits[i]
+			switch c {
+			case '0' ..= '9':
+				size = size << 4 | u64(c - '0')
+			case 'a' ..= 'f':
+				size = size << 4 | u64(c - 'a' + 10)
+			case 'A' ..= 'F':
+				size = size << 4 | u64(c - 'A' + 10)
+			case:
+				return nil, .HTTP_Error
+			}
 		}
 		if size == 0 {
 			// Trailers, then the final CRLF. Counted like the headers they are.
@@ -479,7 +540,12 @@ read_chunked :: proc(r: ^Buf_Reader, allocator: mem.Allocator) -> (body: []u8, e
 		}
 		data := reader_exact(r, int(size)) or_return
 		append(&out, ..data)
-		reader_line(r) or_return
+		// The data ends in CRLF and nothing else (RFC 9112 7.1). Thrown away,
+		// the line let `helloEXTRA` read as `hello` on a connection kept for
+		// the next response (#437).
+		if tail := reader_line(r) or_return; tail != "" {
+			return nil, .HTTP_Error
+		}
 	}
 	return out[:], .None
 }

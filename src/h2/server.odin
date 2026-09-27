@@ -944,6 +944,23 @@ is_token :: proc(s: string) -> bool {
 }
 
 /*
+RFC 9110 5.6.1: whether the comma-separated list `value` holds `token`, compared
+without regard to ASCII case. `Connection: keep-alive, close` is a close, which
+a single-token compare missed (#437); each element loses its OWS and nothing
+more, and empty elements match nothing. For lists of tokens only, such as
+`Connection`: a comma inside a quoted-string is split on like any other.
+*/
+list_has_token :: proc(value, token: string) -> bool {
+	rest := value
+	for element in strings.split_iterator(&rest, ",") {
+		if dns.name_equal_fold(strings.trim(element, " \t"), token) {
+			return true
+		}
+	}
+	return false
+}
+
+/*
 RFC 9113 8.2.1: a field name is an RFC 9110 token, and lowercase. Uppercase is
 not folded on receipt but malformed, so that two hops cannot disagree about
 which of `Transfer-Encoding` and `transfer-encoding` they were sent.
