@@ -74,20 +74,7 @@ exchange_udp :: proc(
 	*/
 	rejected := false
 
-	for {
-		/*
-		Each receive is armed with what is left, not the whole timeout: the
-		socket's timeout restarts with every call, so a datagram passed over
-		below - a stray, a forgery - landing just before it ran out bought
-		another whole one, and an off-path sender could double any exchange
-		(issue #446). Never zero, which `SO_RCVTIMEO` reads as no timeout at
-		all. On the tick clock, which an NTP step cannot move.
-		*/
-		left := time.tick_diff(time.tick_now(), deadline)
-		if left <= 0 {
-			break
-		}
-		_ = net.set_option(socket, .Receive_Timeout, max(left, time.Millisecond))
+	for arm_receive(socket, deadline) {
 		n, remote, recv_err := net.recv_udp(socket, buf)
 		if recv_err != nil {
 			// The datagram was larger than the room the query offered, so what
@@ -120,6 +107,25 @@ exchange_udp :: proc(
 		return out, .None
 	}
 	return nil, .Bad_Response if rejected else .Timeout
+}
+
+/*
+Arm the next receive with what is left before `deadline`, and say whether
+anything is. Not the whole timeout: the socket's timeout restarts with every
+call, so a datagram passed over - a stray, a forgery - landing just before it
+ran out bought another whole one, and an off-path sender could double any
+exchange (issue #446). Never zero, which `SO_RCVTIMEO` reads as no timeout at
+all. On the tick clock, which an NTP step cannot move. Shared with
+`bootstrap_query`, whose loop passes datagrams over the same way.
+*/
+@(private)
+arm_receive :: proc(socket: net.UDP_Socket, deadline: time.Tick) -> bool {
+	left := time.tick_diff(time.tick_now(), deadline)
+	if left <= 0 {
+		return false
+	}
+	_ = net.set_option(socket, .Receive_Timeout, max(left, time.Millisecond))
+	return true
 }
 
 @(private)

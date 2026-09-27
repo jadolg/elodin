@@ -636,3 +636,36 @@ test_a_stray_datagram_does_not_extend_a_udp_exchange :: proc(t: ^testing.T) {
 	testing.expectf(t, spent < DEADLINE_TIMEOUT * 3 / 2, "the exchange waited %v, where its timeout is %v", spent, DEADLINE_TIMEOUT)
 	free_all(context.temp_allocator)
 }
+
+// The bootstrap query waits on its datagrams the same way, and inside the
+// exchange that needs it, so a stray must not stretch it either.
+@(test)
+test_a_stray_datagram_does_not_extend_a_bootstrap_query :: proc(t: ^testing.T) {
+	m: Stray_Mock
+	m.at = DEADLINE_TIMEOUT * 9 / 10
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, serr == nil, "cannot bind the mock: %v", serr) {
+		return
+	}
+	m.socket = socket
+	defer net.close(socket)
+	_ = net.set_option(socket, .Receive_Timeout, 10 * DEADLINE_TIMEOUT)
+	stray, sterr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, sterr == nil, "cannot bind the stray sender: %v", sterr) {
+		return
+	}
+	m.stray = stray
+	defer net.close(stray)
+	bound, _ := net.bound_endpoint(socket)
+	worker := thread.create_and_start_with_poly_data(&m, stray_mock_serve)
+
+	started := time.tick_now()
+	_, ok := bootstrap_query(fmt.tprintf("127.0.0.1:%d", bound.port), "dns.example", .A, DEADLINE_TIMEOUT)
+	spent := time.tick_since(started)
+	thread.join(worker)
+	thread.destroy(worker)
+
+	testing.expect(t, !ok, "the bootstrap query resolved from a silent server")
+	testing.expectf(t, spent < DEADLINE_TIMEOUT * 3 / 2, "the bootstrap query waited %v, where its timeout is %v", spent, DEADLINE_TIMEOUT)
+	free_all(context.temp_allocator)
+}

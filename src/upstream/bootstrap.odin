@@ -171,9 +171,9 @@ bootstrap_query :: proc(
 	arriving first does not deny the real answer the rest of the window.
 	*/
 	buf := make([]u8, 4096, context.temp_allocator)
-	deadline := time.time_add(time.now(), timeout)
+	deadline := time.tick_add(time.tick_now(), timeout)
 
-	for time.diff(deadline, time.now()) < 0 {
+	for arm_receive(socket, deadline) {
 		n, remote, recv_err := net.recv_udp(socket, buf)
 		if recv_err != nil {
 			return nil, false

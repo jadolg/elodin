@@ -155,6 +155,13 @@ once patience runs out, finds the deadline spent and asks nobody. The old
 figure - every server for every attempt, twice for a truncated reply, plus the
 sweep - was sized for a forward nothing bounded, and held a worker ten timeouts
 for a group of two.
+
+The invariant, so it is not widened one stage at a time: this covers the
+crossing exchange as `upstream.exchange` is documented to behave, a timeout and
+its TCP retry. Stages inside it that start a timeout of their own - bootstrap
+resolution, a cookie retry - can carry a leader further, and a follower then
+answers SERVFAIL a moment before the leader lands. That is fixed where it
+starts, by bounding the exchange itself (issue #449), not by guessing here.
 */
 @(private)
 flight_patience :: proc(deadline: time.Tick, span: time.Duration) -> time.Duration {
