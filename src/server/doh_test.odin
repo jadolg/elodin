@@ -2008,3 +2008,53 @@ test_doh_content_type_keeps_what_is_not_ows :: proc(t: ^testing.T) {
 		free_all(context.temp_allocator)
 	}
 }
+
+/*
+A field name is a token (RFC 9110 5.1), and names and the `close` option compare
+without regard to ASCII case only (#432). `strings.equal_fold` folds Unicode, so
+`Ho\u017ft` - the long s, U+017F - was counted as Host and `clo\u017fe` closed the
+connection, and a name outside the token grammar was read at all: a hop that
+folds the same way reads `Tran\u017ffer-Encoding` as chunked framing while this
+one, once it folds ASCII only, would not. So such a line is refused, and a value
+keeps whatever is not OWS.
+*/
+@(test)
+test_doh_field_names_are_ascii_tokens :: proc(t: ^testing.T) {
+	Case :: struct {
+		headers:    string, // between the request line and Content-Length
+		accepted:   bool,
+		keep_alive: bool,
+		host:       string,
+		what:       string,
+	}
+	CASES := []Case {
+		{"Host: dns.example\r\n", true, true, "dns.example", "a plain Host"},
+		{"HOST: dns.example\r\n", true, true, "dns.example", "an uppercase Host"},
+		{"Ho\u017ft: dns.example\r\n", false, false, "", "a Host spelled with a long s"},
+		{"Host: dns.example\r\nHo\u017ft: evil.example\r\n", false, false, "", "a long-s Host after a real one"},
+		{"Host: dns.example\r\nTran\u017ffer-Encoding: chunked\r\n", false, false, "", "Transfer-Encoding with a long s"},
+		{"Host: dns.example\r\nX(y): 1\r\n", false, false, "", "a name with a delimiter"},
+		{"Host: dns.example\r\nX-Caf\u00e9: 1\r\n", false, false, "", "a name with a non-ASCII letter"},
+		{"Host: dns.example\r\nConnection: close\r\n", true, false, "dns.example", "Connection: close"},
+		{"Host: dns.example\r\nConnection: CLOSE\r\n", true, false, "dns.example", "Connection: CLOSE"},
+		{"Host: dns.example\r\nConnection: clo\u017fe\r\n", true, true, "dns.example", "close spelled with a long s"},
+		{"Host: dns.example\r\nConnection: close\u00a0\r\n", true, true, "dns.example", "close with a non-breaking space"},
+		{"Host: dns.example\r\nConnection:\tclose \r\n", true, false, "dns.example", "close with OWS around it"},
+	}
+	for c in CASES {
+		raw := fmt.tprintf(
+			"POST /dns-query HTTP/1.1\r\n%sContent-Type: application/dns-message\r\nContent-Length: 4\r\n\r\nabcd",
+			c.headers,
+		)
+		req, _, parsed, ok := read_request_over_loopback(t, raw, c.what)
+		if !ok {
+			return
+		}
+		testing.expectf(t, parsed == c.accepted, "%s: read %v, want %v", c.what, parsed, c.accepted)
+		if parsed && c.accepted {
+			testing.expectf(t, req.keep_alive == c.keep_alive, "%s: keep-alive %v, want %v", c.what, req.keep_alive, c.keep_alive)
+			testing.expectf(t, req.host == c.host, "%s: host %q, want %q", c.what, req.host, c.host)
+		}
+		free_all(context.temp_allocator)
+	}
+}

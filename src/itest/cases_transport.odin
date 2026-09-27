@@ -163,6 +163,31 @@ run_transport_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	/*
+	A field name is an ASCII token (#432). With the long s (U+017F), which a
+	Unicode case fold takes for an `s`, `Tran\u017ffer-Encoding` is chunked framing
+	to a hop that folds that way and nothing to one that folds ASCII only - so it
+	is refused, not skipped: closed unanswered, as the other field lines this
+	reader cannot place are (see `read_http_request`).
+	*/
+	start_case(r, "doh: a field name that is not an ASCII token is refused")
+	{
+		res := doh_raw(
+			doh_port,
+			fmt.tprintf(
+				"POST /dns-query HTTP/1.1\r\nHost: elodin.local\r\nContent-Type: application/dns-message\r\nTran\u017ffer-Encoding: chunked\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+				len(query),
+				string(query),
+			),
+		)
+		check(r, !res.ok, "answered %d; a field name outside the token grammar was read", res.status)
+		after := doh_post(doh_port, "/dns-query", query)
+		if check(r, after.ok, "the next request got no response") {
+			check_eq_int(r, after.status, 200, "status of the next request")
+		}
+	}
+	end_case(r)
+
 	// The loop keeps the last of a repeat while a hop in front may judge the
 	// first, so a second Content-Type is refused rather than picked from.
 	start_case(r, "doh: a repeated Content-Type is a 400")

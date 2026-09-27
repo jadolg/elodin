@@ -2653,3 +2653,62 @@ test_the_doh_h2_fallback_keeps_the_querys_deadline :: proc(t: ^testing.T) {
 	)
 	free_all(context.temp_allocator)
 }
+
+/*
+A response's field names and its `close` option compare without regard to ASCII
+case only, and a value keeps whatever is not OWS (#432). `strings.equal_fold`
+folds Unicode, so `Tran\u017ffer-Encoding` - the long s, U+017F - framed the body
+as chunked, and `clo\u017fe` or a trailing non-breaking space closed a connection
+the server meant to keep.
+*/
+@(test)
+test_http_response_fields_fold_ascii_only :: proc(t: ^testing.T) {
+	Case :: struct {
+		fields:     string,
+		body:       string,
+		keep_alive: bool,
+		what:       string,
+	}
+	CASES := []Case {
+		{"Connection: close\r\nContent-Length: 5\r\n", "hello", false, "Connection: close"},
+		{"CONNECTION: Close\r\nContent-Length: 5\r\n", "hello", false, "an uppercase Connection: Close"},
+		{"Connection: clo\u017fe\r\nContent-Length: 5\r\n", "hello", true, "close spelled with a long s"},
+		{"Connection: close\u00a0\r\nContent-Length: 5\r\n", "hello", true, "close with a non-breaking space"},
+		{"Tran\u017ffer-Encoding: chunked\r\nContent-Length: 5\r\n", "hello", true, "Transfer-Encoding with a long s"},
+		{"Transfer-Encoding: chunked\r\n", "5\r\nhello\r\n0\r\n\r\n", true, "real chunked framing"},
+		{"Transfer-Encoding: chunked\r\n", "5 \r\nhello\r\n0\r\n\r\n", true, "a chunk size with a space after it"},
+	}
+	for c in CASES {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		resp, err, ok := exchange_against(t, fmt.tprintf("HTTP/1.1 200 OK\r\n%s\r\n%s", c.fields, c.body), &track)
+		if ok {
+			testing.expectf(t, err == .None, "%s: exchange failed: %v", c.what, err)
+			testing.expectf(t, string(resp.body) == "hello", "%s: body %q", c.what, string(resp.body))
+			testing.expectf(t, resp.keep_alive == c.keep_alive, "%s: keep-alive %v, want %v", c.what, resp.keep_alive, c.keep_alive)
+			delete(resp.body, mem.tracking_allocator(&track))
+		}
+		mem.tracking_allocator_destroy(&track)
+		free_all(context.temp_allocator)
+	}
+}
+
+// A chunk size with a non-breaking space after it is not a chunk size: BWS is
+// spaces and tabs, and `strings.trim_space` took the NBSP off as well (#432).
+@(test)
+test_http_chunk_size_keeps_what_is_not_bws :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	resp, err, ok := exchange_against(
+		t,
+		"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5 \r\nhello\r\n0\r\n\r\n",
+		&track,
+	)
+	if !ok {
+		return
+	}
+	testing.expectf(t, err != .None, "a chunk size ending in a non-breaking space was read, body %q", string(resp.body))
+	delete(resp.body, mem.tracking_allocator(&track))
+	free_all(context.temp_allocator)
+}
