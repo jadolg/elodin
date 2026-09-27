@@ -1861,7 +1861,8 @@ resolve_query :: proc(
 	before this point is reached, so its nested call starts its own. See
 	`question_span`.
 	*/
-	deadline := time.tick_add(time.tick_now(), question_span(s, q.name, q.type))
+	span := question_span(s, q.name, q.type)
+	deadline := time.tick_add(time.tick_now(), span)
 	own_flight: Flight
 	flight: ^Flight
 	if unanswered == nil {
@@ -1871,7 +1872,7 @@ resolve_query :: proc(
 			flight = joined
 			flight.forwarded = forwarded
 		} else if joined != nil {
-			patience := flight_patience(route_group(s, q.name, q.type))
+			patience := flight_patience(deadline, span)
 			landed_with, _, same := flight_follow(s, joined, patience, allocator, counted, forwarded)
 			// A NOERROR or NXDOMAIN is shared as the cache shares it - so not with
 			// the cache off, where nothing is shared between two messages - and any

@@ -697,3 +697,176 @@ test_followers_of_a_cloaked_leader_are_blocked_from_its_verdict :: proc(t: ^test
 	testing.expect_value(t, cs.withheld, u64(CLIENTS - 1))
 	testing.expect_value(t, st.coalesced, u64(CLIENTS - 1))
 }
+
+/*
+A follower waits on its leader for what is left of its own deadline and one
+exchange more, not for as long as the unbounded forward once took (issue #446).
+
+Since #439 the deadline is armed before the join, so a leader still out past
+it and the one exchange it may finish is stuck on something other than its
+upstreams - and the follower, when its patience runs out, forwards on a deadline
+already spent and asks nobody. Any wait past that point holds a worker for
+nothing. The leader here never lands; with two servers and two attempts the old
+patience was ten timeouts, where the follower's deadline is two.
+*/
+@(test)
+test_a_follower_waits_no_longer_than_its_deadline_allows :: proc(t: ^testing.T) {
+	TIMEOUT :: 100 * time.Millisecond
+	sockets: [2]net.UDP_Socket
+	servers := make([]config.Upstream_Spec, 2, context.temp_allocator)
+	for i in 0 ..< 2 {
+		socket, err := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+		if !testing.expectf(t, err == nil, "cannot bind mock %d: %v", i, err) {
+			return
+		}
+		sockets[i] = socket
+		bound, _ := net.bound_endpoint(socket)
+		servers[i] = config.Upstream_Spec{name = "silent", kind = .UDP, address = "127.0.0.1", port = bound.port}
+	}
+	defer for socket in sockets {
+		net.close(socket)
+	}
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.cache.enabled = false
+	cfg.blocking.enabled = false
+	cfg.dnssec.enabled = false
+	cfg.upstream.strategy = .Failover
+	cfg.upstream.attempts = 2
+	cfg.upstream.timeout = TIMEOUT
+	cfg.upstream.servers = servers
+	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+		return
+	}
+	defer upstream.destroy_group(group)
+	srv := Server {
+		cfg   = &cfg,
+		group = group,
+	}
+
+	// The leader: in the table under the follower's key, and never landing
+	// until the follower has given up on it.
+	key_buf: [cache.KEY_MAX]u8
+	key := cache.make_key(key_buf[:], QNAME, .A, .IN, false, false)
+	leader: Flight
+	if joined, _ := flight_join(&srv, key, &leader); !testing.expect(t, joined == &leader, "the leader did not get the flight") {
+		return
+	}
+	defer flight_land(&srv, &leader)
+
+	questions := []dns.Question{{name = QNAME, type = .A, class = .IN}}
+	msg := dns.Message{id = 0x4460, question = questions}
+	msg.flags.rd = true
+	query, _, _ := dns.encode_message(msg, context.temp_allocator)
+	started := time.tick_now()
+	out, _, ok := handle_query(&srv, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	took := time.tick_since(started)
+
+	testing.expect(t, ok, "the follower got no answer at all")
+	decoded, derr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.Serv_Fail)
+	// Its two timeouts of deadline and two for the leader's crossing exchange,
+	// with slack; the old patience waited ten.
+	testing.expectf(t, took < 6 * TIMEOUT, "the follower waited %v on a leader, where its deadline is %v", took, 2 * TIMEOUT)
+	// And it forwarded on nothing: the deadline was spent on the wait.
+	for socket in sockets {
+		testing.expect(t, mock_untouched(socket), "the follower asked an upstream after its deadline")
+	}
+	free_all(context.temp_allocator)
+}
+
+@(private = "file")
+Late_Leader :: struct {
+	srv:    ^Server,
+	flight: ^Flight,
+	answer: []u8,
+	at:     time.Tick,
+}
+
+// Lands the leader's flight with `answer` at `at`, as a leader whose crossing
+// exchange came back just past the deadline would.
+@(private = "file")
+land_late :: proc(l: ^Late_Leader) {
+	for time.tick_diff(time.tick_now(), l.at) > 0 {
+		time.sleep(time.Millisecond)
+	}
+	l.flight.answer = l.answer
+	flight_land(l.srv, l.flight)
+}
+
+/*
+And not shorter than that: a leader landing inside the two timeouts past the
+deadline - the exchange that crossed the line, retried over TCP, finishing -
+still serves its follower, which otherwise gives up at its deadline and has
+nobody left to ask.
+*/
+@(test)
+test_a_follower_still_takes_an_answer_landing_just_past_its_deadline :: proc(t: ^testing.T) {
+	TIMEOUT :: 400 * time.Millisecond
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, serr == nil, "cannot bind the mock: %v", serr) {
+		return
+	}
+	defer net.close(socket)
+	bound, _ := net.bound_endpoint(socket)
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.cache.enabled = true
+	cfg.blocking.enabled = false
+	cfg.dnssec.enabled = false
+	cfg.upstream.strategy = .Failover
+	cfg.upstream.attempts = 1
+	cfg.upstream.timeout = TIMEOUT
+	servers := []config.Upstream_Spec{{name = "silent", kind = .UDP, address = "127.0.0.1", port = bound.port}}
+	cfg.upstream.servers = servers
+	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+		return
+	}
+	defer upstream.destroy_group(group)
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
+	defer cache.destroy(answers)
+	srv := Server {
+		cfg     = &cfg,
+		group   = group,
+		answers = answers,
+	}
+
+	questions := []dns.Question{{name = QNAME, type = .A, class = .IN}}
+	reply := dns.Message {
+		id       = 0x4461,
+		question = questions,
+		answer   = []dns.Record{{name = QNAME, type = .A, class = .IN, ttl = 300, data = dns.Rdata_A{addr = {192, 0, 2, 46}}}},
+	}
+	reply.flags.qr, reply.flags.rd, reply.flags.ra = true, true, true
+	answer, _, _ := dns.encode_message(reply, context.temp_allocator)
+
+	key_buf: [cache.KEY_MAX]u8
+	key := cache.make_key(key_buf[:], QNAME, .A, .IN, false, false)
+	leader: Flight
+	if joined, _ := flight_join(&srv, key, &leader); !testing.expect(t, joined == &leader, "the leader did not get the flight") {
+		return
+	}
+	// A timeout and a half past the follower's deadline of two - a UDP reply
+	// that crossed the line truncated and was asked again over TCP - give or
+	// take the moment between this and its join.
+	late := Late_Leader{srv = &srv, flight = &leader, answer = answer, at = time.tick_add(time.tick_now(), 7 * TIMEOUT / 2)}
+	lander := thread.create_and_start_with_poly_data(&late, land_late)
+
+	query_msg := dns.Message{id = 0x4462, question = questions}
+	query_msg.flags.rd = true
+	query, _, _ := dns.encode_message(query_msg, context.temp_allocator)
+	out, outcome, ok := handle_query(&srv, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	thread.join(lander)
+	thread.destroy(lander)
+
+	testing.expect(t, ok, "the follower got no answer at all")
+	testing.expect_value(t, outcome, Outcome.Cached)
+	decoded, derr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
+	testing.expect_value(t, len(decoded.answer), 1)
+	free_all(context.temp_allocator)
+}

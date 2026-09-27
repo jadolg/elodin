@@ -4,7 +4,6 @@ import "core:mem"
 import "core:sync"
 import "core:time"
 import "elodin:pool"
-import "elodin:upstream"
 
 /*
 Identical questions in flight at once go to the upstream once (issue #311).
@@ -40,7 +39,9 @@ list reload lifted during the wait, answered from it. The cloaking lookup is a
 counted one, so that follower's query shows as a miss and then a hit, or as two
 misses where the entry was evicted in between; the Bogus one is a probe, as it
 is on the way in, and counts nothing. A follower whose
-patience ran out forwards on its own too, and so does one that finds the
+patience ran out forwards on its own too - on a deadline that is spent by then,
+so it asks nobody and takes the expired entry or SERVFAIL (see
+`flight_patience`) - and so does one that finds the
 verdict already evicted - outside the table, since it is past its turn to join
 one, which on a cache under that much pressure costs a burst its coalescing.
 
@@ -120,7 +121,8 @@ Stored_Verdict :: enum u8 {
 How many followers may wait on workers of the shared pool at once: a quarter,
 the same share `refresh_ceiling` gives the stale refreshes.
 
-A follower holds its worker for as long as the leader takes, and a leader
+A follower holds its worker for as long as the leader takes, up to its
+`flight_patience`, about four of its longest group's timeouts - and a leader
 validating a slow chain holds one of `dnssec.max_chain_walks` - so without a
 ceiling, one flood of a single cold signed name would park every worker behind
 one walk, which is the exhaustion that bound exists to prevent (issue #356).
@@ -138,18 +140,33 @@ follower_ceiling :: proc(s: ^Server) -> int {
 }
 
 /*
-How long a follower waits before it forwards on its own: what the leader's
-exchange can take, every server for every attempt - twice, for a UDP reply that
-comes back truncated and is asked again over TCP with a timeout of its own - plus
-the readable-rcode sweep's two timeouts. A leader past that is validating a long
-chain or stuck, and either way this query is no worse off asking for itself.
+How long a follower waits before it forwards on its own: what is left of its
+own upstream deadline, and one `span` more (issue #446).
+
+The deadline is armed before the join, and the leader's before this one's, so
+the leader has spent its upstream wait by then - all but the one exchange it may
+still finish, which is the `span` on top. That exchange may be a UDP reply that
+came back truncated and was asked again over TCP, a timeout each (issue #376),
+on the longest-timed of the question's groups, since the leader's last exchange
+may be a chain lookup on the default group rather than the route - two of that
+group's timeouts, which is what `span` is (`question_span`,
+`upstream.query_budget`). A leader past that is validating a long chain or
+stuck, and the follower gains nothing by waiting on: its own forward,
+once patience runs out, finds the deadline spent and asks nobody. The old
+figure - every server for every attempt, twice for a truncated reply, plus the
+sweep - was sized for a forward nothing bounded, and held a worker ten timeouts
+for a group of two.
+
+The invariant, so it is not widened one stage at a time: this covers the
+crossing exchange as `upstream.exchange` is documented to behave, a timeout and
+its TCP retry. Stages inside it that start a timeout of their own - bootstrap
+resolution, a cookie retry - can carry a leader further, and a follower then
+answers SERVFAIL a moment before the leader lands. That is fixed where it
+starts, by bounding the exchange itself (issue #449), not by guessing here.
 */
 @(private)
-flight_patience :: proc(g: ^upstream.Group) -> time.Duration {
-	if g == nil {
-		return 0
-	}
-	return time.Duration(2 * g.attempts * len(g.servers) + 2) * g.timeout
+flight_patience :: proc(deadline: time.Tick, span: time.Duration) -> time.Duration {
+	return max(time.tick_diff(time.tick_now(), deadline), 0) + span
 }
 
 /*
