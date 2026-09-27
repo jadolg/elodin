@@ -453,6 +453,87 @@ test_a_live_upstream_beats_a_stale_entry :: proc(t: ^testing.T) {
 }
 
 /*
+A referral is the outage `serve_stale` covers, not an answer (issue #410).
+
+The upstream is up and answers, but only with the NS of a zone and no SOA:
+`resolve_query` reads that as no answer before the failure branch, so the
+expired entry is what the client gets - not a SERVFAIL, and not the empty
+NOERROR it would read as NODATA. Without that check the referral is forwarded
+as the answer, and below the failure branch it would never reach the fallback.
+*/
+@(test)
+test_a_referral_falls_back_on_a_stale_entry :: proc(t: ^testing.T) {
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+		return
+	}
+	defer net.close(socket)
+	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+	bound, berr := net.bound_endpoint(socket)
+	if !testing.expectf(t, berr == nil, "cannot read the mock's port: %v", berr) {
+		return
+	}
+
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
+	defer cache.destroy(answers)
+	cfg: config.Config
+	s := stale_server(&cfg, answers, nil)
+	cfg.upstream.strategy = .Failover
+	cfg.upstream.attempts = 1
+	cfg.upstream.timeout = 5 * time.Second
+	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
+	servers[0] = config.Upstream_Spec {
+		name    = "mock",
+		kind    = .UDP,
+		address = "127.0.0.1",
+		port    = bound.port,
+	}
+	cfg.upstream.servers = servers
+	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+		return
+	}
+	defer upstream.destroy_group(group)
+	s.group = group
+
+	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
+		return
+	}
+
+	referral := dns.Message {
+		question  = []dns.Question{{name = STALE_NAME, type = .A, class = .IN}},
+		authority = []dns.Record{{name = STALE_NAME, type = .NS, class = .IN, ttl = 3600, data = dns.Rdata_Name{"ns1.example."}}},
+	}
+	referral.flags.qr = true
+	referral.flags.rd = true
+	wire, _, enc := dns.encode_message(referral, context.temp_allocator)
+	if !testing.expect_value(t, enc, dns.Encode_Error.None) {
+		return
+	}
+	x := Stale_Exchange {
+		socket = socket,
+		reply  = wire,
+	}
+	mock := thread.create_and_start_with_poly_data(&x, serve_one_stale)
+	out, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	thread.join(mock)
+	thread.destroy(mock)
+
+	testing.expect(t, x.got, "the upstream was never asked")
+	if !testing.expect(t, ok, "nothing came back at all") {
+		return
+	}
+	testing.expect_value(t, outcome, Outcome.Cached)
+	served, err := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, err, dns.Decode_Error.None)
+	testing.expect_value(t, dns.Rcode(served.flags.rcode), dns.Rcode.No_Error)
+	testing.expectf(t, len(served.answer) == 1, "the client got %d answer records, not the expired entry", len(served.answer))
+	testing.expect_value(t, stats_of(&s).failed, u64(0))
+	testing.expect_value(t, cache.stats(answers).stale, u64(1))
+	free_all(context.temp_allocator)
+}
+
+/*
 A fresh entry is still answered without asking anybody.
 
 The upstream in this fixture cannot answer, so a lookup that reached it would

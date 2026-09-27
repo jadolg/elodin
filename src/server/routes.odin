@@ -410,7 +410,9 @@ parent_answers_apex_ds :: proc(
 	if rcode == .NX_Domain {
 		return false, true
 	}
-	if rcode != .No_Error {
+	// A referral is a server that did not recurse for the name, which settles
+	// nothing about the delegation (issue #410).
+	if rcode != .No_Error || dns.peek_referral(resp) {
 		return false, false
 	}
 	msg, err := dns.decode_through_answer(resp, allocator, spent)

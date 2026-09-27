@@ -420,7 +420,14 @@ wait. A dead first server still hands over to the second inside the query, which
 full `timeout`; a third is left for the next query, by which time the dead ones
 are on their way to the cooldown below. A reply that did arrive but says
 SERVFAIL or REFUSED sends the query on to the rest of the group, inside the
-same two `timeout`s rather than on top of them. One exchange with one server
+same two `timeout`s rather than on top of them. So does a referral - a server
+that does not recurse for the name answering with the NS of a zone and no SOA,
+on its own or after a CNAME whose target that zone holds - and where no member
+does better the client gets SERVFAIL, not the empty NOERROR it would read as
+"no such record" (`outcome=failed detail=referral` in the query log). A
+referral past a CNAME whose target this server routes to another group is still
+swept, and then handed on as it stands, since the client's next question goes
+there. One exchange with one server
 takes its `timeout`, whatever it does inside: resolving a hostname upstream
 through `bootstrap`, asking again with a fresh DNS cookie, retrying a truncated
 answer over TCP. A truncated answer that arrives late therefore leaves its TCP
@@ -2422,7 +2429,7 @@ as a warning at startup.
 | `elodin_upstream_latency_seconds_total{upstream}` | counter | cumulative round-trip time; divide by the query counter under `rate()` for the mean |
 | `elodin_upstream_up{upstream}` | gauge | 0 while an upstream is in its failure cooldown |
 | `elodin_upstream_unreadable_rcode_total{upstream}` | counter | replies from each upstream refused because their rcode is one a client would read as a different rcode — the extended half lives in the OPT record and a stub reads the header. Not counted as a failure above, on purpose: those bytes are forgeable, and a failure would park the group |
-| `elodin_upstream_swept_rcode_total{upstream}` | counter | replies from each upstream that another member of its group was asked to answer instead: for a client's question a SERVFAIL, a REFUSED or an unreadable rcode, and for a DNSSEC chain lookup anything that is not NOERROR or NXDOMAIN. One per such reply, whether or not there was another member left to ask — a member REFUSING everything beside one in its cooldown breaks every query while both look healthy, and this is what names it. Not a failure either, so this is the only figure naming a member that answers but cannot help |
+| `elodin_upstream_swept_rcode_total{upstream}` | counter | replies from each upstream that another member of its group was asked to answer instead: for a client's question a SERVFAIL, a REFUSED, an unreadable rcode or a referral, and for a DNSSEC chain lookup a referral or anything that is not NOERROR or NXDOMAIN. One per such reply, whether or not there was another member left to ask — a member REFUSING everything beside one in its cooldown breaks every query while both look healthy, and this is what names it. Not a failure either, so this is the only figure naming a member that answers but cannot help |
 | `elodin_udp_datagrams_total{reader}` | counter | datagrams each UDP reader took off its socket |
 | `elodin_udp_receive_drops_total{reader}` | counter | datagrams the kernel dropped on that reader's receive queue before they could be read; absent where `/proc` cannot be read |
 | `elodin_pool_workers{pool}` / `elodin_pool_pending{pool}` | gauge | the `query` and `upstream` pools; `pending` that does not return to zero is `server.workers` set too low |

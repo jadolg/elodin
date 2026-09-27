@@ -830,9 +830,14 @@ blocking: {{ enabled: false }}
 		// RFC 2308 section 5, issue #310: nothing in it says how long it holds,
 		// so one upstream that stumbled - an empty NOERROR, or a referral from
 		// a server that did not recurse - is not every client's answer for
-		// `negative_ttl`. Asked twice, the upstream has to hear both. The
-		// server's `min_ttl` is what makes this reach the guard: without it
-		// the zero lifetime a SOA-less denial has would refuse it anyway.
+		// `negative_ttl`. Asked twice, the upstream has to hear both. For the
+		// empty NOERROR, the server's `min_ttl` is what makes this reach the
+		// guard: without it the zero lifetime a SOA-less denial has would
+		// refuse it anyway.
+		//
+		// The referral is not passed on at all (issue #410): it is no answer,
+		// and a client would read the empty NOERROR as NODATA, so with no other
+		// member to ask the query is a SERVFAIL.
 		for name, i in ([]string{"nosoa.example.com.", "referral.example.com."}) {
 			mock_reset_counts(mock)
 			first := query_udp(udp_port, build_query(name, u16(dns.Type.A), id = u16(20 + 2 * i)))
@@ -840,7 +845,11 @@ blocking: {{ enabled: false }}
 				continue
 			}
 			h := parse_header(r, first.wire)
-			check(r, h.rcode == int(dns.Rcode.No_Error) && h.ancount == 0, "%s: want the empty NOERROR the mock sent", name)
+			if i == 0 {
+				check(r, h.rcode == int(dns.Rcode.No_Error) && h.ancount == 0, "%s: want the empty NOERROR the mock sent", name)
+			} else {
+				check(r, h.rcode == int(dns.Rcode.Serv_Fail), "%s: rcode %d, want SERVFAIL for a referral", name, h.rcode)
+			}
 			_ = query_udp(udp_port, build_query(name, u16(dns.Type.A), id = u16(21 + 2 * i)))
 			check_eq_int(r, mock_total(mock), 2, fmt.tprintf("upstream queries for %s asked twice", name))
 		}

@@ -387,6 +387,206 @@ peek_udp_size :: proc(msg: []u8) -> u16 {
 }
 
 /*
+Whether a reply is a referral rather than an answer, read off the wire.
+
+RFC 2308 section 2.2, type 4: NOERROR, nothing in the answer section, and name
+servers in the authority section with no SOA beside them. That is a server
+saying "ask them", which is what an authority that does not recurse sends in
+reply to RD=1 (RFC 1034 section 4.3.1). It is not a NODATA - that is told apart,
+in the RFC's own words, by the SOA being there or the NS not being - and a
+client handed one reads "the name has no records of this type" (issue #410).
+
+And the same after a CNAME, which is RFC 2308 section 2.1's own REFERRAL
+RESPONSE example: `an.example. CNAME tripple.xx.` in the answer, `xx. NS` in
+authority, no SOA. The chain stops at a name the server does not hold, and a
+client handed it gets an alias and no address (issue #451). What makes it one
+is where the NS sit: at or above the chain's target and not above the name
+asked. An authority that includes its own apex NS beside a CNAME out of its
+zone - BIND does, for `mail.corp. CNAME ghs.googlehosted.com.` - has answered
+all it holds, and a stub that follows CNAMEs resolves that today; it is left
+alone. Only CNAME, DNAME and their RRSIGs may stand in the answer: anything
+else there is data, and the reply is an answer.
+
+The RA bit is not read. A server that clears it on answers it does give exists,
+and one that sets it over a referral has still not answered; what the reply
+holds is the whole test.
+
+The AA bit is, over an empty answer. A referral is sent from above the cut,
+where the server is not the authority for the name asked (RFC 1035 section
+4.1.1), so no server sets it on one; an authority that does set it over an
+empty answer with only its own NS beside it is sending a NODATA without the
+SOA, and that is its answer. Beside a CNAME it says nothing: the authority for
+the alias sets it, and the target is still somebody else's.
+
+The rcode is the composed one, so an extended rcode whose low nibble is zero is
+not a NOERROR here. A message that cannot be walked is not a referral: what a
+decode would refuse is refused where it is decoded.
+
+The walk allocates nothing. Only a reply already of the partial shape - every
+answer record an alias, NS and no SOA in authority - has its question, answer
+and NS owners decoded, into scratch, to follow the chain. And only one no larger
+than `MAX_ALIAS_REFERRAL_RECORDS` in either section: every judgement of a reply
+reads this, several times per reply and once per chain-walk step, and none of
+those readings is charged to the request's decode budget (issue #354). A reply
+past it is left as the answer it claims to be, which it was before issue #451.
+*/
+peek_referral :: proc(msg: []u8) -> bool {
+	if len(msg) < HEADER_SIZE {
+		return false
+	}
+	qdcount := int(u16(msg[4]) << 8 | u16(msg[5]))
+	ancount := int(u16(msg[6]) << 8 | u16(msg[7]))
+	nscount := int(u16(msg[8]) << 8 | u16(msg[9]))
+	// A header rcode other than zero composes to something other than NOERROR
+	// whatever the OPT record adds, so only a zero one needs the walk below.
+	if nscount == 0 || msg[3] & 0x0f != 0 || (ancount == 0 && msg[2] & 0x04 != 0) {
+		return false
+	}
+	// The alias branch reads one question, and decodes nothing for any other.
+	if ancount > 0 && (qdcount != 1 || ancount > MAX_ALIAS_REFERRAL_RECORDS || nscount > MAX_ALIAS_REFERRAL_RECORDS) {
+		return false
+	}
+
+	pos := HEADER_SIZE
+	for _ in 0 ..< qdcount {
+		next, ok := skip_name(msg, pos)
+		if !ok {
+			return false
+		}
+		pos = next + 4
+		if pos > len(msg) {
+			return false
+		}
+	}
+	// The answer first: an ordinary answer's first record ends this here.
+	for _ in 0 ..< ancount {
+		type, next, ok := skip_record(msg, pos)
+		if !ok {
+			return false
+		}
+		#partial switch type {
+		case .CNAME, .DNAME, .RRSIG:
+		case:
+			return false
+		}
+		pos = next
+	}
+	// The rcode after the counts and the answer: composing it walks the whole
+	// message for the OPT record.
+	if peek_rcode(msg) != .No_Error {
+		return false
+	}
+	ns := false
+	authority_at := pos
+	for _ in 0 ..< nscount {
+		type, next, ok := skip_record(msg, pos)
+		if !ok {
+			return false
+		}
+		#partial switch type {
+		case .SOA:
+			return false
+		case .NS:
+			ns = true
+		}
+		pos = next
+	}
+	if !ns || ancount == 0 {
+		return ns
+	}
+	return referred_past_alias(msg, authority_at, nscount)
+}
+
+// The resource record at `pos`: its type, and where the one after it starts.
+@(private)
+skip_record :: proc(msg: []u8, pos: int) -> (type: Type, next: int, ok: bool) {
+	fixed, named := skip_name(msg, pos)
+	if !named || fixed + 10 > len(msg) {
+		return
+	}
+	next = fixed + 10 + int(u16(msg[fixed + 8]) << 8 | u16(msg[fixed + 9]))
+	if next > len(msg) {
+		return
+	}
+	return Type(u16(msg[fixed]) << 8 | u16(msg[fixed + 1])), next, true
+}
+
+// The most answer or authority records `peek_referral` follows a chain through:
+// a chain as long as the validator follows (`dnssec.MAX_CNAME_CHAIN`), each link
+// beside its RRSIG. It bounds both the decode and the walk, which is quadratic
+// in the answer.
+@(private)
+MAX_ALIAS_REFERRAL_RECORDS :: 32
+
+/*
+Where the CNAME chain in a reply's answer section ends: the name a client that
+follows it asks next. `aliased` is false where the chain goes nowhere - no CNAME
+from the question's name, a loop back to it, or a question whose CNAME is the
+data rather than a step (a CNAME, DNAME or RRSIG asked for, or ANY, which
+matches the CNAME and is not followed: RFC 1034 section 4.3.2, step 3a).
+
+For `resolve_query`, which asks it of a reply `peek_referral` has already called
+a referral past an alias, and so already bounded.
+*/
+peek_alias_target :: proc(msg: []u8) -> (target: string, aliased: bool) {
+	_, target, aliased = alias_chain(msg)
+	return
+}
+
+@(private)
+alias_chain :: proc(msg: []u8) -> (asked, target: string, aliased: bool) {
+	decoded, err := decode_through_answer(msg, context.temp_allocator)
+	if err != .None || len(decoded.question) != 1 {
+		return
+	}
+	#partial switch decoded.question[0].type {
+	case .CNAME, .DNAME, .RRSIG, .ANY:
+		return
+	}
+	asked = decoded.question[0].name
+	target = asked
+	// One step per answer record at most, so a loop in the chain ends.
+	for _ in decoded.answer {
+		moved := false
+		for rec in decoded.answer {
+			alias, is_name := rec.data.(Rdata_Name)
+			if rec.type == .CNAME && is_name && name_equal_fold(rec.name, target) {
+				target = alias.name
+				moved = true
+				break
+			}
+		}
+		if !moved {
+			break
+		}
+	}
+	return asked, target, !name_equal_fold(target, asked)
+}
+
+// The CNAME half of `peek_referral`: whether the authority's NS are for the
+// chain's target rather than for the name asked. `authority_at` is where the
+// authority section starts, which `peek_referral` has already walked.
+@(private)
+referred_past_alias :: proc(msg: []u8, authority_at, nscount: int) -> bool {
+	asked, target, aliased := alias_chain(msg)
+	if !aliased {
+		return false
+	}
+	pos := authority_at
+	for _ in 0 ..< nscount {
+		type, next, _ := skip_record(msg, pos)
+		if type == .NS {
+			zone, _, nerr := decode_name(msg, pos, context.temp_allocator)
+			if nerr == .None && name_at_or_below(target, zone) && !name_at_or_below(asked, zone) {
+				return true
+			}
+		}
+		pos = next
+	}
+	return false
+}
+
+/*
 The largest TTL a message may carry.
 
 The field is 32 bits wide on the wire, but RFC 2181 section 8 narrows the value

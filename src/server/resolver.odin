@@ -3,6 +3,7 @@ package server
 import "core:fmt"
 import "core:mem"
 import "core:net"
+import "core:slice"
 import "core:sync"
 import "core:time"
 import "elodin:cache"
@@ -2102,7 +2103,7 @@ resolve_query :: proc(
 		read the rcode it is given - see the guard below the exchanges - and
 		that the rcode is not one of the two which say nothing about the name at
 		all, SERVFAIL and REFUSED, where another member of the group is asked
-		instead (issue #309).
+		instead (issue #309) - as it is past a referral (issue #410).
 		*/
 		resp, winner, uerr = upstream.resolve_answerable(asked, forwarded, allocator, &deadline)
 	} else {
@@ -2168,9 +2169,10 @@ resolve_query :: proc(
 			*/
 			if uerr == .None {
 				logx.debugf(
-					"query DS %s: the parent's group answered %s rather than proving the delegation carries no DS, so the route is asked instead",
+					"query DS %s: the parent's group answered %s%s rather than proving the delegation carries no DS, so the route is asked instead",
 					q.name,
 					rcode_text(dns.peek_rcode(resp)),
+					" (a referral)" if logx.enabled(.Debug) && dns.peek_referral(resp) else "",
 				)
 			} else {
 				logx.debugf(
@@ -2303,8 +2305,60 @@ resolve_query :: proc(
 			}
 		}
 	}
-	if uerr != .None {
+	/*
+	And a referral is no answer at all (issue #410): a member that does not
+	recurse for the name said who else to ask, and a client handed that reads
+	NOERROR over an empty answer as "the name has no such record". The group
+	has already asked every other member it could (`upstream.resolve_readable`),
+	so what is left is the question failing - stale if there is anything, and
+	SERVFAIL otherwise - the way it fails when nobody answers. dnsmasq and
+	Unbound refuse a referral from a forwarder the same way.
+
+	Here rather than beside the rcode guard below, so the refresh path and the
+	stale fallback read it as the outage it is. See `dns.peek_referral`.
+	*/
+	referral := uerr == .None && dns.peek_referral(resp)
+	/*
+	Except a referral past a CNAME whose target this server sends somewhere
+	else. Routes `corp.` and `lab.corp.` to two authorities, and the first
+	answers `www.corp. CNAME host.lab.corp.` beside `lab.corp. NS`: that is all
+	it holds, and a client that follows the CNAME asks `host.lab.corp.` of the
+	second, which answers. Whether a group other than the one that referred
+	can answer the target is not known here, so the reply goes out as it did
+	before issue #451; where the target comes back to that same group - one
+	lame member of the default group, the shape the issue is about - the
+	group has already said it cannot, and the refusal stands.
+	*/
+	if referral {
+		if target, aliased := dns.peek_alias_target(resp); aliased {
+			back := route_group(s, target, q.type)
+			if !slice.contains(back.servers, winner) {
+				logx.debugf(
+					"query %s %s from %s: upstream %s referred past a CNAME to %s, which is asked elsewhere; handing it on",
+					dns.type_name(q.type),
+					q.name,
+					client,
+					answering_upstream(winner),
+					target,
+				)
+				referral = false
+			}
+		}
+	}
+	if referral {
+		logx.debugf(
+			"query %s %s from %s: upstream %s answered with a referral rather than recursing",
+			dns.type_name(q.type),
+			q.name,
+			client,
+			answering_upstream(winner),
+		)
+	} else if uerr != .None {
 		logx.debugf("query %s %s from %s failed: %v", dns.type_name(q.type), q.name, client, uerr)
+	}
+	// Not by setting `uerr`: every value it has names a transport failure, and
+	// `.Not_Resolved` is an upstream hostname that would not resolve.
+	if uerr != .None || referral {
 		if flight != nil {
 			flight.failed = true
 		}
@@ -2312,12 +2366,12 @@ resolve_query :: proc(
 		The condition `cache.serve_stale` was always documented by: the refresh
 		was attempted, and there is nothing to answer with but what expired.
 
-		Only a failure to get an answer at all counts. An upstream that answered
-		SERVFAIL answered, and a response this server refused to hand on -
-		because it did not validate - was refused deliberately; serving expired
-		data instead of either would be reaching past a verdict rather than
-		covering an outage. RFC 8767 section 5 leaves both open; neither is
-		decided here.
+		Only a failure to get an answer at all counts - a referral, above, being
+		none. An upstream that answered SERVFAIL answered, and a response this
+		server refused to hand on - because it did not validate - was refused
+		deliberately; serving expired data instead of either would be reaching
+		past a verdict rather than covering an outage. RFC 8767 section 5 leaves
+		both open; neither is decided here.
 		*/
 		if unanswered != nil {
 			/*
@@ -2350,6 +2404,7 @@ resolve_query :: proc(
 			spent,
 			allocator,
 			ede,
+			"referral" if referral else "upstream",
 		)
 	}
 

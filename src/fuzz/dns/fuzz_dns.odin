@@ -24,5 +24,8 @@ fuzz_one :: proc "c" (data: [^]u8, size: uint) -> i32 {
 	the query it pads on the way upstream is one of ours.
 	*/
 	_, _ = dns.pad_response(data[:size], dns.PAD_RESPONSE_BLOCK, dns.MAX_MESSAGE, 1232)
+	// Every upstream reply is judged by this on the raw bytes, and its alias
+	// branch walks and decodes them on its own (issues #410, #451).
+	_ = dns.peek_referral(data[:size])
 	return 0
 }

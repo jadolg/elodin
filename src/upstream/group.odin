@@ -189,6 +189,10 @@ forever, is never parked and every client query stopped at it while the member
 beside it held the answer. dnsmasq, Unbound and BIND all move to the next server
 on these two.
 
+And a referral, a NOERROR that says only who else to ask (issue #410,
+`dns.peek_referral`): a member that does not recurse for the name sends one,
+and a client handed it reads the empty answer as NODATA.
+
 The ordinary path is untouched: a usable reply returns from the first exchange
 and none of the sweep runs. Where no member of the group can manage one the
 first reply still comes back, rcode and all - which is what a group of one, the
@@ -485,9 +489,11 @@ resolve_insisting :: proc(
 			// name, and `%v` renders one of those as a placeholder - the same
 			// reading `unreadable_rcode_refusal` gives its own line.
 			logx.debugf(
-				"upstream %s answered rcode %d, swept past it to %s",
+				"upstream %s answered rcode %d%s, swept past it to %s",
 				winner.spec.name,
 				u16(dns.peek_rcode(response)),
+				// Gated: arguments are evaluated whether or not the line is written.
+				" (a referral)" if logx.enabled(.Debug) && dns.peek_referral(response) else "",
 				u.spec.name,
 			)
 			// The first reply is superseded. It came from the caller's
@@ -508,11 +514,16 @@ resolve_insisting :: proc(
 
 // The two rcodes that say something about the name that was asked for. The
 // same test `dnssec.answerable_rcode` makes, over the wire bytes this package
-// deals in rather than a decoded message.
+// deals in rather than a decoded message - and not a referral, which is a
+// NOERROR that says only who else to ask (issue #410, `dns.peek_referral`).
+// `dnssec.answerable_rcode` does not make that second test: `validator_query`
+// refuses a referral this sweep could not get past before the walk reads it.
 @(private)
 answerable :: proc(response: []u8) -> bool {
 	#partial switch dns.peek_rcode(response) {
-	case .No_Error, .NX_Domain:
+	case .No_Error:
+		return !dns.peek_referral(response)
+	case .NX_Domain:
 		return true
 	}
 	return false
@@ -656,7 +667,7 @@ POLICY_EDE_LAST :: 17
 /*
 Whether a reply is one the client's own question can be answered with.
 
-Two ways it is not, and `resolve_readable` argues both.
+Three ways it is not, and `resolve_readable` argues all three.
 
 An rcode of 16 or above, because the rcode a client reads off the header is then
 not the rcode the responder meant - the upper eight bits live in the OPT
@@ -681,12 +692,17 @@ this has no measurement of. A resolver that meets one is a second report and a
 line in this switch, not a guess made now.
 
 Every other rcode a stub can read is a statement about the name, or close enough
-to one, and stands as the client's answer.
+to one, and stands as the client's answer - except a NOERROR that is a referral
+(issue #410). A member that does not recurse for the name sends one, and the
+client would read it as NODATA; `resolve_query` refuses it where no member of
+the group does better.
 */
 @(private)
 usable_rcode :: proc(response: []u8) -> bool {
 	rcode := dns.peek_rcode(response)
 	#partial switch rcode {
+	case .No_Error:
+		return !dns.peek_referral(response)
 	case .Serv_Fail:
 		return extended_error_within(response, BOGUS_EDE_FIRST, BOGUS_EDE_LAST)
 	case .Refused:
