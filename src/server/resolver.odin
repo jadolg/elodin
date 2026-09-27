@@ -2325,10 +2325,12 @@ resolve_query :: proc(
 			client,
 			answering_upstream(winner),
 		)
-		uerr = .Not_Resolved
-	}
-	if uerr != .None {
+	} else if uerr != .None {
 		logx.debugf("query %s %s from %s failed: %v", dns.type_name(q.type), q.name, client, uerr)
+	}
+	// Not by setting `uerr`: every value it has names a transport failure, and
+	// `.Not_Resolved` is an upstream hostname that would not resolve.
+	if uerr != .None || referral {
 		if flight != nil {
 			flight.failed = true
 		}
