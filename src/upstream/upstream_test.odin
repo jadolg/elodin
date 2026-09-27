@@ -1866,7 +1866,7 @@ test_redirect_within_the_configured_scheme_is_followed :: proc(t: ^testing.T) {
 	origin_server := thread.create_and_start_with_poly_data(&origin_mock, http_mock_once)
 
 	url := fmt.tprintf("http://127.0.0.1:%d/list.txt", origin_bound.port)
-	body, ferr := fetch_url(url, nil, 5 * time.Second, context.temp_allocator)
+	body, ferr := fetch_url(url, nil, 5 * time.Second, 10 * time.Second, context.temp_allocator)
 
 	// Joined before the arena the replies live in is reset.
 	thread.join(origin_server)
@@ -2554,6 +2554,8 @@ test_a_pooled_doh_connection_takes_this_querys_deadline :: proc(t: ^testing.T) {
 		"the pooled connection held a 200ms query for %v",
 		spent,
 	)
+	// The timeout is the deadline spent, so nothing is left to redial with.
+	testing.expectf(t, sync.atomic_load(&m.conns) == 1, "a timed-out pooled query dialled again: %d connections", sync.atomic_load(&m.conns))
 	free_all(context.temp_allocator)
 }
 
@@ -3069,4 +3071,482 @@ test_http_bodyless_statuses_end_at_the_fields :: proc(t: ^testing.T) {
 		expect_caller_holds_nothing(t, &track, "endless interims")
 	}
 	free_all(context.temp_allocator)
+}
+
+/*
+Answers one connection with `head`, then one `line` every `interval`, `count`
+times or until the client goes away: a response that is always just about to
+arrive, so no single read ever waits long enough to time out.
+*/
+@(private = "file")
+Trickle_Mock :: struct {
+	listener: net.TCP_Socket,
+	head:     string,
+	line:     string,
+	count:    int,
+	interval: time.Duration,
+}
+
+@(private = "file")
+trickle_mock_once :: proc(m: ^Trickle_Mock) {
+	client, _, err := net.accept_tcp(m.listener)
+	if err != nil {
+		return
+	}
+	defer net.close(client)
+	drain_request(client)
+	if len(m.head) > 0 {
+		if n, serr := net.send_tcp(client, transmute([]u8)m.head); serr != nil || n <= 0 {
+			return
+		}
+	}
+	for _ in 0 ..< m.count {
+		time.sleep(m.interval)
+		if n, serr := net.send_tcp(client, transmute([]u8)m.line); serr != nil || n <= 0 {
+			return
+		}
+	}
+}
+
+@(private = "file")
+start_trickle :: proc(
+	t: ^testing.T,
+	head, line: string,
+	count := 40,
+	interval := 100 * time.Millisecond,
+) -> (
+	m: ^Trickle_Mock,
+	server: ^thread.Thread,
+	port: int,
+	ok: bool,
+) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		net.close(listener)
+		testing.expectf(t, false, "cannot read the mock's port: %v", berr)
+		return
+	}
+	// So a test that returns before dialling ends the accept, not the suite.
+	_ = net.set_option(listener, .Receive_Timeout, 3 * time.Second)
+	m = new(Trickle_Mock)
+	m^ = Trickle_Mock {
+		listener = listener,
+		head     = head,
+		line     = line,
+		count    = count,
+		interval = interval,
+	}
+	server = thread.create_and_start_with_poly_data(m, trickle_mock_once)
+	return m, server, bound.port, true
+}
+
+@(private = "file")
+stop_trickle :: proc(m: ^Trickle_Mock, server: ^thread.Thread) {
+	thread.join(server)
+	thread.destroy(server)
+	net.close(m.listener)
+	free(m)
+}
+
+/*
+A DoH query over HTTP/1.1 is bounded by its timeout as a whole, not per read
+(#445). The budget went onto the socket as a per-read timeout, so a server
+sending a header line every 100ms - each read well inside a 500ms timeout -
+held the query and its worker for as long as it cared to, up to the field limit
+and then through a chunked body a byte at a time.
+*/
+@(test)
+test_a_trickled_doh_response_is_bounded_by_the_query_timeout :: proc(t: ^testing.T) {
+	m, server, port, ok := start_trickle(t, "HTTP/1.1 200 OK\r\n", "X-Slow: 1\r\n")
+	if !ok {
+		return
+	}
+	defer stop_trickle(m, server)
+
+	u, uerr := make_upstream(
+		config.Upstream_Spec {
+			name = "trickle",
+			kind = .TCP,
+			address = "127.0.0.1",
+			port = port,
+			hostname = "doh.invalid",
+			path = "/dns-query",
+		},
+		8,
+		30 * time.Second,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot make the upstream: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+
+	query := dns.Message {
+		id       = 0x4450,
+		question = []dns.Question{{name = "example.com.", type = .A, class = .IN}},
+	}
+	query.flags.rd = true
+	wire, _, enc := dns.encode_message(query, context.temp_allocator)
+	if !testing.expectf(t, enc == .None, "cannot encode: %v", enc) {
+		return
+	}
+	body := make([]u8, len(wire), context.temp_allocator)
+	copy(body, wire)
+	dns.set_id_in_place(body, 0)
+
+	start := time.tick_now()
+	_, err := exchange_doh_h1(u, wire, body, 500 * time.Millisecond, context.temp_allocator)
+	spent := time.tick_since(start)
+	testing.expectf(t, err == .Timeout, "a trickled response reported %v", err)
+	testing.expectf(t, spent < 1500 * time.Millisecond, "a 500ms query was held for %v", spent)
+	free_all(context.temp_allocator)
+}
+
+/*
+The list download has the same bound, as a total over the whole fetch (#445):
+here a chunked body a byte at a time, each chunk well inside the one-second
+read timeout. And the read timeout still holds under a total that has plenty
+left, so a host that goes quiet is given up on at `timeout`, not at `total`.
+*/
+@(test)
+test_a_trickled_list_download_is_bounded_by_its_total :: proc(t: ^testing.T) {
+	{
+		m, server, port, ok := start_trickle(t, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", "1\r\nx\r\n")
+		if !ok {
+			return
+		}
+		start := time.tick_now()
+		body, err := fetch_url(fmt.tprintf("http://127.0.0.1:%d/list.txt", port), nil, time.Second, 500 * time.Millisecond, context.temp_allocator)
+		spent := time.tick_since(start)
+		stop_trickle(m, server)
+		testing.expectf(t, err == .Timeout, "a trickled body reported %v, %d bytes", err, len(body))
+		testing.expectf(t, spent < 1500 * time.Millisecond, "a 500ms fetch was held for %v", spent)
+	}
+	{
+		m, server, port, ok := start_trickle(t, "HTTP/1.1 200 OK\r\n", "X: y\r\n", count = 1, interval = time.Second)
+		if !ok {
+			return
+		}
+		start := time.tick_now()
+		body, err := fetch_url(fmt.tprintf("http://127.0.0.1:%d/list.txt", port), nil, 300 * time.Millisecond, 10 * time.Second, context.temp_allocator)
+		spent := time.tick_since(start)
+		stop_trickle(m, server)
+		testing.expectf(t, err != .None, "a silent host was answered, %d bytes", len(body))
+		testing.expectf(t, spent < 1500 * time.Millisecond, "a host silent past a 300ms read timeout held the fetch for %v", spent)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+A body with no framing ends when the peer closes, and nothing else ends it. Every
+failed read did: a deadline or a read timeout cut the body short and the part
+that had arrived came back as the whole of it, with no error - for a blocklist,
+a partial list written over the good cached one (#445 review).
+*/
+@(test)
+test_an_unframed_body_cut_short_is_not_a_body :: proc(t: ^testing.T) {
+	{
+		m, server, port, ok := start_trickle(t, "HTTP/1.1 200 OK\r\n\r\n", "0.0.0.0 ads.example\n")
+		if !ok {
+			return
+		}
+		body, err := fetch_url(fmt.tprintf("http://127.0.0.1:%d/list.txt", port), nil, time.Second, 500 * time.Millisecond, context.temp_allocator)
+		stop_trickle(m, server)
+		testing.expectf(t, err == .Timeout, "a body past the deadline reported %v with %d bytes", err, len(body))
+	}
+	{
+		m, server, port, ok := start_trickle(t, "HTTP/1.1 200 OK\r\n\r\n0.0.0.0 ads.example\n", "x", count = 1, interval = time.Second)
+		if !ok {
+			return
+		}
+		body, err := fetch_url(fmt.tprintf("http://127.0.0.1:%d/list.txt", port), nil, 300 * time.Millisecond, 10 * time.Second, context.temp_allocator)
+		stop_trickle(m, server)
+		testing.expectf(t, err == .Timeout, "a body that went quiet reported %v with %d bytes", err, len(body))
+	}
+	free_all(context.temp_allocator)
+}
+
+@(private = "file")
+Tls_Silent_Mock :: struct {
+	listener: net.TCP_Socket,
+	ctx:      ^tlsx.Context,
+	hold:     time.Duration,
+}
+
+// Completes the handshake, reads once, and says nothing for `hold`.
+@(private = "file")
+tls_silent_once :: proc(m: ^Tls_Silent_Mock) {
+	// So a test that returns before dialling ends the accept, not the suite.
+	_ = net.set_option(m.listener, .Receive_Timeout, 3 * time.Second)
+	client, _, err := net.accept_tcp(m.listener)
+	if err != nil {
+		return
+	}
+	_ = net.set_option(client, .Receive_Timeout, 3 * time.Second)
+	_ = net.set_option(client, .Send_Timeout, 3 * time.Second)
+	conn, terr := tlsx.server_accept(m.ctx, client)
+	if terr != .None {
+		net.close(client)
+		return
+	}
+	buf: [4096]u8
+	_, _ = tlsx.read(conn, buf[:])
+	time.sleep(m.hold)
+	tlsx.close(conn)
+}
+
+/*
+The deadline reads as a timeout over TLS as well. `tlsx` rounded what is left
+down to whole milliseconds for `poll`, so its read gave up a fraction early; a
+clock read after the fact found the deadline not yet passed and reported the
+peer as broken rather than slow (#445 review).
+*/
+@(test)
+test_a_silent_tls_peer_is_a_timeout :: proc(t: ^testing.T) {
+	posix.sigignore(.SIGPIPE)
+	sync.once_do(&dot_cert_once, generate_dot_certs)
+	if !dot_cert_ok {
+		testing.expect(t, false, "no certificate available and openssl could not make one")
+		return
+	}
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
+		return
+	}
+	sctx, serr := tlsx.server_context(dot_cert_path, dot_key_path)
+	if serr != .None {
+		testing.expectf(t, false, "server_context: %v", serr)
+		return
+	}
+	defer tlsx.context_destroy(sctx)
+	cctx, cerr := tlsx.client_context(false, "", []string{"http/1.1"})
+	if cerr != .None {
+		testing.expectf(t, false, "client_context: %v", cerr)
+		return
+	}
+	defer tlsx.context_destroy(cctx)
+
+	m := Tls_Silent_Mock {
+		listener = listener,
+		ctx      = sctx,
+		hold     = time.Second,
+	}
+	server := thread.create_and_start_with_poly_data(&m, tls_silent_once)
+	defer {
+		thread.join(server)
+		thread.destroy(server)
+	}
+
+	stream, oerr := open_stream(bound, cctx, "doh.invalid", 2 * time.Second)
+	if !testing.expectf(t, oerr == .None, "cannot open the stream: %v", oerr) {
+		return
+	}
+	defer stream_close(&stream)
+	start := time.tick_now()
+	_, err := http_exchange(
+		&stream,
+		Http_Request{method = "GET", path = "/", host = "doh.invalid"},
+		context.temp_allocator,
+		deadline = time.tick_add(time.tick_now(), 300 * time.Millisecond),
+	)
+	spent := time.tick_since(start)
+	testing.expectf(t, err == .Timeout, "a silent TLS peer reported %v after %v", err, spent)
+	testing.expectf(t, spent < 900 * time.Millisecond, "a 300ms deadline held for %v", spent)
+	// Not a moment before it either: `tlsx` rounded the wait down to whole
+	// milliseconds, so a TLS read gave up with a fraction of the budget left.
+	testing.expectf(t, spent >= 300 * time.Millisecond, "a 300ms deadline gave up after %v", spent)
+	free_all(context.temp_allocator)
+}
+
+/*
+The request's writes are held to the deadline too. The write timeout was what
+`open_stream` put on the connection, per call, so a peer that stopped reading
+held a large request body for that long whatever the deadline said.
+*/
+@(test)
+test_a_peer_that_stops_reading_is_bounded_by_the_deadline :: proc(t: ^testing.T) {
+	posix.sigignore(.SIGPIPE)
+	sync.once_do(&dot_cert_once, generate_dot_certs)
+	if !dot_cert_ok {
+		testing.expect(t, false, "no certificate available and openssl could not make one")
+		return
+	}
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
+		return
+	}
+	sctx, serr := tlsx.server_context(dot_cert_path, dot_key_path)
+	if serr != .None {
+		testing.expectf(t, false, "server_context: %v", serr)
+		return
+	}
+	defer tlsx.context_destroy(sctx)
+	cctx, cerr := tlsx.client_context(false, "", []string{"http/1.1"})
+	if cerr != .None {
+		testing.expectf(t, false, "client_context: %v", cerr)
+		return
+	}
+	defer tlsx.context_destroy(cctx)
+
+	m := Tls_Silent_Mock {
+		listener = listener,
+		ctx      = sctx,
+		hold     = 2 * time.Second,
+	}
+	server := thread.create_and_start_with_poly_data(&m, tls_silent_once)
+	defer {
+		thread.join(server)
+		thread.destroy(server)
+	}
+
+	stream, oerr := open_stream(bound, cctx, "doh.invalid", 3 * time.Second)
+	if !testing.expectf(t, oerr == .None, "cannot open the stream: %v", oerr) {
+		return
+	}
+	defer stream_close(&stream)
+	body := make([]u8, 16 * 1024 * 1024)
+	defer delete(body)
+	start := time.tick_now()
+	_, err := http_exchange(
+		&stream,
+		Http_Request{method = "POST", path = "/", host = "doh.invalid", body = body},
+		context.temp_allocator,
+		deadline = time.tick_add(time.tick_now(), 500 * time.Millisecond),
+	)
+	spent := time.tick_since(start)
+	testing.expectf(t, err == .Timeout, "a peer that stopped reading reported %v after %v", err, spent)
+	testing.expectf(t, spent < 1500 * time.Millisecond, "a 500ms deadline held the write for %v", spent)
+	free_all(context.temp_allocator)
+}
+
+// And a write waits no longer than `idle` under a deadline far off, as a read
+// does: a list host that stopped reading held the fetch for the whole total.
+@(test)
+test_a_peer_that_stops_reading_is_bounded_by_the_idle_bound :: proc(t: ^testing.T) {
+	posix.sigignore(.SIGPIPE)
+	sync.once_do(&dot_cert_once, generate_dot_certs)
+	if !dot_cert_ok {
+		testing.expect(t, false, "no certificate available and openssl could not make one")
+		return
+	}
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
+		return
+	}
+	sctx, serr := tlsx.server_context(dot_cert_path, dot_key_path)
+	if serr != .None {
+		testing.expectf(t, false, "server_context: %v", serr)
+		return
+	}
+	defer tlsx.context_destroy(sctx)
+	cctx, cerr := tlsx.client_context(false, "", []string{"http/1.1"})
+	if cerr != .None {
+		testing.expectf(t, false, "client_context: %v", cerr)
+		return
+	}
+	defer tlsx.context_destroy(cctx)
+
+	m := Tls_Silent_Mock {
+		listener = listener,
+		ctx      = sctx,
+		hold     = 2 * time.Second,
+	}
+	server := thread.create_and_start_with_poly_data(&m, tls_silent_once)
+	defer {
+		thread.join(server)
+		thread.destroy(server)
+	}
+
+	stream, oerr := open_stream(bound, cctx, "doh.invalid", 3 * time.Second)
+	if !testing.expectf(t, oerr == .None, "cannot open the stream: %v", oerr) {
+		return
+	}
+	defer stream_close(&stream)
+	body := make([]u8, 16 * 1024 * 1024)
+	defer delete(body)
+	start := time.tick_now()
+	_, err := http_exchange(
+		&stream,
+		Http_Request{method = "POST", path = "/", host = "doh.invalid", body = body},
+		context.temp_allocator,
+		deadline = time.tick_add(time.tick_now(), 10 * time.Second),
+		idle = 300 * time.Millisecond,
+	)
+	spent := time.tick_since(start)
+	testing.expectf(t, err == .Timeout, "a peer that stopped reading reported %v after %v", err, spent)
+	testing.expectf(t, spent < 1500 * time.Millisecond, "a 300ms idle bound held the write for %v", spent)
+	free_all(context.temp_allocator)
+}
+
+// A read bound on its own, with no deadline over it, still bounds each read.
+@(test)
+test_an_idle_bound_holds_without_a_deadline :: proc(t: ^testing.T) {
+	m, server, port, ok := start_trickle(t, "HTTP/1.1 200 OK\r\n", "X: y\r\n", count = 1, interval = time.Second)
+	if !ok {
+		return
+	}
+	defer stop_trickle(m, server)
+	socket, derr := dial_tcp_timeout(net.Endpoint{address = net.IP4_Loopback, port = port}, time.Second)
+	if !testing.expectf(t, derr == .None, "cannot dial the mock: %v", derr) {
+		return
+	}
+	stream := Stream {
+		socket = socket,
+	}
+	defer stream_close(&stream)
+	set_socket_timeouts(socket, 3 * time.Second)
+	start := time.tick_now()
+	_, err := http_exchange(&stream, Http_Request{method = "GET", path = "/", host = "mock.invalid"}, context.temp_allocator, idle = 300 * time.Millisecond)
+	spent := time.tick_since(start)
+	testing.expectf(t, err == .Timeout, "a silent peer under a 300ms idle bound reported %v", err)
+	testing.expectf(t, spent < 900 * time.Millisecond, "a 300ms idle bound held for %v", spent)
+	free_all(context.temp_allocator)
+}
+
+/*
+A zero timeout is no timeout, as it always was: the floor that keeps a sliver
+of a deadline from rounding to zero must not turn a configured `timeout: 0`
+into a millisecond, which would time every UDP query out.
+*/
+@(test)
+test_a_zero_socket_timeout_is_still_no_timeout :: proc(t: ^testing.T) {
+	m, server, port, ok := start_trickle(t, "", "x", count = 1, interval = 100 * time.Millisecond)
+	if !ok {
+		return
+	}
+	defer stop_trickle(m, server)
+	socket, derr := dial_tcp_timeout(net.Endpoint{address = net.IP4_Loopback, port = port}, time.Second)
+	if !testing.expectf(t, derr == .None, "cannot dial the mock: %v", derr) {
+		return
+	}
+	defer net.close(socket)
+	set_socket_timeouts(socket, 0)
+	buf: [16]u8
+	n, rerr := net.recv_tcp(socket, buf[:])
+	testing.expectf(t, rerr == nil && n == 1, "a read with no timeout gave %d bytes, %v", n, rerr)
 }

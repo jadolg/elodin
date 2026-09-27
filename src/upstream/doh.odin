@@ -185,24 +185,10 @@ exchange_doh_h1 :: proc(
 				socket = conn.socket,
 				tls    = conn.tls,
 			}
-			/*
-			On this query's budget, not the one that opened it.
-
-			The deadlines a pooled connection carries are whatever the query
-			that dialled it had left - `open_stream` puts that figure on the
-			socket and `get_h2_conn` puts the configured timeout on one it
-			hands to the pool. Left alone, a connection opened with a sliver
-			would cut the next query short and one opened with the whole
-			timeout would hold a short query for all of it, which is the same
-			confusion `Pipe_Conn.timeout` exists to avoid.
-			*/
-			set_socket_timeouts(stream.socket, remaining)
-			if stream.tls != nil {
-				tlsx.set_timeouts(stream.tls, remaining, remaining)
-			}
+			// The timeouts it carries are whatever the query that dialled it
+			// had; `http_exchange` replaces them with this query's deadline
+			// before every write and read.
 		} else {
-			// `open_stream` puts this figure on the socket as well as on the
-			// dial, so it bounds the reads that follow too.
 			s, oerr := open_stream(u.endpoint, u.tls_ctx, u.spec.hostname, remaining, u)
 			if oerr != .None {
 				return nil, oerr
@@ -221,6 +207,7 @@ exchange_doh_h1 :: proc(
 				accept = "application/dns-message",
 			},
 			allocator,
+			deadline = deadline,
 		)
 
 		if herr == .None && resp.status == 200 && len(resp.body) >= dns.HEADER_SIZE {
@@ -256,7 +243,13 @@ exchange_doh_h1 :: proc(
 		a pooled connection is retried because it may simply be stale, and a
 		fresh one failing any other way has said what it has to say.
 		*/
-		if attempt == 1 || (!reused && last != .Peer_Closed) {
+		/*
+		A timeout is the deadline spent - `http_exchange` holds every read and
+		write to it - so it is not retried. Said here rather than left to the
+		`remaining <= 0` check above, which a socket timeout firing a hair early
+		would slip past, dialling the upstream with a sliver it cannot use.
+		*/
+		if attempt == 1 || last == .Timeout || (!reused && last != .Peer_Closed) {
 			return nil, last
 		}
 	}
@@ -269,16 +262,22 @@ Fetch a URL over HTTP or HTTPS, following redirects.
 
 Used to download blocklists. Kept here rather than in the filter package so the
 HTTP and TLS machinery has exactly one implementation.
+
+`timeout` bounds the dial and any one read; `total` bounds the whole fetch,
+redirects included. Per read alone, a host sending a line or a chunk just
+inside `timeout` held the fetch for as long as the body limit let it (#445).
 */
 fetch_url :: proc(
 	url: string,
 	bootstrap: []string,
 	timeout: time.Duration,
+	total: time.Duration,
 	allocator := context.allocator,
 ) -> (
 	body: []u8,
 	err: Error,
 ) {
+	deadline := time.tick_add(time.tick_now(), total)
 	current := url
 	// What the operator configured, which is what every later hop is judged
 	// against - rather than the hop before it, so a chain cannot walk itself
@@ -288,6 +287,11 @@ fetch_url :: proc(
 	have_origin := false
 
 	for _ in 0 ..< 5 {
+		// Before the lookup, so a spent budget does not start one. The lookup
+		// itself is bounded by the bootstrap resolver's own timeout.
+		if time.tick_diff(time.tick_now(), deadline) <= 0 {
+			return nil, .Timeout
+		}
 		scheme, host, path, port, host_only, purl_ok := split_http_url(current)
 		if !purl_ok {
 			return nil, .HTTP_Error
@@ -322,13 +326,19 @@ fetch_url :: proc(
 			tlsx.context_destroy(tls_ctx)
 		}
 
-		stream := open_stream(endpoint, tls_ctx, host_only, timeout) or_return
+		remaining := time.tick_diff(time.tick_now(), deadline)
+		if remaining <= 0 {
+			return nil, .Timeout
+		}
+		stream := open_stream(endpoint, tls_ctx, host_only, min(timeout, remaining)) or_return
 		defer stream_close(&stream)
 
 		resp, herr := http_exchange(
 			&stream,
 			Http_Request{method = "GET", path = path, host = host, accept = "text/plain, */*"},
 			allocator,
+			deadline = deadline,
+			idle = timeout,
 		)
 		if herr != .None {
 			return nil, herr

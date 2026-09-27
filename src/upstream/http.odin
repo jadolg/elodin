@@ -29,34 +29,80 @@ stream_read :: proc(s: ^Stream, buf: []u8) -> (n: int, err: Error) {
 		if terr == .Closed {
 			return 0, .None
 		}
+		// A read that ran out of time is a timeout on either half, as in
+		// `pipe_read_full`: `IO_Error` says the peer broke, not that it was slow.
 		if terr != .None {
-			return 0, .IO_Error
+			return 0, roundtrip_failure(terr)
 		}
 		return got, .None
 	}
 	got, nerr := net.recv_tcp(s.socket, buf)
 	if nerr != nil {
+		// SO_RCVTIMEO expiring is EAGAIN, which core:net calls .Would_Block.
+		if nerr == .Timeout || nerr == .Would_Block {
+			return 0, .Timeout
+		}
 		return 0, .IO_Error
 	}
 	return got, .None
 }
 
-stream_write :: proc(s: ^Stream, buf: []u8) -> Error {
+/*
+`deadline`, when set, bounds the write, and `idle` any one write under it, as
+`reader_fill` does for reads: on TLS the whole call waits for what is left, as
+`tlsx.write` holds a call to one timeout. On a plain socket it is
+the timeout on each `send` - core:net retries a short one with a fresh wait - so
+it bounds only a write that fits the socket buffer, which is what the plain-HTTP
+caller sends: a list download's GET. DoH is HTTPS only.
+*/
+stream_write :: proc(s: ^Stream, buf: []u8, deadline := time.Tick{}, idle := time.Duration(0)) -> Error {
+	if wait, bounded := next_wait(deadline, idle); bounded {
+		if wait <= 0 {
+			return .Timeout
+		}
+		stream_set_write_timeout(s, wait)
+	}
 	if s.tls != nil {
 		if _, err := tlsx.write(s.tls, buf); err != .None {
-			return .Peer_Closed if err == .Closed else .IO_Error
+			return roundtrip_failure(err)
 		}
 		return .None
 	}
 	sent := 0
 	for sent < len(buf) {
 		n, err := net.send_tcp(s.socket, buf[sent:])
+		if err == .Timeout || err == .Would_Block {
+			return .Timeout
+		}
 		if err != nil || n <= 0 {
 			return .IO_Error
 		}
 		sent += n
 	}
 	return .None
+}
+
+/*
+How long the next read may wait, on whichever half the stream reads through.
+Never less than a millisecond: a zero `SO_RCVTIMEO` is no timeout at all.
+*/
+stream_set_read_timeout :: proc(s: ^Stream, timeout: time.Duration) {
+	bounded := max(timeout, time.Millisecond)
+	if s.tls != nil {
+		tlsx.set_read_timeout(s.tls, bounded)
+		return
+	}
+	_ = net.set_option(s.socket, .Receive_Timeout, bounded)
+}
+
+// The same for the next write.
+stream_set_write_timeout :: proc(s: ^Stream, timeout: time.Duration) {
+	bounded := max(timeout, time.Millisecond)
+	if s.tls != nil {
+		tlsx.set_write_timeout(s.tls, bounded)
+		return
+	}
+	_ = net.set_option(s.socket, .Send_Timeout, bounded)
 }
 
 stream_close :: proc(s: ^Stream) {
@@ -70,13 +116,33 @@ stream_close :: proc(s: ^Stream) {
 
 @(private)
 Buf_Reader :: struct {
-	stream: ^Stream,
-	buf:    [dynamic]u8,
-	pos:    int,
+	stream:   ^Stream,
+	buf:      [dynamic]u8,
+	pos:      int,
+	// When the whole exchange must be over, and how long any one read may
+	// wait; either may be zero for no such bound, and with both zero the
+	// timeouts already on the socket apply. See `reader_fill`.
+	deadline: time.Tick,
+	idle:     time.Duration,
+	// The peer has closed: what `reader_to_end` waits for, and the only thing
+	// that ends a body with no framing.
+	closed:   bool,
 }
 
 @(private)
 reader_fill :: proc(r: ^Buf_Reader) -> Error {
+	/*
+	A timeout per read bounds a silent peer and nothing else: a peer sending a
+	line just inside it, again and again, held the exchange for as long as the
+	field limit and the body limit let it (#445). So each read waits for what
+	is left of the deadline at most.
+	*/
+	if wait, bounded := next_wait(r.deadline, r.idle); bounded {
+		if wait <= 0 {
+			return .Timeout
+		}
+		stream_set_read_timeout(r.stream, wait)
+	}
 	chunk: [8192]u8
 	n, err := stream_read(r.stream, chunk[:])
 	if err != .None {
@@ -97,10 +163,28 @@ reader_fill :: proc(r: ^Buf_Reader) -> Error {
 	ends a body with no length, and discards whichever of the two it gets.
 	*/
 	if n == 0 {
+		r.closed = true
 		return .Peer_Closed if len(r.buf) == 0 else .IO_Error
 	}
 	append(&r.buf, ..chunk[:n])
 	return .None
+}
+
+/*
+How long the next read or write may wait: what is left of `deadline`, or `idle`
+if that is shorter. `bounded` is false with neither set, and the timeouts
+already on the socket apply; a `wait` of zero or less is the deadline passed.
+*/
+@(private)
+next_wait :: proc(deadline: time.Tick, idle: time.Duration) -> (wait: time.Duration, bounded: bool) {
+	if deadline == {} {
+		return idle, idle > 0
+	}
+	left := time.tick_diff(time.tick_now(), deadline)
+	if idle > 0 && idle < left {
+		return idle, true
+	}
+	return left, true
 }
 
 /*
@@ -182,8 +266,17 @@ reader_to_end :: proc(r: ^Buf_Reader, limit: int) -> (data: []u8, err: Error) {
 		if len(r.buf) - r.pos > limit {
 			return nil, .Too_Large
 		}
+		/*
+		The close is the end of the body, and nothing else is. Any failed read
+		ended it: a deadline or a read timeout cut it short and the part that
+		had arrived came back as the whole, with no error - for a list, a
+		partial copy written over the good cached one (#445).
+		*/
 		if ferr := reader_fill(r); ferr != .None {
-			break
+			if r.closed {
+				break
+			}
+			return nil, ferr
 		}
 	}
 	return r.buf[r.pos:], .None
@@ -229,11 +322,18 @@ Perform one request/response exchange on `stream`.
 
 The returned body is allocated from `allocator`; everything else borrows from
 scratch memory and must be copied if it needs to outlive the call.
+
+`deadline`, when set, bounds the request's writes and the reading of the whole
+response, and `idle` any one read or write under it; see `stream_write` and
+`reader_fill`. Without one, only the timeouts already on
+the stream apply, and those are per read.
 */
 http_exchange :: proc(
 	stream: ^Stream,
 	req: Http_Request,
 	allocator := context.allocator,
+	deadline := time.Tick{},
+	idle := time.Duration(0),
 ) -> (
 	resp: Http_Response,
 	err: Error,
@@ -266,14 +366,16 @@ http_exchange :: proc(
 	}
 	strings.write_string(&b, "\r\n")
 
-	stream_write(stream, transmute([]u8)strings.to_string(b)) or_return
+	stream_write(stream, transmute([]u8)strings.to_string(b), deadline, idle) or_return
 	if len(req.body) > 0 {
-		stream_write(stream, req.body) or_return
+		stream_write(stream, req.body, deadline, idle) or_return
 	}
 
 	r := Buf_Reader {
-		stream = stream,
-		buf    = make([dynamic]u8, 0, 8192, context.temp_allocator),
+		stream   = stream,
+		buf      = make([dynamic]u8, 0, 8192, context.temp_allocator),
+		deadline = deadline,
+		idle     = idle,
 	}
 
 	/*
