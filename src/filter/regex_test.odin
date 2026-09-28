@@ -134,8 +134,13 @@ test_regex_rules_that_are_refused :: proc(t: ^testing.T) {
 	defer set_destroy(allow)
 
 	refused := []string {
-		// Empty: urlfilter would match every name with it.
+		// Empty, or matching the empty string: urlfilter would match every
+		// name with it.
 		"//",
+		"/ads|/",
+		"/x*/",
+		"/(|a)/",
+		"/^/",
 		// Not a regex this engine has: lookahead, an unclosed group.
 		"/(?=ads)/",
 		"/(ads/",
@@ -167,6 +172,13 @@ test_regex_rules_that_are_refused :: proc(t: ^testing.T) {
 		// Odin takes a rune before `\d` as the start of `\d-z`'s range.
 		`/[a\d-z]/`,
 		`/[a-\d]/`,
+		// RE2 refuses `\b` in a class, Odin reads it as `b`; Odin reads `[]`
+		// and `[^]` as empty, RE2 as a class opening with `]`.
+		`/[\b]ads/`,
+		`/[\B]ads/`,
+		`/[a-\b]/`,
+		`/[]a]/`,
+		`/[^]a]/`,
 	}
 	for rule in refused {
 		testing.expectf(t, parse_rule(block, allow, rule) == 0, "%q was added", rule)

@@ -107,12 +107,11 @@ regex_add :: proc(s: ^Set, pattern: string) -> (stored: bool) {
 		return false
 	}
 
-	scratch: virtual.Arena
-	if virtual.arena_init_growing(&scratch) != nil {
+	if s.regex_scratch.curr_block == nil && virtual.arena_init_growing(&s.regex_scratch) != nil {
 		return false
 	}
-	defer virtual.arena_destroy(&scratch)
-	temp := virtual.arena_allocator(&scratch)
+	defer virtual.arena_free_all(&s.regex_scratch)
+	temp := virtual.arena_allocator(&s.regex_scratch)
 
 	{
 		context.allocator = temp
@@ -124,6 +123,9 @@ regex_add :: proc(s: ^Set, pattern: string) -> (stored: bool) {
 	// Compiled into the scratch arena first, so a refused program leaves
 	// nothing behind in the set, then again into the set's own arena.
 	if trial, err := regex.create(pattern, REGEX_FLAGS, temp, temp); err != nil || len(trial.program) > MAX_REGEX_PROGRAM {
+		return false
+	} else if _, matches_empty := regex.match_and_allocate_capture(trial, "", temp, temp); matches_empty {
+		// `/ads|/`, `/x*/`, `/^/`: matches every name, as `//` would.
 		return false
 	} else if s.regex_bytes + len(trial.program) > MAX_REGEX_TOTAL {
 		s.regex_refused += 1
@@ -166,7 +168,9 @@ regex_lookup :: proc(s: ^Set, normalised: string) -> bool {
 	if s == nil || len(s.regexes) == 0 || len(normalised) > MAX_REGEX_NAME {
 		return false
 	}
-	buf: [MATCH_SCRATCH]u8
+	// Left uninitialised: the arena zeroes what it hands out, and zeroing all
+	// 33 KiB here would be a memset on every lookup.
+	buf: [MATCH_SCRATCH]u8 = ---
 	arena: mem.Arena
 	mem.arena_init(&arena, buf[:])
 	scratch := mem.arena_allocator(&arena)
@@ -202,7 +206,8 @@ run as Odin reads it, so a list cannot block a name AdGuard Home would not:
     rune as its low byte, which would make `š` (U+0161) match an `a`.
 
 Empty is refused too, because urlfilter would match every name with it, which no
-list author means by `//`.
+list author means by `//`; `regex_add` refuses any other pattern that matches
+the empty string, such as `ads|` or `x*`, for the same reason.
 */
 @(private)
 regex_pattern_ok :: proc(pattern: string) -> bool {
@@ -288,11 +293,18 @@ The ranges in a class's text, read as Go's `parseClass` reads them: `lo-hi`
 with `hi` not below `lo`. A `-` next to `\d`, `\w` or `\s` and not at the end is
 refused too: Odin takes the rune before the escape as a range's start there,
 where RE2 reads the `-` as itself or refuses the pattern. `regex_pattern_ok`
-has already held an escaped letter to those classes and `\b \B`.
+has already held an escaped letter to those classes and `\b \B`, which RE2
+refuses inside a class and Odin reads as the letter.
+
+An empty class is refused: Odin reads `[]a]` and `[^]a]` as the empty class then
+`a]`, where RE2 reads a class holding `]` and `a`.
 */
 @(private)
 class_ranges_ok :: proc(class: string) -> bool {
 	text := strings.trim_prefix(class, "^")
+	if text == "" {
+		return false
+	}
 	// The literal last read, -1 after a class escape, -2 at the start or
 	// after a range.
 	prev := -2
@@ -306,7 +318,7 @@ class_ranges_ok :: proc(class: string) -> bool {
 			hi := int(text[i])
 			if hi == '\\' && i + 1 < len(text) {
 				i += 1
-				if strings.index_byte("dDwWsS", text[i]) >= 0 {
+				if strings.index_byte("dDwWsSbB", text[i]) >= 0 {
 					return false
 				}
 				hi = int(text[i])
@@ -319,6 +331,9 @@ class_ranges_ok :: proc(class: string) -> bool {
 		}
 		if c == '\\' && i + 1 < len(text) {
 			i += 1
+			if text[i] == 'b' || text[i] == 'B' {
+				return false
+			}
 			c = -1 if strings.index_byte("dDwWsS", text[i]) >= 0 else int(text[i])
 		}
 		prev = c

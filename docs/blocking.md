@@ -83,11 +83,13 @@ both sets.
   RE2: lookaround (`(?=`), inline flags (`(?i)`), escaped letters or digits
   other than `\d \D \w \W \s \S \b \B` (so `\1`, `\x41`, `\A`, `\z`), POSIX
   classes (`[[:alpha:]]`), `{,M}`, a repeat of a repeat (`a**`, `a{2}{3}`),
-  a `)` with no `(`, a class range running backwards (`[a-Z]`), and a `#`,
-  which elodin's engine reads as a comment and no name holds. The last drops
-  the AdGuard DNS filter's one allow regex, which needs a `#` in the name.
-  Also an empty `//`, and any byte outside printable ASCII (write an
-  international name as punycode).
+  a `)` with no `(`, a class range running backwards (`[a-Z]`), `\b` or `\B`
+  inside a class, a class opening with `]` (`[]a]`), and a `#`, which
+  elodin's engine reads as a comment and no name holds. The last drops the
+  AdGuard DNS filter's one allow regex, which needs a `#` in the name.
+  Also an empty `//` or any pattern that matches the empty string (`/ads|/`,
+  `/x*/`), which would block every name, and any byte outside printable ASCII
+  (write an international name as punycode).
 - Once a set's budget refuses a pattern, every later one is dropped too. The
   count is logged once at load: `filter: N regex rules skipped: a set holds 8192
   bytes of compiled regex, and the lists loaded first used them up`.

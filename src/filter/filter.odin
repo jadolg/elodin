@@ -48,6 +48,9 @@ Set :: struct {
 	regex_bytes:   int,
 	// Patterns turned away because `regex_bytes` was already at its budget.
 	regex_refused: int,
+	// What `regex_add` parses and trial-compiles into, emptied after each call:
+	// a fresh arena a pattern cost a map and unmap, 4 µs a line.
+	regex_scratch: virtual.Arena,
 	arena:     virtual.Arena,
 	allocator: mem.Allocator,
 	count:     int,
@@ -100,6 +103,7 @@ set_destroy :: proc(s: ^Set) {
 	if s == nil {
 		return
 	}
+	virtual.arena_destroy(&s.regex_scratch)
 	virtual.arena_destroy(&s.arena)
 	free(s)
 }
