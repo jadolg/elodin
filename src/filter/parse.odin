@@ -202,18 +202,33 @@ parse_hosts_line :: proc(block: ^Set, raw: string) -> (added: int) {
 
 @(private)
 parse_domain_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
-	line := strings.trim_space(strip_line_comment(raw))
+	kept := strip_line_comment(raw)
+	line := strings.trim_space(kept)
 	if line == "" {
 		return 0
 	}
+	// A `/` is never part of a domain, so a line opening with one is a regex
+	// rule, and an allow rule after a `-` or `@@`. On such a line a comment has
+	// to be set off by a space: a `!` or `#` cut inside the slashes (`/a/!b/`)
+	// would leave a shorter pattern that matches far more names.
+	cut_inside := len(kept) < len(raw) && strings.trim_right_space(kept) == kept
 	// A domains list may still carry the odd adblock-style entry.
 	if strings.has_prefix(line, "||") || strings.has_prefix(line, "@@") {
+		if cut_inside && strings.has_prefix(line, "@@/") {
+			return 0
+		}
 		return parse_adblock_line(block, allow, line)
 	}
 	target := block
 	if strings.has_prefix(line, "-") {
 		target = allow
 		line = strings.trim_space(line[1:])
+	}
+	if strings.has_prefix(line, "/") {
+		if cut_inside {
+			return 0
+		}
+		return parse_adblock_line(target, allow, line)
 	}
 	flags := Rule_Flags{.Apex, .Subdomains}
 	if strings.has_prefix(line, "*.") {
@@ -264,14 +279,29 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 	dropping it would widen the rule to every query, so the rule is skipped. That
 	is what AdGuard Home does with a modifier its DNS engine cannot honour.
 	*/
+	/*
+	A regex rule may hold `$` itself, as an anchor. urlfilter takes a rule that
+	opens and closes with `/` as a whole pattern with no options, unless it holds
+	`replace=` (`isRegexRuleWithoutOptions`), and otherwise splits the options
+	off at the *last* `$` not escaped with `\` (`findOptionsDelimiter`); every
+	other rule splits at the first. So `/ads?|x/$replace=/a/b/` is a `$replace`
+	rule, skipped, not the regex `ads?|x/$replace=/a/b`, which matches `ad`.
+	*/
+	options_at := strings.index_byte(line, '$')
+	// `$$` and `$@$` open an HTML filtering rule, not a modifier list. urlfilter
+	// looks for them at the first `$` whatever the rule, so `/a$$/` is one too.
+	if options_at >= 0 && (strings.has_prefix(line[options_at:], "$$") || strings.has_prefix(line[options_at:], "$@$")) {
+		return 0
+	}
+	is_regex := strings.has_prefix(line, "/")
+	if is_regex {
+		whole := strings.has_suffix(line, "/") && len(line) > 1 && !strings.contains(line, "replace=")
+		options_at = -1 if whole else last_options_delimiter(line)
+	}
 	badfilter := false
-	if idx := strings.index_byte(line, '$'); idx >= 0 {
+	if idx := options_at; idx >= 0 {
 		modifiers := line[idx + 1:]
 		line = line[:idx]
-		// `$$` and `$@$` open an HTML filtering rule, not a modifier list.
-		if strings.has_prefix(modifiers, "$") || strings.has_prefix(modifiers, "@$") {
-			return 0
-		}
 		for m in strings.split_iterator(&modifiers, ",") {
 			name := strings.trim_space(m)
 			if eq := strings.index_byte(name, '='); eq >= 0 {
@@ -286,6 +316,18 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 				return 0
 			}
 		}
+	}
+	if is_regex {
+		// `/.../`: what is between the slashes is matched against the name.
+		if len(line) < 2 || !strings.has_suffix(line, "/") {
+			return 0
+		}
+		pattern := line[1:len(line) - 1]
+		if badfilter {
+			regex_cancel(target, pattern)
+			return 0
+		}
+		return int(regex_add(target, pattern))
 	}
 	// `##`, `#@#`, `#$#`, `#?#`: cosmetic rules, naming the site they apply on.
 	if strings.contains(line, "#") {
@@ -313,9 +355,9 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 	if line == "" {
 		return 0
 	}
-	// Regex and wildcard rules cannot be answered at the DNS layer; set_add
-	// refuses a path rule.
-	if line[0] == '/' || strings.contains(line, "*") {
+	// Wildcard rules cannot be answered by a name lookup; set_add refuses a
+	// path rule.
+	if strings.contains(line, "*") {
 		return 0
 	}
 	if badfilter {
@@ -323,4 +365,15 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 		return 0
 	}
 	return int(set_add(target, line, flags))
+}
+
+// urlfilter's `findOptionsDelimiter`: the last `$` that no `\` escapes.
+@(private)
+last_options_delimiter :: proc(line: string) -> int {
+	for i := len(line) - 1; i >= 0; i -= 1 {
+		if line[i] == '$' && (i == 0 || line[i - 1] != '\\') {
+			return i
+		}
+	}
+	return -1
 }

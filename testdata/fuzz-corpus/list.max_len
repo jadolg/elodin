@@ -1,0 +1,4 @@
+# A regex rule may run to MAX_REGEX_PATTERN (1024) bytes, and what is past that
+# limit is its own path (a $badfilter over it once indexed past a stack
+# buffer); left to len_control the target stayed under 300 bytes.
+8192

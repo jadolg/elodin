@@ -53,6 +53,8 @@ run_blocking_cases :: proc(r: ^Runner) {
 |http://exact.test^
 address=/dnsmasq.test/0.0.0.0
 /a-regex-rule.*/
+/^ads[0-9]+\.regex\.test$/$important
+@@/^keep\.evil\.test$/
 `,
 	)
 	domains_path := write_list(
@@ -251,12 +253,27 @@ blocking:
 		}
 		end_case(r)
 
-		start_case(r, "blocking: an unusable rule is skipped, the list still loads")
+		start_case(r, "blocking: a regex rule is matched against the query name")
 		{
-			res := query_udp(udp_port, build_query("a-regex-rule.test.", u16(dns.Type.A)))
-			if check(r, res.ok, "no response") {
-				h := parse_header(r, res.wire)
-				check(r, h.rcode == int(dns.Rcode.No_Error), "a regex rule was treated as a domain")
+			Want :: struct {
+				name:    string,
+				blocked: bool,
+			}
+			for w in ([]Want {
+					{"a-regex-rule.test.", true},
+					{"ads12.regex.test.", true},
+					{"ADS7.Regex.Test.", true},
+					{"ads.regex.test.", false},
+					{"x.ads1.regex.test.", false},
+					// An allow regex outranks the `||evil.test^` above it.
+					{"keep.evil.test.", false},
+				}) {
+				res := query_udp(udp_port, build_query(w.name, u16(dns.Type.A)))
+				if check(r, res.ok, "no response for %s", w.name) {
+					h := parse_header(r, res.wire)
+					want := dns.Rcode.NX_Domain if w.blocked else dns.Rcode.No_Error
+					check(r, h.rcode == int(want), "%s: rcode %d, want %v", w.name, h.rcode, want)
+				}
 			}
 		}
 		end_case(r)
@@ -299,6 +316,70 @@ blocking:
 		end_case(r)
 
 		stop_server(&srv)
+	}
+
+	run_regex_bomb_case(r, upstream_port)
+}
+
+/*
+A downloaded list is untrusted, and a regex in it reaches the compiler (#405).
+Each of these would take the server down at load if it got there - a count pair
+past `max(i64)` hits the compiler's panic, the nested one writes gigabytes of
+program - so the case fails, rather than skips, when the server does not start.
+*/
+@(private = "file")
+run_regex_bomb_case :: proc(r: ^Runner, upstream_port: int) {
+	start_case(r, "blocking: a list of regex bombs loads, and the rules after them apply")
+	defer end_case(r)
+
+	list := write_list(
+		r,
+		"regex-bombs.txt",
+		`! regex rules no list should be able to spend the server on
+/a{9223372036854775808,9223372036854775809}/
+/a{0,18446744073709551615}/
+/((a{1000}){1000}){1000}/
+/(?=lookahead)/
+||after-the-bombs.test^
+/^after[0-9]\.regex\.test$/
+`,
+	)
+	udp_port := next_port(r)
+	config := fmt.tprintf(
+		`log: {{ level: warn }}
+listeners:
+  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
+  tcp: {{ enabled: false }}
+upstream:
+  timeout: 3s
+  servers: ["127.0.0.1:%d"]
+cache: {{ enabled: false }}
+blocking:
+  enabled: true
+  lists:
+    - {{ name: bombs, file: %s, format: adblock }}
+`,
+		udp_port,
+		upstream_port,
+		list,
+	)
+	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
+	if !check(r, ok, "the server did not start on a list of regex bombs") {
+		return
+	}
+	defer stop_server(&srv)
+
+	for name in ([]string{"after-the-bombs.test.", "after7.regex.test."}) {
+		res := query_udp(udp_port, build_query(name, u16(dns.Type.A)))
+		if check(r, res.ok, "no response for %s", name) {
+			h := parse_header(r, res.wire)
+			check(r, h.rcode == int(dns.Rcode.NX_Domain), "%s was not blocked", name)
+		}
+	}
+	res := query_udp(udp_port, build_query("aaaa.test.", u16(dns.Type.A)))
+	if check(r, res.ok, "no response") {
+		h := parse_header(r, res.wire)
+		check(r, h.rcode == int(dns.Rcode.No_Error), "a refused bomb blocked a name")
 	}
 }
 

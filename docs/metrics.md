@@ -52,7 +52,7 @@ scrape_configs:
 | `elodin_cache_hits_total` / `_misses_total` / `_evictions_total` | counter | how it is doing |
 | `elodin_cache_stale_total` | counter | expired answers served because no fresh one could be got in time |
 | `elodin_cache_withheld_total` | counter | answers the cache handed over that were then refused rather than served |
-| `elodin_filter_rules{list}` | gauge | rules loaded, `block` and `allow` |
+| `elodin_filter_rules{list}` | gauge | rules loaded, `block` and `allow`, regex rules included |
 | `elodin_upstream_queries_total{upstream}` | counter | queries sent to each upstream, by its configured name |
 | `elodin_upstream_failures_total{upstream}` | counter | exchanges that produced no usable answer |
 | `elodin_upstream_failure_kind_total{upstream,error}` | counter | the same, by cause: `timeout`, `io_error`, `peer_closed`, `bad_response`, `tls_failed`, `verify_failed`, `dial_failed`, `dial_reset`, `http_error`, `too_large`, `not_resolved`. Only kinds that occurred appear. The log names each kind once, so this is the only running record of why an upstream fails. A lone `peer_closed` does not count towards the cooldown; a sustained run does |

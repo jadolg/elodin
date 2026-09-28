@@ -42,6 +42,19 @@ Set :: struct {
 	// What `$badfilter` rules have taken back, kept so a rule arriving later -
 	// further down the list, or from the next one - is cancelled too.
 	cancelled: map[string]Rule_Flags,
+	// `/re/` rules, matched after the hash maps; `engine_match` says when, and
+	// regex.odin what bounds them.
+	regexes:       [dynamic]Regex_Rule,
+	// The patterns `regexes` holds, so a line is checked against them in one
+	// probe rather than a scan: past the budget every line still asks.
+	regex_held:    map[string]struct{},
+	// What they cost, in `regex_cost`'s units: program bytes and class entries.
+	regex_bytes:   int,
+	// Patterns turned away because `regex_bytes` was already at its budget.
+	regex_refused: int,
+	// What `regex_add` parses and trial-compiles into, emptied after each call:
+	// a fresh arena a pattern cost a map and unmap, 4 µs a line.
+	regex_scratch: virtual.Arena,
 	arena:     virtual.Arena,
 	allocator: mem.Allocator,
 	count:     int,
@@ -86,6 +99,8 @@ set_make :: proc() -> ^Set {
 	s.allocator = virtual.arena_allocator(&s.arena)
 	s.rules = make(map[string]Rule_Flags, 1024, s.allocator)
 	s.cancelled = make(map[string]Rule_Flags, s.allocator)
+	s.regexes = make([dynamic]Regex_Rule, s.allocator)
+	s.regex_held = make(map[string]struct{}, s.allocator)
 	return s
 }
 
@@ -93,6 +108,7 @@ set_destroy :: proc(s: ^Set) {
 	if s == nil {
 		return
 	}
+	virtual.arena_destroy(&s.regex_scratch)
 	virtual.arena_destroy(&s.arena)
 	free(s)
 }
@@ -248,6 +264,11 @@ Decide what to do with a query name.
 `name` may be in either wire-presentation form ("ads.example.com.") or plain
 form; both normalise to the same key. Allow rules take precedence, matching how
 Pi-hole and AdGuard treat their allowlists.
+
+The regex rules come after the hash maps, which settle most names in a few
+probes. An allow regex still has to be asked about a name the block map lists,
+and about one nothing blocks, since `Allowed` exempts an answer from the CNAME
+walk; a block regex only about a name no map has decided.
 */
 engine_match :: proc(e: ^Engine, name: string) -> Decision {
 	buf: [MAX_NORMALISED]u8
@@ -263,7 +284,11 @@ engine_match :: proc(e: ^Engine, name: string) -> Decision {
 	if set_lookup(e.allow, key) {
 		return .Allowed
 	}
-	if set_lookup(e.block, key) {
+	listed := set_lookup(e.block, key)
+	if regex_lookup(e.allow, key) {
+		return .Allowed
+	}
+	if listed || regex_lookup(e.block, key) {
 		sync.atomic_add(&e.stats.blocked, 1)
 		return .Blocked
 	}

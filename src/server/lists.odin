@@ -65,7 +65,20 @@ build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool) -> (block, a
 		}
 	}
 
-	logx.infof("filter: %d block rules, %d allow rules", block.count, allow.count)
+	logx.infof(
+		"filter: %d block rules (%d regex), %d allow rules (%d regex)",
+		block.count,
+		len(block.regexes),
+		allow.count,
+		len(allow.regexes),
+	)
+	if refused := block.regex_refused + allow.regex_refused; refused > 0 {
+		logx.warnf(
+			"filter: %d regex rules skipped: a set holds %d of regex cost (compiled bytes, plus one for each character or range a class lists), and the lists loaded first used it up",
+			refused,
+			filter.MAX_REGEX_TOTAL,
+		)
+	}
 	return
 }
 
@@ -75,7 +88,7 @@ build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool) -> (block, a
 warn_rule_adds_nothing :: proc(rule: string) {
 	// A dnsmasq route has its own warning at startup.
 	if !strings.contains(rule, "badfilter") && !strings.has_prefix(strings.trim_space(rule), "server=/") {
-		logx.warnf("blocking rule %q adds nothing: it carries a modifier DNS cannot honour, is cosmetic, is a regex, wildcard or path rule, names no domain, a $badfilter cancels it, or its name is not ASCII (write an international name in punycode, xn--...)", rule)
+		logx.warnf("blocking rule %q adds nothing: it carries a modifier DNS cannot honour, is cosmetic, is a wildcard or path rule, is a regex this engine cannot run as AdGuard Home does (see docs/blocking.md) or over %d compiled bytes, or no longer fits the regex budget, names no domain, a $badfilter cancels it, or its name is not ASCII (write an international name in punycode, xn--...)", rule, filter.MAX_REGEX_PROGRAM)
 	}
 }
 

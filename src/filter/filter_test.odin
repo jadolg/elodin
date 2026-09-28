@@ -77,8 +77,10 @@ address=/dnsmasq.example/0.0.0.0
 	testing.expect_value(t, engine_match(e, "sub.exactly.example."), Decision.None)
 	testing.expect_value(t, engine_match(e, "dnsmasq.example."), Decision.Blocked)
 	testing.expect_value(t, engine_match(e, "deep.dnsmasq.example."), Decision.Blocked)
-	// Rules that need more than a domain name are ignored, not fatal.
-	testing.expect_value(t, engine_match(e, "regex-rule.example."), Decision.None)
+	// A regex rule is matched against the name, as AdGuard Home does (#405).
+	testing.expect_value(t, engine_match(e, "regex-rule.example."), Decision.Blocked)
+	// A path rule still needs more than a name, and is skipped, not fatal.
+	testing.expect_value(t, engine_match(e, "has."), Decision.None)
 }
 
 @(test)

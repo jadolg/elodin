@@ -1,0 +1,10 @@
+ads12.example.com
+/^ads[0-9]+\.example\.com$/
+@@/^keep\./
+/^(mon|tue|wed|thu|fri|sat|sun)\d{1,2}\.\w{2}\d{1,6}\w{4}\.com$/
+/^https:\/\/(a|c)\.[0-9a-f]{56}\.com$/$important
+/(https?:\/\/)213\.32\.115\..{100,}/
+/^d\.example/$badfilter
+/^d\.example/
+/[a-z]{496}z/
+//
