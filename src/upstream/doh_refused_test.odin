@@ -138,10 +138,9 @@ exchange_with_refusals :: proc(t: ^testing.T, refuse: int) -> (err: Error, heade
 	}
 	// What `get_h2_conn` builds once ALPN says h2, minus the TLS.
 	_ = net.set_option(socket, .Receive_Timeout, 100 * time.Millisecond)
-	hc := start_h2_conn(Stream{socket = socket}, u.allocator)
 	sync.mutex_lock(&u.mu)
 	u.proto = .H2
-	u.h2 = hc
+	u.h2 = start_h2_conn(u, Stream{socket = socket})
 	sync.mutex_unlock(&u.mu)
 
 	query := dns.Message {
