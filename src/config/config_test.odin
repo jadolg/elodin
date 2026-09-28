@@ -1162,30 +1162,42 @@ An upstream URL is written into the request line and the `Host` field of every
 query sent to it, so a byte there that the request line cannot hold is a request
 line of elodin's own making that is malformed - or, given a CR LF, one that
 carries fields the operator never meant to send (#438). Refused on both spellings
-of an upstream, the shorthand and the map.
+of an upstream, the shorthand and the map, and of a block or allow list.
 */
 @(test)
 test_upstream_urls_outside_visible_ascii_are_errors :: proc(t: ^testing.T) {
+	// Refused, and for the rule: a bootstrap in each source, so that the URL is
+	// the only thing wrong with it.
+	refused_for :: proc(t: ^testing.T, src, rule: string) {
+		_, err := load_string(src, context.temp_allocator)
+		e, has := err.?
+		if !testing.expectf(t, has, "%q was accepted", src) {
+			return
+		}
+		named := false
+		for m in e.messages {
+			named ||= strings.contains(m, rule)
+		}
+		testing.expectf(t, named, "%q was refused, but not for the url: %v", src, e.messages)
+	}
 	urls := []string {
 		"\"https://dns.example/dns query\"",
 		"\"https://dns.example/dns-query\\tx\"",
 		"\"https://dns.example/dns-query\\r\\nX-Injected: 1\"",
 		"\"https://dns.example/dns-qu\u00e9ry\"",
 		"\"https://dns.ex\\x7fample/dns-query\"",
+		// Unicode whitespace is not trimmed off the shorthand into a valid url.
+		"\"https://dns.example/dns-query\u00a0\"",
 	}
-	// A bootstrap, so that the URL is the only thing wrong with each of these.
 	FORMS :: []string {
 		"upstream:\n  bootstrap: [9.9.9.9]\n  servers: [%s]\n",
 		"upstream:\n  bootstrap: [9.9.9.9]\n  servers:\n    - url: %s\n",
 	}
 	for form in FORMS {
-		_, good := load_string(fmt.tprintf(form, "\"https://dns.example/dns-query?x=1\""), context.temp_allocator)
+		_, good := load_string(fmt.tprintf(form, "\"https://dns.example/dns-query\""), context.temp_allocator)
 		testing.expectf(t, good == nil, "%q: an ordinary url was refused: %v", form, good)
 		for url in urls {
-			src := fmt.tprintf(form, url)
-			_, err := load_string(src, context.temp_allocator)
-			_, has := err.?
-			testing.expectf(t, has, "%q was accepted", src)
+			refused_for(t, fmt.tprintf(form, url), UPSTREAM_URL_RULE)
 		}
 	}
 	// The map spelling can name the `Host` apart from the url.
@@ -1194,9 +1206,20 @@ test_upstream_urls_outside_visible_ascii_are_errors :: proc(t: ^testing.T) {
 			"upstream:\n  bootstrap: [9.9.9.9]\n  servers:\n    - url: https://dns.example/dns-query\n      hostname: %s\n",
 			hostname,
 		)
-		_, err := load_string(src, context.temp_allocator)
-		_, has := err.?
-		testing.expectf(t, has, "%q was accepted", src)
+		refused_for(t, src, UPSTREAM_URL_RULE)
+	}
+	// A list url goes into a request line and `Host` just the same, on both of
+	// its spellings.
+	LIST_FORMS :: []string {
+		"upstream:\n  bootstrap: [9.9.9.9]\n  servers: [1.1.1.1]\nblocking:\n  lists: [%s]\n",
+		"upstream:\n  bootstrap: [9.9.9.9]\n  servers: [1.1.1.1]\nblocking:\n  allowlists:\n    - url: %s\n",
+	}
+	for form in LIST_FORMS {
+		_, good := load_string(fmt.tprintf(form, "\"https://lists.example/hosts.txt\""), context.temp_allocator)
+		testing.expectf(t, good == nil, "%q: an ordinary list url was refused: %v", form, good)
+		for url in ([]string{"\"https://lists.example/hosts.txt\\r\\nX-Injected: 1\"", "\"https://lists.example/a b\""}) {
+			refused_for(t, fmt.tprintf(form, url), LIST_URL_RULE)
+		}
 	}
 	free_all(context.temp_allocator)
 }

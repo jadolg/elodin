@@ -338,6 +338,16 @@ http_exchange :: proc(
 	resp: Http_Response,
 	err: Error,
 ) {
+	/*
+	The path and host go into the request line and `Host` verbatim, so a byte
+	there the request line cannot hold is a request of this client's making that
+	a server reads some other way - or, given a CR LF, one carrying fields
+	nobody meant to send. Checked here, where every request line is written: a
+	list url comes from config, and a redirect's from whoever answered (#438).
+	*/
+	if !h2.target_is_valid(req.path) || !h2.target_is_valid(req.host) {
+		return {}, .HTTP_Error
+	}
 	b := strings.builder_make(context.temp_allocator)
 	strings.write_string(&b, req.method)
 	strings.write_byte(&b, ' ')

@@ -1359,7 +1359,9 @@ parse_upstream_shorthand :: proc(
 ) {
 	spec.verify = true
 	spec.bootstrap = default_bootstrap
-	s := strings.trim_space(raw)
+	// ASCII whitespace only: `trim_space` also eats Unicode spaces such as NBSP,
+	// which would pass a url the ASCII check below never saw (#438).
+	s := strings.trim(raw, " \t\r\n")
 
 	if strings.has_prefix(s, "https://") {
 		spec.kind = .HTTPS
@@ -1516,6 +1518,10 @@ load_block_lists :: proc(l: ^Loader, n: ^yaml.Node, path: string) -> []Block_Lis
 				continue
 			}
 			if strings.has_prefix(s, "http://") || strings.has_prefix(s, "https://") {
+				if !visible_ascii(s) {
+					errorf(l, "%s[%d]: %s", path, i, LIST_URL_RULE)
+					continue
+				}
 				bl.url = s
 			} else {
 				bl.file = s
@@ -1548,6 +1554,10 @@ load_block_lists :: proc(l: ^Loader, n: ^yaml.Node, path: string) -> []Block_Lis
 		}
 		if bl.url == "" && bl.file == "" {
 			errorf(l, "%s: needs either a url or a file", item_path)
+			continue
+		}
+		if !visible_ascii(bl.url) {
+			errorf(l, "%s.url: %s", item_path, LIST_URL_RULE)
 			continue
 		}
 		if bl.name == "" {
@@ -2941,6 +2951,10 @@ http_path_is_valid :: proc(path: string) -> bool {
 
 @(private)
 UPSTREAM_URL_RULE :: "the url and hostname of an https upstream must be visible ASCII"
+
+// A list url goes into a request line and `Host` the same way.
+@(private)
+LIST_URL_RULE :: "a list url must be visible ASCII"
 
 /*
 Printable ASCII and no space: what a request line and a field value written from

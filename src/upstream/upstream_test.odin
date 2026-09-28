@@ -3529,6 +3529,48 @@ test_an_idle_bound_holds_without_a_deadline :: proc(t: ^testing.T) {
 }
 
 /*
+A path or host the request line cannot hold is refused before anything is sent
+(#438): a list url comes from config and a redirect's `Location` from whoever
+answered, and either would otherwise be written into the request line and `Host`
+verbatim. The mock answers 200 to anything, so a request that went out succeeds.
+*/
+@(test)
+test_a_request_line_holds_only_visible_ascii :: proc(t: ^testing.T) {
+	Case :: struct {
+		path, host: string,
+	}
+	cases := []Case {
+		{"/a b", "mock.invalid"},
+		{"/a\tb", "mock.invalid"},
+		{"/hosts.txt\r\nX-Injected: 1", "mock.invalid"},
+		{"/hösts.txt", "mock.invalid"},
+		{"/", "mock.invalid\r\nX-Injected: 1"},
+		{"/", "mock invalid"},
+	}
+	for c in cases {
+		m, server, port, ok := start_trickle(t, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", "", count = 0)
+		if !ok {
+			return
+		}
+		socket, derr := dial_tcp_timeout(net.Endpoint{address = net.IP4_Loopback, port = port}, time.Second)
+		if !testing.expectf(t, derr == .None, "cannot dial the mock: %v", derr) {
+			stop_trickle(m, server)
+			return
+		}
+		stream := Stream {
+			socket = socket,
+		}
+		set_socket_timeouts(socket, 3 * time.Second)
+		_, err := http_exchange(&stream, Http_Request{method = "GET", path = c.path, host = c.host}, context.temp_allocator)
+		testing.expectf(t, err == .HTTP_Error, "path %q host %q was sent: %v", c.path, c.host, err)
+		// Closed first, so the mock's read of a request that never came ends.
+		stream_close(&stream)
+		stop_trickle(m, server)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
 A zero timeout is no timeout, as it always was: the floor that keeps a sliver
 of a deadline from rounding to zero must not turn a configured `timeout: 0`
 into a millisecond, which would time every UDP query out.
