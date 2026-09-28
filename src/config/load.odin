@@ -1303,6 +1303,12 @@ load_upstream_spec :: proc(
 			errorf(l, "%s: missing address", path)
 			return {}, false
 		}
+		// As the shorthand's `#name` is: an NBSP on the end is a certificate name
+		// no server has.
+		if !h2.target_is_valid(spec.hostname) {
+			errorf(l, "%s.hostname: must be visible ASCII", path)
+			return {}, false
+		}
 		if spec.port == 0 {
 			spec.port = 853 if spec.kind == .TLS else 53
 		}

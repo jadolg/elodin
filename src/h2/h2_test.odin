@@ -2714,6 +2714,10 @@ test_malformed_requests_are_reset :: proc(t: ^testing.T) {
 				{":path", "/dns-query"},
 			},
 		},
+		{
+			"host in place of :authority, with a tab",
+			{{":method", "GET"}, {":scheme", "https"}, {":path", "/dns-query"}, {"host", "dns.example\tx"}},
+		},
 		// RFC 9112 3.2: the target an h2-to-h1 hop would write into a request line.
 		{
 			":path with a space",

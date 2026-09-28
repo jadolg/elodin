@@ -893,6 +893,12 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 			// 8.2.2: connection-specific fields have no meaning in HTTP/2, where
 			// the connection is shared by every stream on it.
 			return true
+		case "host":
+			// 8.3.1 lets a request carry `Host` in place of `:authority`, and an
+			// h2-to-h1 hop writes it out as the one it gets: the same rule (#438).
+			if !target_is_valid(f.value) {
+				return true
+			}
 		case "te":
 			// The one exception 8.2.2 makes, and only for this value.
 			if f.value != "trailers" {
