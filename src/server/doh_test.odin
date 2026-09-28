@@ -968,6 +968,20 @@ test_request_line_is_three_tokens_with_a_known_version :: proc(t: ^testing.T) {
 		{"GET /dns-query ", HOST, 400, false, "no version at all"},
 		{"GET  HTTP/1.1", HOST, 400, false, "an empty target"},
 		{" /dns-query HTTP/1.1", HOST, 400, false, "an empty method"},
+		// RFC 9112 3 lets a recipient split on HTAB, VT, FF or a bare CR as well
+		// as SP, so a method that is not a token is a request line a lenient hop
+		// reads as another one: `POST\t/allowed` routed there by `/allowed` (#438).
+		{"POST\t/allowed /dns-query HTTP/1.1", HOST, 400, false, "a tab inside the method"},
+		{"GET\x0b /dns-query HTTP/1.1", HOST, 400, false, "a VT on the end of the method"},
+		{"GET\x0c /dns-query HTTP/1.1", HOST, 400, false, "an FF on the end of the method"},
+		{"GE(T /dns-query HTTP/1.1", HOST, 400, false, "a method with a delimiter in it"},
+		{"G\u00c9T /dns-query HTTP/1.1", HOST, 400, false, "a method outside ASCII"},
+		// And the target is the other half of the same split.
+		{"GET /allowed\t/dns-query HTTP/1.1", HOST, 400, false, "a tab inside the target"},
+		{"GET /dns-query\x0bHTTP/1.1 HTTP/1.1", HOST, 400, false, "a VT inside the target"},
+		{"GET /dns-query\x7f HTTP/1.1", HOST, 400, false, "a DEL inside the target"},
+		{"GET /dns-query?dns=\u00c9 HTTP/1.1", HOST, 400, false, "a target outside ASCII"},
+		{"M-SEARCH /dns-query HTTP/1.1", HOST, 0, true, "a method that is an unusual token"},
 		{"GET /dns-query", HOST, 400, false, "two tokens"},
 		{"GET /dns-query HTTP/1.1", "", 400, false, "1.1 with no Host"},
 		{"GET /dns-query HTTP/1.1", HOST + HOST, 400, false, "identical repeats of Host"},

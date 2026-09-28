@@ -934,8 +934,14 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 	nothing at all. `:scheme` is worth more than tidiness here - it is what
 	selects the `:path` checks below, so an empty one carried any `:path` at all
 	straight past them.
+
+	And a token, not merely something (RFC 9110 9.1): `GE(T`, `GET\x0b` and
+	`POST\t/allowed` were requests, and the last is a request line that an
+	h2-to-h1 hop writes out for a lenient reader to split on the tab (#438).
+	The HTTP/1.1 side refuses the same methods. `:path` is held to what a
+	request target may hold for the same reason.
 	*/
-	if len(method) == 0 || len(scheme) == 0 {
+	if !is_token(method) || len(scheme) == 0 || !target_is_valid(path) {
 		return true
 	}
 	/*
@@ -992,6 +998,22 @@ is_token :: proc(s: string) -> bool {
 	}
 	// 1*tchar: nothing at all is not a token.
 	return len(s) > 0
+}
+
+/*
+RFC 9112 3.2 and RFC 3986 2: a request target is visible ASCII and nothing
+else. No SP, HTAB, VT or FF, which a lenient hop is entitled to split a request
+line on (RFC 9112 3), no other control, and no byte outside ASCII, which a URI
+cannot hold unencoded. Emptiness is left to the caller, which knows what an
+empty target means on its version.
+*/
+target_is_valid :: proc(s: string) -> bool {
+	for i in 0 ..< len(s) {
+		if s[i] <= ' ' || s[i] >= 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 /*

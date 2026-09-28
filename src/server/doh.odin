@@ -400,6 +400,18 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 	if vstatus := http_version_status(version); vstatus != 0 {
 		return {}, vstatus, false
 	}
+	/*
+	The method is a token (RFC 9110 9.1) and the target visible ASCII (RFC 9112
+	3.2). SP is the only separator this reader splits on, but RFC 9112 3 lets a
+	recipient split on HTAB, VT, FF or a bare CR as well, so a byte of those in
+	either half is a request line two hops read differently:
+	`POST\t/allowed /dns-query HTTP/1.1` was a POST to `/dns-query` here and a
+	request for `/allowed` to a front end that split on the tab (#438). Bare CR
+	never gets this far - see `http_line`.
+	*/
+	if !h2.is_token(line[:first]) || !h2.target_is_valid(target) {
+		return {}, 400, false
+	}
 	req.method = hold(line[:first])
 	http_1_0 := version == "HTTP/1.0"
 	req.keep_alive = !http_1_0

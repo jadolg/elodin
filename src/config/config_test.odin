@@ -1115,6 +1115,93 @@ test_metrics_settings_are_honoured :: proc(t: ^testing.T) {
 }
 
 /*
+A DoH path is matched against the request target, so a path that no target can
+spell is an endpoint that comes up and is never reached: the reader splits the
+target at `?`, a fragment is never sent, and a space, a control or a byte
+outside ASCII is a request line the reader refuses (#438).
+*/
+@(test)
+test_unreachable_doh_paths_are_errors :: proc(t: ^testing.T) {
+	Case :: struct {
+		key, value: string,
+	}
+	cases := []Case {
+		{"path", "\"/dns query\""},
+		{"path", "\"/dns\\tquery\""},
+		{"path", "\"/dns-query?x\""},
+		{"path", "\"/dns-query#x\""},
+		{"path", "\"/dns-qu\u00e9ry\""},
+		{"path", "\"/dns-query\\x7f\""},
+		{"mobileconfig_path", "\"/apple doh.mobileconfig\""},
+		{"mobileconfig_path", "\"/apple-doh.mobileconfig?x\""},
+	}
+	for c in cases {
+		src := strings.concatenate(
+			{"upstream:\n  servers: [1.1.1.1]\nlisteners:\n  doh:\n    enabled: true\n    ", c.key, ": ", c.value, "\n"},
+			context.temp_allocator,
+		)
+		_, err := load_string(src, context.temp_allocator)
+		e, has := err.?
+		testing.expectf(t, has, "%s: %s was accepted", c.key, c.value)
+		if has {
+			named := false
+			want := strings.concatenate({"listeners.doh.", c.key, ":"}, context.temp_allocator)
+			for m in e.messages {
+				if strings.has_prefix(m, want) {
+					named = true
+				}
+			}
+			testing.expectf(t, named, "%s: %s was refused, but not for the path", c.key, c.value)
+		}
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+An upstream URL is written into the request line and the `Host` field of every
+query sent to it, so a byte there that the request line cannot hold is a request
+line of elodin's own making that is malformed - or, given a CR LF, one that
+carries fields the operator never meant to send (#438). Refused on both spellings
+of an upstream, the shorthand and the map.
+*/
+@(test)
+test_upstream_urls_outside_visible_ascii_are_errors :: proc(t: ^testing.T) {
+	urls := []string {
+		"\"https://dns.example/dns query\"",
+		"\"https://dns.example/dns-query\\tx\"",
+		"\"https://dns.example/dns-query\\r\\nX-Injected: 1\"",
+		"\"https://dns.example/dns-qu\u00e9ry\"",
+		"\"https://dns.ex\\x7fample/dns-query\"",
+	}
+	// A bootstrap, so that the URL is the only thing wrong with each of these.
+	FORMS :: []string {
+		"upstream:\n  bootstrap: [9.9.9.9]\n  servers: [%s]\n",
+		"upstream:\n  bootstrap: [9.9.9.9]\n  servers:\n    - url: %s\n",
+	}
+	for form in FORMS {
+		_, good := load_string(fmt.tprintf(form, "\"https://dns.example/dns-query?x=1\""), context.temp_allocator)
+		testing.expectf(t, good == nil, "%q: an ordinary url was refused: %v", form, good)
+		for url in urls {
+			src := fmt.tprintf(form, url)
+			_, err := load_string(src, context.temp_allocator)
+			_, has := err.?
+			testing.expectf(t, has, "%q was accepted", src)
+		}
+	}
+	// The map spelling can name the `Host` apart from the url.
+	for hostname in ([]string{"\"dns.example\\r\\nX-Injected: 1\"", "\"dns example\""}) {
+		src := fmt.tprintf(
+			"upstream:\n  bootstrap: [9.9.9.9]\n  servers:\n    - url: https://dns.example/dns-query\n      hostname: %s\n",
+			hostname,
+		)
+		_, err := load_string(src, context.temp_allocator)
+		_, has := err.?
+		testing.expectf(t, has, "%q was accepted", src)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
 Caught by `--check` rather than at startup.
 
 Each of these comes up as a listener that binds and is never scraped: a path a
@@ -1124,7 +1211,18 @@ takes longest to attribute.
 */
 @(test)
 test_unusable_metrics_settings_are_errors :: proc(t: ^testing.T) {
-	cases := []string{"  path: metrics\n", "  port: 0\n", "  port: 70000\n", "  address: \"localhost\"\n"}
+	cases := []string {
+		"  path: metrics\n",
+		"  port: 0\n",
+		"  port: 70000\n",
+		"  address: \"localhost\"\n",
+		// A path no request target can spell: see `http_path_is_valid`.
+		"  path: \"/st ats\"\n",
+		"  path: \"/st\\tats\"\n",
+		"  path: \"/stats?x\"\n",
+		"  path: \"/stats#x\"\n",
+		"  path: \"/st\u00e4ts\"\n",
+	}
 	for tail in cases {
 		src := strings.concatenate(
 			{"upstream:\n  servers: [1.1.1.1]\nmetrics:\n  enabled: true\n", tail},

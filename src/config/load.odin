@@ -1273,6 +1273,10 @@ load_upstream_spec :: proc(
 			errorf(l, "%s: an https upstream needs a url", path)
 			return {}, false
 		}
+		if !visible_ascii(spec.url) || !visible_ascii(spec.hostname) {
+			errorf(l, "%s: %s", path, UPSTREAM_URL_RULE)
+			return {}, false
+		}
 		scheme, host, url_path, _, _ := net.split_url(spec.url, l.allocator)
 		if scheme != "https" {
 			errorf(l, "%s.url: expected an https:// url", path)
@@ -1360,6 +1364,10 @@ parse_upstream_shorthand :: proc(
 	if strings.has_prefix(s, "https://") {
 		spec.kind = .HTTPS
 		spec.url = s
+		if !visible_ascii(s) {
+			errorf(l, "%s: %s", path, UPSTREAM_URL_RULE)
+			return {}, false
+		}
 		scheme, host, url_path, _, _ := net.split_url(s, l.allocator)
 		_ = scheme
 		host_only, url_port, split_ok := net.split_port(host)
@@ -2452,6 +2460,8 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 
 	if cfg.listeners.doh.enabled && !strings.has_prefix(cfg.listeners.doh.path, "/") {
 		errorf(l, "listeners.doh.path: must start with '/'")
+	} else if cfg.listeners.doh.enabled && !http_path_is_valid(cfg.listeners.doh.path) {
+		errorf(l, "listeners.doh.path: %s", HTTP_PATH_RULE)
 	}
 	// The profile endpoint shares the DoH listener, so it has to be a path of its
 	// own: absolute, and not the one that answers queries — a request cannot be
@@ -2459,6 +2469,8 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	if cfg.listeners.doh.enabled && cfg.listeners.doh.mobileconfig_path != "" {
 		if !strings.has_prefix(cfg.listeners.doh.mobileconfig_path, "/") {
 			errorf(l, "listeners.doh.mobileconfig_path: must start with '/'")
+		} else if !http_path_is_valid(cfg.listeners.doh.mobileconfig_path) {
+			errorf(l, "listeners.doh.mobileconfig_path: %s", HTTP_PATH_RULE)
 		}
 		if cfg.listeners.doh.mobileconfig_path == cfg.listeners.doh.path {
 			errorf(l, "listeners.doh.mobileconfig_path: must not be the same as listeners.doh.path")
@@ -2468,6 +2480,8 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	if cfg.metrics.enabled {
 		if !strings.has_prefix(cfg.metrics.path, "/") {
 			errorf(l, "metrics.path: must start with '/'")
+		} else if !http_path_is_valid(cfg.metrics.path) {
+			errorf(l, "metrics.path: %s", HTTP_PATH_RULE)
 		}
 		// Port 0 binds and works, on whichever port the kernel picked - which
 		// nothing can be told to scrape. Refused here rather than left as an
@@ -2908,4 +2922,39 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 			)
 		}
 	}
+}
+
+@(private)
+HTTP_PATH_RULE :: "must be visible ASCII with no '?' or '#'"
+
+/*
+Whether a request can reach `path` at all. It is compared with the target's path
+exactly, and the HTTP readers split the target at `?`, a client never sends a
+fragment, and a request whose target holds a space, a control or a byte outside
+ASCII is refused before it is routed (RFC 9112 3.2, #438). A path outside that
+is an endpoint that comes up and answers nothing.
+*/
+@(private)
+http_path_is_valid :: proc(path: string) -> bool {
+	return visible_ascii(path) && strings.index_any(path, "?#") < 0
+}
+
+@(private)
+UPSTREAM_URL_RULE :: "the url and hostname of an https upstream must be visible ASCII"
+
+/*
+Printable ASCII and no space: what a request line and a field value written from
+config can carry without becoming a different request. An https upstream's url
+and hostname go into the request line and `Host` of every query sent to it, so a
+CR LF there is a field of the config's making in each one, and a space or a byte
+outside ASCII a request line the upstream reads some other way (#438).
+*/
+@(private)
+visible_ascii :: proc(s: string) -> bool {
+	for i in 0 ..< len(s) {
+		if s[i] <= ' ' || s[i] >= 0x7f {
+			return false
+		}
+	}
+	return true
 }

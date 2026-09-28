@@ -2703,6 +2703,89 @@ test_malformed_requests_are_reset :: proc(t: ^testing.T) {
 			},
 		},
 		{"CONNECT without :authority", {{":method", "CONNECT"}}},
+		// RFC 9112 3.2: the target an h2-to-h1 hop would write into a request line.
+		{
+			":path with a space",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/allowed /dns-query"},
+			},
+		},
+		{
+			":path with a tab",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/allowed\t/dns-query"},
+			},
+		},
+		{
+			":path with a DEL",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query\x7f"},
+			},
+		},
+		{
+			":path outside ASCII",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query?dns=\u00c9"},
+			},
+		},
+		// RFC 9113 8.3.1 / RFC 9110 9.1: a method is a token (#438).
+		{
+			":method with a delimiter",
+			{
+				{":method", "GE(T"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+			},
+		},
+		{
+			":method with a VT",
+			{
+				{":method", "GET\x0b"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+			},
+		},
+		{
+			":method with a tab",
+			{
+				{":method", "POST\t/allowed"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+			},
+		},
+		{
+			":method with a space",
+			{
+				{":method", "GET /x"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+			},
+		},
+		{
+			":method outside ASCII",
+			{
+				{":method", "G\u00c9T"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+			},
+		},
 	}
 
 	for c in cases {
