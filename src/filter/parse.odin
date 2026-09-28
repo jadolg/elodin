@@ -281,9 +281,11 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 	*/
 	/*
 	A regex rule may hold `$` itself, as an anchor. urlfilter takes a rule that
-	opens and closes with `/` as a whole pattern with no options, and otherwise
-	splits the options off at the *last* `$` not escaped with `\`
-	(`findOptionsDelimiter`); every other rule splits at the first.
+	opens and closes with `/` as a whole pattern with no options, unless it holds
+	`replace=` (`isRegexRuleWithoutOptions`), and otherwise splits the options
+	off at the *last* `$` not escaped with `\` (`findOptionsDelimiter`); every
+	other rule splits at the first. So `/ads?|x/$replace=/a/b/` is a `$replace`
+	rule, skipped, not the regex `ads?|x/$replace=/a/b`, which matches `ad`.
 	*/
 	options_at := strings.index_byte(line, '$')
 	// `$$` and `$@$` open an HTML filtering rule, not a modifier list. urlfilter
@@ -293,7 +295,8 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 	}
 	is_regex := strings.has_prefix(line, "/")
 	if is_regex {
-		options_at = -1 if strings.has_suffix(line, "/") && len(line) > 1 else last_options_delimiter(line)
+		whole := strings.has_suffix(line, "/") && len(line) > 1 && !strings.contains(line, "replace=")
+		options_at = -1 if whole else last_options_delimiter(line)
 	}
 	badfilter := false
 	if idx := options_at; idx >= 0 {

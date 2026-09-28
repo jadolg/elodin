@@ -64,6 +64,7 @@ test_regex_rule_dollar_and_modifiers :: proc(t: ^testing.T) {
 /^e\.example/
 /^(f|g)\.example$/
 /^i\.example/$
+/^j\.ex?ample|x/$replace=/a/b/
 `
 	e := engine_of(src)
 	defer engine_destroy(e)
@@ -80,6 +81,10 @@ test_regex_rule_dollar_and_modifiers :: proc(t: ^testing.T) {
 	// urlfilter's `findOptionsDelimiter` starts at the last byte, so a
 	// trailing `$` opens an empty options list and `/re/$` is the regex.
 	testing.expect_value(t, engine_match(e, "i.example."), Decision.Blocked)
+	// A rule holding `replace=` is split at its last `$` even when it ends in
+	// `/` (urlfilter's `isRegexRuleWithoutOptions`), so it is a `$replace`
+	// rule and skipped, not a regex taking in everything up to the end.
+	testing.expect_value(t, engine_match(e, "j.eample."), Decision.None)
 }
 
 @(test)
