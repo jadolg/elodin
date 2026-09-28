@@ -2,6 +2,7 @@ package h2
 
 import "core:encoding/hex"
 import "core:mem"
+import "core:strings"
 import "core:sync"
 import "core:testing"
 import "core:thread"
@@ -2355,6 +2356,8 @@ Request_Log :: struct {
 	rst_code:   Error_Code,
 	goaway:     bool,
 	dispatched: int,
+	// The last dispatched request's, cloned onto the temporary allocator.
+	authority:  string,
 }
 
 @(private = "file")
@@ -2389,6 +2392,7 @@ counting_handler :: proc(conn: ^Conn, req: ^Request) {
 	log := cast(^Request_Log)conn.user
 	if log != nil {
 		log.dispatched += 1
+		log.authority = strings.clone(req.authority, context.temp_allocator)
 	}
 	request_destroy(conn, req)
 }
@@ -2968,6 +2972,11 @@ test_conformant_requests_are_served :: proc(t: ^testing.T) {
 		testing.expectf(t, log.rsts == 0, "%s: a conformant request drew an RST_STREAM", c.what)
 		testing.expectf(t, !log.goaway, "%s: a conformant request drew a GOAWAY", c.what)
 		testing.expectf(t, log.dispatched == 1, "%s: %d requests reached the handler, want 1", c.what, log.dispatched)
+		// The two `host` cases: the handler sees an authority either way, and
+		// the `:authority` one when both are sent.
+		if strings.has_prefix(c.what, "host ") {
+			testing.expectf(t, log.authority == "dns.example", "%s: authority %q, want dns.example", c.what, log.authority)
+		}
 
 		close_stream(conn, 1)
 		conn_unref(conn)

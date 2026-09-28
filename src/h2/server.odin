@@ -1178,7 +1178,10 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 			take(&req.method, f.value, c.allocator)
 		case ":path":
 			take(&req.path, f.value, c.allocator)
-		case ":authority":
+		case ":authority", "host":
+			// 8.3.1: `host` stands in for an absent `:authority`. Both present
+			// means they agree (`request_is_malformed`), and the pseudo-header,
+			// coming first, is the one kept.
 			take(&req.authority, f.value, c.allocator)
 		case ":scheme":
 			take(&req.scheme, f.value, c.allocator)
