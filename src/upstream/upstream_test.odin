@@ -3583,6 +3583,9 @@ back refused rather than as the `.HTTP_Error` of the check.
 test_fetch_url_refuses_a_bad_url_before_dialling :: proc(t: ^testing.T) {
 	_, err := fetch_url("http://127.0.0.1:1/a b", nil, time.Second, time.Second, context.temp_allocator)
 	testing.expectf(t, err == .HTTP_Error, "a url with a space was dialled: %v", err)
+	// And a host that is not one: userinfo is a lookup of `a@127.0.0.1` otherwise.
+	_, err = fetch_url("http://a@127.0.0.1:1/", nil, time.Second, time.Second, context.temp_allocator)
+	testing.expectf(t, err == .HTTP_Error, "a url with userinfo was looked up: %v", err)
 	free_all(context.temp_allocator)
 }
 

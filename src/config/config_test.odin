@@ -1188,6 +1188,8 @@ test_upstream_urls_outside_visible_ascii_are_errors :: proc(t: ^testing.T) {
 		"\"https://dns.ex\\x7fample/dns-query\"",
 		// Unicode whitespace is not trimmed off the shorthand into a valid url.
 		"\"https://dns.example/dns-query\u00a0\"",
+	// The url's host is the `Host` and `:authority`: no userinfo in it.
+		"\"https://a.example@dns.example/dns-query\"",
 	}
 	FORMS :: []string {
 		"upstream:\n  bootstrap: [9.9.9.9]\n  servers: [%s]\n",
@@ -1214,7 +1216,7 @@ test_upstream_urls_outside_visible_ascii_are_errors :: proc(t: ^testing.T) {
 	SHORTHAND :: "upstream:\n  bootstrap: [9.9.9.9]\n  servers: [%s]\n"
 	_, good_dot := load_string(fmt.tprintf(SHORTHAND, "\"tls://1.1.1.1:853#dns.example\""), context.temp_allocator)
 	testing.expectf(t, good_dot == nil, "an ordinary DoT shorthand was refused: %v", good_dot)
-	for s in ([]string{"\"tls://1.1.1.1:853#dns.example\u00a0\"", "\"1.1.1.1\u00a0\""}) {
+	for s in ([]string{"\"tls://1.1.1.1:853#dns.example\u00a0\"", "\"1.1.1.1\u00a0\"", "\"tls://1.1.1.1:853#a.example@b.example\"", "\"tls://a@dns.example:853\""}) {
 		refused_for(t, fmt.tprintf(SHORTHAND, s), "cannot parse")
 	}
 	// And the map spelling of one: the same name, spelled `hostname:`.
@@ -1251,7 +1253,7 @@ test_upstream_urls_outside_visible_ascii_are_errors :: proc(t: ^testing.T) {
 	for form in LIST_FORMS {
 		_, good := load_string(fmt.tprintf(form, "\"https://lists.example/hosts.txt\""), context.temp_allocator)
 		testing.expectf(t, good == nil, "%q: an ordinary list url was refused: %v", form, good)
-		for url in ([]string{"\"https://lists.example/hosts.txt\\r\\nX-Injected: 1\"", "\"https://lists.example/a b\""}) {
+		for url in ([]string{"\"https://lists.example/hosts.txt\\r\\nX-Injected: 1\"", "\"https://lists.example/a b\"", "\"https://a.example@lists.example/hosts.txt\""}) {
 			refused_for(t, fmt.tprintf(form, url), LIST_URL_RULE)
 		}
 	}

@@ -298,7 +298,7 @@ fetch_url :: proc(
 		scheme, host, path, port, host_only, purl_ok := split_http_url(current)
 		// Before the lookup and the dial, not only where `http_exchange` writes
 		// the request line: a redirect's host is also a DNS query and an SNI.
-		if !purl_ok || !h2.target_is_valid(current) {
+		if !purl_ok || !h2.target_is_valid(current) || !h2.authority_is_valid(host) {
 			return nil, .HTTP_Error
 		}
 

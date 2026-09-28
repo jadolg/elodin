@@ -1272,7 +1272,7 @@ load_upstream_spec :: proc(
 	// The address is a lookup when it is a name, on every kind, and the
 	// certificate name too when a DoT upstream gives no hostname.
 	if !h2.authority_is_valid(spec.address) {
-		errorf(l, "%s.address: must be visible ASCII", path)
+		errorf(l, "%s.address: %s", path, HOST_RULE)
 		return {}, false
 	}
 	if spec.kind == .HTTPS {
@@ -1280,7 +1280,7 @@ load_upstream_spec :: proc(
 			errorf(l, "%s: an https upstream needs a url", path)
 			return {}, false
 		}
-		if !h2.target_is_valid(spec.url) || !h2.authority_is_valid(spec.hostname) {
+		if !url_is_valid(spec.url) || !h2.authority_is_valid(spec.hostname) {
 			errorf(l, "%s: %s", path, UPSTREAM_URL_RULE)
 			return {}, false
 		}
@@ -1312,7 +1312,7 @@ load_upstream_spec :: proc(
 		// As the shorthand's `#name` is: an NBSP on the end is a certificate name
 		// no server has.
 		if !h2.authority_is_valid(spec.hostname) {
-			errorf(l, "%s.hostname: must be visible ASCII", path)
+			errorf(l, "%s.hostname: %s", path, HOST_RULE)
 			return {}, false
 		}
 		if spec.port == 0 {
@@ -1380,7 +1380,7 @@ parse_upstream_shorthand :: proc(
 	if strings.has_prefix(s, "https://") {
 		spec.kind = .HTTPS
 		spec.url = s
-		if !h2.target_is_valid(s) {
+		if !url_is_valid(s) {
 			errorf(l, "%s: %s", path, UPSTREAM_URL_RULE)
 			return {}, false
 		}
@@ -1425,7 +1425,8 @@ parse_upstream_shorthand :: proc(
 	}
 
 	host, port, split_ok := net.split_port(s)
-	if !split_ok {
+	// A host each, as the map spelling's `address:` and `hostname:` are.
+	if !split_ok || !h2.authority_is_valid(s) || !h2.authority_is_valid(spec.hostname) {
 		errorf(l, "%s: cannot parse %q", path, raw)
 		return {}, false
 	}
@@ -1538,7 +1539,7 @@ load_block_lists :: proc(l: ^Loader, n: ^yaml.Node, path: string) -> []Block_Lis
 				continue
 			}
 			if strings.has_prefix(s, "http://") || strings.has_prefix(s, "https://") {
-				if !h2.target_is_valid(s) {
+				if !url_is_valid(s) {
 					errorf(l, "%s[%d]: %s", path, i, LIST_URL_RULE)
 					continue
 				}
@@ -1576,7 +1577,7 @@ load_block_lists :: proc(l: ^Loader, n: ^yaml.Node, path: string) -> []Block_Lis
 			errorf(l, "%s: needs either a url or a file", item_path)
 			continue
 		}
-		if !h2.target_is_valid(bl.url) {
+		if !url_is_valid(bl.url) {
 			errorf(l, "%s.url: %s", item_path, LIST_URL_RULE)
 			continue
 		}
@@ -2977,8 +2978,19 @@ config's making in each one, and a space or a byte outside ASCII a request line
 the upstream reads some other way (#438).
 */
 @(private)
-UPSTREAM_URL_RULE :: "the url and hostname of an https upstream must be visible ASCII"
+UPSTREAM_URL_RULE :: "the url and hostname of an https upstream must be visible ASCII, the host with no userinfo, path, query or fragment"
+
+// `h2.authority_is_valid`, which an upstream's address and hostname are held to.
+@(private)
+HOST_RULE :: "must be visible ASCII with no userinfo, path, query or fragment"
+
+// A url is a target, and its host is the `Host` and `:authority` it is sent with.
+@(private)
+url_is_valid :: proc(url: string) -> bool {
+	_, host, _, _, _ := net.split_url(url, context.temp_allocator)
+	return h2.target_is_valid(url) && h2.authority_is_valid(host)
+}
 
 // A list url goes into a request line and `Host` the same way.
 @(private)
-LIST_URL_RULE :: "a list url must be visible ASCII"
+LIST_URL_RULE :: "a list url must be visible ASCII, its host with no userinfo"
