@@ -1,6 +1,5 @@
 package upstream
 
-import "core:mem"
 import "core:net"
 import "core:sync"
 import "core:thread"
@@ -146,15 +145,16 @@ get_h2_conn :: proc(
 		sync.cond_wait_with_timeout(&u.conn_cond, &u.mu, remaining)
 	}
 	u.connecting = true
-	// A dead connection, if any, is torn down below, outside the lock: it may
-	// block for up to H2_POLL_INTERVAL and nothing else here needs to wait for
-	// that.
 	stale := u.h2
 	u.h2 = nil
 	sync.mutex_unlock(&u.mu)
 
+	// Handed to its reader rather than joined here (#454): the reader only
+	// notices `stopping` when its poll ticks, and waiting for that would put up
+	// to H2_POLL_INTERVAL on this caller, outside the deadline its exchange is
+	// held to.
 	if stale != nil {
-		close_h2_conn(stale, u.allocator)
+		retire_h2_conn(stale)
 	}
 
 	// What is left of this caller's deadline rather than the whole timeout, so
@@ -205,7 +205,7 @@ get_h2_conn :: proc(
 		tlsx.set_timeouts(stream.tls, H2_POLL_INTERVAL, timeout)
 	}
 
-	hc := start_h2_conn(stream, u.allocator)
+	hc := start_h2_conn(u, stream)
 	u.h2 = hc
 
 	h2.client_ref(hc.client)
@@ -215,38 +215,85 @@ get_h2_conn :: proc(
 	return conn, true, .None
 }
 
-// Wrap a negotiated stream in an h2 client and start its reader thread.
+/*
+Wrap a negotiated stream in an h2 client and start its reader thread. Under
+`u.mu`.
+
+The connection has two owners, `u.h2` and the reader, and whichever lets go
+last frees it (`release_h2_conn`). The reader's handle is kept on `u` instead,
+since a reader that frees the connection cannot join itself; finished ones are
+reaped here, as each new connection starts, and `teardown_h2` joins the rest.
+*/
 @(private)
-start_h2_conn :: proc(stream: Stream, allocator: mem.Allocator) -> ^H2_Conn {
-	hc := new(H2_Conn, allocator)
+start_h2_conn :: proc(u: ^Upstream, stream: Stream) -> ^H2_Conn {
+	for i := len(u.h2_readers) - 1; i >= 0; i -= 1 {
+		if thread.is_done(u.h2_readers[i]) {
+			thread.destroy(u.h2_readers[i])
+			unordered_remove(&u.h2_readers, i)
+		}
+	}
+	hc := new(H2_Conn, u.allocator)
 	hc.stream = stream
-	hc.client = h2.client_make(h2.IO{user = hc, read = h2_io_read, write = h2_io_write}, allocator)
-	hc.thread = thread.create_and_start_with_poly_data(hc.client, h2.client_serve)
+	hc.allocator = u.allocator
+	hc.refs = 2
+	hc.client = h2.client_make(h2.IO{user = hc, read = h2_io_read, write = h2_io_write}, u.allocator)
+	append(&u.h2_readers, thread.create_and_start_with_poly_data(hc, h2_reader))
 	return hc
 }
 
 @(private)
-close_h2_conn :: proc(hc: ^H2_Conn, allocator: mem.Allocator) {
-	// The reader thread notices this within H2_POLL_INTERVAL and returns on
-	// its own; closing the socket first would race a thread that might still
-	// be reading from it, since on Linux close does not reliably interrupt a
-	// read already blocked elsewhere.
-	sync.atomic_store(&hc.stopping, true)
-	thread.join(hc.thread)
-	thread.destroy(hc.thread)
-	stream_close(&hc.stream)
-	h2.client_unref(hc.client)
-	free(hc, allocator)
+h2_reader :: proc(hc: ^H2_Conn) {
+	h2.client_serve(hc.client)
+	release_h2_conn(hc)
 }
 
+/*
+Let go of `u.h2`'s share of a connection, without waiting for its reader.
+
+The reader notices `stopping` within H2_POLL_INTERVAL and frees the connection
+on its way out, or this does, if it has already gone. Closing the socket to
+hurry it would race a thread that might still be reading from it, since on
+Linux close does not reliably interrupt a read already blocked elsewhere.
+*/
+@(private)
+retire_h2_conn :: proc(hc: ^H2_Conn) {
+	sync.atomic_store(&hc.stopping, true)
+	release_h2_conn(hc)
+}
+
+/*
+Free the connection once both owners are done with it.
+
+Safe against a caller still holding a reference to `hc.client` mid-request:
+the reader is always one of the two, and `client_serve` marks the client closed
+before it returns, so every write after this finds it closed without touching
+`hc`.
+*/
+@(private)
+release_h2_conn :: proc(hc: ^H2_Conn) {
+	if sync.atomic_sub(&hc.refs, 1) != 1 {
+		return
+	}
+	stream_close(&hc.stream)
+	h2.client_unref(hc.client)
+	free(hc, hc.allocator)
+}
+
+// Shutdown's, which unlike a replacement has nobody's deadline on it and waits
+// out every reader: they free into `u.allocator`, and TLS ones use `u.tls_ctx`.
 @(private)
 teardown_h2 :: proc(u: ^Upstream) {
 	sync.mutex_lock(&u.mu)
 	hc := u.h2
 	u.h2 = nil
+	readers := u.h2_readers
+	u.h2_readers = nil
 	sync.mutex_unlock(&u.mu)
-	if hc == nil {
-		return
+	if hc != nil {
+		retire_h2_conn(hc)
 	}
-	close_h2_conn(hc, u.allocator)
+	for t in readers {
+		thread.destroy(t)
+	}
+	delete(readers)
 }
