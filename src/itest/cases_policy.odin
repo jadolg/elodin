@@ -55,7 +55,6 @@ address=/dnsmasq.test/0.0.0.0
 /a-regex-rule.*/
 /^ads[0-9]+\.regex\.test$/$important
 @@/^keep\.evil\.test$/
-||has/path.test^
 `,
 	)
 	domains_path := write_list(

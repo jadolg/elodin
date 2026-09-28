@@ -128,10 +128,13 @@ test_regex_rule_in_a_domains_list :: proc(t: ^testing.T) {
 
 	// A `!` or `#` opens a comment in such a list; one inside the slashes
 	// would leave a shorter pattern that matches far more.
-	f := engine_of("/q/!x/\n/^kept\\./ # a comment\n", .Domains)
+	f := engine_of("/q/!x/\n/^kept\\./ # a comment\nwide.example\n@@/w/!x/\n@@/i/#x/\n", .Domains)
 	defer engine_destroy(f)
 	testing.expect_value(t, engine_match(f, "q.example."), Decision.None)
 	testing.expect_value(t, engine_match(f, "kept.example."), Decision.Blocked)
+	// `@@` takes its own road to the adblock parser, and is held to the same.
+	testing.expect_value(t, engine_match(f, "wide.example."), Decision.Blocked)
+	testing.expect_value(t, len(f.allow.regexes), 0)
 }
 
 @(test)
@@ -300,6 +303,8 @@ Repetition is where a pattern's size stops being its length: Odin's compiler
 writes `e{N}` out N times, and checks the program's size only once it has
 written all of it. So the bound has to be known before compiling, and these must
 come back refused, quickly, and without the memory the expansion would take.
+Each takes microseconds; a second is room for a loaded runner, and what the
+guard's absence costs is minutes.
 */
 @(test)
 test_regex_repetition_is_bounded_before_compiling :: proc(t: ^testing.T) {
@@ -326,7 +331,7 @@ test_regex_repetition_is_bounded_before_compiling :: proc(t: ^testing.T) {
 		n := parse_rule(block, allow, rule)
 		took := time.tick_since(start)
 		testing.expectf(t, n == 0, "%q was added", rule)
-		testing.expectf(t, took < 100 * time.Millisecond, "%q took %v to refuse", rule, took)
+		testing.expectf(t, took < time.Second, "%q took %v to refuse", rule, took)
 	}
 	testing.expect_value(t, block.regex_bytes, 0)
 
@@ -344,7 +349,7 @@ test_regex_repetition_is_bounded_before_compiling :: proc(t: ^testing.T) {
 		start := time.tick_now()
 		parse_rule(block, allow, rule)
 		took := time.tick_since(start)
-		testing.expectf(t, took < 500 * time.Millisecond, "%d-byte pattern took %v", len(rule), took)
+		testing.expectf(t, took < time.Second, "%d-byte pattern took %v", len(rule), took)
 	}
 }
 

@@ -16,10 +16,10 @@ Adblock regex rules: `/ads[0-9]+\.example\./`.
 AdGuard Home matches one against the query name - urlfilter's `matchPattern`
 runs it over the hostname, lowercased and without its trailing dot, and compiles
 it case-insensitively unless the rule says `$match-case` - so lists written for
-it (the AdGuard DNS filter, HaGeZi, OISD's adblock variant) carry them.
+it (the AdGuard DNS filter) carry them.
 
-List text is untrusted, and a pattern is matched on every query the hash sets do
-not settle, so what one may cost is decided here and not by its author:
+List text is untrusted, and a pattern is matched on every query the allow set
+does not settle, so what one may cost is decided here and not by its author:
 
   - The engine is `core:text/regex`, a Pike VM: every thread steps in lock step
     over the name and threads on the same instruction merge, so a match costs at

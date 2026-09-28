@@ -202,12 +202,21 @@ parse_hosts_line :: proc(block: ^Set, raw: string) -> (added: int) {
 
 @(private)
 parse_domain_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
-	line := strings.trim_space(strip_line_comment(raw))
+	kept := strip_line_comment(raw)
+	line := strings.trim_space(kept)
 	if line == "" {
 		return 0
 	}
+	// A `/` is never part of a domain, so a line opening with one is a regex
+	// rule, and an allow rule after a `-` or `@@`. On such a line a comment has
+	// to be set off by a space: a `!` or `#` cut inside the slashes (`/a/!b/`)
+	// would leave a shorter pattern that matches far more names.
+	cut_inside := len(kept) < len(raw) && strings.trim_right_space(kept) == kept
 	// A domains list may still carry the odd adblock-style entry.
 	if strings.has_prefix(line, "||") || strings.has_prefix(line, "@@") {
+		if cut_inside && strings.has_prefix(line, "@@/") {
+			return 0
+		}
 		return parse_adblock_line(block, allow, line)
 	}
 	target := block
@@ -215,13 +224,8 @@ parse_domain_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 		target = allow
 		line = strings.trim_space(line[1:])
 	}
-	// A `/` is never part of a domain, so a line opening with one is a regex
-	// rule, and an allow rule after a `-`. A comment has to be set off by a
-	// space: a `!` or `#` cut inside the slashes (`/a/!b/`) would leave a
-	// shorter pattern that matches far more names.
 	if strings.has_prefix(line, "/") {
-		kept := strip_line_comment(raw)
-		if len(kept) < len(raw) && strings.trim_right_space(kept) == kept {
+		if cut_inside {
 			return 0
 		}
 		return parse_adblock_line(target, allow, line)

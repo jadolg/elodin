@@ -42,8 +42,8 @@ Set :: struct {
 	// What `$badfilter` rules have taken back, kept so a rule arriving later -
 	// further down the list, or from the next one - is cancelled too.
 	cancelled: map[string]Rule_Flags,
-	// `/re/` rules, matched only when the hash maps have settled nothing; see
-	// regex.odin for what bounds them.
+	// `/re/` rules, matched after the hash maps; `engine_match` says when, and
+	// regex.odin what bounds them.
 	regexes:       [dynamic]Regex_Rule,
 	regex_bytes:   int,
 	// Patterns turned away because `regex_bytes` was already at its budget.
