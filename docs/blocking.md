@@ -73,13 +73,19 @@ can make one query cost is bounded instead:
 | a `{N}` or `{N,M}` count | 1000, as in RE2 |
 | one compiled pattern | 1024 bytes |
 | compiled patterns per set, block and allow each | 8 KiB |
+| name matched | 253 characters; a longer one, which only a name spelling bytes as `\DDD` reaches, is not matched against regex rules |
 
-The AdGuard DNS filter's 23 regex rules compile to about 1.5 KiB.
+The AdGuard DNS filter's 22 usable regex rules compile to about 1.5 KiB. Each
+name a query checks - the question and every CNAME hop - is matched against
+both sets.
 
 - Refused, as syntax elodin's engine would read differently from AdGuard Home's
   RE2: lookaround (`(?=`), inline flags (`(?i)`), escaped letters or digits
   other than `\d \D \w \W \s \S \b \B` (so `\1`, `\x41`, `\A`, `\z`), POSIX
-  classes (`[[:alpha:]]`), `{,M}`, and a repeat of a repeat (`a**`, `a{2}{3}`).
+  classes (`[[:alpha:]]`), `{,M}`, a repeat of a repeat (`a**`, `a{2}{3}`),
+  a `)` with no `(`, a class range running backwards (`[a-Z]`), and a `#`,
+  which elodin's engine reads as a comment and no name holds. The last drops
+  the AdGuard DNS filter's one allow regex, which needs a `#` in the name.
   Also an empty `//`, and any byte outside printable ASCII (write an
   international name as punycode).
 - Once a set's budget refuses a pattern, every later one is dropped too. The

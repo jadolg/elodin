@@ -206,15 +206,19 @@ parse_domain_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 	if line == "" {
 		return 0
 	}
-	// A domains list may still carry the odd adblock-style entry; a `/` is
-	// never part of a domain, so a line opening with one is a regex rule.
-	if strings.has_prefix(line, "||") || strings.has_prefix(line, "@@") || strings.has_prefix(line, "/") {
+	// A domains list may still carry the odd adblock-style entry.
+	if strings.has_prefix(line, "||") || strings.has_prefix(line, "@@") {
 		return parse_adblock_line(block, allow, line)
 	}
 	target := block
 	if strings.has_prefix(line, "-") {
 		target = allow
 		line = strings.trim_space(line[1:])
+	}
+	// A `/` is never part of a domain, so a line opening with one is a regex
+	// rule, and an allow rule after a `-`.
+	if strings.has_prefix(line, "/") {
+		return parse_adblock_line(target, allow, line)
 	}
 	flags := Rule_Flags{.Apex, .Subdomains}
 	if strings.has_prefix(line, "*.") {

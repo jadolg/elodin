@@ -25,7 +25,7 @@ not settle, so what one may cost is decided here and not by its author:
     over the name and threads on the same instruction merge, so a match costs at
     most the name's length times the program's size, however the pattern nests.
     There is no backtracking to blow up.
-  - Every `{N}` is held to RE2's 1000, read from the text (`repeat_counts_ok`).
+  - Every `{N}` is held to RE2's 1000, read from the text (`tokens_ok`).
   - Its compiler writes `e{N}` out N times and only checks the program's size
     once it is done, so `((a{1000}){1000}){1000}` would take gigabytes before it
     was refused. `program_bound` works out an upper bound on the size from the
@@ -52,6 +52,13 @@ built to be slow can make a query spend about a millisecond here at the budget,
 on a 253-character name.
 */
 MAX_REGEX_TOTAL :: 8 * 1024
+/*
+The longest name a regex is matched against: a hostname's 253 characters.
+Only a name spelling bytes as `\DDD` runs past it, to about 1000, and that
+quadruples the scan and costs a slow list ten milliseconds a match, a name the
+client chooses. A name that long is no hostname, so no rule meant it.
+*/
+MAX_REGEX_NAME :: 253
 
 @(private)
 REGEX_FLAGS :: regex.Flags{.No_Capture, .Case_Insensitive}
@@ -80,7 +87,7 @@ and every one after it, is counted in `regex_refused` so the loader can say so.
 */
 regex_add :: proc(s: ^Set, pattern: string) -> (stored: bool) {
 	key_buf: [MAX_REGEX_PATTERN + 2]u8
-	if !regex_pattern_ok(pattern) || !repeat_counts_ok(pattern) || regex_key(pattern, key_buf[:]) in s.cancelled {
+	if !regex_pattern_ok(pattern) || !tokens_ok(pattern) || regex_key(pattern, key_buf[:]) in s.cancelled {
 		return false
 	}
 	for r in s.regexes {
@@ -156,7 +163,7 @@ regex_cancel :: proc(s: ^Set, pattern: string) {
 
 // Whether any of the set's patterns matches `normalised`.
 regex_lookup :: proc(s: ^Set, normalised: string) -> bool {
-	if s == nil || len(s.regexes) == 0 {
+	if s == nil || len(s.regexes) == 0 || len(normalised) > MAX_REGEX_NAME {
 		return false
 	}
 	buf: [MATCH_SCRATCH]u8
@@ -186,6 +193,10 @@ run as Odin reads it, so a list cannot block a name AdGuard Home would not:
     anchors. An escaped punctuation mark is that mark in both.
   - `[:`, which opens a POSIX class like `[[:alpha:]]` in RE2 and is only
     characters to Odin.
+  - `#`, which Odin's tokenizer takes as the start of a comment outside a
+    group, dropping the rest of the pattern: the AdGuard DNS filter's
+    `@@/\.(gif|jpe?g|png|webp)#.../` would allow every name holding `.png`.
+    A name never holds a `#`, so RE2 can never match one either.
   - A byte outside printable ASCII: a query name spells one as `\DDD`, so the
     pattern could never match it there, and the ASCII engine stores a pattern
     rune as its low byte, which would make `š` (U+0161) match an `a`.
@@ -195,7 +206,7 @@ list author means by `//`.
 */
 @(private)
 regex_pattern_ok :: proc(pattern: string) -> bool {
-	if len(pattern) == 0 || len(pattern) > MAX_REGEX_PATTERN || strings.contains(pattern, "[:") {
+	if len(pattern) == 0 || len(pattern) > MAX_REGEX_PATTERN || strings.contains(pattern, "[:") || strings.contains(pattern, "#") {
 		return false
 	}
 	escaped := false
@@ -218,25 +229,41 @@ regex_pattern_ok :: proc(pattern: string) -> bool {
 }
 
 /*
-Every `{N,M}` count at most `MAX_REGEX_REPEAT`, read from the pattern's own
-tokens.
+What has to be read from the pattern's own tokens, because the parsed tree
+no longer shows it.
 
-It has to be the text and not the parsed tree: the parser reads a count as a u64
-and stores it as an int, so `{0,18446744073709551615}` arrives as `{0,}` and
-cannot be told from it, and a pair past `max(i64)` arrives as a shape the
-compiler has no case for and panics on. Past 1000 RE2 - and so urlfilter -
-refuses the pattern too, so AdGuard Home would never match the rule either.
+  - Every `{N,M}` count at most `MAX_REGEX_REPEAT`. The parser reads a count as
+    a u64 and stores it as an int, so `{0,18446744073709551615}` arrives as
+    `{0,}` and cannot be told from it, and a pair past `max(i64)` arrives as a
+    shape the compiler has no case for and panics on. Past 1000 RE2 - and so
+    urlfilter - refuses the pattern too, so AdGuard Home would never match the
+    rule either.
+  - No `)` without its `(`: Odin's parser takes `ads)` as `ads`, RE2 refuses it.
+  - No class range running backwards, `[a-Z]`: RE2 refuses it, and Odin's case
+    folding turns it into `[a-z]`.
 */
 @(private)
-repeat_counts_ok :: proc(pattern: string) -> bool {
+tokens_ok :: proc(pattern: string) -> bool {
 	t: tokenizer.Tokenizer
 	tokenizer.init(&t, pattern, REGEX_FLAGS)
+	depth := 0
 	for {
 		tok := tokenizer.scan(&t)
 		#partial switch tok.kind {
 		case .EOF, .Invalid:
 			// Whatever is left is the parser's to refuse.
 			return true
+		case .Open_Paren, .Open_Paren_Non_Capture:
+			depth += 1
+		case .Close_Paren:
+			depth -= 1
+			if depth < 0 {
+				return false
+			}
+		case .Rune_Class:
+			if !class_ranges_ok(tok.text) {
+				return false
+			}
 		case .Repeat_N:
 			// RE2 reads `{,M}` as the characters; Odin as "up to M".
 			if strings.has_prefix(tok.text, ",") {
@@ -254,6 +281,49 @@ repeat_counts_ok :: proc(pattern: string) -> bool {
 			}
 		}
 	}
+}
+
+/*
+The ranges in a class's text, read as Go's `parseClass` reads them: `lo-hi`
+with `hi` not below `lo`. A `-` next to `\d`, `\w` or `\s` and not at the end is
+refused too: Odin takes the rune before the escape as a range's start there,
+where RE2 reads the `-` as itself or refuses the pattern. `regex_pattern_ok`
+has already held an escaped letter to those classes and `\b \B`.
+*/
+@(private)
+class_ranges_ok :: proc(class: string) -> bool {
+	text := strings.trim_prefix(class, "^")
+	// The literal last read, -1 after a class escape, -2 at the start or
+	// after a range.
+	prev := -2
+	for i := 0; i < len(text); i += 1 {
+		c := int(text[i])
+		if c == '-' && prev != -2 && i + 1 < len(text) {
+			if prev == -1 {
+				return false
+			}
+			i += 1
+			hi := int(text[i])
+			if hi == '\\' && i + 1 < len(text) {
+				i += 1
+				if strings.index_byte("dDwWsS", text[i]) >= 0 {
+					return false
+				}
+				hi = int(text[i])
+			}
+			if hi < prev {
+				return false
+			}
+			prev = -2
+			continue
+		}
+		if c == '\\' && i + 1 < len(text) {
+			i += 1
+			c = -1 if strings.index_byte("dDwWsS", text[i]) >= 0 else int(text[i])
+		}
+		prev = c
+	}
+	return true
 }
 
 // Keyed with its slashes in `cancelled`, beside names that can hold no slash.
@@ -317,7 +387,7 @@ node_bound :: proc(node: parser.Node) -> int {
 		if is_repeat(n.inner) {
 			return CAP
 		}
-		// `repeat_counts_ok` has held every count to 0..=1000, so the -1s here
+		// `tokens_ok` has held every count to 0..=1000, so the -1s here
 		// are the parser's "no bound", and each shape is one the compiler has.
 		lo, hi := n.lower, n.upper
 		// e{N} is e N times; e{,M} is `e?` M times; e{N,} is e N times and

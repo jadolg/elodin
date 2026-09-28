@@ -119,10 +119,12 @@ test_regex_rules_are_counted :: proc(t: ^testing.T) {
 // be part of a domain, so the line can only have meant one thing.
 @(test)
 test_regex_rule_in_a_domains_list :: proc(t: ^testing.T) {
-	e := engine_of("plain.example\n/^ads[0-9]\\./\n", .Domains)
+	e := engine_of("plain.example\n/^ads[0-9]\\./\n-/^ads1\\./\n", .Domains)
 	defer engine_destroy(e)
 	testing.expect_value(t, engine_match(e, "plain.example."), Decision.Blocked)
 	testing.expect_value(t, engine_match(e, "ads7.example."), Decision.Blocked)
+	// `-` makes it an allow rule, as it does a domain.
+	testing.expect_value(t, engine_match(e, "ads1.example."), Decision.Allowed)
 }
 
 @(test)
@@ -153,6 +155,18 @@ test_regex_rules_that_are_refused :: proc(t: ^testing.T) {
 		`/a**/`,
 		`/a+?+/`,
 		`/a\/`,
+		// A `#` opens a comment to Odin's tokenizer, so `ads#x` would be `ads`.
+		`/ads#x/`,
+		`/a[#]/`,
+		// RE2 refuses a stray `)` and a range running backwards; Odin reads
+		// `ads)` as `ads` and folds `[a-Z]` into `[a-z]`.
+		`/a)/`,
+		`/[a-Z]/`,
+		`/[^a-Z]/`,
+		`/[b-\.]/`,
+		// Odin takes a rune before `\d` as the start of `\d-z`'s range.
+		`/[a\d-z]/`,
+		`/[a-\d]/`,
 	}
 	for rule in refused {
 		testing.expectf(t, parse_rule(block, allow, rule) == 0, "%q was added", rule)
@@ -164,6 +178,21 @@ test_regex_rules_that_are_refused :: proc(t: ^testing.T) {
 	engine_swap(e, block, allow)
 	testing.expect_value(t, engine_match(e, "a.example."), Decision.None)
 	engine_swap(e, nil, nil)
+
+	// What RE2 reads the same way is still kept.
+	for rule in ([]string{`/[a-z0-9-]/`, `/[-a]/`, `/[\w-]/`, `/[\--z]/`, `/[a-c-e]/`, `/[\.-a]/`, `/(a)(b)/`, `/\)/`, `/[)]/`}) {
+		testing.expectf(t, parse_rule(block, allow, rule) == 1, "%q was refused", rule)
+	}
+}
+
+// The AdGuard DNS filter's one allow regex needs a `#` in the name, which none
+// holds; read as Odin's tokenizer reads it, it allowed every name with `.png`.
+@(test)
+test_regex_hash_is_no_comment :: proc(t: ^testing.T) {
+	e := engine_of("||gdfp.gifshow.com^\n@@/\\.(gif|jpe?g|png|webp)#(\\/?.+)?(\\/(ad)s?\\/|\\/ad-)/\n")
+	defer engine_destroy(e)
+	testing.expect_value(t, engine_match(e, "gdfp.gifshow.com."), Decision.Blocked)
+	testing.expect_value(t, engine_match(e, "img.png.example."), Decision.None)
 }
 
 // What RE2 and Odin read the same way is kept, and means what RE2 means.
@@ -262,11 +291,12 @@ test_regex_pattern_and_program_limits :: proc(t: ^testing.T) {
 	testing.expect_value(t, parse_rule(block, allow, fmt.tprintf("/%s/", long[1:])), 0)
 
 	// Just inside the program limit, and matched against the longest name
-	// there is: the scratch a match runs in is sized from that limit.
-	big := fmt.tprintf("/[a-z]{{%d}}z/", MAX_REGEX_PROGRAM / 2 - 16)
+	// there is: the scratch a match runs in is sized from that limit. Each
+	// `[a-z]?` is a split and a class, seven bytes.
+	big := fmt.tprintf("/[a-z]{{0,%d}}z/", (MAX_REGEX_PROGRAM - 18) / 7)
 	testing.expectf(t, parse_rule(block, allow, big) == 1, "%s was refused", big)
-	testing.expect(t, block.regex_bytes <= MAX_REGEX_PROGRAM)
-	over := fmt.tprintf("/[a-z]{{%d}}y/", MAX_REGEX_PROGRAM / 2)
+	testing.expectf(t, block.regex_bytes > MAX_REGEX_PROGRAM - 32 && block.regex_bytes <= MAX_REGEX_PROGRAM, "%s compiled to %d bytes", big, block.regex_bytes)
+	over := fmt.tprintf("/[a-z]{{0,%d}}y/", (MAX_REGEX_PROGRAM - 18) / 7 + 3)
 	testing.expectf(t, parse_rule(block, allow, over) == 0, "%s was added", over)
 
 	e := engine_make()
@@ -278,7 +308,12 @@ test_regex_pattern_and_program_limits :: proc(t: ^testing.T) {
 	}
 	name := strings.join(labels[:], ".", context.temp_allocator)
 	testing.expect_value(t, engine_match(e, name), Decision.None)
-	testing.expect_value(t, engine_match(e, fmt.tprintf("%s%s", strings.repeat("a", 600, context.temp_allocator), "z")), Decision.Blocked)
+	a := strings.repeat("a", MAX_REGEX_NAME - 1, context.temp_allocator)
+	testing.expect_value(t, engine_match(e, fmt.tprintf("%sz", a)), Decision.Blocked)
+	// Past a hostname's length the name spells bytes as `\DDD`, which only
+	// makes a scan longer: no regex is asked about it.
+	testing.expect_value(t, engine_match(e, fmt.tprintf("%saz", a)), Decision.None)
+	testing.expect_value(t, engine_match(e, fmt.tprintf("%s\\001z", a)), Decision.None)
 	engine_swap(e, nil, nil)
 }
 
