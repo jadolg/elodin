@@ -38,6 +38,7 @@ off once a list has been fetched.
 | `\|\|*.foo.com^`           | subdomains of `foo.com` only     |
 | `address=/foo.com/0.0.0.0` | `foo.com` and its subdomains     |
 | `@@\|\|safe.foo.com^`      | never blocked                    |
+| `/^ads[0-9]+\.foo\.com$/`  | names the regex matches          |
 
 - Allow rules always win.
 - Hosts entries are exact, since hosts lists spell out every subdomain; bare
@@ -52,7 +53,42 @@ off once a list has been fetched.
   `$badfilter` cannot cancel `blocking.rules` or `blocking.allow`.
 - Skipped, without failing the list: any other modifier (`$dnstype`, `$client`,
   `$domain`, `$elemhide`, `$removeparam`, ...), cosmetic rules (`##`, `$$`), and
-  any rule that is not expressible as a domain.
+  any rule that is not expressible as a domain or a regex.
+
+## Regex rules
+
+`/…/` is matched as AdGuard Home matches it: against the query name, lowercased
+and without the trailing dot, case-insensitively, anywhere in the name unless
+anchored with `^` and `$`. `@@/…/` is an allow rule, and `$important`,
+`$third-party` and `$badfilter` work as for any other rule.
+
+Regex rules are tried after the domain rules: an allow regex when no allow rule
+matched, a block regex when no domain rule did. A match runs in time linear in
+the name, so no pattern can make a query backtrack. What a list
+can make one query cost is bounded instead:
+
+| limit | value |
+| --- | --- |
+| pattern length | 1024 bytes |
+| a `{N}` or `{N,M}` count | 1000, as in RE2 |
+| one compiled pattern | 1024 bytes |
+| compiled patterns per set, block and allow each | 8 KiB |
+
+The AdGuard DNS filter's 23 regex rules compile to about 1.5 KiB.
+
+- Refused, as syntax elodin's engine would read differently from AdGuard Home's
+  RE2: lookaround (`(?=`), inline flags (`(?i)`), escaped letters or digits
+  other than `\d \D \w \W \s \S \b \B` (so `\1`, `\x41`, `\A`, `\z`), POSIX
+  classes (`[[:alpha:]]`), `{,M}`, and a repeat of a repeat (`a**`, `a{2}{3}`).
+  Also an empty `//`, and any byte outside printable ASCII (write an
+  international name as punycode).
+- Once a set's budget refuses a pattern, every later one is dropped too. The
+  count is logged once at load: `filter: N regex rules skipped: a set holds 8192
+  bytes of compiled regex, and the lists loaded first used them up`.
+  `blocking.rules` load after the lists, so a rule there that is dropped also
+  gets its own `adds nothing` warning.
+- Regex rules are counted in `elodin_filter_rules` and in the startup line
+  `filter: N block rules (N regex), N allow rules (N regex)`.
 
 ## CNAME chains
 
