@@ -1208,6 +1208,15 @@ test_upstream_urls_outside_visible_ascii_are_errors :: proc(t: ^testing.T) {
 		)
 		refused_for(t, src, UPSTREAM_URL_RULE)
 	}
+	// The other shorthands are refused the same way, rather than trimmed of
+	// Unicode whitespace or kept with it: an NBSP after `#name` is a certificate
+	// name no server has.
+	SHORTHAND :: "upstream:\n  bootstrap: [9.9.9.9]\n  servers: [%s]\n"
+	_, good_dot := load_string(fmt.tprintf(SHORTHAND, "\"tls://1.1.1.1:853#dns.example\""), context.temp_allocator)
+	testing.expectf(t, good_dot == nil, "an ordinary DoT shorthand was refused: %v", good_dot)
+	for s in ([]string{"\"tls://1.1.1.1:853#dns.example\u00a0\"", "\"1.1.1.1\u00a0\""}) {
+		refused_for(t, fmt.tprintf(SHORTHAND, s), "cannot parse")
+	}
 	// A list url goes into a request line and `Host` just the same, on both of
 	// its spellings.
 	LIST_FORMS :: []string {

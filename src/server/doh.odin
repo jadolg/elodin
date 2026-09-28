@@ -510,6 +510,11 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 			if hosts > 1 {
 				return {}, 400, false
 			}
+			// And an invalid one is a 400 too (RFC 9112 3.2): held to what a
+			// target may hold, as `:authority` is on HTTP/2 (#438).
+			if !h2.target_is_valid(value) {
+				return {}, 400, false
+			}
 			req.host = hold(value)
 		case dns.name_equal_fold(name, "transfer-encoding"):
 			// Chunked request bodies are not accepted; DoH clients send a

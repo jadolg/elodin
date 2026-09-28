@@ -830,7 +830,7 @@ what a request is.
 */
 @(private)
 request_is_malformed :: proc(headers: []Header_Field) -> bool {
-	method, scheme, path: string
+	method, scheme, path, authority: string
 	have_method, have_scheme, have_path, have_authority: bool
 	// Set by the first ordinary field, which is where the pseudo-headers end.
 	seen_regular: bool
@@ -874,7 +874,7 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 				if have_authority {
 					return true
 				}
-				have_authority = true
+				have_authority, authority = true, f.value
 			case:
 				// 8.3 again: a request has those four and no others. `:protocol`
 				// lands here too, which is the answer this end wants - extended
@@ -913,6 +913,14 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 		}
 	}
 
+	/*
+	`:authority` is the target of CONNECT's request line and the `Host` of every
+	other request's, so it is held to what a target may hold, for the reason
+	given for `:path` below (#438).
+	*/
+	if !target_is_valid(authority) {
+		return true
+	}
 	/*
 	8.5: CONNECT carries `:authority` and neither `:scheme` nor `:path`. Not
 	implemented here, but a conformant one still has to be recognised as

@@ -8,6 +8,7 @@ import "core:strings"
 import "core:time"
 import "elodin:dns"
 import "elodin:dnssec"
+import "elodin:h2"
 import "elodin:yaml"
 
 Load_Error :: struct {
@@ -1273,7 +1274,7 @@ load_upstream_spec :: proc(
 			errorf(l, "%s: an https upstream needs a url", path)
 			return {}, false
 		}
-		if !visible_ascii(spec.url) || !visible_ascii(spec.hostname) {
+		if !h2.target_is_valid(spec.url) || !h2.target_is_valid(spec.hostname) {
 			errorf(l, "%s: %s", path, UPSTREAM_URL_RULE)
 			return {}, false
 		}
@@ -1366,7 +1367,7 @@ parse_upstream_shorthand :: proc(
 	if strings.has_prefix(s, "https://") {
 		spec.kind = .HTTPS
 		spec.url = s
-		if !visible_ascii(s) {
+		if !h2.target_is_valid(s) {
 			errorf(l, "%s: %s", path, UPSTREAM_URL_RULE)
 			return {}, false
 		}
@@ -1385,6 +1386,12 @@ parse_upstream_shorthand :: proc(
 		return spec, true
 	}
 
+	// Refused on the other kinds too, rather than kept: what `trim_space` used to
+	// take off, an NBSP after `#name` say, is a certificate name no server has.
+	if !h2.target_is_valid(s) {
+		errorf(l, "%s: cannot parse %q", path, raw)
+		return {}, false
+	}
 	spec.kind = .UDP
 	Scheme :: struct {
 		prefix: string,
@@ -1518,7 +1525,7 @@ load_block_lists :: proc(l: ^Loader, n: ^yaml.Node, path: string) -> []Block_Lis
 				continue
 			}
 			if strings.has_prefix(s, "http://") || strings.has_prefix(s, "https://") {
-				if !visible_ascii(s) {
+				if !h2.target_is_valid(s) {
 					errorf(l, "%s[%d]: %s", path, i, LIST_URL_RULE)
 					continue
 				}
@@ -1556,7 +1563,7 @@ load_block_lists :: proc(l: ^Loader, n: ^yaml.Node, path: string) -> []Block_Lis
 			errorf(l, "%s: needs either a url or a file", item_path)
 			continue
 		}
-		if !visible_ascii(bl.url) {
+		if !h2.target_is_valid(bl.url) {
 			errorf(l, "%s.url: %s", item_path, LIST_URL_RULE)
 			continue
 		}
@@ -2946,29 +2953,19 @@ is an endpoint that comes up and answers nothing.
 */
 @(private)
 http_path_is_valid :: proc(path: string) -> bool {
-	return visible_ascii(path) && strings.index_any(path, "?#") < 0
+	return h2.target_is_valid(path) && strings.index_any(path, "?#") < 0
 }
 
+/*
+Printable ASCII and no space, the rule the readers hold a request target to
+(`h2.target_is_valid`): an https upstream's url and hostname go into the request
+line and `Host` of every query sent to it, so a CR LF there is a field of the
+config's making in each one, and a space or a byte outside ASCII a request line
+the upstream reads some other way (#438).
+*/
 @(private)
 UPSTREAM_URL_RULE :: "the url and hostname of an https upstream must be visible ASCII"
 
 // A list url goes into a request line and `Host` the same way.
 @(private)
 LIST_URL_RULE :: "a list url must be visible ASCII"
-
-/*
-Printable ASCII and no space: what a request line and a field value written from
-config can carry without becoming a different request. An https upstream's url
-and hostname go into the request line and `Host` of every query sent to it, so a
-CR LF there is a field of the config's making in each one, and a space or a byte
-outside ASCII a request line the upstream reads some other way (#438).
-*/
-@(private)
-visible_ascii :: proc(s: string) -> bool {
-	for i in 0 ..< len(s) {
-		if s[i] <= ' ' || s[i] >= 0x7f {
-			return false
-		}
-	}
-	return true
-}

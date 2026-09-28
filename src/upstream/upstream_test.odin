@@ -3546,6 +3546,8 @@ test_a_request_line_holds_only_visible_ascii :: proc(t: ^testing.T) {
 		{"/hösts.txt", "mock.invalid"},
 		{"/", "mock.invalid\r\nX-Injected: 1"},
 		{"/", "mock invalid"},
+		// The control: an ordinary request goes out and is answered.
+		{"/hosts.txt", "mock.invalid"},
 	}
 	for c in cases {
 		m, server, port, ok := start_trickle(t, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", "", count = 0)
@@ -3562,11 +3564,25 @@ test_a_request_line_holds_only_visible_ascii :: proc(t: ^testing.T) {
 		}
 		set_socket_timeouts(socket, 3 * time.Second)
 		_, err := http_exchange(&stream, Http_Request{method = "GET", path = c.path, host = c.host}, context.temp_allocator)
-		testing.expectf(t, err == .HTTP_Error, "path %q host %q was sent: %v", c.path, c.host, err)
+		want: Error = .None if c.path == "/hosts.txt" else .HTTP_Error
+		testing.expectf(t, err == want, "path %q host %q: %v, want %v", c.path, c.host, err, want)
 		// Closed first, so the mock's read of a request that never came ends.
 		stream_close(&stream)
 		stop_trickle(m, server)
 	}
+	free_all(context.temp_allocator)
+}
+
+/*
+A url `fetch_url` would refuse to write into a request line is refused before
+it is looked up or dialled: a redirect's host is a DNS query and an SNI too.
+Port 1 on loopback has nothing listening, so a dial that went ahead would come
+back refused rather than as the `.HTTP_Error` of the check.
+*/
+@(test)
+test_fetch_url_refuses_a_bad_url_before_dialling :: proc(t: ^testing.T) {
+	_, err := fetch_url("http://127.0.0.1:1/a b", nil, time.Second, time.Second, context.temp_allocator)
+	testing.expectf(t, err == .HTTP_Error, "a url with a space was dialled: %v", err)
 	free_all(context.temp_allocator)
 }
 

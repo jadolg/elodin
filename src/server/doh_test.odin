@@ -987,6 +987,12 @@ test_request_line_is_three_tokens_with_a_known_version :: proc(t: ^testing.T) {
 		{"GET /dns-query HTTP/1.1", HOST + HOST, 400, false, "identical repeats of Host"},
 		{"GET /dns-query HTTP/1.1", TWO_HOSTS, 400, false, "conflicting repeats of Host"},
 		{"GET /dns-query HTTP/1.0", TWO_HOSTS, 400, false, "repeats of Host on 1.0 as well"},
+		// RFC 9112 3.2: an invalid Host is a 400, and `:authority` is refused
+		// the same way on HTTP/2 (#438).
+		{"GET /dns-query HTTP/1.1", "Host: dns example\r\n", 400, false, "a Host with a space in it"},
+		{"GET /dns-query HTTP/1.1", "Host: dns\texample\r\n", 400, false, "a Host with a tab in it"},
+		{"GET /dns-query HTTP/1.1", "Host: dns.ex\u00e4mple\r\n", 400, false, "a Host outside ASCII"},
+		{"GET /dns-query HTTP/1.1", "Host: [::1]:443\r\n", 0, true, "a Host that is an IPv6 authority"},
 	}
 
 	for c in CASES {

@@ -2703,6 +2703,17 @@ test_malformed_requests_are_reset :: proc(t: ^testing.T) {
 			},
 		},
 		{"CONNECT without :authority", {{":method", "CONNECT"}}},
+		// `:authority` is CONNECT's request target and everyone else's `Host`.
+		{"CONNECT :authority with a tab", {{":method", "CONNECT"}, {":authority", "a.example\tb.example:443"}}},
+		{
+			":authority with a space",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example x"},
+				{":path", "/dns-query"},
+			},
+		},
 		// RFC 9112 3.2: the target an h2-to-h1 hop would write into a request line.
 		{
 			":path with a space",
