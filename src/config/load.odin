@@ -1399,12 +1399,6 @@ parse_upstream_shorthand :: proc(
 		return spec, true
 	}
 
-	// Refused on the other kinds too, rather than kept: what `trim_space` used to
-	// take off, an NBSP after `#name` say, is a certificate name no server has.
-	if !h2.target_is_valid(s) {
-		errorf(l, "%s: cannot parse %q", path, raw)
-		return {}, false
-	}
 	spec.kind = .UDP
 	Scheme :: struct {
 		prefix: string,
@@ -1425,7 +1419,9 @@ parse_upstream_shorthand :: proc(
 	}
 
 	host, port, split_ok := net.split_port(s)
-	// A host each, as the map spelling's `address:` and `hostname:` are.
+	// A host each, as the map spelling's `address:` and `hostname:` are: what
+	// `trim_space` used to take off, an NBSP after `#name` say, is a
+	// certificate name no server has, and is refused rather than kept.
 	if !split_ok || !h2.authority_is_valid(s) || !h2.authority_is_valid(spec.hostname) {
 		errorf(l, "%s: cannot parse %q", path, raw)
 		return {}, false
