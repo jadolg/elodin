@@ -2718,6 +2718,28 @@ test_malformed_requests_are_reset :: proc(t: ^testing.T) {
 			"host in place of :authority, with a tab",
 			{{":method", "GET"}, {":scheme", "https"}, {":path", "/dns-query"}, {"host", "dns.example\tx"}},
 		},
+		// 8.3.1: a Host that names another entity than `:authority` is
+		// malformed, and a repeated one is two answers to which that is.
+		{
+			"host that disagrees with :authority",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "a.example"},
+				{":path", "/dns-query"},
+				{"host", "b.example"},
+			},
+		},
+		{
+			"host repeated",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":path", "/dns-query"},
+				{"host", "a.example"},
+				{"host", "b.example"},
+			},
+		},
 		// RFC 9112 3.2: the target an h2-to-h1 hop would write into a request line.
 		{
 			":path with a space",
@@ -2882,6 +2904,18 @@ test_conformant_requests_are_served :: proc(t: ^testing.T) {
 		// No :authority: legal, and what a client with no authority to convey
 		// sends. Only :method, :scheme and :path are mandatory.
 		{"no :authority", {{":method", "GET"}, {":scheme", "https"}, {":path", "/dns-query"}}},
+		// 8.3.1: `host` in its place, or beside one it agrees with up to case.
+		{"host in place of :authority", {{":method", "GET"}, {":scheme", "https"}, {":path", "/dns-query"}, {"host", "dns.example"}}},
+		{
+			"host agreeing with :authority",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+				{"host", "DNS.example"},
+			},
+		},
 		// The other side of the case-insensitivity above: an uppercase scheme
 		// names https rather than some scheme this specification says nothing
 		// about, so the origin-form :path it carries is served as it stands.

@@ -835,6 +835,8 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 	// Set by the first ordinary field, which is where the pseudo-headers end.
 	seen_regular: bool
 	have_content_type: bool
+	host: string
+	have_host: bool
 
 	for f in headers {
 		if len(f.name) == 0 || !field_value_is_valid(f.value) {
@@ -896,9 +898,11 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 		case "host":
 			// 8.3.1 lets a request carry `Host` in place of `:authority`, and an
 			// h2-to-h1 hop writes it out as the one it gets: the same rule (#438).
-			if !target_is_valid(f.value) {
+			// Once only, as on HTTP/1.1, and checked against `:authority` below.
+			if have_host || !target_is_valid(f.value) {
 				return true
 			}
+			have_host, host = true, f.value
 		case "te":
 			// The one exception 8.2.2 makes, and only for this value.
 			if f.value != "trailers" {
@@ -925,6 +929,13 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 	given for `:path` below (#438).
 	*/
 	if !target_is_valid(authority) {
+		return true
+	}
+	// 8.3.1: a Host naming another entity than `:authority` is malformed. This
+	// end routes by `:authority`, a hop behind it may route by `host`. ASCII
+	// case is the only normalising done, so `a:443` and `a` are refused as two
+	// entities: stricter than the RFC asks, and nothing sends both that way.
+	if have_host && have_authority && !dns.name_equal_fold(host, authority) {
 		return true
 	}
 	/*

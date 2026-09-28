@@ -1221,6 +1221,12 @@ test_upstream_urls_outside_visible_ascii_are_errors :: proc(t: ^testing.T) {
 	DOT_MAP :: "upstream:\n  bootstrap: [9.9.9.9]\n  servers:\n    - type: tls\n      address: 1.1.1.1\n      hostname: %s\n"
 	_, good_dot_map := load_string(fmt.tprintf(DOT_MAP, "dns.example"), context.temp_allocator)
 	testing.expectf(t, good_dot_map == nil, "an ordinary DoT map was refused: %v", good_dot_map)
+	// With no `hostname:`, a name address is the certificate name as well.
+	refused_for(
+		t,
+		"upstream:\n  bootstrap: [9.9.9.9]\n  servers:\n    - type: tls\n      address: \"dns.example \"\n",
+		"address: must be visible ASCII",
+	)
 	refused_for(t, fmt.tprintf(DOT_MAP, "\"dns.example \""), "hostname: must be visible ASCII")
 	// A list url goes into a request line and `Host` just the same, on both of
 	// its spellings.

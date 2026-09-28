@@ -1309,6 +1309,12 @@ load_upstream_spec :: proc(
 			errorf(l, "%s.hostname: must be visible ASCII", path)
 			return {}, false
 		}
+		// And the address, which is the certificate name too when no hostname
+		// is given, and a lookup when it is a name.
+		if !h2.target_is_valid(spec.address) {
+			errorf(l, "%s.address: must be visible ASCII", path)
+			return {}, false
+		}
 		if spec.port == 0 {
 			spec.port = 853 if spec.kind == .TLS else 53
 		}
