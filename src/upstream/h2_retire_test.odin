@@ -90,8 +90,10 @@ replace_dead_h2 :: proc(t: ^testing.T, reader_gone: bool) {
 
 	start := time.tick_now()
 	// What the redial comes to is beside the point, and not asserted: tests
-	// run in parallel, and another may have bound the freed port since.
-	conn, _, _ := get_h2_conn(u, 200 * time.Millisecond, 200 * time.Millisecond)
+	// run in parallel, and another may have bound the freed port since. The
+	// budget is short so a redial that does not fail at once cannot eat the
+	// margin below.
+	conn, _, _ := get_h2_conn(u, 200 * time.Millisecond, 20 * time.Millisecond)
 	took := time.tick_since(start)
 	testing.expect(t, conn == nil)
 	testing.expectf(t, took < H2_POLL_INTERVAL / 4, "replacing the connection took %v", took)
@@ -229,7 +231,16 @@ test_retiring_a_tls_h2_conn_sends_close_notify :: proc(t: ^testing.T) {
 		ctx      = sctx,
 	}
 	peer_thread := thread.create_and_start_with_poly_data(&peer, read_until_closed)
-	defer thread.destroy(peer_thread)
+	defer {
+		// A return before `open_stream` connected leaves the peer in `accept`,
+		// and the join would hang the run instead of failing it.
+		if !thread.is_done(peer_thread) {
+			if s, err := net.dial_tcp(bound); err == nil {
+				net.close(s)
+			}
+		}
+		thread.destroy(peer_thread)
+	}
 
 	u, uerr := make_upstream(
 		config.Upstream_Spec{name = "notify", kind = .TCP, address = "127.0.0.1", port = bound.port, hostname = "doh.invalid", path = "/dns-query"},
