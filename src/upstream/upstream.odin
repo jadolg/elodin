@@ -77,10 +77,10 @@ A shared HTTP/2 connection plus what owns it.
 `stopping` exists because closing a socket does not reliably wake a thread
 already blocked in a read on it (the same reason itest/mock.odin polls rather
 than relying on close to interrupt a loop): the reader thread's socket carries
-a short receive timeout so it wakes on its own and can notice this flag,
-bounding teardown instead of depending on a close to cut its read short.
-`refs` counts the two owners, `Upstream.h2` and the reader; see
-`start_h2_conn`.
+a short receive timeout so it wakes on its own and can notice this flag. The
+`shutdown(2)` in `retire_h2_conn` is what normally wakes it; the flag and the
+timeout bound a reader that shutdown missed. `refs` counts the two owners,
+`Upstream.h2` and the reader; see `start_h2_conn`.
 */
 @(private)
 H2_Conn :: struct {

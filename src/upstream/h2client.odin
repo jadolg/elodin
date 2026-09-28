@@ -267,10 +267,13 @@ next poll: nothing joins it any more, so replacements are only as far apart as
 a dial, and a reader sitting out its poll would hold a thread and a socket for
 each. Shutdown, not close, because close would race a thread that might still
 be reading from the descriptor; this caller's share keeps it open until then.
+A TLS session sends its close_notify first, for the reason `send_close_notify`
+gives.
 */
 @(private)
 retire_h2_conn :: proc(hc: ^H2_Conn) {
 	sync.atomic_store(&hc.stopping, true)
+	tlsx.send_close_notify(hc.stream.tls)
 	_ = net.shutdown(hc.stream.socket, .Both)
 	release_h2_conn(hc)
 }

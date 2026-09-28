@@ -6,6 +6,7 @@ import "core:testing"
 import "core:thread"
 import "core:time"
 import "elodin:config"
+import "elodin:tlsx"
 
 /*
 Replacing a dead shared HTTP/2 connection used to join its reader thread on
@@ -159,4 +160,105 @@ test_finished_h2_readers_are_reaped_by_the_next_conn :: proc(t: ^testing.T) {
 	sync.mutex_lock(&u.mu)
 	testing.expect_value(t, len(u.h2_readers), 1)
 	sync.mutex_unlock(&u.mu)
+}
+
+@(private = "file")
+Close_Notify_Peer :: struct {
+	listener: net.TCP_Socket,
+	ctx:      ^tlsx.Context,
+	// How the peer's reading ended: `.Closed` for a close_notify, an error
+	// for a bare EOF.
+	ended:    tlsx.Error,
+}
+
+@(private = "file")
+read_until_closed :: proc(p: ^Close_Notify_Peer) {
+	p.ended = .IO_Error
+	socket, _, aerr := net.accept_tcp(p.listener)
+	if aerr != nil {
+		return
+	}
+	_ = net.set_option(socket, .Receive_Timeout, 3 * time.Second)
+	conn, terr := tlsx.server_accept(p.ctx, socket)
+	if terr != .None {
+		net.close(socket)
+		return
+	}
+	defer tlsx.close(conn)
+	buf: [1024]u8
+	for {
+		if _, err := tlsx.read(conn, buf[:]); err != .None {
+			p.ended = err
+			return
+		}
+	}
+}
+
+/*
+Every h2 upstream is TLS, and retiring one shuts its socket down to wake the
+reader. With nothing sent first, the reader's EOF is a fatal error that stops
+`tlsx.close` sending close_notify (RFC 8446 6.1), and the alert that error
+writes onto the shut side raised SIGPIPE, which kills a process that has not
+ignored it.
+*/
+@(test)
+test_retiring_a_tls_h2_conn_sends_close_notify :: proc(t: ^testing.T) {
+	sync.once_do(&dot_cert_once, generate_dot_certs)
+	if !testing.expect(t, dot_cert_ok, "no certificate available and openssl could not make one") {
+		return
+	}
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen: %v", lerr) {
+		return
+	}
+	defer net.close(listener)
+	bound, _ := net.bound_endpoint(listener)
+	sctx, serr := tlsx.server_context(dot_cert_path, dot_key_path)
+	if !testing.expectf(t, serr == .None, "server_context: %v", serr) {
+		return
+	}
+	defer tlsx.context_destroy(sctx)
+	cctx, cerr := tlsx.client_context(false)
+	if !testing.expectf(t, cerr == .None, "client_context: %v", cerr) {
+		return
+	}
+	defer tlsx.context_destroy(cctx)
+
+	peer := Close_Notify_Peer {
+		listener = listener,
+		ctx      = sctx,
+	}
+	peer_thread := thread.create_and_start_with_poly_data(&peer, read_until_closed)
+	defer thread.destroy(peer_thread)
+
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "notify", kind = .TCP, address = "127.0.0.1", port = bound.port, hostname = "doh.invalid", path = "/dns-query"},
+		8,
+		30 * time.Second,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot make the upstream: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+
+	stream, oerr := open_stream(bound, cctx, "", 2 * time.Second)
+	if !testing.expectf(t, oerr == .None, "open_stream: %v", oerr) {
+		return
+	}
+	// What `get_h2_conn` sets once ALPN says h2.
+	_ = net.set_option(stream.socket, .Receive_Timeout, H2_POLL_INTERVAL)
+	tlsx.set_timeouts(stream.tls, H2_POLL_INTERVAL, time.Second)
+	sync.mutex_lock(&u.mu)
+	hc := start_h2_conn(u, stream)
+	reader := u.h2_readers[len(u.h2_readers) - 1]
+	sync.mutex_unlock(&u.mu)
+
+	// In its poll, as in `replace_dead_h2`.
+	time.sleep(50 * time.Millisecond)
+	retire_h2_conn(hc)
+	thread.join(peer_thread)
+	testing.expect_value(t, peer.ended, tlsx.Error.Closed)
+	for !thread.is_done(reader) {
+		time.sleep(time.Millisecond)
+	}
 }

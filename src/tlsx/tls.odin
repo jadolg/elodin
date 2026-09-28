@@ -982,6 +982,27 @@ close :: proc(conn: ^Conn) {
 	free(conn, conn.allocator)
 }
 
+/*
+Send close_notify on a session another thread may still be reading, ahead of a
+`shutdown(2)` that ends that read. RFC 8446 6.1 wants the alert before the write
+side closes, and after the shutdown there is none: the reader's EOF is then a
+fatal error that forbids `close` sending it, and the alert that error writes
+raises SIGPIPE on the closed side. The socket is non-blocking, so a peer that has
+stopped reading costs nothing here. `close` still frees the session.
+*/
+send_close_notify :: proc(conn: ^Conn) {
+	if conn == nil {
+		return
+	}
+	sync.mutex_lock(&conn.mu)
+	if conn.ssl != nil {
+		ssl_enter(conn)
+		SSL_shutdown(conn.ssl)
+		ssl_leave(conn)
+	}
+	sync.mutex_unlock(&conn.mu)
+}
+
 // The protocol agreed during the handshake, or "" if none was negotiated.
 alpn_protocol :: proc(conn: ^Conn) -> string {
 	data: [^]u8
