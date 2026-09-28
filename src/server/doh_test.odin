@@ -968,11 +968,38 @@ test_request_line_is_three_tokens_with_a_known_version :: proc(t: ^testing.T) {
 		{"GET /dns-query ", HOST, 400, false, "no version at all"},
 		{"GET  HTTP/1.1", HOST, 400, false, "an empty target"},
 		{" /dns-query HTTP/1.1", HOST, 400, false, "an empty method"},
+		// RFC 9112 3 lets a recipient split on HTAB, VT, FF or a bare CR as well
+		// as SP, so a method that is not a token is a request line a lenient hop
+		// reads as another one: `POST\t/allowed` routed there by `/allowed` (#438).
+		{"POST\t/allowed /dns-query HTTP/1.1", HOST, 400, false, "a tab inside the method"},
+		{"GET\x0b /dns-query HTTP/1.1", HOST, 400, false, "a VT on the end of the method"},
+		{"GET\x0c /dns-query HTTP/1.1", HOST, 400, false, "an FF on the end of the method"},
+		{"GE(T /dns-query HTTP/1.1", HOST, 400, false, "a method with a delimiter in it"},
+		{"G\u00c9T /dns-query HTTP/1.1", HOST, 400, false, "a method outside ASCII"},
+		// And the target is the other half of the same split.
+		{"GET /allowed\t/dns-query HTTP/1.1", HOST, 400, false, "a tab inside the target"},
+		{"GET /dns-query\x0bHTTP/1.1 HTTP/1.1", HOST, 400, false, "a VT inside the target"},
+		{"GET /dns-query\x7f HTTP/1.1", HOST, 400, false, "a DEL inside the target"},
+		{"GET /dns-query?dns=\u00c9 HTTP/1.1", HOST, 400, false, "a target outside ASCII"},
+		{"M-SEARCH /dns-query HTTP/1.1", HOST, 0, true, "a method that is an unusual token"},
 		{"GET /dns-query", HOST, 400, false, "two tokens"},
 		{"GET /dns-query HTTP/1.1", "", 400, false, "1.1 with no Host"},
 		{"GET /dns-query HTTP/1.1", HOST + HOST, 400, false, "identical repeats of Host"},
 		{"GET /dns-query HTTP/1.1", TWO_HOSTS, 400, false, "conflicting repeats of Host"},
 		{"GET /dns-query HTTP/1.0", TWO_HOSTS, 400, false, "repeats of Host on 1.0 as well"},
+		// RFC 9112 3.2: an invalid Host is a 400, and `:authority` is refused
+		// the same way on HTTP/2 (#438).
+		{"GET /dns-query HTTP/1.1", "Host: dns example\r\n", 400, false, "a Host with a space in it"},
+		{"GET /dns-query HTTP/1.1", "Host: dns\texample\r\n", 400, false, "a Host with a tab in it"},
+		{"GET /dns-query HTTP/1.1", "Host: dns.ex\u00e4mple\r\n", 400, false, "a Host outside ASCII"},
+		{"GET /dns-query HTTP/1.1", "Host: [::1]:443\r\n", 0, true, "a Host that is an IPv6 authority"},
+		// uri-host [":" port] holds none of userinfo, a path, a query or a
+		// fragment, and a hop that routes by Host parses each of them its own way.
+		{"GET /dns-query HTTP/1.1", "Host: a.example@b.example\r\n", 400, false, "a Host with userinfo"},
+		{"GET /dns-query HTTP/1.1", "Host: a.example/x\r\n", 400, false, "a Host with a path"},
+		{"GET /dns-query HTTP/1.1", "Host: a.example\\x\r\n", 400, false, "a Host with a backslash"},
+		{"GET /dns-query HTTP/1.1", "Host: a.example?x\r\n", 400, false, "a Host with a query"},
+		{"GET /dns-query HTTP/1.1", "Host: a.example#x\r\n", 400, false, "a Host with a fragment"},
 	}
 
 	for c in CASES {

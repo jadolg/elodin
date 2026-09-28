@@ -830,11 +830,13 @@ what a request is.
 */
 @(private)
 request_is_malformed :: proc(headers: []Header_Field) -> bool {
-	method, scheme, path: string
+	method, scheme, path, authority: string
 	have_method, have_scheme, have_path, have_authority: bool
 	// Set by the first ordinary field, which is where the pseudo-headers end.
 	seen_regular: bool
 	have_content_type: bool
+	host: string
+	have_host: bool
 
 	for f in headers {
 		if len(f.name) == 0 || !field_value_is_valid(f.value) {
@@ -874,7 +876,7 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 				if have_authority {
 					return true
 				}
-				have_authority = true
+				have_authority, authority = true, f.value
 			case:
 				// 8.3 again: a request has those four and no others. `:protocol`
 				// lands here too, which is the answer this end wants - extended
@@ -893,6 +895,14 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 			// 8.2.2: connection-specific fields have no meaning in HTTP/2, where
 			// the connection is shared by every stream on it.
 			return true
+		case "host":
+			// 8.3.1 lets a request carry `Host` in place of `:authority`, and an
+			// h2-to-h1 hop writes it out as the one it gets: the same rule (#438).
+			// Once only, as on HTTP/1.1, and checked against `:authority` below.
+			if have_host || !authority_is_valid(f.value) {
+				return true
+			}
+			have_host, host = true, f.value
 		case "te":
 			// The one exception 8.2.2 makes, and only for this value.
 			if f.value != "trailers" {
@@ -914,6 +924,21 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 	}
 
 	/*
+	`:authority` is the target of CONNECT's request line and the `Host` of every
+	other request's, so it is held to what a host may hold, for the reason
+	given for `:path` below (#438) - see `authority_is_valid`.
+	*/
+	if !authority_is_valid(authority) {
+		return true
+	}
+	// 8.3.1: a Host naming another entity than `:authority` is malformed. This
+	// end routes by `:authority`, a hop behind it may route by `host`. ASCII
+	// case is the only normalising done, so `a:443` and `a` are refused as two
+	// entities: stricter than the RFC asks, and nothing sends both that way.
+	if have_host && have_authority && !dns.name_equal_fold(host, authority) {
+		return true
+	}
+	/*
 	8.5: CONNECT carries `:authority` and neither `:scheme` nor `:path`. Not
 	implemented here, but a conformant one still has to be recognised as
 	conformant - turning it away is the handler's job, and not this procedure's
@@ -934,8 +959,14 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 	nothing at all. `:scheme` is worth more than tidiness here - it is what
 	selects the `:path` checks below, so an empty one carried any `:path` at all
 	straight past them.
+
+	And a token, not merely something (RFC 9110 9.1): `GE(T`, `GET\x0b` and
+	`POST\t/allowed` were requests, and the last is a request line that an
+	h2-to-h1 hop writes out for a lenient reader to split on the tab (#438).
+	The HTTP/1.1 side refuses the same methods. `:path` is held to what a
+	request target may hold for the same reason.
 	*/
-	if len(method) == 0 || len(scheme) == 0 {
+	if !is_token(method) || len(scheme) == 0 || !target_is_valid(path) {
 		return true
 	}
 	/*
@@ -992,6 +1023,34 @@ is_token :: proc(s: string) -> bool {
 	}
 	// 1*tchar: nothing at all is not a token.
 	return len(s) > 0
+}
+
+/*
+RFC 9112 3.2 and RFC 3986 2: a request target is visible ASCII and nothing
+else. No SP, HTAB, VT or FF, which a lenient hop is entitled to split a request
+line on (RFC 9112 3), no other control, and no byte outside ASCII, which a URI
+cannot hold unencoded. Emptiness is left to the caller, which knows what an
+empty target means on its version.
+*/
+target_is_valid :: proc(s: string) -> bool {
+	for i in 0 ..< len(s) {
+		if s[i] <= ' ' || s[i] >= 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+/*
+RFC 9110 7.2 and RFC 3986 3.2: a host, `uri-host [":" port]`, is a target that
+holds no userinfo (which RFC 9113 8.3.1 forbids in `:authority` by name), no
+path, query or fragment, and no backslash, which WHATWG parsers read as a `/`.
+Each of those is a Host that a hop routing by it parses its own way:
+`a.example@b.example` is `b.example` to one reader and `a.example` to another.
+Empty is left to the caller, as for `target_is_valid`.
+*/
+authority_is_valid :: proc(s: string) -> bool {
+	return target_is_valid(s) && strings.index_any(s, "@/\\?#") < 0
 }
 
 /*
@@ -1131,7 +1190,10 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 			take(&req.method, f.value, c.allocator)
 		case ":path":
 			take(&req.path, f.value, c.allocator)
-		case ":authority":
+		case ":authority", "host":
+			// 8.3.1: `host` stands in for an absent `:authority`. Both present
+			// means they agree (`request_is_malformed`), and the pseudo-header,
+			// coming first, is the one kept.
 			take(&req.authority, f.value, c.allocator)
 		case ":scheme":
 			take(&req.scheme, f.value, c.allocator)

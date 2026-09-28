@@ -1115,6 +1115,152 @@ test_metrics_settings_are_honoured :: proc(t: ^testing.T) {
 }
 
 /*
+A DoH path is matched against the request target, so a path that no target can
+spell is an endpoint that comes up and is never reached: the reader splits the
+target at `?`, a fragment is never sent, and a space, a control or a byte
+outside ASCII is a request line the reader refuses (#438).
+*/
+@(test)
+test_unreachable_doh_paths_are_errors :: proc(t: ^testing.T) {
+	Case :: struct {
+		key, value: string,
+	}
+	cases := []Case {
+		{"path", "\"/dns query\""},
+		{"path", "\"/dns\\tquery\""},
+		{"path", "\"/dns-query?x\""},
+		{"path", "\"/dns-query#x\""},
+		{"path", "\"/dns-qu\u00e9ry\""},
+		{"path", "\"/dns-query\\x7f\""},
+		{"mobileconfig_path", "\"/apple doh.mobileconfig\""},
+		{"mobileconfig_path", "\"/apple-doh.mobileconfig?x\""},
+	}
+	for c in cases {
+		src := strings.concatenate(
+			{"upstream:\n  servers: [1.1.1.1]\nlisteners:\n  doh:\n    enabled: true\n    ", c.key, ": ", c.value, "\n"},
+			context.temp_allocator,
+		)
+		_, err := load_string(src, context.temp_allocator)
+		e, has := err.?
+		testing.expectf(t, has, "%s: %s was accepted", c.key, c.value)
+		if has {
+			named := false
+			want := strings.concatenate({"listeners.doh.", c.key, ":"}, context.temp_allocator)
+			for m in e.messages {
+				if strings.has_prefix(m, want) {
+					named = true
+				}
+			}
+			testing.expectf(t, named, "%s: %s was refused, but not for the path", c.key, c.value)
+		}
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+An upstream URL is written into the request line and the `Host` field of every
+query sent to it, so a byte there that the request line cannot hold is a request
+line of elodin's own making that is malformed - or, given a CR LF, one that
+carries fields the operator never meant to send (#438). Refused on both spellings
+of an upstream, the shorthand and the map, and of a block or allow list.
+*/
+@(test)
+test_upstream_urls_outside_visible_ascii_are_errors :: proc(t: ^testing.T) {
+	// Refused, and for the rule: a bootstrap in each source, so that the URL is
+	// the only thing wrong with it.
+	refused_for :: proc(t: ^testing.T, src, rule: string) {
+		_, err := load_string(src, context.temp_allocator)
+		e, has := err.?
+		if !testing.expectf(t, has, "%q was accepted", src) {
+			return
+		}
+		named := false
+		for m in e.messages {
+			named ||= strings.contains(m, rule)
+		}
+		testing.expectf(t, named, "%q was refused, but not for the url: %v", src, e.messages)
+	}
+	urls := []string {
+		"\"https://dns.example/dns query\"",
+		"\"https://dns.example/dns-query\\tx\"",
+		"\"https://dns.example/dns-query\\r\\nX-Injected: 1\"",
+		"\"https://dns.example/dns-qu\u00e9ry\"",
+		"\"https://dns.ex\\x7fample/dns-query\"",
+		// Unicode whitespace is not trimmed off the shorthand into a valid url.
+		"\"https://dns.example/dns-query\u00a0\"",
+	// The url's host is the `Host` and `:authority`: no userinfo in it.
+		"\"https://a.example@dns.example/dns-query\"",
+	}
+	FORMS :: []string {
+		"upstream:\n  bootstrap: [9.9.9.9]\n  servers: [%s]\n",
+		"upstream:\n  bootstrap: [9.9.9.9]\n  servers:\n    - url: %s\n",
+	}
+	for form in FORMS {
+		_, good := load_string(fmt.tprintf(form, "\"https://dns.example/dns-query\""), context.temp_allocator)
+		testing.expectf(t, good == nil, "%q: an ordinary url was refused: %v", form, good)
+		for url in urls {
+			refused_for(t, fmt.tprintf(form, url), UPSTREAM_URL_RULE)
+		}
+	}
+	// The map spelling can name the `Host` apart from the url.
+	for hostname in ([]string{"\"dns.example\\r\\nX-Injected: 1\"", "\"dns example\""}) {
+		src := fmt.tprintf(
+			"upstream:\n  bootstrap: [9.9.9.9]\n  servers:\n    - url: https://dns.example/dns-query\n      hostname: %s\n",
+			hostname,
+		)
+		refused_for(t, src, UPSTREAM_URL_RULE)
+	}
+	// The other shorthands are refused the same way, rather than trimmed of
+	// Unicode whitespace or kept with it: an NBSP after `#name` is a certificate
+	// name no server has.
+	SHORTHAND :: "upstream:\n  bootstrap: [9.9.9.9]\n  servers: [%s]\n"
+	_, good_dot := load_string(fmt.tprintf(SHORTHAND, "\"tls://1.1.1.1:853#dns.example\""), context.temp_allocator)
+	testing.expectf(t, good_dot == nil, "an ordinary DoT shorthand was refused: %v", good_dot)
+	for s in ([]string{"\"tls://1.1.1.1:853#dns.example\u00a0\"", "\"1.1.1.1\u00a0\"", "\"tls://1.1.1.1:853#a.example@b.example\"", "\"tls://a@dns.example:853\""}) {
+		refused_for(t, fmt.tprintf(SHORTHAND, s), "cannot parse")
+	}
+	// And the map spelling of one: the same name, spelled `hostname:`.
+	DOT_MAP :: "upstream:\n  bootstrap: [9.9.9.9]\n  servers:\n    - type: tls\n      address: 1.1.1.1\n      hostname: %s\n"
+	_, good_dot_map := load_string(fmt.tprintf(DOT_MAP, "dns.example"), context.temp_allocator)
+	testing.expectf(t, good_dot_map == nil, "an ordinary DoT map was refused: %v", good_dot_map)
+	// With no `hostname:`, a name address is the certificate name as well.
+	refused_for(
+		t,
+		"upstream:\n  bootstrap: [9.9.9.9]\n  servers:\n    - type: tls\n      address: \"dns.example \"\n",
+		"address: must be visible ASCII",
+	)
+	refused_for(t, fmt.tprintf(DOT_MAP, "\"dns.example \""), "hostname: must be visible ASCII")
+	// And a host: userinfo or a path in one is a name no certificate has, and a
+	// `Host` that a hop routing by it reads its own way.
+	refused_for(t, fmt.tprintf(DOT_MAP, "\"a.example@b.example\""), "hostname: must be visible ASCII")
+	refused_for(
+		t,
+		"upstream:\n  bootstrap: [9.9.9.9]\n  servers:\n    - url: https://dns.example/dns-query\n      hostname: a.example/x\n",
+		UPSTREAM_URL_RULE,
+	)
+	// An https upstream's own address is a lookup just the same.
+	refused_for(
+		t,
+		"upstream:\n  bootstrap: [9.9.9.9]\n  servers:\n    - url: https://dns.example/dns-query\n      address: \"dns.example \"\n",
+		"address: must be visible ASCII",
+	)
+	// A list url goes into a request line and `Host` just the same, on both of
+	// its spellings.
+	LIST_FORMS :: []string {
+		"upstream:\n  bootstrap: [9.9.9.9]\n  servers: [1.1.1.1]\nblocking:\n  lists: [%s]\n",
+		"upstream:\n  bootstrap: [9.9.9.9]\n  servers: [1.1.1.1]\nblocking:\n  allowlists:\n    - url: %s\n",
+	}
+	for form in LIST_FORMS {
+		_, good := load_string(fmt.tprintf(form, "\"https://lists.example/hosts.txt\""), context.temp_allocator)
+		testing.expectf(t, good == nil, "%q: an ordinary list url was refused: %v", form, good)
+		for url in ([]string{"\"https://lists.example/hosts.txt\\r\\nX-Injected: 1\"", "\"https://lists.example/a b\"", "\"https://a.example@lists.example/hosts.txt\""}) {
+			refused_for(t, fmt.tprintf(form, url), LIST_URL_RULE)
+		}
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
 Caught by `--check` rather than at startup.
 
 Each of these comes up as a listener that binds and is never scraped: a path a
@@ -1124,7 +1270,18 @@ takes longest to attribute.
 */
 @(test)
 test_unusable_metrics_settings_are_errors :: proc(t: ^testing.T) {
-	cases := []string{"  path: metrics\n", "  port: 0\n", "  port: 70000\n", "  address: \"localhost\"\n"}
+	cases := []string {
+		"  path: metrics\n",
+		"  port: 0\n",
+		"  port: 70000\n",
+		"  address: \"localhost\"\n",
+		// A path no request target can spell: see `http_path_is_valid`.
+		"  path: \"/st ats\"\n",
+		"  path: \"/st\\tats\"\n",
+		"  path: \"/stats?x\"\n",
+		"  path: \"/stats#x\"\n",
+		"  path: \"/st\u00e4ts\"\n",
+	}
 	for tail in cases {
 		src := strings.concatenate(
 			{"upstream:\n  servers: [1.1.1.1]\nmetrics:\n  enabled: true\n", tail},

@@ -8,6 +8,7 @@ import "core:strings"
 import "core:time"
 import "elodin:dns"
 import "elodin:dnssec"
+import "elodin:h2"
 import "elodin:yaml"
 
 Load_Error :: struct {
@@ -1268,9 +1269,19 @@ load_upstream_spec :: proc(
 		spec.kind = .UDP
 	}
 
+	// The address is a lookup when it is a name, on every kind, and the
+	// certificate name too when a DoT upstream gives no hostname.
+	if !h2.authority_is_valid(spec.address) {
+		errorf(l, "%s.address: %s", path, HOST_RULE)
+		return {}, false
+	}
 	if spec.kind == .HTTPS {
 		if spec.url == "" {
 			errorf(l, "%s: an https upstream needs a url", path)
+			return {}, false
+		}
+		if !url_is_valid(spec.url) || !h2.authority_is_valid(spec.hostname) {
+			errorf(l, "%s: %s", path, UPSTREAM_URL_RULE)
 			return {}, false
 		}
 		scheme, host, url_path, _, _ := net.split_url(spec.url, l.allocator)
@@ -1296,6 +1307,12 @@ load_upstream_spec :: proc(
 	} else {
 		if spec.address == "" {
 			errorf(l, "%s: missing address", path)
+			return {}, false
+		}
+		// As the shorthand's `#name` is: an NBSP on the end is a certificate name
+		// no server has.
+		if !h2.authority_is_valid(spec.hostname) {
+			errorf(l, "%s.hostname: %s", path, HOST_RULE)
 			return {}, false
 		}
 		if spec.port == 0 {
@@ -1355,11 +1372,18 @@ parse_upstream_shorthand :: proc(
 ) {
 	spec.verify = true
 	spec.bootstrap = default_bootstrap
-	s := strings.trim_space(raw)
+	// ASCII whitespace only: `trim_space` also eats Unicode spaces such as NBSP,
+	// silently rewriting what the operator wrote; the check below refuses it
+	// instead (#438).
+	s := strings.trim(raw, " \t\r\n")
 
 	if strings.has_prefix(s, "https://") {
 		spec.kind = .HTTPS
 		spec.url = s
+		if !url_is_valid(s) {
+			errorf(l, "%s: %s", path, UPSTREAM_URL_RULE)
+			return {}, false
+		}
 		scheme, host, url_path, _, _ := net.split_url(s, l.allocator)
 		_ = scheme
 		host_only, url_port, split_ok := net.split_port(host)
@@ -1395,7 +1419,10 @@ parse_upstream_shorthand :: proc(
 	}
 
 	host, port, split_ok := net.split_port(s)
-	if !split_ok {
+	// A host each, as the map spelling's `address:` and `hostname:` are: what
+	// `trim_space` used to take off, an NBSP after `#name` say, is a
+	// certificate name no server has, and is refused rather than kept.
+	if !split_ok || !h2.authority_is_valid(s) || !h2.authority_is_valid(spec.hostname) {
 		errorf(l, "%s: cannot parse %q", path, raw)
 		return {}, false
 	}
@@ -1508,6 +1535,10 @@ load_block_lists :: proc(l: ^Loader, n: ^yaml.Node, path: string) -> []Block_Lis
 				continue
 			}
 			if strings.has_prefix(s, "http://") || strings.has_prefix(s, "https://") {
+				if !url_is_valid(s) {
+					errorf(l, "%s[%d]: %s", path, i, LIST_URL_RULE)
+					continue
+				}
 				bl.url = s
 			} else {
 				bl.file = s
@@ -1540,6 +1571,10 @@ load_block_lists :: proc(l: ^Loader, n: ^yaml.Node, path: string) -> []Block_Lis
 		}
 		if bl.url == "" && bl.file == "" {
 			errorf(l, "%s: needs either a url or a file", item_path)
+			continue
+		}
+		if !url_is_valid(bl.url) {
+			errorf(l, "%s.url: %s", item_path, LIST_URL_RULE)
 			continue
 		}
 		if bl.name == "" {
@@ -2452,6 +2487,8 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 
 	if cfg.listeners.doh.enabled && !strings.has_prefix(cfg.listeners.doh.path, "/") {
 		errorf(l, "listeners.doh.path: must start with '/'")
+	} else if cfg.listeners.doh.enabled && !http_path_is_valid(cfg.listeners.doh.path) {
+		errorf(l, "listeners.doh.path: %s", HTTP_PATH_RULE)
 	}
 	// The profile endpoint shares the DoH listener, so it has to be a path of its
 	// own: absolute, and not the one that answers queries — a request cannot be
@@ -2459,6 +2496,8 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	if cfg.listeners.doh.enabled && cfg.listeners.doh.mobileconfig_path != "" {
 		if !strings.has_prefix(cfg.listeners.doh.mobileconfig_path, "/") {
 			errorf(l, "listeners.doh.mobileconfig_path: must start with '/'")
+		} else if !http_path_is_valid(cfg.listeners.doh.mobileconfig_path) {
+			errorf(l, "listeners.doh.mobileconfig_path: %s", HTTP_PATH_RULE)
 		}
 		if cfg.listeners.doh.mobileconfig_path == cfg.listeners.doh.path {
 			errorf(l, "listeners.doh.mobileconfig_path: must not be the same as listeners.doh.path")
@@ -2468,6 +2507,8 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	if cfg.metrics.enabled {
 		if !strings.has_prefix(cfg.metrics.path, "/") {
 			errorf(l, "metrics.path: must start with '/'")
+		} else if !http_path_is_valid(cfg.metrics.path) {
+			errorf(l, "metrics.path: %s", HTTP_PATH_RULE)
 		}
 		// Port 0 binds and works, on whichever port the kernel picked - which
 		// nothing can be told to scrape. Refused here rather than left as an
@@ -2909,3 +2950,43 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 		}
 	}
 }
+
+@(private)
+HTTP_PATH_RULE :: "must be visible ASCII with no '?' or '#'"
+
+/*
+Whether a request can reach `path` at all. It is compared with the target's path
+exactly, and the HTTP readers split the target at `?`, a client never sends a
+fragment, and a request whose target holds a space, a control or a byte outside
+ASCII is refused before it is routed (RFC 9112 3.2, #438). A path outside that
+is an endpoint that comes up and answers nothing.
+*/
+@(private)
+http_path_is_valid :: proc(path: string) -> bool {
+	return h2.target_is_valid(path) && strings.index_any(path, "?#") < 0
+}
+
+/*
+Printable ASCII and no space, the rule the readers hold a request target to
+(`h2.target_is_valid`): an https upstream's url and hostname go into the request
+line and `Host` of every query sent to it, so a CR LF there is a field of the
+config's making in each one, and a space or a byte outside ASCII a request line
+the upstream reads some other way (#438).
+*/
+@(private)
+UPSTREAM_URL_RULE :: "the url and hostname of an https upstream must be visible ASCII, the host with no userinfo, path, query or fragment"
+
+// `h2.authority_is_valid`, which an upstream's address and hostname are held to.
+@(private)
+HOST_RULE :: "must be visible ASCII with no userinfo, path, query or fragment"
+
+// A url is a target, and its host is the `Host` and `:authority` it is sent with.
+@(private)
+url_is_valid :: proc(url: string) -> bool {
+	_, host, _, _, _ := net.split_url(url, context.temp_allocator)
+	return h2.target_is_valid(url) && h2.authority_is_valid(host)
+}
+
+// A list url goes into a request line and `Host` the same way.
+@(private)
+LIST_URL_RULE :: "a list url must be visible ASCII, its host with no userinfo"

@@ -2,6 +2,7 @@ package h2
 
 import "core:encoding/hex"
 import "core:mem"
+import "core:strings"
 import "core:sync"
 import "core:testing"
 import "core:thread"
@@ -2355,6 +2356,8 @@ Request_Log :: struct {
 	rst_code:   Error_Code,
 	goaway:     bool,
 	dispatched: int,
+	// The last dispatched request's, cloned onto the temporary allocator.
+	authority:  string,
 }
 
 @(private = "file")
@@ -2389,6 +2392,7 @@ counting_handler :: proc(conn: ^Conn, req: ^Request) {
 	log := cast(^Request_Log)conn.user
 	if log != nil {
 		log.dispatched += 1
+		log.authority = strings.clone(req.authority, context.temp_allocator)
 	}
 	request_destroy(conn, req)
 }
@@ -2703,6 +2707,131 @@ test_malformed_requests_are_reset :: proc(t: ^testing.T) {
 			},
 		},
 		{"CONNECT without :authority", {{":method", "CONNECT"}}},
+		// `:authority` is CONNECT's request target and everyone else's `Host`.
+		{"CONNECT :authority with a tab", {{":method", "CONNECT"}, {":authority", "a.example\tb.example:443"}}},
+		{
+			":authority with a space",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example x"},
+				{":path", "/dns-query"},
+			},
+		},
+		{
+			"host in place of :authority, with a tab",
+			{{":method", "GET"}, {":scheme", "https"}, {":path", "/dns-query"}, {"host", "dns.example\tx"}},
+		},
+		// 8.3.1: a Host that names another entity than `:authority` is
+		// malformed, and a repeated one is two answers to which that is.
+		{
+			"host that disagrees with :authority",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "a.example"},
+				{":path", "/dns-query"},
+				{"host", "b.example"},
+			},
+		},
+		{
+			"host repeated",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":path", "/dns-query"},
+				{"host", "a.example"},
+				{"host", "b.example"},
+			},
+		},
+		// 8.3.1: no userinfo, and uri-host [":" port] holds no path either.
+		{":authority with userinfo", {{":method", "GET"}, {":scheme", "https"}, {":authority", "a.example@b.example"}, {":path", "/dns-query"}}},
+		{":authority with a path", {{":method", "GET"}, {":scheme", "https"}, {":authority", "a.example/x"}, {":path", "/dns-query"}}},
+		{":authority with a backslash", {{":method", "GET"}, {":scheme", "https"}, {":authority", "a.example\\x"}, {":path", "/dns-query"}}},
+		{"host with userinfo", {{":method", "GET"}, {":scheme", "https"}, {":path", "/dns-query"}, {"host", "a.example@b.example"}}},
+		// RFC 9112 3.2: the target an h2-to-h1 hop would write into a request line.
+		{
+			":path with a space",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/allowed /dns-query"},
+			},
+		},
+		{
+			":path with a tab",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/allowed\t/dns-query"},
+			},
+		},
+		{
+			":path with a DEL",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query\x7f"},
+			},
+		},
+		{
+			":path outside ASCII",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query?dns=\u00c9"},
+			},
+		},
+		// RFC 9113 8.3.1 / RFC 9110 9.1: a method is a token (#438).
+		{
+			":method with a delimiter",
+			{
+				{":method", "GE(T"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+			},
+		},
+		{
+			":method with a VT",
+			{
+				{":method", "GET\x0b"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+			},
+		},
+		{
+			":method with a tab",
+			{
+				{":method", "POST\t/allowed"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+			},
+		},
+		{
+			":method with a space",
+			{
+				{":method", "GET /x"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+			},
+		},
+		{
+			":method outside ASCII",
+			{
+				{":method", "G\u00c9T"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+			},
+		},
 	}
 
 	for c in cases {
@@ -2784,6 +2913,18 @@ test_conformant_requests_are_served :: proc(t: ^testing.T) {
 		// No :authority: legal, and what a client with no authority to convey
 		// sends. Only :method, :scheme and :path are mandatory.
 		{"no :authority", {{":method", "GET"}, {":scheme", "https"}, {":path", "/dns-query"}}},
+		// 8.3.1: `host` in its place, or beside one it agrees with up to case.
+		{"host in place of :authority", {{":method", "GET"}, {":scheme", "https"}, {":path", "/dns-query"}, {"host", "dns.example"}}},
+		{
+			"host agreeing with :authority",
+			{
+				{":method", "GET"},
+				{":scheme", "https"},
+				{":authority", "dns.example"},
+				{":path", "/dns-query"},
+				{"host", "DNS.example"},
+			},
+		},
 		// The other side of the case-insensitivity above: an uppercase scheme
 		// names https rather than some scheme this specification says nothing
 		// about, so the origin-form :path it carries is served as it stands.
@@ -2836,6 +2977,11 @@ test_conformant_requests_are_served :: proc(t: ^testing.T) {
 		testing.expectf(t, log.rsts == 0, "%s: a conformant request drew an RST_STREAM", c.what)
 		testing.expectf(t, !log.goaway, "%s: a conformant request drew a GOAWAY", c.what)
 		testing.expectf(t, log.dispatched == 1, "%s: %d requests reached the handler, want 1", c.what, log.dispatched)
+		// The two `host` cases: the handler sees an authority either way, and
+		// the `:authority` one when both are sent.
+		if strings.has_prefix(c.what, "host ") {
+			testing.expectf(t, log.authority == "dns.example", "%s: authority %q, want dns.example", c.what, log.authority)
+		}
 
 		close_stream(conn, 1)
 		conn_unref(conn)
