@@ -82,10 +82,12 @@ MATCH_SCRATCH :: 2 * MAX_REGEX_PROGRAM * size_of(virtual_machine.Thread) + (MAX_
 
 Regex_Rule :: struct {
 	// As written between the slashes, for `$badfilter` and duplicates.
-	pattern: string,
-	re:      regex.Regular_Expression,
+	pattern:  string,
+	re:       regex.Regular_Expression,
 	// `regex_cost(re)`, what it holds of the set's budget.
-	cost:    int,
+	cost:     int,
+	// `regex_shortcut(pattern)`: a name not holding it is not matched.
+	shortcut: string,
 }
 
 /*
@@ -132,12 +134,16 @@ regex_add :: proc(s: ^Set, pattern: string) -> (stored: bool) {
 	}
 	// Compiled into the scratch arena first, so a refused program leaves
 	// nothing behind in the set, then again into the set's own arena.
-	if trial, err := regex.create(pattern, REGEX_FLAGS, temp, temp); err != nil || len(trial.program) > MAX_REGEX_PROGRAM {
+	trial, trial_err := regex.create(pattern, REGEX_FLAGS, temp, temp)
+	if trial_err != nil || len(trial.program) > MAX_REGEX_PROGRAM {
 		return false
-	} else if _, matches_empty := regex.match_and_allocate_capture(trial, "", temp, temp); matches_empty {
-		// `/ads|/`, `/x*/`, `/^/`: matches every name, as `//` would.
+	}
+	if _, matches_empty := regex.match_and_allocate_capture(trial, "", temp, temp); matches_empty {
+		// `/ads|/`, `/x*/`, `/^/`: matches every name it is tried on.
 		return false
-	} else if s.regex_bytes + regex_cost(trial) > MAX_REGEX_TOTAL {
+	}
+	cost := regex_cost(trial)
+	if s.regex_bytes + cost > MAX_REGEX_TOTAL {
 		s.regex_refused += 1
 		return false
 	}
@@ -145,7 +151,8 @@ regex_add :: proc(s: ^Set, pattern: string) -> (stored: bool) {
 	if err != nil {
 		return false
 	}
-	kept := Regex_Rule{strings.clone(pattern, s.allocator), re, regex_cost(re)}
+	shortcut := strings.clone(regex_shortcut(pattern, temp), s.allocator)
+	kept := Regex_Rule{strings.clone(pattern, s.allocator), re, cost, shortcut}
 	append(&s.regexes, kept)
 	s.regex_bytes += kept.cost
 	s.count += 1
@@ -205,7 +212,15 @@ regex_lookup :: proc(s: ^Set, normalised: string) -> bool {
 	arena: mem.Arena
 	mem.arena_init(&arena, buf[:])
 	scratch := mem.arena_allocator(&arena)
+	// The URL urlfilter builds for a name, which a rule's shortcut is looked for in.
+	url_buf: [len(URL_PREFIX) + MAX_REGEX_NAME]u8
+	copy(url_buf[:], URL_PREFIX)
+	copy(url_buf[len(URL_PREFIX):], normalised)
+	url := string(url_buf[:len(URL_PREFIX) + len(normalised)])
 	for r in s.regexes {
+		if !strings.contains(url, r.shortcut) {
+			continue
+		}
 		mem.arena_free_all(&arena)
 		_, matched := regex.match_and_allocate_capture(r.re, normalised, scratch, scratch)
 		if matched {
@@ -213,6 +228,64 @@ regex_lookup :: proc(s: ^Set, normalised: string) -> bool {
 		}
 	}
 	return false
+}
+
+@(private)
+URL_PREFIX :: "http://"
+
+/*
+urlfilter's `findRegexpShortcut`: the longest run of the pattern holding no
+regex metacharacter, once everything from the first `{`, `(` or `[` to the last
+of its kind is dropped. `NetworkRule.Match` tries a rule only on a request whose
+URL, `http://` and the name, holds that run (`matchShortcut`), so AdGuard Home
+never matches `/ads|tracker/` against `ads.example` - the run is `tracker` - nor
+`/\bads/` against anything, since `\b` leaves a `b` glued to `ads`. Without the
+same test elodin would block names no AdGuard Home install ever has. None, as
+there, for a pattern holding a `?` or a run of one character.
+*/
+@(private)
+regex_shortcut :: proc(pattern: string, allocator: mem.Allocator) -> string {
+	if strings.contains(pattern, "?") {
+		return ""
+	}
+	p := strings.concatenate({"...", pattern}, allocator)
+	p = strip_brackets(p, '{', '}', allocator)
+	p = strip_brackets(p, '(', ')', allocator)
+	p = strip_brackets(p, '[', ']', allocator)
+	longest := ""
+	start := 0
+	for i := 0; i <= len(p); i += 1 {
+		if i == len(p) || strings.index_byte(`\^$*+?.()|[]{}`, p[i]) >= 0 {
+			if i - start > len(longest) {
+				longest = p[start:i]
+			}
+			start = i + 1
+		}
+	}
+	if len(longest) <= 1 {
+		return ""
+	}
+	return strings.to_lower(longest, allocator)
+}
+
+/*
+Go's `([^\\])\{.*[^\\]\}` replaced by `$1...`, as `findRegexpShortcut` does it:
+from the first `{` after a byte other than `\` to the last `}` after one, at
+least a byte apart. Being greedy, that match is the only one.
+*/
+@(private)
+strip_brackets :: proc(p: string, open, close: u8, allocator: mem.Allocator) -> string {
+	for s := 0; s + 1 < len(p); s += 1 {
+		if p[s] == '\\' || p[s + 1] != open {
+			continue
+		}
+		for j := len(p) - 1; j >= s + 3; j -= 1 {
+			if p[j] == close && p[j - 1] != '\\' {
+				return strings.concatenate({p[:s + 1], "...", p[j + 1:]}, allocator)
+			}
+		}
+	}
+	return p
 }
 
 /*
@@ -238,7 +311,9 @@ run as Odin reads it, so a list cannot block a name AdGuard Home would not:
 
 Empty is refused too, because urlfilter would match every name with it, which no
 list author means by `//`; `regex_add` refuses any other pattern that matches
-the empty string, such as `ads|` or `x*`, for the same reason.
+the empty string, such as `ads|` or `x*`, for the same reason: it matches
+every name its shortcut lets it be tried on, and every name when it has none.
+AdGuard Home keeps them; a typo is the likelier author.
 */
 @(private)
 regex_pattern_ok :: proc(pattern: string) -> bool {

@@ -286,6 +286,11 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 	(`findOptionsDelimiter`); every other rule splits at the first.
 	*/
 	options_at := strings.index_byte(line, '$')
+	// `$$` and `$@$` open an HTML filtering rule, not a modifier list. urlfilter
+	// looks for them at the first `$` whatever the rule, so `/a$$/` is one too.
+	if options_at >= 0 && (strings.has_prefix(line[options_at:], "$$") || strings.has_prefix(line[options_at:], "$@$")) {
+		return 0
+	}
 	is_regex := strings.has_prefix(line, "/")
 	if is_regex {
 		options_at = -1 if strings.has_suffix(line, "/") && len(line) > 1 else last_options_delimiter(line)
@@ -294,10 +299,6 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 	if idx := options_at; idx >= 0 {
 		modifiers := line[idx + 1:]
 		line = line[:idx]
-		// `$$` and `$@$` open an HTML filtering rule, not a modifier list.
-		if strings.has_prefix(modifiers, "$") || strings.has_prefix(modifiers, "@$") {
-			return 0
-		}
 		for m in strings.split_iterator(&modifiers, ",") {
 			name := strings.trim_space(m)
 			if eq := strings.index_byte(name, '='); eq >= 0 {

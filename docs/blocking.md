@@ -62,6 +62,13 @@ and without the trailing dot, case-insensitively, anywhere in the name unless
 anchored with `^` and `$`. `@@/…/` is an allow rule, and `$important`,
 `$third-party` and `$badfilter` work as for any other rule.
 
+As in AdGuard Home, a rule is only tried on a name holding its longest literal
+run, the text left once everything from the first `{`, `(` or `[` to the last of
+its kind is dropped and the rest is split at every regex metacharacter. So
+`/ads|tracker/` matches only names holding `tracker`, and `/\bads/` none, since
+`\b` leaves a `b` in front of `ads`. A pattern holding a `?`, or whose longest
+run is one character, has no such run and is tried on every name.
+
 Regex rules are tried after the domain rules: an allow regex when no allow rule
 matched, a block regex when no domain rule did. A match runs in time linear in
 the name, so no pattern can make a query backtrack. What a list
@@ -94,7 +101,8 @@ both sets.
   elodin's engine reads as a comment and no name holds. The last drops the
   AdGuard DNS filter's one allow regex, which needs a `#` in the name.
   Also an empty `//` or any pattern that matches the empty string (`/ads|/`,
-  `/x*/`), which would block every name, and any byte outside printable ASCII
+  `/x*/`), which would block every name the
+  rule is tried on (every name at all when it has no shortcut), and any byte outside printable ASCII
   (write an international name as punycode).
 - Once a set's budget refuses a pattern, every later one is dropped too. The
   count is logged once at load: `filter: N regex rules skipped: a set holds 8192

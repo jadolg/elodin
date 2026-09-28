@@ -141,6 +141,40 @@ test_regex_rule_in_a_domains_list :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(f.allow.regexes), 0)
 }
 
+/*
+urlfilter tries a rule only on a name whose `http://` URL holds the pattern's
+longest literal run, so these are what AdGuard Home blocks, checked against its
+`DNSEngine`: an alternation matches only through its longest branch, an escape
+glues its letter to the literal after it, and a `?` turns the test off.
+*/
+@(test)
+test_regex_rule_needs_its_shortcut :: proc(t: ^testing.T) {
+	e := engine_of("/ads|tracker/\n/\\bpixel\\b/\n/^beacon\\d?\\./\n")
+	defer engine_destroy(e)
+	testing.expect_value(t, engine_match(e, "ads.example."), Decision.None)
+	testing.expect_value(t, engine_match(e, "tracker.example."), Decision.Blocked)
+	testing.expect_value(t, engine_match(e, "pixel.example."), Decision.None)
+	testing.expect_value(t, engine_match(e, "beacon.example."), Decision.Blocked)
+	testing.expect_value(t, engine_match(e, "beacon7.example."), Decision.Blocked)
+
+	testing.expect_value(t, regex_shortcut(`^(a|c)\.[0-9a-f]{56}\.com$`, context.temp_allocator), "com")
+	testing.expect_value(t, regex_shortcut(`^ADS\d+`, context.temp_allocator), "ads")
+	testing.expect_value(t, regex_shortcut(`a{2}b\{c}d`, context.temp_allocator), "")
+	testing.expect_value(t, regex_shortcut(`x\(ab)`, context.temp_allocator), "ab")
+}
+
+// urlfilter reads a `$$` or `$@$` at the first `$` as an HTML filtering rule,
+// which DNS never applies, a regex rule's included.
+@(test)
+test_regex_html_rule_marker :: proc(t: ^testing.T) {
+	block, allow := set_make(), set_make()
+	defer set_destroy(block)
+	defer set_destroy(allow)
+	testing.expect_value(t, parse_rule(block, allow, "/ads$$/"), 0)
+	testing.expect_value(t, parse_rule(block, allow, "/ads$@$x/"), 0)
+	testing.expect_value(t, parse_rule(block, allow, "/ads$/"), 1)
+}
+
 @(test)
 test_regex_rules_that_are_refused :: proc(t: ^testing.T) {
 	block, allow := set_make(), set_make()
@@ -278,7 +312,8 @@ test_regex_hash_is_no_comment :: proc(t: ^testing.T) {
 	testing.expect_value(t, engine_match(e, "img.png.example."), Decision.None)
 }
 
-// What RE2 and Odin read the same way is kept, and means what RE2 means.
+// What RE2 and Odin read the same way is kept, and means what RE2 means. The
+// `\B` is written beside a group, not a letter, so its shortcut stays empty.
 @(test)
 test_regex_syntax_both_engines_share :: proc(t: ^testing.T) {
 	src := `/^\w+\.\d{2}\b/
@@ -286,7 +321,7 @@ test_regex_syntax_both_engines_share :: proc(t: ^testing.T) {
 /^(?:ab+)+\.test$/
 /^[\w-]+\.dash\.test$/
 /^\S+\.\D\.test$/
-/\Bmid\B/
+/.\B(mid)\B./
 `
 	e := engine_of(src)
 	defer engine_destroy(e)
