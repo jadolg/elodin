@@ -83,7 +83,10 @@ both sets.
   RE2: lookaround (`(?=`), inline flags (`(?i)`), escaped letters or digits
   other than `\d \D \w \W \s \S \b \B` (so `\1`, `\x41`, `\A`, `\z`), POSIX
   classes (`[[:alpha:]]`), `{,M}`, a repeat of a repeat (`a**`, `a{2}{3}`), more than nine `(…)` groups (write `(?:…)`),
-  a `)` with no `(`, a class range running backwards (`[a-Z]`), a range
+  a `)` with no `(`, a class range running backwards (`[a-Z]`) or ending in
+  an escape (`[+-\.]`), a `-` after a range with a single character before
+  it in the class (`[ab-c-e]`), a `-` after `\d`, `\w` or `\s` that is not last
+  (`[\d-z]`), a range
   holding capitals but not their lower case, or running from a capital to a
   lower-case letter (`[0-Z]`, `[A-z]`), `\b` or `\B`
   inside a class, a class opening with `]` (`[]a]`), and a `#`, which

@@ -125,6 +125,13 @@ test_regex_rule_in_a_domains_list :: proc(t: ^testing.T) {
 	testing.expect_value(t, engine_match(e, "ads7.example."), Decision.Blocked)
 	// `-` makes it an allow rule, as it does a domain.
 	testing.expect_value(t, engine_match(e, "ads1.example."), Decision.Allowed)
+
+	// A `!` or `#` opens a comment in such a list; one inside the slashes
+	// would leave a shorter pattern that matches far more.
+	f := engine_of("/q/!x/\n/^kept\\./ # a comment\n", .Domains)
+	defer engine_destroy(f)
+	testing.expect_value(t, engine_match(f, "q.example."), Decision.None)
+	testing.expect_value(t, engine_match(f, "kept.example."), Decision.Blocked)
 }
 
 @(test)
@@ -180,6 +187,20 @@ test_regex_rules_that_are_refused :: proc(t: ^testing.T) {
 		// Odin takes a rune before `\d` as the start of `\d-z`'s range.
 		`/[a\d-z]/`,
 		`/[a-\d]/`,
+		// Odin's `-` takes the last single rune it holds as a range's start,
+		// even one before a range: `[ab-c-e]` is `b-c` and `a-e` to it, where
+		// RE2 reads `b-c`, `-` and `e`.
+		`/[ab-c-e]/`,
+		// Odin ends a range at a `\`, and reads what it escapes on its own:
+		// `[+-\.]` holds every digit and capital to it.
+		`/[+-\.]/`,
+		// Both read these alike, but only by what Odin's `\d` and `\w` leave
+		// held, which is refused rather than relied on.
+		`/[\d-z]/`,
+		`/[\w-_]/`,
+		// A range from a literal `-`: RE2 has one, Odin reads three runes.
+		`/[--/]/`,
+		`/[a-c--/]/`,
 		// RE2 refuses `\b` in a class, Odin reads it as `b`; Odin reads `[]`
 		// and `[^]` as empty, RE2 as a class opening with `]`.
 		`/[\b]ads/`,
@@ -200,9 +221,37 @@ test_regex_rules_that_are_refused :: proc(t: ^testing.T) {
 	engine_swap(e, nil, nil)
 
 	// What RE2 reads the same way is still kept.
-	for rule in ([]string{`/[a-z0-9-]/`, `/[-a]/`, `/[\w-]/`, `/[\--z]/`, `/[a-c-e]/`, `/[A-Z]/`, `/[!-~]/`, `/(a)(b)/`, `/\)/`, `/[)]/`}) {
+	for rule in ([]string{`/[a-z0-9-]/`, `/[-a]/`, `/[\w-]/`, `/[\--z]/`, `/[a-c-e]/`, `/[a-z0-9-_]/`, `/[\da-z]/`, `/[A-Z]/`, `/[!-~]/`, `/(a)(b)/`, `/\)/`, `/[)]/`}) {
 		testing.expectf(t, parse_rule(block, allow, rule) == 1, "%q was refused", rule)
 	}
+}
+
+// A class ending in a range up to `\\` reached an assertion in Odin's parser,
+// which a release build keeps: one list line took the server down at load.
+@(test)
+test_regex_class_range_to_an_escape :: proc(t: ^testing.T) {
+	block, allow := set_make(), set_make()
+	defer set_destroy(block)
+	defer set_destroy(allow)
+	for rule in ([]string{`/[[-\\]/`, `/[\\-\\]/`}) {
+		testing.expectf(t, parse_rule(block, allow, rule) == 0, "%q was added", rule)
+	}
+}
+
+// Odin's optimizer folds `z|\W` into one class and loses the negation; with it
+// on, this blocked `a`.
+@(test)
+test_regex_negated_class_in_an_alternation :: proc(t: ^testing.T) {
+	e := engine_of("/^(z|\\W)$/\n/^(\\S|0)$/\n")
+	defer engine_destroy(e)
+	testing.expect_value(t, engine_match(e, "a"), Decision.Blocked)
+	testing.expect_value(t, engine_match(e, "z"), Decision.Blocked)
+	testing.expect_value(t, engine_match(e, "-"), Decision.Blocked)
+	testing.expect_value(t, engine_match(e, "ab"), Decision.None)
+	e2 := engine_of("/^(z|\\W)$/\n")
+	defer engine_destroy(e2)
+	testing.expect_value(t, engine_match(e2, "a"), Decision.None)
+	testing.expect_value(t, engine_match(e2, "-"), Decision.Blocked)
 }
 
 // The AdGuard DNS filter's one allow regex needs a `#` in the name, which none

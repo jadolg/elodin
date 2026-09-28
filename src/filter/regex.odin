@@ -60,8 +60,15 @@ client chooses. A name that long is no hostname, so no rule meant it.
 */
 MAX_REGEX_NAME :: 253
 
+/*
+Without the optimizer: its alternation-to-class rewrite merges a negated class
+as a plain one, so `z|\W` matched `a`. A differential run against Go's regexp
+over 120,000 random patterns found that and nothing else once it was off, and
+the AdGuard DNS filter's patterns come to 32 bytes more without it. It also
+makes the tree `program_bound` measures the one that is compiled.
+*/
 @(private)
-REGEX_FLAGS :: regex.Flags{.No_Capture, .Case_Insensitive}
+REGEX_FLAGS :: regex.Flags{.No_Capture, .Case_Insensitive, .No_Optimization}
 
 /*
 What `regex.match` asks of its temporary allocator: the VM's two thread arrays
@@ -290,11 +297,20 @@ tokens_ok :: proc(pattern: string) -> bool {
 
 /*
 The ranges in a class's text, read as Go's `parseClass` reads them: `lo-hi`
-with `hi` not below `lo`. A `-` next to `\d`, `\w` or `\s` and not at the end is
-refused too: Odin takes the rune before the escape as a range's start there,
-where RE2 reads the `-` as itself or refuses the pattern. `regex_pattern_ok`
-has already held an escaped letter to those classes and `\b \B`, which RE2
-refuses inside a class and Odin reads as the letter.
+with `hi` not below `lo`. `regex_pattern_ok` has already held an escaped letter
+to `\d \D \w \W \s \S` and `\b \B`, which RE2 refuses inside a class and Odin
+reads as the letter.
+
+Odin's parser makes a range of any `-` not at the end while it holds a single
+rune, popping the last one it pushed, where RE2 starts a range only from the
+element just before. The two agree when that element is a literal, which is the
+last rune pushed, and when Odin holds nothing, where both read the `-` as
+itself (`[a-c-e]`). After a range or a class escape with a literal still held
+(`[ab-c-e]`, `[a\d-z]`) they do not, and how many runes a class escape leaves
+held is Odin's business, so after one a `-` that is not a range's is refused
+(`[\d-z]`). Odin also ends a range at a `\` and reads what it escapes on its
+own, so a range may not end in an escape: `[+-\.]` would hold the digits, and
+`[[-\\]` trips an assertion in its parser.
 
 An empty class is refused: Odin reads `[]a]` and `[^]a]` as the empty class then
 `a]`, where RE2 reads a class holding `]` and `a`.
@@ -305,37 +321,55 @@ class_ranges_ok :: proc(class: string) -> bool {
 	if text == "" {
 		return false
 	}
-	// The literal last read, -1 after a class escape, -2 at the start or
-	// after a range.
+	// The literal last read, -1 after a class escape, -2 at the start, -3
+	// after a range, -4 after a literal `-`.
 	prev := -2
+	// Literals Odin's parser holds for a `-` to pop, and whether a class
+	// escape has left it holding some number of its own.
+	held := 0
+	after_escape := false
 	for i := 0; i < len(text); i += 1 {
 		c := int(text[i])
-		if c == '-' && prev != -2 && i + 1 < len(text) {
-			if prev == -1 {
-				return false
-			}
-			i += 1
-			hi := int(text[i])
-			if hi == '\\' && i + 1 < len(text) {
-				i += 1
-				if strings.index_byte("dDwWsSbB", text[i]) >= 0 {
+		if c == '-' && i + 1 < len(text) && prev != -2 {
+			if prev < 0 {
+				if held > 0 || after_escape {
 					return false
 				}
-				hi = int(text[i])
+				// Both read it as itself.
+				held, prev = 1, -4
+				continue
 			}
+			i += 1
+			if text[i] == '\\' {
+				return false
+			}
+			hi := int(text[i])
 			if hi < prev || !range_folds_alike(prev, hi) {
 				return false
 			}
-			prev = -2
+			held -= 1
+			prev = -3
 			continue
 		}
 		if c == '\\' && i + 1 < len(text) {
 			i += 1
-			if text[i] == 'b' || text[i] == 'B' {
+			switch text[i] {
+			case 'b', 'B':
 				return false
+			case 'd', 'D', 'w', 'W', 's', 'S':
+				after_escape = true
+				prev = -1
+				continue
 			}
-			c = -1 if strings.index_byte("dDwWsS", text[i]) >= 0 else int(text[i])
+			c = int(text[i])
+		} else if c == '-' {
+			// A literal `-` Odin never starts a range from, where RE2 does:
+			// `[--/]` is `-` to `/` in RE2 and `-`, `-`, `/` in Odin.
+			held += 1
+			prev = -4
+			continue
 		}
+		held += 1
 		prev = c
 	}
 	return true

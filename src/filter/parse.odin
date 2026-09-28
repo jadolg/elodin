@@ -216,8 +216,14 @@ parse_domain_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 		line = strings.trim_space(line[1:])
 	}
 	// A `/` is never part of a domain, so a line opening with one is a regex
-	// rule, and an allow rule after a `-`.
+	// rule, and an allow rule after a `-`. A comment has to be set off by a
+	// space: a `!` or `#` cut inside the slashes (`/a/!b/`) would leave a
+	// shorter pattern that matches far more names.
 	if strings.has_prefix(line, "/") {
+		kept := strip_line_comment(raw)
+		if len(kept) < len(raw) && strings.trim_right_space(kept) == kept {
+			return 0
+		}
 		return parse_adblock_line(target, allow, line)
 	}
 	flags := Rule_Flags{.Apex, .Subdomains}
