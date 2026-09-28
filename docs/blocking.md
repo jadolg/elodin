@@ -82,7 +82,8 @@ both sets.
 - Refused, as syntax elodin's engine would read differently from AdGuard Home's
   RE2: lookaround (`(?=`), inline flags (`(?i)`), escaped letters or digits
   other than `\d \D \w \W \s \S \b \B` (so `\1`, `\x41`, `\A`, `\z`), POSIX
-  classes (`[[:alpha:]]`), `{,M}`, a repeat of a repeat (`a**`, `a{2}{3}`), more than nine `(…)` groups (write `(?:…)`),
+  classes (`[[:alpha:]]`), `{,M}`, a count with a leading zero, sign or `_`
+  (`{02}`, `{+2}`, `{1_0}`, which RE2 reads as characters), a repeat of a repeat (`a**`, `a{2}{3}`), more than nine `(…)` groups (write `(?:…)`),
   a `)` with no `(`, a class range running backwards (`[a-Z]`) or ending in
   an escape (`[+-\.]`), a `-` after a range with a single character before
   it in the class (`[ab-c-e]`), a `-` after `\d`, `\w` or `\s` that is not last

@@ -268,7 +268,8 @@ regex_pattern_ok :: proc(pattern: string) -> bool {
 What has to be read from the pattern's own tokens, because the parsed tree
 no longer shows it.
 
-  - Every `{N,M}` count at most `MAX_REGEX_REPEAT`. The parser reads a count as
+  - Every `{N,M}` count bare digits with no leading zero, as RE2 reads one, and
+    at most `MAX_REGEX_REPEAT`. The parser reads a count as
     a u64 and stores it as an int, so `{0,18446744073709551615}` arrives as
     `{0,}` and cannot be told from it, and a pair past `max(i64)` arrives as a
     shape the compiler has no case for and panics on. Past 1000 RE2 - and so
@@ -309,6 +310,12 @@ tokens_ok :: proc(pattern: string) -> bool {
 			for count in strings.split_iterator(&counts, ",") {
 				if count == "" {
 					continue
+				}
+				// RE2 takes a count only as bare digits without a leading
+				// zero, and `{02}`, `{+2}` or `{1_0}` as characters; Odin's
+				// strconv reads all three as numbers.
+				if strings.trim_left(count, "0123456789") != "" || (len(count) > 1 && count[0] == '0') {
+					return false
 				}
 				n, ok := strconv.parse_u64_of_base(count, 10)
 				if !ok || n > MAX_REGEX_REPEAT {

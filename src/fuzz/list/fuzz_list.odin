@@ -1,5 +1,6 @@
 package fuzz_list
 
+import "core:strings"
 import "elodin:filter"
 import "elodin:fuzz/harness"
 
@@ -35,11 +36,8 @@ fuzz_one :: proc "c" (data: [^]u8, size: uint) -> i32 {
 	defer filter.engine_destroy(e)
 	filter.engine_swap(e, block, allow)
 	name := text
-	for c, i in transmute([]u8)text {
-		if c == '\n' {
-			name = text[:i]
-			break
-		}
+	if i := strings.index_byte(text, '\n'); i >= 0 {
+		name = text[:i]
 	}
 	_ = filter.engine_match(e, name)
 	// The sets are the deferred destroys' to free, not the engine's.

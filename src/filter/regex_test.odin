@@ -174,6 +174,13 @@ test_regex_rules_that_are_refused :: proc(t: ^testing.T) {
 		`/a**/`,
 		`/a+?+/`,
 		`/a\/`,
+		// A count RE2 reads as characters - a leading zero, a sign, a `_` -
+		// and Odin's strconv reads as a number: `^a{02}$` would block `aa`.
+		`/^a{02}$/`,
+		`/^a{2,03}$/`,
+		`/^a{+2}$/`,
+		`/^a{1_0}$/`,
+		`/^a{2,_3}$/`,
 		// A `#` opens a comment to Odin's tokenizer, so `ads#x` would be `ads`.
 		`/ads#x/`,
 		`/a[#]/`,
