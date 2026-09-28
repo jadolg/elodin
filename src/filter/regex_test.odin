@@ -169,6 +169,14 @@ test_regex_rules_that_are_refused :: proc(t: ^testing.T) {
 		`/[a-Z]/`,
 		`/[^a-Z]/`,
 		`/[b-\.]/`,
+		// RE2's `(?i)` folds every letter in a range; Odin folds only a range
+		// whose ends are both letters, and then only its ends, so these would
+		// miss a name's `b` (the first three) or `_` (the last two).
+		`/[\.-a]/`,
+		`/[0-Z]/`,
+		`/[5-C]/`,
+		`/[A-z]/`,
+		`/[Z-a]/`,
 		// Odin takes a rune before `\d` as the start of `\d-z`'s range.
 		`/[a\d-z]/`,
 		`/[a-\d]/`,
@@ -192,7 +200,7 @@ test_regex_rules_that_are_refused :: proc(t: ^testing.T) {
 	engine_swap(e, nil, nil)
 
 	// What RE2 reads the same way is still kept.
-	for rule in ([]string{`/[a-z0-9-]/`, `/[-a]/`, `/[\w-]/`, `/[\--z]/`, `/[a-c-e]/`, `/[\.-a]/`, `/(a)(b)/`, `/\)/`, `/[)]/`}) {
+	for rule in ([]string{`/[a-z0-9-]/`, `/[-a]/`, `/[\w-]/`, `/[\--z]/`, `/[a-c-e]/`, `/[A-Z]/`, `/[!-~]/`, `/(a)(b)/`, `/\)/`, `/[)]/`}) {
 		testing.expectf(t, parse_rule(block, allow, rule) == 1, "%q was refused", rule)
 	}
 }

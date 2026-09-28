@@ -82,8 +82,10 @@ both sets.
 - Refused, as syntax elodin's engine would read differently from AdGuard Home's
   RE2: lookaround (`(?=`), inline flags (`(?i)`), escaped letters or digits
   other than `\d \D \w \W \s \S \b \B` (so `\1`, `\x41`, `\A`, `\z`), POSIX
-  classes (`[[:alpha:]]`), `{,M}`, a repeat of a repeat (`a**`, `a{2}{3}`),
-  a `)` with no `(`, a class range running backwards (`[a-Z]`), `\b` or `\B`
+  classes (`[[:alpha:]]`), `{,M}`, a repeat of a repeat (`a**`, `a{2}{3}`), more than nine `(…)` groups (write `(?:…)`),
+  a `)` with no `(`, a class range running backwards (`[a-Z]`), a range
+  holding capitals but not their lower case, or running from a capital to a
+  lower-case letter (`[0-Z]`, `[A-z]`), `\b` or `\B`
   inside a class, a class opening with `]` (`[]a]`), and a `#`, which
   elodin's engine reads as a comment and no name holds. The last drops the
   AdGuard DNS filter's one allow regex, which needs a `#` in the name.

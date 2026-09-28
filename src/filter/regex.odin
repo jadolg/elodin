@@ -323,7 +323,7 @@ class_ranges_ok :: proc(class: string) -> bool {
 				}
 				hi = int(text[i])
 			}
-			if hi < prev {
+			if hi < prev || !range_folds_alike(prev, hi) {
 				return false
 			}
 			prev = -2
@@ -339,6 +339,29 @@ class_ranges_ok :: proc(class: string) -> bool {
 		prev = c
 	}
 	return true
+}
+
+/*
+Whether Odin's case folding of the range `lo-hi` matches the same lowercased
+names as RE2's `(?i)`, which folds every letter inside it. Odin folds a range
+only when both ends are letters, and then folds the ends alone: `[A-z]` becomes
+`[a-zA-Z]`, losing `_`, and `[.-a]` or `[0-Z]` are not folded at all, so a name's
+`b` misses a range that holds `B`.
+*/
+@(private)
+range_folds_alike :: proc(lo, hi: int) -> bool {
+	if hi < 'A' || lo > 'Z' {
+		// No capital in it, and the name holds none.
+		return true
+	}
+	lo_letter := (lo >= 'A' && lo <= 'Z') || (lo >= 'a' && lo <= 'z')
+	hi_letter := (hi >= 'A' && hi <= 'Z') || (hi >= 'a' && hi <= 'z')
+	if lo_letter && hi_letter {
+		// Folded end by end, which is right only when both ends are capitals.
+		return hi <= 'Z'
+	}
+	// Not folded: every capital's lower case has to be in the range too.
+	return min(hi, 'Z') + ('a' - 'A') <= hi
 }
 
 // Keyed with its slashes in `cancelled`, beside names that can hold no slash.
