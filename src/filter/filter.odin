@@ -45,6 +45,9 @@ Set :: struct {
 	// `/re/` rules, matched after the hash maps; `engine_match` says when, and
 	// regex.odin what bounds them.
 	regexes:       [dynamic]Regex_Rule,
+	// The patterns `regexes` holds, so a line is checked against them in one
+	// probe rather than a scan: past the budget every line still asks.
+	regex_held:    map[string]struct{},
 	// What they cost, in `regex_cost`'s units: program bytes and class entries.
 	regex_bytes:   int,
 	// Patterns turned away because `regex_bytes` was already at its budget.
@@ -97,6 +100,7 @@ set_make :: proc() -> ^Set {
 	s.rules = make(map[string]Rule_Flags, 1024, s.allocator)
 	s.cancelled = make(map[string]Rule_Flags, s.allocator)
 	s.regexes = make([dynamic]Regex_Rule, s.allocator)
+	s.regex_held = make(map[string]struct{}, s.allocator)
 	return s
 }
 

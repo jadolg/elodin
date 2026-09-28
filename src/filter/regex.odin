@@ -102,10 +102,8 @@ regex_add :: proc(s: ^Set, pattern: string) -> (stored: bool) {
 	if !regex_pattern_ok(pattern) || !tokens_ok(pattern) || regex_key(pattern, key_buf[:]) in s.cancelled {
 		return false
 	}
-	for r in s.regexes {
-		if r.pattern == pattern {
-			return true
-		}
+	if pattern in s.regex_held {
+		return true
 	}
 	/*
 	Once one pattern has not fitted, none after it is compiled: a list of a
@@ -154,6 +152,7 @@ regex_add :: proc(s: ^Set, pattern: string) -> (stored: bool) {
 	shortcut := strings.clone(regex_shortcut(pattern, temp), s.allocator)
 	kept := Regex_Rule{strings.clone(pattern, s.allocator), re, cost, shortcut}
 	append(&s.regexes, kept)
+	s.regex_held[kept.pattern] = {}
 	s.regex_bytes += kept.cost
 	s.count += 1
 	return true
@@ -172,6 +171,7 @@ regex_cancel :: proc(s: ^Set, pattern: string) {
 	}
 	for r, i in s.regexes {
 		if r.pattern == pattern {
+			delete_key(&s.regex_held, pattern)
 			s.regex_bytes -= r.cost
 			s.count -= 1
 			ordered_remove(&s.regexes, i)
