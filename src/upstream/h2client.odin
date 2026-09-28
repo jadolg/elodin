@@ -237,7 +237,18 @@ start_h2_conn :: proc(u: ^Upstream, stream: Stream) -> ^H2_Conn {
 	hc.allocator = u.allocator
 	hc.refs = 2
 	hc.client = h2.client_make(h2.IO{user = hc, read = h2_io_read, write = h2_io_write}, u.allocator)
-	append(&u.h2_readers, thread.create_and_start_with_poly_data(hc, h2_reader))
+	reader := thread.create_and_start_with_poly_data(hc, h2_reader)
+	if reader == nil {
+		// No thread to be had: nothing would ever read this connection's
+		// answers, so it goes out already closed, the next caller dials
+		// afresh, and the reader's share is let go here instead.
+		sync.mutex_lock(&hc.client.mu)
+		hc.client.closed = true
+		sync.mutex_unlock(&hc.client.mu)
+		release_h2_conn(hc)
+		return hc
+	}
+	append(&u.h2_readers, reader)
 	return hc
 }
 
@@ -250,14 +261,17 @@ h2_reader :: proc(hc: ^H2_Conn) {
 /*
 Let go of `u.h2`'s share of a connection, without waiting for its reader.
 
-The reader notices `stopping` within H2_POLL_INTERVAL and frees the connection
-on its way out, or this does, if it has already gone. Closing the socket to
-hurry it would race a thread that might still be reading from it, since on
-Linux close does not reliably interrupt a read already blocked elsewhere.
+The reader frees the connection on its way out, or this does, if it has already
+gone. It is woken with a shutdown rather than left to notice `stopping` at its
+next poll: nothing joins it any more, so replacements are only as far apart as
+a dial, and a reader sitting out its poll would hold a thread and a socket for
+each. Shutdown, not close, because close would race a thread that might still
+be reading from the descriptor; this caller's share keeps it open until then.
 */
 @(private)
 retire_h2_conn :: proc(hc: ^H2_Conn) {
 	sync.atomic_store(&hc.stopping, true)
+	_ = net.shutdown(hc.stream.socket, .Both)
 	release_h2_conn(hc)
 }
 

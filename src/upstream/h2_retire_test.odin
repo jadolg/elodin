@@ -17,7 +17,7 @@ held to.
 The connection here is handed to the upstream the way `get_h2_conn` would,
 over plain TCP to a listener that never accepts: the kernel completes the
 handshake, so the reader sits in its poll with nothing to read. The upstream
-itself points at a port nobody listens on, so the redial fails at once and
+itself points at a port nobody listens on, so the redial ends at once and
 the time `get_h2_conn` takes is the time it spent on the old connection.
 */
 @(private = "file")
@@ -88,14 +88,24 @@ replace_dead_h2 :: proc(t: ^testing.T, reader_gone: bool) {
 	}
 
 	start := time.tick_now()
-	conn, ok, err := get_h2_conn(u, 200 * time.Millisecond, 200 * time.Millisecond)
+	// What the redial comes to is beside the point, and not asserted: tests
+	// run in parallel, and another may have bound the freed port since.
+	conn, _, _ := get_h2_conn(u, 200 * time.Millisecond, 200 * time.Millisecond)
 	took := time.tick_since(start)
-	testing.expect(t, conn == nil && !ok)
-	testing.expectf(t, err != .None, "the redial reached a dead port: %v", err)
+	testing.expect(t, conn == nil)
 	testing.expectf(t, took < H2_POLL_INTERVAL / 4, "replacing the connection took %v", took)
 	sync.mutex_lock(&u.mu)
 	testing.expect(t, u.h2 == nil)
 	sync.mutex_unlock(&u.mu)
+
+	// Nor does the retired reader sit out its poll: with no join to throttle
+	// replacements, each reader left polling would hold a thread and a socket
+	// for up to H2_POLL_INTERVAL, as many as the upstream can be dialled in
+	// that time.
+	for !thread.is_done(reader) && time.tick_since(start) < H2_POLL_INTERVAL / 2 {
+		time.sleep(time.Millisecond)
+	}
+	testing.expectf(t, thread.is_done(reader), "the retired reader was still polling after %v", time.tick_since(start))
 }
 
 @(test)
