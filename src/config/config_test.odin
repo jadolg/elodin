@@ -1228,6 +1228,14 @@ test_upstream_urls_outside_visible_ascii_are_errors :: proc(t: ^testing.T) {
 		"address: must be visible ASCII",
 	)
 	refused_for(t, fmt.tprintf(DOT_MAP, "\"dns.example \""), "hostname: must be visible ASCII")
+	// And a host: userinfo or a path in one is a name no certificate has, and a
+	// `Host` that a hop routing by it reads its own way.
+	refused_for(t, fmt.tprintf(DOT_MAP, "\"a.example@b.example\""), "hostname: must be visible ASCII")
+	refused_for(
+		t,
+		"upstream:\n  bootstrap: [9.9.9.9]\n  servers:\n    - url: https://dns.example/dns-query\n      hostname: a.example/x\n",
+		UPSTREAM_URL_RULE,
+	)
 	// An https upstream's own address is a lookup just the same.
 	refused_for(
 		t,

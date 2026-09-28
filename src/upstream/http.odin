@@ -345,7 +345,7 @@ http_exchange :: proc(
 	nobody meant to send. Checked here, where every request line is written: a
 	list url comes from config, and a redirect's from whoever answered (#438).
 	*/
-	if !h2.target_is_valid(req.path) || !h2.target_is_valid(req.host) {
+	if !h2.target_is_valid(req.path) || !h2.authority_is_valid(req.host) {
 		return {}, .HTTP_Error
 	}
 	b := strings.builder_make(context.temp_allocator)

@@ -899,7 +899,7 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 			// 8.3.1 lets a request carry `Host` in place of `:authority`, and an
 			// h2-to-h1 hop writes it out as the one it gets: the same rule (#438).
 			// Once only, as on HTTP/1.1, and checked against `:authority` below.
-			if have_host || !target_is_valid(f.value) {
+			if have_host || !authority_is_valid(f.value) {
 				return true
 			}
 			have_host, host = true, f.value
@@ -925,10 +925,10 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 
 	/*
 	`:authority` is the target of CONNECT's request line and the `Host` of every
-	other request's, so it is held to what a target may hold, for the reason
-	given for `:path` below (#438).
+	other request's, so it is held to what a host may hold, for the reason
+	given for `:path` below (#438) - see `authority_is_valid`.
 	*/
-	if !target_is_valid(authority) {
+	if !authority_is_valid(authority) {
 		return true
 	}
 	// 8.3.1: a Host naming another entity than `:authority` is malformed. This
@@ -1039,6 +1039,18 @@ target_is_valid :: proc(s: string) -> bool {
 		}
 	}
 	return true
+}
+
+/*
+RFC 9110 7.2 and RFC 3986 3.2: a host, `uri-host [":" port]`, is a target that
+holds no userinfo (which RFC 9113 8.3.1 forbids in `:authority` by name), no
+path, query or fragment, and no backslash, which WHATWG parsers read as a `/`.
+Each of those is a Host that a hop routing by it parses its own way:
+`a.example@b.example` is `b.example` to one reader and `a.example` to another.
+Empty is left to the caller, as for `target_is_valid`.
+*/
+authority_is_valid :: proc(s: string) -> bool {
+	return target_is_valid(s) && strings.index_any(s, "@/\\?#") < 0
 }
 
 /*

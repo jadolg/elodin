@@ -993,6 +993,13 @@ test_request_line_is_three_tokens_with_a_known_version :: proc(t: ^testing.T) {
 		{"GET /dns-query HTTP/1.1", "Host: dns\texample\r\n", 400, false, "a Host with a tab in it"},
 		{"GET /dns-query HTTP/1.1", "Host: dns.ex\u00e4mple\r\n", 400, false, "a Host outside ASCII"},
 		{"GET /dns-query HTTP/1.1", "Host: [::1]:443\r\n", 0, true, "a Host that is an IPv6 authority"},
+		// uri-host [":" port] holds none of userinfo, a path, a query or a
+		// fragment, and a hop that routes by Host parses each of them its own way.
+		{"GET /dns-query HTTP/1.1", "Host: a.example@b.example\r\n", 400, false, "a Host with userinfo"},
+		{"GET /dns-query HTTP/1.1", "Host: a.example/x\r\n", 400, false, "a Host with a path"},
+		{"GET /dns-query HTTP/1.1", "Host: a.example\\x\r\n", 400, false, "a Host with a backslash"},
+		{"GET /dns-query HTTP/1.1", "Host: a.example?x\r\n", 400, false, "a Host with a query"},
+		{"GET /dns-query HTTP/1.1", "Host: a.example#x\r\n", 400, false, "a Host with a fragment"},
 	}
 
 	for c in CASES {

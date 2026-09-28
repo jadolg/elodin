@@ -2744,6 +2744,11 @@ test_malformed_requests_are_reset :: proc(t: ^testing.T) {
 				{"host", "b.example"},
 			},
 		},
+		// 8.3.1: no userinfo, and uri-host [":" port] holds no path either.
+		{":authority with userinfo", {{":method", "GET"}, {":scheme", "https"}, {":authority", "a.example@b.example"}, {":path", "/dns-query"}}},
+		{":authority with a path", {{":method", "GET"}, {":scheme", "https"}, {":authority", "a.example/x"}, {":path", "/dns-query"}}},
+		{":authority with a backslash", {{":method", "GET"}, {":scheme", "https"}, {":authority", "a.example\\x"}, {":path", "/dns-query"}}},
+		{"host with userinfo", {{":method", "GET"}, {":scheme", "https"}, {":path", "/dns-query"}, {"host", "a.example@b.example"}}},
 		// RFC 9112 3.2: the target an h2-to-h1 hop would write into a request line.
 		{
 			":path with a space",

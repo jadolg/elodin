@@ -1271,7 +1271,7 @@ load_upstream_spec :: proc(
 
 	// The address is a lookup when it is a name, on every kind, and the
 	// certificate name too when a DoT upstream gives no hostname.
-	if !h2.target_is_valid(spec.address) {
+	if !h2.authority_is_valid(spec.address) {
 		errorf(l, "%s.address: must be visible ASCII", path)
 		return {}, false
 	}
@@ -1280,7 +1280,7 @@ load_upstream_spec :: proc(
 			errorf(l, "%s: an https upstream needs a url", path)
 			return {}, false
 		}
-		if !h2.target_is_valid(spec.url) || !h2.target_is_valid(spec.hostname) {
+		if !h2.target_is_valid(spec.url) || !h2.authority_is_valid(spec.hostname) {
 			errorf(l, "%s: %s", path, UPSTREAM_URL_RULE)
 			return {}, false
 		}
@@ -1311,7 +1311,7 @@ load_upstream_spec :: proc(
 		}
 		// As the shorthand's `#name` is: an NBSP on the end is a certificate name
 		// no server has.
-		if !h2.target_is_valid(spec.hostname) {
+		if !h2.authority_is_valid(spec.hostname) {
 			errorf(l, "%s.hostname: must be visible ASCII", path)
 			return {}, false
 		}
@@ -1373,7 +1373,8 @@ parse_upstream_shorthand :: proc(
 	spec.verify = true
 	spec.bootstrap = default_bootstrap
 	// ASCII whitespace only: `trim_space` also eats Unicode spaces such as NBSP,
-	// which would pass a url the ASCII check below never saw (#438).
+	// silently rewriting what the operator wrote; the check below refuses it
+	// instead (#438).
 	s := strings.trim(raw, " \t\r\n")
 
 	if strings.has_prefix(s, "https://") {
