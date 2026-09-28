@@ -72,10 +72,10 @@ can make one query cost is bounded instead:
 | pattern length | 1024 bytes |
 | a `{N}` or `{N,M}` count | 1000, as in RE2 |
 | one compiled pattern | 1024 bytes |
-| compiled patterns per set, block and allow each | 8 KiB |
+| compiled patterns per set, block and allow each | 8 KiB, each character or range a `[…]` lists counting as a byte |
 | name matched | 253 characters; a longer one, which only a name spelling bytes as `\DDD` reaches, is not matched against regex rules |
 
-The AdGuard DNS filter's 22 usable regex rules compile to about 1.5 KiB. Each
+The AdGuard DNS filter's 22 usable regex rules come to about 2.1 KiB of that. Each
 name a query checks - the question and every CNAME hop - is matched against
 both sets.
 
@@ -97,7 +97,8 @@ both sets.
   (write an international name as punycode).
 - Once a set's budget refuses a pattern, every later one is dropped too. The
   count is logged once at load: `filter: N regex rules skipped: a set holds 8192
-  bytes of compiled regex, and the lists loaded first used them up`.
+  of regex cost (compiled bytes, plus one for each character or range a class
+  lists), and the lists loaded first used it up`.
   `blocking.rules` load after the lists, so a rule there that is dropped also
   gets its own `adds nothing` warning.
 - Regex rules are counted in `elodin_filter_rules` and in the startup line

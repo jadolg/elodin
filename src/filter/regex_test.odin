@@ -63,6 +63,7 @@ test_regex_rule_dollar_and_modifiers :: proc(t: ^testing.T) {
 /^e\.example/$badfilter
 /^e\.example/
 /^(f|g)\.example$/
+/^i\.example/$
 `
 	e := engine_of(src)
 	defer engine_destroy(e)
@@ -76,6 +77,9 @@ test_regex_rule_dollar_and_modifiers :: proc(t: ^testing.T) {
 	testing.expect_value(t, engine_match(e, "e.example."), Decision.None)
 	testing.expect_value(t, engine_match(e, "g.example."), Decision.Blocked)
 	testing.expect_value(t, engine_match(e, "h.example."), Decision.None)
+	// urlfilter's `findOptionsDelimiter` starts at the last byte, so a
+	// trailing `$` opens an empty options list and `/re/$` is the regex.
+	testing.expect_value(t, engine_match(e, "i.example."), Decision.Blocked)
 }
 
 @(test)
@@ -369,7 +373,8 @@ test_regex_pattern_and_program_limits :: proc(t: ^testing.T) {
 	// `[a-z]?` is a split and a class, seven bytes.
 	big := fmt.tprintf("/[a-z]{{0,%d}}z/", (MAX_REGEX_PROGRAM - 18) / 7)
 	testing.expectf(t, parse_rule(block, allow, big) == 1, "%s was refused", big)
-	testing.expectf(t, block.regex_bytes > MAX_REGEX_PROGRAM - 32 && block.regex_bytes <= MAX_REGEX_PROGRAM, "%s compiled to %d bytes", big, block.regex_bytes)
+	size := len(block.regexes[0].re.program)
+	testing.expectf(t, size > MAX_REGEX_PROGRAM - 32 && size <= MAX_REGEX_PROGRAM, "%s compiled to %d bytes", big, size)
 	over := fmt.tprintf("/[a-z]{{0,%d}}y/", (MAX_REGEX_PROGRAM - 18) / 7 + 3)
 	testing.expectf(t, parse_rule(block, allow, over) == 0, "%s was added", over)
 
@@ -418,6 +423,27 @@ test_regex_budget_per_set :: proc(t: ^testing.T) {
 	testing.expect_value(t, engine_match(e, fmt.tprintf("r0%s", hex)), Decision.Blocked)
 	testing.expect_value(t, engine_match(e, fmt.tprintf("r%d%s", i - 1, hex)), Decision.None)
 	engine_swap(e, nil, nil)
+}
+
+// A class is two bytes of program however many entries it lists, and a match
+// tests them one by one, so each is charged too: `[~~~...]` patterns would
+// otherwise fit the budget by the hundred and cost a query fifty times as much.
+@(test)
+test_regex_budget_charges_class_entries :: proc(t: ^testing.T) {
+	block, allow := set_make(), set_make()
+	defer set_destroy(block)
+	defer set_destroy(allow)
+
+	class := strings.repeat("~", MAX_REGEX_PATTERN - 8, context.temp_allocator)
+	for i := 0; block.regex_refused == 0; i += 1 {
+		parse_rule(block, allow, fmt.tprintf("/[%s]%d/", class, i))
+	}
+	testing.expectf(t, len(block.regexes) <= MAX_REGEX_TOTAL / (MAX_REGEX_PATTERN - 8), "%d class-heavy patterns kept", len(block.regexes))
+	testing.expect(t, block.regex_bytes <= MAX_REGEX_TOTAL)
+	// What a `$badfilter` gives back is what was charged.
+	charged := block.regex_bytes
+	parse_rule(block, allow, fmt.tprintf("/[%s]0/$badfilter", class))
+	testing.expect(t, block.regex_bytes < charged - (MAX_REGEX_PATTERN - 8))
 }
 
 // `program_bound` is what keeps a pattern from being compiled at all, so it

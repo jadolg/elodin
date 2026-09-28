@@ -45,6 +45,7 @@ Set :: struct {
 	// `/re/` rules, matched after the hash maps; `engine_match` says when, and
 	// regex.odin what bounds them.
 	regexes:       [dynamic]Regex_Rule,
+	// What they cost, in `regex_cost`'s units: program bytes and class entries.
 	regex_bytes:   int,
 	// Patterns turned away because `regex_bytes` was already at its budget.
 	regex_refused: int,

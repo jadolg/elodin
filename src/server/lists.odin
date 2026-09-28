@@ -74,7 +74,7 @@ build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool) -> (block, a
 	)
 	if refused := block.regex_refused + allow.regex_refused; refused > 0 {
 		logx.warnf(
-			"filter: %d regex rules skipped: a set holds %d bytes of compiled regex, and the lists loaded first used them up",
+			"filter: %d regex rules skipped: a set holds %d of regex cost (compiled bytes, plus one for each character or range a class lists), and the lists loaded first used it up",
 			refused,
 			filter.MAX_REGEX_TOTAL,
 		)

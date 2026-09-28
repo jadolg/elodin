@@ -30,9 +30,10 @@ does not settle, so what one may cost is decided here and not by its author:
     once it is done, so `((a{1000}){1000}){1000}` would take gigabytes before it
     was refused. `program_bound` works out an upper bound on the size from the
     parsed tree first, and a pattern over `MAX_REGEX_PROGRAM` is never compiled.
-  - A set holds `MAX_REGEX_TOTAL` bytes of program between all its patterns:
-    the bound on what one query can be made to spend here, charged on the thing
-    the cost grows with rather than on a count of rules.
+  - A set holds `MAX_REGEX_TOTAL` between all its patterns, charged in program
+    bytes and class entries (`regex_cost`): the bound on what one query can be
+    made to spend here, charged on the thing the cost grows with rather than on
+    a count of rules.
   - A match runs in a buffer on the caller's stack, sized from
     `MAX_REGEX_PROGRAM`, so it allocates nothing and is the same whichever
     thread model the query arrived on.
@@ -46,10 +47,10 @@ MAX_REGEX_REPEAT :: 1000
 // Compiled bytes of one pattern.
 MAX_REGEX_PROGRAM :: 1024
 /*
-Compiled bytes of all the patterns in one set. The AdGuard DNS filter's 22
-block patterns come to 1.5 KiB and add a few microseconds to a query; a list
-built to be slow can make a query spend about a millisecond here at the budget,
-on a 253-character name.
+What all the patterns in one set may cost, in `regex_cost`'s units. The AdGuard
+DNS filter's 22 block patterns come to 2.1 KiB and add a few microseconds to a
+query; a list built to be slow can make a query spend about a millisecond here
+at the budget, on a 253-character name.
 */
 MAX_REGEX_TOTAL :: 8 * 1024
 /*
@@ -83,6 +84,8 @@ Regex_Rule :: struct {
 	// As written between the slashes, for `$badfilter` and duplicates.
 	pattern: string,
 	re:      regex.Regular_Expression,
+	// `regex_cost(re)`, what it holds of the set's budget.
+	cost:    int,
 }
 
 /*
@@ -134,7 +137,7 @@ regex_add :: proc(s: ^Set, pattern: string) -> (stored: bool) {
 	} else if _, matches_empty := regex.match_and_allocate_capture(trial, "", temp, temp); matches_empty {
 		// `/ads|/`, `/x*/`, `/^/`: matches every name, as `//` would.
 		return false
-	} else if s.regex_bytes + len(trial.program) > MAX_REGEX_TOTAL {
+	} else if s.regex_bytes + regex_cost(trial) > MAX_REGEX_TOTAL {
 		s.regex_refused += 1
 		return false
 	}
@@ -142,9 +145,9 @@ regex_add :: proc(s: ^Set, pattern: string) -> (stored: bool) {
 	if err != nil {
 		return false
 	}
-	kept := Regex_Rule{strings.clone(pattern, s.allocator), re}
+	kept := Regex_Rule{strings.clone(pattern, s.allocator), re, regex_cost(re)}
 	append(&s.regexes, kept)
-	s.regex_bytes += len(re.program)
+	s.regex_bytes += kept.cost
 	s.count += 1
 	return true
 }
@@ -162,12 +165,33 @@ regex_cancel :: proc(s: ^Set, pattern: string) {
 	}
 	for r, i in s.regexes {
 		if r.pattern == pattern {
-			s.regex_bytes -= len(r.re.program)
+			s.regex_bytes -= r.cost
 			s.count -= 1
 			ordered_remove(&s.regexes, i)
 			return
 		}
 	}
+}
+
+/*
+What a pattern costs a match: its program bytes, and one more for every rune and
+range a class instruction tests. A class is two bytes of program however many
+entries it lists, and the VM tries them one by one on every character, so
+charging bytes alone let a set of `[~~~...]` patterns make a query spend fifty
+times what the budget allows.
+*/
+@(private)
+regex_cost :: proc(re: regex.Regular_Expression) -> int {
+	cost := len(re.program)
+	iter := virtual_machine.Opcode_Iterator{re.program, 0}
+	for op, pc in virtual_machine.iterate_opcodes(&iter) {
+		#partial switch op {
+		case .Rune_Class, .Rune_Class_Negated, .Wait_For_Rune_Class, .Wait_For_Rune_Class_Negated:
+			data := re.class_data[re.program[pc + 1]]
+			cost += len(data.runes) + len(data.ranges)
+		}
+	}
+	return cost
 }
 
 // Whether any of the set's patterns matches `normalised`.
