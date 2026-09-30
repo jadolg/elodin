@@ -94,6 +94,13 @@ build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool, loads: []Lis
 		}
 	}
 
+	return
+}
+
+// What a pair of sets holds. Said of the sets being swapped in, so that a
+// refresh `reload_filters` drops does not log a count nothing is enforcing.
+@(private)
+log_filter_sets :: proc(block, allow: ^filter.Set) {
 	logx.infof(
 		"filter: %d block rules (%d regex), %d allow rules (%d regex)",
 		block.count,
@@ -108,7 +115,6 @@ build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool, loads: []Lis
 			filter.MAX_REGEX_TOTAL,
 		)
 	}
-	return
 }
 
 /*
@@ -159,33 +165,49 @@ load_one_list :: proc(
 		target_block = allow
 	}
 
-	// config.List_Format and filter.Format are declared in the same order so a
-	// list's configured format maps straight across.
-	added := filter.parse_list(target_block, target_allow, text, filter.Format(list.format))
+	added, held_rules := parse_list_text(target_block, target_allow, text, list.format)
 	if downloaded {
 		/*
 		A download replaces the cached copy only once it has been parsed and
 		found to hold rules (#317). Written first, an empty file mid-publish or
 		an error page served as a 200 - which parses to nothing - was the copy
 		every later fallback read. Pi-hole falls back to its cached copy on an
-		empty download likewise. A download that adds nothing added nothing to
+		empty download likewise. A download that holds no rules added nothing to
 		the sets either, so the cached copy is parsed in its place.
 		*/
-		if added > 0 {
+		if held_rules {
 			save_cached_copy(cfg, list, text)
 		} else {
-			logx.warnf("list %s: the download holds no rules; keeping the cached copy", list.name)
+			logx.warnf("list %s: the download holds no rules, so it is not cached", list.name)
 			delete(text)
 			text, load = cached_copy(cfg, list, .Stale)
 			if load == .Unavailable {
 				logx.warnf("list %s: unavailable, skipping it", list.name)
 				return load
 			}
-			added = filter.parse_list(target_block, target_allow, text, filter.Format(list.format))
+			added, _ = parse_list_text(target_block, target_allow, text, list.format)
 		}
 	}
 	logx.infof("list %s: %d rules", list.name, added)
 	return load
+}
+
+/*
+Parse a list's text into the sets, and say whether it held rules: it added some,
+took some back with `$badfilter`, or had regex rules refused because the lists
+before it used up the budget. `added` alone reads a list of `$badfilter` rules,
+or of regexes past the budget, as empty, so its download was never cached and
+the list never counted as current.
+*/
+@(private)
+parse_list_text :: proc(block, allow: ^filter.Set, text: string, format: config.List_Format) -> (added: int, held_rules: bool) {
+	cancels := block.cancels + allow.cancels
+	refused := block.regex_refused + allow.regex_refused
+	// config.List_Format and filter.Format are declared in the same order so a
+	// list's configured format maps straight across.
+	added = filter.parse_list(block, allow, text, filter.Format(format))
+	held_rules = added > 0 || block.cancels + allow.cancels > cancels || block.regex_refused + allow.regex_refused > refused
+	return
 }
 
 /*
@@ -298,7 +320,8 @@ are skipped: `strings.trim_space` would skip Unicode ones too.
 */
 @(private)
 begins_with_markup :: proc(body: string) -> bool {
-	rest := strings.trim_left(body, " \t\r\n")
+	// A UTF-8 byte order mark is no blank, but a page may open with one.
+	rest := strings.trim_left(strings.trim_prefix(body, "\xef\xbb\xbf"), " \t\r\n")
 	return strings.has_prefix(rest, "<")
 }
 
@@ -448,6 +471,7 @@ reload_filters :: proc(s: ^Server, allow_network: bool) -> (current: bool) {
 	}
 	delete(loads)
 
+	log_filter_sets(block, allow)
 	old_block, old_allow := filter.engine_swap(s.filters, block, allow)
 
 	/*
@@ -480,4 +504,9 @@ refresh_retry :: proc(retry, interval: time.Duration) -> time.Duration {
 		return min(REFRESH_RETRY_FIRST, interval)
 	}
 	return min(retry * 2, interval)
+}
+
+// How long after the last refresh the next one is due.
+refresh_wait :: proc(retry, interval: time.Duration) -> time.Duration {
+	return retry if retry > 0 else interval
 }

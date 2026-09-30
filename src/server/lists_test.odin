@@ -155,6 +155,10 @@ test_a_failed_refresh_is_retried_on_a_doubling_backoff :: proc(t: ^testing.T) {
 	testing.expect_value(t, refresh_retry(day, day), day)
 	// An interval shorter than the first retry is never exceeded.
 	testing.expect_value(t, refresh_retry(0, 10 * time.Second), 10 * time.Second)
+	// The maintenance loop waits the retry while there is one, and the
+	// interval otherwise.
+	testing.expect_value(t, refresh_wait(REFRESH_RETRY_FIRST, day), REFRESH_RETRY_FIRST)
+	testing.expect_value(t, refresh_wait(0, day), day)
 }
 
 @(test)
@@ -198,4 +202,34 @@ test_a_download_that_opens_with_markup_is_not_a_list :: proc(t: ^testing.T) {
 	// Only ASCII blanks are skipped; U+00A0 is not one, so this is not markup
 	// at the start of a line and falls to the parse.
 	testing.expect(t, !begins_with_markup(" <html>"))
+	// A byte order mark is skipped, since a page may open with one.
+	testing.expect(t, begins_with_markup("\xef\xbb\xbf<!DOCTYPE html>"))
+}
+
+@(test)
+test_a_list_of_badfilter_rules_holds_rules :: proc(t: ^testing.T) {
+	// It adds nothing and takes rules back, so reading it by what it added
+	// alone called its download empty and never cached it.
+	block, allow := filter.set_make(), filter.set_make()
+	defer filter.set_destroy(block)
+	defer filter.set_destroy(allow)
+
+	added, held := parse_list_text(block, allow, "||x.example^$badfilter\n", .Adblock)
+	testing.expect_value(t, added, 0)
+	testing.expect(t, held, "a list of $badfilter rules was read as empty")
+
+	// A list whose regexes the lists before it left no budget for.
+	for i := 0; block.regex_refused == 0; i += 1 {
+		filter.parse_rule(block, allow, fmt.tprintf("/^r%d[0-9a-f]{60}$/", i))
+		if !testing.expect(t, i < 100_000) {
+			return
+		}
+	}
+	added, held = parse_list_text(block, allow, "/^late[0-9a-f]{60}$/\n", .Adblock)
+	testing.expect_value(t, added, 0)
+	testing.expect(t, held, "a list of regexes past the budget was read as empty")
+
+	_, held = parse_list_text(block, allow, "! only a comment\n\n", .Adblock)
+	testing.expect(t, !held, "a list with no rules was read as holding some")
+	free_all(context.temp_allocator)
 }
