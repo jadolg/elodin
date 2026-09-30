@@ -182,6 +182,11 @@ cache:
   # session drops, and the alternative to a stale answer is every device on the
   # network failing at once. The refresh is tried first (RFC 8767).
   serve_stale: true
+  # Refresh popular entries before they expire, but leave anything that lives
+  # under a minute to expire: short-lived names are most of the added upstream
+  # traffic, and this box has little to spare.
+  prefetch: true
+  prefetch_min_ttl: 60
 
 blocking:
   enabled: true

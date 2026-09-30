@@ -222,6 +222,76 @@ test_cache_stale_timeout :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+/*
+Prefetching is on unless the file says otherwise, and the threshold below which
+an entry is left to expire is the operator's (issue #468).
+
+A threshold the file writes is refused above `max_ttl`, since no entry could
+then reach it and prefetching would be off while the file said it was on.
+Refused only while prefetching is on and the cache is, so a setting left in a
+file that turned either off does not stop the server starting - and never for
+the default, which a file from before the key existed never chose.
+*/
+@(test)
+test_cache_prefetch :: proc(t: ^testing.T) {
+	base, berr := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	testing.expect(t, berr == nil, "expected a clean load")
+	testing.expect(t, base.cache.prefetch, "prefetching is off by default")
+	testing.expect_value(t, base.cache.prefetch_min_ttl, 9)
+
+	set, serr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\ncache:\n  prefetch: false\n  prefetch_min_ttl: 1m\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, serr == nil, "expected a clean load")
+	testing.expect(t, !set.cache.prefetch, "prefetch: false was not read")
+	testing.expect_value(t, set.cache.prefetch_min_ttl, 60)
+
+	every, eerr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\ncache:\n  prefetch_min_ttl: 0\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, eerr == nil, "0 prefetches every entry, and is not an error")
+	testing.expect_value(t, every.cache.prefetch_min_ttl, 0)
+
+	_, nerr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\ncache:\n  prefetch_min_ttl: -1\n",
+		context.temp_allocator,
+	)
+	if e, has := nerr.?; testing.expect(t, has, "a negative prefetch_min_ttl was accepted") {
+		testing.expect(t, strings.contains(e.messages[0], "cache.prefetch_min_ttl"))
+	}
+
+	_, aerr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\ncache:\n  max_ttl: 1h\n  prefetch_min_ttl: 2h\n",
+		context.temp_allocator,
+	)
+	if e, has := aerr.?; testing.expect(t, has, "a threshold above max_ttl was accepted") {
+		testing.expect(t, strings.contains(e.messages[0], "cache.prefetch_min_ttl"))
+	}
+
+	// `max_ttl: 0` is the cache's day, and a threshold above that is as unreachable.
+	_, zerr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\ncache:\n  max_ttl: 0\n  prefetch_min_ttl: 100000\n",
+		context.temp_allocator,
+	)
+	if e, has := zerr.?; testing.expect(t, has, "a threshold above the cache's own day was accepted") {
+		testing.expect(t, strings.contains(e.messages[0], "cache.prefetch_min_ttl"))
+	}
+
+	_, oerr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\ncache:\n  max_ttl: 1h\n  prefetch: false\n  prefetch_min_ttl: 2h\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, oerr == nil, "a threshold is refused with prefetching off")
+
+	// A file that caps entries under the default threshold and never names it,
+	// as every file from before the key did, still loads.
+	_, lerr := load_string("upstream:\n  servers: [1.1.1.1]\ncache:\n  max_ttl: 4\n", context.temp_allocator)
+	testing.expect(t, lerr == nil, "the default threshold refused a max_ttl below it")
+	free_all(context.temp_allocator)
+}
+
 @(test)
 test_defaults_applied :: proc(t: ^testing.T) {
 	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)

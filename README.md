@@ -9,7 +9,7 @@ Pi-hole and AdGuard Home, minus the web interface. One binary, one YAML file.
   that answers it and nowhere else
 - Sink lists in hosts, plain-domain and adblock syntax, with allowlists, matched
   against an answer's CNAME chain as well as the question
-- Answer cache with negative caching and optional stale serving
+- Answer cache with negative caching, prefetching and optional stale serving
 - DNSSEC validation against the root trust anchors, on by default
 - Local rewrites (A, AAAA, CNAME, MX, TXT, SRV, or "answer as if blocked"),
   written as a zone file writes them, with the matching PTR synthesised
@@ -96,7 +96,7 @@ tasks, the layout of the source and how it is tested.
 | [Logs](docs/logging.md) | the logfmt format, the stats line, the query log |
 | [Upstreams](docs/upstreams.md) | strategies, timeouts, failover, bootstrap, and per-domain routes |
 | [Sink lists](docs/blocking.md) | list formats, allow rules, CNAME inspection |
-| [Cache](docs/cache.md) | bounds, TTL handling, coalescing, serve-stale |
+| [Cache](docs/cache.md) | bounds, TTL handling, prefetching, coalescing, serve-stale |
 | [DNS-over-HTTPS](docs/doh.md) | the DoH endpoint and the Apple `.mobileconfig` profile |
 | [DNSSEC](docs/dnssec.md) | validation, its bounds, trust anchors, names served insecure |
 | [Who may ask](docs/access-control.md) | the client allow list and the RD bit |

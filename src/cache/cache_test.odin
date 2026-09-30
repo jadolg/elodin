@@ -6,7 +6,7 @@ import "core:testing"
 import "core:time"
 import "elodin:dns"
 
-@(private = "file")
+@(private)
 build_answer :: proc(name: string, ttl: u32, allocator := context.allocator) -> ([]u8, dns.Message) {
 	m := dns.Message {
 		id       = 0x1111,

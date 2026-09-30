@@ -1186,7 +1186,7 @@ resolve_query :: proc(
 			)
 		}
 		if !counted {
-			sync.atomic_add(&s.stats.rewritten, 1)
+			count_answer(&s.stats.rewritten)
 		}
 		log_query(s, client, proto, q, .Rewritten, "rewrite", started)
 		return out, .Rewritten, true
@@ -1208,14 +1208,14 @@ resolve_query :: proc(
 	that this server answered it out of a forward rule rather than forwarding it.
 	*/
 	if out, matched := apply_reverse_rewrite(s, msg, q, allocator, limit); matched {
-		sync.atomic_add(&s.stats.rewritten, 1)
+		count_answer(&s.stats.rewritten)
 		log_query(s, client, proto, q, .Rewritten, "rewrite-ptr", started)
 		return out, .Rewritten, true
 	}
 
 	if s.cfg.blocking.enabled && s.filters != nil {
 		if filter.engine_match(s.filters, q.name) == .Blocked {
-			sync.atomic_add(&s.stats.blocked, 1)
+			count_answer(&s.stats.blocked)
 			out := build_block_response(s, msg, q, allocator, limit)
 			log_query(s, client, proto, q, .Blocked, "list", started)
 			return out, .Blocked, true
@@ -1391,11 +1391,27 @@ resolve_query :: proc(
 	*/
 	stale_hit: Cached_Answer
 
-	if stored, found := stored_answer(s, key, generation, allocator); found {
-		if !stored.stale {
-			return serve_from_cache(s, stored, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
+	/*
+	A fresh hit near its expiry also refreshes the entry behind the client, so
+	the query after it does not wait for the upstream; see `start_prefetch`.
+
+	Only for a query that recursion was asked for: an RD=0 one wants what this
+	server already knows (RFC 1035 section 4.1.1), and a refresh on its behalf
+	is the forwarding it did not ask for. Never from a refresh, which does not
+	start another. And a prefetch does not read the entry at all - it is here to
+	replace it, and a hit on it would serve the very bytes it came to renew.
+	*/
+	if !prefetching {
+		wants_prefetch := unanswered == nil && msg.flags.rd
+		if stored, found := stored_answer(s, key, generation, allocator, wants_prefetch); found {
+			if !stored.stale {
+				if stored.prefetch {
+					start_prefetch(s, key, query, proto, client, limit, stored.serial)
+				}
+				return serve_from_cache(s, stored, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
+			}
+			stale_hit = stored
 		}
-		stale_hit = stored
 	}
 
 	/*
@@ -1578,7 +1594,7 @@ resolve_query :: proc(
 			block exists to prevent. Losing the answer is the cheaper mistake,
 			and the client is told so rather than left waiting.
 			*/
-			sync.atomic_add(&s.stats.failed, 1)
+			count_answer(&s.stats.failed)
 			out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
 			logx.warnf(
 				"could not strip the client cookie from %s %s from %s; not forwarding",
@@ -1657,7 +1673,7 @@ resolve_query :: proc(
 			it. Nobody else's queries are affected by the refusal, and the
 			client is told rather than left waiting.
 			*/
-			sync.atomic_add(&s.stats.failed, 1)
+			count_answer(&s.stats.failed)
 			out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
 			logx.warnf(
 				"could not strip the client subnet from %s %s from %s; not forwarding",
@@ -1725,7 +1741,7 @@ resolve_query :: proc(
 			list stays one rule rather than three, and a fourth strip added
 			later is read off a list that agrees with itself.
 			*/
-			sync.atomic_add(&s.stats.failed, 1)
+			count_answer(&s.stats.failed)
 			out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
 			logx.warnf(
 				"could not strip the client keepalive from %s %s from %s; not forwarding",
@@ -2491,7 +2507,7 @@ resolve_query :: proc(
 			if !shed {
 				sync.atomic_add(&s.stats.bogus, 1)
 			}
-			sync.atomic_add(&s.stats.failed, 1)
+			count_answer(&s.stats.failed)
 			from := answering_upstream(winner)
 			report_bogus(q, client, result, from, shed)
 			out, built := dnssec_failure_response(msg, result, allocator, limit)
@@ -2680,7 +2696,7 @@ resolve_query :: proc(
 		and a climbing `elodin_cache_stale_total` say the upstream is down while
 		it is answering perfectly well.
 		*/
-		sync.atomic_add(&s.stats.failed, 1)
+		count_answer(&s.stats.failed)
 		out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
 		log_query(s, client, proto, q, .Failed, "answer-unreadable", started)
 		return out, .Failed, built
@@ -2851,7 +2867,7 @@ resolve_query :: proc(
 		flight = nil
 	}
 
-	sync.atomic_add(&s.stats.forwarded, 1)
+	count_answer(&s.stats.forwarded)
 	/*
 	Handed back as the upstream sent it, over the client's limit if that is what
 	it is: the OPT record is the upstream's until `match_client_opt` has settled
@@ -2884,6 +2900,9 @@ stored_answer :: proc(
 	key: string,
 	generation: u64,
 	allocator: mem.Allocator,
+	// Whether this caller starts the refresh `stored.prefetch` hands it; see
+	// `cache.get`.
+	prefetch := false,
 ) -> (
 	stored: Cached_Answer,
 	found: bool,
@@ -2891,7 +2910,7 @@ stored_answer :: proc(
 	if !s.cfg.cache.enabled {
 		return
 	}
-	wire, hit, got := cache.get(s.answers, key, allocator, checked_against = generation)
+	wire, hit, got := cache.get(s.answers, key, allocator, checked_against = generation, prefetch = prefetch)
 	if !got {
 		return
 	}
@@ -2902,8 +2921,9 @@ stored_answer :: proc(
 		recheck = hit.recheck,
 		refused = hit.refused,
 		ede     = hit.ede,
-		serial  = hit.serial,
-		checked = generation,
+		serial   = hit.serial,
+		checked  = generation,
+		prefetch = hit.prefetch,
 	}
 	return stored, true
 }
@@ -2956,7 +2976,7 @@ upstream_failed :: proc(
 	if stale_hit.wire != nil {
 		return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
 	}
-	sync.atomic_add(&s.stats.failed, 1)
+	count_answer(&s.stats.failed)
 	out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
 	log_query(s, client, proto, q, .Failed, detail, started)
 	return out, .Failed, built
@@ -3211,7 +3231,7 @@ unreadable_rcode_refusal :: proc(
 		)
 		logx.warnf("further replies refused for an rcode a client cannot read are logged at debug level")
 	}
-	sync.atomic_add(&s.stats.failed, 1)
+	count_answer(&s.stats.failed)
 	sync.atomic_add(&s.stats.unreadable_rcode, 1)
 	// And against the server that sent it, which is the half of the question
 	// the total cannot answer once the one warn line has scrolled away.
@@ -3291,6 +3311,8 @@ Cached_Answer :: struct {
 	// Not from the cache at all but the answer an identical query in flight
 	// just forwarded; see `inflight.odin`.
 	coalesced: bool,
+	// This lookup is the one to refresh the entry before it expires.
+	prefetch:  bool,
 }
 
 /*
@@ -3440,8 +3462,10 @@ serve_bogus_verdict :: proc(
 	outcome: Outcome,
 	ok: bool,
 ) {
-	sync.atomic_add(&s.stats.bogus, 1)
-	sync.atomic_add(&s.stats.failed, 1)
+	// Both are this client's refusal, replayed rather than reached, so a
+	// prefetch that lands here counts in neither; see `prefetching`.
+	count_answer(&s.stats.bogus)
+	count_answer(&s.stats.failed)
 	/*
 	Not counted as `cached`, and nothing to reconcile: the client was refused
 	rather than answered, and the lookup that found these bytes was a `probe`,
@@ -3617,7 +3641,7 @@ serve_from_cache :: proc(
 			*/
 			cache.forget(s.answers, hit.key, hit.serial)
 			cache.note_withheld(s.answers)
-			sync.atomic_add(&s.stats.failed, 1)
+			count_answer(&s.stats.failed)
 			out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
 			log_query(s, client, proto, q, .Failed, "cache-unreadable", started)
 			return out, .Failed, built
@@ -3638,7 +3662,7 @@ serve_from_cache :: proc(
 	if hit.stale {
 		cache.note_stale_served(s.answers)
 	}
-	sync.atomic_add(&s.stats.cached, 1)
+	count_answer(&s.stats.cached)
 	if hit.coalesced {
 		sync.atomic_add(&s.stats.coalesced, 1)
 	}
@@ -4456,7 +4480,8 @@ log_query :: proc(
 	detail: string,
 	started: time.Time,
 ) {
-	if !s.cfg.log.queries {
+	// A prefetch is not a query anybody sent; see `prefetching`.
+	if !s.cfg.log.queries || prefetching {
 		return
 	}
 	elapsed := time.diff(started, time.now())

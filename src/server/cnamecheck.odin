@@ -1,7 +1,6 @@
 package server
 
 import "core:mem"
-import "core:sync"
 import "core:time"
 import "elodin:dns"
 import "elodin:filter"
@@ -413,7 +412,7 @@ refuse_cloaked :: proc(
 	more confidently than the broad one.
 	*/
 	if verdict == .Unreadable {
-		sync.atomic_add(&s.stats.failed, 1)
+		count_answer(&s.stats.failed)
 		logx.debugf(
 			"%s %s from %s redirects onto a name this server could not read, so where it leads could not be checked; withheld",
 			dns.type_name(q.type),
@@ -425,7 +424,7 @@ refuse_cloaked :: proc(
 		return out
 	}
 
-	sync.atomic_add(&s.stats.blocked, 1)
+	count_answer(&s.stats.blocked)
 	if verdict == .Unwalkable {
 		logx.debugf(
 			"%s %s from %s redirects through more than %d names, which is more than this server will follow; withheld",

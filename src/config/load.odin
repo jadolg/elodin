@@ -1474,6 +1474,8 @@ load_cache :: proc(l: ^Loader, cfg: ^Config) {
 		"negative_ttl",
 		"serve_stale",
 		"stale_timeout",
+		"prefetch",
+		"prefetch_min_ttl",
 	)
 	opt_bool(l, n, "enabled", &cfg.cache.enabled, "cache")
 	opt_int(l, n, "max_entries", &cfg.cache.max_entries, "cache")
@@ -1483,6 +1485,28 @@ load_cache :: proc(l: ^Loader, cfg: ^Config) {
 	opt_u32(l, n, "negative_ttl", &cfg.cache.negative_ttl, "cache")
 	opt_bool(l, n, "serve_stale", &cfg.cache.serve_stale, "cache")
 	opt_duration(l, n, "stale_timeout", &cfg.cache.stale_timeout, "cache")
+	opt_bool(l, n, "prefetch", &cfg.cache.prefetch, "cache")
+	opt_u32(l, n, "prefetch_min_ttl", &cfg.cache.prefetch_min_ttl, "cache")
+	/*
+	No entry lives longer than `max_ttl`, so a threshold above it switches
+	prefetching off while the file says it is on. Only a threshold the file
+	wrote: the default is below any `max_ttl` worth setting, and a file from
+	before this key existed that caps entries under it has nothing here to be
+	wrong about - its entries are all short, and short ones are left to expire.
+	Zero `max_ttl` is the cache's own ceiling of a day (`cache.make_cache`),
+	which a threshold can be above too.
+	*/
+	ceiling := cfg.cache.max_ttl if cfg.cache.max_ttl > 0 else 86400
+	if cfg.cache.enabled &&
+	   cfg.cache.prefetch &&
+	   !yaml.is_null(yaml.get(n, "prefetch_min_ttl")) &&
+	   cfg.cache.prefetch_min_ttl > ceiling {
+		errorf(
+			l,
+			"cache.prefetch_min_ttl must not be larger than cache.max_ttl (%d seconds); set cache.prefetch: false to turn prefetching off",
+			ceiling,
+		)
+	}
 }
 
 @(private)

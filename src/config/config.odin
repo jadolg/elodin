@@ -276,6 +276,19 @@ Cache_Config :: struct {
 	client with nothing.
 	*/
 	stale_timeout: time.Duration,
+	/*
+	Refresh an entry in the background when a query reaches it in the last
+	tenth of its lifetime, so a name that keeps being asked for does not make
+	one client in every TTL wait for the upstream. See `cache.claim_prefetch`.
+	*/
+	prefetch:         bool,
+	/*
+	Seconds. An entry stored with a shorter lifetime is left to expire: a
+	short-lived answer is refreshed about as often as it is asked for anyway,
+	and on a small box those are the names that would cost the most upstream
+	queries for the least gain. Zero prefetches everything.
+	*/
+	prefetch_min_ttl: u32,
 }
 
 Block_Response :: enum u8 {
@@ -1190,6 +1203,9 @@ default_config :: proc() -> Config {
 		// RFC 8767 section 5's recommended client response timer. It costs
 		// nothing while `serve_stale` is off, which is the default.
 		stale_timeout = 1800 * time.Millisecond,
+		prefetch      = true,
+		// BIND's eligibility figure (`prefetch 2 9`).
+		prefetch_min_ttl = 9,
 	}
 	c.blocking = Blocking_Config {
 		enabled     = true,
