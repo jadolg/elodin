@@ -224,6 +224,16 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
   -addext "subjectAltName=DNS:elodin.local,DNS:localhost,IP:127.0.0.1"
 """
 
+# Does elodin read a `/regex/` rule as AdGuard Home does? Random patterns and
+# query names go through urlfilter's own DNSEngine and through elodin, and a
+# pattern elodin keeps must block exactly the names urlfilter blocks. In Go, as
+# the benchmark is, since urlfilter is the reference. RE2DIFF_ARGS passes
+# `-n`, `-seed` and `-v` through.
+[tasks.re2-diff]
+description = "Check regex rules against urlfilter, AdGuard Home's engine (scripts/re2diff)"
+depends = ["prepare"]
+run = "odin build scripts/re2diff/elodin -collection:elodin=src -out:bin/re2diff-elodin -extra-linker-flags:\"$ELODIN_LDFLAGS\" && cd scripts/re2diff && go run . -elodin ../../bin/re2diff-elodin ${RE2DIFF_ARGS:-}"
+
 [tasks.bench]
 description = "Measure throughput, latency, CPU and memory (see bench/README.md)"
 depends = ["release"]

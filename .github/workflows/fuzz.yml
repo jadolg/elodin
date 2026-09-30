@@ -85,3 +85,20 @@ jobs:
         with:
           name: fuzz-crash-${{ matrix.target }}
           path: crashes/
+
+  # Not a fuzzer, but the same shape: a long random run that finds what a gated
+  # one would not. A regex rule elodin keeps must block exactly the names
+  # urlfilter, AdGuard Home's engine, blocks; the seed is printed, so a red run
+  # is reproduced with `RE2DIFF_ARGS="-seed N" mise run re2-diff`.
+  re2diff:
+    name: Regex rules against urlfilter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          install: true
+          cache: true
+      - run: mise run re2-diff
+        env:
+          RE2DIFF_ARGS: -n 2000000
