@@ -218,7 +218,7 @@ test_regex_rules_that_are_refused :: proc(t: ^testing.T) {
 		`/a\/`,
 		// RE2, outside the subset `re2_parse` reads: lookahead, flags, named
 		// groups, a backreference, `\x`, `\A`, `\z`, `\Q`, `\p`, `\n`, octal, a
-		// POSIX class, and a repeat of an anchor.
+		// POSIX class.
 		"/(?=ads)/",
 		"/(?i)ads/",
 		"/(?P<n>ads)/",
@@ -231,8 +231,6 @@ test_regex_rules_that_are_refused :: proc(t: ^testing.T) {
 		`/a\n/`,
 		`/a\0/`,
 		`/[[:alpha:]]/`,
-		`/^*a/`,
-		`/a\b+/`,
 		// A raw byte outside printable ASCII: no query name holds one.
 		"/š/",
 		"/\x01/",
@@ -329,6 +327,12 @@ test_regex_reads_as_re2 :: proc(t: ^testing.T) {
 		{`/^[]a]$/`, "b", false},
 		{`/^[^]a]$/`, "]", false},
 		{`/^[^]a]$/`, "b", true},
+		// A repeat of an anchor or a boundary, as RE2 takes it.
+		{`/^*ads$/`, "xads", true},
+		{`/ads\b+/`, "ads", true},
+		{`/ads\b+/`, "adsx", false},
+		{`/x(?:$){2}/`, "ax", true},
+		{`/x(?:$){2}/`, "xa", false},
 		// A group captures nothing, so Odin's limit of nine does not apply.
 		{`/^(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)$/`, "abcdefghij", true},
 		// The name is matched as miekg/dns spells it: `(` and `;` behind a

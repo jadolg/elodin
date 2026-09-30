@@ -24,8 +24,7 @@ rule, `(?i)` and the pattern with the Perl flags. Anything else is refused:
     (`repeatIsValid`); a `{` that is no count is itself, as in RE2.
 
 A repeat of a repeat (`a**`, `a{2}{3}`) and a repeat with nothing before it are
-refused, as RE2 refuses them; so is a repeat of `^`, `$` or `\b`, which RE2
-takes and no list needs. Flags, named groups, `\x`, `\p`, `\A`, `\z`,
+refused, as RE2 refuses them. Flags, named groups, `\x`, `\p`, `\A`, `\z`,
 backreferences and octal are outside the subset.
 
 A name reaching a regex is lowercased by `normalise` and holds only printable
@@ -171,10 +170,6 @@ re2_repeat :: proc(p: ^Re2_Parser, atom: parser.Node) -> (node: parser.Node, ok:
 	case:
 		return atom, true
 	}
-	#partial switch _ in atom {
-	case ^parser.Node_Anchor, ^parser.Node_Word_Boundary:
-		return nil, false
-	}
 	if p.i < len(p.s) && p.s[p.i] == '?' {
 		p.i += 1
 	}
@@ -226,7 +221,8 @@ re2_count :: proc(s: string) -> (lo, hi, n: int, ok: bool) {
 @(private)
 re2_repeat_valid :: proc(node: parser.Node, n: int) -> bool {
 	n := n
-	switch v in node {
+	// The shapes `re2_parse` makes; a leaf holds no count.
+	#partial switch v in node {
 	case ^parser.Node_Repeat_N:
 		m := v.upper if v.upper >= 0 else v.lower
 		if v.upper == 0 {
@@ -255,7 +251,6 @@ re2_repeat_valid :: proc(node: parser.Node, n: int) -> bool {
 				return false
 			}
 		}
-	case ^parser.Node_Rune, ^parser.Node_Rune_Class, ^parser.Node_Wildcard, ^parser.Node_Anchor, ^parser.Node_Word_Boundary, ^parser.Node_Repeat_Zero_Non_Greedy, ^parser.Node_Repeat_One_Non_Greedy, ^parser.Node_Optional_Non_Greedy, ^parser.Node_Match_All_And_Escape:
 	}
 	return true
 }

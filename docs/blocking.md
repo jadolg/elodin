@@ -84,7 +84,7 @@ can make one query cost is bounded instead:
 | a `{N}` or `{N,M}` count | 1000, as in RE2 |
 | one compiled pattern | 1024 bytes |
 | compiled patterns per set, block and allow each | 8 KiB, each character or range a `[…]` lists counting as a byte |
-| name matched | 253 characters, spelled as above; a longer one, which only a name spelling bytes out reaches, is not matched against regex rules |
+| name matched | 253 characters, spelled as AdGuard Home spells it (below); a longer one, which only a name spelling bytes out reaches, is not matched against regex rules |
 
 The AdGuard DNS filter's 22 usable regex rules come to about 2.1 KiB of that. Each
 name a query checks - the question and every CNAME hop - is matched against
@@ -103,9 +103,9 @@ both sets.
 - Refused, as RE2 outside the subset: lookaround (`(?=`), inline flags
   (`(?i)`), named groups, escaped letters or digits other than
   `\d \D \w \W \s \S \b \B` (so `\1`, `\x41`, `\A`, `\z`, `\n`, `\pL`,
-  `\Q`), POSIX classes (`[[:alpha:]]`), a repeat of `^`, `$`, `\b` or `\B`,
-  more than 254 different classes in one pattern, and any byte outside
-  printable ASCII (write an international name as punycode).
+  `\Q`), POSIX classes (`[[:alpha:]]`), more than 254 different classes in
+  one pattern, and any byte outside printable ASCII (write an international
+  name as punycode).
 - Refused too: an empty `//` or any pattern that matches the empty string
   (`/ads|/`, `/x*/`), which would block every name the rule is tried on
   (every name at all when it has no shortcut).

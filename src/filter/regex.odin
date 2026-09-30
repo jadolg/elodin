@@ -56,7 +56,8 @@ at the budget, on a 253-character name.
 MAX_REGEX_TOTAL :: 8 * 1024
 /*
 The longest name a regex is matched against: a hostname's 253 characters.
-Only a name spelling bytes as `\DDD` runs past it, to about 1000, and that
+Only a name spelling bytes out - as `\DDD`, or `\(` and the like in the form
+`regex_subject` spells - runs past it, to about 1000, and that
 quadruples the scan and costs a slow list ten milliseconds a match, a name the
 client chooses. A name that long is no hostname, so no rule meant it.
 */
@@ -67,10 +68,11 @@ The tree `re2_parse` builds goes to the compiler as it is: Odin's optimizer,
 which `regex.create` would run, merged a negated class as a plain one in its
 alternation-to-class rewrite, so `z|\W` matched `a`. It also makes the tree
 `program_bound` measures the one that is compiled. Case is folded by
-`re2_parse`, not by a flag.
+`re2_parse`, not by a flag, and `.No_Optimization` keeps `compiler.compile`
+from threading jumps too, so the program is the tree as it was built.
 */
 @(private)
-REGEX_FLAGS :: regex.Flags{.No_Capture}
+REGEX_FLAGS :: regex.Flags{.No_Capture, .No_Optimization}
 
 /*
 What `regex.match` asks of its temporary allocator: the VM's two thread arrays
