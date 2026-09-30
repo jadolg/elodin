@@ -4,6 +4,7 @@ import "core:mem"
 import "core:strings"
 import "core:sync"
 import "core:time"
+import "elodin:cache"
 import "elodin:dns"
 import "elodin:pool"
 
@@ -52,7 +53,41 @@ cache - so a slow upstream under `serve_stale` shows a `cached` and a
 `forwarded` for the same query. A blackholed one shows only the `cached`: a
 refresh that got nothing at all counts nothing, since the client it would have
 been counted for was answered from the entry instead.
+
+A prefetch is the same refresh started from the other side of the expiry: a
+fresh hit in the last tenth of its entry's lifetime (`cache.claim_prefetch`) is
+answered from the entry at once, and the refresh runs with nobody waiting on it.
+It takes a slot like any other, so the ceiling and the one-per-key rule below
+bound the two kinds together. What it does not do is count as a query or log
+as one - see `prefetching`.
 */
+
+/*
+Set while this thread runs a prefetch, which is a refresh nobody asked for.
+
+Its answer reaches the cache and no client, so it is not one of the queries an
+operator reads `elodin_answers_total` and the query log for - the client whose
+hit started it has been counted already, as the cache hit it was.
+`count_answer` and `log_query` read this, and `resolve_query` reads it to skip
+the lookup of the entry the refresh is there to replace. What the refresh cost
+still shows where the work is counted: `elodin_cache_prefetches_total`, and the
+upstream and DNSSEC series its exchange moves like any other.
+
+Per thread rather than a parameter because every one of those readers is some
+calls deep in `resolve_query`, and the refresh runs on one worker from start to
+finish; `refresh_job` sets and clears it around that one call.
+*/
+@(private)
+@(thread_local)
+prefetching: bool
+
+// Count an answer this server gave a client, which a prefetch is not.
+@(private)
+count_answer :: proc(counter: ^u64) {
+	if !prefetching {
+		sync.atomic_add(counter, 1)
+	}
+}
 
 /*
 Refreshes that may be in flight at once, for the whole server.
@@ -118,6 +153,10 @@ Refresh :: struct {
 	// The client's own start time, so the refresh's query-log line reports the
 	// latency that client saw rather than the fraction of it this job ran for.
 	started:    time.Time,
+	// Started ahead of the expiry rather than after it, and the entry it was
+	// started for; see `start_prefetch`.
+	prefetch:   bool,
+	serial:     u64,
 	mu:         sync.Mutex,
 	sema:       sync.Sema,
 	/*
@@ -199,6 +238,8 @@ start_refresh :: proc(
 	client: string,
 	limit: int,
 	started: time.Time,
+	prefetch := false,
+	serial: u64 = 0,
 ) -> ^Refresh {
 	if s.handler_pool == nil {
 		return nil
@@ -239,6 +280,8 @@ start_refresh :: proc(
 	r.proto = proto
 	r.limit = limit
 	r.started = started
+	r.prefetch = prefetch
+	r.serial = serial
 	// The waiter's, the table's and the job's, taken before the job can run.
 	r.refs = 3
 	s.refreshes.slots[free_slot] = r
@@ -256,6 +299,35 @@ start_refresh :: proc(
 		return nil
 	}
 	return r
+}
+
+/*
+Refresh the entry numbered `serial` under `key` before it expires, with nobody
+waiting on the answer.
+
+The caller has the entry's claim (`cache.Hit.prefetch`) and is serving its bytes
+now. Every reason `start_refresh` declines - a refresh for this key already
+running, the ceiling reached, the pool full or stopping - leaves the entry to
+expire as it would have without prefetching, which is also what a failed
+prefetch comes to: the claim is spent either way, so neither is tried again for
+this entry.
+*/
+@(private)
+start_prefetch :: proc(
+	s: ^Server,
+	key: string,
+	query: []u8,
+	proto: Protocol,
+	client: string,
+	limit: int,
+	serial: u64,
+) {
+	r := start_refresh(s, key, query, proto, client, limit, time.now(), prefetch = true, serial = serial)
+	if r == nil {
+		return
+	}
+	cache.note_prefetch(s.answers)
+	refresh_release(r)
 }
 
 // Take this refresh out of the table, so the next query for the name starts a
@@ -348,12 +420,22 @@ refresh_job :: proc(data: rawptr) {
 	one. The answer is copied onto the heap before this runs, since the waiter
 	may read it after the frame this was built in is gone.
 	*/
+	s := r.server
+	prefetching = r.prefetch
 	defer {
+		/*
+		Read off the cache rather than off the answer: an upstream can answer
+		and still leave nothing to store, and then the old entry is what the
+		next client meets, and what it will meet until it expires.
+		*/
+		if r.prefetch && !cache.renewed(s.answers, r.key, r.serial) {
+			cache.note_prefetch_failed(s.answers)
+		}
+		prefetching = false
 		finish_refresh(r)
 		free_all(context.temp_allocator)
 	}
 
-	s := r.server
 	/*
 	Decoded again rather than handed over. `dns.Message` is a tree of slices
 	into the arena the client's request owns, which is released as soon as that

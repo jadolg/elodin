@@ -30,6 +30,8 @@ Runner :: struct {
 	failures:  [dynamic]string,
 	current:   string,
 	current_failed: bool,
+	// Between `start_case` and `end_case`. See `fail`.
+	in_case:   bool,
 	verbose:   bool,
 	/*
 	End each case by asking the server to shut down rather than killing it.
@@ -80,12 +82,14 @@ next_port :: proc(r: ^Runner) -> int {
 start_case :: proc(r: ^Runner, name: string) {
 	r.current = name
 	r.current_failed = false
+	r.in_case = true
 	if r.verbose {
 		fmt.printf("  %-52s ", name)
 	}
 }
 
 end_case :: proc(r: ^Runner) {
+	r.in_case = false
 	if r.current_failed {
 		r.failed += 1
 		if r.verbose {
@@ -117,9 +121,28 @@ skip_case :: proc(r: ^Runner, name: string, reason: string) {
 	}
 }
 
+/*
+Record a failure against the case that is running, or as one of its own when
+none is.
+
+A group sets up its server before its first `start_case`, so a server that
+never came up fails here with no case open. Marking the case that last ran
+would put the failure under a name that had already passed, and no `end_case`
+would come to count it - the next `start_case` clears the mark. The run then
+read as one skip and nothing failed, which is how a configuration the server
+refused to load looked green (issue #468).
+*/
 fail :: proc(r: ^Runner, format: string, args: ..any) {
+	message := fmt.tprintf(format, ..args)
+	if !r.in_case {
+		r.failed += 1
+		// No progress mark: the harness's own scratch runners fail outside a
+		// case on purpose, and the details and the total are what report this.
+		append(&r.failures, fmt.aprintf("FAIL (setup, after %q): %s", r.current, message))
+		return
+	}
 	r.current_failed = true
-	append(&r.failures, fmt.aprintf("FAIL %s: %s", r.current, fmt.tprintf(format, ..args)))
+	append(&r.failures, fmt.aprintf("FAIL %s: %s", r.current, message))
 }
 
 check :: proc(r: ^Runner, condition: bool, format: string, args: ..any) -> bool {

@@ -93,6 +93,17 @@ Entry :: struct {
 	nothing had matched it against.
 	*/
 	serial:      u64,
+	/*
+	A hit near expiry has already been handed this entry's prefetch; see
+	`claim_prefetch`.
+
+	One per entry, never reset: the answer a refresh brings back is a new entry
+	with a flag of its own. What this holds off is the refresh that failed. The
+	entry it left behind is still inside its window, and without the flag every
+	hit until it expires would start another refresh - an upstream query per
+	client query, against an upstream that is already failing.
+	*/
+	prefetched:  bool,
 	prev, next:  ^Entry,
 }
 
@@ -123,12 +134,15 @@ Hit :: struct {
 	// The entry's extended error; see `Entry.ede`.
 	ede:     u16,
 	// Which entry the bytes came out of, for `note_checked`.
-	serial:  u64,
+	serial:   u64,
+	// The entry is near its expiry and this caller is the one to refresh it.
+	// See `claim_prefetch`.
+	prefetch: bool,
 }
 
 Stats :: struct {
-	hits:      u64,
-	misses:    u64,
+	hits:              u64,
+	misses:            u64,
 	/*
 	Stale answers that reached a client, which only the caller knows about.
 
@@ -137,11 +151,16 @@ Stats :: struct {
 	fails - so the count is made there, through `note_stale_served`, once there
 	is something to count.
 	*/
-	stale:     u64,
-	inserts:   u64,
-	evictions: u64,
+	stale:             u64,
+	inserts:           u64,
+	evictions:         u64,
 	// Answers `get` handed over that the caller then refused; see `note_withheld`.
-	withheld:  u64,
+	withheld:          u64,
+	// Refreshes started ahead of an entry's expiry, and those of them that left
+	// the entry as it was. Counted by the caller, which is what runs them; see
+	// `note_prefetch`.
+	prefetches:        u64,
+	prefetch_failures: u64,
 }
 
 Cache :: struct {
@@ -156,6 +175,9 @@ Cache :: struct {
 	max_ttl:      u32,
 	negative_ttl: u32,
 	serve_stale:  bool,
+	// See `claim_prefetch`.
+	prefetch:     bool,
+	prefetch_min: time.Duration,
 	// Last number handed to an entry; see `Entry.serial`. Never reset, so an
 	// entry's identity is not reused within the life of the process.
 	serials:      u64,
@@ -234,6 +256,13 @@ Options :: struct {
 	max_ttl:      u32,
 	negative_ttl: u32,
 	serve_stale:  bool,
+	/*
+	Hand a hit near expiry the refresh of its entry, and the shortest lifetime,
+	in seconds, an entry has to have been stored with to be given one. See
+	`claim_prefetch`.
+	*/
+	prefetch:         bool,
+	prefetch_min_ttl: u32,
 }
 
 make_cache :: proc(opts: Options, allocator := context.allocator) -> ^Cache {
@@ -245,6 +274,8 @@ make_cache :: proc(opts: Options, allocator := context.allocator) -> ^Cache {
 	c.max_ttl = opts.max_ttl if opts.max_ttl > 0 else 86400
 	c.negative_ttl = opts.negative_ttl
 	c.serve_stale = opts.serve_stale
+	c.prefetch = opts.prefetch
+	c.prefetch_min = time.Duration(opts.prefetch_min_ttl) * time.Second
 	c.entries = make(map[string]^Entry, max(opts.max_entries, 16), allocator)
 	return c
 }
@@ -361,6 +392,10 @@ identity an operator reads these numbers by, that hits and misses are what the
 queries came to, away from them. What a verdict costs shows as `bogus=` and in
 the query log, which is where a refusal belongs; nothing about it is an answer
 this cache served.
+
+`prefetch` is the caller saying it will refresh the entry if told to, and it is
+what `hit.prefetch` is claimed with - see `claim_prefetch`. A caller that would
+not act on it leaves it off, since the claim is the entry's one chance.
 */
 get :: proc(
 	c: ^Cache,
@@ -368,6 +403,7 @@ get :: proc(
 	allocator := context.allocator,
 	checked_against: u64 = 0,
 	probe := false,
+	prefetch := false,
 ) -> (
 	wire: []u8,
 	hit: Hit,
@@ -432,6 +468,7 @@ get :: proc(
 		if !probe {
 			c.stats.hits += 1
 		}
+		hit.prefetch = prefetch && claim_prefetch(c, e, now)
 	}
 
 	// An expired entry moves to the front along with the fresh ones. Something
@@ -623,6 +660,86 @@ ttl_ceiling :: proc(c: ^Cache) -> u32 {
 		return dns.TTL_MAX
 	}
 	return c.max_ttl
+}
+
+/*
+Whether this hit is the one to refresh `e` before it expires, marking the entry
+as handed out if so.
+
+A hit inside the last tenth of the lifetime the entry was stored with, which is
+Unbound's `prefetch` rule. No RFC covers refreshing ahead of expiry, and of the
+resolvers that do it this is the rule that suits a forwarder asked at a steady
+rate: a name asked every fifteen seconds with a ten-minute TTL is certain to be
+asked inside a sixty-second window, where BIND's fixed two seconds (`prefetch 2
+9`) is missed more often than it is hit. It needs no record of how popular an
+entry is, because the query is the evidence: a name nobody asks for near its
+expiry is not refreshed, and expires as it always has.
+
+Not for an entry stored with less than `prefetch_min_ttl`, which is BIND's
+eligibility figure made the operator's to set - a five-second record would
+otherwise be refreshed on nearly every query that reached it. The lifetime is
+the one this cache gave the entry, after `min_ttl`, `max_ttl` and
+`negative_ttl`, since that is what decides how often it would be fetched anyway.
+
+Never for a verdict, which is looked up only as a probe and whose one minute is
+the point of it. And once per entry: see `Entry.prefetched`.
+
+The caller holds the lock.
+*/
+@(private)
+claim_prefetch :: proc(c: ^Cache, e: ^Entry, now: time.Time) -> bool {
+	if !c.prefetch || e.prefetched || e.bogus {
+		return false
+	}
+	lifetime := time.diff(e.inserted, e.expires)
+	if lifetime < c.prefetch_min || time.diff(now, e.expires) > lifetime / 10 {
+		return false
+	}
+	e.prefetched = true
+	return true
+}
+
+/*
+Count a refresh a caller started on `hit.prefetch`, and one that then left the
+entry as it was; see `Stats.prefetches`.
+
+Here rather than in `get`, which only hands the claim out: whether a refresh
+runs at all is the caller's, which may have no room for one.
+*/
+note_prefetch :: proc(c: ^Cache) {
+	if c == nil {
+		return
+	}
+	sync.mutex_lock(&c.mu)
+	defer sync.mutex_unlock(&c.mu)
+	c.stats.prefetches += 1
+}
+
+note_prefetch_failed :: proc(c: ^Cache) {
+	if c == nil {
+		return
+	}
+	sync.mutex_lock(&c.mu)
+	defer sync.mutex_unlock(&c.mu)
+	c.stats.prefetch_failures += 1
+}
+
+/*
+Whether `key` now holds an entry other than the one numbered `serial`.
+
+What says a refresh worked, read off the cache rather than off the answer it
+got: an upstream can answer and still leave nothing storable - a SERVFAIL, a
+zero TTL - and then the old entry is what the next client meets. An entry
+evicted since reads as not renewed too, since nothing replaced it either.
+*/
+renewed :: proc(c: ^Cache, key: string, serial: u64) -> bool {
+	if c == nil {
+		return false
+	}
+	sync.mutex_lock(&c.mu)
+	defer sync.mutex_unlock(&c.mu)
+	e, found := c.entries[key]
+	return found && e.serial != serial
 }
 
 // Count a stale answer that a caller went on to serve; see `Stats.stale`.

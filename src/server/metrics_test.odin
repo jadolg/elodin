@@ -418,6 +418,8 @@ test_the_stats_line_carries_every_counter :: proc(t: ^testing.T) {
 		stale     = 22,
 		withheld  = 23,
 		evictions = 24,
+		prefetches        = 25,
+		prefetch_failures = 26,
 	}
 	line := stats_line(st, cs, 30, 31, 40, 41, 42)
 
@@ -445,6 +447,8 @@ test_the_stats_line_carries_every_counter :: proc(t: ^testing.T) {
 			"cache_misses=21",
 			"cache_stale=22",
 			"cache_evictions=24",
+			"cache_prefetches=25",
+			"cache_prefetch_failures=26",
 		}) {
 		testing.expectf(t, strings.contains(line, want), "the stats line is missing %q: %s", want, line)
 	}

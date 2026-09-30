@@ -143,18 +143,18 @@ one state a unit test can reach honestly - a group with nothing in it to ask,
 which fails without a socket, a timeout or a name to resolve.
 */
 
-@(private = "file")
+@(private)
 STALE_NAME :: "stale.example."
 
 // A group with no servers to ask: `upstream.resolve` walks the list, finds
 // nothing, and reports it unhealthy. Failover rather than round robin, which
 // divides by the number of servers there are none of.
-@(private = "file")
+@(private)
 down_upstream :: proc() -> upstream.Group {
 	return upstream.Group{strategy = .Failover, attempts = 1}
 }
 
-@(private = "file")
+@(private)
 stale_query :: proc(rd: bool) -> []u8 {
 	questions := make([]dns.Question, 1, context.temp_allocator)
 	questions[0] = dns.Question {
@@ -182,7 +182,7 @@ directly. The alternative - storing a one-second answer and sleeping past it -
 would spend a second of real time in every run of the suite on a clock that is
 not what any of this is about.
 */
-@(private = "file")
+@(private)
 cache_an_answer :: proc(answers: ^cache.Cache, expired: bool) -> bool {
 	answer := make([]dns.Record, 1, context.temp_allocator)
 	answer[0] = dns.Record {
@@ -222,7 +222,7 @@ cache_an_answer :: proc(answers: ^cache.Cache, expired: bool) -> bool {
 	return true
 }
 
-@(private = "file")
+@(private)
 stale_server :: proc(cfg: ^config.Config, answers: ^cache.Cache, group: ^upstream.Group) -> Server {
 	cfg^ = config.default_config()
 	cfg.log.queries = false
@@ -282,10 +282,10 @@ test_a_stale_answer_waits_for_the_upstream_to_fail :: proc(t: ^testing.T) {
 
 // The address the mock upstream answers with, which is not the one in the
 // cache: what the client receives says which of the two produced it.
-@(private = "file")
+@(private)
 LIVE_ADDR :: [4]u8{192, 0, 2, 99}
 
-@(private = "file")
+@(private)
 Stale_Exchange :: struct {
 	socket: net.UDP_Socket,
 	reply:  []u8,
@@ -304,7 +304,7 @@ One query per thread, joined by the caller before it reads `got`: there is no
 shared state to guard, and a query that never arrives leaves `got` false rather
 than hanging the suite - the socket carries a receive timeout.
 */
-@(private = "file")
+@(private)
 serve_one_stale :: proc(x: ^Stale_Exchange) {
 	buf: [4096]u8
 	n, remote, err := net.recv_udp(x.socket, buf[:])
@@ -324,7 +324,7 @@ serve_one_stale :: proc(x: ^Stale_Exchange) {
 	_, _ = net.send_udp(x.socket, out[:len(x.reply)], remote)
 }
 
-@(private = "file")
+@(private)
 live_reply :: proc() -> []u8 {
 	answer := make([]dns.Record, 1, context.temp_allocator)
 	answer[0] = dns.Record {
@@ -1135,7 +1135,7 @@ test_a_zero_timer_waits_the_upstream_out :: proc(t: ^testing.T) {
 }
 
 // One upstream, at a port on loopback, for the response-timer fixtures above.
-@(private = "file")
+@(private)
 blackhole_servers :: proc(port: int) -> []config.Upstream_Spec {
 	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
 	servers[0] = config.Upstream_Spec {

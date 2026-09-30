@@ -724,6 +724,8 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 				max_ttl = cfg.cache.max_ttl,
 				negative_ttl = cfg.cache.negative_ttl,
 				serve_stale = cfg.cache.serve_stale,
+				prefetch = cfg.cache.prefetch,
+				prefetch_min_ttl = cfg.cache.prefetch_min_ttl,
 			},
 		)
 	}

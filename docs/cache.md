@@ -10,6 +10,8 @@ cache:
   negative_ttl: 300      # cap for NXDOMAIN / NODATA (RFC 2308)
   serve_stale: false     # answer from an expired entry if the upstream is down
   stale_timeout: 1.8s    # how long a client waits for the refresh first
+  prefetch: true         # refresh a popular entry before it expires
+  prefetch_min_ttl: 9    # seconds; shorter-lived entries are left to expire
 ```
 
 Answers are stored as the wire bytes the upstream sent, with their TTLs
@@ -29,6 +31,35 @@ rewritten in place on each hit.
   does.
 - A TTL with its top bit set is read as zero (RFC 2181 section 8), forwarded
   answers included, so it is uncacheable unless `min_ttl` raises it.
+
+## Prefetching
+
+Without it, the first query after a popular name's entry expires waits a whole
+upstream round trip, once per TTL. With `prefetch` on, a query that reaches an
+entry in the last tenth of its lifetime is answered from the cache at once, and
+the entry is refreshed in the background (Unbound's `prefetch` rule).
+
+- **Only names being asked for.** An entry nobody queries near its expiry is not
+  refreshed. Each entry gets one refresh: if it leaves the entry unrenewed (no
+  answer, or nothing storable) the entry expires as it would have, and with
+  `serve_stale` the stale path takes over from there.
+- **Cost.** A name asked for steadily is fetched about 11% more often (at 90% of
+  its TTL rather than after it), and at most once per lifetime.
+- **`prefetch_min_ttl`** leaves entries stored with a shorter lifetime (after
+  `min_ttl`, `max_ttl` and `negative_ttl`) to expire. Short-lived names (CDNs,
+  load balancers) cause most of the upstream traffic already, so on a small host
+  raising it to `60` removes most of the added load and keeps prefetching for
+  everything that lives a minute or more. `0` prefetches every entry. It must not
+  be above `max_ttl`.
+- RD=0 queries are answered from the entry without starting a refresh.
+- **Bounds.** A refresh shares `serve_stale`'s slots: one per name at a time, and
+  at most a quarter of the query pool (and 64) at once. With none free, the entry is left
+  to expire.
+- **Counting.** A prefetch is not a client query: it is in neither
+  `elodin_answers_total`, the cache hit and miss counts nor the query log. It
+  counts in `elodin_cache_prefetches_total` (and
+  `elodin_cache_prefetch_failures_total` when it left the entry unrenewed), and
+  its exchange in the upstream and DNSSEC series.
 
 ## Identical queries in flight
 

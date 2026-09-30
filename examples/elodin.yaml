@@ -364,6 +364,15 @@ cache:
   #
   # Read only while serve_stale is on.
   stale_timeout: 1.8s
+  # A query that reaches an entry in the last tenth of its lifetime is answered
+  # from the cache and refreshes the entry in the background, so the query after
+  # it does not wait for the upstream. Only names being asked for are refreshed,
+  # once per entry, for about 11% more upstream queries on the names that are.
+  prefetch: true
+  # Seconds. Entries stored with a shorter lifetime are left to expire: those
+  # names are fetched often already, and are where most of the added upstream
+  # traffic would come from. 60 suits a small host; 0 prefetches everything.
+  prefetch_min_ttl: 9
 
 blocking:
   enabled: true

@@ -73,7 +73,7 @@ stats_line :: proc(
 	limited, slipped, conn_limited: u64,
 ) -> string {
 	return fmt.tprintf(
-		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d rewritten=%d dropped=%d refused=%d conn_refused=%d conn_rate_limited=%d conn_failed=%d accept_backoff=%d handshakes=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d special_use=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d unreadable_rcode=%d coalesced=%d",
+		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d rewritten=%d dropped=%d refused=%d conn_refused=%d conn_rate_limited=%d conn_failed=%d accept_backoff=%d handshakes=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d special_use=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d unreadable_rcode=%d coalesced=%d cache_prefetches=%d cache_prefetch_failures=%d",
 		st.queries,
 		st.blocked,
 		st.cached,
@@ -120,6 +120,8 @@ stats_line :: proc(
 		// operator's eye reading the same line every day is.
 		st.unreadable_rcode,
 		st.coalesced,
+		cs.prefetches,
+		cs.prefetch_failures,
 	)
 }
 
@@ -718,6 +720,33 @@ render_cache_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 		.Counter,
 		"Expired answers served because no fresh one could be got.",
 		cs.stale,
+	)
+	/*
+	What `cache.prefetch` costs, and how often it came to nothing.
+
+	A prefetch is not a query anybody sent, so it is in neither
+	`elodin_answers_total` nor the hit and miss counts; the client whose hit
+	started it is counted there, as the cache hit it was. Its exchange is in the
+	upstream series like any other, which is where the extra traffic shows.
+
+	A failure is a prefetch that left the entry as it was - no answer, or one
+	with nothing to store. That entry expires as it would have without
+	prefetching and is not tried again, so a rising figure is an upstream
+	having trouble rather than load.
+	*/
+	metrics.scalar(
+		b,
+		"elodin_cache_prefetches_total",
+		.Counter,
+		"Entries refreshed in the background because a query reached them near expiry.",
+		cs.prefetches,
+	)
+	metrics.scalar(
+		b,
+		"elodin_cache_prefetch_failures_total",
+		.Counter,
+		"Prefetches that left the entry unrenewed.",
+		cs.prefetch_failures,
 	)
 	metrics.scalar(
 		b,
