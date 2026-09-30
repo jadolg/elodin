@@ -138,7 +138,11 @@ fail :: proc(r: ^Runner, format: string, args: ..any) {
 		r.failed += 1
 		// No progress mark: the harness's own scratch runners fail outside a
 		// case on purpose, and the details and the total are what report this.
-		append(&r.failures, fmt.aprintf("FAIL (setup, after %q): %s", r.current, message))
+		if r.current == "" {
+			append(&r.failures, fmt.aprintf("FAIL (setup): %s", message))
+		} else {
+			append(&r.failures, fmt.aprintf("FAIL (setup, after %q): %s", r.current, message))
+		}
 		return
 	}
 	r.current_failed = true

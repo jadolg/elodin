@@ -26,7 +26,7 @@ Every five minutes, `msg=stats` carries, in order: `queries`, `blocked`,
 `handshakes`, `limited`, `truncated`, `secure`, `bogus`, `rebind`,
 `special_use`, `cache_entries`, `cache_bytes`, `cache_hits`, `cache_withheld`,
 `cache_misses`, `cache_stale`, `cache_evictions`, `unreadable_rcode`,
-`coalesced`.
+`coalesced`, `cache_prefetches`, `cache_prefetch_failures`.
 
 ## Query log
 

@@ -1503,7 +1503,8 @@ load_cache :: proc(l: ^Loader, cfg: ^Config) {
 	   cfg.cache.prefetch_min_ttl > ceiling {
 		errorf(
 			l,
-			"cache.prefetch_min_ttl must not be larger than cache.max_ttl; set cache.prefetch: false to turn prefetching off",
+			"cache.prefetch_min_ttl must not be larger than cache.max_ttl (%d seconds); set cache.prefetch: false to turn prefetching off",
+			ceiling,
 		)
 	}
 }
