@@ -22,9 +22,26 @@ blocking:
   # allow: ["||googleadservices.com^"]   # an exception outranks every list
 ```
 
-Downloaded lists are cached under `cache_dir`. A refresh that fails falls back
-to the cached copy if there is one, so a network outage does not turn blocking
-off once a list has been fetched.
+Downloaded lists are cached under `cache_dir`, every `refresh`. A download
+that fails falls back to the cached copy if there is one, so a network outage
+does not turn blocking off once a list has been fetched.
+
+- A download counts as failed when it is a web page (its first non-blank byte
+  is `<`: a captive portal, an error page sent as a 200) or holds no rules,
+  and it does not replace the cached copy (`the download is a web page, not a
+  list`, `the download holds no rules; keeping the cached copy`).
+- The cached copy is replaced by writing a temporary file beside it, syncing
+  it, then renaming it over the old one. A power cut mid-write leaves the old
+  copy or the new one, never a truncated list.
+- If a list that loaded before has neither a download nor a cached copy at a
+  refresh, the refresh is dropped and every rule already in effect is kept
+  (`list NAME: loaded before and unavailable now; keeping the rules already in
+  effect`). This happens with an unwritable or cleared `cache_dir`. A list that
+  has never loaded does not hold the other lists back.
+- A refresh where some list is unavailable, or was served from its cached copy
+  because the download failed, is retried after 1 minute, then 2, 4 and so on,
+  up to `refresh` (`blocklists: not every list is current; trying again in
+  1m0s`). A start that could not load every list is retried the same way.
 
 ## Rule syntax
 

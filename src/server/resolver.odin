@@ -213,6 +213,10 @@ Server :: struct {
 	apex_memo:    Apex_Memo,
 	answers:      ^cache.Cache,
 	filters:      ^filter.Engine,
+	// Which lists the rules in `filters` were built with, one slot per list as
+	// `build_filter_sets` numbers them; nil before the first load. The caller
+	// that built this `Server` frees it. See `reload_filters`.
+	lists_loaded: []bool,
 	validator:    ^dnssec.Validator,
 	/*
 	The operator's own trust anchors, as parsed.

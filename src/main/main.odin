@@ -764,8 +764,10 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	}
 	defer server.stop_cookies(&s)
 
+	defer delete(s.lists_loaded)
+	lists_current := true
 	if cfg.blocking.enabled {
-		server.reload_filters(&s, !opts.no_fetch)
+		lists_current = server.reload_filters(&s, !opts.no_fetch)
 	}
 
 	listeners: server.Listeners
@@ -833,7 +835,7 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 		cfg.rebind.enabled,
 	)
 
-	maintenance_loop(&s, &listeners, answers, cfg, opts)
+	maintenance_loop(&s, &listeners, answers, cfg, opts, lists_current)
 }
 
 /*
@@ -899,9 +901,16 @@ maintenance_loop :: proc(
 	answers: ^cache.Cache,
 	cfg: ^config.Config,
 	opts: Options,
+	lists_current: bool,
 ) {
 	TICK :: 30 * time.Second
 	last_refresh := time.now()
+	// Zero while the lists are current; otherwise the wait before the next
+	// attempt, which `refresh_retry` stretches on each failure (#411).
+	retry: time.Duration
+	if !lists_current {
+		retry = server.refresh_retry(0, cfg.blocking.refresh)
+	}
 	last_report := time.now()
 	// What the kernel had dropped at the last report, so the line below is
 	// about the interval rather than about the whole run. A counter that only
@@ -935,9 +944,15 @@ maintenance_loop :: proc(
 		}
 
 		if cfg.blocking.enabled && !opts.no_fetch && cfg.blocking.refresh > 0 {
-			if time.diff(last_refresh, time.now()) >= cfg.blocking.refresh {
+			wait := retry if retry > 0 else cfg.blocking.refresh
+			if time.diff(last_refresh, time.now()) >= wait {
 				logx.infof("refreshing blocklists")
-				server.reload_filters(s, true)
+				if server.reload_filters(s, true) {
+					retry = 0
+				} else {
+					retry = server.refresh_retry(retry, cfg.blocking.refresh)
+					logx.warnf("blocklists: not every list is current; trying again in %v", retry)
+				}
 				last_refresh = time.now()
 			}
 		}
