@@ -234,6 +234,8 @@ main :: proc() {
 
 	section(&r, "blocklist downloads")
 	run_list_download_cases(&r)
+	run_list_refresh_cases(&r)
+	run_list_bad_download_cases(&r)
 
 	section(&r, "upstream strategies")
 	run_strategy_cases(&r)
