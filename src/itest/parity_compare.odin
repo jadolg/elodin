@@ -180,7 +180,7 @@ parity_compare :: proc(
 	dropped := pc_first_dropped(&c, up, el)
 	pc_header(&c, q, up, el, policy, dropped)
 	pc_records(&c, q, up, el, policy)
-	pc_edns(&c, q, up, el, policy, dropped)
+	pc_edns(&c, q, up, el, policy, pc_first_dropped(&c, up, el, false))
 	return c
 }
 
@@ -226,9 +226,15 @@ says nothing; the only question is whether the one at the truncation point would
 have gone in.
 
 Costed by `pc_rr_cost`, like every other record whose room is in question.
+
+`with_additional` false leaves the additional section out. `pc_edns` asks it that
+way: a missing OPT record is excused only where the answer and authority alone
+leave no room for one, and glue left out behind them is judged record by record
+in `pc_records`, so counting it here would refuse the excuse to an answer whose
+only loss was glue that never fitted either.
 */
 @(private = "file")
-pc_first_dropped :: proc(c: ^Parity_Compare, up, el: Pw_Msg) -> int {
+pc_first_dropped :: proc(c: ^Parity_Compare, up, el: Pw_Msg, with_additional := true) -> int {
 	// Matches are consumed as they are found. Without that, a section holding
 	// forty copies of one record reads as complete however few of them came
 	// back: every upstream copy matches the one elodin kept, and a truncation
@@ -260,6 +266,9 @@ pc_first_dropped :: proc(c: ^Parity_Compare, up, el: Pw_Msg) -> int {
 	}
 	if n := next(c, up.authority, el.authority); n >= 0 {
 		return n
+	}
+	if !with_additional {
+		return -1
 	}
 	return next(c, up.additional, el.additional)
 }
