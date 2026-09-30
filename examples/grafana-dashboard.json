@@ -2324,7 +2324,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Entries refreshed in the background because a query reached them in the last tenth of their lifetime (cache.prefetch), and those that came back unrenewed. Failures rising is an upstream in trouble; the entry expires as it would have without prefetching.",
+      "description": "Entries refreshed in the background because a query reached them in the last tenth of their lifetime (cache.prefetch), and those that came back unrenewed: no answer, nothing storable, or a caching upstream's counted-down TTL. The entry then expires as it would have without prefetching.",
       "fieldConfig": {
         "defaults": {
           "color": {

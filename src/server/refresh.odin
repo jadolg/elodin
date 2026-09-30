@@ -322,12 +322,12 @@ start_prefetch :: proc(
 	limit: int,
 	serial: u64,
 ) {
-	r := start_refresh(s, key, query, proto, client, limit, time.now(), prefetch = true, serial = serial)
-	if r == nil {
-		return
+	// Counted by the job itself, ahead of any failure it counts, so a scrape
+	// never sees more failures than prefetches.
+	if r := start_refresh(s, key, query, proto, client, limit, time.now(), prefetch = true, serial = serial);
+	   r != nil {
+		refresh_release(r)
 	}
-	cache.note_prefetch(s.answers)
-	refresh_release(r)
 }
 
 // Take this refresh out of the table, so the next query for the name starts a
@@ -422,6 +422,9 @@ refresh_job :: proc(data: rawptr) {
 	*/
 	s := r.server
 	prefetching = r.prefetch
+	if r.prefetch {
+		cache.note_prefetch(s.answers)
+	}
 	defer {
 		/*
 		Read off the cache rather than off the answer: an upstream can answer

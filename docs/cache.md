@@ -43,6 +43,11 @@ the entry is refreshed in the background (Unbound's `prefetch` rule).
   refreshed. Each entry gets one refresh: if it leaves the entry unrenewed (no
   answer, or nothing storable) the entry expires as it would have, and with
   `serve_stale` the stale path takes over from there.
+- **Caching upstreams.** A public resolver's copy counts down alongside this
+  one, so a prefetch can come back with the seconds this entry already had left.
+  Such a renewal ends when the old entry would have: it counts as a prefetch
+  failure and is not refreshed again. A high failure share against such an
+  upstream means it is handing back counted-down TTLs, not that it is failing.
 - **Cost.** A name asked for steadily is fetched about 11% more often (at 90% of
   its TTL rather than after it), and at most once per lifetime.
 - **`prefetch_min_ttl`** leaves entries stored with a shorter lifetime (after

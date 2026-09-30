@@ -3462,7 +3462,9 @@ serve_bogus_verdict :: proc(
 	outcome: Outcome,
 	ok: bool,
 ) {
-	sync.atomic_add(&s.stats.bogus, 1)
+	// Both are this client's refusal, replayed rather than reached, so a
+	// prefetch that lands here counts in neither; see `prefetching`.
+	count_answer(&s.stats.bogus)
 	count_answer(&s.stats.failed)
 	/*
 	Not counted as `cached`, and nothing to reconcile: the client was refused

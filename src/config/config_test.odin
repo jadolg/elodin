@@ -270,6 +270,15 @@ test_cache_prefetch :: proc(t: ^testing.T) {
 		testing.expect(t, strings.contains(e.messages[0], "cache.prefetch_min_ttl"))
 	}
 
+	// `max_ttl: 0` is the cache's day, and a threshold above that is as unreachable.
+	_, zerr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\ncache:\n  max_ttl: 0\n  prefetch_min_ttl: 100000\n",
+		context.temp_allocator,
+	)
+	if e, has := zerr.?; testing.expect(t, has, "a threshold above the cache's own day was accepted") {
+		testing.expect(t, strings.contains(e.messages[0], "cache.prefetch_min_ttl"))
+	}
+
 	_, oerr := load_string(
 		"upstream:\n  servers: [1.1.1.1]\ncache:\n  max_ttl: 1h\n  prefetch: false\n  prefetch_min_ttl: 2h\n",
 		context.temp_allocator,

@@ -228,3 +228,35 @@ test_prefetch_counters_reach_the_endpoint :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(page, "\nelodin_cache_prefetch_failures_total 3\n"), page)
 	free_all(context.temp_allocator)
 }
+
+/*
+A prefetch that meets a remembered Bogus verdict counts nothing.
+
+Serving the verdict replays a refusal reached earlier, for a client; the
+prefetch is not one, and no validation ran to count in the DNSSEC series.
+*/
+@(test)
+test_a_prefetch_does_not_count_a_replayed_verdict :: proc(t: ^testing.T) {
+	cfg: config.Config
+	s := stale_server(&cfg, nil, nil)
+	query := stale_query(true)
+	msg, derr := dns.decode_message(query, context.temp_allocator)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
+	hit := Cached_Answer {
+		wire = make([]u8, len(query), context.temp_allocator),
+	}
+	copy(hit.wire, query)
+
+	prefetching = true
+	serve_bogus_verdict(&s, hit, query, msg, msg.question[0], .UDP, "127.0.0.1:5555", time.now())
+	prefetching = false
+	testing.expect_value(t, s.stats.bogus, 0)
+	testing.expect_value(t, s.stats.failed, 0)
+
+	serve_bogus_verdict(&s, hit, query, msg, msg.question[0], .UDP, "127.0.0.1:5555", time.now())
+	testing.expect_value(t, s.stats.bogus, 1)
+	testing.expect_value(t, s.stats.failed, 1)
+	free_all(context.temp_allocator)
+}

@@ -1493,13 +1493,14 @@ load_cache :: proc(l: ^Loader, cfg: ^Config) {
 	wrote: the default is below any `max_ttl` worth setting, and a file from
 	before this key existed that caps entries under it has nothing here to be
 	wrong about - its entries are all short, and short ones are left to expire.
-	Zero `max_ttl` is the cache's own day, which nothing here can be above.
+	Zero `max_ttl` is the cache's own ceiling of a day (`cache.make_cache`),
+	which a threshold can be above too.
 	*/
+	ceiling := cfg.cache.max_ttl if cfg.cache.max_ttl > 0 else 86400
 	if cfg.cache.enabled &&
 	   cfg.cache.prefetch &&
 	   !yaml.is_null(yaml.get(n, "prefetch_min_ttl")) &&
-	   cfg.cache.max_ttl > 0 &&
-	   cfg.cache.prefetch_min_ttl > cfg.cache.max_ttl {
+	   cfg.cache.prefetch_min_ttl > ceiling {
 		errorf(
 			l,
 			"cache.prefetch_min_ttl must not be larger than cache.max_ttl; set cache.prefetch: false to turn prefetching off",

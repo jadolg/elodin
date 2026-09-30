@@ -729,10 +729,11 @@ render_cache_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 	started it is counted there, as the cache hit it was. Its exchange is in the
 	upstream series like any other, which is where the extra traffic shows.
 
-	A failure is a prefetch that left the entry as it was - no answer, or one
-	with nothing to store. That entry expires as it would have without
-	prefetching and is not tried again, so a rising figure is an upstream
-	having trouble rather than load.
+	A failure is a prefetch that left the entry as it was - no answer, one with
+	nothing to store, or one that ends no later than the old entry, which is
+	what an upstream that is a cache itself hands back when its copy counted
+	down alongside ours. That entry expires as it would have without
+	prefetching and is not tried again.
 	*/
 	metrics.scalar(
 		b,

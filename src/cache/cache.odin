@@ -98,7 +98,8 @@ Entry :: struct {
 	`claim_prefetch`.
 
 	One per entry, never reset: the answer a refresh brings back is a new entry
-	with a flag of its own. What this holds off is the refresh that failed. The
+	with a flag of its own - unless it ends no later than this one, when `put`
+	hands it this one's. What this holds off is the refresh that failed. The
 	entry it left behind is still inside its window, and without the flag every
 	hit until it expires would start another refresh - an upstream query per
 	client query, against an upstream that is already failing.
@@ -725,12 +726,15 @@ note_prefetch_failed :: proc(c: ^Cache) {
 }
 
 /*
-Whether `key` now holds an entry other than the one numbered `serial`.
+Whether `key` now holds an entry other than the one numbered `serial`, that
+lives past it.
 
-What says a refresh worked, read off the cache rather than off the answer it
+What says a prefetch worked, read off the cache rather than off the answer it
 got: an upstream can answer and still leave nothing storable - a SERVFAIL, a
 zero TTL - and then the old entry is what the next client meets. An entry
-evicted since reads as not renewed too, since nothing replaced it either.
+evicted since reads as not renewed too, since nothing replaced it either. So
+does a replacement that ends when the old entry would have, which `put` marks
+by handing it the old entry's spent claim.
 */
 renewed :: proc(c: ^Cache, key: string, serial: u64) -> bool {
 	if c == nil {
@@ -739,7 +743,7 @@ renewed :: proc(c: ^Cache, key: string, serial: u64) -> bool {
 	sync.mutex_lock(&c.mu)
 	defer sync.mutex_unlock(&c.mu)
 	e, found := c.entries[key]
-	return found && e.serial != serial
+	return found && e.serial != serial && !e.prefetched
 }
 
 // Count a stale answer that a caller went on to serve; see `Stats.stale`.
@@ -996,6 +1000,20 @@ put :: proc(
 	defer sync.mutex_unlock(&c.mu)
 
 	if old, exists := c.entries[key]; exists {
+		/*
+		A replacement that ends no later than what it replaces inherits a spent
+		prefetch claim. That is what a prefetch gets back from an upstream that
+		is a cache itself: its copy counted down alongside ours, so the answer
+		carries the time ours had left and the renewal ends when the old entry
+		would have. Re-armed, the new entry would be refreshed again in its own
+		last tenth, and again, for the same instant - upstream queries that buy
+		nothing. Kept spent, it expires as it would have, and `renewed` reads it
+		as the prefetch that did not help. A second's slack for the whole seconds
+		a TTL is counted in.
+		*/
+		if old.prefetched && time.diff(old.expires, e.expires) <= time.Second {
+			e.prefetched = true
+		}
 		remove_entry(c, old)
 	}
 	c.serials += 1

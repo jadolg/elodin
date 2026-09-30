@@ -141,3 +141,39 @@ test_renewed_reads_the_entry_not_the_answer :: proc(t: ^testing.T) {
 	testing.expect(t, !renewed(c, "gone", hit.serial), "a key with no entry reads as renewed")
 	free_all(context.temp_allocator)
 }
+
+/*
+A renewal that ends when the old entry would have keeps the old entry's spent
+claim, and does not read as renewed.
+
+That is what an upstream that is itself a cache hands a prefetch: its copy
+counted down with ours, so the answer carries the seconds ours had left. Given a
+claim of its own, the new entry would be refreshed again in its last tenth, for
+the same instant, and again - upstream queries that buy nothing, counted as
+successes. A renewal that does end later is a new entry with its own claim.
+*/
+@(test)
+test_a_renewal_that_ends_no_later_keeps_the_spent_claim :: proc(t: ^testing.T) {
+	c := prefetch_cache()
+	defer destroy(c)
+
+	testing.expect(t, age_into(c, "k", 600, 30 * time.Second), "the entry was not stored")
+	_, claimed, _ := get(c, "k", context.temp_allocator, prefetch = true)
+	testing.expect(t, claimed.prefetch, "the entry was not handed its refresh")
+
+	// The upstream's counted-down copy: thirty seconds, the time ours had left.
+	wire, msg := build_answer("prefetch.example.", 30, context.temp_allocator)
+	testing.expect(t, put(c, "k", wire, msg), "the renewal was not stored")
+	testing.expect(t, !renewed(c, "k", claimed.serial), "a renewal ending at the old expiry reads as renewed")
+	c.entries["k"].inserted = time.time_add(time.now(), -28 * time.Second)
+	c.entries["k"].expires = time.time_add(time.now(), 2 * time.Second)
+	_, again, _ := get(c, "k", context.temp_allocator, prefetch = true)
+	testing.expect(t, !again.prefetch, "a renewal that did not extend the entry was handed another refresh")
+
+	// A renewal that does end later is a new entry, with its own claim.
+	full, full_msg := build_answer("prefetch.example.", 600, context.temp_allocator)
+	_, spent, _ := get(c, "k", context.temp_allocator)
+	testing.expect(t, put(c, "k", full, full_msg), "the renewal was not stored")
+	testing.expect(t, renewed(c, "k", spent.serial), "a renewal that extended the entry reads as not renewed")
+	free_all(context.temp_allocator)
+}
