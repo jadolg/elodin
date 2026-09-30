@@ -1,5 +1,6 @@
 package filter
 
+import "core:net"
 import "core:strings"
 
 Format :: enum u8 {
@@ -99,21 +100,12 @@ first_field_is_ip :: proc(line: string) -> bool {
 	} else {
 		return false
 	}
-	if strings.contains(field, ":") {
-		return true
-	}
-	dots := 0
-	for i in 0 ..< len(field) {
-		c := field[i]
-		switch {
-		case c == '.':
-			dots += 1
-		case c >= '0' && c <= '9':
-		case:
-			return false
-		}
-	}
-	return dots == 3
+	// Parsed, not judged by its characters: any word with a colon in it passed
+	// for an IPv6 address, so a plain-text error page served as a hosts list
+	// (`Error: rate limited`) was read as one (#317).
+	_, v4 := net.parse_ip4_address(field)
+	_, v6 := net.parse_ip6_address(field)
+	return v4 || v6
 }
 
 @(private)
@@ -176,11 +168,16 @@ parse_hosts_line :: proc(block: ^Set, raw: string) -> (added: int) {
 	if line == "" {
 		return 0
 	}
-	// "IP host [host...]": everything after the address is a name to sink.
-	space := strings.index_any(line, " \t")
-	if space < 0 {
+	/*
+	"IP host [host...]": everything after the address is a name to sink. A line
+	whose first field is no address is not a hosts entry (hosts(5)), and Blocky
+	refuses it likewise. Taken as one, a mirror's `429 Too Many Requests` served
+	as a 200 sank `too`, `many` and `requests`, and passed for a list (#317).
+	*/
+	if !first_field_is_ip(line) {
 		return 0
 	}
+	space := strings.index_any(line, " \t")
 	rest := strings.trim_space(line[space:])
 	for len(rest) > 0 {
 		host := rest

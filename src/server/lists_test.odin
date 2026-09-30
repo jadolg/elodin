@@ -2,6 +2,7 @@ package server
 
 import "core:fmt"
 import "core:os"
+import "core:strings"
 import "core:testing"
 import "core:time"
 import "elodin:config"
@@ -86,12 +87,18 @@ test_a_refresh_that_loses_a_list_keeps_the_rules_in_effect :: proc(t: ^testing.T
 	refresh a day later (#411). The rules in effect stay instead, and the refresh
 	says it was not current so it is retried sooner.
 	*/
-	path := fmt.tprintf("/tmp/elodin-server-lists-test-lost-%d.txt", os.get_pid())
+	// A downloaded list read from its cached copy, as a start without the
+	// network reads it; taking the copy away is losing both.
+	dir := fmt.tprintf("/tmp/elodin-server-lists-test-lost-%d", os.get_pid())
+	testing.expect(t, os.make_directory(dir) == nil)
+	defer os.remove(dir)
+	cfg := config.default_config()
+	cfg.blocking.cache_dir = dir
+	cfg.blocking.lists = []config.Block_List{{name = "l", url = "http://192.0.2.1/l.txt", format = .Adblock, enabled = true}}
+	path := strings.clone(list_cache_path(&cfg, cfg.blocking.lists[0]), context.temp_allocator)
 	testing.expect(t, os.write_entire_file(path, "||kept.example^\n") == nil)
 	defer os.remove(path)
 
-	cfg := config.default_config()
-	cfg.blocking.lists = []config.Block_List{{name = "l", file = path, format = .Adblock, enabled = true}}
 	engine := filter.engine_make()
 	defer filter.engine_destroy(engine)
 	s := Server {
@@ -114,6 +121,7 @@ test_a_refresh_that_loses_a_list_keeps_the_rules_in_effect :: proc(t: ^testing.T
 	testing.expect(t, reload_filters(&s, false))
 	testing.expect(t, filter.engine_match(engine, "back.example") == .Blocked)
 	testing.expect(t, filter.engine_match(engine, "kept.example") != .Blocked)
+	free_all(context.temp_allocator)
 }
 
 @(test)
@@ -151,8 +159,10 @@ test_a_failed_refresh_is_retried_on_a_doubling_backoff :: proc(t: ^testing.T) {
 	day := 24 * time.Hour
 	testing.expect_value(t, refresh_retry(0, day), REFRESH_RETRY_FIRST)
 	testing.expect_value(t, refresh_retry(REFRESH_RETRY_FIRST, day), 2 * REFRESH_RETRY_FIRST)
-	testing.expect_value(t, refresh_retry(16 * time.Hour, day), day)
-	testing.expect_value(t, refresh_retry(day, day), day)
+	testing.expect_value(t, refresh_retry(REFRESH_RETRY_MAX / 2 + time.Minute, day), REFRESH_RETRY_MAX)
+	testing.expect_value(t, refresh_retry(REFRESH_RETRY_MAX, day), REFRESH_RETRY_MAX)
+	// Nor longer than the interval, where that is shorter than the cap.
+	testing.expect_value(t, refresh_retry(20 * time.Minute, 30 * time.Minute), 30 * time.Minute)
 	// An interval shorter than the first retry is never exceeded.
 	testing.expect_value(t, refresh_retry(0, 10 * time.Second), 10 * time.Second)
 	// The maintenance loop waits the retry while there is one, and the
@@ -231,5 +241,49 @@ test_a_list_of_badfilter_rules_holds_rules :: proc(t: ^testing.T) {
 
 	_, held = parse_list_text(block, allow, "! only a comment\n\n", .Adblock)
 	testing.expect(t, !held, "a list with no rules was read as holding some")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_a_deleted_file_list_is_lifted :: proc(t: ^testing.T) {
+	// A `file:` list is the operator's own: deleting it is how its blocks are
+	// lifted, so its absence does not keep them (#411 keeps a download's).
+	path := fmt.tprintf("/tmp/elodin-server-lists-test-deleted-%d.txt", os.get_pid())
+	testing.expect(t, os.write_entire_file(path, "||lifted.example^\n") == nil)
+	defer os.remove(path)
+
+	cfg := config.default_config()
+	cfg.blocking.lists = []config.Block_List{{name = "l", file = path, format = .Adblock, enabled = true}}
+	engine := filter.engine_make()
+	defer filter.engine_destroy(engine)
+	s := Server {
+		cfg     = &cfg,
+		filters = engine,
+	}
+	defer delete(s.lists_loaded)
+
+	testing.expect(t, reload_filters(&s, false))
+	testing.expect(t, filter.engine_match(engine, "lifted.example") == .Blocked)
+	os.remove(path)
+	testing.expect(t, !reload_filters(&s, false), "a missing list was reported current")
+	testing.expect(t, filter.engine_match(engine, "lifted.example") != .Blocked, "a deleted file list kept its blocks")
+}
+
+@(test)
+test_a_cached_page_is_not_a_list :: proc(t: ^testing.T) {
+	// A page cached by a build that wrote a download before checking it.
+	dir := fmt.tprintf("/tmp/elodin-server-lists-test-page-%d", os.get_pid())
+	testing.expect(t, os.make_directory(dir) == nil)
+	defer os.remove(dir)
+	cfg := config.default_config()
+	cfg.blocking.cache_dir = dir
+	list := config.Block_List{name = "l", url = "http://192.0.2.1/l.txt", format = .Hosts, enabled = true}
+	path := list_cache_path(&cfg, list)
+	testing.expect(t, os.write_entire_file(path, "<html>\n0.0.0.0 portal.example\n</html>\n") == nil)
+	defer os.remove(path)
+
+	text, load := cached_copy(&cfg, list, .Current)
+	testing.expect_value(t, load, List_Load.Unavailable)
+	testing.expect_value(t, text, "")
 	free_all(context.temp_allocator)
 }

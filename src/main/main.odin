@@ -908,8 +908,9 @@ maintenance_loop :: proc(
 	// Zero while the lists are current; otherwise the wait before the next
 	// attempt, which `refresh_retry` stretches on each failure (#411).
 	retry: time.Duration
-	if !lists_current {
+	if !lists_current && !opts.no_fetch && cfg.blocking.refresh > 0 {
 		retry = server.refresh_retry(0, cfg.blocking.refresh)
+		logx.warnf("blocklists: not every list is current; trying again in %v", retry)
 	}
 	last_report := time.now()
 	// What the kernel had dropped at the last report, so the line below is

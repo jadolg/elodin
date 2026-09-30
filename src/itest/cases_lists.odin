@@ -288,6 +288,7 @@ run_list_bad_download_cases :: proc(r: ^Runner) {
 	http_mock_serve(http, "/good.txt", "0.0.0.0 cached.test\n")
 	http_mock_serve(http, "/portal.html", "\n<!DOCTYPE html>\n<html><body>Sign in to continue.\n0.0.0.0 portal.example\n</body></html>\n")
 	http_mock_serve(http, "/empty.txt", "")
+	http_mock_serve(http, "/busy.txt", "429 Too Many Requests\n")
 	if !http_mock_start(http) {
 		skip_case(r, "lists: bad download", "cannot start the HTTP mock")
 		return
@@ -316,6 +317,7 @@ run_list_bad_download_cases :: proc(r: ^Runner) {
 		{"lists: a good download is cached", "/good.txt"},
 		{"lists: a web page served as a list keeps the cached copy", "/portal.html"},
 		{"lists: an empty download keeps the cached copy", "/empty.txt"},
+		{"lists: a plain-text error page keeps the cached copy", "/busy.txt"},
 	}
 	for step, i in steps {
 		start_case(r, step.name)
