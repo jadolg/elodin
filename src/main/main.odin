@@ -942,7 +942,7 @@ maintenance_loop :: proc(
 		}
 
 		if cfg.blocking.enabled && !opts.no_fetch && cfg.blocking.refresh > 0 {
-			wait := retry if retry > 0 else cfg.blocking.refresh
+			wait := server.refresh_wait(retry, cfg.blocking.refresh)
 			if time.diff(last_refresh, time.now()) >= wait {
 				logx.infof("refreshing blocklists")
 				if server.reload_filters(s, true) {

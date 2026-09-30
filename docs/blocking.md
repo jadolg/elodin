@@ -29,7 +29,7 @@ does not turn blocking off once a list has been fetched.
 - A download counts as failed when it is a web page (its first non-blank byte
   is `<`: a captive portal, an error page sent as a 200) or holds no rules,
   and it does not replace the cached copy (`the download is a web page, not a
-  list`, `the download holds no rules; keeping the cached copy`).
+  list`, `the download holds no rules, so it is not cached`).
 - The cached copy is replaced by writing a temporary file beside it, syncing
   it, then renaming it over the old one. A power cut mid-write leaves the old
   copy or the new one, never a truncated list.
