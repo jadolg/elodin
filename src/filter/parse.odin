@@ -282,7 +282,8 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 	`$third-party` and `$~third-party` (`$~first-party`, `$first-party`) are
 	skipped too, as AdGuard Home skips them (#464): urlfilter's `NewDNSEngine`
 	loads only the rules `IsHostLevelNetworkRule` accepts, and that refuses a rule
-	with any option set but `$important` and `$badfilter`, or any option negated.
+	with any flag option but `$important` and `$badfilter` enabled, or any flag
+	option negated; `third-party` is one of those flags.
 	*/
 	/*
 	A regex rule may hold `$` itself, as an anchor. urlfilter takes a rule that

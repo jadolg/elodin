@@ -1,4 +1,4 @@
-[Adblock Plus 2.0]
+[Adblock Plus 2.0]
 ||a.example^$third-party
 ||b.example^$~third-party,important
 /c/$first-party
