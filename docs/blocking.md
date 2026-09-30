@@ -45,22 +45,26 @@ off once a list has been fetched.
   domains and `||` rules cover subtrees, as in AdGuard Home.
 - `address=/…/` (dnsmasq syntax) is accepted. A `server=/…/` line that names a
   server is skipped, since dnsmasq forwards it rather than blocking.
-- `$important` and `$third-party` (`$3p`) are dropped and the rest of the rule
-  kept, so an `@@` exception beats a `$important` block (AdGuard Home does the
-  opposite).
+- `$important` is dropped and the rest of the rule kept, so an `@@` exception
+  beats a `$important` block (AdGuard Home does the opposite).
+- A rule with `$third-party` or `$~third-party` (`$~first-party`,
+  `$first-party`, `$3p`, `$1p`) is skipped, as AdGuard Home's DNS engine skips
+  it, so its `$badfilter` cancels nothing either.
 - `$badfilter` cancels what the named rule covers in any list, whichever rule
   gave it: `||*.x^$badfilter` narrows a `||x^` to blocking only `x`. A list's
   `$badfilter` cannot cancel `blocking.rules` or `blocking.allow`.
 - Skipped, without failing the list: any other modifier (`$dnstype`, `$client`,
   `$domain`, `$elemhide`, `$removeparam`, ...), cosmetic rules (`##`, `$$`), and
-  any rule that is not expressible as a domain or a regex.
+  any rule that is not expressible as a domain or a regex. A modifier is read
+  as written, as urlfilter reads it: `$ important`, `$important, badfilter` and
+  `$IMPORTANT` are unknown, so the rule is skipped.
 
 ## Regex rules
 
 `/…/` is matched as AdGuard Home matches it: against the query name, lowercased
 and without the trailing dot, case-insensitively, anywhere in the name unless
-anchored with `^` and `$`. `@@/…/` is an allow rule, and `$important`,
-`$third-party` and `$badfilter` work as for any other rule.
+anchored with `^` and `$`. `@@/…/` is an allow rule, and modifiers work as
+for any other rule.
 
 As in AdGuard Home, a rule is only tried on a name holding its longest literal
 run, the text left once everything from the first `{`, `(` or `[` to the last of

@@ -50,7 +50,7 @@ build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool) -> (block, a
 	clear(&block.cancelled)
 	clear(&allow.cancelled)
 	for rule in cfg.blocking.rules {
-		if filter.parse_rule(block, allow, rule) == 0 {
+		if !operator_rule_takes(block, allow, rule) {
 			warn_rule_adds_nothing(rule)
 		}
 	}
@@ -60,7 +60,7 @@ build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool) -> (block, a
 		if !strings.has_prefix(text, "@@") {
 			text = fmt.tprintf("@@%s", text)
 		}
-		if filter.parse_rule(block, allow, text) == 0 {
+		if !operator_rule_takes(block, allow, text) {
 			warn_rule_adds_nothing(rule)
 		}
 	}
@@ -82,12 +82,23 @@ build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool) -> (block, a
 	return
 }
 
+/*
+Whether the operator's rule added a rule or, as a `$badfilter`, took one back.
+Looking for `badfilter` in the text instead let a skipped one, such as
+`$important, badfilter` or `$third-party,badfilter`, cancel nothing unremarked.
+*/
+@(private)
+operator_rule_takes :: proc(block, allow: ^filter.Set, text: string) -> bool {
+	cancels := block.cancels + allow.cancels
+	return filter.parse_rule(block, allow, text) > 0 || block.cancels + allow.cancels > cancels
+}
+
 // A list skipping what it cannot honour is routine; the operator's own rule
 // doing nothing is worth a word, since one that did block may now be skipped.
 @(private)
 warn_rule_adds_nothing :: proc(rule: string) {
 	// A dnsmasq route has its own warning at startup.
-	if !strings.contains(rule, "badfilter") && !strings.has_prefix(strings.trim_space(rule), "server=/") {
+	if !strings.has_prefix(strings.trim_space(rule), "server=/") {
 		logx.warnf("blocking rule %q adds nothing: it carries a modifier DNS cannot honour, is cosmetic, is a wildcard or path rule, is a regex this engine cannot run as AdGuard Home does (see docs/blocking.md) or over %d compiled bytes, or no longer fits the regex budget, names no domain, a $badfilter cancels it, or its name is not ASCII (write an international name in punycode, xn--...)", rule, filter.MAX_REGEX_PROGRAM)
 	}
 }

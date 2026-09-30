@@ -1,0 +1,11 @@
+[Adblock Plus 2.0]
+||a.example^$third-party
+||b.example^$~third-party,important
+/c/$first-party
+||d.example^$third-party,badfilter
+||e.example^$~first-party
+||f.example^$~third-party,badfilter
+||g.example^$=x
+||f.example^$important=$third-party
+||g.example^$important=\,badfilter
+||h.example^$third-party$important

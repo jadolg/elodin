@@ -481,14 +481,60 @@ test_a_rule_narrowed_by_a_modifier_is_not_widened :: proc(t: ^testing.T) {
 		"@@||narrow.example^$generichide",
 		// An unknown modifier is not known to leave the rule as wide as it looks.
 		"||narrow.example^$IMPORTANT",
+		// urlfilter does not trim a modifier, so a spaced one is unknown too.
+		"||narrow.example^$ important",
 	}
 	for rule in narrowed {
 		testing.expectf(t, matches(rule, .Adblock, "narrow.example.") == .None, "%q matched", rule)
 	}
 	// Modifiers that do not narrow which queries are blocked keep the rule.
 	testing.expect_value(t, matches("||wide.example^$important\n", .Adblock, "wide.example."), Decision.Blocked)
-	testing.expect_value(t, matches("||wide.example^$third-party\n", .Adblock, "wide.example."), Decision.Blocked)
-	testing.expect_value(t, matches("||wide.example^$3p\n", .Adblock, "wide.example."), Decision.Blocked)
+	testing.expect_value(t, matches("||wide.example^$important,\n", .Adblock, "wide.example."), Decision.Blocked)
+	// `=x` names no modifier, and urlfilter refuses it.
+	testing.expect_value(t, matches("||wide.example^$=x\n", .Adblock, "wide.example."), Decision.None)
+	// A spaced `$badfilter` is skipped too, so it cancels nothing.
+	testing.expect_value(t, matches("||wide.example^\n||wide.example^$important, badfilter\n", .Adblock, "wide.example."), Decision.Blocked)
+}
+
+@(test)
+test_a_third_party_rule_blocks_nothing :: proc(t: ^testing.T) {
+	/*
+	AdGuard Home's DNS engine never loads a rule with `$third-party` set or
+	negated (urlfilter's `IsHostLevelNetworkRule`), so neither blocks (#464).
+	`3p` and `1p` are not aliases urlfilter knows, so they are skipped too.
+	*/
+	third_party := []string {
+		"||narrow.example^$third-party",
+		"||narrow.example^$~first-party",
+		"||narrow.example^$~third-party",
+		"||narrow.example^$first-party",
+		"||narrow.example^$3p",
+		"||narrow.example^$1p",
+		"/narrow/$~third-party",
+		"@@||narrow.example^$~third-party",
+		"||narrow.example^$important,third-party",
+		"/narrow/$third-party",
+		"@@||narrow.example^$third-party",
+		// urlfilter splits the options off at the last `$`, so a value does not
+		// hide one.
+		"||narrow.example^$important=$third-party",
+	}
+	for rule in third_party {
+		testing.expectf(t, matches(rule, .Adblock, "narrow.example.") == .None, "%q matched", rule)
+	}
+	// Its `$badfilter` names a rule that is never added, so it cancels nothing.
+	testing.expect_value(t, matches("||narrow.example^\n||narrow.example^$third-party,badfilter\n", .Adblock, "narrow.example."), Decision.Blocked)
+	testing.expect_value(t, matches("||narrow.example^\n||narrow.example^$~third-party,badfilter\n", .Adblock, "narrow.example."), Decision.Blocked)
+	testing.expect_value(t, matches("||narrow.example^\n||narrow.example^$badfilter=$third-party\n", .Adblock, "narrow.example."), Decision.Blocked)
+	// A `\,` does not split, so this is one `important` whose value is `,badfilter`.
+	testing.expect_value(t, matches("||narrow.example^\n||narrow.example^$important=\\,badfilter\n", .Adblock, "narrow.example."), Decision.Blocked)
+	// Nor does a skipped `@@` rule allow what a plain rule blocks.
+	testing.expect_value(t, matches("||narrow.example^\n@@||narrow.example^$first-party\n", .Adblock, "narrow.example."), Decision.Blocked)
+	// What is left before the last `$` holds a `$`, which no name does.
+	block, allow := set_make(), set_make()
+	defer set_destroy(block)
+	defer set_destroy(allow)
+	testing.expect_value(t, parse_rule(block, allow, "||narrow.example^$third-party$important"), 0)
 }
 
 @(test)

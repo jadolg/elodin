@@ -48,7 +48,10 @@ run_blocking_cases :: proc(r: ^Runner) {
 		`[Adblock Plus 2.0]
 ! adblock-format list
 ||evil.test^
-||modifiers.test^$third-party
+||modifiers.test^$important
+||third-party.test^$third-party
+||first-party.test^$~third-party
+/third-party-regex/$third-party
 @@||good.evil.test^
 |http://exact.test^
 address=/dnsmasq.test/0.0.0.0
@@ -224,6 +227,19 @@ blocking:
 			if check(r, res.ok, "no response") {
 				h := parse_header(r, res.wire)
 				check(r, h.rcode == int(dns.Rcode.NX_Domain), "a rule with $modifiers was dropped")
+			}
+		}
+		end_case(r)
+
+		// AdGuard Home's DNS engine never loads a rule with `$third-party` set or negated (#464).
+		start_case(r, "blocking: a $third-party or $~third-party rule blocks nothing")
+		{
+			for name in ([]string{"third-party.test.", "a.third-party-regex.test.", "first-party.test."}) {
+				res := query_udp(udp_port, build_query(name, u16(dns.Type.A)))
+				if check(r, res.ok, "no response for %s", name) {
+					h := parse_header(r, res.wire)
+					check(r, h.rcode == int(dns.Rcode.No_Error), "%s was blocked by a rule with a third-party modifier", name)
+				}
 			}
 		}
 		end_case(r)
