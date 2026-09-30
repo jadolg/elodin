@@ -272,8 +272,13 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 		line = line[2:]
 	}
 	/*
-	`$important` and `$third-party` do not change which name is matched and are
-	dropped; `$badfilter` cancels the rule it names. Any other modifier narrows
+	`$important` does not change which name is matched and is dropped;
+	`$badfilter` cancels the rule it names. A DNS query is made from no page, so
+	it is never third-party: urlfilter fills every hostname request with
+	`ThirdParty = false` (`FillRequestForHostname`), so `$~third-party` (its
+	spelling `$first-party`) matches every query and is dropped, and
+	`$third-party` (`$~first-party`) matches none and the rule is skipped. Any
+	other modifier narrows
 	the rule - to a query type, a client, a site it is loaded from - or makes it
 	something other than a block (`$elemhide`, `$removeparam`, `$csp`, ...), and
 	dropping it would widen the rule to every query, so the rule is skipped. That
@@ -310,8 +315,7 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 			switch name {
 			case "badfilter":
 				badfilter = true
-			// `3p` is uBlock Origin's and AdGuard's short form of `third-party`.
-			case "important", "third-party", "3p", "":
+			case "important", "~third-party", "first-party", "":
 			case:
 				return 0
 			}

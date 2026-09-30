@@ -45,9 +45,11 @@ off once a list has been fetched.
   domains and `||` rules cover subtrees, as in AdGuard Home.
 - `address=/…/` (dnsmasq syntax) is accepted. A `server=/…/` line that names a
   server is skipped, since dnsmasq forwards it rather than blocking.
-- `$important` and `$third-party` (`$3p`) are dropped and the rest of the rule
-  kept, so an `@@` exception beats a `$important` block (AdGuard Home does the
-  opposite).
+- `$important` is dropped and the rest of the rule kept, so an `@@` exception
+  beats a `$important` block (AdGuard Home does the opposite).
+- A DNS query is never third-party, as in AdGuard Home: a `$third-party` rule
+  (`$~first-party`, `$3p`) blocks nothing and is skipped, and `$~third-party`
+  (`$first-party`) is dropped and the rest of the rule kept.
 - `$badfilter` cancels what the named rule covers in any list, whichever rule
   gave it: `||*.x^$badfilter` narrows a `||x^` to blocking only `x`. A list's
   `$badfilter` cannot cancel `blocking.rules` or `blocking.allow`.

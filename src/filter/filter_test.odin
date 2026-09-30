@@ -55,7 +55,7 @@ test_adblock_syntax :: proc(t: ^testing.T) {
 [Adblock Plus 2.0]
 ! a comment
 ||ads.example^
-||analytics.example^$third-party
+||analytics.example^$important
 @@||allowed.ads.example^
 |http://exactly.example^
 address=/dnsmasq.example/0.0.0.0
