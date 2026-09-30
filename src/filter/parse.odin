@@ -273,16 +273,16 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 	}
 	/*
 	`$important` does not change which name is matched and is dropped;
-	`$badfilter` cancels the rule it names. A DNS query is made from no page, so
-	it is never third-party: urlfilter fills every hostname request with
-	`ThirdParty = false` (`FillRequestForHostname`), so `$~third-party` (its
-	spelling `$first-party`) matches every query and is dropped, and
-	`$third-party` (`$~first-party`) matches none and the rule is skipped. Any
-	other modifier narrows
-	the rule - to a query type, a client, a site it is loaded from - or makes it
-	something other than a block (`$elemhide`, `$removeparam`, `$csp`, ...), and
-	dropping it would widen the rule to every query, so the rule is skipped. That
-	is what AdGuard Home does with a modifier its DNS engine cannot honour.
+	`$badfilter` cancels the rule it names. Any other modifier narrows the rule -
+	to a query type, a client, a site it is loaded from - or makes it something
+	other than a block (`$elemhide`, `$removeparam`, `$csp`, ...), and dropping it
+	would widen the rule to every query, so the rule is skipped. That is what
+	AdGuard Home does with a modifier its DNS engine cannot honour.
+
+	`$third-party` and `$~third-party` (`$~first-party`, `$first-party`) are
+	skipped too, as AdGuard Home skips them (#464): urlfilter's `NewDNSEngine`
+	loads only the rules `IsHostLevelNetworkRule` accepts, and that refuses a rule
+	with any option set but `$important` and `$badfilter`, or any option negated.
 	*/
 	/*
 	A regex rule may hold `$` itself, as an anchor. urlfilter takes a rule that
@@ -308,14 +308,16 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 		modifiers := line[idx + 1:]
 		line = line[:idx]
 		for m in strings.split_iterator(&modifiers, ",") {
-			name := strings.trim_space(m)
-			if eq := strings.index_byte(name, '='); eq >= 0 {
+			// As urlfilter's `loadOptions`: a name is not trimmed, so ` important`
+			// is unknown, and `=x` has no name, so it is unknown too.
+			name := m
+			if eq := strings.index_byte(name, '='); eq > 0 {
 				name = name[:eq]
 			}
 			switch name {
 			case "badfilter":
 				badfilter = true
-			case "important", "~third-party", "first-party", "":
+			case "important", "":
 			case:
 				return 0
 			}

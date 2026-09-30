@@ -47,9 +47,9 @@ off once a list has been fetched.
   server is skipped, since dnsmasq forwards it rather than blocking.
 - `$important` is dropped and the rest of the rule kept, so an `@@` exception
   beats a `$important` block (AdGuard Home does the opposite).
-- A DNS query is never third-party, as in AdGuard Home: a `$third-party` rule
-  (`$~first-party`, `$3p`) blocks nothing and is skipped, and `$~third-party`
-  (`$first-party`) is dropped and the rest of the rule kept.
+- A rule with `$third-party` or `$~third-party` (`$~first-party`,
+  `$first-party`, `$3p`, `$1p`) is skipped, as AdGuard Home's DNS engine skips
+  it, so its `$badfilter` cancels nothing either.
 - `$badfilter` cancels what the named rule covers in any list, whichever rule
   gave it: `||*.x^$badfilter` narrows a `||x^` to blocking only `x`. A list's
   `$badfilter` cannot cancel `blocking.rules` or `blocking.allow`.
@@ -61,8 +61,8 @@ off once a list has been fetched.
 
 `/…/` is matched as AdGuard Home matches it: against the query name, lowercased
 and without the trailing dot, case-insensitively, anywhere in the name unless
-anchored with `^` and `$`. `@@/…/` is an allow rule, and `$important`,
-`$third-party` and `$badfilter` work as for any other rule.
+anchored with `^` and `$`. `@@/…/` is an allow rule, and modifiers work as
+for any other rule.
 
 As in AdGuard Home, a rule is only tried on a name holding its longest literal
 run, the text left once everything from the first `{`, `(` or `[` to the last of

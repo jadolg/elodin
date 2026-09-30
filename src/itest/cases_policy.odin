@@ -50,6 +50,7 @@ run_blocking_cases :: proc(r: ^Runner) {
 ||evil.test^
 ||modifiers.test^$important
 ||third-party.test^$third-party
+||first-party.test^$~third-party
 /third-party-regex/$third-party
 @@||good.evil.test^
 |http://exact.test^
@@ -230,14 +231,14 @@ blocking:
 		}
 		end_case(r)
 
-		// AdGuard Home never matches `$third-party` at DNS: a query is never third-party (#464).
-		start_case(r, "blocking: a $third-party rule blocks nothing")
+		// AdGuard Home's DNS engine never loads a rule with `$third-party` set or negated (#464).
+		start_case(r, "blocking: a $third-party or $~third-party rule blocks nothing")
 		{
-			for name in ([]string{"third-party.test.", "a.third-party-regex.test."}) {
+			for name in ([]string{"third-party.test.", "a.third-party-regex.test.", "first-party.test."}) {
 				res := query_udp(udp_port, build_query(name, u16(dns.Type.A)))
 				if check(r, res.ok, "no response for %s", name) {
 					h := parse_header(r, res.wire)
-					check(r, h.rcode == int(dns.Rcode.No_Error), "%s was blocked by a $third-party rule", name)
+					check(r, h.rcode == int(dns.Rcode.No_Error), "%s was blocked by a rule with a third-party modifier", name)
 				}
 			}
 		}
