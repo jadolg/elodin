@@ -67,11 +67,20 @@ func main() {
 		*seed = uint64(time.Now().UnixNano())
 	}
 	fmt.Printf("seed %d\n", *seed)
-	r := rand.New(rand.NewPCG(*seed, 0))
+	// Seeded, so that a divergence is reproduced from the printed seed; no
+	// secret is drawn from it.
+	r := rand.New(rand.NewPCG(*seed, 0)) // nosemgrep: go.lang.security.audit.crypto.math_random.math-random-used
 
 	patterns := drawPatterns(r, *count)
 	wires, names := drawNames(r)
+	got := runElodin(*driver, patterns, wires)
+	if compare(patterns, names, got, *verbose) > 0 {
+		os.Exit(1)
+	}
+}
 
+// What the driver answers for each pattern: `-`, or a bit per name.
+func runElodin(driver string, patterns []string, wires [][]byte) []string {
 	dir, err := os.MkdirTemp("", "re2diff")
 	check(err)
 	defer os.RemoveAll(dir)
@@ -84,44 +93,50 @@ func main() {
 	}
 	check(os.WriteFile(nameFile, []byte(strings.Join(hexNames, "\n")+"\n"), 0o600))
 
-	out, err := exec.Command(*driver, patternFile, nameFile).Output()
+	out, err := exec.Command(driver, patternFile, nameFile).Output()
 	check(err)
 	got := strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
 	if len(got) != len(patterns) {
 		fmt.Fprintf(os.Stderr, "re2diff: %d results for %d patterns\n", len(got), len(patterns))
 		os.Exit(2)
 	}
+	return got
+}
 
-	kept, refused, declined, divergent := 0, 0, 0, 0
+// Holds elodin's answers to urlfilter's, and returns how many kept patterns
+// disagree.
+func compare(patterns, names, got []string, verbose bool) (divergent int) {
+	kept, refused, declined := 0, 0, 0
 	for i, p := range patterns {
+		want := urlfilterBits(p, names)
 		if got[i] == "-" {
 			refused++
-			if strings.Contains(urlfilterBits(p, names), "1") {
+			if strings.Contains(want, "1") {
 				declined++
-				if *verbose {
+				if verbose {
 					fmt.Printf("REFUSED %q\n", p)
 				}
 			}
 			continue
 		}
 		kept++
-		want := urlfilterBits(p, names)
-		if got[i] == want {
-			continue
-		}
-		divergent++
-		if divergent <= 40 {
-			fmt.Printf("DIVERGENT %q\n", p)
-			for j := range names {
-				if got[i][j] != want[j] {
-					fmt.Printf("  %q: elodin %c, urlfilter %c\n", names[j], got[i][j], want[j])
-				}
+		if got[i] != want {
+			divergent++
+			if divergent <= 40 {
+				report(p, names, got[i], want)
 			}
 		}
 	}
 	fmt.Printf("patterns %d, kept %d, refused %d (%d that urlfilter blocks with), divergent %d\n", len(patterns), kept, refused, declined, divergent)
-	if divergent > 0 {
-		os.Exit(1)
+	return divergent
+}
+
+func report(pattern string, names []string, got, want string) {
+	fmt.Printf("DIVERGENT %q\n", pattern)
+	for j := range names {
+		if got[j] != want[j] {
+			fmt.Printf("  %q: elodin %c, urlfilter %c\n", names[j], got[j], want[j])
+		}
 	}
 }
 
