@@ -3,8 +3,6 @@ package filter
 import "core:fmt"
 import "core:strings"
 import "core:testing"
-import "core:text/regex"
-import "core:text/regex/parser"
 import "core:time"
 
 /*
@@ -194,73 +192,54 @@ test_regex_rules_that_are_refused :: proc(t: ^testing.T) {
 		"/x*/",
 		"/(|a)/",
 		"/^/",
-		// Not a regex this engine has: lookahead, an unclosed group.
-		"/(?=ads)/",
+		// Not RE2: an unclosed group or class, a stray `)`, a range running
+		// backwards, a repeat of a repeat or of nothing, a class range to a
+		// class escape, `\b` in a class, a count past 1000 or below its start,
+		// a trailing `\`.
 		"/(ads/",
-		// A raw non-ASCII byte: no query spells one, and the ASCII engine
-		// would store `š` (U+0161) as the byte `a`.
-		"/š/",
-		"/\x01/",
-		// Read by Odin with another meaning than RE2's: a backreference, a hex
-		// escape, `\A` and `\z`, a POSIX class, `{,M}` and nested repeats.
-		`/(a)\1/`,
-		`/\x61/`,
-		`/\Aa/`,
-		`/a\z/`,
-		`/[[:alpha:]]/`,
-		`/a{,3}/`,
-		`/a{2}{3}/`,
-		`/a**/`,
-		`/a+?+/`,
-		`/a\/`,
-		// A count RE2 reads as characters - a leading zero, a sign, a `_` -
-		// and Odin's strconv reads as a number: `^a{02}$` would block `aa`.
-		`/^a{02}$/`,
-		`/^a{2,03}$/`,
-		`/^a{+2}$/`,
-		`/^a{1_0}$/`,
-		`/^a{2,_3}$/`,
-		// A `#` opens a comment to Odin's tokenizer, so `ads#x` would be `ads`.
-		`/ads#x/`,
-		`/a[#]/`,
-		// RE2 refuses a stray `)` and a range running backwards; Odin reads
-		// `ads)` as `ads` and folds `[a-Z]` into `[a-z]`.
+		"/[ab/",
 		`/a)/`,
 		`/[a-Z]/`,
 		`/[^a-Z]/`,
 		`/[b-\.]/`,
-		// RE2's `(?i)` folds every letter in a range; Odin folds only a range
-		// whose ends are both letters, and then only its ends, so these would
-		// miss a name's `b` (the first three) or `_` (the last two).
-		`/[\.-a]/`,
-		`/[0-Z]/`,
-		`/[5-C]/`,
-		`/[A-z]/`,
-		`/[Z-a]/`,
-		// Odin takes a rune before `\d` as the start of `\d-z`'s range.
-		`/[a\d-z]/`,
+		`/a{2}{3}/`,
+		`/a**/`,
+		`/a+?+/`,
+		`/a*??/`,
+		`/*a/`,
+		`/a|+b/`,
+		`/{2}a/`,
 		`/[a-\d]/`,
-		// Odin's `-` takes the last single rune it holds as a range's start,
-		// even one before a range: `[ab-c-e]` is `b-c` and `a-e` to it, where
-		// RE2 reads `b-c`, `-` and `e`.
-		`/[ab-c-e]/`,
-		// Odin ends a range at a `\`, and reads what it escapes on its own:
-		// `[+-\.]` holds every digit and capital to it.
-		`/[+-\.]/`,
-		// Both read these alike, but only by what Odin's `\d` and `\w` leave
-		// held, which is refused rather than relied on.
-		`/[\d-z]/`,
-		`/[\w-_]/`,
-		// A range from a literal `-`: RE2 has one, Odin reads three runes.
-		`/[--/]/`,
-		`/[a-c--/]/`,
-		// RE2 refuses `\b` in a class, Odin reads it as `b`; Odin reads `[]`
-		// and `[^]` as empty, RE2 as a class opening with `]`.
 		`/[\b]ads/`,
 		`/[\B]ads/`,
 		`/[a-\b]/`,
-		`/[]a]/`,
-		`/[^]a]/`,
+		`/a{1001}/`,
+		`/a{3,2}/`,
+		`/a\/`,
+		// RE2, outside the subset `re2_parse` reads: lookahead, flags, named
+		// groups, a backreference, `\x`, `\A`, `\z`, `\Q`, `\p`, `\n`, octal, a
+		// POSIX class.
+		"/(?=ads)/",
+		"/(?i)ads/",
+		"/(?P<n>ads)/",
+		`/(a)\1/`,
+		`/\x61/`,
+		`/\Aa/`,
+		`/a\z/`,
+		`/\Qa/`,
+		`/\pLa/`,
+		`/a\n/`,
+		`/a\0/`,
+		`/[[:alpha:]]/`,
+		// A raw byte outside printable ASCII: no query name holds one.
+		"/š/",
+		"/\x01/",
+		// A cosmetic rule to urlfilter, not a network rule: a marker at the
+		// first `#` or `$`.
+		`/ads#?#x/`,
+		`/ads##x/`,
+		`/ads#%#x/`,
+		`/ads|a$$/`,
 	}
 	for rule in refused {
 		testing.expectf(t, parse_rule(block, allow, rule) == 0, "%q was added", rule)
@@ -279,15 +258,150 @@ test_regex_rules_that_are_refused :: proc(t: ^testing.T) {
 	}
 }
 
-// A class ending in a range up to `\\` reached an assertion in Odin's parser,
-// which a release build keeps: one list line took the server down at load.
+/*
+Patterns RE2 reads one way and Odin's own parser another, and names spelled one
+way by miekg/dns and another by `dns`: each blocks here exactly what it blocks
+in AdGuard Home. Every `want` is urlfilter's answer, from its `DNSEngine` over
+the name as miekg/dns presents it; `scripts/re2diff` asks it the same of random
+patterns.
+*/
 @(test)
-test_regex_class_range_to_an_escape :: proc(t: ^testing.T) {
-	block, allow := set_make(), set_make()
-	defer set_destroy(block)
-	defer set_destroy(allow)
-	for rule in ([]string{`/[[-\\]/`, `/[\\-\\]/`}) {
-		testing.expectf(t, parse_rule(block, allow, rule) == 0, "%q was added", rule)
+test_regex_reads_as_re2 :: proc(t: ^testing.T) {
+	Case :: struct {
+		rule: string,
+		name: string,
+		want: bool,
+	}
+	cases := []Case {
+		// Odin takes `#` outside a group as the start of a comment.
+		{`/ads#x/`, "ads#x", true},
+		{`/ads#x/`, "ads", false},
+		// A space before it keeps `#?#` and `$$` from being markers.
+		{`/a #?#|ads/`, "ads", true},
+		{`/ads|a $$/`, "ads", true},
+		// A `{` that is no count is itself; Odin's strconv read these as counts,
+		// and `{,3}` as "up to three".
+		{`/^a{02}$/`, "a{02}", true},
+		{`/^a{02}$/`, "aa", false},
+		{`/^a{2,03}$/`, "a{2,03}", true},
+		{`/^a{1_0}$/`, "a{1_0}", true},
+		{`/^a{1_0}$/`, "aaaaaaaaaa", false},
+		{`/^a{,3}$/`, "a{,3}", true},
+		{`/^a{,3}$/`, "aa", false},
+		{`/^ab{$/`, "ab{", true},
+		// `+` repeats the `{` before it.
+		{`/^a{+2}$/`, "a{+2}", false},
+		{`/^a{+2}$/`, "a{{2}", true},
+		// `(?i)` folds every letter in a range, whatever its ends; Odin folded
+		// only a range from a letter to a letter, and then only its ends.
+		{`/^[\.-a]$/`, "b", true},
+		{`/^[\.-a]$/`, "_", true},
+		{`/^[\.-a]$/`, "-", false},
+		{`/^[0-Z]$/`, "b", true},
+		{`/^[0-Z]$/`, "_", false},
+		{`/^[A-z]$/`, "_", true},
+		{`/^[A-z]$/`, "-", false},
+		{`/^[Z-a]$/`, "_", true},
+		{`/^[Z-a]$/`, "b", false},
+		// It folds before `^` negates.
+		{`/^[^A]$/`, "a", false},
+		{`/^[^A]$/`, "b", true},
+		// A range starts only from the element just before its `-`; Odin
+		// started one from whatever single rune it held.
+		{`/^[a\d-z]$/`, "-", true},
+		{`/^[a\d-z]$/`, "5", true},
+		{`/^[a\d-z]$/`, "b", false},
+		{`/^[ab-c-e]$/`, "-", true},
+		{`/^[ab-c-e]$/`, "d", false},
+		{`/^[\w-_]$/`, "-", true},
+		{`/^[--/]$/`, "/", true},
+		{`/^[--/]$/`, "_", false},
+		// A range may end in an escape; Odin read what it escaped on its own,
+		// and `[[-\\]` tripped an assertion in its parser.
+		{`/^[+-\.]$/`, ",", true},
+		{`/^[+-\.]$/`, "5", false},
+		{`/^[[-\\]$/`, "[", true},
+		{`/^[[-\\]$/`, "a", false},
+		// `]` first is itself; Odin read `[]` as an empty class.
+		{`/^[]a]$/`, "]", true},
+		{`/^[]a]$/`, "b", false},
+		{`/^[^]a]$/`, "]", false},
+		{`/^[^]a]$/`, "b", true},
+		// A repeat of an anchor or a boundary, as RE2 takes it.
+		{`/^*ads$/`, "xads", true},
+		{`/ads\b+/`, "ads", true},
+		{`/ads\b+/`, "adsx", false},
+		{`/x(?:$){2}/`, "ax", true},
+		{`/x(?:$){2}/`, "xa", false},
+		// A group captures nothing, so Odin's limit of nine does not apply.
+		{`/^(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)$/`, "abcdefghij", true},
+		// The name is matched as miekg/dns spells it: `(` and `;` behind a
+		// `\`, and a label's `.`, `\` and space as `\.`, `\\` and `\ `.
+		{`/^a\(b$/`, "a(b", false},
+		{`/^a\\\(b$/`, "a(b", true},
+		{`/^a\\;b$/`, "a;b", true},
+		{`/^a\\\.b$/`, "a\\046b", true},
+		{`/^a\\\\b$/`, "a\\092b", true},
+		{`/^a\\ b$/`, "a\\032b", true},
+		{`/^a\\032b$/`, "a\\032b", false},
+		{`/^a\\001b$/`, "a\\001b", true},
+	}
+	for c in cases {
+		block, allow := set_make(), set_make()
+		defer set_destroy(block)
+		defer set_destroy(allow)
+		if !testing.expectf(t, parse_rule(block, allow, c.rule) == 1, "%s was refused", c.rule) {
+			continue
+		}
+		e := engine_make()
+		engine_swap(e, block, allow)
+		got := engine_match(e, c.name) == .Blocked
+		testing.expectf(t, got == c.want, "%s on %q: blocked %v, want %v", c.rule, c.name, got, c.want)
+		engine_swap(e, nil, nil)
+		free(e)
+	}
+}
+
+// A name spelled as miekg/dns spells it can be longer than as `dns` spells
+// it, and the spelled-out form is what `MAX_REGEX_NAME` holds to a hostname's
+// length.
+@(test)
+test_regex_subject_fits_a_hostname :: proc(t: ^testing.T) {
+	e := engine_of("/\\\\\\(/\n")
+	defer engine_destroy(e)
+	parens :: proc(n: int) -> string {
+		return strings.repeat("(", n, context.temp_allocator)
+	}
+	// 125 of them, each spelled `\(`, and a dot: 251 characters.
+	testing.expect_value(t, engine_match(e, fmt.tprintf("%s.%s", parens(62), parens(63))), Decision.Blocked)
+	// 126 and two dots: 254.
+	testing.expect_value(t, engine_match(e, fmt.tprintf("%s.%s.(", parens(62), parens(63))), Decision.None)
+	testing.expect_value(t, engine_match(e, fmt.tprintf("%s.%s.%s.%s", parens(62), parens(62), parens(62), parens(62))), Decision.None)
+}
+
+// Go's `repeatIsValid`: counts nested in one another multiply to 1000 at most.
+// The program bound refuses these too, by a few bytes, so the rule is asked of
+// the parser alone.
+@(test)
+test_regex_nested_counts_multiply :: proc(t: ^testing.T) {
+	context.allocator = context.temp_allocator
+	Case :: struct {
+		pattern: string,
+		ok:      bool,
+	}
+	for c in ([]Case {
+			{"(?:a{2}){500}", true},
+			{"(?:a{2}){501}", false},
+			{"(?:(?:a{0}){1000}){1000}", false},
+			{"(?:(?:a{0}){1000}){1}", true},
+			{"(?:(?:a{2,}){10}){51}", false},
+			{"(?:(?:a*){1000}b){1000}", false},
+			{"(?:a*){1000}", true},
+			{"(?:a{2}|b{3}){334}", false},
+			{"(?:a{2}|b{3}){333}", true},
+		}) {
+		_, ok := re2_parse(c.pattern)
+		testing.expectf(t, ok == c.ok, "%s: parsed %v, want %v", c.pattern, ok, c.ok)
 	}
 }
 
@@ -395,6 +509,11 @@ test_regex_repetition_is_bounded_before_compiling :: proc(t: ^testing.T) {
 		fmt.tprintf("/%sa%s/", strings.repeat("(?:", half / 2, context.temp_allocator), strings.repeat(")", half / 2, context.temp_allocator)),
 		fmt.tprintf("/%sa/", strings.repeat("a|", half, context.temp_allocator)),
 		fmt.tprintf("/%sa/", strings.repeat("b|a", MAX_REGEX_PATTERN / 3 - 1, context.temp_allocator)),
+		// Unbalanced, as deep as the length allows: refused, after `re2_parse`
+		// has recursed once per `(`.
+		fmt.tprintf("/%s/", strings.repeat("(", MAX_REGEX_PATTERN, context.temp_allocator)),
+		fmt.tprintf("/%s/", strings.repeat("(?:", MAX_REGEX_PATTERN / 3, context.temp_allocator)),
+		fmt.tprintf("/%s/", strings.repeat("[", MAX_REGEX_PATTERN, context.temp_allocator)),
 	}
 	for rule in deep {
 		start := time.tick_now()
@@ -473,24 +592,39 @@ test_regex_budget_per_set :: proc(t: ^testing.T) {
 }
 
 // A class is two bytes of program however many entries it lists, and a match
-// tests them one by one, so each is charged too: `[~~~...]` patterns would
-// otherwise fit the budget by the hundred and cost a query fifty times as much.
+// tests them one by one, so each is charged too. Every other printable byte
+// is the most runs a class can have once `re2_parse` has merged neighbours;
+// those patterns would otherwise fit the budget by the hundred and cost a
+// query fifty times as much.
 @(test)
 test_regex_budget_charges_class_entries :: proc(t: ^testing.T) {
 	block, allow := set_make(), set_make()
 	defer set_destroy(block)
 	defer set_destroy(allow)
 
-	class := strings.repeat("~", MAX_REGEX_PATTERN - 8, context.temp_allocator)
-	for i := 0; block.regex_refused == 0; i += 1 {
-		parse_rule(block, allow, fmt.tprintf("/[%s]%d/", class, i))
+	class: strings.Builder
+	strings.builder_init(&class, context.temp_allocator)
+	strings.write_byte(&class, '[')
+	entries := 0
+	for c := u8('!'); c <= '~'; c += 2 {
+		if c == ']' || c == '-' {
+			strings.write_byte(&class, '\\')
+		}
+		strings.write_byte(&class, c)
+		entries += 1
 	}
-	testing.expectf(t, len(block.regexes) <= MAX_REGEX_TOTAL / (MAX_REGEX_PATTERN - 8), "%d class-heavy patterns kept", len(block.regexes))
+	strings.write_byte(&class, ']')
+	classes := strings.repeat(strings.to_string(class), (MAX_REGEX_PATTERN - 8) / len(strings.to_string(class)), context.temp_allocator)
+	entries *= len(classes) / len(strings.to_string(class))
+	for i := 0; block.regex_refused == 0; i += 1 {
+		parse_rule(block, allow, fmt.tprintf("/%s%d/", classes, i))
+	}
+	testing.expectf(t, len(block.regexes) > 0 && len(block.regexes) <= MAX_REGEX_TOTAL / entries, "%d class-heavy patterns kept", len(block.regexes))
 	testing.expect(t, block.regex_bytes <= MAX_REGEX_TOTAL)
 	// What a `$badfilter` gives back is what was charged.
 	charged := block.regex_bytes
-	parse_rule(block, allow, fmt.tprintf("/[%s]0/$badfilter", class))
-	testing.expect(t, block.regex_bytes < charged - (MAX_REGEX_PATTERN - 8))
+	parse_rule(block, allow, fmt.tprintf("/%s0/$badfilter", classes))
+	testing.expect(t, block.regex_bytes < charged - entries)
 }
 
 // `program_bound` is what keeps a pattern from being compiled at all, so it
@@ -507,17 +641,17 @@ test_program_bound_covers_the_compiler :: proc(t: ^testing.T) {
 		// Every node and repeat shape.
 		`a`, `.`, `^$`, `\bx\B`, `[^a-z]`, `(?:ab)`, `a|b|c`, `abi|abe`,
 		`a*`, `a*?`, `a+`, `a+?`, `a?`, `a??`, `.*$`, `.+$`,
-		`(ab){7}`, `(ab){,7}`, `(ab){7,}`, `(ab){3,7}`, `(ab){0,}`, `(a{2,3}|b{4}){2,5}`,
+		`(ab){7}`, `(ab){7,}`, `(ab){3,7}`, `(ab){0,}`, `(a{2,3}|b{4}){2,5}`,
 		`((a|b)*c+){3}d?`, `x{1000}`, `[a-z]{496}z`,
 	}
 	for shape in shapes {
-		re, err := regex.create(shape, REGEX_FLAGS, context.temp_allocator, context.temp_allocator)
-		if !testing.expectf(t, err == nil, "%q did not compile: %v", shape, err) {
+		context.allocator = context.temp_allocator
+		tree, parsed := re2_parse(shape)
+		if !testing.expectf(t, parsed, "%q did not parse", shape) {
 			continue
 		}
-		context.allocator = context.temp_allocator
-		tree, perr := parser.parse(shape, REGEX_FLAGS)
-		testing.expect(t, perr == nil)
+		re, compiled := regex_compile(tree, context.temp_allocator)
+		testing.expectf(t, compiled, "%q did not compile", shape)
 		// Past the limit the bound saturates, which refuses the pattern.
 		bound := program_bound(tree)
 		testing.expectf(
@@ -562,4 +696,46 @@ test_regex_badfilter_past_the_pattern_limit :: proc(t: ^testing.T) {
 	long := strings.repeat("a", 4 * MAX_REGEX_PATTERN, context.temp_allocator)
 	testing.expect_value(t, parse_rule(block, allow, fmt.tprintf("/%s/$badfilter", long)), 0)
 	testing.expect_value(t, len(block.cancelled), 0)
+}
+
+// Odin's compiler holds a program to 254 different classes, which is short of
+// what RE2 takes, so a pattern with more is refused rather than compiled.
+@(test)
+test_regex_class_count_limit :: proc(t: ^testing.T) {
+	block, allow := set_make(), set_make()
+	defer set_destroy(block)
+	defer set_destroy(allow)
+	alphabet := "0123456789abcdefghijklmnopqrstuvwxyz"
+	pattern :: proc(alphabet: string, n: int) -> string {
+		b := strings.builder_make(context.temp_allocator)
+		made := 0
+		for i in 0 ..< len(alphabet) {
+			for j in i + 1 ..< len(alphabet) {
+				if made == n {
+					return strings.to_string(b)
+				}
+				fmt.sbprintf(&b, "[%c%c]", alphabet[i], alphabet[j])
+				made += 1
+			}
+		}
+		return strings.to_string(b)
+	}
+	testing.expect_value(t, parse_rule(block, allow, fmt.tprintf("/%s/", pattern(alphabet, 254))), 1)
+	testing.expect_value(t, parse_rule(block, allow, fmt.tprintf("/%s/", pattern(alphabet, 255))), 0)
+}
+
+// A `$badfilter` of a pattern that could never be added cancels nothing, and
+// is not counted as a cancel, which is how an operator's is warned of.
+@(test)
+test_regex_badfilter_of_a_refused_pattern :: proc(t: ^testing.T) {
+	block, allow := set_make(), set_make()
+	defer set_destroy(block)
+	defer set_destroy(allow)
+	for rule in ([]string{`/\x41/$badfilter`, `/(?=a)/$badfilter`, `/a)/$badfilter`}) {
+		parse_rule(block, allow, rule)
+	}
+	testing.expect_value(t, block.cancels, 0)
+	testing.expect_value(t, len(block.cancelled), 0)
+	parse_rule(block, allow, `/^a{02}$/$badfilter`)
+	testing.expect_value(t, block.cancels, 1)
 }

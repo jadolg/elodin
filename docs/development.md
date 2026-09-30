@@ -25,6 +25,7 @@ mise run fuzz             # build the libFuzzer targets in src/fuzz
 mise run fuzz-regression  # replay the committed corpus through each of them
 mise run parity           # compare answers with the upstream's, synthetic upstream
 mise run parity-regression # replay the seeds in testdata/parity-seeds
+mise run re2-diff         # regex rules against urlfilter, AdGuard Home's engine
 mise run run              # run locally on port 5354 with examples/dev.yaml
 mise run certs            # self-signed certificate for local DoT/DoH testing
 mise run bench            # throughput, latency, CPU and memory (see bench/README.md)
@@ -52,12 +53,14 @@ src/metrics/   Prometheus exposition format, and process figures out of /proc
 src/privdrop/  giving up root once the listeners hold their ports
 src/itest/     integration suite: harness, mock upstreams (DNS, HTTP, DoH/h2), clients, fixtures,
                and the upstream-parity check with its own independent wire walker
-src/fuzz/      libFuzzer targets for the DNS, DNSSEC, HPACK, h2, HTTP/1.1, DoH, blocklist
-               and YAML parsers, and their shared harness
+src/fuzz/      libFuzzer targets for the DNS, DNSSEC, HPACK, h2, HTTP/1.1, DoH, blocklist,
+               regex and YAML parsers, and their shared harness
 testdata/      fuzz corpus and dictionary, committed so a found crash stays
                found, the parity seeds that have found a divergence, plus
                gen/ - the generator behind the DNSSEC fixtures
 bench/         benchmark harness and DNSSEC survey, in Go, with committed results
+scripts/       fuzz and leak-check helpers, and re2diff/: regex rules against
+               urlfilter, a Go generator and oracle with the Odin driver it runs
 examples/      the annotated reference configuration, one per deployment (local-only,
                lan, small-device, public, container), a development one, and a
                Grafana dashboard
@@ -189,6 +192,14 @@ checks kept.
   start.
 - A target that feeds its input through a socket refuses a cap above
   `harness.MAX_FEED` at start-up, since `feed` truncates anything longer.
+
+**Regex rules against AdGuard Home** (`mise run re2-diff`): random patterns,
+valid RE2 and not, and random names built from wire bytes go through
+urlfilter's `DNSEngine`, the name spelled as miekg/dns spells it, and through
+elodin. A pattern elodin keeps must block exactly the names urlfilter blocks;
+one it refuses is counted, not failed. `RE2DIFF_ARGS="-n 200000 -seed 7 -v"`
+sets the count and seed and lists the refused patterns urlfilter would have
+blocked with. `fuzz.yml` runs two million nightly.
 
 **Parity with the upstream** (`mise run parity`) checks that nothing is lost
 between the two sides of the resolver, rather than whether a given answer is

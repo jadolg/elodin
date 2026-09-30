@@ -58,6 +58,10 @@ address=/dnsmasq.test/0.0.0.0
 /a-regex-rule.*/
 /^ads[0-9]+\.regex\.test$/$important
 @@/^keep\.evil\.test$/
+/^ads#x\.regex\.test$/
+/^[]q]z\.regex\.test$/
+/^a\\\(b\.regex\.test$/
+/^c\(d\.regex\.test$/
 `,
 	)
 	domains_path := write_list(
@@ -283,6 +287,16 @@ blocking:
 					{"x.ads1.regex.test.", false},
 					// An allow regex outranks the `||evil.test^` above it.
 					{"keep.evil.test.", false},
+					// Read as RE2 reads them (#465): a `#` is no comment, and a
+					// class may open with `]`.
+					{"ads#x.regex.test.", true},
+					{"]z.regex.test.", true},
+					{"qz.regex.test.", true},
+					{"rz.regex.test.", false},
+					// Matched against the name as AdGuard Home spells it, with a
+					// `\` before the `(`.
+					{"a(b.regex.test.", true},
+					{"c(d.regex.test.", false},
 				}) {
 				res := query_udp(udp_port, build_query(w.name, u16(dns.Type.A)))
 				if check(r, res.ok, "no response for %s", w.name) {

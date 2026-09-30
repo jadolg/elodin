@@ -295,15 +295,12 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 	`||x^$important=$third-party` the options are `third-party`, not an
 	`important` with a value.
 	*/
-	options_at := strings.index_byte(line, '$')
-	// `$$` and `$@$` open an HTML filtering rule, not a modifier list. urlfilter
-	// looks for them at the first `$` whatever the rule, so `/a$$/` is one too.
-	if options_at >= 0 && (strings.has_prefix(line[options_at:], "$$") || strings.has_prefix(line[options_at:], "$@$")) {
+	if is_cosmetic(line) {
 		return 0
 	}
 	is_regex := strings.has_prefix(line, "/")
 	whole := is_regex && strings.has_suffix(line, "/") && len(line) > 1 && !strings.contains(line, "replace=")
-	options_at = -1 if whole else last_options_delimiter(line)
+	options_at := -1 if whole else last_options_delimiter(line)
 	badfilter := false
 	if idx := options_at; idx >= 0 {
 		modifiers := line[idx + 1:]
@@ -381,6 +378,30 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 		return 0
 	}
 	return int(set_add(target, line, flags))
+}
+
+/*
+urlfilter's `isCosmetic`, which `NewRule` asks before anything else: a cosmetic
+or HTML filtering rule's marker at the first `#` or the first `$` in the line,
+unless a space comes before it, as in a hosts line's `## comment`. So
+`/ads#?#x/` and `/a$$/` are cosmetic rules, never matched against a name, and
+`/a $$/` is not one.
+*/
+@(private)
+is_cosmetic :: proc(line: string) -> bool {
+	MARKERS :: [?]string{"#@$?#", "#@?#", "#@$#", "#$?#", "#@%#", "#@#", "#?#", "#$#", "#%#", "$@$", "##", "$$"}
+	for first in ([]u8{'#', '$'}) {
+		i := strings.index_byte(line, first)
+		if i < 0 || (i > 0 && line[i - 1] == ' ') {
+			continue
+		}
+		for marker in MARKERS {
+			if strings.has_prefix(line[i:], marker) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // urlfilter's `findOptionsDelimiter`: the last `$` that no `\` escapes.

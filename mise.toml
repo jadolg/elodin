@@ -4,9 +4,9 @@ odin = "dev-2026-07"
 # toolchain reproducible and avoids depending on whether the distribution
 # happens to ship an unversioned `clang` on PATH (Fedora, for one, does not).
 clang = "22.1.8"
-# Only the benchmark needs this. The load generator is deliberately not written
+# Only the benchmark and scripts/re2diff need this. The load generator is deliberately not written
 # in Odin: a generator sharing the codec under test could agree with a bug in it.
-go = "1.26.4"
+go = "1.26.8"
 
 [env]
 ELODIN_SRC = "{{config_root}}/src"
@@ -223,6 +223,16 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
   -days 825 -subj "/CN=elodin.local" \
   -addext "subjectAltName=DNS:elodin.local,DNS:localhost,IP:127.0.0.1"
 """
+
+# Does elodin read a `/regex/` rule as AdGuard Home does? Random patterns and
+# query names go through urlfilter's own DNSEngine and through elodin, and a
+# pattern elodin keeps must block exactly the names urlfilter blocks. In Go, as
+# the benchmark is, since urlfilter is the reference. RE2DIFF_ARGS passes
+# `-n`, `-seed` and `-v` through.
+[tasks.re2-diff]
+description = "Check regex rules against urlfilter, AdGuard Home's engine (scripts/re2diff)"
+depends = ["prepare"]
+run = "odin build scripts/re2diff/elodin -collection:elodin=src -out:bin/re2diff-elodin -extra-linker-flags:\"$ELODIN_LDFLAGS\" && cd scripts/re2diff && go run . -elodin ../../bin/re2diff-elodin ${RE2DIFF_ARGS:-}"
 
 [tasks.bench]
 description = "Measure throughput, latency, CPU and memory (see bench/README.md)"

@@ -84,30 +84,38 @@ can make one query cost is bounded instead:
 | a `{N}` or `{N,M}` count | 1000, as in RE2 |
 | one compiled pattern | 1024 bytes |
 | compiled patterns per set, block and allow each | 8 KiB, each character or range a `[…]` lists counting as a byte |
-| name matched | 253 characters; a longer one, which only a name spelling bytes as `\DDD` reaches, is not matched against regex rules |
+| name matched | 253 characters, spelled as AdGuard Home spells it (below); a longer one, which only a name spelling bytes out reaches, is not matched against regex rules |
 
 The AdGuard DNS filter's 22 usable regex rules come to about 2.1 KiB of that. Each
 name a query checks - the question and every CNAME hop - is matched against
 both sets.
 
-- Refused, as syntax elodin's engine would read differently from AdGuard Home's
-  RE2: lookaround (`(?=`), inline flags (`(?i)`), escaped letters or digits
-  other than `\d \D \w \W \s \S \b \B` (so `\1`, `\x41`, `\A`, `\z`), POSIX
-  classes (`[[:alpha:]]`), `{,M}`, a count with a leading zero, sign or `_`
-  (`{02}`, `{+2}`, `{1_0}`, which RE2 reads as characters), a repeat of a repeat (`a**`, `a{2}{3}`), more than nine `(…)` groups (write `(?:…)`),
-  a `)` with no `(`, a class range running backwards (`[a-Z]`) or ending in
-  an escape (`[+-\.]`), a `-` after a range with a single character before
-  it in the class (`[ab-c-e]`), a `-` after `\d`, `\w` or `\s` that is not last
-  (`[\d-z]`), a range
-  holding capitals but not their lower case, or running from a capital to a
-  lower-case letter (`[0-Z]`, `[A-z]`), `\b` or `\B`
-  inside a class, a class opening with `]` (`[]a]`), and a `#`, which
-  elodin's engine reads as a comment and no name holds. The last drops the
-  AdGuard DNS filter's one allow regex, which needs a `#` in the name.
-  Also an empty `//` or any pattern that matches the empty string (`/ads|/`,
-  `/x*/`), which would block every name the
-  rule is tried on (every name at all when it has no shortcut), and any byte outside printable ASCII
-  (write an international name as punycode).
+- Read as RE2 reads it, the syntax urlfilter compiles, in this subset:
+  literals and `\` before punctuation; `.`, `^`, `$`; `\d \D \w \W \s \S`,
+  and `\b \B` outside a class; classes of literals, ranges and those six,
+  folded to both cases before a `^` negates them; `(…)`, `(?:…)` and `|`; and
+  `* + ?`, `{n}`, `{n,}`, `{n,m}`, each optionally lazy. A `{` that is no
+  count, such as `{,3}` or `{02}`, is the character, as in RE2.
+- Refused, as RE2 refuses them: a `)` with no `(`, an unclosed `(` or `[`, a
+  class range running backwards (`[a-Z]`), a repeat of a repeat (`a**`,
+  `a{2}{3}`) or of nothing (`*a`), a count over 1000, or counts nested in one
+  another multiplying to more than 1000 (`(?:a{2}){501}`).
+- Refused, as RE2 outside the subset: lookaround (`(?=`), inline flags
+  (`(?i)`), named groups, escaped letters or digits other than
+  `\d \D \w \W \s \S \b \B` (so `\1`, `\x41`, `\A`, `\z`, `\n`, `\pL`,
+  `\Q`), POSIX classes (`[[:alpha:]]`), more than 254 different classes in
+  one pattern, and any byte outside printable ASCII (write an international
+  name as punycode).
+- Refused too: an empty `//` or any pattern that matches the empty string
+  (`/ads|/`, `/x*/`), which would block every name the rule is tried on
+  (every name at all when it has no shortcut).
+- A rule is a cosmetic one, and skipped, when the first `#` or the first `$`
+  in the line opens a cosmetic or HTML marker (`##`, `#?#`, `#%#`, `$$`, …)
+  with no space before it, as urlfilter reads it: `/ads#?#x/` is skipped and
+  `/ads#x/` is a regex.
+- The name is matched as AdGuard Home spells it: a label's `.`, `\`, space,
+  `'`, `@`, `;`, `(`, `)` and `"` each behind a `\` (`/a\\\(b/` matches the
+  label `a(b`), and any other byte outside printable ASCII as `\DDD`.
 - Once a set's budget refuses a pattern, every later one is dropped too. The
   count is logged once at load: `filter: N regex rules skipped: a set holds 8192
   of regex cost (compiled bytes, plus one for each character or range a class
