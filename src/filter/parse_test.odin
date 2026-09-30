@@ -483,7 +483,6 @@ test_a_rule_narrowed_by_a_modifier_is_not_widened :: proc(t: ^testing.T) {
 		"||narrow.example^$IMPORTANT",
 		// urlfilter does not trim a modifier, so a spaced one is unknown too.
 		"||narrow.example^$ important",
-		"||narrow.example^$important, badfilter",
 	}
 	for rule in narrowed {
 		testing.expectf(t, matches(rule, .Adblock, "narrow.example.") == .None, "%q matched", rule)
@@ -493,6 +492,8 @@ test_a_rule_narrowed_by_a_modifier_is_not_widened :: proc(t: ^testing.T) {
 	testing.expect_value(t, matches("||wide.example^$important,\n", .Adblock, "wide.example."), Decision.Blocked)
 	// `=x` names no modifier, and urlfilter refuses it.
 	testing.expect_value(t, matches("||wide.example^$=x\n", .Adblock, "wide.example."), Decision.None)
+	// A spaced `$badfilter` is skipped too, so it cancels nothing.
+	testing.expect_value(t, matches("||wide.example^\n||wide.example^$important, badfilter\n", .Adblock, "wide.example."), Decision.Blocked)
 }
 
 @(test)

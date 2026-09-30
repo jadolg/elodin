@@ -42,6 +42,9 @@ Set :: struct {
 	// What `$badfilter` rules have taken back, kept so a rule arriving later -
 	// further down the list, or from the next one - is cancelled too.
 	cancelled: map[string]Rule_Flags,
+	// How many `$badfilter` rules were taken, so one that adds nothing can be
+	// told from one that was skipped.
+	cancels:   int,
 	// `/re/` rules, matched after the hash maps; `engine_match` says when, and
 	// regex.odin what bounds them.
 	regexes:       [dynamic]Regex_Rule,
@@ -155,6 +158,7 @@ set_cancel :: proc(s: ^Set, domain: string, flags: Rule_Flags) {
 	if !ok {
 		return
 	}
+	s.cancels += 1
 	if existing, found := s.cancelled[key]; found {
 		s.cancelled[key] = existing + flags
 	} else {

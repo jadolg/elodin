@@ -34,6 +34,21 @@ test_a_list_badfilter_does_not_cancel_the_operators_own_rules :: proc(t: ^testin
 }
 
 @(test)
+test_an_operator_badfilter_that_is_skipped_is_warned_of :: proc(t: ^testing.T) {
+	// A `$badfilter` adds no rule, so what it takes back is what tells it from
+	// one skipped for a modifier urlfilter refuses (#464).
+	block, allow := filter.set_make(), filter.set_make()
+	defer filter.set_destroy(block)
+	defer filter.set_destroy(allow)
+	testing.expect(t, operator_rule_takes(block, allow, "||x.example^"))
+	testing.expect(t, operator_rule_takes(block, allow, "||x.example^$important,badfilter"))
+	testing.expect(t, operator_rule_takes(block, allow, "/x/$badfilter"))
+	testing.expect(t, !operator_rule_takes(block, allow, "||x.example^$important, badfilter"))
+	testing.expect(t, !operator_rule_takes(block, allow, "||x.example^$third-party,badfilter"))
+	testing.expect(t, !operator_rule_takes(block, allow, "||x.example^$third-party"))
+}
+
+@(test)
 test_a_query_with_a_slash_in_a_label_is_matched_against_the_lists :: proc(t: ^testing.T) {
 	/*
 	A label may hold any byte. Presentation form escapes the dot, whitespace and

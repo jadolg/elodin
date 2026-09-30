@@ -55,7 +55,9 @@ off once a list has been fetched.
   `$badfilter` cannot cancel `blocking.rules` or `blocking.allow`.
 - Skipped, without failing the list: any other modifier (`$dnstype`, `$client`,
   `$domain`, `$elemhide`, `$removeparam`, ...), cosmetic rules (`##`, `$$`), and
-  any rule that is not expressible as a domain or a regex.
+  any rule that is not expressible as a domain or a regex. A modifier is read
+  as written, as urlfilter reads it: `$ important`, `$important, badfilter` and
+  `$IMPORTANT` are unknown, so the rule is skipped.
 
 ## Regex rules
 

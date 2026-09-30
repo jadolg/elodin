@@ -164,6 +164,7 @@ regex_cancel :: proc(s: ^Set, pattern: string) {
 	if !regex_pattern_ok(pattern) {
 		return
 	}
+	s.cancels += 1
 	key_buf: [MAX_REGEX_PATTERN + 2]u8
 	key := regex_key(pattern, key_buf[:])
 	if key not_in s.cancelled {
