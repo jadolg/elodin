@@ -515,6 +515,9 @@ test_a_third_party_rule_blocks_nothing :: proc(t: ^testing.T) {
 		"||narrow.example^$important,third-party",
 		"/narrow/$third-party",
 		"@@||narrow.example^$third-party",
+		// urlfilter splits the options off at the last `$`, so a value does not
+		// hide one.
+		"||narrow.example^$important=$third-party",
 	}
 	for rule in third_party {
 		testing.expectf(t, matches(rule, .Adblock, "narrow.example.") == .None, "%q matched", rule)
@@ -522,8 +525,16 @@ test_a_third_party_rule_blocks_nothing :: proc(t: ^testing.T) {
 	// Its `$badfilter` names a rule that is never added, so it cancels nothing.
 	testing.expect_value(t, matches("||narrow.example^\n||narrow.example^$third-party,badfilter\n", .Adblock, "narrow.example."), Decision.Blocked)
 	testing.expect_value(t, matches("||narrow.example^\n||narrow.example^$~third-party,badfilter\n", .Adblock, "narrow.example."), Decision.Blocked)
+	testing.expect_value(t, matches("||narrow.example^\n||narrow.example^$badfilter=$third-party\n", .Adblock, "narrow.example."), Decision.Blocked)
+	// A `\,` does not split, so this is one `important` whose value is `,badfilter`.
+	testing.expect_value(t, matches("||narrow.example^\n||narrow.example^$important=\\,badfilter\n", .Adblock, "narrow.example."), Decision.Blocked)
 	// Nor does a skipped `@@` rule allow what a plain rule blocks.
 	testing.expect_value(t, matches("||narrow.example^\n@@||narrow.example^$first-party\n", .Adblock, "narrow.example."), Decision.Blocked)
+	// What is left before the last `$` holds a `$`, which no name does.
+	block, allow := set_make(), set_make()
+	defer set_destroy(block)
+	defer set_destroy(allow)
+	testing.expect_value(t, parse_rule(block, allow, "||narrow.example^$third-party$important"), 0)
 }
 
 @(test)

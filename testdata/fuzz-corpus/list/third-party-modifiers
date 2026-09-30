@@ -6,3 +6,6 @@
 ||e.example^$~first-party
 ||f.example^$~third-party,badfilter
 ||g.example^$=x
+||f.example^$important=$third-party
+||g.example^$important=\,badfilter
+||h.example^$third-party$important

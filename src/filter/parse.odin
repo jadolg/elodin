@@ -288,9 +288,11 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 	A regex rule may hold `$` itself, as an anchor. urlfilter takes a rule that
 	opens and closes with `/` as a whole pattern with no options, unless it holds
 	`replace=` (`isRegexRuleWithoutOptions`), and otherwise splits the options
-	off at the *last* `$` not escaped with `\` (`findOptionsDelimiter`); every
-	other rule splits at the first. So `/ads?|x/$replace=/a/b/` is a `$replace`
-	rule, skipped, not the regex `ads?|x/$replace=/a/b`, which matches `ad`.
+	off at the *last* `$` not escaped with `\` (`findOptionsDelimiter`), as it
+	does every rule. So `/ads?|x/$replace=/a/b/` is a `$replace` rule, skipped,
+	not the regex `ads?|x/$replace=/a/b`, which matches `ad`; and in
+	`||x^$important=$third-party` the options are `third-party`, not an
+	`important` with a value.
 	*/
 	options_at := strings.index_byte(line, '$')
 	// `$$` and `$@$` open an HTML filtering rule, not a modifier list. urlfilter
@@ -299,15 +301,21 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 		return 0
 	}
 	is_regex := strings.has_prefix(line, "/")
-	if is_regex {
-		whole := strings.has_suffix(line, "/") && len(line) > 1 && !strings.contains(line, "replace=")
-		options_at = -1 if whole else last_options_delimiter(line)
-	}
+	whole := is_regex && strings.has_suffix(line, "/") && len(line) > 1 && !strings.contains(line, "replace=")
+	options_at = -1 if whole else last_options_delimiter(line)
 	badfilter := false
 	if idx := options_at; idx >= 0 {
 		modifiers := line[idx + 1:]
 		line = line[:idx]
-		for m in strings.split_iterator(&modifiers, ",") {
+		for len(modifiers) > 0 {
+			// As urlfilter's `splitWithEscapeCharacter`: a `\,` does not split, so
+			// `important=\,badfilter` is one `important` with a value.
+			end := 0
+			for end < len(modifiers) && (modifiers[end] != ',' || (end > 0 && modifiers[end - 1] == '\\')) {
+				end += 1
+			}
+			m := modifiers[:end]
+			modifiers = modifiers[min(end + 1, len(modifiers)):]
 			// As urlfilter's `loadOptions`: a name is not trimmed, so ` important`
 			// is unknown, and `=x` has no name, so it is unknown too.
 			name := m
@@ -336,7 +344,8 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 		return int(regex_add(target, pattern))
 	}
 	// `##`, `#@#`, `#$#`, `#?#`: cosmetic rules, naming the site they apply on.
-	if strings.contains(line, "#") {
+	// A `$` left in the pattern is never in a name either.
+	if strings.contains_any(line, "#$") {
 		return 0
 	}
 
