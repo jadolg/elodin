@@ -219,7 +219,7 @@ blocking:
   # needs the WAN up before they apply - a boot with no internet starts with
   # no filtering rather than with yesterday's, and elodin logs the list as
   # unavailable, carries on answering, and tries the download again a minute
-  # later, then at doubling intervals up to `refresh`.
+  # later, then at doubling intervals up to an hour.
   #
   # Point it at persistent storage (/var/lib/elodin, an SD card, a USB stick)
   # if the box has some and you would rather have the lists at boot.

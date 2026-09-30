@@ -29,7 +29,9 @@ does not turn blocking off once a list has been fetched.
 - A download counts as failed when it is a web page (its first non-blank byte
   is `<`: a captive portal, an error page sent as a 200) or holds no rules,
   and it does not replace the cached copy (`the download is a web page, not a
-  list`, `the download holds no rules, so it is not cached`).
+  list`, `the download holds no rules, so it is not cached`). A list the
+  publisher empties on purpose therefore keeps its last copy. A cached copy
+  that is a web page is not used either.
 - The cached copy is replaced by writing a temporary file beside it, syncing
   it, then renaming it over the old one. A power cut mid-write leaves the old
   copy or the new one, never a truncated list.
@@ -37,10 +39,11 @@ does not turn blocking off once a list has been fetched.
   refresh, the refresh is dropped and every rule already in effect is kept
   (`list NAME: loaded before and unavailable now; keeping the rules already in
   effect`). This happens with an unwritable or cleared `cache_dir`. A list that
-  has never loaded does not hold the other lists back.
+  has never loaded does not hold the other lists back, and neither does a
+  `file:` list: delete one and its rules go at the next refresh.
 - A refresh where some list is unavailable, or was served from its cached copy
   because the download failed, is retried after 1 minute, then 2, 4 and so on,
-  up to `refresh` (`blocklists: not every list is current; trying again in
+  up to 1 hour or `refresh`, whichever is shorter (`blocklists: not every list is current; trying again in
   1m0s`). A start that could not load every list is retried the same way.
 
 ## Rule syntax
@@ -59,7 +62,8 @@ does not turn blocking off once a list has been fetched.
 
 - Allow rules always win.
 - Hosts entries are exact, since hosts lists spell out every subdomain; bare
-  domains and `||` rules cover subtrees, as in AdGuard Home.
+  domains and `||` rules cover subtrees, as in AdGuard Home. A hosts line
+  whose first field is not an IPv4 or IPv6 address adds nothing.
 - `address=/…/` (dnsmasq syntax) is accepted. A `server=/…/` line that names a
   server is skipped, since dnsmasq forwards it rather than blocking.
 - `$important` is dropped and the rest of the rule kept, so an `@@` exception

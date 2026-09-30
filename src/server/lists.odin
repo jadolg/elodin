@@ -36,6 +36,12 @@ whole interval left a list that one outage kept from loading out of effect, or
 out of date, for a day by default.
 */
 REFRESH_RETRY_FIRST :: 1 * time.Minute
+/*
+The longest a retry waits, whatever `blocking.refresh` says. Doubling to a week
+on `small-device.yaml` left a box that booted during a ten-hour outage waiting
+most of a further nine hours for its lists once the network was back.
+*/
+REFRESH_RETRY_MAX :: 1 * time.Hour
 
 // How one list fared in a load.
 List_Load :: enum u8 {
@@ -261,6 +267,12 @@ cached_copy :: proc(cfg: ^config.Config, list: config.Block_List, load: List_Loa
 	if err != nil {
 		return "", .Unavailable
 	}
+	// A page cached before a download was checked for one (#317).
+	if begins_with_markup(string(data)) {
+		logx.warnf("list %s: the cached copy at %s is a web page, not a list", list.name, cache_path)
+		delete(data)
+		return "", .Unavailable
+	}
 	logx.infof("list %s: using the cached copy at %s", list.name, cache_path)
 	return string(data), load
 }
@@ -438,7 +450,9 @@ have the swap take its rules out of effect until the next refresh a day later
 (#411). The new sets are dropped instead and the ones in effect kept, whole: they
 cannot be patched per list, being one merged set, and holding each list's text
 in memory to rebuild from would double the footprint on the small devices this
-runs on. A list that never loaded does not hold the others back.
+runs on. A list that never loaded does not hold the others back, and neither does
+a `file:` list: that one is the operator's own, and one deleted to lift its
+blocks has to lift them, where a download is lost to the network.
 
 `current` is false when some list is unavailable or stood in for by a stale copy,
 so the caller retries sooner than the interval; see `refresh_retry`.
@@ -454,9 +468,9 @@ reload_filters :: proc(s: ^Server, allow_network: bool) -> (current: bool) {
 			continue
 		}
 		current = false
-		if load == .Unavailable && s.lists_loaded != nil && s.lists_loaded[i] {
-			name := s.cfg.blocking.lists[i].name if i < lists else s.cfg.blocking.allow_lists[i - lists].name
-			logx.warnf("list %s: loaded before and unavailable now; keeping the rules already in effect", name)
+		list := s.cfg.blocking.lists[i] if i < lists else s.cfg.blocking.allow_lists[i - lists]
+		if load == .Unavailable && list.file == "" && s.lists_loaded != nil && s.lists_loaded[i] {
+			logx.warnf("list %s: loaded before and unavailable now; keeping the rules already in effect", list.name)
 			filter.set_destroy(block)
 			filter.set_destroy(allow)
 			delete(loads)
@@ -496,14 +510,14 @@ reload_filters :: proc(s: ^Server, allow_network: bool) -> (current: bool) {
 /*
 How long to wait before the next refresh after one that was not `current`:
 `REFRESH_RETRY_FIRST` after the first, doubling after each one since, and never
-longer than the interval itself. `retry` is the wait just served, zero when the
+longer than the interval itself or `REFRESH_RETRY_MAX`. `retry` is the wait just served, zero when the
 refresh before this one was current.
 */
 refresh_retry :: proc(retry, interval: time.Duration) -> time.Duration {
 	if retry <= 0 {
 		return min(REFRESH_RETRY_FIRST, interval)
 	}
-	return min(retry * 2, interval)
+	return min(retry * 2, interval, REFRESH_RETRY_MAX)
 }
 
 // How long after the last refresh the next one is due.
