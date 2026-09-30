@@ -21,7 +21,9 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"math/rand/v2"
+	// Seeded, so that a divergence is reproduced from the printed seed; no
+	// secret is drawn from it.
+	"math/rand/v2" // nosemgrep: go.lang.security.audit.crypto.math_random.math-random-used
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -67,9 +69,7 @@ func main() {
 		*seed = uint64(time.Now().UnixNano())
 	}
 	fmt.Printf("seed %d\n", *seed)
-	// Seeded, so that a divergence is reproduced from the printed seed; no
-	// secret is drawn from it.
-	r := rand.New(rand.NewPCG(*seed, 0)) // nosemgrep: go.lang.security.audit.crypto.math_random.math-random-used
+	r := rand.New(rand.NewPCG(*seed, 0))
 
 	patterns := drawPatterns(r, *count)
 	wires, names := drawNames(r)
