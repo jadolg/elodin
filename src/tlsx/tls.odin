@@ -519,8 +519,8 @@ Drop this reference to the `SSL_CTX` and release the wrapper.
 Nothing else here has the wrapper's lifetime, which is the point: `SSL_CTX_free`
 is a reference count decrement, and a connection accepted before this call still
 holds one. Anything freed alongside it that a handshake can still reach would be
-freed too early - the ALPN preference list was, until it was given to the
-`SSL_CTX` instead.
+freed too early, which is why the ALPN preference list belongs to the
+`SSL_CTX` rather than to the wrapper.
 */
 context_destroy :: proc(ctx: ^Context) {
 	if ctx == nil {
@@ -872,8 +872,8 @@ transfer :: proc(conn: ^Conn, op: Op, buf: []u8, timeout: time.Duration) -> (n: 
 		case SSL_ERROR_ZERO_RETURN:
 			return 0, .Closed
 		case SSL_ERROR_SYSCALL:
-			// A would-block arrives as WANT_READ or WANT_WRITE now, so this is
-			// a real failure rather than the timeout it used to stand for.
+			// A would-block arrives as WANT_READ or WANT_WRITE on a non-blocking
+			// socket, so this is a real failure rather than a timeout.
 			return 0, .Closed if ret == 0 else .IO_Error
 		case:
 			return 0, .IO_Error

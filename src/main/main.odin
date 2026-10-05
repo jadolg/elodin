@@ -602,14 +602,12 @@ main :: proc() {
 	resolver, which is the one deployment where forwarding is right, and it is
 	worth reading back to an operator who set it for some other reason.
 
-	There used to be a second line under `enabled: false`, telling an operator
-	with a local tor that they needed `onion: false` as well or their `.onion`
-	answers would be held to the public chain of trust and become SERVFAIL. That
-	was a warning standing in for a fix. `special_use_deferred` now takes a
-	forwarded `.onion` name out of the chain whichever key forwarded it, so there
-	is nothing left to warn about: the two keys no longer have to be written
-	together to work, and a line telling an operator to write both would now be
-	telling them to do something that changes nothing.
+	There is no second line under `enabled: false` telling an operator with a
+	local tor to write `onion: false` as well: `special_use_deferred` takes a
+	forwarded `.onion` name out of the chain whichever key forwarded it, so the
+	two keys do not have to be written together to work, and a line telling an
+	operator to write both would be telling them to do something that changes
+	nothing.
 	*/
 	if text, say := mixed_validation_warning(&cfg); say {
 		logx.warnf("%s", text)
@@ -618,7 +616,7 @@ main :: proc() {
 	switch {
 	case !cfg.special_use.enabled:
 		logx.warnf("special_use.enabled is off: localhost., onion., invalid. and the private reverse zones are forwarded to the upstream")
-		// The second half of what this key now does. `special_use_deferred` fires
+		// The second half of what this key does. `special_use_deferred` fires
 		// on this key as well as on `onion`, so an operator who set it for a
 		// reason having nothing to do with tor - wanting their own hosts file to
 		// own `localhost.`, say - is also giving up the root's signed

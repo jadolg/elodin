@@ -325,10 +325,10 @@ The registry spelling of a response code, and whether there is one.
 
 The IANA registry RFC 6895 section 2.3 established names 0-11 and 16-23 -
 DSOTYPENI arriving later with RFC 8490 and BADCOOKIE with RFC 7873 - and
-everything between and above is unassigned. `known` false is not an error - a composed rcode of 32 is a
-perfectly well-formed thing for a responder to send, RFC 6891 section 6.1.3
-having made the field twelve bits wide - so a caller that has to print one is
-expected to print the number instead. Odin's own `%v` renders an unnamed value
+everything between and above is unassigned. `known` false is not an error - a
+composed rcode of 32 is a perfectly well-formed thing for a responder to send,
+RFC 6891 section 6.1.3 having made the field twelve bits wide - so a caller that
+has to print one is expected to print the number instead. Odin's own `%v` renders an unnamed value
 as a `BAD ENUM VALUE` placeholder, which is the one thing that must not reach a
 log line or an extended DNS error: the byte those twelve bits come out of is one
 an on-path attacker writes, so it would choose the placeholder.

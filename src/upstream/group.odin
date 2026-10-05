@@ -246,7 +246,7 @@ resolve_insisting :: proc(
 	One budget per client question, not per call (issue #439). A question can
 	make several of these calls - a DNSSEC chain walk makes up to
 	`MAX_LOOKUPS_PER_QUERY`, an apex `DS` on a zone route asks two groups, a
-	rewrite alias forwards its target - and each used to wait up to
+	rewrite alias forwards its target - and each would otherwise wait up to
 	`query_budget` of its own, so a degraded group held a query worker for the
 	sum of them.
 
@@ -420,8 +420,7 @@ resolve_insisting :: proc(
 	records it as a failure, so the member parks like a dead one rather than
 	spending the budget on every query (issue #327).
 
-	Nor by dividing the timeout between the members, which was tried and taken
-	back out: `exchange` counts a timeout as a failure, so a member cut off by a
+	Nor by dividing the timeout between the members: `exchange` counts a timeout as a failure, so a member cut off by a
 	share it would have answered inside gets marked down for being asked
 	impatiently, and three of those park the spare this change exists to keep.
 	The wait is what must be bounded; what a member is judged on has to go on
@@ -452,7 +451,8 @@ resolve_insisting :: proc(
 		`healthy`. Without this, a group of one unreachable member and one that
 		answers REFUSED pays that timeout twice for one question - once in
 		`resolve`, once more here - to be handed the same REFUSED, which is a
-		second `timeout` added to a query that took one before issue #309.
+		second `timeout` added to a query that took one before the sweep existed
+		(issue #309).
 
 		Only what this call proved. A failure from a minute ago is somebody
 		else's news and the member goes on being asked, because a group whose
@@ -816,8 +816,8 @@ resolve_sequential :: proc(
 	The invariant, which the two halves of this depend on each other for: every
 	wait is charged, and every failure that costs waiting counts towards
 	parking the member. Charging alone would let a member that never parks -
-	an upstream whose bootstrap resolver has gone quiet, before `exchange`
-	recorded that failure - spend the budget on every query and keep the live
+	an upstream whose bootstrap resolver has gone quiet, were `exchange` not to
+	record that failure - spend the budget on every query and keep the live
 	members behind it unasked for good; not charging it would leave the wait
 	unbounded again. With both, it costs what a dead member costs.
 

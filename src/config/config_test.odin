@@ -178,8 +178,7 @@ RFC 8767 section 5's recommendation is 1.8 seconds and that is where the default
 sits, because with `serve_stale` on the fallback is worth nothing unless it
 reaches the client before the client's own resolver gives up - five seconds for a
 glibc stub, sooner for systemd-resolved (issue #164). Zero is the escape hatch
-and is deliberately not an error: it restores what every release before this one
-did, which is to wait the whole upstream budget out. A negative figure is neither
+and is deliberately not an error: it waits the whole upstream budget out. A negative figure is neither
 of those and is refused rather than read as a third meaning.
 */
 @(test)

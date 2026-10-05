@@ -1419,9 +1419,9 @@ parse_upstream_shorthand :: proc(
 	}
 
 	host, port, split_ok := net.split_port(s)
-	// A host each, as the map spelling's `address:` and `hostname:` are: what
-	// `trim_space` used to take off, an NBSP after `#name` say, is a
-	// certificate name no server has, and is refused rather than kept.
+	// A host each, as the map spelling's `address:` and `hostname:` are: an NBSP
+	// after `#name`, say, is a certificate name no server has, and is refused
+	// rather than trimmed away.
 	if !split_ok || !h2.authority_is_valid(s) || !h2.authority_is_valid(spec.hostname) {
 		errorf(l, "%s: cannot parse %q", path, raw)
 		return {}, false
@@ -1862,10 +1862,10 @@ load_rewrites :: proc(l: ^Loader, cfg: ^Config) {
 		`answer:` is being pointed at a key that is not there.
 
 		Both at once is refused rather than resolved. `answer:` would win and
-		`answers:` would be dropped in silence, and with rules that can now hold
-		several records the obvious way to add an MX to a rule that already has
-		an address is to write the second key underneath the first - which would
-		have thrown the MX away and passed `--check` while doing it.
+		`answers:` would be dropped in silence, and since a rule can hold several
+		records the obvious way to add an MX to a rule that already has an address
+		is to write the second key underneath the first - which would throw the MX
+		away and pass `--check` while doing it.
 		*/
 		answers_node := yaml.get(e, "answer")
 		key := "answer"
@@ -1930,10 +1930,8 @@ owner has met a malformed answer - some stubs take the first record and some
 refuse the lot. One CNAME per name for the same reason: two aliases for one name
 is not a thing a name can be.
 
-This could not be written before, near enough - a rule was an address, an alias
-or the sink - and the list form that could was rare enough to go unnoticed. The
-new kinds make a mixed list the natural thing to write, so the check goes in
-beside them. `block` is exempt because it is not a record: it says to answer as
+With record kinds beyond an address, an alias and the sink, a mixed list is the
+natural thing to write, so the check sits beside them. `block` is exempt because it is not a record: it says to answer as
 though the name were on a list, which `apply_rewrite` does before it looks at
 anything else in the rule.
 */
@@ -2021,11 +2019,10 @@ answers_fit_a_message :: proc(l: ^Loader, answers: []Rewrite_Answer, path: strin
 /*
 One entry of `answer:` / `answers:`, in either of the two forms.
 
-The short form is what the file has always taken and is what most rules are: a
-bare address is an A or a AAAA, a bare name is a CNAME, and `block` is the name
-sunk as though a list had named it. It stays exactly as it was, spaces and all -
-a value this cannot make sense of is a CNAME to whatever was written, which is
-how a typo has always been read here.
+The short form is what most rules are: a bare address is an A or a AAAA, a bare
+name is a CNAME, and `block` is the name sunk as though a list had named it. A
+value this cannot make sense of is a CNAME to whatever was written, which is
+how a typo is read here.
 
 The long form is a type token and then that type's RDATA, spelled the way a zone
 file spells it:
@@ -2117,9 +2114,9 @@ parse_rewrite_answer :: proc(
 		the name `ptr nas.home`, which `encode_name` will put on the wire
 		without complaint - it checks lengths, not characters - so every client
 		asking for that name is handed an alias to a label with a space in it,
-		whatever type it asked for. The type token was added on the promise that
-		an answer naming a type and getting it wrong is an error, and this was
-		the shape where the promise was still broken.
+		whatever type it asked for. The type token promises that an answer naming
+		a type and getting it wrong is an error, and this is the shape that has
+		to keep the promise.
 
 		Every multi-field answer is caught, not only the RR types this does not
 		implement, because a typo is the same mistake as an unsupported type and
@@ -2442,7 +2439,7 @@ the part that is not. The bound is on what the digits come to rather than on how
 many there are, which also stops a thousand of them from being counted before
 being rejected.
 
-The reverse-name parser next door refuses a padded octet on purpose, and the
+The reverse-name parser in `server/reverse.odin` refuses a padded octet on purpose, and the
 two are not in disagreement: `050` there is a second spelling of a *name*, and
 one address answering to two names is a thing worth refusing. A preference is a
 number, and a number has one value.
@@ -2723,8 +2720,7 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 		The denomination, resolved here to the ceiling it is measured against.
 
 		Unset is `server.max_udp_response`, the largest datagram this server will
-		send, so every answer costs exactly one token and a file that does not
-		write this key means what it meant before there was one to write.
+		send, so every answer costs exactly one token.
 
 		Written, it is held to bounds of its own. Below
 		`MIN_RESPONSE_SIZE_ESTIMATE` every answer this server can send costs more

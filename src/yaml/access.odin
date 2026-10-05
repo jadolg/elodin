@@ -12,7 +12,7 @@ get :: proc(n: ^Node, key: string) -> ^Node {
 	return n.fields[key] or_else nil
 }
 
-// Dotted path lookup: at(root, "upstream.cache.max_entries").
+// Dotted path lookup: at(root, "cache.max_entries").
 at :: proc(n: ^Node, path: string) -> ^Node {
 	cur := n
 	rest := path

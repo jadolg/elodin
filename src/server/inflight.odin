@@ -32,7 +32,7 @@ leader did, rather than wait a second full exchange for the same nothing, which
 in an outage is every pool worker held twice as long.
 
 A follower that cannot use what the leader landed with forwards on its own, which
-is what every query did before this - except where the leader stored a verdict
+is what every query does without coalescing - except where the leader stored a verdict
 (a Bogus refusal, a cloaking refusal worth keeping), when it reads that verdict
 straight out of the cache and is refused from it - or, for a cloaking refusal a
 list reload lifted during the wait, answered from it. The cloaking lookup is a

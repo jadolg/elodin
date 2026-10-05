@@ -18,7 +18,7 @@ Answering the two separately is what made the second one dangerous. An
 algorithm we never implemented settles the question at the delegation, where
 RFC 6840 section 5.2 puts it: no DS names anything we can check, so the child
 is an insecure delegation and everything under it is unvalidated data that
-nobody claims otherwise about. An algorithm the *library* declined used to be
+nobody claims otherwise about. An algorithm the *library* declined would be
 noticed much later, inside a zone the chain had already established as secure,
 and treated as unsigned there - which is RFC 6840 section 5.11 inverted. A zone
 mid-migration publishes an RRSIG per algorithm, so an attacker had only to
@@ -33,11 +33,10 @@ assuming: `probe_algorithms` verifies one known-good signature per algorithm
 against the linked library at start-up and drops whatever it will not run.
 What is left is what `algorithm_supported` reports, which is what the DS
 usability checks in `zone_step` and `fetch_keys` read - so a refused algorithm
-now goes insecure at the delegation, in front of the zone, and no RRset inside
+goes insecure at the delegation, in front of the zone, and no RRset inside
 an established zone is ever left resting on a signature this build cannot
-check. A zone publishing only a refused algorithm keeps resolving exactly as it
-did before; a zone publishing one beside a supported one stops being
-strippable.
+check. A zone publishing only a refused algorithm keeps resolving; a zone
+publishing one beside a supported one is not strippable.
 
 The digest half of the table answers for DS digests and for those only.
 NSEC3's iterated hash is SHA-1 by definition (RFC 5155) and `nsec3.odin` calls
@@ -72,8 +71,7 @@ Bits set for algorithms and digests the probe found the library would not run.
 
 Read from every validating worker and written once, so both go through
 `sync.atomic_load`. Zero until `probe_algorithms` has run, which means an
-unprobed build reports exactly the table it implements - the behaviour this
-package had before the probe existed.
+unprobed build reports exactly the table it implements.
 */
 @(private)
 refused_algorithms: u32

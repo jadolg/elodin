@@ -342,7 +342,7 @@ Count one failed exchange, and say why the first time each kind happens.
 
 The `warn` is once per upstream per kind of failure rather than per exchange:
 an upstream that intermittently fails never reaches the threshold below, so
-before this the only trace it left was a `debug` line nobody has on and a
+without it the only trace it left would be a `debug` line nobody has on and a
 counter nobody is scraping - which is how a member of a group can be failing
 every few queries, with the rest of the group covering for it, and nothing in
 the log says so. Once per kind bounds the output at the size of `Error` for
@@ -426,7 +426,7 @@ record_failure :: proc(
 		// A server that stopped sending cookies is a server whose every reply is
 		// now discarded for the want of one, and that arrives here looking like
 		// any other outage. Let the cooldown decide what it does rather than
-		// hold it to what it used to do.
+		// hold it to what it did before.
 		forget_cookie(u)
 	}
 	if u.failures == FAILURE_THRESHOLD {
@@ -583,8 +583,8 @@ exchange :: proc(
 	/*
 	One deadline for the whole exchange, set before anything else and spent by
 	every stage: resolving the hostname, the cookie retry, a truncated reply's
-	retry over TCP. Each used to start a timeout of its own, so one exchange
-	could take several, and every bound above - a group's budget, a question's
+	retry over TCP. Each starting a timeout of its own would let one exchange
+take several, and every bound above - a group's budget, a question's
 	deadline, a follower's patience - allows for one exchange crossing its line
 	on the promise that it takes one timeout (issue #449). A stage left with
 	nothing fails as a timeout, which it is: the upstream had the whole of it.
@@ -598,7 +598,7 @@ exchange :: proc(
 	bootstrap resolver gone quiet, finding that out takes the timeout, and
 	a member that never parked would be asked - and waited on - by every query
 	for as long as the bootstrap stayed down (issue #327). With no bootstrap
-	servers to ask the refusal costs nothing, and is left unrecorded as before.
+servers to ask the refusal costs nothing, and is left unrecorded.
 	*/
 	resolving := !u.resolved
 	if resolving && !resolve_endpoint(u, deadline) {
@@ -638,7 +638,7 @@ exchange :: proc(
 			u.spec.address,
 			u.spec.port,
 			// From entry rather than `start`: bootstrap resolution is part of
-			// what the exchange's timeout covers now.
+			// what the exchange's timeout covers.
 			time.tick_since(entered),
 			err,
 		)

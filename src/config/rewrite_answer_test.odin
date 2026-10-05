@@ -201,9 +201,8 @@ test_rewrite_explicit_address_and_name_types :: proc(t: ^testing.T) {
 A CNAME cannot sit beside other records at the same name (RFC 2181 section
 10.1), and there cannot be two of them.
 
-Barely writable before - a rule was an address, an alias or the sink - and the
-natural thing to write now that a rule can carry several types, which is why the
-check arrives with them. A resolver meeting a CNAME beside an MX has met a
+With a rule able to carry several types, a mixed list is the natural thing to
+write, which is why the check sits beside them. A resolver meeting a CNAME beside an MX has met a
 malformed answer, and what it does with one is its own business: some take the
 first record, some refuse the lot.
 */
@@ -490,10 +489,10 @@ test_rewrite_names_must_fit_on_the_wire :: proc(t: ^testing.T) {
 /*
 Both keys on one rule is refused rather than resolved in silence.
 
-`answer:` won and `answers:` was dropped, and with rules that can hold several
-records the obvious way to add an MX to a rule that has an address is to write
-the second key under the first - which threw the MX away and passed `--check`
-while doing it.
+Resolving it would let `answer:` win and drop `answers:`, and since rules can
+hold several records the obvious way to add an MX to a rule that has an address
+is to write the second key under the first - which would throw the MX away and
+pass `--check` while doing it.
 */
 @(test)
 test_a_rule_may_not_have_both_answer_keys :: proc(t: ^testing.T) {
@@ -591,10 +590,10 @@ test_a_rule_may_not_hold_more_than_a_message :: proc(t: ^testing.T) {
 /*
 An answer that cannot be parsed takes its whole rule with it.
 
-Only `load_string` treating these errors as fatal kept a half-parsed rule out of
-the resolver, and that became load-bearing when a rule with no usable answers
-started reading to the server as a record-only rule it should step over. The
-rule is dropped here instead, the way every other failure in `load_rewrites`
+Relying on `load_string` treating these errors as fatal would be all that kept
+a half-parsed rule out of the resolver, and a rule with no usable answers reads
+to the server as a record-only rule it should step over. The rule is dropped
+here instead, the way every other failure in `load_rewrites`
 drops one.
 */
 @(test)

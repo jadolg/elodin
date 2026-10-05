@@ -195,8 +195,8 @@ encode_name :: proc(name: string, out: []u8, label_offsets: ^[dynamic]int = nil)
 		}
 
 		if label_len == 0 {
-			// An empty label is only valid as the terminating root, which the
-			// loop below writes explicitly.
+			// An empty label is only valid as the terminating root, which is
+			// written explicitly once the loop is done.
 			return 0, .Bad_Name
 		}
 		out[len_pos] = u8(label_len)
@@ -265,8 +265,8 @@ The zone has to begin right after a label break, or "notexample.com." would
 count as a name below "example.com.".
 
 `server.name_below` is this, and calls it: the server package asks the question
-of configured zones and wildcards, and `encode_message` asks it of a delegation
-it is about to drop glue from. One answer, so neither can be tightened without
+of configured zones and wildcards, and `encode_message` asks it, through
+`name_at_or_below`, of a delegation it is about to drop glue from. One answer, so neither can be tightened without
 the other following.
 */
 name_below :: proc(name, zone: string) -> bool {

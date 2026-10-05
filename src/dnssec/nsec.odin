@@ -111,8 +111,8 @@ reads the span without reading the bit map will deny any name in the child -
 against the parent's keys, and with AD.
 
 `nsec_proves_no_data` makes this check on a record that matches. This is the
-covering half of it, and what used to make that half unreachable was the walk:
-it descends to the child and judges the denial against the child's keys, so the
+covering half of it. The walk would otherwise make that half unreachable: it
+descends to the child and judges the denial against the child's keys, so the
 parent's record is dropped before it is read. A name the walk stops above -
 because something remembered it as no zone cut - takes that away, so the check
 belongs with the proof rather than with the walk.

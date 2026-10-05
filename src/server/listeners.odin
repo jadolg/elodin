@@ -593,8 +593,8 @@ was asked for and does not claim it was given.
 */
 udp_readers_line :: proc(readers, asked, granted: int) -> string {
 	// "1 reader" rather than "1 readers", which is the single-core machine and
-	// the configuration everything had before this setting existed - so it is
-	// the wording most installations will read.
+	// the default configuration - so it is the wording most installations
+	// will read.
 	count := "1 reader" if readers == 1 else fmt.tprintf("%d readers", readers)
 	if granted <= 0 {
 		return fmt.tprintf("%s, asking for %.0M of receive buffer each", count, asked)
@@ -899,7 +899,7 @@ once per connection and hold it for the connection's life, so there is no addres
 to render here and nothing to release afterwards. `logx.debugf` returns without
 formatting anything when debug is off.
 
-`closing` is what the caller did with the connection, and the transports no longer
+`closing` is what the caller did with the connection, and the transports do not
 agree: the length-prefixed ones end it, DoH answers 429 and keeps it - see
 `serve_doh_request`. An operator reading "closing the connection" for a refusal
 that closed nothing would go looking for a disconnection that never happened, so

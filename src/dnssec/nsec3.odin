@@ -63,8 +63,8 @@ than per pass.
 A whole allowance measures at 2.1 ms of SHA-1 at worst on this box, optimised,
 against the 55 ms above. At worst because the charge is by block rather than by
 round: a 255-byte salt costs five blocks a round where a short one costs a
-single block, so the longest salt now buys the least - half a millisecond for a
-whole allowance - where counting rounds flat would have sold it five times the
+single block, so the longest salt buys the least - half a millisecond for a
+whole allowance - where counting rounds flat would sell it five times the
 most. Either way it puts NSEC3 hashing in the same order as the signature
 verifications `MAX_VERIFICATIONS_PER_QUERY` already allows.
 
@@ -87,9 +87,9 @@ ceiling can put a deep enough name past the allowance. Nothing in use is
 anywhere near that pair of choices - the salt exists to stop precomputation
 across zones, which a few bytes does - and what such a name gets is
 `Indeterminate`, which is this server saying it did not finish rather than that
-the zone is wrong. A question that
-wants more is answered `Indeterminate`, never `Bogus`: this is an allowance of
-ours running out, not a proof found wanting.
+the zone is wrong. A question that wants more is answered `Indeterminate`,
+never `Bogus`: this is an allowance of ours running out, not a proof found
+wanting.
 */
 MAX_NSEC3_ROUNDS_PER_QUERY :: 8192
 

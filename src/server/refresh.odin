@@ -453,7 +453,7 @@ refresh_job :: proc(data: rawptr) {
 	}
 	/*
 	And the cookie is inspected again, against the same client address and the
-	same bytes, so a server with `cookies.required` on reaches the same verdict
+	same bytes, so a server with `cookies.require` on reaches the same verdict
 	here that it reached for the client. Carrying the verdict over instead would
 	be a value read on one thread and used on another for no gain; this is a
 	hash of eight bytes.

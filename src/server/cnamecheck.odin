@@ -408,7 +408,7 @@ refuse_cloaked :: proc(
 
 	SERVFAIL says what actually happened and is the only one of the three a stub
 	will retry or fail over from. It is also what `answer-unreadable` returns for
-	the wider version of the same problem, so the narrow case no longer answers
+	the wider version of the same problem, so the narrow case does not answer
 	more confidently than the broad one.
 	*/
 	if verdict == .Unreadable {

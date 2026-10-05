@@ -91,13 +91,13 @@ Validator :: struct {
 	/*
 	`zones` in use order, most recent first, so a full cache knows what to drop.
 
-	This used to be emptied wholesale when it filled, on the reasoning that a
+	Emptying it wholesale when it filled would rest on the reasoning that a
 	cache of zones fills slowly and refilling it costs a handful of queries.
 	Both halves are true of a resolver's own traffic and neither is true under a
 	client that picks the names: a flood of fresh delegations fills it as fast
 	as it can send, and what the flush throws out is the root and the TLDs that
-	every other client's walk starts from - so one client's names cost everyone
-	a re-walk from the top. Issue #336.
+	every other client's walk starts from - so one client's names would cost
+	everyone a re-walk from the top. Issue #336.
 
 	A list rather than a stamp compared across the map, because the choice is
 	made on the insert path: walking four thousand entries to find the coldest
@@ -197,7 +197,7 @@ Validator :: struct {
 
 	That is why the bound is a reservation rather than a ceiling, and why it is
 	spent only by queries holding a worker somebody else is waiting for - see
-	`Budget.own_thread`. It is still the trade #356 asks for, the alternative
+	`Walk_Pool`, which counts a connection's own thread apart from a shared worker. It is still the trade #356 asks for, the alternative
 	being every thread held and nothing answered at all, and it is why
 	`max_chain_walks` is an operator's number rather than only ours.
 	*/
@@ -292,8 +292,8 @@ MAX_LOOKUPS_PER_QUERY :: 32
 /*
 Signatures kept beside one RRset when the response is pruned.
 
-Not an attempt limit any more: `validate_rrset` and `verified_rrset` both spend
-`MAX_VERIFICATIONS_PER_QUERY` instead, having each had a per-RRset cap that an
+Not an attempt limit: `validate_rrset` and `verified_rrset` both spend
+`MAX_VERIFICATIONS_PER_QUERY` instead, since a per-RRset cap is one an
 attacker could fill. What is left is what `strip_unauthenticated` will hand on
 besides the signature that actually verified, which is exempt - a set carries
 one signature per algorithm in practice, and more than this is padding aimed at
@@ -317,8 +317,8 @@ targets is the sender's to choose, so the walks need a bound that is not.
 
 Eight is past every answer of this shape that anyone serves: an HTTPS answer
 names one target, an SRV set a handful, and an eight-exchange MX set is a large
-one. A target past the bound keeps no hints, exactly as the whole section used
-to keep none - a round trip for the client, not a wrong answer - so erring small
+one. A target past the bound keeps no hints - a round trip for the client, not a
+wrong answer - so erring small
 costs little and erring large costs upstream queries somebody else picked. The
 eight that are inside it keep theirs, and which eight those are is the order the
 sender wrote its answer section in: a response naming more than eight decides
@@ -347,7 +347,7 @@ not: a key tag is a 16-bit checksum over the RDATA rather than an identity, so a
 signature naming one may name several keys, and `check_signature` has to try
 each of them because any could be the one that made it. Every further key
 sharing the tag is another full verification charged to nobody, so the query
-budget was bounding `MAX_KEYS_PER_ZONE` times what it counted.
+budget would be bounding `MAX_KEYS_PER_ZONE` times what it counted.
 
 The multiplier is the zone's to choose, and it needs no cleverness: nothing
 requires a DNSKEY RRset's records to be distinct, so sixty-four copies of one
@@ -463,8 +463,8 @@ Budget :: struct {
 	counting.
 
 	The walk reads a reply of its own per step into the arena the request is
-	served from, up to `MAX_LOOKUPS_PER_QUERY` of them, and every one of those
-	readings used to be bounded only by its own length. Borrowed from the caller
+	served from, up to `MAX_LOOKUPS_PER_QUERY` of them, and each of those
+readings is bounded only by its own length. Borrowed from the caller
 	that owns the arena, so what this walk takes is charged against what the
 	rest of the request already has. See issue #354.
 	*/
@@ -571,9 +571,9 @@ actually verify - see `signature_worth_trying`, which refuses the rest for
 nothing. Every verification a question can reach comes from here, at four call
 sites: `validate_rrset` for an answer's own RRsets, `verified_rrset` for a
 denial's proof, the RRSIGs over a DS set in `zone_step`, and the RRSIGs over a
-DNSKEY set in `fetch_keys`. The last two were unbounded until #193 - their
-signature list comes out of a response, so its length was whoever answered the
-lookup, and `MAX_LOOKUPS_PER_QUERY` allows 32 such lookups per question.
+DNSKEY set in `fetch_keys`. The last two come out of a response, so the
+length of their signature list is whoever answered the lookup's to choose, and
+`MAX_LOOKUPS_PER_QUERY` allows 32 such lookups per question (#193).
 
 One budget for all four, so no path keeps a private allowance that can be
 emptied on its own - and so the chain walk shares what it spends with the
@@ -610,9 +610,9 @@ cannot verify, and neither can one whose key tag and algorithm name no key the
 zone published.
 
 That is what keeps the budgets below from being an attacker's to spend. A
-forgery now has to name a key tag the zone actually has - and the tag is public,
-so this is a cost rather than a wall - where before any sixteen bytes of noise
-with the right owner name were enough to consume an attempt.
+forgery has to name a key tag the zone actually has - and the tag is public, so
+this is a cost rather than a wall - where otherwise any sixteen bytes of noise
+with the right owner name would be enough to consume an attempt.
 
 Deliberately the same test `check_signature` makes internally, hoisted out. It
 stays there too: this one decides whether to spend, that one decides the result,
@@ -934,10 +934,10 @@ Authenticated_Set :: struct {
 	The whole RRSIG that carried it, so the prune can keep that record whatever
 	else it drops.
 
-	All of it, and this took three goes to get right. Keyed on the key tag and
-	algorithm, a forgery copied both out of the zone's public DNSKEY set and
-	took the exemption. Keyed on the signature bytes, an attacker did not even
-	have to forge: it appended verbatim copies, and then - once those were
+	All of it, because anything less can be matched by a forgery. Keyed on the
+	key tag and algorithm, a forgery copies both out of the zone's public DNSKEY
+	set and takes the exemption. Keyed on the signature bytes, an attacker does
+	not even have to forge: it appends verbatim copies, and then - once those are
 	counted - a near-copy, the genuine record with one bit of its ORIGINAL TTL
 	flipped and the signature left alone. That mutant satisfied a
 	signature-bytes test, took the exemption, and the forgeries behind it filled
@@ -1297,7 +1297,7 @@ denial_claimed :: proc(msg: dns.Message) -> bool {
 /*
 What the answer section does with the question, as the chain sees it.
 
-`answers_question` folded two different outcomes into one `true`: a record of
+`answers_question` folds two different outcomes into one `true`: a record of
 the type asked for, and a CNAME chain that stopped short of it. The second is
 not an answer - it is a redirection, and whatever explains the missing type
 lives in the authority section at a zone this path never walked to. Keeping them
@@ -1499,14 +1499,14 @@ authenticated_only :: proc(
 			never looked at.
 
 			The signature that actually verified is kept whatever else happens
-			to it, which is what makes a cap safe again. A plain count cap was
-			tried here first and was worse than the problem: the section order
-			belongs to whoever wrote the answer, so eight forgeries in front of
-			the real signature filled the allowance and the real one was what
-			got evicted - and the message then went out under AD with nothing in
-			it that verifies, cached that way for every downstream validator
-			behind this resolver. A cap that cannot be made to drop the one
-			record the answer rests on does not have that failure.
+			to it, which is what makes a cap safe. A plain count cap would be
+			worse than the problem: the section order belongs to whoever wrote
+			the answer, so eight forgeries in front of the real signature would
+			fill the allowance and the real one would be what got evicted - and
+			the message would then go out under AD with nothing in it that
+			verifies, cached that way for every downstream validator behind this
+			resolver. A cap that cannot be made to drop the one record the
+			answer rests on does not have that failure.
 
 			The rest are held to `MAX_SIGNATURES_PER_RRSET`, which is what stops
 			an answer padded with hundreds of same-signer forgeries being stamped
@@ -1536,11 +1536,11 @@ authenticated_only :: proc(
 			/*
 			The record that verified is exempt from the cap, and exempt once.
 
-			The test is on the signature bytes, which is a comparison of content
-			rather than of identity - and the genuine signature is public, so an
-			attacker appends verbatim copies of it and every copy matched. The
-			exemption was then unlimited and the cap never fired, which is the
-			padding it exists to stop, arrived at by copying instead of forging.
+			The test compares content rather than identity - and the genuine
+			signature is public, so an attacker appends verbatim copies of it and
+			every copy would match. An exemption that counted each of them would be
+			unlimited and the cap would never fire, which is the padding it exists
+			to stop, arrived at by copying instead of forging.
 			*/
 			exempt := !verified_kept[idx] && rrsig_equal(parsed, kept[idx].rrsig)
 			if exempt {
@@ -1633,7 +1633,7 @@ What it removes is the free version of that. An attacker who holds a signed zone
 of their own can still nominate a target, by appending a signed SVCB or MX RRset
 from it - `validate_answer` authenticates whatever it can and does not ask which
 RRsets concern the question, so that set reaches `answered` like any other. It
-buys the same thing appending an unsigned record used to: up to
+buys the same thing appending an unsigned record would: up to
 `MAX_HINT_TARGETS` names of the attacker's choosing walked to, inside the query
 budget every other walk shares, and authentic data or nothing at the end of it.
 Which is why the bound above is a bound and not a comfort.
@@ -1949,10 +1949,10 @@ validate_answer :: proc(
 			// The reason belongs to the verdict that is being returned, so it
 			// moves only when the verdict does - the same rule the wildcard
 			// proofs below follow. `Insecure` ranks under `Indeterminate`, so
-			// a later unsigned RRset used to leave "unsigned zone" standing
-			// beside a verdict reached because a chain could not be walked:
-			// the benign reason reported, in the log and in the client's
-			// extended error, for a refusal that was anything but.
+			// a later unsigned RRset would otherwise leave "unsigned zone"
+			// standing beside a verdict reached because a chain could not be
+			// walked: the benign reason reported, in the log and in the
+			// client's extended error, for a refusal that was anything but.
 			if worse(worst, status) != worst {
 				reason = why
 			}
@@ -2136,15 +2136,15 @@ validate_answer :: proc(
 	was left: a downstream resolver validating for itself gets an authenticated
 	denial with nothing behind it and refuses it.
 
-	Both halves are needed, and finding that out cost a regression. A chain
-	stopping short is not enough on its own - a DNAME redirection is exactly
-	that shape and is not a denial, so refusing on the shape alone took the AD
-	bit off every one of them. `denial_claimed` is the other half.
+	Both halves are needed. A chain stopping short is not enough on its own -
+	a DNAME redirection is exactly that shape and is not a denial, so refusing
+	on the shape alone would take the AD bit off every one of them.
+	`denial_claimed` is the other half.
 
 	*After* the wildcard proof, and that ordering is load-bearing. Put before it,
-	this became a way to skip that proof: an attacker replays a genuine wildcard
+	this would be a way to skip that proof: an attacker replays a genuine wildcard
 	record as the answer for a name that has its own records, adds one SOA, and
-	what used to be `Bogus` - refused, SERVFAIL - came back `Insecure`, which
+	what is `Bogus` - refused, SERVFAIL - would come back `Insecure`, which
 	`resolve_query` forwards to the client. A guard meant to withhold an answer
 	must not be reachable before the check that would have withheld it outright.
 
@@ -2451,12 +2451,11 @@ validate_rrset :: proc(
 
 	`zone_trust` is the expensive thing in this loop - a walk down the
 	hierarchy, taking the validator's lock and cloning a DNSKEY set out of its
-	cache at every step - and it used to be bounded only by the per-RRset
-	attempt cap that sat above it. With that cap gone the walk became the thing
-	an attacker could multiply: a padded answer carrying two thousand RRSIGs
-	whose signer merely names an ancestor of the owner bought two thousand
-	walks, thousands of acquisitions of a lock every validating worker shares,
-	and megabytes of arena, for one question.
+	cache at every step - and no per-RRset attempt cap bounds it. Unmemoised it
+	would be the thing an attacker could multiply: a padded answer carrying two
+	thousand RRSIGs whose signer merely names an ancestor of the owner would buy
+	two thousand walks, thousands of acquisitions of a lock every validating
+	worker shares, and megabytes of arena, for one question.
 
 	Memoised by signer, which bounds it by the number of ancestors a name has
 	rather than by the number of records somebody wrote. Distinct signers are
@@ -2534,13 +2533,13 @@ validate_rrset :: proc(
 			continue
 		}
 		/*
-		Same two guards as the denial path, and for the same reason: this loop
-		used to stop after eight signatures whose signer merely named a zone in
-		the owner's ancestry, and the signer is a field an attacker writes. Eight
-		forgeries in front of the genuine signature therefore spent the whole
-		allowance and the answer came back Bogus - the very shape
-		`MAX_VERIFICATIONS_PER_QUERY` was introduced to remove, left standing on
-		the path every answer-section RRset takes.
+		Same two guards as the denial path, and for the same reason: a loop that
+		stopped after a fixed number of signatures whose signer merely named a zone
+		in the owner's ancestry would be at the mercy of a field an attacker writes.
+		Eight forgeries in front of the genuine signature would spend the whole
+		allowance and the answer would come back Bogus - the very shape
+		`MAX_VERIFICATIONS_PER_QUERY` exists to remove, on the path every
+		answer-section RRset takes.
 		*/
 		if !signature_worth_trying(sig, keys, unix) {
 			continue
@@ -2553,7 +2552,7 @@ validate_rrset :: proc(
 
 		Which matters because the allowance is what an attacker fills. A zone
 		mid-rollover really does publish the refused algorithm, so copies of its
-		own signature pass every cheap test above and used to cost a
+		own signature pass every cheap test above and would cost a
 		verification each: sixty-four of them in front of the one that would
 		have held, and the answer is `Indeterminate` and a SERVFAIL for a name
 		that resolves.
@@ -2594,13 +2593,12 @@ validate_rrset :: proc(
 	not afford to walk comes back `Indeterminate`, "chain of trust unavailable",
 	because the answer might be perfectly good and we simply stopped looking.
 
-	What that changes today is the extended error the client is sent - 22,
-	"No Reachable Authority", instead of 6, "DNSSEC Bogus" - and the `reason`
-	that reaches the log. It does not change the counters: `resolve_query`
-	handles `Bogus` and `Indeterminate` in one branch, so `Stats.bogus` moves for
-	both, which is worth knowing before reading that gauge as a forgery count.
-	Splitting them is a change to what the metric means and belongs with the
-	metric rather than here.
+	What that changes is the extended error the client is sent - 22, "No
+	Reachable Authority", instead of 6, "DNSSEC Bogus" - and the `reason` that
+	reaches the log. It does not change `Stats.bogus`: `resolve_query` counts every
+	`Bogus` and `Indeterminate` verdict there except one that is our own shedding
+	(`Result.shed`), so a spent verification budget counts like a forgery, which is
+	worth knowing before reading that gauge as a forgery count.
 	*/
 	if exhausted {
 		return .Indeterminate, "", "verification budget spent", "", {}
@@ -2804,9 +2802,9 @@ Denial records already verified for one message, held for the length of a single
 
 An answer can expand from more than one wildcard, and every expansion needs the
 same authority section verified against the same zone. Verifying it per
-expansion was free when nothing counted it; it is not free now that
-`validated_denial_records` spends `MAX_VERIFICATIONS_PER_QUERY`, and the cost
-falls on answers that did nothing wrong. Eight expansions over an authority
+expansion is not free, since `validated_denial_records` spends
+`MAX_VERIFICATIONS_PER_QUERY`, and the cost would fall on answers that did
+nothing wrong. Eight expansions over an authority
 section carrying five NSEC3 RRsets is forty verifications for five sets' worth
 of information, which alone is most of the allowance - so a legitimate response
 came back `Indeterminate`, and reached the client as SERVFAIL, for being large
@@ -2924,7 +2922,7 @@ validate_wildcard_proof :: proc(
 	The same allowance, and the same answer. Falling through here reports a
 	budget of ours as "wildcard expansion not proven", which reaches the client
 	as a forged answer - the one thing every other exhaustion path in this file
-	now takes care not to say.
+	takes care not to say.
 	*/
 	if denial.exhausted {
 		return .Indeterminate, nil, "verification budget spent"
@@ -3084,8 +3082,8 @@ answers "did this zone sign this" and not "did somebody sign this". Every use is
 in an authority section that has already been placed in a zone, where a signer
 of the response's own choosing is precisely what must not be believed.
 
-The attempts are bounded the way `validate_rrset` bounds them, which is no
-longer a per-RRset cap: both spend the query-wide
+The attempts are bounded the way `validate_rrset` bounds them, which is not a
+per-RRset cap: both spend the query-wide
 `MAX_VERIFICATIONS_PER_QUERY`, and both throw out for nothing - through
 `signature_worth_trying` - every signature whose key tag and algorithm name no
 key the zone published. Running the budget out here is reported back as
@@ -3368,17 +3366,18 @@ zone_trust :: proc(
 	keys = root_keys
 	depth := label_count(name)
 	/*
-	Cuts found on the way down, against `MAX_CHAIN_DEPTH`, which was spent on
-	`label_count(name)` until issue #352.
+	Cuts found on the way down, against `MAX_CHAIN_DEPTH` - and not
+	`label_count(name)`, which is what it would be spent on if a label were a zone
+	cut (issue #352).
 
 	A label is not a zone cut and a name is not a hierarchy. The reverse name of
 	an IPv6 address is a nibble per label - thirty-two of them under
-	`ip6.arpa.`, thirty-four in all - so every one of them was past a bound of
-	twenty-four before a single DS was asked for, and `Indeterminate` is
+	`ip6.arpa.`, thirty-four in all - so every one of them would be past a bound
+	of twenty-four before a single DS was asked for, and `Indeterminate` is
 	SERVFAIL. That is every IPv6 reverse lookup a resolver with validation on is
 	asked, which is what mail servers, `UseDNS` and every logging pipeline do.
-	IPv4 reverse names are six labels, so nothing in `in-addr.arpa.` ever showed
-	it.
+	IPv4 reverse names are six labels, so nothing in `in-addr.arpa.` would ever
+	show it.
 
 	Nothing about the walk's cost rested on that reading. The round trips are
 	`MAX_LOOKUPS_PER_QUERY`, the hashing a denial provokes is
@@ -4432,8 +4431,8 @@ cache_put :: proc(v: ^Validator, zone: string, status: Status, keys: []Dnskey, t
 		zone_push_front(v, entry)
 		return
 	}
-	// The coldest entries, and only as many as it takes to make room. What the
-	// flush this replaced threw out was everyone else's root and TLD keys; see
+	// The coldest entries, and only as many as it takes to make room. A
+	// wholesale flush would throw out everyone else's root and TLD keys; see
 	// `Validator.lru_head`.
 	for len(v.zones) >= v.max_cached_zones && v.lru_tail != nil {
 		drop_zone(v, v.lru_tail)

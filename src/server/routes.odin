@@ -250,7 +250,7 @@ client that the route cannot. Every other reply goes back on the route -
     is mirroring the signed zone loses the secure path and keeps the insecure
     one, which is the trade this whole file makes for a routed zone anyway
     (point 3 above), and `trust_anchors` is the escape hatch there as here.
-  - No reply at all. A routed zone used to answer for itself with the public
+  - No reply at all. A routed zone answers for itself with the public
     upstream uninvolved, which on a network with an internal authority and a
     poor path out is most of the point; an outage out there must not take the
     chain out from under every name in a zone that is answering perfectly well.
@@ -289,7 +289,7 @@ where its name says.
 For the second shape the proof is passed on and the client is right to act on it:
 the public tree really does cover those names with signed data, so the local
 authority's unsigned answers below them really are Bogus, and a validator that
-resolved the zone before this carve-out existed did so only because the route's
+resolved the zone without this carve-out would do so only because the route's
 own unsigned NODATA kept the parent's proof out of its sight. The remedy is the
 one this file already documents for a routed zone the public tree signs:
 `trust_anchors` over the zone, or not routing a name the public tree publishes.
@@ -714,8 +714,8 @@ about less often than once per `upstream.COOLDOWN` never arms it at all. Each
 reply's strike expires before the next reply arrives, the count starts again at
 one, and a memory that did arm would have expired before the next query could
 read it anyway. So a parent with an ACL that REFUSEs every `DS`, asked once every
-fifteen seconds, goes on paying its two exchanges per query exactly as it did
-before this existed; what this bounds is the same parent asked faster than its
+fifteen seconds, goes on paying its two exchanges per query exactly as it would
+without this memory; what this bounds is the same parent asked faster than its
 own memory expires. Widening it means keeping a memory longer than the cause it
 stands for, which is the thing issue #243 asked to be bounded by "something like
 the cooldown", and a separate clock per slot is the change if a deployment ever
@@ -754,8 +754,8 @@ asked first for the rest of it.
 
 The slot chosen is this apex's own where it has one, and otherwise the first that
 is free: never claimed, or claimed by a memory whose window has run out. Where
-every slot is live, nothing is written and this apex pays what every apex paid
-before this memory existed. Nothing is evicted, ever, which is the ceiling
+every slot is live, nothing is written and this apex pays what every apex pays
+without this memory. Nothing is evicted, ever, which is the ceiling
 `Apex_Memo` names and the reason it is a ceiling rather than a failure: a table
 that took a live slot to start a new count would, past its size, leave every
 apex restarting and none of them ever remembered.
@@ -791,7 +791,7 @@ remember_apex_ds_parent :: proc(s: ^Server, name: string, reached, settled: bool
 		threshold - the memory would be a table that is always full and never
 		read. A slot nobody has claimed, or one whose window has run out, is
 		free; where none is, this apex is one of the ones the ceiling leaves out
-		and it pays what every apex paid before this memory existed.
+		and it pays what every apex pays without this memory.
 		*/
 		if victim < 0 && time.diff(now, slot.until) <= 0 {
 			victim = i
@@ -852,7 +852,7 @@ is_zone_routed :: proc(s: ^Server, name: string) -> bool {
 /*
 Close idle connections on every upstream this server has, routed or not.
 
-The maintenance loop used to groom the one group there was. A route's
+The maintenance loop must groom every group, not only the default one. A route's
 connections go idle exactly as the default group's do - more so, since an
 internal zone is usually a smaller share of the traffic - and a pool nobody
 grooms is one that holds file descriptors open against a server that may have

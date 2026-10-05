@@ -141,7 +141,7 @@ asks for is charged to the other pool, so a client sent to TCP by a flood in its
 prefix arrives at a budget that flood has not touched. Still a budget: a client
 that has emptied the stream pool itself is refused there like anything else, and a
 slip says the address is worth proving rather than reserving anything for the
-proof. But the retry is no longer answerable only in the gaps a flood leaves.
+proof. But the retry is not answerable only in the gaps a flood leaves.
 
 The truncated answers themselves are charged too, to a third pool. What `slip`
 picks is every Nth datagram *over* the budget, so left uncharged the number this
@@ -168,7 +168,7 @@ A fraction of `responses_per_second` rather than the whole of it, because an
 invitation is worth more than an answer - see `RRL_SLIP_SHARE`.
 
 What it costs, said plainly: the slip is worth less to a client *inside* a flooded
-prefix than it used to be, and against a large enough flood it is worth nothing.
+prefix than an uncharged one would be, and against a large enough flood it is worth nothing.
 The pool is per prefix and the flood draws from it too, so where an uncharged slip
 truncated every second datagram in the bucket - and therefore half of that client's
 own queries - the pool reaches it in proportion to its share of the arrivals. The
@@ -438,8 +438,8 @@ Rate_Limiter :: struct {
 
 	One thread reads the UDP socket, but every TCP, DoT and DoH connection is
 	served on a thread of its own and charges the queries it reads from there, and
-	each of the three accept loops charges the connections it accepts - so the
-	single-reader assumption this table was written under no longer holds.
+	each of the three accept loops charges the connections it accepts - so a
+	single-reader assumption does not hold for this table.
 	Unlocked, what that costs is not a crash but a limiter that under-counts at
 	exactly the moment it is counting something: `tokens` read, decremented and
 	written back by two threads at once loses one of the two decrements, and
@@ -943,8 +943,8 @@ The per-prefix figure `address`'s own network is held to, for the lines that
 name one.
 
 `report_conn_rate_limit` quotes a number and tells an operator which setting to
-raise, and with figures per prefix that number is no longer whatever the top of
-the file says: a client inside an entry in `server.rate_limit.overrides` was
+raise, and with figures per prefix that number is not whatever the top of
+the file says: a client inside an entry in `server.rate_limit.overrides` is
 refused at that entry's figure. Reading the top-level one there would send an
 operator to a line that is not the one refusing their client, which is the
 mistake the override lines at startup exist to prevent.

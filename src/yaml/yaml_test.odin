@@ -542,10 +542,9 @@ test_block_scalar_as_sequence_entry :: proc(t: ^testing.T) {
 @(test)
 test_bad_block_scalar_headers_error :: proc(t: ^testing.T) {
 	// A block header is `|` or `>` alone or with one chomping indicator, and a
-	// plain scalar may not start with `|` or `>`. main misread `- |x` as the
-	// scalar "|x" and parse_block_scalar took `|+x` for `|+`, dropping the
-	// trailing byte. All of these are invalid YAML and error now, as PyYAML
-	// does.
+	// plain scalar may not start with `|` or `>`. Reading `- |x` as the scalar
+	// "|x", or `|+x` as `|+` with the trailing byte dropped, would accept what
+	// is invalid YAML. All of these error, as they do in PyYAML.
 	srcs := []string{
 		"- |x\n",
 		"- |+x\n",
@@ -565,8 +564,8 @@ test_bad_block_scalar_headers_error :: proc(t: ^testing.T) {
 @(test)
 test_folded_scalar_blank_line_is_a_break :: proc(t: ^testing.T) {
 	// Folding joins lines with a space, but a blank line between them is a
-	// paragraph break. Blank lines only reach the folder now that the scanner
-	// keeps them, and folding them as spaces would double the separator.
+	// paragraph break. The scanner keeps blank lines so they reach the folder,
+	// and folding them as spaces would double the separator.
 	root, err := parse("a: >\n  one\n  two\n\n  three\n", context.temp_allocator)
 	testing.expectf(t, err == nil, "parse failed: %v", err)
 	a, ok := as_string(get(root, "a"))
@@ -594,8 +593,8 @@ test_block_scalar_under_escaped_quote_key :: proc(t: ^testing.T) {
 @(test)
 test_block_scalar_body_allows_tabs :: proc(t: ^testing.T) {
 	// Indentation is spaces, but past it a tab is content like any other byte.
-	// A tab straight after the indentation is the case that moved: the
-	// document-wide tab check used to reject it before the body was content.
+	// A tab straight after the indentation is the case to pin: the
+	// document-wide tab check must not reject it, since the body is content.
 	root, err := parse("a: |\n  \ty\nb: 2\n", context.temp_allocator)
 	testing.expectf(t, err == nil, "parse failed: %v", err)
 	a, ok := as_string(get(root, "a"))

@@ -1492,7 +1492,7 @@ test_client_headers_after_end_stream_is_refused :: proc(t: ^testing.T) {
 mid-request. It checked `c.closed` and `s.reset` but not `s.done` or
 `s.rst_sent` - so an upstream answering early (HEADERS+END_STREAM while the
 request body is still uploading) and then drawing our own RST_STREAM with a
-stray DATA frame left the body-sending goroutine writing further DATA frames
+stray DATA frame left the body-sending thread writing further DATA frames
 on a stream this connection had itself just reset.
 */
 @(test)

@@ -1543,8 +1543,8 @@ pc_opt_contents :: proc(c: ^Parity_Compare, q: Parity_Query, up, el: Pw_Msg, pol
 			For the other two, the same bytes on both sides is a copy rather
 			than a coincidence. Two servers can independently reach the same
 			extended-error info-code, which is why the text is part of the
-			test and the info-code alone is not (see
-			`pc_option_text_allowance`).
+			test and the info-code alone is not. The stability check in
+			cases_parity.odin goes the other way, for the opposite reason.
 			*/
 			if pc_bytes_equal(e.data, u.data) {
 				pc_add(

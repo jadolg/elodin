@@ -254,9 +254,9 @@ Read until the peer closes, for responses with no length information.
 
 Bounded by `limit`, like every other framing path: the header scan stops at 64
 KB, and both the chunked and the Content-Length readers check MAX_HTTP_BODY.
-This one had nothing to check against, so a peer that never sent a length - by
-omitting both headers, or by sending a Content-Length that is not a length -
-decided on its own how much of our memory to take.
+This one has nothing to check against, so without `limit` a peer that never
+sent a length - by omitting both headers, or by sending a Content-Length that is
+not a length - would decide on its own how much of our memory to take.
 */
 @(private)
 reader_to_end :: proc(r: ^Buf_Reader, limit: int) -> (data: []u8, err: Error) {
@@ -581,11 +581,12 @@ parse_content_length :: proc(value: string) -> (length: int, err: Error) {
 The status line: `HTTP/1.<DIGIT> SP 3DIGIT`, then optionally a space and a
 reason phrase (RFC 9112 4), and whether its version is 1.0.
 
-Parsed with a detected base the code was rather more: `HTTP/1.1 0x1 OK` came back
-as 1, `1_0` as 10. The three characters were also taken without asking what
-followed them, so `HTTP/1.1 2000 OK` - not a status line at all - read as 200.
-And with only the `HTTP/` prefix checked, `HTTP/1.1x` was a version, one this
-client went on to pool as 1.1 (#437).
+Not parsed with `strconv`'s detected base, which would read `HTTP/1.1 0x1 OK`
+as 1 and `1_0` as 10. The three characters are also checked for what follows
+them, since `HTTP/1.1 2000 OK` is not a status line at all and would otherwise
+read as 200. And the version is held to `HTTP/1.<DIGIT>`: with only the `HTTP/`
+prefix checked, `HTTP/1.1x` would be a version, one this client would go on to
+pool as 1.1 (#437).
 */
 @(private)
 parse_status :: proc(line: string) -> (status: int, http_1_0: bool, err: Error) {

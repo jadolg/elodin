@@ -89,7 +89,7 @@ one that does not implement them, and RFC 7873 has the exchange carry on without
 — but once it has issued one, accepting a reply with the option left off would
 make the check something an attacker opts out of at no cost: it would be back to
 guessing only the transaction ID and the source port, which is what the cookie
-was added to put out of reach. It is asked of the query as well as of the
+exists to put out of reach. It is asked of the query as well as of the
 upstream, though; see the comment on `expected` below.
 
 The option is read off the wire rather than off a decoded message, because a
@@ -138,18 +138,17 @@ cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	The residual, stated plainly: which exchanges carry a cookie is decided by
 	the client, so a client that asks without EDNS gets an exchange with no
 	cookie protection on it, and with the cache on the answer it gets is the
-	answer everyone behind this server gets. Before this change that path failed
-	closed - but failing closed there meant never resolving the name at all, for
-	every stub that does not do EDNS, so it was not a defence anyone was
-	choosing.
+	answer everyone behind this server gets. Failing closed there would mean
+	never resolving the name at all, for every stub that does not do EDNS, so it
+	is not a defence anyone would choose.
 
 	The defence rather than the trade is to put an OPT record on the *upstream*
 	query even where the client sent none, and carry a cookie on it. What ruled
 	that out was that it negotiates EDNS on behalf of a client that did not ask
 	- but since #276 the upstream's OPT record does not reach the client at all
 	(`normalise_client_opt`), so the client need never see that it happened.
-	That is a change to what this server asks upstream and belongs in its own
-	review; this one is the availability half.
+	That would be a change to what this server asks upstream, and is not made
+	here: this handling is the availability half.
 	*/
 	// Behind `held`, so the walk happens only where its answer can change the
 	// outcome. `response_accepted` runs per received datagram, so on an

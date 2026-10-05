@@ -503,7 +503,7 @@ BIND and dnsproxy all default their own outgoing figure to, for the reason RFC
 6891 section 6.2.5 gives - a datagram past the path MTU is fragmented, and the
 second fragment carries no port and no transaction ID, so anything on the path
 can supply it. A signed answer still rarely fits in 512 bytes, which is why this
-is not simply left unset; what changed is that it is no longer 4096.
+is not simply left unset; what it is not is 4096.
 
 Lowered on the two DNSSEC paths as well, which chose their own figure and were
 never the hole - 4096 is simply over an ordinary 1500-byte path MTU, which is
@@ -770,8 +770,8 @@ this server is the responder for the answer it sends:
     MUST be copied in the response." What arrives in a forwarded answer is the
     upstream's copy of the bit *this server* sent it, which on a validating
     resolver is not the bit the client sent at all. This is also what
-    `dnssec.strip_dnssec_records` has always done when it rebuilds an answer for
-    a client that asked without DO, so the two paths now agree.
+    `strip_dnssec_records` does when it rebuilds an answer for a client that
+    asked without DO, so the two paths agree.
   - the remaining fifteen flag bits are reserved and MUST be zero (RFC 6891
     section 6.1.4). `dns.set_edns_version_and_flags` writes them rather than
     masking, for the same reason: an upstream that set one is not a reason to
@@ -815,11 +815,11 @@ which is what that section asks of a sender.
 
 What that costs is worth writing down rather than leaving to be discovered. An
 operator forwarding to a filtering upstream - Quad9, CleanBrowsing, a corporate
-resolver - has clients that were reading its reason: EDE 15 (Blocked), 16
+resolver - has clients that read its reason: EDE 15 (Blocked), 16
 (Censored) and 17 (Filtered) ride on the NXDOMAIN or NOERROR that
 `cache.put` does store, so those are the codes this drops both on the way past
-and for an entry's whole lifetime, and a client that used to be told why a name
-was refused now reads a bare NXDOMAIN. They are also the codes with the best case
+and for an entry's whole lifetime, and a client that would have been told why a name
+was refused reads a bare NXDOMAIN. They are also the codes with the best case
 for being kept: unlike an EDE explaining one SERVFAIL, they are statements about
 the *name*, which is what the entry is keyed on, so repeating them out of the
 cache is not the drift the general argument against caching an EDE is about. The
@@ -1234,13 +1234,12 @@ resolve_query :: proc(
 	operator wrote down wins and is counted as blocked, rather than a table
 	answering first and leaving the list looking like it did nothing.
 
-	This used to sit above the block lists while the reserved-name table below sat
-	beneath them, each with its own reasoning and neither referring to the other.
-	The distinction was real but thin - a blocklist can plausibly name something
+	This sits below the block lists with the reserved-name table below it, under
+	one ordering rather than two. The distinction between them is real but thin - a blocklist can plausibly name something
 	under `onion.` and cannot plausibly name `resolver.arpa` - and it is not worth
 	two orderings for. One place to reason about is worth more than the case it
 	gives up, which is this: a list broad enough to match `resolver.arpa`, which
-	means a rule over `arpa` itself, now blocks a DDR probe instead of having it
+	means a rule over `arpa` itself, blocks a DDR probe instead of having it
 	answered NODATA. Such a list is already breaking every reverse lookup on the
 	machine, so it is not a configuration this ordering has to protect.
 	*/
@@ -1261,11 +1260,11 @@ resolve_query :: proc(
 	operator who put a name on a blocklist still seeing it counted as blocked.
 	This table is the default for the names nobody configured.
 
-	The DDR zone above is in the same place for the same reasons, which it was not
-	always: it used to be answered ahead of the block lists, on the argument that
-	nothing legitimately lists `resolver.arpa`. True, but not worth two orderings
-	in one procedure - a reader should be able to learn where locally answered
-	names go once. Both now sit below the rewrites and the block lists and above
+	The DDR zone above is in the same place for the same reasons. Answering it
+	ahead of the block lists would rest on the argument that nothing legitimately
+	lists `resolver.arpa`; true, but not worth two orderings in one procedure - a
+	reader should be able to learn where locally answered names go once. Both sit
+	below the rewrites and the block lists and above
 	the cache and the RD gate.
 
 	Ahead of the cache, and of the RD gate below. Ahead of the cache because
@@ -1509,8 +1508,8 @@ resolve_query :: proc(
 	that was never going to forward.
 
 	Nothing changes where the cache is not holding anything for this name, where
-	`cache.stale_timeout` is zero - the escape hatch, which is what every
-	release before this one did - or where there is no pool to run the refresh
+	`cache.stale_timeout` is zero - the escape hatch, which turns serving stale
+	off - or where there is no pool to run the refresh
 	on, which is a `Server` built as a literal. The fall-through is the ordinary
 	forwarding path, expired entry in hand, exactly as it was: the client waits
 	the upstream out and is served what it is holding only once that has failed.
@@ -2211,7 +2210,7 @@ resolve_query :: proc(
 			rather than this server's: the client keeps that proof for the
 			parent's negative TTL, and one implementing RFC 8020 reads it as
 			covering every name under the apex. Suppressing our own store, which
-			is what this branch used to do instead, does not reach any of that.
+			is the alternative to this branch, does not reach any of that.
 			The store is withheld anyway in the other arrangement - the route
 			did answer, and what it said stands in for a fact nobody
 			established - but that is a question about the next client rather
@@ -2562,8 +2561,8 @@ resolve_query :: proc(
 	wire afterwards would leave the two disagreeing about the same answer, with
 	the entry outliving what its own bytes tell a client.
 
-	Before the rebinding refusal, where this used to run after it. The argument
-	for the old order was that an answer the refusal turns back is replaced
+	Before the rebinding refusal, not after it. The argument
+	for running after is that an answer the refusal turns back is replaced
 	wholesale, so bounding its TTLs first is work done on bytes nobody is handed.
 	That is true and it is worth a walk of the answers this server refuses; what
 	it cost was a whole decode of the answers it does not. The refusal reads the
@@ -2615,9 +2614,9 @@ resolve_query :: proc(
 	client is served without this running again. See `rebind.odin`, and
 	`test_a_refused_answer_is_not_cached`, which is what says so.
 
-	Below the decode rather than above it now, which is the same position in the
-	order - nothing between here and where this used to sit stores anything or
-	changes what the guard reads.
+	Below the decode rather than above it, which is the same position in the
+	order - nothing between here and the refusal stores anything or changes what
+	the guard reads.
 	*/
 	if checking_rebind {
 		if out, detail, blocked := rebind_refusal(s, msg, q, decoded, limit, allocator); blocked {
@@ -2734,11 +2733,11 @@ resolve_query :: proc(
 	ever validated. A later request that does validate reads the stored bit as a
 	verdict of ours and hands the upstream's claim to a client under our name.
 
-	It lived next to the ordinary store until a second store was added below it,
-	for an answer refused as cloaked, and quietly did not get it: that entry went
-	in carrying the upstream's bit, and a reload that cleared the name later
-	served it with the bit intact. One statement above both is what stops the
-	third one being written without it.
+	Next to the ordinary store it would not cover the second store, below it, for
+	an answer refused as cloaked: that entry would go in carrying the upstream's
+	bit, and a reload that cleared the name later would serve it with the bit
+	intact. One statement above both is what stops a third store being written
+	without it.
 	*/
 	if !validating {
 		set_ad_bit(resp, false)
@@ -3250,10 +3249,10 @@ unreadable_rcode_refusal :: proc(
 	catches what is left, and after the section split there is exactly one thing:
 	an OPT record carrying the top bits of an rcode that could not be re-added
 	behind a cut (see `dns.w_readd_opt`). A record dropped for size alone is left
-	out quietly now, TC being about answer and authority data (RFC 2181 section
+	out quietly, TC being about answer and authority data (RFC 2181 section
 	9), so a refusal too tight for its OPT record comes back from here without
 	the extended error in it - the same explanation the fallback below also
-	lacks, arrived at without the wasted round trip that used to come with it.
+	lacks, arrived at without a wasted round trip.
 
 	Which cannot happen to this one: SERVFAIL is four bits and writes nothing
 	into that TTL. Both conditions are here for the refusal built with a composed
@@ -4135,9 +4134,9 @@ apply_rewrite :: proc(
 		A rule that only adds records to a name does not get to answer for the rest
 		of it.
 
-		Every rule used to say where a name points - an address, an alias, or the
-		sink - so a rule matching at all meant the name was this configuration's,
-		and NODATA for a type it had no record of was the truthful answer: the name
+		Most rules say where a name points - an address, an alias, or the
+		sink - so a rule matching at all means the name is this configuration's,
+		and NODATA for a type it has no record of is the truthful answer: the name
 		exists, here is everything there is. `MX`, `TXT` and `SRV` break that
 		assumption, because the ordinary reason to write one is a name whose address
 		is somebody else's business. `example.com` with two MX records and an SPF

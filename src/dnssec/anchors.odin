@@ -10,8 +10,8 @@ Trust anchors.
 Validation has to start somewhere that was not learned from the DNS. The two
 entries below are the root zone key-signing keys IANA publishes at
 https://data.iana.org/root-anchors/root-anchors.xml, as DS records: KSK-2017,
-in use since February 2017, and KSK-2024, published in July 2024 against the
-rollover to come.
+in use since February 2017, and KSK-2024, published in July 2024 ahead of the
+rollover that replaces its predecessor.
 
 Both are carried because a rollover replaces one with the other without warning
 a resolver: whichever key the root is signing with on the day, one of these
@@ -128,8 +128,8 @@ parse_trust_anchor :: proc(text: string, allocator := context.allocator) -> (anc
 	}
 	/*
 	`digest_size` rather than `digest_supported`: this is a length check on a
-	digest type we recognise, and since the probe landed `digest_supported` also
-	answers for what the local crypto policy will compute. Reading it here would
+digest type we recognise, and `digest_supported` also answers for what the
+local crypto policy will compute. Reading it here would
 	make the same anchor line parse or fail depending on when it was parsed -
 	`--check` runs before the probe, `start_validator` after it - over a
 	question that has nothing to do with the policy.

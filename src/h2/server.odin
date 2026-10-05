@@ -229,7 +229,7 @@ Conn :: struct {
 	request_bytes:            int,
 
 	allocator:           mem.Allocator,
-	// Scratch for a header block spanning CONTINUATION frames.
+	// The stream whose header block is open across CONTINUATION frames, or 0.
 	continuation_on:     u32,
 	// How many of them have arrived for the block currently open.
 	continuation_frames: int,
@@ -975,9 +975,10 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 	is not this specification's to constrain, and is nothing this endpoint would
 	match in any case.
 
-	An absent `:path` used to arrive as "", which fails the comparison in
-	`build_h2_response` and 404s - safe by accident rather than by check, and
-	only for as long as that comparison is what the path is used for.
+	An absent `:path` is refused above rather than left to arrive as "", which
+	would fail the comparison in `build_h2_response` and 404 - safe by accident
+	rather than by check, and only for as long as that comparison is what the
+	path is used for.
 
 	Folded, because RFC 3986 section 3.1 makes scheme names case-insensitive and
 	8.3.1 puts no case restriction on `:scheme` - it is an ordinary field value,
@@ -1259,9 +1260,9 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 
 	An even id is idle too, whatever `last_stream_id` is: `handle_headers`
 	rejects one outright, so this server can never have opened one, and
-	without this half a DATA frame on one below `last_stream_id` fell through
-	to the closed-stream path instead - a connection error misanswered as a
-	stream error, and one that spent the closed-stream budget doing it.
+	without this half a DATA frame on one below `last_stream_id` would fall
+	through to the closed-stream path instead - a connection error misanswered
+	as a stream error, and one that spent the closed-stream budget doing it.
 	*/
 	if h.stream_id > c.last_stream_id || h.stream_id % 2 == 0 {
 		sync.mutex_unlock(&c.mu)
@@ -1279,8 +1280,8 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	asks endpoints to tolerate frames that were genuinely in flight when a
 	stream closed, and a peer that just keeps a dead id around otherwise draws
 	an unbounded run of RST_STREAM writes out of this end. Once the budget is
-	spent, this falls back to the pre-existing behaviour: credit returned, no
-	RST, silently ignored.
+spent, this falls back to returning the credit with no RST: silently
+ignored.
 
 	A stream this end reset while the peer was still sending is not asked
 	about at all: RFC 9113 5.1 has frames that follow our own RST_STREAM

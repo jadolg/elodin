@@ -14,7 +14,7 @@ Whether an accept error is a failure at all.
 trouble:
 
   - **The poll tick.** The listening sockets carry a `Receive_Timeout` of
-    `LISTENER_POLL` so the loop wakes to see `stop` (`start_stream`), and every
+    `LISTENER_POLL` so the loop wakes to see `stop` (`start_stream_listener`), and every
     tick of it returns `Would_Block` - `Timeout` on a platform that reports it
     that way. It is the ordinary idle path, once a second per listener.
   - **A connection that went away.** `Aborted` is a peer that closed between the
@@ -83,9 +83,9 @@ burst that clears costs single-digit milliseconds.
 that meaning: the longest it ever goes without looking at `stop`.
 
 It does cost shutdown something, which is worth stating rather than waving at:
-under a descriptor shortage `accept` returns at once, so before this change a
-loop saw `stop` within microseconds of it being set, and now it may be most of a
-second into a wait. `conn_manager_shutdown` joins without a deadline, so an
+under a descriptor shortage `accept` returns at once, so a loop with no wait
+would see `stop` within microseconds of it being set, where this one may be most
+of a second into a wait. `conn_manager_shutdown` joins without a deadline, so an
 elodin stopped while out of descriptors takes up to a second longer per listener
 to go. Against a shutdown that already waits on client connections for up to
 `server.client_timeout`, that is not the slow part.
@@ -238,7 +238,7 @@ Accept_Run :: struct {
 	errors freely with a shortage - a firewall reject arriving while the process
 	is out of descriptors is two unrelated facts about the same second - and all
 	of those reach `core:net` as `Unknown`. Choosing the wording from whichever
-	of them landed on the crossing attempt gave the operator "this listening
+	of them landed on the crossing attempt would give the operator "this listening
 	socket may no longer be usable" for a descriptor shortage, and the fifty
 	millisecond cadence with it, both wrong.
 
