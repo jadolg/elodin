@@ -10,11 +10,11 @@ import si "core:sys/info"
 /*
 Worker counts derived from the machine elodin is starting on.
 
-`server.workers` and `server.upstream_workers` used to ship as 128 and 64, which
-is a resolver sized for five thousand cache misses a second on every box that
-installs it. The cost of being wrong is not symmetric: too few workers is
-throughput an operator can see and raise, while too many is memory that never
-comes back. A worker holds a scratch arena from its first query onward - 256 KiB
+`server.workers` and `server.upstream_workers` are not shipped as a fixed 128 and
+64, which would be a resolver sized for five thousand cache misses a second on
+every box that installs it. The cost of being wrong is not symmetric: too few
+workers is throughput an operator can see and raise, while too many is memory
+that never comes back. A worker holds a scratch arena from its first query onward - 256 KiB
 here, since the build defines `DEFAULT_TEMP_ALLOCATOR_BACKING_SIZE` - and Odin's
 `arena_free_all` keeps and zeroes the first block rather than returning it, so
 the pages stay resident for the life of the process. 192 threads is some 50 MB
@@ -33,7 +33,7 @@ its time parked on an upstream round trip, not on a core - so the CPU count is
 being read as "how big is this machine" rather than as a limit on useful
 threads. Four per CPU with the bounds below puts a two-core home box on 16
 workers, or about 800 cache misses per second, and a 32-core resolver on the
-128 that used to be everybody's default.
+128 a fixed default would give everybody.
 */
 WORKERS_PER_CPU :: 4
 

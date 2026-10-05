@@ -2922,7 +2922,7 @@ validate_wildcard_proof :: proc(
 	The same allowance, and the same answer. Falling through here reports a
 	budget of ours as "wildcard expansion not proven", which reaches the client
 	as a forged answer - the one thing every other exhaustion path in this file
-	now takes care not to say.
+	takes care not to say.
 	*/
 	if denial.exhausted {
 		return .Indeterminate, nil, "verification budget spent"

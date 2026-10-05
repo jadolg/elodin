@@ -246,7 +246,7 @@ resolve_insisting :: proc(
 	One budget per client question, not per call (issue #439). A question can
 	make several of these calls - a DNSSEC chain walk makes up to
 	`MAX_LOOKUPS_PER_QUERY`, an apex `DS` on a zone route asks two groups, a
-	rewrite alias forwards its target - and each used to wait up to
+	rewrite alias forwards its target - and each would otherwise wait up to
 	`query_budget` of its own, so a degraded group held a query worker for the
 	sum of them.
 

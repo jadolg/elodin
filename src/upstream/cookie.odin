@@ -89,7 +89,7 @@ one that does not implement them, and RFC 7873 has the exchange carry on without
 — but once it has issued one, accepting a reply with the option left off would
 make the check something an attacker opts out of at no cost: it would be back to
 guessing only the transaction ID and the source port, which is what the cookie
-was added to put out of reach. It is asked of the query as well as of the
+exists to put out of reach. It is asked of the query as well as of the
 upstream, though; see the comment on `expected` below.
 
 The option is read off the wire rather than off a decoded message, because a
