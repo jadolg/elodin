@@ -1018,14 +1018,14 @@ RDATA with nothing to expand comes back exactly as it arrived.
 Expansion is only ever a rewrite of compression pointers, so a blob holding none
 - the ordinary case, and the only case for the types RFC 3597 forbids
 compressing at all - has to be handed on byte for byte. A type off the
-compressible list is left alone whatever its bytes look like: a DNSKEY's key
+layout table is left alone whatever its bytes look like: a DNSKEY's key
 material may well contain a 0xc0 byte, and reading that as a pointer would
 corrupt the very records DNSSEC validation rests on.
 */
 @(test)
 test_raw_rdata_without_pointer_is_untouched :: proc(t: ^testing.T) {
 	plain := []u8{0x00, 0x01, 3, 'n', 's', '1', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0}
-	// Not on the compressible list, and these bytes would walk as a pointer if
+	// Not in `raw_rdata_layout`, and these bytes would walk as a pointer if
 	// anything were tempted to look.
 	keyish := []u8{0x01, 0x00, 0x03, 0x08, 0xc0, 0x0c, 0xc0, 0x1a, 0xff, 0xff}
 
@@ -1097,13 +1097,13 @@ test_raw_rdata_expands_every_name :: proc(t: ^testing.T) {
 /*
 The writer refuses raw RDATA that still holds a compression pointer.
 
-Nothing the decoder produces should reach this point any more, which is the
-reason to check: a type added to the compressible list without a layout to walk,
+Nothing the decoder produces should reach this point, which is the
+reason to check: a type whose layout is missing from `raw_rdata_layout`,
 or a layout that stops matching what senders write, would otherwise surface as a
 wrong answer served to a client rather than as a failure here. Every caller
 degrades into something honest - an answer without a cookie, an answer truncated
 so the client retries over TCP - which is worth having in place of a name
-pointing at the wrong bytes. Types off the compressible list are not checked at
+pointing at the wrong bytes. Types with no layout are not checked at
 all, so a blob that merely happens to contain a 0xc0 byte still goes out.
 */
 @(test)

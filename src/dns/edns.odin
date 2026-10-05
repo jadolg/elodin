@@ -359,7 +359,8 @@ back, and there is no field to write a number into.
 */
 set_edns_udp_size :: proc(msg: []u8, size: u16) -> bool {
 	span := find_opt_span(msg) or_return
-	// TYPE, CLASS, TTL, RDLENGTH: the class ends six bytes before the length.
+	// TYPE, CLASS, TTL, RDLENGTH: the class, which an OPT record uses for the
+	// payload size, starts six bytes before the length.
 	class_pos := span.rdlen_pos - 6
 	msg[class_pos] = u8(size >> 8)
 	msg[class_pos + 1] = u8(size)
@@ -586,13 +587,13 @@ arena and only the answer is taken from `allocator`.
 
 Not a detail of taste. Every caller on the client-facing side hands in a
 per-request arena, where a scratch allocation left behind is reclaimed with
-everything else and costs nothing; that is why this read as correct for as long
-as it did. The race strategy is the exception: a race worker can outlive the
+everything else and costs nothing, which is what makes the mistake easy to
+miss. The race strategy is the exception: a race worker can outlive the
 caller's arena, so `upstream.exchange` and everything under it - including
 `exchange_with_cookie`, which strips the server cookie out of every reply through
 here - is given the process heap instead. Nothing ever reclaims that, so a reply
-reaching this path left one decoded message behind per query, for the life of the
-process. It takes an upstream whose OPT record is not the last one in the message,
+reaching this path would leave one decoded message behind per query, for the
+life of the process. It takes an upstream whose OPT record is not the last one in the message,
 or one sending the same option twice, which is what `rewrite_edns_option` sends
 down here.
 */
@@ -733,8 +734,8 @@ simply be cut - see `strip_edns_options`. Out of the temp arena, for the reason
 
 A second OPT record is dropped rather than emptied, and this is the only place
 that can be reached with one: a message carrying two has a record behind the
-first, so it is not `span.last`, and both of `strip_edns_options`'s early returns
-are behind that check for exactly this reason. RFC 6891 section
+first, so it is not `span.last`, and `strip_edns_options`'s early return for an
+empty option list is behind that check for exactly this reason. RFC 6891 section
 6.1.1 allows exactly one, to the point of requiring FORMERR for a *query* that
 carries more, and nothing applies that reading to a reply - so a message with two
 is one an upstream should not have sent and not one to pass on as it stands.

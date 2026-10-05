@@ -431,8 +431,8 @@ parse_sequence :: proc(p: ^Parser, indent: int) -> ^Node {
 		// `- |` and `- >`: the entry's value is a block scalar, read back at
 		// the sequence's indentation like the value of any other key. A line
 		// that merely starts with `|` or `>` — `- |x` — is not a valid block
-		// header, and parse_block_scalar rejects it: main silently misread it
-		// as the plain scalar "|x".
+		// header, and parse_block_scalar rejects it rather than reading it as
+		// the plain scalar "|x".
 		if len(rest) > 0 && (rest[0] == '|' || rest[0] == '>') {
 			p.pos += 1
 			append(&node.seq, parse_block_scalar(p, rest, indent, line.num))
@@ -485,8 +485,8 @@ parse_value :: proc(p: ^Parser, rest: string, indent: int, line_num: int) -> ^No
 parse_block_scalar :: proc(p: ^Parser, header: string, indent: int, line_num: int) -> ^Node {
 	// The header is `|` or `>` with at most one chomping indicator, the same
 	// shapes the scanner recognizes. Anything else — `|x`, `|+x`, `| x` — is
-	// invalid YAML and is rejected here rather than misread: `|+x` used to be
-	// taken for `|+` with the trailing byte dropped.
+	// invalid YAML and is rejected here rather than misread, `|+x` as `|+`
+	// with the trailing byte dropped.
 	if !is_block_header(header) {
 		return fail(p, line_num, "unsupported block scalar indicator")
 	}
@@ -499,8 +499,8 @@ parse_block_scalar :: proc(p: ^Parser, header: string, indent: int, line_num: in
 	b := strings.builder_make(p.allocator)
 	block_indent := -1
 	// Folding joins consecutive lines with a space, but a blank line between
-	// them is a paragraph break and stays a newline. Blank lines only reach
-	// here now that the scanner keeps them, so folding has to account for them.
+	// them is a paragraph break and stays a newline. Blank lines reach here
+	// because the scanner keeps them, so folding has to account for them.
 	blanks, wrote := 0, false
 	for p.pos < len(p.lines) {
 		l := p.lines[p.pos]
@@ -547,14 +547,14 @@ parse_block_scalar :: proc(p: ^Parser, header: string, indent: int, line_num: in
 	}
 	// No flush of a trailing `blanks` run: the scanner drops the blank lines
 	// that merely trail a block, so the last line it hands over is always
-	// content. Keep-chomping them is a separate change to both halves.
+	// content. `|+` therefore keeps only the final line's own newline.
 
 	s := strings.to_string(b)
 	switch chomp {
 	case '-':
 		s = strings.trim_right(s, "\n ")
 	case '+':
-	// keep trailing newlines as-is
+	// keep: leave the trailing newline as written
 	case:
 		s = strings.trim_right(s, "\n ")
 		if !folded && len(s) > 0 {

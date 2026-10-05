@@ -74,8 +74,8 @@ is why it is a quarter of a second rather than a second, that being the bound
 
 Passed by the caller rather than defaulted, though there is one value to pass, so
 that a path added later has to answer where its unread bytes are rather than
-inherit an answer. The 429 in `serve_doh_request` is the path that used to have
-the other one, and it drains nothing now: it keeps the connection, and where the
+inherit an answer. The 429 in `serve_doh_request` is the one path that drains
+nothing: it keeps the connection, and where the
 client asked for `Connection: close` the request it refused was read in full, so
 neither case leaves the close anything to trip over.
 

@@ -53,11 +53,10 @@ The `msg=stats` line, built here rather than in `main`.
 Every other figure this server reports at startup or on a schedule is built by a
 procedure that returns it - `connection_limits_line`, `udp_readers_line`,
 `rate_limit_override_lines` - and each of them says the same reason: returned so
-a test can hold it, and so two wordings of one fact cannot drift apart. This line
-was the exception, and it is the one that drifted. `cache_withheld` was added to
-the endpoint and not to the line, which the comment beside it in `main` still
-records; `accept_backoff` was added to the struct, the endpoint, the docs and
-every hint that points an operator at this line, and not to the line.
+a test can hold it, and so two wordings of one fact cannot drift apart. A line
+built inline in `main` is the one that drifts: a counter reaches the struct, the
+endpoint, the docs and every hint that points an operator at this line, and not
+the line.
 
 So it is here, beside `render` - which the endpoint's own guard test already
 covers - and `test_the_stats_line_carries_every_counter` holds it to the same
@@ -88,8 +87,8 @@ stats_line :: proc(
 		st.conn_refused,
 		// Beside `conn_refused` because the pair is the diagnosis: a table that
 		// is full and a client arriving too fast are different problems with
-		// different settings behind them, and the second used to show up in
-		// neither figure.
+		// different settings behind them, and the second shows up in
+		// neither of the other two figures.
 		conn_limited,
 		st.conn_failed,
 		// Not a connection, which is why it is last of this group rather than

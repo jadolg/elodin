@@ -24,7 +24,8 @@ edns_present :: proc(m: Message) -> bool {
 	return found
 }
 
-// DO bit lives in the top bit of the OPT record's 32-bit TTL field.
+// The DO bit is the top bit of the flags half of the OPT record's TTL field,
+// the low sixteen bits.
 edns_do :: proc(m: Message) -> bool {
 	opt, found := find_opt(m)
 	if !found {
@@ -39,10 +40,10 @@ record's TTL.
 
 RFC 6891 section 6.1.3 divides that 32-bit field into an extended rcode, this
 version number, and sixteen flag bits of which DO is the top one. The three are
-windows onto one number, and until this one was cut only the two at either end
-of it were ever looked through - so a request asking in a version this server
-does not implement was indistinguishable from one asking in version 0, and got
-an answer in a version nobody had agreed on.
+windows onto one number. Reading only the two at either end of it would leave a
+request asking in a version this server does not implement indistinguishable
+from one asking in version 0, and it would get an answer in a version nobody had
+agreed on.
 
 A message with no OPT record asked in no version at all, and zero is the right
 answer for it: a requestor that never mentioned EDNS is asking for something
@@ -274,16 +275,12 @@ scan_ttl_offsets :: proc(msg: []u8, allocator := context.allocator) -> (offsets:
 	least 11 - a root name plus the fixed fields - which is the same arithmetic
 	`decode_message` makes, for the same reason.
 
-	Kept although every caller now reaches here behind a decode: `cache.put` is
-	the only one, and `resolve_query` decodes a response before it offers it, so
-	a datagram with impossible counts is turned away one step earlier. This
-	guard was added when `cap_ttls` walked undecoded bytes through here and a
-	17-byte reply claiming three sections of 65535 records made it allocate
-	1.5 MB for a walk that then failed on the first name. `cap_ttls` allocates
-	nothing and does its own walk now, so that route is gone - but the capacity
-	is still spent on counts a caller supplies, and a guard that costs one
-	comparison is not worth removing for a caller that might not always decode
-	first.
+	Callers are `cache.put`, which `resolve_query` reaches only with a response
+	it has decoded, and `server.doh_max_age`, which scans the answer about to
+	be sent. A 17-byte reply claiming three sections of 65535 records would
+	otherwise allocate 1.5 MB for a walk that fails on the first name, and a
+	guard that costs one comparison is not worth removing for a caller that
+	might hand it bytes nothing has checked.
 	*/
 	remaining := len(msg) - HEADER_SIZE
 	if qdcount * 5 + total * 11 > remaining {
@@ -679,7 +676,7 @@ Nothing is given up by not refusing. A message this cannot fully walk is one
 ever pins the sender's figure; the exposure is the single forwarded copy, whose
 answer section this bounded on the way past. An answer section this cannot walk
 is one the client's own parser has to contend with, and where blocking is on
-`resolve_query` refuses it a few lines below for reasons of its own.
+`resolve_query` refuses it later for reasons of its own.
 
 Walks the message itself rather than taking offsets from the caller: the one
 caller that has already scanned is the cache, and it has its own reason to hold

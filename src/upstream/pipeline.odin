@@ -11,15 +11,15 @@ import "elodin:tlsx"
 /*
 Query pipelining for the stream transports, RFC 7766 section 6.2.
 
-Before this, `tcp://` and `tls://` wrote one query and blocked reading its
-reply, so the connection was unavailable to anyone else until that returned and
-N concurrent queries cost N connections. Section 6.2.1.1 asks for the opposite
-- a client SHOULD NOT wait for an outstanding reply before sending the next
-query - and section 6.2.2 makes the consequence a MUST: no more than one
-connection for regular queries. It matters in practice as well as on paper. A
-resolver that rate-limits *new* connections (Quad9 measurably does) refuses a
-share of them while answering perfectly well on one already established, so the
-connection churn was itself the failure.
+A `tcp://` or `tls://` upstream that wrote one query and blocked reading its
+reply would leave the connection unavailable to anyone else until that
+returned, and N concurrent queries would cost N connections. Section 6.2.1.1
+asks for the opposite - a client SHOULD NOT wait for an outstanding reply
+before sending the next query - and section 6.2.2 makes the consequence a MUST:
+no more than one connection for regular queries. It matters in practice as well
+as on paper. A resolver that rate-limits *new* connections (Quad9 measurably
+does) refuses a share of them while answering perfectly well on one already
+established, so connection churn would itself be the failure.
 
 The shape is the DoH one, arrived at through the DNS message ID rather than an
 HTTP/2 stream ID. One connection per upstream is held and shared; every caller
@@ -34,9 +34,9 @@ the others wait on `cond`. A connection with nothing outstanding therefore has
 nobody blocked on it and needs no poll interval, no stopping flag and no thread
 to join - the whole of `H2_Conn`'s lifecycle problem does not arise.
 
-Two things are kept from the code this replaces. A pooled connection found dead
-is retried once on a fresh one, which is what makes an upstream closing an idle
-connection invisible rather than a failure. And `exchange`'s contract that the
+Two properties matter besides. A pooled connection found dead is retried once on
+a fresh one, which is what makes an upstream closing an idle connection
+invisible rather than a failure. And `exchange`'s contract that the
 caller owns the transaction ID still holds: the ID on the wire is this
 connection's, since two queries in flight on one connection cannot share one,
 and the caller's is put back on the answer before it is returned.
@@ -81,16 +81,16 @@ PIPE_SILENT_TIMEOUTS :: 2
 /*
 What a peer gets to finish a message it has already begun.
 
-Two review rounds argued opposite sides of one trade-off here, which is the
-sign that neither side was the rule. A reader with a sliver of its deadline
-left must not abandon a message it has committed the framing to - giving up
-partway leaves the stream unreadable and costs every other caller on the
-connection its answer - so the budget cannot be the reader's. But the
-connection's budget is the whole configured timeout, and handing that to a
-reader that is already out of time is how one `send` comes to cost two.
+Neither the reader's deadline nor the connection's whole timeout is the right
+bound here. A reader with a sliver of its deadline left must not abandon a
+message it has committed the framing to - giving up partway leaves the stream
+unreadable and costs every other caller on the connection its answer - so the
+budget cannot be the reader's. But the connection's budget is the whole
+configured timeout, and handing that to a reader that is already out of time is
+how one `send` comes to cost two.
 
-The two are different quantities and conflating them is what produced both
-findings. What a peer may spend finishing a message is a transmission on an
+The two are different quantities and conflating them gives one failure or the
+other. What a peer may spend finishing a message is a transmission on an
 established connection, measured in round trips; what a query may spend being
 answered is a resolution, measured in seconds and set by the operator. This is
 the first of those, and `Pipe_Conn.timeout` remains the ceiling - the grace can
@@ -422,9 +422,8 @@ all but one of them discarding - a connection of its own. Which is the whole
 point here, so the losers wait on `u.conn_cond` and pick up the winner's.
 
 Whether the connection was dialled here or found open is deliberately not
-reported. `exchange_pipelined` used to ask, and retried only what it had not
-dialled itself; a peer refuses a new connection as readily as it recycles an
-old one, so the query that paid for the dial needs the retry just as much.
+reported: a peer refuses a new connection as readily as it recycles an old
+one, so the query that paid for the dial needs the retry just as much.
 */
 @(private)
 get_pipe :: proc(
@@ -511,8 +510,7 @@ get_pipe :: proc(
 One query over a pipelined connection: TCP, DoT, and a UDP upstream's retry of
 an answer that would not fit a datagram.
 
-The retry is the one the pooled TCP path used to make, narrowed to the case it was
-written for. A resolver closes connections its client has left idle, so a
+The retry is narrowed to the case it exists for. A resolver closes connections its client has left idle, so a
 shared one is quite normally dead by the time a query lands on it; that is not
 an upstream failure and must not be reported as one, since a handful of them
 would trip the health cooldown and bench a working server. Anything else - a
@@ -536,9 +534,9 @@ exchange_pipelined :: proc(
 	/*
 	One deadline for the whole of this, set by `exchange` and handed to every
 	stage. Waiting for somebody else's dial, dialling, asking, writing and
-	retrying each used to start a clock of its own, so a query could cost
-	several times the timeout its caller was promised - with an upstream worker
-	held for all of it.
+retrying each starting a clock of its own would let a query cost several
+times the timeout its caller was promised - with an upstream worker held for
+all of it.
 
 	A `Tick` rather than a `Time`, for the reason `tlsx.wait_ready` gives: this
 	is a bound on waiting rather than a moment anyone reads off a clock, and
@@ -580,12 +578,11 @@ exchange_pipelined :: proc(
 	again; the query after this one finds the connection dead and dials afresh,
 	which is what makes a server that vanished recoverable.
 
-	A connection this query dialled itself is retried too, where it used to be
-	the one case excluded. The reading behind excluding it was that a brand new
-	connection failing says the server is broken rather than that we picked up
-	a stale one - but a peer that limits how often a source may connect refuses
-	the new connection exactly as readily, and then the query that paid for the
-	dial was the only one with no second chance. On the instance this came
+	A connection this query dialled itself is retried too. The case for excluding
+	it would be that a brand new connection failing says the server is broken
+	rather than that we picked up a stale one - but a peer that limits how often a
+	source may connect refuses the new connection exactly as readily, and then the
+	query that paid for the dial would be the only one with no second chance. On the instance this came
 	from, that was most of what the failure rate was made of: the shared
 	connection recycled every fourteen seconds or so, and whichever query had
 	to replace it wore the failure alone.
@@ -759,9 +756,8 @@ pipe_wait :: proc(c: ^Pipe_Conn, w: ^Pipe_Waiter, id: u16, deadline: time.Tick) 
 			cost one spurious handshake. Cheap enough to leave, and a timestamp
 			of the last reply rather than a bare count is what would fix it.
 
-			Killing it puts back what the pooled path did on every failed round
-			trip: `exchange_pipelined` finds the connection dead and the next
-			query dials a fresh one.
+			Killing it means `exchange_pipelined` finds the connection dead and the
+			next query dials a fresh one.
 
 			Both conditions are load-bearing. A reply having arrived for
 			somebody says the connection is delivering, so a slow answer to
@@ -812,18 +808,6 @@ pipe_wait :: proc(c: ^Pipe_Conn, w: ^Pipe_Waiter, id: u16, deadline: time.Tick) 
 }
 
 /*
-Read one reply off the wire and hand it to its waiter.
-
-`.Timeout` means nothing arrived and nothing was consumed, so the connection is
-untouched. Every other error means the stream can no longer be read as a
-sequence of messages and the connection is finished.
-
-The reads are bounded differently on purpose, and `Pipe_Conn.timeout` says why:
-until a byte of the message has been taken, this caller is free to give up and
-hand the reading to somebody else; from the first byte on, the message has to
-be finished or the connection is no longer readable at all.
-*/
-/*
 When a message that has been committed to has to be finished by.
 
 `mine` is the deadline of whoever is doing the work. The larger of what it has
@@ -839,6 +823,18 @@ pipe_framing_deadline :: proc(c: ^Pipe_Conn, mine: time.Tick) -> time.Tick {
 	return time.tick_add(now, min(max(time.tick_diff(now, mine), PIPE_FRAMING_GRACE), c.timeout))
 }
 
+/*
+Read one reply off the wire and hand it to its waiter.
+
+`.Timeout` means nothing arrived and nothing was consumed, so the connection is
+untouched. Every other error means the stream can no longer be read as a
+sequence of messages and the connection is finished.
+
+The reads are bounded differently on purpose, and `Pipe_Conn.timeout` says why:
+until a byte of the message has been taken, this caller is free to give up and
+hand the reading to somebody else; from the first byte on, the message has to
+be finished or the connection is no longer readable at all.
+*/
 @(private)
 pipe_read_one :: proc(c: ^Pipe_Conn, budget: time.Duration) -> Error {
 	length_buf: [2]u8
@@ -928,9 +924,9 @@ pipe_deliver :: proc(c: ^Pipe_Conn, msg: []u8) {
 	}
 	delete_key(&c.waiters, id)
 	if !response_matches(w.query, msg) {
-		// The refusal the pooled path made of a reply that did not answer the
-		// query it was sent: on a stream there is no off-path packet to pass
-		// over, so this is the server contradicting itself.
+		// The refusal of a reply that did not answer the query it was sent: on a
+		// stream there is no off-path packet to pass over, so this is the server
+		// contradicting itself.
 		delete(msg, c.allocator)
 		w.err = .Bad_Response
 		w.done = true
@@ -1004,16 +1000,16 @@ read that was meant to be the shortest of all would be the one that never
 returned. The caller reaching here with a sliver of its deadline left is
 ordinary: it is a waiter that woke a hair before its own expiry.
 */
+@(private)
+pipe_set_read_timeout :: proc(c: ^Pipe_Conn, d: time.Duration) {
+	stream_set_read_timeout(&c.stream, d)
+}
+
 // The write side of `pipe_set_read_timeout`, and the same floor for the same
 // reason: `SO_SNDTIMEO` is a `timeval` too.
 @(private)
 pipe_set_write_timeout :: proc(c: ^Pipe_Conn, d: time.Duration) {
 	stream_set_write_timeout(&c.stream, d)
-}
-
-@(private)
-pipe_set_read_timeout :: proc(c: ^Pipe_Conn, d: time.Duration) {
-	stream_set_read_timeout(&c.stream, d)
 }
 
 @(private)

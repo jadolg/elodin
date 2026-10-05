@@ -30,7 +30,7 @@ MAX_HEADER_LIST is what a block may weigh, and against a peer sending empty
 frames that is no bound at all - nothing accrues, so nothing trips, and the
 block stays open for as long as the peer keeps sending. A block at the size
 limit arrives in three frames at the default 16 KiB maximum frame size, so this
-is fifty times what a legitimate sender needs and still a number.
+is some forty times what a legitimate sender needs and still a number.
 */
 MAX_CONTINUATION_FRAMES :: 128
 
@@ -225,7 +225,7 @@ decode :: proc(
 		buf = block,
 	}
 	out := make([dynamic]Header_Field, 0, 16, allocator)
-	// Every failure below abandons the whole list, and there are eight ways to
+	// Every failure below abandons the whole list, and there are several ways to
 	// reach one. Releasing the fields decoded so far here rather than at each
 	// return keeps a peer from leaking a header block per rejected connection.
 	defer if err != .None {
@@ -270,10 +270,9 @@ decode :: proc(
 			disagree about cannot be recovered from on a live connection.
 
 			The limit is the size this end advertised, not a constant of the
-			decoder's own. It used to be 65536 here against a table built with
-			4096, so a peer could hold what it liked up to whatever
-			`read_integer` would still read - a decoder's worth of state per
-			connection that this end never agreed to.
+			decoder's own. A larger fixed ceiling would let a peer hold whatever it
+			liked up to what `read_integer` would still read - a decoder's worth of
+			state per connection that this end never agreed to.
 			*/
 			size := read_integer(&r, 5) or_return
 			if size > table.limit {

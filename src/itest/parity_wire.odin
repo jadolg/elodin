@@ -27,7 +27,7 @@ PW_MAX_NAME :: 255
 How many compression pointers one name may follow.
 
 A cap alone does not stop a decompression loop, so pointers must also aim
-strictly backwards (see `pw_read_name`); with that in place this only bounds the
+strictly backwards (see `pw_name`); with that in place this only bounds the
 work a deeply chained but legal name can cost.
 */
 PW_MAX_JUMPS :: 64

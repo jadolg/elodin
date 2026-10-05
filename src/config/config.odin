@@ -139,8 +139,7 @@ Upstream_Config :: struct {
 	idle_timeout: time.Duration,
 	/*
 	The zones that do not go to `servers` above, and where each of them goes
-	instead. Empty on a server that forwards everything to one place, which is
-	every configuration that existed before this field did.
+	instead. Empty on a server that forwards everything to one place.
 
 	Always empty on a route's own `upstream` below: routes do not nest, and
 	`load_upstream` refuses a `zones` key inside one rather than reading it and
@@ -265,11 +264,10 @@ Cache_Config :: struct {
 	flight at a time, so a popular expired name does not put an upstream query
 	on the wire per client; see `server/refresh.odin`.
 
-	Zero turns the timer off and restores the behaviour this replaced: the
-	client waits out the whole upstream budget, and the expired entry is served
-	only once that has failed. Kept as an escape hatch for an operator who would
-	rather wait than be handed data known to be out of date, and because it is
-	what every release before this one did.
+	Zero turns the timer off: the client waits out the whole upstream budget,
+	and the expired entry is served only once that has failed. Kept as an
+	escape hatch for an operator who would rather wait than be handed data
+	known to be out of date.
 
 	Read only while `serve_stale` is on. With nothing held for the name there is
 	no answer to cut the wait short for, and a timer that fired would leave the
@@ -371,13 +369,14 @@ Dnssec_Config :: struct {
 	that quarter cannot be held inside a walk - it turns over in a round trip
 	rather than in the thirty a walk may take. Free of the walk rather than idle:
 	a reserved worker may still be parked on the query's own upstream forward,
-	which nothing here bounds. It is exposed because the
-	cost of the number being too small is real - a resolver whose honest
-	cache-miss load is above it turns the surplus into SERVFAIL - and it is not a
-	number anybody here can know. `elodin_dnssec_queries_shed_total` says the bound was
-	reached - not why, since an attack and honest saturation are the same from
-	in here - and is how an operator finds out they may need a bigger one, and a smaller one is how they cap
-	the upstream volume a flood can provoke, which the reservation does not.
+	which nothing here bounds. It is exposed because the cost of the number
+	being too small is real - a resolver whose honest cache-miss load is above
+	it turns the surplus into SERVFAIL - and it is not a number anybody here
+	can know. `elodin_dnssec_queries_shed_total` says the bound was reached -
+	not why, since an attack and honest saturation are the same from
+	in here - and is how an operator finds out they may need a bigger one. A
+	smaller one is how they cap the upstream volume a flood can provoke, which
+	the reservation does not.
 	*/
 	max_chain_walks:      int,
 	/*

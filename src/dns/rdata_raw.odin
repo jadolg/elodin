@@ -45,8 +45,7 @@ Only types whose RDATA may carry a domain name need an entry, and only those
 whose layout is fixed enough to walk without knowing more than the type. A6 is
 left out: where its name starts depends on a prefix length in its own RDATA, and
 it has been formally obsolete since RFC 6563. An A6 record therefore still
-forwards with its pointer intact, which is what it did before any of this
-existed.
+forwards with its pointer intact.
 
 The types this decoder models natively - NS, CNAME, PTR, DNAME, MB, MG, MR,
 NSAP-PTR, SOA, MX, SRV - are on the list too, because a record of one of them
@@ -186,8 +185,7 @@ expand_rdata_names :: proc(
 	in 20 KB, which is a long way under what the budget means to refuse.
 
 	Nothing is allocated for a walk that fails, either - a record whose RDATA
-	does not add up now costs the decoder nothing at all, where before it paid
-	for a buffer it never filled.
+	does not add up costs the decoder no buffer at all.
 	*/
 	wire: [MAX_RAW_NAMES][MAX_NAME_WIRE]u8
 	lengths: [MAX_RAW_NAMES]int
@@ -243,8 +241,8 @@ expand_rdata_names :: proc(
 
 	The charge above stays spent although nothing was taken for it, and the
 	verbatim copy is then charged on top. An over-count in the safe direction,
-	and not one anything can read: the reading it happened in is refused three
-	lines later, and every reading after it is refused before it allocates
+	and not one anything can read: the reading it happened in is refused as
+	soon as this returns, and every reading after it is refused before it allocates
 	anything at all. Refunding it would be a second way to move the counter for
 	no gain.
 	*/

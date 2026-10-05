@@ -99,14 +99,14 @@ the count check in `decode_message` rejects the message, and the bytes reach the
 client verbatim - where glibc's `getanswer`, which only ever walks the answer
 section, hands the browser the address.
 
-What used to be written here in place of refusing was that such a message is also
-one the validator cannot validate and the cache declines to store. The second
-half is true and useless: the client is served either way. The first was simply
-wrong. `validating` is false whenever `dnssec.enabled` is off - which is a
-supported configuration and the one recommended for an upstream that cannot
-return DNSSEC records - or the client sets CD; and an attacker's own zone is
-unsigned in any case, so validation reaches Insecure and serves it. A mitigation
-an attacker switches off by not signing their zone was never one.
+It is not enough that such a message is also one the validator cannot validate
+and the cache declines to store. The second half is true and useless: the client
+is served either way. The first does not hold either. `validating` is false
+whenever `dnssec.enabled` is off - which is a supported configuration and the
+one recommended for an upstream that cannot return DNSSEC records - or the
+client sets CD; and an attacker's own zone is unsigned in any case, so
+validation reaches Insecure and serves it. A mitigation an attacker switches off
+by not signing their zone is not one.
 
 So it fails closed, and only exactly here: with the guard on, for the questions
 the guard covers, when the part of the message a client acts on cannot be read.
@@ -125,8 +125,8 @@ the count check is in the prologue both share - so nothing is given back to the
 attacker; see `rebind_readable`.
 
 What it still costs is a name whose upstream emits an answer section this decoder
-rejects becoming NODATA for A and AAAA where it used to be forwarded - an answer
-that was already not cacheable, not re-encodable and not validatable, so the
+rejects becoming NODATA for A and AAAA where it would otherwise be forwarded - an answer
+that is already not cacheable, not re-encodable and not validatable, so the
 marginal loss is small and the fuzz corpus in `testdata/fuzz-corpus/dns` is what
 keeps the set small. Widening it to every question type would be a different
 change with a much larger blast radius, and is not this one.
@@ -210,9 +210,9 @@ anything: everything here is settled from the question and the configuration,
 without looking at a single byte of the answer.
 
 Split out so that the decode it gates can be the one the cache and the chain walk
-were doing anyway. The guard now reads the answer section of the same
-`dns.Message` those two read instead of making a second pass over the same bytes
-for itself, which is issue #188.
+do anyway. The guard reads the answer section of the same `dns.Message` those
+two read instead of making a second pass over the same bytes for itself, which
+is issue #188.
 
 The five types are the ones an address reaches a client through:
 `first_private_answer` takes addresses out of A, AAAA and the `ipv4hint` and

@@ -86,7 +86,7 @@ process_stats :: proc() -> (p: Process) {
 	p.open_fds = open_fd_count()
 	p.max_fds = i64(descriptor_limit())
 
-	// One line, of about thirty small numbers.
+	// One line, of about fifty small numbers.
 	buf: [1024]u8
 	text, read_ok := read_small_file("/proc/self/stat", buf[:])
 	if !read_ok {

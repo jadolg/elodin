@@ -67,7 +67,7 @@ reverse space and anchors it here has said, specifically about these names, that
 they are to be validated - and an answer invented here carries no signature, so
 a downstream validator holding the same anchor would fetch the real signed
 DNSKEY through this server, conclude the zone is secure, meet an unsigned PTR
-and hand its client SERVFAIL where a signed answer used to arrive. The forward
+and hand its client SERVFAIL where a signed answer would arrive. The forward
 direction does not defer, and the asymmetry is the point: there the operator
 wrote the name down, while here the name is one this server made up, and a made-
 up answer is the weaker of the two claims an operator has written. It costs such

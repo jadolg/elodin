@@ -556,8 +556,8 @@ left a trap: an operator with a local tor who reached for `enabled: false` -
 the blunter key, and the one whose name sounds like it covers everything - got
 the forwarding they asked for and a SERVFAIL for every `.onion` name, because
 the bypass was still waiting for a key they had no reason to think they needed.
-A startup warning used to point at it. Answering it in the code is better: the
-rule is now that a `.onion` name this server forwards is a `.onion` name it does
+A startup warning could have pointed at it; answering it in the code is better:
+the rule is that a `.onion` name this server forwards is a `.onion` name it does
 not validate, which holds however the operator said to forward it.
 
 The same standing-down `is_locally_served` performs above, for the same reason

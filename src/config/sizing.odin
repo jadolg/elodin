@@ -527,9 +527,10 @@ zone route is named anywhere: `main` builds one group per `upstream.zones` entry
 each with the route's own `max_idle` and its own servers.
 
 Counted rather than estimated because a configuration with a dozen routes has a
-pool that is no longer a rounding error against the connection table. See
-`server.descriptors_wanted`, which is the only caller and the reason this is a
-figure rather than a comment.
+pool that is no longer a rounding error against the connection table. The
+only caller is `server.start_listeners`, which hands it to
+`descriptors_wanted`, and that is the reason this is a figure rather than a
+comment.
 
 `tcp` and `tls` servers do not pool at all: they pipeline every query onto one
 connection each (RFC 7766 section 6.2, see upstream/pipeline.odin), so for them

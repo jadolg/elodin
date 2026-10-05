@@ -26,7 +26,7 @@ does not settle, so what one may cost is decided here and not by its author:
     most the name's length times the program's size, however the pattern nests.
     There is no backtracking to blow up.
   - Every `{N}` is held to RE2's 1000, and counts nested in one another to
-    1000 between them (`re2_repeat`).
+    1000 between them (`re2_repeat_valid`).
   - Its compiler writes `e{N}` out N times and only checks the program's size
     once it is done, so a long `(...){1000}` would take a megabyte before it
     was refused. `program_bound` works out an upper bound on the size from the

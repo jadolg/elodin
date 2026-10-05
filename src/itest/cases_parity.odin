@@ -551,11 +551,10 @@ parity_same_options :: proc(x, y: Pw_Msg) -> bool {
 			if taken[i] || b.code != a.code {
 				continue
 			}
-			// An extended DNS error is judged on its info-code, for the reason
-			// `pc_option_text_allowance` gives: the text is the responder's own
-			// wording and two nodes of one service word it differently, so
-			// holding the reference to its own text would skip every name that
-			// carries one.
+			// An extended DNS error is judged on its info-code: the text is the
+			// responder's own wording and two nodes of one service word it
+			// differently, so holding the reference to its own text would skip
+			// every name that carries one.
 			ad, bd := a.data, b.data
 			if a.code == 15 && len(ad) >= 2 && len(bd) >= 2 {
 				ad, bd = ad[:2], bd[:2]

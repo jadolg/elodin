@@ -12,7 +12,7 @@ The shared HTTP/2 connection an HTTPS upstream uses once ALPN has shown it
 speaks h2.
 
 Every concurrent DoH query against an h2 upstream multiplexes onto the *same*
-connection: h2.Client_request opens its own stream and blocks on it, while
+connection: h2.client_request opens its own stream and blocks on it, while
 h2.client_serve — running on its own thread — reads frames for every stream at
 once. See src/h2/client.odin for that machinery; this file only wires it to a
 real socket and to `Upstream`'s lifecycle.
@@ -263,10 +263,10 @@ Let go of `u.h2`'s share of a connection, without waiting for its reader.
 
 The reader frees the connection on its way out, or this does, if it has already
 gone. It is woken with a shutdown rather than left to notice `stopping` at its
-next poll: nothing joins it any more, so replacements are only as far apart as
-a dial, and a reader sitting out its poll would hold a thread and a socket for
-each. Shutdown, not close, because close would race a thread that might still
-be reading from the descriptor; this caller's share keeps it open until then.
+next poll: nothing joins it, so replacements are only as far apart as a dial,
+and a reader sitting out its poll would hold a thread and a socket for each.
+Shutdown, not close, because close would race a thread that might still be
+reading from the descriptor; this caller's share keeps it open until then.
 A TLS session sends its close_notify first, for the reason `send_close_notify`
 gives.
 */

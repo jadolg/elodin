@@ -23,8 +23,8 @@ Entry :: struct {
 	inserted:    time.Time,
 	expires:     time.Time,
 	/*
-	Whether the answer section redirects anywhere: a CNAME, or the DNAME that
-	comes with one.
+	Whether the answer section redirects anywhere: it holds a CNAME. A DNAME
+	always arrives with one, so is not looked for separately - see `redirects`.
 
 	Noted at insert, where the message is decoded anyway, so that a caller whose
 	interest is in where an answer leads can be told on the way out that there is
@@ -623,13 +623,13 @@ for a chain that leads somewhere listed, or one it could not finish checking.
 Left unrecorded, `elodin_cache_hits_total` and the resolver's `cached` drift
 apart with nothing to account for the gap.
 
-A counter of its own rather than a hit taken back off `hits`, which is what this
-was first: a counter that goes down is read by Prometheus as a reset, and the
-window is real - `get` increments under the lock and releases it, and the
-caller's decode and walk happen before the correction lands, so a scrape falling
-between the two sees the higher figure and the next sees the lower. It would
-discard the accumulated rate for the series every time an answer was withheld.
-Both numbers now only ever rise. Not that `hits - withheld` is what was served,
+A counter of its own rather than a hit taken back off `hits`: a counter that
+goes down is read by Prometheus as a reset, and the window is real - `get`
+increments under the lock and releases it, and the caller's decode and walk
+happen before the correction would land, so a scrape falling between the two
+sees the higher figure and the next sees the lower. It would discard the
+accumulated rate for the series every time an answer was withheld. Both
+numbers only ever rise. Not that `hits - withheld` is what was served,
 though: a withheld stale lend is counted here and was counted a miss by `get`,
 so the subtraction is only exact where `serve_stale` is off.
 
@@ -833,8 +833,8 @@ put :: proc(
 	What sends one is an attacker. Take a zone's own signed answer - the TLSA
 	record for a mail host, say - rewrite the low nibble of byte 3, and the
 	records and their signatures are untouched and still verify. `validate_answer`
-	refuses that outright now, which is where the harm is actually closed; this
-	is the same shape stopped one layer further out, on the paths no validator
+refuses that outright, which is where the harm is actually closed; this is
+the same shape stopped one layer further out, on the paths no validator
 	runs on. Cached, it is far worse than forwarded: the negative branch below
 	reads the lifetime from an SOA, and the one the zone's own denials carry
 	would do - up to `negative_ttl`, five minutes by default, of every client
@@ -899,8 +899,9 @@ put :: proc(
 	dnsmasq and BIND remember nothing without the SOA; neither does this.
 
 	Refused here rather than left to the zero lifetime below, which `min_ttl`
-	would lift into a stored entry - and this is what used to happen with
-	`negative_ttl` standing in for the SOA, for five minutes by default.
+	would lift into a stored entry; `negative_ttl` must not stand in for a
+	missing SOA either, since that would hold the denial for five minutes by
+	default.
 	*/
 	negative := !bogus && (rcode == .NX_Domain || len(msg.answer) == 0)
 	soa_ttl: u32
@@ -932,9 +933,9 @@ put :: proc(
 	long after this cache has dropped it, which is the half of a poisoned answer
 	that outlives the poisoning. It is why dnsmasq's `--max-ttl`, Unbound's
 	`cache-max-ttl` and BIND's `max-cache-ttl` all rewrite the TTL in the answer
-	they hand out. The mirror of `min_ttl`, which has always reached the client -
-	`patch_ttls` takes it as a floor - and the pair now says the same kind of
-	thing in both directions.
+	they hand out. The mirror of `min_ttl`, which reaches the client as well -
+`patch_ttls` takes it as a floor - so the pair says the same kind of
+thing in both directions.
 	*/
 	for &t in ttls {
 		t = min(t, c.max_ttl)
@@ -1053,9 +1054,9 @@ Remove every entry that has run out of use. Called periodically so a cache that
 stops being queried does not hold memory indefinitely.
 
 Expiry is not that point when `serve_stale` is on: `main.maintenance_loop` runs
-this every thirty seconds, so sweeping at expiry left an expired entry alive for
-half a minute at most - and an upstream that has been down for half a minute is
-one nothing has noticed yet. The setting could only ever have worked in the
+this every thirty seconds, so sweeping at expiry would leave an expired entry
+alive for half a minute at most - and an upstream that has been down for half a
+minute is one nothing has noticed yet. The setting would only ever work in the
 window before the next tick, which is the window in which it is needed least.
 See `deadline`.
 */
@@ -1154,7 +1155,7 @@ entry_bytes :: proc(e: ^Entry) -> int {
 Take an entry out of the cache entirely: the list, the map, the byte total, the
 memory.
 
-Every removal goes through here. Doing it by hand at each of the four call sites
+Every removal goes through here. Doing it by hand at each call site
 is how a byte total drifts from what is actually held, and a bound computed from
 a drifting total is not a bound.
 

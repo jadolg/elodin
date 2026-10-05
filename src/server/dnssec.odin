@@ -315,7 +315,7 @@ validator_query :: proc(
 	client's own question does follow one, with the single exception `route_group`
 	carves out for a `DS` at a route's apex - the same argument as this one
 	reached from the other side, and the reason the client's copy of that question
-	no longer lands somewhere this one calls wrong. The two are not the same
+	does not land somewhere this one calls wrong. The two are not the same
 	selector even so: `route_group` asks the group that answers the *parent*,
 	which for a route nested inside another route is that outer route's group
 	rather than `s.group`. A chain walk reaching an anchored zone that deep wants

@@ -53,7 +53,7 @@ nothing. And a multiple would not survive this codebase's own rewrites - a
 message is stripped of its RRSIGs and stored, and `encode_message` compresses
 what it writes, so the same names can come back in half the bytes. The entry
 would then be refused on every cache hit by a budget its own message had passed,
-which is a branch `resolve` documents as unreachable.
+which is a branch `resolve_query` documents as unreachable.
 
 640 KB is what one reading may spend. A record whose owner is a pointer is 16
 wire bytes, so a full-length reply crosses it at around 160 presentation
@@ -516,21 +516,19 @@ decode_rdata :: proc(
 		Counted before anything is taken, so the list is allocated once at the
 		size the wire asks for.
 
-		These used to be collected into a `[dynamic]string` that started at two
-		and doubled, and a caller serving a query hands this decoder an arena,
-		which does not give back the buffers a doubling walks past. A
-		<character-string> may be zero bytes long, so one length byte buys a
-		16-byte `string` header - sixteen times its wire length on its own, and
-		thirty-two with the doubling behind it, which is more than the budget
-		above permits for the shapes it does bound. The count is on the wire
-		either way: follow the length bytes and stop at the RDATA's end. Issue
-		#351.
+		A list that grew by doubling would leave every buffer it walked past in
+		the arena a caller serving a query hands this decoder, since an arena
+		does not give them back. A <character-string> may be zero bytes long, so
+		one length byte buys a 16-byte `string` header - sixteen times its wire
+		length on its own, and thirty-two with a doubling behind it, which is
+		more than the budget above permits for the shapes it does bound. The
+		count is on the wire either way: follow the length bytes and stop at the
+		RDATA's end. Issue #351.
 
 		An element running past the RDATA is refused here rather than half way
-		through the read, which is the same refusal by a shorter route. The read
-		reached `.Short_Buffer` or the end-of-RDATA check below, and either way
-		`decode_record` keeps the record as raw bytes rather than rejecting the
-		message - which it still does.
+		through the read, which is the same refusal by a shorter route. Either
+		way `decode_record` keeps the record as raw bytes rather than rejecting
+		the message.
 		*/
 		count := 0
 		for p := start; p < end; count += 1 {
@@ -585,8 +583,8 @@ decode_rdata :: proc(
 
 	case .OPT:
 		// Counted first, for the reason written at TXT above: an option is four
-		// wire bytes at its smallest and twenty-four in memory, which the
-		// doubling took to twelve times the wire.
+		// wire bytes at its smallest and twenty-four in memory, and a list grown
+		// by doubling would take that to twelve times the wire.
 		count := 0
 		for p := start; p + 4 <= end; count += 1 {
 			p += 4 + (int(r.msg[p + 2]) << 8 | int(r.msg[p + 3]))

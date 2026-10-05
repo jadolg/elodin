@@ -46,7 +46,7 @@ Client :: struct {
 	decoder:             Dynamic_Table,
 	streams:             map[u32]^Client_Stream,
 	// Scratch for a response header block spanning CONTINUATION frames. Only
-	// the reader goroutine touches this, so it needs no lock.
+	// the reader thread touches this, so it needs no lock.
 	header_scratch:      [dynamic]u8,
 	continuation_on:     u32,
 	// How many CONTINUATION frames have arrived for the block currently open.

@@ -200,8 +200,8 @@ pad_write :: proc(
 Free a buffer this file made and is not returning.
 
 On the arena paths this is a no-op, and on the race path `allocator` is the
-process heap, where nothing else would ever reclaim it - see the leak
-`rebuild_edns_option` used to hand that caller. Guarded against freeing the
+process heap, where nothing else would ever reclaim it - see
+`rebuild_edns_option`. Guarded against freeing the
 input: every writer above allocates, but a free of the caller's own query would
 be far worse than a buffer left behind, and the guard costs a comparison.
 */
