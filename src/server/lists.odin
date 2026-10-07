@@ -188,8 +188,11 @@ load_one_list :: proc(
 			delete(text)
 			text, load = cached_copy(cfg, list, .Stale)
 			if load == .Unavailable {
-				logx.warnf("list %s: unavailable, skipping it", list.name)
-				return load
+				// The download arrived and holds nothing, and there is no copy
+				// to stand in: the list is empty, not lost, so it does not hold
+				// the other lists back as `reload_filters` holds them for a
+				// list it cannot reach. It stays not current, and so retried.
+				return .Stale
 			}
 			added, _ = parse_list_text(target_block, target_allow, text, list.format)
 		}
@@ -251,6 +254,17 @@ list_contents :: proc(
 		case .Fetched:
 			return fresh, .Current, true
 		case .Cache_Is_Fresh:
+			if text, load = cached_copy(cfg, list, .Current); load != .Unavailable {
+				return
+			}
+			// A fresh copy that cannot stand in - unreadable, or a page an
+			// earlier build cached - is downloaded over. Otherwise the list
+			// stays out of effect until the copy ages past the window, every
+			// retry meanwhile skipping the download as fresh.
+			if fresh, fetch = fetch_list(cfg, list, ignore_fresh = true); fetch == .Fetched {
+				return fresh, .Current, true
+			}
+			return "", .Unavailable, false
 		case .Failed:
 			load = .Stale
 		}
@@ -298,9 +312,9 @@ Fetch :: enum u8 {
 }
 
 @(private)
-fetch_list :: proc(cfg: ^config.Config, list: config.Block_List) -> (text: string, fetch: Fetch) {
+fetch_list :: proc(cfg: ^config.Config, list: config.Block_List, ignore_fresh := false) -> (text: string, fetch: Fetch) {
 	// Skip the download when the cached copy is still within the refresh window.
-	if info, err := os.stat(list_cache_path(cfg, list), context.temp_allocator); err == nil {
+	if info, err := os.stat(list_cache_path(cfg, list), context.temp_allocator); err == nil && !ignore_fresh {
 		age := time.diff(info.modification_time, time.now())
 		if age < cfg.blocking.refresh {
 			return "", .Cache_Is_Fresh
@@ -467,9 +481,14 @@ reload_filters :: proc(s: ^Server, allow_network: bool) -> (current: bool) {
 		if load == .Current {
 			continue
 		}
-		current = false
 		list := s.cfg.blocking.lists[i] if i < lists else s.cfg.blocking.allow_lists[i - lists]
-		if load == .Unavailable && list.file == "" && s.lists_loaded != nil && s.lists_loaded[i] {
+		// A retry is for a download. A missing `file:` list is the operator's
+		// to put back, and retrying it would rebuild every set hourly for good.
+		if list.file != "" {
+			continue
+		}
+		current = false
+		if load == .Unavailable && s.lists_loaded != nil && s.lists_loaded[i] {
 			logx.warnf("list %s: loaded before and unavailable now; keeping the rules already in effect", list.name)
 			filter.set_destroy(block)
 			filter.set_destroy(allow)

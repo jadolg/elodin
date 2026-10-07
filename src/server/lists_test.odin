@@ -1,9 +1,11 @@
 package server
 
 import "core:fmt"
+import "core:net"
 import "core:os"
 import "core:strings"
 import "core:testing"
+import "core:thread"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
@@ -129,13 +131,15 @@ test_a_list_that_never_loaded_does_not_hold_the_others_back :: proc(t: ^testing.
 	// Otherwise one list gone for good would freeze every other list at the
 	// rules it had when the server started.
 	path := fmt.tprintf("/tmp/elodin-server-lists-test-never-%d.txt", os.get_pid())
-	missing := fmt.tprintf("/tmp/elodin-server-lists-test-never-missing-%d.txt", os.get_pid())
 	testing.expect(t, os.write_entire_file(path, "||first.example^\n") == nil)
 	defer os.remove(path)
 
 	cfg := config.default_config()
+	// A download with no copy in an empty cache directory, read without the
+	// network: unavailable from the start.
+	cfg.blocking.cache_dir = fmt.tprintf("/tmp/elodin-server-lists-test-never-cache-%d", os.get_pid())
 	cfg.blocking.lists = []config.Block_List {
-		{name = "missing", file = missing, format = .Adblock, enabled = true},
+		{name = "missing", url = "http://192.0.2.1/l.txt", format = .Adblock, enabled = true},
 		{name = "l", file = path, format = .Adblock, enabled = true},
 	}
 	engine := filter.engine_make()
@@ -265,7 +269,8 @@ test_a_deleted_file_list_is_lifted :: proc(t: ^testing.T) {
 	testing.expect(t, reload_filters(&s, false))
 	testing.expect(t, filter.engine_match(engine, "lifted.example") == .Blocked)
 	os.remove(path)
-	testing.expect(t, !reload_filters(&s, false), "a missing list was reported current")
+	// Nor is it retried: no retry brings a local file back.
+	testing.expect(t, reload_filters(&s, false), "a deleted file list was retried")
 	testing.expect(t, filter.engine_match(engine, "lifted.example") != .Blocked, "a deleted file list kept its blocks")
 }
 
@@ -285,5 +290,122 @@ test_a_cached_page_is_not_a_list :: proc(t: ^testing.T) {
 	text, load := cached_copy(&cfg, list, .Current)
 	testing.expect_value(t, load, List_Load.Unavailable)
 	testing.expect_value(t, text, "")
+	free_all(context.temp_allocator)
+}
+
+@(private = "file")
+One_List :: struct {
+	listener: net.TCP_Socket,
+	body:     string,
+}
+
+// Answer one request on `listener` with `body` as a 200.
+@(private = "file")
+serve_one_list :: proc(one: ^One_List) {
+	client, _, err := net.accept_tcp(one.listener)
+	if err != nil {
+		return
+	}
+	defer net.close(client)
+	buf: [1024]u8
+	_, _ = net.recv_tcp(client, buf[:])
+	reply := fmt.tprintf("HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(one.body), one.body)
+	_, _ = net.send_tcp(client, transmute([]u8)reply)
+}
+
+// A loopback listener for `serve_one_list`, and the URL that reaches it.
+@(private = "file")
+listen_one_list :: proc(t: ^testing.T) -> (listener: net.TCP_Socket, url: string, ok: bool) {
+	err: net.Network_Error
+	listener, err = net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expect_value(t, err, nil) {
+		return
+	}
+	bound, _ := net.bound_endpoint(listener)
+	// So a test that returns before dialling ends the accept, not the suite.
+	_ = net.set_option(listener, .Receive_Timeout, 3 * time.Second)
+	return listener, fmt.tprintf("http://127.0.0.1:%d/l.txt", bound.port), true
+}
+
+@(test)
+test_a_fresh_cached_page_is_downloaded_over :: proc(t: ^testing.T) {
+	/*
+	A copy inside the refresh window skips the download. One that cannot stand
+	in - a page an earlier build cached (#317) - left the list out of effect
+	until it aged past the window, every retry skipping the download meanwhile.
+	*/
+	listener, url, ok := listen_one_list(t)
+	if !ok {
+		return
+	}
+	defer net.close(listener)
+	one := One_List{listener, "0.0.0.0 fetched.example\n"}
+	server := thread.create_and_start_with_poly_data(&one, serve_one_list)
+	defer thread.destroy(server)
+	defer thread.join(server)
+
+	dir := fmt.tprintf("/tmp/elodin-server-lists-test-fresh-page-%d", os.get_pid())
+	testing.expect(t, os.make_directory(dir) == nil)
+	defer os.remove(dir)
+	cfg := config.default_config()
+	cfg.blocking.cache_dir = dir
+	list := config.Block_List {
+		name    = "l",
+		url     = url,
+		format  = .Hosts,
+		enabled = true,
+	}
+	path := strings.clone(list_cache_path(&cfg, list), context.temp_allocator)
+	testing.expect(t, os.write_entire_file(path, "<html>\n0.0.0.0 portal.example\n</html>\n") == nil)
+	defer os.remove(path)
+
+	text, load, downloaded := list_contents(&cfg, list, true)
+	defer delete(text)
+	testing.expect_value(t, load, List_Load.Current)
+	testing.expect(t, downloaded, "a fresh cached page kept the download from running")
+	testing.expect_value(t, text, "0.0.0.0 fetched.example\n")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_an_empty_download_with_no_copy_does_not_hold_the_others_back :: proc(t: ^testing.T) {
+	/*
+	A list that loaded before, then downloads empty with no cached copy behind
+	it - a cleared tmpfs `cache_dir`, a publisher that emptied it. It arrived,
+	so it is empty rather than lost: the refresh goes through without it, and is
+	not current so it is tried again.
+	*/
+	listener, url, ok := listen_one_list(t)
+	if !ok {
+		return
+	}
+	defer net.close(listener)
+	one := One_List{listener, "# emptied\n"}
+	server := thread.create_and_start_with_poly_data(&one, serve_one_list)
+	defer thread.destroy(server)
+	defer thread.join(server)
+
+	dir := fmt.tprintf("/tmp/elodin-server-lists-test-emptied-%d", os.get_pid())
+	testing.expect(t, os.make_directory(dir) == nil)
+	defer os.remove(dir)
+	cfg := config.default_config()
+	cfg.blocking.cache_dir = dir
+	cfg.blocking.refresh = 0
+	cfg.blocking.lists = []config.Block_List{{name = "l", url = url, format = .Hosts, enabled = true}}
+	engine := filter.engine_make()
+	defer filter.engine_destroy(engine)
+	s := Server {
+		cfg     = &cfg,
+		filters = engine,
+	}
+	defer delete(s.lists_loaded)
+	// As if it had loaded at the last refresh.
+	s.lists_loaded = make([]bool, 1)
+	s.lists_loaded[0] = true
+	generation := filter.engine_generation(engine)
+
+	testing.expect(t, !reload_filters(&s, true), "an empty download was reported current")
+	testing.expect(t, filter.engine_generation(engine) != generation, "an empty download held the refresh back")
+	testing.expect(t, !os.exists(list_cache_path(&cfg, cfg.blocking.lists[0])), "an empty download was cached")
 	free_all(context.temp_allocator)
 }

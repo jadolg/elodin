@@ -30,8 +30,9 @@ does not turn blocking off once a list has been fetched.
   is `<`: a captive portal, an error page sent as a 200) or holds no rules,
   and it does not replace the cached copy (`the download is a web page, not a
   list`, `the download holds no rules, so it is not cached`). A list the
-  publisher empties on purpose therefore keeps its last copy. A cached copy
-  that is a web page is not used either.
+  publisher empties on purpose therefore keeps its last copy; with no copy it
+  adds nothing. A cached copy that is a web page or cannot be read is not used,
+  and is downloaded over even inside the refresh window.
 - The cached copy is replaced by writing a temporary file beside it, syncing
   it, then renaming it over the old one. A power cut mid-write leaves the old
   copy or the new one, never a truncated list.
@@ -41,10 +42,12 @@ does not turn blocking off once a list has been fetched.
   effect`). This happens with an unwritable or cleared `cache_dir`. A list that
   has never loaded does not hold the other lists back, and neither does a
   `file:` list: delete one and its rules go at the next refresh.
-- A refresh where some list is unavailable, or was served from its cached copy
-  because the download failed, is retried after 1 minute, then 2, 4 and so on,
-  up to 1 hour or `refresh`, whichever is shorter (`blocklists: not every list is current; trying again in
-  1m0s`). A start that could not load every list is retried the same way.
+- A refresh where some downloaded list is unavailable, or was served from its
+  cached copy because the download failed or held no rules, is retried after 1
+  minute, then 2, 4 and so on, up to 1 hour or `refresh`, whichever is shorter
+  (`blocklists: not every list is current; trying again in 1m0s`). A start that
+  could not load every list is retried the same way. A missing `file:` list is
+  not retried.
 
 ## Rule syntax
 

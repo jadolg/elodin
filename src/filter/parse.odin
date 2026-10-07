@@ -102,10 +102,15 @@ first_field_is_ip :: proc(line: string) -> bool {
 	}
 	// Parsed, not judged by its characters: any word with a colon in it passed
 	// for an IPv6 address, so a plain-text error page served as a hosts list
-	// (`Error: rate limited`) was read as one (#317).
+	// (`Error: rate limited`) was read as one (#317). The parsers also take a
+	// port (`1.2.3.4:80`, `[::1]:53`) and a short IPv4 form (`10.20.30`),
+	// neither of which is a hosts address, so IPv4 needs its four parts.
+	if strings.contains(field, ":") {
+		_, v6 := net.parse_ip6_address(field)
+		return v6 && field[0] != '['
+	}
 	_, v4 := net.parse_ip4_address(field)
-	_, v6 := net.parse_ip6_address(field)
-	return v4 || v6
+	return v4 && strings.count(field, ".") == 3
 }
 
 @(private)
