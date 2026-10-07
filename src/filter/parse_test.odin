@@ -143,6 +143,26 @@ test_first_field_is_ip_needs_a_field_and_an_address :: proc(t: ^testing.T) {
 	testing.expect(t, !first_field_is_ip("ads.example"), "and neither is a bare name")
 	testing.expect(t, !first_field_is_ip("1.2.3 ads.example"), "three octets is not an address")
 	testing.expect(t, !first_field_is_ip("a.b.c.d ads.example"), "nor is a name shaped like one")
+	// A colon does not make a word an IPv6 address, nor digits and dots an IPv4 one.
+	testing.expect(t, !first_field_is_ip("Error: rate limited"), "a word with a colon is not an address")
+	testing.expect(t, !first_field_is_ip("10.20.30 ads.example"), "a short IPv4 form is not a hosts address")
+	testing.expect(t, !first_field_is_ip("1.2.3.4:80 ads.example"), "nor is an address with a port")
+	testing.expect(t, !first_field_is_ip("[::1]:53 ads.example"), "in either family")
+	testing.expect(t, !first_field_is_ip("x::1]:53 ads.example"), "nor with a bracket further in")
+	testing.expect(t, !first_field_is_ip("999.1.1.1 ads.example"), "an octet past 255 is not an address")
+	testing.expect(t, first_field_is_ip("::ffff:192.0.2.1 ads.example"), "a mapped address is one")
+}
+
+@(test)
+test_a_hosts_line_needs_an_address_first :: proc(t: ^testing.T) {
+	// An error page served as a hosts list sank every word after the first
+	// (#317), and passed for a list that held rules.
+	block, allow := parsed("429 Too Many Requests\nError: service unavailable\n0.0.0.0 ads.example\n", .Hosts)
+	defer set_destroy(block)
+	defer set_destroy(allow)
+	testing.expect_value(t, block.count, 1)
+	testing.expect(t, set_lookup(block, "ads.example"))
+	testing.expect(t, !set_lookup(block, "requests"), "a word of an error page was sunk")
 }
 
 @(test)

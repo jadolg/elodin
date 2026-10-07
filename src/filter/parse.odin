@@ -1,5 +1,6 @@
 package filter
 
+import "core:net"
 import "core:strings"
 
 Format :: enum u8 {
@@ -99,21 +100,19 @@ first_field_is_ip :: proc(line: string) -> bool {
 	} else {
 		return false
 	}
+	// Parsed, not judged by its characters: judged so, any word with a colon
+	// passes for an IPv6 address, and a plain-text error page served as a hosts
+	// list (`Error: rate limited`) for a hosts line (#317). The parsers take a
+	// port (`1.2.3.4:80`, `[::1]:53`) and a short IPv4 form (`10.20.30`),
+	// neither of which is a hosts address, so IPv4 needs its four parts.
 	if strings.contains(field, ":") {
-		return true
+		_, v6 := net.parse_ip6_address(field)
+		// Brackets anywhere, not just first: `split_port` drops the first
+		// byte of a field ending `]:port`, so `x::1]:53` parses as `::1`.
+		return v6 && !strings.contains_any(field, "[]")
 	}
-	dots := 0
-	for i in 0 ..< len(field) {
-		c := field[i]
-		switch {
-		case c == '.':
-			dots += 1
-		case c >= '0' && c <= '9':
-		case:
-			return false
-		}
-	}
-	return dots == 3
+	_, v4 := net.parse_ip4_address(field)
+	return v4 && strings.count(field, ".") == 3
 }
 
 @(private)
@@ -176,11 +175,16 @@ parse_hosts_line :: proc(block: ^Set, raw: string) -> (added: int) {
 	if line == "" {
 		return 0
 	}
-	// "IP host [host...]": everything after the address is a name to sink.
-	space := strings.index_any(line, " \t")
-	if space < 0 {
+	/*
+	"IP host [host...]": everything after the address is a name to sink. A line
+	whose first field is no address is not a hosts entry (hosts(5)), and Blocky
+	refuses it likewise. Otherwise a mirror's `429 Too Many Requests` served as
+	a 200 would sink `too`, `many` and `requests`, and pass for a list (#317).
+	*/
+	if !first_field_is_ip(line) {
 		return 0
 	}
+	space := strings.index_any(line, " \t")
 	rest := strings.trim_space(line[space:])
 	for len(rest) > 0 {
 		host := rest
