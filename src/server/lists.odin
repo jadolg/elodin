@@ -31,15 +31,15 @@ FETCH_DEADLINE :: 5 * time.Minute
 
 /*
 How soon a refresh that could not bring every list up to date is tried again,
-doubling on each further failure up to `blocking.refresh` (#411). Waiting the
-whole interval left a list that one outage kept from loading out of effect, or
-out of date, for a day by default.
+doubling on each further failure up to `blocking.refresh` (#411), so a list one
+outage kept from loading is not out of effect, or out of date, for a whole
+interval - a day by default.
 */
 REFRESH_RETRY_FIRST :: 1 * time.Minute
 /*
-The longest a retry waits, whatever `blocking.refresh` says. Doubling to a week
-on `small-device.yaml` left a box that booted during a ten-hour outage waiting
-most of a further nine hours for its lists once the network was back.
+The longest a retry waits, whatever `blocking.refresh` says. `small-device.yaml`
+refreshes weekly, and a box that boots during a long outage gets its lists
+within the hour of the network coming back, not hours after.
 */
 REFRESH_RETRY_MAX :: 1 * time.Hour
 
@@ -175,11 +175,11 @@ load_one_list :: proc(
 	if downloaded {
 		/*
 		A download replaces the cached copy only once it has been parsed and
-		found to hold rules (#317). Written first, an empty file mid-publish or
-		an error page served as a 200 - which parses to nothing - was the copy
-		every later fallback read. Pi-hole falls back to its cached copy on an
-		empty download likewise. A download that holds no rules added nothing to
-		the sets either, so the cached copy is parsed in its place.
+		found to hold rules (#317), so an empty file mid-publish or an error
+		page served as a 200 never becomes the copy every later fallback reads.
+		Pi-hole falls back to its cached copy on an empty download likewise. A
+		download that holds no rules has added nothing to the sets either, so
+		the cached copy is parsed in its place.
 		*/
 		if held_rules {
 			save_cached_copy(cfg, list, text)
@@ -204,9 +204,8 @@ load_one_list :: proc(
 /*
 Parse a list's text into the sets, and say whether it held rules: it added some,
 took some back with `$badfilter`, or had regex rules refused because the lists
-before it used up the budget. `added` alone reads a list of `$badfilter` rules,
-or of regexes past the budget, as empty, so its download was never cached and
-the list never counted as current.
+before it used up the budget. `added` alone would read a list of `$badfilter`
+rules, or of regexes past the budget, as empty: never cached, never current.
 */
 @(private)
 parse_list_text :: proc(block, allow: ^filter.Set, text: string, format: config.List_Format) -> (added: int, held_rules: bool) {
@@ -281,7 +280,7 @@ cached_copy :: proc(cfg: ^config.Config, list: config.Block_List, load: List_Loa
 	if err != nil {
 		return "", .Unavailable
 	}
-	// A page cached before a download was checked for one (#317).
+	// A page an earlier build cached before downloads were checked (#317).
 	if begins_with_markup(string(data)) {
 		logx.warnf("list %s: the cached copy at %s is a web page, not a list", list.name, cache_path)
 		delete(data)
@@ -355,11 +354,11 @@ begins_with_markup :: proc(body: string) -> bool {
 Replace a cached copy so that a crash at any point leaves the old one or the new
 one whole on disk, never a truncated file (#411).
 
-Writing in place truncated the copy first, and a power cut mid-write - on the
-router or SD-card board `small-device.yaml` is for - left a partial list that
-the next start without a network loaded as if it were the whole of it. The new
-copy goes to a temporary file beside the old, reaches the disk, and is renamed
-over it; rename(2) replaces the name atomically. The temporary name ends in
+A write in place truncates the copy first, and a power cut mid-write - on the
+router or SD-card board `small-device.yaml` is for - leaves a partial list the
+next start without a network would load as the whole of it. So the new copy goes
+to a temporary file beside the old, reaches the disk, and is renamed over it;
+rename(2) replaces the name atomically. The temporary name ends in
 `.tmp`, which no `sanitise_name` result does, so it cannot be another list's.
 */
 @(private)

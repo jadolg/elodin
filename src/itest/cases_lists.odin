@@ -195,9 +195,9 @@ blocking:
 A refresh at runtime that can reach neither a list nor a cached copy of it.
 
 The startup fallback above is to the copy on disk. With no copy - an unwritable
-or cleared `cache_dir` - and the list server gone at the refresh, the refresh
-used to swap in a set without the list and leave its names unblocked for a day
-(#411). The first refresh runs on the maintenance loop's first 30s tick.
+or cleared `cache_dir` - and the list server gone at the refresh, the rules in
+effect have to stay, not be swapped for a set without the list until the next
+refresh (#411). The first refresh runs on the maintenance loop's first 30s tick.
 */
 run_list_refresh_cases :: proc(r: ^Runner) {
 	http_port := next_port(r)
@@ -274,13 +274,12 @@ blocking:
 
 /*
 A download that succeeds and is not a list: a captive portal's page or a
-mirror's error page served as a 200, or an empty file mid-publish (#317). It
-used to be written over the cached copy before it was parsed, so the list went
-out of effect and the copy every later fallback reads went with it. The page
-carries a line that parses as a hosts rule, so it is refused for being a page
-rather than for holding no rules. Each start
-here comes after the 1s refresh window, so each one downloads again, under the
-same list name and so the same cached copy.
+mirror's error page served as a 200, or an empty file mid-publish (#317). None
+may be written over the cached copy: the list would go out of effect and the
+copy every later fallback reads with it. The page carries a line that parses as
+a hosts rule, so it is refused for being a page rather than for holding no
+rules. Each start here comes after the 1s refresh window, so each one downloads
+again, under the same list name and so the same cached copy.
 */
 run_list_bad_download_cases :: proc(r: ^Runner) {
 	http_port := next_port(r)

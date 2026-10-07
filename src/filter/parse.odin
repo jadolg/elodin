@@ -100,9 +100,9 @@ first_field_is_ip :: proc(line: string) -> bool {
 	} else {
 		return false
 	}
-	// Parsed, not judged by its characters: any word with a colon in it passed
-	// for an IPv6 address, so a plain-text error page served as a hosts list
-	// (`Error: rate limited`) was read as one (#317). The parsers also take a
+	// Parsed, not judged by its characters: judged so, any word with a colon
+	// passes for an IPv6 address, and a plain-text error page served as a hosts
+	// list (`Error: rate limited`) for a hosts line (#317). The parsers take a
 	// port (`1.2.3.4:80`, `[::1]:53`) and a short IPv4 form (`10.20.30`),
 	// neither of which is a hosts address, so IPv4 needs its four parts.
 	if strings.contains(field, ":") {
@@ -176,8 +176,8 @@ parse_hosts_line :: proc(block: ^Set, raw: string) -> (added: int) {
 	/*
 	"IP host [host...]": everything after the address is a name to sink. A line
 	whose first field is no address is not a hosts entry (hosts(5)), and Blocky
-	refuses it likewise. Taken as one, a mirror's `429 Too Many Requests` served
-	as a 200 sank `too`, `many` and `requests`, and passed for a list (#317).
+	refuses it likewise. Otherwise a mirror's `429 Too Many Requests` served as
+	a 200 would sink `too`, `many` and `requests`, and pass for a list (#317).
 	*/
 	if !first_field_is_ip(line) {
 		return 0

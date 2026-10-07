@@ -85,9 +85,9 @@ test_a_query_with_a_slash_in_a_label_is_matched_against_the_lists :: proc(t: ^te
 test_a_refresh_that_loses_a_list_keeps_the_rules_in_effect :: proc(t: ^testing.T) {
 	/*
 	A list that loaded before and has neither its source nor a cached copy now
-	used to be swapped out along with everything it blocked, until the next
-	refresh a day later (#411). The rules in effect stay instead, and the refresh
-	says it was not current so it is retried sooner.
+	keeps the rules in effect rather than taking everything it blocked out until
+	the next refresh (#411), and the refresh says it was not current so it is
+	retried sooner.
 	*/
 	// A downloaded list read from its cached copy, as a start without the
 	// network reads it; taking the copy away is losing both.
@@ -331,8 +331,8 @@ listen_one_list :: proc(t: ^testing.T) -> (listener: net.TCP_Socket, url: string
 test_a_fresh_cached_page_is_downloaded_over :: proc(t: ^testing.T) {
 	/*
 	A copy inside the refresh window skips the download. One that cannot stand
-	in - a page an earlier build cached (#317) - left the list out of effect
-	until it aged past the window, every retry skipping the download meanwhile.
+	in - a page an earlier build cached (#317) - is downloaded over, or the list
+	would be out of effect until it aged past the window.
 	*/
 	listener, url, ok := listen_one_list(t)
 	if !ok {
