@@ -407,5 +407,27 @@ test_an_empty_download_with_no_copy_does_not_hold_the_others_back :: proc(t: ^te
 	testing.expect(t, !reload_filters(&s, true), "an empty download was reported current")
 	testing.expect(t, filter.engine_generation(engine) != generation, "an empty download held the refresh back")
 	testing.expect(t, !os.exists(list_cache_path(&cfg, cfg.blocking.lists[0])), "an empty download was cached")
+	// It added nothing, so losing it later has no rules of its to keep.
+	testing.expect(t, !s.lists_loaded[0], "an empty list was recorded as loaded")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_an_empty_cached_copy_is_not_a_list :: proc(t: ^testing.T) {
+	// An empty download an earlier build cached, or a copy its in-place write
+	// truncated before a crash.
+	dir := fmt.tprintf("/tmp/elodin-server-lists-test-empty-copy-%d", os.get_pid())
+	testing.expect(t, os.make_directory(dir) == nil)
+	defer os.remove(dir)
+	cfg := config.default_config()
+	cfg.blocking.cache_dir = dir
+	list := config.Block_List{name = "l", url = "http://192.0.2.1/l.txt", format = .Hosts, enabled = true}
+	path := list_cache_path(&cfg, list)
+	testing.expect(t, os.write_entire_file(path, " \n\r\n") == nil)
+	defer os.remove(path)
+
+	text, load := cached_copy(&cfg, list, .Current)
+	testing.expect_value(t, load, List_Load.Unavailable)
+	testing.expect_value(t, text, "")
 	free_all(context.temp_allocator)
 }

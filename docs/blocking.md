@@ -31,8 +31,8 @@ does not turn blocking off once a list has been fetched.
   and it does not replace the cached copy (`the download is a web page, not a
   list`, `the download holds no rules, so it is not cached`). A list the
   publisher empties on purpose therefore keeps its last copy; with no copy it
-  adds nothing. A cached copy that is a web page or cannot be read is not used,
-  and is downloaded over even inside the refresh window.
+  adds nothing. A cached copy that is a web page, is empty or cannot be read
+  is not used, and is downloaded over even inside the refresh window.
 - The cached copy is replaced by writing a temporary file beside it, syncing
   it, then renaming it over the old one. A power cut mid-write leaves the old
   copy or the new one, never a truncated list.

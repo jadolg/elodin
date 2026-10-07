@@ -52,6 +52,9 @@ List_Load :: enum u8 {
 	Stale,
 	// Neither the source nor a cached copy could be read: it adds nothing.
 	Unavailable,
+	// The download arrived holding no rules and there is no copy: it adds
+	// nothing, but is empty rather than lost, so it holds nothing back.
+	Empty,
 }
 
 /*
@@ -192,7 +195,7 @@ load_one_list :: proc(
 				// to stand in: the list is empty, not lost, so it does not hold
 				// the other lists back as `reload_filters` holds them for a
 				// list it cannot reach. It stays not current, and so retried.
-				return .Stale
+				return .Empty
 			}
 			added, _ = parse_list_text(target_block, target_allow, text, list.format)
 		}
@@ -283,6 +286,13 @@ cached_copy :: proc(cfg: ^config.Config, list: config.Block_List, load: List_Loa
 	// A page an earlier build cached before downloads were checked (#317).
 	if begins_with_markup(string(data)) {
 		logx.warnf("list %s: the cached copy at %s is a web page, not a list", list.name, cache_path)
+		delete(data)
+		return "", .Unavailable
+	}
+	// An empty download an earlier build cached (#317), or a copy its in-place
+	// write truncated before a crash (#411): no list either.
+	if strings.trim(string(data), " \t\r\n") == "" {
+		logx.warnf("list %s: the cached copy at %s is empty", list.name, cache_path)
 		delete(data)
 		return "", .Unavailable
 	}
@@ -499,7 +509,8 @@ reload_filters :: proc(s: ^Server, allow_network: bool) -> (current: bool) {
 		s.lists_loaded = make([]bool, len(loads))
 	}
 	for load, i in loads {
-		s.lists_loaded[i] = load != .Unavailable
+		// An empty list contributed nothing, so it has nothing to keep later.
+		s.lists_loaded[i] = load == .Current || load == .Stale
 	}
 	delete(loads)
 

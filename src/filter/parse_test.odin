@@ -148,6 +148,7 @@ test_first_field_is_ip_needs_a_field_and_an_address :: proc(t: ^testing.T) {
 	testing.expect(t, !first_field_is_ip("10.20.30 ads.example"), "a short IPv4 form is not a hosts address")
 	testing.expect(t, !first_field_is_ip("1.2.3.4:80 ads.example"), "nor is an address with a port")
 	testing.expect(t, !first_field_is_ip("[::1]:53 ads.example"), "in either family")
+	testing.expect(t, !first_field_is_ip("x::1]:53 ads.example"), "nor with a bracket further in")
 	testing.expect(t, !first_field_is_ip("999.1.1.1 ads.example"), "an octet past 255 is not an address")
 	testing.expect(t, first_field_is_ip("::ffff:192.0.2.1 ads.example"), "a mapped address is one")
 }

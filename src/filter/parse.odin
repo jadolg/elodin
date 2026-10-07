@@ -107,7 +107,9 @@ first_field_is_ip :: proc(line: string) -> bool {
 	// neither of which is a hosts address, so IPv4 needs its four parts.
 	if strings.contains(field, ":") {
 		_, v6 := net.parse_ip6_address(field)
-		return v6 && field[0] != '['
+		// Brackets anywhere, not just first: `split_port` drops the first
+		// byte of a field ending `]:port`, so `x::1]:53` parses as `::1`.
+		return v6 && !strings.contains_any(field, "[]")
 	}
 	_, v4 := net.parse_ip4_address(field)
 	return v4 && strings.count(field, ".") == 3
