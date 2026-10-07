@@ -91,6 +91,8 @@ test_a_refresh_that_loses_a_list_keeps_the_rules_in_effect :: proc(t: ^testing.T
 	*/
 	// A downloaded list read from its cached copy, as a start without the
 	// network reads it; taking the copy away is losing both.
+	// Registered first so it runs last: the removals below read paths it zeroes.
+	defer free_all(context.temp_allocator)
 	dir := fmt.tprintf("/tmp/elodin-server-lists-test-lost-%d", os.get_pid())
 	testing.expect(t, os.make_directory(dir) == nil)
 	defer os.remove(dir)
@@ -123,7 +125,6 @@ test_a_refresh_that_loses_a_list_keeps_the_rules_in_effect :: proc(t: ^testing.T
 	testing.expect(t, reload_filters(&s, false))
 	testing.expect(t, filter.engine_match(engine, "back.example") == .Blocked)
 	testing.expect(t, filter.engine_match(engine, "kept.example") != .Blocked)
-	free_all(context.temp_allocator)
 }
 
 @(test)
@@ -183,6 +184,8 @@ test_a_cached_copy_is_replaced_whole :: proc(t: ^testing.T) {
 	it, so a crash mid-write leaves one or the other whole, never a truncated
 	list the next start would load as the whole of it (#411).
 	*/
+	// Registered first so it runs last: the removals below read paths it zeroes.
+	defer free_all(context.temp_allocator)
 	path := fmt.tprintf("/tmp/elodin-server-lists-test-cache-%d.list", os.get_pid())
 	testing.expect(t, os.write_entire_file(path, "||old.example^\n") == nil)
 	defer os.remove(path)
@@ -202,7 +205,6 @@ test_a_cached_copy_is_replaced_whole :: proc(t: ^testing.T) {
 	testing.expect_value(t, rerr, nil)
 	testing.expect_value(t, string(now), "||new.example^\n")
 	testing.expect(t, !os.exists(fmt.tprintf("%s.tmp", path)), "the temporary copy was left behind")
-	free_all(context.temp_allocator)
 }
 
 @(test)
@@ -277,6 +279,8 @@ test_a_deleted_file_list_is_lifted :: proc(t: ^testing.T) {
 @(test)
 test_a_cached_page_is_not_a_list :: proc(t: ^testing.T) {
 	// A page cached by a build that wrote a download before checking it.
+	// Registered first so it runs last: the removals below read paths it zeroes.
+	defer free_all(context.temp_allocator)
 	dir := fmt.tprintf("/tmp/elodin-server-lists-test-page-%d", os.get_pid())
 	testing.expect(t, os.make_directory(dir) == nil)
 	defer os.remove(dir)
@@ -290,7 +294,6 @@ test_a_cached_page_is_not_a_list :: proc(t: ^testing.T) {
 	text, load := cached_copy(&cfg, list, .Current)
 	testing.expect_value(t, load, List_Load.Unavailable)
 	testing.expect_value(t, text, "")
-	free_all(context.temp_allocator)
 }
 
 @(private = "file")
@@ -344,6 +347,8 @@ test_a_fresh_cached_page_is_downloaded_over :: proc(t: ^testing.T) {
 	defer thread.destroy(server)
 	defer thread.join(server)
 
+	// Registered first so it runs last: the removals below read paths it zeroes.
+	defer free_all(context.temp_allocator)
 	dir := fmt.tprintf("/tmp/elodin-server-lists-test-fresh-page-%d", os.get_pid())
 	testing.expect(t, os.make_directory(dir) == nil)
 	defer os.remove(dir)
@@ -364,7 +369,6 @@ test_a_fresh_cached_page_is_downloaded_over :: proc(t: ^testing.T) {
 	testing.expect_value(t, load, List_Load.Current)
 	testing.expect(t, downloaded, "a fresh cached page kept the download from running")
 	testing.expect_value(t, text, "0.0.0.0 fetched.example\n")
-	free_all(context.temp_allocator)
 }
 
 @(test)
@@ -385,6 +389,8 @@ test_an_empty_download_with_no_copy_does_not_hold_the_others_back :: proc(t: ^te
 	defer thread.destroy(server)
 	defer thread.join(server)
 
+	// Registered first so it runs last: the removals below read paths it zeroes.
+	defer free_all(context.temp_allocator)
 	dir := fmt.tprintf("/tmp/elodin-server-lists-test-emptied-%d", os.get_pid())
 	testing.expect(t, os.make_directory(dir) == nil)
 	defer os.remove(dir)
@@ -409,13 +415,14 @@ test_an_empty_download_with_no_copy_does_not_hold_the_others_back :: proc(t: ^te
 	testing.expect(t, !os.exists(list_cache_path(&cfg, cfg.blocking.lists[0])), "an empty download was cached")
 	// It added nothing, so losing it later has no rules of its to keep.
 	testing.expect(t, !s.lists_loaded[0], "an empty list was recorded as loaded")
-	free_all(context.temp_allocator)
 }
 
 @(test)
 test_an_empty_cached_copy_is_not_a_list :: proc(t: ^testing.T) {
 	// An empty download an earlier build cached, or a copy its in-place write
 	// truncated before a crash.
+	// Registered first so it runs last: the removals below read paths it zeroes.
+	defer free_all(context.temp_allocator)
 	dir := fmt.tprintf("/tmp/elodin-server-lists-test-empty-copy-%d", os.get_pid())
 	testing.expect(t, os.make_directory(dir) == nil)
 	defer os.remove(dir)
@@ -429,5 +436,4 @@ test_an_empty_cached_copy_is_not_a_list :: proc(t: ^testing.T) {
 	text, load := cached_copy(&cfg, list, .Current)
 	testing.expect_value(t, load, List_Load.Unavailable)
 	testing.expect_value(t, text, "")
-	free_all(context.temp_allocator)
 }

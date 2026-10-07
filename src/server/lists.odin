@@ -539,8 +539,8 @@ reload_filters :: proc(s: ^Server, allow_network: bool) -> (current: bool) {
 /*
 How long to wait before the next refresh after one that was not `current`:
 `REFRESH_RETRY_FIRST` after the first, doubling after each one since, and never
-longer than the interval itself or `REFRESH_RETRY_MAX`. `retry` is the wait just served, zero when the
-refresh before this one was current.
+longer than the interval itself or `REFRESH_RETRY_MAX`. `retry` is the wait just
+served, zero when the refresh before this one was current.
 */
 refresh_retry :: proc(retry, interval: time.Duration) -> time.Duration {
 	if retry <= 0 {
