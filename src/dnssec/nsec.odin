@@ -268,9 +268,9 @@ nsec_proves_no_data :: proc(
 		return .Failed
 	}
 	// An empty non-terminal: the span's next name is under `qname`, so the name
-	// exists and holds nothing (see `nsec_shows_node`). Read before the
-	// wildcard, which never answers for its own parent.
-	if name_in_zone(covering.rr.next, qname) && !dns.name_equal_fold(covering.rr.next, qname) {
+	// exists and holds nothing. Read before the wildcard, which never answers
+	// for its own parent.
+	if nsec_shows_node(nsecs, qname) {
 		return .Proven
 	}
 	from_owner := common_ancestor(qname, covering.owner)
