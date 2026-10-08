@@ -131,6 +131,38 @@ test_peek_referral_follows_a_cname_chain :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+/*
+A CNAME on the chain whose target cannot be read - here one that does not end
+where its RDLENGTH says (issue #299) - leaves where the chain goes unknown, and
+with NS and no SOA beside it that is answered as a referral, not passed on as
+the answer it claims to be: "cannot tell" is never "serve it", as in
+`cloaked_chain_target`. Nor is there a target to hand the reply on to.
+*/
+@(test)
+test_peek_referral_does_not_pass_an_unreadable_link :: proc(t: ^testing.T) {
+	target := []u8{4, 'h', 'o', 's', 't', 3, 's', 'u', 'b', 4, 'c', 'o', 'r', 'p', 0, 0xde, 0xad}
+	msg := Message {
+		question  = []Question{{name = "www.corp.", type = .A, class = .IN}},
+		answer    = []Record{{name = "www.corp.", type = .CNAME, class = .IN, ttl = 60, data = Rdata_Raw{target}}},
+		authority = []Record{{name = "sub.corp.", type = .NS, class = .IN, ttl = 3600, data = Rdata_Name{"ns1.elsewhere."}}},
+	}
+	msg.flags.qr = true
+	wire, _, err := encode_message(msg, context.temp_allocator)
+	if !testing.expect_value(t, err, Encode_Error.None) {
+		return
+	}
+	// The premise: the link decodes, and only as raw RDATA.
+	decoded, derr := decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	_, is_raw := decoded.answer[0].data.(Rdata_Raw)
+	testing.expect(t, is_raw, "the overlong CNAME decoded as a name")
+
+	testing.expect(t, peek_referral(wire), "a referral behind an unreadable CNAME passed as an answer")
+	_, aliased := peek_alias_target(wire)
+	testing.expect(t, !aliased, "a target was read past an unreadable CNAME")
+	free_all(context.temp_allocator)
+}
+
 
 /*
 The alias branch's bounds: a chain past `MAX_ALIAS_REFERRAL_RECORDS` records in

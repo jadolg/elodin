@@ -173,10 +173,12 @@ find out - and passing over it was the last place here that answered "cannot
 tell" with "serve it". The rest of this file, and both unreadable-answer paths in
 the resolver, answer it the other way.
 
-It costs nothing that a client keeps: a CNAME reaches `Rdata_Raw` only when the
-name inside it ran outside the message, pointed forward, or came to more than
-255 octets, and the whole message decoded around it - so this is a target the
-client cannot read either, in an answer that otherwise parsed.
+It costs little that a client keeps: a CNAME reaches `Rdata_Raw` only when the
+name inside it ran outside the message, pointed forward, came to more than 255
+octets, or did not end where its RDLENGTH says (RFC 1035 section 3.2.1), and the
+whole message decoded around it - so this is a target a strict client cannot
+read either, and a reply Unbound and BIND reject, in an answer that otherwise
+parsed.
 */
 @(private)
 cloaked_chain_target :: proc(

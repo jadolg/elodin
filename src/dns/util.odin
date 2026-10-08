@@ -520,18 +520,20 @@ Where the CNAME chain in a reply's answer section ends: the name a client that
 follows it asks next. `aliased` is false where the chain goes nowhere - no CNAME
 from the question's name, a loop back to it, or a question whose CNAME is the
 data rather than a step (a CNAME, DNAME or RRSIG asked for, or ANY, which
-matches the CNAME and is not followed: RFC 1034 section 4.3.2, step 3a).
+matches the CNAME and is not followed: RFC 1034 section 4.3.2, step 3a) - and
+where a link on it is unreadable, since then nobody here knows where it goes.
 
 For `resolve_query`, which asks it of a reply `peek_referral` has already called
 a referral past an alias, and so already bounded.
 */
 peek_alias_target :: proc(msg: []u8) -> (target: string, aliased: bool) {
-	_, target, aliased = alias_chain(msg)
-	return
+	unreadable: bool
+	_, target, aliased, unreadable = alias_chain(msg)
+	return target, aliased && !unreadable
 }
 
 @(private)
-alias_chain :: proc(msg: []u8) -> (asked, target: string, aliased: bool) {
+alias_chain :: proc(msg: []u8) -> (asked, target: string, aliased, unreadable: bool) {
 	decoded, err := decode_through_answer(msg, context.temp_allocator)
 	if err != .None || len(decoded.question) != 1 {
 		return
@@ -546,18 +548,24 @@ alias_chain :: proc(msg: []u8) -> (asked, target: string, aliased: bool) {
 	for _ in decoded.answer {
 		moved := false
 		for rec in decoded.answer {
-			alias, is_name := rec.data.(Rdata_Name)
-			if rec.type == .CNAME && is_name && name_equal_fold(rec.name, target) {
-				target = alias.name
-				moved = true
-				break
+			if rec.type != .CNAME || !name_equal_fold(rec.name, target) {
+				continue
 			}
+			// A link kept raw, its target unreadable (`decode_record`): the
+			// chain goes somewhere, and nobody here can say where.
+			alias, is_name := rec.data.(Rdata_Name)
+			if !is_name {
+				return asked, target, true, true
+			}
+			target = alias.name
+			moved = true
+			break
 		}
 		if !moved {
 			break
 		}
 	}
-	return asked, target, !name_equal_fold(target, asked)
+	return asked, target, !name_equal_fold(target, asked), false
 }
 
 // The CNAME half of `peek_referral`: whether the authority's NS are for the
@@ -565,9 +573,14 @@ alias_chain :: proc(msg: []u8) -> (asked, target: string, aliased: bool) {
 // authority section starts, which `peek_referral` has already walked.
 @(private)
 referred_past_alias :: proc(msg: []u8, authority_at, nscount: int) -> bool {
-	asked, target, aliased := alias_chain(msg)
+	asked, target, aliased, unreadable := alias_chain(msg)
 	if !aliased {
 		return false
+	}
+	// Where the chain ends is unknown, so whether the NS are for it is too, and
+	// "cannot tell" is not passed on as an answer (see `cloaked_chain_target`).
+	if unreadable {
+		return true
 	}
 	pos := authority_at
 	for _ in 0 ..< nscount {
