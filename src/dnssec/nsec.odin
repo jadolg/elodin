@@ -207,6 +207,29 @@ denial_is_the_childs_own_apex :: proc(types: []u8, qname: string, qtype: dns.Typ
 }
 
 /*
+Does a bit map, read as the record at `qname`, deny `qtype` there?
+
+The same questions whether the record is the name's own or the wildcard that
+answered for it (RFC 4035 section 5.4, RFC 5155 section 8.7): the wildcard's
+record stands in for the name, so a wildcard delegation is as much a referral
+as a delegation at the name itself.
+*/
+@(private)
+types_deny :: proc(types: []u8, qname: string, qtype: dns.Type) -> bool {
+	if bitmap_has(types, qtype) || bitmap_has(types, .CNAME) {
+		return false
+	}
+	// NS but no SOA belongs to the parent side of a zone cut, so it says
+	// nothing about the type at the child.
+	if qtype != .DS && bitmap_has(types, .NS) && !bitmap_has(types, .SOA) {
+		return false
+	}
+	// And the converse: SOA set is the child's own apex, which says nothing
+	// about the DS its parent holds.
+	return !denial_is_the_childs_own_apex(types, qname, qtype)
+}
+
+/*
 Prove that `qname` exists but has no records of `qtype` (RFC 4035 section 5.4).
 
 Either an NSEC sits on the name with the type missing from its bit map, or the
@@ -219,20 +242,7 @@ nsec_proves_no_data :: proc(
 	allocator := context.temp_allocator,
 ) -> Proof {
 	if match, found := nsec_matching(nsecs, qname); found {
-		if bitmap_has(match.rr.types, qtype) || bitmap_has(match.rr.types, .CNAME) {
-			return .Failed
-		}
-		// An NSEC with NS but no SOA belongs to the parent side of a zone cut,
-		// so it says nothing about the type at the child.
-		if bitmap_has(match.rr.types, .NS) && !bitmap_has(match.rr.types, .SOA) && qtype != .DS {
-			return .Failed
-		}
-		// And the converse: SOA set is the child's own apex, which says nothing
-		// about the DS its parent holds.
-		if denial_is_the_childs_own_apex(match.rr.types, qname, qtype) {
-			return .Failed
-		}
-		return .Proven
+		return .Proven if types_deny(match.rr.types, qname, qtype) else .Failed
 	}
 
 	covering, found := nsec_covering(nsecs, qname)
@@ -247,10 +257,7 @@ nsec_proves_no_data :: proc(
 	if !wfound {
 		return .Failed
 	}
-	if bitmap_has(wildcard.rr.types, qtype) || bitmap_has(wildcard.rr.types, .CNAME) {
-		return .Failed
-	}
-	return .Proven
+	return .Proven if types_deny(wildcard.rr.types, qname, qtype) else .Failed
 }
 
 /*

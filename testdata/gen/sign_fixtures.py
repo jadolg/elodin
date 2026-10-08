@@ -241,7 +241,7 @@ def nsec3_rdata(next_hash, types, salt, iterations, flags=0):
     )
 
 
-def nsec3_chain(zone, nodes, salt, iterations):
+def nsec3_chain(zone, nodes, salt, iterations, flags=0):
     """One NSEC3 record per name, in hash order, the last wrapping to the first."""
     # Keyed by the name each record speaks for, so a scenario can pick the one
     # its message needs without depending on where in the chain it landed.
@@ -253,7 +253,7 @@ def nsec3_chain(zone, nodes, salt, iterations):
     for i, (digest, name, types) in enumerate(hashed):
         owner = base32hex(digest) + "." + zone
         next_hash = hashed[(i + 1) % len(hashed)][0]
-        out[name] = RR(owner, NSEC3, nsec3_rdata(next_hash, types, salt, iterations))
+        out[name] = RR(owner, NSEC3, nsec3_rdata(next_hash, types, salt, iterations, flags))
     return out
 
 
@@ -1252,6 +1252,59 @@ def nsec3_signed_cut_below_ceiling():
          message(child.zone, DNSKEY, child_keys + [sign(child_keys, child)]))
     answer = [a_rr(child.zone, "192.0.2.53")]
     emit("c3_answer", child.zone, "A", message(child.zone, A, answer + [sign(answer, child)]))
+
+
+@scenario
+def wildcard_nodata():
+    """Cover a wildcard NODATA under an opt-out span, and one from a wildcard delegation."""
+    # Issue #334. The wildcard's record stands in for the name, so it has to
+    # pass what a record on the name would: NS without SOA is a wildcard
+    # delegation, which answers with a referral rather than NODATA. And RFC 5155
+    # section 9.2 forbids AD over a next closer cover with opt-out set, wildcard
+    # or not. `wotest.` is the NSEC3 opt-out zone, `wntest.` the NSEC zone
+    # whose wildcard is a delegation. The walk's DS question for `foo.` gets
+    # the same denial the zone sends for any type there.
+    root = Key(".", "wnodata-root")
+    opt = Key("wotest.", "wnodata-opt-out")
+    deleg = Key("wntest.", "wnodata-delegation")
+
+    root_keys = [RR(".", DNSKEY, root.rdata)]
+    print("// anchor: %s" % root.ds_text())
+    emit("wn_root_dnskey", ".", "DNSKEY", message(".", DNSKEY, root_keys + [sign(root_keys, root)]))
+    for key in (opt, deleg):
+        ds_set = [RR(key.zone, DS, key.ds())]
+        emit("wn_ds_" + key.zone[:-1], key.zone, "DS", message(key.zone, DS, ds_set + [sign(ds_set, root)]))
+        keys = [RR(key.zone, DNSKEY, key.rdata)]
+        emit("wn_dnskey_" + key.zone[:-1], key.zone, "DNSKEY",
+             message(key.zone, DNSKEY, keys + [sign(keys, key)]))
+
+    chain = nsec3_chain(
+        "wotest.",
+        [
+            ("wotest.", [NS, SOA, RRSIG, DNSKEY, NSEC3PARAM]),
+            ("*.wotest.", [MX, RRSIG]),
+        ],
+        bytes.fromhex("0e0f"),
+        12,
+        flags=1,
+    )
+    soa = [soa_rr(opt.zone)]
+    authority = soa + [sign(soa, opt)]
+    for record in chain.values():
+        authority += [record, sign([record], opt)]
+    emit("wn_opt_out", "foo.wotest.", "A", message("foo.wotest.", A, [], authority))
+    emit("wn_opt_out_ds", "foo.wotest.", "DS", message("foo.wotest.", DS, [], authority))
+
+    soa = [soa_rr(deleg.zone)]
+    authority = soa + [sign(soa, deleg)]
+    for owner, next_name, types in (
+        ("wntest.", "*.wntest.", [NS, SOA, RRSIG, NSEC, DNSKEY]),
+        ("*.wntest.", "wntest.", [NS, RRSIG, NSEC]),
+    ):
+        nsec = [RR(owner, NSEC, nsec_rdata(next_name, types))]
+        authority += nsec + [sign(nsec, deleg)]
+    emit("wn_delegation", "foo.wntest.", "A", message("foo.wntest.", A, [], authority))
+    emit("wn_delegation_ds", "foo.wntest.", "DS", message("foo.wntest.", DS, [], authority))
 
 
 if __name__ == "__main__":

@@ -295,3 +295,18 @@ test_first_label_steps_over_escapes :: proc(t: ^testing.T) {
 	testing.expect_value(t, first_label("."), "")
 	free_all(context.temp_allocator)
 }
+
+@(test)
+test_nsec_wildcard_no_data_reads_the_wildcard_as_the_name :: proc(t: ^testing.T) {
+	// As `test_nsec3_wildcard_no_data_reads_the_wildcard_as_the_name`: a
+	// wildcard delegation answers with a referral, and an apex denies no DS.
+	zone := []Nsec_Rr {
+		nsec_rr("example.", "*.example.", {.NS, .SOA, .RRSIG, .NSEC, .DNSKEY}),
+		nsec_rr("*.example.", "z.example.", {.NS, .RRSIG, .NSEC}),
+	}
+	testing.expect_value(t, nsec_proves_no_data(zone, "foo.example.", .A), Proof.Failed)
+	testing.expect_value(t, nsec_proves_no_data(zone, "foo.example.", .DS), Proof.Proven)
+	zone[1] = nsec_rr("*.example.", "z.example.", {.NS, .SOA, .RRSIG, .NSEC})
+	testing.expect_value(t, nsec_proves_no_data(zone, "foo.example.", .DS), Proof.Failed)
+	free_all(context.temp_allocator)
+}

@@ -583,18 +583,7 @@ nsec3_proves_no_data :: proc(
 	allocator := context.temp_allocator,
 ) -> Proof {
 	if match, found := nsec3_matching(n3s, qname, budget); found {
-		if bitmap_has(match.rr.types, qtype) || bitmap_has(match.rr.types, .CNAME) {
-			return .Failed
-		}
-		if qtype != .DS && bitmap_has(match.rr.types, .NS) && !bitmap_has(match.rr.types, .SOA) {
-			return .Failed
-		}
-		// SOA set is the child's own apex, which holds no DS and never did -
-		// see `denial_is_the_childs_own_apex`.
-		if denial_is_the_childs_own_apex(match.rr.types, qname, qtype) {
-			return .Failed
-		}
-		return .Proven
+		return .Proven if types_deny(match.rr.types, qname, qtype) else .Failed
 	}
 
 	// No record on the name itself: a wildcard must be what answered, and it
@@ -646,8 +635,13 @@ nsec3_proves_no_data :: proc(
 		}
 		return .Failed
 	}
-	if bitmap_has(wildcard.rr.types, qtype) || bitmap_has(wildcard.rr.types, .CNAME) {
+	if !types_deny(wildcard.rr.types, qname, qtype) {
 		return .Failed
+	}
+	// RFC 5155 section 9.2: no AD over a next closer cover that is an opt-out
+	// span, which may hide an unsigned delegation the wildcard never reached.
+	if cover.rr.flags & NSEC3_FLAG_OPT_OUT != 0 {
+		return .Opt_Out
 	}
 	return .Proven
 }

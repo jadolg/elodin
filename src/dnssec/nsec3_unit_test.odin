@@ -903,3 +903,35 @@ test_nsec3_a_delegation_is_no_closest_encloser_for_a_name_error :: proc(t: ^test
 	// proves `Opt_Out` over this same delegation with the flag actually set.
 	free_all(context.temp_allocator)
 }
+
+@(test)
+test_nsec3_wildcard_no_data_under_an_opt_out_cover_is_not_secure :: proc(t: ^testing.T) {
+	/*
+	RFC 5155 section 9.2: no AD over a closest encloser proof whose next closer
+	cover is an opt-out span. The span may hide an unsigned delegation at the
+	next closer, and then the wildcard never answered for the name at all.
+	*/
+	zone := a_zone()
+	for &record in zone {
+		record.rr.flags |= NSEC3_FLAG_OPT_OUT
+	}
+	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.w.example.", "example.", .A, budget_at(A_ITERATIONS)), Proof.Opt_Out)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_nsec3_wildcard_no_data_reads_the_wildcard_as_the_name :: proc(t: ^testing.T) {
+	/*
+	The wildcard's record stands in for the name, so it has to pass every check
+	a record on the name does. NS without SOA is a wildcard delegation, which
+	answers with a referral rather than NODATA - except for DS, which the
+	parent side holds. SOA is a zone apex, which says nothing about a DS.
+	*/
+	zone := a_zone()
+	zone[9].rr.types = types_bitmap({.NS}) // *.w.example.
+	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.w.example.", "example.", .A, budget_at(A_ITERATIONS)), Proof.Failed)
+	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.w.example.", "example.", .DS, budget_at(A_ITERATIONS)), Proof.Proven)
+	zone[9].rr.types = types_bitmap({.NS, .SOA})
+	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.w.example.", "example.", .DS, budget_at(A_ITERATIONS)), Proof.Failed)
+	free_all(context.temp_allocator)
+}
