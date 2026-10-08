@@ -527,11 +527,16 @@ For `resolve_query`, which asks it of a reply `peek_referral` has already called
 a referral past an alias, and so already bounded.
 */
 peek_alias_target :: proc(msg: []u8) -> (target: string, aliased: bool) {
-	unreadable: bool
-	_, target, aliased, unreadable = alias_chain(msg)
-	return target, aliased && !unreadable
+	_, target, aliased, _ = alias_chain(msg)
+	return
 }
 
+/*
+`unreadable` where a link on the chain was kept raw (`decode_record`): the chain
+goes somewhere and nobody here can say where, so `aliased` is false beside it.
+Every CNAME at an owner is looked at, not just the first, so where a second one
+sits in the section does not decide whether the chain can be read.
+*/
 @(private)
 alias_chain :: proc(msg: []u8) -> (asked, target: string, aliased, unreadable: bool) {
 	decoded, err := decode_through_answer(msg, context.temp_allocator)
@@ -546,24 +551,23 @@ alias_chain :: proc(msg: []u8) -> (asked, target: string, aliased, unreadable: b
 	target = asked
 	// One step per answer record at most, so a loop in the chain ends.
 	for _ in decoded.answer {
-		moved := false
+		next := ""
 		for rec in decoded.answer {
 			if rec.type != .CNAME || !name_equal_fold(rec.name, target) {
 				continue
 			}
-			// A link kept raw, its target unreadable (`decode_record`): the
-			// chain goes somewhere, and nobody here can say where.
 			alias, is_name := rec.data.(Rdata_Name)
 			if !is_name {
-				return asked, target, true, true
+				return asked, target, false, true
 			}
-			target = alias.name
-			moved = true
+			if next == "" {
+				next = alias.name
+			}
+		}
+		if next == "" {
 			break
 		}
-		if !moved {
-			break
-		}
+		target = next
 	}
 	return asked, target, !name_equal_fold(target, asked), false
 }
@@ -574,13 +578,13 @@ alias_chain :: proc(msg: []u8) -> (asked, target: string, aliased, unreadable: b
 @(private)
 referred_past_alias :: proc(msg: []u8, authority_at, nscount: int) -> bool {
 	asked, target, aliased, unreadable := alias_chain(msg)
-	if !aliased {
-		return false
-	}
 	// Where the chain ends is unknown, so whether the NS are for it is too, and
 	// "cannot tell" is not passed on as an answer (see `cloaked_chain_target`).
 	if unreadable {
 		return true
+	}
+	if !aliased {
+		return false
 	}
 	pos := authority_at
 	for _ in 0 ..< nscount {

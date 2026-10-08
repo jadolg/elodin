@@ -153,13 +153,30 @@ test_peek_referral_does_not_pass_an_unreadable_link :: proc(t: ^testing.T) {
 	}
 	// The premise: the link decodes, and only as raw RDATA.
 	decoded, derr := decode_message(wire, context.temp_allocator)
-	testing.expect_value(t, derr, Decode_Error.None)
+	if !testing.expect_value(t, derr, Decode_Error.None) || !testing.expect_value(t, len(decoded.answer), 1) {
+		return
+	}
 	_, is_raw := decoded.answer[0].data.(Rdata_Raw)
 	testing.expect(t, is_raw, "the overlong CNAME decoded as a name")
 
 	testing.expect(t, peek_referral(wire), "a referral behind an unreadable CNAME passed as an answer")
 	_, aliased := peek_alias_target(wire)
 	testing.expect(t, !aliased, "a target was read past an unreadable CNAME")
+
+	// A readable CNAME at the same owner, listed first and into the asked
+	// name's own zone, does not make the unreadable one beside it readable.
+	decoy := msg
+	decoy.answer = []Record {
+		{name = "www.corp.", type = .CNAME, class = .IN, ttl = 60, data = Rdata_Name{"web.corp."}},
+		msg.answer[0],
+	}
+	decoy.authority = []Record{{name = "corp.", type = .NS, class = .IN, ttl = 3600, data = Rdata_Name{"ns1.corp."}}}
+	dwire, _, eerr := encode_message(decoy, context.temp_allocator)
+	if testing.expect_value(t, eerr, Encode_Error.None) {
+		testing.expect(t, peek_referral(dwire), "an unreadable CNAME behind a readable one passed as an answer")
+		_, decoy_aliased := peek_alias_target(dwire)
+		testing.expect(t, !decoy_aliased, "a target was read beside an unreadable CNAME")
+	}
 	free_all(context.temp_allocator)
 }
 
