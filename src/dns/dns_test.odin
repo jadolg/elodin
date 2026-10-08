@@ -1,5 +1,6 @@
 package dns
 
+import "core:bytes"
 import "core:fmt"
 import "core:mem"
 import "core:testing"
@@ -1137,5 +1138,102 @@ test_encode_refuses_raw_rdata_holding_a_pointer :: proc(t: ^testing.T) {
 	}
 	_, _, opaque_err := encode_message(opaque, context.temp_allocator)
 	testing.expect_value(t, opaque_err, Encode_Error.None)
+	free_all(context.temp_allocator)
+}
+
+/*
+A single-name RDATA is bounded by its RDLENGTH, RFC 1035 section 3.2.1: a name
+that runs past the record is not taken from the next record's owner, and bytes
+after the name are not dropped. Either way the record is kept as it arrived
+rather than modelled (issue #299).
+*/
+@(test)
+test_a_single_name_rdata_is_bounded_by_its_rdlength :: proc(t: ^testing.T) {
+	for type in ([]Type{.NS, .CNAME, .PTR, .DNAME, .MB, .MG, .MR, .NSAP_PTR}) {
+		// example.com. <type> with RDLENGTH 0, then stolen.example. A 192.0.2.1.
+		short := []u8{
+			0x12, 0x34, 0x80, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+			7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0, 0x00, 0x01, 0x00, 0x01,
+			0xc0, 0x0c, u8(u16(type) >> 8), u8(type), 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x00,
+			6, 's', 't', 'o', 'l', 'e', 'n', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0,
+			0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 192, 0, 2, 1,
+		}
+		msg, derr := decode_message(short, context.temp_allocator)
+		if !testing.expectf(t, derr == .None && len(msg.answer) == 2, "%v: %v", type, derr) {
+			continue
+		}
+		if name, is_name := msg.answer[0].data.(Rdata_Name); is_name {
+			testing.expectf(t, false, "%v with RDLENGTH 0 decoded with target %q", type, name.name)
+		}
+		testing.expect_value(t, msg.answer[1].name, "stolen.example.")
+		wire, _, eerr := encode_message(msg, context.temp_allocator)
+		if testing.expectf(t, eerr == .None, "%v: re-encode: %v", type, eerr) {
+			again, aerr := decode_message(wire, context.temp_allocator)
+			if testing.expectf(t, aerr == .None && len(again.answer) == 2, "%v: re-decode: %v", type, aerr) {
+				raw, is_raw := again.answer[0].data.(Rdata_Raw)
+				testing.expectf(t, is_raw && len(raw.data) == 0, "%v: re-encoded as %v", type, again.answer[0].data)
+			}
+		}
+
+		// example.com. <type> a.example.com. and four bytes after it, RDLENGTH 8.
+		trailing := []u8{
+			0x12, 0x34, 0x80, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+			7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0, 0x00, 0x01, 0x00, 0x01,
+			0xc0, 0x0c, u8(u16(type) >> 8), u8(type), 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x08,
+			1, 'a', 0xc0, 0x0c, 0xde, 0xad, 0xbe, 0xef,
+		}
+		tmsg, terr := decode_message(trailing, context.temp_allocator)
+		if !testing.expectf(t, terr == .None && len(tmsg.answer) == 1, "%v: %v", type, terr) {
+			continue
+		}
+		if name, is_name := tmsg.answer[0].data.(Rdata_Name); is_name {
+			testing.expectf(t, false, "%v with trailing bytes decoded as %q, dropping them", type, name.name)
+		}
+		twire, _, teerr := encode_message(tmsg, context.temp_allocator)
+		if testing.expectf(t, teerr == .None, "%v: re-encode: %v", type, teerr) {
+			testing.expectf(t, bytes.has_suffix(twire, []u8{0xde, 0xad, 0xbe, 0xef}), "%v: the trailing bytes were lost: % x", type, twire)
+		}
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+A record whose RDATA ends part way through a compression pointer is kept raw,
+the decoder's standing posture for RDATA that does not add up (see
+`test_raw_rdata_that_cannot_be_walked_is_kept`), and the writer refuses it, the
+honest degradation `test_encode_refuses_a_modelled_type_holding_a_pointer`
+gives. What it must not do is finish the pointer with the next record's first
+byte. The name types reach this through #299's bound; MX always did.
+*/
+@(test)
+test_rdata_cut_off_inside_a_pointer_is_kept_and_not_written :: proc(t: ^testing.T) {
+	cases := []struct {
+		type:  Type,
+		rdata: []u8,
+	}{
+		{.CNAME, {1, 'a', 0xc0}},
+		{.NS, {1, 'a', 0xc0}},
+		{.MX, {0x00, 0x0a, 1, 'a', 0xc0}},
+	}
+	for c in cases {
+		m := make([dynamic]u8, context.temp_allocator)
+		append(&m, 0x12, 0x34, 0x80, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00)
+		append(&m, 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0, 0x00, 0x01, 0x00, 0x01)
+		append_answer(&m, c.type, c.rdata)
+		// The pointer's second byte is the next record's first: the length of
+		// its owner's twelve-byte label, so a pointer to offset 12, the question.
+		append(&m, 12, 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 0)
+		append(&m, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 192, 0, 2, 1)
+
+		msg, derr := decode_message(m[:], context.temp_allocator)
+		if !testing.expectf(t, derr == .None && len(msg.answer) == 2, "%v: %v", c.type, derr) {
+			continue
+		}
+		raw, is_raw := msg.answer[0].data.(Rdata_Raw)
+		testing.expectf(t, is_raw && mem.compare(raw.data, c.rdata) == 0, "%v cut off inside a pointer decoded as %v", c.type, msg.answer[0].data)
+		testing.expect_value(t, msg.answer[1].name, "abcdefghijkl.")
+		_, _, eerr := encode_message(msg, context.temp_allocator)
+		testing.expectf(t, eerr == .Bad_Rdata, "%v kept raw with its pointer: encoded with %v", c.type, eerr)
+	}
 	free_all(context.temp_allocator)
 }

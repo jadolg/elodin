@@ -120,11 +120,12 @@ single upstream, the client gets the rcode that arrived. The member passed over
 is counted in `elodin_upstream_swept_rcode_total{upstream}`.
 
 **A referral** — a server that does not recurse for the name answering with a
-zone's NS and no SOA, alone or after a CNAME into that zone — is swept the same
-way. If no member does better the client gets SERVFAIL (`outcome=failed
-detail=referral`), not an empty NOERROR it would read as "no such record". A
-referral past a CNAME whose target is routed to another group is still swept,
-then handed on as it stands, since the client's next question goes there.
+zone's NS and no SOA, alone, after a CNAME into that zone, or after a CNAME whose
+target cannot be read — is swept the same way. If no member does better the
+client gets SERVFAIL (`outcome=failed detail=referral`), not an empty NOERROR it
+would read as "no such record". A referral past a CNAME whose target is routed
+to another group is still swept, then handed on as it stands, since the client's
+next question goes there.
 
 Not swept, because they are statements about the name:
 

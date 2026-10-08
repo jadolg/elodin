@@ -485,7 +485,13 @@ decode_rdata :: proc(
 		return v, .None
 
 	case .NS, .CNAME, .PTR, .DNAME, .MB, .MG, .MR, .NSAP_PTR:
+		// RDLENGTH bounds the RDATA (RFC 1035 section 3.2.1): `r_name` reads to
+		// the message's end, so a name that ran on into the next record, or
+		// stopped short of the record's end, is refused here.
 		name := r_name(r, allocator) or_return
+		if r.pos != end {
+			return nil, .Bad_Rdata
+		}
 		return Rdata_Name{name = name}, .None
 
 	case .SOA:

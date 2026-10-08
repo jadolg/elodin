@@ -401,8 +401,11 @@ is where the NS sit: at or above the chain's target and not above the name
 asked. An authority that includes its own apex NS beside a CNAME out of its
 zone - BIND does, for `mail.corp. CNAME ghs.googlehosted.com.` - has answered
 all it holds, and a stub that follows CNAMEs resolves that today; it is left
-alone. Only CNAME, DNAME and their RRSIGs may stand in the answer: anything
-else there is data, and the reply is an answer.
+alone. A CNAME on the chain whose target cannot be read (`Rdata_Raw`, issue
+#299) leaves where the NS sit unknown, so it is a referral wherever they sit:
+"cannot tell" is not passed on as an answer. Only CNAME, DNAME and their RRSIGs
+may stand in the answer: anything else there is data, and the reply is an
+answer.
 
 The RA bit is not read. A server that clears it on answers it does give exists,
 and one that sets it over a referral has still not answered; what the reply
@@ -520,18 +523,25 @@ Where the CNAME chain in a reply's answer section ends: the name a client that
 follows it asks next. `aliased` is false where the chain goes nowhere - no CNAME
 from the question's name, a loop back to it, or a question whose CNAME is the
 data rather than a step (a CNAME, DNAME or RRSIG asked for, or ANY, which
-matches the CNAME and is not followed: RFC 1034 section 4.3.2, step 3a).
+matches the CNAME and is not followed: RFC 1034 section 4.3.2, step 3a) - and
+where a link on it is unreadable, since then nobody here knows where it goes.
 
 For `resolve_query`, which asks it of a reply `peek_referral` has already called
 a referral past an alias, and so already bounded.
 */
 peek_alias_target :: proc(msg: []u8) -> (target: string, aliased: bool) {
-	_, target, aliased = alias_chain(msg)
+	_, target, aliased, _ = alias_chain(msg)
 	return
 }
 
+/*
+`unreadable` where a link on the chain was kept raw (`decode_record`): the chain
+goes somewhere and nobody here can say where, so `aliased` is false beside it.
+Every CNAME at an owner is looked at, not just the first, so where a second one
+sits in the section does not decide whether the chain can be read.
+*/
 @(private)
-alias_chain :: proc(msg: []u8) -> (asked, target: string, aliased: bool) {
+alias_chain :: proc(msg: []u8) -> (asked, target: string, aliased, unreadable: bool) {
 	decoded, err := decode_through_answer(msg, context.temp_allocator)
 	if err != .None || len(decoded.question) != 1 {
 		return
@@ -544,20 +554,25 @@ alias_chain :: proc(msg: []u8) -> (asked, target: string, aliased: bool) {
 	target = asked
 	// One step per answer record at most, so a loop in the chain ends.
 	for _ in decoded.answer {
-		moved := false
+		next := ""
 		for rec in decoded.answer {
+			if rec.type != .CNAME || !name_equal_fold(rec.name, target) {
+				continue
+			}
 			alias, is_name := rec.data.(Rdata_Name)
-			if rec.type == .CNAME && is_name && name_equal_fold(rec.name, target) {
-				target = alias.name
-				moved = true
-				break
+			if !is_name {
+				return asked, target, false, true
+			}
+			if next == "" {
+				next = alias.name
 			}
 		}
-		if !moved {
+		if next == "" {
 			break
 		}
+		target = next
 	}
-	return asked, target, !name_equal_fold(target, asked)
+	return asked, target, !name_equal_fold(target, asked), false
 }
 
 // The CNAME half of `peek_referral`: whether the authority's NS are for the
@@ -565,7 +580,12 @@ alias_chain :: proc(msg: []u8) -> (asked, target: string, aliased: bool) {
 // authority section starts, which `peek_referral` has already walked.
 @(private)
 referred_past_alias :: proc(msg: []u8, authority_at, nscount: int) -> bool {
-	asked, target, aliased := alias_chain(msg)
+	asked, target, aliased, unreadable := alias_chain(msg)
+	// Where the chain ends is unknown, so whether the NS are for it is too, and
+	// "cannot tell" is not passed on as an answer (see `cloaked_chain_target`).
+	if unreadable {
+		return true
+	}
 	if !aliased {
 		return false
 	}
