@@ -1,5 +1,5 @@
 [tools]
-odin = "dev-2026-07"
+odin = "dev-2026-10"
 # Odin shells out to `clang` as its linker driver. Pinning it here keeps the
 # toolchain reproducible and avoids depending on whether the distribution
 # happens to ship an unversioned `clang` on PATH (Fedora, for one, does not).
