@@ -3,13 +3,27 @@ package netx
 import "core:testing"
 
 /*
-A `]:` that does not close a `[literal]`: `core:net` reads `]:53` as the host `]`
-on port 53. A blocklist line or a redirect's Location can carry one.
+A bracket that does not close a `[literal]`: `core:net` reads `]:53` as the host
+`]` on port 53, and `[dns.example:80` as `[dns.example` on port 80. A blocklist
+line or a redirect's Location can carry one.
 */
 @(test)
 test_a_stray_bracket_is_refused :: proc(t: ^testing.T) {
-	// The last three split, by `core:net`'s rule, into the host `]:`.
-	for s in ([]string{"]:", "]:53", "]:1.2.3.4", "]:\tads.example", "a]:]:80", "x]:]:80", "[]:]:80"}) {
+	// `a]:]:80` to `[]:]:80` split, by `core:net`'s rule, into the host `]:`.
+	for s in ([]string {
+			"]:",
+			"]:53",
+			"]:1.2.3.4",
+			"]:\tads.example",
+			"a]:]:80",
+			"x]:]:80",
+			"[]:]:80",
+			"[dns.example:80",
+			"[1.1.1.1:53",
+			"dns]example:53",
+			"a[b",
+			"::1]",
+		}) {
 		testing.expect(t, parse_address(s) == nil, s)
 		_, ok4 := parse_ip4_address(s)
 		testing.expect(t, !ok4, s)

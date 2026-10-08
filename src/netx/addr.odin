@@ -9,7 +9,8 @@ import "core:strings"
 `core:net` reads a port with `strconv.parse_int`, so a sign, `_` separators and
 digits that wrap past 2^64 all pass; it drops a port from an address it parses,
 so `1.2.3.4:5353` is 1.2.3.4; and it takes a name or an IPv4 address in brackets,
-`[1.1.1.1]:53`, and a host with a stray bracket, `]:53` as `]` on port 53.
+`[1.1.1.1]:53`, and a host with a stray bracket, `]:53` as `]` on port 53 and
+`[dns.example:80` as `[dns.example` on port 80.
 
 Each parser here runs its input through this package's `split_port` first, which
 refuses all of those, so whatever `core:net` then reads is an address, or an
@@ -36,7 +37,9 @@ split_port :: proc(s: string) -> (addr_or_host: string, port: int, ok: bool) {
 		return s, 0, false
 	}
 	addr_or_host, port, ok = net.split_port(s)
-	if strings.contains(s, "]:") && !is_ip6_literal(addr_or_host) {
+	// Any other bracket is stray: `core:net` hands `[dns.example:80` back as the
+	// host `[dns.example`, and `dns]example:53` as `dns]example`.
+	if strings.contains_any(s, "[]") && !(strings.has_prefix(s, "[") && is_ip6_literal(addr_or_host)) {
 		return s, 0, false
 	}
 	if ok && addr_or_host != s {

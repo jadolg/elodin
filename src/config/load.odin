@@ -1285,7 +1285,7 @@ load_upstream_spec :: proc(
 	opt_int(l, n, "port", &spec.port, path)
 	// 0 is the scheme's default, filled in below.
 	if spec.port < 0 || spec.port > 65535 {
-		errorf(l, "%s.port: must be between 1 and 65535", path)
+		errorf(l, "%s.port: must be between 1 and 65535, or 0 for the default", path)
 		return {}, false
 	}
 	opt_bool(l, n, "verify", &spec.verify, path)
@@ -3057,19 +3057,21 @@ config's making in each one, and a space or a byte outside ASCII a request line
 the upstream reads some other way (#438).
 */
 @(private)
-UPSTREAM_URL_RULE :: "the url and hostname of an https upstream must be visible ASCII, the host with no userinfo, path, query or fragment"
+UPSTREAM_URL_RULE :: "the url and hostname of an https upstream must be visible ASCII, the host with no userinfo, path, query or fragment and any port 0 to 65535 in digits"
 
 // `h2.authority_is_valid`, which an upstream's address and hostname are held to.
 @(private)
 HOST_RULE :: "must be visible ASCII with no userinfo, path, query or fragment"
 
-// A url is a target, and its host is the `Host` and `:authority` it is sent with.
+// A url is a target, and its host is the `Host` and `:authority` it is sent with,
+// and what the fetcher splits with `netx.split_port` before every download.
 @(private)
 url_is_valid :: proc(url: string) -> bool {
 	_, host, _, _, _ := net.split_url(url, context.temp_allocator)
-	return h2.target_is_valid(url) && h2.authority_is_valid(host)
+	host_only, _, split_ok := netx.split_port(host)
+	return h2.target_is_valid(url) && h2.authority_is_valid(host) && split_ok && is_host(host_only)
 }
 
 // A list url goes into a request line and `Host` the same way.
 @(private)
-LIST_URL_RULE :: "a list url must be visible ASCII, its host with no userinfo"
+LIST_URL_RULE :: "a list url must be visible ASCII, its host with no userinfo and any port 0 to 65535 in digits"

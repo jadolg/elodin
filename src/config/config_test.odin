@@ -1322,7 +1322,17 @@ test_upstream_urls_outside_visible_ascii_are_errors :: proc(t: ^testing.T) {
 	for form in LIST_FORMS {
 		_, good := load_string(fmt.tprintf(form, "\"https://lists.example/hosts.txt\""), context.temp_allocator)
 		testing.expectf(t, good == nil, "%q: an ordinary list url was refused: %v", form, good)
-		for url in ([]string{"\"https://lists.example/hosts.txt\\r\\nX-Injected: 1\"", "\"https://lists.example/a b\"", "\"https://a.example@lists.example/hosts.txt\""}) {
+		_, good6 := load_string(fmt.tprintf(form, "\"https://[2001:db8::1]:8443/hosts.txt\""), context.temp_allocator)
+		testing.expectf(t, good6 == nil, "%q: a bracketed literal list url was refused: %v", form, good6)
+		for url in ([]string {
+				"\"https://lists.example/hosts.txt\\r\\nX-Injected: 1\"",
+				"\"https://lists.example/a b\"",
+				"\"https://a.example@lists.example/hosts.txt\"",
+				// A host the fetcher cannot split fails every refresh, so not at load.
+				"\"https://lists.example:5_3/hosts.txt\"",
+				"\"https://[1.1.1.1]/hosts.txt\"",
+				"\"https://[lists.example:443/hosts.txt\"",
+			}) {
 			refused_for(t, fmt.tprintf(form, url), LIST_URL_RULE)
 		}
 	}
