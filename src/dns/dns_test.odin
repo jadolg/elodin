@@ -1219,8 +1219,7 @@ test_rdata_cut_off_inside_a_pointer_is_kept_and_not_written :: proc(t: ^testing.
 		m := make([dynamic]u8, context.temp_allocator)
 		append(&m, 0x12, 0x34, 0x80, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00)
 		append(&m, 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0, 0x00, 0x01, 0x00, 0x01)
-		append(&m, 0xc0, 0x0c, u8(u16(c.type) >> 8), u8(c.type), 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, u8(len(c.rdata)))
-		append(&m, ..c.rdata)
+		append_answer(&m, c.type, c.rdata)
 		// The pointer's second byte is the next record's first: the length of
 		// its owner's twelve-byte label, so a pointer to offset 12, the question.
 		append(&m, 12, 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 0)

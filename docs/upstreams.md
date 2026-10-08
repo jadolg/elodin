@@ -123,9 +123,9 @@ is counted in `elodin_upstream_swept_rcode_total{upstream}`.
 zone's NS and no SOA, alone, after a CNAME into that zone, or after a CNAME whose
 target cannot be read — is swept the same way. If no member does better the
 client gets SERVFAIL (`outcome=failed detail=referral`), not an empty NOERROR it
-would read as "no such record". A
-referral past a CNAME whose target is routed to another group is still swept,
-then handed on as it stands, since the client's next question goes there.
+would read as "no such record". A referral past a CNAME whose target is routed
+to another group is still swept, then handed on as it stands, since the client's
+next question goes there.
 
 Not swept, because they are statements about the name:
 

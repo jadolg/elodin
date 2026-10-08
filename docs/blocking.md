@@ -168,7 +168,7 @@ These name a withheld or failed answer that no list explains:
 | detail | rcode | what happened |
 | --- | --- | --- |
 | `cname-deep` | the `blocking.response` | the chain ran past the sixteenth name, so where it ends was never checked |
-| `cname-unreadable` | SERVFAIL | a CNAME's target could not be parsed, or did not end where its RDLENGTH says |
+| `cname-unreadable` | SERVFAIL | a CNAME's target could not be parsed, or did not end where its RDLENGTH says; beside NS and no SOA it is a [referral](upstreams.md#rcodes-and-the-rest-of-the-group) instead, `detail=referral` |
 | `answer-unreadable` | SERVFAIL | the upstream's reply could not be parsed at all |
 | `cache-unreadable` | SERVFAIL | a stored answer could not be parsed on the way back out |
 

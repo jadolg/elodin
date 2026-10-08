@@ -401,8 +401,11 @@ is where the NS sit: at or above the chain's target and not above the name
 asked. An authority that includes its own apex NS beside a CNAME out of its
 zone - BIND does, for `mail.corp. CNAME ghs.googlehosted.com.` - has answered
 all it holds, and a stub that follows CNAMEs resolves that today; it is left
-alone. Only CNAME, DNAME and their RRSIGs may stand in the answer: anything
-else there is data, and the reply is an answer.
+alone. A CNAME on the chain whose target cannot be read (`Rdata_Raw`, issue
+#299) leaves where the NS sit unknown, so it is a referral wherever they sit:
+"cannot tell" is not passed on as an answer. Only CNAME, DNAME and their RRSIGs
+may stand in the answer: anything else there is data, and the reply is an
+answer.
 
 The RA bit is not read. A server that clears it on answers it does give exists,
 and one that sets it over a referral has still not answered; what the reply
