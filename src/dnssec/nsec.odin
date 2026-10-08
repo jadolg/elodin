@@ -119,13 +119,31 @@ belongs with the proof rather than with the walk.
 
 Names beside the cut rather than under it are still the parent's to deny, which
 is why this asks where the name sits rather than refusing the record outright.
+
+The same section says it of DNAME: everything under the owner is redirected, so
+the record cannot deny any subdomain of it.
 */
 @(private)
 nsec_speaks_for :: proc(n: Nsec_Rr, name: string) -> bool {
-	if !bitmap_has(n.rr.types, .NS) || bitmap_has(n.rr.types, .SOA) {
+	if !name_in_zone(name, n.owner) || dns.name_equal_fold(name, n.owner) {
 		return true
 	}
-	return !name_in_zone(name, n.owner) || dns.name_equal_fold(name, n.owner)
+	return types_enclose(n.rr.types)
+}
+
+/*
+May a record with these types deny names below its owner? RFC 6840 section 4.1:
+not when it is the parent's own at a cut (NS set, SOA clear), nor when it holds
+a DNAME, which redirects everything below its owner. `nsec_speaks_for` asks it
+of an NSEC span, and the NSEC3 denials of the closest encloser's record.
+Unbound refuses both in `nsec3_prove_closest_encloser`.
+*/
+@(private)
+types_enclose :: proc(types: []u8) -> bool {
+	if bitmap_has(types, .DNAME) {
+		return false
+	}
+	return !bitmap_has(types, .NS) || bitmap_has(types, .SOA)
 }
 
 @(private)
@@ -207,6 +225,29 @@ denial_is_the_childs_own_apex :: proc(types: []u8, qname: string, qtype: dns.Typ
 }
 
 /*
+Does a bit map, read as the record at `qname`, deny `qtype` there?
+
+The same questions whether the record is the name's own or the wildcard that
+answered for it (RFC 4035 section 5.4, RFC 5155 section 8.7): the wildcard's
+record stands in for the name, so a wildcard delegation is as much a referral
+as a delegation at the name itself.
+*/
+@(private)
+types_deny :: proc(types: []u8, qname: string, qtype: dns.Type) -> bool {
+	if bitmap_has(types, qtype) || bitmap_has(types, .CNAME) {
+		return false
+	}
+	// NS but no SOA belongs to the parent side of a zone cut, so it says
+	// nothing about the type at the child.
+	if qtype != .DS && bitmap_has(types, .NS) && !bitmap_has(types, .SOA) {
+		return false
+	}
+	// And the converse: SOA set is the child's own apex, which says nothing
+	// about the DS its parent holds.
+	return !denial_is_the_childs_own_apex(types, qname, qtype)
+}
+
+/*
 Prove that `qname` exists but has no records of `qtype` (RFC 4035 section 5.4).
 
 Either an NSEC sits on the name with the type missing from its bit map, or the
@@ -219,25 +260,18 @@ nsec_proves_no_data :: proc(
 	allocator := context.temp_allocator,
 ) -> Proof {
 	if match, found := nsec_matching(nsecs, qname); found {
-		if bitmap_has(match.rr.types, qtype) || bitmap_has(match.rr.types, .CNAME) {
-			return .Failed
-		}
-		// An NSEC with NS but no SOA belongs to the parent side of a zone cut,
-		// so it says nothing about the type at the child.
-		if bitmap_has(match.rr.types, .NS) && !bitmap_has(match.rr.types, .SOA) && qtype != .DS {
-			return .Failed
-		}
-		// And the converse: SOA set is the child's own apex, which says nothing
-		// about the DS its parent holds.
-		if denial_is_the_childs_own_apex(match.rr.types, qname, qtype) {
-			return .Failed
-		}
-		return .Proven
+		return .Proven if types_deny(match.rr.types, qname, qtype) else .Failed
 	}
 
 	covering, found := nsec_covering(nsecs, qname)
-	if !found {
+	if !found || !nsec_speaks_for(covering, qname) {
 		return .Failed
+	}
+	// An empty non-terminal: the span's next name is under `qname`, so the name
+	// exists and holds nothing. Read before the wildcard, which never answers
+	// for its own parent.
+	if nsec_shows_node(nsecs, qname) {
+		return .Proven
 	}
 	from_owner := common_ancestor(qname, covering.owner)
 	from_next := common_ancestor(qname, covering.rr.next)
@@ -247,10 +281,7 @@ nsec_proves_no_data :: proc(
 	if !wfound {
 		return .Failed
 	}
-	if bitmap_has(wildcard.rr.types, qtype) || bitmap_has(wildcard.rr.types, .CNAME) {
-		return .Failed
-	}
-	return .Proven
+	return .Proven if types_deny(wildcard.rr.types, qname, qtype) else .Failed
 }
 
 /*

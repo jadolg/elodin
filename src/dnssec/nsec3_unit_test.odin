@@ -153,8 +153,8 @@ a_zone :: proc() -> []Nsec3_Rr {
 	append(&zone, n3(H_A, H_XW, {.NS, .DS, .RRSIG}))
 	append(&zone, n3(H_XW, H_AI, {.MX, .RRSIG}))
 	append(&zone, n3(H_AI, H_YW, {.A, .HINFO, .AAAA, .RRSIG}))
-	append(&zone, n3(H_YW, H_W, {.NS}))
-	append(&zone, n3(H_W, H_NS2, {.NS}))
+	append(&zone, n3(H_YW, H_W, {.NS})) // an empty non-terminal in the RFC; a delegation here
+	append(&zone, n3(H_W, H_NS2, {})) // an empty non-terminal
 	append(&zone, n3(H_NS2, H_STAR_W, {.A, .RRSIG}))
 	append(&zone, n3(H_STAR_W, H_XX, {.MX, .RRSIG}))
 	append(&zone, n3(H_XX, H_EXAMPLE, {.A, .HINFO, .AAAA, .RRSIG}))
@@ -847,12 +847,12 @@ test_a_chain_above_the_ceiling_does_not_suppress_an_opt_out :: proc(t: ^testing.
 	for &record in zone {
 		record.rr.flags |= NSEC3_FLAG_OPT_OUT
 	}
-	// `a.example.` is in the zone and `*.a.example.` is not, so a name under it
-	// has a closest encloser, a covered next closer and no wildcard.
+	// `ai.example.` is in the zone and `*.ai.example.` is not, so a name under
+	// it has a closest encloser, a covered next closer and no wildcard.
 	whole := Nsec3_Budget {
 		max_iterations = A_ITERATIONS,
 	}
-	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.a.example.", "example.", .A, &whole), Proof.Opt_Out)
+	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.ai.example.", "example.", .A, &whole), Proof.Opt_Out)
 
 	// The same records with a chain on its way out beside them, every one of it
 	// past the ceiling.
@@ -867,7 +867,7 @@ test_a_chain_above_the_ceiling_does_not_suppress_an_opt_out :: proc(t: ^testing.
 	budget := Nsec3_Budget {
 		max_iterations = A_ITERATIONS,
 	}
-	testing.expect_value(t, nsec3_proves_no_data(mixed[:], "foo.a.example.", "example.", .A, &budget), Proof.Opt_Out)
+	testing.expect_value(t, nsec3_proves_no_data(mixed[:], "foo.ai.example.", "example.", .A, &budget), Proof.Opt_Out)
 	testing.expect(t, budget.over_ceiling > 0, "the chain on its way out should have been refused, or this proves nothing")
 	testing.expect_value(t, budget.spent, 0)
 	free_all(context.temp_allocator)
@@ -901,5 +901,64 @@ test_nsec3_a_delegation_is_no_closest_encloser_for_a_name_error :: proc(t: ^test
 	// The mechanism it must not disturb is held by
 	// `test_a_chain_above_the_ceiling_does_not_suppress_an_opt_out`, which
 	// proves `Opt_Out` over this same delegation with the flag actually set.
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_nsec3_wildcard_no_data_under_an_opt_out_cover_is_not_secure :: proc(t: ^testing.T) {
+	/*
+	RFC 5155 section 9.2: no AD over a closest encloser proof whose next closer
+	cover is an opt-out span. The span may hide an unsigned delegation at the
+	next closer, and then the wildcard never answered for the name at all.
+
+	Only the next closer's cover carries the flag, so a check that reads it off
+	the wildcard's record, or any other, does not pass.
+	*/
+	zone := a_zone()
+	cover, covered := nsec3_covering(zone, "foo.w.example.", budget_at(A_ITERATIONS))
+	testing.expect(t, covered, "foo.w.example. should be covered")
+	testing.expect(t, raw_data(cover.hash) != raw_data(zone[9].hash), "the cover must not be the wildcard's own record")
+	for &record in zone {
+		if raw_data(record.hash) == raw_data(cover.hash) {
+			record.rr.flags |= NSEC3_FLAG_OPT_OUT
+		}
+	}
+	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.w.example.", "example.", .A, budget_at(A_ITERATIONS)), Proof.Opt_Out)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_nsec3_wildcard_no_data_reads_the_wildcard_as_the_name :: proc(t: ^testing.T) {
+	/*
+	The wildcard's record stands in for the name, so it has to pass every check
+	a record on the name does. NS without SOA is a wildcard delegation, which
+	answers with a referral rather than NODATA - except for DS, which the
+	parent side holds. SOA is a zone apex, which says nothing about a DS.
+	*/
+	zone := a_zone()
+	zone[9].rr.types = types_bitmap({.NS}) // *.w.example.
+	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.w.example.", "example.", .A, budget_at(A_ITERATIONS)), Proof.Failed)
+	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.w.example.", "example.", .DS, budget_at(A_ITERATIONS)), Proof.Proven)
+	zone[9].rr.types = types_bitmap({.NS, .SOA})
+	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.w.example.", "example.", .DS, budget_at(A_ITERATIONS)), Proof.Failed)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_nsec3_a_delegation_or_dname_encloses_nothing :: proc(t: ^testing.T) {
+	/*
+	RFC 6840 section 4.1: a closest encloser with NS and no SOA is the parent's
+	record at a cut, and one with DNAME redirects everything under it. Neither
+	may deny a name below it, through a wildcard or otherwise.
+	*/
+	zone := a_zone()
+	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.w.example.", "example.", .A, budget_at(A_ITERATIONS)), Proof.Proven)
+	testing.expect_value(t, nsec3_proves_name_error(zone, "nx.ai.example.", "example.", budget_at(A_ITERATIONS)), Proof.Proven)
+	zone[7].rr.types = types_bitmap({.NS}) // w.example.
+	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.w.example.", "example.", .A, budget_at(A_ITERATIONS)), Proof.Failed)
+	zone[7].rr.types = types_bitmap({.DNAME})
+	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.w.example.", "example.", .A, budget_at(A_ITERATIONS)), Proof.Failed)
+	zone[5].rr.types = types_bitmap({.A, .DNAME}) // ai.example.
+	testing.expect_value(t, nsec3_proves_name_error(zone, "nx.ai.example.", "example.", budget_at(A_ITERATIONS)), Proof.Failed)
 	free_all(context.temp_allocator)
 }

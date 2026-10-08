@@ -295,3 +295,71 @@ test_first_label_steps_over_escapes :: proc(t: ^testing.T) {
 	testing.expect_value(t, first_label("."), "")
 	free_all(context.temp_allocator)
 }
+
+@(test)
+test_nsec_wildcard_no_data_reads_the_wildcard_as_the_name :: proc(t: ^testing.T) {
+	// As `test_nsec3_wildcard_no_data_reads_the_wildcard_as_the_name`: a
+	// wildcard delegation answers with a referral, and an apex denies no DS.
+	zone := []Nsec_Rr {
+		nsec_rr("example.", "*.example.", {.NS, .SOA, .RRSIG, .NSEC, .DNSKEY}),
+		nsec_rr("*.example.", "z.example.", {.NS, .RRSIG, .NSEC}),
+	}
+	testing.expect_value(t, nsec_proves_no_data(zone, "foo.example.", .A), Proof.Failed)
+	testing.expect_value(t, nsec_proves_no_data(zone, "foo.example.", .DS), Proof.Proven)
+	zone[1] = nsec_rr("*.example.", "z.example.", {.NS, .SOA, .RRSIG, .NSEC})
+	testing.expect_value(t, nsec_proves_no_data(zone, "foo.example.", .DS), Proof.Failed)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_nsec_a_delegation_or_dname_speaks_for_nothing_below_it :: proc(t: ^testing.T) {
+	/*
+	RFC 6840 section 4.1: a span whose owner is the parent's side of a cut, or
+	holds a DNAME, swallows names it may not deny. The wildcard NODATA reads
+	the covering record as much as the name error does.
+	*/
+	for types in ([][]dns.Type{{.NS, .RRSIG, .NSEC}, {.DNAME, .RRSIG, .NSEC}}) {
+		zone := []Nsec_Rr {
+			nsec_rr("cut.example.", "z.example.", types),
+			nsec_rr("*.cut.example.", "a.cut.example.", {.MX, .RRSIG, .NSEC}),
+		}
+		testing.expect_value(t, nsec_proves_no_data(zone, "foo.cut.example.", .A), Proof.Failed)
+		testing.expect_value(t, nsec_proves_name_error(zone, "foo.cut.example."), Proof.Failed)
+	}
+	zone := []Nsec_Rr {
+		nsec_rr("cut.example.", "z.example.", {.A, .RRSIG, .NSEC}),
+		nsec_rr("*.cut.example.", "a.cut.example.", {.MX, .RRSIG, .NSEC}),
+	}
+	testing.expect_value(t, nsec_proves_no_data(zone, "foo.cut.example.", .A), Proof.Proven)
+	testing.expect_value(t, nsec_proves_name_error(zone[:1], "foo.cut.example."), Proof.Proven)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_nsec_an_empty_non_terminal_has_no_data :: proc(t: ^testing.T) {
+	/*
+	An empty non-terminal has no NSEC of its own: the span covering it points
+	at the descendant it exists for, and that is the whole NODATA proof. The
+	wildcard under it answers for names below it, never for the name itself,
+	so its MX denies nothing about `ent.example.` and has no say here.
+	*/
+	zone := []Nsec_Rr {
+		nsec_rr("example.", "*.ent.example.", {.NS, .SOA, .RRSIG, .NSEC, .DNSKEY}),
+		nsec_rr("*.ent.example.", "example.", {.MX, .RRSIG, .NSEC}),
+	}
+	testing.expect_value(t, nsec_proves_no_data(zone, "ent.example.", .A), Proof.Proven)
+	testing.expect_value(t, nsec_proves_no_data(zone, "ent.example.", .MX), Proof.Proven)
+	testing.expect_value(t, nsec_proves_no_data(zone, "ent.example.", .DS), Proof.Proven)
+	// A span that runs past the name is no node, so the wildcard decides.
+	testing.expect_value(t, nsec_proves_no_data(zone, "foo.ent.example.", .MX), Proof.Failed)
+	testing.expect_value(t, nsec_proves_no_data(zone, "foo.ent.example.", .A), Proof.Proven)
+
+	// And with no wildcard to fall back on, the span is the proof on its own.
+	bare := []Nsec_Rr {
+		nsec_rr("example.", "a.ent.example.", {.NS, .SOA, .RRSIG, .NSEC, .DNSKEY}),
+		nsec_rr("a.ent.example.", "example.", {.A, .RRSIG, .NSEC}),
+	}
+	testing.expect_value(t, nsec_proves_no_data(bare, "ent.example.", .A), Proof.Proven)
+	testing.expect_value(t, nsec_proves_no_data(bare, "nx.example.", .A), Proof.Failed)
+	free_all(context.temp_allocator)
+}
