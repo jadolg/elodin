@@ -95,7 +95,8 @@ H2_Conn :: struct {
 Upstream :: struct {
 	spec:         config.Upstream_Spec,
 	// Published once and read without a lock, so only `resolve_endpoint`
-	// writes them and readers go through `endpoint_of`.
+	// writes them, `endpoint` is read through `endpoint_of`, and `resolved`
+	// only with an acquire load.
 	endpoint:     net.Endpoint,
 	resolved:     bool,
 	tls_ctx:      ^tlsx.Context,
@@ -655,10 +656,11 @@ servers to ask the refusal costs nothing, and is left unrecorded.
 
 	if err != .None {
 		/*
-		Except a timeout on the exchange that resolved the hostname: the
+		Except a timeout on an exchange that looked the hostname up: the
 		bootstrap servers spent part of the member's timeout, so the member was
 		not given the whole of it, and a member cut short must not be parked for
-		it - the rule `resolve_sequential` states. Once, since the address is
+		it - the rule `resolve_sequential` states. Only the exchanges that found
+		it unresolved, several when they arrive together, since the address is
 		then held and every later exchange gives the member its whole timeout
 		and judges it on that. Still counted, so the figures show the query.
 		*/
