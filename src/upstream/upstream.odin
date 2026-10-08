@@ -94,6 +94,9 @@ H2_Conn :: struct {
 
 Upstream :: struct {
 	spec:         config.Upstream_Spec,
+	// Published once and read without a lock, so only `resolve_endpoint`
+	// writes them, `endpoint` is read through `endpoint_of`, and `resolved`
+	// only with an acquire load.
 	endpoint:     net.Endpoint,
 	resolved:     bool,
 	tls_ctx:      ^tlsx.Context,
@@ -251,6 +254,12 @@ An IP literal is used as-is. A hostname is resolved through the configured
 bootstrap resolvers rather than the system resolver, because on a machine where
 elodin *is* the system resolver, asking it to resolve its own upstream would
 deadlock at boot.
+
+A name that did not resolve at startup is resolved by whichever queries reach
+it first, several at once while others are dialling, so the endpoint is
+published once: written under `mu` by the first lookup to succeed, then
+`resolved` is set with release ordering, and the endpoint is never written
+again. A lookup that fails leaves alone whatever another thread published.
 */
 @(private)
 resolve_endpoint :: proc(
@@ -259,28 +268,51 @@ resolve_endpoint :: proc(
 	// each has `BOOTSTRAP_TIMEOUT` of its own.
 	deadline := time.Tick{},
 ) -> bool {
-	if addr := netx.parse_address(u.spec.address); addr != nil {
+	addr := netx.parse_address(u.spec.address)
+	literal := addr != nil
+	if !literal {
+		ok: bool
+		addr, ok = bootstrap_resolve(u.spec.bootstrap, u.spec.address, deadline)
+		if !ok {
+			// Another thread's lookup may have published meanwhile, and then
+			// the upstream is not unresolvable.
+			if sync.atomic_load_explicit(&u.resolved, .Acquire) {
+				return true
+			}
+			logx.warnf("upstream %s: cannot resolve %q via bootstrap resolvers", u.spec.name, u.spec.address)
+			return false
+		}
+	}
+	sync.mutex_lock(&u.mu)
+	published := !sync.atomic_load_explicit(&u.resolved, .Relaxed)
+	if published {
 		u.endpoint = net.Endpoint {
 			address = addr,
 			port    = u.spec.port,
 		}
-		u.resolved = true
-		return true
+		sync.atomic_store_explicit(&u.resolved, true, .Release)
 	}
-
-	addr, ok := bootstrap_resolve(u.spec.bootstrap, u.spec.address, deadline)
-	if !ok {
-		logx.warnf("upstream %s: cannot resolve %q via bootstrap resolvers", u.spec.name, u.spec.address)
-		u.resolved = false
-		return false
+	sync.mutex_unlock(&u.mu)
+	// Only the address dialled is logged, not one a lookup that lost the race
+	// found.
+	if published && !literal {
+		logx.debugf("upstream %s: resolved %s to %s", u.spec.name, u.spec.address, net.address_to_string(addr, context.temp_allocator))
 	}
-	u.endpoint = net.Endpoint {
-		address = addr,
-		port    = u.spec.port,
-	}
-	u.resolved = true
-	logx.debugf("upstream %s: resolved %s to %s", u.spec.name, u.spec.address, net.address_to_string(addr, context.temp_allocator))
 	return true
+}
+
+/*
+The address to dial, or `Not_Resolved` while there is none yet. Read without a
+lock: the endpoint is written once, before `resolved` is released (see
+`resolve_endpoint`). A copy, so one exchange sends to and checks replies against
+the same address.
+*/
+@(private)
+endpoint_of :: proc(u: ^Upstream) -> (endpoint: net.Endpoint, err: Error) {
+	if !sync.atomic_load_explicit(&u.resolved, .Acquire) {
+		return {}, .Not_Resolved
+	}
+	return u.endpoint, .None
 }
 
 healthy :: proc(u: ^Upstream) -> bool {
@@ -601,7 +633,7 @@ take several, and every bound above - a group's budget, a question's
 	for as long as the bootstrap stayed down (issue #327). With no bootstrap
 servers to ask the refusal costs nothing, and is left unrecorded.
 	*/
-	resolving := !u.resolved
+	resolving := !sync.atomic_load_explicit(&u.resolved, .Acquire)
 	if resolving && !resolve_endpoint(u, deadline) {
 		if len(u.spec.bootstrap) > 0 {
 			record_failure(u, .Not_Resolved)
@@ -624,10 +656,11 @@ servers to ask the refusal costs nothing, and is left unrecorded.
 
 	if err != .None {
 		/*
-		Except a timeout on the exchange that resolved the hostname: the
+		Except a timeout on an exchange that looked the hostname up: the
 		bootstrap servers spent part of the member's timeout, so the member was
 		not given the whole of it, and a member cut short must not be parked for
-		it - the rule `resolve_sequential` states. Once, since the address is
+		it - the rule `resolve_sequential` states. Only the exchanges that found
+		it unresolved, several when they arrive together, since the address is
 		then held and every later exchange gives the member its whole timeout
 		and judges it on that. Still counted, so the figures show the query.
 		*/

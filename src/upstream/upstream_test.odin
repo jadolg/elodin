@@ -3635,3 +3635,93 @@ test_a_doh_authority_brackets_an_ipv6_literal :: proc(t: ^testing.T) {
 	testing.expect(t, doh_authority("dns.example", "https://dns.example:8443/dns-query") == "dns.example:8443", "a name and its port")
 	testing.expect(t, doh_authority("2606:4700::1111", "https://[2606:4700::1111]:8443/dns-query") == "[2606:4700::1111]:8443", "a literal and its port")
 }
+
+@(private = "file")
+late_resolver_worker :: proc(u: ^Upstream) {
+	q := dns.Message{id = 1, question = []dns.Question{{name = "example.com.", type = .A, class = .IN}}}
+	q.flags.rd = true
+	wire, _, _ := dns.encode_message(q, context.temp_allocator)
+	_, _ = exchange(u, wire, 200 * time.Millisecond, context.temp_allocator)
+	free_all(context.temp_allocator)
+}
+
+/*
+An upstream whose hostname did not resolve at startup is resolved by whichever
+queries reach it first, several at once, while others are already reading the
+endpoint to dial it (issue #347). Run under `-sanitize:thread` to see the race;
+without it, this checks what every thread ends up with, and that a later lookup
+does not write over it.
+
+Marked unresolved by hand over an address literal rather than resolved through
+the bootstrap cache, which is package-global and owned by another test while it
+runs; the literal takes the same path to publishing the endpoint. The member is
+a bound socket that never answers, so no other test's server is asked.
+*/
+@(test)
+test_a_late_resolved_endpoint_is_published_once :: proc(t: ^testing.T) {
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, serr == nil, "cannot bind the silent member: %v", serr) {
+		return
+	}
+	defer net.close(socket)
+	bound, _ := net.bound_endpoint(socket)
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "late", kind = .UDP, address = "127.0.0.1", port = bound.port},
+		0,
+		time.Second,
+		context.allocator,
+	)
+	if !testing.expectf(t, uerr == .None, "setup: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+	u.resolved = false
+	u.endpoint = {}
+
+	workers: [8]^thread.Thread
+	for &w in workers {
+		w = thread.create_and_start_with_poly_data(u, late_resolver_worker)
+	}
+	for w in workers {
+		thread.join(w)
+		thread.destroy(w)
+	}
+
+	ep, eerr := endpoint_of(u)
+	testing.expect_value(t, eerr, Error.None)
+	testing.expect_value(t, ep.port, bound.port)
+	testing.expect(t, addresses_equal(ep.address, net.IP4_Loopback), "the endpoint is not the address the name resolved to")
+
+	// A lookup that finishes after the endpoint is out leaves it as it is: a
+	// reader holding no lock may be copying it.
+	u.spec.address = "127.0.0.2"
+	testing.expect(t, resolve_endpoint(u), "a lookup after the endpoint was published")
+	ep, _ = endpoint_of(u)
+	testing.expect(t, addresses_equal(ep.address, net.IP4_Loopback), "the published endpoint was written over")
+}
+
+/*
+A thread whose bootstrap lookup failed does not take back the endpoint another
+thread published meanwhile, which would send every later query back through the
+bootstrap servers.
+*/
+@(test)
+test_a_failed_resolution_does_not_unpublish_the_endpoint :: proc(t: ^testing.T) {
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "kept", kind = .UDP, address = "127.0.0.1", port = 41154},
+		0,
+		time.Second,
+		context.allocator,
+	)
+	if !testing.expectf(t, uerr == .None, "setup: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+	// The losing thread's view: a hostname with no bootstrap servers to ask.
+	u.spec.address = "kept-347.test"
+	testing.expect(t, resolve_endpoint(u), "the endpoint published before the failed lookup does not stand")
+
+	ep, eerr := endpoint_of(u)
+	testing.expect_value(t, eerr, Error.None)
+	testing.expect_value(t, ep.port, 41154)
+}
