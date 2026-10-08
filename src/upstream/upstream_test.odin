@@ -3649,16 +3649,24 @@ late_resolver_worker :: proc(u: ^Upstream) {
 An upstream whose hostname did not resolve at startup is resolved by whichever
 queries reach it first, several at once, while others are already reading the
 endpoint to dial it (issue #347). Run under `-sanitize:thread` to see the race;
-without it, this checks what every thread ends up with.
+without it, this checks what every thread ends up with, and that a later lookup
+does not write over it.
 
 Marked unresolved by hand over an address literal rather than resolved through
 the bootstrap cache, which is package-global and owned by another test while it
-runs; the literal takes the same path to publishing the endpoint.
+runs; the literal takes the same path to publishing the endpoint. The member is
+a bound socket that never answers, so no other test's server is asked.
 */
 @(test)
 test_a_late_resolved_endpoint_is_published_once :: proc(t: ^testing.T) {
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, serr == nil, "cannot bind the silent member: %v", serr) {
+		return
+	}
+	defer net.close(socket)
+	bound, _ := net.bound_endpoint(socket)
 	u, uerr := make_upstream(
-		config.Upstream_Spec{name = "late", kind = .UDP, address = "127.0.0.1", port = 41153},
+		config.Upstream_Spec{name = "late", kind = .UDP, address = "127.0.0.1", port = bound.port},
 		0,
 		time.Second,
 		context.allocator,
@@ -3681,8 +3689,15 @@ test_a_late_resolved_endpoint_is_published_once :: proc(t: ^testing.T) {
 
 	ep, eerr := endpoint_of(u)
 	testing.expect_value(t, eerr, Error.None)
-	testing.expect_value(t, ep.port, 41153)
+	testing.expect_value(t, ep.port, bound.port)
 	testing.expect(t, addresses_equal(ep.address, net.IP4_Loopback), "the endpoint is not the address the name resolved to")
+
+	// A lookup that finishes after the endpoint is out leaves it as it is: a
+	// reader holding no lock may be copying it.
+	u.spec.address = "127.0.0.2"
+	testing.expect(t, resolve_endpoint(u), "a lookup after the endpoint was published")
+	ep, _ = endpoint_of(u)
+	testing.expect(t, addresses_equal(ep.address, net.IP4_Loopback), "the published endpoint was written over")
 }
 
 /*

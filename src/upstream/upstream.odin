@@ -94,6 +94,8 @@ H2_Conn :: struct {
 
 Upstream :: struct {
 	spec:         config.Upstream_Spec,
+	// Published once and read without a lock, so only `resolve_endpoint`
+	// writes them and readers go through `endpoint_of`.
 	endpoint:     net.Endpoint,
 	resolved:     bool,
 	tls_ctx:      ^tlsx.Context,
@@ -266,23 +268,34 @@ resolve_endpoint :: proc(
 	deadline := time.Tick{},
 ) -> bool {
 	addr := netx.parse_address(u.spec.address)
-	if addr == nil {
+	literal := addr != nil
+	if !literal {
 		ok: bool
 		addr, ok = bootstrap_resolve(u.spec.bootstrap, u.spec.address, deadline)
 		if !ok {
+			// Another thread's lookup may have published meanwhile, and then
+			// the upstream is not unresolvable.
+			if sync.atomic_load_explicit(&u.resolved, .Acquire) {
+				return true
+			}
 			logx.warnf("upstream %s: cannot resolve %q via bootstrap resolvers", u.spec.name, u.spec.address)
-			return sync.atomic_load_explicit(&u.resolved, .Acquire)
+			return false
 		}
-		logx.debugf("upstream %s: resolved %s to %s", u.spec.name, u.spec.address, net.address_to_string(addr, context.temp_allocator))
 	}
 	sync.mutex_lock(&u.mu)
-	defer sync.mutex_unlock(&u.mu)
-	if !sync.atomic_load_explicit(&u.resolved, .Relaxed) {
+	published := !sync.atomic_load_explicit(&u.resolved, .Relaxed)
+	if published {
 		u.endpoint = net.Endpoint {
 			address = addr,
 			port    = u.spec.port,
 		}
 		sync.atomic_store_explicit(&u.resolved, true, .Release)
+	}
+	sync.mutex_unlock(&u.mu)
+	// Only the address dialled is logged, not one a lookup that lost the race
+	// found.
+	if published && !literal {
+		logx.debugf("upstream %s: resolved %s to %s", u.spec.name, u.spec.address, net.address_to_string(addr, context.temp_allocator))
 	}
 	return true
 }
@@ -619,8 +632,7 @@ take several, and every bound above - a group's budget, a question's
 	for as long as the bootstrap stayed down (issue #327). With no bootstrap
 servers to ask the refusal costs nothing, and is left unrecorded.
 	*/
-	_, unresolved := endpoint_of(u)
-	resolving := unresolved != .None
+	resolving := !sync.atomic_load_explicit(&u.resolved, .Acquire)
 	if resolving && !resolve_endpoint(u, deadline) {
 		if len(u.spec.bootstrap) > 0 {
 			record_failure(u, .Not_Resolved)
