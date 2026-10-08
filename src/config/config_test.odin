@@ -1666,6 +1666,17 @@ test_an_address_or_port_out_of_shape_is_a_config_error :: proc(t: ^testing.T) {
 		// No host at all: with verify off, nothing else asks for one.
 		"upstream:\n  servers:\n    - { url: \"https:///dns-query\", verify: false }\n  bootstrap: [9.9.9.9]\n",
 		"upstream:\n  servers: [\"https:///dns-query\"]\n  bootstrap: [9.9.9.9]\n",
+		"upstream:\n  servers: [\"udp://\"]\n",
+		"upstream:\n  servers: [\":53\"]\n",
+		"upstream:\n  servers: [\"tls://:853#dns.example\"]\n  bootstrap: [9.9.9.9]\n",
+		// An IPv6 address's IPv4 part has four parts too.
+		UP + "server:\n  allow_from: [\"::ffff:192.168.1./120\"]\n",
+		UP + "listeners:\n  udp: { enabled: true, address: \"::ffff:10.20.30.\" }\n",
+		// A host in an answer, typed or not, has no port or brackets.
+		UP + "rewrites:\n  - domain: example.com\n    answers: \"[1.2.3.4]\"\n",
+		UP + "rewrites:\n  - domain: example.com\n    answers: \"CNAME dns.example:53\"\n",
+		UP + "rewrites:\n  - domain: example.com\n    answers: \"MX 10 mail.example:25\"\n",
+		UP + "rewrites:\n  - domain: example.com\n    answers: \"CNAME 10.20.30\"\n",
 	}
 	for src in SOURCES {
 		_, err := load_string(src, context.temp_allocator)

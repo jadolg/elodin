@@ -72,7 +72,7 @@ is_ip6_literal :: proc(s: string) -> bool {
 		return false
 	}
 	_, ok := net.parse_ip6_address(s)
-	return ok
+	return ok && is_dotted_quad(s)
 }
 
 // Whether `s` splits into a host and a port. `[::1]` is not bare but has none:
@@ -87,9 +87,10 @@ A host alone: an IP address, or a name, which holds no colon or bracket.
 `is_bare` passes any string of two or more colons as an IPv6 literal it has not
 parsed, so `dns.example::853` and `[::1]x` would stand as names to look up and
 certificate names to check. Nor is a name numeric: that is an address mistyped.
+Nor empty: a field that may be left out is checked only when it is not.
 */
 is_host :: proc(s: string) -> bool {
-	return parse_address(s) != nil || (!strings.contains_any(s, ":[]") && !is_numeric_name(s))
+	return parse_address(s) != nil || (s != "" && !strings.contains_any(s, ":[]") && !is_numeric_name(s))
 }
 
 /*
@@ -111,24 +112,26 @@ is_numeric_name :: proc(s: string) -> bool {
 }
 
 /*
-An IPv4 address is four decimal parts. `core:net` also takes the short `inet_aton`
-forms, so `192.168.1` is 192.168.0.1 and `10.2.3.` is 10.2.0.3: an allow list
-entry `192.168.1/24` would be another network.
+An IPv4 address is four decimal parts, alone or as an IPv6 address's last 32
+bits. `core:net` also takes the short `inet_aton` forms, so `192.168.1` is
+192.168.0.1, `10.2.3.` is 10.2.0.3 and `::ffff:10.2.3.` is ::ffff:10.2.0.3: an
+allow list entry `192.168.1/24` would be another network. An IPv6 address with
+no IPv4 part passes.
 */
 @(private)
 is_dotted_quad :: proc(s: string) -> bool {
-	return strings.count(s, ".") == 3 && !strings.has_suffix(s, ".")
+	v4 := s[strings.last_index_byte(s, ':') + 1:]
+	if v4 != s && !strings.contains_rune(v4, '.') {
+		return true
+	}
+	return strings.count(v4, ".") == 3 && !strings.has_suffix(v4, ".")
 }
 
 parse_address :: proc(s: string) -> net.Address {
-	if !is_bare(s) {
+	if !is_bare(s) || !is_dotted_quad(s) {
 		return nil
 	}
-	addr := net.parse_address(s)
-	if _, is4 := addr.(net.IP4_Address); is4 && !is_dotted_quad(s) {
-		return nil
-	}
-	return addr
+	return net.parse_address(s)
 }
 
 parse_ip4_address :: proc(s: string) -> (addr: net.IP4_Address, ok: bool) {
@@ -139,7 +142,7 @@ parse_ip4_address :: proc(s: string) -> (addr: net.IP4_Address, ok: bool) {
 }
 
 parse_ip6_address :: proc(s: string) -> (addr: net.IP6_Address, ok: bool) {
-	if !is_bare(s) {
+	if !is_bare(s) || !is_dotted_quad(s) {
 		return
 	}
 	return net.parse_ip6_address(s)

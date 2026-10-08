@@ -1311,7 +1311,7 @@ load_upstream_spec :: proc(
 	}
 	// On every kind: a port written into the address would be dropped for the
 	// default one, or, on https, the address taken for a name to look up.
-	if !netx.is_host(spec.address) {
+	if spec.address != "" && !netx.is_host(spec.address) {
 		errorf(l, "%s.address: %q is not an address or a name alone%s", path, spec.address, address_hint(spec.address))
 		return {}, false
 	}
@@ -1360,7 +1360,7 @@ load_upstream_spec :: proc(
 		}
 	}
 	// The certificate name and SNI: a port there is a name no certificate has.
-	if !netx.is_host(spec.hostname) {
+	if spec.hostname != "" && !netx.is_host(spec.hostname) {
 		errorf(l, "%s.hostname: %q is not a name alone%s", path, spec.hostname, address_hint(spec.hostname))
 		return {}, false
 	}
@@ -1461,7 +1461,7 @@ parse_upstream_shorthand :: proc(
 	// A host each, as the map spelling's `address:` and `hostname:` are: an NBSP
 	// after `#name`, say, is a certificate name no server has, and is refused
 	// rather than trimmed away; so is a port after it.
-	if !split_ok || !h2.authority_is_valid(s) || !netx.is_host(host) || !h2.authority_is_valid(spec.hostname) || !netx.is_host(spec.hostname) {
+	if !split_ok || !h2.authority_is_valid(s) || !netx.is_host(host) || !h2.authority_is_valid(spec.hostname) || (spec.hostname != "" && !netx.is_host(spec.hostname)) {
 		errorf(l, "%s: cannot parse %q", path, raw)
 		return {}, false
 	}
@@ -2181,17 +2181,6 @@ parse_rewrite_answer :: proc(
 	case net.IP6_Address:
 		return v6_rewrite_answer(v), true
 	}
-	// Not a name either, though a colon is legal in one: an answer has no port,
-	// after an address or a name, and an address in one goes without brackets.
-	if host, _, split_ok := netx.split_port(trimmed); split_ok && host != trimmed && (netx.parse_address(host) != nil || netx.has_port(trimmed)) {
-		why := "a host with a port, and an answer has no port" if netx.has_port(trimmed) else "an address in brackets; write it without them"
-		errorf(l, "%s: %q is %s", path, trimmed, why)
-		return {}, false
-	}
-	if netx.is_numeric_name(trimmed) {
-		errorf(l, "%s: %q is no IPv4 address, which has four parts, nor a name, which does not end in a number", path, trimmed)
-		return {}, false
-	}
 	name := rdata_name(l, trimmed, path, "an answer") or_return
 	return Rewrite_Answer{kind = .CNAME, name = name}, true
 }
@@ -2407,6 +2396,20 @@ rdata_name :: proc(l: ^Loader, text, path, type: string) -> (name: string, ok: b
 	trimmed := strings.trim_space(text)
 	if trimmed == "" || strings.index_any(trimmed, " \t") >= 0 {
 		errorf(l, "%s: %s needs one host name, got %q", path, type, text)
+		return "", false
+	}
+	// A host, though a colon or a bracket is legal in a name: a port, brackets
+	// or an all-digit last label make it an address or an endpoint mistyped.
+	if netx.has_port(trimmed) {
+		errorf(l, "%s: %s host %q has a port, and a host has none", path, type, trimmed)
+		return "", false
+	}
+	if strings.contains_any(trimmed, "[]") {
+		errorf(l, "%s: %s host %q has brackets; an address goes without them", path, type, trimmed)
+		return "", false
+	}
+	if netx.is_numeric_name(trimmed) {
+		errorf(l, "%s: %s host %q is no IPv4 address, which has four parts, nor a name, which does not end in a number", path, type, trimmed)
 		return "", false
 	}
 	canonical := canonical_domain(trimmed, l.allocator)
@@ -3056,7 +3059,7 @@ HOST_RULE :: "must be visible ASCII with no userinfo, path, query or fragment"
 url_is_valid :: proc(url: string) -> bool {
 	_, host, _, _, _ := net.split_url(url, context.temp_allocator)
 	host_only, _, split_ok := netx.split_port(host)
-	return h2.target_is_valid(url) && h2.authority_is_valid(host) && split_ok && host_only != "" && netx.is_host(host_only)
+	return h2.target_is_valid(url) && h2.authority_is_valid(host) && split_ok && netx.is_host(host_only)
 }
 
 // A list url goes into a request line and `Host` the same way.
