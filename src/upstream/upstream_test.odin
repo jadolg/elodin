@@ -3616,7 +3616,7 @@ test_a_zero_socket_timeout_is_still_no_timeout :: proc(t: ^testing.T) {
 // is refused, not looked up.
 @(test)
 test_a_stray_bracket_in_a_url_is_refused :: proc(t: ^testing.T) {
-	for url in ([]string{"http://]:80/", "http://a]:]:80/", "https://[]:]:443/"}) {
+	for url in ([]string{"http://]:80/", "http://a]:]:80/", "https://[]:]:443/", "http://dns.example::80/"}) {
 		_, _, _, _, _, ok := split_http_url(url)
 		testing.expectf(t, !ok, "%q was split", url)
 	}
@@ -3629,9 +3629,9 @@ test_a_stray_bracket_in_a_url_is_refused :: proc(t: ^testing.T) {
 // The authority brackets an IPv6 literal; the TLS name check is given it bare.
 @(test)
 test_a_doh_authority_brackets_an_ipv6_literal :: proc(t: ^testing.T) {
-	testing.expect(t, doh_authority("2606:4700::1111", 443) == "[2606:4700::1111]", "an IPv6 literal")
-	testing.expect(t, doh_authority("1.1.1.1", 443) == "1.1.1.1" && doh_authority("dns.example", 443) == "dns.example", "others as written")
+	testing.expect(t, doh_authority("2606:4700::1111", "https://[2606:4700::1111]/dns-query") == "[2606:4700::1111]", "an IPv6 literal")
+	testing.expect(t, doh_authority("1.1.1.1", "https://1.1.1.1:443/dns-query") == "1.1.1.1" && doh_authority("dns.example", "https://dns.example/dns-query") == "dns.example", "others as written")
 	// And names a port that is not https's own, as the url does.
-	testing.expect(t, doh_authority("dns.example", 8443) == "dns.example:8443", "a name and its port")
-	testing.expect(t, doh_authority("2606:4700::1111", 8443) == "[2606:4700::1111]:8443", "a literal and its port")
+	testing.expect(t, doh_authority("dns.example", "https://dns.example:8443/dns-query") == "dns.example:8443", "a name and its port")
+	testing.expect(t, doh_authority("2606:4700::1111", "https://[2606:4700::1111]:8443/dns-query") == "[2606:4700::1111]:8443", "a literal and its port")
 }

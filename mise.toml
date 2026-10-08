@@ -87,7 +87,7 @@ description = "Type-check every package without emitting a binary"
 run = [
   "odin check src/main -collection:elodin=src -vet -strict-style",
   """
-  if grep -rnE 'net\\.(split_port|aton|parse_address|parse_ip4_address|parse_ip6_address|parse_endpoint|parse_hostname_or_endpoint|resolve|resolve_ip4|resolve_ip6|join_port|dial_tcp|dial_tcp_from_hostname[a-z_]*|parse_hosts|parse_resolv_conf)\\(' src \\
+  if grep -rnE '\\bnet\\.(split_port|aton|parse_address|parse_ip4_address|parse_ip6_address|parse_endpoint|parse_hostname_or_endpoint|resolve|resolve_ip4|resolve_ip6|join_port|dial_tcp|dial_tcp_from_hostname[a-z_]*|parse_hosts|parse_resolv_conf)\\(' src \\
       --include='*.odin' --exclude='*_test.odin' --exclude-dir=netx --exclude-dir=itest --exclude-dir=fuzz; then
     echo 'parse addresses with elodin:netx, not core:net' >&2
     exit 1

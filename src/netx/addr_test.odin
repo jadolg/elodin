@@ -107,3 +107,34 @@ test_brackets_hold_only_ipv6 :: proc(t: ^testing.T) {
 		testing.expect(t, !okep, s)
 	}
 }
+
+// `inet_aton`'s short forms: `192.168.1` is 192.168.0.1 to `core:net`.
+@(test)
+test_an_ipv4_address_has_four_parts :: proc(t: ^testing.T) {
+	for s in ([]string{"192.168.1", "10.20.30", "10.2.3.", "127.0.1"}) {
+		testing.expect(t, parse_address(s) == nil, s)
+		_, ok4 := parse_ip4_address(s)
+		testing.expect(t, !ok4, s)
+		_, okep := parse_endpoint(s)
+		testing.expect(t, !okep, s)
+	}
+	_, ok := parse_ip4_address("192.168.1.1")
+	testing.expect(t, ok && parse_address("192.168.1.1") != nil, "a dotted quad")
+	// A host alone, so neither a port nor brackets reach `core:net`'s lookup.
+	for s in ([]string{"[::1]", "1.1.1.1:53", "dns.example::53"}) {
+		_, _, rerr := resolve(s)
+		testing.expect(t, rerr != nil, s)
+	}
+}
+
+// RFC 3696 section 2: no top-level domain is all digits, so a name ending in one
+// is an address mistyped, not a host.
+@(test)
+test_a_numeric_name_is_no_host :: proc(t: ^testing.T) {
+	for s in ([]string{"10.20.30", "10.20.30.", "1.2.3.4.5", "123"}) {
+		testing.expect(t, !is_host(s), s)
+	}
+	for s in ([]string{"1.2.3.4", "dns.example", "1dns.example", "dns.example.", "::1"}) {
+		testing.expect(t, is_host(s), s)
+	}
+}

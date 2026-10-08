@@ -82,18 +82,60 @@ has_port :: proc(s: string) -> bool {
 	return ok && host != s && !strings.has_suffix(s, "]")
 }
 
-parse_address :: proc(s: string, non_decimal_address := false) -> net.Address {
+/*
+A host alone: an IP address, or a name, which holds no colon or bracket.
+`is_bare` passes any string of two or more colons as an IPv6 literal it has not
+parsed, so `dns.example::853` and `[::1]x` would stand as names to look up and
+certificate names to check. Nor is a name numeric: that is an address mistyped.
+*/
+is_host :: proc(s: string) -> bool {
+	return parse_address(s) != nil || (!strings.contains_any(s, ":[]") && !is_numeric_name(s))
+}
+
+/*
+Whether `s` ends in an all-digit label, which RFC 3696 section 2 says no top-level
+domain is: `10.20.30` is an IPv4 address short a part, not a name to look up.
+*/
+is_numeric_name :: proc(s: string) -> bool {
+	name := strings.trim_suffix(s, ".")
+	last := name[strings.last_index_byte(name, '.') + 1:]
+	if last == "" {
+		return false
+	}
+	for c in last {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+/*
+An IPv4 address is four decimal parts. `core:net` also takes the short `inet_aton`
+forms, so `192.168.1` is 192.168.0.1 and `10.2.3.` is 10.2.0.3: an allow list
+entry `192.168.1/24` would be another network.
+*/
+@(private)
+is_dotted_quad :: proc(s: string) -> bool {
+	return strings.count(s, ".") == 3 && !strings.has_suffix(s, ".")
+}
+
+parse_address :: proc(s: string) -> net.Address {
 	if !is_bare(s) {
 		return nil
 	}
-	return net.parse_address(s, non_decimal_address)
+	addr := net.parse_address(s)
+	if _, is4 := addr.(net.IP4_Address); is4 && !is_dotted_quad(s) {
+		return nil
+	}
+	return addr
 }
 
-parse_ip4_address :: proc(s: string, allow_non_decimal := false) -> (addr: net.IP4_Address, ok: bool) {
-	if !is_bare(s) {
+parse_ip4_address :: proc(s: string) -> (addr: net.IP4_Address, ok: bool) {
+	if !is_bare(s) || !is_dotted_quad(s) {
 		return
 	}
-	return net.parse_ip4_address(s, allow_non_decimal)
+	return net.parse_ip4_address(s)
 }
 
 parse_ip6_address :: proc(s: string) -> (addr: net.IP6_Address, ok: bool) {
@@ -113,9 +155,11 @@ parse_endpoint :: proc(s: string) -> (ep: net.Endpoint, ok: bool) {
 	return
 }
 
+// A host alone, as `is_host` holds it: `core:net`'s `resolve` splits a port off
+// by its own rule, and looks `[::1]` up as a name.
 resolve :: proc(s: string) -> (ep4, ep6: net.Endpoint, err: net.Network_Error) {
-	if _, _, split_ok := split_port(s); !split_ok {
-		return {}, {}, net.Parse_Endpoint_Error.Bad_Port
+	if !is_host(s) {
+		return {}, {}, net.Parse_Endpoint_Error.Bad_Hostname
 	}
 	return net.resolve(s)
 }

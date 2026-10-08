@@ -650,17 +650,6 @@ load_bootstrap :: proc(l: ^Loader, b: ^yaml.Node, path: string) -> []string {
 	return list
 }
 
-/*
-A host alone: an IP address, or a name, which holds no colon or bracket.
-`netx.is_bare` passes any string of two or more colons as an IPv6 literal it has
-not parsed, so `dns.example::853` and `[::1]x` would stand as names to look up
-and certificate names to check.
-*/
-@(private)
-is_host :: proc(s: string) -> bool {
-	return netx.parse_address(s) != nil || !strings.contains_any(s, ":[]")
-}
-
 // What to add to an address refused for not standing alone: where its port
 // goes, or that a literal goes without its brackets.
 @(private)
@@ -1322,7 +1311,7 @@ load_upstream_spec :: proc(
 	}
 	// On every kind: a port written into the address would be dropped for the
 	// default one, or, on https, the address taken for a name to look up.
-	if !is_host(spec.address) {
+	if !netx.is_host(spec.address) {
 		errorf(l, "%s.address: %q is not an address or a name alone%s", path, spec.address, address_hint(spec.address))
 		return {}, false
 	}
@@ -1340,11 +1329,8 @@ load_upstream_spec :: proc(
 			errorf(l, "%s.url: expected an https:// url", path)
 			return {}, false
 		}
-		host_only, url_port, split_ok := netx.split_port(host)
-		if !split_ok || !is_host(host_only) {
-			errorf(l, "%s.url: cannot parse host %q", path, host)
-			return {}, false
-		}
+		// `url_is_valid` has split it.
+		host_only, url_port, _ := netx.split_port(host)
 		if spec.hostname == "" {
 			spec.hostname = host_only
 		}
@@ -1374,7 +1360,7 @@ load_upstream_spec :: proc(
 		}
 	}
 	// The certificate name and SNI: a port there is a name no certificate has.
-	if !is_host(spec.hostname) {
+	if !netx.is_host(spec.hostname) {
 		errorf(l, "%s.hostname: %q is not a name alone%s", path, spec.hostname, address_hint(spec.hostname))
 		return {}, false
 	}
@@ -1442,11 +1428,8 @@ parse_upstream_shorthand :: proc(
 		}
 		scheme, host, url_path, _, _ := net.split_url(s, l.allocator)
 		_ = scheme
-		host_only, url_port, split_ok := netx.split_port(host)
-		if !split_ok || !is_host(host_only) {
-			errorf(l, "%s: cannot parse %q", path, raw)
-			return {}, false
-		}
+		// `url_is_valid` has split it.
+		host_only, url_port, _ := netx.split_port(host)
 		spec.address = host_only
 		spec.hostname = host_only
 		spec.port = url_port if url_port != 0 else 443
@@ -1478,7 +1461,7 @@ parse_upstream_shorthand :: proc(
 	// A host each, as the map spelling's `address:` and `hostname:` are: an NBSP
 	// after `#name`, say, is a certificate name no server has, and is refused
 	// rather than trimmed away; so is a port after it.
-	if !split_ok || !h2.authority_is_valid(s) || !is_host(host) || !h2.authority_is_valid(spec.hostname) || !is_host(spec.hostname) {
+	if !split_ok || !h2.authority_is_valid(s) || !netx.is_host(host) || !h2.authority_is_valid(spec.hostname) || !netx.is_host(spec.hostname) {
 		errorf(l, "%s: cannot parse %q", path, raw)
 		return {}, false
 	}
@@ -2203,6 +2186,10 @@ parse_rewrite_answer :: proc(
 	if host, _, split_ok := netx.split_port(trimmed); split_ok && host != trimmed && netx.parse_address(host) != nil {
 		why := "an address with a port, and an answer has no port" if netx.has_port(trimmed) else "an address in brackets; write it without them"
 		errorf(l, "%s: %q is %s", path, trimmed, why)
+		return {}, false
+	}
+	if netx.is_numeric_name(trimmed) {
+		errorf(l, "%s: %q is no IPv4 address, which has four parts, nor a name, which does not end in a number", path, trimmed)
 		return {}, false
 	}
 	name := rdata_name(l, trimmed, path, "an answer") or_return
@@ -3069,7 +3056,7 @@ HOST_RULE :: "must be visible ASCII with no userinfo, path, query or fragment"
 url_is_valid :: proc(url: string) -> bool {
 	_, host, _, _, _ := net.split_url(url, context.temp_allocator)
 	host_only, _, split_ok := netx.split_port(host)
-	return h2.target_is_valid(url) && h2.authority_is_valid(host) && split_ok && is_host(host_only)
+	return h2.target_is_valid(url) && h2.authority_is_valid(host) && split_ok && netx.is_host(host_only)
 }
 
 // A list url goes into a request line and `Host` the same way.

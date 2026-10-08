@@ -1641,6 +1641,14 @@ test_an_address_or_port_out_of_shape_is_a_config_error :: proc(t: ^testing.T) {
 		UP + "rewrites:\n  - domain: example.com\n    answers: \"A 1.2.3.4:80\"\n",
 		UP + "rewrites:\n  - domain: example.com\n    answers: \"1.2.3.4:80\"\n",
 		UP + "server:\n  allow_from: [\"10.0.0.1:53\"]\n",
+		// A short IPv4 form: `core:net` reads `192.168.1` as 192.168.0.1, so this
+		// would allow another network.
+		UP + "server:\n  allow_from: [\"192.168.1/24\"]\n",
+		UP + "listeners:\n  udp: { enabled: true, address: \"10.20.30\" }\n",
+		"upstream:\n  servers:\n    - { address: 10.20.30 }\n  bootstrap: [9.9.9.9]\n",
+		"upstream:\n  servers: [1.1.1.1]\n  bootstrap: [\"10.20.30\"]\n",
+		UP + "rewrites:\n  - domain: example.com\n    answers: \"10.20.30\"\n",
+		UP + "rewrites:\n  - domain: example.com\n    answers: \"A 10.20.30\"\n",
 		// A port on the certificate name: an SNI and a name check no server passes.
 		"upstream:\n  servers:\n    - { address: 1.1.1.1, hostname: \"dns.example:853\", type: tls }\n",
 		"upstream:\n  servers: [\"tls://1.1.1.1#dns.example:853\"]\n",
