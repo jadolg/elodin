@@ -334,3 +334,32 @@ test_nsec_a_delegation_or_dname_speaks_for_nothing_below_it :: proc(t: ^testing.
 	testing.expect_value(t, nsec_proves_name_error(zone[:1], "foo.cut.example."), Proof.Proven)
 	free_all(context.temp_allocator)
 }
+
+@(test)
+test_nsec_an_empty_non_terminal_has_no_data :: proc(t: ^testing.T) {
+	/*
+	An empty non-terminal has no NSEC of its own: the span covering it points
+	at the descendant it exists for, and that is the whole NODATA proof. The
+	wildcard under it answers for names below it, never for the name itself,
+	so its MX denies nothing about `ent.example.` and has no say here.
+	*/
+	zone := []Nsec_Rr {
+		nsec_rr("example.", "*.ent.example.", {.NS, .SOA, .RRSIG, .NSEC, .DNSKEY}),
+		nsec_rr("*.ent.example.", "example.", {.MX, .RRSIG, .NSEC}),
+	}
+	testing.expect_value(t, nsec_proves_no_data(zone, "ent.example.", .A), Proof.Proven)
+	testing.expect_value(t, nsec_proves_no_data(zone, "ent.example.", .MX), Proof.Proven)
+	testing.expect_value(t, nsec_proves_no_data(zone, "ent.example.", .DS), Proof.Proven)
+	// A span that runs past the name is no node, so the wildcard decides.
+	testing.expect_value(t, nsec_proves_no_data(zone, "foo.ent.example.", .MX), Proof.Failed)
+	testing.expect_value(t, nsec_proves_no_data(zone, "foo.ent.example.", .A), Proof.Proven)
+
+	// And with no wildcard to fall back on, the span is the proof on its own.
+	bare := []Nsec_Rr {
+		nsec_rr("example.", "a.ent.example.", {.NS, .SOA, .RRSIG, .NSEC, .DNSKEY}),
+		nsec_rr("a.ent.example.", "example.", {.A, .RRSIG, .NSEC}),
+	}
+	testing.expect_value(t, nsec_proves_no_data(bare, "ent.example.", .A), Proof.Proven)
+	testing.expect_value(t, nsec_proves_no_data(bare, "nx.example.", .A), Proof.Failed)
+	free_all(context.temp_allocator)
+}

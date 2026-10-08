@@ -128,10 +128,22 @@ nsec_speaks_for :: proc(n: Nsec_Rr, name: string) -> bool {
 	if !name_in_zone(name, n.owner) || dns.name_equal_fold(name, n.owner) {
 		return true
 	}
-	if bitmap_has(n.rr.types, .DNAME) {
+	return types_enclose(n.rr.types)
+}
+
+/*
+May a record with these types deny names below its owner? RFC 6840 section 4.1:
+not when it is the parent's own at a cut (NS set, SOA clear), nor when it holds
+a DNAME, which redirects everything below its owner. `nsec_speaks_for` asks it
+of an NSEC span, and the NSEC3 denials of the closest encloser's record.
+Unbound refuses both in `nsec3_prove_closest_encloser`.
+*/
+@(private)
+types_enclose :: proc(types: []u8) -> bool {
+	if bitmap_has(types, .DNAME) {
 		return false
 	}
-	return !bitmap_has(n.rr.types, .NS) || bitmap_has(n.rr.types, .SOA)
+	return !bitmap_has(types, .NS) || bitmap_has(types, .SOA)
 }
 
 @(private)
@@ -254,6 +266,12 @@ nsec_proves_no_data :: proc(
 	covering, found := nsec_covering(nsecs, qname)
 	if !found || !nsec_speaks_for(covering, qname) {
 		return .Failed
+	}
+	// An empty non-terminal: the span's next name is under `qname`, so the name
+	// exists and holds nothing (see `nsec_shows_node`). Read before the
+	// wildcard, which never answers for its own parent.
+	if name_in_zone(covering.rr.next, qname) && !dns.name_equal_fold(covering.rr.next, qname) {
+		return .Proven
 	}
 	from_owner := common_ancestor(qname, covering.owner)
 	from_next := common_ancestor(qname, covering.rr.next)
