@@ -2,7 +2,6 @@ package server
 
 import "core:fmt"
 import "core:mem"
-import "core:net"
 import "core:slice"
 import "core:sync"
 import "core:time"
@@ -12,6 +11,7 @@ import "elodin:dns"
 import "elodin:dnssec"
 import "elodin:filter"
 import "elodin:logx"
+import "elodin:netx"
 import "elodin:pool"
 import "elodin:upstream"
 
@@ -4503,7 +4503,7 @@ log_query :: proc(
 	label it cannot read goes through whole under `client` with `port=0`: an
 	address this server could not take apart is still the address it saw.
 	*/
-	host, port, split_ok := net.split_port(client)
+	host, port, split_ok := netx.split_port(client)
 	if !split_ok {
 		host, port = client, 0
 	}

@@ -1592,3 +1592,120 @@ test_the_connection_table_must_be_at_least_one :: proc(t: ^testing.T) {
 	}
 	free_all(context.temp_allocator)
 }
+
+/*
+A stray bracket, a port that is not 0 to 65535 in digits, or a port where only an
+address goes is a config error on its line, not a value read some other way or
+dropped. Every source of an address or a port is here.
+*/
+@(test)
+test_an_address_or_port_out_of_shape_is_a_config_error :: proc(t: ^testing.T) {
+	UP :: "upstream:\n  servers: [1.1.1.1]\n"
+	SOURCES := []string {
+		"upstream:\n  servers: [\"]:53\"]\n",
+		"upstream:\n  servers: [\"tls://]:853#dns.example\"]\n",
+		"upstream:\n  servers: [\"a]:]:53\"]\n",
+		"upstream:\n  servers: [\"1.1.1.1:-1\"]\n",
+		"upstream:\n  servers: [\"1.1.1.1:5_3\"]\n",
+		"upstream:\n  servers: [\"1.1.1.1:9223372036854775861\"]\n",
+		"upstream:\n  servers: [\"1.1.1.1:18446744073709551669\"]\n",
+		"upstream:\n  servers:\n    - { address: 1.1.1.1, port: -7 }\n",
+		"upstream:\n  servers:\n    - { address: 1.1.1.1, port: 65536 }\n",
+		"upstream:\n  servers: [1.1.1.1]\n  bootstrap: [\"]:53\"]\n",
+		"upstream:\n  servers: [1.1.1.1]\n  bootstrap: [\"a]:]:53\"]\n",
+		"upstream:\n  servers: [1.1.1.1]\n  bootstrap: [dns.example]\n",
+		"upstream:\n  servers:\n    - { address: 1.1.1.1, bootstrap: [\"]:53\"] }\n",
+		UP + "  zones:\n    - domains: [corp.example]\n      servers: [10.0.0.1]\n      bootstrap: [\"]:53\"]\n",
+		UP + "rewrites:\n  - domain: example.com\n    answers: \"A ]:1.2.3.4\"\n",
+		UP + "rewrites:\n  - domain: example.com\n    answers: \"AAAA ]::1\"\n",
+		UP + "metrics:\n  enabled: true\n  address: \"]:\"\n",
+		UP + "listeners:\n  udp: { port: -1 }\n",
+		// A port in an address field: read through `core:net`, it is dropped
+		// for the default one with nothing said.
+		"upstream:\n  servers:\n    - { address: \"1.1.1.1:5353\" }\n",
+		"upstream:\n  servers:\n    - { address: \"dns.example:853\", type: tls }\n",
+		"upstream:\n  servers:\n    - { url: \"https://dns.google/dns-query\", address: \"8.8.8.8:5353\" }\n  bootstrap: [9.9.9.9]\n",
+		UP + "listeners:\n  udp: { enabled: true, address: \"127.0.0.1:5353\" }\n",
+		UP + "listeners:\n  udp: { enabled: true, address: \"]:\" }\n",
+		UP + "metrics:\n  enabled: true\n  address: \"127.0.0.1:9100\"\n",
+		UP + "rewrites:\n  - domain: example.com\n    answers: \"A 1.2.3.4:80\"\n",
+		UP + "rewrites:\n  - domain: example.com\n    answers: \"1.2.3.4:80\"\n",
+		UP + "server:\n  allow_from: [\"10.0.0.1:53\"]\n",
+		// A port on the certificate name: an SNI and a name check no server passes.
+		"upstream:\n  servers:\n    - { address: 1.1.1.1, hostname: \"dns.example:853\", type: tls }\n",
+		"upstream:\n  servers: [\"tls://1.1.1.1#dns.example:853\"]\n",
+		"upstream:\n  servers:\n    - { url: \"https://1.1.1.1/dns-query\", hostname: \"dns.example:443\" }\n",
+		// Two colons or a stray bracket: no IPv6 literal, and no name either.
+		"upstream:\n  servers:\n    - { address: 1.1.1.1, hostname: \"dns.example::853\", type: tls }\n",
+		"upstream:\n  servers:\n    - { address: \"dns.example:853:\", type: tls }\n  bootstrap: [9.9.9.9]\n",
+		"upstream:\n  servers:\n    - { address: \"[::1]x\", type: tls }\n  bootstrap: [9.9.9.9]\n",
+		"upstream:\n  servers:\n    - { url: \"https://dns.example:853:/dns-query\" }\n  bootstrap: [9.9.9.9]\n",
+		"upstream:\n  servers: [\"tls://1.1.1.1#dns.example:853:\"]\n",
+		"upstream:\n  servers: [\"tls://dns.example:853:\"]\n  bootstrap: [9.9.9.9]\n",
+		"upstream:\n  servers: [\"https://dns.example:853:/dns-query\"]\n  bootstrap: [9.9.9.9]\n",
+	}
+	for src in SOURCES {
+		_, err := load_string(src, context.temp_allocator)
+		testing.expectf(t, err != nil, "%q was accepted", src)
+	}
+	_, ok := parse_prefix("]:53")
+	testing.expect(t, !ok, "nor is it a network")
+
+	// And says so: without its own check, the address is taken for a hostname
+	// and the error is about a certificate or a bootstrap resolver instead.
+	for src in ([]string {
+			"upstream:\n  servers:\n    - { address: \"1.1.1.1:5353\" }\n",
+			"upstream:\n  servers:\n    - { address: \"dns.example:853\", type: tls }\n",
+			"upstream:\n  servers:\n    - { url: \"https://dns.google/dns-query\", address: \"8.8.8.8:5353\" }\n  bootstrap: [9.9.9.9]\n",
+			UP + "listeners:\n  udp: { enabled: true, address: \"127.0.0.1:5353\" }\n",
+			UP + "metrics:\n  enabled: true\n  address: \"127.0.0.1:9100\"\n",
+		}) {
+		_, err := load_string(src, context.temp_allocator)
+		e, has := err.?
+		testing.expectf(t, has && strings.contains(e.messages[0], "a port goes in port:"), "%q: %v", src, err)
+	}
+	// A bracketed literal is told to drop the brackets, on each source.
+	for src in ([]string {
+			"upstream:\n  servers:\n    - { address: \"[2606:4700::1111]\" }\n",
+			UP + "listeners:\n  udp: { enabled: true, address: \"[::]\" }\n",
+			UP + "metrics:\n  enabled: true\n  address: \"[::1]\"\n",
+		}) {
+		_, err := load_string(src, context.temp_allocator)
+		e, has := err.?
+		testing.expectf(t, has && strings.contains(e.messages[0], "without brackets"), "%q: %v", src, err)
+	}
+
+	// And only when there is one: a bracketed literal has no port to move.
+	for src in ([]string {
+			"upstream:\n  servers:\n    - { address: \"[2606:4700::1111]\" }\n",
+			UP + "listeners:\n  udp: { enabled: true, address: \"[::]\" }\n",
+			UP + "rewrites:\n  - domain: example.com\n    answers: \"[::1]\"\n",
+		}) {
+		_, err := load_string(src, context.temp_allocator)
+		e, has := err.?
+		testing.expectf(t, has && !strings.contains(e.messages[0], "a port"), "%q: %v", src, err)
+	}
+
+	// A listener that does not bind is not held to an address it never uses.
+	_, lerr := load_string(UP + "listeners:\n  dot: { enabled: false, address: localhost }\n", context.temp_allocator)
+	testing.expectf(t, lerr == nil, "a disabled listener's address was checked: %v", lerr)
+
+	// And what they sit beside still loads.
+	_, err := load_string(
+		"upstream:\n  servers: [\"tls://1.1.1.1:853#one.one.one.one\", \"[2606:4700::1111]:53\"]\n  bootstrap: [\"9.9.9.9\", \"[2620:fe::fe]:53\"]\n",
+		context.temp_allocator,
+	)
+	testing.expectf(t, err == nil, "a well-formed config was refused: %v", err)
+
+	// A bracketed literal with no port is an address too, not a name that needs
+	// a bootstrap resolver.
+	for src in ([]string {
+			"upstream:\n  servers: [\"[2606:4700::1111]\"]\n",
+			"upstream:\n  servers: [\"https://[2606:4700::1111]/dns-query\"]\n",
+			"upstream:\n  servers: [1.1.1.1]\n  bootstrap: [\"[2620:fe::fe]\"]\n",
+		}) {
+		cfg, berr := load_string(src, context.temp_allocator)
+		testing.expectf(t, berr == nil && cfg.upstream.servers[0].address != "[2606:4700::1111]", "%q: %v", src, berr)
+	}
+	free_all(context.temp_allocator)
+}

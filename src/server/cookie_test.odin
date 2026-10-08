@@ -505,17 +505,16 @@ test_cookie_unbindable_address_is_kept_apart :: proc(t: ^testing.T) {
 	k := keeper("e5e973e5a6b2a43f48e7dc849e37bfcf")
 	sent := unhex("2464c4abcf10c957")
 
-	// A bracketed IPv6 address with no port is in here because `parse_endpoint`
-	// takes bare `::1` and refuses `[::1]`, so this is not only reachable
-	// through a listener that has lost its mind.
-	unbindable := []string{"", "not-an-address", "[::1]", "999.1.1.1", "/run/elodin.sock"}
+	// An unclosed bracket is in here so a bracketed form is: `[::1]` binds as
+	// `::1` does.
+	unbindable := []string{"", "not-an-address", "[::1", "999.1.1.1", "/run/elodin.sock"}
 	for client in unbindable {
 		req := inspect_cookie(&k, query_with_cookie(sent), client)
 		testing.expectf(t, req.verdict == .Unbindable, "%q gave verdict %v", client, req.verdict)
 	}
 
 	// A missing port is not a missing address, and only the host is hashed.
-	bindable := []string{"198.51.100.100", "::1", "198.51.100.100:9999", "[::1]:53"}
+	bindable := []string{"198.51.100.100", "::1", "198.51.100.100:9999", "[::1]:53", "[::1]"}
 	for client in bindable {
 		req := inspect_cookie(&k, query_with_cookie(sent), client)
 		testing.expectf(t, req.verdict == .Unproven, "%q gave verdict %v", client, req.verdict)

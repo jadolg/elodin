@@ -6,6 +6,7 @@ import "core:sync"
 import "core:time"
 import "elodin:dns"
 import "elodin:logx"
+import "elodin:netx"
 
 /*
 Hostname resolution that does not go through the system resolver.
@@ -53,7 +54,7 @@ bootstrap_resolve :: proc(
 	addr: net.Address,
 	ok: bool,
 ) {
-	if literal := net.parse_address(hostname); literal != nil {
+	if literal := netx.parse_address(hostname); literal != nil {
 		return literal, true
 	}
 
@@ -126,7 +127,7 @@ bootstrap_resolve :: proc(
 
 // Resolve a host that may already be an IP literal, for the HTTP fetcher.
 resolve_address :: proc(host: string, bootstrap: []string) -> (addr: net.Address, ok: bool) {
-	if literal := net.parse_address(host); literal != nil {
+	if literal := netx.parse_address(host); literal != nil {
 		return literal, true
 	}
 	if resolved, found := bootstrap_resolve(bootstrap, host); found {
@@ -134,7 +135,7 @@ resolve_address :: proc(host: string, bootstrap: []string) -> (addr: net.Address
 	}
 	// Nothing configured to bootstrap with: fall back to the system resolver,
 	// which is fine for a blocklist download once the server is already up.
-	ip4, ip6, err := net.resolve(host)
+	ip4, ip6, err := netx.resolve(host)
 	if err != nil {
 		return nil, false
 	}
@@ -157,18 +158,13 @@ bootstrap_query :: proc(
 	addr: net.Address,
 	ok: bool,
 ) {
-	host, port, split_ok := net.split_port(server)
-	if !split_ok {
-		return nil, false
-	}
-	server_addr := net.parse_address(host)
-	if server_addr == nil {
+	endpoint, parsed := netx.parse_endpoint(server)
+	if !parsed {
 		logx.warnf("bootstrap resolver %q is not an IP address", server)
 		return nil, false
 	}
-	endpoint := net.Endpoint {
-		address = server_addr,
-		port    = port if port != 0 else 53,
+	if endpoint.port == 0 {
+		endpoint.port = 53
 	}
 
 	name := dns.name_canonical(hostname, context.temp_allocator)
@@ -255,7 +251,7 @@ split_http_url :: proc(url: string) -> (scheme, host, path: string, port: int, h
 	if s != "http" && s != "https" {
 		return "", "", "", 0, "", false
 	}
-	name, explicit_port, split_ok := net.split_port(h)
+	name, explicit_port, split_ok := netx.split_port(h)
 	if !split_ok {
 		return "", "", "", 0, "", false
 	}

@@ -1,7 +1,7 @@
 package filter
 
-import "core:net"
 import "core:strings"
+import "elodin:netx"
 
 Format :: enum u8 {
 	Auto,
@@ -102,16 +102,15 @@ first_field_is_ip :: proc(line: string) -> bool {
 	}
 	// Parsed, not judged by its characters: judged so, any word with a colon
 	// passes for an IPv6 address, and a plain-text error page served as a hosts
-	// list (`Error: rate limited`) for a hosts line (#317). The parsers take a
-	// port (`1.2.3.4:80`, `[::1]:53`) and a short IPv4 form (`10.20.30`),
-	// neither of which is a hosts address, so IPv4 needs its four parts.
+	// list (`Error: rate limited`) for a hosts line (#317). `netx` refuses an
+	// address with a port (`1.2.3.4:80`, `[::1]:53`); the parser still takes a
+	// short IPv4 form (`10.20.30`), which is no hosts address, so IPv4 needs its
+	// four parts.
 	if strings.contains(field, ":") {
-		_, v6 := net.parse_ip6_address(field)
-		// Brackets anywhere, not just first: `split_port` drops the first
-		// byte of a field ending `]:port`, so `x::1]:53` parses as `::1`.
-		return v6 && !strings.contains_any(field, "[]")
+		_, v6 := netx.parse_ip6_address(field)
+		return v6
 	}
-	_, v4 := net.parse_ip4_address(field)
+	_, v4 := netx.parse_ip4_address(field)
 	return v4 && strings.count(field, ".") == 3
 }
 

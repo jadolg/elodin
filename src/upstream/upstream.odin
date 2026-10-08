@@ -9,6 +9,7 @@ import "elodin:config"
 import "elodin:dns"
 import "elodin:h2"
 import "elodin:logx"
+import "elodin:netx"
 import "elodin:tlsx"
 
 Error :: enum u8 {
@@ -258,7 +259,7 @@ resolve_endpoint :: proc(
 	// each has `BOOTSTRAP_TIMEOUT` of its own.
 	deadline := time.Tick{},
 ) -> bool {
-	if addr := net.parse_address(u.spec.address); addr != nil {
+	if addr := netx.parse_address(u.spec.address); addr != nil {
 		u.endpoint = net.Endpoint {
 			address = addr,
 			port    = u.spec.port,

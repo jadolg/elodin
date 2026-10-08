@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:net"
 import "core:strconv"
 import "core:strings"
+import "elodin:netx"
 
 /*
 Which sources may ask.
@@ -238,7 +239,7 @@ parse_prefix :: proc(text: string) -> (p: Prefix, ok: bool) {
 		has_length = true
 	}
 
-	address := net.parse_address(addr_text)
+	address := netx.parse_address(addr_text)
 	if address == nil {
 		return {}, false
 	}

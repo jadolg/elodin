@@ -20,6 +20,8 @@
 /itest
 /logx
 /main
+/metrics
+/netx
 /pool
 /privdrop
 /server

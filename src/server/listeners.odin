@@ -10,6 +10,7 @@ import "elodin:config"
 import "elodin:dns"
 import "elodin:logx"
 import "elodin:metrics"
+import "elodin:netx"
 import "elodin:pool"
 import "elodin:tlsx"
 
@@ -96,7 +97,7 @@ LISTENER_POLL :: time.Second
 
 @(private)
 parse_bind :: proc(address: string, port: int) -> (endpoint: net.Endpoint, ok: bool) {
-	addr := net.parse_address(address)
+	addr := netx.parse_address(address)
 	if addr == nil {
 		return {}, false
 	}

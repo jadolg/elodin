@@ -1,10 +1,12 @@
 package upstream
 
+import "core:fmt"
 import "core:mem"
 import "core:net"
 import "core:time"
 import "elodin:dns"
 import "elodin:h2"
+import "elodin:netx"
 import "elodin:tlsx"
 
 /*
@@ -97,7 +99,7 @@ exchange_doh_h2 :: proc(
 			h2.Client_Request {
 				method = "POST",
 				scheme = "https",
-				authority = u.spec.hostname,
+				authority = doh_authority(u.spec.hostname, u.spec.port),
 				path = u.spec.path,
 				content_type = "application/dns-message",
 				accept = "application/dns-message",
@@ -204,7 +206,7 @@ exchange_doh_h1 :: proc(
 			Http_Request {
 				method = "POST",
 				path = u.spec.path,
-				host = u.spec.hostname,
+				host = doh_authority(u.spec.hostname, u.spec.port),
 				body = body,
 				content_type = "application/dns-message",
 				accept = "application/dns-message",
@@ -455,4 +457,22 @@ address_is_public :: proc(addr: net.Address) -> bool {
 	}
 	// No address at all is not an address a redirect may name.
 	return false
+}
+
+/*
+RFC 3986 3.2.2: an IPv6 literal goes in brackets in the authority, or a server
+reading `host:port` takes `2606` for the host. The TLS name check takes it bare,
+so `spec.hostname` is kept without them. RFC 9110 7.2: the port goes with it
+unless it is https's own.
+*/
+@(private)
+doh_authority :: proc(hostname: string, port: int) -> string {
+	host := hostname
+	if _, is6 := netx.parse_ip6_address(hostname); is6 {
+		host = fmt.tprintf("[%s]", hostname)
+	}
+	if port == 443 || port == 0 {
+		return host
+	}
+	return fmt.tprintf("%s:%d", host, port)
 }

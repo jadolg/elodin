@@ -30,7 +30,8 @@ upstream:
 
 `bootstrap` resolves upstream hostnames. elodin does not use the system resolver
 for them, since on a machine where elodin *is* the system resolver that would
-loop back to a server that has not started yet.
+loop back to a server that has not started yet. Each entry is an IP address with
+an optional port (`9.9.9.9`, `[2620:fe::fe]:53`); a name there is a config error.
 
 ## Time budget
 
