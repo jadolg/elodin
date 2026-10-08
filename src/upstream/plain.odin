@@ -24,7 +24,8 @@ exchange_udp :: proc(
 	response: []u8,
 	err: Error,
 ) {
-	family := net.family_from_endpoint(u.endpoint)
+	endpoint := endpoint_of(u) or_return
+	family := net.family_from_endpoint(endpoint)
 	socket, serr := net.make_unbound_udp_socket(family)
 	if serr != nil {
 		return nil, .Dial_Failed
@@ -32,7 +33,7 @@ exchange_udp :: proc(
 	defer net.close(socket)
 	set_socket_timeouts(socket, timeout)
 
-	if _, send_err := net.send_udp(socket, query, u.endpoint); send_err != nil {
+	if _, send_err := net.send_udp(socket, query, endpoint); send_err != nil {
 		return nil, .IO_Error
 	}
 
@@ -88,7 +89,7 @@ exchange_udp :: proc(
 			continue
 		}
 		// Ignore anything that did not come from the server we asked.
-		if remote.port != u.endpoint.port || !addresses_equal(remote.address, u.endpoint.address) {
+		if remote.port != endpoint.port || !addresses_equal(remote.address, endpoint.address) {
 			continue
 		}
 		// A forged datagram is passed over rather than reported: the genuine

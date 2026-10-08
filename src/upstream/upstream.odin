@@ -251,6 +251,12 @@ An IP literal is used as-is. A hostname is resolved through the configured
 bootstrap resolvers rather than the system resolver, because on a machine where
 elodin *is* the system resolver, asking it to resolve its own upstream would
 deadlock at boot.
+
+A name that did not resolve at startup is resolved by whichever queries reach
+it first, several at once while others are dialling, so the endpoint is
+published once: written under `mu` by the first lookup to succeed, then
+`resolved` is set with release ordering, and the endpoint is never written
+again. A lookup that fails leaves alone whatever another thread published.
 */
 @(private)
 resolve_endpoint :: proc(
@@ -259,28 +265,40 @@ resolve_endpoint :: proc(
 	// each has `BOOTSTRAP_TIMEOUT` of its own.
 	deadline := time.Tick{},
 ) -> bool {
-	if addr := netx.parse_address(u.spec.address); addr != nil {
+	addr := netx.parse_address(u.spec.address)
+	if addr == nil {
+		ok: bool
+		addr, ok = bootstrap_resolve(u.spec.bootstrap, u.spec.address, deadline)
+		if !ok {
+			logx.warnf("upstream %s: cannot resolve %q via bootstrap resolvers", u.spec.name, u.spec.address)
+			return sync.atomic_load_explicit(&u.resolved, .Acquire)
+		}
+		logx.debugf("upstream %s: resolved %s to %s", u.spec.name, u.spec.address, net.address_to_string(addr, context.temp_allocator))
+	}
+	sync.mutex_lock(&u.mu)
+	defer sync.mutex_unlock(&u.mu)
+	if !sync.atomic_load_explicit(&u.resolved, .Relaxed) {
 		u.endpoint = net.Endpoint {
 			address = addr,
 			port    = u.spec.port,
 		}
-		u.resolved = true
-		return true
+		sync.atomic_store_explicit(&u.resolved, true, .Release)
 	}
-
-	addr, ok := bootstrap_resolve(u.spec.bootstrap, u.spec.address, deadline)
-	if !ok {
-		logx.warnf("upstream %s: cannot resolve %q via bootstrap resolvers", u.spec.name, u.spec.address)
-		u.resolved = false
-		return false
-	}
-	u.endpoint = net.Endpoint {
-		address = addr,
-		port    = u.spec.port,
-	}
-	u.resolved = true
-	logx.debugf("upstream %s: resolved %s to %s", u.spec.name, u.spec.address, net.address_to_string(addr, context.temp_allocator))
 	return true
+}
+
+/*
+The address to dial, or `Not_Resolved` while there is none yet. Read without a
+lock: the endpoint is written once, before `resolved` is released (see
+`resolve_endpoint`). A copy, so one exchange sends to and checks replies against
+the same address.
+*/
+@(private)
+endpoint_of :: proc(u: ^Upstream) -> (endpoint: net.Endpoint, err: Error) {
+	if !sync.atomic_load_explicit(&u.resolved, .Acquire) {
+		return {}, .Not_Resolved
+	}
+	return u.endpoint, .None
 }
 
 healthy :: proc(u: ^Upstream) -> bool {
@@ -601,7 +619,8 @@ take several, and every bound above - a group's budget, a question's
 	for as long as the bootstrap stayed down (issue #327). With no bootstrap
 servers to ask the refusal costs nothing, and is left unrecorded.
 	*/
-	resolving := !u.resolved
+	_, unresolved := endpoint_of(u)
+	resolving := unresolved != .None
 	if resolving && !resolve_endpoint(u, deadline) {
 		if len(u.spec.bootstrap) > 0 {
 			record_failure(u, .Not_Resolved)
