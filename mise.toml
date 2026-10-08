@@ -91,6 +91,9 @@ run = [
       --include='*.odin' --exclude='*_test.odin' --exclude-dir=netx --exclude-dir=itest --exclude-dir=fuzz; then
     echo 'parse addresses with elodin:netx, not core:net' >&2
     exit 1
+  elif [ $? -gt 1 ]; then
+    echo 'the core:net gate could not search src' >&2
+    exit 1
   fi
   """,
 ]

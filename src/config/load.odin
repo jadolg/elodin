@@ -2182,9 +2182,9 @@ parse_rewrite_answer :: proc(
 		return v6_rewrite_answer(v), true
 	}
 	// Not a name either, though a colon is legal in one: an answer has no port,
-	// and an address in one goes without brackets.
-	if host, _, split_ok := netx.split_port(trimmed); split_ok && host != trimmed && netx.parse_address(host) != nil {
-		why := "an address with a port, and an answer has no port" if netx.has_port(trimmed) else "an address in brackets; write it without them"
+	// after an address or a name, and an address in one goes without brackets.
+	if host, _, split_ok := netx.split_port(trimmed); split_ok && host != trimmed && (netx.parse_address(host) != nil || netx.has_port(trimmed)) {
+		why := "a host with a port, and an answer has no port" if netx.has_port(trimmed) else "an address in brackets; write it without them"
 		errorf(l, "%s: %q is %s", path, trimmed, why)
 		return {}, false
 	}
@@ -3044,7 +3044,7 @@ config's making in each one, and a space or a byte outside ASCII a request line
 the upstream reads some other way (#438).
 */
 @(private)
-UPSTREAM_URL_RULE :: "the url and hostname of an https upstream must be visible ASCII, the host with no userinfo, path, query or fragment and any port 0 to 65535 in digits"
+UPSTREAM_URL_RULE :: "the url and hostname of an https upstream must be visible ASCII, the host present, with no userinfo, path, query or fragment and any port 0 to 65535 in digits"
 
 // `h2.authority_is_valid`, which an upstream's address and hostname are held to.
 @(private)
@@ -3056,9 +3056,9 @@ HOST_RULE :: "must be visible ASCII with no userinfo, path, query or fragment"
 url_is_valid :: proc(url: string) -> bool {
 	_, host, _, _, _ := net.split_url(url, context.temp_allocator)
 	host_only, _, split_ok := netx.split_port(host)
-	return h2.target_is_valid(url) && h2.authority_is_valid(host) && split_ok && netx.is_host(host_only)
+	return h2.target_is_valid(url) && h2.authority_is_valid(host) && split_ok && host_only != "" && netx.is_host(host_only)
 }
 
 // A list url goes into a request line and `Host` the same way.
 @(private)
-LIST_URL_RULE :: "a list url must be visible ASCII, its host with no userinfo and any port 0 to 65535 in digits"
+LIST_URL_RULE :: "a list url must be visible ASCII, its host present, with no userinfo and any port 0 to 65535 in digits"

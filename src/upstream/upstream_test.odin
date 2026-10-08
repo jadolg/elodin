@@ -3616,7 +3616,7 @@ test_a_zero_socket_timeout_is_still_no_timeout :: proc(t: ^testing.T) {
 // is refused, not looked up.
 @(test)
 test_a_stray_bracket_in_a_url_is_refused :: proc(t: ^testing.T) {
-	for url in ([]string{"http://]:80/", "http://a]:]:80/", "https://[]:]:443/", "http://dns.example::80/"}) {
+	for url in ([]string{"http://]:80/", "http://a]:]:80/", "https://[]:]:443/", "http://dns.example::80/", "http:///list"}) {
 		_, _, _, _, _, ok := split_http_url(url)
 		testing.expectf(t, !ok, "%q was split", url)
 	}

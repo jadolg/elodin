@@ -252,9 +252,9 @@ split_http_url :: proc(url: string) -> (scheme, host, path: string, port: int, h
 		return "", "", "", 0, "", false
 	}
 	// Held to a host alone as the list url was at load: a redirect to
-	// `http://dns.example::80/` is no name to look up.
+	// `http://dns.example::80/` is no name to look up, nor is `http:///`.
 	name, explicit_port, split_ok := netx.split_port(h)
-	if !split_ok || !netx.is_host(name) {
+	if !split_ok || name == "" || !netx.is_host(name) {
 		return "", "", "", 0, "", false
 	}
 	resolved_port := explicit_port

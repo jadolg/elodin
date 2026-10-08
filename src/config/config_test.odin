@@ -1332,6 +1332,7 @@ test_upstream_urls_outside_visible_ascii_are_errors :: proc(t: ^testing.T) {
 				"\"https://lists.example:5_3/hosts.txt\"",
 				"\"https://[1.1.1.1]/hosts.txt\"",
 				"\"https://[lists.example:443/hosts.txt\"",
+				"\"https:///hosts.txt\"",
 			}) {
 			refused_for(t, fmt.tprintf(form, url), LIST_URL_RULE)
 		}
@@ -1640,6 +1641,7 @@ test_an_address_or_port_out_of_shape_is_a_config_error :: proc(t: ^testing.T) {
 		UP + "metrics:\n  enabled: true\n  address: \"127.0.0.1:9100\"\n",
 		UP + "rewrites:\n  - domain: example.com\n    answers: \"A 1.2.3.4:80\"\n",
 		UP + "rewrites:\n  - domain: example.com\n    answers: \"1.2.3.4:80\"\n",
+		UP + "rewrites:\n  - domain: example.com\n    answers: \"dns.example:53\"\n",
 		UP + "server:\n  allow_from: [\"10.0.0.1:53\"]\n",
 		// A short IPv4 form: `core:net` reads `192.168.1` as 192.168.0.1, so this
 		// would allow another network.
@@ -1661,6 +1663,9 @@ test_an_address_or_port_out_of_shape_is_a_config_error :: proc(t: ^testing.T) {
 		"upstream:\n  servers: [\"tls://1.1.1.1#dns.example:853:\"]\n",
 		"upstream:\n  servers: [\"tls://dns.example:853:\"]\n  bootstrap: [9.9.9.9]\n",
 		"upstream:\n  servers: [\"https://dns.example:853:/dns-query\"]\n  bootstrap: [9.9.9.9]\n",
+		// No host at all: with verify off, nothing else asks for one.
+		"upstream:\n  servers:\n    - { url: \"https:///dns-query\", verify: false }\n  bootstrap: [9.9.9.9]\n",
+		"upstream:\n  servers: [\"https:///dns-query\"]\n  bootstrap: [9.9.9.9]\n",
 	}
 	for src in SOURCES {
 		_, err := load_string(src, context.temp_allocator)
