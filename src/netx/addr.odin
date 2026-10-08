@@ -60,6 +60,7 @@ An address alone. `core:net`'s parsers take an optional port and drop it, so
 nothing said; here it is not an address, and the caller says why. A port is
 read by `split_port` and `parse_endpoint`.
 */
+@(private)
 is_bare :: proc(s: string) -> bool {
 	host, _, ok := split_port(s)
 	return ok && host == s

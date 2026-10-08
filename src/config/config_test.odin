@@ -1677,6 +1677,10 @@ test_an_address_or_port_out_of_shape_is_a_config_error :: proc(t: ^testing.T) {
 		UP + "rewrites:\n  - domain: example.com\n    answers: \"CNAME dns.example:53\"\n",
 		UP + "rewrites:\n  - domain: example.com\n    answers: \"MX 10 mail.example:25\"\n",
 		UP + "rewrites:\n  - domain: example.com\n    answers: \"CNAME 10.20.30\"\n",
+		// An address where a name goes, either family.
+		UP + "rewrites:\n  - domain: example.com\n    answers: \"CNAME 2001:db8::1\"\n",
+		UP + "rewrites:\n  - domain: example.com\n    answers: \"MX 10 ::1\"\n",
+		UP + "rewrites:\n  - domain: example.com\n    answers: \"SRV 1 1 53 192.0.2.1\"\n",
 	}
 	for src in SOURCES {
 		_, err := load_string(src, context.temp_allocator)
@@ -1697,6 +1701,18 @@ test_an_address_or_port_out_of_shape_is_a_config_error :: proc(t: ^testing.T) {
 		_, err := load_string(src, context.temp_allocator)
 		e, has := err.?
 		testing.expectf(t, has && strings.contains(e.messages[0], "a port goes in port:"), "%q: %v", src, err)
+	}
+	// On https the authority's port is the url's, so that is where a hostname's goes.
+	{
+		_, err := load_string("upstream:\n  servers:\n    - { url: \"https://1.1.1.1/dns-query\", hostname: \"dns.example:8443\" }\n", context.temp_allocator)
+		e, has := err.?
+		testing.expectf(t, has && strings.contains(e.messages[0], "a port goes in the url"), "%v", err)
+	}
+	// An address where a name goes is called one.
+	{
+		_, err := load_string(UP + "rewrites:\n  - domain: example.com\n    answers: \"CNAME 1.2.3.4\"\n", context.temp_allocator)
+		e, has := err.?
+		testing.expectf(t, has && strings.contains(e.messages[0], "is an address"), "%v", err)
 	}
 	// A bracketed literal is told to drop the brackets, on each source.
 	for src in ([]string {

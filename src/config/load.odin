@@ -1361,7 +1361,12 @@ load_upstream_spec :: proc(
 	}
 	// The certificate name and SNI: a port there is a name no certificate has.
 	if spec.hostname != "" && !netx.is_host(spec.hostname) {
-		errorf(l, "%s.hostname: %q is not a name alone%s", path, spec.hostname, address_hint(spec.hostname))
+		hint := address_hint(spec.hostname)
+		// On https, `port:` is only where to dial; the authority's port is the url's.
+		if spec.kind == .HTTPS && netx.has_port(spec.hostname) {
+			hint = "; a port goes in the url"
+		}
+		errorf(l, "%s.hostname: %q is not a name alone%s", path, spec.hostname, hint)
 		return {}, false
 	}
 
@@ -2398,8 +2403,13 @@ rdata_name :: proc(l: ^Loader, text, path, type: string) -> (name: string, ok: b
 		errorf(l, "%s: %s needs one host name, got %q", path, type, text)
 		return "", false
 	}
-	// A host, though a colon or a bracket is legal in a name: a port, brackets
-	// or an all-digit last label make it an address or an endpoint mistyped.
+	// A host, though a colon or a bracket is legal in a name: an address, a
+	// port, brackets or an all-digit last label make it an address or an
+	// endpoint mistyped. The short form never gets here with an address.
+	if netx.parse_address(trimmed) != nil {
+		errorf(l, "%s: %s host %q is an address, and a %s points at a name", path, type, trimmed, type)
+		return "", false
+	}
 	if netx.has_port(trimmed) {
 		errorf(l, "%s: %s host %q has a port, and a host has none", path, type, trimmed)
 		return "", false
@@ -2409,7 +2419,7 @@ rdata_name :: proc(l: ^Loader, text, path, type: string) -> (name: string, ok: b
 		return "", false
 	}
 	if netx.is_numeric_name(trimmed) {
-		errorf(l, "%s: %s host %q is no IPv4 address, which has four parts, nor a name, which does not end in a number", path, type, trimmed)
+		errorf(l, "%s: %s host %q ends in a number, so it is no name, and it is no IPv4 address either", path, type, trimmed)
 		return "", false
 	}
 	canonical := canonical_domain(trimmed, l.allocator)
