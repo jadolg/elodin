@@ -1196,3 +1196,45 @@ test_a_single_name_rdata_is_bounded_by_its_rdlength :: proc(t: ^testing.T) {
 	}
 	free_all(context.temp_allocator)
 }
+
+/*
+A record whose RDATA ends part way through a compression pointer is kept raw,
+the decoder's standing posture for RDATA that does not add up (see
+`test_raw_rdata_that_cannot_be_walked_is_kept`), and the writer refuses it, the
+honest degradation `test_encode_refuses_a_modelled_type_holding_a_pointer`
+gives. What it must not do is finish the pointer with the next record's first
+byte. The name types reach this through #299's bound; MX always did.
+*/
+@(test)
+test_rdata_cut_off_inside_a_pointer_is_kept_and_not_written :: proc(t: ^testing.T) {
+	cases := []struct {
+		type:  Type,
+		rdata: []u8,
+	}{
+		{.CNAME, {1, 'a', 0xc0}},
+		{.NS, {1, 'a', 0xc0}},
+		{.MX, {0x00, 0x0a, 1, 'a', 0xc0}},
+	}
+	for c in cases {
+		m := make([dynamic]u8, context.temp_allocator)
+		append(&m, 0x12, 0x34, 0x80, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00)
+		append(&m, 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0, 0x00, 0x01, 0x00, 0x01)
+		append(&m, 0xc0, 0x0c, u8(u16(c.type) >> 8), u8(c.type), 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, u8(len(c.rdata)))
+		append(&m, ..c.rdata)
+		// The pointer's second byte is the next record's first: the length of
+		// its owner's twelve-byte label, so a pointer to offset 12, the question.
+		append(&m, 12, 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 0)
+		append(&m, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 192, 0, 2, 1)
+
+		msg, derr := decode_message(m[:], context.temp_allocator)
+		if !testing.expectf(t, derr == .None && len(msg.answer) == 2, "%v: %v", c.type, derr) {
+			continue
+		}
+		raw, is_raw := msg.answer[0].data.(Rdata_Raw)
+		testing.expectf(t, is_raw && mem.compare(raw.data, c.rdata) == 0, "%v cut off inside a pointer decoded as %v", c.type, msg.answer[0].data)
+		testing.expect_value(t, msg.answer[1].name, "abcdefghijkl.")
+		_, _, eerr := encode_message(msg, context.temp_allocator)
+		testing.expectf(t, eerr == .Bad_Rdata, "%v kept raw with its pointer: encoded with %v", c.type, eerr)
+	}
+	free_all(context.temp_allocator)
+}
