@@ -151,6 +151,22 @@ test_first_field_is_ip_needs_a_field_and_an_address :: proc(t: ^testing.T) {
 	testing.expect(t, !first_field_is_ip("x::1]:53 ads.example"), "nor with a bracket further in")
 	testing.expect(t, !first_field_is_ip("999.1.1.1 ads.example"), "an octet past 255 is not an address")
 	testing.expect(t, first_field_is_ip("::ffff:192.0.2.1 ads.example"), "a mapped address is one")
+	testing.expect(t, !first_field_is_ip("]: ads.example"), "nor is a stray bracket")
+}
+
+/*
+`core:net`'s `split_port` slices from after a `[` it does not check for before
+dev-2026-10, so a list line beginning `]:` panics there. This is the fuzzer's
+input: whatever a list host serves reaches the address parser.
+*/
+@(test)
+test_a_list_line_beginning_with_a_bracket_does_not_panic :: proc(t: ^testing.T) {
+	text := "\x00f\n]:\t\xeb@\xf1/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb{99\\[/\np\n1}/"
+	for format in Format {
+		block, allow := parsed(text, format)
+		set_destroy(block)
+		set_destroy(allow)
+	}
 }
 
 @(test)
