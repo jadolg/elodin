@@ -119,13 +119,19 @@ belongs with the proof rather than with the walk.
 
 Names beside the cut rather than under it are still the parent's to deny, which
 is why this asks where the name sits rather than refusing the record outright.
+
+The same section says it of DNAME: everything under the owner is redirected, so
+the record cannot deny any subdomain of it.
 */
 @(private)
 nsec_speaks_for :: proc(n: Nsec_Rr, name: string) -> bool {
-	if !bitmap_has(n.rr.types, .NS) || bitmap_has(n.rr.types, .SOA) {
+	if !name_in_zone(name, n.owner) || dns.name_equal_fold(name, n.owner) {
 		return true
 	}
-	return !name_in_zone(name, n.owner) || dns.name_equal_fold(name, n.owner)
+	if bitmap_has(n.rr.types, .DNAME) {
+		return false
+	}
+	return !bitmap_has(n.rr.types, .NS) || bitmap_has(n.rr.types, .SOA)
 }
 
 @(private)
@@ -246,7 +252,7 @@ nsec_proves_no_data :: proc(
 	}
 
 	covering, found := nsec_covering(nsecs, qname)
-	if !found {
+	if !found || !nsec_speaks_for(covering, qname) {
 		return .Failed
 	}
 	from_owner := common_ancestor(qname, covering.owner)

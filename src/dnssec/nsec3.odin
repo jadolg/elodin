@@ -503,8 +503,8 @@ nsec3_closest_encloser :: proc(
 ) -> (
 	encloser, next_closer: string,
 	// The record that matched the encloser. Handed back rather than left to be
-	// hashed for a second time: `nsec3_proves_name_error` has to read its bit
-	// map, and the other callers must not - an opt-out proof rests on a
+	// hashed for a second time: the denial proofs have to read its bit map,
+	// and `nsec3_proves_no_ds` must not - an opt-out proof rests on a
 	// delegation record being the encloser, which is the whole mechanism.
 	match: Nsec3_Rr,
 	ok: bool,
@@ -529,6 +529,20 @@ nsec3_closest_encloser :: proc(
 	}
 }
 
+/*
+May the record matching a closest encloser deny names under it? RFC 6840 section
+4.1: not when it is the parent's own at a cut (NS set, SOA clear), nor when it
+holds a DNAME, which redirects everything below its owner. `nsec_speaks_for` is
+the NSEC side. Unbound refuses both in `nsec3_prove_closest_encloser`.
+*/
+@(private)
+nsec3_encloses :: proc(match: Nsec3_Rr) -> bool {
+	if bitmap_has(match.rr.types, .DNAME) {
+		return false
+	}
+	return !bitmap_has(match.rr.types, .NS) || bitmap_has(match.rr.types, .SOA)
+}
+
 // RFC 5155 section 8.4.
 nsec3_proves_name_error :: proc(
 	n3s: []Nsec3_Rr,
@@ -547,15 +561,15 @@ nsec3_proves_name_error :: proc(
 	parent does not answer for names inside the child - so it encloses none of
 	them, and a proof built on it would deny every name in the child against
 	the parent's keys. The same statement `nsec_speaks_for` makes on the NSEC
-	side.
+	side, and `nsec3_encloses` makes it of DNAME too.
 
 	Here rather than in `nsec3_closest_encloser`, and that distinction is the
 	whole of it: an opt-out proof reaches the same routine and *must* take a
 	delegation as the encloser, because declining to speak for what is under an
-	unsigned delegation is exactly what opt-out is. This is the one caller that
-	claims a name is absent.
+	unsigned delegation is exactly what opt-out is. This and
+	`nsec3_proves_no_data` are the callers that claim something is absent.
 	*/
-	if bitmap_has(match.rr.types, .NS) && !bitmap_has(match.rr.types, .SOA) {
+	if !nsec3_encloses(match) {
 		return .Failed
 	}
 	cover, covered := nsec3_covering(n3s, next_closer, budget)
@@ -574,7 +588,7 @@ nsec3_proves_name_error :: proc(
 	return .Proven
 }
 
-// RFC 5155 sections 8.5 and 8.6.
+// RFC 5155 sections 8.5 to 8.7.
 nsec3_proves_no_data :: proc(
 	n3s: []Nsec3_Rr,
 	qname, zone: string,
@@ -588,8 +602,8 @@ nsec3_proves_no_data :: proc(
 
 	// No record on the name itself: a wildcard must be what answered, and it
 	// must be missing the type too.
-	encloser, next_closer, _, ok := nsec3_closest_encloser(n3s, qname, zone, budget)
-	if !ok {
+	encloser, next_closer, encloser_match, ok := nsec3_closest_encloser(n3s, qname, zone, budget)
+	if !ok || !nsec3_encloses(encloser_match) {
 		return .Failed
 	}
 	cover, covered := nsec3_covering(n3s, next_closer, budget)

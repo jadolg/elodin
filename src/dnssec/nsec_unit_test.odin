@@ -310,3 +310,27 @@ test_nsec_wildcard_no_data_reads_the_wildcard_as_the_name :: proc(t: ^testing.T)
 	testing.expect_value(t, nsec_proves_no_data(zone, "foo.example.", .DS), Proof.Failed)
 	free_all(context.temp_allocator)
 }
+
+@(test)
+test_nsec_a_delegation_or_dname_speaks_for_nothing_below_it :: proc(t: ^testing.T) {
+	/*
+	RFC 6840 section 4.1: a span whose owner is the parent's side of a cut, or
+	holds a DNAME, swallows names it may not deny. The wildcard NODATA reads
+	the covering record as much as the name error does.
+	*/
+	for types in ([][]dns.Type{{.NS, .RRSIG, .NSEC}, {.DNAME, .RRSIG, .NSEC}}) {
+		zone := []Nsec_Rr {
+			nsec_rr("cut.example.", "z.example.", types),
+			nsec_rr("*.cut.example.", "a.cut.example.", {.MX, .RRSIG, .NSEC}),
+		}
+		testing.expect_value(t, nsec_proves_no_data(zone, "foo.cut.example.", .A), Proof.Failed)
+		testing.expect_value(t, nsec_proves_name_error(zone, "foo.cut.example."), Proof.Failed)
+	}
+	zone := []Nsec_Rr {
+		nsec_rr("cut.example.", "z.example.", {.A, .RRSIG, .NSEC}),
+		nsec_rr("*.cut.example.", "a.cut.example.", {.MX, .RRSIG, .NSEC}),
+	}
+	testing.expect_value(t, nsec_proves_no_data(zone, "foo.cut.example.", .A), Proof.Proven)
+	testing.expect_value(t, nsec_proves_name_error(zone[:1], "foo.cut.example."), Proof.Proven)
+	free_all(context.temp_allocator)
+}
