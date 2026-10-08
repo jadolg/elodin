@@ -1713,6 +1713,15 @@ test_an_address_or_port_out_of_shape_is_a_config_error :: proc(t: ^testing.T) {
 	_, lerr := load_string(UP + "listeners:\n  dot: { enabled: false, address: localhost }\n", context.temp_allocator)
 	testing.expectf(t, lerr == nil, "a disabled listener's address was checked: %v", lerr)
 
+	// A file list has no url to hold to the url's rule, in either spelling.
+	for src in ([]string {
+			UP + "blocking:\n  lists: [/etc/elodin/ads.txt]\n",
+			UP + "blocking:\n  lists:\n    - { file: /etc/elodin/ads.txt }\n",
+		}) {
+		cfg, ferr := load_string(src, context.temp_allocator)
+		testing.expectf(t, ferr == nil && len(cfg.blocking.lists) == 1, "a file list was refused: %q: %v", src, ferr)
+	}
+
 	// And what they sit beside still loads.
 	_, err := load_string(
 		"upstream:\n  servers: [\"tls://1.1.1.1:853#one.one.one.one\", \"[2606:4700::1111]:53\"]\n  bootstrap: [\"9.9.9.9\", \"[2620:fe::fe]:53\"]\n",
