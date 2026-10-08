@@ -8,6 +8,7 @@ import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:logx"
+import "elodin:netx"
 
 /*
 DNS cookies, on the side facing the clients (RFC 7873, RFC 9018).
@@ -367,7 +368,7 @@ it is not worth doing for tidiness.
 */
 @(private)
 cookie_client_ip :: proc(client: string, out: []u8) -> (n: int, ok: bool) {
-	endpoint := net.parse_endpoint(client) or_return
+	endpoint := netx.parse_endpoint(client) or_return
 	switch addr in endpoint.address {
 	case net.IP4_Address:
 		bytes := addr

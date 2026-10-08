@@ -1044,3 +1044,15 @@ test_the_handshake_keeps_its_floor_under_a_short_client_timeout :: proc(t: ^test
 		)
 	}
 }
+
+// A listener address is the operator's, and is parsed at bind time; one with a
+// stray bracket is a bind failure.
+@(test)
+test_parse_bind_refuses_a_stray_bracket :: proc(t: ^testing.T) {
+	for address in ([]string{"]:", "]:53", "a]:]:53"}) {
+		_, ok := parse_bind(address, 53)
+		testing.expect(t, !ok, address)
+	}
+	ep, ok := parse_bind("::1", 53)
+	testing.expect(t, ok && ep.port == 53, "an IPv6 address binds")
+}

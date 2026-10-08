@@ -5,6 +5,7 @@ import "core:net"
 import "core:strings"
 import "core:sys/posix"
 import "core:time"
+import "elodin:netx"
 
 /*
 Signing a blob of bytes with the certificate a server context already serves.
@@ -158,7 +159,7 @@ signer_covers_host :: proc(s: Signer, host: string) -> bool {
 	if !signer_present(s) || host == "" {
 		return false
 	}
-	if net.parse_address(host) != nil {
+	if netx.parse_address(host) != nil {
 		return X509_check_ip_asc(s.cert, strings.clone_to_cstring(host, context.temp_allocator), 0) == 1
 	}
 	// Passed with an explicit length, so an embedded NUL cannot truncate the
@@ -252,7 +253,7 @@ split_host_port :: proc(authority: string) -> (host: string, port: string) {
 			return authority, ""
 		}
 		inner := authority[1:end]
-		if _, is_v6 := net.parse_address(inner).(net.IP6_Address); !is_v6 {
+		if _, is_v6 := netx.parse_address(inner).(net.IP6_Address); !is_v6 {
 			return authority, ""
 		}
 		switch rest := authority[end + 1:]; {

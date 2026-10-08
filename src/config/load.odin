@@ -9,6 +9,7 @@ import "core:time"
 import "elodin:dns"
 import "elodin:dnssec"
 import "elodin:h2"
+import "elodin:netx"
 import "elodin:yaml"
 
 Load_Error :: struct {
@@ -629,6 +630,39 @@ load_allow_from :: proc(l: ^Loader, n: ^yaml.Node, cfg: ^Config) {
 	cfg.server.allow_from = out[:kept]
 }
 
+/*
+A bootstrap list: each entry an IP address with an optional port, which is all
+`bootstrap_query` can ask. A name there is a resolver it would need a resolver
+to find.
+*/
+@(private)
+load_bootstrap :: proc(l: ^Loader, b: ^yaml.Node, path: string) -> []string {
+	list, ok := yaml.as_string_list(b, l.allocator)
+	if !ok {
+		errorf(l, "%s: expected a list of addresses", path)
+		return nil
+	}
+	for entry in list {
+		if _, entry_ok := netx.parse_endpoint(entry); !entry_ok {
+			errorf(l, "%s: %q is not an IP address", path, entry)
+		}
+	}
+	return list
+}
+
+// What to add to an address refused for not standing alone: where its port
+// goes, or that a literal goes without its brackets.
+@(private)
+address_hint :: proc(s: string) -> string {
+	if netx.has_port(s) {
+		return "; a port goes in port:"
+	}
+	if _, _, ok := netx.split_port(s); ok && strings.has_prefix(s, "[") {
+		return "; write it without brackets"
+	}
+	return ""
+}
+
 @(private)
 load_listener :: proc(l: ^Loader, parent: ^yaml.Node, key: string, dst: ^Listener, needs_tls: bool) {
 	n := yaml.get(parent, key)
@@ -649,6 +683,13 @@ load_listener :: proc(l: ^Loader, parent: ^yaml.Node, key: string, dst: ^Listene
 	opt_bool(l, n, "enabled", &dst.enabled, path)
 	opt_string(l, n, "address", &dst.address, path)
 	opt_int(l, n, "port", &dst.port, path)
+	// Only one that binds, as its certificate is only checked then.
+	if dst.enabled && netx.parse_address(dst.address) == nil {
+		errorf(l, "%s.address: %q is not an IP address%s", path, dst.address, address_hint(dst.address))
+	}
+	if dst.port < 0 || dst.port > 65535 {
+		errorf(l, "%s.port: must be between 0 and 65535", path)
+	}
 	if needs_tls {
 		opt_string(l, n, "cert_file", &dst.cert_file, path)
 		opt_string(l, n, "key_file", &dst.key_file, path)
@@ -725,11 +766,7 @@ load_upstream :: proc(l: ^Loader, cfg: ^Config) {
 	opt_duration(l, n, "idle_timeout", &cfg.upstream.idle_timeout, "upstream")
 
 	if b := yaml.get(n, "bootstrap"); !yaml.is_null(b) {
-		if list, ok := yaml.as_string_list(b, l.allocator); ok {
-			cfg.upstream.bootstrap = list
-		} else {
-			errorf(l, "upstream.bootstrap: expected a list of addresses")
-		}
+		cfg.upstream.bootstrap = load_bootstrap(l, b, "upstream.bootstrap")
 	}
 
 	// As in `load_block_lists`: `items` answers nil for one server written
@@ -839,11 +876,7 @@ load_upstream_zones :: proc(l: ^Loader, cfg: ^Config, n: ^yaml.Node) {
 		opt_int(l, entry, "max_idle", &route.upstream.max_idle, path)
 		opt_duration(l, entry, "idle_timeout", &route.upstream.idle_timeout, path)
 		if b := yaml.get(entry, "bootstrap"); !yaml.is_null(b) {
-			if list, ok := yaml.as_string_list(b, l.allocator); ok {
-				route.upstream.bootstrap = list
-			} else {
-				errorf(l, "%s.bootstrap: expected a list of addresses", path)
-			}
+			route.upstream.bootstrap = load_bootstrap(l, b, fmt.tprintf("%s.bootstrap", path))
 		}
 
 		route.domains = load_route_domains(l, entry, path, i, &claimed)
@@ -1239,13 +1272,14 @@ load_upstream_spec :: proc(
 	opt_string(l, n, "hostname", &spec.hostname, path)
 	opt_string(l, n, "url", &spec.url, path)
 	opt_int(l, n, "port", &spec.port, path)
+	// 0 is the scheme's default, filled in below.
+	if spec.port < 0 || spec.port > 65535 {
+		errorf(l, "%s.port: must be between 1 and 65535, or 0 for the default", path)
+		return {}, false
+	}
 	opt_bool(l, n, "verify", &spec.verify, path)
 	if b := yaml.get(n, "bootstrap"); !yaml.is_null(b) {
-		if list, lok := yaml.as_string_list(b, l.allocator); lok {
-			spec.bootstrap = list
-		} else {
-			errorf(l, "%s.bootstrap: expected a list of addresses", path)
-		}
+		spec.bootstrap = load_bootstrap(l, b, fmt.tprintf("%s.bootstrap", path))
 	}
 
 	kind_str, has_kind := yaml.as_string(yaml.get(n, "type"))
@@ -1275,6 +1309,12 @@ load_upstream_spec :: proc(
 		errorf(l, "%s.address: %s", path, HOST_RULE)
 		return {}, false
 	}
+	// On every kind: a port written into the address would be dropped for the
+	// default one, or, on https, the address taken for a name to look up.
+	if spec.address != "" && !netx.is_host(spec.address) {
+		errorf(l, "%s.address: %q is not an address or a name alone%s", path, spec.address, address_hint(spec.address))
+		return {}, false
+	}
 	if spec.kind == .HTTPS {
 		if spec.url == "" {
 			errorf(l, "%s: an https upstream needs a url", path)
@@ -1289,11 +1329,8 @@ load_upstream_spec :: proc(
 			errorf(l, "%s.url: expected an https:// url", path)
 			return {}, false
 		}
-		host_only, url_port, split_ok := net.split_port(host)
-		if !split_ok {
-			errorf(l, "%s.url: cannot parse host %q", path, host)
-			return {}, false
-		}
+		// `url_is_valid` has split it.
+		host_only, url_port, _ := netx.split_port(host)
 		if spec.hostname == "" {
 			spec.hostname = host_only
 		}
@@ -1318,9 +1355,19 @@ load_upstream_spec :: proc(
 		if spec.port == 0 {
 			spec.port = 853 if spec.kind == .TLS else 53
 		}
-		if spec.hostname == "" && net.parse_address(spec.address) == nil {
+		if spec.hostname == "" && netx.parse_address(spec.address) == nil {
 			spec.hostname = spec.address
 		}
+	}
+	// The certificate name and SNI: a port there is a name no certificate has.
+	if spec.hostname != "" && !netx.is_host(spec.hostname) {
+		hint := address_hint(spec.hostname)
+		// On https, `port:` is only where to dial; the authority's port is the url's.
+		if spec.kind == .HTTPS && netx.has_port(spec.hostname) {
+			hint = "; a port goes in the url"
+		}
+		errorf(l, "%s.hostname: %q is not a name alone%s", path, spec.hostname, hint)
+		return {}, false
 	}
 
 	if !check_verify_has_a_name(l, spec, path) {
@@ -1386,11 +1433,8 @@ parse_upstream_shorthand :: proc(
 		}
 		scheme, host, url_path, _, _ := net.split_url(s, l.allocator)
 		_ = scheme
-		host_only, url_port, split_ok := net.split_port(host)
-		if !split_ok {
-			errorf(l, "%s: cannot parse %q", path, raw)
-			return {}, false
-		}
+		// `url_is_valid` has split it.
+		host_only, url_port, _ := netx.split_port(host)
 		spec.address = host_only
 		spec.hostname = host_only
 		spec.port = url_port if url_port != 0 else 443
@@ -1418,17 +1462,17 @@ parse_upstream_shorthand :: proc(
 		s = s[:idx]
 	}
 
-	host, port, split_ok := net.split_port(s)
+	host, port, split_ok := netx.split_port(s)
 	// A host each, as the map spelling's `address:` and `hostname:` are: an NBSP
 	// after `#name`, say, is a certificate name no server has, and is refused
-	// rather than trimmed away.
-	if !split_ok || !h2.authority_is_valid(s) || !h2.authority_is_valid(spec.hostname) {
+	// rather than trimmed away; so is a port after it.
+	if !split_ok || !h2.authority_is_valid(s) || !netx.is_host(host) || !h2.authority_is_valid(spec.hostname) || (spec.hostname != "" && !netx.is_host(spec.hostname)) {
 		errorf(l, "%s: cannot parse %q", path, raw)
 		return {}, false
 	}
 	spec.address = host
 	spec.port = port if port != 0 else (853 if spec.kind == .TLS else 53)
-	if spec.hostname == "" && net.parse_address(host) == nil {
+	if spec.hostname == "" && netx.parse_address(host) == nil {
 		spec.hostname = host
 	}
 	if !check_verify_has_a_name(l, spec, path) {
@@ -1511,7 +1555,7 @@ load_cache :: proc(l: ^Loader, cfg: ^Config) {
 
 @(private)
 parse_v4 :: proc(l: ^Loader, s: string, path: string, dst: ^[4]u8) {
-	addr := net.parse_address(s)
+	addr := netx.parse_address(s)
 	if v4, is_v4 := addr.(net.IP4_Address); is_v4 {
 		dst^ = cast([4]u8)v4
 		return
@@ -1521,7 +1565,7 @@ parse_v4 :: proc(l: ^Loader, s: string, path: string, dst: ^[4]u8) {
 
 @(private)
 parse_v6 :: proc(l: ^Loader, s: string, path: string, dst: ^[16]u8) {
-	addr := net.parse_address(s)
+	addr := netx.parse_address(s)
 	if v6, is_v6 := addr.(net.IP6_Address); is_v6 {
 		for group, i in v6 {
 			v := u16(group)
@@ -1597,7 +1641,7 @@ load_block_lists :: proc(l: ^Loader, n: ^yaml.Node, path: string) -> []Block_Lis
 			errorf(l, "%s: needs either a url or a file", item_path)
 			continue
 		}
-		if !url_is_valid(bl.url) {
+		if bl.url != "" && !url_is_valid(bl.url) {
 			errorf(l, "%s.url: %s", item_path, LIST_URL_RULE)
 			continue
 		}
@@ -2076,7 +2120,7 @@ parse_rewrite_answer :: proc(
 	if typed {
 		switch {
 		case strings.equal_fold(head, "a"):
-			addr, is4 := net.parse_address(rest).(net.IP4_Address)
+			addr, is4 := netx.parse_address(rest).(net.IP4_Address)
 			if !is4 {
 				errorf(l, "%s: A needs an IPv4 address, got %q", path, rest)
 				return {}, false
@@ -2084,7 +2128,7 @@ parse_rewrite_answer :: proc(
 			return Rewrite_Answer{kind = .A, v4 = cast([4]u8)addr}, true
 
 		case strings.equal_fold(head, "aaaa"):
-			addr, is6 := net.parse_address(rest).(net.IP6_Address)
+			addr, is6 := netx.parse_address(rest).(net.IP6_Address)
 			if !is6 {
 				errorf(l, "%s: AAAA needs an IPv6 address, got %q", path, rest)
 				return {}, false
@@ -2136,7 +2180,7 @@ parse_rewrite_answer :: proc(
 
 	// The short form, unchanged: an address is what it looks like, and anything
 	// else is a name to point at.
-	switch v in net.parse_address(trimmed) {
+	switch v in netx.parse_address(trimmed) {
 	case net.IP4_Address:
 		return Rewrite_Answer{kind = .A, v4 = cast([4]u8)v}, true
 	case net.IP6_Address:
@@ -2359,6 +2403,25 @@ rdata_name :: proc(l: ^Loader, text, path, type: string) -> (name: string, ok: b
 		errorf(l, "%s: %s needs one host name, got %q", path, type, text)
 		return "", false
 	}
+	// A host, though a colon or a bracket is legal in a name: an address, a
+	// port, brackets or an all-digit last label make it an address or an
+	// endpoint mistyped. The short form never gets here with an address.
+	if netx.parse_address(trimmed) != nil {
+		errorf(l, "%s: %s host %q is an address, and a %s points at a name", path, type, trimmed, type)
+		return "", false
+	}
+	if netx.has_port(trimmed) {
+		errorf(l, "%s: %s host %q has a port, and a host has none", path, type, trimmed)
+		return "", false
+	}
+	if strings.contains_any(trimmed, "[]") {
+		errorf(l, "%s: %s host %q has brackets; an address goes without them", path, type, trimmed)
+		return "", false
+	}
+	if netx.is_numeric_name(trimmed) {
+		errorf(l, "%s: %s host %q ends in a number, so it is no name, and it is no IPv4 address either", path, type, trimmed)
+		return "", false
+	}
 	canonical := canonical_domain(trimmed, l.allocator)
 	if !name_fits_the_wire(l, canonical, fmt.tprintf("%s: %s host %q", path, type, trimmed)) {
 		return "", false
@@ -2537,14 +2600,14 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 		if cfg.metrics.port < 1 || cfg.metrics.port > 65535 {
 			errorf(l, "metrics.port: must be between 1 and 65535")
 		}
-		if net.parse_address(cfg.metrics.address) == nil {
-			errorf(l, "metrics.address: %q is not an IP address", cfg.metrics.address)
+		if netx.parse_address(cfg.metrics.address) == nil {
+			errorf(l, "metrics.address: %q is not an IP address%s", cfg.metrics.address, address_hint(cfg.metrics.address))
 		}
 	}
 
 	check_bootstrap :: proc(l: ^Loader, specs: []Upstream_Spec) {
 		for spec in specs {
-			needs_resolution := spec.hostname != "" && net.parse_address(spec.address) == nil
+			needs_resolution := spec.hostname != "" && netx.parse_address(spec.address) == nil
 			if needs_resolution && len(spec.bootstrap) == 0 {
 				errorf(
 					l,
@@ -2994,19 +3057,21 @@ config's making in each one, and a space or a byte outside ASCII a request line
 the upstream reads some other way (#438).
 */
 @(private)
-UPSTREAM_URL_RULE :: "the url and hostname of an https upstream must be visible ASCII, the host with no userinfo, path, query or fragment"
+UPSTREAM_URL_RULE :: "the url and hostname of an https upstream must be visible ASCII, the host present, with no userinfo, path, query or fragment and any port 0 to 65535 in digits"
 
 // `h2.authority_is_valid`, which an upstream's address and hostname are held to.
 @(private)
 HOST_RULE :: "must be visible ASCII with no userinfo, path, query or fragment"
 
-// A url is a target, and its host is the `Host` and `:authority` it is sent with.
+// A url is a target, and its host is the `Host` and `:authority` it is sent with,
+// and what the fetcher splits with `netx.split_port` before every download.
 @(private)
 url_is_valid :: proc(url: string) -> bool {
 	_, host, _, _, _ := net.split_url(url, context.temp_allocator)
-	return h2.target_is_valid(url) && h2.authority_is_valid(host)
+	host_only, _, split_ok := netx.split_port(host)
+	return h2.target_is_valid(url) && h2.authority_is_valid(host) && split_ok && netx.is_host(host_only)
 }
 
 // A list url goes into a request line and `Host` the same way.
 @(private)
-LIST_URL_RULE :: "a list url must be visible ASCII, its host with no userinfo"
+LIST_URL_RULE :: "a list url must be visible ASCII, its host present, with no userinfo and any port 0 to 65535 in digits"

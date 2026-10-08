@@ -78,9 +78,25 @@ description = "Build a .deb from the optimised binary (dist/)"
 depends = ["release"]
 run = "packaging/build-deb.sh"
 
+# core:net's address parsers take signed and wrapping ports, drop a port from an
+# address, and take a name in brackets (see src/netx), so every address elodin
+# parses goes through netx; only the tests and the harnesses that format their
+# own may call core:net's directly.
 [tasks.check]
 description = "Type-check every package without emitting a binary"
-run = "odin check src/main -collection:elodin=src -vet -strict-style"
+run = [
+  "odin check src/main -collection:elodin=src -vet -strict-style",
+  """
+  if grep -rnE '\\bnet\\.(split_port|aton|parse_address|parse_ip4_address|parse_ip6_address|parse_endpoint|parse_hostname_or_endpoint|resolve|resolve_ip4|resolve_ip6|join_port|dial_tcp|dial_tcp_from_hostname[a-z_]*|parse_hosts|parse_resolv_conf)\\(' src \\
+      --include='*.odin' --exclude='*_test.odin' --exclude-dir=netx --exclude-dir=itest --exclude-dir=fuzz; then
+    echo 'parse addresses with elodin:netx, not core:net' >&2
+    exit 1
+  elif [ $? -gt 1 ]; then
+    echo 'the core:net gate could not search src' >&2
+    exit 1
+  fi
+  """,
+]
 
 # Odin has no -fsanitize=fuzzer of its own, so coverage instrumentation has to
 # be added on the IR rather than by the Odin driver: `odin build` emits LLVM IR
@@ -147,6 +163,7 @@ run = [
   "odin test src/yaml     -collection:elodin=src -out:bin/test_yaml -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
   "odin test src/config   -collection:elodin=src -out:bin/test_config -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
   "odin test src/filter   -collection:elodin=src -out:bin/test_filter -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
+  "odin test src/netx     -collection:elodin=src -out:bin/test_netx -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
   "odin test src/logx     -collection:elodin=src -out:bin/test_logx -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
   "odin test src/metrics  -collection:elodin=src -out:bin/test_metrics -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
   "odin test src/privdrop -collection:elodin=src -out:bin/test_privdrop -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",

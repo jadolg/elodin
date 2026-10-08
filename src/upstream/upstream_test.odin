@@ -3611,3 +3611,27 @@ test_a_zero_socket_timeout_is_still_no_timeout :: proc(t: ^testing.T) {
 	n, rerr := net.recv_tcp(socket, buf[:])
 	testing.expectf(t, rerr == nil && n == 1, "a read with no timeout gave %d bytes, %v", n, rerr)
 }
+
+// A redirect's Location is the list host's to write: a host with a stray bracket
+// is refused, not looked up.
+@(test)
+test_a_stray_bracket_in_a_url_is_refused :: proc(t: ^testing.T) {
+	for url in ([]string{"http://]:80/", "http://a]:]:80/", "https://[]:]:443/", "http://dns.example::80/", "http:///list"}) {
+		_, _, _, _, _, ok := split_http_url(url)
+		testing.expectf(t, !ok, "%q was split", url)
+	}
+	_, _, _, port, host, ok := split_http_url("https://[::1]:8443/list")
+	testing.expect(t, ok && host == "::1" && port == 8443, "a bracketed literal still splits")
+	_, _, _, port, host, ok = split_http_url("https://[::1]/list")
+	testing.expect(t, ok && host == "::1" && port == 443, "and one with no port")
+}
+
+// The authority brackets an IPv6 literal; the TLS name check is given it bare.
+@(test)
+test_a_doh_authority_brackets_an_ipv6_literal :: proc(t: ^testing.T) {
+	testing.expect(t, doh_authority("2606:4700::1111", "https://[2606:4700::1111]/dns-query") == "[2606:4700::1111]", "an IPv6 literal")
+	testing.expect(t, doh_authority("1.1.1.1", "https://1.1.1.1:443/dns-query") == "1.1.1.1" && doh_authority("dns.example", "https://dns.example/dns-query") == "dns.example", "others as written")
+	// And names a port that is not https's own, as the url does.
+	testing.expect(t, doh_authority("dns.example", "https://dns.example:8443/dns-query") == "dns.example:8443", "a name and its port")
+	testing.expect(t, doh_authority("2606:4700::1111", "https://[2606:4700::1111]:8443/dns-query") == "[2606:4700::1111]:8443", "a literal and its port")
+}
