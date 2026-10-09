@@ -2215,12 +2215,9 @@ validate_denial :: proc(
 	unsigned delegation would end the walk as insecure before the parent's
 	proof that it is unsigned was read, and a signed one would make the child
 	the only zone whose records could be checked - the one zone with no say.
-	The root has no parent, and keeps its own.
+	The root has no parent, and keeps its own. See `zone_holding`.
 	*/
-	zone_of := qname
-	if qtype == .DS && qname != "." && qname != "" {
-		zone_of = dns.name_parent(qname)
-	}
+	zone_of := zone_holding(qname, qtype)
 	status, keys, established := zone_trust(v, budget, zone_of, now, allocator)
 	#partial switch status {
 	case .Insecure:
@@ -2462,7 +2459,7 @@ validate_rrset :: proc(
 	walked := make([dynamic]Walked, 0, 4, allocator)
 
 	for sig in sigs {
-		if !signer_holds(owner, sig.type_covered, sig.signer) {
+		if !signer_holds(owner, type, sig.signer) {
 			continue
 		}
 		/*
@@ -2571,7 +2568,7 @@ validate_rrset :: proc(
 	/*
 	Nothing verified. Whether that means forged or merely unsigned is a question
 	about the zone the name lives in, not about the signatures that arrived with
-	it, so it is settled by walking down to the name itself.
+	it, so it is settled by walking down to the zone that holds the set.
 	*/
 	/*
 	Our own allowance running out is not evidence about the zone.
@@ -2592,13 +2589,17 @@ validate_rrset :: proc(
 	}
 
 	missing := "signature missing" if len(sigs) == 0 else "no valid signature"
-	owner_status, _, owner_zone := zone_trust(v, budget, owner, now, allocator)
+	// The zone holding the set, which for a DS is the parent: walking to the
+	// owner would stop at the parent's proof that an unsigned delegation has no
+	// DS, and serve a forged DS set there as merely insecure.
+	holder := zone_holding(owner, type)
+	owner_status, _, owner_zone := zone_trust(v, budget, holder, now, allocator)
 	// The walk held up and stopped above the owner, and nothing here verified:
 	// one reason is a delegation at a name the table still calls no cut, which
 	// for an *unsigned* one leaves this the only verdict that can notice. The
 	// denial and wildcard paths do the same; see `forget_unreached_non_cut`.
 	if owner_status == .Secure {
-		forget_unreached_non_cut(v, owner, owner_zone)
+		forget_unreached_non_cut(v, holder, owner_zone)
 	}
 	switch owner_status {
 	case .Insecure:
@@ -2674,6 +2675,16 @@ validate_rrset :: proc(
 }
 
 /*
+The name whose zone holds an RRset of `type` at `name`: the name itself, except
+for a DS, which lives in the parent (RFC 4035 section 5.3.1). The root has no
+parent and `dns.name_parent` keeps it at the root.
+*/
+@(private)
+zone_holding :: proc(name: string, type: dns.Type) -> string {
+	return dns.name_parent(name) if type == .DS else name
+}
+
+/*
 Whether `signer` is the zone that may hold an RRset of `type` at `owner`.
 
 A zone may only sign what is inside it. Without this a zone could vouch for
@@ -2716,7 +2727,13 @@ check_signature :: proc(
 	if !signature_current(sig, unix) {
 		return .Bad, ""
 	}
-	if !signer_holds(owner, sig.type_covered, sig.signer) {
+	// RFC 4035 section 5.3.1: the RRSIG's Type Covered must equal the RRset's
+	// type. Callers filter by type already; read here off the records, so the
+	// DS signer rule below never rests on a field the sender wrote.
+	if len(records) == 0 || sig.type_covered != records[0].type {
+		return .Bad, ""
+	}
+	if !signer_holds(owner, records[0].type, sig.signer) {
 		return .Bad, ""
 	}
 	/*

@@ -152,7 +152,7 @@ def signing_owner(owner, labels):
     return "*." + ".".join(parts[len(parts) - labels:]) + "."
 
 
-def sign(rrset, key, signer=None, labels=None):
+def sign(rrset, key, signer=None, labels=None, covered=None):
     """Build an RRSIG over `rrset`, which is one owner name and one type."""
     # The validity window and the TTLs come from the module constants: no scenario
     # has needed to vary them, and a signature outside the window is a case the
@@ -160,10 +160,12 @@ def sign(rrset, key, signer=None, labels=None):
     #
     # `signer` and `labels` default to the truthful values and are overridable
     # because two tests need a signature that is internally consistent with an
-    # untruthful one - see `check_signature_test.odin`.
+    # untruthful one - see `check_signature_test.odin`. `covered` signs the
+    # set's RDATA as if it were that type, which is what its key holder can
+    # make of any RDATA it likes.
     signer = signer if signer is not None else key.zone
     owner = rrset[0].name
-    rtype = rrset[0].type
+    rtype = covered if covered is not None else rrset[0].type
     if labels is None:
         labels = signed_label_count(owner)
     prefix = (
@@ -765,6 +767,12 @@ def ds_denial_from_child_apex():
     fabricated = Key("dstest.", "fabricated")
     self_ds = [RR("dstest.", DS, fabricated.ds())]
     emit("da_self_ds", "dstest.", "DS", message("dstest.", DS, self_ds + [sign(self_ds, child)]))
+    # The same RDATA signed by `dstest.` as an A set at its own apex. Nothing
+    # that filters by type lets it near `check_signature`, so the test calls it
+    # directly: the arithmetic holds over the DS set, and only the type check
+    # refuses it.
+    emit("da_self_ds_covers_a", "dstest.", "DS",
+         message("dstest.", DS, self_ds + [sign(self_ds, child, covered=A)]))
 
 
 @scenario

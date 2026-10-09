@@ -184,6 +184,14 @@ DA_FIXTURES := []Fixture{
 			"a8a6c576c9cb36588a8199e40a12f4f1c517f008",
 	},
 	{
+		key   = "da_unsigned_forged_ds",
+		name  = "unsigned.",
+		type  = .DS,
+		rcode = 0,
+		wire  = "12348580000100010000000008756e7369676e656400002b000108756e7369676e656400002b000100000e10002404d2" +
+			"0f02abababababababababababababababababababababababababababababababab",
+	},
+	{
 		key   = "da_self_ds",
 		name  = "dstest.",
 		type  = .DS,
@@ -192,6 +200,16 @@ DA_FIXTURES := []Fixture{
 			"24faee5876e7a569b61787ae3da9d4a1d4b6bbad678e42e148fe2bc4e8f50664737465737400002e000100000e10005a" +
 			"002b0f0100000e107d3b18206a47882039360664737465737400df97fcb1faae28eb30db1c4f99620e32ef9712f1a895" +
 			"70d775e2d151bfb1ee2a4e1510362031e4f852e206ffd758beac6afe155204e6e02a077a840a0042a804",
+	},
+	{
+		key   = "da_self_ds_covers_a",
+		name  = "dstest.",
+		type  = .DS,
+		rcode = 0,
+		wire  = "1234858000010002000000000664737465737400002b00010664737465737400002b000100000e10002444250f024a41" +
+			"24faee5876e7a569b61787ae3da9d4a1d4b6bbad678e42e148fe2bc4e8f50664737465737400002e000100000e10005a" +
+			"00010f0100000e107d3b18206a47882039360664737465737400a59a3752ac58c21860b6a18138f3e39898dd4a3f1f4d" +
+			"d6b33420cb95d88f203df68f5a4765c3d4eb61a312c149acd992c97a19a650fc6fb73ecdb48ef8ed7204",
 	},
 }
 
@@ -421,7 +439,13 @@ like for their own zone under this server's AD bit.
 @(test)
 test_a_ds_set_signed_by_the_child_itself_is_bogus :: proc(t: ^testing.T) {
 	result := da_validate("da_self_ds", "dstest.")
-	testing.expectf(t, result.status == .Bogus, "got %v (%q)", result.status, result.reason)
+	testing.expectf(
+		t,
+		result.status == .Bogus && result.reason == "no valid signature",
+		"got %v (%q)",
+		result.status,
+		result.reason,
+	)
 	free_all(context.temp_allocator)
 }
 
@@ -430,5 +454,58 @@ test_a_ds_set_signed_by_the_child_itself_is_bogus :: proc(t: ^testing.T) {
 test_a_ds_set_signed_by_the_parent_is_secure :: proc(t: ^testing.T) {
 	result := da_validate("da_ds", "dstest.")
 	testing.expectf(t, result.status == .Secure, "got %v (%q)", result.status, result.reason)
+	free_all(context.temp_allocator)
+}
+
+/*
+A DS set at `unsigned.` with no signature at all. The root holds that DS and is
+signed, so an unsigned DS set there is a forgery. Settled against the owner
+instead, the walk stops at the root's proof that `unsigned.` has no DS and calls
+the set insecure.
+*/
+@(test)
+test_an_unsigned_ds_set_under_a_signed_parent_is_bogus :: proc(t: ^testing.T) {
+	result := da_validate("da_unsigned_forged_ds", "unsigned.")
+	testing.expectf(
+		t,
+		result.status == .Bogus && result.reason == "signature missing",
+		"got %v (%q)",
+		result.status,
+		result.reason,
+	)
+	free_all(context.temp_allocator)
+}
+
+/*
+`check_signature` reads the DS signer rule off the records, not off the Type
+Covered the sender wrote (RFC 4035 section 5.3.1 has the two agree). This is a
+real signature by `dstest.` over its own DS RDATA, made as an A set at its apex:
+read off the signature, the set is no DS and the child may sign it.
+*/
+@(test)
+test_check_signature_reads_the_type_off_the_records :: proc(t: ^testing.T) {
+	msg, err := dns.decode_message(da_reply("da_self_ds_covers_a"), context.temp_allocator)
+	testing.expect(t, err == .None, "the fixture should decode")
+	keys_msg, kerr := dns.decode_message(da_reply("da_dnskey"), context.temp_allocator)
+	testing.expect(t, kerr == .None, "the key fixture should decode")
+
+	records := records_of(msg.answer, "dstest.", .DS, .IN, context.temp_allocator)
+	sigs := sigs_covering(msg.answer, "dstest.", .A, .IN, context.temp_allocator)
+	keys := make([dynamic]Dnskey, 0, 1, context.temp_allocator)
+	for rec in records_of(keys_msg.answer, "dstest.", .DNSKEY, .IN, context.temp_allocator) {
+		rdata, _ := raw_rdata(rec)
+		key, perr := parse_dnskey(rdata)
+		if perr == .None {
+			append(&keys, key)
+		}
+	}
+	testing.expect_value(t, len(records), 1)
+	testing.expect_value(t, len(sigs), 1)
+	testing.expect_value(t, len(keys), 1)
+	if len(records) != 1 || len(sigs) != 1 || len(keys) != 1 {
+		return
+	}
+	result, _ := check_signature(sigs[0], "dstest.", .IN, records, keys[:], u32(FIXTURE_TIME), context.temp_allocator)
+	testing.expect_value(t, result, Verify_Result.Bad)
 	free_all(context.temp_allocator)
 }
