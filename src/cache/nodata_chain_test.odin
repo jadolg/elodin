@@ -107,6 +107,10 @@ test_a_bare_cname_without_a_soa_is_not_cached :: proc(t: ^testing.T) {
 	testing.expectf(t, !kept, "a bare CNAME with no SOA was held for %v", held)
 	held, kept = held_for(c, {qtype = .AAAA, cname_ttl = 86400, dname = true})
 	testing.expectf(t, !kept, "a bare DNAME chain with no SOA was held for %v", held)
+	// Asked for the DNAME type: the one above the name is the redirection, not
+	// the answer (see `answers_the_question`).
+	held, kept = held_for(c, {qtype = .DNAME, cname_ttl = 86400, dname = true})
+	testing.expectf(t, !kept, "a DNAME question answered by the DNAME above it was held for %v", held)
 	free_all(context.temp_allocator)
 }
 

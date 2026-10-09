@@ -1558,11 +1558,9 @@ first_stale_address :: proc(r: ^Runner, wire: []u8) -> string {
 	return addrs[0] if len(addrs) > 0 else ""
 }
 
-// A referral: NOERROR, RA clear, the zone's NS in authority and no SOA - what a
-// server that does not recurse sends for a name below a cut.
-@(private = "file")
 // NOERROR whose answer is a CNAME out of the zone and nothing else: no record at
 // the target, and nothing in authority.
+@(private = "file")
 bare_cname_reply :: proc(name: string) -> []u8 {
 	question := make([]dns.Question, 1, context.temp_allocator)
 	question[0] = dns.Question{name = name, type = .A, class = .IN}
@@ -1587,6 +1585,9 @@ bare_cname_reply :: proc(name: string) -> []u8 {
 	return wire
 }
 
+// A referral: NOERROR, RA clear, the zone's NS in authority and no SOA - what a
+// server that does not recurse sends for a name below a cut.
+@(private = "file")
 referral_reply :: proc(name: string) -> []u8 {
 	question := make([]dns.Question, 1, context.temp_allocator)
 	question[0] = dns.Question{name = name, type = .A, class = .IN}

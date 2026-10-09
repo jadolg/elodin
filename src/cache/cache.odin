@@ -543,6 +543,10 @@ type in the section leaves the message to be read as the answer it claims to be,
 as it was. A record of the type asked for anywhere in the section ends it, which
 is the type check alone and not a walk: the cache does not judge whether the
 chain is sound, only how long what it was handed is good for.
+
+Except for a DNAME above the question name, which is the redirection that
+synthesizes the CNAME and not data at any name the chain reaches, even when
+DNAME is the type asked for - the reading `answers_the_question` gives it.
 */
 @(private)
 only_a_chain :: proc(msg: dns.Message) -> bool {
@@ -550,12 +554,19 @@ only_a_chain :: proc(msg: dns.Message) -> bool {
 		return false
 	}
 	q := msg.question[0]
+	if q.type == .ANY {
+		return false
+	}
 	for r in msg.answer {
-		if q.type == .ANY || r.type == q.type {
-			return false
-		}
 		#partial switch r.type {
-		case .CNAME, .DNAME, .RRSIG:
+		case .DNAME:
+			if r.type == q.type && !dns.name_below(q.name, r.name) {
+				return false
+			}
+		case .CNAME, .RRSIG:
+			if r.type == q.type {
+				return false
+			}
 		case:
 			return false
 		}
@@ -989,8 +1000,9 @@ thing in both directions.
 			And no longer than any record the entry hands back. A denial after a
 			CNAME carries the chain, which `get` counts down like any answer, so
 			outliving it would serve the CNAME at zero, or at `min_ttl`, for the
-			rest of the SOA figure. A plain denial's shortest record is the SOA,
-			whose own TTL already bounds `soa_ttl`.
+			rest of the SOA figure. The same holds for every record a plain denial
+			carries - the SOA, whose own TTL already bounds `soa_ttl`, and any
+			NSEC, NSEC3, RRSIG or NS beside it.
 			*/
 			v, _ := dns.min_ttl(ttls)
 			effective = min(soa_ttl, v)

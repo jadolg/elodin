@@ -558,6 +558,88 @@ test_a_pruned_denial_after_a_cname_is_not_cached :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+/*
+A pruned answer that reaches the type asked for is cached and served.
+
+The stored bytes are the pruned copy, and `serve_from_cache` is what hands them
+to every later client - with the stored AD bit, for one that set DO.
+*/
+@(test)
+test_a_pruned_answer_is_still_cached_and_served :: proc(t: ^testing.T) {
+	msg := cname_nodata_response()
+	answer := make([]dns.Record, len(msg.answer) + 1, context.temp_allocator)
+	copy(answer, msg.answer)
+	answer[len(msg.answer)] = dns.Record {
+		name = "cdn.example.net.",
+		type = .AAAA,
+		class = .IN,
+		ttl = 600,
+		data = dns.Rdata_AAAA{addr = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}},
+	}
+	msg.answer = answer
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	testing.expect_value(t, err, dns.Encode_Error.None)
+
+	covered := make([]dnssec.Authenticated_Set, 2, context.temp_allocator)
+	covered[0] = dnssec.Authenticated_Set {
+		name   = "www.example.com.",
+		type   = .CNAME,
+		class  = .IN,
+		signer = TEST_SIGNER,
+	}
+	covered[1] = dnssec.Authenticated_Set {
+		name   = "cdn.example.net.",
+		type   = .AAAA,
+		class  = .IN,
+		signer = TEST_SIGNER,
+	}
+	verdict := dnssec.Result {
+		status = .Secure,
+		answer = covered,
+	}
+
+	out := present_response(wire, aaaa_query(), .AAAA, verdict, nil, context.temp_allocator)
+	decoded, derr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+	testing.expect_value(t, len(decoded.answer), 3)
+	testing.expect_value(t, len(decoded.authority), 0)
+
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, negative_ttl = 0})
+	defer cache.destroy(answers)
+	key_buf: [cache.KEY_MAX]u8
+	key := cache.make_key(key_buf[:], "www.example.com.", .AAAA, .IN, true, false)
+	if !testing.expect(t, cache.put(answers, key, out, decoded), "a pruned answer was not cacheable") {
+		return
+	}
+
+	cfg := config.default_config()
+	cfg.log.queries = false
+	s := Server {
+		cfg     = &cfg,
+		answers = answers,
+	}
+	// Present so the request counts as one this server would validate, which is
+	// what lets the stored AD bit reach a client that asked for it.
+	s.validator = dnssec.make_validator(nil, nil, dnssec.Options{})
+	defer dnssec.destroy_validator(s.validator)
+
+	query_wire, _, qenc := dns.encode_message(aaaa_query(), context.temp_allocator)
+	testing.expect_value(t, qenc, dns.Encode_Error.None)
+
+	served, outcome, ok := handle_query(&s, query_wire, .UDP, "test", context.temp_allocator)
+	testing.expect(t, ok, "no response was produced")
+	testing.expect_value(t, outcome, Outcome.Cached)
+	if !ok {
+		return
+	}
+	testing.expect(t, served[3] & 0x20 != 0, "the stored verdict should reach a client that set DO")
+	hit, hderr := dns.decode_message(served, context.temp_allocator)
+	testing.expect_value(t, hderr, dns.Decode_Error.None)
+	testing.expect_value(t, len(hit.answer), 3)
+	testing.expect_value(t, len(hit.authority), 0)
+	free_all(context.temp_allocator)
+}
+
 @(test)
 test_upstream_query_asks_for_signatures :: proc(t: ^testing.T) {
 	query := client_query(false)
