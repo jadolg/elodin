@@ -534,6 +534,16 @@ answers_the_question :: proc(msg: dns.Message, rec: dns.Record) -> bool {
 }
 
 /*
+Is this response a denial - NXDOMAIN, or NODATA with or without a CNAME chain
+in front of it (RFC 2308 sections 2.1 and 2.2)? What `put` keeps for the SOA
+figure, and refuses without one; DoH's `Cache-Control` reads it for the same
+reason.
+*/
+denial :: proc(msg: dns.Message) -> bool {
+	return dns.rcode_of(msg) == .NX_Domain || len(msg.answer) == 0 || stops_short(msg)
+}
+
+/*
 How many CNAME hops `stops_short` follows past the question name before it reads
 the answer as a chain that never ends. Four times the sixteen that the server's
 own chain check (`server.MAX_CHAIN_NAMES`) and the validator's
@@ -569,11 +579,20 @@ stops_short :: proc(msg: dns.Message) -> bool {
 		return false
 	}
 	q := msg.question[0]
+	// No chain has more hops than the section has CNAMEs; any further is a
+	// loop, and stopping there keeps a padded section from buying passes.
+	hops := 0
+	for r in msg.answer {
+		if r.type == .CNAME {
+			hops += 1
+		}
+	}
 	name := q.name
-	for _ in 0 ..= CHAIN_NAMES_MAX {
+	for _ in 0 ..= min(hops, CHAIN_NAMES_MAX) {
 		target := ""
 		for r in msg.answer {
-			if r.class != q.class || !dns.name_equal_fold(r.name, name) {
+			// A QCLASS ANY question is answered in whatever class holds the name.
+			if (q.class != .ANY && r.class != q.class) || !dns.name_equal_fold(r.name, name) {
 				continue
 			}
 			if r.type == q.type || q.type == .ANY {
@@ -968,7 +987,7 @@ the same shape stopped one layer further out, on the paths no validator
 	says nothing is there, and read as data it would be held for the chain's own
 	TTL - up to `max_ttl` - with no SOA behind it at all.
 	*/
-	negative := !bogus && (rcode == .NX_Domain || len(msg.answer) == 0 || stops_short(msg))
+	negative := !bogus && denial(msg)
 	soa_ttl: u32
 	if negative {
 		has_soa: bool
@@ -1022,12 +1041,15 @@ thing in both directions.
 			the rest of the SOA figure. The answer section alone: the SOA's own
 			TTL already bounds `soa_ttl`, and a short-lived record elsewhere -
 			a zero-TTL one in additional, say - is no reason to forget the
-			denial. The answer records are the first `len(msg.answer)` TTLs,
-			since `scan_ttl_offsets` skips only the OPT record.
+			denial. Read off the decoded records, through RFC 2181 section 8
+			as `read_ttls` reads them, so nothing depends on where in `ttls`
+			the section starts; an OPT there is transport, not a TTL.
 			*/
 			effective = soa_ttl
-			if v, has := dns.min_ttl(ttls[:min(len(ttls), len(msg.answer))]); has {
-				effective = min(effective, v)
+			for r in msg.answer {
+				if r.type != .OPT {
+					effective = min(effective, dns.sane_ttl(r.ttl))
+				}
 			}
 			if c.negative_ttl > 0 {
 				effective = min(effective, c.negative_ttl)

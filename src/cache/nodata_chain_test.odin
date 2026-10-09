@@ -235,5 +235,16 @@ test_a_chain_that_answers_is_not_a_denial :: proc(t: ^testing.T) {
 	kb: [KEY_MAX]u8
 	key := make_key(kb[:], "example.com.", .DNAME, .IN, false)
 	testing.expect(t, put(c, key, wire, at), "the DNAME asked for, at the question name, was not cached")
+
+	// QCLASS ANY is answered in IN, which is still the answer.
+	any_class := dns.Message {
+		question = []dns.Question{{name = "www.example.com.", type = .A, class = .ANY}},
+		answer = []dns.Record{{name = "www.example.com.", type = .A, class = .IN, ttl = 3600, data = dns.Rdata_A{addr = {203, 0, 113, 7}}}},
+	}
+	any_class.flags.qr = true
+	wire, _, err = dns.encode_message(any_class, context.temp_allocator)
+	testing.expect_value(t, err, dns.Encode_Error.None)
+	key = make_key(kb[:], "www.example.com.", .A, .ANY, false)
+	testing.expect(t, put(c, key, wire, any_class), "an IN answer to a QCLASS ANY question was not cached")
 	free_all(context.temp_allocator)
 }

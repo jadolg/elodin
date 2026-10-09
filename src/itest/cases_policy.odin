@@ -1560,7 +1560,6 @@ first_stale_address :: proc(r: ^Runner, wire: []u8) -> string {
 
 // NOERROR whose answer is a CNAME out of the zone and nothing else: no record at
 // the target, and nothing in authority.
-@(private = "file")
 bare_cname_reply :: proc(name: string) -> []u8 {
 	question := make([]dns.Question, 1, context.temp_allocator)
 	question[0] = dns.Question{name = name, type = .A, class = .IN}

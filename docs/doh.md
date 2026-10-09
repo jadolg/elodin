@@ -19,6 +19,10 @@ listeners:
   `application/dns-message` body, and `GET` with a base64url `dns` parameter.
 - Requests on one HTTP/2 connection are answered in parallel on the query worker
   pool, so a browser's A and AAAA lookups run at the same time.
+- `Cache-Control: max-age` is the smallest TTL in the answer as sent, after
+  `cache.max_ttl`. For a denial (NXDOMAIN, NODATA, or NODATA after a CNAME) it
+  is also capped by the SOA's MINIMUM (RFC 8484 section 5.1), and it is 0 when
+  there is no SOA.
 
 HTTP/2 limits, per connection:
 

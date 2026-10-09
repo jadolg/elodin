@@ -3,6 +3,7 @@ package server
 import "core:encoding/base64"
 import "core:strings"
 import "core:time"
+import "elodin:cache"
 import "elodin:dns"
 import "elodin:h2"
 import "elodin:logx"
@@ -789,9 +790,9 @@ serve_doh_request :: proc(
 		return send_http_error(conn, "doh", 500, "no response", req.keep_alive)
 	}
 
-	// Cache-Control mirrors the smallest TTL so intermediaries expire the
-	// answer at the same time the DNS data does - the bounded TTL, see
-	// `doh_max_age`.
+	// Cache-Control mirrors the smallest TTL, or a denial's SOA figure, so
+	// intermediaries expire the answer at the same time the DNS data does -
+	// the bounded TTL, see `doh_max_age`.
 	max_age := doh_max_age(response)
 
 	b := strings.builder_make(context.temp_allocator)
@@ -918,7 +919,28 @@ doh_max_age :: proc(response: []u8) -> u32 {
 	}
 	ttls := dns.read_ttls(response, offsets, context.temp_allocator)
 	v, has := dns.min_ttl(ttls)
-	return v if has else 0
+	if !has {
+		return 0
+	}
+	/*
+	And a denial no longer than its SOA says. RFC 8484 section 5.1: with no
+	answer records and a SOA in authority, the freshness lifetime "MUST NOT be
+	greater than the MINIMUM field from that SOA record" - which the smallest
+	TTL alone does not bound, since the SOA record's own TTL is usually the
+	larger of the two. NODATA after a CNAME is a denial too (RFC 2308 section
+	2.2), and one without a SOA gets no freshness at all, as `cache.put` keeps
+	none: the CNAME's own TTL would otherwise have every HTTP cache in the path
+	hold the NODATA for up to `cache.max_ttl`.
+	*/
+	msg, err := dns.decode_message(response, context.temp_allocator)
+	if err != .None {
+		return 0
+	}
+	if cache.denial(msg) {
+		soa, has_soa := dns.negative_ttl(msg)
+		v = min(v, soa) if has_soa else 0
+	}
+	return v
 }
 
 @(private)

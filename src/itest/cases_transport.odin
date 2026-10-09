@@ -48,6 +48,7 @@ run_transport_cases :: proc(r: ^Runner) {
 
 	mock := mock_make("primary", upstream_port)
 	mock_reply(mock, fix.qname, fix.qtype, from_hex(fix.response, context.allocator))
+	mock_reply(mock, "cname-nosoa.example.com.", u16(dns.Type.A), bare_cname_reply("cname-nosoa.example.com."))
 	if !mock_start(mock) {
 		skip_case(r, "transports", "cannot start the mock upstream")
 		return
@@ -147,6 +148,24 @@ run_transport_cases :: proc(r: ^Runner) {
 				check_eq_int(r, h.ancount, fix.ancount, "answer count")
 				check(r, h.id == 0x1111, "transaction ID not echoed")
 			}
+		}
+	}
+	end_case(r)
+
+	start_case(r, "doh: NODATA after a CNAME without a SOA gets no freshness (#418)")
+	{
+		// RFC 2308 section 2.2 makes it a denial, and with no SOA nothing says
+		// how long it holds, so an HTTP cache is told not to keep it rather
+		// than to keep it for the CNAME's hour.
+		res := doh_post(doh_port, "/dns-query", build_query("cname-nosoa.example.com.", u16(dns.Type.A), id = 0x4180))
+		if check(r, res.ok, "no HTTP response") {
+			check_eq_int(r, res.status, 200, "status")
+			if check(r, len(res.body) >= dns.HEADER_SIZE, "body too short: %d bytes", len(res.body)) {
+				h := parse_header(r, res.body)
+				check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want the NOERROR the mock sent", h.rcode)
+				check_eq_int(r, h.ancount, 1, "answer count, the bare CNAME")
+			}
+			check(r, header_contains(res.headers, "cache-control: max-age=0"), "a bare CNAME was given a max-age: %s", res.headers)
 		}
 	}
 	end_case(r)
