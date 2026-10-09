@@ -1105,7 +1105,8 @@ the caller's range check, and its digits are still all checked: too large and
 not a length at all are different refusals.
 */
 parse_content_length :: proc(value: string, limit: int) -> (length: int, ok: bool) {
-	// `limit + 1` and the step towards it must not wrap themselves.
+	// A step is taken only from `length <= limit`, so it stays under
+	// `limit * 10 + 9`, which this keeps inside an int.
 	assert(limit >= 0 && limit < max(int) / 10)
 	digits := trim_ows(value)
 	if len(digits) == 0 {
@@ -1116,7 +1117,9 @@ parse_content_length :: proc(value: string, limit: int) -> (length: int, ok: boo
 		if c < '0' || c > '9' {
 			return 0, false
 		}
-		length = min(length * 10 + int(c - '0'), limit + 1)
+		if length <= limit {
+			length = min(length * 10 + int(c - '0'), limit + 1)
+		}
 	}
 	return length, true
 }

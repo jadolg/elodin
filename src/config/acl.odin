@@ -1,6 +1,7 @@
 package config
 
 import "core:fmt"
+import "core:mem"
 import "core:net"
 import "core:strconv"
 import "core:strings"
@@ -107,15 +108,14 @@ carrying one is a broken zone rather than a machine an attacker gains anything
 by reaching.
 
 The IPv6 forms that carry an IPv4 address inside them are not entries here, and
-only one of them is handled below. `address_in` undoes `::ffff:a.b.c.d`, because
-that one reaches this check from the client side as well. `64:ff9b::a.b.c.d`
-(RFC 6052) and `::a.b.c.d` (RFC 4291, deprecated) reach a private IPv4 host too,
-but only ever as something an answer said, so they are unwrapped by
-`unwrap_embedded_v4` below rather than by `address_in` - a client that
-arrives from one is a question about the ACL, and that question has not been
-asked. Nothing is silently missing from the table on their account; what a table
-of prefixes cannot express is an address that has to be rewritten before it is
-matched.
+only one of them is handled by `address_in`: it undoes `::ffff:a.b.c.d`, because
+that one reaches this check from the client side as well. The NAT64, compat,
+IPv4-translated and 6to4 forms reach a private IPv4 host too, but only ever as
+something an answer said, so they are unwrapped by `unwrap_embedded_v4` below
+rather than by `address_in` - a client that arrives from one is a question about
+the ACL, and that question has not been asked. Nothing is silently missing from
+the table on their account; what a table of prefixes cannot express is an
+address that has to be rewritten before it is matched.
 */
 PRIVATE_NETWORKS := []Prefix {
 	{addr = {0 = 127}, bits = 8}, // 127.0.0.0/8      loopback
@@ -150,7 +150,8 @@ to: the IANA special-purpose registries' entries that are not globally reachable
 (RFC 6890 section 2.2, as RFC 8190 updates it), plus multicast. All of
 `192.0.0.0/24` is here, though the registry marks two anycast addresses in it
 reachable: no list is served from either. `2001::/23` is not, since much of it
-is reachable (AS112 and ORCHIDv2 among it). A public list
+is reachable (AS112 and ORCHIDv2 among it), but its benchmarking `2001:2::/48`
+is. A public list
 host has no business naming any of them, and a resolver sits somewhere with a
 view of a network the list author does not have - the shape of an SSRF.
 
@@ -164,8 +165,10 @@ limited broadcast included.
 `::/96` is the IPv4-compatible block (RFC 4291 section 2.5.5.1) as a whole: what
 `unwrap_embedded_v4` hands back as IPv6 from it - `::`, `::1` and a compat
 address whose first octet is zero - is no host on the internet either.
-`64:ff9b::/96`, the /96 of `64:ff9b:1::/48`, `::ffff:0:0:0/96` and 6to4 are not
-here: each is judged as the IPv4 address it carries.
+`64:ff9b::/96`, `::ffff:0:0:0/96` and 6to4 are not here: each is judged as the
+IPv4 address it carries. `64:ff9b:1::/48` is, for the layouts under it this
+cannot read; its first /96 is unwrapped before the table is consulted, and so is
+judged as what it carries. See `origin_is_public` for the other side of it.
 */
 NON_PUBLIC_NETWORKS := []Prefix {
 	{addr = {}, bits = 8}, // 0.0.0.0/8        "this network" (RFC 1122)
@@ -182,7 +185,10 @@ NON_PUBLIC_NETWORKS := []Prefix {
 	{addr = {0 = 203, 2 = 113}, bits = 24}, // 203.0.113.0/24   documentation (RFC 5737)
 	{addr = {0 = 224}, bits = 3}, // 224.0.0.0/3      multicast, reserved, broadcast
 	{addr = {}, bits = 96, v6 = true}, // ::/96            IPv4-compatible, ::, ::1 (RFC 4291)
+	{addr = {1 = 0x64, 2 = 0xff, 3 = 0x9b, 5 = 1}, bits = 48, v6 = true}, // 64:ff9b:1::/48 local-use NAT64 (RFC 8215)
 	{addr = {0 = 0x01}, bits = 64, v6 = true}, // 100::/64         discard-only (RFC 6666)
+	{addr = {0 = 0x01, 7 = 1}, bits = 64, v6 = true}, // 100:0:0:1::/64   dummy prefix (RFC 9780)
+	{addr = {0 = 0x20, 1 = 0x01, 3 = 0x02}, bits = 48, v6 = true}, // 2001:2::/48      benchmarking (RFC 5180)
 	{addr = {0 = 0x20, 1 = 0x01, 2 = 0x0d, 3 = 0xb8}, bits = 32, v6 = true}, // 2001:db8::/32 documentation (RFC 3849)
 	{addr = {0 = 0x3f, 1 = 0xff}, bits = 20, v6 = true}, // 3fff::/20        documentation (RFC 9637)
 	{addr = {0 = 0x5f}, bits = 16, v6 = true}, // 5f00::/16        SRv6 SIDs (RFC 9602)
@@ -201,6 +207,27 @@ address_is_public :: proc(addr: net.Address) -> bool {
 	bytes, family := unwrap_embedded_v4(raw, v6)
 	return !address_in(NON_PUBLIC_NETWORKS, bytes, family)
 }
+
+/*
+Whether a fetch that starts at `addr` is held to the public rule for its
+redirects - `address_is_public`, except for an address under the local-use NAT64
+prefix that `unwrap_embedded_v4` cannot read. RFC 8215 leaves the layout under
+`64:ff9b:1::/48` to the site, so a DNS64 there may synthesise a public list host
+as `64:ff9b:1:abcd::808:808`; as a redirect target that address is refused, not
+being readable, and as an origin it keeps the guard on rather than switching it
+off.
+*/
+origin_is_public :: proc(addr: net.Address) -> bool {
+	raw, v6 := netx.address_bytes(addr)
+	bytes, family := unwrap_embedded_v4(raw, v6)
+	if addr != nil && family && prefix_list_contains(LOCAL_USE_NAT64, bytes, true) {
+		return true
+	}
+	return address_is_public(addr)
+}
+
+@(private)
+LOCAL_USE_NAT64 := []Prefix{{addr = {1 = 0x64, 2 = 0xff, 3 = 0x9b, 5 = 1}, bits = 48, v6 = true}}
 
 /*
 The IPv4 address inside a v6 address that carries one, for the forms
@@ -238,22 +265,21 @@ hole rather than a nicety: `64:ff9b::` is RFC 6052's encoding of 0.0.0.0, and a
 stack on such a network connects there - the "0.0.0.0 Day" bypass
 `PRIVATE_NETWORKS` describes.
 
-Not covered, and named because the rest of this file names what it leaves out:
-any other NAT64 prefix, including the rest of `64:ff9b:1::/48` (RFC 6052 allows
+Not read, and named because the rest of this file names what it leaves out: any
+other NAT64 prefix, including the rest of `64:ff9b:1::/48` (RFC 6052 allows
 /32 through /64 as well, with the embedded octets at a different offset for each
 length, skipping the `u` byte). This server is not told what its network's
-prefix is and length is. A site running one has `allow_domains`, and dnsmasq and
-Unbound do not recognise even the well-known prefix.
+prefix or its length is. The redirect check refuses the rest of the local-use
+prefix as a target all the same, see `origin_is_public`; for the rebinding check
+a site running one has `allow_domains`, and dnsmasq and Unbound do not recognise
+even the well-known prefix.
+
+Nor Teredo (`2001::/32`, RFC 4380), whose obfuscated IPv4 address is the
+client's NAT mapping: a packet to it is UDP to that mapping, not a connection to
+a service on the host, and section 4 has the mapping be the NAT's global one.
 */
 unwrap_embedded_v4 :: proc(addr: [16]u8, v6: bool) -> (bytes: [16]u8, family: bool) {
-	zero :: proc(b: []u8) -> bool {
-		for x in b {
-			if x != 0 {
-				return false
-			}
-		}
-		return true
-	}
+	zero :: mem.check_zero
 	if !v6 {
 		return addr, false
 	}

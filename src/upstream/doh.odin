@@ -313,7 +313,7 @@ fetch_url :: proc(
 
 		if !have_origin {
 			origin_scheme = scheme
-			origin_public = config.address_is_public(addr)
+			origin_public = config.origin_is_public(addr)
 			have_origin = true
 		} else if !redirect_allowed(origin_scheme, origin_public, scheme, addr) {
 			return nil, .HTTP_Error

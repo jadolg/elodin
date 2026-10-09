@@ -3393,6 +3393,10 @@ test_http1_content_length_is_digits_only :: proc(t: ^testing.T) {
 		length, ok := parse_content_length(c.text, 100)
 		testing.expectf(t, ok == c.ok && length == c.length, "%q: got %d %v, want %d %v", c.text, length, ok, c.length, c.ok)
 	}
+	// The largest limit the assert takes: a step from `limit + 1` would wrap.
+	top := max(int) / 10 - 1
+	length, ok := parse_content_length("9223372036854775808", top)
+	testing.expectf(t, ok && length == top + 1, "at the top limit: got %d %v, want %d", length, ok, top + 1)
 }
 
 @(test)

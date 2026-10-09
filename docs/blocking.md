@@ -35,7 +35,9 @@ does not turn blocking off once a list has been fetched.
   at. An IPv4 address written inside an
   IPv6 one (`::ffff:a.b.c.d`, `::a.b.c.d`,
   `::ffff:0:a.b.c.d`, the NAT64 prefixes `64:ff9b::/96` and `64:ff9b:1::/96`,
-  and 6to4 `2002:aabb:ccdd::/48`) is judged as the IPv4 address. A list url is requested with its
+  and 6to4 `2002:aabb:ccdd::/48`) is judged as the IPv4 address. Any other
+  address under the local-use NAT64 prefix `64:ff9b:1::/48` is never followed
+  to, and a list at one is held to the public rule. A list url is requested with its
   query (`?format=hosts`).
 - A download counts as failed when it is a web page (its first non-blank byte
   is `<`: a captive portal, an error page sent as a 200) or holds no rules,

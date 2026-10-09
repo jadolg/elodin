@@ -1815,11 +1815,16 @@ test_address_is_public_classifies_reserved_ranges :: proc(t: ^testing.T) {
 		{"203.0.113.1", false},
 		{"255.255.255.255", false},
 		{"223.255.255.255", true},
-		// Another length's layout under the local-use prefix is not read.
-		{"64:ff9b:1:ffff::1", true},
+		// Another layout under the local-use prefix cannot be read, so as a
+		// target it is not public.
+		{"64:ff9b:1:ffff::1", false},
+		{"64:ff9b:1:abcd::a9fe:a9fe", false},
 		{"64:ff9b:2::1", true},
 		{"100::1", false},
-		{"100:0:0:1::1", true},
+		{"100:0:0:1::1", false},
+		{"100:0:0:2::1", true},
+		{"2001:2::1", false},
+		{"2001:2:1::1", true},
 		{"2001:db8::1", false},
 		{"2001:db9::1", true},
 		{"3fff:fff::1", false},
@@ -1837,6 +1842,32 @@ test_address_is_public_classifies_reserved_ranges :: proc(t: ^testing.T) {
 	}
 	// Nothing at all is not somewhere a redirect may name.
 	testing.expect(t, !config.address_is_public(nil), "a nil address was treated as public")
+}
+
+/*
+The origin side of the same table. An address under the local-use NAT64 prefix
+that cannot be read is a public origin, so its redirects stay held to the public
+rule; one that can is judged by the IPv4 address it carries, like any other.
+*/
+@(test)
+test_origin_is_public_keeps_the_guard_on_what_it_cannot_read :: proc(t: ^testing.T) {
+	Case :: struct {
+		text:   string,
+		public: bool,
+	}
+	cases := []Case {
+		{"8.8.8.8", true},
+		{"10.0.0.1", false},
+		{"64:ff9b::c0a8:101", false},
+		{"64:ff9b:1::808:808", true},
+		{"64:ff9b:1::c0a8:101", false},
+		{"64:ff9b:1:abcd::a9fe:a9fe", true},
+		{"64:ff9b:1:ffff::1", true},
+	}
+	for c in cases {
+		testing.expectf(t, config.origin_is_public(net.parse_address(c.text)) == c.public, "%q: expected public=%v", c.text, c.public)
+	}
+	testing.expect(t, !config.origin_is_public(nil), "no address at all was a public origin")
 }
 
 @(test)
@@ -1858,6 +1889,7 @@ test_redirect_allowed_refuses_downgrade_and_retarget :: proc(t: ^testing.T) {
 		{"https", true, "https", "169.254.169.254", false, "a public origin retargeted at link-local"},
 		{"https", true, "https", "64:ff9b::a9fe:a9fe", false, "a public origin retargeted at link-local through NAT64"},
 		{"https", true, "https", "64:ff9b::808:808", true, "a public origin retargeted at a public host through NAT64"},
+		{"https", true, "https", "64:ff9b:1:abcd::a9fe:a9fe", false, "a public origin retargeted through a local-use NAT64 /96 this cannot read"},
 		// An operator who configured a local mirror meant it.
 		{"http", false, "http", "127.0.0.1", true, "a local mirror redirecting locally"},
 		{"https", false, "https", "10.0.0.1", true, "a private origin staying private"},
