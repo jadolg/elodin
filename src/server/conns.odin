@@ -202,7 +202,8 @@ active_connections :: proc(cm: ^Conn_Manager) -> int {
 
 /*
 Wait for every connection thread to finish, and refuse any spawn after it.
-Callers close the listening sockets first so the handlers see EOF and return.
+Callers set `stop` and close the listening sockets first so the loops return;
+a client connection ends when its client closes it or at `server.client_timeout`.
 
 Reaped in place rather than joined one by one from a copy: a thread leaves the
 table as soon as it is done, whichever order they finish in, so

@@ -310,16 +310,22 @@ test_spawn_after_shutdown_is_refused :: proc(t: ^testing.T) {
 	conn_manager_shutdown(&cm)
 }
 
+// Shutdown started on a thread of its own, returned once it has marked the
+// manager stopped, so the caller can look at the table while it waits.
 @(private = "file")
-shuts_down :: proc(cm: ^Conn_Manager) {
-	conn_manager_shutdown(cm)
-}
-
-@(private = "file")
-is_stopped :: proc(cm: ^Conn_Manager) -> bool {
-	sync.mutex_lock(&cm.mu)
-	defer sync.mutex_unlock(&cm.mu)
-	return cm.stopped
+start_shutdown :: proc(cm: ^Conn_Manager) -> ^thread.Thread {
+	shutdown := thread.create_and_start_with_poly_data(cm, conn_manager_shutdown)
+	deadline := time.time_add(time.now(), 2 * time.Second)
+	for time.diff(time.now(), deadline) > 0 {
+		sync.mutex_lock(&cm.mu)
+		stopped := cm.stopped
+		sync.mutex_unlock(&cm.mu)
+		if stopped {
+			break
+		}
+		time.sleep(time.Millisecond)
+	}
+	return shutdown
 }
 
 /*
@@ -339,11 +345,7 @@ test_a_connection_being_joined_is_still_counted :: proc(t: ^testing.T) {
 	client := Held{}
 	testing.expect_value(t, conn_spawn(&cm, &client, holds_until_released), Spawn_Result.Started)
 
-	shutdown := thread.create_and_start_with_poly_data(&cm, shuts_down)
-	deadline := time.time_add(time.now(), 2 * time.Second)
-	for !is_stopped(&cm) && time.diff(time.now(), deadline) > 0 {
-		time.sleep(time.Millisecond)
-	}
+	shutdown := start_shutdown(&cm)
 	testing.expect_value(t, active_connections(&cm), 1)
 
 	sync.atomic_store(&client.go, true)
@@ -371,11 +373,7 @@ test_a_connection_closed_during_shutdown_is_not_counted :: proc(t: ^testing.T) {
 	testing.expect_value(t, conn_spawn(&cm, &older, holds_until_released), Spawn_Result.Started)
 	testing.expect_value(t, conn_spawn(&cm, &newer, holds_until_released), Spawn_Result.Started)
 
-	shutdown := thread.create_and_start_with_poly_data(&cm, shuts_down)
-	deadline := time.time_add(time.now(), 2 * time.Second)
-	for !is_stopped(&cm) && time.diff(time.now(), deadline) > 0 {
-		time.sleep(time.Millisecond)
-	}
+	shutdown := start_shutdown(&cm)
 	sync.atomic_store(&older.go, true)
 	testing.expect_value(t, wait_for_reap(&cm, 1), 1)
 

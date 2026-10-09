@@ -227,8 +227,8 @@ Stop the metrics endpoint, once the slow part of shutdown is over.
 Separate from `stop_listeners` and called right after it rather than as part of
 the same sweep, so a scrape lands throughout `conn_manager_shutdown` instead of
 finding the port already closed. That join is where shutdown actually spends
-its time: it joins client connections one at a time with no overall deadline,
-and a DoT or DoH one can hold out for `server.client_timeout`. An operator
+its time: it waits on every client connection with no overall deadline, and a
+DoT or DoH one can hold out for `server.client_timeout`. An operator
 watching `elodin_connections_active` fall to zero during that stretch is
 watching the shutdown succeed; one watching a gap where the endpoint used to be
 cannot tell a slow stop from a stuck one.
