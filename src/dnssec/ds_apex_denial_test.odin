@@ -17,11 +17,10 @@ Read the other way round it is the cheapest DNSSEC downgrade there is. A
 malicious upstream, or anyone on the path to a plain UDP one, answers a
 forwarded `DS dstest.` with NOERROR/NODATA carrying `dstest.`'s own apex NSEC and
 its RRSIG, both copied verbatim from the public zone. Nothing is forged and
-nothing has to be broken: the records verify against the child's keys, which this
-server reached by fetching and checking the very DS it is then told does not
-exist. Answering AD=1 to that tells a stub, or a downstream forwarder, that a
-signed zone is an unsigned delegation, and every name under it stops being
-validated.
+nothing has to be broken: the records verify against the child's keys, which the
+very DS it is told does not exist leads to. Answering AD=1 to that tells a stub,
+or a downstream forwarder, that a signed zone is an unsigned delegation, and
+every name under it stops being validated.
 
 `www` under each zone is the honest shape of the same reply - an ordinary name
 that is not a zone cut, whose denial really does settle that no DS is there - and
@@ -145,11 +144,11 @@ DA_FIXTURES := []Fixture{
 		type  = .DS,
 		rcode = 0,
 		wire  = "12348580000100000002000003777777076473746573743300002b000120746a6d75696771683833356a6e376b346738" +
-			"6f38387036316a6f746c6a6a62680764737465737433000032000100000e10002401000000020a0b14582defa9c7764d" +
-			"e57dafbd22ab108142cb93a00b000640000000000220746a6d75696771683833356a6e376b3467386f38387036316a6f" +
+			"6f38387036316a6f746c6a6a62680764737465737433000032000100000e10002401000000020a0b142670ce4fbe08b2" +
+			"1e5b0001007f9a198e7165eaef000640000000000220746a6d75696771683833356a6e376b3467386f38387036316a6f" +
 			"746c6a6a6268076473746573743300002e000100000e10005b00320f0200000e107d3b18206a478820c9d90764737465" +
-			"73743300712ec0f32fdd7d46caf9aa05646b31b6c5b8411f0ccac80ed0a8c1930deea11bac35118b2b16460a4cd8ba2a" +
-			"088a07c5cb6c615b0c8591d4d0c444fa83511205",
+			"73743300fb2a31dc99afe265493d5ef31c30082b89b7cb4b05df93c17010ac7938927369d1eaf6f2a99be50d7a4968e1" +
+			"6ed78bd5cd106899cc8fdc3bf44086947e977608",
 	},
 	{
 		key   = "bl_apex_nodata",
@@ -160,6 +159,56 @@ DA_FIXTURES := []Fixture{
 			"65737400000600000000000306626c7465737400002e000100000e10005a002f0f0100000e107d3b18206a4788202875" +
 			"06626c7465737400ea6fa83f54677f32464f6f29ca4a3c0dbe19890bce16ab3d6c7eb35edc07e0eafdc02888694a86d9" +
 			"8c903ade3fe21d05593194720ca21e4325ac465083440a06",
+	},
+	{
+		key   = "da_unsigned_nodata",
+		name  = "unsigned.",
+		type  = .DS,
+		rcode = 0,
+		wire  = "12348580000100000002000008756e7369676e656400002b000108756e7369676e656400002f000100000e10000c027a" +
+			"7a00000620000000000308756e7369676e656400002e000100000e100053002f0f0100000e107d3b18206a4788207970" +
+			"008d1009c5f6eb8d6e05719899e1fe4432025e36801fed08b395c173307720ff2064c84e083702653d4eeb04db91e296" +
+			"c0cbab688d1db150439a8699be670a6306",
+	},
+	{
+		key   = "da3_unsigned_nodata",
+		name  = "unsigned.dstest3.",
+		type  = .DS,
+		rcode = 0,
+		wire  = "12348580000100000002000008756e7369676e6564076473746573743300002b00012034706f63736a74753132703173" +
+			"6d6f30303430377636677068706f6d62716e660764737465737433000032000100000e10001f01000000020a0b14582d" +
+			"efa9c7764de57dafbd22ab108142cb93a00b0001202034706f63736a747531327031736d6f3030343037763667706870" +
+			"6f6d62716e66076473746573743300002e000100000e10005b00320f0200000e107d3b18206a478820c9d90764737465" +
+			"73743300c615162c652a9acec0ba60d848b9cb9c00053127ac3edbfbaac8e49e26919552bb9fa62351b5ee7c79606b3c" +
+			"a8a6c576c9cb36588a8199e40a12f4f1c517f008",
+	},
+	{
+		key   = "da_unsigned_forged_ds",
+		name  = "unsigned.",
+		type  = .DS,
+		rcode = 0,
+		wire  = "12348580000100010000000008756e7369676e656400002b000108756e7369676e656400002b000100000e10002404d2" +
+			"0f02abababababababababababababababababababababababababababababababab",
+	},
+	{
+		key   = "da_self_ds",
+		name  = "dstest.",
+		type  = .DS,
+		rcode = 0,
+		wire  = "1234858000010002000000000664737465737400002b00010664737465737400002b000100000e10002444250f024a41" +
+			"24faee5876e7a569b61787ae3da9d4a1d4b6bbad678e42e148fe2bc4e8f50664737465737400002e000100000e10005a" +
+			"002b0f0100000e107d3b18206a47882039360664737465737400df97fcb1faae28eb30db1c4f99620e32ef9712f1a895" +
+			"70d775e2d151bfb1ee2a4e1510362031e4f852e206ffd758beac6afe155204e6e02a077a840a0042a804",
+	},
+	{
+		key   = "da_self_ds_covers_a",
+		name  = "dstest.",
+		type  = .DS,
+		rcode = 0,
+		wire  = "1234858000010002000000000664737465737400002b00010664737465737400002b000100000e10002444250f024a41" +
+			"24faee5876e7a569b61787ae3da9d4a1d4b6bbad678e42e148fe2bc4e8f50664737465737400002e000100000e10005a" +
+			"00010f0100000e107d3b18206a47882039360664737465737400a59a3752ac58c21860b6a18138f3e39898dd4a3f1f4d" +
+			"d6b33420cb95d88f203df68f5a4765c3d4eb61a312c149acd992c97a19a650fc6fb73ecdb48ef8ed7204",
 	},
 }
 
@@ -207,13 +256,15 @@ drifted out of - and a test reading only the verdict would stay green while
 exercising nothing at all. Naming the reason pins each refusal to the check it
 is here for.
 
-It is the same string in all three, because `validate_denial` settles a DS
-question against the zone the walk reached before any bit map is read. The bit
-map guard is what stands behind that one, and it is `nsec_unit_test` and
-`nsec3_unit_test` that hold it to account, by calling the two routines directly.
+It is the same string in all three, because `validate_denial` reads a DS
+denial against the parent's keys, and every record in these replies is signed
+by the child: none of them is a denial from the zone that holds the DS, before
+any bit map is read. The bit map guard is what stands behind that, and it is
+`nsec_unit_test` and `nsec3_unit_test` that hold it to account, by calling the
+two routines directly.
 */
 @(private = "file")
-DA_REFUSED :: "ds denial from the zone itself"
+DA_REFUSED :: "no denial of existence"
 
 @(private = "file")
 da_validate :: proc(key, qname: string) -> Result {
@@ -265,11 +316,9 @@ test_a_ds_denial_from_the_zone_itself_is_bogus_whatever_the_bit_map_says :: proc
 	`DS bltest.` - and both bit-map guards stand down, because there is nothing
 	in the bit map for them to read.
 
-	What settles it is not in the response at all. `zone_trust` walked down to
-	`bltest.` and established it, which for a DS question means `zone_step`
-	fetched the DS at that name and checked it against the parent's keys. A
-	denial of the DS that got us here contradicts the work that made the answer
-	readable, and no record an attacker can send changes that.
+	What settles it is not in the bit map at all. A DS denial is the parent's
+	to give (RFC 4035 section 5.3.1), so it is read against the root's keys,
+	and a record `bltest.` signed is no denial from the root whatever it says.
 
 	So this is the test for that check on its own: the bit-map guard cannot pass
 	it, and the unit tests in `nsec_unit_test` and `nsec3_unit_test` call the two
@@ -279,7 +328,7 @@ test_a_ds_denial_from_the_zone_itself_is_bogus_whatever_the_bit_map_says :: proc
 	testing.expectf(
 		t,
 		result.status == .Bogus && result.reason == DA_REFUSED,
-		"a zone cannot deny the DS this server followed to reach it, got %v (%q)",
+		"a zone cannot deny the DS its parent holds, got %v (%q)",
 		result.status,
 		result.reason,
 	)
@@ -322,11 +371,9 @@ what a proof stopped partway through has to come back as is `Indeterminate`:
 this server did not finish reading it, which is not the same statement as
 "forged" and must not reach the client as one.
 
-What runs out here is the walk down to the name, whose DS denial is this very
-fixture, and it answers in `zone_trust`'s words. The answer's own proof is the
-other place the meter can empty, and it takes a name error to reach - the walk
-settles a DS question before the proof is read, and every hash the proof would
-want is one the walk already made. `nsec3_name_error_test` is that case.
+What runs out here is the proof itself: a DS question walks only to the parent,
+`dstest3.`, whose DS is a positive answer and hashes nothing, so the first hash
+is the one this NODATA needs. `nsec3_name_error_test` is the name error case.
 */
 @(test)
 test_a_denial_whose_hashing_ran_out_is_indeterminate_not_bogus :: proc(t: ^testing.T) {
@@ -358,5 +405,131 @@ test_a_denial_whose_hashing_ran_out_is_indeterminate_not_bogus :: proc(t: ^testi
 	fresh := query_budget(fresh_v)
 	held := validate_denial(fresh_v, &fresh, msg, qname, .DS, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 	testing.expectf(t, held.status == .Secure, "the denial itself holds up, got %v (%q)", held.status, held.reason)
+	free_all(context.temp_allocator)
+}
+
+/*
+A DS question belongs to the parent (RFC 4035 section 5.3.1), so the parent's
+proof that a delegation carries no DS is a proven denial like any other, and
+Secure. Settled against the child instead, it is the walk that stops at the
+unsigned delegation and calls the answer insecure before the proof is read.
+*/
+@(test)
+test_the_parents_nsec_proving_no_ds_is_secure :: proc(t: ^testing.T) {
+	result := da_validate("da_unsigned_nodata", "unsigned.")
+	testing.expectf(t, result.status == .Secure, "got %v (%q)", result.status, result.reason)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_the_parents_nsec3_proving_no_ds_is_secure :: proc(t: ^testing.T) {
+	result := da_validate("da3_unsigned_nodata", "unsigned.dstest3.")
+	testing.expectf(t, result.status == .Secure, "got %v (%q)", result.status, result.reason)
+	free_all(context.temp_allocator)
+}
+
+/*
+A DS set at `dstest.` signed by `dstest.` itself. The signature verifies, and
+the key that made it is reached through the genuine DS - but the signer of an
+RRset has to be the zone that holds it (RFC 4035 section 5.3.1), and a DS lives
+in the parent. Accepting it lets a zone's operator publish whatever DS set they
+like for their own zone under this server's AD bit.
+*/
+@(test)
+test_a_ds_set_signed_by_the_child_itself_is_bogus :: proc(t: ^testing.T) {
+	result := da_validate("da_self_ds", "dstest.")
+	testing.expectf(
+		t,
+		result.status == .Bogus && result.reason == "no valid signature",
+		"got %v (%q)",
+		result.status,
+		result.reason,
+	)
+	free_all(context.temp_allocator)
+}
+
+// The control: the genuine DS set, signed by the root, is Secure.
+@(test)
+test_a_ds_set_signed_by_the_parent_is_secure :: proc(t: ^testing.T) {
+	result := da_validate("da_ds", "dstest.")
+	testing.expectf(t, result.status == .Secure, "got %v (%q)", result.status, result.reason)
+	free_all(context.temp_allocator)
+}
+
+/*
+A DS set at `unsigned.` with no signature at all. The root holds that DS and is
+signed, so an unsigned DS set there is a forgery. Settled against the owner
+instead, the walk stops at the root's proof that `unsigned.` has no DS and calls
+the set insecure.
+*/
+@(test)
+test_an_unsigned_ds_set_under_a_signed_parent_is_bogus :: proc(t: ^testing.T) {
+	result := da_validate("da_unsigned_forged_ds", "unsigned.")
+	testing.expectf(
+		t,
+		result.status == .Bogus && result.reason == "signature missing",
+		"got %v (%q)",
+		result.status,
+		result.reason,
+	)
+	free_all(context.temp_allocator)
+}
+
+/*
+`check_signature` holds both of its type rules itself, with no caller's filter
+in front of it. Both signatures here are real ones by `dstest.` over its own DS
+RDATA, so each refusal is the rule under test rather than the arithmetic.
+
+The DS signer rule: signed as a DS, the set is the child vouching for its own
+delegation. The Type Covered rule (RFC 4035 section 5.3.1): signed as an A set,
+the signature holds over that RDATA read as A, so offered as a TXT set - which
+the child may sign - only the type check refuses it. And offered as the DS set
+it is, the signer rule reads the type off the records, not off the signature.
+*/
+@(test)
+test_check_signature_holds_its_type_rules_itself :: proc(t: ^testing.T) {
+	self_msg, serr := dns.decode_message(da_reply("da_self_ds"), context.temp_allocator)
+	testing.expect(t, serr == .None, "the fixture should decode")
+	covers_msg, cerr := dns.decode_message(da_reply("da_self_ds_covers_a"), context.temp_allocator)
+	testing.expect(t, cerr == .None, "the fixture should decode")
+	keys_msg, kerr := dns.decode_message(da_reply("da_dnskey"), context.temp_allocator)
+	testing.expect(t, kerr == .None, "the key fixture should decode")
+
+	records := records_of(self_msg.answer, "dstest.", .DS, .IN, context.temp_allocator)
+	ds_sigs := sigs_covering(self_msg.answer, "dstest.", .DS, .IN, context.temp_allocator)
+	a_sigs := sigs_covering(covers_msg.answer, "dstest.", .A, .IN, context.temp_allocator)
+	keys := make([dynamic]Dnskey, 0, 1, context.temp_allocator)
+	for rec in records_of(keys_msg.answer, "dstest.", .DNSKEY, .IN, context.temp_allocator) {
+		rdata, _ := raw_rdata(rec)
+		key, perr := parse_dnskey(rdata)
+		if perr == .None {
+			append(&keys, key)
+		}
+	}
+	testing.expect_value(t, len(records), 1)
+	testing.expect_value(t, len(ds_sigs), 1)
+	testing.expect_value(t, len(a_sigs), 1)
+	testing.expect_value(t, len(keys), 1)
+	if len(records) != 1 || len(ds_sigs) != 1 || len(a_sigs) != 1 || len(keys) != 1 {
+		return
+	}
+	as_type :: proc(records: []dns.Record, type: dns.Type) -> []dns.Record {
+		out := make([]dns.Record, len(records), context.temp_allocator)
+		copy(out, records)
+		for &r in out {
+			r.type = type
+		}
+		return out
+	}
+	check :: proc(sig: Rrsig, records: []dns.Record, keys: []Dnskey) -> Verify_Result {
+		result, _ := check_signature(sig, "dstest.", .IN, records, keys, u32(FIXTURE_TIME), context.temp_allocator)
+		return result
+	}
+
+	testing.expect_value(t, check(ds_sigs[0], records, keys[:]), Verify_Result.Bad)
+	// The control: the A signature does verify over the RDATA read as A.
+	testing.expect_value(t, check(a_sigs[0], as_type(records, .A), keys[:]), Verify_Result.Ok)
+	testing.expect_value(t, check(a_sigs[0], as_type(records, .TXT), keys[:]), Verify_Result.Bad)
+	testing.expect_value(t, check(a_sigs[0], records, keys[:]), Verify_Result.Bad)
 	free_all(context.temp_allocator)
 }

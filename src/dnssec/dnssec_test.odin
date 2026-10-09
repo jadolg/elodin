@@ -579,6 +579,33 @@ test_unsigned_delegation_is_insecure :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+@(test)
+test_a_ds_question_is_settled_by_the_parents_opt_out_span :: proc(t: ^testing.T) {
+	/*
+	`reddit.com. DS` as `com.` answers it: no NSEC3 on the name, `com.` as the
+	closest encloser, and the next closer covered by an opt-out span. The
+	proof is the parent's to give, and an opt-out span is insecure rather than
+	secure (RFC 5155 sections 8.6 and 9.2) - Cloudflare, Google and Quad9 all
+	answer this question without AD.
+
+	The reason is the assertion. Walking to `reddit.com.` itself stops at the
+	unsigned delegation and says "unsigned zone" without reading the proof at
+	all, which reaches the same verdict for every DS NODATA under an insecure
+	delegation, including those the parent has proven outright.
+	*/
+	v := test_validator()
+	defer destroy_validator(v)
+	result := validate_fixture(v, "reddit_ds", "reddit.com.", .DS)
+	testing.expectf(
+		t,
+		result.status == .Insecure && result.reason == "opt-out span",
+		"got %v (%q)",
+		result.status,
+		result.reason,
+	)
+	free_all(context.temp_allocator)
+}
+
 // ---------------------------------------------------------------------------
 // Things that must not validate
 // ---------------------------------------------------------------------------

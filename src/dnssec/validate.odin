@@ -2207,8 +2207,18 @@ validate_denial :: proc(
 	the whole denial written off as insecure and served - which is precisely the
 	forged NXDOMAIN that DNSSEC exists to refuse. Walking down to the name costs
 	a lookup and settles it.
+
+	Except that for a DS the name asked about is not the zone that answers. A
+	DS lives in the parent (RFC 4035 section 5.3.1), so the walk stops at the
+	zone holding the parent, and the proof is read against that zone's keys.
+	Walking to the name itself would pass through the very DS in question: an
+	unsigned delegation would end the walk as insecure before the parent's
+	proof that it is unsigned was read, and a signed one would make the child
+	the only zone whose records could be checked - the one zone with no say.
+	The root has no parent, and keeps its own. See `zone_holding`.
 	*/
-	status, keys, established := zone_trust(v, budget, qname, now, allocator)
+	zone_of := zone_holding(qname, qtype)
+	status, keys, established := zone_trust(v, budget, zone_of, now, allocator)
 	#partial switch status {
 	case .Insecure:
 		return {status = .Insecure, reason = "unsigned zone"}
@@ -2216,32 +2226,6 @@ validate_denial :: proc(
 		return {status = .Bogus, reason = "broken chain of trust"}
 	case .Indeterminate:
 		return {status = .Indeterminate, reason = walk_reason(budget)}
-	}
-
-	/*
-	A DS denial from the very zone the DS is about.
-
-	`established` is what the walk down to `qname` actually reached, and for a
-	DS question it is the one part of this decision an attacker has no hand in.
-	Reaching `qname` itself means `zone_step` fetched the DS at that name and
-	checked it against the parent's keys - so an answer saying that DS does not
-	exist contradicts the work that made the answer readable at all. Every
-	record in it verifies, because they are the child's own and the child's keys
-	are the ones this walk went and got.
-
-	`nsec_proves_no_data` reads the same conclusion off the SOA bit, which is
-	the right test for the record in front of it and is not what this repeats.
-	That bit is the signer's to set: RFC 4470 lets a zone answer NODATA with an
-	NSEC minted for the question rather than one from its chain, and such a
-	record carries neither SOA nor NS, leaving both bit-map guards nothing to
-	read. Nothing sent by the other side is consulted here.
-
-	The root is the one name whose own zone may deny its DS, having no parent to
-	hold one - and `zone_trust` reaches the root from the trust anchor rather
-	than from a DS, so a denial there detaches nothing from anything.
-	*/
-	if qtype == .DS && qname != "." && qname != "" && dns.name_equal_fold(qname, established) {
-		return {status = .Bogus, reason = "ds denial from the zone itself"}
 	}
 
 	nsecs, nsec3s, proved, denial_spent := validated_denial_records(
@@ -2270,7 +2254,7 @@ validate_denial :: proc(
 		// never reached it: a delegation appearing at a name the table still
 		// calls no cut leaves the proof signed by a zone `established` is
 		// above. See `forget_unreached_non_cut`.
-		forget_unreached_non_cut(v, qname, established)
+		forget_unreached_non_cut(v, zone_of, established)
 		// Or the walk kept a parent's keys past a DS denial it could not read,
 		// and this is an unsigned delegation's own answer. See
 		// `Budget.walk_past_ceiling`.
@@ -2475,7 +2459,7 @@ validate_rrset :: proc(
 	walked := make([dynamic]Walked, 0, 4, allocator)
 
 	for sig in sigs {
-		if !name_in_zone(owner, sig.signer) {
+		if !signer_holds(owner, type, sig.signer) {
 			continue
 		}
 		/*
@@ -2584,7 +2568,7 @@ validate_rrset :: proc(
 	/*
 	Nothing verified. Whether that means forged or merely unsigned is a question
 	about the zone the name lives in, not about the signatures that arrived with
-	it, so it is settled by walking down to the name itself.
+	it, so it is settled by walking down to the zone that holds the set.
 	*/
 	/*
 	Our own allowance running out is not evidence about the zone.
@@ -2605,13 +2589,17 @@ validate_rrset :: proc(
 	}
 
 	missing := "signature missing" if len(sigs) == 0 else "no valid signature"
-	owner_status, _, owner_zone := zone_trust(v, budget, owner, now, allocator)
-	// The walk held up and stopped above the owner, and nothing here verified:
+	// The zone holding the set, which for a DS is the parent: walking to the
+	// owner would stop at the parent's proof that an unsigned delegation has no
+	// DS, and serve a forged DS set there as merely insecure.
+	holder := zone_holding(owner, type)
+	owner_status, _, owner_zone := zone_trust(v, budget, holder, now, allocator)
+	// The walk held up and stopped above the holder, and nothing here verified:
 	// one reason is a delegation at a name the table still calls no cut, which
 	// for an *unsigned* one leaves this the only verdict that can notice. The
 	// denial and wildcard paths do the same; see `forget_unreached_non_cut`.
 	if owner_status == .Secure {
-		forget_unreached_non_cut(v, owner, owner_zone)
+		forget_unreached_non_cut(v, holder, owner_zone)
 	}
 	switch owner_status {
 	case .Insecure:
@@ -2687,11 +2675,42 @@ validate_rrset :: proc(
 }
 
 /*
+The name whose zone holds an RRset of `type` at `name`: the name itself, except
+for a DS, which lives in the parent (RFC 4035 section 5.3.1). The root has no
+parent and `dns.name_parent` keeps it at the root.
+*/
+@(private)
+zone_holding :: proc(name: string, type: dns.Type) -> string {
+	return dns.name_parent(name) if type == .DS else name
+}
+
+/*
+Whether `signer` is the zone that may hold an RRset of `type` at `owner`.
+
+A zone may only sign what is inside it. Without this a zone could vouch for
+names it has no authority over, which is the whole point of the hierarchy.
+
+And a DS is the one type a zone never holds at its own apex: it lives in the
+parent (RFC 4035 section 5.3.1), so a DS signed by the zone it names is the
+child vouching for its own delegation, and its keys are reached through the
+genuine DS - the signature verifies, and says nothing. The root has no parent
+and so no DS, and nothing may sign one there.
+*/
+@(private)
+signer_holds :: proc(owner: string, type: dns.Type, signer: string) -> bool {
+	if !name_in_zone(owner, signer) {
+		return false
+	}
+	return type != .DS || !dns.name_equal_fold(owner, signer)
+}
+
+/*
 Try one signature against the keys of its zone.
 
 Rejects everything RFC 4035 section 5.3.1 asks to be rejected before any
-cryptography happens: the wrong signer, a label count that does not fit the
-owner name, an expired or not-yet-valid period.
+cryptography happens: a Type Covered that is not the set's type, the wrong
+signer (see `signer_holds`), a label count that does not fit the owner name, an
+expired or not-yet-valid period.
 */
 @(private)
 check_signature :: proc(
@@ -2709,10 +2728,13 @@ check_signature :: proc(
 	if !signature_current(sig, unix) {
 		return .Bad, ""
 	}
-	// A zone may only sign what is inside it. Without this a zone could vouch
-	// for names it has no authority over, which is the whole point of the
-	// hierarchy.
-	if !name_in_zone(owner, sig.signer) {
+	// RFC 4035 section 5.3.1: the RRSIG's Type Covered must equal the RRset's
+	// type. Callers filter by type already; read here off the records, so the
+	// DS signer rule below never rests on a field the sender wrote.
+	if len(records) == 0 || sig.type_covered != records[0].type {
+		return .Bad, ""
+	}
+	if !signer_holds(owner, records[0].type, sig.signer) {
 		return .Bad, ""
 	}
 	/*

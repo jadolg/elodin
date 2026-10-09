@@ -152,7 +152,7 @@ def signing_owner(owner, labels):
     return "*." + ".".join(parts[len(parts) - labels:]) + "."
 
 
-def sign(rrset, key, signer=None, labels=None):
+def sign(rrset, key, signer=None, labels=None, covered=None):
     """Build an RRSIG over `rrset`, which is one owner name and one type."""
     # The validity window and the TTLs come from the module constants: no scenario
     # has needed to vary them, and a signature outside the window is a case the
@@ -160,10 +160,12 @@ def sign(rrset, key, signer=None, labels=None):
     #
     # `signer` and `labels` default to the truthful values and are overridable
     # because two tests need a signature that is internally consistent with an
-    # untruthful one - see `check_signature_test.odin`.
+    # untruthful one - see `check_signature_test.odin`. `covered` signs the
+    # set's RDATA as if it were that type, which is what its key holder can
+    # make of any RDATA it likes.
     signer = signer if signer is not None else key.zone
     owner = rrset[0].name
-    rtype = rrset[0].type
+    rtype = covered if covered is not None else rrset[0].type
     if labels is None:
         labels = signed_label_count(owner)
     prefix = (
@@ -723,6 +725,7 @@ def ds_denial_from_child_apex():
         [
             ("dstest3.", [A, NS, SOA, RRSIG, DNSKEY, NSEC3PARAM]),
             ("www.dstest3.", [A, RRSIG]),
+            ("unsigned.dstest3.", [NS]),
         ],
         salt,
         0,
@@ -745,6 +748,31 @@ def ds_denial_from_child_apex():
     blind_nsec = [RR("bltest.", NSEC, nsec_rdata("a.bltest.", [RRSIG, NSEC]))]
     emit("bl_apex_nodata", "bltest.", "DS",
          message("bltest.", DS, [], blind_nsec + [sign(blind_nsec, blind)]))
+
+    # The parent's word, which is the only one a DS question can take (RFC 4035
+    # section 5.3.1). `unsigned.` and `unsigned.dstest3.` are delegations with
+    # no DS, and the zone above each says so with a record on the name itself:
+    # NS set, DS clear. That is a proven denial, and so Secure.
+    unsigned_nsec = [RR("unsigned.", NSEC, nsec_rdata("zz.", [NS, RRSIG, NSEC]))]
+    emit("da_unsigned_nodata", "unsigned.", "DS",
+         message("unsigned.", DS, [], unsigned_nsec + [sign(unsigned_nsec, root)]))
+    unsigned_nsec3 = [chain["unsigned.dstest3."]]
+    emit("da3_unsigned_nodata", "unsigned.dstest3.", "DS",
+         message("unsigned.dstest3.", DS, [], unsigned_nsec3 + [sign(unsigned_nsec3, child3)]))
+
+    # A DS set at `dstest.` for a key the root never delegated to, signed by
+    # `dstest.` itself. The signature verifies, and the zone it names is
+    # reached by the genuine DS above - but a DS at `dstest.` belongs to the
+    # root zone, so the child's signature over it vouches for nothing.
+    fabricated = Key("dstest.", "fabricated")
+    self_ds = [RR("dstest.", DS, fabricated.ds())]
+    emit("da_self_ds", "dstest.", "DS", message("dstest.", DS, self_ds + [sign(self_ds, child)]))
+    # The same RDATA signed by `dstest.` as an A set at its own apex. Nothing
+    # that filters by type lets it near `check_signature`, so the test calls it
+    # directly: the arithmetic holds over that RDATA read as A, and offered under
+    # any other type only the type check refuses it.
+    emit("da_self_ds_covers_a", "dstest.", "DS",
+         message("dstest.", DS, self_ds + [sign(self_ds, child, covered=A)]))
 
 
 @scenario
