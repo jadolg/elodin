@@ -36,6 +36,7 @@ keys are cached, so the cost falls on the first query into a zone.
 | denial of existence | NSEC and NSEC3, including closest-encloser proofs and opt-out |
 | wildcards | a wildcard answer must come with a proof that the name had nothing of its own |
 | unsigned zones | insecure: served, no AD bit |
+| a DS question | judged against the parent zone, which holds the DS (RFC 4035 section 5.3.1): its signed proof of no DS gets AD, a proof through an opt-out span does not (RFC 5155 section 9.2), and a DS set signed by the zone it names is bogus |
 | bounds | 32 DS/DNSKEY lookups and 64 signature checks per question, 24 zone cuts of chain, 8 signatures per RRset, 64 keys per zone and 8 KB of them cached, 8 hint targets per answer, 100 NSEC3 iterations |
 | a DS set naming nothing we can check | an insecure delegation, whether the algorithm is unimplemented here or refused by the host's crypto policy (RFC 6840 section 5.2) |
 | a DS set naming something we can check | that path has to hold up: a DNSKEY set it does not lead to is bogus, however many uncheckable DS records sit beside it |
