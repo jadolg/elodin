@@ -8,8 +8,9 @@ A DoH upstream's url is sent as written from the path on, query and all: some
 services name the account in the query, and without it every query goes to
 the service's default. A url with no path is `/` (RFC 3986 6.2.3), with the
 query after it, its order, repeated keys and escapes kept, and the host and
-port end where it starts. Both forms of upstream, the map and the bare url,
-read it the same way, and the scheme in any case (RFC 3986 3.1).
+port end at the first `/`, `?` or `#` (RFC 3986 3.2). Both forms of upstream,
+the map and the bare url, read it the same way, and the scheme in any case
+(RFC 3986 3.1).
 */
 @(test)
 test_a_doh_upstream_keeps_its_query :: proc(t: ^testing.T) {
