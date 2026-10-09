@@ -57,9 +57,9 @@ belong to one transaction and are never forwarded as an answer.
 Some of the types listed may not legally be compressed at all: RFC 4034
 sections 3.1.7 and 4.1.1 forbid it for the RRSIG signer and the NSEC next owner,
 and RFC 3597 section 4 for every type defined after it, which covers TALINK, LP,
-DSYNC, IPSECKEY, AMTRELAY and HIP. A sender that does it anyway still hands this decoder a pointer, and
-expanding it is what Unbound does too; carrying it through would put a
-different name in the answer than the sender wrote.
+DSYNC, IPSECKEY, AMTRELAY and HIP. A sender that does it anyway still hands this
+decoder a pointer, and expanding it is what Unbound does too; carrying it through
+would put a different name in the answer than the sender wrote.
 
 The types this decoder models natively - NS, CNAME, PTR, DNAME, MB, MG, MR,
 NSAP-PTR, SOA, MX, SRV - are on the list too, because a record of one of them
@@ -189,7 +189,8 @@ decode_raw_rdata :: proc(r: ^Reader, type: Type, start, end: int, allocator: mem
 	return Rdata_Raw{data = verbatim}
 }
 
-// No layout has more than two names in it, and the walk holds them on the stack.
+// The most names a walk holds on the stack. Every fixed layout has two at most; a
+// HIP record with more rendezvous servers than this is not expanded.
 @(private)
 MAX_RAW_NAMES :: 2
 

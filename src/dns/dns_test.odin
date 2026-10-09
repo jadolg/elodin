@@ -1031,22 +1031,27 @@ test_rrsig_signature_bytes_are_not_taken_for_a_pointer :: proc(t: ^testing.T) {
 /*
 A layout read from the RDATA reaches no further than the RDATA says.
 
-An IPSECKEY whose gateway is an IPv4 address holds no name, so bytes there that
-look like a pointer are an address and come through byte for byte. A HIP record
-with more rendezvous servers than the walk holds is not expanded, and the pointer
-in it is refused by the writer rather than copied to name whatever byte sits at
-its offset afterwards.
+An IPSECKEY whose gateway, or an AMTRELAY whose relay, is an IPv4 address holds
+no name, so bytes there that look like a pointer are an address and come through
+byte for byte. A HIP record with more rendezvous servers than the walk holds is
+not expanded, and the pointer in it is refused by the writer rather than copied
+to name whatever byte sits at its offset afterwards.
 */
 @(test)
 test_raw_rdata_layout_read_from_the_rdata :: proc(t: ^testing.T) {
-	m, ns_target := message_prefix(4)
+	m, ns_target := message_prefix(5)
 	gateway := []u8{10, 1, 2, 0xc0, 0x46, 0x00, 0x01, 0xaa}
 	append_answer(&m, .IPSECKEY, gateway)
+	// D bit set, relay type 1: an IPv4 relay.
+	relay := []u8{10, 0x81, 0xc0, 0x46, 0x00, 0x01}
+	append_answer(&m, .AMTRELAY, relay)
 	hip := []u8{1, 2, 0, 0, 0xab, 0, 0, 0xc0 | u8(ns_target >> 8), u8(ns_target)}
 	append_answer(&m, .HIP, hip)
 
 	raw, ok := raw_rdata_of(m[:], .IPSECKEY)
 	testing.expect(t, ok && mem.compare(raw, gateway) == 0, "an IPv4 gateway was altered")
+	raw, ok = raw_rdata_of(m[:], .AMTRELAY)
+	testing.expect(t, ok && mem.compare(raw, relay) == 0, "an IPv4 relay was altered")
 	raw, ok = raw_rdata_of(m[:], .HIP)
 	testing.expect(t, ok && mem.compare(raw, hip) == 0, "a HIP record past the walk's reach was altered")
 

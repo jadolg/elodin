@@ -385,8 +385,27 @@ Pw_Layout :: struct {
 }
 
 @(private = "file")
-pw_layout :: proc(t: u16) -> (layout: Pw_Layout, ok: bool) {
+pw_layout :: proc(t: u16, rdata: []u8) -> (layout: Pw_Layout, ok: bool) {
 	switch t {
+	// IPSECKEY: a name only when the gateway type is 3
+	case 45:
+		if len(rdata) > 1 && rdata[1] == 3 {
+			return {3, 0, 1}, true
+		}
+	// AMTRELAY: a name only when the relay type is 3
+	case 260:
+		if len(rdata) > 1 && rdata[1] & 0x7f == 3 {
+			return {2, 0, 1}, true
+		}
+	// HIP: rendezvous servers after the HIT and key, to the end
+	case 55:
+		if len(rdata) < 4 {
+			break
+		}
+		fixed := 4 + int(rdata[0]) + (int(rdata[2]) << 8 | int(rdata[3]))
+		if names, counted := pw_count_names(rdata, fixed); counted {
+			return {fixed, 0, names}, true
+		}
 	// NS, MD, MF, CNAME, MB, MG, MR, PTR, NSAP-PTR, NXT, DNAME
 	case 2, 3, 4, 5, 7, 8, 9, 12, 23, 30, 39:
 		return {0, 0, 1}, true
@@ -424,6 +443,29 @@ pw_layout :: proc(t: u16) -> (layout: Pw_Layout, ok: bool) {
 	return {}, false
 }
 
+// How many names run from `pos` to the end of `rdata`, each ending at a root
+// label or a pointer; false when they do not end exactly at the end.
+@(private = "file")
+pw_count_names :: proc(rdata: []u8, pos: int) -> (n: int, ok: bool) {
+	pos := pos
+	for pos < len(rdata) {
+		l := rdata[pos]
+		switch {
+		case l & 0xc0 == 0xc0:
+			pos += 2
+			n += 1
+		case l & 0xc0 != 0:
+			return 0, false
+		case l == 0:
+			pos += 1
+			n += 1
+		case:
+			pos += 1 + int(l)
+		}
+	}
+	return n, pos == len(rdata)
+}
+
 /*
 Copy the RDATA at `msg[start:end]`, expanding any compressed name in it.
 
@@ -445,7 +487,7 @@ pw_canonical_rdata :: proc(
 		return out
 	}
 
-	layout, known := pw_layout(type)
+	layout, known := pw_layout(type, msg[start:end])
 	if !known {
 		return verbatim(msg, start, end, allocator)
 	}
@@ -630,7 +672,7 @@ and only these types may compress one. Anything else is returned as it stands.
 */
 @(private = "file")
 pw_fold_rdata_names :: proc(type: u16, rdata: []u8, allocator: mem.Allocator) -> []u8 {
-	layout, known := pw_layout(type)
+	layout, known := pw_layout(type, rdata)
 	if !known {
 		return rdata
 	}
