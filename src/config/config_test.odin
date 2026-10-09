@@ -1227,33 +1227,6 @@ test_unreachable_doh_paths_are_errors :: proc(t: ^testing.T) {
 }
 
 /*
-The query is part of the request target (RFC 9112 3.2.1): a DoH provider may carry
-a per-user profile or key there, so it is sent as written, on both spellings of
-an upstream. The fragment is the client's alone and is never sent, and a url with
-no path names `/` (RFC 3986 6.2.3) (#459).
-*/
-@(test)
-test_an_upstream_url_keeps_its_query :: proc(t: ^testing.T) {
-	Case :: struct {
-		src, path: string,
-	}
-	cases := []Case {
-		{"servers: [\"https://dns.example/dns-query?token=abc&b=1&b=2#frag\"]", "/dns-query?token=abc&b=1&b=2"},
-		{"servers:\n    - url: \"https://dns.example/dns-query?token=abc&b=1&b=2#frag\"", "/dns-query?token=abc&b=1&b=2"},
-		{"servers: [\"https://dns.example?token=abc\"]", "/?token=abc"},
-		{"servers:\n    - url: \"https://dns.example:8443?token=abc\"", "/?token=abc"},
-	}
-	for c in cases {
-		src := strings.concatenate({"upstream:\n  bootstrap: [9.9.9.9]\n  ", c.src, "\n"}, context.temp_allocator)
-		cfg, err := load_string(src, context.temp_allocator)
-		if testing.expectf(t, err == nil, "%q: %v", c.src, err) {
-			testing.expectf(t, cfg.upstream.servers[0].path == c.path, "%q: path %q, want %q", c.src, cfg.upstream.servers[0].path, c.path)
-		}
-	}
-	free_all(context.temp_allocator)
-}
-
-/*
 An upstream URL is written into the request line and the `Host` field of every
 query sent to it, so a byte there that the request line cannot hold is a request
 line of elodin's own making that is malformed - or, given a CR LF, one that

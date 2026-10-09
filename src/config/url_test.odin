@@ -7,8 +7,9 @@ import "core:testing"
 A DoH upstream's url is sent as written from the path on, query and all: some
 services name the account in the query, and without it every query goes to
 the service's default. A url with no path is `/` (RFC 3986 6.2.3), with the
-query after it. Both forms of upstream, the map and the bare url, read it the
-same way, and the scheme in any case (RFC 3986 3.1).
+query after it, its order and repeated keys kept. Both forms of upstream, the
+map and the bare url, read it the same way, and the scheme in any case (RFC
+3986 3.1).
 */
 @(test)
 test_a_doh_upstream_keeps_its_query :: proc(t: ^testing.T) {
@@ -16,10 +17,11 @@ test_a_doh_upstream_keeps_its_query :: proc(t: ^testing.T) {
 		src, want: string,
 	}
 	cases := []Case {
-		{"upstream:\n  bootstrap: [1.1.1.1]\n  servers: [\"https://dns.example/dns-query?profile=ab12\"]\n", "/dns-query?profile=ab12"},
+		{"upstream:\n  bootstrap: [1.1.1.1]\n  servers: [\"https://dns.example/dns-query?profile=ab12&b=1&b=2\"]\n", "/dns-query?profile=ab12&b=1&b=2"},
 		{"upstream:\n  bootstrap: [1.1.1.1]\n  servers: [{url: \"HTTPS://dns.example/q?profile=ab12#x\"}]\n", "/q?profile=ab12"},
 		{"upstream:\n  bootstrap: [1.1.1.1]\n  servers: [\"Https://dns.example?profile=ab12\"]\n", "/?profile=ab12"},
 		{"upstream:\n  bootstrap: [1.1.1.1]\n  servers: [{url: \"https://dns.example:8443\"}]\n", "/"},
+		{"upstream:\n  bootstrap: [1.1.1.1]\n  servers: [\"https://dns.example:8443?profile=ab12#x\"]\n", "/?profile=ab12"},
 	}
 	for c in cases {
 		cfg, err := load_string(c.src, context.temp_allocator)
