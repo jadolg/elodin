@@ -1411,6 +1411,8 @@ test_an_entry_that_turns_unreadable_on_a_later_walk_is_dropped :: proc(t: ^testi
 	thread.destroy(mock)
 	// Allowlisted, so it was served and stored rather than refused.
 	testing.expect_value(t, first, Outcome.Forwarded)
+	// Stored, or the refusal below is the dead mock's timeout and not the re-walk.
+	testing.expect_value(t, cache.stats(answers).inserts, 1)
 
 	// The operator drops the allow rule and reloads.
 	ob, oa := filter.engine_swap(engine, filter.set_make(), filter.set_make())

@@ -111,6 +111,23 @@ test_a_bare_cname_without_a_soa_is_not_cached :: proc(t: ^testing.T) {
 	// the answer (see `answers_the_question`).
 	held, kept = held_for(c, {qtype = .DNAME, cname_ttl = 86400, dname = true})
 	testing.expectf(t, !kept, "a DNAME question answered by the DNAME above it was held for %v", held)
+
+	// And a DNAME above a later link, not the question name: it synthesized
+	// the second CNAME, so it is the chain and not the answer.
+	later := dns.Message {
+		question = []dns.Question{{name = "www.example.com.", type = .DNAME, class = .IN}},
+		answer = []dns.Record {
+			{name = "www.example.com.", type = .CNAME, class = .IN, ttl = 86400, data = dns.Rdata_Name{"a.example.org."}},
+			{name = "example.org.", type = .DNAME, class = .IN, ttl = 86400, data = dns.Rdata_Name{"example.net."}},
+			{name = "a.example.org.", type = .CNAME, class = .IN, ttl = 86400, data = dns.Rdata_Name{"a.example.net."}},
+		},
+	}
+	later.flags.qr = true
+	wire, _, err := dns.encode_message(later, context.temp_allocator)
+	testing.expect_value(t, err, dns.Encode_Error.None)
+	kb: [KEY_MAX]u8
+	key := make_key(kb[:], "www.example.com.", .DNAME, .IN, false)
+	testing.expect(t, !put(c, key, wire, later), "a DNAME question answered by a DNAME above a later link was cached")
 	free_all(context.temp_allocator)
 }
 
@@ -166,5 +183,17 @@ test_a_chain_that_answers_is_not_a_denial :: proc(t: ^testing.T) {
 	held, kept = held_for(c, {qtype = .ANY, cname_ttl = 3600})
 	testing.expect(t, kept, "a CNAME in answer to ANY was not cached")
 	testing.expect_value(t, held, 3600 * time.Second)
+
+	// A DNAME owned at the question name is the data asked for.
+	at := dns.Message {
+		question = []dns.Question{{name = "example.com.", type = .DNAME, class = .IN}},
+		answer = []dns.Record{{name = "example.com.", type = .DNAME, class = .IN, ttl = 3600, data = dns.Rdata_Name{"example.net."}}},
+	}
+	at.flags.qr = true
+	wire, _, err := dns.encode_message(at, context.temp_allocator)
+	testing.expect_value(t, err, dns.Encode_Error.None)
+	kb: [KEY_MAX]u8
+	key := make_key(kb[:], "example.com.", .DNAME, .IN, false)
+	testing.expect(t, put(c, key, wire, at), "the DNAME asked for, at the question name, was not cached")
 	free_all(context.temp_allocator)
 }

@@ -544,9 +544,13 @@ as it was. A record of the type asked for anywhere in the section ends it, which
 is the type check alone and not a walk: the cache does not judge whether the
 chain is sound, only how long what it was handed is good for.
 
-Except for a DNAME above the question name, which is the redirection that
-synthesizes the CNAME and not data at any name the chain reaches, even when
-DNAME is the type asked for - the reading `answers_the_question` gives it.
+A DNAME is the answer to a DNAME question only when it is owned at the question
+name. One above it, or above a later link, is the redirection that synthesized
+a CNAME of the chain and not data at any name it reaches (RFC 6672 section 2.3,
+and the reading `answers_the_question` gives it). One at a later link's target
+would be the answer, and is read as chain all the same: telling it apart means
+matching every DNAME against every link, a cost the upstream chooses, and
+reading it as chain costs only the cache entry, never the client's answer.
 */
 @(private)
 only_a_chain :: proc(msg: dns.Message) -> bool {
@@ -560,7 +564,7 @@ only_a_chain :: proc(msg: dns.Message) -> bool {
 	for r in msg.answer {
 		#partial switch r.type {
 		case .DNAME:
-			if r.type == q.type && !dns.name_below(q.name, r.name) {
+			if r.type == q.type && dns.name_equal_fold(r.name, q.name) {
 				return false
 			}
 		case .CNAME, .RRSIG:
@@ -995,23 +999,21 @@ thing in both directions.
 		// minute this is allowed to.
 		effective = min(u32(BOGUS_TTL), c.max_ttl)
 	} else {
+		/*
+		No longer than any record the entry hands back, denial or not. A denial
+		after a CNAME carries the chain, which `get` counts down like any answer,
+		so outliving it would serve the CNAME at zero, or at `min_ttl`, for the
+		rest of the SOA figure. The same holds for every record a plain denial
+		carries - the SOA, whose own TTL already bounds `soa_ttl`, and any NSEC,
+		NSEC3, RRSIG or NS beside it.
+		*/
+		v, has := dns.min_ttl(ttls)
+		effective = v if has else 0
 		if negative {
-			/*
-			And no longer than any record the entry hands back. A denial after a
-			CNAME carries the chain, which `get` counts down like any answer, so
-			outliving it would serve the CNAME at zero, or at `min_ttl`, for the
-			rest of the SOA figure. The same holds for every record a plain denial
-			carries - the SOA, whose own TTL already bounds `soa_ttl`, and any
-			NSEC, NSEC3, RRSIG or NS beside it.
-			*/
-			v, _ := dns.min_ttl(ttls)
-			effective = min(soa_ttl, v)
+			effective = min(effective, soa_ttl)
 			if c.negative_ttl > 0 {
 				effective = min(effective, c.negative_ttl)
 			}
-		} else {
-			v, has := dns.min_ttl(ttls)
-			effective = v if has else 0
 		}
 		effective = clamp(effective, c.min_ttl, c.max_ttl)
 	}
