@@ -1187,11 +1187,8 @@ zone, which nothing here ever established. So out it goes with the rest, SOA
 included, and a downstream resolver falls back to its own idea of how long to
 remember the absence.
 
-Our own cache pays for it, and only on the NXDOMAIN half. `cache.put` picks
-its lifetime on `rcode == .NX_Domain || len(msg.answer) == 0`, so the NODATA one
-keeps its CNAME in the answer section and is held for the shortest TTL still
-there; the NXDOMAIN one takes the negative branch whatever its answer section
-holds, finds no SOA to read, and is not kept at all (RFC 2308 section 5), so
+Our own cache pays for it. `cache.put` reads both as the denials they are
+(RFC 2308 section 2.2), finds no SOA to read, and keeps neither (section 5), so
 every repeat goes upstream. Both are the same missing chain walk, and are fixed
 by the same one.
 

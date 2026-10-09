@@ -830,6 +830,7 @@ run_cache_cases :: proc(r: ^Runner) {
 	mock_reply(mock, POISONED_NAME, u16(dns.Type.A), denial_reply(POISONED_NAME, .NX_Domain, data = true))
 	mock_reply(mock, "nosoa.example.com.", u16(dns.Type.A), nil)
 	mock_reply(mock, "referral.example.com.", u16(dns.Type.A), referral_reply("referral.example.com."))
+	mock_reply(mock, "cname-nosoa.example.com.", u16(dns.Type.A), bare_cname_reply("cname-nosoa.example.com."))
 	// Any other question (the AAAA case below) gets a matching synthesised
 	// answer rather than a canned one for the wrong name.
 	mock_synth_all(mock, {203, 0, 113, 2})
@@ -963,6 +964,25 @@ blocking: {{ enabled: false }}
 			}
 			_ = query_udp(udp_port, build_query(name, u16(dns.Type.A), id = u16(21 + 2 * i)))
 			check_eq_int(r, mock_total(mock), 2, fmt.tprintf("upstream queries for %s asked twice", name))
+		}
+	}
+	end_case(r)
+
+	start_case(r, "cache: NODATA after a CNAME without a SOA is not cached")
+	{
+		// Issue #418: a CNAME that never reaches the type asked for is a denial
+		// (RFC 2308 section 2.2) and is kept like one, so with no SOA it is not
+		// kept at all - rather than for the CNAME's own TTL, up to `max_ttl`.
+		mock_reset_counts(mock)
+		name := "cname-nosoa.example.com."
+		first := query_udp(udp_port, build_query(name, u16(dns.Type.A), id = 30))
+		if check(r, first.ok, "no response to the first query") {
+			h := parse_header(r, first.wire)
+			check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want the NOERROR the mock sent", h.rcode)
+			check_eq_int(r, h.ancount, 1, "answer count, the bare CNAME")
+			check_eq_int(r, h.nscount, 0, "authority count")
+			_ = query_udp(udp_port, build_query(name, u16(dns.Type.A), id = 31))
+			check_eq_int(r, mock_total(mock), 2, "upstream queries for a bare CNAME asked twice")
 		}
 	}
 	end_case(r)
@@ -1541,6 +1561,32 @@ first_stale_address :: proc(r: ^Runner, wire: []u8) -> string {
 // A referral: NOERROR, RA clear, the zone's NS in authority and no SOA - what a
 // server that does not recurse sends for a name below a cut.
 @(private = "file")
+// NOERROR whose answer is a CNAME out of the zone and nothing else: no record at
+// the target, and nothing in authority.
+bare_cname_reply :: proc(name: string) -> []u8 {
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question{name = name, type = .A, class = .IN}
+	answer := make([]dns.Record, 1, context.temp_allocator)
+	answer[0] = dns.Record {
+		name  = name,
+		type  = .CNAME,
+		class = .IN,
+		ttl   = 3600,
+		data  = dns.Rdata_Name{name = "cdn.example.net."},
+	}
+	msg := dns.Message {
+		question = question,
+		answer   = answer,
+	}
+	msg.flags.qr = true
+	msg.flags.ra = true
+	wire, _, err := dns.encode_message(msg, context.allocator)
+	if err != .None {
+		return nil
+	}
+	return wire
+}
+
 referral_reply :: proc(name: string) -> []u8 {
 	question := make([]dns.Question, 1, context.temp_allocator)
 	question[0] = dns.Question{name = name, type = .A, class = .IN}

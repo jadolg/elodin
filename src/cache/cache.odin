@@ -533,6 +533,36 @@ answers_the_question :: proc(msg: dns.Message, rec: dns.Record) -> bool {
 	return dns.name_equal_fold(q.name, rec.name)
 }
 
+/*
+Is the answer section a redirection chain that stops short of the type asked
+for? That is NODATA after a CNAME (RFC 2308 section 2.2), and `put` keeps it as
+the denial it is.
+
+Only CNAME and DNAME records, and the RRSIGs over them, make a chain; any other
+type in the section leaves the message to be read as the answer it claims to be,
+as it was. A record of the type asked for anywhere in the section ends it, which
+is the type check alone and not a walk: the cache does not judge whether the
+chain is sound, only how long what it was handed is good for.
+*/
+@(private)
+only_a_chain :: proc(msg: dns.Message) -> bool {
+	if len(msg.question) == 0 || len(msg.answer) == 0 {
+		return false
+	}
+	q := msg.question[0]
+	for r in msg.answer {
+		if q.type == .ANY || r.type == q.type {
+			return false
+		}
+		#partial switch r.type {
+		case .CNAME, .DNAME, .RRSIG:
+		case:
+			return false
+		}
+	}
+	return true
+}
+
 // The class the response was asked in. `IN` where there is no question to read
 // it from, which is the class every path into this cache asks in.
 @(private)
@@ -902,8 +932,13 @@ the same shape stopped one layer further out, on the paths no validator
 	would lift into a stored entry; `negative_ttl` must not stand in for a
 	missing SOA either, since that would hold the denial for five minutes by
 	default.
+
+	NODATA after a redirection is a denial too (RFC 2308 section 2.2): an answer
+	section holding a CNAME or DNAME chain that never reaches the type asked for
+	says nothing is there, and read as data it would be held for the chain's own
+	TTL - up to `max_ttl` - with no SOA behind it at all.
 	*/
-	negative := !bogus && (rcode == .NX_Domain || len(msg.answer) == 0)
+	negative := !bogus && (rcode == .NX_Domain || len(msg.answer) == 0 || only_a_chain(msg))
 	soa_ttl: u32
 	if negative {
 		has_soa: bool
@@ -950,7 +985,15 @@ thing in both directions.
 		effective = min(u32(BOGUS_TTL), c.max_ttl)
 	} else {
 		if negative {
-			effective = soa_ttl
+			/*
+			And no longer than any record the entry hands back. A denial after a
+			CNAME carries the chain, which `get` counts down like any answer, so
+			outliving it would serve the CNAME at zero, or at `min_ttl`, for the
+			rest of the SOA figure. A plain denial's shortest record is the SOA,
+			whose own TTL already bounds `soa_ttl`.
+			*/
+			v, _ := dns.min_ttl(ttls)
+			effective = min(soa_ttl, v)
 			if c.negative_ttl > 0 {
 				effective = min(effective, c.negative_ttl)
 			}

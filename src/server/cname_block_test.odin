@@ -1393,13 +1393,16 @@ test_an_entry_that_turns_unreadable_on_a_later_walk_is_dropped :: proc(t: ^testi
 	}
 	bad := make([dynamic]u8, 0, len(base) + 32, context.temp_allocator)
 	append(&bad, ..base)
-	bad[7] = 1
+	bad[7] = 2
 	for label in ([]string{"www", "brand", "example"}) {
 		append(&bad, u8(len(label)))
 		append(&bad, ..transmute([]u8)label)
 	}
 	append(&bad, 0)
 	append(&bad, 0, 5, 0, 1, 0, 0, 0, 60, 0, 2, 0xc0, 0xfe)
+	// And an A, so the answer is one the cache keeps: a chain that stops short
+	// of the type asked for is a denial, and with no SOA it is not stored.
+	append(&bad, 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 1)
 
 	x := Cloak_Mock{socket = socket, reply = bad[:]}
 	mock := thread.create_and_start_with_poly_data(&x, serve_cloak)
