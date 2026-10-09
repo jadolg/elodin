@@ -47,14 +47,15 @@ Conn_Manager :: struct {
 	// figure that only ever grows stops describing anything once a loop ends.
 	permanent:    int,
 	/*
-	Set by `conn_manager_shutdown`, under `mu`, when it takes the table to join.
+	Set by `conn_manager_shutdown`, under `mu`, before it joins the table.
 
 	The accept loops read `stop` before they block in an accept, not after it
 	returns, so a connection accepted as shutdown begins still asks for a
 	thread. Refused here, in the same critical section that would otherwise
 	append it, because no check outside the lock can be made atomic with the
-	spawn: a thread started past this point lands in a table nothing drains
-	again, and outlives the `Stream_Context` that `destroy_listeners` frees.
+	spawn: a thread started once the join has emptied the table lands in one
+	nothing drains again, and outlives the `Stream_Context` that
+	`destroy_listeners` frees.
 	*/
 	stopped:      bool,
 }
@@ -175,6 +176,11 @@ prefix_conns_locked :: proc(cm: ^Conn_Manager, prefix: Client_Prefix) -> int {
 
 @(private)
 reap_locked :: proc(cm: ^Conn_Manager) {
+	// Once stopped the table is `conn_manager_shutdown`'s alone to empty: a reap
+	// here would join a thread it is joining, and move the entry it pops.
+	if cm.stopped {
+		return
+	}
 	i := 0
 	for i < len(cm.threads) {
 		entry := cm.threads[i]
@@ -198,20 +204,38 @@ active_connections :: proc(cm: ^Conn_Manager) -> int {
 	return len(cm.threads) - cm.permanent
 }
 
-// Wait for every connection thread to finish, and refuse any spawn after it.
-// Callers close the listening sockets first so the handlers see EOF and return.
-// The threads taken here are all there will be, so `permanent` goes with them.
+/*
+Wait for every connection thread to finish, and refuse any spawn after it.
+Callers close the listening sockets first so the handlers see EOF and return.
+
+Each thread leaves the table only once it is joined, so `active_connections`
+falls as the join goes - which is what `stop_metrics` keeps the endpoint open to
+show - and `permanent` falls with the loops it counts.
+*/
 conn_manager_shutdown :: proc(cm: ^Conn_Manager) {
 	sync.mutex_lock(&cm.mu)
 	cm.stopped = true
-	threads := cm.threads
-	cm.threads = nil
-	cm.permanent = 0
 	sync.mutex_unlock(&cm.mu)
 
-	for entry in threads {
+	for {
+		sync.mutex_lock(&cm.mu)
+		if len(cm.threads) == 0 {
+			delete(cm.threads)
+			cm.threads = nil
+			sync.mutex_unlock(&cm.mu)
+			return
+		}
+		entry := cm.threads[len(cm.threads) - 1]
+		sync.mutex_unlock(&cm.mu)
+
 		thread.join(entry.handle)
+
+		sync.mutex_lock(&cm.mu)
+		pop(&cm.threads)
+		if entry.permanent {
+			cm.permanent -= 1
+		}
+		sync.mutex_unlock(&cm.mu)
 		thread.destroy(entry.handle)
 	}
-	delete(threads)
 }

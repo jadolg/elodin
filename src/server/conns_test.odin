@@ -3,6 +3,7 @@ package server
 import "core:net"
 import "core:sync"
 import "core:testing"
+import "core:thread"
 import "core:time"
 
 /*
@@ -272,10 +273,10 @@ Shutdown is final: a spawn after it starts nothing.
 
 An accept loop reads `stop` before it blocks, not after the accept returns, so a
 connection accepted as shutdown begins reaches `conn_spawn` once
-`conn_manager_shutdown` has taken the table to join. Started then, its thread
-went into a fresh table nothing drains again and outlived the `Stream_Context`
-`destroy_listeners` frees under it. The permanent tally the shutdown took the
-loops out of has to go with them, or `active_connections` reads negative.
+`conn_manager_shutdown` has started. A thread started then would land in a table
+nothing drains again and outlive the `Stream_Context` `destroy_listeners` frees
+under it. The permanent tally goes with the loops it counts, or
+`active_connections` reads negative.
 */
 @(test)
 test_spawn_after_shutdown_is_refused :: proc(t: ^testing.T) {
@@ -307,4 +308,73 @@ test_spawn_after_shutdown_is_refused :: proc(t: ^testing.T) {
 	// late thread that did start fails the case instead of hanging the join.
 	sync.atomic_store(&late.go, true)
 	conn_manager_shutdown(&cm)
+}
+
+@(private = "file")
+shuts_down :: proc(cm: ^Conn_Manager) {
+	conn_manager_shutdown(cm)
+}
+
+@(private = "file")
+is_stopped :: proc(cm: ^Conn_Manager) -> bool {
+	sync.mutex_lock(&cm.mu)
+	defer sync.mutex_unlock(&cm.mu)
+	return cm.stopped
+}
+
+/*
+The gauge counts the connections the shutdown is still waiting on.
+
+`stop_metrics` keeps the endpoint open through `conn_manager_shutdown` so that an
+operator can watch `elodin_connections_active` fall to zero. A connection being
+joined is still open, so it is still counted, and a loop already gone is not.
+*/
+@(test)
+test_a_connection_being_joined_is_still_counted :: proc(t: ^testing.T) {
+	cm: Conn_Manager
+	conn_manager_init(&cm, 4, 0)
+
+	loop := Held{go = true}
+	testing.expect_value(t, conn_spawn(&cm, &loop, holds_until_released, counted = false), Spawn_Result.Started)
+	client := Held{}
+	testing.expect_value(t, conn_spawn(&cm, &client, holds_until_released), Spawn_Result.Started)
+
+	shutdown := thread.create_and_start_with_poly_data(&cm, shuts_down)
+	deadline := time.time_add(time.now(), 2 * time.Second)
+	for !is_stopped(&cm) && time.diff(time.now(), deadline) > 0 {
+		time.sleep(time.Millisecond)
+	}
+	testing.expect_value(t, active_connections(&cm), 1)
+
+	sync.atomic_store(&client.go, true)
+	thread.join(shutdown)
+	thread.destroy(shutdown)
+	testing.expect_value(t, active_connections(&cm), 0)
+}
+
+/*
+Once stopped, nothing but the shutdown takes a thread off the table.
+
+The shutdown joins the last entry with the lock released and pops it after. A
+scrape reaping meanwhile would join and destroy that same thread, or move the
+entry the pop then takes, so `reap_locked` leaves a stopped table alone - even a
+finished thread waits for the shutdown to join it.
+*/
+@(test)
+test_a_stopped_table_is_not_reaped :: proc(t: ^testing.T) {
+	cm: Conn_Manager
+	conn_manager_init(&cm, 4, 0)
+	testing.expect_value(t, conn_spawn(&cm, nil, returns_immediately), Spawn_Result.Started)
+
+	deadline := time.time_add(time.now(), 2 * time.Second)
+	for !thread.is_done(cm.threads[0].handle) && time.diff(time.now(), deadline) > 0 {
+		time.sleep(time.Millisecond)
+	}
+	sync.mutex_lock(&cm.mu)
+	cm.stopped = true
+	sync.mutex_unlock(&cm.mu)
+
+	testing.expect_value(t, active_connections(&cm), 1)
+	conn_manager_shutdown(&cm)
+	testing.expect_value(t, active_connections(&cm), 0)
 }
