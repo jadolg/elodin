@@ -379,8 +379,8 @@ test_a_connection_over_its_prefix_share_is_refused :: proc(t: ^testing.T) {
 /*
 A connection accepted as shutdown begins is closed, and is not counted.
 
-`conn_spawn` refuses it with `.Stopped` once `conn_manager_shutdown` has taken the
-table. The accept loop has to close the socket and free the job on that refusal,
+`conn_spawn` refuses it with `.Stopped` once `conn_manager_shutdown` has begun.
+The accept loop has to close the socket and free the job on that refusal,
 and must not book it as `conn_refused=` or `conn_failed=` or log a line telling
 the operator to raise a limit: the server is exiting, not full. The manager is
 marked stopped by hand so the accept loop is still running to show it - the

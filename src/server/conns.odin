@@ -2,6 +2,7 @@ package server
 
 import "core:sync"
 import "core:thread"
+import "core:time"
 
 // Stamped at build time from the git tag; see ELODIN_VERSION in mise.toml. A
 // build that bypasses mise reports "dev" rather than claiming a release number.
@@ -53,8 +54,8 @@ Conn_Manager :: struct {
 	returns, so a connection accepted as shutdown begins still asks for a
 	thread. Refused here, in the same critical section that would otherwise
 	append it, because no check outside the lock can be made atomic with the
-	spawn: a thread started once the join has emptied the table lands in one
-	nothing drains again, and outlives the `Stream_Context` that
+	spawn: a thread started once the shutdown has found the table empty lands in
+	one nothing drains again, and outlives the `Stream_Context` that
 	`destroy_listeners` frees.
 	*/
 	stopped:      bool,
@@ -176,11 +177,6 @@ prefix_conns_locked :: proc(cm: ^Conn_Manager, prefix: Client_Prefix) -> int {
 
 @(private)
 reap_locked :: proc(cm: ^Conn_Manager) {
-	// Once stopped the table is `conn_manager_shutdown`'s alone to empty: a reap
-	// here would join a thread it is joining, and move the entry it pops.
-	if cm.stopped {
-		return
-	}
 	i := 0
 	for i < len(cm.threads) {
 		entry := cm.threads[i]
@@ -208,9 +204,12 @@ active_connections :: proc(cm: ^Conn_Manager) -> int {
 Wait for every connection thread to finish, and refuse any spawn after it.
 Callers close the listening sockets first so the handlers see EOF and return.
 
-Each thread leaves the table only once it is joined, so `active_connections`
-falls as the join goes - which is what `stop_metrics` keeps the endpoint open to
-show - and `permanent` falls with the loops it counts.
+Reaped in place rather than joined one by one from a copy: a thread leaves the
+table as soon as it is done, whichever order they finish in, so
+`active_connections` counts down the connections still open - which is what
+`stop_metrics` keeps the endpoint open to show. Every join is of a finished
+thread and happens under `mu`, so a scrape reaping at the same time cannot join
+one twice.
 */
 conn_manager_shutdown :: proc(cm: ^Conn_Manager) {
 	sync.mutex_lock(&cm.mu)
@@ -219,23 +218,19 @@ conn_manager_shutdown :: proc(cm: ^Conn_Manager) {
 
 	for {
 		sync.mutex_lock(&cm.mu)
+		reap_locked(cm)
 		if len(cm.threads) == 0 {
 			delete(cm.threads)
 			cm.threads = nil
 			sync.mutex_unlock(&cm.mu)
 			return
 		}
-		entry := cm.threads[len(cm.threads) - 1]
 		sync.mutex_unlock(&cm.mu)
-
-		thread.join(entry.handle)
-
-		sync.mutex_lock(&cm.mu)
-		pop(&cm.threads)
-		if entry.permanent {
-			cm.permanent -= 1
-		}
-		sync.mutex_unlock(&cm.mu)
-		thread.destroy(entry.handle)
+		// ponytail: polled, so shutdown ends up to one interval after the last
+		// thread does; a condition variable signalled at thread exit if it matters.
+		time.sleep(SHUTDOWN_POLL)
 	}
 }
+
+@(private)
+SHUTDOWN_POLL :: 10 * time.Millisecond

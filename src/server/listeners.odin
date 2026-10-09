@@ -76,8 +76,8 @@ Listeners :: struct {
 	stream_loop_ctx:  [dynamic]^Stream_Context,
 	metrics_loop_ctx: ^Metrics_Context,
 	// Not routed through `conns` like every other loop: `conn_manager_shutdown`
-	// joins that list in order and this one must outlive the join, not sit in
-	// the middle of it. See `stop_metrics`.
+	// joins everything on that list and this one must outlive the join, not sit
+	// in the middle of it. See `stop_metrics`.
 	metrics_thread:   ^thread.Thread,
 }
 

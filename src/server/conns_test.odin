@@ -353,28 +353,34 @@ test_a_connection_being_joined_is_still_counted :: proc(t: ^testing.T) {
 }
 
 /*
-Once stopped, nothing but the shutdown takes a thread off the table.
+A connection that closes during shutdown stops being counted then, not when the
+ones before it have been joined.
 
-The shutdown joins the last entry with the lock released and pops it after. A
-scrape reaping meanwhile would join and destroy that same thread, or move the
-entry the pop then takes, so `reap_locked` leaves a stopped table alone - even a
-finished thread waits for the shutdown to join it.
+Two clients held open, the older released first: a shutdown joining one thread at
+a time, newest first, would sit on the newer one with the older finished behind it, and the
+gauge would go on counting a connection that is gone for up to
+`client_timeout`.
 */
 @(test)
-test_a_stopped_table_is_not_reaped :: proc(t: ^testing.T) {
+test_a_connection_closed_during_shutdown_is_not_counted :: proc(t: ^testing.T) {
 	cm: Conn_Manager
 	conn_manager_init(&cm, 4, 0)
-	testing.expect_value(t, conn_spawn(&cm, nil, returns_immediately), Spawn_Result.Started)
 
+	older := Held{}
+	newer := Held{}
+	testing.expect_value(t, conn_spawn(&cm, &older, holds_until_released), Spawn_Result.Started)
+	testing.expect_value(t, conn_spawn(&cm, &newer, holds_until_released), Spawn_Result.Started)
+
+	shutdown := thread.create_and_start_with_poly_data(&cm, shuts_down)
 	deadline := time.time_add(time.now(), 2 * time.Second)
-	for !thread.is_done(cm.threads[0].handle) && time.diff(time.now(), deadline) > 0 {
+	for !is_stopped(&cm) && time.diff(time.now(), deadline) > 0 {
 		time.sleep(time.Millisecond)
 	}
-	sync.mutex_lock(&cm.mu)
-	cm.stopped = true
-	sync.mutex_unlock(&cm.mu)
+	sync.atomic_store(&older.go, true)
+	testing.expect_value(t, wait_for_reap(&cm, 1), 1)
 
-	testing.expect_value(t, active_connections(&cm), 1)
-	conn_manager_shutdown(&cm)
+	sync.atomic_store(&newer.go, true)
+	thread.join(shutdown)
+	thread.destroy(shutdown)
 	testing.expect_value(t, active_connections(&cm), 0)
 }
