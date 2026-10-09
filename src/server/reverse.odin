@@ -359,13 +359,13 @@ REVERSIBLE_NETWORKS := []config.Prefix {
 	{addr = {0 = 0xfe, 1 = 0x80}, bits = 10, v6 = true}, // fe80::/10        link-local (RFC 4291)
 }
 
-// As written: an AAAA of `::ffff:10.0.0.1` is not a host on this network's v6
-// side, and is not reversed.
 @(private)
 address_is_local_v4 :: proc(a: [4]u8) -> bool {
 	return config.prefix_list_contains(REVERSIBLE_NETWORKS, {0 = a[0], 1 = a[1], 2 = a[2], 3 = a[3]}, false)
 }
 
+// As written: an AAAA of `::ffff:10.0.0.1` is not a host on this network's v6
+// side, and is not reversed.
 @(private)
 address_is_local_v6 :: proc(a: [16]u8) -> bool {
 	return config.prefix_list_contains(REVERSIBLE_NETWORKS, a, true)

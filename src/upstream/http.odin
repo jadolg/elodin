@@ -571,13 +571,8 @@ parse_status :: proc(line: string) -> (status: int, http_1_0: bool, err: Error) 
 	if len(line) > V + 4 && line[V + 4] != ' ' {
 		return 0, false, .HTTP_Error
 	}
-	v := 0
-	for c in transmute([]u8)line[V + 1:V + 4] {
-		if c < '0' || c > '9' {
-			return 0, false, .HTTP_Error
-		}
-		v = v * 10 + int(c - '0')
-	}
+	// Three digits or 0, which the range check below refuses.
+	v := h2.parse_status(line[V + 1:V + 4])
 	// RFC 9110 15: a status is 100 to 599. Below that it is not even an interim
 	// response to pass over, which is what `099` was read as (#442).
 	if v < 100 || v > 599 {

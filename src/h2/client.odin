@@ -565,7 +565,6 @@ it says anywhere else, which is a poor thing to hang a `== 200` on. Anything
 that is not three digits is not a status, and 0 is how a missing one is already
 reported.
 */
-@(private)
 parse_status :: proc(value: string) -> int {
 	if len(value) != 3 {
 		return 0

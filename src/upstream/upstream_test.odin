@@ -1786,8 +1786,17 @@ test_address_is_public_classifies_reserved_ranges :: proc(t: ^testing.T) {
 		{"64:ff9b::a9fe:a9fe", false},
 		{"64:ff9b::c0a8:101", false},
 		{"64:ff9b::", false},
-		// RFC 8215: the local-use prefix is the site's own, never global.
-		{"64:ff9b:1::808:808", false},
+		// RFC 8215's local-use prefix, its /96 judged the same way, so a list
+		// host a DNS64 synthesised under it is public when its IPv4 one is.
+		{"64:ff9b:1::808:808", true},
+		{"64:ff9b:1::7f00:1", false},
+		{"64:ff9b:1::a9fe:a9fe", false},
+		// The IPv4-translated form (RFC 2765) and 6to4 (RFC 3056).
+		{"::ffff:0:a9fe:a9fe", false},
+		{"::ffff:0:808:808", true},
+		{"2002:a9fe:a9fe::1", false},
+		{"2002:c0a8:101::1", false},
+		{"2002:808:808::1", true},
 		// The IPv4-compatible form, deprecated but parsed (RFC 4291 2.5.5.1).
 		{"::127.0.0.1", false},
 		{"::8.8.8.8", true},
@@ -1806,7 +1815,8 @@ test_address_is_public_classifies_reserved_ranges :: proc(t: ^testing.T) {
 		{"203.0.113.1", false},
 		{"255.255.255.255", false},
 		{"223.255.255.255", true},
-		{"64:ff9b:1:ffff::1", false},
+		// Another length's layout under the local-use prefix is not read.
+		{"64:ff9b:1:ffff::1", true},
 		{"64:ff9b:2::1", true},
 		{"100::1", false},
 		{"100:0:0:1::1", true},

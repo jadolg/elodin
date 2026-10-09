@@ -1077,7 +1077,7 @@ list_has_token :: proc(value, token: string) -> bool {
 
 `OWS` is spaces and tabs (RFC 9110 5.6.3), which is all a recipient may take off
 a field value. `strings.trim_space` takes more: it is Unicode-aware, so it also
-takes a non-breaking space off the end, which made `close\u00a0` a close. A hop
+takes a non-breaking space off the end, which would make `close\u00a0` a close. A hop
 in front reads the field as the grammar writes it and refuses the message rather
 than trimming it, so trimming one here is this hop reading a value the front end
 never saw.
@@ -1105,6 +1105,8 @@ the caller's range check, and its digits are still all checked: too large and
 not a length at all are different refusals.
 */
 parse_content_length :: proc(value: string, limit: int) -> (length: int, ok: bool) {
+	// `limit + 1` and the step towards it must not wrap themselves.
+	assert(limit >= 0 && limit < max(int) / 10)
 	digits := trim_ows(value)
 	if len(digits) == 0 {
 		return 0, false

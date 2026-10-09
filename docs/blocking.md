@@ -33,8 +33,9 @@ does not turn blocking off once a list has been fetched.
   link-local, carrier-grade NAT, multicast, the documentation and benchmarking
   ranges, and the other special-purpose ranges (RFC 6890) no list host can be
   at. An IPv4 address written inside an
-  IPv6 one (`::ffff:a.b.c.d`, `::a.b.c.d`, or the NAT64 prefix `64:ff9b::/96`,
-  RFC 6052) is judged as the IPv4 address. A list url is requested with its
+  IPv6 one (`::ffff:a.b.c.d`, `::a.b.c.d`,
+  `::ffff:0:a.b.c.d`, the NAT64 prefixes `64:ff9b::/96` and `64:ff9b:1::/96`,
+  and 6to4 `2002:aabb:ccdd::/48`) is judged as the IPv4 address. A list url is requested with its
   query (`?format=hosts`).
 - A download counts as failed when it is a web page (its first non-blank byte
   is `<`: a captive portal, an error page sent as a 200) or holds no rules,

@@ -15,7 +15,10 @@ dnsmasq's `--stop-dns-rebind` and Unbound's `private-address`.
 **Refused addresses:** loopback (`127.0.0.0/8`, `::1`), the RFC 1918 ranges,
 link-local (`169.254.0.0/16`, `fe80::/10`, which includes the `169.254.169.254`
 cloud metadata endpoint), IPv6 unique-local (`fc00::/7`), `0.0.0.0/8` and `::`
-(`0.0.0.0` reaches `127.0.0.1` services in browsers on Linux and macOS).
+(`0.0.0.0` reaches `127.0.0.1` services in browsers on Linux and macOS). An
+IPv4 address written inside an IPv6 one (`::ffff:a.b.c.d`, `::a.b.c.d`,
+`::ffff:0:a.b.c.d`, the NAT64 prefixes `64:ff9b::/96` and `64:ff9b:1::/96`, and
+6to4 `2002:aabb:ccdd::/48`) is judged as the IPv4 address.
 
 **What is checked:** answers to A, AAAA, ANY, SVCB and HTTPS questions. It reads A
 and AAAA records and the `ipv4hint`/`ipv6hint` of SVCB and HTTPS records, and

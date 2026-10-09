@@ -9,8 +9,8 @@ import "elodin:dns"
 
 @(private = "file")
 unhex :: proc(text: string, allocator := context.temp_allocator) -> []u8 {
-	out, _ := hex.decode(transmute([]u8)text, allocator)
-	return out
+	out, ok := hex.decode(transmute([]u8)text, allocator)
+	return out if ok else nil
 }
 
 @(private = "file")
