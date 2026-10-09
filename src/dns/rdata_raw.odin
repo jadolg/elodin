@@ -41,19 +41,23 @@ Where the domain names sit inside the RDATA of a type kept as raw bytes: some
 fixed-width bytes, then some character-strings, then the names. Everything past
 the last name is carried through untouched.
 
-Only types whose RDATA may carry a domain name need an entry, and only those
-whose layout is fixed enough to walk without knowing more than the type. A6 is
-left out: where its name starts depends on a prefix length in its own RDATA, and
-it has been formally obsolete since RFC 6563. An A6 record therefore still
-forwards with its pointer intact. HIP, IPSECKEY and AMTRELAY are left out for
-the same reason - their names sit behind lengths or a gateway type read from
-their own RDATA - and TKEY and TSIG because they belong to one transaction and
-are never forwarded as an answer.
+Only types whose RDATA may carry a domain name need an entry. Most layouts
+follow from the type alone; three are read from the RDATA too. An IPSECKEY
+(RFC 4025 section 2) or AMTRELAY (RFC 8777 section 4) holds a name only when
+its gateway or relay type is 3, and a HIP record's rendezvous servers (RFC 8005
+section 5) start after a HIT and a public key whose lengths it states, and run
+to the end. A HIP record with more rendezvous servers than `MAX_RAW_NAMES` is
+not expanded, and a pointer in it is refused by the writer instead.
+
+A6 is left out: where its name starts depends on a prefix length in its own
+RDATA, and it has been formally obsolete since RFC 6563. An A6 record therefore
+still forwards with its pointer intact. TKEY and TSIG are left out because they
+belong to one transaction and are never forwarded as an answer.
 
 Some of the types listed may not legally be compressed at all: RFC 4034
 sections 3.1.7 and 4.1.1 forbid it for the RRSIG signer and the NSEC next owner,
-and RFC 3597 section 4 for every type defined after it, which covers TALINK, LP
-and DSYNC. A sender that does it anyway still hands this decoder a pointer, and
+and RFC 3597 section 4 for every type defined after it, which covers TALINK, LP,
+DSYNC, IPSECKEY, AMTRELAY and HIP. A sender that does it anyway still hands this decoder a pointer, and
 expanding it is what Unbound does too; carrying it through would put a
 different name in the answer than the sender wrote.
 
@@ -78,8 +82,24 @@ itself signed, and the validator canonicalizes the signer of the one it checks
 on its own.
 */
 @(private)
-raw_rdata_layout :: proc "contextless" (t: Type) -> (layout: Raw_Layout, ok: bool) {
+raw_rdata_layout :: proc "contextless" (t: Type, rdata: []u8) -> (layout: Raw_Layout, ok: bool) {
 	#partial switch t {
+	case .IPSECKEY:
+		if len(rdata) > 1 && rdata[1] == 3 {
+			return {3, 0, 1}, true
+		}
+	case .AMTRELAY:
+		if len(rdata) > 1 && rdata[1] & 0x7f == 3 {
+			return {2, 0, 1}, true
+		}
+	case .HIP:
+		if len(rdata) < 4 {
+			break
+		}
+		fixed := 4 + int(rdata[0]) + (int(rdata[2]) << 8 | int(rdata[3]))
+		if names, counted := count_names(rdata, fixed); counted {
+			return {fixed, 0, names}, true
+		}
 	case .NS, .CNAME, .PTR, .DNAME, .MB, .MG, .MR, .MD, .MF, .NXT, .NSAP_PTR:
 		return {0, 0, 1}, true
 	case .SOA, .MINFO, .RP:
@@ -106,6 +126,29 @@ raw_rdata_layout :: proc "contextless" (t: Type) -> (layout: Raw_Layout, ok: boo
 	return {}, false
 }
 
+// How many names run from `pos` to the end of `rdata`, each ending at a root
+// label or a pointer. False when they do not end exactly at the end.
+@(private)
+count_names :: proc "contextless" (rdata: []u8, pos: int) -> (n: int, ok: bool) {
+	pos := pos
+	for pos < len(rdata) {
+		l := rdata[pos]
+		switch {
+		case l & 0xc0 == 0xc0:
+			pos += 2
+			n += 1
+		case l & 0xc0 != 0:
+			return 0, false
+		case l == 0:
+			pos += 1
+			n += 1
+		case:
+			pos += 1 + int(l)
+		}
+	}
+	return n, pos == len(rdata)
+}
+
 /*
 Take a copy of the RDATA at `msg[start:end]`, expanding any compressed name in
 it.
@@ -127,7 +170,7 @@ decode_raw_rdata :: proc(r: ^Reader, type: Type, start, end: int, allocator: mem
 	// Checking that slot rather than every byte matters for RRSIG, whose
 	// signature nearly always holds a byte that looks like one.
 	if raw_rdata_holds_pointer(type, msg[start:end]) {
-		layout, _ := raw_rdata_layout(type)
+		layout, _ := raw_rdata_layout(type, msg[start:end])
 		if expanded, ok := expand_rdata_names(r, layout, start, end, allocator); ok {
 			return Rdata_Raw{data = expanded}
 		}
@@ -281,7 +324,7 @@ would cost an answer for nothing.
 */
 @(private)
 raw_rdata_holds_pointer :: proc "contextless" (type: Type, rdata: []u8) -> bool {
-	layout, known := raw_rdata_layout(type)
+	layout, known := raw_rdata_layout(type, rdata)
 	if !known {
 		return false
 	}
