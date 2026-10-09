@@ -376,6 +376,76 @@ test_a_connection_over_its_prefix_share_is_refused :: proc(t: ^testing.T) {
 	testing.expect_value(t, sync.atomic_load(&s.stats.conn_failed), u64(0))
 }
 
+/*
+A connection accepted as shutdown begins is closed, and is not counted.
+
+`conn_spawn` refuses it with `.Stopped` once `conn_manager_shutdown` has begun.
+The accept loop has to close the socket and free the job on that refusal,
+and must not book it as `conn_refused=` or `conn_failed=` or log a line telling
+the operator to raise a limit: the server is exiting, not full. The manager is
+marked stopped by hand so the accept loop is still running to show it - the
+shutdown itself would join that loop first.
+*/
+@(test)
+test_a_connection_accepted_during_shutdown_is_dropped :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	cfg.listeners.udp.enabled = false
+	cfg.listeners.tcp = config.Listener {
+		enabled = true,
+		address = "127.0.0.1",
+		port    = 0,
+	}
+	cfg.listeners.dot.enabled = false
+	cfg.listeners.doh.enabled = false
+	cfg.cache.enabled = false
+	cfg.blocking.enabled = false
+	cfg.log.queries = false
+	// Long enough that a connection a thread was started for is still open when
+	// the read below gives up, so EOF can only be the accept loop closing it.
+	cfg.server.client_timeout = 5 * time.Second
+
+	handler_pool := pool.make_pool(1)
+	s := Server {
+		cfg          = &cfg,
+		handler_pool = handler_pool,
+	}
+
+	l: Listeners
+	if !start_listeners(&s, &l) {
+		pool.destroy(handler_pool)
+		testing.expect(t, false, "could not start the TCP listener")
+		return
+	}
+	defer {
+		stop_listeners(&l)
+		pool.destroy(handler_pool)
+		destroy_listeners(&l)
+	}
+
+	bound, berr := net.bound_endpoint(l.tcp_socket)
+	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
+		return
+	}
+
+	sync.mutex_lock(&l.conns.mu)
+	l.conns.stopped = true
+	sync.mutex_unlock(&l.conns.mu)
+
+	conn, cerr := net.dial_tcp(bound)
+	if !testing.expectf(t, cerr == nil, "cannot open the connection: %v", cerr) {
+		return
+	}
+	defer net.close(conn)
+	_ = net.set_option(conn, .Receive_Timeout, 2 * time.Second)
+
+	buf: [1]u8
+	n, rerr := net.recv_tcp(conn, buf[:])
+	testing.expectf(t, n == 0 && rerr == nil, "the connection was not closed: n=%d err=%v", n, rerr)
+	testing.expect_value(t, active_connections(&l.conns), 0)
+	testing.expect_value(t, sync.atomic_load(&s.stats.conn_refused), u64(0))
+	testing.expect_value(t, sync.atomic_load(&s.stats.conn_failed), u64(0))
+}
+
 @(private = "file")
 month_number :: proc(name: string) -> int {
 	names := []string{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}

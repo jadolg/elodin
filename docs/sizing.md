@@ -75,7 +75,8 @@ figures are on [the same page](public-resolver.md#handshake-floods).
 | `accept_backoff=` | no file descriptor for the accept (`RLIMIT_NOFILE`) | nothing yet: the peer stays queued |
 
 `conn_refused=` is kept apart from `refused=`: this is a client elodin would serve
-and has no room for.
+and has no room for. A connection accepted as shutdown begins is closed and
+counted under none of these.
 
 A failing accept is retried at once three times in a row, with no wait and no
 count. Past that the listener waits between attempts: up to 50 ms for errors on

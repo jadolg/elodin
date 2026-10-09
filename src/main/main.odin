@@ -794,8 +794,8 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	Metrics is stopped here too, right after `stop_listeners` and before
 	either pool is touched - not merged into `stop_listeners` and not left
 	running past it. `stop_listeners` is the slow, client-facing part: a DoT or
-	DoH connection can hold out for `server.client_timeout`, its thread joined
-	one at a time along with everyone else's, and an operator scraping through
+	DoH connection can hold out for `server.client_timeout`, the shutdown waits
+	on every one of them, and an operator scraping through
 	that wait wants to see it happening rather than find the port already
 	closed. `pool.destroy` is a different hazard rather than a smaller version
 	of the same one: it frees the pool it joins, and `render_pool_metrics`

@@ -76,8 +76,8 @@ Listeners :: struct {
 	stream_loop_ctx:  [dynamic]^Stream_Context,
 	metrics_loop_ctx: ^Metrics_Context,
 	// Not routed through `conns` like every other loop: `conn_manager_shutdown`
-	// joins that list in order and this one must outlive the join, not sit in
-	// the middle of it. See `stop_metrics`.
+	// joins everything on that list and this one must outlive the join, not sit
+	// in the middle of it. See `stop_metrics`.
 	metrics_thread:   ^thread.Thread,
 }
 
@@ -227,8 +227,8 @@ Stop the metrics endpoint, once the slow part of shutdown is over.
 Separate from `stop_listeners` and called right after it rather than as part of
 the same sweep, so a scrape lands throughout `conn_manager_shutdown` instead of
 finding the port already closed. That join is where shutdown actually spends
-its time: it joins client connections one at a time with no overall deadline,
-and a DoT or DoH one can hold out for `server.client_timeout`. An operator
+its time: it waits on every client connection with no overall deadline, and a
+DoT or DoH one can hold out for `server.client_timeout`. An operator
 watching `elodin_connections_active` fall to zero during that stretch is
 watching the shutdown succeed; one watching a gap where the endpoint used to be
 cannot tell a slow stop from a stuck one.
@@ -1020,7 +1020,7 @@ spawn_failure_words :: proc(why: Spawn_Result) -> Spawn_Failure_Words {
 			line = "%s: refusing a connection, this client's /24 or /64 already holds server.max_connections_per_prefix (%d) of them",
 			hint = "raise server.max_connections_per_prefix if one client network should be able to hold more of server.max_connections at once, or set it to max_connections to let any one of them hold the table; these are counted as conn_refused= in the stats line, and further ones are logged at debug level",
 		}
-	case .Started, .Thread_Failed:
+	case .Started, .Thread_Failed, .Stopped:
 	}
 	return Spawn_Failure_Words {
 		reported = &conn_failed_reported,
@@ -1724,12 +1724,17 @@ accept_loop :: proc(data: rawptr) {
 			out of: this loop is the one place that never resets it, and nothing
 			here outlives the iteration.
 			*/
-			if spawned == .Thread_Failed {
-				sync.atomic_add(&ctx.server.stats.conn_failed, 1)
-			} else {
-				sync.atomic_add(&ctx.server.stats.conn_refused, 1)
+			// `.Stopped` is a connection accepted as shutdown began: not this
+			// server refusing a client it could serve, so neither counted nor
+			// logged, since either would name a setting with nothing to do with it.
+			if spawned != .Stopped {
+				if spawned == .Thread_Failed {
+					sync.atomic_add(&ctx.server.stats.conn_failed, 1)
+				} else {
+					sync.atomic_add(&ctx.server.stats.conn_refused, 1)
+				}
+				report_spawn_failure(ctx.proto, spawned, &l.conns)
 			}
-			report_spawn_failure(ctx.proto, spawned, &l.conns)
 			net.close(client_socket)
 			free(job)
 		}

@@ -3,6 +3,7 @@ package server
 import "core:net"
 import "core:sync"
 import "core:testing"
+import "core:thread"
 import "core:time"
 
 /*
@@ -265,4 +266,119 @@ test_the_listener_loops_spend_nobodys_share :: proc(t: ^testing.T) {
 	)
 	client := client_prefix(net.IP4_Address{192, 0, 2, 1})
 	testing.expect_value(t, conn_spawn(&cm, &held, holds_until_released, client), Spawn_Result.Started)
+}
+
+/*
+Shutdown is final: a spawn after it starts nothing.
+
+An accept loop reads `stop` before it blocks, not after the accept returns, so a
+connection accepted as shutdown begins reaches `conn_spawn` once
+`conn_manager_shutdown` has started. A thread started then would land in a table
+nothing drains again and outlive the `Stream_Context` `destroy_listeners` frees
+under it. The permanent tally goes with the loops it counts, or
+`active_connections` reads negative.
+*/
+@(test)
+test_spawn_after_shutdown_is_refused :: proc(t: ^testing.T) {
+	cm: Conn_Manager
+	conn_manager_init(&cm, 4, 0)
+
+	// A listener loop, registered the way start_udp/start_stream_listener do.
+	loop := Held{}
+	testing.expect_value(t, conn_spawn(&cm, &loop, holds_until_released, counted = false), Spawn_Result.Started)
+
+	sync.atomic_store(&loop.go, true)
+	conn_manager_shutdown(&cm)
+	testing.expect_value(t, active_connections(&cm), 0)
+
+	// An accept that returned just before the shutdown now asks for a thread.
+	late := Held{}
+	res := conn_spawn(&cm, &late, holds_until_released)
+	testing.expectf(
+		t,
+		res == .Stopped,
+		"conn_spawn returned %v after conn_manager_shutdown; nothing will ever join that thread",
+		res,
+	)
+	testing.expect(t, len(cm.threads) == 0, "the late thread was tracked in a table nobody will drain")
+	// So are the server's own loops: nothing joins them either.
+	testing.expect_value(t, conn_spawn(&cm, &late, holds_until_released, counted = false), Spawn_Result.Stopped)
+	testing.expect_value(t, active_connections(&cm), 0)
+	// Released before the second shutdown rather than deferred past it, so a
+	// late thread that did start fails the case instead of hanging the join.
+	sync.atomic_store(&late.go, true)
+	conn_manager_shutdown(&cm)
+}
+
+// Shutdown started on a thread of its own, returned once it has marked the
+// manager stopped, so the caller can look at the table while it waits.
+@(private = "file")
+start_shutdown :: proc(cm: ^Conn_Manager) -> ^thread.Thread {
+	shutdown := thread.create_and_start_with_poly_data(cm, conn_manager_shutdown)
+	deadline := time.time_add(time.now(), 2 * time.Second)
+	for time.diff(time.now(), deadline) > 0 {
+		sync.mutex_lock(&cm.mu)
+		stopped := cm.stopped
+		sync.mutex_unlock(&cm.mu)
+		if stopped {
+			break
+		}
+		time.sleep(time.Millisecond)
+	}
+	return shutdown
+}
+
+/*
+The gauge counts the connections the shutdown is still waiting on.
+
+`stop_metrics` keeps the endpoint open through `conn_manager_shutdown` so that an
+operator can watch `elodin_connections_active` fall to zero. A connection being
+joined is still open, so it is still counted, and a loop already gone is not.
+*/
+@(test)
+test_a_connection_being_joined_is_still_counted :: proc(t: ^testing.T) {
+	cm: Conn_Manager
+	conn_manager_init(&cm, 4, 0)
+
+	loop := Held{go = true}
+	testing.expect_value(t, conn_spawn(&cm, &loop, holds_until_released, counted = false), Spawn_Result.Started)
+	client := Held{}
+	testing.expect_value(t, conn_spawn(&cm, &client, holds_until_released), Spawn_Result.Started)
+
+	shutdown := start_shutdown(&cm)
+	testing.expect_value(t, active_connections(&cm), 1)
+
+	sync.atomic_store(&client.go, true)
+	thread.join(shutdown)
+	thread.destroy(shutdown)
+	testing.expect_value(t, active_connections(&cm), 0)
+}
+
+/*
+A connection that closes during shutdown stops being counted then, not when the
+ones before it have been joined.
+
+Two clients held open, the older released first: a shutdown joining one thread at
+a time, newest first, would sit on the newer one with the older finished behind it, and the
+gauge would go on counting a connection that is gone for up to
+`client_timeout`.
+*/
+@(test)
+test_a_connection_closed_during_shutdown_is_not_counted :: proc(t: ^testing.T) {
+	cm: Conn_Manager
+	conn_manager_init(&cm, 4, 0)
+
+	older := Held{}
+	newer := Held{}
+	testing.expect_value(t, conn_spawn(&cm, &older, holds_until_released), Spawn_Result.Started)
+	testing.expect_value(t, conn_spawn(&cm, &newer, holds_until_released), Spawn_Result.Started)
+
+	shutdown := start_shutdown(&cm)
+	sync.atomic_store(&older.go, true)
+	testing.expect_value(t, wait_for_reap(&cm, 1), 1)
+
+	sync.atomic_store(&newer.go, true)
+	thread.join(shutdown)
+	thread.destroy(shutdown)
+	testing.expect_value(t, active_connections(&cm), 0)
 }

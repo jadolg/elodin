@@ -2,6 +2,7 @@ package server
 
 import "core:sync"
 import "core:thread"
+import "core:time"
 
 // Stamped at build time from the git tag; see ELODIN_VERSION in mise.toml. A
 // build that bypasses mise reports "dev" rather than claiming a release number.
@@ -46,6 +47,18 @@ Conn_Manager :: struct {
 	// well as as they are added: the limit is `len(threads) - permanent`, so a
 	// figure that only ever grows stops describing anything once a loop ends.
 	permanent:    int,
+	/*
+	Set by `conn_manager_shutdown`, under `mu`, before it joins the table.
+
+	The accept loops read `stop` before they block in an accept, not after it
+	returns, so a connection accepted as shutdown begins still asks for a
+	thread. Refused here, in the same critical section that would otherwise
+	append it, because no check outside the lock can be made atomic with the
+	spawn: a thread started once the shutdown has found the table empty lands in
+	one nothing drains again, and outlives the `Stream_Context` that
+	`destroy_listeners` frees.
+	*/
+	stopped:      bool,
 }
 
 @(private)
@@ -66,7 +79,11 @@ conn_manager_init :: proc(cm: ^Conn_Manager, limit: int, prefix_limit: int) {
 /*
 Why a spawn did not happen.
 
-Three things stop one, and they do not ask for the same response from an
+`Stopped` is the manager having been shut down, which is no refusal an operator
+can act on: the server is exiting, and the caller drops the connection without
+counting or reporting it.
+
+Three other things stop one, and they do not ask for the same response from an
 operator. `Limit_Reached` is `server.max_connections` doing its job, and raising
 it is the fix. `Prefix_Limit_Reached` is one client's share of that table being
 full while the table itself is not, so raising `max_connections` would only hand
@@ -80,6 +97,7 @@ Spawn_Result :: enum u8 {
 	Limit_Reached,
 	Prefix_Limit_Reached,
 	Thread_Failed,
+	Stopped,
 }
 
 /*
@@ -101,6 +119,9 @@ conn_spawn :: proc(
 	sync.mutex_lock(&cm.mu)
 	defer sync.mutex_unlock(&cm.mu)
 
+	if cm.stopped {
+		return .Stopped
+	}
 	reap_locked(cm)
 	if counted {
 		if len(cm.threads) - cm.permanent >= cm.limit {
@@ -179,17 +200,38 @@ active_connections :: proc(cm: ^Conn_Manager) -> int {
 	return len(cm.threads) - cm.permanent
 }
 
-// Wait for every connection thread to finish. Callers close the listening
-// sockets first so the handlers see EOF and return.
+/*
+Wait for every connection thread to finish, and refuse any spawn after it.
+Callers set `stop` and close the listening sockets first so the loops return;
+a client connection ends when its client closes it or at `server.client_timeout`.
+
+Reaped in place rather than joined one by one from a copy: a thread leaves the
+table as soon as it is done, whichever order they finish in, so
+`active_connections` counts down the connections still open - which is what
+`stop_metrics` keeps the endpoint open to show. Every join is of a finished
+thread and happens under `mu`, so a scrape reaping at the same time cannot join
+one twice.
+*/
 conn_manager_shutdown :: proc(cm: ^Conn_Manager) {
 	sync.mutex_lock(&cm.mu)
-	threads := cm.threads
-	cm.threads = nil
+	cm.stopped = true
 	sync.mutex_unlock(&cm.mu)
 
-	for entry in threads {
-		thread.join(entry.handle)
-		thread.destroy(entry.handle)
+	for {
+		sync.mutex_lock(&cm.mu)
+		reap_locked(cm)
+		if len(cm.threads) == 0 {
+			delete(cm.threads)
+			cm.threads = nil
+			sync.mutex_unlock(&cm.mu)
+			return
+		}
+		sync.mutex_unlock(&cm.mu)
+		// ponytail: polled, so shutdown ends up to one interval after the last
+		// thread does; a condition variable signalled at thread exit if it matters.
+		time.sleep(SHUTDOWN_POLL)
 	}
-	delete(threads)
 }
+
+@(private)
+SHUTDOWN_POLL :: 10 * time.Millisecond
