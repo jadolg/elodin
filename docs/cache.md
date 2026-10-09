@@ -25,10 +25,12 @@ rewritten in place on each hit.
   `blocking.block_ttl` or a rewrite's own `ttl`.
 - **`min_ttl`** is a floor on the copies served from an entry.
 - **Entry lifetime.** An entry lives for the smallest TTL in its message; a
-  negative one for the SOA's figure, capped by `negative_ttl`. A denial with no
-  SOA is not kept (RFC 2308 section 5). Each record still goes out with its own
-  TTL up to the ceiling, so a client's copy need not expire when this cache's
-  does.
+  negative one for the SOA's figure, capped by `negative_ttl` and by any
+  shorter TTL in its answer section. NODATA after a CNAME or DNAME chain that
+  never reaches the type asked for is negative (RFC 2308 section 2.2). A denial
+  with no SOA is not kept (RFC 2308 section 5). Each record still goes out with
+  its own TTL up to the ceiling, so a client's copy need not expire when this
+  cache's does.
 - A TTL with its top bit set is read as zero (RFC 2181 section 8), forwarded
   answers included, so it is uncacheable unless `min_ttl` raises it.
 

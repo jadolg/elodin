@@ -497,36 +497,99 @@ cname_nodata_response :: proc() -> dns.Message {
 }
 
 /*
-A pruned answer must still be an answer the cache will keep.
+A denial after a CNAME, pruned, is not cached.
 
-`cache.put` reads a lifetime out of one of two branches, and which one it lands
-in is decided by `rcode == .NX_Domain || len(msg.answer) == 0`. NODATA after a
-CNAME keeps the CNAME in its answer section, so it takes the ordinary branch and
-is held for the shortest TTL among the records that are left. The other branch
-reads the SOA, which is exactly what the prune took away.
+The prune takes the SOA out with the rest of the authority section - it belongs
+to the target's zone, which the validator never established - and what is left
+is a CNAME that never reaches the type asked for, under NOERROR or NXDOMAIN.
+Either way that is a denial (RFC 2308 section 2.2), and a denial without a SOA
+is not kept at all (RFC 2308 section 5), whatever `cache.negative_ttl` says.
 
-Worth pinning because it comes out right by which branch the message falls into
-rather than by anything the prune does on purpose: had this entry taken the
-negative branch there would be no SOA left to read, and `cache.put` refuses a
-denial without one. An answer shape that quietly stopped being
-cacheable would send every AAAA lookup for a CNAME'd name upstream, every time,
-with nothing to connect it to this change.
+The verdict here is built by hand, and it is one the validator will not reach on
+its own: `chain_shape` plus `denial_claimed` report a chain ending without the
+type asked for, with a SOA beside it, as `Insecure`, so nothing is pruned and the
+SOA reaches the cache, which holds the entry for that figure. What this pins is
+the prune's own behaviour when it *is* handed such a verdict - worth keeping,
+because the shape becomes reachable again the moment #186 lands and the denial
+at the target's zone is genuinely checked, at which point the SOA is among the
+records the verdict names and survives the prune.
+*/
+@(test)
+test_a_pruned_denial_after_a_cname_is_not_cached :: proc(t: ^testing.T) {
+	for rcode in ([]dns.Rcode{.No_Error, .NX_Domain}) {
+		msg := cname_nodata_response()
+		msg.flags.rcode = u8(rcode)
+		wire, _, err := dns.encode_message(msg, context.temp_allocator)
+		testing.expect_value(t, err, dns.Encode_Error.None)
 
-The stored bytes are then served back through `handle_query`, because the copy
-in the cache is the pruned one and `serve_from_cache` is what hands it to every
-later client.
+		covered := make([]dnssec.Authenticated_Set, 1, context.temp_allocator)
+		covered[0] = dnssec.Authenticated_Set {
+			name   = "www.example.com.",
+			type   = .CNAME,
+			class  = .IN,
+			signer = TEST_SIGNER,
+		}
+		verdict := dnssec.Result {
+			status = .Secure,
+			answer = covered,
+		}
+
+		out := present_response(wire, aaaa_query(), .AAAA, verdict, nil, context.temp_allocator)
+		decoded, derr := dns.decode_message(out, context.temp_allocator)
+		testing.expect_value(t, derr, dns.Decode_Error.None)
+		testing.expect_value(t, dns.rcode_of(decoded), rcode)
+		testing.expect_value(t, len(decoded.answer), 2)
+		testing.expect_value(t, len(decoded.authority), 0)
+
+		key_buf: [cache.KEY_MAX]u8
+		key := cache.make_key(key_buf[:], "www.example.com.", .AAAA, .IN, true, false)
+
+		// Not even with a `min_ttl` floor to lift it: there is nothing left in
+		// it to read a lifetime from.
+		answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, min_ttl = 60, negative_ttl = 300})
+		defer cache.destroy(answers)
+		testing.expectf(t, !cache.put(answers, key, out, decoded), "cache.put kept a pruned %v after a CNAME", rcode)
+
+		// The same message unpruned, SOA and all, is kept: the refusal is the
+		// missing SOA and not the shape.
+		full, _ := dns.decode_message(wire, context.temp_allocator)
+		testing.expectf(t, cache.put(answers, key, wire, full), "cache.put refused an unpruned %v after a CNAME", rcode)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+A pruned answer that reaches the type asked for is cached and served.
+
+The stored bytes are the pruned copy, and `serve_from_cache` is what hands them
+to every later client - with the stored AD bit, for one that set DO.
 */
 @(test)
 test_a_pruned_answer_is_still_cached_and_served :: proc(t: ^testing.T) {
-	wire, _, err := dns.encode_message(cname_nodata_response(), context.temp_allocator)
+	msg := cname_nodata_response()
+	answer := make([]dns.Record, len(msg.answer) + 1, context.temp_allocator)
+	copy(answer, msg.answer)
+	answer[len(msg.answer)] = dns.Record {
+		name = "cdn.example.net.",
+		type = .AAAA,
+		class = .IN,
+		ttl = 600,
+		data = dns.Rdata_AAAA{addr = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}},
+	}
+	msg.answer = answer
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
 	testing.expect_value(t, err, dns.Encode_Error.None)
 
-	// The verdict `validate_answer` reaches on this shape: the CNAME held up,
-	// and nothing in the authority section was ever looked at.
-	covered := make([]dnssec.Authenticated_Set, 1, context.temp_allocator)
+	covered := make([]dnssec.Authenticated_Set, 2, context.temp_allocator)
 	covered[0] = dnssec.Authenticated_Set {
 		name   = "www.example.com.",
 		type   = .CNAME,
+		class  = .IN,
+		signer = TEST_SIGNER,
+	}
+	covered[1] = dnssec.Authenticated_Set {
+		name   = "cdn.example.net.",
+		type   = .AAAA,
 		class  = .IN,
 		signer = TEST_SIGNER,
 	}
@@ -538,45 +601,15 @@ test_a_pruned_answer_is_still_cached_and_served :: proc(t: ^testing.T) {
 	out := present_response(wire, aaaa_query(), .AAAA, verdict, nil, context.temp_allocator)
 	decoded, derr := dns.decode_message(out, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
-
-	if !testing.expect_value(t, len(decoded.answer), 2) {
-		return
-	}
-	testing.expect_value(t, decoded.answer[0].type, dns.Type.CNAME)
+	testing.expect_value(t, len(decoded.answer), 3)
 	testing.expect_value(t, len(decoded.authority), 0)
-	// The condition `cache.put` reads, stated where a change to it would show.
-	testing.expect_value(t, dns.rcode_of(decoded), dns.Rcode.No_Error)
-	testing.expect(t, len(decoded.answer) > 0, "an empty answer section would take the negative branch")
 
 	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, negative_ttl = 0})
 	defer cache.destroy(answers)
-
 	key_buf: [cache.KEY_MAX]u8
 	key := cache.make_key(key_buf[:], "www.example.com.", .AAAA, .IN, true, false)
 	if !testing.expect(t, cache.put(answers, key, out, decoded), "a pruned answer was not cacheable") {
 		return
-	}
-
-	/*
-	The other side of that, so the reason it worked is on the record rather than
-	inferred. Take the CNAME out as well and the same message falls into the
-	negative branch, where there is now no SOA to read a lifetime from - and
-	the cache turns the entry away, as it does any denial without one.
-	*/
-	{
-		answerless := decoded
-		answerless.answer = nil
-		empty, _, eerr := dns.encode_message(answerless, context.temp_allocator)
-		testing.expect_value(t, eerr, dns.Encode_Error.None)
-		// A `min_ttl` floor, so the refusal is the missing SOA and not the zero
-		// lifetime that floor would otherwise lift.
-		other := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, min_ttl = 60, negative_ttl = 300})
-		defer cache.destroy(other)
-		testing.expect(
-			t,
-			!cache.put(other, key, empty, answerless),
-			"an answer section pruned to nothing was cached anyway, so this test proves less than it claims",
-		)
 	}
 
 	cfg := config.default_config()
@@ -600,76 +633,10 @@ test_a_pruned_answer_is_still_cached_and_served :: proc(t: ^testing.T) {
 		return
 	}
 	testing.expect(t, served[3] & 0x20 != 0, "the stored verdict should reach a client that set DO")
-
 	hit, hderr := dns.decode_message(served, context.temp_allocator)
 	testing.expect_value(t, hderr, dns.Decode_Error.None)
-	if !testing.expect_value(t, len(hit.answer), 2) {
-		return
-	}
-	testing.expect_value(t, hit.answer[0].type, dns.Type.CNAME)
+	testing.expect_value(t, len(hit.answer), 3)
 	testing.expect_value(t, len(hit.authority), 0)
-	free_all(context.temp_allocator)
-}
-
-/*
-The other half of that shape, where the answer section stops deciding.
-
-A CNAME pointing at a name that does not exist comes back NXDOMAIN with the
-CNAME still in the answer section, and `cache.put` reads the rcode first: the
-negative branch is taken whatever the answer holds. The prune has just removed
-the SOA that branch reads - it belongs to the target's zone, which the validator
-never established - and a denial without a SOA is not kept at all (RFC 2308
-section 5), whatever `cache.negative_ttl` says. Every repeat of this question
-then goes upstream.
-
-Pinned as the cost it is, not as a property worth having. It is what this prune
-leaves behind until the denial at a CNAME target is validated properly.
-
-The verdict here is built by hand, and since the denial guard went in it is one
-the validator will not reach on its own: `chain_shape` plus `denial_claimed` now
-report a chain ending without the type asked for as `Insecure`, so nothing is
-pruned and the proof reaches the client. What this still pins is the prune's own
-behaviour when it *is* handed such a verdict - worth keeping, because the shape
-becomes reachable again the moment #186 lands and the denial at the target's zone
-is genuinely checked.
-*/
-@(test)
-test_a_pruned_nxdomain_after_a_cname_is_not_cached :: proc(t: ^testing.T) {
-	msg := cname_nodata_response()
-	msg.flags.rcode = u8(dns.Rcode.NX_Domain)
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	testing.expect_value(t, err, dns.Encode_Error.None)
-
-	covered := make([]dnssec.Authenticated_Set, 1, context.temp_allocator)
-	covered[0] = dnssec.Authenticated_Set {
-		name   = "www.example.com.",
-		type   = .CNAME,
-		class  = .IN,
-		signer = TEST_SIGNER,
-	}
-	verdict := dnssec.Result {
-		status = .Secure,
-		answer = covered,
-	}
-
-	out := present_response(wire, aaaa_query(), .AAAA, verdict, nil, context.temp_allocator)
-	decoded, derr := dns.decode_message(out, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
-	testing.expect_value(t, dns.rcode_of(decoded), dns.Rcode.NX_Domain)
-	testing.expect_value(t, len(decoded.authority), 0)
-
-	key_buf: [cache.KEY_MAX]u8
-	key := cache.make_key(key_buf[:], "www.example.com.", .AAAA, .IN, true, false)
-
-	// Not even with a `min_ttl` floor to lift it: there is nothing left in it
-	// to read a lifetime from.
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, min_ttl = 60, negative_ttl = 300})
-	defer cache.destroy(answers)
-	testing.expect(
-		t,
-		!cache.put(answers, key, out, decoded),
-		"cache.put kept a pruned NXDOMAIN, so the comment above is out of date",
-	)
 	free_all(context.temp_allocator)
 }
 

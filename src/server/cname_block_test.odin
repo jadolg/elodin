@@ -1393,13 +1393,20 @@ test_an_entry_that_turns_unreadable_on_a_later_walk_is_dropped :: proc(t: ^testi
 	}
 	bad := make([dynamic]u8, 0, len(base) + 32, context.temp_allocator)
 	append(&bad, ..base)
-	bad[7] = 1
+	bad[7] = 2
 	for label in ([]string{"www", "brand", "example"}) {
 		append(&bad, u8(len(label)))
 		append(&bad, ..transmute([]u8)label)
 	}
 	append(&bad, 0)
 	append(&bad, 0, 5, 0, 1, 0, 0, 0, 60, 0, 2, 0xc0, 0xfe)
+	// And an A at the question name, so the answer is one the cache keeps: a
+	// chain that stops short of the type asked for is a denial, and with no SOA
+	// it is not stored. Beside a CNAME at the same name that is CNAME-and-other-
+	// data (RFC 2181 section 10.1), which no zone serves - but the CNAME's target
+	// is unreadable, so no name past this one is there to hold it, and the walk
+	// that refuses the entry later never reads the A.
+	append(&bad, 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 1)
 
 	x := Cloak_Mock{socket = socket, reply = bad[:]}
 	mock := thread.create_and_start_with_poly_data(&x, serve_cloak)
@@ -1408,6 +1415,8 @@ test_an_entry_that_turns_unreadable_on_a_later_walk_is_dropped :: proc(t: ^testi
 	thread.destroy(mock)
 	// Allowlisted, so it was served and stored rather than refused.
 	testing.expect_value(t, first, Outcome.Forwarded)
+	// Stored, or the refusal below is the dead mock's timeout and not the re-walk.
+	testing.expect_value(t, cache.stats(answers).inserts, 1)
 
 	// The operator drops the allow rule and reloads.
 	ob, oa := filter.engine_swap(engine, filter.set_make(), filter.set_make())

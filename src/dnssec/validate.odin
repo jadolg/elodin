@@ -1178,29 +1178,23 @@ narrow reading of "those" is written down. Not passed through unchecked: AD is a
 property of the message, and a client that reads AD=1 and then connects to an
 address nobody verified is the exact harm this procedure exists to prevent.
 
-The one real loss is a CNAME chain that ends in a denial - a dual-stack client
-asking AAAA for an IPv4-only name is the everyday version of it, and a CNAME
-pointing at a name that does not exist is the same shape with NXDOMAIN on it.
-Either reaches `Secure` through `validate_answer` on the strength of the CNAME
-alone, and the proof sitting in its authority section belongs to the target's
-zone, which nothing here ever established. So out it goes with the rest, SOA
-included, and a downstream resolver falls back to its own idea of how long to
-remember the absence.
-
-Our own cache pays for it, and only on the NXDOMAIN half. `cache.put` picks
-its lifetime on `rcode == .NX_Domain || len(msg.answer) == 0`, so the NODATA one
-keeps its CNAME in the answer section and is held for the shortest TTL still
-there; the NXDOMAIN one takes the negative branch whatever its answer section
-holds, finds no SOA to read, and is not kept at all (RFC 2308 section 5), so
-every repeat goes upstream. Both are the same missing chain walk, and are fixed
-by the same one.
+A CNAME chain that ends in a denial - a dual-stack client asking AAAA for an
+IPv4-only name is the everyday version of it, and a CNAME pointing at a name
+that does not exist is the same shape with NXDOMAIN on it - never reaches this
+prune: `validate_answer` reports it `Insecure` (`denial_claimed`), so nothing is
+pruned and the SOA reaches the client and our cache intact. Handed a `Secure`
+verdict over that shape anyway, the prune takes the SOA with the rest, since it
+belongs to the target's zone, which nothing here established; `cache.put` then
+reads the result as the denial it is (RFC 2308 section 2.2), finds no SOA, and
+keeps none of it (section 5). Validating the denial at the target is #186.
 
 The rcode is the part of this no prune can reach. AD covers the records in those
 two sections, and this makes it honest about them; it says nothing about the
-header. An on-path attacker who flips a signed CNAME answer to NXDOMAIN still
-gets `Secure` out of `validate_answer`, on the strength of a CNAME that really
-is signed, and the client reads an authenticated denial nobody proved. That is
-the same missing chain walk again, from the other end, and the same issue.
+header. That is why `validate_answer` reads the rcode itself: an on-path
+attacker who flips a signed CNAME answer to NXDOMAIN gets `Insecure` out of it
+(`denial_claimed`), not `Secure`, so the denial goes out without the AD bit
+rather than as one this server proved. Proving it is the same missing chain
+walk, and the same issue.
 
 Two ways not to lose it, and neither belongs here. Keeping the records and
 clearing AD instead is the one that looks free: it is not, because AD is a

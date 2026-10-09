@@ -533,6 +533,89 @@ answers_the_question :: proc(msg: dns.Message, rec: dns.Record) -> bool {
 	return dns.name_equal_fold(q.name, rec.name)
 }
 
+/*
+Is this response a denial - NXDOMAIN, or NODATA with or without a CNAME chain
+in front of it (RFC 2308 sections 2.1 and 2.2)? What `put` keeps for the SOA
+figure, and refuses without one; DoH's `Cache-Control` reads it for the same
+reason.
+*/
+denial :: proc(msg: dns.Message) -> bool {
+	return dns.rcode_of(msg) == .NX_Domain || len(msg.answer) == 0 || stops_short(msg)
+}
+
+/*
+How many CNAME hops `stops_short` follows past the question name before it reads
+the answer as a chain that never ends. Four times the sixteen that the server's
+own chain check (`server.MAX_CHAIN_NAMES`) and the validator's
+(`dnssec.MAX_CNAME_CHAIN`) follow, so any chain those checks pass is walked to
+its end and kept by the rule for answers. With blocking and validation off a
+longer chain is served as the upstream sent it, and past this bound it reads as
+a denial: kept only with a SOA, which costs the entry and never the answer. A
+recursive upstream gives up on a chain long before this. One scan of the answer
+section per name, so the walk costs at most sixty-five passes over a section
+the decoder has already bounded, however the upstream wrote it.
+*/
+@(private)
+CHAIN_NAMES_MAX :: 64
+
+/*
+Does the answer section fail to reach the type asked for? That is NODATA after
+a CNAME (RFC 2308 section 2.2), and `put` keeps it as the denial it is.
+
+A walk, not a scan for the type: from the question name, along the CNAME each
+name reached owns, until a record of the type asked for is found there. A name
+owning several CNAMEs is a broken answer (RFC 1034 section 3.6.2), and the walk
+follows the last of them; a wrong pick costs the entry and never the answer. A
+record of that type anywhere else in the section is not the answer - an upstream
+that appends `x.other.example. A` to a chain that stops short has not answered
+`www A` - and nor is a DNAME, whose CNAME is what the walk follows (RFC 6672
+section 3.1): a DNAME is the answer only where it is the type asked for at a
+name the walk reaches. A CNAME or ANY question is answered at the question name
+itself (RFC 1034 section 4.3.2 step 3a), which the first pass sees.
+
+A section with nothing at the question name concerns no part of the question
+and reads as a denial too, as does a chain too long to follow: either costs the
+entry at most - without a SOA it is not kept - and never the client's answer.
+*/
+@(private)
+stops_short :: proc(msg: dns.Message) -> bool {
+	if len(msg.question) == 0 || len(msg.answer) == 0 {
+		return false
+	}
+	q := msg.question[0]
+	// No chain has more hops than the section has CNAMEs; any further is a
+	// loop, and stopping there keeps a padded section from buying passes.
+	hops := 0
+	for r in msg.answer {
+		if r.type == .CNAME {
+			hops += 1
+		}
+	}
+	name := q.name
+	for _ in 0 ..= min(hops, CHAIN_NAMES_MAX) {
+		target := ""
+		for r in msg.answer {
+			// A QCLASS ANY question is answered in whatever class holds the name.
+			if (q.class != .ANY && r.class != q.class) || !dns.name_equal_fold(r.name, name) {
+				continue
+			}
+			if r.type == q.type || q.type == .ANY {
+				return false
+			}
+			if r.type == .CNAME {
+				if v, is_name := r.data.(dns.Rdata_Name); is_name {
+					target = v.name
+				}
+			}
+		}
+		if target == "" {
+			return true
+		}
+		name = target
+	}
+	return true
+}
+
 // The class the response was asked in. `IN` where there is no question to read
 // it from, which is the class every path into this cache asks in.
 @(private)
@@ -902,8 +985,13 @@ the same shape stopped one layer further out, on the paths no validator
 	would lift into a stored entry; `negative_ttl` must not stand in for a
 	missing SOA either, since that would hold the denial for five minutes by
 	default.
+
+	NODATA after a redirection is a denial too (RFC 2308 section 2.2): an answer
+	section holding a CNAME or DNAME chain that never reaches the type asked for
+	says nothing is there, and read as data it would be held for the chain's own
+	TTL - up to `max_ttl` - with no SOA behind it at all.
 	*/
-	negative := !bogus && (rcode == .NX_Domain || len(msg.answer) == 0)
+	negative := !bogus && denial(msg)
 	soa_ttl: u32
 	if negative {
 		has_soa: bool
@@ -950,7 +1038,23 @@ thing in both directions.
 		effective = min(u32(BOGUS_TTL), c.max_ttl)
 	} else {
 		if negative {
+			/*
+			And no longer than the answer section. A denial after a CNAME
+			carries the chain, which `get` counts down like any answer, so
+			outliving it would serve the CNAME at zero, or at `min_ttl`, for
+			the rest of the SOA figure. The answer section alone: the SOA's own
+			TTL already bounds `soa_ttl`, and a short-lived record elsewhere -
+			a zero-TTL one in additional, say - is no reason to forget the
+			denial. Read off the decoded records, through RFC 2181 section 8
+			as `read_ttls` reads them, so nothing depends on where in `ttls`
+			the section starts; an OPT there is transport, not a TTL.
+			*/
 			effective = soa_ttl
+			for r in msg.answer {
+				if r.type != .OPT {
+					effective = min(effective, dns.sane_ttl(r.ttl))
+				}
+			}
 			if c.negative_ttl > 0 {
 				effective = min(effective, c.negative_ttl)
 			}

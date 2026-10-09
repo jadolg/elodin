@@ -3,6 +3,7 @@ package server
 import "core:encoding/base64"
 import "core:strings"
 import "core:time"
+import "elodin:cache"
 import "elodin:dns"
 import "elodin:h2"
 import "elodin:logx"
@@ -783,16 +784,14 @@ serve_doh_request :: proc(
 	}
 
 	// HTTP/1.1, which answers on the connection's own thread rather than on a
-	// worker of the shared pool.
-	response, _, ok := handle_query(s, query, .DoH, client, context.temp_allocator, shared_worker = false)
+	// worker of the shared pool. Cache-Control mirrors the smallest TTL, or a
+	// denial's SOA figure, so intermediaries expire the answer at the same time
+	// the DNS data does - the bounded TTL, see `doh_max_age`.
+	max_age: u32
+	response, _, ok := handle_query(s, query, .DoH, client, context.temp_allocator, shared_worker = false, max_age = &max_age)
 	if !ok || len(response) == 0 {
 		return send_http_error(conn, "doh", 500, "no response", req.keep_alive)
 	}
-
-	// Cache-Control mirrors the smallest TTL so intermediaries expire the
-	// answer at the same time the DNS data does - the bounded TTL, see
-	// `doh_max_age`.
-	max_age := doh_max_age(response)
 
 	b := strings.builder_make(context.temp_allocator)
 	strings.write_string(&b, "HTTP/1.1 200 OK\r\nContent-Type: ")
@@ -898,7 +897,8 @@ decode_dns_param :: proc(encoded: string) -> (data: []u8, ok: bool) {
 }
 
 /*
-The `Cache-Control: max-age` for a response, read back off its own TTLs.
+The `Cache-Control: max-age` for a response: the smallest TTL it carries, and
+for a denial no more than its SOA says.
 
 Reads the answer as it is about to be sent, which is the answer after
 `handle_query` has bounded its TTLs: RFC 2181 section 8 applied and
@@ -906,19 +906,48 @@ Reads the answer as it is about to be sent, which is the answer after
 straight from an upstream. So the header cannot outlive the DNS data it is
 mirroring, and a hostile TTL cannot be laundered through it into every HTTP
 cache between here and the client - which recomputing the figure from what the
-upstream sent would do. `read_ttls` applies section 8 again on the way past,
+upstream sent would do. `sane_ttl` applies section 8 again on the way past,
 which costs nothing and means this holds for any caller that reaches it with
 bytes from somewhere else.
+
+A denial is bounded by RFC 8484 section 5.1: with no answer records and a SOA
+in authority, the freshness lifetime "MUST NOT be greater than the MINIMUM
+field from that SOA record" - which the smallest TTL alone does not bound,
+since the SOA record's own TTL is usually the larger of the two. NODATA after a
+CNAME is a denial too (RFC 2308 section 2.2), and one without a SOA gets no
+freshness at all, as `cache.put` keeps none: the CNAME's own TTL would
+otherwise have every HTTP cache in the path hold the NODATA for up to
+`cache.max_ttl`.
+
+One decode, charged to `spent`, the request's counter, like every other
+reading it makes. A response that will not decode - or that this request can no
+longer afford to read - gets no freshness: nothing here can say it is not a
+denial, and `cache.put` keeps nothing it read only in part either.
 */
 @(private)
-doh_max_age :: proc(response: []u8) -> u32 {
-	offsets, ok := dns.scan_ttl_offsets(response, context.temp_allocator)
-	if !ok || len(offsets) == 0 {
+doh_max_age :: proc(response: []u8, allocator := context.temp_allocator, spent: ^int = nil) -> u32 {
+	msg, err := dns.decode_message(response, allocator, spent)
+	if err != .None {
 		return 0
 	}
-	ttls := dns.read_ttls(response, offsets, context.temp_allocator)
-	v, has := dns.min_ttl(ttls)
-	return v if has else 0
+	v: u32 = max(u32)
+	has := false
+	for section in ([][]dns.Record{msg.answer, msg.authority, msg.additional}) {
+		for r in section {
+			// An OPT record's TTL field is extended rcode and flags.
+			if r.type != .OPT {
+				v, has = min(v, dns.sane_ttl(r.ttl)), true
+			}
+		}
+	}
+	if !has {
+		return 0
+	}
+	if cache.denial(msg) {
+		soa, has_soa := dns.negative_ttl(msg)
+		v = min(v, soa) if has_soa else 0
+	}
+	return v
 }
 
 @(private)
