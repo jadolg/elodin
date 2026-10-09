@@ -98,10 +98,10 @@ resolve_reference :: proc(base, ref: string) -> string {
 	if i := strings.index_byte(path, '#'); i >= 0 {
 		path, fragment = path[:i], path[i:]
 	}
+	// Held with its `?`, so an empty query (`?`) is still a query.
 	query := ""
-	has_query := false
 	if i := strings.index_byte(path, '?'); i >= 0 {
-		path, query, has_query = path[:i], path[i:], true
+		path, query = path[:i], path[i:]
 	}
 	base_path, base_query := base_target, ""
 	if i := strings.index_byte(base_path, '?'); i >= 0 {
@@ -115,7 +115,7 @@ resolve_reference :: proc(base, ref: string) -> string {
 		}
 	case path == "":
 		path = base_path
-		if !has_query {
+		if query == "" {
 			query = base_query
 		}
 	case path[0] == '/':

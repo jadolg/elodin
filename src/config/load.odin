@@ -1329,7 +1329,7 @@ load_upstream_spec :: proc(
 			errorf(l, "%s: %s", path, UPSTREAM_URL_RULE)
 			return {}, false
 		}
-		// `url_is_valid` has split it.
+		// `url_is_valid` has checked the port.
 		host_only, url_port, _ := netx.split_port(host)
 		if spec.hostname == "" {
 			spec.hostname = host_only
@@ -1601,7 +1601,7 @@ load_block_lists :: proc(l: ^Loader, n: ^yaml.Node, path: string) -> []Block_Lis
 				errorf(l, "%s[%d]: needs either a url or a file", path, i)
 				continue
 			}
-			if has_scheme(s, "http://") || has_scheme(s, "https://") {
+			if is_http_url(s) {
 				if !url_is_valid(s) {
 					errorf(l, "%s[%d]: %s", path, i, LIST_URL_RULE)
 					continue
@@ -1641,7 +1641,7 @@ load_block_lists :: proc(l: ^Loader, n: ^yaml.Node, path: string) -> []Block_Lis
 			continue
 		}
 		// A file is `file:`, so a url is a list host's: http or https.
-		if bl.url != "" && (!url_is_valid(bl.url) || !(has_scheme(bl.url, "http://") || has_scheme(bl.url, "https://"))) {
+		if bl.url != "" && (!url_is_valid(bl.url) || !is_http_url(bl.url)) {
 			errorf(l, "%s.url: %s", item_path, LIST_URL_RULE)
 			continue
 		}
@@ -3057,7 +3057,7 @@ config's making in each one, and a space or a byte outside ASCII a request line
 the upstream reads some other way (#438).
 */
 @(private)
-UPSTREAM_URL_RULE :: "the url and hostname of an https upstream must be visible ASCII, the host present, with no userinfo, path, query or fragment and any port 0 to 65535 in digits"
+UPSTREAM_URL_RULE :: "the url of an https upstream must be visible ASCII, its host present, with no userinfo and any port 0 to 65535 in digits, and its hostname a host alone, with no userinfo, path, query or fragment"
 
 // `h2.authority_is_valid`, which an upstream's address and hostname are held to.
 @(private)
@@ -3076,6 +3076,12 @@ url_is_valid :: proc(url: string) -> bool {
 @(private)
 has_scheme :: proc(s, prefix: string) -> bool {
 	return len(s) >= len(prefix) && dns.name_equal_fold(s[:len(prefix)], prefix)
+}
+
+// A list url, which the fetcher reads with either scheme and no other.
+@(private)
+is_http_url :: proc(s: string) -> bool {
+	return has_scheme(s, "http://") || has_scheme(s, "https://")
 }
 
 // A list url goes into a request line and `Host` the same way.

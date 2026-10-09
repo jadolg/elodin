@@ -41,8 +41,8 @@ test_a_doh_upstream_keeps_its_query :: proc(t: ^testing.T) {
 /*
 RFC 3986 3.1: a scheme is compared without regard to case, at every place the
 config reads one: `HTTPS://` names a list url, not a file, and `TLS://` a DoT
-upstream. And a list url is an http or https one, in either spelling of a list:
-`ftp://` loaded, and failed every refresh.
+upstream. And a list url is an http or https one, in either spelling of a list,
+since the fetcher reads no other scheme.
 */
 @(test)
 test_a_scheme_is_read_in_any_case :: proc(t: ^testing.T) {
