@@ -94,13 +94,13 @@ pointer_px_answer :: proc() -> []u8 {
 }
 
 /*
-An answer of NXT records whose RDATA holds a pointer byte but no walkable name.
+An answer of NXT records whose RDATA is a pointer to no walkable name.
 
-`decode_raw_rdata` used to take the expansion buffer before it knew whether the
-walk would get anywhere - 255 bytes and more whatever the RDATA held, for a
-record of fourteen wire bytes - and an arena does not take it back when the walk
-fails on the first byte. Nothing is taken until the walk has finished now, so
-these records cost what their bytes cost and no more.
+A buffer taken before the walk knew whether it would get anywhere would cost 255
+bytes and more whatever the RDATA held, for a record of fourteen wire bytes, and
+an arena does not take it back when the walk fails. `expand_rdata_names` takes
+nothing until the walk has finished, so these records cost what their bytes cost
+and no more.
 */
 @(private = "file")
 unwalkable_raw_answer :: proc() -> []u8 {
@@ -116,10 +116,10 @@ unwalkable_raw_answer :: proc() -> []u8 {
 		put_u16(&msg, u16(Class.IN))
 		append(&msg, 0, 0, 0x0e, 0x10)
 		put_u16(&msg, 2) // rdlength
-		// A reserved label type, so the name walk fails before it starts - but
-		// the second byte is a pointer byte, which is what makes it look worth
-		// walking.
-		append(&msg, 0x80, 0xc0)
+		// A pointer where the name belongs, so the walk is attempted, aimed at
+		// the header's flags byte 0x81: a reserved label type, so the name it
+		// names does not decode.
+		append(&msg, 0xc0, 0x02)
 		count += 1
 	}
 	msg[6] = u8(count >> 8)
@@ -336,9 +336,9 @@ had already read.
 
 The fixture is the one that found it: 100 PX records whose two RDATA names are
 pointers, with 300 A records behind them, 6871 bytes on the wire and 57471 once
-the names are expanded. The name octets are 0xc0 so the blob still looks worth
-walking after the rebuild, which is what makes the second reading charge for the
-expansion again.
+the names are expanded. The name octets are 0xc0, which a scan for pointer bytes
+would take for pointers; `raw_rdata_holds_pointer` walks the labels instead, so
+the second reading copies the expanded blob without walking it.
 */
 @(test)
 test_a_rebuilt_message_still_decodes :: proc(t: ^testing.T) {
@@ -404,16 +404,16 @@ test_a_rebuilt_message_still_decodes :: proc(t: ^testing.T) {
 /*
 A record whose names do not expand is not charged as though they had.
 
-The expansion buffer used to be reserved - and charged - at what a record of the
-type might come to, `layout.names * MAX_NAME_WIRE`, whether or not a single name
-grew. A PX carries two, so every one of them cost 510 bytes of budget, and
-`holds_pointer_byte` is a byte scan: a preference field of 0xc000 is a legal
-number and enough to send the record down this path.
+An expansion buffer reserved - and charged - at what a record of the type might
+come to, `layout.names * MAX_NAME_WIRE`, would cost a PX 510 bytes of budget
+whether or not a single name grew. Both names here are pointers, so the walk is
+taken, but they point at the root, which comes out a byte shorter than the
+pointer to it.
 
-A thousand of those fit in 20 KB, and the reply is well formed - both names are
-the root, nothing expands, and every byte comes out as it went in. It was
-refused at 1280 records and cost 37.8 times its own length in arena, which is a
-long way from the full-length bomb the budget exists for.
+A thousand of those fit in 20 KB, and the reply is well formed. Reserved at the
+most the type might need, it was refused at 1280 records and cost 37.8 times
+its own length in arena, which is a long way from the full-length bomb the
+budget exists for.
 */
 @(test)
 test_a_record_whose_names_do_not_expand_is_barely_charged :: proc(t: ^testing.T) {
@@ -429,9 +429,10 @@ test_a_record_whose_names_do_not_expand_is_barely_charged :: proc(t: ^testing.T)
 		put_u16(&msg, u16(Type.PX))
 		put_u16(&msg, u16(Class.IN))
 		append(&msg, 0, 0, 0x0e, 0x10)
-		put_u16(&msg, 4)
-		put_u16(&msg, 0xc000) // preference: legal, and looks like a pointer
-		append(&msg, 0, 0) // both names are the root
+		put_u16(&msg, 6)
+		put_u16(&msg, 10) // preference
+		// Both names point at the root that ends the question's "x.".
+		append(&msg, 0xc0, 0x0e, 0xc0, 0x0e)
 		count += 1
 	}
 	msg[6] = u8(count >> 8)

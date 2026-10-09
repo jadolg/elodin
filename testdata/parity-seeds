@@ -44,3 +44,7 @@
 # A slash in a label under a blocked zone (#398): presentation form leaves `/`
 # unescaped, and the matcher refused the name instead of walking its parents.
 1790351003840249874
+
+# A compressed RRSIG signer or NSEC next name in a truncated answer (#300):
+# kept as a pointer, it named whatever the cut-down re-encode put at its offset.
+300

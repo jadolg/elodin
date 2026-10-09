@@ -925,6 +925,144 @@ test_raw_rdata_pointer_survives_reencode :: proc(t: ^testing.T) {
 }
 
 /*
+The types whose specifications forbid compressing a name are expanded too when a
+sender compresses one anyway.
+
+RFC 4034 sections 3.1.7 and 4.1.1 say the RRSIG signer and the NSEC next owner
+MUST NOT be compressed, and RFC 3597 section 4 says the same of every type
+defined after it - TALINK, LP and DSYNC among them. A sender that ignores that
+still hands this decoder a pointer, and a pointer copied into a message of our
+own names whatever byte now sits at its offset: for an RRSIG, a signer nobody
+signed with. `message_prefix` writes an owner name in full that the re-encode
+compresses, so every offset after it moves.
+*/
+@(test)
+test_raw_rdata_pointer_in_a_never_compressed_name_survives_reencode :: proc(t: ^testing.T) {
+	Case :: struct {
+		type: Type,
+		head: []u8, // the RDATA before the name
+		tail: []u8, // the RDATA after it
+	}
+	cases := []Case {
+		// type covered, algorithm, labels, TTL, expiration, inception, key tag;
+		// a signature after the signer.
+		{.RRSIG, {0, 1, 8, 2, 0, 0, 0, 60, 0x70, 0, 0, 0, 0x60, 0, 0, 0, 0x12, 0x34}, {0xde, 0xad, 0xbe, 0xef}},
+		// The next owner, then a type bitmap of {A}.
+		{.NSEC, {}, {0, 1, 0x40}},
+		// Previous and next: the pointer is the second name.
+		{.TALINK, {3, 'p', 'r', 'v', 0}, {}},
+		{.LP, {0, 10}, {}},
+		// RRtype, scheme, port.
+		{.DSYNC, {0, 59, 1, 0x14, 0xeb}, {}},
+		// Precedence, gateway type 3 (a name), algorithm; a public key after.
+		{.IPSECKEY, {10, 3, 2}, {0xc0, 0x01, 0x02}},
+		// Precedence, D bit and relay type 3.
+		{.AMTRELAY, {10, 0x83}, {}},
+		// HIT and public-key lengths, algorithm, HIT, key; then two rendezvous
+		// servers, the first spelled out and the second the pointer.
+		{.HIP, {2, 2, 0, 1, 0xc0, 0xc1, 0xc2, 3, 'r', 'v', 's', 0}, {}},
+	}
+	for c in cases {
+		m, ns_target := message_prefix(3)
+		rdata := make([dynamic]u8, context.temp_allocator)
+		append(&rdata, ..c.head)
+		append(&rdata, 0xc0 | u8(ns_target >> 8), u8(ns_target))
+		append(&rdata, ..c.tail)
+		append_answer(&m, c.type, rdata[:])
+
+		msg, derr := decode_message(m[:], context.temp_allocator)
+		testing.expect_value(t, derr, Decode_Error.None)
+		out, _, eerr := encode_message(msg, context.temp_allocator)
+		testing.expect_value(t, eerr, Encode_Error.None)
+
+		raw, ok := raw_rdata_of(out, c.type)
+		testing.expectf(t, ok, "%v: the record did not survive the re-encode", c.type)
+		name, next, nerr := decode_name(raw, len(c.head), context.temp_allocator)
+		testing.expectf(
+			t,
+			nerr == .None && name == "ns1.example.com." && mem.compare(raw[next:], c.tail) == 0,
+			"%v: after the re-encode the RDATA is %02x",
+			c.type,
+			raw,
+		)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+An RRSIG whose signer is written out comes through byte for byte, and costs the
+budget what its bytes cost, whatever its signature holds.
+
+Nearly every signature has a byte with both high bits set in it, and only the
+signer's slot can hold a name. A pre-check that took such a byte for a pointer
+would walk every signed record and charge its signer for nothing, so the twin
+whose signature holds no such byte has to cost exactly the same.
+*/
+@(test)
+test_rrsig_signature_bytes_are_not_taken_for_a_pointer :: proc(t: ^testing.T) {
+	head := []u8{0, 1, 8, 2, 0, 0, 0, 60, 0x70, 0, 0, 0, 0x60, 0, 0, 0, 0x12, 0x34}
+	signer := []u8{3, 'n', 's', '1', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0}
+	spent: [2]int
+	for sig_byte, i in ([]u8{0xc0, 0x00}) {
+		rdata := make([dynamic]u8, context.temp_allocator)
+		append(&rdata, ..head)
+		append(&rdata, ..signer)
+		append(&rdata, 0x12, sig_byte, sig_byte, 0x34)
+		m, _ := message_prefix(3)
+		append_answer(&m, .RRSIG, rdata[:])
+
+		msg, derr := decode_message(m[:], context.temp_allocator, &spent[i])
+		testing.expect_value(t, derr, Decode_Error.None)
+		raw, ok := raw_rdata_of(m[:], .RRSIG)
+		testing.expectf(
+			t,
+			ok && mem.compare(raw, rdata[:]) == 0,
+			"signature byte %02x: the RDATA came back as %02x",
+			sig_byte,
+			raw,
+		)
+		_, _, eerr := encode_message(msg, context.temp_allocator)
+		testing.expect_value(t, eerr, Encode_Error.None)
+	}
+	testing.expectf(t, spent[0] == spent[1], "a signature holding 0xc0 cost %d, one without cost %d", spent[0], spent[1])
+	free_all(context.temp_allocator)
+}
+
+/*
+A layout read from the RDATA reaches no further than the RDATA says.
+
+An IPSECKEY whose gateway, or an AMTRELAY whose relay, is an IPv4 address holds
+no name, so bytes there that look like a pointer are an address and come through
+byte for byte. A HIP record with more rendezvous servers than the walk holds is
+not expanded, and the pointer in it is refused by the writer rather than copied
+to name whatever byte sits at its offset afterwards.
+*/
+@(test)
+test_raw_rdata_layout_read_from_the_rdata :: proc(t: ^testing.T) {
+	m, ns_target := message_prefix(5)
+	gateway := []u8{10, 1, 2, 0xc0, 0x46, 0x00, 0x01, 0xaa}
+	append_answer(&m, .IPSECKEY, gateway)
+	// D bit set, relay type 1: an IPv4 relay.
+	relay := []u8{10, 0x81, 0xc0, 0x46, 0x00, 0x01}
+	append_answer(&m, .AMTRELAY, relay)
+	hip := []u8{1, 2, 0, 0, 0xab, 0, 0, 0xc0 | u8(ns_target >> 8), u8(ns_target)}
+	append_answer(&m, .HIP, hip)
+
+	raw, ok := raw_rdata_of(m[:], .IPSECKEY)
+	testing.expect(t, ok && mem.compare(raw, gateway) == 0, "an IPv4 gateway was altered")
+	raw, ok = raw_rdata_of(m[:], .AMTRELAY)
+	testing.expect(t, ok && mem.compare(raw, relay) == 0, "an IPv4 relay was altered")
+	raw, ok = raw_rdata_of(m[:], .HIP)
+	testing.expect(t, ok && mem.compare(raw, hip) == 0, "a HIP record past the walk's reach was altered")
+
+	msg, derr := decode_message(m[:], context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	_, _, eerr := encode_message(msg, context.temp_allocator)
+	testing.expect_value(t, eerr, Encode_Error.Bad_Rdata)
+	free_all(context.temp_allocator)
+}
+
+/*
 A type this decoder does model is expanded too when its RDATA falls back to raw.
 
 `decode_rdata` rejects an MX whose RDLENGTH counts a byte more than its two
@@ -1123,6 +1261,20 @@ test_encode_refuses_raw_rdata_holding_a_pointer :: proc(t: ^testing.T) {
 	}
 	_, _, err := encode_message(compressed, context.temp_allocator)
 	testing.expect_value(t, err, Encode_Error.Bad_Rdata)
+
+	// A signer RFC 4034 forbids compressing is refused the same way, not copied.
+	signed := compressed
+	signed.answer = []Record {
+		{
+			name = "example.com.",
+			type = .RRSIG,
+			class = .IN,
+			ttl = 60,
+			data = Rdata_Raw{data = []u8{0, 1, 8, 2, 0, 0, 0, 60, 0x70, 0, 0, 0, 0x60, 0, 0, 0, 0x12, 0x34, 0xc0, 0x0c, 0xde}},
+		},
+	}
+	_, _, signed_err := encode_message(signed, context.temp_allocator)
+	testing.expect_value(t, signed_err, Encode_Error.Bad_Rdata)
 
 	opaque := Message {
 		id     = 2,

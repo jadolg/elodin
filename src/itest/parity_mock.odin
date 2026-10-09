@@ -68,13 +68,13 @@ parity_synth_reply :: proc(
 		case 1:
 			counts[1] = pm_soa_authority(&body, &r, allocator)
 		case 2:
-			counts[0] = pm_cname_chain(&body, &r, qtype, allocator)
+			counts[0] = pm_cname_chain(&body, &r, qtype, q_end, allocator)
 		case 3:
 			counts[0] = pm_answer(&body, &r, qtype, allocator)
 			counts[1] = pm_ns_authority(&body, &r, allocator)
 			counts[2] = pm_glue(&body, &r, allocator)
 		case 4:
-			counts[0] = pm_large_answer(&body, &r, qtype, allocator)
+			counts[0] = pm_large_answer(&body, &r, qtype, query[12:q_end - 4], q_end, allocator)
 		case 5:
 			aa = true
 			counts[0] = pm_answer(&body, &r, qtype, allocator)
@@ -275,10 +275,20 @@ pm_large_answer :: proc(
 	body: ^[dynamic]u8,
 	r: ^Pg_Rand,
 	qtype: u16,
+	qname: []u8,
+	base: int,
 	allocator: mem.Allocator,
 ) -> u16 {
 	count := u16(40)
 	for _ in 0 ..< count {
+		// RRSIG and NSEC owners are spelled out in full, and the re-encode
+		// `fit_response` makes when it cuts this answer down compresses them,
+		// so the pointer `pm_rdata_aimed` puts in each aims at a moving target.
+		if qtype == 46 || qtype == 47 {
+			owner_at := base + len(body^)
+			pm_rr(body, qname, qtype, 1, 3600, pm_rdata_aimed(r, qtype, owner_at, allocator), allocator)
+			continue
+		}
 		pm_rr(body, PM_PTR_Q, qtype, 1, 3600, pm_rdata(r, qtype, allocator), allocator)
 	}
 	return count
@@ -289,6 +299,7 @@ pm_cname_chain :: proc(
 	body: ^[dynamic]u8,
 	r: ^Pg_Rand,
 	qtype: u16,
+	base: int,
 	allocator: mem.Allocator,
 ) -> u16 {
 	alias := pm_name("alias." + PM_ZONE, allocator)
@@ -296,8 +307,48 @@ pm_cname_chain :: proc(
 	if qtype == 5 {
 		return 1
 	}
-	pm_rr(body, alias, qtype, 1, 600, pm_rdata(r, qtype, allocator), allocator)
+	// The owner is spelled out in full after a CNAME target spelled out in
+	// full, and a re-encode compresses both.
+	owner_at := base + len(body^)
+	pm_rr(body, alias, qtype, 1, 600, pm_rdata_aimed(r, qtype, owner_at, allocator), allocator)
 	return 2
+}
+
+/*
+RDATA for `qtype`, with the RRSIG signer or the NSEC next owner compressed into
+a pointer at `target`.
+
+RFC 4034 sections 3.1.7 and 4.1.1 forbid compressing either, which is why a
+server that does it anyway is worth being. `target` is the record's own owner,
+written out in full where a re-encode will compress it, so the offset the
+pointer holds names something else in the message the client gets unless the
+name was expanded on the way through. A pointer at the question would survive
+any re-encode and prove nothing.
+*/
+@(private = "file")
+pm_rdata_aimed :: proc(r: ^Pg_Rand, qtype: u16, target: int, allocator: mem.Allocator) -> []u8 {
+	rdata := pm_rdata(r, qtype, allocator)
+	switch qtype {
+	case 46:
+		return pm_compress_name(rdata, 18, target, allocator)
+	case 47:
+		return pm_compress_name(rdata, 0, target, allocator)
+	}
+	return rdata
+}
+
+// `rdata` with the uncompressed name at `at` replaced by a pointer to `target`.
+@(private = "file")
+pm_compress_name :: proc(rdata: []u8, at, target: int, allocator: mem.Allocator) -> []u8 {
+	end := at
+	for rdata[end] != 0 {
+		end += 1 + int(rdata[end])
+	}
+	out := make([dynamic]u8, 0, len(rdata), allocator)
+	append(&out, ..rdata[:at])
+	append(&out, 0xc0 | u8(target >> 8), u8(target))
+	append(&out, ..rdata[end + 1:])
+	return out[:]
 }
 
 @(private = "file")
