@@ -468,6 +468,7 @@ build_h2_response :: proc(
 		return h2_error(status, why), true
 	}
 
+	max_age: u32
 	answer, _, handled := handle_query(
 		ctx.server,
 		message,
@@ -475,6 +476,7 @@ build_h2_response :: proc(
 		ctx.client,
 		context.temp_allocator,
 		shared_worker = on_pool,
+		max_age = &max_age,
 	)
 	if !handled || len(answer) == 0 {
 		return h2_error(500, "no response"), true
@@ -483,7 +485,7 @@ build_h2_response :: proc(
 	return h2.Response {
 			status = 200,
 			content_type = DOH_CONTENT_TYPE,
-			cache_control = h2_cache_control(answer),
+			cache_control = h2_cache_control(max_age),
 			body = answer,
 		},
 		true
@@ -538,10 +540,10 @@ h2_split_path :: proc(path: string) -> (endpoint: string, query: string) {
 }
 
 @(private)
-h2_cache_control :: proc(response: []u8) -> string {
+h2_cache_control :: proc(max_age: u32) -> string {
 	b := strings.builder_make(context.temp_allocator)
 	strings.write_string(&b, "max-age=")
-	strings.write_int(&b, int(doh_max_age(response)))
+	strings.write_int(&b, int(max_age))
 	return strings.to_string(b)
 }
 

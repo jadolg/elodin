@@ -547,9 +547,11 @@ denial :: proc(msg: dns.Message) -> bool {
 How many CNAME hops `stops_short` follows past the question name before it reads
 the answer as a chain that never ends. Four times the sixteen that the server's
 own chain check (`server.MAX_CHAIN_NAMES`) and the validator's
-(`dnssec.MAX_CNAME_CHAIN`) follow, so any chain this server will serve is walked
-to its end and kept by the rule for answers, and only a loop or a stall is cut
-off. One scan of the answer section per name, so the walk costs at most
+(`dnssec.MAX_CNAME_CHAIN`) follow, so any chain those checks pass is walked to
+its end and kept by the rule for answers. With blocking and validation off a
+longer chain is served as the upstream sent it, and past this bound it reads as
+a denial: kept only with a SOA, which costs the entry and never the answer. A
+recursive upstream gives up on a chain long before this. One scan of the answer section per name, so the walk costs at most
 sixty-five passes over a section the decoder has already bounded, however the
 upstream wrote it.
 */

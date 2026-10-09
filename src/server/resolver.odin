@@ -299,6 +299,14 @@ handle_query :: proc(
 	it gets the guard; the four that have say so.
 	*/
 	shared_worker := true,
+	/*
+	Where a DoH caller wants the `Cache-Control: max-age` for the answer: see
+	`doh_max_age`. Worked out here, off the bytes about to leave, because this
+	is where the request's arena and its decode counter live - so reading the
+	answer once more to tell a denial from an answer is charged like every other
+	reading this request makes, rather than on top of the bound.
+	*/
+	max_age: ^u32 = nil,
 ) -> (
 	response: []u8,
 	outcome: Outcome,
@@ -479,6 +487,9 @@ handle_query :: proc(
 		// length of the bytes that leave, so nothing may change the length -
 		// or, as `set_edns_udp_size` would, rewrite the OPT record - behind it.
 		response = pad_answer(response, msg, proto, limit, advertise, allocator)
+		if max_age != nil {
+			max_age^ = doh_max_age(response, allocator, &spent)
+		}
 	}
 	return response, outcome, ok
 }

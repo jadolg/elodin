@@ -69,7 +69,27 @@ test_doh_max_age_for_a_denial_is_the_soa_figure :: proc(t: ^testing.T) {
 	testing.expect_value(t, max_age_of(.No_Error, 60, false, true), u32(60))
 	// And none at all without a SOA.
 	testing.expect_value(t, max_age_of(.No_Error, 86400, false, false), u32(0))
-	// An answer that reaches the type is its smallest TTL, as it always was.
+	// An answer that reaches the type gets its smallest TTL.
 	testing.expect_value(t, max_age_of(.No_Error, 86400, true, false), u32(600))
+	free_all(context.temp_allocator)
+}
+
+// The reading is charged to the request: one that has spent its budget gets no
+// freshness rather than a decode on top of the bound.
+@(test)
+test_doh_max_age_is_charged_to_the_request :: proc(t: ^testing.T) {
+	m := dns.Message {
+		question = []dns.Question{{name = "www.example.com.", type = .A, class = .IN}},
+		answer = []dns.Record{{name = "www.example.com.", type = .A, class = .IN, ttl = 600, data = dns.Rdata_A{addr = {203, 0, 113, 7}}}},
+	}
+	m.flags.qr = true
+	wire, _, err := dns.encode_message(m, context.temp_allocator)
+	testing.expect_value(t, err, dns.Encode_Error.None)
+
+	spent := 0
+	testing.expect_value(t, doh_max_age(wire, context.temp_allocator, &spent), u32(600))
+	testing.expect(t, spent > 0, "the reading was not charged")
+	spent = dns.REQUEST_DECODE_BUDGET + 1
+	testing.expect_value(t, doh_max_age(wire, context.temp_allocator, &spent), u32(0))
 	free_all(context.temp_allocator)
 }

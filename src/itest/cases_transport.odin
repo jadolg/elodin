@@ -143,6 +143,9 @@ run_transport_cases :: proc(r: ^Runner) {
 			check_eq_int(r, res.status, 200, "status")
 			check(r, header_contains(res.headers, "content-type: application/dns-message"), "content type header missing")
 			check(r, header_contains(res.headers, "cache-control: max-age="), "cache-control header missing")
+			// An answer is given its freshness: the control for the bare
+			// CNAME's zero below.
+			check(r, !header_contains(res.headers, "cache-control: max-age=0"), "an answer was given no freshness: %s", res.headers)
 			if check(r, len(res.body) >= dns.HEADER_SIZE, "body too short: %d bytes", len(res.body)) {
 				h := parse_header(r, res.body)
 				check_eq_int(r, h.ancount, fix.ancount, "answer count")

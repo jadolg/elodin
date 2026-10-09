@@ -785,7 +785,8 @@ serve_doh_request :: proc(
 
 	// HTTP/1.1, which answers on the connection's own thread rather than on a
 	// worker of the shared pool.
-	response, _, ok := handle_query(s, query, .DoH, client, context.temp_allocator, shared_worker = false)
+	max_age: u32
+	response, _, ok := handle_query(s, query, .DoH, client, context.temp_allocator, shared_worker = false, max_age = &max_age)
 	if !ok || len(response) == 0 {
 		return send_http_error(conn, "doh", 500, "no response", req.keep_alive)
 	}
@@ -793,7 +794,6 @@ serve_doh_request :: proc(
 	// Cache-Control mirrors the smallest TTL, or a denial's SOA figure, so
 	// intermediaries expire the answer at the same time the DNS data does -
 	// the bounded TTL, see `doh_max_age`.
-	max_age := doh_max_age(response)
 
 	b := strings.builder_make(context.temp_allocator)
 	strings.write_string(&b, "HTTP/1.1 200 OK\r\nContent-Type: ")
@@ -912,12 +912,12 @@ which costs nothing and means this holds for any caller that reaches it with
 bytes from somewhere else.
 */
 @(private)
-doh_max_age :: proc(response: []u8) -> u32 {
-	offsets, ok := dns.scan_ttl_offsets(response, context.temp_allocator)
+doh_max_age :: proc(response: []u8, allocator := context.temp_allocator, spent: ^int = nil) -> u32 {
+	offsets, ok := dns.scan_ttl_offsets(response, allocator)
 	if !ok || len(offsets) == 0 {
 		return 0
 	}
-	ttls := dns.read_ttls(response, offsets, context.temp_allocator)
+	ttls := dns.read_ttls(response, offsets, allocator)
 	v, has := dns.min_ttl(ttls)
 	if !has {
 		return 0
@@ -932,7 +932,13 @@ doh_max_age :: proc(response: []u8) -> u32 {
 	none: the CNAME's own TTL would otherwise have every HTTP cache in the path
 	hold the NODATA for up to `cache.max_ttl`.
 	*/
-	msg, err := dns.decode_message(response, context.temp_allocator)
+	/*
+	`spent` is the request's counter, so this reading is charged like the rest.
+	A response that will not decode - or that this request can no longer afford
+	to read - gets no freshness: nothing here can say it is not a denial, and
+	`cache.put` keeps nothing it read only in part either.
+	*/
+	msg, err := dns.decode_message(response, allocator, spent)
 	if err != .None {
 		return 0
 	}
