@@ -1,5 +1,6 @@
 package itest
 
+import "core:encoding/hex"
 import "core:fmt"
 import "core:net"
 import "core:strconv"
@@ -465,11 +466,7 @@ parity_report :: proc(r: ^Runner, opts: Parity_Options, stats: Parity_Stats) {
 
 @(private)
 parity_hex :: proc(b: []u8) -> string {
-	sb := strings.builder_make(context.temp_allocator)
-	for x in b {
-		fmt.sbprintf(&sb, "%02x", x)
-	}
-	return strings.to_string(sb)
+	return string(hex.encode(b, context.temp_allocator))
 }
 
 parity_split_host_port :: proc(s: string) -> (host: string, port: int, ok: bool) {

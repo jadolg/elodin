@@ -111,7 +111,7 @@ only one of them is handled below. `address_in` undoes `::ffff:a.b.c.d`, because
 that one reaches this check from the client side as well. `64:ff9b::a.b.c.d`
 (RFC 6052) and `::a.b.c.d` (RFC 4291, deprecated) reach a private IPv4 host too,
 but only ever as something an answer said, so they are unwrapped by
-`rebind_unwrap` in `src/server/rebind.odin` rather than here - a client that
+`unwrap_embedded_v4` below rather than by `address_in` - a client that
 arrives from one is a question about the ACL, and that question has not been
 asked. Nothing is silently missing from the table on their account; what a table
 of prefixes cannot express is an address that has to be rewritten before it is
@@ -145,6 +145,132 @@ LOOPBACK_NETWORKS := []Prefix {
 }
 
 /*
+The addresses a fetch that started on the public internet may not be redirected
+to: the IANA special-purpose registries' entries that are not globally reachable
+(RFC 6890 section 2.2, as RFC 8190 updates it), plus multicast. All of
+`192.0.0.0/24` is here, though the registry marks two anycast addresses in it
+reachable: no list is served from either. `2001::/23` is not, since much of it
+is reachable (AS112 and ORCHIDv2 among it). A public list
+host has no business naming any of them, and a resolver sits somewhere with a
+view of a network the list author does not have - the shape of an SSRF.
+
+A superset of `PRIVATE_NETWORKS` rather than a reuse of it, because a redirect
+answers a stricter question than a rebinding check: carrier-grade NAT, the
+documentation and benchmarking ranges and multicast are wrong places for a list
+fetch to land, where an answer naming one is a broken zone the rebinding check
+leaves alone. `224.0.0.0/3` is multicast and the reserved space above it,
+limited broadcast included.
+
+`::/96` is the IPv4-compatible block (RFC 4291 section 2.5.5.1) as a whole: what
+`unwrap_embedded_v4` hands back as IPv6 from it - `::`, `::1` and a compat
+address whose first octet is zero - is no host on the internet either.
+`64:ff9b::/96` is not here: it is judged as the IPv4 address it carries.
+*/
+NON_PUBLIC_NETWORKS := []Prefix {
+	{addr = {}, bits = 8}, // 0.0.0.0/8        "this network" (RFC 1122)
+	{addr = {0 = 10}, bits = 8}, // 10.0.0.0/8       private (RFC 1918)
+	{addr = {0 = 100, 1 = 64}, bits = 10}, // 100.64.0.0/10   shared, carrier-grade NAT (RFC 6598)
+	{addr = {0 = 127}, bits = 8}, // 127.0.0.0/8      loopback
+	{addr = {0 = 169, 1 = 254}, bits = 16}, // 169.254.0.0/16  link-local (RFC 3927)
+	{addr = {0 = 172, 1 = 16}, bits = 12}, // 172.16.0.0/12   private (RFC 1918)
+	{addr = {0 = 192}, bits = 24}, // 192.0.0.0/24     IETF protocol assignments (RFC 6890)
+	{addr = {0 = 192, 2 = 2}, bits = 24}, // 192.0.2.0/24     documentation (RFC 5737)
+	{addr = {0 = 192, 1 = 168}, bits = 16}, // 192.168.0.0/16  private (RFC 1918)
+	{addr = {0 = 198, 1 = 18}, bits = 15}, // 198.18.0.0/15   benchmarking (RFC 2544)
+	{addr = {0 = 198, 1 = 51, 2 = 100}, bits = 24}, // 198.51.100.0/24 documentation (RFC 5737)
+	{addr = {0 = 203, 2 = 113}, bits = 24}, // 203.0.113.0/24   documentation (RFC 5737)
+	{addr = {0 = 224}, bits = 3}, // 224.0.0.0/3      multicast, reserved, broadcast
+	{addr = {}, bits = 96, v6 = true}, // ::/96            IPv4-compatible, ::, ::1 (RFC 4291)
+	{addr = {1 = 0x64, 2 = 0xff, 3 = 0x9b, 5 = 1}, bits = 48, v6 = true}, // 64:ff9b:1::/48 local-use NAT64 (RFC 8215)
+	{addr = {0 = 0x01}, bits = 64, v6 = true}, // 100::/64         discard-only (RFC 6666)
+	{addr = {0 = 0x20, 1 = 0x01, 2 = 0x0d, 3 = 0xb8}, bits = 32, v6 = true}, // 2001:db8::/32 documentation (RFC 3849)
+	{addr = {0 = 0x3f, 1 = 0xff}, bits = 20, v6 = true}, // 3fff::/20        documentation (RFC 9637)
+	{addr = {0 = 0x5f}, bits = 16, v6 = true}, // 5f00::/16        SRv6 SIDs (RFC 9602)
+	{addr = {0 = 0xfc}, bits = 7, v6 = true}, // fc00::/7         unique local (RFC 4193)
+	{addr = {0 = 0xfe, 1 = 0x80}, bits = 10, v6 = true}, // fe80::/10        link-local (RFC 4291)
+	{addr = {0 = 0xff}, bits = 8, v6 = true}, // ff00::/8         multicast (RFC 4291)
+}
+
+// Whether `addr` is one a fetch that started on the public internet may be
+// redirected to. No address at all is not.
+address_is_public :: proc(addr: net.Address) -> bool {
+	if addr == nil {
+		return false
+	}
+	raw, v6 := netx.address_bytes(addr)
+	bytes, family := unwrap_embedded_v4(raw, v6)
+	return !address_in(NON_PUBLIC_NETWORKS, bytes, family)
+}
+
+/*
+The IPv4 address inside a v6 address that carries one, for the two forms
+`address_in` does not already undo.
+
+`address_in` unwraps `::ffff:a.b.c.d`, which is the form that matters to the ACL
+as well - a client can arrive from one. These two only matter to an answer or a
+redirect:
+
+  - `64:ff9b::/96`, RFC 6052's well-known prefix. On a NAT64 network the stack
+    connects to the embedded IPv4 host, so `64:ff9b::c0a8:0101` reaches
+    192.168.1.1 as squarely as an A record for it would, and an AAAA is the
+    record such a network's clients ask for. RFC 6052 section 3.1 forbids using
+    the well-known prefix with a non-global address, which is the argument that
+    a legitimate answer never carries one and refusing costs nothing.
+  - `::a.b.c.d`, the IPv4-compatible form deprecated by RFC 4291 section
+    2.5.5.1. Deprecated is not the same as not parsed, and it is one byte of
+    difference from the mapped form that everything does parse.
+
+Left alone deliberately: a *compat* address whose first embedded byte is zero,
+so `::` and `::1` stay the addresses they are and keep matching the `::/128` and
+`::1/128` entries - unwrapping them would turn `::1` into 0.0.0.1 and quietly
+put it outside `LOOPBACK_NETWORKS`, taking `allow_loopback` away from the one
+address it exists for. The same latitude under the NAT64 prefix would be a hole
+rather than a nicety, and the one that matters most; see the body.
+
+Not covered, and named because the rest of this file names what it leaves out: a
+site-specific NAT64 prefix (RFC 6052 allows /32 through /64, RFC 8215 reserves
+`64:ff9b:1::/48` for local use). This server is not told what its network's
+prefix is, and the embedded octets sit at a different offset for each length,
+skipping the `u` byte. A site running one has `allow_domains`, and dnsmasq and
+Unbound do not recognise even the well-known prefix.
+*/
+unwrap_embedded_v4 :: proc(addr: [16]u8, v6: bool) -> (bytes: [16]u8, family: bool) {
+	if !v6 {
+		return addr, false
+	}
+	// Bytes 4 through 11 are zero in both forms. `::ffff:a.b.c.d` fails here on
+	// its own 0xff pair, which is what leaves it to `address_in`.
+	for i in 4 ..< 12 {
+		if addr[i] != 0 {
+			return addr, true
+		}
+	}
+	nat64 := addr[0] == 0x00 && addr[1] == 0x64 && addr[2] == 0xff && addr[3] == 0x9b
+	compat := addr[0] == 0 && addr[1] == 0 && addr[2] == 0 && addr[3] == 0
+	if !nat64 && !compat {
+		return addr, true
+	}
+	/*
+	The "left alone" rule above, and it belongs to the compat branch alone.
+	Under a prefix of zeroes a zero first octet is `::` or `::1` - addresses in
+	their own right, which the tables already hold as themselves.
+
+	Under the NAT64 prefix it is nothing of the kind: `64:ff9b::` is RFC 6052's
+	encoding of 0.0.0.0, and a stack on such a network translates it to 0.0.0.0
+	and connects there. That is the entry `PRIVATE_NETWORKS` describes as a
+	working bypass rather than an odd answer - "0.0.0.0 Day", where a browser
+	reaches a service bound to 127.0.0.1 by connecting to 0.0.0.0 - so it is the
+	last address that should be waved through for having a zero in it.
+	*/
+	if compat && addr[12] == 0 {
+		return addr, true
+	}
+	v4: [16]u8
+	v4[0], v4[1], v4[2], v4[3] = addr[12], addr[13], addr[14], addr[15]
+	return v4, false
+}
+
+/*
 Whether an address that came out of an answer is one of `prefixes`.
 
 Takes the bytes rather than a `net.Address` because the caller has them: an A
@@ -160,14 +286,13 @@ write a private address that this does not see.
 address_in :: proc(prefixes: []Prefix, addr: [16]u8, v6: bool) -> bool {
 	bytes, family := addr, v6
 	if v6 {
-		if v4, mapped := unmap_bytes(addr); mapped {
+		if v4, mapped := netx.unmap_bytes(addr); mapped {
 			bytes, family = v4, false
 		}
 	}
 	return prefix_list_contains(prefixes, bytes, family)
 }
 
-@(private)
 prefix_list_contains :: proc(prefixes: []Prefix, addr: [16]u8, v6: bool) -> bool {
 	for p in prefixes {
 		if p.v6 == v6 && prefix_contains(p, addr) {
@@ -195,7 +320,7 @@ error rather than a silent choice between two figures.
 
 Normalised through `address_bytes` like every other source-side check in this
 file, so a v4-mapped client arriving on a `::` listener matches an IPv4 entry.
-One procedure for the whole package, deliberately - see `unmap_bytes`.
+One procedure for the whole package, deliberately - see `netx.unmap_bytes`.
 */
 prefix_match :: proc(prefixes: []Prefix, address: net.Address) -> (index: int, found: bool) {
 	if len(prefixes) == 0 || address == nil {
@@ -253,18 +378,8 @@ parse_prefix :: proc(text: string) -> (p: Prefix, ok: bool) {
 		return {}, false
 	}
 
-	switch a in address {
-	case net.IP4_Address:
-		p.addr[0], p.addr[1], p.addr[2], p.addr[3] = a[0], a[1], a[2], a[3]
-		p.bits = 32
-	case net.IP6_Address:
-		for i in 0 ..< 8 {
-			p.addr[i * 2] = u8(u16(a[i]) >> 8)
-			p.addr[i * 2 + 1] = u8(u16(a[i]))
-		}
-		p.v6 = true
-		p.bits = 128
-	}
+	p.addr, p.v6 = netx.address_bytes(address)
+	p.bits = 128 if p.v6 else 32
 
 	if has_length {
 		// `parse_int` stops at the first byte it cannot use, so "8junk" parses as
@@ -300,7 +415,7 @@ unmap_prefix :: proc(p: ^Prefix) {
 	if !p.v6 || p.bits < 96 {
 		return
 	}
-	v4, mapped := unmap_bytes(p.addr)
+	v4, mapped := netx.unmap_bytes(p.addr)
 	if !mapped {
 		return
 	}
@@ -360,43 +475,15 @@ An address as the bytes a prefix is compared against.
 An IPv4 client reaching a socket bound to `::` arrives as `::ffff:a.b.c.d`, and
 an operator who wrote `192.168.0.0/16` means that client too - so the mapping is
 undone here rather than left for every entry in the list to have to anticipate.
+`address_in` undoes it on the answer side by the same rule, `netx.unmap_bytes`.
 */
 @(private)
 address_bytes :: proc(address: net.Address) -> (out: [16]u8, v6: bool) {
-	switch a in address {
-	case net.IP4_Address:
-		out[0], out[1], out[2], out[3] = a[0], a[1], a[2], a[3]
-		return out, false
-	case net.IP6_Address:
-		for i in 0 ..< 8 {
-			out[i * 2] = u8(u16(a[i]) >> 8)
-			out[i * 2 + 1] = u8(u16(a[i]))
-		}
-		if v4, mapped := unmap_bytes(out); mapped {
-			return v4, false
-		}
-		return out, true
+	out, v6 = netx.address_bytes(address)
+	if v4, mapped := netx.unmap_bytes(out); v6 && mapped {
+		return v4, false
 	}
-	// Unreachable: `source_allowed` turns an address of neither family away
-	// before asking for its bytes.
-	return out, false
-}
-
-// The IPv4 address inside `::ffff:a.b.c.d`, when that is what the sixteen bytes
-// hold. Split out from `address_bytes` so that the answer-side check in
-// `address_in` undoes the mapping by the same rule the source-side check does.
-@(private)
-unmap_bytes :: proc(addr: [16]u8) -> (v4: [16]u8, mapped: bool) {
-	for i in 0 ..< 10 {
-		if addr[i] != 0 {
-			return {}, false
-		}
-	}
-	if addr[10] != 0xff || addr[11] != 0xff {
-		return {}, false
-	}
-	v4[0], v4[1], v4[2], v4[3] = addr[12], addr[13], addr[14], addr[15]
-	return v4, true
+	return
 }
 
 @(private)

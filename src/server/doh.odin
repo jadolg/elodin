@@ -47,7 +47,7 @@ doh_content_type_ok :: proc(value: string) -> bool {
 	if semi := strings.index_byte(media, ';'); semi >= 0 {
 		media = media[:semi]
 	}
-	return dns.name_equal_fold(trim_ows(media), DOH_CONTENT_TYPE)
+	return dns.name_equal_fold(h2.trim_ows(media), DOH_CONTENT_TYPE)
 }
 
 /*
@@ -229,66 +229,6 @@ http_exact :: proc(r: ^Http_Reader, n: int) -> (data: []u8, ok: bool) {
 }
 
 /*
-`value` with `OWS` taken off either end and nothing else.
-
-`OWS` is spaces and tabs (RFC 9110 5.6.3), which is all a recipient may take off
-a field value. `strings.trim_space` takes more: it is Unicode-aware, so it also
-takes a non-breaking space off the end. A hop in front reads the field as the
-grammar writes it and refuses the message rather than trimming it, so trimming
-one here is this hop reading a value the front end never saw.
-*/
-@(private)
-trim_ows :: proc(value: string) -> string {
-	return strings.trim_right(strings.trim_left(value, " \t"), " \t")
-}
-
-/*
-Parse a `Content-Length` value, which is `1*DIGIT` and nothing else.
-
-RFC 9110 8.6 writes the field that way, and `strconv.parse_int` with its default
-base does not read it that way. It takes the base from a prefix, so `0x10` is
-16, `0b1010` is 10 and `0o20` is 16; it skips `_` between digits, so `1_0` is
-10; it allows a leading sign; and it wraps without reporting it, so
-`18446744073709551620` comes back as 4 and a range check downstream sees nothing
-wrong with the answer.
-
-None of that is academic here. Sharing :443 with a web server, or terminating
-TLS at nginx, haproxy or Envoy, is an ordinary way to run DoH, and a front end
-parses this field as the RFC writes it: it rejects the message, or reads a
-different length out of it. Two hops that disagree about where a request ends is
-the whole of CL.CL request smuggling - what this server takes for the tail of a
-body, the front end takes for the start of the next request, and attributes to
-whoever's connection it is pipelining onto. `transfer-encoding` is refused
-outright where the headers are read, which closes the TE.CL half of the same
-problem.
-
-The limit is applied digit by digit rather than to the total, so there is
-nothing for an overlong value to wrap in on the way to being checked.
-
-What may surround the digits is `OWS` - spaces and tabs, RFC 9110 5.6.3 - and
-that is all this takes off, whether or not the caller already has.
-*/
-@(private)
-parse_content_length :: proc(value: string) -> (length: int, ok: bool) {
-	digits := trim_ows(value)
-	if len(digits) == 0 {
-		return 0, false
-	}
-	v := 0
-	for i in 0 ..< len(digits) {
-		c := digits[i]
-		if c < '0' || c > '9' {
-			return 0, false
-		}
-		v = v * 10 + int(c - '0')
-		if v > MAX_DOH_BODY {
-			return 0, false
-		}
-	}
-	return v, true
-}
-
-/*
 What to answer a request line's third token with: 0 for a version this endpoint
 speaks, and otherwise the status the RFC asks for.
 
@@ -312,18 +252,12 @@ elsewhere - see the note at the top of this file.
 */
 @(private)
 http_version_status :: proc(version: string) -> int {
-	is_digit :: proc(c: u8) -> bool {
-		return c >= '0' && c <= '9'
-	}
-	// `HTTP/` `DIGIT` `.` `DIGIT` is eight bytes, and the token is all of them.
-	if len(version) != 8 || !strings.has_prefix(version, "HTTP/") {
-		return 400
-	}
-	if !is_digit(version[5]) || version[6] != '.' || !is_digit(version[7]) {
+	major, _, ok := h2.http1_version(version)
+	if !ok {
 		return 400
 	}
 	// The major version, which is all a 505 is about.
-	if version[5] != '1' {
+	if major != 1 {
 		return 505
 	}
 	return 0
@@ -383,7 +317,7 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 	one: read as "not HTTP/1.0, so 1.1 with keep-alive", `GET / JUNK` was a
 	request, and so was `GET / HTTP/1.1 trailing-garbage`.
 
-	Both are the disagreement `parse_content_length` above is written against, on
+	Both are the disagreement `h2.parse_content_length` is written against, on
 	the other half of the request line. A front end sharing :443 with elodin, or
 	terminating TLS in front of it, reads the request line as the grammar writes
 	it: it refuses the message, or - given a fourth token - takes the target to be
@@ -470,8 +404,8 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 		if !h2.is_token(name) {
 			return {}, 0, false
 		}
-		// `OWS` off it and nothing more: see `trim_ows`.
-		value := trim_ows(header[colon + 1:])
+		// `OWS` off it and nothing more: see `h2.trim_ows`.
+		value := h2.trim_ows(header[colon + 1:])
 		switch {
 		case dns.name_equal_fold(name, "content-length"):
 			// RFC 9112 6.3: a message with more than one of these is invalid,
@@ -480,8 +414,8 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 			if content_length >= 0 {
 				return {}, 0, false
 			}
-			v, vok := parse_content_length(value)
-			if !vok {
+			v, vok := h2.parse_content_length(value, MAX_DOH_BODY)
+			if !vok || v > MAX_DOH_BODY {
 				return {}, 0, false
 			}
 			content_length = v

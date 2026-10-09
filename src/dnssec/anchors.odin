@@ -1,6 +1,7 @@
 package dnssec
 
 import "core:strconv"
+import "core:encoding/hex"
 import "core:strings"
 import "elodin:dns"
 
@@ -164,33 +165,14 @@ destroy_trust_anchor :: proc(anchor: Trust_Anchor, allocator := context.allocato
 	delete(anchor.zone, allocator)
 }
 
+// `hex.decode`, which hands back the buffer it allocated on a bad digit as well
+// as on success, so the caller would have to know to free a failure.
 @(private)
 decode_hex :: proc(text: string, allocator := context.allocator) -> (out: []u8, ok: bool) {
-	if len(text) % 2 != 0 {
+	out, ok = hex.decode(transmute([]u8)text, allocator)
+	if !ok {
+		delete(out, allocator)
 		return nil, false
 	}
-	buf := make([]u8, len(text) / 2, allocator)
-	for i := 0; i < len(text); i += 2 {
-		hi, hi_ok := hex_value(text[i])
-		lo, lo_ok := hex_value(text[i + 1])
-		if !hi_ok || !lo_ok {
-			delete(buf, allocator)
-			return nil, false
-		}
-		buf[i / 2] = hi << 4 | lo
-	}
-	return buf, true
-}
-
-@(private)
-hex_value :: proc(c: u8) -> (v: u8, ok: bool) {
-	switch {
-	case c >= '0' && c <= '9':
-		return c - '0', true
-	case c >= 'a' && c <= 'f':
-		return c - 'a' + 10, true
-	case c >= 'A' && c <= 'F':
-		return c - 'A' + 10, true
-	}
-	return 0, false
+	return
 }

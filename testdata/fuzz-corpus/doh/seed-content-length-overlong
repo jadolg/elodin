@@ -1,0 +1,5 @@
+POST /dns-query HTTP/1.1
+Host: a
+Content-Type: application/dns-message
+Content-Length: 18446744073709551620x
+

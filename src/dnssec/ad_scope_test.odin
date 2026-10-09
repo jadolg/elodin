@@ -37,16 +37,10 @@ ad_fixture :: proc(key: string) -> Fixture {
 }
 
 @(private = "file")
-ad_unhex :: proc(text: string, allocator := context.temp_allocator) -> []u8 {
-	out, _ := decode_hex(text, allocator)
-	return out
-}
-
-@(private = "file")
 ad_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
 	for f in FIXTURES {
 		if f.type == type && dns.name_equal_fold(f.name, name) {
-			return ad_unhex(f.wire, allocator), true
+			return unhex(f.wire, allocator), true
 		}
 	}
 	return nil, false
@@ -102,7 +96,7 @@ test_unsigned_authority_records_do_not_reach_the_client :: proc(t: ^testing.T) {
 	defer destroy_validator(v)
 
 	// A real, correctly signed answer for www.example.com.
-	msg, derr := dns.decode_message(ad_unhex(ad_fixture("example_a").wire), context.temp_allocator)
+	msg, derr := dns.decode_message(unhex(ad_fixture("example_a").wire), context.temp_allocator)
 	if !testing.expect(t, derr == .None, "the fixture did not decode") {
 		return
 	}
@@ -227,7 +221,7 @@ test_a_proven_denial_keeps_its_proof_and_its_soa :: proc(t: ^testing.T) {
 	v := make_validator(ad_query, nil, Options{})
 	defer destroy_validator(v)
 
-	msg, derr := dns.decode_message(ad_unhex(ad_fixture("nxdomain_root").wire), context.temp_allocator)
+	msg, derr := dns.decode_message(unhex(ad_fixture("nxdomain_root").wire), context.temp_allocator)
 	if !testing.expect(t, derr == .None, "the fixture did not decode") {
 		return
 	}
@@ -326,7 +320,7 @@ test_forged_signatures_do_not_survive_the_prune_in_bulk :: proc(t: ^testing.T) {
 	v := make_validator(ad_query, nil, Options{})
 	defer destroy_validator(v)
 
-	msg, derr := dns.decode_message(ad_unhex(ad_fixture("example_a").wire), context.temp_allocator)
+	msg, derr := dns.decode_message(unhex(ad_fixture("example_a").wire), context.temp_allocator)
 	if !testing.expect(t, derr == .None, "the fixture did not decode") {
 		return
 	}
@@ -428,7 +422,7 @@ test_forgeries_ahead_of_the_real_signature_do_not_evict_it :: proc(t: ^testing.T
 	v := make_validator(ad_query, nil, Options{})
 	defer destroy_validator(v)
 
-	msg, derr := dns.decode_message(ad_unhex(ad_fixture("nodata_cloudflare").wire), context.temp_allocator)
+	msg, derr := dns.decode_message(unhex(ad_fixture("nodata_cloudflare").wire), context.temp_allocator)
 	if !testing.expect(t, derr == .None, "the fixture did not decode") {
 		return
 	}
@@ -573,7 +567,7 @@ test_free_rejectable_forgeries_do_not_touch_the_budget :: proc(t: ^testing.T) {
 	v := make_validator(ad_query, nil, Options{})
 	defer destroy_validator(v)
 
-	msg, derr := dns.decode_message(ad_unhex(ad_fixture("nodata_cloudflare").wire), context.temp_allocator)
+	msg, derr := dns.decode_message(unhex(ad_fixture("nodata_cloudflare").wire), context.temp_allocator)
 	if !testing.expect(t, derr == .None, "the fixture did not decode") {
 		return
 	}
@@ -630,7 +624,7 @@ test_copies_of_the_real_signature_do_not_inherit_its_exemption :: proc(t: ^testi
 	v := make_validator(ad_query, nil, Options{})
 	defer destroy_validator(v)
 
-	msg, derr := dns.decode_message(ad_unhex(ad_fixture("example_a").wire), context.temp_allocator)
+	msg, derr := dns.decode_message(unhex(ad_fixture("example_a").wire), context.temp_allocator)
 	if !testing.expect(t, derr == .None, "the fixture did not decode") {
 		return
 	}
@@ -703,7 +697,7 @@ test_verbatim_copies_of_the_real_signature_are_capped :: proc(t: ^testing.T) {
 	v := make_validator(ad_query, nil, Options{})
 	defer destroy_validator(v)
 
-	msg, derr := dns.decode_message(ad_unhex(ad_fixture("example_a").wire), context.temp_allocator)
+	msg, derr := dns.decode_message(unhex(ad_fixture("example_a").wire), context.temp_allocator)
 	if !testing.expect(t, derr == .None, "the fixture did not decode") {
 		return
 	}
@@ -779,7 +773,7 @@ test_a_near_copy_does_not_evict_the_record_that_verified :: proc(t: ^testing.T) 
 	v := make_validator(ad_query, nil, Options{})
 	defer destroy_validator(v)
 
-	msg, derr := dns.decode_message(ad_unhex(ad_fixture("example_a").wire), context.temp_allocator)
+	msg, derr := dns.decode_message(unhex(ad_fixture("example_a").wire), context.temp_allocator)
 	if !testing.expect(t, derr == .None, "the fixture did not decode") {
 		return
 	}
@@ -984,7 +978,7 @@ test_a_messages_denial_records_are_verified_once :: proc(t: ^testing.T) {
 	v := make_validator(ad_query, nil, Options{})
 	defer destroy_validator(v)
 
-	msg, derr := dns.decode_message(ad_unhex(ad_fixture("nodata_cloudflare").wire), context.temp_allocator)
+	msg, derr := dns.decode_message(unhex(ad_fixture("nodata_cloudflare").wire), context.temp_allocator)
 	if !testing.expect(t, derr == .None, "the fixture did not decode") {
 		return
 	}

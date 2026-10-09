@@ -167,3 +167,71 @@ resolve :: proc(s: string) -> (ep4, ep6: net.Endpoint, err: net.Network_Error) {
 	}
 	return net.resolve(s)
 }
+
+/*
+An address as sixteen bytes, IPv4 in the first four, and whether it is IPv6.
+As written: a v4-mapped address stays IPv6 here, `unmap_bytes` undoes it.
+*/
+address_bytes :: proc(address: net.Address) -> (out: [16]u8, v6: bool) {
+	switch a in address {
+	case net.IP4_Address:
+		out[0], out[1], out[2], out[3] = a[0], a[1], a[2], a[3]
+	case net.IP6_Address:
+		for i in 0 ..< 8 {
+			out[i * 2] = u8(u16(a[i]) >> 8)
+			out[i * 2 + 1] = u8(u16(a[i]))
+		}
+		v6 = true
+	}
+	return
+}
+
+/*
+The IPv4 address inside `::ffff:a.b.c.d` (RFC 4291 section 2.5.5.2), when that
+is what the sixteen bytes hold.
+
+Exactly the mapped prefix: ten zero bytes, then `ff ff`. The deprecated compat
+form `::a.b.c.d` and the translated form `::ffff:0:a.b.c.d` are IPv6 addresses
+that happen to carry four familiar octets, and no stack sources a datagram from
+them; reading them as IPv4 would judge a source by an address the ACL compares
+as IPv6, which is the way round that gives a v6 sender the choice. Every check
+that undoes the mapping - the ACL, the rate limiter, loopback, the answer-side
+rebinding check - comes through here, so all of them agree on it.
+*/
+unmap_bytes :: proc(addr: [16]u8) -> (v4: [16]u8, mapped: bool) {
+	for i in 0 ..< 10 {
+		if addr[i] != 0 {
+			return {}, false
+		}
+	}
+	if addr[10] != 0xff || addr[11] != 0xff {
+		return {}, false
+	}
+	v4[0], v4[1], v4[2], v4[3] = addr[12], addr[13], addr[14], addr[15]
+	return v4, true
+}
+
+// `unmap_bytes` for a `net.Address`: the IPv4 address a mapped one carries, and
+// anything else as it is.
+unmap :: proc(a: net.Address) -> net.Address {
+	bytes, v6 := address_bytes(a)
+	if v4, mapped := unmap_bytes(bytes); v6 && mapped {
+		return net.IP4_Address{v4[0], v4[1], v4[2], v4[3]}
+	}
+	return a
+}
+
+// Mapped or not is not a difference between two addresses: `::ffff:10.0.0.1` is
+// 10.0.0.1 to every stack, so a peer answering from one form of the address
+// asked is answering from that address.
+addresses_equal :: proc(a, b: net.Address) -> bool {
+	switch x in unmap(a) {
+	case net.IP4_Address:
+		y, ok := unmap(b).(net.IP4_Address)
+		return ok && x == y
+	case net.IP6_Address:
+		y, ok := unmap(b).(net.IP6_Address)
+		return ok && x == y
+	}
+	return false
+}

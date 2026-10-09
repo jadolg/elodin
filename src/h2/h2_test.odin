@@ -3360,3 +3360,51 @@ test_a_closed_stream_stays_closed :: proc(t: ^testing.T) {
 	testing.expect_value(t, s.state, Stream_State.Closed)
 	testing.expect_value(t, c.closed_held, 1)
 }
+
+// The HTTP/1 field grammar both the DoH server and the HTTP client read through.
+@(test)
+test_http1_content_length_is_digits_only :: proc(t: ^testing.T) {
+	Case :: struct {
+		text:   string,
+		length: int,
+		ok:     bool,
+	}
+	cases := []Case {
+		{"0", 0, true},
+		{"42", 42, true},
+		{" \t42\t ", 42, true},
+		{"100", 100, true},
+		// Past the limit is the limit plus one, never a wrapped small number.
+		{"101", 101, true},
+		{"18446744073709551620", 101, true},
+		{"", 0, false},
+		{" ", 0, false},
+		{"+1", 0, false},
+		{"-1", 0, false},
+		{"0x10", 0, false},
+		{"1_0", 0, false},
+		{"1 0", 0, false},
+		{"1,1", 0, false},
+		{"99999999999999999999x", 0, false},
+		// A non-breaking space is not OWS.
+		{"42 ", 0, false},
+	}
+	for c in cases {
+		length, ok := parse_content_length(c.text, 100)
+		testing.expectf(t, ok == c.ok && length == c.length, "%q: got %d %v, want %d %v", c.text, length, ok, c.length, c.ok)
+	}
+}
+
+@(test)
+test_http1_version_is_eight_bytes :: proc(t: ^testing.T) {
+	major, minor, ok := http1_version("HTTP/1.1")
+	testing.expect(t, ok && major == 1 && minor == 1, "HTTP/1.1 was not 1.1")
+	major, minor, ok = http1_version("HTTP/2.0")
+	testing.expect(t, ok && major == 2 && minor == 0, "HTTP/2.0 was not 2.0")
+	for bad in ([]string{"", "HTTP/1.", "HTTP/1.10", "http/1.1", "HTTP/1,1", "HTTP/x.1", "HTTP/1.x", " HTTP/1.1", "JUNK1234"}) {
+		_, _, ok = http1_version(bad)
+		testing.expectf(t, !ok, "%q read as a version", bad)
+	}
+	testing.expect_value(t, trim_ows(" \t a b \t "), "a b")
+	testing.expect_value(t, trim_ows("a "), "a ")
+}

@@ -29,7 +29,27 @@ fixture :: proc(key: string) -> Fixture {
 	return {}
 }
 
-@(private = "file")
+/*
+`hex.decode` hands back the buffer it allocated when it meets a bad digit, so
+`decode_hex` frees it: a trust anchor's digest comes from the configuration, on
+the heap, and a bad one is refused rather than kept. The test's tracking
+allocator fails the run on what a failed decode leaves behind.
+*/
+@(test)
+test_decode_hex_refuses_and_frees :: proc(t: ^testing.T) {
+	for text in ([]string{"0g", "g0", "abc", "00zz", "+1"}) {
+		out, ok := decode_hex(text, context.allocator)
+		testing.expectf(t, !ok && out == nil, "%q decoded to %v", text, out)
+	}
+	out, ok := decode_hex("00fF", context.allocator)
+	defer delete(out)
+	testing.expect(t, ok && len(out) == 2 && out[0] == 0 && out[1] == 0xff, "00fF did not decode to 00 ff")
+	empty, empty_ok := decode_hex("", context.allocator)
+	testing.expect(t, empty_ok && len(empty) == 0, "an empty string did not decode to nothing")
+}
+
+// Test fixtures are well-formed, so a bad one is nil rather than a second
+// value every caller would drop.
 unhex :: proc(text: string, allocator := context.temp_allocator) -> []u8 {
 	out, ok := decode_hex(text, allocator)
 	if !ok {

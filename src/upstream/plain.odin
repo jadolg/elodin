@@ -4,6 +4,7 @@ import "core:mem"
 import "core:net"
 import "core:time"
 import "elodin:dns"
+import "elodin:netx"
 import "elodin:tlsx"
 
 /*
@@ -89,7 +90,7 @@ exchange_udp :: proc(
 			continue
 		}
 		// Ignore anything that did not come from the server we asked.
-		if remote.port != endpoint.port || !addresses_equal(remote.address, endpoint.address) {
+		if remote.port != endpoint.port || !netx.addresses_equal(remote.address, endpoint.address) {
 			continue
 		}
 		// A forged datagram is passed over rather than reported: the genuine
@@ -132,19 +133,6 @@ arm_receive :: proc(socket: net.UDP_Socket, deadline: time.Tick) -> bool {
 	}
 	_ = net.set_option(socket, .Receive_Timeout, max(left, time.Millisecond))
 	return true
-}
-
-@(private)
-addresses_equal :: proc(a, b: net.Address) -> bool {
-	switch x in a {
-	case net.IP4_Address:
-		y, ok := b.(net.IP4_Address)
-		return ok && x == y
-	case net.IP6_Address:
-		y, ok := b.(net.IP6_Address)
-		return ok && x == y
-	}
-	return false
 }
 
 @(private)

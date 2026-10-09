@@ -1176,65 +1176,12 @@ plausible_source :: proc(l: ^Listeners, client: net.Endpoint) -> bool {
 		return true
 	}
 	// Bound to a concrete address, and the source claims to be it.
-	if addresses_equal(client.address, bound.address) {
+	if netx.addresses_equal(client.address, bound.address) {
 		return false
 	}
 	// Bound to the wildcard, where the source of our own datagrams is whichever
 	// local address the route picked rather than the address we bound.
 	return !is_loopback(client.address)
-}
-
-/*
-The IPv4 address inside `::ffff:a.b.c.d`, when that is what an address holds.
-
-An IPv4 client reaching a socket bound to `::` arrives mapped, and so do our own
-datagrams to an IPv4 destination under such a bind. `core:net` reports the
-sixteen bytes as they arrived and nothing between the socket and here normalises
-them, so a judgement that needs the address a client actually has asks for it
-through this. A deployment `config.source_allowed` goes out of its way to support
-(see `config.address_bytes`, and docs/access-control.md) is one
-every other judgement about a source has to be able to make too: whether it is
-loopback, and which prefix's budget it spends.
-
-Exactly the mapped prefix, which is `config.unmap_bytes`'s rule and has to stay
-the same rule: ten zero bytes, then `ff ff`. The deprecated compat form
-`::a.b.c.d` and the translated form `::ffff:0:a.b.c.d` are IPv6 addresses that
-happen to carry four familiar octets, no stack sources a datagram from them, and
-reading them as IPv4 here would judge a source by an address the ACL compares as
-IPv6 - which is the way round that gives a v6 sender the choice.
-*/
-@(private)
-unmap_v4 :: proc(a: net.Address) -> net.Address {
-	x, is6 := a.(net.IP6_Address)
-	if !is6 {
-		return a
-	}
-	for i in 0 ..< 5 {
-		if x[i] != 0 {
-			return a
-		}
-	}
-	if u16(x[5]) != 0xffff {
-		return a
-	}
-	hi, lo := u16(x[6]), u16(x[7])
-	return net.IP4_Address{u8(hi >> 8), u8(hi), u8(lo >> 8), u8(lo)}
-}
-
-// Mapped or not is not a difference between two addresses: `::ffff:10.0.0.1` is
-// 10.0.0.1, and a source claiming one of the two forms of an address we bound is
-// claiming that address.
-@(private)
-addresses_equal :: proc(a, b: net.Address) -> bool {
-	switch x in unmap_v4(a) {
-	case net.IP4_Address:
-		y, ok := unmap_v4(b).(net.IP4_Address)
-		return ok && x == y
-	case net.IP6_Address:
-		y, ok := unmap_v4(b).(net.IP6_Address)
-		return ok && x == y
-	}
-	return false
 }
 
 /*
@@ -1250,13 +1197,8 @@ our own datagrams to a v4 destination carry under a `::` bind.
 */
 @(private)
 is_loopback :: proc(a: net.Address) -> bool {
-	switch x in unmap_v4(a) {
-	case net.IP4_Address:
-		return x[0] == 127
-	case net.IP6_Address:
-		return x == net.IP6_Loopback
-	}
-	return false
+	bytes, v6 := netx.address_bytes(a)
+	return config.address_in(config.LOOPBACK_NETWORKS, bytes, v6)
 }
 
 /*
@@ -1270,7 +1212,7 @@ socket sees them.
 */
 @(private)
 is_unicast :: proc(a: net.Address) -> bool {
-	switch x in unmap_v4(a) {
+	switch x in netx.unmap(a) {
 	case net.IP4_Address:
 		return x != net.IP4_Address{} && x[0] & 0xf0 != 224 && x != net.IP4_Address{255, 255, 255, 255}
 	case net.IP6_Address:

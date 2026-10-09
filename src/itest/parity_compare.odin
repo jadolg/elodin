@@ -1,8 +1,8 @@
 package itest
 
+import "core:encoding/hex"
 import "core:fmt"
 import "core:mem"
-import "core:strings"
 
 /*
 Hold elodin's answer against the upstream's and say where they differ.
@@ -1759,11 +1759,7 @@ pc_hex :: proc(b: []u8, allocator: mem.Allocator) -> string {
 	if len(b) == 0 {
 		return "(empty)"
 	}
-	sb := strings.builder_make(allocator)
-	for x in b {
-		fmt.sbprintf(&sb, "%02x", x)
-	}
-	return strings.to_string(sb)
+	return string(hex.encode(b, allocator))
 }
 
 @(private)

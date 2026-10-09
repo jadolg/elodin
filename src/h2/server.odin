@@ -1065,11 +1065,73 @@ more, and empty elements match nothing. For lists of tokens only, such as
 list_has_token :: proc(value, token: string) -> bool {
 	rest := value
 	for element in strings.split_iterator(&rest, ",") {
-		if dns.name_equal_fold(strings.trim(element, " \t"), token) {
+		if dns.name_equal_fold(trim_ows(element), token) {
 			return true
 		}
 	}
 	return false
+}
+
+/*
+`value` with `OWS` taken off either end and nothing else.
+
+`OWS` is spaces and tabs (RFC 9110 5.6.3), which is all a recipient may take off
+a field value. `strings.trim_space` takes more: it is Unicode-aware, so it also
+takes a non-breaking space off the end, which made `close\u00a0` a close. A hop
+in front reads the field as the grammar writes it and refuses the message rather
+than trimming it, so trimming one here is this hop reading a value the front end
+never saw.
+*/
+trim_ows :: proc(value: string) -> string {
+	return strings.trim(value, " \t")
+}
+
+/*
+An HTTP/1 `Content-Length` value, which is `1*DIGIT` (RFC 9110 8.6) and nothing
+else, with `OWS` around it. One parser for the DoH server and the HTTP client,
+since both carry the same request-smuggling hardening and two that disagree are
+the bug.
+
+`strconv.parse_int` with its default base reads a good deal more: the base comes
+from a prefix, so `0x10` is 16 and `0b1010` is 10; `_` between digits is
+skipped; a leading sign is allowed; and the accumulator wraps in silence, so
+`18446744073709551620` comes back as 4 and a range check downstream sees nothing
+wrong. On the server that is CL.CL request smuggling behind a front end that
+reads the field as the RFC writes it; on the client it leaves a kept-alive
+connection reading from the middle of a body.
+
+A value past `limit` comes back as `limit + 1`, so nothing wraps on the way to
+the caller's range check, and its digits are still all checked: too large and
+not a length at all are different refusals.
+*/
+parse_content_length :: proc(value: string, limit: int) -> (length: int, ok: bool) {
+	digits := trim_ows(value)
+	if len(digits) == 0 {
+		return 0, false
+	}
+	for i in 0 ..< len(digits) {
+		c := digits[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		length = min(length * 10 + int(c - '0'), limit + 1)
+	}
+	return length, true
+}
+
+/*
+An HTTP/1 `HTTP-version`: `HTTP/` `DIGIT` `.` `DIGIT`, case-sensitively, and
+nothing on either side of it (RFC 9112 2.3) - the request line's third token, or
+the first eight bytes of a status line.
+*/
+http1_version :: proc(s: string) -> (major, minor: u8, ok: bool) {
+	if len(s) != 8 || !strings.has_prefix(s, "HTTP/") || s[6] != '.' {
+		return
+	}
+	if s[5] < '0' || s[5] > '9' || s[7] < '0' || s[7] > '9' {
+		return
+	}
+	return s[5] - '0', s[7] - '0', true
 }
 
 /*

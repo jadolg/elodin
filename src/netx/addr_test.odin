@@ -1,5 +1,6 @@
 package netx
 
+import "core:net"
 import "core:testing"
 
 /*
@@ -143,4 +144,31 @@ test_a_numeric_name_is_no_host :: proc(t: ^testing.T) {
 	for s in ([]string{"1.2.3.4", "dns.example", "1dns.example", "dns.example.", "::1"}) {
 		testing.expect(t, is_host(s), s)
 	}
+}
+
+// Exactly `::ffff:0:0/96` is undone; the compat and translated forms that also
+// carry four familiar octets stay the IPv6 addresses they are.
+@(test)
+test_unmap_takes_only_the_mapped_prefix :: proc(t: ^testing.T) {
+	Case :: struct {
+		text: string,
+		want: string,
+	}
+	cases := []Case {
+		{"::ffff:10.0.0.1", "10.0.0.1"},
+		{"::ffff:127.0.0.1", "127.0.0.1"},
+		{"10.0.0.1", "10.0.0.1"},
+		{"::10.0.0.1", "::10.0.0.1"},
+		{"::ffff:0:10.0.0.1", "::ffff:0:10.0.0.1"},
+		{"::fffe:10.0.0.1", "::fffe:10.0.0.1"},
+		{"1::ffff:10.0.0.1", "1::ffff:10.0.0.1"},
+		{"::1", "::1"},
+	}
+	for c in cases {
+		got := unmap(net.parse_address(c.text))
+		testing.expectf(t, got == net.parse_address(c.want), "%s unmapped to %v, want %s", c.text, got, c.want)
+	}
+	testing.expect(t, addresses_equal(net.parse_address("::ffff:10.0.0.1"), net.IP4_Address{10, 0, 0, 1}), "a mapped address is not its IPv4 one")
+	testing.expect(t, !addresses_equal(net.parse_address("::10.0.0.1"), net.IP4_Address{10, 0, 0, 1}), "a compat address is its IPv4 one")
+	testing.expect(t, !addresses_equal(nil, nil), "no address equals no address")
 }

@@ -492,7 +492,7 @@ test_a_real_v4_client_on_a_wildcard_bind_is_judged_by_its_v4_address :: proc(t: 
 /*
 No single bit off the mapped prefix is read as IPv4.
 
-`unmap_v4`'s guard is ten zero bytes and then `ff ff`, and a guard is worth
+`netx.unmap`'s guard is ten zero bytes and then `ff ff`, and a guard is worth
 sweeping rather than sampling: a loop bound one short, a mask on the wrong byte,
 a comparison against the wrong half of the pair. Every bit that can be set in
 the ten zero bytes, and every bit that can be cleared in the pair, must leave the
