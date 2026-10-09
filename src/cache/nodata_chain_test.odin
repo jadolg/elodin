@@ -26,18 +26,33 @@ Chain :: struct {
 	// The target zone's SOA in authority: `minimum` 300, TTL 900.
 	soa:       bool,
 	rcode:     dns.Rcode,
+	// An A at a name the chain never reaches.
+	stray_a:   bool,
+	// A zero-TTL address record in additional.
+	zero_glue: bool,
 }
 
 @(private = "file")
 chain_response :: proc(c: Chain) -> ([]u8, dns.Message) {
 	answer: [dynamic]dns.Record
 	answer.allocator = context.temp_allocator
+	target := "cdn.example.net."
 	if c.dname {
+		// And the CNAME it synthesizes (RFC 6672 section 3.1).
 		append(&answer, dns.Record{name = "example.com.", type = .DNAME, class = .IN, ttl = c.cname_ttl, data = dns.Rdata_Name{"example.net."}})
+		target = "www.example.net."
 	}
-	append(&answer, dns.Record{name = "www.example.com.", type = .CNAME, class = .IN, ttl = c.cname_ttl, data = dns.Rdata_Name{"cdn.example.net."}})
+	append(&answer, dns.Record{name = "www.example.com.", type = .CNAME, class = .IN, ttl = c.cname_ttl, data = dns.Rdata_Name{target}})
 	if c.target_a {
-		append(&answer, dns.Record{name = "cdn.example.net.", type = .A, class = .IN, ttl = 600, data = dns.Rdata_A{addr = {203, 0, 113, 7}}})
+		append(&answer, dns.Record{name = target, type = .A, class = .IN, ttl = 600, data = dns.Rdata_A{addr = {203, 0, 113, 7}}})
+	}
+	if c.stray_a {
+		append(&answer, dns.Record{name = "x.other.example.", type = .A, class = .IN, ttl = 86400, data = dns.Rdata_A{addr = {203, 0, 113, 9}}})
+	}
+	additional: [dynamic]dns.Record
+	additional.allocator = context.temp_allocator
+	if c.zero_glue {
+		append(&additional, dns.Record{name = "ns.example.net.", type = .A, class = .IN, ttl = 0, data = dns.Rdata_A{addr = {203, 0, 113, 53}}})
 	}
 	authority: [dynamic]dns.Record
 	authority.allocator = context.temp_allocator
@@ -67,8 +82,9 @@ chain_response :: proc(c: Chain) -> ([]u8, dns.Message) {
 	m := dns.Message {
 		id        = 0x4180,
 		question  = []dns.Question{{name = "www.example.com.", type = c.qtype, class = .IN}},
-		answer    = answer[:],
-		authority = authority[:],
+		answer     = answer[:],
+		authority  = authority[:],
+		additional = additional[:],
 	}
 	m.flags.qr = true
 	m.flags.rcode = u8(c.rcode)
@@ -108,7 +124,7 @@ test_a_bare_cname_without_a_soa_is_not_cached :: proc(t: ^testing.T) {
 	held, kept = held_for(c, {qtype = .AAAA, cname_ttl = 86400, dname = true})
 	testing.expectf(t, !kept, "a bare DNAME chain with no SOA was held for %v", held)
 	// Asked for the DNAME type: the one above the name is the redirection, not
-	// the answer (see `answers_the_question`).
+	// the answer, and the walk follows the CNAME it synthesized.
 	held, kept = held_for(c, {qtype = .DNAME, cname_ttl = 86400, dname = true})
 	testing.expectf(t, !kept, "a DNAME question answered by the DNAME above it was held for %v", held)
 
@@ -128,6 +144,25 @@ test_a_bare_cname_without_a_soa_is_not_cached :: proc(t: ^testing.T) {
 	kb: [KEY_MAX]u8
 	key := make_key(kb[:], "www.example.com.", .DNAME, .IN, false)
 	testing.expect(t, !put(c, key, wire, later), "a DNAME question answered by a DNAME above a later link was cached")
+
+	// A record of the type asked for at a name the chain never reaches is not
+	// the answer: the walk, not a scan for the type.
+	held, kept = held_for(c, {qtype = .A, cname_ttl = 86400, stray_a = true})
+	testing.expectf(t, !kept, "a bare CNAME padded with an unrelated A was held for %v", held)
+
+	// A loop never reaches the type, and the walk stops on its own bound.
+	loop := dns.Message {
+		question = []dns.Question{{name = "a.example.com.", type = .A, class = .IN}},
+		answer = []dns.Record {
+			{name = "a.example.com.", type = .CNAME, class = .IN, ttl = 86400, data = dns.Rdata_Name{"b.example.com."}},
+			{name = "b.example.com.", type = .CNAME, class = .IN, ttl = 86400, data = dns.Rdata_Name{"a.example.com."}},
+		},
+	}
+	loop.flags.qr = true
+	wire, _, err = dns.encode_message(loop, context.temp_allocator)
+	testing.expect_value(t, err, dns.Encode_Error.None)
+	key = make_key(kb[:], "a.example.com.", .A, .IN, false)
+	testing.expect(t, !put(c, key, wire, loop), "a CNAME loop with no SOA was cached")
 	free_all(context.temp_allocator)
 }
 
@@ -164,6 +199,11 @@ test_a_denial_after_a_cname_does_not_outlive_the_cname :: proc(t: ^testing.T) {
 	held, kept = held_for(c, {qtype = .A, cname_ttl = 30, soa = true, rcode = .NX_Domain})
 	testing.expect(t, kept, "NXDOMAIN after a CNAME with its SOA was not cached")
 	testing.expect_value(t, held, 30 * time.Second)
+
+	// The answer section bounds it, not a short-lived record elsewhere.
+	held, kept = held_for(c, {qtype = .A, cname_ttl = 86400, soa = true, zero_glue = true})
+	testing.expect(t, kept, "NODATA after a CNAME was forgotten for a zero-TTL record in additional")
+	testing.expect_value(t, held, 300 * time.Second)
 	free_all(context.temp_allocator)
 }
 
