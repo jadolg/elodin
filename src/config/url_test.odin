@@ -7,19 +7,23 @@ import "core:testing"
 A DoH upstream's url is sent as written from the path on, query and all: some
 services name the account in the query, and without it every query goes to
 the service's default. A url with no path is `/` (RFC 3986 6.2.3), with the
-query after it. Both forms of upstream, the map and the bare url, read it the
-same way, and the scheme in any case (RFC 3986 3.1).
+query after it, its order, repeated keys and escapes kept, and the host and
+port end at the first `/`, `?` or `#` (RFC 3986 3.2). Both forms of upstream,
+the map and the bare url, read it the same way, and the scheme in any case
+(RFC 3986 3.1).
 */
 @(test)
 test_a_doh_upstream_keeps_its_query :: proc(t: ^testing.T) {
 	Case :: struct {
 		src, want: string,
+		port:      int,
 	}
 	cases := []Case {
-		{"upstream:\n  bootstrap: [1.1.1.1]\n  servers: [\"https://dns.example/dns-query?profile=ab12\"]\n", "/dns-query?profile=ab12"},
-		{"upstream:\n  bootstrap: [1.1.1.1]\n  servers: [{url: \"HTTPS://dns.example/q?profile=ab12#x\"}]\n", "/q?profile=ab12"},
-		{"upstream:\n  bootstrap: [1.1.1.1]\n  servers: [\"Https://dns.example?profile=ab12\"]\n", "/?profile=ab12"},
-		{"upstream:\n  bootstrap: [1.1.1.1]\n  servers: [{url: \"https://dns.example:8443\"}]\n", "/"},
+		{"upstream:\n  bootstrap: [1.1.1.1]\n  servers: [\"https://dns.example/dns-query?profile=ab12&b=1&b=2\"]\n", "/dns-query?profile=ab12&b=1&b=2", 443},
+		{"upstream:\n  bootstrap: [1.1.1.1]\n  servers: [{url: \"HTTPS://dns.example/q?profile=ab12&b=2&b=1&c=%2f+#x\"}]\n", "/q?profile=ab12&b=2&b=1&c=%2f+", 443},
+		{"upstream:\n  bootstrap: [1.1.1.1]\n  servers: [\"Https://dns.example?profile=ab12\"]\n", "/?profile=ab12", 443},
+		{"upstream:\n  bootstrap: [1.1.1.1]\n  servers: [{url: \"https://dns.example:8443\"}]\n", "/", 8443},
+		{"upstream:\n  bootstrap: [1.1.1.1]\n  servers: [\"https://dns.example:8443?profile=ab12#x\"]\n", "/?profile=ab12", 8443},
 	}
 	for c in cases {
 		cfg, err := load_string(c.src, context.temp_allocator)
@@ -28,7 +32,10 @@ test_a_doh_upstream_keeps_its_query :: proc(t: ^testing.T) {
 			continue
 		}
 		if testing.expectf(t, len(cfg.upstream.servers) == 1, "%q: %d servers", c.src, len(cfg.upstream.servers)) {
-			testing.expect_value(t, cfg.upstream.servers[0].path, c.want)
+			s := cfg.upstream.servers[0]
+			testing.expect_value(t, s.path, c.want)
+			testing.expect_value(t, s.hostname, "dns.example")
+			testing.expect_value(t, s.port, c.port)
 		}
 	}
 	// And a url that is no url is told so, not read as a host.
