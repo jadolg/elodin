@@ -5,6 +5,7 @@ import "core:strings"
 import "core:sync"
 import "core:time"
 import "elodin:dns"
+import "elodin:netx"
 
 /*
 A server-side HTTP/2 connection, scoped to what a DoH endpoint needs.
@@ -993,7 +994,7 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 	folded in ASCII only: `strings.equal_fold` folds Unicode, where the long s
 	(U+017F) is an `s`, so `http\u017f` read as https (#432).
 	*/
-	if !scheme_is_valid(scheme) {
+	if !netx.is_scheme(scheme) {
 		return true
 	}
 	if dns.name_equal_fold(scheme, "http") || dns.name_equal_fold(scheme, "https") {
@@ -1084,23 +1085,6 @@ field_name_is_valid :: proc(name: string) -> bool {
 		}
 	}
 	return is_token(name)
-}
-
-// RFC 3986 3.1: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ).
-@(private)
-scheme_is_valid :: proc(scheme: string) -> bool {
-	for i in 0 ..< len(scheme) {
-		switch scheme[i] {
-		case 'a' ..= 'z', 'A' ..= 'Z':
-			continue
-		case '0' ..= '9', '+', '-', '.':
-			if i > 0 {
-				continue
-			}
-		}
-		return false
-	}
-	return len(scheme) > 0
 }
 
 /*

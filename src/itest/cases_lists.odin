@@ -367,3 +367,69 @@ blocking:
 		end_case(r)
 	}
 }
+
+/*
+A list host that moves its list answers with a relative Location (RFC 9110
+10.2.2), which the fetcher resolves against the url it asked for (RFC 3986 5.2)
+and follows (#460). The query is part of what is asked for at each hop.
+*/
+run_list_redirect_cases :: proc(r: ^Runner) {
+	http_port := next_port(r)
+	http := http_mock_make(http_port)
+	http_mock_redirect(http, "/old/hosts.txt?v=1", "../new/hosts.txt?v=2")
+	http_mock_serve(http, "/new/hosts.txt?v=2", "0.0.0.0 moved.test\n")
+	if !http_mock_start(http) {
+		skip_case(r, "lists: relative redirect", "cannot start the HTTP mock")
+		return
+	}
+	defer http_mock_stop(http)
+
+	upstream_port := next_port(r)
+	mock := mock_make("lists-redirect", upstream_port)
+	mock_synth_all(mock, {203, 0, 113, 9})
+	if !mock_start(mock) {
+		skip_case(r, "lists: relative redirect", "cannot start the mock upstream")
+		return
+	}
+	defer mock_stop(mock)
+
+	cache_dir := filepath.join({r.work_dir, "redirectcache"}, context.allocator) or_else ""
+	defer delete(cache_dir)
+
+	start_case(r, "lists: a relative redirect is followed, query and all")
+	udp_port := next_port(r)
+	config := fmt.tprintf(
+		`log: {{ level: debug }}
+listeners:
+  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
+  tcp: {{ enabled: false }}
+upstream:
+  timeout: 3s
+  servers: ["127.0.0.1:%d"]
+cache: {{ enabled: false }}
+blocking:
+  enabled: true
+  response: nxdomain
+  cache_dir: %s
+  refresh: 24h
+  lists:
+    - {{ name: moved-list, url: "http://127.0.0.1:%d/old/hosts.txt?v=1", format: hosts }}
+`,
+		udp_port,
+		upstream_port,
+		cache_dir,
+		http_port,
+	)
+	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port, allow_fetch = true})
+	if check(r, ok, "the server did not start") {
+		check_eq_int(r, http_mock_hits(http, "/old/hosts.txt?v=1"), 1, "requests for the list url, query and all")
+		check_eq_int(r, http_mock_hits(http, "/new/hosts.txt?v=2"), 1, "requests for where it moved")
+		res := query_udp(udp_port, build_query("moved.test.", u16(dns.Type.A)))
+		if check(r, res.ok, "no response") {
+			h := parse_header(r, res.wire)
+			check(r, h.rcode == int(dns.Rcode.NX_Domain), "the moved list was not loaded")
+		}
+		stop_server(&srv)
+	}
+	end_case(r)
+}

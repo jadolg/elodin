@@ -1320,13 +1320,13 @@ load_upstream_spec :: proc(
 			errorf(l, "%s: an https upstream needs a url", path)
 			return {}, false
 		}
-		if !url_is_valid(spec.url) || !h2.authority_is_valid(spec.hostname) {
-			errorf(l, "%s: %s", path, UPSTREAM_URL_RULE)
+		scheme, host, url_path, split_ok := netx.split_url(spec.url)
+		if !split_ok || scheme != "https" {
+			errorf(l, "%s.url: expected an https:// url", path)
 			return {}, false
 		}
-		scheme, host, url_path, _, _ := net.split_url(spec.url, l.allocator)
-		if scheme != "https" {
-			errorf(l, "%s.url: expected an https:// url", path)
+		if !url_is_valid(spec.url) || !h2.authority_is_valid(spec.hostname) {
+			errorf(l, "%s: %s", path, UPSTREAM_URL_RULE)
 			return {}, false
 		}
 		// `url_is_valid` has split it.
@@ -1340,7 +1340,7 @@ load_upstream_spec :: proc(
 		if spec.port == 0 {
 			spec.port = url_port if url_port != 0 else 443
 		}
-		spec.path = url_path if url_path != "" else "/dns-query"
+		spec.path = doh_path(url_path, l.allocator)
 	} else {
 		if spec.address == "" {
 			errorf(l, "%s: missing address", path)
@@ -1431,14 +1431,13 @@ parse_upstream_shorthand :: proc(
 			errorf(l, "%s: %s", path, UPSTREAM_URL_RULE)
 			return {}, false
 		}
-		scheme, host, url_path, _, _ := net.split_url(s, l.allocator)
-		_ = scheme
 		// `url_is_valid` has split it.
+		_, host, url_path, _ := netx.split_url(s)
 		host_only, url_port, _ := netx.split_port(host)
 		spec.address = host_only
 		spec.hostname = host_only
 		spec.port = url_port if url_port != 0 else 443
-		spec.path = url_path if url_path != "" else "/dns-query"
+		spec.path = doh_path(url_path, l.allocator)
 		spec.name = s
 		return spec, true
 	}
@@ -3067,9 +3066,23 @@ HOST_RULE :: "must be visible ASCII with no userinfo, path, query or fragment"
 // and what the fetcher splits with `netx.split_port` before every download.
 @(private)
 url_is_valid :: proc(url: string) -> bool {
-	_, host, _, _, _ := net.split_url(url, context.temp_allocator)
+	_, host, _, url_ok := netx.split_url(url)
 	host_only, _, split_ok := netx.split_port(host)
-	return h2.target_is_valid(url) && h2.authority_is_valid(host) && split_ok && netx.is_host(host_only)
+	return url_ok && h2.target_is_valid(url) && h2.authority_is_valid(host) && split_ok && netx.is_host(host_only)
+}
+
+/*
+The target a DoH upstream is sent, query and all: `/dns-query?profile=x` is a
+query string some services name the account by, and a POST carries it as any
+request target does (RFC 8484 4.1, RFC 9112 3.2.1). No path at all is the
+conventional `/dns-query`.
+*/
+@(private)
+doh_path :: proc(target: string, allocator: mem.Allocator) -> string {
+	if target == "" || target[0] == '?' {
+		return strings.concatenate({"/dns-query", target}, allocator)
+	}
+	return target
 }
 
 // A list url goes into a request line and `Host` the same way.

@@ -362,7 +362,9 @@ fetch_url :: proc(
 			if len(resp.body) > 0 {
 				delete(resp.body, allocator)
 			}
-			current = resp.location
+			// RFC 9110 10.2.2: a URI-reference, resolved against the target it
+			// answered (RFC 3986 5.2), then checked as any url at the top.
+			current = netx.resolve_reference(current, resp.location)
 			continue
 		case:
 			if len(resp.body) > 0 {
@@ -473,7 +475,7 @@ doh_authority :: proc(hostname, url: string) -> string {
 	if _, is6 := netx.parse_ip6_address(hostname); is6 {
 		host = fmt.tprintf("[%s]", hostname)
 	}
-	_, url_host, _, _, _ := net.split_url(url, context.temp_allocator)
+	_, url_host, _, _ := netx.split_url(url)
 	_, port, _ := netx.split_port(url_host)
 	if port == 443 || port == 0 {
 		return host

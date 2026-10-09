@@ -33,6 +33,10 @@ for them, since on a machine where elodin *is* the system resolver that would
 loop back to a server that has not started yet. Each entry is an IP address with
 an optional port (`9.9.9.9`, `[2620:fe::fe]:53`); a name there is a config error.
 
+An `https` upstream is sent its url from the path on, query included
+(`https://dns.example/dns-query?profile=ab12`), as the target of each POST. A
+url with no path is sent to `/dns-query`.
+
 ## Time budget
 
 A query waits at most about two `timeout`s on its upstreams, however many servers
