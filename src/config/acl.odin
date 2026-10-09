@@ -147,7 +147,9 @@ LOOPBACK_NETWORKS := []Prefix {
 /*
 The addresses a fetch that started on the public internet may not be redirected
 to: the IANA special-purpose registries' entries that are not globally reachable
-(RFC 6890 section 2.2, as RFC 8190 updates it), plus multicast. All of
+(RFC 6890 section 2.2, as RFC 8190 updates it), plus multicast and the
+deprecated site-local block, which RFC 3879 section 4 lets old deployments go on
+using and nothing global ever will. All of
 `192.0.0.0/24` is here, though the registry marks two anycast addresses in it
 reachable: no list is served from either. `2001::/23` is not, since much of it
 is reachable (AS112 and ORCHIDv2 among it), but its benchmarking `2001:2::/48`
@@ -194,6 +196,7 @@ NON_PUBLIC_NETWORKS := []Prefix {
 	{addr = {0 = 0x5f}, bits = 16, v6 = true}, // 5f00::/16        SRv6 SIDs (RFC 9602)
 	{addr = {0 = 0xfc}, bits = 7, v6 = true}, // fc00::/7         unique local (RFC 4193)
 	{addr = {0 = 0xfe, 1 = 0x80}, bits = 10, v6 = true}, // fe80::/10        link-local (RFC 4291)
+	{addr = {0 = 0xfe, 1 = 0xc0}, bits = 10, v6 = true}, // fec0::/10        site-local, deprecated (RFC 3879)
 	{addr = {0 = 0xff}, bits = 8, v6 = true}, // ff00::/8         multicast (RFC 4291)
 }
 
@@ -220,14 +223,19 @@ off.
 origin_is_public :: proc(addr: net.Address) -> bool {
 	raw, v6 := netx.address_bytes(addr)
 	bytes, family := unwrap_embedded_v4(raw, v6)
-	if addr != nil && family && prefix_list_contains(LOCAL_USE_NAT64, bytes, true) {
+	// No address at all comes back as IPv4, so it falls through to a refusal.
+	if family && prefix_contains(LOCAL_USE_NAT64, bytes) {
 		return true
 	}
 	return address_is_public(addr)
 }
 
 @(private)
-LOCAL_USE_NAT64 := []Prefix{{addr = {1 = 0x64, 2 = 0xff, 3 = 0x9b, 5 = 1}, bits = 48, v6 = true}}
+LOCAL_USE_NAT64 := Prefix {
+	addr = {1 = 0x64, 2 = 0xff, 3 = 0x9b, 5 = 1},
+	bits = 48,
+	v6   = true,
+}
 
 /*
 The IPv4 address inside a v6 address that carries one, for the forms

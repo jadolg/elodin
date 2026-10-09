@@ -13,7 +13,6 @@ import "core:thread"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
-import "elodin:netx"
 import "elodin:tlsx"
 
 /*
@@ -1831,6 +1830,8 @@ test_address_is_public_classifies_reserved_ranges :: proc(t: ^testing.T) {
 		{"3fff:1000::1", true},
 		{"5f00::1", false},
 		{"5f01::1", true},
+		{"fec0::1", false},
+		{"feff:ffff::1", false},
 	}
 	for c in CASES {
 		addr := net.parse_address(c.text)
@@ -3773,14 +3774,14 @@ test_a_late_resolved_endpoint_is_published_once :: proc(t: ^testing.T) {
 	ep, eerr := endpoint_of(u)
 	testing.expect_value(t, eerr, Error.None)
 	testing.expect_value(t, ep.port, bound.port)
-	testing.expect(t, netx.addresses_equal(ep.address, net.IP4_Loopback), "the endpoint is not the address the name resolved to")
+	testing.expect(t, ep.address == net.Address(net.IP4_Loopback), "the endpoint is not the address the name resolved to")
 
 	// A lookup that finishes after the endpoint is out leaves it as it is: a
 	// reader holding no lock may be copying it.
 	u.spec.address = "127.0.0.2"
 	testing.expect(t, resolve_endpoint(u), "a lookup after the endpoint was published")
 	ep, _ = endpoint_of(u)
-	testing.expect(t, netx.addresses_equal(ep.address, net.IP4_Loopback), "the published endpoint was written over")
+	testing.expect(t, ep.address == net.Address(net.IP4_Loopback), "the published endpoint was written over")
 }
 
 /*

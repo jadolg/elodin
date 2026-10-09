@@ -589,7 +589,7 @@ test_cookie_unbindable_address_is_answered_when_not_required :: proc(t: ^testing
 A cookie is bound to the client's address as the socket reported it.
 
 `cookie_client_ip` hashes `::ffff:a.b.c.d` as the sixteen bytes it arrived as,
-and is the one place in the server that does not undo the mapping - `netx.unmap`
+and is the one place in the server that does not undo the mapping - `netx.unmap_bytes`
 undoes it for the rate limiter and for loopback, and `config.address_bytes` for
 the ACL. What is decided here is only whether a cookie this server issued came
 back from the address it was issued to, and a client returns to the socket that

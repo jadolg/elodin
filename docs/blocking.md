@@ -30,7 +30,7 @@ does not turn blocking off once a list has been fetched.
   relative `Location` against the url that answered it (RFC 3986 5.2). An
   `https` list is never followed to `http`, and a list on a public address is
   never followed to one that is not globally reachable: loopback, private,
-  link-local, carrier-grade NAT, multicast, the documentation and benchmarking
+  link-local, site-local, carrier-grade NAT, multicast, the documentation and benchmarking
   ranges, and the other special-purpose ranges (RFC 6890) no list host can be
   at. An IPv4 address written inside an
   IPv6 one (`::ffff:a.b.c.d`, `::a.b.c.d`,

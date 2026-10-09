@@ -986,8 +986,8 @@ kind of socket it arrived on. Left mapped it would be read as IPv6, and every
 `::ffff:a.b.c.d` address is zeroes in the four groups a /64 is taken from - so
 the whole IPv4 side of a listener bound to `::` would be one prefix, and any one
 client there could spend the budget, or occupy the connections, of all the
-others. `netx.unmap` is the same normalisation `is_loopback` reads a source
-through, and the rule the ACL compared it against on the way in.
+others. `netx.unmap` reads it through `netx.unmap_bytes`, the normalisation
+`is_loopback` reads a source through, and the rule the ACL compared it against on the way in.
 
 `n` of 0 is an address that was neither family, which nothing this server
 accepts produces; each caller says what it does with one. Compared by value, so
