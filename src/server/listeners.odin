@@ -1020,7 +1020,7 @@ spawn_failure_words :: proc(why: Spawn_Result) -> Spawn_Failure_Words {
 			line = "%s: refusing a connection, this client's /24 or /64 already holds server.max_connections_per_prefix (%d) of them",
 			hint = "raise server.max_connections_per_prefix if one client network should be able to hold more of server.max_connections at once, or set it to max_connections to let any one of them hold the table; these are counted as conn_refused= in the stats line, and further ones are logged at debug level",
 		}
-	case .Started, .Thread_Failed:
+	case .Started, .Thread_Failed, .Stopped:
 	}
 	return Spawn_Failure_Words {
 		reported = &conn_failed_reported,
@@ -1724,12 +1724,17 @@ accept_loop :: proc(data: rawptr) {
 			out of: this loop is the one place that never resets it, and nothing
 			here outlives the iteration.
 			*/
-			if spawned == .Thread_Failed {
-				sync.atomic_add(&ctx.server.stats.conn_failed, 1)
-			} else {
-				sync.atomic_add(&ctx.server.stats.conn_refused, 1)
+			// `.Stopped` is a connection accepted as shutdown began: not this
+			// server refusing a client it could serve, so neither counted nor
+			// logged, since either would name a setting with nothing to do with it.
+			if spawned != .Stopped {
+				if spawned == .Thread_Failed {
+					sync.atomic_add(&ctx.server.stats.conn_failed, 1)
+				} else {
+					sync.atomic_add(&ctx.server.stats.conn_refused, 1)
+				}
+				report_spawn_failure(ctx.proto, spawned, &l.conns)
 			}
-			report_spawn_failure(ctx.proto, spawned, &l.conns)
 			net.close(client_socket)
 			free(job)
 		}

@@ -266,3 +266,45 @@ test_the_listener_loops_spend_nobodys_share :: proc(t: ^testing.T) {
 	client := client_prefix(net.IP4_Address{192, 0, 2, 1})
 	testing.expect_value(t, conn_spawn(&cm, &held, holds_until_released, client), Spawn_Result.Started)
 }
+
+/*
+Shutdown is final: a spawn after it starts nothing.
+
+An accept loop reads `stop` before it blocks, not after the accept returns, so a
+connection accepted as shutdown begins reaches `conn_spawn` once
+`conn_manager_shutdown` has taken the table to join. Started then, its thread
+went into a fresh table nothing drains again and outlived the `Stream_Context`
+`destroy_listeners` frees under it. The permanent tally the shutdown took the
+loops out of has to go with them, or `active_connections` reads negative.
+*/
+@(test)
+test_spawn_after_shutdown_is_refused :: proc(t: ^testing.T) {
+	cm: Conn_Manager
+	conn_manager_init(&cm, 4, 0)
+
+	// A listener loop, registered the way start_udp/start_stream_listener do.
+	loop := Held{}
+	testing.expect_value(t, conn_spawn(&cm, &loop, holds_until_released, counted = false), Spawn_Result.Started)
+
+	sync.atomic_store(&loop.go, true)
+	conn_manager_shutdown(&cm)
+	testing.expect_value(t, active_connections(&cm), 0)
+
+	// An accept that returned just before the shutdown now asks for a thread.
+	late := Held{}
+	res := conn_spawn(&cm, &late, holds_until_released)
+	testing.expectf(
+		t,
+		res == .Stopped,
+		"conn_spawn returned %v after conn_manager_shutdown; nothing will ever join that thread",
+		res,
+	)
+	testing.expect(t, len(cm.threads) == 0, "the late thread was tracked in a table nobody will drain")
+	// So are the server's own loops: nothing joins them either.
+	testing.expect_value(t, conn_spawn(&cm, &late, holds_until_released, counted = false), Spawn_Result.Stopped)
+	testing.expect_value(t, active_connections(&cm), 0)
+	// Released before the second shutdown rather than deferred past it, so a
+	// late thread that did start fails the case instead of hanging the join.
+	sync.atomic_store(&late.go, true)
+	conn_manager_shutdown(&cm)
+}
