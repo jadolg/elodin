@@ -2708,8 +2708,9 @@ signer_holds :: proc(owner: string, type: dns.Type, signer: string) -> bool {
 Try one signature against the keys of its zone.
 
 Rejects everything RFC 4035 section 5.3.1 asks to be rejected before any
-cryptography happens: the wrong signer, a label count that does not fit the
-owner name, an expired or not-yet-valid period.
+cryptography happens: a Type Covered that is not the set's type, the wrong
+signer (see `signer_holds`), a label count that does not fit the owner name, an
+expired or not-yet-valid period.
 */
 @(private)
 check_signature :: proc(

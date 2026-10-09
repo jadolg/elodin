@@ -201,9 +201,10 @@ looks like, and that absence denies nothing. SOA is what marks the apex.
 Reading such a record as a DS denial costs an attacker nothing to arrange: the
 child's apex record is public, is signed by the child's own keys, and may be
 fetched and replayed verbatim. A validator that accepts it answers "this signed
-zone is an unsigned delegation" with the AD bit set - and to have got that far it
-must have fetched and checked the very DS it is now denying. RFC 6840 section
-4.4.
+zone is an unsigned delegation" with the AD bit set. RFC 6840 section 4.4.
+`validate_denial` reads a DS denial against the parent's keys, so a record the
+child signed is refused before its bit map is read; this is the check behind
+that one.
 
 The root is the one name with no parent to hold a DS, so its own apex record is
 the only one that could ever answer the question. Refusing that would fail a

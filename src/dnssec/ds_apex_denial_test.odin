@@ -17,11 +17,10 @@ Read the other way round it is the cheapest DNSSEC downgrade there is. A
 malicious upstream, or anyone on the path to a plain UDP one, answers a
 forwarded `DS dstest.` with NOERROR/NODATA carrying `dstest.`'s own apex NSEC and
 its RRSIG, both copied verbatim from the public zone. Nothing is forged and
-nothing has to be broken: the records verify against the child's keys, which this
-server reached by fetching and checking the very DS it is then told does not
-exist. Answering AD=1 to that tells a stub, or a downstream forwarder, that a
-signed zone is an unsigned delegation, and every name under it stops being
-validated.
+nothing has to be broken: the records verify against the child's keys, which the
+very DS it is told does not exist leads to. Answering AD=1 to that tells a stub,
+or a downstream forwarder, that a signed zone is an unsigned delegation, and
+every name under it stops being validated.
 
 `www` under each zone is the honest shape of the same reply - an ordinary name
 that is not a zone cut, whose denial really does settle that no DS is there - and
@@ -477,20 +476,28 @@ test_an_unsigned_ds_set_under_a_signed_parent_is_bogus :: proc(t: ^testing.T) {
 }
 
 /*
-`check_signature` reads the DS signer rule off the records, not off the Type
-Covered the sender wrote (RFC 4035 section 5.3.1 has the two agree). This is a
-real signature by `dstest.` over its own DS RDATA, made as an A set at its apex:
-read off the signature, the set is no DS and the child may sign it.
+`check_signature` holds both of its type rules itself, with no caller's filter
+in front of it. Both signatures here are real ones by `dstest.` over its own DS
+RDATA, so each refusal is the rule under test rather than the arithmetic.
+
+The DS signer rule: signed as a DS, the set is the child vouching for its own
+delegation. The Type Covered rule (RFC 4035 section 5.3.1): signed as an A set,
+the signature holds over that RDATA read as A, so offered as a TXT set - which
+the child may sign - only the type check refuses it. And offered as the DS set
+it is, the signer rule reads the type off the records, not off the signature.
 */
 @(test)
-test_check_signature_reads_the_type_off_the_records :: proc(t: ^testing.T) {
-	msg, err := dns.decode_message(da_reply("da_self_ds_covers_a"), context.temp_allocator)
-	testing.expect(t, err == .None, "the fixture should decode")
+test_check_signature_holds_its_type_rules_itself :: proc(t: ^testing.T) {
+	self_msg, serr := dns.decode_message(da_reply("da_self_ds"), context.temp_allocator)
+	testing.expect(t, serr == .None, "the fixture should decode")
+	covers_msg, cerr := dns.decode_message(da_reply("da_self_ds_covers_a"), context.temp_allocator)
+	testing.expect(t, cerr == .None, "the fixture should decode")
 	keys_msg, kerr := dns.decode_message(da_reply("da_dnskey"), context.temp_allocator)
 	testing.expect(t, kerr == .None, "the key fixture should decode")
 
-	records := records_of(msg.answer, "dstest.", .DS, .IN, context.temp_allocator)
-	sigs := sigs_covering(msg.answer, "dstest.", .A, .IN, context.temp_allocator)
+	records := records_of(self_msg.answer, "dstest.", .DS, .IN, context.temp_allocator)
+	ds_sigs := sigs_covering(self_msg.answer, "dstest.", .DS, .IN, context.temp_allocator)
+	a_sigs := sigs_covering(covers_msg.answer, "dstest.", .A, .IN, context.temp_allocator)
 	keys := make([dynamic]Dnskey, 0, 1, context.temp_allocator)
 	for rec in records_of(keys_msg.answer, "dstest.", .DNSKEY, .IN, context.temp_allocator) {
 		rdata, _ := raw_rdata(rec)
@@ -500,12 +507,29 @@ test_check_signature_reads_the_type_off_the_records :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expect_value(t, len(records), 1)
-	testing.expect_value(t, len(sigs), 1)
+	testing.expect_value(t, len(ds_sigs), 1)
+	testing.expect_value(t, len(a_sigs), 1)
 	testing.expect_value(t, len(keys), 1)
-	if len(records) != 1 || len(sigs) != 1 || len(keys) != 1 {
+	if len(records) != 1 || len(ds_sigs) != 1 || len(a_sigs) != 1 || len(keys) != 1 {
 		return
 	}
-	result, _ := check_signature(sigs[0], "dstest.", .IN, records, keys[:], u32(FIXTURE_TIME), context.temp_allocator)
-	testing.expect_value(t, result, Verify_Result.Bad)
+	as_type :: proc(records: []dns.Record, type: dns.Type) -> []dns.Record {
+		out := make([]dns.Record, len(records), context.temp_allocator)
+		copy(out, records)
+		for &r in out {
+			r.type = type
+		}
+		return out
+	}
+	check :: proc(sig: Rrsig, records: []dns.Record, keys: []Dnskey) -> Verify_Result {
+		result, _ := check_signature(sig, "dstest.", .IN, records, keys, u32(FIXTURE_TIME), context.temp_allocator)
+		return result
+	}
+
+	testing.expect_value(t, check(ds_sigs[0], records, keys[:]), Verify_Result.Bad)
+	// The control: the A signature does verify over the RDATA read as A.
+	testing.expect_value(t, check(a_sigs[0], as_type(records, .A), keys[:]), Verify_Result.Ok)
+	testing.expect_value(t, check(a_sigs[0], as_type(records, .TXT), keys[:]), Verify_Result.Bad)
+	testing.expect_value(t, check(a_sigs[0], records, keys[:]), Verify_Result.Bad)
 	free_all(context.temp_allocator)
 }

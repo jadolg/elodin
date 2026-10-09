@@ -769,8 +769,8 @@ def ds_denial_from_child_apex():
     emit("da_self_ds", "dstest.", "DS", message("dstest.", DS, self_ds + [sign(self_ds, child)]))
     # The same RDATA signed by `dstest.` as an A set at its own apex. Nothing
     # that filters by type lets it near `check_signature`, so the test calls it
-    # directly: the arithmetic holds over the DS set, and only the type check
-    # refuses it.
+    # directly: the arithmetic holds over that RDATA read as A, and offered under
+    # any other type only the type check refuses it.
     emit("da_self_ds_covers_a", "dstest.", "DS",
          message("dstest.", DS, self_ds + [sign(self_ds, child, covered=A)]))
 
