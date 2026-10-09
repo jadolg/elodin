@@ -406,9 +406,9 @@ A record whose names do not expand is not charged as though they had.
 
 The expansion buffer used to be reserved - and charged - at what a record of the
 type might come to, `layout.names * MAX_NAME_WIRE`, whether or not a single name
-grew. A PX carries two, so every one of them cost 510 bytes of budget, and
-`holds_pointer_byte` is a byte scan: a preference field of 0xc000 is a legal
-number and enough to send the record down this path.
+grew. A PX carries two, so every one of them cost 510 bytes of budget, and a
+preference field of 0xc000 is a legal number that looks like a pointer to any
+check that scans bytes rather than walking to where the names are.
 
 A thousand of those fit in 20 KB, and the reply is well formed - both names are
 the root, nothing expands, and every byte comes out as it went in. It was

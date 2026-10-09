@@ -925,6 +925,64 @@ test_raw_rdata_pointer_survives_reencode :: proc(t: ^testing.T) {
 }
 
 /*
+The types whose specifications forbid compressing a name are expanded too when a
+sender compresses one anyway.
+
+RFC 4034 sections 3.1.7 and 4.1.1 say the RRSIG signer and the NSEC next owner
+MUST NOT be compressed, and RFC 3597 section 4 says the same of every type
+defined after it - TALINK, LP and DSYNC among them. A sender that ignores that
+still hands this decoder a pointer, and a pointer copied into a message of our
+own names whatever byte now sits at its offset: for an RRSIG, a signer nobody
+signed with. `message_prefix` writes an owner name in full that the re-encode
+compresses, so every offset after it moves.
+*/
+@(test)
+test_raw_rdata_pointer_in_a_never_compressed_name_survives_reencode :: proc(t: ^testing.T) {
+	Case :: struct {
+		type: Type,
+		head: []u8, // the RDATA before the name
+		tail: []u8, // the RDATA after it
+	}
+	cases := []Case {
+		// type covered, algorithm, labels, TTL, expiration, inception, key tag;
+		// a signature after the signer.
+		{.RRSIG, {0, 1, 8, 2, 0, 0, 0, 60, 0x70, 0, 0, 0, 0x60, 0, 0, 0, 0x12, 0x34}, {0xde, 0xad, 0xbe, 0xef}},
+		// The next owner, then a type bitmap of {A}.
+		{.NSEC, {}, {0, 1, 0x40}},
+		// Previous and next: the pointer is the second name.
+		{.TALINK, {3, 'p', 'r', 'v', 0}, {}},
+		{.LP, {0, 10}, {}},
+		// RRtype, scheme, port.
+		{.DSYNC, {0, 59, 1, 0x14, 0xeb}, {}},
+	}
+	for c in cases {
+		m, ns_target := message_prefix(3)
+		rdata := make([dynamic]u8, context.temp_allocator)
+		append(&rdata, ..c.head)
+		append(&rdata, 0xc0 | u8(ns_target >> 8), u8(ns_target))
+		append(&rdata, ..c.tail)
+		append_answer(&m, c.type, rdata[:])
+
+		msg, derr := decode_message(m[:], context.temp_allocator)
+		testing.expect_value(t, derr, Decode_Error.None)
+		out, _, eerr := encode_message(msg, context.temp_allocator)
+		testing.expect_value(t, eerr, Encode_Error.None)
+
+		raw, ok := raw_rdata_of(out, c.type)
+		testing.expectf(t, ok, "%v: the record did not survive the re-encode", c.type)
+		name, next, nerr := decode_name(raw, len(c.head), context.temp_allocator)
+		testing.expectf(
+			t,
+			nerr == .None && name == "ns1.example.com." && mem.compare(raw[next:], c.tail) == 0,
+			"%v: after the re-encode the RDATA is %02x",
+			c.type,
+			raw,
+		)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
 A type this decoder does model is expanded too when its RDATA falls back to raw.
 
 `decode_rdata` rejects an MX whose RDLENGTH counts a byte more than its two

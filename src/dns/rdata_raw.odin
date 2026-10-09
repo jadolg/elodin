@@ -45,7 +45,17 @@ Only types whose RDATA may carry a domain name need an entry, and only those
 whose layout is fixed enough to walk without knowing more than the type. A6 is
 left out: where its name starts depends on a prefix length in its own RDATA, and
 it has been formally obsolete since RFC 6563. An A6 record therefore still
-forwards with its pointer intact.
+forwards with its pointer intact. HIP, IPSECKEY and AMTRELAY are left out for
+the same reason - their names sit behind lengths or a gateway type read from
+their own RDATA - and TKEY and TSIG because they belong to one transaction and
+are never forwarded as an answer.
+
+Some of the types listed may not legally be compressed at all: RFC 4034
+sections 3.1.7 and 4.1.1 forbid it for the RRSIG signer and the NSEC next owner,
+and RFC 3597 section 4 for every type defined after it, which covers TALINK, LP
+and DSYNC. A sender that does it anyway still hands this decoder a pointer, and
+expanding it is what Unbound does too; carrying it through would put a
+different name in the answer than the sender wrote.
 
 The types this decoder models natively - NS, CNAME, PTR, DNAME, MB, MG, MR,
 NSAP-PTR, SOA, MX, SRV - are on the list too, because a record of one of them
@@ -61,8 +71,11 @@ private helper in this package and this package must not depend on that one, so
 the two are kept in step by hand. The lists are not quite the same list, though,
 and a type added here only belongs there if RFC 4034 section 6.2 names it: this
 one is "a name may be compressed in here", that one is "a name in here is
-lowercased for a signature". NSAP-PTR is the difference today - a name this
-decoder walks, and one no signer ever downcased.
+lowercased for a signature". NSAP-PTR, NSEC, TALINK, LP and DSYNC are names
+this decoder walks and no signer downcases - RFC 6840 section 5.1 took NSEC
+back off the RFC 4034 list. RRSIG stays on that list, but no RRSIG set is ever
+itself signed, and the validator canonicalizes the signer of the one it checks
+on its own.
 */
 @(private)
 raw_rdata_layout :: proc "contextless" (t: Type) -> (layout: Raw_Layout, ok: bool) {
@@ -79,8 +92,16 @@ raw_rdata_layout :: proc "contextless" (t: Type) -> (layout: Raw_Layout, ok: boo
 		return {4, 3, 1}, true
 	case .SRV:
 		return {6, 0, 1}, true
-	case .SIG:
+	case .SIG, .RRSIG:
 		return {18, 0, 1}, true
+	case .NSEC:
+		return {0, 0, 1}, true
+	case .TALINK:
+		return {0, 0, 2}, true
+	case .LP:
+		return {2, 0, 1}, true
+	case .DSYNC:
+		return {5, 0, 1}, true
 	}
 	return {}, false
 }
@@ -101,13 +122,12 @@ budget stays spent and the next owner name refuses the decode outright.
 @(private)
 decode_raw_rdata :: proc(r: ^Reader, type: Type, start, end: int, allocator: mem.Allocator) -> Rdata_Raw {
 	msg := r.msg
-	layout, known := raw_rdata_layout(type)
-	// Walking costs an allocation, and the overwhelming majority of raw RDATA
-	// has no pointer anywhere in it. Two set high bits are what a pointer starts
-	// with, so their absence settles it; their presence only means the walk is
-	// worth attempting, since the byte may equally be part of a signature or a
-	// flags field.
-	if known && holds_pointer_byte(msg[start:end]) {
+	// Walking costs an allocation and a charge against the budget, and the
+	// overwhelming majority of raw RDATA has no pointer where a name belongs.
+	// Checking that slot rather than every byte matters for RRSIG, whose
+	// signature nearly always holds a byte that looks like one.
+	if raw_rdata_holds_pointer(type, msg[start:end]) {
+		layout, _ := raw_rdata_layout(type)
 		if expanded, ok := expand_rdata_names(r, layout, start, end, allocator); ok {
 			return Rdata_Raw{data = expanded}
 		}
@@ -124,16 +144,6 @@ decode_raw_rdata :: proc(r: ^Reader, type: Type, start, end: int, allocator: mem
 	verbatim := make([]u8, end - start, allocator)
 	copy(verbatim, msg[start:end])
 	return Rdata_Raw{data = verbatim}
-}
-
-@(private)
-holds_pointer_byte :: proc "contextless" (rdata: []u8) -> bool {
-	for b in rdata {
-		if b & 0xc0 == 0xc0 {
-			return true
-		}
-	}
-	return false
 }
 
 // No layout has more than two names in it, and the walk holds them on the stack.

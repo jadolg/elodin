@@ -5,7 +5,11 @@
 Queries of any type are answered: A, AAAA, CNAME, MX, TXT, SRV, SOA, NS, PTR,
 CAA, SVCB/HTTPS, DS, DNSKEY, RRSIG and everything else. Types the codec does not
 model natively are carried through as opaque RDATA per RFC 3597, and forwarded
-answers are passed back byte for byte, so DNSSEC records survive untouched. With
+answers are passed back byte for byte, so DNSSEC records survive untouched. The
+one change made to opaque RDATA is to a domain name an upstream compressed inside
+it - legally, as in an AFSDB or RP, or against RFC 4034, as in an RRSIG signer or
+an NSEC next name: it is expanded (RFC 3597 section 4), so a rebuilt answer still
+names the host the upstream named. With
 validation on, an answer for a client that did not ask for DNSSEC records is
 rebuilt without them; every other answer goes back as the upstream sent it, bar the OPT
 record this server answers with and, from the cache, TTLs counted down.

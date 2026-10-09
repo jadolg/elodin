@@ -405,9 +405,21 @@ pw_layout :: proc(t: u16) -> (layout: Pw_Layout, ok: bool) {
 	// SRV
 	case 33:
 		return {6, 0, 1}, true
-	// SIG
-	case 24:
+	// SIG, RRSIG
+	case 24, 46:
 		return {18, 0, 1}, true
+	// NSEC
+	case 47:
+		return {0, 0, 1}, true
+	// TALINK
+	case 58:
+		return {0, 0, 2}, true
+	// LP
+	case 107:
+		return {2, 0, 1}, true
+	// DSYNC
+	case 66:
+		return {5, 0, 1}, true
 	}
 	return {}, false
 }
