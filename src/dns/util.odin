@@ -275,9 +275,8 @@ scan_ttl_offsets :: proc(msg: []u8, allocator := context.allocator) -> (offsets:
 	least 11 - a root name plus the fixed fields - which is the same arithmetic
 	`decode_message` makes, for the same reason.
 
-	Callers are `cache.put`, which `resolve_query` reaches only with a response
-	it has decoded, and `server.doh_max_age`, which scans the answer about to
-	be sent. A 17-byte reply claiming three sections of 65535 records would
+	The caller is `cache.put`, which `resolve_query` reaches only with a
+	response it has decoded. A 17-byte reply claiming three sections of 65535 records would
 	otherwise allocate 1.5 MB for a walk that fails on the first name, and a
 	guard that costs one comparison is not worth removing for a caller that
 	might hand it bytes nothing has checked.

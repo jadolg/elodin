@@ -105,6 +105,9 @@ the whole will not parse, and a budget the first reading can empty takes the
 second one with it, which refuses an answer this server had no opinion about.
 A full-length reply built to spend everything a reading may is about 1.7 MB, so
 the three readings of the answer path come to 5 MB and the chain still has room.
+A DoH response is read once more, for its `Cache-Control` (`server.doh_max_age`),
+and one this budget can no longer afford goes out with `max-age=0` rather than
+refused.
 
 Against the pool rather than against one query is where the figure is worth
 checking: `config` derives 16 to 128 workers and charges each

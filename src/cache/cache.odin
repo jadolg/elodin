@@ -551,9 +551,9 @@ own chain check (`server.MAX_CHAIN_NAMES`) and the validator's
 its end and kept by the rule for answers. With blocking and validation off a
 longer chain is served as the upstream sent it, and past this bound it reads as
 a denial: kept only with a SOA, which costs the entry and never the answer. A
-recursive upstream gives up on a chain long before this. One scan of the answer section per name, so the walk costs at most
-sixty-five passes over a section the decoder has already bounded, however the
-upstream wrote it.
+recursive upstream gives up on a chain long before this. One scan of the answer
+section per name, so the walk costs at most sixty-five passes over a section
+the decoder has already bounded, however the upstream wrote it.
 */
 @(private)
 CHAIN_NAMES_MAX :: 64
@@ -562,8 +562,10 @@ CHAIN_NAMES_MAX :: 64
 Does the answer section fail to reach the type asked for? That is NODATA after
 a CNAME (RFC 2308 section 2.2), and `put` keeps it as the denial it is.
 
-A walk, not a scan for the type: from the question name, along each CNAME it
-owns, until a record of the type asked for is found at the name reached. A
+A walk, not a scan for the type: from the question name, along the CNAME each
+name reached owns, until a record of the type asked for is found there. A name
+owning several CNAMEs is a broken answer (RFC 1034 section 3.6.2), and the walk
+follows the last of them; a wrong pick costs the entry and never the answer. A
 record of that type anywhere else in the section is not the answer - an upstream
 that appends `x.other.example. A` to a chain that stops short has not answered
 `www A` - and nor is a DNAME, whose CNAME is what the walk follows (RFC 6672
