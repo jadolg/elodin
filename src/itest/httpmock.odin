@@ -18,9 +18,11 @@ are about TLS.
 // request path would mean storing a key that borrows the connection's scratch
 // buffer, and the entry would turn to garbage the moment that was reused.
 Http_Route :: struct {
-	path: string,
-	body: string,
-	hits: int,
+	path:     string,
+	body:     string,
+	// Answered with a 302 to this, as written, when set.
+	location: string,
+	hits:     int,
 }
 
 Http_Mock :: struct {
@@ -45,6 +47,12 @@ http_mock_serve :: proc(m: ^Http_Mock, path: string, body: string) {
 	sync.mutex_lock(&m.mu)
 	defer sync.mutex_unlock(&m.mu)
 	append(&m.routes, Http_Route{path = strings.clone(path), body = strings.clone(body)})
+}
+
+http_mock_redirect :: proc(m: ^Http_Mock, path: string, location: string) {
+	sync.mutex_lock(&m.mu)
+	defer sync.mutex_unlock(&m.mu)
+	append(&m.routes, Http_Route{path = strings.clone(path), location = strings.clone(location)})
 }
 
 http_mock_hits :: proc(m: ^Http_Mock, path: string) -> int {
@@ -94,6 +102,7 @@ http_mock_stop :: proc(m: ^Http_Mock) {
 	for route in m.routes {
 		delete(route.path)
 		delete(route.body)
+		delete(route.location)
 	}
 	delete(m.routes)
 	free(m)
@@ -170,12 +179,14 @@ http_mock_conn :: proc(conn: ^Http_Mock_Conn) {
 	path := parts[1]
 
 	body := ""
+	location := ""
 	found := false
 	sync.mutex_lock(&m.mu)
 	for &route in m.routes {
 		if route.path == path {
 			route.hits += 1
 			body = route.body
+			location = route.location
 			found = true
 			break
 		}
@@ -185,6 +196,10 @@ http_mock_conn :: proc(conn: ^Http_Mock_Conn) {
 	b := strings.builder_make(context.temp_allocator)
 	if !found {
 		strings.write_string(&b, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+	} else if location != "" {
+		strings.write_string(&b, "HTTP/1.1 302 Found\r\nLocation: ")
+		strings.write_string(&b, location)
+		strings.write_string(&b, "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 	} else {
 		strings.write_string(&b, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ")
 		strings.write_int(&b, len(body))

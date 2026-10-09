@@ -244,11 +244,23 @@ bootstrap_query :: proc(
 	return nil, false
 }
 
-// Split an http(s) URL into the pieces the fetcher needs.
+/*
+Split an http(s) URL into the pieces the fetcher needs. `path` is the request
+target, query and all, in origin-form. The scheme is
+compared without regard to ASCII case (RFC 3986 3.1), and comes back lowercase.
+*/
 @(private)
 split_http_url :: proc(url: string) -> (scheme, host, path: string, port: int, host_only: string, ok: bool) {
-	s, h, p, _, _ := net.split_url(url, context.temp_allocator)
-	if s != "http" && s != "https" {
+	raw_scheme, h, p, url_ok := netx.split_url(url)
+	s: string
+	switch {
+	case !url_ok:
+		return "", "", "", 0, "", false
+	case dns.name_equal_fold(raw_scheme, "http"):
+		s = "http"
+	case dns.name_equal_fold(raw_scheme, "https"):
+		s = "https"
+	case:
 		return "", "", "", 0, "", false
 	}
 	// Held to a host alone as the list url was at load: a redirect to
@@ -261,5 +273,5 @@ split_http_url :: proc(url: string) -> (scheme, host, path: string, port: int, h
 	if resolved_port == 0 {
 		resolved_port = 443 if s == "https" else 80
 	}
-	return s, h, (p if p != "" else "/"), resolved_port, name, true
+	return s, h, netx.origin_form(p), resolved_port, name, true
 }
