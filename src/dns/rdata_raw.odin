@@ -75,11 +75,11 @@ private helper in this package and this package must not depend on that one, so
 the two are kept in step by hand. The lists are not quite the same list, though,
 and a type added here only belongs there if RFC 4034 section 6.2 names it: this
 one is "a name may be compressed in here", that one is "a name in here is
-lowercased for a signature". NSAP-PTR, NSEC, TALINK, LP and DSYNC are names
-this decoder walks and no signer downcases - RFC 6840 section 5.1 took NSEC
-back off the RFC 4034 list. RRSIG stays on that list, but no RRSIG set is ever
-itself signed, and the validator canonicalizes the signer of the one it checks
-on its own.
+lowercased for a signature". NSAP-PTR, NSEC, TALINK, LP, DSYNC, IPSECKEY,
+AMTRELAY and HIP are names this decoder walks and no signer downcases - RFC 6840
+section 5.1 took NSEC back off the RFC 4034 list. RRSIG stays on that list, but
+no RRSIG set is ever itself signed, and the validator canonicalizes the signer
+of the one it checks on its own.
 */
 @(private)
 raw_rdata_layout :: proc "contextless" (t: Type, rdata: []u8) -> (layout: Raw_Layout, ok: bool) {

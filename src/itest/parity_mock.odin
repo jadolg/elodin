@@ -281,9 +281,9 @@ pm_large_answer :: proc(
 ) -> u16 {
 	count := u16(40)
 	for _ in 0 ..< count {
-		// RRSIG and NSEC owners are spelled out in full, which the re-encode
-		// `fit_response` makes when it cuts this answer down compresses, so the
-		// pointer `pm_rdata_aimed` puts in each aims at a moving target.
+		// RRSIG and NSEC owners are spelled out in full, and the re-encode
+		// `fit_response` makes when it cuts this answer down compresses them,
+		// so the pointer `pm_rdata_aimed` puts in each aims at a moving target.
 		if qtype == 46 || qtype == 47 {
 			owner_at := base + len(body^)
 			pm_rr(body, qname, qtype, 1, 3600, pm_rdata_aimed(r, qtype, owner_at, allocator), allocator)
