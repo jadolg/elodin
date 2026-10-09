@@ -1321,7 +1321,7 @@ load_upstream_spec :: proc(
 			return {}, false
 		}
 		scheme, host, url_path, split_ok := netx.split_url(spec.url)
-		if !split_ok || scheme != "https" {
+		if !split_ok || !dns.name_equal_fold(scheme, "https") {
 			errorf(l, "%s.url: expected an https:// url", path)
 			return {}, false
 		}
@@ -1340,7 +1340,7 @@ load_upstream_spec :: proc(
 		if spec.port == 0 {
 			spec.port = url_port if url_port != 0 else 443
 		}
-		spec.path = doh_path(url_path, l.allocator)
+		spec.path = netx.origin_form(url_path, l.allocator)
 	} else {
 		if spec.address == "" {
 			errorf(l, "%s: missing address", path)
@@ -1424,7 +1424,7 @@ parse_upstream_shorthand :: proc(
 	// instead (#438).
 	s := strings.trim(raw, " \t\r\n")
 
-	if strings.has_prefix(s, "https://") {
+	if has_scheme(s, "https://") {
 		spec.kind = .HTTPS
 		spec.url = s
 		if !url_is_valid(s) {
@@ -1437,7 +1437,7 @@ parse_upstream_shorthand :: proc(
 		spec.address = host_only
 		spec.hostname = host_only
 		spec.port = url_port if url_port != 0 else 443
-		spec.path = doh_path(url_path, l.allocator)
+		spec.path = netx.origin_form(url_path, l.allocator)
 		spec.name = s
 		return spec, true
 	}
@@ -1448,7 +1448,7 @@ parse_upstream_shorthand :: proc(
 		kind:   Upstream_Kind,
 	}
 	for sch in ([]Scheme{{"udp://", .UDP}, {"tcp://", .TCP}, {"tls://", .TLS}}) {
-		if strings.has_prefix(s, sch.prefix) {
+		if has_scheme(s, sch.prefix) {
 			spec.kind = sch.kind
 			s = s[len(sch.prefix):]
 			break
@@ -1601,7 +1601,7 @@ load_block_lists :: proc(l: ^Loader, n: ^yaml.Node, path: string) -> []Block_Lis
 				errorf(l, "%s[%d]: needs either a url or a file", path, i)
 				continue
 			}
-			if strings.has_prefix(s, "http://") || strings.has_prefix(s, "https://") {
+			if has_scheme(s, "http://") || has_scheme(s, "https://") {
 				if !url_is_valid(s) {
 					errorf(l, "%s[%d]: %s", path, i, LIST_URL_RULE)
 					continue
@@ -1640,7 +1640,8 @@ load_block_lists :: proc(l: ^Loader, n: ^yaml.Node, path: string) -> []Block_Lis
 			errorf(l, "%s: needs either a url or a file", item_path)
 			continue
 		}
-		if bl.url != "" && !url_is_valid(bl.url) {
+		// A file is `file:`, so a url is a list host's: http or https.
+		if bl.url != "" && (!url_is_valid(bl.url) || !(has_scheme(bl.url, "http://") || has_scheme(bl.url, "https://"))) {
 			errorf(l, "%s.url: %s", item_path, LIST_URL_RULE)
 			continue
 		}
@@ -3071,20 +3072,12 @@ url_is_valid :: proc(url: string) -> bool {
 	return url_ok && h2.target_is_valid(url) && h2.authority_is_valid(host) && split_ok && netx.is_host(host_only)
 }
 
-/*
-The target a DoH upstream is sent, query and all: `/dns-query?profile=x` is a
-query string some services name the account by, and a POST carries it as any
-request target does (RFC 8484 4.1, RFC 9112 3.2.1). No path at all is the
-conventional `/dns-query`.
-*/
+// RFC 3986 3.1: a scheme is compared without regard to case, `HTTPS://` as `https://`.
 @(private)
-doh_path :: proc(target: string, allocator: mem.Allocator) -> string {
-	if target == "" || target[0] == '?' {
-		return strings.concatenate({"/dns-query", target}, allocator)
-	}
-	return target
+has_scheme :: proc(s, prefix: string) -> bool {
+	return len(s) >= len(prefix) && dns.name_equal_fold(s[:len(prefix)], prefix)
 }
 
 // A list url goes into a request line and `Host` the same way.
 @(private)
-LIST_URL_RULE :: "a list url must be visible ASCII, its host present, with no userinfo and any port 0 to 65535 in digits"
+LIST_URL_RULE :: "a list url must be an http:// or https:// url of visible ASCII, its host present, with no userinfo and any port 0 to 65535 in digits"

@@ -35,7 +35,7 @@ an optional port (`9.9.9.9`, `[2620:fe::fe]:53`); a name there is a config error
 
 An `https` upstream is sent its url from the path on, query included
 (`https://dns.example/dns-query?profile=ab12`), as the target of each POST. A
-url with no path is sent to `/dns-query`.
+url with no path is sent to `/`.
 
 ## Time budget
 

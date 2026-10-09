@@ -246,7 +246,7 @@ bootstrap_query :: proc(
 
 /*
 Split an http(s) URL into the pieces the fetcher needs. `path` is the request
-target, query and all; an empty one is `/` (RFC 9112 3.2.1). The scheme is
+target, query and all, in origin-form. The scheme is
 compared without regard to ASCII case (RFC 3986 3.1), and comes back lowercase.
 */
 @(private)
@@ -273,8 +273,5 @@ split_http_url :: proc(url: string) -> (scheme, host, path: string, port: int, h
 	if resolved_port == 0 {
 		resolved_port = 443 if s == "https" else 80
 	}
-	if p == "" || p[0] == '?' {
-		p = strings.concatenate({"/", p}, context.temp_allocator)
-	}
-	return s, h, p, resolved_port, name, true
+	return s, h, netx.origin_form(p), resolved_port, name, true
 }

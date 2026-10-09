@@ -69,6 +69,10 @@ test_a_reference_resolves_as_rfc_3986_reads_it :: proc(t: ^testing.T) {
 	// behind something no scheme holds, is a relative path.
 	testing.expect_value(t, resolve_reference(base, "g/h:i"), "http://a/b/c/g/h:i")
 	testing.expect_value(t, resolve_reference(base, "1g:h"), "http://a/b/c/1g:h")
+	// 5.2.2: a reference with its own authority has its dot segments removed
+	// too, and its query and fragment kept as written.
+	testing.expect_value(t, resolve_reference(base, "//g/x/../y/./z?q/../r#s"), "http://g/y/z?q/../r#s")
+	testing.expect_value(t, resolve_reference(base, "https://g/x/../y/."), "https://g/y/")
 	free_all(context.temp_allocator)
 }
 
@@ -112,7 +116,8 @@ size.
 @(test)
 test_dot_segments_cost_their_own_bytes :: proc(t: ^testing.T) {
 	for unit in ([]string{"./", "../", "a/../", "/"}) {
-		ref := strings.repeat(unit, 16 * 1024, context.temp_allocator)
+		// After `g/`, so that a run of `/` is a path and not a network path.
+		ref := strings.concatenate({"g/", strings.repeat(unit, 16 * 1024, context.temp_allocator)}, context.temp_allocator)
 		got := resolve_reference("http://a/b/c", ref)
 		testing.expectf(t, len(got) <= len("http://a/b/c") + len(ref) + 1, "%q x16k resolved to %d bytes", unit, len(got))
 	}

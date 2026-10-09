@@ -32,9 +32,6 @@ fuzz_one :: proc "c" (data: [^]u8, size: uint) -> i32 {
 	colon := strings.index_byte(ref, ':')
 	has_scheme := colon >= 0 && netx.is_scheme(ref[:colon])
 	if ok && !has_scheme && !strings.has_prefix(ref, "//") {
-		if !strings.has_prefix(got, strings.concatenate({scheme, "://", authority})) {
-			panic("a relative reference moved the authority")
-		}
 		g_scheme, g_authority, _, g_ok := netx.split_url(got)
 		if !g_ok || g_scheme != scheme || g_authority != authority {
 			panic("a relative reference split to another authority")

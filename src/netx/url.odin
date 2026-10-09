@@ -45,30 +45,56 @@ split_url :: proc(url: string) -> (scheme, authority, target: string, ok: bool) 
 }
 
 /*
+RFC 9112 3.2.1: a request target in origin-form is rooted, and a url with no path
+names `/` (RFC 3986 6.2.3), so `?q` is `/?q`.
+*/
+origin_form :: proc(target: string, allocator := context.temp_allocator) -> string {
+	if target == "" || target[0] == '?' {
+		return strings.concatenate({"/", target}, allocator)
+	}
+	return target
+}
+
+/*
 RFC 3986 5.2: the url a reference names, read against `base`, the absolute url
 it was found at. RFC 9110 10.2.2 lets a redirect's `Location` be relative -
 `/v2/hosts.txt`, `hosts.txt`, `?page=2` or `//cdn.example/hosts.txt` - and
-servers send all four. A reference with a scheme is absolute and comes back as
-it is, as does anything when `base` is not an absolute url. What comes back is
-held to no rule here: the caller checks it as it checks any url.
+servers send all four. A reference with a scheme and no authority (`g:h`) comes
+back as it is, as does any reference when `base` is not an absolute url. What
+comes back is held to no rule here: the caller checks it as it checks any url.
 
 The result is at most `len(base) + len(ref) + 1` bytes, in the temp allocator.
 */
 resolve_reference :: proc(base, ref: string) -> string {
+	scheme, authority, rest := "", "", ref
 	// 5.2.2: a scheme is a run of scheme characters ending in the first `:`.
 	if colon := strings.index_byte(ref, ':'); colon >= 0 && is_scheme(ref[:colon]) {
-		return ref
+		scheme, rest = ref[:colon], ref[colon + 1:]
+		if !strings.has_prefix(rest, "//") {
+			return ref
+		}
 	}
-	scheme, authority, base_target, ok := split_url(base)
-	if !ok {
-		return ref
+	base_target := ""
+	if scheme == "" {
+		ok: bool
+		scheme, authority, base_target, ok = split_url(base)
+		if !ok {
+			return ref
+		}
 	}
-	if strings.has_prefix(ref, "//") {
-		return strings.concatenate({scheme, ":", ref}, context.temp_allocator)
+	// An authority of its own, whose path loses its dot segments as any other.
+	own_authority := strings.has_prefix(rest, "//")
+	if own_authority {
+		rest = rest[2:]
+		end := strings.index_any(rest, "/?#")
+		if end < 0 {
+			end = len(rest)
+		}
+		authority, rest = rest[:end], rest[end:]
 	}
 
 	// The fragment, then the query: either may hold a `/`, a `?` or a dot segment.
-	path, fragment := ref, ""
+	path, fragment := rest, ""
 	if i := strings.index_byte(path, '#'); i >= 0 {
 		path, fragment = path[:i], path[i:]
 	}
@@ -83,6 +109,10 @@ resolve_reference :: proc(base, ref: string) -> string {
 	}
 
 	switch {
+	case own_authority:
+		if path != "" {
+			path = remove_dot_segments(path)
+		}
 	case path == "":
 		path = base_path
 		if !has_query {
