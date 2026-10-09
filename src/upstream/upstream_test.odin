@@ -1777,6 +1777,61 @@ test_address_is_public_classifies_reserved_ranges :: proc(t: ^testing.T) {
 		// Reserved ranges spelled as IPv4-mapped IPv6 are still reserved.
 		{"::ffff:127.0.0.1", false},
 		{"::ffff:8.8.8.8", true},
+		// RFC 6052 section 3.1: the well-known NAT64 prefix carries a global
+		// IPv4 address or none, and a NAT64 network's stack connects to the one
+		// it carries - so it is judged as that address.
+		{"64:ff9b::808:808", true},
+		{"64:ff9b::7f00:1", false},
+		{"64:ff9b::a9fe:a9fe", false},
+		{"64:ff9b::c0a8:101", false},
+		{"64:ff9b::", false},
+		// RFC 8215's local-use prefix, its /96 judged the same way, so a list
+		// host a DNS64 synthesised under it is public when its IPv4 one is.
+		{"64:ff9b:1::808:808", true},
+		{"64:ff9b:1::7f00:1", false},
+		{"64:ff9b:1::a9fe:a9fe", false},
+		// The IPv4-translated form (RFC 2765) and 6to4 (RFC 3056).
+		{"::ffff:0:a9fe:a9fe", false},
+		{"::ffff:0:808:808", true},
+		{"2002:a9fe:a9fe::1", false},
+		{"2002:c0a8:101::1", false},
+		{"2002:808:808::1", true},
+		// The IPv4-compatible form, deprecated but parsed (RFC 4291 2.5.5.1).
+		{"::127.0.0.1", false},
+		{"::8.8.8.8", true},
+		{"::1:2", false},
+		// The rest of the special-purpose registries that is not globally
+		// reachable (RFC 6890), each just inside and just outside.
+		{"100.63.255.255", true},
+		{"100.128.0.0", true},
+		{"192.0.0.9", false},
+		{"192.0.1.0", true},
+		{"192.0.2.1", false},
+		{"198.18.0.1", false},
+		{"198.19.255.255", false},
+		{"198.20.0.0", true},
+		{"198.51.100.1", false},
+		{"203.0.113.1", false},
+		{"255.255.255.255", false},
+		{"223.255.255.255", true},
+		// Another layout under the local-use prefix cannot be read, so as a
+		// target it is not public.
+		{"64:ff9b:1:ffff::1", false},
+		{"64:ff9b:1:abcd::a9fe:a9fe", false},
+		{"64:ff9b:2::1", true},
+		{"100::1", false},
+		{"100:0:0:1::1", false},
+		{"100:0:0:2::1", true},
+		{"2001:2::1", false},
+		{"2001:2:1::1", true},
+		{"2001:db8::1", false},
+		{"2001:db9::1", true},
+		{"3fff:fff::1", false},
+		{"3fff:1000::1", true},
+		{"5f00::1", false},
+		{"5f01::1", true},
+		{"fec0::1", false},
+		{"feff:ffff::1", false},
 	}
 	for c in CASES {
 		addr := net.parse_address(c.text)
@@ -1784,10 +1839,36 @@ test_address_is_public_classifies_reserved_ranges :: proc(t: ^testing.T) {
 			testing.expectf(t, false, "%q did not parse as an address", c.text)
 			continue
 		}
-		testing.expectf(t, address_is_public(addr) == c.public, "%q: expected public=%v", c.text, c.public)
+		testing.expectf(t, config.address_is_public(addr) == c.public, "%q: expected public=%v", c.text, c.public)
 	}
 	// Nothing at all is not somewhere a redirect may name.
-	testing.expect(t, !address_is_public(nil), "a nil address was treated as public")
+	testing.expect(t, !config.address_is_public(nil), "a nil address was treated as public")
+}
+
+/*
+The origin side of the same table. An address under the local-use NAT64 prefix
+that cannot be read is a public origin, so its redirects stay held to the public
+rule; one that can is judged by the IPv4 address it carries, like any other.
+*/
+@(test)
+test_origin_is_public_keeps_the_guard_on_what_it_cannot_read :: proc(t: ^testing.T) {
+	Case :: struct {
+		text:   string,
+		public: bool,
+	}
+	cases := []Case {
+		{"8.8.8.8", true},
+		{"10.0.0.1", false},
+		{"64:ff9b::c0a8:101", false},
+		{"64:ff9b:1::808:808", true},
+		{"64:ff9b:1::c0a8:101", false},
+		{"64:ff9b:1:abcd::a9fe:a9fe", true},
+		{"64:ff9b:1:ffff::1", true},
+	}
+	for c in cases {
+		testing.expectf(t, config.origin_is_public(net.parse_address(c.text)) == c.public, "%q: expected public=%v", c.text, c.public)
+	}
+	testing.expect(t, !config.origin_is_public(nil), "no address at all was a public origin")
 }
 
 @(test)
@@ -1807,6 +1888,9 @@ test_redirect_allowed_refuses_downgrade_and_retarget :: proc(t: ^testing.T) {
 		{"http", true, "http", "8.8.8.8", true, "http staying http"},
 		{"https", true, "https", "127.0.0.1", false, "a public origin retargeted at loopback"},
 		{"https", true, "https", "169.254.169.254", false, "a public origin retargeted at link-local"},
+		{"https", true, "https", "64:ff9b::a9fe:a9fe", false, "a public origin retargeted at link-local through NAT64"},
+		{"https", true, "https", "64:ff9b::808:808", true, "a public origin retargeted at a public host through NAT64"},
+		{"https", true, "https", "64:ff9b:1:abcd::a9fe:a9fe", false, "a public origin retargeted through a local-use NAT64 /96 this cannot read"},
 		// An operator who configured a local mirror meant it.
 		{"http", false, "http", "127.0.0.1", true, "a local mirror redirecting locally"},
 		{"https", false, "https", "10.0.0.1", true, "a private origin staying private"},
@@ -3690,14 +3774,14 @@ test_a_late_resolved_endpoint_is_published_once :: proc(t: ^testing.T) {
 	ep, eerr := endpoint_of(u)
 	testing.expect_value(t, eerr, Error.None)
 	testing.expect_value(t, ep.port, bound.port)
-	testing.expect(t, addresses_equal(ep.address, net.IP4_Loopback), "the endpoint is not the address the name resolved to")
+	testing.expect(t, ep.address == net.Address(net.IP4_Loopback), "the endpoint is not the address the name resolved to")
 
 	// A lookup that finishes after the endpoint is out leaves it as it is: a
 	// reader holding no lock may be copying it.
 	u.spec.address = "127.0.0.2"
 	testing.expect(t, resolve_endpoint(u), "a lookup after the endpoint was published")
 	ep, _ = endpoint_of(u)
-	testing.expect(t, addresses_equal(ep.address, net.IP4_Loopback), "the published endpoint was written over")
+	testing.expect(t, ep.address == net.Address(net.IP4_Loopback), "the published endpoint was written over")
 }
 
 /*

@@ -114,6 +114,11 @@ stream_close :: proc(s: ^Stream) {
 	net.close(s.socket)
 }
 
+/*
+Not `core:bufio`: every read here is held to the exchange's deadline, through
+`stream_set_read_timeout`, and a line ends at CRLF with a bare CR or LF in it
+refused (RFC 9112 2.2), where `bufio.reader_read_string` splits on a bare LF.
+*/
 @(private)
 Buf_Reader :: struct {
 	stream:   ^Stream,
@@ -440,12 +445,15 @@ http_exchange :: proc(
 				if content_length >= 0 {
 					return resp, .HTTP_Error
 				}
-				v, cl_err := parse_content_length(value)
+				v, cl_ok := h2.parse_content_length(value, MAX_HTTP_BODY)
 				// A value that is not a length is refused here rather than left to
 				// fall past the `== 0` and `> 0` cases below onto the read-to-end
 				// path, which is not what the peer asked for.
-				if cl_err != .None {
-					return resp, cl_err
+				if !cl_ok {
+					return resp, .HTTP_Error
+				}
+				if v > MAX_HTTP_BODY {
+					return resp, .Too_Large
 				}
 				content_length = v
 			case dns.name_equal_fold(name, "transfer-encoding"):
@@ -538,46 +546,6 @@ http_exchange :: proc(
 }
 
 /*
-Parse a `Content-Length` value, which is `1*DIGIT` (RFC 9110 8.6) and nothing
-else.
-
-`strconv.parse_int` with its default base reads a good deal more than that: the
-base comes from a prefix, so `0x10` is 16 and `0b1010` is 10; `_` between digits
-is skipped; a leading sign is allowed; and the accumulator wraps in silence, so
-a value past 64 bits arrives as something small enough for any range check that
-follows. What is on the other end of this parser is a blocklist host or a DoH
-upstream, over a connection this client keeps alive and reuses, so a length read
-differently from the way it was sent leaves the reader standing in the middle of
-a body with the next response starting from wherever that landed.
-
-The server side of the field is in `server/doh.odin`, where the same laxity is a
-request-smuggling primitive rather than a desync with oneself.
-
-The limit is applied digit by digit, so nothing can wrap on the way to it. What
-may surround the digits is `OWS` - spaces and tabs, RFC 9110 5.6.3 - and that is
-all this takes off, `split_header` having already trimmed the field value.
-*/
-@(private)
-parse_content_length :: proc(value: string) -> (length: int, err: Error) {
-	digits := strings.trim_right(strings.trim_left(value, " \t"), " \t")
-	if len(digits) == 0 {
-		return 0, .HTTP_Error
-	}
-	v := 0
-	for i in 0 ..< len(digits) {
-		c := digits[i]
-		if c < '0' || c > '9' {
-			return 0, .HTTP_Error
-		}
-		v = v * 10 + int(c - '0')
-		if v > MAX_HTTP_BODY {
-			return 0, .Too_Large
-		}
-	}
-	return v, .None
-}
-
-/*
 The status line: `HTTP/1.<DIGIT> SP 3DIGIT`, then optionally a space and a
 reason phrase (RFC 9112 4), and whether its version is 1.0.
 
@@ -591,11 +559,11 @@ pool as 1.1 (#437).
 @(private)
 parse_status :: proc(line: string) -> (status: int, http_1_0: bool, err: Error) {
 	V :: len("HTTP/1.1")
-	if len(line) < V + 4 || !strings.has_prefix(line, "HTTP/") || line[V] != ' ' {
+	if len(line) < V + 4 || line[V] != ' ' {
 		return 0, false, .HTTP_Error
 	}
 	// Major version 1 is the only one spoken on this wire (RFC 9112 2.3).
-	if line[5] != '1' || line[6] != '.' || line[7] < '0' || line[7] > '9' {
+	if major, _, ok := h2.http1_version(line[:V]); !ok || major != 1 {
 		return 0, false, .HTTP_Error
 	}
 	// A reason phrase is optional, but if anything follows the code it is the
@@ -603,13 +571,8 @@ parse_status :: proc(line: string) -> (status: int, http_1_0: bool, err: Error) 
 	if len(line) > V + 4 && line[V + 4] != ' ' {
 		return 0, false, .HTTP_Error
 	}
-	v := 0
-	for c in transmute([]u8)line[V + 1:V + 4] {
-		if c < '0' || c > '9' {
-			return 0, false, .HTTP_Error
-		}
-		v = v * 10 + int(c - '0')
-	}
+	// Three digits or 0, which the range check below refuses.
+	v := h2.parse_status(line[V + 1:V + 4])
 	// RFC 9110 15: a status is 100 to 599. Below that it is not even an interim
 	// response to pass over, which is what `099` was read as (#442).
 	if v < 100 || v > 599 {
@@ -631,9 +594,7 @@ split_header :: proc(line: string) -> (name, value: string, ok: bool) {
 	if idx <= 0 || line[0] == ' ' || line[0] == '\t' || line[idx - 1] == ' ' || line[idx - 1] == '\t' {
 		return "", "", false
 	}
-	// `OWS` off the value and nothing more (RFC 9110 5.6.3): `strings.trim_space`
-	// also takes a non-breaking space, which made `close\u00a0` a close.
-	return line[:idx], strings.trim(line[idx + 1:], " \t"), true
+	return line[:idx], h2.trim_ows(line[idx + 1:]), true
 }
 
 @(private)

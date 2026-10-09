@@ -6,6 +6,11 @@ import "core:strings"
 import "core:sync"
 import "core:time"
 
+/*
+Not `core:log`: its file logger writes `[LEVEL] --- [date]` lines, where these are
+logfmt (`ts= level= msg=` with quoted values) for log shippers to parse, and a
+`log.Logger` that wrote them would be this package behind one more indirection.
+*/
 Level :: enum u8 {
 	Debug,
 	Info,

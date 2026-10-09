@@ -544,7 +544,7 @@ refusal caught.
 */
 @(private)
 rebind_private :: proc(addr: [16]u8, v6: bool, loopback_ok: bool) -> bool {
-	bytes, family := rebind_unwrap(addr, v6)
+	bytes, family := config.unwrap_embedded_v4(addr, v6)
 	if !config.address_in(config.PRIVATE_NETWORKS, bytes, family) {
 		return false
 	}
@@ -552,74 +552,6 @@ rebind_private :: proc(addr: [16]u8, v6: bool, loopback_ok: bool) -> bool {
 		return false
 	}
 	return true
-}
-
-/*
-The IPv4 address inside a v6 address that carries one, for the two forms
-`address_in` does not already undo.
-
-`address_in` unwraps `::ffff:a.b.c.d`, which is the form that matters to the ACL
-as well - a client can arrive from one. These two only matter to an answer:
-
-  - `64:ff9b::/96`, RFC 6052's well-known prefix. On a NAT64 network the stack
-    connects to the embedded IPv4 host, so `64:ff9b::c0a8:0101` reaches
-    192.168.1.1 as squarely as an A record for it would, and an AAAA is the
-    record such a network's clients ask for. RFC 6052 section 3.1 forbids using
-    the well-known prefix with a non-global address, which is the argument that
-    a legitimate answer never carries one and refusing costs nothing.
-  - `::a.b.c.d`, the IPv4-compatible form deprecated by RFC 4291 section
-    2.5.5.1. Deprecated is not the same as not parsed, and it is one byte of
-    difference from the mapped form that everything does parse.
-
-Left alone deliberately: a *compat* address whose first embedded byte is zero,
-so `::` and `::1` stay the addresses they are and keep matching the `::/128` and
-`::1/128` entries - unwrapping them would turn `::1` into 0.0.0.1 and quietly
-put it outside `LOOPBACK_NETWORKS`, taking `allow_loopback` away from the one
-address it exists for. The same latitude under the NAT64 prefix would be a hole
-rather than a nicety, and the one that matters most; see the body.
-
-Not covered, and named because the rest of this file names what it leaves out: a
-site-specific NAT64 prefix (RFC 6052 allows /32 through /64, RFC 8215 reserves
-`64:ff9b:1::/48` for local use). This server is not told what its network's
-prefix is, and the embedded octets sit at a different offset for each length,
-skipping the `u` byte. A site running one has `allow_domains`, and dnsmasq and
-Unbound do not recognise even the well-known prefix.
-*/
-@(private)
-rebind_unwrap :: proc(addr: [16]u8, v6: bool) -> (bytes: [16]u8, family: bool) {
-	if !v6 {
-		return addr, false
-	}
-	// Bytes 4 through 11 are zero in both forms. `::ffff:a.b.c.d` fails here on
-	// its own 0xff pair, which is what leaves it to `address_in`.
-	for i in 4 ..< 12 {
-		if addr[i] != 0 {
-			return addr, true
-		}
-	}
-	nat64 := addr[0] == 0x00 && addr[1] == 0x64 && addr[2] == 0xff && addr[3] == 0x9b
-	compat := addr[0] == 0 && addr[1] == 0 && addr[2] == 0 && addr[3] == 0
-	if !nat64 && !compat {
-		return addr, true
-	}
-	/*
-	The "left alone" rule above, and it belongs to the compat branch alone.
-	Under a prefix of zeroes a zero first octet is `::` or `::1` - addresses in
-	their own right, which the tables already hold as themselves.
-
-	Under the NAT64 prefix it is nothing of the kind: `64:ff9b::` is RFC 6052's
-	encoding of 0.0.0.0, and a stack on such a network translates it to 0.0.0.0
-	and connects there. That is the entry `PRIVATE_NETWORKS` describes as a
-	working bypass rather than an odd answer - "0.0.0.0 Day", where a browser
-	reaches a service bound to 127.0.0.1 by connecting to 0.0.0.0 - so it is the
-	last address that should be waved through for having a zero in it.
-	*/
-	if compat && addr[12] == 0 {
-		return addr, true
-	}
-	v4: [16]u8
-	v4[0], v4[1], v4[2], v4[3] = addr[12], addr[13], addr[14], addr[15]
-	return v4, false
 }
 
 /*

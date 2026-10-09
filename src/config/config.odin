@@ -1,5 +1,6 @@
 package config
 
+import "core:encoding/hex"
 import "core:time"
 
 Log_Level :: enum u8 {
@@ -493,27 +494,9 @@ parse_cookie_secret :: proc(text: string, out: ^[COOKIE_SECRET_LEN]u8) -> bool {
 		return false
 	}
 	for i in 0 ..< COOKIE_SECRET_LEN {
-		hi, hi_ok := cookie_hex_value(text[i * 2])
-		lo, lo_ok := cookie_hex_value(text[i * 2 + 1])
-		if !hi_ok || !lo_ok {
-			return false
-		}
-		out[i] = hi << 4 | lo
+		out[i] = hex.decode_sequence(text[i * 2:i * 2 + 2]) or_return
 	}
 	return true
-}
-
-@(private)
-cookie_hex_value :: proc(c: u8) -> (v: u8, ok: bool) {
-	switch c {
-	case '0' ..= '9':
-		return c - '0', true
-	case 'a' ..= 'f':
-		return c - 'a' + 10, true
-	case 'A' ..= 'F':
-		return c - 'A' + 10, true
-	}
-	return 0, false
 }
 
 Rewrite_Kind :: enum u8 {

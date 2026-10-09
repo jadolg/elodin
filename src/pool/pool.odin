@@ -11,6 +11,11 @@ The server runs two of these. Query handling gets one; racing upstreams gets a
 second, separate one. Keeping them apart matters: a race job is submitted *by* a
 handler and waited on by it, so sharing a single pool could deadlock once every
 worker is blocked waiting for jobs that no one is left to run.
+
+Not `core:thread`'s `Pool`, which has no bounded submit: `pool_add_task` always
+queues, where the listeners shed at `try_submit`'s limit rather than queue a
+flood. It also appends every finished task to a `tasks_done` list that grows
+until someone pops it, which a server that never does would hold forever.
 */
 
 Job :: struct {

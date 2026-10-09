@@ -1293,6 +1293,30 @@ test_an_ipv4_embedded_in_ipv6_cannot_hide_a_private_address :: proc(t: ^testing.
 		{12 = 192, 13 = 168, 14 = 1, 15 = 1},
 		"a private address in the IPv4-compatible form",
 	)
+	// 64:ff9b:1::192.168.1.1, the /96 of the local-use prefix (RFC 8215).
+	refused(
+		t,
+		&cfg,
+		"nat64-local.attacker.example.",
+		{1 = 0x64, 2 = 0xff, 3 = 0x9b, 5 = 1, 12 = 192, 13 = 168, 14 = 1, 15 = 1},
+		"a private address behind the local-use NAT64 prefix",
+	)
+	// ::ffff:0:192.168.1.1, the IPv4-translated form.
+	refused(
+		t,
+		&cfg,
+		"siit.attacker.example.",
+		{8 = 0xff, 9 = 0xff, 12 = 192, 13 = 168, 14 = 1, 15 = 1},
+		"a private address in the IPv4-translated form",
+	)
+	// 2002:c0a8:0101::1, 6to4 to 192.168.1.1.
+	refused(
+		t,
+		&cfg,
+		"6to4.attacker.example.",
+		{0 = 0x20, 1 = 0x02, 2 = 192, 3 = 168, 4 = 1, 5 = 1, 15 = 1},
+		"a private address as a 6to4 router",
+	)
 	// 64:ff9b::169.254.169.254, the metadata endpoint by the same door.
 	refused(
 		t,

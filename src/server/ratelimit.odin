@@ -9,6 +9,7 @@ import "core:sync"
 import "core:time"
 import "elodin:config"
 import "elodin:logx"
+import "elodin:netx"
 
 /*
 Response rate limiting.
@@ -985,8 +986,8 @@ kind of socket it arrived on. Left mapped it would be read as IPv6, and every
 `::ffff:a.b.c.d` address is zeroes in the four groups a /64 is taken from - so
 the whole IPv4 side of a listener bound to `::` would be one prefix, and any one
 client there could spend the budget, or occupy the connections, of all the
-others. `unmap_v4` is the same normalisation `is_loopback` reads a source
-through, and the rule the ACL compared it against on the way in.
+others. `netx.unmap` reads it through `netx.unmap_bytes`, the normalisation
+`is_loopback` reads a source through, and the rule the ACL compared it against on the way in.
 
 `n` of 0 is an address that was neither family, which nothing this server
 accepts produces; each caller says what it does with one. Compared by value, so
@@ -1000,7 +1001,7 @@ Client_Prefix :: struct {
 
 client_prefix :: proc(address: net.Address) -> Client_Prefix {
 	p: Client_Prefix
-	switch a in unmap_v4(address) {
+	switch a in netx.unmap(address) {
 	case net.IP4_Address:
 		p.bytes[0], p.bytes[1], p.bytes[2] = a[0], a[1], a[2]
 		p.n = 3

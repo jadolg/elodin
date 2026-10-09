@@ -1,5 +1,6 @@
 package itest
 
+import "core:encoding/hex"
 import "core:fmt"
 import "core:mem"
 import "core:slice"
@@ -641,9 +642,7 @@ pw_rr_key :: proc(rec: Pw_RR, allocator := context.temp_allocator) -> string {
 		rec.type,
 		rec.ttl,
 	)
-	for b in rec.rdata {
-		fmt.sbprintf(&sb, "%02x", b)
-	}
+	strings.write_bytes(&sb, hex.encode(rec.rdata, allocator))
 	return strings.to_string(sb)
 }
 

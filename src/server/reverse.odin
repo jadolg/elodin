@@ -349,25 +349,26 @@ loopback and `0.0.0.0`, for the reason in the file comment, and minus the CGNAT
 zones, whose addresses are the ISP's rather than this network's.
 */
 @(private)
-address_is_local_v4 :: proc(a: [4]u8) -> bool {
-	switch {
-	case a[0] == 10:
-		return true
-	case a[0] == 172 && a[1] >= 16 && a[1] <= 31:
-		return true
-	case a[0] == 192 && a[1] == 168:
-		return true
-	case a[0] == 169 && a[1] == 254:
-		return true
-	}
-	return false
+REVERSIBLE_NETWORKS := []config.Prefix {
+	{addr = {0 = 10}, bits = 8}, // 10.0.0.0/8       private (RFC 1918)
+	{addr = {0 = 172, 1 = 16}, bits = 12}, // 172.16.0.0/12   private (RFC 1918)
+	{addr = {0 = 192, 1 = 168}, bits = 16}, // 192.168.0.0/16  private (RFC 1918)
+	{addr = {0 = 169, 1 = 254}, bits = 16}, // 169.254.0.0/16  link-local (RFC 3927)
+	// The half of RFC 4193's fc00::/7 that is defined and deployed.
+	{addr = {0 = 0xfd}, bits = 8, v6 = true}, // fd00::/8         unique local
+	{addr = {0 = 0xfe, 1 = 0x80}, bits = 10, v6 = true}, // fe80::/10        link-local (RFC 4291)
 }
 
 @(private)
+address_is_local_v4 :: proc(a: [4]u8) -> bool {
+	return config.prefix_list_contains(REVERSIBLE_NETWORKS, {0 = a[0], 1 = a[1], 2 = a[2], 3 = a[3]}, false)
+}
+
+// As written: an AAAA of `::ffff:10.0.0.1` is not a host on this network's v6
+// side, and is not reversed.
+@(private)
 address_is_local_v6 :: proc(a: [16]u8) -> bool {
-	// fd00::/8, the half of RFC 4193's fc00::/7 that is defined and deployed,
-	// and fe80::/10.
-	return a[0] == 0xfd || (a[0] == 0xfe && a[1] & 0xc0 == 0x80)
+	return config.prefix_list_contains(REVERSIBLE_NETWORKS, a, true)
 }
 
 @(private)

@@ -1,5 +1,6 @@
 package server
 
+import "core:encoding/hex"
 import "core:mem"
 import "core:testing"
 import "elodin:cache"
@@ -8,22 +9,8 @@ import "elodin:dns"
 
 @(private = "file")
 unhex :: proc(text: string, allocator := context.temp_allocator) -> []u8 {
-	value :: proc(c: u8) -> u8 {
-		switch c {
-		case '0' ..= '9':
-			return c - '0'
-		case 'a' ..= 'f':
-			return c - 'a' + 10
-		case 'A' ..= 'F':
-			return c - 'A' + 10
-		}
-		return 0
-	}
-	out := make([]u8, len(text) / 2, allocator)
-	for i in 0 ..< len(out) {
-		out[i] = value(text[i * 2]) << 4 | value(text[i * 2 + 1])
-	}
-	return out
+	out, ok := hex.decode(transmute([]u8)text, allocator)
+	return out if ok else nil
 }
 
 @(private = "file")
@@ -481,14 +468,18 @@ test_cookie_is_not_shared_through_the_cache :: proc(t: ^testing.T) {
 test_cookie_secret_parsing :: proc(t: ^testing.T) {
 	secret: [COOKIE_SECRET_LEN]u8
 	testing.expect(t, config.parse_cookie_secret("e5e973e5a6b2a43f48e7dc849e37bfcf", &secret), "a valid secret was refused")
-	testing.expect(
-		t,
-		mem.compare(secret[:], unhex("e5e973e5a6b2a43f48e7dc849e37bfcf")) == 0,
-		"the secret was decoded wrongly",
-	)
+	want := [COOKIE_SECRET_LEN]u8{0xe5, 0xe9, 0x73, 0xe5, 0xa6, 0xb2, 0xa4, 0x3f, 0x48, 0xe7, 0xdc, 0x84, 0x9e, 0x37, 0xbf, 0xcf}
+	testing.expect(t, secret == want, "the secret was decoded wrongly")
+	testing.expect(t, config.parse_cookie_secret("E5E973E5A6B2A43F48E7DC849E37BFCF", &secret), "an upper-case secret was refused")
+	testing.expect(t, secret == want, "the upper-case secret was decoded wrongly")
 
 	testing.expect(t, !config.parse_cookie_secret("e5e973", &secret), "a short secret was accepted")
 	testing.expect(t, !config.parse_cookie_secret("e5e973e5a6b2a43f48e7dc849e37bfcg", &secret), "a non-hex secret was accepted")
+	// `hex.decode_sequence`, which reads each pair, takes a `0x` prefix off
+	// before it looks: a pair that is the prefix is not a byte.
+	testing.expect(t, !config.parse_cookie_secret("0xe973e5a6b2a43f48e7dc849e37bfcf", &secret), "a 0x pair was accepted")
+	testing.expect(t, !config.parse_cookie_secret("e5e973e5a6b2a43f48e7dc849e370X", &secret), "a 0X pair was accepted")
+	testing.expect(t, !config.parse_cookie_secret("+5e973e5a6b2a43f48e7dc849e37bfcf", &secret), "a sign was accepted")
 	free_all(context.temp_allocator)
 }
 
@@ -598,7 +589,7 @@ test_cookie_unbindable_address_is_answered_when_not_required :: proc(t: ^testing
 A cookie is bound to the client's address as the socket reported it.
 
 `cookie_client_ip` hashes `::ffff:a.b.c.d` as the sixteen bytes it arrived as,
-and is the one place in the server that does not undo the mapping - `unmap_v4`
+and is the one place in the server that does not undo the mapping - `netx.unmap_bytes`
 undoes it for the rate limiter and for loopback, and `config.address_bytes` for
 the ACL. What is decided here is only whether a cookie this server issued came
 back from the address it was issued to, and a client returns to the socket that

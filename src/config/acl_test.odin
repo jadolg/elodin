@@ -389,3 +389,19 @@ test_the_loopback_table_is_loopback_alone :: proc(t: ^testing.T) {
 	testing.expect(t, !address_in(LOOPBACK_NETWORKS, rfc1918, false))
 	testing.expect(t, !address_in(LOOPBACK_NETWORKS, [16]u8{}, false))
 }
+
+// `NON_PUBLIC_NETWORKS` is written out in full rather than built on
+// `PRIVATE_NETWORKS`, so an entry added to the rebinding table and not to this
+// one would let a redirect land where an answer may not point.
+@(test)
+test_non_public_networks_cover_the_private_ones :: proc(t: ^testing.T) {
+	for p in PRIVATE_NETWORKS {
+		covered := false
+		for q in NON_PUBLIC_NETWORKS {
+			if q.v6 == p.v6 && q.bits <= p.bits && prefix_contains(q, p.addr) {
+				covered = true
+			}
+		}
+		testing.expectf(t, covered, "%v is private but not in NON_PUBLIC_NETWORKS", p)
+	}
+}

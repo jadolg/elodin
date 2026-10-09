@@ -29,8 +29,16 @@ does not turn blocking off once a list has been fetched.
 - A download follows up to 4 redirects (301, 302, 303, 307, 308), resolving a
   relative `Location` against the url that answered it (RFC 3986 5.2). An
   `https` list is never followed to `http`, and a list on a public address is
-  never followed to a loopback, private, link-local or other reserved one. A
-  list url is requested with its query (`?format=hosts`).
+  never followed to one that is not globally reachable: loopback, private,
+  link-local, site-local, carrier-grade NAT, multicast, the documentation and benchmarking
+  ranges, and the other special-purpose ranges (RFC 6890) no list host can be
+  at. An IPv4 address written inside an
+  IPv6 one (`::ffff:a.b.c.d`, `::a.b.c.d`,
+  `::ffff:0:a.b.c.d`, the NAT64 prefixes `64:ff9b::/96` and `64:ff9b:1::/96`,
+  and 6to4 `2002:aabb:ccdd::/48`) is judged as the IPv4 address. Any other
+  address under the local-use NAT64 prefix `64:ff9b:1::/48` is never followed
+  to, and a list at one is held to the public rule. A list url is requested with its
+  query (`?format=hosts`).
 - A download counts as failed when it is a web page (its first non-blank byte
   is `<`: a captive portal, an error page sent as a 200) or holds no rules,
   and it does not replace the cached copy (`the download is a web page, not a

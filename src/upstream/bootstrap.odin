@@ -216,7 +216,7 @@ bootstrap_query :: proc(
 		if n < dns.HEADER_SIZE {
 			continue
 		}
-		if remote.port != endpoint.port || !addresses_equal(remote.address, endpoint.address) {
+		if remote.port != endpoint.port || !netx.addresses_equal(remote.address, endpoint.address) {
 			continue
 		}
 		if !response_matches(wire, buf[:n]) {
