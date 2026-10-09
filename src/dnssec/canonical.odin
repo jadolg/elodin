@@ -176,9 +176,12 @@ where the decoder walks it to expand compressed names. That one is private to it
 package and this one is private to this, so the two are kept in step by hand -
 but they are not quite the same list. That one asks whether a name in the RDATA
 may have been compressed; this one asks whether a name in the RDATA is lowercased
-for a signature, which only the types in RFC 4034 section 6.2 are. NSAP-PTR is
-walked there and deliberately absent here: downcasing it would build a canonical
-form no signer ever computed.
+for a signature, which only the types in RFC 4034 section 6.2 are. NSAP-PTR,
+NSEC, TALINK, LP and DSYNC are walked there and deliberately absent here:
+downcasing them would build a canonical form no signer ever computed (RFC 6840
+section 5.1 took NSEC off the RFC 4034 list). RRSIG is walked there and absent
+here too, though on the list: no RRSIG set is itself signed, and the validator
+canonicalizes the signer of the one it checks on its own.
 */
 @(private)
 Raw_Layout :: struct {
