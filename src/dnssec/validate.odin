@@ -2594,7 +2594,7 @@ validate_rrset :: proc(
 	// DS, and serve a forged DS set there as merely insecure.
 	holder := zone_holding(owner, type)
 	owner_status, _, owner_zone := zone_trust(v, budget, holder, now, allocator)
-	// The walk held up and stopped above the owner, and nothing here verified:
+	// The walk held up and stopped above the holder, and nothing here verified:
 	// one reason is a delegation at a name the table still calls no cut, which
 	// for an *unsigned* one leaves this the only verdict that can notice. The
 	// denial and wildcard paths do the same; see `forget_unreached_non_cut`.
