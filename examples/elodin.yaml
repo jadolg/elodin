@@ -454,11 +454,10 @@ dnssec:
   # line in the log naming the number this build computes from its allowance.
   max_nsec3_iterations: 100
 
-  # Chain-of-trust walks that may be waiting on an upstream at once, for every
-  # transport. The walk waits once per label of the name being walked, on
-  # behalf of the query it validates, and how many labels there are is the
-  # client's to choose — so without a bound a flood of fresh names holds every
-  # query in flight. Past this many, a walk reads the caches and answers SERVFAIL
+  # Chain-of-trust walks that may be waiting on an upstream at once. The walk
+  # waits once per label of the name being walked, on behalf of the query it
+  # validates, and how many labels there are is the client's to choose — so
+  # without a bound a flood of fresh names holds every query in flight. Past this many, a walk reads the caches and answers SERVFAIL
   # where it would have gone upstream, which is what an upstream that did not
   # answer already produces.
   #
