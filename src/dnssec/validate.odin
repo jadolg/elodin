@@ -9,6 +9,7 @@ import "core:sync"
 import "core:time"
 import "elodin:dns"
 import "elodin:logx"
+import "elodin:loop"
 
 /*
 The chain of trust.
@@ -636,6 +637,18 @@ unsafe - that is unbounded verification on a message an attacker wrote.
 MAX_VERIFICATIONS_PER_QUERY :: 64
 
 /*
+Signature checks a query makes between giving its loop to the other fibers on it.
+
+A check is CPU and never waits, so a walk that reaches the budget without a
+lookup in between would hold its loop for all of them - 64 checks at the 40 us an
+Ed25519 one takes here is 2.6 ms - while every other query on the loop, cache
+hits included, waits behind it. Threads had the kernel's scheduler for this.
+Four is at most ~160 us between turns; a turn costs about a microsecond, which
+before every check would be a tenth of the cheapest one (RSA-2048, 8 us).
+*/
+VERIFICATIONS_PER_TURN :: 4
+
+/*
 Whether a signature could verify at all, decided without doing any crypto.
 
 Every signature reaching a verification is one an attacker may have written, so
@@ -674,6 +687,9 @@ spend_verification :: proc(budget: ^Budget) -> bool {
 		return false
 	}
 	budget.verifications += 1
+	if budget.verifications % VERIFICATIONS_PER_TURN == 0 {
+		loop.yield()
+	}
 	return true
 }
 

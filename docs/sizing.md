@@ -51,7 +51,13 @@ the loop it arrived on.
 
 What a loop does with the CPU between waits - decoding, the cache, DNSSEC
 signature checks, TLS handshakes - is done inline, so a loop at 100% of its core
-is the ceiling, and adding loops past the cores does not raise it.
+is the ceiling, and adding loops past the cores does not raise it. Nothing
+preempts a fiber the way the kernel preempts a thread, so the long stretches of
+CPU give the loop a turn as they go: DNSSEC validation every fourth signature
+check and every ~100 µs of NSEC3 hashing, and a reader every 64 messages it
+reads without waiting. Between turns a validating query holds its loop for a
+few hundred microseconds at most, where the whole of its DNSSEC allowance is a
+few milliseconds.
 
 ## Queries in flight
 
@@ -74,6 +80,26 @@ the server is; a figure sitting at the maximum while `elodin_queries_dropped_tot
 rises is the server turning queries away. Against a 20 ms upstream, 1,000 in
 flight is 50,000 cache misses a second; raise `max_pending` only when the dropped
 counter says so.
+
+### What reaches the upstreams
+
+`max_pending` is also how much of a flood the upstreams see. A query for a name
+nobody has asked before - the random-subdomain attack - is a cache miss, and every
+one admitted is forwarded. With threads, the worker count held that to about 128
+upstream exchanges at once, around 6,000 a second against a 20 ms upstream,
+however many clients took part. Now it is `max_pending` at once, thousands, which
+is the point of the event loops for honest misses and the same multiplier for a
+flood: twenty times or more of what reached a public upstream before, enough for
+one with a per-client limit to start refusing this resolver, and every client
+behind it with it.
+
+`server.rate_limit` still holds each client prefix to its budget, so a flood from
+one network is no larger than before. What changed is the ceiling on a flood
+spread over many. Where the upstream is a public resolver with limits of its own,
+or a link with a fixed capacity, set `max_pending` to what the upstream should
+carry: target misses per second × upstream round trip, with headroom - 1,000 is
+50,000 a second against 20 ms. `dnssec.max_chain_walks` caps the chain walks
+within that the same way, for validating resolvers.
 
 Measured before and after the event loops, and against Unbound, in
 [`bench/results/2026-10-26-event-loop.md`](../bench/results/2026-10-26-event-loop.md).
