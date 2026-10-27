@@ -3272,7 +3272,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "The descriptor limit is not plotted here: it is five orders of magnitude larger and would flatten both lines. It is the headroom stat below. Descriptors climbing while the connection count sits still is a leak rather than load.",
+      "description": "Fibers are what each event loop is running - queries in flight, connections, racers and upstream readers - and loops far apart are load the kernel's UDP hash or the round-robin accept spread unevenly. Threads (blue, right-hand axis) are the loops plus a handful of service threads, and stay close to flat. The descriptor limit is not plotted here: it is five orders of magnitude larger and would flatten both lines. It is the headroom stat below. Descriptors climbing while the connection count sits still is a leak rather than load.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3337,6 +3337,10 @@
                   "mode": "fixed",
                   "fixedColor": "#3987e5"
                 }
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
               }
             ]
           },
@@ -3403,9 +3407,21 @@
           "range": true,
           "instant": false,
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "expr": "elodin_fibers{job=~\"$job\", instance=~\"$instance\"}",
+          "legendFormat": "fibers, loop {{loop}}",
+          "refId": "C"
         }
       ],
-      "title": "Threads and descriptors",
+      "title": "Threads, fibers and descriptors",
       "type": "timeseries"
     },
     {
@@ -3413,7 +3429,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "The one number that says whether this server is keeping up. Every UDP query, DoH/2 request and cache refresh is in flight from arrival to answer; one sitting at max_pending (dashed) is the server turning queries away, which elodin_queries_dropped_total then counts. Raise server.max_pending only when it does. Heavy decodes are requests reading past the ordinary allowance against the slots there are for them; at the maximum, answers built to expand are being refused as over budget.",
+      "description": "The one number that says whether this server is keeping up. Every UDP query, DoH/2 request and cache refresh is in flight from arrival to answer; one sitting at max_pending (dashed) is the server turning queries away, which elodin_queries_dropped_total then counts. Raise server.max_pending only when it does. Heavy decodes are requests reading past the ordinary allowance against the slots there are for them; at the maximum, answers built to expand are being refused as over budget. Heavy decodes (orange) are on the right-hand axis: a few dozen slots against thousands in flight.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3508,6 +3524,10 @@
                   "mode": "fixed",
                   "fixedColor": "#d95926"
                 }
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
               }
             ]
           },
@@ -3523,6 +3543,10 @@
                   "mode": "fixed",
                   "fixedColor": "#d95926"
                 }
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
               }
             ]
           },

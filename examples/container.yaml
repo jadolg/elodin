@@ -91,9 +91,9 @@ listeners:
     address: "0.0.0.0"
     port: 53
     # Derived like max_pending, and from the same reading of the cgroup: one
-    # reader - one event loop - per usable CPU, to eight, so a pod limited to one CPU
-    # gets one reader rather than one per core of the node it landed on. That
-    # is the whole reason to leave it unset here.
+    # reader - one event loop - per usable CPU, to eight, so a pod limited to
+    # one CPU gets one reader rather than one per core of the node it landed on.
+    # That is the whole reason to leave it unset here.
     readers: 0
   tcp:
     enabled: true

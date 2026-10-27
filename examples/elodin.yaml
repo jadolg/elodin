@@ -457,9 +457,10 @@ dnssec:
   # Chain-of-trust walks that may be waiting on an upstream at once. The walk
   # waits once per label of the name being walked, on behalf of the query it
   # validates, and how many labels there are is the client's to choose — so
-  # without a bound a flood of fresh names holds every query in flight. Past this many, a walk reads the caches and answers SERVFAIL
-  # where it would have gone upstream, which is what an upstream that did not
-  # answer already produces.
+  # without a bound a flood of fresh names holds every query in flight. Past
+  # this many, a walk reads the caches and answers SERVFAIL where it would have
+  # gone upstream, which is what an upstream that did not answer already
+  # produces.
   #
   # 0 is server.max_pending less a reserved quarter of it: the point is to keep
   # that quarter out of the walk, so it comes back in a round trip rather than

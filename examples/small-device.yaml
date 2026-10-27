@@ -55,11 +55,11 @@ server:
   # decode.
   max_pending: 32
 
-  # Every TCP, DoT or DoH connection is a fiber, about 30 KB held, so this
-  # figure is a claim about what the box can hold. 64 is generous for a household - a client
-  # opens one and reuses it - and the per-prefix share below derives half of
-  # it, which is fine here because the whole LAN is one /24 and there is
-  # nobody hostile inside the allow list.
+  # Every TCP, DoT or DoH connection is a fiber, about 21 KB held (72 KB with
+  # TLS), so this figure is a claim about what the box can hold. 64 is generous
+  # for a household - a client opens one and reuses it - and the per-prefix
+  # share below derives half of it, which is fine here because the whole LAN is
+  # one /24 and there is nobody hostile inside the allow list.
   max_connections: 64
 
   # The shipped budget, unchanged: 500 answers a second per client prefix, and
