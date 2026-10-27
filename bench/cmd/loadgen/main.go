@@ -408,7 +408,7 @@ func dialDoT(c config) (client, error) {
 	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", c.server, &tls.Config{
 		// The server under test presents the harness's own self-signed
 		// certificate; verifying it would measure nothing.
-		InsecureSkipVerify: true, // nosemgrep
+		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS12,
 		NextProtos:         []string{"dot"},
 	})
