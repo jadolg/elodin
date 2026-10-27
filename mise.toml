@@ -29,11 +29,12 @@ ELODIN_LDFLAGS = "--sysroot=/ -B/usr/bin"
 # were never fetched, and a tree with no .git at all still builds.
 ELODIN_VERSION = "{{ exec(command='echo ${ELODIN_VERSION:-$(git describe --tags --exact-match 2>/dev/null || echo dev-$(git rev-parse --short HEAD 2>/dev/null || echo unknown))}') }}"
 
-# Each worker thread keeps its own scratch arena, and Odin sizes those at 4 MB
-# by default. A query needs a few kilobytes at most, so that costs ~4 MB per
-# worker — half a gigabyte at the default worker count — for nothing. 256 KB
-# measures identically on throughput and cuts resident memory by an order of
-# magnitude; the arena still grows if a request ever needs more.
+# Every thread keeps its own scratch arena, and Odin sizes those at 4 MB by
+# default. Queries run on fibers, whose scratch is their own (see
+# src/loop/fiber.odin); what is left on a thread's arena - the main and
+# maintenance threads, the metrics endpoint, a blocklist rebuild - needs a few
+# kilobytes at a time, so 256 KB is ample, and the arena still grows if a call
+# ever needs more.
 ELODIN_DEFINES = "-define:DEFAULT_TEMP_ALLOCATOR_BACKING_SIZE=262144 -define:ELODIN_VERSION={{ env.ELODIN_VERSION }}"
 
 # `odin test` already wraps each test in a tracking allocator and prints what it

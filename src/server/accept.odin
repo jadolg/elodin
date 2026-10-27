@@ -484,8 +484,10 @@ sets are disjoint, so the total is their sum:
     included;
   - the queries in flight, `server.max_pending`, since a query doing an upstream
     exchange holds a socket for the round trip and a socket checked out of a
-    pool is not in it. One each is the ordinary case; a racing group holds one
-    per member for a moment, and the reserve covers what that adds;
+    pool is not in it;
+  - the race legs, `server.max_pending` per member of the widest racing group,
+    a socket each while their query waits and after it has gone (see
+    `upstream.Racer_Budget`);
   - the UDP readers, one socket each, which is up to `MAX_UDP_READERS` (64) when
     an operator sets the figure rather than the eight a derivation will pick;
   - the event loops, an epoll descriptor and an eventfd each.
@@ -532,8 +534,11 @@ race_width :: proc(cfg: config.Upstream_Config) -> int {
 }
 
 /*
-Memory mappings one fiber costs at most: its stack and the guard page under it,
-which `mprotect` splits in two, and its scratch arena's block.
+Memory mappings one fiber costs while it holds a query whose scratch fits one
+block, which an ordinary one's does: its stack and the guard page under it,
+which `mprotect` splits in two, and that block. A query taking more scratch maps
+one more per further block (`loop.SCRATCH_FIRST_BLOCK`, 16 KiB), so this is the figure for a
+server under ordinary load, not a ceiling.
 */
 MAPPINGS_PER_FIBER :: 3
 
@@ -613,12 +618,13 @@ descriptor_limit_line :: proc(soft_limit: int, d: Descriptor_Demand) -> (line: s
 		table = "no connection table, every stream listener being off"
 	}
 	return fmt.tprintf(
-		"descriptors: the limit is %d, short of the %d this configuration can want (%s, %d pooled upstream connections, %d queries in flight that may hold one each for a round trip, %d UDP readers, %d for the event loops, and %d over). Past it, accepts fail and the listeners wait between attempts, counted as accept_backoff=; raise RLIMIT_NOFILE (LimitNOFILE= in the systemd unit)",
+		"descriptors: the limit is %d, short of the %d this configuration can want (%s, %d pooled upstream connections, %d queries in flight that may hold one each for a round trip, %d race legs, %d UDP readers, %d for the event loops, and %d over). Past it, accepts fail and the listeners wait between attempts, counted as accept_backoff=; raise RLIMIT_NOFILE (LimitNOFILE= in the systemd unit)",
 		soft_limit,
 		wanted,
 		table,
 		d.pooled_upstream,
 		d.in_flight,
+		d.racers,
 		d.udp_readers,
 		2 * d.loops,
 		DESCRIPTOR_RESERVE,

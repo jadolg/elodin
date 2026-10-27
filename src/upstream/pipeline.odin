@@ -78,6 +78,10 @@ PIPELINE_OUTSTANDING_CEILING :: 1 << 15
 `Upstream.max_outstanding` for a server that may have `in_flight` queries and
 `connections` connections asking at once; see `PIPELINE_MAX_OUTSTANDING`.
 */
+pipeline_outstanding :: proc(in_flight, connections: int) -> int {
+	return clamp(in_flight + connections, PIPELINE_MAX_OUTSTANDING, PIPELINE_OUTSTANDING_CEILING)
+}
+
 /*
 Move what each of `g`'s pipelined connections may carry, for a reload that keeps
 the group - and with it its connections, health and learned idle ceilings - but
@@ -91,10 +95,6 @@ set_max_outstanding :: proc(g: ^Group, n: int) {
 	for u in g.servers {
 		sync.atomic_store(&u.max_outstanding, n)
 	}
-}
-
-pipeline_outstanding :: proc(in_flight, connections: int) -> int {
-	return clamp(in_flight + connections, PIPELINE_MAX_OUTSTANDING, PIPELINE_OUTSTANDING_CEILING)
 }
 
 /*

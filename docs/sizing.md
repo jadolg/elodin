@@ -150,8 +150,8 @@ that (`LimitNOFILE=` in the systemd unit, 65536 as shipped).
 ## Memory mappings
 
 Every query in flight, race query and connection runs on a fiber, and a fiber
-holds up to three memory mappings (its stack, the guard page under it, its
-scratch). Startup warns when `vm.max_map_count` (65530 by default) cannot hold
+holds three memory mappings (its stack, the guard page under it, its scratch),
+and one more for each further 16 KiB a query's scratch grows to. Startup warns when `vm.max_map_count` (65530 by default) cannot hold
 all of them, which the derived figures reach on a large machine racing a wide
 group:
 

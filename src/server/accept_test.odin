@@ -167,6 +167,11 @@ test_the_descriptor_line_is_silent_unless_the_limit_is_short :: proc(t: ^testing
 		strings.contains(line, "accept_backoff="),
 		"the counter has to be named, since the warn is said once and the counter goes on",
 	)
+
+	// Every term of the total is itemised, the race legs among them, so the
+	// figures the line lists add up to the one it says is wanted.
+	racing, _ := descriptor_limit_line(1, Descriptor_Demand{racers = 7777})
+	testing.expect(t, strings.contains(racing, "7777 race legs"), "the race legs have to be named")
 }
 
 /*
