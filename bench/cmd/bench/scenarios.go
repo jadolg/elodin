@@ -136,6 +136,7 @@ func (h *harness) loadOnce(s *server, o loadOpts) (Result, sample, error) {
 		"-qname", o.qname,
 		"-duration", o.duration.String(),
 		"-warmup", warmup.String(),
+		"-ca", s.caPath,
 	}
 	if o.rate > 0 {
 		args = append(args, "-rate", strconv.Itoa(o.rate))
@@ -503,7 +504,7 @@ func (h *harness) latency() (section, error) {
 func (h *harness) once(s *server, transport string, n int, qmode string) (Result, int64, int64, error) {
 	cmd := exec.Command(h.loadgen,
 		"-server", s.addrFor(transport), "-transport", transport,
-		"-clients", strconv.Itoa(n), "-qmode", qmode, "-once")
+		"-clients", strconv.Itoa(n), "-qmode", qmode, "-once", "-ca", s.caPath)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return Result{}, 0, 0, err

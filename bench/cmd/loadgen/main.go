@@ -14,6 +14,7 @@ package main
 import (
 	"bytes"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -43,6 +44,7 @@ type config struct {
 	path        string
 	rate        int
 	once        bool
+	roots       *x509.CertPool
 }
 
 // Result is the JSON the orchestrator reads back.
@@ -74,7 +76,17 @@ func main() {
 	flag.StringVar(&c.path, "path", "/dns-query", "DoH path")
 	flag.IntVar(&c.rate, "rate", 0, "total queries per second to offer; 0 is as fast as possible")
 	flag.BoolVar(&c.once, "once", false, "each client asks one question, the result is printed, and the connections are held until stdin closes")
+	ca := flag.String("ca", "", "PEM certificate DoT trusts: the one the server under test presents")
 	flag.Parse()
+
+	if c.transport == "dot" {
+		pem, err := os.ReadFile(*ca)
+		c.roots = x509.NewCertPool()
+		if err != nil || !c.roots.AppendCertsFromPEM(pem) {
+			fmt.Fprintln(os.Stderr, "loadgen: dot needs -ca, the server's certificate in PEM")
+			os.Exit(2)
+		}
+	}
 
 	if c.concurrency > 1 && c.transport != "doh1" && c.transport != "doh2" {
 		fmt.Fprintln(os.Stderr, "loadgen: concurrency above 1 needs doh1 or doh2; raise -clients instead")
@@ -406,11 +418,9 @@ func dialDoT(c config) (client, error) {
 	// connection accepted by the kernel and never handshake on it, and an
 	// unbounded dial would wait on that forever.
 	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", c.server, &tls.Config{
-		// The server under test presents the harness's own self-signed
-		// certificate; verifying it would measure nothing.
-		InsecureSkipVerify: true,
-		MinVersion:         tls.VersionTLS12,
-		NextProtos:         []string{"dot"},
+		RootCAs:    c.roots,
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"dot"},
 	})
 	if err != nil {
 		return nil, err

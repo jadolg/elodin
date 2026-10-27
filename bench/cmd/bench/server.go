@@ -73,6 +73,8 @@ type server struct {
 	dnsAddr string
 	dotAddr string
 	dohAddr string
+	// caPath is the certificate the server presents, which the generator trusts.
+	caPath  string
 	logPath string
 	pid     int
 }
@@ -134,6 +136,7 @@ func (h *harness) start(o serverOpts) (*server, error) {
 		dnsAddr: fmt.Sprintf("127.0.0.1:%d", dnsPort),
 		dotAddr: fmt.Sprintf("127.0.0.1:%d", dotPort),
 		dohAddr: fmt.Sprintf("127.0.0.1:%d", dohPort),
+		caPath:  filepath.Join(h.dir, o.certKind+"-cert.pem"),
 		logPath: filepath.Join(h.dir, o.name+"-"+o.kind+".log"),
 	}
 	var argv []string
