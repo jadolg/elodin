@@ -85,11 +85,11 @@ DEFAULT_HEAVY_DECODES :: 16
 /*
 Memory charged to each connection `server.max_connections` lets the server hold.
 
-Every TCP, DoT and DoH connection has a fiber of its own. With 200 held open
-after one query each, a TCP connection measured ~29 KB resident - the stack its
-fiber touched and its scratch - and a DoT one adds OpenSSL's session, ~95 KB
-measured on threads; this rounds up for DoH and the stack a query touches
-(#526, #547). The scratch a query uses past that is held until its connection
+Every TCP, DoT and DoH connection has a fiber of its own. Held open after one
+query each, a TCP connection measured ~21 KB resident in a release build - the
+stack its fiber touched and its scratch - and a DoT or DoH/2 one ~72 KB, most of
+it OpenSSL's session (bench/results/2026-10-26-event-loop.md); this rounds up
+for the stack a query touches (#526, #547). The scratch a query uses past that is held until its connection
 closes and unmapped when it does.
 */
 CONNECTION_MEMORY_BYTES :: 128 * 1024
