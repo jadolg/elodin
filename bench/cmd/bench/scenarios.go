@@ -319,7 +319,8 @@ func (h *harness) loops() (section, error) {
 		"A thread-model release takes `readers` as its UDP reader count only.\n\n", thousands(clients))
 	sb.WriteString("| server | loops | cache misses | miss p99 | cache hits | hit p99 |\n|---|---|---|---|---|---|\n")
 	for _, kind := range h.kinds {
-		for _, loops := range []int{1, 2, runtime.NumCPU()} {
+		// Past the two cores, but within the 64 readers elodin's loader accepts.
+		for _, loops := range []int{1, 2, min(runtime.NumCPU(), 64)} {
 			s, err := h.start(serverOpts{
 				name: "loops", kind: kind, cache: true, loops: loops, maxPending: 4096, cpus: "0-1",
 			})

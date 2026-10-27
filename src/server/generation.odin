@@ -324,6 +324,21 @@ cache_options :: proc(c: config.Cache_Config) -> cache.Options {
 }
 
 /*
+What one pipelined upstream connection may carry under `cfg`.
+
+A race's losers run on after their query has gone and its place in `max_pending`
+has been taken by another, so where any group races, its racers - up to the
+budget `build_live` sets, `max_pending` legs per member of the widest racing
+group - may be asking one upstream beside the queries that are: a member slow to
+answer is the one whose legs every race leaves behind.
+*/
+@(private)
+connection_outstanding :: proc(cfg: ^config.Config) -> int {
+	in_flight := cfg.server.max_pending * (1 + race_width(cfg.upstream))
+	return upstream.pipeline_outstanding(in_flight, cfg.server.max_connections)
+}
+
+/*
 The default group and one per `upstream.zones` entry.
 
 A route whose servers are all unusable fails the whole build rather than being
@@ -336,15 +351,7 @@ replies rather than failing.
 @(private)
 build_upstreams :: proc(s: ^Server, l: ^Live) -> bool {
 	cfg := l.cfg
-	/*
-	A race's losers run on after their query has gone and its place in
-	`max_pending` has been taken by another, so where any group races, its
-	racers - up to the budget `build_live` sets, `max_pending` legs per member of
-	the widest racing group - may be asking one upstream beside the queries that
-	are: a member slow to answer is the one whose legs every race leaves behind.
-	*/
-	in_flight := cfg.server.max_pending * (1 + race_width(cfg.upstream))
-	outstanding := upstream.pipeline_outstanding(in_flight, cfg.server.max_connections)
+	outstanding := connection_outstanding(cfg)
 	// The budget's figure is set by `build_live` once the whole generation is built.
 	group, gerr := upstream.make_group(
 		cfg.upstream,
@@ -440,12 +447,9 @@ build_live :: proc(s: ^Server, l: ^Live, prev: ^Live) -> (built, carried: Parts,
 		built, carried = {}, {}
 	}
 
-	// `max_pending` too: each connection's `max_outstanding` is derived from it
-	// when its group is built (see `build_upstreams`).
 	if prev == nil ||
 	   differs(prev.cfg.upstream, cfg.upstream) ||
-	   prev.cfg.cookies.upstream != cfg.cookies.upstream ||
-	   prev.cfg.server.max_pending != cfg.server.max_pending {
+	   prev.cfg.cookies.upstream != cfg.cookies.upstream {
 		// The hostnames too, before the new groups resolve theirs: an address
 		// the old bootstrap servers gave is otherwise dialled for up to
 		// `BOOTSTRAP_TTL` after a reload that replaced them.
@@ -538,6 +542,18 @@ build_live :: proc(s: ^Server, l: ^Live, prev: ^Live) -> (built, carried: Parts,
 	so a reload refused above leaves it at the figure in effect.
 	*/
 	sync.atomic_store(&s.racers.limit, cfg.server.max_pending * max(race_width(cfg.upstream), 1))
+	/*
+	Groups kept from the last generation keep their connections, health and
+	learned ceilings; what each connection may carry follows `max_pending`, set
+	here for the same reason as the budget above.
+	*/
+	if .Upstreams in carried {
+		outstanding := connection_outstanding(cfg)
+		upstream.set_max_outstanding(l.group, outstanding)
+		for r in l.routes {
+			upstream.set_max_outstanding(r.group, outstanding)
+		}
+	}
 	return built, carried, true
 }
 

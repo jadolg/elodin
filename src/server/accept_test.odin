@@ -5,6 +5,7 @@ import "core:strings"
 import "core:testing"
 import "core:time"
 import "elodin:config"
+import "elodin:metrics"
 
 /*
 Every `net.Accept_Error`, against a table written out by hand.
@@ -683,4 +684,30 @@ test_race_width_is_the_widest_racing_group :: proc(t: ^testing.T) {
 	cfg.zones = zones
 	testing.expect_value(t, race_width(cfg), 5)
 	free_all(context.temp_allocator)
+}
+
+/*
+The mapping count is said only when it cannot hold every fiber the
+configuration may run - three mappings each - and is read off this machine, where
+procfs has it.
+*/
+@(test)
+test_the_map_count_line_is_silent_unless_the_limit_is_short :: proc(t: ^testing.T) {
+	d := Descriptor_Demand {
+		max_connections = 512,
+		in_flight       = 4096,
+		racers          = 4096 * 12,
+		udp_readers     = 8,
+		loops           = 8,
+	}
+	fibers := 512 + 4096 + 4096 * 12 + 8 + 8
+	wanted := fibers * MAPPINGS_PER_FIBER + MAPPING_RESERVE
+	line, short := map_count_line(65530, d)
+	testing.expect(t, short, "the default limit covers a dozen-wide race at the largest derived figures")
+	testing.expect(t, strings.contains(line, "vm.max_map_count"), "the line does not name the setting")
+	_, enough := map_count_line(wanted, d)
+	testing.expect(t, !enough, "a limit that exactly covers the fibers is short")
+	_, unread := map_count_line(0, d)
+	testing.expect(t, !unread, "an unreadable limit is called short")
+	testing.expect(t, metrics.map_count_limit() > 0, "vm.max_map_count could not be read here")
 }

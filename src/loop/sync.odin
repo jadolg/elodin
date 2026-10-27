@@ -48,6 +48,18 @@ list_push :: proc(list: ^Waiter_List, w: ^Waiter) {
 }
 
 @(private)
+list_push_front :: proc(list: ^Waiter_List, w: ^Waiter) {
+	w.prev = nil
+	w.next = list.head
+	if list.head != nil {
+		list.head.prev = w
+	} else {
+		list.tail = w
+	}
+	list.head = w
+}
+
+@(private)
 list_remove :: proc(list: ^Waiter_List, w: ^Waiter) {
 	if w.prev != nil {
 		w.prev.next = w.next
@@ -144,9 +156,16 @@ parks, the next fiber on the same thread asks for the lock and blocks the thread
 and the holder never runs again to let it go. This one parks the second fiber
 instead.
 
-Handed to waiters in order, directly: an unlock with somebody waiting passes the
-lock to the first of them rather than releasing it for whoever asks next, so a
-fiber that keeps taking and releasing it cannot starve one that waits.
+Released, not handed over: an unlock with somebody waiting frees the lock and
+wakes the first waiter, which takes it if it is still free when it runs. Handed
+over directly, the lock would stay owned by a waiter on another loop until that
+loop got round to the wake - a whole round of its other fibers - with every
+fiber that wants it, the holder's own loop's included, queued behind an owner
+that is not running: on a connection shared by every loop, a convoy. Order is
+kept all the same: a woken waiter that finds the lock taken again goes back to
+the head of the queue, not the tail, so the waiters are served in turn and a
+fiber that keeps taking and releasing it can delay the first of them but not
+pass it in the queue.
 
 Not cancellable: a lock wait always ends with the lock held. A `sync.Mutex` is
 still the right lock for anything held only across code that does not wait,
@@ -168,39 +187,30 @@ lock :: proc(m: ^Mutex) {
 	w: Waiter
 	waiter_init(&w)
 	list_push(&m.waiters, &w)
-	// Ownership is handed over by `unlock`, which sets `signalled`; nothing else
-	// ends this wait.
-	for !waiter_block(&w, &m.mu, {}, false) {
+	for {
+		// Ended only by `unlock`, which sets `signalled`.
+		for !waiter_block(&w, &m.mu, {}, false) {
+		}
+		if !m.locked {
+			m.locked = true
+			sync.mutex_unlock(&m.mu)
+			return
+		}
+		// Taken in between by somebody not queued: first in line again.
+		w.signalled = false
+		waiter_init(&w)
+		list_push_front(&m.waiters, &w)
 	}
-	sync.mutex_unlock(&m.mu)
-}
-
-try_lock :: proc(m: ^Mutex) -> bool {
-	sync.mutex_lock(&m.mu)
-	defer sync.mutex_unlock(&m.mu)
-	if m.locked {
-		return false
-	}
-	m.locked = true
-	return true
 }
 
 unlock :: proc(m: ^Mutex) {
 	sync.mutex_lock(&m.mu)
 	defer sync.mutex_unlock(&m.mu)
 	assert(m.locked, "unlocking a loop.Mutex nobody holds")
-	if w := list_pop(&m.waiters); w != nil {
-		// Stays locked: it is the waiter's now.
-		waiter_wake(w)
-		return
-	}
 	m.locked = false
-}
-
-// `lock` for the rest of the enclosing scope.
-@(deferred_in = unlock)
-lock_scope :: proc(m: ^Mutex) {
-	lock(m)
+	if w := list_pop(&m.waiters); w != nil {
+		waiter_wake(w)
+	}
 }
 
 // --- Cond ------------------------------------------------------------------------

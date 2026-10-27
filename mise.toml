@@ -136,9 +136,10 @@ run = [
 # is built and replayed without being listed here. FUZZ_TARGETS narrows it to the
 # ones named, which is how the nightly job builds only the target it runs.
 #
-# The fiber switch is assembly that `odin build` assembles and links itself, which
-# it does not do for IR, so it is assembled here and linked into every target -
-# the ones that never reach `elodin:loop` leave it unreferenced. And every
+# The fiber switch is an object `prepare` assembles and `fiber.odin` names with a
+# foreign import, which an IR build does not link, so it is assembled here and
+# linked into every target - the ones that never reach `elodin:loop` leave it
+# unreferenced. And every
 # allocation a fiber's scratch makes is a heap allocation of its own
 # (`ELODIN_SCRATCH_DEBUG`), so ASan sees a pointer kept past a reset as the
 # use-after-free it is rather than a read of reused arena.

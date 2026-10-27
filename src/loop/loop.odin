@@ -240,8 +240,10 @@ run :: proc(l: ^Loop) {
 			// otherwise wrap to a negative figure, which is no timeout at all.
 			timeout = i32(clamp((left + time.Millisecond - 1) / time.Millisecond, 0, time.Duration(max(i32))))
 		}
-		// Wake to trim, if there is anything to trim; see `trim_idle`.
-		if trim_pending(l) && (timeout < 0 || timeout > i32(TRIM_AFTER / time.Millisecond)) {
+		// Wake to trim, if there is anything to trim; see `trim_idle`. The lock
+		// `trim_pending` takes is asked for only when the answer could matter: a
+		// busy round polls without waiting, and a busy round is every round under load.
+		if (timeout < 0 || timeout > i32(TRIM_AFTER / time.Millisecond)) && trim_pending(l) {
 			timeout = i32(TRIM_AFTER / time.Millisecond)
 		}
 		n, err := epoll_wait(l.epfd, events[:], timeout)
@@ -333,15 +335,6 @@ current :: proc "contextless" () -> ^Fiber {
 		return nil
 	}
 	return l.current
-}
-
-// The handle of the running fiber, to be cancelled from elsewhere.
-current_handle :: proc "contextless" () -> Handle {
-	f := current()
-	if f == nil {
-		return {}
-	}
-	return Handle{f, f.incarnation}
 }
 
 // Whether the running fiber has been cancelled. Always false off a fiber.
@@ -703,17 +696,6 @@ park :: proc(deadline: Tick, cancellable := true) -> Wake_Reason {
 		return .Cancelled
 	}
 	return f.wake_reason
-}
-
-/*
-The token a waker must present to end the running fiber's next park.
-
-Taken before the fiber signs up anywhere and before it parks; see `park` and
-`wake`.
-*/
-park_token :: proc "contextless" () -> u64 {
-	f := current()
-	return f.token if f != nil else 0
 }
 
 /*

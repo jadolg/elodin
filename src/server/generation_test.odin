@@ -732,10 +732,13 @@ test_a_reload_of_max_pending_moves_the_racer_and_pipeline_bounds :: proc(t: ^tes
 	testing.expect(t, !out.applied, "a configuration whose validator could not be built was applied")
 	testing.expect_value(t, sync.atomic_load(&f.s.racers.limit), 100)
 
+	kept := f.s.gens.current.group
 	out = reload_from(t, f, raised)
 	testing.expect(t, out.applied, "the reload was not applied")
 	testing.expect_value(t, sync.atomic_load(&f.s.racers.limit), 3000)
 	cur := f.s.gens.current
+	// The group, and with it its connections and health, is kept.
+	testing.expect(t, cur.group == kept, "a reload of max_pending alone rebuilt the upstream group")
 	want := upstream.pipeline_outstanding(3000, cur.cfg.server.max_connections)
 	for u in cur.group.servers {
 		testing.expect_value(t, u.max_outstanding, want)

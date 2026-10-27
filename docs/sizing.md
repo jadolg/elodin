@@ -147,6 +147,22 @@ race`, `max_pending` times the servers of the widest racing group, for the race
 queries ([upstreams](upstreams.md)). Startup warns when `RLIMIT_NOFILE` is short of
 that (`LimitNOFILE=` in the systemd unit, 65536 as shipped).
 
+## Memory mappings
+
+Every query in flight, race query and connection runs on a fiber, and a fiber
+holds up to three memory mappings (its stack, the guard page under it, its
+scratch). Startup warns when `vm.max_map_count` (65530 by default) cannot hold
+all of them, which the derived figures reach on a large machine racing a wide
+group:
+
+```
+memory mappings: vm.max_map_count is 65530, short of the 163376 this configuration can want (...)
+```
+
+Past it no stack can be mapped: a query is dropped or shed and a connection
+refused as `conn_failed=`. Raise it (`sysctl vm.max_map_count=262144`) or lower
+`server.max_pending`.
+
 ## Refused and failed connections
 
 | counter | cause | what the client sees |

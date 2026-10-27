@@ -531,6 +531,39 @@ race_width :: proc(cfg: config.Upstream_Config) -> int {
 	return width
 }
 
+/*
+Memory mappings one fiber costs at most: its stack and the guard page under it,
+which `mprotect` splits in two, and its scratch arena's block.
+*/
+MAPPINGS_PER_FIBER :: 3
+
+// Mappings left for everything else: the binary, its libraries, the heap.
+MAPPING_RESERVE :: 2048
+
+/*
+Said at startup when `vm.max_map_count` cannot hold every fiber this
+configuration may run at once - each query in flight, each race leg, each
+connection, each reader - which the derived figures can pass on a large machine
+racing a wide group. Past it no stack can be mapped: a query is dropped or shed,
+a connection refused as `conn_failed=`. Quiet otherwise, and when the limit
+cannot be read.
+*/
+map_count_line :: proc(limit: int, d: Descriptor_Demand) -> (line: string, short: bool) {
+	fibers := d.max_connections + d.in_flight + d.racers + d.udp_readers + d.loops
+	wanted := fibers * MAPPINGS_PER_FIBER + MAPPING_RESERVE
+	if limit <= 0 || limit >= wanted {
+		return "", false
+	}
+	return fmt.tprintf(
+		"memory mappings: vm.max_map_count is %d, short of the %d this configuration can want (%d fibers - queries in flight, race legs, connections and readers - at %d each, and %d over). Past it a fiber cannot be started, so a query is dropped or shed and a connection refused as conn_failed=; raise vm.max_map_count (sysctl) or lower server.max_pending",
+		limit,
+		wanted,
+		fibers,
+		MAPPINGS_PER_FIBER,
+		MAPPING_RESERVE,
+	), true
+}
+
 descriptors_wanted :: proc(d: Descriptor_Demand) -> int {
 	return(
 		d.max_connections +

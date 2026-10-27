@@ -78,6 +78,21 @@ PIPELINE_OUTSTANDING_CEILING :: 1 << 15
 `Upstream.max_outstanding` for a server that may have `in_flight` queries and
 `connections` connections asking at once; see `PIPELINE_MAX_OUTSTANDING`.
 */
+/*
+Move what each of `g`'s pipelined connections may carry, for a reload that keeps
+the group - and with it its connections, health and learned idle ceilings - but
+changes what may be in flight. A connection already carrying more drains to the
+new figure as its replies come in.
+*/
+set_max_outstanding :: proc(g: ^Group, n: int) {
+	if g == nil {
+		return
+	}
+	for u in g.servers {
+		sync.atomic_store(&u.max_outstanding, n)
+	}
+}
+
 pipeline_outstanding :: proc(in_flight, connections: int) -> int {
 	return clamp(in_flight + connections, PIPELINE_MAX_OUTSTANDING, PIPELINE_OUTSTANDING_CEILING)
 }
@@ -513,7 +528,7 @@ get_pipe :: proc(
 			return nil, .Timeout
 		}
 		if u.pipe != nil {
-			switch pipe_state(u.pipe, pipe_idle_ceiling_locked(u), u.max_outstanding) {
+			switch pipe_state(u.pipe, pipe_idle_ceiling_locked(u), sync.atomic_load(&u.max_outstanding)) {
 			case .Ready:
 				c = u.pipe
 				pipe_ref(c)
@@ -1238,7 +1253,7 @@ close_pipe :: proc(u: ^Upstream, all: bool) -> (closed: int) {
 	if u.pipe == nil {
 		return 0
 	}
-	if !all && pipe_state(u.pipe, pipe_idle_ceiling_locked(u), u.max_outstanding) != .Gone {
+	if !all && pipe_state(u.pipe, pipe_idle_ceiling_locked(u), sync.atomic_load(&u.max_outstanding)) != .Gone {
 		return 0
 	}
 	c := u.pipe

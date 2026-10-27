@@ -82,6 +82,20 @@ descriptor_limit :: proc() -> int {
 	return 0
 }
 
+/*
+`vm.max_map_count`: the memory mappings this process may hold, every fiber's
+stack and guard page among them. Zero when it cannot be read.
+*/
+map_count_limit :: proc() -> int {
+	buf: [32]u8
+	text, ok := read_small_file("/proc/sys/vm/max_map_count", buf[:])
+	if !ok {
+		return 0
+	}
+	n, parsed := strconv.parse_int(strings.trim_space(text))
+	return n if parsed && n > 0 else 0
+}
+
 process_stats :: proc() -> (p: Process) {
 	p.open_fds = open_fd_count()
 	p.max_fds = i64(descriptor_limit())

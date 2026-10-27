@@ -159,20 +159,22 @@ start_listeners :: proc(s: ^Server, l: ^Listeners) -> bool {
 	Startup only - `--check` reads a different process's limit. See
 	`descriptor_limit_line`.
 	*/
+	demand := Descriptor_Demand {
+		max_connections = cfg.server.max_connections if streams else 0,
+		pooled_upstream = config.pooled_upstream_connections(cfg.upstream),
+		in_flight       = cfg.server.max_pending,
+		racers          = cfg.server.max_pending * race_width(cfg.upstream),
+		udp_readers     = cfg.listeners.udp.readers if cfg.listeners.udp.enabled else 0,
+		loops           = len(s.loops),
+	}
 	if streams || cfg.metrics.enabled {
-		if line, short := descriptor_limit_line(
-			descriptor_limit(),
-			Descriptor_Demand {
-				max_connections = cfg.server.max_connections if streams else 0,
-				pooled_upstream = config.pooled_upstream_connections(cfg.upstream),
-				in_flight = cfg.server.max_pending,
-				racers = cfg.server.max_pending * race_width(cfg.upstream),
-				udp_readers = cfg.listeners.udp.readers if cfg.listeners.udp.enabled else 0,
-				loops = len(s.loops),
-			},
-		); short {
+		if line, short := descriptor_limit_line(descriptor_limit(), demand); short {
 			logx.warnf("%s", line)
 		}
+	}
+	// The same figures, as fibers; see `map_count_line`.
+	if line, short := map_count_line(metrics.map_count_limit(), demand); short {
+		logx.warnf("%s", line)
 	}
 
 	if cfg.listeners.udp.enabled {

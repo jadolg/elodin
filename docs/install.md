@@ -151,7 +151,7 @@ rules in effect` when turned off), or keep the rules in effect;
 | `log`, `rewrites`, `special_use`, `rebind` | applied from the next query |
 | `server.allow_from`, `max_pending`, `max_udp_response`, `client_timeout` | applied from the next query or read |
 | `server.rate_limit` | a change rebuilds the limiter, so every prefix starts again from a full budget |
-| `upstream`, `cookies.upstream`, `server.max_pending` | a change rebuilds every group and route: new connections, new upstream cookies (`max_pending` sizes how many queries one pipelined upstream connection carries) |
+| `upstream`, `cookies.upstream` | a change rebuilds every group and route: new connections, new upstream cookies |
 | `cache` | resized in place; turned off or on, dropped or started empty |
 | `dnssec` | a change rebuilds the validator, which fetches its zone keys again |
 | `cookies` | applied; the secret is kept unless `cookies.secret` changes |

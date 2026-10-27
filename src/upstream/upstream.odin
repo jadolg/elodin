@@ -148,7 +148,8 @@ Upstream :: struct {
 	// `PIPELINE_MAX_OUTSTANDING`. Per upstream rather than a constant read
 	// where it is used, so a test can reach the overflow path without the
 	// hundreds of callers the shipped figure would need, and so the server can
-	// derive it from what may be in flight (`pipeline_outstanding`).
+	// derive it from what may be in flight (`pipeline_outstanding`). Atomic: a
+	// reload that keeps the group moves it (`set_max_outstanding`).
 	max_outstanding: int,
 
 	// Whether queries to this server carry a DNS cookie. The client half is

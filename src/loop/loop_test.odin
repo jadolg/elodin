@@ -521,6 +521,118 @@ test_a_mutex_held_across_a_park_does_not_stall_the_loop :: proc(t: ^testing.T) {
 	delete(s.holder.order)
 }
 
+/*
+An unlock frees a `Mutex` even when the waiter it wakes cannot run yet: here the
+waiter is a fiber on a loop another fiber is keeping busy, and the lock is free
+for anybody else the moment it is let go of, rather than owned by a waiter that
+is not running. Handed over instead, every fiber after it - on any loop - would
+queue behind that loop's round.
+*/
+@(test)
+test_an_unlocked_mutex_is_free_while_its_waiter_waits_to_run :: proc(t: ^testing.T) {
+	r, started := start(t)
+	if !started {
+		return
+	}
+	defer finish(r)
+	Shared :: struct {
+		m:        Mutex,
+		release:  bool,
+		spinning: Sema,
+		took:     Probe,
+	}
+	s: Shared
+	lock(&s.m)
+	_, _ = spawn(r.l, proc(data: rawptr) {
+		s := (^Shared)(data)
+		lock(&s.m)
+		unlock(&s.m)
+		sync.sema_post(&s.took.done)
+	}, &s)
+	// The waiter is queued once the list has it.
+	for deadline := time.tick_now(); time.tick_since(deadline) < WAIT; {
+		sync.mutex_lock(&s.m.mu)
+		queued := s.m.waiters.head != nil
+		sync.mutex_unlock(&s.m.mu)
+		if queued {
+			break
+		}
+		time.sleep(time.Millisecond)
+	}
+	// Keeps the waiter's loop from running it until told to stop.
+	_, _ = spawn(r.l, proc(data: rawptr) {
+		s := (^Shared)(data)
+		sema_post(&s.spinning)
+		for !sync.atomic_load(&s.release) {
+		}
+	}, &s)
+	testing.expect(t, sema_wait_with_timeout(&s.spinning, WAIT))
+	unlock(&s.m)
+	sync.mutex_lock(&s.m.mu)
+	free := !s.m.locked
+	sync.mutex_unlock(&s.m.mu)
+	sync.atomic_store(&s.release, true)
+	testing.expect(t, free, "the lock stayed owned by a waiter that could not run")
+	testing.expect(t, sync.sema_wait_with_timeout(&s.took.done, WAIT), "the woken waiter never took the lock")
+}
+
+/*
+Waiters are still served in the order they queued: a woken waiter that finds the
+lock taken goes back to the head, so three fibers waiting on a held lock take it
+first, second and third.
+*/
+@(test)
+test_mutex_waiters_take_the_lock_in_turn :: proc(t: ^testing.T) {
+	r, started := start(t)
+	if !started {
+		return
+	}
+	defer finish(r)
+	Shared :: struct {
+		m:     Mutex,
+		order: [dynamic]int,
+		done:  Sema,
+	}
+	s: Shared
+	Arg :: struct {
+		s:  ^Shared,
+		id: int,
+	}
+	args := [3]Arg{{&s, 1}, {&s, 2}, {&s, 3}}
+	lock(&s.m)
+	for &a in args {
+		_, _ = spawn(r.l, proc(data: rawptr) {
+			a := (^Arg)(data)
+			lock(&a.s.m)
+			append(&a.s.order, a.id)
+			unlock(&a.s.m)
+			sema_post(&a.s.done)
+		}, &a)
+		// Queued before the next is started, so the order is theirs.
+		for deadline := time.tick_now(); time.tick_since(deadline) < WAIT; {
+			sync.mutex_lock(&s.m.mu)
+			n := 0
+			for w := s.m.waiters.head; w != nil; w = w.next {
+				n += 1
+			}
+			sync.mutex_unlock(&s.m.mu)
+			if n == a.id {
+				break
+			}
+			time.sleep(time.Millisecond)
+		}
+	}
+	unlock(&s.m)
+	for _ in 0 ..< 3 {
+		testing.expect(t, sema_wait_with_timeout(&s.done, WAIT))
+	}
+	testing.expect_value(t, len(s.order), 3)
+	if len(s.order) == 3 {
+		testing.expect(t, s.order[0] == 1 && s.order[1] == 2 && s.order[2] == 3, "waiters took the lock out of turn")
+	}
+	delete(s.order)
+}
+
 // A fiber waiting on a `Cond` is woken by a plain thread signalling it.
 @(test)
 test_a_cond_wakes_a_fiber_from_another_thread :: proc(t: ^testing.T) {
