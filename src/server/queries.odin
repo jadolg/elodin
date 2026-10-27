@@ -116,8 +116,7 @@ next_loop :: proc(s: ^Server) -> ^loop.Loop {
 /*
 Whether this server can start a query nobody waits on, such as a refresh: on a
 loop, or with loops of its own to put one on. A `Server` built as a literal and
-driven from a test's own thread has neither, and does what this server did before
-refreshes were detached - serves what it has.
+driven from a test's own thread has neither, and serves what it has.
 */
 can_detach :: proc(s: ^Server) -> bool {
 	return loop.current_loop() != nil || len(s.loops) > 0

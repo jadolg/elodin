@@ -252,7 +252,7 @@ h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 			}
 			h2.conn_unref(hc)
 			free(job)
-			h2_shed(ctx, hc, req, max_pending)
+			h2_shed(ctx, hc, req, max_pending, spawn_failed = true)
 			return
 		}
 		// No loop to start it on - a `Server` built as a literal, driven from a
@@ -282,7 +282,15 @@ Nothing is freed here beyond the request: this runs on the arena `h2.serve` is
 still working through, which is also why it is not reached through `h2_job`.
 */
 @(private)
-h2_shed :: proc(ctx: ^H2_Context, hc: ^h2.Conn, req: ^h2.Request, max_pending: int) {
+h2_shed :: proc(
+	ctx: ^H2_Context,
+	hc: ^h2.Conn,
+	req: ^h2.Request,
+	max_pending: int,
+	// Whether the bound was not what refused it: a stack that could not be
+	// mapped, which raising `max_pending` would only make more of.
+	spawn_failed := false,
+) {
 	// Counted as a query the server dropped only when it was going to be one. A
 	// request for some other path was never going to reach the resolver, and
 	// `dropped` counts refused queries rather than turned-away streams.
@@ -293,17 +301,25 @@ h2_shed :: proc(ctx: ^H2_Context, hc: ^h2.Conn, req: ^h2.Request, max_pending: i
 	/*
 	Logged whatever the path, which the counter above is not: dropped= is a
 	figure about queries, and this is the line that says a 503 came from the
-	in-flight bound rather than from a broken endpoint. Without it a shed off the DoH
-	path leaves no trace anywhere at all.
+	in-flight bound, or from a stack the OS would not map, rather than from a
+	broken endpoint - and which, since the two want opposite remedies. Without it
+	a shed off the DoH path leaves no trace anywhere at all.
 
 	Nothing is released after it: `h2.serve` resets this arena between frames,
 	which is the same reason `h2_error` can format on this fiber.
 	*/
-	logx.debugf(
-		"doh/h2: shedding a request from %s, server.max_pending (%d) is reached",
-		ctx.client,
-		max_pending,
-	)
+	if spawn_failed {
+		logx.debugf(
+			"doh/h2: shedding a request from %s, the OS would not map a stack for it; check the memory limits and vm.max_map_count",
+			ctx.client,
+		)
+	} else {
+		logx.debugf(
+			"doh/h2: shedding a request from %s, server.max_pending (%d) is reached",
+			ctx.client,
+			max_pending,
+		)
+	}
 	h2.respond(hc, req.stream_id, h2.Response{status = 503})
 	h2.request_destroy(hc, req)
 }

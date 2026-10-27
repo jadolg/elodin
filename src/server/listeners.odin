@@ -331,9 +331,9 @@ Udp_Reader :: struct {
 
 	So the socket closes as soon as nothing will read or answer on it - at
 	shutdown, once the reader has stopped and its last query has answered,
-	rather than after every client connection has drained, which left the port
-	bound and unread for up to `client_timeout` and clients waiting out their
-	own timeouts where a closed port would have refused them at once. And never
+	rather than after every client connection has drained, which would leave the
+	port bound and unread for up to `client_timeout` and clients waiting out their
+	own timeouts where a closed port refuses them at once. And never
 	before: a query answers on the socket its datagram came in on, and a number
 	closed under it goes to the next socket opened.
 	*/

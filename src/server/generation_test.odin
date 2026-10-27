@@ -743,6 +743,39 @@ test_a_reload_of_max_pending_moves_the_racer_and_pipeline_bounds :: proc(t: ^tes
 }
 
 @(test)
+test_a_pipelined_connection_carries_every_racer_the_budget_allows :: proc(t: ^testing.T) {
+	/*
+	The racer budget is `max_pending` legs per member of the widest racing group,
+	and the legs a race leaves behind all ask the one member slow to answer, so a
+	connection to it has to carry the whole budget beside the queries that are
+	not racing - or the callers past it dial a connection per query. Few
+	connections, so the table does not cover the shortfall by itself.
+	*/
+	text := swap(
+		swap(BASE, "server:\n", "server:\n  max_pending: 100\n  max_connections: 8\n"),
+		`servers: ["127.0.0.1:1"]`,
+		`strategy: race, servers: ["127.0.0.1:1", "127.0.0.1:2", "127.0.0.1:3"]`,
+	)
+	f, ok := boot_fixture(t, "racer-pipeline", text)
+	if !ok {
+		return
+	}
+	defer close_fixture(f)
+	cur := f.s.gens.current
+	budget := sync.atomic_load(&f.s.racers.limit)
+	testing.expect_value(t, budget, 300)
+	for u in cur.group.servers {
+		testing.expectf(
+			t,
+			u.max_outstanding >= cur.cfg.server.max_pending + budget,
+			"a connection carries %d, short of the %d racers and queries that may ask it",
+			u.max_outstanding,
+			cur.cfg.server.max_pending + budget,
+		)
+	}
+}
+
+@(test)
 test_a_reload_that_adds_a_list_keeps_each_lists_history :: proc(t: ^testing.T) {
 	/*
 	Through `reload_config`, so it is the reload that moves the history: a list

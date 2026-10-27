@@ -347,10 +347,9 @@ locals_used: int
 /*
 Make a thread-local per fiber instead.
 
-Some state is per request and is kept in a thread-local because the request used
-to run on one thread from start to finish: the generation a query pinned
-(`server.pin`), whether it is a prefetch. On a loop thread many requests take
-turns, so each fiber keeps its own copy: the value is saved when the fiber parks
+Some state is per request and is kept in a thread-local rather than passed down
+through every call that reads it: the generation a query pinned (`server.pin`),
+whether it is a prefetch. On a loop thread many requests take turns, so each fiber keeps its own copy: the value is saved when the fiber parks
 and put back when it runs, and the loop thread sees zero in between.
 
 `address` returns the calling thread's instance of the variable - an `@(thread_local)`

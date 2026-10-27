@@ -339,10 +339,11 @@ build_upstreams :: proc(s: ^Server, l: ^Live) -> bool {
 	/*
 	A race's losers run on after their query has gone and its place in
 	`max_pending` has been taken by another, so where any group races, its
-	racers - up to `max_pending` more, the budget below - may be asking an
-	upstream beside the queries that are.
+	racers - up to the budget `build_live` sets, `max_pending` legs per member of
+	the widest racing group - may be asking one upstream beside the queries that
+	are: a member slow to answer is the one whose legs every race leaves behind.
 	*/
-	in_flight := cfg.server.max_pending * (2 if race_width(cfg.upstream) > 0 else 1)
+	in_flight := cfg.server.max_pending * (1 + race_width(cfg.upstream))
 	outstanding := upstream.pipeline_outstanding(in_flight, cfg.server.max_connections)
 	// The budget's figure is set by `build_live` once the whole generation is built.
 	group, gerr := upstream.make_group(

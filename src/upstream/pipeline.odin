@@ -56,8 +56,9 @@ has to sit above every number of callers the server can actually put in
 That number is what may be in flight: every query a fiber of its own runs
 (`server.max_pending`) and every connection's (`server.max_connections`), all of
 which may be calling `exchange` on the same upstream at once, and under a race
-the losers still running after their queries have gone, up to `max_pending`
-more. So the figure is derived from those (`pipeline_outstanding`), and this is
+every leg the racer budget allows, `max_pending` per member of the widest racing
+group, each of which may be the one left asking a slow member after its query has
+gone. So the figure is derived from those (`pipeline_outstanding`), and this is
 its floor.
 
 Which leaves the bound doing what it was asked to do and nothing else: a server
