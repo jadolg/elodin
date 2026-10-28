@@ -79,11 +79,11 @@ func main() {
 	ca := flag.String("ca", "", "PEM certificate DoT trusts: the one the server under test presents")
 	flag.Parse()
 
-	if c.transport == "dot" {
+	if c.transport == "dot" || c.transport == "handshake" {
 		pem, err := os.ReadFile(*ca)
 		c.roots = x509.NewCertPool()
 		if err != nil || !c.roots.AppendCertsFromPEM(pem) {
-			fmt.Fprintln(os.Stderr, "loadgen: dot needs -ca, the server's certificate in PEM")
+			fmt.Fprintf(os.Stderr, "loadgen: %s needs -ca, the server's certificate in PEM\n", c.transport)
 			os.Exit(2)
 		}
 	}
@@ -571,9 +571,12 @@ func runHandshake(c config) (Result, error) {
 				t0 := time.Now()
 				// Bounded for the reason `dialDoT` gives: a server at its cap can
 				// accept and never handshake, and the phase would never end.
+				// Checked as `dialDoT` checks it: verifying is the client's CPU,
+				// not the server's, and the handshake under test is the same.
 				conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", c.server, &tls.Config{
-					InsecureSkipVerify: true,
-					NextProtos:         []string{"dot"},
+					RootCAs:    c.roots,
+					MinVersion: tls.VersionTLS12,
+					NextProtos: []string{"dot"},
 					// A resumed session would measure the wrong thing.
 					ClientSessionCache: nil,
 				})
