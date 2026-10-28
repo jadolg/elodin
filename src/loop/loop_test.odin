@@ -1151,6 +1151,60 @@ test_a_reader_that_never_waits_yields_by_itself :: proc(t: ^testing.T) {
 }
 
 /*
+A socket call that returns without waiting still counts as a turn. A cancelled
+fiber's read returns `Would_Block` at once, as one on a descriptor epoll will not
+take does, and the read and accept loops retry on exactly that: without the turn,
+such a loop holds its loop for as long as the cause lasts, and the fiber started
+beside it never runs.
+*/
+@(test)
+test_a_read_that_cannot_wait_still_takes_its_turn :: proc(t: ^testing.T) {
+	rx, rerr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, rerr == nil, "cannot bind: %v", rerr) {
+		return
+	}
+	defer net.close(rx)
+	_ = net.set_blocking(rx, false)
+	r, started := start(t)
+	if !started {
+		return
+	}
+	defer finish(r)
+	Shared :: struct {
+		p:         Probe,
+		rx:        net.UDP_Socket,
+		other_ran: bool,
+		// Read before the fiber finishes, which lets the other one run anyway.
+		in_time:   bool,
+		blocked:   bool,
+	}
+	s := Shared {
+		rx = rx,
+	}
+	_, _ = spawn(r.l, proc(data: rawptr) {
+		s := (^Shared)(data)
+		_, _ = spawn(current_loop(), proc(data: rawptr) {
+			(^Shared)(data).other_ran = true
+		}, s)
+		f := current()
+		cancel(Handle{f, f.incarnation})
+		buf: [8]u8
+		for _ in 0 ..< 2 * TURN_BATCH {
+			if s.other_ran {
+				break
+			}
+			_, _, err := recv_udp(s.rx, buf[:])
+			s.blocked = err == .Would_Block
+		}
+		s.in_time = s.other_ran
+		sync.sema_post(&s.p.done)
+	}, &s)
+	testing.expect(t, sync.sema_wait_with_timeout(&s.p.done, WAIT))
+	testing.expect(t, s.blocked, "a cancelled read did not return Would_Block")
+	testing.expect(t, s.in_time, "a read loop that could not wait held its loop")
+}
+
+/*
 A cancelled fiber waiting on a cond in the usual loop - `for !ready { cond_wait }`
 - parks until it is signalled, rather than having every wait return at once and
 spinning its loop: the fiber that would signal it is on the same loop, and a spin

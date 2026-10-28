@@ -110,6 +110,22 @@ test_every_line_is_logfmt :: proc(t: ^testing.T) {
 	testing.expect(t, strings.has_prefix(after_stamp(t, lines[13]), "level=warn msg=xxxx"), "the cut-short line lost its record")
 	testing.expectf(t, len(lines[13]) < LINE_BUFFER, "the cut-short line is %d bytes, past the stack buffer", len(lines[13]))
 	testing.expect_value(t, after_stamp(t, lines[14]), "level=warn msg=after")
+
+	// A quoted message cut short keeps its closing quote: a line that ends inside
+	// a quoted value is no record to a logfmt reader. Control bytes render four
+	// bytes each, so even the message `render` cut to its buffer is past the line's.
+	{
+		escaped := strings.repeat("\x01", LINE_BUFFER, context.temp_allocator)
+		context.temp_allocator = refusing_allocator()
+		warnf("%s", escaped)
+	}
+	lines = log_lines(t, path)
+	if !testing.expectf(t, len(lines) == 16, "%d lines after the quoted one, want 16", len(lines)) {
+		return
+	}
+	cut := after_stamp(t, lines[15])
+	testing.expect(t, strings.has_prefix(cut, `level=warn msg="\x01\x01`), "the cut-short quoted line lost its record")
+	testing.expect(t, strings.has_suffix(cut, `\x01"`), "the cut-short line ends inside its quoted message")
 }
 
 // An allocator with nothing to give, as a fiber's scratch is once the OS will

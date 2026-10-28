@@ -153,8 +153,15 @@ write_line :: proc(level: Level, msg: string, fields: string) {
 		if s := strings.to_string(long); len(s) > LINE_BUFFER && s[len(s) - 1] == '\n' {
 			line = s
 		} else {
-			// Cut short, but still one record.
-			buf[LINE_BUFFER - 1] = '\n'
+			/*
+			Cut short, but still one record: the message cut to what fits even
+			quoted at its widest, and the fields left off. Cutting the rendered
+			line instead can end it inside a quoted value, which no logfmt reader
+			takes as a record.
+			*/
+			b = strings.builder_from_bytes(buf[:])
+			write_record(&b, now, stamp, level, msg[:min(len(msg), CUT_MESSAGE)], "")
+			line = strings.to_string(b)
 		}
 	}
 
@@ -190,6 +197,12 @@ full-length name is a few hundred bytes.
 LINE_BUFFER :: 2048
 @(private)
 PART_BUFFER :: 1024
+/*
+The message bytes a cut-short record keeps: four rendered bytes each at most
+(`\x7f`), and the timestamp, level and quotes beside them, inside `LINE_BUFFER`.
+*/
+@(private)
+CUT_MESSAGE :: LINE_BUFFER / 4 - 64
 
 /*
 `format` rendered into `buf`, or, when it does not fit, on the temp allocator -

@@ -78,6 +78,11 @@ socket_deadline :: proc(fd: linux.Fd, option: linux.Socket_Option, start: Tick) 
 Wait for `fd` until the deadline the socket option gives, computed once. False
 when the wait ended without the descriptor becoming ready: a timeout, a
 cancellation, or a descriptor epoll will not take.
+
+A wait that ends without parking - the deadline already spent, the fiber
+cancelled, epoll refusing the descriptor - counts as a turn, as a completed call
+does: the read and accept loops retry on `Would_Block`, and a retry that never
+parks would otherwise hold the loop for as long as the cause lasts.
 */
 @(private)
 socket_wait :: proc(
@@ -93,9 +98,18 @@ socket_wait :: proc(
 		armed^ = true
 	}
 	if deadline^ != (Tick{}) && time.tick_diff(time.tick_now(), deadline^) <= 0 {
+		take_turn()
 		return false
 	}
-	return wait_fd(fd, events, deadline^) == .Ready
+	switch wait_fd(fd, events, deadline^) {
+	case .Ready:
+		return true
+	case .Cancelled, .Failed:
+		// Either may return without parking; one that parked has its count reset.
+		take_turn()
+	case .Timeout:
+	}
+	return false
 }
 
 recv_tcp :: proc(socket: net.TCP_Socket, buf: []u8) -> (int, net.TCP_Recv_Error) {
