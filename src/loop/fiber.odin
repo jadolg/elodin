@@ -178,6 +178,7 @@ when ASAN {
 	foreign _ {
 		__sanitizer_start_switch_fiber :: proc(fake_stack_save: ^rawptr, bottom: rawptr, size: uint) ---
 		__sanitizer_finish_switch_fiber :: proc(fake_stack_save: rawptr, bottom_old: ^rawptr, size_old: ^uint) ---
+		__asan_unpoison_memory_region :: proc(addr: rawptr, size: uint) ---
 	}
 }
 
@@ -199,6 +200,15 @@ stack_map :: proc() -> (s: Stack, ok: bool) {
 @(private)
 stack_unmap :: proc(s: Stack) {
 	if s.base != nil {
+		/*
+		The frame a fiber leaves on its stack for good - `fiber_entry`'s, which
+		never returns - leaves its redzones poisoned, and a raw `munmap` is one
+		AddressSanitizer never sees. The next stack of this size is mapped at the
+		same addresses, and its locals would sit on that stale poison.
+		*/
+		when ASAN {
+			__asan_unpoison_memory_region(rawptr(uintptr(s.base) + PAGE), s.size - PAGE)
+		}
 		linux.munmap(s.base, s.size)
 	}
 }
