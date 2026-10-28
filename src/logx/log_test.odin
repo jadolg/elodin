@@ -142,6 +142,35 @@ test_every_line_is_logfmt :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, utf8.valid_string(lines[16]), "a cut-short line split a rune")
 	testing.expect(t, strings.has_suffix(lines[16], `"`), "the cut-short multibyte line ends inside its quoted message")
+
+	// A record that exactly fills the line buffer is whole, and keeps its fields.
+	eventf(.Info, "exact", "pad=%s", "x")
+	lines = log_lines(t, path)
+	if !testing.expectf(t, len(lines) == 18, "%d lines after the probe, want 18", len(lines)) {
+		return
+	}
+	// The probe's length less its one-byte pad, and one for the newline.
+	pad := strings.repeat("x", LINE_BUFFER - (len(lines[17]) - 1) - 1, context.temp_allocator)
+	eventf(.Info, "exact", "pad=%s", pad)
+	lines = log_lines(t, path)
+	if !testing.expectf(t, len(lines) == 19, "%d lines after the exact one, want 19", len(lines)) {
+		return
+	}
+	testing.expect_value(t, len(lines[18]) + 1, LINE_BUFFER)
+	testing.expect_value(t, after_stamp(t, lines[18]), strings.concatenate({"level=info msg=exact pad=", pad}, context.temp_allocator))
+
+	// Fields cut short for want of memory are left off, as on the cut-short
+	// record: cut, they would end inside their quoted value.
+	{
+		quoted := strings.concatenate({`"`, strings.repeat("y", 2 * PART_BUFFER, context.temp_allocator), `"`}, context.temp_allocator)
+		context.temp_allocator = refusing_allocator()
+		eventf(.Info, "cut", "name=%s", quoted)
+	}
+	lines = log_lines(t, path)
+	if !testing.expectf(t, len(lines) == 20, "%d lines after the cut fields, want 20", len(lines)) {
+		return
+	}
+	testing.expect_value(t, after_stamp(t, lines[19]), "level=info msg=cut")
 }
 
 // An allocator with nothing to give, as a fiber's scratch is once the OS will

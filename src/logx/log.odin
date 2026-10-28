@@ -150,7 +150,8 @@ write_line :: proc(level: Level, msg: string, fields: string) {
 	if len(line) == LINE_BUFFER {
 		long := strings.builder_make(context.temp_allocator)
 		write_record(&long, now, stamp, level, msg, fields)
-		if s := strings.to_string(long); len(s) > LINE_BUFFER && s[len(s) - 1] == '\n' {
+		// At least, not past: a record that exactly fills the buffer is whole.
+		if s := strings.to_string(long); len(s) >= LINE_BUFFER && s[len(s) - 1] == '\n' {
 			line = s
 		} else {
 			/*
@@ -213,17 +214,21 @@ as it grows. The lines that matter most are written at the moment the OS stops
 mapping memory - a connection refused because no stack could be mapped - and
 most of those are said once (`report_once`), so a line rendered on the scratch
 there would come out empty and be gone for good.
+
+`whole` is false for the cut: a field list cut there can end inside a quoted
+value, which the caller leaves off rather than write, as `write_line` does.
 */
 @(private)
-render :: proc(buf: []u8, format: string, args: ..any) -> string {
-	s := fmt.bprintf(buf, format, ..args)
+render :: proc(buf: []u8, format: string, args: ..any) -> (s: string, whole: bool) {
+	s = fmt.bprintf(buf, format, ..args)
 	if len(s) < len(buf) {
-		return s
+		return s, true
 	}
-	if long := fmt.tprintf(format, ..args); len(long) > len(s) {
-		return long
+	// At least as long: a rendering that exactly fills `buf` is whole too.
+	if long := fmt.tprintf(format, ..args); len(long) >= len(s) {
+		return long, true
 	}
-	return cut_runes(s, len(s))
+	return cut_runes(s, len(s)), false
 }
 
 /*
@@ -265,7 +270,8 @@ emit :: proc(level: Level, format: string, args: ..any) {
 		return
 	}
 	msg: [PART_BUFFER]u8
-	write_line(level, render(msg[:], format, ..args), "")
+	m, _ := render(msg[:], format, ..args)
+	write_line(level, m, "")
 }
 
 /*
@@ -282,7 +288,8 @@ eventf :: proc(level: Level, msg: string, format: string, args: ..any) {
 		return
 	}
 	fields: [PART_BUFFER]u8
-	write_line(level, msg, render(fields[:], format, ..args))
+	f, whole := render(fields[:], format, ..args)
+	write_line(level, msg, f if whole else "")
 }
 
 /*
@@ -345,7 +352,8 @@ warnf_held :: proc(held: u64, format: string, args: ..any) {
 	}
 	msg: [PART_BUFFER]u8
 	count: [32]u8
-	write_line(.Warn, render(msg[:], format, ..args), fmt.bprintf(count[:], "held=%d", held))
+	m, _ := render(msg[:], format, ..args)
+	write_line(.Warn, m, fmt.bprintf(count[:], "held=%d", held))
 }
 
 /*
@@ -378,7 +386,8 @@ gated_warnf_from :: proc(g: ^Gate, client: string, format: string, args: ..any) 
 	f := strings.builder_from_bytes(from[:])
 	strings.write_string(&f, "client=")
 	write_quoted(&f, client)
-	write_line(.Debug, render(msg[:], format, ..args), strings.to_string(f))
+	m, _ := render(msg[:], format, ..args)
+	write_line(.Debug, m, strings.to_string(f))
 }
 
 debugf :: proc(format: string, args: ..any) {

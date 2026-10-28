@@ -1144,7 +1144,9 @@ Formats nothing out of the scratch, since the HTTP/2 caller's holds the frame
 */
 @(private)
 report_query_spawn_failure :: proc(proto: Protocol) {
-	if say, _ := report_once(&query_spawn_reported, false); !say {
+	// `first`, not `say`: readers on several loops fail together, and only the
+	// one that turned the flag may speak.
+	if _, first := report_once(&query_spawn_reported, false); !first {
 		return
 	}
 	logx.warnf(
