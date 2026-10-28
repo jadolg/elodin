@@ -138,32 +138,24 @@ it as a key.
 @(private)
 write_line :: proc(level: Level, msg: string, fields: string) {
 	now := time.now()
-	buf: [64]u8
-	stamp := time.to_string_hms(now, buf[:])
-	y, m, d := time.date(now)
+	stamp_buf: [64]u8
+	stamp := time.to_string_hms(now, stamp_buf[:])
 
-	line: string
-	if fields == "" {
-		line = fmt.tprintf(
-			"ts=%04d-%02d-%02dT%sZ level=%s msg=%s\n",
-			y,
-			int(m),
-			d,
-			stamp,
-			level_tag(level),
-			quote(msg),
-		)
-	} else {
-		line = fmt.tprintf(
-			"ts=%04d-%02d-%02dT%sZ level=%s msg=%s %s\n",
-			y,
-			int(m),
-			d,
-			stamp,
-			level_tag(level),
-			quote(msg),
-			fields,
-		)
+	// On the stack first, so a line goes out when there is no memory to render
+	// it in - which is when the lines about memory are written. See `render`.
+	buf: [LINE_BUFFER]u8
+	b := strings.builder_from_bytes(buf[:])
+	write_record(&b, now, stamp, level, msg, fields)
+	line := strings.to_string(b)
+	if len(line) == LINE_BUFFER {
+		long := strings.builder_make(context.temp_allocator)
+		write_record(&long, now, stamp, level, msg, fields)
+		if s := strings.to_string(long); len(s) > LINE_BUFFER && s[len(s) - 1] == '\n' {
+			line = s
+		} else {
+			// Cut short, but still one record.
+			buf[LINE_BUFFER - 1] = '\n'
+		}
 	}
 
 	sync.mutex_lock(&state.mu)
@@ -178,6 +170,50 @@ write_line :: proc(level: Level, msg: string, fields: string) {
 }
 
 @(private)
+write_record :: proc(b: ^strings.Builder, now: time.Time, stamp: string, level: Level, msg: string, fields: string) {
+	y, m, d := time.date(now)
+	fmt.sbprintf(b, "ts=%04d-%02d-%02dT%sZ level=%s msg=", y, int(m), d, stamp, level_tag(level))
+	write_quoted(b, msg)
+	if fields != "" {
+		strings.write_byte(b, ' ')
+		strings.write_string(b, fields)
+	}
+	strings.write_byte(b, '\n')
+}
+
+/*
+The longest record, and the longest message or field list, rendered without
+allocating. Every line this server writes fits: a query line naming a
+full-length name is a few hundred bytes.
+*/
+@(private)
+LINE_BUFFER :: 2048
+@(private)
+PART_BUFFER :: 1024
+
+/*
+`format` rendered into `buf`, or, when it does not fit, on the temp allocator -
+and cut to `buf` when that has nothing to give either.
+
+On a fiber the temp allocator is the fiber's scratch, whose blocks are mapped
+as it grows. The lines that matter most are written at the moment the OS stops
+mapping memory - a connection refused because no stack could be mapped - and
+most of those are said once (`report_once`), so a line rendered on the scratch
+there would come out empty and be gone for good.
+*/
+@(private)
+render :: proc(buf: []u8, format: string, args: ..any) -> string {
+	s := fmt.bprintf(buf, format, ..args)
+	if len(s) < len(buf) {
+		return s
+	}
+	if long := fmt.tprintf(format, ..args); len(long) > len(s) {
+		return long
+	}
+	return s
+}
+
+@(private)
 emit :: proc(level: Level, format: string, args: ..any) {
 	// Before the formatting, not after: at debug level off and `log.queries`
 	// on, this is the only thing standing between the hot path and a rendered
@@ -185,7 +221,8 @@ emit :: proc(level: Level, format: string, args: ..any) {
 	if !enabled(level) {
 		return
 	}
-	write_line(level, fmt.tprintf(format, ..args), "")
+	msg: [PART_BUFFER]u8
+	write_line(level, render(msg[:], format, ..args), "")
 }
 
 /*
@@ -201,7 +238,8 @@ eventf :: proc(level: Level, msg: string, format: string, args: ..any) {
 	if !enabled(level) {
 		return
 	}
-	write_line(level, msg, fmt.tprintf(format, ..args))
+	fields: [PART_BUFFER]u8
+	write_line(level, msg, render(fields[:], format, ..args))
 }
 
 /*
@@ -262,7 +300,9 @@ warnf_held :: proc(held: u64, format: string, args: ..any) {
 	if !enabled(.Warn) {
 		return
 	}
-	write_line(.Warn, fmt.tprintf(format, ..args), fmt.tprintf("held=%d", held))
+	msg: [PART_BUFFER]u8
+	count: [32]u8
+	write_line(.Warn, render(msg[:], format, ..args), fmt.bprintf(count[:], "held=%d", held))
 }
 
 /*
@@ -291,7 +331,11 @@ gated_warnf_from :: proc(g: ^Gate, client: string, format: string, args: ..any) 
 	if !enabled(.Debug) {
 		return
 	}
-	write_line(.Debug, fmt.tprintf(format, ..args), fmt.tprintf("client=%s", quote(client)))
+	msg, from: [PART_BUFFER]u8
+	f := strings.builder_from_bytes(from[:])
+	strings.write_string(&f, "client=")
+	write_quoted(&f, client)
+	write_line(.Debug, render(msg[:], format, ..args), strings.to_string(f))
 }
 
 debugf :: proc(format: string, args: ..any) {
@@ -325,30 +369,40 @@ quote :: proc(s: string) -> string {
 		return s
 	}
 	b := strings.builder_make(context.temp_allocator)
-	strings.write_byte(&b, '"')
+	write_quoted(&b, s)
+	return strings.to_string(b)
+}
+
+// `quote`, into a builder the caller holds.
+@(private)
+write_quoted :: proc(b: ^strings.Builder, s: string) {
+	if !needs_quoting(s) {
+		strings.write_string(b, s)
+		return
+	}
+	strings.write_byte(b, '"')
 	for i in 0 ..< len(s) {
 		switch c := s[i]; c {
 		case '"', '\\':
-			strings.write_byte(&b, '\\')
-			strings.write_byte(&b, c)
+			strings.write_byte(b, '\\')
+			strings.write_byte(b, c)
 		case '\n':
-			strings.write_string(&b, "\\n")
+			strings.write_string(b, "\\n")
 		case '\r':
-			strings.write_string(&b, "\\r")
+			strings.write_string(b, "\\r")
 		case '\t':
-			strings.write_string(&b, "\\t")
+			strings.write_string(b, "\\t")
 		case:
 			// Bytes above 0x7f are the continuation of a UTF-8 rune and go
 			// through as they are; the rest of the control range does not.
 			if c < 0x20 || c == 0x7f {
-				fmt.sbprintf(&b, "\\x%02x", c)
+				fmt.sbprintf(b, "\\x%02x", c)
 			} else {
-				strings.write_byte(&b, c)
+				strings.write_byte(b, c)
 			}
 		}
 	}
-	strings.write_byte(&b, '"')
-	return strings.to_string(b)
+	strings.write_byte(b, '"')
 }
 
 @(private)
