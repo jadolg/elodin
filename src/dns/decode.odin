@@ -2,6 +2,7 @@ package dns
 
 import "core:mem"
 import "core:sync"
+import "elodin:loop"
 
 Decode_Error :: enum u8 {
 	None,
@@ -153,6 +154,21 @@ one takes a slot, and an ordinary query never comes near one.
 REQUEST_ORDINARY_DECODE :: 256 * 1024
 
 /*
+How much a request may decode between turns of its loop.
+
+Decoding is CPU that never waits, and a fiber is never preempted: a reading of
+an answer built to expand - thousands of records whose names are two-byte
+pointers to a long one - holds its loop for the whole of it, every other query
+on the loop behind it, cache hits included. Measured here at 0.44 µs per KiB
+charged (release build), one reading of such an answer is ~280 µs at
+`NAME_BUDGET` and the several readings one answer gets came to ~2 ms. This many
+bytes is ~28 µs, against ~1 µs a turn costs, the same order as DNSSEC's
+`VERIFICATIONS_PER_TURN`. An ordinary answer decodes a few KiB and never gets
+here.
+*/
+DECODE_BYTES_PER_TURN :: 64 * 1024
+
+/*
 Requests past `REQUEST_ORDINARY_DECODE` that may be in flight at once, and how
 many are; a `limit` of zero is none, which is every process that never sets one
 - the tests, the fuzz targets. The process keeps one of these (`heavy`), set
@@ -213,6 +229,11 @@ charge_against :: proc(h: ^Heavy_Slots, spent: ^int, n: int) -> bool {
 		return false
 	}
 	spent^ = after
+	// Crossing a step is a turn for the rest of the loop; see
+	// `DECODE_BYTES_PER_TURN`. Off a fiber it does nothing.
+	if after / DECODE_BYTES_PER_TURN != before / DECODE_BYTES_PER_TURN {
+		loop.yield()
+	}
 	return after <= REQUEST_DECODE_BUDGET
 }
 

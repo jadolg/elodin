@@ -54,10 +54,11 @@ signature checks, TLS handshakes - is done inline, so a loop at 100% of its core
 is the ceiling, and adding loops past the cores does not raise it. Nothing
 preempts a fiber the way the kernel preempts a thread, so the long stretches of
 CPU give the loop a turn as they go: DNSSEC validation every fourth signature
-check and every ~100 µs of NSEC3 hashing, and a reader every 64 messages it
-reads without waiting. Between turns a validating query holds its loop for a
-few hundred microseconds at most, where the whole of its DNSSEC allowance is a
-few milliseconds.
+check and every ~100 µs of NSEC3 hashing, decoding every 64 KiB of names a query
+expands (an answer built to expand is ~2 ms of decoding; an ordinary one never
+reaches 64 KiB), and a reader every 64 messages it reads without waiting.
+Between turns a validating query holds its loop for a few hundred microseconds
+at most, where the whole of its DNSSEC allowance is a few milliseconds.
 
 ## Queries in flight
 
