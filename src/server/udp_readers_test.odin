@@ -367,6 +367,9 @@ test_a_refused_start_drops_the_datagram_and_keeps_the_reader :: proc(t: ^testing
 			return
 		}
 	}
+	// And said, once, at warn: dropped= alone reads as the in-flight bound, whose
+	// remedy - raising max_pending - is the wrong one here.
+	testing.expect(t, sync.atomic_load(&query_spawn_reported), "a query refused a stack was not reported")
 }
 
 /*

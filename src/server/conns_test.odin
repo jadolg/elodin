@@ -45,16 +45,16 @@ wait_for_reap :: proc(cm: ^Conn_Manager, want: int) -> int {
 }
 
 /*
-Reaping a listener loop must take it off the permanent tally too.
+A listener loop that leaves takes itself off the permanent tally too.
 
 The loops are excluded from the connection limit by being counted separately
-and subtracted. `reap_locked` removed a finished thread from the list without
-touching that count, so once a loop had been reaped the subtraction was against
-a number that no longer described anything: the total goes negative, and the
-limit stops holding for as many connections as there were loops.
+and subtracted, so an entry that left the table without moving that count would
+leave the subtraction against a number that no longer describes anything: the
+total goes negative, and the limit stops holding for as many connections as there
+were loops.
 */
 @(test)
-test_reaping_a_permanent_thread_keeps_the_count_honest :: proc(t: ^testing.T) {
+test_a_permanent_entry_leaving_keeps_the_count_honest :: proc(t: ^testing.T) {
 	cm: Conn_Manager
 	// No per-prefix share, which is this case's subject: the total limit alone.
 	conn_manager_init(&cm, 1, 0)
@@ -74,8 +74,8 @@ test_reaping_a_permanent_thread_keeps_the_count_honest :: proc(t: ^testing.T) {
 	And the refusal says which of the two it was.
 
 	`Limit_Reached` and `Spawn_Failed` ask an operator for opposite things -
-	raise the limit, or find out what stopped the OS giving this process a
-	thread - so the accept loop counts and reports them apart. A boolean could
+	raise the limit, or find out what stopped the OS mapping this process a
+	fiber's stack - so the accept loop counts and reports them apart. A boolean could
 	not tell them apart, and named `max_connections` for both.
 	*/
 	testing.expect_value(t, conn_spawn(&cm, &held, holds_until_released), Spawn_Result.Limit_Reached)

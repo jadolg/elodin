@@ -569,7 +569,9 @@ func runHandshake(c config) (Result, error) {
 			local := make([]time.Duration, 0, 1<<10)
 			for time.Now().Before(deadline) {
 				t0 := time.Now()
-				conn, err := tls.Dial("tcp", c.server, &tls.Config{
+				// Bounded for the reason `dialDoT` gives: a server at its cap can
+				// accept and never handshake, and the phase would never end.
+				conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", c.server, &tls.Config{
 					InsecureSkipVerify: true,
 					NextProtos:         []string{"dot"},
 					// A resumed session would measure the wrong thing.

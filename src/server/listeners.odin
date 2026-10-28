@@ -819,6 +819,7 @@ udp_loop :: proc(data: rawptr) {
 				break reading
 			}
 			sync.atomic_add(&ctx.server.stats.dropped, 1)
+			report_query_spawn_failure(.UDP)
 		}
 	}
 	// `ctx` is not released here: queries started above still hold it, and they
@@ -1125,6 +1126,34 @@ spawn_failure_limit :: proc(why: Spawn_Result, cm: ^Conn_Manager) -> int {
 	// Set once by `conn_manager_init` and never written again, so read without
 	// the manager's lock - which the accept loop is not holding here anyway.
 	return cm.prefix_limit if why == .Prefix_Limit_Reached else cm.limit
+}
+
+@(private)
+query_spawn_reported: bool
+
+/*
+Say, once, that a query could not be given a fiber of its own.
+
+The query-side twin of `report_spawn_failure`'s third cause: a UDP datagram or an
+HTTP/2 request that `submit_query` could not start because the OS would not map
+a stack. Counted as dropped=, which is also what `max_pending` shedding counts,
+and the two want opposite remedies - so the first one is said at `warn`, naming
+what to check. Once per process: the per-client detail is the debug lines' job.
+Formats nothing out of the scratch, since the HTTP/2 caller's holds the frame
+`h2.serve` is still working through.
+*/
+@(private)
+report_query_spawn_failure :: proc(proto: Protocol) {
+	if say, _ := report_once(&query_spawn_reported, false); !say {
+		return
+	}
+	logx.warnf(
+		"%s: dropping a query, the OS would not map a stack for it - this is below server.max_pending, so raising that will not help",
+		proto_name(proto),
+	)
+	logx.warnf(
+		"check the process memory limits (RLIMIT_AS, cgroup memory.max, MemoryMax=) and the mapping count (vm.max_map_count); these are counted as dropped= in the stats line",
+	)
 }
 
 @(private)

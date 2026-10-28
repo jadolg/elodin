@@ -157,10 +157,10 @@ write_line :: proc(level: Level, msg: string, fields: string) {
 			Cut short, but still one record: the message cut to what fits even
 			quoted at its widest, and the fields left off. Cutting the rendered
 			line instead can end it inside a quoted value, which no logfmt reader
-			takes as a record.
+			takes as a record. On a rune boundary, for the reason `cut_runes` gives.
 			*/
 			b = strings.builder_from_bytes(buf[:])
-			write_record(&b, now, stamp, level, msg[:min(len(msg), CUT_MESSAGE)], "")
+			write_record(&b, now, stamp, level, cut_runes(msg, CUT_MESSAGE), "")
 			line = strings.to_string(b)
 		}
 	}
@@ -223,7 +223,37 @@ render :: proc(buf: []u8, format: string, args: ..any) -> string {
 	if long := fmt.tprintf(format, ..args); len(long) > len(s) {
 		return long
 	}
-	return s
+	return cut_runes(s, len(s))
+}
+
+/*
+`s` cut to at most `n` bytes, backed off to the start of a rune: a record cut
+inside one is no longer UTF-8, which a shipper may refuse or mangle.
+*/
+@(private)
+cut_runes :: proc(s: string, n: int) -> string {
+	cut := min(len(s), max(n, 0))
+	// The lead byte of the last rune before the cut, at most three back.
+	lead := cut - 1
+	for lead > 0 && lead > cut - 4 && s[lead] & 0xc0 == 0x80 {
+		lead -= 1
+	}
+	if lead < 0 {
+		return s[:cut]
+	}
+	width := 1
+	switch {
+	case s[lead] & 0xe0 == 0xc0:
+		width = 2
+	case s[lead] & 0xf0 == 0xe0:
+		width = 3
+	case s[lead] & 0xf8 == 0xf0:
+		width = 4
+	}
+	if lead + width > cut {
+		cut = lead
+	}
+	return s[:cut]
 }
 
 @(private)

@@ -253,6 +253,7 @@ h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 			h2.conn_unref(hc)
 			free(job)
 			h2_shed(ctx, hc, req, max_pending, spawn_failed = true)
+			report_query_spawn_failure(.DoH)
 			return
 		}
 		// No loop to start it on - a `Server` built as a literal, driven from a

@@ -893,6 +893,7 @@ test_cancel_all_reaches_a_fiber_waiting_on_a_descriptor :: proc(t: ^testing.T) {
 	Shared :: struct {
 		fd:      linux.Fd,
 		parked:  Sema,
+		waiter:  ^Fiber,
 		result:  Wait_Result,
 		done:    sync.Sema,
 	}
@@ -903,13 +904,24 @@ test_cancel_all_reaches_a_fiber_waiting_on_a_descriptor :: proc(t: ^testing.T) {
 		// Started from a fiber, as an upstream reader is.
 		_ = go(proc(data: rawptr) {
 			s := (^Shared)(data)
+			sync.atomic_store(&s.waiter, current())
 			sema_post(&s.parked)
 			s.result = wait_fd(s.fd, {.In}, time.tick_add(time.tick_now(), time.Hour))
 			sync.sema_post(&s.done)
 		}, data)
 	}, &s)
 	testing.expect(t, sema_wait_with_timeout(&s.parked, WAIT))
-	time.sleep(10 * time.Millisecond)
+	/*
+	The premise: the fiber is parked in the wait when the cancel lands. Cancelled
+	before it got there, `wait_fd` returns `.Cancelled` without ever parking, and
+	this would pass without a parked waiter having been woken at all.
+	*/
+	waiter := sync.atomic_load(&s.waiter)
+	start := time.tick_now()
+	for sync.atomic_load(&waiter.state) != .Parked && time.tick_since(start) < WAIT {
+		time.sleep(time.Millisecond)
+	}
+	testing.expect(t, sync.atomic_load(&waiter.state) == .Parked, "the waiter never parked on the descriptor")
 	cancel_all(l)
 	woke := sync.sema_wait_with_timeout(&s.done, WAIT)
 	testing.expect(t, woke, "cancel_all did not end the wait")

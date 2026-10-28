@@ -5,6 +5,7 @@ import "core:os"
 import "core:path/filepath"
 import "core:strings"
 import "core:testing"
+import "core:unicode/utf8"
 
 /*
 One test proc, on purpose.
@@ -126,6 +127,21 @@ test_every_line_is_logfmt :: proc(t: ^testing.T) {
 	cut := after_stamp(t, lines[15])
 	testing.expect(t, strings.has_prefix(cut, `level=warn msg="\x01\x01`), "the cut-short quoted line lost its record")
 	testing.expect(t, strings.has_suffix(cut, `\x01"`), "the cut-short line ends inside its quoted message")
+
+	// Both cuts land on a rune boundary. Five bytes a unit, so neither the
+	// message buffer (1024) nor the cut-short record (`CUT_MESSAGE`) ends on one
+	// by accident, and the escapes push the record past the line buffer.
+	{
+		runes := strings.repeat("\x01\x01€", 400, context.temp_allocator)
+		context.temp_allocator = refusing_allocator()
+		warnf("%s", runes)
+	}
+	lines = log_lines(t, path)
+	if !testing.expectf(t, len(lines) == 17, "%d lines after the multibyte one, want 17", len(lines)) {
+		return
+	}
+	testing.expect(t, utf8.valid_string(lines[16]), "a cut-short line split a rune")
+	testing.expect(t, strings.has_suffix(lines[16], `"`), "the cut-short multibyte line ends inside its quoted message")
 }
 
 // An allocator with nothing to give, as a fiber's scratch is once the OS will
