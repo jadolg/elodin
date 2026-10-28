@@ -213,16 +213,28 @@ open_fd_count :: proc() -> i64 {
 		if entry == nil {
 			break
 		}
-		// Compared byte by byte rather than turned into a string: `d_name` is a
-		// C array of an implementation-defined character type, and the two
-		// names being skipped are three bytes between them.
-		name := entry.d_name
-		if name[0] == '.' && (name[1] == 0 || (name[1] == '.' && name[2] == 0)) {
+		if is_dot_entry(entry) {
 			continue
 		}
 		count += 1
 	}
 	return count
+}
+
+/*
+Whether a directory entry is `.` or `..`.
+
+Compared byte by byte rather than turned into a string: `d_name` is a C array of
+an implementation-defined character type, and the two names being skipped are
+three bytes between them. Read through a pointer, and no further than the first
+byte that settles it: a record is only `d_reclen` long, so the last one in
+`readdir`'s buffer can end well short of the 256 bytes `d_name` is declared
+with, and a copy of the whole array reads past the buffer.
+*/
+@(private)
+is_dot_entry :: proc(entry: ^posix.dirent) -> bool {
+	name := &entry.d_name
+	return name[0] == '.' && (name[1] == 0 || (name[1] == '.' && name[2] == 0))
 }
 
 /*
