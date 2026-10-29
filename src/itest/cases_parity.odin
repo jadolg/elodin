@@ -256,6 +256,14 @@ PARITY_LIVE_POOL := []string {
 	*/
 	"8.8.8.8.in-addr.arpa.",
 	"8.8.8.8.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.6.8.4.0.6.8.4.1.0.0.2.ip6.arpa.",
+	/*
+	An unsigned delegation under a name that owns a CNAME (issue #552):
+	`bitcoin.sipa.be.` is a CNAME signed by `sipa.be.`, so the chain walk's DS
+	question for it comes back as that CNAME, and the walk has to read it as no
+	cut to reach the delegation below. Bitcoin Core has shipped this seed for
+	over a decade.
+	*/
+	"seed.bitcoin.sipa.be.",
 }
 
 @(private = "file")

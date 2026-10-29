@@ -304,6 +304,71 @@ special_use: {{private_reverse: false}}
 	}
 	end_case(r)
 
+	start_case(r, "dnssec: the walk passes a name owning a CNAME its parent signed")
+	{
+		/*
+		Issue #552: `seed.bitcoin.sipa.be.` and its like. The walk's DS question
+		for `alias.cntest.` comes back as the CNAME it owns, signed by
+		`cntest.`, which makes it no cut, so the walk reaches the unsigned
+		delegation below and the answer is served insecure rather than refused.
+		A CNAME the parent did not sign proves nothing, so the same walk through
+		those is still DNSSEC Bogus.
+		*/
+		cut_port := next_port(r)
+		cut_mock := mock_make("dnssec-cname-cut", cut_port)
+		for f in CNAME_CUT_FIXTURES {
+			mock_reply(cut_mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
+		}
+		for name in ([]string{"seed.alias.cntest.", "x.bare.cntest.", "x.wild.cntest.", "x.stray.cntest."}) {
+			mock_synth(cut_mock, name, u16(dns.Type.A), {192, 0, 2, 1})
+		}
+		if mock_start(cut_mock) {
+			defer mock_stop(cut_mock)
+			cut_udp := next_port(r)
+			config := fmt.tprintf(
+				`listeners:
+  udp: {{enabled: true, address: 127.0.0.1, port: %d}}
+  tcp: {{enabled: false}}
+upstream:
+  servers: [udp://127.0.0.1:%d]
+cache: {{enabled: false}}
+blocking: {{enabled: false}}
+dnssec:
+  enabled: true
+  trust_anchors: [%q]
+`,
+				cut_udp,
+				cut_port,
+				CNAME_CUT_ANCHOR,
+			)
+			cut, started := start_server(r, Server_Options{config = config, udp_port = cut_udp})
+			if started {
+				defer stop_server(&cut)
+				for c in ([]struct {
+						name:  string,
+						rcode: dns.Rcode,
+						ede:   int,
+					}{
+						{"seed.alias.cntest.", .No_Error, -1},
+						{"x.bare.cntest.", .Serv_Fail, 6},
+						{"x.wild.cntest.", .Serv_Fail, 6},
+						{"x.stray.cntest.", .Serv_Fail, 6},
+					}) {
+					res := query_udp(cut_udp, build_query(c.name, u16(dns.Type.A), edns_size = 1232, dnssec_ok = true))
+					if check(r, res.ok, "no response for %s", c.name) {
+						h := parse_header(r, res.wire)
+						check_eq_int(r, h.rcode, int(c.rcode), fmt.tprintf("rcode for %s", c.name))
+						check(r, len(res.wire) >= 4 && res.wire[3] & 0x20 == 0, "AD for %s, which is not secure", c.name)
+						check_eq_int(r, extended_error(r, res.wire), c.ede, fmt.tprintf("extended DNS error for %s", c.name))
+					}
+				}
+			}
+		} else {
+			check(r, false, "cannot start the mock upstream")
+		}
+	}
+	end_case(r)
+
 	start_case(r, "dnssec: a refused answer carries an extended DNS error")
 	{
 		res := query_udp(udp_port, build_query("ede.test.", u16(dns.Type.A), edns_size = 1232))
