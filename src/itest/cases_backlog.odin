@@ -15,7 +15,7 @@ connection carries a second, the queue on it grows past the timeout. A caller
 that gives up leaves its answer on the stream, so from there the connection
 carries answers nobody reads and nearly every query fails. The mock here is
 that connection: its TCP side answers one query at a time, `SERVICE` apart,
-and the client asks four times faster than that.
+and the client asks twice as fast as that.
 
 What shows the excess is turned away rather than queued: a SERVFAIL well inside
 the timeout, which a query put on the queue cannot get, and the failure kind
@@ -82,7 +82,7 @@ metrics: {{ enabled: true, address: 127.0.0.1, port: %d }}
 }
 
 /*
-`QUERIES` for the truncated name, one every `PACE`, collecting the replies as
+`QUERIES` truncated names, each its own, one every `PACE`, collecting the replies as
 they come. A SERVFAIL counts as fast when it came back in under half the
 upstream's one-second timeout.
 */

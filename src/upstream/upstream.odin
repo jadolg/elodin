@@ -56,8 +56,9 @@ Error :: enum u8 {
 	*/
 	Deadline,
 	/*
-	The pipelined connection was answering more slowly than this query had
-	left to wait, so it was not put on it (issue #551; see `pipe_backlogged`).
+	The pipelined connection's recent replies all queued for at least half of
+	what this query had left, so it was not put on it (issue #551; see
+	`pipe_backlogged`).
 	A statement about the path to the upstream rather than the upstream, and
 	not charged towards its cooldown: a `udp` member's datagram answers are
 	still arriving.
